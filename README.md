@@ -1,8 +1,8 @@
 # zvidlib
 
-zvidlib is a planned Rust library for frame-accurate video and synchronized audio I/O on native and WebAssembly targets. Its primary jobs are reading an MP4 into a GL/WebGL canvas and writing canvas frames plus an audio stream into an MP4, behind a small API centered on indexed `get` and `put` operations.
+zvidlib is a Rust library under active development for frame-accurate video and synchronized audio I/O on native and WebAssembly targets. Its primary jobs are reading an MP4 into a GL/WebGL canvas and writing canvas frames plus an audio stream into an MP4, behind a small API centered on indexed `get` and `put` operations.
 
-> **Project status:** design and build scaffolding only. No media implementation is present yet. The interfaces below describe the intended API and may change before the first release.
+> **Project status:** the portable foundation now includes checked rational timeline arithmetic, synchronized frame/audio intervals, validated CPU media buffers, capability and error types, and asynchronous in-memory byte I/O. MP4, codec, graphics, playback, recording, and JavaScript APIs remain planned. The interfaces below describe the intended complete API and may change before the first release.
 
 ## Goals
 
@@ -233,9 +233,9 @@ Codec and hardware availability varies by browser and operating system. Opening 
 
 ## Repository layout
 
-The repository currently contains documentation and a deliberately empty Rust library target so Cargo can validate native and WASM build configuration. Planned modules and dependency boundaries are described in [ARCHITECTURE.md](ARCHITECTURE.md). Runtime dependencies will be added only with a documented portability, maintenance, size, and licensing rationale.
+The repository contains a dependency-free portable core that validates native and WASM build configuration while implementing the first architecture layer. Planned modules and dependency boundaries are described in [ARCHITECTURE.md](ARCHITECTURE.md). Runtime dependencies will be added only with a documented portability, maintenance, size, and licensing rationale.
 
-## Building the scaffold
+## Building the library
 
 Install stable Rust with the `wasm32-unknown-unknown` target, then run:
 
@@ -246,7 +246,7 @@ cargo fmt --all -- --check
 cargo clippy --all-targets --features native -- -D warnings
 ```
 
-These commands currently validate project setup only; they do not produce a functional media library.
+These commands validate the portable core on both targets. They do not yet produce an end-to-end media reader or writer.
 
 ## Building and using WebAssembly
 
@@ -267,7 +267,7 @@ python -m http.server 8000
 
 Open `http://localhost:8000/` and import the generated module with `import init, { ... } from "./pkg/zvidlib.js"`, as in the browser examples. Call `await init()` exactly once before using an exported class. Deploy the generated `pkg/zvidlib.js` and `pkg/zvidlib_bg.wasm` together, with the server returning `application/wasm` for the `.wasm` file.
 
-`wasm-pack build` currently produces only the empty scaffold: `MediaInput`, `MediaOutput`, and `Playback` will become available as the implementation milestones land. The base build does not require WASM threads or cross-origin isolation. Future optional threaded builds will document their additional headers and browser requirements separately.
+`wasm-pack build` currently packages the portable core only: `MediaInput`, `MediaOutput`, and `Playback` will become available as the implementation milestones land. The base build does not require WASM threads or cross-origin isolation. Future optional threaded builds will document their additional headers and browser requirements separately.
 
 ## Roadmap
 
