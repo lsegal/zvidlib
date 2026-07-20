@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: Rust checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: rustup show
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Check native target
+        run: cargo check --all-targets --features native
+      - name: Lint native target
+        run: cargo clippy --all-targets --features native -- -D warnings
+      - name: Check WebAssembly target
+        run: cargo check --target wasm32-unknown-unknown --no-default-features --features web
