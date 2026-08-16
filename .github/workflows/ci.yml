@@ -24,3 +24,9 @@ jobs:
         run: cargo clippy --all-targets --features native -- -D warnings
       - name: Check WebAssembly target
         run: cargo check --target wasm32-unknown-unknown --no-default-features --features web
+      - name: Install wasm-pack
+        run: cargo install wasm-pack --version 0.15.0 --locked
+      - name: Build browser package
+        run: wasm-pack build --target web --out-dir pkg --no-default-features --features web
+      - name: Test in headless Chrome
+        run: wasm-pack test --headless --chrome --no-default-features --features web

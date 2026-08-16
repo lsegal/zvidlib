@@ -158,13 +158,15 @@ Recording adapters timestamp canvas captures and Web Audio/native audio buffers 
 
 Portable core modules avoid operating-system handles, blocking I/O, native threads, and JavaScript types. Platform modules implement storage, task spawning, clocks, codec factories, and graphics transfer.
 
-The JavaScript package will expose classes mirroring Rust sessions and streams. Boundary rules include:
+The `web` feature exposes classes mirroring Rust sessions, streams, options, and media values through `wasm-bindgen`. Boundary rules include:
 
 - 64-bit frame and timestamp values use `BigInt` or validated safe-number conversions;
 - async Rust operations become cancellable Promises where feasible;
-- CPU frames can expose typed-array views only while backing memory is pinned and valid;
+- CPU frames and audio buffers cross the boundary as owned copies; returned typed arrays are snapshots rather than views into growable WASM memory;
 - browser objects such as `Blob`, `ReadableStream`, `VideoFrame`, WebGL contexts, and audio buffers remain platform adapter values;
 - Rust errors become stable JavaScript error codes plus human-readable context.
+
+Blob and buffer inputs are copied into WASM-owned storage. `ReadableStream<Uint8Array>` inputs are consumed with a bounded allocation, release their reader locks, and can be cancelled with `AbortSignal`. Finalized browser output is copied into a browser-owned `Blob`. Session and stream handles are present even when a backend is unavailable; such operations reject with `UNSUPPORTED` instead of returning placeholder media.
 
 The base WASM build does not require threads. Optional worker/thread acceleration must account for cross-origin isolation, shared memory availability, and object transfer rules. Feature selection must prevent native-only dependencies from compiling into browser builds.
 
