@@ -11,6 +11,7 @@ pub mod codec;
 pub mod io;
 pub mod media;
 pub mod mp4;
+pub mod mp4_demux;
 pub mod output;
 pub mod timeline;
 pub mod transfer;
@@ -33,6 +34,7 @@ pub use codec::{
 pub use media::{
     AudioBuffer, Codec, ColorRange, Container, PixelFormat, Plane, VideoDimensions, VideoFrame,
 };
+pub use mp4_demux::{EditMapping, Mp4Demuxer, Mp4DemuxerOptions, Mp4Sample, Mp4Track, probe_mp4};
 pub use output::{MediaOutput, OutputOptions};
 pub use timeline::{FrameIndex, FrameRate, Rational, SampleRange, Timeline};
 pub use transfer::{

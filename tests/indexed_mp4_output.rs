@@ -3,12 +3,13 @@ use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
-use zvidlib::io::{ByteSink, IoFuture, MemorySink};
+use zvidlib::io::{ByteSink, IoFuture, MemorySink, MemorySource};
 use zvidlib::{
     AudioBuffer, AudioDrain, AudioEncoder, AudioEncoderFormat, AudioGapless, Codec, ColorRange,
     EncodedSample, EncoderConfig, EncoderFuture, Error, ErrorKind, FrameIndex, FrameRate, Limits,
-    MediaOutput, OutputOptions, PixelFormat, Plane, SampleDependency, SampleRange, Timeline,
-    VideoDimensions, VideoEncoder, VideoEncoderFormat, VideoFrame,
+    MediaOutput, Mp4Demuxer, Mp4DemuxerOptions, OutputOptions, PixelFormat, Plane,
+    SampleDependency, SampleRange, Timeline, VideoDimensions, VideoEncoder, VideoEncoderFormat,
+    VideoFrame,
 };
 use zvidlib::{
     ContextIdentity, CpuFrameSource, ExecutionOwner, FrameSource, GraphicsApi, GraphicsResource,
@@ -336,6 +337,18 @@ fn synchronized_output_round_trips_exact_mp4_indexes() {
             .unwrap();
 
         let bytes = output.finish().await.unwrap().into_inner();
+        let demuxer = Mp4Demuxer::open(
+            &MemorySource::new(bytes.clone()),
+            Mp4DemuxerOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(demuxer.tracks.len(), 2);
+        assert_eq!(demuxer.tracks[0].samples.len(), 2);
+        assert_eq!(demuxer.tracks[0].presentation_order, vec![1, 0]);
+        assert_eq!(demuxer.tracks[0].samples[0].pts, 1_000);
+        assert_eq!(demuxer.tracks[0].samples[1].pts, 0);
+        assert_eq!(demuxer.tracks[1].edits[0].media_time, 1_024);
         assert_eq!(&bytes[4..8], b"ftyp");
         let ftyp_size = u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize;
         assert_eq!(&bytes[ftyp_size + 4..ftyp_size + 8], b"mdat");

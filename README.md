@@ -2,7 +2,7 @@
 
 zvidlib is a Rust library under active development for frame-accurate video and synchronized audio I/O on native and WebAssembly targets. Its primary jobs are reading an MP4 into a GL/WebGL canvas and writing canvas frames plus an audio stream into an MP4, behind a small API centered on indexed `get` and `put` operations.
 
-> **Project status:** the portable foundation now includes checked timeline arithmetic, validated media buffers, asynchronous byte I/O, CPU/GL/WebGL transfer contracts, normalized codec factories, a bounded exact-frame decoder path with an uncompressed conformance backend, encoder contracts, strict indexed output, seekable MP4 muxing, and the browser WebAssembly boundary. The generated JavaScript package includes BigInt-safe values, stable errors, Blob/stream input, Blob output, and session/stream/playback handles. Production compressed-codec integrations, MP4 reading, and playback adapters remain planned, so backend-dependent JavaScript operations currently reject with `UNSUPPORTED`. The complete workflow interfaces below remain intentionally aspirational and may change before the first release.
+> **Project status:** the portable foundation now includes checked timeline arithmetic, validated media buffers, asynchronous byte I/O, CPU/GL/WebGL transfer contracts, bounded ordinary/fragmented MP4 sample indexing, normalized codec factories, a bounded exact-frame decoder path with an uncompressed conformance backend, encoder contracts, strict indexed output, seekable MP4 muxing, and the browser WebAssembly boundary. The generated JavaScript package includes BigInt-safe values, stable errors, Blob/stream input, Blob output, and session/stream/playback handles. Production compressed-codec integrations and playback adapters remain planned, so backend-dependent JavaScript operations currently reject with `UNSUPPORTED`. The complete workflow interfaces below remain intentionally aspirational and may change before the first release.
 
 ## Goals
 
@@ -283,7 +283,7 @@ Codec and hardware availability varies by browser and operating system. Opening 
 
 ## Repository layout
 
-The repository contains a dependency-free portable core that validates native and WASM build configuration and implements the foundational timeline, media, I/O, frame-transfer, codec factory, exact-frame decoding, encoder, indexed-output, and seekable MP4 writing layers. Planned modules and dependency boundaries are described in [ARCHITECTURE.md](ARCHITECTURE.md). Runtime dependencies will be added only with a documented portability, maintenance, size, and licensing rationale.
+The repository contains a dependency-free portable core that validates native and WASM build configuration and implements the foundational timeline, media, I/O, frame-transfer, bounded MP4 reading, codec factory, exact-frame decoding, encoder, indexed-output, and seekable MP4 writing layers. Planned modules and dependency boundaries are described in [ARCHITECTURE.md](ARCHITECTURE.md). Runtime dependencies will be added only with a documented portability, maintenance, size, and licensing rationale.
 
 ## Building the library
 
