@@ -2,7 +2,7 @@
 
 zvidlib is a Rust library under active development for frame-accurate video and synchronized audio I/O on native and WebAssembly targets. Its primary jobs are reading an MP4 into a GL/WebGL canvas and writing canvas frames plus an audio stream into an MP4, behind a small API centered on indexed `get` and `put` operations.
 
-> **Project status:** the portable foundation now includes checked rational timeline arithmetic, synchronized frame/audio intervals, validated CPU media buffers, capability and error types, asynchronous byte I/O, explicit CPU/GL/WebGL frame transfer contracts, normalized codec factories, a bounded exact-frame decoder path with an uncompressed conformance backend, encoder contracts, strict indexed output, and seekable MP4 muxing. Production compressed-codec integrations, MP4 reading, playback adapters, and JavaScript APIs remain planned. The interfaces below describe the intended complete API and may change before the first release.
+> **Project status:** the portable foundation now includes checked rational timeline arithmetic, synchronized frame/audio intervals, validated CPU media buffers, capability and error types, asynchronous byte I/O, explicit CPU/GL/WebGL frame transfer contracts, normalized codec factories, a bounded exact-frame decoder path with an uncompressed conformance backend, exact AAC sample reads, audio-clock playback control, encoder contracts, strict indexed output, and seekable MP4 muxing. Production compressed-codec integrations, concrete device/browser bindings, MP4 reading, and JavaScript APIs remain planned. The interfaces below describe the intended complete API and may change before the first release.
 
 ## Goals
 

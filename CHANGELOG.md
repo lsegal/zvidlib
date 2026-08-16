@@ -4,6 +4,7 @@ All notable changes to zvidlib will be documented in this file.
 
 ## Unreleased
 
+- Add exact AAC sample-range reads with gapless/edit mapping and audio-clock-driven native/Web Audio playback synchronization with cancellable seek preroll.
 - Add normalized video codec factories and a bounded exact-frame decoder path with presentation-order reordering, cancellation, and a portable uncompressed conformance backend.
 - Add strict synchronized indexed video/audio writing with portable encoder contracts, bounded sink backpressure, gapless finalization, and deterministic seekable MP4 muxing.
 - Add explicit CPU, native OpenGL, and browser WebGL frame transfer contracts with inspectable copy modes, conversion stages, context validation, strict fallback policies, and caller-safe resource ownership.
