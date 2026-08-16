@@ -114,7 +114,7 @@ impl GraphicsResource {
     }
 
     /// Releases a library-owned resource. Caller-owned handles are deliberately left untouched.
-    pub fn release(self, adapter: &mut impl GraphicsAdapter) -> Result<()> {
+    pub fn release(self, adapter: &mut dyn GraphicsAdapter) -> Result<()> {
         validate_resource(adapter, self)?;
         if self.ownership == ResourceOwnership::Library {
             adapter.delete(self)?;
@@ -295,7 +295,7 @@ pub trait GraphicsAdapter {
 
 /// Inspects a transfer without executing it.
 pub fn inspect_transfer(
-    adapter: Option<&impl GraphicsAdapter>,
+    adapter: Option<&dyn GraphicsAdapter>,
     source: FrameSource<'_>,
     destination: &FrameDestination<'_>,
     policy: TransferPolicy,
@@ -325,6 +325,11 @@ pub fn inspect_transfer(
             ));
         }
     }
+    if mode == TransferMode::Shared && !stages.is_empty() {
+        return TransferCapability::unsupported(
+            "the backend reported a shared transfer that requires conversion stages",
+        );
+    }
     if mode == TransferMode::Shared {
         stages.clear();
     }
@@ -333,7 +338,7 @@ pub fn inspect_transfer(
 
 /// Validates, plans, and executes a CPU/GL/WebGL transfer.
 pub fn execute_transfer(
-    mut adapter: Option<&mut impl GraphicsAdapter>,
+    mut adapter: Option<&mut dyn GraphicsAdapter>,
     source: FrameSource<'_>,
     destination: FrameDestination<'_>,
     policy: TransferPolicy,
@@ -369,7 +374,7 @@ pub fn execute_transfer(
 }
 
 fn validate_endpoints(
-    adapter: &impl GraphicsAdapter,
+    adapter: &dyn GraphicsAdapter,
     source: FrameSource<'_>,
     destination: &FrameDestination<'_>,
 ) -> Result<()> {
@@ -388,7 +393,7 @@ fn validate_endpoints(
     Ok(())
 }
 
-fn validate_resource(adapter: &impl GraphicsAdapter, resource: GraphicsResource) -> Result<()> {
+fn validate_resource(adapter: &dyn GraphicsAdapter, resource: GraphicsResource) -> Result<()> {
     if adapter.is_context_lost() {
         return Err(graphics("the graphics context is lost"));
     }
@@ -843,7 +848,7 @@ mod tests {
             }],
         };
         let capability = execute_transfer(
-            None::<&mut FakeAdapter>,
+            None,
             FrameSource::Cpu(CpuFrameSource {
                 frame: &source,
                 orientation: Orientation::TopLeft,
@@ -876,7 +881,7 @@ mod tests {
             }],
         };
         execute_transfer(
-            None::<&mut FakeAdapter>,
+            None,
             FrameSource::Cpu(CpuFrameSource {
                 frame: &source,
                 orientation: Orientation::TopLeft,
@@ -949,6 +954,22 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Unsupported);
         assert!(adapter.calls.is_empty());
+    }
+
+    #[test]
+    fn shared_graphics_transfer_is_reported_when_no_conversion_is_needed() {
+        let mut adapter = FakeAdapter::new(GraphicsApi::NativeOpenGl, TransferMode::Shared);
+        let graphics = resource(GraphicsApi::NativeOpenGl, ResourceOwnership::Caller);
+        let capability = execute_transfer(
+            Some(&mut adapter),
+            FrameSource::Graphics(graphics),
+            FrameDestination::Graphics(graphics),
+            TransferPolicy::require(TransferMode::Shared),
+        )
+        .unwrap();
+        assert_eq!(capability.mode, TransferMode::Shared);
+        assert!(capability.stages.is_empty());
+        assert_eq!(adapter.calls, ["copy"]);
     }
 
     #[test]
