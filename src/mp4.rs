@@ -94,13 +94,15 @@ impl<S: ByteSink> Mp4Muxer<S> {
         let tracks = configs
             .into_iter()
             .enumerate()
-            .map(|(index, config)| TrackState {
-                id: u32::try_from(index + 1).unwrap_or(u32::MAX),
-                config,
-                samples: Vec::new(),
-                gapless: AudioGapless::default(),
+            .map(|(index, config)| {
+                Ok(TrackState {
+                    id: u32::try_from(index + 1).map_err(|_| limit("too many MP4 tracks"))?,
+                    config,
+                    samples: Vec::new(),
+                    gapless: AudioGapless::default(),
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             sink,
             tracks,
@@ -198,6 +200,14 @@ fn validate_track_config(config: &Mp4TrackConfig) -> Result<()> {
     if usize::try_from(declared).ok() != Some(config.encoder.decoder_config.len()) {
         return Err(invalid("codec configuration box size is inconsistent"));
     }
+    let expected_config = match config.encoder.codec {
+        Codec::Hevc => b"hvcC",
+        Codec::Av1 => b"av1C",
+        Codec::Aac => b"esds",
+    };
+    if &config.encoder.decoder_config[4..8] != expected_config {
+        return Err(invalid("codec configuration box type is incompatible"));
+    }
     match (config.encoder.codec, config.format) {
         (Codec::Hevc | Codec::Av1, Mp4TrackFormat::Video(_))
         | (Codec::Aac, Mp4TrackFormat::Audio { .. }) => Ok(()),
@@ -208,6 +218,16 @@ fn validate_track_config(config: &Mp4TrackConfig) -> Result<()> {
 fn validate_sample(track: &TrackState, sample: &EncodedSample) -> Result<()> {
     if sample.duration == 0 {
         return Err(invalid("encoded sample duration must be nonzero"));
+    }
+    if sample.data.is_empty() {
+        return Err(invalid("encoded sample data must be nonempty"));
+    }
+    if sample.dependency.is_leading > 3
+        || sample.dependency.depends_on > 3
+        || sample.dependency.is_depended_on > 3
+        || sample.dependency.has_redundancy > 3
+    {
+        return Err(invalid("sample dependency fields must fit in two bits"));
     }
     if sample.dts < 0 {
         return Err(invalid("negative decode timestamps are not supported"));
@@ -586,13 +606,25 @@ fn track_duration(track: &TrackState) -> Result<u64> {
 }
 
 fn presentation_duration(track: &TrackState, timescale: u32) -> Result<u64> {
-    let mut duration = track_duration(track)?;
+    let mut duration = presentation_end(track)?;
     if track.config.kind() == TrackKind::Audio {
         duration = duration
             .checked_sub(u64::from(track.gapless.priming) + u64::from(track.gapless.padding))
             .ok_or_else(|| invalid("audio gapless trim exceeds its duration"))?;
     }
     scale_duration(duration, track.config.encoder.timescale, timescale)
+}
+
+fn presentation_end(track: &TrackState) -> Result<u64> {
+    track.samples.iter().try_fold(0_u64, |maximum, sample| {
+        let end = sample
+            .pts
+            .checked_add(i64::from(sample.duration))
+            .ok_or_else(|| limit("presentation duration overflow"))?;
+        let end = u64::try_from(end)
+            .map_err(|_| invalid("encoded presentation ends before time zero"))?;
+        Ok(maximum.max(end))
+    })
 }
 
 fn scale_duration(value: u64, source: u32, target: u32) -> Result<u64> {

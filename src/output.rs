@@ -10,12 +10,15 @@ use crate::{AudioBuffer, Error, ErrorKind, FrameIndex, Result, Timeline};
 pub struct OutputOptions {
     /// Maximum encoded samples retained in each track's finalization index.
     pub max_samples_per_track: usize,
+    /// Maximum packet batch an encoder may return from one call or drain.
+    pub max_samples_per_encode: usize,
 }
 
 impl Default for OutputOptions {
     fn default() -> Self {
         Self {
             max_samples_per_track: 1_000_000,
+            max_samples_per_encode: 64,
         }
     }
 }
@@ -28,6 +31,7 @@ pub struct MediaOutput<S, V, A> {
     timeline: Timeline,
     next_video: u64,
     next_audio: u64,
+    max_samples_per_encode: usize,
     failure: Option<Error>,
 }
 
@@ -56,6 +60,12 @@ where
                 "audio MP4 timescale must preserve the encoder sample clock",
             ));
         }
+        if options.max_samples_per_encode == 0 {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "the encoder packet batch limit must be nonzero",
+            ));
+        }
         let tracks = vec![
             Mp4TrackConfig {
                 encoder: video.config().clone(),
@@ -76,6 +86,7 @@ where
             timeline,
             next_video: 0,
             next_audio: 0,
+            max_samples_per_encode: options.max_samples_per_encode,
             failure: None,
         })
     }
@@ -96,6 +107,9 @@ where
             Ok(samples) => samples,
             Err(error) => return Err(self.fail(error)),
         };
+        if let Err(error) = check_batch_limit(self.max_samples_per_encode, samples.len()) {
+            return Err(self.fail(error));
+        }
         for sample in samples {
             if let Err(error) = self.muxer.write_sample(0, sample).await {
                 return Err(self.fail(error));
@@ -127,6 +141,9 @@ where
             Ok(samples) => samples,
             Err(error) => return Err(self.fail(error)),
         };
+        if let Err(error) = check_batch_limit(self.max_samples_per_encode, samples.len()) {
+            return Err(self.fail(error));
+        }
         for sample in samples {
             if let Err(error) = self.muxer.write_sample(1, sample).await {
                 return Err(self.fail(error));
@@ -148,10 +165,12 @@ where
         }
 
         let delayed_video = self.video.finish().await?;
+        check_batch_limit(self.max_samples_per_encode, delayed_video.len())?;
         for sample in delayed_video {
             self.muxer.write_sample(0, sample).await?;
         }
         let delayed_audio = self.audio.finish().await?;
+        check_batch_limit(self.max_samples_per_encode, delayed_audio.samples.len())?;
         for sample in delayed_audio.samples {
             self.muxer.write_sample(1, sample).await?;
         }
@@ -195,4 +214,14 @@ fn advance(index: FrameIndex) -> Result<u64> {
             "indexed output cannot advance beyond the maximum frame index",
         )
     })
+}
+
+fn check_batch_limit(limit: usize, actual: usize) -> Result<()> {
+    if actual > limit {
+        return Err(Error::new(
+            ErrorKind::ResourceLimit,
+            "encoder packet batch exceeds the configured output limit",
+        ));
+    }
+    Ok(())
 }
