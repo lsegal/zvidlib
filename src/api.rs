@@ -93,6 +93,7 @@ pub struct Limits {
     pub max_tracks: u16,
     pub max_allocation_bytes: u64,
     pub max_cached_frames: u32,
+    pub max_decode_samples_per_seek: u32,
 }
 
 impl Default for Limits {
@@ -105,6 +106,7 @@ impl Default for Limits {
             max_tracks: 64,
             max_allocation_bytes: 512 * 1024 * 1024,
             max_cached_frames: 32,
+            max_decode_samples_per_seek: 4_096,
         }
     }
 }
@@ -126,5 +128,6 @@ mod tests {
         assert!(limits.max_width > 0);
         assert!(limits.max_allocation_bytes > 0);
         assert!(limits.max_cached_frames > 0);
+        assert!(limits.max_decode_samples_per_seek > 0);
     }
 }

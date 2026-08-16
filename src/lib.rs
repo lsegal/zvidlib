@@ -22,8 +22,12 @@ pub use wasm_api::*;
 
 pub use api::{Capability, Error, ErrorKind, Limits, Result, Support, TransferMode};
 pub use codec::{
-    AudioDrain, AudioEncoder, AudioEncoderFormat, AudioGapless, EncodedSample, EncoderConfig,
-    EncoderFuture, SampleDependency, TrackKind, VideoEncoder, VideoEncoderFormat,
+    AudioDrain, AudioEncoder, AudioEncoderFormat, AudioGapless, CancellationToken,
+    CodecImplementation, CodecProfile, CodecSupport, DecodeStatistics, DecodedVideoFrame,
+    EncodedSample, EncodedVideoSample, EncoderConfig, EncoderFuture, ExactFrameReader,
+    HardwarePreference, SampleDependency, TrackKind, VideoDecoder, VideoDecoderConfig,
+    VideoDecoderFactory, VideoEncoder, VideoEncoderConfig, VideoEncoderFactory, VideoEncoderFormat,
+    uncompressed_video_decoder_factory,
 };
 pub use media::{
     AudioBuffer, Codec, ColorRange, Container, PixelFormat, Plane, VideoDimensions, VideoFrame,
