@@ -6,15 +6,23 @@
 //! these types without leaking platform-specific values into the common API.
 
 pub mod api;
+pub mod codec;
 pub mod io;
 pub mod media;
+pub mod mp4;
+pub mod output;
 pub mod timeline;
 pub mod transfer;
 
 pub use api::{Capability, Error, ErrorKind, Limits, Result, Support, TransferMode};
+pub use codec::{
+    AudioDrain, AudioEncoder, AudioEncoderFormat, AudioGapless, EncodedSample, EncoderConfig,
+    EncoderFuture, SampleDependency, TrackKind, VideoEncoder, VideoEncoderFormat,
+};
 pub use media::{
     AudioBuffer, Codec, ColorRange, Container, PixelFormat, Plane, VideoDimensions, VideoFrame,
 };
+pub use output::{MediaOutput, OutputOptions};
 pub use timeline::{FrameIndex, FrameRate, Rational, SampleRange, Timeline};
 pub use transfer::{
     ColorConversion, ContextIdentity, CpuFrameDestination, CpuFrameSource, CpuPlaneDestination,
