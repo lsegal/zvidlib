@@ -66,7 +66,7 @@ All exported 64-bit frame, sample, and timestamp values return JavaScript `BigIn
 
 ## Planned API examples
 
-The examples in this section show the intended complete workflows. They are deliberately marked `ignore` because the repository is still a scaffold and does not yet export these APIs. The names may change before the first release, but the ownership, synchronization, and cleanup steps are part of the design.
+The examples in this section show the intended complete workflows. Rust examples are deliberately marked `ignore`, and browser examples depend on media backends that are not registered yet. The boundary classes exist, but backend-dependent calls reject with `UNSUPPORTED` until their implementations land. Names may change before the first release, while the ownership, synchronization, and cleanup steps are part of the design.
 
 ### Read, play audio, and render with native OpenGL
 

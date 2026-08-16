@@ -1,9 +1,10 @@
 //! Portable core types for frame-accurate video and synchronized audio I/O.
 //!
-//! The crate currently provides the backend-independent foundation: checked
-//! timeline arithmetic, validated media values, capability descriptions, and
-//! asynchronous byte I/O contracts. Container and codec backends build on
-//! these types without leaking platform-specific values into the common API.
+//! The crate provides checked timeline and media values, byte I/O, codec and
+//! transfer contracts, exact-frame decoding, indexed MP4 output, and a
+//! browser-facing WebAssembly boundary. Production container, codec, and
+//! playback backends build on these types without leaking platform-specific
+//! values into the common API.
 
 pub mod api;
 pub mod codec;
