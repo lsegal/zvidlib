@@ -650,6 +650,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn random_access_decode_work_obeys_the_configured_bound() {
+        let factory = uncompressed_video_decoder_factory();
+        let mut reader = ExactFrameReader::new(
+            &factory,
+            config(),
+            vec![sample(0, 1, true), sample(1, 2, false), sample(2, 3, false)],
+            Limits {
+                max_decode_samples_per_seek: 2,
+                ..Limits::default()
+            },
+        )
+        .unwrap();
+        let error = reader
+            .get(FrameIndex(2), &CancellationToken::new())
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::ResourceLimit);
+        assert_eq!(reader.statistics().samples_submitted, 2);
+    }
+
     struct DelayedFactory;
     impl VideoDecoderFactory for DelayedFactory {
         fn capability(&self, _: &VideoDecoderConfig) -> CodecSupport {
