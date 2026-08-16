@@ -2,7 +2,7 @@
 
 zvidlib is a Rust library under active development for frame-accurate video and synchronized audio I/O on native and WebAssembly targets. Its primary jobs are reading an MP4 into a GL/WebGL canvas and writing canvas frames plus an audio stream into an MP4, behind a small API centered on indexed `get` and `put` operations.
 
-> **Project status:** the portable foundation now includes checked rational timeline arithmetic, synchronized frame/audio intervals, validated CPU media buffers, capability and error types, and asynchronous in-memory byte I/O. MP4, codec, graphics, playback, recording, and JavaScript APIs remain planned. The interfaces below describe the intended complete API and may change before the first release.
+> **Project status:** the portable foundation now includes checked rational timeline arithmetic, synchronized frame/audio intervals, validated CPU media buffers, capability and error types, asynchronous in-memory byte I/O, and explicit CPU/GL/WebGL frame transfer contracts. MP4, codec execution, playback, recording, and JavaScript APIs remain planned. The interfaces below describe the intended complete API and may change before the first release.
 
 ## Goals
 
@@ -233,7 +233,7 @@ Codec and hardware availability varies by browser and operating system. Opening 
 
 ## Repository layout
 
-The repository contains a dependency-free portable core that validates native and WASM build configuration while implementing the first architecture layer. Planned modules and dependency boundaries are described in [ARCHITECTURE.md](ARCHITECTURE.md). Runtime dependencies will be added only with a documented portability, maintenance, size, and licensing rationale.
+The repository contains a dependency-free portable core that validates native and WASM build configuration while implementing timeline, media, I/O, and frame-transfer contracts. Planned modules and dependency boundaries are described in [ARCHITECTURE.md](ARCHITECTURE.md). Runtime dependencies will be added only with a documented portability, maintenance, size, and licensing rationale.
 
 ## Building the library
 
