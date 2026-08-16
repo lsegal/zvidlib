@@ -154,9 +154,23 @@ impl Mp4Demuxer {
                 }
                 b"moof" => {
                     let bytes = read_payload(source, header, &options).await?;
+                    ensure_allocation(
+                        fragments.len() + 1,
+                        std::mem::size_of::<Fragment>(),
+                        &options,
+                        "movie fragments",
+                    )?;
                     fragments.push(parse_moof(&bytes, header.start, &mut budget, &options)?);
                 }
-                b"mdat" => media_ranges.push((header.payload_start, header.end)),
+                b"mdat" => {
+                    ensure_allocation(
+                        media_ranges.len() + 1,
+                        std::mem::size_of::<(u64, u64)>(),
+                        &options,
+                        "media data ranges",
+                    )?;
+                    media_ranges.push((header.payload_start, header.end));
+                }
                 _ => {}
             }
             cursor = header.end;
@@ -167,7 +181,24 @@ impl Mp4Demuxer {
         } = movie.ok_or_else(|| malformed("MP4 does not contain a movie box"))?;
         append_fragments(&mut demuxer, fragments, &fragment_defaults, &options)?;
         for track in &mut demuxer.tracks {
+            track
+                .samples
+                .sort_by_key(|sample| (sample.dts, sample.offset));
             validate_samples(track, source_len, &media_ranges)?;
+            for sample in &track.samples {
+                track.duration = track.duration.max(
+                    sample
+                        .dts
+                        .checked_add(u64::from(sample.duration))
+                        .ok_or_else(|| limit("track duration overflow"))?,
+                );
+            }
+            ensure_allocation(
+                track.samples.len(),
+                std::mem::size_of::<usize>(),
+                &options,
+                "presentation index",
+            )?;
             track.presentation_order = (0..track.samples.len()).collect();
             track.presentation_order.sort_by_key(|&index| {
                 let sample = &track.samples[index];
@@ -318,6 +349,7 @@ struct TrackBuilder {
     sync: Option<BTreeSet<u32>>,
     dependencies: Vec<SampleDependency>,
     samples: Vec<Mp4Sample>,
+    ignored: bool,
 }
 
 #[derive(Default)]
@@ -365,6 +397,9 @@ fn parse_moov(
             .ok_or_else(|| malformed("track header is missing"))?;
         if id == 0 || !ids.insert(id) {
             return Err(malformed("MP4 track IDs must be unique and nonzero"));
+        }
+        if track.ignored {
+            continue;
         }
         tracks.push(finalize_track(track, options)?);
     }
@@ -432,6 +467,12 @@ fn parse_edts(
         }
         let (version, body) = full(child.payload)?;
         let count = count(body, 0, options.max_samples_per_track, "edit")?;
+        ensure_allocation(
+            count,
+            std::mem::size_of::<EditMapping>(),
+            options,
+            "edit list",
+        )?;
         let entry_size = if version == 1 {
             20
         } else if version == 0 {
@@ -507,11 +548,14 @@ fn parse_mdhd(payload: &[u8], track: &mut TrackBuilder) -> Result<()> {
 
 fn parse_hdlr(payload: &[u8], track: &mut TrackBuilder) -> Result<()> {
     let (_, body) = full(payload)?;
-    track.kind = Some(match slice(body, 4, 4)? {
-        b"vide" => TrackKind::Video,
-        b"soun" => TrackKind::Audio,
-        _ => return Err(unsupported("unsupported MP4 track handler")),
-    });
+    track.kind = match slice(body, 4, 4)? {
+        b"vide" => Some(TrackKind::Video),
+        b"soun" => Some(TrackKind::Audio),
+        _ => {
+            track.ignored = true;
+            None
+        }
+    };
     Ok(())
 }
 
@@ -521,6 +565,9 @@ fn parse_minf(
     budget: &mut Budget,
     options: &Mp4DemuxerOptions,
 ) -> Result<()> {
+    if track.ignored {
+        return Ok(());
+    }
     for child in children(bytes, 4, budget, options)? {
         if &child.kind == b"stbl" {
             parse_stbl(child.payload, track, budget, options)?;
@@ -542,6 +589,7 @@ fn parse_stbl(
             b"ctts" => track.ctts = parse_ctts(child.payload, options)?,
             b"stsc" => track.stsc = parse_u32_triples(child.payload, options)?,
             b"stsz" => track.sizes = parse_stsz(child.payload, options)?,
+            b"stz2" => track.sizes = parse_stz2(child.payload, options)?,
             b"stco" => track.chunks = parse_offsets(child.payload, options, false)?,
             b"co64" => track.chunks = parse_offsets(child.payload, options, true)?,
             b"stss" => track.sync = Some(parse_sync(child.payload, options)?),
@@ -558,6 +606,9 @@ fn parse_stsd(
     budget: &mut Budget,
     options: &Mp4DemuxerOptions,
 ) -> Result<()> {
+    if track.ignored {
+        return Ok(());
+    }
     let (_, body) = full(payload)?;
     let entries = count(body, 0, 16, "sample description")?;
     if entries != 1 {
@@ -606,7 +657,8 @@ fn parse_u32_pairs(
 ) -> Result<Vec<(u32, u32)>> {
     let (_, body) = full(payload)?;
     let count = count(body, 0, options.max_samples_per_track, label)?;
-    require(body, 4, count * 8)?;
+    ensure_allocation(count, std::mem::size_of::<(u32, u32)>(), options, label)?;
+    require(body, 4, checked_product(count, 8, label)?)?;
     (0..count)
         .map(|i| Ok((be_u32(body, 4 + i * 8)?, be_u32(body, 8 + i * 8)?)))
         .collect()
@@ -615,7 +667,8 @@ fn parse_u32_pairs(
 fn parse_ctts(payload: &[u8], options: &Mp4DemuxerOptions) -> Result<Vec<(u32, i64)>> {
     let (version, body) = full(payload)?;
     let count = count(body, 0, options.max_samples_per_track, "ctts")?;
-    require(body, 4, count * 8)?;
+    ensure_allocation(count, std::mem::size_of::<(u32, i64)>(), options, "ctts")?;
+    require(body, 4, checked_product(count, 8, "ctts")?)?;
     (0..count)
         .map(|i| {
             let raw = be_u32(body, 8 + i * 8)?;
@@ -636,7 +689,13 @@ fn parse_ctts(payload: &[u8], options: &Mp4DemuxerOptions) -> Result<Vec<(u32, i
 fn parse_u32_triples(payload: &[u8], options: &Mp4DemuxerOptions) -> Result<Vec<(u32, u32, u32)>> {
     let (_, body) = full(payload)?;
     let count = count(body, 0, options.max_samples_per_track, "stsc")?;
-    require(body, 4, count * 12)?;
+    ensure_allocation(
+        count,
+        std::mem::size_of::<(u32, u32, u32)>(),
+        options,
+        "stsc",
+    )?;
+    require(body, 4, checked_product(count, 12, "stsc")?)?;
     (0..count)
         .map(|i| {
             Ok((
@@ -652,18 +711,55 @@ fn parse_stsz(payload: &[u8], options: &Mp4DemuxerOptions) -> Result<Vec<u32>> {
     let (_, body) = full(payload)?;
     let fixed = be_u32(body, 0)?;
     let count = count(body, 4, options.max_samples_per_track, "sample")?;
+    ensure_allocation(count, std::mem::size_of::<u32>(), options, "sample sizes")?;
     if fixed != 0 {
         return Ok(vec![fixed; count]);
     }
-    require(body, 8, count * 4)?;
+    require(body, 8, checked_product(count, 4, "sample sizes")?)?;
     (0..count).map(|i| be_u32(body, 8 + i * 4)).collect()
+}
+
+fn parse_stz2(payload: &[u8], options: &Mp4DemuxerOptions) -> Result<Vec<u32>> {
+    let (_, body) = full(payload)?;
+    let field_size = slice(body, 3, 1)?[0];
+    let count = count(body, 4, options.max_samples_per_track, "sample")?;
+    ensure_allocation(count, std::mem::size_of::<u32>(), options, "sample sizes")?;
+    let encoded_bytes = match field_size {
+        4 => count.div_ceil(2),
+        8 => count,
+        16 => checked_product(count, 2, "compact sample sizes")?,
+        _ => return Err(malformed("unsupported compact sample size width")),
+    };
+    let encoded = slice(body, 8, encoded_bytes)?;
+    let mut sizes = Vec::with_capacity(count);
+    for index in 0..count {
+        sizes.push(match field_size {
+            4 => {
+                let byte = encoded[index / 2];
+                u32::from(if index % 2 == 0 {
+                    byte >> 4
+                } else {
+                    byte & 0x0f
+                })
+            }
+            8 => u32::from(encoded[index]),
+            16 => u32::from(u16::from_be_bytes(
+                encoded[index * 2..index * 2 + 2]
+                    .try_into()
+                    .expect("validated compact sample size"),
+            )),
+            _ => unreachable!("validated compact sample size width"),
+        });
+    }
+    Ok(sizes)
 }
 
 fn parse_offsets(payload: &[u8], options: &Mp4DemuxerOptions, wide: bool) -> Result<Vec<u64>> {
     let (_, body) = full(payload)?;
     let count = count(body, 0, options.max_samples_per_track, "chunk")?;
+    ensure_allocation(count, std::mem::size_of::<u64>(), options, "chunk offsets")?;
     let width = if wide { 8 } else { 4 };
-    require(body, 4, count * width)?;
+    require(body, 4, checked_product(count, width, "chunk offsets")?)?;
     (0..count)
         .map(|i| {
             if wide {
@@ -678,7 +774,8 @@ fn parse_offsets(payload: &[u8], options: &Mp4DemuxerOptions, wide: bool) -> Res
 fn parse_sync(payload: &[u8], options: &Mp4DemuxerOptions) -> Result<BTreeSet<u32>> {
     let (_, body) = full(payload)?;
     let count = count(body, 0, options.max_samples_per_track, "sync sample")?;
-    require(body, 4, count * 4)?;
+    ensure_allocation(count, std::mem::size_of::<u32>(), options, "sync samples")?;
+    require(body, 4, checked_product(count, 4, "sync samples")?)?;
     (0..count).map(|i| be_u32(body, 4 + i * 4)).collect()
 }
 
@@ -687,6 +784,12 @@ fn parse_sdtp(payload: &[u8], options: &Mp4DemuxerOptions) -> Result<Vec<SampleD
     if body.len() > options.max_samples_per_track as usize {
         return Err(limit("sample dependency count limit exceeded"));
     }
+    ensure_allocation(
+        body.len(),
+        std::mem::size_of::<SampleDependency>(),
+        options,
+        "sample dependencies",
+    )?;
     Ok(body
         .iter()
         .map(|&v| SampleDependency {
@@ -711,6 +814,27 @@ fn finalize_track(mut b: TrackBuilder, options: &Mp4DemuxerOptions) -> Result<Mp
         .ok_or_else(|| malformed("media header is missing"))?;
     if b.sizes.len() > options.max_samples_per_track as usize {
         return Err(limit("sample count limit exceeded"));
+    }
+    ensure_allocation(
+        b.sizes.len(),
+        std::mem::size_of::<Mp4Sample>(),
+        options,
+        "sample index",
+    )?;
+    ensure_allocation(
+        b.sizes.len(),
+        std::mem::size_of::<i64>(),
+        options,
+        "expanded timing table",
+    )?;
+    if b.sync.as_ref().is_some_and(|sync| {
+        sync.iter()
+            .any(|&index| index == 0 || index as usize > b.sizes.len())
+    }) {
+        return Err(malformed("sync sample index is out of range"));
+    }
+    if !b.dependencies.is_empty() && b.dependencies.len() != b.sizes.len() {
+        return Err(malformed("sample dependency count does not match samples"));
     }
     if !b.sizes.is_empty() {
         let durations = expand_runs(&b.stts, b.sizes.len(), "decode timing")?;
@@ -805,6 +929,12 @@ fn expand_chunks(stsc: &[(u32, u32, u32)], chunks: &[u64], sizes: &[u32]) -> Res
     if stsc[0].0 != 1 {
         return Err(malformed("first stsc entry must start at chunk one"));
     }
+    if stsc.windows(2).any(|entries| entries[0].0 >= entries[1].0) {
+        return Err(malformed("stsc first-chunk values are not increasing"));
+    }
+    if stsc.iter().any(|entry| entry.1 == 0 || entry.2 != 1) {
+        return Err(malformed("invalid or unsupported stsc entry"));
+    }
     let mut out = Vec::with_capacity(sizes.len());
     let mut sample = 0;
     for (ci, &chunk_offset) in chunks.iter().enumerate() {
@@ -814,9 +944,6 @@ fn expand_chunks(stsc: &[(u32, u32, u32)], chunks: &[u64], sizes: &[u32]) -> Res
             .rev()
             .find(|e| e.0 <= chunk_number)
             .ok_or_else(|| malformed("chunk has no stsc mapping"))?;
-        if entry.1 == 0 || entry.2 == 0 {
-            return Err(malformed("invalid stsc entry"));
-        }
         let mut offset = chunk_offset;
         for _ in 0..entry.1 {
             if sample >= sizes.len() {
@@ -972,6 +1099,12 @@ fn parse_tfdt(payload: &[u8], traf: &mut Traf) -> Result<()> {
 fn parse_trun(payload: &[u8], options: &Mp4DemuxerOptions) -> Result<Run> {
     let (version, flags, body) = full_flags(payload)?;
     let count = count(body, 0, options.max_samples_per_track, "fragment sample")?;
+    ensure_allocation(
+        count,
+        std::mem::size_of::<FragSample>(),
+        options,
+        "fragment samples",
+    )?;
     let mut at = 4;
     let data_offset = if flags & 1 != 0 {
         let v = be_i32(body, at)?;
@@ -1048,6 +1181,12 @@ fn append_fragments(
                     if track.samples.len() >= options.max_samples_per_track as usize {
                         return Err(limit("fragment sample count limit exceeded"));
                     }
+                    ensure_allocation(
+                        track.samples.len() + 1,
+                        std::mem::size_of::<Mp4Sample>(),
+                        options,
+                        "sample index",
+                    )?;
                     let duration = s
                         .duration
                         .or(nonzero(traf.default_duration))
@@ -1195,6 +1334,12 @@ fn children<'a>(
         if end > bytes.len() {
             return Err(malformed("child box exceeds its parent"));
         }
+        ensure_allocation(
+            out.len() + 1,
+            std::mem::size_of::<Child<'_>>(),
+            options,
+            "child boxes",
+        )?;
         out.push(Child {
             kind,
             payload: &bytes[at + header..end],
@@ -1234,6 +1379,23 @@ fn count(bytes: &[u8], at: usize, max: u32, label: &str) -> Result<usize> {
         return Err(limit(format!("{label} count limit exceeded")));
     }
     Ok(value as usize)
+}
+fn checked_product(count: usize, width: usize, label: &str) -> Result<usize> {
+    count
+        .checked_mul(width)
+        .ok_or_else(|| malformed(format!("{label} byte count overflow")))
+}
+fn ensure_allocation(
+    count: usize,
+    element_size: usize,
+    options: &Mp4DemuxerOptions,
+    label: &str,
+) -> Result<()> {
+    let bytes = checked_product(count, element_size, label)?;
+    if bytes as u128 > u128::from(options.limits.max_allocation_bytes) {
+        return Err(limit(format!("{label} allocation limit exceeded")));
+    }
+    Ok(())
 }
 fn require(bytes: &[u8], at: usize, len: usize) -> Result<()> {
     let end = at
@@ -1472,6 +1634,13 @@ mod tests {
     fn malformed_sizes_and_limits_fail_without_panicking() {
         block_on(async {
             let valid = fragmented_fixture();
+            for length in 0..valid.len() {
+                let _result = Mp4Demuxer::open(
+                    &MemorySource::new(valid[..length].to_vec()),
+                    Mp4DemuxerOptions::default(),
+                )
+                .await;
+            }
             for declared in 0_u32..8 {
                 let mut bytes = valid.clone();
                 bytes[..4].copy_from_slice(&declared.to_be_bytes());
@@ -1489,5 +1658,24 @@ mod tests {
                 .unwrap_err();
             assert_eq!(error.kind(), ErrorKind::ResourceLimit);
         });
+    }
+
+    #[test]
+    fn compact_sample_sizes_expand_at_every_supported_width() {
+        let options = Mp4DemuxerOptions::default();
+        for (width, count, encoded, expected) in [
+            (4_u8, 3_u32, vec![0x12, 0x30], vec![1, 2, 3]),
+            (8, 3, vec![1, 2, 255], vec![1, 2, 255]),
+            (16, 2, vec![0, 1, 1, 0], vec![1, 256]),
+        ] {
+            let mut body = vec![0; 4];
+            body[3] = width;
+            body.extend_from_slice(&count.to_be_bytes());
+            body.extend_from_slice(&encoded);
+            assert_eq!(
+                parse_stz2(&full_box(b"stz2", 0, 0, &body)[8..], &options).unwrap(),
+                expected
+            );
+        }
     }
 }
