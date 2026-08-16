@@ -9,9 +9,16 @@ pub mod api;
 pub mod io;
 pub mod media;
 pub mod timeline;
+pub mod transfer;
 
 pub use api::{Capability, Error, ErrorKind, Limits, Result, Support, TransferMode};
 pub use media::{
     AudioBuffer, Codec, ColorRange, Container, PixelFormat, Plane, VideoDimensions, VideoFrame,
 };
 pub use timeline::{FrameIndex, FrameRate, Rational, SampleRange, Timeline};
+pub use transfer::{
+    ColorConversion, ContextIdentity, CpuFrameDestination, CpuFrameSource, CpuPlaneDestination,
+    ExecutionOwner, FrameDestination, FrameSource, GraphicsAdapter, GraphicsApi, GraphicsResource,
+    Orientation, ResourceKind, ResourceOwnership, ScaleFilter, TransferCapability, TransferPolicy,
+    TransferStage, execute_transfer, inspect_transfer,
+};
