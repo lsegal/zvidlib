@@ -2,7 +2,7 @@
 
 zvidlib is a Rust library under active development for frame-accurate video and synchronized audio I/O on native and WebAssembly targets. Its primary jobs are reading an MP4 into a GL/WebGL canvas and writing canvas frames plus an audio stream into an MP4, behind a small API centered on indexed `get` and `put` operations.
 
-> **Project status:** the portable foundation now includes checked rational timeline arithmetic, synchronized frame/audio intervals, validated CPU media buffers, capability and error types, asynchronous byte I/O, explicit CPU/GL/WebGL frame transfer contracts, normalized codec factories, a bounded exact-frame decoder path with an uncompressed conformance backend, exact AAC sample reads, audio-clock playback control, encoder contracts, strict indexed output, and seekable MP4 muxing. Production compressed-codec integrations, concrete device/browser bindings, MP4 reading, and JavaScript APIs remain planned. The interfaces below describe the intended complete API and may change before the first release.
+> **Project status:** the portable foundation now includes checked timeline arithmetic, validated media buffers, asynchronous byte I/O, CPU/GL/WebGL transfer contracts, normalized codec factories, bounded exact-frame video decoding, exact AAC sample reads, audio-clock playback control and adapter contracts, encoder contracts, strict indexed output, seekable MP4 muxing, and the browser WebAssembly boundary. The generated JavaScript package includes BigInt-safe values, stable errors, Blob/stream input, Blob output, and session/stream/playback handles. Production compressed-codec integrations, MP4 reading, concrete audio-device and `AudioContext` bindings remain planned, so backend-dependent JavaScript operations currently reject with `UNSUPPORTED`. The complete workflow interfaces below remain intentionally aspirational and may change before the first release.
 
 ## Goals
 
@@ -16,9 +16,57 @@ zvidlib is a Rust library under active development for frame-accurate video and 
 
 The project is a library, not a media CLI or an FFmpeg binding. FFmpeg is a feature-set reference only; zvidlib will not copy or incorporate FFmpeg source.
 
+## Implemented browser boundary
+
+The `web` feature exposes `MediaInput`, `MediaOutput`, `Playback`, `VideoStream`, `AudioStream`, `OpenOptions`, `CreateOptions`, `PlaybackOptions`, `FrameIndex`, `Timestamp`, `Rational`, `SampleRange`, `VideoFrame`, and `AudioBuffer` through `wasm-bindgen`.
+
+`MediaInput.open` accepts a `Blob`, `ReadableStream<Uint8Array>`, `ArrayBuffer`, or typed-array view. It consumes streams, always releases its reader lock, and supports cancellation through `OpenOptions.signal`. Input bytes are copied into owned WebAssembly storage; `bytes()` returns a fresh JavaScript snapshot rather than a view into growable WebAssembly memory.
+
+```js
+import init, { FrameIndex, MediaInput, OpenOptions, errorCode } from "./pkg/zvidlib.js";
+
+await init();
+
+const controller = new AbortController();
+const options = new OpenOptions(64n * 1024n * 1024n);
+options.signal = controller.signal;
+
+const response = await fetch("./clip.mp4");
+const input = await MediaInput.open(await response.blob(), options);
+console.log(input.byteLength); // BigInt
+console.log(new FrameIndex(18_446_744_073_709_551_615n).value);
+
+try {
+  await input.video(0).get(0n);
+} catch (error) {
+  // Until a decoder backend is registered, this is "UNSUPPORTED" rather
+  // than a fake or nearest frame.
+  console.log(errorCode(error));
+}
+
+input.close();
+```
+
+`MediaOutput.finish()` returns a browser-owned `Blob` with the configured MIME type. `writeEncodedChunk()` is the byte-sink boundary used by a muxer backend; indexed video/audio `put` calls remain explicitly unsupported until those backends land.
+
+```js
+import { CreateOptions, MediaOutput } from "./pkg/zvidlib.js";
+
+const createOptions = new CreateOptions("mp4");
+createOptions.maxOutputBytes = 512n * 1024n * 1024n;
+const output = await MediaOutput.create(createOptions);
+
+// A future MP4 muxer supplies already-encoded container chunks here.
+output.writeEncodedChunk(new Uint8Array([0, 0, 0, 8, 0x66, 0x72, 0x65, 0x65]));
+const blob = await output.finish();
+console.log(blob.type); // "video/mp4"
+```
+
+All exported 64-bit frame, sample, and timestamp values return JavaScript `BigInt`. Inputs accept `BigInt` across the full Rust range or validated `Number` values only within JavaScript's safe-integer range. Rust and boundary failures reject with native `Error` instances named `ZvidError`; their stable `code` values can be read directly or with `errorCode(error)`.
+
 ## Planned API examples
 
-The examples in this section show the intended complete workflows. They are deliberately marked `ignore` because the repository is still a scaffold and does not yet export these APIs. The names may change before the first release, but the ownership, synchronization, and cleanup steps are part of the design.
+The examples in this section show the intended complete workflows. Rust examples are deliberately marked `ignore`, and browser examples depend on media backends that are not registered yet. The boundary classes exist, but backend-dependent calls reject with `UNSUPPORTED` until their implementations land. Names may change before the first release, while the ownership, synchronization, and cleanup steps are part of the design.
 
 ### Read, play audio, and render with native OpenGL
 
@@ -250,7 +298,7 @@ cargo clippy --all-targets --features native -- -D warnings
 
 These commands validate the portable core on both targets. No concrete video or audio codec backend is bundled yet, so they do not by themselves produce an end-to-end media reader or encoded recording.
 
-## Building and using WebAssembly
+## Building, testing, and using WebAssembly
 
 The `web` feature excludes native-only integrations. During scaffold development, install the Rust target and verify it directly:
 
@@ -259,7 +307,7 @@ rustup target add wasm32-unknown-unknown
 cargo check --target wasm32-unknown-unknown --no-default-features --features web
 ```
 
-Once the JavaScript wrapper described above lands, install [`wasm-pack`](https://rustwasm.github.io/wasm-pack/installer/) and create a browser-ready package:
+Install [`wasm-pack`](https://rustwasm.github.io/wasm-pack/installer/) and create a browser-ready ES module package:
 
 ```console
 cargo install wasm-pack
@@ -267,9 +315,15 @@ wasm-pack build --target web --out-dir pkg --no-default-features --features web
 python -m http.server 8000
 ```
 
-Open `http://localhost:8000/` and import the generated module with `import init, { ... } from "./pkg/zvidlib.js"`, as in the browser examples. Call `await init()` exactly once before using an exported class. Deploy the generated `pkg/zvidlib.js` and `pkg/zvidlib_bg.wasm` together, with the server returning `application/wasm` for the `.wasm` file.
+The build creates `pkg/zvidlib.js`, `pkg/zvidlib.d.ts`, `pkg/zvidlib_bg.wasm`, and package metadata. Open `http://localhost:8000/` and import the generated module with `import init, { ... } from "./pkg/zvidlib.js"`, as in the browser examples. Call `await init()` exactly once before using an exported class. Deploy the generated JavaScript and WASM files together, with the server returning `application/wasm` for the `.wasm` file.
 
-`wasm-pack build` currently packages the portable core only: `MediaInput`, `MediaOutput`, and `Playback` will become available as the implementation milestones land. The base build does not require WASM threads or cross-origin isolation. Future optional threaded builds will document their additional headers and browser requirements separately.
+Run the browser integration suite in an installed Chrome browser with:
+
+```console
+wasm-pack test --headless --chrome --no-default-features --features web
+```
+
+The suite verifies Blob and stream input, cancellation, reader-lock cleanup, BigInt range handling, typed-array copy lifetimes, browser-object ownership, stable errors, and Blob output. The base build does not require WASM threads or cross-origin isolation. Future optional threaded builds will document their additional headers and browser requirements separately.
 
 ## Roadmap
 
