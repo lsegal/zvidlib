@@ -10,6 +10,12 @@ pub mod io;
 pub mod media;
 pub mod timeline;
 
+#[cfg(all(feature = "web", target_arch = "wasm32"))]
+mod wasm_api;
+
+#[cfg(all(feature = "web", target_arch = "wasm32"))]
+pub use wasm_api::*;
+
 pub use api::{Capability, Error, ErrorKind, Limits, Result, Support, TransferMode};
 pub use media::{
     AudioBuffer, Codec, ColorRange, Container, PixelFormat, Plane, VideoDimensions, VideoFrame,
