@@ -286,6 +286,7 @@ pub struct ExactFrameReader {
     decode_position_by_presentation: HashMap<FrameIndex, usize>,
     cache: BTreeMap<FrameIndex, VideoFrame>,
     lru: VecDeque<FrameIndex>,
+    published_since_reset: HashSet<FrameIndex>,
     next_decode_position: Option<usize>,
     limits: Limits,
     statistics: DecodeStatistics,
@@ -340,6 +341,7 @@ impl ExactFrameReader {
             decode_position_by_presentation: positions,
             cache: BTreeMap::new(),
             lru: VecDeque::new(),
+            published_since_reset: HashSet::new(),
             next_decode_position: None,
             limits,
             statistics: DecodeStatistics::default(),
@@ -371,6 +373,7 @@ impl ExactFrameReader {
         if !can_reuse {
             self.decoder.reset()?;
             self.statistics.resets = self.statistics.resets.saturating_add(1);
+            self.published_since_reset.clear();
             self.next_decode_position = Some(random_access_position);
         }
 
@@ -421,6 +424,7 @@ impl ExactFrameReader {
         self.next_decode_position = None;
         self.cache.clear();
         self.lru.clear();
+        self.published_since_reset.clear();
         Ok(())
     }
 
@@ -449,12 +453,11 @@ impl ExactFrameReader {
     }
 
     fn publish(&mut self, outputs: Vec<DecodedVideoFrame>) -> Result<()> {
-        let mut batch = HashSet::with_capacity(outputs.len());
         for output in outputs {
-            if !batch.insert(output.presentation_index) {
+            if !self.published_since_reset.insert(output.presentation_index) {
                 return Err(Error::new(
                     ErrorKind::MalformedMedia,
-                    "decoder produced the same presentation frame more than once",
+                    "decoder produced the same presentation frame more than once without a reset",
                 ));
             }
             if !self
@@ -497,14 +500,26 @@ impl ExactFrameReader {
 }
 
 fn capability_error(capability: CodecSupport) -> Error {
-    let message = match capability {
-        CodecSupport::UnsupportedCodec => "decoder does not support the requested codec".into(),
-        CodecSupport::UnsupportedProfile => "decoder does not support the requested profile".into(),
-        CodecSupport::InvalidConfiguration { reason } => reason,
-        CodecSupport::HardwareUnavailable => "requested hardware decoder is unavailable".into(),
-        CodecSupport::Supported { .. } => "decoder capability changed unexpectedly".into(),
+    let (kind, message) = match capability {
+        CodecSupport::UnsupportedCodec => (
+            ErrorKind::Unsupported,
+            "decoder does not support the requested codec".into(),
+        ),
+        CodecSupport::UnsupportedProfile => (
+            ErrorKind::Unsupported,
+            "decoder does not support the requested profile".into(),
+        ),
+        CodecSupport::InvalidConfiguration { reason } => (ErrorKind::InvalidInput, reason),
+        CodecSupport::HardwareUnavailable => (
+            ErrorKind::Unsupported,
+            "requested hardware decoder is unavailable".into(),
+        ),
+        CodecSupport::Supported { .. } => (
+            ErrorKind::Internal,
+            "decoder capability changed unexpectedly".into(),
+        ),
     };
-    Error::new(ErrorKind::Unsupported, message)
+    Error::new(kind, message)
 }
 
 /// Returns the portable, software-only uncompressed Gray8 decoder backend.
@@ -549,6 +564,14 @@ impl VideoDecoderFactory for UncompressedVideoDecoderFactory {
         let capability = self.capability(configuration);
         if !capability.is_supported() {
             return Err(capability_error(capability));
+        }
+        if configuration.coded_dimensions.width > limits.max_width
+            || configuration.coded_dimensions.height > limits.max_height
+        {
+            return Err(Error::new(
+                ErrorKind::ResourceLimit,
+                "decoded dimensions exceed the configured limits",
+            ));
         }
         let required = u64::from(configuration.coded_dimensions.width)
             .checked_mul(u64::from(configuration.coded_dimensions.height))
@@ -672,6 +695,30 @@ mod tests {
         assert_eq!(
             factory.capability(&candidate),
             CodecSupport::HardwareUnavailable
+        );
+
+        candidate = config();
+        candidate.output_format = PixelFormat::Rgba8;
+        assert_eq!(
+            factory
+                .create(&candidate, &Limits::default())
+                .err()
+                .unwrap()
+                .kind(),
+            ErrorKind::InvalidInput
+        );
+
+        let restrictive = Limits {
+            max_width: 0,
+            ..Limits::default()
+        };
+        assert_eq!(
+            factory
+                .create(&config(), &restrictive)
+                .err()
+                .unwrap()
+                .kind(),
+            ErrorKind::ResourceLimit
         );
     }
 
@@ -879,13 +926,17 @@ mod tests {
         ) -> Result<Box<dyn VideoDecoder>> {
             let factory = UncompressedVideoDecoderFactory;
             factory.create(configuration, limits).map(|decoder| {
-                Box::new(MalformedOutputDecoder { decoder }) as Box<dyn VideoDecoder>
+                Box::new(MalformedOutputDecoder {
+                    decoder,
+                    previous: None,
+                }) as Box<dyn VideoDecoder>
             })
         }
     }
 
     struct MalformedOutputDecoder {
         decoder: Box<dyn VideoDecoder>,
+        previous: Option<FrameIndex>,
     }
 
     impl VideoDecoder for MalformedOutputDecoder {
@@ -895,7 +946,10 @@ mod tests {
             cancellation: &CancellationToken,
         ) -> Result<Vec<DecodedVideoFrame>> {
             let mut output = self.decoder.submit(sample, cancellation)?;
-            output[0].presentation_index = FrameIndex(99);
+            if let (Some(previous), Some(frame)) = (self.previous, output.first_mut()) {
+                frame.presentation_index = previous;
+            }
+            self.previous = Some(sample.presentation_index);
             Ok(output)
         }
 
@@ -904,6 +958,7 @@ mod tests {
         }
 
         fn reset(&mut self) -> Result<()> {
+            self.previous = None;
             self.decoder.reset()
         }
     }
@@ -913,12 +968,12 @@ mod tests {
         let mut reader = ExactFrameReader::new(
             &MalformedOutputFactory,
             config(),
-            vec![sample(0, 1, true)],
+            vec![sample(0, 1, true), sample(1, 2, false)],
             Limits::default(),
         )
         .unwrap();
         let error = reader
-            .get(FrameIndex(0), &CancellationToken::new())
+            .get(FrameIndex(1), &CancellationToken::new())
             .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::MalformedMedia);
     }
