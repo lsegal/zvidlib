@@ -10,6 +10,21 @@ pub enum AudioOutputKind {
     WebAudio,
 }
 
+/// Scheduling operations supplied by a native device or browser binding.
+pub trait AudioOutputBackend {
+    fn clock_samples(&self) -> u64;
+    fn start(&mut self, media_sample: u64) -> Result<()>;
+    fn schedule(&mut self, buffer: AudioBuffer, generation: u64) -> Result<()>;
+    fn cancel_queued(&mut self, generation: u64) -> Result<()>;
+    fn stop(&mut self) -> Result<()>;
+}
+
+/// Adapts a native audio-device backend to the shared playback contract.
+pub struct NativeAudioOutput<B>(pub B);
+
+/// Adapts a browser `AudioContext` backend to the shared playback contract.
+pub struct WebAudioOutput<B>(pub B);
+
 /// Native device and Web Audio implementations expose the same monotonic clock.
 pub trait PlaybackAudioOutput {
     fn kind(&self) -> AudioOutputKind;
@@ -19,6 +34,34 @@ pub trait PlaybackAudioOutput {
     fn cancel_queued(&mut self, generation: u64) -> Result<()>;
     fn stop(&mut self) -> Result<()>;
 }
+
+macro_rules! output_adapter {
+    ($adapter:ident, $kind:expr) => {
+        impl<B: AudioOutputBackend> PlaybackAudioOutput for $adapter<B> {
+            fn kind(&self) -> AudioOutputKind {
+                $kind
+            }
+            fn clock_samples(&self) -> u64 {
+                self.0.clock_samples()
+            }
+            fn start(&mut self, media_sample: u64) -> Result<()> {
+                self.0.start(media_sample)
+            }
+            fn schedule(&mut self, buffer: AudioBuffer, generation: u64) -> Result<()> {
+                self.0.schedule(buffer, generation)
+            }
+            fn cancel_queued(&mut self, generation: u64) -> Result<()> {
+                self.0.cancel_queued(generation)
+            }
+            fn stop(&mut self) -> Result<()> {
+                self.0.stop()
+            }
+        }
+    };
+}
+
+output_adapter!(NativeAudioOutput, AudioOutputKind::Native);
+output_adapter!(WebAudioOutput, AudioOutputKind::WebAudio);
 
 pub trait PlaybackAudioSource {
     fn sample_rate(&self) -> u32;
@@ -323,17 +366,13 @@ mod tests {
         }
     }
 
-    struct FixtureOutput {
-        kind: AudioOutputKind,
+    struct FixtureBackend {
         clock: Arc<Mutex<u64>>,
         scheduled: Arc<Mutex<Vec<(SampleRange, u64)>>>,
         cancelled: Arc<Mutex<Vec<u64>>>,
     }
 
-    impl PlaybackAudioOutput for FixtureOutput {
-        fn kind(&self) -> AudioOutputKind {
-            self.kind
-        }
+    impl AudioOutputBackend for FixtureBackend {
         fn clock_samples(&self) -> u64 {
             *self.clock.lock().unwrap()
         }
@@ -363,18 +402,50 @@ mod tests {
         let clock = Arc::new(Mutex::new(0));
         let scheduled = Arc::new(Mutex::new(Vec::new()));
         let cancelled = Arc::new(Mutex::new(Vec::new()));
+        let backend = FixtureBackend {
+            clock: clock.clone(),
+            scheduled: scheduled.clone(),
+            cancelled: cancelled.clone(),
+        };
+        match kind {
+            AudioOutputKind::Native => run_playback(
+                NativeAudioOutput(backend),
+                requested.clone(),
+                resets.clone(),
+                reads.clone(),
+                clock.clone(),
+            ),
+            AudioOutputKind::WebAudio => run_playback(
+                WebAudioOutput(backend),
+                requested.clone(),
+                resets.clone(),
+                reads.clone(),
+                clock.clone(),
+            ),
+        }
+        assert_eq!(&*cancelled.lock().unwrap(), &[1]);
+        assert!(
+            scheduled
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(_, generation)| *generation <= 1)
+        );
+    }
+
+    fn run_playback<O: PlaybackAudioOutput>(
+        output: O,
+        requested: Arc<Mutex<Vec<FrameIndex>>>,
+        resets: Arc<Mutex<usize>>,
+        reads: Arc<Mutex<Vec<SampleRange>>>,
+        clock: Arc<Mutex<u64>>,
+    ) {
         let video = FixtureVideo {
             requested: requested.clone(),
             resets: resets.clone(),
         };
         let audio = FixtureAudio {
             reads: reads.clone(),
-        };
-        let output = FixtureOutput {
-            kind,
-            clock: clock.clone(),
-            scheduled: scheduled.clone(),
-            cancelled: cancelled.clone(),
         };
         let timeline = Timeline::new(crate::FrameRate::new(30, 1).unwrap(), 48_000).unwrap();
         let mut playback = PlaybackController::new(
@@ -399,18 +470,10 @@ mod tests {
 
         playback.seek(FrameIndex(10)).unwrap();
         assert_eq!(*resets.lock().unwrap(), 1);
-        assert_eq!(&*cancelled.lock().unwrap(), &[1]);
         assert!(reads.lock().unwrap().contains(&SampleRange {
             start: 15_200,
             end: 16_000
         }));
-        assert!(
-            scheduled
-                .lock()
-                .unwrap()
-                .iter()
-                .all(|(_, generation)| *generation <= 1)
-        );
     }
 
     #[test]

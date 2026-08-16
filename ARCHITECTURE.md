@@ -4,7 +4,7 @@
 
 zvidlib is a Rust media library that provides frame-accurate, indexed video access and synchronized audio access for native and WebAssembly applications. The first complete vertical slice will read and write MP4-family containers carrying HEVC/H.265 or AV1 video and AAC audio, and transfer images through CPU memory, OpenGL, or WebGL.
 
-This document is primarily a design contract. The repository implements the portable foundation—errors, limits, capability values, rational timeline arithmetic, synchronized audio intervals, validated CPU media buffers, byte I/O, normalized codec factories, bounded exact-frame decoding with a portable conformance backend, encoder contracts, CPU/GL/WebGL transfer contracts, strict synchronized indexed output, and deterministic seekable MP4 muxing—while MP4 parsing, production compressed-codec backends, playback, and browser session layers remain planned.
+This document is primarily a design contract. The repository implements the portable foundation—errors, limits, capability values, rational timeline arithmetic, synchronized audio intervals, validated CPU media buffers, byte I/O, normalized codec factories, bounded exact-frame video decoding with a portable conformance backend, exact AAC packet/sample reads, audio-clock playback control and native/Web Audio adapter contracts, encoder contracts, CPU/GL/WebGL transfer contracts, strict synchronized indexed output, and deterministic seekable MP4 muxing—while MP4 parsing, production compressed-codec and audio-device bindings, and browser session layers remain planned.
 
 The design is governed by these constraints:
 
@@ -190,8 +190,8 @@ src/
   codec/        traits, registry, normalized configuration
   transfer/     CPU conversion and graphics-neutral contracts
   platform/
-    native/     native storage, runtime, codec, GL and audio adapters
-    web/        browser storage, WebCodecs, WebGL and Web Audio adapters
+    native/     native storage, runtime, codec, GL and audio bindings
+    web/        browser storage, WebCodecs, WebGL and Web Audio bindings
   wasm_api/     JavaScript-facing wrappers and type conversion
 ```
 

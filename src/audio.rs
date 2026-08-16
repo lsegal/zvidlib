@@ -97,7 +97,14 @@ impl<D: AacDecoder> AacSampleReader<D> {
             }
             .ok_or_else(|| invalid("track offset exceeds gapless audio duration"))?
         } else {
-            timing.edits.last().map_or(0, |edit| edit.presentation.end)
+            timing.edits.iter().try_fold(0, |length, edit| {
+                Ok::<_, Error>(
+                    length.max(
+                        shifted_edit(*edit, timing.track_offset)?
+                            .map_or(0, |shifted| shifted.presentation.end),
+                    ),
+                )
+            })?
         };
         Ok(Self {
             decoder,
@@ -142,6 +149,12 @@ impl<D: AacDecoder> AacSampleReader<D> {
             .len()
             .checked_mul(u64::from(self.channels))
             .ok_or_else(|| limit("audio request size overflow"))?;
+        let bytes = sample_count
+            .checked_mul(std::mem::size_of::<f32>() as u64)
+            .ok_or_else(|| limit("audio request allocation overflow"))?;
+        if bytes > self.limits.max_allocation_bytes {
+            return Err(limit("audio request exceeds the allocation limit"));
+        }
         let mut output = vec![
             0.0;
             usize::try_from(sample_count)
@@ -183,14 +196,20 @@ impl<D: AacDecoder> AacSampleReader<D> {
                 .ok_or_else(|| limit("audio media offset overflow"))?;
             let playable_end = self.decoded_length - u64::from(self.timing.padding);
             let length = playable_end.saturating_sub(media_start);
+            let presentation_end = presentation_start
+                .checked_add(length)
+                .ok_or_else(|| limit("audio presentation range overflow"))?;
             push_intersection(
                 &mut mappings,
                 request,
-                SampleRange::new(presentation_start, presentation_start + length)?,
+                SampleRange::new(presentation_start, presentation_end)?,
                 Some(media_start),
             )?;
         } else {
             for edit in &self.timing.edits {
+                let Some(edit) = shifted_edit(*edit, self.timing.track_offset)? else {
+                    continue;
+                };
                 push_intersection(&mut mappings, request, edit.presentation, edit.media_start)?;
             }
         }
@@ -212,6 +231,13 @@ impl<D: AacDecoder> AacSampleReader<D> {
             .iter()
             .rposition(|packet| packet.decoded_range.start < range.end)
             .ok_or_else(|| invalid("audio edit maps before decoded AAC samples"))?;
+        let decode_start = first.saturating_sub(self.preroll_packets);
+        let decode_work = last - decode_start + 1;
+        if decode_work > self.limits.max_decode_samples_per_seek as usize {
+            return Err(limit(
+                "AAC request exceeded the configured decode-work limit",
+            ));
+        }
         if (first..=last).all(|index| {
             self.decoded
                 .contains_key(&self.packets[index].decoded_range.start)
@@ -219,7 +245,8 @@ impl<D: AacDecoder> AacSampleReader<D> {
             return Ok(());
         }
         self.decoder.reset()?;
-        for index in first.saturating_sub(self.preroll_packets)..=last {
+        self.decoded.clear();
+        for index in decode_start..=last {
             if cancellation.is_cancelled() {
                 return Err(cancelled());
             }
@@ -304,10 +331,13 @@ fn push_intersection(
     }
     let media = media_start
         .map(|base| {
-            SampleRange::new(
-                base + start - presentation.start,
-                base + end - presentation.start,
-            )
+            let source_start = base
+                .checked_add(start - presentation.start)
+                .ok_or_else(|| limit("audio edit mapping overflow"))?;
+            let source_end = base
+                .checked_add(end - presentation.start)
+                .ok_or_else(|| limit("audio edit mapping overflow"))?;
+            SampleRange::new(source_start, source_end)
         })
         .transpose()?;
     out.push(Mapping {
@@ -340,6 +370,34 @@ fn validate_edits(timing: &AudioTrackTiming, decoded_length: u64) -> Result<()> 
         end = edit.presentation.end;
     }
     Ok(())
+}
+
+fn shifted_edit(edit: AudioEdit, offset: i64) -> Result<Option<AudioEdit>> {
+    let shifted_start = i128::from(edit.presentation.start) + i128::from(offset);
+    let shifted_end = i128::from(edit.presentation.end) + i128::from(offset);
+    if shifted_end <= 0 {
+        return Ok(None);
+    }
+    let clipped = shifted_start.min(0).unsigned_abs();
+    let start = u64::try_from(shifted_start.max(0))
+        .map_err(|_| limit("shifted audio edit start cannot be represented"))?;
+    let end = u64::try_from(shifted_end)
+        .map_err(|_| limit("shifted audio edit end cannot be represented"))?;
+    let media_start = edit
+        .media_start
+        .map(|value| {
+            value
+                .checked_add(
+                    u64::try_from(clipped)
+                        .map_err(|_| limit("shifted audio edit clip cannot be represented"))?,
+                )
+                .ok_or_else(|| limit("shifted audio edit media offset overflow"))
+        })
+        .transpose()?;
+    Ok(Some(AudioEdit {
+        presentation: SampleRange::new(start, end)?,
+        media_start,
+    }))
 }
 
 fn invalid(message: &str) -> Error {
@@ -426,7 +484,7 @@ mod tests {
         let timing = AudioTrackTiming {
             priming: 1,
             padding: 1,
-            track_offset: 0,
+            track_offset: 1,
             edits: vec![
                 AudioEdit {
                     presentation: SampleRange::new(0, 2).unwrap(),
@@ -449,9 +507,9 @@ mod tests {
         )
         .unwrap();
         let buffer = reader
-            .get_range(SampleRange::new(0, 5).unwrap(), &CancellationToken::new())
+            .get_range(SampleRange::new(0, 6).unwrap(), &CancellationToken::new())
             .unwrap();
-        assert_eq!(buffer.samples, vec![0.0, 0.0, 4.0, 5.0, 6.0]);
+        assert_eq!(buffer.samples, vec![0.0, 0.0, 0.0, 4.0, 5.0, 6.0]);
     }
 
     #[test]

@@ -31,8 +31,9 @@ pub use media::{
 };
 pub use output::{MediaOutput, OutputOptions};
 pub use playback::{
-    AudioOutputKind, PlaybackAudioOutput, PlaybackAudioSource, PlaybackController, PlaybackOptions,
-    PlaybackVideoSource, Presentation,
+    AudioOutputBackend, AudioOutputKind, NativeAudioOutput, PlaybackAudioOutput,
+    PlaybackAudioSource, PlaybackController, PlaybackOptions, PlaybackVideoSource, Presentation,
+    WebAudioOutput,
 };
 pub use timeline::{FrameIndex, FrameRate, Rational, SampleRange, Timeline};
 pub use transfer::{
