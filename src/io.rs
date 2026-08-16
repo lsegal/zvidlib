@@ -19,8 +19,14 @@ pub trait ByteSource {
 /// An asynchronous sequential byte sink with optional seek support.
 pub trait ByteSink {
     fn position(&self) -> u64;
+    fn is_seekable(&self) -> bool {
+        true
+    }
     fn write<'a>(&'a mut self, bytes: &'a [u8]) -> IoFuture<'a, ()>;
     fn seek<'a>(&'a mut self, position: u64) -> IoFuture<'a, ()>;
+    fn flush<'a>(&'a mut self) -> IoFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 /// An owned in-memory source useful for portable callers and deterministic tests.

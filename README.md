@@ -2,7 +2,7 @@
 
 zvidlib is a Rust library under active development for frame-accurate video and synchronized audio I/O on native and WebAssembly targets. Its primary jobs are reading an MP4 into a GL/WebGL canvas and writing canvas frames plus an audio stream into an MP4, behind a small API centered on indexed `get` and `put` operations.
 
-> **Project status:** the portable foundation and browser WebAssembly boundary are implemented. The generated JavaScript package includes BigInt-safe timeline values, owned CPU media values, stable errors, Blob/stream input, Blob output, and session/stream/playback handles. MP4, codec, graphics, playback, and recording backends remain planned, so backend-dependent operations currently reject with `UNSUPPORTED`. The complete workflow interfaces below remain intentionally aspirational and may change before the first release.
+> **Project status:** the portable foundation now includes checked timeline arithmetic, validated media buffers, asynchronous byte I/O, CPU/GL/WebGL transfer contracts, encoder contracts, strict indexed output, seekable MP4 muxing, and the browser WebAssembly boundary. The generated JavaScript package includes BigInt-safe values, stable errors, Blob/stream input, Blob output, and session/stream/playback handles. MP4 reading, codec backends, and playback adapters remain planned, so backend-dependent JavaScript operations currently reject with `UNSUPPORTED`. The complete workflow interfaces below remain intentionally aspirational and may change before the first release.
 
 ## Goals
 
@@ -254,6 +254,8 @@ document.body.append(link);
 
 JavaScript frame indices are `BigInt` so the wrapper can preserve the Rust `u64` range. Both writers reject skipped or repeated indices by default, and `finish()` is required to drain codecs and finalize the MP4.
 
+The implemented portable writer core exposes `VideoEncoder` and `AudioEncoder` contracts plus `MediaOutput`. An encoder backend declares its MP4 codec configuration and exact output timescale, then returns `EncodedSample` values with DTS, PTS, duration, sync, and dependency metadata. `MediaOutput::put_video` accepts the shared CPU/GL/WebGL `FrameSource`; it and `put_audio` enforce zero-based consecutive indices and exact frame-aligned audio ranges. `finish` drains both encoders, records audio priming and padding in an edit list, finalizes sample indexes, and flushes the seekable `ByteSink`.
+
 Frame indices are zero-based. A video `get(n)` returns exactly frame `n` in presentation order, not merely the nearest keyframe. The matching audio `get(n)` returns the half-open sample interval covered by video frame `n`; sample-accurate APIs will also be available for audio-only use.
 
 ## Data paths
@@ -281,7 +283,7 @@ Codec and hardware availability varies by browser and operating system. Opening 
 
 ## Repository layout
 
-The repository contains a dependency-free portable core that validates native and WASM build configuration while implementing the first architecture layer. Planned modules and dependency boundaries are described in [ARCHITECTURE.md](ARCHITECTURE.md). Runtime dependencies will be added only with a documented portability, maintenance, size, and licensing rationale.
+The repository contains a dependency-free portable core that validates native and WASM build configuration and implements the foundational timeline, media, I/O, frame-transfer, encoder, indexed-output, and seekable MP4 writing layers. Planned modules and dependency boundaries are described in [ARCHITECTURE.md](ARCHITECTURE.md). Runtime dependencies will be added only with a documented portability, maintenance, size, and licensing rationale.
 
 ## Building the library
 
@@ -294,7 +296,7 @@ cargo fmt --all -- --check
 cargo clippy --all-targets --features native -- -D warnings
 ```
 
-These commands validate the portable core on both targets. They do not yet produce an end-to-end media reader or writer.
+These commands validate the portable core on both targets. No concrete video or audio codec backend is bundled yet, so they do not by themselves produce an end-to-end media reader or encoded recording.
 
 ## Building, testing, and using WebAssembly
 
