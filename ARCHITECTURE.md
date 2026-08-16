@@ -4,7 +4,7 @@
 
 zvidlib is a Rust media library that provides frame-accurate, indexed video access and synchronized audio access for native and WebAssembly applications. The first complete vertical slice will read and write MP4-family containers carrying HEVC/H.265 or AV1 video and AAC audio, and transfer images through CPU memory, OpenGL, or WebGL.
 
-This document is primarily a design contract. The repository implements the portable foundation—errors, limits, capability values, rational timeline arithmetic, synchronized audio intervals, validated CPU media buffers, byte I/O and encoder contracts, CPU/GL/WebGL transfer contracts, bounded ordinary/fragmented MP4 sample indexing, strict synchronized indexed output, and deterministic seekable MP4 muxing—while concrete codec backends, playback, and browser session layers remain planned.
+This document is primarily a design contract. The repository implements the portable foundation—errors, limits, capability values, rational timeline arithmetic, synchronized audio intervals, validated CPU media buffers, byte I/O, bounded ordinary/fragmented MP4 sample indexing, normalized codec factories, bounded exact-frame decoding with a portable conformance backend, encoder contracts, CPU/GL/WebGL transfer contracts, strict synchronized indexed output, and deterministic seekable MP4 muxing—while production compressed-codec backends and playback remain planned.
 
 The design is governed by these constraints:
 
@@ -158,13 +158,15 @@ Recording adapters timestamp canvas captures and Web Audio/native audio buffers 
 
 Portable core modules avoid operating-system handles, blocking I/O, native threads, and JavaScript types. Platform modules implement storage, task spawning, clocks, codec factories, and graphics transfer.
 
-The JavaScript package will expose classes mirroring Rust sessions and streams. Boundary rules include:
+The `web` feature exposes classes mirroring Rust sessions, streams, options, and media values through `wasm-bindgen`. Boundary rules include:
 
 - 64-bit frame and timestamp values use `BigInt` or validated safe-number conversions;
 - async Rust operations become cancellable Promises where feasible;
-- CPU frames can expose typed-array views only while backing memory is pinned and valid;
+- CPU frames and audio buffers cross the boundary as owned copies; returned typed arrays are snapshots rather than views into growable WASM memory;
 - browser objects such as `Blob`, `ReadableStream`, `VideoFrame`, WebGL contexts, and audio buffers remain platform adapter values;
 - Rust errors become stable JavaScript error codes plus human-readable context.
+
+Blob and buffer inputs are copied into WASM-owned storage. `ReadableStream<Uint8Array>` inputs are consumed with a bounded allocation, release their reader locks, and can be cancelled with `AbortSignal`. Finalized browser output is copied into a browser-owned `Blob`. Session and stream handles are present even when a backend is unavailable; such operations reject with `UNSUPPORTED` instead of returning placeholder media.
 
 The base WASM build does not require threads. Optional worker/thread acceleration must account for cross-origin isolation, shared memory availability, and object transfer rules. Feature selection must prevent native-only dependencies from compiling into browser builds.
 

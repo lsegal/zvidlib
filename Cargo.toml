@@ -16,6 +16,25 @@ crate-type = ["rlib", "cdylib"]
 [features]
 default = []
 native = []
-web = []
+web = [
+    "dep:js-sys",
+    "dep:wasm-bindgen",
+    "dep:wasm-bindgen-futures",
+    "dep:web-sys",
+]
 
 [dependencies]
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = { version = "0.3.104", optional = true }
+wasm-bindgen = { version = "0.2.127", optional = true }
+wasm-bindgen-futures = { version = "0.4.77", optional = true }
+web-sys = { version = "0.3.104", optional = true, features = [
+    "AbortController",
+    "AbortSignal",
+    "Blob",
+    "ReadableStream",
+] }
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3.77"

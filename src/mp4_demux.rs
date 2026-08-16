@@ -639,6 +639,11 @@ fn parse_stsd(
         Codec::Hevc => b"hvcC",
         Codec::Av1 => b"av1C",
         Codec::Aac => b"esds",
+        Codec::UncompressedVideo => {
+            return Err(unsupported(
+                "uncompressed MP4 sample entries are not supported",
+            ));
+        }
     };
     let nested = children(&entry.payload[prefix..], 7, budget, options)?;
     let config = nested
