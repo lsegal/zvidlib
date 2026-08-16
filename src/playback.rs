@@ -266,6 +266,10 @@ impl<V: PlaybackVideoSource, A: PlaybackAudioSource, O: PlaybackAudioOutput>
         let target = now
             .saturating_add(self.options.schedule_ahead_samples)
             .min(self.audio.presentation_length());
+        if self.queued_until < now {
+            // Do not enqueue audio whose clock deadline has already passed.
+            self.queued_until = now;
+        }
         if self.queued_until
             < self
                 .media_anchor
@@ -467,6 +471,10 @@ mod tests {
         assert_eq!(presentation.frame, Some(FrameIndex(2)));
         assert!(frame.is_some());
         assert_eq!(&*requested.lock().unwrap(), &[FrameIndex(2)]);
+        assert!(reads.lock().unwrap().contains(&SampleRange {
+            start: 3_300,
+            end: 6_500
+        }));
 
         playback.seek(FrameIndex(10)).unwrap();
         assert_eq!(*resets.lock().unwrap(), 1);
