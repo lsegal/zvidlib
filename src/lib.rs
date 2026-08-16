@@ -9,19 +9,24 @@ pub mod api;
 pub mod codec;
 pub mod io;
 pub mod media;
+pub mod mp4;
+pub mod output;
 pub mod timeline;
 pub mod transfer;
 
 pub use api::{Capability, Error, ErrorKind, Limits, Result, Support, TransferMode};
 pub use codec::{
-    CancellationToken, CodecImplementation, CodecProfile, CodecSupport, DecodeStatistics,
-    DecodedVideoFrame, EncodedVideoSample, ExactFrameReader, HardwarePreference, VideoDecoder,
-    VideoDecoderConfig, VideoDecoderFactory, VideoEncoder, VideoEncoderConfig, VideoEncoderFactory,
+    AudioDrain, AudioEncoder, AudioEncoderFormat, AudioGapless, CancellationToken,
+    CodecImplementation, CodecProfile, CodecSupport, DecodeStatistics, DecodedVideoFrame,
+    EncodedSample, EncodedVideoSample, EncoderConfig, EncoderFuture, ExactFrameReader,
+    HardwarePreference, SampleDependency, TrackKind, VideoDecoder, VideoDecoderConfig,
+    VideoDecoderFactory, VideoEncoder, VideoEncoderConfig, VideoEncoderFactory, VideoEncoderFormat,
     uncompressed_video_decoder_factory,
 };
 pub use media::{
     AudioBuffer, Codec, ColorRange, Container, PixelFormat, Plane, VideoDimensions, VideoFrame,
 };
+pub use output::{MediaOutput, OutputOptions};
 pub use timeline::{FrameIndex, FrameRate, Rational, SampleRange, Timeline};
 pub use transfer::{
     ColorConversion, ContextIdentity, CpuFrameDestination, CpuFrameSource, CpuPlaneDestination,
