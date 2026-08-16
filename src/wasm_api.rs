@@ -252,7 +252,8 @@ impl WasmFrameIndex {
         bigint_u64(self.0.0)
     }
 
-    pub fn to_string(&self) -> String {
+    #[wasm_bindgen(js_name = toString)]
+    pub fn as_string(&self) -> String {
         self.0.0.to_string()
     }
 }
@@ -1021,7 +1022,10 @@ mod tests {
         assert_eq!(parse_u64(&index.value(), "frame").unwrap(), u64::MAX);
 
         let unsafe_number = JsValue::from_f64(MAX_SAFE_INTEGER as f64 + 1.0);
-        let error = WasmFrameIndex::new(unsafe_number).unwrap_err();
+        let error = match WasmFrameIndex::new(unsafe_number) {
+            Err(error) => error,
+            Ok(_) => panic!("an unsafe integer must be rejected"),
+        };
         assert_error_code(&error, "INVALID_INPUT");
     }
 
@@ -1074,7 +1078,10 @@ mod tests {
             Some(signal),
         );
         controller.abort();
-        let error = pending.await.unwrap_err();
+        let error = match pending.await {
+            Err(error) => error,
+            Ok(_) => panic!("an aborted stream must not open successfully"),
+        };
         assert_error_code(&error, "CANCELLED");
     }
 
@@ -1124,8 +1131,8 @@ mod tests {
         };
         playback.close();
         assert_eq!(
-            Reflect::get(&object, &"closed".into()).unwrap(),
-            false.into()
+            Reflect::get(&object, &"closed".into()).unwrap().as_bool(),
+            Some(false)
         );
     }
 }
