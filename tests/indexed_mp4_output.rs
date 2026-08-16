@@ -10,6 +10,10 @@ use zvidlib::{
     MediaOutput, OutputOptions, PixelFormat, Plane, SampleDependency, SampleRange, Timeline,
     VideoDimensions, VideoEncoder, VideoEncoderFormat, VideoFrame,
 };
+use zvidlib::{
+    ContextIdentity, CpuFrameSource, ExecutionOwner, FrameSource, GraphicsApi, GraphicsResource,
+    Orientation, ResourceKind, ResourceOwnership,
+};
 
 fn block_on<T>(future: impl Future<Output = T>) -> T {
     let waker = Waker::noop();
@@ -57,8 +61,6 @@ impl DelayedVideoEncoder {
 }
 
 impl VideoEncoder for DelayedVideoEncoder {
-    type Frame = VideoFrame;
-
     fn config(&self) -> &EncoderConfig {
         &self.config
     }
@@ -70,12 +72,14 @@ impl VideoEncoder for DelayedVideoEncoder {
     fn encode<'a>(
         &'a mut self,
         index: FrameIndex,
-        frame: Self::Frame,
+        frame: FrameSource<'a>,
     ) -> EncoderFuture<'a, Vec<EncodedSample>> {
         Box::pin(async move {
-            if frame.dimensions != self.format.dimensions
-                || frame.pixel_format != self.format.pixel_format
-            {
+            let (dimensions, pixel_format) = match frame {
+                FrameSource::Cpu(source) => (source.frame.dimensions, source.frame.pixel_format),
+                FrameSource::Graphics(resource) => (resource.dimensions(), resource.pixel_format()),
+            };
+            if dimensions != self.format.dimensions || pixel_format != self.format.pixel_format {
                 return Err(Error::new(
                     ErrorKind::InvalidInput,
                     "video frame format changed",
@@ -210,6 +214,28 @@ fn frame(dimensions: VideoDimensions, value: u8) -> VideoFrame {
     .unwrap()
 }
 
+fn cpu_source(frame: &VideoFrame) -> FrameSource<'_> {
+    FrameSource::Cpu(CpuFrameSource {
+        frame,
+        orientation: Orientation::TopLeft,
+    })
+}
+
+fn webgl_source(dimensions: VideoDimensions) -> FrameSource<'static> {
+    FrameSource::Graphics(GraphicsResource::new(
+        GraphicsApi::WebGl,
+        ContextIdentity(7),
+        ExecutionOwner(9),
+        ResourceKind::Framebuffer,
+        42,
+        dimensions,
+        PixelFormat::Gray8,
+        ColorRange::Full,
+        Orientation::BottomLeft,
+        ResourceOwnership::Caller,
+    ))
+}
+
 fn audio(range: SampleRange) -> AudioBuffer {
     AudioBuffer::new(
         range,
@@ -280,14 +306,18 @@ fn synchronized_output_round_trips_exact_mp4_indexes() {
         .await
         .unwrap();
 
-        let skipped = output.put_video(FrameIndex(1), frame(dimensions, 1)).await;
+        let skipped = output
+            .put_video(FrameIndex(1), cpu_source(&frame(dimensions, 1)))
+            .await;
         assert_eq!(skipped.unwrap_err().kind(), ErrorKind::InvalidInput);
 
         output
-            .put_video(FrameIndex(0), frame(dimensions, 1))
+            .put_video(FrameIndex(0), cpu_source(&frame(dimensions, 1)))
             .await
             .unwrap();
-        let repeated = output.put_video(FrameIndex(0), frame(dimensions, 1)).await;
+        let repeated = output
+            .put_video(FrameIndex(0), cpu_source(&frame(dimensions, 1)))
+            .await;
         assert_eq!(repeated.unwrap_err().kind(), ErrorKind::InvalidInput);
 
         let first_audio = timeline.audio_interval_for_frame(FrameIndex(0)).unwrap();
@@ -296,7 +326,7 @@ fn synchronized_output_round_trips_exact_mp4_indexes() {
             .await
             .unwrap();
         output
-            .put_video(FrameIndex(1), frame(dimensions, 2))
+            .put_video(FrameIndex(1), webgl_source(dimensions))
             .await
             .unwrap();
         let second_audio = timeline.audio_interval_for_frame(FrameIndex(1)).unwrap();
@@ -374,7 +404,7 @@ fn incompatible_audio_and_unsynchronized_finish_are_rejected() {
         .await
         .unwrap();
         output
-            .put_video(FrameIndex(0), frame(dimensions, 1))
+            .put_video(FrameIndex(0), cpu_source(&frame(dimensions, 1)))
             .await
             .unwrap();
         let range = timeline.audio_interval_for_frame(FrameIndex(0)).unwrap();
@@ -464,7 +494,7 @@ fn sink_backpressure_and_flush_errors_reach_the_caller() {
         .await
         .unwrap();
         output
-            .put_video(FrameIndex(0), frame(dimensions, 1))
+            .put_video(FrameIndex(0), cpu_source(&frame(dimensions, 1)))
             .await
             .unwrap();
         let error = output

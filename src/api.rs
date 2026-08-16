@@ -72,6 +72,7 @@ pub enum TransferMode {
     Shared,
     GpuCopy,
     CpuCopy,
+    Unsupported,
 }
 
 /// A named feature and its runtime support state.

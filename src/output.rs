@@ -3,6 +3,7 @@
 use crate::codec::{AudioEncoder, VideoEncoder};
 use crate::io::ByteSink;
 use crate::mp4::{Mp4Muxer, Mp4TrackConfig, Mp4TrackFormat};
+use crate::transfer::FrameSource;
 use crate::{AudioBuffer, Error, ErrorKind, FrameIndex, Result, Timeline};
 
 /// Resource policy for a seekable output session.
@@ -100,7 +101,11 @@ where
     }
 
     /// Encodes exactly the next presentation-order video frame.
-    pub async fn put_video(&mut self, index: FrameIndex, frame: V::Frame) -> Result<()> {
+    pub async fn put_video<'a>(
+        &'a mut self,
+        index: FrameIndex,
+        frame: FrameSource<'a>,
+    ) -> Result<()> {
         self.ensure_healthy()?;
         check_index("video", self.next_video, index)?;
         let samples = match self.video.encode(index, frame).await {

@@ -12,14 +12,21 @@ pub mod media;
 pub mod mp4;
 pub mod output;
 pub mod timeline;
+pub mod transfer;
 
 pub use api::{Capability, Error, ErrorKind, Limits, Result, Support, TransferMode};
 pub use codec::{
-    AudioDrain, AudioEncoder, AudioEncoderFormat, AudioGapless, CpuVideoEncoder, EncodedSample,
-    EncoderConfig, EncoderFuture, SampleDependency, TrackKind, VideoEncoder, VideoEncoderFormat,
+    AudioDrain, AudioEncoder, AudioEncoderFormat, AudioGapless, EncodedSample, EncoderConfig,
+    EncoderFuture, SampleDependency, TrackKind, VideoEncoder, VideoEncoderFormat,
 };
 pub use media::{
     AudioBuffer, Codec, ColorRange, Container, PixelFormat, Plane, VideoDimensions, VideoFrame,
 };
 pub use output::{MediaOutput, OutputOptions};
 pub use timeline::{FrameIndex, FrameRate, Rational, SampleRange, Timeline};
+pub use transfer::{
+    ColorConversion, ContextIdentity, CpuFrameDestination, CpuFrameSource, CpuPlaneDestination,
+    ExecutionOwner, FrameDestination, FrameSource, GraphicsAdapter, GraphicsApi, GraphicsResource,
+    Orientation, ResourceKind, ResourceOwnership, ScaleFilter, TransferCapability, TransferPolicy,
+    TransferStage, execute_transfer, inspect_transfer,
+};

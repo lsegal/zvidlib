@@ -1,6 +1,7 @@
+use crate::Result;
 use crate::media::{AudioBuffer, Codec, PixelFormat, VideoDimensions};
 use crate::timeline::FrameIndex;
-use crate::{Result, VideoFrame};
+use crate::transfer::FrameSource;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -96,25 +97,18 @@ pub struct AudioDrain {
 
 /// Backend-neutral video encoder contract.
 ///
-/// The associated frame type lets CPU, GL, and WebGL transfer backends feed
-/// their native frame source without exposing those handles to the muxer.
+/// CPU, GL, and WebGL sources share the validated transfer-layer frame source
+/// while remaining opaque to the muxer.
 pub trait VideoEncoder {
-    type Frame;
-
     fn config(&self) -> &EncoderConfig;
     fn format(&self) -> VideoEncoderFormat;
     fn encode<'a>(
         &'a mut self,
         index: FrameIndex,
-        frame: Self::Frame,
+        frame: FrameSource<'a>,
     ) -> EncoderFuture<'a, Vec<EncodedSample>>;
     fn finish<'a>(&'a mut self) -> EncoderFuture<'a, Vec<EncodedSample>>;
 }
-
-/// Convenience contract for encoders that consume portable CPU frames.
-pub trait CpuVideoEncoder: VideoEncoder<Frame = VideoFrame> {}
-
-impl<T: VideoEncoder<Frame = VideoFrame>> CpuVideoEncoder for T {}
 
 /// Backend-neutral audio encoder contract.
 pub trait AudioEncoder {
