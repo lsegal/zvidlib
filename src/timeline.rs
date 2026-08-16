@@ -202,6 +202,31 @@ impl Timeline {
 
         SampleRange::new(boundary(frame.0)?, boundary(next_frame)?)
     }
+
+    /// Returns the presentation frame containing an audio sample boundary.
+    ///
+    /// This is the inverse of [`Self::audio_interval_for_frame`] using floor
+    /// rounding, so playback driven by an audio clock never selects a future
+    /// frame.
+    pub fn frame_for_audio_sample(self, sample: u64) -> Result<FrameIndex> {
+        let rate = self.frame_rate.as_rational();
+        let numerator = u128::try_from(rate.numerator())
+            .map_err(|_| invalid_timeline("a frame rate must be positive"))?;
+        let denominator = u128::try_from(rate.denominator())
+            .map_err(|_| invalid_timeline("a frame-rate denominator must be positive"))?;
+        let divisor = u128::from(self.audio_sample_rate)
+            .checked_mul(denominator)
+            .ok_or_else(|| timeline_overflow("mapping an audio sample to a frame"))?;
+        let frame = u128::from(sample)
+            .checked_add(1)
+            .and_then(|value| value.checked_mul(numerator))
+            .and_then(|value| value.checked_sub(1))
+            .ok_or_else(|| timeline_overflow("mapping an audio sample to a frame"))?
+            / divisor;
+        Ok(FrameIndex(
+            u64::try_from(frame).map_err(|_| timeline_overflow("storing a frame index"))?,
+        ))
+    }
 }
 
 fn gcd(mut left: u128, mut right: u128) -> u128 {
@@ -299,5 +324,19 @@ mod tests {
             .audio_interval_for_frame(FrameIndex(u64::MAX))
             .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::ResourceLimit);
+    }
+
+    #[test]
+    fn audio_clock_mapping_selects_the_containing_frame() {
+        let timeline = Timeline::new(FrameRate::new(30_000, 1_001).unwrap(), 48_000).unwrap();
+        assert_eq!(timeline.frame_for_audio_sample(0).unwrap(), FrameIndex(0));
+        assert_eq!(
+            timeline.frame_for_audio_sample(1_600).unwrap(),
+            FrameIndex(0)
+        );
+        assert_eq!(
+            timeline.frame_for_audio_sample(1_601).unwrap(),
+            FrameIndex(1)
+        );
     }
 }

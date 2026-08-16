@@ -7,12 +7,14 @@
 //! values into the common API.
 
 pub mod api;
+pub mod audio;
 pub mod codec;
 pub mod io;
 pub mod media;
 pub mod mp4;
 pub mod mp4_demux;
 pub mod output;
+pub mod playback;
 pub mod timeline;
 pub mod transfer;
 
@@ -23,6 +25,7 @@ mod wasm_api;
 pub use wasm_api::*;
 
 pub use api::{Capability, Error, ErrorKind, Limits, Result, Support, TransferMode};
+pub use audio::{AacDecoder, AacSampleReader, AudioEdit, AudioTrackTiming, EncodedAudioSample};
 pub use codec::{
     AudioDrain, AudioEncoder, AudioEncoderFormat, AudioGapless, CancellationToken,
     CodecImplementation, CodecProfile, CodecSupport, DecodeStatistics, DecodedVideoFrame,
@@ -36,6 +39,11 @@ pub use media::{
 };
 pub use mp4_demux::{EditMapping, Mp4Demuxer, Mp4DemuxerOptions, Mp4Sample, Mp4Track, probe_mp4};
 pub use output::{MediaOutput, OutputOptions};
+pub use playback::{
+    AudioOutputBackend, AudioOutputKind, NativeAudioOutput, PlaybackAudioOutput,
+    PlaybackAudioSource, PlaybackController, PlaybackOptions, PlaybackVideoSource, Presentation,
+    WebAudioOutput,
+};
 pub use timeline::{FrameIndex, FrameRate, Rational, SampleRange, Timeline};
 pub use transfer::{
     ColorConversion, ContextIdentity, CpuFrameDestination, CpuFrameSource, CpuPlaneDestination,

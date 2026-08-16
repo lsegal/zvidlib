@@ -4,6 +4,7 @@ All notable changes to zvidlib will be documented in this file.
 
 ## Unreleased
 
+- Add exact AAC sample-range reads with gapless/edit mapping and audio-clock-driven native/Web Audio playback synchronization with cancellable seek preroll.
 - Add bounded incremental MP4 probing and read-only ordinary/fragmented sample indexes with decode and presentation timing, byte ranges, dependencies, edits, and codec configuration.
 - Add the browser WebAssembly package with BigInt-safe timeline values, stable JavaScript errors, cancellable Blob and stream input, owned typed-array media values, stream and playback handles, and Blob output.
 - Add normalized video codec factories and a bounded exact-frame decoder path with presentation-order reordering, cancellation, and a portable uncompressed conformance backend.
