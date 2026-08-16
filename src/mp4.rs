@@ -201,6 +201,11 @@ fn validate_track_config(config: &Mp4TrackConfig) -> Result<()> {
         return Err(invalid("codec configuration box size is inconsistent"));
     }
     let expected_config = match config.encoder.codec {
+        Codec::UncompressedVideo => {
+            return Err(invalid(
+                "the uncompressed conformance codec is not an MP4 output codec",
+            ));
+        }
         Codec::Hevc => b"hvcC",
         Codec::Av1 => b"av1C",
         Codec::Aac => b"esds",
@@ -477,6 +482,11 @@ fn video_sample_entry(track: &TrackState, dimensions: VideoDimensions) -> Result
     body.extend_from_slice(&track.config.encoder.decoder_config);
     make_box(
         match track.config.encoder.codec {
+            Codec::UncompressedVideo => {
+                return Err(internal(
+                    "uncompressed conformance codec used for an MP4 video sample entry",
+                ));
+            }
             Codec::Hevc => *b"hvc1",
             Codec::Av1 => *b"av01",
             Codec::Aac => return Err(internal("AAC used for a video sample entry")),
