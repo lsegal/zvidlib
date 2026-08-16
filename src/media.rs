@@ -11,6 +11,7 @@ pub enum Container {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[non_exhaustive]
 pub enum Codec {
+    UncompressedVideo,
     Hevc,
     Av1,
     Aac,

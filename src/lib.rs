@@ -6,12 +6,19 @@
 //! these types without leaking platform-specific values into the common API.
 
 pub mod api;
+pub mod codec;
 pub mod io;
 pub mod media;
 pub mod timeline;
 pub mod transfer;
 
 pub use api::{Capability, Error, ErrorKind, Limits, Result, Support, TransferMode};
+pub use codec::{
+    CancellationToken, CodecImplementation, CodecProfile, CodecSupport, DecodeStatistics,
+    DecodedVideoFrame, EncodedVideoSample, ExactFrameReader, HardwarePreference, VideoDecoder,
+    VideoDecoderConfig, VideoDecoderFactory, VideoEncoder, VideoEncoderConfig, VideoEncoderFactory,
+    uncompressed_video_decoder_factory,
+};
 pub use media::{
     AudioBuffer, Codec, ColorRange, Container, PixelFormat, Plane, VideoDimensions, VideoFrame,
 };
