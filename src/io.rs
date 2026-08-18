@@ -17,6 +17,15 @@ pub trait ByteSource {
 }
 
 /// An asynchronous sequential byte sink with optional seek support.
+///
+/// `is_seekable()` defaults to `true`, so implementers that cannot seek
+/// (e.g. a streaming HTTP upload or a pipe) must override it to return
+/// `false` *and* make `seek()` reject every call with
+/// [`ErrorKind::Unsupported`]. Callers that require a seekable sink, such as
+/// [`crate::mp4::Mp4Muxer`], check `is_seekable()` up front and never call
+/// `seek()` on a sink that reports `false`; a non-seekable sink's `seek()`
+/// implementation exists only to fail safely if that contract is ever
+/// violated.
 pub trait ByteSink {
     fn position(&self) -> u64;
     fn is_seekable(&self) -> bool {
@@ -126,6 +135,42 @@ impl ByteSink for MemorySink {
     }
 }
 
+/// A sequential-only in-memory sink used to test the non-seekable `ByteSink`
+/// contract: it reports `is_seekable() == false` and rejects every `seek()`
+/// call with [`ErrorKind::Unsupported`].
+#[cfg(test)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct NonSeekableSink {
+    bytes: Vec<u8>,
+}
+
+#[cfg(test)]
+impl ByteSink for NonSeekableSink {
+    fn position(&self) -> u64 {
+        self.bytes.len() as u64
+    }
+
+    fn is_seekable(&self) -> bool {
+        false
+    }
+
+    fn write<'a>(&'a mut self, bytes: &'a [u8]) -> IoFuture<'a, ()> {
+        Box::pin(async move {
+            self.bytes.extend_from_slice(bytes);
+            Ok(())
+        })
+    }
+
+    fn seek<'a>(&'a mut self, _position: u64) -> IoFuture<'a, ()> {
+        Box::pin(async move {
+            Err(Error::new(
+                ErrorKind::Unsupported,
+                "this sink does not support seeking",
+            ))
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,5 +210,15 @@ mod tests {
         ready(sink.seek(5)).unwrap();
         ready(sink.write(b"!")).unwrap();
         assert_eq!(sink.as_slice(), b"aZc\0\0!");
+    }
+
+    #[test]
+    fn non_seekable_sink_writes_but_rejects_seek() {
+        let mut sink = NonSeekableSink::default();
+        assert!(!sink.is_seekable());
+        ready(sink.write(b"abc")).unwrap();
+        assert_eq!(sink.bytes, b"abc");
+        let error = ready(sink.seek(0)).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
     }
 }
