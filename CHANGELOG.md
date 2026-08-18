@@ -4,6 +4,7 @@ All notable changes to zvidlib will be documented in this file.
 
 ## Unreleased
 
+- Document the required non-seekable `ByteSink` contract and add tests verifying a sink that overrides `is_seekable()` rejects `seek()` with `ErrorKind::Unsupported` and that ordinary MP4 creation rejects such a sink before writing any bytes.
 - Add exact AAC sample-range reads with gapless/edit mapping and audio-clock-driven native/Web Audio playback synchronization with cancellable seek preroll.
 - Add bounded incremental MP4 probing and read-only ordinary/fragmented sample indexes with decode and presentation timing, byte ranges, dependencies, edits, and codec configuration.
 - Add the browser WebAssembly package with BigInt-safe timeline values, stable JavaScript errors, cancellable Blob and stream input, owned typed-array media values, stream and playback handles, and Blob output.
