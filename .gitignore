@@ -3,3 +3,5 @@
 **/*.rs.bk
 .DS_Store
 .glorp.json
+/examples/media/*.mp4
+/examples/output/

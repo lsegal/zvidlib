@@ -258,6 +258,8 @@ The implemented portable writer core exposes `VideoEncoder` and `AudioEncoder` c
 
 Frame indices are zero-based. A video `get(n)` returns exactly frame `n` in presentation order, not merely the nearest keyframe. The matching audio `get(n)` returns the half-open sample interval covered by video frame `n`; sample-accurate APIs will also be available for audio-only use.
 
+Runnable versions of the native GL and browser WebGL workflows above, driven against a real Big Buck Bunny MP4 sample, live in [`examples/`](examples/README.md).
+
 ## Data paths
 
 Video frames will support two families of destination/source:
