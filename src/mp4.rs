@@ -721,3 +721,92 @@ fn limit(message: impl Into<String>) -> Error {
 fn internal(message: impl Into<String>) -> Error {
     Error::new(ErrorKind::Internal, message)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codec::EncoderConfig;
+    use crate::io::{IoFuture, NonSeekableSink};
+    use crate::media::{Codec, VideoDimensions};
+    use std::cell::Cell;
+    use std::future::Future;
+    use std::rc::Rc;
+    use std::task::{Context, Poll, Waker};
+
+    /// Wraps [`NonSeekableSink`] to record whether `write()` was ever called,
+    /// so the test can prove rejection happens before any bytes are written.
+    struct TrackingSink {
+        inner: NonSeekableSink,
+        wrote: Rc<Cell<bool>>,
+    }
+
+    impl ByteSink for TrackingSink {
+        fn position(&self) -> u64 {
+            self.inner.position()
+        }
+
+        fn is_seekable(&self) -> bool {
+            self.inner.is_seekable()
+        }
+
+        fn write<'a>(&'a mut self, bytes: &'a [u8]) -> IoFuture<'a, ()> {
+            self.wrote.set(true);
+            self.inner.write(bytes)
+        }
+
+        fn seek<'a>(&'a mut self, position: u64) -> IoFuture<'a, ()> {
+            self.inner.seek(position)
+        }
+    }
+
+    fn block_on<T>(future: impl Future<Output = T>) -> T {
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+        match Box::pin(future).as_mut().poll(&mut context) {
+            Poll::Ready(value) => value,
+            Poll::Pending => panic!("MP4 muxer test unexpectedly returned a pending future"),
+        }
+    }
+
+    fn codec_box(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let mut output = u32::try_from(payload.len() + 8)
+            .unwrap()
+            .to_be_bytes()
+            .to_vec();
+        output.extend_from_slice(kind);
+        output.extend_from_slice(payload);
+        output
+    }
+
+    fn video_track_config() -> Mp4TrackConfig {
+        Mp4TrackConfig {
+            encoder: EncoderConfig {
+                codec: Codec::Av1,
+                timescale: 1_000,
+                decoder_config: codec_box(b"av1C", &[0x81, 0, 0, 0]),
+            },
+            format: Mp4TrackFormat::Video(VideoDimensions {
+                width: 16,
+                height: 16,
+            }),
+        }
+    }
+
+    #[test]
+    fn ordinary_mp4_creation_rejects_non_seekable_sink_before_writing() {
+        let wrote = Rc::new(Cell::new(false));
+        let sink = TrackingSink {
+            inner: NonSeekableSink::default(),
+            wrote: wrote.clone(),
+        };
+        let error = match block_on(Mp4Muxer::new(sink, vec![video_track_config()], 16)) {
+            Ok(_) => panic!("expected a non-seekable sink to be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        assert!(
+            !wrote.get(),
+            "sink must not be written to before the seekability check"
+        );
+    }
+}
