@@ -444,6 +444,47 @@ fn incompatible_audio_and_unsynchronized_finish_are_rejected() {
     });
 }
 
+#[test]
+fn empty_output_produces_internally_consistent_index_tables() {
+    block_on(async {
+        let (_dimensions, timeline, video, _audio_encoder) = fixture();
+        let output = MediaOutput::new(
+            MemorySink::new(),
+            video,
+            PcmFixtureEncoder::without_gapless(),
+            timeline,
+            OutputOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let bytes = output.finish().await.unwrap().into_inner();
+        let demuxer = Mp4Demuxer::open(
+            &MemorySource::new(bytes.clone()),
+            Mp4DemuxerOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(demuxer.tracks.len(), 2);
+        for track in &demuxer.tracks {
+            assert!(track.samples.is_empty());
+        }
+
+        for occurrence in 0..2 {
+            let stsc = box_payload(&bytes, b"stsc", occurrence);
+            assert_eq!(
+                u32::from_be_bytes(stsc[4..8].try_into().unwrap()),
+                0,
+                "empty track must declare zero stsc entries"
+            );
+            let stsz = box_payload(&bytes, b"stsz", occurrence);
+            assert_eq!(u32::from_be_bytes(stsz[8..12].try_into().unwrap()), 0);
+            let co64 = box_payload(&bytes, b"co64", occurrence);
+            assert_eq!(u32::from_be_bytes(co64[4..8].try_into().unwrap()), 0);
+        }
+    });
+}
+
 #[derive(Debug)]
 struct ObservedSink {
     inner: MemorySink,
