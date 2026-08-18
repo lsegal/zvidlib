@@ -4,6 +4,7 @@ All notable changes to zvidlib will be documented in this file.
 
 ## Unreleased
 
+- Fix the seekable MP4 muxer emitting an `stsc` entry for tracks finished without any samples, which referenced a chunk that did not exist.
 - Publish API documentation to GitHub Pages and update the README to describe the current pre-1.0 status instead of "in development".
 - Add exact AAC sample-range reads with gapless/edit mapping and audio-clock-driven native/Web Audio playback synchronization with cancellable seek preroll.
 - Add bounded incremental MP4 probing and read-only ordinary/fragmented sample indexes with decode and presentation timing, byte ranges, dependencies, edits, and codec configuration.
