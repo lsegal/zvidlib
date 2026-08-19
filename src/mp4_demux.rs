@@ -1,8 +1,9 @@
 //! Bounded, read-only ISO BMFF/MP4 probing and sample indexing.
 
-use crate::codec::{SampleDependency, TrackKind};
+use crate::codec::{EncodedVideoSample, SampleDependency, TrackKind};
 use crate::io::ByteSource;
 use crate::media::{Codec, VideoDimensions};
+use crate::timeline::FrameIndex;
 use crate::{Error, ErrorKind, Limits, Result};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -93,6 +94,52 @@ impl Mp4Track {
             return Err(invalid("sample destination size does not match the index"));
         }
         read_exact(source, sample.offset, destination).await
+    }
+
+    /// Reads every decode-order sample and returns owned
+    /// [`EncodedVideoSample`] values keyed by presentation order, ready for
+    /// a [`crate::codec::VideoDecoderFactory`] backend.
+    ///
+    /// The zero-based position of each sample within
+    /// [`Self::presentation_order`] becomes its `presentation_index`, and
+    /// `is_sync` becomes `random_access`. Total decoded sample bytes are
+    /// bounded by `limits.max_allocation_bytes`.
+    pub async fn to_encoded_video_samples<S: ByteSource + ?Sized>(
+        &self,
+        source: &S,
+        limits: &Limits,
+    ) -> Result<Vec<EncodedVideoSample>> {
+        if self.kind != TrackKind::Video {
+            return Err(unsupported("encoded video samples require a video track"));
+        }
+        let mut presentation_index_by_decode = vec![0_u64; self.samples.len()];
+        for (presentation_index, &decode_index) in self.presentation_order.iter().enumerate() {
+            let presentation_index = u64::try_from(presentation_index)
+                .map_err(|_| limit("presentation index overflow"))?;
+            presentation_index_by_decode[decode_index] = presentation_index;
+        }
+
+        let mut total_bytes = 0_u64;
+        let mut samples = Vec::with_capacity(self.samples.len());
+        for (decode_index, sample) in self.samples.iter().enumerate() {
+            total_bytes = total_bytes
+                .checked_add(u64::from(sample.size))
+                .ok_or_else(|| limit("encoded sample allocation overflow"))?;
+            if total_bytes > limits.max_allocation_bytes {
+                return Err(limit(
+                    "encoded video samples exceed the configured allocation limit",
+                ));
+            }
+            let mut data = vec![0_u8; sample.size as usize];
+            self.read_sample_into(source, decode_index, &mut data)
+                .await?;
+            samples.push(EncodedVideoSample {
+                presentation_index: FrameIndex(presentation_index_by_decode[decode_index]),
+                random_access: sample.is_sync,
+                data,
+            });
+        }
+        Ok(samples)
     }
 }
 
@@ -1682,5 +1729,44 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn to_encoded_video_samples_reads_the_bundled_hevc_sample_in_presentation_order() {
+        let bytes = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/examples/media/BigBuckBunny.mp4"
+        ))
+        .expect("bundled sample video is checked into the repository");
+        let source = MemorySource::new(bytes);
+        let demuxer = block_on(Mp4Demuxer::open(&source, Mp4DemuxerOptions::default())).unwrap();
+        let track = demuxer
+            .tracks
+            .iter()
+            .find(|track| track.kind == TrackKind::Video)
+            .expect("sample video has a video track");
+        assert_eq!(track.codec, Codec::Hevc);
+        assert!(!track.decoder_config.is_empty());
+
+        let samples =
+            block_on(track.to_encoded_video_samples(&source, &Limits::default())).unwrap();
+        assert_eq!(samples.len(), track.samples.len());
+        assert!(
+            samples[0].random_access,
+            "decode must start at a sync sample"
+        );
+        let mut seen: Vec<u64> = samples.iter().map(|s| s.presentation_index.0).collect();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(
+            seen.len(),
+            samples.len(),
+            "presentation indexes must be unique"
+        );
+        assert!(samples.iter().all(|sample| !sample.data.is_empty()));
+
+        let derived =
+            crate::codec_config::derive_codec_string(track.codec, &track.decoder_config).unwrap();
+        assert!(derived.codec_string.starts_with("hev1."));
     }
 }
