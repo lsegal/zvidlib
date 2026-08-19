@@ -1086,7 +1086,10 @@ mod tests {
     /// Not every headless Chrome build can decode HEVC (it depends on
     /// platform codec licensing), so this accepts either a real decoded RGBA
     /// frame or a browser-reported `UNSUPPORTED`, and only fails on other
-    /// error kinds or on structurally wrong output.
+    /// error kinds or on structurally wrong output. Fetches two sequential
+    /// presentation frames, matching how the `web_canvas` example plays back
+    /// frame by frame, and checks that each frame's reported dimensions
+    /// match its own pixel buffer rather than a stale, session-wide value.
     #[wasm_bindgen_test(async)]
     async fn video_get_decodes_the_bundled_sample_or_reports_unsupported() {
         const SAMPLE: &[u8] = include_bytes!("../examples/media/BigBuckBunny.mp4");
@@ -1098,25 +1101,27 @@ mod tests {
         let video = input.video(0).unwrap();
         assert_eq!(video.direction(), "input");
 
-        match JsFuture::from(video.get(BigInt::from(0_u64).into(), None)).await {
-            Ok(frame) => {
-                // `WasmVideoFrame` doesn't implement `JsCast`, so read its
-                // wasm-bindgen getters back through `Reflect` instead.
-                let get_u32 = |name: &str| -> u32 {
-                    Reflect::get(&frame, &JsValue::from_str(name))
-                        .unwrap()
-                        .as_f64()
-                        .unwrap() as u32
-                };
-                let width = get_u32("width");
-                let height = get_u32("height");
-                assert!(width > 0);
-                assert!(height > 0);
-                let pixels = Reflect::get(&frame, &JsValue::from_str("pixels")).unwrap();
-                let pixels: Uint8Array = pixels.unchecked_into();
-                assert_eq!(pixels.length(), width * height * 4);
+        for frame_index in [0_u64, 1_u64] {
+            match JsFuture::from(video.get(BigInt::from(frame_index).into(), None)).await {
+                Ok(frame) => {
+                    // `WasmVideoFrame` doesn't implement `JsCast`, so read its
+                    // wasm-bindgen getters back through `Reflect` instead.
+                    let get_u32 = |name: &str| -> u32 {
+                        Reflect::get(&frame, &JsValue::from_str(name))
+                            .unwrap()
+                            .as_f64()
+                            .unwrap() as u32
+                    };
+                    let width = get_u32("width");
+                    let height = get_u32("height");
+                    assert!(width > 0);
+                    assert!(height > 0);
+                    let pixels = Reflect::get(&frame, &JsValue::from_str("pixels")).unwrap();
+                    let pixels: Uint8Array = pixels.unchecked_into();
+                    assert_eq!(pixels.length(), width * height * 4);
+                }
+                Err(error) => assert_error_code(&error, "UNSUPPORTED"),
             }
-            Err(error) => assert_error_code(&error, "UNSUPPORTED"),
         }
     }
 

@@ -14,7 +14,7 @@ use crate::mp4_demux::{Mp4Demuxer, Mp4DemuxerOptions, Mp4Track};
 use crate::timeline::FrameIndex;
 use crate::{Error, ErrorKind, Limits, Result};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
@@ -59,14 +59,17 @@ async fn parse_video_track(source: &MemorySource, index: u32, limits: &Limits) -
 
 /// A lazily-configured `WebCodecs` decode session for one input video track.
 pub struct WebVideoDecodeSession {
-    dimensions: VideoDimensions,
     samples: Vec<EncodedVideoSample>,
     decode_position_by_presentation: HashMap<FrameIndex, usize>,
     decoder: JsVideoDecoder,
     config: JsVideoDecoderConfig,
     pending_frames: Rc<RefCell<Vec<JsVideoFrame>>>,
     decode_error: Rc<RefCell<Option<String>>>,
-    next_decode_position: Option<usize>,
+    /// Bounded cache of already-decoded frames, keyed by presentation index,
+    /// so sequential `get()` calls within the same batch (see `get()`) don't
+    /// each trigger a fresh reset-and-redecode pass.
+    cache: HashMap<FrameIndex, (VideoDimensions, Vec<u8>)>,
+    cache_order: VecDeque<FrameIndex>,
     limits: Limits,
     // Kept alive for the lifetime of `decoder`, which retains only the raw
     // `js_sys::Function` handles produced by `as_ref().unchecked_ref()`.
@@ -137,14 +140,14 @@ impl WebVideoDecodeSession {
         }
 
         Ok(Self {
-            dimensions,
             samples,
             decode_position_by_presentation,
             decoder,
             config,
             pending_frames,
             decode_error,
-            next_decode_position: None,
+            cache: HashMap::new(),
+            cache_order: VecDeque::new(),
             limits: *limits,
             _output_closure: output_closure,
             _error_closure: error_closure,
@@ -163,6 +166,9 @@ impl WebVideoDecodeSession {
         &mut self,
         presentation_index: FrameIndex,
     ) -> Result<(VideoDimensions, Vec<u8>)> {
+        if let Some(cached) = self.cache.get(&presentation_index) {
+            return Ok(cached.clone());
+        }
         let target_position = *self
             .decode_position_by_presentation
             .get(&presentation_index)
@@ -170,34 +176,47 @@ impl WebVideoDecodeSession {
                 Error::new(ErrorKind::InvalidInput, "presentation frame is not indexed")
             })?;
         let random_access_position = self.nearest_random_access(target_position);
-        let can_resume = self.next_decode_position.is_some_and(|position| {
-            position >= random_access_position && position <= target_position
-        });
-        if !can_resume {
-            self.decoder.reset().map_err(|error| {
-                normalize_js_error(error, "resetting the WebCodecs VideoDecoder")
-            })?;
-            self.pending_frames.borrow_mut().clear();
-            *self.decode_error.borrow_mut() = None;
-            self.decoder.configure(&self.config).map_err(|error| {
-                normalize_js_error(error, "reconfiguring the WebCodecs VideoDecoder")
-            })?;
-            self.next_decode_position = Some(random_access_position);
-        }
+        let required_span = target_position - random_access_position + 1;
 
-        let start = self.next_decode_position.expect("just set above");
-        let submitted = target_position.saturating_sub(start).saturating_add(1);
-        if submitted as u64 > u64::from(self.limits.max_decode_samples_per_seek) {
+        // Chrome's WebCodecs `VideoDecoder` requires the next submitted chunk
+        // to be a key frame after every `flush()`, not just after
+        // `configure()`. Since every `get()` call below ends with a flush to
+        // observe its output, the decoder can never resume mid-GOP across
+        // calls: each call must reset and redecode from the nearest key
+        // frame. Submitting a large batch of chunks to a single
+        // `decode()`/`flush()` pass can also stall the browser's decoder
+        // indefinitely (observed with WebCodecs software HEVC decode past
+        // roughly 20 chunks in one pass), so batches are capped well under
+        // that rather than trusting `max_decode_samples_per_seek`, which is
+        // sized for the portable decoder's very different cost model.
+        const MAX_DECODE_BATCH_FRAMES: usize = 12;
+        let safe_span =
+            (self.limits.max_decode_samples_per_seek as usize).clamp(1, MAX_DECODE_BATCH_FRAMES);
+        if required_span > safe_span {
             return Err(Error::new(
                 ErrorKind::ResourceLimit,
                 "exact-frame request exceeded the configured decode-work limit",
             ));
         }
-        for position in start..=target_position {
+        // Decode as far past the target frame as the batch cap allows, and
+        // cache every output frame, so later sequential `get()` calls within
+        // the same key-frame interval are served from `self.cache` instead
+        // of triggering another reset-and-redecode pass.
+        let end_position = (random_access_position + safe_span - 1).min(self.samples.len() - 1);
+
+        self.decoder
+            .reset()
+            .map_err(|error| normalize_js_error(error, "resetting the WebCodecs VideoDecoder"))?;
+        self.pending_frames.borrow_mut().clear();
+        *self.decode_error.borrow_mut() = None;
+        self.decoder.configure(&self.config).map_err(|error| {
+            normalize_js_error(error, "reconfiguring the WebCodecs VideoDecoder")
+        })?;
+
+        for position in random_access_position..=end_position {
             let sample = &self.samples[position];
             self.submit(sample)?;
         }
-        self.next_decode_position = Some(target_position + 1);
 
         JsFuture::from(js_to_promise(self.decoder.flush()))
             .await
@@ -208,20 +227,32 @@ impl WebVideoDecodeSession {
         }
 
         let frames = std::mem::take(&mut *self.pending_frames.borrow_mut());
-        let target_timestamp = presentation_index.0 as f64;
-        let mut result = None;
         for frame in frames {
-            if frame.timestamp() == target_timestamp && result.is_none() {
-                result = Some(self.copy_frame_rgba(&frame).await?);
-            }
+            let index = FrameIndex(frame.timestamp() as u64);
+            let copied = self.copy_frame_rgba(&frame).await;
             frame.close();
+            if let Ok(value) = copied {
+                self.insert_cache(index, value);
+            }
         }
-        result.map(|rgba| (self.dimensions, rgba)).ok_or_else(|| {
+        self.cache.get(&presentation_index).cloned().ok_or_else(|| {
             Error::new(
                 ErrorKind::Internal,
                 "decoder did not output the requested frame",
             )
         })
+    }
+
+    fn insert_cache(&mut self, index: FrameIndex, value: (VideoDimensions, Vec<u8>)) {
+        if self.cache.insert(index, value).is_none() {
+            self.cache_order.push_back(index);
+        }
+        while self.cache.len() > self.limits.max_cached_frames as usize {
+            let Some(oldest) = self.cache_order.pop_front() else {
+                break;
+            };
+            self.cache.remove(&oldest);
+        }
     }
 
     fn submit(&self, sample: &EncodedVideoSample) -> Result<()> {
@@ -240,11 +271,15 @@ impl WebVideoDecodeSession {
             .map_err(|error| normalize_js_error(error, "decoding a video sample"))
     }
 
-    async fn copy_frame_rgba(&self, frame: &JsVideoFrame) -> Result<Vec<u8>> {
-        let width = frame.display_width();
-        let height = frame.display_height();
-        let byte_length = (width as usize)
-            .checked_mul(height as usize)
+    async fn copy_frame_rgba(&self, frame: &JsVideoFrame) -> Result<(VideoDimensions, Vec<u8>)> {
+        // Use the frame's own display dimensions, not the session's track-level
+        // dimensions: they can diverge (container padding/cropping), and the
+        // pixel buffer below is always laid out to match the frame's actual size.
+        let dimensions =
+            VideoDimensions::new(frame.display_width(), frame.display_height(), &self.limits)
+                .map_err(|error| Error::new(error.kind(), error.message()))?;
+        let byte_length = (dimensions.width as usize)
+            .checked_mul(dimensions.height as usize)
             .and_then(|pixels| pixels.checked_mul(4))
             .ok_or_else(|| {
                 Error::new(
@@ -260,7 +295,7 @@ impl WebVideoDecodeSession {
         ))
         .await
         .map_err(|error| normalize_js_error(error, "copying a decoded video frame"))?;
-        Ok(destination.to_vec())
+        Ok((dimensions, destination.to_vec()))
     }
 }
 
