@@ -4,6 +4,7 @@ All notable changes to zvidlib will be documented in this file.
 
 ## Unreleased
 
+- Add a real compressed video decoder backend for the browser (`web`) build, backed by the browser's native `WebCodecs` `VideoDecoder`, so `VideoStream.get()` decodes actual HEVC/AV1 MP4 samples into RGBA frames instead of always rejecting with `UNSUPPORTED`; the `web_canvas` example now renders real decoded frames when the browser supports the sample's codec.
 - Add an `examples/` directory with runnable native GL and browser WebGL canvas examples driven against a Big Buck Bunny MP4 sample checked into the repo at `examples/media/BigBuckBunny.mp4` (shared with the web canvas example via a symlink), so no manual download is required.
 - Fix the seekable MP4 muxer emitting an `stsc` entry for tracks finished without any samples, which referenced a chunk that did not exist.
 - Document the required non-seekable `ByteSink` contract and add tests verifying a sink that overrides `is_seekable()` rejects `seek()` with `ErrorKind::Unsupported` and that ordinary MP4 creation rejects such a sink before writing any bytes.

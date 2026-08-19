@@ -2,7 +2,7 @@
 
 zvidlib is a Rust library for frame-accurate video and synchronized audio I/O on native and WebAssembly targets. Its primary jobs are reading an MP4 into a GL/WebGL canvas and writing canvas frames plus an audio stream into an MP4, behind a small API centered on indexed `get` and `put` operations.
 
-> **Project status:** zvidlib is pre-1.0 and its API may still change before the first release. The portable foundation now includes checked timeline arithmetic, validated media buffers, asynchronous byte I/O, CPU/GL/WebGL transfer contracts, bounded ordinary/fragmented MP4 sample indexing, normalized codec factories, bounded exact-frame video decoding, exact AAC sample reads, audio-clock playback control and adapter contracts, encoder contracts, strict indexed output, seekable MP4 muxing, and the browser WebAssembly boundary. The generated JavaScript package includes BigInt-safe values, stable errors, Blob/stream input, Blob output, and session/stream/playback handles. Production compressed-codec integrations and concrete audio-device and `AudioContext` bindings remain planned, so backend-dependent JavaScript operations currently reject with `UNSUPPORTED`. The complete workflow interfaces below remain intentionally aspirational and may change before the first release.
+> **Project status:** zvidlib is pre-1.0 and its API may still change before the first release. The portable foundation now includes checked timeline arithmetic, validated media buffers, asynchronous byte I/O, CPU/GL/WebGL transfer contracts, bounded ordinary/fragmented MP4 sample indexing, normalized codec factories, bounded exact-frame video decoding, exact AAC sample reads, audio-clock playback control and adapter contracts, encoder contracts, strict indexed output, seekable MP4 muxing, and the browser WebAssembly boundary. The generated JavaScript package includes BigInt-safe values, stable errors, Blob/stream input, Blob output, and session/stream/playback handles, and the browser (`web`) build decodes real HEVC/AV1 video through the browser's native `WebCodecs` `VideoDecoder`. Compressed video encoding and concrete audio-device and `AudioContext` bindings remain planned, so those backend-dependent JavaScript operations currently reject with `UNSUPPORTED`. The complete workflow interfaces below remain intentionally aspirational and may change before the first release.
 
 ## Documentation
 
@@ -41,10 +41,13 @@ console.log(input.byteLength); // BigInt
 console.log(new FrameIndex(18_446_744_073_709_551_615n).value);
 
 try {
-  await input.video(0).get(0n);
+  // Decodes the real frame via the browser's native WebCodecs `VideoDecoder`
+  // for HEVC/AV1 input tracks.
+  const frame = await input.video(0).get(0n);
+  console.log(frame.width, frame.height, frame.pixels.length);
 } catch (error) {
-  // Until a decoder backend is registered, this is "UNSUPPORTED" rather
-  // than a fake or nearest frame.
+  // "UNSUPPORTED" if this browser/platform has no decoder for the track's
+  // codec, rather than a fake or nearest frame.
   console.log(errorCode(error));
 }
 
@@ -70,7 +73,7 @@ All exported 64-bit frame, sample, and timestamp values return JavaScript `BigIn
 
 ## Planned API examples
 
-The examples in this section show the intended complete workflows. Rust examples are deliberately marked `ignore`, and browser examples depend on media backends that are not registered yet. The boundary classes exist, but backend-dependent calls reject with `UNSUPPORTED` until their implementations land. Names may change before the first release, while the ownership, synchronization, and cleanup steps are part of the design.
+The examples in this section show the intended complete workflows. Rust examples are deliberately marked `ignore`, and browser examples depend on media backends that are not fully registered yet: video decoding works (see [Implemented browser boundary](#implemented-browser-boundary)), but `Playback`, audio decode/encode, and video encode still reject with `UNSUPPORTED` until their implementations land. The boundary classes exist for all of these. Names may change before the first release, while the ownership, synchronization, and cleanup steps are part of the design.
 
 ### Read, play audio, and render with native OpenGL
 
@@ -329,7 +332,9 @@ Run the browser integration suite in an installed Chrome browser with:
 wasm-pack test --headless --chrome --no-default-features --features web
 ```
 
-The suite verifies Blob and stream input, cancellation, reader-lock cleanup, BigInt range handling, typed-array copy lifetimes, browser-object ownership, stable errors, and Blob output. The base build does not require WASM threads or cross-origin isolation. Future optional threaded builds will document their additional headers and browser requirements separately.
+The suite verifies Blob and stream input, cancellation, reader-lock cleanup, BigInt range handling, typed-array copy lifetimes, browser-object ownership, stable errors, Blob output, and decoding the bundled HEVC sample through WebCodecs. The base build does not require WASM threads or cross-origin isolation. Future optional threaded builds will document their additional headers and browser requirements separately.
+
+The `web` feature's video decoder uses `web-sys`'s `WebCodecs` bindings, which that crate gates behind `--cfg=web_sys_unstable_apis` because the spec is still evolving. `.cargo/config.toml` sets that flag for the `wasm32-unknown-unknown` target automatically, so the `cargo`/`wasm-pack` commands above need no extra flags.
 
 ## Roadmap
 

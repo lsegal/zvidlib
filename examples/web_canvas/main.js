@@ -44,8 +44,8 @@ function compileProgram(gl) {
   return program;
 }
 
-// Builds a synthetic RGBA gradient frame, standing in for a decoded frame until zvidlib
-// registers a compressed video decoder backend (see examples/README.md).
+// Builds a synthetic RGBA gradient frame, used only as a fallback when the browser cannot
+// decode the sample's HEVC track via WebCodecs (see examples/README.md).
 function syntheticFrame(width, height, phase) {
   const pixels = new Uint8Array(width * height * 4);
   for (let y = 0; y < height; y++) {
@@ -98,45 +98,75 @@ async function main() {
     `Video stream 0 direction: ${video.direction}`,
   ];
 
+  // Real decoding depends on the browser having an HEVC WebCodecs decoder; fall back to a
+  // synthetic gradient sized to the track when it doesn't (see examples/README.md).
+  let decodedFrame = null;
   try {
-    await video.get(0n);
-    lines.push("video.get(0n) unexpectedly succeeded.");
+    decodedFrame = await video.get(0n);
+    lines.push(`video.get(0n) decoded a real ${decodedFrame.width}x${decodedFrame.height} frame.`);
   } catch (error) {
-    lines.push(`video.get(0n) rejected with ${errorCode(error)}, as expected: no browser video decoder backend is registered yet.`);
+    lines.push(`video.get(0n) rejected with ${errorCode(error)}: falling back to a synthetic frame.`);
   }
+  const useRealDecode = decodedFrame !== null;
   status.textContent = lines.join("\n");
 
   let playing = false;
-  let animationFrame = 0;
   let frameIndex = 0;
+  let stopped = false;
 
-  function render() {
-    const phase = (frameIndex % 60) / 60;
-    const pixels = syntheticFrame(canvas.width, canvas.height, phase);
+  function uploadFrame(pixels, width, height) {
     gl.bindTexture(gl.TEXTURE_2D, texture);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, canvas.width, canvas.height, 0, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
-
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
     gl.viewport(0, 0, canvas.width, canvas.height);
     gl.useProgram(program);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  }
 
+  async function renderFrame() {
+    if (useRealDecode) {
+      try {
+        const frame = await video.get(BigInt(frameIndex));
+        uploadFrame(frame.pixels, frame.width, frame.height);
+        frameIndex += 1;
+        return;
+      } catch {
+        // Ran past the last indexed frame: loop back to the start.
+        frameIndex = 0;
+        const frame = await video.get(0n);
+        uploadFrame(frame.pixels, frame.width, frame.height);
+        frameIndex = 1;
+        return;
+      }
+    }
+    const phase = (frameIndex % 60) / 60;
+    uploadFrame(syntheticFrame(canvas.width, canvas.height, phase), canvas.width, canvas.height);
     frameIndex += 1;
-    if (playing) animationFrame = requestAnimationFrame(render);
+  }
+
+  async function renderLoop() {
+    while (!stopped) {
+      if (playing) await renderFrame();
+      await new Promise((resolve) => requestAnimationFrame(resolve));
+    }
   }
 
   playButton.addEventListener("click", () => {
     playing = !playing;
     playButton.textContent = playing ? "Pause" : "Play";
-    if (playing) animationFrame = requestAnimationFrame(render);
-    else cancelAnimationFrame(animationFrame);
   });
 
-  render();
+  if (decodedFrame) {
+    uploadFrame(decodedFrame.pixels, decodedFrame.width, decodedFrame.height);
+    frameIndex = 1;
+  } else {
+    await renderFrame();
+  }
+  renderLoop();
 
   window.addEventListener(
     "pagehide",
     () => {
-      cancelAnimationFrame(animationFrame);
+      stopped = true;
       input.close();
     },
     { once: true },

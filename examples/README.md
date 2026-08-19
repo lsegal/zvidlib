@@ -7,15 +7,16 @@ Blender Foundation. The clip is checked into the repo at `examples/media/BigBuck
 download is needed before running either example. `examples/web_canvas/BigBuckBunny.mp4` is a
 symlink to that same file so both examples share one copy.
 
-## Current limitation: no compressed decoder backend yet
+## Compressed decoding
 
-As documented in the main [README](../README.md#implemented-browser-boundary), zvidlib has not
-yet registered a compressed (HEVC/AV1) video decoder backend, so indexed video `get`/decode calls
-reject with `UNSUPPORTED`. Both examples still demux the real sample file to read its actual track
-metadata (dimensions, codec, sample count, timing), but they render synthetic frames sized to that
-track instead of real decoded pixels. Once a decoder backend lands, replace the synthetic frame
-generator with `ExactFrameReader::get`/`Playback` output; everything downstream (the transfer
-contract, canvas upload) is unchanged.
+As documented in the main [README](../README.md#implemented-browser-boundary), the browser
+(`web`) build now decodes the sample's real HEVC video track through the browser's native
+`WebCodecs` `VideoDecoder`, so `web_canvas/` renders real decoded pixels instead of a synthetic
+gradient. Whether that decode actually succeeds depends on the browser and platform: zvidlib
+queries `VideoDecoder.isConfigSupported()` first, and `video.get()` still rejects with
+`UNSUPPORTED` (falling back to the synthetic gradient) if the browser has no HEVC decoder
+available. The native example has no `WebCodecs` equivalent, so it still only demuxes the real
+sample's track metadata and does not decode pixels.
 
 ## Native GL: `native_gl.rs`
 
@@ -32,9 +33,9 @@ cargo run --example native_gl --features native
 ## Web canvas: `web_canvas/`
 
 A browser page that opens the sample as a `Blob`, creates a WebGL2 canvas context, and drives the
-same CPU → WebGL upload path via the generated `zvidlib` package. It renders synthetic frames the
-same way as the native example and shows the real `UNSUPPORTED` error zvidlib returns for
-`video.get()` until a decoder backend is registered.
+same CPU → WebGL upload path via the generated `zvidlib` package. It calls `video.get()` for each
+displayed frame and uploads the real decoded RGBA pixels; if the browser cannot decode HEVC it
+falls back to a synthetic gradient sized to the real track instead.
 
 Build the WebAssembly package first (see the main [README](../README.md#building-testing-and-using-webassembly)):
 
