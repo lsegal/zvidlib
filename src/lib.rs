@@ -23,6 +23,9 @@ pub mod transfer;
 mod wasm_api;
 
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
+mod web_decoder;
+
+#[cfg(all(feature = "web", target_arch = "wasm32"))]
 pub use wasm_api::*;
 
 pub use api::{Capability, Error, ErrorKind, Limits, Result, Support, TransferMode};

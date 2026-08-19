@@ -4,13 +4,14 @@
 //! typed arrays are snapshots rather than views into growable WebAssembly
 //! memory, and browser-owned objects are retained only as JavaScript handles.
 
+use crate::web_decoder::WebVideoDecodeSession;
 use crate::{
     AudioBuffer as CoreAudioBuffer, ColorRange, ErrorKind, FrameIndex as CoreFrameIndex, FrameRate,
     Limits, PixelFormat, Plane, Rational as CoreRational, SampleRange as CoreSampleRange, Timeline,
     VideoDimensions, VideoFrame as CoreVideoFrame,
 };
 use js_sys::{BigInt, Float32Array, Promise, Reflect, Uint8Array};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
@@ -601,6 +602,10 @@ pub struct WasmVideoStream {
     index: u32,
     state: Rc<Cell<bool>>,
     direction: StreamDirection,
+    /// Source bytes for an input stream, shared with the owning `MediaInput`.
+    bytes: Option<Rc<Vec<u8>>>,
+    /// Lazily-configured `WebCodecs` decode session, built on first `get()`.
+    decode_session: Rc<RefCell<Option<WebVideoDecodeSession>>>,
 }
 
 #[wasm_bindgen(js_class = VideoStream)]
@@ -622,20 +627,42 @@ impl WasmVideoStream {
     pub fn get(&self, frame_index: JsValue, signal: Option<AbortSignal>) -> Promise {
         let state = Rc::clone(&self.state);
         let direction = self.direction;
+        let index = self.index;
+        let bytes = self.bytes.clone();
+        let decode_session = Rc::clone(&self.decode_session);
         future_to_promise(async move {
             ensure_open(&state)?;
             check_signal(signal.as_ref())?;
-            parse_u64(&frame_index, "frame index")?;
+            let frame_index = CoreFrameIndex(parse_u64(&frame_index, "frame index")?);
             if direction != StreamDirection::Input {
                 return Err(js_error(
                     ErrorKind::InvalidState,
                     "get is only valid on an input video stream",
                 ));
             }
-            Err(js_error(
-                ErrorKind::Unsupported,
-                "no browser video decoder backend is registered",
-            ))
+            let bytes = bytes.ok_or_else(|| {
+                js_error(
+                    ErrorKind::Unsupported,
+                    "no browser video decoder backend is registered",
+                )
+            })?;
+
+            let mut session = decode_session.borrow_mut().take();
+            if session.is_none() {
+                session = Some(
+                    WebVideoDecodeSession::open(&bytes, index, &Limits::default())
+                        .await
+                        .map_err(|error| js_error(error.kind(), error.message()))?,
+                );
+            }
+            let mut session = session.expect("just populated above");
+            check_signal(signal.as_ref())?;
+            let result = session.get(frame_index).await;
+            *decode_session.borrow_mut() = Some(session);
+            let (dimensions, rgba) =
+                result.map_err(|error| js_error(error.kind(), error.message()))?;
+            WasmVideoFrame::rgba(dimensions.width, dimensions.height, owned_u8_array(&rgba))
+                .map(JsValue::from)
         })
     }
 
@@ -754,7 +781,7 @@ impl WasmAudioStream {
 /// A browser input whose source bytes are owned by WebAssembly after opening.
 #[wasm_bindgen(js_name = MediaInput)]
 pub struct WasmMediaInput {
-    bytes: Vec<u8>,
+    bytes: Rc<Vec<u8>>,
     state: Rc<Cell<bool>>,
 }
 
@@ -777,7 +804,7 @@ impl WasmMediaInput {
             )
         })?;
         Ok(Self {
-            bytes: bytes.to_vec(),
+            bytes: Rc::new(bytes.to_vec()),
             state: Rc::new(Cell::new(false)),
         })
     }
@@ -812,6 +839,8 @@ impl WasmMediaInput {
             index,
             state: Rc::clone(&self.state),
             direction: StreamDirection::Input,
+            bytes: Some(Rc::clone(&self.bytes)),
+            decode_session: Rc::new(RefCell::new(None)),
         })
     }
 
@@ -832,7 +861,7 @@ impl WasmMediaInput {
 
     pub fn close(&mut self) {
         if !self.state.replace(true) {
-            self.bytes.clear();
+            self.bytes = Rc::new(Vec::new());
         }
     }
 }
@@ -891,6 +920,8 @@ impl WasmMediaOutput {
             index,
             state: Rc::clone(&self.state),
             direction: StreamDirection::Output,
+            bytes: None,
+            decode_session: Rc::new(RefCell::new(None)),
         })
     }
 
@@ -1048,6 +1079,45 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(input.bytes().unwrap().to_vec(), vec![4, 5, 6]);
+    }
+
+    /// The bundled HEVC sample decoded through the real `WebCodecs` backend.
+    ///
+    /// Not every headless Chrome build can decode HEVC (it depends on
+    /// platform codec licensing), so this accepts either a real decoded RGBA
+    /// frame or a browser-reported `UNSUPPORTED`, and only fails on other
+    /// error kinds or on structurally wrong output.
+    #[wasm_bindgen_test(async)]
+    async fn video_get_decodes_the_bundled_sample_or_reports_unsupported() {
+        const SAMPLE: &[u8] = include_bytes!("../examples/media/BigBuckBunny.mp4");
+        let bytes = Uint8Array::from(SAMPLE);
+        let input =
+            WasmMediaInput::open_inner(bytes.into(), Limits::default().max_allocation_bytes, None)
+                .await
+                .unwrap();
+        let video = input.video(0).unwrap();
+        assert_eq!(video.direction(), "input");
+
+        match JsFuture::from(video.get(BigInt::from(0_u64).into(), None)).await {
+            Ok(frame) => {
+                // `WasmVideoFrame` doesn't implement `JsCast`, so read its
+                // wasm-bindgen getters back through `Reflect` instead.
+                let get_u32 = |name: &str| -> u32 {
+                    Reflect::get(&frame, &JsValue::from_str(name))
+                        .unwrap()
+                        .as_f64()
+                        .unwrap() as u32
+                };
+                let width = get_u32("width");
+                let height = get_u32("height");
+                assert!(width > 0);
+                assert!(height > 0);
+                let pixels = Reflect::get(&frame, &JsValue::from_str("pixels")).unwrap();
+                let pixels: Uint8Array = pixels.unchecked_into();
+                assert_eq!(pixels.length(), width * height * 4);
+            }
+            Err(error) => assert_error_code(&error, "UNSUPPORTED"),
+        }
     }
 
     #[wasm_bindgen_test(async)]

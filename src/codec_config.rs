@@ -31,7 +31,7 @@ pub fn derive_codec_string(codec: Codec, decoder_config: &[u8]) -> Result<Derive
 }
 
 /// Returns the payload of a box given its complete bytes (size + fourcc + payload).
-fn box_payload<'a>(whole: &'a [u8], expected_fourcc: &[u8; 4]) -> Result<&'a [u8]> {
+pub(crate) fn box_payload<'a>(whole: &'a [u8], expected_fourcc: &[u8; 4]) -> Result<&'a [u8]> {
     if whole.len() < 8 {
         return Err(Error::new(
             ErrorKind::MalformedMedia,
