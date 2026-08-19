@@ -33,7 +33,18 @@ web-sys = { version = "0.3.104", optional = true, features = [
     "AbortController",
     "AbortSignal",
     "Blob",
+    "EncodedVideoChunk",
+    "EncodedVideoChunkInit",
+    "EncodedVideoChunkType",
+    "PlaneLayout",
     "ReadableStream",
+    "VideoDecoder",
+    "VideoDecoderConfig",
+    "VideoDecoderInit",
+    "VideoDecoderSupport",
+    "VideoFrame",
+    "VideoFrameCopyToOptions",
+    "VideoPixelFormat",
 ] }
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]

@@ -1,0 +1,5 @@
+# web-sys gates its WebCodecs bindings (VideoDecoder, EncodedVideoChunk, ...) behind
+# this cfg because the spec is still evolving; see
+# https://rustwasm.github.io/wasm-bindgen/web-sys/unstable-apis.html
+[target.wasm32-unknown-unknown]
+rustflags = ["--cfg=web_sys_unstable_apis"]

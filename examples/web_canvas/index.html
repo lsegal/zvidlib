@@ -9,9 +9,10 @@
   </style>
   <h1>zvidlib WebGL canvas example</h1>
   <p>
-    Opens the Big Buck Bunny sample, demuxes it with zvidlib, and renders synthetic frames onto a
-    WebGL2 canvas. See <a href="../README.md">examples/README.md</a> for why the frames are
-    synthetic rather than decoded.
+    Opens the Big Buck Bunny sample, decodes it with zvidlib's browser WebCodecs backend, and
+    renders the real frames onto a WebGL2 canvas. If this browser can't decode the sample's HEVC
+    track, it falls back to a synthetic gradient instead; see
+    <a href="../README.md">examples/README.md</a> for details.
   </p>
   <canvas id="video" width="1280" height="720"></canvas>
   <p><button id="play" type="button">Play</button></p>
