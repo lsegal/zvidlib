@@ -1,13 +1,11 @@
 # Examples
 
-These examples demonstrate zvidlib's currently implemented API against a real MP4 sample, the
-public-domain [Big Buck Bunny](https://peach.blender.org/) clip. Download it once before running
-either example:
-
-```console
-curl -o examples/media/BigBuckBunny.mp4 \
-  https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4
-```
+These examples demonstrate zvidlib's currently implemented API against a real MP4 sample: a short,
+re-encoded clip of the CC-BY-licensed [Big Buck Bunny](https://peach.blender.org/) film by the
+Blender Foundation. The clip is checked into the repo at `examples/media/BigBuckBunny.mp4`
+(trimmed to a few seconds and re-encoded small so it's cheap to keep in git), so no manual
+download is needed before running either example. `examples/web_canvas/BigBuckBunny.mp4` is a
+symlink to that same file so both examples share one copy.
 
 ## Current limitation: no compressed decoder backend yet
 
@@ -44,12 +42,11 @@ Build the WebAssembly package first (see the main [README](../README.md#building
 wasm-pack build --target web --out-dir pkg --no-default-features --features web
 ```
 
-Then copy or symlink `pkg/` next to `examples/web_canvas/index.html`, place
-`BigBuckBunny.mp4` alongside it, and serve the directory over HTTP(S):
+Then copy or symlink `pkg/` next to `examples/web_canvas/index.html` and serve the directory over
+HTTP(S) (`BigBuckBunny.mp4` is already symlinked in):
 
 ```console
 cp -r pkg examples/web_canvas/pkg
-cp examples/media/BigBuckBunny.mp4 examples/web_canvas/BigBuckBunny.mp4
 python -m http.server 8000 --directory examples/web_canvas
 ```
 

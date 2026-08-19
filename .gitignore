@@ -4,4 +4,5 @@
 .DS_Store
 .glorp.json
 /examples/media/*.mp4
+!/examples/media/BigBuckBunny.mp4
 /examples/output/
