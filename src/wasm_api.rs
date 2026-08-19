@@ -1125,6 +1125,72 @@ mod tests {
         }
     }
 
+    /// Regression test for issue #38: the very last frame of a GOP has no
+    /// further samples available to prime the decoder pipeline with, so
+    /// `get()` must be able to fall back to draining the decoder instead of
+    /// waiting forever for an output that more input would otherwise elicit.
+    #[wasm_bindgen_test(async)]
+    async fn video_get_decodes_the_last_frame_of_a_sparse_keyframe_gop() {
+        const SAMPLE: &[u8] = include_bytes!("../examples/media/BigBuckBunny.mp4");
+        const LAST_FRAME_INDEX: u64 = 119;
+        let bytes = Uint8Array::from(SAMPLE);
+        let input =
+            WasmMediaInput::open_inner(bytes.into(), Limits::default().max_allocation_bytes, None)
+                .await
+                .unwrap();
+        let video = input.video(0).unwrap();
+
+        match JsFuture::from(video.get(BigInt::from(LAST_FRAME_INDEX).into(), None)).await {
+            Ok(frame) => {
+                let get_u32 = |name: &str| -> u32 {
+                    Reflect::get(&frame, &JsValue::from_str(name))
+                        .unwrap()
+                        .as_f64()
+                        .unwrap() as u32
+                };
+                assert!(get_u32("width") > 0);
+                assert!(get_u32("height") > 0);
+            }
+            Err(error) => assert_error_code(&error, "UNSUPPORTED"),
+        }
+    }
+
+    /// Regression test for issue #38: `BigBuckBunny.mp4` has a single key
+    /// frame followed by ~120 delta frames, so decoding a frame this deep
+    /// into the GOP used to exceed the old 12-frame WebCodecs batch cap and
+    /// fail with `ResourceLimit` even though it was well within
+    /// `Limits::max_decode_samples_per_seek`.
+    #[wasm_bindgen_test(async)]
+    async fn video_get_decodes_deep_into_a_sparse_keyframe_gop() {
+        const SAMPLE: &[u8] = include_bytes!("../examples/media/BigBuckBunny.mp4");
+        const DEEP_FRAME_INDEX: u64 = 60;
+        let bytes = Uint8Array::from(SAMPLE);
+        let input =
+            WasmMediaInput::open_inner(bytes.into(), Limits::default().max_allocation_bytes, None)
+                .await
+                .unwrap();
+        let video = input.video(0).unwrap();
+
+        match JsFuture::from(video.get(BigInt::from(DEEP_FRAME_INDEX).into(), None)).await {
+            Ok(frame) => {
+                let get_u32 = |name: &str| -> u32 {
+                    Reflect::get(&frame, &JsValue::from_str(name))
+                        .unwrap()
+                        .as_f64()
+                        .unwrap() as u32
+                };
+                let width = get_u32("width");
+                let height = get_u32("height");
+                assert!(width > 0);
+                assert!(height > 0);
+                let pixels = Reflect::get(&frame, &JsValue::from_str("pixels")).unwrap();
+                let pixels: Uint8Array = pixels.unchecked_into();
+                assert_eq!(pixels.length(), width * height * 4);
+            }
+            Err(error) => assert_error_code(&error, "UNSUPPORTED"),
+        }
+    }
+
     #[wasm_bindgen_test(async)]
     async fn readable_stream_input_releases_its_lock() {
         let chunks = Array::new();

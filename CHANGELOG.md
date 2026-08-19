@@ -4,6 +4,7 @@ All notable changes to zvidlib will be documented in this file.
 
 ## Unreleased
 
+- Fix the browser `WebCodecs` video decoder (`WebVideoDecodeSession::get()`) getting stuck on the first ~12 frames of content with sparse key frames (e.g. the bundled `examples/media/BigBuckBunny.mp4` sample, a single key frame followed by ~120 delta frames): it now keeps a decode session open across `get()` calls instead of resetting and flushing on every call, removing the artificial 12-frame batch cap so `get()` is bounded only by `Limits::max_decode_samples_per_seek`.
 - Add `examples/web_canvas/package.json` with a `pnpm dev` script that builds the WebAssembly package straight into `examples/web_canvas/pkg` and starts a Vite dev server, replacing the previous manual `wasm-pack build` + `cp -r` + `python -m http.server` steps.
 - Add a real compressed video decoder backend for the browser (`web`) build, backed by the browser's native `WebCodecs` `VideoDecoder`, so `VideoStream.get()` decodes actual HEVC/AV1 MP4 samples into RGBA frames instead of always rejecting with `UNSUPPORTED`; the `web_canvas` example now renders real decoded frames when the browser supports the sample's codec.
 - Add an `examples/` directory with runnable native GL and browser WebGL canvas examples driven against a Big Buck Bunny MP4 sample checked into the repo at `examples/media/BigBuckBunny.mp4` (shared with the web canvas example via a symlink), so no manual download is required.
