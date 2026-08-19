@@ -326,6 +326,8 @@ python -m http.server 8000
 
 The build creates `pkg/zvidlib.js`, `pkg/zvidlib.d.ts`, `pkg/zvidlib_bg.wasm`, and package metadata. Open `http://localhost:8000/` and import the generated module with `import init, { ... } from "./pkg/zvidlib.js"`, as in the browser examples. Call `await init()` exactly once before using an exported class. Deploy the generated JavaScript and WASM files together, with the server returning `application/wasm` for the `.wasm` file.
 
+For the browser example specifically, `examples/web_canvas/package.json` wraps the `wasm-pack build` and serving steps above into one `pnpm dev` command; see [examples/README.md](examples/README.md#web-canvas-web_canvas).
+
 Run the browser integration suite in an installed Chrome browser with:
 
 ```console

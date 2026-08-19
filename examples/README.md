@@ -37,18 +37,18 @@ same CPU → WebGL upload path via the generated `zvidlib` package. It calls `vi
 displayed frame and uploads the real decoded RGBA pixels; if the browser cannot decode HEVC it
 falls back to a synthetic gradient sized to the real track instead.
 
-Build the WebAssembly package first (see the main [README](../README.md#building-testing-and-using-webassembly)):
+`examples/web_canvas/package.json` wraps the whole setup in one command. From `examples/web_canvas/`:
 
 ```console
-wasm-pack build --target web --out-dir pkg --no-default-features --features web
+pnpm install
+pnpm dev
 ```
 
-Then copy or symlink `pkg/` next to `examples/web_canvas/index.html` and serve the directory over
-HTTP(S) (`BigBuckBunny.mp4` is already symlinked in):
+`pnpm dev` builds the WebAssembly package straight into `examples/web_canvas/pkg` with
+[`wasm-pack`](https://rustwasm.github.io/wasm-pack/installer/) (install it first if you don't have
+it: `cargo install wasm-pack`), then starts a [Vite](https://vitejs.dev/) dev server for the
+directory. Open the printed `http://localhost:5173/` URL and click **Play**.
 
-```console
-cp -r pkg examples/web_canvas/pkg
-python -m http.server 8000 --directory examples/web_canvas
-```
-
-Open `http://localhost:8000/` and click **Play**.
+Requires `wasm-pack` on `PATH` and [`pnpm`](https://pnpm.io/installation). See the main
+[README](../README.md#building-testing-and-using-webassembly) for the equivalent manual
+`wasm-pack build` command if you'd rather run it outside this workflow.
