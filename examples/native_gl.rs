@@ -1,7 +1,7 @@
 //! Native GL rendering example.
 //!
-//! Demuxes an MP4 (by default the Big Buck Bunny sample, see
-//! `examples/README.md` for how to download it) and drives the real
+//! Demuxes an MP4 (by default the Big Buck Bunny sample checked into
+//! `examples/media/BigBuckBunny.mp4`) and drives the real
 //! CPU -> native OpenGL [`execute_transfer`] path with a minimal in-process
 //! [`GraphicsAdapter`] that stands in for a real GL context. Each uploaded
 //! "texture" is written out as a PPM image so the transfer is observable
@@ -54,7 +54,7 @@ fn run() -> Result<()> {
 
     let bytes = fs::read(&input_path).map_err(|error| {
         invalid(format!(
-            "could not read {} ({error}); see examples/README.md for how to download the Big Buck Bunny sample",
+            "could not read {} ({error}); pass an MP4 path as the first argument to use a different sample",
             input_path.display()
         ))
     })?;

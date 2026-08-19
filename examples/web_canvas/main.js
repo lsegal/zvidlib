@@ -1,5 +1,5 @@
-// See examples/README.md for setup: build the wasm package into ./pkg and place
-// BigBuckBunny.mp4 next to this file before serving it over HTTP(S).
+// See examples/README.md for setup: build the wasm package into ./pkg before serving this
+// directory over HTTP(S). BigBuckBunny.mp4 is already symlinked in from examples/media/.
 import init, { MediaInput, errorCode } from "./pkg/zvidlib.js";
 
 const canvas = document.querySelector("#video");
