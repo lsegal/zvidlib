@@ -438,7 +438,7 @@ fn stbl_box(track: &TrackState) -> Result<Vec<u8>> {
     if track.samples.iter().any(|sample| sample.pts != sample.dts) {
         payload.extend_from_slice(&ctts_box(track)?);
     }
-    payload.extend_from_slice(&stsc_box()?);
+    payload.extend_from_slice(&stsc_box(track)?);
     payload.extend_from_slice(&stsz_box(track)?);
     payload.extend_from_slice(&co64_box(track)?);
     if track.config.kind() == TrackKind::Video {
@@ -547,11 +547,14 @@ fn ctts_box(track: &TrackState) -> Result<Vec<u8>> {
     full_box(*b"ctts", 1, 0, body)
 }
 
-fn stsc_box() -> Result<Vec<u8>> {
-    let mut body = 1_u32.to_be_bytes().to_vec();
-    body.extend_from_slice(&1_u32.to_be_bytes());
-    body.extend_from_slice(&1_u32.to_be_bytes());
-    body.extend_from_slice(&1_u32.to_be_bytes());
+fn stsc_box(track: &TrackState) -> Result<Vec<u8>> {
+    let entry_count = u32::from(!track.samples.is_empty());
+    let mut body = entry_count.to_be_bytes().to_vec();
+    if !track.samples.is_empty() {
+        body.extend_from_slice(&1_u32.to_be_bytes());
+        body.extend_from_slice(&1_u32.to_be_bytes());
+        body.extend_from_slice(&1_u32.to_be_bytes());
+    }
     full_box(*b"stsc", 0, 0, body)
 }
 

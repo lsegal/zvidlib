@@ -5,6 +5,7 @@ All notable changes to zvidlib will be documented in this file.
 ## Unreleased
 
 - Add an `examples/` directory with runnable native GL and browser WebGL canvas examples driven against a Big Buck Bunny MP4 sample.
+- Fix the seekable MP4 muxer emitting an `stsc` entry for tracks finished without any samples, which referenced a chunk that did not exist.
 - Document the required non-seekable `ByteSink` contract and add tests verifying a sink that overrides `is_seekable()` rejects `seek()` with `ErrorKind::Unsupported` and that ordinary MP4 creation rejects such a sink before writing any bytes.
 - Publish API documentation to GitHub Pages and update the README to describe the current pre-1.0 status instead of "in development".
 - Add exact AAC sample-range reads with gapless/edit mapping and audio-clock-driven native/Web Audio playback synchronization with cancellable seek preroll.
