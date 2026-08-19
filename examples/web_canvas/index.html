@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+  <meta charset="utf-8" />
+  <title>zvidlib WebGL canvas example</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 2rem; }
+    canvas { background: #000; border: 1px solid #444; }
+    #status { white-space: pre-wrap; max-width: 40rem; }
+  </style>
+  <h1>zvidlib WebGL canvas example</h1>
+  <p>
+    Opens the Big Buck Bunny sample, demuxes it with zvidlib, and renders synthetic frames onto a
+    WebGL2 canvas. See <a href="../README.md">examples/README.md</a> for why the frames are
+    synthetic rather than decoded.
+  </p>
+  <canvas id="video" width="1280" height="720"></canvas>
+  <p><button id="play" type="button">Play</button></p>
+  <pre id="status">Loading…</pre>
+  <script type="module" src="./main.js"></script>
+</html>
