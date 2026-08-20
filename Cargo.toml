@@ -13,6 +13,11 @@ publish = false
 [lib]
 crate-type = ["rlib", "cdylib"]
 
+[[example]]
+name = "native_gl"
+path = "examples/native_gl/main.rs"
+required-features = ["native"]
+
 [features]
 default = []
 native = []
