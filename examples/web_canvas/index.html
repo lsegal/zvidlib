@@ -4,7 +4,13 @@
   <title>zvidlib WebGL canvas example</title>
   <style>
     body { font-family: system-ui, sans-serif; margin: 2rem; }
-    canvas { background: #000; border: 1px solid #444; }
+    #canvas-wrap { position: relative; width: 100%; max-width: 1280px; }
+    canvas { display: block; width: 100%; height: auto; background: #000; border: 1px solid #444; }
+    #fps {
+      position: absolute; top: 0.5rem; left: 0.5rem; margin: 0;
+      color: #0f0; font: 12px/1.4 ui-monospace, monospace;
+      background: rgba(0, 0, 0, 0.5); padding: 0.15rem 0.4rem; border-radius: 0.25rem;
+    }
     #status { white-space: pre-wrap; max-width: 40rem; }
   </style>
   <h1>zvidlib WebGL canvas example</h1>
@@ -14,7 +20,10 @@
     track, it falls back to a synthetic gradient instead; see
     <a href="../README.md">examples/README.md</a> for details.
   </p>
-  <canvas id="video" width="1280" height="720"></canvas>
+  <div id="canvas-wrap">
+    <canvas id="video" width="1280" height="720"></canvas>
+    <p id="fps">-- fps</p>
+  </div>
   <p><button id="play" type="button">Play</button></p>
   <pre id="status">Loading…</pre>
   <script type="module" src="./main.js"></script>
