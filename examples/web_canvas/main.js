@@ -5,6 +5,7 @@ import init, { MediaInput, errorCode } from "./pkg/zvidlib.js";
 const canvas = document.querySelector("#video");
 const playButton = document.querySelector("#play");
 const status = document.querySelector("#status");
+const fps = document.querySelector("#fps");
 
 const VERTEX_SHADER = `
   attribute vec2 position;
@@ -143,9 +144,26 @@ async function main() {
     frameIndex += 1;
   }
 
+  let framesSinceFpsUpdate = 0;
+  let lastFpsUpdate = performance.now();
+
+  function tickFps() {
+    framesSinceFpsUpdate += 1;
+    const now = performance.now();
+    const elapsed = now - lastFpsUpdate;
+    if (elapsed >= 500) {
+      fps.textContent = `${((framesSinceFpsUpdate * 1000) / elapsed).toFixed(1)} fps`;
+      framesSinceFpsUpdate = 0;
+      lastFpsUpdate = now;
+    }
+  }
+
   async function renderLoop() {
     while (!stopped) {
-      if (playing) await renderFrame();
+      if (playing) {
+        await renderFrame();
+        tickFps();
+      }
       await new Promise((resolve) => requestAnimationFrame(resolve));
     }
   }
