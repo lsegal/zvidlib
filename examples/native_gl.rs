@@ -2,15 +2,15 @@
 //!
 //! Demuxes an MP4 (by default the Big Buck Bunny sample checked into
 //! `examples/media/BigBuckBunny.mp4`) and drives the real
-//! CPU -> native OpenGL [`execute_transfer`] path with a minimal in-process
-//! [`GraphicsAdapter`] that stands in for a real GL context. Each uploaded
-//! "texture" is written out as a PPM image so the transfer is observable
-//! without a window.
+//! CPU -> native OpenGL [`execute_transfer`] path with a [`GraphicsAdapter`] backed by a real
+//! `winit` window and `glutin` OpenGL context, so the uploaded frames are drawn to an actual
+//! window on all platforms. Playback loops back to the first frame once the last one is shown,
+//! and an FPS counter is drawn in the top-left corner.
 //!
-//! zvidlib does not ship a compressed (HEVC/AV1) video decoder backend yet,
-//! so real decoded pixels are not available; this example demuxes the
-//! sample's real track metadata but renders synthetic gradient frames sized
-//! to the demuxed video track in place of `ExactFrameReader::get` output.
+//! zvidlib does not ship a compressed (HEVC/AV1) video decoder backend yet, so real decoded
+//! pixels are not available; this example demuxes the sample's real track metadata but renders
+//! synthetic gradient frames sized to the demuxed video track in place of
+//! `ExactFrameReader::get` output.
 //!
 //! Run with:
 //!
@@ -18,24 +18,38 @@
 //! cargo run --example native_gl --features native
 //! ```
 
-use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::future::Future;
-use std::io::Write;
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::task::{Context, Poll, Waker};
+use std::time::Instant;
+
+use glutin::config::ConfigTemplateBuilder;
+use glutin::context::{ContextApi, ContextAttributesBuilder, PossiblyCurrentContext};
+use glutin::display::GetGlDisplay;
+use glutin::prelude::*;
+use glutin::surface::{Surface, SurfaceAttributesBuilder, SwapInterval, WindowSurface};
+use glutin_winit::DisplayBuilder;
+use raw_window_handle::HasWindowHandle;
+use winit::application::ApplicationHandler;
+use winit::event::WindowEvent;
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::window::{Window, WindowId};
 
 use zvidlib::io::MemorySource;
 use zvidlib::{
-    ColorRange, ContextIdentity, CpuFrameSource, Error, ErrorKind, ExecutionOwner,
-    FrameDestination, FrameSource, GraphicsAdapter, GraphicsApi, GraphicsResource, Limits,
-    Mp4Demuxer, Mp4DemuxerOptions, Orientation, PixelFormat, Plane, ResourceKind,
-    ResourceOwnership, Result, TrackKind, TransferMode, TransferPolicy, TransferStage,
+    ColorRange, CpuFrameSource, Error, ErrorKind, FrameDestination, FrameSource, GraphicsAdapter,
+    GraphicsApi, GraphicsResource, Limits, Mp4Demuxer, Mp4DemuxerOptions, Orientation,
+    PixelFormat, Plane, ResourceKind, ResourceOwnership, Result, TrackKind, TransferPolicy,
     VideoDimensions, VideoFrame, execute_transfer,
 };
 
-const FRAME_COUNT: usize = 5;
+mod gl_window;
+
+use gl_window::{FpsCounter, GlWindowAdapter};
+
 const TEXTURE_HANDLE: u64 = 1;
 
 fn main() {
@@ -50,7 +64,6 @@ fn run() -> Result<()> {
         .nth(1)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("examples/media/BigBuckBunny.mp4"));
-    let output_dir = PathBuf::from("examples/output/native_gl");
 
     let bytes = fs::read(&input_path).map_err(|error| {
         invalid(format!(
@@ -86,51 +99,241 @@ fn run() -> Result<()> {
         video.codec
     );
 
-    fs::create_dir_all(&output_dir).map_err(|error| {
-        invalid(format!(
-            "could not create {}: {error}",
-            output_dir.display()
-        ))
-    })?;
-
-    let mut adapter = RecordingGraphicsAdapter::new();
+    let frame_count = video.presentation_order.len().max(1);
     let limits = Limits::default();
-    let frame_count = FRAME_COUNT.min(video.presentation_order.len().max(1));
-    for index in 0..frame_count {
-        let frame = synthetic_frame(dimensions, index, frame_count, &limits)?;
+    let mut app = App::new(dimensions, frame_count, limits);
+    let event_loop = EventLoop::new()
+        .map_err(|error| invalid(format!("could not create the event loop: {error}")))?;
+    event_loop.set_control_flow(ControlFlow::Poll);
+    event_loop
+        .run_app(&mut app)
+        .map_err(|error| invalid(format!("windowed event loop failed: {error}")))?;
+    app.into_result()
+}
+
+/// Drives the `winit` window, owns the `glutin` GL context, and renders looping frames.
+struct App {
+    dimensions: VideoDimensions,
+    frame_count: usize,
+    limits: Limits,
+    frame_index: usize,
+    fps: FpsCounter,
+    state: Option<WindowState>,
+    error: Option<Error>,
+}
+
+struct WindowState {
+    window: Window,
+    surface: Surface<WindowSurface>,
+    context: PossiblyCurrentContext,
+    adapter: GlWindowAdapter,
+}
+
+impl App {
+    fn new(dimensions: VideoDimensions, frame_count: usize, limits: Limits) -> Self {
+        Self {
+            dimensions,
+            frame_count,
+            limits,
+            frame_index: 0,
+            fps: FpsCounter::new(Instant::now()),
+            state: None,
+            error: None,
+        }
+    }
+
+    fn into_result(self) -> Result<()> {
+        match self.error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    fn fail(&mut self, event_loop: &ActiveEventLoop, error: Error) {
+        eprintln!("error: {}", error.message());
+        self.error = Some(error);
+        event_loop.exit();
+    }
+
+    fn render(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(state) = self.state.as_mut() else {
+            return;
+        };
+
+        let frame = match synthetic_frame(self.dimensions, self.frame_index, self.frame_count, &self.limits) {
+            Ok(frame) => frame,
+            Err(error) => return self.fail(event_loop, error),
+        };
         let resource = GraphicsResource::new(
             GraphicsApi::NativeOpenGl,
-            adapter.context_identity(),
-            adapter.execution_owner(),
+            state.adapter.context_identity(),
+            state.adapter.execution_owner(),
             ResourceKind::Texture2d,
             TEXTURE_HANDLE,
-            dimensions,
+            self.dimensions,
             PixelFormat::Rgba8,
             ColorRange::Full,
             Orientation::TopLeft,
             ResourceOwnership::Caller,
         );
-        let capability = execute_transfer(
-            Some(&mut adapter),
+        if let Err(error) = execute_transfer(
+            Some(&mut state.adapter),
             FrameSource::Cpu(CpuFrameSource {
                 frame: &frame,
                 orientation: Orientation::TopLeft,
             }),
             FrameDestination::Graphics(resource),
             TransferPolicy::any(),
-        )?;
+        ) {
+            return self.fail(event_loop, error);
+        }
 
-        let path = output_dir.join(format!("frame_{index:04}.ppm"));
-        adapter.write_texture_ppm(TEXTURE_HANDLE, dimensions, &path)?;
-        println!(
-            "Uploaded frame {index} via {:?} ({} stage(s)) -> {}",
-            capability.mode,
-            capability.stages.len(),
-            path.display()
+        let fps = self.fps.tick(Instant::now());
+        state.adapter.draw(TEXTURE_HANDLE, self.dimensions, fps);
+        if let Err(error) = state.surface.swap_buffers(&state.context) {
+            return self.fail(
+                event_loop,
+                invalid(format!("could not swap GL buffers: {error}")),
+            );
+        }
+
+        // Loop back to the first frame once the last one has been shown.
+        self.frame_index = (self.frame_index + 1) % self.frame_count.max(1);
+        state.window.request_redraw();
+    }
+}
+
+impl ApplicationHandler for App {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.state.is_some() {
+            return;
+        }
+
+        let window_attributes = Window::default_attributes()
+            .with_title("zvidlib native GL example")
+            .with_inner_size(winit::dpi::LogicalSize::new(
+                self.dimensions.width.max(1),
+                self.dimensions.height.max(1),
+            ));
+        let template = ConfigTemplateBuilder::new();
+        let display_builder = DisplayBuilder::new().with_window_attributes(Some(window_attributes));
+
+        let (window, gl_config) = match display_builder.build(event_loop, template, |configs| {
+            configs
+                .reduce(|accum, config| {
+                    if config.num_samples() > accum.num_samples() {
+                        config
+                    } else {
+                        accum
+                    }
+                })
+                .expect("glutin reported no usable GL configs")
+        }) {
+            Ok((Some(window), config)) => (window, config),
+            Ok((None, _)) => {
+                return self.fail(event_loop, invalid("glutin did not create a window"));
+            }
+            Err(error) => {
+                return self.fail(
+                    event_loop,
+                    invalid(format!("could not create a GL window: {error}")),
+                );
+            }
+        };
+
+        let raw_window_handle = window.window_handle().ok().map(|handle| handle.as_raw());
+        let gl_display = gl_config.display();
+        let context_attributes = ContextAttributesBuilder::new()
+            .with_context_api(ContextApi::OpenGl(None))
+            .build(raw_window_handle);
+        let not_current_context = match unsafe {
+            gl_display.create_context(&gl_config, &context_attributes)
+        } {
+            Ok(context) => context,
+            Err(error) => {
+                return self.fail(
+                    event_loop,
+                    invalid(format!("could not create a GL context: {error}")),
+                );
+            }
+        };
+
+        let size = window.inner_size();
+        let width = NonZeroU32::new(size.width.max(1)).expect("non-zero window width");
+        let height = NonZeroU32::new(size.height.max(1)).expect("non-zero window height");
+        let surface_attributes = SurfaceAttributesBuilder::<WindowSurface>::new().build(
+            raw_window_handle.expect("window must provide a raw window handle"),
+            width,
+            height,
         );
+        let surface = match unsafe { gl_display.create_window_surface(&gl_config, &surface_attributes) } {
+            Ok(surface) => surface,
+            Err(error) => {
+                return self.fail(
+                    event_loop,
+                    invalid(format!("could not create a GL surface: {error}")),
+                );
+            }
+        };
+
+        let context = match not_current_context.make_current(&surface) {
+            Ok(context) => context,
+            Err(error) => {
+                return self.fail(
+                    event_loop,
+                    invalid(format!("could not activate the GL context: {error}")),
+                );
+            }
+        };
+
+        if let Err(error) =
+            surface.set_swap_interval(&context, SwapInterval::Wait(NonZeroU32::new(1).unwrap()))
+        {
+            eprintln!("warning: could not enable vsync: {error}");
+        }
+
+        let gl = unsafe {
+            glow::Context::from_loader_function(|symbol| {
+                let symbol = std::ffi::CString::new(symbol).unwrap();
+                gl_display.get_proc_address(symbol.as_c_str()).cast()
+            })
+        };
+        let adapter = GlWindowAdapter::new(gl);
+
+        window.request_redraw();
+        self.state = Some(WindowState {
+            window,
+            surface,
+            context,
+            adapter,
+        });
     }
 
-    Ok(())
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        let matches_window = self
+            .state
+            .as_ref()
+            .is_some_and(|state| state.window.id() == id);
+        if !matches_window {
+            return;
+        }
+
+        match event {
+            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Resized(size) => {
+                if let Some(state) = self.state.as_mut() {
+                    if let (Some(width), Some(height)) =
+                        (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
+                    {
+                        state.surface.resize(&state.context, width, height);
+                        state.adapter.resize(size.width, size.height);
+                    }
+                }
+            }
+            WindowEvent::RedrawRequested => self.render(event_loop),
+            _ => {}
+        }
+    }
 }
 
 /// Builds a synthetic RGBA gradient frame sized to `dimensions`. Stands in for a decoded frame
@@ -162,131 +365,6 @@ fn synthetic_frame(
         vec![Plane { data, stride }],
         limits,
     )
-}
-
-/// A minimal [`GraphicsAdapter`] that records uploaded textures in memory instead of issuing
-/// real OpenGL calls, so this example runs without windowing or GL dependencies.
-struct RecordingGraphicsAdapter {
-    context: ContextIdentity,
-    owner: ExecutionOwner,
-    textures: HashMap<u64, (VideoDimensions, Vec<u8>)>,
-}
-
-impl RecordingGraphicsAdapter {
-    fn new() -> Self {
-        Self {
-            context: ContextIdentity(1),
-            owner: ExecutionOwner(1),
-            textures: HashMap::new(),
-        }
-    }
-
-    fn write_texture_ppm(
-        &self,
-        handle: u64,
-        dimensions: VideoDimensions,
-        path: &std::path::Path,
-    ) -> Result<()> {
-        let (stored_dimensions, data) = self
-            .textures
-            .get(&handle)
-            .ok_or_else(|| invalid("no texture was uploaded for this handle"))?;
-        if *stored_dimensions != dimensions {
-            return Err(invalid(
-                "stored texture dimensions do not match the request",
-            ));
-        }
-        let mut file = fs::File::create(path)
-            .map_err(|error| invalid(format!("could not create {}: {error}", path.display())))?;
-        write!(
-            file,
-            "P6\n{} {}\n255\n",
-            dimensions.width, dimensions.height
-        )
-        .map_err(|error| invalid(format!("could not write {}: {error}", path.display())))?;
-        for pixel in data.chunks_exact(4) {
-            file.write_all(&pixel[..3])
-                .map_err(|error| invalid(format!("could not write {}: {error}", path.display())))?;
-        }
-        Ok(())
-    }
-}
-
-impl GraphicsAdapter for RecordingGraphicsAdapter {
-    fn api(&self) -> GraphicsApi {
-        GraphicsApi::NativeOpenGl
-    }
-
-    fn context_identity(&self) -> ContextIdentity {
-        self.context
-    }
-
-    fn execution_owner(&self) -> ExecutionOwner {
-        self.owner
-    }
-
-    fn is_current(&self) -> bool {
-        true
-    }
-
-    fn is_context_lost(&self) -> bool {
-        false
-    }
-
-    fn capability(
-        &self,
-        _source: FrameSource<'_>,
-        _destination: &FrameDestination<'_>,
-    ) -> TransferMode {
-        TransferMode::GpuCopy
-    }
-
-    fn upload(
-        &mut self,
-        source: CpuFrameSource<'_>,
-        destination: GraphicsResource,
-        _stages: &[TransferStage],
-    ) -> Result<()> {
-        let plane = source
-            .frame
-            .planes
-            .first()
-            .ok_or_else(|| invalid("the source frame has no planes"))?;
-        self.textures.insert(
-            destination.handle(),
-            (destination.dimensions(), plane.data.clone()),
-        );
-        Ok(())
-    }
-
-    fn readback(
-        &mut self,
-        _source: GraphicsResource,
-        _destination: zvidlib::CpuFrameDestination<'_>,
-        _stages: &[TransferStage],
-    ) -> Result<()> {
-        Err(Error::new(
-            ErrorKind::Unsupported,
-            "RecordingGraphicsAdapter does not implement readback",
-        ))
-    }
-
-    fn copy(
-        &mut self,
-        _source: GraphicsResource,
-        _destination: GraphicsResource,
-        _stages: &[TransferStage],
-    ) -> Result<()> {
-        Err(Error::new(
-            ErrorKind::Unsupported,
-            "RecordingGraphicsAdapter does not implement copy",
-        ))
-    }
-
-    fn delete(&mut self, resource: GraphicsResource) -> Result<()> {
-        self.textures.remove(&resource.handle());
-        Ok(())
-    }
 }
 
 fn invalid(message: impl Into<String>) -> Error {
