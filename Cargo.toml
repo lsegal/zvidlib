@@ -13,6 +13,11 @@ publish = false
 [lib]
 crate-type = ["rlib", "cdylib"]
 
+[[example]]
+name = "native_gl"
+path = "examples/native_gl/main.rs"
+required-features = ["native"]
+
 [features]
 default = []
 native = []
@@ -49,3 +54,10 @@ web-sys = { version = "0.3.104", optional = true, features = [
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 wasm-bindgen-test = "0.3.77"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+glow = "0.18.0"
+glutin = "0.32.3"
+glutin-winit = "0.5.0"
+raw-window-handle = "0.6.2"
+winit = "0.30.13"
