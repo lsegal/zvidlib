@@ -307,6 +307,15 @@ cargo clippy --all-targets --features native -- -D warnings
 
 These commands validate the portable core on both targets. No concrete video or audio codec backend is bundled yet, so they do not by themselves produce an end-to-end media reader or encoded recording.
 
+Native compressed-codec backends use the public `VideoDecoderConformanceVector`
+and `VideoEncoderConformanceVector` runners before registration. Decoder vectors
+pin canonical SHA-256 fingerprints for every presentation frame and are tested
+under sequential, reverse, and seek-heavy access. Encoder vectors validate
+standard configuration and packet timing, then decode through an independently
+conforming backend and enforce an explicit PSNR floor. This gives HEVC and AV1
+work finite, reusable acceptance targets without delegating codec behavior to an
+external library.
+
 ## Building, testing, and using WebAssembly
 
 The `web` feature excludes native-only integrations. During scaffold development, install the Rust target and verify it directly:

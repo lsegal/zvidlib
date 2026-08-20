@@ -4,6 +4,7 @@ All notable changes to zvidlib will be documented in this file.
 
 ## Unreleased
 
+- Add backend-independent HEVC/AV1 codec conformance infrastructure with canonical SHA-256 frame fingerprints, exact-frame decoder access-pattern checks, encoder round-trip quality validation, and a complete 120-frame expected-output vector for the bundled HEVC sample.
 - Make the native GL example (`examples/native_gl/`) draw to a real cross-platform `winit`/`glutin` window instead of writing uploaded frames out as PPM files, with looping playback (matching the web example) and an on-screen FPS counter in the top-left corner.
 - Fix the `web_canvas` example's canvas being a fixed 1280x720 size instead of stretching to fill its container (including on windows wider than the video's intrinsic 1280x720 resolution), and add an on-screen FPS counter in the top-left corner.
 - Fix the browser `WebCodecs` video decoder (`WebVideoDecodeSession::get()`) getting stuck on the first ~12 frames of content with sparse key frames (e.g. the bundled `examples/media/BigBuckBunny.mp4` sample, a single key frame followed by ~120 delta frames): it now keeps a decode session open across `get()` calls instead of resetting and flushing on every call, removing the artificial 12-frame batch cap so `get()` is bounded only by `Limits::max_decode_samples_per_seek`.
