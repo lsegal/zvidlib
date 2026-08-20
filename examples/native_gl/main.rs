@@ -41,9 +41,9 @@ use winit::window::{Window, WindowId};
 use zvidlib::io::MemorySource;
 use zvidlib::{
     ColorRange, CpuFrameSource, Error, ErrorKind, FrameDestination, FrameSource, GraphicsAdapter,
-    GraphicsApi, GraphicsResource, Limits, Mp4Demuxer, Mp4DemuxerOptions, Orientation,
-    PixelFormat, Plane, ResourceKind, ResourceOwnership, Result, TrackKind, TransferPolicy,
-    VideoDimensions, VideoFrame, execute_transfer,
+    GraphicsApi, GraphicsResource, Limits, Mp4Demuxer, Mp4DemuxerOptions, Orientation, PixelFormat,
+    Plane, ResourceKind, ResourceOwnership, Result, TrackKind, TransferPolicy, VideoDimensions,
+    VideoFrame, execute_transfer,
 };
 
 mod gl_window;
@@ -160,7 +160,12 @@ impl App {
             return;
         };
 
-        let frame = match synthetic_frame(self.dimensions, self.frame_index, self.frame_count, &self.limits) {
+        let frame = match synthetic_frame(
+            self.dimensions,
+            self.frame_index,
+            self.frame_count,
+            &self.limits,
+        ) {
             Ok(frame) => frame,
             Err(error) => return self.fail(event_loop, error),
         };
@@ -246,17 +251,16 @@ impl ApplicationHandler for App {
         let context_attributes = ContextAttributesBuilder::new()
             .with_context_api(ContextApi::OpenGl(None))
             .build(raw_window_handle);
-        let not_current_context = match unsafe {
-            gl_display.create_context(&gl_config, &context_attributes)
-        } {
-            Ok(context) => context,
-            Err(error) => {
-                return self.fail(
-                    event_loop,
-                    invalid(format!("could not create a GL context: {error}")),
-                );
-            }
-        };
+        let not_current_context =
+            match unsafe { gl_display.create_context(&gl_config, &context_attributes) } {
+                Ok(context) => context,
+                Err(error) => {
+                    return self.fail(
+                        event_loop,
+                        invalid(format!("could not create a GL context: {error}")),
+                    );
+                }
+            };
 
         let size = window.inner_size();
         let width = NonZeroU32::new(size.width.max(1)).expect("non-zero window width");
@@ -266,15 +270,16 @@ impl ApplicationHandler for App {
             width,
             height,
         );
-        let surface = match unsafe { gl_display.create_window_surface(&gl_config, &surface_attributes) } {
-            Ok(surface) => surface,
-            Err(error) => {
-                return self.fail(
-                    event_loop,
-                    invalid(format!("could not create a GL surface: {error}")),
-                );
-            }
-        };
+        let surface =
+            match unsafe { gl_display.create_window_surface(&gl_config, &surface_attributes) } {
+                Ok(surface) => surface,
+                Err(error) => {
+                    return self.fail(
+                        event_loop,
+                        invalid(format!("could not create a GL surface: {error}")),
+                    );
+                }
+            };
 
         let context = match not_current_context.make_current(&surface) {
             Ok(context) => context,
