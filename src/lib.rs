@@ -10,6 +10,7 @@ pub mod api;
 pub mod audio;
 pub mod codec;
 pub mod codec_config;
+pub mod conformance;
 pub mod io;
 pub mod media;
 pub mod mp4;
@@ -39,6 +40,11 @@ pub use codec::{
     uncompressed_video_decoder_factory,
 };
 pub use codec_config::{DerivedCodecString, derive_codec_string};
+pub use conformance::{
+    ExpectedVideoFrame, FrameDigest, VideoDecoderConformanceReport, VideoDecoderConformanceVector,
+    VideoEncoderConformanceReport, VideoEncoderConformanceVector, verify_video_decoder_conformance,
+    verify_video_encoder_conformance,
+};
 pub use media::{
     AudioBuffer, Codec, ColorRange, Container, PixelFormat, Plane, VideoDimensions, VideoFrame,
 };

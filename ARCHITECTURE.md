@@ -201,6 +201,8 @@ Circular dependencies are forbidden. In particular, timeline and media values ca
 
 ## 12. Verification strategy
 
+- Compressed decoder backends must land with checked-in `VideoDecoderConformanceVector` inputs and expected canonical `FrameDigest` values. The shared runner verifies every presentation frame sequentially, in reverse, and with alternating distant seeks so reorder, reset, and exact-frame behavior cannot be special-cased to linear playback.
+- Compressed encoder backends must land with checked-in `VideoEncoderConformanceVector` source frames and an explicit PSNR floor. The shared runner validates configuration and packet timing, then round-trips the output through a decoder that has independently passed decoder conformance; encoder and decoder implementations must not share a private nonstandard bitstream path.
 - Unit tests cover rational arithmetic, sample-table expansion, edit mapping, audio boundaries, cache eviction, and state transitions.
 - Golden MP4 fixtures cover constant/variable frame rates, B-frame reordering, fragmented files, multiple tracks, edit lists, AAC priming, large offsets, and malformed structures.
 - Codec conformance tests compare presentation hashes and timestamps from known vectors without depending on a single backend.
