@@ -18,13 +18,14 @@ queries `VideoDecoder.isConfigSupported()` first, and `video.get()` still reject
 available. The native example has no `WebCodecs` equivalent, so it still only demuxes the real
 sample's track metadata and does not decode pixels.
 
-## Native GL: `native_gl.rs`
+## Native GL: `native_gl/`
 
 Opens the sample, prints its demuxed video track metadata, and drives the real CPU → native
-OpenGL upload path (`execute_transfer`) through a minimal in-process `GraphicsAdapter` that stands
-in for a real GL context, so the example runs without a window or GL dependencies. Each uploaded
-"texture" is written out as a PPM image under `examples/output/native_gl/` so the transfer is
-observable.
+OpenGL upload path (`execute_transfer`) through a `GraphicsAdapter` backed by a real `winit`
+window and `glutin` OpenGL context, so the uploaded frames are drawn to an actual window on all
+platforms (Windows, macOS, and Linux). Playback loops back to the first frame once the last one
+has been shown, matching the web example's looping behavior, and an FPS counter is drawn in the
+window's top-left corner.
 
 ```console
 cargo run --example native_gl --features native
