@@ -1,3 +1,5 @@
+#![cfg(not(target_arch = "wasm32"))]
+
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
