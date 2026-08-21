@@ -29,61 +29,88 @@ pub fn validate_cdf(cdf: &[u16]) -> Result<usize> {
     Ok(cdf.len())
 }
 
-/// A bounded, MSB-first arithmetic decoder over AV1's 15-bit CDF domain.
+/// A bounded AV1 range-symbol decoder over the 15-bit CDF domain.
 ///
-/// It rejects truncated streams rather than synthesizing padding bits.  The
-/// decoder deliberately has no allocation path and consumes at most the bytes
-/// supplied by its caller.
+/// This is the `init_symbol`/`read_symbol` process from AV1 section 8.2, not a
+/// generic arithmetic coder.  In particular, AV1 uses an inverted code value,
+/// a 15-bit normalized range, and its specified end padding.  The decoder
+/// deliberately has no allocation path and never reads more source bits than
+/// its caller supplied.
 #[derive(Clone, Debug)]
 pub struct Av1SymbolDecoder<'a> {
     input: &'a [u8],
     bit_offset: usize,
-    low: u64,
-    high: u64,
-    code: u64,
+    value: u32,
+    range: u32,
+    remaining_bits: i64,
 }
 
 impl<'a> Av1SymbolDecoder<'a> {
-    const PRECISION: u32 = 32;
-    const TOP: u64 = (1u64 << Self::PRECISION) - 1;
-    const HALF: u64 = 1u64 << (Self::PRECISION - 1);
-    const QUARTER: u64 = Self::HALF >> 1;
-    const THREE_QUARTERS: u64 = Self::QUARTER * 3;
+    const PROB_SHIFT: u32 = 6;
+    const MIN_PROB: u32 = 4;
 
     pub fn new(input: &'a [u8]) -> Result<Self> {
+        if input.is_empty() {
+            return malformed("AV1 arithmetic stream is truncated");
+        }
         let mut decoder = Self {
             input,
             bit_offset: 0,
-            low: 0,
-            high: Self::TOP,
-            code: 0,
+            value: 0,
+            range: AV1_CDF_MAX.into(),
+            remaining_bits: i64::try_from(input.len())
+                .ok()
+                .and_then(|bytes| bytes.checked_mul(8))
+                .and_then(|bits| bits.checked_sub(15))
+                .ok_or_else(|| malformed_error("AV1 arithmetic stream is too large"))?,
         };
-        for _ in 0..Self::PRECISION {
-            decoder.code = (decoder.code << 1) | decoder.read_bit()?;
-        }
+        let initial_bits = input.len().saturating_mul(8).min(15);
+        let initial = decoder.read_bits(initial_bits)?;
+        decoder.value = (u32::from(AV1_CDF_MAX) - 1) ^ (initial << (15 - initial_bits));
         Ok(decoder)
     }
 
     /// Reads one symbol using `cdf`, whose values are upper cumulative bounds
     /// in the inclusive interval `1..=32768`.
     pub fn symbol(&mut self, cdf: &[u16]) -> Result<usize> {
-        let symbols = validate_cdf(cdf)?;
-        let range = self
-            .high
-            .checked_sub(self.low)
-            .and_then(|value| value.checked_add(1))
-            .ok_or_else(|| malformed_error("AV1 arithmetic interval overflow"))?;
-        let scaled = (((self.code - self.low + 1) * u64::from(AV1_CDF_MAX) - 1) / range) as u16;
-        let symbol = cdf
-            .iter()
-            .position(|&upper| scaled < upper)
-            .ok_or_else(|| malformed_error("AV1 arithmetic code is outside its CDF"))?;
-        debug_assert!(symbol < symbols);
-        let lower = if symbol == 0 { 0 } else { cdf[symbol - 1] };
-        let upper = cdf[symbol];
-        self.high = self.low + (range * u64::from(upper) / u64::from(AV1_CDF_MAX)) - 1;
-        self.low += range * u64::from(lower) / u64::from(AV1_CDF_MAX);
-        self.renormalize()?;
+        validate_cdf(cdf)?;
+        let symbols = u32::try_from(cdf.len())
+            .map_err(|_| malformed_error("AV1 CDF has too many symbols"))?;
+        let mut symbol = 0usize;
+        let mut lower = self.range;
+        let mut upper;
+        loop {
+            upper = lower;
+            let inverse_cdf = u32::from(AV1_CDF_MAX) - u32::from(cdf[symbol]);
+            lower =
+                ((self.range >> 8) * (inverse_cdf >> Self::PROB_SHIFT)) >> (7 - Self::PROB_SHIFT);
+            let index = u32::try_from(symbol)
+                .map_err(|_| malformed_error("AV1 CDF symbol index overflows"))?;
+            lower = lower
+                .checked_add(Self::MIN_PROB * (symbols - index - 1))
+                .ok_or_else(|| malformed_error("AV1 arithmetic interval overflow"))?;
+            if self.value >= lower {
+                break;
+            }
+            symbol += 1;
+            if symbol >= cdf.len() {
+                return malformed("AV1 arithmetic code is outside its CDF");
+            }
+        }
+        self.range = upper
+            .checked_sub(lower)
+            .ok_or_else(|| malformed_error("AV1 arithmetic interval underflow"))?;
+        self.value = self
+            .value
+            .checked_sub(lower)
+            .ok_or_else(|| malformed_error("AV1 arithmetic value underflow"))?;
+        let shift = 15 - self.range.ilog2();
+        self.range <<= shift;
+        let available = self.remaining_bits.max(0).min(i64::from(shift)) as usize;
+        let bits = self.read_bits(available)?;
+        self.value = (bits << (shift - u32::try_from(available).unwrap()))
+            ^ (((self.value + 1) << shift) - 1);
+        self.remaining_bits -= i64::from(shift);
         Ok(symbol)
     }
 
@@ -91,38 +118,21 @@ impl<'a> Av1SymbolDecoder<'a> {
         self.bit_offset
     }
 
-    fn renormalize(&mut self) -> Result<()> {
-        loop {
-            if self.high < Self::HALF {
-                // The leading bit is zero.
-            } else if self.low >= Self::HALF {
-                self.low -= Self::HALF;
-                self.high -= Self::HALF;
-                self.code -= Self::HALF;
-            } else if self.low >= Self::QUARTER && self.high < Self::THREE_QUARTERS {
-                self.low -= Self::QUARTER;
-                self.high -= Self::QUARTER;
-                self.code -= Self::QUARTER;
-            } else {
-                break;
-            }
-            self.low <<= 1;
-            self.high = (self.high << 1) | 1;
-            self.code = (self.code << 1) | self.read_bit()?;
+    fn read_bits(&mut self, count: usize) -> Result<u32> {
+        let end = self
+            .bit_offset
+            .checked_add(count)
+            .ok_or_else(|| malformed_error("AV1 arithmetic bit offset overflow"))?;
+        if end > self.input.len().saturating_mul(8) {
+            return malformed("AV1 arithmetic stream is truncated");
         }
-        Ok(())
-    }
-
-    fn read_bit(&mut self) -> Result<u64> {
-        let byte = *self.input.get(self.bit_offset / 8).ok_or_else(|| {
-            Error::new(
-                ErrorKind::MalformedMedia,
-                "AV1 arithmetic stream is truncated",
-            )
-        })?;
-        let bit = u64::from((byte >> (7 - (self.bit_offset & 7))) & 1);
-        self.bit_offset += 1;
-        Ok(bit)
+        let mut value = 0;
+        while self.bit_offset < end {
+            let byte = self.input[self.bit_offset / 8];
+            value = (value << 1) | u32::from((byte >> (7 - (self.bit_offset & 7))) & 1);
+            self.bit_offset += 1;
+        }
+        Ok(value)
     }
 }
 
