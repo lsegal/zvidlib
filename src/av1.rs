@@ -5,8 +5,6 @@
 
 use crate::{Error, ErrorKind, Limits, Result};
 
-const MAX_OPERATING_POINTS: usize = 32;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum Av1SyntaxSupport {
@@ -210,13 +208,29 @@ impl Av1CodecConfigurationRecord {
         if bytes.len() < 12 {
             return malformed("av1C box is truncated");
         }
-        let declared = u32::from_be_bytes(bytes[0..4].try_into().expect("four bytes"));
-        let declared = usize::try_from(declared)
-            .map_err(|_| resource("av1C box size does not fit this platform"))?;
+        let size32 = u32::from_be_bytes(bytes[0..4].try_into().expect("four bytes"));
+        let (declared, payload_offset) = if size32 == 1 {
+            let large = bytes.get(8..16).ok_or_else(|| {
+                Error::new(ErrorKind::MalformedMedia, "extended av1C box is truncated")
+            })?;
+            let declared = u64::from_be_bytes(large.try_into().expect("eight bytes"));
+            let declared = usize::try_from(declared)
+                .map_err(|_| resource("av1C box size does not fit this platform"))?;
+            (declared, 16)
+        } else {
+            let declared = usize::try_from(size32)
+                .map_err(|_| resource("av1C box size does not fit this platform"))?;
+            (declared, 8)
+        };
         if declared != bytes.len() || &bytes[4..8] != b"av1C" {
             return malformed("av1C box size or fourcc is invalid");
         }
-        let p = &bytes[8..];
+        let p = bytes
+            .get(payload_offset..)
+            .ok_or_else(|| Error::new(ErrorKind::MalformedMedia, "av1C record is truncated"))?;
+        if p.len() < 4 {
+            return malformed("av1C record is truncated");
+        }
         if p[0] != 0x81 {
             return malformed("av1C marker or version is invalid");
         }
@@ -235,10 +249,7 @@ impl Av1CodecConfigurationRecord {
         let mut parser = Av1Parser::new(*limits)?;
         let config_obus = parser.parse_low_overhead(&p[4..])?;
         for obu in &config_obus {
-            if !matches!(
-                obu,
-                Av1Obu::SequenceHeader { .. } | Av1Obu::Metadata { .. } | Av1Obu::Skipped { .. }
-            ) {
+            if !matches!(obu, Av1Obu::SequenceHeader { .. } | Av1Obu::Metadata { .. }) {
                 return malformed("av1C configOBUs contain a disallowed OBU type");
             }
         }
@@ -287,7 +298,11 @@ pub struct Av1Parser {
 
 impl Av1Parser {
     pub fn new(limits: Limits) -> Result<Self> {
-        if limits.max_av1_obus_per_unit == 0 || limits.max_av1_tiles_per_frame == 0 {
+        if limits.max_av1_obus_per_unit == 0
+            || limits.max_av1_operating_points == 0
+            || limits.max_av1_operating_points > 32
+            || limits.max_av1_tiles_per_frame == 0
+        {
             return Err(resource("AV1 parser limits must be nonzero"));
         }
         Ok(Self {
@@ -618,9 +633,9 @@ fn parse_sequence_header(payload: &[u8], limits: &Limits) -> Result<Av1SequenceH
         }
         let initial_display_delay_present = b.flag("initial_display_delay_present_flag")?;
         let count = usize::from(b.u8(5, "operating_points_cnt_minus_1")?) + 1;
-        if count > MAX_OPERATING_POINTS {
+        if count > usize::from(limits.max_av1_operating_points) {
             return Err(resource(
-                "AV1 operating point count exceeds specification limit",
+                "AV1 operating point count exceeds configured limit",
             ));
         }
         operating_points
@@ -1120,6 +1135,14 @@ mod tests {
         bytes
     }
 
+    fn extended_av1c(payload: &[u8]) -> Vec<u8> {
+        let mut bytes = 1u32.to_be_bytes().to_vec();
+        bytes.extend_from_slice(b"av1C");
+        bytes.extend_from_slice(&(16u64 + payload.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
     #[test]
     fn parses_sequence_frame_tile_metadata_and_padding_obus() {
         let mut stream = obu(1, &reduced_sequence_payload());
@@ -1161,6 +1184,20 @@ mod tests {
         assert_eq!(parsed.seq_level_idx_0, 4);
         assert_eq!(parsed.config_obus.len(), 1);
         assert_eq!(parsed.support, Av1SyntaxSupport::MainProfile);
+
+        let extended =
+            Av1CodecConfigurationRecord::parse(&extended_av1c(&record), &Limits::default())
+                .unwrap();
+        assert_eq!(extended, parsed);
+    }
+
+    #[test]
+    fn av1c_rejects_disallowed_configuration_obus() {
+        let mut record = vec![0x81, 0x04, 0, 0];
+        record.extend_from_slice(&obu(2, &[]));
+        let error =
+            Av1CodecConfigurationRecord::parse(&av1c(&record), &Limits::default()).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::MalformedMedia);
     }
 
     #[test]
