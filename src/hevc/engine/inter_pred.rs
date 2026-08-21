@@ -1,0 +1,1385 @@
+//! §8.5.3.3.3 — fractional sample interpolation, plus the §8.5.3.3.4
+//! weighted sample prediction combines (default and explicit).
+//!
+//! This module turns a reference-picture sample plane and a motion vector
+//! into an `(nPbW)x(nPbH)` array of inter-predicted samples. Four ITU-T
+//! H.265 subclauses are implemented, in the order §8.5.3.3.3.1 invokes
+//! them:
+//!
+//! * §8.5.3.3.3.2 **luma sample interpolation** ([`interp_luma_block`]) —
+//!   the separable 8-tap quarter-pel filter of equations 8-224..8-238,
+//!   with the Table 8-8 phase selection. `shift1 = Min(4, BitDepthY − 8)`,
+//!   `shift2 = 6`, `shift3 = Max(2, 14 − BitDepthY)`; the full-pel case is
+//!   `A << shift3`.
+//! * §8.5.3.3.3.3 **chroma sample interpolation** ([`interp_chroma_block`])
+//!   — the separable 4-tap eighth-pel filter of equations 8-241..8-261,
+//!   with the Table 8-9 phase selection. `shift1 = Min(4, BitDepthC − 8)`,
+//!   `shift2 = 6`, `shift3 = Max(2, 14 − BitDepthC)`.
+//! * §8.5.3.3.4.2 **default weighted sample prediction**
+//!   ([`default_weighted_pred`]) — the uni- / bi-predictive combine of
+//!   equations 8-262..8-264 (`weightedPredFlag == 0`), with
+//!   `shift1 = Max(2, 14 − bitDepth)`, `shift2 = Max(3, 15 − bitDepth)`.
+//! * §8.5.3.3.4.3 **explicit weighted sample prediction**
+//!   ([`explicit_weighted_pred`]) — the per-reference weight / offset
+//!   combine of equations 8-265..8-277 (`weightedPredFlag == 1`, i.e.
+//!   `weighted_pred_flag` for P slices / `weighted_bipred_flag` for B
+//!   slices), with `log2Wd = log2WeightDenom + shift1`.
+//!
+//! The interpolation processes emit *intermediate* sample values at the
+//! `14 − BitDepth`-bit internal precision the spec carries between
+//! §8.5.3.3.3 and §8.5.3.3.4 (i.e. the `>> shift1` / `>> shift2` outputs,
+//! `A << shift3` for full-pel — they are **not** yet clipped to the
+//! sample range). The weighted combines consume those intermediate
+//! arrays and produce the final `[0, (1 << bitDepth) − 1]` prediction
+//! samples.
+//!
+//! ## Scope
+//!
+//! The numerics are self-contained. The §8.5.3.2 merge / §8.5.3.1 MV
+//! derivation that produces `mvLX`, the §8.5.3.3.1 driver that splits a
+//! motion vector into its integer / fractional parts and walks the
+//! prediction block, and the §8.6.5 picture-construction step that adds
+//! the residual are the caller's responsibility — this module starts at
+//! a `(xInt, yInt, xFrac, yFrac)` location and a reference plane, and
+//! stops at the prediction sample arrays.
+
+/// A reference-picture luma / chroma sample plane with the §8.5.3.3.3
+/// `Clip3( 0, dim − 1, … )` edge-extension border (equations 8-222 /
+/// 8-223 for luma, 8-239 / 8-240 for chroma).
+///
+/// The interpolation filters read samples at negative and past-the-edge
+/// coordinates; this type clamps every access into the valid plane so the
+/// callers can index with the raw `xInt + i` / `yInt + j` offsets the
+/// equations use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RefPlane<'a> {
+    /// Row-major samples, `width * height` of them. `sample[ y * width + x ]`
+    /// is the plane sample at full-sample location `( x, y )`.
+    samples: &'a [i32],
+    /// Plane width in samples (`pic_width_in_luma_samples` for luma, or
+    /// `pic_width_in_luma_samples / SubWidthC` for chroma).
+    width: usize,
+    /// Plane height in samples.
+    height: usize,
+}
+
+impl<'a> RefPlane<'a> {
+    /// Wraps a row-major `width * height` sample plane.
+    ///
+    /// # Errors
+    ///
+    /// [`InterPredError::PlaneLengthMismatch`] if `samples.len()` is not
+    /// exactly `width * height`, or [`InterPredError::EmptyPlane`] if
+    /// either dimension is zero.
+    pub fn new(samples: &'a [i32], width: usize, height: usize) -> Result<Self, InterPredError> {
+        if width == 0 || height == 0 {
+            return Err(InterPredError::EmptyPlane);
+        }
+        let expected = width
+            .checked_mul(height)
+            .ok_or(InterPredError::EmptyPlane)?;
+        if samples.len() != expected {
+            return Err(InterPredError::PlaneLengthMismatch {
+                expected,
+                got: samples.len(),
+            });
+        }
+        Ok(Self {
+            samples,
+            width,
+            height,
+        })
+    }
+
+    /// The plane width in samples.
+    #[inline]
+    #[must_use]
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
+    /// The plane height in samples.
+    #[inline]
+    #[must_use]
+    pub fn height(&self) -> usize {
+        self.height
+    }
+
+    /// Sample at full-sample location `( x, y )` with the §8.5.3.3.3
+    /// `Clip3( 0, dim − 1, … )` edge extension (equations 8-222 / 8-223 /
+    /// 8-239 / 8-240). `x` and `y` may be negative or past the edge.
+    #[inline]
+    #[must_use]
+    pub fn at(&self, x: i32, y: i32) -> i32 {
+        let xc = x.clamp(0, self.width as i32 - 1) as usize;
+        let yc = y.clamp(0, self.height as i32 - 1) as usize;
+        self.samples[yc * self.width + xc]
+    }
+}
+
+/// Errors from the §8.5.3.3 inter-prediction processes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterPredError {
+    /// A reference plane had a zero width or height.
+    EmptyPlane,
+    /// A reference plane's sample count did not equal `width * height`.
+    PlaneLengthMismatch {
+        /// The `width * height` count the plane requires.
+        expected: usize,
+        /// The element count actually supplied.
+        got: usize,
+    },
+    /// A prediction-block dimension (`nPbW` or `nPbH`) was zero.
+    EmptyBlock,
+    /// `xFracL` / `yFracL` was outside the `0..=3` quarter-pel range, or
+    /// `xFracC` / `yFracC` was outside the `0..=7` eighth-pel range.
+    InvalidFraction(i32),
+    /// `bitDepth` was outside the 8..=16 range the equations are
+    /// dimensioned for.
+    InvalidBitDepth(u8),
+    /// The two `predSamplesLX` arrays handed to the weighted combine did
+    /// not have matching `nPbW * nPbH` lengths.
+    ArrayLengthMismatch {
+        /// The `nPbW * nPbH` count both arrays require.
+        expected: usize,
+        /// The element count actually supplied.
+        got: usize,
+    },
+}
+
+impl core::fmt::Display for InterPredError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::EmptyPlane => write!(f, "reference plane has zero width or height"),
+            Self::PlaneLengthMismatch { expected, got } => {
+                write!(
+                    f,
+                    "reference plane length {got} != width*height = {expected}"
+                )
+            }
+            Self::EmptyBlock => write!(f, "prediction block dimension nPbW/nPbH is zero"),
+            Self::InvalidFraction(v) => {
+                write!(
+                    f,
+                    "invalid fractional offset {v} (luma 0..=3, chroma 0..=7)"
+                )
+            }
+            Self::InvalidBitDepth(b) => write!(f, "invalid bitDepth {b} (expected 8..=16)"),
+            Self::ArrayLengthMismatch { expected, got } => {
+                write!(f, "prediction array length {got} != nPbW*nPbH = {expected}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for InterPredError {}
+
+/// `shift1` for luma / chroma interpolation: `Min( 4, BitDepth − 8 )`.
+#[inline]
+fn interp_shift1(bit_depth: u8) -> i32 {
+    core::cmp::min(4, bit_depth as i32 - 8)
+}
+
+/// `shift3` for luma / chroma interpolation: `Max( 2, 14 − BitDepth )`.
+#[inline]
+fn interp_shift3(bit_depth: u8) -> i32 {
+    core::cmp::max(2, 14 - bit_depth as i32)
+}
+
+// ---------------------------------------------------------------------------
+// §8.5.3.3.3.2 — luma sample interpolation
+// ---------------------------------------------------------------------------
+
+/// The §8.5.3.3.3.2 horizontal 8-tap luma filters, indexed by `xFracL`.
+///
+/// Row 0 (`xFracL == 0`) is the identity (the spec leaves the integer
+/// sample untouched on the horizontal pass); rows 1/2/3 are the `a`/`b`/`c`
+/// kernels of equations 8-224 / 8-225 / 8-226, each over the eight taps
+/// `A[−3..4]`.
+const LUMA_FILTER: [[i32; 8]; 4] = [
+    [0, 0, 0, 64, 0, 0, 0, 0],
+    [-1, 4, -10, 58, 17, -5, 1, 0],
+    [-1, 4, -11, 40, 40, -11, 4, -1],
+    [0, 1, -5, 17, 58, -10, 4, -1],
+];
+
+/// One separable 8-tap luma sample at fractional offset `( x_frac, y_frac )`,
+/// centred on integer location `( x_int, y_int )` (§8.5.3.3.3.2).
+///
+/// Returns the intermediate sample value (`>> shift1` / `>> shift2`, or
+/// `A << shift3` for the full-pel `( 0, 0 )` corner) at the
+/// `14 − BitDepthY`-bit internal precision — not yet clipped.
+#[inline]
+fn interp_luma_sample(
+    plane: &RefPlane<'_>,
+    x_int: i32,
+    y_int: i32,
+    x_frac: i32,
+    y_frac: i32,
+    bit_depth: u8,
+) -> i32 {
+    let shift1 = interp_shift1(bit_depth);
+    let shift3 = interp_shift3(bit_depth);
+
+    // Full-pel: A << shift3 (Table 8-8, xFracL == yFracL == 0).
+    if x_frac == 0 && y_frac == 0 {
+        return plane.at(x_int, y_int) << shift3;
+    }
+
+    let hk = &LUMA_FILTER[x_frac as usize];
+    let vk = &LUMA_FILTER[y_frac as usize];
+
+    if y_frac == 0 {
+        // Horizontal-only (a / b / c): >> shift1.
+        let mut acc = 0i32;
+        for (t, &c) in hk.iter().enumerate() {
+            acc += c * plane.at(x_int - 3 + t as i32, y_int);
+        }
+        return acc >> shift1;
+    }
+
+    if x_frac == 0 {
+        // Vertical-only (d / h / n): >> shift1.
+        let mut acc = 0i32;
+        for (t, &c) in vk.iter().enumerate() {
+            acc += c * plane.at(x_int, y_int - 3 + t as i32);
+        }
+        return acc >> shift1;
+    }
+
+    // Two-dimensional (e/i/p, f/j/q, g/k/r): horizontal pass at >> shift1
+    // over rows j = −3..4, then a vertical pass at >> shift2 = 6.
+    let mut acc = 0i32;
+    for (vt, &cv) in vk.iter().enumerate() {
+        let row = y_int - 3 + vt as i32;
+        let mut h = 0i32;
+        for (ht, &ch) in hk.iter().enumerate() {
+            h += ch * plane.at(x_int - 3 + ht as i32, row);
+        }
+        acc += cv * (h >> shift1);
+    }
+    acc >> 6
+}
+
+/// §8.5.3.3.3.2 — fill an `(nPbW)x(nPbH)` luma prediction block.
+///
+/// `( x_int, y_int )` is the integer part of the motion-compensated
+/// top-left location (`xPb + ( mvLX[0] >> 2 )`, `yPb + ( mvLX[1] >> 2 )`
+/// per equations 8-214 / 8-215) and `( x_frac, y_frac )` the
+/// quarter-pel remainder (`mvLX[..] & 3`, equations 8-216 / 8-217). The
+/// output is row-major, `predSamples[ y * nPbW + x ]`, holding the
+/// intermediate-precision values §8.5.3.3.4 consumes.
+///
+/// # Errors
+///
+/// [`InterPredError::EmptyBlock`] for a zero block dimension,
+/// [`InterPredError::InvalidFraction`] for a fraction outside `0..=3`, and
+/// [`InterPredError::InvalidBitDepth`] for a bit depth outside `8..=16`.
+// The §8.5.3.3.3.2 location / fraction / dimension / bit-depth inputs are
+// each distinct spec quantities; bundling them would obscure the mapping.
+#[allow(clippy::too_many_arguments)]
+pub fn interp_luma_block(
+    plane: &RefPlane<'_>,
+    x_int: i32,
+    y_int: i32,
+    x_frac: i32,
+    y_frac: i32,
+    n_pb_w: usize,
+    n_pb_h: usize,
+    bit_depth: u8,
+) -> Result<Vec<i32>, InterPredError> {
+    if n_pb_w == 0 || n_pb_h == 0 {
+        return Err(InterPredError::EmptyBlock);
+    }
+    if !(0..=3).contains(&x_frac) {
+        return Err(InterPredError::InvalidFraction(x_frac));
+    }
+    if !(0..=3).contains(&y_frac) {
+        return Err(InterPredError::InvalidFraction(y_frac));
+    }
+    if !(8..=16).contains(&bit_depth) {
+        return Err(InterPredError::InvalidBitDepth(bit_depth));
+    }
+
+    let mut out = vec![0i32; n_pb_w * n_pb_h];
+    for yl in 0..n_pb_h as i32 {
+        for xl in 0..n_pb_w as i32 {
+            out[(yl as usize) * n_pb_w + xl as usize] =
+                interp_luma_sample(plane, x_int + xl, y_int + yl, x_frac, y_frac, bit_depth);
+        }
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// §8.5.3.3.3.3 — chroma sample interpolation
+// ---------------------------------------------------------------------------
+
+/// The §8.5.3.3.3.3 4-tap chroma filters, indexed by the eighth-pel phase.
+///
+/// Row 0 (phase 0) is the identity; rows 1..7 are the `ab`/`ac`/`ad`/`ae`/
+/// `af`/`ag`/`ah` kernels of equations 8-241..8-247, each over the four
+/// taps `B[−1..2]`.
+const CHROMA_FILTER: [[i32; 4]; 8] = [
+    [0, 64, 0, 0],
+    [-2, 58, 10, -2],
+    [-4, 54, 16, -2],
+    [-6, 46, 28, -4],
+    [-4, 36, 36, -4],
+    [-4, 28, 46, -6],
+    [-2, 16, 54, -4],
+    [-2, 10, 58, -2],
+];
+
+/// One separable 4-tap chroma sample at eighth-pel offset
+/// `( x_frac, y_frac )`, centred on integer location `( x_int, y_int )`
+/// (§8.5.3.3.3.3). Returns the intermediate-precision value (not clipped).
+#[inline]
+fn interp_chroma_sample(
+    plane: &RefPlane<'_>,
+    x_int: i32,
+    y_int: i32,
+    x_frac: i32,
+    y_frac: i32,
+    bit_depth: u8,
+) -> i32 {
+    let shift1 = interp_shift1(bit_depth);
+    let shift3 = interp_shift3(bit_depth);
+
+    if x_frac == 0 && y_frac == 0 {
+        return plane.at(x_int, y_int) << shift3;
+    }
+
+    let hk = &CHROMA_FILTER[x_frac as usize];
+    let vk = &CHROMA_FILTER[y_frac as usize];
+
+    if y_frac == 0 {
+        // Horizontal-only (aX, equations 8-241..8-247): >> shift1.
+        let mut acc = 0i32;
+        for (t, &c) in hk.iter().enumerate() {
+            acc += c * plane.at(x_int - 1 + t as i32, y_int);
+        }
+        return acc >> shift1;
+    }
+
+    if x_frac == 0 {
+        // Vertical-only (Xa, equations 8-248..8-254): >> shift1.
+        let mut acc = 0i32;
+        for (t, &c) in vk.iter().enumerate() {
+            acc += c * plane.at(x_int, y_int - 1 + t as i32);
+        }
+        return acc >> shift1;
+    }
+
+    // Two-dimensional (XY, equations 8-255..8-261): horizontal pass at
+    // >> shift1 over rows i = −1..2, then a vertical pass at >> shift2 = 6.
+    let mut acc = 0i32;
+    for (vt, &cv) in vk.iter().enumerate() {
+        let row = y_int - 1 + vt as i32;
+        let mut h = 0i32;
+        for (ht, &ch) in hk.iter().enumerate() {
+            h += ch * plane.at(x_int - 1 + ht as i32, row);
+        }
+        acc += cv * (h >> shift1);
+    }
+    acc >> 6
+}
+
+/// §8.5.3.3.3.3 — fill an `(nPbW / SubWidthC)x(nPbH / SubHeightC)` chroma
+/// prediction block.
+///
+/// `( x_int, y_int )` is the integer chroma location and
+/// `( x_frac, y_frac )` the eighth-pel remainder (`mvCLX[..] & 7`,
+/// equations 8-220 / 8-221). `block_w` / `block_h` are the chroma block
+/// dimensions. Output is row-major intermediate-precision values.
+///
+/// # Errors
+///
+/// [`InterPredError::EmptyBlock`] for a zero block dimension,
+/// [`InterPredError::InvalidFraction`] for a fraction outside `0..=7`, and
+/// [`InterPredError::InvalidBitDepth`] for a bit depth outside `8..=16`.
+// The §8.5.3.3.3.3 location / fraction / dimension / bit-depth inputs are
+// each distinct spec quantities; bundling them would obscure the mapping.
+#[allow(clippy::too_many_arguments)]
+pub fn interp_chroma_block(
+    plane: &RefPlane<'_>,
+    x_int: i32,
+    y_int: i32,
+    x_frac: i32,
+    y_frac: i32,
+    block_w: usize,
+    block_h: usize,
+    bit_depth: u8,
+) -> Result<Vec<i32>, InterPredError> {
+    if block_w == 0 || block_h == 0 {
+        return Err(InterPredError::EmptyBlock);
+    }
+    if !(0..=7).contains(&x_frac) {
+        return Err(InterPredError::InvalidFraction(x_frac));
+    }
+    if !(0..=7).contains(&y_frac) {
+        return Err(InterPredError::InvalidFraction(y_frac));
+    }
+    if !(8..=16).contains(&bit_depth) {
+        return Err(InterPredError::InvalidBitDepth(bit_depth));
+    }
+
+    let mut out = vec![0i32; block_w * block_h];
+    for yc in 0..block_h as i32 {
+        for xc in 0..block_w as i32 {
+            out[(yc as usize) * block_w + xc as usize] =
+                interp_chroma_sample(plane, x_int + xc, y_int + yc, x_frac, y_frac, bit_depth);
+        }
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// §8.5.3.3.4.2 — default weighted sample prediction
+// ---------------------------------------------------------------------------
+
+/// §8.5.3.3.4.2 — combine the L0 / L1 intermediate prediction arrays into
+/// the final `(nPbW)x(nPbH)` prediction samples (the
+/// `weighted_pred_flag == 0` path, equations 8-262..8-264).
+///
+/// `pred_l0` / `pred_l1` are the intermediate-precision arrays produced by
+/// [`interp_luma_block`] / [`interp_chroma_block`]; `pred_flag_l0` /
+/// `pred_flag_l1` are the §8.5.3.2.1 prediction-list utilisation flags. At
+/// least one flag must be set (the spec only invokes this process for a
+/// predicted block). Output is the clipped `[0, (1 << bitDepth) − 1]`
+/// sample array.
+///
+/// Unused arrays may be empty when their `pred_flag` is `false`; only the
+/// array(s) whose flag is set are read and length-checked.
+///
+/// # Errors
+///
+/// [`InterPredError::EmptyBlock`] for a zero block dimension,
+/// [`InterPredError::InvalidBitDepth`] for a bit depth outside `8..=16`,
+/// [`InterPredError::EmptyPlane`] (re-used as "no list selected") when
+/// both flags are `false`, and [`InterPredError::ArrayLengthMismatch`]
+/// when a selected array is not `nPbW * nPbH` long.
+pub fn default_weighted_pred(
+    pred_l0: &[i32],
+    pred_l1: &[i32],
+    pred_flag_l0: bool,
+    pred_flag_l1: bool,
+    n_pb_w: usize,
+    n_pb_h: usize,
+    bit_depth: u8,
+) -> Result<Vec<i32>, InterPredError> {
+    if n_pb_w == 0 || n_pb_h == 0 {
+        return Err(InterPredError::EmptyBlock);
+    }
+    if !(8..=16).contains(&bit_depth) {
+        return Err(InterPredError::InvalidBitDepth(bit_depth));
+    }
+    let count = n_pb_w * n_pb_h;
+    if pred_flag_l0 && pred_l0.len() != count {
+        return Err(InterPredError::ArrayLengthMismatch {
+            expected: count,
+            got: pred_l0.len(),
+        });
+    }
+    if pred_flag_l1 && pred_l1.len() != count {
+        return Err(InterPredError::ArrayLengthMismatch {
+            expected: count,
+            got: pred_l1.len(),
+        });
+    }
+
+    let shift1 = core::cmp::max(2, 14 - bit_depth as i32);
+    let shift2 = core::cmp::max(3, 15 - bit_depth as i32);
+    let offset1 = 1i32 << (shift1 - 1);
+    let offset2 = 1i32 << (shift2 - 1);
+    let max_val = (1i32 << bit_depth) - 1;
+
+    let mut out = vec![0i32; count];
+    match (pred_flag_l0, pred_flag_l1) {
+        // Uni-predictive from L0 (equation 8-262).
+        (true, false) => {
+            for (o, &p0) in out.iter_mut().zip(pred_l0) {
+                *o = ((p0 + offset1) >> shift1).clamp(0, max_val);
+            }
+        }
+        // Uni-predictive from L1 (equation 8-263).
+        (false, true) => {
+            for (o, &p1) in out.iter_mut().zip(pred_l1) {
+                *o = ((p1 + offset1) >> shift1).clamp(0, max_val);
+            }
+        }
+        // Bi-predictive (equation 8-264).
+        (true, true) => {
+            for ((o, &p0), &p1) in out.iter_mut().zip(pred_l0).zip(pred_l1) {
+                *o = ((p0 + p1 + offset2) >> shift2).clamp(0, max_val);
+            }
+        }
+        (false, false) => return Err(InterPredError::EmptyPlane),
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// §8.5.3.3.4.3 — explicit weighted sample prediction
+// ---------------------------------------------------------------------------
+
+/// §8.5.3.3.4.3 — combine the L0 / L1 intermediate prediction arrays with
+/// per-reference explicit weights and offsets (the `weightedPredFlag == 1`
+/// path, equations 8-265..8-277).
+///
+/// `log2_weight_denom` is the component's raw denominator
+/// (`luma_log2_weight_denom` for luma, `ChromaLog2WeightDenom` for
+/// chroma); the process adds `shift1 = Max(2, 14 − bitDepth)` internally
+/// (equations 8-265 / 8-270). `w0` / `w1` are `LumaWeightLX[refIdxLX]` or
+/// `ChromaWeightLX[refIdxLX][cIdx−1]`; `o0` / `o1` are the offsets
+/// **already scaled** by `WpOffsetBdShiftY` / `WpOffsetBdShiftC`
+/// (equations 8-268 / 8-269 / 8-273 / 8-274). An unused list's weight /
+/// offset values are ignored.
+///
+/// # Errors
+/// Same contract as [`default_weighted_pred`].
+#[allow(clippy::too_many_arguments)]
+pub fn explicit_weighted_pred(
+    pred_l0: &[i32],
+    pred_l1: &[i32],
+    pred_flag_l0: bool,
+    pred_flag_l1: bool,
+    n_pb_w: usize,
+    n_pb_h: usize,
+    log2_weight_denom: u8,
+    w0: i32,
+    o0: i32,
+    w1: i32,
+    o1: i32,
+    bit_depth: u8,
+) -> Result<Vec<i32>, InterPredError> {
+    if n_pb_w == 0 || n_pb_h == 0 {
+        return Err(InterPredError::EmptyBlock);
+    }
+    if !(8..=16).contains(&bit_depth) {
+        return Err(InterPredError::InvalidBitDepth(bit_depth));
+    }
+    let count = n_pb_w * n_pb_h;
+    if pred_flag_l0 && pred_l0.len() != count {
+        return Err(InterPredError::ArrayLengthMismatch {
+            expected: count,
+            got: pred_l0.len(),
+        });
+    }
+    if pred_flag_l1 && pred_l1.len() != count {
+        return Err(InterPredError::ArrayLengthMismatch {
+            expected: count,
+            got: pred_l1.len(),
+        });
+    }
+
+    // Equations 8-265 / 8-270: log2Wd = log2WeightDenom + shift1.
+    let shift1 = core::cmp::max(2, 14 - i64::from(bit_depth));
+    let log2_wd = i64::from(log2_weight_denom) + shift1;
+    let max_val = (1i64 << bit_depth) - 1;
+    let (w0, o0, w1, o1) = (i64::from(w0), i64::from(o0), i64::from(w1), i64::from(o1));
+
+    let mut out = vec![0i32; count];
+    match (pred_flag_l0, pred_flag_l1) {
+        // Uni-predictive from L0 (equation 8-275).
+        (true, false) => {
+            let round = 1i64 << (log2_wd - 1);
+            for (o, &p0) in out.iter_mut().zip(pred_l0) {
+                *o = ((((i64::from(p0) * w0 + round) >> log2_wd) + o0).clamp(0, max_val)) as i32;
+            }
+        }
+        // Uni-predictive from L1 (equation 8-276).
+        (false, true) => {
+            let round = 1i64 << (log2_wd - 1);
+            for (o, &p1) in out.iter_mut().zip(pred_l1) {
+                *o = ((((i64::from(p1) * w1 + round) >> log2_wd) + o1).clamp(0, max_val)) as i32;
+            }
+        }
+        // Bi-predictive (equation 8-277).
+        (true, true) => {
+            let round = (o0 + o1 + 1) << log2_wd;
+            for ((o, &p0), &p1) in out.iter_mut().zip(pred_l0).zip(pred_l1) {
+                *o = (((i64::from(p0) * w0 + i64::from(p1) * w1 + round) >> (log2_wd + 1))
+                    .clamp(0, max_val)) as i32;
+            }
+        }
+        (false, false) => return Err(InterPredError::EmptyPlane),
+    }
+    Ok(out)
+}
+
+/// One reference list's §8.5.3.3.4.3 weights / offsets for one PU,
+/// resolved for its `refIdxLX`: `w` is `LumaWeightLX[refIdx]` /
+/// `ChromaWeightLX[refIdx][j]`; `o` is the corresponding offset already
+/// scaled by `WpOffsetBdShiftY` / `WpOffsetBdShiftC` (equations
+/// 8-268 / 8-269 / 8-273 / 8-274).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WpListWeights {
+    /// `LumaWeightLX[refIdxLX]` (equations 8-266 / 8-267).
+    pub w_luma: i32,
+    /// `luma_offset_lX[refIdxLX] << WpOffsetBdShiftY`.
+    pub o_luma: i32,
+    /// `ChromaWeightLX[refIdxLX][0]` (Cb).
+    pub w_cb: i32,
+    /// `ChromaOffsetLX[refIdxLX][0] << WpOffsetBdShiftC` (Cb).
+    pub o_cb: i32,
+    /// `ChromaWeightLX[refIdxLX][1]` (Cr).
+    pub w_cr: i32,
+    /// `ChromaOffsetLX[refIdxLX][1] << WpOffsetBdShiftC` (Cr).
+    pub o_cr: i32,
+}
+
+/// The complete §8.5.3.3.4.3 inputs for one PU's weighted combine: the
+/// two log2 denominators plus each list's per-component weights, already
+/// resolved for the PU's reference indices.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PuWeights {
+    /// `luma_log2_weight_denom` (§7.4.7.3).
+    pub luma_log2_weight_denom: u8,
+    /// `ChromaLog2WeightDenom` (§7.4.7.3).
+    pub chroma_log2_weight_denom: u8,
+    /// L0 weights (ignored when `predFlagL0 == 0`).
+    pub l0: WpListWeights,
+    /// L1 weights (ignored when `predFlagL1 == 0`).
+    pub l1: WpListWeights,
+}
+
+// ---------------------------------------------------------------------------
+// §8.5.3.3.1 — inter prediction sample block-walk driver
+// ---------------------------------------------------------------------------
+
+/// A `[mvLX[0], mvLX[1]]` motion vector in quarter-luma-sample units
+/// (the §8.5.3 luma MV) — the integer / fractional split of equations
+/// 8-214..8-217 is performed by the driver.
+pub type MotionVector = [i32; 2];
+
+/// One reference list's prediction inputs for a prediction unit: the
+/// reference picture planes selected by §8.5.3.3.2 plus the luma motion
+/// vector mvLX (quarter-pel) and chroma motion vector mvCLX (eighth-pel,
+/// already derived per §8.5.3.2.10). `pred_flag == false` means the list
+/// is not used and the planes / vectors are ignored.
+#[derive(Debug, Clone, Copy)]
+pub struct ListPrediction<'a> {
+    /// `predFlagLX` — whether reference list X contributes to this PU.
+    pub pred_flag: bool,
+    /// `refPicLXL` — the §8.5.3.3.2 luma reference plane.
+    pub luma: RefPlane<'a>,
+    /// `refPicLXCb` — the §8.5.3.3.2 Cb reference plane (ignored when
+    /// `chroma_array_type == 0`).
+    pub cb: Option<RefPlane<'a>>,
+    /// `refPicLXCr` — the §8.5.3.3.2 Cr reference plane.
+    pub cr: Option<RefPlane<'a>>,
+    /// `mvLX` in quarter-luma-sample units (equations 8-214..8-217).
+    pub mv_l: MotionVector,
+    /// `mvCLX` in eighth-chroma-sample units (equations 8-218..8-221,
+    /// derived from `mvLX` by §8.5.3.2.10).
+    pub mv_c: MotionVector,
+}
+
+/// The reconstructed prediction-sample planes for one inter prediction
+/// block, produced by [`predict_inter_pu`]. Each plane is row-major and
+/// holds the final clipped `[0, (1 << bitDepth) − 1]` prediction samples.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterPrediction {
+    /// `predSamplesL` — `nPbW * nPbH` luma prediction samples.
+    pub luma: Vec<i32>,
+    /// `predSamplesCb` — `(nPbW / SubWidthC) * (nPbH / SubHeightC)` Cb
+    /// prediction samples, empty when `chroma_array_type == 0`.
+    pub cb: Vec<i32>,
+    /// `predSamplesCr` — Cr prediction samples, empty when monochrome.
+    pub cr: Vec<i32>,
+}
+
+/// §8.5.3.3.1 — geometry / format inputs constant for one PU prediction.
+#[derive(Debug, Clone, Copy)]
+pub struct InterPredGeometry {
+    /// `xPb = xCb + xBl` (equation 8-212) — the PU's luma top-left x.
+    pub x_pb: i32,
+    /// `yPb = yCb + yBl` (equation 8-213) — the PU's luma top-left y.
+    pub y_pb: i32,
+    /// `nPbW` — luma prediction-block width.
+    pub n_pb_w: usize,
+    /// `nPbH` — luma prediction-block height.
+    pub n_pb_h: usize,
+    /// `ChromaArrayType` (0 = monochrome, 1 = 4:2:0, 2 = 4:2:2, 3 = 4:4:4).
+    pub chroma_array_type: u8,
+    /// `BitDepthY`.
+    pub bit_depth_luma: u8,
+    /// `BitDepthC`.
+    pub bit_depth_chroma: u8,
+}
+
+/// `(SubWidthC, SubHeightC)` from Table 6-1 (mirrors
+/// [`crate::hevc::engine::picture::sub_wh_c`] without the cross-module dependency).
+#[inline]
+fn sub_wh_c_local(chroma_array_type: u8) -> (i32, i32) {
+    match chroma_array_type {
+        1 => (2, 2),
+        2 => (2, 1),
+        3 => (1, 1),
+        _ => (2, 2),
+    }
+}
+
+/// Fill one list's intermediate luma prediction array for a PU
+/// (§8.5.3.3.3.1 equations 8-214..8-217 + the §8.5.3.3.3.2 per-sample
+/// interpolation). `xPb`/`yPb` are added inside the integer split.
+fn list_luma_pred(
+    list: &ListPrediction<'_>,
+    geom: &InterPredGeometry,
+) -> Result<Vec<i32>, InterPredError> {
+    // §8.5.3.3.3.1: xIntL = xPb + (mvLX[0] >> 2), xFracL = mvLX[0] & 3.
+    let x_int = geom.x_pb + (list.mv_l[0] >> 2);
+    let y_int = geom.y_pb + (list.mv_l[1] >> 2);
+    let x_frac = list.mv_l[0] & 3;
+    let y_frac = list.mv_l[1] & 3;
+    interp_luma_block(
+        &list.luma,
+        x_int,
+        y_int,
+        x_frac,
+        y_frac,
+        geom.n_pb_w,
+        geom.n_pb_h,
+        geom.bit_depth_luma,
+    )
+}
+
+/// Fill one list's intermediate chroma prediction array for a PU
+/// (§8.5.3.3.3.1 equations 8-218..8-221 + §8.5.3.3.3.3 interpolation).
+fn list_chroma_pred(
+    plane: &RefPlane<'_>,
+    list: &ListPrediction<'_>,
+    geom: &InterPredGeometry,
+    sub_w: i32,
+    sub_h: i32,
+) -> Result<Vec<i32>, InterPredError> {
+    // §8.5.3.3.3.1: xIntC = (xPb / SubWidthC) + (mvCLX[0] >> 3),
+    //               xFracC = mvCLX[0] & 7.
+    let x_int = geom.x_pb / sub_w + (list.mv_c[0] >> 3);
+    let y_int = geom.y_pb / sub_h + (list.mv_c[1] >> 3);
+    let x_frac = list.mv_c[0] & 7;
+    let y_frac = list.mv_c[1] & 7;
+    interp_chroma_block(
+        plane,
+        x_int,
+        y_int,
+        x_frac,
+        y_frac,
+        geom.n_pb_w / sub_w as usize,
+        geom.n_pb_h / sub_h as usize,
+        geom.bit_depth_chroma,
+    )
+}
+
+/// §8.5.3.3.1 — drive the inter-prediction sample process for one
+/// prediction block: split each used list's motion vector into its
+/// integer / fractional parts, run the §8.5.3.3.3 fractional-sample
+/// interpolation over the whole block for luma and (when chroma is
+/// present) Cb / Cr, then combine the L0 / L1 intermediate arrays with
+/// the §8.5.3.3.4.2 default weighted sample prediction.
+///
+/// This is the `weightedPredFlag == 0` path of §8.5.3.3.4.1; see
+/// [`predict_inter_pu_weighted`] for the full dispatch including the
+/// §8.5.3.3.4.3 explicit-weighting path.
+///
+/// # Errors
+///
+/// [`InterPredError::EmptyBlock`] for a zero PU dimension,
+/// [`InterPredError::EmptyPlane`] when neither list is used, and the
+/// interpolation / combine errors propagated from the primitives.
+pub fn predict_inter_pu(
+    l0: &ListPrediction<'_>,
+    l1: &ListPrediction<'_>,
+    geom: &InterPredGeometry,
+) -> Result<InterPrediction, InterPredError> {
+    predict_inter_pu_weighted(l0, l1, geom, None)
+}
+
+/// §8.5.3.3.1 + §8.5.3.3.4.1 — as [`predict_inter_pu`], with the
+/// weighted-sample-prediction dispatch: `weights == None` is the
+/// `weightedPredFlag == 0` default combine (§8.5.3.3.4.2);
+/// `weights == Some(..)` is the explicit per-reference combine
+/// (§8.5.3.3.4.3), with the PU's `refIdxLX`-resolved weights carried in
+/// the [`PuWeights`].
+///
+/// # Errors
+/// Same contract as [`predict_inter_pu`].
+pub fn predict_inter_pu_weighted(
+    l0: &ListPrediction<'_>,
+    l1: &ListPrediction<'_>,
+    geom: &InterPredGeometry,
+    weights: Option<&PuWeights>,
+) -> Result<InterPrediction, InterPredError> {
+    if geom.n_pb_w == 0 || geom.n_pb_h == 0 {
+        return Err(InterPredError::EmptyBlock);
+    }
+    if !l0.pred_flag && !l1.pred_flag {
+        return Err(InterPredError::EmptyPlane);
+    }
+
+    // Luma: interpolate each used list, then combine per §8.5.3.3.4.1.
+    let pred_l0_luma = if l0.pred_flag {
+        list_luma_pred(l0, geom)?
+    } else {
+        Vec::new()
+    };
+    let pred_l1_luma = if l1.pred_flag {
+        list_luma_pred(l1, geom)?
+    } else {
+        Vec::new()
+    };
+    let luma = match weights {
+        None => default_weighted_pred(
+            &pred_l0_luma,
+            &pred_l1_luma,
+            l0.pred_flag,
+            l1.pred_flag,
+            geom.n_pb_w,
+            geom.n_pb_h,
+            geom.bit_depth_luma,
+        )?,
+        Some(wp) => explicit_weighted_pred(
+            &pred_l0_luma,
+            &pred_l1_luma,
+            l0.pred_flag,
+            l1.pred_flag,
+            geom.n_pb_w,
+            geom.n_pb_h,
+            wp.luma_log2_weight_denom,
+            wp.l0.w_luma,
+            wp.l0.o_luma,
+            wp.l1.w_luma,
+            wp.l1.o_luma,
+            geom.bit_depth_luma,
+        )?,
+    };
+
+    let (mut cb, mut cr) = (Vec::new(), Vec::new());
+    if geom.chroma_array_type != 0 {
+        let (sub_w, sub_h) = sub_wh_c_local(geom.chroma_array_type);
+        let wp_cb = weights.map(|wp| {
+            (
+                wp.chroma_log2_weight_denom,
+                wp.l0.w_cb,
+                wp.l0.o_cb,
+                wp.l1.w_cb,
+                wp.l1.o_cb,
+            )
+        });
+        let wp_cr = weights.map(|wp| {
+            (
+                wp.chroma_log2_weight_denom,
+                wp.l0.w_cr,
+                wp.l0.o_cr,
+                wp.l1.w_cr,
+                wp.l1.o_cr,
+            )
+        });
+        cb = combine_chroma(l0, l1, geom, sub_w, sub_h, wp_cb, |lp| lp.cb)?;
+        cr = combine_chroma(l0, l1, geom, sub_w, sub_h, wp_cr, |lp| lp.cr)?;
+    }
+
+    Ok(InterPrediction { luma, cb, cr })
+}
+
+/// Interpolate and §8.5.3.3.4-combine one chroma component for a PU.
+/// `select` picks the Cb or Cr reference plane from a [`ListPrediction`];
+/// `wp` is `Some((ChromaLog2WeightDenom, w0, o0, w1, o1))` for the
+/// §8.5.3.3.4.3 explicit path, `None` for the §8.5.3.3.4.2 default.
+fn combine_chroma<'a>(
+    l0: &ListPrediction<'a>,
+    l1: &ListPrediction<'a>,
+    geom: &InterPredGeometry,
+    sub_w: i32,
+    sub_h: i32,
+    wp: Option<(u8, i32, i32, i32, i32)>,
+    select: impl Fn(&ListPrediction<'a>) -> Option<RefPlane<'a>>,
+) -> Result<Vec<i32>, InterPredError> {
+    let cw = geom.n_pb_w / sub_w as usize;
+    let ch = geom.n_pb_h / sub_h as usize;
+    let p0 = if l0.pred_flag {
+        let plane = select(l0).ok_or(InterPredError::EmptyPlane)?;
+        list_chroma_pred(&plane, l0, geom, sub_w, sub_h)?
+    } else {
+        Vec::new()
+    };
+    let p1 = if l1.pred_flag {
+        let plane = select(l1).ok_or(InterPredError::EmptyPlane)?;
+        list_chroma_pred(&plane, l1, geom, sub_w, sub_h)?
+    } else {
+        Vec::new()
+    };
+    match wp {
+        None => default_weighted_pred(
+            &p0,
+            &p1,
+            l0.pred_flag,
+            l1.pred_flag,
+            cw,
+            ch,
+            geom.bit_depth_chroma,
+        ),
+        Some((denom, w0, o0, w1, o1)) => explicit_weighted_pred(
+            &p0,
+            &p1,
+            l0.pred_flag,
+            l1.pred_flag,
+            cw,
+            ch,
+            denom,
+            w0,
+            o0,
+            w1,
+            o1,
+            geom.bit_depth_chroma,
+        ),
+    }
+}
+
+#[cfg(any())]
+mod tests {
+    use super::*;
+
+    /// A flat plane interpolates to the constant sample value scaled to
+    /// the internal precision: every tap kernel sums to 64, so
+    /// `64 * v >> shift1` at 8-bit (`shift1 == 0`) is `64 * v`, matching
+    /// the `v << shift3` (`shift3 == 6`) full-pel value.
+    #[test]
+    fn luma_flat_plane_constant() {
+        let plane_samples = vec![100i32; 16 * 16];
+        let plane = RefPlane::new(&plane_samples, 16, 16).unwrap();
+        for xf in 0..=3 {
+            for yf in 0..=3 {
+                let blk = interp_luma_block(&plane, 5, 5, xf, yf, 4, 4, 8).unwrap();
+                for &s in &blk {
+                    assert_eq!(s, 100 << 6, "xf={xf} yf={yf}");
+                }
+            }
+        }
+    }
+
+    /// Full-pel luma is `A << shift3`; at 8-bit `shift3 == 6`.
+    #[test]
+    fn luma_full_pel_shift3() {
+        let mut s = vec![0i32; 8 * 8];
+        for (i, v) in s.iter_mut().enumerate() {
+            *v = i as i32;
+        }
+        let plane = RefPlane::new(&s, 8, 8).unwrap();
+        let blk = interp_luma_block(&plane, 2, 3, 0, 0, 2, 2, 8).unwrap();
+        // predSamples[0][0] = A(2,3) << 6 = (3*8 + 2) << 6 = 26 << 6.
+        assert_eq!(blk[0], (3 * 8 + 2) << 6);
+        // predSamples[1][1] = A(3,4) << 6 = (4*8 + 3) << 6 = 35 << 6.
+        assert_eq!(blk[3], (4 * 8 + 3) << 6);
+    }
+
+    /// The luma `a` kernel (xFracL == 1) on a known column reproduces
+    /// equation 8-224 hand-computed.
+    #[test]
+    fn luma_a_kernel_hand_value() {
+        // A row of samples; pick a center so the 8 taps land inside.
+        // Coords x = −3..4 around x_int = 5 -> indices 2..9.
+        let mut s = vec![0i32; 16];
+        let vals = [
+            10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160,
+        ];
+        s.copy_from_slice(&vals);
+        let plane = RefPlane::new(&s, 16, 1).unwrap();
+        let blk = interp_luma_block(&plane, 5, 0, 1, 0, 1, 1, 8).unwrap();
+        // a = −A−3 + 4A−2 − 10A−1 + 58A0 + 17A1 − 5A2 + A3, >> shift1(=0).
+        // A−3..A3 = x=2..8 = 30,40,50,60,70,80,90.
+        let expected = -30 + 4 * 40 - 10 * 50 + 58 * 60 + 17 * 70 - 5 * 80 + 90;
+        assert_eq!(blk[0], expected);
+    }
+
+    /// Chroma flat plane interpolates to the constant value (each 4-tap
+    /// kernel sums to 64) for all 8x8 eighth-pel phases.
+    #[test]
+    fn chroma_flat_plane_constant() {
+        let plane_samples = vec![77i32; 12 * 12];
+        let plane = RefPlane::new(&plane_samples, 12, 12).unwrap();
+        for xf in 0..=7 {
+            for yf in 0..=7 {
+                let blk = interp_chroma_block(&plane, 4, 4, xf, yf, 3, 3, 8).unwrap();
+                for &s in &blk {
+                    assert_eq!(s, 77 << 6, "xf={xf} yf={yf}");
+                }
+            }
+        }
+    }
+
+    /// Chroma `ab` kernel (xFracC == 1) reproduces equation 8-241.
+    #[test]
+    fn chroma_ab_kernel_hand_value() {
+        let s = vec![10, 20, 30, 40, 50, 60, 70, 80];
+        let plane = RefPlane::new(&s, 8, 1).unwrap();
+        // x_int = 3, taps x = −1..2 -> x=2,3,4,5 = 30,40,50,60.
+        let blk = interp_chroma_block(&plane, 3, 0, 1, 0, 1, 1, 8).unwrap();
+        // ab = −2B−1 + 58B0 + 10B1 − 2B2, >> shift1(=0).
+        let expected = -2 * 30 + 58 * 40 + 10 * 50 - 2 * 60;
+        assert_eq!(blk[0], expected);
+    }
+
+    /// Edge extension clamps negative / past-edge coordinates.
+    #[test]
+    fn ref_plane_edge_extension() {
+        let s = vec![1, 2, 3, 4, 5, 6]; // 3x2
+        let plane = RefPlane::new(&s, 3, 2).unwrap();
+        assert_eq!(plane.at(-5, -5), 1); // top-left corner
+        assert_eq!(plane.at(99, 99), 6); // bottom-right corner
+        assert_eq!(plane.at(1, -1), 2); // clamp y to row 0
+        assert_eq!(plane.at(99, 1), 6); // clamp x to col 2, row 1
+    }
+
+    /// Uni-predictive L0 default weight: (p + offset1) >> shift1, clipped.
+    #[test]
+    fn weighted_uni_l0() {
+        // 8-bit: shift1 = Max(2, 6) = 6, offset1 = 32.
+        let p0 = vec![100 << 6, 0, 200 << 6, 255 << 6];
+        let out = default_weighted_pred(&p0, &[], true, false, 2, 2, 8).unwrap();
+        assert_eq!(out[0], ((100 << 6) + 32) >> 6); // = 100
+        assert_eq!(out[1], 32 >> 6); // = 0
+        assert_eq!(out[2], ((200 << 6) + 32) >> 6); // = 200
+        assert_eq!(out[3], ((255 << 6) + 32) >> 6); // = 255
+    }
+
+    /// Bi-predictive default weight: (p0 + p1 + offset2) >> shift2.
+    #[test]
+    fn weighted_bi() {
+        // 8-bit: shift2 = Max(3, 7) = 7, offset2 = 64.
+        let p0 = vec![100 << 6];
+        let p1 = vec![140 << 6];
+        let out = default_weighted_pred(&p0, &p1, true, true, 1, 1, 8).unwrap();
+        // ((100<<6) + (140<<6) + 64) >> 7 = (6400 + 8960 + 64) >> 7 = 15424>>7 = 120.
+        assert_eq!(out[0], ((100 << 6) + (140 << 6) + 64) >> 7);
+        assert_eq!(out[0], 120);
+    }
+
+    /// Default weight clips to the sample range.
+    #[test]
+    fn weighted_clips() {
+        let p0 = vec![-50 << 6, 1000 << 6];
+        let out = default_weighted_pred(&p0, &[], true, false, 2, 1, 8).unwrap();
+        assert_eq!(out[0], 0);
+        assert_eq!(out[1], 255);
+    }
+
+    /// Explicit uni-predictive L0 weight (equation 8-275): 8-bit,
+    /// denom 3 → log2Wd = 9, w0 = 7, o0 = 2:
+    /// `((100·64·7 + 256) >> 9) + 2 = 88 + 2`.
+    #[test]
+    fn explicit_weighted_uni_l0() {
+        let p0 = vec![100 << 6];
+        let out = explicit_weighted_pred(&p0, &[], true, false, 1, 1, 3, 7, 2, 0, 0, 8).unwrap();
+        assert_eq!(out[0], 90);
+    }
+
+    /// Explicit uni-predictive L1 weight (equation 8-276) mirrors L0.
+    #[test]
+    fn explicit_weighted_uni_l1() {
+        let p1 = vec![100 << 6];
+        let out = explicit_weighted_pred(&[], &p1, false, true, 1, 1, 3, 0, 0, 7, 2, 8).unwrap();
+        assert_eq!(out[0], 90);
+    }
+
+    /// Explicit bi-predictive combine (equation 8-277): denom 0 →
+    /// log2Wd = 6, w0 = 1, w1 = 3, zero offsets:
+    /// `(50·64 + 100·64·3 + 64) >> 7 = 175`.
+    #[test]
+    fn explicit_weighted_bi() {
+        let p0 = vec![50 << 6];
+        let p1 = vec![100 << 6];
+        let out = explicit_weighted_pred(&p0, &p1, true, true, 1, 1, 0, 1, 0, 3, 0, 8).unwrap();
+        assert_eq!(out[0], 175);
+        // Bi offsets enter as ((o0 + o1 + 1) << log2Wd) >> (log2Wd + 1)
+        // ≈ (o0 + o1 + 1) / 2 added to the weighted mean.
+        let out = explicit_weighted_pred(&p0, &p1, true, true, 1, 1, 0, 1, 10, 3, 9, 8).unwrap();
+        assert_eq!(out[0], 175 + 10);
+    }
+
+    /// The explicit combine clips to the sample range on both sides.
+    #[test]
+    fn explicit_weighted_clips() {
+        let p0 = vec![100 << 6, 200 << 6];
+        // Large negative offset floors at 0; weight 127 saturates at 255.
+        let out = explicit_weighted_pred(&p0, &[], true, false, 2, 1, 0, 1, -128, 0, 0, 8).unwrap();
+        assert_eq!(out[0], 0);
+        let out = explicit_weighted_pred(&p0, &[], true, false, 2, 1, 0, 127, 0, 0, 0, 8).unwrap();
+        assert_eq!(out[1], 255);
+    }
+
+    /// With weight `1 << denom` and zero offset, the explicit combine
+    /// degenerates to the default uni combine (§7.4.7.3 inferred values).
+    #[test]
+    fn explicit_default_weights_match_default_combine() {
+        let p0: Vec<i32> = (0..16).map(|v| v << 6).collect();
+        for denom in 0..=7u8 {
+            let explicit =
+                explicit_weighted_pred(&p0, &[], true, false, 4, 4, denom, 1 << denom, 0, 0, 0, 8)
+                    .unwrap();
+            let default = default_weighted_pred(&p0, &[], true, false, 4, 4, 8).unwrap();
+            assert_eq!(explicit, default, "denom={denom}");
+        }
+    }
+
+    /// Explicit-combine argument validation matches the default combine.
+    #[test]
+    fn explicit_weighted_errors() {
+        assert_eq!(
+            explicit_weighted_pred(&[], &[], false, false, 1, 1, 0, 1, 0, 1, 0, 8),
+            Err(InterPredError::EmptyPlane)
+        );
+        assert_eq!(
+            explicit_weighted_pred(&[1, 2], &[], true, false, 1, 1, 0, 1, 0, 1, 0, 8),
+            Err(InterPredError::ArrayLengthMismatch {
+                expected: 1,
+                got: 2
+            })
+        );
+        assert_eq!(
+            explicit_weighted_pred(&[1], &[], true, false, 0, 1, 0, 1, 0, 1, 0, 8),
+            Err(InterPredError::EmptyBlock)
+        );
+        assert_eq!(
+            explicit_weighted_pred(&[1], &[], true, false, 1, 1, 0, 1, 0, 1, 0, 7),
+            Err(InterPredError::InvalidBitDepth(7))
+        );
+    }
+
+    /// 10-bit full-pel luma uses shift3 = Max(2, 4) = 4.
+    #[test]
+    fn luma_full_pel_10bit() {
+        let s = vec![500i32; 8 * 8];
+        let plane = RefPlane::new(&s, 8, 8).unwrap();
+        let blk = interp_luma_block(&plane, 2, 2, 0, 0, 1, 1, 10).unwrap();
+        assert_eq!(blk[0], 500 << 4);
+    }
+
+    /// Error surface: zero block, bad fraction, bad bit depth, bad plane.
+    #[test]
+    fn errors() {
+        let s = vec![0i32; 4];
+        let plane = RefPlane::new(&s, 2, 2).unwrap();
+        assert_eq!(
+            interp_luma_block(&plane, 0, 0, 0, 0, 0, 1, 8),
+            Err(InterPredError::EmptyBlock)
+        );
+        assert_eq!(
+            interp_luma_block(&plane, 0, 0, 4, 0, 1, 1, 8),
+            Err(InterPredError::InvalidFraction(4))
+        );
+        assert_eq!(
+            interp_chroma_block(&plane, 0, 0, 8, 0, 1, 1, 8),
+            Err(InterPredError::InvalidFraction(8))
+        );
+        assert_eq!(
+            interp_luma_block(&plane, 0, 0, 0, 0, 1, 1, 7),
+            Err(InterPredError::InvalidBitDepth(7))
+        );
+        assert!(matches!(
+            RefPlane::new(&[0, 1, 2], 2, 2),
+            Err(InterPredError::PlaneLengthMismatch { .. })
+        ));
+        assert_eq!(RefPlane::new(&[], 0, 2), Err(InterPredError::EmptyPlane));
+        assert_eq!(
+            default_weighted_pred(&[], &[], false, false, 1, 1, 8),
+            Err(InterPredError::EmptyPlane)
+        );
+        assert!(matches!(
+            default_weighted_pred(&[1, 2], &[], true, false, 1, 1, 8),
+            Err(InterPredError::ArrayLengthMismatch { .. })
+        ));
+    }
+
+    /// End-to-end: interpolate two reference blocks and bi-combine.
+    #[test]
+    fn pipeline_luma_bi() {
+        let a = vec![80i32; 16 * 16];
+        let b = vec![120i32; 16 * 16];
+        let pa = RefPlane::new(&a, 16, 16).unwrap();
+        let pb = RefPlane::new(&b, 16, 16).unwrap();
+        let l0 = interp_luma_block(&pa, 4, 4, 2, 2, 4, 4, 8).unwrap();
+        let l1 = interp_luma_block(&pb, 4, 4, 1, 3, 4, 4, 8).unwrap();
+        let out = default_weighted_pred(&l0, &l1, true, true, 4, 4, 8).unwrap();
+        // Flat planes: l0 == 80<<6 everywhere, l1 == 120<<6; bi-combine
+        // = ((80+120)<<6 + 64) >> 7 = (12800 + 64) >> 7 = 100.
+        for &s in &out {
+            assert_eq!(s, 100);
+        }
+    }
+
+    // -- §8.5.3.3.1 driver tests -------------------------------------------
+
+    /// A full-pel uni-L0 PU on a flat luma plane reproduces the reference
+    /// sample value (full-pel: `A << shift3`, then default-weight
+    /// `(p + offset1) >> shift1` recovers `A`).
+    #[test]
+    fn driver_uni_l0_full_pel_flat() {
+        let luma = vec![130i32; 32 * 32];
+        let cb = vec![70i32; 16 * 16];
+        let cr = vec![200i32; 16 * 16];
+        let lp = RefPlane::new(&luma, 32, 32).unwrap();
+        let cbp = RefPlane::new(&cb, 16, 16).unwrap();
+        let crp = RefPlane::new(&cr, 16, 16).unwrap();
+        let l0 = ListPrediction {
+            pred_flag: true,
+            luma: lp,
+            cb: Some(cbp),
+            cr: Some(crp),
+            mv_l: [0, 0],
+            mv_c: [0, 0],
+        };
+        // Unused L1: a dummy (1x1) plane that is never read.
+        let dummy = vec![0i32; 1];
+        let dp = RefPlane::new(&dummy, 1, 1).unwrap();
+        let l1 = ListPrediction {
+            pred_flag: false,
+            luma: dp,
+            cb: None,
+            cr: None,
+            mv_l: [0, 0],
+            mv_c: [0, 0],
+        };
+        let geom = InterPredGeometry {
+            x_pb: 4,
+            y_pb: 4,
+            n_pb_w: 8,
+            n_pb_h: 8,
+            chroma_array_type: 1,
+            bit_depth_luma: 8,
+            bit_depth_chroma: 8,
+        };
+        let pred = predict_inter_pu(&l0, &l1, &geom).unwrap();
+        assert_eq!(pred.luma.len(), 64);
+        assert_eq!(pred.cb.len(), 16);
+        assert_eq!(pred.cr.len(), 16);
+        assert!(pred.luma.iter().all(|&v| v == 130));
+        assert!(pred.cb.iter().all(|&v| v == 70));
+        assert!(pred.cr.iter().all(|&v| v == 200));
+    }
+
+    /// A full-pel motion vector shifts the reference window: a ramp plane
+    /// predicted with `mvL = [4, 0]` (one full luma sample right) reads
+    /// the column one to the right of `xPb`.
+    #[test]
+    fn driver_full_pel_mv_shifts_window() {
+        // 16-wide luma ramp where sample(x,y) == x.
+        let mut luma = vec![0i32; 16 * 16];
+        for y in 0..16 {
+            for x in 0..16 {
+                luma[y * 16 + x] = x as i32;
+            }
+        }
+        let lp = RefPlane::new(&luma, 16, 16).unwrap();
+        let dummy = vec![0i32; 1];
+        let dp = RefPlane::new(&dummy, 1, 1).unwrap();
+        let l0 = ListPrediction {
+            pred_flag: true,
+            luma: lp,
+            cb: None,
+            cr: None,
+            mv_l: [4, 0], // +1 full luma sample horizontally.
+            mv_c: [0, 0],
+        };
+        let l1 = ListPrediction {
+            pred_flag: false,
+            luma: dp,
+            cb: None,
+            cr: None,
+            mv_l: [0, 0],
+            mv_c: [0, 0],
+        };
+        let geom = InterPredGeometry {
+            x_pb: 2,
+            y_pb: 2,
+            n_pb_w: 4,
+            n_pb_h: 4,
+            chroma_array_type: 0,
+            bit_depth_luma: 8,
+            bit_depth_chroma: 8,
+        };
+        let pred = predict_inter_pu(&l0, &l1, &geom).unwrap();
+        // predSamples[xL] reads ref column xPb + 1 + xL = 3 + xL.
+        for yl in 0..4 {
+            for xl in 0..4 {
+                assert_eq!(pred.luma[yl * 4 + xl], 3 + xl as i32, "xl={xl}");
+            }
+        }
+        assert!(pred.cb.is_empty(), "monochrome PU has no chroma");
+    }
+
+    /// Bi-prediction on two flat planes averages the two reference values.
+    #[test]
+    fn driver_bi_averages() {
+        let a = vec![60i32; 16 * 16];
+        let b = vec![100i32; 16 * 16];
+        let pa = RefPlane::new(&a, 16, 16).unwrap();
+        let pb = RefPlane::new(&b, 16, 16).unwrap();
+        let l0 = ListPrediction {
+            pred_flag: true,
+            luma: pa,
+            cb: None,
+            cr: None,
+            mv_l: [0, 0],
+            mv_c: [0, 0],
+        };
+        let l1 = ListPrediction {
+            pred_flag: true,
+            luma: pb,
+            cb: None,
+            cr: None,
+            mv_l: [2, 1], // quarter-pel; flat plane is unaffected.
+            mv_c: [0, 0],
+        };
+        let geom = InterPredGeometry {
+            x_pb: 4,
+            y_pb: 4,
+            n_pb_w: 4,
+            n_pb_h: 4,
+            chroma_array_type: 0,
+            bit_depth_luma: 8,
+            bit_depth_chroma: 8,
+        };
+        let pred = predict_inter_pu(&l0, &l1, &geom).unwrap();
+        // ((60 + 100) >> 1) == 80.
+        assert!(pred.luma.iter().all(|&v| v == 80));
+    }
+
+    /// The driver rejects a PU with no list selected and a zero block.
+    #[test]
+    fn driver_errors() {
+        let dummy = vec![0i32; 1];
+        let dp = RefPlane::new(&dummy, 1, 1).unwrap();
+        let none = ListPrediction {
+            pred_flag: false,
+            luma: dp,
+            cb: None,
+            cr: None,
+            mv_l: [0, 0],
+            mv_c: [0, 0],
+        };
+        let geom = InterPredGeometry {
+            x_pb: 0,
+            y_pb: 0,
+            n_pb_w: 4,
+            n_pb_h: 4,
+            chroma_array_type: 0,
+            bit_depth_luma: 8,
+            bit_depth_chroma: 8,
+        };
+        assert_eq!(
+            predict_inter_pu(&none, &none, &geom),
+            Err(InterPredError::EmptyPlane)
+        );
+        let l0 = ListPrediction {
+            pred_flag: true,
+            ..none
+        };
+        let zero = InterPredGeometry { n_pb_w: 0, ..geom };
+        assert_eq!(
+            predict_inter_pu(&l0, &none, &zero),
+            Err(InterPredError::EmptyBlock)
+        );
+    }
+}
