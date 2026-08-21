@@ -9,6 +9,7 @@
 pub mod api;
 pub mod audio;
 pub mod av1;
+mod av1_encoder;
 pub mod codec;
 pub mod codec_config;
 pub mod conformance;
@@ -40,6 +41,7 @@ pub use av1::{
     Av1ObuHeader, Av1ObuType, Av1OperatingPoint, Av1Parser, Av1SequenceHeader, Av1SyntaxSupport,
     Av1TileGroup,
 };
+pub use av1_encoder::native_av1_video_encoder_factory;
 pub use codec::{
     AudioDrain, AudioEncoder, AudioEncoderFormat, AudioGapless, CancellationToken,
     CodecImplementation, CodecProfile, CodecSupport, DecodeStatistics, DecodedVideoFrame,

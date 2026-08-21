@@ -2,7 +2,7 @@
 
 zvidlib is a Rust library for frame-accurate video and synchronized audio I/O on native and WebAssembly targets. Its primary jobs are reading an MP4 into a GL/WebGL canvas and writing canvas frames plus an audio stream into an MP4, behind a small API centered on indexed `get` and `put` operations.
 
-> **Project status:** zvidlib is pre-1.0 and its API may still change before the first release. The portable foundation now includes checked timeline arithmetic, validated media buffers, asynchronous byte I/O, CPU/GL/WebGL transfer contracts, bounded ordinary/fragmented MP4 sample indexing, normalized codec factories, bounded exact-frame video decoding, exact AAC sample reads, audio-clock playback control and adapter contracts, encoder contracts, strict indexed output, seekable MP4 muxing, and the browser WebAssembly boundary. The generated JavaScript package includes BigInt-safe values, stable errors, Blob/stream input, Blob output, and session/stream/playback handles, and the browser (`web`) build decodes real HEVC/AV1 video through the browser's native `WebCodecs` `VideoDecoder`. Compressed video encoding and concrete audio-device and `AudioContext` bindings remain planned, so those backend-dependent JavaScript operations currently reject with `UNSUPPORTED`. The complete workflow interfaces below remain intentionally aspirational and may change before the first release.
+> **Project status:** zvidlib is pre-1.0 and its API may still change before the first release. The portable foundation now includes checked timeline arithmetic, validated media buffers, asynchronous byte I/O, CPU/GL/WebGL transfer contracts, bounded ordinary/fragmented MP4 sample indexing, normalized codec factories, bounded exact-frame video decoding, exact AAC sample reads, audio-clock playback control and adapter contracts, encoder contracts, strict indexed output, seekable MP4 muxing, and the browser WebAssembly boundary. The generated JavaScript package includes BigInt-safe values, stable errors, Blob/stream input, Blob output, and session/stream/playback handles, and the browser (`web`) build decodes real HEVC/AV1 video through the browser's native `WebCodecs` `VideoDecoder`. Native builds include dependency-free lossless monochrome AV1 Main-profile encoding; color/inter-frame AV1, HEVC encoding, and concrete audio-device and `AudioContext` bindings remain planned. The complete workflow interfaces below remain intentionally aspirational and may change before the first release.
 
 ## Documentation
 
@@ -263,6 +263,8 @@ JavaScript frame indices are `BigInt` so the wrapper can preserve the Rust `u64`
 
 The implemented portable writer core exposes `VideoEncoder` and `AudioEncoder` contracts plus `MediaOutput`. An encoder backend declares its MP4 codec configuration and exact output timescale, then returns `EncodedSample` values with DTS, PTS, duration, sync, and dependency metadata. `MediaOutput::put_video` accepts the shared CPU/GL/WebGL `FrameSource`; it and `put_audio` enforce zero-based consecutive indices and exact frame-aligned audio ranges. `finish` drains both encoders, records audio priming and padding in an edit list, finalizes sample indexes, and flushes the seekable `ByteSink`.
 
+`native_av1_video_encoder_factory()` supplies a dependency-free software backend for lossless 8-bit monochrome AV1 Main profile. It accepts `Gray8` CPU frames, emits one independently decodable keyframe access unit per input frame, and generates the matching standardized `av1C` box. `VideoEncoderConfig::timescale` and `frame_duration` define the exact constant-rate clock used for emitted DTS, PTS, and duration values. Unsupported color formats, hardware requirements, private configuration bytes, out-of-level rates/dimensions, and resource-limit violations are rejected during capability discovery or creation.
+
 Frame indices are zero-based. A video `get(n)` returns exactly frame `n` in presentation order, not merely the nearest keyframe. The matching audio `get(n)` returns the half-open sample interval covered by video frame `n`; sample-accurate APIs will also be available for audio-only use.
 
 Runnable versions of the native GL and browser WebGL workflows above, driven against a real Big Buck Bunny MP4 sample, live in [`examples/`](examples/README.md).
@@ -305,7 +307,7 @@ cargo fmt --all -- --check
 cargo clippy --all-targets --features native -- -D warnings
 ```
 
-These commands validate the portable core on both targets. Native builds include a dependency-free pure-Rust HEVC Main decoder; native AV1 decoding, compressed video encoding, and concrete audio codecs remain planned.
+These commands validate the portable core on both targets. Native builds include a dependency-free pure-Rust HEVC Main decoder and the lossless monochrome AV1 encoder described above; native AV1 decoding, other compressed video encoding, and concrete audio codecs remain planned.
 
 Native compressed-codec backends use the public `VideoDecoderConformanceVector`
 and `VideoEncoderConformanceVector` runners before registration. Decoder vectors
