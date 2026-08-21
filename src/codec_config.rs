@@ -8,7 +8,7 @@
 
 use crate::codec::CodecProfile;
 use crate::media::Codec;
-use crate::{Error, ErrorKind, Result};
+use crate::{Av1CodecConfigurationRecord, Error, ErrorKind, Limits, Result};
 
 /// A codec string plus the normalized profile it was derived from.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -133,25 +133,12 @@ fn derive_hevc(decoder_config: &[u8]) -> Result<DerivedCodecString> {
 // ...
 
 fn derive_av1(decoder_config: &[u8]) -> Result<DerivedCodecString> {
-    let payload = box_payload(decoder_config, b"av1C")?;
-    if payload.len() < 4 {
-        return Err(Error::new(
-            ErrorKind::MalformedMedia,
-            "av1C configuration is too short",
-        ));
-    }
-    let seq_profile = (payload[1] >> 5) & 0b111;
-    let seq_level_idx_0 = payload[1] & 0b0001_1111;
-    let seq_tier_0 = (payload[2] >> 7) & 0b1;
-    let high_bitdepth = (payload[2] >> 6) & 0b1;
-    let twelve_bit = (payload[2] >> 5) & 0b1;
-    let monochrome = (payload[2] >> 4) & 0b1;
-    let chroma_subsampling_x = (payload[2] >> 3) & 0b1;
-    let chroma_subsampling_y = (payload[2] >> 2) & 0b1;
-    let chroma_sample_position = payload[2] & 0b11;
+    let record = Av1CodecConfigurationRecord::parse(decoder_config, &Limits::default())?;
+    let seq_profile = record.seq_profile;
+    let seq_level_idx_0 = record.seq_level_idx_0;
 
-    let bit_depth: u32 = if high_bitdepth == 1 {
-        if seq_profile == 2 && twelve_bit == 1 {
+    let bit_depth: u32 = if record.high_bitdepth {
+        if seq_profile == 2 && record.twelve_bit {
             12
         } else {
             10
@@ -160,15 +147,23 @@ fn derive_av1(decoder_config: &[u8]) -> Result<DerivedCodecString> {
         8
     };
 
-    let tier_letter = if seq_tier_0 == 1 { 'H' } else { 'M' };
-    let mono = if monochrome == 1 { 1 } else { 0 };
+    let tier_letter = if record.seq_tier_0 { 'H' } else { 'M' };
+    let mono = u8::from(record.monochrome);
+    let chroma_subsampling_x = u8::from(record.chroma_subsampling_x);
+    let chroma_subsampling_y = u8::from(record.chroma_subsampling_y);
+    let chroma_sample_position = record.chroma_sample_position;
     let codec_string = format!(
         "av01.{seq_profile}.{seq_level_idx_0:02}{tier_letter}.{bit_depth:02}.{mono}.{chroma_subsampling_x}{chroma_subsampling_y}{chroma_sample_position}"
     );
 
     Ok(DerivedCodecString {
         codec_string,
-        profile: CodecProfile::Av1Main,
+        profile: match seq_profile {
+            0 => CodecProfile::Av1Main,
+            1 => CodecProfile::Av1High,
+            2 => CodecProfile::Av1Professional,
+            _ => unreachable!("validated AV1 profile"),
+        },
     })
 }
 
@@ -220,6 +215,22 @@ mod tests {
         let derived = derive_codec_string(Codec::Av1, &av1c).unwrap();
         assert_eq!(derived.profile, CodecProfile::Av1Main);
         assert_eq!(derived.codec_string, "av01.0.04M.08.0.000");
+    }
+
+    #[test]
+    fn distinguishes_av1_high_and_professional_profiles() {
+        let high = boxed(b"av1C", &[0x81, 0x24, 0, 0]);
+        assert_eq!(
+            derive_codec_string(Codec::Av1, &high).unwrap().profile,
+            CodecProfile::Av1High
+        );
+        let professional = boxed(b"av1C", &[0x81, 0x44, 0x68, 0]);
+        assert_eq!(
+            derive_codec_string(Codec::Av1, &professional)
+                .unwrap()
+                .profile,
+            CodecProfile::Av1Professional
+        );
     }
 
     #[test]

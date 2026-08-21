@@ -130,6 +130,8 @@ pub enum CodecProfile {
     HevcMain,
     HevcMain10,
     Av1Main,
+    Av1High,
+    Av1Professional,
     AacLowComplexity,
 }
 
