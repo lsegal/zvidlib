@@ -2,15 +2,11 @@
 //!
 //! Demuxes an MP4 (by default the Big Buck Bunny sample checked into
 //! `examples/media/BigBuckBunny.mp4`) and drives the real
-//! CPU -> native OpenGL [`execute_transfer`] path with a [`GraphicsAdapter`] backed by a real
+//! dependency-free native HEVC decoder and the CPU -> native OpenGL [`execute_transfer`] path
+//! with a [`GraphicsAdapter`] backed by a real
 //! `winit` window and `glutin` OpenGL context, so the uploaded frames are drawn to an actual
 //! window on all platforms. Playback loops back to the first frame once the last one is shown,
 //! and an FPS counter is drawn in the top-left corner.
-//!
-//! zvidlib does not ship a compressed (HEVC/AV1) video decoder backend yet, so real decoded
-//! pixels are not available; this example demuxes the sample's real track metadata but renders
-//! synthetic gradient frames sized to the demuxed video track in place of
-//! `ExactFrameReader::get` output.
 //!
 //! Run with:
 //!
@@ -40,10 +36,11 @@ use winit::window::{Window, WindowId};
 
 use zvidlib::io::MemorySource;
 use zvidlib::{
-    ColorRange, CpuFrameSource, Error, ErrorKind, FrameDestination, FrameSource, GraphicsAdapter,
-    GraphicsApi, GraphicsResource, Limits, Mp4Demuxer, Mp4DemuxerOptions, Orientation, PixelFormat,
-    Plane, ResourceKind, ResourceOwnership, Result, TrackKind, TransferPolicy, VideoDimensions,
-    VideoFrame, execute_transfer,
+    CancellationToken, CodecProfile, ColorRange, CpuFrameSource, Error, ErrorKind,
+    ExactFrameReader, FrameDestination, FrameIndex, FrameSource, GraphicsAdapter, GraphicsApi,
+    GraphicsResource, HardwarePreference, Limits, Mp4Demuxer, Mp4DemuxerOptions, Orientation,
+    PixelFormat, ResourceKind, ResourceOwnership, Result, TrackKind, TransferPolicy,
+    VideoDecoderConfig, VideoDimensions, execute_transfer, native_hevc_video_decoder_factory,
 };
 
 mod gl_window;
@@ -92,16 +89,29 @@ fn run() -> Result<()> {
         video.samples.len(),
         video.presentation_order.len(),
     );
+    let frame_count = video.presentation_order.len().max(1);
+    let limits = Limits::default();
+    let samples = block_on(video.to_encoded_video_samples(&source, &limits))?;
+    let reader = ExactFrameReader::new(
+        &native_hevc_video_decoder_factory(),
+        VideoDecoderConfig {
+            codec: video.codec,
+            profile: CodecProfile::HevcMain,
+            coded_dimensions: dimensions,
+            output_format: PixelFormat::Rgba8,
+            color_range: ColorRange::Limited,
+            hardware: HardwarePreference::Avoid,
+            configuration: video.decoder_config.clone(),
+        },
+        samples,
+        limits,
+    )?;
     println!(
-        "zvidlib has no registered compressed decoder backend yet, so this example renders \
-         synthetic frames through the real CPU -> native GL upload path instead of decoded \
-         {:?} pixels.",
+        "Rendering decoded {:?} pixels through native OpenGL.",
         video.codec
     );
 
-    let frame_count = video.presentation_order.len().max(1);
-    let limits = Limits::default();
-    let mut app = App::new(dimensions, frame_count, limits);
+    let mut app = App::new(dimensions, frame_count, reader);
     let event_loop = EventLoop::new()
         .map_err(|error| invalid(format!("could not create the event loop: {error}")))?;
     event_loop.set_control_flow(ControlFlow::Poll);
@@ -115,8 +125,9 @@ fn run() -> Result<()> {
 struct App {
     dimensions: VideoDimensions,
     frame_count: usize,
-    limits: Limits,
     frame_index: usize,
+    reader: ExactFrameReader,
+    cancellation: CancellationToken,
     fps: FpsCounter,
     state: Option<WindowState>,
     error: Option<Error>,
@@ -130,12 +141,13 @@ struct WindowState {
 }
 
 impl App {
-    fn new(dimensions: VideoDimensions, frame_count: usize, limits: Limits) -> Self {
+    fn new(dimensions: VideoDimensions, frame_count: usize, reader: ExactFrameReader) -> Self {
         Self {
             dimensions,
             frame_count,
-            limits,
             frame_index: 0,
+            reader,
+            cancellation: CancellationToken::new(),
             fps: FpsCounter::new(Instant::now()),
             state: None,
             error: None,
@@ -160,12 +172,10 @@ impl App {
             return;
         };
 
-        let frame = match synthetic_frame(
-            self.dimensions,
-            self.frame_index,
-            self.frame_count,
-            &self.limits,
-        ) {
+        let frame = match self
+            .reader
+            .get(FrameIndex(self.frame_index as u64), &self.cancellation)
+        {
             Ok(frame) => frame,
             Err(error) => return self.fail(event_loop, error),
         };
@@ -177,7 +187,7 @@ impl App {
             TEXTURE_HANDLE,
             self.dimensions,
             PixelFormat::Rgba8,
-            ColorRange::Full,
+            ColorRange::Limited,
             Orientation::TopLeft,
             ResourceOwnership::Caller,
         );
@@ -339,37 +349,6 @@ impl ApplicationHandler for App {
             _ => {}
         }
     }
-}
-
-/// Builds a synthetic RGBA gradient frame sized to `dimensions`. Stands in for a decoded frame
-/// until zvidlib registers a compressed video decoder backend.
-fn synthetic_frame(
-    dimensions: VideoDimensions,
-    index: usize,
-    frame_count: usize,
-    limits: &Limits,
-) -> Result<VideoFrame> {
-    let width = dimensions.width as usize;
-    let height = dimensions.height as usize;
-    let stride = width * 4;
-    let phase = (255 * index / frame_count.max(1)) as u8;
-    let mut data = vec![0_u8; stride * height];
-    for y in 0..height {
-        for x in 0..width {
-            let offset = y * stride + x * 4;
-            data[offset] = (255 * x / width.max(1)) as u8;
-            data[offset + 1] = (255 * y / height.max(1)) as u8;
-            data[offset + 2] = phase;
-            data[offset + 3] = 255;
-        }
-    }
-    VideoFrame::new(
-        dimensions,
-        PixelFormat::Rgba8,
-        ColorRange::Full,
-        vec![Plane { data, stride }],
-        limits,
-    )
 }
 
 fn invalid(message: impl Into<String>) -> Error {
