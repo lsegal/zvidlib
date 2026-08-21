@@ -1094,7 +1094,7 @@ fn build_inter_slice_context(
             .slice_loop_filter_across_slices_enabled_flag
             .unwrap_or(pps.pps_loop_filter_across_slices_enabled_flag),
         filter_across_tiles: pps.loop_filter_across_tiles_enabled_flag,
-        deblock_enabled: deblock.map_or(true, |d| !d.disabled_flag),
+        deblock_enabled: deblock.is_none_or(|d| !d.disabled_flag),
         beta_offset_div2: deblock.map_or(0, |d| i32::from(d.beta_offset_div2)),
         tc_offset_div2: deblock.map_or(0, |d| i32::from(d.tc_offset_div2)),
         slice_qp_y: recon.slice_qp_y,
