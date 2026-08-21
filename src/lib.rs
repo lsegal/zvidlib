@@ -8,6 +8,7 @@
 
 pub mod api;
 pub mod audio;
+mod av1_encoder;
 pub mod codec;
 pub mod codec_config;
 pub mod conformance;
@@ -31,6 +32,7 @@ pub use wasm_api::*;
 
 pub use api::{Capability, Error, ErrorKind, Limits, Result, Support, TransferMode};
 pub use audio::{AacDecoder, AacSampleReader, AudioEdit, AudioTrackTiming, EncodedAudioSample};
+pub use av1_encoder::native_av1_video_encoder_factory;
 pub use codec::{
     AudioDrain, AudioEncoder, AudioEncoderFormat, AudioGapless, CancellationToken,
     CodecImplementation, CodecProfile, CodecSupport, DecodeStatistics, DecodedVideoFrame,
