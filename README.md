@@ -307,7 +307,7 @@ cargo fmt --all -- --check
 cargo clippy --all-targets --features native -- -D warnings
 ```
 
-These commands validate the portable core on both targets. Native builds also include the lossless monochrome AV1 encoder described above; other compressed encoder and native decoder backends remain separate capability-gated work.
+These commands validate the portable core on both targets. Native builds include a dependency-free pure-Rust HEVC Main decoder and the lossless monochrome AV1 encoder described above; native AV1 decoding, other compressed video encoding, and concrete audio codecs remain planned.
 
 Native compressed-codec backends use the public `VideoDecoderConformanceVector`
 and `VideoEncoderConformanceVector` runners before registration. Decoder vectors

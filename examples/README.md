@@ -15,12 +15,12 @@ As documented in the main [README](../README.md#implemented-browser-boundary), t
 gradient. Whether that decode actually succeeds depends on the browser and platform: zvidlib
 queries `VideoDecoder.isConfigSupported()` first, and `video.get()` still rejects with
 `UNSUPPORTED` (falling back to the synthetic gradient) if the browser has no HEVC decoder
-available. The native example has no `WebCodecs` equivalent, so it still only demuxes the real
-sample's track metadata and does not decode pixels.
+available. The native build instead uses zvidlib's dependency-free pure-Rust HEVC Main decoder,
+so the native OpenGL example renders the same sample's decoded pixels without a system codec.
 
 ## Native GL: `native_gl/`
 
-Opens the sample, prints its demuxed video track metadata, and drives the real CPU → native
+Opens the sample, decodes its HEVC Main frames in pure Rust, and drives the real CPU → native
 OpenGL upload path (`execute_transfer`) through a `GraphicsAdapter` backed by a real `winit`
 window and `glutin` OpenGL context, so the uploaded frames are drawn to an actual window on all
 platforms (Windows, macOS, and Linux). Playback loops back to the first frame once the last one

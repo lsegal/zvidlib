@@ -22,6 +22,9 @@ pub mod playback;
 pub mod timeline;
 pub mod transfer;
 
+#[cfg(not(target_arch = "wasm32"))]
+mod hevc;
+
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
 mod wasm_api;
 
@@ -70,3 +73,6 @@ pub use transfer::{
     Orientation, ResourceKind, ResourceOwnership, ScaleFilter, TransferCapability, TransferPolicy,
     TransferStage, execute_transfer, inspect_transfer,
 };
+
+#[cfg(not(target_arch = "wasm32"))]
+pub use hevc::native_hevc_video_decoder_factory;
