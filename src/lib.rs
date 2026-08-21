@@ -8,6 +8,7 @@
 
 pub mod api;
 pub mod audio;
+pub mod av1;
 pub mod codec;
 pub mod codec_config;
 pub mod conformance;
@@ -20,6 +21,9 @@ pub mod playback;
 pub mod timeline;
 pub mod transfer;
 
+#[cfg(not(target_arch = "wasm32"))]
+mod hevc;
+
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
 mod wasm_api;
 
@@ -31,6 +35,11 @@ pub use wasm_api::*;
 
 pub use api::{Capability, Error, ErrorKind, Limits, Result, Support, TransferMode};
 pub use audio::{AacDecoder, AacSampleReader, AudioEdit, AudioTrackTiming, EncodedAudioSample};
+pub use av1::{
+    Av1CodecConfigurationRecord, Av1ColorConfig, Av1FrameHeader, Av1FrameType, Av1Metadata, Av1Obu,
+    Av1ObuHeader, Av1ObuType, Av1OperatingPoint, Av1Parser, Av1SequenceHeader, Av1SyntaxSupport,
+    Av1TileGroup,
+};
 pub use codec::{
     AudioDrain, AudioEncoder, AudioEncoderFormat, AudioGapless, CancellationToken,
     CodecImplementation, CodecProfile, CodecSupport, DecodeStatistics, DecodedVideoFrame,
@@ -62,3 +71,6 @@ pub use transfer::{
     Orientation, ResourceKind, ResourceOwnership, ScaleFilter, TransferCapability, TransferPolicy,
     TransferStage, execute_transfer, inspect_transfer,
 };
+
+#[cfg(not(target_arch = "wasm32"))]
+pub use hevc::native_hevc_video_decoder_factory;
