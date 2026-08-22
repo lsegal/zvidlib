@@ -6,6 +6,12 @@
 //! with the trailing adaptation-count element dropped, so each row is ready to pass straight to
 //! [`gamut_bitstream::SymbolEncoder::encode_symbol`] (the M0 frame sets `disable_cdf_update = 1`,
 //! so the tables are never adapted). These values are extracted verbatim from the specification.
+//!
+//! The inter-frame tables below (`IS_INTER` through `MV_FR`) extend the same bounded slice to the
+//! single-reference NEARESTMV/GLOBALMV/NEWMV subset used by [`crate::av1_inter_decoder`]: a single
+//! fixed context (context 0) is used everywhere the full specification varies a CDF by neighbouring
+//! mode/skip/reference state, matching this module's existing "smallest context that keeps bitstream
+//! conformance" precedent (e.g. `TX_4X4`-only coefficient contexts above).
 
 // --- Partition CDFs (Default_Partition_W*_Cdf), indexed [ctx]. ---
 /// `Default_Partition_W8_Cdf` (4 partitions: NONE/HORZ/VERT/SPLIT).
@@ -300,3 +306,64 @@ pub static SIG_REF_DIFF_OFFSET_2D: [(usize, usize); 5] = [(0, 1), (1, 0), (1, 1)
 
 /// `Mag_Ref_Offset_With_Tx_Class[TX_CLASS_2D]` (§8.3.2): neighbour offsets for `coeff_br`.
 pub static MAG_REF_OFFSET_2D: [(usize, usize); 3] = [(0, 1), (1, 0), (1, 1)];
+
+// --- Inter-frame mode/reference/motion-vector CDFs, fixed context 0 only. ---
+
+/// `Default_Is_Inter_Cdf[0]`: is the block inter- or intra-predicted.
+pub static IS_INTER: [u16; 2] = [806, 32768];
+
+/// `Default_Comp_Mode_Cdf[1]`: no-neighbour single versus compound prediction.
+pub static COMP_MODE: [u16; 2] = [24035, 32768];
+
+/// `Default_Comp_Ref_Type_Cdf[2]`: no-neighbour compound direction type.
+pub static COMP_REF_TYPE: [u16; 2] = [9166, 32768];
+
+/// `Default_Uni_Comp_Ref_Cdf[1][0]`: no-neighbour forward versus backward pair.
+pub static UNI_COMP_REF: [u16; 2] = [23152, 32768];
+
+/// `Default_Uni_Comp_Ref_Cdf[1][1]`: no-neighbour LAST/LAST2 selection.
+pub static UNI_COMP_REF_P1: [u16; 2] = [14173, 32768];
+
+/// `Default_Compound_Mode_Cdf[0]`: compound motion-vector mode.
+pub static COMPOUND_MODE: [u16; 8] = [7760, 13823, 15808, 17641, 19156, 20666, 26891, 32768];
+
+/// `Default_Single_Ref_Cdf[1][0]`: no-neighbour `single_ref_p1`.
+pub static SINGLE_REF_P1: [u16; 2] = [16973, 32768];
+
+/// `Default_Single_Ref_Cdf[0][2]`: LAST/LAST2 versus LAST3/GOLDEN.
+pub static SINGLE_REF_P3: [u16; 2] = [19647, 32768];
+
+/// `Default_Single_Ref_Cdf[0][3]`: LAST versus LAST2.
+pub static SINGLE_REF_P4: [u16; 2] = [24773, 32768];
+
+/// `Default_New_Mv_Cdf[0]`: `new_mv` flag (0 selects `NEWMV`).
+pub static NEW_MV: [u16; 2] = [24035, 32768];
+
+/// `Default_Zero_Mv_Cdf[0]`: `zero_mv` flag (0 selects `GLOBALMV`) once `new_mv` is 1.
+pub static ZERO_MV: [u16; 2] = [2175, 32768];
+
+/// `Default_Ref_Mv_Cdf[0]`: nearest versus near motion-vector prediction.
+pub static REF_MV: [u16; 2] = [23974, 32768];
+
+/// `Default_Mv_Joint_Cdf`: which of the two motion-vector components change.
+pub static MV_JOINT: [u16; 4] = [4096, 11264, 19328, 32768];
+
+/// `Default_Mv_Class_Cdf[comp]`: motion-vector class per component (row 0, col 1).
+pub static MV_CLASS: [[u16; 11]; 2] = [
+    [
+        28672, 30976, 31858, 32320, 32551, 32656, 32740, 32757, 32762, 32767, 32768,
+    ],
+    [
+        28672, 30976, 31858, 32320, 32551, 32656, 32740, 32757, 32762, 32767, 32768,
+    ],
+];
+
+/// `Default_Mv_Class0_Bit_Cdf[comp]`: MV_CLASS_0 integer bit.
+pub static MV_CLASS0_BIT: [u16; 2] = [27648, 32768];
+
+/// `Default_Mv_Class0_Fr_Cdf[comp]`: MV_CLASS_0 fractional part.
+pub static MV_CLASS0_FR: [[u16; 4]; 2] =
+    [[16384, 24576, 26624, 32768], [16384, 24576, 26624, 32768]];
+
+/// `Default_Mv_Sign_Cdf[comp]`: motion-vector component sign.
+pub static MV_SIGN: [u16; 2] = [16384, 32768];
