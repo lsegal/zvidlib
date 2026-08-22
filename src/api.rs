@@ -102,6 +102,14 @@ pub struct Limits {
     pub max_av1_tiles_per_frame: u32,
     /// Maximum number of 4x4 AV1 reconstruction blocks decoded per frame.
     pub max_av1_blocks_per_frame: u32,
+    /// Maximum number of CDEF strength units accepted in an AV1 frame header.
+    pub max_av1_cdef_units: u8,
+    /// Maximum number of loop-restoration units accepted per plane per frame.
+    pub max_av1_restoration_units: u32,
+    /// Maximum number of film-grain scaling points accepted per channel.
+    pub max_av1_film_grain_points: u8,
+    /// Maximum number of autoregressive film-grain coefficients accepted per channel.
+    pub max_av1_film_grain_ar_coeffs: u16,
 }
 
 impl Default for Limits {
@@ -119,6 +127,10 @@ impl Default for Limits {
             max_av1_operating_points: 32,
             max_av1_tiles_per_frame: 4_096,
             max_av1_blocks_per_frame: 4_194_304,
+            max_av1_cdef_units: 8,
+            max_av1_restoration_units: 4_096,
+            max_av1_film_grain_points: 14,
+            max_av1_film_grain_ar_coeffs: 24,
         }
     }
 }
@@ -145,5 +157,9 @@ mod tests {
         assert!(limits.max_av1_operating_points > 0);
         assert!(limits.max_av1_tiles_per_frame > 0);
         assert!(limits.max_av1_blocks_per_frame > 0);
+        assert!(limits.max_av1_cdef_units > 0);
+        assert!(limits.max_av1_restoration_units > 0);
+        assert!(limits.max_av1_film_grain_points > 0);
+        assert!(limits.max_av1_film_grain_ar_coeffs > 0);
     }
 }

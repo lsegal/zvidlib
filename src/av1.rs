@@ -142,6 +142,540 @@ pub struct Av1FrameHeader {
     pub parsed_bits: usize,
 }
 
+/// `loop_filter_params()` (AV1 §5.9.11): per-plane, per-direction deblocking
+/// levels, sharpness, and optional per-reference-frame/mode deltas.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Av1LoopFilterParams {
+    /// `loop_filter_level[0..=3]`: luma vertical, luma horizontal, U, V.
+    pub level: [u8; 4],
+    pub sharpness: u8,
+    pub delta_enabled: bool,
+    /// `loop_filter_ref_deltas[0..=7]`, meaningful only when `delta_enabled`.
+    pub ref_deltas: [i8; 8],
+    /// `loop_filter_mode_deltas[0..=1]`, meaningful only when `delta_enabled`.
+    pub mode_deltas: [i8; 2],
+}
+
+impl Av1LoopFilterParams {
+    /// A loop filter configuration with every level at zero, i.e. disabled.
+    pub fn disabled() -> Self {
+        Self {
+            level: [0; 4],
+            sharpness: 0,
+            delta_enabled: false,
+            ref_deltas: [1, 0, 0, 0, 0, -1, -1, -1],
+            mode_deltas: [0, 0],
+        }
+    }
+
+    /// Whether any deblocking edge is actually filtered.
+    pub fn is_active(&self) -> bool {
+        self.level[0] != 0 || self.level[1] != 0
+    }
+}
+
+/// One CDEF strength unit: `cdef_y_pri_strength[i]`, `cdef_y_sec_strength[i]`,
+/// `cdef_uv_pri_strength[i]`, `cdef_uv_sec_strength[i]`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Av1CdefStrength {
+    pub y_primary: u8,
+    pub y_secondary: u8,
+    pub uv_primary: u8,
+    pub uv_secondary: u8,
+}
+
+/// `cdef_params()` (AV1 §5.9.19).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Av1CdefParams {
+    pub damping: u8,
+    pub bits: u8,
+    pub strengths: Vec<Av1CdefStrength>,
+}
+
+impl Av1CdefParams {
+    pub fn disabled() -> Self {
+        Self {
+            damping: 3,
+            bits: 0,
+            strengths: vec![Av1CdefStrength {
+                y_primary: 0,
+                y_secondary: 0,
+                uv_primary: 0,
+                uv_secondary: 0,
+            }],
+        }
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.strengths.iter().any(|s| {
+            s.y_primary != 0 || s.y_secondary != 0 || s.uv_primary != 0 || s.uv_secondary != 0
+        })
+    }
+}
+
+/// Loop restoration type for one plane, `RESTORE_*` in AV1 §5.9.20.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum Av1RestorationType {
+    None,
+    Wiener,
+    Sgrproj,
+    Switchable,
+}
+
+/// `lr_params()` (AV1 §5.9.20).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Av1LrParams {
+    pub frame_restoration_type: [Av1RestorationType; 3],
+    pub unit_size: [u32; 3],
+}
+
+impl Av1LrParams {
+    pub fn disabled() -> Self {
+        Self {
+            frame_restoration_type: [Av1RestorationType::None; 3],
+            unit_size: [256, 256, 256],
+        }
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.frame_restoration_type
+            .iter()
+            .any(|t| !matches!(t, Av1RestorationType::None))
+    }
+}
+
+/// `film_grain_params()` (AV1 §5.9.30), bounded by
+/// [`Limits::max_av1_film_grain_points`] and
+/// [`Limits::max_av1_film_grain_ar_coeffs`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Av1FilmGrainParams {
+    pub apply_grain: bool,
+    pub grain_seed: u16,
+    pub update_grain: bool,
+    pub num_y_points: u8,
+    pub point_y_value: Vec<u8>,
+    pub point_y_scaling: Vec<u8>,
+    pub chroma_scaling_from_luma: bool,
+    pub num_cb_points: u8,
+    pub point_cb_value: Vec<u8>,
+    pub point_cb_scaling: Vec<u8>,
+    pub num_cr_points: u8,
+    pub point_cr_value: Vec<u8>,
+    pub point_cr_scaling: Vec<u8>,
+    pub grain_scaling_minus_8: u8,
+    pub ar_coeff_lag: u8,
+    pub ar_coeffs_y: Vec<i16>,
+    pub ar_coeffs_cb: Vec<i16>,
+    pub ar_coeffs_cr: Vec<i16>,
+    pub ar_coeff_shift_minus_6: u8,
+    pub grain_scale_shift: u8,
+    pub cb_mult: u8,
+    pub cb_luma_mult: u8,
+    pub cb_offset: u16,
+    pub cr_mult: u8,
+    pub cr_luma_mult: u8,
+    pub cr_offset: u16,
+    pub overlap_flag: bool,
+    pub clip_to_restricted_range: bool,
+}
+
+impl Av1FilmGrainParams {
+    pub fn disabled() -> Self {
+        Self {
+            apply_grain: false,
+            grain_seed: 0,
+            update_grain: true,
+            num_y_points: 0,
+            point_y_value: Vec::new(),
+            point_y_scaling: Vec::new(),
+            chroma_scaling_from_luma: false,
+            num_cb_points: 0,
+            point_cb_value: Vec::new(),
+            point_cb_scaling: Vec::new(),
+            num_cr_points: 0,
+            point_cr_value: Vec::new(),
+            point_cr_scaling: Vec::new(),
+            grain_scaling_minus_8: 0,
+            ar_coeff_lag: 0,
+            ar_coeffs_y: Vec::new(),
+            ar_coeffs_cb: Vec::new(),
+            ar_coeffs_cr: Vec::new(),
+            ar_coeff_shift_minus_6: 0,
+            grain_scale_shift: 0,
+            cb_mult: 128,
+            cb_luma_mult: 192,
+            cb_offset: 256,
+            cr_mult: 128,
+            cr_luma_mult: 192,
+            cr_offset: 256,
+            overlap_flag: false,
+            clip_to_restricted_range: false,
+        }
+    }
+}
+
+/// Parses `loop_filter_params()` (AV1 §5.9.11). `coded_lossless` and
+/// `allow_intrabc` gate the syntax exactly as the spec's
+/// `uncompressed_header()` does.
+pub fn parse_loop_filter_params(
+    b: &mut Bits<'_>,
+    coded_lossless: bool,
+    allow_intrabc: bool,
+    num_planes: u8,
+) -> Result<Av1LoopFilterParams> {
+    if coded_lossless || allow_intrabc {
+        return Ok(Av1LoopFilterParams::disabled());
+    }
+    let mut level = [0u8; 4];
+    level[0] = b.u8(6, "loop_filter_level[0]")?;
+    level[1] = b.u8(6, "loop_filter_level[1]")?;
+    if num_planes > 1 && (level[0] != 0 || level[1] != 0) {
+        level[2] = b.u8(6, "loop_filter_level[2]")?;
+        level[3] = b.u8(6, "loop_filter_level[3]")?;
+    }
+    let sharpness = b.u8(3, "loop_filter_sharpness")?;
+    let delta_enabled = b.flag("loop_filter_delta_enabled")?;
+    let mut ref_deltas = [1, 0, 0, 0, 0, -1, -1, -1];
+    let mut mode_deltas = [0i8, 0];
+    if delta_enabled && b.flag("loop_filter_delta_update")? {
+        for delta in &mut ref_deltas {
+            if b.flag("update_ref_delta")? {
+                *delta = b.su(6, "loop_filter_ref_delta")? as i8;
+            }
+        }
+        for delta in &mut mode_deltas {
+            if b.flag("update_mode_delta")? {
+                *delta = b.su(6, "loop_filter_mode_delta")? as i8;
+            }
+        }
+    }
+    Ok(Av1LoopFilterParams {
+        level,
+        sharpness,
+        delta_enabled,
+        ref_deltas,
+        mode_deltas,
+    })
+}
+
+/// Parses `cdef_params()` (AV1 §5.9.19), bounded by
+/// [`Limits::max_av1_cdef_units`].
+pub fn parse_cdef_params(
+    b: &mut Bits<'_>,
+    coded_lossless: bool,
+    allow_intrabc: bool,
+    enable_cdef: bool,
+    bit_depth: u8,
+    num_planes: u8,
+    limits: &Limits,
+) -> Result<Av1CdefParams> {
+    if coded_lossless || allow_intrabc || !enable_cdef {
+        return Ok(Av1CdefParams::disabled());
+    }
+    let damping = b.u8(2, "cdef_damping_minus_3")? + 3;
+    let bits = b.u8(2, "cdef_bits")?;
+    let count = 1usize << bits;
+    if count > usize::from(limits.max_av1_cdef_units) {
+        return Err(resource("AV1 CDEF strength count exceeds configured limit"));
+    }
+    let shift = bit_depth.saturating_sub(8);
+    let mut strengths = Vec::with_capacity(count);
+    for _ in 0..count {
+        let y_primary = b.u8(4, "cdef_y_pri_strength")? << shift;
+        let y_secondary_raw = b.u8(2, "cdef_y_sec_strength")?;
+        let y_secondary = (if y_secondary_raw == 3 {
+            4
+        } else {
+            y_secondary_raw
+        }) << shift;
+        let (uv_primary, uv_secondary) = if num_planes > 1 {
+            let uv_primary = b.u8(4, "cdef_uv_pri_strength")? << shift;
+            let uv_secondary_raw = b.u8(2, "cdef_uv_sec_strength")?;
+            let uv_secondary = (if uv_secondary_raw == 3 {
+                4
+            } else {
+                uv_secondary_raw
+            }) << shift;
+            (uv_primary, uv_secondary)
+        } else {
+            (0, 0)
+        };
+        strengths.push(Av1CdefStrength {
+            y_primary,
+            y_secondary,
+            uv_primary,
+            uv_secondary,
+        });
+    }
+    Ok(Av1CdefParams {
+        damping,
+        bits,
+        strengths,
+    })
+}
+
+/// Parses `lr_params()` (AV1 §5.9.20), bounded by
+/// [`Limits::max_av1_restoration_units`].
+pub fn parse_lr_params(
+    b: &mut Bits<'_>,
+    all_lossless: bool,
+    allow_intrabc: bool,
+    enable_restoration: bool,
+    num_planes: u8,
+    subsampling_x: bool,
+    subsampling_y: bool,
+    use_128x128_superblock: bool,
+    frame_width: u32,
+    frame_height: u32,
+    limits: &Limits,
+) -> Result<Av1LrParams> {
+    if all_lossless || allow_intrabc || !enable_restoration {
+        return Ok(Av1LrParams::disabled());
+    }
+    let mut frame_restoration_type = [Av1RestorationType::None; 3];
+    let mut uses_lr = false;
+    let mut uses_chroma_lr = false;
+    for plane in 0..usize::from(num_planes) {
+        let restoration_type = match b.u8(2, "restoration_type")? {
+            0 => Av1RestorationType::None,
+            1 => Av1RestorationType::Switchable,
+            2 => Av1RestorationType::Wiener,
+            _ => Av1RestorationType::Sgrproj,
+        };
+        frame_restoration_type[plane] = restoration_type;
+        if !matches!(restoration_type, Av1RestorationType::None) {
+            uses_lr = true;
+            if plane > 0 {
+                uses_chroma_lr = true;
+            }
+        }
+    }
+    let mut unit_size = [256u32; 3];
+    if uses_lr {
+        let mut size = if use_128x128_superblock {
+            b.flag("lr_unit_shift")?;
+            128u32
+        } else {
+            let shift = b.flag("lr_unit_shift")?;
+            let shift = if shift {
+                1 + u32::from(b.flag("lr_unit_extra_shift")?)
+            } else {
+                0
+            };
+            64u32 << shift
+        };
+        size = size.min(256);
+        unit_size[0] = size;
+        let uv_shift = if subsampling_x && subsampling_y && uses_chroma_lr {
+            u32::from(b.flag("lr_uv_shift")?)
+        } else {
+            0
+        };
+        unit_size[1] = size >> uv_shift;
+        unit_size[2] = size >> uv_shift;
+    }
+    let luma_units_per_row = (frame_width as u64)
+        .div_ceil(unit_size[0].max(1) as u64)
+        .max(1);
+    let luma_units_per_col = (frame_height as u64)
+        .div_ceil(unit_size[0].max(1) as u64)
+        .max(1);
+    let mut total_units = luma_units_per_row.saturating_mul(luma_units_per_col);
+    for plane in 1..usize::from(num_planes) {
+        let cw = if subsampling_x {
+            frame_width.div_ceil(2)
+        } else {
+            frame_width
+        };
+        let ch = if subsampling_y {
+            frame_height.div_ceil(2)
+        } else {
+            frame_height
+        };
+        let units = (cw as u64)
+            .div_ceil(unit_size[plane].max(1) as u64)
+            .max(1)
+            .saturating_mul((ch as u64).div_ceil(unit_size[plane].max(1) as u64).max(1));
+        total_units = total_units.saturating_add(units);
+    }
+    if total_units > u64::from(limits.max_av1_restoration_units) {
+        return Err(resource(
+            "AV1 loop restoration unit count exceeds configured limit",
+        ));
+    }
+    Ok(Av1LrParams {
+        frame_restoration_type,
+        unit_size,
+    })
+}
+
+/// Parses `film_grain_params()` (AV1 §5.9.30), bounded by
+/// [`Limits::max_av1_film_grain_points`] and
+/// [`Limits::max_av1_film_grain_ar_coeffs`].
+pub fn parse_film_grain_params(
+    b: &mut Bits<'_>,
+    film_grain_params_present: bool,
+    show_frame: bool,
+    showable_frame: bool,
+    error_resilient_mode: bool,
+    monochrome: bool,
+    subsampling_x: bool,
+    subsampling_y: bool,
+    separate_uv_delta_q: bool,
+    limits: &Limits,
+) -> Result<Av1FilmGrainParams> {
+    if !film_grain_params_present || (!show_frame && !showable_frame) {
+        return Ok(Av1FilmGrainParams::disabled());
+    }
+    let apply_grain = b.flag("apply_grain")?;
+    if !apply_grain {
+        return Ok(Av1FilmGrainParams::disabled());
+    }
+    let grain_seed = b.u16(16, "grain_seed")?;
+    let update_grain = if error_resilient_mode {
+        true
+    } else {
+        b.flag("update_grain")?
+    };
+    if !update_grain {
+        // load_grain_params(film_grain_params_ref_idx): temporal grain reuse
+        // is not modeled; treat the referenced parameters as disabled rather
+        // than guessing state this parser does not retain.
+        b.u8(3, "film_grain_params_ref_idx")?;
+        let mut params = Av1FilmGrainParams::disabled();
+        params.apply_grain = true;
+        params.grain_seed = grain_seed;
+        params.update_grain = false;
+        return Ok(params);
+    }
+    let max_points = usize::from(limits.max_av1_film_grain_points);
+    let num_y_points = b.u8(4, "num_y_points")?;
+    if usize::from(num_y_points) > max_points {
+        return Err(resource(
+            "AV1 film grain luma point count exceeds configured limit",
+        ));
+    }
+    let mut point_y_value = Vec::with_capacity(usize::from(num_y_points));
+    let mut point_y_scaling = Vec::with_capacity(usize::from(num_y_points));
+    for _ in 0..num_y_points {
+        point_y_value.push(b.u8(8, "point_y_value")?);
+        point_y_scaling.push(b.u8(8, "point_y_scaling")?);
+    }
+    let chroma_scaling_from_luma = if monochrome {
+        false
+    } else {
+        b.flag("chroma_scaling_from_luma")?
+    };
+    let (mut num_cb_points, mut num_cr_points) = (0u8, 0u8);
+    let (mut point_cb_value, mut point_cb_scaling) = (Vec::new(), Vec::new());
+    let (mut point_cr_value, mut point_cr_scaling) = (Vec::new(), Vec::new());
+    if !monochrome
+        && !chroma_scaling_from_luma
+        && !(subsampling_x && subsampling_y && num_y_points == 0)
+    {
+        num_cb_points = b.u8(4, "num_cb_points")?;
+        num_cr_points = b.u8(4, "num_cr_points")?;
+        if usize::from(num_cb_points) > max_points || usize::from(num_cr_points) > max_points {
+            return Err(resource(
+                "AV1 film grain chroma point count exceeds configured limit",
+            ));
+        }
+        for _ in 0..num_cb_points {
+            point_cb_value.push(b.u8(8, "point_cb_value")?);
+            point_cb_scaling.push(b.u8(8, "point_cb_scaling")?);
+        }
+        for _ in 0..num_cr_points {
+            point_cr_value.push(b.u8(8, "point_cr_value")?);
+            point_cr_scaling.push(b.u8(8, "point_cr_scaling")?);
+        }
+    }
+    let grain_scaling_minus_8 = b.u8(2, "grain_scaling_minus_8")?;
+    let ar_coeff_lag = b.u8(2, "ar_coeff_lag")?;
+    let max_ar = usize::from(limits.max_av1_film_grain_ar_coeffs);
+    let num_pos_luma = usize::from(2 * ar_coeff_lag) * (usize::from(ar_coeff_lag) + 1);
+    let num_pos_chroma = if num_y_points > 0 {
+        num_pos_luma + 1
+    } else {
+        num_pos_luma
+    };
+    if num_y_points > 0 && num_pos_luma > max_ar {
+        return Err(resource(
+            "AV1 film grain luma AR coefficient count exceeds configured limit",
+        ));
+    }
+    if (num_cb_points > 0 || chroma_scaling_from_luma) && num_pos_chroma > max_ar {
+        return Err(resource(
+            "AV1 film grain chroma AR coefficient count exceeds configured limit",
+        ));
+    }
+    let mut ar_coeffs_y = Vec::new();
+    if num_y_points > 0 {
+        for _ in 0..num_pos_luma {
+            ar_coeffs_y.push(i16::from(b.u8(8, "ar_coeffs_y_plus_128")?) - 128);
+        }
+    }
+    let mut ar_coeffs_cb = Vec::new();
+    if chroma_scaling_from_luma || num_cb_points > 0 {
+        for _ in 0..num_pos_chroma {
+            ar_coeffs_cb.push(i16::from(b.u8(8, "ar_coeffs_cb_plus_128")?) - 128);
+        }
+    }
+    let mut ar_coeffs_cr = Vec::new();
+    if chroma_scaling_from_luma || num_cr_points > 0 {
+        for _ in 0..num_pos_chroma {
+            ar_coeffs_cr.push(i16::from(b.u8(8, "ar_coeffs_cr_plus_128")?) - 128);
+        }
+    }
+    let ar_coeff_shift_minus_6 = b.u8(2, "ar_coeff_shift_minus_6")?;
+    let grain_scale_shift = b.u8(2, "grain_scale_shift")?;
+    let (mut cb_mult, mut cb_luma_mult, mut cb_offset) = (128u8, 192u8, 256u16);
+    let (mut cr_mult, mut cr_luma_mult, mut cr_offset) = (128u8, 192u8, 256u16);
+    if num_cb_points > 0 {
+        cb_mult = b.u8(8, "cb_mult")?;
+        cb_luma_mult = b.u8(8, "cb_luma_mult")?;
+        cb_offset = b.u16(9, "cb_offset")?;
+    }
+    if num_cr_points > 0 {
+        cr_mult = b.u8(8, "cr_mult")?;
+        cr_luma_mult = b.u8(8, "cr_luma_mult")?;
+        cr_offset = b.u16(9, "cr_offset")?;
+    }
+    let overlap_flag = b.flag("overlap_flag")?;
+    let clip_to_restricted_range = b.flag("clip_to_restricted_range")?;
+    let _ = separate_uv_delta_q;
+    Ok(Av1FilmGrainParams {
+        apply_grain,
+        grain_seed,
+        update_grain,
+        num_y_points,
+        point_y_value,
+        point_y_scaling,
+        chroma_scaling_from_luma,
+        num_cb_points,
+        point_cb_value,
+        point_cb_scaling,
+        num_cr_points,
+        point_cr_value,
+        point_cr_scaling,
+        grain_scaling_minus_8,
+        ar_coeff_lag,
+        ar_coeffs_y,
+        ar_coeffs_cb,
+        ar_coeffs_cr,
+        ar_coeff_shift_minus_6,
+        grain_scale_shift,
+        cb_mult,
+        cb_luma_mult,
+        cb_offset,
+        cr_mult,
+        cr_luma_mult,
+        cr_offset,
+        overlap_flag,
+        clip_to_restricted_range,
+    })
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Av1TileGroup {
     pub tile_start: u32,
@@ -1007,18 +1541,21 @@ fn parse_leb128(bytes: &[u8]) -> Result<(u64, usize)> {
     malformed("AV1 leb128 value exceeds eight bytes")
 }
 
-struct Bits<'a> {
+/// A bit-level reader over an AV1 header payload. Public within the crate so
+/// filter-parameter parsers can share the same primitive the sequence/frame
+/// header parsers use.
+pub struct Bits<'a> {
     bytes: &'a [u8],
     bit: usize,
 }
 impl<'a> Bits<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
+    pub(crate) fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, bit: 0 }
     }
-    fn position(&self) -> usize {
+    pub(crate) fn position(&self) -> usize {
         self.bit
     }
-    fn u32(&mut self, n: usize, name: &str) -> Result<u32> {
+    pub(crate) fn u32(&mut self, n: usize, name: &str) -> Result<u32> {
         if n > 32 {
             return Err(resource(format!("{name} is wider than 32 bits")));
         }
@@ -1028,13 +1565,13 @@ impl<'a> Bits<'a> {
         }
         Ok(value)
     }
-    fn u16(&mut self, n: usize, name: &str) -> Result<u16> {
+    pub(crate) fn u16(&mut self, n: usize, name: &str) -> Result<u16> {
         Ok(self.u32(n, name)? as u16)
     }
-    fn u8(&mut self, n: usize, name: &str) -> Result<u8> {
+    pub(crate) fn u8(&mut self, n: usize, name: &str) -> Result<u8> {
         Ok(self.u32(n, name)? as u8)
     }
-    fn flag(&mut self, name: &str) -> Result<bool> {
+    pub(crate) fn flag(&mut self, name: &str) -> Result<bool> {
         let byte = self.bytes.get(self.bit / 8).ok_or_else(|| {
             Error::new(
                 ErrorKind::MalformedMedia,
@@ -1048,13 +1585,23 @@ impl<'a> Bits<'a> {
             .ok_or_else(|| resource("AV1 bit offset overflow"))?;
         Ok(value)
     }
-    fn skip(&mut self, n: usize, name: &str) -> Result<()> {
+    pub(crate) fn skip(&mut self, n: usize, name: &str) -> Result<()> {
         for _ in 0..n {
             self.flag(name)?;
         }
         Ok(())
     }
-    fn uvlc(&mut self, name: &str) -> Result<u32> {
+    /// Reads an `n`-bit magnitude followed by a sign bit (AV1 `su(n)`).
+    pub(crate) fn su(&mut self, n: usize, name: &str) -> Result<i32> {
+        let magnitude =
+            i32::try_from(self.u32(n, name)?).map_err(|_| resource("AV1 su magnitude overflow"))?;
+        if self.flag(name)? {
+            Ok(-magnitude)
+        } else {
+            Ok(magnitude)
+        }
+    }
+    pub(crate) fn uvlc(&mut self, name: &str) -> Result<u32> {
         let mut leading = 0usize;
         while !self.flag(name)? {
             leading += 1;
@@ -1071,7 +1618,7 @@ impl<'a> Bits<'a> {
             .and_then(|v| v.checked_add(suffix))
             .ok_or_else(|| resource(format!("AV1 {name} overflow")))
     }
-    fn trailing_bits(&mut self) -> Result<()> {
+    pub(crate) fn trailing_bits(&mut self) -> Result<()> {
         if !self.flag("trailing_one_bit")? {
             return malformed("AV1 trailing one bit is zero");
         }
