@@ -6,6 +6,12 @@
 //! with the trailing adaptation-count element dropped, so each row is ready to pass straight to
 //! [`gamut_bitstream::SymbolEncoder::encode_symbol`] (the M0 frame sets `disable_cdf_update = 1`,
 //! so the tables are never adapted). These values are extracted verbatim from the specification.
+//!
+//! The inter-frame tables below (`IS_INTER` through `MV_FR`) extend the same bounded slice to the
+//! single-reference NEARESTMV/GLOBALMV/NEWMV subset used by [`crate::av1_inter_decoder`]: a single
+//! fixed context (context 0) is used everywhere the full specification varies a CDF by neighbouring
+//! mode/skip/reference state, matching this module's existing "smallest context that keeps bitstream
+//! conformance" precedent (e.g. `TX_4X4`-only coefficient contexts above).
 
 // --- Partition CDFs (Default_Partition_W*_Cdf), indexed [ctx]. ---
 /// `Default_Partition_W8_Cdf` (4 partitions: NONE/HORZ/VERT/SPLIT).
@@ -300,3 +306,45 @@ pub static SIG_REF_DIFF_OFFSET_2D: [(usize, usize); 5] = [(0, 1), (1, 0), (1, 1)
 
 /// `Mag_Ref_Offset_With_Tx_Class[TX_CLASS_2D]` (§8.3.2): neighbour offsets for `coeff_br`.
 pub static MAG_REF_OFFSET_2D: [(usize, usize); 3] = [(0, 1), (1, 0), (1, 1)];
+
+// --- Inter-frame mode/reference/motion-vector CDFs, fixed context 0 only. ---
+
+/// `Default_Is_Inter_Cdf[0]`: is the block inter- or intra-predicted.
+pub static IS_INTER: [u16; 2] = [16384, 32768];
+
+/// `Default_Single_Ref_Cdf[0][0]`: `single_ref_p1` (LAST vs. later reference groups).
+pub static SINGLE_REF_P1: [u16; 2] = [4897, 32768];
+
+/// `Default_New_Mv_Cdf[0]`: `new_mv` flag (0 selects `NEWMV`).
+pub static NEW_MV: [u16; 2] = [24035, 32768];
+
+/// `Default_Zero_Mv_Cdf[0]`: `zero_mv` flag (0 selects `GLOBALMV`) once `new_mv` is 1.
+pub static ZERO_MV: [u16; 2] = [32306, 32768];
+
+/// `Default_Mv_Joint_Cdf`: which of the two motion-vector components change.
+pub static MV_JOINT: [u16; 4] = [4200, 11238, 15606, 32768];
+
+/// `Default_Mv_Class_Cdf[comp]`: motion-vector class per component (row 0, col 1).
+pub static MV_CLASS: [[u16; 11]; 2] = [
+    [
+        28672, 30976, 31858, 32320, 32551, 32656, 32690, 32724, 32741, 32758, 32768,
+    ],
+    [
+        28672, 30976, 31858, 32320, 32551, 32656, 32690, 32724, 32741, 32758, 32768,
+    ],
+];
+
+/// `Default_Mv_Class0_Bit_Cdf[comp]`: MV_CLASS_0 integer bit.
+pub static MV_CLASS0_BIT: [u16; 2] = [16384, 32768];
+
+/// `Default_Mv_Fr_Cdf[comp]`: two-bit motion-vector fractional part.
+pub static MV_FR: [[u16; 4]; 2] = [[16384, 24576, 28672, 32768], [16384, 24576, 28672, 32768]];
+
+/// `Default_Mv_Class0_Fr_Cdf[comp]`: MV_CLASS_0 fractional part.
+pub static MV_CLASS0_FR: [[u16; 4]; 2] = [[16384, 24576, 28672, 32768], [16384, 24576, 28672, 32768]];
+
+/// `Default_Mv_Class0_Hp_Cdf` / `Default_Mv_Hp_Cdf`: high-precision bit (equiprobable default).
+pub static MV_HP: [u16; 2] = [16384, 32768];
+
+/// `Default_Mv_Sign_Cdf[comp]`: motion-vector component sign.
+pub static MV_SIGN: [u16; 2] = [16384, 32768];
