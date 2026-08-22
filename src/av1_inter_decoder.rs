@@ -2193,12 +2193,45 @@ mod tests {
         stream.extend(show_existing_temporal_unit(2));
         let mut child = Command::new("ffmpeg")
             .args([
-                "-v", "error", "-f", "obu", "-i", "pipe:0", "-f", "null", "-",
+                "-v", "error", "-f", "obu", "-i", "pipe:0", "-pix_fmt", "yuv420p", "-f",
+                "rawvideo", "pipe:1",
             ])
             .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
             .spawn()
             .unwrap();
         child.stdin.take().unwrap().write_all(&stream).unwrap();
-        assert!(child.wait().unwrap().success());
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        let frame_bytes = 16 * 16 + 2 * 8 * 8;
+        assert_eq!(output.stdout.len(), 5 * frame_bytes);
+
+        let units = temporal_units_from_generated_stream(&stream);
+        let mut decoder = Av1InterDecoder::new(Limits::default()).unwrap();
+        let mut decoded = None;
+        for unit in units.iter().take(4) {
+            decoded = Some(decoder.decode_temporal_unit(unit).unwrap());
+        }
+        let decoded = decoded.unwrap();
+        let ffmpeg = &output.stdout[3 * frame_bytes..4 * frame_bytes];
+        assert_eq!(&decoded.planes[0].data, &ffmpeg[..256]);
+        assert_eq!(&decoded.planes[1].data, &ffmpeg[256..320]);
+        assert_eq!(&decoded.planes[2].data, &ffmpeg[320..384]);
+    }
+
+    fn temporal_units_from_generated_stream(stream: &[u8]) -> Vec<&[u8]> {
+        let starts = stream
+            .windows(2)
+            .enumerate()
+            .filter_map(|(index, bytes)| (bytes == [0x12, 0x00]).then_some(index))
+            .collect::<Vec<_>>();
+        starts
+            .iter()
+            .enumerate()
+            .map(|(index, &start)| {
+                let end = starts.get(index + 1).copied().unwrap_or(stream.len());
+                &stream[start..end]
+            })
+            .collect()
     }
 }
