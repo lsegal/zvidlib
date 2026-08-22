@@ -185,8 +185,8 @@ pub(crate) fn write_ptl(w: &mut BitWriter, level_idc: u8) {
     w.put_bits(0, 2); // general_profile_space
     w.put_bit(0); // general_tier_flag
     w.put_bits(1, 5); // general_profile_idc = 1 (Main)
-                      // general_profile_compatibility_flag[0..32]: Main (1) is also
-                      // decodable by Main 10 (2) decoders.
+    // general_profile_compatibility_flag[0..32]: Main (1) is also
+    // decodable by Main 10 (2) decoders.
     let mut compat: u32 = 0;
     compat |= 1 << (31 - 1); // flag[1] — Main
     compat |= 1 << (31 - 2); // flag[2] — Main 10
@@ -195,13 +195,13 @@ pub(crate) fn write_ptl(w: &mut BitWriter, level_idc: u8) {
     w.put_bit(0); // general_interlaced_source_flag
     w.put_bit(1); // general_non_packed_constraint_flag
     w.put_bit(1); // general_frame_only_constraint_flag
-                  // Main profile: general_reserved_zero_43bits.
+    // Main profile: general_reserved_zero_43bits.
     w.put_bits(0, 32);
     w.put_bits(0, 11);
     // Profile 1: general_inbld_flag = 0.
     w.put_bit(0);
     w.put_bits(u32::from(level_idc), 8); // general_level_idc
-                                         // max_sub_layers_minus1 == 0: no sub-layer PTL syntax.
+    // max_sub_layers_minus1 == 0: no sub-layer PTL syntax.
 }
 
 /// §7.3.2.1 — the minimal single-layer VPS.
@@ -899,7 +899,8 @@ mod tests {
         for (w, h) in [(16usize, 16usize), (48, 32), (32, 64)] {
             let (y, cb, cr) = gradient_planes(w, h);
             let au = encode_idr_pcm_au(&y, &cb, &cr, w, h).expect("encode");
-            let frames = crate::hevc::engine::sequence::decode_annexb_sequence(&au).expect("decode");
+            let frames =
+                crate::hevc::engine::sequence::decode_annexb_sequence(&au).expect("decode");
             assert_eq!(frames.len(), 1, "{w}x{h}: one IDR frame");
             let mut expected = Vec::new();
             expected.extend_from_slice(&y);
@@ -921,7 +922,8 @@ mod tests {
         let y1: Vec<u8> = y0.iter().map(|&v| v ^ 0x5A).collect();
         let mut stream = encode_idr_pcm_au(&y0, &cb0, &cr0, 32, 32).expect("au0");
         stream.extend(encode_idr_pcm_au(&y1, &cb0, &cr0, 32, 32).expect("au1"));
-        let frames = crate::hevc::engine::sequence::decode_annexb_sequence(&stream).expect("decode");
+        let frames =
+            crate::hevc::engine::sequence::decode_annexb_sequence(&stream).expect("decode");
         assert_eq!(frames.len(), 2);
         let p0 = frames[0].picture.to_planar_u8().unwrap();
         let p1 = frames[1].picture.to_planar_u8().unwrap();
@@ -944,7 +946,8 @@ mod tests {
             let units = crate::hevc::engine::nal::collect_nal_units(&au).expect("walk");
             assert_eq!(units.len(), 3 + segments, "{segments} segments");
             assert!(units[4..].iter().all(|u| u.header.nal_unit_type == 20));
-            let frames = crate::hevc::engine::sequence::decode_annexb_sequence(&au).expect("decode");
+            let frames =
+                crate::hevc::engine::sequence::decode_annexb_sequence(&au).expect("decode");
             assert_eq!(frames.len(), 1);
             let mut expected = Vec::new();
             expected.extend_from_slice(&y);
@@ -1002,7 +1005,8 @@ mod tests {
                 ..PcmAuOptions::default()
             };
             let au = encode_idr_pcm_au_opts(&y, &cb, &cr, w, h, opts).expect("encode");
-            let frames = crate::hevc::engine::sequence::decode_annexb_sequence(&au).expect("decode");
+            let frames =
+                crate::hevc::engine::sequence::decode_annexb_sequence(&au).expect("decode");
             assert_eq!(frames.len(), 1);
             let mut expected = Vec::new();
             expected.extend_from_slice(&y);
@@ -1035,7 +1039,8 @@ mod tests {
                 ..PcmAuOptions::default()
             };
             let au = encode_idr_pcm_au_opts(&y, &cb, &cr, w, h, opts).expect("encode");
-            let frames = crate::hevc::engine::sequence::decode_annexb_sequence(&au).expect("decode");
+            let frames =
+                crate::hevc::engine::sequence::decode_annexb_sequence(&au).expect("decode");
             assert_eq!(frames.len(), 1);
             decoded.push(frames[0].picture.to_planar_u8().expect("8-bit"));
         }
@@ -1065,7 +1070,8 @@ mod tests {
                 ..PcmAuOptions::default()
             };
             let au = encode_idr_pcm_au_opts(&y, &cb, &cr, w, h, opts).expect("encode");
-            let frames = crate::hevc::engine::sequence::decode_annexb_sequence(&au).expect("decode");
+            let frames =
+                crate::hevc::engine::sequence::decode_annexb_sequence(&au).expect("decode");
             assert_eq!(frames.len(), 1, "{cols}x{rows}: one IDR frame");
             let mut expected = Vec::new();
             expected.extend_from_slice(&y);
