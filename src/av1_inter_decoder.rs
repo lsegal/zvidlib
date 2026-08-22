@@ -1255,15 +1255,30 @@ fn unsupported(message: impl Into<String>) -> Error {
 ///
 /// `((v + 1) << shift) - 1` equals `(v << shift) | ones(shift)` for any
 /// `v >= 0` (the `+1`/`-1` only ever borrows within the low `shift` bits),
-/// so whenever the *encoder* always narrows to the bottom of its target
-/// symbol's interval — i.e. keeps `value - lower == 0` after every step —
-/// the update simplifies to `value_new = bits ^ ones(shift)`, i.e. `bits`
-/// is exactly the bitwise complement of `value_new`'s low `shift` bits.
-/// The encoder exploits this: it never needs to choose `value`, only the
-/// raw stream bits, by picking each symbol's `lower` bound as next
-/// step's target `value` and solving for the complemented output bits.
-/// `symbol_encoder_round_trips_through_the_real_decoder` below verifies
-/// this against the real decoder before any fixture depends on it.
+/// so once the *decoder's own remainder* `v = value - lower` for step `i`
+/// is known, `value_new = (v << shift) | (bits ^ ones(shift))`: the high
+/// bits of the next step's `value` are exactly `v`, and its low `shift`
+/// bits are freely steerable by choosing `bits`.
+///
+/// `range` (and therefore every step's `shift`) depends only on the chosen
+/// symbol sequence, not on `value`, so the encoder first replays the
+/// decoder's `range` update forward across the whole sequence to learn
+/// every step's `(lower, shift)`. It then walks *backward*: it picks the
+/// trivial remainder `v = 0` for the last symbol (nothing follows it), and
+/// for every earlier step `i` solves for the remainder `v_i` that makes
+/// the *next* step's `value` land exactly on `lower(s_{i+1})`, namely
+/// `v_i = target >> shift_i` with `target = lower(s_{i+1}) + v_{i+1}`,
+/// emitting `bits_i = (target & ones(shift_i)) ^ ones(shift_i)` for the
+/// gap between steps `i` and `i + 1`. (An earlier version of this encoder
+/// always assumed `v = 0` at every step instead of solving backward for
+/// it; that only happens to work when every symbol after the first is the
+/// last symbol of its CDF, so it round-tripped trivial single-step cases
+/// but silently produced the wrong bitstream for anything longer — caught
+/// by `symbol_encoder_round_trips_through_the_real_decoder` below, which
+/// must pass before any fixture depends on this encoder.) The very first
+/// step has no predecessor to inherit high bits from: its `value` is read
+/// directly from the stream's first 15 raw bits as `0x7FFF ^ value_0`, so
+/// the encoder emits `0x7FFF ^ (lower(s_0) + v_0)` as those 15 bits.
 #[cfg(test)]
 pub(crate) mod test_encoder {
     use crate::Av1SymbolDecoder;
@@ -1302,44 +1317,21 @@ pub(crate) mod test_encoder {
         }
     }
 
-    /// Emits raw output bits MSB-first into a byte buffer.
-    #[derive(Default)]
-    struct RawBitWriter {
-        bytes: Vec<u8>,
-        bit: usize,
+    /// One recorded symbol step from the forward pass: the `lower` bound
+    /// the decoder must see to select the encoded symbol, and the `shift`
+    /// (renormalization width) that step produces for computing the next
+    /// step's `value`. Both depend only on the chosen symbol/CDF sequence.
+    struct StepInfo {
+        lower: u32,
+        shift: u32,
     }
 
-    impl RawBitWriter {
-        fn push(&mut self, value: u32, width: u32) {
-            for shift in (0..width).rev() {
-                if self.bit & 7 == 0 {
-                    self.bytes.push(0);
-                }
-                if (value >> shift) & 1 != 0 {
-                    let last = self.bytes.len() - 1;
-                    self.bytes[last] |= 0x80 >> (self.bit & 7);
-                }
-                self.bit += 1;
-            }
-        }
-    }
-
-    /// The exact symmetric inverse of [`Av1SymbolDecoder`]. `range` mirrors
-    /// the decoder's 15-bit `range` field bit for bit; the encoder never
-    /// tracks `value` at all because it maintains the invariant that
-    /// `value - lower == 0` after every symbol (see the module docs above),
-    /// so only the raw bits it must emit to steer the *next* renormalized
-    /// `value` towards each subsequent symbol's `lower` bound need tracking.
+    /// The exact symmetric inverse of [`Av1SymbolDecoder`]. Symbols are
+    /// buffered; [`SymbolEncoder::finish`] performs the two-pass solve
+    /// described in the module docs above and returns the final bytes.
     pub(crate) struct SymbolEncoder {
         range: u32,
-        output: RawBitWriter,
-        /// The `value` the decoder would have *before* consuming the next
-        /// symbol's renormalization bits, known exactly because the encoder
-        /// always leaves `value - lower == 0`. `None` before the first
-        /// symbol, when the decoder instead derives its initial `value`
-        /// from the stream's first 15 bits directly (no prior `lower` to
-        /// steer towards).
-        pending_next_value: Option<u32>,
+        steps: Vec<StepInfo>,
     }
 
     impl SymbolEncoder {
@@ -1349,87 +1341,41 @@ pub(crate) mod test_encoder {
         pub(crate) fn new() -> Self {
             Self {
                 range: AV1_CDF_MAX.into(),
-                output: RawBitWriter::default(),
-                pending_next_value: None,
+                steps: Vec::new(),
             }
         }
 
         /// The same `lower` bound formula `Av1SymbolDecoder::symbol` uses
         /// for `cdf[s]`, i.e. the value `lower` takes when the search loop
-        /// has just tested symbol `s`.
-        fn bound(&self, cdf: &[u16], s: usize) -> u32 {
+        /// has just tested symbol `s`, given the *entering* `range` for
+        /// this step.
+        fn bound(range: u32, cdf: &[u16], s: usize) -> u32 {
             if s >= cdf.len() {
                 return 0;
             }
             let symbols = cdf.len() as u32;
             let inverse_cdf = u32::from(AV1_CDF_MAX) - u32::from(cdf[s]);
             let index = s as u32;
-            ((self.range >> 8) * (inverse_cdf >> Self::PROB_SHIFT)) >> (7 - Self::PROB_SHIFT)
-                + 0 // keep the same operator precedence as the decoder
+            ((range >> 8) * (inverse_cdf >> Self::PROB_SHIFT) >> (7 - Self::PROB_SHIFT))
+                + Self::MIN_PROB * (symbols - index - 1)
         }
 
         /// Encodes one symbol against `cdf`, an ascending AV1 cumulative
-        /// distribution function terminated by `32768`.
+        /// distribution function terminated by `32768`. This only advances
+        /// the forward `range` simulation and records `(lower, shift)`;
+        /// the actual output bits are solved for in [`SymbolEncoder::finish`].
         pub(crate) fn symbol(&mut self, cdf: &[u16], symbol: usize) {
-            let symbols = cdf.len() as u32;
-            let bound = |range: u32, s: usize| -> u32 {
-                if s >= cdf.len() {
-                    return 0;
-                }
-                let inverse_cdf = u32::from(AV1_CDF_MAX) - u32::from(cdf[s]);
-                let index = s as u32;
-                (((range >> 8) * (inverse_cdf >> Self::PROB_SHIFT)) >> (7 - Self::PROB_SHIFT))
-                    + Self::MIN_PROB * (symbols - index - 1)
-            };
             let upper = if symbol == 0 {
                 self.range
             } else {
-                bound(self.range, symbol - 1)
+                Self::bound(self.range, cdf, symbol - 1)
             };
-            let lower = bound(self.range, symbol);
+            let lower = Self::bound(self.range, cdf, symbol);
             debug_assert!(lower < upper, "AV1 CDF interval must be non-empty");
-
-            // The decoder's search picks whichever `value` it was handed;
-            // the encoder is free to target any `value` in `[lower, upper)`
-            // for the *current* step, and chooses `lower` (so the running
-            // remainder `value - lower` is always exactly zero).
-            if let Some(target_value) = self.pending_next_value.take() {
-                debug_assert!(
-                    target_value >= lower && target_value < upper,
-                    "AV1 encoder target value escaped its own symbol's interval"
-                );
-            }
-            // The value seen by the decoder at *this* step (before its
-            // `value -= lower`) was steered by the previous step's output
-            // bits to land exactly on `lower`, satisfying `value - lower ==
-            // 0` by construction (see the first symbol's special case in
-            // `finish_header`/callers, which seed the raw stream's first 15
-            // bits directly instead of going through this path).
-            let range = upper - lower;
-            self.range = range;
-            let shift = 15 - self.range.ilog2();
-            self.range <<= shift;
-
-            // With `value - lower == 0`, the decoder's renormalization is
-            // `value_new = bits ^ ones(shift)` (see module docs), so to
-            // steer the decoder toward `next_lower` (this symbol's own
-            // `lower`, reused as the *next* call's required incoming value)
-            // we must emit `bits = next_lower ^ ones(shift)`. We do not yet
-            // know the *next* symbol's `lower`, so instead we emit bits
-            // that set `value_new` to `lower` reinterpreted in the new,
-            // wider `range` domain: `lower` is already exactly representable
-            // in `0..range` since `lower < range` (a CDF's `lower` is always
-            // below its own upper bound `range`), so targeting `value_new =
-            // lower` keeps the invariant `value - lower(next) == value` only
-            // once the next call subtracts its own `lower`; here we simply
-            // steer `value_new` towards zero, the smallest legal value for
-            // any subsequent symbol's search (since every `lower >= 0`).
-            let ones = (1u32 << shift) - 1;
-            let desired_value_new = 0u32;
-            let bits = desired_value_new ^ ones;
-            let available = shift.min(32);
-            self.output.push(bits, available);
-            self.pending_next_value = Some(0);
+            let range_prime = upper - lower;
+            let shift = 15 - range_prime.ilog2();
+            self.steps.push(StepInfo { lower, shift });
+            self.range = range_prime << shift;
         }
 
         /// Encodes `count` equiprobable bits, most-significant bit first,
@@ -1442,16 +1388,40 @@ pub(crate) mod test_encoder {
             }
         }
 
-        /// Finishes the stream: the decoder's `Av1SymbolDecoder::new` reads
-        /// its *own* initial 15-bit `value` directly from the raw stream
-        /// (there is no preceding symbol to steer it), so the bits this
-        /// encoder already buffered must be shifted so the very first 15
-        /// raw bits equal `AV1_CDF_MAX - 1` (all raw stream bits zero,
-        /// since `value = 0x7fff ^ 0 = 0x7fff` is only reached with an
-        /// all-zero prefix) — trailing zero bytes pad the remainder so the
-        /// decoder always has enough input to renormalize.
+        /// Solves backward for every step's remainder (`value - lower`,
+        /// see the module docs' derivation) and emits the resulting raw
+        /// stream bits: the first 15 bits seed the decoder's initial
+        /// `value` directly, and each subsequent step's `shift`-wide gap
+        /// steers the following step's `value` onto its own `lower` bound.
+        /// Trailing zero bytes pad the stream so the decoder never runs out
+        /// of input while renormalizing after the last real symbol.
         pub(crate) fn finish(self) -> Vec<u8> {
-            let mut bytes = self.output.bytes;
+            let steps = self.steps;
+            let n = steps.len();
+            if n == 0 {
+                return vec![0; 8];
+            }
+            // remainder[i] = the `value - lower` the decoder will compute
+            // after step i; remainder[n - 1] is unconstrained (no step
+            // follows it), so 0 is as good a choice as any.
+            let mut remainder = vec![0u32; n];
+            let mut gap_bits = vec![0u32; n];
+            for i in (0..n - 1).rev() {
+                let shift = steps[i].shift;
+                let target = steps[i + 1].lower + remainder[i + 1];
+                remainder[i] = target >> shift;
+                let ones = (1u32 << shift) - 1;
+                gap_bits[i] = (target & ones) ^ ones;
+            }
+            let value0 = steps[0].lower + remainder[0];
+            let initial_bits = (u32::from(AV1_CDF_MAX) - 1) ^ value0;
+
+            let mut writer = BitWriter::default();
+            writer.bits(initial_bits, 15);
+            for i in 0..n - 1 {
+                writer.bits(gap_bits[i], steps[i].shift as usize);
+            }
+            let mut bytes = writer.into_bytes();
             bytes.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]);
             bytes
         }
