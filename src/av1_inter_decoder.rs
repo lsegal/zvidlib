@@ -1368,7 +1368,7 @@ pub(crate) mod test_encoder {
             let symbols = cdf.len() as u32;
             let inverse_cdf = u32::from(AV1_CDF_MAX) - u32::from(cdf[s]);
             let index = s as u32;
-            ((range >> 8) * (inverse_cdf >> Self::PROB_SHIFT) >> (7 - Self::PROB_SHIFT))
+            (((range >> 8) * (inverse_cdf >> Self::PROB_SHIFT)) >> (7 - Self::PROB_SHIFT))
                 + Self::MIN_PROB * (symbols - index - 1)
         }
 
@@ -1483,7 +1483,7 @@ pub(crate) mod test_encoder {
             encoder.symbol(&cdf::SKIP[0], symbol);
             expectations.push((&cdf::SKIP[0], symbol));
             encoder.literal((i % 3) as u32, 2);
-            expectations.push((&[16_384, AV1_CDF_MAX], (i % 3 >> 1) & 1));
+            expectations.push((&[16_384, AV1_CDF_MAX], ((i % 3) >> 1) & 1));
             expectations.push((&[16_384, AV1_CDF_MAX], (i % 3) & 1));
         }
         let bytes = encoder.finish();
@@ -1507,7 +1507,6 @@ mod tests {
     use super::test_encoder::{BitWriter, SymbolEncoder};
     use super::*;
     use crate::av1_cdf as cdf;
-    use crate::{ErrorKind, FrameDigest};
 
     const FRAME_DIM: u32 = 16;
 
@@ -1605,37 +1604,6 @@ mod tests {
             // are all absent for intra frames.
             w.bits(0, 1); // disable_frame_end_update_cdf
             Self { w }
-        }
-
-        fn inter_frame(order_hint_bits: usize, order_hint: u32, ref_frame_idx: [u8; 7]) -> Self {
-            let mut w = BitWriter::default();
-            w.bits(1, 2); // frame_type = INTER_FRAME
-            w.bits(1, 1); // show_frame = 1
-            w.bits(0, 1); // error_resilient_mode = 0
-            w.bits(1, 1); // disable_cdf_update = 1
-            // allow_screen_content_tools is implied 0 (seq_force = 0).
-            w.bits(PRIMARY_REF_NONE.into(), 3); // primary_ref_frame = PRIMARY_REF_NONE
-            w.bits(order_hint, order_hint_bits); // order_hint
-            w.bits(0, 8); // refresh_frame_flags: refresh no slots by default
-            w.bits(0, 1); // frame_refs_short_signaling
-            for idx in ref_frame_idx {
-                w.bits(idx.into(), 3); // ref_frame_idx[i]
-            }
-            w.bits(0, 1); // frame_size_override_flag
-            w.bits(0, 1); // render_and_frame_size_different
-            w.bits(0, 1); // is_filter_switchable
-            w.bits(0, 2); // interpolation_filter
-            w.bits(0, 1); // is_motion_mode_switchable
-            w.bits(0, 1); // disable_frame_end_update_cdf
-            Self { w }
-        }
-
-        fn refresh(mut self, flags: u8) -> Self {
-            // Only meaningful for inter frames; key frames never read this
-            // bit (refresh_frame_flags is implied 0xff), so callers must
-            // not invoke this on a key-frame builder.
-            self.w.bits(flags.into(), 8);
-            self
         }
 
         /// Appends `tile_info()`, `quantization_params()`,
