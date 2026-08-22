@@ -195,8 +195,8 @@ fn rgba_to_yuv420(
                 }
             }
             let at = (py / 2) * (w / 2) + x / 2;
-            cb[at] = ((-26 * r - 87 * g + 112 * b + 2048) >> 10).clamp(16, 240) as u8;
-            cr[at] = ((112 * r - 102 * g - 10 * b + 2048) >> 10).clamp(16, 240) as u8;
+            cb[at] = ((-26 * r - 87 * g + 112 * b + 131_072) >> 10).clamp(16, 240) as u8;
+            cr[at] = ((112 * r - 102 * g - 10 * b + 131_072) >> 10).clamp(16, 240) as u8;
         }
     }
     Ok((y, cb, cr))
@@ -278,6 +278,13 @@ fn support_error(s: CodecSupport) -> Error {
 mod tests {
     use super::super::engine::hvcc::parse_hvcc;
     use super::*;
+    use crate::{
+        Plane, VideoDecoderConfig, VideoEncoderConformanceVector, VideoFrame,
+        native_hevc_video_decoder_factory, verify_video_encoder_conformance,
+    };
+    use std::future::Future;
+    use std::pin::pin;
+    use std::task::{Context, Poll, Waker};
 
     #[test]
     fn generated_configuration_and_sample_are_standardized() {
@@ -307,5 +314,72 @@ mod tests {
         let sample = length_prefixed_vcl(&au).unwrap();
         assert!(sample.len() > 4);
         assert_eq!(sample[4] >> 1, 20);
+    }
+
+    #[test]
+    fn factory_round_trips_a_conformance_vector_with_exact_timing() {
+        let limits = Limits::default();
+        let dimensions = crate::VideoDimensions::new(16, 16, &limits).unwrap();
+        let mut pixels = vec![0_u8; 16 * 16 * 4];
+        for (index, pixel) in pixels.chunks_exact_mut(4).enumerate() {
+            let value = 32 + (index as u8).wrapping_mul(7) % 192;
+            pixel.copy_from_slice(&[value, value, value, 255]);
+        }
+        let frame = VideoFrame::new(
+            dimensions,
+            PixelFormat::Rgba8,
+            ColorRange::Limited,
+            vec![Plane {
+                data: pixels,
+                stride: 64,
+            }],
+            &limits,
+        )
+        .unwrap();
+        let configuration = VideoEncoderConfig {
+            codec: Codec::Hevc,
+            profile: CodecProfile::HevcMain,
+            coded_dimensions: dimensions,
+            input_format: PixelFormat::Rgba8,
+            color_range: ColorRange::Limited,
+            hardware: HardwarePreference::Avoid,
+            timescale: 30_000,
+            frame_duration: 1_001,
+            configuration: Vec::new(),
+        };
+        let vector = VideoEncoderConformanceVector {
+            name: "native hevc pcm idr".into(),
+            configuration: configuration.clone(),
+            decoder_configuration: VideoDecoderConfig {
+                codec: Codec::Hevc,
+                profile: CodecProfile::HevcMain,
+                coded_dimensions: dimensions,
+                output_format: PixelFormat::Rgba8,
+                color_range: ColorRange::Limited,
+                hardware: HardwarePreference::Avoid,
+                configuration: Vec::new(),
+            },
+            frames: vec![frame],
+            minimum_psnr_db: 30.0,
+        };
+        let report = block_on(verify_video_encoder_conformance(
+            &native_hevc_video_encoder_factory(),
+            &native_hevc_video_decoder_factory(),
+            &vector,
+            limits,
+        ))
+        .unwrap();
+        assert_eq!(report.frames_encoded, 1);
+    }
+
+    fn block_on<T>(future: impl Future<Output = T>) -> T {
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+        let mut future = pin!(future);
+        loop {
+            if let Poll::Ready(value) = future.as_mut().poll(&mut context) {
+                return value;
+            }
+        }
     }
 }
