@@ -5,8 +5,8 @@
 
 use crate::av1_cdf as cdf;
 use crate::{
-    Av1FrameType, Av1IntraFrame, Av1Obu, Av1Parser, Av1SymbolDecoder, Av1SyntaxSupport, ColorRange,
-    Error, ErrorKind, Limits, Result, VideoDimensions, VideoFrame, inverse_wht_4x4,
+    Av1FrameType, Av1IntraFrame, Av1Obu, Av1ObuType, Av1Parser, Av1SymbolDecoder, Av1SyntaxSupport,
+    ColorRange, Error, ErrorKind, Limits, Result, VideoDimensions, VideoFrame, inverse_wht_4x4,
 };
 
 const NUM_BASE_LEVELS: i32 = 2;
@@ -19,6 +19,33 @@ pub fn decode_av1_lossless_intra(bytes: &[u8], limits: &Limits) -> Result<VideoF
     }
     let mut parser = Av1Parser::new(*limits)?;
     let obus = parser.parse_low_overhead(bytes)?;
+    let sequence_count = obus
+        .iter()
+        .filter(|obu| matches!(obu, Av1Obu::SequenceHeader { .. }))
+        .count();
+    let frame_count = obus
+        .iter()
+        .filter(|obu| matches!(obu, Av1Obu::Frame { .. }))
+        .count();
+    if sequence_count != 1 || frame_count != 1 {
+        return Err(malformed_error(
+            "AV1 intra unit must contain exactly one sequence header and one frame OBU",
+        ));
+    }
+    for obu in &obus {
+        match obu {
+            Av1Obu::SequenceHeader { .. }
+            | Av1Obu::Frame { .. }
+            | Av1Obu::TemporalDelimiter { .. }
+            | Av1Obu::Metadata { .. } => {}
+            Av1Obu::Skipped { header, .. } if header.obu_type == Av1ObuType::Padding => {}
+            _ => {
+                return Err(unsupported(
+                    "AV1 intra unit contains an unsupported OBU type",
+                ));
+            }
+        }
+    }
     let sequence = obus
         .iter()
         .find_map(|obu| match obu {
@@ -278,14 +305,28 @@ impl<'a> LosslessTileDecoder<'a> {
             }
         } else if has_columns {
             let context = self.partition_context(row, column, bsl);
-            self.symbols
+            if self
+                .symbols
                 .symbol(&split_or_horz_cdf(partition_cdf(bsl, context)))?
-                == 1
+                != 1
+            {
+                return Err(unsupported(
+                    "AV1 horizontal edge partitions are not supported",
+                ));
+            }
+            true
         } else if has_rows {
             let context = self.partition_context(row, column, bsl);
-            self.symbols
+            if self
+                .symbols
                 .symbol(&split_or_vert_cdf(partition_cdf(bsl, context)))?
-                == 1
+                != 1
+            {
+                return Err(unsupported(
+                    "AV1 vertical edge partitions are not supported",
+                ));
+            }
+            true
         } else {
             true
         };

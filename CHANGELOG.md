@@ -4,6 +4,7 @@ All notable changes to zvidlib will be documented in this file.
 
 ## Unreleased
 
+- Add dependency-free, bounded reconstruction of standardized AV1 Main-profile 8-bit lossless monochrome intra frames to validated YUV420 planes, including static-CDF symbol and coefficient decoding, partition traversal, DC prediction, inverse WHT, explicit unsupported-syntax errors, decode-work limits, and a checked-in canonical vector.
 - Add bounded, dependency-free AV1 `av1C`, low-overhead OBU, sequence-header, frame-header, tile-group, and metadata syntax parsing with stable malformed-input errors, explicit resource limits, and no premature native decoder registration.
 - Add backend-independent HEVC/AV1 codec conformance infrastructure with canonical SHA-256 frame fingerprints, exact-frame decoder access-pattern checks, encoder round-trip quality validation, and a complete 120-frame expected-output vector for the bundled HEVC sample.
 - Make the native GL example (`examples/native_gl/`) draw to a real cross-platform `winit`/`glutin` window instead of writing uploaded frames out as PPM files, with looping playback (matching the web example) and an on-screen FPS counter in the top-left corner.
