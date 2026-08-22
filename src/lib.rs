@@ -74,3 +74,5 @@ pub use transfer::{
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use hevc::native_hevc_video_decoder_factory;
+#[cfg(not(target_arch = "wasm32"))]
+pub use hevc::native_hevc_video_encoder_factory;
