@@ -310,39 +310,63 @@ pub static MAG_REF_OFFSET_2D: [(usize, usize); 3] = [(0, 1), (1, 0), (1, 1)];
 // --- Inter-frame mode/reference/motion-vector CDFs, fixed context 0 only. ---
 
 /// `Default_Is_Inter_Cdf[0]`: is the block inter- or intra-predicted.
-pub static IS_INTER: [u16; 2] = [16384, 32768];
+pub static IS_INTER: [u16; 2] = [806, 32768];
+
+/// `Default_Comp_Mode_Cdf[0]`: single versus compound reference prediction.
+pub static COMP_MODE: [u16; 2] = [26828, 32768];
+
+/// `Default_Comp_Ref_Type_Cdf[0]`: uni- versus bidirectional compound references.
+pub static COMP_REF_TYPE: [u16; 2] = [1198, 32768];
+
+/// `Default_Uni_Comp_Ref_Cdf[0][0]`: LAST/LAST2-family versus backward pair.
+pub static UNI_COMP_REF: [u16; 2] = [5284, 32768];
+
+/// `Default_Uni_Comp_Ref_Cdf[0][1]`: LAST/LAST2 versus LAST/later-forward.
+pub static UNI_COMP_REF_P1: [u16; 2] = [3865, 32768];
+
+/// `Default_Compound_Mode_Cdf[0]`: compound motion-vector mode.
+pub static COMPOUND_MODE: [u16; 8] = [7760, 13823, 15808, 17641, 19156, 20666, 26891, 32768];
 
 /// `Default_Single_Ref_Cdf[0][0]`: `single_ref_p1` (LAST vs. later reference groups).
 pub static SINGLE_REF_P1: [u16; 2] = [4897, 32768];
+
+/// `Default_Single_Ref_Cdf[0][2]`: LAST/LAST2 versus LAST3/GOLDEN.
+pub static SINGLE_REF_P3: [u16; 2] = [4236, 32768];
+
+/// `Default_Single_Ref_Cdf[0][3]`: LAST versus LAST2.
+pub static SINGLE_REF_P4: [u16; 2] = [8650, 32768];
 
 /// `Default_New_Mv_Cdf[0]`: `new_mv` flag (0 selects `NEWMV`).
 pub static NEW_MV: [u16; 2] = [24035, 32768];
 
 /// `Default_Zero_Mv_Cdf[0]`: `zero_mv` flag (0 selects `GLOBALMV`) once `new_mv` is 1.
-pub static ZERO_MV: [u16; 2] = [32306, 32768];
+pub static ZERO_MV: [u16; 2] = [2175, 32768];
+
+/// `Default_Ref_Mv_Cdf[0]`: nearest versus near motion-vector prediction.
+pub static REF_MV: [u16; 2] = [23974, 32768];
 
 /// `Default_Mv_Joint_Cdf`: which of the two motion-vector components change.
-pub static MV_JOINT: [u16; 4] = [4200, 11238, 15606, 32768];
+pub static MV_JOINT: [u16; 4] = [4096, 11264, 19328, 32768];
 
 /// `Default_Mv_Class_Cdf[comp]`: motion-vector class per component (row 0, col 1).
 pub static MV_CLASS: [[u16; 11]; 2] = [
     [
-        28672, 30976, 31858, 32320, 32551, 32656, 32690, 32724, 32741, 32758, 32768,
+        28672, 30976, 31858, 32320, 32551, 32656, 32740, 32757, 32762, 32767, 32768,
     ],
     [
-        28672, 30976, 31858, 32320, 32551, 32656, 32690, 32724, 32741, 32758, 32768,
+        28672, 30976, 31858, 32320, 32551, 32656, 32740, 32757, 32762, 32767, 32768,
     ],
 ];
 
 /// `Default_Mv_Class0_Bit_Cdf[comp]`: MV_CLASS_0 integer bit.
-pub static MV_CLASS0_BIT: [u16; 2] = [16384, 32768];
+pub static MV_CLASS0_BIT: [u16; 2] = [27648, 32768];
 
 /// `Default_Mv_Fr_Cdf[comp]`: two-bit motion-vector fractional part.
-pub static MV_FR: [[u16; 4]; 2] = [[16384, 24576, 28672, 32768], [16384, 24576, 28672, 32768]];
+pub static MV_FR: [[u16; 4]; 2] = [[8192, 17408, 21248, 32768], [8192, 17408, 21248, 32768]];
 
 /// `Default_Mv_Class0_Fr_Cdf[comp]`: MV_CLASS_0 fractional part.
 pub static MV_CLASS0_FR: [[u16; 4]; 2] =
-    [[16384, 24576, 28672, 32768], [16384, 24576, 28672, 32768]];
+    [[16384, 24576, 26624, 32768], [16384, 24576, 26624, 32768]];
 
 /// `Default_Mv_Class0_Hp_Cdf` / `Default_Mv_Hp_Cdf`: high-precision bit (equiprobable default).
 pub static MV_HP: [u16; 2] = [16384, 32768];

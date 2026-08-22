@@ -52,6 +52,8 @@ struct RefSlot {
     mi_rows: usize,
     order_hint: u32,
     color_range: ColorRange,
+    frame_type: Av1FrameType,
+    showable_frame: bool,
 }
 
 /// A bounded, stateful AV1 decoder that retains reference frames across
@@ -91,6 +93,9 @@ impl Av1InterDecoder {
     /// retained planes are no longer known to match the new coded geometry.
     pub fn decode_temporal_unit(&mut self, bytes: &[u8]) -> Result<VideoFrame> {
         let mut parser = Av1Parser::new(self.limits)?;
+        if let Some(sequence) = self.sequence.clone() {
+            parser.set_sequence(sequence);
+        }
         let obus = parser.parse_low_overhead(bytes)?;
         for obu in &obus {
             if let Av1Obu::SequenceHeader { sequence, .. } = obu {
@@ -136,8 +141,13 @@ impl Av1InterDecoder {
             ));
         }
         let slot = self.refs[index]
-            .clone()
+            .as_ref()
             .ok_or_else(|| malformed("show_existing_frame references an empty reference slot"))?;
+        if !slot.showable_frame {
+            return Err(malformed(
+                "show_existing_frame references a frame that is not showable",
+            ));
+        }
         luma_to_video_frame(
             slot.luma.clone(),
             slot.width,
@@ -171,8 +181,15 @@ impl Av1InterDecoder {
 
         let mut bits = HeaderBits::new(payload);
         let header = parse_inter_frame_header(&mut bits, &sequence, mi_cols, mi_rows)?;
-        if header.error_resilient_mode && header.primary_ref_frame == PRIMARY_REF_NONE {
-            self.refs = Default::default();
+        if let Some(ref_order_hints) = header.ref_order_hints {
+            for (index, order_hint) in ref_order_hints.into_iter().enumerate() {
+                if self.refs[index]
+                    .as_ref()
+                    .is_some_and(|slot| slot.order_hint != order_hint)
+                {
+                    self.refs[index] = None;
+                }
+            }
         }
 
         let refs = self.resolve_references(&header)?;
@@ -206,17 +223,14 @@ impl Av1InterDecoder {
                 mi_rows,
                 order_hint: header.order_hint,
                 color_range,
+                frame_type: header.frame_type,
+                showable_frame: header.showable_frame,
             };
             for i in 0..NUM_REF_FRAMES {
                 if header.refresh_frame_flags & (1 << i) != 0 {
                     self.refs[i] = Some(slot.clone());
                 }
             }
-        }
-        if !header.show_frame {
-            return Err(unsupported(
-                "AV1 inter decoder requires every decoded frame to be shown",
-            ));
         }
         luma_to_video_frame(luma, width, height, color_range, &self.limits)
     }
@@ -258,16 +272,6 @@ impl Av1InterDecoder {
             if slot.width != header.width || slot.height != header.height {
                 return Err(unsupported(
                     "AV1 inter decoder requires references matching the current frame size",
-                ));
-            }
-            let order_hint_bits = self
-                .sequence
-                .as_ref()
-                .expect("sequence was validated before resolve_references was called")
-                .order_hint_bits;
-            if relative_order_distance(header.order_hint, slot.order_hint, order_hint_bits) <= 0 {
-                return Err(malformed(
-                    "AV1 inter frame references a reference frame that is not in its past",
                 ));
             }
             resolved[i] = Some(slot);
@@ -343,11 +347,14 @@ fn check_sequence_support(sequence: &Av1SequenceHeader) -> Result<()> {
 struct InterFrameHeader {
     frame_type: Av1FrameType,
     show_frame: bool,
+    showable_frame: bool,
     error_resilient_mode: bool,
     primary_ref_frame: u8,
     order_hint: u32,
     refresh_frame_flags: u8,
+    ref_order_hints: Option<[u32; NUM_REF_FRAMES]>,
     ref_frame_idx: [u8; 7],
+    reference_select: bool,
     width: usize,
     height: usize,
 }
@@ -361,6 +368,7 @@ fn parse_inter_frame_header(
     mi_cols: usize,
     mi_rows: usize,
 ) -> Result<InterFrameHeader> {
+    require_bit(bits, false, "show_existing_frame in a coded Frame OBU")?;
     let frame_type = match bits.read(2, "frame_type")? {
         0 => Av1FrameType::Key,
         1 => Av1FrameType::Inter,
@@ -371,17 +379,12 @@ fn parse_inter_frame_header(
             ));
         }
     };
-    if frame_type == Av1FrameType::IntraOnly {
-        return Err(unsupported(
-            "AV1 inter decoder does not support intra-only non-key frames",
-        ));
-    }
     let show_frame = bits.read(1, "show_frame")? != 0;
-    if !show_frame {
-        return Err(unsupported(
-            "AV1 inter decoder requires every decoded frame to be shown",
-        ));
-    }
+    let showable_frame = if show_frame {
+        frame_type != Av1FrameType::Key
+    } else {
+        bits.read(1, "showable_frame")? != 0
+    };
     let error_resilient_mode = if frame_type == Av1FrameType::Key && show_frame {
         true
     } else {
@@ -400,18 +403,29 @@ fn parse_inter_frame_header(
             "AV1 inter decoder does not support screen content tools",
         ));
     }
-    let is_intra = frame_type == Av1FrameType::Key;
+    let is_intra = matches!(frame_type, Av1FrameType::Key | Av1FrameType::IntraOnly);
+    require_bit(bits, false, "frame_size_override_flag")?;
+    let order_hint = bits.read(usize::from(seq.order_hint_bits), "order_hint")?;
     let primary_ref_frame = if is_intra || error_resilient_mode {
         PRIMARY_REF_NONE
     } else {
         u8::try_from(bits.read(3, "primary_ref_frame")?).expect("three bits fit u8")
     };
     // refresh_frame_flags is implicitly 0xff for a shown key frame.
-    let order_hint = bits.read(usize::from(seq.order_hint_bits), "order_hint")?;
     let refresh_frame_flags = if frame_type == Av1FrameType::Key && show_frame {
         0xffu8
     } else {
         u8::try_from(bits.read(8, "refresh_frame_flags")?).expect("eight bits fit u8")
+    };
+
+    let ref_order_hints = if error_resilient_mode && !is_intra {
+        let mut hints = [0u32; NUM_REF_FRAMES];
+        for hint in &mut hints {
+            *hint = bits.read(usize::from(seq.order_hint_bits), "ref_order_hint")?;
+        }
+        Some(hints)
+    } else {
+        None
     };
 
     let mut ref_frame_idx = [0u8; 7];
@@ -422,7 +436,6 @@ fn parse_inter_frame_header(
         }
     }
 
-    require_bit(bits, false, "frame_size_override_flag")?;
     // frame_size(): superres is disallowed by the sequence header bound, so
     // FrameWidth/FrameHeight are exactly the sequence header's maximums.
     let width = usize::try_from(seq.max_frame_width)
@@ -433,6 +446,7 @@ fn parse_inter_frame_header(
     require_bit(bits, false, "render_and_frame_size_different")?;
 
     if !is_intra {
+        require_bit(bits, false, "allow_high_precision_mv")?;
         // force_integer_mv is implicitly true whenever
         // allow_screen_content_tools is false (checked above), so
         // allow_high_precision_mv is implicitly false with no bit read
@@ -449,7 +463,8 @@ fn parse_inter_frame_header(
         // the spec sets UseRefFrameMvs = 0 without reading a bit.
     }
 
-    require_bit(bits, false, "disable_frame_end_update_cdf")?;
+    // disable_frame_end_update_cdf is inferred to 1 because
+    // disable_cdf_update is required to be 1; no bit is present here.
     parse_tile_info(bits, mi_cols, mi_rows)?;
     // quantization_params(): base_q_idx must select the lossless path (all
     // delta_q_* implicitly zero) so loop filter, CDEF, and loop restoration
@@ -470,16 +485,14 @@ fn parse_inter_frame_header(
     // CodedLossless is true (base_q_idx == 0, no segmentation deltas).
     // read_tx_mode(): CodedLossless forces TX_MODE_ONLY_4X4, no bit read.
     // frame_reference_mode(): intra frames imply single reference; inter
-    // frames must additionally signal only single-reference prediction.
+    // frames may signal per-block single or compound prediction.
     let reference_select = if is_intra {
         false
     } else {
         bits.read(1, "reference_select")? != 0
     };
     if reference_select {
-        return Err(unsupported(
-            "AV1 inter decoder supports single-reference prediction only",
-        ));
+        require_bit(bits, false, "skip_mode_present")?;
     }
     // skip_mode_params(): SkipModeAllowed is false whenever reference
     // selection is unavailable (single-reference-only frames), so no
@@ -504,11 +517,14 @@ fn parse_inter_frame_header(
     Ok(InterFrameHeader {
         frame_type,
         show_frame,
+        showable_frame,
         error_resilient_mode,
         primary_ref_frame,
         order_hint,
         refresh_frame_flags,
+        ref_order_hints,
         ref_frame_idx,
+        reference_select,
         width,
         height,
     })
@@ -585,6 +601,26 @@ enum InterMode {
     New,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct MotionVector {
+    row: i32,
+    column: i32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct InterPrediction {
+    reference_indices: [usize; 2],
+    motion_vectors: [MotionVector; 2],
+    compound: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BlockMotion {
+    reference_indices: [usize; 2],
+    motion_vectors: [MotionVector; 2],
+    compound: bool,
+}
+
 /// Decodes one bounded lossless tile that may mix intra and single-reference
 /// inter blocks, reusing the intra decoder's DC-prediction and coefficient
 /// syntax for intra blocks and adding translational, integer-pel motion
@@ -606,7 +642,9 @@ struct InterTileDecoder<'a> {
     decoded_blocks: u32,
     max_blocks: u32,
     frame_type: Av1FrameType,
-    reference: Option<&'a RefSlot>,
+    references: [Option<&'a RefSlot>; 7],
+    reference_select: bool,
+    motion_grid: Vec<Option<BlockMotion>>,
 }
 
 impl<'a> InterTileDecoder<'a> {
@@ -643,16 +681,8 @@ impl<'a> InterTileDecoder<'a> {
         {
             return Err(resource("AV1 reconstruction exceeds the allocation limit"));
         }
-        let is_intra = header.frame_type == Av1FrameType::Key;
-        let reference =
-            if is_intra {
-                None
-            } else {
-                Some(refs[0].as_ref().ok_or_else(|| {
-                    malformed("AV1 inter frame has no resolved reference in slot 0")
-                })?)
-            };
-        if let Some(reference) = reference {
+        let references = std::array::from_fn(|index| refs[index].as_ref());
+        for reference in references.iter().flatten() {
             if reference.mi_cols != mi_cols || reference.mi_rows != mi_rows {
                 return Err(unsupported(
                     "AV1 inter decoder requires references matching the current coded geometry",
@@ -676,7 +706,9 @@ impl<'a> InterTileDecoder<'a> {
             decoded_blocks: 0,
             max_blocks: limits.max_av1_blocks_per_frame,
             frame_type: header.frame_type,
-            reference,
+            references,
+            reference_select: header.reference_select,
+            motion_grid: vec![None; contexts],
         })
     }
 
@@ -777,8 +809,8 @@ impl<'a> InterTileDecoder<'a> {
         }
         let is_inter =
             self.frame_type != Av1FrameType::Key && self.symbols.symbol(&cdf::IS_INTER)? != 0;
-        let motion = if is_inter {
-            Some(self.decode_inter_mode_and_ref()?)
+        let prediction = if is_inter {
+            Some(self.decode_inter_mode_and_ref(row, column, block_width)?)
         } else {
             if self.symbols.symbol(&cdf::INTRA_FRAME_Y_MODE_DC_DC)? != 0 {
                 return Err(unsupported(
@@ -797,15 +829,28 @@ impl<'a> InterTileDecoder<'a> {
                 }
             }
         }
-        if let Some((row_offset, column_offset)) = motion {
-            self.predict_inter_block(row, column, block_width, row_offset, column_offset)?;
+        if let Some(prediction) = prediction {
+            self.predict_inter_block(row, column, block_width, prediction)?;
+            let block_motion = BlockMotion {
+                reference_indices: prediction.reference_indices,
+                motion_vectors: prediction.motion_vectors,
+                compound: prediction.compound,
+            };
+            for y in 0..units {
+                for x in 0..units {
+                    let (mi_row, mi_column) = (row + y, column + x);
+                    if mi_row < self.mi_rows && mi_column < self.mi_cols {
+                        self.motion_grid[mi_row * self.mi_cols + mi_column] = Some(block_motion);
+                    }
+                }
+            }
         }
         for transform_y in 0..units {
             for transform_x in 0..units {
                 let x = column * 4 + transform_x * 4;
                 let y = row * 4 + transform_y * 4;
                 if x < self.coded_width && y < self.coded_height {
-                    self.decode_transform_block(x, y, block_width, motion.is_some())?;
+                    self.decode_transform_block(x, y, block_width, prediction.is_some())?;
                 }
             }
         }
@@ -815,26 +860,86 @@ impl<'a> InterTileDecoder<'a> {
     /// Decodes `is_inter`'s companion syntax (reference selection and mode)
     /// and returns the block's integer-pel motion vector as `(row, column)`
     /// offsets in luma samples.
-    fn decode_inter_mode_and_ref(&mut self) -> Result<(i32, i32)> {
-        if self.symbols.symbol(&cdf::SINGLE_REF_P1)? != 0 {
+    fn decode_inter_mode_and_ref(
+        &mut self,
+        row: usize,
+        column: usize,
+        block_width: usize,
+    ) -> Result<InterPrediction> {
+        let compound =
+            self.reference_select && block_width >= 8 && self.symbols.symbol(&cdf::COMP_MODE)? != 0;
+        if compound {
+            if self.symbols.symbol(&cdf::COMP_REF_TYPE)? != 0
+                || self.symbols.symbol(&cdf::UNI_COMP_REF)? != 0
+                || self.symbols.symbol(&cdf::UNI_COMP_REF_P1)? != 0
+            {
+                return Err(unsupported(
+                    "AV1 inter decoder supports LAST/LAST2 average compound prediction",
+                ));
+            }
+            let compound_mode = self.symbols.symbol(&cdf::COMPOUND_MODE)?;
+            let motion_vectors = match compound_mode {
+                0 => [
+                    self.nearest_motion_vector(row, column, 0),
+                    self.nearest_motion_vector(row, column, 1),
+                ],
+                6 => [MotionVector::default(); 2],
+                _ => {
+                    return Err(unsupported(
+                        "AV1 compound prediction supports NEAREST_NEARESTMV and GLOBAL_GLOBALMV",
+                    ));
+                }
+            };
+            return Ok(InterPrediction {
+                reference_indices: [0, 1],
+                motion_vectors,
+                compound: true,
+            });
+        }
+
+        if self.symbols.symbol(&cdf::SINGLE_REF_P1)? != 0
+            || self.symbols.symbol(&cdf::SINGLE_REF_P3)? != 0
+            || self.symbols.symbol(&cdf::SINGLE_REF_P4)? != 0
+        {
             return Err(unsupported(
-                "AV1 inter decoder only predicts from the primary (LAST) reference slot",
+                "AV1 single prediction currently supports the LAST reference",
             ));
         }
+        let predicted = self.nearest_motion_vector(row, column, 0);
         let mode = if self.symbols.symbol(&cdf::NEW_MV)? == 0 {
             InterMode::New
         } else if self.symbols.symbol(&cdf::ZERO_MV)? == 0 {
             InterMode::Global
         } else {
+            if self.symbols.symbol(&cdf::REF_MV)? != 0 {
+                return Err(unsupported("AV1 NEARMV prediction is not supported"));
+            }
             InterMode::Nearest
         };
-        match mode {
-            InterMode::Global | InterMode::Nearest => Ok((0, 0)),
-            InterMode::New => self.decode_new_mv(),
-        }
+        let motion =
+            match mode {
+                InterMode::Global => MotionVector::default(),
+                InterMode::Nearest => predicted,
+                InterMode::New => {
+                    let delta = self.decode_new_mv()?;
+                    MotionVector {
+                        row: predicted.row.checked_add(delta.row).ok_or_else(|| {
+                            malformed("AV1 predicted motion-vector row overflows")
+                        })?,
+                        column: predicted.column.checked_add(delta.column).ok_or_else(|| {
+                            malformed("AV1 predicted motion-vector column overflows")
+                        })?,
+                    }
+                }
+            };
+        Ok(InterPrediction {
+            reference_indices: [0, 0],
+            motion_vectors: [motion, MotionVector::default()],
+            compound: false,
+        })
     }
 
-    fn decode_new_mv(&mut self) -> Result<(i32, i32)> {
+    fn decode_new_mv(&mut self) -> Result<MotionVector> {
         let joint = self.symbols.symbol(&cdf::MV_JOINT)?;
         let row = if joint == 1 || joint == 3 {
             self.decode_mv_component(0)?
@@ -846,7 +951,7 @@ impl<'a> InterTileDecoder<'a> {
         } else {
             0
         };
-        Ok((row, column))
+        Ok(MotionVector { row, column })
     }
 
     /// Decodes one AV1 `mv_component` (§5.11.32) restricted to integer pel:
@@ -857,26 +962,50 @@ impl<'a> InterTileDecoder<'a> {
     fn decode_mv_component(&mut self, component: usize) -> Result<i32> {
         let sign = self.symbols.symbol(&cdf::MV_SIGN)? != 0;
         let class = self.symbols.symbol(&cdf::MV_CLASS[component])?;
-        let magnitude = if class == 0 {
-            let bit = self.symbols.symbol(&cdf::MV_CLASS0_BIT)?;
-            self.symbols.symbol(&cdf::MV_CLASS0_FR[component])?;
-            self.symbols.symbol(&cdf::MV_HP)?;
-            (bit as i32) + 1
-        } else {
-            let mut value = 1i32;
-            for bit_index in (0..class).rev() {
-                let bit = self.symbols.literal(1)?;
-                value |= (bit as i32) << bit_index;
-            }
-            value <<= 3;
-            self.symbols.symbol(&cdf::MV_FR[component])?;
-            self.symbols.symbol(&cdf::MV_HP)?;
-            value + 1
-        };
-        if magnitude > i32::from(i16::MAX) {
+        if class != 0 {
+            return Err(unsupported(
+                "AV1 motion-vector differences larger than two pixels are not supported",
+            ));
+        }
+        let class0_bit = self.symbols.symbol(&cdf::MV_CLASS0_BIT)?;
+        let fraction = self.symbols.symbol(&cdf::MV_CLASS0_FR[component])?;
+        if fraction != 3 {
+            return Err(unsupported(
+                "AV1 inter decoder requires whole-pel motion vectors",
+            ));
+        }
+        let magnitude_eighths = ((class0_bit as i32) << 3) | ((fraction as i32) << 1) | 1;
+        let magnitude_eighths = magnitude_eighths + 1;
+        let magnitude = magnitude_eighths / 8;
+        if magnitude == 0 || magnitude > 2 {
             return Err(malformed("AV1 motion vector magnitude is out of range"));
         }
         Ok(if sign { -magnitude } else { magnitude })
+    }
+
+    fn nearest_motion_vector(
+        &self,
+        row: usize,
+        column: usize,
+        reference_index: usize,
+    ) -> MotionVector {
+        let candidates = [
+            row.checked_sub(1)
+                .map(|above| above * self.mi_cols + column),
+            column.checked_sub(1).map(|left| row * self.mi_cols + left),
+        ];
+        for index in candidates.into_iter().flatten() {
+            let Some(block) = self.motion_grid[index] else {
+                continue;
+            };
+            let count = if block.compound { 2 } else { 1 };
+            for slot in 0..count {
+                if block.reference_indices[slot] == reference_index {
+                    return block.motion_vectors[slot];
+                }
+            }
+        }
+        MotionVector::default()
     }
 
     /// Copies the reference block for a whole coding block at once: with
@@ -888,12 +1017,8 @@ impl<'a> InterTileDecoder<'a> {
         row: usize,
         column: usize,
         block_width: usize,
-        row_offset: i32,
-        column_offset: i32,
+        prediction: InterPrediction,
     ) -> Result<()> {
-        let reference = self
-            .reference
-            .ok_or_else(|| malformed("AV1 inter block decoded without a resolved reference"))?;
         let x = column * 4;
         let y = row * 4;
         let units = block_width / 4;
@@ -905,19 +1030,33 @@ impl<'a> InterTileDecoder<'a> {
                 }
                 for sy in 0..4 {
                     for sx in 0..4 {
-                        let src_row = i64::from(dst_y as i32 + sy + row_offset);
-                        let src_col = i64::from(dst_x as i32 + sx + column_offset);
-                        if src_row < 0
-                            || src_col < 0
-                            || src_row as usize >= reference.height
-                            || src_col as usize >= reference.width
-                        {
-                            return Err(malformed(
-                                "AV1 motion vector references outside the reference frame",
-                            ));
+                        let mut samples = [0u8; 2];
+                        let reference_count = if prediction.compound { 2 } else { 1 };
+                        for reference_slot in 0..reference_count {
+                            let reference_index = prediction.reference_indices[reference_slot];
+                            let reference = self.references[reference_index].ok_or_else(|| {
+                                malformed("AV1 inter block references an unavailable frame")
+                            })?;
+                            let motion = prediction.motion_vectors[reference_slot];
+                            let src_row = i64::from(dst_y as i32 + sy + motion.row);
+                            let src_col = i64::from(dst_x as i32 + sx + motion.column);
+                            if src_row < 0
+                                || src_col < 0
+                                || src_row as usize >= reference.height
+                                || src_col as usize >= reference.width
+                            {
+                                return Err(malformed(
+                                    "AV1 motion vector references outside the reference frame",
+                                ));
+                            }
+                            samples[reference_slot] = reference.luma
+                                [src_row as usize * reference.width + src_col as usize];
                         }
-                        let sample =
-                            reference.luma[src_row as usize * reference.width + src_col as usize];
+                        let sample = if prediction.compound {
+                            ((u16::from(samples[0]) + u16::from(samples[1]) + 1) >> 1) as u8
+                        } else {
+                            samples[0]
+                        };
                         self.pixels
                             [(dst_y + sy as usize) * self.coded_width + dst_x + sx as usize] =
                             sample;

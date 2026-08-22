@@ -319,6 +319,14 @@ impl Av1Parser {
         })
     }
 
+    /// Seeds the parser with a sequence header retained by a stateful
+    /// decoder. Low-overhead temporal units are not required to repeat the
+    /// sequence header before every frame, so callers decoding a sequence of
+    /// temporal units must carry this state across parser instances.
+    pub(crate) fn set_sequence(&mut self, sequence: Av1SequenceHeader) {
+        self.sequence = Some(sequence);
+    }
+
     /// Parses one low-overhead AV1 byte stream. Every OBU must carry a leb128 size.
     pub fn parse_low_overhead(&mut self, bytes: &[u8]) -> Result<Vec<Av1Obu>> {
         check_allocation(bytes.len(), &self.limits, "AV1 input")?;
