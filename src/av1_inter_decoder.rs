@@ -1034,7 +1034,9 @@ impl<'a> InterTileDecoder<'a> {
                     for sx in 0..4 {
                         let mut samples = [0u8; 2];
                         let reference_count = if prediction.compound { 2 } else { 1 };
-                        for reference_slot in 0..reference_count {
+                        for (reference_slot, sample) in
+                            samples.iter_mut().enumerate().take(reference_count)
+                        {
                             let reference_index = prediction.reference_indices[reference_slot];
                             let reference = self.references[reference_index].ok_or_else(|| {
                                 malformed("AV1 inter block references an unavailable frame")
@@ -1051,7 +1053,7 @@ impl<'a> InterTileDecoder<'a> {
                                     "AV1 motion vector references outside the reference frame",
                                 ));
                             }
-                            samples[reference_slot] = reference.luma
+                            *sample = reference.luma
                                 [src_row as usize * reference.width + src_col as usize];
                         }
                         let sample = if prediction.compound {
