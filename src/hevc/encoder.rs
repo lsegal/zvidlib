@@ -180,7 +180,7 @@ fn rgba_to_yuv420(
     for py in 0..h {
         for x in 0..w {
             let (r, g, b) = px(x, py);
-            y[py * w + x] = ((47 * r + 157 * g + 16 * b + 128) >> 8).clamp(16, 235) as u8;
+            y[py * w + x] = (((66 * r + 129 * g + 25 * b + 128) >> 8) + 16).clamp(16, 235) as u8;
         }
     }
     for py in (0..h).step_by(2) {
@@ -195,8 +195,8 @@ fn rgba_to_yuv420(
                 }
             }
             let at = (py / 2) * (w / 2) + x / 2;
-            cb[at] = ((-26 * r - 87 * g + 112 * b + 131_072) >> 10).clamp(16, 240) as u8;
-            cr[at] = ((112 * r - 102 * g - 10 * b + 131_072) >> 10).clamp(16, 240) as u8;
+            cb[at] = ((-38 * r - 74 * g + 112 * b + 131_584) >> 10).clamp(16, 240) as u8;
+            cr[at] = ((112 * r - 94 * g - 18 * b + 131_584) >> 10).clamp(16, 240) as u8;
         }
     }
     Ok((y, cb, cr))
