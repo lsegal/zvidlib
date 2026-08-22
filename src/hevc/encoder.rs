@@ -34,6 +34,9 @@ impl VideoEncoderFactory for HevcEncoderFactory {
                 "native HEVC encoding does not accept pre-existing codec configuration",
             );
         }
+        if c.timescale == 0 || c.frame_duration == 0 {
+            return invalid("native HEVC encoding requires nonzero timescale and frame duration");
+        }
         if c.coded_dimensions.width % 16 != 0 || c.coded_dimensions.height % 16 != 0 {
             return invalid("native HEVC PCM encoding requires dimensions divisible by 16");
         }
@@ -66,7 +69,7 @@ impl VideoEncoderFactory for HevcEncoderFactory {
             configuration: c.clone(),
             config: EncoderConfig {
                 codec: Codec::Hevc,
-                timescale: 1,
+                timescale: c.timescale,
                 decoder_config: hvcc_box(&au)?,
             },
             next_index: 0,
@@ -129,14 +132,17 @@ impl VideoEncoder for HevcEncoder {
                     "HEVC access unit exceeds configured allocation limit",
                 ));
             }
-            let tick =
-                i64::try_from(self.next_index).map_err(|_| limit("HEVC timeline overflows"))?;
+            let tick = self
+                .next_index
+                .checked_mul(u64::from(self.configuration.frame_duration))
+                .ok_or_else(|| limit("HEVC timeline overflows"))?;
+            let tick = i64::try_from(tick).map_err(|_| limit("HEVC timeline overflows"))?;
             self.next_index += 1;
             Ok(vec![EncodedSample {
                 data,
                 dts: tick,
                 pts: tick,
-                duration: 1,
+                duration: self.configuration.frame_duration,
                 is_sync: true,
                 dependency: SampleDependency::INDEPENDENT,
             }])

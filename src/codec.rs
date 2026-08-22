@@ -191,6 +191,10 @@ pub struct VideoEncoderConfig {
     pub input_format: PixelFormat,
     pub color_range: ColorRange,
     pub hardware: HardwarePreference,
+    /// Exact media-clock timescale used for emitted DTS and PTS values.
+    pub timescale: u32,
+    /// Exact duration, in `timescale` ticks, of every submitted frame.
+    pub frame_duration: u32,
     pub configuration: Vec<u8>,
 }
 
