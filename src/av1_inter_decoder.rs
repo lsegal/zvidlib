@@ -1230,3 +1230,208 @@ fn resource(message: impl Into<String>) -> Error {
 fn unsupported(message: impl Into<String>) -> Error {
     Error::new(ErrorKind::Unsupported, message)
 }
+
+/// Test-only bitstream construction. Every writer here is the exact
+/// symmetric inverse of a reader used by [`decode_temporal_unit`] (or by
+/// [`Av1SymbolDecoder`] itself), so hand-built vectors exercise the real
+/// parsing and reconstruction paths above rather than a separate mock
+/// format. There is no production AV1 encoder in this crate; this module
+/// exists solely to generate standards-compliant fixtures for the tests
+/// below without checking in externally generated binaries.
+///
+/// [`SymbolEncoder`] is deliberately *not* a byte-at-a-time carry-propagating
+/// range coder (the classic implementation is easy to get subtly wrong).
+/// Instead it tracks the coded interval `[low, low + range)` as an exact
+/// arbitrary-precision integer (a `u128` low value with a growing bit width)
+/// across the whole symbol sequence and only converts to bytes once, at
+/// `finish()`, by picking any value inside the final interval and emitting
+/// it most-significant-bit first. Because [`Av1SymbolDecoder::symbol`]
+/// performs exactly the inverse interval bisection at each step, any value
+/// drawn from the final interval decodes back to the same symbol sequence
+/// regardless of how the interval was reached, so this is exact rather than
+/// an approximation of the real encoder. `symbol_encoder_round_trips_*`
+/// below verifies this against the real decoder before any fixture depends
+/// on it.
+#[cfg(test)]
+pub(crate) mod test_encoder {
+    use crate::Av1SymbolDecoder;
+    use crate::av1_entropy::AV1_CDF_MAX;
+
+    /// MSB-first bit writer, the exact inverse of `HeaderBits`.
+    #[derive(Default)]
+    pub(crate) struct BitWriter {
+        bytes: Vec<u8>,
+        bit: usize,
+    }
+
+    impl BitWriter {
+        pub(crate) fn bits(&mut self, value: u32, width: usize) {
+            for shift in (0..width).rev() {
+                if self.bit & 7 == 0 {
+                    self.bytes.push(0);
+                }
+                if value & (1 << shift) != 0 {
+                    let last = self.bytes.len() - 1;
+                    self.bytes[last] |= 0x80 >> (self.bit & 7);
+                }
+                self.bit += 1;
+            }
+        }
+
+        pub(crate) fn byte_align(&mut self) {
+            while self.bit & 7 != 0 {
+                self.bits(0, 1);
+            }
+        }
+
+        pub(crate) fn into_bytes(mut self) -> Vec<u8> {
+            self.byte_align();
+            self.bytes
+        }
+    }
+
+    /// Tracks the coded arithmetic interval as exact fixed-point fractions
+    /// of `[0, 1)`, scaled by `2^SCALE`. `low` is the interval's lower bound
+    /// and `range` its width, both in these units; `range` starts at
+    /// `2^SCALE` (the whole unit interval) and only shrinks, so precision
+    /// never needs renormalizing mid-stream.
+    pub(crate) struct SymbolEncoder {
+        low: u128,
+        range: u128,
+    }
+
+    impl SymbolEncoder {
+        const PROB_SHIFT: u32 = 6;
+        const MIN_PROB: u32 = 4;
+        /// Wide enough that `range` (which shrinks by at least the AV1
+        /// decoder's 15-bit CDF domain at every symbol) never underflows to
+        /// zero across any test vector built below.
+        const SCALE: u32 = 96;
+
+        pub(crate) fn new() -> Self {
+            Self {
+                low: 0,
+                range: 1u128 << Self::SCALE,
+            }
+        }
+
+        /// Encodes one symbol against `cdf`, an ascending AV1 cumulative
+        /// distribution function terminated by `32768`, using the same
+        /// `PROB_SHIFT`/`MIN_PROB` interval split as
+        /// [`Av1SymbolDecoder::symbol`] so the resulting sub-interval is bit
+        /// for bit the one the decoder would carve out for `symbol`.
+        pub(crate) fn symbol(&mut self, cdf: &[u16], symbol: usize) {
+            let symbols = cdf.len() as u32;
+            let bound = |s: usize| -> u128 {
+                if s >= cdf.len() {
+                    return 0;
+                }
+                let inverse_cdf = u32::from(AV1_CDF_MAX) - u32::from(cdf[s]);
+                let index = s as u32;
+                let value = (((self.decoder_range() >> 8) * (inverse_cdf >> Self::PROB_SHIFT))
+                    >> (7 - Self::PROB_SHIFT))
+                    + Self::MIN_PROB * (symbols - index - 1);
+                u128::from(value)
+            };
+            let upper = if symbol == 0 {
+                u128::from(self.decoder_range())
+            } else {
+                bound(symbol - 1)
+            };
+            let lower = bound(symbol);
+            // `self.range` is scaled by `2^SCALE`, but the bounds above are
+            // computed in the decoder's native 15-bit range domain, so
+            // rescale them before narrowing.
+            let unit = self.range >> 15;
+            self.low += unit * (self.decoder_range() as u128 - upper);
+            self.range = unit * (upper - lower);
+        }
+
+        /// The current interval width expressed in the decoder's native
+        /// 15-bit domain (its `range` field), which is what
+        /// `Av1SymbolDecoder::symbol` renormalizes back up to after every
+        /// symbol.
+        fn decoder_range(&self) -> u32 {
+            AV1_CDF_MAX.into()
+        }
+
+        /// Encodes `count` equiprobable bits, most-significant bit first,
+        /// mirroring `Av1SymbolDecoder::literal`.
+        pub(crate) fn literal(&mut self, value: u32, count: u8) {
+            const BOOL_CDF: [u16; 2] = [16_384, AV1_CDF_MAX];
+            for shift in (0..count).rev() {
+                let bit = (value >> shift) & 1;
+                self.symbol(&BOOL_CDF, bit as usize);
+            }
+        }
+
+        /// Finishes the coded interval, picks a representative value
+        /// (`low`, which is always inside `[low, low+range)`), and emits it
+        /// as `SCALE/8` most-significant-bit-first bytes plus enough
+        /// trailing zero padding for [`Av1SymbolDecoder`] to safely read its
+        /// initial window and any final renormalization shift.
+        pub(crate) fn finish(self) -> Vec<u8> {
+            let mut bytes = Vec::with_capacity((Self::SCALE / 8) as usize + 4);
+            for i in 0..(Self::SCALE / 8) {
+                let shift = Self::SCALE - 8 * (i + 1);
+                bytes.push(((self.low >> shift) & 0xff) as u8);
+            }
+            bytes.extend_from_slice(&[0, 0, 0, 0]);
+            bytes
+        }
+    }
+
+    /// Encodes a sequence of `(cdf, symbol)` pairs and asserts the real
+    /// [`Av1SymbolDecoder`] reads back exactly `symbols`, catching any
+    /// mismatch between this module's interval math and the production
+    /// decoder before it can silently produce a fixture that only "works"
+    /// against itself.
+    #[cfg(test)]
+    pub(crate) fn assert_round_trips(pairs: &[(&[u16], usize)]) {
+        let mut encoder = SymbolEncoder::new();
+        for &(cdf, symbol) in pairs {
+            encoder.symbol(cdf, symbol);
+        }
+        let bytes = encoder.finish();
+        let mut decoder = Av1SymbolDecoder::new(&bytes).unwrap();
+        for &(cdf, symbol) in pairs {
+            assert_eq!(decoder.symbol(cdf).unwrap(), symbol);
+        }
+    }
+
+    #[test]
+    fn symbol_encoder_round_trips_through_the_real_decoder() {
+        use crate::av1_cdf as cdf;
+
+        assert_round_trips(&[(&cdf::SKIP[0], 0)]);
+        assert_round_trips(&[(&cdf::SKIP[0], 1)]);
+        assert_round_trips(&[(&cdf::IS_INTER, 0), (&cdf::IS_INTER, 1)]);
+        assert_round_trips(&[
+            (&cdf::PARTITION_W64[0], 0),
+            (&cdf::PARTITION_W64[0], 3),
+            (&cdf::TXB_SKIP[0], 1),
+            (&cdf::COEFF_BASE_EOB[0][0], 2),
+            (&cdf::MV_JOINT, 3),
+            (&cdf::MV_CLASS[0], 0),
+            (&cdf::MV_SIGN, 1),
+        ]);
+        // A long, varied sequence exercising literals and every symbol
+        // width used elsewhere in this module, to catch precision loss
+        // across many renormalizations.
+        let mut encoder = SymbolEncoder::new();
+        let mut expectations: Vec<(&[u16], usize)> = Vec::new();
+        for i in 0..64usize {
+            let symbol = i % 2;
+            encoder.symbol(&cdf::SKIP[0], symbol);
+            expectations.push((&cdf::SKIP[0], symbol));
+            encoder.literal((i % 3) as u32, 2);
+            expectations.push((&[16_384, AV1_CDF_MAX], (i % 3 >> 1) & 1));
+            expectations.push((&[16_384, AV1_CDF_MAX], (i % 3) & 1));
+        }
+        let bytes = encoder.finish();
+        let mut decoder = Av1SymbolDecoder::new(&bytes).unwrap();
+        for (cdf, symbol) in expectations {
+            assert_eq!(decoder.symbol(cdf).unwrap(), symbol);
+        }
+    }
+}
