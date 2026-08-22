@@ -4,6 +4,7 @@ All notable changes to zvidlib will be documented in this file.
 
 ## Unreleased
 
+- Add stateful, dependency-free AV1 lossless inter decoding with bounded reference retention, order-hint and error-resilient refresh handling, whole-pel motion-vector prediction, average compound prediction, validated `show_existing_frame` output, reset/replay determinism, and panic-free malformed-reference rejection.
 - Add dependency-free, bounded reconstruction of standardized AV1 Main-profile 8-bit lossless monochrome intra frames to validated YUV420 planes, including static-CDF symbol and coefficient decoding, partition traversal, DC prediction, inverse WHT, explicit unsupported-syntax errors, decode-work limits, and a checked-in canonical vector.
 - Add a dependency-free native HEVC Main encoder factory that validates bounded RGBA8 input, writes standardized `hvcC` configuration and length-prefixed PCM-IDR access units, and produces independent random-access samples.
 - Add a dependency-free pure-Rust native HEVC Main decoder with bounded hvcC and bitstream validation, exact sequential/reverse/seek-heavy conformance against all 120 bundled frames, and real decoded-pixel rendering in the native OpenGL example.

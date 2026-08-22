@@ -12,16 +12,16 @@
 //!   (default CDFs only, never adapted), and `reduced_tx_set = 1` — the same
 //!   lossless-4x4 coefficient path as the intra decoder.
 //! - Key frames use the intra decoder's DC-prediction-only path. Inter frames
-//!   restrict every block to single-reference translational, integer-pel
-//!   motion compensation with `NEARESTMV`, `GLOBALMV`, or `NEWMV` (no
-//!   `NEARMV`, no dynamic reference list, no compound/masked/warped
-//!   prediction, no sub-pel interpolation filters).
+//!   restrict blocks to translational, whole-pel motion compensation with
+//!   `NEARESTMV`, `GLOBALMV`, or bounded `NEWMV`, plus average LAST/LAST2
+//!   compound prediction with `NEAREST_NEARESTMV` or `GLOBAL_GLOBALMV` (no
+//!   `NEARMV`, masked/warped prediction, or sub-pel interpolation).
 //! - `show_existing_frame` is supported and validated against an 8-slot
 //!   reference frame map keyed by `ref_frame_idx`, following the spec's
 //!   `frame_to_show_map_idx` and key-frame refresh rules.
 //!
-//! Any syntax outside that bound (compound prediction, sub-pel motion,
-//! multiple tiles, non-lossless quantization, chroma planes, frame-size
+//! Any syntax outside that bound (masked compound, sub-pel motion, multiple
+//! tiles, non-lossless quantization, chroma planes, frame-size
 //! changes relative to the sequence header, etc.) is rejected with a clear
 //! [`ErrorKind::Unsupported`] error rather than attempting a partial decode.
 //! Malformed input never panics; it returns [`ErrorKind::MalformedMedia`].
@@ -54,6 +54,8 @@ struct RefSlot {
     color_range: ColorRange,
     frame_type: Av1FrameType,
     showable_frame: bool,
+    generation: u64,
+    key_shown_existing: bool,
 }
 
 /// A bounded, stateful AV1 decoder that retains reference frames across
@@ -62,6 +64,7 @@ pub struct Av1InterDecoder {
     limits: Limits,
     sequence: Option<Av1SequenceHeader>,
     refs: [Option<RefSlot>; NUM_REF_FRAMES],
+    next_generation: u64,
 }
 
 impl Av1InterDecoder {
@@ -74,6 +77,7 @@ impl Av1InterDecoder {
             limits,
             sequence: None,
             refs: Default::default(),
+            next_generation: 0,
         })
     }
 
@@ -83,6 +87,7 @@ impl Av1InterDecoder {
     pub fn reset(&mut self) {
         self.sequence = None;
         self.refs = Default::default();
+        self.next_generation = 0;
     }
 
     /// Decodes one low-overhead AV1 temporal unit and returns the frame it
@@ -128,6 +133,7 @@ impl Av1InterDecoder {
             // A changed sequence header invalidates every retained reference:
             // their coded geometry is no longer guaranteed to match.
             self.refs = Default::default();
+            self.next_generation = 0;
         }
         self.sequence = Some(sequence);
         Ok(())
@@ -141,15 +147,27 @@ impl Av1InterDecoder {
             ));
         }
         let slot = self.refs[index]
-            .as_ref()
+            .clone()
             .ok_or_else(|| malformed("show_existing_frame references an empty reference slot"))?;
         if !slot.showable_frame {
             return Err(malformed(
                 "show_existing_frame references a frame that is not showable",
             ));
         }
+        if slot.frame_type == Av1FrameType::Key {
+            if slot.key_shown_existing {
+                return Err(malformed(
+                    "show_existing_frame may show a retained key frame only once",
+                ));
+            }
+            for retained in self.refs.iter_mut().flatten() {
+                if retained.generation == slot.generation {
+                    retained.key_shown_existing = true;
+                }
+            }
+        }
         luma_to_video_frame(
-            slot.luma.clone(),
+            slot.luma,
             slot.width,
             slot.height,
             slot.color_range,
@@ -215,6 +233,11 @@ impl Av1InterDecoder {
             ColorRange::Limited
         };
         if header.refresh_frame_flags != 0 {
+            let generation = self.next_generation;
+            self.next_generation = self
+                .next_generation
+                .checked_add(1)
+                .ok_or_else(|| resource("AV1 reference generation counter overflows"))?;
             let slot = RefSlot {
                 luma: luma.clone(),
                 width,
@@ -225,6 +248,8 @@ impl Av1InterDecoder {
                 color_range,
                 frame_type: header.frame_type,
                 showable_frame: header.showable_frame,
+                generation,
+                key_shown_existing: false,
             };
             for i in 0..NUM_REF_FRAMES {
                 if header.refresh_frame_flags & (1 << i) != 0 {
@@ -280,23 +305,6 @@ impl Av1InterDecoder {
     }
 }
 
-/// `get_relative_dist` (AV1 §5.9.3): the signed distance from `b` to `a` in
-/// wrapped order-hint space, positive when `a` is ahead of `b`.
-fn relative_order_distance(a: u32, b: u32, order_hint_bits: u8) -> i32 {
-    if order_hint_bits == 0 {
-        return 0;
-    }
-    let bits = u32::from(order_hint_bits);
-    let diff = a.wrapping_sub(b) & ((1u32 << bits) - 1);
-    let half = 1i64 << (bits - 1);
-    let signed = i64::from(diff);
-    (if signed > half {
-        signed - (half << 1)
-    } else {
-        signed
-    }) as i32
-}
-
 fn luma_to_video_frame(
     luma: Vec<u8>,
     width: usize,
@@ -328,7 +336,7 @@ fn check_sequence_support(sequence: &Av1SequenceHeader) -> Result<()> {
         || sequence.enable_jnt_comp
     {
         return Err(unsupported(
-            "AV1 inter decoder supports non-reduced Main-profile 8-bit monochrome streams with order hints, no frame-id numbering, and no warped motion, reference-MV projection, dual filters, or compound prediction features",
+            "AV1 inter decoder supports non-reduced Main-profile 8-bit monochrome streams with order hints, no frame-id numbering, and no warped motion, reference-MV projection, dual filters, interintra, or masked compound prediction",
         ));
     }
     if sequence.enable_superres
@@ -346,10 +354,7 @@ fn check_sequence_support(sequence: &Av1SequenceHeader) -> Result<()> {
 #[derive(Clone, Debug)]
 struct InterFrameHeader {
     frame_type: Av1FrameType,
-    show_frame: bool,
     showable_frame: bool,
-    error_resilient_mode: bool,
-    primary_ref_frame: u8,
     order_hint: u32,
     refresh_frame_flags: u8,
     ref_order_hints: Option<[u32; NUM_REF_FRAMES]>,
@@ -406,7 +411,7 @@ fn parse_inter_frame_header(
     let is_intra = matches!(frame_type, Av1FrameType::Key | Av1FrameType::IntraOnly);
     require_bit(bits, false, "frame_size_override_flag")?;
     let order_hint = bits.read(usize::from(seq.order_hint_bits), "order_hint")?;
-    let primary_ref_frame = if is_intra || error_resilient_mode {
+    let _primary_ref_frame = if is_intra || error_resilient_mode {
         PRIMARY_REF_NONE
     } else {
         u8::try_from(bits.read(3, "primary_ref_frame")?).expect("three bits fit u8")
@@ -516,10 +521,7 @@ fn parse_inter_frame_header(
     }
     Ok(InterFrameHeader {
         frame_type,
-        show_frame,
         showable_frame,
-        error_resilient_mode,
-        primary_ref_frame,
         order_hint,
         refresh_frame_flags,
         ref_order_hints,
@@ -1646,6 +1648,7 @@ mod tests {
     use super::test_encoder::{BitWriter, SymbolEncoder};
     use super::*;
     use crate::av1_cdf as cdf;
+    use crate::{ErrorKind, FrameDigest};
 
     const FRAME_DIM: u32 = 16;
 
@@ -1728,20 +1731,55 @@ mod tests {
     impl FrameHeaderBuilder {
         fn key_frame(order_hint_bits: usize) -> Self {
             let mut w = BitWriter::default();
+            w.bits(0, 1); // show_existing_frame = 0
             w.bits(0, 2); // frame_type = KEY_FRAME
             w.bits(1, 1); // show_frame = 1
             // error_resilient_mode is implied true for a shown key frame.
             w.bits(1, 1); // disable_cdf_update = 1
             // allow_screen_content_tools is implied 0 (seq_force = 0).
             // primary_ref_frame is implied PRIMARY_REF_NONE for intra frames.
+            w.bits(0, 1); // frame_size_override_flag
             w.bits(0, order_hint_bits); // order_hint
             // refresh_frame_flags is implied 0xff for a shown key frame.
             // ref_frame_idx() is absent for intra frames.
-            w.bits(0, 1); // frame_size_override_flag
             w.bits(0, 1); // render_and_frame_size_different
-            // is_filter_switchable/interpolation_filter/is_motion_mode_switchable
-            // are all absent for intra frames.
-            w.bits(0, 1); // disable_frame_end_update_cdf
+            Self { w }
+        }
+
+        fn inter_frame(
+            order_hint_bits: usize,
+            order_hint: u32,
+            refresh_frame_flags: u8,
+            ref_frame_idx: [u8; 7],
+            ref_order_hints: Option<[u32; NUM_REF_FRAMES]>,
+        ) -> Self {
+            let mut w = BitWriter::default();
+            w.bits(0, 1); // show_existing_frame = 0
+            w.bits(1, 2); // frame_type = INTER_FRAME
+            w.bits(1, 1); // show_frame = 1 (showable_frame is inferred true)
+            w.bits(ref_order_hints.is_some().into(), 1); // error_resilient_mode
+            w.bits(1, 1); // disable_cdf_update = 1
+            // allow_screen_content_tools is implied 0.
+            w.bits(0, 1); // frame_size_override_flag
+            w.bits(order_hint, order_hint_bits);
+            if ref_order_hints.is_none() {
+                w.bits(PRIMARY_REF_NONE.into(), 3);
+            }
+            w.bits(refresh_frame_flags.into(), 8);
+            if let Some(hints) = ref_order_hints {
+                for hint in hints {
+                    w.bits(hint, order_hint_bits);
+                }
+            }
+            w.bits(0, 1); // frame_refs_short_signaling = 0
+            for index in ref_frame_idx {
+                w.bits(index.into(), 3);
+            }
+            w.bits(0, 1); // render_and_frame_size_different
+            w.bits(0, 1); // allow_high_precision_mv
+            w.bits(0, 1); // is_filter_switchable
+            w.bits(0, 2); // interpolation_filter = EIGHTTAP
+            w.bits(0, 1); // is_motion_mode_switchable
             Self { w }
         }
 
@@ -1749,7 +1787,13 @@ mod tests {
         /// `segmentation_params()`, `frame_reference_mode()`,
         /// `reduced_tx_set`, and (for inter frames) the identity
         /// `global_motion_params()`, then byte-aligns.
-        fn finish_common(mut self, is_intra: bool, mi_cols: usize, mi_rows: usize) -> Vec<u8> {
+        fn finish_common(
+            mut self,
+            is_intra: bool,
+            reference_select: bool,
+            mi_cols: usize,
+            mi_rows: usize,
+        ) -> Vec<u8> {
             // tile_info(): uniform spacing, one tile (mi_cols/mi_rows <= 64
             // superblock units here, so no increment bits are read).
             self.w.bits(1, 1); // uniform_tile_spacing_flag
@@ -1761,7 +1805,10 @@ mod tests {
             self.w.bits(0, 1); // using_qmatrix
             self.w.bits(0, 1); // segmentation_enabled
             if !is_intra {
-                self.w.bits(0, 1); // reference_select = 0 (single reference)
+                self.w.bits(reference_select.into(), 1);
+                if reference_select {
+                    self.w.bits(0, 1); // skip_mode_present = 0
+                }
             }
             self.w.bits(1, 1); // reduced_tx_set = 1
             if !is_intra {
@@ -1821,13 +1868,108 @@ mod tests {
         e.finish()
     }
 
+    fn inter_frame_tile(compound: bool, add_dc_residual: bool) -> Vec<u8> {
+        let mut e = SymbolEncoder::new();
+        e.symbol(&cdf::PARTITION_W16[0], 0); // one 16x16 block
+        e.symbol(&cdf::SKIP[0], 0);
+        e.symbol(&cdf::IS_INTER, 1);
+        if compound {
+            e.symbol(&cdf::COMP_MODE, 1);
+            e.symbol(&cdf::COMP_REF_TYPE, 0);
+            e.symbol(&cdf::UNI_COMP_REF, 0);
+            e.symbol(&cdf::UNI_COMP_REF_P1, 0);
+            e.symbol(&cdf::COMPOUND_MODE, 6); // GLOBAL_GLOBALMV
+        } else {
+            e.symbol(&cdf::SINGLE_REF_P1, 0);
+            e.symbol(&cdf::SINGLE_REF_P3, 0);
+            e.symbol(&cdf::SINGLE_REF_P4, 0);
+            e.symbol(&cdf::NEW_MV, 1);
+            e.symbol(&cdf::ZERO_MV, 0); // GLOBALMV
+        }
+        for transform in 0..16 {
+            let context = match transform {
+                0 => 1,
+                1 | 4 if add_dc_residual => 2,
+                _ => 1,
+            };
+            if add_dc_residual && transform == 0 {
+                e.symbol(&cdf::TXB_SKIP[context], 0);
+                e.symbol(&cdf::EOB_PT_16[0][0], 0);
+                e.symbol(&cdf::COEFF_BASE_EOB[0][0], 0);
+                e.symbol(&cdf::DC_SIGN[0][0], 0);
+            } else {
+                e.symbol(&cdf::TXB_SKIP[context], 1);
+            }
+        }
+        e.finish()
+    }
+
+    fn inter_frame_temporal_unit(
+        order_hint: u32,
+        refresh_frame_flags: u8,
+        ref_frame_idx: [u8; 7],
+        compound: bool,
+        add_dc_residual: bool,
+    ) -> Vec<u8> {
+        let mi = 2 * FRAME_DIM.div_ceil(8) as usize;
+        let header = FrameHeaderBuilder::inter_frame(
+            3,
+            order_hint,
+            refresh_frame_flags,
+            ref_frame_idx,
+            None,
+        )
+        .finish_common(false, compound, mi, mi);
+        let mut payload = header;
+        payload.extend_from_slice(&inter_frame_tile(compound, add_dc_residual));
+        let mut stream = Vec::new();
+        push_obu(&mut stream, 2, &[]);
+        push_obu(&mut stream, 6, &payload);
+        stream
+    }
+
+    fn error_resilient_inter_temporal_unit(
+        order_hint: u32,
+        refresh_frame_flags: u8,
+        ref_frame_idx: [u8; 7],
+        ref_order_hints: [u32; NUM_REF_FRAMES],
+    ) -> Vec<u8> {
+        let mi = 2 * FRAME_DIM.div_ceil(8) as usize;
+        let header = FrameHeaderBuilder::inter_frame(
+            3,
+            order_hint,
+            refresh_frame_flags,
+            ref_frame_idx,
+            Some(ref_order_hints),
+        )
+        .finish_common(false, false, mi, mi);
+        let mut payload = header;
+        payload.extend_from_slice(&inter_frame_tile(false, false));
+        let mut stream = Vec::new();
+        push_obu(&mut stream, 2, &[]);
+        push_obu(&mut stream, 6, &payload);
+        stream
+    }
+
+    fn show_existing_temporal_unit(map_index: u8) -> Vec<u8> {
+        let mut bits = BitWriter::default();
+        bits.bits(1, 1); // show_existing_frame
+        bits.bits(map_index.into(), 3);
+        bits.bits(1, 1); // trailing_one_bit
+        bits.byte_align();
+        let mut stream = Vec::new();
+        push_obu(&mut stream, 2, &[]);
+        push_obu(&mut stream, 3, &bits.into_bytes());
+        stream
+    }
+
     /// Wraps `sequence_header_payload()` and `key_frame_tile()` into a
     /// complete low-overhead temporal unit: temporal delimiter, sequence
     /// header, and one Frame OBU (frame header + tile data concatenated,
     /// matching how `Av1Parser` splits `Av1Obu::Frame` payloads).
     fn key_frame_temporal_unit() -> Vec<u8> {
         let mi = 2 * FRAME_DIM.div_ceil(8) as usize;
-        let header = FrameHeaderBuilder::key_frame(3).finish_common(true, mi, mi);
+        let header = FrameHeaderBuilder::key_frame(3).finish_common(true, false, mi, mi);
         let mut payload = header;
         payload.extend_from_slice(&key_frame_tile());
 
@@ -1853,6 +1995,208 @@ mod tests {
             (frame.dimensions.width, frame.dimensions.height),
             (FRAME_DIM, FRAME_DIM)
         );
-        eprintln!("luma = {:?}", frame.planes[0].data);
+        assert_eq!(frame.planes[0].data.len(), 256);
+    }
+
+    #[test]
+    fn sequential_compound_show_existing_and_reset_replay_are_deterministic() {
+        let limits = Limits::default();
+        let key = key_frame_temporal_unit();
+        let first = inter_frame_temporal_unit(1, 0x01, [1; 7], false, true);
+        let second = inter_frame_temporal_unit(3, 0x02, [0; 7], false, true);
+        let compound = inter_frame_temporal_unit(2, 0x04, [0, 1, 0, 0, 0, 0, 0], true, false);
+        let shown = show_existing_temporal_unit(2);
+
+        let decode = |decoder: &mut Av1InterDecoder| -> Result<FrameDigest> {
+            decoder.decode_temporal_unit(&key)?;
+            decoder.decode_temporal_unit(&first)?;
+            decoder.decode_temporal_unit(&second)?;
+            let compound_frame = decoder.decode_temporal_unit(&compound)?;
+            let digest = FrameDigest::from_frame(&compound_frame)?;
+            let shown_frame = decoder.decode_temporal_unit(&shown)?;
+            assert_eq!(FrameDigest::from_frame(&shown_frame)?, digest);
+            Ok(digest)
+        };
+
+        let mut decoder = Av1InterDecoder::new(limits).unwrap();
+        decoder.decode_temporal_unit(&key).unwrap();
+        assert_eq!(
+            decoder
+                .decode_temporal_unit(&show_existing_temporal_unit(0))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::MalformedMedia
+        );
+        decoder.reset();
+        let first_digest = decode(&mut decoder).unwrap();
+        assert_eq!(
+            first_digest,
+            FrameDigest::from_hex(
+                "7ea14a38407023bc5ab57e0e4e49deb4c7aad077b662e5aca2378e033049b829"
+            )
+            .unwrap()
+        );
+        decoder.reset();
+        assert_eq!(
+            decoder.decode_temporal_unit(&shown).unwrap_err().kind(),
+            ErrorKind::MalformedMedia
+        );
+        let replay_digest = decode(&mut decoder).unwrap();
+        assert_eq!(replay_digest, first_digest);
+    }
+
+    #[test]
+    fn invalid_reference_and_motion_data_fail_without_panicking() {
+        let limits = Limits::default();
+        let mut decoder = Av1InterDecoder::new(limits).unwrap();
+        decoder
+            .decode_temporal_unit(&key_frame_temporal_unit())
+            .unwrap();
+        decoder.refs[7] = None;
+
+        let invalid_reference = inter_frame_temporal_unit(1, 0, [0, 7, 0, 0, 0, 0, 0], true, false);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            decoder.decode_temporal_unit(&invalid_reference)
+        }));
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap().unwrap_err().kind(),
+            ErrorKind::MalformedMedia
+        );
+
+        let reference = decoder.refs[0].as_ref().unwrap().clone();
+        let header = InterFrameHeader {
+            frame_type: Av1FrameType::Inter,
+            showable_frame: true,
+            order_hint: 1,
+            refresh_frame_flags: 0,
+            ref_order_hints: None,
+            ref_frame_idx: [0; 7],
+            reference_select: false,
+            width: 16,
+            height: 16,
+        };
+        let refs: [Option<RefSlot>; 8] = std::array::from_fn(|index| {
+            if index == 0 {
+                Some(reference.clone())
+            } else {
+                None
+            }
+        });
+        let mut tile =
+            InterTileDecoder::new(&[0xff; 8], 16, 16, 4, 4, &header, &refs, &limits).unwrap();
+        let prediction = InterPrediction {
+            reference_indices: [0, 0],
+            motion_vectors: [MotionVector { row: -1, column: 0 }, MotionVector::default()],
+            compound: false,
+        };
+        assert_eq!(
+            tile.predict_inter_block(0, 0, 16, prediction)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::MalformedMedia
+        );
+    }
+
+    #[test]
+    fn error_resilient_order_hints_invalidate_stale_reference_slots() {
+        let limits = Limits::default();
+        let mut decoder = Av1InterDecoder::new(limits).unwrap();
+        decoder
+            .decode_temporal_unit(&key_frame_temporal_unit())
+            .unwrap();
+        decoder
+            .decode_temporal_unit(&inter_frame_temporal_unit(1, 0x01, [1; 7], false, true))
+            .unwrap();
+        decoder
+            .decode_temporal_unit(&inter_frame_temporal_unit(3, 0x02, [0; 7], false, true))
+            .unwrap();
+        assert_eq!(decoder.refs[1].as_ref().unwrap().order_hint, 3);
+
+        decoder
+            .decode_temporal_unit(&error_resilient_inter_temporal_unit(
+                4,
+                0,
+                [0; 7],
+                [1, 0, 0, 0, 0, 0, 0, 0],
+            ))
+            .unwrap();
+        assert!(decoder.refs[0].is_some());
+        assert!(decoder.refs[1].is_none());
+    }
+
+    #[test]
+    fn motion_vector_deltas_feed_nearest_prediction() {
+        let limits = Limits::default();
+        let mut decoder = Av1InterDecoder::new(limits).unwrap();
+        decoder
+            .decode_temporal_unit(&key_frame_temporal_unit())
+            .unwrap();
+        let reference = decoder.refs[0].as_ref().unwrap().clone();
+        let refs: [Option<RefSlot>; 8] = std::array::from_fn(|_| Some(reference.clone()));
+        let header = InterFrameHeader {
+            frame_type: Av1FrameType::Inter,
+            showable_frame: true,
+            order_hint: 1,
+            refresh_frame_flags: 0,
+            ref_order_hints: None,
+            ref_frame_idx: [0; 7],
+            reference_select: false,
+            width: 16,
+            height: 16,
+        };
+        let mut symbols = SymbolEncoder::new();
+        symbols.symbol(&cdf::MV_JOINT, 1); // nonzero row, zero column
+        symbols.symbol(&cdf::MV_SIGN, 0);
+        symbols.symbol(&cdf::MV_CLASS[0], 0);
+        symbols.symbol(&cdf::MV_CLASS0_BIT, 0);
+        symbols.symbol(&cdf::MV_CLASS0_FR[0], 3); // whole-pel +1
+        let bytes = symbols.finish();
+        let mut tile =
+            InterTileDecoder::new(&bytes, 16, 16, 4, 4, &header, &refs, &limits).unwrap();
+        let delta = tile.decode_new_mv().unwrap();
+        assert_eq!(delta, MotionVector { row: 1, column: 0 });
+
+        tile.motion_grid[0] = Some(BlockMotion {
+            reference_indices: [0, 0],
+            motion_vectors: [delta, MotionVector::default()],
+            compound: false,
+        });
+        assert_eq!(tile.nearest_motion_vector(0, 1, 0), delta);
+        let prediction = InterPrediction {
+            reference_indices: [0, 0],
+            motion_vectors: [delta, MotionVector::default()],
+            compound: false,
+        };
+        tile.predict_inter_block(0, 0, 8, prediction).unwrap();
+        assert_eq!(tile.pixels[0], reference.luma[reference.width]);
+    }
+
+    #[test]
+    #[ignore = "local standards cross-check"]
+    fn generated_sequence_decodes_with_ffmpeg() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let mut stream = key_frame_temporal_unit();
+        stream.extend(inter_frame_temporal_unit(1, 0x01, [1; 7], false, true));
+        stream.extend(inter_frame_temporal_unit(3, 0x02, [0; 7], false, true));
+        stream.extend(inter_frame_temporal_unit(
+            2,
+            0x04,
+            [0, 1, 0, 0, 0, 0, 0],
+            true,
+            false,
+        ));
+        stream.extend(show_existing_temporal_unit(2));
+        let mut child = Command::new("ffmpeg")
+            .args([
+                "-v", "error", "-f", "obu", "-i", "pipe:0", "-f", "null", "-",
+            ])
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(&stream).unwrap();
+        assert!(child.wait().unwrap().success());
     }
 }
