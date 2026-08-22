@@ -341,7 +341,8 @@ pub static MV_CLASS0_BIT: [u16; 2] = [16384, 32768];
 pub static MV_FR: [[u16; 4]; 2] = [[16384, 24576, 28672, 32768], [16384, 24576, 28672, 32768]];
 
 /// `Default_Mv_Class0_Fr_Cdf[comp]`: MV_CLASS_0 fractional part.
-pub static MV_CLASS0_FR: [[u16; 4]; 2] = [[16384, 24576, 28672, 32768], [16384, 24576, 28672, 32768]];
+pub static MV_CLASS0_FR: [[u16; 4]; 2] =
+    [[16384, 24576, 28672, 32768], [16384, 24576, 28672, 32768]];
 
 /// `Default_Mv_Class0_Hp_Cdf` / `Default_Mv_Hp_Cdf`: high-precision bit (equiprobable default).
 pub static MV_HP: [u16; 2] = [16384, 32768];

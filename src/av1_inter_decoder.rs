@@ -152,8 +152,11 @@ impl Av1InterDecoder {
             .sequence
             .clone()
             .ok_or_else(|| malformed("AV1 frame OBU precedes a supported sequence header"))?;
-        let dimensions =
-            VideoDimensions::new(sequence.max_frame_width, sequence.max_frame_height, &self.limits)?;
+        let dimensions = VideoDimensions::new(
+            sequence.max_frame_width,
+            sequence.max_frame_height,
+            &self.limits,
+        )?;
         let width = usize::try_from(dimensions.width)
             .map_err(|_| resource("AV1 frame width is not representable"))?;
         let height = usize::try_from(dimensions.height)
@@ -177,8 +180,16 @@ impl Av1InterDecoder {
         let tile = payload
             .get(tile_offset..)
             .ok_or_else(|| malformed("AV1 tile data is truncated"))?;
-        let mut decoder =
-            InterTileDecoder::new(tile, width, height, mi_cols, mi_rows, &header, &refs, &self.limits)?;
+        let mut decoder = InterTileDecoder::new(
+            tile,
+            width,
+            height,
+            mi_cols,
+            mi_rows,
+            &header,
+            &refs,
+            &self.limits,
+        )?;
         let luma = decoder.decode()?;
 
         let color_range = if sequence.color_config.color_range {
@@ -220,7 +231,8 @@ impl Av1InterDecoder {
         let total = per_frame
             .checked_mul(NUM_REF_FRAMES)
             .ok_or_else(|| resource("AV1 reference frame budget overflows"))?;
-        if u64::try_from(total).map_err(|_| resource("AV1 reference budget is not representable"))?
+        if u64::try_from(total)
+            .map_err(|_| resource("AV1 reference budget is not representable"))?
             > self.limits.max_allocation_bytes
         {
             return Err(resource(
@@ -632,13 +644,14 @@ impl<'a> InterTileDecoder<'a> {
             return Err(resource("AV1 reconstruction exceeds the allocation limit"));
         }
         let is_intra = header.frame_type == Av1FrameType::Key;
-        let reference = if is_intra {
-            None
-        } else {
-            Some(refs[0].as_ref().ok_or_else(|| {
-                malformed("AV1 inter frame has no resolved reference in slot 0")
-            })?)
-        };
+        let reference =
+            if is_intra {
+                None
+            } else {
+                Some(refs[0].as_ref().ok_or_else(|| {
+                    malformed("AV1 inter frame has no resolved reference in slot 0")
+                })?)
+            };
         if let Some(reference) = reference {
             if reference.mi_cols != mi_cols || reference.mi_rows != mi_rows {
                 return Err(unsupported(
@@ -762,8 +775,8 @@ impl<'a> InterTileDecoder<'a> {
         if self.symbols.symbol(&cdf::SKIP[0])? != 0 {
             return Err(unsupported("AV1 skipped blocks are not supported"));
         }
-        let is_inter = self.frame_type != Av1FrameType::Key
-            && self.symbols.symbol(&cdf::IS_INTER)? != 0;
+        let is_inter =
+            self.frame_type != Av1FrameType::Key && self.symbols.symbol(&cdf::IS_INTER)? != 0;
         let motion = if is_inter {
             Some(self.decode_inter_mode_and_ref()?)
         } else {
@@ -903,9 +916,10 @@ impl<'a> InterTileDecoder<'a> {
                                 "AV1 motion vector references outside the reference frame",
                             ));
                         }
-                        let sample = reference.luma
-                            [src_row as usize * reference.width + src_col as usize];
-                        self.pixels[(dst_y + sy as usize) * self.coded_width + dst_x + sx as usize] =
+                        let sample =
+                            reference.luma[src_row as usize * reference.width + src_col as usize];
+                        self.pixels
+                            [(dst_y + sy as usize) * self.coded_width + dst_x + sx as usize] =
                             sample;
                     }
                 }
@@ -1012,9 +1026,7 @@ impl<'a> InterTileDecoder<'a> {
             (1usize << (eob_point - 2)) + 1 + extra
         };
         if eob == 0 || eob > 16 {
-            return Err(malformed(
-                "AV1 coefficient EOB is outside a 4x4 transform",
-            ));
+            return Err(malformed("AV1 coefficient EOB is outside a 4x4 transform"));
         }
         let mut levels = [0i32; 16];
         for coefficient in (0..eob).rev() {
@@ -1672,8 +1684,7 @@ mod tests {
     /// since every neighbor they see is either untouched (0) or that lone
     /// nonzero level (which never exceeds the "one zero neighbor" cutoff).
     fn key_frame_tile() -> Vec<u8> {
-        const CONTEXTS: [[usize; 4]; 4] =
-            [[1, 2, 2, 1], [1, 1, 1, 1], [1, 1, 1, 1], [1, 1, 1, 1]];
+        const CONTEXTS: [[usize; 4]; 4] = [[1, 2, 2, 1], [1, 1, 1, 1], [1, 1, 1, 1], [1, 1, 1, 1]];
         let mut e = SymbolEncoder::new();
         // decode_partition(0,0,64) / (0,0,32) / (0,0,16) force-split with no
         // symbol read (mi_cols = mi_rows = 4 < the half-block thresholds),
@@ -1715,7 +1726,11 @@ mod tests {
 
         let mut stream = Vec::new();
         push_obu(&mut stream, 2, &[]); // temporal delimiter
-        push_obu(&mut stream, 1, &sequence_header_payload(FRAME_DIM, FRAME_DIM));
+        push_obu(
+            &mut stream,
+            1,
+            &sequence_header_payload(FRAME_DIM, FRAME_DIM),
+        );
         push_obu(&mut stream, 6, &payload); // Frame OBU
         stream
     }
