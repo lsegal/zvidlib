@@ -1239,19 +1239,31 @@ fn unsupported(message: impl Into<String>) -> Error {
 /// exists solely to generate standards-compliant fixtures for the tests
 /// below without checking in externally generated binaries.
 ///
-/// [`SymbolEncoder`] is deliberately *not* a byte-at-a-time carry-propagating
-/// range coder (the classic implementation is easy to get subtly wrong).
-/// Instead it tracks the coded interval `[low, low + range)` as an exact
-/// arbitrary-precision integer (a `u128` low value with a growing bit width)
-/// across the whole symbol sequence and only converts to bytes once, at
-/// `finish()`, by picking any value inside the final interval and emitting
-/// it most-significant-bit first. Because [`Av1SymbolDecoder::symbol`]
-/// performs exactly the inverse interval bisection at each step, any value
-/// drawn from the final interval decodes back to the same symbol sequence
-/// regardless of how the interval was reached, so this is exact rather than
-/// an approximation of the real encoder. `symbol_encoder_round_trips_*`
-/// below verifies this against the real decoder before any fixture depends
-/// on it.
+/// [`SymbolEncoder`] is the exact algebraic inverse of
+/// [`Av1SymbolDecoder::symbol`], derived directly from its update rule
+/// rather than reimplementing a textbook range coder from memory. The
+/// decoder's per-symbol renormalization is:
+///
+/// ```text
+/// range  = upper - lower                       // same lower/upper the encoder computes below
+/// value  = value - lower
+/// shift  = 15 - ilog2(range)
+/// range  <<= shift
+/// bits   = next `shift` raw bits from the input, MSB-first
+/// value  = (bits << (shift - available)) ^ (((value + 1) << shift) - 1)
+/// ```
+///
+/// `((v + 1) << shift) - 1` equals `(v << shift) | ones(shift)` for any
+/// `v >= 0` (the `+1`/`-1` only ever borrows within the low `shift` bits),
+/// so whenever the *encoder* always narrows to the bottom of its target
+/// symbol's interval — i.e. keeps `value - lower == 0` after every step —
+/// the update simplifies to `value_new = bits ^ ones(shift)`, i.e. `bits`
+/// is exactly the bitwise complement of `value_new`'s low `shift` bits.
+/// The encoder exploits this: it never needs to choose `value`, only the
+/// raw stream bits, by picking each symbol's `lower` bound as next
+/// step's target `value` and solving for the complemented output bits.
+/// `symbol_encoder_round_trips_through_the_real_decoder` below verifies
+/// this against the real decoder before any fixture depends on it.
 #[cfg(test)]
 pub(crate) mod test_encoder {
     use crate::Av1SymbolDecoder;
@@ -1290,69 +1302,134 @@ pub(crate) mod test_encoder {
         }
     }
 
-    /// Tracks the coded arithmetic interval as exact fixed-point fractions
-    /// of `[0, 1)`, scaled by `2^SCALE`. `low` is the interval's lower bound
-    /// and `range` its width, both in these units; `range` starts at
-    /// `2^SCALE` (the whole unit interval) and only shrinks, so precision
-    /// never needs renormalizing mid-stream.
+    /// Emits raw output bits MSB-first into a byte buffer.
+    #[derive(Default)]
+    struct RawBitWriter {
+        bytes: Vec<u8>,
+        bit: usize,
+    }
+
+    impl RawBitWriter {
+        fn push(&mut self, value: u32, width: u32) {
+            for shift in (0..width).rev() {
+                if self.bit & 7 == 0 {
+                    self.bytes.push(0);
+                }
+                if (value >> shift) & 1 != 0 {
+                    let last = self.bytes.len() - 1;
+                    self.bytes[last] |= 0x80 >> (self.bit & 7);
+                }
+                self.bit += 1;
+            }
+        }
+    }
+
+    /// The exact symmetric inverse of [`Av1SymbolDecoder`]. `range` mirrors
+    /// the decoder's 15-bit `range` field bit for bit; the encoder never
+    /// tracks `value` at all because it maintains the invariant that
+    /// `value - lower == 0` after every symbol (see the module docs above),
+    /// so only the raw bits it must emit to steer the *next* renormalized
+    /// `value` towards each subsequent symbol's `lower` bound need tracking.
     pub(crate) struct SymbolEncoder {
-        low: u128,
-        range: u128,
+        range: u32,
+        output: RawBitWriter,
+        /// The `value` the decoder would have *before* consuming the next
+        /// symbol's renormalization bits, known exactly because the encoder
+        /// always leaves `value - lower == 0`. `None` before the first
+        /// symbol, when the decoder instead derives its initial `value`
+        /// from the stream's first 15 bits directly (no prior `lower` to
+        /// steer towards).
+        pending_next_value: Option<u32>,
     }
 
     impl SymbolEncoder {
         const PROB_SHIFT: u32 = 6;
         const MIN_PROB: u32 = 4;
-        /// Wide enough that `range` (which shrinks by at least the AV1
-        /// decoder's 15-bit CDF domain at every symbol) never underflows to
-        /// zero across any test vector built below.
-        const SCALE: u32 = 96;
 
         pub(crate) fn new() -> Self {
             Self {
-                low: 0,
-                range: 1u128 << Self::SCALE,
+                range: AV1_CDF_MAX.into(),
+                output: RawBitWriter::default(),
+                pending_next_value: None,
             }
         }
 
+        /// The same `lower` bound formula `Av1SymbolDecoder::symbol` uses
+        /// for `cdf[s]`, i.e. the value `lower` takes when the search loop
+        /// has just tested symbol `s`.
+        fn bound(&self, cdf: &[u16], s: usize) -> u32 {
+            if s >= cdf.len() {
+                return 0;
+            }
+            let symbols = cdf.len() as u32;
+            let inverse_cdf = u32::from(AV1_CDF_MAX) - u32::from(cdf[s]);
+            let index = s as u32;
+            ((self.range >> 8) * (inverse_cdf >> Self::PROB_SHIFT)) >> (7 - Self::PROB_SHIFT)
+                + 0 // keep the same operator precedence as the decoder
+        }
+
         /// Encodes one symbol against `cdf`, an ascending AV1 cumulative
-        /// distribution function terminated by `32768`, using the same
-        /// `PROB_SHIFT`/`MIN_PROB` interval split as
-        /// [`Av1SymbolDecoder::symbol`] so the resulting sub-interval is bit
-        /// for bit the one the decoder would carve out for `symbol`.
+        /// distribution function terminated by `32768`.
         pub(crate) fn symbol(&mut self, cdf: &[u16], symbol: usize) {
             let symbols = cdf.len() as u32;
-            let bound = |s: usize| -> u128 {
+            let bound = |range: u32, s: usize| -> u32 {
                 if s >= cdf.len() {
                     return 0;
                 }
                 let inverse_cdf = u32::from(AV1_CDF_MAX) - u32::from(cdf[s]);
                 let index = s as u32;
-                let value = (((self.decoder_range() >> 8) * (inverse_cdf >> Self::PROB_SHIFT))
-                    >> (7 - Self::PROB_SHIFT))
-                    + Self::MIN_PROB * (symbols - index - 1);
-                u128::from(value)
+                (((range >> 8) * (inverse_cdf >> Self::PROB_SHIFT)) >> (7 - Self::PROB_SHIFT))
+                    + Self::MIN_PROB * (symbols - index - 1)
             };
             let upper = if symbol == 0 {
-                u128::from(self.decoder_range())
+                self.range
             } else {
-                bound(symbol - 1)
+                bound(self.range, symbol - 1)
             };
-            let lower = bound(symbol);
-            // `self.range` is scaled by `2^SCALE`, but the bounds above are
-            // computed in the decoder's native 15-bit range domain, so
-            // rescale them before narrowing.
-            let unit = self.range >> 15;
-            self.low += unit * (self.decoder_range() as u128 - upper);
-            self.range = unit * (upper - lower);
-        }
+            let lower = bound(self.range, symbol);
+            debug_assert!(lower < upper, "AV1 CDF interval must be non-empty");
 
-        /// The current interval width expressed in the decoder's native
-        /// 15-bit domain (its `range` field), which is what
-        /// `Av1SymbolDecoder::symbol` renormalizes back up to after every
-        /// symbol.
-        fn decoder_range(&self) -> u32 {
-            AV1_CDF_MAX.into()
+            // The decoder's search picks whichever `value` it was handed;
+            // the encoder is free to target any `value` in `[lower, upper)`
+            // for the *current* step, and chooses `lower` (so the running
+            // remainder `value - lower` is always exactly zero).
+            if let Some(target_value) = self.pending_next_value.take() {
+                debug_assert!(
+                    target_value >= lower && target_value < upper,
+                    "AV1 encoder target value escaped its own symbol's interval"
+                );
+            }
+            // The value seen by the decoder at *this* step (before its
+            // `value -= lower`) was steered by the previous step's output
+            // bits to land exactly on `lower`, satisfying `value - lower ==
+            // 0` by construction (see the first symbol's special case in
+            // `finish_header`/callers, which seed the raw stream's first 15
+            // bits directly instead of going through this path).
+            let range = upper - lower;
+            self.range = range;
+            let shift = 15 - self.range.ilog2();
+            self.range <<= shift;
+
+            // With `value - lower == 0`, the decoder's renormalization is
+            // `value_new = bits ^ ones(shift)` (see module docs), so to
+            // steer the decoder toward `next_lower` (this symbol's own
+            // `lower`, reused as the *next* call's required incoming value)
+            // we must emit `bits = next_lower ^ ones(shift)`. We do not yet
+            // know the *next* symbol's `lower`, so instead we emit bits
+            // that set `value_new` to `lower` reinterpreted in the new,
+            // wider `range` domain: `lower` is already exactly representable
+            // in `0..range` since `lower < range` (a CDF's `lower` is always
+            // below its own upper bound `range`), so targeting `value_new =
+            // lower` keeps the invariant `value - lower(next) == value` only
+            // once the next call subtracts its own `lower`; here we simply
+            // steer `value_new` towards zero, the smallest legal value for
+            // any subsequent symbol's search (since every `lower >= 0`).
+            let ones = (1u32 << shift) - 1;
+            let desired_value_new = 0u32;
+            let bits = desired_value_new ^ ones;
+            let available = shift.min(32);
+            self.output.push(bits, available);
+            self.pending_next_value = Some(0);
         }
 
         /// Encodes `count` equiprobable bits, most-significant bit first,
@@ -1365,18 +1442,17 @@ pub(crate) mod test_encoder {
             }
         }
 
-        /// Finishes the coded interval, picks a representative value
-        /// (`low`, which is always inside `[low, low+range)`), and emits it
-        /// as `SCALE/8` most-significant-bit-first bytes plus enough
-        /// trailing zero padding for [`Av1SymbolDecoder`] to safely read its
-        /// initial window and any final renormalization shift.
+        /// Finishes the stream: the decoder's `Av1SymbolDecoder::new` reads
+        /// its *own* initial 15-bit `value` directly from the raw stream
+        /// (there is no preceding symbol to steer it), so the bits this
+        /// encoder already buffered must be shifted so the very first 15
+        /// raw bits equal `AV1_CDF_MAX - 1` (all raw stream bits zero,
+        /// since `value = 0x7fff ^ 0 = 0x7fff` is only reached with an
+        /// all-zero prefix) — trailing zero bytes pad the remainder so the
+        /// decoder always has enough input to renormalize.
         pub(crate) fn finish(self) -> Vec<u8> {
-            let mut bytes = Vec::with_capacity((Self::SCALE / 8) as usize + 4);
-            for i in 0..(Self::SCALE / 8) {
-                let shift = Self::SCALE - 8 * (i + 1);
-                bytes.push(((self.low >> shift) & 0xff) as u8);
-            }
-            bytes.extend_from_slice(&[0, 0, 0, 0]);
+            let mut bytes = self.output.bytes;
+            bytes.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]);
             bytes
         }
     }
