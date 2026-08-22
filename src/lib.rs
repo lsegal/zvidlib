@@ -9,6 +9,10 @@
 pub mod api;
 pub mod audio;
 pub mod av1;
+mod av1_cdf;
+pub mod av1_entropy;
+pub mod av1_intra;
+pub mod av1_intra_decoder;
 pub mod codec;
 pub mod codec_config;
 pub mod conformance;
@@ -40,6 +44,9 @@ pub use av1::{
     Av1ObuHeader, Av1ObuType, Av1OperatingPoint, Av1Parser, Av1SequenceHeader, Av1SyntaxSupport,
     Av1TileGroup,
 };
+pub use av1_entropy::{AV1_CDF_MAX, Av1SymbolDecoder, validate_cdf};
+pub use av1_intra::{Av1IntraBlock, Av1IntraFrame, Av1IntraMode, inverse_wht_4x4};
+pub use av1_intra_decoder::decode_av1_lossless_intra;
 pub use codec::{
     AudioDrain, AudioEncoder, AudioEncoderFormat, AudioGapless, CancellationToken,
     CodecImplementation, CodecProfile, CodecSupport, DecodeStatistics, DecodedVideoFrame,
