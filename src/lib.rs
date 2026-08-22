@@ -40,7 +40,7 @@ pub use av1::{
     Av1TileGroup,
 };
 pub use av1_entropy::{AV1_CDF_MAX, Av1SymbolDecoder, validate_cdf};
-pub use av1_intra::{Av1IntraFrame, Av1IntraMode, inverse_wht_4x4};
+pub use av1_intra::{Av1IntraBlock, Av1IntraFrame, Av1IntraMode, inverse_wht_4x4};
 pub use codec::{
     AudioDrain, AudioEncoder, AudioEncoderFormat, AudioGapless, CancellationToken,
     CodecImplementation, CodecProfile, CodecSupport, DecodeStatistics, DecodedVideoFrame,

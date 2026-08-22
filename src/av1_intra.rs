@@ -17,6 +17,17 @@ pub enum Av1IntraMode {
     Paeth,
 }
 
+/// Geometry and prediction mode for one decoded intra block.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Av1IntraBlock {
+    pub plane: usize,
+    pub x: usize,
+    pub y: usize,
+    pub width: usize,
+    pub height: usize,
+    pub mode: Av1IntraMode,
+}
+
 /// A bounded 8-bit 4:2:0 reconstruction target.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Av1IntraFrame {
@@ -60,16 +71,15 @@ impl Av1IntraFrame {
 
     /// Applies one luma or chroma intra block. Residuals are signed spatial
     /// samples after the tile decoder's inverse transform stage.
-    pub fn reconstruct_block(
-        &mut self,
-        plane: usize,
-        x: usize,
-        y: usize,
-        width: usize,
-        height: usize,
-        mode: Av1IntraMode,
-        residuals: &[i16],
-    ) -> Result<()> {
+    pub fn reconstruct_block(&mut self, block: Av1IntraBlock, residuals: &[i16]) -> Result<()> {
+        let Av1IntraBlock {
+            plane,
+            x,
+            y,
+            width,
+            height,
+            mode,
+        } = block;
         if plane > 2 || width == 0 || height == 0 {
             return Err(malformed("AV1 intra block has an invalid plane or size"));
         }
@@ -212,7 +222,17 @@ mod tests {
         let dimensions = VideoDimensions::new(4, 4, &limits).unwrap();
         let mut frame = Av1IntraFrame::new(dimensions, &limits).unwrap();
         frame
-            .reconstruct_block(0, 0, 0, 4, 4, Av1IntraMode::Dc, &[0; 16])
+            .reconstruct_block(
+                Av1IntraBlock {
+                    plane: 0,
+                    x: 0,
+                    y: 0,
+                    width: 4,
+                    height: 4,
+                    mode: Av1IntraMode::Dc,
+                },
+                &[0; 16],
+            )
             .unwrap();
         let frame = frame.into_video_frame(&limits).unwrap();
         assert_eq!(frame.planes[0].data, vec![128; 16]);
@@ -226,7 +246,17 @@ mod tests {
         let mut frame = Av1IntraFrame::new(dimensions, &limits).unwrap();
         assert_eq!(
             frame
-                .reconstruct_block(0, 3, 0, 2, 1, Av1IntraMode::Dc, &[0, 0])
+                .reconstruct_block(
+                    Av1IntraBlock {
+                        plane: 0,
+                        x: 3,
+                        y: 0,
+                        width: 2,
+                        height: 1,
+                        mode: Av1IntraMode::Dc
+                    },
+                    &[0, 0]
+                )
                 .unwrap_err()
                 .kind(),
             ErrorKind::MalformedMedia
