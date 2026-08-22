@@ -49,4 +49,14 @@ fn malformed_and_over_budget_intra_units_fail_explicitly() {
             .kind(),
         ErrorKind::ResourceLimit
     );
+
+    let mut malformed_tile = bytes;
+    malformed_tile[15..].fill(0);
+    let result =
+        std::panic::catch_unwind(|| decode_av1_lossless_intra(&malformed_tile, &Limits::default()));
+    assert!(result.is_ok(), "malformed AV1 tile data must not panic");
+    assert!(matches!(
+        result.unwrap().unwrap_err().kind(),
+        ErrorKind::MalformedMedia | ErrorKind::Unsupported | ErrorKind::ResourceLimit
+    ));
 }
