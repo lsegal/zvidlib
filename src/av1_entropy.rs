@@ -114,6 +114,20 @@ impl<'a> Av1SymbolDecoder<'a> {
         Ok(symbol)
     }
 
+    /// Reads `count` equiprobable bits, most-significant bit first.
+    pub fn literal(&mut self, count: u8) -> Result<u32> {
+        if count > 32 {
+            return malformed("AV1 literal is wider than 32 bits");
+        }
+        const BOOL_CDF: [u16; 2] = [16_384, AV1_CDF_MAX];
+        let mut value = 0u32;
+        for _ in 0..count {
+            value = (value << 1)
+                | u32::try_from(self.symbol(&BOOL_CDF)?).expect("a boolean symbol is zero or one");
+        }
+        Ok(value)
+    }
+
     pub fn bits_consumed(&self) -> usize {
         self.bit_offset
     }
@@ -179,5 +193,15 @@ mod tests {
     fn a_single_symbol_cdf_decodes_without_context_specific_state() {
         let mut decoder = Av1SymbolDecoder::new(&[0; 8]).unwrap();
         assert_eq!(decoder.symbol(&[AV1_CDF_MAX]).unwrap(), 0);
+    }
+
+    #[test]
+    fn zero_padded_literals_are_bounded() {
+        let mut decoder = Av1SymbolDecoder::new(&[0; 8]).unwrap();
+        assert!(decoder.literal(8).is_ok());
+        assert_eq!(
+            decoder.literal(33).unwrap_err().kind(),
+            ErrorKind::MalformedMedia
+        );
     }
 }

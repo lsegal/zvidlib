@@ -32,6 +32,7 @@ pub struct Av1IntraBlock {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Av1IntraFrame {
     dimensions: VideoDimensions,
+    color_range: ColorRange,
     planes: [Vec<u8>; 3],
     strides: [usize; 3],
 }
@@ -64,9 +65,29 @@ impl Av1IntraFrame {
         }
         Ok(Self {
             dimensions,
+            color_range: ColorRange::Limited,
             planes: [vec![0; y_len], vec![128; c_len], vec![128; c_len]],
             strides: [width, chroma_width, chroma_width],
         })
+    }
+
+    /// Creates a neutral-chroma 4:2:0 frame from a tightly packed decoded
+    /// luma plane.
+    pub fn from_luma(
+        dimensions: VideoDimensions,
+        luma: Vec<u8>,
+        color_range: ColorRange,
+        limits: &Limits,
+    ) -> Result<Self> {
+        let mut frame = Self::new(dimensions, limits)?;
+        if luma.len() != frame.planes[0].len() {
+            return Err(malformed(
+                "AV1 luma plane length does not match the coded dimensions",
+            ));
+        }
+        frame.planes[0] = luma;
+        frame.color_range = color_range;
+        Ok(frame)
     }
 
     /// Applies one luma or chroma intra block. Residuals are signed spatial
@@ -139,7 +160,7 @@ impl Av1IntraFrame {
         VideoFrame::new(
             self.dimensions,
             PixelFormat::Yuv420p8,
-            ColorRange::Limited,
+            self.color_range,
             vec![
                 Plane {
                     data: self.planes[0].clone(),
@@ -159,32 +180,54 @@ impl Av1IntraFrame {
     }
 }
 
-/// The inverse 4x4 Walsh-Hadamard transform used by lossless AV1 blocks.
+/// The normative inverse 4x4 Walsh-Hadamard transform used by lossless AV1
+/// blocks. The input is the coded coefficient array before the required
+/// 8-bit lossless dequantization by four.
 pub fn inverse_wht_4x4(coefficients: &[i32; 16]) -> [i16; 16] {
-    let mut intermediate = [0i32; 16];
+    let mut rows = [[0i64; 4]; 4];
     for row in 0..4 {
-        let offset = row * 4;
-        let a = coefficients[offset] + coefficients[offset + 2];
-        let b = coefficients[offset + 1] + coefficients[offset + 3];
-        let c = coefficients[offset + 1] - coefficients[offset + 3];
-        let d = coefficients[offset] - coefficients[offset + 2];
-        intermediate[offset] = a + b;
-        intermediate[offset + 1] = d + c;
-        intermediate[offset + 2] = a - b;
-        intermediate[offset + 3] = d - c;
+        rows[row] = inverse_wht_1d(
+            [
+                i64::from(coefficients[row * 4]) * 4,
+                i64::from(coefficients[row * 4 + 1]) * 4,
+                i64::from(coefficients[row * 4 + 2]) * 4,
+                i64::from(coefficients[row * 4 + 3]) * 4,
+            ],
+            2,
+        );
     }
     let mut output = [0i16; 16];
     for column in 0..4 {
-        let a = intermediate[column] + intermediate[8 + column];
-        let b = intermediate[4 + column] + intermediate[12 + column];
-        let c = intermediate[4 + column] - intermediate[12 + column];
-        let d = intermediate[column] - intermediate[8 + column];
-        output[column] = ((a + b) >> 4).clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
-        output[4 + column] = ((d + c) >> 4).clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
-        output[8 + column] = ((a - b) >> 4).clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
-        output[12 + column] = ((d - c) >> 4).clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
+        let transformed = inverse_wht_1d(
+            [
+                rows[0][column],
+                rows[1][column],
+                rows[2][column],
+                rows[3][column],
+            ],
+            0,
+        );
+        for row in 0..4 {
+            output[row * 4 + column] =
+                transformed[row].clamp(i64::from(i16::MIN), i64::from(i16::MAX)) as i16;
+        }
     }
     output
+}
+
+fn inverse_wht_1d(values: [i64; 4], shift: u32) -> [i64; 4] {
+    let mut a = values[0] >> shift;
+    let mut c = values[1] >> shift;
+    let mut d = values[2] >> shift;
+    let mut b = values[3] >> shift;
+    a += c;
+    d -= b;
+    let e = (a - d) >> 1;
+    b = e - b;
+    c = e - c;
+    a -= b;
+    d += c;
+    [a, b, c, d]
 }
 
 fn paeth(top_left: u8, top: u8, left: u8) -> u8 {
@@ -264,9 +307,9 @@ mod tests {
     }
 
     #[test]
-    fn wht_preserves_dc_energy() {
+    fn wht_matches_lossless_av1_dc_reconstruction() {
         let mut coefficients = [0; 16];
         coefficients[0] = 64;
-        assert_eq!(inverse_wht_4x4(&coefficients), [4; 16]);
+        assert_eq!(inverse_wht_4x4(&coefficients), [16; 16]);
     }
 }
