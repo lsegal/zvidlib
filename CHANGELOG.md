@@ -4,6 +4,7 @@ All notable changes to zvidlib will be documented in this file.
 
 ## Unreleased
 
+- Skip the CI Rust/WebAssembly check suite for pushes and pull requests that only change Markdown files.
 - Fix AV1 film grain synthesis (`av1_filters`) using a direct linear LFSR mapping instead of the spec's 2048-entry `Gaussian_Sequence` lookup table, so generated luma grain now matches the reference decoder's `Generate grain process` (§7.18.3.3) sample-for-sample for a given seed and parameter set.
 - Add the AV1 deblocking loop filter's wide 8-tap and 14-tap filters (spec §7.14), selected per edge from caller-supplied per-block transform-size metadata (`TxSizeGrid`), in addition to the existing narrow 4-tap filter; `deblock_frame` now takes an `Option<&TxSizeGrid>` (`None` preserves the previous narrow-only behavior).
 - Add stateful, dependency-free AV1 lossless inter decoding with bounded reference retention, order-hint and error-resilient refresh handling, whole-pel motion-vector prediction, average compound prediction, validated `show_existing_frame` output, reset/replay determinism, and panic-free malformed-reference rejection.
