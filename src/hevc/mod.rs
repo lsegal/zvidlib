@@ -1,5 +1,6 @@
 //! Native, dependency-free HEVC/H.265 software decoding.
 
+mod encoder;
 mod engine;
 
 use std::cmp::Reverse;
@@ -12,6 +13,7 @@ use crate::{
     Limits, PixelFormat, Plane, Result, VideoDecoder, VideoDecoderConfig, VideoDecoderFactory,
     VideoFrame,
 };
+pub use encoder::native_hevc_video_encoder_factory;
 use engine::hvcc::{HvccRecord, parse_hvcc, split_length_prefixed};
 use engine::picture::{Picture, Plane as HevcPlane, sub_wh_c};
 use engine::sequence::{DecodedFrame, SequenceDecoder, SequenceError};

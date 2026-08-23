@@ -100,6 +100,8 @@ pub struct Limits {
     pub max_av1_operating_points: u8,
     /// Maximum number of AV1 tiles accepted in one coded frame.
     pub max_av1_tiles_per_frame: u32,
+    /// Maximum number of 4x4 AV1 reconstruction blocks decoded per frame.
+    pub max_av1_blocks_per_frame: u32,
 }
 
 impl Default for Limits {
@@ -116,6 +118,7 @@ impl Default for Limits {
             max_av1_obus_per_unit: 4_096,
             max_av1_operating_points: 32,
             max_av1_tiles_per_frame: 4_096,
+            max_av1_blocks_per_frame: 4_194_304,
         }
     }
 }
@@ -141,5 +144,6 @@ mod tests {
         assert!(limits.max_av1_obus_per_unit > 0);
         assert!(limits.max_av1_operating_points > 0);
         assert!(limits.max_av1_tiles_per_frame > 0);
+        assert!(limits.max_av1_blocks_per_frame > 0);
     }
 }
