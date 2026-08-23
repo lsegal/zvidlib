@@ -4,6 +4,7 @@ All notable changes to zvidlib will be documented in this file.
 
 ## Unreleased
 
+- Add a dependency-free native lossless monochrome AV1 Main-profile encoder with standardized OBU access units and `av1C`, exact configurable timescale/frame-duration metadata, strict format/rate/resource validation, and independent native-to-native and FFmpeg round-trip conformance coverage.
 - Add non-lossless (`base_q_idx != 0`) AV1 intra-frame decoding to `decode_av1_lossless_intra`/the new `decode_av1_lossless_intra_with_tx_sizes`: per-block `TX_4X4`/`TX_8X8` transform-size and `DCT_DCT`/`IDTX` transform-type signaling, spec §7.12 dequantization, real inverse DCT/identity transforms, `loop_filter_params` parsing, and end-to-end deblocking of the reconstructed frame using the decoded per-block transform sizes.
 - Fix `ExactFrameReader::get()` performing a full decoder reset and redecode from the nearest keyframe on almost every call when playing back content with reordered decoder output (e.g. HEVC hierarchical B-frames), instead of only when the requested frame had genuinely already been produced and evicted from the cache. This made the `native_gl` example (and any other sequential playback through `ExactFrameReader`) close to O(n^2) in decode work, rendering at a couple of frames per second even for small clips.
 - Skip the CI Rust/WebAssembly check suite for pushes and pull requests that only change Markdown files.

@@ -10,6 +10,7 @@ pub mod api;
 pub mod audio;
 pub mod av1;
 mod av1_cdf;
+mod av1_encoder;
 pub mod av1_entropy;
 pub mod av1_filters;
 pub mod av1_inter_decoder;
@@ -49,6 +50,7 @@ pub use av1::{
     Av1ObuHeader, Av1ObuType, Av1OperatingPoint, Av1Parser, Av1SequenceHeader, Av1SyntaxSupport,
     Av1TileGroup,
 };
+pub use av1_encoder::native_av1_video_encoder_factory;
 pub use av1_entropy::{AV1_CDF_MAX, Av1SymbolDecoder, validate_cdf};
 pub use av1_filters::{
     CdefStrength, FilmGrainParams, FilterFrame, FilterPlane, LoopFilterParams, MatrixCoefficients,
