@@ -340,6 +340,11 @@ fn validate_encoder_vector(vector: &VideoEncoderConformanceVector) -> Result<()>
             "encoder conformance PSNR must be finite and nonnegative",
         ));
     }
+    if vector.configuration.timescale == 0 || vector.configuration.frame_duration == 0 {
+        return Err(invalid(
+            "encoder conformance requires a nonzero timescale and frame duration",
+        ));
+    }
     if vector.decoder_configuration.codec != vector.configuration.codec
         || vector.decoder_configuration.coded_dimensions != vector.configuration.coded_dimensions
         || vector.decoder_configuration.output_format != vector.configuration.input_format
@@ -377,7 +382,10 @@ fn validate_encoded_packets(
     configuration: &crate::EncoderConfig,
     vector: &VideoEncoderConformanceVector,
 ) -> Result<()> {
-    if configuration.codec != vector.configuration.codec || configuration.timescale == 0 {
+    if configuration.codec != vector.configuration.codec
+        || configuration.timescale != vector.configuration.timescale
+        || configuration.timescale == 0
+    {
         return Err(Error::new(
             ErrorKind::Codec,
             "encoder emitted invalid codec configuration",
@@ -396,21 +404,40 @@ fn validate_encoded_packets(
         ));
     }
     let mut pts = HashSet::new();
-    let mut previous_dts = None;
-    for packet in packets {
-        if packet.data.is_empty() || packet.duration == 0 || !pts.insert(packet.pts) {
+    for (decode_index, packet) in packets.iter().enumerate() {
+        let expected_dts = i64::try_from(decode_index)
+            .ok()
+            .and_then(|value| value.checked_mul(i64::from(vector.configuration.frame_duration)))
+            .ok_or_else(|| Error::new(ErrorKind::ResourceLimit, "encoder DTS overflow"))?;
+        if packet.data.is_empty()
+            || packet.duration != vector.configuration.frame_duration
+            || packet.dts != expected_dts
+            || !pts.insert(packet.pts)
+        {
             return Err(Error::new(
                 ErrorKind::Codec,
-                "encoder emitted empty, zero-duration, or duplicate-PTS samples",
+                "encoder emitted invalid data, duration, DTS, or duplicate PTS",
             ));
         }
-        if previous_dts.is_some_and(|value| packet.dts <= value) {
+        let duration = i64::from(vector.configuration.frame_duration);
+        if packet.pts < 0 || packet.pts % duration != 0 {
             return Err(Error::new(
                 ErrorKind::Codec,
-                "encoder sample DTS values must increase in decode order",
+                "encoder sample PTS is outside the configured frame clock",
             ));
         }
-        previous_dts = Some(packet.dts);
+    }
+    for presentation_index in 0..frame_count {
+        let expected_pts = i64::try_from(presentation_index)
+            .ok()
+            .and_then(|value| value.checked_mul(i64::from(vector.configuration.frame_duration)))
+            .ok_or_else(|| Error::new(ErrorKind::ResourceLimit, "encoder PTS overflow"))?;
+        if !pts.contains(&expected_pts) {
+            return Err(Error::new(
+                ErrorKind::Codec,
+                "encoder sample PTS values do not cover the input timeline",
+            ));
+        }
     }
     Ok(())
 }
@@ -745,6 +772,7 @@ mod tests {
     struct PassThroughEncoder {
         config: crate::EncoderConfig,
         format: VideoEncoderFormat,
+        frame_duration: u32,
     }
 
     impl VideoEncoder for PassThroughEncoder {
@@ -767,9 +795,13 @@ mod tests {
                 };
                 Ok(vec![EncodedSample {
                     data: source.frame.planes[0].data.clone(),
-                    dts: index.0 as i64,
-                    pts: index.0 as i64,
-                    duration: 1,
+                    dts: i64::try_from(index.0)
+                        .map_err(|_| invalid("fixture timestamp overflow"))?
+                        * i64::from(self.frame_duration),
+                    pts: i64::try_from(index.0)
+                        .map_err(|_| invalid("fixture timestamp overflow"))?
+                        * i64::from(self.frame_duration),
+                    duration: self.frame_duration,
                     is_sync: true,
                     dependency: SampleDependency::INDEPENDENT,
                 }])
@@ -802,13 +834,14 @@ mod tests {
             Ok(Box::new(PassThroughEncoder {
                 config: crate::EncoderConfig {
                     codec: Codec::UncompressedVideo,
-                    timescale: 1,
+                    timescale: configuration.timescale,
                     decoder_config: Vec::new(),
                 },
                 format: VideoEncoderFormat {
                     dimensions: configuration.coded_dimensions,
                     pixel_format: configuration.input_format,
                 },
+                frame_duration: configuration.frame_duration,
             }))
         }
     }
@@ -825,6 +858,8 @@ mod tests {
                 input_format: PixelFormat::Gray8,
                 color_range: ColorRange::Full,
                 hardware: HardwarePreference::Avoid,
+                timescale: 1,
+                frame_duration: 1,
                 configuration: Vec::new(),
             },
             decoder_configuration: decoder,

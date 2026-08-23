@@ -94,6 +94,14 @@ pub struct Limits {
     pub max_allocation_bytes: u64,
     pub max_cached_frames: u32,
     pub max_decode_samples_per_seek: u32,
+    /// Maximum number of OBUs accepted in one AV1 low-overhead unit.
+    pub max_av1_obus_per_unit: u32,
+    /// Maximum number of operating points accepted in an AV1 sequence header.
+    pub max_av1_operating_points: u8,
+    /// Maximum number of AV1 tiles accepted in one coded frame.
+    pub max_av1_tiles_per_frame: u32,
+    /// Maximum number of 4x4 AV1 reconstruction blocks decoded per frame.
+    pub max_av1_blocks_per_frame: u32,
 }
 
 impl Default for Limits {
@@ -107,6 +115,10 @@ impl Default for Limits {
             max_allocation_bytes: 512 * 1024 * 1024,
             max_cached_frames: 32,
             max_decode_samples_per_seek: 4_096,
+            max_av1_obus_per_unit: 4_096,
+            max_av1_operating_points: 32,
+            max_av1_tiles_per_frame: 4_096,
+            max_av1_blocks_per_frame: 4_194_304,
         }
     }
 }
@@ -129,5 +141,9 @@ mod tests {
         assert!(limits.max_allocation_bytes > 0);
         assert!(limits.max_cached_frames > 0);
         assert!(limits.max_decode_samples_per_seek > 0);
+        assert!(limits.max_av1_obus_per_unit > 0);
+        assert!(limits.max_av1_operating_points > 0);
+        assert!(limits.max_av1_tiles_per_frame > 0);
+        assert!(limits.max_av1_blocks_per_frame > 0);
     }
 }
