@@ -1688,7 +1688,9 @@ mod tests {
     use super::test_encoder::{BitWriter, SymbolEncoder};
     use super::*;
     use crate::av1_cdf as cdf;
-    use crate::{ErrorKind, FrameDigest};
+    use crate::{
+        ErrorKind, FilterFrame, FilterPlane, FrameDigest, LoopFilterParams, deblock_frame,
+    };
 
     const FRAME_DIM: u32 = 16;
 
@@ -2036,6 +2038,77 @@ mod tests {
             (FRAME_DIM, FRAME_DIM)
         );
         assert_eq!(frame.planes[0].data.len(), 256);
+    }
+
+    /// End-to-end: decoding a real (`CodedLossless`) frame through
+    /// [`Av1InterDecoder`] records a [`TxSizeGrid`] reachable via
+    /// [`Av1InterDecoder::last_frame_tx_sizes`], and that grid produces the
+    /// exact same `deblock_frame` output as `None` would. This is the
+    /// spec-correct behavior for every stream this decoder accepts: AV1
+    /// forces `TX_MODE_ONLY_4X4` whenever `CodedLossless` is true (see the
+    /// `read_tx_mode` comment in `parse_inter_frame_header`), so a real
+    /// decode from this decoder can never produce a non-4x4 transform size
+    /// to thread into the wide 8/14-tap filters — `filter_length_selection_follows_transform_size`
+    /// and `deblock_with_wide_tx_sizes_smooths_further_from_the_edge_than_narrow`
+    /// in `av1_filters` already cover that selection logic directly against
+    /// a synthetic [`TxSizeGrid`], independent of decoder support for
+    /// non-lossless streams.
+    #[test]
+    fn decoded_frame_tx_size_grid_matches_lossless_narrow_only_filtering() {
+        let limits = Limits::default();
+        let mut decoder = Av1InterDecoder::new(limits).unwrap();
+        assert!(decoder.last_frame_tx_sizes().is_none());
+
+        decoder
+            .decode_temporal_unit(&key_frame_temporal_unit())
+            .unwrap();
+        // A shown key frame's own `showable_frame` is spec-false (it was
+        // already shown), so reconstruct a showable inter frame to exercise
+        // `show_existing_frame` below.
+        let frame = decoder
+            .decode_temporal_unit(&inter_frame_temporal_unit(1, 0x01, [0; 7], false, false))
+            .unwrap();
+        let grid = decoder
+            .last_frame_tx_sizes()
+            .expect("a coded frame was just reconstructed")
+            .clone();
+        assert_eq!(
+            grid,
+            TxSizeGrid::new(FRAME_DIM as usize, FRAME_DIM as usize)
+        );
+
+        let luma = frame.planes[0].data.clone();
+        let mut with_grid = FilterFrame::new_monochrome(
+            FilterPlane::from_samples(
+                FRAME_DIM as usize,
+                FRAME_DIM as usize,
+                luma.clone(),
+                &limits,
+            )
+            .unwrap(),
+        );
+        let mut without_grid = FilterFrame::new_monochrome(
+            FilterPlane::from_samples(FRAME_DIM as usize, FRAME_DIM as usize, luma, &limits)
+                .unwrap(),
+        );
+        let params = LoopFilterParams {
+            y_vertical_level: 30,
+            y_horizontal_level: 30,
+            u_level: 0,
+            v_level: 0,
+            sharpness: 0,
+        };
+        deblock_frame(&mut with_grid, &params, Some(&grid)).unwrap();
+        deblock_frame(&mut without_grid, &params, None).unwrap();
+        assert_eq!(with_grid, without_grid);
+
+        // Showing a retained frame reconstructs nothing new, so it clears
+        // the grid rather than reporting stale metadata for a different
+        // frame.
+        decoder
+            .decode_temporal_unit(&show_existing_temporal_unit(0))
+            .unwrap();
+        assert!(decoder.last_frame_tx_sizes().is_none());
     }
 
     #[test]

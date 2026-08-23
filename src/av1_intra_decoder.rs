@@ -130,7 +130,8 @@ pub fn decode_av1_lossless_intra_with_tx_sizes(
     } else {
         ColorRange::Limited
     };
-    let frame = Av1IntraFrame::from_luma(dimensions, luma, range, limits)?.into_video_frame(limits)?;
+    let frame =
+        Av1IntraFrame::from_luma(dimensions, luma, range, limits)?.into_video_frame(limits)?;
     Ok((frame, tx_sizes))
 }
 

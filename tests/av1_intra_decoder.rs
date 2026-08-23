@@ -1,4 +1,7 @@
-use zvidlib::{ErrorKind, FrameDigest, Limits, PixelFormat, decode_av1_lossless_intra};
+use zvidlib::{
+    ErrorKind, FilterFrame, FilterPlane, FrameDigest, Limits, LoopFilterParams, PixelFormat,
+    TxSizeGrid, deblock_frame, decode_av1_lossless_intra, decode_av1_lossless_intra_with_tx_sizes,
+};
 
 fn vector() -> Vec<u8> {
     let hex = include_str!("fixtures/codec/av1_lossless_17x9.hex").trim();
@@ -28,6 +31,45 @@ fn standardized_lossless_intra_vector_reconstructs_canonical_yuv() {
     )
     .unwrap();
     assert_eq!(FrameDigest::from_frame(&frame).unwrap(), expected);
+}
+
+/// End-to-end: decoding a real (`CodedLossless`) standardized vector
+/// through [`decode_av1_lossless_intra_with_tx_sizes`] records a
+/// [`TxSizeGrid`] that produces the exact same `deblock_frame` output as
+/// `None` would. This is the spec-correct behavior for every stream this
+/// decoder accepts: AV1 forces `TX_MODE_ONLY_4X4` whenever `CodedLossless`
+/// is true, so a real decode from this decoder can never produce a
+/// non-4x4 transform size to thread into the wide 8/14-tap filters — the
+/// `av1_filters` unit tests already cover that selection logic directly
+/// against a synthetic `TxSizeGrid`, independent of decoder support for
+/// non-lossless streams.
+#[test]
+fn standardized_lossless_intra_vector_tx_size_grid_matches_narrow_only_filtering() {
+    let limits = Limits::default();
+    let (frame, grid) = decode_av1_lossless_intra_with_tx_sizes(&vector(), &limits).unwrap();
+    assert_eq!(grid, TxSizeGrid::new(17, 9));
+
+    let luma = frame.planes[0].data.clone();
+    let mut with_grid = FilterFrame::new_monochrome(
+        FilterPlane::from_samples(17, 9, luma.clone(), &limits).unwrap(),
+    );
+    let mut without_grid =
+        FilterFrame::new_monochrome(FilterPlane::from_samples(17, 9, luma, &limits).unwrap());
+    let params = LoopFilterParams {
+        y_vertical_level: 30,
+        y_horizontal_level: 30,
+        u_level: 0,
+        v_level: 0,
+        sharpness: 0,
+    };
+    deblock_frame(&mut with_grid, &params, Some(&grid)).unwrap();
+    deblock_frame(&mut without_grid, &params, None).unwrap();
+    assert_eq!(with_grid, without_grid);
+
+    // The plain (no-grid) entry point still returns just the frame,
+    // matching every existing caller's signature.
+    let plain = decode_av1_lossless_intra(&vector(), &limits).unwrap();
+    assert_eq!(plain.planes[0].data, frame.planes[0].data);
 }
 
 #[test]
