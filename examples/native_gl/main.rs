@@ -5,8 +5,10 @@
 //! dependency-free native HEVC decoder and the CPU -> native OpenGL [`execute_transfer`] path
 //! with a [`GraphicsAdapter`] backed by a real
 //! `winit` window and `glutin` OpenGL context, so the uploaded frames are drawn to an actual
-//! window on all platforms. Playback loops back to the first frame once the last one is shown,
-//! and an FPS counter is drawn in the top-left corner.
+//! window on all platforms. Decoding runs on a background thread so the window keeps redrawing
+//! smoothly even when the software decoder cannot keep up with the source frame rate; the render
+//! loop simply displays the newest frame that has finished decoding. Playback loops back to the
+//! first frame once the last one is shown, and an FPS counter is drawn in the top-left corner.
 //!
 //! Run with:
 //!
@@ -19,7 +21,9 @@ use std::fs;
 use std::future::Future;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
+use std::sync::mpsc::{Receiver, TryRecvError, sync_channel};
 use std::task::{Context, Poll, Waker};
+use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
 use glutin::config::ConfigTemplateBuilder;
@@ -40,7 +44,8 @@ use zvidlib::{
     ExactFrameReader, FrameDestination, FrameIndex, FrameSource, GraphicsAdapter, GraphicsApi,
     GraphicsResource, HardwarePreference, Limits, Mp4Demuxer, Mp4DemuxerOptions, Orientation,
     PixelFormat, ResourceKind, ResourceOwnership, Result, TrackKind, TransferPolicy,
-    VideoDecoderConfig, VideoDimensions, execute_transfer, native_hevc_video_decoder_factory,
+    VideoDecoderConfig, VideoDimensions, VideoFrame, execute_transfer,
+    native_hevc_video_decoder_factory,
 };
 
 mod gl_window;
@@ -111,7 +116,8 @@ fn run() -> Result<()> {
         video.codec
     );
 
-    let mut app = App::new(dimensions, frame_count, reader);
+    let decoder = DecodeThread::spawn(reader, frame_count);
+    let mut app = App::new(dimensions, decoder);
     let event_loop = EventLoop::new()
         .map_err(|error| invalid(format!("could not create the event loop: {error}")))?;
     event_loop.set_control_flow(ControlFlow::Poll);
@@ -121,13 +127,76 @@ fn run() -> Result<()> {
     app.into_result()
 }
 
+/// One decoded frame handed from the background decode thread to the render loop.
+struct DecodedFrame {
+    frame: VideoFrame,
+}
+
+/// Decodes the (looping) video on a dedicated background thread and hands finished frames to
+/// the render loop through a bounded channel.
+///
+/// The bundled native HEVC decoder is a dependency-free, pure-Rust software decoder with no fast
+/// path for 1080p sources, so it cannot keep up with the sample's real-time frame rate. Running
+/// it inline in the render callback (as before) stalled every redraw on a full frame decode,
+/// dropping the window to about 1 FPS (#89). Decoding on its own thread lets the render loop keep
+/// redrawing at the display's own pace, simply showing the newest frame that has finished.
+struct DecodeThread {
+    frames: Receiver<DecodedFrame>,
+    cancellation: CancellationToken,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl DecodeThread {
+    fn spawn(mut reader: ExactFrameReader, frame_count: usize) -> Self {
+        let (sender, frames) = sync_channel(1);
+        let cancellation = CancellationToken::new();
+        let thread_cancellation = cancellation.clone();
+        let handle = thread::spawn(move || {
+            let mut index = 0usize;
+            loop {
+                let frame = match reader.get(FrameIndex(index as u64), &thread_cancellation) {
+                    Ok(frame) => frame,
+                    Err(_) => return,
+                };
+                if sender.send(DecodedFrame { frame }).is_err() {
+                    return;
+                }
+                index = (index + 1) % frame_count.max(1);
+            }
+        });
+        Self {
+            frames,
+            cancellation,
+            handle: Some(handle),
+        }
+    }
+
+    /// Returns the newest decoded frame, if one has finished since the last call.
+    fn latest(&mut self) -> std::result::Result<Option<DecodedFrame>, ()> {
+        let mut newest = None;
+        loop {
+            match self.frames.try_recv() {
+                Ok(frame) => newest = Some(frame),
+                Err(TryRecvError::Empty) => return Ok(newest),
+                Err(TryRecvError::Disconnected) => return Err(()),
+            }
+        }
+    }
+}
+
+impl Drop for DecodeThread {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 /// Drives the `winit` window, owns the `glutin` GL context, and renders looping frames.
 struct App {
     dimensions: VideoDimensions,
-    frame_count: usize,
-    frame_index: usize,
-    reader: ExactFrameReader,
-    cancellation: CancellationToken,
+    decoder: DecodeThread,
     fps: FpsCounter,
     state: Option<WindowState>,
     error: Option<Error>,
@@ -141,13 +210,10 @@ struct WindowState {
 }
 
 impl App {
-    fn new(dimensions: VideoDimensions, frame_count: usize, reader: ExactFrameReader) -> Self {
+    fn new(dimensions: VideoDimensions, decoder: DecodeThread) -> Self {
         Self {
             dimensions,
-            frame_count,
-            frame_index: 0,
-            reader,
-            cancellation: CancellationToken::new(),
+            decoder,
             fps: FpsCounter::new(Instant::now()),
             state: None,
             error: None,
@@ -172,35 +238,39 @@ impl App {
             return;
         };
 
-        let frame = match self
-            .reader
-            .get(FrameIndex(self.frame_index as u64), &self.cancellation)
-        {
-            Ok(frame) => frame,
-            Err(error) => return self.fail(event_loop, error),
-        };
-        let resource = GraphicsResource::new(
-            GraphicsApi::NativeOpenGl,
-            state.adapter.context_identity(),
-            state.adapter.execution_owner(),
-            ResourceKind::Texture2d,
-            TEXTURE_HANDLE,
-            self.dimensions,
-            PixelFormat::Rgba8,
-            ColorRange::Limited,
-            Orientation::TopLeft,
-            ResourceOwnership::Caller,
-        );
-        if let Err(error) = execute_transfer(
-            Some(&mut state.adapter),
-            FrameSource::Cpu(CpuFrameSource {
-                frame: &frame,
-                orientation: Orientation::TopLeft,
-            }),
-            FrameDestination::Graphics(resource),
-            TransferPolicy::any(),
-        ) {
-            return self.fail(event_loop, error);
+        match self.decoder.latest() {
+            Ok(Some(decoded)) => {
+                let resource = GraphicsResource::new(
+                    GraphicsApi::NativeOpenGl,
+                    state.adapter.context_identity(),
+                    state.adapter.execution_owner(),
+                    ResourceKind::Texture2d,
+                    TEXTURE_HANDLE,
+                    self.dimensions,
+                    PixelFormat::Rgba8,
+                    ColorRange::Limited,
+                    Orientation::TopLeft,
+                    ResourceOwnership::Caller,
+                );
+                if let Err(error) = execute_transfer(
+                    Some(&mut state.adapter),
+                    FrameSource::Cpu(CpuFrameSource {
+                        frame: &decoded.frame,
+                        orientation: Orientation::TopLeft,
+                    }),
+                    FrameDestination::Graphics(resource),
+                    TransferPolicy::any(),
+                ) {
+                    return self.fail(event_loop, error);
+                }
+            }
+            Ok(None) => {}
+            Err(()) => {
+                return self.fail(
+                    event_loop,
+                    invalid("the decode thread stopped unexpectedly"),
+                );
+            }
         }
 
         let fps = self.fps.tick(Instant::now());
@@ -212,8 +282,6 @@ impl App {
             );
         }
 
-        // Loop back to the first frame once the last one has been shown.
-        self.frame_index = (self.frame_index + 1) % self.frame_count.max(1);
         state.window.request_redraw();
     }
 }

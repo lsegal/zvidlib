@@ -4,6 +4,7 @@ All notable changes to zvidlib will be documented in this file.
 
 ## Unreleased
 
+- Fix the `native_gl` example dropping to about 1 FPS against the 1920x1080 bundled sample by decoding on a dedicated background thread instead of inline in the render callback, so the window keeps redrawing smoothly at its own pace regardless of the (still not real-time at that resolution) software HEVC decoder's throughput. `VideoDecoder` now requires `Send` to support this.
 - Replace the bundled `examples/media/BigBuckBunny.mp4` sample (320x180, 5s) with a 1920x1080, 32-second clip so the examples exercise the native HEVC decoder at a realistic resolution and duration; regenerated the checked-in conformance fixture (`tests/fixtures/codec/big_buck_bunny_hevc_rgba.sha256`) against the new clip.
 - Update `README.md` and `ARCHITECTURE.md` to describe the native HEVC and AV1 decode/encode backends (`native_hevc_video_decoder_factory`, `native_hevc_video_encoder_factory`, `native_av1_video_decoder_factory`, `native_av1_video_encoder_factory`) that now exist, instead of listing native AV1 and HEVC encoding as still-planned work.
 

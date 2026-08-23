@@ -62,10 +62,10 @@ glutin-winit = "0.5.0"
 raw-window-handle = "0.6.2"
 winit = "0.30.13"
 
-# The native HEVC/AV1 decoders are pure-Rust software codecs with no fast path at opt-level 0;
-# an unoptimized debug build cannot keep up with the sample video's real-time frame rate (measured
-# well under 24 FPS for the sample's 1080p clip), so the `native_gl` example stutters even though the
-# decoder itself is fast once optimized. opt-level 2 keeps debug assertions and fast incremental
-# compiles while getting real-time decode throughput without requiring `--release`.
+# The native HEVC/AV1 decoders are pure-Rust software codecs with no fast path at opt-level 0,
+# so an unoptimized debug build is unusably slow. opt-level 2 keeps debug assertions and fast
+# incremental compiles while getting decode throughput much closer to `--release` (which is still
+# not real-time for the bundled 1080p sample even at opt-level 3; see the `native_gl` example,
+# which decodes on a background thread so the window keeps redrawing smoothly regardless).
 [profile.dev]
 opt-level = 2
