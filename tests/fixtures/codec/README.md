@@ -19,3 +19,18 @@ corresponding `av1_lossless_17x9_yuv420.sha256` is the canonical digest of its
 full-range YUV420 output with neutral chroma. FFmpeg independently accepted the
 encoder's standardized bitstream in the source branch's conformance test; the
 decoder test itself is hermetic and uses no external codec.
+
+`av1_inter_show_existing_16x16.hex` is five standardized low-overhead AV1
+temporal units generated from the normative AV1 syntax tables and
+independently decoded by FFmpeg/libdav1d: a Main-profile 8-bit monochrome key
+frame, two refreshed lossless inter references, a LAST/LAST2 average
+compound-prediction frame, and a `show_existing_frame` header replaying that
+compound frame. `av1_inter_show_existing_16x16.sha256` is the canonical
+digest of the compound frame's hermetically decoded YUV420 output (used by
+`tests/av1_inter_decoder.rs` to test `Av1InterDecoder` directly).
+`av1_inter_show_existing_16x16_rgba.sha256` carries one canonical digest per
+presentation frame (0-4) of the same vector's `Rgba8` output — the format the
+registered `native_av1_video_decoder_factory` `VideoDecoderFactory` produces
+(`src/av1_decoder.rs`) — computed by applying this crate's independently
+unit-tested, spec-documented BT.601 `convert_to_rgba8` conversion
+(`src/av1_filters.rs`) to the same hermetic YUV420 decode.

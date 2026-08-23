@@ -28,6 +28,9 @@ pub mod timeline;
 pub mod transfer;
 
 #[cfg(not(target_arch = "wasm32"))]
+mod av1_decoder;
+
+#[cfg(not(target_arch = "wasm32"))]
 mod hevc;
 
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
@@ -87,6 +90,8 @@ pub use transfer::{
     TransferStage, execute_transfer, inspect_transfer,
 };
 
+#[cfg(not(target_arch = "wasm32"))]
+pub use av1_decoder::native_av1_video_decoder_factory;
 #[cfg(not(target_arch = "wasm32"))]
 pub use hevc::native_hevc_video_decoder_factory;
 #[cfg(not(target_arch = "wasm32"))]
