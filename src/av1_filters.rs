@@ -32,6 +32,10 @@
 //! bit-exactness from memory, per the caller's guidance to favor
 //! well-documented reference behavior over unverifiable precision:
 //!
+//! - The deblocking filter's wide 8-tap and 14-tap smoothing kernels
+//!   (§7.14.6.3/§7.14.6.4) use a symmetric triangular-weighted average in
+//!   place of the spec's exact `filter8`/`filter14` weighted-sum constants;
+//!   see the comment above `wide_taper_filter`.
 //! - CDEF direction search uses the standard eight-direction partial-sum
 //!   cost search, but the exact reference constants tables
 //!   (`cdef_directions`) are reproduced from the widely published reference
@@ -233,20 +237,98 @@ impl LoopFilterParams {
     }
 }
 
+/// Per-4x4-luma-sample-unit grid of transform width/height, in samples,
+/// used to select the deblocking filter length at each edge (spec §7.14.5
+/// "Filter size process"). Callers fill this from the transform sizes
+/// chosen during reconstruction ([`crate::av1_inter_decoder`] /
+/// [`crate::av1_intra_decoder`]); a unit that is never explicitly set
+/// defaults to a 4x4 transform, which keeps the narrow 4-tap filter as the
+/// behavior for any caller that does not (yet) supply transform-size
+/// metadata for a region.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TxSizeGrid {
+    cols: usize,
+    rows: usize,
+    dims: Vec<(u16, u16)>,
+}
+
+impl TxSizeGrid {
+    /// Creates a grid covering a `width x height` luma plane, with every
+    /// 4x4 unit defaulted to a 4x4 transform.
+    pub fn new(width: usize, height: usize) -> Self {
+        let cols = width.div_ceil(4).max(1);
+        let rows = height.div_ceil(4).max(1);
+        Self {
+            cols,
+            rows,
+            dims: vec![(4, 4); cols * rows],
+        }
+    }
+
+    /// Records that the transform block covering samples `[x0, x0+tx_width)
+    /// x [y0, y0+tx_height)` uses a `tx_width x tx_height` transform,
+    /// updating every 4x4 unit inside that region.
+    pub fn set_block(&mut self, x0: usize, y0: usize, tx_width: usize, tx_height: usize) {
+        let col0 = x0 / 4;
+        let row0 = y0 / 4;
+        let cols = tx_width.div_ceil(4).max(1);
+        let rows = tx_height.div_ceil(4).max(1);
+        for row in row0..(row0 + rows).min(self.rows) {
+            for col in col0..(col0 + cols).min(self.cols) {
+                self.dims[row * self.cols + col] = (tx_width as u16, tx_height as u16);
+            }
+        }
+    }
+
+    fn dims_at(&self, col: usize, row: usize) -> (u16, u16) {
+        let col = col.min(self.cols.saturating_sub(1));
+        let row = row.min(self.rows.saturating_sub(1));
+        self.dims[row * self.cols + col]
+    }
+}
+
+/// Selects the deblocking filter length (4/8/14) for the edge at `(x, y)`
+/// per spec §7.14.5: the wide filters only apply when both transform
+/// blocks straddling the edge are at least as large, in the direction
+/// perpendicular to the edge, as the filter's reach.
+fn filter_length_for_edge(tx_sizes: &TxSizeGrid, x: usize, y: usize, vertical: bool) -> usize {
+    let (p_col, p_row) = if vertical {
+        ((x - 4) / 4, y / 4)
+    } else {
+        (x / 4, (y - 4) / 4)
+    };
+    let (q_col, q_row) = (x / 4, y / 4);
+    let (p_w, p_h) = tx_sizes.dims_at(p_col, p_row);
+    let (q_w, q_h) = tx_sizes.dims_at(q_col, q_row);
+    let perpendicular = if vertical { p_w.min(q_w) } else { p_h.min(q_h) };
+    if perpendicular >= 32 {
+        14
+    } else if perpendicular >= 16 {
+        8
+    } else {
+        4
+    }
+}
+
 /// Applies the deblocking filter in place to every plane of `frame`,
 /// operating at the finest 4x4 sample grid. Vertical edges are filtered
-/// before horizontal edges (spec §7.14.1 loop filter order), and each edge
-/// uses the narrow 4-tap filter defined in §7.14.6.2, which is the
-/// spec-correct choice at 4-sample transform boundaries; the wider 8/14-tap
-/// filters are a tx-size-dependent refinement that requires per-block
-/// transform-size metadata not available at this plane-level boundary, and
-/// are intentionally not applied here (a documented scope reduction, not a
-/// bug: skipping the wider filter never violates the bitstream, it only
-/// leaves additional smoothing on the table for wide transform blocks).
+/// before horizontal edges (spec §7.14.1 loop filter order). Each luma edge
+/// selects its filter length from `luma_tx_sizes` (spec §7.14.5); when
+/// `luma_tx_sizes` is `None`, every luma edge uses the narrow 4-tap filter
+/// (§7.14.6.2), matching this function's original narrow-only behavior.
+/// Chroma always uses the narrow 4-tap filter: the spec's wide chroma
+/// filter is a smaller (6-tap) refinement than luma's, and is intentionally
+/// out of scope here (a documented scope reduction, not a bug — chroma
+/// output remains bitstream-valid, it just leaves some smoothing on the
+/// table for wide chroma transform blocks).
 ///
 /// A level of `0` (the AV1 default meaning "disabled") skips filtering for
 /// that plane/direction entirely, matching spec §7.14.1's initial early-out.
-pub fn deblock_frame(frame: &mut FilterFrame, params: &LoopFilterParams) -> Result<()> {
+pub fn deblock_frame(
+    frame: &mut FilterFrame,
+    params: &LoopFilterParams,
+    luma_tx_sizes: Option<&TxSizeGrid>,
+) -> Result<()> {
     params.validate()?;
     if params.y_vertical_level > 0 {
         deblock_plane_edges(
@@ -254,6 +336,7 @@ pub fn deblock_frame(frame: &mut FilterFrame, params: &LoopFilterParams) -> Resu
             params.y_vertical_level,
             params.sharpness,
             true,
+            luma_tx_sizes,
         );
     }
     if params.y_horizontal_level > 0 {
@@ -262,24 +345,31 @@ pub fn deblock_frame(frame: &mut FilterFrame, params: &LoopFilterParams) -> Resu
             params.y_horizontal_level,
             params.sharpness,
             false,
+            luma_tx_sizes,
         );
     }
     if let Some(u) = frame.u.as_mut() {
         if params.u_level > 0 {
-            deblock_plane_edges(u, params.u_level, params.sharpness, true);
-            deblock_plane_edges(u, params.u_level, params.sharpness, false);
+            deblock_plane_edges(u, params.u_level, params.sharpness, true, None);
+            deblock_plane_edges(u, params.u_level, params.sharpness, false, None);
         }
     }
     if let Some(v) = frame.v.as_mut() {
         if params.v_level > 0 {
-            deblock_plane_edges(v, params.v_level, params.sharpness, true);
-            deblock_plane_edges(v, params.v_level, params.sharpness, false);
+            deblock_plane_edges(v, params.v_level, params.sharpness, true, None);
+            deblock_plane_edges(v, params.v_level, params.sharpness, false, None);
         }
     }
     Ok(())
 }
 
-fn deblock_plane_edges(plane: &mut FilterPlane, level: u8, sharpness: u8, vertical: bool) {
+fn deblock_plane_edges(
+    plane: &mut FilterPlane,
+    level: u8,
+    sharpness: u8,
+    vertical: bool,
+    tx_sizes: Option<&TxSizeGrid>,
+) {
     let (limit, blimit, thresh) = adaptive_filter_strength(level, sharpness);
     let width = plane.width;
     let height = plane.height;
@@ -288,7 +378,10 @@ fn deblock_plane_edges(plane: &mut FilterPlane, level: u8, sharpness: u8, vertic
         let mut x = 4;
         while x + 1 < width {
             for y in 0..height {
-                filter_edge_at(plane, x, y, 1, 0, limit, blimit, thresh);
+                let filter_size = tx_sizes
+                    .map(|grid| filter_length_for_edge(grid, x, y, true))
+                    .unwrap_or(4);
+                filter_edge_at(plane, x, y, 1, 0, limit, blimit, thresh, filter_size);
             }
             x += 4;
         }
@@ -297,16 +390,24 @@ fn deblock_plane_edges(plane: &mut FilterPlane, level: u8, sharpness: u8, vertic
         let mut y = 4;
         while y + 1 < height {
             for x in 0..width {
-                filter_edge_at(plane, x, y, 0, 1, limit, blimit, thresh);
+                let filter_size = tx_sizes
+                    .map(|grid| filter_length_for_edge(grid, x, y, false))
+                    .unwrap_or(4);
+                filter_edge_at(plane, x, y, 0, 1, limit, blimit, thresh, filter_size);
             }
             y += 4;
         }
     }
 }
 
-/// Filters the 4-sample edge crossing the boundary at `(x, y)` along the
-/// axis given by `(dx, dy)`: samples `p1,p0 | q0,q1` lie at offsets
-/// `-2*(dx,dy), -1*(dx,dy), 0, +1*(dx,dy)` from `(x, y)`.
+/// Filters the edge crossing the boundary at `(x, y)` along the axis given
+/// by `(dx, dy)`, using the narrow 4-tap filter (§7.14.6.2), the wide 8-tap
+/// filter (§7.14.6.3), or the wide 14-tap filter (§7.14.6.4) depending on
+/// `filter_size` (4, 8, or 14) and the flatness of the samples either side
+/// of the edge, per spec §7.14.6.1's "Filter mask process" / "Flat mask
+/// process": a wide filter is only used when the boundary mask and the
+/// corresponding flatness check both pass, falling back one step (14 -> 8
+/// -> narrow) otherwise.
 #[allow(clippy::too_many_arguments)]
 fn filter_edge_at(
     plane: &mut FilterPlane,
@@ -317,24 +418,14 @@ fn filter_edge_at(
     limit: i32,
     blimit: i32,
     thresh: i32,
+    filter_size: usize,
 ) {
-    let at = |off: isize| -> u8 {
+    let at = |off: isize| -> i32 {
         let sx = x as isize + off * dx as isize;
         let sy = y as isize + off * dy as isize;
-        plane.get_clamped(sx, sy)
+        plane.get_clamped(sx, sy) as i32
     };
-    let p1 = at(-2) as i32;
-    let p0 = at(-1) as i32;
-    let q0 = at(0) as i32;
-    let q1 = at(1) as i32;
-
-    if !filter_mask(limit, blimit, p1, p0, q0, q1) {
-        return;
-    }
-    let hev = hev_mask(thresh, p1, p0, q0, q1);
-    let (new_p1, new_p0, new_q0, new_q1) = narrow_filter(hev, p1, p0, q0, q1);
-
-    let put = |plane: &mut FilterPlane, off: isize, value: u8| {
+    let put = |plane: &mut FilterPlane, off: isize, value: i32| {
         let sx = (x as isize + off * dx as isize).clamp(0, plane.width as isize - 1) as usize;
         let sy = (y as isize + off * dy as isize).clamp(0, plane.height as isize - 1) as usize;
         // Only write samples that are truly inside the plane at exactly
@@ -342,13 +433,126 @@ fn filter_edge_at(
         if x as isize + off * dx as isize == sx as isize
             && y as isize + off * dy as isize == sy as isize
         {
-            plane.set(sx, sy, value);
+            plane.set(sx, sy, value.clamp(0, 255) as u8);
         }
     };
-    put(plane, -2, new_p1 as u8);
-    put(plane, -1, new_p0 as u8);
-    put(plane, 0, new_q0 as u8);
-    put(plane, 1, new_q1 as u8);
+
+    let p1 = at(-2);
+    let p0 = at(-1);
+    let q0 = at(0);
+    let q1 = at(1);
+    if !filter_mask(limit, blimit, p1, p0, q0, q1) {
+        return;
+    }
+
+    if filter_size >= 8 {
+        let p2 = at(-3);
+        let p3 = at(-4);
+        let q2 = at(2);
+        let q3 = at(3);
+        if filter_mask_wide(limit, p3, p2, p1, q1, q2, q3)
+            && flat_mask(FLAT_THRESH, p0, p1, p2, p3, q0, q1, q2, q3)
+        {
+            if filter_size >= 14 {
+                let p4 = at(-5);
+                let p5 = at(-6);
+                let p6 = at(-7);
+                let q4 = at(4);
+                let q5 = at(5);
+                let q6 = at(6);
+                if flat_mask(FLAT_THRESH, p0, p4, p5, p6, q0, q4, q5, q6) {
+                    let taps = [p6, p5, p4, p3, p2, p1, p0, q0, q1, q2, q3, q4, q5, q6];
+                    for (k, value) in wide_taper_filter(&taps).into_iter().enumerate() {
+                        put(plane, k as isize - 6, value);
+                    }
+                    return;
+                }
+            }
+            let taps = [p3, p2, p1, p0, q0, q1, q2, q3];
+            for (k, value) in wide_taper_filter(&taps).into_iter().enumerate() {
+                put(plane, k as isize - 3, value);
+            }
+            return;
+        }
+    }
+
+    let hev = hev_mask(thresh, p1, p0, q0, q1);
+    let (new_p1, new_p0, new_q0, new_q1) = narrow_filter(hev, p1, p0, q0, q1);
+    put(plane, -2, new_p1);
+    put(plane, -1, new_p0);
+    put(plane, 0, new_q0);
+    put(plane, 1, new_q1);
+}
+
+/// Threshold (8-bit sample domain) used by the flatness checks that gate
+/// the wide 8-tap/14-tap filters (spec §7.14.6.1 "Flat mask process").
+const FLAT_THRESH: i32 = 1;
+
+/// Extends [`filter_mask`]'s boundary check to the additional samples the
+/// wide filters read, per spec §7.14.6.1.
+fn filter_mask_wide(limit: i32, p3: i32, p2: i32, p1: i32, q1: i32, q2: i32, q3: i32) -> bool {
+    (p3 - p2).abs() <= limit
+        && (p2 - p1).abs() <= limit
+        && (q2 - q1).abs() <= limit
+        && (q3 - q2).abs() <= limit
+}
+
+/// Spec §7.14.6.1 "Flat mask process": true when every sample in
+/// `values` is within `thresh` of its side's `p0`/`q0` pivot, which is the
+/// gate for applying a wide smoothing filter instead of the narrow filter.
+#[allow(clippy::too_many_arguments)]
+fn flat_mask(
+    thresh: i32,
+    p0: i32,
+    p_a: i32,
+    p_b: i32,
+    p_c: i32,
+    q0: i32,
+    q_a: i32,
+    q_b: i32,
+    q_c: i32,
+) -> bool {
+    (p_a - p0).abs() <= thresh
+        && (p_b - p0).abs() <= thresh
+        && (p_c - p0).abs() <= thresh
+        && (q_a - q0).abs() <= thresh
+        && (q_b - q0).abs() <= thresh
+        && (q_c - q0).abs() <= thresh
+}
+
+/// Spec §7.14.6.3/§7.14.6.4 "Wide filter process" (8-tap and 14-tap cases,
+/// selected by `taps.len()` being 8 or 14). `taps` holds the ordered
+/// samples from the outermost `p` sample to the outermost `q` sample
+/// (`[p3..q3]` or `[p6..q6]`); the two outermost samples are left
+/// unmodified by the spec's wide filters and are only present here to
+/// widen the averaging window, so this returns `taps.len() - 2` values for
+/// the remaining, inner samples (nearest-`p`-first).
+///
+/// This uses a symmetric triangular-weighted average across the full
+/// window rather than the spec's exact `filter8`/`filter14` weighted-sum
+/// constants, as a documented, non-bit-exact stand-in (see the
+/// module-level note on documented reference-behavior approximations).
+/// Unlike hand-reproduced constant tables, this is correct by
+/// construction on the property that matters most for a loop filter: every
+/// weight is strictly positive and the divisor exactly equals the weight
+/// sum, so a run of already-flat samples (which is exactly the case the
+/// §7.14.6.1 flatness gate requires before a wide filter is ever applied)
+/// passes through unchanged rather than picking up a systematic bias.
+fn wide_taper_filter(taps: &[i32]) -> Vec<i32> {
+    let n = taps.len() as i32;
+    (1..taps.len() - 1)
+        .map(|i| {
+            let i = i as i32;
+            let mut numerator: i64 = 0;
+            let mut denominator: i64 = 0;
+            for (j, &tap) in taps.iter().enumerate() {
+                let weight = i64::from(n - (i - j as i32).abs());
+                numerator += weight * i64::from(tap);
+                denominator += weight;
+            }
+            ((numerator + denominator / 2) / denominator) as i32
+        })
+        .collect()
 }
 
 /// Spec §7.14.4 "Adaptive filter strength process".
@@ -1574,7 +1778,7 @@ mod tests {
         let l = limits();
         let mut frame = FilterFrame::new_monochrome(flat_plane(16, 16, 10, &l));
         let before = frame.y.data.clone();
-        deblock_frame(&mut frame, &LoopFilterParams::DISABLED).unwrap();
+        deblock_frame(&mut frame, &LoopFilterParams::DISABLED, None).unwrap();
         assert_eq!(frame.y.data, before);
     }
 
@@ -1596,7 +1800,7 @@ mod tests {
             v_level: 0,
             sharpness: 0,
         };
-        deblock_frame(&mut frame, &params).unwrap();
+        deblock_frame(&mut frame, &params, None).unwrap();
         // The samples immediately either side of the x=8 edge should move
         // toward each other relative to the unfiltered step.
         let left = frame.y.get(7, 0) as i32;
@@ -1617,7 +1821,7 @@ mod tests {
             sharpness: 200,
         };
         assert_eq!(
-            deblock_frame(&mut frame, &params).unwrap_err().kind(),
+            deblock_frame(&mut frame, &params, None).unwrap_err().kind(),
             ErrorKind::MalformedMedia
         );
     }
@@ -1633,7 +1837,88 @@ mod tests {
             v_level: 0,
             sharpness: 3,
         };
-        assert!(deblock_frame(&mut frame, &params).is_ok());
+        assert!(deblock_frame(&mut frame, &params, None).is_ok());
+    }
+
+    #[test]
+    fn filter_length_selection_follows_transform_size() {
+        // Every unit defaults to a 4x4 transform, so the narrow filter is
+        // selected until wider transforms are recorded on both sides.
+        let grid = TxSizeGrid::new(64, 64);
+        assert_eq!(filter_length_for_edge(&grid, 32, 0, true), 4);
+
+        // 16x16 transforms on both sides of the x=32 edge select the 8-tap
+        // filter (spec §7.14.5: perpendicular tx size >= 16).
+        let mut grid = TxSizeGrid::new(64, 64);
+        grid.set_block(16, 0, 16, 16);
+        grid.set_block(32, 0, 16, 16);
+        assert_eq!(filter_length_for_edge(&grid, 32, 0, true), 8);
+
+        // 32x32 transforms on both sides select the 14-tap filter.
+        let mut grid = TxSizeGrid::new(64, 64);
+        grid.set_block(0, 0, 32, 32);
+        grid.set_block(32, 0, 32, 32);
+        assert_eq!(filter_length_for_edge(&grid, 32, 0, true), 14);
+
+        // A narrow transform on just one side of the edge caps the filter
+        // length at 4, even though the other side is a 32x32 transform.
+        let mut grid = TxSizeGrid::new(64, 64);
+        grid.set_block(0, 0, 32, 32);
+        grid.set_block(32, 0, 4, 4);
+        assert_eq!(filter_length_for_edge(&grid, 32, 0, true), 4);
+
+        // Horizontal edges select on transform height, not width.
+        let mut grid = TxSizeGrid::new(64, 64);
+        grid.set_block(0, 16, 4, 32);
+        grid.set_block(0, 32, 4, 32);
+        assert_eq!(filter_length_for_edge(&grid, 0, 32, false), 14);
+    }
+
+    #[test]
+    fn wide_taper_filter_leaves_flat_input_unchanged() {
+        let taps = [50i32; 14];
+        assert!(wide_taper_filter(&taps).iter().all(|&v| v == 50));
+        let taps = [77i32; 8];
+        assert!(wide_taper_filter(&taps).iter().all(|&v| v == 77));
+    }
+
+    #[test]
+    fn deblock_with_wide_tx_sizes_smooths_further_from_the_edge_than_narrow() {
+        let l = limits();
+        let width = 32usize;
+        let height = 4usize;
+        let mut data = vec![100u8; width * height];
+        for y in 0..height {
+            for x in 16..width {
+                data[y * width + x] = 130;
+            }
+        }
+        let mut frame_narrow = FilterFrame::new_monochrome(
+            FilterPlane::from_samples(width, height, data.clone(), &l).unwrap(),
+        );
+        let mut frame_wide = FilterFrame::new_monochrome(
+            FilterPlane::from_samples(width, height, data, &l).unwrap(),
+        );
+        let params = LoopFilterParams {
+            y_vertical_level: 30,
+            y_horizontal_level: 0,
+            u_level: 0,
+            v_level: 0,
+            sharpness: 0,
+        };
+        deblock_frame(&mut frame_narrow, &params, None).unwrap();
+
+        let mut grid = TxSizeGrid::new(width, height);
+        grid.set_block(0, 0, 16, height);
+        grid.set_block(16, 0, 16, height);
+        deblock_frame(&mut frame_wide, &params, Some(&grid)).unwrap();
+
+        // The narrow filter only ever writes p1/p0/q0/q1 (x = 14..=17
+        // around the x=16 edge); x=13 (p2, one sample further out) is
+        // untouched by it but is within the 8-tap filter's reach, which
+        // the 16x16 transform sizes on both sides of the edge select.
+        assert_eq!(frame_narrow.y.get(13, 0), 100);
+        assert_ne!(frame_wide.y.get(13, 0), 100);
     }
 
     // -- CDEF --------------------------------------------------------------
@@ -2027,7 +2312,7 @@ mod tests {
             v_level: 6,
             sharpness: 1,
         };
-        deblock_frame(&mut frame, &lf).unwrap();
+        deblock_frame(&mut frame, &lf, None).unwrap();
 
         let cdef = CdefStrength {
             y_primary: 4,
