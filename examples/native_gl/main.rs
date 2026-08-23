@@ -313,7 +313,8 @@ impl ApplicationHandler for App {
                 gl_display.get_proc_address(symbol.as_c_str()).cast()
             })
         };
-        let adapter = GlWindowAdapter::new(gl);
+        let mut adapter = GlWindowAdapter::new(gl);
+        adapter.resize(size.width, size.height);
 
         window.request_redraw();
         self.state = Some(WindowState {
