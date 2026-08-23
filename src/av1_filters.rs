@@ -195,7 +195,7 @@ impl FilterFrame {
 /// `MiCols`/`MiRows` chroma sizes with this same ceil-shift rule so odd
 /// luma dimensions never lose a chroma sample column/row).
 fn chroma_dim(luma: usize, subsampled: bool) -> usize {
-    if subsampled { (luma + 1) / 2 } else { luma }
+    if subsampled { luma.div_ceil(2) } else { luma }
 }
 
 // ---------------------------------------------------------------------
@@ -602,16 +602,14 @@ fn cdef_filter_pixel(
         let taps = CDEF_PRI_TAPS[(primary_strength as usize) & 1];
         let (dr, dc) = CDEF_DIRECTIONS[dir][0];
         for (i, &tap) in taps.iter().enumerate() {
+            // i == 0 samples the +direction neighbor, i == 1 the -direction
+            // neighbor, matching the two primary taps in spec §7.15.3.
             let sign = if i == 0 { 1 } else { -1 };
-            for s in [1i32, sign] {
-                let (rr, cc) = if s == 1 { (dr, dc) } else { (-dr, -dc) };
-                let px =
-                    plane.get_clamped(x as isize + cc as isize, y as isize + rr as isize) as i32;
-                let diff = px - center;
-                sum += tap * constrain(diff, i32::from(primary_strength), i32::from(damping));
-                total_weight += tap;
-                break; // one direction per sign handled by outer taps loop
-            }
+            let (rr, cc) = (dr * sign, dc * sign);
+            let px = plane.get_clamped(x as isize + cc as isize, y as isize + rr as isize) as i32;
+            let diff = px - center;
+            sum += tap * constrain(diff, i32::from(primary_strength), i32::from(damping));
+            total_weight += tap;
         }
     }
     if secondary_strength > 0 {
@@ -823,7 +821,7 @@ pub fn apply_restoration_unit(
             eps,
             weight,
         } => {
-            self_guided_restore(plane, *radius, *eps, *weight, x0, y0, x1, y1);
+            self_guided_restore(plane, *radius, *eps, *weight, (x0, y0, x1, y1));
             Ok(())
         }
     }
@@ -848,11 +846,11 @@ fn wiener_restore(
     for (row, y) in (y0..y1).enumerate() {
         for (col, x) in (x0..x1).enumerate() {
             let mut sum = 0i32;
-            for k in 0..3 {
+            for (k, &tap) in horizontal.iter().enumerate() {
                 let off = k as isize - 3;
                 let p_minus = plane.get_clamped(x as isize + off, y as isize) as i32;
                 let p_plus = plane.get_clamped(x as isize - off, y as isize) as i32;
-                sum += horizontal[k] * (p_minus + p_plus);
+                sum += tap * (p_minus + p_plus);
             }
             sum += h_center * plane.get(x, y) as i32;
             intermediate[row * width + col] = round_shift(sum, WIENER_ROUND0);
@@ -862,11 +860,11 @@ fn wiener_restore(
     for (row, y) in (y0..y1).enumerate() {
         for (col, x) in (x0..x1).enumerate() {
             let mut sum = 0i32;
-            for k in 0..3 {
+            for (k, &tap) in vertical.iter().enumerate() {
                 let off = k as isize - 3;
                 let ry_minus = (row as isize + off).clamp(0, height as isize - 1) as usize;
                 let ry_plus = (row as isize - off).clamp(0, height as isize - 1) as usize;
-                sum += vertical[k]
+                sum += tap
                     * (intermediate[ry_minus * width + col] + intermediate[ry_plus * width + col]);
             }
             sum += v_center * intermediate[row * width + col];
@@ -893,11 +891,9 @@ fn self_guided_restore(
     radius: [u8; 2],
     eps: [i32; 2],
     weight: [i32; 2],
-    x0: usize,
-    y0: usize,
-    x1: usize,
-    y1: usize,
+    region: (usize, usize, usize, usize),
 ) {
+    let (x0, y0, x1, y1) = region;
     let original: Vec<i32> = (y0..y1)
         .flat_map(|y| (x0..x1).map(move |x| (x, y)))
         .map(|(x, y)| plane.get(x, y) as i32)
@@ -1080,7 +1076,7 @@ fn build_scaling_lookup(points: &[(u8, u8)]) -> [i32; 256] {
     if points.is_empty() {
         return lut;
     }
-    for i in 0..256usize {
+    for (i, entry) in lut.iter_mut().enumerate() {
         let x = i as i32;
         let (mut lo, mut hi) = (points[0], *points.last().unwrap());
         for w in points.windows(2) {
@@ -1090,17 +1086,17 @@ fn build_scaling_lookup(points: &[(u8, u8)]) -> [i32; 256] {
                 break;
             }
         }
-        if x <= i32::from(points[0].0) {
-            lut[i] = i32::from(points[0].1);
+        *entry = if x <= i32::from(points[0].0) {
+            i32::from(points[0].1)
         } else if x >= i32::from(points[points.len() - 1].0) {
-            lut[i] = i32::from(points[points.len() - 1].1);
+            i32::from(points[points.len() - 1].1)
         } else if hi.0 == lo.0 {
-            lut[i] = i32::from(lo.1);
+            i32::from(lo.1)
         } else {
             let (x0, y0) = (i32::from(lo.0), i32::from(lo.1));
             let (x1, y1) = (i32::from(hi.0), i32::from(hi.1));
-            lut[i] = y0 + (y1 - y0) * (x - x0) / (x1 - x0);
-        }
+            y0 + (y1 - y0) * (x - x0) / (x1 - x0)
+        };
     }
     lut
 }
@@ -1145,7 +1141,7 @@ pub fn apply_film_grain(
                     let scale = lut[pixel as usize];
                     let noise = round_shift(grain_value * scale, i32::from(params.scaling_shift));
                     let noise =
-                        round_shift(noise, i32::from(params.grain_scale_shift).max(0).min(31));
+                        round_shift(noise, i32::from(params.grain_scale_shift).clamp(0, 31));
                     let (lo, hi) = if params.clip_to_restricted_range {
                         (16, 235)
                     } else {
