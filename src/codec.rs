@@ -245,7 +245,10 @@ impl CancellationToken {
 }
 
 /// A stateful video decoder that may retain reference and reorder state.
-pub trait VideoDecoder {
+///
+/// Requires `Send` so an [`ExactFrameReader`] (and the decoder it owns) can be moved to a
+/// background thread, which native examples rely on to decode without stalling rendering.
+pub trait VideoDecoder: Send {
     fn submit(
         &mut self,
         sample: &EncodedVideoSample,
