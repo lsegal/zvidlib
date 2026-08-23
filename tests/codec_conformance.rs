@@ -5,10 +5,10 @@ use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 use zvidlib::io::MemorySource;
 use zvidlib::{
-    CancellationToken, Codec, CodecProfile, ColorRange, EncodedVideoSample, ErrorKind, ExpectedVideoFrame,
-    FrameDigest, FrameIndex, HardwarePreference, Limits, Mp4DemuxerOptions, PixelFormat,
-    VideoDecoderConfig, VideoDecoderConformanceVector, VideoDecoderFactory, VideoDimensions,
-    native_av1_video_decoder_factory, native_hevc_video_decoder_factory,
+    CancellationToken, Codec, CodecProfile, ColorRange, EncodedVideoSample, ErrorKind,
+    ExpectedVideoFrame, FrameDigest, FrameIndex, HardwarePreference, Limits, Mp4DemuxerOptions,
+    PixelFormat, VideoDecoderConfig, VideoDecoderConformanceVector, VideoDecoderFactory,
+    VideoDimensions, native_av1_video_decoder_factory, native_hevc_video_decoder_factory,
     verify_video_decoder_conformance,
 };
 
@@ -151,8 +151,7 @@ fn native_av1_decoder_conforms_for_sequential_reverse_and_alternating_seeks() {
     // unit-tested `convert_to_rgba8` BT.601 conversion (see
     // `src/av1_filters.rs`) applied to that hermetically decoded YUV420
     // output.
-    let stream_hex =
-        include_str!("fixtures/codec/av1_inter_show_existing_16x16.hex").trim();
+    let stream_hex = include_str!("fixtures/codec/av1_inter_show_existing_16x16.hex").trim();
     let stream: Vec<u8> = stream_hex
         .as_bytes()
         .chunks_exact(2)
