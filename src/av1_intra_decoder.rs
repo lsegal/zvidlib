@@ -6,7 +6,8 @@
 use crate::av1_cdf as cdf;
 use crate::{
     Av1FrameType, Av1IntraFrame, Av1Obu, Av1ObuType, Av1Parser, Av1SymbolDecoder, Av1SyntaxSupport,
-    ColorRange, Error, ErrorKind, Limits, Result, VideoDimensions, VideoFrame, inverse_wht_4x4,
+    ColorRange, Error, ErrorKind, Limits, Result, TxSizeGrid, VideoDimensions, VideoFrame,
+    inverse_wht_4x4,
 };
 
 const NUM_BASE_LEVELS: i32 = 2;
@@ -14,6 +15,28 @@ const COEFF_BASE_PLUS_RANGE: i32 = 14;
 
 /// Decodes one low-overhead AV1 temporal unit into validated YUV planes.
 pub fn decode_av1_lossless_intra(bytes: &[u8], limits: &Limits) -> Result<VideoFrame> {
+    decode_av1_lossless_intra_with_tx_sizes(bytes, limits).map(|(frame, _)| frame)
+}
+
+/// Decodes one low-overhead AV1 temporal unit into validated YUV planes,
+/// alongside the per-4x4-luma-unit transform-size grid recorded while
+/// reconstructing it ([`TxSizeGrid`], the filter-length-selection metadata
+/// [`crate::deblock_frame`] takes as `luma_tx_sizes`).
+///
+/// Every block in the returned grid is currently the AV1 spec's mandatory
+/// `TX_4X4` transform size: this decoder only accepts `CodedLossless`
+/// streams, and the spec forces `TX_MODE_ONLY_4X4` whenever
+/// `CodedLossless` is true (see `parse_supported_frame_header`'s
+/// `reduced_tx_set` comment; a lossless AV1 stream never has a choice of
+/// transform size to signal). The per-block value is still threaded
+/// through explicitly here, rather than left at [`TxSizeGrid::new`]'s
+/// default, so extending this decoder to non-lossless streams in the
+/// future only needs to change what gets recorded at each transform
+/// block, not how the grid reaches the deblocking filter.
+pub fn decode_av1_lossless_intra_with_tx_sizes(
+    bytes: &[u8],
+    limits: &Limits,
+) -> Result<(VideoFrame, TxSizeGrid)> {
     if limits.max_av1_blocks_per_frame == 0 {
         return Err(resource("AV1 reconstruction block limit must be nonzero"));
     }
@@ -101,12 +124,14 @@ pub fn decode_av1_lossless_intra(bytes: &[u8], limits: &Limits) -> Result<VideoF
         .ok_or_else(|| malformed_error("AV1 tile data is truncated"))?;
     let mut decoder = LosslessTileDecoder::new(tile, width, height, mi_cols, mi_rows, limits)?;
     let luma = decoder.decode()?;
+    let tx_sizes = decoder.tx_sizes;
     let range = if sequence.color_config.color_range {
         ColorRange::Full
     } else {
         ColorRange::Limited
     };
-    Av1IntraFrame::from_luma(dimensions, luma, range, limits)?.into_video_frame(limits)
+    let frame = Av1IntraFrame::from_luma(dimensions, luma, range, limits)?.into_video_frame(limits)?;
+    Ok((frame, tx_sizes))
 }
 
 fn parse_supported_frame_header(payload: &[u8], mi_cols: usize, mi_rows: usize) -> Result<usize> {
@@ -204,6 +229,7 @@ struct LosslessTileDecoder<'a> {
     mi_bsl: Vec<u8>,
     decoded_blocks: u32,
     max_blocks: u32,
+    tx_sizes: TxSizeGrid,
 }
 
 impl<'a> LosslessTileDecoder<'a> {
@@ -253,6 +279,7 @@ impl<'a> LosslessTileDecoder<'a> {
             mi_bsl: vec![0; contexts],
             decoded_blocks: 0,
             max_blocks: limits.max_av1_blocks_per_frame,
+            tx_sizes: TxSizeGrid::new(width, height),
         })
     }
 
@@ -397,6 +424,11 @@ impl<'a> LosslessTileDecoder<'a> {
                     (i16::from(prediction) + residuals[row * 4 + column]).clamp(0, 255) as u8;
             }
         }
+        // CodedLossless mandates TX_4X4 for every transform block (spec
+        // §5.9.11 / `TX_MODE_ONLY_4X4`); recorded explicitly rather than
+        // relying on the grid's default so this stays correct once the
+        // decoder can choose a different transform size.
+        self.tx_sizes.set_block(x, y, 4, 4);
         Ok(())
     }
 

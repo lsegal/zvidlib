@@ -32,7 +32,8 @@
 use crate::av1_cdf as cdf;
 use crate::{
     Av1FrameType, Av1Obu, Av1Parser, Av1SequenceHeader, Av1SymbolDecoder, Av1SyntaxSupport,
-    ColorRange, Error, ErrorKind, Limits, Result, VideoDimensions, VideoFrame, inverse_wht_4x4,
+    ColorRange, Error, ErrorKind, Limits, Result, TxSizeGrid, VideoDimensions, VideoFrame,
+    inverse_wht_4x4,
 };
 
 const NUM_REF_FRAMES: usize = 8;
@@ -65,6 +66,7 @@ pub struct Av1InterDecoder {
     sequence: Option<Av1SequenceHeader>,
     refs: [Option<RefSlot>; NUM_REF_FRAMES],
     next_generation: u64,
+    last_tx_sizes: Option<TxSizeGrid>,
 }
 
 impl Av1InterDecoder {
@@ -78,6 +80,7 @@ impl Av1InterDecoder {
             sequence: None,
             refs: Default::default(),
             next_generation: 0,
+            last_tx_sizes: None,
         })
     }
 
@@ -88,6 +91,29 @@ impl Av1InterDecoder {
         self.sequence = None;
         self.refs = Default::default();
         self.next_generation = 0;
+        self.last_tx_sizes = None;
+    }
+
+    /// Returns the per-4x4-luma-unit transform-size grid recorded while
+    /// reconstructing the most recently *coded* frame (the
+    /// filter-length-selection metadata [`crate::deblock_frame`] takes as
+    /// `luma_tx_sizes`), or `None` if no coded frame has been reconstructed
+    /// yet or the most recent call instead showed a retained
+    /// `show_existing_frame` (which reconstructs nothing new, so there is
+    /// no metadata for the frame it shows).
+    ///
+    /// Every block in the grid is currently the AV1 spec's mandatory
+    /// `TX_4X4` transform size: this decoder only accepts `CodedLossless`
+    /// streams (`base_q_idx == 0`), and the spec forces
+    /// `TX_MODE_ONLY_4X4` whenever `CodedLossless` is true (see
+    /// `parse_inter_frame_header`'s `read_tx_mode` comment). The per-block
+    /// value is still threaded through explicitly here, rather than left
+    /// at [`TxSizeGrid::new`]'s default, so extending this decoder to
+    /// non-lossless streams in the future only needs to change what gets
+    /// recorded at each transform block, not how the grid reaches the
+    /// deblocking filter.
+    pub fn last_frame_tx_sizes(&self) -> Option<&TxSizeGrid> {
+        self.last_tx_sizes.as_ref()
     }
 
     /// Decodes one low-overhead AV1 temporal unit and returns the frame it
@@ -140,6 +166,10 @@ impl Av1InterDecoder {
     }
 
     fn show_existing_frame(&mut self, idx: u8) -> Result<VideoFrame> {
+        // Showing a retained frame reconstructs nothing new, and retained
+        // reference slots don't keep their own tx-size grid, so there is no
+        // metadata for the frame this call shows.
+        self.last_tx_sizes = None;
         let index = usize::from(idx);
         if index >= NUM_REF_FRAMES {
             return Err(malformed(
@@ -226,6 +256,7 @@ impl Av1InterDecoder {
             &self.limits,
         )?;
         let luma = decoder.decode()?;
+        self.last_tx_sizes = Some(decoder.tx_sizes);
 
         let color_range = if sequence.color_config.color_range {
             ColorRange::Full
@@ -647,6 +678,7 @@ struct InterTileDecoder<'a> {
     references: [Option<&'a RefSlot>; 7],
     reference_select: bool,
     motion_grid: Vec<Option<BlockMotion>>,
+    tx_sizes: TxSizeGrid,
 }
 
 impl<'a> InterTileDecoder<'a> {
@@ -711,6 +743,7 @@ impl<'a> InterTileDecoder<'a> {
             references,
             reference_select: header.reference_select,
             motion_grid: vec![None; contexts],
+            tx_sizes: TxSizeGrid::new(width, height),
         })
     }
 
@@ -1107,6 +1140,11 @@ impl<'a> InterTileDecoder<'a> {
                 }
             }
         }
+        // CodedLossless mandates TX_4X4 for every transform block (spec
+        // §5.9.11 / `TX_MODE_ONLY_4X4`); recorded explicitly rather than
+        // relying on the grid's default so this stays correct once the
+        // decoder can choose a different transform size.
+        self.tx_sizes.set_block(x, y, 4, 4);
         Ok(())
     }
 
