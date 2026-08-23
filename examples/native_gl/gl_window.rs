@@ -211,9 +211,12 @@ pub struct GlWindowAdapter {
     context: ContextIdentity,
     owner: ExecutionOwner,
     program: glow::Program,
+    rect_ndc_location: Option<glow::UniformLocation>,
+    texture_location: Option<glow::UniformLocation>,
     vao: glow::VertexArray,
     video_texture: Option<(u64, VideoDimensions, glow::Texture)>,
     text_texture: glow::Texture,
+    text_texture_size: (usize, usize),
     window_size: (u32, u32),
 }
 
@@ -221,6 +224,8 @@ impl GlWindowAdapter {
     pub fn new(gl: glow::Context) -> Self {
         let program = link_program(&gl, VIDEO_VERTEX_SHADER, VIDEO_FRAGMENT_SHADER)
             .expect("built-in shaders must compile");
+        let rect_ndc_location = unsafe { gl.get_uniform_location(program, "uRectNdc") };
+        let texture_location = unsafe { gl.get_uniform_location(program, "uTexture") };
 
         let (vao, text_texture) = unsafe {
             let vao = gl.create_vertex_array().expect("create vertex array");
@@ -270,9 +275,12 @@ impl GlWindowAdapter {
             context: ContextIdentity(1),
             owner: ExecutionOwner(1),
             program,
+            rect_ndc_location,
+            texture_location,
             vao,
             video_texture: None,
             text_texture,
+            text_texture_size: (0, 0),
             window_size: (1, 1),
         }
     }
@@ -284,8 +292,9 @@ impl GlWindowAdapter {
         }
     }
 
-    /// Draws the texture uploaded for `handle` as a full-window quad, then overlays the FPS
-    /// counter text in the top-left corner.
+    /// Draws the texture uploaded for `handle` letterboxed/pillarboxed so it is fully contained
+    /// within the window (preserving its aspect ratio, matching CSS `object-fit: contain`), then
+    /// overlays the FPS counter text in the top-left corner.
     pub fn draw(&mut self, handle: u64, dimensions: VideoDimensions, fps: f32) {
         let gl = &self.gl;
         unsafe {
@@ -296,23 +305,39 @@ impl GlWindowAdapter {
 
             if let Some((stored_handle, stored_dimensions, texture)) = self.video_texture {
                 if stored_handle == handle && stored_dimensions == dimensions {
-                    self.draw_rect(texture, -1.0, -1.0, 1.0, 1.0);
+                    let (x0, y0, x1, y1) = self.contained_rect(dimensions);
+                    self.draw_rect(texture, x0, y0, x1, y1);
                 }
             }
 
             let (width, height, data) = rasterize_text(&format!("FPS: {fps:.1}"), 3);
             gl.bind_texture(glow::TEXTURE_2D, Some(self.text_texture));
-            gl.tex_image_2d(
-                glow::TEXTURE_2D,
-                0,
-                glow::RGBA as i32,
-                width as i32,
-                height as i32,
-                0,
-                glow::RGBA,
-                glow::UNSIGNED_BYTE,
-                glow::PixelUnpackData::Slice(Some(&data)),
-            );
+            if self.text_texture_size == (width, height) {
+                gl.tex_sub_image_2d(
+                    glow::TEXTURE_2D,
+                    0,
+                    0,
+                    0,
+                    width as i32,
+                    height as i32,
+                    glow::RGBA,
+                    glow::UNSIGNED_BYTE,
+                    glow::PixelUnpackData::Slice(Some(&data)),
+                );
+            } else {
+                gl.tex_image_2d(
+                    glow::TEXTURE_2D,
+                    0,
+                    glow::RGBA as i32,
+                    width as i32,
+                    height as i32,
+                    0,
+                    glow::RGBA,
+                    glow::UNSIGNED_BYTE,
+                    glow::PixelUnpackData::Slice(Some(&data)),
+                );
+                self.text_texture_size = (width, height);
+            }
 
             let (window_width, window_height) = self.window_size;
             let ndc_width = 2.0 * width as f32 / window_width as f32;
@@ -327,15 +352,24 @@ impl GlWindowAdapter {
         }
     }
 
+    /// Returns the NDC rect for `dimensions` scaled to fit entirely within the current window
+    /// while preserving its aspect ratio, centered on both axes.
+    fn contained_rect(&self, dimensions: VideoDimensions) -> (f32, f32, f32, f32) {
+        let (window_width, window_height) = self.window_size;
+        let scale = (window_width as f32 / dimensions.width.max(1) as f32)
+            .min(window_height as f32 / dimensions.height.max(1) as f32);
+        let ndc_width = (dimensions.width as f32 * scale / window_width as f32).min(1.0);
+        let ndc_height = (dimensions.height as f32 * scale / window_height as f32).min(1.0);
+        (-ndc_width, -ndc_height, ndc_width, ndc_height)
+    }
+
     unsafe fn draw_rect(&self, texture: glow::Texture, x0: f32, y0: f32, x1: f32, y1: f32) {
         let gl = &self.gl;
         unsafe {
-            let location = gl.get_uniform_location(self.program, "uRectNdc");
-            gl.uniform_4_f32(location.as_ref(), x0, y0, x1, y1);
+            gl.uniform_4_f32(self.rect_ndc_location.as_ref(), x0, y0, x1, y1);
             gl.active_texture(glow::TEXTURE0);
             gl.bind_texture(glow::TEXTURE_2D, Some(texture));
-            let sampler_location = gl.get_uniform_location(self.program, "uTexture");
-            gl.uniform_1_i32(sampler_location.as_ref(), 0);
+            gl.uniform_1_i32(self.texture_location.as_ref(), 0);
             gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
         }
     }
@@ -383,28 +417,47 @@ impl GraphicsAdapter for GlWindowAdapter {
             .ok_or_else(|| gl_error("the source frame has no planes"))?;
         let dimensions = destination.dimensions();
 
-        let texture = match self.video_texture {
-            Some((_, stored_dimensions, texture)) if stored_dimensions == dimensions => texture,
+        let (texture, reuse_storage) = match self.video_texture {
+            Some((_, stored_dimensions, texture)) if stored_dimensions == dimensions => {
+                (texture, true)
+            }
             Some((_, _, texture)) => {
                 unsafe { self.gl.delete_texture(texture) };
-                self.create_video_texture()
+                (self.create_video_texture(), false)
             }
-            None => self.create_video_texture(),
+            None => (self.create_video_texture(), false),
         };
 
         unsafe {
             self.gl.bind_texture(glow::TEXTURE_2D, Some(texture));
-            self.gl.tex_image_2d(
-                glow::TEXTURE_2D,
-                0,
-                glow::RGBA as i32,
-                dimensions.width as i32,
-                dimensions.height as i32,
-                0,
-                glow::RGBA,
-                glow::UNSIGNED_BYTE,
-                glow::PixelUnpackData::Slice(Some(&plane.data)),
-            );
+            if reuse_storage {
+                // Reusing the previous frame's texture storage avoids a driver-side
+                // reallocation on every frame, which mattered for keeping up with the source
+                // video's frame rate.
+                self.gl.tex_sub_image_2d(
+                    glow::TEXTURE_2D,
+                    0,
+                    0,
+                    0,
+                    dimensions.width as i32,
+                    dimensions.height as i32,
+                    glow::RGBA,
+                    glow::UNSIGNED_BYTE,
+                    glow::PixelUnpackData::Slice(Some(&plane.data)),
+                );
+            } else {
+                self.gl.tex_image_2d(
+                    glow::TEXTURE_2D,
+                    0,
+                    glow::RGBA as i32,
+                    dimensions.width as i32,
+                    dimensions.height as i32,
+                    0,
+                    glow::RGBA,
+                    glow::UNSIGNED_BYTE,
+                    glow::PixelUnpackData::Slice(Some(&plane.data)),
+                );
+            }
         }
         self.video_texture = Some((destination.handle(), dimensions, texture));
         Ok(())
