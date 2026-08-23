@@ -261,6 +261,7 @@ pub mod ctx_init;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod deblock;
+pub mod encoder;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod decode;
