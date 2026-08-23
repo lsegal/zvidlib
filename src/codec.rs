@@ -373,9 +373,18 @@ impl ExactFrameReader {
                 Error::new(ErrorKind::InvalidInput, "presentation frame is not indexed")
             })?;
         let random_access_position = self.nearest_random_access(target_position);
-        let can_reuse = self.next_decode_position.is_some_and(|position| {
-            position >= random_access_position && position <= target_position
-        });
+        // A decoder with output reordering (e.g. hierarchical B-frames) may need to be fed
+        // samples *past* `target_position` before the reordered frame at `target_position` is
+        // actually emitted. So `next_decode_position > target_position` does not by itself mean
+        // the frame is unreachable without a reset: it may simply still be buffered inside the
+        // decoder, pending release as more samples are submitted. The only case that truly
+        // requires a reset is when the frame was already published once and evicted from the
+        // cache, since a decoder must never be asked to emit the same presentation frame twice
+        // without an intervening reset (see `publish`).
+        let can_reuse = self
+            .next_decode_position
+            .is_some_and(|position| position >= random_access_position)
+            && !self.published_since_reset.contains(&presentation_index);
         if !can_reuse {
             self.decoder.reset()?;
             self.statistics.resets = self.statistics.resets.saturating_add(1);
@@ -914,6 +923,47 @@ mod tests {
             value(&reader.get(FrameIndex(0), &cancellation).unwrap()),
             11
         );
+    }
+
+    #[test]
+    fn sequential_playback_through_a_pipelined_decoder_does_not_reset_every_frame() {
+        // `DelayedDecoder` only emits a frame's output on the *next* `submit` call (or on
+        // `drain`), modeling the one-frame pipeline latency a real reordering decoder exhibits.
+        // Even though `next_decode_position` therefore always runs one step ahead of the frame
+        // a straightforward sequential `get(0), get(1), get(2), ...` walk is actually waiting
+        // on, that lag must not force a full reset-and-redecode-from-keyframe on every call.
+        let mut reader = ExactFrameReader::new(
+            &DelayedFactory,
+            config(),
+            vec![
+                sample(0, 11, true),
+                sample(1, 22, false),
+                sample(2, 33, false),
+                sample(3, 44, false),
+                sample(4, 55, false),
+            ],
+            Limits::default(),
+        )
+        .unwrap();
+        let cancellation = CancellationToken::new();
+
+        assert_eq!(
+            value(&reader.get(FrameIndex(0), &cancellation).unwrap()),
+            11
+        );
+        assert_eq!(reader.statistics().resets, 1);
+
+        for (index, expected) in [(1, 22_u8), (2, 33), (3, 44), (4, 55)] {
+            let frame = reader.get(FrameIndex(index), &cancellation).unwrap();
+            assert_eq!(value(&frame), expected);
+            assert_eq!(
+                reader.statistics().resets,
+                1,
+                "sequential forward playback must not reset once decoding has started"
+            );
+        }
+        assert_eq!(reader.statistics().samples_submitted, 5);
+        assert_eq!(reader.statistics().drains, 1);
     }
 
     struct MalformedOutputFactory;

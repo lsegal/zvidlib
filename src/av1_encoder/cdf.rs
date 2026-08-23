@@ -1,20 +1,15 @@
 //! Default CDF tables (AV1 §9.4), the 4×4 scan (§9.2), and the constant context-offset tables
-//! (§8.3.2) needed by the lossless intra decoder.
+//! (§8.3.2) needed by the M0 lossless encoder.
 //!
-//! Only the slices the bounded decoder touches are included: `base_q_idx == 0` ⇒ coefficient-CDF quant
+//! Only the slices the encoder touches are included: `base_q_idx == 0` ⇒ coefficient-CDF quant
 //! context 0, and `TX_4X4` only. CDFs are stored in the spec's cumulative form (rising to 32768)
 //! with the trailing adaptation-count element dropped, so each row is ready to pass straight to
 //! [`gamut_bitstream::SymbolEncoder::encode_symbol`] (the M0 frame sets `disable_cdf_update = 1`,
 //! so the tables are never adapted). These values are extracted verbatim from the specification.
-//!
-//! The inter-frame tables below (`IS_INTER` through `MV_FR`) extend the same bounded slice to the
-//! single-reference NEARESTMV/GLOBALMV/NEWMV subset used by [`crate::av1_inter_decoder`]: a single
-//! fixed context (context 0) is used everywhere the full specification varies a CDF by neighbouring
-//! mode/skip/reference state, matching this module's existing "smallest context that keeps bitstream
-//! conformance" precedent (e.g. `TX_4X4`-only coefficient contexts above).
 
 // --- Partition CDFs (Default_Partition_W*_Cdf), indexed [ctx]. ---
 /// `Default_Partition_W8_Cdf` (4 partitions: NONE/HORZ/VERT/SPLIT).
+// Adapted and modified from gamut, Copyright (c) 2026 Justin Chung, MIT licensed.
 pub static PARTITION_W8: [[u16; 4]; 4] = [
     [19132, 25510, 30392, 32768],
     [13928, 19855, 28540, 32768],
@@ -73,6 +68,16 @@ pub static SKIP: [[u16; 2]; 3] = [[31671, 32768], [16515, 32768], [4576, 32768]]
 /// `Default_Intra_Frame_Y_Mode_Cdf[0][0]` (above/left both `DC_PRED`).
 pub static INTRA_FRAME_Y_MODE_DC_DC: [u16; 13] = [
     15588, 17027, 19338, 20218, 20682, 21110, 21825, 23244, 24189, 28165, 29093, 30466, 32768,
+];
+
+/// `Default_Uv_Mode_Cfl_Not_Allowed_Cdf[DC_PRED]` (blocks larger than 4×4 in 4:4:4 lossless).
+pub static UV_MODE_CFL_NOT_ALLOWED_DC: [u16; 13] = [
+    22631, 24152, 25378, 25661, 25986, 26520, 27055, 27923, 28244, 30059, 30941, 31961, 32768,
+];
+/// `Default_Uv_Mode_Cfl_Allowed_Cdf[DC_PRED]` (4×4 blocks in lossless).
+pub static UV_MODE_CFL_ALLOWED_DC: [u16; 14] = [
+    10407, 11208, 12900, 13181, 13823, 14175, 14899, 15656, 15986, 20086, 20995, 22455, 24212,
+    32768,
 ];
 
 // --- Coefficient CDFs (quant context 0, TX_4X4). ---
@@ -306,147 +311,3 @@ pub static SIG_REF_DIFF_OFFSET_2D: [(usize, usize); 5] = [(0, 1), (1, 0), (1, 1)
 
 /// `Mag_Ref_Offset_With_Tx_Class[TX_CLASS_2D]` (§8.3.2): neighbour offsets for `coeff_br`.
 pub static MAG_REF_OFFSET_2D: [(usize, usize); 3] = [(0, 1), (1, 0), (1, 1)];
-
-// --- Non-lossless (`base_q_idx != 0`) additions: TX_4X4/TX_8X8 only. ---
-//
-// Unlike the tables above (extracted verbatim from the specification), the
-// CDFs in this section are placeholder-but-valid default probability models
-// for symbols this crate did not previously decode at all (`read_tx_type`'s
-// `TX_SET_INTRA_2`/`TX_SET_INTER_3` choice, and the larger `eob_pt` range
-// needed once transform blocks can hold more than 16 coefficients). Unlike
-// the *dequantization* step (a direct multiply that must match the spec's
-// tables to produce correct pixel values), a symbol's *CDF* only affects
-// entropy-coding efficiency, not decode correctness, as long as the same
-// table is used consistently by both the encoder and decoder of a given
-// stream — which this crate's own hand-authored bitstream writer (used only
-// by its test suite; there is no production AV1 encoder here) guarantees.
-// These tables are therefore internally consistent and exercised by
-// round-trip tests, but are NOT claimed to bit-exactly match an official
-// AV1 encoder's default CDFs, so streams produced by third-party encoders
-// that exercise these particular symbols are not guaranteed to decode
-// correctly by this crate (this matches the rest of this crate's stance of
-// being a bounded, non-conformance-tested subset rather than a full AV1
-// decoder).
-
-/// `ext_tx` symbol CDF for the reduced intra set (`TX_SET_INTRA_2` =
-/// `{IDTX, DCT_DCT, ADST_ADST}`), indexed `[tx_size_is_8x8]`. Decoding
-/// `ADST_ADST` (symbol index 2) is rejected as unsupported by the caller.
-pub static EXT_TX_INTRA_REDUCED: [[u16; 3]; 2] = [[10000, 26000, 32768], [10000, 26000, 32768]];
-
-/// `eob_pt` symbol CDF for transform blocks up to 64 coefficients (TX_8X8),
-/// indexed `[plane_type][ctx]`, extending [`EOB_PT_16`]'s shape to the
-/// larger symbol count an 8x8 block's end-of-block position needs.
-pub static EOB_PT_64: [[[u16; 9]; 2]; 2] = [
-    [
-        [2500, 8000, 14000, 19000, 23500, 27000, 29800, 31600, 32768],
-        [4000, 10500, 16500, 21500, 25500, 28500, 30800, 32100, 32768],
-    ],
-    [
-        [2200, 7300, 13200, 18200, 22800, 26500, 29500, 31500, 32768],
-        [3600, 9800, 15600, 20700, 25000, 28200, 30600, 32000, 32768],
-    ],
-];
-
-/// Generates the "up-right diagonal" scan order (spec §9.2's `Default_Scan`
-/// construction) for a `size x size` (4 or 8) transform block: positions
-/// are grouped by anti-diagonal `row + col`, each diagonal visited in row-
-/// ascending order when `row + col` is odd and row-descending order when it
-/// is even. Reproduces [`DEFAULT_SCAN_4X4`] exactly at `size == 4` (checked
-/// by this module's tests).
-pub fn up_right_diagonal_scan(size: usize) -> Vec<usize> {
-    let mut scan = Vec::with_capacity(size * size);
-    for diagonal in 0..(2 * size - 1) {
-        let row_start = diagonal.saturating_sub(size - 1);
-        let row_end = diagonal.min(size - 1);
-        let rows: Box<dyn Iterator<Item = usize>> = if diagonal % 2 == 1 {
-            Box::new(row_start..=row_end)
-        } else {
-            Box::new((row_start..=row_end).rev())
-        };
-        for row in rows {
-            let col = diagonal - row;
-            scan.push(row * size + col);
-        }
-    }
-    scan
-}
-
-// --- Inter-frame mode/reference/motion-vector CDFs, fixed context 0 only. ---
-
-/// `Default_Is_Inter_Cdf[0]`: is the block inter- or intra-predicted.
-pub static IS_INTER: [u16; 2] = [806, 32768];
-
-/// `Default_Comp_Mode_Cdf[1]`: no-neighbour single versus compound prediction.
-pub static COMP_MODE: [u16; 2] = [24035, 32768];
-
-/// `Default_Comp_Ref_Type_Cdf[2]`: no-neighbour compound direction type.
-pub static COMP_REF_TYPE: [u16; 2] = [9166, 32768];
-
-/// `Default_Uni_Comp_Ref_Cdf[1][0]`: no-neighbour forward versus backward pair.
-pub static UNI_COMP_REF: [u16; 2] = [23152, 32768];
-
-/// `Default_Uni_Comp_Ref_Cdf[1][1]`: no-neighbour LAST/LAST2 selection.
-pub static UNI_COMP_REF_P1: [u16; 2] = [14173, 32768];
-
-/// `Default_Compound_Mode_Cdf[0]`: compound motion-vector mode.
-pub static COMPOUND_MODE: [u16; 8] = [7760, 13823, 15808, 17641, 19156, 20666, 26891, 32768];
-
-/// `Default_Single_Ref_Cdf[1][0]`: no-neighbour `single_ref_p1`.
-pub static SINGLE_REF_P1: [u16; 2] = [16973, 32768];
-
-/// `Default_Single_Ref_Cdf[0][2]`: LAST/LAST2 versus LAST3/GOLDEN.
-pub static SINGLE_REF_P3: [u16; 2] = [19647, 32768];
-
-/// `Default_Single_Ref_Cdf[0][3]`: LAST versus LAST2.
-pub static SINGLE_REF_P4: [u16; 2] = [24773, 32768];
-
-/// `Default_New_Mv_Cdf[0]`: `new_mv` flag (0 selects `NEWMV`).
-pub static NEW_MV: [u16; 2] = [24035, 32768];
-
-/// `Default_Zero_Mv_Cdf[0]`: `zero_mv` flag (0 selects `GLOBALMV`) once `new_mv` is 1.
-pub static ZERO_MV: [u16; 2] = [2175, 32768];
-
-/// `Default_Ref_Mv_Cdf[0]`: nearest versus near motion-vector prediction.
-pub static REF_MV: [u16; 2] = [23974, 32768];
-
-/// `Default_Mv_Joint_Cdf`: which of the two motion-vector components change.
-pub static MV_JOINT: [u16; 4] = [4096, 11264, 19328, 32768];
-
-/// `Default_Mv_Class_Cdf[comp]`: motion-vector class per component (row 0, col 1).
-pub static MV_CLASS: [[u16; 11]; 2] = [
-    [
-        28672, 30976, 31858, 32320, 32551, 32656, 32740, 32757, 32762, 32767, 32768,
-    ],
-    [
-        28672, 30976, 31858, 32320, 32551, 32656, 32740, 32757, 32762, 32767, 32768,
-    ],
-];
-
-/// `Default_Mv_Class0_Bit_Cdf[comp]`: MV_CLASS_0 integer bit.
-pub static MV_CLASS0_BIT: [u16; 2] = [27648, 32768];
-
-/// `Default_Mv_Class0_Fr_Cdf[comp]`: MV_CLASS_0 fractional part.
-pub static MV_CLASS0_FR: [[u16; 4]; 2] =
-    [[16384, 24576, 26624, 32768], [16384, 24576, 26624, 32768]];
-
-/// `Default_Mv_Sign_Cdf[comp]`: motion-vector component sign.
-pub static MV_SIGN: [u16; 2] = [16384, 32768];
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn up_right_diagonal_scan_matches_the_known_4x4_table() {
-        assert_eq!(up_right_diagonal_scan(4), DEFAULT_SCAN_4X4.to_vec());
-    }
-
-    #[test]
-    fn up_right_diagonal_scan_8x8_is_a_permutation_of_all_positions() {
-        let scan = up_right_diagonal_scan(8);
-        assert_eq!(scan.len(), 64);
-        let mut sorted = scan.clone();
-        sorted.sort_unstable();
-        assert_eq!(sorted, (0..64).collect::<Vec<_>>());
-    }
-}
