@@ -381,7 +381,9 @@ impl ExactFrameReader {
         // requires a reset is when the frame was already published once and evicted from the
         // cache, since a decoder must never be asked to emit the same presentation frame twice
         // without an intervening reset (see `publish`).
-        let can_reuse = self.next_decode_position.is_some_and(|position| position >= random_access_position)
+        let can_reuse = self
+            .next_decode_position
+            .is_some_and(|position| position >= random_access_position)
             && !self.published_since_reset.contains(&presentation_index);
         if !can_reuse {
             self.decoder.reset()?;
