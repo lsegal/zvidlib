@@ -8,7 +8,8 @@ use zvidlib::{
     FrameSource, HardwarePreference, Limits, Orientation, PixelFormat, Plane, Result, VideoDecoder,
     VideoDecoderConfig, VideoDecoderFactory, VideoDimensions, VideoEncoderConfig,
     VideoEncoderConformanceVector, VideoEncoderFactory, VideoFrame,
-    native_av1_video_encoder_factory, verify_video_encoder_conformance,
+    native_av1_video_decoder_factory, native_av1_video_encoder_factory,
+    verify_video_encoder_conformance,
 };
 
 fn block_on<T>(future: impl Future<Output = T>) -> T {
@@ -303,4 +304,115 @@ fn native_av1_passes_the_shared_encoder_conformance_runner() {
     assert_eq!(report.frames_encoded, 3);
     assert_eq!(report.packets_emitted, 3);
     assert!(report.minimum_observed_psnr_db.is_infinite());
+}
+
+/// Round-trips the native AV1 encoder's output through the native AV1
+/// decoder directly, with no external tooling involved on either side of the
+/// codec. `verify_video_encoder_conformance`'s shared PSNR check requires
+/// the reference and decoded frames to share a pixel format, but the native
+/// decoder always produces `Rgba8`; this test decodes with
+/// `native_av1_video_decoder_factory` directly and compares against the
+/// exact RGBA value a `Gray8` sample maps to under full-range BT.601 with
+/// neutral (monochrome) chroma: `(y, y, y, 255)` for every pixel (see the
+/// `convert_to_rgba8` derivation in `src/av1_filters.rs`, where a neutral
+/// chroma sample makes R, G, and B all equal to the luma sample regardless
+/// of the matrix coefficients).
+#[test]
+fn native_av1_round_trips_through_the_native_decoder() {
+    let limits = Limits::default();
+    let dimensions = VideoDimensions::new(17, 9, &limits).unwrap();
+    let encoder_configuration = VideoEncoderConfig {
+        codec: Codec::Av1,
+        profile: CodecProfile::Av1Main,
+        coded_dimensions: dimensions,
+        input_format: PixelFormat::Gray8,
+        color_range: ColorRange::Full,
+        hardware: HardwarePreference::Avoid,
+        timescale: 30,
+        frame_duration: 1,
+        configuration: Vec::new(),
+    };
+    let mut encoder = native_av1_video_encoder_factory()
+        .create(&encoder_configuration, &limits)
+        .unwrap();
+
+    let mut expected_pixels = Vec::new();
+    let mut packets = Vec::new();
+    for index in 0..3_u64 {
+        let pixels = (0..dimensions.height)
+            .flat_map(|y| {
+                (0..dimensions.width)
+                    .map(move |x| ((x * 23 + y * 37 + index as u32 * 41) & 0xff) as u8)
+            })
+            .collect::<Vec<_>>();
+        expected_pixels.push(pixels.clone());
+        let frame = VideoFrame::new(
+            dimensions,
+            PixelFormat::Gray8,
+            ColorRange::Full,
+            vec![Plane {
+                data: pixels,
+                stride: dimensions.width as usize,
+            }],
+            &limits,
+        )
+        .unwrap();
+        packets.extend(
+            block_on(encoder.encode(
+                FrameIndex(index),
+                FrameSource::Cpu(CpuFrameSource {
+                    frame: &frame,
+                    orientation: Orientation::TopLeft,
+                }),
+            ))
+            .unwrap(),
+        );
+    }
+    packets.extend(block_on(encoder.finish()).unwrap());
+    assert_eq!(packets.len(), 3);
+    let decoder_config = encoder.config().decoder_config.clone();
+
+    let decoder_configuration = VideoDecoderConfig {
+        codec: Codec::Av1,
+        profile: CodecProfile::Av1Main,
+        coded_dimensions: dimensions,
+        output_format: PixelFormat::Rgba8,
+        color_range: ColorRange::Full,
+        hardware: HardwarePreference::Avoid,
+        configuration: decoder_config,
+    };
+    let mut decoder = native_av1_video_decoder_factory()
+        .create(&decoder_configuration, &limits)
+        .unwrap();
+    let cancellation = CancellationToken::new();
+    let mut decoded: Vec<DecodedVideoFrame> = Vec::new();
+    for (index, packet) in packets.iter().enumerate() {
+        let sample = EncodedVideoSample {
+            presentation_index: FrameIndex(index as u64),
+            random_access: packet.is_sync,
+            data: packet.data.clone(),
+        };
+        decoded.extend(decoder.submit(&sample, &cancellation).unwrap());
+    }
+    decoded.extend(decoder.drain(&cancellation).unwrap());
+    assert_eq!(decoded.len(), 3);
+    decoded.sort_by_key(|frame| frame.presentation_index.0);
+
+    for (index, frame) in decoded.iter().enumerate() {
+        assert_eq!(frame.presentation_index, FrameIndex(index as u64));
+        assert_eq!(frame.frame.pixel_format, PixelFormat::Rgba8);
+        let plane = &frame.frame.planes[0];
+        let source = &expected_pixels[index];
+        for y in 0..dimensions.height as usize {
+            for x in 0..dimensions.width as usize {
+                let luma = source[y * dimensions.width as usize + x];
+                let offset = y * plane.stride + x * 4;
+                assert_eq!(
+                    &plane.data[offset..offset + 4],
+                    [luma, luma, luma, 255],
+                    "frame {index} pixel ({x}, {y}) did not round-trip losslessly"
+                );
+            }
+        }
+    }
 }

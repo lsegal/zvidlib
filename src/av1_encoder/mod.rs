@@ -342,6 +342,7 @@ impl NativeAv1Encoder {
             self.format.dimensions.width,
             self.format.dimensions.height,
         );
+        let order_hint = (index.0 % u64::from(1u32 << headers::ORDER_HINT_BITS)) as u32;
         let mut frame_payload = headers::frame_header_payload(
             self.format.dimensions.width,
             self.format.dimensions.height,
@@ -349,6 +350,7 @@ impl NativeAv1Encoder {
                 .map_err(|_| Error::new(ErrorKind::ResourceLimit, "AV1 MI width overflow"))?,
             u32::try_from(mi_rows)
                 .map_err(|_| Error::new(ErrorKind::ResourceLimit, "AV1 MI height overflow"))?,
+            order_hint,
         );
         frame_payload.extend_from_slice(&FrameEncoder::new(&packed, width, height).encode());
         let data = headers::assemble_temporal_unit(&sequence, &frame_payload);

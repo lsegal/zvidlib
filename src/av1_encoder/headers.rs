@@ -1,5 +1,12 @@
-//! AV1 OBU framing (§5.3, Annex B), the reduced-still-picture sequence header (§5.5), and the
-//! lossless intra-keyframe uncompressed frame header (§5.9.2), specialised to the M0 config.
+//! AV1 OBU framing (§5.3, Annex B), the non-reduced sequence header (§5.5), and the lossless
+//! intra-keyframe uncompressed frame header (§5.9.2), specialised to the M0 config.
+//!
+//! The sequence header is non-reduced with `enable_order_hint = 1` and every other optional tool
+//! disabled, matching the bounded subset [`crate::av1_inter_decoder::Av1InterDecoder`] accepts
+//! (see its `check_sequence_support`), so every native-encoded stream is native-decodable without
+//! sacrificing anything this backend actually emits: a still-picture reduced header carries no
+//! information this encoder needs, and only the independent, spec-compliant decoder gains from
+//! order hints being present.
 
 // Adapted and modified from gamut, Copyright (c) 2026 Justin Chung, MIT licensed.
 use super::bitwriter::BitWriter;
@@ -10,6 +17,10 @@ use crate::{Error, ErrorKind, Result};
 const OBU_SEQUENCE_HEADER: u8 = 1;
 /// `OBU_FRAME` (frame header + tile group in one OBU).
 pub(crate) const OBU_FRAME: u8 = 6;
+/// `order_hint_bits_minus_1 + 1`: enough range for any reasonable seek distance while every
+/// frame stays an independent key frame (`refresh_frame_flags` is always implied `0xff`, so the
+/// actual order-hint value never affects reference selection).
+pub(crate) const ORDER_HINT_BITS: u32 = 3;
 
 /// The sequence-header field values that `gamut-avif` must mirror into `av1C` and `colr`
 /// (AV1-ISOBMFF v1.3.0 §2.3.4). Fixed by the M0 config except `seq_level_idx_0`, which depends on
@@ -102,14 +113,26 @@ pub(crate) fn write_obu(out: &mut Vec<u8>, obu_type: u8, payload: &[u8]) {
     out.extend_from_slice(payload);
 }
 
-/// Builds the sequence-header OBU payload for a reduced still picture, profile 0,
-/// 8-bit monochrome stream, terminated with `trailing_bits` (AV1 §5.2, §5.3.4).
+/// Builds the sequence-header OBU payload for a non-reduced, profile 0, 8-bit monochrome
+/// stream with `enable_order_hint = 1` and one operating point, terminated with `trailing_bits`
+/// (AV1 §5.2, §5.3.4). Non-reduced (rather than a reduced still-picture header) is required so
+/// [`crate::av1_inter_decoder::Av1InterDecoder`] can decode this encoder's own output natively —
+/// see the module documentation.
 pub(crate) fn sequence_header_payload(cfg: &Av1StillConfig, width: u32, height: u32) -> Vec<u8> {
     let mut w = BitWriter::new();
     w.put_bits(u32::from(cfg.seq_profile), 3); // seq_profile
-    w.put_bit(1); // still_picture
-    w.put_bit(1); // reduced_still_picture_header
+    w.put_bit(0); // still_picture
+    w.put_bit(0); // reduced_still_picture_header
+    w.put_bit(0); // timing_info_present_flag
+    w.put_bit(0); // initial_display_delay_present_flag
+    w.put_bits(0, 5); // operating_points_cnt_minus_1 = 0 (one operating point)
+    w.put_bits(0, 12); // operating_point_idc[0]
     w.put_bits(u32::from(cfg.seq_level_idx_0), 5); // seq_level_idx[0]
+    if cfg.seq_level_idx_0 > 7 {
+        w.put_bits(u32::from(cfg.seq_tier_0), 1); // seq_tier[0]
+    }
+    // decoder_model_info_present_flag and initial_display_delay_present_flag are both false, so
+    // no per-operating-point model/delay bits follow.
 
     let wbits = dimension_bits(width);
     let hbits = dimension_bits(height);
@@ -117,10 +140,22 @@ pub(crate) fn sequence_header_payload(cfg: &Av1StillConfig, width: u32, height: 
     w.put_bits(hbits - 1, 4); // frame_height_bits_minus_1
     w.put_bits(width - 1, wbits); // max_frame_width_minus_1
     w.put_bits(height - 1, hbits); // max_frame_height_minus_1
-    // frame_id_numbers_present_flag = 0 (reduced)
+    w.put_bit(0); // frame_id_numbers_present_flag = 0
     w.put_bit(0); // use_128x128_superblock = 0
     w.put_bit(0); // enable_filter_intra = 0
     w.put_bit(0); // enable_intra_edge_filter = 0
+    w.put_bit(0); // enable_interintra_compound = 0
+    w.put_bit(0); // enable_masked_compound = 0
+    w.put_bit(0); // enable_warped_motion = 0
+    w.put_bit(0); // enable_dual_filter = 0
+    w.put_bit(1); // enable_order_hint = 1
+    w.put_bit(0); // enable_jnt_comp = 0
+    w.put_bit(0); // enable_ref_frame_mvs = 0
+    w.put_bit(0); // seq_choose_screen_content_tools = 0
+    w.put_bit(0); // seq_force_screen_content_tools = 0
+    // seq_force_screen_content_tools == 0 ⇒ seq_force_integer_mv is fixed at
+    // SELECT_INTEGER_MV (2) with no bits read.
+    w.put_bits(ORDER_HINT_BITS - 1, 3); // order_hint_bits_minus_1
     w.put_bit(0); // enable_superres = 0
     w.put_bit(0); // enable_cdef = 0
     w.put_bit(0); // enable_restoration = 0
@@ -142,21 +177,37 @@ pub(crate) fn sequence_header_payload(cfg: &Av1StillConfig, width: u32, height: 
     w.into_bytes()
 }
 
-/// Builds the uncompressed frame header for the lossless intra keyframe (AV1 §5.9.2), byte-aligned
+/// Builds the uncompressed frame header for a lossless intra keyframe (AV1 §5.9.2), byte-aligned
 /// (`byte_alignment`, no trailing one — the tile data follows in the same `OBU_FRAME`).
+///
+/// `order_hint` is the frame's `order_hint` field value (taken mod `2^ORDER_HINT_BITS` by the
+/// caller); every frame is an independent shown key frame, so the actual value never affects
+/// decoding, but a real, incrementing value keeps the stream honest about frame order.
 ///
 /// The returned bytes precede the tile (symbol-coded) data; together they form the frame OBU
 /// payload (AV1 §5.10).
-pub(crate) fn frame_header_payload(width: u32, height: u32, mi_cols: u32, mi_rows: u32) -> Vec<u8> {
+pub(crate) fn frame_header_payload(
+    width: u32,
+    height: u32,
+    mi_cols: u32,
+    mi_rows: u32,
+    order_hint: u32,
+) -> Vec<u8> {
     let mut w = BitWriter::new();
-    // reduced_still_picture_header ⇒ KEY_FRAME, show_frame=1, FrameIsIntra=1 (no bits).
+    w.put_bit(0); // show_existing_frame = 0
+    w.put_bits(0, 2); // frame_type = KEY_FRAME
+    w.put_bit(1); // show_frame = 1
+    // error_resilient_mode is implied true for a shown key frame ⇒ no bit.
     w.put_bit(1); // disable_cdf_update = 1
-    w.put_bit(0); // allow_screen_content_tools = 0
-    // force_integer_mv inferred; frame_size_override_flag=0; order_hint f(0); primary_ref_frame
-    // inferred; refresh_frame_flags inferred — all no bits.
+    // seq_force_screen_content_tools = 0 (explicit, non-reduced) ⇒ allow_screen_content_tools is
+    // implied 0 with no bit; FrameIsIntra then forces force_integer_mv = 1, also with no bit.
+    w.put_bit(0); // frame_size_override_flag = 0
+    w.put_bits(order_hint, ORDER_HINT_BITS); // order_hint
+    // primary_ref_frame is implied PRIMARY_REF_NONE for an intra frame; refresh_frame_flags is
+    // implied 0xff for a shown key frame — neither reads bits.
     // frame_size(): no override ⇒ from seq header; superres disabled. render_size():
     w.put_bit(0); // render_and_frame_size_different = 0
-    // disable_frame_end_update_cdf inferred 1.
+    // disable_frame_end_update_cdf is implied 1 because disable_cdf_update = 1.
 
     // tile_info(): single tile. Emit increment-stop bits only where the level/size permit > 0 tiles.
     let _ = (width, height);
