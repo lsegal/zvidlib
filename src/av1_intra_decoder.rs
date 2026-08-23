@@ -382,7 +382,7 @@ impl<'a> LosslessTileDecoder<'a> {
             left_level: vec![0; mi_rows],
             left_dc: vec![0; mi_rows],
             mi_bsl: vec![0; contexts],
-            tx_sizes: TxSizeGrid::new(coded_width, coded_height),
+            tx_sizes: TxSizeGrid::new(width, height),
             decoded_blocks: 0,
             max_blocks: limits.max_av1_blocks_per_frame,
         })
