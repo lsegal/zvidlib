@@ -35,7 +35,7 @@
 //! - CDEF direction search uses the standard eight-direction partial-sum
 //!   cost search, but the exact reference constants tables
 //!   (`cdef_directions`) are reproduced from the widely published reference
-//!   decoder tables; see the comment above [`CDEF_DIRECTIONS`].
+//!   decoder tables; see the comment above the `CDEF_DIRECTIONS` constant.
 //! - Film grain substitutes a direct linear mapping of the spec's 11-bit
 //!   LFSR output for the reference `Gaussian_Sequence` 2048-entry lookup
 //!   table (§7.18.3.3), which is not reproduced verbatim here. The LFSR
