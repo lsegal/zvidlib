@@ -1213,11 +1213,9 @@ impl<'a> InterTileDecoder<'a> {
             let prediction = self.dc_prediction_sized(x, y, tx_width);
             for row in 0..tx_width {
                 for column in 0..tx_width {
-                    self.pixels[(y + row) * self.coded_width + x + column] = (i16::from(
-                        prediction,
-                    )
-                        + residuals[row * tx_width + column])
-                        .clamp(0, 255) as u8;
+                    self.pixels[(y + row) * self.coded_width + x + column] =
+                        (i16::from(prediction) + residuals[row * tx_width + column]).clamp(0, 255)
+                            as u8;
                 }
             }
         }
@@ -1337,7 +1335,9 @@ impl<'a> InterTileDecoder<'a> {
             (1usize << (eob_point - 2)) + 1 + extra
         };
         if eob == 0 || eob > count {
-            return Err(malformed("AV1 coefficient EOB is outside the transform block"));
+            return Err(malformed(
+                "AV1 coefficient EOB is outside the transform block",
+            ));
         }
         let mut levels = vec![0i32; count];
         for coefficient in (0..eob).rev() {
@@ -2544,9 +2544,10 @@ mod tests {
         let tile_offset = bits.position() / 8;
         let tile = &payload[tile_offset..];
         let refs: [Option<RefSlot>; NUM_REF_FRAMES] = Default::default();
-        let mut tile_decoder =
-            InterTileDecoder::new(tile, width, height, mi_cols, mi_rows, &header, &refs, &limits)
-                .unwrap();
+        let mut tile_decoder = InterTileDecoder::new(
+            tile, width, height, mi_cols, mi_rows, &header, &refs, &limits,
+        )
+        .unwrap();
         let unfiltered_luma = tile_decoder.decode().unwrap();
         let tx_sizes = tile_decoder.tx_sizes;
 
