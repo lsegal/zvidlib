@@ -43,7 +43,7 @@ fn native_hevc_decoder_conforms_for_sequential_reverse_and_alternating_seeks() {
         VideoDecoderConfig {
             codec: Codec::Hevc,
             profile: CodecProfile::HevcMain,
-            coded_dimensions: VideoDimensions::new(320, 180, &limits).unwrap(),
+            coded_dimensions: VideoDimensions::new(1920, 1080, &limits).unwrap(),
             output_format: PixelFormat::Rgba8,
             color_range: ColorRange::Limited,
             hardware: HardwarePreference::Avoid,
@@ -52,8 +52,8 @@ fn native_hevc_decoder_conforms_for_sequential_reverse_and_alternating_seeks() {
         &expected,
     ))
     .unwrap();
-    assert_eq!(vector.samples.len(), 120);
-    assert_eq!(vector.expected_frames.len(), 120);
+    assert_eq!(vector.samples.len(), 768);
+    assert_eq!(vector.expected_frames.len(), 768);
     assert_eq!(vector.samples[0].presentation_index.0, 0);
     assert!(vector.samples[0].random_access);
     assert!(!vector.configuration.configuration.is_empty());
@@ -61,7 +61,7 @@ fn native_hevc_decoder_conforms_for_sequential_reverse_and_alternating_seeks() {
     let report =
         verify_video_decoder_conformance(&native_hevc_video_decoder_factory(), &vector, limits)
             .unwrap();
-    assert_eq!(report.frames_verified, 360);
+    assert_eq!(report.frames_verified, 2304);
     assert_eq!(report.access_patterns_verified, 3);
 
     let factory = native_hevc_video_decoder_factory();

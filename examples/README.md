@@ -1,9 +1,9 @@
 # Examples
 
-These examples demonstrate zvidlib's currently implemented API against a real MP4 sample: a short,
-re-encoded clip of the CC-BY-licensed [Big Buck Bunny](https://peach.blender.org/) film by the
-Blender Foundation. The clip is checked into the repo at `examples/media/BigBuckBunny.mp4`
-(trimmed to a few seconds and re-encoded small so it's cheap to keep in git), so no manual
+These examples demonstrate zvidlib's currently implemented API against a real MP4 sample: a
+1080p, 32-second, re-encoded clip of the CC-BY-licensed [Big Buck Bunny](https://peach.blender.org/)
+film by the Blender Foundation. The clip is checked into the repo at
+`examples/media/BigBuckBunny.mp4` (re-encoded small so it's cheap to keep in git), so no manual
 download is needed before running either example. `examples/web_canvas/BigBuckBunny.mp4` is a
 symlink to that same file so both examples share one copy.
 

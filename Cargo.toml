@@ -64,7 +64,7 @@ winit = "0.30.13"
 
 # The native HEVC/AV1 decoders are pure-Rust software codecs with no fast path at opt-level 0;
 # an unoptimized debug build cannot keep up with the sample video's real-time frame rate (measured
-# well under 24 FPS for a 320x180 clip), so the `native_gl` example stutters even though the
+# well under 24 FPS for the sample's 1080p clip), so the `native_gl` example stutters even though the
 # decoder itself is fast once optimized. opt-level 2 keeps debug assertions and fast incremental
 # compiles while getting real-time decode throughput without requiring `--release`.
 [profile.dev]

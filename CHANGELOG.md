@@ -4,6 +4,7 @@ All notable changes to zvidlib will be documented in this file.
 
 ## Unreleased
 
+- Replace the bundled `examples/media/BigBuckBunny.mp4` sample (320x180, 5s) with a 1920x1080, 32-second clip so the examples exercise the native HEVC decoder at a realistic resolution and duration; regenerated the checked-in conformance fixture (`tests/fixtures/codec/big_buck_bunny_hevc_rgba.sha256`) against the new clip.
 - Update `README.md` and `ARCHITECTURE.md` to describe the native HEVC and AV1 decode/encode backends (`native_hevc_video_decoder_factory`, `native_hevc_video_encoder_factory`, `native_av1_video_decoder_factory`, `native_av1_video_encoder_factory`) that now exist, instead of listing native AV1 and HEVC encoding as still-planned work.
 
 - Add non-lossless (`base_q_idx != 0`) AV1 inter-frame decoding to the production decoder registered via `native_av1_video_decoder_factory`: per-block `TX_4X4`/`TX_8X8` transform-size and `DCT_DCT`/`IDTX` transform-type signaling, spec §7.12 dequantization, real inverse DCT/identity transforms, `loop_filter_params` parsing, and end-to-end deblocking of the reconstructed frame using the decoded per-block transform sizes, bringing the production decode path in line with the non-lossless support already available in `decode_av1_lossless_intra_with_tx_sizes`.
