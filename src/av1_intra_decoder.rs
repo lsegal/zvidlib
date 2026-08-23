@@ -29,8 +29,7 @@ use crate::av1_filters::{FilterFrame, FilterPlane, LoopFilterParams, TxSizeGrid,
 use crate::av1_intra::{Av1TxType, get_ac_quant, get_dc_quant, inverse_transform};
 use crate::{
     Av1FrameType, Av1IntraFrame, Av1Obu, Av1ObuType, Av1Parser, Av1SymbolDecoder, Av1SyntaxSupport,
-    ColorRange, Error, ErrorKind, Limits, Result, TxSizeGrid, VideoDimensions, VideoFrame,
-    inverse_wht_4x4,
+    ColorRange, Error, ErrorKind, Limits, Result, VideoDimensions, VideoFrame, inverse_wht_4x4,
 };
 
 const NUM_BASE_LEVELS: i32 = 2;
@@ -334,7 +333,6 @@ struct LosslessTileDecoder<'a> {
     tx_sizes: TxSizeGrid,
     decoded_blocks: u32,
     max_blocks: u32,
-    tx_sizes: TxSizeGrid,
 }
 
 impl<'a> LosslessTileDecoder<'a> {
@@ -384,10 +382,9 @@ impl<'a> LosslessTileDecoder<'a> {
             left_level: vec![0; mi_rows],
             left_dc: vec![0; mi_rows],
             mi_bsl: vec![0; contexts],
-            tx_sizes: TxSizeGrid::new(coded_width, coded_height),
+            tx_sizes: TxSizeGrid::new(width, height),
             decoded_blocks: 0,
             max_blocks: limits.max_av1_blocks_per_frame,
-            tx_sizes: TxSizeGrid::new(width, height),
         })
     }
 
