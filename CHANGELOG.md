@@ -4,6 +4,7 @@ All notable changes to zvidlib will be documented in this file.
 
 ## Unreleased
 
+- Replace the bundled `examples/media/BigBuckBunny.mp4` sample (320x180, 5s) with a 1920x1080, 32-second clip so the examples exercise the native HEVC decoder at a realistic resolution and duration; regenerated the checked-in conformance fixture (`tests/fixtures/codec/big_buck_bunny_hevc_rgba.sha256`) against the new clip.
 - Fix the `native_gl` example stretching the decoded video to fill the whole window instead of preserving its aspect ratio, and set `opt-level = 2` for the crate's `dev` profile so the pure-Rust HEVC decoder used by the example sustains the sample video's real-time frame rate without requiring `cargo run --release`.
 - Add a dependency-free native lossless monochrome AV1 Main-profile encoder with standardized OBU access units and `av1C`, exact configurable timescale/frame-duration metadata, strict format/rate/resource validation, and independent native-to-native and FFmpeg round-trip conformance coverage.
 - Add non-lossless (`base_q_idx != 0`) AV1 intra-frame decoding to `decode_av1_lossless_intra`/the new `decode_av1_lossless_intra_with_tx_sizes`: per-block `TX_4X4`/`TX_8X8` transform-size and `DCT_DCT`/`IDTX` transform-type signaling, spec §7.12 dequantization, real inverse DCT/identity transforms, `loop_filter_params` parsing, and end-to-end deblocking of the reconstructed frame using the decoded per-block transform sizes.

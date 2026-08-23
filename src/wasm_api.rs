@@ -1132,7 +1132,7 @@ mod tests {
     #[wasm_bindgen_test(async)]
     async fn video_get_decodes_the_last_frame_of_a_sparse_keyframe_gop() {
         const SAMPLE: &[u8] = include_bytes!("../examples/media/BigBuckBunny.mp4");
-        const LAST_FRAME_INDEX: u64 = 119;
+        const LAST_FRAME_INDEX: u64 = 767;
         let bytes = Uint8Array::from(SAMPLE);
         let input =
             WasmMediaInput::open_inner(bytes.into(), Limits::default().max_allocation_bytes, None)
@@ -1156,14 +1156,14 @@ mod tests {
     }
 
     /// Regression test for issue #38: `BigBuckBunny.mp4` has a single key
-    /// frame followed by ~120 delta frames, so decoding a frame this deep
+    /// frame followed by ~768 delta frames, so decoding a frame this deep
     /// into the GOP used to exceed the old 12-frame WebCodecs batch cap and
     /// fail with `ResourceLimit` even though it was well within
     /// `Limits::max_decode_samples_per_seek`.
     #[wasm_bindgen_test(async)]
     async fn video_get_decodes_deep_into_a_sparse_keyframe_gop() {
         const SAMPLE: &[u8] = include_bytes!("../examples/media/BigBuckBunny.mp4");
-        const DEEP_FRAME_INDEX: u64 = 60;
+        const DEEP_FRAME_INDEX: u64 = 400;
         let bytes = Uint8Array::from(SAMPLE);
         let input =
             WasmMediaInput::open_inner(bytes.into(), Limits::default().max_allocation_bytes, None)
