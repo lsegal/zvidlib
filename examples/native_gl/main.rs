@@ -266,7 +266,10 @@ impl App {
             }
             Ok(None) => {}
             Err(()) => {
-                return self.fail(event_loop, invalid("the decode thread stopped unexpectedly"));
+                return self.fail(
+                    event_loop,
+                    invalid("the decode thread stopped unexpectedly"),
+                );
             }
         }
 
