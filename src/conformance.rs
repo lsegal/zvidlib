@@ -858,7 +858,7 @@ mod tests {
                 input_format: PixelFormat::Gray8,
                 color_range: ColorRange::Full,
                 hardware: HardwarePreference::Avoid,
-                timescale: 30,
+                timescale: 1,
                 frame_duration: 1,
                 configuration: Vec::new(),
             },

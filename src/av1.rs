@@ -1,7 +1,11 @@
 //! Bounded AV1 low-overhead bitstream and configuration parsing.
 //!
-//! This module intentionally provides syntax/state only. It does not implement
-//! pixel reconstruction and is not registered as a [`VideoDecoderFactory`](crate::VideoDecoderFactory).
+//! This module intentionally provides syntax/state only; it does not
+//! implement pixel reconstruction. Pixel reconstruction lives in
+//! [`crate::av1_intra_decoder`] and [`crate::av1_inter_decoder`], and the
+//! registered [`VideoDecoderFactory`](crate::VideoDecoderFactory) that wires
+//! them together lives in `crate::av1_decoder`
+//! ([`native_av1_video_decoder_factory`](crate::native_av1_video_decoder_factory)).
 
 use crate::{Error, ErrorKind, Limits, Result};
 
@@ -90,7 +94,13 @@ pub struct Av1SequenceHeader {
     pub frame_id_numbers_present: bool,
     pub delta_frame_id_length: u8,
     pub additional_frame_id_length: u8,
+    pub enable_interintra_compound: bool,
+    pub enable_masked_compound: bool,
+    pub enable_warped_motion: bool,
+    pub enable_dual_filter: bool,
     pub enable_order_hint: bool,
+    pub enable_jnt_comp: bool,
+    pub enable_ref_frame_mvs: bool,
     pub order_hint_bits: u8,
     pub seq_force_screen_content_tools: u8,
     pub seq_force_integer_mv: u8,
@@ -311,6 +321,14 @@ impl Av1Parser {
             frame: None,
             seen_frame_header: false,
         })
+    }
+
+    /// Seeds the parser with a sequence header retained by a stateful
+    /// decoder. Low-overhead temporal units are not required to repeat the
+    /// sequence header before every frame, so callers decoding a sequence of
+    /// temporal units must carry this state across parser instances.
+    pub(crate) fn set_sequence(&mut self, sequence: Av1SequenceHeader) {
+        self.sequence = Some(sequence);
     }
 
     /// Parses one low-overhead AV1 byte stream. Every OBU must carry a leb128 size.
@@ -694,36 +712,62 @@ fn parse_sequence_header(payload: &[u8], limits: &Limits) -> Result<Av1SequenceH
     let _use_128x128_superblock = b.flag("use_128x128_superblock")?;
     let _enable_filter_intra = b.flag("enable_filter_intra")?;
     let _enable_intra_edge_filter = b.flag("enable_intra_edge_filter")?;
-    let (enable_order_hint, seq_force_screen_content_tools, seq_force_integer_mv, order_hint_bits) =
-        if reduced {
-            (false, 2, 2, 0)
+    let (
+        enable_interintra_compound,
+        enable_masked_compound,
+        enable_warped_motion,
+        enable_dual_filter,
+        enable_order_hint,
+        enable_jnt_comp,
+        enable_ref_frame_mvs,
+        seq_force_screen_content_tools,
+        seq_force_integer_mv,
+        order_hint_bits,
+    ) = if reduced {
+        (false, false, false, false, false, false, false, 2, 2, 0)
+    } else {
+        let enable_interintra_compound = b.flag("enable_interintra_compound")?;
+        let enable_masked_compound = b.flag("enable_masked_compound")?;
+        let enable_warped_motion = b.flag("enable_warped_motion")?;
+        let enable_dual_filter = b.flag("enable_dual_filter")?;
+        let enable_order_hint = b.flag("enable_order_hint")?;
+        let (enable_jnt_comp, enable_ref_frame_mvs) = if enable_order_hint {
+            (b.flag("enable_jnt_comp")?, b.flag("enable_ref_frame_mvs")?)
         } else {
-            b.skip(4, "inter prediction feature flags")?;
-            let enable_order_hint = b.flag("enable_order_hint")?;
-            if enable_order_hint {
-                b.skip(2, "order hint feature flags")?;
-            }
-            let screen = if b.flag("seq_choose_screen_content_tools")? {
-                2
-            } else {
-                u8::from(b.flag("seq_force_screen_content_tools")?)
-            };
-            let integer = if screen > 0 {
-                if b.flag("seq_choose_integer_mv")? {
-                    2
-                } else {
-                    u8::from(b.flag("seq_force_integer_mv")?)
-                }
-            } else {
-                2
-            };
-            let bits = if enable_order_hint {
-                b.u8(3, "order_hint_bits_minus_1")? + 1
-            } else {
-                0
-            };
-            (enable_order_hint, screen, integer, bits)
+            (false, false)
         };
+        let screen = if b.flag("seq_choose_screen_content_tools")? {
+            2
+        } else {
+            u8::from(b.flag("seq_force_screen_content_tools")?)
+        };
+        let integer = if screen > 0 {
+            if b.flag("seq_choose_integer_mv")? {
+                2
+            } else {
+                u8::from(b.flag("seq_force_integer_mv")?)
+            }
+        } else {
+            2
+        };
+        let bits = if enable_order_hint {
+            b.u8(3, "order_hint_bits_minus_1")? + 1
+        } else {
+            0
+        };
+        (
+            enable_interintra_compound,
+            enable_masked_compound,
+            enable_warped_motion,
+            enable_dual_filter,
+            enable_order_hint,
+            enable_jnt_comp,
+            enable_ref_frame_mvs,
+            screen,
+            integer,
+            bits,
+        )
+    };
     let enable_superres = b.flag("enable_superres")?;
     let enable_cdef = b.flag("enable_cdef")?;
     let enable_restoration = b.flag("enable_restoration")?;
@@ -743,7 +787,13 @@ fn parse_sequence_header(payload: &[u8], limits: &Limits) -> Result<Av1SequenceH
         frame_id_numbers_present,
         delta_frame_id_length,
         additional_frame_id_length,
+        enable_interintra_compound,
+        enable_masked_compound,
+        enable_warped_motion,
+        enable_dual_filter,
         enable_order_hint,
+        enable_jnt_comp,
+        enable_ref_frame_mvs,
         order_hint_bits,
         seq_force_screen_content_tools,
         seq_force_integer_mv,
