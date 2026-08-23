@@ -1647,6 +1647,87 @@ mod tests {
         assert!(deblock_frame(&mut frame, &params, None).is_ok());
     }
 
+    #[test]
+    fn filter_length_selection_follows_transform_size() {
+        // Every unit defaults to a 4x4 transform, so the narrow filter is
+        // selected until wider transforms are recorded on both sides.
+        let grid = TxSizeGrid::new(64, 64);
+        assert_eq!(filter_length_for_edge(&grid, 32, 0, true), 4);
+
+        // 16x16 transforms on both sides of the x=32 edge select the 8-tap
+        // filter (spec §7.14.5: perpendicular tx size >= 16).
+        let mut grid = TxSizeGrid::new(64, 64);
+        grid.set_block(16, 0, 16, 16);
+        grid.set_block(32, 0, 16, 16);
+        assert_eq!(filter_length_for_edge(&grid, 32, 0, true), 8);
+
+        // 32x32 transforms on both sides select the 14-tap filter.
+        let mut grid = TxSizeGrid::new(64, 64);
+        grid.set_block(0, 0, 32, 32);
+        grid.set_block(32, 0, 32, 32);
+        assert_eq!(filter_length_for_edge(&grid, 32, 0, true), 14);
+
+        // A narrow transform on just one side of the edge caps the filter
+        // length at 4, even though the other side is a 32x32 transform.
+        let mut grid = TxSizeGrid::new(64, 64);
+        grid.set_block(0, 0, 32, 32);
+        grid.set_block(32, 0, 4, 4);
+        assert_eq!(filter_length_for_edge(&grid, 32, 0, true), 4);
+
+        // Horizontal edges select on transform height, not width.
+        let mut grid = TxSizeGrid::new(64, 64);
+        grid.set_block(0, 16, 4, 32);
+        grid.set_block(0, 32, 4, 32);
+        assert_eq!(filter_length_for_edge(&grid, 0, 32, false), 14);
+    }
+
+    #[test]
+    fn wide_taper_filter_leaves_flat_input_unchanged() {
+        let taps = [50i32; 14];
+        assert!(wide_taper_filter(&taps).iter().all(|&v| v == 50));
+        let taps = [77i32; 8];
+        assert!(wide_taper_filter(&taps).iter().all(|&v| v == 77));
+    }
+
+    #[test]
+    fn deblock_with_wide_tx_sizes_smooths_further_from_the_edge_than_narrow() {
+        let l = limits();
+        let width = 32usize;
+        let height = 4usize;
+        let mut data = vec![100u8; width * height];
+        for y in 0..height {
+            for x in 16..width {
+                data[y * width + x] = 130;
+            }
+        }
+        let mut frame_narrow = FilterFrame::new_monochrome(
+            FilterPlane::from_samples(width, height, data.clone(), &l).unwrap(),
+        );
+        let mut frame_wide = FilterFrame::new_monochrome(
+            FilterPlane::from_samples(width, height, data, &l).unwrap(),
+        );
+        let params = LoopFilterParams {
+            y_vertical_level: 30,
+            y_horizontal_level: 0,
+            u_level: 0,
+            v_level: 0,
+            sharpness: 0,
+        };
+        deblock_frame(&mut frame_narrow, &params, None).unwrap();
+
+        let mut grid = TxSizeGrid::new(width, height);
+        grid.set_block(0, 0, 16, height);
+        grid.set_block(16, 0, 16, height);
+        deblock_frame(&mut frame_wide, &params, Some(&grid)).unwrap();
+
+        // The narrow filter only ever writes p1/p0/q0/q1 (x = 14..=17
+        // around the x=16 edge); x=13 (p2, one sample further out) is
+        // untouched by it but is within the 8-tap filter's reach, which
+        // the 16x16 transform sizes on both sides of the edge select.
+        assert_eq!(frame_narrow.y.get(13, 0), 100);
+        assert_ne!(frame_wide.y.get(13, 0), 100);
+    }
+
     // -- CDEF --------------------------------------------------------------
 
     #[test]

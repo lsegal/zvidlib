@@ -49,8 +49,8 @@ pub use av1::{
 pub use av1_entropy::{AV1_CDF_MAX, Av1SymbolDecoder, validate_cdf};
 pub use av1_filters::{
     CdefStrength, FilmGrainParams, FilterFrame, FilterPlane, LoopFilterParams, MatrixCoefficients,
-    RestorationUnit, apply_film_grain, apply_restoration_unit, cdef_frame, convert_to_rgba8,
-    deblock_frame, super_resolution_upscale,
+    RestorationUnit, TxSizeGrid, apply_film_grain, apply_restoration_unit, cdef_frame,
+    convert_to_rgba8, deblock_frame, super_resolution_upscale,
 };
 pub use av1_inter_decoder::Av1InterDecoder;
 pub use av1_intra::{Av1IntraBlock, Av1IntraFrame, Av1IntraMode, inverse_wht_4x4};
