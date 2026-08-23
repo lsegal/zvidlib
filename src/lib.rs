@@ -56,8 +56,11 @@ pub use av1_filters::{
     convert_to_rgba8, deblock_frame, super_resolution_upscale,
 };
 pub use av1_inter_decoder::Av1InterDecoder;
-pub use av1_intra::{Av1IntraBlock, Av1IntraFrame, Av1IntraMode, inverse_wht_4x4};
-pub use av1_intra_decoder::decode_av1_lossless_intra;
+pub use av1_intra::{
+    Av1IntraBlock, Av1IntraFrame, Av1IntraMode, Av1TxType, get_ac_quant, get_dc_quant,
+    inverse_transform, inverse_wht_4x4,
+};
+pub use av1_intra_decoder::{decode_av1_lossless_intra, decode_av1_lossless_intra_with_tx_sizes};
 pub use codec::{
     AudioDrain, AudioEncoder, AudioEncoderFormat, AudioGapless, CancellationToken,
     CodecImplementation, CodecProfile, CodecSupport, DecodeStatistics, DecodedVideoFrame,

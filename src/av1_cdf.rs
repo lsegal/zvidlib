@@ -307,6 +307,70 @@ pub static SIG_REF_DIFF_OFFSET_2D: [(usize, usize); 5] = [(0, 1), (1, 0), (1, 1)
 /// `Mag_Ref_Offset_With_Tx_Class[TX_CLASS_2D]` (§8.3.2): neighbour offsets for `coeff_br`.
 pub static MAG_REF_OFFSET_2D: [(usize, usize); 3] = [(0, 1), (1, 0), (1, 1)];
 
+// --- Non-lossless (`base_q_idx != 0`) additions: TX_4X4/TX_8X8 only. ---
+//
+// Unlike the tables above (extracted verbatim from the specification), the
+// CDFs in this section are placeholder-but-valid default probability models
+// for symbols this crate did not previously decode at all (`read_tx_type`'s
+// `TX_SET_INTRA_2`/`TX_SET_INTER_3` choice, and the larger `eob_pt` range
+// needed once transform blocks can hold more than 16 coefficients). Unlike
+// the *dequantization* step (a direct multiply that must match the spec's
+// tables to produce correct pixel values), a symbol's *CDF* only affects
+// entropy-coding efficiency, not decode correctness, as long as the same
+// table is used consistently by both the encoder and decoder of a given
+// stream — which this crate's own hand-authored bitstream writer (used only
+// by its test suite; there is no production AV1 encoder here) guarantees.
+// These tables are therefore internally consistent and exercised by
+// round-trip tests, but are NOT claimed to bit-exactly match an official
+// AV1 encoder's default CDFs, so streams produced by third-party encoders
+// that exercise these particular symbols are not guaranteed to decode
+// correctly by this crate (this matches the rest of this crate's stance of
+// being a bounded, non-conformance-tested subset rather than a full AV1
+// decoder).
+
+/// `ext_tx` symbol CDF for the reduced intra set (`TX_SET_INTRA_2` =
+/// `{IDTX, DCT_DCT, ADST_ADST}`), indexed `[tx_size_is_8x8]`. Decoding
+/// `ADST_ADST` (symbol index 2) is rejected as unsupported by the caller.
+pub static EXT_TX_INTRA_REDUCED: [[u16; 3]; 2] = [[10000, 26000, 32768], [10000, 26000, 32768]];
+
+/// `eob_pt` symbol CDF for transform blocks up to 64 coefficients (TX_8X8),
+/// indexed `[plane_type][ctx]`, extending [`EOB_PT_16`]'s shape to the
+/// larger symbol count an 8x8 block's end-of-block position needs.
+pub static EOB_PT_64: [[[u16; 9]; 2]; 2] = [
+    [
+        [2500, 8000, 14000, 19000, 23500, 27000, 29800, 31600, 32768],
+        [4000, 10500, 16500, 21500, 25500, 28500, 30800, 32100, 32768],
+    ],
+    [
+        [2200, 7300, 13200, 18200, 22800, 26500, 29500, 31500, 32768],
+        [3600, 9800, 15600, 20700, 25000, 28200, 30600, 32000, 32768],
+    ],
+];
+
+/// Generates the "up-right diagonal" scan order (spec §9.2's `Default_Scan`
+/// construction) for a `size x size` (4 or 8) transform block: positions
+/// are grouped by anti-diagonal `row + col`, each diagonal visited in row-
+/// ascending order when `row + col` is odd and row-descending order when it
+/// is even. Reproduces [`DEFAULT_SCAN_4X4`] exactly at `size == 4` (checked
+/// by this module's tests).
+pub fn up_right_diagonal_scan(size: usize) -> Vec<usize> {
+    let mut scan = Vec::with_capacity(size * size);
+    for diagonal in 0..(2 * size - 1) {
+        let row_start = diagonal.saturating_sub(size - 1);
+        let row_end = diagonal.min(size - 1);
+        let rows: Box<dyn Iterator<Item = usize>> = if diagonal % 2 == 1 {
+            Box::new(row_start..=row_end)
+        } else {
+            Box::new((row_start..=row_end).rev())
+        };
+        for row in rows {
+            let col = diagonal - row;
+            scan.push(row * size + col);
+        }
+    }
+    scan
+}
+
 // --- Inter-frame mode/reference/motion-vector CDFs, fixed context 0 only. ---
 
 /// `Default_Is_Inter_Cdf[0]`: is the block inter- or intra-predicted.
@@ -367,3 +431,22 @@ pub static MV_CLASS0_FR: [[u16; 4]; 2] =
 
 /// `Default_Mv_Sign_Cdf[comp]`: motion-vector component sign.
 pub static MV_SIGN: [u16; 2] = [16384, 32768];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn up_right_diagonal_scan_matches_the_known_4x4_table() {
+        assert_eq!(up_right_diagonal_scan(4), DEFAULT_SCAN_4X4.to_vec());
+    }
+
+    #[test]
+    fn up_right_diagonal_scan_8x8_is_a_permutation_of_all_positions() {
+        let scan = up_right_diagonal_scan(8);
+        assert_eq!(scan.len(), 64);
+        let mut sorted = scan.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..64).collect::<Vec<_>>());
+    }
+}
