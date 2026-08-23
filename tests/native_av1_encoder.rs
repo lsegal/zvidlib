@@ -1,3 +1,5 @@
+#![cfg(not(target_arch = "wasm32"))]
+
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::task::{Context, Poll, Waker};
