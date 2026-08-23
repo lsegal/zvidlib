@@ -1,9 +1,32 @@
-//! Dependency-free reconstruction of bounded AV1 Main-profile lossless intra
-//! frames. The implemented syntax is the standards-compliant reduced-still,
-//! 8-bit monochrome, single-tile subset used by zvidlib's native AV1 encoder.
+//! Dependency-free reconstruction of bounded AV1 Main-profile intra frames.
+//! The implemented syntax is the standards-compliant reduced-still, 8-bit
+//! monochrome, single-tile subset used by zvidlib's native AV1 encoder.
 //! Every other syntax branch is rejected explicitly.
+//!
+//! Two quantization profiles are supported, selected by `base_q_idx` (spec
+//! §5.9.12 `quantization_params`):
+//!
+//! - `base_q_idx == 0` (`CodedLossless`): every 4x4 block is reconstructed
+//!   with the normative inverse Walsh-Hadamard transform
+//!   ([`crate::inverse_wht_4x4`]). Lossless streams never signal
+//!   `loop_filter_params` (spec §5.9.11: `CodedLossless` forces every loop
+//!   filter level to 0), so deblocking is unreachable on this path, matching
+//!   the spec.
+//! - `base_q_idx != 0` (non-lossless): each transform block signals its own
+//!   `tx_size` (`TX_4X4` or `TX_8X8`, i.e. this decoder's bounded
+//!   `TX_MODE_LARGEST`-equivalent subset) and `tx_type` (`DCT_DCT` or
+//!   `IDTX`; `ADST_ADST` is rejected as unsupported), coefficients are
+//!   dequantized per spec §7.12 (`get_dc_quant`/`get_ac_quant`) and inverse
+//!   transformed ([`crate::av1_intra::inverse_transform`]). `loop_filter_params`
+//!   is parsed and the chosen per-block transform sizes are recorded into a
+//!   [`crate::av1_filters::TxSizeGrid`] so [`crate::av1_filters::deblock_frame`]
+//!   can select the correct filter length at each edge (spec §7.14.5).
+//!   [`decode_av1_lossless_intra_with_tx_sizes`] exposes both the
+//!   deblocked frame and the grid that produced it.
 
 use crate::av1_cdf as cdf;
+use crate::av1_filters::{FilterFrame, FilterPlane, LoopFilterParams, TxSizeGrid, deblock_frame};
+use crate::av1_intra::{Av1TxType, get_ac_quant, get_dc_quant, inverse_transform};
 use crate::{
     Av1FrameType, Av1IntraFrame, Av1Obu, Av1ObuType, Av1Parser, Av1SymbolDecoder, Av1SyntaxSupport,
     ColorRange, Error, ErrorKind, Limits, Result, VideoDimensions, VideoFrame, inverse_wht_4x4,
@@ -13,7 +36,24 @@ const NUM_BASE_LEVELS: i32 = 2;
 const COEFF_BASE_PLUS_RANGE: i32 = 14;
 
 /// Decodes one low-overhead AV1 temporal unit into validated YUV planes.
+/// Equivalent to [`decode_av1_lossless_intra_with_tx_sizes`] for callers
+/// that do not need the per-block transform-size metadata.
 pub fn decode_av1_lossless_intra(bytes: &[u8], limits: &Limits) -> Result<VideoFrame> {
+    decode_av1_lossless_intra_with_tx_sizes(bytes, limits).map(|(frame, _)| frame)
+}
+
+/// Decodes one low-overhead AV1 temporal unit into validated YUV planes,
+/// also returning the [`TxSizeGrid`] recording the transform size chosen
+/// for every 4x4 luma unit. For `base_q_idx == 0` (lossless) streams every
+/// unit is `TX_4X4` (lossless AV1 streams never signal `loop_filter_params`,
+/// per spec §5.9.11, so the frame is returned unfiltered). For
+/// `base_q_idx != 0` streams, the grid reflects the real per-block
+/// `TX_4X4`/`TX_8X8` choice and the frame has already been passed through
+/// [`deblock_frame`] using the parsed `loop_filter_params`.
+pub fn decode_av1_lossless_intra_with_tx_sizes(
+    bytes: &[u8],
+    limits: &Limits,
+) -> Result<(VideoFrame, TxSizeGrid)> {
     if limits.max_av1_blocks_per_frame == 0 {
         return Err(resource("AV1 reconstruction block limit must be nonzero"));
     }
@@ -95,21 +135,54 @@ pub fn decode_av1_lossless_intra(bytes: &[u8], limits: &Limits) -> Result<VideoF
     let mi_rows = 2usize
         .checked_mul(height.saturating_add(7) >> 3)
         .ok_or_else(|| resource("AV1 MI row count overflows"))?;
-    let tile_offset = parse_supported_frame_header(payload, mi_cols, mi_rows)?;
+    let header = parse_supported_frame_header(payload, mi_cols, mi_rows)?;
     let tile = payload
-        .get(tile_offset..)
+        .get(header.tile_offset..)
         .ok_or_else(|| malformed_error("AV1 tile data is truncated"))?;
-    let mut decoder = LosslessTileDecoder::new(tile, width, height, mi_cols, mi_rows, limits)?;
+    let mut decoder = LosslessTileDecoder::new(
+        tile,
+        width,
+        height,
+        mi_cols,
+        mi_rows,
+        header.base_q_idx,
+        limits,
+    )?;
     let luma = decoder.decode()?;
+    let tx_sizes = decoder.tx_sizes;
     let range = if sequence.color_config.color_range {
         ColorRange::Full
     } else {
         ColorRange::Limited
     };
-    Av1IntraFrame::from_luma(dimensions, luma, range, limits)?.into_video_frame(limits)
+    let mut video_frame =
+        Av1IntraFrame::from_luma(dimensions, luma, range, limits)?.into_video_frame(limits)?;
+    if header.base_q_idx != 0 {
+        let mut filter_frame = FilterFrame::new_monochrome(FilterPlane::from_samples(
+            width,
+            height,
+            video_frame.planes[0].data.clone(),
+            limits,
+        )?);
+        deblock_frame(&mut filter_frame, &header.loop_filter, Some(&tx_sizes))?;
+        video_frame.planes[0].data = filter_frame.y.data;
+    }
+    Ok((video_frame, tx_sizes))
 }
 
-fn parse_supported_frame_header(payload: &[u8], mi_cols: usize, mi_rows: usize) -> Result<usize> {
+/// The subset of `uncompressed_header()` this decoder parses, plus the tile
+/// data's byte offset.
+struct SupportedFrameHeader {
+    base_q_idx: u8,
+    loop_filter: LoopFilterParams,
+    tile_offset: usize,
+}
+
+fn parse_supported_frame_header(
+    payload: &[u8],
+    mi_cols: usize,
+    mi_rows: usize,
+) -> Result<SupportedFrameHeader> {
     let mut bits = HeaderBits::new(payload);
     require_bit(&mut bits, true, "disable_cdf_update")?;
     require_bit(&mut bits, false, "allow_screen_content_tools")?;
@@ -123,19 +196,73 @@ fn parse_supported_frame_header(payload: &[u8], mi_cols: usize, mi_rows: usize) 
     if tile_log2(1, sb_rows.min(64)) > 0 {
         require_bit(&mut bits, false, "increment_tile_rows_log2")?;
     }
-    if bits.read(8, "base_q_idx")? != 0 {
-        return Err(unsupported(
-            "AV1 intra decoder currently requires lossless quantization",
-        ));
-    }
+    // quantization_params() (spec §5.9.12): base_q_idx selects between the
+    // lossless (WHT) and non-lossless (dequantized DCT/IDTX) reconstruction
+    // paths below. delta_q_y_dc/using_qmatrix are only ever signaled by this
+    // decoder's encoder as 0 (no per-block delta-Q or quantizer-matrix
+    // support), regardless of losslessness, so they stay required-false.
+    let base_q_idx = u8::try_from(bits.read(8, "base_q_idx")?).expect("8 bits fit u8");
+    let lossless = base_q_idx == 0;
     require_bit(&mut bits, false, "delta_q_y_dc")?;
     require_bit(&mut bits, false, "using_qmatrix")?;
+    // segmentation_params()
     require_bit(&mut bits, false, "segmentation_enabled")?;
+    // delta_q_params()/delta_lf_params(): both are only present when
+    // base_q_idx > 0, and even then only when segmentation/delta-Q are
+    // enabled; this decoder never signals either, so no bits are read.
+    // loop_filter_params() (spec §5.9.11): `CodedLossless` (base_q_idx == 0
+    // with every delta-Q field 0, which is exactly this decoder's lossless
+    // path) forces every filter level to 0 with no bits read at all. The
+    // non-lossless path parses a minimal but real subset: two luma levels
+    // (vertical/horizontal), and when they're not both zero, the two chroma
+    // levels, a 3-bit sharpness, and (deliberately out of scope for this
+    // bounded decoder, see the module docs) no per-reference delta syntax —
+    // `loop_filter_delta_enabled` is required to be 0.
+    let loop_filter = if lossless {
+        LoopFilterParams::DISABLED
+    } else {
+        let y_vertical_level =
+            u8::try_from(bits.read(6, "loop_filter_level[0]")?).expect("6 bits fit u8");
+        let y_horizontal_level =
+            u8::try_from(bits.read(6, "loop_filter_level[1]")?).expect("6 bits fit u8");
+        let (u_level, v_level) = if y_vertical_level != 0 || y_horizontal_level != 0 {
+            let u_level =
+                u8::try_from(bits.read(6, "loop_filter_level[2]")?).expect("6 bits fit u8");
+            let v_level =
+                u8::try_from(bits.read(6, "loop_filter_level[3]")?).expect("6 bits fit u8");
+            (u_level, v_level)
+        } else {
+            (0, 0)
+        };
+        let sharpness =
+            u8::try_from(bits.read(3, "loop_filter_sharpness")?).expect("3 bits fit u8");
+        require_bit(&mut bits, false, "loop_filter_delta_enabled")?;
+        LoopFilterParams {
+            y_vertical_level,
+            y_horizontal_level,
+            u_level,
+            v_level,
+            sharpness,
+        }
+    };
+    // cdef_params(), lr_params(): skipped because the sequence header is
+    // required to have enable_cdef == 0 and enable_restoration == 0.
+    // read_tx_mode() (spec §5.9.20): CodedLossless forces TX_MODE_ONLY_4X4
+    // with no bit read; the non-lossless path here implements this bounded
+    // decoder's TX_MODE_LARGEST-equivalent subset (see the module docs), so
+    // no explicit tx_mode symbol is read either — every block's tx_size is
+    // instead chosen per-block by decode_transform_block from the bounded
+    // {TX_4X4, TX_8X8} set, matching TX_MODE_SELECT syntax shape without
+    // the full per-size symbol space this crate does not implement.
     require_bit(&mut bits, true, "reduced_tx_set")?;
     while bits.position() & 7 != 0 {
         require_bit(&mut bits, false, "frame header byte alignment")?;
     }
-    Ok(bits.position() / 8)
+    Ok(SupportedFrameHeader {
+        base_q_idx,
+        loop_filter,
+        tile_offset: bits.position() / 8,
+    })
 }
 
 fn require_bit(bits: &mut HeaderBits<'_>, expected: bool, name: &str) -> Result<()> {
@@ -196,12 +323,14 @@ struct LosslessTileDecoder<'a> {
     mi_rows: usize,
     coded_width: usize,
     coded_height: usize,
+    base_q_idx: u8,
     pixels: Vec<u8>,
     above_level: Vec<u8>,
     above_dc: Vec<u8>,
     left_level: Vec<u8>,
     left_dc: Vec<u8>,
     mi_bsl: Vec<u8>,
+    tx_sizes: TxSizeGrid,
     decoded_blocks: u32,
     max_blocks: u32,
 }
@@ -213,6 +342,7 @@ impl<'a> LosslessTileDecoder<'a> {
         height: usize,
         mi_cols: usize,
         mi_rows: usize,
+        base_q_idx: u8,
         limits: &Limits,
     ) -> Result<Self> {
         let coded_width = mi_cols
@@ -245,12 +375,14 @@ impl<'a> LosslessTileDecoder<'a> {
             mi_rows,
             coded_width,
             coded_height,
+            base_q_idx,
             pixels: vec![0; pixels],
             above_level: vec![0; mi_cols],
             above_dc: vec![0; mi_cols],
             left_level: vec![0; mi_rows],
             left_dc: vec![0; mi_rows],
             mi_bsl: vec![0; contexts],
+            tx_sizes: TxSizeGrid::new(coded_width, coded_height),
             decoded_blocks: 0,
             max_blocks: limits.max_av1_blocks_per_frame,
         })
@@ -366,19 +498,36 @@ impl<'a> LosslessTileDecoder<'a> {
                 }
             }
         }
-        for transform_y in 0..units {
-            for transform_x in 0..units {
+        // TX_MODE_LARGEST-equivalent selection (spec §5.11.16 `read_tx_size`
+        // when `tx_mode == TX_MODE_LARGEST`): the non-lossless path picks
+        // one transform per coding block, sized as large as this decoder's
+        // bounded {TX_4X4, TX_8X8} set allows (TX_8X8 for an 8x8-or-larger
+        // block, TX_4X4 otherwise), and iterates that transform size across
+        // the block. The lossless path is unaffected: it always uses
+        // TX_MODE_ONLY_4X4, per spec §5.9.20.
+        let tx_width = if self.base_q_idx != 0 && block_width >= 8 {
+            8
+        } else {
+            4
+        };
+        let step = tx_width / 4;
+        let mut transform_y = 0;
+        while transform_y < units {
+            let mut transform_x = 0;
+            while transform_x < units {
                 let x = column * 4 + transform_x * 4;
                 let y = row * 4 + transform_y * 4;
                 if x < self.coded_width && y < self.coded_height {
-                    self.decode_transform_block(x, y, block_width)?;
+                    self.decode_transform_block(x, y, tx_width)?;
                 }
+                transform_x += step;
             }
+            transform_y += step;
         }
         Ok(())
     }
 
-    fn decode_transform_block(&mut self, x: usize, y: usize, block_width: usize) -> Result<()> {
+    fn decode_transform_block(&mut self, x: usize, y: usize, tx_width: usize) -> Result<()> {
         self.decoded_blocks = self
             .decoded_blocks
             .checked_add(1)
@@ -388,59 +537,127 @@ impl<'a> LosslessTileDecoder<'a> {
                 "AV1 reconstruction exceeds the configured block limit",
             ));
         }
-        let coefficients = self.decode_coefficients(x >> 2, y >> 2, block_width)?;
-        let residuals = inverse_wht_4x4(&coefficients);
+        if self.base_q_idx == 0 {
+            let coefficients = self.decode_coefficients_4x4(x >> 2, y >> 2)?;
+            let residuals = inverse_wht_4x4(&coefficients);
+            let prediction = self.dc_prediction(x, y);
+            for row in 0..4 {
+                for column in 0..4 {
+                    self.pixels[(y + row) * self.coded_width + x + column] =
+                        (i16::from(prediction) + residuals[row * 4 + column]).clamp(0, 255) as u8;
+                }
+            }
+            self.tx_sizes.set_block(x, y, 4, 4);
+            return Ok(());
+        }
+        let (coefficients, tx_type) =
+            self.decode_coefficients_nonlossless(x >> 2, y >> 2, tx_width)?;
+        let dc_quant = get_dc_quant(self.base_q_idx);
+        let ac_quant = get_ac_quant(self.base_q_idx);
+        let residuals = inverse_transform(&coefficients, tx_width, tx_type, dc_quant, ac_quant);
         let prediction = self.dc_prediction(x, y);
-        for row in 0..4 {
-            for column in 0..4 {
+        for row in 0..tx_width {
+            for column in 0..tx_width {
                 self.pixels[(y + row) * self.coded_width + x + column] =
-                    (i16::from(prediction) + residuals[row * 4 + column]).clamp(0, 255) as u8;
+                    (i16::from(prediction) + residuals[row * tx_width + column]).clamp(0, 255)
+                        as u8;
             }
         }
+        self.tx_sizes.set_block(x, y, tx_width, tx_width);
         Ok(())
     }
 
-    fn dc_prediction(&self, x: usize, y: usize) -> u8 {
+    /// Spec §7.11.2 DC intra prediction, generalized from the original
+    /// fixed 4x4 window to any `size x size` (4 or 8) transform block: the
+    /// prediction is the rounded average of the `size` samples immediately
+    /// above and/or to the left, or 128 when neither neighbor is available.
+    fn dc_prediction_sized(&self, x: usize, y: usize, size: usize) -> u8 {
         match (y > 0, x > 0) {
             (true, true) => {
                 let mut sum = 0u32;
-                for offset in 0..4 {
+                for offset in 0..size {
                     sum += u32::from(self.pixels[(y - 1) * self.coded_width + x + offset]);
                     sum += u32::from(self.pixels[(y + offset) * self.coded_width + x - 1]);
                 }
-                ((sum + 4) >> 3) as u8
+                let count = 2 * size as u32;
+                ((sum + count / 2) / count) as u8
             }
             (false, true) => {
-                let sum = (0..4)
+                let sum = (0..size)
                     .map(|offset| u32::from(self.pixels[(y + offset) * self.coded_width + x - 1]))
                     .sum::<u32>();
-                ((sum + 2) >> 2) as u8
+                let count = size as u32;
+                ((sum + count / 2) / count) as u8
             }
             (true, false) => {
-                let sum = (0..4)
+                let sum = (0..size)
                     .map(|offset| u32::from(self.pixels[(y - 1) * self.coded_width + x + offset]))
                     .sum::<u32>();
-                ((sum + 2) >> 2) as u8
+                let count = size as u32;
+                ((sum + count / 2) / count) as u8
             }
             (false, false) => 128,
         }
     }
 
-    #[allow(clippy::too_many_lines)]
-    fn decode_coefficients(
+    fn dc_prediction(&self, x: usize, y: usize) -> u8 {
+        self.dc_prediction_sized(x, y, 4)
+    }
+
+    fn decode_coefficients_4x4(&mut self, x4: usize, y4: usize) -> Result<[i32; 16]> {
+        let coefficients = self.decode_coefficient_levels(x4, y4, 4, &cdf::DEFAULT_SCAN_4X4)?;
+        let mut levels = [0i32; 16];
+        levels.copy_from_slice(&coefficients);
+        Ok(levels)
+    }
+
+    /// Decodes one non-lossless transform block's `tx_type` (spec §5.11.47
+    /// `read_tx_type`, restricted to this decoder's reduced intra set,
+    /// `{IDTX, DCT_DCT}`; `ADST_ADST` is rejected as unsupported) and
+    /// dequantized-domain coefficient levels, returning coefficients in
+    /// row-major order ready for [`inverse_transform`].
+    fn decode_coefficients_nonlossless(
         &mut self,
         x4: usize,
         y4: usize,
-        block_width: usize,
-    ) -> Result<[i32; 16]> {
+        tx_width: usize,
+    ) -> Result<(Vec<i32>, Av1TxType)> {
+        let is_8x8 = usize::from(tx_width == 8);
+        let tx_type_symbol = self.symbols.symbol(&cdf::EXT_TX_INTRA_REDUCED[is_8x8])?;
+        let tx_type = match tx_type_symbol {
+            0 => Av1TxType::Idtx,
+            1 => Av1TxType::DctDct,
+            _ => {
+                return Err(unsupported(
+                    "AV1 intra decoder does not support the ADST_ADST transform type",
+                ));
+            }
+        };
+        let scan = cdf::up_right_diagonal_scan(tx_width);
+        let coefficients = self.decode_coefficient_levels(x4, y4, tx_width, &scan)?;
+        Ok((coefficients, tx_type))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn decode_coefficient_levels(
+        &mut self,
+        x4: usize,
+        y4: usize,
+        size: usize,
+        scan: &[usize],
+    ) -> Result<Vec<i32>> {
         let plane_type = 0;
-        let scan = &cdf::DEFAULT_SCAN_4X4;
-        let skip_context = self.txb_skip_context(x4, y4, block_width);
+        let count = size * size;
+        let skip_context = self.txb_skip_context(x4, y4, size * 4);
         if self.symbols.symbol(&cdf::TXB_SKIP[skip_context])? == 1 {
             self.set_coefficient_context(x4, y4, 0, 0);
-            return Ok([0; 16]);
+            return Ok(vec![0; count]);
         }
-        let eob_point = self.symbols.symbol(&cdf::EOB_PT_16[plane_type][0])? + 1;
+        let eob_point = if size <= 4 {
+            self.symbols.symbol(&cdf::EOB_PT_16[plane_type][0])? + 1
+        } else {
+            self.symbols.symbol(&cdf::EOB_PT_64[plane_type][0])? + 1
+        };
         let eob = if eob_point < 2 {
             eob_point
         } else {
@@ -458,30 +675,29 @@ impl<'a> LosslessTileDecoder<'a> {
             }
             (1usize << (eob_point - 2)) + 1 + extra
         };
-        if eob == 0 || eob > 16 {
+        if eob == 0 || eob > count {
             return Err(malformed_error(
-                "AV1 coefficient EOB is outside a 4x4 transform",
+                "AV1 coefficient EOB is outside the transform block",
             ));
         }
-        let mut levels = [0i32; 16];
+        let mut levels = vec![0i32; count];
         for coefficient in (0..eob).rev() {
             let position = scan[coefficient];
-            let mut level =
-                if coefficient == eob - 1 {
-                    i32::try_from(
-                        self.symbols.symbol(
-                            &cdf::COEFF_BASE_EOB[plane_type][coeff_base_eob_context(coefficient)],
-                        )? + 1,
-                    )
-                    .expect("coefficient base level fits i32")
-                } else {
-                    i32::try_from(self.symbols.symbol(
-                        &cdf::COEFF_BASE[plane_type][coeff_base_context(position, &levels)],
-                    )?)
-                    .expect("coefficient base level fits i32")
-                };
+            let mut level = if coefficient == eob - 1 {
+                i32::try_from(
+                    self.symbols.symbol(
+                        &cdf::COEFF_BASE_EOB[plane_type][coeff_base_eob_context(coefficient)],
+                    )? + 1,
+                )
+                .expect("coefficient base level fits i32")
+            } else {
+                i32::try_from(self.symbols.symbol(
+                    &cdf::COEFF_BASE[plane_type][coeff_base_context(position, &levels, size)],
+                )?)
+                .expect("coefficient base level fits i32")
+            };
             if level > NUM_BASE_LEVELS {
-                let context = coeff_br_context(position, &levels);
+                let context = coeff_br_context(position, &levels, size);
                 for _ in 0..4 {
                     let value =
                         i32::try_from(self.symbols.symbol(&cdf::COEFF_BR[plane_type][context])?)
@@ -630,13 +846,13 @@ fn coeff_base_eob_context(coefficient: usize) -> usize {
     }
 }
 
-fn coeff_base_context(position: usize, levels: &[i32; 16]) -> usize {
-    let (row, column) = (position >> 2, position & 3);
+fn coeff_base_context(position: usize, levels: &[i32], size: usize) -> usize {
+    let (row, column) = (position / size, position % size);
     let mut magnitude = 0i32;
     for &(delta_row, delta_column) in &cdf::SIG_REF_DIFF_OFFSET_2D {
         let (neighbor_row, neighbor_column) = (row + delta_row, column + delta_column);
-        if neighbor_row < 4 && neighbor_column < 4 {
-            magnitude += levels[(neighbor_row << 2) + neighbor_column].abs().min(3);
+        if neighbor_row < size && neighbor_column < size {
+            magnitude += levels[neighbor_row * size + neighbor_column].abs().min(3);
         }
     }
     let context = (((magnitude + 1) >> 1).min(4)) as usize;
@@ -647,13 +863,13 @@ fn coeff_base_context(position: usize, levels: &[i32; 16]) -> usize {
     }
 }
 
-fn coeff_br_context(position: usize, levels: &[i32; 16]) -> usize {
-    let (row, column) = (position >> 2, position & 3);
+fn coeff_br_context(position: usize, levels: &[i32], size: usize) -> usize {
+    let (row, column) = (position / size, position % size);
     let mut magnitude = 0i32;
     for &(delta_row, delta_column) in &cdf::MAG_REF_OFFSET_2D {
         let (neighbor_row, neighbor_column) = (row + delta_row, column + delta_column);
-        if neighbor_row < 4 && neighbor_column < 4 {
-            magnitude += levels[(neighbor_row << 2) + neighbor_column].abs().min(15);
+        if neighbor_row < size && neighbor_column < size {
+            magnitude += levels[neighbor_row * size + neighbor_column].abs().min(15);
         }
     }
     let magnitude = (((magnitude + 1) >> 1).min(6)) as usize;

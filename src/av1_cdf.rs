@@ -333,10 +333,6 @@ pub static MAG_REF_OFFSET_2D: [(usize, usize); 3] = [(0, 1), (1, 0), (1, 1)];
 /// `ADST_ADST` (symbol index 2) is rejected as unsupported by the caller.
 pub static EXT_TX_INTRA_REDUCED: [[u16; 3]; 2] = [[10000, 26000, 32768], [10000, 26000, 32768]];
 
-/// `ext_tx` symbol CDF for the reduced inter set (`TX_SET_INTER_3` =
-/// `{IDTX, DCT_DCT}`), indexed `[tx_size_is_8x8]`.
-pub static EXT_TX_INTER_REDUCED: [[u16; 2]; 2] = [[16384, 32768], [16384, 32768]];
-
 /// `eob_pt` symbol CDF for transform blocks up to 64 coefficients (TX_8X8),
 /// indexed `[plane_type][ctx]`, extending [`EOB_PT_16`]'s shape to the
 /// larger symbol count an 8x8 block's end-of-block position needs.
