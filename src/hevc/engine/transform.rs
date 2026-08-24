@@ -322,6 +322,19 @@ const DCT32: [[i32; 32]; 32] = [
 #[must_use]
 fn transform_1d(input: &[i64], n_tbs: usize, tr_type: bool) -> Vec<i64> {
     let mut out = vec![0i64; n_tbs];
+    transform_1d_into(input, n_tbs, tr_type, &mut out);
+    out
+}
+
+/// Same computation as [`transform_1d`], writing into a caller-owned
+/// `out` slice instead of allocating a fresh `Vec` each call. `nTbS` is
+/// always one of 4/8/16/32, so hot callers can pass a stack-allocated
+/// buffer and avoid a heap allocation per row/column of every transform
+/// block — this function runs `nTbS` times per (de)coded transform
+/// block, i.e. millions of times per frame.
+fn transform_1d_into(input: &[i64], n_tbs: usize, tr_type: bool, out: &mut [i64]) {
+    debug_assert_eq!(input.len(), n_tbs);
+    debug_assert_eq!(out.len(), n_tbs);
     if tr_type {
         // §8.6.4.2 eq. 8-315/8-316: y[i] = Σ_j transMatrix[i][j] * x[j],
         // the 4x4 DST. trType == 1 is only ever invoked with nTbS == 4.
@@ -366,7 +379,6 @@ fn transform_1d(input: &[i64], n_tbs: usize, tr_type: bool) -> Vec<i64> {
             *oi = acc;
         }
     }
-    out
 }
 
 /// Encoder-side forward DCT-II 1-D over the same §8.6.4.2 basis the
@@ -436,10 +448,22 @@ pub fn inverse_transform(
 
     // §8.6.4 step 1: column transform d[x][y] over y -> e[x][y].
     // d is row-major by y; a column is the fixed-x slice.
+    //
+    // nTbS is always 4/8/16/32, so the per-column/per-row 1-D transform
+    // inputs/outputs fit in fixed-size stack buffers; this avoids two
+    // heap allocations (the gathered column/row and transform_1d's
+    // former Vec return) per column and per row of every transform
+    // block decoded, which otherwise dominates decode time at 1080p.
     let mut e = vec![0i64; count];
+    let mut in_buf = [0i64; 32];
+    let mut out_buf = [0i64; 32];
     for x in 0..n_tbs {
-        let col: Vec<i64> = (0..n_tbs).map(|y| d[y * n_tbs + x] as i64).collect();
-        let te = transform_1d(&col, n_tbs, tr_type);
+        let col = &mut in_buf[..n_tbs];
+        for (y, cv) in col.iter_mut().enumerate() {
+            *cv = d[y * n_tbs + x] as i64;
+        }
+        let te = &mut out_buf[..n_tbs];
+        transform_1d_into(col, n_tbs, tr_type, te);
         for (y, &v) in te.iter().enumerate() {
             e[y * n_tbs + x] = v;
         }
@@ -454,8 +478,12 @@ pub fn inverse_transform(
     // §8.6.4 step 3: row transform g[x][y] over x -> r[x][y].
     let mut r = vec![0i32; count];
     for y in 0..n_tbs {
-        let row: Vec<i64> = (0..n_tbs).map(|x| g[y * n_tbs + x]).collect();
-        let tr = transform_1d(&row, n_tbs, tr_type);
+        let row = &mut in_buf[..n_tbs];
+        for (x, rv) in row.iter_mut().enumerate() {
+            *rv = g[y * n_tbs + x];
+        }
+        let tr = &mut out_buf[..n_tbs];
+        transform_1d_into(row, n_tbs, tr_type, tr);
         for (x, &v) in tr.iter().enumerate() {
             // r stays i64-valued through here; equation 8-299's bdShift
             // round (in residual_block) is what reduces it. Per the

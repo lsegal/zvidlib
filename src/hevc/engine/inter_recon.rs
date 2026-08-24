@@ -753,7 +753,7 @@ pub fn reconstruct_inter_picture(
         ),
     };
     let filtered = crate::hevc::engine::sao::apply_sao_picture_full(
-        &pic,
+        pic,
         &sao_grid,
         slice.ctb_log2_size_y,
         params.chroma_array_type,

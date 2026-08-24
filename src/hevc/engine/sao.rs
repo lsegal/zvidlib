@@ -425,7 +425,7 @@ pub fn apply_sao_ctb_full(
 /// `recPicture` source.
 #[must_use]
 pub fn apply_sao_picture(
-    pic: &Picture,
+    pic: Picture,
     ctb_sao: &[ResolvedSao],
     ctb_log2_size_y: u32,
     chroma_array_type: u8,
@@ -448,7 +448,7 @@ pub fn apply_sao_picture(
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub fn apply_sao_picture_with_boundaries(
-    pic: &Picture,
+    pic: Picture,
     ctb_sao: &[ResolvedSao],
     ctb_log2_size_y: u32,
     chroma_array_type: u8,
@@ -473,7 +473,7 @@ pub fn apply_sao_picture_with_boundaries(
 #[allow(clippy::too_many_arguments)]
 #[must_use]
 pub fn apply_sao_picture_full(
-    pic: &Picture,
+    pic: Picture,
     ctb_sao: &[ResolvedSao],
     ctb_log2_size_y: u32,
     chroma_array_type: u8,
@@ -487,9 +487,12 @@ pub fn apply_sao_picture_full(
     let pic_height_in_ctbs = pic.height_luma().div_ceil(ctb_size_y);
     // §8.7.3.1: saoPicture starts equal to recPicture; the edge / band
     // classification reads recPicture (the snapshot below), the write
-    // targets saoPicture.
+    // targets saoPicture. `pic` is taken by value so `out` can reuse its
+    // buffer directly instead of a second full-picture clone — SAO
+    // decodes a 1080p frame's worth of planes (~8MB+ luma/chroma), so an
+    // extra clone here is a meaningful per-frame cost.
     let rec = pic.clone();
-    let mut out = pic.clone();
+    let mut out = pic;
 
     let (sw, sh) = if chroma_array_type == 0 {
         (1, 1)
@@ -704,7 +707,7 @@ mod tests {
             }
         }
         let grid = vec![ResolvedSao::off(); 1];
-        let out = apply_sao_picture(&pic, &grid, 4, 1, true, true);
+        let out = apply_sao_picture(pic.clone(), &grid, 4, 1, true, true);
         assert_eq!(out, pic);
     }
 
@@ -728,7 +731,7 @@ mod tests {
                 ResolvedSaoComponent::off(),
             ],
         };
-        let out = apply_sao_picture(&pic, &[resolved], 4, 1, true, true);
+        let out = apply_sao_picture(pic, &[resolved], 4, 1, true, true);
         // luma band 1 ⇒ +2; chroma off ⇒ unchanged.
         assert_eq!(out.sample(Plane::Luma, 0, 0), 12);
         assert_eq!(out.sample(Plane::Cb, 0, 0), 10);
@@ -754,7 +757,7 @@ mod tests {
                 ResolvedSaoComponent::off(),
             ],
         };
-        let out = apply_sao_picture(&pic, &[resolved], 4, 1, true, false);
+        let out = apply_sao_picture(pic, &[resolved], 4, 1, true, false);
         // Interior column 5: cur=40, left=36, right=44. Sign(40-36)=+1,
         // Sign(40-44)=−1 ⇒ edgeIdx 2 → 0, offset_val[0]=0 ⇒ unchanged.
         assert_eq!(out.sample(Plane::Luma, 5, 5), 40);

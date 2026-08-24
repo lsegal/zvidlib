@@ -1895,7 +1895,7 @@ pub fn reconstruct_intra_picture(
     // §8.7.3.1 — apply SAO across the whole picture (no-op when both slice
     // SAO flags are clear or every CTB resolved to type 0).
     let filtered = crate::hevc::engine::sao::apply_sao_picture(
-        &pic,
+        pic,
         &sao_grid,
         pic_params.ctb_log2_size_y,
         params.chroma_array_type,

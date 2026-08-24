@@ -65,6 +65,7 @@ impl<'a> BitReader<'a> {
     }
 
     /// Read a single bit (the `u(1)` descriptor).
+    #[inline]
     pub fn u1(&mut self) -> Result<u8, BitReaderError> {
         if self.bit_pos >= self.buf.len() * 8 {
             return Err(BitReaderError::EndOfBuffer);
@@ -78,6 +79,7 @@ impl<'a> BitReader<'a> {
     /// Read `n` bits MSB-first as an unsigned integer (the `u(n)`
     /// descriptor, with `n` in `0..=32`). `n == 0` returns 0 and does
     /// not advance the cursor.
+    #[inline]
     pub fn u(&mut self, n: u8) -> Result<u32, BitReaderError> {
         if n > 32 {
             return Err(BitReaderError::TooManyBits);
