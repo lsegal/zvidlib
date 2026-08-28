@@ -4,6 +4,8 @@ mod encoder;
 mod engine;
 #[cfg(windows)]
 mod windows_mf;
+#[cfg(all(windows, target_pointer_width = "64"))]
+mod windows_nvdec;
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -88,12 +90,19 @@ impl VideoDecoderFactory for HevcDecoderFactory {
         let parsed = ParsedConfiguration::parse(configuration, limits)?;
         if configuration.hardware != HardwarePreference::Avoid {
             #[cfg(windows)]
-            match windows_mf::create(configuration, limits, &parsed.record) {
-                Ok(decoder) => return Ok(decoder),
-                Err(error) if configuration.hardware == HardwarePreference::Require => {
-                    return Err(error);
+            {
+                #[cfg(target_pointer_width = "64")]
+                match windows_nvdec::create(configuration, limits, &parsed.record) {
+                    Ok(decoder) => return Ok(decoder),
+                    Err(_) => {}
                 }
-                Err(_) => {}
+                match windows_mf::create(configuration, limits, &parsed.record) {
+                    Ok(decoder) => return Ok(decoder),
+                    Err(error) if configuration.hardware == HardwarePreference::Require => {
+                        return Err(error);
+                    }
+                    Err(_) => {}
+                }
             }
             #[cfg(not(windows))]
             if configuration.hardware == HardwarePreference::Require {
@@ -135,6 +144,10 @@ impl HevcDecoderFactory {
 
 #[cfg(windows)]
 fn hardware_available(configuration: &VideoDecoderConfig) -> bool {
+    #[cfg(target_pointer_width = "64")]
+    if windows_nvdec::is_available(configuration.coded_dimensions) {
+        return true;
+    }
     windows_mf::is_available(configuration.coded_dimensions)
 }
 
