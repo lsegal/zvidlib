@@ -15,10 +15,10 @@ As documented in the main [README](../README.md#implemented-browser-boundary), t
 gradient. Whether that decode actually succeeds depends on the browser and platform: zvidlib
 queries `VideoDecoder.isConfigSupported()` first, and `video.get()` still rejects with
 `UNSUPPORTED` (falling back to the synthetic gradient) if the browser has no HEVC decoder
-available. On 64-bit Windows, the native build prefers NVIDIA NVDEC and then the D3D11-aware Media
-Foundation HEVC decoder when the installed driver/codec supports the requested stream. It falls
-back to zvidlib's dependency-free pure-Rust HEVC Main decoder everywhere else, so the native
-OpenGL example still renders the same decoded pixels without requiring a system codec.
+available. The native build prefers NVIDIA NVDEC on supported 64-bit Windows/Linux systems, then
+the D3D11-aware Media Foundation HEVC decoder on Windows, or VideoToolbox on macOS. It falls back
+to zvidlib's dependency-free pure-Rust HEVC Main decoder when acceleration is unavailable, so the
+native OpenGL example still renders the same decoded pixels without requiring a system codec.
 
 ## Native GL: `native_gl/`
 

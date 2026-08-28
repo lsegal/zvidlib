@@ -1,4 +1,4 @@
-//! NVIDIA NVDEC HEVC backend, loaded from the display driver at runtime.
+//! NVIDIA NVDEC HEVC backend for Windows and Linux, loaded from the display driver at runtime.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -24,6 +24,15 @@ const CUDA_VIDEO_CREATE_PREFER_CUVID: u32 = 4;
 const CUVID_PKT_ENDOFSTREAM: u32 = 0x01;
 const CUVID_PKT_TIMESTAMP: u32 = 0x02;
 const CUVID_PKT_ENDOFPICTURE: u32 = 0x08;
+
+#[cfg(windows)]
+const CUDA_DRIVER_LIBRARY: &str = "nvcuda.dll";
+#[cfg(windows)]
+const NVDEC_DRIVER_LIBRARY: &str = "nvcuvid.dll";
+#[cfg(target_os = "linux")]
+const CUDA_DRIVER_LIBRARY: &str = "libcuda.so.1";
+#[cfg(target_os = "linux")]
+const NVDEC_DRIVER_LIBRARY: &str = "libnvcuvid.so.1";
 
 type CuInit = unsafe extern "system" fn(u32) -> i32;
 type CuDeviceGet = unsafe extern "system" fn(*mut c_int, c_int) -> i32;
@@ -431,9 +440,9 @@ struct NvApi {
 
 impl NvApi {
     fn load() -> Result<Self> {
-        let cuda = unsafe { Library::new("nvcuda.dll") }
+        let cuda = unsafe { Library::new(CUDA_DRIVER_LIBRARY) }
             .map_err(|error| unsupported(format!("NVIDIA CUDA driver is unavailable: {error}")))?;
-        let cuvid = unsafe { Library::new("nvcuvid.dll") }
+        let cuvid = unsafe { Library::new(NVDEC_DRIVER_LIBRARY) }
             .map_err(|error| unsupported(format!("NVIDIA NVDEC driver is unavailable: {error}")))?;
         unsafe {
             Ok(Self {
