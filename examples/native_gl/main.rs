@@ -5,11 +5,10 @@
 //! native HEVC decoder and the CPU -> native OpenGL [`execute_transfer`] path with a
 //! [`GraphicsAdapter`] backed by a real
 //! `winit` window and `glutin` OpenGL context, so the uploaded frames are drawn to an actual
-//! window on all platforms. The example prefers the accelerated Windows NVDEC/Media Foundation
-//! backend and falls back to the dependency-free software decoder. Decoding runs on a background
-//! thread, and the render loop displays the newest completed frame. Playback loops back to the
-//! first frame once the last one is shown, and the decoded-frame playback rate is drawn in the
-//! top-left corner.
+//! window on all platforms. The example prefers an available accelerated backend and falls back
+//! to the dependency-free software decoder. Decoding runs on a background thread, and the render
+//! loop displays the newest completed frame. Playback loops back to the first frame once the last
+//! one is shown, and the decoded-frame playback rate is drawn in the top-left corner.
 //!
 //! Run with:
 //!

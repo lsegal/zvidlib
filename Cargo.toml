@@ -62,8 +62,10 @@ glutin-winit = "0.5.0"
 raw-window-handle = "0.6.2"
 winit = "0.30.13"
 
-[target.'cfg(windows)'.dependencies]
+[target.'cfg(any(windows, target_os = "linux"))'.dependencies]
 libloading = "0.8.9"
+
+[target.'cfg(windows)'.dependencies]
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct3D",
@@ -72,6 +74,10 @@ windows = { version = "0.62.2", features = [
     "Win32_Media_MediaFoundation",
     "Win32_System_Com",
 ] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-cf = { version = "0.9.3", default-features = false, features = ["cm", "cv"] }
+videotoolbox = { version = "0.18.1", default-features = false, features = ["decompression"] }
 
 # The native HEVC/AV1 decoders are pure-Rust software codecs with no fast path at opt-level 0,
 # so an unoptimized debug build is unusably slow. opt-level 2 keeps debug assertions and fast

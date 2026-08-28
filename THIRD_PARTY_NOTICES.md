@@ -1,6 +1,6 @@
 # Third-party notices
 
-The NVIDIA NVDEC ABI declarations in `src/hevc/windows_nvdec.rs` are derived from the
+The NVIDIA NVDEC ABI declarations in `src/hevc/nvdec.rs` are derived from the
 `nvcuvid.h` and `cuviddec.h` headers in NVIDIA's Video Codec SDK samples.
 
 Copyright (c) 2010-2018 NVIDIA Corporation

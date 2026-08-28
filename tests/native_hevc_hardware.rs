@@ -3,11 +3,9 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
-#[cfg(windows)]
 use std::time::Instant;
 
 use zvidlib::io::MemorySource;
-#[cfg(windows)]
 use zvidlib::{CancellationToken, ExactFrameReader, FrameIndex};
 use zvidlib::{
     Codec, CodecImplementation, CodecProfile, CodecSupport, ColorRange, FrameDigest,
@@ -100,7 +98,6 @@ fn native_hevc_factory_honors_hardware_preference_and_fallback() {
     }
 }
 
-#[cfg(windows)]
 #[test]
 fn accelerated_hevc_preserves_exact_frame_identity_and_seek_behavior() {
     let mut vector = bundled_vector();
@@ -141,7 +138,6 @@ fn accelerated_hevc_preserves_exact_frame_identity_and_seek_behavior() {
     assert_eq!(frames_verified, 40);
 }
 
-#[cfg(windows)]
 #[test]
 #[ignore = "host-specific real-time playback benchmark"]
 fn accelerated_hevc_decodes_bundled_1080p_sample_at_source_rate() {

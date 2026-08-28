@@ -1,11 +1,13 @@
-//! Native, dependency-free HEVC/H.265 software decoding.
+//! Native HEVC/H.265 decoding with platform acceleration and a dependency-free software fallback.
 
 mod encoder;
 mod engine;
+#[cfg(all(any(windows, target_os = "linux"), target_pointer_width = "64"))]
+mod nvdec;
+#[cfg(target_os = "macos")]
+mod videotoolbox;
 #[cfg(windows)]
 mod windows_mf;
-#[cfg(all(windows, target_pointer_width = "64"))]
-mod windows_nvdec;
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -27,9 +29,9 @@ const DEFAULT_REORDER_DEPTH: usize = 8;
 
 /// Returns the native HEVC Main decoder backend.
 ///
-/// On Windows, `Prefer` and `Require` select Media Foundation's D3D11-backed HEVC decoder when
-/// the active adapter advertises HEVC Main/NV12 decode support. `Prefer` falls back to the
-/// dependency-free software decoder everywhere else; `Avoid` always selects software.
+/// `Prefer` and `Require` select NVIDIA NVDEC on supported 64-bit Windows/Linux hosts, D3D11-aware
+/// Media Foundation on Windows, or VideoToolbox on macOS. `Prefer` falls back to the dependency-free
+/// software decoder when acceleration is unavailable; `Avoid` always selects software.
 pub fn native_hevc_video_decoder_factory() -> impl VideoDecoderFactory {
     HevcDecoderFactory
 }
@@ -89,39 +91,35 @@ impl VideoDecoderFactory for HevcDecoderFactory {
         }
         let parsed = ParsedConfiguration::parse(configuration, limits)?;
         if configuration.hardware != HardwarePreference::Avoid {
+            let mut hardware_errors = Vec::new();
+            #[cfg(all(any(windows, target_os = "linux"), target_pointer_width = "64"))]
+            match nvdec::create(configuration, limits, &parsed.record) {
+                Ok(decoder) => return Ok(decoder),
+                Err(error) => hardware_errors.push(format!("NVDEC: {}", error.message())),
+            }
             #[cfg(windows)]
-            {
-                #[cfg(target_pointer_width = "64")]
-                let earlier_error =
-                    match windows_nvdec::create(configuration, limits, &parsed.record) {
-                        Ok(decoder) => return Ok(decoder),
-                        Err(error) => Some(error),
-                    };
-                #[cfg(not(target_pointer_width = "64"))]
-                let earlier_error: Option<Error> = None;
-                match windows_mf::create(configuration, limits, &parsed.record) {
-                    Ok(decoder) => return Ok(decoder),
-                    Err(error) if configuration.hardware == HardwarePreference::Require => {
-                        if let Some(earlier) = earlier_error {
-                            return Err(Error::new(
-                                ErrorKind::Unsupported,
-                                format!(
-                                    "hardware HEVC decoding is unavailable (NVDEC: {}; Media Foundation: {})",
-                                    earlier.message(),
-                                    error.message()
-                                ),
-                            ));
-                        }
-                        return Err(error);
-                    }
-                    Err(_) => {}
+            match windows_mf::create(configuration, limits, &parsed.record) {
+                Ok(decoder) => return Ok(decoder),
+                Err(error) => {
+                    hardware_errors.push(format!("Media Foundation: {}", error.message()));
                 }
             }
-            #[cfg(not(windows))]
+            #[cfg(target_os = "macos")]
+            match videotoolbox::create(configuration, limits, &parsed.record) {
+                Ok(decoder) => return Ok(decoder),
+                Err(error) => {
+                    hardware_errors.push(format!("VideoToolbox: {}", error.message()));
+                }
+            }
             if configuration.hardware == HardwarePreference::Require {
+                let detail = if hardware_errors.is_empty() {
+                    "no accelerated backend exists for this target".to_owned()
+                } else {
+                    hardware_errors.join("; ")
+                };
                 return Err(Error::new(
                     ErrorKind::Unsupported,
-                    "hardware HEVC decoding is unavailable on this platform",
+                    format!("hardware HEVC decoding is unavailable ({detail})"),
                 ));
             }
         }
@@ -155,17 +153,19 @@ impl HevcDecoderFactory {
     }
 }
 
-#[cfg(windows)]
-fn hardware_available(configuration: &VideoDecoderConfig) -> bool {
-    #[cfg(target_pointer_width = "64")]
-    if windows_nvdec::is_available(configuration.coded_dimensions) {
+fn hardware_available(_configuration: &VideoDecoderConfig) -> bool {
+    #[cfg(all(any(windows, target_os = "linux"), target_pointer_width = "64"))]
+    if nvdec::is_available(_configuration.coded_dimensions) {
         return true;
     }
-    windows_mf::is_available(configuration.coded_dimensions)
-}
-
-#[cfg(not(windows))]
-fn hardware_available(_configuration: &VideoDecoderConfig) -> bool {
+    #[cfg(windows)]
+    if windows_mf::is_available(_configuration.coded_dimensions) {
+        return true;
+    }
+    #[cfg(target_os = "macos")]
+    if videotoolbox::is_available(_configuration.coded_dimensions) {
+        return true;
+    }
     false
 }
 
