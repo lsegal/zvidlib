@@ -646,6 +646,10 @@ pub fn reconstruct_inter_picture(
     // PCM (`pcm_loop_filter_disabled_flag`) / transquant-bypass CUs.
     let (w4, h4) = (pic_width_luma.div_ceil(4), pic_height_luma.div_ceil(4));
     let mut no_filter_cells = vec![false; w4 * h4];
+    // Motion derivation needs an immutable prediction-mode view while it
+    // mutates resolved motion cells. Maintain that view once per picture
+    // instead of rebuilding a full-grid snapshot for every inter CU.
+    let mut intra_cells = vec![true; w4 * h4];
     let mut prev_slice_addr: Option<u32> = None;
     let mut prev_tile: Option<u32> = None;
     for placed in ctus {
@@ -682,6 +686,7 @@ pub fn reconstruct_inter_picture(
             slice,
             &mut deblock_cus,
             &mut no_filter_cells,
+            &mut intra_cells,
             w4,
             &filter_across_map,
             &placed.ctu.quadtree,
@@ -753,7 +758,7 @@ pub fn reconstruct_inter_picture(
         ),
     };
     let filtered = crate::hevc::engine::sao::apply_sao_picture_full(
-        &pic,
+        pic,
         &sao_grid,
         slice.ctb_log2_size_y,
         params.chroma_array_type,
@@ -779,6 +784,7 @@ fn reconstruct_inter_quadtree(
     slice: &InterSliceContext,
     deblock_cus: &mut Vec<crate::hevc::engine::deblock::DeblockCuDesc>,
     no_filter_cells: &mut [bool],
+    intra_cells: &mut [bool],
     w4: usize,
     filter_across_of_ctb: &[bool],
     qt: &crate::hevc::engine::slice_data::CodingQuadtree,
@@ -797,6 +803,7 @@ fn reconstruct_inter_quadtree(
                     slice,
                     deblock_cus,
                     no_filter_cells,
+                    intra_cells,
                     w4,
                     filter_across_of_ctb,
                     child,
@@ -827,6 +834,8 @@ fn reconstruct_inter_quadtree(
                 refs,
                 slice,
                 deblock_cus,
+                intra_cells,
+                w4,
                 filter_across_of_ctb,
                 cu,
             )
@@ -895,6 +904,8 @@ fn reconstruct_inter_leaf_cu(
     refs: &RefListAccess,
     slice: &InterSliceContext,
     deblock_cus: &mut Vec<crate::hevc::engine::deblock::DeblockCuDesc>,
+    intra_cells: &mut [bool],
+    w4: usize,
     filter_across_of_ctb: &[bool],
     cu: &CodingUnit,
 ) -> Result<(), ReconError> {
@@ -985,21 +996,19 @@ fn reconstruct_inter_leaf_cu(
         return Ok(());
     }
 
-    // §6.4.2 prediction-block availability against the shared tiling + the
-    // per-cell intra / inter flag of the motion field. The candidate
-    // derivation also *mutates* `field` (writing each PU's resolved motion),
-    // so the closure cannot borrow `field` directly; snapshot the per-4×4
-    // intra-flag grid up front. A neighbour outside the current CU was
-    // decoded before it, so its intra flag is already final; positions
-    // inside the current CU are excluded by the §6.4.2 z-scan test.
+    // §6.4.2 prediction-block availability against the shared tiling and the
+    // incrementally maintained prediction-mode grid. Motion derivation can
+    // read this independent grid while it mutates `field`.
     let x_cb = cu.x0;
     let y_cb = cu.y0;
-    let w4 = field.width_4();
     let h4 = field.height_4();
-    let mut intra_grid = vec![false; w4 * h4];
-    for (gy, row) in intra_grid.chunks_mut(w4).enumerate() {
-        for (gx, cell) in row.iter_mut().enumerate() {
-            *cell = field.cell_at(gx * 4, gy * 4).is_intra;
+    let bx0 = cu.x0 as usize / 4;
+    let by0 = cu.y0 as usize / 4;
+    let bx1 = (cu.x0 as usize + n_cb_s).min(w4 * 4).div_ceil(4);
+    let by1 = (cu.y0 as usize + n_cb_s).min(h4 * 4).div_ceil(4);
+    for by in by0..by1 {
+        for bx in bx0..bx1 {
+            intra_cells[by * w4 + bx] = false;
         }
     }
     let tiling = ctx.tiling();
@@ -1020,7 +1029,7 @@ fn reconstruct_inter_leaf_cu(
                 return 0;
             }
             let (gx, gy) = ((x as usize) / 4, (y as usize) / 4);
-            if gx < w4 && gy < h4 && intra_grid[gy * w4 + gx] {
+            if gx < w4 && gy < h4 && intra_cells[gy * w4 + gx] {
                 crate::hevc::engine::availability::MODE_INTRA
             } else {
                 0

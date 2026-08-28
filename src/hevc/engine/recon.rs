@@ -853,6 +853,23 @@ impl CuResidualPlane {
     #[must_use]
     pub fn slice_region(&self, rx: usize, ry: usize, w: usize, h: usize) -> Vec<i32> {
         let mut out = vec![0; w * h];
+        if rx >= self.x0
+            && ry >= self.y0
+            && rx
+                .checked_add(w)
+                .is_some_and(|end| end <= self.x0 + self.width)
+            && ry
+                .checked_add(h)
+                .is_some_and(|end| end <= self.y0 + self.height)
+        {
+            let source_x = rx - self.x0;
+            let source_y = ry - self.y0;
+            for y in 0..h {
+                let source = (source_y + y) * self.width + source_x;
+                out[y * w..(y + 1) * w].copy_from_slice(&self.samples[source..source + w]);
+            }
+            return out;
+        }
         for y in 0..h {
             let py = ry + y;
             if py < self.y0 || py >= self.y0 + self.height {
@@ -1895,7 +1912,7 @@ pub fn reconstruct_intra_picture(
     // §8.7.3.1 — apply SAO across the whole picture (no-op when both slice
     // SAO flags are clear or every CTB resolved to type 0).
     let filtered = crate::hevc::engine::sao::apply_sao_picture(
-        &pic,
+        pic,
         &sao_grid,
         pic_params.ctb_log2_size_y,
         params.chroma_array_type,

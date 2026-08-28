@@ -69,3 +69,11 @@ winit = "0.30.13"
 # which decodes on a background thread so the window keeps redrawing smoothly regardless).
 [profile.dev]
 opt-level = 2
+
+# LTO + a single codegen unit let the optimizer inline and specialize across
+# the (crate-internal) hevc decoder's module boundaries, which matters a lot
+# for the many small hot per-sample/per-block functions in the decode path
+# (measured ~2.7 -> ~3.7 fps, +37%, decoding the bundled 1080p sample).
+[profile.release]
+lto = "fat"
+codegen-units = 1
