@@ -15,17 +15,20 @@ As documented in the main [README](../README.md#implemented-browser-boundary), t
 gradient. Whether that decode actually succeeds depends on the browser and platform: zvidlib
 queries `VideoDecoder.isConfigSupported()` first, and `video.get()` still rejects with
 `UNSUPPORTED` (falling back to the synthetic gradient) if the browser has no HEVC decoder
-available. The native build instead uses zvidlib's dependency-free pure-Rust HEVC Main decoder,
-so the native OpenGL example renders the same sample's decoded pixels without a system codec.
+available. On 64-bit Windows, the native build prefers NVIDIA NVDEC and then the D3D11-aware Media
+Foundation HEVC decoder when the installed driver/codec supports the requested stream. It falls
+back to zvidlib's dependency-free pure-Rust HEVC Main decoder everywhere else, so the native
+OpenGL example still renders the same decoded pixels without requiring a system codec.
 
 ## Native GL: `native_gl/`
 
-Opens the sample, decodes its HEVC Main frames in pure Rust, and drives the real CPU → native
-OpenGL upload path (`execute_transfer`) through a `GraphicsAdapter` backed by a real `winit`
-window and `glutin` OpenGL context, so the uploaded frames are drawn to an actual window on all
-platforms (Windows, macOS, and Linux). Playback loops back to the first frame once the last one
-has been shown, matching the web example's looping behavior, and the decoded-frame playback rate
-is drawn in the window's top-left corner.
+Opens the sample, selects accelerated HEVC Main decoding when available (printing the selected
+`CodecImplementation`), and drives the real CPU → native OpenGL upload path (`execute_transfer`)
+through a `GraphicsAdapter` backed by a real `winit` window and `glutin` OpenGL context, so the
+uploaded frames are drawn to an actual window on all platforms (Windows, macOS, and Linux).
+Playback loops back to the first frame once the last one has been shown, matching the web
+example's looping behavior, and the decoded-frame playback rate is drawn in the window's
+top-left corner.
 
 ```console
 cargo run --example native_gl --features native
