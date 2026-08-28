@@ -2,6 +2,10 @@
 
 mod encoder;
 mod engine;
+#[cfg(windows)]
+mod windows_mf;
+#[cfg(all(windows, target_pointer_width = "64"))]
+mod windows_nvdec;
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -21,7 +25,11 @@ use engine::sps::SeqParameterSet;
 
 const DEFAULT_REORDER_DEPTH: usize = 8;
 
-/// Returns the dependency-free native HEVC Main software decoder backend.
+/// Returns the native HEVC Main decoder backend.
+///
+/// On Windows, `Prefer` and `Require` select Media Foundation's D3D11-backed HEVC decoder when
+/// the active adapter advertises HEVC Main/NV12 decode support. `Prefer` falls back to the
+/// dependency-free software decoder everywhere else; `Avoid` always selects software.
 pub fn native_hevc_video_decoder_factory() -> impl VideoDecoderFactory {
     HevcDecoderFactory
 }
@@ -31,25 +39,24 @@ struct HevcDecoderFactory;
 
 impl VideoDecoderFactory for HevcDecoderFactory {
     fn capability(&self, configuration: &VideoDecoderConfig) -> CodecSupport {
-        if configuration.codec != Codec::Hevc {
-            return CodecSupport::UnsupportedCodec;
-        }
-        if configuration.profile != CodecProfile::HevcMain {
-            return CodecSupport::UnsupportedProfile;
-        }
-        if configuration.hardware == HardwarePreference::Require {
-            return CodecSupport::HardwareUnavailable;
-        }
-        if configuration.output_format != PixelFormat::Rgba8 {
-            return invalid_configuration("native HEVC Main decoding currently outputs RGBA8");
-        }
-        if configuration.color_range != ColorRange::Limited {
-            return invalid_configuration(
-                "native HEVC Main RGBA output requires limited-range input",
-            );
+        if let unsupported @ (CodecSupport::UnsupportedCodec
+        | CodecSupport::UnsupportedProfile
+        | CodecSupport::InvalidConfiguration { .. }) =
+            self.capability_without_hardware(configuration)
+        {
+            return unsupported;
         }
         if let Err(error) = ParsedConfiguration::parse(configuration, &Limits::default()) {
             return invalid_configuration(error.message());
+        }
+        if configuration.hardware != HardwarePreference::Avoid && hardware_available(configuration)
+        {
+            return CodecSupport::Supported {
+                implementation: CodecImplementation::Hardware,
+            };
+        }
+        if configuration.hardware == HardwarePreference::Require {
+            return CodecSupport::HardwareUnavailable;
         }
         CodecSupport::Supported {
             implementation: CodecImplementation::Software,
@@ -61,7 +68,7 @@ impl VideoDecoderFactory for HevcDecoderFactory {
         configuration: &VideoDecoderConfig,
         limits: &Limits,
     ) -> Result<Box<dyn VideoDecoder>> {
-        match self.capability_without_parsing(configuration) {
+        match self.capability_without_hardware(configuration) {
             CodecSupport::Supported { .. } => {}
             CodecSupport::UnsupportedCodec => {
                 return Err(Error::new(
@@ -75,17 +82,49 @@ impl VideoDecoderFactory for HevcDecoderFactory {
                     "native HEVC decoder supports the Main profile",
                 ));
             }
-            CodecSupport::HardwareUnavailable => {
-                return Err(Error::new(
-                    ErrorKind::Unsupported,
-                    "native HEVC decoder is software-only",
-                ));
-            }
+            CodecSupport::HardwareUnavailable => unreachable!("hardware is not checked here"),
             CodecSupport::InvalidConfiguration { reason } => {
                 return Err(Error::new(ErrorKind::InvalidInput, reason));
             }
         }
         let parsed = ParsedConfiguration::parse(configuration, limits)?;
+        if configuration.hardware != HardwarePreference::Avoid {
+            #[cfg(windows)]
+            {
+                #[cfg(target_pointer_width = "64")]
+                let earlier_error =
+                    match windows_nvdec::create(configuration, limits, &parsed.record) {
+                        Ok(decoder) => return Ok(decoder),
+                        Err(error) => Some(error),
+                    };
+                #[cfg(not(target_pointer_width = "64"))]
+                let earlier_error: Option<Error> = None;
+                match windows_mf::create(configuration, limits, &parsed.record) {
+                    Ok(decoder) => return Ok(decoder),
+                    Err(error) if configuration.hardware == HardwarePreference::Require => {
+                        if let Some(earlier) = earlier_error {
+                            return Err(Error::new(
+                                ErrorKind::Unsupported,
+                                format!(
+                                    "hardware HEVC decoding is unavailable (NVDEC: {}; Media Foundation: {})",
+                                    earlier.message(),
+                                    error.message()
+                                ),
+                            ));
+                        }
+                        return Err(error);
+                    }
+                    Err(_) => {}
+                }
+            }
+            #[cfg(not(windows))]
+            if configuration.hardware == HardwarePreference::Require {
+                return Err(Error::new(
+                    ErrorKind::Unsupported,
+                    "hardware HEVC decoding is unavailable on this platform",
+                ));
+            }
+        }
         Ok(Box::new(HevcDecoder::new(
             configuration.clone(),
             *limits,
@@ -95,15 +134,12 @@ impl VideoDecoderFactory for HevcDecoderFactory {
 }
 
 impl HevcDecoderFactory {
-    fn capability_without_parsing(&self, configuration: &VideoDecoderConfig) -> CodecSupport {
+    fn capability_without_hardware(&self, configuration: &VideoDecoderConfig) -> CodecSupport {
         if configuration.codec != Codec::Hevc {
             return CodecSupport::UnsupportedCodec;
         }
         if configuration.profile != CodecProfile::HevcMain {
             return CodecSupport::UnsupportedProfile;
-        }
-        if configuration.hardware == HardwarePreference::Require {
-            return CodecSupport::HardwareUnavailable;
         }
         if configuration.output_format != PixelFormat::Rgba8 {
             return invalid_configuration("native HEVC Main decoding currently outputs RGBA8");
@@ -117,6 +153,20 @@ impl HevcDecoderFactory {
             implementation: CodecImplementation::Software,
         }
     }
+}
+
+#[cfg(windows)]
+fn hardware_available(configuration: &VideoDecoderConfig) -> bool {
+    #[cfg(target_pointer_width = "64")]
+    if windows_nvdec::is_available(configuration.coded_dimensions) {
+        return true;
+    }
+    windows_mf::is_available(configuration.coded_dimensions)
+}
+
+#[cfg(not(windows))]
+fn hardware_available(_configuration: &VideoDecoderConfig) -> bool {
+    false
 }
 
 fn invalid_configuration(reason: impl Into<String>) -> CodecSupport {

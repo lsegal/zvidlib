@@ -2,14 +2,13 @@
 //!
 //! Demuxes an MP4 (by default the Big Buck Bunny sample checked into
 //! `examples/media/BigBuckBunny.mp4`) and drives the real
-//! dependency-free native HEVC decoder and the CPU -> native OpenGL [`execute_transfer`] path
-//! with a [`GraphicsAdapter`] backed by a real
+//! native HEVC decoder and the CPU -> native OpenGL [`execute_transfer`] path with a
+//! [`GraphicsAdapter`] backed by a real
 //! `winit` window and `glutin` OpenGL context, so the uploaded frames are drawn to an actual
-//! window on all platforms. Decoding runs on a background thread so the window keeps redrawing
-//! smoothly even when the software decoder cannot keep up with the source frame rate; the render
-//! loop simply displays the newest frame that has finished decoding. Playback loops back to the
-//! first frame once the last one is shown, and the decoded-frame playback rate is drawn in the
-//! top-left corner.
+//! window on all platforms. The example prefers an available accelerated backend and falls back
+//! to the dependency-free software decoder. Decoding runs on a background thread, and the render
+//! loop displays the newest completed frame. Playback loops back to the first frame once the last
+//! one is shown, and the decoded-frame playback rate is drawn in the top-left corner.
 //!
 //! Run with:
 //!
@@ -45,7 +44,7 @@ use zvidlib::{
     ExactFrameReader, FrameDestination, FrameIndex, FrameSource, GraphicsAdapter, GraphicsApi,
     GraphicsResource, HardwarePreference, Limits, Mp4Demuxer, Mp4DemuxerOptions, Orientation,
     PixelFormat, ResourceKind, ResourceOwnership, Result, TrackKind, TransferPolicy,
-    VideoDecoderConfig, VideoDimensions, VideoFrame, execute_transfer,
+    VideoDecoderConfig, VideoDecoderFactory, VideoDimensions, VideoFrame, execute_transfer,
     native_hevc_video_decoder_factory,
 };
 
@@ -63,10 +62,9 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    let input_path = env::args()
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("examples/media/BigBuckBunny.mp4"));
+    let input_path = env::args().nth(1).map(PathBuf::from).unwrap_or_else(|| {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/media/BigBuckBunny.mp4")
+    });
 
     let bytes = fs::read(&input_path).map_err(|error| {
         invalid(format!(
@@ -98,20 +96,19 @@ fn run() -> Result<()> {
     let frame_count = video.presentation_order.len().max(1);
     let limits = Limits::default();
     let samples = block_on(video.to_encoded_video_samples(&source, &limits))?;
-    let reader = ExactFrameReader::new(
-        &native_hevc_video_decoder_factory(),
-        VideoDecoderConfig {
-            codec: video.codec,
-            profile: CodecProfile::HevcMain,
-            coded_dimensions: dimensions,
-            output_format: PixelFormat::Rgba8,
-            color_range: ColorRange::Limited,
-            hardware: HardwarePreference::Avoid,
-            configuration: video.decoder_config.clone(),
-        },
-        samples,
-        limits,
-    )?;
+    let factory = native_hevc_video_decoder_factory();
+    let configuration = VideoDecoderConfig {
+        codec: video.codec,
+        profile: CodecProfile::HevcMain,
+        coded_dimensions: dimensions,
+        output_format: PixelFormat::Rgba8,
+        color_range: ColorRange::Limited,
+        hardware: HardwarePreference::Prefer,
+        configuration: video.decoder_config.clone(),
+    };
+    let support = factory.capability(&configuration);
+    let reader = ExactFrameReader::new(&factory, configuration, samples, limits)?;
+    println!("Selected {support:?} HEVC decoding.");
     println!(
         "Rendering decoded {:?} pixels through native OpenGL.",
         video.codec
@@ -136,11 +133,9 @@ struct DecodedFrame {
 /// Decodes the (looping) video on a dedicated background thread and hands finished frames to
 /// the render loop through a bounded channel.
 ///
-/// The bundled native HEVC decoder is a dependency-free, pure-Rust software decoder with no fast
-/// path for 1080p sources, so it cannot keep up with the sample's real-time frame rate. Running
-/// it inline in the render callback (as before) stalled every redraw on a full frame decode,
-/// dropping the window to about 1 FPS (#89). Decoding on its own thread lets the render loop keep
-/// redrawing at the display's own pace, simply showing the newest frame that has finished.
+/// The accelerated decoder exceeds the bundled sample's source rate on supported hardware. The
+/// software fallback remains slower at 1080p; keeping either backend off the render callback lets
+/// the window redraw at the display's own pace while showing the newest completed frame.
 struct DecodeThread {
     frames: Receiver<DecodedFrame>,
     cancellation: CancellationToken,
