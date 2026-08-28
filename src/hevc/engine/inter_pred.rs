@@ -301,6 +301,39 @@ pub fn interp_luma_block(
         return Err(InterPredError::InvalidBitDepth(bit_depth));
     }
 
+    if x_frac != 0 && y_frac != 0 {
+        let shift1 = interp_shift1(bit_depth);
+        let hk = &LUMA_FILTER[x_frac as usize];
+        let vk = &LUMA_FILTER[y_frac as usize];
+        // The two-dimensional filter is separable. Cache each horizontal
+        // result for the block plus its seven vertical halo rows, then reuse
+        // it across the vertical pass instead of recomputing eight horizontal
+        // dot products for every output sample.
+        let intermediate_h = n_pb_h + 7;
+        let mut horizontal = vec![0i32; n_pb_w * intermediate_h];
+        for row in 0..intermediate_h {
+            let source_y = y_int - 3 + row as i32;
+            for x in 0..n_pb_w {
+                let mut acc = 0i32;
+                for (tap, &coefficient) in hk.iter().enumerate() {
+                    acc += coefficient * plane.at(x_int + x as i32 - 3 + tap as i32, source_y);
+                }
+                horizontal[row * n_pb_w + x] = acc >> shift1;
+            }
+        }
+        let mut out = vec![0i32; n_pb_w * n_pb_h];
+        for y in 0..n_pb_h {
+            for x in 0..n_pb_w {
+                let mut acc = 0i32;
+                for (tap, &coefficient) in vk.iter().enumerate() {
+                    acc += coefficient * horizontal[(y + tap) * n_pb_w + x];
+                }
+                out[y * n_pb_w + x] = acc >> 6;
+            }
+        }
+        return Ok(out);
+    }
+
     let mut out = vec![0i32; n_pb_w * n_pb_h];
     for yl in 0..n_pb_h as i32 {
         for xl in 0..n_pb_w as i32 {
@@ -422,6 +455,35 @@ pub fn interp_chroma_block(
     }
     if !(8..=16).contains(&bit_depth) {
         return Err(InterPredError::InvalidBitDepth(bit_depth));
+    }
+
+    if x_frac != 0 && y_frac != 0 {
+        let shift1 = interp_shift1(bit_depth);
+        let hk = &CHROMA_FILTER[x_frac as usize];
+        let vk = &CHROMA_FILTER[y_frac as usize];
+        let intermediate_h = block_h + 3;
+        let mut horizontal = vec![0i32; block_w * intermediate_h];
+        for row in 0..intermediate_h {
+            let source_y = y_int - 1 + row as i32;
+            for x in 0..block_w {
+                let mut acc = 0i32;
+                for (tap, &coefficient) in hk.iter().enumerate() {
+                    acc += coefficient * plane.at(x_int + x as i32 - 1 + tap as i32, source_y);
+                }
+                horizontal[row * block_w + x] = acc >> shift1;
+            }
+        }
+        let mut out = vec![0i32; block_w * block_h];
+        for y in 0..block_h {
+            for x in 0..block_w {
+                let mut acc = 0i32;
+                for (tap, &coefficient) in vk.iter().enumerate() {
+                    acc += coefficient * horizontal[(y + tap) * block_w + x];
+                }
+                out[y * block_w + x] = acc >> 6;
+            }
+        }
+        return Ok(out);
     }
 
     let mut out = vec![0i32; block_w * block_h];

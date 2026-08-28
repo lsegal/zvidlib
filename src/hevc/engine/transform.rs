@@ -462,6 +462,9 @@ pub fn inverse_transform(
         for (y, cv) in col.iter_mut().enumerate() {
             *cv = d[y * n_tbs + x] as i64;
         }
+        if col.iter().all(|&value| value == 0) {
+            continue;
+        }
         let te = &mut out_buf[..n_tbs];
         transform_1d_into(col, n_tbs, tr_type, te);
         for (y, &v) in te.iter().enumerate() {
@@ -481,6 +484,9 @@ pub fn inverse_transform(
         let row = &mut in_buf[..n_tbs];
         for (x, rv) in row.iter_mut().enumerate() {
             *rv = g[y * n_tbs + x];
+        }
+        if row.iter().all(|&value| value == 0) {
+            continue;
         }
         let tr = &mut out_buf[..n_tbs];
         transform_1d_into(row, n_tbs, tr_type, tr);
