@@ -24,8 +24,8 @@ Opens the sample, decodes its HEVC Main frames in pure Rust, and drives the real
 OpenGL upload path (`execute_transfer`) through a `GraphicsAdapter` backed by a real `winit`
 window and `glutin` OpenGL context, so the uploaded frames are drawn to an actual window on all
 platforms (Windows, macOS, and Linux). Playback loops back to the first frame once the last one
-has been shown, matching the web example's looping behavior, and an FPS counter is drawn in the
-window's top-left corner.
+has been shown, matching the web example's looping behavior, and the decoded-frame playback rate
+is drawn in the window's top-left corner.
 
 ```console
 cargo run --example native_gl --features native
