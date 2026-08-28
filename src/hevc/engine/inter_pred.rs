@@ -999,7 +999,7 @@ fn combine_chroma<'a>(
     }
 }
 
-#[cfg(any())]
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1017,6 +1017,48 @@ mod tests {
                 for &s in &blk {
                     assert_eq!(s, 100 << 6, "xf={xf} yf={yf}");
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn separable_luma_block_matches_per_sample_reference() {
+        let samples = (0..24 * 20)
+            .map(|index| (index * 37 + index / 11) & 0xff)
+            .collect::<Vec<_>>();
+        let plane = RefPlane::new(&samples, 24, 20).unwrap();
+        for x_frac in 1..=3 {
+            for y_frac in 1..=3 {
+                let actual = interp_luma_block(&plane, -1, 2, x_frac, y_frac, 9, 7, 8).unwrap();
+                let expected = (0..7)
+                    .flat_map(|y| {
+                        (0..9).map(move |x| {
+                            interp_luma_sample(&plane, -1 + x, 2 + y, x_frac, y_frac, 8)
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(actual, expected, "x_frac={x_frac} y_frac={y_frac}");
+            }
+        }
+    }
+
+    #[test]
+    fn separable_chroma_block_matches_per_sample_reference() {
+        let samples = (0..13 * 11)
+            .map(|index| (index * 53 + index / 7) & 0xff)
+            .collect::<Vec<_>>();
+        let plane = RefPlane::new(&samples, 13, 11).unwrap();
+        for x_frac in 1..=7 {
+            for y_frac in 1..=7 {
+                let actual = interp_chroma_block(&plane, 3, -1, x_frac, y_frac, 6, 5, 8).unwrap();
+                let expected = (0..5)
+                    .flat_map(|y| {
+                        (0..6).map(move |x| {
+                            interp_chroma_sample(&plane, 3 + x, -1 + y, x_frac, y_frac, 8)
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(actual, expected, "x_frac={x_frac} y_frac={y_frac}");
             }
         }
     }
