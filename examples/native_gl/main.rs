@@ -8,7 +8,8 @@
 //! window on all platforms. The example prefers the accelerated Windows NVDEC/Media Foundation
 //! backend and falls back to the dependency-free software decoder. Decoding runs on a background
 //! thread, and the render loop displays the newest completed frame. Playback loops back to the
-//! first frame once the last one is shown, and an FPS counter is drawn in the top-left corner.
+//! first frame once the last one is shown, and the decoded-frame playback rate is drawn in the
+//! top-left corner.
 //!
 //! Run with:
 //!
@@ -210,7 +211,7 @@ impl App {
         Self {
             dimensions,
             decoder,
-            fps: FpsCounter::new(Instant::now()),
+            fps: FpsCounter::new(),
             state: None,
             error: None,
         }
@@ -234,7 +235,7 @@ impl App {
             return;
         };
 
-        match self.decoder.latest() {
+        let frame_presented = match self.decoder.latest() {
             Ok(Some(decoded)) => {
                 let resource = GraphicsResource::new(
                     GraphicsApi::NativeOpenGl,
@@ -259,17 +260,18 @@ impl App {
                 ) {
                     return self.fail(event_loop, error);
                 }
+                true
             }
-            Ok(None) => {}
+            Ok(None) => false,
             Err(()) => {
                 return self.fail(
                     event_loop,
                     invalid("the decode thread stopped unexpectedly"),
                 );
             }
-        }
+        };
 
-        let fps = self.fps.tick(Instant::now());
+        let fps = self.fps.update(frame_presented, Instant::now());
         state.adapter.draw(TEXTURE_HANDLE, self.dimensions, fps);
         if let Err(error) = state.surface.swap_buffers(&state.context) {
             return self.fail(

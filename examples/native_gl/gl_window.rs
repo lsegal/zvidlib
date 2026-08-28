@@ -133,25 +133,32 @@ fn rasterize_text(text: &str, scale: usize) -> (usize, usize, Vec<u8>) {
     (width, height, data)
 }
 
-/// Tracks per-frame timing and reports a smoothed frames-per-second value.
+/// Tracks presented video-frame timing and reports a smoothed frames-per-second value.
 pub struct FpsCounter {
-    last: Instant,
+    last: Option<Instant>,
     smoothed: f32,
 }
 
 impl FpsCounter {
-    pub fn new(now: Instant) -> Self {
+    pub fn new() -> Self {
         Self {
-            last: now,
+            last: None,
             smoothed: 0.0,
         }
     }
 
-    pub fn tick(&mut self, now: Instant) -> f32 {
+    /// Updates the measurement for a render pass, sampling time only when a new video frame was
+    /// presented. Redraw-only passes retain the last reported playback rate.
+    pub fn update(&mut self, frame_presented: bool, now: Instant) -> f32 {
+        if !frame_presented {
+            return self.smoothed;
+        }
+        let Some(last) = self.last.replace(now) else {
+            return self.smoothed;
+        };
         let delta = now
-            .saturating_duration_since(self.last)
+            .saturating_duration_since(last)
             .max(Duration::from_micros(1));
-        self.last = now;
         let instantaneous = 1.0 / delta.as_secs_f32();
         // Exponential moving average so the on-screen counter doesn't flicker every frame.
         self.smoothed = if self.smoothed == 0.0 {
@@ -160,6 +167,38 @@ impl FpsCounter {
             self.smoothed * 0.9 + instantaneous * 0.1
         };
         self.smoothed
+    }
+}
+
+#[cfg(test)]
+mod fps_counter_tests {
+    use super::*;
+
+    #[test]
+    fn reports_the_rate_of_presented_video_frames() {
+        let start = Instant::now();
+        let mut counter = FpsCounter::new();
+
+        assert_eq!(counter.update(true, start), 0.0);
+
+        let measured = counter.update(true, start + Duration::from_millis(100));
+        assert!((measured - 10.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn retains_the_last_rate_between_presented_frames() {
+        let start = Instant::now();
+        let mut counter = FpsCounter::new();
+        counter.update(true, start);
+        let measured = counter.update(true, start + Duration::from_millis(100));
+
+        assert_eq!(
+            counter.update(false, start + Duration::from_millis(150)),
+            measured
+        );
+
+        let next = counter.update(true, start + Duration::from_millis(200));
+        assert!((next - 10.0).abs() < f32::EPSILON);
     }
 }
 
