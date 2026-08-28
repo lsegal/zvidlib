@@ -92,13 +92,26 @@ impl VideoDecoderFactory for HevcDecoderFactory {
             #[cfg(windows)]
             {
                 #[cfg(target_pointer_width = "64")]
-                match windows_nvdec::create(configuration, limits, &parsed.record) {
-                    Ok(decoder) => return Ok(decoder),
-                    Err(_) => {}
-                }
+                let earlier_error =
+                    match windows_nvdec::create(configuration, limits, &parsed.record) {
+                        Ok(decoder) => return Ok(decoder),
+                        Err(error) => Some(error),
+                    };
+                #[cfg(not(target_pointer_width = "64"))]
+                let earlier_error: Option<Error> = None;
                 match windows_mf::create(configuration, limits, &parsed.record) {
                     Ok(decoder) => return Ok(decoder),
                     Err(error) if configuration.hardware == HardwarePreference::Require => {
+                        if let Some(earlier) = earlier_error {
+                            return Err(Error::new(
+                                ErrorKind::Unsupported,
+                                format!(
+                                    "hardware HEVC decoding is unavailable (NVDEC: {}; Media Foundation: {})",
+                                    earlier.message(),
+                                    error.message()
+                                ),
+                            ));
+                        }
                         return Err(error);
                     }
                     Err(_) => {}
