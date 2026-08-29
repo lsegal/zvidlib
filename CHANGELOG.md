@@ -4,6 +4,7 @@ All notable changes to zvidlib will be documented in this file.
 
 ## Unreleased
 
+- Draw an on-screen control legend in the `native_gl` example listing the play/pause, frame-stepping, five-second seek, and timeline-scrub controls above the timeline bar. The legend fades out a few seconds after startup so it does not cover the video, and `H` shows or hides it again. The example's 5x7 bitmap font now covers uppercase `A`-`Z`, `/`, `-`, `+`, and space in addition to the digits it already had, while the `FPS: n.n` overlay renders exactly as before.
 - Add playback controls to the native GL and web canvas examples, including play/pause, five-second rewind/fast-forward, previous/next frame stepping, and a hover-scrubbable timeline bar; audio and video stay synchronized while seeking, and scrubbing keeps playing when playback was running.
 - Update README building/testing wording to reflect the implemented AAC-LC native decode/output path and browser AAC packet/config playback support while keeping portable audio-device abstractions listed as planned.
 - Lock the native GL and web canvas examples to each video's MP4 presentation timing, preventing accelerated decoders and high-refresh displays from running playback above the source frame rate; browser `VideoStream` now exposes `frameDuration(index)` for this pacing even when codec decode is unavailable.
