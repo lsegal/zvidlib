@@ -57,6 +57,36 @@ async fn parse_video_track(source: &MemorySource, index: u32, limits: &Limits) -
         .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "no such video track"))
 }
 
+/// Returns each video sample's presentation duration in milliseconds.
+///
+/// Timing is parsed independently from WebCodecs capability discovery so callers can still pace
+/// fallback rendering when the browser cannot decode the track's codec.
+pub async fn video_frame_durations_ms(
+    bytes: &[u8],
+    track_index: u32,
+    limits: &Limits,
+) -> Result<Vec<f64>> {
+    let source = MemorySource::new(bytes.to_vec());
+    let track = parse_video_track(&source, track_index, limits).await?;
+    let milliseconds_per_tick = 1_000.0 / f64::from(track.timescale);
+    track
+        .presentation_order
+        .iter()
+        .map(|&decode_index| {
+            track
+                .samples
+                .get(decode_index)
+                .map(|sample| f64::from(sample.duration) * milliseconds_per_tick)
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::MalformedMedia,
+                        "video presentation index references a missing sample",
+                    )
+                })
+        })
+        .collect()
+}
+
 /// A lazily-configured `WebCodecs` decode session for one input video track.
 pub struct WebVideoDecodeSession {
     samples: Vec<EncodedVideoSample>,

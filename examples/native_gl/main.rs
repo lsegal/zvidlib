@@ -24,7 +24,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, TryRecvError, sync_channel};
 use std::task::{Context, Poll, Waker};
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use glutin::config::ConfigTemplateBuilder;
 use glutin::context::{ContextApi, ContextAttributesBuilder, PossiblyCurrentContext};
@@ -93,7 +93,17 @@ fn run() -> Result<()> {
         video.samples.len(),
         video.presentation_order.len(),
     );
-    let frame_count = video.presentation_order.len().max(1);
+    let frame_durations = video
+        .presentation_order
+        .iter()
+        .map(|&decode_index| {
+            let sample = video
+                .samples
+                .get(decode_index)
+                .ok_or_else(|| invalid("video presentation index references a missing sample"))?;
+            sample_duration(sample.duration, video.timescale)
+        })
+        .collect::<Result<Vec<_>>>()?;
     let limits = Limits::default();
     let samples = block_on(video.to_encoded_video_samples(&source, &limits))?;
     let factory = native_hevc_video_decoder_factory();
@@ -114,7 +124,7 @@ fn run() -> Result<()> {
         video.codec
     );
 
-    let decoder = DecodeThread::spawn(reader, frame_count);
+    let decoder = DecodeThread::spawn(reader, frame_durations);
     let mut app = App::new(dimensions, decoder);
     let event_loop = EventLoop::new()
         .map_err(|error| invalid(format!("could not create the event loop: {error}")))?;
@@ -128,6 +138,7 @@ fn run() -> Result<()> {
 /// One decoded frame handed from the background decode thread to the render loop.
 struct DecodedFrame {
     frame: VideoFrame,
+    display_duration: Duration,
 }
 
 /// Decodes the (looping) video on a dedicated background thread and hands finished frames to
@@ -143,7 +154,7 @@ struct DecodeThread {
 }
 
 impl DecodeThread {
-    fn spawn(mut reader: ExactFrameReader, frame_count: usize) -> Self {
+    fn spawn(mut reader: ExactFrameReader, frame_durations: Vec<Duration>) -> Self {
         let (sender, frames) = sync_channel(1);
         let cancellation = CancellationToken::new();
         let thread_cancellation = cancellation.clone();
@@ -154,10 +165,17 @@ impl DecodeThread {
                     Ok(frame) => frame,
                     Err(_) => return,
                 };
-                if sender.send(DecodedFrame { frame }).is_err() {
+                let display_duration = frame_durations[index];
+                if sender
+                    .send(DecodedFrame {
+                        frame,
+                        display_duration,
+                    })
+                    .is_err()
+                {
                     return;
                 }
-                index = (index + 1) % frame_count.max(1);
+                index = (index + 1) % frame_durations.len();
             }
         });
         Self {
@@ -167,15 +185,12 @@ impl DecodeThread {
         }
     }
 
-    /// Returns the newest decoded frame, if one has finished since the last call.
-    fn latest(&mut self) -> std::result::Result<Option<DecodedFrame>, ()> {
-        let mut newest = None;
-        loop {
-            match self.frames.try_recv() {
-                Ok(frame) => newest = Some(frame),
-                Err(TryRecvError::Empty) => return Ok(newest),
-                Err(TryRecvError::Disconnected) => return Err(()),
-            }
+    /// Returns the next decoded frame without draining later frames from the bounded channel.
+    fn next(&mut self) -> std::result::Result<Option<DecodedFrame>, ()> {
+        match self.frames.try_recv() {
+            Ok(frame) => Ok(Some(frame)),
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(TryRecvError::Disconnected) => Err(()),
         }
     }
 }
@@ -194,6 +209,7 @@ struct App {
     dimensions: VideoDimensions,
     decoder: DecodeThread,
     fps: FpsCounter,
+    pacer: FramePacer,
     state: Option<WindowState>,
     error: Option<Error>,
 }
@@ -211,6 +227,7 @@ impl App {
             dimensions,
             decoder,
             fps: FpsCounter::new(),
+            pacer: FramePacer::new(),
             state: None,
             error: None,
         }
@@ -234,43 +251,49 @@ impl App {
             return;
         };
 
-        let frame_presented = match self.decoder.latest() {
-            Ok(Some(decoded)) => {
-                let resource = GraphicsResource::new(
-                    GraphicsApi::NativeOpenGl,
-                    state.adapter.context_identity(),
-                    state.adapter.execution_owner(),
-                    ResourceKind::Texture2d,
-                    TEXTURE_HANDLE,
-                    self.dimensions,
-                    PixelFormat::Rgba8,
-                    ColorRange::Limited,
-                    Orientation::TopLeft,
-                    ResourceOwnership::Caller,
-                );
-                if let Err(error) = execute_transfer(
-                    Some(&mut state.adapter),
-                    FrameSource::Cpu(CpuFrameSource {
-                        frame: &decoded.frame,
-                        orientation: Orientation::TopLeft,
-                    }),
-                    FrameDestination::Graphics(resource),
-                    TransferPolicy::any(),
-                ) {
-                    return self.fail(event_loop, error);
+        let now = Instant::now();
+        let frame_presented = if !self.pacer.ready(now) {
+            false
+        } else {
+            match self.decoder.next() {
+                Ok(Some(decoded)) => {
+                    let resource = GraphicsResource::new(
+                        GraphicsApi::NativeOpenGl,
+                        state.adapter.context_identity(),
+                        state.adapter.execution_owner(),
+                        ResourceKind::Texture2d,
+                        TEXTURE_HANDLE,
+                        self.dimensions,
+                        PixelFormat::Rgba8,
+                        ColorRange::Limited,
+                        Orientation::TopLeft,
+                        ResourceOwnership::Caller,
+                    );
+                    if let Err(error) = execute_transfer(
+                        Some(&mut state.adapter),
+                        FrameSource::Cpu(CpuFrameSource {
+                            frame: &decoded.frame,
+                            orientation: Orientation::TopLeft,
+                        }),
+                        FrameDestination::Graphics(resource),
+                        TransferPolicy::any(),
+                    ) {
+                        return self.fail(event_loop, error);
+                    }
+                    self.pacer.presented(decoded.display_duration, now);
+                    true
                 }
-                true
-            }
-            Ok(None) => false,
-            Err(()) => {
-                return self.fail(
-                    event_loop,
-                    invalid("the decode thread stopped unexpectedly"),
-                );
+                Ok(None) => false,
+                Err(()) => {
+                    return self.fail(
+                        event_loop,
+                        invalid("the decode thread stopped unexpectedly"),
+                    );
+                }
             }
         };
 
-        let fps = self.fps.update(frame_presented, Instant::now());
+        let fps = self.fps.update(frame_presented, now);
         state.adapter.draw(TEXTURE_HANDLE, self.dimensions, fps);
         if let Err(error) = state.surface.swap_buffers(&state.context) {
             return self.fail(
@@ -280,6 +303,84 @@ impl App {
         }
 
         state.window.request_redraw();
+    }
+}
+
+/// Prevents decoded frames from being displayed faster than their source presentation durations.
+struct FramePacer {
+    next_frame_at: Option<Instant>,
+}
+
+impl FramePacer {
+    fn new() -> Self {
+        Self {
+            next_frame_at: None,
+        }
+    }
+
+    fn ready(&self, now: Instant) -> bool {
+        self.next_frame_at.is_none_or(|deadline| now >= deadline)
+    }
+
+    fn presented(&mut self, duration: Duration, now: Instant) {
+        let scheduled = self.next_frame_at.map_or(now + duration, |deadline| {
+            deadline.checked_add(duration).unwrap_or(now + duration)
+        });
+        self.next_frame_at = Some(if scheduled < now {
+            now + duration
+        } else {
+            scheduled
+        });
+    }
+}
+
+fn sample_duration(ticks: u32, timescale: u32) -> Result<Duration> {
+    if ticks == 0 || timescale == 0 {
+        return Err(invalid("video sample timing must be nonzero"));
+    }
+    let nanos = u64::from(ticks)
+        .checked_mul(1_000_000_000)
+        .ok_or_else(|| invalid("video sample duration overflow"))?;
+    Ok(Duration::from_nanos(
+        (nanos + u64::from(timescale) / 2) / u64::from(timescale),
+    ))
+}
+
+#[cfg(test)]
+mod pacing_tests {
+    use super::*;
+
+    #[test]
+    fn converts_mp4_timing_to_a_frame_duration() {
+        assert_eq!(
+            sample_duration(512, 12_288).unwrap(),
+            Duration::from_nanos(41_666_667)
+        );
+    }
+
+    #[test]
+    fn waits_a_full_source_duration_after_each_presented_frame() {
+        let start = Instant::now();
+        let duration = Duration::from_millis(40);
+        let mut pacer = FramePacer::new();
+
+        assert!(pacer.ready(start));
+        pacer.presented(duration, start);
+        assert!(!pacer.ready(start + Duration::from_millis(39)));
+        assert!(pacer.ready(start + duration));
+
+        // A display refresh that arrives after one deadline keeps the following frame aligned to
+        // the original source timeline instead of quantizing every interval up to the refresh.
+        let refresh = start + Duration::from_millis(50);
+        pacer.presented(duration, refresh);
+        assert!(!pacer.ready(start + Duration::from_millis(79)));
+        assert!(pacer.ready(start + Duration::from_millis(80)));
+
+        // A genuinely late frame starts a fresh interval so playback never races to catch up.
+        let late = start + Duration::from_millis(200);
+        pacer.presented(duration, late);
+        assert!(!pacer.ready(late + Duration::from_millis(39)));
+        assert!(pacer.ready(late + duration));
     }
 }
 

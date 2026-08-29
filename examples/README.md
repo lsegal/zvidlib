@@ -26,8 +26,9 @@ Opens the sample, selects accelerated HEVC Main decoding when available (printin
 `CodecImplementation`), and drives the real CPU → native OpenGL upload path (`execute_transfer`)
 through a `GraphicsAdapter` backed by a real `winit` window and `glutin` OpenGL context on Windows,
 macOS, and Linux. Playback loops back to the first frame once the last one has been shown, matching
-the web example's looping behavior, and the decoded-frame playback rate is drawn in the window's
-top-left corner.
+the web example's looping behavior. Frames are held for their MP4 presentation durations, so fast
+decoders cannot run playback above the source frame rate, and the decoded-frame playback rate is
+drawn in the window's top-left corner.
 
 ```console
 cargo run --example native_gl --features native
@@ -38,7 +39,9 @@ cargo run --example native_gl --features native
 A browser page that opens the sample as a `Blob`, creates a WebGL2 canvas context, and drives the
 same CPU → WebGL upload path via the generated `zvidlib` package. It calls `video.get()` for each
 displayed frame and uploads the real decoded RGBA pixels; if the browser cannot decode HEVC it
-falls back to a synthetic gradient sized to the real track instead.
+falls back to a synthetic gradient sized to the real track instead. Both paths use
+`video.frameDuration()` to pace rendering from the MP4 sample timing rather than the browser's
+display refresh rate.
 
 `examples/web_canvas/package.json` wraps the whole setup in one command. From `examples/web_canvas/`:
 
