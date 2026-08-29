@@ -14,7 +14,7 @@ use crate::mp4_demux::{Mp4Demuxer, Mp4DemuxerOptions, Mp4Track};
 use crate::timeline::FrameIndex;
 use crate::{Error, ErrorKind, Limits, Result};
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
@@ -108,6 +108,11 @@ pub struct WebVideoDecodeSession {
     /// decoder, which is what lets a session walk arbitrarily deep into a
     /// single GOP (see `get()` for why resets are otherwise required).
     next_decode_position: Option<usize>,
+    /// Presentation frames the decoder has already emitted since the last
+    /// reset. A `WebCodecs` decoder never emits the same presentation frame
+    /// twice without an intervening reset, so this is the only condition
+    /// that genuinely forces one; see `get()`.
+    published_since_reset: HashSet<FrameIndex>,
     /// Resolver for a pending "wait for the next decoder event" `Promise`,
     /// set by `wait_for_output()` and fulfilled by the output/error
     /// closures below.
@@ -201,6 +206,7 @@ impl WebVideoDecodeSession {
             cache: HashMap::new(),
             cache_order: VecDeque::new(),
             next_decode_position: None,
+            published_since_reset: HashSet::new(),
             waker,
             limits: *limits,
             _output_closure: output_closure,
@@ -230,13 +236,6 @@ impl WebVideoDecodeSession {
                 Error::new(ErrorKind::InvalidInput, "presentation frame is not indexed")
             })?;
         let random_access_position = self.nearest_random_access(target_position);
-        let required_span = target_position - random_access_position + 1;
-        if required_span > self.limits.max_decode_samples_per_seek as usize {
-            return Err(Error::new(
-                ErrorKind::ResourceLimit,
-                "exact-frame request exceeded the configured decode-work limit",
-            ));
-        }
 
         // Chrome's WebCodecs `VideoDecoder` requires the next submitted
         // chunk to be a key frame after every `flush()`, not just after
@@ -249,26 +248,42 @@ impl WebVideoDecodeSession {
         // `flush()` promise, so a session can walk arbitrarily deep into a
         // single GOP without ever triggering the key-frame-after-flush
         // requirement.
-        let can_reuse = self.next_decode_position.is_some_and(|position| {
-            position >= random_access_position && position <= target_position
-        });
+        let can_reuse = can_continue_session(
+            self.next_decode_position,
+            random_access_position,
+            &self.published_since_reset,
+            presentation_index,
+        );
         if !can_reuse {
+            // Only a reset re-decodes the whole span from the key frame, so
+            // that is the only case the decode-work limit has to bound up
+            // front; a continued session's work is bounded per call below.
+            let required_span = target_position - random_access_position + 1;
+            if required_span > self.limits.max_decode_samples_per_seek as usize {
+                return Err(Error::new(
+                    ErrorKind::ResourceLimit,
+                    "exact-frame request exceeded the configured decode-work limit",
+                ));
+            }
             self.decoder.reset().map_err(|error| {
                 normalize_js_error(error, "resetting the WebCodecs VideoDecoder")
             })?;
-            self.pending_frames.borrow_mut().clear();
+            self.close_pending_frames();
             *self.decode_error.borrow_mut() = None;
+            self.published_since_reset.clear();
             self.decoder.configure(&self.config).map_err(|error| {
                 normalize_js_error(error, "reconfiguring the WebCodecs VideoDecoder")
             })?;
             self.next_decode_position = Some(random_access_position);
         }
 
+        let mut submitted = 0_u32;
         while let Some(position) = self.next_decode_position {
             if position > target_position {
                 break;
             }
             self.submit_at(position)?;
+            submitted += 1;
         }
 
         let mut drained_after_flush = false;
@@ -298,10 +313,10 @@ impl WebVideoDecodeSession {
             // while there is more to submit.
             if let Some(position) = self.next_decode_position {
                 if position < self.samples.len()
-                    && position - random_access_position
-                        < self.limits.max_decode_samples_per_seek as usize
+                    && submitted < self.limits.max_decode_samples_per_seek
                 {
                     self.submit_at(position)?;
+                    submitted += 1;
                     continue;
                 }
             }
@@ -332,10 +347,24 @@ impl WebVideoDecodeSession {
         for frame in frames {
             let index = FrameIndex(frame.timestamp() as u64);
             let copied = self.copy_frame_rgba(&frame).await;
+            // Every `VideoFrame` handed to the output callback owns a real
+            // platform decode buffer, so it must be closed explicitly and
+            // deterministically; letting one reach the garbage collector
+            // stalls Chrome's decoder and logs "A VideoFrame was garbage
+            // collected without being closed".
             frame.close();
+            self.published_since_reset.insert(index);
             if let Ok(value) = copied {
                 self.insert_cache(index, value);
             }
+        }
+    }
+
+    /// Closes and discards every frame the decoder emitted but that has not
+    /// been drained yet, so no `VideoFrame` is ever dropped unclosed.
+    fn close_pending_frames(&self) {
+        for frame in std::mem::take(&mut *self.pending_frames.borrow_mut()) {
+            frame.close();
         }
     }
 
@@ -422,6 +451,36 @@ impl WebVideoDecodeSession {
     }
 }
 
+impl Drop for WebVideoDecodeSession {
+    fn drop(&mut self) {
+        self.close_pending_frames();
+        let _ = self.decoder.close();
+    }
+}
+
+/// Decides whether the requested presentation frame can still be reached by
+/// continuing the open decode session instead of resetting the decoder.
+///
+/// A decoder with output reordering (HEVC hierarchical B-frames, for example)
+/// must be fed samples *past* the requested frame's decode position before
+/// that frame is emitted, so `next_decode_position` legitimately runs ahead of
+/// the target during ordinary sequential presentation-order playback.
+/// Requiring `next_decode_position <= target_position` therefore forced a
+/// reset-and-redecode from the key frame on almost every call, which made
+/// playback O(n^2) in decode work. The only condition that genuinely requires
+/// a reset is the frame having already been emitted once since the last reset
+/// (and since evicted from the cache), because a `WebCodecs` decoder will not
+/// emit the same presentation frame twice without one.
+fn can_continue_session(
+    next_decode_position: Option<usize>,
+    random_access_position: usize,
+    published_since_reset: &HashSet<FrameIndex>,
+    presentation_index: FrameIndex,
+) -> bool {
+    next_decode_position.is_some_and(|position| position >= random_access_position)
+        && !published_since_reset.contains(&presentation_index)
+}
+
 fn normalize_js_error(error: JsValue, context: &str) -> Error {
     let detail = js_sys::Reflect::get(&error, &JsValue::from_str("message"))
         .ok()
@@ -429,4 +488,60 @@ fn normalize_js_error(error: JsValue, context: &str) -> Error {
         .or_else(|| error.as_string())
         .unwrap_or_else(|| "WebCodecs operation failed".to_owned());
     Error::new(ErrorKind::Codec, format!("{context}: {detail}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wasm_bindgen_test::*;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    #[wasm_bindgen_test]
+    fn reordered_output_keeps_the_session_open_past_the_target_position() {
+        // Sequential presentation-order playback of hierarchical B-frames
+        // leaves `next_decode_position` ahead of the next requested frame's
+        // decode position. That must not force a reset, or every displayed
+        // frame re-decodes the whole GOP from its key frame.
+        let published = HashSet::new();
+        assert!(can_continue_session(Some(9), 0, &published, FrameIndex(2)));
+        assert!(can_continue_session(
+            Some(120),
+            0,
+            &published,
+            FrameIndex(3)
+        ));
+    }
+
+    #[wasm_bindgen_test]
+    fn a_frame_already_emitted_since_the_last_reset_requires_a_reset() {
+        // A `WebCodecs` decoder will not emit the same presentation frame
+        // twice, so a re-request after cache eviction genuinely needs one.
+        let published = HashSet::from([FrameIndex(2)]);
+        assert!(!can_continue_session(Some(9), 0, &published, FrameIndex(2)));
+        assert!(can_continue_session(Some(9), 0, &published, FrameIndex(3)));
+    }
+
+    #[wasm_bindgen_test]
+    fn seeking_before_the_open_session_random_access_point_requires_a_reset() {
+        let published = HashSet::new();
+        assert!(!can_continue_session(
+            Some(4),
+            30,
+            &published,
+            FrameIndex(31)
+        ));
+        assert!(can_continue_session(
+            Some(30),
+            30,
+            &published,
+            FrameIndex(31)
+        ));
+    }
+
+    #[wasm_bindgen_test]
+    fn an_invalidated_session_requires_a_reset() {
+        let published = HashSet::new();
+        assert!(!can_continue_session(None, 0, &published, FrameIndex(0)));
+    }
 }
