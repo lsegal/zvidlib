@@ -4,6 +4,7 @@
 //! typed arrays are snapshots rather than views into growable WebAssembly
 //! memory, and browser-owned objects are retained only as JavaScript handles.
 
+use crate::io::MemorySource;
 use crate::web_decoder::{WebVideoDecodeSession, video_frame_durations_ms};
 use crate::{
     AudioBuffer as CoreAudioBuffer, ColorRange, ErrorKind, FrameIndex as CoreFrameIndex, FrameRate,
@@ -423,6 +424,55 @@ impl WasmAudioBuffer {
     }
 }
 
+/// One indexed compressed AAC access unit from an input MP4 audio track.
+#[wasm_bindgen(js_name = EncodedAudioSample)]
+pub struct WasmEncodedAudioSample(crate::EncodedAudioSample);
+
+#[wasm_bindgen(js_class = EncodedAudioSample)]
+impl WasmEncodedAudioSample {
+    #[wasm_bindgen(getter)]
+    pub fn range(&self) -> WasmSampleRange {
+        WasmSampleRange(self.0.decoded_range)
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn data(&self) -> Uint8Array {
+        owned_u8_array(&self.0.data)
+    }
+}
+
+/// AAC decoder configuration for an input MP4 audio track.
+#[wasm_bindgen(js_name = AacConfig)]
+pub struct WasmAacConfig(crate::AacTrackConfig);
+
+#[wasm_bindgen(js_class = AacConfig)]
+impl WasmAacConfig {
+    #[wasm_bindgen(getter, js_name = audioObjectType)]
+    pub fn audio_object_type(&self) -> u8 {
+        self.0.audio_object_type
+    }
+
+    #[wasm_bindgen(getter, js_name = sampleRate)]
+    pub fn sample_rate(&self) -> u32 {
+        self.0.sample_rate
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn channels(&self) -> u16 {
+        self.0.channels
+    }
+
+    #[wasm_bindgen(getter, js_name = audioSpecificConfig)]
+    pub fn audio_specific_config(&self) -> Uint8Array {
+        owned_u8_array(&self.0.audio_specific_config)
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn codec(&self) -> String {
+        format!("mp4a.40.{}", self.0.audio_object_type)
+    }
+}
+
 #[wasm_bindgen(js_name = OpenOptions)]
 pub struct WasmOpenOptions {
     max_input_bytes: u64,
@@ -738,11 +788,34 @@ impl WasmVideoStream {
     }
 }
 
+async fn parse_audio_track(
+    bytes: Option<Rc<Vec<u8>>>,
+    index: u32,
+) -> Result<crate::Mp4Track, JsValue> {
+    let bytes = bytes.ok_or_else(|| {
+        js_error(
+            ErrorKind::Unsupported,
+            "input audio metadata is unavailable",
+        )
+    })?;
+    let source = MemorySource::new((*bytes).clone());
+    let demuxer = crate::Mp4Demuxer::open(&source, crate::Mp4DemuxerOptions::default())
+        .await
+        .map_err(|error| js_error(error.kind(), error.message()))?;
+    demuxer
+        .tracks
+        .into_iter()
+        .filter(|track| track.kind == crate::TrackKind::Audio)
+        .nth(index as usize)
+        .ok_or_else(|| js_error(ErrorKind::InvalidInput, "no such audio track"))
+}
+
 #[wasm_bindgen(js_name = AudioStream)]
 pub struct WasmAudioStream {
     index: u32,
     state: Rc<Cell<bool>>,
     direction: StreamDirection,
+    bytes: Option<Rc<Vec<u8>>>,
     timeline: Option<Timeline>,
 }
 
@@ -776,6 +849,88 @@ impl WasmAudioStream {
             .audio_interval_for_frame(frame_index)
             .map(WasmSampleRange)
             .map_err(|error| js_error(error.kind(), error.message()))
+    }
+
+    #[wasm_bindgen(js_name = aacConfig)]
+    pub fn aac_config(&self, signal: Option<AbortSignal>) -> Promise {
+        let state = Rc::clone(&self.state);
+        let direction = self.direction;
+        let index = self.index;
+        let bytes = self.bytes.clone();
+        future_to_promise(async move {
+            ensure_open(&state)?;
+            check_signal(signal.as_ref())?;
+            if direction != StreamDirection::Input {
+                return Err(js_error(
+                    ErrorKind::InvalidState,
+                    "aacConfig is only valid on an input audio stream",
+                ));
+            }
+            let track = parse_audio_track(bytes, index).await?;
+            track
+                .aac_config()
+                .map(WasmAacConfig)
+                .map(JsValue::from)
+                .map_err(|error| js_error(error.kind(), error.message()))
+        })
+    }
+
+    #[wasm_bindgen(js_name = packetCount)]
+    pub fn packet_count(&self, signal: Option<AbortSignal>) -> Promise {
+        let state = Rc::clone(&self.state);
+        let direction = self.direction;
+        let index = self.index;
+        let bytes = self.bytes.clone();
+        future_to_promise(async move {
+            ensure_open(&state)?;
+            check_signal(signal.as_ref())?;
+            if direction != StreamDirection::Input {
+                return Err(js_error(
+                    ErrorKind::InvalidState,
+                    "packetCount is only valid on an input audio stream",
+                ));
+            }
+            let track = parse_audio_track(bytes, index).await?;
+            Ok(bigint_u64(track.samples.len() as u64))
+        })
+    }
+
+    #[wasm_bindgen(js_name = packet)]
+    pub fn packet(&self, packet_index: JsValue, signal: Option<AbortSignal>) -> Promise {
+        let state = Rc::clone(&self.state);
+        let direction = self.direction;
+        let index = self.index;
+        let bytes = self.bytes.clone();
+        future_to_promise(async move {
+            ensure_open(&state)?;
+            check_signal(signal.as_ref())?;
+            let packet_index = usize::try_from(parse_u64(&packet_index, "packet index")?)
+                .map_err(|_| js_error(ErrorKind::InvalidInput, "packet index is out of range"))?;
+            if direction != StreamDirection::Input {
+                return Err(js_error(
+                    ErrorKind::InvalidState,
+                    "packet is only valid on an input audio stream",
+                ));
+            }
+            let bytes = bytes.ok_or_else(|| {
+                js_error(
+                    ErrorKind::Unsupported,
+                    "input audio packet metadata is unavailable",
+                )
+            })?;
+            let source = MemorySource::new((*bytes).clone());
+            let track = parse_audio_track(Some(bytes), index).await?;
+            let packets = track
+                .to_encoded_audio_samples(&source, &Limits::default())
+                .await
+                .map_err(|error| js_error(error.kind(), error.message()))?;
+            packets
+                .get(packet_index)
+                .cloned()
+                .map(WasmEncodedAudioSample)
+                .map(JsValue::from)
+                .ok_or_else(|| js_error(ErrorKind::InvalidInput, "AAC packet is not indexed"))
+        })
     }
 
     pub fn get(&self, frame_index: JsValue, signal: Option<AbortSignal>) -> Promise {
@@ -897,6 +1052,7 @@ impl WasmMediaInput {
             index,
             state: Rc::clone(&self.state),
             direction: StreamDirection::Input,
+            bytes: Some(Rc::clone(&self.bytes)),
             timeline: None,
         })
     }
@@ -979,6 +1135,7 @@ impl WasmMediaOutput {
             index,
             state: Rc::clone(&self.state),
             direction: StreamDirection::Output,
+            bytes: None,
             timeline: self.timeline,
         })
     }

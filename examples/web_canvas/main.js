@@ -94,9 +94,11 @@ async function main() {
 
   const input = await MediaInput.open(await response.blob());
   const video = input.video(0);
+  const audio = input.audio(0);
   const lines = [
     `Opened ${input.byteLength} bytes.`,
     `Video stream 0 direction: ${video.direction}`,
+    `Audio stream 0 direction: ${audio.direction}`,
   ];
 
   // Real decoding depends on the browser having an HEVC WebCodecs decoder; fall back to a
@@ -109,11 +111,20 @@ async function main() {
     lines.push(`video.get(0n) rejected with ${errorCode(error)}: falling back to a synthetic frame.`);
   }
   const useRealDecode = decodedFrame !== null;
+  let audioState = null;
+  try {
+    audioState = await prepareAudio(audio);
+    lines.push(`AAC audio ready: ${audioState.config.sampleRate} Hz, ${audioState.config.numberOfChannels} channels.`);
+  } catch (error) {
+    lines.push(`AAC audio unavailable (${errorCode(error) ?? error?.name ?? "ERROR"}): playback will be silent.`);
+  }
+  const frameStarts = await buildFrameStarts(video);
   status.textContent = lines.join("\n");
 
   let playing = false;
   let frameIndex = 0;
   let stopped = false;
+  let videoClockStart = 0;
 
   function uploadFrame(pixels, width, height) {
     gl.bindTexture(gl.TEXTURE_2D, texture);
@@ -131,6 +142,28 @@ async function main() {
       frameIndex = 0;
       return await video.frameDuration(0n);
     }
+  }
+
+  async function buildFrameStarts(video) {
+    const starts = [0];
+    for (let index = 0; ; index++) {
+      try {
+        starts.push(starts[index] + (await video.frameDuration(BigInt(index))));
+      } catch {
+        return starts;
+      }
+    }
+  }
+
+  function frameForMediaTime(milliseconds) {
+    let low = 0;
+    let high = Math.max(0, frameStarts.length - 2);
+    while (low < high) {
+      const mid = Math.floor((low + high + 1) / 2);
+      if (frameStarts[mid] <= milliseconds) low = mid;
+      else high = mid - 1;
+    }
+    return Math.min(low, frameStarts.length - 1);
   }
 
   async function renderFrame() {
@@ -173,27 +206,30 @@ async function main() {
   }
 
   async function renderLoop() {
-    let nextFrameAt = performance.now();
     while (!stopped) {
-      const now = await new Promise((resolve) => requestAnimationFrame(resolve));
-      if (playing && now >= nextFrameAt) {
-        const duration = await renderFrame();
-        tickFps();
-        nextFrameAt += duration;
-        const finishedAt = performance.now();
-        if (nextFrameAt < finishedAt) {
-          // Start a fresh interval after slow decoding or a suspended tab instead of rapidly
-          // presenting queued frames to catch up with an obsolete deadline.
-          nextFrameAt = finishedAt + duration;
+      await new Promise((resolve) => requestAnimationFrame(resolve));
+      if (playing) {
+        if (audioState?.startedAt !== undefined) {
+          const elapsedMs = (audioState.context.currentTime - audioState.startedAt) * 1000;
+          const durationMs = frameStarts[frameStarts.length - 1] || 1;
+          frameIndex = frameForMediaTime(((elapsedMs % durationMs) + durationMs) % durationMs);
+        } else {
+          frameIndex = frameForMediaTime((performance.now() - videoClockStart) % (frameStarts[frameStarts.length - 1] || 1));
         }
-      } else if (!playing) {
-        nextFrameAt = now;
+        await renderFrame();
+        tickFps();
       }
     }
   }
 
-  playButton.addEventListener("click", () => {
+  playButton.addEventListener("click", async () => {
     playing = !playing;
+    if (playing) {
+      videoClockStart = performance.now();
+      if (audioState) await startAudio(audioState);
+    } else if (audioState) {
+      stopAudio(audioState);
+    }
     playButton.textContent = playing ? "Pause" : "Play";
   });
 
@@ -213,6 +249,75 @@ async function main() {
     },
     { once: true },
   );
+}
+
+async function prepareAudio(audio) {
+  if (!globalThis.AudioDecoder) throw new Error("WebCodecs AudioDecoder is unavailable");
+  const config = await audio.aacConfig();
+  const packetCount = Number(await audio.packetCount());
+  const packets = [];
+  for (let index = 0; index < packetCount; index++) {
+    packets.push(await audio.packet(BigInt(index)));
+  }
+  const context = new AudioContext({ sampleRate: config.sampleRate });
+  return {
+    audio,
+    config: {
+      codec: config.codec,
+      sampleRate: config.sampleRate,
+      numberOfChannels: config.channels,
+      description: config.audioSpecificConfig,
+    },
+    context,
+    packets,
+    sources: [],
+  };
+}
+
+async function startAudio(state) {
+  stopAudio(state);
+  await state.context.resume();
+  const startAt = state.context.currentTime + 0.08;
+  const outputs = [];
+  const decoder = new AudioDecoder({
+    output: (data) => outputs.push(data),
+    error: (error) => console.error(error),
+  });
+  decoder.configure(state.config);
+  for (const packet of state.packets) {
+    const range = packet.range;
+    decoder.decode(new EncodedAudioChunk({
+      type: "key",
+      timestamp: Number(range.start) * 1_000_000 / state.config.sampleRate,
+      duration: Number(range.length) * 1_000_000 / state.config.sampleRate,
+      data: packet.data,
+    }));
+  }
+  await decoder.flush();
+  state.startedAt = startAt;
+  for (const data of outputs) {
+    const buffer = state.context.createBuffer(data.numberOfChannels, data.numberOfFrames, data.sampleRate);
+    for (let channel = 0; channel < data.numberOfChannels; channel++) {
+      const plane = new Float32Array(data.numberOfFrames);
+      data.copyTo(plane, { planeIndex: channel, format: "f32-planar" });
+      buffer.copyToChannel(plane, channel);
+    }
+    const source = state.context.createBufferSource();
+    source.buffer = buffer;
+    source.connect(state.context.destination);
+    source.start(startAt + data.timestamp / 1_000_000);
+    state.sources.push(source);
+    data.close();
+  }
+}
+
+function stopAudio(state) {
+  for (const source of state.sources.splice(0)) {
+    try {
+      source.stop();
+    } catch {}
+  }
+  state.startedAt = undefined;
 }
 
 main().catch((error) => {

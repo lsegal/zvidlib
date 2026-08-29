@@ -23,12 +23,12 @@ native OpenGL example still renders the same decoded pixels without requiring a 
 ## Native GL: `native_gl/`
 
 Opens the sample, selects accelerated HEVC Main decoding when available (printing the selected
-`CodecImplementation`), and drives the real CPU → native OpenGL upload path (`execute_transfer`)
-through a `GraphicsAdapter` backed by a real `winit` window and `glutin` OpenGL context on Windows,
-macOS, and Linux. Playback loops back to the first frame once the last one has been shown, matching
-the web example's looping behavior. Frames are held for their MP4 presentation durations, so fast
-decoders cannot run playback above the source frame rate, and the decoded-frame playback rate is
-drawn in the window's top-left corner.
+`CodecImplementation`), extracts the AAC-LC access units from the same MP4 sample index, and plays
+decoded PCM through the default native audio device. The `PlaybackController` uses the audio
+device's sample clock to choose exact video presentation frames from the MP4 PTS/duration map, then
+uploads those decoded RGBA pixels through the real CPU → native OpenGL path (`execute_transfer`).
+Playback loops back to the first frame after end-of-stream, matching the web example's looping
+behavior, and the decoded-frame playback rate is drawn in the window's top-left corner.
 
 ```console
 cargo run --example native_gl --features native
@@ -36,12 +36,13 @@ cargo run --example native_gl --features native
 
 ## Web canvas: `web_canvas/`
 
-A browser page that opens the sample as a `Blob`, creates a WebGL2 canvas context, and drives the
-same CPU → WebGL upload path via the generated `zvidlib` package. It calls `video.get()` for each
-displayed frame and uploads the real decoded RGBA pixels; if the browser cannot decode HEVC it
-falls back to a synthetic gradient sized to the real track instead. Both paths use
-`video.frameDuration()` to pace rendering from the MP4 sample timing rather than the browser's
-display refresh rate.
+A browser page that opens the sample as a `Blob`, creates a WebGL2 canvas context, extracts the
+indexed AAC-LC access units from zvidlib's MP4 demuxer, and schedules decoded PCM through Web
+Audio with WebCodecs `AudioDecoder` after the play button's user gesture. It calls `video.get()`
+for each displayed frame and uploads the real decoded RGBA pixels; if the browser cannot decode
+HEVC it falls back to a synthetic gradient sized to the real track instead. Both paths use MP4
+sample timing and, when audio is available, the `AudioContext` clock rather than display-refresh
+or hard-coded FPS pacing.
 
 `examples/web_canvas/package.json` wraps the whole setup in one command. From `examples/web_canvas/`:
 

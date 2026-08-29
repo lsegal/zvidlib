@@ -88,9 +88,9 @@ pub use mp4_demux::{
 };
 pub use output::{MediaOutput, OutputOptions};
 pub use playback::{
-    AudioOutputBackend, AudioOutputKind, NativeAudioOutput, PlaybackAudioOutput,
-    PlaybackAudioSource, PlaybackController, PlaybackOptions, PlaybackVideoSource, Presentation,
-    WebAudioOutput,
+    AudioOutputBackend, AudioOutputKind, IndexedPresentationTimeline, NativeAudioOutput,
+    PlaybackAudioOutput, PlaybackAudioSource, PlaybackController, PlaybackOptions,
+    PlaybackVideoSource, Presentation, WebAudioOutput,
 };
 pub use timeline::{FrameIndex, FrameRate, Rational, SampleRange, Timeline};
 pub use transfer::{
