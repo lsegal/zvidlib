@@ -4,6 +4,11 @@ import init, { MediaInput, errorCode } from "./pkg/zvidlib.js";
 
 const canvas = document.querySelector("#video");
 const playButton = document.querySelector("#play");
+const rewindButton = document.querySelector("#rewind");
+const fastForwardButton = document.querySelector("#fast-forward");
+const previousFrameButton = document.querySelector("#previous-frame");
+const nextFrameButton = document.querySelector("#next-frame");
+const timeline = document.querySelector("#timeline");
 const status = document.querySelector("#status");
 const fps = document.querySelector("#fps");
 
@@ -119,12 +124,16 @@ async function main() {
     lines.push(`AAC audio unavailable (${errorCode(error) ?? error?.name ?? "ERROR"}): playback will be silent.`);
   }
   const frameStarts = await buildFrameStarts(video);
+  const mediaDurationMs = frameStarts[frameStarts.length - 1] || 1;
+  const lastFrameIndex = Math.max(0, frameStarts.length - 2);
+  timeline.max = String(lastFrameIndex);
   status.textContent = lines.join("\n");
 
   let playing = false;
   let frameIndex = 0;
   let stopped = false;
   let videoClockStart = 0;
+  let pausedMediaTimeMs = 0;
 
   function uploadFrame(pixels, width, height) {
     gl.bindTexture(gl.TEXTURE_2D, texture);
@@ -166,13 +175,73 @@ async function main() {
     return Math.min(low, frameStarts.length - 1);
   }
 
-  async function renderFrame() {
+  function mediaTimeForFrame(index) {
+    return frameStarts[Math.min(Math.max(index, 0), lastFrameIndex)] ?? 0;
+  }
+
+  function syncTimeline() {
+    timeline.value = String(Math.min(frameIndex, lastFrameIndex));
+  }
+
+  function currentMediaTimeMs() {
+    if (!playing) return pausedMediaTimeMs;
+    if (audioState?.startedAt !== undefined) {
+      // Audio is scheduled a few ms ahead of the clock, so clamp the pre-roll window to zero.
+      const elapsedMs = Math.max((audioState.context.currentTime - audioState.startedAt) * 1000, 0);
+      return ((elapsedMs % mediaDurationMs) + mediaDurationMs) % mediaDurationMs;
+    }
+    return (performance.now() - videoClockStart) % mediaDurationMs;
+  }
+
+  async function seekToFrame(index, keepPlaying = playing) {
+    frameIndex = Math.min(Math.max(index, 0), lastFrameIndex);
+    pausedMediaTimeMs = mediaTimeForFrame(frameIndex);
+    if (audioState) stopAudio(audioState);
+    if (keepPlaying && audioState) await startAudio(audioState, pausedMediaTimeMs);
+    if (keepPlaying && !audioState) videoClockStart = performance.now() - pausedMediaTimeMs;
+    await renderFrame(false);
+    syncTimeline();
+  }
+
+  // Pointer scrubbing can outrun the decoder, so keep only the newest requested position and
+  // drop superseded ones instead of queueing every intermediate seek.
+  let pendingSeek = null;
+  let seeking = false;
+  async function requestSeek(index, keepPlaying) {
+    pendingSeek = { index, keepPlaying: keepPlaying ?? playing };
+    if (seeking) return;
+    seeking = true;
+    try {
+      while (pendingSeek) {
+        const next = pendingSeek;
+        pendingSeek = null;
+        await seekToFrame(next.index, next.keepPlaying);
+      }
+    } finally {
+      seeking = false;
+    }
+  }
+
+  async function seekByMilliseconds(deltaMs) {
+    const targetTime = ((currentMediaTimeMs() + deltaMs) % mediaDurationMs + mediaDurationMs) % mediaDurationMs;
+    await requestSeek(frameForMediaTime(targetTime));
+  }
+
+  async function stepFrame(delta) {
+    const from = playing ? frameForMediaTime(currentMediaTimeMs()) : frameIndex;
+    playing = false;
+    playButton.textContent = "Play";
+    await requestSeek(from + delta, false);
+  }
+
+  async function renderFrame(advance = true) {
     if (useRealDecode) {
       try {
         const duration = await frameDuration(frameIndex);
         const frame = await video.get(BigInt(frameIndex));
         uploadFrame(frame.pixels, frame.width, frame.height);
-        frameIndex += 1;
+        if (advance) frameIndex += 1;
+        syncTimeline();
         return duration;
       } catch {
         // Ran past the last indexed frame: loop back to the start.
@@ -180,14 +249,16 @@ async function main() {
         const duration = await frameDuration(frameIndex);
         const frame = await video.get(0n);
         uploadFrame(frame.pixels, frame.width, frame.height);
-        frameIndex = 1;
+        if (advance) frameIndex = 1;
+        syncTimeline();
         return duration;
       }
     }
     const duration = await frameDuration(frameIndex);
     const phase = (frameIndex % 60) / 60;
     uploadFrame(syntheticFrame(canvas.width, canvas.height, phase), canvas.width, canvas.height);
-    frameIndex += 1;
+    if (advance) frameIndex += 1;
+    syncTimeline();
     return duration;
   }
 
@@ -209,13 +280,7 @@ async function main() {
     while (!stopped) {
       await new Promise((resolve) => requestAnimationFrame(resolve));
       if (playing) {
-        if (audioState?.startedAt !== undefined) {
-          const elapsedMs = (audioState.context.currentTime - audioState.startedAt) * 1000;
-          const durationMs = frameStarts[frameStarts.length - 1] || 1;
-          frameIndex = frameForMediaTime(((elapsedMs % durationMs) + durationMs) % durationMs);
-        } else {
-          frameIndex = frameForMediaTime((performance.now() - videoClockStart) % (frameStarts[frameStarts.length - 1] || 1));
-        }
+        frameIndex = frameForMediaTime(currentMediaTimeMs());
         await renderFrame();
         tickFps();
       }
@@ -225,12 +290,27 @@ async function main() {
   playButton.addEventListener("click", async () => {
     playing = !playing;
     if (playing) {
-      videoClockStart = performance.now();
-      if (audioState) await startAudio(audioState);
+      videoClockStart = performance.now() - pausedMediaTimeMs;
+      if (audioState) await startAudio(audioState, pausedMediaTimeMs);
     } else if (audioState) {
+      pausedMediaTimeMs = currentMediaTimeMs();
       stopAudio(audioState);
+    } else {
+      pausedMediaTimeMs = currentMediaTimeMs();
     }
     playButton.textContent = playing ? "Pause" : "Play";
+  });
+  rewindButton.addEventListener("click", () => seekByMilliseconds(-5000));
+  fastForwardButton.addEventListener("click", () => seekByMilliseconds(5000));
+  previousFrameButton.addEventListener("click", () => stepFrame(-1));
+  nextFrameButton.addEventListener("click", () => stepFrame(1));
+  timeline.addEventListener("input", () => requestSeek(Number(timeline.value)));
+  // The issue asks for a bar that scrubs as the pointer moves across it, so hovering seeks
+  // whether or not a button is held; playback (audio included) keeps running while it does.
+  timeline.addEventListener("mousemove", (event) => {
+    const rect = timeline.getBoundingClientRect();
+    const fraction = Math.min(Math.max((event.clientX - rect.left) / rect.width, 0), 1);
+    requestSeek(Math.round(fraction * lastFrameIndex));
   });
 
   if (decodedFrame) {
@@ -270,14 +350,15 @@ async function prepareAudio(audio) {
     },
     context,
     packets,
+    buffer: undefined,
     sources: [],
   };
 }
 
-async function startAudio(state) {
-  stopAudio(state);
-  await state.context.resume();
-  const startAt = state.context.currentTime + 0.08;
+/// Decodes every AAC packet once into a single contiguous `AudioBuffer` covering the whole track.
+/// Seeking and scrubbing then only reschedule one buffer source instead of re-running the decoder.
+async function decodeAudioBuffer(state) {
+  if (state.buffer) return state.buffer;
   const outputs = [];
   const decoder = new AudioDecoder({
     output: (data) => outputs.push(data),
@@ -294,21 +375,47 @@ async function startAudio(state) {
     }));
   }
   await decoder.flush();
-  state.startedAt = startAt;
+  decoder.close();
+  if (outputs.length === 0) throw new Error("AAC decode produced no audio");
+
+  const sampleRate = outputs[0].sampleRate;
+  const channels = outputs[0].numberOfChannels;
+  const frames = outputs.reduce(
+    (end, data) => Math.max(end, sampleAt(data, sampleRate) + data.numberOfFrames),
+    0,
+  );
+  const buffer = state.context.createBuffer(channels, Math.max(frames, 1), sampleRate);
   for (const data of outputs) {
-    const buffer = state.context.createBuffer(data.numberOfChannels, data.numberOfFrames, data.sampleRate);
-    for (let channel = 0; channel < data.numberOfChannels; channel++) {
+    const start = sampleAt(data, sampleRate);
+    for (let channel = 0; channel < channels; channel++) {
       const plane = new Float32Array(data.numberOfFrames);
-      data.copyTo(plane, { planeIndex: channel, format: "f32-planar" });
-      buffer.copyToChannel(plane, channel);
+      data.copyTo(plane, { planeIndex: Math.min(channel, data.numberOfChannels - 1), format: "f32-planar" });
+      buffer.copyToChannel(plane, channel, start);
     }
-    const source = state.context.createBufferSource();
-    source.buffer = buffer;
-    source.connect(state.context.destination);
-    source.start(startAt + data.timestamp / 1_000_000);
-    state.sources.push(source);
     data.close();
   }
+  state.buffer = buffer;
+  return buffer;
+}
+
+function sampleAt(data, sampleRate) {
+  return Math.max(0, Math.round((data.timestamp / 1_000_000) * sampleRate));
+}
+
+async function startAudio(state, offsetMs = 0) {
+  stopAudio(state);
+  const buffer = await decodeAudioBuffer(state);
+  await state.context.resume();
+  const offsetSeconds = Math.min(Math.max(offsetMs / 1000, 0), Math.max(buffer.duration - 0.001, 0));
+  const startAt = state.context.currentTime + 0.05;
+  const source = state.context.createBufferSource();
+  source.buffer = buffer;
+  source.loop = true;
+  source.connect(state.context.destination);
+  source.start(startAt, offsetSeconds);
+  state.sources.push(source);
+  // Anchor the audio clock to media time zero so `currentMediaTimeMs()` stays absolute across seeks.
+  state.startedAt = startAt - offsetSeconds;
 }
 
 function stopAudio(state) {

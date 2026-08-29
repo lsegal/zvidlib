@@ -30,6 +30,12 @@ uploads those decoded RGBA pixels through the real CPU → native OpenGL path (`
 Playback loops back to the first frame after end-of-stream, matching the web example's looping
 behavior, and the decoded-frame playback rate is drawn in the window's top-left corner.
 
+Playback controls (also printed at startup): `SPACE` toggles play/pause, `LEFT`/`RIGHT` step to the
+previous/next frame, `J`/`L` rewind/fast-forward five seconds, and the timeline bar drawn along the
+bottom edge scrubs as the pointer moves across it (clicking works too). Seeking keeps the audio
+clock and the displayed video frame in sync, and audio keeps playing while scrubbing if playback
+was running.
+
 ```console
 cargo run --example native_gl --features native
 ```
@@ -43,6 +49,11 @@ for each displayed frame and uploads the real decoded RGBA pixels; if the browse
 HEVC it falls back to a synthetic gradient sized to the real track instead. Both paths use MP4
 sample timing and, when audio is available, the `AudioContext` clock rather than display-refresh
 or hard-coded FPS pacing.
+
+The page's controls are play/pause, five-second rewind/fast-forward, previous/next frame stepping,
+and a timeline range input that scrubs as the pointer moves across it. The whole AAC track is
+decoded once into a single `AudioBuffer`, so seeking and scrubbing only reschedule playback from
+the new offset instead of re-running the decoder, and audio keeps playing while you scrub.
 
 `examples/web_canvas/package.json` wraps the whole setup in one command. From `examples/web_canvas/`:
 

@@ -304,6 +304,35 @@ impl<V: PlaybackVideoSource, A: PlaybackAudioSource, O: PlaybackAudioOutput>
         self.fill_audio()
     }
 
+    pub fn pause(&mut self) -> Result<()> {
+        if !self.playing {
+            return Ok(());
+        }
+        self.media_anchor = self.current_sample();
+        self.clock_anchor = self.output.clock_samples();
+        self.queued_until = self.media_anchor;
+        self.output.stop()?;
+        self.cancellation.cancel();
+        self.cancellation = CancellationToken::new();
+        self.playing = false;
+        Ok(())
+    }
+
+    pub fn is_playing(&self) -> bool {
+        self.playing
+    }
+
+    pub fn current_frame(&mut self) -> Result<VideoFrame> {
+        let frame = self.current_frame_index()?;
+        let decoded = self.video.get_exact(frame, &self.cancellation)?;
+        self.last_presented = Some(frame);
+        Ok(decoded)
+    }
+
+    pub fn current_frame_index(&self) -> Result<FrameIndex> {
+        self.timeline.frame_for_audio_sample(self.current_sample())
+    }
+
     /// Cancels old decode/scheduling work, resets both streams, prerolls, then resumes.
     pub fn seek(&mut self, frame: FrameIndex) -> Result<()> {
         let target = self.timeline.audio_interval_for_frame(frame)?.start;
@@ -394,6 +423,19 @@ impl<V: PlaybackVideoSource, A: PlaybackAudioSource, O: PlaybackAudioOutput>
 
     pub fn output_kind(&self) -> AudioOutputKind {
         self.output.kind()
+    }
+
+    fn current_sample(&self) -> u64 {
+        if !self.playing {
+            return self.media_anchor;
+        }
+        self.media_anchor
+            .saturating_add(
+                self.output
+                    .clock_samples()
+                    .saturating_sub(self.clock_anchor),
+            )
+            .min(self.audio.presentation_length())
     }
 
     fn fill_audio(&mut self) -> Result<()> {
@@ -650,6 +692,91 @@ mod tests {
     #[test]
     fn web_audio_output_uses_the_same_seek_and_sync_contract() {
         exercise(AudioOutputKind::WebAudio);
+    }
+
+    #[test]
+    fn pause_preserves_the_current_playback_position() {
+        let requested = Arc::new(Mutex::new(Vec::new()));
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let clock = Arc::new(Mutex::new(0));
+        let backend = FixtureBackend {
+            clock: clock.clone(),
+            scheduled: Arc::new(Mutex::new(Vec::new())),
+            cancelled: Arc::new(Mutex::new(Vec::new())),
+        };
+        let timeline = Timeline::new(crate::FrameRate::new(30, 1).unwrap(), 48_000).unwrap();
+        let mut playback = PlaybackController::new(
+            FixtureVideo {
+                requested: requested.clone(),
+                resets: Arc::new(Mutex::new(0)),
+            },
+            FixtureAudio { reads },
+            NativeAudioOutput(backend),
+            timeline,
+            PlaybackOptions {
+                schedule_ahead_samples: 3_200,
+                preroll_samples: 800,
+            },
+        )
+        .unwrap();
+
+        playback.play().unwrap();
+        *clock.lock().unwrap() = 3_300;
+        playback.pause().unwrap();
+
+        assert!(!playback.is_playing());
+        assert_eq!(playback.current_frame_index().unwrap(), FrameIndex(2));
+        let frame = playback.current_frame().unwrap();
+        assert_eq!(frame.planes[0].data[0], 2);
+        assert_eq!(&*requested.lock().unwrap(), &[FrameIndex(2)]);
+    }
+
+    #[test]
+    fn seeking_while_paused_moves_the_position_without_resuming_output() {
+        let requested = Arc::new(Mutex::new(Vec::new()));
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let clock = Arc::new(Mutex::new(0));
+        let scheduled = Arc::new(Mutex::new(Vec::new()));
+        let backend = FixtureBackend {
+            clock: clock.clone(),
+            scheduled: scheduled.clone(),
+            cancelled: Arc::new(Mutex::new(Vec::new())),
+        };
+        let timeline = Timeline::new(crate::FrameRate::new(30, 1).unwrap(), 48_000).unwrap();
+        let mut playback = PlaybackController::new(
+            FixtureVideo {
+                requested: requested.clone(),
+                resets: Arc::new(Mutex::new(0)),
+            },
+            FixtureAudio { reads },
+            NativeAudioOutput(backend),
+            timeline,
+            PlaybackOptions {
+                schedule_ahead_samples: 3_200,
+                preroll_samples: 800,
+            },
+        )
+        .unwrap();
+
+        playback.play().unwrap();
+        *clock.lock().unwrap() = 3_300;
+        playback.pause().unwrap();
+        scheduled.lock().unwrap().clear();
+        requested.lock().unwrap().clear();
+
+        // Frame stepping and timeline scrubbing while paused: the position moves and the exact
+        // frame is decodable, but nothing is queued to the audio device until playback resumes.
+        playback.seek(FrameIndex(7)).unwrap();
+        assert!(!playback.is_playing());
+        assert_eq!(playback.current_frame_index().unwrap(), FrameIndex(7));
+        assert_eq!(playback.current_frame().unwrap().planes[0].data[0], 7);
+        assert_eq!(&*requested.lock().unwrap(), &[FrameIndex(7)]);
+        assert!(scheduled.lock().unwrap().is_empty());
+
+        // Resuming picks up from the scrubbed position rather than where pause happened.
+        playback.play().unwrap();
+        assert!(playback.is_playing());
+        assert_eq!(playback.current_frame_index().unwrap(), FrameIndex(7));
     }
 
     #[test]

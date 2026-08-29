@@ -256,6 +256,9 @@ pub struct GlWindowAdapter {
     video_texture: Option<(u64, VideoDimensions, glow::Texture)>,
     text_texture: glow::Texture,
     text_texture_size: (usize, usize),
+    timeline_background: glow::Texture,
+    timeline_progress: glow::Texture,
+    timeline_hover: glow::Texture,
     window_size: (u32, u32),
 }
 
@@ -266,7 +269,7 @@ impl GlWindowAdapter {
         let rect_ndc_location = unsafe { gl.get_uniform_location(program, "uRectNdc") };
         let texture_location = unsafe { gl.get_uniform_location(program, "uTexture") };
 
-        let (vao, text_texture) = unsafe {
+        let (vao, text_texture, timeline_background, timeline_progress, timeline_hover) = unsafe {
             let vao = gl.create_vertex_array().expect("create vertex array");
             gl.bind_vertex_array(Some(vao));
             let vbo = gl.create_buffer().expect("create buffer");
@@ -306,7 +309,13 @@ impl GlWindowAdapter {
             gl.enable(glow::BLEND);
             gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
 
-            (vao, text_texture)
+            (
+                vao,
+                text_texture,
+                solid_texture(&gl, [25, 25, 25, 220]),
+                solid_texture(&gl, [85, 185, 235, 255]),
+                solid_texture(&gl, [255, 255, 255, 235]),
+            )
         };
 
         Self {
@@ -320,6 +329,9 @@ impl GlWindowAdapter {
             video_texture: None,
             text_texture,
             text_texture_size: (0, 0),
+            timeline_background,
+            timeline_progress,
+            timeline_hover,
             window_size: (1, 1),
         }
     }
@@ -334,7 +346,14 @@ impl GlWindowAdapter {
     /// Draws the texture uploaded for `handle` letterboxed/pillarboxed so it is fully contained
     /// within the window (preserving its aspect ratio, matching CSS `object-fit: contain`), then
     /// overlays the FPS counter text in the top-left corner.
-    pub fn draw(&mut self, handle: u64, dimensions: VideoDimensions, fps: f32) {
+    pub fn draw(
+        &mut self,
+        handle: u64,
+        dimensions: VideoDimensions,
+        fps: f32,
+        progress: f32,
+        hover: Option<f32>,
+    ) {
         let gl = &self.gl;
         unsafe {
             gl.clear_color(0.05, 0.05, 0.05, 1.0);
@@ -379,6 +398,38 @@ impl GlWindowAdapter {
             }
 
             let (window_width, window_height) = self.window_size;
+            // 14px tall, inset 14px from the bottom edge so the bar and its hover marker stay
+            // fully on-screen instead of being clipped by the window border.
+            let pixel = 2.0 / window_height as f32;
+            let timeline_bottom = -1.0 + pixel * 14.0;
+            let timeline_top = timeline_bottom + pixel * 14.0;
+            let progress_right = -1.0 + progress.clamp(0.0, 1.0) * 2.0;
+            self.draw_rect(
+                self.timeline_background,
+                -1.0,
+                timeline_bottom,
+                1.0,
+                timeline_top,
+            );
+            self.draw_rect(
+                self.timeline_progress,
+                -1.0,
+                timeline_bottom,
+                progress_right,
+                timeline_top,
+            );
+            if let Some(hover) = hover {
+                let x = -1.0 + hover.clamp(0.0, 1.0) * 2.0;
+                let half_width = 3.0 * 2.0 / window_width as f32;
+                self.draw_rect(
+                    self.timeline_hover,
+                    x - half_width,
+                    timeline_bottom - pixel * 5.0,
+                    x + half_width,
+                    timeline_top + pixel * 5.0,
+                );
+            }
+
             let ndc_width = 2.0 * width as f32 / window_width as f32;
             let ndc_height = 2.0 * height as f32 / window_height as f32;
             self.draw_rect(
@@ -411,6 +462,45 @@ impl GlWindowAdapter {
             gl.uniform_1_i32(self.texture_location.as_ref(), 0);
             gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
         }
+    }
+}
+
+unsafe fn solid_texture(gl: &glow::Context, color: [u8; 4]) -> glow::Texture {
+    unsafe {
+        let texture = gl.create_texture().expect("create texture");
+        gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_MIN_FILTER,
+            glow::NEAREST as i32,
+        );
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_MAG_FILTER,
+            glow::NEAREST as i32,
+        );
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_WRAP_S,
+            glow::CLAMP_TO_EDGE as i32,
+        );
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_WRAP_T,
+            glow::CLAMP_TO_EDGE as i32,
+        );
+        gl.tex_image_2d(
+            glow::TEXTURE_2D,
+            0,
+            glow::RGBA as i32,
+            1,
+            1,
+            0,
+            glow::RGBA,
+            glow::UNSIGNED_BYTE,
+            glow::PixelUnpackData::Slice(Some(&color)),
+        );
+        texture
     }
 }
 

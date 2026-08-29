@@ -12,6 +12,8 @@
       background: rgba(0, 0, 0, 0.5); padding: 0.15rem 0.4rem; border-radius: 0.25rem;
     }
     #status { white-space: pre-wrap; max-width: 40rem; }
+    #controls { display: grid; grid-template-columns: repeat(5, max-content) 1fr; gap: 0.5rem; align-items: center; margin: 1rem 0; }
+    #timeline { width: 100%; }
   </style>
   <h1>zvidlib WebGL canvas example</h1>
   <p>
@@ -24,7 +26,14 @@
     <canvas id="video" width="1280" height="720"></canvas>
     <p id="fps">-- fps</p>
   </div>
-  <p><button id="play" type="button">Play</button></p>
+  <div id="controls">
+    <button id="rewind" type="button">-5s</button>
+    <button id="previous-frame" type="button">Prev</button>
+    <button id="play" type="button">Play</button>
+    <button id="next-frame" type="button">Next</button>
+    <button id="fast-forward" type="button">+5s</button>
+    <input id="timeline" type="range" min="0" max="0" value="0" step="1" aria-label="Timeline" />
+  </div>
   <pre id="status">Loading…</pre>
   <script type="module" src="./main.js"></script>
 </html>
