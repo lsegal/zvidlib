@@ -398,9 +398,11 @@ impl GlWindowAdapter {
             }
 
             let (window_width, window_height) = self.window_size;
-            let timeline_height = 10.0 / window_height as f32;
-            let timeline_top = -1.0 + timeline_height * 3.0;
-            let timeline_bottom = timeline_top - timeline_height;
+            // 14px tall, inset 14px from the bottom edge so the bar and its hover marker stay
+            // fully on-screen instead of being clipped by the window border.
+            let pixel = 2.0 / window_height as f32;
+            let timeline_bottom = -1.0 + pixel * 14.0;
+            let timeline_top = timeline_bottom + pixel * 14.0;
             let progress_right = -1.0 + progress.clamp(0.0, 1.0) * 2.0;
             self.draw_rect(
                 self.timeline_background,
@@ -418,12 +420,13 @@ impl GlWindowAdapter {
             );
             if let Some(hover) = hover {
                 let x = -1.0 + hover.clamp(0.0, 1.0) * 2.0;
+                let half_width = 3.0 * 2.0 / window_width as f32;
                 self.draw_rect(
                     self.timeline_hover,
-                    x - 0.006,
-                    timeline_bottom - 0.02,
-                    x + 0.006,
-                    timeline_top + 0.02,
+                    x - half_width,
+                    timeline_bottom - pixel * 5.0,
+                    x + half_width,
+                    timeline_top + pixel * 5.0,
                 );
             }
 
