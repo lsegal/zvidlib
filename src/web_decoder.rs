@@ -282,6 +282,12 @@ impl WebVideoDecodeSession {
             if position > target_position {
                 break;
             }
+            if submitted >= self.limits.max_decode_samples_per_seek {
+                return Err(Error::new(
+                    ErrorKind::ResourceLimit,
+                    "exact-frame request exceeded the configured decode-work limit",
+                ));
+            }
             self.submit_at(position)?;
             submitted += 1;
         }
