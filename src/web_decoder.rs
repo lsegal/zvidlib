@@ -265,13 +265,12 @@ impl WebVideoDecodeSession {
         // chunk to be a key frame after every `flush()`, not just after
         // `configure()`. So instead of flushing after every `get()` (which
         // would force a reset-and-redecode from the nearest key frame on
-        // every call), a decode session is kept open across calls and only
-        // reset when the requested frame can't be reached by continuing to
-        // submit from where the session left off. Outputs are awaited via
-        // the output callback (see `wait_for_output()`) rather than a
-        // `flush()` promise, so a session can walk arbitrarily deep into a
-        // single GOP without ever triggering the key-frame-after-flush
-        // requirement.
+        // every call), a decode session is kept open across calls and reset
+        // only when it genuinely cannot produce the requested frame; see
+        // `can_continue_session()`. Outputs are awaited via the output
+        // callback (see `wait_for_output()`) rather than a `flush()`
+        // promise, so a session can walk arbitrarily deep into a single GOP
+        // without ever triggering the key-frame-after-flush requirement.
         let can_reuse = can_continue_session(
             self.next_decode_position,
             random_access_position,
