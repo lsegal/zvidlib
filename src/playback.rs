@@ -732,6 +732,54 @@ mod tests {
     }
 
     #[test]
+    fn seeking_while_paused_moves_the_position_without_resuming_output() {
+        let requested = Arc::new(Mutex::new(Vec::new()));
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let clock = Arc::new(Mutex::new(0));
+        let scheduled = Arc::new(Mutex::new(Vec::new()));
+        let backend = FixtureBackend {
+            clock: clock.clone(),
+            scheduled: scheduled.clone(),
+            cancelled: Arc::new(Mutex::new(Vec::new())),
+        };
+        let timeline = Timeline::new(crate::FrameRate::new(30, 1).unwrap(), 48_000).unwrap();
+        let mut playback = PlaybackController::new(
+            FixtureVideo {
+                requested: requested.clone(),
+                resets: Arc::new(Mutex::new(0)),
+            },
+            FixtureAudio { reads },
+            NativeAudioOutput(backend),
+            timeline,
+            PlaybackOptions {
+                schedule_ahead_samples: 3_200,
+                preroll_samples: 800,
+            },
+        )
+        .unwrap();
+
+        playback.play().unwrap();
+        *clock.lock().unwrap() = 3_300;
+        playback.pause().unwrap();
+        scheduled.lock().unwrap().clear();
+        requested.lock().unwrap().clear();
+
+        // Frame stepping and timeline scrubbing while paused: the position moves and the exact
+        // frame is decodable, but nothing is queued to the audio device until playback resumes.
+        playback.seek(FrameIndex(7)).unwrap();
+        assert!(!playback.is_playing());
+        assert_eq!(playback.current_frame_index().unwrap(), FrameIndex(7));
+        assert_eq!(playback.current_frame().unwrap().planes[0].data[0], 7);
+        assert_eq!(&*requested.lock().unwrap(), &[FrameIndex(7)]);
+        assert!(scheduled.lock().unwrap().is_empty());
+
+        // Resuming picks up from the scrubbed position rather than where pause happened.
+        playback.play().unwrap();
+        assert!(playback.is_playing());
+        assert_eq!(playback.current_frame_index().unwrap(), FrameIndex(7));
+    }
+
+    #[test]
     fn indexed_timeline_selects_video_by_audio_sample_ranges() {
         let timeline = IndexedPresentationTimeline::new(vec![
             SampleRange::new(0, 100).unwrap(),
