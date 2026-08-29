@@ -8,7 +8,8 @@
 //! window on all platforms. The example prefers an available accelerated backend and falls back
 //! to the dependency-free software decoder. Decoding runs on a background thread, and the render
 //! loop displays the newest completed frame. Playback loops back to the first frame once the last
-//! one is shown, and the decoded-frame playback rate is drawn in the top-left corner.
+//! one is shown, the decoded-frame playback rate is drawn in the top-left corner, and a control
+//! legend is drawn above the timeline bar until it fades out (press `H` to show or hide it).
 //!
 //! Run with:
 //!
@@ -50,7 +51,7 @@ use zvidlib::{
 
 mod gl_window;
 
-use gl_window::{FpsCounter, GlWindowAdapter};
+use gl_window::{CONTROL_LEGEND, FpsCounter, GlWindowAdapter, LegendVisibility};
 
 const TEXTURE_HANDLE: u64 = 1;
 
@@ -151,7 +152,9 @@ fn run() -> Result<()> {
 
     println!(
         "Controls: SPACE play/pause, LEFT/RIGHT previous/next frame, J/L rewind/fast-forward 5s, \
-         hover or click the timeline bar along the bottom edge to scrub."
+         hover or click the timeline bar along the bottom edge to scrub, H show/hide the \
+         on-screen legend ({} lines).",
+        CONTROL_LEGEND.len()
     );
 
     let mut app = App::new(dimensions, playback, frame_count, frames_per_five_seconds);
@@ -172,6 +175,7 @@ struct App<P> {
     frames_per_five_seconds: u64,
     needs_static_frame: bool,
     timeline_hover: Option<f32>,
+    legend: LegendVisibility,
     fps: FpsCounter,
     state: Option<WindowState>,
     error: Option<Error>,
@@ -203,6 +207,7 @@ where
             frames_per_five_seconds,
             needs_static_frame: false,
             timeline_hover: None,
+            legend: LegendVisibility::new(Instant::now()),
             fps: FpsCounter::new(),
             state: None,
             error: None,
@@ -326,6 +331,7 @@ where
             .map(|frame| frame.0 as f32 / self.frame_count.saturating_sub(1).max(1) as f32)
             .unwrap_or(0.0);
         let fps = self.fps.update(frame_presented, now);
+        let legend_opacity = self.legend.opacity(now);
         let state = self.state.as_mut().expect("state exists");
         state.adapter.draw(
             TEXTURE_HANDLE,
@@ -333,6 +339,7 @@ where
             fps,
             progress,
             self.timeline_hover,
+            legend_opacity,
         );
         if let Err(error) = state.surface.swap_buffers(&state.context) {
             return self.fail(
@@ -341,7 +348,8 @@ where
             );
         }
 
-        if self.playback.is_playing() {
+        // Keep redrawing while the legend is fading so the fade animates even when paused.
+        if self.playback.is_playing() || legend_opacity > 0.0 {
             state.window.request_redraw();
         }
     }
@@ -512,6 +520,12 @@ where
                     }
                     PhysicalKey::Code(KeyCode::KeyL) => {
                         self.seek_by_frames(event_loop, self.frames_per_five_seconds as i64)
+                    }
+                    PhysicalKey::Code(KeyCode::KeyH) => {
+                        self.legend.toggle(Instant::now());
+                        if let Some(state) = self.state.as_ref() {
+                            state.window.request_redraw();
+                        }
                     }
                     _ => {}
                 }
