@@ -4,7 +4,7 @@
 //! typed arrays are snapshots rather than views into growable WebAssembly
 //! memory, and browser-owned objects are retained only as JavaScript handles.
 
-use crate::web_decoder::WebVideoDecodeSession;
+use crate::web_decoder::{WebVideoDecodeSession, video_frame_durations_ms};
 use crate::{
     AudioBuffer as CoreAudioBuffer, ColorRange, ErrorKind, FrameIndex as CoreFrameIndex, FrameRate,
     Limits, PixelFormat, Plane, Rational as CoreRational, SampleRange as CoreSampleRange, Timeline,
@@ -606,6 +606,8 @@ pub struct WasmVideoStream {
     bytes: Option<Rc<Vec<u8>>>,
     /// Lazily-configured `WebCodecs` decode session, built on first `get()`.
     decode_session: Rc<RefCell<Option<WebVideoDecodeSession>>>,
+    /// Lazily-parsed per-presentation-frame durations in milliseconds.
+    frame_durations_ms: Rc<RefCell<Option<Vec<f64>>>>,
 }
 
 #[wasm_bindgen(js_class = VideoStream)]
@@ -622,6 +624,50 @@ impl WasmVideoStream {
             StreamDirection::Output => "output",
         }
         .to_owned()
+    }
+
+    /// Returns the indexed frame's MP4 presentation duration in milliseconds.
+    #[wasm_bindgen(js_name = frameDuration)]
+    pub fn frame_duration(&self, frame_index: JsValue, signal: Option<AbortSignal>) -> Promise {
+        let state = Rc::clone(&self.state);
+        let direction = self.direction;
+        let index = self.index;
+        let bytes = self.bytes.clone();
+        let durations = Rc::clone(&self.frame_durations_ms);
+        future_to_promise(async move {
+            ensure_open(&state)?;
+            check_signal(signal.as_ref())?;
+            let frame_index = usize::try_from(parse_u64(&frame_index, "frame index")?)
+                .map_err(|_| js_error(ErrorKind::InvalidInput, "frame index is out of range"))?;
+            if direction != StreamDirection::Input {
+                return Err(js_error(
+                    ErrorKind::InvalidState,
+                    "frameDuration is only valid on an input video stream",
+                ));
+            }
+            let bytes = bytes.ok_or_else(|| {
+                js_error(
+                    ErrorKind::Unsupported,
+                    "input video timing metadata is unavailable",
+                )
+            })?;
+            if durations.borrow().is_none() {
+                let parsed = video_frame_durations_ms(&bytes, index, &Limits::default())
+                    .await
+                    .map_err(|error| js_error(error.kind(), error.message()))?;
+                *durations.borrow_mut() = Some(parsed);
+            }
+            check_signal(signal.as_ref())?;
+            durations
+                .borrow()
+                .as_ref()
+                .and_then(|values| values.get(frame_index))
+                .copied()
+                .map(JsValue::from_f64)
+                .ok_or_else(|| {
+                    js_error(ErrorKind::InvalidInput, "presentation frame is not indexed")
+                })
+        })
     }
 
     pub fn get(&self, frame_index: JsValue, signal: Option<AbortSignal>) -> Promise {
@@ -841,6 +887,7 @@ impl WasmMediaInput {
             direction: StreamDirection::Input,
             bytes: Some(Rc::clone(&self.bytes)),
             decode_session: Rc::new(RefCell::new(None)),
+            frame_durations_ms: Rc::new(RefCell::new(None)),
         })
     }
 
@@ -922,6 +969,7 @@ impl WasmMediaOutput {
             direction: StreamDirection::Output,
             bytes: None,
             decode_session: Rc::new(RefCell::new(None)),
+            frame_durations_ms: Rc::new(RefCell::new(None)),
         })
     }
 
@@ -1100,6 +1148,13 @@ mod tests {
                 .unwrap();
         let video = input.video(0).unwrap();
         assert_eq!(video.direction(), "input");
+
+        let duration = JsFuture::from(video.frame_duration(BigInt::from(0_u64).into(), None))
+            .await
+            .unwrap()
+            .as_f64()
+            .unwrap();
+        assert!((duration - (1_000.0 / 24.0)).abs() < 0.001);
 
         for frame_index in [0_u64, 1_u64] {
             match JsFuture::from(video.get(BigInt::from(frame_index).into(), None)).await {

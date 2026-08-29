@@ -71,6 +71,10 @@ console.log(blob.type); // "video/mp4"
 
 All exported 64-bit frame, sample, and timestamp values return JavaScript `BigInt`. Inputs accept `BigInt` across the full Rust range or validated `Number` values only within JavaScript's safe-integer range. Rust and boundary failures reject with native `Error` instances named `ZvidError`; their stable `code` values can be read directly or with `errorCode(error)`.
 
+Input `VideoStream` handles also expose `frameDuration(index)`, which resolves to that presentation
+frame's MP4 duration in milliseconds. This timing query is independent of codec availability, so
+browser applications can pace fallback rendering even when `get(index)` reports `UNSUPPORTED`.
+
 ## Planned API examples
 
 The examples in this section show the intended complete workflows. Rust examples are deliberately marked `ignore`, and browser examples depend on media backends that are not fully registered yet: video decoding works (see [Implemented browser boundary](#implemented-browser-boundary)), but `Playback`, audio decode/encode, and video encode still reject with `UNSUPPORTED` until their implementations land. The boundary classes exist for all of these. Names may change before the first release, while the ownership, synchronization, and cleanup steps are part of the design.

@@ -123,25 +123,39 @@ async function main() {
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
   }
 
+  async function frameDuration(index) {
+    try {
+      return await video.frameDuration(BigInt(index));
+    } catch {
+      // The previous frame was the last indexed frame, so loop its timing with the video.
+      frameIndex = 0;
+      return await video.frameDuration(0n);
+    }
+  }
+
   async function renderFrame() {
     if (useRealDecode) {
       try {
+        const duration = await frameDuration(frameIndex);
         const frame = await video.get(BigInt(frameIndex));
         uploadFrame(frame.pixels, frame.width, frame.height);
         frameIndex += 1;
-        return;
+        return duration;
       } catch {
         // Ran past the last indexed frame: loop back to the start.
         frameIndex = 0;
+        const duration = await frameDuration(frameIndex);
         const frame = await video.get(0n);
         uploadFrame(frame.pixels, frame.width, frame.height);
         frameIndex = 1;
-        return;
+        return duration;
       }
     }
+    const duration = await frameDuration(frameIndex);
     const phase = (frameIndex % 60) / 60;
     uploadFrame(syntheticFrame(canvas.width, canvas.height, phase), canvas.width, canvas.height);
     frameIndex += 1;
+    return duration;
   }
 
   let framesSinceFpsUpdate = 0;
@@ -159,12 +173,18 @@ async function main() {
   }
 
   async function renderLoop() {
+    let nextFrameAt = performance.now();
     while (!stopped) {
-      if (playing) {
-        await renderFrame();
+      const now = await new Promise((resolve) => requestAnimationFrame(resolve));
+      if (playing && now >= nextFrameAt) {
+        const duration = await renderFrame();
         tickFps();
+        // Start a fresh source-duration interval after slow decoding or a suspended tab instead
+        // of rapidly presenting queued frames to catch up with an obsolete deadline.
+        nextFrameAt = performance.now() + duration;
+      } else if (!playing) {
+        nextFrameAt = now;
       }
-      await new Promise((resolve) => requestAnimationFrame(resolve));
     }
   }
 
