@@ -568,7 +568,7 @@ impl GlWindowAdapter {
                 let quantized = (legend_opacity.clamp(0.0, 1.0) * 255.0) as u8;
                 if self.legend_opacity != Some(quantized) {
                     let (legend_width, legend_height, legend_data) =
-                        rasterize_lines(CONTROL_LEGEND, 2, legend_opacity);
+                        rasterize_lines(CONTROL_LEGEND, 3, legend_opacity);
                     self.upload_overlay(
                         self.legend_texture,
                         self.legend_texture_size,
