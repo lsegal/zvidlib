@@ -311,7 +311,7 @@ cargo fmt --all -- --check
 cargo clippy --all-targets --features native -- -D warnings
 ```
 
-These commands validate the portable core on both targets. Native builds include accelerated HEVC Main decode through NVDEC on supported 64-bit Windows/Linux systems, Media Foundation on Windows, and VideoToolbox on macOS, with a dependency-free pure-Rust fallback. They also include the pure-Rust AV1 Main decoder (including non-lossless intra/inter AV1 decoding) and dependency-free HEVC Main and lossless monochrome AV1 Main-profile encoders described above; color AV1 encoding beyond the lossless monochrome profile and concrete audio codecs remain planned.
+These commands validate the portable core on both targets. Native builds include accelerated HEVC Main decode through NVDEC on supported 64-bit Windows/Linux systems, Media Foundation on Windows, and VideoToolbox on macOS, with a dependency-free pure-Rust fallback. They also include the pure-Rust AV1 Main decoder (including non-lossless intra/inter AV1 decoding), dependency-free HEVC Main and lossless monochrome AV1 Main-profile encoders, AAC-LC decode, and default-device PCM output described above. The browser build exposes AAC packet/config data for WebCodecs `AudioDecoder` playback. Color AV1 encoding beyond the lossless monochrome profile and fully portable audio-device abstractions remain planned.
 
 Native compressed-codec backends use the public `VideoDecoderConformanceVector`
 and `VideoEncoderConformanceVector` runners before registration. Decoder vectors
