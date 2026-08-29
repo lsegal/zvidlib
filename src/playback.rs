@@ -1,7 +1,8 @@
 //! Audio-clock-driven playback shared by native and browser adapters.
 
 use crate::{
-    AudioBuffer, CancellationToken, Error, ErrorKind, FrameIndex, Result, Timeline, VideoFrame,
+    AudioBuffer, CancellationToken, Error, ErrorKind, FrameIndex, Result, SampleRange, Timeline,
+    VideoFrame,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -105,12 +106,118 @@ pub struct Presentation {
     pub finished: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IndexedPresentationTimeline {
+    frame_audio_ranges: Vec<SampleRange>,
+}
+
+impl IndexedPresentationTimeline {
+    pub fn new(frame_audio_ranges: Vec<SampleRange>) -> Result<Self> {
+        if frame_audio_ranges.is_empty() {
+            return Err(invalid(
+                "playback timeline requires at least one video frame",
+            ));
+        }
+        let mut previous_end = 0;
+        for range in &frame_audio_ranges {
+            if range.is_empty() || range.start < previous_end {
+                return Err(invalid(
+                    "playback frame audio ranges must be nonempty and ordered",
+                ));
+            }
+            previous_end = range.end;
+        }
+        Ok(Self { frame_audio_ranges })
+    }
+
+    pub fn from_mp4_track(
+        track: &crate::Mp4Track,
+        audio_sample_rate: u32,
+        limits: &crate::Limits,
+    ) -> Result<Self> {
+        if track.kind != crate::TrackKind::Video {
+            return Err(invalid("indexed playback timeline requires a video track"));
+        }
+        if audio_sample_rate == 0 || audio_sample_rate > limits.max_sample_rate {
+            return Err(Error::new(
+                ErrorKind::ResourceLimit,
+                "playback audio sample rate is outside configured limits",
+            ));
+        }
+        let mut ranges = Vec::with_capacity(track.presentation_order.len());
+        for sample in track
+            .presentation_order
+            .iter()
+            .map(|&index| &track.samples[index])
+        {
+            if sample.pts < 0 {
+                return Err(Error::new(
+                    ErrorKind::MalformedMedia,
+                    "negative video PTS is unsupported for indexed playback",
+                ));
+            }
+            let start =
+                scale_to_audio_samples(sample.pts as u64, track.timescale, audio_sample_rate)?;
+            let end_ticks = (sample.pts as u64)
+                .checked_add(u64::from(sample.duration))
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::ResourceLimit,
+                        "video presentation timing overflow",
+                    )
+                })?;
+            let end = scale_to_audio_samples(end_ticks, track.timescale, audio_sample_rate)?;
+            ranges.push(SampleRange::new(start, end)?);
+        }
+        Self::new(ranges)
+    }
+
+    pub fn audio_interval_for_frame(&self, frame: FrameIndex) -> Result<SampleRange> {
+        let index = usize::try_from(frame.0)
+            .map_err(|_| Error::new(ErrorKind::InvalidInput, "frame index is out of range"))?;
+        self.frame_audio_ranges
+            .get(index)
+            .copied()
+            .ok_or_else(|| invalid("presentation frame is not indexed"))
+    }
+
+    pub fn frame_for_audio_sample(&self, sample: u64) -> Result<FrameIndex> {
+        let index = self
+            .frame_audio_ranges
+            .partition_point(|range| range.end <= sample);
+        let index = index.min(self.frame_audio_ranges.len() - 1);
+        Ok(FrameIndex(index as u64))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PlaybackTimeline {
+    Constant(Timeline),
+    Indexed(IndexedPresentationTimeline),
+}
+
+impl PlaybackTimeline {
+    fn audio_interval_for_frame(&self, frame: FrameIndex) -> Result<SampleRange> {
+        match self {
+            Self::Constant(timeline) => timeline.audio_interval_for_frame(frame),
+            Self::Indexed(timeline) => timeline.audio_interval_for_frame(frame),
+        }
+    }
+
+    fn frame_for_audio_sample(&self, sample: u64) -> Result<FrameIndex> {
+        match self {
+            Self::Constant(timeline) => timeline.frame_for_audio_sample(sample),
+            Self::Indexed(timeline) => timeline.frame_for_audio_sample(sample),
+        }
+    }
+}
+
 /// Schedules audio ahead and selects exact video frames from its master clock.
 pub struct PlaybackController<V, A, O> {
     video: V,
     audio: A,
     output: O,
-    timeline: Timeline,
+    timeline: PlaybackTimeline,
     options: PlaybackOptions,
     cancellation: CancellationToken,
     generation: u64,
@@ -136,6 +243,38 @@ impl<V: PlaybackVideoSource, A: PlaybackAudioSource, O: PlaybackAudioOutput>
                 "playback timeline and audio source sample rates do not match",
             ));
         }
+        Self::new_with_playback_timeline(
+            video,
+            audio,
+            output,
+            PlaybackTimeline::Constant(timeline),
+            options,
+        )
+    }
+
+    pub fn new_with_indexed_timeline(
+        video: V,
+        audio: A,
+        output: O,
+        timeline: IndexedPresentationTimeline,
+        options: PlaybackOptions,
+    ) -> Result<Self> {
+        Self::new_with_playback_timeline(
+            video,
+            audio,
+            output,
+            PlaybackTimeline::Indexed(timeline),
+            options,
+        )
+    }
+
+    fn new_with_playback_timeline(
+        video: V,
+        audio: A,
+        output: O,
+        timeline: PlaybackTimeline,
+        options: PlaybackOptions,
+    ) -> Result<Self> {
         if options.schedule_ahead_samples == 0 {
             return Err(invalid("playback scheduling window must be nonzero"));
         }
@@ -295,6 +434,25 @@ impl<V: PlaybackVideoSource, A: PlaybackAudioSource, O: PlaybackAudioOutput>
 
 fn invalid(message: &str) -> Error {
     Error::new(ErrorKind::InvalidInput, message)
+}
+
+fn scale_to_audio_samples(
+    value: u64,
+    source_timescale: u32,
+    audio_sample_rate: u32,
+) -> Result<u64> {
+    if source_timescale == 0 {
+        return Err(Error::new(
+            ErrorKind::MalformedMedia,
+            "video track timescale must be nonzero",
+        ));
+    }
+    let scaled = u128::from(value)
+        .checked_mul(u128::from(audio_sample_rate))
+        .ok_or_else(|| Error::new(ErrorKind::ResourceLimit, "video timing scale overflow"))?
+        / u128::from(source_timescale);
+    u64::try_from(scaled)
+        .map_err(|_| Error::new(ErrorKind::ResourceLimit, "scaled video time overflows"))
 }
 
 impl PlaybackVideoSource for crate::ExactFrameReader {
@@ -492,5 +650,70 @@ mod tests {
     #[test]
     fn web_audio_output_uses_the_same_seek_and_sync_contract() {
         exercise(AudioOutputKind::WebAudio);
+    }
+
+    #[test]
+    fn indexed_timeline_selects_video_by_audio_sample_ranges() {
+        let timeline = IndexedPresentationTimeline::new(vec![
+            SampleRange::new(0, 100).unwrap(),
+            SampleRange::new(100, 250).unwrap(),
+            SampleRange::new(250, 300).unwrap(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            timeline.audio_interval_for_frame(FrameIndex(1)).unwrap(),
+            SampleRange {
+                start: 100,
+                end: 250
+            }
+        );
+        assert_eq!(timeline.frame_for_audio_sample(0).unwrap(), FrameIndex(0));
+        assert_eq!(timeline.frame_for_audio_sample(99).unwrap(), FrameIndex(0));
+        assert_eq!(timeline.frame_for_audio_sample(100).unwrap(), FrameIndex(1));
+        assert_eq!(timeline.frame_for_audio_sample(249).unwrap(), FrameIndex(1));
+        assert_eq!(timeline.frame_for_audio_sample(250).unwrap(), FrameIndex(2));
+        assert_eq!(timeline.frame_for_audio_sample(400).unwrap(), FrameIndex(2));
+    }
+
+    #[test]
+    fn indexed_timeline_drives_playback_without_constant_frame_rate() {
+        let requested = Arc::new(Mutex::new(Vec::new()));
+        let resets = Arc::new(Mutex::new(0));
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let clock = Arc::new(Mutex::new(0));
+        let scheduled = Arc::new(Mutex::new(Vec::new()));
+        let backend = FixtureBackend {
+            clock: clock.clone(),
+            scheduled,
+            cancelled: Arc::new(Mutex::new(Vec::new())),
+        };
+        let timeline = IndexedPresentationTimeline::new(vec![
+            SampleRange::new(0, 100).unwrap(),
+            SampleRange::new(100, 250).unwrap(),
+            SampleRange::new(250, 300).unwrap(),
+        ])
+        .unwrap();
+        let mut playback = PlaybackController::new_with_indexed_timeline(
+            FixtureVideo {
+                requested: requested.clone(),
+                resets,
+            },
+            FixtureAudio { reads },
+            NativeAudioOutput(backend),
+            timeline,
+            PlaybackOptions {
+                schedule_ahead_samples: 50,
+                preroll_samples: 10,
+            },
+        )
+        .unwrap();
+
+        playback.play().unwrap();
+        *clock.lock().unwrap() = 110;
+        let (presentation, _) = playback.present().unwrap();
+
+        assert_eq!(presentation.requested_frame, FrameIndex(1));
+        assert_eq!(&*requested.lock().unwrap(), &[FrameIndex(1)]);
     }
 }
