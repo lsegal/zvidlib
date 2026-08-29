@@ -1367,6 +1367,49 @@ mod tests {
         }
     }
 
+    /// Regression test for issue #108: sequential presentation-order playback
+    /// of content with reordered decoder output used to reset the `WebCodecs`
+    /// decoder and re-decode from the key frame on almost every call, which
+    /// made ordinary playback quadratic in decode work and held the bundled
+    /// 1080p sample under 1 fps.
+    #[wasm_bindgen_test(async)]
+    async fn video_get_decodes_consecutive_frames_without_restarting_the_gop() {
+        const SAMPLE: &[u8] = include_bytes!("../examples/media/BigBuckBunny.mp4");
+        const FRAME_COUNT: u64 = 48;
+        let bytes = Uint8Array::from(SAMPLE);
+        let input =
+            WasmMediaInput::open_inner(bytes.into(), Limits::default().max_allocation_bytes, None)
+                .await
+                .unwrap();
+        let video = input.video(0).unwrap();
+
+        for frame_index in 0..FRAME_COUNT {
+            match JsFuture::from(video.get(BigInt::from(frame_index).into(), None)).await {
+                Ok(frame) => {
+                    let get_u32 = |name: &str| -> u32 {
+                        Reflect::get(&frame, &JsValue::from_str(name))
+                            .unwrap()
+                            .as_f64()
+                            .unwrap() as u32
+                    };
+                    let width = get_u32("width");
+                    let height = get_u32("height");
+                    assert!(width > 0);
+                    assert!(height > 0);
+                    let pixels: Uint8Array = Reflect::get(&frame, &JsValue::from_str("pixels"))
+                        .unwrap()
+                        .unchecked_into();
+                    assert_eq!(pixels.length(), width * height * 4);
+                }
+                // This browser has no decoder for the track's codec at all.
+                Err(error) => {
+                    assert_error_code(&error, "UNSUPPORTED");
+                    return;
+                }
+            }
+        }
+    }
+
     /// Regression test for issue #38: `BigBuckBunny.mp4` has a single key
     /// frame followed by ~768 delta frames, so decoding a frame this deep
     /// into the GOP used to exceed the old 12-frame WebCodecs batch cap and

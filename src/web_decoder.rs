@@ -25,6 +25,25 @@ use web_sys::{
     VideoDecoderSupport, VideoFrame as JsVideoFrame, VideoFrameCopyToOptions, VideoPixelFormat,
 };
 
+/// How many samples may sit in the `WebCodecs` decoder's queue at once while
+/// `get()` waits for a frame. Deep enough to keep an accelerated decoder busy
+/// across an ordinary reorder window, shallow enough that the decoder cannot
+/// run so far ahead that the awaited frame is evicted from the frame cache.
+const MAX_IN_FLIGHT_CHUNKS: u32 = 16;
+
+/// Resolves `resolve` on the next event-loop turn.
+///
+/// Reached through `globalThis` so it works in both window and worker scopes
+/// without pulling in another `web-sys` feature.
+fn schedule_event_loop_tick(resolve: &js_sys::Function) {
+    let global = js_sys::global();
+    if let Ok(set_timeout) = js_sys::Reflect::get(&global, &JsValue::from_str("setTimeout"))
+        && let Ok(set_timeout) = set_timeout.dyn_into::<js_sys::Function>()
+    {
+        let _ = set_timeout.call2(&global, resolve, &JsValue::from_f64(0.0));
+    }
+}
+
 fn codec_description(codec: Codec, decoder_config: &[u8]) -> Result<&[u8]> {
     match codec {
         Codec::Hevc => box_payload(decoder_config, b"hvcC"),
@@ -283,20 +302,6 @@ impl WebVideoDecodeSession {
         }
 
         let mut submitted = 0_u32;
-        while let Some(position) = self.next_decode_position {
-            if position > target_position {
-                break;
-            }
-            if submitted >= self.limits.max_decode_samples_per_seek {
-                return Err(Error::new(
-                    ErrorKind::ResourceLimit,
-                    "exact-frame request exceeded the configured decode-work limit",
-                ));
-            }
-            self.submit_at(position)?;
-            submitted += 1;
-        }
-
         let mut drained_after_flush = false;
         loop {
             if let Some(message) = self.decode_error.borrow_mut().take() {
@@ -318,15 +323,24 @@ impl WebVideoDecodeSession {
                 ));
             }
             // Real decoder pipelines (particularly hardware-accelerated
-            // ones) can hold several samples before emitting their first
-            // output. Rather than blocking on a decoder that is simply
-            // waiting for more input, prime it with subsequent samples
-            // (within the same work limit that bounds the initial span)
-            // while there is more to submit.
+            // ones) hold several samples before emitting their first output,
+            // so keep the decoder fed rather than blocking on one that is
+            // simply waiting for more input. Submission is flow-controlled by
+            // the decoder's own queue depth: handing it the whole remaining
+            // track at once would emit far more frames than
+            // `Limits::max_cached_frames` can retain, evicting the very frame
+            // being waited for, and would starve the event loop that delivers
+            // the output callbacks in the first place.
             if let Some(position) = self.next_decode_position {
                 if position < self.samples.len()
-                    && submitted < self.limits.max_decode_samples_per_seek
+                    && self.decoder.decode_queue_size() < MAX_IN_FLIGHT_CHUNKS
                 {
+                    if submitted >= self.limits.max_decode_samples_per_seek {
+                        return Err(Error::new(
+                            ErrorKind::ResourceLimit,
+                            "exact-frame request exceeded the configured decode-work limit",
+                        ));
+                    }
                     self.submit_at(position)?;
                     submitted += 1;
                     continue;
@@ -397,10 +411,16 @@ impl WebVideoDecodeSession {
 
     /// Awaits the next decoder event (an output frame or a decode error),
     /// via a `Promise` fulfilled by whichever of the output/error closures
-    /// fires next.
+    /// fires next, or the next event-loop turn, whichever comes first.
+    ///
+    /// The event-loop tick matters: the decoder can quietly work its way
+    /// through its queue without emitting anything yet, and waiting only on
+    /// an output event would then park forever instead of noticing there is
+    /// room to submit more.
     async fn wait_for_output(&self) {
         let waker = Rc::clone(&self.waker);
         let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+            schedule_event_loop_tick(&resolve);
             *waker.borrow_mut() = Some(resolve);
         });
         let _ = JsFuture::from(promise).await;
