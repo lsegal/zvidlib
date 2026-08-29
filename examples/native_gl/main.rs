@@ -323,7 +323,14 @@ impl FramePacer {
     }
 
     fn presented(&mut self, duration: Duration, now: Instant) {
-        self.next_frame_at = Some(now + duration);
+        let scheduled = self.next_frame_at.map_or(now + duration, |deadline| {
+            deadline.checked_add(duration).unwrap_or(now + duration)
+        });
+        self.next_frame_at = Some(if scheduled < now {
+            now + duration
+        } else {
+            scheduled
+        });
     }
 }
 
@@ -362,7 +369,15 @@ mod pacing_tests {
         assert!(!pacer.ready(start + Duration::from_millis(39)));
         assert!(pacer.ready(start + duration));
 
-        let late = start + Duration::from_millis(100);
+        // A display refresh that arrives after one deadline keeps the following frame aligned to
+        // the original source timeline instead of quantizing every interval up to the refresh.
+        let refresh = start + Duration::from_millis(50);
+        pacer.presented(duration, refresh);
+        assert!(!pacer.ready(start + Duration::from_millis(79)));
+        assert!(pacer.ready(start + Duration::from_millis(80)));
+
+        // A genuinely late frame starts a fresh interval so playback never races to catch up.
+        let late = start + Duration::from_millis(200);
         pacer.presented(duration, late);
         assert!(!pacer.ready(late + Duration::from_millis(39)));
         assert!(pacer.ready(late + duration));

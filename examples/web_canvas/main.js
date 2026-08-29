@@ -179,9 +179,13 @@ async function main() {
       if (playing && now >= nextFrameAt) {
         const duration = await renderFrame();
         tickFps();
-        // Start a fresh source-duration interval after slow decoding or a suspended tab instead
-        // of rapidly presenting queued frames to catch up with an obsolete deadline.
-        nextFrameAt = performance.now() + duration;
+        nextFrameAt += duration;
+        const finishedAt = performance.now();
+        if (nextFrameAt < finishedAt) {
+          // Start a fresh interval after slow decoding or a suspended tab instead of rapidly
+          // presenting queued frames to catch up with an obsolete deadline.
+          nextFrameAt = finishedAt + duration;
+        }
       } else if (!playing) {
         nextFrameAt = now;
       }
