@@ -95,10 +95,15 @@ pub struct WebVideoDecodeSession {
     config: JsVideoDecoderConfig,
     pending_frames: Rc<RefCell<Vec<JsVideoFrame>>>,
     decode_error: Rc<RefCell<Option<String>>>,
-    /// Bounded cache of already-decoded frames, keyed by presentation index,
-    /// so sequential `get()` calls within the same decode session (see
-    /// `get()`) don't each trigger a fresh reset-and-redecode pass.
-    cache: HashMap<FrameIndex, (VideoDimensions, Vec<u8>)>,
+    /// Bounded cache of decoded frames the decoder has already emitted,
+    /// keyed by presentation index, so sequential `get()` calls within the
+    /// same decode session (see `get()`) don't each trigger a fresh
+    /// reset-and-redecode pass. Frames are held as live `VideoFrame`
+    /// handles and converted to RGBA only when a caller actually asks for
+    /// one: a real decoder runs ahead of the requested frame, and
+    /// converting every frame it emits costs far more than the decode
+    /// itself. Evicted frames are closed rather than dropped.
+    cache: HashMap<FrameIndex, JsVideoFrame>,
     cache_order: VecDeque<FrameIndex>,
     /// Position of the next sample not yet submitted to `decoder` in the
     /// current decode session; `None` once a reset is needed. Mirrors
@@ -226,8 +231,8 @@ impl WebVideoDecodeSession {
         &mut self,
         presentation_index: FrameIndex,
     ) -> Result<(VideoDimensions, Vec<u8>)> {
-        if let Some(cached) = self.cache.get(&presentation_index) {
-            return Ok(cached.clone());
+        if let Some(frame) = self.cache.get(&presentation_index) {
+            return self.copy_frame_rgba(frame).await;
         }
         let target_position = *self
             .decode_position_by_presentation
@@ -298,9 +303,10 @@ impl WebVideoDecodeSession {
                 self.next_decode_position = None;
                 return Err(Error::new(ErrorKind::Codec, message));
             }
-            self.drain_pending_frames().await;
-            if let Some(cached) = self.cache.get(&presentation_index) {
-                return Ok(cached.clone());
+            self.drain_pending_frames();
+            if self.cache.contains_key(&presentation_index) {
+                let frame = &self.cache[&presentation_index];
+                return self.copy_frame_rgba(frame).await;
             }
             if drained_after_flush {
                 // Already flushed and drained everything the decoder had
@@ -347,22 +353,13 @@ impl WebVideoDecodeSession {
     }
 
     /// Moves every frame the decoder has produced so far out of
-    /// `pending_frames` and into `cache`, converting each to RGBA.
-    async fn drain_pending_frames(&mut self) {
+    /// `pending_frames` and into the bounded frame cache.
+    fn drain_pending_frames(&mut self) {
         let frames = std::mem::take(&mut *self.pending_frames.borrow_mut());
         for frame in frames {
             let index = FrameIndex(frame.timestamp() as u64);
-            let copied = self.copy_frame_rgba(&frame).await;
-            // Every `VideoFrame` handed to the output callback owns a real
-            // platform decode buffer, so it must be closed explicitly and
-            // deterministically; letting one reach the garbage collector
-            // stalls Chrome's decoder and logs "A VideoFrame was garbage
-            // collected without being closed".
-            frame.close();
             self.published_since_reset.insert(index);
-            if let Ok(value) = copied {
-                self.insert_cache(index, value);
-            }
+            self.insert_cache(index, frame);
         }
     }
 
@@ -370,6 +367,14 @@ impl WebVideoDecodeSession {
     /// been drained yet, so no `VideoFrame` is ever dropped unclosed.
     fn close_pending_frames(&self) {
         for frame in std::mem::take(&mut *self.pending_frames.borrow_mut()) {
+            frame.close();
+        }
+    }
+
+    /// Closes every cached frame, leaving the cache empty.
+    fn close_cached_frames(&mut self) {
+        self.cache_order.clear();
+        for (_, frame) in self.cache.drain() {
             frame.close();
         }
     }
@@ -401,15 +406,23 @@ impl WebVideoDecodeSession {
         let _ = JsFuture::from(promise).await;
     }
 
-    fn insert_cache(&mut self, index: FrameIndex, value: (VideoDimensions, Vec<u8>)) {
-        if self.cache.insert(index, value).is_none() {
-            self.cache_order.push_back(index);
+    fn insert_cache(&mut self, index: FrameIndex, frame: JsVideoFrame) {
+        // Every `VideoFrame` owns a real platform decode buffer, so replaced
+        // and evicted frames must be closed explicitly and deterministically;
+        // letting one reach the garbage collector starves the decoder's buffer
+        // pool and logs "A VideoFrame was garbage collected without being
+        // closed".
+        match self.cache.insert(index, frame) {
+            Some(replaced) => replaced.close(),
+            None => self.cache_order.push_back(index),
         }
         while self.cache.len() > self.limits.max_cached_frames as usize {
             let Some(oldest) = self.cache_order.pop_front() else {
                 break;
             };
-            self.cache.remove(&oldest);
+            if let Some(frame) = self.cache.remove(&oldest) {
+                frame.close();
+            }
         }
     }
 
@@ -460,6 +473,7 @@ impl WebVideoDecodeSession {
 impl Drop for WebVideoDecodeSession {
     fn drop(&mut self) {
         self.close_pending_frames();
+        self.close_cached_frames();
         let _ = self.decoder.close();
     }
 }
