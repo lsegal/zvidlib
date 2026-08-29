@@ -17,6 +17,9 @@ crate-type = ["rlib", "cdylib"]
 name = "native_gl"
 path = "examples/native_gl/main.rs"
 required-features = ["native"]
+# The example's bitmap-font overlay helpers carry unit tests; `test = true` lets
+# `cargo test --features native --example native_gl` run them.
+test = true
 
 [features]
 default = []

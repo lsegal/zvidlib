@@ -28,6 +28,8 @@ jobs:
         run: cargo check --all-targets --features native
       - name: Lint native target
         run: cargo clippy --all-targets --features native -- -D warnings
+      - name: Test native_gl example overlays
+        run: cargo test --features native --example native_gl
       - name: Check WebAssembly target
         run: cargo check --target wasm32-unknown-unknown --no-default-features --features web
       - name: Install wasm-pack
