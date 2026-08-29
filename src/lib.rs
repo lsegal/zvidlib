@@ -34,6 +34,9 @@ mod av1_decoder;
 #[cfg(not(target_arch = "wasm32"))]
 mod hevc;
 
+#[cfg(not(target_arch = "wasm32"))]
+mod native_audio;
+
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
 mod wasm_api;
 
@@ -80,7 +83,9 @@ pub use conformance::{
 pub use media::{
     AudioBuffer, Codec, ColorRange, Container, PixelFormat, Plane, VideoDimensions, VideoFrame,
 };
-pub use mp4_demux::{EditMapping, Mp4Demuxer, Mp4DemuxerOptions, Mp4Sample, Mp4Track, probe_mp4};
+pub use mp4_demux::{
+    AacTrackConfig, EditMapping, Mp4Demuxer, Mp4DemuxerOptions, Mp4Sample, Mp4Track, probe_mp4,
+};
 pub use output::{MediaOutput, OutputOptions};
 pub use playback::{
     AudioOutputBackend, AudioOutputKind, NativeAudioOutput, PlaybackAudioOutput,
@@ -101,3 +106,5 @@ pub use av1_decoder::native_av1_video_decoder_factory;
 pub use hevc::native_hevc_video_decoder_factory;
 #[cfg(not(target_arch = "wasm32"))]
 pub use hevc::native_hevc_video_encoder_factory;
+#[cfg(not(target_arch = "wasm32"))]
+pub use native_audio::{DefaultAudioOutput, NativeAacDecoder};

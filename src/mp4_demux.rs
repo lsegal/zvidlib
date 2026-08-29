@@ -1,5 +1,6 @@
 //! Bounded, read-only ISO BMFF/MP4 probing and sample indexing.
 
+use crate::audio::{AudioEdit, AudioTrackTiming, EncodedAudioSample};
 use crate::codec::{EncodedVideoSample, SampleDependency, TrackKind};
 use crate::io::ByteSource;
 use crate::media::{Codec, VideoDimensions};
@@ -62,6 +63,7 @@ pub struct Mp4Track {
     pub duration: u64,
     pub dimensions: Option<VideoDimensions>,
     pub channels: Option<u16>,
+    pub sample_rate: Option<u32>,
     /// Complete codec configuration box, including its header.
     pub decoder_config: Vec<u8>,
     pub edits: Vec<EditMapping>,
@@ -141,6 +143,129 @@ impl Mp4Track {
         }
         Ok(samples)
     }
+
+    /// Parses the AAC AudioSpecificConfig carried by this track's `esds` box.
+    pub fn aac_config(&self) -> Result<AacTrackConfig> {
+        if self.kind != TrackKind::Audio || self.codec != Codec::Aac {
+            return Err(unsupported("AAC configuration requires an AAC audio track"));
+        }
+        let sample_rate = self
+            .sample_rate
+            .ok_or_else(|| malformed("AAC sample rate is missing"))?;
+        let channels = self
+            .channels
+            .ok_or_else(|| malformed("AAC channel count is missing"))?;
+        parse_aac_config(&self.decoder_config, sample_rate, channels)
+    }
+
+    /// Reads every indexed AAC access unit from its validated byte range.
+    ///
+    /// Packet intervals use the decoded PCM sample clock and remain contiguous
+    /// even when the MP4 track timescale differs from the AAC sample rate.
+    pub async fn to_encoded_audio_samples<S: ByteSource + ?Sized>(
+        &self,
+        source: &S,
+        limits: &Limits,
+    ) -> Result<Vec<EncodedAudioSample>> {
+        let config = self.aac_config()?;
+        let mut total_bytes = 0_u64;
+        let mut decoded_start = 0_u64;
+        let mut track_ticks = 0_u64;
+        let mut packets = Vec::with_capacity(self.samples.len());
+        for (decode_index, sample) in self.samples.iter().enumerate() {
+            total_bytes = total_bytes
+                .checked_add(u64::from(sample.size))
+                .ok_or_else(|| limit("encoded AAC allocation overflow"))?;
+            if total_bytes > limits.max_allocation_bytes {
+                return Err(limit(
+                    "encoded AAC samples exceed the configured allocation limit",
+                ));
+            }
+            track_ticks = track_ticks
+                .checked_add(u64::from(sample.duration))
+                .ok_or_else(|| limit("AAC track timing overflow"))?;
+            let decoded_end = scale_time(track_ticks, self.timescale, config.sample_rate)?;
+            if decoded_end <= decoded_start {
+                return Err(malformed("AAC packet has an empty decoded interval"));
+            }
+            let mut data = vec![0_u8; sample.size as usize];
+            self.read_sample_into(source, decode_index, &mut data)
+                .await?;
+            packets.push(EncodedAudioSample {
+                decoded_range: crate::SampleRange::new(decoded_start, decoded_end)?,
+                data,
+            });
+            decoded_start = decoded_end;
+        }
+        if packets.is_empty() {
+            return Err(malformed("AAC track contains no samples"));
+        }
+        Ok(packets)
+    }
+
+    /// Converts MP4 edit-list timing to the presentation sample clock used by
+    /// [`crate::AacSampleReader`], including decoder priming and end padding.
+    pub fn audio_timing(&self, movie_timescale: u32) -> Result<AudioTrackTiming> {
+        let config = self.aac_config()?;
+        let decoded_length = scale_time(self.duration, self.timescale, config.sample_rate)?;
+        if self.edits.is_empty() {
+            return Ok(AudioTrackTiming::default());
+        }
+        let mut presentation_start = 0_u64;
+        let mut edits = Vec::with_capacity(self.edits.len());
+        let mut first_media = None;
+        let mut last_media_end = 0_u64;
+        for edit in &self.edits {
+            if edit.media_rate_integer != 1 || edit.media_rate_fraction != 0 {
+                return Err(unsupported("AAC edit rates other than 1.0 are unsupported"));
+            }
+            let length = scale_time(edit.segment_duration, movie_timescale, config.sample_rate)?;
+            if length == 0 {
+                return Err(malformed("AAC edit has an empty presentation interval"));
+            }
+            let presentation_end = presentation_start
+                .checked_add(length)
+                .ok_or_else(|| limit("AAC edit presentation overflow"))?;
+            let media_start = if edit.media_time == -1 {
+                None
+            } else {
+                if edit.media_time < 0 {
+                    return Err(malformed("AAC edit has an invalid negative media time"));
+                }
+                let start = scale_time(edit.media_time as u64, self.timescale, config.sample_rate)?;
+                let end = start
+                    .checked_add(length)
+                    .ok_or_else(|| limit("AAC edit media range overflow"))?;
+                first_media = Some(first_media.map_or(start, |value: u64| value.min(start)));
+                last_media_end = last_media_end.max(end);
+                Some(start)
+            };
+            edits.push(AudioEdit {
+                presentation: crate::SampleRange::new(presentation_start, presentation_end)?,
+                media_start,
+            });
+            presentation_start = presentation_end;
+        }
+        let priming = u32::try_from(first_media.unwrap_or(0))
+            .map_err(|_| limit("AAC priming exceeds the supported range"))?;
+        let padding = u32::try_from(decoded_length.saturating_sub(last_media_end))
+            .map_err(|_| limit("AAC padding exceeds the supported range"))?;
+        Ok(AudioTrackTiming {
+            priming,
+            padding,
+            track_offset: 0,
+            edits,
+        })
+    }
+}
+
+/// Decoder configuration extracted from an AAC `mp4a` / `esds` description.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AacTrackConfig {
+    pub audio_object_type: u8,
+    pub sample_rate: u32,
+    pub channels: u16,
+    pub audio_specific_config: Vec<u8>,
 }
 
 /// Parsed MP4 movie metadata and indexes.
@@ -386,6 +511,7 @@ struct TrackBuilder {
     duration: u64,
     dimensions: Option<VideoDimensions>,
     channels: Option<u16>,
+    sample_rate: Option<u32>,
     decoder_config: Vec<u8>,
     edits: Vec<EditMapping>,
     stts: Vec<(u32, u32)>,
@@ -681,6 +807,11 @@ fn parse_stsd(
         track.dimensions = Some(VideoDimensions::new(width, height, &options.limits)?);
     } else {
         track.channels = Some(be_u16(entry.payload, 16)?);
+        let fixed_rate = be_u32(entry.payload, 24)?;
+        if fixed_rate & 0xffff != 0 {
+            return Err(unsupported("fractional AAC sample rates are unsupported"));
+        }
+        track.sample_rate = Some(fixed_rate >> 16);
     }
     let config_kind = match codec {
         Codec::Hevc => b"hvcC",
@@ -935,6 +1066,7 @@ fn finalize_track(mut b: TrackBuilder, options: &Mp4DemuxerOptions) -> Result<Mp
         duration: b.duration,
         dimensions: b.dimensions,
         channels: b.channels,
+        sample_rate: b.sample_rate,
         decoder_config: b.decoder_config,
         edits: b.edits,
         samples: b.samples,
@@ -1462,6 +1594,149 @@ fn slice(bytes: &[u8], at: usize, len: usize) -> Result<&[u8]> {
     require(bytes, at, len)?;
     Ok(&bytes[at..at + len])
 }
+
+fn scale_time(value: u64, source_timescale: u32, destination_rate: u32) -> Result<u64> {
+    if source_timescale == 0 || destination_rate == 0 {
+        return Err(malformed("media timescale and sample rate must be nonzero"));
+    }
+    let numerator = u128::from(value)
+        .checked_mul(u128::from(destination_rate))
+        .ok_or_else(|| limit("media time scaling overflow"))?;
+    let rounded = numerator
+        .checked_add(u128::from(source_timescale) / 2)
+        .ok_or_else(|| limit("media time rounding overflow"))?
+        / u128::from(source_timescale);
+    u64::try_from(rounded).map_err(|_| limit("scaled media time cannot be represented"))
+}
+
+fn parse_aac_config(esds: &[u8], entry_rate: u32, entry_channels: u16) -> Result<AacTrackConfig> {
+    if esds.len() < 13 || &esds[4..8] != b"esds" {
+        return Err(malformed("AAC decoder configuration is not an esds box"));
+    }
+    let payload = &esds[12..];
+    let mut unsupported_type = None;
+    for at in 0..payload.len() {
+        if payload[at] != 0x05 {
+            continue;
+        }
+        let Ok((length, header)) = descriptor_length(&payload[at + 1..]) else {
+            continue;
+        };
+        let start = at + 1 + header;
+        let Some(end) = start.checked_add(length) else {
+            continue;
+        };
+        if end > payload.len() || length < 2 {
+            continue;
+        }
+        let asc = &payload[start..end];
+        let Ok((object_type, sample_rate, channel_config)) = parse_audio_specific_config(asc)
+        else {
+            continue;
+        };
+        if object_type != 2 {
+            unsupported_type = Some(object_type);
+            continue;
+        }
+        if sample_rate != entry_rate {
+            return Err(malformed(
+                "AAC AudioSpecificConfig sample rate disagrees with mp4a",
+            ));
+        }
+        if u16::from(channel_config) != entry_channels {
+            return Err(malformed(
+                "AAC AudioSpecificConfig channel count disagrees with mp4a",
+            ));
+        }
+        return Ok(AacTrackConfig {
+            audio_object_type: object_type,
+            sample_rate,
+            channels: entry_channels,
+            audio_specific_config: asc.to_vec(),
+        });
+    }
+    if let Some(object_type) = unsupported_type {
+        Err(unsupported(format!(
+            "AAC audio object type {object_type} is unsupported; AAC-LC is required"
+        )))
+    } else {
+        Err(malformed(
+            "AAC esds does not contain a valid DecoderSpecificInfo descriptor",
+        ))
+    }
+}
+
+fn descriptor_length(bytes: &[u8]) -> Result<(usize, usize)> {
+    let mut length = 0_usize;
+    for (index, &byte) in bytes.iter().take(4).enumerate() {
+        length = length
+            .checked_shl(7)
+            .and_then(|value| value.checked_add(usize::from(byte & 0x7f)))
+            .ok_or_else(|| malformed("AAC descriptor length overflow"))?;
+        if byte & 0x80 == 0 {
+            return Ok((length, index + 1));
+        }
+    }
+    Err(malformed("AAC descriptor has an invalid length"))
+}
+
+fn parse_audio_specific_config(bytes: &[u8]) -> Result<(u8, u32, u8)> {
+    let mut bits = AscBits::new(bytes);
+    let mut object_type = bits.read(5)? as u8;
+    if object_type == 31 {
+        object_type = 32_u8
+            .checked_add(bits.read(6)? as u8)
+            .ok_or_else(|| malformed("AAC audio object type overflow"))?;
+    }
+    let frequency_index = bits.read(4)? as usize;
+    const FREQUENCIES: [u32; 13] = [
+        96_000, 88_200, 64_000, 48_000, 44_100, 32_000, 24_000, 22_050, 16_000, 12_000, 11_025,
+        8_000, 7_350,
+    ];
+    let sample_rate = if frequency_index == 15 {
+        bits.read(24)?
+    } else {
+        *FREQUENCIES
+            .get(frequency_index)
+            .ok_or_else(|| malformed("AAC AudioSpecificConfig has an invalid sample rate"))?
+    };
+    let channel_config = bits.read(4)? as u8;
+    if channel_config == 0 || channel_config > 7 {
+        return Err(unsupported(
+            "AAC program-config-element channel layouts are unsupported",
+        ));
+    }
+    Ok((object_type, sample_rate, channel_config))
+}
+
+struct AscBits<'a> {
+    bytes: &'a [u8],
+    position: usize,
+}
+
+impl<'a> AscBits<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, position: 0 }
+    }
+
+    fn read(&mut self, count: usize) -> Result<u32> {
+        if count > 32
+            || self
+                .position
+                .checked_add(count)
+                .is_none_or(|end| end > self.bytes.len() * 8)
+        {
+            return Err(malformed("truncated AAC AudioSpecificConfig"));
+        }
+        let mut value = 0_u32;
+        for _ in 0..count {
+            value = (value << 1)
+                | u32::from((self.bytes[self.position / 8] >> (7 - self.position % 8)) & 1);
+            self.position += 1;
+        }
+        Ok(value)
+    }
+}
 fn be_u16(b: &[u8], a: usize) -> Result<u16> {
     Ok(u16::from_be_bytes(
         slice(b, a, 2)?.try_into().expect("fixed"),
@@ -1768,5 +2043,52 @@ mod tests {
         let derived =
             crate::codec_config::derive_codec_string(track.codec, &track.decoder_config).unwrap();
         assert!(derived.codec_string.starts_with("hev1."));
+    }
+
+    #[test]
+    fn bundled_aac_track_exposes_indexed_packets_configuration_and_gapless_timing() {
+        block_on(async {
+            let source =
+                MemorySource::new(include_bytes!("../examples/media/BigBuckBunny.mp4").to_vec());
+            let movie = Mp4Demuxer::open(&source, Mp4DemuxerOptions::default())
+                .await
+                .unwrap();
+            let track = movie
+                .tracks
+                .iter()
+                .find(|track| track.kind == TrackKind::Audio)
+                .unwrap();
+            let config = track.aac_config().unwrap();
+            assert_eq!(config.audio_object_type, 2);
+            assert_eq!(config.sample_rate, 48_000);
+            assert_eq!(config.channels, 2);
+            assert_eq!(config.audio_specific_config, [0x11, 0x90, 0x56, 0xe5, 0x00]);
+
+            let packets = track
+                .to_encoded_audio_samples(&source, &Limits::default())
+                .await
+                .unwrap();
+            assert_eq!(packets.len(), 1_501);
+            assert_eq!(
+                packets[0].decoded_range,
+                crate::SampleRange::new(0, 1_024).unwrap()
+            );
+            assert_eq!(
+                packets[1].decoded_range,
+                crate::SampleRange::new(1_024, 2_048).unwrap()
+            );
+            assert_eq!(packets.last().unwrap().decoded_range.end, 1_537_024);
+            assert_eq!(packets[0].data.len(), track.samples[0].size as usize);
+
+            let timing = track.audio_timing(movie.movie_timescale).unwrap();
+            assert_eq!(timing.priming, 1_024);
+            assert_eq!(timing.padding, 0);
+            assert_eq!(timing.edits.len(), 1);
+            assert_eq!(
+                timing.edits[0].presentation,
+                crate::SampleRange::new(0, 1_536_000).unwrap()
+            );
+            assert_eq!(timing.edits[0].media_start, Some(1_024));
+        });
     }
 }
