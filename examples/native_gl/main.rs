@@ -32,8 +32,9 @@ use glutin::surface::{Surface, SurfaceAttributesBuilder, SwapInterval, WindowSur
 use glutin_winit::DisplayBuilder;
 use raw_window_handle::HasWindowHandle;
 use winit::application::ApplicationHandler;
-use winit::event::WindowEvent;
+use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use zvidlib::io::MemorySource;
@@ -128,6 +129,11 @@ fn run() -> Result<()> {
         audio_config.sample_rate,
         audio_config.channels,
     )?);
+    let frame_count = video.presentation_order.len().max(1) as u64;
+    let frames_per_five_seconds = ((u128::from(frame_count) * u128::from(video.timescale) * 5)
+        / u128::from(video.duration.max(1)))
+    .max(1)
+    .min(u128::from(frame_count)) as u64;
     let timeline =
         IndexedPresentationTimeline::from_mp4_track(video, audio_config.sample_rate, &limits)?;
     let playback = PlaybackController::new_with_indexed_timeline(
@@ -143,7 +149,7 @@ fn run() -> Result<()> {
         video.codec
     );
 
-    let mut app = App::new(dimensions, playback);
+    let mut app = App::new(dimensions, playback, frame_count, frames_per_five_seconds);
     let event_loop = EventLoop::new()
         .map_err(|error| invalid(format!("could not create the event loop: {error}")))?;
     event_loop.set_control_flow(ControlFlow::Poll);
@@ -157,6 +163,10 @@ fn run() -> Result<()> {
 struct App<P> {
     dimensions: VideoDimensions,
     playback: P,
+    frame_count: u64,
+    frames_per_five_seconds: u64,
+    needs_static_frame: bool,
+    timeline_hover: Option<f32>,
     fps: FpsCounter,
     state: Option<WindowState>,
     error: Option<Error>,
@@ -175,10 +185,19 @@ where
     A: zvidlib::PlaybackAudioSource,
     O: zvidlib::PlaybackAudioOutput,
 {
-    fn new(dimensions: VideoDimensions, playback: PlaybackController<V, A, O>) -> Self {
+    fn new(
+        dimensions: VideoDimensions,
+        playback: PlaybackController<V, A, O>,
+        frame_count: u64,
+        frames_per_five_seconds: u64,
+    ) -> Self {
         Self {
             dimensions,
             playback,
+            frame_count,
+            frames_per_five_seconds,
+            needs_static_frame: false,
+            timeline_hover: None,
             fps: FpsCounter::new(),
             state: None,
             error: None,
@@ -198,54 +217,115 @@ where
         event_loop.exit();
     }
 
-    fn render(&mut self, event_loop: &ActiveEventLoop) {
-        let Some(state) = self.state.as_mut() else {
+    fn toggle_playback(&mut self, event_loop: &ActiveEventLoop) {
+        let result = if self.playback.is_playing() {
+            self.needs_static_frame = true;
+            self.playback.pause()
+        } else {
+            self.needs_static_frame = false;
+            self.playback.play()
+        };
+        if let Err(error) = result {
+            self.fail(event_loop, error);
+        }
+        if let Some(state) = self.state.as_ref() {
+            state.window.request_redraw();
+        }
+    }
+
+    fn seek_by_frames(&mut self, event_loop: &ActiveEventLoop, delta: i64) {
+        let Ok(current) = self.playback.current_frame_index() else {
             return;
         };
+        let maximum = self.frame_count.saturating_sub(1);
+        let target = if delta < 0 {
+            current.0.saturating_sub(delta.unsigned_abs())
+        } else {
+            current.0.saturating_add(delta as u64).min(maximum)
+        };
+        self.seek_to_frame(event_loop, target);
+    }
+
+    fn seek_to_frame(&mut self, event_loop: &ActiveEventLoop, frame: u64) {
+        if let Err(error) = self.playback.seek(zvidlib::FrameIndex(frame)) {
+            return self.fail(event_loop, error);
+        }
+        if !self.playback.is_playing() {
+            self.needs_static_frame = true;
+        }
+        if let Some(state) = self.state.as_ref() {
+            state.window.request_redraw();
+        }
+    }
+
+    fn timeline_fraction(&self, x: f64, y: f64) -> Option<f32> {
+        let state = self.state.as_ref()?;
+        let size = state.window.inner_size();
+        if y < f64::from(size.height.saturating_sub(40)) {
+            return None;
+        }
+        Some((x / f64::from(size.width.max(1))).clamp(0.0, 1.0) as f32)
+    }
+
+    fn scrub_timeline(&mut self, event_loop: &ActiveEventLoop, fraction: f32) {
+        let maximum = self.frame_count.saturating_sub(1);
+        self.seek_to_frame(
+            event_loop,
+            (f64::from(fraction) * maximum as f64).round() as u64,
+        );
+    }
+
+    fn render(&mut self, event_loop: &ActiveEventLoop) {
+        if self.state.is_none() {
+            return;
+        }
 
         let now = Instant::now();
-        let frame_presented = match self.playback.present() {
-            Ok((_, Some(frame))) => {
-                let resource = GraphicsResource::new(
-                    GraphicsApi::NativeOpenGl,
-                    state.adapter.context_identity(),
-                    state.adapter.execution_owner(),
-                    ResourceKind::Texture2d,
-                    TEXTURE_HANDLE,
-                    self.dimensions,
-                    PixelFormat::Rgba8,
-                    ColorRange::Limited,
-                    Orientation::TopLeft,
-                    ResourceOwnership::Caller,
-                );
-                if let Err(error) = execute_transfer(
-                    Some(&mut state.adapter),
-                    FrameSource::Cpu(CpuFrameSource {
-                        frame: &frame,
-                        orientation: Orientation::TopLeft,
-                    }),
-                    FrameDestination::Graphics(resource),
-                    TransferPolicy::any(),
-                ) {
+        let frame_presented = if self.playback.is_playing() {
+            match self.playback.present() {
+                Ok((_, Some(frame))) => {
+                    self.upload_frame(event_loop, &frame);
+                    true
+                }
+                Ok((presentation, None)) => {
+                    if presentation.finished {
+                        if let Err(error) = self.playback.seek(zvidlib::FrameIndex(0)) {
+                            return self.fail(event_loop, error);
+                        }
+                    }
+                    false
+                }
+                Err(error) => {
                     return self.fail(event_loop, error);
                 }
-                true
             }
-            Ok((presentation, None)) => {
-                if presentation.finished {
-                    if let Err(error) = self.playback.seek(zvidlib::FrameIndex(0)) {
-                        return self.fail(event_loop, error);
-                    }
+        } else if self.needs_static_frame {
+            match self.playback.current_frame() {
+                Ok(frame) => {
+                    self.needs_static_frame = false;
+                    self.upload_frame(event_loop, &frame);
+                    true
                 }
-                false
+                Err(error) => return self.fail(event_loop, error),
             }
-            Err(error) => {
-                return self.fail(event_loop, error);
-            }
+        } else {
+            false
         };
 
+        let progress = self
+            .playback
+            .current_frame_index()
+            .map(|frame| frame.0 as f32 / self.frame_count.saturating_sub(1).max(1) as f32)
+            .unwrap_or(0.0);
         let fps = self.fps.update(frame_presented, now);
-        state.adapter.draw(TEXTURE_HANDLE, self.dimensions, fps);
+        let state = self.state.as_mut().expect("state exists");
+        state.adapter.draw(
+            TEXTURE_HANDLE,
+            self.dimensions,
+            fps,
+            progress,
+            self.timeline_hover,
+        );
         if let Err(error) = state.surface.swap_buffers(&state.context) {
             return self.fail(
                 event_loop,
@@ -253,7 +333,38 @@ where
             );
         }
 
-        state.window.request_redraw();
+        if self.playback.is_playing() {
+            state.window.request_redraw();
+        }
+    }
+
+    fn upload_frame(&mut self, event_loop: &ActiveEventLoop, frame: &zvidlib::VideoFrame) {
+        let Some(state) = self.state.as_mut() else {
+            return;
+        };
+        let resource = GraphicsResource::new(
+            GraphicsApi::NativeOpenGl,
+            state.adapter.context_identity(),
+            state.adapter.execution_owner(),
+            ResourceKind::Texture2d,
+            TEXTURE_HANDLE,
+            self.dimensions,
+            PixelFormat::Rgba8,
+            ColorRange::Limited,
+            Orientation::TopLeft,
+            ResourceOwnership::Caller,
+        );
+        if let Err(error) = execute_transfer(
+            Some(&mut state.adapter),
+            FrameSource::Cpu(CpuFrameSource {
+                frame,
+                orientation: Orientation::TopLeft,
+            }),
+            FrameDestination::Graphics(resource),
+            TransferPolicy::any(),
+        ) {
+            self.fail(event_loop, error);
+        }
     }
 }
 
@@ -383,6 +494,37 @@ where
 
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                match event.physical_key {
+                    PhysicalKey::Code(KeyCode::Space) => self.toggle_playback(event_loop),
+                    PhysicalKey::Code(KeyCode::ArrowLeft) => self.seek_by_frames(event_loop, -1),
+                    PhysicalKey::Code(KeyCode::ArrowRight) => self.seek_by_frames(event_loop, 1),
+                    PhysicalKey::Code(KeyCode::KeyJ) => {
+                        self.seek_by_frames(event_loop, -(self.frames_per_five_seconds as i64))
+                    }
+                    PhysicalKey::Code(KeyCode::KeyL) => {
+                        self.seek_by_frames(event_loop, self.frames_per_five_seconds as i64)
+                    }
+                    _ => {}
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                self.timeline_hover = self.timeline_fraction(position.x, position.y);
+                if let Some(fraction) = self.timeline_hover {
+                    self.scrub_timeline(event_loop, fraction);
+                } else if let Some(state) = self.state.as_ref() {
+                    state.window.request_redraw();
+                }
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Left,
+                ..
+            } => {
+                if let Some(fraction) = self.timeline_hover {
+                    self.scrub_timeline(event_loop, fraction);
+                }
+            }
             WindowEvent::Resized(size) => {
                 if let Some(state) = self.state.as_mut() {
                     if let (Some(width), Some(height)) =

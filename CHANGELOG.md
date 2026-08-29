@@ -4,6 +4,7 @@ All notable changes to zvidlib will be documented in this file.
 
 ## Unreleased
 
+- Add playback controls to the native GL and web canvas examples, including play/pause, five-second rewind/fast-forward, previous/next frame stepping, and scrub-capable timeline bars that keep audio and video synchronized.
 - Lock the native GL and web canvas examples to each video's MP4 presentation timing, preventing accelerated decoders and high-refresh displays from running playback above the source frame rate; browser `VideoStream` now exposes `frameDuration(index)` for this pacing even when codec decode is unavailable.
 - Play the bundled AAC-LC track through zvidlib-owned MP4 packet indexing and synchronized audio-clock playback in the native GL and web canvas examples, with native AAC decode/default-device output and browser AAC packet/config exports for WebCodecs `AudioDecoder`.
 - Fix the `native_gl` example's FPS overlay reporting the window redraw rate (which could exceed 300 FPS) instead of the rate at which newly decoded video frames are actually displayed.
