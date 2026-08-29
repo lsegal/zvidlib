@@ -25,9 +25,9 @@ native OpenGL example still renders the same decoded pixels without requiring a 
 Opens the sample, selects accelerated HEVC Main decoding when available (printing the selected
 `CodecImplementation`), and drives the real CPU → native OpenGL upload path (`execute_transfer`)
 through a `GraphicsAdapter` backed by a real `winit` window and `glutin` OpenGL context on Windows,
-macOS, and Linux. Playback loops back to the first frame once the last one has been shown, matching
-the web example's looping behavior, and the decoded-frame playback rate is drawn in the window's
-top-left corner.
+macOS, and Linux. Playback sends the sample's AAC track to the default system audio device through
+Rodio and uses that audio clock to select video frames. Audio and video loop together, and the
+decoded-frame playback rate is drawn in the window's top-left corner.
 
 ```console
 cargo run --example native_gl --features native
@@ -37,7 +37,8 @@ cargo run --example native_gl --features native
 
 A browser page that opens the sample as a `Blob`, creates a WebGL2 canvas context, and drives the
 same CPU → WebGL upload path via the generated `zvidlib` package. It calls `video.get()` for each
-displayed frame and uploads the real decoded RGBA pixels; if the browser cannot decode HEVC it
+displayed frame and uploads the real decoded RGBA pixels. The Play button also sends the sample's
+AAC track to the browser's native audio output; if the browser cannot decode HEVC it
 falls back to a synthetic gradient sized to the real track instead.
 
 `examples/web_canvas/package.json` wraps the whole setup in one command. From `examples/web_canvas/`:

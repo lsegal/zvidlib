@@ -6,6 +6,7 @@ const canvas = document.querySelector("#video");
 const playButton = document.querySelector("#play");
 const status = document.querySelector("#status");
 const fps = document.querySelector("#fps");
+const SAMPLE_FRAME_RATE = 24;
 
 const VERTEX_SHADER = `
   attribute vec2 position;
@@ -92,11 +93,17 @@ async function main() {
     return;
   }
 
-  const input = await MediaInput.open(await response.blob());
+  const mediaBlob = await response.blob();
+  const mediaUrl = URL.createObjectURL(mediaBlob);
+  const audio = new Audio(mediaUrl);
+  audio.loop = true;
+  audio.preload = "auto";
+  const input = await MediaInput.open(mediaBlob);
   const video = input.video(0);
   const lines = [
     `Opened ${input.byteLength} bytes.`,
     `Video stream 0 direction: ${video.direction}`,
+    "The MP4 audio track will play through the browser's native audio output.",
   ];
 
   // Real decoding depends on the browser having an HEVC WebCodecs decoder; fall back to a
@@ -113,6 +120,7 @@ async function main() {
 
   let playing = false;
   let frameIndex = 0;
+  let renderedFrameIndex = -1;
   let stopped = false;
 
   function uploadFrame(pixels, width, height) {
@@ -124,24 +132,32 @@ async function main() {
   }
 
   async function renderFrame() {
+    const targetFrame = playing
+      ? Math.floor(audio.currentTime * SAMPLE_FRAME_RATE)
+      : frameIndex;
+    if (targetFrame === renderedFrameIndex) return false;
     if (useRealDecode) {
       try {
-        const frame = await video.get(BigInt(frameIndex));
+        const frame = await video.get(BigInt(targetFrame));
         uploadFrame(frame.pixels, frame.width, frame.height);
-        frameIndex += 1;
-        return;
+        renderedFrameIndex = targetFrame;
+        frameIndex = targetFrame + 1;
+        return true;
       } catch {
         // Ran past the last indexed frame: loop back to the start.
         frameIndex = 0;
         const frame = await video.get(0n);
         uploadFrame(frame.pixels, frame.width, frame.height);
         frameIndex = 1;
-        return;
+        renderedFrameIndex = 0;
+        return true;
       }
     }
-    const phase = (frameIndex % 60) / 60;
+    const phase = (targetFrame % 60) / 60;
     uploadFrame(syntheticFrame(canvas.width, canvas.height, phase), canvas.width, canvas.height);
-    frameIndex += 1;
+    renderedFrameIndex = targetFrame;
+    frameIndex = targetFrame + 1;
+    return true;
   }
 
   let framesSinceFpsUpdate = 0;
@@ -161,20 +177,26 @@ async function main() {
   async function renderLoop() {
     while (!stopped) {
       if (playing) {
-        await renderFrame();
-        tickFps();
+        if (await renderFrame()) tickFps();
       }
       await new Promise((resolve) => requestAnimationFrame(resolve));
     }
   }
 
-  playButton.addEventListener("click", () => {
-    playing = !playing;
+  playButton.addEventListener("click", async () => {
+    if (playing) {
+      audio.pause();
+      playing = false;
+    } else {
+      await audio.play();
+      playing = true;
+    }
     playButton.textContent = playing ? "Pause" : "Play";
   });
 
   if (decodedFrame) {
     uploadFrame(decodedFrame.pixels, decodedFrame.width, decodedFrame.height);
+    renderedFrameIndex = 0;
     frameIndex = 1;
   } else {
     await renderFrame();
@@ -185,6 +207,8 @@ async function main() {
     "pagehide",
     () => {
       stopped = true;
+      audio.pause();
+      URL.revokeObjectURL(mediaUrl);
       input.close();
     },
     { once: true },

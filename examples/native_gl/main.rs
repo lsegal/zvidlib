@@ -21,10 +21,12 @@ use std::fs;
 use std::future::Future;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError, sync_channel};
 use std::task::{Context, Poll, Waker};
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use glutin::config::ConfigTemplateBuilder;
 use glutin::context::{ContextApi, ContextAttributesBuilder, PossiblyCurrentContext};
@@ -33,6 +35,7 @@ use glutin::prelude::*;
 use glutin::surface::{Surface, SurfaceAttributesBuilder, SwapInterval, WindowSurface};
 use glutin_winit::DisplayBuilder;
 use raw_window_handle::HasWindowHandle;
+use rodio::{Decoder, OutputStream, OutputStreamBuilder, Sink, Source};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -94,6 +97,10 @@ fn run() -> Result<()> {
         video.presentation_order.len(),
     );
     let frame_count = video.presentation_order.len().max(1);
+    let frame_rate = video
+        .presentation_sample(0)
+        .map(|sample| f64::from(video.timescale) / f64::from(sample.duration))
+        .ok_or_else(|| invalid("the video track does not contain presentation samples"))?;
     let limits = Limits::default();
     let samples = block_on(video.to_encoded_video_samples(&source, &limits))?;
     let factory = native_hevc_video_decoder_factory();
@@ -114,8 +121,9 @@ fn run() -> Result<()> {
         video.codec
     );
 
+    let audio = AudioPlayback::open(&input_path)?;
     let decoder = DecodeThread::spawn(reader, frame_count);
-    let mut app = App::new(dimensions, decoder);
+    let mut app = App::new(dimensions, frame_count, frame_rate, decoder, audio);
     let event_loop = EventLoop::new()
         .map_err(|error| invalid(format!("could not create the event loop: {error}")))?;
     event_loop.set_control_flow(ControlFlow::Poll);
@@ -138,6 +146,7 @@ struct DecodedFrame {
 /// the window redraw at the display's own pace while showing the newest completed frame.
 struct DecodeThread {
     frames: Receiver<DecodedFrame>,
+    requested: Arc<AtomicUsize>,
     cancellation: CancellationToken,
     handle: Option<JoinHandle<()>>,
 }
@@ -145,11 +154,18 @@ struct DecodeThread {
 impl DecodeThread {
     fn spawn(mut reader: ExactFrameReader, frame_count: usize) -> Self {
         let (sender, frames) = sync_channel(1);
+        let requested = Arc::new(AtomicUsize::new(0));
+        let thread_requested = requested.clone();
         let cancellation = CancellationToken::new();
         let thread_cancellation = cancellation.clone();
         let handle = thread::spawn(move || {
-            let mut index = 0usize;
+            let mut last_index = None;
             loop {
+                let index = thread_requested.load(Ordering::Acquire) % frame_count.max(1);
+                if last_index == Some(index) {
+                    thread::sleep(Duration::from_millis(1));
+                    continue;
+                }
                 let frame = match reader.get(FrameIndex(index as u64), &thread_cancellation) {
                     Ok(frame) => frame,
                     Err(_) => return,
@@ -157,11 +173,12 @@ impl DecodeThread {
                 if sender.send(DecodedFrame { frame }).is_err() {
                     return;
                 }
-                index = (index + 1) % frame_count.max(1);
+                last_index = Some(index);
             }
         });
         Self {
             frames,
+            requested,
             cancellation,
             handle: Some(handle),
         }
@@ -178,6 +195,10 @@ impl DecodeThread {
             }
         }
     }
+
+    fn request(&self, index: usize) {
+        self.requested.store(index, Ordering::Release);
+    }
 }
 
 impl Drop for DecodeThread {
@@ -189,10 +210,42 @@ impl Drop for DecodeThread {
     }
 }
 
+/// Owns the native output stream and loops the MP4's AAC track. Rodio uses the same MP4 file as
+/// the zvidlib video path, so its playback position can drive video presentation.
+struct AudioPlayback {
+    _stream: OutputStream,
+    sink: Sink,
+}
+
+impl AudioPlayback {
+    fn open(path: &PathBuf) -> Result<Self> {
+        let stream = OutputStreamBuilder::open_default_stream().map_err(|error| {
+            invalid(format!("could not open the default audio output ({error})"))
+        })?;
+        let sink = Sink::connect_new(stream.mixer());
+        let file = fs::File::open(path)
+            .map_err(|error| invalid(format!("could not reopen audio input ({error})")))?;
+        let source = Decoder::try_from(file)
+            .map_err(|error| invalid(format!("could not decode the MP4 audio track ({error})")))?;
+        sink.append(source.repeat_infinite());
+        Ok(Self {
+            _stream: stream,
+            sink,
+        })
+    }
+
+    fn position(&self) -> Duration {
+        self.sink.get_pos()
+    }
+}
+
 /// Drives the `winit` window, owns the `glutin` GL context, and renders looping frames.
 struct App {
     dimensions: VideoDimensions,
+    frame_count: usize,
+    frame_rate: f64,
     decoder: DecodeThread,
+    audio: AudioPlayback,
     fps: FpsCounter,
     state: Option<WindowState>,
     error: Option<Error>,
@@ -206,10 +259,19 @@ struct WindowState {
 }
 
 impl App {
-    fn new(dimensions: VideoDimensions, decoder: DecodeThread) -> Self {
+    fn new(
+        dimensions: VideoDimensions,
+        frame_count: usize,
+        frame_rate: f64,
+        decoder: DecodeThread,
+        audio: AudioPlayback,
+    ) -> Self {
         Self {
             dimensions,
+            frame_count,
+            frame_rate,
             decoder,
+            audio,
             fps: FpsCounter::new(),
             state: None,
             error: None,
@@ -234,6 +296,9 @@ impl App {
             return;
         };
 
+        let requested_frame =
+            ((self.audio.position().as_secs_f64() * self.frame_rate) as usize) % self.frame_count;
+        self.decoder.request(requested_frame);
         let frame_presented = match self.decoder.latest() {
             Ok(Some(decoded)) => {
                 let resource = GraphicsResource::new(
