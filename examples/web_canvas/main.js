@@ -186,7 +186,8 @@ async function main() {
   function currentMediaTimeMs() {
     if (!playing) return pausedMediaTimeMs;
     if (audioState?.startedAt !== undefined) {
-      const elapsedMs = (audioState.context.currentTime - audioState.startedAt) * 1000;
+      // Audio is scheduled a few ms ahead of the clock, so clamp the pre-roll window to zero.
+      const elapsedMs = Math.max((audioState.context.currentTime - audioState.startedAt) * 1000, 0);
       return ((elapsedMs % mediaDurationMs) + mediaDurationMs) % mediaDurationMs;
     }
     return (performance.now() - videoClockStart) % mediaDurationMs;
@@ -202,15 +203,35 @@ async function main() {
     syncTimeline();
   }
 
+  // Pointer scrubbing can outrun the decoder, so keep only the newest requested position and
+  // drop superseded ones instead of queueing every intermediate seek.
+  let pendingSeek = null;
+  let seeking = false;
+  async function requestSeek(index, keepPlaying) {
+    pendingSeek = { index, keepPlaying: keepPlaying ?? playing };
+    if (seeking) return;
+    seeking = true;
+    try {
+      while (pendingSeek) {
+        const next = pendingSeek;
+        pendingSeek = null;
+        await seekToFrame(next.index, next.keepPlaying);
+      }
+    } finally {
+      seeking = false;
+    }
+  }
+
   async function seekByMilliseconds(deltaMs) {
     const targetTime = ((currentMediaTimeMs() + deltaMs) % mediaDurationMs + mediaDurationMs) % mediaDurationMs;
-    await seekToFrame(frameForMediaTime(targetTime));
+    await requestSeek(frameForMediaTime(targetTime));
   }
 
   async function stepFrame(delta) {
-    await seekToFrame((playing ? frameForMediaTime(currentMediaTimeMs()) : frameIndex) + delta, false);
+    const from = playing ? frameForMediaTime(currentMediaTimeMs()) : frameIndex;
     playing = false;
     playButton.textContent = "Play";
+    await requestSeek(from + delta, false);
   }
 
   async function renderFrame(advance = true) {
@@ -283,12 +304,13 @@ async function main() {
   fastForwardButton.addEventListener("click", () => seekByMilliseconds(5000));
   previousFrameButton.addEventListener("click", () => stepFrame(-1));
   nextFrameButton.addEventListener("click", () => stepFrame(1));
-  timeline.addEventListener("input", () => seekToFrame(Number(timeline.value)));
+  timeline.addEventListener("input", () => requestSeek(Number(timeline.value)));
+  // The issue asks for a bar that scrubs as the pointer moves across it, so hovering seeks
+  // whether or not a button is held; playback (audio included) keeps running while it does.
   timeline.addEventListener("mousemove", (event) => {
-    if (event.buttons !== 1 && !playing) return;
     const rect = timeline.getBoundingClientRect();
     const fraction = Math.min(Math.max((event.clientX - rect.left) / rect.width, 0), 1);
-    seekToFrame(Math.round(fraction * lastFrameIndex));
+    requestSeek(Math.round(fraction * lastFrameIndex));
   });
 
   if (decodedFrame) {
@@ -328,15 +350,15 @@ async function prepareAudio(audio) {
     },
     context,
     packets,
+    buffer: undefined,
     sources: [],
   };
 }
 
-async function startAudio(state, offsetMs = 0) {
-  stopAudio(state);
-  await state.context.resume();
-  const startAt = state.context.currentTime + 0.08;
-  const offsetSeconds = offsetMs / 1000;
+/// Decodes every AAC packet once into a single contiguous `AudioBuffer` covering the whole track.
+/// Seeking and scrubbing then only reschedule one buffer source instead of re-running the decoder.
+async function decodeAudioBuffer(state) {
+  if (state.buffer) return state.buffer;
   const outputs = [];
   const decoder = new AudioDecoder({
     output: (data) => outputs.push(data),
@@ -353,24 +375,47 @@ async function startAudio(state, offsetMs = 0) {
     }));
   }
   await decoder.flush();
-  state.startedAt = startAt;
+  decoder.close();
+  if (outputs.length === 0) throw new Error("AAC decode produced no audio");
+
+  const sampleRate = outputs[0].sampleRate;
+  const channels = outputs[0].numberOfChannels;
+  const frames = outputs.reduce(
+    (end, data) => Math.max(end, sampleAt(data, sampleRate) + data.numberOfFrames),
+    0,
+  );
+  const buffer = state.context.createBuffer(channels, Math.max(frames, 1), sampleRate);
   for (const data of outputs) {
-    const buffer = state.context.createBuffer(data.numberOfChannels, data.numberOfFrames, data.sampleRate);
-    for (let channel = 0; channel < data.numberOfChannels; channel++) {
+    const start = sampleAt(data, sampleRate);
+    for (let channel = 0; channel < channels; channel++) {
       const plane = new Float32Array(data.numberOfFrames);
-      data.copyTo(plane, { planeIndex: channel, format: "f32-planar" });
-      buffer.copyToChannel(plane, channel);
+      data.copyTo(plane, { planeIndex: Math.min(channel, data.numberOfChannels - 1), format: "f32-planar" });
+      buffer.copyToChannel(plane, channel, start);
     }
-    const source = state.context.createBufferSource();
-    source.buffer = buffer;
-    source.connect(state.context.destination);
-    const timestampSeconds = data.timestamp / 1_000_000;
-    const when = startAt + Math.max(0, timestampSeconds - offsetSeconds);
-    const offset = Math.max(0, offsetSeconds - timestampSeconds);
-    if (offset < buffer.duration) source.start(when, offset);
-    state.sources.push(source);
     data.close();
   }
+  state.buffer = buffer;
+  return buffer;
+}
+
+function sampleAt(data, sampleRate) {
+  return Math.max(0, Math.round((data.timestamp / 1_000_000) * sampleRate));
+}
+
+async function startAudio(state, offsetMs = 0) {
+  stopAudio(state);
+  const buffer = await decodeAudioBuffer(state);
+  await state.context.resume();
+  const offsetSeconds = Math.min(Math.max(offsetMs / 1000, 0), Math.max(buffer.duration - 0.001, 0));
+  const startAt = state.context.currentTime + 0.05;
+  const source = state.context.createBufferSource();
+  source.buffer = buffer;
+  source.loop = true;
+  source.connect(state.context.destination);
+  source.start(startAt, offsetSeconds);
+  state.sources.push(source);
+  // Anchor the audio clock to media time zero so `currentMediaTimeMs()` stays absolute across seeks.
+  state.startedAt = startAt - offsetSeconds;
 }
 
 function stopAudio(state) {

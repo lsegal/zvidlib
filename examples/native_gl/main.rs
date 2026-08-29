@@ -149,6 +149,11 @@ fn run() -> Result<()> {
         video.codec
     );
 
+    println!(
+        "Controls: SPACE play/pause, LEFT/RIGHT previous/next frame, J/L rewind/fast-forward 5s, \
+         hover or click the timeline bar along the bottom edge to scrub."
+    );
+
     let mut app = App::new(dimensions, playback, frame_count, frames_per_five_seconds);
     let event_loop = EventLoop::new()
         .map_err(|error| invalid(format!("could not create the event loop: {error}")))?;
@@ -269,10 +274,13 @@ where
 
     fn scrub_timeline(&mut self, event_loop: &ActiveEventLoop, fraction: f32) {
         let maximum = self.frame_count.saturating_sub(1);
-        self.seek_to_frame(
-            event_loop,
-            (f64::from(fraction) * maximum as f64).round() as u64,
-        );
+        let target = (f64::from(fraction) * maximum as f64).round() as u64;
+        // Pointer moves land far more often than frames change; seeking resets both decoders, so
+        // only do it when the scrub actually selects a different frame.
+        if matches!(self.playback.current_frame_index(), Ok(frame) if frame.0 == target) {
+            return;
+        }
+        self.seek_to_frame(event_loop, target);
     }
 
     fn render(&mut self, event_loop: &ActiveEventLoop) {
