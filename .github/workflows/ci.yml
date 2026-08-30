@@ -34,6 +34,12 @@ jobs:
         run: cargo test --features native --lib av1_mc -- --nocapture
       - name: Test native_gl example overlays
         run: cargo test --features native --example native_gl
+      # The HEVC/AV1 engine unit tests are pure numerics, and the inter-prediction
+      # ones compare every SIMD backend the runner's CPU offers against the scalar
+      # reference — which is how the x86_64 SSE4.1/AVX2 kernels get covered at all,
+      # since the other CI hosts are aarch64.
+      - name: Test HEVC/AV1 engine unit tests (including SIMD backends)
+        run: cargo test --features native --lib -- hevc::engine:: av1
       - name: Check WebAssembly target
         run: cargo check --target wasm32-unknown-unknown --no-default-features --features web
       - name: Install wasm-pack
