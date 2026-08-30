@@ -6,6 +6,7 @@
 
 use crate::{
     ColorRange, Error, ErrorKind, Limits, PixelFormat, Plane, Result, VideoDimensions, VideoFrame,
+    av1_intra_pred::{add_residual_row, paeth_row, sum_samples},
 };
 
 /// Intra predictors used by the first AV1 reconstruction stages.
@@ -129,29 +130,29 @@ impl Av1IntraFrame {
         let mut top = vec![128; width];
         let mut left = vec![128; height];
         if y > 0 {
-            for (i, sample) in top.iter_mut().enumerate() {
-                *sample = self.planes[plane][(y - 1) * stride + x + i];
-            }
+            let above = (y - 1) * stride + x;
+            top.copy_from_slice(&self.planes[plane][above..above + width]);
         }
         if x > 0 {
             for (i, sample) in left.iter_mut().enumerate() {
                 *sample = self.planes[plane][(y + i) * stride + x - 1];
             }
         }
-        let dc = (top.iter().map(|&v| u32::from(v)).sum::<u32>()
-            + left.iter().map(|&v| u32::from(v)).sum::<u32>())
-            / u32::try_from(width + height).expect("nonzero block dimensions");
+        let dc = ((sum_samples(&top) + sum_samples(&left))
+            / u32::try_from(width + height).expect("nonzero block dimensions"))
+            as u8;
+        let mut prediction = vec![0u8; width];
         for row in 0..height {
-            for column in 0..width {
-                let prediction = match mode {
-                    Av1IntraMode::Dc => dc as u8,
-                    Av1IntraMode::Vertical => top[column],
-                    Av1IntraMode::Horizontal => left[row],
-                    Av1IntraMode::Paeth => paeth(top_left, top[column], left[row]),
-                };
-                self.planes[plane][(y + row) * stride + x + column] =
-                    (i16::from(prediction) + residuals[row * width + column]).clamp(0, 255) as u8;
+            match mode {
+                Av1IntraMode::Dc => prediction.fill(dc),
+                Av1IntraMode::Vertical => prediction.copy_from_slice(&top),
+                Av1IntraMode::Horizontal => prediction.fill(left[row]),
+                Av1IntraMode::Paeth => paeth_row(top_left, &top, left[row], &mut prediction),
             }
+            let start = (y + row) * stride + x;
+            let destination = &mut self.planes[plane][start..start + width];
+            destination.copy_from_slice(&prediction);
+            add_residual_row(&residuals[row * width..row * width + width], destination);
         }
         Ok(())
     }
@@ -463,21 +464,6 @@ pub fn inverse_transform(
             }
             output
         }
-    }
-}
-
-fn paeth(top_left: u8, top: u8, left: u8) -> u8 {
-    let base = i16::from(top) + i16::from(left) - i16::from(top_left);
-    let distance = |candidate: u8| (base - i16::from(candidate)).unsigned_abs();
-    let top_distance = distance(top);
-    let left_distance = distance(left);
-    let corner_distance = distance(top_left);
-    if top_distance <= left_distance && top_distance <= corner_distance {
-        top
-    } else if left_distance <= corner_distance {
-        left
-    } else {
-        top_left
     }
 }
 
