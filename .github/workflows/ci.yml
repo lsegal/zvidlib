@@ -28,6 +28,10 @@ jobs:
         run: cargo check --all-targets --features native
       - name: Lint native target
         run: cargo clippy --all-targets --features native -- -D warnings
+      - name: Test library units
+        run: cargo test --features native --lib
+      - name: Test AV1 SIMD motion compensation
+        run: cargo test --features native --lib av1_mc -- --nocapture
       - name: Test native_gl example overlays
         run: cargo test --features native --example native_gl
       # The HEVC/AV1 engine unit tests are pure numerics, and the inter-prediction
@@ -58,5 +62,9 @@ jobs:
         run: rustup show
       - name: Check native target
         run: cargo check --all-targets --features native
+      - name: Test library units
+        run: cargo test --features native --lib
       - name: Test accelerated HEVC selection and correctness
         run: cargo test --features native --test native_hevc_hardware -- --nocapture
+      - name: Test AV1 SIMD motion compensation
+        run: cargo test --features native --lib av1_mc -- --nocapture

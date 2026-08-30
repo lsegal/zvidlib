@@ -27,6 +27,7 @@
 use crate::av1_cdf as cdf;
 use crate::av1_filters::{FilterFrame, FilterPlane, LoopFilterParams, TxSizeGrid, deblock_frame};
 use crate::av1_intra::{Av1TxType, get_ac_quant, get_dc_quant, inverse_transform};
+use crate::av1_intra_pred::{add_residual_row, sum_samples};
 use crate::{
     Av1FrameType, Av1IntraFrame, Av1Obu, Av1ObuType, Av1Parser, Av1SymbolDecoder, Av1SyntaxSupport,
     ColorRange, Error, ErrorKind, Limits, Result, VideoDimensions, VideoFrame, inverse_wht_4x4,
@@ -541,12 +542,7 @@ impl<'a> LosslessTileDecoder<'a> {
             let coefficients = self.decode_coefficients_4x4(x >> 2, y >> 2)?;
             let residuals = inverse_wht_4x4(&coefficients);
             let prediction = self.dc_prediction(x, y);
-            for row in 0..4 {
-                for column in 0..4 {
-                    self.pixels[(y + row) * self.coded_width + x + column] =
-                        (i16::from(prediction) + residuals[row * 4 + column]).clamp(0, 255) as u8;
-                }
-            }
+            self.apply_prediction(x, y, 4, prediction, &residuals);
             self.tx_sizes.set_block(x, y, 4, 4);
             return Ok(());
         }
@@ -556,15 +552,27 @@ impl<'a> LosslessTileDecoder<'a> {
         let ac_quant = get_ac_quant(self.base_q_idx);
         let residuals = inverse_transform(&coefficients, tx_width, tx_type, dc_quant, ac_quant);
         let prediction = self.dc_prediction(x, y);
-        for row in 0..tx_width {
-            for column in 0..tx_width {
-                self.pixels[(y + row) * self.coded_width + x + column] =
-                    (i16::from(prediction) + residuals[row * tx_width + column]).clamp(0, 255)
-                        as u8;
-            }
-        }
+        self.apply_prediction(x, y, tx_width, prediction, &residuals);
         self.tx_sizes.set_block(x, y, tx_width, tx_width);
         Ok(())
+    }
+
+    /// Writes a uniform intra `prediction` over a `size x size` block and
+    /// adds the inverse-transformed residual through the SIMD kernels.
+    fn apply_prediction(
+        &mut self,
+        x: usize,
+        y: usize,
+        size: usize,
+        prediction: u8,
+        residuals: &[i16],
+    ) {
+        for row in 0..size {
+            let start = (y + row) * self.coded_width + x;
+            let destination = &mut self.pixels[start..start + size];
+            destination.fill(prediction);
+            add_residual_row(&residuals[row * size..row * size + size], destination);
+        }
     }
 
     /// Spec §7.11.2 DC intra prediction, generalized from the original
@@ -574,9 +582,9 @@ impl<'a> LosslessTileDecoder<'a> {
     fn dc_prediction_sized(&self, x: usize, y: usize, size: usize) -> u8 {
         match (y > 0, x > 0) {
             (true, true) => {
-                let mut sum = 0u32;
+                let above = (y - 1) * self.coded_width + x;
+                let mut sum = sum_samples(&self.pixels[above..above + size]);
                 for offset in 0..size {
-                    sum += u32::from(self.pixels[(y - 1) * self.coded_width + x + offset]);
                     sum += u32::from(self.pixels[(y + offset) * self.coded_width + x - 1]);
                 }
                 let count = 2 * size as u32;
@@ -590,9 +598,8 @@ impl<'a> LosslessTileDecoder<'a> {
                 ((sum + count / 2) / count) as u8
             }
             (true, false) => {
-                let sum = (0..size)
-                    .map(|offset| u32::from(self.pixels[(y - 1) * self.coded_width + x + offset]))
-                    .sum::<u32>();
+                let above = (y - 1) * self.coded_width + x;
+                let sum = sum_samples(&self.pixels[above..above + size]);
                 let count = size as u32;
                 ((sum + count / 2) / count) as u8
             }
