@@ -334,6 +334,9 @@ pub mod sps;
 pub mod transform;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
+pub mod transform_simd;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod transform_tree;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
