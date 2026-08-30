@@ -57,6 +57,18 @@ pub(crate) trait I32x: Copy {
     unsafe fn gt(self, other: Self) -> Self;
     /// Sum of all lanes.
     unsafe fn hsum(self) -> i32;
+    /// Lane-wise `self / divisor`, truncating toward zero.
+    ///
+    /// Only valid for non-negative lanes with `1 <= divisor` and
+    /// `self <= 255 * divisor + divisor / 2`, which is the range the wide
+    /// deblocking taper in [`super::filters`] produces (a weighted average of
+    /// 8-bit samples, so the quotient never exceeds 255). Within that range the
+    /// `f32` round trip these implementations use is exact: `f32` represents
+    /// both operands exactly, IEEE division is correctly rounded, and a
+    /// quotient of at most `255.5` has an absolute rounding error under
+    /// `2^-16`, far below the `1/divisor >= 1/255` distance from a
+    /// non-integral quotient to the next integer.
+    unsafe fn div_small_nonneg(self, divisor: i32) -> Self;
 
     #[inline(always)]
     unsafe fn zero() -> Self {
@@ -89,23 +101,43 @@ pub(crate) trait I32x: Copy {
         unsafe { self.max(low).min(high) }
     }
 
-    /// Clamps to `0..=255` and stores `LANES` bytes to the front of `dst`.
+    /// True when any lane of a comparison mask is set.
+    #[inline(always)]
+    unsafe fn any(self) -> bool {
+        unsafe { self.hsum() != 0 }
+    }
+
+    /// Stores the first `count` lanes (`count <= LANES`) to `dst`, leaving the
+    /// remaining lanes unwritten. This is how the kernels finish a partial row
+    /// or column at the right or bottom edge of a plane without spilling into
+    /// samples the caller did not ask for.
+    #[inline(always)]
+    unsafe fn store_masked(self, dst: &mut [i32], count: usize) {
+        unsafe {
+            let mut scratch = [0i32; MAX_LANES];
+            self.store(&mut scratch);
+            dst[..count].copy_from_slice(&scratch[..count]);
+        }
+    }
+
+    /// Clamps to `0..=255` and stores the first `count` lanes as bytes.
     ///
     /// Packing 32-bit lanes down to bytes differs enough between the three
     /// instruction sets (and AVX2's `packus` crosses its 128-bit halves) that
     /// this goes through a small stack buffer instead; the kernels here load far
     /// more than they store, so the load paths are the ones written natively.
     #[inline(always)]
-    unsafe fn store_u8_clamped(self, dst: &mut [u8]) {
+    unsafe fn store_u8_clamped_masked(self, dst: &mut [u8], count: usize) {
         unsafe {
             let mut scratch = [0i32; MAX_LANES];
             self.clamp(Self::zero(), Self::splat(255))
                 .store(&mut scratch);
-            for (out, &value) in dst.iter_mut().zip(scratch.iter()).take(Self::LANES) {
+            for (out, &value) in dst.iter_mut().zip(scratch.iter()).take(count) {
                 *out = value as u8;
             }
         }
     }
+
 }
 
 /// A 4-lane vector that can transpose a 4x4 block of lanes.
@@ -207,6 +239,13 @@ mod x86 {
             unsafe {
                 let pairs = _mm_hadd_epi32(self.0, self.0);
                 _mm_cvtsi128_si32(_mm_hadd_epi32(pairs, pairs))
+            }
+        }
+        #[inline(always)]
+        unsafe fn div_small_nonneg(self, divisor: i32) -> Self {
+            unsafe {
+                let quotient = _mm_div_ps(_mm_cvtepi32_ps(self.0), _mm_set1_ps(divisor as f32));
+                Self(_mm_cvttps_epi32(quotient))
             }
         }
     }
@@ -314,6 +353,14 @@ mod x86 {
                 _mm_cvtsi128_si32(_mm_hadd_epi32(pairs, pairs))
             }
         }
+        #[inline(always)]
+        unsafe fn div_small_nonneg(self, divisor: i32) -> Self {
+            unsafe {
+                let quotient =
+                    _mm256_div_ps(_mm256_cvtepi32_ps(self.0), _mm256_set1_ps(divisor as f32));
+                Self(_mm256_cvttps_epi32(quotient))
+            }
+        }
     }
 }
 
@@ -414,6 +461,15 @@ mod arm {
         #[inline(always)]
         unsafe fn hsum(self) -> i32 {
             unsafe { vaddvq_s32(self.0) }
+        }
+        #[inline(always)]
+        unsafe fn div_small_nonneg(self, divisor: i32) -> Self {
+            unsafe {
+                let quotient = vdivq_f32(vcvtq_f32_s32(self.0), vdupq_n_f32(divisor as f32));
+                // `vcvtq_s32_f32` rounds toward zero, which is the floor the
+                // scalar reference's non-negative integer division performs.
+                Self(vcvtq_s32_f32(quotient))
+            }
         }
     }
 
