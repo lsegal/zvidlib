@@ -17,6 +17,7 @@ pub mod av1_inter_decoder;
 pub mod av1_intra;
 pub mod av1_intra_decoder;
 pub mod av1_intra_pred;
+pub mod av1_mc;
 pub mod av1_simd;
 pub mod codec;
 pub mod codec_config;
