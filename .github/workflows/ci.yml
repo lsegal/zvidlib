@@ -54,5 +54,7 @@ jobs:
         run: rustup show
       - name: Check native target
         run: cargo check --all-targets --features native
+      - name: Test library units
+        run: cargo test --features native --lib
       - name: Test accelerated HEVC selection and correctness
         run: cargo test --features native --test native_hevc_hardware -- --nocapture
