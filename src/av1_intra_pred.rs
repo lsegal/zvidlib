@@ -66,6 +66,7 @@ pub fn av1_intra_simd() -> Av1IntraSimd {
 /// Sums a contiguous run of neighbor samples, as the DC predictors do over the
 /// row above and the column to the left of a block.
 #[must_use]
+#[inline]
 pub fn sum_samples(samples: &[u8]) -> u32 {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     match av1_intra_simd() {
@@ -86,6 +87,7 @@ pub fn sum_samples(samples: &[u8]) -> u32 {
 /// # Panics
 ///
 /// Panics when `residuals` and `row` have different lengths.
+#[inline]
 pub fn add_residual_row(residuals: &[i16], row: &mut [u8]) {
     assert_eq!(
         residuals.len(),
@@ -112,6 +114,7 @@ pub fn add_residual_row(residuals: &[i16], row: &mut [u8]) {
 /// # Panics
 ///
 /// Panics when `top` and `out` have different lengths.
+#[inline]
 pub fn paeth_row(top_left: u8, top: &[u8], left: u8, out: &mut [u8]) {
     assert_eq!(
         top.len(),
@@ -157,8 +160,12 @@ fn sum_samples_scalar(samples: &[u8]) -> u32 {
 }
 
 fn add_residual_row_scalar(residuals: &[i16], row: &mut [u8]) {
+    // The addition saturates rather than wraps so the scalar kernel stays
+    // bit-exact with the vector paths (which use saturating 16-bit adds) even
+    // for residuals near `i16::MIN`/`i16::MAX`, which no inverse transform in
+    // this crate produces but which callers can hand to the public kernel.
     for (sample, &residual) in row.iter_mut().zip(residuals) {
-        *sample = (i16::from(*sample) + residual).clamp(0, 255) as u8;
+        *sample = i16::from(*sample).saturating_add(residual).clamp(0, 255) as u8;
     }
 }
 
@@ -359,6 +366,20 @@ unsafe fn sum_samples_neon(samples: &[u8]) -> u32 {
 unsafe fn add_residual_row_neon(residuals: &[i16], row: &mut [u8]) {
     unsafe {
         let mut index = 0;
+        // 16 samples per iteration matches what the autovectorizer produces
+        // for the scalar loop, which matters for the 64- and 128-wide blocks.
+        while index + 16 <= row.len() {
+            let samples = vld1q_u8(row.as_ptr().add(index));
+            let low = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(samples)));
+            let high = vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(samples)));
+            let sum_low = vqaddq_s16(low, vld1q_s16(residuals.as_ptr().add(index)));
+            let sum_high = vqaddq_s16(high, vld1q_s16(residuals.as_ptr().add(index + 8)));
+            vst1q_u8(
+                row.as_mut_ptr().add(index),
+                vcombine_u8(vqmovun_s16(sum_low), vqmovun_s16(sum_high)),
+            );
+            index += 16;
+        }
         while index + 8 <= row.len() {
             let widened = vreinterpretq_s16_u16(vmovl_u8(vld1_u8(row.as_ptr().add(index))));
             let residual = vld1q_s16(residuals.as_ptr().add(index));
