@@ -1,4 +1,12 @@
-use super::engine::{encoder::pcm::encode_idr_pcm_au, nal::collect_nal_units};
+#[cfg(test)]
+use super::engine::encoder::rdo::DistortionBackend;
+use super::engine::{
+    encoder::{
+        pcm::encode_idr_pcm_au,
+        rdo::{DecisionConfig, decide_picture},
+    },
+    nal::collect_nal_units,
+};
 use crate::{
     Codec, CodecImplementation, CodecProfile, CodecSupport, ColorRange, EncodedSample,
     EncoderConfig, EncoderFuture, Error, ErrorKind, FrameIndex, FrameSource, HardwarePreference,
@@ -74,6 +82,7 @@ impl VideoEncoderFactory for HevcEncoderFactory {
             },
             next_index: 0,
             limits: *limits,
+            previous_y: None,
         }))
     }
 }
@@ -82,6 +91,7 @@ struct HevcEncoder {
     config: EncoderConfig,
     next_index: u64,
     limits: Limits,
+    previous_y: Option<Vec<u8>>,
 }
 impl VideoEncoder for HevcEncoder {
     fn config(&self) -> &EncoderConfig {
@@ -124,6 +134,14 @@ impl VideoEncoder for HevcEncoder {
             }
             let (y, cb, cr) = rgba_to_yuv420(frame, source.orientation)?;
             let d = self.configuration.coded_dimensions;
+            let _decision = decide_picture(
+                &y,
+                d.width as usize,
+                d.width as usize,
+                d.height as usize,
+                self.previous_y.as_deref(),
+                DecisionConfig::default(),
+            );
             let au = encode_idr_pcm_au(&y, &cb, &cr, d.width as usize, d.height as usize)
                 .map_err(|e| invalid_input(e.to_string()))?;
             let data = length_prefixed_vcl(&au)?;
@@ -138,6 +156,7 @@ impl VideoEncoder for HevcEncoder {
                 .ok_or_else(|| limit("HEVC timeline overflows"))?;
             let tick = i64::try_from(tick).map_err(|_| limit("HEVC timeline overflows"))?;
             self.next_index += 1;
+            self.previous_y = Some(y);
             Ok(vec![EncodedSample {
                 data,
                 dts: tick,
@@ -151,6 +170,41 @@ impl VideoEncoder for HevcEncoder {
     fn finish<'a>(&'a mut self) -> EncoderFuture<'a, Vec<EncodedSample>> {
         Box::pin(async { Ok(Vec::new()) })
     }
+}
+
+#[cfg(test)]
+fn encode_with_rdo_backend(
+    configuration: &VideoEncoderConfig,
+    limits: &Limits,
+    frame: &crate::VideoFrame,
+    backend: DistortionBackend,
+) -> Result<Vec<u8>> {
+    let source = crate::CpuFrameSource {
+        frame,
+        orientation: crate::Orientation::TopLeft,
+    };
+    let (y, cb, cr) = rgba_to_yuv420(frame, source.orientation)?;
+    let d = configuration.coded_dimensions;
+    let _decision = decide_picture(
+        &y,
+        d.width as usize,
+        d.width as usize,
+        d.height as usize,
+        None,
+        DecisionConfig {
+            backend,
+            ..DecisionConfig::default()
+        },
+    );
+    let au = encode_idr_pcm_au(&y, &cb, &cr, d.width as usize, d.height as usize)
+        .map_err(|e| invalid_input(e.to_string()))?;
+    let data = length_prefixed_vcl(&au)?;
+    if data.len() as u64 > limits.max_allocation_bytes {
+        return Err(limit(
+            "HEVC access unit exceeds configured allocation limit",
+        ));
+    }
+    Ok(data)
 }
 fn blank_planes(w: usize, h: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     (vec![16; w * h], vec![128; w * h / 4], vec![128; w * h / 4])
@@ -370,6 +424,53 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(report.frames_encoded, 1);
+    }
+
+    #[test]
+    fn scalar_and_dispatched_rdo_paths_emit_identical_bitstreams() {
+        let limits = Limits::default();
+        let dimensions = crate::VideoDimensions::new(32, 32, &limits).unwrap();
+        let mut pixels = vec![0_u8; 32 * 32 * 4];
+        for (index, pixel) in pixels.chunks_exact_mut(4).enumerate() {
+            let x = index % 32;
+            let y = index / 32;
+            let value = (32 + (x * 5 + y * 9) % 180) as u8;
+            pixel.copy_from_slice(&[value, value.saturating_add(7), value / 2, 255]);
+        }
+        let frame = VideoFrame::new(
+            dimensions,
+            PixelFormat::Rgba8,
+            ColorRange::Limited,
+            vec![Plane {
+                data: pixels,
+                stride: 128,
+            }],
+            &limits,
+        )
+        .unwrap();
+        let configuration = VideoEncoderConfig {
+            codec: Codec::Hevc,
+            profile: CodecProfile::HevcMain,
+            coded_dimensions: dimensions,
+            input_format: PixelFormat::Rgba8,
+            color_range: ColorRange::Limited,
+            hardware: HardwarePreference::Avoid,
+            timescale: 30_000,
+            frame_duration: 1_001,
+            configuration: Vec::new(),
+        };
+
+        let scalar =
+            encode_with_rdo_backend(&configuration, &limits, &frame, DistortionBackend::Scalar)
+                .unwrap();
+        let dispatched = encode_with_rdo_backend(
+            &configuration,
+            &limits,
+            &frame,
+            DistortionBackend::Dispatched,
+        )
+        .unwrap();
+        assert_eq!(scalar, dispatched);
     }
 
     fn block_on<T>(future: impl Future<Output = T>) -> T {
