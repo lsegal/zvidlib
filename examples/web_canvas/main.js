@@ -264,6 +264,7 @@ async function main() {
 
   let framesSinceFpsUpdate = 0;
   let lastFpsUpdate = performance.now();
+  let lastDisplayedFrame = -1;
 
   function tickFps() {
     framesSinceFpsUpdate += 1;
@@ -281,8 +282,15 @@ async function main() {
       await new Promise((resolve) => requestAnimationFrame(resolve));
       if (playing) {
         frameIndex = frameForMediaTime(currentMediaTimeMs());
+        const displayedFrame = frameIndex;
         await renderFrame();
-        tickFps();
+        // Count newly displayed video frames, not render-loop iterations: a
+        // display refreshing faster than the source rate re-presents the same
+        // frame, which would otherwise read as a frame rate above the clip's.
+        if (displayedFrame !== lastDisplayedFrame) {
+          lastDisplayedFrame = displayedFrame;
+          tickFps();
+        }
       }
     }
   }
