@@ -173,23 +173,23 @@ unsafe fn dct8<V: I32x>(input: [V; 8]) -> [V; 8] {
         let step2_6 = V::zero().sub(step1_6).add(step1_7);
         let step2_7 = step1_6.add(step1_7);
         // stage 3
-        let step1_0 = step2_0.add(step2_3);
-        let step1_1 = step2_1.add(step2_2);
-        let step1_2 = step2_1.sub(step2_2);
-        let step1_3 = step2_0.sub(step2_3);
-        let step1_4 = step2_4;
-        let step1_5 = dot_rs14([(step2_6, COSPI_16_64), (step2_5, -COSPI_16_64)]);
-        let step1_6 = dot_rs14([(step2_5, COSPI_16_64), (step2_6, COSPI_16_64)]);
-        let step1_7 = step2_7;
+        let step1_0_2 = step2_0.add(step2_3);
+        let step1_1_2 = step2_1.add(step2_2);
+        let step1_2_2 = step2_1.sub(step2_2);
+        let step1_3_2 = step2_0.sub(step2_3);
+        let step1_4_2 = step2_4;
+        let step1_5_2 = dot_rs14([(step2_6, COSPI_16_64), (step2_5, -COSPI_16_64)]);
+        let step1_6_2 = dot_rs14([(step2_5, COSPI_16_64), (step2_6, COSPI_16_64)]);
+        let step1_7_2 = step2_7;
         // stage 4
-        output[0] = step1_0.add(step1_7);
-        output[1] = step1_1.add(step1_6);
-        output[2] = step1_2.add(step1_5);
-        output[3] = step1_3.add(step1_4);
-        output[4] = step1_3.sub(step1_4);
-        output[5] = step1_2.sub(step1_5);
-        output[6] = step1_1.sub(step1_6);
-        output[7] = step1_0.sub(step1_7);
+        output[0] = step1_0_2.add(step1_7_2);
+        output[1] = step1_1_2.add(step1_6_2);
+        output[2] = step1_2_2.add(step1_5_2);
+        output[3] = step1_3_2.add(step1_4_2);
+        output[4] = step1_3_2.sub(step1_4_2);
+        output[5] = step1_2_2.sub(step1_5_2);
+        output[6] = step1_1_2.sub(step1_6_2);
+        output[7] = step1_0_2.sub(step1_7_2);
         output
     }
 }
@@ -253,90 +253,90 @@ unsafe fn dct16<V: I32x>(input: [V; 16]) -> [V; 16] {
         let step2_11 = dot_rs14([(step1_11, COSPI_6_64), (step1_12, -COSPI_26_64)]);
         let step2_12 = dot_rs14([(step1_11, COSPI_26_64), (step1_12, COSPI_6_64)]);
         // stage 3
-        let step1_0 = step2_0;
-        let step1_1 = step2_1;
-        let step1_2 = step2_2;
-        let step1_3 = step2_3;
-        let step1_4 = dot_rs14([(step2_4, COSPI_28_64), (step2_7, -COSPI_4_64)]);
-        let step1_7 = dot_rs14([(step2_4, COSPI_4_64), (step2_7, COSPI_28_64)]);
-        let step1_5 = dot_rs14([(step2_5, COSPI_12_64), (step2_6, -COSPI_20_64)]);
-        let step1_6 = dot_rs14([(step2_5, COSPI_20_64), (step2_6, COSPI_12_64)]);
-        let step1_8 = step2_8.add(step2_9);
-        let step1_9 = step2_8.sub(step2_9);
-        let step1_10 = V::zero().sub(step2_10).add(step2_11);
-        let step1_11 = step2_10.add(step2_11);
-        let step1_12 = step2_12.add(step2_13);
-        let step1_13 = step2_12.sub(step2_13);
-        let step1_14 = V::zero().sub(step2_14).add(step2_15);
-        let step1_15 = step2_14.add(step2_15);
+        let step1_0_2 = step2_0;
+        let step1_1_2 = step2_1;
+        let step1_2_2 = step2_2;
+        let step1_3_2 = step2_3;
+        let step1_4_2 = dot_rs14([(step2_4, COSPI_28_64), (step2_7, -COSPI_4_64)]);
+        let step1_7_2 = dot_rs14([(step2_4, COSPI_4_64), (step2_7, COSPI_28_64)]);
+        let step1_5_2 = dot_rs14([(step2_5, COSPI_12_64), (step2_6, -COSPI_20_64)]);
+        let step1_6_2 = dot_rs14([(step2_5, COSPI_20_64), (step2_6, COSPI_12_64)]);
+        let step1_8_2 = step2_8.add(step2_9);
+        let step1_9_2 = step2_8.sub(step2_9);
+        let step1_10_2 = V::zero().sub(step2_10).add(step2_11);
+        let step1_11_2 = step2_10.add(step2_11);
+        let step1_12_2 = step2_12.add(step2_13);
+        let step1_13_2 = step2_12.sub(step2_13);
+        let step1_14_2 = V::zero().sub(step2_14).add(step2_15);
+        let step1_15_2 = step2_14.add(step2_15);
         // stage 4
-        let step2_0 = dot_rs14([(step1_0, COSPI_16_64), (step1_1, COSPI_16_64)]);
-        let step2_1 = dot_rs14([(step1_0, COSPI_16_64), (step1_1, -COSPI_16_64)]);
-        let step2_2 = dot_rs14([(step1_2, COSPI_24_64), (step1_3, -COSPI_8_64)]);
-        let step2_3 = dot_rs14([(step1_2, COSPI_8_64), (step1_3, COSPI_24_64)]);
-        let step2_4 = step1_4.add(step1_5);
-        let step2_5 = step1_4.sub(step1_5);
-        let step2_6 = V::zero().sub(step1_6).add(step1_7);
-        let step2_7 = step1_6.add(step1_7);
-        let step2_8 = step1_8;
-        let step2_15 = step1_15;
-        let step2_9 = dot_rs14([(step1_9, -COSPI_8_64), (step1_14, COSPI_24_64)]);
-        let step2_14 = dot_rs14([(step1_9, COSPI_24_64), (step1_14, COSPI_8_64)]);
-        let step2_10 = dot_rs14([(step1_10, -COSPI_24_64), (step1_13, -COSPI_8_64)]);
-        let step2_13 = dot_rs14([(step1_10, -COSPI_8_64), (step1_13, COSPI_24_64)]);
-        let step2_11 = step1_11;
-        let step2_12 = step1_12;
+        let step2_0_2 = dot_rs14([(step1_0_2, COSPI_16_64), (step1_1_2, COSPI_16_64)]);
+        let step2_1_2 = dot_rs14([(step1_0_2, COSPI_16_64), (step1_1_2, -COSPI_16_64)]);
+        let step2_2_2 = dot_rs14([(step1_2_2, COSPI_24_64), (step1_3_2, -COSPI_8_64)]);
+        let step2_3_2 = dot_rs14([(step1_2_2, COSPI_8_64), (step1_3_2, COSPI_24_64)]);
+        let step2_4_2 = step1_4_2.add(step1_5_2);
+        let step2_5_2 = step1_4_2.sub(step1_5_2);
+        let step2_6_2 = V::zero().sub(step1_6_2).add(step1_7_2);
+        let step2_7_2 = step1_6_2.add(step1_7_2);
+        let step2_8_2 = step1_8_2;
+        let step2_15_2 = step1_15_2;
+        let step2_9_2 = dot_rs14([(step1_9_2, -COSPI_8_64), (step1_14_2, COSPI_24_64)]);
+        let step2_14_2 = dot_rs14([(step1_9_2, COSPI_24_64), (step1_14_2, COSPI_8_64)]);
+        let step2_10_2 = dot_rs14([(step1_10_2, -COSPI_24_64), (step1_13_2, -COSPI_8_64)]);
+        let step2_13_2 = dot_rs14([(step1_10_2, -COSPI_8_64), (step1_13_2, COSPI_24_64)]);
+        let step2_11_2 = step1_11_2;
+        let step2_12_2 = step1_12_2;
         // stage 5
-        let step1_0 = step2_0.add(step2_3);
-        let step1_1 = step2_1.add(step2_2);
-        let step1_2 = step2_1.sub(step2_2);
-        let step1_3 = step2_0.sub(step2_3);
-        let step1_4 = step2_4;
-        let step1_5 = dot_rs14([(step2_6, COSPI_16_64), (step2_5, -COSPI_16_64)]);
-        let step1_6 = dot_rs14([(step2_5, COSPI_16_64), (step2_6, COSPI_16_64)]);
-        let step1_7 = step2_7;
-        let step1_8 = step2_8.add(step2_11);
-        let step1_9 = step2_9.add(step2_10);
-        let step1_10 = step2_9.sub(step2_10);
-        let step1_11 = step2_8.sub(step2_11);
-        let step1_12 = V::zero().sub(step2_12).add(step2_15);
-        let step1_13 = V::zero().sub(step2_13).add(step2_14);
-        let step1_14 = step2_13.add(step2_14);
-        let step1_15 = step2_12.add(step2_15);
+        let step1_0_3 = step2_0_2.add(step2_3_2);
+        let step1_1_3 = step2_1_2.add(step2_2_2);
+        let step1_2_3 = step2_1_2.sub(step2_2_2);
+        let step1_3_3 = step2_0_2.sub(step2_3_2);
+        let step1_4_3 = step2_4_2;
+        let step1_5_3 = dot_rs14([(step2_6_2, COSPI_16_64), (step2_5_2, -COSPI_16_64)]);
+        let step1_6_3 = dot_rs14([(step2_5_2, COSPI_16_64), (step2_6_2, COSPI_16_64)]);
+        let step1_7_3 = step2_7_2;
+        let step1_8_3 = step2_8_2.add(step2_11_2);
+        let step1_9_3 = step2_9_2.add(step2_10_2);
+        let step1_10_3 = step2_9_2.sub(step2_10_2);
+        let step1_11_3 = step2_8_2.sub(step2_11_2);
+        let step1_12_3 = V::zero().sub(step2_12_2).add(step2_15_2);
+        let step1_13_3 = V::zero().sub(step2_13_2).add(step2_14_2);
+        let step1_14_3 = step2_13_2.add(step2_14_2);
+        let step1_15_3 = step2_12_2.add(step2_15_2);
         // stage 6
-        let step2_0 = step1_0.add(step1_7);
-        let step2_1 = step1_1.add(step1_6);
-        let step2_2 = step1_2.add(step1_5);
-        let step2_3 = step1_3.add(step1_4);
-        let step2_4 = step1_3.sub(step1_4);
-        let step2_5 = step1_2.sub(step1_5);
-        let step2_6 = step1_1.sub(step1_6);
-        let step2_7 = step1_0.sub(step1_7);
-        let step2_8 = step1_8;
-        let step2_9 = step1_9;
-        let step2_10 = dot_rs14([(step1_10, -COSPI_16_64), (step1_13, COSPI_16_64)]);
-        let step2_13 = dot_rs14([(step1_10, COSPI_16_64), (step1_13, COSPI_16_64)]);
-        let step2_11 = dot_rs14([(step1_11, -COSPI_16_64), (step1_12, COSPI_16_64)]);
-        let step2_12 = dot_rs14([(step1_11, COSPI_16_64), (step1_12, COSPI_16_64)]);
-        let step2_14 = step1_14;
-        let step2_15 = step1_15;
+        let step2_0_3 = step1_0_3.add(step1_7_3);
+        let step2_1_3 = step1_1_3.add(step1_6_3);
+        let step2_2_3 = step1_2_3.add(step1_5_3);
+        let step2_3_3 = step1_3_3.add(step1_4_3);
+        let step2_4_3 = step1_3_3.sub(step1_4_3);
+        let step2_5_3 = step1_2_3.sub(step1_5_3);
+        let step2_6_3 = step1_1_3.sub(step1_6_3);
+        let step2_7_3 = step1_0_3.sub(step1_7_3);
+        let step2_8_3 = step1_8_3;
+        let step2_9_3 = step1_9_3;
+        let step2_10_3 = dot_rs14([(step1_10_3, -COSPI_16_64), (step1_13_3, COSPI_16_64)]);
+        let step2_13_3 = dot_rs14([(step1_10_3, COSPI_16_64), (step1_13_3, COSPI_16_64)]);
+        let step2_11_3 = dot_rs14([(step1_11_3, -COSPI_16_64), (step1_12_3, COSPI_16_64)]);
+        let step2_12_3 = dot_rs14([(step1_11_3, COSPI_16_64), (step1_12_3, COSPI_16_64)]);
+        let step2_14_3 = step1_14_3;
+        let step2_15_3 = step1_15_3;
         // stage 7
-        output[0] = step2_0.add(step2_15);
-        output[1] = step2_1.add(step2_14);
-        output[2] = step2_2.add(step2_13);
-        output[3] = step2_3.add(step2_12);
-        output[4] = step2_4.add(step2_11);
-        output[5] = step2_5.add(step2_10);
-        output[6] = step2_6.add(step2_9);
-        output[7] = step2_7.add(step2_8);
-        output[8] = step2_7.sub(step2_8);
-        output[9] = step2_6.sub(step2_9);
-        output[10] = step2_5.sub(step2_10);
-        output[11] = step2_4.sub(step2_11);
-        output[12] = step2_3.sub(step2_12);
-        output[13] = step2_2.sub(step2_13);
-        output[14] = step2_1.sub(step2_14);
-        output[15] = step2_0.sub(step2_15);
+        output[0] = step2_0_3.add(step2_15_3);
+        output[1] = step2_1_3.add(step2_14_3);
+        output[2] = step2_2_3.add(step2_13_3);
+        output[3] = step2_3_3.add(step2_12_3);
+        output[4] = step2_4_3.add(step2_11_3);
+        output[5] = step2_5_3.add(step2_10_3);
+        output[6] = step2_6_3.add(step2_9_3);
+        output[7] = step2_7_3.add(step2_8_3);
+        output[8] = step2_7_3.sub(step2_8_3);
+        output[9] = step2_6_3.sub(step2_9_3);
+        output[10] = step2_5_3.sub(step2_10_3);
+        output[11] = step2_4_3.sub(step2_11_3);
+        output[12] = step2_3_3.sub(step2_12_3);
+        output[13] = step2_2_3.sub(step2_13_3);
+        output[14] = step2_1_3.sub(step2_14_3);
+        output[15] = step2_0_3.sub(step2_15_3);
         output
     }
 }
@@ -413,203 +413,203 @@ unsafe fn dct32<V: I32x>(input: [V; 32]) -> [V; 32] {
         let step2_30 = V::zero().sub(step1_30).add(step1_31);
         let step2_31 = step1_30.add(step1_31);
         // stage 3
-        let step1_0 = step2_0;
-        let step1_1 = step2_1;
-        let step1_2 = step2_2;
-        let step1_3 = step2_3;
-        let step1_4 = dot_rs14([(step2_4, COSPI_28_64), (step2_7, -COSPI_4_64)]);
-        let step1_7 = dot_rs14([(step2_4, COSPI_4_64), (step2_7, COSPI_28_64)]);
-        let step1_5 = dot_rs14([(step2_5, COSPI_12_64), (step2_6, -COSPI_20_64)]);
-        let step1_6 = dot_rs14([(step2_5, COSPI_20_64), (step2_6, COSPI_12_64)]);
-        let step1_8 = step2_8.add(step2_9);
-        let step1_9 = step2_8.sub(step2_9);
-        let step1_10 = V::zero().sub(step2_10).add(step2_11);
-        let step1_11 = step2_10.add(step2_11);
-        let step1_12 = step2_12.add(step2_13);
-        let step1_13 = step2_12.sub(step2_13);
-        let step1_14 = V::zero().sub(step2_14).add(step2_15);
-        let step1_15 = step2_14.add(step2_15);
-        let step1_16 = step2_16;
-        let step1_31 = step2_31;
-        let step1_17 = dot_rs14([(step2_17, -COSPI_4_64), (step2_30, COSPI_28_64)]);
-        let step1_30 = dot_rs14([(step2_17, COSPI_28_64), (step2_30, COSPI_4_64)]);
-        let step1_18 = dot_rs14([(step2_18, -COSPI_28_64), (step2_29, -COSPI_4_64)]);
-        let step1_29 = dot_rs14([(step2_18, -COSPI_4_64), (step2_29, COSPI_28_64)]);
-        let step1_19 = step2_19;
-        let step1_20 = step2_20;
-        let step1_21 = dot_rs14([(step2_21, -COSPI_20_64), (step2_26, COSPI_12_64)]);
-        let step1_26 = dot_rs14([(step2_21, COSPI_12_64), (step2_26, COSPI_20_64)]);
-        let step1_22 = dot_rs14([(step2_22, -COSPI_12_64), (step2_25, -COSPI_20_64)]);
-        let step1_25 = dot_rs14([(step2_22, -COSPI_20_64), (step2_25, COSPI_12_64)]);
-        let step1_23 = step2_23;
-        let step1_24 = step2_24;
-        let step1_27 = step2_27;
-        let step1_28 = step2_28;
+        let step1_0_2 = step2_0;
+        let step1_1_2 = step2_1;
+        let step1_2_2 = step2_2;
+        let step1_3_2 = step2_3;
+        let step1_4_2 = dot_rs14([(step2_4, COSPI_28_64), (step2_7, -COSPI_4_64)]);
+        let step1_7_2 = dot_rs14([(step2_4, COSPI_4_64), (step2_7, COSPI_28_64)]);
+        let step1_5_2 = dot_rs14([(step2_5, COSPI_12_64), (step2_6, -COSPI_20_64)]);
+        let step1_6_2 = dot_rs14([(step2_5, COSPI_20_64), (step2_6, COSPI_12_64)]);
+        let step1_8_2 = step2_8.add(step2_9);
+        let step1_9_2 = step2_8.sub(step2_9);
+        let step1_10_2 = V::zero().sub(step2_10).add(step2_11);
+        let step1_11_2 = step2_10.add(step2_11);
+        let step1_12_2 = step2_12.add(step2_13);
+        let step1_13_2 = step2_12.sub(step2_13);
+        let step1_14_2 = V::zero().sub(step2_14).add(step2_15);
+        let step1_15_2 = step2_14.add(step2_15);
+        let step1_16_2 = step2_16;
+        let step1_31_2 = step2_31;
+        let step1_17_2 = dot_rs14([(step2_17, -COSPI_4_64), (step2_30, COSPI_28_64)]);
+        let step1_30_2 = dot_rs14([(step2_17, COSPI_28_64), (step2_30, COSPI_4_64)]);
+        let step1_18_2 = dot_rs14([(step2_18, -COSPI_28_64), (step2_29, -COSPI_4_64)]);
+        let step1_29_2 = dot_rs14([(step2_18, -COSPI_4_64), (step2_29, COSPI_28_64)]);
+        let step1_19_2 = step2_19;
+        let step1_20_2 = step2_20;
+        let step1_21_2 = dot_rs14([(step2_21, -COSPI_20_64), (step2_26, COSPI_12_64)]);
+        let step1_26_2 = dot_rs14([(step2_21, COSPI_12_64), (step2_26, COSPI_20_64)]);
+        let step1_22_2 = dot_rs14([(step2_22, -COSPI_12_64), (step2_25, -COSPI_20_64)]);
+        let step1_25_2 = dot_rs14([(step2_22, -COSPI_20_64), (step2_25, COSPI_12_64)]);
+        let step1_23_2 = step2_23;
+        let step1_24_2 = step2_24;
+        let step1_27_2 = step2_27;
+        let step1_28_2 = step2_28;
         // stage 4
-        let step2_0 = dot_rs14([(step1_0, COSPI_16_64), (step1_1, COSPI_16_64)]);
-        let step2_1 = dot_rs14([(step1_0, COSPI_16_64), (step1_1, -COSPI_16_64)]);
-        let step2_2 = dot_rs14([(step1_2, COSPI_24_64), (step1_3, -COSPI_8_64)]);
-        let step2_3 = dot_rs14([(step1_2, COSPI_8_64), (step1_3, COSPI_24_64)]);
-        let step2_4 = step1_4.add(step1_5);
-        let step2_5 = step1_4.sub(step1_5);
-        let step2_6 = V::zero().sub(step1_6).add(step1_7);
-        let step2_7 = step1_6.add(step1_7);
-        let step2_8 = step1_8;
-        let step2_15 = step1_15;
-        let step2_9 = dot_rs14([(step1_9, -COSPI_8_64), (step1_14, COSPI_24_64)]);
-        let step2_14 = dot_rs14([(step1_9, COSPI_24_64), (step1_14, COSPI_8_64)]);
-        let step2_10 = dot_rs14([(step1_10, -COSPI_24_64), (step1_13, -COSPI_8_64)]);
-        let step2_13 = dot_rs14([(step1_10, -COSPI_8_64), (step1_13, COSPI_24_64)]);
-        let step2_11 = step1_11;
-        let step2_12 = step1_12;
-        let step2_16 = step1_16.add(step1_19);
-        let step2_17 = step1_17.add(step1_18);
-        let step2_18 = step1_17.sub(step1_18);
-        let step2_19 = step1_16.sub(step1_19);
-        let step2_20 = V::zero().sub(step1_20).add(step1_23);
-        let step2_21 = V::zero().sub(step1_21).add(step1_22);
-        let step2_22 = step1_21.add(step1_22);
-        let step2_23 = step1_20.add(step1_23);
-        let step2_24 = step1_24.add(step1_27);
-        let step2_25 = step1_25.add(step1_26);
-        let step2_26 = step1_25.sub(step1_26);
-        let step2_27 = step1_24.sub(step1_27);
-        let step2_28 = V::zero().sub(step1_28).add(step1_31);
-        let step2_29 = V::zero().sub(step1_29).add(step1_30);
-        let step2_30 = step1_29.add(step1_30);
-        let step2_31 = step1_28.add(step1_31);
+        let step2_0_2 = dot_rs14([(step1_0_2, COSPI_16_64), (step1_1_2, COSPI_16_64)]);
+        let step2_1_2 = dot_rs14([(step1_0_2, COSPI_16_64), (step1_1_2, -COSPI_16_64)]);
+        let step2_2_2 = dot_rs14([(step1_2_2, COSPI_24_64), (step1_3_2, -COSPI_8_64)]);
+        let step2_3_2 = dot_rs14([(step1_2_2, COSPI_8_64), (step1_3_2, COSPI_24_64)]);
+        let step2_4_2 = step1_4_2.add(step1_5_2);
+        let step2_5_2 = step1_4_2.sub(step1_5_2);
+        let step2_6_2 = V::zero().sub(step1_6_2).add(step1_7_2);
+        let step2_7_2 = step1_6_2.add(step1_7_2);
+        let step2_8_2 = step1_8_2;
+        let step2_15_2 = step1_15_2;
+        let step2_9_2 = dot_rs14([(step1_9_2, -COSPI_8_64), (step1_14_2, COSPI_24_64)]);
+        let step2_14_2 = dot_rs14([(step1_9_2, COSPI_24_64), (step1_14_2, COSPI_8_64)]);
+        let step2_10_2 = dot_rs14([(step1_10_2, -COSPI_24_64), (step1_13_2, -COSPI_8_64)]);
+        let step2_13_2 = dot_rs14([(step1_10_2, -COSPI_8_64), (step1_13_2, COSPI_24_64)]);
+        let step2_11_2 = step1_11_2;
+        let step2_12_2 = step1_12_2;
+        let step2_16_2 = step1_16_2.add(step1_19_2);
+        let step2_17_2 = step1_17_2.add(step1_18_2);
+        let step2_18_2 = step1_17_2.sub(step1_18_2);
+        let step2_19_2 = step1_16_2.sub(step1_19_2);
+        let step2_20_2 = V::zero().sub(step1_20_2).add(step1_23_2);
+        let step2_21_2 = V::zero().sub(step1_21_2).add(step1_22_2);
+        let step2_22_2 = step1_21_2.add(step1_22_2);
+        let step2_23_2 = step1_20_2.add(step1_23_2);
+        let step2_24_2 = step1_24_2.add(step1_27_2);
+        let step2_25_2 = step1_25_2.add(step1_26_2);
+        let step2_26_2 = step1_25_2.sub(step1_26_2);
+        let step2_27_2 = step1_24_2.sub(step1_27_2);
+        let step2_28_2 = V::zero().sub(step1_28_2).add(step1_31_2);
+        let step2_29_2 = V::zero().sub(step1_29_2).add(step1_30_2);
+        let step2_30_2 = step1_29_2.add(step1_30_2);
+        let step2_31_2 = step1_28_2.add(step1_31_2);
         // stage 5
-        let step1_0 = step2_0.add(step2_3);
-        let step1_1 = step2_1.add(step2_2);
-        let step1_2 = step2_1.sub(step2_2);
-        let step1_3 = step2_0.sub(step2_3);
-        let step1_4 = step2_4;
-        let step1_5 = dot_rs14([(step2_6, COSPI_16_64), (step2_5, -COSPI_16_64)]);
-        let step1_6 = dot_rs14([(step2_5, COSPI_16_64), (step2_6, COSPI_16_64)]);
-        let step1_7 = step2_7;
-        let step1_8 = step2_8.add(step2_11);
-        let step1_9 = step2_9.add(step2_10);
-        let step1_10 = step2_9.sub(step2_10);
-        let step1_11 = step2_8.sub(step2_11);
-        let step1_12 = V::zero().sub(step2_12).add(step2_15);
-        let step1_13 = V::zero().sub(step2_13).add(step2_14);
-        let step1_14 = step2_13.add(step2_14);
-        let step1_15 = step2_12.add(step2_15);
-        let step1_16 = step2_16;
-        let step1_17 = step2_17;
-        let step1_18 = dot_rs14([(step2_18, -COSPI_8_64), (step2_29, COSPI_24_64)]);
-        let step1_29 = dot_rs14([(step2_18, COSPI_24_64), (step2_29, COSPI_8_64)]);
-        let step1_19 = dot_rs14([(step2_19, -COSPI_8_64), (step2_28, COSPI_24_64)]);
-        let step1_28 = dot_rs14([(step2_19, COSPI_24_64), (step2_28, COSPI_8_64)]);
-        let step1_20 = dot_rs14([(step2_20, -COSPI_24_64), (step2_27, -COSPI_8_64)]);
-        let step1_27 = dot_rs14([(step2_20, -COSPI_8_64), (step2_27, COSPI_24_64)]);
-        let step1_21 = dot_rs14([(step2_21, -COSPI_24_64), (step2_26, -COSPI_8_64)]);
-        let step1_26 = dot_rs14([(step2_21, -COSPI_8_64), (step2_26, COSPI_24_64)]);
-        let step1_22 = step2_22;
-        let step1_23 = step2_23;
-        let step1_24 = step2_24;
-        let step1_25 = step2_25;
-        let step1_30 = step2_30;
-        let step1_31 = step2_31;
+        let step1_0_3 = step2_0_2.add(step2_3_2);
+        let step1_1_3 = step2_1_2.add(step2_2_2);
+        let step1_2_3 = step2_1_2.sub(step2_2_2);
+        let step1_3_3 = step2_0_2.sub(step2_3_2);
+        let step1_4_3 = step2_4_2;
+        let step1_5_3 = dot_rs14([(step2_6_2, COSPI_16_64), (step2_5_2, -COSPI_16_64)]);
+        let step1_6_3 = dot_rs14([(step2_5_2, COSPI_16_64), (step2_6_2, COSPI_16_64)]);
+        let step1_7_3 = step2_7_2;
+        let step1_8_3 = step2_8_2.add(step2_11_2);
+        let step1_9_3 = step2_9_2.add(step2_10_2);
+        let step1_10_3 = step2_9_2.sub(step2_10_2);
+        let step1_11_3 = step2_8_2.sub(step2_11_2);
+        let step1_12_3 = V::zero().sub(step2_12_2).add(step2_15_2);
+        let step1_13_3 = V::zero().sub(step2_13_2).add(step2_14_2);
+        let step1_14_3 = step2_13_2.add(step2_14_2);
+        let step1_15_3 = step2_12_2.add(step2_15_2);
+        let step1_16_3 = step2_16_2;
+        let step1_17_3 = step2_17_2;
+        let step1_18_3 = dot_rs14([(step2_18_2, -COSPI_8_64), (step2_29_2, COSPI_24_64)]);
+        let step1_29_3 = dot_rs14([(step2_18_2, COSPI_24_64), (step2_29_2, COSPI_8_64)]);
+        let step1_19_3 = dot_rs14([(step2_19_2, -COSPI_8_64), (step2_28_2, COSPI_24_64)]);
+        let step1_28_3 = dot_rs14([(step2_19_2, COSPI_24_64), (step2_28_2, COSPI_8_64)]);
+        let step1_20_3 = dot_rs14([(step2_20_2, -COSPI_24_64), (step2_27_2, -COSPI_8_64)]);
+        let step1_27_3 = dot_rs14([(step2_20_2, -COSPI_8_64), (step2_27_2, COSPI_24_64)]);
+        let step1_21_3 = dot_rs14([(step2_21_2, -COSPI_24_64), (step2_26_2, -COSPI_8_64)]);
+        let step1_26_3 = dot_rs14([(step2_21_2, -COSPI_8_64), (step2_26_2, COSPI_24_64)]);
+        let step1_22_3 = step2_22_2;
+        let step1_23_3 = step2_23_2;
+        let step1_24_3 = step2_24_2;
+        let step1_25_3 = step2_25_2;
+        let step1_30_3 = step2_30_2;
+        let step1_31_3 = step2_31_2;
         // stage 6
-        let step2_0 = step1_0.add(step1_7);
-        let step2_1 = step1_1.add(step1_6);
-        let step2_2 = step1_2.add(step1_5);
-        let step2_3 = step1_3.add(step1_4);
-        let step2_4 = step1_3.sub(step1_4);
-        let step2_5 = step1_2.sub(step1_5);
-        let step2_6 = step1_1.sub(step1_6);
-        let step2_7 = step1_0.sub(step1_7);
-        let step2_8 = step1_8;
-        let step2_9 = step1_9;
-        let step2_10 = dot_rs14([(step1_10, -COSPI_16_64), (step1_13, COSPI_16_64)]);
-        let step2_13 = dot_rs14([(step1_10, COSPI_16_64), (step1_13, COSPI_16_64)]);
-        let step2_11 = dot_rs14([(step1_11, -COSPI_16_64), (step1_12, COSPI_16_64)]);
-        let step2_12 = dot_rs14([(step1_11, COSPI_16_64), (step1_12, COSPI_16_64)]);
-        let step2_14 = step1_14;
-        let step2_15 = step1_15;
-        let step2_16 = step1_16.add(step1_23);
-        let step2_17 = step1_17.add(step1_22);
-        let step2_18 = step1_18.add(step1_21);
-        let step2_19 = step1_19.add(step1_20);
-        let step2_20 = step1_19.sub(step1_20);
-        let step2_21 = step1_18.sub(step1_21);
-        let step2_22 = step1_17.sub(step1_22);
-        let step2_23 = step1_16.sub(step1_23);
-        let step2_24 = V::zero().sub(step1_24).add(step1_31);
-        let step2_25 = V::zero().sub(step1_25).add(step1_30);
-        let step2_26 = V::zero().sub(step1_26).add(step1_29);
-        let step2_27 = V::zero().sub(step1_27).add(step1_28);
-        let step2_28 = step1_27.add(step1_28);
-        let step2_29 = step1_26.add(step1_29);
-        let step2_30 = step1_25.add(step1_30);
-        let step2_31 = step1_24.add(step1_31);
+        let step2_0_3 = step1_0_3.add(step1_7_3);
+        let step2_1_3 = step1_1_3.add(step1_6_3);
+        let step2_2_3 = step1_2_3.add(step1_5_3);
+        let step2_3_3 = step1_3_3.add(step1_4_3);
+        let step2_4_3 = step1_3_3.sub(step1_4_3);
+        let step2_5_3 = step1_2_3.sub(step1_5_3);
+        let step2_6_3 = step1_1_3.sub(step1_6_3);
+        let step2_7_3 = step1_0_3.sub(step1_7_3);
+        let step2_8_3 = step1_8_3;
+        let step2_9_3 = step1_9_3;
+        let step2_10_3 = dot_rs14([(step1_10_3, -COSPI_16_64), (step1_13_3, COSPI_16_64)]);
+        let step2_13_3 = dot_rs14([(step1_10_3, COSPI_16_64), (step1_13_3, COSPI_16_64)]);
+        let step2_11_3 = dot_rs14([(step1_11_3, -COSPI_16_64), (step1_12_3, COSPI_16_64)]);
+        let step2_12_3 = dot_rs14([(step1_11_3, COSPI_16_64), (step1_12_3, COSPI_16_64)]);
+        let step2_14_3 = step1_14_3;
+        let step2_15_3 = step1_15_3;
+        let step2_16_3 = step1_16_3.add(step1_23_3);
+        let step2_17_3 = step1_17_3.add(step1_22_3);
+        let step2_18_3 = step1_18_3.add(step1_21_3);
+        let step2_19_3 = step1_19_3.add(step1_20_3);
+        let step2_20_3 = step1_19_3.sub(step1_20_3);
+        let step2_21_3 = step1_18_3.sub(step1_21_3);
+        let step2_22_3 = step1_17_3.sub(step1_22_3);
+        let step2_23_3 = step1_16_3.sub(step1_23_3);
+        let step2_24_3 = V::zero().sub(step1_24_3).add(step1_31_3);
+        let step2_25_3 = V::zero().sub(step1_25_3).add(step1_30_3);
+        let step2_26_3 = V::zero().sub(step1_26_3).add(step1_29_3);
+        let step2_27_3 = V::zero().sub(step1_27_3).add(step1_28_3);
+        let step2_28_3 = step1_27_3.add(step1_28_3);
+        let step2_29_3 = step1_26_3.add(step1_29_3);
+        let step2_30_3 = step1_25_3.add(step1_30_3);
+        let step2_31_3 = step1_24_3.add(step1_31_3);
         // stage 7
-        let step1_0 = step2_0.add(step2_15);
-        let step1_1 = step2_1.add(step2_14);
-        let step1_2 = step2_2.add(step2_13);
-        let step1_3 = step2_3.add(step2_12);
-        let step1_4 = step2_4.add(step2_11);
-        let step1_5 = step2_5.add(step2_10);
-        let step1_6 = step2_6.add(step2_9);
-        let step1_7 = step2_7.add(step2_8);
-        let step1_8 = step2_7.sub(step2_8);
-        let step1_9 = step2_6.sub(step2_9);
-        let step1_10 = step2_5.sub(step2_10);
-        let step1_11 = step2_4.sub(step2_11);
-        let step1_12 = step2_3.sub(step2_12);
-        let step1_13 = step2_2.sub(step2_13);
-        let step1_14 = step2_1.sub(step2_14);
-        let step1_15 = step2_0.sub(step2_15);
-        let step1_16 = step2_16;
-        let step1_17 = step2_17;
-        let step1_18 = step2_18;
-        let step1_19 = step2_19;
-        let step1_20 = dot_rs14([(step2_20, -COSPI_16_64), (step2_27, COSPI_16_64)]);
-        let step1_27 = dot_rs14([(step2_20, COSPI_16_64), (step2_27, COSPI_16_64)]);
-        let step1_21 = dot_rs14([(step2_21, -COSPI_16_64), (step2_26, COSPI_16_64)]);
-        let step1_26 = dot_rs14([(step2_21, COSPI_16_64), (step2_26, COSPI_16_64)]);
-        let step1_22 = dot_rs14([(step2_22, -COSPI_16_64), (step2_25, COSPI_16_64)]);
-        let step1_25 = dot_rs14([(step2_22, COSPI_16_64), (step2_25, COSPI_16_64)]);
-        let step1_23 = dot_rs14([(step2_23, -COSPI_16_64), (step2_24, COSPI_16_64)]);
-        let step1_24 = dot_rs14([(step2_23, COSPI_16_64), (step2_24, COSPI_16_64)]);
-        let step1_28 = step2_28;
-        let step1_29 = step2_29;
-        let step1_30 = step2_30;
-        let step1_31 = step2_31;
+        let step1_0_4 = step2_0_3.add(step2_15_3);
+        let step1_1_4 = step2_1_3.add(step2_14_3);
+        let step1_2_4 = step2_2_3.add(step2_13_3);
+        let step1_3_4 = step2_3_3.add(step2_12_3);
+        let step1_4_4 = step2_4_3.add(step2_11_3);
+        let step1_5_4 = step2_5_3.add(step2_10_3);
+        let step1_6_4 = step2_6_3.add(step2_9_3);
+        let step1_7_4 = step2_7_3.add(step2_8_3);
+        let step1_8_4 = step2_7_3.sub(step2_8_3);
+        let step1_9_4 = step2_6_3.sub(step2_9_3);
+        let step1_10_4 = step2_5_3.sub(step2_10_3);
+        let step1_11_4 = step2_4_3.sub(step2_11_3);
+        let step1_12_4 = step2_3_3.sub(step2_12_3);
+        let step1_13_4 = step2_2_3.sub(step2_13_3);
+        let step1_14_4 = step2_1_3.sub(step2_14_3);
+        let step1_15_4 = step2_0_3.sub(step2_15_3);
+        let step1_16_4 = step2_16_3;
+        let step1_17_4 = step2_17_3;
+        let step1_18_4 = step2_18_3;
+        let step1_19_4 = step2_19_3;
+        let step1_20_4 = dot_rs14([(step2_20_3, -COSPI_16_64), (step2_27_3, COSPI_16_64)]);
+        let step1_27_4 = dot_rs14([(step2_20_3, COSPI_16_64), (step2_27_3, COSPI_16_64)]);
+        let step1_21_4 = dot_rs14([(step2_21_3, -COSPI_16_64), (step2_26_3, COSPI_16_64)]);
+        let step1_26_4 = dot_rs14([(step2_21_3, COSPI_16_64), (step2_26_3, COSPI_16_64)]);
+        let step1_22_4 = dot_rs14([(step2_22_3, -COSPI_16_64), (step2_25_3, COSPI_16_64)]);
+        let step1_25_4 = dot_rs14([(step2_22_3, COSPI_16_64), (step2_25_3, COSPI_16_64)]);
+        let step1_23_4 = dot_rs14([(step2_23_3, -COSPI_16_64), (step2_24_3, COSPI_16_64)]);
+        let step1_24_4 = dot_rs14([(step2_23_3, COSPI_16_64), (step2_24_3, COSPI_16_64)]);
+        let step1_28_4 = step2_28_3;
+        let step1_29_4 = step2_29_3;
+        let step1_30_4 = step2_30_3;
+        let step1_31_4 = step2_31_3;
         // final stage
-        output[0] = step1_0.add(step1_31);
-        output[1] = step1_1.add(step1_30);
-        output[2] = step1_2.add(step1_29);
-        output[3] = step1_3.add(step1_28);
-        output[4] = step1_4.add(step1_27);
-        output[5] = step1_5.add(step1_26);
-        output[6] = step1_6.add(step1_25);
-        output[7] = step1_7.add(step1_24);
-        output[8] = step1_8.add(step1_23);
-        output[9] = step1_9.add(step1_22);
-        output[10] = step1_10.add(step1_21);
-        output[11] = step1_11.add(step1_20);
-        output[12] = step1_12.add(step1_19);
-        output[13] = step1_13.add(step1_18);
-        output[14] = step1_14.add(step1_17);
-        output[15] = step1_15.add(step1_16);
-        output[16] = step1_15.sub(step1_16);
-        output[17] = step1_14.sub(step1_17);
-        output[18] = step1_13.sub(step1_18);
-        output[19] = step1_12.sub(step1_19);
-        output[20] = step1_11.sub(step1_20);
-        output[21] = step1_10.sub(step1_21);
-        output[22] = step1_9.sub(step1_22);
-        output[23] = step1_8.sub(step1_23);
-        output[24] = step1_7.sub(step1_24);
-        output[25] = step1_6.sub(step1_25);
-        output[26] = step1_5.sub(step1_26);
-        output[27] = step1_4.sub(step1_27);
-        output[28] = step1_3.sub(step1_28);
-        output[29] = step1_2.sub(step1_29);
-        output[30] = step1_1.sub(step1_30);
-        output[31] = step1_0.sub(step1_31);
+        output[0] = step1_0_4.add(step1_31_4);
+        output[1] = step1_1_4.add(step1_30_4);
+        output[2] = step1_2_4.add(step1_29_4);
+        output[3] = step1_3_4.add(step1_28_4);
+        output[4] = step1_4_4.add(step1_27_4);
+        output[5] = step1_5_4.add(step1_26_4);
+        output[6] = step1_6_4.add(step1_25_4);
+        output[7] = step1_7_4.add(step1_24_4);
+        output[8] = step1_8_4.add(step1_23_4);
+        output[9] = step1_9_4.add(step1_22_4);
+        output[10] = step1_10_4.add(step1_21_4);
+        output[11] = step1_11_4.add(step1_20_4);
+        output[12] = step1_12_4.add(step1_19_4);
+        output[13] = step1_13_4.add(step1_18_4);
+        output[14] = step1_14_4.add(step1_17_4);
+        output[15] = step1_15_4.add(step1_16_4);
+        output[16] = step1_15_4.sub(step1_16_4);
+        output[17] = step1_14_4.sub(step1_17_4);
+        output[18] = step1_13_4.sub(step1_18_4);
+        output[19] = step1_12_4.sub(step1_19_4);
+        output[20] = step1_11_4.sub(step1_20_4);
+        output[21] = step1_10_4.sub(step1_21_4);
+        output[22] = step1_9_4.sub(step1_22_4);
+        output[23] = step1_8_4.sub(step1_23_4);
+        output[24] = step1_7_4.sub(step1_24_4);
+        output[25] = step1_6_4.sub(step1_25_4);
+        output[26] = step1_5_4.sub(step1_26_4);
+        output[27] = step1_4_4.sub(step1_27_4);
+        output[28] = step1_3_4.sub(step1_28_4);
+        output[29] = step1_2_4.sub(step1_29_4);
+        output[30] = step1_1_4.sub(step1_30_4);
+        output[31] = step1_0_4.sub(step1_31_4);
         output
     }
 }
@@ -669,100 +669,100 @@ unsafe fn adst8<V: I32x>(input: [V; 8]) -> [V; 8] {
         let x6 = input[1];
         let x7 = input[6];
         // stage 1
-        let x0 = dot_rs14([
+        let x0_2 = dot_rs14([
             (x0, COSPI_2_64),
             (x1, COSPI_30_64),
             (x4, COSPI_18_64),
             (x5, COSPI_14_64),
         ]);
-        let x1 = dot_rs14([
+        let x1_2 = dot_rs14([
             (x0, COSPI_30_64),
             (x1, -COSPI_2_64),
             (x4, COSPI_14_64),
             (x5, -COSPI_18_64),
         ]);
-        let x2 = dot_rs14([
+        let x2_2 = dot_rs14([
             (x2, COSPI_10_64),
             (x3, COSPI_22_64),
             (x6, COSPI_26_64),
             (x7, COSPI_6_64),
         ]);
-        let x3 = dot_rs14([
+        let x3_2 = dot_rs14([
             (x2, COSPI_22_64),
             (x3, -COSPI_10_64),
             (x6, COSPI_6_64),
             (x7, -COSPI_26_64),
         ]);
-        let x4 = dot_rs14([
+        let x4_2 = dot_rs14([
             (x0, COSPI_2_64),
             (x1, COSPI_30_64),
             (x4, -COSPI_18_64),
             (x5, -COSPI_14_64),
         ]);
-        let x5 = dot_rs14([
+        let x5_2 = dot_rs14([
             (x0, COSPI_30_64),
             (x1, -COSPI_2_64),
             (x4, -COSPI_14_64),
             (x5, COSPI_18_64),
         ]);
-        let x6 = dot_rs14([
+        let x6_2 = dot_rs14([
             (x2, COSPI_10_64),
             (x3, COSPI_22_64),
             (x6, -COSPI_26_64),
             (x7, -COSPI_6_64),
         ]);
-        let x7 = dot_rs14([
+        let x7_2 = dot_rs14([
             (x2, COSPI_22_64),
             (x3, -COSPI_10_64),
             (x6, -COSPI_6_64),
             (x7, COSPI_26_64),
         ]);
         // stage 2
-        let s0 = x0;
-        let s1 = x1;
-        let s2 = x2;
-        let s3 = x3;
-        let x0 = s0.add(s2);
-        let x1 = s1.add(s3);
-        let x2 = s0.sub(s2);
-        let x3 = s1.sub(s3);
-        let x4 = dot_rs14([
-            (x4, COSPI_8_64),
-            (x5, COSPI_24_64),
-            (x6, -COSPI_24_64),
-            (x7, COSPI_8_64),
+        let s0 = x0_2;
+        let s1 = x1_2;
+        let s2 = x2_2;
+        let s3 = x3_2;
+        let x0_3 = s0.add(s2);
+        let x1_3 = s1.add(s3);
+        let x2_3 = s0.sub(s2);
+        let x3_3 = s1.sub(s3);
+        let x4_3 = dot_rs14([
+            (x4_2, COSPI_8_64),
+            (x5_2, COSPI_24_64),
+            (x6_2, -COSPI_24_64),
+            (x7_2, COSPI_8_64),
         ]);
-        let x5 = dot_rs14([
-            (x4, COSPI_24_64),
-            (x5, -COSPI_8_64),
-            (x6, COSPI_8_64),
-            (x7, COSPI_24_64),
+        let x5_3 = dot_rs14([
+            (x4_2, COSPI_24_64),
+            (x5_2, -COSPI_8_64),
+            (x6_2, COSPI_8_64),
+            (x7_2, COSPI_24_64),
         ]);
-        let x6 = dot_rs14([
-            (x4, COSPI_8_64),
-            (x5, COSPI_24_64),
-            (x6, COSPI_24_64),
-            (x7, -COSPI_8_64),
+        let x6_3 = dot_rs14([
+            (x4_2, COSPI_8_64),
+            (x5_2, COSPI_24_64),
+            (x6_2, COSPI_24_64),
+            (x7_2, -COSPI_8_64),
         ]);
-        let x7 = dot_rs14([
-            (x4, COSPI_24_64),
-            (x5, -COSPI_8_64),
-            (x6, -COSPI_8_64),
-            (x7, -COSPI_24_64),
+        let x7_3 = dot_rs14([
+            (x4_2, COSPI_24_64),
+            (x5_2, -COSPI_8_64),
+            (x6_2, -COSPI_8_64),
+            (x7_2, -COSPI_24_64),
         ]);
         // stage 3
-        let x2 = dot_rs14([(x2, COSPI_16_64), (x3, COSPI_16_64)]);
-        let x3 = dot_rs14([(x2, COSPI_16_64), (x3, -COSPI_16_64)]);
-        let x6 = dot_rs14([(x6, COSPI_16_64), (x7, COSPI_16_64)]);
-        let x7 = dot_rs14([(x6, COSPI_16_64), (x7, -COSPI_16_64)]);
-        output[0] = x0;
-        output[1] = V::zero().sub(x4);
-        output[2] = x6;
-        output[3] = V::zero().sub(x2);
-        output[4] = x3;
-        output[5] = V::zero().sub(x7);
-        output[6] = x5;
-        output[7] = V::zero().sub(x1);
+        let x2_4 = dot_rs14([(x2_3, COSPI_16_64), (x3_3, COSPI_16_64)]);
+        let x3_4 = dot_rs14([(x2_3, COSPI_16_64), (x3_3, -COSPI_16_64)]);
+        let x6_4 = dot_rs14([(x6_3, COSPI_16_64), (x7_3, COSPI_16_64)]);
+        let x7_4 = dot_rs14([(x6_3, COSPI_16_64), (x7_3, -COSPI_16_64)]);
+        output[0] = x0_3;
+        output[1] = V::zero().sub(x4_3);
+        output[2] = x6_4;
+        output[3] = V::zero().sub(x2_4);
+        output[4] = x3_4;
+        output[5] = V::zero().sub(x7_4);
+        output[6] = x5_3;
+        output[7] = V::zero().sub(x1_3);
         output
     }
 }
@@ -789,257 +789,257 @@ unsafe fn adst16<V: I32x>(input: [V; 16]) -> [V; 16] {
         let x14 = input[1];
         let x15 = input[14];
         // stage 1
-        let x0 = dot_rs14([
+        let x0_2 = dot_rs14([
             (x0, COSPI_1_64),
             (x1, COSPI_31_64),
             (x8, COSPI_17_64),
             (x9, COSPI_15_64),
         ]);
-        let x1 = dot_rs14([
+        let x1_2 = dot_rs14([
             (x0, COSPI_31_64),
             (x1, -COSPI_1_64),
             (x8, COSPI_15_64),
             (x9, -COSPI_17_64),
         ]);
-        let x2 = dot_rs14([
+        let x2_2 = dot_rs14([
             (x2, COSPI_5_64),
             (x3, COSPI_27_64),
             (x10, COSPI_21_64),
             (x11, COSPI_11_64),
         ]);
-        let x3 = dot_rs14([
+        let x3_2 = dot_rs14([
             (x2, COSPI_27_64),
             (x3, -COSPI_5_64),
             (x10, COSPI_11_64),
             (x11, -COSPI_21_64),
         ]);
-        let x4 = dot_rs14([
+        let x4_2 = dot_rs14([
             (x4, COSPI_9_64),
             (x5, COSPI_23_64),
             (x12, COSPI_25_64),
             (x13, COSPI_7_64),
         ]);
-        let x5 = dot_rs14([
+        let x5_2 = dot_rs14([
             (x4, COSPI_23_64),
             (x5, -COSPI_9_64),
             (x12, COSPI_7_64),
             (x13, -COSPI_25_64),
         ]);
-        let x6 = dot_rs14([
+        let x6_2 = dot_rs14([
             (x6, COSPI_13_64),
             (x7, COSPI_19_64),
             (x14, COSPI_29_64),
             (x15, COSPI_3_64),
         ]);
-        let x7 = dot_rs14([
+        let x7_2 = dot_rs14([
             (x6, COSPI_19_64),
             (x7, -COSPI_13_64),
             (x14, COSPI_3_64),
             (x15, -COSPI_29_64),
         ]);
-        let x8 = dot_rs14([
+        let x8_2 = dot_rs14([
             (x0, COSPI_1_64),
             (x1, COSPI_31_64),
             (x8, -COSPI_17_64),
             (x9, -COSPI_15_64),
         ]);
-        let x9 = dot_rs14([
+        let x9_2 = dot_rs14([
             (x0, COSPI_31_64),
             (x1, -COSPI_1_64),
             (x8, -COSPI_15_64),
             (x9, COSPI_17_64),
         ]);
-        let x10 = dot_rs14([
+        let x10_2 = dot_rs14([
             (x2, COSPI_5_64),
             (x3, COSPI_27_64),
             (x10, -COSPI_21_64),
             (x11, -COSPI_11_64),
         ]);
-        let x11 = dot_rs14([
+        let x11_2 = dot_rs14([
             (x2, COSPI_27_64),
             (x3, -COSPI_5_64),
             (x10, -COSPI_11_64),
             (x11, COSPI_21_64),
         ]);
-        let x12 = dot_rs14([
+        let x12_2 = dot_rs14([
             (x4, COSPI_9_64),
             (x5, COSPI_23_64),
             (x12, -COSPI_25_64),
             (x13, -COSPI_7_64),
         ]);
-        let x13 = dot_rs14([
+        let x13_2 = dot_rs14([
             (x4, COSPI_23_64),
             (x5, -COSPI_9_64),
             (x12, -COSPI_7_64),
             (x13, COSPI_25_64),
         ]);
-        let x14 = dot_rs14([
+        let x14_2 = dot_rs14([
             (x6, COSPI_13_64),
             (x7, COSPI_19_64),
             (x14, -COSPI_29_64),
             (x15, -COSPI_3_64),
         ]);
-        let x15 = dot_rs14([
+        let x15_2 = dot_rs14([
             (x6, COSPI_19_64),
             (x7, -COSPI_13_64),
             (x14, -COSPI_3_64),
             (x15, COSPI_29_64),
         ]);
         // stage 2
-        let s0 = x0;
-        let s1 = x1;
-        let s2 = x2;
-        let s3 = x3;
-        let s4 = x4;
-        let s5 = x5;
-        let s6 = x6;
-        let s7 = x7;
-        let x0 = s0.add(s4);
-        let x1 = s1.add(s5);
-        let x2 = s2.add(s6);
-        let x3 = s3.add(s7);
-        let x4 = s0.sub(s4);
-        let x5 = s1.sub(s5);
-        let x6 = s2.sub(s6);
-        let x7 = s3.sub(s7);
-        let x8 = dot_rs14([
-            (x8, COSPI_4_64),
-            (x9, COSPI_28_64),
-            (x12, -COSPI_28_64),
-            (x13, COSPI_4_64),
+        let s0 = x0_2;
+        let s1 = x1_2;
+        let s2 = x2_2;
+        let s3 = x3_2;
+        let s4 = x4_2;
+        let s5 = x5_2;
+        let s6 = x6_2;
+        let s7 = x7_2;
+        let x0_3 = s0.add(s4);
+        let x1_3 = s1.add(s5);
+        let x2_3 = s2.add(s6);
+        let x3_3 = s3.add(s7);
+        let x4_3 = s0.sub(s4);
+        let x5_3 = s1.sub(s5);
+        let x6_3 = s2.sub(s6);
+        let x7_3 = s3.sub(s7);
+        let x8_3 = dot_rs14([
+            (x8_2, COSPI_4_64),
+            (x9_2, COSPI_28_64),
+            (x12_2, -COSPI_28_64),
+            (x13_2, COSPI_4_64),
         ]);
-        let x9 = dot_rs14([
-            (x8, COSPI_28_64),
-            (x9, -COSPI_4_64),
-            (x12, COSPI_4_64),
-            (x13, COSPI_28_64),
+        let x9_3 = dot_rs14([
+            (x8_2, COSPI_28_64),
+            (x9_2, -COSPI_4_64),
+            (x12_2, COSPI_4_64),
+            (x13_2, COSPI_28_64),
         ]);
-        let x10 = dot_rs14([
-            (x10, COSPI_20_64),
-            (x11, COSPI_12_64),
-            (x14, -COSPI_12_64),
-            (x15, COSPI_20_64),
+        let x10_3 = dot_rs14([
+            (x10_2, COSPI_20_64),
+            (x11_2, COSPI_12_64),
+            (x14_2, -COSPI_12_64),
+            (x15_2, COSPI_20_64),
         ]);
-        let x11 = dot_rs14([
-            (x10, COSPI_12_64),
-            (x11, -COSPI_20_64),
-            (x14, COSPI_20_64),
-            (x15, COSPI_12_64),
+        let x11_3 = dot_rs14([
+            (x10_2, COSPI_12_64),
+            (x11_2, -COSPI_20_64),
+            (x14_2, COSPI_20_64),
+            (x15_2, COSPI_12_64),
         ]);
-        let x12 = dot_rs14([
-            (x8, COSPI_4_64),
-            (x9, COSPI_28_64),
-            (x12, COSPI_28_64),
-            (x13, -COSPI_4_64),
+        let x12_3 = dot_rs14([
+            (x8_2, COSPI_4_64),
+            (x9_2, COSPI_28_64),
+            (x12_2, COSPI_28_64),
+            (x13_2, -COSPI_4_64),
         ]);
-        let x13 = dot_rs14([
-            (x8, COSPI_28_64),
-            (x9, -COSPI_4_64),
-            (x12, -COSPI_4_64),
-            (x13, -COSPI_28_64),
+        let x13_3 = dot_rs14([
+            (x8_2, COSPI_28_64),
+            (x9_2, -COSPI_4_64),
+            (x12_2, -COSPI_4_64),
+            (x13_2, -COSPI_28_64),
         ]);
-        let x14 = dot_rs14([
-            (x10, COSPI_20_64),
-            (x11, COSPI_12_64),
-            (x14, COSPI_12_64),
-            (x15, -COSPI_20_64),
+        let x14_3 = dot_rs14([
+            (x10_2, COSPI_20_64),
+            (x11_2, COSPI_12_64),
+            (x14_2, COSPI_12_64),
+            (x15_2, -COSPI_20_64),
         ]);
-        let x15 = dot_rs14([
-            (x10, COSPI_12_64),
-            (x11, -COSPI_20_64),
-            (x14, -COSPI_20_64),
-            (x15, -COSPI_12_64),
+        let x15_3 = dot_rs14([
+            (x10_2, COSPI_12_64),
+            (x11_2, -COSPI_20_64),
+            (x14_2, -COSPI_20_64),
+            (x15_2, -COSPI_12_64),
         ]);
         // stage 3
-        let s0 = x0;
-        let s1 = x1;
-        let s2 = x2;
-        let s3 = x3;
-        let s8 = x8;
-        let s9 = x9;
-        let s10 = x10;
-        let s11 = x11;
-        let x0 = s0.add(s2);
-        let x1 = s1.add(s3);
-        let x2 = s0.sub(s2);
-        let x3 = s1.sub(s3);
-        let x4 = dot_rs14([
-            (x4, COSPI_8_64),
-            (x5, COSPI_24_64),
-            (x6, -COSPI_24_64),
-            (x7, COSPI_8_64),
+        let s0_2 = x0_3;
+        let s1_2 = x1_3;
+        let s2_2 = x2_3;
+        let s3_2 = x3_3;
+        let s8 = x8_3;
+        let s9 = x9_3;
+        let s10 = x10_3;
+        let s11 = x11_3;
+        let x0_4 = s0_2.add(s2_2);
+        let x1_4 = s1_2.add(s3_2);
+        let x2_4 = s0_2.sub(s2_2);
+        let x3_4 = s1_2.sub(s3_2);
+        let x4_4 = dot_rs14([
+            (x4_3, COSPI_8_64),
+            (x5_3, COSPI_24_64),
+            (x6_3, -COSPI_24_64),
+            (x7_3, COSPI_8_64),
         ]);
-        let x5 = dot_rs14([
-            (x4, COSPI_24_64),
-            (x5, -COSPI_8_64),
-            (x6, COSPI_8_64),
-            (x7, COSPI_24_64),
+        let x5_4 = dot_rs14([
+            (x4_3, COSPI_24_64),
+            (x5_3, -COSPI_8_64),
+            (x6_3, COSPI_8_64),
+            (x7_3, COSPI_24_64),
         ]);
-        let x6 = dot_rs14([
-            (x4, COSPI_8_64),
-            (x5, COSPI_24_64),
-            (x6, COSPI_24_64),
-            (x7, -COSPI_8_64),
+        let x6_4 = dot_rs14([
+            (x4_3, COSPI_8_64),
+            (x5_3, COSPI_24_64),
+            (x6_3, COSPI_24_64),
+            (x7_3, -COSPI_8_64),
         ]);
-        let x7 = dot_rs14([
-            (x4, COSPI_24_64),
-            (x5, -COSPI_8_64),
-            (x6, -COSPI_8_64),
-            (x7, -COSPI_24_64),
+        let x7_4 = dot_rs14([
+            (x4_3, COSPI_24_64),
+            (x5_3, -COSPI_8_64),
+            (x6_3, -COSPI_8_64),
+            (x7_3, -COSPI_24_64),
         ]);
-        let x8 = s8.add(s10);
-        let x9 = s9.add(s11);
-        let x10 = s8.sub(s10);
-        let x11 = s9.sub(s11);
-        let x12 = dot_rs14([
-            (x12, COSPI_8_64),
-            (x13, COSPI_24_64),
-            (x14, -COSPI_24_64),
-            (x15, COSPI_8_64),
+        let x8_4 = s8.add(s10);
+        let x9_4 = s9.add(s11);
+        let x10_4 = s8.sub(s10);
+        let x11_4 = s9.sub(s11);
+        let x12_4 = dot_rs14([
+            (x12_3, COSPI_8_64),
+            (x13_3, COSPI_24_64),
+            (x14_3, -COSPI_24_64),
+            (x15_3, COSPI_8_64),
         ]);
-        let x13 = dot_rs14([
-            (x12, COSPI_24_64),
-            (x13, -COSPI_8_64),
-            (x14, COSPI_8_64),
-            (x15, COSPI_24_64),
+        let x13_4 = dot_rs14([
+            (x12_3, COSPI_24_64),
+            (x13_3, -COSPI_8_64),
+            (x14_3, COSPI_8_64),
+            (x15_3, COSPI_24_64),
         ]);
-        let x14 = dot_rs14([
-            (x12, COSPI_8_64),
-            (x13, COSPI_24_64),
-            (x14, COSPI_24_64),
-            (x15, -COSPI_8_64),
+        let x14_4 = dot_rs14([
+            (x12_3, COSPI_8_64),
+            (x13_3, COSPI_24_64),
+            (x14_3, COSPI_24_64),
+            (x15_3, -COSPI_8_64),
         ]);
-        let x15 = dot_rs14([
-            (x12, COSPI_24_64),
-            (x13, -COSPI_8_64),
-            (x14, -COSPI_8_64),
-            (x15, -COSPI_24_64),
+        let x15_4 = dot_rs14([
+            (x12_3, COSPI_24_64),
+            (x13_3, -COSPI_8_64),
+            (x14_3, -COSPI_8_64),
+            (x15_3, -COSPI_24_64),
         ]);
         // stage 4
-        let x2 = dot_rs14([(x2, -COSPI_16_64), (x3, -COSPI_16_64)]);
-        let x3 = dot_rs14([(x2, COSPI_16_64), (x3, -COSPI_16_64)]);
-        let x6 = dot_rs14([(x6, COSPI_16_64), (x7, COSPI_16_64)]);
-        let x7 = dot_rs14([(x6, -COSPI_16_64), (x7, COSPI_16_64)]);
-        let x10 = dot_rs14([(x10, COSPI_16_64), (x11, COSPI_16_64)]);
-        let x11 = dot_rs14([(x10, -COSPI_16_64), (x11, COSPI_16_64)]);
-        let x14 = dot_rs14([(x14, -COSPI_16_64), (x15, -COSPI_16_64)]);
-        let x15 = dot_rs14([(x14, COSPI_16_64), (x15, -COSPI_16_64)]);
-        output[0] = x0;
-        output[1] = V::zero().sub(x8);
-        output[2] = x12;
-        output[3] = V::zero().sub(x4);
-        output[4] = x6;
-        output[5] = x14;
-        output[6] = x10;
-        output[7] = x2;
-        output[8] = x3;
-        output[9] = x11;
-        output[10] = x15;
-        output[11] = x7;
-        output[12] = x5;
-        output[13] = V::zero().sub(x13);
-        output[14] = x9;
-        output[15] = V::zero().sub(x1);
+        let x2_5 = dot_rs14([(x2_4, -COSPI_16_64), (x3_4, -COSPI_16_64)]);
+        let x3_5 = dot_rs14([(x2_4, COSPI_16_64), (x3_4, -COSPI_16_64)]);
+        let x6_5 = dot_rs14([(x6_4, COSPI_16_64), (x7_4, COSPI_16_64)]);
+        let x7_5 = dot_rs14([(x6_4, -COSPI_16_64), (x7_4, COSPI_16_64)]);
+        let x10_5 = dot_rs14([(x10_4, COSPI_16_64), (x11_4, COSPI_16_64)]);
+        let x11_5 = dot_rs14([(x10_4, -COSPI_16_64), (x11_4, COSPI_16_64)]);
+        let x14_5 = dot_rs14([(x14_4, -COSPI_16_64), (x15_4, -COSPI_16_64)]);
+        let x15_5 = dot_rs14([(x14_4, COSPI_16_64), (x15_4, -COSPI_16_64)]);
+        output[0] = x0_4;
+        output[1] = V::zero().sub(x8_4);
+        output[2] = x12_4;
+        output[3] = V::zero().sub(x4_4);
+        output[4] = x6_5;
+        output[5] = x14_5;
+        output[6] = x10_5;
+        output[7] = x2_5;
+        output[8] = x3_5;
+        output[9] = x11_5;
+        output[10] = x15_5;
+        output[11] = x7_5;
+        output[12] = x5_4;
+        output[13] = V::zero().sub(x13_4);
+        output[14] = x9_4;
+        output[15] = V::zero().sub(x1_4);
         output
     }
 }
