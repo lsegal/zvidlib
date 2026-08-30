@@ -69,7 +69,10 @@ pub use av1_intra::{
     inverse_transform, inverse_wht_4x4,
 };
 pub use av1_intra_decoder::{decode_av1_lossless_intra, decode_av1_lossless_intra_with_tx_sizes};
-pub use av1_intra_pred::{Av1IntraSimd, add_residual_row, av1_intra_simd, paeth_row, sum_samples};
+pub use av1_intra_pred::{
+    Av1IntraSimd, SmoothMode, add_residual_row, av1_intra_simd, directional_row, paeth_row,
+    smooth_row, sum_samples,
+};
 pub use av1_simd::SimdIsa;
 pub use codec::{
     AudioDrain, AudioEncoder, AudioEncoderFormat, AudioGapless, CancellationToken,

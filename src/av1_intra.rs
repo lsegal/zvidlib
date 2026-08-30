@@ -6,7 +6,9 @@
 
 use crate::{
     ColorRange, Error, ErrorKind, Limits, PixelFormat, Plane, Result, VideoDimensions, VideoFrame,
-    av1_intra_pred::{add_residual_row, paeth_row, sum_samples},
+    av1_intra_pred::{
+        SmoothMode, add_residual_row, directional_row, paeth_row, smooth_row, sum_samples,
+    },
 };
 
 /// Intra predictors used by the first AV1 reconstruction stages.
@@ -16,6 +18,17 @@ pub enum Av1IntraMode {
     Vertical,
     Horizontal,
     Paeth,
+    Smooth,
+    SmoothVertical,
+    SmoothHorizontal,
+    D45,
+    D63,
+    D67,
+    D113,
+    D135,
+    D157,
+    D203,
+    Directional { angle: i16, filter_edges: bool },
 }
 
 /// Geometry and prediction mode for one decoded intra block.
@@ -138,7 +151,9 @@ impl Av1IntraFrame {
                 *sample = self.planes[plane][(y + i) * stride + x - 1];
             }
         }
-        let dc = ((sum_samples(&top) + sum_samples(&left))
+        let dc = ((sum_samples(&top)
+            + sum_samples(&left)
+            + u32::try_from(width + height).expect("nonzero block dimensions") / 2)
             / u32::try_from(width + height).expect("nonzero block dimensions"))
             as u8;
         let mut prediction = vec![0u8; width];
@@ -148,6 +163,34 @@ impl Av1IntraFrame {
                 Av1IntraMode::Vertical => prediction.copy_from_slice(&top),
                 Av1IntraMode::Horizontal => prediction.fill(left[row]),
                 Av1IntraMode::Paeth => paeth_row(top_left, &top, left[row], &mut prediction),
+                Av1IntraMode::Smooth => {
+                    smooth_row(SmoothMode::Smooth, &top, &left, row, &mut prediction)
+                }
+                Av1IntraMode::SmoothVertical => smooth_row(
+                    SmoothMode::SmoothVertical,
+                    &top,
+                    &left,
+                    row,
+                    &mut prediction,
+                ),
+                Av1IntraMode::SmoothHorizontal => smooth_row(
+                    SmoothMode::SmoothHorizontal,
+                    &top,
+                    &left,
+                    row,
+                    &mut prediction,
+                ),
+                Av1IntraMode::D45 => directional_row(45, &top, &left, row, true, &mut prediction),
+                Av1IntraMode::D63 => directional_row(63, &top, &left, row, true, &mut prediction),
+                Av1IntraMode::D67 => directional_row(67, &top, &left, row, true, &mut prediction),
+                Av1IntraMode::D113 => directional_row(113, &top, &left, row, true, &mut prediction),
+                Av1IntraMode::D135 => directional_row(135, &top, &left, row, true, &mut prediction),
+                Av1IntraMode::D157 => directional_row(157, &top, &left, row, true, &mut prediction),
+                Av1IntraMode::D203 => directional_row(203, &top, &left, row, true, &mut prediction),
+                Av1IntraMode::Directional {
+                    angle,
+                    filter_edges,
+                } => directional_row(angle, &top, &left, row, filter_edges, &mut prediction),
             }
             let start = (y + row) * stride + x;
             let destination = &mut self.planes[plane][start..start + width];
