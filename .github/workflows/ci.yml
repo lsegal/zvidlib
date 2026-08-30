@@ -30,6 +30,8 @@ jobs:
         run: cargo clippy --all-targets --features native -- -D warnings
       - name: Test library units
         run: cargo test --features native --lib
+      - name: Test AV1 SIMD motion compensation
+        run: cargo test --features native --lib av1_mc -- --nocapture
       - name: Test native_gl example overlays
         run: cargo test --features native --example native_gl
       - name: Test SIMD in-loop filters are bit-exact with the scalar path
@@ -62,3 +64,5 @@ jobs:
         run: cargo test --features native --lib
       - name: Test accelerated HEVC selection and correctness
         run: cargo test --features native --test native_hevc_hardware -- --nocapture
+      - name: Test AV1 SIMD motion compensation
+        run: cargo test --features native --lib av1_mc -- --nocapture
