@@ -260,47 +260,52 @@ simd_entry_points! {
     ) -> bool = transforms::inverse_transform32, avx2 = Sse4;
 }
 simd_entry_points! {
+    #[allow(clippy::too_many_arguments)]
     fn [deblock_h_sse41, deblock_h_avx2, deblock_h_neon](
-        data: &mut [u8], stride: usize, x0: usize, y: usize,
-        limit: i32, blimit: i32, thresh: i32
-    ) = filters::deblock_narrow_horizontal, avx2 = Avx2;
+        data: &mut [u8], geom: filters::Geometry, x0: usize, y: usize, count: usize,
+        limit: i32, blimit: i32, thresh: i32, sizes: &[i32]
+    ) = filters::deblock_edge_horizontal, avx2 = Avx2;
 }
 simd_entry_points! {
+    #[allow(clippy::too_many_arguments)]
     fn [deblock_v_sse41, deblock_v_avx2, deblock_v_neon](
-        data: &mut [u8], stride: usize, x: usize, y0: usize,
-        limit: i32, blimit: i32, thresh: i32
-    ) = filters::deblock_narrow_vertical, avx2 = Avx2;
+        data: &mut [u8], geom: filters::Geometry, x: usize, y0: usize, count: usize,
+        limit: i32, blimit: i32, thresh: i32, sizes: &[i32]
+    ) = filters::deblock_edge_vertical, avx2 = Avx2;
 }
 simd_entry_points! {
     fn [cdef_stats_sse41, cdef_stats_avx2, cdef_stats_neon](
-        data: &[u8], stride: usize, x0: usize, y0: usize, dr: i32, dc: i32
+        data: &[u8], geom: filters::Geometry, x0: usize, y0: usize, dr: i32, dc: i32
     ) -> (i32, i32) = filters::cdef_direction_stats, avx2 = Avx2;
 }
 simd_entry_points! {
     #[allow(clippy::too_many_arguments)]
     fn [cdef_row_sse41, cdef_row_avx2, cdef_row_neon](
-        data: &[u8], stride: usize, x0: usize, y: usize,
+        data: &[u8], geom: filters::Geometry, x0: usize, y: usize, count: usize,
         primary: &[filters::CdefTap], primary_strength: i32, primary_damping_adj: i32,
         secondary: &[filters::CdefTap], secondary_strength: i32, secondary_damping_adj: i32,
         total_weight: i32, dst: &mut [u8]
     ) = filters::cdef_filter_row, avx2 = Avx2;
 }
 simd_entry_points! {
+    #[allow(clippy::too_many_arguments)]
     fn [wiener_h_sse41, wiener_h_avx2, wiener_h_neon](
-        data: &[u8], stride: usize, x0: usize, y: usize,
+        data: &[u8], geom: filters::Geometry, x0: usize, y: usize, count: usize,
         taps: [i32; 3], center_tap: i32, out: &mut [i32]
     ) = filters::wiener_horizontal_row, avx2 = Avx2;
 }
 simd_entry_points! {
+    #[allow(clippy::too_many_arguments)]
     fn [wiener_v_sse41, wiener_v_avx2, wiener_v_neon](
-        intermediate: &[i32], width: usize, row: usize, column: usize,
-        taps: [i32; 3], center_tap: i32, dst: &mut [u8]
+        intermediate: &[i32], width: usize, height: usize, row: usize, column: usize,
+        count: usize, taps: [i32; 3], center_tap: i32, dst: &mut [u8]
     ) = filters::wiener_vertical_row, avx2 = Avx2;
 }
 simd_entry_points! {
+    #[allow(clippy::too_many_arguments)]
     fn [box_stats_sse41, box_stats_avx2, box_stats_neon](
-        data: &[u8], stride: usize, x0: usize, y: usize, radius: usize,
-        sums: &mut [i32], sums_sq: &mut [i32]
+        data: &[u8], geom: filters::Geometry, x0: usize, y: usize, count: usize,
+        radius: usize, sums: &mut [i32], sums_sq: &mut [i32]
     ) = filters::box_stats_row, avx2 = Avx2;
 }
 
@@ -428,43 +433,52 @@ pub(crate) fn inverse_transform(
     }
 }
 
-/// Filters `lanes(isa)` positions of the horizontal edge above row `y`.
+/// Filters `count` consecutive positions of the horizontal edge above row `y`,
+/// including positions whose filter window leaves the plane; `sizes` gives each
+/// position's §7.14.5 filter length, or is empty when every edge is narrow.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn deblock_narrow_horizontal(
+pub(crate) fn deblock_edge_horizontal(
     isa: SimdIsa,
     data: &mut [u8],
-    stride: usize,
+    geom: filters::Geometry,
     x0: usize,
     y: usize,
+    count: usize,
     limit: i32,
     blimit: i32,
     thresh: i32,
+    sizes: &[i32],
 ) {
     dispatch!(
         isa,
         [deblock_h_sse41, deblock_h_avx2, deblock_h_neon](
-            data, stride, x0, y, limit, blimit, thresh
+            data, geom, x0, y, count, limit, blimit, thresh, sizes
         ),
         ()
     )
 }
 
-/// Filters `lanes(isa)` positions of the vertical edge left of column `x`.
+/// Filters `count` consecutive positions of the vertical edge left of column
+/// `x`, including positions whose filter window leaves the plane; `sizes` gives
+/// each position's §7.14.5 filter length, or is empty when every edge is
+/// narrow.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn deblock_narrow_vertical(
+pub(crate) fn deblock_edge_vertical(
     isa: SimdIsa,
     data: &mut [u8],
-    stride: usize,
+    geom: filters::Geometry,
     x: usize,
     y0: usize,
+    count: usize,
     limit: i32,
     blimit: i32,
     thresh: i32,
+    sizes: &[i32],
 ) {
     dispatch!(
         isa,
         [deblock_v_sse41, deblock_v_avx2, deblock_v_neon](
-            data, stride, x, y0, limit, blimit, thresh
+            data, geom, x, y0, count, limit, blimit, thresh, sizes
         ),
         ()
     )
@@ -475,7 +489,7 @@ pub(crate) fn deblock_narrow_vertical(
 pub(crate) fn cdef_direction_stats(
     isa: SimdIsa,
     data: &[u8],
-    stride: usize,
+    geom: filters::Geometry,
     x0: usize,
     y0: usize,
     dr: i32,
@@ -483,20 +497,21 @@ pub(crate) fn cdef_direction_stats(
 ) -> Option<(i32, i32)> {
     let stats: (i32, i32) = dispatch!(
         isa,
-        [cdef_stats_sse41, cdef_stats_avx2, cdef_stats_neon](data, stride, x0, y0, dr, dc),
+        [cdef_stats_sse41, cdef_stats_avx2, cdef_stats_neon](data, geom, x0, y0, dr, dc),
         return None
     );
     Some(stats)
 }
 
-/// CDEF-filters `lanes(isa)` samples of row `y` starting at column `x0`.
+/// CDEF-filters `count` consecutive samples of row `y` starting at column `x0`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn cdef_filter_row(
     isa: SimdIsa,
     data: &[u8],
-    stride: usize,
+    geom: filters::Geometry,
     x0: usize,
     y: usize,
+    count: usize,
     primary: &[filters::CdefTap],
     primary_strength: i32,
     secondary: &[filters::CdefTap],
@@ -511,9 +526,10 @@ pub(crate) fn cdef_filter_row(
         isa,
         [cdef_row_sse41, cdef_row_avx2, cdef_row_neon](
             data,
-            stride,
+            geom,
             x0,
             y,
+            count,
             primary,
             primary_strength,
             primary_adj,
@@ -527,33 +543,38 @@ pub(crate) fn cdef_filter_row(
     )
 }
 
-/// Wiener horizontal pass for `lanes(isa)` samples of row `y`.
+/// Wiener horizontal pass for `count` consecutive samples of row `y`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn wiener_horizontal_row(
     isa: SimdIsa,
     data: &[u8],
-    stride: usize,
+    geom: filters::Geometry,
     x0: usize,
     y: usize,
+    count: usize,
     taps: [i32; 3],
     center_tap: i32,
     out: &mut [i32],
 ) {
     dispatch!(
         isa,
-        [wiener_h_sse41, wiener_h_avx2, wiener_h_neon](data, stride, x0, y, taps, center_tap, out),
+        [wiener_h_sse41, wiener_h_avx2, wiener_h_neon](
+            data, geom, x0, y, count, taps, center_tap, out
+        ),
         ()
     )
 }
 
-/// Wiener vertical pass for `lanes(isa)` columns of `row`.
+/// Wiener vertical pass for `count` consecutive columns of `row`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn wiener_vertical_row(
     isa: SimdIsa,
     intermediate: &[i32],
     width: usize,
+    height: usize,
     row: usize,
     column: usize,
+    count: usize,
     taps: [i32; 3],
     center_tap: i32,
     dst: &mut [u8],
@@ -563,8 +584,10 @@ pub(crate) fn wiener_vertical_row(
         [wiener_v_sse41, wiener_v_avx2, wiener_v_neon](
             intermediate,
             width,
+            height,
             row,
             column,
+            count,
             taps,
             center_tap,
             dst
@@ -573,14 +596,15 @@ pub(crate) fn wiener_vertical_row(
     )
 }
 
-/// Self-guided box statistics for `lanes(isa)` samples of row `y`.
+/// Self-guided box statistics for `count` consecutive samples of row `y`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn box_stats_row(
     isa: SimdIsa,
     data: &[u8],
-    stride: usize,
+    geom: filters::Geometry,
     x0: usize,
     y: usize,
+    count: usize,
     radius: usize,
     sums: &mut [i32],
     sums_sq: &mut [i32],
@@ -588,7 +612,7 @@ pub(crate) fn box_stats_row(
     dispatch!(
         isa,
         [box_stats_sse41, box_stats_avx2, box_stats_neon](
-            data, stride, x0, y, radius, sums, sums_sq
+            data, geom, x0, y, count, radius, sums, sums_sq
         ),
         ()
     )
