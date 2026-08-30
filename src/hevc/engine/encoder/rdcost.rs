@@ -367,12 +367,10 @@ mod x86 {
     /// Horizontal sum of the four `i32` lanes.
     #[target_feature(enable = "sse4.1")]
     unsafe fn hsum_epi32(v: __m128i) -> u32 {
-        unsafe {
-            let hi = _mm_unpackhi_epi64(v, v);
-            let sum = _mm_add_epi32(v, hi);
-            let sum = _mm_add_epi32(sum, _mm_shuffle_epi32(sum, 0b01_01_01_01));
-            _mm_cvtsi128_si32(sum) as u32
-        }
+        let hi = _mm_unpackhi_epi64(v, v);
+        let sum = _mm_add_epi32(v, hi);
+        let sum = _mm_add_epi32(sum, _mm_shuffle_epi32(sum, 0b01_01_01_01));
+        _mm_cvtsi128_si32(sum) as u32
     }
 
     /// SSE4.1 SAD: 16 bytes per `_mm_sad_epu8`, plus a scalar tail for 4- and 8-wide blocks.
@@ -504,34 +502,32 @@ mod x86 {
     /// Transposes an 8x8 `i16` matrix held one row per 128-bit vector.
     #[target_feature(enable = "sse4.1")]
     unsafe fn transpose8_epi16(r: [__m128i; 8]) -> [__m128i; 8] {
-        unsafe {
-            let a0 = _mm_unpacklo_epi16(r[0], r[1]);
-            let a1 = _mm_unpacklo_epi16(r[2], r[3]);
-            let a2 = _mm_unpacklo_epi16(r[4], r[5]);
-            let a3 = _mm_unpacklo_epi16(r[6], r[7]);
-            let a4 = _mm_unpackhi_epi16(r[0], r[1]);
-            let a5 = _mm_unpackhi_epi16(r[2], r[3]);
-            let a6 = _mm_unpackhi_epi16(r[4], r[5]);
-            let a7 = _mm_unpackhi_epi16(r[6], r[7]);
-            let b0 = _mm_unpacklo_epi32(a0, a1);
-            let b1 = _mm_unpackhi_epi32(a0, a1);
-            let b2 = _mm_unpacklo_epi32(a2, a3);
-            let b3 = _mm_unpackhi_epi32(a2, a3);
-            let b4 = _mm_unpacklo_epi32(a4, a5);
-            let b5 = _mm_unpackhi_epi32(a4, a5);
-            let b6 = _mm_unpacklo_epi32(a6, a7);
-            let b7 = _mm_unpackhi_epi32(a6, a7);
-            [
-                _mm_unpacklo_epi64(b0, b2),
-                _mm_unpackhi_epi64(b0, b2),
-                _mm_unpacklo_epi64(b1, b3),
-                _mm_unpackhi_epi64(b1, b3),
-                _mm_unpacklo_epi64(b4, b6),
-                _mm_unpackhi_epi64(b4, b6),
-                _mm_unpacklo_epi64(b5, b7),
-                _mm_unpackhi_epi64(b5, b7),
-            ]
-        }
+        let a0 = _mm_unpacklo_epi16(r[0], r[1]);
+        let a1 = _mm_unpacklo_epi16(r[2], r[3]);
+        let a2 = _mm_unpacklo_epi16(r[4], r[5]);
+        let a3 = _mm_unpacklo_epi16(r[6], r[7]);
+        let a4 = _mm_unpackhi_epi16(r[0], r[1]);
+        let a5 = _mm_unpackhi_epi16(r[2], r[3]);
+        let a6 = _mm_unpackhi_epi16(r[4], r[5]);
+        let a7 = _mm_unpackhi_epi16(r[6], r[7]);
+        let b0 = _mm_unpacklo_epi32(a0, a1);
+        let b1 = _mm_unpackhi_epi32(a0, a1);
+        let b2 = _mm_unpacklo_epi32(a2, a3);
+        let b3 = _mm_unpackhi_epi32(a2, a3);
+        let b4 = _mm_unpacklo_epi32(a4, a5);
+        let b5 = _mm_unpackhi_epi32(a4, a5);
+        let b6 = _mm_unpacklo_epi32(a6, a7);
+        let b7 = _mm_unpackhi_epi32(a6, a7);
+        [
+            _mm_unpacklo_epi64(b0, b2),
+            _mm_unpackhi_epi64(b0, b2),
+            _mm_unpacklo_epi64(b1, b3),
+            _mm_unpackhi_epi64(b1, b3),
+            _mm_unpacklo_epi64(b4, b6),
+            _mm_unpackhi_epi64(b4, b6),
+            _mm_unpacklo_epi64(b5, b7),
+            _mm_unpackhi_epi64(b5, b7),
+        ]
     }
 
     /// SSE4.1 SATD over one 8x8 tile. Every intermediate fits in `i16`: a 2-D 8x8 Hadamard of

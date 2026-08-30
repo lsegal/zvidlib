@@ -28,6 +28,8 @@ jobs:
         run: cargo check --all-targets --features native
       - name: Lint native target
         run: cargo clippy --all-targets --features native -- -D warnings
+      - name: Test library units
+        run: cargo test --features native --lib
       - name: Test native_gl example overlays
         run: cargo test --features native --example native_gl
       - name: Check WebAssembly target
