@@ -370,22 +370,100 @@ pub fn get_ac_quant(qindex: u8) -> i32 {
 }
 
 /// A supported non-lossless transform type (AV1 spec §5.11.47 `TxType`,
-/// restricted to the entries this crate implements: `reduced_tx_set = 1`
-/// with `ADST_ADST` deliberately left unsupported, see the decoder's own
-/// module docs).
+/// restricted to the entries this crate implements: the identity transform
+/// plus every combination of the DCT, ADST, and flipped-ADST kernels).
+///
+/// The decoder only ever signals [`Av1TxType::DctDct`] and
+/// [`Av1TxType::Idtx`] today; the remaining entries are reachable through
+/// [`inverse_transform`] and are covered by the transform tests and
+/// benchmark.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Av1TxType {
     DctDct,
     Idtx,
+    AdstDct,
+    DctAdst,
+    AdstAdst,
+    FlipadstDct,
+    DctFlipadst,
+    FlipadstFlipadst,
+    AdstFlipadst,
+    FlipadstAdst,
 }
 
+/// One of the two separable 1-D kernels an [`Av1TxType`] applies.
+///
+/// The spec names each transform type after its vertical and horizontal
+/// kernels; `FLIPADST` is the ADST kernel plus a reversal of the finished
+/// block along that axis, so it is represented here as [`Tx1d::Adst`] with a
+/// flip flag rather than as a separate kernel.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Tx1d {
+    /// Inverse DCT. Defined for 4, 8, 16, and 32 points.
+    Dct,
+    /// Inverse ADST. Defined for 4, 8, and 16 points; a 32-point block always
+    /// uses the DCT.
+    Adst,
+}
+
+impl Av1TxType {
+    /// The vertical kernel, the horizontal kernel, and whether the finished
+    /// block is reversed left-to-right and/or top-to-bottom.
+    ///
+    /// [`Av1TxType::Idtx`] has no butterfly pass at all and reports the DCT
+    /// pair; [`inverse_transform`] handles it before consulting this.
+    #[must_use]
+    pub fn kernels(self) -> (Tx1d, Tx1d, bool, bool) {
+        use Tx1d::{Adst, Dct};
+        match self {
+            Av1TxType::DctDct | Av1TxType::Idtx => (Dct, Dct, false, false),
+            Av1TxType::AdstDct => (Adst, Dct, false, false),
+            Av1TxType::DctAdst => (Dct, Adst, false, false),
+            Av1TxType::AdstAdst => (Adst, Adst, false, false),
+            Av1TxType::FlipadstDct => (Adst, Dct, false, true),
+            Av1TxType::DctFlipadst => (Dct, Adst, true, false),
+            Av1TxType::FlipadstFlipadst => (Adst, Adst, true, true),
+            Av1TxType::AdstFlipadst => (Adst, Adst, true, false),
+            Av1TxType::FlipadstAdst => (Adst, Adst, false, true),
+        }
+    }
+}
+
+const COSPI_1_64: i64 = 16364;
+const COSPI_2_64: i64 = 16305;
+const COSPI_3_64: i64 = 16207;
 const COSPI_4_64: i64 = 16069;
+const COSPI_5_64: i64 = 15893;
+const COSPI_6_64: i64 = 15679;
+const COSPI_7_64: i64 = 15426;
 const COSPI_8_64: i64 = 15137;
+const COSPI_9_64: i64 = 14811;
+const COSPI_10_64: i64 = 14449;
+const COSPI_11_64: i64 = 14053;
 const COSPI_12_64: i64 = 13623;
+const COSPI_13_64: i64 = 13160;
+const COSPI_14_64: i64 = 12665;
+const COSPI_15_64: i64 = 12140;
 const COSPI_16_64: i64 = 11585;
+const COSPI_17_64: i64 = 11003;
+const COSPI_18_64: i64 = 10394;
+const COSPI_19_64: i64 = 9760;
 const COSPI_20_64: i64 = 9102;
+const COSPI_21_64: i64 = 8423;
+const COSPI_22_64: i64 = 7723;
+const COSPI_23_64: i64 = 7005;
 const COSPI_24_64: i64 = 6270;
+const COSPI_25_64: i64 = 5520;
+const COSPI_26_64: i64 = 4756;
+const COSPI_27_64: i64 = 3981;
 const COSPI_28_64: i64 = 3196;
+const COSPI_29_64: i64 = 2404;
+const COSPI_30_64: i64 = 1606;
+const COSPI_31_64: i64 = 804;
+const SINPI_1_9: i64 = 5283;
+const SINPI_2_9: i64 = 9929;
+const SINPI_3_9: i64 = 13377;
+const SINPI_4_9: i64 = 15212;
 
 fn dct_round_shift(value: i64) -> i64 {
     (value + (1 << 13)) >> 14
@@ -458,9 +536,775 @@ fn inverse_dct8_1d(input: [i64; 8]) -> [i64; 8] {
     ]
 }
 
+/// The AV1/VP9-lineage 16-point inverse DCT partial butterfly.
+fn inverse_dct16_1d(input: [i64; 16]) -> [i64; 16] {
+    let mut output = [0i64; 16];
+    // stage 1
+    let step1_0 = input[0];
+    let step1_1 = input[8];
+    let step1_2 = input[4];
+    let step1_3 = input[12];
+    let step1_4 = input[2];
+    let step1_5 = input[10];
+    let step1_6 = input[6];
+    let step1_7 = input[14];
+    let step1_8 = input[1];
+    let step1_9 = input[9];
+    let step1_10 = input[5];
+    let step1_11 = input[13];
+    let step1_12 = input[3];
+    let step1_13 = input[11];
+    let step1_14 = input[7];
+    let step1_15 = input[15];
+    // stage 2
+    let step2_0 = step1_0;
+    let step2_1 = step1_1;
+    let step2_2 = step1_2;
+    let step2_3 = step1_3;
+    let step2_4 = step1_4;
+    let step2_5 = step1_5;
+    let step2_6 = step1_6;
+    let step2_7 = step1_7;
+    let temp_1 = (step1_8 * COSPI_30_64) - (step1_15 * COSPI_2_64);
+    let temp_2 = (step1_8 * COSPI_2_64) + (step1_15 * COSPI_30_64);
+    let step2_8 = dct_round_shift(temp_1);
+    let step2_15 = dct_round_shift(temp_2);
+    let temp_1 = (step1_9 * COSPI_14_64) - (step1_14 * COSPI_18_64);
+    let temp_2 = (step1_9 * COSPI_18_64) + (step1_14 * COSPI_14_64);
+    let step2_9 = dct_round_shift(temp_1);
+    let step2_14 = dct_round_shift(temp_2);
+    let temp_1 = (step1_10 * COSPI_22_64) - (step1_13 * COSPI_10_64);
+    let temp_2 = (step1_10 * COSPI_10_64) + (step1_13 * COSPI_22_64);
+    let step2_10 = dct_round_shift(temp_1);
+    let step2_13 = dct_round_shift(temp_2);
+    let temp_1 = (step1_11 * COSPI_6_64) - (step1_12 * COSPI_26_64);
+    let temp_2 = (step1_11 * COSPI_26_64) + (step1_12 * COSPI_6_64);
+    let step2_11 = dct_round_shift(temp_1);
+    let step2_12 = dct_round_shift(temp_2);
+    // stage 3
+    let step1_0 = step2_0;
+    let step1_1 = step2_1;
+    let step1_2 = step2_2;
+    let step1_3 = step2_3;
+    let temp_1 = (step2_4 * COSPI_28_64) - (step2_7 * COSPI_4_64);
+    let temp_2 = (step2_4 * COSPI_4_64) + (step2_7 * COSPI_28_64);
+    let step1_4 = dct_round_shift(temp_1);
+    let step1_7 = dct_round_shift(temp_2);
+    let temp_1 = (step2_5 * COSPI_12_64) - (step2_6 * COSPI_20_64);
+    let temp_2 = (step2_5 * COSPI_20_64) + (step2_6 * COSPI_12_64);
+    let step1_5 = dct_round_shift(temp_1);
+    let step1_6 = dct_round_shift(temp_2);
+    let step1_8 = step2_8 + step2_9;
+    let step1_9 = step2_8 - step2_9;
+    let step1_10 = -step2_10 + step2_11;
+    let step1_11 = step2_10 + step2_11;
+    let step1_12 = step2_12 + step2_13;
+    let step1_13 = step2_12 - step2_13;
+    let step1_14 = -step2_14 + step2_15;
+    let step1_15 = step2_14 + step2_15;
+    // stage 4
+    let temp_1 = (step1_0 + step1_1) * COSPI_16_64;
+    let temp_2 = (step1_0 - step1_1) * COSPI_16_64;
+    let step2_0 = dct_round_shift(temp_1);
+    let step2_1 = dct_round_shift(temp_2);
+    let temp_1 = (step1_2 * COSPI_24_64) - (step1_3 * COSPI_8_64);
+    let temp_2 = (step1_2 * COSPI_8_64) + (step1_3 * COSPI_24_64);
+    let step2_2 = dct_round_shift(temp_1);
+    let step2_3 = dct_round_shift(temp_2);
+    let step2_4 = step1_4 + step1_5;
+    let step2_5 = step1_4 - step1_5;
+    let step2_6 = -step1_6 + step1_7;
+    let step2_7 = step1_6 + step1_7;
+    let step2_8 = step1_8;
+    let step2_15 = step1_15;
+    let temp_1 = (-step1_9 * COSPI_8_64) + (step1_14 * COSPI_24_64);
+    let temp_2 = (step1_9 * COSPI_24_64) + (step1_14 * COSPI_8_64);
+    let step2_9 = dct_round_shift(temp_1);
+    let step2_14 = dct_round_shift(temp_2);
+    let temp_1 = (-step1_10 * COSPI_24_64) - (step1_13 * COSPI_8_64);
+    let temp_2 = (-step1_10 * COSPI_8_64) + (step1_13 * COSPI_24_64);
+    let step2_10 = dct_round_shift(temp_1);
+    let step2_13 = dct_round_shift(temp_2);
+    let step2_11 = step1_11;
+    let step2_12 = step1_12;
+    // stage 5
+    let step1_0 = step2_0 + step2_3;
+    let step1_1 = step2_1 + step2_2;
+    let step1_2 = step2_1 - step2_2;
+    let step1_3 = step2_0 - step2_3;
+    let step1_4 = step2_4;
+    let temp_1 = (step2_6 - step2_5) * COSPI_16_64;
+    let temp_2 = (step2_5 + step2_6) * COSPI_16_64;
+    let step1_5 = dct_round_shift(temp_1);
+    let step1_6 = dct_round_shift(temp_2);
+    let step1_7 = step2_7;
+    let step1_8 = step2_8 + step2_11;
+    let step1_9 = step2_9 + step2_10;
+    let step1_10 = step2_9 - step2_10;
+    let step1_11 = step2_8 - step2_11;
+    let step1_12 = -step2_12 + step2_15;
+    let step1_13 = -step2_13 + step2_14;
+    let step1_14 = step2_13 + step2_14;
+    let step1_15 = step2_12 + step2_15;
+    // stage 6
+    let step2_0 = step1_0 + step1_7;
+    let step2_1 = step1_1 + step1_6;
+    let step2_2 = step1_2 + step1_5;
+    let step2_3 = step1_3 + step1_4;
+    let step2_4 = step1_3 - step1_4;
+    let step2_5 = step1_2 - step1_5;
+    let step2_6 = step1_1 - step1_6;
+    let step2_7 = step1_0 - step1_7;
+    let step2_8 = step1_8;
+    let step2_9 = step1_9;
+    let temp_1 = (-step1_10 + step1_13) * COSPI_16_64;
+    let temp_2 = (step1_10 + step1_13) * COSPI_16_64;
+    let step2_10 = dct_round_shift(temp_1);
+    let step2_13 = dct_round_shift(temp_2);
+    let temp_1 = (-step1_11 + step1_12) * COSPI_16_64;
+    let temp_2 = (step1_11 + step1_12) * COSPI_16_64;
+    let step2_11 = dct_round_shift(temp_1);
+    let step2_12 = dct_round_shift(temp_2);
+    let step2_14 = step1_14;
+    let step2_15 = step1_15;
+    // stage 7
+    output[0] = step2_0 + step2_15;
+    output[1] = step2_1 + step2_14;
+    output[2] = step2_2 + step2_13;
+    output[3] = step2_3 + step2_12;
+    output[4] = step2_4 + step2_11;
+    output[5] = step2_5 + step2_10;
+    output[6] = step2_6 + step2_9;
+    output[7] = step2_7 + step2_8;
+    output[8] = step2_7 - step2_8;
+    output[9] = step2_6 - step2_9;
+    output[10] = step2_5 - step2_10;
+    output[11] = step2_4 - step2_11;
+    output[12] = step2_3 - step2_12;
+    output[13] = step2_2 - step2_13;
+    output[14] = step2_1 - step2_14;
+    output[15] = step2_0 - step2_15;
+    output
+}
+
+/// The AV1/VP9-lineage 32-point inverse DCT partial butterfly.
+fn inverse_dct32_1d(input: [i64; 32]) -> [i64; 32] {
+    let mut output = [0i64; 32];
+    // stage 1
+    let step1_0 = input[0];
+    let step1_1 = input[16];
+    let step1_2 = input[8];
+    let step1_3 = input[24];
+    let step1_4 = input[4];
+    let step1_5 = input[20];
+    let step1_6 = input[12];
+    let step1_7 = input[28];
+    let step1_8 = input[2];
+    let step1_9 = input[18];
+    let step1_10 = input[10];
+    let step1_11 = input[26];
+    let step1_12 = input[6];
+    let step1_13 = input[22];
+    let step1_14 = input[14];
+    let step1_15 = input[30];
+    let temp_1 = (input[1] * COSPI_31_64) - (input[31] * COSPI_1_64);
+    let temp_2 = (input[1] * COSPI_1_64) + (input[31] * COSPI_31_64);
+    let step1_16 = dct_round_shift(temp_1);
+    let step1_31 = dct_round_shift(temp_2);
+    let temp_1 = (input[17] * COSPI_15_64) - (input[15] * COSPI_17_64);
+    let temp_2 = (input[17] * COSPI_17_64) + (input[15] * COSPI_15_64);
+    let step1_17 = dct_round_shift(temp_1);
+    let step1_30 = dct_round_shift(temp_2);
+    let temp_1 = (input[9] * COSPI_23_64) - (input[23] * COSPI_9_64);
+    let temp_2 = (input[9] * COSPI_9_64) + (input[23] * COSPI_23_64);
+    let step1_18 = dct_round_shift(temp_1);
+    let step1_29 = dct_round_shift(temp_2);
+    let temp_1 = (input[25] * COSPI_7_64) - (input[7] * COSPI_25_64);
+    let temp_2 = (input[25] * COSPI_25_64) + (input[7] * COSPI_7_64);
+    let step1_19 = dct_round_shift(temp_1);
+    let step1_28 = dct_round_shift(temp_2);
+    let temp_1 = (input[5] * COSPI_27_64) - (input[27] * COSPI_5_64);
+    let temp_2 = (input[5] * COSPI_5_64) + (input[27] * COSPI_27_64);
+    let step1_20 = dct_round_shift(temp_1);
+    let step1_27 = dct_round_shift(temp_2);
+    let temp_1 = (input[21] * COSPI_11_64) - (input[11] * COSPI_21_64);
+    let temp_2 = (input[21] * COSPI_21_64) + (input[11] * COSPI_11_64);
+    let step1_21 = dct_round_shift(temp_1);
+    let step1_26 = dct_round_shift(temp_2);
+    let temp_1 = (input[13] * COSPI_19_64) - (input[19] * COSPI_13_64);
+    let temp_2 = (input[13] * COSPI_13_64) + (input[19] * COSPI_19_64);
+    let step1_22 = dct_round_shift(temp_1);
+    let step1_25 = dct_round_shift(temp_2);
+    let temp_1 = (input[29] * COSPI_3_64) - (input[3] * COSPI_29_64);
+    let temp_2 = (input[29] * COSPI_29_64) + (input[3] * COSPI_3_64);
+    let step1_23 = dct_round_shift(temp_1);
+    let step1_24 = dct_round_shift(temp_2);
+    // stage 2
+    let step2_0 = step1_0;
+    let step2_1 = step1_1;
+    let step2_2 = step1_2;
+    let step2_3 = step1_3;
+    let step2_4 = step1_4;
+    let step2_5 = step1_5;
+    let step2_6 = step1_6;
+    let step2_7 = step1_7;
+    let temp_1 = (step1_8 * COSPI_30_64) - (step1_15 * COSPI_2_64);
+    let temp_2 = (step1_8 * COSPI_2_64) + (step1_15 * COSPI_30_64);
+    let step2_8 = dct_round_shift(temp_1);
+    let step2_15 = dct_round_shift(temp_2);
+    let temp_1 = (step1_9 * COSPI_14_64) - (step1_14 * COSPI_18_64);
+    let temp_2 = (step1_9 * COSPI_18_64) + (step1_14 * COSPI_14_64);
+    let step2_9 = dct_round_shift(temp_1);
+    let step2_14 = dct_round_shift(temp_2);
+    let temp_1 = (step1_10 * COSPI_22_64) - (step1_13 * COSPI_10_64);
+    let temp_2 = (step1_10 * COSPI_10_64) + (step1_13 * COSPI_22_64);
+    let step2_10 = dct_round_shift(temp_1);
+    let step2_13 = dct_round_shift(temp_2);
+    let temp_1 = (step1_11 * COSPI_6_64) - (step1_12 * COSPI_26_64);
+    let temp_2 = (step1_11 * COSPI_26_64) + (step1_12 * COSPI_6_64);
+    let step2_11 = dct_round_shift(temp_1);
+    let step2_12 = dct_round_shift(temp_2);
+    let step2_16 = step1_16 + step1_17;
+    let step2_17 = step1_16 - step1_17;
+    let step2_18 = -step1_18 + step1_19;
+    let step2_19 = step1_18 + step1_19;
+    let step2_20 = step1_20 + step1_21;
+    let step2_21 = step1_20 - step1_21;
+    let step2_22 = -step1_22 + step1_23;
+    let step2_23 = step1_22 + step1_23;
+    let step2_24 = step1_24 + step1_25;
+    let step2_25 = step1_24 - step1_25;
+    let step2_26 = -step1_26 + step1_27;
+    let step2_27 = step1_26 + step1_27;
+    let step2_28 = step1_28 + step1_29;
+    let step2_29 = step1_28 - step1_29;
+    let step2_30 = -step1_30 + step1_31;
+    let step2_31 = step1_30 + step1_31;
+    // stage 3
+    let step1_0 = step2_0;
+    let step1_1 = step2_1;
+    let step1_2 = step2_2;
+    let step1_3 = step2_3;
+    let temp_1 = (step2_4 * COSPI_28_64) - (step2_7 * COSPI_4_64);
+    let temp_2 = (step2_4 * COSPI_4_64) + (step2_7 * COSPI_28_64);
+    let step1_4 = dct_round_shift(temp_1);
+    let step1_7 = dct_round_shift(temp_2);
+    let temp_1 = (step2_5 * COSPI_12_64) - (step2_6 * COSPI_20_64);
+    let temp_2 = (step2_5 * COSPI_20_64) + (step2_6 * COSPI_12_64);
+    let step1_5 = dct_round_shift(temp_1);
+    let step1_6 = dct_round_shift(temp_2);
+    let step1_8 = step2_8 + step2_9;
+    let step1_9 = step2_8 - step2_9;
+    let step1_10 = -step2_10 + step2_11;
+    let step1_11 = step2_10 + step2_11;
+    let step1_12 = step2_12 + step2_13;
+    let step1_13 = step2_12 - step2_13;
+    let step1_14 = -step2_14 + step2_15;
+    let step1_15 = step2_14 + step2_15;
+    let step1_16 = step2_16;
+    let step1_31 = step2_31;
+    let temp_1 = (-step2_17 * COSPI_4_64) + (step2_30 * COSPI_28_64);
+    let temp_2 = (step2_17 * COSPI_28_64) + (step2_30 * COSPI_4_64);
+    let step1_17 = dct_round_shift(temp_1);
+    let step1_30 = dct_round_shift(temp_2);
+    let temp_1 = (-step2_18 * COSPI_28_64) - (step2_29 * COSPI_4_64);
+    let temp_2 = (-step2_18 * COSPI_4_64) + (step2_29 * COSPI_28_64);
+    let step1_18 = dct_round_shift(temp_1);
+    let step1_29 = dct_round_shift(temp_2);
+    let step1_19 = step2_19;
+    let step1_20 = step2_20;
+    let temp_1 = (-step2_21 * COSPI_20_64) + (step2_26 * COSPI_12_64);
+    let temp_2 = (step2_21 * COSPI_12_64) + (step2_26 * COSPI_20_64);
+    let step1_21 = dct_round_shift(temp_1);
+    let step1_26 = dct_round_shift(temp_2);
+    let temp_1 = (-step2_22 * COSPI_12_64) - (step2_25 * COSPI_20_64);
+    let temp_2 = (-step2_22 * COSPI_20_64) + (step2_25 * COSPI_12_64);
+    let step1_22 = dct_round_shift(temp_1);
+    let step1_25 = dct_round_shift(temp_2);
+    let step1_23 = step2_23;
+    let step1_24 = step2_24;
+    let step1_27 = step2_27;
+    let step1_28 = step2_28;
+    // stage 4
+    let temp_1 = (step1_0 + step1_1) * COSPI_16_64;
+    let temp_2 = (step1_0 - step1_1) * COSPI_16_64;
+    let step2_0 = dct_round_shift(temp_1);
+    let step2_1 = dct_round_shift(temp_2);
+    let temp_1 = (step1_2 * COSPI_24_64) - (step1_3 * COSPI_8_64);
+    let temp_2 = (step1_2 * COSPI_8_64) + (step1_3 * COSPI_24_64);
+    let step2_2 = dct_round_shift(temp_1);
+    let step2_3 = dct_round_shift(temp_2);
+    let step2_4 = step1_4 + step1_5;
+    let step2_5 = step1_4 - step1_5;
+    let step2_6 = -step1_6 + step1_7;
+    let step2_7 = step1_6 + step1_7;
+    let step2_8 = step1_8;
+    let step2_15 = step1_15;
+    let temp_1 = (-step1_9 * COSPI_8_64) + (step1_14 * COSPI_24_64);
+    let temp_2 = (step1_9 * COSPI_24_64) + (step1_14 * COSPI_8_64);
+    let step2_9 = dct_round_shift(temp_1);
+    let step2_14 = dct_round_shift(temp_2);
+    let temp_1 = (-step1_10 * COSPI_24_64) - (step1_13 * COSPI_8_64);
+    let temp_2 = (-step1_10 * COSPI_8_64) + (step1_13 * COSPI_24_64);
+    let step2_10 = dct_round_shift(temp_1);
+    let step2_13 = dct_round_shift(temp_2);
+    let step2_11 = step1_11;
+    let step2_12 = step1_12;
+    let step2_16 = step1_16 + step1_19;
+    let step2_17 = step1_17 + step1_18;
+    let step2_18 = step1_17 - step1_18;
+    let step2_19 = step1_16 - step1_19;
+    let step2_20 = -step1_20 + step1_23;
+    let step2_21 = -step1_21 + step1_22;
+    let step2_22 = step1_21 + step1_22;
+    let step2_23 = step1_20 + step1_23;
+    let step2_24 = step1_24 + step1_27;
+    let step2_25 = step1_25 + step1_26;
+    let step2_26 = step1_25 - step1_26;
+    let step2_27 = step1_24 - step1_27;
+    let step2_28 = -step1_28 + step1_31;
+    let step2_29 = -step1_29 + step1_30;
+    let step2_30 = step1_29 + step1_30;
+    let step2_31 = step1_28 + step1_31;
+    // stage 5
+    let step1_0 = step2_0 + step2_3;
+    let step1_1 = step2_1 + step2_2;
+    let step1_2 = step2_1 - step2_2;
+    let step1_3 = step2_0 - step2_3;
+    let step1_4 = step2_4;
+    let temp_1 = (step2_6 - step2_5) * COSPI_16_64;
+    let temp_2 = (step2_5 + step2_6) * COSPI_16_64;
+    let step1_5 = dct_round_shift(temp_1);
+    let step1_6 = dct_round_shift(temp_2);
+    let step1_7 = step2_7;
+    let step1_8 = step2_8 + step2_11;
+    let step1_9 = step2_9 + step2_10;
+    let step1_10 = step2_9 - step2_10;
+    let step1_11 = step2_8 - step2_11;
+    let step1_12 = -step2_12 + step2_15;
+    let step1_13 = -step2_13 + step2_14;
+    let step1_14 = step2_13 + step2_14;
+    let step1_15 = step2_12 + step2_15;
+    let step1_16 = step2_16;
+    let step1_17 = step2_17;
+    let temp_1 = (-step2_18 * COSPI_8_64) + (step2_29 * COSPI_24_64);
+    let temp_2 = (step2_18 * COSPI_24_64) + (step2_29 * COSPI_8_64);
+    let step1_18 = dct_round_shift(temp_1);
+    let step1_29 = dct_round_shift(temp_2);
+    let temp_1 = (-step2_19 * COSPI_8_64) + (step2_28 * COSPI_24_64);
+    let temp_2 = (step2_19 * COSPI_24_64) + (step2_28 * COSPI_8_64);
+    let step1_19 = dct_round_shift(temp_1);
+    let step1_28 = dct_round_shift(temp_2);
+    let temp_1 = (-step2_20 * COSPI_24_64) - (step2_27 * COSPI_8_64);
+    let temp_2 = (-step2_20 * COSPI_8_64) + (step2_27 * COSPI_24_64);
+    let step1_20 = dct_round_shift(temp_1);
+    let step1_27 = dct_round_shift(temp_2);
+    let temp_1 = (-step2_21 * COSPI_24_64) - (step2_26 * COSPI_8_64);
+    let temp_2 = (-step2_21 * COSPI_8_64) + (step2_26 * COSPI_24_64);
+    let step1_21 = dct_round_shift(temp_1);
+    let step1_26 = dct_round_shift(temp_2);
+    let step1_22 = step2_22;
+    let step1_23 = step2_23;
+    let step1_24 = step2_24;
+    let step1_25 = step2_25;
+    let step1_30 = step2_30;
+    let step1_31 = step2_31;
+    // stage 6
+    let step2_0 = step1_0 + step1_7;
+    let step2_1 = step1_1 + step1_6;
+    let step2_2 = step1_2 + step1_5;
+    let step2_3 = step1_3 + step1_4;
+    let step2_4 = step1_3 - step1_4;
+    let step2_5 = step1_2 - step1_5;
+    let step2_6 = step1_1 - step1_6;
+    let step2_7 = step1_0 - step1_7;
+    let step2_8 = step1_8;
+    let step2_9 = step1_9;
+    let temp_1 = (-step1_10 + step1_13) * COSPI_16_64;
+    let temp_2 = (step1_10 + step1_13) * COSPI_16_64;
+    let step2_10 = dct_round_shift(temp_1);
+    let step2_13 = dct_round_shift(temp_2);
+    let temp_1 = (-step1_11 + step1_12) * COSPI_16_64;
+    let temp_2 = (step1_11 + step1_12) * COSPI_16_64;
+    let step2_11 = dct_round_shift(temp_1);
+    let step2_12 = dct_round_shift(temp_2);
+    let step2_14 = step1_14;
+    let step2_15 = step1_15;
+    let step2_16 = step1_16 + step1_23;
+    let step2_17 = step1_17 + step1_22;
+    let step2_18 = step1_18 + step1_21;
+    let step2_19 = step1_19 + step1_20;
+    let step2_20 = step1_19 - step1_20;
+    let step2_21 = step1_18 - step1_21;
+    let step2_22 = step1_17 - step1_22;
+    let step2_23 = step1_16 - step1_23;
+    let step2_24 = -step1_24 + step1_31;
+    let step2_25 = -step1_25 + step1_30;
+    let step2_26 = -step1_26 + step1_29;
+    let step2_27 = -step1_27 + step1_28;
+    let step2_28 = step1_27 + step1_28;
+    let step2_29 = step1_26 + step1_29;
+    let step2_30 = step1_25 + step1_30;
+    let step2_31 = step1_24 + step1_31;
+    // stage 7
+    let step1_0 = step2_0 + step2_15;
+    let step1_1 = step2_1 + step2_14;
+    let step1_2 = step2_2 + step2_13;
+    let step1_3 = step2_3 + step2_12;
+    let step1_4 = step2_4 + step2_11;
+    let step1_5 = step2_5 + step2_10;
+    let step1_6 = step2_6 + step2_9;
+    let step1_7 = step2_7 + step2_8;
+    let step1_8 = step2_7 - step2_8;
+    let step1_9 = step2_6 - step2_9;
+    let step1_10 = step2_5 - step2_10;
+    let step1_11 = step2_4 - step2_11;
+    let step1_12 = step2_3 - step2_12;
+    let step1_13 = step2_2 - step2_13;
+    let step1_14 = step2_1 - step2_14;
+    let step1_15 = step2_0 - step2_15;
+    let step1_16 = step2_16;
+    let step1_17 = step2_17;
+    let step1_18 = step2_18;
+    let step1_19 = step2_19;
+    let temp_1 = (-step2_20 + step2_27) * COSPI_16_64;
+    let temp_2 = (step2_20 + step2_27) * COSPI_16_64;
+    let step1_20 = dct_round_shift(temp_1);
+    let step1_27 = dct_round_shift(temp_2);
+    let temp_1 = (-step2_21 + step2_26) * COSPI_16_64;
+    let temp_2 = (step2_21 + step2_26) * COSPI_16_64;
+    let step1_21 = dct_round_shift(temp_1);
+    let step1_26 = dct_round_shift(temp_2);
+    let temp_1 = (-step2_22 + step2_25) * COSPI_16_64;
+    let temp_2 = (step2_22 + step2_25) * COSPI_16_64;
+    let step1_22 = dct_round_shift(temp_1);
+    let step1_25 = dct_round_shift(temp_2);
+    let temp_1 = (-step2_23 + step2_24) * COSPI_16_64;
+    let temp_2 = (step2_23 + step2_24) * COSPI_16_64;
+    let step1_23 = dct_round_shift(temp_1);
+    let step1_24 = dct_round_shift(temp_2);
+    let step1_28 = step2_28;
+    let step1_29 = step2_29;
+    let step1_30 = step2_30;
+    let step1_31 = step2_31;
+    // final stage
+    output[0] = step1_0 + step1_31;
+    output[1] = step1_1 + step1_30;
+    output[2] = step1_2 + step1_29;
+    output[3] = step1_3 + step1_28;
+    output[4] = step1_4 + step1_27;
+    output[5] = step1_5 + step1_26;
+    output[6] = step1_6 + step1_25;
+    output[7] = step1_7 + step1_24;
+    output[8] = step1_8 + step1_23;
+    output[9] = step1_9 + step1_22;
+    output[10] = step1_10 + step1_21;
+    output[11] = step1_11 + step1_20;
+    output[12] = step1_12 + step1_19;
+    output[13] = step1_13 + step1_18;
+    output[14] = step1_14 + step1_17;
+    output[15] = step1_15 + step1_16;
+    output[16] = step1_15 - step1_16;
+    output[17] = step1_14 - step1_17;
+    output[18] = step1_13 - step1_18;
+    output[19] = step1_12 - step1_19;
+    output[20] = step1_11 - step1_20;
+    output[21] = step1_10 - step1_21;
+    output[22] = step1_9 - step1_22;
+    output[23] = step1_8 - step1_23;
+    output[24] = step1_7 - step1_24;
+    output[25] = step1_6 - step1_25;
+    output[26] = step1_5 - step1_26;
+    output[27] = step1_4 - step1_27;
+    output[28] = step1_3 - step1_28;
+    output[29] = step1_2 - step1_29;
+    output[30] = step1_1 - step1_30;
+    output[31] = step1_0 - step1_31;
+    output
+}
+
+/// The AV1/VP9-lineage 4-point inverse ADST partial butterfly.
+fn inverse_adst4_1d(input: [i64; 4]) -> [i64; 4] {
+    let mut output = [0i64; 4];
+    let x0 = input[0];
+    let x1 = input[1];
+    let x2 = input[2];
+    let x3 = input[3];
+    // 32-bit result is enough for the following multiplications.
+    let s0 = SINPI_1_9 * x0;
+    let s1 = SINPI_2_9 * x0;
+    let s2 = SINPI_3_9 * x1;
+    let s3 = SINPI_4_9 * x2;
+    let s4 = SINPI_1_9 * x2;
+    let s5 = SINPI_2_9 * x3;
+    let s6 = SINPI_4_9 * x3;
+    let s7 = (x0 - x2) + x3;
+    let s0 = (s0 + s3) + s5;
+    let s1 = (s1 - s4) - s6;
+    let s3 = s2;
+    let s2 = SINPI_3_9 * s7;
+    // 1-D transform scaling factor is sqrt(2).
+    // The overall dynamic range is 14b (input) + 14b (multiplication scaling)
+    // + 1b (addition) = 29b.
+    // Hence the output bit depth is 15b.
+    output[0] = dct_round_shift(s0 + s3);
+    output[1] = dct_round_shift(s1 + s3);
+    output[2] = dct_round_shift(s2);
+    output[3] = dct_round_shift((s0 + s1) - s3);
+    output
+}
+
+/// The AV1/VP9-lineage 8-point inverse ADST partial butterfly.
+fn inverse_adst8_1d(input: [i64; 8]) -> [i64; 8] {
+    let mut output = [0i64; 8];
+    let x0 = input[7];
+    let x1 = input[0];
+    let x2 = input[5];
+    let x3 = input[2];
+    let x4 = input[3];
+    let x5 = input[4];
+    let x6 = input[1];
+    let x7 = input[6];
+    // stage 1
+    let s0 = (COSPI_2_64 * x0) + (COSPI_30_64 * x1);
+    let s1 = (COSPI_30_64 * x0) - (COSPI_2_64 * x1);
+    let s2 = (COSPI_10_64 * x2) + (COSPI_22_64 * x3);
+    let s3 = (COSPI_22_64 * x2) - (COSPI_10_64 * x3);
+    let s4 = (COSPI_18_64 * x4) + (COSPI_14_64 * x5);
+    let s5 = (COSPI_14_64 * x4) - (COSPI_18_64 * x5);
+    let s6 = (COSPI_26_64 * x6) + (COSPI_6_64 * x7);
+    let s7 = (COSPI_6_64 * x6) - (COSPI_26_64 * x7);
+    let x0 = dct_round_shift(s0 + s4);
+    let x1 = dct_round_shift(s1 + s5);
+    let x2 = dct_round_shift(s2 + s6);
+    let x3 = dct_round_shift(s3 + s7);
+    let x4 = dct_round_shift(s0 - s4);
+    let x5 = dct_round_shift(s1 - s5);
+    let x6 = dct_round_shift(s2 - s6);
+    let x7 = dct_round_shift(s3 - s7);
+    // stage 2
+    let s0 = x0;
+    let s1 = x1;
+    let s2 = x2;
+    let s3 = x3;
+    let s4 = (COSPI_8_64 * x4) + (COSPI_24_64 * x5);
+    let s5 = (COSPI_24_64 * x4) - (COSPI_8_64 * x5);
+    let s6 = (-COSPI_24_64 * x6) + (COSPI_8_64 * x7);
+    let s7 = (COSPI_8_64 * x6) + (COSPI_24_64 * x7);
+    let x0 = s0 + s2;
+    let x1 = s1 + s3;
+    let x2 = s0 - s2;
+    let x3 = s1 - s3;
+    let x4 = dct_round_shift(s4 + s6);
+    let x5 = dct_round_shift(s5 + s7);
+    let x6 = dct_round_shift(s4 - s6);
+    let x7 = dct_round_shift(s5 - s7);
+    // stage 3
+    let s2 = COSPI_16_64 * (x2 + x3);
+    let s3 = COSPI_16_64 * (x2 - x3);
+    let s6 = COSPI_16_64 * (x6 + x7);
+    let s7 = COSPI_16_64 * (x6 - x7);
+    let x2 = dct_round_shift(s2);
+    let x3 = dct_round_shift(s3);
+    let x6 = dct_round_shift(s6);
+    let x7 = dct_round_shift(s7);
+    output[0] = x0;
+    output[1] = -x4;
+    output[2] = x6;
+    output[3] = -x2;
+    output[4] = x3;
+    output[5] = -x7;
+    output[6] = x5;
+    output[7] = -x1;
+    output
+}
+
+/// The AV1/VP9-lineage 16-point inverse ADST partial butterfly.
+fn inverse_adst16_1d(input: [i64; 16]) -> [i64; 16] {
+    let mut output = [0i64; 16];
+    let x0 = input[15];
+    let x1 = input[0];
+    let x2 = input[13];
+    let x3 = input[2];
+    let x4 = input[11];
+    let x5 = input[4];
+    let x6 = input[9];
+    let x7 = input[6];
+    let x8 = input[7];
+    let x9 = input[8];
+    let x10 = input[5];
+    let x11 = input[10];
+    let x12 = input[3];
+    let x13 = input[12];
+    let x14 = input[1];
+    let x15 = input[14];
+    // stage 1
+    let s0 = (x0 * COSPI_1_64) + (x1 * COSPI_31_64);
+    let s1 = (x0 * COSPI_31_64) - (x1 * COSPI_1_64);
+    let s2 = (x2 * COSPI_5_64) + (x3 * COSPI_27_64);
+    let s3 = (x2 * COSPI_27_64) - (x3 * COSPI_5_64);
+    let s4 = (x4 * COSPI_9_64) + (x5 * COSPI_23_64);
+    let s5 = (x4 * COSPI_23_64) - (x5 * COSPI_9_64);
+    let s6 = (x6 * COSPI_13_64) + (x7 * COSPI_19_64);
+    let s7 = (x6 * COSPI_19_64) - (x7 * COSPI_13_64);
+    let s8 = (x8 * COSPI_17_64) + (x9 * COSPI_15_64);
+    let s9 = (x8 * COSPI_15_64) - (x9 * COSPI_17_64);
+    let s10 = (x10 * COSPI_21_64) + (x11 * COSPI_11_64);
+    let s11 = (x10 * COSPI_11_64) - (x11 * COSPI_21_64);
+    let s12 = (x12 * COSPI_25_64) + (x13 * COSPI_7_64);
+    let s13 = (x12 * COSPI_7_64) - (x13 * COSPI_25_64);
+    let s14 = (x14 * COSPI_29_64) + (x15 * COSPI_3_64);
+    let s15 = (x14 * COSPI_3_64) - (x15 * COSPI_29_64);
+    let x0 = dct_round_shift(s0 + s8);
+    let x1 = dct_round_shift(s1 + s9);
+    let x2 = dct_round_shift(s2 + s10);
+    let x3 = dct_round_shift(s3 + s11);
+    let x4 = dct_round_shift(s4 + s12);
+    let x5 = dct_round_shift(s5 + s13);
+    let x6 = dct_round_shift(s6 + s14);
+    let x7 = dct_round_shift(s7 + s15);
+    let x8 = dct_round_shift(s0 - s8);
+    let x9 = dct_round_shift(s1 - s9);
+    let x10 = dct_round_shift(s2 - s10);
+    let x11 = dct_round_shift(s3 - s11);
+    let x12 = dct_round_shift(s4 - s12);
+    let x13 = dct_round_shift(s5 - s13);
+    let x14 = dct_round_shift(s6 - s14);
+    let x15 = dct_round_shift(s7 - s15);
+    // stage 2
+    let s0 = x0;
+    let s1 = x1;
+    let s2 = x2;
+    let s3 = x3;
+    let s4 = x4;
+    let s5 = x5;
+    let s6 = x6;
+    let s7 = x7;
+    let s8 = (x8 * COSPI_4_64) + (x9 * COSPI_28_64);
+    let s9 = (x8 * COSPI_28_64) - (x9 * COSPI_4_64);
+    let s10 = (x10 * COSPI_20_64) + (x11 * COSPI_12_64);
+    let s11 = (x10 * COSPI_12_64) - (x11 * COSPI_20_64);
+    let s12 = (-x12 * COSPI_28_64) + (x13 * COSPI_4_64);
+    let s13 = (x12 * COSPI_4_64) + (x13 * COSPI_28_64);
+    let s14 = (-x14 * COSPI_12_64) + (x15 * COSPI_20_64);
+    let s15 = (x14 * COSPI_20_64) + (x15 * COSPI_12_64);
+    let x0 = s0 + s4;
+    let x1 = s1 + s5;
+    let x2 = s2 + s6;
+    let x3 = s3 + s7;
+    let x4 = s0 - s4;
+    let x5 = s1 - s5;
+    let x6 = s2 - s6;
+    let x7 = s3 - s7;
+    let x8 = dct_round_shift(s8 + s12);
+    let x9 = dct_round_shift(s9 + s13);
+    let x10 = dct_round_shift(s10 + s14);
+    let x11 = dct_round_shift(s11 + s15);
+    let x12 = dct_round_shift(s8 - s12);
+    let x13 = dct_round_shift(s9 - s13);
+    let x14 = dct_round_shift(s10 - s14);
+    let x15 = dct_round_shift(s11 - s15);
+    // stage 3
+    let s0 = x0;
+    let s1 = x1;
+    let s2 = x2;
+    let s3 = x3;
+    let s4 = (x4 * COSPI_8_64) + (x5 * COSPI_24_64);
+    let s5 = (x4 * COSPI_24_64) - (x5 * COSPI_8_64);
+    let s6 = (-x6 * COSPI_24_64) + (x7 * COSPI_8_64);
+    let s7 = (x6 * COSPI_8_64) + (x7 * COSPI_24_64);
+    let s8 = x8;
+    let s9 = x9;
+    let s10 = x10;
+    let s11 = x11;
+    let s12 = (x12 * COSPI_8_64) + (x13 * COSPI_24_64);
+    let s13 = (x12 * COSPI_24_64) - (x13 * COSPI_8_64);
+    let s14 = (-x14 * COSPI_24_64) + (x15 * COSPI_8_64);
+    let s15 = (x14 * COSPI_8_64) + (x15 * COSPI_24_64);
+    let x0 = s0 + s2;
+    let x1 = s1 + s3;
+    let x2 = s0 - s2;
+    let x3 = s1 - s3;
+    let x4 = dct_round_shift(s4 + s6);
+    let x5 = dct_round_shift(s5 + s7);
+    let x6 = dct_round_shift(s4 - s6);
+    let x7 = dct_round_shift(s5 - s7);
+    let x8 = s8 + s10;
+    let x9 = s9 + s11;
+    let x10 = s8 - s10;
+    let x11 = s9 - s11;
+    let x12 = dct_round_shift(s12 + s14);
+    let x13 = dct_round_shift(s13 + s15);
+    let x14 = dct_round_shift(s12 - s14);
+    let x15 = dct_round_shift(s13 - s15);
+    // stage 4
+    let s2 = -COSPI_16_64 * (x2 + x3);
+    let s3 = COSPI_16_64 * (x2 - x3);
+    let s6 = COSPI_16_64 * (x6 + x7);
+    let s7 = COSPI_16_64 * (-x6 + x7);
+    let s10 = COSPI_16_64 * (x10 + x11);
+    let s11 = COSPI_16_64 * (-x10 + x11);
+    let s14 = -COSPI_16_64 * (x14 + x15);
+    let s15 = COSPI_16_64 * (x14 - x15);
+    let x2 = dct_round_shift(s2);
+    let x3 = dct_round_shift(s3);
+    let x6 = dct_round_shift(s6);
+    let x7 = dct_round_shift(s7);
+    let x10 = dct_round_shift(s10);
+    let x11 = dct_round_shift(s11);
+    let x14 = dct_round_shift(s14);
+    let x15 = dct_round_shift(s15);
+    output[0] = x0;
+    output[1] = -x8;
+    output[2] = x12;
+    output[3] = -x4;
+    output[4] = x6;
+    output[5] = x14;
+    output[6] = x10;
+    output[7] = x2;
+    output[8] = x3;
+    output[9] = x11;
+    output[10] = x15;
+    output[11] = x7;
+    output[12] = x5;
+    output[13] = -x13;
+    output[14] = x9;
+    output[15] = -x1;
+    output
+}
+
+/// One separable 1-D pass. Falls back to the identity for a size the AV1
+/// transform set does not define, which [`inverse_transform`] rejects first.
+fn inverse_transform_1d(kind: Tx1d, values: &[i64]) -> Vec<i64> {
+    match (kind, values.len()) {
+        (Tx1d::Dct, 4) => inverse_dct4_1d(values.try_into().unwrap()).to_vec(),
+        (Tx1d::Dct, 8) => inverse_dct8_1d(values.try_into().unwrap()).to_vec(),
+        (Tx1d::Dct, 16) => inverse_dct16_1d(values.try_into().unwrap()).to_vec(),
+        (Tx1d::Dct, 32) => inverse_dct32_1d(values.try_into().unwrap()).to_vec(),
+        (Tx1d::Adst, 4) => inverse_adst4_1d(values.try_into().unwrap()).to_vec(),
+        (Tx1d::Adst, 8) => inverse_adst8_1d(values.try_into().unwrap()).to_vec(),
+        (Tx1d::Adst, 16) => inverse_adst16_1d(values.try_into().unwrap()).to_vec(),
+        _ => values.to_vec(),
+    }
+}
+
+/// Downshift applied to the column pass output for a `size x size` block.
+pub(crate) fn transform_shift(size: usize) -> u32 {
+    match size {
+        4 => 4,
+        8 => 5,
+        _ => 6,
+    }
+}
+
 /// Dequantizes and applies the non-lossless inverse transform (spec
-/// §7.12.3, §7.13) for one `size x size` (4 or 8) transform block,
-/// returning row-major residual samples.
+/// §7.12.3, §7.13) for one `size x size` transform block, returning
+/// row-major residual samples.
+///
+/// `size` must be 4, 8, 16, or 32. The ADST kernels are only defined for 4,
+/// 8, and 16 points, so a 32-point block runs the DCT along both axes
+/// regardless of `tx_type`. An unsupported `size` leaves the dequantized
+/// coefficients untransformed rather than panicking.
 pub fn inverse_transform(
     coefficients: &[i32],
     size: usize,
@@ -469,63 +1313,78 @@ pub fn inverse_transform(
     ac_quant: i32,
 ) -> Vec<i16> {
     debug_assert_eq!(coefficients.len(), size * size);
+    debug_assert!(matches!(size, 4 | 8 | 16 | 32));
     let mut dequantized = vec![0i64; size * size];
     for (index, value) in dequantized.iter_mut().enumerate() {
         let quant = if index == 0 { dc_quant } else { ac_quant };
         *value = i64::from(coefficients[index]) * i64::from(quant);
     }
-    match tx_type {
-        Av1TxType::Idtx => dequantized
+    if tx_type == Av1TxType::Idtx {
+        // The 2-D identity is the one type with no butterfly pass and no
+        // output downshift, so it keeps its own short path.
+        return dequantized
             .into_iter()
             .map(|value| value.clamp(i64::from(i16::MIN), i64::from(i16::MAX)) as i16)
-            .collect(),
-        Av1TxType::DctDct => {
-            // The vectorized kernels work in 32-bit lanes and decline blocks
-            // whose magnitudes could overflow one, so a coefficient the guard
-            // rejects simply falls through to the scalar butterflies below.
-            let narrow: Option<Vec<i32>> = dequantized
-                .iter()
-                .map(|&value| i32::try_from(value).ok())
-                .collect();
-            if let Some(values) = narrow {
-                let mut output = vec![0i16; size * size];
-                if crate::av1_simd::inverse_dct(
-                    crate::av1_simd::active_isa(),
-                    &values,
-                    size,
-                    &mut output,
-                ) {
-                    return output;
-                }
-            }
-            let mut rows = vec![0i64; size * size];
-            for row in 0..size {
-                let start = row * size;
-                let transformed = if size == 4 {
-                    inverse_dct4_1d(dequantized[start..start + 4].try_into().unwrap()).to_vec()
-                } else {
-                    inverse_dct8_1d(dequantized[start..start + 8].try_into().unwrap()).to_vec()
-                };
-                rows[start..start + size].copy_from_slice(&transformed);
-            }
-            let mut output = vec![0i16; size * size];
-            for column in 0..size {
-                let values: Vec<i64> = (0..size).map(|row| rows[row * size + column]).collect();
-                let transformed = if size == 4 {
-                    inverse_dct4_1d(values.try_into().unwrap()).to_vec()
-                } else {
-                    inverse_dct8_1d(values.try_into().unwrap()).to_vec()
-                };
-                let shift = if size == 4 { 4 } else { 5 };
-                for (row, value) in transformed.into_iter().enumerate() {
-                    let rounded = (value + (1 << (shift - 1))) >> shift;
-                    output[row * size + column] =
-                        rounded.clamp(i64::from(i16::MIN), i64::from(i16::MAX)) as i16;
-                }
-            }
-            output
+            .collect();
+    }
+
+    let (mut column, mut row, lr_flip, ud_flip) = tx_type.kernels();
+    if size == 32 {
+        column = Tx1d::Dct;
+        row = Tx1d::Dct;
+    }
+
+    // The vectorized kernels work in 32-bit lanes and decline blocks whose
+    // magnitudes could overflow one, so a coefficient the guard rejects
+    // simply falls through to the scalar butterflies below.
+    let narrow: Option<Vec<i32>> = dequantized
+        .iter()
+        .map(|&value| i32::try_from(value).ok())
+        .collect();
+    if let Some(values) = narrow {
+        let mut output = vec![0i16; size * size];
+        if crate::av1_simd::inverse_transform(
+            crate::av1_simd::active_isa(),
+            &values,
+            size,
+            column,
+            row,
+            lr_flip,
+            ud_flip,
+            &mut output,
+        ) {
+            return output;
         }
     }
+
+    let mut rows = vec![0i64; size * size];
+    for index in 0..size {
+        let start = index * size;
+        let transformed = inverse_transform_1d(row, &dequantized[start..start + size]);
+        rows[start..start + size].copy_from_slice(&transformed);
+    }
+    let shift = transform_shift(size);
+    let mut output = vec![0i16; size * size];
+    for column_index in 0..size {
+        let values: Vec<i64> = (0..size).map(|r| rows[r * size + column_index]).collect();
+        let transformed = inverse_transform_1d(column, &values);
+        let target_column = if lr_flip {
+            size - 1 - column_index
+        } else {
+            column_index
+        };
+        for (row_index, value) in transformed.into_iter().enumerate() {
+            let rounded = (value + (1 << (shift - 1))) >> shift;
+            let target_row = if ud_flip {
+                size - 1 - row_index
+            } else {
+                row_index
+            };
+            output[target_row * size + target_column] =
+                rounded.clamp(i64::from(i16::MIN), i64::from(i16::MAX)) as i16;
+        }
+    }
+    output
 }
 
 fn malformed(message: &str) -> Error {
