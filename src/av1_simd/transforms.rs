@@ -322,8 +322,14 @@ unsafe fn dct8_pass<V: I32x>(block: [[V; 2]; 8]) -> [[V; 2]; 8] {
         let mut out = [[V::zero(); 2]; 8];
         for g in 0..2 {
             let lanes = dct8([
-                block[0][g], block[1][g], block[2][g], block[3][g], block[4][g], block[5][g],
-                block[6][g], block[7][g],
+                block[0][g],
+                block[1][g],
+                block[2][g],
+                block[3][g],
+                block[4][g],
+                block[5][g],
+                block[6][g],
+                block[7][g],
             ]);
             for (index, value) in lanes.into_iter().enumerate() {
                 out[index][g] = value;

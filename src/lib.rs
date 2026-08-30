@@ -67,6 +67,7 @@ pub use av1_intra::{
     inverse_transform, inverse_wht_4x4,
 };
 pub use av1_intra_decoder::{decode_av1_lossless_intra, decode_av1_lossless_intra_with_tx_sizes};
+pub use av1_simd::SimdIsa;
 pub use codec::{
     AudioDrain, AudioEncoder, AudioEncoderFormat, AudioGapless, CancellationToken,
     CodecImplementation, CodecProfile, CodecSupport, DecodeStatistics, DecodedVideoFrame,

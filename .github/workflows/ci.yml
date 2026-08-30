@@ -28,6 +28,8 @@ jobs:
         run: cargo check --all-targets --features native
       - name: Lint native target
         run: cargo clippy --all-targets --features native -- -D warnings
+      - name: Test AV1 SIMD kernels against the scalar path
+        run: cargo test --features native --lib av1_simd -- --nocapture
       - name: Test native_gl example overlays
         run: cargo test --features native --example native_gl
       - name: Check WebAssembly target

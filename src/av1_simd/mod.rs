@@ -30,24 +30,20 @@
 //! same input through more than one implementation, and it is safe to call at
 //! any time because all implementations agree.
 
+// Targets with no vector implementation (`wasm32` in particular) never
+// instantiate the generic kernels and never reach the dispatchers' vector
+// arms, so the resulting unused-code warnings are silenced there and only
+// there.
+#![cfg_attr(
+    not(any(target_arch = "x86_64", target_arch = "aarch64")),
+    allow(dead_code, unused_variables, unreachable_code)
+)]
+
 use core::sync::atomic::{AtomicU8, Ordering};
 
-/// On targets with no vector implementation (`wasm32` in particular) the
-/// generic kernels below are never instantiated, so silence the resulting
-/// dead-code warnings there rather than on every target.
-macro_rules! kernel_module {
-    ($name:ident) => {
-        #[cfg_attr(
-            not(any(target_arch = "x86_64", target_arch = "aarch64")),
-            allow(dead_code)
-        )]
-        pub(crate) mod $name;
-    };
-}
-
-kernel_module!(filters);
-kernel_module!(transforms);
-kernel_module!(vector);
+pub(crate) mod filters;
+pub(crate) mod transforms;
+pub(crate) mod vector;
 
 /// An instruction set the AV1 kernels can run on.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -136,6 +132,10 @@ pub fn detected_isa() -> SimdIsa {
 /// [`SimdIsa::Scalar`]. Used by the bit-exactness tests and the benchmark.
 #[must_use]
 pub fn available_isas() -> Vec<SimdIsa> {
+    #[cfg_attr(
+        not(any(target_arch = "x86_64", target_arch = "aarch64")),
+        allow(unused_mut)
+    )]
     let mut isas = vec![SimdIsa::Scalar];
     #[cfg(target_arch = "x86_64")]
     {
@@ -308,12 +308,12 @@ pub(crate) fn iwht4x4(isa: SimdIsa, quant: &[i32; 16]) -> Option<[i32; 16]> {
     if !transforms::within_limit(quant, transforms::WHT_INPUT_LIMIT) {
         return None;
     }
-    dispatch!(
+    let residual: [i32; 16] = dispatch!(
         isa,
         [iwht4x4_sse41, iwht4x4_avx2, iwht4x4_neon](quant),
         return None
-    )
-    .into()
+    );
+    Some(residual)
 }
 
 /// Vectorized [`crate::av1_encoder`] forward WHT, or `None` when the caller
@@ -322,12 +322,12 @@ pub(crate) fn fwht4x4(isa: SimdIsa, residual: &[i32; 16]) -> Option<[i32; 16]> {
     if !transforms::within_limit(residual, transforms::WHT_INPUT_LIMIT) {
         return None;
     }
-    dispatch!(
+    let coefficients: [i32; 16] = dispatch!(
         isa,
         [fwht4x4_sse41, fwht4x4_avx2, fwht4x4_neon](residual),
         return None
-    )
-    .into()
+    );
+    Some(coefficients)
 }
 
 /// Vectorized `DCT_DCT` inverse transform for a 4x4 or 8x8 block. Returns
@@ -405,12 +405,12 @@ pub(crate) fn cdef_direction_stats(
     dr: i32,
     dc: i32,
 ) -> Option<(i32, i32)> {
-    dispatch!(
+    let stats: (i32, i32) = dispatch!(
         isa,
         [cdef_stats_sse41, cdef_stats_avx2, cdef_stats_neon](data, stride, x0, y0, dr, dc),
         return None
-    )
-    .into()
+    );
+    Some(stats)
 }
 
 /// CDEF-filters `lanes(isa)` samples of row `y` starting at column `x0`.
@@ -522,35 +522,4 @@ pub(crate) fn box_stats_row(
 pub(crate) const MAX_LANES: usize = vector::MAX_LANES;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn available_isas_always_include_scalar_and_the_detected_one() {
-        let isas = available_isas();
-        assert!(isas.contains(&SimdIsa::Scalar));
-        assert!(isas.contains(&detected_isa()) || detected_isa() == SimdIsa::Scalar);
-    }
-
-    #[test]
-    fn lane_counts_match_register_widths() {
-        assert_eq!(lanes(SimdIsa::Scalar), 0);
-        assert_eq!(lanes(SimdIsa::Sse41), 4);
-        assert_eq!(lanes(SimdIsa::Neon), 4);
-        assert_eq!(lanes(SimdIsa::Avx2), 8);
-        assert!(lanes(SimdIsa::Avx2) <= MAX_LANES);
-    }
-
-    #[test]
-    fn unsupported_override_falls_back_to_scalar() {
-        let unsupported = if cfg!(target_arch = "aarch64") {
-            SimdIsa::Avx2
-        } else {
-            SimdIsa::Neon
-        };
-        set_active_isa(Some(unsupported));
-        assert_eq!(active_isa(), SimdIsa::Scalar);
-        set_active_isa(None);
-        assert_eq!(active_isa(), detected_isa());
-    }
-}
+mod tests;
