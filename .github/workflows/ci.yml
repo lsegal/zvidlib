@@ -30,6 +30,10 @@ jobs:
         run: cargo clippy --all-targets --features native -- -D warnings
       - name: Test native_gl example overlays
         run: cargo test --features native --example native_gl
+      - name: Test SIMD in-loop filters are bit-exact with the scalar path
+        # Runs on an x86_64 runner, so this covers the AVX2 and SSE4.1
+        # kernels that the macOS/Windows jobs above cannot reach.
+        run: cargo test --features native --lib hevc::engine::simd
       - name: Check WebAssembly target
         run: cargo check --target wasm32-unknown-unknown --no-default-features --features web
       - name: Install wasm-pack

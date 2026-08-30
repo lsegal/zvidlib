@@ -906,6 +906,7 @@ unsafe fn filter_luma_rows_sse41(
 }
 
 #[cfg(target_arch = "aarch64")]
+#[inline]
 #[allow(clippy::too_many_arguments)]
 unsafe fn filter_luma_rows_neon(
     p: &LumaSeg,
@@ -930,6 +931,7 @@ unsafe fn filter_luma_rows_neon(
 /// `q0'..q2'`. Only `0..nDp` / `0..nDq` of them are replacements, exactly
 /// as for [`super::deblock::filter_luma_sample`]; the remaining entries
 /// hold the unmodified input samples.
+#[inline]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn filter_luma_rows(
     p: &LumaSeg,
@@ -1033,6 +1035,7 @@ unsafe fn filter_chroma_rows_sse41(
 }
 
 #[cfg(target_arch = "aarch64")]
+#[inline]
 unsafe fn filter_chroma_rows_neon(
     p: &ChromaSeg,
     q: &ChromaSeg,
@@ -1046,6 +1049,7 @@ unsafe fn filter_chroma_rows_neon(
 
 /// §8.7.2.5.7 chroma filtering of one four-row edge segment, producing
 /// `p0'` / `q0'` for each row.
+#[inline]
 pub(crate) fn filter_chroma_rows(
     p: &ChromaSeg,
     q: &ChromaSeg,
@@ -1421,7 +1425,21 @@ mod tests {
         const W: usize = 1920;
         const H: usize = 1080;
         const CTB: usize = 64;
-        let rec = filled_picture(W, H, 8, 0xB0B);
+        // A representative *reconstructed* frame: smooth gradients with a
+        // per-16x16-block DC step and light residual noise. Uniform random
+        // noise would leave `d >= beta` at every edge, so the §8.7.2.5.3
+        // decision would reject every edge and the filter taps would never
+        // run; real reconstructions engage both the weak and strong filter.
+        let mut rec = Picture::new(W, H, 1, 8, 8);
+        let mut noise = Rng::new(0xF00D);
+        for y in 0..H {
+            for x in 0..W {
+                let smooth = (x * 200 / W + y * 55 / H) as i32;
+                let dc = (((x / 16) * 7 + (y / 16) * 11) % 23) as i32;
+                let v = (smooth + dc + (noise.next() % 5) as i32 - 2).clamp(0, 255);
+                rec.set_sample(Plane::Luma, x, y, v);
+            }
+        }
         let mut rng = Rng::new(0xBEE5);
         // One representative SAO parameter set per CTB, cycling the
         // band / edge types the way a real slice does.
@@ -1496,7 +1514,7 @@ mod tests {
             }
         };
 
-        let reps = 3;
+        let reps = 10;
         let guard = PIN.lock().unwrap_or_else(|e| e.into_inner());
         FORCE_SCALAR.store(true, Ordering::SeqCst);
         let t = Instant::now();

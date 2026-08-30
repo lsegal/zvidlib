@@ -803,6 +803,18 @@ impl SamplePlane<'_> {
     fn set(&mut self, x: usize, y: usize, v: i32) {
         self.samples[y * self.stride + x] = v;
     }
+    /// The four samples `[x, x + 4)` of row `y`.
+    #[inline]
+    fn run4(&self, x: usize, y: usize) -> [i32; 4] {
+        let mut out = [0i32; 4];
+        out.copy_from_slice(&self.samples[y * self.stride + x..][..4]);
+        out
+    }
+    /// Overwrite the four samples `[x, x + 4)` of row `y`.
+    #[inline]
+    fn set_run4(&mut self, x: usize, y: usize, v: [i32; 4]) {
+        self.samples[y * self.stride + x..][..4].copy_from_slice(&v);
+    }
     /// `(x, y)` plane coordinates for the `i`-th sample on the p (`pi`,
     /// negative side) or q (`qi`, positive side) of an edge at `(ex, ey)`
     /// for row offset `k` along the edge.
@@ -917,14 +929,30 @@ pub fn filter_luma_block_edge_gated(
     // Gather the whole 4-row segment once: `seg_p[i][k]` = `pi,k`. The
     // four rows are filtered together (they share one decision), so this
     // is also the layout the vectorized kernel consumes.
+    // Both orientations gather four contiguous samples per access, so
+    // the whole segment costs eight row reads rather than 32 bounds-
+    // checked per-sample reads.
     let mut seg_p: crate::hevc::engine::simd::LumaSeg = [[0i32; 4]; 4];
     let mut seg_q: crate::hevc::engine::simd::LumaSeg = [[0i32; 4]; 4];
-    for k in 0..4 {
-        for i in 0..4 {
-            let (px, py) = plane.edge_xy(ex, ey, edge, true, i, k);
-            let (qx, qy) = plane.edge_xy(ex, ey, edge, false, i, k);
-            seg_p[i][k] = plane.get(px, py);
-            seg_q[i][k] = plane.get(qx, qy);
+    match edge {
+        EdgeType::Vertical => {
+            for k in 0..4 {
+                // p3..p0 run left-to-right at x = ex-4 .. ex-1.
+                let run = plane.run4(ex - 4, ey + k);
+                for i in 0..4 {
+                    seg_p[i][k] = run[3 - i];
+                }
+                let run = plane.run4(ex, ey + k);
+                for i in 0..4 {
+                    seg_q[i][k] = run[i];
+                }
+            }
+        }
+        EdgeType::Horizontal => {
+            for i in 0..4 {
+                seg_p[i] = plane.run4(ex, ey - i - 1);
+                seg_q[i] = plane.run4(ex, ey + i);
+            }
         }
     }
     // The decision grid is rows k=0 and k=3 of the same segment.
@@ -956,6 +984,16 @@ pub fn filter_luma_block_edge_gated(
     } else {
         (dec.deq + 1) as usize
     };
+    if no_filter.is_none() && edge == EdgeType::Horizontal {
+        // Each filtered `pi'` / `qi'` row is four contiguous samples.
+        for (i, row) in out_p.iter().enumerate().take(ndp) {
+            plane.set_run4(ex, ey - i - 1, *row);
+        }
+        for (j, row) in out_q.iter().enumerate().take(ndq) {
+            plane.set_run4(ex, ey + j, *row);
+        }
+        return dec;
+    }
     for k in 0..4 {
         for (i, row) in out_p.iter().enumerate().take(ndp) {
             let (px, py) = plane.edge_xy(ex, ey, edge, true, i, k);
@@ -1024,12 +1062,21 @@ pub fn filter_chroma_block_edge_gated(
     // its four rows together.
     let mut seg_p: crate::hevc::engine::simd::ChromaSeg = [[0i32; 4]; 2];
     let mut seg_q: crate::hevc::engine::simd::ChromaSeg = [[0i32; 4]; 2];
-    for k in 0..4 {
-        for i in 0..2 {
-            let (px, py) = plane.edge_xy(ex, ey, edge, true, i, k);
-            let (qx, qy) = plane.edge_xy(ex, ey, edge, false, i, k);
-            seg_p[i][k] = plane.get(px, py);
-            seg_q[i][k] = plane.get(qx, qy);
+    match edge {
+        EdgeType::Vertical => {
+            for k in 0..4 {
+                let run = plane.run4(ex - 2, ey + k);
+                seg_p[0][k] = run[1];
+                seg_p[1][k] = run[0];
+                seg_q[0][k] = run[2];
+                seg_q[1][k] = run[3];
+            }
+        }
+        EdgeType::Horizontal => {
+            for i in 0..2 {
+                seg_p[i] = plane.run4(ex, ey - i - 1);
+                seg_q[i] = plane.run4(ex, ey + i);
+            }
         }
     }
     let mut out_p0 = [0i32; 4];
@@ -1042,6 +1089,11 @@ pub fn filter_chroma_block_edge_gated(
         &mut out_p0,
         &mut out_q0,
     );
+    if no_filter.is_none() && edge == EdgeType::Horizontal {
+        plane.set_run4(ex, ey - 1, out_p0);
+        plane.set_run4(ex, ey, out_q0);
+        return tc;
+    }
     for k in 0..4 {
         let (px, py) = plane.edge_xy(ex, ey, edge, true, 0, k);
         let (qx, qy) = plane.edge_xy(ex, ey, edge, false, 0, k);
