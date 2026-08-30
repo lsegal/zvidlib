@@ -26,8 +26,10 @@
 
 use crate::av1_cdf as cdf;
 use crate::av1_filters::{FilterFrame, FilterPlane, LoopFilterParams, TxSizeGrid, deblock_frame};
-use crate::av1_intra::{Av1TxType, get_ac_quant, get_dc_quant, inverse_transform};
-use crate::av1_intra_pred::{add_residual_row, sum_samples};
+use crate::av1_intra::{Av1IntraMode, Av1TxType, get_ac_quant, get_dc_quant, inverse_transform};
+use crate::av1_intra_pred::{
+    SmoothMode, add_residual_row, directional_row, paeth_row, smooth_row, sum_samples,
+};
 use crate::{
     Av1FrameType, Av1IntraFrame, Av1Obu, Av1ObuType, Av1Parser, Av1SymbolDecoder, Av1SyntaxSupport,
     ColorRange, Error, ErrorKind, Limits, Result, VideoDimensions, VideoFrame, inverse_wht_4x4,
@@ -484,11 +486,7 @@ impl<'a> LosslessTileDecoder<'a> {
         if self.symbols.symbol(&cdf::SKIP[0])? != 0 {
             return Err(unsupported("AV1 skipped intra blocks are not supported"));
         }
-        if self.symbols.symbol(&cdf::INTRA_FRAME_Y_MODE_DC_DC)? != 0 {
-            return Err(unsupported(
-                "AV1 intra decoder currently supports DC_PRED blocks",
-            ));
-        }
+        let mode = read_intra_y_mode(self.symbols.symbol(&cdf::INTRA_FRAME_Y_MODE_DC_DC)?)?;
         let units = block_width / 4;
         let bsl = units.trailing_zeros() as u8;
         for y in 0..units {
@@ -519,7 +517,7 @@ impl<'a> LosslessTileDecoder<'a> {
                 let x = column * 4 + transform_x * 4;
                 let y = row * 4 + transform_y * 4;
                 if x < self.coded_width && y < self.coded_height {
-                    self.decode_transform_block(x, y, tx_width)?;
+                    self.decode_transform_block(x, y, tx_width, mode)?;
                 }
                 transform_x += step;
             }
@@ -528,7 +526,13 @@ impl<'a> LosslessTileDecoder<'a> {
         Ok(())
     }
 
-    fn decode_transform_block(&mut self, x: usize, y: usize, tx_width: usize) -> Result<()> {
+    fn decode_transform_block(
+        &mut self,
+        x: usize,
+        y: usize,
+        tx_width: usize,
+        mode: Av1IntraMode,
+    ) -> Result<()> {
         self.decoded_blocks = self
             .decoded_blocks
             .checked_add(1)
@@ -541,8 +545,7 @@ impl<'a> LosslessTileDecoder<'a> {
         if self.base_q_idx == 0 {
             let coefficients = self.decode_coefficients_4x4(x >> 2, y >> 2)?;
             let residuals = inverse_wht_4x4(&coefficients);
-            let prediction = self.dc_prediction(x, y);
-            self.apply_prediction(x, y, 4, prediction, &residuals);
+            self.apply_intra_prediction(x, y, 4, mode, &residuals);
             self.tx_sizes.set_block(x, y, 4, 4);
             return Ok(());
         }
@@ -551,8 +554,7 @@ impl<'a> LosslessTileDecoder<'a> {
         let dc_quant = get_dc_quant(self.base_q_idx);
         let ac_quant = get_ac_quant(self.base_q_idx);
         let residuals = inverse_transform(&coefficients, tx_width, tx_type, dc_quant, ac_quant);
-        let prediction = self.dc_prediction(x, y);
-        self.apply_prediction(x, y, tx_width, prediction, &residuals);
+        self.apply_intra_prediction(x, y, tx_width, mode, &residuals);
         self.tx_sizes.set_block(x, y, tx_width, tx_width);
         Ok(())
     }
@@ -571,6 +573,76 @@ impl<'a> LosslessTileDecoder<'a> {
             let start = (y + row) * self.coded_width + x;
             let destination = &mut self.pixels[start..start + size];
             destination.fill(prediction);
+            add_residual_row(&residuals[row * size..row * size + size], destination);
+        }
+    }
+
+    fn apply_intra_prediction(
+        &mut self,
+        x: usize,
+        y: usize,
+        size: usize,
+        mode: Av1IntraMode,
+        residuals: &[i16],
+    ) {
+        if mode == Av1IntraMode::Dc {
+            self.apply_prediction(x, y, size, self.dc_prediction_sized(x, y, size), residuals);
+            return;
+        }
+        let top_left = if x > 0 && y > 0 {
+            self.pixels[(y - 1) * self.coded_width + x - 1]
+        } else {
+            128
+        };
+        let mut top = vec![128; size];
+        let mut left = vec![128; size];
+        if y > 0 {
+            top.copy_from_slice(&self.pixels[(y - 1) * self.coded_width + x..][..size]);
+        }
+        if x > 0 {
+            for (row, sample) in left.iter_mut().enumerate() {
+                *sample = self.pixels[(y + row) * self.coded_width + x - 1];
+            }
+        }
+        let mut prediction = vec![0u8; size];
+        for row in 0..size {
+            match mode {
+                Av1IntraMode::Dc => unreachable!(),
+                Av1IntraMode::Vertical => prediction.copy_from_slice(&top),
+                Av1IntraMode::Horizontal => prediction.fill(left[row]),
+                Av1IntraMode::Paeth => paeth_row(top_left, &top, left[row], &mut prediction),
+                Av1IntraMode::Smooth => {
+                    smooth_row(SmoothMode::Smooth, &top, &left, row, &mut prediction)
+                }
+                Av1IntraMode::SmoothVertical => smooth_row(
+                    SmoothMode::SmoothVertical,
+                    &top,
+                    &left,
+                    row,
+                    &mut prediction,
+                ),
+                Av1IntraMode::SmoothHorizontal => smooth_row(
+                    SmoothMode::SmoothHorizontal,
+                    &top,
+                    &left,
+                    row,
+                    &mut prediction,
+                ),
+                Av1IntraMode::D45 => directional_row(45, &top, &left, row, true, &mut prediction),
+                Av1IntraMode::D63 => directional_row(63, &top, &left, row, true, &mut prediction),
+                Av1IntraMode::D67 => directional_row(67, &top, &left, row, true, &mut prediction),
+                Av1IntraMode::D113 => directional_row(113, &top, &left, row, true, &mut prediction),
+                Av1IntraMode::D135 => directional_row(135, &top, &left, row, true, &mut prediction),
+                Av1IntraMode::D157 => directional_row(157, &top, &left, row, true, &mut prediction),
+                Av1IntraMode::D203 => directional_row(203, &top, &left, row, true, &mut prediction),
+                Av1IntraMode::Directional {
+                    angle,
+                    filter_edges,
+                } => directional_row(angle, &top, &left, row, filter_edges, &mut prediction),
+            }
+            let start = (y + row) * self.coded_width + x;
+            let destination = &mut self.pixels[start..start + size];
+            destination.copy_from_slice(&prediction);
             add_residual_row(&residuals[row * size..row * size + size], destination);
         }
     }
@@ -605,10 +677,6 @@ impl<'a> LosslessTileDecoder<'a> {
             }
             (false, false) => 128,
         }
-    }
-
-    fn dc_prediction(&self, x: usize, y: usize) -> u8 {
-        self.dc_prediction_sized(x, y, 4)
     }
 
     fn decode_coefficients_4x4(&mut self, x4: usize, y4: usize) -> Result<[i32; 16]> {
@@ -908,6 +976,25 @@ fn resource(message: impl Into<String>) -> Error {
 
 fn unsupported(message: impl Into<String>) -> Error {
     Error::new(ErrorKind::Unsupported, message)
+}
+
+fn read_intra_y_mode(symbol: usize) -> Result<Av1IntraMode> {
+    match symbol {
+        0 => Ok(Av1IntraMode::Dc),
+        1 => Ok(Av1IntraMode::Vertical),
+        2 => Ok(Av1IntraMode::Horizontal),
+        3 => Ok(Av1IntraMode::D45),
+        4 => Ok(Av1IntraMode::D135),
+        5 => Ok(Av1IntraMode::D113),
+        6 => Ok(Av1IntraMode::D157),
+        7 => Ok(Av1IntraMode::D203),
+        8 => Ok(Av1IntraMode::D67),
+        9 => Ok(Av1IntraMode::Smooth),
+        10 => Ok(Av1IntraMode::SmoothVertical),
+        11 => Ok(Av1IntraMode::SmoothHorizontal),
+        12 => Ok(Av1IntraMode::Paeth),
+        _ => Err(unsupported("AV1 intra decoder read an invalid y mode")),
+    }
 }
 
 #[cfg(test)]

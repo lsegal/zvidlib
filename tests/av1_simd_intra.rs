@@ -9,20 +9,31 @@
 use std::time::Instant;
 
 use zvidlib::{
-    Av1IntraBlock, Av1IntraFrame, Av1IntraMode, ColorRange, Limits, VideoDimensions,
-    add_residual_row, av1_intra_simd, paeth_row, sum_samples,
+    Av1IntraBlock, Av1IntraFrame, Av1IntraMode, ColorRange, Limits, SmoothMode, VideoDimensions,
+    add_residual_row, av1_intra_simd, directional_row, paeth_row, smooth_row, sum_samples,
 };
 
-const MODES: [Av1IntraMode; 4] = [
+const MODES: [Av1IntraMode; 14] = [
     Av1IntraMode::Dc,
     Av1IntraMode::Vertical,
     Av1IntraMode::Horizontal,
     Av1IntraMode::Paeth,
+    Av1IntraMode::Smooth,
+    Av1IntraMode::SmoothVertical,
+    Av1IntraMode::SmoothHorizontal,
+    Av1IntraMode::D45,
+    Av1IntraMode::D63,
+    Av1IntraMode::D67,
+    Av1IntraMode::D113,
+    Av1IntraMode::D135,
+    Av1IntraMode::D157,
+    Av1IntraMode::D203,
 ];
 
 /// AV1 block dimensions the reconstruction path sees, from the smallest
 /// transform block up to the largest square superblock partition.
 const SIZES: [usize; 6] = [4, 8, 16, 32, 64, 128];
+const SMOOTH_SIZES: [usize; 5] = [4, 8, 16, 32, 64];
 
 fn pseudo_random(seed: &mut u32) -> u32 {
     *seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
@@ -70,20 +81,90 @@ fn reference_reconstruct(plane: &mut [u8], stride: usize, block: Av1IntraBlock, 
     }
     let dc = (top.iter().map(|&v| u32::from(v)).sum::<u32>()
         + left.iter().map(|&v| u32::from(v)).sum::<u32>())
-        / u32::try_from(width + height).expect("nonzero block dimensions");
+        + u32::try_from(width + height).expect("nonzero block dimensions") / 2;
+    let dc = dc / u32::try_from(width + height).expect("nonzero block dimensions");
+    let mut prediction_row = vec![0u8; width];
     for row in 0..height {
+        match block.mode {
+            Av1IntraMode::Dc => prediction_row.fill(dc as u8),
+            Av1IntraMode::Vertical => prediction_row.copy_from_slice(&top),
+            Av1IntraMode::Horizontal => prediction_row.fill(left[row]),
+            Av1IntraMode::Paeth => {
+                for (column, prediction) in prediction_row.iter_mut().enumerate() {
+                    *prediction = reference_paeth(top_left, top[column], left[row]);
+                }
+            }
+            Av1IntraMode::Smooth => {
+                reference_smooth_row(SmoothMode::Smooth, &top, &left, row, &mut prediction_row)
+            }
+            Av1IntraMode::SmoothVertical => reference_smooth_row(
+                SmoothMode::SmoothVertical,
+                &top,
+                &left,
+                row,
+                &mut prediction_row,
+            ),
+            Av1IntraMode::SmoothHorizontal => reference_smooth_row(
+                SmoothMode::SmoothHorizontal,
+                &top,
+                &left,
+                row,
+                &mut prediction_row,
+            ),
+            Av1IntraMode::D45 => {
+                reference_directional_row(45, &top, &left, row, true, &mut prediction_row)
+            }
+            Av1IntraMode::D63 => {
+                reference_directional_row(63, &top, &left, row, true, &mut prediction_row)
+            }
+            Av1IntraMode::D67 => {
+                reference_directional_row(67, &top, &left, row, true, &mut prediction_row)
+            }
+            Av1IntraMode::D113 => {
+                reference_directional_row(113, &top, &left, row, true, &mut prediction_row)
+            }
+            Av1IntraMode::D135 => {
+                reference_directional_row(135, &top, &left, row, true, &mut prediction_row)
+            }
+            Av1IntraMode::D157 => {
+                reference_directional_row(157, &top, &left, row, true, &mut prediction_row)
+            }
+            Av1IntraMode::D203 => {
+                reference_directional_row(203, &top, &left, row, true, &mut prediction_row)
+            }
+            Av1IntraMode::Directional {
+                angle,
+                filter_edges,
+            } => reference_directional_row(
+                angle,
+                &top,
+                &left,
+                row,
+                filter_edges,
+                &mut prediction_row,
+            ),
+        }
         for column in 0..width {
-            let prediction = match block.mode {
-                Av1IntraMode::Dc => dc as u8,
-                Av1IntraMode::Vertical => top[column],
-                Av1IntraMode::Horizontal => left[row],
-                Av1IntraMode::Paeth => reference_paeth(top_left, top[column], left[row]),
-            };
-            plane[(y + row) * stride + x + column] = i16::from(prediction)
+            plane[(y + row) * stride + x + column] = i16::from(prediction_row[column])
                 .saturating_add(residuals[row * width + column])
                 .clamp(0, 255) as u8;
         }
     }
+}
+
+fn reference_smooth_row(mode: SmoothMode, top: &[u8], left: &[u8], row: usize, out: &mut [u8]) {
+    smooth_row(mode, top, left, row, out);
+}
+
+fn reference_directional_row(
+    angle: i16,
+    top: &[u8],
+    left: &[u8],
+    row: usize,
+    filter_edges: bool,
+    out: &mut [u8],
+) {
+    directional_row(angle, top, left, row, filter_edges, out);
 }
 
 #[test]
@@ -127,12 +208,67 @@ fn residual_and_paeth_kernels_match_the_scalar_reference() {
 }
 
 #[test]
+fn smooth_and_directional_kernels_match_the_scalar_reference() {
+    let mut seed = 211;
+    for size in SMOOTH_SIZES {
+        let top: Vec<u8> = (0..size)
+            .map(|_| (pseudo_random(&mut seed) >> 10) as u8)
+            .collect();
+        let left: Vec<u8> = (0..size)
+            .map(|_| (pseudo_random(&mut seed) >> 11) as u8)
+            .collect();
+        for mode in [
+            SmoothMode::Smooth,
+            SmoothMode::SmoothVertical,
+            SmoothMode::SmoothHorizontal,
+        ] {
+            for row in 0..size {
+                let mut expected = vec![0u8; size];
+                reference_smooth_row(mode, &top, &left, row, &mut expected);
+                let mut actual = vec![0u8; size];
+                smooth_row(mode, &top, &left, row, &mut actual);
+                assert_eq!(actual, expected, "smooth {mode:?} size {size} row {row}");
+            }
+        }
+    }
+    for size in SIZES {
+        let top: Vec<u8> = (0..size)
+            .map(|_| (pseudo_random(&mut seed) >> 10) as u8)
+            .collect();
+        let left: Vec<u8> = (0..size)
+            .map(|_| (pseudo_random(&mut seed) >> 11) as u8)
+            .collect();
+        for angle in [45, 63, 67, 113, 135, 157, 203] {
+            for row in 0..size {
+                let mut expected = vec![0u8; size];
+                reference_directional_row(angle, &top, &left, row, true, &mut expected);
+                let mut actual = vec![0u8; size];
+                directional_row(angle, &top, &left, row, true, &mut actual);
+                assert_eq!(
+                    actual, expected,
+                    "directional {angle} size {size} row {row}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn reconstructed_blocks_are_bit_exact_for_every_size_and_mode() {
     let limits = Limits::default();
     let dimensions = VideoDimensions::new(256, 256, &limits).expect("valid dimensions");
     let mut seed = 91;
     for mode in MODES {
         for size in SIZES {
+            if matches!(
+                mode,
+                Av1IntraMode::Smooth
+                    | Av1IntraMode::SmoothVertical
+                    | Av1IntraMode::SmoothHorizontal
+            ) && size > 64
+            {
+                continue;
+            }
             for &(x, y) in &[(0usize, 0usize), (0, size), (size, 0), (size, size)] {
                 let luma: Vec<u8> = (0..256 * 256)
                     .map(|_| (pseudo_random(&mut seed) >> 9) as u8)

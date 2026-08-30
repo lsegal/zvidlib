@@ -134,6 +134,40 @@ pub fn paeth_row(top_left: u8, top: &[u8], left: u8, out: &mut [u8]) {
     paeth_row_scalar(top_left, top, left, out);
 }
 
+/// Writes one row of AV1 smooth-family intra predictions (spec §7.11.2.6).
+#[inline]
+pub fn smooth_row(mode: SmoothMode, top: &[u8], left: &[u8], row: usize, out: &mut [u8]) {
+    assert_eq!(top.len(), out.len());
+    assert!(row < left.len());
+    assert!(smooth_weights(top.len()).is_some() && smooth_weights(left.len()).is_some());
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    match av1_intra_simd() {
+        Av1IntraSimd::Avx2 => return unsafe { smooth_row_avx2(mode, top, left, row, out) },
+        Av1IntraSimd::Sse41 => return unsafe { smooth_row_sse41(mode, top, left, row, out) },
+        _ => {}
+    }
+    #[cfg(target_arch = "aarch64")]
+    if av1_intra_simd() == Av1IntraSimd::Neon {
+        return unsafe { smooth_row_neon(mode, top, left, row, out) };
+    }
+    smooth_row_scalar(mode, top, left, row, out);
+}
+
+/// Writes one row of AV1 directional intra predictions (spec §7.11.2.4).
+#[inline]
+pub fn directional_row(
+    angle: i16,
+    top: &[u8],
+    left: &[u8],
+    row: usize,
+    filter_edges: bool,
+    out: &mut [u8],
+) {
+    assert_eq!(top.len(), out.len());
+    assert!(row < left.len());
+    directional_row_scalar(angle, top, left, row, filter_edges, out);
+}
+
 /// The scalar paeth predictor for a single sample (spec §7.11.2.2).
 #[must_use]
 pub fn paeth(top_left: u8, top: u8, left: u8) -> u8 {
@@ -149,6 +183,13 @@ pub fn paeth(top_left: u8, top: u8, left: u8) -> u8 {
     } else {
         top_left
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SmoothMode {
+    Smooth,
+    SmoothVertical,
+    SmoothHorizontal,
 }
 
 // ---------------------------------------------------------------------
@@ -174,6 +215,312 @@ fn paeth_row_scalar(top_left: u8, top: &[u8], left: u8, out: &mut [u8]) {
         *prediction = paeth(top_left, above, left);
     }
 }
+
+fn smooth_row_scalar(mode: SmoothMode, top: &[u8], left: &[u8], row: usize, out: &mut [u8]) {
+    let weights_x = smooth_weights(top.len()).expect("validated smooth width");
+    let weights_y = smooth_weights(left.len()).expect("validated smooth height");
+    let bottom_left = u32::from(left[left.len() - 1]);
+    let top_right = u32::from(top[top.len() - 1]);
+    for (column, prediction) in out.iter_mut().enumerate() {
+        let above = u32::from(top[column]);
+        let left_sample = u32::from(left[row]);
+        let value = match mode {
+            SmoothMode::Smooth => {
+                u32::from(weights_y[row]) * above
+                    + u32::from(256u16 - u16::from(weights_y[row])) * bottom_left
+                    + u32::from(weights_x[column]) * left_sample
+                    + u32::from(256u16 - u16::from(weights_x[column])) * top_right
+                    + 256
+            }
+            SmoothMode::SmoothVertical => {
+                u32::from(weights_y[row]) * above
+                    + u32::from(256u16 - u16::from(weights_y[row])) * bottom_left
+                    + 128
+            }
+            SmoothMode::SmoothHorizontal => {
+                u32::from(weights_x[column]) * left_sample
+                    + u32::from(256u16 - u16::from(weights_x[column])) * top_right
+                    + 128
+            }
+        };
+        *prediction = (value
+            >> match mode {
+                SmoothMode::Smooth => 9,
+                SmoothMode::SmoothVertical | SmoothMode::SmoothHorizontal => 8,
+            }) as u8;
+    }
+}
+
+fn directional_row_scalar(
+    angle: i16,
+    top: &[u8],
+    left: &[u8],
+    row: usize,
+    filter_edges: bool,
+    out: &mut [u8],
+) {
+    let width = top.len();
+    let height = left.len();
+    let angle = angle.clamp(0, 270);
+    if angle == 90 {
+        out.copy_from_slice(top);
+        return;
+    }
+    if angle == 180 {
+        out.fill(left[row]);
+        return;
+    }
+    let mut above = Edge::from(top, left[0]);
+    let mut left_edge = Edge::from(left, top[0]);
+    let mut upsample_above = false;
+    let mut upsample_left = false;
+    if filter_edges {
+        let filter_type = 0;
+        if angle > 90 && angle < 180 && width + height >= 24 {
+            let corner = ((u16::from(left[0]) * 5
+                + u16::from(above.get(-1)) * 6
+                + u16::from(top[0]) * 5
+                + 8)
+                >> 4) as u8;
+            above.set(-1, corner);
+            left_edge.set(-1, corner);
+        }
+        if angle < 180 {
+            let strength = intra_edge_filter_strength(width, height, 0, i32::from(angle) - 90);
+            above.filter(width + usize::from(angle < 90) * height + 1, strength);
+        }
+        if angle > 90 {
+            let strength = intra_edge_filter_strength(width, height, 0, i32::from(angle) - 180);
+            left_edge.filter(height + usize::from(angle > 180) * width + 1, strength);
+        }
+        upsample_above = intra_edge_upsample(width, height, filter_type, i32::from(angle) - 90);
+        if upsample_above {
+            above.upsample(width + usize::from(angle < 90) * height);
+        }
+        upsample_left = intra_edge_upsample(width, height, filter_type, i32::from(angle) - 180);
+        if upsample_left {
+            left_edge.upsample(height + usize::from(angle > 180) * width);
+        }
+    }
+    if angle < 90 {
+        let dx = dr_intra_derivative(angle);
+        let idx = (row as i32 + 1) * dx;
+        let max_base_x = ((width + height - 1) as i32) << i32::from(upsample_above);
+        for (column, prediction) in out.iter_mut().enumerate() {
+            let base = (idx >> (6 - u32::from(upsample_above)))
+                + ((column as i32) << i32::from(upsample_above));
+            let shift = (((idx << i32::from(upsample_above)) >> 1) & 0x1f) as u16;
+            *prediction = if base < max_base_x {
+                round_weighted(above.get(base), above.get(base + 1), shift)
+            } else {
+                above.get(max_base_x)
+            };
+        }
+    } else if angle < 180 {
+        let dx = dr_intra_derivative(180 - angle);
+        let dy = dr_intra_derivative(angle - 90);
+        for (column, prediction) in out.iter_mut().enumerate() {
+            let idx = ((column as i32) << 6) - (row as i32 + 1) * dx;
+            let base = idx >> (6 - u32::from(upsample_above));
+            if base >= -(1 << i32::from(upsample_above)) {
+                let shift = (((idx << i32::from(upsample_above)) >> 1) & 0x1f) as u16;
+                *prediction = round_weighted(above.get(base), above.get(base + 1), shift);
+            } else {
+                let idx = ((row as i32) << 6) - (column as i32 + 1) * dy;
+                let base = idx >> (6 - u32::from(upsample_left));
+                let shift = (((idx << i32::from(upsample_left)) >> 1) & 0x1f) as u16;
+                *prediction = round_weighted(left_edge.get(base), left_edge.get(base + 1), shift);
+            }
+        }
+    } else {
+        let dy = dr_intra_derivative(270 - angle);
+        for (column, prediction) in out.iter_mut().enumerate() {
+            let idx = (column as i32 + 1) * dy;
+            let base = (idx >> (6 - u32::from(upsample_left)))
+                + ((row as i32) << i32::from(upsample_left));
+            let shift = (((idx << i32::from(upsample_left)) >> 1) & 0x1f) as u16;
+            *prediction = round_weighted(left_edge.get(base), left_edge.get(base + 1), shift);
+        }
+    }
+}
+
+fn round_weighted(a: u8, b: u8, shift: u16) -> u8 {
+    ((u16::from(a) * (32 - shift) + u16::from(b) * shift + 16) >> 5) as u8
+}
+
+fn smooth_weights(size: usize) -> Option<&'static [u8]> {
+    match size {
+        4 => Some(&SM_WEIGHTS_4),
+        8 => Some(&SM_WEIGHTS_8),
+        16 => Some(&SM_WEIGHTS_16),
+        32 => Some(&SM_WEIGHTS_32),
+        64 | 128 => Some(&SM_WEIGHTS_64),
+        _ => None,
+    }
+}
+
+fn dr_intra_derivative(angle: i16) -> i32 {
+    const DERIVATIVE: [i32; 90] = [
+        0, 0, 0, 1023, 0, 0, 547, 0, 0, 372, 0, 0, 0, 0, 273, 0, 0, 215, 0, 0, 178, 0, 0, 151, 0,
+        0, 132, 0, 0, 116, 0, 0, 102, 0, 0, 0, 90, 0, 0, 80, 0, 0, 71, 0, 0, 64, 0, 0, 57, 0, 0,
+        51, 0, 0, 45, 0, 0, 0, 40, 0, 0, 35, 0, 0, 31, 0, 0, 27, 0, 0, 23, 0, 0, 19, 0, 0, 15, 0,
+        0, 0, 0, 11, 0, 0, 7, 0, 0, 3, 0, 0,
+    ];
+    DERIVATIVE.get(angle as usize).copied().unwrap_or(0)
+}
+
+fn intra_edge_filter_strength(w: usize, h: usize, filter_type: usize, delta: i32) -> usize {
+    let d = delta.unsigned_abs();
+    let blk_wh = w + h;
+    let mut strength = 0;
+    if filter_type == 0 {
+        if blk_wh <= 8 {
+            if d >= 56 {
+                strength = 1;
+            }
+        } else if blk_wh <= 16 {
+            if d >= 40 {
+                strength = 1;
+            }
+        } else if blk_wh <= 24 {
+            if d >= 8 {
+                strength = 1;
+            }
+            if d >= 16 {
+                strength = 2;
+            }
+            if d >= 32 {
+                strength = 3;
+            }
+        } else if blk_wh <= 32 {
+            strength = 1;
+            if d >= 4 {
+                strength = 2;
+            }
+            if d >= 32 {
+                strength = 3;
+            }
+        } else {
+            strength = 3;
+        }
+    } else if blk_wh <= 8 {
+        if d >= 40 {
+            strength = 1;
+        }
+        if d >= 64 {
+            strength = 2;
+        }
+    } else if blk_wh <= 16 {
+        if d >= 20 {
+            strength = 1;
+        }
+        if d >= 48 {
+            strength = 2;
+        }
+    } else if blk_wh <= 24 {
+        if d >= 4 {
+            strength = 3;
+        }
+    } else {
+        strength = 3;
+    }
+    strength
+}
+
+fn intra_edge_upsample(w: usize, h: usize, filter_type: usize, delta: i32) -> bool {
+    let d = delta.unsigned_abs();
+    if d == 0 || d >= 40 {
+        false
+    } else if filter_type == 0 {
+        w + h <= 16
+    } else {
+        w + h <= 8
+    }
+}
+
+struct Edge {
+    base: i32,
+    samples: Vec<u8>,
+}
+
+impl Edge {
+    fn from(edge: &[u8], fallback: u8) -> Self {
+        let mut samples = Vec::with_capacity(edge.len() * 2 + 4);
+        let last = edge.last().copied().unwrap_or(fallback);
+        samples.extend([fallback, fallback]);
+        samples.extend_from_slice(edge);
+        samples.resize(edge.len() * 2 + 4, last);
+        Self { base: -2, samples }
+    }
+
+    fn get(&self, index: i32) -> u8 {
+        let slot = index - self.base;
+        if slot < 0 {
+            self.samples[0]
+        } else {
+            self.samples
+                .get(slot as usize)
+                .copied()
+                .unwrap_or_else(|| *self.samples.last().expect("edge is non-empty"))
+        }
+    }
+
+    fn set(&mut self, index: i32, value: u8) {
+        let slot = index - self.base;
+        if slot >= 0 {
+            if let Some(sample) = self.samples.get_mut(slot as usize) {
+                *sample = value;
+            }
+        }
+    }
+
+    fn filter(&mut self, size: usize, strength: usize) {
+        if strength == 0 {
+            return;
+        }
+        const KERNELS: [[u16; 5]; 3] = [[0, 4, 8, 4, 0], [0, 5, 6, 5, 0], [2, 4, 4, 4, 2]];
+        let edge: Vec<u8> = (0..size).map(|i| self.get(i as i32 - 1)).collect();
+        for i in 1..size {
+            let mut sum = 0u16;
+            for j in 0..5 {
+                let k = (i as isize - 2 + j as isize).clamp(0, size as isize - 1) as usize;
+                sum += KERNELS[strength - 1][j] * u16::from(edge[k]);
+            }
+            self.set(i as i32 - 1, ((sum + 8) >> 4) as u8);
+        }
+    }
+
+    fn upsample(&mut self, num_px: usize) {
+        let dup: Vec<u8> = std::iter::once(self.get(-1))
+            .chain((-1..num_px as i32).map(|i| self.get(i)))
+            .chain(std::iter::once(self.get(num_px as i32 - 1)))
+            .collect();
+        self.base = -2;
+        self.samples.resize(num_px * 2 + 1, 0);
+        self.samples[0] = dup[0];
+        for i in 0..num_px {
+            let s = -i16::from(dup[i]) + 9 * i16::from(dup[i + 1]) + 9 * i16::from(dup[i + 2])
+                - i16::from(dup[i + 3]);
+            self.set(2 * i as i32 - 1, ((s + 8) >> 4).clamp(0, 255) as u8);
+            self.set(2 * i as i32, dup[i + 2]);
+        }
+    }
+}
+
+const SM_WEIGHTS_4: [u8; 4] = [255, 149, 85, 64];
+const SM_WEIGHTS_8: [u8; 8] = [255, 197, 146, 105, 73, 50, 37, 32];
+const SM_WEIGHTS_16: [u8; 16] = [
+    255, 225, 196, 170, 145, 123, 102, 84, 68, 54, 43, 33, 26, 20, 17, 16,
+];
+const SM_WEIGHTS_32: [u8; 32] = [
+    255, 240, 225, 210, 196, 182, 169, 157, 145, 133, 122, 111, 101, 92, 83, 74, 66, 59, 52, 45,
+    39, 34, 29, 25, 21, 17, 14, 12, 10, 9, 8, 8,
+];
+const SM_WEIGHTS_64: [u8; 64] = [
+    255, 248, 240, 233, 225, 218, 210, 203, 196, 189, 182, 176, 169, 163, 156, 150, 144, 138, 133,
+    127, 121, 116, 111, 106, 101, 96, 91, 86, 82, 77, 73, 69, 65, 61, 57, 54, 50, 47, 44, 41, 38,
+    35, 32, 29, 27, 25, 22, 20, 18, 16, 15, 13, 12, 10, 9, 8, 7, 6, 6, 5, 5, 4, 4, 4,
+];
 
 // ---------------------------------------------------------------------
 // x86/x86_64.
@@ -304,6 +651,12 @@ unsafe fn paeth_row_avx2(top_left: u8, top: &[u8], left: u8, out: &mut [u8]) {
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn smooth_row_avx2(mode: SmoothMode, top: &[u8], left: &[u8], row: usize, out: &mut [u8]) {
+    smooth_row_scalar(mode, top, left, row, out);
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "sse4.1")]
 unsafe fn paeth_row_sse41(top_left: u8, top: &[u8], left: u8, out: &mut [u8]) {
     unsafe {
@@ -339,6 +692,12 @@ unsafe fn paeth_row_sse41(top_left: u8, top: &[u8], left: u8, out: &mut [u8]) {
         }
         paeth_row_scalar(top_left, &top[index..], left, &mut out[index..]);
     }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "sse4.1")]
+unsafe fn smooth_row_sse41(mode: SmoothMode, top: &[u8], left: &[u8], row: usize, out: &mut [u8]) {
+    smooth_row_scalar(mode, top, left, row, out);
 }
 
 // ---------------------------------------------------------------------
@@ -421,6 +780,12 @@ unsafe fn paeth_row_neon(top_left: u8, top: &[u8], left: u8, out: &mut [u8]) {
         }
         paeth_row_scalar(top_left, &top[index..], left, &mut out[index..]);
     }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn smooth_row_neon(mode: SmoothMode, top: &[u8], left: &[u8], row: usize, out: &mut [u8]) {
+    smooth_row_scalar(mode, top, left, row, out);
 }
 
 #[cfg(test)]

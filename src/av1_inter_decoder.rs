@@ -44,8 +44,10 @@
 
 use crate::av1_cdf as cdf;
 use crate::av1_filters::{FilterFrame, FilterPlane, LoopFilterParams, TxSizeGrid, deblock_frame};
-use crate::av1_intra::{Av1TxType, get_ac_quant, get_dc_quant, inverse_transform};
-use crate::av1_intra_pred::{add_residual_row, sum_samples};
+use crate::av1_intra::{Av1IntraMode, Av1TxType, get_ac_quant, get_dc_quant, inverse_transform};
+use crate::av1_intra_pred::{
+    SmoothMode, add_residual_row, directional_row, paeth_row, smooth_row, sum_samples,
+};
 use crate::av1_mc::{InterpFilter, McContext, RefPlane, blend_average};
 use crate::{
     Av1FrameType, Av1Obu, Av1Parser, Av1SequenceHeader, Av1SymbolDecoder, Av1SyntaxSupport,
@@ -932,12 +934,12 @@ impl<'a> InterTileDecoder<'a> {
         let prediction = if is_inter {
             Some(self.decode_inter_mode_and_ref(row, column, block_width)?)
         } else {
-            if self.symbols.symbol(&cdf::INTRA_FRAME_Y_MODE_DC_DC)? != 0 {
-                return Err(unsupported(
-                    "AV1 inter decoder currently supports DC_PRED intra blocks",
-                ));
-            }
             None
+        };
+        let intra_mode = if prediction.is_none() {
+            read_intra_y_mode(self.symbols.symbol(&cdf::INTRA_FRAME_Y_MODE_DC_DC)?)?
+        } else {
+            Av1IntraMode::Dc
         };
         let units = block_width / 4;
         let bsl = units.trailing_zeros() as u8;
@@ -984,7 +986,7 @@ impl<'a> InterTileDecoder<'a> {
                 let x = column * 4 + transform_x * 4;
                 let y = row * 4 + transform_y * 4;
                 if x < self.coded_width && y < self.coded_height {
-                    self.decode_transform_block(x, y, tx_width, prediction.is_some())?;
+                    self.decode_transform_block(x, y, tx_width, prediction.is_some(), intra_mode)?;
                 }
                 transform_x += step;
             }
@@ -1242,6 +1244,7 @@ impl<'a> InterTileDecoder<'a> {
         y: usize,
         tx_width: usize,
         is_inter: bool,
+        intra_mode: Av1IntraMode,
     ) -> Result<()> {
         self.decoded_blocks = self
             .decoded_blocks
@@ -1258,8 +1261,7 @@ impl<'a> InterTileDecoder<'a> {
             if is_inter {
                 self.add_residuals(x, y, 4, &residuals);
             } else {
-                let prediction = self.dc_prediction_sized(x, y, 4);
-                self.apply_prediction(x, y, 4, prediction, &residuals);
+                self.apply_intra_prediction(x, y, 4, intra_mode, &residuals);
             }
             self.tx_sizes.set_block(x, y, 4, 4);
             return Ok(());
@@ -1272,8 +1274,7 @@ impl<'a> InterTileDecoder<'a> {
         if is_inter {
             self.add_residuals(x, y, tx_width, &residuals);
         } else {
-            let prediction = self.dc_prediction_sized(x, y, tx_width);
-            self.apply_prediction(x, y, tx_width, prediction, &residuals);
+            self.apply_intra_prediction(x, y, tx_width, intra_mode, &residuals);
         }
         self.tx_sizes.set_block(x, y, tx_width, tx_width);
         Ok(())
@@ -1293,6 +1294,76 @@ impl<'a> InterTileDecoder<'a> {
             let start = (y + row) * self.coded_width + x;
             let destination = &mut self.pixels[start..start + size];
             destination.fill(prediction);
+            add_residual_row(&residuals[row * size..row * size + size], destination);
+        }
+    }
+
+    fn apply_intra_prediction(
+        &mut self,
+        x: usize,
+        y: usize,
+        size: usize,
+        mode: Av1IntraMode,
+        residuals: &[i16],
+    ) {
+        if mode == Av1IntraMode::Dc {
+            self.apply_prediction(x, y, size, self.dc_prediction_sized(x, y, size), residuals);
+            return;
+        }
+        let top_left = if x > 0 && y > 0 {
+            self.pixels[(y - 1) * self.coded_width + x - 1]
+        } else {
+            128
+        };
+        let mut top = vec![128; size];
+        let mut left = vec![128; size];
+        if y > 0 {
+            top.copy_from_slice(&self.pixels[(y - 1) * self.coded_width + x..][..size]);
+        }
+        if x > 0 {
+            for (row, sample) in left.iter_mut().enumerate() {
+                *sample = self.pixels[(y + row) * self.coded_width + x - 1];
+            }
+        }
+        let mut prediction = vec![0u8; size];
+        for row in 0..size {
+            match mode {
+                Av1IntraMode::Dc => unreachable!(),
+                Av1IntraMode::Vertical => prediction.copy_from_slice(&top),
+                Av1IntraMode::Horizontal => prediction.fill(left[row]),
+                Av1IntraMode::Paeth => paeth_row(top_left, &top, left[row], &mut prediction),
+                Av1IntraMode::Smooth => {
+                    smooth_row(SmoothMode::Smooth, &top, &left, row, &mut prediction)
+                }
+                Av1IntraMode::SmoothVertical => smooth_row(
+                    SmoothMode::SmoothVertical,
+                    &top,
+                    &left,
+                    row,
+                    &mut prediction,
+                ),
+                Av1IntraMode::SmoothHorizontal => smooth_row(
+                    SmoothMode::SmoothHorizontal,
+                    &top,
+                    &left,
+                    row,
+                    &mut prediction,
+                ),
+                Av1IntraMode::D45 => directional_row(45, &top, &left, row, true, &mut prediction),
+                Av1IntraMode::D63 => directional_row(63, &top, &left, row, true, &mut prediction),
+                Av1IntraMode::D67 => directional_row(67, &top, &left, row, true, &mut prediction),
+                Av1IntraMode::D113 => directional_row(113, &top, &left, row, true, &mut prediction),
+                Av1IntraMode::D135 => directional_row(135, &top, &left, row, true, &mut prediction),
+                Av1IntraMode::D157 => directional_row(157, &top, &left, row, true, &mut prediction),
+                Av1IntraMode::D203 => directional_row(203, &top, &left, row, true, &mut prediction),
+                Av1IntraMode::Directional {
+                    angle,
+                    filter_edges,
+                } => directional_row(angle, &top, &left, row, filter_edges, &mut prediction),
+            }
+            let start = (y + row) * self.coded_width + x;
+            let destination = &mut self.pixels[start..start + size];
+            destination.copy_from_slice(&prediction);
             add_residual_row(&residuals[row * size..row * size + size], destination);
         }
     }
@@ -1636,6 +1707,25 @@ fn resource(message: impl Into<String>) -> Error {
 
 fn unsupported(message: impl Into<String>) -> Error {
     Error::new(ErrorKind::Unsupported, message)
+}
+
+fn read_intra_y_mode(symbol: usize) -> Result<Av1IntraMode> {
+    match symbol {
+        0 => Ok(Av1IntraMode::Dc),
+        1 => Ok(Av1IntraMode::Vertical),
+        2 => Ok(Av1IntraMode::Horizontal),
+        3 => Ok(Av1IntraMode::D45),
+        4 => Ok(Av1IntraMode::D135),
+        5 => Ok(Av1IntraMode::D113),
+        6 => Ok(Av1IntraMode::D157),
+        7 => Ok(Av1IntraMode::D203),
+        8 => Ok(Av1IntraMode::D67),
+        9 => Ok(Av1IntraMode::Smooth),
+        10 => Ok(Av1IntraMode::SmoothVertical),
+        11 => Ok(Av1IntraMode::SmoothHorizontal),
+        12 => Ok(Av1IntraMode::Paeth),
+        _ => Err(unsupported("AV1 inter decoder read an invalid y mode")),
+    }
 }
 
 /// Test-only bitstream construction. Every writer here is the exact
