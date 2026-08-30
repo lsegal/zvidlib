@@ -51,6 +51,7 @@
 //! module stops at the `(nTbS)x(nTbS)` array `r`.
 
 use crate::hevc::engine::scaling_list::ScalingFactorMatrix;
+use crate::hevc::engine::transform_simd::{self, Backend};
 
 /// §8.6.3 `levelScale[ k ]` rational quantization-step list, indexed by
 /// `qP % 6` (the list is `{ 40, 45, 51, 57, 64, 72 }`).
@@ -229,33 +230,40 @@ pub fn scale_coefficients(
     } else {
         15
     };
+    // bdShift is always >= 1 for the dimensioned ranges (bitDepth >= 8,
+    // log2TrafoSize >= 2, log2TransformRange <= bitDepth + 6), so the
+    // (1 << (bdShift - 1)) rounding offset the kernel applies is
+    // well-formed.
     let bd_shift = bit_depth as i32 + log2_tbs as i32 + 10 - log2_transform_range;
     let (coeff_min, coeff_max) = coeff_range(bit_depth, extended_precision);
 
-    let level_scale = LEVEL_SCALE[(q_p % 6) as usize] as i64;
+    let level_scale = LEVEL_SCALE[(q_p % 6) as usize];
     let qp_div6 = q_p / 6;
-    // bdShift is always >= 1 for the dimensioned ranges (bitDepth >= 8,
-    // log2TrafoSize >= 2, log2TransformRange <= bitDepth + 6), so the
-    // (1 << (bdShift - 1)) rounding offset is well-formed.
-    let round = 1i64 << (bd_shift - 1);
 
     let mut d = vec![0i32; count];
-    for y in 0..n_tbs {
-        for x in 0..n_tbs {
-            let idx = y * n_tbs + x;
-            // §8.6.3 m[ x ][ y ]: flat 16 unless an explicit
-            // ScalingFactor matrix is supplied (the caller folds the
-            // "transform_skip && nTbS > 4 ⇒ 16" exception into the
-            // `scaling` argument it passes).
-            let m = scaling.map_or(16i64, |sf| sf.at(x, y) as i64);
-            // §8.6.3 eq. 8-309: clip( (TransCoeffLevel * m * levelScale
-            // << (qP/6)) + round ) >> bdShift.
-            let prod = (levels[idx] as i64) * m * level_scale;
-            let shifted = (prod << qp_div6) + round;
-            let scaled = clip3(coeff_min as i64, coeff_max as i64, shifted >> bd_shift);
-            d[idx] = scaled as i32;
-        }
-    }
+    // §8.6.3 m[ x ][ y ]: flat 16 unless an explicit ScalingFactor
+    // matrix is supplied (the caller folds the "transform_skip && nTbS >
+    // 4 ⇒ 16" exception into the `scaling` argument it passes). The
+    // matrix is stored row-major by `y` exactly like `levels`, so
+    // `ScalingFactorMatrix::at( x, y )` is `coef[ y * nTbS + x ]` — the
+    // kernel consumes it as one flat slice.
+    //
+    // §8.6.3 eq. 8-309: clip( (TransCoeffLevel * m * levelScale <<
+    // (qP/6)) + round ) >> bdShift, applied by the SIMD-dispatched
+    // kernel (bit-exact with its own scalar reference).
+    transform_simd::dequant_block(
+        transform_simd::detected(),
+        &mut d,
+        levels,
+        scaling.map(|sf| sf.coef.as_slice()),
+        transform_simd::DequantParams {
+            level_scale,
+            qp_div6,
+            bd_shift: bd_shift as u32,
+            coeff_min,
+            coeff_max,
+        },
+    );
     Ok(d)
 }
 
@@ -419,6 +427,206 @@ pub(crate) fn forward_dct_1d(input: &[i64], n_tbs: usize) -> Vec<i64> {
 /// [`TransformError::InvalidBlockSize`] / [`TransformError::LengthMismatch`]
 /// / [`TransformError::InvalidBitDepth`] as for [`scale_coefficients`].
 pub fn inverse_transform(
+    d: &[i32],
+    n_tbs: usize,
+    pred_mode: PredMode,
+    component: Component,
+    bit_depth: u8,
+    extended_precision: bool,
+) -> Result<Vec<i32>, TransformError> {
+    inverse_transform_with_backend(
+        transform_simd::detected(),
+        d,
+        n_tbs,
+        pred_mode,
+        component,
+        bit_depth,
+        extended_precision,
+    )
+}
+
+/// [`inverse_transform`] with an explicitly chosen SIMD backend.
+///
+/// Production callers want [`inverse_transform`], which picks the best
+/// backend the host supports. This entry point exists so the
+/// bit-exactness tests and the transform benchmark can drive every
+/// backend the machine can run, including [`Backend::Scalar`].
+///
+/// # Errors
+/// As for [`inverse_transform`].
+pub fn inverse_transform_with_backend(
+    backend: Backend,
+    d: &[i32],
+    n_tbs: usize,
+    pred_mode: PredMode,
+    component: Component,
+    bit_depth: u8,
+    extended_precision: bool,
+) -> Result<Vec<i32>, TransformError> {
+    if log2_tbs(n_tbs).is_none() {
+        return Err(TransformError::InvalidBlockSize(n_tbs));
+    }
+    if !(8..=16).contains(&bit_depth) {
+        return Err(TransformError::InvalidBitDepth(bit_depth));
+    }
+    if d.len() != n_tbs * n_tbs {
+        return Err(TransformError::LengthMismatch {
+            expected: n_tbs * n_tbs,
+            got: d.len(),
+        });
+    }
+    let (coeff_min, coeff_max) = coeff_range(bit_depth, extended_precision);
+    if !fits_i32_accumulation(n_tbs, coeff_min, coeff_max) {
+        // Extended precision widens coeffMin/coeffMax past the point
+        // where a 32-bit lane can hold a partial sum; that path keeps
+        // the exact i64 reference below.
+        return inverse_transform_reference(
+            d,
+            n_tbs,
+            pred_mode,
+            component,
+            bit_depth,
+            extended_precision,
+        );
+    }
+    // §8.6.4 trType: 1 iff MODE_INTRA, nTbS == 4, cIdx == 0.
+    let tr_type =
+        matches!(pred_mode, PredMode::Intra) && n_tbs == 4 && matches!(component, Component::Luma);
+    Ok(inverse_transform_i32(
+        backend, d, n_tbs, tr_type, coeff_min, coeff_max,
+    ))
+}
+
+/// Largest magnitude in the §8.6.4.2 basis tables: [`DCT32`] peaks at 90
+/// and [`DST4`] at 84.
+const MAX_BASIS_MAGNITUDE: i64 = 90;
+
+/// Whether a full `nTbS`-term §8.6.4.2 butterfly over inputs bounded by
+/// `coeffMin`/`coeffMax` is guaranteed to stay inside `i32`.
+///
+/// Both transform passes take clipped input (`d` from §8.6.3, and the
+/// equation-8-314 `g` between the passes), so the worst case is `nTbS`
+/// terms of `maxBasis * max( |coeffMin|, coeffMax )`. That holds for
+/// every 4/8/16/32 block at the default 16-bit coefficient range but not
+/// for the wider extended-precision one, which keeps the `i64` path.
+fn fits_i32_accumulation(n_tbs: usize, coeff_min: i32, coeff_max: i32) -> bool {
+    let magnitude = core::cmp::max(i64::from(coeff_max), -i64::from(coeff_min));
+    n_tbs as i64 * MAX_BASIS_MAGNITUDE * magnitude <= i64::from(i32::MAX)
+}
+
+/// The §8.6.4 separable inverse transform accumulated in `i32` lanes.
+///
+/// Identical arithmetic to [`inverse_transform_reference`], reassociated
+/// so the innermost loop is a vectorizable
+/// [`transform_simd::accumulate_scaled`] over all `nTbS` outputs instead
+/// of a serial per-output dot product. Zero inputs contribute nothing and
+/// are skipped outright, which matters because dequantized coefficient
+/// blocks are overwhelmingly sparse.
+///
+/// The caller must have checked [`fits_i32_accumulation`].
+fn inverse_transform_i32(
+    backend: Backend,
+    d: &[i32],
+    n_tbs: usize,
+    tr_type: bool,
+    coeff_min: i32,
+    coeff_max: i32,
+) -> Vec<i32> {
+    let count = n_tbs * n_tbs;
+    // nTbS is always 4/8/16/32, so the per-column/per-row 1-D transform
+    // inputs/outputs fit in fixed-size stack buffers; this avoids two
+    // heap allocations per column and per row of every transform block
+    // decoded, which otherwise dominates decode time at 1080p.
+    let mut in_buf = [0i32; 32];
+    let mut out_buf = [0i32; 32];
+
+    // §8.6.4 step 1: column transform d[x][y] over y -> e[x][y].
+    // d is row-major by y; a column is the fixed-x slice.
+    let mut e = vec![0i32; count];
+    for x in 0..n_tbs {
+        let col = &mut in_buf[..n_tbs];
+        for (y, cv) in col.iter_mut().enumerate() {
+            *cv = d[y * n_tbs + x];
+        }
+        if col.iter().all(|&value| value == 0) {
+            continue;
+        }
+        let te = &mut out_buf[..n_tbs];
+        transform_1d_i32_into(backend, col, n_tbs, tr_type, te);
+        for (y, &v) in te.iter().enumerate() {
+            e[y * n_tbs + x] = v;
+        }
+    }
+
+    // §8.6.4 step 2 (eq. 8-314): g[x][y] = clip( (e + 64) >> 7 ).
+    for ev in &mut e {
+        *ev = ((*ev + 64) >> 7).clamp(coeff_min, coeff_max);
+    }
+
+    // §8.6.4 step 3: row transform g[x][y] over x -> r[x][y].
+    let mut r = vec![0i32; count];
+    for y in 0..n_tbs {
+        let row = &e[y * n_tbs..(y + 1) * n_tbs];
+        if row.iter().all(|&value| value == 0) {
+            continue;
+        }
+        // Per the spec the §8.6.4 row output is not itself clipped;
+        // equation 8-299's bdShift round (in residual_block) is what
+        // reduces it.
+        transform_1d_i32_into(
+            backend,
+            row,
+            n_tbs,
+            tr_type,
+            &mut r[y * n_tbs..(y + 1) * n_tbs],
+        );
+    }
+    r
+}
+
+/// [`transform_1d_into`] over `i32` lanes, driven as one
+/// broadcast-multiply-add per non-zero input rather than one dot product
+/// per output.
+///
+/// `out[ i ] = Σ_j transMatrix[ i ][ j ] * x[ j ]` is computed as
+/// `Σ_j x[ j ] * ( row j of the basis )`, which is the same sum of the
+/// same integer products — addition is associative in `i32` as long as
+/// no partial sum overflows, which [`fits_i32_accumulation`] guarantees.
+/// See [`transform_1d_into`] for why the in-code [`DST4`] / [`DCT32`]
+/// tables are read transposed relative to the printed equations.
+fn transform_1d_i32_into(
+    backend: Backend,
+    input: &[i32],
+    n_tbs: usize,
+    tr_type: bool,
+    out: &mut [i32],
+) {
+    debug_assert_eq!(input.len(), n_tbs);
+    debug_assert_eq!(out.len(), n_tbs);
+    if tr_type {
+        // §8.6.4.2 eq. 8-315/8-316, the 4x4 DST. trType == 1 is only
+        // ever invoked with nTbS == 4, so consecutive basis rows are
+        // consecutive DST4 rows.
+        transform_simd::transform_1d(backend, input, out, DST4.as_flattened(), 4, 1);
+    } else {
+        // §8.6.4.2 eq. 8-317, stride = 1 << (5 - log2(nTbS)).
+        let log2 = log2_tbs(n_tbs).expect("transform_1d called with non-2^k nTbS");
+        let stride = 1usize << (5 - log2);
+        transform_simd::transform_1d(backend, input, out, DCT32.as_flattened(), 32, stride);
+    }
+}
+
+/// The unreassociated `i64` reference implementation of §8.6.4.
+///
+/// [`inverse_transform`] produces bit-identical output through the
+/// vectorized `i32` kernels for every block whose coefficient range fits
+/// (see [`fits_i32_accumulation`]); this is what runs for the wider
+/// extended-precision ranges, and what the SIMD backends are tested
+/// against.
+///
+/// # Errors
+/// As for [`inverse_transform`].
+pub fn inverse_transform_reference(
     d: &[i32],
     n_tbs: usize,
     pred_mode: PredMode,
