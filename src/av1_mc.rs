@@ -2574,8 +2574,8 @@ mod tests {
             for _ in 0..3 {
                 let start = Instant::now();
                 for block in 0..blocks {
-                    let x = (block % 200) as i32;
-                    let y = ((block / 200) % 200) as i32;
+                    let x = block % 200;
+                    let y = (block / 200) % 200;
                     context.predict_single(
                         reference,
                         x,
