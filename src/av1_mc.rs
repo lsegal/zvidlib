@@ -2008,3 +2008,621 @@ mod neon {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Small deterministic PRNG so the fixtures below are reproducible
+    /// without pulling in a dependency.
+    struct Rng(u64);
+
+    impl Rng {
+        fn new(seed: u64) -> Rng {
+            Rng(seed | 1)
+        }
+
+        fn next(&mut self) -> u32 {
+            let mut state = self.0;
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            self.0 = state;
+            (state >> 32) as u32
+        }
+
+        fn byte(&mut self) -> u8 {
+            (self.next() & 0xff) as u8
+        }
+    }
+
+    /// A pseudo-random reference plane with a few flat and saturated
+    /// regions, so kernels are exercised on both smooth and clipping input.
+    fn reference_plane(width: usize, height: usize, seed: u64) -> Vec<u8> {
+        let mut rng = Rng::new(seed);
+        let mut plane = vec![0u8; width * height];
+        for (index, sample) in plane.iter_mut().enumerate() {
+            *sample = match index % 37 {
+                0..=3 => 0,
+                4..=7 => 255,
+                _ => rng.byte(),
+            };
+        }
+        plane
+    }
+
+    /// Block geometries covering vector-width multiples, sub-vector widths,
+    /// and widths whose tail the vector loops cannot cover.
+    const BLOCK_SIZES: [(usize, usize); 12] = [
+        (4, 4),
+        (4, 8),
+        (8, 4),
+        (8, 8),
+        (12, 12),
+        (16, 16),
+        (16, 8),
+        (20, 4),
+        (32, 32),
+        (33, 5),
+        (64, 64),
+        (7, 9),
+    ];
+
+    #[test]
+    fn every_filter_phase_sums_to_unity() {
+        for set in SUBPEL_FILTERS.iter() {
+            for taps in set.iter() {
+                let sum: i32 = taps.iter().map(|tap| i32::from(*tap)).sum();
+                assert_eq!(sum, 1 << FILTER_BITS, "filter phase {taps:?} is not unity");
+            }
+        }
+    }
+
+    #[test]
+    fn whole_pel_phase_is_a_pure_copy() {
+        for set in SUBPEL_FILTERS.iter() {
+            assert_eq!(set[0], [0, 0, 0, 1 << FILTER_BITS, 0, 0, 0, 0]);
+        }
+    }
+
+    #[test]
+    fn narrow_blocks_select_the_four_tap_sets() {
+        for filter in InterpFilter::ALL {
+            for subpel in 1..SUBPEL_SHIFTS {
+                let narrow = filter.taps(4, subpel);
+                if filter != InterpFilter::Bilinear {
+                    assert_eq!(narrow[0], 0, "narrow {filter:?} uses an eight-tap span");
+                    assert_eq!(narrow[7], 0, "narrow {filter:?} uses an eight-tap span");
+                }
+            }
+            // Wide blocks keep the full eight-tap span for the sharp filter.
+            if filter == InterpFilter::Sharp {
+                assert_ne!(filter.taps(8, 8)[0], 0);
+            }
+        }
+    }
+
+    #[test]
+    fn flat_input_is_reproduced_exactly() {
+        let plane = vec![137u8; 32 * 32];
+        let reference = RefPlane::new(&plane, 32, 32);
+        for level in available_levels() {
+            let mut context = McContext::with_level(level);
+            for filter in InterpFilter::ALL {
+                for subpel_x in 0..SUBPEL_SHIFTS {
+                    for subpel_y in 0..SUBPEL_SHIFTS {
+                        let mut dst = vec![0u8; 16 * 16];
+                        context.predict_single(
+                            reference, 8, 8, 16, 16, subpel_x, subpel_y, filter, &mut dst, 16,
+                        );
+                        assert!(
+                            dst.iter().all(|sample| *sample == 137),
+                            "{} {filter:?} phase ({subpel_x},{subpel_y}) did not preserve a flat plane",
+                            level.name()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn whole_pel_prediction_copies_the_reference() {
+        let plane = reference_plane(48, 48, 7);
+        let reference = RefPlane::new(&plane, 48, 48);
+        for level in available_levels() {
+            let mut context = McContext::with_level(level);
+            for (width, height) in BLOCK_SIZES {
+                if width > 48 || height > 48 {
+                    continue;
+                }
+                let mut dst = vec![0u8; width * height];
+                context.predict_single(
+                    reference,
+                    3,
+                    5,
+                    width,
+                    height,
+                    0,
+                    0,
+                    InterpFilter::Regular,
+                    &mut dst,
+                    width,
+                );
+                for row in 0..height {
+                    let expected = &plane[(5 + row) * 48 + 3..][..width];
+                    assert_eq!(&dst[row * width..][..width], expected, "{}", level.name());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_backend_matches_the_scalar_single_prediction() {
+        let plane = reference_plane(96, 72, 0x5eed);
+        let reference = RefPlane::new(&plane, 96, 72);
+        // Positions include blocks that hang off every edge, exercising the
+        // clamped (edge-extended) reference fetch.
+        let positions = [(10i32, 12i32), (-5, 3), (0, 0), (90, 68), (-9, -9), (33, 7)];
+        let mut scalar = McContext::with_level(SimdLevel::Scalar);
+        for level in available_levels() {
+            if level == SimdLevel::Scalar {
+                continue;
+            }
+            let mut context = McContext::with_level(level);
+            assert_eq!(
+                context.level(),
+                level,
+                "backend {} unavailable",
+                level.name()
+            );
+            for (width, height) in BLOCK_SIZES {
+                for (x, y) in positions {
+                    for filter in InterpFilter::ALL {
+                        for (subpel_x, subpel_y) in
+                            [(0, 0), (1, 0), (0, 15), (5, 7), (8, 8), (15, 1)]
+                        {
+                            let mut expected = vec![0u8; width * height];
+                            let mut actual = vec![0u8; width * height];
+                            scalar.predict_single(
+                                reference,
+                                x,
+                                y,
+                                width,
+                                height,
+                                subpel_x,
+                                subpel_y,
+                                filter,
+                                &mut expected,
+                                width,
+                            );
+                            context.predict_single(
+                                reference,
+                                x,
+                                y,
+                                width,
+                                height,
+                                subpel_x,
+                                subpel_y,
+                                filter,
+                                &mut actual,
+                                width,
+                            );
+                            assert_eq!(
+                                actual,
+                                expected,
+                                "{} differs at {width}x{height} ({x},{y}) {filter:?} phase ({subpel_x},{subpel_y})",
+                                level.name()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_backend_matches_the_scalar_compound_prediction() {
+        let plane = reference_plane(96, 72, 0xc0ffee);
+        let reference = RefPlane::new(&plane, 96, 72);
+        let mut scalar = McContext::with_level(SimdLevel::Scalar);
+        for level in available_levels() {
+            if level == SimdLevel::Scalar {
+                continue;
+            }
+            let mut context = McContext::with_level(level);
+            for (width, height) in BLOCK_SIZES {
+                for filter in InterpFilter::ALL {
+                    for (subpel_x, subpel_y) in [(0, 0), (3, 11), (15, 15), (9, 0)] {
+                        let mut expected = vec![0i16; width * height];
+                        let mut actual = vec![0i16; width * height];
+                        scalar.predict_compound(
+                            reference,
+                            7,
+                            6,
+                            width,
+                            height,
+                            subpel_x,
+                            subpel_y,
+                            filter,
+                            &mut expected,
+                            width,
+                        );
+                        context.predict_compound(
+                            reference,
+                            7,
+                            6,
+                            width,
+                            height,
+                            subpel_x,
+                            subpel_y,
+                            filter,
+                            &mut actual,
+                            width,
+                        );
+                        assert_eq!(
+                            actual,
+                            expected,
+                            "{} differs at {width}x{height} {filter:?} phase ({subpel_x},{subpel_y})",
+                            level.name()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Builds two compound predictions and a mask for the blend tests.
+    fn compound_pair(width: usize, height: usize) -> (Vec<i16>, Vec<i16>, Vec<u8>) {
+        let plane = reference_plane(128, 128, 0xbeef);
+        let reference = RefPlane::new(&plane, 128, 128);
+        let mut context = McContext::with_level(SimdLevel::Scalar);
+        let mut first = vec![0i16; width * height];
+        let mut second = vec![0i16; width * height];
+        context.predict_compound(
+            reference,
+            5,
+            9,
+            width,
+            height,
+            5,
+            7,
+            InterpFilter::Sharp,
+            &mut first,
+            width,
+        );
+        context.predict_compound(
+            reference,
+            40,
+            33,
+            width,
+            height,
+            11,
+            2,
+            InterpFilter::Smooth,
+            &mut second,
+            width,
+        );
+        let mut mask = vec![0u8; width * height];
+        build_difference_mask(
+            &first, width, &second, width, width, height, false, &mut mask, width,
+        );
+        (first, second, mask)
+    }
+
+    #[test]
+    fn every_backend_matches_the_scalar_compound_blends() {
+        for (width, height) in BLOCK_SIZES {
+            let (first, second, mask) = compound_pair(width, height);
+            let mut expected = vec![0u8; width * height];
+            blend_average(
+                SimdLevel::Scalar,
+                &first,
+                width,
+                &second,
+                width,
+                width,
+                height,
+                &mut expected,
+                width,
+            );
+            for level in available_levels() {
+                let mut actual = vec![0u8; width * height];
+                blend_average(
+                    level,
+                    &first,
+                    width,
+                    &second,
+                    width,
+                    width,
+                    height,
+                    &mut actual,
+                    width,
+                );
+                assert_eq!(actual, expected, "{} average blend", level.name());
+
+                for (weight0, weight1) in [(9i16, 7i16), (11, 5), (12, 4), (13, 3), (7, 9)] {
+                    let mut reference_blend = vec![0u8; width * height];
+                    let mut candidate = vec![0u8; width * height];
+                    blend_distance(
+                        SimdLevel::Scalar,
+                        &first,
+                        width,
+                        &second,
+                        width,
+                        weight0,
+                        weight1,
+                        width,
+                        height,
+                        &mut reference_blend,
+                        width,
+                    );
+                    blend_distance(
+                        level,
+                        &first,
+                        width,
+                        &second,
+                        width,
+                        weight0,
+                        weight1,
+                        width,
+                        height,
+                        &mut candidate,
+                        width,
+                    );
+                    assert_eq!(
+                        candidate,
+                        reference_blend,
+                        "{} distance blend {weight0}/{weight1}",
+                        level.name()
+                    );
+                }
+
+                let mut reference_blend = vec![0u8; width * height];
+                let mut candidate = vec![0u8; width * height];
+                blend_mask(
+                    SimdLevel::Scalar,
+                    &first,
+                    width,
+                    &second,
+                    width,
+                    &mask,
+                    width,
+                    width,
+                    height,
+                    &mut reference_blend,
+                    width,
+                );
+                blend_mask(
+                    level,
+                    &first,
+                    width,
+                    &second,
+                    width,
+                    &mask,
+                    width,
+                    width,
+                    height,
+                    &mut candidate,
+                    width,
+                );
+                assert_eq!(candidate, reference_blend, "{} masked blend", level.name());
+            }
+        }
+    }
+
+    #[test]
+    fn average_blend_matches_the_naive_whole_pel_average() {
+        // At whole-pel phases the compound path carries the reference
+        // samples at 16x scale, so the average blend must agree with the
+        // plain `(a + b + 1) >> 1` a scalar decoder would compute.
+        let plane = reference_plane(64, 64, 0x1234);
+        let reference = RefPlane::new(&plane, 64, 64);
+        let mut context = McContext::new();
+        let (width, height) = (16, 16);
+        let mut first = vec![0i16; width * height];
+        let mut second = vec![0i16; width * height];
+        context.predict_compound(
+            reference,
+            4,
+            4,
+            width,
+            height,
+            0,
+            0,
+            InterpFilter::Regular,
+            &mut first,
+            width,
+        );
+        context.predict_compound(
+            reference,
+            20,
+            30,
+            width,
+            height,
+            0,
+            0,
+            InterpFilter::Regular,
+            &mut second,
+            width,
+        );
+        let mut blended = vec![0u8; width * height];
+        blend_average(
+            context.level(),
+            &first,
+            width,
+            &second,
+            width,
+            width,
+            height,
+            &mut blended,
+            width,
+        );
+        for row in 0..height {
+            for column in 0..width {
+                let a = u16::from(plane[(4 + row) * 64 + 4 + column]);
+                let b = u16::from(plane[(30 + row) * 64 + 20 + column]);
+                assert_eq!(blended[row * width + column], ((a + b + 1) >> 1) as u8);
+            }
+        }
+    }
+
+    #[test]
+    fn difference_mask_stays_in_range_and_inverts() {
+        let (width, height) = (16, 16);
+        let (first, second, mask) = compound_pair(width, height);
+        let mut inverted = vec![0u8; width * height];
+        build_difference_mask(
+            &first,
+            width,
+            &second,
+            width,
+            width,
+            height,
+            true,
+            &mut inverted,
+            width,
+        );
+        for (alpha, complement) in mask.iter().zip(&inverted) {
+            assert!(*alpha <= MAX_MASK_ALPHA);
+            assert_eq!(*alpha + *complement, MAX_MASK_ALPHA);
+        }
+        assert!(mask.iter().any(|alpha| *alpha > DIFF_MASK_BASE as u8));
+    }
+
+    #[test]
+    fn masked_blend_at_the_extremes_selects_one_prediction() {
+        let (width, height) = (16, 16);
+        let (first, second, _) = compound_pair(width, height);
+        for (alpha, expected_source) in [(MAX_MASK_ALPHA, &first), (0, &second)] {
+            let mask = vec![alpha; width * height];
+            let mut blended = vec![0u8; width * height];
+            blend_mask(
+                detected_level(),
+                &first,
+                width,
+                &second,
+                width,
+                &mask,
+                width,
+                width,
+                height,
+                &mut blended,
+                width,
+            );
+            for (sample, source) in blended.iter().zip(expected_source) {
+                assert_eq!(
+                    *sample,
+                    clip_pixel(round2(i32::from(*source), INTER_POST_ROUND))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn distance_weights_sum_to_sixteen_and_mirror() {
+        for d0 in 0..12u32 {
+            for d1 in 0..12u32 {
+                let (weight0, weight1) = distance_weights(d0, d1);
+                assert_eq!(weight0 + weight1, 16, "weights for ({d0},{d1})");
+                if d0 != d1 {
+                    let (mirror0, mirror1) = distance_weights(d1, d0);
+                    assert_eq!((mirror1, mirror0), (weight0, weight1));
+                }
+                if d0 > 0 && d1 > 0 && d0 < d1 {
+                    assert!(
+                        weight0 >= weight1,
+                        "the nearer reference must not lose weight at ({d0},{d1})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn simd_backends_outrun_the_scalar_kernels() {
+        use std::time::{Duration, Instant};
+
+        let plane = reference_plane(256, 256, 0xf00d);
+        let reference = RefPlane::new(&plane, 256, 256);
+        let (width, height) = (16, 16);
+        let blocks = 8_000;
+        let mut timings = Vec::new();
+        for level in available_levels() {
+            let mut context = McContext::with_level(level);
+            let mut dst = vec![0u8; width * height];
+            let mut checksum = 0u64;
+            // Warm the caches and the branch predictors before timing.
+            for _ in 0..64 {
+                context.predict_single(
+                    reference,
+                    8,
+                    8,
+                    width,
+                    height,
+                    5,
+                    7,
+                    InterpFilter::Regular,
+                    &mut dst,
+                    width,
+                );
+            }
+            // Shared CI runners are noisy, so the best of three trials is
+            // reported rather than a single measurement.
+            let mut elapsed = Duration::MAX;
+            for _ in 0..3 {
+                let start = Instant::now();
+                for block in 0..blocks {
+                    let x = (block % 200) as i32;
+                    let y = ((block / 200) % 200) as i32;
+                    context.predict_single(
+                        reference,
+                        x,
+                        y,
+                        width,
+                        height,
+                        5,
+                        7,
+                        InterpFilter::Regular,
+                        &mut dst,
+                        width,
+                    );
+                    checksum += u64::from(dst[0]);
+                }
+                elapsed = elapsed.min(start.elapsed());
+            }
+            assert!(checksum > 0);
+            timings.push((level, elapsed));
+        }
+        let scalar = timings
+            .iter()
+            .find(|(level, _)| *level == SimdLevel::Scalar)
+            .map(|(_, elapsed)| *elapsed)
+            .expect("scalar timing");
+        for (level, elapsed) in &timings {
+            let nanos = elapsed.as_nanos().max(1);
+            println!(
+                "av1_mc {:>7}: {:>8.1} ns/block, {:>6.2} Mpixel/s, {:.2}x scalar",
+                level.name(),
+                nanos as f64 / f64::from(blocks),
+                (blocks as f64 * (width * height) as f64) / nanos as f64 * 1_000.0,
+                scalar.as_nanos() as f64 / nanos as f64,
+            );
+        }
+        // Timing is machine-dependent, so only the ordering is asserted, and
+        // only when a vector backend actually exists.
+        if timings.len() > 1 {
+            let best = timings
+                .iter()
+                .filter(|(level, _)| *level != SimdLevel::Scalar)
+                .map(|(_, elapsed)| *elapsed)
+                .min()
+                .expect("vector timing");
+            assert!(
+                best < scalar,
+                "no vector backend beat the scalar kernels ({best:?} vs {scalar:?})"
+            );
+        }
+    }
+}
