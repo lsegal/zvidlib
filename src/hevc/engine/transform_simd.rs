@@ -917,12 +917,29 @@ mod tests {
                 })
                 .collect();
             let levels = d.clone();
-            let iterations = 2_000_000 / count;
+            // Enough repetitions that each timed section runs for
+            // ~100ms, plus an untimed warmup, so the numbers are not
+            // dominated by first-touch and loop-entry noise.
+            let iterations = 20_000_000 / count;
+            let warmup = iterations / 8;
 
             // Baseline: the unreassociated i64 reference this change
             // replaced, so the table shows the end-to-end speedup and not
             // just backend-to-backend deltas.
             let mut sink = 0i64;
+            for _ in 0..warmup {
+                sink += i64::from(
+                    inverse_transform_reference(
+                        &d,
+                        n_tbs,
+                        PredMode::Inter,
+                        Component::Luma,
+                        bit_depth,
+                        false,
+                    )
+                    .expect("valid transform inputs")[0],
+                );
+            }
             let start = Instant::now();
             for _ in 0..iterations {
                 let r = inverse_transform_reference(
@@ -943,6 +960,20 @@ mod tests {
             );
 
             for backend in supported_backends() {
+                for _ in 0..warmup {
+                    sink += i64::from(
+                        inverse_transform_with_backend(
+                            backend,
+                            &d,
+                            n_tbs,
+                            PredMode::Inter,
+                            Component::Luma,
+                            bit_depth,
+                            false,
+                        )
+                        .expect("valid transform inputs")[0],
+                    );
+                }
                 let start = Instant::now();
                 for _ in 0..iterations {
                     let r = inverse_transform_with_backend(
@@ -967,6 +998,10 @@ mod tests {
                     coeff_max,
                 };
                 let mut out = vec![0i32; count];
+                for _ in 0..warmup {
+                    dequant_block(backend, &mut out, &levels, None, params);
+                    sink += i64::from(out[0]);
+                }
                 let start = Instant::now();
                 for _ in 0..iterations {
                     dequant_block(backend, &mut out, &levels, None, params);
