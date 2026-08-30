@@ -257,7 +257,7 @@ pub fn scale_coefficients(
         levels,
         scaling.map(|sf| sf.coef.as_slice()),
         transform_simd::DequantParams {
-            level_scale: level_scale as i32,
+            level_scale,
             qp_div6,
             bd_shift: bd_shift as u32,
             coeff_min,

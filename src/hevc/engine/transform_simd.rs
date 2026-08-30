@@ -506,3 +506,322 @@ mod aarch64 {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hevc::engine::scaling_list::ScalingFactorMatrix;
+    use crate::hevc::engine::transform::{
+        Component, PredMode, coeff_range, inverse_transform_reference,
+        inverse_transform_with_backend, scale_coefficients,
+    };
+
+    /// Small deterministic LCG so tests are reproducible without `rand`.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next_u32(&mut self) -> u32 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (self.0 >> 32) as u32
+        }
+        /// A signed value spanning `[ -bound, bound ]`.
+        fn signed(&mut self, bound: i32) -> i32 {
+            (self.next_u32() % (2 * bound as u32 + 1)) as i32 - bound
+        }
+    }
+
+    /// The host always offers the scalar reference, and never reports a
+    /// backend for another architecture.
+    #[test]
+    fn detected_backend_is_supported() {
+        assert!(detected().supported());
+        let backends = supported_backends();
+        assert_eq!(backends[0], Backend::Scalar);
+        assert!(backends.contains(&detected()));
+        assert!(backends.iter().all(|b| b.supported()));
+    }
+
+    /// Every vector butterfly kernel reproduces the scalar accumulation
+    /// exactly, including the sub-vector tail lengths a hand-written
+    /// caller could pass (block sides are always 4/8/16/32, but the
+    /// kernel must not silently drop a remainder).
+    #[test]
+    fn accumulate_scaled_matches_scalar_for_every_backend() {
+        let mut rng = Lcg(0x51ed_2701);
+        for len in [1usize, 2, 3, 4, 5, 7, 8, 9, 15, 16, 31, 32] {
+            for _ in 0..64 {
+                let coeffs: Vec<i32> = (0..len).map(|_| rng.signed(90)).collect();
+                let seed: Vec<i32> = (0..len).map(|_| rng.signed(1 << 20)).collect();
+                let scale = rng.signed(1 << 15);
+
+                let mut expected = seed.clone();
+                accumulate_scaled(Backend::Scalar, &mut expected, &coeffs, scale);
+                for backend in supported_backends() {
+                    let mut got = seed.clone();
+                    accumulate_scaled(backend, &mut got, &coeffs, scale);
+                    assert_eq!(got, expected, "backend {backend:?}, len {len}");
+                }
+            }
+        }
+    }
+
+    /// Every vector dequantization kernel reproduces §8.6.3 exactly for
+    /// every block size, both scaling-matrix modes, the whole HEVC `qP`
+    /// range, and both coefficient ranges.
+    #[test]
+    fn dequant_block_matches_scalar_for_every_backend() {
+        let mut rng = Lcg(0x0bad_c0de);
+        for n_tbs in [4usize, 8, 16, 32] {
+            let count = n_tbs * n_tbs;
+            for extended in [false, true] {
+                for bit_depth in [8u8, 10, 12, 16] {
+                    let (coeff_min, coeff_max) = coeff_range(bit_depth, extended);
+                    let log2_range = if extended {
+                        core::cmp::max(15, i32::from(bit_depth) + 6)
+                    } else {
+                        15
+                    };
+                    let log2_tbs = n_tbs.trailing_zeros() as i32;
+                    let bd_shift = i32::from(bit_depth) + log2_tbs + 10 - log2_range;
+                    // The full §7.4.3.1 qP range for the bit depth,
+                    // 0..=51 + 6 * (bitDepth - 8).
+                    for q_p in (0..=51 + 6 * (u32::from(bit_depth) - 8)).step_by(3) {
+                        let levels: Vec<i32> = (0..count).map(|_| rng.signed(coeff_max)).collect();
+                        // Explicit matrices carry the §7.4.5 1..=255 range.
+                        let m: Vec<u16> = (0..count)
+                            .map(|_| 1 + (rng.next_u32() % 255) as u16)
+                            .collect();
+                        let params = DequantParams {
+                            level_scale: super::super::transform::LEVEL_SCALE[(q_p % 6) as usize],
+                            qp_div6: q_p / 6,
+                            bd_shift: bd_shift as u32,
+                            coeff_min,
+                            coeff_max,
+                        };
+                        for matrix in [None, Some(m.as_slice())] {
+                            let mut expected = vec![0i32; count];
+                            dequant_block(Backend::Scalar, &mut expected, &levels, matrix, params);
+                            for backend in supported_backends() {
+                                let mut got = vec![0i32; count];
+                                dequant_block(backend, &mut got, &levels, matrix, params);
+                                assert_eq!(
+                                    got,
+                                    expected,
+                                    "backend {backend:?}, nTbS {n_tbs}, bitDepth \
+                                     {bit_depth}, extended {extended}, qP {q_p}, \
+                                     matrix {}",
+                                    matrix.is_some()
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The dispatched §8.6.3 scaling process is bit-exact with a direct
+    /// transcription of equation 8-309, end to end through
+    /// [`scale_coefficients`] (i.e. including the row-major
+    /// `ScalingFactor` handoff).
+    #[test]
+    fn scale_coefficients_matches_equation_8_309() {
+        let mut rng = Lcg(0x8609_0309);
+        for n_tbs in [4usize, 8, 16, 32] {
+            let count = n_tbs * n_tbs;
+            for bit_depth in [8u8, 10, 12] {
+                let (coeff_min, coeff_max) = coeff_range(bit_depth, false);
+                for q_p in 0..=51 + 6 * (u32::from(bit_depth) - 8) {
+                    let levels: Vec<i32> = (0..count).map(|_| rng.signed(coeff_max)).collect();
+                    let matrix = ScalingFactorMatrix {
+                        dim: n_tbs as u8,
+                        coef: (0..count)
+                            .map(|_| 1 + (rng.next_u32() % 255) as u16)
+                            .collect(),
+                    };
+                    for scaling in [None, Some(&matrix)] {
+                        let got =
+                            scale_coefficients(&levels, n_tbs, q_p, bit_depth, false, scaling)
+                                .expect("valid scaling inputs");
+                        let log2_tbs = n_tbs.trailing_zeros() as i32;
+                        let bd_shift = i32::from(bit_depth) + log2_tbs + 10 - 15;
+                        let round = 1i64 << (bd_shift - 1);
+                        let level_scale =
+                            i64::from(super::super::transform::LEVEL_SCALE[(q_p % 6) as usize]);
+                        for y in 0..n_tbs {
+                            for x in 0..n_tbs {
+                                let idx = y * n_tbs + x;
+                                let m = scaling.map_or(16i64, |sf| i64::from(sf.at(x, y)));
+                                let prod = i64::from(levels[idx]) * m * level_scale;
+                                let want = (((prod << (q_p / 6)) + round) >> bd_shift)
+                                    .clamp(i64::from(coeff_min), i64::from(coeff_max))
+                                    as i32;
+                                assert_eq!(
+                                    got[idx], want,
+                                    "nTbS {n_tbs}, bitDepth {bit_depth}, qP {q_p}, \
+                                     ({x},{y})"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The vectorized §8.6.4 inverse transform is bit-exact with the
+    /// `i64` reference for every transform size, both `trType` values,
+    /// and every backend the host supports — including saturated inputs
+    /// at the edges of the coefficient range.
+    #[test]
+    fn inverse_transform_matches_reference_for_every_backend() {
+        let mut rng = Lcg(0xfeed_face);
+        for n_tbs in [4usize, 8, 16, 32] {
+            let count = n_tbs * n_tbs;
+            for bit_depth in [8u8, 10, 12, 16] {
+                let (coeff_min, coeff_max) = coeff_range(bit_depth, false);
+                for (pred_mode, component) in [
+                    (PredMode::Intra, Component::Luma),
+                    (PredMode::Intra, Component::Cb),
+                    (PredMode::Inter, Component::Luma),
+                ] {
+                    for round in 0..24 {
+                        let d: Vec<i32> = (0..count)
+                            .map(|_| match round % 4 {
+                                // Sparse blocks (the common decode case),
+                                // dense blocks, and worst-case saturation.
+                                0 if rng.next_u32() % 8 != 0 => 0,
+                                1 => coeff_max,
+                                2 => coeff_min,
+                                _ => rng.signed(coeff_max),
+                            })
+                            .collect();
+                        let expected = inverse_transform_reference(
+                            &d, n_tbs, pred_mode, component, bit_depth, false,
+                        )
+                        .expect("valid transform inputs");
+                        for backend in supported_backends() {
+                            let got = inverse_transform_with_backend(
+                                backend, &d, n_tbs, pred_mode, component, bit_depth, false,
+                            )
+                            .expect("valid transform inputs");
+                            assert_eq!(
+                                got, expected,
+                                "backend {backend:?}, nTbS {n_tbs}, bitDepth {bit_depth}, \
+                                 {pred_mode:?}/{component:?}, round {round}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Extended precision widens the coefficient range past what an
+    /// `i32` accumulator can hold, so it must keep taking the exact
+    /// `i64` path rather than overflowing a vector lane.
+    #[test]
+    fn extended_precision_falls_back_to_the_i64_reference() {
+        let n_tbs = 32;
+        let count = n_tbs * n_tbs;
+        let (_, coeff_max) = coeff_range(16, true);
+        let d = vec![coeff_max; count];
+        let expected =
+            inverse_transform_reference(&d, n_tbs, PredMode::Inter, Component::Luma, 16, true)
+                .expect("valid transform inputs");
+        for backend in supported_backends() {
+            let got = inverse_transform_with_backend(
+                backend,
+                &d,
+                n_tbs,
+                PredMode::Inter,
+                Component::Luma,
+                16,
+                true,
+            )
+            .expect("valid transform inputs");
+            assert_eq!(got, expected, "backend {backend:?}");
+        }
+    }
+
+    /// Benchmark for the two vectorized kernels across the four HEVC
+    /// transform sizes, reported per backend against the scalar path.
+    ///
+    /// Ignored by default because it only measures; run it with
+    /// `cargo test --release --features native --lib \
+    ///  transform_simd::tests::bench -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "benchmark; run explicitly with --ignored --nocapture"]
+    fn bench_inverse_transform_and_dequant() {
+        use std::time::Instant;
+
+        let bit_depth = 8u8;
+        let (coeff_min, coeff_max) = coeff_range(bit_depth, false);
+        println!(
+            "host backend: {:?} (available: {:?})",
+            detected(),
+            supported_backends()
+        );
+        for n_tbs in [4usize, 8, 16, 32] {
+            let count = n_tbs * n_tbs;
+            let mut rng = Lcg(0x1234_5678);
+            // A realistically sparse dequantized block: a low-frequency
+            // cluster plus scattered high-frequency levels.
+            let d: Vec<i32> = (0..count)
+                .map(|i| {
+                    let (x, y) = (i % n_tbs, i / n_tbs);
+                    if x + y < 4 || rng.next_u32() % 16 == 0 {
+                        rng.signed(coeff_max)
+                    } else {
+                        0
+                    }
+                })
+                .collect();
+            let levels = d.clone();
+            let iterations = 2_000_000 / count;
+
+            for backend in supported_backends() {
+                let start = Instant::now();
+                let mut sink = 0i64;
+                for _ in 0..iterations {
+                    let r = inverse_transform_with_backend(
+                        backend,
+                        &d,
+                        n_tbs,
+                        PredMode::Inter,
+                        Component::Luma,
+                        bit_depth,
+                        false,
+                    )
+                    .expect("valid transform inputs");
+                    sink += i64::from(r[0]);
+                }
+                let transform = start.elapsed();
+
+                let params = DequantParams {
+                    level_scale: 51,
+                    qp_div6: 5,
+                    bd_shift: 7,
+                    coeff_min,
+                    coeff_max,
+                };
+                let mut out = vec![0i32; count];
+                let start = Instant::now();
+                for _ in 0..iterations {
+                    dequant_block(backend, &mut out, &levels, None, params);
+                    sink += i64::from(out[0]);
+                }
+                let dequant = start.elapsed();
+
+                println!(
+                    "{n_tbs:>2}x{n_tbs:<2} {backend:?}: inverse transform {:>9.2} ns/block, \
+                     dequant {:>9.2} ns/block (checksum {sink})",
+                    transform.as_nanos() as f64 / iterations as f64,
+                    dequant.as_nanos() as f64 / iterations as f64,
+                );
+            }
+        }
+    }
+}
