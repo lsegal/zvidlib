@@ -28,6 +28,8 @@ jobs:
         run: cargo check --all-targets --features native
       - name: Lint native target
         run: cargo clippy --all-targets --features native -- -D warnings
+      - name: Test AV1 SIMD motion compensation
+        run: cargo test --features native --lib av1_mc -- --nocapture
       - name: Test native_gl example overlays
         run: cargo test --features native --example native_gl
       - name: Check WebAssembly target
@@ -54,3 +56,5 @@ jobs:
         run: cargo check --all-targets --features native
       - name: Test accelerated HEVC selection and correctness
         run: cargo test --features native --test native_hevc_hardware -- --nocapture
+      - name: Test AV1 SIMD motion compensation
+        run: cargo test --features native --lib av1_mc -- --nocapture
