@@ -1066,18 +1066,16 @@ mod x86 {
     /// Requires SSE2.
     #[target_feature(enable = "sse4.1")]
     unsafe fn taps_epi32(taps: &[i16; 8]) -> [__m128i; 8] {
-        unsafe {
-            [
-                _mm_set1_epi32(i32::from(taps[0])),
-                _mm_set1_epi32(i32::from(taps[1])),
-                _mm_set1_epi32(i32::from(taps[2])),
-                _mm_set1_epi32(i32::from(taps[3])),
-                _mm_set1_epi32(i32::from(taps[4])),
-                _mm_set1_epi32(i32::from(taps[5])),
-                _mm_set1_epi32(i32::from(taps[6])),
-                _mm_set1_epi32(i32::from(taps[7])),
-            ]
-        }
+        [
+            _mm_set1_epi32(i32::from(taps[0])),
+            _mm_set1_epi32(i32::from(taps[1])),
+            _mm_set1_epi32(i32::from(taps[2])),
+            _mm_set1_epi32(i32::from(taps[3])),
+            _mm_set1_epi32(i32::from(taps[4])),
+            _mm_set1_epi32(i32::from(taps[5])),
+            _mm_set1_epi32(i32::from(taps[6])),
+            _mm_set1_epi32(i32::from(taps[7])),
+        ]
     }
 
     /// Broadcasts each tap into its own 256-bit 32-bit-lane vector.
@@ -1087,18 +1085,16 @@ mod x86 {
     /// Requires AVX2.
     #[target_feature(enable = "avx2")]
     unsafe fn taps_epi32_avx2(taps: &[i16; 8]) -> [__m256i; 8] {
-        unsafe {
-            [
-                _mm256_set1_epi32(i32::from(taps[0])),
-                _mm256_set1_epi32(i32::from(taps[1])),
-                _mm256_set1_epi32(i32::from(taps[2])),
-                _mm256_set1_epi32(i32::from(taps[3])),
-                _mm256_set1_epi32(i32::from(taps[4])),
-                _mm256_set1_epi32(i32::from(taps[5])),
-                _mm256_set1_epi32(i32::from(taps[6])),
-                _mm256_set1_epi32(i32::from(taps[7])),
-            ]
-        }
+        [
+            _mm256_set1_epi32(i32::from(taps[0])),
+            _mm256_set1_epi32(i32::from(taps[1])),
+            _mm256_set1_epi32(i32::from(taps[2])),
+            _mm256_set1_epi32(i32::from(taps[3])),
+            _mm256_set1_epi32(i32::from(taps[4])),
+            _mm256_set1_epi32(i32::from(taps[5])),
+            _mm256_set1_epi32(i32::from(taps[6])),
+            _mm256_set1_epi32(i32::from(taps[7])),
+        ]
     }
 
     /// Scalar remainder of the horizontal pass, for the columns a vector
@@ -1160,8 +1156,8 @@ mod x86 {
                         );
                     }
                     let packed = _mm_packs_epi32(
-                        _mm_srai_epi32(low, INTER_ROUND0 as i32),
-                        _mm_srai_epi32(high, INTER_ROUND0 as i32),
+                        _mm_srai_epi32::<{ INTER_ROUND0 as i32 }>(low),
+                        _mm_srai_epi32::<{ INTER_ROUND0 as i32 }>(high),
                     );
                     _mm_storeu_si128(dest.as_mut_ptr().add(column).cast::<__m128i>(), packed);
                     column += 8;
@@ -1203,7 +1199,7 @@ mod x86 {
                             _mm256_mullo_epi32(_mm256_cvtepu8_epi32(bytes), *coefficient),
                         );
                     }
-                    let shifted = _mm256_srai_epi32(accumulator, INTER_ROUND0 as i32);
+                    let shifted = _mm256_srai_epi32::<{ INTER_ROUND0 as i32 }>(accumulator);
                     let packed = _mm_packs_epi32(
                         _mm256_castsi256_si128(shifted),
                         _mm256_extracti128_si256(shifted, 1),
@@ -1228,14 +1224,12 @@ mod x86 {
         values: __m128i,
         coefficient: __m128i,
     ) -> (__m128i, __m128i) {
-        unsafe {
-            let products_low = _mm_mullo_epi16(values, coefficient);
-            let products_high = _mm_mulhi_epi16(values, coefficient);
-            (
-                _mm_add_epi32(low, _mm_unpacklo_epi16(products_low, products_high)),
-                _mm_add_epi32(high, _mm_unpackhi_epi16(products_low, products_high)),
-            )
-        }
+        let products_low = _mm_mullo_epi16(values, coefficient);
+        let products_high = _mm_mulhi_epi16(values, coefficient);
+        (
+            _mm_add_epi32(low, _mm_unpacklo_epi16(products_low, products_high)),
+            _mm_add_epi32(high, _mm_unpackhi_epi16(products_low, products_high)),
+        )
     }
 
     /// Widens sixteen 16-bit products into two 32-bit accumulators.
@@ -1250,14 +1244,12 @@ mod x86 {
         values: __m256i,
         coefficient: __m256i,
     ) -> (__m256i, __m256i) {
-        unsafe {
-            let products_low = _mm256_mullo_epi16(values, coefficient);
-            let products_high = _mm256_mulhi_epi16(values, coefficient);
-            (
-                _mm256_add_epi32(low, _mm256_unpacklo_epi16(products_low, products_high)),
-                _mm256_add_epi32(high, _mm256_unpackhi_epi16(products_low, products_high)),
-            )
-        }
+        let products_low = _mm256_mullo_epi16(values, coefficient);
+        let products_high = _mm256_mulhi_epi16(values, coefficient);
+        (
+            _mm256_add_epi32(low, _mm256_unpacklo_epi16(products_low, products_high)),
+            _mm256_add_epi32(high, _mm256_unpackhi_epi16(products_low, products_high)),
+        )
     }
 
     /// Vertical pass into 8-bit pixels, eight samples per iteration.
@@ -1279,6 +1271,7 @@ mod x86 {
     ) {
         unsafe {
             let rounding = _mm_set1_epi32(1 << (shift - 1));
+            let down = _mm_cvtsi32_si128(shift as i32);
             for row in 0..height {
                 let mut column = 0;
                 while column + 8 <= width {
@@ -1295,10 +1288,8 @@ mod x86 {
                         low = a;
                         high = b;
                     }
-                    let packed = _mm_packs_epi32(
-                        _mm_srai_epi32(low, shift as i32),
-                        _mm_srai_epi32(high, shift as i32),
-                    );
+                    let packed =
+                        _mm_packs_epi32(_mm_sra_epi32(low, down), _mm_sra_epi32(high, down));
                     _mm_storel_epi64(
                         dst.as_mut_ptr()
                             .add(row * dst_stride + column)
@@ -1339,6 +1330,7 @@ mod x86 {
     ) {
         unsafe {
             let rounding = _mm_set1_epi32(1 << (shift - 1));
+            let down = _mm_cvtsi32_si128(shift as i32);
             for row in 0..height {
                 let mut column = 0;
                 while column + 8 <= width {
@@ -1355,10 +1347,8 @@ mod x86 {
                         low = a;
                         high = b;
                     }
-                    let packed = _mm_packs_epi32(
-                        _mm_srai_epi32(low, shift as i32),
-                        _mm_srai_epi32(high, shift as i32),
-                    );
+                    let packed =
+                        _mm_packs_epi32(_mm_sra_epi32(low, down), _mm_sra_epi32(high, down));
                     _mm_storeu_si128(
                         dst.as_mut_ptr()
                             .add(row * dst_stride + column)
@@ -1399,6 +1389,7 @@ mod x86 {
     ) {
         unsafe {
             let rounding = _mm256_set1_epi32(1 << (shift - 1));
+            let down = _mm_cvtsi32_si128(shift as i32);
             for row in 0..height {
                 let mut column = 0;
                 while column + 16 <= width {
@@ -1416,8 +1407,8 @@ mod x86 {
                         high = b;
                     }
                     let packed = _mm256_packs_epi32(
-                        _mm256_srai_epi32(low, shift as i32),
-                        _mm256_srai_epi32(high, shift as i32),
+                        _mm256_sra_epi32(low, down),
+                        _mm256_sra_epi32(high, down),
                     );
                     let bytes = _mm256_packus_epi16(packed, packed);
                     _mm_storeu_si128(
@@ -1463,6 +1454,7 @@ mod x86 {
     ) {
         unsafe {
             let rounding = _mm256_set1_epi32(1 << (shift - 1));
+            let down = _mm_cvtsi32_si128(shift as i32);
             for row in 0..height {
                 let mut column = 0;
                 while column + 16 <= width {
@@ -1480,8 +1472,8 @@ mod x86 {
                         high = b;
                     }
                     let packed = _mm256_packs_epi32(
-                        _mm256_srai_epi32(low, shift as i32),
-                        _mm256_srai_epi32(high, shift as i32),
+                        _mm256_sra_epi32(low, down),
+                        _mm256_sra_epi32(high, down),
                     );
                     _mm256_storeu_si256(
                         dst.as_mut_ptr()
@@ -1524,6 +1516,7 @@ mod x86 {
             let weight0 = _mm_set1_epi16(params.weight0);
             let weight1 = _mm_set1_epi16(params.weight1);
             let rounding = _mm_set1_epi32(1 << (params.shift - 1));
+            let down = _mm_cvtsi32_si128(params.shift as i32);
             for row in 0..params.height {
                 let mut column = 0;
                 while column + 8 <= params.width {
@@ -1535,10 +1528,8 @@ mod x86 {
                     );
                     let (low, high) = accumulate_sse41(rounding, rounding, first, weight0);
                     let (low, high) = accumulate_sse41(low, high, second, weight1);
-                    let packed = _mm_packs_epi32(
-                        _mm_srai_epi32(low, params.shift as i32),
-                        _mm_srai_epi32(high, params.shift as i32),
-                    );
+                    let packed =
+                        _mm_packs_epi32(_mm_sra_epi32(low, down), _mm_sra_epi32(high, down));
                     _mm_storel_epi64(
                         dst.as_mut_ptr()
                             .add(row * dst_stride + column)
@@ -1577,6 +1568,7 @@ mod x86 {
             let weight0 = _mm256_set1_epi16(params.weight0);
             let weight1 = _mm256_set1_epi16(params.weight1);
             let rounding = _mm256_set1_epi32(1 << (params.shift - 1));
+            let down = _mm_cvtsi32_si128(params.shift as i32);
             for row in 0..params.height {
                 let mut column = 0;
                 while column + 16 <= params.width {
@@ -1589,8 +1581,8 @@ mod x86 {
                     let (low, high) = accumulate_avx2(rounding, rounding, first, weight0);
                     let (low, high) = accumulate_avx2(low, high, second, weight1);
                     let packed = _mm256_packs_epi32(
-                        _mm256_srai_epi32(low, params.shift as i32),
-                        _mm256_srai_epi32(high, params.shift as i32),
+                        _mm256_sra_epi32(low, down),
+                        _mm256_sra_epi32(high, down),
                     );
                     let bytes = _mm256_packus_epi16(packed, packed);
                     _mm_storeu_si128(
@@ -1637,6 +1629,7 @@ mod x86 {
         unsafe {
             let full = _mm_set1_epi16(i16::from(MAX_MASK_ALPHA));
             let rounding = _mm_set1_epi32(1 << (shift - 1));
+            let down = _mm_cvtsi32_si128(shift as i32);
             for row in 0..height {
                 let mut column = 0;
                 while column + 8 <= width {
@@ -1654,10 +1647,8 @@ mod x86 {
                     let inverse = _mm_sub_epi16(full, alpha);
                     let (low, high) = accumulate_sse41(rounding, rounding, first, alpha);
                     let (low, high) = accumulate_sse41(low, high, second, inverse);
-                    let packed = _mm_packs_epi32(
-                        _mm_srai_epi32(low, shift as i32),
-                        _mm_srai_epi32(high, shift as i32),
-                    );
+                    let packed =
+                        _mm_packs_epi32(_mm_sra_epi32(low, down), _mm_sra_epi32(high, down));
                     _mm_storel_epi64(
                         dst.as_mut_ptr()
                             .add(row * dst_stride + column)
@@ -1702,6 +1693,7 @@ mod x86 {
         unsafe {
             let full = _mm256_set1_epi16(i16::from(MAX_MASK_ALPHA));
             let rounding = _mm256_set1_epi32(1 << (shift - 1));
+            let down = _mm_cvtsi32_si128(shift as i32);
             for row in 0..height {
                 let mut column = 0;
                 while column + 16 <= width {
@@ -1720,8 +1712,8 @@ mod x86 {
                     let (low, high) = accumulate_avx2(rounding, rounding, first, alpha);
                     let (low, high) = accumulate_avx2(low, high, second, inverse);
                     let packed = _mm256_packs_epi32(
-                        _mm256_srai_epi32(low, shift as i32),
-                        _mm256_srai_epi32(high, shift as i32),
+                        _mm256_sra_epi32(low, down),
+                        _mm256_sra_epi32(high, down),
                     );
                     let bytes = _mm256_packus_epi16(packed, packed);
                     _mm_storeu_si128(

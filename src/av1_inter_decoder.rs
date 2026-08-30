@@ -45,6 +45,7 @@
 use crate::av1_cdf as cdf;
 use crate::av1_filters::{FilterFrame, FilterPlane, LoopFilterParams, TxSizeGrid, deblock_frame};
 use crate::av1_intra::{Av1TxType, get_ac_quant, get_dc_quant, inverse_transform};
+use crate::av1_mc::{InterpFilter, McContext, RefPlane, blend_average};
 use crate::{
     Av1FrameType, Av1Obu, Av1Parser, Av1SequenceHeader, Av1SymbolDecoder, Av1SyntaxSupport,
     ColorRange, Error, ErrorKind, Limits, Result, VideoDimensions, VideoFrame, inverse_wht_4x4,
@@ -420,6 +421,7 @@ struct InterFrameHeader {
     height: usize,
     base_q_idx: u8,
     loop_filter: LoopFilterParams,
+    interpolation_filter: InterpFilter,
 }
 
 /// Parses the frame header bits this decoder supports and positions `bits`
@@ -432,6 +434,9 @@ fn parse_inter_frame_header(
     mi_rows: usize,
 ) -> Result<InterFrameHeader> {
     require_bit(bits, false, "show_existing_frame in a coded Frame OBU")?;
+    // Intra-only frames never code an interpolation filter; the default is
+    // never consulted because they never motion-compensate.
+    let mut interpolation_filter = InterpFilter::Regular;
     let frame_type = match bits.read(2, "frame_type")? {
         0 => Av1FrameType::Key,
         1 => Av1FrameType::Inter,
@@ -515,10 +520,14 @@ fn parse_inter_frame_header(
         // allow_high_precision_mv is implicitly false with no bit read
         // (AV1 §5.9.2) — motion vectors are always integer-pel here.
         require_bit(bits, false, "is_filter_switchable")?;
-        // interpolation_filter selects the sub-pel tap set; motion vectors
-        // are always integer-pel in this decoder so its value has no
-        // reconstruction effect, but the bits must still be consumed.
-        bits.read(2, "interpolation_filter")?;
+        // interpolation_filter selects the sub-pel tap set. Motion vectors
+        // are always integer-pel in this decoder, so every tap set reduces
+        // to the same whole-sample copy, but the choice is still carried
+        // through to the motion-compensation primitives rather than being
+        // discarded.
+        let code = bits.read(2, "interpolation_filter")?;
+        interpolation_filter =
+            InterpFilter::from_code(code).ok_or_else(|| malformed("AV1 interpolation_filter"))?;
         require_bit(bits, false, "is_motion_mode_switchable")?;
         // use_ref_frame_mvs is never present: the sequence header is
         // required to have enable_ref_frame_mvs == 0 above, so
@@ -622,6 +631,7 @@ fn parse_inter_frame_header(
         height,
         base_q_idx,
         loop_filter,
+        interpolation_filter,
     })
 }
 
@@ -739,6 +749,13 @@ struct InterTileDecoder<'a> {
     frame_type: Av1FrameType,
     references: [Option<&'a RefSlot>; 7],
     reference_select: bool,
+    interpolation_filter: InterpFilter,
+    /// Reusable motion-compensation state, bound to the best SIMD backend
+    /// this host supports.
+    mc: McContext,
+    /// Per-reference compound prediction scratch, at the 16x compound scale
+    /// the blend kernels consume.
+    compound: [Vec<i16>; 2],
     motion_grid: Vec<Option<BlockMotion>>,
     base_q_idx: u8,
     tx_sizes: TxSizeGrid,
@@ -805,6 +822,9 @@ impl<'a> InterTileDecoder<'a> {
             frame_type: header.frame_type,
             references,
             reference_select: header.reference_select,
+            interpolation_filter: header.interpolation_filter,
+            mc: McContext::new(),
+            compound: [Vec::new(), Vec::new()],
             motion_grid: vec![None; contexts],
             base_q_idx: header.base_q_idx,
             tx_sizes: TxSizeGrid::new(width, height),
@@ -1123,10 +1143,15 @@ impl<'a> InterTileDecoder<'a> {
         MotionVector::default()
     }
 
-    /// Copies the reference block for a whole coding block at once: with
-    /// integer-pel translational motion every 4x4 transform block within it
-    /// shares the same displaced source region, so the residual stage only
-    /// needs to add coefficients on top of this prediction.
+    /// Motion-compensates a whole coding block at once through the shared
+    /// SIMD primitives in [`crate::av1_mc`]: with integer-pel translational
+    /// motion every 4x4 transform block within it shares the same displaced
+    /// source region, so the residual stage only needs to add coefficients
+    /// on top of this prediction.
+    ///
+    /// Compound blocks go through the 16x-scale compound prediction path and
+    /// the vectorized average blend, which is bit-identical to the
+    /// `(a + b + 1) >> 1` this used to compute one sample at a time.
     fn predict_inter_block(
         &mut self,
         row: usize,
@@ -1136,50 +1161,76 @@ impl<'a> InterTileDecoder<'a> {
     ) -> Result<()> {
         let x = column * 4;
         let y = row * 4;
-        let units = block_width / 4;
-        for by in 0..units {
-            for bx in 0..units {
-                let (dst_x, dst_y) = (x + bx * 4, y + by * 4);
-                if dst_x >= self.coded_width || dst_y >= self.coded_height {
-                    continue;
-                }
-                for sy in 0..4 {
-                    for sx in 0..4 {
-                        let mut samples = [0u8; 2];
-                        let reference_count = if prediction.compound { 2 } else { 1 };
-                        for (reference_slot, sample) in
-                            samples.iter_mut().enumerate().take(reference_count)
-                        {
-                            let reference_index = prediction.reference_indices[reference_slot];
-                            let reference = self.references[reference_index].ok_or_else(|| {
-                                malformed("AV1 inter block references an unavailable frame")
-                            })?;
-                            let motion = prediction.motion_vectors[reference_slot];
-                            let src_row = i64::from(dst_y as i32 + sy + motion.row);
-                            let src_col = i64::from(dst_x as i32 + sx + motion.column);
-                            if src_row < 0
-                                || src_col < 0
-                                || src_row as usize >= reference.height
-                                || src_col as usize >= reference.width
-                            {
-                                return Err(malformed(
-                                    "AV1 motion vector references outside the reference frame",
-                                ));
-                            }
-                            *sample = reference.luma
-                                [src_row as usize * reference.width + src_col as usize];
-                        }
-                        let sample = if prediction.compound {
-                            ((u16::from(samples[0]) + u16::from(samples[1]) + 1) >> 1) as u8
-                        } else {
-                            samples[0]
-                        };
-                        self.pixels
-                            [(dst_y + sy as usize) * self.coded_width + dst_x + sx as usize] =
-                            sample;
-                    }
-                }
+        if x >= self.coded_width || y >= self.coded_height {
+            return Ok(());
+        }
+        // Coding blocks may hang off the right or bottom edge of the coded
+        // plane; only the visible part is reconstructed.
+        let width = block_width.min(self.coded_width - x);
+        let height = block_width.min(self.coded_height - y);
+        let reference_count = if prediction.compound { 2 } else { 1 };
+        let stride = self.coded_width;
+        let filter = self.interpolation_filter;
+        for slot in 0..reference_count {
+            let reference = self.references[prediction.reference_indices[slot]]
+                .ok_or_else(|| malformed("AV1 inter block references an unavailable frame"))?;
+            let motion = prediction.motion_vectors[slot];
+            let source_x = x as i64 + i64::from(motion.column);
+            let source_y = y as i64 + i64::from(motion.row);
+            if source_x < 0
+                || source_y < 0
+                || source_x + width as i64 > reference.width as i64
+                || source_y + height as i64 > reference.height as i64
+            {
+                return Err(malformed(
+                    "AV1 motion vector references outside the reference frame",
+                ));
             }
+            let plane = RefPlane::new(&reference.luma, reference.width, reference.height);
+            let (source_x, source_y) = (source_x as i32, source_y as i32);
+            if prediction.compound {
+                self.compound[slot].clear();
+                self.compound[slot].resize(width * height, 0);
+                self.mc.predict_compound(
+                    plane,
+                    source_x,
+                    source_y,
+                    width,
+                    height,
+                    0,
+                    0,
+                    filter,
+                    &mut self.compound[slot],
+                    width,
+                );
+            } else {
+                self.mc.predict_single(
+                    plane,
+                    source_x,
+                    source_y,
+                    width,
+                    height,
+                    0,
+                    0,
+                    filter,
+                    &mut self.pixels[y * stride + x..],
+                    stride,
+                );
+            }
+        }
+        if prediction.compound {
+            let [first, second] = &self.compound;
+            blend_average(
+                self.mc.level(),
+                first,
+                width,
+                second,
+                width,
+                width,
+                height,
+                &mut self.pixels[y * stride + x..],
+                stride,
+            );
         }
         Ok(())
     }
@@ -2377,6 +2428,7 @@ mod tests {
             height: 16,
             base_q_idx: 0,
             loop_filter: LoopFilterParams::DISABLED,
+            interpolation_filter: InterpFilter::Regular,
         };
         let refs: [Option<RefSlot>; 8] = std::array::from_fn(|index| {
             if index == 0 {
@@ -2448,6 +2500,7 @@ mod tests {
             height: 16,
             base_q_idx: 0,
             loop_filter: LoopFilterParams::DISABLED,
+            interpolation_filter: InterpFilter::Regular,
         };
         let mut symbols = SymbolEncoder::new();
         symbols.symbol(&cdf::MV_JOINT, 1); // nonzero row, zero column
