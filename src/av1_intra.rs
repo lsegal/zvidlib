@@ -436,6 +436,24 @@ pub fn inverse_transform(
             .map(|value| value.clamp(i64::from(i16::MIN), i64::from(i16::MAX)) as i16)
             .collect(),
         Av1TxType::DctDct => {
+            // The vectorized kernels work in 32-bit lanes and decline blocks
+            // whose magnitudes could overflow one, so a coefficient the guard
+            // rejects simply falls through to the scalar butterflies below.
+            let narrow: Option<Vec<i32>> = dequantized
+                .iter()
+                .map(|&value| i32::try_from(value).ok())
+                .collect();
+            if let Some(values) = narrow {
+                let mut output = vec![0i16; size * size];
+                if crate::av1_simd::inverse_dct(
+                    crate::av1_simd::active_isa(),
+                    &values,
+                    size,
+                    &mut output,
+                ) {
+                    return output;
+                }
+            }
             let mut rows = vec![0i64; size * size];
             for row in 0..size {
                 let start = row * size;

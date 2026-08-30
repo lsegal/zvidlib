@@ -56,6 +56,16 @@ fn iwht_1d_inverse(o: [i64; 4]) -> [i64; 4] {
 /// applying the inverse butterfly to columns then rows. `iwht4x4(fwht4x4(r)) == r` for all `r`.
 #[must_use]
 pub fn fwht4x4(residual: &[i32; 16]) -> [i32; 16] {
+    if let Some(coefficients) = crate::av1_simd::fwht4x4(crate::av1_simd::active_isa(), residual) {
+        return coefficients;
+    }
+    fwht4x4_scalar(residual)
+}
+
+/// Portable reference implementation of [`fwht4x4`], and the oracle the
+/// vectorized kernels in [`crate::av1_simd`] are checked against.
+#[must_use]
+pub fn fwht4x4_scalar(residual: &[i32; 16]) -> [i32; 16] {
     // Undo the decoder's column pass: inverse butterfly down each column.
     let mut m = [[0i64; 4]; 4];
     for j in 0..4 {
@@ -86,6 +96,16 @@ pub fn fwht4x4(residual: &[i32; 16]) -> [i32; 16] {
 /// `base_q_idx == 0` block (AV1 §7.12.3, §7.13.3, §7.13.2.10).
 #[must_use]
 pub fn iwht4x4(quant: &[i32; 16]) -> [i32; 16] {
+    if let Some(residual) = crate::av1_simd::iwht4x4(crate::av1_simd::active_isa(), quant) {
+        return residual;
+    }
+    iwht4x4_scalar(quant)
+}
+
+/// Portable reference implementation of [`iwht4x4`], and the oracle the
+/// vectorized kernels in [`crate::av1_simd`] are checked against.
+#[must_use]
+pub fn iwht4x4_scalar(quant: &[i32; 16]) -> [i32; 16] {
     // Row pass with shift = 2 over Dequant = Quant * 4; the >> 2 cancels the * 4.
     let mut m = [[0i64; 4]; 4];
     for i in 0..4 {
