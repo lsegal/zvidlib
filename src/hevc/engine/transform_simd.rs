@@ -5,12 +5,13 @@
 //! runs on the order of millions of times per frame, so they are the
 //! natural place to spend explicit vectorization effort:
 //!
-//! * [`accumulate_scaled`] is the inner operation of the separable 1-D
-//!   inverse DCT/DST: `out[ i ] += scale * coeffs[ i ]` over a whole
-//!   basis row. Driving the butterfly as one broadcast-multiply-add per
-//!   *non-zero* input turns the `nTbS`-term dot product into `nTbS`
-//!   independent lanes and lets the (typically very sparse) coefficient
-//!   vector skip most of the work outright.
+//! * [`transform_1d`] is one pass of the separable 1-D inverse DCT/DST.
+//!   Driving the butterfly as one broadcast-multiply-add per *non-zero*
+//!   input — `out[ .. ] += x[ j ] * basisRow( j )` — turns the
+//!   `nTbS`-term dot product into `nTbS` independent lanes and lets the
+//!   (typically very sparse) coefficient vector skip most of the work
+//!   outright. The whole pass lives inside one `#[target_feature]`
+//!   function so the per-row work is never charged a non-inlinable call.
 //! * [`dequant_block`] is §8.6.3 equation 8-309 applied to every
 //!   position of a transform block.
 //!
@@ -114,47 +115,82 @@ pub fn supported_backends() -> Vec<Backend> {
     backends
 }
 
-/// `out[ i ] += scale * coeffs[ i ]` for the whole slice — one term of
-/// the §8.6.4.2 equation-8-315/8-317 butterfly, accumulated across all
-/// output positions at once.
+/// One pass of the §8.6.4.2 separable inverse transform:
+/// `out[ i ] = Σ_j basis[ j * row_step ][ i ] * input[ j ]`.
 ///
-/// `coeffs` is a row of the transform basis (`transMatrix`) and `scale`
-/// a single input coefficient. Callers must guarantee that no partial
-/// sum leaves the `i32` range; see
-/// [`crate::hevc::engine::transform::inverse_transform`], which checks
-/// the worst-case bound for `nTbS` and the block's `coeffMin`/`coeffMax`
-/// before choosing this path.
+/// `basis` is a row-major `transMatrix` table of `basis_stride`-wide
+/// rows ([`crate::hevc::engine::transform`] passes the flattened `DCT32`
+/// or `DST4`), and `row_step` is equation 8-317's `1 << ( 5 − log2( nTbS
+/// ) )` basis-row stride (always 1 for the DST). The sum is evaluated as
+/// one broadcast-multiply-add per non-zero `input[ j ]` across all
+/// `out.len()` output lanes, which is the same set of integer products
+/// added in a different order.
+///
+/// Callers must guarantee that no partial sum leaves the `i32` range;
+/// see [`crate::hevc::engine::transform::inverse_transform`], which
+/// checks the worst-case bound for `nTbS` and the block's
+/// `coeffMin`/`coeffMax` before choosing this path.
 ///
 /// # Panics
-/// Panics if `out` and `coeffs` have different lengths.
-pub fn accumulate_scaled(backend: Backend, out: &mut [i32], coeffs: &[i32], scale: i32) {
-    assert_eq!(out.len(), coeffs.len(), "butterfly operand length mismatch");
+/// Panics if `input` and `out` differ in length, or if `basis` is too
+/// short for the addressed rows.
+pub fn transform_1d(
+    backend: Backend,
+    input: &[i32],
+    out: &mut [i32],
+    basis: &[i32],
+    basis_stride: usize,
+    row_step: usize,
+) {
+    assert_eq!(input.len(), out.len(), "butterfly operand length mismatch");
+    assert!(
+        out.len() <= basis_stride,
+        "butterfly output wider than the basis"
+    );
+    assert!(
+        basis.len() >= (input.len() - 1) * row_step * basis_stride + out.len(),
+        "butterfly basis table too short"
+    );
     match backend {
         #[cfg(target_arch = "x86_64")]
         Backend::Avx2 => {
             // SAFETY: `Backend::Avx2` is only produced by `detected` /
             // `supported_backends` after `is_x86_feature_detected!` has
-            // confirmed AVX2 on this host.
-            unsafe { x86::accumulate_scaled_avx2(out, coeffs, scale) }
+            // confirmed AVX2 on this host. The length preconditions are
+            // asserted above.
+            unsafe { x86::transform_1d_avx2(input, out, basis, basis_stride, row_step) }
         }
         #[cfg(target_arch = "x86_64")]
         Backend::Sse41 | Backend::Sse42 => {
             // SAFETY: as above, for SSE4.1 (SSE4.2 implies SSE4.1).
-            unsafe { x86::accumulate_scaled_sse41(out, coeffs, scale) }
+            unsafe { x86::transform_1d_sse41(input, out, basis, basis_stride, row_step) }
         }
         #[cfg(target_arch = "aarch64")]
         Backend::Neon => {
             // SAFETY: NEON is architecturally guaranteed on aarch64.
-            unsafe { aarch64::accumulate_scaled_neon(out, coeffs, scale) }
+            unsafe { aarch64::transform_1d_neon(input, out, basis, basis_stride, row_step) }
         }
-        _ => accumulate_scaled_scalar(out, coeffs, scale),
+        _ => transform_1d_scalar(input, out, basis, basis_stride, row_step),
     }
 }
 
-/// Portable reference for [`accumulate_scaled`].
-fn accumulate_scaled_scalar(out: &mut [i32], coeffs: &[i32], scale: i32) {
-    for (o, &c) in out.iter_mut().zip(coeffs.iter()) {
-        *o += scale * c;
+/// Portable reference for [`transform_1d`].
+fn transform_1d_scalar(
+    input: &[i32],
+    out: &mut [i32],
+    basis: &[i32],
+    basis_stride: usize,
+    row_step: usize,
+) {
+    out.fill(0);
+    for (j, &xj) in input.iter().enumerate() {
+        if xj == 0 {
+            continue;
+        }
+        let row = &basis[j * row_step * basis_stride..][..out.len()];
+        for (o, &c) in out.iter_mut().zip(row.iter()) {
+            *o += xj * c;
+        }
     }
 }
 
@@ -251,45 +287,86 @@ mod x86 {
     use super::DequantParams;
     use core::arch::x86_64::*;
 
-    /// AVX2 [`super::accumulate_scaled`]: eight `i32` lanes per step,
-    /// `vpmulld` + `vpaddd`, with a scalar tail for the (never taken for
-    /// 4/8/16/32-wide blocks) remainder.
+    /// AVX2 [`super::transform_1d`]: eight `i32` lanes per step,
+    /// `vpmulld` + `vpaddd`, with a scalar tail for a width the vector
+    /// loop cannot cover (only `nTbS == 4` among the real block sizes).
     ///
     /// # Safety
-    /// The host must support AVX2.
+    /// The host must support AVX2. `basis` must cover every addressed row.
     #[target_feature(enable = "avx2")]
-    pub unsafe fn accumulate_scaled_avx2(out: &mut [i32], coeffs: &[i32], scale: i32) {
+    pub unsafe fn transform_1d_avx2(
+        input: &[i32],
+        out: &mut [i32],
+        basis: &[i32],
+        basis_stride: usize,
+        row_step: usize,
+    ) {
         unsafe {
-            let s = _mm256_set1_epi32(scale);
-            let mut i = 0;
-            while i + 8 <= out.len() {
-                let c = _mm256_loadu_si256(coeffs.as_ptr().add(i).cast());
-                let o = _mm256_loadu_si256(out.as_ptr().add(i).cast());
-                let acc = _mm256_add_epi32(o, _mm256_mullo_epi32(c, s));
-                _mm256_storeu_si256(out.as_mut_ptr().add(i).cast(), acc);
-                i += 8;
+            out.fill(0);
+            let n = out.len();
+            for (j, &xj) in input.iter().enumerate() {
+                if xj == 0 {
+                    continue;
+                }
+                let row = basis.as_ptr().add(j * row_step * basis_stride);
+                let s = _mm256_set1_epi32(xj);
+                let mut i = 0;
+                while i + 8 <= n {
+                    let c = _mm256_loadu_si256(row.add(i).cast());
+                    let o = _mm256_loadu_si256(out.as_ptr().add(i).cast());
+                    let acc = _mm256_add_epi32(o, _mm256_mullo_epi32(c, s));
+                    _mm256_storeu_si256(out.as_mut_ptr().add(i).cast(), acc);
+                    i += 8;
+                }
+                while i + 4 <= n {
+                    let c = _mm_loadu_si128(row.add(i).cast());
+                    let o = _mm_loadu_si128(out.as_ptr().add(i).cast());
+                    let acc = _mm_add_epi32(o, _mm_mullo_epi32(c, s));
+                    _mm_storeu_si128(out.as_mut_ptr().add(i).cast(), acc);
+                    i += 4;
+                }
+                while i < n {
+                    out[i] += xj * *row.add(i);
+                    i += 1;
+                }
             }
-            super::accumulate_scaled_scalar(&mut out[i..], &coeffs[i..], scale);
         }
     }
 
-    /// SSE4.1 [`super::accumulate_scaled`]: four `i32` lanes per step.
+    /// SSE4.1 [`super::transform_1d`]: four `i32` lanes per step.
     ///
     /// # Safety
-    /// The host must support SSE4.1.
+    /// The host must support SSE4.1. `basis` must cover every addressed row.
     #[target_feature(enable = "sse4.1")]
-    pub unsafe fn accumulate_scaled_sse41(out: &mut [i32], coeffs: &[i32], scale: i32) {
+    pub unsafe fn transform_1d_sse41(
+        input: &[i32],
+        out: &mut [i32],
+        basis: &[i32],
+        basis_stride: usize,
+        row_step: usize,
+    ) {
         unsafe {
-            let s = _mm_set1_epi32(scale);
-            let mut i = 0;
-            while i + 4 <= out.len() {
-                let c = _mm_loadu_si128(coeffs.as_ptr().add(i).cast());
-                let o = _mm_loadu_si128(out.as_ptr().add(i).cast());
-                let acc = _mm_add_epi32(o, _mm_mullo_epi32(c, s));
-                _mm_storeu_si128(out.as_mut_ptr().add(i).cast(), acc);
-                i += 4;
+            out.fill(0);
+            let n = out.len();
+            for (j, &xj) in input.iter().enumerate() {
+                if xj == 0 {
+                    continue;
+                }
+                let row = basis.as_ptr().add(j * row_step * basis_stride);
+                let s = _mm_set1_epi32(xj);
+                let mut i = 0;
+                while i + 4 <= n {
+                    let c = _mm_loadu_si128(row.add(i).cast());
+                    let o = _mm_loadu_si128(out.as_ptr().add(i).cast());
+                    let acc = _mm_add_epi32(o, _mm_mullo_epi32(c, s));
+                    _mm_storeu_si128(out.as_mut_ptr().add(i).cast(), acc);
+                    i += 4;
+                }
+                while i < n {
+                    out[i] += xj * *row.add(i);
+                    i += 1;
+                }
             }
-            super::accumulate_scaled_scalar(&mut out[i..], &coeffs[i..], scale);
         }
     }
 
@@ -427,22 +504,51 @@ mod aarch64 {
     use super::DequantParams;
     use core::arch::aarch64::*;
 
-    /// NEON [`super::accumulate_scaled`]: four `i32` lanes per step.
+    /// NEON [`super::transform_1d`]: four `i32` lanes per `vmlaq_s32`,
+    /// two per step.
     ///
     /// # Safety
-    /// The host must support NEON (guaranteed on aarch64).
+    /// The host must support NEON (guaranteed on aarch64). `basis` must
+    /// cover every addressed row.
     #[target_feature(enable = "neon")]
-    pub unsafe fn accumulate_scaled_neon(out: &mut [i32], coeffs: &[i32], scale: i32) {
+    pub unsafe fn transform_1d_neon(
+        input: &[i32],
+        out: &mut [i32],
+        basis: &[i32],
+        basis_stride: usize,
+        row_step: usize,
+    ) {
         unsafe {
-            let s = vdupq_n_s32(scale);
-            let mut i = 0;
-            while i + 4 <= out.len() {
-                let c = vld1q_s32(coeffs.as_ptr().add(i));
-                let o = vld1q_s32(out.as_ptr().add(i));
-                vst1q_s32(out.as_mut_ptr().add(i), vmlaq_s32(o, c, s));
-                i += 4;
+            out.fill(0);
+            let n = out.len();
+            for (j, &xj) in input.iter().enumerate() {
+                if xj == 0 {
+                    continue;
+                }
+                let row = basis.as_ptr().add(j * row_step * basis_stride);
+                let s = vdupq_n_s32(xj);
+                let mut i = 0;
+                while i + 8 <= n {
+                    let lo = vmlaq_s32(vld1q_s32(out.as_ptr().add(i)), vld1q_s32(row.add(i)), s);
+                    let hi = vmlaq_s32(
+                        vld1q_s32(out.as_ptr().add(i + 4)),
+                        vld1q_s32(row.add(i + 4)),
+                        s,
+                    );
+                    vst1q_s32(out.as_mut_ptr().add(i), lo);
+                    vst1q_s32(out.as_mut_ptr().add(i + 4), hi);
+                    i += 8;
+                }
+                while i + 4 <= n {
+                    let acc = vmlaq_s32(vld1q_s32(out.as_ptr().add(i)), vld1q_s32(row.add(i)), s);
+                    vst1q_s32(out.as_mut_ptr().add(i), acc);
+                    i += 4;
+                }
+                while i < n {
+                    out[i] += xj * *row.add(i);
+                    i += 1;
+                }
             }
-            super::accumulate_scaled_scalar(&mut out[i..], &coeffs[i..], scale);
         }
     }
 
@@ -543,25 +649,56 @@ mod tests {
         assert!(backends.iter().all(|b| b.supported()));
     }
 
-    /// Every vector butterfly kernel reproduces the scalar accumulation
-    /// exactly, including the sub-vector tail lengths a hand-written
+    /// Every vector butterfly kernel reproduces the scalar pass
+    /// exactly, including the sub-vector widths and basis-row strides a
     /// caller could pass (block sides are always 4/8/16/32, but the
     /// kernel must not silently drop a remainder).
     #[test]
-    fn accumulate_scaled_matches_scalar_for_every_backend() {
+    fn transform_1d_matches_scalar_for_every_backend() {
         let mut rng = Lcg(0x51ed_2701);
-        for len in [1usize, 2, 3, 4, 5, 7, 8, 9, 15, 16, 31, 32] {
-            for _ in 0..64 {
-                let coeffs: Vec<i32> = (0..len).map(|_| rng.signed(90)).collect();
-                let seed: Vec<i32> = (0..len).map(|_| rng.signed(1 << 20)).collect();
-                let scale = rng.signed(1 << 15);
+        for (n, basis_stride, row_step) in [
+            (1usize, 32usize, 1usize),
+            (3, 32, 1),
+            (4, 4, 1),
+            (4, 32, 8),
+            (5, 32, 1),
+            (7, 32, 1),
+            (8, 32, 4),
+            (9, 32, 1),
+            (15, 32, 1),
+            (16, 32, 2),
+            (31, 32, 1),
+            (32, 32, 1),
+        ] {
+            let basis: Vec<i32> = (0..(n * row_step * basis_stride + basis_stride))
+                .map(|_| rng.signed(90))
+                .collect();
+            for round in 0..64 {
+                // Alternate dense and sparse inputs so the kernels' zero
+                // skip is covered alongside the full accumulation.
+                let input: Vec<i32> = (0..n)
+                    .map(|_| {
+                        if round % 2 == 0 && rng.next_u32() % 4 != 0 {
+                            0
+                        } else {
+                            rng.signed(1 << 15)
+                        }
+                    })
+                    .collect();
 
-                let mut expected = seed.clone();
-                accumulate_scaled(Backend::Scalar, &mut expected, &coeffs, scale);
+                let mut expected = vec![0i32; n];
+                transform_1d(
+                    Backend::Scalar,
+                    &input,
+                    &mut expected,
+                    &basis,
+                    basis_stride,
+                    row_step,
+                );
                 for backend in supported_backends() {
-                    let mut got = seed.clone();
-                    accumulate_scaled(backend, &mut got, &coeffs, scale);
-                    assert_eq!(got, expected, "backend {backend:?}, len {len}");
+                    let mut got = vec![i32::MIN; n];
+                    transform_1d(backend, &input, &mut got, &basis, basis_stride, row_step);
+                    assert_eq!(got, expected, "backend {backend:?}, n {n}");
                 }
             }
         }
@@ -782,9 +919,31 @@ mod tests {
             let levels = d.clone();
             let iterations = 2_000_000 / count;
 
+            // Baseline: the unreassociated i64 reference this change
+            // replaced, so the table shows the end-to-end speedup and not
+            // just backend-to-backend deltas.
+            let mut sink = 0i64;
+            let start = Instant::now();
+            for _ in 0..iterations {
+                let r = inverse_transform_reference(
+                    &d,
+                    n_tbs,
+                    PredMode::Inter,
+                    Component::Luma,
+                    bit_depth,
+                    false,
+                )
+                .expect("valid transform inputs");
+                sink += i64::from(r[0]);
+            }
+            let baseline = start.elapsed();
+            println!(
+                "{n_tbs:>2}x{n_tbs:<2} i64 reference: inverse transform {:>9.2} ns/block",
+                baseline.as_nanos() as f64 / iterations as f64,
+            );
+
             for backend in supported_backends() {
                 let start = Instant::now();
-                let mut sink = 0i64;
                 for _ in 0..iterations {
                     let r = inverse_transform_with_backend(
                         backend,
@@ -816,9 +975,10 @@ mod tests {
                 let dequant = start.elapsed();
 
                 println!(
-                    "{n_tbs:>2}x{n_tbs:<2} {backend:?}: inverse transform {:>9.2} ns/block, \
-                     dequant {:>9.2} ns/block (checksum {sink})",
+                    "{n_tbs:>2}x{n_tbs:<2} {backend:?}: inverse transform {:>9.2} ns/block \
+                     ({:.2}x baseline), dequant {:>9.2} ns/block (checksum {sink})",
                     transform.as_nanos() as f64 / iterations as f64,
+                    baseline.as_secs_f64() / transform.as_secs_f64(),
                     dequant.as_nanos() as f64 / iterations as f64,
                 );
             }

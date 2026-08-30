@@ -603,24 +603,16 @@ fn transform_1d_i32_into(
 ) {
     debug_assert_eq!(input.len(), n_tbs);
     debug_assert_eq!(out.len(), n_tbs);
-    out.fill(0);
     if tr_type {
         // §8.6.4.2 eq. 8-315/8-316, the 4x4 DST. trType == 1 is only
-        // ever invoked with nTbS == 4.
-        for (j, &xj) in input.iter().enumerate() {
-            if xj != 0 {
-                transform_simd::accumulate_scaled(backend, out, &DST4[j][..n_tbs], xj);
-            }
-        }
+        // ever invoked with nTbS == 4, so consecutive basis rows are
+        // consecutive DST4 rows.
+        transform_simd::transform_1d(backend, input, out, DST4.as_flattened(), 4, 1);
     } else {
         // §8.6.4.2 eq. 8-317, stride = 1 << (5 - log2(nTbS)).
         let log2 = log2_tbs(n_tbs).expect("transform_1d called with non-2^k nTbS");
         let stride = 1usize << (5 - log2);
-        for (j, &xj) in input.iter().enumerate() {
-            if xj != 0 {
-                transform_simd::accumulate_scaled(backend, out, &DCT32[j * stride][..n_tbs], xj);
-            }
-        }
+        transform_simd::transform_1d(backend, input, out, DCT32.as_flattened(), 32, stride);
     }
 }
 
