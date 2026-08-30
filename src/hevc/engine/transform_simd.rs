@@ -122,9 +122,11 @@ pub fn supported_backends() -> Vec<Backend> {
 /// rows ([`crate::hevc::engine::transform`] passes the flattened `DCT32`
 /// or `DST4`), and `row_step` is equation 8-317's `1 << ( 5 − log2( nTbS
 /// ) )` basis-row stride (always 1 for the DST). The sum is evaluated as
-/// one broadcast-multiply-add per non-zero `input[ j ]` across all
-/// `out.len()` output lanes, which is the same set of integer products
-/// added in a different order.
+/// one broadcast-multiply-add per non-zero `input[ j ]` across a tile of
+/// output lanes, which is the same set of integer products added in a
+/// different order. The vector kernels hold each tile's accumulators in
+/// registers for the whole `j` sweep, so a basis row costs one load and
+/// one multiply-add instead of a read-modify-write of `out`.
 ///
 /// Callers must guarantee that no partial sum leaves the `i32` range;
 /// see [`crate::hevc::engine::transform::inverse_transform`], which
@@ -287,9 +289,10 @@ mod x86 {
     use super::DequantParams;
     use core::arch::x86_64::*;
 
-    /// AVX2 [`super::transform_1d`]: eight `i32` lanes per step,
-    /// `vpmulld` + `vpaddd`, with a scalar tail for a width the vector
-    /// loop cannot cover (only `nTbS == 4` among the real block sizes).
+    /// AVX2 [`super::transform_1d`]: sixteen `i32` output lanes per
+    /// tile, `vpmulld` + `vpaddd` into register accumulators, narrowing
+    /// to 8- and 4-wide tiles and finally a scalar one for widths the
+    /// widest tile cannot cover.
     ///
     /// # Safety
     /// The host must support AVX2. `basis` must cover every addressed row.
@@ -302,38 +305,75 @@ mod x86 {
         row_step: usize,
     ) {
         unsafe {
-            out.fill(0);
             let n = out.len();
-            for (j, &xj) in input.iter().enumerate() {
-                if xj == 0 {
-                    continue;
+            let row_stride = row_step * basis_stride;
+            let mut base = 0;
+            while base + 16 <= n {
+                let mut acc0 = _mm256_setzero_si256();
+                let mut acc1 = _mm256_setzero_si256();
+                for (j, &xj) in input.iter().enumerate() {
+                    if xj == 0 {
+                        continue;
+                    }
+                    let row = basis.as_ptr().add(j * row_stride + base);
+                    let s = _mm256_set1_epi32(xj);
+                    acc0 = _mm256_add_epi32(
+                        acc0,
+                        _mm256_mullo_epi32(_mm256_loadu_si256(row.cast()), s),
+                    );
+                    acc1 = _mm256_add_epi32(
+                        acc1,
+                        _mm256_mullo_epi32(_mm256_loadu_si256(row.add(8).cast()), s),
+                    );
                 }
-                let row = basis.as_ptr().add(j * row_step * basis_stride);
-                let s = _mm256_set1_epi32(xj);
-                let mut i = 0;
-                while i + 8 <= n {
-                    let c = _mm256_loadu_si256(row.add(i).cast());
-                    let o = _mm256_loadu_si256(out.as_ptr().add(i).cast());
-                    let acc = _mm256_add_epi32(o, _mm256_mullo_epi32(c, s));
-                    _mm256_storeu_si256(out.as_mut_ptr().add(i).cast(), acc);
-                    i += 8;
+                _mm256_storeu_si256(out.as_mut_ptr().add(base).cast(), acc0);
+                _mm256_storeu_si256(out.as_mut_ptr().add(base + 8).cast(), acc1);
+                base += 16;
+            }
+            while base + 8 <= n {
+                let mut acc = _mm256_setzero_si256();
+                for (j, &xj) in input.iter().enumerate() {
+                    if xj != 0 {
+                        let row = basis.as_ptr().add(j * row_stride + base);
+                        acc = _mm256_add_epi32(
+                            acc,
+                            _mm256_mullo_epi32(
+                                _mm256_loadu_si256(row.cast()),
+                                _mm256_set1_epi32(xj),
+                            ),
+                        );
+                    }
                 }
-                while i + 4 <= n {
-                    let c = _mm_loadu_si128(row.add(i).cast());
-                    let o = _mm_loadu_si128(out.as_ptr().add(i).cast());
-                    let acc = _mm_add_epi32(o, _mm_mullo_epi32(c, s));
-                    _mm_storeu_si128(out.as_mut_ptr().add(i).cast(), acc);
-                    i += 4;
+                _mm256_storeu_si256(out.as_mut_ptr().add(base).cast(), acc);
+                base += 8;
+            }
+            while base + 4 <= n {
+                let mut acc = _mm_setzero_si128();
+                for (j, &xj) in input.iter().enumerate() {
+                    if xj != 0 {
+                        let row = basis.as_ptr().add(j * row_stride + base);
+                        acc = _mm_add_epi32(
+                            acc,
+                            _mm_mullo_epi32(_mm_loadu_si128(row.cast()), _mm_set1_epi32(xj)),
+                        );
+                    }
                 }
-                while i < n {
-                    out[i] += xj * *row.add(i);
-                    i += 1;
+                _mm_storeu_si128(out.as_mut_ptr().add(base).cast(), acc);
+                base += 4;
+            }
+            while base < n {
+                let mut acc = 0i32;
+                for (j, &xj) in input.iter().enumerate() {
+                    acc += xj * *basis.as_ptr().add(j * row_stride + base);
                 }
+                out[base] = acc;
+                base += 1;
             }
         }
     }
 
-    /// SSE4.1 [`super::transform_1d`]: four `i32` lanes per step.
+    /// SSE4.1 [`super::transform_1d`]: eight `i32` output lanes per
+    /// tile, held in two register accumulators.
     ///
     /// # Safety
     /// The host must support SSE4.1. `basis` must cover every addressed row.
@@ -346,26 +386,47 @@ mod x86 {
         row_step: usize,
     ) {
         unsafe {
-            out.fill(0);
             let n = out.len();
-            for (j, &xj) in input.iter().enumerate() {
-                if xj == 0 {
-                    continue;
+            let row_stride = row_step * basis_stride;
+            let mut base = 0;
+            while base + 8 <= n {
+                let mut acc0 = _mm_setzero_si128();
+                let mut acc1 = _mm_setzero_si128();
+                for (j, &xj) in input.iter().enumerate() {
+                    if xj == 0 {
+                        continue;
+                    }
+                    let row = basis.as_ptr().add(j * row_stride + base);
+                    let s = _mm_set1_epi32(xj);
+                    acc0 = _mm_add_epi32(acc0, _mm_mullo_epi32(_mm_loadu_si128(row.cast()), s));
+                    acc1 =
+                        _mm_add_epi32(acc1, _mm_mullo_epi32(_mm_loadu_si128(row.add(4).cast()), s));
                 }
-                let row = basis.as_ptr().add(j * row_step * basis_stride);
-                let s = _mm_set1_epi32(xj);
-                let mut i = 0;
-                while i + 4 <= n {
-                    let c = _mm_loadu_si128(row.add(i).cast());
-                    let o = _mm_loadu_si128(out.as_ptr().add(i).cast());
-                    let acc = _mm_add_epi32(o, _mm_mullo_epi32(c, s));
-                    _mm_storeu_si128(out.as_mut_ptr().add(i).cast(), acc);
-                    i += 4;
+                _mm_storeu_si128(out.as_mut_ptr().add(base).cast(), acc0);
+                _mm_storeu_si128(out.as_mut_ptr().add(base + 4).cast(), acc1);
+                base += 8;
+            }
+            while base + 4 <= n {
+                let mut acc = _mm_setzero_si128();
+                for (j, &xj) in input.iter().enumerate() {
+                    if xj != 0 {
+                        let row = basis.as_ptr().add(j * row_stride + base);
+                        acc = _mm_add_epi32(
+                            acc,
+                            _mm_mullo_epi32(_mm_loadu_si128(row.cast()), _mm_set1_epi32(xj)),
+                        );
+                    }
                 }
-                while i < n {
-                    out[i] += xj * *row.add(i);
-                    i += 1;
+                _mm_storeu_si128(out.as_mut_ptr().add(base).cast(), acc);
+                base += 4;
+            }
+            while base < n {
+                let mut acc = 0i32;
+                for (j, &xj) in input.iter().enumerate() {
+                    acc += xj * *basis.as_ptr().add(j * row_stride + base);
                 }
+                out[base] = acc;
+                base += 1;
             }
         }
     }
@@ -504,8 +565,8 @@ mod aarch64 {
     use super::DequantParams;
     use core::arch::aarch64::*;
 
-    /// NEON [`super::transform_1d`]: four `i32` lanes per `vmlaq_s32`,
-    /// two per step.
+    /// NEON [`super::transform_1d`]: eight `i32` output lanes per tile,
+    /// held in two `vmlaq_s32` register accumulators.
     ///
     /// # Safety
     /// The host must support NEON (guaranteed on aarch64). `basis` must
@@ -519,35 +580,46 @@ mod aarch64 {
         row_step: usize,
     ) {
         unsafe {
-            out.fill(0);
             let n = out.len();
-            for (j, &xj) in input.iter().enumerate() {
-                if xj == 0 {
-                    continue;
+            let row_stride = row_step * basis_stride;
+            let mut base = 0;
+            while base + 8 <= n {
+                let mut acc0 = vdupq_n_s32(0);
+                let mut acc1 = vdupq_n_s32(0);
+                for (j, &xj) in input.iter().enumerate() {
+                    if xj == 0 {
+                        continue;
+                    }
+                    let row = basis.as_ptr().add(j * row_stride + base);
+                    let s = vdupq_n_s32(xj);
+                    acc0 = vmlaq_s32(acc0, vld1q_s32(row), s);
+                    acc1 = vmlaq_s32(acc1, vld1q_s32(row.add(4)), s);
                 }
-                let row = basis.as_ptr().add(j * row_step * basis_stride);
-                let s = vdupq_n_s32(xj);
-                let mut i = 0;
-                while i + 8 <= n {
-                    let lo = vmlaq_s32(vld1q_s32(out.as_ptr().add(i)), vld1q_s32(row.add(i)), s);
-                    let hi = vmlaq_s32(
-                        vld1q_s32(out.as_ptr().add(i + 4)),
-                        vld1q_s32(row.add(i + 4)),
-                        s,
-                    );
-                    vst1q_s32(out.as_mut_ptr().add(i), lo);
-                    vst1q_s32(out.as_mut_ptr().add(i + 4), hi);
-                    i += 8;
+                vst1q_s32(out.as_mut_ptr().add(base), acc0);
+                vst1q_s32(out.as_mut_ptr().add(base + 4), acc1);
+                base += 8;
+            }
+            while base + 4 <= n {
+                let mut acc = vdupq_n_s32(0);
+                for (j, &xj) in input.iter().enumerate() {
+                    if xj != 0 {
+                        acc = vmlaq_s32(
+                            acc,
+                            vld1q_s32(basis.as_ptr().add(j * row_stride + base)),
+                            vdupq_n_s32(xj),
+                        );
+                    }
                 }
-                while i + 4 <= n {
-                    let acc = vmlaq_s32(vld1q_s32(out.as_ptr().add(i)), vld1q_s32(row.add(i)), s);
-                    vst1q_s32(out.as_mut_ptr().add(i), acc);
-                    i += 4;
+                vst1q_s32(out.as_mut_ptr().add(base), acc);
+                base += 4;
+            }
+            while base < n {
+                let mut acc = 0i32;
+                for (j, &xj) in input.iter().enumerate() {
+                    acc += xj * *basis.as_ptr().add(j * row_stride + base);
                 }
-                while i < n {
-                    out[i] += xj * *row.add(i);
-                    i += 1;
-                }
+                out[base] = acc;
+                base += 1;
             }
         }
     }
