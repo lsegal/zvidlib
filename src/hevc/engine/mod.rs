@@ -318,6 +318,9 @@ pub mod scaling_list;
 pub mod scan;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
+pub mod simd;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod sei;
 pub mod sequence;
 // internal — exposed for tests/fuzz; not part of the stable API
@@ -388,9 +391,14 @@ pub use hvcc::{
 #[doc(hidden)]
 pub use inter_pred::{
     InterPredError, InterPredGeometry, InterPrediction, ListPrediction, MotionVector, PuWeights,
-    RefPlane, WpListWeights, default_weighted_pred, explicit_weighted_pred, interp_chroma_block,
-    interp_luma_block, predict_inter_pu, predict_inter_pu_weighted,
+    RefPlane, WpListWeights, default_weighted_pred, default_weighted_pred_with,
+    explicit_weighted_pred, explicit_weighted_pred_with, interp_chroma_block,
+    interp_chroma_block_with, interp_luma_block, interp_luma_block_with, predict_inter_pu,
+    predict_inter_pu_weighted,
 };
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
+pub use simd::{Isa, available_isas, detected_isa};
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use inter_recon::SliceWpTables;

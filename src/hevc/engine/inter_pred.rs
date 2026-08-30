@@ -43,6 +43,8 @@
 //! a `(xInt, yInt, xFrac, yFrac)` location and a reference plane, and
 //! stops at the prediction sample arrays.
 
+use crate::hevc::engine::simd::{self, Isa};
+
 /// A reference-picture luma / chroma sample plane with the §8.5.3.3.3
 /// `Clip3( 0, dim − 1, … )` edge-extension border (equations 8-222 /
 /// 8-223 for luma, 8-239 / 8-240 for chroma).
@@ -114,6 +116,64 @@ impl<'a> RefPlane<'a> {
         let xc = x.clamp(0, self.width as i32 - 1) as usize;
         let yc = y.clamp(0, self.height as i32 - 1) as usize;
         self.samples[yc * self.width + xc]
+    }
+
+    /// Copies `dst.len()` samples of row `y` starting at full-sample
+    /// column `x_start` into `dst`, with the same §8.5.3.3.3 `Clip3` edge
+    /// extension [`RefPlane::at`] applies. `x_start` may be negative and
+    /// the window may run past either edge.
+    ///
+    /// The wholly-inside case is a straight row copy; only a window that
+    /// actually crosses an edge pays for the per-sample clamp.
+    #[inline]
+    fn copy_row(&self, x_start: i32, y: i32, dst: &mut [i32]) {
+        let yc = y.clamp(0, self.height as i32 - 1) as usize;
+        let base = yc * self.width;
+        if x_start >= 0 && (x_start as usize).saturating_add(dst.len()) <= self.width {
+            let start = base + x_start as usize;
+            dst.copy_from_slice(&self.samples[start..start + dst.len()]);
+            return;
+        }
+        let row = &self.samples[base..base + self.width];
+        let last = self.width as i32 - 1;
+        for (i, d) in dst.iter_mut().enumerate() {
+            *d = row[x_start.saturating_add(i as i32).clamp(0, last) as usize];
+        }
+    }
+
+    /// A `len`-sample window of row `y` starting at column `x_start`.
+    ///
+    /// Borrowed straight out of the plane when the window lies wholly
+    /// inside it — the common case for the interpolation filters, which
+    /// then read the reference samples with no copy at all — and
+    /// materialized into `scratch` with edge extension when it does not.
+    /// `scratch` must be at least `len` long.
+    #[inline]
+    fn row_window<'s>(
+        &'s self,
+        x_start: i32,
+        len: usize,
+        y: i32,
+        scratch: &'s mut [i32],
+    ) -> &'s [i32] {
+        let yc = y.clamp(0, self.height as i32 - 1) as usize;
+        let base = yc * self.width;
+        if x_start >= 0 && (x_start as usize).saturating_add(len) <= self.width {
+            let start = base + x_start as usize;
+            return &self.samples[start..start + len];
+        }
+        self.copy_row(x_start, y, &mut scratch[..len]);
+        &scratch[..len]
+    }
+
+    /// Gathers the edge-extended `w` x `h` region whose top-left
+    /// full-sample location is `( x0, y0 )`, row-major.
+    fn gather(&self, x0: i32, y0: i32, w: usize, h: usize) -> Vec<i32> {
+        let mut buf = vec![0i32; w * h];
+        for (r, row) in buf.chunks_exact_mut(w).enumerate() {
+            self.copy_row(x0, y0 + r as i32, row);
+        }
+        buf
     }
 }
 
@@ -288,6 +348,41 @@ pub fn interp_luma_block(
     n_pb_h: usize,
     bit_depth: u8,
 ) -> Result<Vec<i32>, InterPredError> {
+    interp_luma_block_with(
+        simd::detected_isa(),
+        plane,
+        x_int,
+        y_int,
+        x_frac,
+        y_frac,
+        n_pb_w,
+        n_pb_h,
+        bit_depth,
+    )
+}
+
+/// [`interp_luma_block`] on an explicitly chosen SIMD backend.
+///
+/// [`interp_luma_block`] picks [`simd::detected_isa`]; this entry point
+/// exists so tests and benchmarks can drive every backend the host
+/// supports and compare it against [`Isa::Scalar`]. An `isa` the running
+/// CPU does not support degrades to the scalar kernels, and every
+/// backend produces bit-identical output.
+///
+/// # Errors
+/// Same contract as [`interp_luma_block`].
+#[allow(clippy::too_many_arguments)]
+pub fn interp_luma_block_with(
+    isa: Isa,
+    plane: &RefPlane<'_>,
+    x_int: i32,
+    y_int: i32,
+    x_frac: i32,
+    y_frac: i32,
+    n_pb_w: usize,
+    n_pb_h: usize,
+    bit_depth: u8,
+) -> Result<Vec<i32>, InterPredError> {
     if n_pb_w == 0 || n_pb_h == 0 {
         return Err(InterPredError::EmptyBlock);
     }
@@ -300,48 +395,109 @@ pub fn interp_luma_block(
     if !(8..=16).contains(&bit_depth) {
         return Err(InterPredError::InvalidBitDepth(bit_depth));
     }
+    Ok(interp_block::<8>(
+        isa,
+        plane,
+        x_int,
+        y_int,
+        (x_frac != 0).then(|| &LUMA_FILTER[x_frac as usize]),
+        (y_frac != 0).then(|| &LUMA_FILTER[y_frac as usize]),
+        n_pb_w,
+        n_pb_h,
+        bit_depth,
+    ))
+}
 
-    if x_frac != 0 && y_frac != 0 {
-        let shift1 = interp_shift1(bit_depth);
-        let hk = &LUMA_FILTER[x_frac as usize];
-        let vk = &LUMA_FILTER[y_frac as usize];
-        // The two-dimensional filter is separable. Cache each horizontal
-        // result for the block plus its seven vertical halo rows, then reuse
-        // it across the vertical pass instead of recomputing eight horizontal
-        // dot products for every output sample.
-        let intermediate_h = n_pb_h + 7;
-        let mut horizontal = vec![0i32; n_pb_w * intermediate_h];
-        for row in 0..intermediate_h {
-            let source_y = y_int - 3 + row as i32;
-            for x in 0..n_pb_w {
-                let mut acc = 0i32;
-                for (tap, &coefficient) in hk.iter().enumerate() {
-                    acc += coefficient * plane.at(x_int + x as i32 - 3 + tap as i32, source_y);
+/// The separable filter block walk shared by §8.5.3.3.3.2 luma and
+/// §8.5.3.3.3.3 chroma interpolation.
+///
+/// `N` is the tap count — 8 for luma, 4 for chroma — and the leading
+/// halo is `N / 2 − 1` samples, matching the `A[−3..4]` / `B[−1..2]` tap
+/// windows of the two subclauses. `hk` / `vk` are `None` when that
+/// dimension's fractional phase is zero, where the spec leaves the
+/// dimension unfiltered; both `None` is the full-pel `A << shift3`
+/// corner of Table 8-8 / Table 8-9.
+///
+/// All four cases hand their inner loop to [`simd::filter_taps`], which
+/// evaluates the tap accumulation eight (AVX2) or four (SSE4.1 / NEON)
+/// output samples at a time. The two-dimensional case still caches the
+/// horizontal pass across the vertical one, so a `w * h` block costs
+/// `w * ( h + N − 1 )` horizontal and `w * h` vertical accumulations
+/// rather than `N` horizontal dot products per output sample.
+#[allow(clippy::too_many_arguments)]
+fn interp_block<const N: usize>(
+    isa: Isa,
+    plane: &RefPlane<'_>,
+    x_int: i32,
+    y_int: i32,
+    hk: Option<&[i32; N]>,
+    vk: Option<&[i32; N]>,
+    w: usize,
+    h: usize,
+    bit_depth: u8,
+) -> Vec<i32> {
+    let shift1 = interp_shift1(bit_depth);
+    let halo = N as i32 / 2 - 1;
+    let span = w + N - 1;
+    let mut out = vec![0i32; w * h];
+    match (hk, vk) {
+        // Full-pel (Table 8-8 / 8-9 phase 0, 0): A << shift3.
+        (None, None) => {
+            let shift3 = interp_shift3(bit_depth);
+            let mut scratch = vec![0i32; w];
+            for (y, row) in out.chunks_exact_mut(w).enumerate() {
+                plane.copy_row(x_int, y_int + y as i32, &mut scratch);
+                for (o, &s) in row.iter_mut().zip(scratch.iter()) {
+                    *o = s << shift3;
                 }
-                horizontal[row * n_pb_w + x] = acc >> shift1;
             }
         }
-        let mut out = vec![0i32; n_pb_w * n_pb_h];
-        for y in 0..n_pb_h {
-            for x in 0..n_pb_w {
-                let mut acc = 0i32;
-                for (tap, &coefficient) in vk.iter().enumerate() {
-                    acc += coefficient * horizontal[(y + tap) * n_pb_w + x];
-                }
-                out[y * n_pb_w + x] = acc >> 6;
+        // Horizontal-only (a/b/c, aX): one source window per output row.
+        (Some(hk), None) => {
+            let mut scratch = vec![0i32; span];
+            for y in 0..h {
+                let src = plane.row_window(x_int - halo, span, y_int + y as i32, &mut scratch);
+                let taps: [&[i32]; N] = std::array::from_fn(|t| &src[t..t + w]);
+                simd::filter_taps(isa, &taps, hk, shift1, &mut out[y * w..(y + 1) * w]);
             }
         }
-        return Ok(out);
-    }
-
-    let mut out = vec![0i32; n_pb_w * n_pb_h];
-    for yl in 0..n_pb_h as i32 {
-        for xl in 0..n_pb_w as i32 {
-            out[(yl as usize) * n_pb_w + xl as usize] =
-                interp_luma_sample(plane, x_int + xl, y_int + yl, x_frac, y_frac, bit_depth);
+        // Vertical-only (d/h/n, Xa): gather the `h + N − 1` source rows
+        // once, then accumulate down the columns — the tap slices are
+        // consecutive rows, so the loads stay contiguous.
+        (None, Some(vk)) => {
+            let src = plane.gather(x_int, y_int - halo, w, h + N - 1);
+            for y in 0..h {
+                let taps: [&[i32]; N] = std::array::from_fn(|t| &src[(y + t) * w..(y + t + 1) * w]);
+                simd::filter_taps(isa, &taps, vk, shift1, &mut out[y * w..(y + 1) * w]);
+            }
+        }
+        // Two-dimensional (e/i/p, f/j/q, g/k/r, XY): horizontal pass over
+        // the block plus its vertical halo rows at >> shift1, then the
+        // vertical pass at >> shift2 = 6.
+        (Some(hk), Some(vk)) => {
+            let rows = h + N - 1;
+            let mut horizontal = vec![0i32; w * rows];
+            let mut scratch = vec![0i32; span];
+            for row in 0..rows {
+                let src =
+                    plane.row_window(x_int - halo, span, y_int - halo + row as i32, &mut scratch);
+                let taps: [&[i32]; N] = std::array::from_fn(|t| &src[t..t + w]);
+                simd::filter_taps(
+                    isa,
+                    &taps,
+                    hk,
+                    shift1,
+                    &mut horizontal[row * w..(row + 1) * w],
+                );
+            }
+            for y in 0..h {
+                let taps: [&[i32]; N] =
+                    std::array::from_fn(|t| &horizontal[(y + t) * w..(y + t + 1) * w]);
+                simd::filter_taps(isa, &taps, vk, 6, &mut out[y * w..(y + 1) * w]);
+            }
         }
     }
-    Ok(out)
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -444,6 +600,36 @@ pub fn interp_chroma_block(
     block_h: usize,
     bit_depth: u8,
 ) -> Result<Vec<i32>, InterPredError> {
+    interp_chroma_block_with(
+        simd::detected_isa(),
+        plane,
+        x_int,
+        y_int,
+        x_frac,
+        y_frac,
+        block_w,
+        block_h,
+        bit_depth,
+    )
+}
+
+/// [`interp_chroma_block`] on an explicitly chosen SIMD backend; see
+/// [`interp_luma_block_with`].
+///
+/// # Errors
+/// Same contract as [`interp_chroma_block`].
+#[allow(clippy::too_many_arguments)]
+pub fn interp_chroma_block_with(
+    isa: Isa,
+    plane: &RefPlane<'_>,
+    x_int: i32,
+    y_int: i32,
+    x_frac: i32,
+    y_frac: i32,
+    block_w: usize,
+    block_h: usize,
+    bit_depth: u8,
+) -> Result<Vec<i32>, InterPredError> {
     if block_w == 0 || block_h == 0 {
         return Err(InterPredError::EmptyBlock);
     }
@@ -456,44 +642,17 @@ pub fn interp_chroma_block(
     if !(8..=16).contains(&bit_depth) {
         return Err(InterPredError::InvalidBitDepth(bit_depth));
     }
-
-    if x_frac != 0 && y_frac != 0 {
-        let shift1 = interp_shift1(bit_depth);
-        let hk = &CHROMA_FILTER[x_frac as usize];
-        let vk = &CHROMA_FILTER[y_frac as usize];
-        let intermediate_h = block_h + 3;
-        let mut horizontal = vec![0i32; block_w * intermediate_h];
-        for row in 0..intermediate_h {
-            let source_y = y_int - 1 + row as i32;
-            for x in 0..block_w {
-                let mut acc = 0i32;
-                for (tap, &coefficient) in hk.iter().enumerate() {
-                    acc += coefficient * plane.at(x_int + x as i32 - 1 + tap as i32, source_y);
-                }
-                horizontal[row * block_w + x] = acc >> shift1;
-            }
-        }
-        let mut out = vec![0i32; block_w * block_h];
-        for y in 0..block_h {
-            for x in 0..block_w {
-                let mut acc = 0i32;
-                for (tap, &coefficient) in vk.iter().enumerate() {
-                    acc += coefficient * horizontal[(y + tap) * block_w + x];
-                }
-                out[y * block_w + x] = acc >> 6;
-            }
-        }
-        return Ok(out);
-    }
-
-    let mut out = vec![0i32; block_w * block_h];
-    for yc in 0..block_h as i32 {
-        for xc in 0..block_w as i32 {
-            out[(yc as usize) * block_w + xc as usize] =
-                interp_chroma_sample(plane, x_int + xc, y_int + yc, x_frac, y_frac, bit_depth);
-        }
-    }
-    Ok(out)
+    Ok(interp_block::<4>(
+        isa,
+        plane,
+        x_int,
+        y_int,
+        (x_frac != 0).then(|| &CHROMA_FILTER[x_frac as usize]),
+        (y_frac != 0).then(|| &CHROMA_FILTER[y_frac as usize]),
+        block_w,
+        block_h,
+        bit_depth,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -530,6 +689,34 @@ pub fn default_weighted_pred(
     n_pb_h: usize,
     bit_depth: u8,
 ) -> Result<Vec<i32>, InterPredError> {
+    default_weighted_pred_with(
+        simd::detected_isa(),
+        pred_l0,
+        pred_l1,
+        pred_flag_l0,
+        pred_flag_l1,
+        n_pb_w,
+        n_pb_h,
+        bit_depth,
+    )
+}
+
+/// [`default_weighted_pred`] on an explicitly chosen SIMD backend; see
+/// [`interp_luma_block_with`].
+///
+/// # Errors
+/// Same contract as [`default_weighted_pred`].
+#[allow(clippy::too_many_arguments)]
+pub fn default_weighted_pred_with(
+    isa: Isa,
+    pred_l0: &[i32],
+    pred_l1: &[i32],
+    pred_flag_l0: bool,
+    pred_flag_l1: bool,
+    n_pb_w: usize,
+    n_pb_h: usize,
+    bit_depth: u8,
+) -> Result<Vec<i32>, InterPredError> {
     if n_pb_w == 0 || n_pb_h == 0 {
         return Err(InterPredError::EmptyBlock);
     }
@@ -556,26 +743,45 @@ pub fn default_weighted_pred(
     let offset2 = 1i32 << (shift2 - 1);
     let max_val = (1i32 << bit_depth) - 1;
 
+    // Every case is `Clip3( 0, max, ( Σ 1 · predLX + offset ) >> shift )`,
+    // which is exactly the shape `simd::combine_weighted` vectorizes. The
+    // intermediate samples and the offsets both stay well inside `i32`
+    // for every supported bit depth, so no widening is needed.
     let mut out = vec![0i32; count];
     match (pred_flag_l0, pred_flag_l1) {
         // Uni-predictive from L0 (equation 8-262).
-        (true, false) => {
-            for (o, &p0) in out.iter_mut().zip(pred_l0) {
-                *o = ((p0 + offset1) >> shift1).clamp(0, max_val);
-            }
-        }
+        (true, false) => simd::combine_weighted(
+            isa,
+            &[pred_l0],
+            &[1],
+            offset1,
+            shift1,
+            0,
+            max_val,
+            &mut out,
+        ),
         // Uni-predictive from L1 (equation 8-263).
-        (false, true) => {
-            for (o, &p1) in out.iter_mut().zip(pred_l1) {
-                *o = ((p1 + offset1) >> shift1).clamp(0, max_val);
-            }
-        }
+        (false, true) => simd::combine_weighted(
+            isa,
+            &[pred_l1],
+            &[1],
+            offset1,
+            shift1,
+            0,
+            max_val,
+            &mut out,
+        ),
         // Bi-predictive (equation 8-264).
-        (true, true) => {
-            for ((o, &p0), &p1) in out.iter_mut().zip(pred_l0).zip(pred_l1) {
-                *o = ((p0 + p1 + offset2) >> shift2).clamp(0, max_val);
-            }
-        }
+        (true, true) => simd::combine_weighted(
+            isa,
+            &[pred_l0, pred_l1],
+            &[1, 1],
+            offset2,
+            shift2,
+            0,
+            max_val,
+            &mut out,
+        ),
         (false, false) => return Err(InterPredError::EmptyPlane),
     }
     Ok(out)
@@ -602,6 +808,44 @@ pub fn default_weighted_pred(
 /// Same contract as [`default_weighted_pred`].
 #[allow(clippy::too_many_arguments)]
 pub fn explicit_weighted_pred(
+    pred_l0: &[i32],
+    pred_l1: &[i32],
+    pred_flag_l0: bool,
+    pred_flag_l1: bool,
+    n_pb_w: usize,
+    n_pb_h: usize,
+    log2_weight_denom: u8,
+    w0: i32,
+    o0: i32,
+    w1: i32,
+    o1: i32,
+    bit_depth: u8,
+) -> Result<Vec<i32>, InterPredError> {
+    explicit_weighted_pred_with(
+        simd::detected_isa(),
+        pred_l0,
+        pred_l1,
+        pred_flag_l0,
+        pred_flag_l1,
+        n_pb_w,
+        n_pb_h,
+        log2_weight_denom,
+        w0,
+        o0,
+        w1,
+        o1,
+        bit_depth,
+    )
+}
+
+/// [`explicit_weighted_pred`] on an explicitly chosen SIMD backend; see
+/// [`interp_luma_block_with`].
+///
+/// # Errors
+/// Same contract as [`explicit_weighted_pred`].
+#[allow(clippy::too_many_arguments)]
+pub fn explicit_weighted_pred_with(
+    isa: Isa,
     pred_l0: &[i32],
     pred_l1: &[i32],
     pred_flag_l0: bool,
@@ -644,30 +888,100 @@ pub fn explicit_weighted_pred(
     let mut out = vec![0i32; count];
     match (pred_flag_l0, pred_flag_l1) {
         // Uni-predictive from L0 (equation 8-275).
-        (true, false) => {
-            let round = 1i64 << (log2_wd - 1);
-            for (o, &p0) in out.iter_mut().zip(pred_l0) {
-                *o = ((((i64::from(p0) * w0 + round) >> log2_wd) + o0).clamp(0, max_val)) as i32;
-            }
-        }
+        (true, false) => explicit_uni(isa, pred_l0, w0, o0, log2_wd, max_val, &mut out),
         // Uni-predictive from L1 (equation 8-276).
-        (false, true) => {
-            let round = 1i64 << (log2_wd - 1);
-            for (o, &p1) in out.iter_mut().zip(pred_l1) {
-                *o = ((((i64::from(p1) * w1 + round) >> log2_wd) + o1).clamp(0, max_val)) as i32;
-            }
-        }
+        (false, true) => explicit_uni(isa, pred_l1, w1, o1, log2_wd, max_val, &mut out),
         // Bi-predictive (equation 8-277).
-        (true, true) => {
-            let round = (o0 + o1 + 1) << log2_wd;
-            for ((o, &p0), &p1) in out.iter_mut().zip(pred_l0).zip(pred_l1) {
-                *o = (((i64::from(p0) * w0 + i64::from(p1) * w1 + round) >> (log2_wd + 1))
-                    .clamp(0, max_val)) as i32;
-            }
-        }
+        (true, true) => explicit_bi(
+            isa,
+            (pred_l0, w0, o0),
+            (pred_l1, w1, o1),
+            log2_wd,
+            max_val,
+            &mut out,
+        ),
         (false, false) => return Err(InterPredError::EmptyPlane),
     }
     Ok(out)
+}
+
+/// The largest `| v |` in `values`, widened to `i64`.
+fn max_abs(values: &[i32]) -> i64 {
+    values
+        .iter()
+        .fold(0i64, |max, &v| max.max(i64::from(v).abs()))
+}
+
+/// §8.5.3.3.4.3 uni-predictive combine (equations 8-275 / 8-276).
+///
+/// The spec arithmetic is `i64`, but for every legal HEVC weight, offset
+/// and intermediate sample the whole expression fits in `i32` — so when
+/// a bound derived from the block's actual peak magnitude proves it,
+/// the combine runs on the vectorized `i32` kernel, and otherwise it
+/// falls back to the `i64` scalar loop. Both produce the same values.
+fn explicit_uni(
+    isa: Isa,
+    pred: &[i32],
+    w: i64,
+    o: i64,
+    log2_wd: i64,
+    max_val: i64,
+    out: &mut [i32],
+) {
+    let round = 1i64 << (log2_wd - 1);
+    let peak = max_abs(pred) * w.abs() + round;
+    let limit = i64::from(i32::MAX);
+    if log2_wd < 31 && peak <= limit && (peak >> log2_wd) + o.abs() + 1 <= limit {
+        simd::combine_weighted(
+            isa,
+            &[pred],
+            &[w as i32],
+            round as i32,
+            log2_wd as i32,
+            o as i32,
+            max_val as i32,
+            out,
+        );
+        return;
+    }
+    for (o_out, &p) in out.iter_mut().zip(pred) {
+        *o_out = ((((i64::from(p) * w + round) >> log2_wd) + o).clamp(0, max_val)) as i32;
+    }
+}
+
+/// §8.5.3.3.4.3 bi-predictive combine (equation 8-277), with the same
+/// `i32`-when-provable / `i64`-otherwise split as [`explicit_uni`].
+/// Each list is passed as its `( predSamplesLX, wX, oX )` triple.
+fn explicit_bi(
+    isa: Isa,
+    l0: (&[i32], i64, i64),
+    l1: (&[i32], i64, i64),
+    log2_wd: i64,
+    max_val: i64,
+    out: &mut [i32],
+) {
+    let (p0, w0, o0) = l0;
+    let (p1, w1, o1) = l1;
+    let round = (o0 + o1 + 1) << log2_wd;
+    let shift = log2_wd + 1;
+    let peak = max_abs(p0) * w0.abs() + max_abs(p1) * w1.abs() + round.abs();
+    if shift < 31 && peak <= i64::from(i32::MAX) {
+        simd::combine_weighted(
+            isa,
+            &[p0, p1],
+            &[w0 as i32, w1 as i32],
+            round as i32,
+            shift as i32,
+            0,
+            max_val as i32,
+            out,
+        );
+        return;
+    }
+    for ((o_out, &a), &b) in out.iter_mut().zip(p0).zip(p1) {
+        *o_out = (((i64::from(a) * w0 + i64::from(b) * w1 + round) >> shift).clamp(0, max_val))
+            as i32;
+    }
 }
 
 /// One reference list's §8.5.3.3.4.3 weights / offsets for one PU,
