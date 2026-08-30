@@ -11,13 +11,14 @@
 
 use std::sync::{Mutex, MutexGuard};
 
+use super::inverse_transform as inverse_transform_simd;
 use super::*;
 use crate::av1_encoder::wht::{fwht4x4_scalar, iwht4x4_scalar};
 use crate::av1_filters::{
     CdefStrength, FilterFrame, FilterPlane, LoopFilterParams, RestorationUnit,
     apply_restoration_unit, cdef_frame, deblock_frame,
 };
-use crate::av1_intra::{Av1TxType, inverse_transform};
+use crate::av1_intra::{Av1TxType, Tx1d, inverse_transform};
 use crate::{Limits, TxSizeGrid};
 
 static ISA_LOCK: Mutex<()> = Mutex::new(());
@@ -125,32 +126,217 @@ fn out_of_range_walsh_hadamard_blocks_fall_back_to_scalar() {
     }
 }
 
+/// Every transform type this crate implements, paired with the sizes it is
+/// defined at. ADST has no 32-point kernel in AV1.
+const TX_TYPES: [(Av1TxType, &[usize]); 10] = [
+    (Av1TxType::Idtx, &[4, 8, 16, 32]),
+    (Av1TxType::DctDct, &[4, 8, 16, 32]),
+    (Av1TxType::AdstDct, &[4, 8, 16]),
+    (Av1TxType::DctAdst, &[4, 8, 16]),
+    (Av1TxType::AdstAdst, &[4, 8, 16]),
+    (Av1TxType::FlipadstDct, &[4, 8, 16]),
+    (Av1TxType::DctFlipadst, &[4, 8, 16]),
+    (Av1TxType::FlipadstFlipadst, &[4, 8, 16]),
+    (Av1TxType::AdstFlipadst, &[4, 8, 16]),
+    (Av1TxType::FlipadstAdst, &[4, 8, 16]),
+];
+
 #[test]
-fn inverse_dct_matches_the_scalar_reference_for_both_sizes() {
+fn inverse_transforms_match_the_scalar_reference_at_every_size_and_type() {
     let mut rng = Lcg(0x5eed_0120_0000_0002);
-    for size in [4usize, 8] {
-        for _ in 0..500 {
-            let coefficients: Vec<i32> = (0..size * size).map(|_| rng.in_range(600)).collect();
-            let results =
-                for_each_isa(|_| inverse_transform(&coefficients, size, Av1TxType::DctDct, 20, 14));
-            assert_all_match(&results, "inverse DCT output");
+    for (tx_type, sizes) in TX_TYPES {
+        for &size in sizes {
+            for _ in 0..40 {
+                let coefficients: Vec<i32> = (0..size * size).map(|_| rng.in_range(600)).collect();
+                let results =
+                    for_each_isa(|_| inverse_transform(&coefficients, size, tx_type, 20, 14));
+                assert_all_match(&results, &format!("{tx_type:?} {size}x{size} output"));
+            }
+        }
+    }
+}
+
+/// The widened accumulators are only worth anything if they stay bit-exact
+/// right up to the documented bound, so this drives every size and type with
+/// coefficients placed exactly at it, in the sign patterns that maximize each
+/// butterfly stage.
+#[test]
+fn inverse_transforms_stay_bit_exact_at_the_documented_input_limit() {
+    let mut rng = Lcg(0x5eed_0120_0000_0003);
+    for (tx_type, sizes) in TX_TYPES {
+        for &size in sizes {
+            let limit = transforms::input_limit(size);
+            // The dequantizer multiplies by `ac_quant`, so feed coefficients
+            // that land exactly on the limit after scaling.
+            let extreme = limit / 4;
+            for pattern in 0..6 {
+                let coefficients: Vec<i32> = (0..size * size)
+                    .map(|index| {
+                        let sign = match pattern {
+                            0 => 1,
+                            1 => -1,
+                            2 => {
+                                if index % 2 == 0 {
+                                    1
+                                } else {
+                                    -1
+                                }
+                            }
+                            3 => {
+                                if (index / size) % 2 == 0 {
+                                    1
+                                } else {
+                                    -1
+                                }
+                            }
+                            4 => {
+                                if index % size < size / 2 {
+                                    1
+                                } else {
+                                    -1
+                                }
+                            }
+                            _ => {
+                                if rng.next() & 1 == 0 {
+                                    1
+                                } else {
+                                    -1
+                                }
+                            }
+                        };
+                        sign * extreme
+                    })
+                    .collect();
+                let results =
+                    for_each_isa(|_| inverse_transform(&coefficients, size, tx_type, 4, 4));
+                assert_all_match(
+                    &results,
+                    &format!("{tx_type:?} {size}x{size} at the input limit"),
+                );
+            }
         }
     }
 }
 
 #[test]
-fn out_of_range_dct_blocks_fall_back_to_scalar() {
-    let coefficients: Vec<i32> = (0..16)
-        .map(|index| if index == 3 { 1 << 24 } else { 1 })
-        .collect();
-    let results = for_each_isa(|isa| {
-        let mut out = vec![0i16; 16];
-        let values: Vec<i32> = coefficients.clone();
-        let vectorized = inverse_dct(isa, &values, 4, &mut out);
-        assert!(!vectorized, "the range guard must reject this block");
-        inverse_transform(&coefficients, 4, Av1TxType::DctDct, 20, 14)
-    });
-    assert_all_match(&results, "out-of-range inverse DCT output");
+fn out_of_range_transform_blocks_fall_back_to_scalar() {
+    for size in [4usize, 8, 16, 32] {
+        let over = transforms::input_limit(size) as i64 + 1;
+        let coefficients: Vec<i32> = (0..size * size)
+            .map(|index| if index == 3 { over as i32 } else { 1 })
+            .collect();
+        let results = for_each_isa(|isa| {
+            let mut out = vec![0i16; size * size];
+            let vectorized = inverse_transform_simd(
+                isa,
+                &coefficients,
+                size,
+                Tx1d::Dct,
+                Tx1d::Dct,
+                false,
+                false,
+                &mut out,
+            );
+            assert!(!vectorized, "the range guard must reject this block");
+            inverse_transform(&coefficients, size, Av1TxType::DctDct, 1, 1)
+        });
+        assert_all_match(&results, "out-of-range inverse transform output");
+    }
+}
+
+/// The fixed-point butterflies must actually compute the transforms they
+/// claim to: `idctN` is the AV1/VP9-lineage DCT-III, `iadst4` is the DST-VII
+/// the `sinpi` constants encode, and `iadst8`/`iadst16` are DST-IV. Checking
+/// against a direct double-precision evaluation catches a mistranscribed
+/// butterfly or constant that a scalar-versus-SIMD comparison alone cannot.
+#[test]
+fn scalar_kernels_match_the_mathematical_transforms() {
+    use std::f64::consts::{PI, SQRT_2};
+
+    for size in [4usize, 8, 16, 32] {
+        for basis in 0..size {
+            let mut coefficients = vec![0i32; size * size];
+            // A single row coefficient, so the column pass only scales the DC
+            // basis and the row pass is what is being measured.
+            coefficients[basis] = 1;
+            let residual =
+                inverse_transform(&coefficients, size, Av1TxType::DctDct, 1 << 12, 1 << 12);
+            let column_gain = 1.0 / SQRT_2;
+            let shift = f64::from(1 << crate::av1_intra::transform_shift(size));
+            for (n, &sample) in residual.iter().take(size).enumerate() {
+                let expected = f64::from(1 << 12)
+                    * if basis == 0 {
+                        1.0 / SQRT_2
+                    } else {
+                        (PI * (2.0 * n as f64 + 1.0) * basis as f64 / (2.0 * size as f64)).cos()
+                    }
+                    * column_gain
+                    / shift;
+                let got = f64::from(sample);
+                assert!(
+                    (got - expected).abs() <= 2.0,
+                    "dct{size} basis {basis} position {n}: {got} vs {expected}"
+                );
+            }
+        }
+    }
+
+    for size in [4usize, 8, 16] {
+        for basis in 0..size {
+            let mut coefficients = vec![0i32; size * size];
+            coefficients[basis] = 1;
+            let residual =
+                inverse_transform(&coefficients, size, Av1TxType::DctAdst, 1 << 12, 1 << 12);
+            let shift = f64::from(1 << crate::av1_intra::transform_shift(size));
+            for (n, &sample) in residual.iter().take(size).enumerate() {
+                let sine = if size == 4 {
+                    // DST-VII, scaled by `2 * sqrt(2) / 3` by the `sinpi`
+                    // constants.
+                    2.0 * SQRT_2 / 3.0
+                        * (PI * (n as f64 + 1.0) * (2.0 * basis as f64 + 1.0) / 9.0).sin()
+                } else {
+                    // DST-IV.
+                    (PI * (2.0 * n as f64 + 1.0) * (2.0 * basis as f64 + 1.0) / (4.0 * size as f64))
+                        .sin()
+                };
+                let expected = f64::from(1 << 12) * sine / SQRT_2 / shift;
+                let got = f64::from(sample);
+                assert!(
+                    (got - expected).abs() <= 2.0,
+                    "adst{size} basis {basis} position {n}: {got} vs {expected}"
+                );
+            }
+        }
+    }
+}
+
+/// The flipped-ADST types are the plain ADST block reversed along one or both
+/// axes, so they must agree with an explicit reversal of the unflipped result.
+#[test]
+fn flipped_adst_reverses_the_unflipped_block() {
+    let mut rng = Lcg(0x5eed_0120_0000_0004);
+    for size in [4usize, 8, 16] {
+        let coefficients: Vec<i32> = (0..size * size).map(|_| rng.in_range(600)).collect();
+        let plain = inverse_transform(&coefficients, size, Av1TxType::AdstAdst, 20, 14);
+        for (tx_type, lr, ud) in [
+            (Av1TxType::AdstFlipadst, true, false),
+            (Av1TxType::FlipadstAdst, false, true),
+            (Av1TxType::FlipadstFlipadst, true, true),
+        ] {
+            let flipped = inverse_transform(&coefficients, size, tx_type, 20, 14);
+            for row in 0..size {
+                for column in 0..size {
+                    let source_row = if ud { size - 1 - row } else { row };
+                    let source_column = if lr { size - 1 - column } else { column };
+                    assert_eq!(
+                        flipped[row * size + column],
+                        plain[source_row * size + source_column],
+                        "{tx_type:?} {size}x{size} at ({row}, {column})"
+                    );
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------

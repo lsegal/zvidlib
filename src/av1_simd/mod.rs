@@ -17,7 +17,7 @@
 //! either proves the `i32` range is sufficient for 8-bit input (the filters) or
 //! range-checks its input and defers to the scalar path when the check fails
 //! (the transforms; see `transforms::WHT_INPUT_LIMIT` and
-//! `transforms::DCT_INPUT_LIMIT`). Positions whose taps would need edge
+//! `transforms::input_limit`). Positions whose taps would need edge
 //! clamping stay on the scalar path as well, so the vector kernels never read
 //! outside a plane. `tests/av1_simd.rs` asserts equality against the scalar
 //! path for every instruction set the host supports.
@@ -40,6 +40,8 @@
 )]
 
 use core::sync::atomic::{AtomicU8, Ordering};
+
+use crate::av1_intra::Tx1d;
 
 pub(crate) mod filters;
 pub(crate) mod transforms;
@@ -230,12 +232,32 @@ simd_entry_points! {
         = transforms::fwht4x4, avx2 = Sse4;
 }
 simd_entry_points! {
-    fn [dct4_sse41, dct4_avx2, dct4_neon](dequantized: &[i32], out: &mut [i16]) -> bool
-        = transforms::inverse_dct4x4, avx2 = Sse4;
+    #[allow(clippy::fn_params_excessive_bools)]
+    fn [tx4_sse41, tx4_avx2, tx4_neon](
+        dequantized: &[i32], column: Tx1d, row: Tx1d,
+        lr_flip: bool, ud_flip: bool, out: &mut [i16]
+    ) -> bool = transforms::inverse_transform4, avx2 = Sse4;
 }
 simd_entry_points! {
-    fn [dct8_sse41, dct8_avx2, dct8_neon](dequantized: &[i32], out: &mut [i16]) -> bool
-        = transforms::inverse_dct8x8, avx2 = Sse4;
+    #[allow(clippy::fn_params_excessive_bools)]
+    fn [tx8_sse41, tx8_avx2, tx8_neon](
+        dequantized: &[i32], column: Tx1d, row: Tx1d,
+        lr_flip: bool, ud_flip: bool, out: &mut [i16]
+    ) -> bool = transforms::inverse_transform8, avx2 = Sse4;
+}
+simd_entry_points! {
+    #[allow(clippy::fn_params_excessive_bools)]
+    fn [tx16_sse41, tx16_avx2, tx16_neon](
+        dequantized: &[i32], column: Tx1d, row: Tx1d,
+        lr_flip: bool, ud_flip: bool, out: &mut [i16]
+    ) -> bool = transforms::inverse_transform16, avx2 = Sse4;
+}
+simd_entry_points! {
+    #[allow(clippy::fn_params_excessive_bools)]
+    fn [tx32_sse41, tx32_avx2, tx32_neon](
+        dequantized: &[i32], column: Tx1d, row: Tx1d,
+        lr_flip: bool, ud_flip: bool, out: &mut [i16]
+    ) -> bool = transforms::inverse_transform32, avx2 = Sse4;
 }
 simd_entry_points! {
     fn [deblock_h_sse41, deblock_h_avx2, deblock_h_neon](
@@ -330,22 +352,76 @@ pub(crate) fn fwht4x4(isa: SimdIsa, residual: &[i32; 16]) -> Option<[i32; 16]> {
     Some(coefficients)
 }
 
-/// Vectorized `DCT_DCT` inverse transform for a 4x4 or 8x8 block. Returns
-/// `false` (leaving `out` untouched) when the caller should use the scalar
-/// path.
-pub(crate) fn inverse_dct(isa: SimdIsa, dequantized: &[i32], size: usize, out: &mut [i16]) -> bool {
-    if !transforms::within_limit(dequantized, transforms::DCT_INPUT_LIMIT) {
+/// Vectorized non-lossless inverse transform for one `size x size` block.
+///
+/// `column` and `row` are the vertical and horizontal 1-D kernels and
+/// `lr_flip`/`ud_flip` the flipped-ADST output reversals, as reported by
+/// [`crate::av1_intra::Av1TxType::kernels`]. Returns `false` (leaving `out`
+/// untouched) when the caller should use the scalar path: an unsupported
+/// size, an instruction set this build cannot reach, or coefficients large
+/// enough that a 32-bit lane could overflow.
+#[allow(clippy::fn_params_excessive_bools, clippy::too_many_arguments)]
+pub(crate) fn inverse_transform(
+    isa: SimdIsa,
+    dequantized: &[i32],
+    size: usize,
+    column: Tx1d,
+    row: Tx1d,
+    lr_flip: bool,
+    ud_flip: bool,
+    out: &mut [i16],
+) -> bool {
+    if !transforms::within_limit(dequantized, transforms::input_limit(size)) {
         return false;
     }
+    let arguments = (dequantized, column, row, lr_flip, ud_flip, out);
     match size {
         4 => dispatch!(
             isa,
-            [dct4_sse41, dct4_avx2, dct4_neon](dequantized, out),
+            [tx4_sse41, tx4_avx2, tx4_neon](
+                arguments.0,
+                arguments.1,
+                arguments.2,
+                arguments.3,
+                arguments.4,
+                arguments.5
+            ),
             false
         ),
         8 => dispatch!(
             isa,
-            [dct8_sse41, dct8_avx2, dct8_neon](dequantized, out),
+            [tx8_sse41, tx8_avx2, tx8_neon](
+                arguments.0,
+                arguments.1,
+                arguments.2,
+                arguments.3,
+                arguments.4,
+                arguments.5
+            ),
+            false
+        ),
+        16 => dispatch!(
+            isa,
+            [tx16_sse41, tx16_avx2, tx16_neon](
+                arguments.0,
+                arguments.1,
+                arguments.2,
+                arguments.3,
+                arguments.4,
+                arguments.5
+            ),
+            false
+        ),
+        32 => dispatch!(
+            isa,
+            [tx32_sse41, tx32_avx2, tx32_neon](
+                arguments.0,
+                arguments.1,
+                arguments.2,
+                arguments.3,
+                arguments.4,
+                arguments.5
+            ),
             false
         ),
         _ => false,

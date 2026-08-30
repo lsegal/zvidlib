@@ -71,7 +71,12 @@ fn av1_simd_speedup_on_a_representative_frame() {
     let mut cdef = Vec::new();
     let mut wiener = Vec::new();
     let mut self_guided = Vec::new();
-    let mut transforms = Vec::new();
+    let mut dct4 = Vec::new();
+    let mut dct8 = Vec::new();
+    let mut dct16 = Vec::new();
+    let mut dct32 = Vec::new();
+    let mut adst8 = Vec::new();
+    let mut adst16 = Vec::new();
 
     for isa in isas {
         set_active_isa(Some(isa));
@@ -133,20 +138,32 @@ fn av1_simd_speedup_on_a_representative_frame() {
             }),
         ));
 
-        // One inverse transform per 8x8 block of the frame.
-        let coefficients: Vec<i32> = (0..64).map(|index: i32| (index * 37) % 121 - 60).collect();
-        let blocks = (WIDTH / 8) * (HEIGHT / 8);
-        transforms.push((
-            isa,
-            measure(|| {
-                let mut checksum = 0i64;
-                for _ in 0..blocks {
-                    let residual = inverse_transform(&coefficients, 8, Av1TxType::DctDct, 20, 14);
-                    checksum += i64::from(residual[0]);
-                }
-                assert_ne!(checksum, i64::MIN);
-            }),
-        ));
+        // One inverse transform per block of the frame, at every size and
+        // transform type the vector kernels cover.
+        for (slot, size, tx_type) in [
+            (&mut dct4, 4usize, Av1TxType::DctDct),
+            (&mut dct8, 8, Av1TxType::DctDct),
+            (&mut dct16, 16, Av1TxType::DctDct),
+            (&mut dct32, 32, Av1TxType::DctDct),
+            (&mut adst8, 8, Av1TxType::AdstAdst),
+            (&mut adst16, 16, Av1TxType::FlipadstAdst),
+        ] {
+            let coefficients: Vec<i32> = (0..size * size)
+                .map(|index| (index as i32 * 37) % 121 - 60)
+                .collect();
+            let blocks = (WIDTH / size) * (HEIGHT / size);
+            slot.push((
+                isa,
+                measure(|| {
+                    let mut checksum = 0i64;
+                    for _ in 0..blocks {
+                        let residual = inverse_transform(&coefficients, size, tx_type, 20, 14);
+                        checksum += i64::from(residual[0]);
+                    }
+                    assert_ne!(checksum, i64::MIN);
+                }),
+            ));
+        }
     }
     set_active_isa(None);
 
@@ -158,5 +175,10 @@ fn av1_simd_speedup_on_a_representative_frame() {
     report("cdef (frame)", &cdef);
     report("wiener restoration (frame)", &wiener);
     report("self-guided (256x256 unit)", &self_guided);
-    report("inverse dct 8x8 (frame)", &transforms);
+    report("inverse dct 4x4 (frame)", &dct4);
+    report("inverse dct 8x8 (frame)", &dct8);
+    report("inverse dct 16x16 (frame)", &dct16);
+    report("inverse dct 32x32 (frame)", &dct32);
+    report("inverse adst 8x8 (frame)", &adst8);
+    report("flip-adst 16x16 (frame)", &adst16);
 }
