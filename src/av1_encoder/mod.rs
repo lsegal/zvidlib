@@ -16,7 +16,7 @@ mod leb128;
 mod symbol;
 mod tile;
 #[allow(dead_code)]
-mod wht;
+pub(crate) mod wht;
 
 use crate::{
     Codec, CodecImplementation, CodecProfile, CodecSupport, ColorRange, EncodedSample,

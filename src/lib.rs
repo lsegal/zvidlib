@@ -18,6 +18,7 @@ pub mod av1_intra;
 pub mod av1_intra_decoder;
 pub mod av1_intra_pred;
 pub mod av1_mc;
+pub mod av1_simd;
 pub mod codec;
 pub mod codec_config;
 pub mod conformance;
@@ -72,6 +73,7 @@ pub use av1_intra_pred::{
     Av1IntraSimd, SmoothMode, add_residual_row, av1_intra_simd, directional_row, paeth_row,
     smooth_row, sum_samples,
 };
+pub use av1_simd::SimdIsa;
 pub use codec::{
     AudioDrain, AudioEncoder, AudioEncoderFormat, AudioGapless, CancellationToken,
     CodecImplementation, CodecProfile, CodecSupport, DecodeStatistics, DecodedVideoFrame,

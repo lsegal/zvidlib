@@ -480,11 +480,12 @@ impl Edge {
         }
         const KERNELS: [[u16; 5]; 3] = [[0, 4, 8, 4, 0], [0, 5, 6, 5, 0], [2, 4, 4, 4, 2]];
         let edge: Vec<u8> = (0..size).map(|i| self.get(i as i32 - 1)).collect();
+        let kernel = &KERNELS[strength - 1];
         for i in 1..size {
             let mut sum = 0u16;
-            for j in 0..5 {
+            for (j, weight) in kernel.iter().enumerate() {
                 let k = (i as isize - 2 + j as isize).clamp(0, size as isize - 1) as usize;
-                sum += KERNELS[strength - 1][j] * u16::from(edge[k]);
+                sum += *weight * u16::from(edge[k]);
             }
             self.set(i as i32 - 1, ((sum + 8) >> 4) as u8);
         }
