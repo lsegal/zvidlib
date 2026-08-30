@@ -932,8 +932,8 @@ pub fn filter_luma_block_edge_gated(
     // Both orientations gather four contiguous samples per access, so
     // the whole segment costs eight row reads rather than 32 bounds-
     // checked per-sample reads.
-    let mut seg_p: crate::hevc::engine::simd::LumaSeg = [[0i32; 4]; 4];
-    let mut seg_q: crate::hevc::engine::simd::LumaSeg = [[0i32; 4]; 4];
+    let mut seg_p: crate::hevc::engine::simd::in_loop::LumaSeg = [[0i32; 4]; 4];
+    let mut seg_q: crate::hevc::engine::simd::in_loop::LumaSeg = [[0i32; 4]; 4];
     match edge {
         EdgeType::Vertical => {
             for k in 0..4 {
@@ -969,9 +969,9 @@ pub fn filter_luma_block_edge_gated(
     // Apply the filter to all 4 rows at once (eq. 8-372/8-373 layout).
     // Rows the weak filter leaves alone come back holding their input
     // samples, so writing `0..nDp` / `0..nDq` back is a no-op for them.
-    let mut out_p: crate::hevc::engine::simd::LumaSegOut = [[0i32; 4]; 3];
-    let mut out_q: crate::hevc::engine::simd::LumaSegOut = [[0i32; 4]; 3];
-    crate::hevc::engine::simd::filter_luma_rows(
+    let mut out_p: crate::hevc::engine::simd::in_loop::LumaSegOut = [[0i32; 4]; 3];
+    let mut out_q: crate::hevc::engine::simd::in_loop::LumaSegOut = [[0i32; 4]; 3];
+    crate::hevc::engine::simd::in_loop::filter_luma_rows(
         &seg_p, &seg_q, dec.de, dec.dep, dec.deq, tc, bit_depth, &mut out_p, &mut out_q,
     );
     let ndp = if dec.de == 2 {
@@ -1060,8 +1060,8 @@ pub fn filter_chroma_block_edge_gated(
     );
     // Gather the whole 4-row segment (`seg_p[i][k]` = `pi,k`) and filter
     // its four rows together.
-    let mut seg_p: crate::hevc::engine::simd::ChromaSeg = [[0i32; 4]; 2];
-    let mut seg_q: crate::hevc::engine::simd::ChromaSeg = [[0i32; 4]; 2];
+    let mut seg_p: crate::hevc::engine::simd::in_loop::ChromaSeg = [[0i32; 4]; 2];
+    let mut seg_q: crate::hevc::engine::simd::in_loop::ChromaSeg = [[0i32; 4]; 2];
     match edge {
         EdgeType::Vertical => {
             for k in 0..4 {
@@ -1081,7 +1081,7 @@ pub fn filter_chroma_block_edge_gated(
     }
     let mut out_p0 = [0i32; 4];
     let mut out_q0 = [0i32; 4];
-    crate::hevc::engine::simd::filter_chroma_rows(
+    crate::hevc::engine::simd::in_loop::filter_chroma_rows(
         &seg_p,
         &seg_q,
         tc,

@@ -363,7 +363,7 @@ pub fn apply_sao_ctb_full(
                 let cur = y as usize * pw + x_lo;
                 let o0 = y0 as usize * pw + (x_lo as i32 + h0) as usize;
                 let o1 = y1 as usize * pw + (x_lo as i32 + h1) as usize;
-                super::simd::sao_edge_row(
+                super::simd::in_loop::sao_edge_row(
                     &src[cur..cur + n],
                     &src[o0..o0 + n],
                     &src[o1..o1 + n],
@@ -385,7 +385,7 @@ pub fn apply_sao_ctb_full(
         debug_assert_eq!(dst_stride, pw);
         for j in 0..h {
             let o = (y_ctb + j) * pw + x_ctb;
-            super::simd::sao_band_row(
+            super::simd::in_loop::sao_band_row(
                 &src[o..o + w],
                 &mut dst[o..o + w],
                 &comp.offset_val,
