@@ -629,7 +629,11 @@ unsafe fn sao_edge_row_simd<V: Ops>(
             // equation 8-411.
             let raw = two.add(s0).add(s1);
             // equation 8-412: 0 -> 1, 1 -> 2, 2 -> 0, 3 and 4 unchanged.
-            let idx = blend(raw.cmpeq(idxs[2]), zero, blend(two.cmpgt(raw), raw.add(one), raw));
+            let idx = blend(
+                raw.cmpeq(idxs[2]),
+                zero,
+                blend(two.cmpgt(raw), raw.add(one), raw),
+            );
             // equation 8-413 (`off[0]` is 0, so index 0 needs no blend).
             let mut o = zero;
             o = blend(idx.cmpeq(idxs[1]), os[0], o);
@@ -813,12 +817,7 @@ unsafe fn filter_luma_rows_simd<V: Ops>(
         let a = q0.sub(p0);
         let b = q1.sub(p1);
         // delta = ( 9*(q0 - p0) - 3*(q1 - p1) + 8 ) >> 4
-        let delta = a
-            .sll(3)
-            .add(a)
-            .sub(b.sll(1).add(b))
-            .add(V::splat(8))
-            .sra(4);
+        let delta = a.sll(3).add(a).sub(b.sll(1).add(b)).add(V::splat(8)).sra(4);
         // The rows that pass |delta| < tC * 10 are the filtered ones.
         let keep = V::splat(tc * 10).cmpgt(vabs(delta));
         let d = delta.max(V::splat(-tc)).min(V::splat(tc)); // equation 8-396
@@ -1065,5 +1064,482 @@ pub(crate) fn filter_chroma_rows(
             filter_chroma_rows_neon(p, q, tc, bit_depth, out_p0, out_q0);
         },
         _ => filter_chroma_rows_scalar(p, q, tc, bit_depth, out_p0, out_q0),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hevc::engine::deblock::{
+        EdgePos, EdgeQp, EdgeType, SamplePlane, filter_chroma_block_edge, filter_luma_block_edge,
+    };
+    use crate::hevc::engine::picture::{Picture, Plane};
+    use crate::hevc::engine::sao::{ResolvedSaoComponent, SaoBoundaries, apply_sao_ctb_full};
+    use std::sync::{Mutex, MutexGuard};
+
+    /// Serializes the tests that pin [`FORCE_SCALAR`], which is process
+    /// global. Only these tests need to exclude each other: the scalar
+    /// and vector kernels are bit-exact, so an unrelated test that runs
+    /// while the switch is on still sees correct output.
+    static PIN: Mutex<()> = Mutex::new(());
+
+    /// A pinned reference run: everything inside `f` uses the scalar
+    /// kernels.
+    fn with_scalar<T>(f: impl FnOnce() -> T) -> (T, MutexGuard<'static, ()>) {
+        let guard = PIN.lock().unwrap_or_else(|e| e.into_inner());
+        FORCE_SCALAR.store(true, Ordering::SeqCst);
+        let out = f();
+        FORCE_SCALAR.store(false, Ordering::SeqCst);
+        (out, guard)
+    }
+
+    /// Deterministic xorshift so failures reproduce exactly.
+    struct Rng(u64);
+    impl Rng {
+        fn new(seed: u64) -> Self {
+            Rng(seed | 1)
+        }
+        fn next(&mut self) -> u32 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            (x >> 32) as u32
+        }
+        fn sample(&mut self, bit_depth: u8) -> i32 {
+            (self.next() % (1u32 << bit_depth)) as i32
+        }
+    }
+
+    fn offsets(rng: &mut Rng, scale: i32) -> [i32; 5] {
+        let mut o = [0i32; 5];
+        for v in o.iter_mut().skip(1) {
+            *v = (rng.next() % (2 * scale as u32 + 1)) as i32 - scale;
+        }
+        o
+    }
+
+    #[test]
+    fn sao_band_row_kernel_is_bit_exact_across_bands_and_bit_depths() {
+        // Hold PIN so no concurrently running test can pin the
+        // scalar path underneath us; this must exercise the vector one.
+        let _pin = PIN.lock().unwrap_or_else(|e| e.into_inner());
+        let mut rng = Rng::new(0x5A0B);
+        for &bit_depth in &[8u8, 10, 12] {
+            let max = (1i32 << bit_depth) - 1;
+            let band_shift = i32::from(bit_depth) - 5;
+            for band_position in 0..32i32 {
+                let off = offsets(&mut rng, 7 << (bit_depth - 8));
+                // Lengths straddle every vector width so the scalar tail
+                // of each kernel is exercised too.
+                for len in 0..40usize {
+                    let src: Vec<i32> = (0..len).map(|_| rng.sample(bit_depth)).collect();
+                    let mut want = vec![0i32; len];
+                    let mut got = vec![0i32; len];
+                    sao_band_row_scalar(&src, &mut want, &off, band_position, band_shift, max);
+                    sao_band_row(&src, &mut got, &off, band_position, band_shift, max);
+                    assert_eq!(got, want, "bd={bit_depth} band={band_position} len={len}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sao_edge_row_kernel_is_bit_exact_for_every_sign_pattern() {
+        // Hold PIN so no concurrently running test can pin the
+        // scalar path underneath us; this must exercise the vector one.
+        let _pin = PIN.lock().unwrap_or_else(|e| e.into_inner());
+        let mut rng = Rng::new(0xED9E);
+        for &bit_depth in &[8u8, 10, 12] {
+            let max = (1i32 << bit_depth) - 1;
+            let off = offsets(&mut rng, 7 << (bit_depth - 8));
+            for len in 0..40usize {
+                // Neighbours drawn from a tiny alphabet so all nine
+                // (sign, sign) combinations of equation 8-411 appear.
+                let src: Vec<i32> = (0..len).map(|_| (rng.next() % 3) as i32 + 1).collect();
+                let n0: Vec<i32> = (0..len).map(|_| (rng.next() % 3) as i32 + 1).collect();
+                let n1: Vec<i32> = (0..len).map(|_| (rng.next() % 3) as i32 + 1).collect();
+                let mut want = vec![0i32; len];
+                let mut got = vec![0i32; len];
+                sao_edge_row_scalar(&src, &n0, &n1, &mut want, &off, max);
+                sao_edge_row(&src, &n0, &n1, &mut got, &off, max);
+                assert_eq!(got, want, "sign sweep bd={bit_depth} len={len}");
+                // ... and again over the full sample range, which also
+                // exercises the equation 8-413 clip at both ends.
+                let src: Vec<i32> = (0..len).map(|_| rng.sample(bit_depth)).collect();
+                let n0: Vec<i32> = (0..len).map(|_| rng.sample(bit_depth)).collect();
+                let n1: Vec<i32> = (0..len).map(|_| rng.sample(bit_depth)).collect();
+                let mut want = vec![0i32; len];
+                let mut got = vec![0i32; len];
+                sao_edge_row_scalar(&src, &n0, &n1, &mut want, &off, max);
+                sao_edge_row(&src, &n0, &n1, &mut got, &off, max);
+                assert_eq!(got, want, "range sweep bd={bit_depth} len={len}");
+            }
+        }
+    }
+
+    #[test]
+    fn deblock_luma_rows_are_bit_exact_across_decisions_and_tc() {
+        // Hold PIN so no concurrently running test can pin the
+        // scalar path underneath us; this must exercise the vector one.
+        let _pin = PIN.lock().unwrap_or_else(|e| e.into_inner());
+        let mut rng = Rng::new(0xDEB1);
+        for &bit_depth in &[8u8, 10] {
+            // Every tC the §8.7.2.5.3 table can produce at this depth.
+            for q_tc in 0..=53i32 {
+                let tc = super::super::deblock::tc_prime(q_tc) * (1 << (bit_depth - 8));
+                for de in 1..=2u8 {
+                    for dep in 0..=1u8 {
+                        for deq in 0..=1u8 {
+                            for _ in 0..8 {
+                                let mut p: LumaSeg = [[0; 4]; 4];
+                                let mut q: LumaSeg = [[0; 4]; 4];
+                                for i in 0..4 {
+                                    for k in 0..4 {
+                                        p[i][k] = rng.sample(bit_depth);
+                                        q[i][k] = rng.sample(bit_depth);
+                                    }
+                                }
+                                let mut want_p: LumaSegOut = [[0; 4]; 3];
+                                let mut want_q: LumaSegOut = [[0; 4]; 3];
+                                let mut got_p: LumaSegOut = [[0; 4]; 3];
+                                let mut got_q: LumaSegOut = [[0; 4]; 3];
+                                filter_luma_rows_scalar(
+                                    &p,
+                                    &q,
+                                    de,
+                                    dep,
+                                    deq,
+                                    tc,
+                                    bit_depth,
+                                    &mut want_p,
+                                    &mut want_q,
+                                );
+                                filter_luma_rows(
+                                    &p, &q, de, dep, deq, tc, bit_depth, &mut got_p, &mut got_q,
+                                );
+                                let ndp = if de == 2 { 3 } else { (dep + 1) as usize };
+                                let ndq = if de == 2 { 3 } else { (deq + 1) as usize };
+                                assert_eq!(
+                                    got_p[..ndp],
+                                    want_p[..ndp],
+                                    "p side bd={bit_depth} tc={tc} dE={de} dEp={dep}"
+                                );
+                                assert_eq!(
+                                    got_q[..ndq],
+                                    want_q[..ndq],
+                                    "q side bd={bit_depth} tc={tc} dE={de} dEq={deq}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn deblock_chroma_rows_are_bit_exact_across_tc() {
+        // Hold PIN so no concurrently running test can pin the
+        // scalar path underneath us; this must exercise the vector one.
+        let _pin = PIN.lock().unwrap_or_else(|e| e.into_inner());
+        let mut rng = Rng::new(0xC780);
+        for &bit_depth in &[8u8, 10] {
+            for q_tc in 0..=53i32 {
+                let tc = super::super::deblock::tc_prime(q_tc) * (1 << (bit_depth - 8));
+                for _ in 0..16 {
+                    let mut p: ChromaSeg = [[0; 4]; 2];
+                    let mut q: ChromaSeg = [[0; 4]; 2];
+                    for i in 0..2 {
+                        for k in 0..4 {
+                            p[i][k] = rng.sample(bit_depth);
+                            q[i][k] = rng.sample(bit_depth);
+                        }
+                    }
+                    let (mut want_p, mut want_q) = ([0i32; 4], [0i32; 4]);
+                    let (mut got_p, mut got_q) = ([0i32; 4], [0i32; 4]);
+                    filter_chroma_rows_scalar(&p, &q, tc, bit_depth, &mut want_p, &mut want_q);
+                    filter_chroma_rows(&p, &q, tc, bit_depth, &mut got_p, &mut got_q);
+                    assert_eq!((got_p, got_q), (want_p, want_q), "bd={bit_depth} tc={tc}");
+                }
+            }
+        }
+    }
+
+    /// A `SaoBoundaries` whose CTBs all share one slice and one tile, so
+    /// `neighbour_allowed` is always true. Passing it keeps
+    /// `apply_sao_ctb_full` on its normative scalar loop with exactly the
+    /// semantics of the `None` (vectorized) path.
+    fn permissive_boundaries(pic: &Picture, ctb_log2: u32) -> SaoBoundaries {
+        let w_ctbs = pic.width_luma().div_ceil(1 << ctb_log2);
+        let h_ctbs = pic.height_luma().div_ceil(1 << ctb_log2);
+        SaoBoundaries {
+            slice_addr_of_ctb: vec![0; w_ctbs * h_ctbs],
+            tile_id_of_ctb: vec![0; w_ctbs * h_ctbs],
+            pic_w_ctbs: w_ctbs,
+            ctb_log2_size_y: ctb_log2,
+            across_slices: true,
+            across_tiles: true,
+            filter_across_of_ctb: None,
+            ctb_ts_of_rs: None,
+        }
+    }
+
+    fn filled_picture(w: usize, h: usize, bit_depth: u8, seed: u64) -> Picture {
+        let mut pic = Picture::new(w, h, 1, bit_depth, bit_depth);
+        let mut rng = Rng::new(seed);
+        for y in 0..h {
+            for x in 0..w {
+                pic.set_sample(Plane::Luma, x, y, rng.sample(bit_depth));
+            }
+        }
+        let (cw, ch) = pic.plane_dims(Plane::Cb);
+        for y in 0..ch {
+            for x in 0..cw {
+                let v = rng.sample(bit_depth);
+                pic.set_sample(Plane::Cb, x, y, v);
+                let v = rng.sample(bit_depth);
+                pic.set_sample(Plane::Cr, x, y, v);
+            }
+        }
+        pic
+    }
+
+    #[test]
+    fn sao_ctb_vector_path_matches_the_normative_scalar_loop() {
+        // Hold PIN so no concurrently running test can pin the
+        // scalar path underneath us; this must exercise the vector one.
+        let _pin = PIN.lock().unwrap_or_else(|e| e.into_inner());
+        // 43 x 37 is deliberately not a multiple of any vector width or
+        // of the CTB size, so partial CTBs and scalar tails are covered.
+        let mut rng = Rng::new(0x5A0C7B);
+        for &bit_depth in &[8u8, 10] {
+            let rec = filled_picture(48, 40, bit_depth, 0x1234 + u64::from(bit_depth));
+            let bounds = permissive_boundaries(&rec, 4);
+            for sao_type_idx in 1..=2u8 {
+                // All four Table 8-13 classes / all 32 band positions.
+                for param in 0..32u8 {
+                    let comp = ResolvedSaoComponent {
+                        sao_type_idx,
+                        offset_val: offsets(&mut rng, 7 << (bit_depth - 8)),
+                        band_position: param,
+                        eo_class: param & 3,
+                    };
+                    for plane in [Plane::Luma, Plane::Cb, Plane::Cr] {
+                        let (pw, ph) = rec.plane_dims(plane);
+                        for y_ctb in (0..ph).step_by(16) {
+                            for x_ctb in (0..pw).step_by(16) {
+                                let mut want = rec.clone();
+                                let mut got = rec.clone();
+                                apply_sao_ctb_full(
+                                    &rec,
+                                    &mut want,
+                                    plane,
+                                    &comp,
+                                    x_ctb,
+                                    y_ctb,
+                                    16,
+                                    16,
+                                    Some(&bounds),
+                                    None,
+                                );
+                                apply_sao_ctb_full(
+                                    &rec, &mut got, plane, &comp, x_ctb, y_ctb, 16, 16, None, None,
+                                );
+                                assert_eq!(
+                                    got.plane(plane),
+                                    want.plane(plane),
+                                    "type={sao_type_idx} param={param} ctb=({x_ctb},{y_ctb}) bd={bit_depth}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn deblock_block_edges_are_bit_exact_across_bs_qp_and_orientation() {
+        let (w, h) = (32usize, 32usize);
+        for &bit_depth in &[8u8, 10] {
+            for edge in [EdgeType::Vertical, EdgeType::Horizontal] {
+                for bs in 1..=2u8 {
+                    for qp in (0..=51i32).step_by(3) {
+                        for &off in &[-6i32, 0, 6] {
+                            let base = filled_picture(w, h, bit_depth, 0xABCD + qp as u64);
+                            let qpx = EdgeQp {
+                                qp_q: qp,
+                                qp_p: (qp + 4).min(51),
+                                beta_offset_div2: off,
+                                tc_offset_div2: off,
+                                bit_depth,
+                            };
+                            let pos = EdgePos { ex: 8, ey: 8, edge };
+                            let run = |pic: &mut Picture| {
+                                let (buf, stride) = pic.plane_mut(Plane::Luma);
+                                let mut sp = SamplePlane {
+                                    samples: buf,
+                                    width: w,
+                                    stride,
+                                };
+                                let dec = filter_luma_block_edge(&mut sp, pos, bs, qpx);
+                                let tc = filter_chroma_block_edge(&mut sp, pos, qpx, 0, 1);
+                                (dec, tc)
+                            };
+                            let mut want = base.clone();
+                            let (want_dec, guard) = with_scalar(|| run(&mut want));
+                            let mut got = base.clone();
+                            let got_dec = run(&mut got);
+                            drop(guard);
+                            assert_eq!(got_dec, want_dec);
+                            assert_eq!(
+                                got.plane(Plane::Luma),
+                                want.plane(Plane::Luma),
+                                "bd={bit_depth} bs={bs} qp={qp} off={off} {edge:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Reports the measured in-loop-filter speedup on a representative
+    /// reconstructed frame. Ignored by default (it is a timing
+    /// measurement, not an assertion):
+    ///
+    /// ```text
+    /// cargo test --release --features native --lib \
+    ///     hevc::engine::simd::tests::bench_in_loop_filters -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "benchmark; run explicitly with --ignored --nocapture"]
+    fn bench_in_loop_filters() {
+        use std::time::Instant;
+        const W: usize = 1920;
+        const H: usize = 1080;
+        const CTB: usize = 64;
+        let rec = filled_picture(W, H, 8, 0xB0B);
+        let mut rng = Rng::new(0xBEE5);
+        // One representative SAO parameter set per CTB, cycling the
+        // band / edge types the way a real slice does.
+        let comps: Vec<ResolvedSaoComponent> = (0..(W / CTB + 1) * (H / CTB + 1))
+            .map(|i| ResolvedSaoComponent {
+                sao_type_idx: [1u8, 2, 2, 1][i % 4],
+                offset_val: offsets(&mut rng, 7),
+                band_position: (i % 32) as u8,
+                eo_class: (i % 4) as u8,
+            })
+            .collect();
+
+        let sao_pass = || {
+            let mut out = rec.clone();
+            let mut c = 0usize;
+            for y in (0..H).step_by(CTB) {
+                for x in (0..W).step_by(CTB) {
+                    apply_sao_ctb_full(
+                        &rec,
+                        &mut out,
+                        Plane::Luma,
+                        &comps[c % comps.len()],
+                        x,
+                        y,
+                        CTB,
+                        CTB,
+                        None,
+                        None,
+                    );
+                    c += 1;
+                }
+            }
+            out
+        };
+
+        let deblock_pass = || {
+            let mut pic = rec.clone();
+            let (buf, stride) = pic.plane_mut(Plane::Luma);
+            let mut sp = SamplePlane {
+                samples: buf,
+                width: W,
+                stride,
+            };
+            let qp = EdgeQp {
+                qp_q: 32,
+                qp_p: 30,
+                beta_offset_div2: 0,
+                tc_offset_div2: 0,
+                bit_depth: 8,
+            };
+            // The §8.7.2.5.1 sampling grid: every 8 samples across the
+            // edge, every 4 along it, both orientations.
+            for y in (4..H - 8).step_by(4) {
+                for x in (8..W - 8).step_by(8) {
+                    let pos = EdgePos {
+                        ex: x,
+                        ey: y,
+                        edge: EdgeType::Vertical,
+                    };
+                    filter_luma_block_edge(&mut sp, pos, 2, qp);
+                }
+            }
+            for y in (8..H - 8).step_by(8) {
+                for x in (4..W - 8).step_by(4) {
+                    let pos = EdgePos {
+                        ex: x,
+                        ey: y,
+                        edge: EdgeType::Horizontal,
+                    };
+                    filter_luma_block_edge(&mut sp, pos, 2, qp);
+                }
+            }
+        };
+
+        let reps = 3;
+        let guard = PIN.lock().unwrap_or_else(|e| e.into_inner());
+        FORCE_SCALAR.store(true, Ordering::SeqCst);
+        let t = Instant::now();
+        for _ in 0..reps {
+            std::hint::black_box(sao_pass());
+        }
+        let sao_scalar = t.elapsed();
+        let t = Instant::now();
+        for _ in 0..reps {
+            deblock_pass();
+        }
+        let deblock_scalar = t.elapsed();
+        FORCE_SCALAR.store(false, Ordering::SeqCst);
+        let t = Instant::now();
+        for _ in 0..reps {
+            std::hint::black_box(sao_pass());
+        }
+        let sao_simd = t.elapsed();
+        let t = Instant::now();
+        for _ in 0..reps {
+            deblock_pass();
+        }
+        let deblock_simd = t.elapsed();
+        drop(guard);
+
+        let ratio = |a: std::time::Duration, b: std::time::Duration| {
+            a.as_secs_f64() / b.as_secs_f64().max(f64::EPSILON)
+        };
+        println!(
+            "in-loop filter benchmark, {W}x{H} luma, {reps} frames, isa={}",
+            isa()
+        );
+        println!(
+            "  SAO      scalar {:>9.3?} / vector {:>9.3?}  => {:.2}x",
+            sao_scalar / reps,
+            sao_simd / reps,
+            ratio(sao_scalar, sao_simd)
+        );
+        println!(
+            "  deblock  scalar {:>9.3?} / vector {:>9.3?}  => {:.2}x",
+            deblock_scalar / reps,
+            deblock_simd / reps,
+            ratio(deblock_scalar, deblock_simd)
+        );
     }
 }

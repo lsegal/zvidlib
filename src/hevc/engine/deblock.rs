@@ -946,8 +946,16 @@ pub fn filter_luma_block_edge_gated(
     crate::hevc::engine::simd::filter_luma_rows(
         &seg_p, &seg_q, dec.de, dec.dep, dec.deq, tc, bit_depth, &mut out_p, &mut out_q,
     );
-    let ndp = if dec.de == 2 { 3 } else { (dec.dep + 1) as usize }; // eq. 8-403
-    let ndq = if dec.de == 2 { 3 } else { (dec.deq + 1) as usize };
+    let ndp = if dec.de == 2 {
+        3
+    } else {
+        (dec.dep + 1) as usize
+    }; // eq. 8-403
+    let ndq = if dec.de == 2 {
+        3
+    } else {
+        (dec.deq + 1) as usize
+    };
     for k in 0..4 {
         for (i, row) in out_p.iter().enumerate().take(ndp) {
             let (px, py) = plane.edge_xy(ex, ey, edge, true, i, k);
