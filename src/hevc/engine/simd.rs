@@ -300,6 +300,10 @@ fn filter_taps_tail<const N: usize>(
 /// is responsible for having established that the accumulation cannot
 /// overflow `i32`. An `isa` the running CPU does not support falls back
 /// to [`Isa::Scalar`].
+// The round / shift / post / max quartet are the four distinct spec
+// quantities of equations 8-262..8-277; grouping them into the private
+// `CombineParams` would force that type into the public signature.
+#[allow(clippy::too_many_arguments)]
 #[inline]
 pub fn combine_weighted<const N: usize>(
     isa: Isa,
@@ -481,7 +485,9 @@ mod tests {
         let mut state = seed | 1;
         (0..len)
             .map(|_| {
-                state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
                 let v = (state >> 33) as i64 % (2 * i64::from(limit) + 1);
                 (v - i64::from(limit)) as i32
             })
@@ -529,9 +535,27 @@ mod tests {
                 let taps1: [&[i32]; 1] = [&a];
                 let w1 = [weights[0]];
                 let mut reference = vec![0i32; len];
-                combine_weighted(Isa::Scalar, &taps2, &weights, round, shift, post, 255, &mut reference);
+                combine_weighted(
+                    Isa::Scalar,
+                    &taps2,
+                    &weights,
+                    round,
+                    shift,
+                    post,
+                    255,
+                    &mut reference,
+                );
                 let mut reference1 = vec![0i32; len];
-                combine_weighted(Isa::Scalar, &taps1, &w1, round, shift, post, 1023, &mut reference1);
+                combine_weighted(
+                    Isa::Scalar,
+                    &taps1,
+                    &w1,
+                    round,
+                    shift,
+                    post,
+                    1023,
+                    &mut reference1,
+                );
                 for isa in available_isas() {
                     let mut got = vec![0i32; len];
                     combine_weighted(isa, &taps2, &weights, round, shift, post, 255, &mut got);

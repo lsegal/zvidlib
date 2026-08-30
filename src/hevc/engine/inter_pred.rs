@@ -750,27 +750,13 @@ pub fn default_weighted_pred_with(
     let mut out = vec![0i32; count];
     match (pred_flag_l0, pred_flag_l1) {
         // Uni-predictive from L0 (equation 8-262).
-        (true, false) => simd::combine_weighted(
-            isa,
-            &[pred_l0],
-            &[1],
-            offset1,
-            shift1,
-            0,
-            max_val,
-            &mut out,
-        ),
+        (true, false) => {
+            simd::combine_weighted(isa, &[pred_l0], &[1], offset1, shift1, 0, max_val, &mut out)
+        }
         // Uni-predictive from L1 (equation 8-263).
-        (false, true) => simd::combine_weighted(
-            isa,
-            &[pred_l1],
-            &[1],
-            offset1,
-            shift1,
-            0,
-            max_val,
-            &mut out,
-        ),
+        (false, true) => {
+            simd::combine_weighted(isa, &[pred_l1], &[1], offset1, shift1, 0, max_val, &mut out)
+        }
         // Bi-predictive (equation 8-264).
         (true, true) => simd::combine_weighted(
             isa,
@@ -931,7 +917,7 @@ fn explicit_uni(
     let round = 1i64 << (log2_wd - 1);
     let peak = max_abs(pred) * w.abs() + round;
     let limit = i64::from(i32::MAX);
-    if log2_wd < 31 && peak <= limit && (peak >> log2_wd) + o.abs() + 1 <= limit {
+    if log2_wd < 31 && peak <= limit && (peak >> log2_wd) + o.abs() < limit {
         simd::combine_weighted(
             isa,
             &[pred],
@@ -979,8 +965,8 @@ fn explicit_bi(
         return;
     }
     for ((o_out, &a), &b) in out.iter_mut().zip(p0).zip(p1) {
-        *o_out = (((i64::from(a) * w0 + i64::from(b) * w1 + round) >> shift).clamp(0, max_val))
-            as i32;
+        *o_out =
+            (((i64::from(a) * w0 + i64::from(b) * w1 + round) >> shift).clamp(0, max_val)) as i32;
     }
 }
 
@@ -1799,5 +1785,284 @@ mod tests {
             predict_inter_pu(&l0, &none, &zero),
             Err(InterPredError::EmptyBlock)
         );
+    }
+
+    // -----------------------------------------------------------------
+    // SIMD backend bit-exactness (§8.5.3.3 vectorized kernels)
+    // -----------------------------------------------------------------
+
+    /// Deterministic pseudo-random samples in `[0, max]`, so the
+    /// cross-backend comparisons run on realistic data rather than on a
+    /// constant plane whose filter output is degenerate.
+    fn pseudo_random(seed: u64, len: usize, max: i32) -> Vec<i32> {
+        let mut state = seed | 1;
+        (0..len)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                ((state >> 33) % (max as u64 + 1)) as i32
+            })
+            .collect()
+    }
+
+    /// Luma / chroma prediction-block shapes HEVC can signal (the PART_*
+    /// splits of a 64x64 through 8x8 CU, plus their 4:2:0 chroma halves).
+    const BLOCK_SHAPES: [(usize, usize); 12] = [
+        (4, 4),
+        (4, 8),
+        (8, 4),
+        (8, 8),
+        (4, 16),
+        (16, 4),
+        (12, 16),
+        (16, 12),
+        (16, 16),
+        (24, 32),
+        (32, 32),
+        (64, 64),
+    ];
+
+    /// Motion-compensated block origins: interior, straddling the left /
+    /// top edge, and straddling the right / bottom edge — so the
+    /// borrowed-window fast path and the `Clip3` edge-extension path are
+    /// both exercised on every backend.
+    const ORIGINS: [(i32, i32); 5] = [(9, 7), (-5, 3), (2, -6), (70, 40), (-3, -3)];
+
+    #[test]
+    fn every_backend_matches_scalar_luma_block() {
+        let (pw, ph) = (96usize, 72usize);
+        for bit_depth in [8u8, 10, 16] {
+            let plane_samples = pseudo_random(bit_depth as u64, pw * ph, (1 << bit_depth) - 1);
+            let plane = RefPlane::new(&plane_samples, pw, ph).unwrap();
+            for &(w, h) in &BLOCK_SHAPES {
+                for &(x_int, y_int) in &ORIGINS {
+                    for x_frac in 0..4 {
+                        for y_frac in 0..4 {
+                            let reference = interp_luma_block_with(
+                                Isa::Scalar,
+                                &plane,
+                                x_int,
+                                y_int,
+                                x_frac,
+                                y_frac,
+                                w,
+                                h,
+                                bit_depth,
+                            )
+                            .unwrap();
+                            for isa in simd::available_isas() {
+                                let got = interp_luma_block_with(
+                                    isa, &plane, x_int, y_int, x_frac, y_frac, w, h, bit_depth,
+                                )
+                                .unwrap();
+                                assert_eq!(
+                                    got, reference,
+                                    "{isa:?} luma {w}x{h} @({x_int},{y_int}) \
+                                     frac=({x_frac},{y_frac}) bd={bit_depth}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_backend_matches_scalar_chroma_block() {
+        let (pw, ph) = (64usize, 48usize);
+        for bit_depth in [8u8, 10, 16] {
+            let plane_samples = pseudo_random(bit_depth as u64 + 99, pw * ph, (1 << bit_depth) - 1);
+            let plane = RefPlane::new(&plane_samples, pw, ph).unwrap();
+            for &(w, h) in &BLOCK_SHAPES[..9] {
+                for &(x_int, y_int) in &ORIGINS {
+                    for x_frac in 0..8 {
+                        for y_frac in 0..8 {
+                            let reference = interp_chroma_block_with(
+                                Isa::Scalar,
+                                &plane,
+                                x_int,
+                                y_int,
+                                x_frac,
+                                y_frac,
+                                w,
+                                h,
+                                bit_depth,
+                            )
+                            .unwrap();
+                            for isa in simd::available_isas() {
+                                let got = interp_chroma_block_with(
+                                    isa, &plane, x_int, y_int, x_frac, y_frac, w, h, bit_depth,
+                                )
+                                .unwrap();
+                                assert_eq!(
+                                    got, reference,
+                                    "{isa:?} chroma {w}x{h} @({x_int},{y_int}) \
+                                     frac=({x_frac},{y_frac}) bd={bit_depth}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The interpolation output range the combines actually see: the
+    /// §8.5.3.3.3 intermediates are signed and span roughly
+    /// `± 2^( bitDepth − 2 ) · 64`.
+    fn intermediates(seed: u64, len: usize, bit_depth: u8) -> Vec<i32> {
+        let span = ((1i64 << bit_depth) - 1) * 80;
+        pseudo_random(seed, len, span as i32)
+            .into_iter()
+            .map(|v| v - (span / 2) as i32)
+            .collect()
+    }
+
+    #[test]
+    fn every_backend_matches_scalar_default_weighted_pred() {
+        for bit_depth in [8u8, 10, 16] {
+            for &(w, h) in &BLOCK_SHAPES {
+                let count = w * h;
+                let p0 = intermediates(1 + bit_depth as u64, count, bit_depth);
+                let p1 = intermediates(2 + bit_depth as u64, count, bit_depth);
+                for &(f0, f1) in &[(true, false), (false, true), (true, true)] {
+                    let reference =
+                        default_weighted_pred_with(Isa::Scalar, &p0, &p1, f0, f1, w, h, bit_depth)
+                            .unwrap();
+                    for isa in simd::available_isas() {
+                        let got =
+                            default_weighted_pred_with(isa, &p0, &p1, f0, f1, w, h, bit_depth)
+                                .unwrap();
+                        assert_eq!(got, reference, "{isa:?} default {w}x{h} bd={bit_depth}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_backend_matches_scalar_explicit_weighted_pred() {
+        // Legal HEVC weights/offsets, plus a deliberately out-of-range
+        // weight that forces the `i64` scalar fallback, so both the
+        // vectorized and the widened path are compared against scalar.
+        let cases: [(u8, i32, i32, i32, i32); 5] = [
+            (0, 1, 0, 1, 0),
+            (6, 64, 0, 64, 0),
+            (7, 127, 40, -128, -40),
+            (5, -3, -12, 41, 7),
+            (0, i32::MAX / 2, i32::MIN / 4, i32::MAX / 2, 0),
+        ];
+        for bit_depth in [8u8, 10, 16] {
+            for &(w, h) in &BLOCK_SHAPES {
+                let count = w * h;
+                let p0 = intermediates(21 + bit_depth as u64, count, bit_depth);
+                let p1 = intermediates(22 + bit_depth as u64, count, bit_depth);
+                for &(denom, w0, o0, w1, o1) in &cases {
+                    for &(f0, f1) in &[(true, false), (false, true), (true, true)] {
+                        let reference = explicit_weighted_pred_with(
+                            Isa::Scalar,
+                            &p0,
+                            &p1,
+                            f0,
+                            f1,
+                            w,
+                            h,
+                            denom,
+                            w0,
+                            o0,
+                            w1,
+                            o1,
+                            bit_depth,
+                        )
+                        .unwrap();
+                        for isa in simd::available_isas() {
+                            let got = explicit_weighted_pred_with(
+                                isa, &p0, &p1, f0, f1, w, h, denom, w0, o0, w1, o1, bit_depth,
+                            )
+                            .unwrap();
+                            assert_eq!(
+                                got, reference,
+                                "{isa:?} explicit {w}x{h} denom={denom} bd={bit_depth}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Micro-benchmark for the §8.5.3.3 inter-prediction kernels: the
+    /// two-dimensional 8-tap luma filter, the two-dimensional 4-tap
+    /// chroma filter, and the bi-predictive default combine, each timed
+    /// on the scalar reference and on every SIMD backend the host CPU
+    /// offers.
+    ///
+    /// Ignored by default because it is a timing measurement, not an
+    /// assertion. Run it with
+    /// `cargo test --release --features native --lib
+    /// simd_inter_pred_benchmark -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "benchmark; run with --ignored --nocapture"]
+    fn simd_inter_pred_benchmark() {
+        use std::time::Instant;
+
+        let (pw, ph) = (1920usize, 1088usize);
+        let plane_samples = pseudo_random(7, pw * ph, 255);
+        let plane = RefPlane::new(&plane_samples, pw, ph).unwrap();
+        // One 1080p frame's worth of 16x16 luma / 8x8 chroma blocks.
+        let blocks: Vec<(i32, i32)> = (0..68)
+            .flat_map(|by| (0..120).map(move |bx| (bx * 16, by * 16)))
+            .collect();
+        let combine_len = 16 * 16;
+        let p0 = intermediates(31, combine_len, 8);
+        let p1 = intermediates(32, combine_len, 8);
+
+        println!(
+            "\ninter-prediction kernels, {} 16x16 blocks/pass",
+            blocks.len()
+        );
+        let mut baselines = [0f64; 3];
+        for (i, isa) in simd::available_isas().into_iter().enumerate() {
+            let start = Instant::now();
+            let mut sink = 0i64;
+            for &(x, y) in &blocks {
+                let b = interp_luma_block_with(isa, &plane, x, y, 2, 3, 16, 16, 8).unwrap();
+                sink += b[0] as i64;
+            }
+            let luma = start.elapsed().as_secs_f64();
+
+            let start = Instant::now();
+            for &(x, y) in &blocks {
+                let b = interp_chroma_block_with(isa, &plane, x / 2, y / 2, 5, 3, 8, 8, 8).unwrap();
+                sink += b[0] as i64;
+            }
+            let chroma = start.elapsed().as_secs_f64();
+
+            let start = Instant::now();
+            for _ in &blocks {
+                let b = default_weighted_pred_with(isa, &p0, &p1, true, true, 16, 16, 8).unwrap();
+                sink += b[0] as i64;
+            }
+            let combine = start.elapsed().as_secs_f64();
+
+            let timings = [luma, chroma, combine];
+            if i == 0 {
+                baselines = timings;
+            }
+            println!(
+                "  {:>8}  luma 8-tap 2D {:7.2} ms ({:4.2}x)  chroma 4-tap 2D {:7.2} ms ({:4.2}x)  \
+                 bi combine {:7.2} ms ({:4.2}x){}",
+                format!("{isa:?}"),
+                luma * 1e3,
+                baselines[0] / luma,
+                chroma * 1e3,
+                baselines[1] / chroma,
+                combine * 1e3,
+                baselines[2] / combine,
+                if sink == i64::MIN { "!" } else { "" },
+            );
+        }
     }
 }
