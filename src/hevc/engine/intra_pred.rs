@@ -46,6 +46,8 @@
 //! the caller's / follow-ups' responsibility — this module starts at the
 //! marked reference array and stops at `predSamples`.
 
+use crate::hevc::engine::simd::{self, Isa};
+
 /// Table 8-1 mode index `0` — the planar predictor (§8.4.4.2.4).
 pub const INTRA_PLANAR: u8 = 0;
 /// Table 8-1 mode index `1` — the DC predictor (§8.4.4.2.5).
@@ -442,6 +444,24 @@ pub fn filter_reference_samples(
     cidx: Component,
     bit_depth_luma: u8,
 ) -> ReferenceSamples {
+    filter_reference_samples_with_isa(
+        simd::detected_isa(),
+        p,
+        pred_mode_intra,
+        strong_intra_smoothing_enabled,
+        cidx,
+        bit_depth_luma,
+    )
+}
+
+fn filter_reference_samples_with_isa(
+    isa: Isa,
+    p: &ReferenceSamples,
+    pred_mode_intra: u8,
+    strong_intra_smoothing_enabled: bool,
+    cidx: Component,
+    bit_depth_luma: u8,
+) -> ReferenceSamples {
     let n = p.n_tbs;
     if !reference_filter_flag(pred_mode_intra, n) {
         return p.clone();
@@ -467,29 +487,63 @@ pub fn filter_reference_samples(
         let p_left_63 = p.left(63);
         let p_top_63 = p.top(63);
         let p_corner = p.corner();
-        for y in 0..=62 {
-            // pF[ −1 ][ y ] = ((63−y)*p[−1][−1] + (y+1)*p[−1][63] + 32) >> 6
-            // (eq 8-37, y = 0..62 INCLUSIVE — 63 interpolated samples).
-            left[y as usize] = ((63 - y) * p_corner + (y + 1) * p_left_63 + 32) >> 6;
-        }
+        // pF[ −1 ][ y ] = ((63−y)*p[−1][−1] + (y+1)*p[−1][63] + 32) >> 6
+        // (eq 8-37, y = 0..62 INCLUSIVE — 63 interpolated samples).
+        simd::affine_i32(
+            isa,
+            63 * p_corner + p_left_63,
+            p_left_63 - p_corner,
+            32,
+            6,
+            &mut left[..63],
+        );
         left[63] = p_left_63;
-        for x in 0..=62 {
-            // eq 8-39, x = 0..62 inclusive.
-            top[x as usize] = ((63 - x) * p_corner + (x + 1) * p_top_63 + 32) >> 6;
-        }
+        // eq 8-39, x = 0..62 inclusive.
+        simd::affine_i32(
+            isa,
+            63 * p_corner + p_top_63,
+            p_top_63 - p_corner,
+            32,
+            6,
+            &mut top[..63],
+        );
         top[63] = p_top_63;
     } else {
         // Equations 8-41..8-45, the [1 2 1] >> 2 smoothing.
         corner = (p.left(0) + 2 * p.corner() + p.top(0) + 2) >> 2;
         let last = 2 * n as i32 - 1;
-        for y in 0..=(last - 1) {
-            // pF[ −1 ][ y ] = (p[−1][y+1] + 2*p[−1][y] + p[−1][y−1] + 2) >> 2
-            left[y as usize] = (p.left(y + 1) + 2 * p.left(y) + p.left(y - 1) + 2) >> 2;
-        }
+        let mut left_ext = Vec::with_capacity(len + 2);
+        left_ext.push(p.corner());
+        left_ext.extend_from_slice(&p.left);
+        left_ext.push(p.left(last));
+        let left_taps = [&left_ext[2..], &left_ext[1..], &left_ext[..]];
+        simd::combine_weighted(
+            isa,
+            &left_taps,
+            &[1, 2, 1],
+            2,
+            2,
+            0,
+            i32::MAX,
+            &mut left[..len - 1],
+        );
         left[last as usize] = p.left(last);
-        for x in 0..=(last - 1) {
-            top[x as usize] = (p.top(x - 1) + 2 * p.top(x) + p.top(x + 1) + 2) >> 2;
-        }
+
+        let mut top_ext = Vec::with_capacity(len + 2);
+        top_ext.push(p.corner());
+        top_ext.extend_from_slice(&p.top);
+        top_ext.push(p.top(last));
+        let top_taps = [&top_ext[..], &top_ext[1..], &top_ext[2..]];
+        simd::combine_weighted(
+            isa,
+            &top_taps,
+            &[1, 2, 1],
+            2,
+            2,
+            0,
+            i32::MAX,
+            &mut top[..len - 1],
+        );
         top[last as usize] = p.top(last);
     }
 
@@ -507,6 +561,10 @@ pub fn filter_reference_samples(
 /// (`pred[ y * nTbS + x ]` is `predSamples[ x ][ y ]`).
 #[must_use]
 pub fn predict_planar(p: &ReferenceSamples) -> Vec<i32> {
+    predict_planar_with_isa(simd::detected_isa(), p)
+}
+
+fn predict_planar_with_isa(isa: Isa, p: &ReferenceSamples) -> Vec<i32> {
     let n = p.n_tbs;
     let ni = n as i32;
     let shift = log2_tbs(n) + 1;
@@ -515,15 +573,11 @@ pub fn predict_planar(p: &ReferenceSamples) -> Vec<i32> {
     let mut pred = vec![0i32; n * n];
     for y in 0..ni {
         let p_left_y = p.left(y); // p[ −1 ][ y ]
-        for x in 0..ni {
-            let p_top_x = p.top(x); // p[ x ][ −1 ]
-            let v = (ni - 1 - x) * p_left_y
-                + (x + 1) * p_top_n
-                + (ni - 1 - y) * p_top_x
-                + (y + 1) * p_left_n
-                + ni;
-            pred[(y * ni + x) as usize] = v >> shift;
-        }
+        let row = &mut pred[(y as usize) * n..(y as usize + 1) * n];
+        let base = (ni - 1) * p_left_y + p_top_n + (y + 1) * p_left_n + ni;
+        let step = p_top_n - p_left_y;
+        let top_scale = ni - 1 - y;
+        simd::affine_source_i32(isa, base, step, &p.top, top_scale, 0, shift as i32, row);
     }
     pred
 }
@@ -538,6 +592,15 @@ pub fn predict_planar(p: &ReferenceSamples) -> Vec<i32> {
 /// Returns the `(nTbS)x(nTbS)` predicted samples row-major.
 #[must_use]
 pub fn predict_dc(
+    p: &ReferenceSamples,
+    cidx: Component,
+    disable_boundary_filter: bool,
+) -> Vec<i32> {
+    predict_dc_with_isa(simd::detected_isa(), p, cidx, disable_boundary_filter)
+}
+
+fn predict_dc_with_isa(
+    isa: Isa,
     p: &ReferenceSamples,
     cidx: Component,
     disable_boundary_filter: bool,
@@ -557,7 +620,8 @@ pub fn predict_dc(
     }
     let dc_val = (sum + ni) >> (k + 1);
 
-    let mut pred = vec![dc_val; n * n];
+    let mut pred = vec![0; n * n];
+    simd::fill_i32(isa, dc_val, &mut pred);
 
     if cidx.is_luma() && !disable_boundary_filter && n < 32 {
         // Equation 8-48: predSamples[0][0]
@@ -632,6 +696,24 @@ pub fn predict_angular(
     bit_depth: u8,
     disable_boundary_filter: bool,
 ) -> Result<Vec<i32>, IntraPredError> {
+    predict_angular_with_isa(
+        simd::detected_isa(),
+        p,
+        pred_mode_intra,
+        cidx,
+        bit_depth,
+        disable_boundary_filter,
+    )
+}
+
+fn predict_angular_with_isa(
+    isa: Isa,
+    p: &ReferenceSamples,
+    pred_mode_intra: u8,
+    cidx: Component,
+    bit_depth: u8,
+    disable_boundary_filter: bool,
+) -> Result<Vec<i32>, IntraPredError> {
     if !(2..=34).contains(&pred_mode_intra) {
         return Err(IntraPredError::InvalidMode(pred_mode_intra));
     }
@@ -670,17 +752,13 @@ pub fn predict_angular(
         for y in 0..ni {
             let i_idx = ((y + 1) * angle) >> 5; // equation 8-56
             let i_fact = ((y + 1) * angle) & 31; // equation 8-57
-            for x in 0..ni {
-                let v = if i_fact != 0 {
-                    // equation 8-58
-                    let a = refa[(x + i_idx + 1 + off) as usize];
-                    let b = refa[(x + i_idx + 2 + off) as usize];
-                    ((32 - i_fact) * a + i_fact * b + 16) >> 5
-                } else {
-                    // equation 8-59
-                    refa[(x + i_idx + 1 + off) as usize]
-                };
-                pred[(y * ni + x) as usize] = v;
+            let row = &mut pred[(y as usize) * n..(y as usize + 1) * n];
+            let start = (i_idx + 1 + off) as usize;
+            if i_fact != 0 {
+                let taps = [&refa[start..], &refa[start + 1..]];
+                simd::combine_weighted(isa, &taps, &[32 - i_fact, i_fact], 16, 5, 0, i32::MAX, row);
+            } else {
+                row.copy_from_slice(&refa[start..start + n]);
             }
         }
 
@@ -724,17 +802,27 @@ pub fn predict_angular(
         for x in 0..ni {
             let i_idx = ((x + 1) * angle) >> 5; // equation 8-64
             let i_fact = ((x + 1) * angle) & 31; // equation 8-65
-            for y in 0..ni {
-                let v = if i_fact != 0 {
-                    // equation 8-66
-                    let a = refa[(y + i_idx + 1 + off) as usize];
-                    let b = refa[(y + i_idx + 2 + off) as usize];
-                    ((32 - i_fact) * a + i_fact * b + 16) >> 5
-                } else {
-                    // equation 8-67
-                    refa[(y + i_idx + 1 + off) as usize]
-                };
-                pred[(y * ni + x) as usize] = v;
+            let start = (i_idx + 1 + off) as usize;
+            if i_fact != 0 {
+                let mut col = vec![0; n];
+                let taps = [&refa[start..], &refa[start + 1..]];
+                simd::combine_weighted(
+                    isa,
+                    &taps,
+                    &[32 - i_fact, i_fact],
+                    16,
+                    5,
+                    0,
+                    i32::MAX,
+                    &mut col,
+                );
+                for (y, &v) in col.iter().enumerate() {
+                    pred[y * n + x as usize] = v;
+                }
+            } else {
+                for y in 0..n {
+                    pred[y * n + x as usize] = refa[start + y];
+                }
             }
         }
 
@@ -806,6 +894,14 @@ pub fn intra_predict(
     p: &ReferenceSamples,
     params: &IntraPredParams,
 ) -> Result<Vec<i32>, IntraPredError> {
+    intra_predict_with_isa(simd::detected_isa(), p, params)
+}
+
+fn intra_predict_with_isa(
+    isa: Isa,
+    p: &ReferenceSamples,
+    params: &IntraPredParams,
+) -> Result<Vec<i32>, IntraPredError> {
     if params.pred_mode_intra > 34 {
         return Err(IntraPredError::InvalidMode(params.pred_mode_intra));
     }
@@ -819,7 +915,8 @@ pub fn intra_predict(
         !params.intra_smoothing_disabled && (params.cidx.is_luma() || params.chroma_array_type_3);
     let filtered;
     let pp: &ReferenceSamples = if filter_gate {
-        filtered = filter_reference_samples(
+        filtered = filter_reference_samples_with_isa(
+            isa,
             p,
             params.pred_mode_intra,
             params.strong_intra_smoothing_enabled,
@@ -833,9 +930,10 @@ pub fn intra_predict(
 
     // Step 2: predictor dispatch.
     let pred = match params.pred_mode_intra {
-        INTRA_PLANAR => predict_planar(pp),
-        INTRA_DC => predict_dc(pp, params.cidx, params.disable_boundary_filter),
-        m => predict_angular(
+        INTRA_PLANAR => predict_planar_with_isa(isa, pp),
+        INTRA_DC => predict_dc_with_isa(isa, pp, params.cidx, params.disable_boundary_filter),
+        m => predict_angular_with_isa(
+            isa,
             pp,
             m,
             params.cidx,
@@ -856,7 +954,7 @@ pub fn intra_predict_with_substitution(
     intra_predict(&p, params)
 }
 
-#[cfg(any())]
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1226,5 +1324,105 @@ mod tests {
                 got: 7
             }
         );
+    }
+
+    fn patterned_ref(n: usize, seed: i32) -> ReferenceSamples {
+        let max = 1023;
+        let left = (0..2 * n)
+            .map(|i| (seed + i as i32 * 37 + (i as i32 * i as i32 * 5)).rem_euclid(max))
+            .collect();
+        let top = (0..2 * n)
+            .map(|i| (seed * 3 + i as i32 * 29 + (i as i32 * i as i32 * 7)).rem_euclid(max))
+            .collect();
+        ReferenceSamples::new(n, seed.rem_euclid(max), left, top).unwrap()
+    }
+
+    #[test]
+    fn simd_backends_match_scalar_for_all_modes_and_sizes() {
+        for n in [4usize, 8, 16, 32] {
+            let p = patterned_ref(n, 17 + n as i32);
+            for mode in 0..=34 {
+                let params = IntraPredParams {
+                    pred_mode_intra: mode,
+                    cidx: Component::Luma,
+                    bit_depth: 10,
+                    bit_depth_luma: 10,
+                    intra_smoothing_disabled: false,
+                    strong_intra_smoothing_enabled: true,
+                    chroma_array_type_3: false,
+                    disable_boundary_filter: false,
+                };
+                let filtered = filter_reference_samples_with_isa(
+                    Isa::Scalar,
+                    &p,
+                    mode,
+                    params.strong_intra_smoothing_enabled,
+                    params.cidx,
+                    params.bit_depth_luma,
+                );
+                let reference = match mode {
+                    INTRA_PLANAR => predict_planar_with_isa(Isa::Scalar, &filtered),
+                    INTRA_DC => predict_dc_with_isa(Isa::Scalar, &filtered, params.cidx, false),
+                    _ => predict_angular_with_isa(
+                        Isa::Scalar,
+                        &filtered,
+                        mode,
+                        params.cidx,
+                        params.bit_depth,
+                        false,
+                    )
+                    .unwrap(),
+                };
+                for isa in simd::available_isas() {
+                    let got = intra_predict_with_isa(isa, &p, &params).unwrap();
+                    assert_eq!(got, reference, "{isa:?} mode={mode} n={n}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "benchmark; run explicitly with --ignored --nocapture"]
+    fn bench_intra_prediction_backends() {
+        use std::time::Instant;
+
+        const PASSES: usize = 20_000;
+        for n in [8usize, 16, 32] {
+            let p = patterned_ref(n, 91 + n as i32);
+            for mode in [INTRA_PLANAR, INTRA_DC, 10, 18, 26, 34] {
+                let params = IntraPredParams {
+                    pred_mode_intra: mode,
+                    cidx: Component::Luma,
+                    bit_depth: 10,
+                    bit_depth_luma: 10,
+                    intra_smoothing_disabled: false,
+                    strong_intra_smoothing_enabled: true,
+                    chroma_array_type_3: false,
+                    disable_boundary_filter: false,
+                };
+                let scalar_start = Instant::now();
+                let mut scalar = Vec::new();
+                for _ in 0..PASSES {
+                    scalar = intra_predict_with_isa(Isa::Scalar, &p, &params).unwrap();
+                }
+                let scalar_elapsed = scalar_start.elapsed().as_secs_f64();
+                for isa in simd::available_isas() {
+                    if isa == Isa::Scalar {
+                        continue;
+                    }
+                    let started = Instant::now();
+                    let mut got = Vec::new();
+                    for _ in 0..PASSES {
+                        got = intra_predict_with_isa(isa, &p, &params).unwrap();
+                    }
+                    let elapsed = started.elapsed().as_secs_f64();
+                    assert_eq!(got, scalar, "{isa:?} mode={mode} n={n}");
+                    println!(
+                        "HEVC intra {isa:?} mode {mode} {n}x{n}: {:.2}x",
+                        scalar_elapsed / elapsed
+                    );
+                }
+            }
+        }
     }
 }

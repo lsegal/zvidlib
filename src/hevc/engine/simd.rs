@@ -114,6 +114,335 @@ pub fn available_isas() -> Vec<Isa> {
     isas
 }
 
+/// Fill `out` with `value`, on the requested backend.
+#[inline]
+pub fn fill_i32(isa: Isa, value: i32, out: &mut [i32]) {
+    if !supported(isa) {
+        return out.fill(value);
+    }
+    match isa {
+        Isa::Scalar => out.fill(value),
+        #[cfg(target_arch = "x86_64")]
+        Isa::Sse41 => unsafe { fill_i32_sse41(value, out) },
+        #[cfg(target_arch = "x86_64")]
+        Isa::Avx2 => unsafe { fill_i32_avx2(value, out) },
+        #[cfg(target_arch = "aarch64")]
+        Isa::Neon => unsafe { fill_i32_neon(value, out) },
+    }
+}
+
+/// Generate `out[i] = (base + i * step + round) >> shift`.
+#[inline]
+pub fn affine_i32(isa: Isa, base: i32, step: i32, round: i32, shift: i32, out: &mut [i32]) {
+    debug_assert!((0..32).contains(&shift));
+    if !supported(isa) {
+        return affine_i32_scalar(base, step, round, shift, out);
+    }
+    match isa {
+        Isa::Scalar => affine_i32_scalar(base, step, round, shift, out),
+        #[cfg(target_arch = "x86_64")]
+        Isa::Sse41 => unsafe { affine_i32_sse41(base, step, round, shift, out) },
+        #[cfg(target_arch = "x86_64")]
+        Isa::Avx2 => unsafe { affine_i32_avx2(base, step, round, shift, out) },
+        #[cfg(target_arch = "aarch64")]
+        Isa::Neon => unsafe { affine_i32_neon(base, step, round, shift, out) },
+    }
+}
+
+/// Generate `out[i] = (base + i * step + source[i] * source_scale + round) >> shift`.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub fn affine_source_i32(
+    isa: Isa,
+    base: i32,
+    step: i32,
+    source: &[i32],
+    source_scale: i32,
+    round: i32,
+    shift: i32,
+    out: &mut [i32],
+) {
+    debug_assert!((0..32).contains(&shift));
+    debug_assert!(source.len() >= out.len());
+    if !supported(isa) {
+        return affine_source_i32_scalar(base, step, source, source_scale, round, shift, out);
+    }
+    match isa {
+        Isa::Scalar => {
+            affine_source_i32_scalar(base, step, source, source_scale, round, shift, out)
+        }
+        #[cfg(target_arch = "x86_64")]
+        Isa::Sse41 => unsafe {
+            affine_source_i32_sse41(base, step, source, source_scale, round, shift, out)
+        },
+        #[cfg(target_arch = "x86_64")]
+        Isa::Avx2 => unsafe {
+            affine_source_i32_avx2(base, step, source, source_scale, round, shift, out)
+        },
+        #[cfg(target_arch = "aarch64")]
+        Isa::Neon => unsafe {
+            affine_source_i32_neon(base, step, source, source_scale, round, shift, out)
+        },
+    }
+}
+
+fn affine_i32_scalar(base: i32, step: i32, round: i32, shift: i32, out: &mut [i32]) {
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = (base + i as i32 * step + round) >> shift;
+    }
+}
+
+fn affine_source_i32_scalar(
+    base: i32,
+    step: i32,
+    source: &[i32],
+    source_scale: i32,
+    round: i32,
+    shift: i32,
+    out: &mut [i32],
+) {
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = (base + i as i32 * step + source[i] * source_scale + round) >> shift;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.1")]
+unsafe fn fill_i32_sse41(value: i32, out: &mut [i32]) {
+    unsafe {
+        let v = _mm_set1_epi32(value);
+        let mut i = 0usize;
+        while i + 4 <= out.len() {
+            _mm_storeu_si128(out.as_mut_ptr().add(i).cast(), v);
+            i += 4;
+        }
+        out[i..].fill(value);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn fill_i32_avx2(value: i32, out: &mut [i32]) {
+    unsafe {
+        let v = _mm256_set1_epi32(value);
+        let mut i = 0usize;
+        while i + 8 <= out.len() {
+            _mm256_storeu_si256(out.as_mut_ptr().add(i).cast(), v);
+            i += 8;
+        }
+        if i + 4 <= out.len() {
+            _mm_storeu_si128(out.as_mut_ptr().add(i).cast(), _mm256_castsi256_si128(v));
+            i += 4;
+        }
+        out[i..].fill(value);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn fill_i32_neon(value: i32, out: &mut [i32]) {
+    unsafe {
+        let v = vdupq_n_s32(value);
+        let mut i = 0usize;
+        while i + 4 <= out.len() {
+            vst1q_s32(out.as_mut_ptr().add(i), v);
+            i += 4;
+        }
+        out[i..].fill(value);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.1")]
+unsafe fn affine_i32_sse41(base: i32, step: i32, round: i32, shift: i32, out: &mut [i32]) {
+    unsafe {
+        let idx0 = _mm_setr_epi32(0, 1, 2, 3);
+        let four_steps = _mm_set1_epi32(4 * step);
+        let step_v = _mm_set1_epi32(step);
+        let round_v = _mm_set1_epi32(round);
+        let sh = _mm_cvtsi32_si128(shift);
+        let mut b = _mm_add_epi32(_mm_set1_epi32(base), _mm_mullo_epi32(idx0, step_v));
+        let mut i = 0usize;
+        while i + 4 <= out.len() {
+            _mm_storeu_si128(
+                out.as_mut_ptr().add(i).cast(),
+                _mm_sra_epi32(_mm_add_epi32(b, round_v), sh),
+            );
+            b = _mm_add_epi32(b, four_steps);
+            i += 4;
+        }
+        affine_i32_scalar(base + i as i32 * step, step, round, shift, &mut out[i..]);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.1")]
+unsafe fn affine_source_i32_sse41(
+    base: i32,
+    step: i32,
+    source: &[i32],
+    source_scale: i32,
+    round: i32,
+    shift: i32,
+    out: &mut [i32],
+) {
+    unsafe {
+        let idx0 = _mm_setr_epi32(0, 1, 2, 3);
+        let four_steps = _mm_set1_epi32(4 * step);
+        let step_v = _mm_set1_epi32(step);
+        let scale_v = _mm_set1_epi32(source_scale);
+        let round_v = _mm_set1_epi32(round);
+        let sh = _mm_cvtsi32_si128(shift);
+        let mut b = _mm_add_epi32(_mm_set1_epi32(base), _mm_mullo_epi32(idx0, step_v));
+        let mut i = 0usize;
+        while i + 4 <= out.len() {
+            let src = _mm_loadu_si128(source.as_ptr().add(i).cast());
+            let acc = _mm_add_epi32(_mm_add_epi32(b, _mm_mullo_epi32(src, scale_v)), round_v);
+            _mm_storeu_si128(out.as_mut_ptr().add(i).cast(), _mm_sra_epi32(acc, sh));
+            b = _mm_add_epi32(b, four_steps);
+            i += 4;
+        }
+        affine_source_i32_scalar(
+            base + i as i32 * step,
+            step,
+            &source[i..],
+            source_scale,
+            round,
+            shift,
+            &mut out[i..],
+        );
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn affine_i32_avx2(base: i32, step: i32, round: i32, shift: i32, out: &mut [i32]) {
+    unsafe {
+        let idx0 = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+        let eight_steps = _mm256_set1_epi32(8 * step);
+        let step_v = _mm256_set1_epi32(step);
+        let round_v = _mm256_set1_epi32(round);
+        let sh = _mm_cvtsi32_si128(shift);
+        let mut b = _mm256_add_epi32(_mm256_set1_epi32(base), _mm256_mullo_epi32(idx0, step_v));
+        let mut i = 0usize;
+        while i + 8 <= out.len() {
+            _mm256_storeu_si256(
+                out.as_mut_ptr().add(i).cast(),
+                _mm256_sra_epi32(_mm256_add_epi32(b, round_v), sh),
+            );
+            b = _mm256_add_epi32(b, eight_steps);
+            i += 8;
+        }
+        affine_i32_scalar(base + i as i32 * step, step, round, shift, &mut out[i..]);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn affine_source_i32_avx2(
+    base: i32,
+    step: i32,
+    source: &[i32],
+    source_scale: i32,
+    round: i32,
+    shift: i32,
+    out: &mut [i32],
+) {
+    unsafe {
+        let idx0 = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+        let eight_steps = _mm256_set1_epi32(8 * step);
+        let step_v = _mm256_set1_epi32(step);
+        let scale_v = _mm256_set1_epi32(source_scale);
+        let round_v = _mm256_set1_epi32(round);
+        let sh = _mm_cvtsi32_si128(shift);
+        let mut b = _mm256_add_epi32(_mm256_set1_epi32(base), _mm256_mullo_epi32(idx0, step_v));
+        let mut i = 0usize;
+        while i + 8 <= out.len() {
+            let src = _mm256_loadu_si256(source.as_ptr().add(i).cast());
+            let acc = _mm256_add_epi32(
+                _mm256_add_epi32(b, _mm256_mullo_epi32(src, scale_v)),
+                round_v,
+            );
+            _mm256_storeu_si256(out.as_mut_ptr().add(i).cast(), _mm256_sra_epi32(acc, sh));
+            b = _mm256_add_epi32(b, eight_steps);
+            i += 8;
+        }
+        affine_source_i32_scalar(
+            base + i as i32 * step,
+            step,
+            &source[i..],
+            source_scale,
+            round,
+            shift,
+            &mut out[i..],
+        );
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn affine_i32_neon(base: i32, step: i32, round: i32, shift: i32, out: &mut [i32]) {
+    unsafe {
+        let idx0 = [0, 1, 2, 3];
+        let idx0 = vld1q_s32(idx0.as_ptr());
+        let four_steps = vdupq_n_s32(4 * step);
+        let step_v = vdupq_n_s32(step);
+        let round_v = vdupq_n_s32(round);
+        let sh = vdupq_n_s32(-shift);
+        let mut b = vmlaq_s32(vdupq_n_s32(base), idx0, step_v);
+        let mut i = 0usize;
+        while i + 4 <= out.len() {
+            vst1q_s32(
+                out.as_mut_ptr().add(i),
+                vshlq_s32(vaddq_s32(b, round_v), sh),
+            );
+            b = vaddq_s32(b, four_steps);
+            i += 4;
+        }
+        affine_i32_scalar(base + i as i32 * step, step, round, shift, &mut out[i..]);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn affine_source_i32_neon(
+    base: i32,
+    step: i32,
+    source: &[i32],
+    source_scale: i32,
+    round: i32,
+    shift: i32,
+    out: &mut [i32],
+) {
+    unsafe {
+        let idx0 = [0, 1, 2, 3];
+        let idx0 = vld1q_s32(idx0.as_ptr());
+        let four_steps = vdupq_n_s32(4 * step);
+        let step_v = vdupq_n_s32(step);
+        let scale_v = vdupq_n_s32(source_scale);
+        let round_v = vdupq_n_s32(round);
+        let sh = vdupq_n_s32(-shift);
+        let mut b = vmlaq_s32(vdupq_n_s32(base), idx0, step_v);
+        let mut i = 0usize;
+        while i + 4 <= out.len() {
+            let src = vld1q_s32(source.as_ptr().add(i));
+            let acc = vaddq_s32(vmlaq_s32(b, src, scale_v), round_v);
+            vst1q_s32(out.as_mut_ptr().add(i), vshlq_s32(acc, sh));
+            b = vaddq_s32(b, four_steps);
+            i += 4;
+        }
+        affine_source_i32_scalar(
+            base + i as i32 * step,
+            step,
+            &source[i..],
+            source_scale,
+            round,
+            shift,
+            &mut out[i..],
+        );
+    }
+}
+
 /// Whether the running CPU can execute `isa`'s kernels.
 #[inline]
 fn supported(isa: Isa) -> bool {
