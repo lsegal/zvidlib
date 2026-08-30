@@ -47,6 +47,56 @@ impl Geometry {
     }
 }
 
+/// Loads `V::LANES` samples of the row that starts at byte offset `row_base`,
+/// beginning at column `x`, replicating the nearest in-plane sample for columns
+/// outside the plane.
+///
+/// The row offset is a parameter rather than a row index so callers that read
+/// several vectors from one row (the Wiener horizontal pass, the box
+/// statistics) pay for the clamp and the multiply once instead of once per
+/// load.
+///
+/// # Safety
+/// `V`'s instruction set must be available and `row_base` must be the start of
+/// a row of `data`.
+#[inline(always)]
+unsafe fn load_lanes<V: I32x>(data: &[u8], geom: Geometry, row_base: usize, x: isize) -> V {
+    unsafe { load_lanes_inside(data, geom, row_base, x, columns_inside::<V>(geom, x)) }
+}
+
+/// True when a whole `V::LANES` window starting at column `x` is inside the
+/// plane. A kernel whose taps share one window (the Wiener horizontal pass, the
+/// box statistics) evaluates this once and hands it to every load.
+#[inline(always)]
+fn columns_inside<V: I32x>(geom: Geometry, x: isize) -> bool {
+    x >= 0 && (x as usize) + V::LANES <= geom.width
+}
+
+/// [`load_lanes`] with the in-plane test already made by the caller.
+///
+/// # Safety
+/// As [`load_lanes`], and `inside` must equal [`columns_inside`] for `x`.
+#[inline(always)]
+unsafe fn load_lanes_inside<V: I32x>(
+    data: &[u8],
+    geom: Geometry,
+    row_base: usize,
+    x: isize,
+    inside: bool,
+) -> V {
+    unsafe {
+        if inside {
+            V::load_u8(&data[row_base + x as usize..])
+        } else {
+            let mut staged = [0u8; MAX_LANES];
+            for (lane, slot) in staged.iter_mut().enumerate().take(V::LANES) {
+                *slot = data[row_base + geom.clamp_x(x + lane as isize)];
+            }
+            V::load_u8(&staged)
+        }
+    }
+}
+
 /// Loads `V::LANES` samples of row `y` starting at column `x`, replicating the
 /// nearest in-plane sample for any position outside it, exactly as the scalar
 /// `get_clamped` does.
@@ -59,18 +109,7 @@ impl Geometry {
 /// `V`'s instruction set must be available.
 #[inline(always)]
 unsafe fn load_row<V: I32x>(data: &[u8], geom: Geometry, x: isize, y: isize) -> V {
-    unsafe {
-        let row = geom.row(y);
-        if x >= 0 && (x as usize) + V::LANES <= geom.width {
-            V::load_u8(&data[row + x as usize..])
-        } else {
-            let mut staged = [0u8; MAX_LANES];
-            for (lane, slot) in staged.iter_mut().enumerate().take(V::LANES) {
-                *slot = data[row + geom.clamp_x(x + lane as isize)];
-            }
-            V::load_u8(&staged)
-        }
-    }
+    unsafe { load_lanes(data, geom, geom.row(y), x) }
 }
 
 /// Gathers column `x` of the `V::LANES` rows starting at `y0` into one vector,
@@ -159,12 +198,27 @@ unsafe fn clamp_pixel<V: I32x>(value: V) -> V {
     unsafe { value.clamp(V::zero(), V::splat(255)) }
 }
 
-/// Vector form of `av1_filters::filter_mask`.
+/// The two inner-tap gradients `|p1 - p0|` and `|q1 - q0|`, which both
+/// `filter_mask` and `hev_mask` are expressed in.
 #[inline(always)]
-unsafe fn filter_mask_lanes<V: I32x>(p1: V, p0: V, q0: V, q1: V, limit: i32, blimit: i32) -> V {
+unsafe fn edge_deltas<V: I32x>(p1: V, p0: V, q0: V, q1: V) -> (V, V) {
+    unsafe { (p1.sub(p0).abs(), q1.sub(q0).abs()) }
+}
+
+/// Vector form of `av1_filters::filter_mask`, given [`edge_deltas`].
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+unsafe fn filter_mask_lanes<V: I32x>(
+    dp: V,
+    dq: V,
+    p1: V,
+    p0: V,
+    q0: V,
+    q1: V,
+    limit: i32,
+    blimit: i32,
+) -> V {
     unsafe {
-        let dp = p1.sub(p0).abs();
-        let dq = q1.sub(q0).abs();
         let boundary = p0
             .sub(q0)
             .abs()
@@ -227,11 +281,20 @@ unsafe fn flat_mask_lanes<V: I32x>(
 
 /// Vector form of `hev_mask` + `narrow_filter`: returns the new
 /// `(p1, p0, q0, q1)` with lanes whose boundary `mask` fails left untouched.
+/// `dp` / `dq` are [`edge_deltas`], which the caller already needed for `mask`.
+#[allow(clippy::too_many_arguments)]
 #[inline(always)]
-unsafe fn narrow_filter_lanes<V: I32x>(mask: V, p1: V, p0: V, q0: V, q1: V, thresh: i32) -> [V; 4] {
+unsafe fn narrow_filter_lanes<V: I32x>(
+    mask: V,
+    dp: V,
+    dq: V,
+    p1: V,
+    p0: V,
+    q0: V,
+    q1: V,
+    thresh: i32,
+) -> [V; 4] {
     unsafe {
-        let dp = p1.sub(p0).abs();
-        let dq = q1.sub(q0).abs();
         let thresh = V::splat(thresh);
         let hev = dp.gt(thresh).or(dq.gt(thresh));
 
@@ -338,8 +401,9 @@ unsafe fn deblock_filter_lanes<V: I32x>(
             *slot = taps[index + 1];
         }
 
-        let mask = filter_mask_lanes(p1, p0, q0, q1, limit, blimit);
-        let narrow = narrow_filter_lanes(mask, p1, p0, q0, q1, thresh);
+        let (dp, dq) = edge_deltas(p1, p0, q0, q1);
+        let mask = filter_mask_lanes(dp, dq, p1, p0, q0, q1, limit, blimit);
+        let narrow = narrow_filter_lanes(mask, dp, dq, p1, p0, q0, q1, thresh);
         out[4..8].copy_from_slice(&narrow);
 
         // Both wide filters need the boundary mask, a filter length that
@@ -386,14 +450,154 @@ unsafe fn deblock_filter_lanes<V: I32x>(
     }
 }
 
-/// Filters `count` positions of the horizontal edge above row `y`, starting at
-/// column `x0`. Each of the fourteen taps lives in its own row, so every load
-/// is a contiguous byte run; rows outside the plane replicate the nearest edge
-/// row and are never written back.
+/// Stores `count` lanes into row `row` at column `x0`, skipping rows outside
+/// the plane (the scalar path's `put` does the same).
 ///
 /// # Safety
-/// `V`'s instruction set must be available, `count <= V::LANES`, and
-/// `x0 + count <= geom.width`.
+/// `V`'s instruction set must be available and `x0 + count <= geom.width`.
+#[inline(always)]
+unsafe fn store_edge_row<V: I32x>(
+    value: V,
+    data: &mut [u8],
+    geom: Geometry,
+    row: isize,
+    x0: usize,
+    count: usize,
+) {
+    unsafe {
+        if row < 0 || row >= geom.height as isize {
+            return;
+        }
+        let base = row as usize * geom.stride + x0;
+        value.store_u8_clamped_masked(&mut data[base..], count);
+    }
+}
+
+/// The per-lane filter lengths of the `count` positions at `offset`, and
+/// whether any of them exceeds the narrow filter.
+///
+/// `sizes` is either empty (no transform-size metadata, so every edge is
+/// narrow) or padded to a whole number of vectors so a chunk always loads.
+///
+/// # Safety
+/// `V`'s instruction set must be available.
+#[inline(always)]
+unsafe fn chunk_sizes<V: I32x>(sizes: &[i32], offset: usize, count: usize) -> (V, bool) {
+    unsafe {
+        if sizes.is_empty() {
+            return (V::splat(4), false);
+        }
+        let wide = sizes[offset..offset + count].iter().any(|&size| size > 4);
+        (V::load(&sizes[offset..]), wide)
+    }
+}
+
+/// Filters one chunk of a horizontal edge with the narrow (4-tap) filter.
+/// `rows` holds the byte offsets of rows `y - 2 ..= y + 1`, which the caller's
+/// edge grid keeps inside the plane.
+///
+/// # Safety
+/// `V`'s instruction set must be available, `lanes <= V::LANES`,
+/// `x + lanes <= geom.width`, and `inside` must equal [`columns_inside`] for
+/// `x` (whole chunks always satisfy it, so the caller knows it without
+/// testing).
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+unsafe fn narrow_chunk_horizontal<V: I32x>(
+    data: &mut [u8],
+    geom: Geometry,
+    rows: [usize; 4],
+    x: usize,
+    lanes: usize,
+    inside: bool,
+    limit: i32,
+    blimit: i32,
+    thresh: i32,
+) {
+    unsafe {
+        let taps = rows.map(|row| load_lanes_inside::<V>(data, geom, row, x as isize, inside));
+        let (dp, dq) = edge_deltas(taps[0], taps[1], taps[2], taps[3]);
+        let mask = filter_mask_lanes(dp, dq, taps[0], taps[1], taps[2], taps[3], limit, blimit);
+        let out = narrow_filter_lanes(mask, dp, dq, taps[0], taps[1], taps[2], taps[3], thresh);
+        for (row, value) in rows.into_iter().zip(out) {
+            value.store_u8_clamped_masked(&mut data[row + x..], lanes);
+        }
+    }
+}
+
+/// Filters one chunk of a vertical edge with the narrow (4-tap) filter. The
+/// window is columns `x - 2 ..= x + 1` of one row per lane, which the caller's
+/// edge grid keeps inside the plane, so one row offset per lane serves all four
+/// taps.
+///
+/// `full` says the chunk ends before the plane's last row, so it needs no row
+/// clamping at all; every chunk but the last of a column satisfies it.
+///
+/// # Safety
+/// `V`'s instruction set must be available, `lanes <= V::LANES`,
+/// `y + lanes <= geom.height`, `full == (y + V::LANES <= geom.height)`,
+/// `2 <= x` and `x + 1 < geom.width`.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+unsafe fn narrow_chunk_vertical<V: I32x>(
+    data: &mut [u8],
+    geom: Geometry,
+    x: usize,
+    y: usize,
+    lanes: usize,
+    full: bool,
+    limit: i32,
+    blimit: i32,
+    thresh: i32,
+) {
+    unsafe {
+        let mut staged = [[0u8; MAX_LANES]; 4];
+        for lane in 0..V::LANES {
+            let row = if full {
+                (y + lane) * geom.stride
+            } else {
+                geom.row((y + lane) as isize)
+            };
+            let base = row + x - 2;
+            for (tap, column) in staged.iter_mut().enumerate() {
+                column[lane] = data[base + tap];
+            }
+        }
+        let taps = [
+            V::load_u8(&staged[0]),
+            V::load_u8(&staged[1]),
+            V::load_u8(&staged[2]),
+            V::load_u8(&staged[3]),
+        ];
+        let (dp, dq) = edge_deltas(taps[0], taps[1], taps[2], taps[3]);
+        let mask = filter_mask_lanes(dp, dq, taps[0], taps[1], taps[2], taps[3], limit, blimit);
+        let out = narrow_filter_lanes(mask, dp, dq, taps[0], taps[1], taps[2], taps[3], thresh);
+        for (tap, value) in out.into_iter().enumerate() {
+            value.store_u8_clamped_masked(&mut staged[tap], V::LANES);
+        }
+        for lane in 0..lanes {
+            let base = (y + lane) * geom.stride + x - 2;
+            for (tap, column) in staged.iter().enumerate() {
+                data[base + tap] = column[lane];
+            }
+        }
+    }
+}
+
+/// Filters `count` consecutive positions of the horizontal edge above row `y`,
+/// starting at column `x0`. Each tap lives in its own row, so every load is a
+/// contiguous byte run; rows outside the plane replicate the nearest edge row
+/// and are never written back.
+///
+/// Positions whose §7.14.5 filter length (from `sizes`, per position) is the
+/// narrow one only touch the four narrow taps, which is why the common case —
+/// every chroma edge, and every luma edge of a frame decoded without
+/// transform-size metadata — does not pay for the wide filters' fourteen loads.
+///
+/// # Safety
+/// `V`'s instruction set must be available, `x0 + count <= geom.width`,
+/// `2 <= y` and `y + 1 < geom.height`, and `sizes` must be empty or at least
+/// `count` rounded up to a whole number of vectors long.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn deblock_edge_horizontal<V: I32x>(
     data: &mut [u8],
@@ -404,34 +608,64 @@ pub(crate) unsafe fn deblock_edge_horizontal<V: I32x>(
     limit: i32,
     blimit: i32,
     thresh: i32,
-    sizes: &[i32; MAX_LANES],
+    sizes: &[i32],
 ) {
     unsafe {
-        let mut taps = [V::zero(); WIDE_TAPS];
-        for (index, tap) in taps.iter_mut().enumerate() {
-            let row = y as isize + index as isize - EDGE as isize;
-            *tap = load_row::<V>(data, geom, x0 as isize, row);
-        }
-        let out = deblock_filter_lanes(&taps, V::load(sizes), limit, blimit, thresh);
-        for (index, value) in out.into_iter().enumerate() {
-            let row = y as isize + index as isize - (EDGE as isize - 1);
-            if row < 0 || row >= geom.height as isize {
+        // The narrow window is rows `y - 2 ..= y + 1`, which the caller's edge
+        // grid keeps inside the plane, so the narrow path skips the row
+        // clamping and the per-row bounds checks the wide filters need.
+        let narrow_rows = [
+            (y - 2) * geom.stride,
+            (y - 1) * geom.stride,
+            y * geom.stride,
+            (y + 1) * geom.stride,
+        ];
+        let mut done = 0;
+        while done < count {
+            let x = x0 + done;
+            let lanes = V::LANES.min(count - done);
+            let (sizes_lanes, wide) = chunk_sizes::<V>(sizes, done, lanes);
+            if !wide {
+                narrow_chunk_horizontal::<V>(
+                    data,
+                    geom,
+                    narrow_rows,
+                    x,
+                    lanes,
+                    lanes == V::LANES,
+                    limit,
+                    blimit,
+                    thresh,
+                );
+                done += lanes;
                 continue;
             }
-            let base = row as usize * geom.stride + x0;
-            value.store_u8_clamped_masked(&mut data[base..], count);
+            let mut taps = [V::zero(); WIDE_TAPS];
+            for (index, tap) in taps.iter_mut().enumerate() {
+                let row = y as isize + index as isize - EDGE as isize;
+                *tap = load_row::<V>(data, geom, x as isize, row);
+            }
+            let out = deblock_filter_lanes(&taps, sizes_lanes, limit, blimit, thresh);
+            for (index, value) in out.into_iter().enumerate() {
+                let row = y as isize + index as isize - (EDGE as isize - 1);
+                store_edge_row(value, data, geom, row, x, lanes);
+            }
+            done += lanes;
         }
     }
 }
 
-/// Filters `count` positions of the vertical edge left of column `x`, starting
-/// at row `y0`. The taps are contiguous *within* a row but the filtered
-/// positions run down the column, so each tap is gathered into a vector and
-/// scattered back; the per-position arithmetic still runs vectorized.
+/// Filters `count` consecutive positions of the vertical edge left of column
+/// `x`, starting at row `y0`, with the same narrow/wide split as
+/// [`deblock_edge_horizontal`]. The taps are contiguous *within* a row but the
+/// filtered positions run down the column, so each tap is gathered into a
+/// vector and scattered back; the per-position arithmetic still runs
+/// vectorized.
 ///
 /// # Safety
-/// `V`'s instruction set must be available, `count <= V::LANES`, and
-/// `y0 + count <= geom.height`.
+/// `V`'s instruction set must be available, `y0 + count <= geom.height`,
+/// `2 <= x` and `x + 1 < geom.width`, and `sizes` must be empty or at least
+/// `count` rounded up to a whole number of vectors long.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn deblock_edge_vertical<V: I32x>(
     data: &mut [u8],
@@ -442,21 +676,42 @@ pub(crate) unsafe fn deblock_edge_vertical<V: I32x>(
     limit: i32,
     blimit: i32,
     thresh: i32,
-    sizes: &[i32; MAX_LANES],
+    sizes: &[i32],
 ) {
     unsafe {
-        let mut taps = [V::zero(); WIDE_TAPS];
-        for (index, tap) in taps.iter_mut().enumerate() {
-            let column = x as isize + index as isize - EDGE as isize;
-            *tap = gather_column::<V>(data, geom, column, y0);
-        }
-        let out = deblock_filter_lanes(&taps, V::load(sizes), limit, blimit, thresh);
-        for (index, value) in out.into_iter().enumerate() {
-            let column = x as isize + index as isize - (EDGE as isize - 1);
-            if column < 0 || column >= geom.width as isize {
+        let mut done = 0;
+        while done < count {
+            let y = y0 + done;
+            let lanes = V::LANES.min(count - done);
+            let (sizes_lanes, wide) = chunk_sizes::<V>(sizes, done, lanes);
+            if !wide {
+                narrow_chunk_vertical::<V>(
+                    data,
+                    geom,
+                    x,
+                    y,
+                    lanes,
+                    lanes == V::LANES,
+                    limit,
+                    blimit,
+                    thresh,
+                );
+                done += lanes;
                 continue;
             }
-            scatter_column(value, data, geom, column as usize, y0, count);
+            let mut taps = [V::zero(); WIDE_TAPS];
+            for (index, tap) in taps.iter_mut().enumerate() {
+                let column = x as isize + index as isize - EDGE as isize;
+                *tap = gather_column::<V>(data, geom, column, y);
+            }
+            let out = deblock_filter_lanes(&taps, sizes_lanes, limit, blimit, thresh);
+            for (index, value) in out.into_iter().enumerate() {
+                let column = x as isize + index as isize - (EDGE as isize - 1);
+                if column >= 0 && column < geom.width as isize {
+                    scatter_column(value, data, geom, column as usize, y, lanes);
+                }
+            }
+            done += lanes;
         }
     }
 }
@@ -489,12 +744,13 @@ pub(crate) unsafe fn cdef_direction_stats<V: I32x>(
         let mut sum = V::zero();
         let mut sum_sq = V::zero();
         for row in 0..8isize {
+            let y = y0 as isize + row;
+            let (a_row, b_row) = (geom.row(y), geom.row(y + dr as isize));
             let mut column = 0isize;
             while column < 8 {
                 let x = x0 as isize + column;
-                let y = y0 as isize + row;
-                let a: V = load_row(data, geom, x, y);
-                let b: V = load_row(data, geom, x + dc as isize, y + dr as isize);
+                let a: V = load_lanes(data, geom, a_row, x);
+                let b: V = load_lanes(data, geom, b_row, x + dc as isize);
                 let diff = a.sub(b);
                 sum = sum.add(diff);
                 sum_sq = sum_sq.add(diff.mul(diff));
@@ -526,13 +782,13 @@ pub(crate) fn constrain_damping_adjustment(threshold: i32, damping: i32) -> i32 
     (damping - (31 - threshold.max(1).leading_zeros() as i32)).max(0)
 }
 
-/// Filters `count` samples of row `y` starting at column `x0`, writing them to
-/// `dst` (the destination row's slice starting at `x0`). Taps that leave the
-/// plane replicate the nearest edge sample.
+/// Filters `count` consecutive samples of row `y` starting at column `x0`,
+/// writing them to `dst` (the destination row's slice starting at `x0`). Taps
+/// that leave the plane replicate the nearest edge sample.
 ///
 /// # Safety
-/// `V`'s instruction set must be available, `count <= V::LANES`, and `dst` must
-/// hold at least `count` bytes.
+/// `V`'s instruction set must be available and `dst` must hold at least `count`
+/// bytes.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn cdef_filter_row<V: I32x>(
     data: &[u8],
@@ -550,38 +806,37 @@ pub(crate) unsafe fn cdef_filter_row<V: I32x>(
     dst: &mut [u8],
 ) {
     unsafe {
-        let center: V = load_row(data, geom, x0 as isize, y as isize);
-        let mut sum = V::zero();
-        for &(weight, dr, dc) in primary {
-            let tap: V = load_row(
-                data,
-                geom,
-                x0 as isize + dc as isize,
-                y as isize + dr as isize,
-            );
-            sum = sum.add(
-                constrain_lanes(tap.sub(center), primary_strength, primary_damping_adj)
-                    .mul(V::splat(weight)),
-            );
+        let center_row = geom.row(y as isize);
+        let mut done = 0;
+        while done < count {
+            let x = (x0 + done) as isize;
+            let lanes = V::LANES.min(count - done);
+            let center: V = load_lanes(data, geom, center_row, x);
+            let mut sum = V::zero();
+            for &(weight, dr, dc) in primary {
+                let row = geom.row(y as isize + dr as isize);
+                let tap: V = load_lanes(data, geom, row, x + dc as isize);
+                sum = sum.add(
+                    constrain_lanes(tap.sub(center), primary_strength, primary_damping_adj)
+                        .mul(V::splat(weight)),
+                );
+            }
+            for &(weight, dr, dc) in secondary {
+                let row = geom.row(y as isize + dr as isize);
+                let tap: V = load_lanes(data, geom, row, x + dc as isize);
+                sum = sum.add(
+                    constrain_lanes(tap.sub(center), secondary_strength, secondary_damping_adj)
+                        .mul(V::splat(weight)),
+                );
+            }
+            let out = if total_weight == 0 {
+                center
+            } else {
+                center.add(sum.add(V::splat(1 << 3)).sra::<4>())
+            };
+            out.store_u8_clamped_masked(&mut dst[done..], lanes);
+            done += lanes;
         }
-        for &(weight, dr, dc) in secondary {
-            let tap: V = load_row(
-                data,
-                geom,
-                x0 as isize + dc as isize,
-                y as isize + dr as isize,
-            );
-            sum = sum.add(
-                constrain_lanes(tap.sub(center), secondary_strength, secondary_damping_adj)
-                    .mul(V::splat(weight)),
-            );
-        }
-        if total_weight == 0 {
-            center.store_u8_clamped_masked(dst, count);
-            return;
-        }
-        let rounded = sum.add(V::splat(1 << 3)).sra::<4>();
-        center.add(rounded).store_u8_clamped_masked(dst, count);
     }
 }
 
@@ -589,13 +844,14 @@ pub(crate) unsafe fn cdef_filter_row<V: I32x>(
 // Loop restoration: Wiener, spec 7.17.2
 // ---------------------------------------------------------------------
 
-/// Runs the Wiener horizontal pass for `count` samples of row `y` starting at
-/// column `x0`, writing the rounded intermediate values to `out`. The 7-tap
-/// window's reach outside the plane replicates the nearest edge sample.
+/// Runs the Wiener horizontal pass for `count` consecutive samples of row `y`
+/// starting at column `x0`, writing the rounded intermediate values to `out`.
+/// The 7-tap window's reach outside the plane replicates the nearest edge
+/// sample.
 ///
 /// # Safety
-/// `V`'s instruction set must be available, `count <= V::LANES`, and `out` must
-/// hold at least `count` values.
+/// `V`'s instruction set must be available and `out` must hold at least `count`
+/// values.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn wiener_horizontal_row<V: I32x>(
     data: &[u8],
@@ -608,30 +864,38 @@ pub(crate) unsafe fn wiener_horizontal_row<V: I32x>(
     out: &mut [i32],
 ) {
     unsafe {
-        let x0 = x0 as isize;
-        let y = y as isize;
-        let center: V = load_row(data, geom, x0, y);
-        let mut sum = center.mul(V::splat(center_tap));
-        for (k, &tap) in taps.iter().enumerate() {
-            let offset = 3 - k as isize;
-            let minus: V = load_row(data, geom, x0 - offset, y);
-            let plus: V = load_row(data, geom, x0 + offset, y);
-            sum = sum.add(minus.add(plus).mul(V::splat(tap)));
+        let row = geom.row(y as isize);
+        let mut done = 0;
+        while done < count {
+            let x = (x0 + done) as isize;
+            let lanes = V::LANES.min(count - done);
+            // The whole 7-tap window shares one in-plane test: away from the
+            // left and right borders every tap loads directly.
+            let inside = columns_inside::<V>(geom, x - 3) && columns_inside::<V>(geom, x + 3);
+            let center: V = load_lanes_inside(data, geom, row, x, inside);
+            let mut sum = center.mul(V::splat(center_tap));
+            for (k, &tap) in taps.iter().enumerate() {
+                let offset = 3 - k as isize;
+                let minus: V = load_lanes_inside(data, geom, row, x - offset, inside);
+                let plus: V = load_lanes_inside(data, geom, row, x + offset, inside);
+                sum = sum.add(minus.add(plus).mul(V::splat(tap)));
+            }
+            sum.add(V::splat(1 << 2))
+                .sra::<3>()
+                .store_masked(&mut out[done..], lanes);
+            done += lanes;
         }
-        sum.add(V::splat(1 << 2))
-            .sra::<3>()
-            .store_masked(out, count);
     }
 }
 
-/// Runs the Wiener vertical pass for `count` columns of `row` over the
-/// horizontal pass's `intermediate` buffer (a `width` by `height` restoration
-/// region), writing clipped samples to `dst`. Rows outside the region clamp to
-/// its first or last row, matching the scalar path.
+/// Runs the Wiener vertical pass for `count` consecutive columns of `row` over
+/// the horizontal pass's `intermediate` buffer (a `width` by `height`
+/// restoration region), writing clipped samples to `dst`. Rows outside the
+/// region clamp to its first or last row, matching the scalar path.
 ///
 /// # Safety
-/// `V`'s instruction set must be available, `count <= V::LANES`,
-/// `column + count <= width`, and `dst` must hold at least `count` bytes.
+/// `V`'s instruction set must be available, `column + count <= width`, and
+/// `dst` must hold at least `count` bytes.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn wiener_vertical_row<V: I32x>(
     intermediate: &[i32],
@@ -645,20 +909,41 @@ pub(crate) unsafe fn wiener_vertical_row<V: I32x>(
     dst: &mut [u8],
 ) {
     unsafe {
-        let clamp_row = |offset: isize| -> usize {
-            (row as isize + offset).clamp(0, height as isize - 1) as usize * width + column
-        };
-        let center: V = load_i32_padded(intermediate, clamp_row(0), count);
-        let mut sum = center.mul(V::splat(center_tap));
-        for (k, &tap) in taps.iter().enumerate() {
-            let offset = 3 - k as isize;
-            let minus: V = load_i32_padded(intermediate, clamp_row(-offset), count);
-            let plus: V = load_i32_padded(intermediate, clamp_row(offset), count);
-            sum = sum.add(minus.add(plus).mul(V::splat(tap)));
+        let interior_rows = row >= 3 && row + 3 < height;
+        let mut done = 0;
+        while done < count {
+            let lanes = V::LANES.min(count - done);
+            let base = row * width + column + done;
+            let mut sum;
+            if interior_rows && column + done + V::LANES <= width {
+                // Interior rows reach their taps by adding whole row strides,
+                // which is the shape the vast majority of a unit takes.
+                sum = V::load(&intermediate[base..]).mul(V::splat(center_tap));
+                for (k, &tap) in taps.iter().enumerate() {
+                    let offset = (3 - k) * width;
+                    let minus = V::load(&intermediate[base - offset..]);
+                    let plus = V::load(&intermediate[base + offset..]);
+                    sum = sum.add(minus.add(plus).mul(V::splat(tap)));
+                }
+            } else {
+                let clamp_row = |offset: isize| -> usize {
+                    (row as isize + offset).clamp(0, height as isize - 1) as usize * width
+                        + column
+                        + done
+                };
+                sum = load_i32_padded::<V>(intermediate, base, lanes).mul(V::splat(center_tap));
+                for (k, &tap) in taps.iter().enumerate() {
+                    let offset = 3 - k as isize;
+                    let minus: V = load_i32_padded(intermediate, clamp_row(-offset), lanes);
+                    let plus: V = load_i32_padded(intermediate, clamp_row(offset), lanes);
+                    sum = sum.add(minus.add(plus).mul(V::splat(tap)));
+                }
+            }
+            sum.add(V::splat(1 << 10))
+                .sra::<11>()
+                .store_u8_clamped_masked(&mut dst[done..], lanes);
+            done += lanes;
         }
-        sum.add(V::splat(1 << 10))
-            .sra::<11>()
-            .store_u8_clamped_masked(dst, count);
     }
 }
 
@@ -676,8 +961,8 @@ pub(crate) unsafe fn wiener_vertical_row<V: I32x>(
 /// lanes agree exactly.
 ///
 /// # Safety
-/// `V`'s instruction set must be available, `count <= V::LANES`, and `sums` /
-/// `sums_sq` must hold at least `count` values.
+/// `V`'s instruction set must be available and `sums` / `sums_sq` must hold at
+/// least `count` values.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn box_stats_row<V: I32x>(
     data: &[u8],
@@ -691,16 +976,25 @@ pub(crate) unsafe fn box_stats_row<V: I32x>(
 ) {
     unsafe {
         let radius = radius as isize;
-        let mut sum = V::zero();
-        let mut sum_sq = V::zero();
-        for dy in -radius..=radius {
-            for dx in -radius..=radius {
-                let value: V = load_row(data, geom, x0 as isize + dx, y as isize + dy);
-                sum = sum.add(value);
-                sum_sq = sum_sq.add(value.mul(value));
+        let mut done = 0;
+        while done < count {
+            let x = (x0 + done) as isize;
+            let lanes = V::LANES.min(count - done);
+            let inside =
+                columns_inside::<V>(geom, x - radius) && columns_inside::<V>(geom, x + radius);
+            let mut sum = V::zero();
+            let mut sum_sq = V::zero();
+            for dy in -radius..=radius {
+                let row = geom.row(y as isize + dy);
+                for dx in -radius..=radius {
+                    let value: V = load_lanes_inside(data, geom, row, x + dx, inside);
+                    sum = sum.add(value);
+                    sum_sq = sum_sq.add(value.mul(value));
+                }
             }
+            sum.store_masked(&mut sums[done..], lanes);
+            sum_sq.store_masked(&mut sums_sq[done..], lanes);
+            done += lanes;
         }
-        sum.store_masked(sums, count);
-        sum_sq.store_masked(sums_sq, count);
     }
 }

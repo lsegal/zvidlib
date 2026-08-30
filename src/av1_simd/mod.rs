@@ -241,14 +241,14 @@ simd_entry_points! {
     #[allow(clippy::too_many_arguments)]
     fn [deblock_h_sse41, deblock_h_avx2, deblock_h_neon](
         data: &mut [u8], geom: filters::Geometry, x0: usize, y: usize, count: usize,
-        limit: i32, blimit: i32, thresh: i32, sizes: &[i32; MAX_LANES]
+        limit: i32, blimit: i32, thresh: i32, sizes: &[i32]
     ) = filters::deblock_edge_horizontal, avx2 = Avx2;
 }
 simd_entry_points! {
     #[allow(clippy::too_many_arguments)]
     fn [deblock_v_sse41, deblock_v_avx2, deblock_v_neon](
         data: &mut [u8], geom: filters::Geometry, x: usize, y0: usize, count: usize,
-        limit: i32, blimit: i32, thresh: i32, sizes: &[i32; MAX_LANES]
+        limit: i32, blimit: i32, thresh: i32, sizes: &[i32]
     ) = filters::deblock_edge_vertical, avx2 = Avx2;
 }
 simd_entry_points! {
@@ -357,9 +357,9 @@ pub(crate) fn inverse_dct(isa: SimdIsa, dequantized: &[i32], size: usize, out: &
     }
 }
 
-/// Filters `count` positions of the horizontal edge above row `y`, including
-/// positions whose filter window leaves the plane; `sizes` gives each
-/// position's §7.14.5 filter length.
+/// Filters `count` consecutive positions of the horizontal edge above row `y`,
+/// including positions whose filter window leaves the plane; `sizes` gives each
+/// position's §7.14.5 filter length, or is empty when every edge is narrow.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn deblock_edge_horizontal(
     isa: SimdIsa,
@@ -371,7 +371,7 @@ pub(crate) fn deblock_edge_horizontal(
     limit: i32,
     blimit: i32,
     thresh: i32,
-    sizes: &[i32; MAX_LANES],
+    sizes: &[i32],
 ) {
     dispatch!(
         isa,
@@ -382,9 +382,10 @@ pub(crate) fn deblock_edge_horizontal(
     )
 }
 
-/// Filters `count` positions of the vertical edge left of column `x`, including
-/// positions whose filter window leaves the plane; `sizes` gives each
-/// position's §7.14.5 filter length.
+/// Filters `count` consecutive positions of the vertical edge left of column
+/// `x`, including positions whose filter window leaves the plane; `sizes` gives
+/// each position's §7.14.5 filter length, or is empty when every edge is
+/// narrow.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn deblock_edge_vertical(
     isa: SimdIsa,
@@ -396,7 +397,7 @@ pub(crate) fn deblock_edge_vertical(
     limit: i32,
     blimit: i32,
     thresh: i32,
-    sizes: &[i32; MAX_LANES],
+    sizes: &[i32],
 ) {
     dispatch!(
         isa,
@@ -426,7 +427,7 @@ pub(crate) fn cdef_direction_stats(
     Some(stats)
 }
 
-/// CDEF-filters `count` samples of row `y` starting at column `x0`.
+/// CDEF-filters `count` consecutive samples of row `y` starting at column `x0`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn cdef_filter_row(
     isa: SimdIsa,
@@ -466,7 +467,7 @@ pub(crate) fn cdef_filter_row(
     )
 }
 
-/// Wiener horizontal pass for `count` samples of row `y`.
+/// Wiener horizontal pass for `count` consecutive samples of row `y`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn wiener_horizontal_row(
     isa: SimdIsa,
@@ -488,7 +489,7 @@ pub(crate) fn wiener_horizontal_row(
     )
 }
 
-/// Wiener vertical pass for `count` columns of `row`.
+/// Wiener vertical pass for `count` consecutive columns of `row`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn wiener_vertical_row(
     isa: SimdIsa,
@@ -519,7 +520,7 @@ pub(crate) fn wiener_vertical_row(
     )
 }
 
-/// Self-guided box statistics for `count` samples of row `y`.
+/// Self-guided box statistics for `count` consecutive samples of row `y`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn box_stats_row(
     isa: SimdIsa,

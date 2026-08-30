@@ -384,44 +384,40 @@ fn deblock_plane_edges(
     };
     // Positions along one edge are independent of each other (each reads and
     // writes only the samples perpendicular to the edge at its own position),
-    // so a run of them can be filtered together. The vector kernel clamps its
-    // own reads and masks its own writes, so a run needs no in-plane filter
-    // window and may be shorter than a whole vector at the bottom or right
-    // edge of the plane; each position carries its own §7.14.5 filter length,
-    // so a run straddling transform blocks of different sizes stays on the
-    // vector path as well.
+    // so the whole edge is handed to the vector kernel in one call. The kernel
+    // clamps its own reads and masks its own writes, so no position is
+    // ineligible for its window leaving the plane, and it takes each position's
+    // §7.14.5 filter length from `sizes`, so an edge that straddles transform
+    // blocks of different sizes stays vectorized too.
     let isa = crate::av1_simd::active_isa();
     let lanes = crate::av1_simd::lanes(isa);
-    let mut sizes = [4i32; crate::av1_simd::MAX_LANES];
+    let mut sizes = Vec::new();
     if vertical {
         // Vertical edges: filter across columns at x = 4, 8, 12, ...
         let mut x = 4;
         while x + 1 < width {
-            let mut y = 0;
-            while y < height {
-                if lanes > 0 {
-                    let count = lanes.min(height - y);
-                    fill_filter_sizes(&mut sizes, tx_sizes, x, y, count, true);
-                    crate::av1_simd::deblock_edge_vertical(
-                        isa,
-                        &mut plane.data,
-                        geom,
-                        x,
-                        y,
-                        count,
-                        limit,
-                        blimit,
-                        thresh,
-                        &sizes,
-                    );
-                    y += count;
-                    continue;
-                }
+            if lanes > 0 {
+                fill_filter_sizes(&mut sizes, tx_sizes, x, 0, height, true);
+                crate::av1_simd::deblock_edge_vertical(
+                    isa,
+                    &mut plane.data,
+                    geom,
+                    x,
+                    0,
+                    height,
+                    limit,
+                    blimit,
+                    thresh,
+                    &sizes,
+                );
+                x += 4;
+                continue;
+            }
+            for y in 0..height {
                 let filter_size = tx_sizes
                     .map(|grid| filter_length_for_edge(grid, x, y, true))
                     .unwrap_or(4);
                 filter_edge_at(plane, x, y, 1, 0, limit, blimit, thresh, filter_size);
-                y += 1;
             }
             x += 4;
         }
@@ -429,64 +425,60 @@ fn deblock_plane_edges(
         // Horizontal edges: filter across rows at y = 4, 8, 12, ...
         let mut y = 4;
         while y + 1 < height {
-            let mut x = 0;
-            while x < width {
-                if lanes > 0 {
-                    let count = lanes.min(width - x);
-                    fill_filter_sizes(&mut sizes, tx_sizes, x, y, count, false);
-                    crate::av1_simd::deblock_edge_horizontal(
-                        isa,
-                        &mut plane.data,
-                        geom,
-                        x,
-                        y,
-                        count,
-                        limit,
-                        blimit,
-                        thresh,
-                        &sizes,
-                    );
-                    x += count;
-                    continue;
-                }
+            if lanes > 0 {
+                fill_filter_sizes(&mut sizes, tx_sizes, 0, y, width, false);
+                crate::av1_simd::deblock_edge_horizontal(
+                    isa,
+                    &mut plane.data,
+                    geom,
+                    0,
+                    y,
+                    width,
+                    limit,
+                    blimit,
+                    thresh,
+                    &sizes,
+                );
+                y += 4;
+                continue;
+            }
+            for x in 0..width {
                 let filter_size = tx_sizes
                     .map(|grid| filter_length_for_edge(grid, x, y, false))
                     .unwrap_or(4);
                 filter_edge_at(plane, x, y, 0, 1, limit, blimit, thresh, filter_size);
-                x += 1;
             }
             y += 4;
         }
     }
 }
 
-/// Fills the per-lane §7.14.5 filter lengths for the `count` edge positions
-/// starting at `(x, y)`. Lanes past `count` are never written back by the
-/// kernel, so they take the narrow length.
+/// Collects the per-position §7.14.5 filter lengths of the `count` edge
+/// positions starting at `(x, y)`, padded to a whole number of vector lanes so
+/// the kernel can load a chunk unconditionally. Without a transform-size grid
+/// every edge is narrow, which the kernel represents as an empty slice.
 fn fill_filter_sizes(
-    sizes: &mut [i32; crate::av1_simd::MAX_LANES],
+    sizes: &mut Vec<i32>,
     tx_sizes: Option<&TxSizeGrid>,
     x: usize,
     y: usize,
     count: usize,
     vertical: bool,
 ) {
+    sizes.clear();
     let Some(grid) = tx_sizes else {
-        sizes.fill(4);
         return;
     };
-    for (offset, slot) in sizes.iter_mut().enumerate() {
-        *slot = if offset < count {
-            let (px, py) = if vertical {
-                (x, y + offset)
-            } else {
-                (x + offset, y)
-            };
-            filter_length_for_edge(grid, px, py, vertical) as i32
+    sizes.reserve(count.next_multiple_of(crate::av1_simd::MAX_LANES));
+    for offset in 0..count {
+        let (px, py) = if vertical {
+            (x, y + offset)
         } else {
-            4
+            (x + offset, y)
         };
+        sizes.push(filter_length_for_edge(grid, px, py, vertical) as i32);
     }
+    sizes.resize(count.next_multiple_of(crate::av1_simd::MAX_LANES), 4);
 }
 
 /// Filters the edge crossing the boundary at `(x, y)` along the axis given
@@ -839,35 +831,31 @@ fn cdef_plane(src: &FilterPlane, dst: &mut FilterPlane, primary: u8, secondary: 
             // tap set is resolved once here and reused for every filtered row.
             let (taps, total_weight) = cdef_taps(dir, primary, secondary);
             for y in y0..y1 {
-                let mut x = x0;
-                while x < x1 {
-                    if lanes > 0 {
-                        // The kernel replicates edge samples for taps that
-                        // leave the plane and writes only `count` samples, so
-                        // blocks clipped by the frame border stay vectorized.
-                        let count = lanes.min(x1 - x);
-                        let row = y * dst.stride + x;
-                        crate::av1_simd::cdef_filter_row(
-                            isa,
-                            &src.data,
-                            geom,
-                            x,
-                            y,
-                            count,
-                            &taps[..taps_primary_len(primary)],
-                            i32::from(primary),
-                            &taps[taps_primary_len(primary)..],
-                            i32::from(secondary),
-                            i32::from(damping),
-                            total_weight,
-                            &mut dst.data[row..],
-                        );
-                        x += count;
-                        continue;
-                    }
+                if lanes > 0 {
+                    // The kernel replicates edge samples for taps that leave
+                    // the plane and writes only the block's own samples, so a
+                    // block clipped by the frame border stays vectorized.
+                    let row = y * dst.stride + x0;
+                    crate::av1_simd::cdef_filter_row(
+                        isa,
+                        &src.data,
+                        geom,
+                        x0,
+                        y,
+                        x1 - x0,
+                        &taps[..taps_primary_len(primary)],
+                        i32::from(primary),
+                        &taps[taps_primary_len(primary)..],
+                        i32::from(secondary),
+                        i32::from(damping),
+                        total_weight,
+                        &mut dst.data[row..],
+                    );
+                    continue;
+                }
+                for x in x0..x1 {
                     let filtered = cdef_filter_pixel(src, x, y, dir, primary, secondary, damping);
                     dst.set(x, y, filtered);
-                    x += 1;
                 }
             }
         }
@@ -1235,25 +1223,22 @@ fn wiener_restore(
     // and right borders vectorize like any other.
     let mut intermediate = vec![0i32; width * height];
     for (row, y) in (y0..y1).enumerate() {
-        let mut col = 0;
-        while col < width {
+        if lanes > 0 {
+            crate::av1_simd::wiener_horizontal_row(
+                isa,
+                &plane.data,
+                geom,
+                x0,
+                y,
+                width,
+                horizontal,
+                h_center,
+                &mut intermediate[row * width..],
+            );
+            continue;
+        }
+        for col in 0..width {
             let x = x0 + col;
-            if lanes > 0 {
-                let count = lanes.min(width - col);
-                crate::av1_simd::wiener_horizontal_row(
-                    isa,
-                    &plane.data,
-                    geom,
-                    x,
-                    y,
-                    count,
-                    horizontal,
-                    h_center,
-                    &mut intermediate[row * width + col..],
-                );
-                col += count;
-                continue;
-            }
             let mut sum = 0i32;
             for (k, &tap) in horizontal.iter().enumerate() {
                 let off = k as isize - 3;
@@ -1263,34 +1248,30 @@ fn wiener_restore(
             }
             sum += h_center * plane.get(x, y) as i32;
             intermediate[row * width + col] = round_shift(sum, WIENER_ROUND0);
-            col += 1;
         }
     }
     // Vertical pass, writing the final clipped result back. Rows outside the
     // restoration region clamp to its first or last row, in the kernel as in
     // the scalar path below.
     for (row, y) in (y0..y1).enumerate() {
-        let mut col = 0;
-        while col < width {
+        if lanes > 0 {
+            let destination = y * plane.stride + x0;
+            crate::av1_simd::wiener_vertical_row(
+                isa,
+                &intermediate,
+                width,
+                height,
+                row,
+                0,
+                width,
+                vertical,
+                v_center,
+                &mut plane.data[destination..],
+            );
+            continue;
+        }
+        for col in 0..width {
             let x = x0 + col;
-            if lanes > 0 {
-                let count = lanes.min(width - col);
-                let destination = y * plane.stride + x;
-                crate::av1_simd::wiener_vertical_row(
-                    isa,
-                    &intermediate,
-                    width,
-                    height,
-                    row,
-                    col,
-                    count,
-                    vertical,
-                    v_center,
-                    &mut plane.data[destination..],
-                );
-                col += count;
-                continue;
-            }
             let mut sum = 0i32;
             for (k, &tap) in vertical.iter().enumerate() {
                 let off = k as isize - 3;
@@ -1302,7 +1283,6 @@ fn wiener_restore(
             sum += v_center * intermediate[row * width + col];
             let value = round_shift(sum, WIENER_ROUND1);
             plane.set(x, y, value.clamp(0, 255) as u8);
-            col += 1;
         }
     }
 }
@@ -1351,50 +1331,40 @@ fn self_guided_restore(
         let radius = r as usize;
         // The box statistics are the expensive part (a (2r+1)^2 window per
         // sample); the per-sample linear model afterwards is O(1) and stays
-        // scalar, including its integer divisions.
-        let mut sums = [0i32; crate::av1_simd::MAX_LANES];
-        let mut sums_sq = [0i32; crate::av1_simd::MAX_LANES];
+        // scalar, including its integer divisions. The kernel clamps window
+        // positions that leave the plane, so a unit flush against a border is
+        // vectorized like any other.
+        let mut sums = vec![0i32; width];
+        let mut sums_sq = vec![0i32; width];
+        let count = ((2 * radius + 1) * (2 * radius + 1)) as i32;
         for (row, y) in (y0..y1).enumerate() {
-            let mut col = 0;
-            while col < width {
+            if lanes > 0 {
+                crate::av1_simd::box_stats_row(
+                    isa,
+                    &plane.data,
+                    geom,
+                    x0,
+                    y,
+                    width,
+                    radius,
+                    &mut sums,
+                    &mut sums_sq,
+                );
+            }
+            for col in 0..width {
                 let x = x0 + col;
-                // The kernel clamps window positions that leave the plane and
-                // writes only `count` results, so the region's borders and its
-                // partial trailing columns stay on the vector path.
-                let batched = lanes > 0;
-                let batch = if batched {
-                    let count = lanes.min(width - col);
-                    crate::av1_simd::box_stats_row(
-                        isa,
-                        &plane.data,
-                        geom,
-                        x,
-                        y,
-                        count,
-                        radius,
-                        &mut sums,
-                        &mut sums_sq,
-                    );
-                    count
+                let (mean, var) = if lanes > 0 {
+                    let mean = sums[col] / count;
+                    let var = (sums_sq[col] / count) - mean * mean;
+                    (mean, var.max(0))
                 } else {
-                    1
+                    box_stats(plane, x, y, r as isize)
                 };
-                let count = ((2 * radius + 1) * (2 * radius + 1)) as i32;
-                for lane in 0..batch {
-                    let (mean, var) = if batched {
-                        let mean = sums[lane] / count;
-                        let var = (sums_sq[lane] / count) - mean * mean;
-                        (mean, var.max(0))
-                    } else {
-                        box_stats(plane, x, y, r as isize)
-                    };
-                    let a = var * 256 / (var + e);
-                    let b = mean * (256 - a);
-                    let guided = (a * plane.get(x + lane, y) as i32 + b + 128) >> 8;
-                    let orig = original[row * width + col + lane];
-                    blended[row * width + col + lane] += ((guided - orig) * w) >> 6;
-                }
-                col += batch;
+                let a = var * 256 / (var + e);
+                let b = mean * (256 - a);
+                let guided = (a * plane.get(x, y) as i32 + b + 128) >> 8;
+                let orig = original[row * width + col];
+                blended[row * width + col] += ((guided - orig) * w) >> 6;
             }
         }
     }

@@ -13,6 +13,7 @@
 use std::time::{Duration, Instant};
 
 use zvidlib::Limits;
+use zvidlib::TxSizeGrid;
 use zvidlib::av1_filters::{
     CdefStrength, FilterFrame, FilterPlane, LoopFilterParams, RestorationUnit,
     apply_restoration_unit, cdef_frame, deblock_frame,
@@ -37,6 +38,34 @@ fn representative_plane() -> FilterPlane {
         data.push(((gradient + noise) & 0xff) as u8);
     }
     FilterPlane::from_samples(WIDTH, HEIGHT, data, &Limits::default()).unwrap()
+}
+
+/// Near-flat block content: the wide (8-tap and 14-tap) deblocking filters are
+/// gated on a flatness check, so they only do work on content like this.
+fn flat_blocks_plane(width: usize, height: usize) -> FilterPlane {
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let mut data = Vec::with_capacity(width * height);
+    for index in 0..width * height {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let (x, y) = (index % width, index / width);
+        let block = ((x / 32 + y / 32) % 5) as i32;
+        data.push((100 + block * 6 + ((state >> 60) as i32 & 1)) as u8);
+    }
+    FilterPlane::from_samples(width, height, data, &Limits::default()).unwrap()
+}
+
+/// A frame-wide grid of 32x32 transform blocks, which is what makes every luma
+/// edge select the 14-tap filter (spec §7.14.5).
+fn wide_tx_grid(width: usize, height: usize) -> TxSizeGrid {
+    let mut grid = TxSizeGrid::new(width, height);
+    for y in (0..height).step_by(32) {
+        for x in (0..width).step_by(32) {
+            grid.set_block(x, y, 32, 32);
+        }
+    }
+    grid
 }
 
 fn measure(mut body: impl FnMut()) -> Duration {
@@ -67,7 +96,14 @@ fn av1_simd_speedup_on_a_representative_frame() {
     println!("frame: {WIDTH}x{HEIGHT} luma\n");
 
     let source = representative_plane();
+    let flat = flat_blocks_plane(WIDTH, HEIGHT);
+    let wide_grid = wide_tx_grid(WIDTH, HEIGHT);
+    // Small planes are where boundary positions dominate: a 33x17 plane is
+    // almost entirely frame border and partial rows/columns.
+    let small: Vec<FilterPlane> = (0..64).map(|_| flat_blocks_plane(33, 17)).collect();
     let mut deblocking = Vec::new();
+    let mut deblocking_wide = Vec::new();
+    let mut deblocking_small = Vec::new();
     let mut cdef = Vec::new();
     let mut wiener = Vec::new();
     let mut self_guided = Vec::new();
@@ -133,6 +169,26 @@ fn av1_simd_speedup_on_a_representative_frame() {
             }),
         ));
 
+        let mut frame = FilterFrame::new_monochrome(flat.clone());
+        deblocking_wide.push((
+            isa,
+            measure(|| {
+                deblock_frame(&mut frame, &params, Some(&wide_grid)).unwrap();
+            }),
+        ));
+
+        let mut planes = small.clone();
+        deblocking_small.push((
+            isa,
+            measure(|| {
+                for plane in planes.iter_mut() {
+                    let mut frame = FilterFrame::new_monochrome(plane.clone());
+                    deblock_frame(&mut frame, &params, None).unwrap();
+                    *plane = frame.y;
+                }
+            }),
+        ));
+
         // One inverse transform per 8x8 block of the frame.
         let coefficients: Vec<i32> = (0..64).map(|index: i32| (index * 37) % 121 - 60).collect();
         let blocks = (WIDTH / 8) * (HEIGHT / 8);
@@ -155,6 +211,8 @@ fn av1_simd_speedup_on_a_representative_frame() {
         "stage", "isa", "time", "vs scalar"
     );
     report("deblocking (frame)", &deblocking);
+    report("deblocking (frame, 14-tap)", &deblocking_wide);
+    report("deblocking (64x 33x17 planes)", &deblocking_small);
     report("cdef (frame)", &cdef);
     report("wiener restoration (frame)", &wiener);
     report("self-guided (256x256 unit)", &self_guided);

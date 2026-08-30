@@ -55,6 +55,24 @@ fn plane(width: usize, height: usize, seed: u64) -> FilterPlane {
     FilterPlane::from_samples(width, height, data, &Limits::default()).unwrap()
 }
 
+/// A plane of near-flat blocks separated by small steps: the wide deblocking
+/// filters are gated on §7.14.6.1's flatness check, so uniformly random content
+/// never reaches them. Each 16x16 block is constant apart from a one-level
+/// ripple, which is inside `FLAT_THRESH`, and neighboring blocks differ by a
+/// small step so the boundary masks still have something to smooth.
+fn flat_blocks_plane(width: usize, height: usize, seed: u64) -> FilterPlane {
+    let mut rng = Lcg(seed);
+    let data = (0..width * height)
+        .map(|index| {
+            let (x, y) = (index % width, index / width);
+            let block = ((x / 16 + y / 16) % 5) as i32;
+            let ripple = (rng.byte() % 2) as i32;
+            (100 + block * 6 + ripple) as u8
+        })
+        .collect();
+    FilterPlane::from_samples(width, height, data, &Limits::default()).unwrap()
+}
+
 /// Runs `body` once per available instruction set, returning the results in
 /// the same order as [`available_isas`].
 fn for_each_isa<T>(mut body: impl FnMut(SimdIsa) -> T) -> Vec<(SimdIsa, T)> {
@@ -252,6 +270,152 @@ fn self_guided_restoration_matches_the_scalar_reference() {
             target.data
         });
         assert_all_match(&results, "self-guided restored plane");
+    }
+}
+
+/// A transform-size grid whose block sizes change at 64-sample (superblock and
+/// tile) boundaries, so edges select all three filter lengths and a single
+/// vector run can straddle two different ones.
+fn mixed_tx_grid(width: usize, height: usize) -> TxSizeGrid {
+    let mut grid = TxSizeGrid::new(width, height);
+    for y in (0..height).step_by(64) {
+        for x in (0..width).step_by(64) {
+            let size = match ((x / 64) + (y / 64)) % 4 {
+                0 => 32,
+                1 => 16,
+                2 => 8,
+                _ => 4,
+            };
+            let mut by = y;
+            while by < (y + 64).min(height) {
+                let mut bx = x;
+                while bx < (x + 64).min(width) {
+                    grid.set_block(bx, by, size, size);
+                    bx += size;
+                }
+                by += size;
+            }
+        }
+    }
+    grid
+}
+
+#[test]
+fn wide_deblocking_filters_match_the_scalar_reference() {
+    for (width, height) in [(96usize, 96usize), (67, 71), (33, 18)] {
+        for (level, sharpness) in [(16u8, 0u8), (40, 2), (63, 7)] {
+            let grid = mixed_tx_grid(width, height);
+            let results = for_each_isa(|_| {
+                let mut frame =
+                    FilterFrame::new_monochrome(flat_blocks_plane(width, height, 0x5eed));
+                deblock_frame(&mut frame, &deblock_params(level, sharpness), Some(&grid)).unwrap();
+                frame.y.data
+            });
+            assert_all_match(&results, "deblocked plane with wide filters");
+        }
+    }
+}
+
+#[test]
+fn wide_deblocking_filters_actually_run_on_flat_content() {
+    // Guards the coverage above: if the flatness gate never opened, every
+    // result would equal the narrow-only run and the test would be vacuous.
+    let (width, height) = (96usize, 96usize);
+    let grid = mixed_tx_grid(width, height);
+    let mut wide = FilterFrame::new_monochrome(flat_blocks_plane(width, height, 0x5eed));
+    deblock_frame(&mut wide, &deblock_params(40, 2), Some(&grid)).unwrap();
+    let mut narrow = FilterFrame::new_monochrome(flat_blocks_plane(width, height, 0x5eed));
+    deblock_frame(&mut narrow, &deblock_params(40, 2), None).unwrap();
+    assert_ne!(
+        wide.y.data, narrow.y.data,
+        "the 8-tap/14-tap filters should change samples the narrow filter does not"
+    );
+
+    // The two grids differ only in whether an edge selects the 14-tap or the
+    // 8-tap filter, so a difference here means the 14-tap path ran too.
+    let uniform = |size: usize| {
+        let mut grid = TxSizeGrid::new(width, height);
+        for y in (0..height).step_by(size) {
+            for x in (0..width).step_by(size) {
+                grid.set_block(x, y, size, size);
+            }
+        }
+        let mut frame = FilterFrame::new_monochrome(flat_blocks_plane(width, height, 0x5eed));
+        deblock_frame(&mut frame, &deblock_params(40, 2), Some(&grid)).unwrap();
+        frame.y.data
+    };
+    assert_ne!(
+        uniform(32),
+        uniform(16),
+        "the 14-tap filter should reach samples the 8-tap filter does not"
+    );
+}
+
+#[test]
+fn deblocking_at_frame_borders_matches_the_scalar_reference() {
+    // Planes small enough that every edge position's filter window leaves the
+    // plane on at least one side, and whose dimensions are not a multiple of
+    // any lane count, so every run is a partial one.
+    for (width, height) in [(5usize, 5usize), (9, 3), (3, 9), (6, 13), (17, 6)] {
+        for tx in [false, true] {
+            let grid = tx.then(|| mixed_tx_grid(width, height));
+            let results = for_each_isa(|_| {
+                let mut frame =
+                    FilterFrame::new_monochrome(flat_blocks_plane(width, height, 0xb0_1d));
+                deblock_frame(&mut frame, &deblock_params(48, 1), grid.as_ref()).unwrap();
+                frame.y.data
+            });
+            assert_all_match(&results, "deblocked plane at the frame border");
+        }
+    }
+}
+
+#[test]
+fn cdef_at_frame_borders_matches_the_scalar_reference() {
+    // Widths and heights that are not multiples of 8 leave partial CDEF blocks
+    // at the right and bottom edges, whose taps and direction search both read
+    // outside the plane.
+    for (width, height) in [(5usize, 5usize), (9, 3), (13, 11), (23, 17)] {
+        for (primary, secondary, damping) in [(4u8, 2u8, 3u8), (15, 0, 6), (0, 4, 5)] {
+            let results = for_each_isa(|_| {
+                let strength = CdefStrength {
+                    y_primary: primary,
+                    y_secondary: secondary,
+                    uv_primary: primary,
+                    uv_secondary: secondary,
+                    damping,
+                };
+                let mut frame = FilterFrame::new_monochrome(plane(width, height, 0xcdef));
+                cdef_frame(&mut frame, &strength, &Limits::default()).unwrap();
+                frame.y.data
+            });
+            assert_all_match(&results, "CDEF filtered plane at the frame border");
+        }
+    }
+}
+
+#[test]
+fn restoration_at_region_borders_matches_the_scalar_reference() {
+    // Restoration units flush against the plane's edges (so the 7-tap Wiener
+    // window and the box-statistics windows clamp) and with widths that leave a
+    // partial trailing vector.
+    for (width, height) in [(7usize, 5usize), (11, 9), (34, 13)] {
+        let results = for_each_isa(|_| {
+            let mut target = plane(width, height, 0x2468);
+            let unit = RestorationUnit::Wiener {
+                horizontal: [3, -7, 15],
+                vertical: [-2, 5, 11],
+            };
+            apply_restoration_unit(&mut target, &unit, 0, 0, width, height).unwrap();
+            let unit = RestorationUnit::SelfGuided {
+                radius: [1, 3],
+                eps: [12, 30],
+                weight: [40, 24],
+            };
+            apply_restoration_unit(&mut target, &unit, 0, 0, width, height).unwrap();
+            target.data
+        });
+        assert_all_match(&results, "restored plane at the region border");
     }
 }
 

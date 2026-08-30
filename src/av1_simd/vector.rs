@@ -114,6 +114,12 @@ pub(crate) trait I32x: Copy {
     #[inline(always)]
     unsafe fn store_masked(self, dst: &mut [i32], count: usize) {
         unsafe {
+            // Whole vectors are the common case (only a plane's trailing
+            // positions are partial), and they store natively.
+            if count == Self::LANES {
+                self.store(dst);
+                return;
+            }
             let mut scratch = [0i32; MAX_LANES];
             self.store(&mut scratch);
             dst[..count].copy_from_slice(&scratch[..count]);
@@ -132,12 +138,20 @@ pub(crate) trait I32x: Copy {
             let mut scratch = [0i32; MAX_LANES];
             self.clamp(Self::zero(), Self::splat(255))
                 .store(&mut scratch);
+            // Splitting the whole-vector case out keeps its byte copy a
+            // constant-length one, which is what lets it stay unrolled; only a
+            // plane's trailing positions take the variable-length loop.
+            if count == Self::LANES {
+                for (out, &value) in dst.iter_mut().zip(scratch.iter()).take(Self::LANES) {
+                    *out = value as u8;
+                }
+                return;
+            }
             for (out, &value) in dst.iter_mut().zip(scratch.iter()).take(count) {
                 *out = value as u8;
             }
         }
     }
-
 }
 
 /// A 4-lane vector that can transpose a 4x4 block of lanes.
