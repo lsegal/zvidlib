@@ -331,6 +331,72 @@ pub fn apply_sao_ctb_full(
     let w = n_w.min(pw.saturating_sub(x_ctb));
     let h = n_h.min(ph.saturating_sub(y_ctb));
 
+    // Fast path: with no slice / tile boundary mask and no PCM /
+    // transquant-bypass suppression, whole runs of a row take the same
+    // branch-free treatment, so they go through the vectorized kernels
+    // in `super::simd` (which fall back to scalar on targets without a
+    // supported vector ISA). The results are bit-exact with the scalar
+    // code below, which stays the normative reference.
+    let vectorizable = boundaries.is_none() && no_filter.is_none() && w > 0 && h > 0;
+
+    if vectorizable && comp.sao_type_idx == 2 {
+        let (h0, v0, h1, v1) = eo_pos(comp.eo_class);
+        // A neighbour outside the picture forces edgeIdx = 0, so only the
+        // x range where both Table 8-13 neighbours are in-picture is
+        // modified at all; the margins keep their reconstructed values,
+        // which `sao_out` already holds.
+        let left_margin = (-(h0.min(h1))).max(0) as usize;
+        let right_margin = h0.max(h1).max(0) as usize;
+        let x_lo = x_ctb.max(left_margin);
+        let x_hi = (x_ctb + w).min(pw.saturating_sub(right_margin));
+        if x_hi > x_lo {
+            let n = x_hi - x_lo;
+            let src = rec.plane(plane);
+            let (dst, dst_stride) = sao_out.plane_mut(plane);
+            debug_assert_eq!(dst_stride, pw);
+            for j in 0..h {
+                let y = (y_ctb + j) as i32;
+                let (y0, y1) = (y + v0, y + v1);
+                if y0 < 0 || y1 < 0 || y0 as usize >= ph || y1 as usize >= ph {
+                    continue; // whole row's neighbours are out of picture
+                }
+                let cur = y as usize * pw + x_lo;
+                let o0 = y0 as usize * pw + (x_lo as i32 + h0) as usize;
+                let o1 = y1 as usize * pw + (x_lo as i32 + h1) as usize;
+                super::simd::in_loop::sao_edge_row(
+                    &src[cur..cur + n],
+                    &src[o0..o0 + n],
+                    &src[o1..o1 + n],
+                    &mut dst[cur..cur + n],
+                    &comp.offset_val,
+                    max,
+                );
+            }
+        }
+        return;
+    }
+
+    if vectorizable && comp.sao_type_idx != 2 {
+        // §8.7.3.2 band offset over whole rows (equations 8-414..8-415).
+        let band_shift = i32::from(bit_depth) - 5;
+        let left = i32::from(comp.band_position);
+        let src = rec.plane(plane);
+        let (dst, dst_stride) = sao_out.plane_mut(plane);
+        debug_assert_eq!(dst_stride, pw);
+        for j in 0..h {
+            let o = (y_ctb + j) * pw + x_ctb;
+            super::simd::in_loop::sao_band_row(
+                &src[o..o + w],
+                &mut dst[o..o + w],
+                &comp.offset_val,
+                left,
+                band_shift,
+                max,
+            );
+        }
+        return;
+    }
+
     if comp.sao_type_idx == 2 {
         // §8.7.3.2 edge offset (equations 8-409..8-413).
         let (h0, v0, h1, v1) = eo_pos(comp.eo_class);
