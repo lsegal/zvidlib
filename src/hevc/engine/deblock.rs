@@ -803,6 +803,18 @@ impl SamplePlane<'_> {
     fn set(&mut self, x: usize, y: usize, v: i32) {
         self.samples[y * self.stride + x] = v;
     }
+    /// The four samples `[x, x + 4)` of row `y`.
+    #[inline]
+    fn run4(&self, x: usize, y: usize) -> [i32; 4] {
+        let mut out = [0i32; 4];
+        out.copy_from_slice(&self.samples[y * self.stride + x..][..4]);
+        out
+    }
+    /// Overwrite the four samples `[x, x + 4)` of row `y`.
+    #[inline]
+    fn set_run4(&mut self, x: usize, y: usize, v: [i32; 4]) {
+        self.samples[y * self.stride + x..][..4].copy_from_slice(&v);
+    }
     /// `(x, y)` plane coordinates for the `i`-th sample on the p (`pi`,
     /// negative side) or q (`qi`, positive side) of an edge at `(ex, ey)`
     /// for row offset `k` along the edge.
@@ -914,45 +926,88 @@ pub fn filter_luma_block_edge_gated(
         qp.bit_depth,
     );
     let bit_depth = qp.bit_depth;
-    // Gather the decision grid: rows k=0 and k=3, samples i=0..3 each side.
+    // Gather the whole 4-row segment once: `seg_p[i][k]` = `pi,k`. The
+    // four rows are filtered together (they share one decision), so this
+    // is also the layout the vectorized kernel consumes.
+    // Both orientations gather four contiguous samples per access, so
+    // the whole segment costs eight row reads rather than 32 bounds-
+    // checked per-sample reads.
+    let mut seg_p: crate::hevc::engine::simd::in_loop::LumaSeg = [[0i32; 4]; 4];
+    let mut seg_q: crate::hevc::engine::simd::in_loop::LumaSeg = [[0i32; 4]; 4];
+    match edge {
+        EdgeType::Vertical => {
+            for k in 0..4 {
+                // p3..p0 run left-to-right at x = ex-4 .. ex-1.
+                let run = plane.run4(ex - 4, ey + k);
+                for i in 0..4 {
+                    seg_p[i][k] = run[3 - i];
+                }
+                let run = plane.run4(ex, ey + k);
+                for i in 0..4 {
+                    seg_q[i][k] = run[i];
+                }
+            }
+        }
+        EdgeType::Horizontal => {
+            for i in 0..4 {
+                seg_p[i] = plane.run4(ex, ey - i - 1);
+                seg_q[i] = plane.run4(ex, ey + i);
+            }
+        }
+    }
+    // The decision grid is rows k=0 and k=3 of the same segment.
     let mut pg = [[0i32; 2]; 4];
     let mut qg = [[0i32; 2]; 4];
-    for (k_idx, &k) in [0usize, 3].iter().enumerate() {
-        for i in 0..4 {
-            let (px, py) = plane.edge_xy(ex, ey, edge, true, i, k);
-            let (qx, qy) = plane.edge_xy(ex, ey, edge, false, i, k);
-            pg[i][k_idx] = plane.get(px, py);
-            qg[i][k_idx] = plane.get(qx, qy);
-        }
+    for i in 0..4 {
+        pg[i] = [seg_p[i][0], seg_p[i][3]];
+        qg[i] = [seg_q[i][0], seg_q[i][3]];
     }
     let dec = luma_edge_decision(pg, qg, beta, tc);
     if dec.de == 0 {
         return dec;
     }
-    // Apply the filter to each of the 4 rows (eq. 8-372/8-373 layout).
-    for k in 0..4 {
-        let mut p = [0i32; 4];
-        let mut q = [0i32; 4];
-        for i in 0..4 {
-            let (px, py) = plane.edge_xy(ex, ey, edge, true, i, k);
-            let (qx, qy) = plane.edge_xy(ex, ey, edge, false, i, k);
-            p[i] = plane.get(px, py);
-            q[i] = plane.get(qx, qy);
+    // Apply the filter to all 4 rows at once (eq. 8-372/8-373 layout).
+    // Rows the weak filter leaves alone come back holding their input
+    // samples, so writing `0..nDp` / `0..nDq` back is a no-op for them.
+    let mut out_p: crate::hevc::engine::simd::in_loop::LumaSegOut = [[0i32; 4]; 3];
+    let mut out_q: crate::hevc::engine::simd::in_loop::LumaSegOut = [[0i32; 4]; 3];
+    crate::hevc::engine::simd::in_loop::filter_luma_rows(
+        &seg_p, &seg_q, dec.de, dec.dep, dec.deq, tc, bit_depth, &mut out_p, &mut out_q,
+    );
+    let ndp = if dec.de == 2 {
+        3
+    } else {
+        (dec.dep + 1) as usize
+    }; // eq. 8-403
+    let ndq = if dec.de == 2 {
+        3
+    } else {
+        (dec.deq + 1) as usize
+    };
+    if no_filter.is_none() && edge == EdgeType::Horizontal {
+        // Each filtered `pi'` / `qi'` row is four contiguous samples.
+        for (i, row) in out_p.iter().enumerate().take(ndp) {
+            plane.set_run4(ex, ey - i - 1, *row);
         }
-        let out = filter_luma_sample(p, q, dec.de, dec.dep, dec.deq, tc, bit_depth);
-        for i in 0..out.ndp {
+        for (j, row) in out_q.iter().enumerate().take(ndq) {
+            plane.set_run4(ex, ey + j, *row);
+        }
+        return dec;
+    }
+    for k in 0..4 {
+        for (i, row) in out_p.iter().enumerate().take(ndp) {
             let (px, py) = plane.edge_xy(ex, ey, edge, true, i, k);
             if no_filter.is_some_and(|m| m.at_luma(px, py)) {
                 continue; // §8.7.2.5.4 nDp = 0 (PCM / bypass / palette)
             }
-            plane.set(px, py, out.p[i]);
+            plane.set(px, py, row[k]);
         }
-        for j in 0..out.ndq {
+        for (j, row) in out_q.iter().enumerate().take(ndq) {
             let (qx, qy) = plane.edge_xy(ex, ey, edge, false, j, k);
             if no_filter.is_some_and(|m| m.at_luma(qx, qy)) {
                 continue; // §8.7.2.5.4 nDq = 0
             }
-            plane.set(qx, qy, out.q[j]);
+            plane.set(qx, qy, row[k]);
         }
     }
     dec
@@ -1003,23 +1058,50 @@ pub fn filter_chroma_block_edge_gated(
         qp.tc_offset_div2,
         bit_depth,
     );
-    for k in 0..4 {
-        let mut p = [0i32; 2];
-        let mut q = [0i32; 2];
-        for i in 0..2 {
-            let (px, py) = plane.edge_xy(ex, ey, edge, true, i, k);
-            let (qx, qy) = plane.edge_xy(ex, ey, edge, false, i, k);
-            p[i] = plane.get(px, py);
-            q[i] = plane.get(qx, qy);
+    // Gather the whole 4-row segment (`seg_p[i][k]` = `pi,k`) and filter
+    // its four rows together.
+    let mut seg_p: crate::hevc::engine::simd::in_loop::ChromaSeg = [[0i32; 4]; 2];
+    let mut seg_q: crate::hevc::engine::simd::in_loop::ChromaSeg = [[0i32; 4]; 2];
+    match edge {
+        EdgeType::Vertical => {
+            for k in 0..4 {
+                let run = plane.run4(ex - 2, ey + k);
+                seg_p[0][k] = run[1];
+                seg_p[1][k] = run[0];
+                seg_q[0][k] = run[2];
+                seg_q[1][k] = run[3];
+            }
         }
-        let (p0p, q0p) = filter_chroma_sample(p, q, tc, bit_depth);
+        EdgeType::Horizontal => {
+            for i in 0..2 {
+                seg_p[i] = plane.run4(ex, ey - i - 1);
+                seg_q[i] = plane.run4(ex, ey + i);
+            }
+        }
+    }
+    let mut out_p0 = [0i32; 4];
+    let mut out_q0 = [0i32; 4];
+    crate::hevc::engine::simd::in_loop::filter_chroma_rows(
+        &seg_p,
+        &seg_q,
+        tc,
+        bit_depth,
+        &mut out_p0,
+        &mut out_q0,
+    );
+    if no_filter.is_none() && edge == EdgeType::Horizontal {
+        plane.set_run4(ex, ey - 1, out_p0);
+        plane.set_run4(ex, ey, out_q0);
+        return tc;
+    }
+    for k in 0..4 {
         let (px, py) = plane.edge_xy(ex, ey, edge, true, 0, k);
         let (qx, qy) = plane.edge_xy(ex, ey, edge, false, 0, k);
         if !no_filter.is_some_and(|m| m.at_luma(px * sub_w, py * sub_h)) {
-            plane.set(px, py, p0p);
+            plane.set(px, py, out_p0[k]);
         }
         if !no_filter.is_some_and(|m| m.at_luma(qx * sub_w, qy * sub_h)) {
-            plane.set(qx, qy, q0p);
+            plane.set(qx, qy, out_q0[k]);
         }
     }
     tc
