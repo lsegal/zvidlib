@@ -17,7 +17,7 @@
 //! either proves the `i32` range is sufficient for 8-bit input (the filters) or
 //! range-checks its input and defers to the scalar path when the check fails
 //! (the transforms; see `transforms::WHT_INPUT_LIMIT` and
-//! `transforms::DCT_INPUT_LIMIT`). Positions whose taps would need edge
+//! `transforms::input_limit`). Positions whose taps would need edge
 //! clamping stay on the scalar path as well, so the vector kernels never read
 //! outside a plane. `tests/av1_simd.rs` asserts equality against the scalar
 //! path for every instruction set the host supports.

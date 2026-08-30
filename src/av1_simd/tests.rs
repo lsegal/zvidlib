@@ -263,7 +263,7 @@ fn scalar_kernels_match_the_mathematical_transforms() {
                 inverse_transform(&coefficients, size, Av1TxType::DctDct, 1 << 12, 1 << 12);
             let column_gain = 1.0 / SQRT_2;
             let shift = f64::from(1 << crate::av1_intra::transform_shift(size));
-            for n in 0..size {
+            for (n, &sample) in residual.iter().take(size).enumerate() {
                 let expected = f64::from(1 << 12)
                     * if basis == 0 {
                         1.0 / SQRT_2
@@ -272,7 +272,7 @@ fn scalar_kernels_match_the_mathematical_transforms() {
                     }
                     * column_gain
                     / shift;
-                let got = f64::from(residual[n]);
+                let got = f64::from(sample);
                 assert!(
                     (got - expected).abs() <= 2.0,
                     "dct{size} basis {basis} position {n}: {got} vs {expected}"
@@ -288,7 +288,7 @@ fn scalar_kernels_match_the_mathematical_transforms() {
             let residual =
                 inverse_transform(&coefficients, size, Av1TxType::DctAdst, 1 << 12, 1 << 12);
             let shift = f64::from(1 << crate::av1_intra::transform_shift(size));
-            for n in 0..size {
+            for (n, &sample) in residual.iter().take(size).enumerate() {
                 let sine = if size == 4 {
                     // DST-VII, scaled by `2 * sqrt(2) / 3` by the `sinpi`
                     // constants.
@@ -300,7 +300,7 @@ fn scalar_kernels_match_the_mathematical_transforms() {
                         .sin()
                 };
                 let expected = f64::from(1 << 12) * sine / SQRT_2 / shift;
-                let got = f64::from(residual[n]);
+                let got = f64::from(sample);
                 assert!(
                     (got - expected).abs() <= 2.0,
                     "adst{size} basis {basis} position {n}: {got} vs {expected}"
