@@ -594,18 +594,30 @@ mod aarch64 {
     use super::DequantParams;
     use core::arch::aarch64::*;
 
-    /// NEON [`super::transform_1d`]: up to thirty-two `i32` output
-    /// lanes per tile, held in `vmlaq_s32` register accumulators for the
-    /// whole `j` sweep.
+    /// NEON [`super::transform_1d`]: the whole output row is held in
+    /// `vmlaq_s32` register accumulators across the entire `j` sweep, so
+    /// the input is scanned exactly once.
     ///
-    /// The tile is as wide as the remaining output, because the `j` loop
-    /// is re-run once per tile: every extra tile re-reads the whole
-    /// `input`, re-tests each entry against zero, and re-broadcasts it.
-    /// At `nTbS == 32` an 8-lane tile pays that four times over, which
-    /// was enough to put the kernel behind the auto-vectorized scalar
-    /// loop at the largest transform size — the widest tile costs eight
-    /// accumulator registers out of aarch64's thirty-two and scans the
-    /// input once. See `bench_inverse_transform_and_dequant`.
+    /// The width is chosen by an exact match on `nTbS` rather than by a
+    /// descending chain of tile widths, and that shape matters twice
+    /// over:
+    ///
+    /// * **Wide enough at 32.** The `j` loop is re-run once per tile,
+    ///   and every extra tile re-reads the whole `input`, re-tests each
+    ///   entry against zero and re-broadcasts it. An 8-lane tile pays
+    ///   that four times over at `nTbS == 32`, which was enough to put
+    ///   the kernel *behind* the auto-vectorized scalar loop on a sparse
+    ///   column (0.91x). Eight accumulators out of aarch64's thirty-two
+    ///   registers buys 3.3x instead.
+    /// * **Not a chain at 4 and 8.** Reaching the narrow tiles through
+    ///   `while base + 32 <= n` / `+ 16` / `+ 8` guards costs 30-45% at
+    ///   the two smallest sizes — which are also the most common ones in
+    ///   a real stream — even though the guards are trivially false.
+    ///   Dispatching straight to the right width avoids that entirely.
+    ///
+    /// Any other length (there is none in §8.6, which defines
+    /// `nTbS ∈ { 4, 8, 16, 32 }`) falls back to a descending tile chain
+    /// plus a scalar tail. See `bench_inverse_transform_and_dequant`.
     ///
     /// # Safety
     /// The host must support NEON (guaranteed on aarch64). `basis` must
@@ -621,44 +633,53 @@ mod aarch64 {
         unsafe {
             let n = out.len();
             let row_stride = row_step * basis_stride;
-            let mut base = 0;
 
-            // Widest tile first: 32 lanes, then 16, 8 and 4, then the
-            // sub-vector tail. Block sides are always 4/8/16/32, so in
-            // practice exactly one of these runs once.
+            /// One straight-line pass: `$accs` accumulators covering
+            /// `4 * $accs` output lanes starting at `$base`, filled by
+            /// one sweep of the non-zero `input` entries.
             macro_rules! tile {
-                ($width:literal, $accs:literal) => {
-                    while base + $width <= n {
-                        let mut acc = [vdupq_n_s32(0); $accs];
-                        for (j, &xj) in input.iter().enumerate() {
-                            if xj == 0 {
-                                continue;
-                            }
-                            let row = basis.as_ptr().add(j * row_stride + base);
-                            let s = vdupq_n_s32(xj);
-                            for (k, a) in acc.iter_mut().enumerate() {
-                                *a = vmlaq_s32(*a, vld1q_s32(row.add(k * 4)), s);
-                            }
+                ($base:expr, $accs:literal) => {{
+                    let base = $base;
+                    let mut acc = [vdupq_n_s32(0); $accs];
+                    for (j, &xj) in input.iter().enumerate() {
+                        if xj == 0 {
+                            continue;
                         }
-                        for (k, a) in acc.iter().enumerate() {
-                            vst1q_s32(out.as_mut_ptr().add(base + k * 4), *a);
+                        let row = basis.as_ptr().add(j * row_stride + base);
+                        let s = vdupq_n_s32(xj);
+                        for (k, a) in acc.iter_mut().enumerate() {
+                            *a = vmlaq_s32(*a, vld1q_s32(row.add(k * 4)), s);
                         }
-                        base += $width;
                     }
-                };
+                    for (k, a) in acc.iter().enumerate() {
+                        vst1q_s32(out.as_mut_ptr().add(base + k * 4), *a);
+                    }
+                }};
             }
-            tile!(32, 8);
-            tile!(16, 4);
-            tile!(8, 2);
-            tile!(4, 1);
 
-            while base < n {
-                let mut acc = 0i32;
-                for (j, &xj) in input.iter().enumerate() {
-                    acc += xj * *basis.as_ptr().add(j * row_stride + base);
+            match n {
+                32 => tile!(0, 8),
+                16 => tile!(0, 4),
+                8 => tile!(0, 2),
+                4 => tile!(0, 1),
+                // Unreachable from §8.6, which defines nTbS as 4/8/16/32.
+                // Kept correct rather than deleted so the kernel stays a
+                // total function of its slice lengths.
+                _ => {
+                    let mut base = 0;
+                    while base + 4 <= n {
+                        tile!(base, 1);
+                        base += 4;
+                    }
+                    while base < n {
+                        let mut acc = 0i32;
+                        for (j, &xj) in input.iter().enumerate() {
+                            acc += xj * *basis.as_ptr().add(j * row_stride + base);
+                        }
+                        out[base] = acc;
+                        base += 1;
+                    }
                 }
-                out[base] = acc;
-                base += 1;
             }
         }
     }
