@@ -154,5 +154,12 @@ fn hevc_decode_1080p(criterion: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, host_report, smoke, av1_decode, encoder_input, hevc_decode_1080p);
+criterion_group!(
+    benches,
+    host_report,
+    smoke,
+    av1_decode,
+    encoder_input,
+    hevc_decode_1080p
+);
 criterion_main!(benches);
