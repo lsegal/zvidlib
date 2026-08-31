@@ -39,8 +39,6 @@
     allow(dead_code, unused_variables, unreachable_code)
 )]
 
-use core::sync::atomic::{AtomicU8, Ordering};
-
 use crate::av1_intra::Tx1d;
 
 pub(crate) mod filters;
@@ -72,7 +70,7 @@ impl SimdIsa {
         }
     }
 
-    fn code(self) -> u8 {
+    pub(crate) fn code(self) -> u8 {
         match self {
             SimdIsa::Scalar => 1,
             SimdIsa::Sse41 => 2,
@@ -81,7 +79,7 @@ impl SimdIsa {
         }
     }
 
-    fn from_code(code: u8) -> Option<Self> {
+    pub(crate) fn from_code(code: u8) -> Option<Self> {
         match code {
             1 => Some(SimdIsa::Scalar),
             2 => Some(SimdIsa::Sse41),
@@ -155,30 +153,28 @@ pub fn available_isas() -> Vec<SimdIsa> {
     isas
 }
 
-static OVERRIDE: AtomicU8 = AtomicU8::new(0);
-
 /// The instruction set the kernels will actually use.
+///
+/// This is the crate-wide [`crate::simd::active`] value; the override lives in
+/// [`crate::simd`] so that pinning an instruction set reaches the HEVC kernels
+/// and the other AV1 dispatch sites too, not just this module.
 #[must_use]
 pub fn active_isa() -> SimdIsa {
-    match SimdIsa::from_code(OVERRIDE.load(Ordering::Relaxed)) {
-        Some(isa) => isa,
-        None => detected_isa(),
-    }
+    crate::simd::active()
 }
 
-/// Forces every AV1 kernel onto `isa`, or restores automatic detection with
-/// `None`.
+/// Forces every SIMD kernel in the crate onto `isa`, or restores automatic
+/// detection with `None`.
+///
+/// Retained as the historical AV1-facing spelling of
+/// [`crate::simd::set_override`], which it delegates to; prefer that entry
+/// point in new code.
 ///
 /// Every implementation is bit-exact with every other, so this only changes
 /// performance, never output. Passing an instruction set this host does not
-/// support is ignored (the kernels fall back to scalar).
+/// support pins the scalar path instead.
 pub fn set_active_isa(isa: Option<SimdIsa>) {
-    let code = match isa {
-        Some(isa) if available_isas().contains(&isa) => isa.code(),
-        Some(_) => SimdIsa::Scalar.code(),
-        None => 0,
-    };
-    OVERRIDE.store(code, Ordering::Relaxed);
+    crate::simd::set_override(isa);
 }
 
 // ---------------------------------------------------------------------
