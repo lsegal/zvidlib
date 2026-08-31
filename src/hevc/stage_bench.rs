@@ -559,7 +559,9 @@ mod tests {
     fn every_stage_is_bit_exact_across_instruction_sets() {
         let _guard = simd::test_lock();
         let inputs = small_inputs();
-        let stages: [(&str, fn(&HevcStageInputs) -> Vec<u8>); 6] = [
+        /// One stage's name and the entry point that runs it.
+        type Stage = (&'static str, fn(&HevcStageInputs) -> Vec<u8>);
+        let stages: [Stage; 6] = [
             ("inter_pred", HevcStageInputs::run_inter_pred),
             ("intra_pred", HevcStageInputs::run_intra_pred),
             ("deblock", HevcStageInputs::run_deblock),
