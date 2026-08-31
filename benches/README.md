@@ -201,14 +201,48 @@ regardless of the filter — it is not a criterion benchmark and criterion's
 filter does not reach it — so filtering shortens the *timed* part of a run, not
 all of it.
 
-The whole-frame per-ISA HEVC group (`hevc_decode`) decodes the bundled 1080p
-sample, so it sits behind the same `ZVIDLIB_BENCH_LARGE=1` opt-in as the other
-1080p group.
+The whole-frame per-ISA HEVC groups (`hevc_decode` and
+`hevc_decode_to_picture`) decode the bundled 1080p sample, so they sit behind
+the same `ZVIDLIB_BENCH_LARGE=1` opt-in as the other 1080p group.
+
+### Which whole-frame HEVC group answers which question
+
+There are two, and they measure deliberately different intervals:
+
+| Group | Interval | The question it answers |
+| --- | --- | --- |
+| `hevc_decode/<isa>` | `submit` to RGBA | what does an application pay per frame |
+| `hevc_decode_to_picture/<isa>` | `submit` to the decoded `Picture` | how fast is the decoder |
+
+They decode the same access units of the same sample, the same number of frames,
+through the same `HevcDecoder`. The only difference is that the first converts
+each decoded picture to RGBA and the second does not.
+
+The distinction exists because that conversion is **33.5% of what `hevc_decode`
+times** (the attribution below) and no HEVC kernel touches it. A scalar-versus-SIMD
+ratio taken off `hevc_decode` therefore has a third of its denominator pinned
+regardless of how fast the vector kernels get: it is not a decode ratio, and
+reading it as one understates every SIMD arm. `hevc_decode_to_picture` is the
+group to read a decode ratio off. `hevc_decode` stays because the round trip is
+what an application actually pays, and dropping it would trade one misleading
+number for another.
+
+The two are not a subtraction. Each carries its own output fold for the
+bit-exactness guard — `FrameDigest` over RGBA in one, an FNV fold over the
+picture's planes in the other — so the gap between them is the conversion plus a
+digest difference. `hevc_color_convert` below times the conversion itself, which
+is the number to use.
+
+`hevc_decode_1080p` reports both intervals the same way:
+`sequential_from_keyframe` goes through `ExactFrameReader` out to RGBA, and
+`sequential_from_keyframe_to_picture` decodes the same leading frames and stops
+at the picture.
 
 ### The HEVC per-stage groups
 
-`hevc_decode` answers "how fast is a frame". The per-stage groups answer "which
-kernel changed", so a regression can be attributed rather than only observed:
+The whole-frame groups answer "how fast is a frame". The per-stage groups answer
+"which kernel changed", so a regression can be attributed rather than only
+observed:
 
 | Group | Stage | Vectorized |
 | --- | --- | --- |
@@ -217,12 +251,21 @@ kernel changed", so a regression can be attributed rather than only observed:
 | `hevc_deblock` | §8.7.2 luma block-edge deblocking | yes |
 | `hevc_sao` | §8.7.3 sample adaptive offset, band and edge | yes |
 | `hevc_inverse_transform` | §8.6 dequantization + inverse DCT/DST | yes |
+| `hevc_color_convert` | YUV420-to-RGBA output conversion (`picture_to_rgba`) | no, today |
 | `hevc_cabac` | §9.3.4 arithmetic bin decoding | no, by design |
 
 They run unconditionally — none of them touches the bundled sample, so none of
 them needs the `ZVIDLIB_BENCH_LARGE=1` opt-in — and each runs once per available
 instruction set under the same bit-exactness and per-site override guards as
 every other per-ISA group.
+
+`hevc_color_convert` is the stage that separates the two whole-frame groups,
+measured directly rather than inferred from the gap between them. It has no
+vector kernel today, so its arms come out equal — which is the finding, not a
+null result: it is the largest single item in a `submit`-to-RGBA measurement and
+none of the decoder's kernels reach it. Issue #219 is the ticket that vectorizes
+it, and this is the group that would show the difference. Its input is the same
+full 8-bit 4:2:0 picture the SAO group filters.
 
 `hevc_cabac` is in the list precisely because it is *not* vectorized. The
 arithmetic decoder is inherently serial (each bin's range update depends on the
@@ -326,8 +369,10 @@ consequence of it.
 of everything the whole-frame groups measure, it is on the path of both
 `hevc_decode_1080p` and `hevc_decode/<isa>`, and it has no vector kernel: it is
 the per-sample BT.601/709 integer conversion in `picture_to_rgba`. Every
-whole-frame SIMD number is diluted by roughly a third for a stage no HEVC kernel
-touches.
+`submit`-to-RGBA SIMD number is diluted by roughly a third for a stage no HEVC
+kernel touches — which is why `hevc_decode_to_picture` and `hevc_color_convert`
+exist (issue #220): the decode ratio and the conversion are now measured
+separately instead of being read off one blended interval.
 
 **The next target is therefore colour conversion, not CABAC.** It is the largest
 single stage, it is embarrassingly parallel per sample, and it is the one place
