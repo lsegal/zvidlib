@@ -19,6 +19,9 @@
 //! supported instruction set falls back to [`crate::av1_filters`]'s scalar code.
 
 use super::vector::{I32x, MAX_LANES};
+use crate::av1_filters::{
+    WIDE_FILTER8_SHIFT, WIDE_FILTER8_WEIGHTS, WIDE_FILTER14_SHIFT, WIDE_FILTER14_WEIGHTS,
+};
 
 /// The plane geometry a kernel needs to reproduce the scalar path's edge
 /// clamping: the row stride plus the logical sample bounds.
@@ -324,49 +327,23 @@ unsafe fn narrow_filter_lanes<V: I32x>(
     }
 }
 
-/// Symmetric triangular taper weights for an `N`-tap wide filter: entry
-/// `(weights[i][j], denominators[i])` reproduces the `j`-th term and the
-/// divisor of `av1_filters::wide_taper_filter`'s output `i`. Only the inner
-/// outputs `1..N - 1` are used; the outermost taps only widen the window.
-const fn taper_table<const N: usize>() -> ([[i32; N]; N], [i32; N]) {
-    let mut weights = [[0i32; N]; N];
-    let mut denominators = [0i32; N];
-    let n = N as i32;
-    let mut i = 0;
-    while i < N {
-        let mut j = 0;
-        while j < N {
-            let distance = i as i32 - j as i32;
-            let weight = n - if distance < 0 { -distance } else { distance };
-            weights[i][j] = weight;
-            denominators[i] += weight;
-            j += 1;
-        }
-        i += 1;
-    }
-    (weights, denominators)
-}
-
-const TAPER8: ([[i32; 8]; 8], [i32; 8]) = taper_table::<8>();
-const TAPER14: ([[i32; 14]; 14], [i32; 14]) = taper_table::<14>();
-
-/// One wide-filter output: `(sum(weight * tap) + denominator / 2) /
-/// denominator`, the exact integer result the scalar reference computes in
-/// `i64`.
+/// One wide-filter output: `Round2(sum(weight * tap), shift)`, the exact
+/// integer result the scalar reference computes.
 ///
-/// Every tap is an 8-bit sample and every weight is positive, so the numerator
-/// is non-negative and at most `255 * denominator` (at most `49_980` for the
-/// widest window), which keeps it inside an `i32` lane and inside
-/// [`I32x::div_small_nonneg`]'s exact range.
+/// Every tap is an 8-bit sample and every weight is non-negative, so the
+/// numerator is non-negative and at most `255 << shift` (at most `4_080`),
+/// which keeps the rounded sum inside an `i32` lane and makes the spec's
+/// rounding shift an arithmetic right shift of a non-negative value.
 #[inline(always)]
-unsafe fn taper_output<V: I32x>(taps: &[V], weights: &[i32], denominator: i32) -> V {
+unsafe fn wide_filter_output<V: I32x>(taps: &[V], weights: &[i32], shift: i32) -> V {
     unsafe {
         let mut sum = V::zero();
         for (&tap, &weight) in taps.iter().zip(weights.iter()) {
-            sum = sum.add(tap.mul(V::splat(weight)));
+            if weight != 0 {
+                sum = sum.add(tap.mul(V::splat(weight)));
+            }
         }
-        sum.add(V::splat(denominator / 2))
-            .div_small_nonneg(denominator)
+        sum.add(V::splat(1 << (shift - 1))).sra_var(shift)
     }
 }
 
@@ -418,11 +395,9 @@ unsafe fn deblock_filter_lanes<V: I32x>(
             return out;
         }
 
-        let (weights, denominators) = &TAPER8;
         let window = &taps[EDGE - 4..EDGE + 4];
-        for (index, slot) in out[3..9].iter_mut().enumerate() {
-            let output = index + 1;
-            let filtered = taper_output(window, &weights[output], denominators[output]);
+        for (weights, slot) in WIDE_FILTER8_WEIGHTS.iter().zip(out[3..9].iter_mut()) {
+            let filtered = wide_filter_output(window, weights, WIDE_FILTER8_SHIFT);
             *slot = V::select(wide8, filtered, *slot);
         }
 
@@ -440,10 +415,8 @@ unsafe fn deblock_filter_lanes<V: I32x>(
             return out;
         }
 
-        let (weights, denominators) = &TAPER14;
-        for (index, slot) in out.iter_mut().enumerate() {
-            let output = index + 1;
-            let filtered = taper_output(&taps[..], &weights[output], denominators[output]);
+        for (weights, slot) in WIDE_FILTER14_WEIGHTS.iter().zip(out.iter_mut()) {
+            let filtered = wide_filter_output(&taps[..], weights, WIDE_FILTER14_SHIFT);
             *slot = V::select(wide14, filtered, *slot);
         }
         out

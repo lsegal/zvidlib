@@ -72,19 +72,6 @@ pub(crate) trait I32x: Copy {
     unsafe fn gt(self, other: Self) -> Self;
     /// Sum of all lanes.
     unsafe fn hsum(self) -> i32;
-    /// Lane-wise `self / divisor`, truncating toward zero.
-    ///
-    /// Only valid for non-negative lanes with `1 <= divisor` and
-    /// `self <= 255 * divisor + divisor / 2`, which is the range the wide
-    /// deblocking taper in [`super::filters`] produces (a weighted average of
-    /// 8-bit samples, so the quotient never exceeds 255). Within that range the
-    /// `f32` round trip these implementations use is exact: `f32` represents
-    /// both operands exactly, IEEE division is correctly rounded, and a
-    /// quotient of at most `255.5` has an absolute rounding error under
-    /// `2^-16`, far below the `1/divisor >= 1/255` distance from a
-    /// non-integral quotient to the next integer.
-    unsafe fn div_small_nonneg(self, divisor: i32) -> Self;
-
     #[inline(always)]
     unsafe fn zero() -> Self {
         unsafe { Self::splat(0) }
@@ -345,13 +332,6 @@ mod x86 {
                 _mm_cvtsi128_si32(_mm_hadd_epi32(pairs, pairs))
             }
         }
-        #[inline(always)]
-        unsafe fn div_small_nonneg(self, divisor: i32) -> Self {
-            unsafe {
-                let quotient = _mm_div_ps(_mm_cvtepi32_ps(self.0), _mm_set1_ps(divisor as f32));
-                Self(_mm_cvttps_epi32(quotient))
-            }
-        }
     }
 
     impl Transpose4 for Sse4 {
@@ -516,14 +496,6 @@ mod x86 {
                 _mm_cvtsi128_si32(_mm_hadd_epi32(pairs, pairs))
             }
         }
-        #[inline(always)]
-        unsafe fn div_small_nonneg(self, divisor: i32) -> Self {
-            unsafe {
-                let quotient =
-                    _mm256_div_ps(_mm256_cvtepi32_ps(self.0), _mm256_set1_ps(divisor as f32));
-                Self(_mm256_cvttps_epi32(quotient))
-            }
-        }
     }
 }
 
@@ -677,15 +649,6 @@ mod arm {
         #[inline(always)]
         unsafe fn hsum(self) -> i32 {
             unsafe { vaddvq_s32(self.0) }
-        }
-        #[inline(always)]
-        unsafe fn div_small_nonneg(self, divisor: i32) -> Self {
-            unsafe {
-                let quotient = vdivq_f32(vcvtq_f32_s32(self.0), vdupq_n_f32(divisor as f32));
-                // `vcvtq_s32_f32` rounds toward zero, which is the floor the
-                // scalar reference's non-negative integer division performs.
-                Self(vcvtq_s32_f32(quotient))
-            }
         }
     }
 

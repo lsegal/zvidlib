@@ -31,15 +31,17 @@
 //! parsed in [`crate::av1`] (`enable_cdef`, `enable_restoration`,
 //! `enable_superres`, `film_grain_params_present`).
 //!
-//! One normative piece is intentionally reproduced with a *documented,
-//! conservative* simplification rather than a best-effort guess at exact
-//! bit-exactness from memory, per the caller's guidance to favor
-//! well-documented reference behavior over unverifiable precision:
+//! The deblocking filter's wide 8-tap and 14-tap smoothing kernels
+//! (§7.14.6.3/§7.14.6.4) apply the spec's exact `filter8`/`filter14`
+//! weighted-sum constants (`WIDE_FILTER8_WEIGHTS` / `WIDE_FILTER14_WEIGHTS`,
+//! applied by `filter8` / `filter14`), replacing the symmetric
+//! triangular-weighted average that earlier stood in for them. Chroma still
+//! always takes the narrow 4-tap filter rather than the spec's 6-tap wide
+//! chroma filter; that scope reduction is documented in `deblock_frame`.
 //!
-//! - The deblocking filter's wide 8-tap and 14-tap smoothing kernels
-//!   (§7.14.6.3/§7.14.6.4) use a symmetric triangular-weighted average in
-//!   place of the spec's exact `filter8`/`filter14` weighted-sum constants;
-//!   see the comment above `wide_taper_filter`.
+//! One normative piece is still reproduced from published reference tables
+//! rather than derived here:
+//!
 //! - CDEF direction search uses the standard eight-direction partial-sum
 //!   cost search, but the exact reference constants tables
 //!   (`cdef_directions`) are reproduced from the widely published reference
@@ -543,14 +545,14 @@ fn filter_edge_at(
                 let q6 = at(6);
                 if flat_mask(FLAT_THRESH, p0, p4, p5, p6, q0, q4, q5, q6) {
                     let taps = [p6, p5, p4, p3, p2, p1, p0, q0, q1, q2, q3, q4, q5, q6];
-                    for (k, value) in wide_taper_filter(&taps).into_iter().enumerate() {
+                    for (k, value) in filter14(&taps).into_iter().enumerate() {
                         put(plane, k as isize - 6, value);
                     }
                     return;
                 }
             }
             let taps = [p3, p2, p1, p0, q0, q1, q2, q3];
-            for (k, value) in wide_taper_filter(&taps).into_iter().enumerate() {
+            for (k, value) in filter8(&taps).into_iter().enumerate() {
                 put(plane, k as isize - 3, value);
             }
             return;
@@ -601,39 +603,92 @@ fn flat_mask(
         && (q_c - q0).abs() <= thresh
 }
 
-/// Spec §7.14.6.3/§7.14.6.4 "Wide filter process" (8-tap and 14-tap cases,
-/// selected by `taps.len()` being 8 or 14). `taps` holds the ordered
-/// samples from the outermost `p` sample to the outermost `q` sample
-/// (`[p3..q3]` or `[p6..q6]`); the two outermost samples are left
-/// unmodified by the spec's wide filters and are only present here to
-/// widen the averaging window, so this returns `taps.len() - 2` values for
-/// the remaining, inner samples (nearest-`p`-first).
-///
-/// This uses a symmetric triangular-weighted average across the full
-/// window rather than the spec's exact `filter8`/`filter14` weighted-sum
-/// constants, as a documented, non-bit-exact stand-in (see the
-/// module-level note on documented reference-behavior approximations).
-/// Unlike hand-reproduced constant tables, this is correct by
-/// construction on the property that matters most for a loop filter: every
-/// weight is strictly positive and the divisor exactly equals the weight
-/// sum, so a run of already-flat samples (which is exactly the case the
-/// §7.14.6.1 flatness gate requires before a wide filter is ever applied)
-/// passes through unchanged rather than picking up a systematic bias.
-fn wide_taper_filter(taps: &[i32]) -> Vec<i32> {
-    let n = taps.len() as i32;
-    (1..taps.len() - 1)
-        .map(|i| {
-            let i = i as i32;
-            let mut numerator: i64 = 0;
-            let mut denominator: i64 = 0;
-            for (j, &tap) in taps.iter().enumerate() {
-                let weight = i64::from(n - (i - j as i32).abs());
-                numerator += weight * i64::from(tap);
-                denominator += weight;
-            }
-            ((numerator + denominator / 2) / denominator) as i32
-        })
-        .collect()
+/// Spec §7.14.6.3 `filter8`: the coefficient each of the eight taps
+/// `[p3, p2, p1, p0, q0, q1, q2, q3]` contributes to output `i`, where
+/// output `0` is the new `p2` and output `5` is the new `q2`. The two
+/// outermost taps (`p3`/`q3`) are read but never written. Every row sums to
+/// `1 << WIDE_FILTER8_SHIFT`, so a run of equal samples passes through
+/// unchanged.
+pub(crate) const WIDE_FILTER8_WEIGHTS: [[i32; 8]; 6] = [
+    // p2' = p3*3 + p2*2 + p1 + p0 + q0
+    [3, 2, 1, 1, 1, 0, 0, 0],
+    // p1' = p3*2 + p2 + p1*2 + p0 + q0 + q1
+    [2, 1, 2, 1, 1, 1, 0, 0],
+    // p0' = p3 + p2 + p1 + p0*2 + q0 + q1 + q2
+    [1, 1, 1, 2, 1, 1, 1, 0],
+    // q0' = p2 + p1 + p0 + q0*2 + q1 + q2 + q3
+    [0, 1, 1, 1, 2, 1, 1, 1],
+    // q1' = p1 + p0 + q0 + q1*2 + q2 + q3*2
+    [0, 0, 1, 1, 1, 2, 1, 2],
+    // q2' = p0 + q0 + q1 + q2*2 + q3*3
+    [0, 0, 0, 1, 1, 1, 2, 3],
+];
+
+/// Rounding shift of the §7.14.6.3 weighted sums (the weights sum to 8).
+pub(crate) const WIDE_FILTER8_SHIFT: i32 = 3;
+
+/// Spec §7.14.6.4 `filter14`: the coefficient each of the fourteen taps
+/// `[p6, ..., p0, q0, ..., q6]` contributes to output `i`, where output `0`
+/// is the new `p5` and output `11` is the new `q5`. The two outermost taps
+/// (`p6`/`q6`) are read but never written. Every row sums to
+/// `1 << WIDE_FILTER14_SHIFT`.
+pub(crate) const WIDE_FILTER14_WEIGHTS: [[i32; 14]; 12] = [
+    // p5' = p6*7 + p5*2 + p4*2 + p3 + p2 + p1 + p0 + q0
+    [7, 2, 2, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0],
+    // p4' = p6*5 + p5*2 + p4*2 + p3*2 + p2 + p1 + p0 + q0 + q1
+    [5, 2, 2, 2, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0],
+    // p3' = p6*4 + p5 + p4*2 + p3*2 + p2*2 + p1 + p0 + q0 + q1 + q2
+    [4, 1, 2, 2, 2, 1, 1, 1, 1, 1, 0, 0, 0, 0],
+    // p2' = p6*3 + p5 + p4 + p3*2 + p2*2 + p1*2 + p0 + q0 + q1 + q2 + q3
+    [3, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 0, 0, 0],
+    // p1' = p6*2 + p5 + p4 + p3 + p2*2 + p1*2 + p0*2 + q0 + q1 + q2 + q3 + q4
+    [2, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 0, 0],
+    // p0' = p6 + p5 + p4 + p3 + p2 + p1*2 + p0*2 + q0*2 + q1 + q2 + q3 + q4 + q5
+    [1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 0],
+    // q0' = p5 + p4 + p3 + p2 + p1 + p0*2 + q0*2 + q1*2 + q2 + q3 + q4 + q5 + q6
+    [0, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1],
+    // q1' = p4 + p3 + p2 + p1 + p0 + q0*2 + q1*2 + q2*2 + q3 + q4 + q5 + q6*2
+    [0, 0, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 2],
+    // q2' = p3 + p2 + p1 + p0 + q0 + q1*2 + q2*2 + q3*2 + q4 + q5 + q6*3
+    [0, 0, 0, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 3],
+    // q3' = p2 + p1 + p0 + q0 + q1 + q2*2 + q3*2 + q4*2 + q5 + q6*4
+    [0, 0, 0, 0, 1, 1, 1, 1, 1, 2, 2, 2, 1, 4],
+    // q4' = p1 + p0 + q0 + q1 + q2 + q3*2 + q4*2 + q5*2 + q6*5
+    [0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 2, 2, 2, 5],
+    // q5' = p0 + q0 + q1 + q2 + q3 + q4*2 + q5*2 + q6*7
+    [0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 2, 2, 7],
+];
+
+/// Rounding shift of the §7.14.6.4 weighted sums (the weights sum to 16).
+pub(crate) const WIDE_FILTER14_SHIFT: i32 = 4;
+
+/// Evaluates one wide-filter weight table against `taps`, rounding each
+/// weighted sum with the spec's `Round2(sum, shift)`.
+fn wide_filter<const TAPS: usize, const OUTPUTS: usize>(
+    taps: &[i32; TAPS],
+    weights: &[[i32; TAPS]; OUTPUTS],
+    shift: i32,
+) -> [i32; OUTPUTS] {
+    let mut out = [0i32; OUTPUTS];
+    for (value, row) in out.iter_mut().zip(weights.iter()) {
+        let sum: i32 = row.iter().zip(taps.iter()).map(|(&w, &tap)| w * tap).sum();
+        *value = (sum + (1 << (shift - 1))) >> shift;
+    }
+    out
+}
+
+/// Spec §7.14.6.3 "Wide filter process", 8-tap case. `taps` holds
+/// `[p3, p2, p1, p0, q0, q1, q2, q3]`; the result holds the six written
+/// samples `p2'..q2'`, nearest-`p`-first.
+fn filter8(taps: &[i32; 8]) -> [i32; 6] {
+    wide_filter(taps, &WIDE_FILTER8_WEIGHTS, WIDE_FILTER8_SHIFT)
+}
+
+/// Spec §7.14.6.4 "Wide filter process", 14-tap case. `taps` holds
+/// `[p6, ..., p0, q0, ..., q6]`; the result holds the twelve written
+/// samples `p5'..q5'`, nearest-`p`-first.
+fn filter14(taps: &[i32; 14]) -> [i32; 12] {
+    wide_filter(taps, &WIDE_FILTER14_WEIGHTS, WIDE_FILTER14_SHIFT)
 }
 
 /// Spec §7.14.4 "Adaptive filter strength process".
@@ -2114,11 +2169,68 @@ mod tests {
     }
 
     #[test]
-    fn wide_taper_filter_leaves_flat_input_unchanged() {
-        let taps = [50i32; 14];
-        assert!(wide_taper_filter(&taps).iter().all(|&v| v == 50));
-        let taps = [77i32; 8];
-        assert!(wide_taper_filter(&taps).iter().all(|&v| v == 77));
+    fn spec_wide_filter_weights_sum_to_their_rounding_shift() {
+        for row in WIDE_FILTER8_WEIGHTS {
+            assert_eq!(row.iter().sum::<i32>(), 1 << WIDE_FILTER8_SHIFT);
+        }
+        for row in WIDE_FILTER14_WEIGHTS {
+            assert_eq!(row.iter().sum::<i32>(), 1 << WIDE_FILTER14_SHIFT);
+        }
+    }
+
+    #[test]
+    fn spec_wide_filter_weights_are_symmetric() {
+        // §7.14.6.3/§7.14.6.4 are mirror-symmetric about the edge: the row
+        // producing q_k is the p_k row read right-to-left.
+        for (i, row) in WIDE_FILTER8_WEIGHTS.iter().enumerate() {
+            let mirrored = WIDE_FILTER8_WEIGHTS[5 - i];
+            assert!(row.iter().rev().eq(mirrored.iter()));
+        }
+        for (i, row) in WIDE_FILTER14_WEIGHTS.iter().enumerate() {
+            let mirrored = WIDE_FILTER14_WEIGHTS[11 - i];
+            assert!(row.iter().rev().eq(mirrored.iter()));
+        }
+    }
+
+    #[test]
+    fn spec_wide_filters_leave_flat_input_unchanged() {
+        assert_eq!(filter14(&[50i32; 14]), [50i32; 12]);
+        assert_eq!(filter8(&[77i32; 8]), [77i32; 6]);
+    }
+
+    #[test]
+    fn spec_wide_filters_match_reference_step_edge_vectors() {
+        // Spec-derived vectors, computed by hand from the §7.14.6.3 and
+        // §7.14.6.4 weighted sums for a unit step across the edge
+        // (all p = 0, all q = 16, Round2 of the q-side weight sum). These
+        // are independent of this module's own implementation: for a step
+        // input, output k is 16 * (sum of the q-side weights of row k) >>
+        // shift, and the q-side weight sums come straight from the spec's
+        // tap lists.
+        let mut taps8 = [0i32; 8];
+        taps8[4..].fill(16);
+        // q-side weight sums per §7.14.6.3 row: 1, 2, 3, 5, 6, 7 out of 8.
+        assert_eq!(filter8(&taps8), [2, 4, 6, 10, 12, 14]);
+
+        let mut taps14 = [0i32; 14];
+        taps14[7..].fill(16);
+        // q-side weight sums per §7.14.6.4 row: 1, 2, 3, 4, 5, 7,
+        // 9, 11, 12, 13, 14, 15 out of 16.
+        assert_eq!(filter14(&taps14), [1, 2, 3, 4, 5, 7, 9, 11, 12, 13, 14, 15]);
+    }
+
+    #[test]
+    fn spec_filter8_matches_reference_ramp_vector() {
+        // p3..q3 = 10, 20, 30, 40, 50, 60, 70, 80. Each output is the
+        // §7.14.6.3 weighted sum rounded with Round2(_, 3):
+        //   p2' = 3*10 + 2*20 + 30 + 40 + 50 = 190 -> (190 + 4) >> 3 = 24
+        //   p1' = 2*10 + 20 + 2*30 + 40 + 50 + 60 = 250 -> 31
+        //   p0' = 10 + 20 + 30 + 2*40 + 50 + 60 + 70 = 320 -> 40
+        //   q0' = 20 + 30 + 40 + 2*50 + 60 + 70 + 80 = 400 -> 50
+        //   q1' = 30 + 40 + 50 + 2*60 + 70 + 2*80 = 470 -> 59
+        //   q2' = 40 + 50 + 60 + 2*70 + 3*80 = 530 -> 66
+        let taps = [10, 20, 30, 40, 50, 60, 70, 80];
+        assert_eq!(filter8(&taps), [24, 31, 40, 50, 59, 66]);
     }
 
     #[test]
