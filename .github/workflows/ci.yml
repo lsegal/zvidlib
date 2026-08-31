@@ -36,6 +36,11 @@ jobs:
         run: cargo check --all-targets --features native
       - name: Lint native target
         run: cargo clippy --all-targets --features native -- -D warnings
+      # The checks above only cover files some target actually compiles, so an
+      # undeclared file under benches/ passes them by being skipped. This asserts
+      # every one of them is reachable from a [[bench]] target.
+      - name: Check every bench source is compiled
+        run: cargo test --features native --test bench_sources_compile
       - name: Test AV1 SIMD kernels against the scalar path
         run: cargo test --features native --lib av1_simd -- --nocapture
       - name: Test library units
@@ -89,22 +94,26 @@ jobs:
         run: rustup show
       - name: Install native audio dependencies
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      # Every `[[bench]]` target, not one of them: the suite is seven targets
+      # (`codec`, `av1_decode`, `av1_encode`, `hevc_decode`, `hevc_encode`,
+      # `audio_decode`, `audio_mux`) and naming one would let the other six rot
+      # unnoticed, which is the exact failure this step exists to catch.
       - name: Compile the benchmark suite
-        run: cargo bench --features native --bench codec --no-run
+        run: cargo bench --features native --benches --no-run
 
       - name: Run the benchmarks
         if: github.event_name != 'pull_request'
         env:
-          # The per-ISA HEVC group is the one that proves the crate-wide SIMD
-          # override reaches the HEVC kernels, and it decodes the bundled 1080p
-          # sample. It is opt-in because it is slow, which matters in an edit
-          # loop and not here.
+          # The whole-frame 1080p groups are the ones that prove the
+          # crate-wide SIMD override reaches the HEVC kernels on real decode
+          # work. They are opt-in because they are slow, which matters in an
+          # edit loop and not here.
           ZVIDLIB_BENCH_LARGE: '1'
         # `tee` would otherwise swallow a panicking benchmark's exit status;
         # Actions runs `run:` under `bash -e` without pipefail.
         run: |
           set -o pipefail
-          cargo bench --features native --bench codec 2>&1 | tee bench.log
+          cargo bench --features native --benches 2>&1 | tee bench.log
 
       # `bench_across_isas` runs one arm per entry in `zvidlib::simd::available()`,
       # so a runner without AVX2 has no `avx2` arm rather than reporting scalar
@@ -118,8 +127,8 @@ jobs:
             echo '## Benchmark host'
             echo
             echo '```'
-            grep -E '^# (host instruction sets|widest detected|dispatch site)' bench.log || \
-              echo 'no instruction-set log found in the benchmark output'
+            grep -hE '^# (host instruction sets|widest detected|dispatch site)' bench.log \
+              | sort -u || echo 'no instruction-set log found in the benchmark output'
             echo '```'
             echo
           } >> "$GITHUB_STEP_SUMMARY"

@@ -1,5 +1,12 @@
 //! Native HEVC/H.265 decoding with platform acceleration and a dependency-free software fallback.
 
+// internal — exposed for the criterion benchmark suite; not part of the stable API
+#[doc(hidden)]
+pub mod bench;
+pub mod decode_bench;
+// internal — exposed for the stage-attribution example; not part of the stable API
+#[doc(hidden)]
+pub use engine::profile as decode_profile;
 mod encoder;
 pub(crate) mod engine;
 #[cfg(all(any(windows, target_os = "linux"), target_pointer_width = "64"))]
@@ -422,11 +429,15 @@ impl VideoDecoder for HevcDecoder {
     }
 }
 
+/// Issue #189 stage attribution: colour conversion is not decoding, but it is
+/// on the path every whole-frame measurement takes, so it is reported as its
+/// own stage rather than left in the unattributed remainder.
 fn picture_to_rgba(
     picture: &Picture,
     configuration: &VideoDecoderConfig,
     limits: &Limits,
 ) -> Result<VideoFrame> {
+    let _profile = engine::profile::scope(engine::profile::Stage::ColorConvert);
     if picture.chroma_array_type() != 1
         || picture.bit_depth_luma() != 8
         || picture.bit_depth_chroma() != 8
