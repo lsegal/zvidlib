@@ -60,10 +60,9 @@ mod support;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
-use zvidlib::hevc_decoder_bench::{HevcStageInputs, decode_pictures};
+use zvidlib::hevc_decoder_bench::{HevcStageInputs, decode_frames, decode_pictures};
 use zvidlib::{
-    CancellationToken, ExactFrameReader, FrameDigest, FrameIndex, Limits, VideoDecoderFactory,
-    native_hevc_video_decoder_factory,
+    CancellationToken, ExactFrameReader, FrameIndex, Limits, native_hevc_video_decoder_factory,
 };
 
 use support::isa::{IsaWorkload, bench_across_isas};
@@ -152,8 +151,14 @@ fn hevc_decode_1080p(criterion: &mut Criterion) {
 /// The bundled 1080p HEVC sample decoded through zvidlib's own software
 /// decoder, once per instruction set.
 ///
-/// This is the group the issue's "the switch actually reaches the HEVC kernels"
-/// requirement rides on. Whether it shows a *timing* difference is host- and
+/// This is the round trip an application pays per frame: decode plus the
+/// `picture_to_rgba` output conversion, which issue #189's attribution put at a
+/// third of it. [`hevc_decode_to_picture_by_isa`] is the same decode without
+/// that tail, and is the group to read a decode ratio off; this one is kept
+/// because the round-trip cost is real.
+///
+/// It is also the group the issue's "the switch actually reaches the HEVC
+/// kernels" requirement rides on. Whether it shows a *timing* difference is host- and
 /// kernel-dependent — it comes out near parity on Apple Silicon, where LLVM
 /// auto-vectorizes the scalar reference well under `lto = "fat"` — so
 /// `bench_across_isas` asserts the override landed rather than inferring it
@@ -165,7 +170,6 @@ fn hevc_decode_by_isa(criterion: &mut Criterion) {
         return;
     }
     let sample = support::bundled_hevc_sample();
-    let factory = native_hevc_video_decoder_factory();
     let workload = IsaWorkload {
         measurement_time: std::time::Duration::from_secs(10),
         ..IsaWorkload::new(
@@ -174,32 +178,12 @@ fn hevc_decode_by_isa(criterion: &mut Criterion) {
         )
     };
     bench_across_isas(criterion, &workload, || {
-        let mut decoder = factory
-            .create(&sample.configuration, &Limits::default())
-            .expect("the software HEVC decoder is constructible");
-        let cancellation = CancellationToken::new();
-        let mut digests = Vec::new();
-        for encoded in &sample.samples {
-            for decoded in decoder
-                .submit(encoded, &cancellation)
-                .expect("the bundled sample decodes")
-            {
-                digests.extend_from_slice(
-                    FrameDigest::from_frame(&decoded.frame)
-                        .expect("a decoded frame digests")
-                        .to_hex()
-                        .as_bytes(),
-                );
-            }
-            if digests.len() as u64 >= ISA_HEVC_FRAMES * 64 {
-                break;
-            }
-        }
-        assert!(
-            digests.len() as u64 >= ISA_HEVC_FRAMES * 64,
-            "the bundled sample yields at least {ISA_HEVC_FRAMES} decoded frames"
-        );
-        digests
+        decode_frames(
+            &sample.configuration,
+            &sample.samples,
+            &Limits::default(),
+            ISA_HEVC_FRAMES,
+        )
     });
 }
 

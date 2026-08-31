@@ -31,7 +31,7 @@ use super::engine::{BitReader, CabacEngine, ContextModel};
 use super::{HevcDecoder, ParsedConfiguration, picture_to_rgba};
 use crate::{
     CancellationToken, Codec, CodecProfile, ColorRange, EncodedVideoSample, HardwarePreference,
-    Limits, PixelFormat, VideoDecoderConfig, VideoDimensions,
+    Limits, PixelFormat, VideoDecoder, VideoDecoderConfig, VideoDimensions,
 };
 
 /// Luma side of one inter-prediction block.
@@ -646,13 +646,73 @@ fn convert_config(width: usize, height: usize) -> VideoDecoderConfig {
 /// is the conversion and nothing else about how the bitstream is handled.
 ///
 /// Returns a fold over every decoded sample, for the harness's bit-exactness
-/// guard. Pins no instruction set; the caller selects the arm through
+/// guard — the same fold [`decode_frames`] applies to the converted bytes, so
+/// neither group pays for identifying its output more than the other does. Pins no instruction set; the caller selects the arm through
 /// [`crate::simd::set_override`] exactly as for an end-to-end decode.
 ///
 /// # Panics
 /// Panics if the configuration is not decodable or if `samples` does not yield
 /// `frames` frames — a benchmark measuring less work than it reports would be
 /// worse than a failure.
+/// Decodes `frames` frames of `samples` all the way out to RGBA.
+///
+/// The end-to-end half of the issue #220 split, and the counterpart to
+/// [`decode_pictures`]: same decoder, same access units, same frame count, same
+/// output fold — the only difference is the [`picture_to_rgba`] pass on each
+/// decoded picture, which is what makes the gap between the two groups the
+/// conversion rather than an artefact of how each arm identifies its output.
+///
+/// # Panics
+/// Panics under the same conditions as [`decode_pictures`].
+#[must_use]
+pub fn decode_frames(
+    configuration: &VideoDecoderConfig,
+    samples: &[EncodedVideoSample],
+    limits: &Limits,
+    frames: u64,
+) -> Vec<u8> {
+    let mut decoder = bench_decoder(configuration, limits);
+    let cancellation = CancellationToken::new();
+    let mut digest = Digest::new();
+    let mut decoded = 0_u64;
+    for sample in samples {
+        for frame in decoder
+            .submit(sample, &cancellation)
+            .expect("the sample decodes")
+        {
+            for plane in &frame.frame.planes {
+                digest.push_bytes(&plane.data);
+            }
+            decoded += 1;
+        }
+        if decoded >= frames {
+            break;
+        }
+    }
+    assert_frame_count(decoded, frames);
+    digest.finish()
+}
+
+/// The software decoder the whole-frame benchmark surface drives.
+///
+/// # Panics
+/// Panics if the configuration is not decodable.
+fn bench_decoder(configuration: &VideoDecoderConfig, limits: &Limits) -> HevcDecoder {
+    let parsed = ParsedConfiguration::parse(configuration, limits)
+        .expect("the sample's configuration record parses");
+    HevcDecoder::new(configuration.clone(), *limits, parsed)
+        .expect("the software HEVC decoder is constructible")
+}
+
+/// A benchmark measuring less work than it reports would be worse than a
+/// failure.
+fn assert_frame_count(decoded: u64, frames: u64) {
+    assert!(
+        decoded >= frames,
+        "the sample yielded {decoded} decoded pictures, not the {frames} the group reports"
+    );
+}
+
 #[must_use]
 pub fn decode_pictures(
     configuration: &VideoDecoderConfig,
@@ -660,10 +720,7 @@ pub fn decode_pictures(
     limits: &Limits,
     frames: u64,
 ) -> Vec<u8> {
-    let parsed = ParsedConfiguration::parse(configuration, limits)
-        .expect("the sample's configuration record parses");
-    let mut decoder = HevcDecoder::new(configuration.clone(), *limits, parsed)
-        .expect("the software HEVC decoder is constructible");
+    let mut decoder = bench_decoder(configuration, limits);
     let cancellation = CancellationToken::new();
     let mut digest = Digest::new();
     let mut decoded = 0_u64;
@@ -681,17 +738,13 @@ pub fn decode_pictures(
             break;
         }
     }
-    assert!(
-        decoded >= frames,
-        "the sample yielded {decoded} decoded pictures, not the {frames} the group reports"
-    );
+    assert_frame_count(decoded, frames);
     digest.finish()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::VideoDecoder;
     use crate::simd::{self, SimdIsa};
 
     /// A frame small enough to build and run quickly, but still a whole number
@@ -867,6 +920,21 @@ mod tests {
         assert_eq!(one, decode_pictures(&configuration, &samples, &limits, 1));
         assert_ne!(one, decode_pictures(&configuration, &samples, &limits, 2));
         assert_ne!(one, Digest::new().finish());
+    }
+
+    /// The two whole-frame surfaces have to decode the same frames, so the
+    /// interval between them is the conversion and not a different workload.
+    #[test]
+    fn the_two_whole_frame_paths_fold_the_same_number_of_frames() {
+        let (configuration, samples) = pcm_stream();
+        let limits = Limits::default();
+        let frames = decode_frames(&configuration, &samples, &limits, 2);
+        assert_eq!(frames, decode_frames(&configuration, &samples, &limits, 2));
+        assert_ne!(
+            frames,
+            decode_pictures(&configuration, &samples, &limits, 2)
+        );
+        assert_ne!(frames, Digest::new().finish());
     }
 
     /// The conversion stage folds a real converted frame, and folds a

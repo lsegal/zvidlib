@@ -227,11 +227,14 @@ group to read a decode ratio off. `hevc_decode` stays because the round trip is
 what an application actually pays, and dropping it would trade one misleading
 number for another.
 
-The two are not a subtraction. Each carries its own output fold for the
-bit-exactness guard — `FrameDigest` over RGBA in one, an FNV fold over the
-picture's planes in the other — so the gap between them is the conversion plus a
-digest difference. `hevc_color_convert` below times the conversion itself, which
-is the number to use.
+Both arms fold their output with the same cheap FNV step for the bit-exactness
+guard — over the RGBA bytes in one case and the picture's planes in the other —
+so the gap between the groups is the conversion and not an artefact of how each
+identifies its result. (`hevc_decode` previously took a `FrameDigest` per frame
+inside the timed loop; SHA-256 over an 8 MB frame cost more than the decode it
+was measuring, which inflated the group and buried the conversion it was meant
+to expose.) `hevc_color_convert` below still times the conversion directly, and
+that is the number to quote for it.
 
 `hevc_decode_1080p` reports both intervals the same way:
 `sequential_from_keyframe` goes through `ExactFrameReader` out to RGBA, and
