@@ -290,6 +290,31 @@ mod x86 {
             unsafe { Self(_mm_slli_epi32::<N>(self.0)) }
         }
         #[inline(always)]
+        unsafe fn load_u32_rows(src: &[u8], base: usize, stride: usize) -> Self {
+            unsafe {
+                let word = |lane: usize| {
+                    let at = base + lane * stride;
+                    i32::from_le_bytes([src[at], src[at + 1], src[at + 2], src[at + 3]])
+                };
+                Self(_mm_set_epi32(word(3), word(2), word(1), word(0)))
+            }
+        }
+        #[inline(always)]
+        unsafe fn store_u32_rows(self, dst: &mut [u8], base: usize, stride: usize) {
+            unsafe {
+                let words = [
+                    _mm_extract_epi32::<0>(self.0) as u32,
+                    _mm_extract_epi32::<1>(self.0) as u32,
+                    _mm_extract_epi32::<2>(self.0) as u32,
+                    _mm_extract_epi32::<3>(self.0) as u32,
+                ];
+                for (lane, word) in words.into_iter().enumerate() {
+                    let at = base + lane * stride;
+                    dst[at..at + 4].copy_from_slice(&word.to_le_bytes());
+                }
+            }
+        }
+        #[inline(always)]
         unsafe fn store_u8_clamped(self, dst: &mut [u8]) {
             unsafe {
                 // `packus_epi16` reads its inputs as *signed* 16-bit, so the
@@ -421,6 +446,39 @@ mod x86 {
         #[inline(always)]
         unsafe fn sll<const N: i32>(self) -> Self {
             unsafe { Self(_mm256_slli_epi32::<N>(self.0)) }
+        }
+        #[inline(always)]
+        unsafe fn load_u32_rows(src: &[u8], base: usize, stride: usize) -> Self {
+            unsafe {
+                let word = |lane: usize| {
+                    let at = base + lane * stride;
+                    i32::from_le_bytes([src[at], src[at + 1], src[at + 2], src[at + 3]])
+                };
+                let lo = _mm_set_epi32(word(3), word(2), word(1), word(0));
+                let hi = _mm_set_epi32(word(7), word(6), word(5), word(4));
+                Self(_mm256_set_m128i(hi, lo))
+            }
+        }
+        #[inline(always)]
+        unsafe fn store_u32_rows(self, dst: &mut [u8], base: usize, stride: usize) {
+            unsafe {
+                let halves = [
+                    _mm256_castsi256_si128(self.0),
+                    _mm256_extracti128_si256::<1>(self.0),
+                ];
+                for (half, lanes) in halves.into_iter().enumerate() {
+                    let words = [
+                        _mm_extract_epi32::<0>(lanes) as u32,
+                        _mm_extract_epi32::<1>(lanes) as u32,
+                        _mm_extract_epi32::<2>(lanes) as u32,
+                        _mm_extract_epi32::<3>(lanes) as u32,
+                    ];
+                    for (lane, word) in words.into_iter().enumerate() {
+                        let at = base + (half * 4 + lane) * stride;
+                        dst[at..at + 4].copy_from_slice(&word.to_le_bytes());
+                    }
+                }
+            }
         }
         #[inline(always)]
         unsafe fn store_u8_clamped(self, dst: &mut [u8]) {
@@ -565,6 +623,36 @@ mod arm {
         #[inline(always)]
         unsafe fn sll<const N: i32>(self) -> Self {
             unsafe { Self(vshlq_n_s32::<N>(self.0)) }
+        }
+        #[inline(always)]
+        unsafe fn load_u32_rows(src: &[u8], base: usize, stride: usize) -> Self {
+            unsafe {
+                let word = |lane: usize| {
+                    let at = base + lane * stride;
+                    u32::from_le_bytes([src[at], src[at + 1], src[at + 2], src[at + 3]])
+                };
+                let words = vdupq_n_u32(word(0));
+                let words = vsetq_lane_u32::<1>(word(1), words);
+                let words = vsetq_lane_u32::<2>(word(2), words);
+                let words = vsetq_lane_u32::<3>(word(3), words);
+                Self(vreinterpretq_s32_u32(words))
+            }
+        }
+        #[inline(always)]
+        unsafe fn store_u32_rows(self, dst: &mut [u8], base: usize, stride: usize) {
+            unsafe {
+                let lanes = vreinterpretq_u32_s32(self.0);
+                let words = [
+                    vgetq_lane_u32::<0>(lanes),
+                    vgetq_lane_u32::<1>(lanes),
+                    vgetq_lane_u32::<2>(lanes),
+                    vgetq_lane_u32::<3>(lanes),
+                ];
+                for (lane, word) in words.into_iter().enumerate() {
+                    let at = base + lane * stride;
+                    dst[at..at + 4].copy_from_slice(&word.to_le_bytes());
+                }
+            }
         }
         #[inline(always)]
         unsafe fn store_u8_clamped(self, dst: &mut [u8]) {

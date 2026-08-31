@@ -542,7 +542,19 @@ fn deblocking_at_frame_borders_matches_the_scalar_reference() {
     // Planes small enough that every edge position's filter window leaves the
     // plane on at least one side, and whose dimensions are not a multiple of
     // any lane count, so every run is a partial one.
-    for (width, height) in [(5usize, 5usize), (9, 3), (3, 9), (6, 13), (17, 6)] {
+    // `(9, 8)` and `(17, 12)` additionally give the vertical edges a whole
+    // final chunk whose last lane is the plane's last row, which is the
+    // narrow kernel's unclamped row-word path running right up against the
+    // end of the sample buffer.
+    for (width, height) in [
+        (5usize, 5usize),
+        (9, 3),
+        (3, 9),
+        (6, 13),
+        (17, 6),
+        (9, 8),
+        (17, 12),
+    ] {
         for tx in [false, true] {
             let grid = tx.then(|| mixed_tx_grid(width, height));
             let results = for_each_isa(|_| {
@@ -639,4 +651,132 @@ fn unsupported_override_falls_back_to_scalar() {
     }
     set_active_isa(None);
     assert_eq!(active_isa(), detected_isa());
+}
+
+// ---------------------------------------------------------------------
+// Vector primitives
+// ---------------------------------------------------------------------
+
+/// Lane values for the packed-store checks, chosen so each vector width sees
+/// negatives, both ends of `0..=255`, and magnitudes that a saturating
+/// 32 -> 16 -> 8 bit pack chain would mishandle if it dropped the range clamp
+/// (65536 saturates to `0xffff`, which reads back as a *negative* 16-bit lane).
+const PACK_CASES: [[i32; MAX_LANES]; 3] = [
+    [-300, -1, 0, 1, 128, 254, 255, 400],
+    [255, 256, 65535, 65536, -1, 70000, 42, 0],
+    [i32::MIN, i32::MAX, 0, 255, 1, 200, -70000, 65536],
+];
+
+/// Checks the byte-packing store and the row-word load/store pair the narrow
+/// deblocking kernels use against straightforward scalar equivalents.
+///
+/// # Safety
+/// `V`'s instruction set must be available on this host.
+unsafe fn check_vector_byte_paths<V: vector::I32x>() {
+    unsafe {
+        for case in PACK_CASES {
+            let value = V::load(&case);
+
+            // `store_u8_clamped` must equal a per-lane `clamp(0, 255)`.
+            let mut packed = [0u8; MAX_LANES];
+            value.store_u8_clamped(&mut packed);
+            for (lane, &input) in case.iter().enumerate().take(V::LANES) {
+                assert_eq!(
+                    packed[lane],
+                    input.clamp(0, 255) as u8,
+                    "store_u8_clamped lane {lane} of {case:?}"
+                );
+            }
+
+            // ... and so must every partial count, which takes the staged path.
+            for count in 0..=V::LANES {
+                let mut masked = [0xaau8; MAX_LANES];
+                value.store_u8_clamped_masked(&mut masked, count);
+                for (lane, &input) in case.iter().enumerate().take(V::LANES) {
+                    let expected = if lane < count {
+                        input.clamp(0, 255) as u8
+                    } else {
+                        0xaa
+                    };
+                    assert_eq!(masked[lane], expected, "masked store lane {lane}, {count} of {case:?}");
+                }
+            }
+        }
+
+        // Row words: `LANES` rows of `stride` bytes, four of which per row are
+        // the window the narrow vertical-edge filter reads and writes.
+        const STRIDE: usize = 11;
+        const BASE: usize = 3;
+        let mut buffer: Vec<u8> = (0..STRIDE * MAX_LANES).map(|i| (i * 7 + 1) as u8).collect();
+        let original = buffer.clone();
+
+        let loaded = V::load_u32_rows(&buffer, BASE, STRIDE);
+        let mut lanes = [0i32; MAX_LANES];
+        loaded.store(&mut lanes);
+        for (lane, &word) in lanes.iter().enumerate().take(V::LANES) {
+            let at = BASE + lane * STRIDE;
+            let expected = i32::from_le_bytes([
+                buffer[at],
+                buffer[at + 1],
+                buffer[at + 2],
+                buffer[at + 3],
+            ]);
+            assert_eq!(word, expected, "load_u32_rows lane {lane}");
+        }
+
+        // Storing the loaded words back is the identity, and storing something
+        // else touches exactly the four bytes of each row's window.
+        loaded.store_u32_rows(&mut buffer, BASE, STRIDE);
+        assert_eq!(buffer, original, "store_u32_rows should round-trip");
+
+        let replacement = V::splat(0x0403_0201);
+        replacement.store_u32_rows(&mut buffer, BASE, STRIDE);
+        for index in 0..buffer.len() {
+            let lane = index.checked_sub(BASE).map(|offset| offset / STRIDE);
+            let column = index.wrapping_sub(BASE) % STRIDE;
+            let inside =
+                index >= BASE && column < 4 && lane.is_some_and(|lane| lane < V::LANES);
+            let expected = if inside {
+                (column + 1) as u8
+            } else {
+                original[index]
+            };
+            assert_eq!(buffer[index], expected, "store_u32_rows byte {index}");
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn neon_byte_paths_match_the_scalar_reference() {
+    if !std::arch::is_aarch64_feature_detected!("neon") {
+        return;
+    }
+    unsafe { check_vector_byte_paths::<vector::Neon>() };
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn sse41_byte_paths_match_the_scalar_reference() {
+    #[target_feature(enable = "sse4.1")]
+    unsafe fn run() {
+        unsafe { check_vector_byte_paths::<vector::Sse4>() };
+    }
+    if !std::arch::is_x86_feature_detected!("sse4.1") {
+        return;
+    }
+    unsafe { run() };
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn avx2_byte_paths_match_the_scalar_reference() {
+    #[target_feature(enable = "avx2")]
+    unsafe fn run() {
+        unsafe { check_vector_byte_paths::<vector::Avx2>() };
+    }
+    if !std::arch::is_x86_feature_detected!("avx2") {
+        return;
+    }
+    unsafe { run() };
 }
