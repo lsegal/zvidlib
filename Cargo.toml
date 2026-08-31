@@ -21,8 +21,23 @@ required-features = ["native"]
 # `cargo test --features native --example native_gl` run them.
 test = true
 
+# Criterion drives its own harness (`harness = false`), so the bench target must
+# not link libtest. The whole benchmark suite lives in one target so the shared
+# `benches/support/` fixture cache is loaded and decoded once per process.
+[[bench]]
+name = "codec"
+path = "benches/codec.rs"
+harness = false
+
 [features]
 default = []
+# Additive, off by default. The crate's SIMD kernels dispatch at run time rather
+# than at compile time, so this feature intentionally gates no code today: it is
+# the switch the per-codec benchmark tickets code against, and the benchmark
+# harness folds `cfg!(feature = "simd")` into every criterion group name
+# (`hevc_decode/simd=off` vs `hevc_decode/simd=on`) so the two arms are
+# separately recorded and comparable.
+simd = []
 native = []
 web = [
     "dep:js-sys",
@@ -59,6 +74,7 @@ web-sys = { version = "0.3.104", optional = true, features = [
 wasm-bindgen-test = "0.3.77"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+criterion = { version = "0.7", features = ["html_reports"] }
 glow = "0.18.0"
 glutin = "0.32.3"
 glutin-winit = "0.5.0"
@@ -100,5 +116,13 @@ opt-level = 2
 # for the many small hot per-sample/per-block functions in the decode path
 # (measured ~2.7 -> ~3.7 fps, +37%, decoding the bundled 1080p sample).
 [profile.release]
+lto = "fat"
+codegen-units = 1
+
+# Cargo's `bench` profile only inherits `release`'s *defaults*, not the settings
+# above, so benchmark numbers would otherwise be measured without the whole-crate
+# optimization shipped builds get. Repeat them here so `cargo bench` measures the
+# same code generation as `--release`.
+[profile.bench]
 lto = "fat"
 codegen-units = 1
