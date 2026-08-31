@@ -28,6 +28,7 @@ use crate::hevc::engine::dpb::{DpbEntry, RefPicLists};
 use crate::hevc::engine::inter_pred::{PuWeights, WpListWeights};
 use crate::hevc::engine::motion::{MotionField, derive_chroma_mv};
 use crate::hevc::engine::picture::{Picture, sub_wh_c};
+use crate::hevc::engine::profile::{Stage as ProfStage, scope as prof_scope};
 use crate::hevc::engine::pu_mv::{InterCuDesc, PuMotion, PuMvContext, PuRect, resolve_cu_motion};
 use crate::hevc::engine::recon::{
     CuResidual, ReconError, ReconParams, ResolvedList, extract_cu_residual,
@@ -356,8 +357,7 @@ pub fn resolve_and_reconstruct_inter_cu(
     // pointer-chasing over the neighbour motion field rather than arithmetic
     // over sample arrays, so it is its own stage and not part of `inter_pred`.
     let motions = {
-        let _profile =
-            crate::hevc::engine::profile::scope(crate::hevc::engine::profile::Stage::MotionDerive);
+        let _profile = prof_scope(ProfStage::MotionDerive);
         resolve_cu_motion(field, desc, pus, ctx, available)
     };
     let rects = crate::hevc::engine::pu_mv::pu_partitions(
@@ -713,8 +713,7 @@ pub fn reconstruct_inter_picture(
     if slice.deblock_enabled {
         // Issue #189 stage attribution: one scope per picture, since the
         // in-loop filters run as whole-picture passes rather than per block.
-        let _profile =
-            crate::hevc::engine::profile::scope(crate::hevc::engine::profile::Stage::Deblock);
+        let _profile = prof_scope(ProfStage::Deblock);
         let qp_map = ctx
             .qp_cells()
             .map(|(cells, w_cells)| crate::hevc::engine::deblock::QpMap { cells, w_cells });
@@ -768,8 +767,7 @@ pub fn reconstruct_inter_picture(
                 .collect(),
         ),
     };
-    let _sao_profile =
-        crate::hevc::engine::profile::scope(crate::hevc::engine::profile::Stage::Sao);
+    let _sao_profile = prof_scope(ProfStage::Sao);
     let filtered = crate::hevc::engine::sao::apply_sao_picture_full(
         pic,
         &sao_grid,

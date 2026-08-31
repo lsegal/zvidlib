@@ -44,6 +44,7 @@ use crate::hevc::engine::binarization::{
 use crate::hevc::engine::cabac::CabacEngine;
 use crate::hevc::engine::ctx_init::SliceContexts;
 use crate::hevc::engine::intra_mode_field::{IntraModeField, Neighbour};
+use crate::hevc::engine::profile::{Stage as ProfStage, scope as prof_scope};
 use crate::hevc::engine::residual::ResidualCodingError;
 use crate::hevc::engine::transform_tree::{
     TransformTree, TransformTreeParams, decode_transform_tree,
@@ -1496,8 +1497,7 @@ pub fn decode_coding_tree_unit_in_picture(
     // Issue #189 stage attribution: one scope per CTU covers the whole
     // §7.3.8 syntax walk. The §7.3.8.11 residual scope nests inside it, so
     // what is left here is the non-coefficient CABAC decode.
-    let _profile =
-        crate::hevc::engine::profile::scope(crate::hevc::engine::profile::Stage::SliceData);
+    let _profile = prof_scope(ProfStage::SliceData);
     let mut qg = QuantGroupState::default();
     state.begin_ctu(x_ctb, y_ctb, slice_addr_rs, tile_id);
 

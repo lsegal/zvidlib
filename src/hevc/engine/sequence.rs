@@ -30,6 +30,7 @@ use crate::hevc::engine::nal::{NalError, NalIter, NalUnit};
 use crate::hevc::engine::picture::Picture;
 use crate::hevc::engine::poc::NalKind;
 use crate::hevc::engine::pps::{PicParameterSet, PpsError};
+use crate::hevc::engine::profile::{Stage as ProfStage, scope as prof_scope};
 use crate::hevc::engine::recon::{ReconError, ReconParams};
 use crate::hevc::engine::residual::ResidualCodingError;
 use crate::hevc::engine::slice::{
@@ -205,9 +206,7 @@ impl SequenceDecoder {
             let unit = {
                 // Issue #189 stage attribution: start-code scan and §7.3.1.1
                 // emulation-prevention unescaping.
-                let _profile = crate::hevc::engine::profile::scope(
-                    crate::hevc::engine::profile::Stage::HeaderParse,
-                );
+                let _profile = prof_scope(ProfStage::HeaderParse);
                 unit?
             };
             self.push_nal_unit(unit)?;
@@ -233,9 +232,7 @@ impl SequenceDecoder {
                 self.finish_picture()?;
             }
             // Issue #189 stage attribution: §7.3.6 slice segment header.
-            let _profile = crate::hevc::engine::profile::scope(
-                crate::hevc::engine::profile::Stage::HeaderParse,
-            );
+            let _profile = prof_scope(ProfStage::HeaderParse);
             let pps_id = peek_slice_pps_id(&rbsp, header.nal_unit_type)?;
             let pps = self
                 .pps
@@ -281,9 +278,7 @@ impl SequenceDecoder {
                 if header.nuh_layer_id == 0 {
                     self.finish_picture()?;
                 }
-                let _profile = crate::hevc::engine::profile::scope(
-                    crate::hevc::engine::profile::Stage::HeaderParse,
-                );
+                let _profile = prof_scope(ProfStage::HeaderParse);
                 let sps = SeqParameterSet::parse(&rbsp)?;
                 self.sps.insert(sps.sps_id, sps);
             }
@@ -291,9 +286,7 @@ impl SequenceDecoder {
                 if header.nuh_layer_id == 0 {
                     self.finish_picture()?;
                 }
-                let _profile = crate::hevc::engine::profile::scope(
-                    crate::hevc::engine::profile::Stage::HeaderParse,
-                );
+                let _profile = prof_scope(ProfStage::HeaderParse);
                 let pps = PicParameterSet::parse(&rbsp)?;
                 self.pps.insert(pps.pps_id, pps);
             }
@@ -453,8 +446,7 @@ impl SequenceDecoder {
             // Issue #189 stage attribution: the §8.3.1-§8.3.5 per-picture
             // reference derivation, which is DPB bookkeeping rather than
             // sample work.
-            let _profile =
-                crate::hevc::engine::profile::scope(crate::hevc::engine::profile::Stage::DpbOutput);
+            let _profile = prof_scope(ProfStage::DpbOutput);
             self.state.begin_picture(&header_info, &slice_ref)
         };
         let lists = ref_state.ref_pic_lists.clone().unwrap_or(RefPicLists {
@@ -531,8 +523,7 @@ impl SequenceDecoder {
         let poc = ref_state.poc;
         // The picture clone into the output queue and the §8.3.2 DPB insertion
         // are both output-side handling, charged together.
-        let _profile =
-            crate::hevc::engine::profile::scope(crate::hevc::engine::profile::Stage::DpbOutput);
+        let _profile = prof_scope(ProfStage::DpbOutput);
         self.frames.push(DecodedFrame {
             cvs_index: self.cvs_index,
             poc: poc.val,
