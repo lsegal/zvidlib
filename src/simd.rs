@@ -113,6 +113,7 @@ pub fn available() -> Vec<SimdIsa> {
 /// | `hevc_prediction_filters` | HEVC inter/intra prediction and in-loop filters |
 /// | `hevc_transforms` | HEVC inverse transforms and dequantization |
 /// | `hevc_rdcost` | HEVC encoder-side distortion metrics |
+/// | `hevc_recon` | HEVC encoder-side reconstruction and SAO parameter search |
 ///
 /// The `hevc_*` sites are absent on `wasm32`, which does not build the HEVC
 /// engine.
@@ -129,7 +130,7 @@ pub fn active_by_site() -> Vec<(&'static str, SimdIsa)> {
     ];
     #[cfg(not(target_arch = "wasm32"))]
     {
-        use crate::hevc::engine::encoder::rdcost;
+        use crate::hevc::engine::encoder::{rdcost, recon_simd};
         use crate::hevc::engine::{simd as hevc_simd, transform_simd};
         sites.push((
             "hevc_prediction_filters",
@@ -140,6 +141,7 @@ pub fn active_by_site() -> Vec<(&'static str, SimdIsa)> {
             from_hevc_backend(transform_simd::detected()),
         ));
         sites.push(("hevc_rdcost", from_rdcost_isa(rdcost::isa())));
+        sites.push(("hevc_recon", from_recon_isa(recon_simd::isa())));
     }
     sites
 }
@@ -189,6 +191,20 @@ fn from_hevc_backend(backend: crate::hevc::engine::transform_simd::Backend) -> S
         Backend::Sse41 | Backend::Sse42 => SimdIsa::Sse41,
         Backend::Avx2 => SimdIsa::Avx2,
         Backend::Neon => SimdIsa::Neon,
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn from_recon_isa(isa: crate::hevc::engine::encoder::recon_simd::Isa) -> SimdIsa {
+    use crate::hevc::engine::encoder::recon_simd::Isa;
+    match isa {
+        Isa::Scalar => SimdIsa::Scalar,
+        #[cfg(target_arch = "x86_64")]
+        Isa::Sse41 => SimdIsa::Sse41,
+        #[cfg(target_arch = "x86_64")]
+        Isa::Avx2 => SimdIsa::Avx2,
+        #[cfg(target_arch = "aarch64")]
+        Isa::Neon => SimdIsa::Neon,
     }
 }
 
@@ -287,7 +303,7 @@ mod tests {
     fn pinning_scalar_reaches_every_dispatch_site() {
         use crate::av1_intra_pred::{Av1IntraSimd, av1_intra_simd};
         use crate::av1_mc::{McContext, SimdLevel, default_level};
-        use crate::hevc::engine::encoder::rdcost;
+        use crate::hevc::engine::encoder::{rdcost, recon_simd};
         use crate::hevc::engine::{simd as hevc_simd, transform_simd};
 
         let _guard = lock();

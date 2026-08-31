@@ -7,3 +7,4 @@ pub mod pcm;
 pub mod rdcost;
 pub mod rdo;
 pub mod recon;
+pub mod recon_simd;
