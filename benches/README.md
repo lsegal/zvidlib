@@ -170,8 +170,48 @@ regardless of the filter — it is not a criterion benchmark and criterion's
 filter does not reach it — so filtering shortens the *timed* part of a run, not
 all of it.
 
-The per-ISA HEVC group decodes the bundled 1080p sample, so it sits behind the
-same `ZVIDLIB_BENCH_LARGE=1` opt-in as the other 1080p group.
+The whole-frame per-ISA HEVC group (`hevc_decode`) decodes the bundled 1080p
+sample, so it sits behind the same `ZVIDLIB_BENCH_LARGE=1` opt-in as the other
+1080p group.
+
+### The HEVC per-stage groups
+
+`hevc_decode` answers "how fast is a frame". The per-stage groups answer "which
+kernel changed", so a regression can be attributed rather than only observed:
+
+| Group | Stage | Vectorized |
+| --- | --- | --- |
+| `hevc_inter_pred` | §8.5.3.3 8-tap luma interpolation + the weighted combine | yes |
+| `hevc_intra_pred` | §8.4.4.2 reference smoothing, planar / DC / angular | yes |
+| `hevc_deblock` | §8.7.2 luma block-edge deblocking | yes |
+| `hevc_sao` | §8.7.3 sample adaptive offset, band and edge | yes |
+| `hevc_inverse_transform` | §8.6 dequantization + inverse DCT/DST | yes |
+| `hevc_cabac` | §9.3.4 arithmetic bin decoding | no, by design |
+
+They run unconditionally — none of them touches the bundled sample, so none of
+them needs the `ZVIDLIB_BENCH_LARGE=1` opt-in — and each runs once per available
+instruction set under the same bit-exactness and per-site override guards as
+every other per-ISA group.
+
+`hevc_cabac` is in the list precisely because it is *not* vectorized. The
+arithmetic decoder is inherently serial (each bin's range update depends on the
+previous one's), so whatever fraction of a decode it owns is the fraction no
+amount of SIMD elsewhere can remove. Its arms should come out equal; the number
+is meaningful next to the other stages, as the Amdahl ceiling on the whole-frame
+group. Its throughput axis counts bins, so its `Mpx/s` line reads as
+megabins/sec.
+
+The inputs come from `zvidlib::hevc_decoder_bench`, a narrow public surface over
+the otherwise crate-private HEVC engine. Its `HevcStageInputs::new` does all the
+allocation and content generation; only the kernel under test runs inside
+`run_*`. The content deliberately mixes textured and flat regions: the wide
+deblocking filter is gated on the §8.7.2.5.3 flatness check, so a purely
+textured plane would time only the narrow path and under-report the kernel.
+
+Each `run_*` returns an eight-byte FNV-1a fold over every sample the stage
+produced rather than the samples themselves, which keeps a multi-megabyte
+allocation out of the timed loop while still letting the bit-exactness guard
+catch a backend that diverged anywhere.
 
 ### Correctness guard
 
