@@ -28,6 +28,17 @@ const LARGE_GROUP_ENV: &str = "ZVIDLIB_BENCH_LARGE";
 /// The number of 1080p frames the long-running group decodes per iteration.
 const LARGE_GROUP_FRAMES: u64 = 4;
 
+/// Reports the host's architecture, the `simd` arm, and every instruction set
+/// runtime feature detection found, before any group runs.
+///
+/// This is not a benchmark: criterion runs each registered function regardless
+/// of the benchmark-id filter, so the line is always in the output, and CI reads
+/// it to confirm the vector arms it thinks it measured were really available on
+/// that runner.
+fn host_report(_criterion: &mut Criterion) {
+    support::print_host_report();
+}
+
 /// Smoke benchmark: end-to-end proof that fixture loading, decoding, and
 /// throughput reporting all work.
 fn smoke(criterion: &mut Criterion) {
@@ -143,5 +154,5 @@ fn hevc_decode_1080p(criterion: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, smoke, av1_decode, encoder_input, hevc_decode_1080p);
+criterion_group!(benches, host_report, smoke, av1_decode, encoder_input, hevc_decode_1080p);
 criterion_main!(benches);

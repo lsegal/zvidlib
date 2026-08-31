@@ -309,3 +309,37 @@ pub fn synthetic_yuv420_sequence(width: u32, height: u32, frames: usize) -> Vec<
         })
         .collect()
 }
+
+/// The instruction sets this host can actually execute, as `scalar, sse4.1,
+/// avx2`-style names.
+///
+/// The crate's vector kernels are selected by runtime CPU feature detection, so
+/// a benchmark run on a host without AVX2 silently measures the SSE4.1 or
+/// scalar kernel instead. Shared CI runners are exactly that: AVX2 availability
+/// varies by runner generation. Printing what the host offers keeps a scalar
+/// measurement from being read as a vectorized one.
+pub fn available_isas() -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = Vec::new();
+    for isa in zvidlib::av1_simd::available_isas() {
+        if !names.contains(&isa.name()) {
+            names.push(isa.name());
+        }
+    }
+    for level in zvidlib::av1_mc::available_levels() {
+        if !names.contains(&level.name()) {
+            names.push(level.name());
+        }
+    }
+    names
+}
+
+/// Prints the host's instruction sets and the `simd` arm being measured, as a
+/// `#`-prefixed criterion comment line.
+pub fn print_host_report() {
+    println!(
+        "# zvidlib benches: arch {}, simd feature {}, instruction sets available: {}",
+        std::env::consts::ARCH,
+        if simd_enabled() { "on" } else { "off" },
+        available_isas().join(", "),
+    );
+}

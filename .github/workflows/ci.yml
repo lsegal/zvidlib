@@ -8,6 +8,9 @@ on:
   pull_request:
     paths-ignore:
       - '**/*.md'
+  # Timed benchmark runs are otherwise only triggered by a push to main; this
+  # lets one be started by hand against any ref.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -50,6 +53,71 @@ jobs:
         run: wasm-pack build --target web --out-dir pkg --no-default-features --features web
       - name: Test in headless Chrome
         run: wasm-pack test --headless --chrome --no-default-features --features web
+
+  benchmarks:
+    name: Benchmarks
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Reading the previous successful main run's stored baseline artifact.
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: rustup show
+      - name: Install native audio dependencies
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      # Every PR compiles the bench target. Bench code that no longer builds is
+      # the most common way a benchmark suite dies, and this catches it for the
+      # price of a compile.
+      - name: Compile benchmarks
+        run: cargo bench --no-run --features native
+      - name: Compile benchmarks (simd arm)
+        run: cargo bench --no-run --features native,simd
+      # Timings are measured on pushes to main and manual runs only. Shared
+      # runners have a noise floor far above any threshold worth enforcing, so
+      # gating PRs on them would produce false failures until the job was
+      # disabled.
+      - name: Run benchmarks
+        if: github.event_name != 'pull_request'
+        run: |
+          cargo bench --features native --bench codec -- --noplot
+          cargo bench --features native,simd --bench codec -- --noplot
+      - name: Collect estimates
+        if: github.event_name != 'pull_request'
+        run: python3 .github/scripts/bench_delta.py collect --criterion-dir target/criterion --output bench-estimates.json
+      # The previous successful main run's artifact is the baseline. A fresh
+      # runner has no target/criterion tree, so criterion's own change detection
+      # has nothing to compare against without this.
+      - name: Download the previous main baseline
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p previous
+          for run in $(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml \
+              --branch main --event push --status success --limit 10 \
+              --json databaseId --jq '.[].databaseId'); do
+            if gh run download "$run" --repo "$GITHUB_REPOSITORY" -n bench-baseline -D previous 2>/dev/null; then
+              echo "baseline from run $run"
+              break
+            fi
+          done
+          test -f previous/bench-estimates.json || echo "no previous baseline found"
+      - name: Report deltas
+        if: github.event_name != 'pull_request'
+        run: |
+          python3 .github/scripts/bench_delta.py compare \
+            --previous previous/bench-estimates.json \
+            --current bench-estimates.json \
+            --threshold 15 | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Store this run as the next baseline
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-baseline
+          path: bench-estimates.json
+          retention-days: 90
 
   native-platforms:
     name: Native checks (${{ matrix.os }})
