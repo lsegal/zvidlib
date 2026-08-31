@@ -691,6 +691,7 @@ pub fn decode_pictures(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::VideoDecoder;
     use crate::simd::{self, SimdIsa};
 
     /// A frame small enough to build and run quickly, but still a whole number
@@ -712,12 +713,13 @@ mod tests {
         let inputs = small_inputs();
         /// One stage's name and the entry point that runs it.
         type Stage = (&'static str, fn(&HevcStageInputs) -> Vec<u8>);
-        let stages: [Stage; 6] = [
+        let stages: [Stage; 7] = [
             ("inter_pred", HevcStageInputs::run_inter_pred),
             ("intra_pred", HevcStageInputs::run_intra_pred),
             ("deblock", HevcStageInputs::run_deblock),
             ("sao", HevcStageInputs::run_sao),
             ("inverse_transform", HevcStageInputs::run_inverse_transform),
+            ("color_convert", HevcStageInputs::run_color_convert),
             ("cabac", HevcStageInputs::run_cabac),
         ];
 
@@ -754,6 +756,7 @@ mod tests {
             inputs.run_deblock(),
             inputs.run_sao(),
             inputs.run_inverse_transform(),
+            inputs.run_color_convert(),
             inputs.run_cabac(),
         ];
         simd::set_override(None);
@@ -815,5 +818,96 @@ mod tests {
         assert_eq!(inputs.cabac_bins(), CABAC_BINS as u64);
         assert!(inputs.intra_pred_samples() > 0);
         assert!(inputs.inverse_transform_samples() > 0);
+    }
+
+    /// The picture-only path exists so a whole-frame benchmark can leave the
+    /// output conversion out of the measured interval — which is only sound if
+    /// it is otherwise the same decode. Converting what it collects has to
+    /// reproduce, frame for frame and byte for byte, what the public
+    /// `submit` returns.
+    #[test]
+    fn the_picture_only_path_decodes_what_the_rgba_path_decodes() {
+        let (configuration, samples) = pcm_stream();
+        let limits = Limits::default();
+        let cancellation = CancellationToken::new();
+
+        let mut rgba_decoder = new_decoder(&configuration, &limits);
+        let mut expected = Vec::new();
+        for sample in &samples {
+            for frame in rgba_decoder.submit(sample, &cancellation).unwrap() {
+                expected.push(frame.frame);
+            }
+        }
+        assert!(
+            !expected.is_empty(),
+            "the generated stream has to produce output frames for this to test anything"
+        );
+
+        let mut picture_decoder = new_decoder(&configuration, &limits);
+        let mut actual = Vec::new();
+        for sample in &samples {
+            for picture in picture_decoder
+                .submit_pictures(sample, &cancellation)
+                .unwrap()
+            {
+                actual.push(picture_to_rgba(&picture, &configuration, &limits).unwrap());
+            }
+        }
+        assert_eq!(actual, expected);
+    }
+
+    /// The digest the picture-only whole-frame group returns is what the
+    /// harness compares across instruction sets, so it has to depend on the
+    /// decoded samples and be reproducible.
+    #[test]
+    fn decode_pictures_folds_the_decoded_samples_reproducibly() {
+        let (configuration, samples) = pcm_stream();
+        let limits = Limits::default();
+        let one = decode_pictures(&configuration, &samples, &limits, 1);
+        assert_eq!(one, decode_pictures(&configuration, &samples, &limits, 1));
+        assert_ne!(one, decode_pictures(&configuration, &samples, &limits, 2));
+        assert_ne!(one, Digest::new().finish());
+    }
+
+    /// The conversion stage folds a real converted frame, and folds a
+    /// different one for different content.
+    #[test]
+    fn color_convert_folds_the_converted_frame() {
+        let inputs = small_inputs();
+        let converted = inputs.run_color_convert();
+        assert_eq!(converted, inputs.run_color_convert());
+        assert_ne!(converted, HevcStageInputs::new(128, 64).run_color_convert());
+        assert_eq!(inputs.color_convert_samples(), 256 * 128);
+    }
+
+    /// A short PCM-coded stream, built with the crate's own HEVC encoder so
+    /// the decode-side tests run on a real bitstream without a fixture.
+    fn pcm_stream() -> (VideoDecoderConfig, Vec<EncodedVideoSample>) {
+        use super::super::encoder::{hvcc_box, length_prefixed_vcl};
+        use super::super::engine::encoder::pcm::encode_idr_pcm_au;
+        use crate::FrameIndex;
+
+        const SIDE: usize = 16;
+        const FRAMES: u64 = 4;
+        let mut rng = Lcg::new(0x8EEF_0220);
+        let y: Vec<u8> = (0..SIDE * SIDE).map(|_| rng.below(256) as u8).collect();
+        let chroma: Vec<u8> = (0..SIDE * SIDE / 4).map(|_| rng.below(256) as u8).collect();
+        let au = encode_idr_pcm_au(&y, &chroma, &chroma, SIDE, SIDE).unwrap();
+        let data = length_prefixed_vcl(&au).unwrap();
+        let mut configuration = convert_config(SIDE, SIDE);
+        configuration.configuration = hvcc_box(&au).unwrap();
+        let samples = (0..FRAMES)
+            .map(|index| EncodedVideoSample {
+                presentation_index: FrameIndex(index),
+                random_access: true,
+                data: data.clone(),
+            })
+            .collect();
+        (configuration, samples)
+    }
+
+    fn new_decoder(configuration: &VideoDecoderConfig, limits: &Limits) -> HevcDecoder {
+        let parsed = ParsedConfiguration::parse(configuration, limits).unwrap();
+        HevcDecoder::new(configuration.clone(), *limits, parsed).unwrap()
     }
 }
