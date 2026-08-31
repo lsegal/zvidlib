@@ -9,9 +9,6 @@ readme = "README.md"
 keywords = ["video", "audio", "webassembly", "webgl", "mp4"]
 categories = ["multimedia", "wasm"]
 publish = false
-# Bench targets are declared explicitly so `benches/support/` stays a shared
-# module rather than being auto-discovered as a benchmark of its own.
-autobenches = false
 
 [lib]
 crate-type = ["rlib", "cdylib"]
@@ -24,13 +21,23 @@ required-features = ["native"]
 # `cargo test --features native --example native_gl` run them.
 test = true
 
+# Criterion drives its own harness (`harness = false`), so the bench target must
+# not link libtest. The whole benchmark suite lives in one target so the shared
+# `benches/support/` fixture cache is loaded and decoded once per process.
 [[bench]]
-name = "smoke"
-path = "benches/smoke.rs"
+name = "codec"
+path = "benches/codec.rs"
 harness = false
 
 [features]
 default = []
+# Additive, off by default. The crate's SIMD kernels dispatch at run time rather
+# than at compile time, so this feature intentionally gates no code today: it is
+# the switch the per-codec benchmark tickets code against, and the benchmark
+# harness folds `cfg!(feature = "simd")` into every criterion group name
+# (`hevc_decode/simd=off` vs `hevc_decode/simd=on`) so the two arms are
+# separately recorded and comparable.
+simd = []
 native = []
 web = [
     "dep:js-sys",
@@ -67,7 +74,7 @@ web-sys = { version = "0.3.104", optional = true, features = [
 wasm-bindgen-test = "0.3.77"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-criterion = { version = "0.7.0", features = ["html_reports"] }
+criterion = { version = "0.7", features = ["html_reports"] }
 glow = "0.18.0"
 glutin = "0.32.3"
 glutin-winit = "0.5.0"
@@ -112,9 +119,10 @@ opt-level = 2
 lto = "fat"
 codegen-units = 1
 
-# Cargo's built-in `bench` profile mirrors `release`'s defaults but does not
-# pick up the customizations above, so benchmark numbers would come from a
-# build with neither cross-module LTO nor a single codegen unit - i.e. not the
-# build zvidlib ships. Inheriting from `release` makes the two identical.
+# Cargo's `bench` profile only inherits `release`'s *defaults*, not the settings
+# above, so benchmark numbers would otherwise be measured without the whole-crate
+# optimization shipped builds get. Repeat them here so `cargo bench` measures the
+# same code generation as `--release`.
 [profile.bench]
-inherits = "release"
+lto = "fat"
+codegen-units = 1

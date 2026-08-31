@@ -19,6 +19,9 @@
 //! supported instruction set falls back to [`crate::av1_filters`]'s scalar code.
 
 use super::vector::{I32x, MAX_LANES};
+use crate::av1_filters::{
+    WIDE_FILTER8_SHIFT, WIDE_FILTER8_WEIGHTS, WIDE_FILTER14_SHIFT, WIDE_FILTER14_WEIGHTS,
+};
 
 /// The plane geometry a kernel needs to reproduce the scalar path's edge
 /// clamping: the row stride plus the logical sample bounds.
@@ -324,49 +327,23 @@ unsafe fn narrow_filter_lanes<V: I32x>(
     }
 }
 
-/// Symmetric triangular taper weights for an `N`-tap wide filter: entry
-/// `(weights[i][j], denominators[i])` reproduces the `j`-th term and the
-/// divisor of `av1_filters::wide_taper_filter`'s output `i`. Only the inner
-/// outputs `1..N - 1` are used; the outermost taps only widen the window.
-const fn taper_table<const N: usize>() -> ([[i32; N]; N], [i32; N]) {
-    let mut weights = [[0i32; N]; N];
-    let mut denominators = [0i32; N];
-    let n = N as i32;
-    let mut i = 0;
-    while i < N {
-        let mut j = 0;
-        while j < N {
-            let distance = i as i32 - j as i32;
-            let weight = n - if distance < 0 { -distance } else { distance };
-            weights[i][j] = weight;
-            denominators[i] += weight;
-            j += 1;
-        }
-        i += 1;
-    }
-    (weights, denominators)
-}
-
-const TAPER8: ([[i32; 8]; 8], [i32; 8]) = taper_table::<8>();
-const TAPER14: ([[i32; 14]; 14], [i32; 14]) = taper_table::<14>();
-
-/// One wide-filter output: `(sum(weight * tap) + denominator / 2) /
-/// denominator`, the exact integer result the scalar reference computes in
-/// `i64`.
+/// One wide-filter output: `Round2(sum(weight * tap), shift)`, the exact
+/// integer result the scalar reference computes.
 ///
-/// Every tap is an 8-bit sample and every weight is positive, so the numerator
-/// is non-negative and at most `255 * denominator` (at most `49_980` for the
-/// widest window), which keeps it inside an `i32` lane and inside
-/// [`I32x::div_small_nonneg`]'s exact range.
+/// Every tap is an 8-bit sample and every weight is non-negative, so the
+/// numerator is non-negative and at most `255 << shift` (at most `4_080`),
+/// which keeps the rounded sum inside an `i32` lane and makes the spec's
+/// rounding shift an arithmetic right shift of a non-negative value.
 #[inline(always)]
-unsafe fn taper_output<V: I32x>(taps: &[V], weights: &[i32], denominator: i32) -> V {
+unsafe fn wide_filter_output<V: I32x>(taps: &[V], weights: &[i32], shift: i32) -> V {
     unsafe {
         let mut sum = V::zero();
         for (&tap, &weight) in taps.iter().zip(weights.iter()) {
-            sum = sum.add(tap.mul(V::splat(weight)));
+            if weight != 0 {
+                sum = sum.add(tap.mul(V::splat(weight)));
+            }
         }
-        sum.add(V::splat(denominator / 2))
-            .div_small_nonneg(denominator)
+        sum.add(V::splat(1 << (shift - 1))).sra_var(shift)
     }
 }
 
@@ -418,11 +395,9 @@ unsafe fn deblock_filter_lanes<V: I32x>(
             return out;
         }
 
-        let (weights, denominators) = &TAPER8;
         let window = &taps[EDGE - 4..EDGE + 4];
-        for (index, slot) in out[3..9].iter_mut().enumerate() {
-            let output = index + 1;
-            let filtered = taper_output(window, &weights[output], denominators[output]);
+        for (weights, slot) in WIDE_FILTER8_WEIGHTS.iter().zip(out[3..9].iter_mut()) {
+            let filtered = wide_filter_output(window, weights, WIDE_FILTER8_SHIFT);
             *slot = V::select(wide8, filtered, *slot);
         }
 
@@ -440,10 +415,8 @@ unsafe fn deblock_filter_lanes<V: I32x>(
             return out;
         }
 
-        let (weights, denominators) = &TAPER14;
-        for (index, slot) in out.iter_mut().enumerate() {
-            let output = index + 1;
-            let filtered = taper_output(&taps[..], &weights[output], denominators[output]);
+        for (weights, slot) in WIDE_FILTER14_WEIGHTS.iter().zip(out.iter_mut()) {
+            let filtered = wide_filter_output(&taps[..], weights, WIDE_FILTER14_SHIFT);
             *slot = V::select(wide14, filtered, *slot);
         }
         out
@@ -551,6 +524,42 @@ unsafe fn narrow_chunk_vertical<V: I32x>(
     thresh: i32,
 ) {
     unsafe {
+        // The four taps of one lane are four *consecutive* bytes of one row,
+        // and consecutive lanes are one row stride apart. So when the whole
+        // chunk is inside the plane the window is `LANES` unaligned 32-bit
+        // words, and shifting the loaded words apart yields the tap vectors
+        // without touching memory once per tap per lane. Repacking the filtered
+        // bytes into words stores the same way. That replaces the
+        // `4 * LANES` byte loads, `4 * LANES` byte stores and four scratch-
+        // buffer round trips the staged path below performs with `LANES` word
+        // loads, `LANES` word stores and a handful of shifts.
+        let byte = V::splat(0xff);
+        if full && lanes == V::LANES {
+            let base = y * geom.stride + x - 2;
+            let words = V::load_u32_rows(data, base, geom.stride);
+            let taps = [
+                words.and(byte),
+                words.srl::<8>().and(byte),
+                words.srl::<16>().and(byte),
+                words.srl::<24>(),
+            ];
+            let (dp, dq) = edge_deltas(taps[0], taps[1], taps[2], taps[3]);
+            let mask = filter_mask_lanes(dp, dq, taps[0], taps[1], taps[2], taps[3], limit, blimit);
+            let out = narrow_filter_lanes(mask, dp, dq, taps[0], taps[1], taps[2], taps[3], thresh);
+            // Every output is either an untouched input sample or a
+            // `clamp_pixel` result, so each already occupies exactly one byte
+            // and the packed word needs no further masking.
+            let packed = out[0]
+                .or(out[1].sll::<8>())
+                .or(out[2].sll::<16>())
+                .or(out[3].sll::<24>());
+            packed.store_u32_rows(data, base, geom.stride);
+            return;
+        }
+
+        // The last chunk of a column, which either runs past the plane's final
+        // row (so lanes repeat the clamped edge row and are not a fixed stride
+        // apart) or writes fewer than `LANES` rows.
         let mut staged = [[0u8; MAX_LANES]; 4];
         for lane in 0..V::LANES {
             let row = if full {
