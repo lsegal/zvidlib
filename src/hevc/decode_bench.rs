@@ -634,14 +634,14 @@ fn convert_config(width: usize, height: usize) -> VideoDecoderConfig {
     }
 }
 
-/// Decodes `frames` frames of `samples` and stops at the decoded [`Picture`].
+/// Decodes `frames` frames of `samples` and stops at the decoded `Picture`.
 ///
 /// Issue #220: the public decoder's `submit` returns RGBA, so a whole-frame
 /// benchmark through it measures decoding *plus* the colour conversion of
 /// [`HevcStageInputs::run_color_convert`] — a third of the interval, with no
 /// vector kernel behind it, diluting every scalar-versus-SIMD ratio taken off
 /// those groups. This is the same decode without that tail: it drives the same
-/// [`HevcDecoder`] over the same access units and collects its pictures instead
+/// `HevcDecoder` over the same access units and collects its pictures instead
 /// of converting them, so the difference between this and the end-to-end group
 /// is the conversion and nothing else about how the bitstream is handled.
 ///
@@ -658,7 +658,7 @@ fn convert_config(width: usize, height: usize) -> VideoDecoderConfig {
 ///
 /// The end-to-end half of the issue #220 split, and the counterpart to
 /// [`decode_pictures`]: same decoder, same access units, same frame count, same
-/// output fold — the only difference is the [`picture_to_rgba`] pass on each
+/// output fold — the only difference is the `picture_to_rgba` pass on each
 /// decoded picture, which is what makes the gap between the two groups the
 /// conversion rather than an artefact of how each arm identifies its output.
 ///
