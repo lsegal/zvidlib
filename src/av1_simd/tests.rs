@@ -576,6 +576,60 @@ fn wide_deblocking_filters_actually_run_on_flat_content() {
     );
 }
 
+/// Verifies wide-filter output against spec-derived values rather than
+/// against this crate's own scalar path, on every instruction set.
+///
+/// The plane is a single step edge: columns `0..16` hold 100 and columns
+/// `16..20` hold 110, with a frame-wide 32x32 transform grid so §7.14.5
+/// selects the 14-tap filter. Height 4 leaves no horizontal edge, and the
+/// vertical edges at x = 4, 8 and 12 see an all-100 window, which any filter
+/// whose weights sum to its rounding shift leaves unchanged. Only the last
+/// edge, x = 16, actually filters, so no cascade obscures its output.
+///
+/// The expected samples come from §7.14.6.4 directly: with p6..p0 = 100 and
+/// q0..q6 = 110 (the taps past the right border replicate column 19), output
+/// `k` is `Round2(100 * (16 - w) + 110 * w, 4)` where `w` is the row's q-side
+/// weight sum, i.e. `(1608 + 10 * w) >> 4`. The q-side weight sums read off
+/// the spec's tap lists are 1, 2, 3, 4, 5, 7, 9, 11, 12, 13, 14 and 15.
+#[test]
+fn wide_deblocking_output_matches_spec_derived_vectors() {
+    const WIDTH: usize = 20;
+    const HEIGHT: usize = 4;
+    // Written at columns 10..=21; the last two land outside the plane.
+    const Q_WEIGHT_SUMS: [i32; 12] = [1, 2, 3, 4, 5, 7, 9, 11, 12, 13, 14, 15];
+
+    let mut expected: Vec<u8> = (0..WIDTH)
+        .map(|x| if x < 16 { 100u8 } else { 110u8 })
+        .collect();
+    for (offset, weight) in Q_WEIGHT_SUMS.into_iter().enumerate() {
+        let column = 10 + offset;
+        if column < WIDTH {
+            expected[column] = ((1608 + 10 * weight) >> 4) as u8;
+        }
+    }
+    let expected: Vec<u8> = expected.repeat(HEIGHT);
+
+    let mut grid = TxSizeGrid::new(WIDTH, HEIGHT);
+    grid.set_block(0, 0, 32, 32);
+    let results = for_each_isa(|_| {
+        let data: Vec<u8> = (0..WIDTH * HEIGHT)
+            .map(|index| if index % WIDTH < 16 { 100u8 } else { 110u8 })
+            .collect();
+        let plane = FilterPlane::from_samples(WIDTH, HEIGHT, data, &Limits::default()).unwrap();
+        let mut frame = FilterFrame::new_monochrome(plane);
+        deblock_frame(&mut frame, &deblock_params(40, 0), Some(&grid)).unwrap();
+        frame.y.data
+    });
+    for (isa, data) in &results {
+        assert_eq!(
+            data,
+            &expected,
+            "{} wide-filter output should match the spec's filter14 constants",
+            isa.name()
+        );
+    }
+}
+
 #[test]
 fn deblocking_at_frame_borders_matches_the_scalar_reference() {
     // Planes small enough that every edge position's filter window leaves the
