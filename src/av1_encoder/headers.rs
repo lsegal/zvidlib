@@ -177,12 +177,19 @@ pub(crate) fn sequence_header_payload(cfg: &Av1StillConfig, width: u32, height: 
     w.into_bytes()
 }
 
-/// Builds the uncompressed frame header for a lossless intra keyframe (AV1 §5.9.2), byte-aligned
+/// Builds the uncompressed frame header for an intra keyframe (AV1 §5.9.2), byte-aligned
 /// (`byte_alignment`, no trailing one — the tile data follows in the same `OBU_FRAME`).
 ///
 /// `order_hint` is the frame's `order_hint` field value (taken mod `2^ORDER_HINT_BITS` by the
 /// caller); every frame is an independent shown key frame, so the actual value never affects
 /// decoding, but a real, incrementing value keeps the stream honest about frame order.
+///
+/// `base_q_idx` selects the two quantization profiles the crate implements (§5.9.12): `0` is
+/// `CodedLossless`, which suppresses `loop_filter_params` and `read_tx_mode` entirely, and any
+/// other value is the non-lossless profile, which signals both. The loop filter is always
+/// signalled off — the encoder reconstructs without deblocking, so a nonzero level would make
+/// its reconstruction disagree with the decoder's — and `tx_mode_select` is always
+/// `TX_MODE_SELECT`, since the encoder chooses a transform size per coding block.
 ///
 /// The returned bytes precede the tile (symbol-coded) data; together they form the frame OBU
 /// payload (AV1 §5.10).
@@ -192,6 +199,7 @@ pub(crate) fn frame_header_payload(
     mi_cols: u32,
     mi_rows: u32,
     order_hint: u32,
+    base_q_idx: u8,
 ) -> Vec<u8> {
     let mut w = BitWriter::new();
     w.put_bit(0); // show_existing_frame = 0
@@ -224,16 +232,32 @@ pub(crate) fn frame_header_payload(
     }
     // TileColsLog2 == TileRowsLog2 == 0 ⇒ no context_update_tile_id / tile_size_bytes.
 
-    // quantization_params(): base_q_idx = 0 ⇒ CodedLossless.
-    w.put_bits(0, 8); // base_q_idx
+    // quantization_params(): base_q_idx == 0 ⇒ CodedLossless.
+    w.put_bits(u32::from(base_q_idx), 8); // base_q_idx
     w.put_bit(0); // DeltaQYDc: delta_coded = 0
     w.put_bit(0); // using_qmatrix = 0
 
     w.put_bit(0); // segmentation_enabled = 0
-    // delta_q_params() (spec §5.9.17) reads `delta_q_present` for every frame with
-    // base_q_idx > 0; this encoder is lossless, so base_q_idx == 0 and no bit is present. A
-    // non-lossless encode path has to write it here, and delta_lf_params() (§5.9.18) after it.
-    // CodedLossless ⇒ loop_filter / cdef / lr / tx_mode emit nothing.
+    // delta_q_params() (spec §5.9.17): `delta_q_present` is read for every frame with
+    // base_q_idx > 0, gated on the quantizer alone rather than on segmentation. Omitting it
+    // left every non-lossless frame header one bit short from here on, which an independent
+    // decoder (ffmpeg 7.1's dav1d) rejects while parsing the header. This encoder signals no
+    // per-block delta-Q, so the bit is 0 and delta_lf_params() (§5.9.18) is then absent
+    // entirely, being gated on `delta_q_present`.
+    if base_q_idx != 0 {
+        w.put_bit(0); // delta_q_present = 0
+    }
+    // cdef_params / lr_params: the sequence header disables both, so neither emits bits.
+    if base_q_idx != 0 {
+        // loop_filter_params() (§5.9.11): both luma levels 0, which suppresses the chroma
+        // levels, then sharpness and the (unused) per-reference delta switch.
+        w.put_bits(0, 6); // loop_filter_level[0]
+        w.put_bits(0, 6); // loop_filter_level[1]
+        w.put_bits(0, 3); // loop_filter_sharpness
+        w.put_bit(0); // loop_filter_delta_enabled = 0
+        w.put_bit(1); // tx_mode_select = 1 (TX_MODE_SELECT)
+    }
+    // CodedLossless ⇒ loop_filter / tx_mode emit nothing at all.
     // frame_reference_mode / skip_mode_params (intra) ⇒ no bits. allow_warped_motion=0.
     w.put_bit(1); // reduced_tx_set = 1
     // global_motion_params / film_grain_params (intra, not present) ⇒ no bits.
