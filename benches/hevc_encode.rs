@@ -40,14 +40,17 @@
 //! picture, and those *are* vectorized, so it is the one encoder-side group
 //! outside mode search that is expected to move with the instruction set.
 //!
-//! ## Stages this encoder does not have yet
+//! ## Stage coverage
 //!
-//! Every stage the tracking issue names is now benchmarked, but the encoder's
-//! access-unit writer is still a lossless PCM bootstrap writer: it does not
-//! call the forward transform + quantization stage or the encode-side
-//! reconstruction path, both of which are measured here directly rather than
-//! through it. [`report_absent_stages`] prints that on every run so a group is
-//! never read as covering more of the encoder than it does.
+//! Every stage of the encoder is benchmarked, and every one of them is now
+//! reached by an access-unit writer rather than only measured in isolation:
+//! the `..._residual_write` group runs the lossy writer end to end — intra
+//! prediction, forward transform, quantization, the decoder's own
+//! reconstruction, and §7.3.8.11 entropy coding of the levels — alongside the
+//! `..._pcm_write` group for the lossless PCM writer.
+//! [`report_stage_coverage`] prints that list on every run, so a group missing
+//! from the output reads as a broken run rather than as a stage that costs
+//! nothing.
 
 mod support;
 
@@ -91,14 +94,13 @@ const WHOLE_FRAME_FRAMES: usize = 2;
 ///
 /// A benchmark suite reports what it measured; the stages it *could not* measure
 /// have to be reported too, or their absence reads as zero cost.
-fn report_absent_stages(_: &mut Criterion) {
+fn report_stage_coverage(_: &mut Criterion) {
     println!(
-        "# hevc_encode: every stage the tracking issue names is benchmarked below: mode\n\
-         # search/RDO, forward transform + quantization, encode-side reconstruction + in-loop\n\
-         # filtering, CABAC + bitwriting, whole-picture PCM access-unit writing, and the\n\
-         # RGBA8->YUV420 input conversion. The access-unit writer is still a lossless PCM\n\
-         # writer, so it reaches neither the transform/quantization nor the reconstruction\n\
-         # stage; both are measured directly instead.\n\
+        "# hevc_encode: every stage of the encoder is benchmarked below: mode search/RDO,\n\
+         # forward transform + quantization, encode-side reconstruction + in-loop filtering\n\
+         # (with both an exact and a quantized residual), CABAC + bitwriting, whole-picture\n\
+         # access-unit writing for both the lossless PCM writer and the lossy residual writer,\n\
+         # and the RGBA8->YUV420 input conversion. No stage of the pipeline is absent.\n\
          # hevc_encode: hevc_rdcost and hevc_fwd_transform_quant are the encoder's two SIMD\n\
          # dispatch families, so apart from the mode-search, forward-transform and\n\
          # reconstruction groups (the last running the decoder's vectorized in-loop filter\n\
@@ -347,6 +349,36 @@ fn fwd_transform_quant(criterion: &mut Criterion, size: (u32, u32), group_prefix
     });
 }
 
+/// Whole-picture bitstream writing for the *lossy* writer: intra prediction,
+/// forward transform, quantization, the decoder's own reconstruction, and the
+/// §7.3.8.11 entropy coding of the quantized levels.
+///
+/// The counterpart of [`pcm_write`], and the group that reaches the forward
+/// transform and quantization stage through an access-unit writer rather than
+/// in isolation. Comparing the two separates what coding a quantized residual
+/// costs from what writing a bitstream costs at all — the residual writer's
+/// access unit is a fraction of the PCM one's size, so the two also differ in
+/// how much entropy coding they do.
+fn residual_write(criterion: &mut Criterion, size: (u32, u32), group_prefix: &str) {
+    let (current, _) = planes_pair(size.0, size.1);
+    let qp = zvidlib_rdo_defaults().0;
+    let name = format!("{group_prefix}_residual_write");
+    let workload = IsaWorkload::new(
+        &name,
+        FrameWork::new(1, u64::from(size.0), u64::from(size.1)),
+    );
+    bench_across_isas(criterion, &workload, || {
+        encoder_bench::write_idr_residual_access_unit(
+            &current.y,
+            &current.cb,
+            &current.cr,
+            current.width,
+            current.height,
+            qp,
+        )
+    });
+}
+
 /// Bins per CABAC iteration. Roughly the CU-syntax bin count of a small
 /// picture, large enough that per-call setup is negligible.
 const CABAC_BINS: usize = 1 << 18;
@@ -432,6 +464,7 @@ fn hevc_encode_stages_small(criterion: &mut Criterion) {
     fwd_transform_quant(criterion, SMALL, "hevc_encode_640x352");
     reconstruct(criterion, SMALL, "hevc_encode_640x352");
     pcm_write(criterion, SMALL, "hevc_encode_640x352");
+    residual_write(criterion, SMALL, "hevc_encode_640x352");
     color_conversion(criterion, SMALL, "hevc_encode_640x352");
 }
 
@@ -443,12 +476,13 @@ fn hevc_encode_stages_large(criterion: &mut Criterion) {
     fwd_transform_quant(criterion, LARGE, "hevc_encode_1920x1088");
     reconstruct(criterion, LARGE, "hevc_encode_1920x1088");
     pcm_write(criterion, LARGE, "hevc_encode_1920x1088");
+    residual_write(criterion, LARGE, "hevc_encode_1920x1088");
     color_conversion(criterion, LARGE, "hevc_encode_1920x1088");
 }
 
 criterion_group!(
     benches,
-    report_absent_stages,
+    report_stage_coverage,
     hevc_encode_small,
     hevc_encode_stages_small,
     entropy_coding,

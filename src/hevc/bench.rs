@@ -21,6 +21,7 @@
 use crate::hevc::engine::cabac::ContextModel;
 use crate::hevc::engine::encoder::bitwriter::BitWriter;
 use crate::hevc::engine::encoder::cabac::CabacEncoder;
+use crate::hevc::engine::encoder::lossy::encode_idr_residual_au;
 use crate::hevc::engine::encoder::pcm::encode_idr_pcm_au;
 use crate::hevc::engine::encoder::rdo::{DecisionConfig, PictureDecision, decide_picture};
 use crate::hevc::engine::encoder::recon::{
@@ -254,6 +255,36 @@ pub fn fwd_transform_quant_picture(
     out
 }
 
+/// Writes one IDR access unit whose coding units carry *quantized residual*
+/// rather than raw PCM samples: intra prediction, forward transform,
+/// quantization, the decoder's own reconstruction, and the §7.3.8.11
+/// `residual_coding( )` entropy coding of the levels.
+///
+/// This is the lossy write path end to end, and the counterpart to
+/// [`write_idr_pcm_access_unit`]: comparing the two separates what coding a
+/// quantized residual costs from what writing a bitstream costs at all. The
+/// returned Annex B access unit is the stage's own output, so the
+/// bit-exactness guard covers the bitstream itself.
+///
+/// # Panics
+///
+/// Panics if the picture does not satisfy the writer's requirements
+/// (dimensions divisible by 16, correctly sized planes, `qp` in 0..=51),
+/// which a benchmark input always does.
+#[must_use]
+pub fn write_idr_residual_access_unit(
+    y: &[u8],
+    cb: &[u8],
+    cr: &[u8],
+    width: usize,
+    height: usize,
+    qp: i32,
+) -> Vec<u8> {
+    encode_idr_residual_au(y, cb, cr, width, height, qp)
+        .expect("benchmark pictures are writable as residual")
+        .0
+}
+
 /// A picture-reconstruction workload with its mode-search plan already built.
 ///
 /// The reconstruction stage consumes the decisions the mode search produced,
@@ -343,6 +374,24 @@ pub fn reconstruct_encoded_picture(
     deblocking: bool,
     sao: bool,
 ) -> Vec<u8> {
+    reconstruct_encoded_picture_quantized(workload, deblocking, sao, false)
+}
+
+/// [`reconstruct_encoded_picture`] with control over whether the residual is
+/// round-tripped through the forward transform and quantizer.
+///
+/// With `quantized` set, every transform block of every partition goes through
+/// §8.6.4 / §8.6.3 and back through the decoder's §8.6.2 reconstruction, which
+/// is what the reconstruction stage costs once the writer stops coding PCM.
+/// Measuring both says how much of the stage is prediction and filtering and
+/// how much is the transform round trip.
+#[must_use]
+pub fn reconstruct_encoded_picture_quantized(
+    workload: &ReconstructWorkload,
+    deblocking: bool,
+    sao: bool,
+    quantized: bool,
+) -> Vec<u8> {
     let reconstructed = reconstruct_picture(
         SourcePlanes {
             y: &workload.y,
@@ -362,6 +411,7 @@ pub fn reconstruct_encoded_picture(
             // (`pcm_loop_filter_disabled_flag == 0`, which
             // `PcmAuOptions::pcm_loop_filter_disabled == false` writes).
             pcm_loop_filter_disabled: !(deblocking || sao),
+            quantized_residual: quantized,
             ..ReconConfig::default()
         },
     );
