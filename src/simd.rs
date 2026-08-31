@@ -113,6 +113,7 @@ pub fn available() -> Vec<SimdIsa> {
 /// | `hevc_prediction_filters` | HEVC inter/intra prediction and in-loop filters |
 /// | `hevc_transforms` | HEVC inverse transforms and dequantization |
 /// | `hevc_rdcost` | HEVC encoder-side distortion metrics |
+/// | `hevc_color_convert` | HEVC decoder output YUV420-to-RGBA conversion |
 ///
 /// The `hevc_*` sites are absent on `wasm32`, which does not build the HEVC
 /// engine.
@@ -129,6 +130,7 @@ pub fn active_by_site() -> Vec<(&'static str, SimdIsa)> {
     ];
     #[cfg(not(target_arch = "wasm32"))]
     {
+        use crate::hevc::color_convert;
         use crate::hevc::engine::encoder::rdcost;
         use crate::hevc::engine::{simd as hevc_simd, transform_simd};
         sites.push((
@@ -143,6 +145,10 @@ pub fn active_by_site() -> Vec<(&'static str, SimdIsa)> {
         sites.push((
             "hevc_fwd_transform_quant",
             from_hevc_backend(crate::hevc::engine::encoder::quant_simd::detected()),
+        ));
+        sites.push((
+            "hevc_color_convert",
+            from_color_convert_isa(color_convert::detected_isa()),
         ));
     }
     sites
@@ -193,6 +199,20 @@ fn from_hevc_backend(backend: crate::hevc::engine::transform_simd::Backend) -> S
         Backend::Sse41 | Backend::Sse42 => SimdIsa::Sse41,
         Backend::Avx2 => SimdIsa::Avx2,
         Backend::Neon => SimdIsa::Neon,
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn from_color_convert_isa(isa: crate::hevc::color_convert::Isa) -> SimdIsa {
+    use crate::hevc::color_convert::Isa;
+    match isa {
+        Isa::Scalar => SimdIsa::Scalar,
+        #[cfg(target_arch = "x86_64")]
+        Isa::Sse41 => SimdIsa::Sse41,
+        #[cfg(target_arch = "x86_64")]
+        Isa::Avx2 => SimdIsa::Avx2,
+        #[cfg(target_arch = "aarch64")]
+        Isa::Neon => SimdIsa::Neon,
     }
 }
 
@@ -291,6 +311,7 @@ mod tests {
     fn pinning_scalar_reaches_every_dispatch_site() {
         use crate::av1_intra_pred::{Av1IntraSimd, av1_intra_simd};
         use crate::av1_mc::{McContext, SimdLevel, default_level};
+        use crate::hevc::color_convert;
         use crate::hevc::engine::encoder::rdcost;
         use crate::hevc::engine::{simd as hevc_simd, transform_simd};
 
@@ -311,6 +332,8 @@ mod tests {
         assert_eq!(transform_simd::detected(), transform_simd::Backend::Scalar);
         // HEVC encoder-side distortion metrics.
         assert_eq!(rdcost::isa(), rdcost::Isa::Scalar);
+        // The HEVC decoder's YUV420-to-RGBA output conversion.
+        assert_eq!(color_convert::detected_isa(), color_convert::Isa::Scalar);
 
         set_override(None);
     }

@@ -20,6 +20,7 @@
 //! | `hevc_deblock` | §8.7.2 luma block-edge deblocking | yes |
 //! | `hevc_sao` | §8.7.3 sample adaptive offset, band and edge | yes |
 //! | `hevc_inverse_transform` | §8.6 dequantization + inverse DCT/DST | yes |
+//! | `hevc_color_convert` | decoder output YUV420-to-RGBA conversion | yes |
 //! | `hevc_cabac` | §9.3.4 arithmetic bin decoding | no, by design |
 //!
 //! The two whole-frame groups need the bundled sample and so sit behind
@@ -236,6 +237,21 @@ fn hevc_inverse_transform_by_isa(criterion: &mut Criterion) {
     });
 }
 
+/// The decoder's 8-bit 4:2:0 YUV-to-RGBA output conversion over a full 1080p
+/// picture.
+///
+/// Not a decoding stage, but the largest single item in a whole-frame decode —
+/// the issue #189 attribution in `benches/README.md` measured it at a third of
+/// everything the two whole-frame groups time — and it is on the path of both
+/// of them, so its arms are what say how much of the diluted whole-frame ratio
+/// the kernel recovers.
+fn hevc_color_convert_by_isa(criterion: &mut Criterion) {
+    let samples = hevc_stage_inputs().color_convert_samples();
+    hevc_stage_group(criterion, "hevc_color_convert", samples, |inputs| {
+        inputs.run_color_convert()
+    });
+}
+
 /// §9.3.4 CABAC bin decoding — the serial stage, measured for the ceiling it
 /// puts on everything else.
 ///
@@ -258,6 +274,7 @@ criterion_group!(
     hevc_deblock_by_isa,
     hevc_sao_by_isa,
     hevc_inverse_transform_by_isa,
+    hevc_color_convert_by_isa,
     hevc_cabac_by_isa
 );
 criterion_main!(benches);

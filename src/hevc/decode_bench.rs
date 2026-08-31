@@ -19,6 +19,7 @@
 //! [`crate::simd::set_override`], so the caller selects the arm exactly as it
 //! does for a whole-frame decode.
 
+use super::color_convert::convert_yuv420_to_rgba;
 use super::engine::deblock::{EdgePos, EdgeQp, EdgeType, SamplePlane, filter_luma_block_edge};
 use super::engine::inter_pred::{RefPlane, default_weighted_pred, interp_luma_block};
 use super::engine::intra_pred::{
@@ -50,6 +51,13 @@ impl Digest {
 
     fn push_i32(&mut self, value: i32) {
         for byte in value.to_le_bytes() {
+            self.0 ^= u64::from(byte);
+            self.0 = self.0.wrapping_mul(0x1000_0000_01b3);
+        }
+    }
+
+    fn push_bytes(&mut self, values: &[u8]) {
+        for &byte in values {
             self.0 ^= u64::from(byte);
             self.0 = self.0.wrapping_mul(0x1000_0000_01b3);
         }
@@ -188,6 +196,12 @@ impl HevcStageInputs {
         (self.luma_edges().len() * 4 * 8) as u64
     }
 
+    /// RGBA pixels the colour-conversion stage writes per run.
+    #[must_use]
+    pub fn color_convert_samples(&self) -> u64 {
+        (self.width * self.height) as u64
+    }
+
     /// Samples the SAO stage reads and writes per run, luma plus chroma.
     #[must_use]
     pub fn sao_samples(&self) -> u64 {
@@ -321,6 +335,35 @@ impl HevcStageInputs {
         for plane in [Plane::Luma, Plane::Cb, Plane::Cr] {
             digest.push_all(filtered.plane(plane));
         }
+        digest.finish()
+    }
+
+    /// The decoder's 8-bit 4:2:0 YUV-to-RGBA output conversion, over a full
+    /// picture.
+    ///
+    /// Not a decoding stage, but the largest single item in a whole-frame
+    /// decode (see `benches/README.md`), and on the path of both whole-frame
+    /// groups. The destination buffer is allocated inside the measured region
+    /// because `picture_to_rgba` allocates one per frame too, and the profiler
+    /// scope this group corresponds to covers that allocation.
+    #[must_use]
+    pub fn run_color_convert(&self) -> Vec<u8> {
+        let picture = &self.sao_picture;
+        let chroma_width = picture.plane_dims(Plane::Cb).0;
+        let mut rgba = vec![0_u8; self.width * self.height * 4];
+        convert_yuv420_to_rgba(
+            picture.plane(Plane::Luma),
+            picture.width_luma(),
+            picture.plane(Plane::Cb),
+            picture.plane(Plane::Cr),
+            chroma_width,
+            self.width,
+            self.height,
+            &mut rgba,
+            self.width * 4,
+        );
+        let mut digest = Digest::new();
+        digest.push_bytes(&rgba);
         digest.finish()
     }
 
