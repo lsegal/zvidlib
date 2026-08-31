@@ -987,138 +987,218 @@ mod tests {
         }
     }
 
-    /// Benchmark for the two vectorized kernels across the four HEVC
-    /// transform sizes, reported per backend against the scalar path.
+    /// Micro-benchmark for the two §8.6 kernels, per transform size,
+    /// on the scalar reference and on every SIMD backend the host
+    /// offers.
+    ///
+    /// Four arms, because they answer different questions:
+    ///
+    /// * [`dequant_block`] and [`transform_1d`] **alone**, over one
+    ///   L1-resident block reused across many passes, with no allocator
+    ///   in the timing. This is what a backend is actually worth.
+    /// * The butterfly arm is split into a **dense** and a **sparse**
+    ///   input. Both kernels skip zero inputs outright, and a column of
+    ///   a dequantized block is mostly zero while the equation-8-314 `g`
+    ///   between the passes is not, so the two can disagree: the sparse
+    ///   case does less vector work per call while paying the same
+    ///   per-call overhead.
+    /// * The whole §8.6 **block path**,
+    ///   [`inverse_transform_with_backend`]. That path allocates and
+    ///   zeroes a `Vec` per block and per intermediate — identical work
+    ///   on every backend — which compresses every ratio towards 1.00x.
+    ///   It is here to show that compression, not to stand in for the
+    ///   kernel figures.
+    ///
+    /// Every figure is the *minimum* over [`BENCH_ROUNDS`] timed passes,
+    /// with the backends measured round-robin inside each round. A single
+    /// timed pass on a loaded machine swings by more than the effect being
+    /// measured, which is enough to report a real speedup as a regression;
+    /// the minimum is the pass that suffered least interference and is the
+    /// closest this can get to the kernel's own cost. This is the method
+    /// `inter_pred`'s `simd_inter_pred_benchmark` introduced, for the same
+    /// reason.
     ///
     /// Ignored by default because it only measures; run it with
     /// `cargo test --release --features native --lib \
-    ///  transform_simd::tests::bench -- --ignored --nocapture`.
+    ///  bench_inverse_transform_and_dequant -- --ignored --nocapture`.
     #[test]
     #[ignore = "benchmark; run explicitly with --ignored --nocapture"]
     fn bench_inverse_transform_and_dequant() {
+        use super::super::transform::transform_basis;
         use std::time::Instant;
 
-        let bit_depth = 8u8;
-        let (coeff_min, coeff_max) = coeff_range(bit_depth, false);
-        println!(
-            "host backend: {:?} (available: {:?})",
-            detected(),
-            supported_backends()
-        );
-        for n_tbs in [4usize, 8, 16, 32] {
-            let count = n_tbs * n_tbs;
-            let mut rng = Lcg(0x1234_5678);
-            // A realistically sparse dequantized block: a low-frequency
-            // cluster plus scattered high-frequency levels.
-            let d: Vec<i32> = (0..count)
-                .map(|i| {
-                    let (x, y) = (i % n_tbs, i / n_tbs);
-                    if x + y < 4 || rng.next_u32() % 16 == 0 {
-                        rng.signed(coeff_max)
-                    } else {
-                        0
-                    }
-                })
-                .collect();
-            let levels = d.clone();
-            // Enough repetitions that each timed section runs for
-            // ~100ms, plus an untimed warmup, so the numbers are not
-            // dominated by first-touch and loop-entry noise.
-            let iterations = 20_000_000 / count;
-            let warmup = iterations / 8;
+        /// Timed passes per arm; every reported figure is the best of these.
+        const BENCH_ROUNDS: usize = 5;
+        /// Transform-block sides §8.6 is defined over.
+        const SIZES: [usize; 4] = [4, 8, 16, 32];
+        /// Coefficients each isolated arm touches per timed pass, held
+        /// constant across sizes so the sizes are comparable to one
+        /// another and not only to their own scalar baseline.
+        const KERNEL_COEFFS: usize = 1 << 21;
+        /// Blocks per timed pass in the block-path arm.
+        const PATH_BLOCKS: usize = 2048;
+        const BIT_DEPTH: u8 = 8;
 
-            // Baseline: the unreassociated i64 reference this change
-            // replaced, so the table shows the end-to-end speedup and not
-            // just backend-to-backend deltas.
-            let mut sink = 0i64;
-            for _ in 0..warmup {
-                sink += i64::from(
-                    inverse_transform_reference(
-                        &d,
-                        n_tbs,
-                        PredMode::Inter,
-                        Component::Luma,
-                        bit_depth,
-                        false,
-                    )
-                    .expect("valid transform inputs")[0],
-                );
-            }
-            let start = Instant::now();
-            for _ in 0..iterations {
-                let r = inverse_transform_reference(
-                    &d,
+        /// Per-size inputs, built once so no arm pays for generating them.
+        struct SizeInputs {
+            n_tbs: usize,
+            /// A realistically sparse level block: a low-frequency
+            /// cluster plus scattered high-frequency levels, as a coded
+            /// sub-block group would leave.
+            levels: Vec<i32>,
+            params: DequantParams,
+            /// A column of `d`, non-zero only in its low-frequency rows.
+            sparse: Vec<i32>,
+            /// A row of the equation-8-314 `g` between the two passes.
+            dense: Vec<i32>,
+            basis: &'static [i32],
+            basis_stride: usize,
+            row_step: usize,
+        }
+
+        let (coeff_min, coeff_max) = coeff_range(BIT_DEPTH, false);
+        let backends = supported_backends();
+        let mut rng = Lcg(0x1234_5678);
+        let inputs: Vec<SizeInputs> = SIZES
+            .iter()
+            .map(|&n_tbs| {
+                let count = n_tbs * n_tbs;
+                let levels = (0..count)
+                    .map(|i| {
+                        let (x, y) = (i % n_tbs, i / n_tbs);
+                        if x + y < 4 || rng.next_u32() % 16 == 0 {
+                            rng.signed(coeff_max)
+                        } else {
+                            0
+                        }
+                    })
+                    .collect();
+                let coded = (n_tbs / 2).max(4);
+                let sparse = (0..n_tbs)
+                    .map(|y| if y < coded { rng.signed(1 << 12) } else { 0 })
+                    .collect();
+                let dense = (0..n_tbs).map(|_| rng.signed(1 << 12)).collect();
+                let (basis, basis_stride, row_step) = transform_basis(n_tbs, false);
+                let log2_tbs = n_tbs.trailing_zeros() as i32;
+                SizeInputs {
                     n_tbs,
-                    PredMode::Inter,
-                    Component::Luma,
-                    bit_depth,
-                    false,
-                )
-                .expect("valid transform inputs");
-                sink += i64::from(r[0]);
-            }
-            let baseline = start.elapsed();
-            println!(
-                "{n_tbs:>2}x{n_tbs:<2} i64 reference: inverse transform {:>9.2} ns/block",
-                baseline.as_nanos() as f64 / iterations as f64,
-            );
+                    levels,
+                    params: DequantParams {
+                        level_scale: 51,
+                        qp_div6: 5,
+                        bd_shift: (i32::from(BIT_DEPTH) + log2_tbs + 10 - 15) as u32,
+                        coeff_min,
+                        coeff_max,
+                    },
+                    sparse,
+                    dense,
+                    basis,
+                    basis_stride,
+                    row_step,
+                }
+            })
+            .collect();
 
-            for backend in supported_backends() {
-                for _ in 0..warmup {
-                    sink += i64::from(
-                        inverse_transform_with_backend(
+        // best[size][backend] = [dequant, butterfly dense, butterfly
+        // sparse, block path], in seconds.
+        let mut best = vec![vec![[f64::INFINITY; 4]; backends.len()]; SIZES.len()];
+        let mut block_out = vec![0i32; 32 * 32];
+        let mut lane = [0i32; 32];
+        let mut sink = 0i64;
+        for _ in 0..BENCH_ROUNDS {
+            for (s, input) in inputs.iter().enumerate() {
+                let n = input.n_tbs;
+                let count = n * n;
+                let block_passes = KERNEL_COEFFS / count;
+                let lane_passes = KERNEL_COEFFS / n;
+                for (b, &backend) in backends.iter().enumerate() {
+                    let out = &mut block_out[..count];
+                    let start = Instant::now();
+                    for _ in 0..block_passes {
+                        dequant_block(backend, out, &input.levels, None, input.params);
+                    }
+                    let dequant = start.elapsed().as_secs_f64();
+                    sink += i64::from(out[0]);
+
+                    let lanes = &mut lane[..n];
+                    let start = Instant::now();
+                    for _ in 0..lane_passes {
+                        transform_1d(
                             backend,
-                            &d,
-                            n_tbs,
+                            &input.dense,
+                            lanes,
+                            input.basis,
+                            input.basis_stride,
+                            input.row_step,
+                        );
+                    }
+                    let dense = start.elapsed().as_secs_f64();
+                    sink += i64::from(lanes[0]);
+
+                    let start = Instant::now();
+                    for _ in 0..lane_passes {
+                        transform_1d(
+                            backend,
+                            &input.sparse,
+                            lanes,
+                            input.basis,
+                            input.basis_stride,
+                            input.row_step,
+                        );
+                    }
+                    let sparse = start.elapsed().as_secs_f64();
+                    sink += i64::from(lanes[0]);
+
+                    let start = Instant::now();
+                    for _ in 0..PATH_BLOCKS {
+                        let r = inverse_transform_with_backend(
+                            backend,
+                            &input.levels,
+                            n,
                             PredMode::Inter,
                             Component::Luma,
-                            bit_depth,
+                            BIT_DEPTH,
                             false,
                         )
-                        .expect("valid transform inputs")[0],
-                    );
-                }
-                let start = Instant::now();
-                for _ in 0..iterations {
-                    let r = inverse_transform_with_backend(
-                        backend,
-                        &d,
-                        n_tbs,
-                        PredMode::Inter,
-                        Component::Luma,
-                        bit_depth,
-                        false,
-                    )
-                    .expect("valid transform inputs");
-                    sink += i64::from(r[0]);
-                }
-                let transform = start.elapsed();
+                        .expect("valid transform inputs");
+                        sink += i64::from(r[0]);
+                    }
+                    let path = start.elapsed().as_secs_f64();
 
-                let params = DequantParams {
-                    level_scale: 51,
-                    qp_div6: 5,
-                    bd_shift: 7,
-                    coeff_min,
-                    coeff_max,
-                };
-                let mut out = vec![0i32; count];
-                for _ in 0..warmup {
-                    dequant_block(backend, &mut out, &levels, None, params);
-                    sink += i64::from(out[0]);
+                    for (slot, t) in best[s][b].iter_mut().zip([dequant, dense, sparse, path]) {
+                        *slot = slot.min(t);
+                    }
                 }
-                let start = Instant::now();
-                for _ in 0..iterations {
-                    dequant_block(backend, &mut out, &levels, None, params);
-                    sink += i64::from(out[0]);
-                }
-                let dequant = start.elapsed();
+            }
+        }
 
+        println!(
+            "\n§8.6 kernels, best of {BENCH_ROUNDS} interleaved rounds (host backend {:?}){}",
+            detected(),
+            if sink == i64::MIN { "!" } else { "" }
+        );
+        println!(
+            "  isolated arms: {KERNEL_COEFFS} coefficients/pass, L1-resident, no allocation\n  \
+             block path: {PATH_BLOCKS} blocks/pass through inverse_transform_with_backend"
+        );
+        for (s, input) in inputs.iter().enumerate() {
+            let baseline = best[s][0];
+            for (b, &backend) in backends.iter().enumerate() {
+                let [dequant, dense, sparse, path] = best[s][b];
                 println!(
-                    "{n_tbs:>2}x{n_tbs:<2} {backend:?}: inverse transform {:>9.2} ns/block \
-                     ({:.2}x baseline), dequant {:>9.2} ns/block (checksum {sink})",
-                    transform.as_nanos() as f64 / iterations as f64,
-                    baseline.as_secs_f64() / transform.as_secs_f64(),
-                    dequant.as_nanos() as f64 / iterations as f64,
+                    "  {n:>2}x{n:<2} {:>8}  dequant_block {:7.2} ms ({:4.2}x)  transform_1d dense \
+                     {:7.2} ms ({:4.2}x)  sparse {:7.2} ms ({:4.2}x)  block path {:7.2} ms \
+                     ({:4.2}x)",
+                    format!("{backend:?}"),
+                    dequant * 1e3,
+                    baseline[0] / dequant,
+                    dense * 1e3,
+                    baseline[1] / dense,
+                    sparse * 1e3,
+                    baseline[2] / sparse,
+                    path * 1e3,
+                    baseline[3] / path,
+                    n = input.n_tbs,
                 );
             }
         }
