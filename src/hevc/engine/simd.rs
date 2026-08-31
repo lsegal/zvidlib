@@ -46,9 +46,9 @@
 //!
 //! | kernel | SSE4.1 | AVX2 | NEON |
 //! | --- | --- | --- | --- |
-//! | §8.5.3.3.3.2 8-tap luma [`filter_taps`] (block path) | 2.2x | 2.6x | 1.6-1.9x |
+//! | §8.5.3.3.3.2 8-tap luma [`filter_taps`] (block path) | 2.1-2.3x | 2.6x | 1.6-1.9x |
 //! | §8.5.3.3.3.3 4-tap chroma [`filter_taps`] (block path) | 1.4x | 1.5x | 1.5-1.7x |
-//! | [`filter_taps`] (one long L1-resident buffer) | 1.3x | 2.7x | ~1.0x |
+//! | [`filter_taps`] (one long L1-resident buffer) | 1.1-1.3x | 2.5-2.7x | ~1.0x |
 //! | §8.5.3.3.4 [`combine_weighted`] (block path) | 0.95x — dispatched to scalar | 1.4x | 0.91x — dispatched to scalar |
 //! | §8.5.3.3.4 [`combine_weighted`] (L1-resident buffer) | ~1.0x | 2.2x | 0.91x |
 //! | §8.7.2 `in_loop::filter_luma_rows` / `filter_chroma_rows` | 1.3x | 1.3x | ~1.3x |
