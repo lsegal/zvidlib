@@ -2,7 +2,7 @@
 //!
 //! `crate::hevc` is a private module, and criterion benchmarks are a separate
 //! crate, so the per-stage encoder groups in `benches/hevc_encode.rs` cannot
-//! reach [`rdo::decide_picture`], the CABAC encoding engine, or the PCM
+//! reach `rdo::decide_picture`, the CABAC encoding engine, or the PCM
 //! bitstream writer through the public API. The public
 //! [`crate::native_hevc_video_encoder_factory`] runs all of them at once, which
 //! is exactly what a per-stage breakdown must avoid.
@@ -113,7 +113,7 @@ pub fn write_idr_pcm_access_unit(
 /// `contexts` sets how many distinct context models the sequence cycles
 /// through, which is what makes the state transitions non-degenerate. The
 /// returned bytes are the arithmetic codeword, so this measures the CABAC
-/// engine plus the [`BitWriter`] it writes through.
+/// engine plus the bit writer it writes through.
 #[must_use]
 pub fn cabac_encode_bins(bins: &[u8], contexts: usize) -> Vec<u8> {
     assert!(contexts > 0, "the bin sequence needs at least one context");
@@ -136,8 +136,8 @@ pub fn cabac_encode_bins(bins: &[u8], contexts: usize) -> Vec<u8> {
     writer.finish()
 }
 
-/// Writes a deterministic syntax-element sequence through the raw
-/// [`BitWriter`], with no arithmetic coding on top.
+/// Writes a deterministic syntax-element sequence through the raw bit writer,
+/// with no arithmetic coding on top.
 ///
 /// The parameter sets and slice headers of every access unit go through these
 /// fixed-length, `ue(v)` and `se(v)` writers, so measuring them separately
