@@ -235,9 +235,17 @@ fn parse_supported_frame_header(
     require_bit(&mut bits, false, "using_qmatrix")?;
     // segmentation_params()
     require_bit(&mut bits, false, "segmentation_enabled")?;
-    // delta_q_params()/delta_lf_params(): both are only present when
-    // base_q_idx > 0, and even then only when segmentation/delta-Q are
-    // enabled; this decoder never signals either, so no bits are read.
+    // delta_q_params() (spec §5.9.17): `delta_q_present` is read for *every*
+    // frame with `base_q_idx > 0`, whatever segmentation signaled - it is
+    // gated on the quantizer alone. Missing it left every non-lossless frame
+    // header one bit short from this point on, which an independent decoder
+    // (ffmpeg 7.1's dav1d) rejects while parsing the header rather than
+    // silently mis-decoding. This decoder never signals per-block delta-Q, so
+    // the bit is required to be 0, and delta_lf_params() (§5.9.18) is then
+    // absent entirely because it is gated on `delta_q_present`.
+    if base_q_idx > 0 {
+        require_bit(&mut bits, false, "delta_q_present")?;
+    }
     // loop_filter_params() (spec §5.9.11): `CodedLossless` (base_q_idx == 0
     // with every delta-Q field 0, which is exactly this decoder's lossless
     // path) forces every filter level to 0 with no bits read at all. The
@@ -1272,6 +1280,9 @@ mod tests {
             w.bits(0, 1); // loop_filter_delta_enabled
         }
         if base_q_idx != 0 {
+            w.bits(0, 1); // delta_q_present = 0 (spec §5.9.17)
+        }
+        if base_q_idx != 0 {
             // read_tx_mode(): only present when the frame is not
             // CodedLossless.
             w.bits(u32::from(tx_mode_select), 1);
@@ -1297,22 +1308,19 @@ mod tests {
     /// neighbors is block (0,0) directly) keeps a real, non-cascading step
     /// edge in the final reconstruction for [`deblock_frame`] to smooth.
     ///
-    /// `txb_skip_context` at 8x8 depends on `above_level`/`left_level` left
-    /// behind by earlier blocks in the same row/column, precomputed here by
-    /// walking the same recurrence `LosslessTileDecoder::txb_skip_context`/
-    /// `set_coefficient_context` use, in decode order (blocks visited in mi
-    /// order (0,0), (0,2), (2,0), (2,2), each an 8x8 block spanning a 2x2 mi
-    /// footprint, `x4`/`y4` at mi-column/row 0 or 2): block (0,0) sees no
-    /// neighbors set yet (`top == 0 && left == 0` -> context 1), leaving
-    /// `above_level[0]` and `left_level[0]` both at the clamped cumulative
-    /// level (`14`, from the large DC coefficient below). Block (0,2) then
-    /// sees `above_level[2] == 0`, `left_level[0] == 14` (one zero
-    /// neighbor, `max > 3`) -> context 3; block (2,0) sees the symmetric
-    /// `above_level[0] == 14`, `left_level[2] == 0` -> context 3. Both are
-    /// skipped, so they reset `above_level[2]`/`left_level[2]` back to 0,
-    /// leaving block (2,2) with both neighbors 0 -> context 1 again.
-    fn non_lossless_key_frame_tile(tx_set: cdf::Av1TxSet, tx_type_symbol: usize) -> Vec<u8> {
-        const CONTEXTS: [usize; 4] = [1, 3, 3, 1];
+    /// Each 8x8 block holds a single 8x8 transform, so the transform covers
+    /// the whole coding block and `getTXBSkipCtx` (spec §8.3.2) returns
+    /// context 0 for every one of them without consulting a neighbour - the
+    /// `above_level`/`left_level` recurrence never gets a say.
+    fn non_lossless_key_frame_tile(
+        base_q_idx: u8,
+        tx_set: cdf::Av1TxSet,
+        tx_type_symbol: usize,
+    ) -> Vec<u8> {
+        // The transform covers the whole 8x8 coding block.
+        const CONTEXTS: [usize; 4] = [0, 0, 0, 0];
+        let qctx = cdf::coeff_qctx(base_q_idx);
+        let tx_ctx = cdf::coeff_tx_size_ctx(8);
         let mut e = SymbolEncoder::new();
         e.symbol(&cdf::PARTITION_W16[0], 3); // SPLIT into four 8x8 blocks
         for (block, &context) in CONTEXTS.iter().enumerate() {
@@ -1320,19 +1328,20 @@ mod tests {
             e.symbol(&cdf::SKIP[0], 0); // skip = 0
             e.symbol(&cdf::INTRA_FRAME_Y_MODE_DC_DC, 0); // DC_PRED
             if block == 0 || block == 3 {
-                e.symbol(&cdf::TXB_SKIP[context], 0); // not skipped
-                e.symbol(&cdf::EOB_PT_64[0][0], 0); // eob_point = 1 -> eob = 1
-                e.symbol(&cdf::COEFF_BASE_EOB[0][0], 2); // level = 3 (max base)
-                e.symbol(&cdf::COEFF_BR[0][0], 3); // +3, keep extending
-                e.symbol(&cdf::COEFF_BR[0][0], 3); // +3, keep extending
-                e.symbol(&cdf::COEFF_BR[0][0], 3); // +3, keep extending
-                e.symbol(&cdf::COEFF_BR[0][0], 2); // +2, stop (level = 14)
-                e.symbol(&cdf::DC_SIGN[0][0], usize::from(block == 0)); // block 0 negative, block 3 positive
+                e.symbol(cdf::txb_skip_cdf(qctx, tx_ctx, context), 0); // not skipped
+                e.symbol(cdf::eob_pt_cdf(qctx, 8, 0), 0); // eob_point = 1 -> eob = 1
+                e.symbol(cdf::coeff_base_eob_cdf(qctx, tx_ctx, 0, 0), 2); // level = 3 (max base)
+                e.symbol(cdf::coeff_br_cdf(qctx, tx_ctx, 0, 0), 3); // +3, keep extending
+                e.symbol(cdf::coeff_br_cdf(qctx, tx_ctx, 0, 0), 3); // +3, keep extending
+                e.symbol(cdf::coeff_br_cdf(qctx, tx_ctx, 0, 0), 3); // +3, keep extending
+                e.symbol(cdf::coeff_br_cdf(qctx, tx_ctx, 0, 0), 2); // +2, stop (level = 14)
+                // block 0 negative, block 3 positive
+                e.symbol(cdf::dc_sign_cdf(qctx, 0, 0), usize::from(block == 0));
                 // read_tx_type: an 8x8 DC_PRED block's set-appropriate
                 // `tx_type` symbol.
                 e.symbol(cdf::tx_type_cdf(tx_set, 8, 0).unwrap(), tx_type_symbol);
             } else {
-                e.symbol(&cdf::TXB_SKIP[context], 1); // skipped -> all zero
+                e.symbol(cdf::txb_skip_cdf(qctx, tx_ctx, context), 1); // skipped -> all zero
             }
         }
         e.finish()
@@ -1348,7 +1357,11 @@ mod tests {
         tx_type_symbol: usize,
     ) -> Vec<u8> {
         let mut payload = frame_header_payload(base_q_idx, loop_filter, false, reduced_tx_set);
-        payload.extend_from_slice(&non_lossless_key_frame_tile(tx_set, tx_type_symbol));
+        payload.extend_from_slice(&non_lossless_key_frame_tile(
+            base_q_idx,
+            tx_set,
+            tx_type_symbol,
+        ));
 
         let mut stream = Vec::new();
         push_obu(&mut stream, 2, &[]); // temporal delimiter
@@ -1593,12 +1606,20 @@ mod tests {
     /// Codes one transform block holding a single positive DC coefficient
     /// of level 4 (`COEFF_BASE_EOB` = 3, then one `COEFF_BR` increment of
     /// 1, which is below 3 and so terminates the range extension).
-    fn encode_dc_only_transform_block(e: &mut SymbolEncoder, skip_context: usize, coded: usize) {
-        e.symbol(&cdf::TXB_SKIP[skip_context], 0); // not skipped
-        e.symbol(cdf::eob_pt_cdf(coded, 0), 0); // eob_point = 1 -> eob = 1
-        e.symbol(&cdf::COEFF_BASE_EOB[0][0], 2); // level = 3 (max base)
-        e.symbol(&cdf::COEFF_BR[0][0], 1); // +1, stop (level = 4)
-        e.symbol(&cdf::DC_SIGN[0][0], 0); // positive
+    ///
+    /// `size` is the transform's own side length, which selects both the
+    /// coefficient CDFs' transform-size context and (capped at 32, since a
+    /// 64x64 transform codes only its upper-left quadrant) the `eob_pt`
+    /// class.
+    fn encode_dc_only_transform_block(e: &mut SymbolEncoder, skip_context: usize, size: usize) {
+        let qctx = cdf::coeff_qctx(SUPERBLOCK_Q);
+        let tx_ctx = cdf::coeff_tx_size_ctx(size);
+        e.symbol(cdf::txb_skip_cdf(qctx, tx_ctx, skip_context), 0); // not skipped
+        // eob_point = 1 -> eob = 1
+        e.symbol(cdf::eob_pt_cdf(qctx, size.min(32), 0), 0);
+        e.symbol(cdf::coeff_base_eob_cdf(qctx, tx_ctx, 0, 0), 2); // level = 3 (max base)
+        e.symbol(cdf::coeff_br_cdf(qctx, tx_ctx, 0, 0), 1); // +1, stop (level = 4)
+        e.symbol(cdf::dc_sign_cdf(qctx, 0, 0), 0); // positive
     }
 
     /// The reconstruction a `size x size` transform carrying DC level 4
@@ -1627,8 +1648,9 @@ mod tests {
         // 64x64 block selects TX_64X64. Its coefficients are coded in the
         // upper-left 32x32 quadrant only, hence the 32-wide eob_pt class,
         // and TX_64X64's transform set is TX_SET_DCTONLY, so no tx_type
-        // symbol follows the coefficients either.
-        encode_dc_only_transform_block(&mut e, 1, 32);
+        // symbol follows the coefficients either. The transform covers the
+        // whole coding block, so `getTXBSkipCtx` is 0.
+        encode_dc_only_transform_block(&mut e, 0, 64);
         let stream = superblock_temporal_unit(&e.finish(), false);
 
         let limits = Limits::default();
@@ -1660,7 +1682,11 @@ mod tests {
         // (context 3), and the last one sees neither (context 1).
         encode_dc_only_transform_block(&mut e, 1, 32);
         for context in [3, 3, 1] {
-            e.symbol(&cdf::TXB_SKIP[context], 1); // skipped -> all zero
+            // skipped -> all zero
+            e.symbol(
+                cdf::txb_skip_cdf(cdf::coeff_qctx(SUPERBLOCK_Q), cdf::coeff_tx_size_ctx(32), context),
+                1,
+            );
         }
         let stream = superblock_temporal_unit(&e.finish(), true);
 
@@ -1691,7 +1717,10 @@ mod tests {
         // All sixteen 16x16 transforms are skipped, so every one of them
         // sees zeroed level contexts and codes at skip context 1.
         for _ in 0..16 {
-            e.symbol(&cdf::TXB_SKIP[1], 1);
+            e.symbol(
+                cdf::txb_skip_cdf(cdf::coeff_qctx(SUPERBLOCK_Q), cdf::coeff_tx_size_ctx(16), 1),
+                1,
+            );
         }
         let stream = superblock_temporal_unit(&e.finish(), true);
 
@@ -1717,7 +1746,7 @@ mod tests {
         // TX_64X64 would write outside the reconstruction buffer.
         let mut e = SymbolEncoder::new();
         superblock_prefix(&mut e);
-        encode_dc_only_transform_block(&mut e, 1, 32);
+        encode_dc_only_transform_block(&mut e, 0, 64);
         let tile = e.finish();
         let mut payload = frame_header_payload(SUPERBLOCK_Q, Some((0, 0, 0, 0, 0)), false, true);
         payload.extend_from_slice(&tile);
@@ -1748,20 +1777,27 @@ mod coefficient_level_tests {
     #[test]
     fn decodes_a_golomb_extended_negative_dc_coefficient() {
         let mut e = SymbolEncoder::new();
-        e.symbol(&cdf::TXB_SKIP[1], 0); // not skipped
-        e.symbol(&cdf::EOB_PT_64[0][0], 0); // eob_point = 1 -> eob = 1
-        e.symbol(&cdf::COEFF_BASE_EOB[0][0], 2); // level = 3 (max base)
-        e.symbol(&cdf::COEFF_BR[0][0], 3); // +3, keep extending
-        e.symbol(&cdf::COEFF_BR[0][0], 3); // +3, keep extending
-        e.symbol(&cdf::COEFF_BR[0][0], 3); // +3, keep extending
-        e.symbol(&cdf::COEFF_BR[0][0], 2); // +2, stop (level = 14)
-        e.symbol(&cdf::DC_SIGN[0][0], 1); // negative
+        // A 16x16 coding block holding an 8x8 transform, so the transform
+        // does not cover the block and the neighbour-derived skip context 1
+        // (no nonzero neighbour yet) applies.
+        let qctx = cdf::coeff_qctx(40);
+        let tx_ctx = cdf::coeff_tx_size_ctx(8);
+        e.symbol(cdf::txb_skip_cdf(qctx, tx_ctx, 1), 0); // not skipped
+        e.symbol(cdf::eob_pt_cdf(qctx, 8, 0), 0); // eob_point = 1 -> eob = 1
+        e.symbol(cdf::coeff_base_eob_cdf(qctx, tx_ctx, 0, 0), 2); // level = 3 (max base)
+        e.symbol(cdf::coeff_br_cdf(qctx, tx_ctx, 0, 0), 3); // +3, keep extending
+        e.symbol(cdf::coeff_br_cdf(qctx, tx_ctx, 0, 0), 3); // +3, keep extending
+        e.symbol(cdf::coeff_br_cdf(qctx, tx_ctx, 0, 0), 3); // +3, keep extending
+        e.symbol(cdf::coeff_br_cdf(qctx, tx_ctx, 0, 0), 2); // +2, stop (level = 14)
+        e.symbol(cdf::dc_sign_cdf(qctx, 0, 1), 1); // negative
         let bytes = e.finish();
         let limits = Limits::default();
         let mut decoder =
             LosslessTileDecoder::new(&bytes, 16, 16, 4, 4, 40, false, true, &limits).unwrap();
         let scan = cdf::up_right_diagonal_scan(8);
-        let (levels, skipped) = decoder.decode_coefficient_levels(0, 0, 8, &scan).unwrap();
+        let (levels, skipped) = decoder
+            .decode_coefficient_levels(0, 0, 16, 8, &scan)
+            .unwrap();
         assert!(!skipped);
         assert_eq!(levels[0], -14);
     }

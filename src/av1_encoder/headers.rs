@@ -230,7 +230,9 @@ pub(crate) fn frame_header_payload(
     w.put_bit(0); // using_qmatrix = 0
 
     w.put_bit(0); // segmentation_enabled = 0
-    // delta_q_params / delta_lf_params: base_q_idx == 0 ⇒ no bits.
+    // delta_q_params() (spec §5.9.17) reads `delta_q_present` for every frame with
+    // base_q_idx > 0; this encoder is lossless, so base_q_idx == 0 and no bit is present. A
+    // non-lossless encode path has to write it here, and delta_lf_params() (§5.9.18) after it.
     // CodedLossless ⇒ loop_filter / cdef / lr / tx_mode emit nothing.
     // frame_reference_mode / skip_mode_params (intra) ⇒ no bits. allow_warped_motion=0.
     w.put_bit(1); // reduced_tx_set = 1

@@ -570,9 +570,17 @@ fn parse_inter_frame_header(
     require_bit(bits, false, "using_qmatrix")?;
     // segmentation_params()
     require_bit(bits, false, "segmentation_enabled")?;
-    // delta_q_params()/delta_lf_params(): only present when base_q_idx > 0,
-    // and even then only when segmentation/delta-Q are enabled; this
-    // decoder never signals either, so no bits are read.
+    // delta_q_params() (spec §5.9.17): `delta_q_present` is read for *every*
+    // frame with `base_q_idx > 0`, whatever segmentation signaled - it is
+    // gated on the quantizer alone. Missing it left every non-lossless frame
+    // header one bit short from this point on, which an independent decoder
+    // (ffmpeg 7.1's dav1d) rejects while parsing the header rather than
+    // silently mis-decoding. This decoder never signals per-block delta-Q, so
+    // the bit is required to be 0, and delta_lf_params() (§5.9.18) is then
+    // absent entirely because it is gated on `delta_q_present`.
+    if base_q_idx > 0 {
+        require_bit(bits, false, "delta_q_present")?;
+    }
     // loop_filter_params() (spec §5.9.11): `CodedLossless` forces every
     // filter level to 0 with no bits read. The non-lossless path parses a
     // minimal but real subset, mirroring the intra decoder: two luma
@@ -2127,8 +2135,8 @@ pub(crate) mod test_encoder {
         assert_round_trips(&[
             (&cdf::PARTITION_W64[0], 0),
             (&cdf::PARTITION_W64[0], 3),
-            (&cdf::TXB_SKIP[0], 1),
-            (&cdf::COEFF_BASE_EOB[0][0], 2),
+            (cdf::txb_skip_cdf(0, 0, 0), 1),
+            (cdf::coeff_base_eob_cdf(0, 0, 0, 0), 2),
             (&cdf::MV_JOINT, 3),
             (&cdf::MV_CLASS[0], 0),
             (&cdf::MV_SIGN, 1),
@@ -2356,6 +2364,9 @@ mod tests {
             self.w.bits(0, 1); // using_qmatrix
             self.w.bits(0, 1); // segmentation_enabled
             if base_q_idx != 0 {
+                self.w.bits(0, 1); // delta_q_present = 0 (spec §5.9.17)
+            }
+            if base_q_idx != 0 {
                 let (y_v, y_h, u, v, sharpness) = loop_filter.unwrap_or((0, 0, 0, 0, 0));
                 self.w.bits(y_v.into(), 6);
                 self.w.bits(y_h.into(), 6);
@@ -2417,16 +2428,19 @@ mod tests {
             e.symbol(&cdf::SKIP[0], 0); // skip = 0
             e.symbol(&cdf::INTRA_FRAME_Y_MODE_DC_DC, 0); // DC_PRED
             for (t, &context) in contexts.iter().enumerate() {
+                // A lossless frame lands on qctx 0 and, with TX_4X4
+                // transforms inside 8x8 coding blocks, txSzCtx 0 and the
+                // neighbour-derived skip contexts above.
                 if block == 0 && t == 0 {
-                    e.symbol(&cdf::TXB_SKIP[context], 0); // not skipped
-                    e.symbol(&cdf::EOB_PT_16[0][0], 0); // eob_point = 1 -> eob = 1
+                    e.symbol(cdf::txb_skip_cdf(0, 0, context), 0); // not skipped
+                    e.symbol(cdf::eob_pt_cdf(0, 4, 0), 0); // eob_point = 1 -> eob = 1
                     // coefficient 0 is also eob - 1: COEFF_BASE_EOB, ctx 0.
-                    e.symbol(&cdf::COEFF_BASE_EOB[0][0], 0); // level = 1
+                    e.symbol(cdf::coeff_base_eob_cdf(0, 0, 0, 0), 0); // level = 1
                     // level (1) <= NUM_BASE_LEVELS, so no COEFF_BR reads.
                     // dc_sign_context(0,0): both neighbor categories are 0.
-                    e.symbol(&cdf::DC_SIGN[0][0], 0); // positive
+                    e.symbol(cdf::dc_sign_cdf(0, 0, 0), 0); // positive
                 } else {
-                    e.symbol(&cdf::TXB_SKIP[context], 1); // skipped -> all zero
+                    e.symbol(cdf::txb_skip_cdf(0, 0, context), 1); // skipped -> all zero
                 }
             }
         }
@@ -2458,12 +2472,12 @@ mod tests {
                 _ => 1,
             };
             if add_dc_residual && transform == 0 {
-                e.symbol(&cdf::TXB_SKIP[context], 0);
-                e.symbol(&cdf::EOB_PT_16[0][0], 0);
-                e.symbol(&cdf::COEFF_BASE_EOB[0][0], 0);
-                e.symbol(&cdf::DC_SIGN[0][0], 0);
+                e.symbol(cdf::txb_skip_cdf(0, 0, context), 0);
+                e.symbol(cdf::eob_pt_cdf(0, 4, 0), 0);
+                e.symbol(cdf::coeff_base_eob_cdf(0, 0, 0, 0), 0);
+                e.symbol(cdf::dc_sign_cdf(0, 0, 0), 0);
             } else {
-                e.symbol(&cdf::TXB_SKIP[context], 1);
+                e.symbol(cdf::txb_skip_cdf(0, 0, context), 1);
             }
         }
         e.finish()
@@ -2892,8 +2906,16 @@ mod tests {
     /// (0,2) and (2,0) are `TXB_SKIP`, producing a real step edge for
     /// [`deblock_frame`] to smooth without cascading through every later
     /// DC-predicted block.
-    fn non_lossless_key_frame_tile(tx_set: cdf::Av1TxSet, tx_type_symbol: usize) -> Vec<u8> {
-        const CONTEXTS: [usize; 4] = [1, 3, 3, 1];
+    fn non_lossless_key_frame_tile(
+        base_q_idx: u8,
+        tx_set: cdf::Av1TxSet,
+        tx_type_symbol: usize,
+    ) -> Vec<u8> {
+        // Each 8x8 transform covers its whole 8x8 coding block, so
+        // `getTXBSkipCtx` returns 0 without consulting a neighbour.
+        const CONTEXTS: [usize; 4] = [0, 0, 0, 0];
+        let qctx = cdf::coeff_qctx(base_q_idx);
+        let tx_ctx = cdf::coeff_tx_size_ctx(8);
         let mut e = SymbolEncoder::new();
         e.symbol(&cdf::PARTITION_W16[0], 3); // SPLIT into four 8x8 blocks
         for (block, &context) in CONTEXTS.iter().enumerate() {
@@ -2901,19 +2923,20 @@ mod tests {
             e.symbol(&cdf::SKIP[0], 0); // skip = 0
             e.symbol(&cdf::INTRA_FRAME_Y_MODE_DC_DC, 0); // DC_PRED
             if block == 0 || block == 3 {
-                e.symbol(&cdf::TXB_SKIP[context], 0); // not skipped
-                e.symbol(&cdf::EOB_PT_64[0][0], 0); // eob_point = 1 -> eob = 1
-                e.symbol(&cdf::COEFF_BASE_EOB[0][0], 2); // level = 3 (max base)
-                e.symbol(&cdf::COEFF_BR[0][0], 3); // +3, keep extending
-                e.symbol(&cdf::COEFF_BR[0][0], 3); // +3, keep extending
-                e.symbol(&cdf::COEFF_BR[0][0], 3); // +3, keep extending
-                e.symbol(&cdf::COEFF_BR[0][0], 2); // +2, stop (level = 14)
-                e.symbol(&cdf::DC_SIGN[0][0], usize::from(block == 0)); // block 0 negative, block 3 positive
+                e.symbol(cdf::txb_skip_cdf(qctx, tx_ctx, context), 0); // not skipped
+                e.symbol(cdf::eob_pt_cdf(qctx, 8, 0), 0); // eob_point = 1 -> eob = 1
+                e.symbol(cdf::coeff_base_eob_cdf(qctx, tx_ctx, 0, 0), 2); // level = 3 (max base)
+                e.symbol(cdf::coeff_br_cdf(qctx, tx_ctx, 0, 0), 3); // +3, keep extending
+                e.symbol(cdf::coeff_br_cdf(qctx, tx_ctx, 0, 0), 3); // +3, keep extending
+                e.symbol(cdf::coeff_br_cdf(qctx, tx_ctx, 0, 0), 3); // +3, keep extending
+                e.symbol(cdf::coeff_br_cdf(qctx, tx_ctx, 0, 0), 2); // +2, stop (level = 14)
+                // block 0 negative, block 3 positive
+                e.symbol(cdf::dc_sign_cdf(qctx, 0, 0), usize::from(block == 0));
                 // read_tx_type: an 8x8 DC_PRED block's set-appropriate
                 // `tx_type` symbol.
                 e.symbol(cdf::tx_type_cdf(tx_set, 8, 0).unwrap(), tx_type_symbol);
             } else {
-                e.symbol(&cdf::TXB_SKIP[context], 1); // skipped -> all zero
+                e.symbol(cdf::txb_skip_cdf(qctx, tx_ctx, context), 1); // skipped -> all zero
             }
         }
         e.finish()
@@ -2940,7 +2963,11 @@ mod tests {
             reduced_tx_set,
         );
         let mut payload = header;
-        payload.extend_from_slice(&non_lossless_key_frame_tile(tx_set, tx_type_symbol));
+        payload.extend_from_slice(&non_lossless_key_frame_tile(
+            base_q_idx,
+            tx_set,
+            tx_type_symbol,
+        ));
 
         let mut stream = Vec::new();
         push_obu(&mut stream, 2, &[]); // temporal delimiter
@@ -2976,11 +3003,15 @@ mod tests {
         e.symbol(&cdf::NEW_MV, 1);
         e.symbol(&cdf::ZERO_MV, 0); // GLOBALMV
         // TX_MODE_LARGEST: one TX_16X16 transform block, no tx_depth symbol.
-        e.symbol(&cdf::TXB_SKIP[1], 0); // not skipped, no neighbours yet
-        e.symbol(cdf::eob_pt_cdf(16, 0), 0); // eob_point = 1 -> eob = 1
-        e.symbol(&cdf::COEFF_BASE_EOB[0][0], 2); // level = 3 (max base)
-        e.symbol(&cdf::COEFF_BR[0][0], 1); // +1, stop (level = 4)
-        e.symbol(&cdf::DC_SIGN[0][0], 0); // positive
+        // The transform covers the whole 16x16 coding block, so
+        // `getTXBSkipCtx` is 0.
+        let qctx = cdf::coeff_qctx(40);
+        let tx_ctx = cdf::coeff_tx_size_ctx(16);
+        e.symbol(cdf::txb_skip_cdf(qctx, tx_ctx, 0), 0); // not skipped
+        e.symbol(cdf::eob_pt_cdf(qctx, 16, 0), 0); // eob_point = 1 -> eob = 1
+        e.symbol(cdf::coeff_base_eob_cdf(qctx, tx_ctx, 0, 0), 2); // level = 3 (max base)
+        e.symbol(cdf::coeff_br_cdf(qctx, tx_ctx, 0, 0), 1); // +1, stop (level = 4)
+        e.symbol(cdf::dc_sign_cdf(qctx, 0, 0), 0); // positive
         e.symbol(cdf::tx_type_cdf(tx_set, 16, 0).unwrap(), tx_type_symbol);
 
         let mi = 2 * FRAME_DIM.div_ceil(8) as usize;
@@ -3229,11 +3260,15 @@ mod tests {
         e.symbol(&cdf::PARTITION_W64[0], 0); // PARTITION_NONE
         e.symbol(&cdf::SKIP[0], 0); // skip = 0
         e.symbol(&cdf::INTRA_FRAME_Y_MODE_DC_DC, 0); // DC_PRED
-        e.symbol(&cdf::TXB_SKIP[1], 0); // not skipped, no neighbours yet
-        e.symbol(cdf::eob_pt_cdf(32, 0), 0); // eob_point = 1 -> eob = 1
-        e.symbol(&cdf::COEFF_BASE_EOB[0][0], 2); // level = 3 (max base)
-        e.symbol(&cdf::COEFF_BR[0][0], 1); // +1, stop (level = 4)
-        e.symbol(&cdf::DC_SIGN[0][0], 0); // positive
+        // The TX_64X64 transform covers the whole 64x64 coding block, so
+        // `getTXBSkipCtx` is 0.
+        let qctx = cdf::coeff_qctx(SUPERBLOCK_Q);
+        let tx_ctx = cdf::coeff_tx_size_ctx(64);
+        e.symbol(cdf::txb_skip_cdf(qctx, tx_ctx, 0), 0); // not skipped
+        e.symbol(cdf::eob_pt_cdf(qctx, 32, 0), 0); // eob_point = 1 -> eob = 1
+        e.symbol(cdf::coeff_base_eob_cdf(qctx, tx_ctx, 0, 0), 2); // level = 3 (max base)
+        e.symbol(cdf::coeff_br_cdf(qctx, tx_ctx, 0, 0), 1); // +1, stop (level = 4)
+        e.symbol(cdf::dc_sign_cdf(qctx, 0, 0), 0); // positive
 
         let mi = 2 * SUPERBLOCK_DIM.div_ceil(8) as usize;
         let mut payload = FrameHeaderBuilder::key_frame(3).finish_common_with_quantizer(

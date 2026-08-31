@@ -87,7 +87,7 @@ pub static INTRA_FRAME_Y_MODE_DC_DC: [u16; 13] = [
 // lands on `qctx = 0`, `txSzCtx = 0`, which is the only slice this module
 // used to carry.
 
-pub use crate::av1_cdf_tables::TX_SIZE_CTXS;
+pub use crate::av1_cdf_tables::{Q_CTXS, TX_SIZE_CTXS};
 
 /// The quantizer context the coefficient CDFs are selected by (spec §8.3.2:
 /// `base_q_idx <= 20`, `<= 60`, `<= 120`, else), from the frame header's
@@ -634,11 +634,12 @@ mod tests {
     fn eob_pt_cdfs_span_their_transform_blocks_coefficient_count() {
         // eobPt is coded with log2(count) + 1 symbols, and the largest
         // eobPt must be able to address the block's final coefficient.
+        for qctx in 0..Q_CTXS {
         for (size, cdf) in [
-            (4usize, eob_pt_cdf(4, 0)),
-            (8, eob_pt_cdf(8, 0)),
-            (16, eob_pt_cdf(16, 0)),
-            (32, eob_pt_cdf(32, 0)),
+            (4usize, eob_pt_cdf(qctx, 4, 0)),
+            (8, eob_pt_cdf(qctx, 8, 0)),
+            (16, eob_pt_cdf(qctx, 16, 0)),
+            (32, eob_pt_cdf(qctx, 32, 0)),
         ] {
             let count = size * size;
             let max_eob_pt = cdf.len();
@@ -648,6 +649,7 @@ mod tests {
                 "size {size}: eob_pt reaches {max_eob}, needs {count}"
             );
             assert_eq!(*cdf.last().unwrap(), 32768);
+        }
         }
     }
 
