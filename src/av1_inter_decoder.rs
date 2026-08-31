@@ -2257,6 +2257,7 @@ mod tests {
                 0,
                 None,
                 false,
+                true,
             )
         }
 
@@ -2270,6 +2271,7 @@ mod tests {
             base_q_idx: u8,
             loop_filter: Option<(u8, u8, u8, u8, u8)>,
             tx_mode_select: bool,
+            reduced_tx_set: bool,
         ) -> Vec<u8> {
             // tile_info(): uniform spacing, one tile (mi_cols/mi_rows <= 64
             // superblock units here, so no increment bits are read).
@@ -2301,7 +2303,7 @@ mod tests {
                     self.w.bits(0, 1); // skip_mode_present = 0
                 }
             }
-            self.w.bits(1, 1); // reduced_tx_set = 1
+            self.w.bits(u32::from(reduced_tx_set), 1); // reduced_tx_set
             if !is_intra {
                 for _ in 0..7 {
                     self.w.bits(0, 1); // is_global (identity global motion)
@@ -2818,7 +2820,7 @@ mod tests {
     /// (0,2) and (2,0) are `TXB_SKIP`, producing a real step edge for
     /// [`deblock_frame`] to smooth without cascading through every later
     /// DC-predicted block.
-    fn non_lossless_key_frame_tile() -> Vec<u8> {
+    fn non_lossless_key_frame_tile(tx_set: cdf::Av1TxSet, tx_type_symbol: usize) -> Vec<u8> {
         const CONTEXTS: [usize; 4] = [1, 3, 3, 1];
         let mut e = SymbolEncoder::new();
         e.symbol(&cdf::PARTITION_W16[0], 3); // SPLIT into four 8x8 blocks
@@ -2835,12 +2837,9 @@ mod tests {
                 e.symbol(&cdf::COEFF_BR[0][0], 3); // +3, keep extending
                 e.symbol(&cdf::COEFF_BR[0][0], 2); // +2, stop (level = 14)
                 e.symbol(&cdf::DC_SIGN[0][0], usize::from(block == 0)); // block 0 negative, block 3 positive
-                // TX_SET_INTRA_2 (reduced_tx_set = 1, 8x8, DC_PRED):
-                // {IDTX, DCT_DCT, ADST_ADST, ADST_DCT, DCT_ADST}.
-                e.symbol(
-                    cdf::tx_type_cdf(cdf::Av1TxSet::Intra2, 8, 0).unwrap(),
-                    1,
-                ); // DCT_DCT
+                // read_tx_type: an 8x8 DC_PRED block's set-appropriate
+                // `tx_type` symbol.
+                e.symbol(cdf::tx_type_cdf(tx_set, 8, 0).unwrap(), tx_type_symbol);
             } else {
                 e.symbol(&cdf::TXB_SKIP[context], 1); // skipped -> all zero
             }
@@ -2853,6 +2852,9 @@ mod tests {
     fn non_lossless_key_frame_temporal_unit(
         base_q_idx: u8,
         loop_filter: Option<(u8, u8, u8, u8, u8)>,
+        reduced_tx_set: bool,
+        tx_set: cdf::Av1TxSet,
+        tx_type_symbol: usize,
     ) -> Vec<u8> {
         let mi = 2 * FRAME_DIM.div_ceil(8) as usize;
         let header = FrameHeaderBuilder::key_frame(3).finish_common_with_quantizer(
@@ -2863,9 +2865,10 @@ mod tests {
             base_q_idx,
             loop_filter,
             false,
+            reduced_tx_set,
         );
         let mut payload = header;
-        payload.extend_from_slice(&non_lossless_key_frame_tile());
+        payload.extend_from_slice(&non_lossless_key_frame_tile(tx_set, tx_type_symbol));
 
         let mut stream = Vec::new();
         push_obu(&mut stream, 2, &[]); // temporal delimiter
@@ -2878,10 +2881,195 @@ mod tests {
         stream
     }
 
+    /// A non-lossless inter frame whose single 16x16 `GLOBALMV` block
+    /// carries one DC coefficient (level 4, positive) and signals
+    /// `tx_type_symbol` out of `tx_set`.
+    ///
+    /// Identity global motion makes the prediction a straight copy of the
+    /// co-located reference samples and every loop filter level is 0, so
+    /// the reconstruction is exactly the reference plane plus the
+    /// signalled transform's residual.
+    fn non_lossless_inter_temporal_unit(
+        reduced_tx_set: bool,
+        tx_set: cdf::Av1TxSet,
+        tx_type_symbol: usize,
+    ) -> Vec<u8> {
+        let mut e = SymbolEncoder::new();
+        e.symbol(&cdf::PARTITION_W16[0], 0); // one 16x16 block
+        e.symbol(&cdf::SKIP[0], 0);
+        e.symbol(&cdf::IS_INTER, 1);
+        e.symbol(&cdf::SINGLE_REF_P1, 0);
+        e.symbol(&cdf::SINGLE_REF_P3, 0);
+        e.symbol(&cdf::SINGLE_REF_P4, 0);
+        e.symbol(&cdf::NEW_MV, 1);
+        e.symbol(&cdf::ZERO_MV, 0); // GLOBALMV
+        // TX_MODE_LARGEST: one TX_16X16 transform block, no tx_depth symbol.
+        e.symbol(&cdf::TXB_SKIP[1], 0); // not skipped, no neighbours yet
+        e.symbol(cdf::eob_pt_cdf(16, 0), 0); // eob_point = 1 -> eob = 1
+        e.symbol(&cdf::COEFF_BASE_EOB[0][0], 2); // level = 3 (max base)
+        e.symbol(&cdf::COEFF_BR[0][0], 1); // +1, stop (level = 4)
+        e.symbol(&cdf::DC_SIGN[0][0], 0); // positive
+        e.symbol(cdf::tx_type_cdf(tx_set, 16, 0).unwrap(), tx_type_symbol);
+
+        let mi = 2 * FRAME_DIM.div_ceil(8) as usize;
+        let mut payload = FrameHeaderBuilder::inter_frame(3, 1, 0x01, [0; 7], None)
+            .finish_common_with_quantizer(
+                false,
+                false,
+                mi,
+                mi,
+                40,
+                Some((0, 0, 0, 0, 0)),
+                false,
+                reduced_tx_set,
+            );
+        payload.extend_from_slice(&e.finish());
+
+        let mut stream = Vec::new();
+        push_obu(&mut stream, 2, &[]); // temporal delimiter
+        push_obu(&mut stream, 6, &payload); // Frame OBU
+        stream
+    }
+
+    /// The reference plane the fixture above predicts from: the
+    /// non-lossless key frame decoded on its own, with every loop filter
+    /// level 0 so nothing perturbs the reconstruction.
+    fn non_lossless_reference_luma() -> Vec<u8> {
+        let mut decoder = Av1InterDecoder::new(Limits::default()).unwrap();
+        decoder
+            .decode_temporal_unit(&non_lossless_key_frame_temporal_unit(
+                40,
+                Some((0, 0, 0, 0, 0)),
+                true,
+                cdf::Av1TxSet::Intra2,
+                1,
+            ))
+            .unwrap()
+            .planes[0]
+            .data
+            .clone()
+    }
+
+    /// Every transform type `TX_SET_INTER_2`/`TX_SET_INTER_3` can signal
+    /// and this crate has a kernel for must reach that kernel from an
+    /// inter-predicted bitstream block, including the flipped-ADST types.
+    #[test]
+    fn every_signalled_inter_transform_type_reconstructs_through_its_kernel() {
+        let reference = non_lossless_reference_luma();
+        let mut coefficients = vec![0i32; 16 * 16];
+        coefficients[0] = 4;
+        let mut seen = Vec::new();
+        for (reduced_tx_set, symbol, tx_type) in [
+            // TX_SET_INTER_3 (reduced_tx_set = 1): {IDTX, DCT_DCT}.
+            (true, 0, Av1TxType::Idtx),
+            (true, 1, Av1TxType::DctDct),
+            // TX_SET_INTER_2 (16x16, reduced_tx_set = 0), skipping the
+            // V_DCT/H_DCT entries at symbol indices 1 and 2.
+            (false, 0, Av1TxType::Idtx),
+            (false, 3, Av1TxType::DctDct),
+            (false, 4, Av1TxType::AdstDct),
+            (false, 5, Av1TxType::DctAdst),
+            (false, 6, Av1TxType::FlipadstDct),
+            (false, 7, Av1TxType::DctFlipadst),
+            (false, 8, Av1TxType::AdstAdst),
+            (false, 9, Av1TxType::FlipadstFlipadst),
+            (false, 10, Av1TxType::AdstFlipadst),
+            (false, 11, Av1TxType::FlipadstAdst),
+        ] {
+            let tx_set = if reduced_tx_set {
+                cdf::Av1TxSet::Inter3
+            } else {
+                cdf::Av1TxSet::Inter2
+            };
+            let mut decoder = Av1InterDecoder::new(Limits::default()).unwrap();
+            decoder
+                .decode_temporal_unit(&non_lossless_key_frame_temporal_unit(
+                    40,
+                    Some((0, 0, 0, 0, 0)),
+                    true,
+                    cdf::Av1TxSet::Intra2,
+                    1,
+                ))
+                .unwrap();
+            let frame = decoder
+                .decode_temporal_unit(&non_lossless_inter_temporal_unit(
+                    reduced_tx_set,
+                    tx_set,
+                    symbol,
+                ))
+                .unwrap();
+            let residuals = inverse_transform(
+                &coefficients,
+                16,
+                tx_type,
+                get_dc_quant(40),
+                get_ac_quant(40),
+            );
+            let stride = frame.planes[0].stride;
+            let expected: Vec<u8> = (0..16)
+                .flat_map(|row| {
+                    (0..16).map(move |column| (row, column)).collect::<Vec<_>>()
+                })
+                .map(|(row, column)| {
+                    let predicted = i32::from(reference[row * stride + column]);
+                    (predicted + i32::from(residuals[row * 16 + column])).clamp(0, 255) as u8
+                })
+                .collect();
+            let decoded: Vec<u8> = (0..16)
+                .flat_map(|row| {
+                    let start = row * stride;
+                    frame.planes[0].data[start..start + 16].to_vec()
+                })
+                .collect();
+            assert_eq!(decoded, expected, "{tx_type:?} (reduced = {reduced_tx_set})");
+            seen.push((tx_type, decoded));
+        }
+        // Each distinct kernel must produce a distinct block, or the
+        // assertions above would pass on a decoder that ignored tx_type.
+        for (index, (tx_type, block)) in seen.iter().enumerate() {
+            assert!(
+                !seen[..index]
+                    .iter()
+                    .any(|(other, earlier)| other != tx_type && earlier == block),
+                "{tx_type:?} is not distinguishable from an earlier transform type"
+            );
+        }
+    }
+
+    /// `TX_SET_INTER_2` also contains the half-identity `V_DCT`/`H_DCT`
+    /// types, which have no kernel here and must be an explicit
+    /// `Unsupported` rather than a silent substitution.
+    #[test]
+    fn signalling_a_half_identity_inter_transform_type_is_unsupported() {
+        for symbol in [1usize, 2] {
+            let mut decoder = Av1InterDecoder::new(Limits::default()).unwrap();
+            decoder
+                .decode_temporal_unit(&non_lossless_key_frame_temporal_unit(
+                    40,
+                    Some((0, 0, 0, 0, 0)),
+                    true,
+                    cdf::Av1TxSet::Intra2,
+                    1,
+                ))
+                .unwrap();
+            assert_eq!(
+                decoder
+                    .decode_temporal_unit(&non_lossless_inter_temporal_unit(
+                        false,
+                        cdf::Av1TxSet::Inter2,
+                        symbol,
+                    ))
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::Unsupported
+            );
+        }
+    }
+
     #[test]
     fn non_lossless_stream_reaches_deblock_frame_with_non_default_transform_sizes() {
         let limits = Limits::default();
-        let stream = non_lossless_key_frame_temporal_unit(40, Some((30, 30, 0, 0, 0)));
+        let stream = non_lossless_key_frame_temporal_unit(40, Some((30, 30, 0, 0, 0)), true, cdf::Av1TxSet::Intra2, 1);
         let mut decoder = Av1InterDecoder::new(limits).unwrap();
         let frame = decoder.decode_temporal_unit(&stream).unwrap();
         assert_eq!(
@@ -2977,6 +3165,7 @@ mod tests {
             SUPERBLOCK_Q,
             Some((0, 0, 0, 0, 0)), // every filter level 0: deblocking is a no-op
             false,                 // TX_MODE_LARGEST
+            true,                  // reduced_tx_set
         );
         payload.extend_from_slice(&e.finish());
 
