@@ -362,9 +362,8 @@ pub struct SyntheticAv1Stream {
 /// and nothing else.
 pub fn synthetic_av1_stream() -> &'static SyntheticAv1Stream {
     use zvidlib::{
-        CpuFrameSource, FrameIndex, FrameSource, HardwarePreference, Orientation,
-        VideoDimensions, VideoEncoderConfig, VideoEncoderFactory,
-        native_av1_video_encoder_factory,
+        CpuFrameSource, FrameIndex, FrameSource, HardwarePreference, Orientation, VideoDimensions,
+        VideoEncoderConfig, VideoEncoderFactory, native_av1_video_encoder_factory,
     };
 
     static STREAM: OnceLock<SyntheticAv1Stream> = OnceLock::new();

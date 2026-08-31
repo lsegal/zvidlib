@@ -171,7 +171,11 @@ fn av1_inverse_transforms(criterion: &mut Criterion) {
         let blocks = (WIDTH / size) * (HEIGHT / size);
         let workload = kernel_workload(
             name,
-            FrameWork::new(1, (WIDTH / size * size) as u64, (HEIGHT / size * size) as u64),
+            FrameWork::new(
+                1,
+                (WIDTH / size * size) as u64,
+                (HEIGHT / size * size) as u64,
+            ),
         );
         bench_across_isas(criterion, &workload, || {
             let mut digest = 0u64;
@@ -237,11 +241,7 @@ fn av1_deblock_boundary(criterion: &mut Criterion) {
     let small = support::av1_flat_blocks_plane(SMALL_WIDTH, SMALL_HEIGHT);
     let workload = kernel_workload(
         "av1_deblock_boundary",
-        FrameWork::new(
-            PLANES as u64,
-            SMALL_WIDTH as u64,
-            SMALL_HEIGHT as u64,
-        ),
+        FrameWork::new(PLANES as u64, SMALL_WIDTH as u64, SMALL_HEIGHT as u64),
     );
     bench_across_isas(criterion, &workload, || {
         let mut out = Vec::with_capacity(PLANES * SMALL_WIDTH * SMALL_HEIGHT);
@@ -335,7 +335,11 @@ fn av1_mc_single(criterion: &mut Criterion) {
     let (blocks_x, blocks_y) = mc_blocks();
     let workload = kernel_workload(
         "av1_mc_single",
-        FrameWork::new(1, (blocks_x * MC_BLOCK) as u64, (blocks_y * MC_BLOCK) as u64),
+        FrameWork::new(
+            1,
+            (blocks_x * MC_BLOCK) as u64,
+            (blocks_y * MC_BLOCK) as u64,
+        ),
     );
     bench_across_isas(criterion, &workload, || {
         let mut context = McContext::new();
@@ -369,7 +373,11 @@ fn av1_mc_compound_average(criterion: &mut Criterion) {
     let (blocks_x, blocks_y) = mc_blocks();
     let workload = kernel_workload(
         "av1_mc_compound_average",
-        FrameWork::new(1, (blocks_x * MC_BLOCK) as u64, (blocks_y * MC_BLOCK) as u64),
+        FrameWork::new(
+            1,
+            (blocks_x * MC_BLOCK) as u64,
+            (blocks_y * MC_BLOCK) as u64,
+        ),
     );
     bench_across_isas(criterion, &workload, || {
         let level = default_level();
@@ -430,7 +438,11 @@ fn av1_mc_blend_mask(criterion: &mut Criterion) {
     let (blocks_x, blocks_y) = mc_blocks();
     let workload = kernel_workload(
         "av1_mc_blend_mask",
-        FrameWork::new(1, (blocks_x * MC_BLOCK) as u64, (blocks_y * MC_BLOCK) as u64),
+        FrameWork::new(
+            1,
+            (blocks_x * MC_BLOCK) as u64,
+            (blocks_y * MC_BLOCK) as u64,
+        ),
     );
     bench_across_isas(criterion, &workload, || {
         let level = default_level();
@@ -468,14 +480,7 @@ fn av1_mc_blend_mask(criterion: &mut Criterion) {
                     MC_BLOCK,
                 );
                 build_difference_mask(
-                    &pred0,
-                    MC_BLOCK,
-                    &pred1,
-                    MC_BLOCK,
-                    MC_BLOCK,
-                    MC_BLOCK,
-                    false,
-                    &mut mask,
+                    &pred0, MC_BLOCK, &pred1, MC_BLOCK, MC_BLOCK, MC_BLOCK, false, &mut mask,
                     MC_BLOCK,
                 );
                 blend_mask(
@@ -541,8 +546,12 @@ fn av1_intra_prediction(criterion: &mut Criterion) {
         let mut digest = 0u64;
         for _ in 0..blocks {
             for row in 0..INTRA_BLOCK {
-                let (predicted, _) = out.split_at_mut(INTRA_BLOCK);
-                paeth_row(top[0], &top, left[row], predicted);
+                paeth_row(
+                    top[0],
+                    &top,
+                    left[row],
+                    &mut out[row * INTRA_BLOCK..][..INTRA_BLOCK],
+                );
             }
             digest ^= checksum(&out);
         }
@@ -555,8 +564,13 @@ fn av1_intra_prediction(criterion: &mut Criterion) {
         let mut digest = 0u64;
         for _ in 0..blocks {
             for row in 0..INTRA_BLOCK {
-                let (predicted, _) = out.split_at_mut(INTRA_BLOCK);
-                smooth_row(SmoothMode::Smooth, &top, &left, row, predicted);
+                smooth_row(
+                    SmoothMode::Smooth,
+                    &top,
+                    &left,
+                    row,
+                    &mut out[row * INTRA_BLOCK..][..INTRA_BLOCK],
+                );
             }
             digest ^= checksum(&out);
         }
@@ -569,8 +583,14 @@ fn av1_intra_prediction(criterion: &mut Criterion) {
         let mut digest = 0u64;
         for _ in 0..blocks {
             for row in 0..INTRA_BLOCK {
-                let (predicted, _) = out.split_at_mut(INTRA_BLOCK);
-                directional_row(67, &top, &left, row, true, predicted);
+                directional_row(
+                    67,
+                    &top,
+                    &left,
+                    row,
+                    true,
+                    &mut out[row * INTRA_BLOCK..][..INTRA_BLOCK],
+                );
             }
             digest ^= checksum(&out);
         }
@@ -619,9 +639,14 @@ fn av1_entropy_symbol(criterion: &mut Criterion) {
     const EOB_CDF: [u16; 3] = [10_000, 26_000, AV1_CDF_MAX];
     const COEFF_CDF: [u16; 4] = [4_016, 15_324, 25_112, AV1_CDF_MAX];
 
+    // Symbols, not pixels: this stage's rate is symbols per second, so the
+    // harness's megapixel line reads as millions of symbols per second.
     let workload = IsaWorkload {
         sample_size: 20,
-        ..kernel_workload("av1_entropy_symbol", FrameWork::new(1, WIDTH as u64, HEIGHT as u64))
+        ..kernel_workload(
+            "av1_entropy_symbol",
+            FrameWork::new(1, ENTROPY_SYMBOLS as u64, 1),
+        )
     };
     bench_across_isas(criterion, &workload, || {
         let mut decoder =

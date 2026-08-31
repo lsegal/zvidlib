@@ -1,15 +1,21 @@
 # Benchmarks
 
 zvidlib's benchmarks run under [criterion](https://docs.rs/criterion) with
-`harness = false`. The whole suite lives in a single bench target
-(`benches/codec.rs`) so the shared fixture cache in `benches/support/` is loaded
-and decoded once per process and each iteration measures codec work only.
+`harness = false`. Every target shares the fixture cache in `benches/support/`,
+so each fixture is demuxed, decoded, or encoded once per process and each
+iteration measures codec work only.
+
+| Target | Scope |
+| --- | --- |
+| `codec` | the cross-codec groups: fixture smoke decode, encoder inputs, and the bundled 1080p HEVC sample |
+| `av1_decode` | the AV1 software decoder: whole-frame decode and every hot stage, scalar versus SIMD |
 
 ## Running
 
 ```sh
-cargo bench                       # the default, fast groups
+cargo bench                       # every target's default, fast groups
 cargo bench --features simd       # the same groups, recorded under `simd=on`
+cargo bench --bench av1_decode    # one target
 cargo bench --no-run              # compile only
 ```
 
@@ -88,6 +94,45 @@ av1_motion_compensation/scalar
 av1_motion_compensation/neon
 ```
 
+## The AV1 decoder suite (`--bench av1_decode`)
+
+`benches/av1_decode.rs` measures the pure-Rust AV1 software decoder end to end
+and per hot stage. Every group in it is a per-ISA group, because the point of
+the target is where AV1 decode time goes and how much of it vectorizes.
+
+| Group | Stage |
+| --- | --- |
+| `av1_decode_frame` | whole-frame decode through `native_av1_video_decoder_factory` |
+| `av1_inverse_dct_{4x4,8x8,16x16,32x32,64x64}` | inverse DCT, `src/av1_simd/transforms.rs` |
+| `av1_inverse_adst_8x8`, `av1_inverse_flipadst_16x16` | the inverse ADST family |
+| `av1_deblock`, `av1_deblock_wide`, `av1_deblock_boundary` | deblocking: narrow filters, the wide 8/14-tap filters, and boundary-dominated planes |
+| `av1_cdef`, `av1_wiener`, `av1_self_guided` | CDEF and loop restoration |
+| `av1_mc_single`, `av1_mc_compound_average`, `av1_mc_blend_mask` | inter prediction, `src/av1_mc.rs` |
+| `av1_intra_paeth`, `av1_intra_smooth`, `av1_intra_directional` | intra prediction, `src/av1_intra_pred.rs` |
+| `av1_entropy_symbol` | arithmetic symbol decode, `src/av1_entropy.rs` |
+
+A single `scalar` arm is only meaningful here because `simd::set_override`
+covers all three of AV1's independent dispatch sites at once (`av1_simd`,
+`av1_mc`, `av1_intra_pred`); pinning any one of them alone would leave the
+others vectorized.
+
+`av1_entropy_symbol` is deliberately expected to read the same on every arm. The
+range decoder is inherently serial and has no vector path, so it is the Amdahl
+ceiling on any whole-frame SIMD win: the number to take from it is its share of
+`av1_decode_frame`, not a speedup. Its throughput line counts symbols rather
+than pixels, so the harness's "Mpx/s" reads as millions of symbols per second.
+There is no separate CDF-adaptation measurement because both AV1 decoders in the
+crate require `disable_cdf_update = 1`, so `src/av1_cdf.rs`'s tables are read but
+never adapted.
+
+This target replaces the ad-hoc, `#[ignore]`d `tests/av1_simd_bench.rs`: its
+input generators are now `support::av1_structured_plane`,
+`support::av1_flat_blocks_plane`, and `support::av1_wide_tx_grid`, and its
+hand-rolled timing loops are the criterion groups above, so the same
+measurements now produce stored baselines. The bit-exactness tests that file sat
+next to (`tests/av1_simd_intra.rs`, `src/av1_simd/tests.rs`) are correctness
+checks and are unchanged.
+
 On an `x86_64` host with AVX2 the arms are `scalar`, `sse4.1`, and `avx2`
 instead. These groups deliberately carry the instruction set in the name rather
 than the `simd=on`/`simd=off` build tag: the instruction set *is* the measured
@@ -97,8 +142,14 @@ Filter to one of them the same way as any other group:
 
 ```sh
 cargo bench --bench codec -- av1_deblock
-cargo bench --bench codec -- 'av1_deblock/scalar'
+cargo bench --bench av1_decode -- 'av1_deblock/scalar'
+cargo bench --bench av1_decode -- av1_inverse   # every inverse-transform group
 ```
+
+Note that the correctness guard below runs for every group in a target
+regardless of the filter — it is not a criterion benchmark and criterion's
+filter does not reach it — so filtering shortens the *timed* part of a run, not
+all of it.
 
 The per-ISA HEVC group decodes the bundled 1080p sample, so it sits behind the
 same `ZVIDLIB_BENCH_LARGE=1` opt-in as the other 1080p group.
@@ -141,6 +192,8 @@ same host are 2.4-4.9x. `active_by_site()` answers the question directly.
 | `av1_inter_stream` / `av1_inter_temporal_units` | `tests/fixtures/codec/av1_inter_show_existing_16x16.hex` |
 | `bundled_hevc_sample` | `examples/media/BigBuckBunny.mp4` |
 | `synthetic_yuv420_sequence` | generated; encoder inputs without decoding first |
+| `synthetic_av1_stream` | generated; encoded once by `native_av1_video_encoder_factory` |
+| `av1_structured_plane` / `av1_flat_blocks_plane` / `av1_wide_tx_grid` | generated; the AV1 kernel-level inputs |
 
 Every one of them is cached in a `OnceLock`, so the demux and decode cost is paid
 once per process rather than once per iteration.
@@ -164,6 +217,12 @@ without the whole-crate optimization that shipped builds get.
 Benchmarks are native-only. They are declared as an explicit `[[bench]]` target
 and criterion is a `cfg(not(target_arch = "wasm32"))` dev-dependency, so the
 `wasm32` builds neither resolve nor compile them.
+
+The checked-in AV1 vectors are 17x9 and 16x16 conformance streams, which are
+correct but far too small to time a decoder with. `synthetic_av1_stream` is
+therefore produced by the crate's own AV1 encoder — the bounded lossless
+monochrome subset its decoder implements — at 320x180, once per process and
+entirely outside the timed loop.
 
 `benches/support/` holds everything that is not the measurement: fixtures and
 synthetic inputs in `support`, and the scalar-vs-SIMD axis in `support::isa`
