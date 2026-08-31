@@ -260,7 +260,11 @@ fn session_audio_buffers(timeline: Timeline, frames: u64) -> Vec<AudioBuffer> {
 }
 
 /// Runs one synchronized session end to end and returns the written bytes.
-fn run_session(buffers: Vec<AudioBuffer>, dimensions: VideoDimensions, frame: &VideoFrame) -> usize {
+fn run_session(
+    buffers: Vec<AudioBuffer>,
+    dimensions: VideoDimensions,
+    frame: &VideoFrame,
+) -> usize {
     block_on(async {
         let timeline = Timeline::new(
             FrameRate::new(SESSION_FRAMES as u32, 1).expect("the bench frame rate is valid"),
@@ -314,9 +318,7 @@ fn run_sample_table(packets: u64, packet_bytes: usize) -> usize {
                 timescale: SAMPLE_RATE,
                 decoder_config: codec_box(b"esds", &[0, 0, 0, 0]),
             },
-            format: Mp4TrackFormat::Audio {
-                channels: CHANNELS,
-            },
+            format: Mp4TrackFormat::Audio { channels: CHANNELS },
         };
         let mut muxer = Mp4Muxer::new(
             MemorySink::new(),
@@ -343,10 +345,13 @@ fn run_sample_table(packets: u64, packet_bytes: usize) -> usize {
                 .expect("the bench audio sample is writable");
         }
         muxer
-            .set_audio_gapless(0, AudioGapless {
-                priming: 1_024,
-                padding: 512,
-            })
+            .set_audio_gapless(
+                0,
+                AudioGapless {
+                    priming: 1_024,
+                    padding: 512,
+                },
+            )
             .expect("the bench track accepts gapless metadata");
         muxer
             .finish()
@@ -432,6 +437,22 @@ fn audio_demux(criterion: &mut Criterion) {
     let name = group_name("audio_demux");
     let mut group = criterion.benchmark_group(&name);
 
+    // Deliberately first: `audio_timing` reconstructs priming, padding, and the
+    // edit list, which is O(edits) (one, here) and touches no samples at all, so
+    // a samples/sec rate for it would be a fabricated number. Criterion's group
+    // throughput is sticky once set, so this benchmark has to run before the two
+    // that do register one.
+    group.bench_function("aac_timing_bundled", |bencher| {
+        bencher.iter(|| {
+            black_box(
+                fixture
+                    .track()
+                    .audio_timing(black_box(fixture.movie.movie_timescale))
+                    .expect("the bundled AAC track has readable gapless timing"),
+            )
+        });
+    });
+
     // `open` parses the whole movie, including the video track's much larger
     // sample tables, so it is the read-side counterpart to `finish` writing them.
     report_audio_throughput(&mut group, "open_bundled_mp4", work);
@@ -462,17 +483,6 @@ fn audio_demux(criterion: &mut Criterion) {
         });
     });
 
-    report_audio_throughput(&mut group, "aac_timing_bundled", work);
-    group.bench_function("aac_timing_bundled", |bencher| {
-        bencher.iter(|| {
-            black_box(
-                fixture
-                    .track()
-                    .audio_timing(black_box(fixture.movie.movie_timescale))
-                    .expect("the bundled AAC track has readable gapless timing"),
-            )
-        });
-    });
     group.finish();
 }
 

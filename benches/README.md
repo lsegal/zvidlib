@@ -1,14 +1,24 @@
 # Benchmarks
 
 zvidlib's benchmarks run under [criterion](https://docs.rs/criterion) with
-`harness = false`. The whole suite lives in a single bench target
-(`benches/codec.rs`) so the shared fixture cache in `benches/support/` is loaded
-and decoded once per process and each iteration measures codec work only.
+`harness = false`, across two bench targets that share `benches/support/`:
+
+| Target | Measures |
+| --- | --- |
+| `benches/codec.rs` | codec work: decode, encoder inputs, and the per-ISA SIMD groups |
+| `benches/audio_mux.rs` | the audio container path: MP4 muxing, sample-table growth, demux, and gapless timing |
+
+Each target loads and decodes its fixtures once per process, so every iteration
+measures the work under test and nothing else. `codec` is one target rather than
+several because its groups share the same decoded-frame cache; `audio_mux` shares
+none of those fixtures and is separately runnable.
 
 ## Running
 
 ```sh
-cargo bench                       # the default, fast groups
+cargo bench                       # the default, fast groups in both targets
+cargo bench --bench codec         # codec work only
+cargo bench --bench audio_mux     # the audio container path only
 cargo bench --features simd       # the same groups, recorded under `simd=on`
 cargo bench --no-run              # compile only
 ```
@@ -131,6 +141,51 @@ out roughly even on Apple Silicon, where LLVM auto-vectorizes the scalar code
 well under `lto = "fat"`, while AV1 deblocking and motion compensation on the
 same host are 2.4-4.9x. `active_by_site()` answers the question directly.
 
+## The audio container path
+
+`cargo bench --bench audio_mux` measures the audio write and read paths in two
+groups.
+
+`audio_mux` is the write side:
+
+* `media_output_1s_30fps` drives a whole synchronized `MediaOutput` session --
+  index checking, timeline interval validation, encoder dispatch, muxer writes,
+  the gapless drain, and finalization -- over one second of 48 kHz stereo audio
+  and 30 video frames.
+* `sample_table_1500_packets` and `sample_table_15000_packets` drive the muxer
+  alone over a long audio-only track. The muxer writes one chunk per sample, so
+  `stsz` and `co64` each grow by a fixed width per sample while `stts` and `stsc`
+  stay run-length constant. The two sizes are an order of magnitude apart on
+  purpose: the *ratio* between them is the regression guard, and it should stay
+  close to linear.
+
+`audio_demux` is the read side, over the bundled sample's real AAC track:
+`Mp4Demuxer::open` (which parses those same sample tables back),
+`to_encoded_audio_samples` (packet extraction over the decoded sample clock), and
+`audio_timing` (priming, padding, and edit-list mapping).
+
+### There is no audio encoder to benchmark
+
+`AudioEncoder` (`src/codec.rs`) is a trait with no implementation in the crate.
+Its only implementor anywhere in the tree is `PcmFixtureEncoder` in
+`tests/indexed_mp4_output.rs`, a test double that packages PCM without
+compressing anything. "Benchmark the audio encoder" therefore has no subject, and
+this target does not invent one -- whether the crate should grow a native AAC-LC
+encoder, delegate to a platform encoder (AudioToolbox / Media Foundation), or
+leave the trait for platform and web backends to fill is a product decision.
+
+The bench-local `PcmBenchEncoder` is the same kind of pass-through double, and it
+is bench-local on purpose: holding codec work at effectively zero is what makes
+the measurement isolate container work.
+
+### No SIMD axis
+
+Muxing and demuxing are bit-shuffling and table building, not arithmetic over
+sample arrays, so there is nothing here for a vector kernel to do. These groups
+run on the detected instruction set only and do not use `bench_across_isas`. They
+still carry the `simd=off` / `simd=on` build tag every group name carries,
+because that tag records which *build* produced a number, not which kernel ran.
+
 ## Fixtures
 
 `benches/support/` loads only fixtures already checked into the repository:
@@ -140,6 +195,7 @@ same host are 2.4-4.9x. `active_by_site()` answers the question directly.
 | `av1_lossless_intra_stream` / `av1_lossless_intra_frame` | `tests/fixtures/codec/av1_lossless_17x9.hex` |
 | `av1_inter_stream` / `av1_inter_temporal_units` | `tests/fixtures/codec/av1_inter_show_existing_16x16.hex` |
 | `bundled_hevc_sample` | `examples/media/BigBuckBunny.mp4` |
+| `bundled_aac_track` / `bundled_mp4_bytes` | `examples/media/BigBuckBunny.mp4` (its AAC track) |
 | `synthetic_yuv420_sequence` | generated; encoder inputs without decoding first |
 
 Every one of them is cached in a `OnceLock`, so the demux and decode cost is paid
@@ -152,6 +208,15 @@ once per process rather than once per iteration.
 prints a frames/sec rate — and prints the megapixels each frame carries, which
 converts that rate to megapixels per second.
 
+Audio has no pixels, so it reports on its own scale: `support::AudioWork` and
+`support::report_audio_throughput` set `Throughput::Elements(samples)` — a
+per-channel samples/sec rate — and print the sample rate and covered duration,
+which convert that rate to a factor of realtime. Both sides of the write path and
+both sides of the read path use it, so mux, demux, and AAC decode numbers stay
+directly comparable. A benchmark that touches no samples (`audio_timing`, which is
+O(edits)) deliberately registers no throughput rather than reporting a fabricated
+sample rate.
+
 ## Profile
 
 `[profile.bench]` repeats `[profile.release]`'s `lto = "fat"` and
@@ -161,9 +226,14 @@ without the whole-crate optimization that shipped builds get.
 
 ## Targets
 
-Benchmarks are native-only. They are declared as an explicit `[[bench]]` target
-and criterion is a `cfg(not(target_arch = "wasm32"))` dev-dependency, so the
-`wasm32` builds neither resolve nor compile them.
+Benchmarks are native-only. They are declared as explicit `[[bench]]` targets and
+criterion is a `cfg(not(target_arch = "wasm32"))` dev-dependency, so the `wasm32`
+builds neither resolve nor compile them.
+
+Each bench target is its own crate root and compiles all of `benches/support/`,
+but uses only the fixtures its own measurements need, so the module carries
+`#![allow(dead_code)]`: without it `cargo clippy --all-targets` would fail one
+target over helpers another target depends on.
 
 `benches/support/` holds everything that is not the measurement: fixtures and
 synthetic inputs in `support`, and the scalar-vs-SIMD axis in `support::isa`

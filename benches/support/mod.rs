@@ -445,7 +445,9 @@ pub fn bundled_aac_track() -> &'static BundledAacTrack {
             .position(|track| track.kind == TrackKind::Audio && track.codec == Codec::Aac)
             .expect("the bundled sample has an AAC audio track");
         let track = &movie.tracks[track_index];
-        let config = track.aac_config().expect("the bundled AAC track configures");
+        let config = track
+            .aac_config()
+            .expect("the bundled AAC track configures");
         let packets = block_on(track.to_encoded_audio_samples(&source, &limits))
             .expect("the bundled AAC packets are readable");
         let timing = track
