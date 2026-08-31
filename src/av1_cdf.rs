@@ -318,25 +318,25 @@ pub static MAG_REF_OFFSET_2D: [(usize, usize); 3] = [(0, 1), (1, 0), (1, 1)];
 // TX_4X4 through TX_64X64 that this crate's inverse transform kernels
 // implement. ---
 //
-// Unlike the tables above (extracted verbatim from the specification), the
-// CDFs in this section are placeholder-but-valid default probability models
-// for symbols this crate did not previously decode at all (`read_tx_type`'s
-// per-set `ext_tx` symbol, `read_tx_size`'s `tx_depth`,
-// and the larger `eob_pt` ranges needed once transform blocks can hold
-// more than 16 coefficients). Unlike
-// the *dequantization* step (a direct multiply that must match the spec's
-// tables to produce correct pixel values), a symbol's *CDF* only affects
-// entropy-coding efficiency, not decode correctness, as long as the same
-// table is used consistently by both the encoder and decoder of a given
+// The `ext_tx` CDFs below are the specification's `Default_Intra_Ext_Tx_Cdf`
+// and `Default_Inter_Ext_Tx_Cdf` (§9.4), transcribed verbatim like the
+// tables above. The remaining CDFs in this section — `read_tx_size`'s
+// `tx_depth` and the larger `eob_pt` ranges needed once transform blocks can
+// hold more than 16 coefficients — are still placeholder-but-valid default
+// probability models for symbols this crate did not previously decode at
+// all. Unlike the *dequantization* step (a direct multiply that must match
+// the spec's tables to produce correct pixel values), a symbol's *CDF* only
+// affects entropy-coding efficiency, not decode correctness, as long as the
+// same table is used consistently by both the encoder and decoder of a given
 // stream — which this crate's own hand-authored bitstream writer (used only
 // by its test suite; there is no production AV1 encoder here) guarantees.
-// These tables are therefore internally consistent and exercised by
-// round-trip tests, but are NOT claimed to bit-exactly match an official
-// AV1 encoder's default CDFs, so streams produced by third-party encoders
-// that exercise these particular symbols are not guaranteed to decode
-// correctly by this crate (this matches the rest of this crate's stance of
-// being a bounded, non-conformance-tested subset rather than a full AV1
-// decoder).
+// Those remaining placeholders are therefore internally consistent and
+// exercised by round-trip tests, but are NOT claimed to bit-exactly match an
+// official AV1 encoder's default CDFs, so streams produced by third-party
+// encoders that exercise `tx_depth` or a large `eob_pt` are not guaranteed to
+// decode correctly by this crate (this matches the rest of this crate's
+// stance of being a bounded, non-conformance-tested subset rather than a full
+// AV1 decoder).
 
 /// A transform-type set (AV1 spec §5.11.47 `get_tx_set`). Only the square
 /// transform sizes this crate codes are reachable, so `txSzSqr` and
@@ -477,74 +477,114 @@ pub fn tx_type_inverse_set(set: Av1TxSet) -> &'static [TxTypeSlot] {
 /// (spec `INTRA_MODES`).
 pub const INTRA_MODES: usize = 13;
 
-/// A valid, strictly increasing `N`-symbol CDF that varies with `seed`.
-///
-/// The `tx_type` CDFs below are placeholders in the sense the section
-/// header describes, but the specification selects a *different* row per
-/// transform size and (for intra blocks) per intra direction, so the rows
-/// here must genuinely differ or that indexing would be unobservable and
-/// untestable. Each row is a uniform split perturbed by less than half a
-/// step, which keeps it strictly increasing and ending at 32768.
-const fn placeholder_cdf<const N: usize>(seed: usize) -> [u16; N] {
-    let mut cdf = [0u16; N];
-    let step = 32768 / N;
-    let mut index = 0;
-    while index + 1 < N {
-        cdf[index] = ((index + 1) * step + ((seed + index) % 7) * (step / 16)) as u16;
-        index += 1;
-    }
-    cdf[N - 1] = 32768;
-    cdf
-}
-
-/// Builds a `[rows][INTRA_MODES][N]` intra `tx_type` CDF table.
-const fn intra_tx_type_table<const ROWS: usize, const N: usize>() -> [[[u16; N]; INTRA_MODES]; ROWS]
-{
-    let mut table = [[[0u16; N]; INTRA_MODES]; ROWS];
-    let mut size = 0;
-    while size < ROWS {
-        let mut direction = 0;
-        while direction < INTRA_MODES {
-            table[size][direction] = placeholder_cdf::<N>(size * INTRA_MODES + direction);
-            direction += 1;
-        }
-        size += 1;
-    }
-    table
-}
-
-/// Builds a `[rows][N]` inter `tx_type` CDF table.
-const fn inter_tx_type_table<const ROWS: usize, const N: usize>() -> [[u16; N]; ROWS] {
-    let mut table = [[0u16; N]; ROWS];
-    let mut size = 0;
-    while size < ROWS {
-        table[size] = placeholder_cdf::<N>(size);
-        size += 1;
-    }
-    table
-}
-
-/// `Default_Intra_Ext_Tx_Cdf[TX_SET_INTRA_1]`, indexed by `txSzSqr`
-/// (`0` = `TX_4X4`, `1` = `TX_8X8`) then by the block's intra direction.
-/// `TX_16X16` selects `TX_SET_INTRA_2` and `TX_32X32` selects
+/// `Default_Intra_Ext_Tx_Cdf[TX_SET_INTRA_1]` (spec §9.4), indexed by
+/// `txSzSqr` (`0` = `TX_4X4`, `1` = `TX_8X8`) then by the block's intra
+/// direction. `TX_16X16` selects `TX_SET_INTRA_2` and `TX_32X32` selects
 /// `TX_SET_DCTONLY`, so neither has a row here.
-pub static INTRA_TX_TYPE_SET1: [[[u16; 7]; INTRA_MODES]; 2] = intra_tx_type_table();
+pub static INTRA_TX_TYPE_SET1: [[[u16; 7]; INTRA_MODES]; 2] = [
+    [
+        [1535, 8035, 9461, 12751, 23467, 27825, 32768],
+        [564, 3335, 9709, 10870, 18143, 28094, 32768],
+        [672, 3247, 3676, 11982, 19415, 23127, 32768],
+        [5279, 13885, 15487, 18044, 23527, 30252, 32768],
+        [4423, 6074, 7985, 10416, 25693, 29298, 32768],
+        [1486, 4241, 9460, 10662, 16456, 27694, 32768],
+        [439, 2838, 3522, 6737, 18058, 23754, 32768],
+        [1190, 4233, 4855, 11670, 20281, 24377, 32768],
+        [1045, 4312, 8647, 10159, 18644, 29335, 32768],
+        [202, 3734, 4747, 7298, 17127, 24016, 32768],
+        [447, 4312, 6819, 8884, 16010, 23858, 32768],
+        [277, 4369, 5255, 8905, 16465, 22271, 32768],
+        [3409, 5436, 10599, 15599, 19687, 24040, 32768],
+    ],
+    [
+        [1870, 13742, 14530, 16498, 23770, 27698, 32768],
+        [326, 8796, 14632, 15079, 19272, 27486, 32768],
+        [484, 7576, 7712, 14443, 19159, 22591, 32768],
+        [1126, 15340, 15895, 17023, 20896, 30279, 32768],
+        [655, 4854, 5249, 5913, 22099, 27138, 32768],
+        [1299, 6458, 8885, 9290, 14851, 25497, 32768],
+        [311, 5295, 5552, 6885, 16107, 22672, 32768],
+        [883, 8059, 8270, 11258, 17289, 21549, 32768],
+        [741, 7580, 9318, 10345, 16688, 29046, 32768],
+        [110, 7406, 7915, 9195, 16041, 23329, 32768],
+        [363, 7974, 9357, 10673, 15629, 24474, 32768],
+        [153, 7647, 8112, 9936, 15307, 19996, 32768],
+        [3511, 6332, 11165, 15335, 19323, 23594, 32768],
+    ],
+];
 
-/// `Default_Intra_Ext_Tx_Cdf[TX_SET_INTRA_2]`, indexed by `txSzSqr`
-/// (`0` = `TX_4X4` .. `2` = `TX_16X16`) then by intra direction.
-pub static INTRA_TX_TYPE_SET2: [[[u16; 5]; INTRA_MODES]; 3] = intra_tx_type_table();
+/// `Default_Intra_Ext_Tx_Cdf[TX_SET_INTRA_2]` (spec §9.4), indexed by
+/// `txSzSqr` (`0` = `TX_4X4` .. `2` = `TX_16X16`) then by intra direction.
+pub static INTRA_TX_TYPE_SET2: [[[u16; 5]; INTRA_MODES]; 3] = [
+    [
+        [6554, 13107, 19661, 26214, 32768],
+        [6554, 13107, 19661, 26214, 32768],
+        [6554, 13107, 19661, 26214, 32768],
+        [6554, 13107, 19661, 26214, 32768],
+        [6554, 13107, 19661, 26214, 32768],
+        [6554, 13107, 19661, 26214, 32768],
+        [6554, 13107, 19661, 26214, 32768],
+        [6554, 13107, 19661, 26214, 32768],
+        [6554, 13107, 19661, 26214, 32768],
+        [6554, 13107, 19661, 26214, 32768],
+        [6554, 13107, 19661, 26214, 32768],
+        [6554, 13107, 19661, 26214, 32768],
+        [6554, 13107, 19661, 26214, 32768],
+    ],
+    [
+        [6554, 13107, 19661, 26214, 32768],
+        [6554, 13107, 19661, 26214, 32768],
+        [6554, 13107, 19661, 26214, 32768],
+        [6554, 13107, 19661, 26214, 32768],
+        [6554, 13107, 19661, 26214, 32768],
+        [6554, 13107, 19661, 26214, 32768],
+        [6554, 13107, 19661, 26214, 32768],
+        [6554, 13107, 19661, 26214, 32768],
+        [6554, 13107, 19661, 26214, 32768],
+        [6554, 13107, 19661, 26214, 32768],
+        [6554, 13107, 19661, 26214, 32768],
+        [6554, 13107, 19661, 26214, 32768],
+        [6554, 13107, 19661, 26214, 32768],
+    ],
+    [
+        [1127, 12814, 22772, 27483, 32768],
+        [145, 6761, 11980, 26667, 32768],
+        [362, 5887, 11678, 16725, 32768],
+        [385, 15213, 18587, 30693, 32768],
+        [25, 2914, 23134, 27903, 32768],
+        [60, 4470, 11749, 23991, 32768],
+        [37, 3332, 14511, 21448, 32768],
+        [157, 6320, 13036, 17439, 32768],
+        [119, 6719, 12906, 29396, 32768],
+        [47, 5537, 12576, 21499, 32768],
+        [269, 6076, 11258, 23115, 32768],
+        [83, 5615, 12001, 17228, 32768],
+        [1968, 5556, 12023, 18547, 32768],
+    ],
+];
 
-/// `Default_Inter_Ext_Tx_Cdf[TX_SET_INTER_1]`, indexed by `txSzSqr`
-/// (`0` = `TX_4X4`, `1` = `TX_8X8`).
-pub static INTER_TX_TYPE_SET1: [[u16; 16]; 2] = inter_tx_type_table();
+/// `Default_Inter_Ext_Tx_Cdf[TX_SET_INTER_1]` (spec §9.4), indexed by
+/// `txSzSqr` (`0` = `TX_4X4`, `1` = `TX_8X8`).
+pub static INTER_TX_TYPE_SET1: [[u16; 16]; 2] = [
+    [4458, 5560, 7695, 9709, 13330, 14789, 17537, 20266, 21504, 22848, 23934, 25474, 27727, 28915, 30631, 32768],
+    [1645, 2573, 4778, 5711, 7807, 8622, 10522, 15357, 17674, 20408, 22517, 25010, 27116, 28856, 30749, 32768],
+];
 
-/// `Default_Inter_Ext_Tx_Cdf[TX_SET_INTER_2]`; only `TX_16X16` selects this
-/// set, so it has the single row.
-pub static INTER_TX_TYPE_SET2: [[u16; 12]; 1] = inter_tx_type_table();
+/// `Default_Inter_Ext_Tx_Cdf[TX_SET_INTER_2]` (spec §9.4); only `TX_16X16`
+/// selects this set, so only that `txSzSqr` row is kept here.
+pub static INTER_TX_TYPE_SET2: [[u16; 12]; 1] = [
+    [770, 2421, 5225, 12907, 15819, 18927, 21561, 24089, 26595, 28526, 30529, 32768],
+];
 
-/// `Default_Inter_Ext_Tx_Cdf[TX_SET_INTER_3]`, indexed by `txSzSqr`
-/// (`0` = `TX_4X4` .. `3` = `TX_32X32`).
-pub static INTER_TX_TYPE_SET3: [[u16; 2]; 4] = inter_tx_type_table();
+/// `Default_Inter_Ext_Tx_Cdf[TX_SET_INTER_3]` (spec §9.4), indexed by
+/// `txSzSqr` (`0` = `TX_4X4` .. `3` = `TX_32X32`).
+pub static INTER_TX_TYPE_SET3: [[u16; 2]; 4] = [
+    [16384, 32768],
+    [4167, 32768],
+    [1998, 32768],
+    [748, 32768],
+];
 
 /// `txSzSqr` as a table row index: `TX_4X4` is 0 through `TX_32X32` at 3.
 fn tx_size_sqr_index(tx_size: usize) -> usize {
