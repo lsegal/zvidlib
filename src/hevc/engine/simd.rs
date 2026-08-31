@@ -31,6 +31,37 @@
 //! weighted combine is only vectorized when a bound check proves the
 //! `i32` product cannot overflow — otherwise it stays on the `i64`
 //! scalar path (see `inter_pred`).
+//!
+//! # What each backend is actually worth
+//!
+//! The scalar implementations here are not a slow reference kept only for
+//! portability: under the crate's `lto = "fat"` / `codegen-units = 1`
+//! release profile LLVM auto-vectorizes them, so a hand-written kernel
+//! has to beat *vectorized* scalar code, not a sample-at-a-time loop.
+//! Where it cannot, the dispatch prefers scalar rather than pretending
+//! otherwise. Measured on Apple silicon with the `simd_inter_pred_benchmark`
+//! and `in_loop::tests::bench_in_loop_filters` benchmarks, each reporting
+//! the best of five interleaved rounds:
+//!
+//! | kernel | NEON vs scalar |
+//! | --- | --- |
+//! | §8.5.3.3.3.2 / §8.5.3.3.3.3 [`filter_taps`] (block path) | 1.6-1.9x luma, 1.5-1.7x chroma |
+//! | [`filter_taps`] (one long L1-resident buffer) | ~1.0x |
+//! | §8.5.3.3.4 [`combine_weighted`] | 0.91x — dispatched to scalar on aarch64 |
+//! | §8.7.2 `in_loop::filter_luma_rows` / `filter_chroma_rows` | ~1.3x |
+//! | §8.7.3 `in_loop::sao_band_row` / `sao_edge_row` | ~2.3x |
+//!
+//! The two [`filter_taps`] rows are the same kernel at different call
+//! sizes, and the difference is the point: the win comes from the short
+//! 4..16-sample rows the block walk actually issues, where the kernel's
+//! tight inner loop beats the scalar call's per-invocation setup. Over one
+//! long buffer that setup amortizes away and the two are level. The
+//! deblocking figure is bounded by shape rather than by codegen — a
+//! four-row edge segment is exactly one 4-lane vector, so §8.7.2 has no
+//! width left to exploit and its §8.7.2.5.3 decisions stay scalar.
+//!
+//! These figures are aarch64-only; the x86_64 kernels have not been timed
+//! on x86_64 hardware.
 
 #[cfg(target_arch = "aarch64")]
 use core::arch::aarch64::*;
@@ -693,9 +724,32 @@ pub fn combine_weighted<const N: usize>(
         #[cfg(target_arch = "x86_64")]
         // SAFETY: `supported` confirmed AVX2 above; same bounds argument.
         Isa::Avx2 => unsafe { combine_weighted_avx2(taps, weights, p, out) },
+        // On AArch64 the scalar reference *is* the faster backend, so the
+        // dispatch prefers it and there is no NEON kernel to call.
+        //
+        // The combine is one or two multiply-accumulates, a shift and a
+        // clamp per sample — no reduction, no shuffle, nothing a hand
+        // kernel can express that the auto-vectorizer cannot. Under this
+        // crate's `lto = "fat"` / `codegen-units = 1` profile LLVM already
+        // vectorizes `combine_weighted_scalar` to four-lane NEON, and its
+        // version schedules better than the intrinsics one did: on Apple
+        // silicon the hand-written kernel measured 0.91x of scalar both in
+        // the §8.5.3.3.4 block path and on an L1-resident buffer with the
+        // allocator kept out of the timing (best of five interleaved
+        // rounds — see `inter_pred`'s `simd_inter_pred_benchmark`).
+        // Widening it to eight and sixteen samples per iteration, and
+        // dropping its redundant `#[target_feature(enable = "neon")]`,
+        // were both tried and both made it slower still.
+        //
+        // `filter_taps` above is a different case and keeps its NEON
+        // kernel: at the 4..16-sample row lengths the decoder actually
+        // asks for, it runs 1.6-1.9x the scalar path.
+        //
+        // x86_64 keeps its kernels either way — AVX2 has real width to add
+        // over a four-lane auto-vectorization, and this measurement is
+        // aarch64-only.
         #[cfg(target_arch = "aarch64")]
-        // SAFETY: NEON is mandatory on AArch64; same bounds argument.
-        Isa::Neon => unsafe { combine_weighted_neon(taps, weights, p, out) },
+        Isa::Neon => combine_weighted_scalar(taps, weights, p, out),
     }
 }
 
@@ -786,36 +840,6 @@ unsafe fn combine_weighted_avx2<const N: usize>(
     }
 }
 
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-unsafe fn combine_weighted_neon<const N: usize>(
-    taps: &[&[i32]; N],
-    weights: &[i32; N],
-    p: CombineParams,
-    out: &mut [i32],
-) {
-    unsafe {
-        let count = out.len();
-        let sh = vdupq_n_s32(-p.shift);
-        let round = vdupq_n_s32(p.round);
-        let post = vdupq_n_s32(p.post);
-        let lo = vdupq_n_s32(0);
-        let hi = vdupq_n_s32(p.max_val);
-        let mut i = 0usize;
-        while i + 4 <= count {
-            let mut acc = round;
-            for (&w, tap) in weights.iter().zip(taps.iter()) {
-                acc = vmlaq_n_s32(acc, vld1q_s32(tap.as_ptr().add(i)), w);
-            }
-            let v = vaddq_s32(vshlq_s32(acc, sh), post);
-            let v = vminq_s32(vmaxq_s32(v, lo), hi);
-            vst1q_s32(out.as_mut_ptr().add(i), v);
-            i += 4;
-        }
-        combine_weighted_tail(taps, weights, p, out, i);
-    }
-}
-
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[inline]
 fn combine_weighted_tail<const N: usize>(
@@ -859,8 +883,11 @@ mod tests {
         let taps4: [&[i32]; 4] = std::array::from_fn(|t| src[t].as_slice());
         let c8 = [-1, 4, -11, 40, 40, -11, 4, -1];
         let c4 = [-2, 58, 10, -2];
-        // Widths that exercise the 8-, 4- and 1-wide code paths.
-        for len in [1usize, 2, 3, 4, 5, 7, 8, 12, 16, 31, 64, 200] {
+        // Widths that exercise the 8-, 4- and 1-wide code paths, plus the
+        // lengths that straddle each vector step and leave a partial tail.
+        for len in [
+            1usize, 2, 3, 4, 5, 7, 8, 12, 16, 17, 20, 24, 31, 33, 48, 64, 200,
+        ] {
             for shift in [0i32, 2, 4, 6] {
                 let mut reference = vec![0i32; len];
                 filter_taps(Isa::Scalar, &taps8, &c8, shift, &mut reference);
@@ -882,7 +909,7 @@ mod tests {
     fn every_backend_matches_scalar_combine_weighted() {
         let a = samples(3, 200, 30_000);
         let b = samples(11, 200, 30_000);
-        for len in [1usize, 3, 4, 5, 8, 13, 16, 64, 200] {
+        for len in [1usize, 3, 4, 5, 8, 13, 16, 17, 20, 24, 33, 48, 64, 200] {
             for (weights, round, shift, post) in [
                 ([1, 1], 32, 6, 0),
                 ([1, 1], 64, 7, 0),
@@ -2407,7 +2434,7 @@ pub(crate) mod in_loop {
         #[test]
         #[ignore = "benchmark; run explicitly with --ignored --nocapture"]
         fn bench_in_loop_filters() {
-            use std::time::Instant;
+            use std::time::{Duration, Instant};
             const W: usize = 1920;
             const H: usize = 1080;
             const CTB: usize = 64;
@@ -2500,51 +2527,54 @@ pub(crate) mod in_loop {
                 }
             };
 
+            // Each round times one scalar and one vector pass of each
+            // filter, and every figure reported below is the *minimum*
+            // over the rounds. A single timed pass on a machine that is
+            // doing anything else swings by more than 2x — enough to
+            // report a real speedup as a regression — so one pass is not
+            // a measurement of the kernel at all. The minimum is the round
+            // that suffered least interference, which is as close to the
+            // kernel's own cost as wall-clock timing gets. Scalar and
+            // vector alternate inside the round so a burst of interference
+            // cannot land on only one of them.
+            let rounds = 5;
             let reps = 10;
+            let mut sao = [Duration::MAX; 2];
+            let mut deblock = [Duration::MAX; 2];
             let guard = crate::simd::test_lock();
-            FORCE_SCALAR.store(true, Ordering::SeqCst);
-            let t = Instant::now();
-            for _ in 0..reps {
-                std::hint::black_box(sao_pass());
+            for _ in 0..rounds {
+                for (slot, force_scalar) in [(0usize, true), (1, false)] {
+                    FORCE_SCALAR.store(force_scalar, Ordering::SeqCst);
+                    let t = Instant::now();
+                    for _ in 0..reps {
+                        std::hint::black_box(sao_pass());
+                    }
+                    sao[slot] = sao[slot].min(t.elapsed());
+                    let t = Instant::now();
+                    for _ in 0..reps {
+                        deblock_pass();
+                    }
+                    deblock[slot] = deblock[slot].min(t.elapsed());
+                }
             }
-            let sao_scalar = t.elapsed();
-            let t = Instant::now();
-            for _ in 0..reps {
-                deblock_pass();
-            }
-            let deblock_scalar = t.elapsed();
             FORCE_SCALAR.store(false, Ordering::SeqCst);
-            let t = Instant::now();
-            for _ in 0..reps {
-                std::hint::black_box(sao_pass());
-            }
-            let sao_simd = t.elapsed();
-            let t = Instant::now();
-            for _ in 0..reps {
-                deblock_pass();
-            }
-            let deblock_simd = t.elapsed();
             drop(guard);
 
-            let ratio = |a: std::time::Duration, b: std::time::Duration| {
-                a.as_secs_f64() / b.as_secs_f64().max(f64::EPSILON)
-            };
+            let ratio =
+                |a: Duration, b: Duration| a.as_secs_f64() / b.as_secs_f64().max(f64::EPSILON);
             println!(
-                "in-loop filter benchmark, {W}x{H} luma, {reps} frames, isa={}",
+                "in-loop filter benchmark, {W}x{H} luma, best of {rounds} rounds x {reps} frames, \
+                 isa={}",
                 isa()
             );
-            println!(
-                "  SAO      scalar {:>9.3?} / vector {:>9.3?}  => {:.2}x",
-                sao_scalar / reps,
-                sao_simd / reps,
-                ratio(sao_scalar, sao_simd)
-            );
-            println!(
-                "  deblock  scalar {:>9.3?} / vector {:>9.3?}  => {:.2}x",
-                deblock_scalar / reps,
-                deblock_simd / reps,
-                ratio(deblock_scalar, deblock_simd)
-            );
+            for (name, [scalar, vector]) in [("SAO     ", sao), ("deblock ", deblock)] {
+                println!(
+                    "  {name} scalar {:>9.3?} / vector {:>9.3?}  => {:.2}x",
+                    scalar / reps,
+                    vector / reps,
+                    ratio(scalar, vector)
+                );
+            }
         }
     }
 }
