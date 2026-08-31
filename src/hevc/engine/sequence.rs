@@ -212,6 +212,11 @@ impl SequenceDecoder {
     /// # Errors
     /// Any parse / decode error.
     pub fn push_nal_unit(&mut self, unit: NalUnit) -> Result<(), SequenceError> {
+        // Issue #189 stage attribution: header work for this NAL. The picture
+        // decode a `finish_picture` inside can trigger opens its own scopes,
+        // so those nest out of this one rather than inflating it.
+        let _profile =
+            crate::hevc::engine::profile::scope(crate::hevc::engine::profile::Stage::HeaderParse);
         let NalUnit {
             header,
             rbsp,
@@ -431,7 +436,15 @@ impl SequenceDecoder {
         let header_info = self.build_header_info(indep, sps, nal_kind, no_rasl_output)?;
         let slice_ref = build_slice_ref_params(&indep.header, pps, slice_type, &header_info);
 
-        let ref_state = self.state.begin_picture(&header_info, &slice_ref);
+        let ref_state = {
+            // Issue #189 stage attribution: the §8.3.1-§8.3.5 per-picture
+            // reference derivation, which is DPB bookkeeping rather than
+            // sample work.
+            let _profile = crate::hevc::engine::profile::scope(
+                crate::hevc::engine::profile::Stage::DpbOutput,
+            );
+            self.state.begin_picture(&header_info, &slice_ref)
+        };
         let lists = ref_state.ref_pic_lists.clone().unwrap_or(RefPicLists {
             list0: Vec::new(),
             list1: None,
@@ -504,6 +517,10 @@ impl SequenceDecoder {
 
         let output = indep.header.pic_output_flag;
         let poc = ref_state.poc;
+        // The picture clone into the output queue and the §8.3.2 DPB insertion
+        // are both output-side handling, charged together.
+        let _profile =
+            crate::hevc::engine::profile::scope(crate::hevc::engine::profile::Stage::DpbOutput);
         self.frames.push(DecodedFrame {
             cvs_index: self.cvs_index,
             poc: poc.val,

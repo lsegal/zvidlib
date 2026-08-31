@@ -1493,6 +1493,11 @@ pub fn decode_coding_tree_unit_in_picture(
     sao_merge_left_allowed: bool,
     sao_merge_up_allowed: bool,
 ) -> Result<CodingTreeUnit, ResidualCodingError> {
+    // Issue #189 stage attribution: one scope per CTU covers the whole
+    // §7.3.8 syntax walk. The §7.3.8.11 residual scope nests inside it, so
+    // what is left here is the non-coefficient CABAC decode.
+    let _profile =
+        crate::hevc::engine::profile::scope(crate::hevc::engine::profile::Stage::SliceData);
     let mut qg = QuantGroupState::default();
     state.begin_ctu(x_ctb, y_ctb, slice_addr_rs, tile_id);
 

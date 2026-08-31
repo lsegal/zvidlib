@@ -557,6 +557,11 @@ fn predict_add_store(
     transquant_bypass: bool,
     res: Option<&[i32]>,
 ) -> Result<(), ReconError> {
+    // Issue #189 stage attribution: reference gathering, prediction and the
+    // §8.6.7 add are one stage because they are one block's intra work and no
+    // decision separates them.
+    let _profile =
+        crate::hevc::engine::profile::scope(crate::hevc::engine::profile::Stage::IntraPred);
     let bit_depth = pic.bit_depth(plane);
     let marked = gather_reference_samples(pic, ctx, plane, xb, yb, n_tbs);
     // §8.4.4.2.6: disableIntraBoundaryFilter is 1 when
@@ -717,6 +722,10 @@ pub fn reconstruct_inter_pu_weighted(
     residual_cr: Option<&[i32]>,
     weights: Option<&crate::hevc::engine::inter_pred::PuWeights>,
 ) -> Result<(), ReconError> {
+    // Issue #189 stage attribution: `reconstruct_inter_pu` delegates here, so
+    // this one scope covers every inter prediction unit in a picture.
+    let _profile =
+        crate::hevc::engine::profile::scope(crate::hevc::engine::profile::Stage::InterPred);
     let cat = params.chroma_array_type;
     // Build the §8.5.3.3.2 reference planes for each used list.
     let lp0 = build_list_prediction(&l0, cat)?;

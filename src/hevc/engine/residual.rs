@@ -980,6 +980,12 @@ pub fn decode_residual_coding(
     contexts: &mut ResidualContexts,
     params: &ResidualCodingParams,
 ) -> Result<ResidualBlock, ResidualCodingError> {
+    // Issue #189 stage attribution: charged separately from the rest of the
+    // slice-data CABAC walk it nests inside, because coefficient parsing is
+    // the part of §7.3.8 that scales with residual density rather than with
+    // block count.
+    let _profile =
+        crate::hevc::engine::profile::scope(crate::hevc::engine::profile::Stage::Residual);
     let mut bins = EngineResidualBinSource { engine, contexts };
     decode_residual_coding_with(params, &mut bins)
 }

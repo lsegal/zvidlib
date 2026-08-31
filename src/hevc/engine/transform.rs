@@ -747,6 +747,11 @@ pub fn residual_block(
     scaling: Option<&ScalingFactorMatrix>,
     params: BlockParams,
 ) -> Result<Vec<i32>, TransformError> {
+    // Issue #189 stage attribution: every dequantized / inverse-transformed
+    // block in a decode passes through here, so one scope covers §8.6.
+    let _profile = crate::hevc::engine::profile::scope(
+        crate::hevc::engine::profile::Stage::InverseTransform,
+    );
     let n_tbs = params.n_tbs;
     let log2_tbs = log2_tbs(n_tbs).ok_or(TransformError::InvalidBlockSize(n_tbs))?;
     if !(8..=16).contains(&params.bit_depth) {

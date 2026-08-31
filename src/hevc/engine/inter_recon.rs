@@ -704,6 +704,10 @@ pub fn reconstruct_inter_picture(
     // §8.7.2 — in-loop deblocking (all vertical edges, then horizontal),
     // ahead of the §8.7.3 SAO pass.
     if slice.deblock_enabled {
+        // Issue #189 stage attribution: one scope per picture, since the
+        // in-loop filters run as whole-picture passes rather than per block.
+        let _profile =
+            crate::hevc::engine::profile::scope(crate::hevc::engine::profile::Stage::Deblock);
         let qp_map = ctx
             .qp_cells()
             .map(|(cells, w_cells)| crate::hevc::engine::deblock::QpMap { cells, w_cells });
@@ -757,6 +761,8 @@ pub fn reconstruct_inter_picture(
                 .collect(),
         ),
     };
+    let _sao_profile =
+        crate::hevc::engine::profile::scope(crate::hevc::engine::profile::Stage::Sao);
     let filtered = crate::hevc::engine::sao::apply_sao_picture_full(
         pic,
         &sao_grid,
