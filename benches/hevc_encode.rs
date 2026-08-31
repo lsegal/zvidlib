@@ -262,10 +262,12 @@ fn zvidlib_rdo_defaults() -> (i32, i32) {
 ///
 /// The stage that makes the encoder predict from what a decoder will hold
 /// rather than from the source it was handed: every coded block is
-/// reconstructed (predict + add residual), then the §8.7.2 deblocking filter
-/// and §8.7.3 SAO run over the whole picture through the decoder's own
-/// kernels, which is why this is the one non-mode-search encoder group that
-/// can show an instruction-set delta.
+/// reconstructed (predict + add residual), then the §8.7.3 SAO parameters are
+/// searched and the §8.7.2 deblocking filter and §8.7.3 SAO run over the whole
+/// picture through the decoder's own kernels. The reconstruction loop and the
+/// SAO search dispatch through `hevc_recon` and the filters through
+/// `hevc_prediction_filters`, which is why this is the one non-mode-search
+/// encoder group that can show an instruction-set delta.
 ///
 /// The mode-search plan the reconstruction consumes is built in setup, not in
 /// the timed loop — mode search costs an order of magnitude more than
