@@ -3,6 +3,7 @@
 // internal — exposed for the criterion benchmark suite; not part of the stable API
 #[doc(hidden)]
 pub mod bench;
+pub mod decode_bench;
 mod encoder;
 pub(crate) mod engine;
 #[cfg(all(any(windows, target_os = "linux"), target_pointer_width = "64"))]

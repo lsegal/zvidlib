@@ -35,15 +35,19 @@
 //! `simd::active_by_site()` that the override landed rather than inferring it
 //! from the clock.
 //!
+//! The one exception is the reconstruction group. It runs the decoder's own
+//! §8.7.2 deblocking and §8.7.3 SAO kernels over the encoder's reconstructed
+//! picture, and those *are* vectorized, so it is the one encoder-side group
+//! outside mode search that is expected to move with the instruction set.
+//!
 //! ## Stages this encoder does not have yet
 //!
-//! The encoder's access-unit writer is still a lossless PCM bootstrap writer, so
-//! it has no encoder-side reconstruction or in-loop filtering to measure: PCM
-//! samples are written verbatim, and no reconstructed picture can differ from
-//! the source. The forward transform and quantization stage does exist and is
-//! benchmarked below, even though the PCM writer does not call it yet.
-//! [`report_absent_stages`] prints the remaining gaps explicitly on every run so
-//! a missing group is never read as a stage that costs nothing.
+//! Every stage the tracking issue names is now benchmarked, but the encoder's
+//! access-unit writer is still a lossless PCM bootstrap writer: it does not
+//! call the forward transform + quantization stage or the encode-side
+//! reconstruction path, both of which are measured here directly rather than
+//! through it. [`report_absent_stages`] prints that on every run so a group is
+//! never read as covering more of the encoder than it does.
 
 mod support;
 
@@ -89,14 +93,16 @@ const WHOLE_FRAME_FRAMES: usize = 2;
 /// have to be reported too, or their absence reads as zero cost.
 fn report_absent_stages(_: &mut Criterion) {
     println!(
-        "# hevc_encode: the access-unit writer is still a lossless PCM writer, so there is no\n\
-         # encoder-side reconstruction or in-loop filtering to measure.\n\
-         # The stages benchmarked below are mode search/RDO, forward transform + quantization,\n\
-         # CABAC + bitwriting, whole-picture PCM access-unit writing, and the RGBA8->YUV420\n\
-         # input conversion.\n\
+        "# hevc_encode: every stage the tracking issue names is benchmarked below: mode\n\
+         # search/RDO, forward transform + quantization, encode-side reconstruction + in-loop\n\
+         # filtering, CABAC + bitwriting, whole-picture PCM access-unit writing, and the\n\
+         # RGBA8->YUV420 input conversion. The access-unit writer is still a lossless PCM\n\
+         # writer, so it reaches neither the transform/quantization nor the reconstruction\n\
+         # stage; both are measured directly instead.\n\
          # hevc_encode: hevc_rdcost and hevc_fwd_transform_quant are the encoder's two SIMD\n\
-         # dispatch families, so only the mode-search and forward-transform groups can show an\n\
-         # instruction-set delta; the others are expected to be flat across arms, which is the\n\
+         # dispatch families, so apart from the mode-search, forward-transform and\n\
+         # reconstruction groups (the last running the decoder's vectorized in-loop filter\n\
+         # kernels) the arms are expected to read flat across instruction sets, which is the\n\
          # measured result, not a broken bench."
     );
 }
@@ -126,6 +132,23 @@ fn planes_pair(width: u32, height: u32) -> (Planes, Vec<u8>) {
         height: height as usize,
     };
     (extract(&frames[1]), frames[0].planes[0].data.clone())
+}
+
+/// Both pictures of the synthetic pair, all three planes each.
+///
+/// [`planes_pair`] keeps only the reference's luma, which is all the mode
+/// search needs; reconstruction predicts chroma too, so it needs the whole
+/// reference picture.
+fn planes_sequence(width: u32, height: u32) -> (Planes, Planes) {
+    let frames = support::synthetic_yuv420_sequence(width, height, 2);
+    let extract = |frame: &VideoFrame| Planes {
+        y: frame.planes[0].data.clone(),
+        cb: frame.planes[1].data.clone(),
+        cr: frame.planes[2].data.clone(),
+        width: width as usize,
+        height: height as usize,
+    };
+    (extract(&frames[0]), extract(&frames[1]))
 }
 
 /// Whether the 1080p-class groups were opted into.
@@ -235,6 +258,47 @@ fn mode_search(criterion: &mut Criterion, size: (u32, u32), group_prefix: &str) 
 /// measures the shipped search rather than a tuned one.
 fn zvidlib_rdo_defaults() -> (i32, i32) {
     (26, 4)
+}
+
+/// Encode-side reconstruction and in-loop filtering.
+///
+/// The stage that makes the encoder predict from what a decoder will hold
+/// rather than from the source it was handed: every coded block is
+/// reconstructed (predict + add residual), then the §8.7.2 deblocking filter
+/// and §8.7.3 SAO run over the whole picture through the decoder's own
+/// kernels, which is why this is the one non-mode-search encoder group that
+/// can show an instruction-set delta.
+///
+/// The mode-search plan the reconstruction consumes is built in setup, not in
+/// the timed loop — mode search costs an order of magnitude more than
+/// everything else and would swamp the measurement.
+///
+/// Both loop filters are enabled here. The shipped writer emits an access unit
+/// that neutralizes them (`pcm_loop_filter_disabled_flag == 1`), which is what
+/// keeps its PCM encode exactly lossless; the filters are what this group
+/// exists to measure, so it models the access unit that leaves them on.
+fn reconstruct(criterion: &mut Criterion, size: (u32, u32), group_prefix: &str) {
+    let (reference, current) = planes_sequence(size.0, size.1);
+    let config = zvidlib_rdo_defaults();
+    let workload = encoder_bench::plan_reconstruct(
+        &current.y,
+        &current.cb,
+        &current.cr,
+        current.width,
+        current.height,
+        Some((&reference.y, &reference.cb, &reference.cr)),
+        config.0,
+        config.1,
+    );
+
+    let name = format!("{group_prefix}_reconstruct");
+    let isa_workload = IsaWorkload::new(
+        &name,
+        FrameWork::new(1, u64::from(size.0), u64::from(size.1)),
+    );
+    bench_across_isas(criterion, &isa_workload, || {
+        encoder_bench::reconstruct_encoded_picture(&workload, true, true)
+    });
 }
 
 /// Whole-picture bitstream writing: parameter sets, slice header, and the
@@ -366,6 +430,7 @@ fn hevc_encode_large(criterion: &mut Criterion) {
 fn hevc_encode_stages_small(criterion: &mut Criterion) {
     mode_search(criterion, SMALL, "hevc_encode_640x352");
     fwd_transform_quant(criterion, SMALL, "hevc_encode_640x352");
+    reconstruct(criterion, SMALL, "hevc_encode_640x352");
     pcm_write(criterion, SMALL, "hevc_encode_640x352");
     color_conversion(criterion, SMALL, "hevc_encode_640x352");
 }
@@ -376,6 +441,7 @@ fn hevc_encode_stages_large(criterion: &mut Criterion) {
     }
     mode_search(criterion, LARGE, "hevc_encode_1920x1088");
     fwd_transform_quant(criterion, LARGE, "hevc_encode_1920x1088");
+    reconstruct(criterion, LARGE, "hevc_encode_1920x1088");
     pcm_write(criterion, LARGE, "hevc_encode_1920x1088");
     color_conversion(criterion, LARGE, "hevc_encode_1920x1088");
 }

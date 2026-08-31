@@ -38,6 +38,11 @@ name = "av1_decode"
 path = "benches/av1_decode.rs"
 harness = false
 
+[[bench]]
+name = "hevc_decode"
+path = "benches/hevc_decode.rs"
+harness = false
+
 # The audio decode path is a separate target rather than another group in
 # `codec`: it shares `benches/support/` but none of `codec`'s decoded-frame
 # fixtures, and issue #152 specifies `cargo bench --bench audio_decode` as its
@@ -149,8 +154,12 @@ opt-level = 2
 
 # LTO + a single codegen unit let the optimizer inline and specialize across
 # the (crate-internal) hevc decoder's module boundaries, which matters a lot
-# for the many small hot per-sample/per-block functions in the decode path
-# (measured ~2.7 -> ~3.7 fps, +37%, decoding the bundled 1080p sample).
+# for the many small hot per-sample/per-block functions in the decode path.
+# The benchmark owns the numbers rather than this comment: run
+# `ZVIDLIB_BENCH_LARGE=1 cargo bench --bench codec -- hevc_decode` for the
+# whole-frame fps of the bundled 1080p sample per instruction set, and
+# `cargo bench --bench codec -- hevc_` for the per-stage breakdown that says
+# which kernel a change moved. See benches/README.md.
 [profile.release]
 lto = "fat"
 codegen-units = 1

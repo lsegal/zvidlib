@@ -7,4 +7,5 @@ pub mod pcm;
 pub mod quant_simd;
 pub mod rdcost;
 pub mod rdo;
+pub mod recon;
 pub mod transform;
