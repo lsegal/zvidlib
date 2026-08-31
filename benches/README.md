@@ -1,14 +1,23 @@
 # Benchmarks
 
 zvidlib's benchmarks run under [criterion](https://docs.rs/criterion) with
-`harness = false`. The whole suite lives in a single bench target
-(`benches/codec.rs`) so the shared fixture cache in `benches/support/` is loaded
-and decoded once per process and each iteration measures codec work only.
+`harness = false`, across two bench targets that share one fixture module:
+
+| Target | Covers |
+| --- | --- |
+| `benches/codec.rs` | video decode, encode inputs, and the scalar-vs-SIMD axis |
+| `benches/audio_decode.rs` | AAC decode and `AacSampleReader` range/seek paths |
+
+Both compile `benches/support/`, so the fixture cache is loaded and decoded once
+per process and each iteration measures codec work only. Each target uses a
+different subset of that module, which is why it carries an `#![allow(dead_code)]`.
 
 ## Running
 
 ```sh
-cargo bench                       # the default, fast groups
+cargo bench                       # every target's default, fast groups
+cargo bench --bench codec         # one target
+cargo bench --bench audio_decode  # the audio target
 cargo bench --features simd       # the same groups, recorded under `simd=on`
 cargo bench --no-run              # compile only
 ```
@@ -140,6 +149,8 @@ same host are 2.4-4.9x. `active_by_site()` answers the question directly.
 | `av1_lossless_intra_stream` / `av1_lossless_intra_frame` | `tests/fixtures/codec/av1_lossless_17x9.hex` |
 | `av1_inter_stream` / `av1_inter_temporal_units` | `tests/fixtures/codec/av1_inter_show_existing_16x16.hex` |
 | `bundled_hevc_sample` | `examples/media/BigBuckBunny.mp4` |
+| `bundled_aac_stereo` | `examples/media/BigBuckBunny.mp4` (its AAC-LC stereo track) |
+| `aac_mono_fixture` | `tests/fixtures/codec/aac_lc_mono_48k.m4a` |
 | `synthetic_yuv420_sequence` | generated; encoder inputs without decoding first |
 
 Every one of them is cached in a `OnceLock`, so the demux and decode cost is paid
@@ -151,6 +162,14 @@ once per process rather than once per iteration.
 `support::report_throughput` sets `Throughput::Elements(frames)` — criterion then
 prints a frames/sec rate — and prints the megapixels each frame carries, which
 converts that rate to megapixels per second.
+
+Audio has no pixels, so `support::AudioWork` counts decoded samples instead.
+`support::report_audio_throughput` sets `Throughput::Elements(samples)` — a
+decoded-samples/sec rate — and prints the sample rate and the seconds of audio
+one iteration covers, which converts that rate to a realtime factor. Every audio
+benchmark additionally prints its own `NNNx realtime` line from a single timed
+pass, because x-realtime is the figure a playback path is judged by and criterion
+has no unit for it.
 
 ## Profile
 
@@ -169,3 +188,33 @@ and criterion is a `cfg(not(target_arch = "wasm32"))` dev-dependency, so the
 synthetic inputs in `support`, and the scalar-vs-SIMD axis in `support::isa`
 (`bench_across_isas`, the bit-exactness guard, and the per-site override
 assertion).
+
+## Audio groups
+
+`benches/audio_decode.rs` measures two layers, and keeps them in separate groups
+on purpose:
+
+| Group | What it measures |
+| --- | --- |
+| `aac_decode` | `NativeAacDecoder::decode` over a fixed run of access units, mono and stereo |
+| `aac_reader_sequential` | `AacSampleReader::get_range` re-reading a resident range, and walking forward |
+| `aac_reader_seek` | random-access ranges, each forcing a decoder reset and a preroll re-decode |
+| `aac_reader_edits` | reads crossing edit-list boundaries and gapless priming/padding trims |
+
+`AacSampleReader` keeps decoded packets in a `BTreeMap`, so the same call costs
+two very different things depending on whether the requested media range is
+already resident. `cached_repeat_stereo_48k` is the pure hit path — no decode at
+all — and everything in `aac_reader_seek` is the cold path. Reporting them
+together would average the seek cost away, and the seek cost is the one that
+shows up as an audible stall.
+
+These groups carry **no `simd=` tag and no per-ISA arms**. AAC decoding is
+delegated to the third-party `symphonia-codec-aac` crate, `zvidlib::simd`'s
+override does not reach it, and the crate has no audio SIMD kernels of its own,
+so a scalar arm and a vector arm would be the same code reported twice.
+
+The mono fixture exists because the bundled sample is stereo and carries no edit
+list, while `NativeAacDecoder` accepts AAC-LC mono as well (and rejects
+everything beyond stereo, so mono and stereo are its entire supported input
+space). It also supplies the real `elst` and decoder-priming timing the bundled
+sample does not have.

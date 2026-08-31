@@ -154,9 +154,12 @@ fn aac_reader_sequential(criterion: &mut Criterion) {
     report_audio_throughput(&mut group, cached_id, cached_work);
     group.bench_function(cached_id, |bencher| bencher.iter(&mut cached_run));
 
-    // The playback path: consecutive forward ranges. Each request that crosses
-    // into an undecoded packet pays for it, so this is the mixed steady-state
-    // cost rather than either extreme.
+    // The playback path: consecutive forward ranges. `ensure_decoded` clears
+    // the whole cache whenever the requested packets are not all resident, so
+    // at this read size a request that advances past the previous one does not
+    // extend the cache - it discards it and re-decodes with preroll. That is
+    // why this arm measures close to the seek group rather than to the cached
+    // one, and it is a property of the reader, not of the fixture.
     let forward_id = "forward_walk_stereo_48k";
     let forward_ranges = (0..SEQUENTIAL_READS)
         .map(|step| range_at(SEQUENTIAL_START + step * READ_SAMPLES, READ_SAMPLES))
