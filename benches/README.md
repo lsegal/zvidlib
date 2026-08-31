@@ -269,10 +269,13 @@ groups.
 `AudioEncoder` (`src/codec.rs`) is a trait with no implementation in the crate.
 Its only implementor anywhere in the tree is `PcmFixtureEncoder` in
 `tests/indexed_mp4_output.rs`, a test double that packages PCM without
-compressing anything. "Benchmark the audio encoder" therefore has no subject, and
-this target does not invent one -- whether the crate should grow a native AAC-LC
-encoder, delegate to a platform encoder (AudioToolbox / Media Foundation), or
-leave the trait for platform and web backends to fill is a product decision.
+compressing anything. "Benchmark the audio encoder" therefore has no subject.
+
+That question is now closed rather than open. zvidlib ships no audio encoder by
+decision: the trait is the seam that platform and browser backends fill, and the
+rationale is recorded on `AudioEncoder` in `src/codec.rs` and in the README. So
+there is no audio-encode target pending for this suite, and none of the audio
+groups below are placeholders waiting on one.
 
 The bench-local `PcmBenchEncoder` is the same kind of pass-through double, and it
 is bench-local on purpose: holding codec work at effectively zero is what makes
