@@ -2,8 +2,8 @@
 //!
 //! Covers the lossless 4x4 Walsh-Hadamard transform in both directions
 //! ([`crate::av1_encoder`]) and the whole non-lossless inverse transform set
-//! used by [`crate::av1_intra::inverse_transform`]: the 4-, 8-, 16-, and
-//! 32-point inverse DCT and the 4-, 8-, and 16-point inverse ADST, in every
+//! used by [`crate::av1_intra::inverse_transform`]: the 4-, 8-, 16-, 32-, and
+//! 64-point inverse DCT and the 4-, 8-, and 16-point inverse ADST, in every
 //! vertical/horizontal combination including the flipped-ADST output
 //! reversals.
 //!
@@ -54,7 +54,10 @@ fn pass_gain(size: usize) -> i32 {
         4 => 4,
         8 => 7,
         16 => 12,
-        _ => 22,
+        32 => 22,
+        // The 64-point gain is `40.95`, the same `2N/pi` trend the smaller
+        // sizes follow, with the same ~7% margin the 32-point bound carries.
+        _ => 44,
     }
 }
 
@@ -64,7 +67,7 @@ fn pass_gain(size: usize) -> i32 {
 /// Two passes multiply magnitudes by at most `pass_gain(size)` each, and the
 /// spare factor of four covers the rounding slack [`dot_rs14`] adds to its
 /// high half. Compare the old product-limited bound of 30000: this is 2^25 at
-/// 4 points and still 2^20 at 32 points.
+/// 4 points, still 2^20 at 32 points, and 2^18 (277309) at 64.
 pub(crate) fn input_limit(size: usize) -> i32 {
     let gain = pass_gain(size);
     (i32::MAX / 4) / (gain * gain)
@@ -144,6 +147,35 @@ unsafe fn dot_rs14<V: I32x, const N: usize>(terms: [(V, i32); N]) -> V {
             let scale = V::splat(coefficient);
             high = high.add(value.sra::<14>().mul(scale));
             low = low.add(value.and(mask).mul(scale));
+        }
+        high.add(round_shift14(low))
+    }
+}
+
+/// Bit-exact vector form of `av1_intra::dct_round_shift(sum(x_i * k_i))` for a
+/// dot product with more terms than [`dot_rs14`] can hold.
+///
+/// [`dot_rs14`] bounds its low accumulator by `N * 2^28`, which leaves a lane
+/// past seven terms; the 64-point kernel's odd half needs 32. Folding the low
+/// accumulator's carry into the high one - `x == (x >> 14) * 2^14 + (x &
+/// 0x3fff)` holds for negative values too, so `2^14 * high + low` is invariant
+/// under it - caps the low half at `4 * 2^28` for any `N`. Renormalizing every
+/// fourth term rather than every term keeps the cost near two extra operations
+/// per output instead of two per term.
+#[inline(always)]
+unsafe fn dot_rs14_wide<V: I32x, const N: usize>(values: &[V; N], coefficients: &[i32; N]) -> V {
+    unsafe {
+        let mask = V::splat(0x3fff);
+        let mut high = V::zero();
+        let mut low = V::zero();
+        for (index, (value, &coefficient)) in values.iter().zip(coefficients.iter()).enumerate() {
+            let scale = V::splat(coefficient);
+            high = high.add(value.sra::<14>().mul(scale));
+            low = low.add(value.and(mask).mul(scale));
+            if index % 4 == 3 {
+                high = high.add(low.sra::<14>());
+                low = low.and(mask);
+            }
         }
         high.add(round_shift14(low))
     }
@@ -1164,6 +1196,49 @@ unsafe fn store_i16_clamped<V: I32x>(row: V, out: &mut [i16]) {
     }
 }
 
+/// The 32x32 DCT-IV matrix of the 64-point inverse DCT's odd half, narrowed
+/// from the scalar path's table so the two cannot drift apart.
+const DCT4_32: [[i32; 32]; 32] = {
+    let source = crate::av1_intra::DCT4_32;
+    let mut table = [[0i32; 32]; 32];
+    let mut n = 0;
+    while n < 32 {
+        let mut j = 0;
+        while j < 32 {
+            table[n][j] = source[n][j] as i32;
+            j += 1;
+        }
+        n += 1;
+    }
+    table
+};
+
+/// Vector form of `av1_intra::inverse_dct64_1d`.
+///
+/// The same even/odd split the scalar kernel documents: the even-indexed
+/// coefficients are a 32-point inverse DCT and the odd-indexed ones a 32-point
+/// DCT-IV, whose sum and difference give the two output halves.
+#[inline(always)]
+unsafe fn dct64<V: I32x>(input: [V; 64]) -> [V; 64] {
+    unsafe {
+        let mut even = [V::zero(); 32];
+        let mut odd = [V::zero(); 32];
+        for j in 0..32 {
+            even[j] = input[2 * j];
+            odd[j] = input[2 * j + 1];
+        }
+        let even = dct32(even);
+
+        let mut output = [V::zero(); 64];
+        for (n, basis) in DCT4_32.iter().enumerate() {
+            let half = dot_rs14_wide(&odd, basis);
+            output[n] = even[n].add(half);
+            output[63 - n] = even[n].sub(half);
+        }
+        output
+    }
+}
+
 /// Runs one separable pass of an `N x N` block.
 ///
 /// Reads `$src` row-major, transforms each row with the kernel `$kind`
@@ -1201,8 +1276,8 @@ macro_rules! separable_pass {
 
 /// Defines the `N x N` inverse transform driver for one block size.
 ///
-/// `$adst` is the ADST kernel at that size, or the DCT kernel again at 32
-/// points where AV1 defines no ADST (the dispatcher normalizes the request
+/// `$adst` is the ADST kernel at that size, or the DCT kernel again at 32 and
+/// 64 points where AV1 defines no ADST (the dispatcher normalizes the request
 /// before calling in, so that arm is unreachable).
 macro_rules! inverse_transform_driver {
     ($name:ident, $n:literal, $shift:literal, $dct:ident, $adst:ident) => {
@@ -1263,3 +1338,4 @@ inverse_transform_driver!(inverse_transform4, 4, 4, dct4, adst4);
 inverse_transform_driver!(inverse_transform8, 8, 5, dct8, adst8);
 inverse_transform_driver!(inverse_transform16, 16, 6, dct16, adst16);
 inverse_transform_driver!(inverse_transform32, 32, 6, dct32, dct32);
+inverse_transform_driver!(inverse_transform64, 64, 6, dct64, dct64);

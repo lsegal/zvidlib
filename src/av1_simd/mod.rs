@@ -260,6 +260,13 @@ simd_entry_points! {
     ) -> bool = transforms::inverse_transform32, avx2 = Sse4;
 }
 simd_entry_points! {
+    #[allow(clippy::fn_params_excessive_bools)]
+    fn [tx64_sse41, tx64_avx2, tx64_neon](
+        dequantized: &[i32], column: Tx1d, row: Tx1d,
+        lr_flip: bool, ud_flip: bool, out: &mut [i16]
+    ) -> bool = transforms::inverse_transform64, avx2 = Sse4;
+}
+simd_entry_points! {
     #[allow(clippy::too_many_arguments)]
     fn [deblock_h_sse41, deblock_h_avx2, deblock_h_neon](
         data: &mut [u8], geom: filters::Geometry, x0: usize, y: usize, count: usize,
@@ -420,6 +427,18 @@ pub(crate) fn inverse_transform(
         32 => dispatch!(
             isa,
             [tx32_sse41, tx32_avx2, tx32_neon](
+                arguments.0,
+                arguments.1,
+                arguments.2,
+                arguments.3,
+                arguments.4,
+                arguments.5
+            ),
+            false
+        ),
+        64 => dispatch!(
+            isa,
+            [tx64_sse41, tx64_avx2, tx64_neon](
                 arguments.0,
                 arguments.1,
                 arguments.2,

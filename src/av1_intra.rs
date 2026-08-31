@@ -399,10 +399,10 @@ pub enum Av1TxType {
 /// flip flag rather than as a separate kernel.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Tx1d {
-    /// Inverse DCT. Defined for 4, 8, 16, and 32 points.
+    /// Inverse DCT. Defined for 4, 8, 16, 32, and 64 points.
     Dct,
-    /// Inverse ADST. Defined for 4, 8, and 16 points; a 32-point block always
-    /// uses the DCT.
+    /// Inverse ADST. Defined for 4, 8, and 16 points; a 32- or 64-point block
+    /// always uses the DCT.
     Adst,
 }
 
@@ -1023,6 +1023,104 @@ fn inverse_dct32_1d(input: [i64; 32]) -> [i64; 32] {
     output
 }
 
+/// `round(cos(m * pi / 128) * 2^14)` for the odd `m` a 64-point transform
+/// needs, at the same 14-bit scale as the `COSPI_*_64` constants above.
+///
+/// # Lineage
+///
+/// AV1 defines its 64-point inverse DCT against the 12-bit
+/// `cospi_arr(cos_bit)` table and a per-stage `av1_round_shift_array`
+/// schedule, which is a different fixed-point contract from the 14-bit
+/// VP9-lineage butterflies the rest of this module uses. Introducing that
+/// second lineage would leave two rounding conventions in one crate, so this
+/// kernel extends the existing one instead: `COSPI_k_64` is exactly
+/// `round(cos(2k * pi / 128) * 2^14)`, so the constants below are the missing
+/// *odd* multiples of `pi / 128` at that same scale, and the two tables
+/// together are one 14-bit table at the 1/128 angular resolution 64 points
+/// require. The 4-, 8-, 16-, and 32-point kernels therefore do **not**
+/// migrate, `dct_round_shift` stays the single rounding step, and there is no
+/// second lineage to coexist with.
+#[rustfmt::skip]
+const COSPI_ODD_128: [i64; 32] = [
+    16379, 16340, 16261, 16143, 15986, 15791, 15557, 15286,
+    14978, 14635, 14256, 13842, 13395, 12916, 12406, 11866,
+    11297, 10702, 10080,  9434,  8765,  8076,  7366,  6639,
+     5897,  5139,  4370,  3590,  2801,  2006,  1205,   402,
+];
+
+/// `round(cos((2n + 1)(2j + 1) * pi / 128) * 2^14)`, folded into the first
+/// quadrant of [`COSPI_ODD_128`].
+const fn cospi_odd_128(n: usize, j: usize) -> i64 {
+    // `(2n + 1)(2j + 1)` is odd, so the folded angle never lands on a
+    // quadrant boundary and every arm below indexes an odd multiple of
+    // `pi / 128`.
+    let r = ((2 * n + 1) * (2 * j + 1)) % 256;
+    if r < 64 {
+        COSPI_ODD_128[(r - 1) / 2]
+    } else if r < 128 {
+        -COSPI_ODD_128[(127 - r) / 2]
+    } else if r < 192 {
+        -COSPI_ODD_128[(r - 129) / 2]
+    } else {
+        COSPI_ODD_128[(255 - r) / 2]
+    }
+}
+
+/// The 32x32 DCT-IV matrix the odd half of the 64-point inverse DCT applies.
+pub(crate) const DCT4_32: [[i64; 32]; 32] = {
+    let mut table = [[0i64; 32]; 32];
+    let mut n = 0;
+    while n < 32 {
+        let mut j = 0;
+        while j < 32 {
+            table[n][j] = cospi_odd_128(n, j);
+            j += 1;
+        }
+        n += 1;
+    }
+    table
+};
+
+/// The 64-point inverse DCT, in the same 14-bit lineage as the smaller sizes
+/// (see [`COSPI_ODD_128`]).
+///
+/// Written as the textbook even/odd split of the DCT-III rather than as a
+/// twelve-stage partial butterfly: the even-indexed coefficients are exactly a
+/// 32-point inverse DCT, and the odd-indexed ones a 32-point DCT-IV, so
+///
+/// ```text
+/// out[n]      = even(n) + odd(n)
+/// out[63 - n] = even(n) - odd(n)
+/// ```
+///
+/// for `n` in `0..32`. That reuses [`inverse_dct32_1d`] unchanged and leaves
+/// only the DCT-IV half to define, which is applied here as a direct
+/// 32-term dot product with one [`dct_round_shift`] per output. The dot
+/// product costs more multiplies than a fully factored butterfly would, but it
+/// is the part the vectorized kernels in [`crate::av1_simd`] parallelize, and
+/// keeping the rounding to a single step per output makes the scalar and
+/// vector paths bit-exact by construction.
+fn inverse_dct64_1d(input: [i64; 64]) -> [i64; 64] {
+    let mut even = [0i64; 32];
+    for (j, slot) in even.iter_mut().enumerate() {
+        *slot = input[2 * j];
+    }
+    let even = inverse_dct32_1d(even);
+
+    let mut output = [0i64; 64];
+    for (n, &basis) in DCT4_32.iter().enumerate() {
+        let mut sum = 0i64;
+        for (j, &coefficient) in basis.iter().enumerate() {
+            sum += input[2 * j + 1] * coefficient;
+        }
+        let odd = dct_round_shift(sum);
+        output[n] = even[n] + odd;
+        output[63 - n] = even[n] - odd;
+    }
+    output
+}
+
+
 /// The AV1/VP9-lineage 4-point inverse ADST partial butterfly.
 fn inverse_adst4_1d(input: [i64; 4]) -> [i64; 4] {
     let mut output = [0i64; 4];
@@ -1281,6 +1379,7 @@ fn inverse_transform_1d(kind: Tx1d, values: &[i64]) -> Vec<i64> {
         (Tx1d::Dct, 8) => inverse_dct8_1d(values.try_into().unwrap()).to_vec(),
         (Tx1d::Dct, 16) => inverse_dct16_1d(values.try_into().unwrap()).to_vec(),
         (Tx1d::Dct, 32) => inverse_dct32_1d(values.try_into().unwrap()).to_vec(),
+        (Tx1d::Dct, 64) => inverse_dct64_1d(values.try_into().unwrap()).to_vec(),
         (Tx1d::Adst, 4) => inverse_adst4_1d(values.try_into().unwrap()).to_vec(),
         (Tx1d::Adst, 8) => inverse_adst8_1d(values.try_into().unwrap()).to_vec(),
         (Tx1d::Adst, 16) => inverse_adst16_1d(values.try_into().unwrap()).to_vec(),
@@ -1289,6 +1388,12 @@ fn inverse_transform_1d(kind: Tx1d, values: &[i64]) -> Vec<i64> {
 }
 
 /// Downshift applied to the column pass output for a `size x size` block.
+///
+/// The 64-point size keeps the 32-point shift: both 1-D passes have unit
+/// gain on a DC-only block regardless of size, so the extra points widen the
+/// dynamic range of the *coefficients* a block can carry (which
+/// [`crate::av1_simd::transforms::input_limit`] bounds) rather than the scale
+/// of its output samples.
 pub(crate) fn transform_shift(size: usize) -> u32 {
     match size {
         4 => 4,
@@ -1301,9 +1406,9 @@ pub(crate) fn transform_shift(size: usize) -> u32 {
 /// §7.12.3, §7.13) for one `size x size` transform block, returning
 /// row-major residual samples.
 ///
-/// `size` must be 4, 8, 16, or 32. The ADST kernels are only defined for 4,
-/// 8, and 16 points, so a 32-point block runs the DCT along both axes
-/// regardless of `tx_type`. An unsupported `size` leaves the dequantized
+/// `size` must be 4, 8, 16, 32, or 64. The ADST kernels are only defined for
+/// 4, 8, and 16 points, so a 32- or 64-point block runs the DCT along both
+/// axes regardless of `tx_type`. An unsupported `size` leaves the dequantized
 /// coefficients untransformed rather than panicking.
 pub fn inverse_transform(
     coefficients: &[i32],
@@ -1313,7 +1418,7 @@ pub fn inverse_transform(
     ac_quant: i32,
 ) -> Vec<i16> {
     debug_assert_eq!(coefficients.len(), size * size);
-    debug_assert!(matches!(size, 4 | 8 | 16 | 32));
+    debug_assert!(matches!(size, 4 | 8 | 16 | 32 | 64));
     let mut dequantized = vec![0i64; size * size];
     for (index, value) in dequantized.iter_mut().enumerate() {
         let quant = if index == 0 { dc_quant } else { ac_quant };
@@ -1329,7 +1434,7 @@ pub fn inverse_transform(
     }
 
     let (mut column, mut row, lr_flip, ud_flip) = tx_type.kernels();
-    if size == 32 {
+    if size >= 32 {
         column = Tx1d::Dct;
         row = Tx1d::Dct;
     }
