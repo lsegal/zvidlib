@@ -756,44 +756,6 @@ mod nonlossless_tests {
     }
 
     #[test]
-    fn zz_probe() {
-        for (width, height) in [(96_usize, 80_usize), (640, 352)] {
-            let pixels = test_pattern(width as u32, height as u32);
-            for q in [1_u8, 8, 32, 80, 160, 200] {
-                let start = std::time::Instant::now();
-                let fast = tile::FrameEncoder::new(&pixels, width, height, q).encode_with_report();
-                let fast_ms = start.elapsed().as_secs_f64() * 1000.0;
-                let start = std::time::Instant::now();
-                let slow = tile::FrameEncoder::new(&pixels, width, height, q)
-                    .without_search_shortcuts()
-                    .encode_with_report();
-                let slow_ms = start.elapsed().as_secs_f64() * 1000.0;
-                let quality = |report: &tile::SearchReport| {
-                    let recon: Vec<u8> = (0..height)
-                        .flat_map(|row| {
-                            report.reconstruction[row * report.coded_width..][..width].to_vec()
-                        })
-                        .collect();
-                    psnr(&pixels, &recon)
-                };
-                println!(
-                    "PROBE {width}x{height} q={q} bytes {} vs {} ({:+.2}%) psnr {:.3} vs {:.3} ({:+.3}) cand {} vs {} ms {:.1} vs {:.1}",
-                    fast.tile.len(),
-                    slow.tile.len(),
-                    100.0 * (fast.tile.len() as f64 / slow.tile.len() as f64 - 1.0),
-                    quality(&fast),
-                    quality(&slow),
-                    quality(&fast) - quality(&slow),
-                    fast.candidates_evaluated,
-                    slow.candidates_evaluated,
-                    fast_ms,
-                    slow_ms,
-                );
-            }
-        }
-    }
-
-    #[test]
     fn non_lossless_frames_round_trip_within_a_distortion_bound() {
         let (width, height) = (96_u32, 80_u32);
         let pixels = test_pattern(width, height);
