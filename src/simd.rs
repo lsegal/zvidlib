@@ -140,6 +140,10 @@ pub fn active_by_site() -> Vec<(&'static str, SimdIsa)> {
             from_hevc_backend(transform_simd::detected()),
         ));
         sites.push(("hevc_rdcost", from_rdcost_isa(rdcost::isa())));
+        sites.push((
+            "hevc_fwd_transform_quant",
+            from_hevc_backend(crate::hevc::engine::encoder::quant_simd::detected()),
+        ));
     }
     sites
 }
