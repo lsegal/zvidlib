@@ -145,10 +145,10 @@ fn out_of_range_walsh_hadamard_blocks_fall_back_to_scalar() {
 }
 
 /// Every transform type this crate implements, paired with the sizes it is
-/// defined at. ADST has no 32-point kernel in AV1.
+/// defined at. ADST has no 32- or 64-point kernel in AV1.
 const TX_TYPES: [(Av1TxType, &[usize]); 10] = [
-    (Av1TxType::Idtx, &[4, 8, 16, 32]),
-    (Av1TxType::DctDct, &[4, 8, 16, 32]),
+    (Av1TxType::Idtx, &[4, 8, 16, 32, 64]),
+    (Av1TxType::DctDct, &[4, 8, 16, 32, 64]),
     (Av1TxType::AdstDct, &[4, 8, 16]),
     (Av1TxType::DctAdst, &[4, 8, 16]),
     (Av1TxType::AdstAdst, &[4, 8, 16]),
@@ -238,7 +238,7 @@ fn inverse_transforms_stay_bit_exact_at_the_documented_input_limit() {
 
 #[test]
 fn out_of_range_transform_blocks_fall_back_to_scalar() {
-    for size in [4usize, 8, 16, 32] {
+    for size in [4usize, 8, 16, 32, 64] {
         let over = transforms::input_limit(size) as i64 + 1;
         let coefficients: Vec<i32> = (0..size * size)
             .map(|index| if index == 3 { over as i32 } else { 1 })
@@ -262,6 +262,45 @@ fn out_of_range_transform_blocks_fall_back_to_scalar() {
     }
 }
 
+/// A bit-exactness comparison passes vacuously if every backend quietly took
+/// the scalar path, so pin down that each size really is dispatched to a
+/// vector kernel for ordinary coefficient magnitudes.
+#[test]
+fn every_transform_size_reaches_a_vector_kernel() {
+    let mut rng = Lcg(0x5eed_0120_0000_0005);
+    for (tx_type, sizes) in TX_TYPES {
+        if tx_type == Av1TxType::Idtx {
+            // The identity transform has no butterfly pass and never
+            // dispatches.
+            continue;
+        }
+        let (column, row, lr_flip, ud_flip) = tx_type.kernels();
+        for &size in sizes {
+            let coefficients: Vec<i32> = (0..size * size).map(|_| rng.in_range(600)).collect();
+            for (isa, vectorized) in for_each_isa(|isa| {
+                let mut out = vec![0i16; size * size];
+                inverse_transform_simd(
+                    isa,
+                    &coefficients,
+                    size,
+                    column,
+                    row,
+                    lr_flip,
+                    ud_flip,
+                    &mut out,
+                )
+            }) {
+                assert_eq!(
+                    vectorized,
+                    isa != SimdIsa::Scalar,
+                    "{tx_type:?} {size}x{size} on {}",
+                    isa.name()
+                );
+            }
+        }
+    }
+}
+
 /// The fixed-point butterflies must actually compute the transforms they
 /// claim to: `idctN` is the AV1/VP9-lineage DCT-III, `iadst4` is the DST-VII
 /// the `sinpi` constants encode, and `iadst8`/`iadst16` are DST-IV. Checking
@@ -271,7 +310,7 @@ fn out_of_range_transform_blocks_fall_back_to_scalar() {
 fn scalar_kernels_match_the_mathematical_transforms() {
     use std::f64::consts::{PI, SQRT_2};
 
-    for size in [4usize, 8, 16, 32] {
+    for size in [4usize, 8, 16, 32, 64] {
         for basis in 0..size {
             let mut coefficients = vec![0i32; size * size];
             // A single row coefficient, so the column pass only scales the DC
