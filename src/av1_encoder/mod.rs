@@ -1,9 +1,15 @@
 //! Dependency-free native AV1 encoding.
 //!
-//! The first backend is deliberately narrow and honest: lossless, all-intra,
-//! 8-bit monochrome AV1 Main profile. Every sample is an independent temporal
-//! unit containing a sequence header and key frame, so MP4 random access does
-//! not depend on encoder-private state.
+//! The backend is deliberately narrow and honest: all-intra, 8-bit monochrome
+//! AV1 Main profile. Every sample is an independent temporal unit containing a
+//! sequence header and key frame, so MP4 random access does not depend on
+//! encoder-private state.
+//!
+//! Two quantization profiles are available, selected by
+//! [`VideoEncoderConfig::configuration`]: an empty configuration (the default)
+//! encodes losslessly with the 4x4 WHT, and a single-byte configuration
+//! carrying a nonzero `base_q_idx` encodes non-lossless, which is what gives
+//! [`transform::forward_transform`] a caller. See [`parse_base_q_idx`].
 
 #[allow(dead_code)]
 mod bitwriter;
@@ -62,6 +68,13 @@ impl VideoEncoderFactory for NativeAv1EncoderFactory {
         )?;
         let stream = stream_configuration(configuration.color_range, level);
         let decoder_config = make_av1c(configuration.coded_dimensions, &stream)?;
+        let base_q_idx = parse_base_q_idx(&configuration.configuration).ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidInput,
+                "the native AV1 encoder's configuration is either empty (lossless) or a single \
+                 base_q_idx byte",
+            )
+        })?;
         Ok(Box::new(NativeAv1Encoder {
             declared: EncoderConfig {
                 codec: Codec::Av1,
@@ -78,6 +91,7 @@ impl VideoEncoderFactory for NativeAv1EncoderFactory {
             next_index: 0,
             finished: false,
             stream,
+            base_q_idx,
         }))
     }
 }
@@ -101,9 +115,10 @@ fn validate_configuration(configuration: &VideoEncoderConfig) -> CodecSupport {
     if configuration.timescale == 0 || configuration.frame_duration == 0 {
         return invalid_support("AV1 timescale and frame duration must be nonzero");
     }
-    if !configuration.configuration.is_empty() {
+    if parse_base_q_idx(&configuration.configuration).is_none() {
         return invalid_support(
-            "the native AV1 encoder does not accept backend-private configuration",
+            "the native AV1 encoder's configuration is either empty (lossless) or a single \
+             base_q_idx byte",
         );
     }
     if headers::pick_level(
@@ -118,6 +133,27 @@ fn validate_configuration(configuration: &VideoEncoderConfig) -> CodecSupport {
     }
     CodecSupport::Supported {
         implementation: CodecImplementation::Software,
+    }
+}
+
+/// The backend-private configuration this encoder accepts, as the frame header's `base_q_idx`
+/// (AV1 §5.9.12), or `None` when the blob is not one this backend understands.
+///
+/// An empty configuration is `base_q_idx = 0`, the lossless profile every earlier release
+/// emitted. A one-byte configuration is that byte, so `vec![32]` asks for a non-lossless frame at
+/// quantizer index 32; the quantizer index is the only encoder knob the AV1 bitstream needs, and
+/// keeping it a single byte means the whole surface is `configuration.is_empty()` or not.
+///
+/// Non-lossless streams round-trip through [`crate::decode_av1_lossless_intra`], the crate's own
+/// decoder. They are *not* yet interchange-grade: the symbols only a non-lossless frame reads
+/// (`eob_pt` above 16 coefficients, `tx_depth`, `ext_tx`) use this crate's placeholder CDFs
+/// rather than the specification's default tables, and the encoder writes no `delta_q_present`
+/// bit, matching the decoder's parse. Lossless output is unchanged and stays the default.
+fn parse_base_q_idx(configuration: &[u8]) -> Option<u8> {
+    match configuration {
+        [] => Some(0),
+        [base_q_idx] => Some(*base_q_idx),
+        _ => None,
     }
 }
 
@@ -235,6 +271,8 @@ struct NativeAv1Encoder {
     next_index: u64,
     finished: bool,
     stream: Av1StillConfig,
+    /// The frame header's `base_q_idx`; `0` selects the lossless WHT profile.
+    base_q_idx: u8,
 }
 
 impl VideoEncoder for NativeAv1Encoder {
@@ -352,8 +390,10 @@ impl NativeAv1Encoder {
             u32::try_from(mi_rows)
                 .map_err(|_| Error::new(ErrorKind::ResourceLimit, "AV1 MI height overflow"))?,
             order_hint,
+            self.base_q_idx,
         );
-        frame_payload.extend_from_slice(&FrameEncoder::new(&packed, width, height).encode());
+        frame_payload
+            .extend_from_slice(&FrameEncoder::new(&packed, width, height, self.base_q_idx).encode());
         let data = headers::assemble_temporal_unit(&sequence, &frame_payload);
         if u64::try_from(data.len()).unwrap_or(u64::MAX) > self.limits.max_allocation_bytes {
             return Err(Error::new(

@@ -2,7 +2,10 @@
 //! (§8.3.2) needed by the M0 lossless encoder.
 //!
 //! Only the slices the encoder touches are included: `base_q_idx == 0` ⇒ coefficient-CDF quant
-//! context 0, and `TX_4X4` only. CDFs are stored in the spec's cumulative form (rising to 32768)
+//! context 0, and `TX_4X4` only. The symbols that only a non-lossless frame reads — the larger
+//! `eob_pt` classes, `tx_depth`, the general scan orders and context offsets, and `ext_tx` — are
+//! re-exported from [`crate::av1_cdf`] rather than duplicated here, so the encoder and
+//! [`crate::av1_intra_decoder`] necessarily agree on every table they share. CDFs are stored in the spec's cumulative form (rising to 32768)
 //! with the trailing adaptation-count element dropped, so each row is ready to pass straight to
 //! [`gamut_bitstream::SymbolEncoder::encode_symbol`] (the M0 frame sets `disable_cdf_update = 1`,
 //! so the tables are never adapted). These values are extracted verbatim from the specification.
@@ -311,3 +314,8 @@ pub static SIG_REF_DIFF_OFFSET_2D: [(usize, usize); 5] = [(0, 1), (1, 0), (1, 1)
 
 /// `Mag_Ref_Offset_With_Tx_Class[TX_CLASS_2D]` (§8.3.2): neighbour offsets for `coeff_br`.
 pub static MAG_REF_OFFSET_2D: [(usize, usize); 3] = [(0, 1), (1, 0), (1, 1)];
+
+// --- Non-lossless symbols, shared verbatim with the decoder. ---
+pub use crate::av1_cdf::{
+    coeff_base_ctx_offset, eob_pt_cdf, ext_tx_cdf, tx_depth_cdf, up_right_diagonal_scan,
+};
