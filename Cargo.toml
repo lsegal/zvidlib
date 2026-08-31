@@ -36,6 +36,14 @@ harness = false
 [[bench]]
 name = "hevc_encode"
 path = "benches/hevc_encode.rs"
+
+# The audio write/read path is a separate target rather than another group in
+# `codec`: it shares `benches/support/` but none of `codec`'s decoded-frame
+# fixtures, and issue #153 specifies `cargo bench --bench audio_mux` as its
+# entry point. Container work is cheap enough that its default run stays fast.
+[[bench]]
+name = "audio_mux"
+path = "benches/audio_mux.rs"
 harness = false
 
 [features]
