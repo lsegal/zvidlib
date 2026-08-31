@@ -57,6 +57,7 @@ pub use av1::{
     Av1TileGroup,
 };
 pub use av1_encoder::native_av1_video_encoder_factory;
+pub use av1_encoder::transform::forward_transform;
 pub use av1_entropy::{AV1_CDF_MAX, Av1SymbolDecoder, validate_cdf};
 pub use av1_filters::{
     CdefStrength, FilmGrainParams, FilterFrame, FilterPlane, LoopFilterParams, MatrixCoefficients,
