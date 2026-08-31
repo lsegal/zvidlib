@@ -255,7 +255,7 @@ mistaken for bitstream-writing cost:
 | `..._pcm_write` | whole-picture access-unit writing: parameter sets, slice header, CABAC-coded CU syntax, PCM samples |
 | `hevc_encode_cabac` | the §9.3.5 arithmetic encoder alone, over a synthetic bin stream |
 | `hevc_encode_bitwriter` | the raw fixed-length / `ue(v)` / `se(v)` writer alone |
-| `..._rgba_to_yuv420` | the RGBA8 input conversion every encoded frame pays |
+| `..._rgba_to_yuv420` | the RGBA8 input conversion every encoded frame pays (`engine::encoder::colorconv`) |
 
 Every group runs once per available instruction set through
 `support::isa::bench_across_isas`, with the same bit-exactness and
@@ -278,14 +278,19 @@ run so a missing group is never read as a stage that costs nothing.
 
 ### Where the SIMD axis reads flat, and why that is the result
 
-`hevc_rdcost` — the SAD and SATD distortion metrics the mode search calls — is
-the encoder's **only** SIMD dispatch family. Bitstream writing, CABAC, and the
-RGBA-to-YUV420 conversion have no vector path at all, so their arms are expected
-to read the same under every instruction set. That is a measured result, not a
-broken benchmark: it says the next encoder-side vectorization targets are
-entropy coding and color conversion. It is also why every group asserts through
-`simd::active_by_site()` that the override landed rather than inferring it from
-the clock — see [Reading a null result](#reading-a-null-result).
+The encoder has two SIMD dispatch families: `hevc_rdcost`, the SAD and SATD
+distortion metrics the mode search calls, and `hevc_colorconv`, the RGBA8 to
+YUV420 input conversion. **Bitstream writing and CABAC** have no vector path at
+all, so `..._pcm_write`, `hevc_encode_cabac` and `hevc_encode_bitwriter` are
+expected to read the same under every instruction set. That is a measured
+result, not a broken benchmark: it says the remaining encoder-side
+vectorization targets are entropy coding and the bitwriter — and that for the
+bitwriter, a widening rewrite of its `put_bit`-at-a-time inner loop is likely
+worth more than vector kernels, while CABAC's renormalization is serial by
+construction and is a bin-parallel-algorithm question rather than a kernel one.
+It is also why every group asserts through `simd::active_by_site()` that the
+override landed rather than inferring it from the clock — see
+[Reading a null result](#reading-a-null-result).
 
 ## Per-stage access to the encoder
 

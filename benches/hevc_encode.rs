@@ -303,9 +303,10 @@ fn entropy_coding(criterion: &mut Criterion) {
 
 /// The RGBA8 to YUV420 conversion every encoded frame pays before mode search.
 ///
-/// Not one of the stages the tracking issue lists, and not a SIMD dispatch site,
-/// but it is real per-frame encoder cost: without it the per-stage groups do not
-/// add up to the whole-frame number.
+/// Real per-frame encoder cost — without it the per-stage groups do not add up
+/// to the whole-frame number — and, since `engine::encoder::colorconv`, the
+/// encoder's second SIMD dispatch site, so this group measures a scalar arm
+/// against a vector one rather than reading flat.
 fn color_conversion(criterion: &mut Criterion, size: (u32, u32), group_prefix: &str) {
     let frame = support::synthetic_rgba8_sequence(size.0, size.1, 1).remove(0);
     let name = format!("{group_prefix}_rgba_to_yuv420");
