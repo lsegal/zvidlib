@@ -20,6 +20,7 @@
 //! | --- | --- |
 //! | `av1_decode_frame` | whole-frame decode through `native_av1_video_decoder_factory` |
 //! | `av1_inverse_dct_*`, `av1_inverse_adst_*` | inverse transforms, `src/av1_simd/transforms.rs` |
+//! | `av1_forward_dct_*`, `av1_forward_adst_*` | forward transforms, migrated from the file this target replaces |
 //! | `av1_deblock*`, `av1_cdef`, `av1_wiener`, `av1_self_guided` | in-loop filters, `src/av1_simd/filters.rs` and `src/av1_filters.rs` |
 //! | `av1_mc_*` | inter prediction, `src/av1_mc.rs` |
 //! | `av1_intra_*` | intra prediction, `src/av1_intra_pred.rs` |
@@ -50,7 +51,7 @@ use zvidlib::av1_mc::{
 };
 use zvidlib::{
     AV1_CDF_MAX, Av1SymbolDecoder, Av1TxType, CancellationToken, FrameDigest, Limits,
-    VideoDecoderFactory, inverse_transform, native_av1_video_decoder_factory,
+    VideoDecoderFactory, forward_transform, inverse_transform, native_av1_video_decoder_factory,
 };
 
 use support::FrameWork;
@@ -173,6 +174,42 @@ fn av1_inverse_transforms(criterion: &mut Criterion) {
             for _ in 0..blocks {
                 let residual = inverse_transform(&coefficients, size, tx_type, 20, 14);
                 digest ^= checksum(&residual[0].to_le_bytes());
+            }
+            digest.to_le_bytes().to_vec()
+        });
+    }
+}
+
+/// The encoder-side forward transforms (issue #140), over the same block counts
+/// as the inverse sweep above.
+///
+/// These are encoder kernels in a decoder target, and they are here for one
+/// reason: they were part of `tests/av1_simd_bench.rs`, and this target's
+/// contract is that deleting that file loses no coverage. They belong in
+/// `benches/av1_encode.rs` (issue #150) once that target exists, and share the
+/// `av1_simd` dispatch site with the inverse kernels either way.
+fn av1_forward_transforms(criterion: &mut Criterion) {
+    for (name, size, tx_type) in [
+        ("av1_forward_dct_4x4", 4usize, Av1TxType::DctDct),
+        ("av1_forward_dct_8x8", 8, Av1TxType::DctDct),
+        ("av1_forward_dct_16x16", 16, Av1TxType::DctDct),
+        ("av1_forward_dct_32x32", 32, Av1TxType::DctDct),
+        ("av1_forward_adst_8x8", 8, Av1TxType::AdstAdst),
+        ("av1_forward_flipadst_16x16", 16, Av1TxType::FlipadstAdst),
+    ] {
+        let residual: Vec<i32> = (0..size * size)
+            .map(|index| (index as i32 * 53) % 511 - 255)
+            .collect();
+        let blocks = (WIDTH / size) * (HEIGHT / size);
+        let covered_width = (WIDTH / size * size) as u64;
+        let covered_height = (HEIGHT / size * size) as u64;
+        let work = FrameWork::new(1, covered_width, covered_height);
+        let workload = kernel_workload(name, work);
+        bench_across_isas(criterion, &workload, || {
+            let mut digest = 0u64;
+            for _ in 0..blocks {
+                let coefficients = forward_transform(&residual, size, tx_type);
+                digest ^= checksum(&coefficients[0].to_le_bytes());
             }
             digest.to_le_bytes().to_vec()
         });
@@ -601,6 +638,7 @@ criterion_group!(
     benches,
     av1_decode_frame,
     av1_inverse_transforms,
+    av1_forward_transforms,
     av1_deblock,
     av1_deblock_wide,
     av1_deblock_boundary,

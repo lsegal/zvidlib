@@ -21,8 +21,8 @@ required-features = ["native"]
 # `cargo test --features native --example native_gl` run them.
 test = true
 
-# Criterion drives its own harness (`harness = false`), so the bench target must
-# not link libtest. The whole benchmark suite lives in one target so the shared
+# Criterion drives its own harness (`harness = false`), so the bench targets must
+# not link libtest. Every codec group lives in this one target so the shared
 # `benches/support/` fixture cache is loaded and decoded once per process.
 [[bench]]
 name = "codec"
@@ -36,6 +36,24 @@ harness = false
 [[bench]]
 name = "av1_decode"
 path = "benches/av1_decode.rs"
+harness = false
+
+# The audio decode path is a separate target rather than another group in
+# `codec`: it shares `benches/support/` but none of `codec`'s decoded-frame
+# fixtures, and issue #152 specifies `cargo bench --bench audio_decode` as its
+# entry point.
+[[bench]]
+name = "audio_decode"
+path = "benches/audio_decode.rs"
+harness = false
+
+# The audio write/read path is a separate target rather than another group in
+# `codec`: it shares `benches/support/` but none of `codec`'s decoded-frame
+# fixtures, and issue #153 specifies `cargo bench --bench audio_mux` as its
+# entry point. Container work is cheap enough that its default run stays fast.
+[[bench]]
+name = "audio_mux"
+path = "benches/audio_mux.rs"
 harness = false
 
 [features]
