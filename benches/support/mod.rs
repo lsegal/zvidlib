@@ -16,8 +16,7 @@ use criterion::Throughput;
 use zvidlib::io::MemorySource;
 use zvidlib::{
     Codec, CodecProfile, ColorRange, EncodedVideoSample, Limits, Mp4Demuxer, Mp4DemuxerOptions,
-    PixelFormat, Plane, VideoDecoderConfig, VideoDimensions, VideoFrame,
-    decode_av1_lossless_intra,
+    PixelFormat, Plane, VideoDecoderConfig, VideoDimensions, VideoFrame, decode_av1_lossless_intra,
 };
 
 /// Whether the crate was built with the additive `simd` cargo feature.
@@ -32,7 +31,11 @@ pub fn simd_enabled() -> bool {
 
 /// The `simd=on` / `simd=off` suffix every criterion group name carries.
 pub fn simd_tag() -> &'static str {
-    if simd_enabled() { "simd=on" } else { "simd=off" }
+    if simd_enabled() {
+        "simd=on"
+    } else {
+        "simd=off"
+    }
 }
 
 /// Builds a criterion group name of the form `hevc_decode/simd=off`.
@@ -132,7 +135,11 @@ fn from_hex(hex: &str) -> Vec<u8> {
 /// The standardized AV1 Main lossless monochrome intra vector (17x9).
 pub fn av1_lossless_intra_stream() -> &'static [u8] {
     static STREAM: OnceLock<Vec<u8>> = OnceLock::new();
-    STREAM.get_or_init(|| from_hex(include_str!("../../tests/fixtures/codec/av1_lossless_17x9.hex")))
+    STREAM.get_or_init(|| {
+        from_hex(include_str!(
+            "../../tests/fixtures/codec/av1_lossless_17x9.hex"
+        ))
+    })
 }
 
 /// The standardized AV1 inter + `show_existing_frame` vector (16x16).
@@ -249,11 +256,7 @@ pub fn bundled_hevc_sample() -> &'static BundledHevcSample {
 /// Encoder benchmarks need frames without paying for a decode first, and the
 /// content has a moving gradient plus low-amplitude noise so neither prediction
 /// nor entropy coding degenerates into an unrepresentative best case.
-pub fn synthetic_yuv420_sequence(
-    width: u32,
-    height: u32,
-    frames: usize,
-) -> Vec<VideoFrame> {
+pub fn synthetic_yuv420_sequence(width: u32, height: u32, frames: usize) -> Vec<VideoFrame> {
     let limits = Limits::default();
     let dimensions =
         VideoDimensions::new(width, height, &limits).expect("synthetic dimensions are valid");
@@ -279,9 +282,7 @@ pub fn synthetic_yuv420_sequence(
             let chroma = |offset: i32| {
                 (0..chroma_h)
                     .flat_map(|y| (0..chroma_w).map(move |x| (x, y)))
-                    .map(|(x, y)| {
-                        (128 + ((x as i32 - y as i32 + shift + offset) % 24) - 12) as u8
-                    })
+                    .map(|(x, y)| (128 + ((x as i32 - y as i32 + shift + offset) % 24) - 12) as u8)
                     .collect::<Vec<_>>()
             };
             VideoFrame::new(

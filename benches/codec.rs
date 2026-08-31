@@ -43,7 +43,10 @@ fn smoke(criterion: &mut Criterion) {
     let decoded = decode_av1_lossless_intra(stream, &Limits::default())
         .expect("the checked-in AV1 intra vector decodes");
     let elapsed = started.elapsed();
-    assert_eq!(decoded.planes, frame.planes, "cached fixture matches a fresh decode");
+    assert_eq!(
+        decoded.planes, frame.planes,
+        "cached fixture matches a fresh decode"
+    );
     println!(
         "# zvidlib benches: simd feature {}, AV1 {}x{} intra smoke decode {:.2} Mpx/s",
         if support::simd_enabled() { "on" } else { "off" },
@@ -57,9 +60,7 @@ fn smoke(criterion: &mut Criterion) {
     report_throughput(&mut group, "av1_intra_17x9", work);
     group.bench_function("av1_intra_17x9", |bencher| {
         bencher.iter(|| {
-            black_box(
-                decode_av1_lossless_intra(black_box(stream), &Limits::default()).unwrap(),
-            )
+            black_box(decode_av1_lossless_intra(black_box(stream), &Limits::default()).unwrap())
         });
     });
     group.finish();
@@ -73,7 +74,11 @@ fn av1_decode(criterion: &mut Criterion) {
 
     let name = group_name("av1_decode");
     let mut group = criterion.benchmark_group(&name);
-    report_throughput(&mut group, "inter_show_existing_16x16", FrameWork::new(frames, 16, 16));
+    report_throughput(
+        &mut group,
+        "inter_show_existing_16x16",
+        FrameWork::new(frames, 16, 16),
+    );
     group.bench_function("inter_show_existing_16x16", |bencher| {
         bencher.iter(|| {
             let mut decoder = Av1InterDecoder::new(Limits::default()).unwrap();
@@ -107,9 +112,7 @@ fn encoder_input(criterion: &mut Criterion) {
 /// The bundled 1080p HEVC sample. Opt-in; see [`LARGE_GROUP_ENV`].
 fn hevc_decode_1080p(criterion: &mut Criterion) {
     if std::env::var_os(LARGE_GROUP_ENV).is_none() {
-        println!(
-            "# skipping the 1080p HEVC group; set {LARGE_GROUP_ENV}=1 to run it",
-        );
+        println!("# skipping the 1080p HEVC group; set {LARGE_GROUP_ENV}=1 to run it",);
         return;
     }
 
