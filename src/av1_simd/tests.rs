@@ -11,8 +11,10 @@
 
 use std::sync::{Mutex, MutexGuard};
 
+use super::forward_transform as forward_transform_simd;
 use super::inverse_transform as inverse_transform_simd;
 use super::*;
+use crate::av1_encoder::transform::forward_transform;
 use crate::av1_encoder::wht::{fwht4x4_scalar, iwht4x4_scalar};
 use crate::av1_filters::{
     CdefStrength, FilterFrame, FilterPlane, LoopFilterParams, RestorationUnit,
@@ -639,4 +641,155 @@ fn unsupported_override_falls_back_to_scalar() {
     }
     set_active_isa(None);
     assert_eq!(active_isa(), detected_isa());
+}
+
+// ---------------------------------------------------------------------
+// Forward transforms (issue #140)
+// ---------------------------------------------------------------------
+
+#[test]
+fn forward_transforms_match_the_scalar_reference_at_every_size_and_type() {
+    let mut rng = Lcg(0x5eed_0140_0000_0001);
+    for (tx_type, sizes) in TX_TYPES {
+        for &size in sizes {
+            for _ in 0..40 {
+                let residual: Vec<i32> = (0..size * size).map(|_| rng.in_range(255)).collect();
+                let results = for_each_isa(|_| forward_transform(&residual, size, tx_type));
+                assert_all_match(
+                    &results,
+                    &format!("forward {tx_type:?} {size}x{size} output"),
+                );
+            }
+        }
+    }
+}
+
+/// The same input-limit sweep the inverse transforms get: the forward bound is
+/// only worth documenting if the vector kernels stay bit-exact right at it, in
+/// the sign patterns that maximize each pass.
+#[test]
+fn forward_transforms_stay_bit_exact_at_the_documented_input_limit() {
+    let mut rng = Lcg(0x5eed_0140_0000_0002);
+    for (tx_type, sizes) in TX_TYPES {
+        for &size in sizes {
+            let extreme = crate::av1_encoder::transform::input_limit(size);
+            for pattern in 0..6 {
+                let residual: Vec<i32> = (0..size * size)
+                    .map(|index| {
+                        let sign = match pattern {
+                            0 => 1,
+                            1 => -1,
+                            2 => {
+                                if index % 2 == 0 {
+                                    1
+                                } else {
+                                    -1
+                                }
+                            }
+                            3 => {
+                                if (index / size) % 2 == 0 {
+                                    1
+                                } else {
+                                    -1
+                                }
+                            }
+                            4 => {
+                                if index % size < size / 2 {
+                                    1
+                                } else {
+                                    -1
+                                }
+                            }
+                            _ => {
+                                if rng.next() & 1 == 0 {
+                                    1
+                                } else {
+                                    -1
+                                }
+                            }
+                        };
+                        sign * extreme
+                    })
+                    .collect();
+                let results = for_each_isa(|_| forward_transform(&residual, size, tx_type));
+                assert_all_match(
+                    &results,
+                    &format!("forward {tx_type:?} {size}x{size} at the input limit"),
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn out_of_range_forward_transform_blocks_fall_back_to_scalar() {
+    for size in [4usize, 8, 16, 32] {
+        let over = i64::from(crate::av1_encoder::transform::input_limit(size)) + 1;
+        let residual: Vec<i32> = (0..size * size)
+            .map(|index| if index == 3 { over as i32 } else { 1 })
+            .collect();
+        let results = for_each_isa(|isa| {
+            let mut out = vec![0i32; size * size];
+            let vectorized = forward_transform_simd(
+                isa,
+                &residual,
+                size,
+                Tx1d::Dct,
+                Tx1d::Dct,
+                false,
+                false,
+                &mut out,
+            );
+            assert!(!vectorized, "the range guard must reject this block");
+            // The comparison above is only meaningful if an in-range block
+            // does reach the vector kernels, so check that here too.
+            let in_range = vec![1i32; size * size];
+            let accepted = forward_transform_simd(
+                isa,
+                &in_range,
+                size,
+                Tx1d::Dct,
+                Tx1d::Dct,
+                false,
+                false,
+                &mut out,
+            );
+            assert_eq!(
+                accepted,
+                isa != SimdIsa::Scalar,
+                "{} should{} vectorize an in-range {size}x{size} block",
+                isa.name(),
+                if isa == SimdIsa::Scalar { " not" } else { "" }
+            );
+            forward_transform(&residual, size, Av1TxType::DctDct)
+        });
+        assert_all_match(&results, "out-of-range forward transform output");
+    }
+}
+
+/// The forward and inverse vector kernels have to agree with each other, not
+/// just each with its own scalar reference: a round trip run entirely on one
+/// instruction set must reproduce the residual as closely as the scalar pair.
+#[test]
+fn vectorized_round_trip_reproduces_the_residual() {
+    let mut rng = Lcg(0x5eed_0140_0000_0003);
+    for (tx_type, sizes) in TX_TYPES {
+        for &size in sizes {
+            let residual: Vec<i32> = (0..size * size).map(|_| rng.in_range(255)).collect();
+            let results = for_each_isa(|_| {
+                let coefficients = forward_transform(&residual, size, tx_type);
+                inverse_transform(&coefficients, size, tx_type, 1, 1)
+            });
+            for (isa, reconstructed) in &results {
+                for (&want, &got) in residual.iter().zip(reconstructed.iter()) {
+                    assert!(
+                        (want - i32::from(got)).abs() <= 4,
+                        "{} {tx_type:?} {size}x{size} round trip: {want} became {got}",
+                        isa.name()
+                    );
+                }
+            }
+            assert_all_match(&results, &format!("{tx_type:?} {size}x{size} round trip"));
+        }
+    }
 }

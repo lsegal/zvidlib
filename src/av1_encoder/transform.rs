@@ -27,10 +27,11 @@
 //! ADST, N = 4:     b(k, n) = (2 * sqrt(2) / 3) * sin(pi * (2k + 1) * (n + 1) / 9)
 //! ```
 //!
-//! `tests::basis_matches_inverse_kernels` asserts entry-for-entry that the
-//! generated tables are the impulse responses of the inverse kernels, and
-//! `tests::basis_matches_double_precision` asserts they are the rounded
-//! `f64` evaluation of the formulas above. Both hold for all 1696 entries.
+//! `tests::basis_matches_the_inverse_kernels` asserts entry for entry that
+//! the generated tables are the inverse kernels' impulse responses (to within
+//! the one 2^14 LSB those kernels' per-stage rounding costs), and
+//! `tests::basis_matches_the_mathematical_transforms` asserts they are the
+//! rounded `f64` evaluation of the formulas above.
 //!
 //! # Rounding schedule and scale
 //!
@@ -323,4 +324,265 @@ pub fn forward_transform(residual: &[i32], size: usize, tx_type: Av1TxType) -> V
         }
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::av1_intra::{inverse_transform, inverse_transform_1d};
+
+    /// Small deterministic LCG, matching the style used elsewhere in the crate.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn in_range(&mut self, span: i32) -> i32 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((self.0 >> 33) as i32) % (2 * span + 1) - span
+        }
+    }
+
+    /// Every 1-D kernel this module defines, paired with the sizes it covers.
+    const KERNELS: [(Tx1d, &[usize]); 2] = [(Tx1d::Dct, &[4, 8, 16, 32]), (Tx1d::Adst, &[4, 8, 16])];
+
+    /// The forward basis must be the transpose of the inverse kernels', or
+    /// "forward/inverse round trip" means nothing. Feeding the inverse kernel
+    /// an impulse recovers one basis column at a time; at 2^24 the kernel's
+    /// own rounding is four orders of magnitude below one 2^14 basis LSB.
+    #[test]
+    fn basis_matches_the_inverse_kernels() {
+        const IMPULSE: i64 = 1 << 24;
+        for (kind, sizes) in KERNELS {
+            for &size in sizes {
+                let table = basis(kind, size).expect("kernel is defined at this size");
+                for k in 0..size {
+                    let mut input = vec![0i64; size];
+                    input[k] = IMPULSE;
+                    let response = inverse_transform_1d(kind, &input);
+                    for (n, &value) in response.iter().enumerate() {
+                        // Round half away from zero; `/` truncates toward it.
+                        let bias = if value < 0 { -IMPULSE / 2 } else { IMPULSE / 2 };
+                        let recovered = (value * (1 << 14) + bias) / IMPULSE;
+                        let deviation = (recovered - i64::from(table[k * size + n])).abs();
+                        assert!(
+                            deviation <= BASIS_TOLERANCE,
+                            "{kind:?}{size} basis({k}, {n}) is off the inverse kernel's \
+                             transpose by {deviation}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// How far the inverse kernels' impulse response may sit from the ideal
+    /// basis. They round once per butterfly stage, so their effective matrix is
+    /// the transform's rounded to a fraction of a 2^14 LSB rather than to it
+    /// exactly; the forward tables hold the ideal value.
+    const BASIS_TOLERANCE: i64 = 1;
+
+    /// The tables must also be the transform they claim to be, not merely
+    /// self-consistent with the inverse kernels: a direct double-precision
+    /// evaluation catches a shared mistranscription that a transpose check
+    /// alone cannot.
+    #[test]
+    fn basis_matches_the_mathematical_transforms() {
+        use std::f64::consts::PI;
+        for (kind, sizes) in KERNELS {
+            for &size in sizes {
+                let table = basis(kind, size).expect("kernel is defined at this size");
+                let points = size as f64;
+                for k in 0..size {
+                    for n in 0..size {
+                        let (k64, n64) = (k as f64, n as f64);
+                        let exact = match (kind, size) {
+                            (Tx1d::Dct, _) => {
+                                let scale = if k == 0 { 1.0 / 2f64.sqrt() } else { 1.0 };
+                                scale * (PI * (2.0 * n64 + 1.0) * k64 / (2.0 * points)).cos()
+                            }
+                            (Tx1d::Adst, 4) => {
+                                (2.0 * 2f64.sqrt() / 3.0)
+                                    * (PI * (2.0 * k64 + 1.0) * (n64 + 1.0) / 9.0).sin()
+                            }
+                            (Tx1d::Adst, _) => (PI * (2.0 * k64 + 1.0) * (2.0 * n64 + 1.0)
+                                / (4.0 * points))
+                                .sin(),
+                        };
+                        let expected = (exact * 16384.0).round() as i32;
+                        assert!(
+                            (table[k * size + n] - expected).abs() <= 1,
+                            "{kind:?}{size} basis({k}, {n}) is {} but the transform wants {expected}",
+                            table[k * size + n]
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The documented row-sum bound behind [`input_limit`] must actually hold.
+    #[test]
+    fn pass_gain_bounds_every_basis_row() {
+        for (kind, sizes) in KERNELS {
+            for &size in sizes {
+                let table = basis(kind, size).expect("kernel is defined at this size");
+                for k in 0..size {
+                    let sum: i64 = table[k * size..(k + 1) * size]
+                        .iter()
+                        .map(|&b| i64::from(b.abs()))
+                        .sum();
+                    assert!(
+                        sum <= i64::from(pass_gain(size)) << 14,
+                        "{kind:?}{size} row {k} grows by more than pass_gain({size})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Every transform type, paired with the sizes it is defined at.
+    const TX_TYPES: [(Av1TxType, &[usize]); 10] = [
+        (Av1TxType::Idtx, &[4, 8, 16, 32]),
+        (Av1TxType::DctDct, &[4, 8, 16, 32]),
+        (Av1TxType::AdstDct, &[4, 8, 16]),
+        (Av1TxType::DctAdst, &[4, 8, 16]),
+        (Av1TxType::AdstAdst, &[4, 8, 16]),
+        (Av1TxType::FlipadstDct, &[4, 8, 16]),
+        (Av1TxType::DctFlipadst, &[4, 8, 16]),
+        (Av1TxType::FlipadstFlipadst, &[4, 8, 16]),
+        (Av1TxType::AdstFlipadst, &[4, 8, 16]),
+        (Av1TxType::FlipadstAdst, &[4, 8, 16]),
+    ];
+
+    /// The reason these kernels exist: with unit quantizers the forward and
+    /// inverse transforms must cancel, leaving only the two paths' rounding.
+    #[test]
+    fn round_trip_reproduces_the_residual() {
+        let mut rng = Lcg(0x5eed_0140_0000_0001);
+        for (tx_type, sizes) in TX_TYPES {
+            for &size in sizes {
+                let mut worst = 0i32;
+                for _ in 0..40 {
+                    let residual: Vec<i32> =
+                        (0..size * size).map(|_| rng.in_range(255)).collect();
+                    let coefficients = forward_transform(&residual, size, tx_type);
+                    let reconstructed = inverse_transform(&coefficients, size, tx_type, 1, 1);
+                    for (&want, &got) in residual.iter().zip(reconstructed.iter()) {
+                        worst = worst.max((want - i32::from(got)).abs());
+                    }
+                }
+                assert!(
+                    worst <= ROUND_TRIP_TOLERANCE,
+                    "{tx_type:?} {size}x{size} round trip is off by {worst}"
+                );
+            }
+        }
+    }
+
+    /// Worst per-sample round-trip error observed across every type, size, and
+    /// the sign patterns below. Both directions round once per 1-D pass, so a
+    /// few least-significant bits is the floor for a fixed-point transform
+    /// pair; anything larger means a scale or rounding mismatch.
+    const ROUND_TRIP_TOLERANCE: i32 = 4;
+
+    /// Flat and extreme-signed blocks, which maximize the DC term and the
+    /// highest-frequency terms respectively, are where a scale error shows up.
+    #[test]
+    fn round_trip_handles_flat_and_extreme_blocks() {
+        for (tx_type, sizes) in TX_TYPES {
+            for &size in sizes {
+                for pattern in 0..4 {
+                    let residual: Vec<i32> = (0..size * size)
+                        .map(|index| match pattern {
+                            0 => 255,
+                            1 => -255,
+                            2 => {
+                                if index % 2 == 0 {
+                                    255
+                                } else {
+                                    -255
+                                }
+                            }
+                            _ => {
+                                if (index / size) % 2 == 0 {
+                                    255
+                                } else {
+                                    -255
+                                }
+                            }
+                        })
+                        .collect();
+                    let coefficients = forward_transform(&residual, size, tx_type);
+                    let reconstructed = inverse_transform(&coefficients, size, tx_type, 1, 1);
+                    for (&want, &got) in residual.iter().zip(reconstructed.iter()) {
+                        assert!(
+                            (want - i32::from(got)).abs() <= ROUND_TRIP_TOLERANCE,
+                            "{tx_type:?} {size}x{size} pattern {pattern}: {want} became {got}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// `IDTX` has no butterfly pass and no scaling in either direction, so its
+    /// round trip is exact rather than merely close.
+    #[test]
+    fn identity_transform_round_trips_exactly() {
+        let mut rng = Lcg(0x5eed_0140_0000_0002);
+        for size in [4usize, 8, 16, 32] {
+            let residual: Vec<i32> = (0..size * size).map(|_| rng.in_range(255)).collect();
+            let coefficients = forward_transform(&residual, size, Av1TxType::Idtx);
+            assert_eq!(coefficients, residual);
+            let reconstructed = inverse_transform(&coefficients, size, Av1TxType::Idtx, 1, 1);
+            let reconstructed: Vec<i32> = reconstructed.into_iter().map(i32::from).collect();
+            assert_eq!(reconstructed, residual);
+        }
+    }
+
+    /// A flipped-ADST type must consume the residual reversed along the axis
+    /// its inverse reverses the reconstruction along; otherwise the round trip
+    /// would only appear to work because both directions flipped.
+    #[test]
+    fn flipped_types_reverse_the_forward_input() {
+        let mut rng = Lcg(0x5eed_0140_0000_0003);
+        for size in [4usize, 8, 16] {
+            let residual: Vec<i32> = (0..size * size).map(|_| rng.in_range(255)).collect();
+            let plain = forward_transform(&residual, size, Av1TxType::AdstAdst);
+            for (tx_type, lr_flip, ud_flip) in [
+                (Av1TxType::FlipadstFlipadst, true, true),
+                (Av1TxType::AdstFlipadst, true, false),
+                (Av1TxType::FlipadstAdst, false, true),
+            ] {
+                let flipped: Vec<i32> = (0..size * size)
+                    .map(|index| {
+                        let (row, column) = (index / size, index % size);
+                        let row = if ud_flip { size - 1 - row } else { row };
+                        let column = if lr_flip { size - 1 - column } else { column };
+                        residual[row * size + column]
+                    })
+                    .collect();
+                assert_eq!(
+                    forward_transform(&flipped, size, tx_type),
+                    plain,
+                    "{tx_type:?} {size}x{size} should transform the reversed residual"
+                );
+            }
+        }
+    }
+
+    /// An 8-bit residual can never reach the vector guard, which is the point
+    /// of widening the accumulator; the bound is still documented per size.
+    #[test]
+    fn input_limit_leaves_room_for_any_real_residual() {
+        for size in [4usize, 8, 16, 32] {
+            assert!(input_limit(size) > 1 << 21, "{size} bound is too tight");
+            assert!(
+                i64::from(input_limit(size)) * i64::from(pass_gain(size)) <= i64::from(i32::MAX),
+                "{size} bound does not fit a lane"
+            );
+        }
+    }
 }

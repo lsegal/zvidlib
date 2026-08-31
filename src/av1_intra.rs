@@ -1275,7 +1275,7 @@ fn inverse_adst16_1d(input: [i64; 16]) -> [i64; 16] {
 
 /// One separable 1-D pass. Falls back to the identity for a size the AV1
 /// transform set does not define, which [`inverse_transform`] rejects first.
-fn inverse_transform_1d(kind: Tx1d, values: &[i64]) -> Vec<i64> {
+pub(crate) fn inverse_transform_1d(kind: Tx1d, values: &[i64]) -> Vec<i64> {
     match (kind, values.len()) {
         (Tx1d::Dct, 4) => inverse_dct4_1d(values.try_into().unwrap()).to_vec(),
         (Tx1d::Dct, 8) => inverse_dct8_1d(values.try_into().unwrap()).to_vec(),
