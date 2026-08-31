@@ -29,6 +29,15 @@ name = "codec"
 path = "benches/codec.rs"
 harness = false
 
+# The AV1 software decoder's own scalar-vs-SIMD suite. It is a separate target
+# because its per-stage groups and its whole-frame decode are slower than the
+# shared fast groups above and deserve to be runnable on their own; it shares
+# `benches/support/` with them.
+[[bench]]
+name = "av1_decode"
+path = "benches/av1_decode.rs"
+harness = false
+
 # The audio decode path is a separate target rather than another group in
 # `codec`: it shares `benches/support/` but none of `codec`'s decoded-frame
 # fixtures, and issue #152 specifies `cargo bench --bench audio_decode` as its
