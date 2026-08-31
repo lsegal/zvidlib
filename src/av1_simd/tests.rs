@@ -277,11 +277,6 @@ fn out_of_range_transform_blocks_fall_back_to_scalar() {
 fn every_transform_size_reaches_a_vector_kernel() {
     let mut rng = Lcg(0x5eed_0120_0000_0005);
     for (tx_type, sizes) in TX_TYPES {
-        if tx_type == Av1TxType::Idtx {
-            // The identity transform has no butterfly pass and never
-            // dispatches.
-            continue;
-        }
         let (column, row, lr_flip, ud_flip) = tx_type.kernels();
         for &size in sizes {
             let coefficients: Vec<i32> = (0..size * size).map(|_| rng.in_range(600)).collect();
