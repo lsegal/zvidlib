@@ -19,10 +19,13 @@
 //! measurement to regress against.
 //!
 //! ```sh
-//! cargo run --release --example hevc_decode_profile
-//! cargo run --release --example hevc_decode_profile -- 120     # frame count
-//! cargo run --release --example hevc_decode_profile -- 60 scalar
+//! cargo run --release --features native --example hevc_decode_profile
+//! cargo run --release --features native --example hevc_decode_profile -- 120
+//! cargo run --release --features native --example hevc_decode_profile -- 60 scalar
 //! ```
+//!
+//! The `native` feature gates no code here; it is what keeps the wasm build,
+//! which has no HEVC decoder at all, from trying to compile this target.
 //!
 //! The second argument pins an instruction set through `zvidlib::simd`, so the
 //! same breakdown can be read with and without the vector kernels. Run under

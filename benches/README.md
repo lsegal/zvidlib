@@ -260,10 +260,14 @@ nested inside the §7.3.8 slice-data walk is subtracted from it rather than
 counted twice — and prints each stage's share:
 
 ```sh
-cargo run --release --example hevc_decode_profile
-cargo run --release --example hevc_decode_profile -- 120        # frame count
-cargo run --release --example hevc_decode_profile -- 48 scalar  # pin an ISA
+cargo run --release --features native --example hevc_decode_profile
+cargo run --release --features native --example hevc_decode_profile -- 120
+cargo run --release --features native --example hevc_decode_profile -- 48 scalar
 ```
+
+The second positional argument is a frame count and the third pins an
+instruction set. `native` gates no code in the example; it is what keeps the
+wasm build, which has no HEVC decoder, from compiling a native-only target.
 
 It is an example rather than a criterion group because the question is how one
 decode divides, which is a composition rather than a number to regress against.
