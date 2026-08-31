@@ -213,6 +213,8 @@ Circular dependencies are forbidden. In particular, timeline and media values ca
 
 Performance benchmarks measure sequential decode, cold random seek, warm nearby seek, CPU conversion, GPU transfer, memory high-water marks, and WASM bundle size. Performance work cannot weaken exact-frame or synchronization assertions.
 
+The criterion benchmark suite lives in `benches/` and is documented in `benches/README.md`: a single `harness = false` bench target over shared, once-per-process fixtures, with the bundled 1080p sample gated behind a long-running group. Every criterion group name carries the arm it was measured under (`hevc_decode/simd=off` or `hevc_decode/simd=on`) from the additive, off-by-default `simd` cargo feature, so the two builds record separately and stay comparable.
+
 ## 13. Delivery sequence
 
 1. Core types, errors, capability discovery, byte I/O, and timeline tests.
