@@ -20,9 +20,9 @@
 //!   through the full spec §5.11.47 `get_tx_set` / §5.11.48 `read_tx_type`
 //!   derivation (`TX_SET_INTRA_1` or `TX_SET_INTRA_2` as `reduced_tx_set`
 //!   and the transform size select; `TX_32X32` and above are
-//!   `TX_SET_DCTONLY` and signal no `tx_type` at all). The half-identity
-//!   `V_DCT`/`H_DCT` types `TX_SET_INTRA_1` also contains have no kernel
-//!   here and are rejected as unsupported. Coefficients are
+//!   `TX_SET_DCTONLY` and signal no `tx_type` at all), including the
+//!   half-identity `V_DCT`/`H_DCT` types `TX_SET_INTRA_1` also contains.
+//!   Coefficients are
 //!   dequantized per spec §7.12 (`get_dc_quant`/`get_ac_quant`) and inverse
 //!   transformed ([`crate::av1_intra::inverse_transform`]). `loop_filter_params`
 //!   is parsed and the chosen per-block transform sizes are recorded into a
