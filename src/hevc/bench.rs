@@ -23,6 +23,16 @@ use crate::hevc::engine::encoder::bitwriter::BitWriter;
 use crate::hevc::engine::encoder::cabac::CabacEncoder;
 use crate::hevc::engine::encoder::pcm::encode_idr_pcm_au;
 use crate::hevc::engine::encoder::rdo::{DecisionConfig, decide_picture};
+use crate::hevc::engine::encoder::transform::{self as fwd_transform, ForwardBlockParams};
+use crate::hevc::engine::transform::{Component, PredMode};
+
+/// Bit depth the encoder benchmarks run at — the only depth the PCM
+/// writer and the synthetic 8-bit inputs use.
+const BENCH_BIT_DEPTH: u8 = 8;
+
+/// The fixed predictor [`fwd_transform_quant_picture`] subtracts, the
+/// mid-point of the 8-bit range.
+const BENCH_PREDICTOR: i32 = 128;
 
 /// Runs the encoder's mode-search / RDO stage over one luma picture.
 ///
@@ -176,6 +186,69 @@ pub fn bitwriter_write_syntax(values: &[u32]) -> Vec<u8> {
 pub fn rgba_to_yuv420_planes(frame: &crate::VideoFrame) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     super::encoder::rgba_to_yuv420(frame, crate::Orientation::TopLeft)
         .expect("benchmark frames are RGBA8")
+}
+
+/// Runs the encoder's forward transform and quantization stage over one
+/// luma picture, once per transform-block size.
+///
+/// Every 4x4, 8x8, 16x16 and 32x32 block that fits in the picture is
+/// transformed and quantized, so one iteration covers all four §8.6.4.2
+/// matrices and the 4x4 DST-VII the intra path selects. The residual is
+/// the source sample minus a fixed mid-level predictor rather than a real
+/// prediction: this group measures the transform and quantization
+/// kernels, and a mode-dependent predictor would fold mode-search cost
+/// into that number.
+///
+/// The returned bytes are the quantized levels themselves, so the
+/// bit-exactness guard in `benches/support/isa.rs` covers every level the
+/// vector kernels produced.
+///
+/// # Panics
+///
+/// Panics if `y` is smaller than `height * stride`.
+#[must_use]
+pub fn fwd_transform_quant_picture(
+    y: &[u8],
+    stride: usize,
+    width: usize,
+    height: usize,
+    qp: i32,
+) -> Vec<u8> {
+    assert!(
+        y.len() >= (height - 1) * stride + width,
+        "the luma plane is smaller than the requested picture"
+    );
+    let q_p = fwd_transform::luma_qp(qp, BENCH_BIT_DEPTH);
+    let mut out = Vec::new();
+    let mut residual = vec![0i32; 32 * 32];
+    for log2 in 2u32..=5 {
+        let n_tbs = 1usize << log2;
+        let params = ForwardBlockParams {
+            n_tbs,
+            q_p,
+            component: Component::Luma,
+            pred_mode: PredMode::Intra,
+            bit_depth: BENCH_BIT_DEPTH,
+            extended_precision: false,
+        };
+        let block = &mut residual[..n_tbs * n_tbs];
+        for by in (0..=height.saturating_sub(n_tbs)).step_by(n_tbs) {
+            for bx in (0..=width.saturating_sub(n_tbs)).step_by(n_tbs) {
+                for row in 0..n_tbs {
+                    let src = &y[(by + row) * stride + bx..][..n_tbs];
+                    for (dst, &sample) in block[row * n_tbs..][..n_tbs].iter_mut().zip(src) {
+                        *dst = i32::from(sample) - BENCH_PREDICTOR;
+                    }
+                }
+                let levels = fwd_transform::transform_and_quantize(block, None, params)
+                    .expect("benchmark blocks are legal transform blocks");
+                for level in levels {
+                    out.extend_from_slice(&(level as i16).to_le_bytes());
+                }
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]

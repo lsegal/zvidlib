@@ -171,7 +171,12 @@ pub fn quant_block(
 }
 
 /// Portable reference for [`quant_block`].
-fn quant_block_scalar(out: &mut [i32], coeffs: &[i32], factors: Option<&[i32]>, params: QuantParams) {
+fn quant_block_scalar(
+    out: &mut [i32],
+    coeffs: &[i32],
+    factors: Option<&[i32]>,
+    params: QuantParams,
+) {
     for (i, (o, &c)) in out.iter_mut().zip(coeffs.iter()).enumerate() {
         let factor = i64::from(factors.map_or(params.quant_scale, |f| f[i]));
         let magnitude = (i64::from(c).abs() * factor + params.round_add) >> params.qbits;
@@ -266,7 +271,10 @@ mod x86 {
                 };
                 let step = |m: __m128i, f: __m128i| {
                     _mm_srl_epi64(
-                        _mm_add_epi64(_mm_mul_epi32(_mm_cvtepi32_epi64(m), _mm_cvtepi32_epi64(f)), add),
+                        _mm_add_epi64(
+                            _mm_mul_epi32(_mm_cvtepi32_epi64(m), _mm_cvtepi32_epi64(f)),
+                            add,
+                        ),
                         shr,
                     )
                 };

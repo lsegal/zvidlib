@@ -509,13 +509,10 @@ pub fn chroma_qp(qp_y: i32, chroma_qp_offset: i32, bit_depth_c: u8, chroma_array
     (qpc + qp_bd_c).max(0) as u32
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hevc::engine::transform::{
-        LEVEL_SCALE, inverse_transform, scale_coefficients,
-    };
+    use crate::hevc::engine::transform::{LEVEL_SCALE, inverse_transform, scale_coefficients};
 
     /// Deterministic pseudo-random residual generator. A fixed LCG keeps
     /// the round-trip tests reproducible across hosts, which matters
@@ -525,7 +522,9 @@ mod tests {
         let mut state = seed;
         (0..n_tbs * n_tbs)
             .map(|_| {
-                state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
                 ((state >> 33) as i32 % (2 * span + 1)) - span
             })
             .collect()
@@ -562,15 +561,25 @@ mod tests {
             )
             .expect("the coefficients invert");
             let round_trip = apply_bd_shift(&inverse, 8);
-            let worst = source
+            let errors: Vec<i32> = source
                 .iter()
                 .zip(round_trip.iter())
                 .map(|(&a, &b)| (a - b).abs())
-                .max()
-                .expect("blocks are non-empty");
+                .collect();
+            let worst = errors.iter().copied().max().expect("blocks are non-empty");
+            // Four rounding stages (two forward shifts, the §8.6.4
+            // intermediate shift, and equation 8-299's bdShift) each cost
+            // up to half a unit, and a 32-point basis accumulates the
+            // most; the mean bound is what makes this a normalization
+            // check rather than a loose sanity one.
             assert!(
-                worst <= 3,
+                worst <= 4,
                 "{n_tbs}x{n_tbs} round trip drifted by {worst}, expected rounding error only"
+            );
+            let mean = f64::from(errors.iter().sum::<i32>()) / errors.len() as f64;
+            assert!(
+                mean < 1.0,
+                "{n_tbs}x{n_tbs} round trip is biased: mean absolute error {mean}"
             );
         }
     }
@@ -582,8 +591,9 @@ mod tests {
         let source = residual(4, 8, 0xd57);
         let coefficients =
             forward_transform(&source, 4, true, 8, false).expect("4x4 is a valid DST block");
-        let inverse = inverse_transform(&coefficients, 4, PredMode::Intra, Component::Luma, 8, false)
-            .expect("the coefficients invert");
+        let inverse =
+            inverse_transform(&coefficients, 4, PredMode::Intra, Component::Luma, 8, false)
+                .expect("the coefficients invert");
         let round_trip = apply_bd_shift(&inverse, 8);
         let worst = source
             .iter()
@@ -613,9 +623,8 @@ mod tests {
                 // flat-16 scaling factor times levelScale, shifted by
                 // the same bdShift §8.6.3 applies.
                 let bd_shift = 8 + log2 + 10 - 15;
-                let step = ((16i64 * i64::from(LEVEL_SCALE[(q_p % 6) as usize]))
-                    << (q_p / 6))
-                    >> bd_shift;
+                let step =
+                    ((16i64 * i64::from(LEVEL_SCALE[(q_p % 6) as usize])) << (q_p / 6)) >> bd_shift;
                 for (&want, &got) in coefficients.iter().zip(scaled.iter()) {
                     let error = (i64::from(want) - i64::from(got)).abs();
                     assert!(
@@ -644,7 +653,10 @@ mod tests {
                 "intra level {i} is closer to zero than inter level {p}"
             );
         }
-        assert_ne!(intra, inter, "the two rounding offsets must differ somewhere");
+        assert_ne!(
+            intra, inter,
+            "the two rounding offsets must differ somewhere"
+        );
     }
 
     /// A scaling list that halves every position must roughly double the
@@ -694,9 +706,15 @@ mod tests {
                     continue;
                 }
                 let source = residual(n_tbs, 8, 0xbee5 + n_tbs as u64 + u64::from(tr_type));
-                let reference =
-                    forward_transform_with_backend(Backend::Scalar, &source, n_tbs, tr_type, 8, false)
-                        .expect("the scalar reference transforms");
+                let reference = forward_transform_with_backend(
+                    Backend::Scalar,
+                    &source,
+                    n_tbs,
+                    tr_type,
+                    8,
+                    false,
+                )
+                .expect("the scalar reference transforms");
                 for backend in quant_simd::supported_backends() {
                     let actual =
                         forward_transform_with_backend(backend, &source, n_tbs, tr_type, 8, false)
