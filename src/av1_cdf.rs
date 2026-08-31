@@ -14,6 +14,8 @@
 //! mode/skip/reference state, matching this module's existing "smallest context that keeps bitstream
 //! conformance" precedent (e.g. `TX_4X4`-only coefficient contexts above).
 
+use crate::av1_intra::Av1TxType;
+
 // --- Partition CDFs (Default_Partition_W*_Cdf), indexed [ctx]. ---
 /// `Default_Partition_W8_Cdf` (4 partitions: NONE/HORZ/VERT/SPLIT).
 pub static PARTITION_W8: [[u16; 4]; 4] = [
@@ -336,28 +338,244 @@ pub static MAG_REF_OFFSET_2D: [(usize, usize); 3] = [(0, 1), (1, 0), (1, 1)];
 // being a bounded, non-conformance-tested subset rather than a full AV1
 // decoder).
 
-/// `ext_tx` symbol CDF for the reduced intra set (`TX_SET_INTRA_2` =
-/// `{IDTX, DCT_DCT, ADST_ADST}`), indexed by `txSzSqr` (`0` = `TX_4X4`,
-/// `1` = `TX_8X8`, `2` = `TX_16X16`); see [`ext_tx_cdf`]. Decoding
-/// `ADST_ADST` (symbol index 2) is rejected as unsupported by the caller.
-/// `TX_32X32` and above select `TX_SET_DCTONLY` and read no symbol at all
-/// (spec §5.11.47 `get_tx_set`), so they have no row here.
-pub static EXT_TX_INTRA_REDUCED: [[u16; 3]; 3] = [
-    [10000, 26000, 32768],
-    [10000, 26000, 32768],
-    [10000, 26000, 32768],
+/// A transform-type set (AV1 spec §5.11.47 `get_tx_set`). Only the square
+/// transform sizes this crate codes are reachable, so `txSzSqr` and
+/// `txSzSqrUp` are both the block's side length.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Av1TxSet {
+    /// `TX_SET_DCTONLY`: `DCT_DCT` with no `tx_type` symbol coded at all.
+    DctOnly,
+    /// `TX_SET_INTRA_1`, seven types.
+    Intra1,
+    /// `TX_SET_INTRA_2`, five types.
+    Intra2,
+    /// `TX_SET_INTER_1`, sixteen types.
+    Inter1,
+    /// `TX_SET_INTER_2`, twelve types.
+    Inter2,
+    /// `TX_SET_INTER_3`, `{IDTX, DCT_DCT}`.
+    Inter3,
+}
+
+/// Spec §5.11.47 `get_tx_set`: the transform-type set a `tx_size x tx_size`
+/// transform block in an intra or inter block signals under the frame
+/// header's `reduced_tx_set`.
+#[must_use]
+pub fn get_tx_set(tx_size: usize, is_inter: bool, reduced_tx_set: bool) -> Av1TxSet {
+    // txSzSqrUp > TX_32X32 (i.e. TX_64X64 here) is always DCT-only.
+    if tx_size > 32 {
+        return Av1TxSet::DctOnly;
+    }
+    if is_inter {
+        if reduced_tx_set || tx_size == 32 {
+            Av1TxSet::Inter3
+        } else if tx_size == 16 {
+            Av1TxSet::Inter2
+        } else {
+            Av1TxSet::Inter1
+        }
+    } else if tx_size == 32 {
+        Av1TxSet::DctOnly
+    } else if reduced_tx_set || tx_size == 16 {
+        Av1TxSet::Intra2
+    } else {
+        Av1TxSet::Intra1
+    }
+}
+
+/// One entry of a transform set's inverse table (spec §5.11.48
+/// `Tx_Type_Intra_Inv_Set*` / `Tx_Type_Inter_Inv_Set*`): the specification's
+/// name for the transform type, and the kernel this crate implements for it.
+///
+/// The half-identity `V_*`/`H_*` types (identity along one axis, DCT/ADST
+/// along the other) have no [`Av1TxType`] and no kernel in this crate, so
+/// they carry `None` and are rejected as unsupported when a bitstream
+/// signals them.
+pub type TxTypeSlot = (&'static str, Option<Av1TxType>);
+
+const IDTX: TxTypeSlot = ("IDTX", Some(Av1TxType::Idtx));
+const DCT_DCT: TxTypeSlot = ("DCT_DCT", Some(Av1TxType::DctDct));
+const ADST_DCT: TxTypeSlot = ("ADST_DCT", Some(Av1TxType::AdstDct));
+const DCT_ADST: TxTypeSlot = ("DCT_ADST", Some(Av1TxType::DctAdst));
+const ADST_ADST: TxTypeSlot = ("ADST_ADST", Some(Av1TxType::AdstAdst));
+const FLIPADST_DCT: TxTypeSlot = ("FLIPADST_DCT", Some(Av1TxType::FlipadstDct));
+const DCT_FLIPADST: TxTypeSlot = ("DCT_FLIPADST", Some(Av1TxType::DctFlipadst));
+const FLIPADST_FLIPADST: TxTypeSlot =
+    ("FLIPADST_FLIPADST", Some(Av1TxType::FlipadstFlipadst));
+const ADST_FLIPADST: TxTypeSlot = ("ADST_FLIPADST", Some(Av1TxType::AdstFlipadst));
+const FLIPADST_ADST: TxTypeSlot = ("FLIPADST_ADST", Some(Av1TxType::FlipadstAdst));
+const V_DCT: TxTypeSlot = ("V_DCT", None);
+const H_DCT: TxTypeSlot = ("H_DCT", None);
+const V_ADST: TxTypeSlot = ("V_ADST", None);
+const H_ADST: TxTypeSlot = ("H_ADST", None);
+const V_FLIPADST: TxTypeSlot = ("V_FLIPADST", None);
+const H_FLIPADST: TxTypeSlot = ("H_FLIPADST", None);
+
+static TX_TYPE_DCT_ONLY: [TxTypeSlot; 1] = [DCT_DCT];
+
+/// `Tx_Type_Intra_Inv_Set1` (spec §5.11.48).
+static TX_TYPE_INTRA_INV_SET1: [TxTypeSlot; 7] =
+    [IDTX, DCT_DCT, V_DCT, H_DCT, ADST_ADST, ADST_DCT, DCT_ADST];
+
+/// `Tx_Type_Intra_Inv_Set2` (spec §5.11.48).
+static TX_TYPE_INTRA_INV_SET2: [TxTypeSlot; 5] =
+    [IDTX, DCT_DCT, ADST_ADST, ADST_DCT, DCT_ADST];
+
+/// `Tx_Type_Inter_Inv_Set1` (spec §5.11.48).
+static TX_TYPE_INTER_INV_SET1: [TxTypeSlot; 16] = [
+    IDTX,
+    V_DCT,
+    H_DCT,
+    V_ADST,
+    H_ADST,
+    V_FLIPADST,
+    H_FLIPADST,
+    DCT_DCT,
+    ADST_DCT,
+    DCT_ADST,
+    FLIPADST_DCT,
+    DCT_FLIPADST,
+    ADST_ADST,
+    FLIPADST_FLIPADST,
+    ADST_FLIPADST,
+    FLIPADST_ADST,
 ];
 
-/// The `ext_tx` CDF for a `size x size` transform block, or `None` when the
-/// transform set is `TX_SET_DCTONLY` and `read_tx_type` reads no symbol
-/// (spec §5.11.47 `get_tx_set`: intra blocks with `txSzSqrUp >= TX_32X32`).
+/// `Tx_Type_Inter_Inv_Set2` (spec §5.11.48).
+static TX_TYPE_INTER_INV_SET2: [TxTypeSlot; 12] = [
+    IDTX,
+    V_DCT,
+    H_DCT,
+    DCT_DCT,
+    ADST_DCT,
+    DCT_ADST,
+    FLIPADST_DCT,
+    DCT_FLIPADST,
+    ADST_ADST,
+    FLIPADST_FLIPADST,
+    ADST_FLIPADST,
+    FLIPADST_ADST,
+];
+
+/// `Tx_Type_Inter_Inv_Set3` (spec §5.11.48).
+static TX_TYPE_INTER_INV_SET3: [TxTypeSlot; 2] = [IDTX, DCT_DCT];
+
+/// The inverse table that maps a decoded `tx_type` symbol index to its
+/// transform type, for `set`. Its length always matches the length of the
+/// CDF [`tx_type_cdf`] returns for the same set.
 #[must_use]
-pub fn ext_tx_cdf(size: usize) -> Option<&'static [u16; 3]> {
-    match size {
-        4 => Some(&EXT_TX_INTRA_REDUCED[0]),
-        8 => Some(&EXT_TX_INTRA_REDUCED[1]),
-        16 => Some(&EXT_TX_INTRA_REDUCED[2]),
-        _ => None,
+pub fn tx_type_inverse_set(set: Av1TxSet) -> &'static [TxTypeSlot] {
+    match set {
+        Av1TxSet::DctOnly => &TX_TYPE_DCT_ONLY,
+        Av1TxSet::Intra1 => &TX_TYPE_INTRA_INV_SET1,
+        Av1TxSet::Intra2 => &TX_TYPE_INTRA_INV_SET2,
+        Av1TxSet::Inter1 => &TX_TYPE_INTER_INV_SET1,
+        Av1TxSet::Inter2 => &TX_TYPE_INTER_INV_SET2,
+        Av1TxSet::Inter3 => &TX_TYPE_INTER_INV_SET3,
+    }
+}
+
+/// The number of `YMode` values `Default_Intra_Ext_Tx_Cdf` is indexed by
+/// (spec `INTRA_MODES`).
+pub const INTRA_MODES: usize = 13;
+
+/// A valid, strictly increasing `N`-symbol CDF that varies with `seed`.
+///
+/// The `tx_type` CDFs below are placeholders in the sense the section
+/// header describes, but the specification selects a *different* row per
+/// transform size and (for intra blocks) per intra direction, so the rows
+/// here must genuinely differ or that indexing would be unobservable and
+/// untestable. Each row is a uniform split perturbed by less than half a
+/// step, which keeps it strictly increasing and ending at 32768.
+const fn placeholder_cdf<const N: usize>(seed: usize) -> [u16; N] {
+    let mut cdf = [0u16; N];
+    let step = 32768 / N;
+    let mut index = 0;
+    while index + 1 < N {
+        cdf[index] = ((index + 1) * step + ((seed + index) % 7) * (step / 16)) as u16;
+        index += 1;
+    }
+    cdf[N - 1] = 32768;
+    cdf
+}
+
+/// Builds a `[rows][INTRA_MODES][N]` intra `tx_type` CDF table.
+const fn intra_tx_type_table<const ROWS: usize, const N: usize>()
+-> [[[u16; N]; INTRA_MODES]; ROWS] {
+    let mut table = [[[0u16; N]; INTRA_MODES]; ROWS];
+    let mut size = 0;
+    while size < ROWS {
+        let mut direction = 0;
+        while direction < INTRA_MODES {
+            table[size][direction] = placeholder_cdf::<N>(size * INTRA_MODES + direction);
+            direction += 1;
+        }
+        size += 1;
+    }
+    table
+}
+
+/// Builds a `[rows][N]` inter `tx_type` CDF table.
+const fn inter_tx_type_table<const ROWS: usize, const N: usize>() -> [[u16; N]; ROWS] {
+    let mut table = [[0u16; N]; ROWS];
+    let mut size = 0;
+    while size < ROWS {
+        table[size] = placeholder_cdf::<N>(size);
+        size += 1;
+    }
+    table
+}
+
+/// `Default_Intra_Ext_Tx_Cdf[TX_SET_INTRA_1]`, indexed by `txSzSqr`
+/// (`0` = `TX_4X4`, `1` = `TX_8X8`) then by the block's intra direction.
+/// `TX_16X16` selects `TX_SET_INTRA_2` and `TX_32X32` selects
+/// `TX_SET_DCTONLY`, so neither has a row here.
+pub static INTRA_TX_TYPE_SET1: [[[u16; 7]; INTRA_MODES]; 2] = intra_tx_type_table();
+
+/// `Default_Intra_Ext_Tx_Cdf[TX_SET_INTRA_2]`, indexed by `txSzSqr`
+/// (`0` = `TX_4X4` .. `2` = `TX_16X16`) then by intra direction.
+pub static INTRA_TX_TYPE_SET2: [[[u16; 5]; INTRA_MODES]; 3] = intra_tx_type_table();
+
+/// `Default_Inter_Ext_Tx_Cdf[TX_SET_INTER_1]`, indexed by `txSzSqr`
+/// (`0` = `TX_4X4`, `1` = `TX_8X8`).
+pub static INTER_TX_TYPE_SET1: [[u16; 16]; 2] = inter_tx_type_table();
+
+/// `Default_Inter_Ext_Tx_Cdf[TX_SET_INTER_2]`; only `TX_16X16` selects this
+/// set, so it has the single row.
+pub static INTER_TX_TYPE_SET2: [[u16; 12]; 1] = inter_tx_type_table();
+
+/// `Default_Inter_Ext_Tx_Cdf[TX_SET_INTER_3]`, indexed by `txSzSqr`
+/// (`0` = `TX_4X4` .. `3` = `TX_32X32`).
+pub static INTER_TX_TYPE_SET3: [[u16; 2]; 4] = inter_tx_type_table();
+
+/// `txSzSqr` as a table row index: `TX_4X4` is 0 through `TX_32X32` at 3.
+fn tx_size_sqr_index(tx_size: usize) -> usize {
+    match tx_size {
+        4 => 0,
+        8 => 1,
+        16 => 2,
+        _ => 3,
+    }
+}
+
+/// The `tx_type` CDF for a `tx_size x tx_size` transform block in `set`,
+/// or `None` when the set is `TX_SET_DCTONLY` and `read_tx_type` codes no
+/// symbol at all (spec §5.11.48).
+///
+/// `intra_dir` is the block's `YMode` (spec `Default_Intra_Ext_Tx_Cdf` is
+/// indexed by intra direction as well as by transform size) and is ignored
+/// for the inter sets.
+#[must_use]
+pub fn tx_type_cdf(set: Av1TxSet, tx_size: usize, intra_dir: usize) -> Option<&'static [u16]> {
+    let size = tx_size_sqr_index(tx_size);
+    let direction = intra_dir.min(INTRA_MODES - 1);
+    match set {
+        Av1TxSet::DctOnly => None,
+        Av1TxSet::Intra1 => Some(&INTRA_TX_TYPE_SET1[size][direction]),
+        Av1TxSet::Intra2 => Some(&INTRA_TX_TYPE_SET2[size][direction]),
+        Av1TxSet::Inter1 => Some(&INTER_TX_TYPE_SET1[size]),
+        Av1TxSet::Inter2 => Some(&INTER_TX_TYPE_SET2[0]),
+        Av1TxSet::Inter3 => Some(&INTER_TX_TYPE_SET3[size]),
     }
 }
 

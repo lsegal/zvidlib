@@ -377,10 +377,10 @@ pub fn get_ac_quant(qindex: u8) -> i32 {
 /// restricted to the entries this crate implements: the identity transform
 /// plus every combination of the DCT, ADST, and flipped-ADST kernels).
 ///
-/// The decoder only ever signals [`Av1TxType::DctDct`] and
-/// [`Av1TxType::Idtx`] today; the remaining entries are reachable through
-/// [`inverse_transform`] and are covered by the transform tests and
-/// benchmark.
+/// The decoders signal these through the full `get_tx_set`/`read_tx_type`
+/// derivation (spec §5.11.47, §5.11.48). The half-identity `V_*`/`H_*`
+/// types the larger sets also contain have no kernel here and are rejected
+/// as unsupported by [`crate::av1_cdf::tx_type_inverse_set`]'s callers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Av1TxType {
     DctDct,
@@ -408,6 +408,31 @@ pub enum Tx1d {
     /// Inverse ADST. Defined for 4, 8, and 16 points; a 32- or 64-point block
     /// always uses the DCT.
     Adst,
+}
+
+/// The block's `YMode` as spec §5.11.48 indexes `Default_Intra_Ext_Tx_Cdf`
+/// by it (`DC_PRED` = 0 through `PAETH_PRED` = 12).
+///
+/// [`Av1IntraMode::Directional`] and [`Av1IntraMode::D63`] are not coded
+/// `YMode` values — they come from the public prediction API rather than
+/// from a bitstream — so they map to `DC_PRED`'s row.
+#[must_use]
+pub(crate) fn intra_dir_index(mode: Av1IntraMode) -> usize {
+    match mode {
+        Av1IntraMode::Dc | Av1IntraMode::D63 | Av1IntraMode::Directional { .. } => 0,
+        Av1IntraMode::Vertical => 1,
+        Av1IntraMode::Horizontal => 2,
+        Av1IntraMode::D45 => 3,
+        Av1IntraMode::D135 => 4,
+        Av1IntraMode::D113 => 5,
+        Av1IntraMode::D157 => 6,
+        Av1IntraMode::D203 => 7,
+        Av1IntraMode::D67 => 8,
+        Av1IntraMode::Smooth => 9,
+        Av1IntraMode::SmoothVertical => 10,
+        Av1IntraMode::SmoothHorizontal => 11,
+        Av1IntraMode::Paeth => 12,
+    }
 }
 
 impl Av1TxType {

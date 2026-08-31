@@ -48,7 +48,9 @@
 
 use crate::av1_cdf as cdf;
 use crate::av1_filters::{FilterFrame, FilterPlane, LoopFilterParams, TxSizeGrid, deblock_frame};
-use crate::av1_intra::{Av1IntraMode, Av1TxType, get_ac_quant, get_dc_quant, inverse_transform};
+use crate::av1_intra::{
+    Av1IntraMode, Av1TxType, get_ac_quant, get_dc_quant, intra_dir_index, inverse_transform,
+};
 use crate::av1_intra_pred::{
     SmoothMode, add_residual_row, directional_row, paeth_row, smooth_row, sum_samples,
 };
@@ -434,6 +436,9 @@ struct InterFrameHeader {
     /// is `TX_MODE_LARGEST`, and lossless frames force `TX_MODE_ONLY_4X4`
     /// with no bit read.
     tx_mode_select: bool,
+    /// `reduced_tx_set` (spec §5.9.2), the frame-level input to
+    /// [`cdf::get_tx_set`].
+    reduced_tx_set: bool,
     interpolation_filter: InterpFilter,
 }
 
@@ -624,7 +629,9 @@ fn parse_inter_frame_header(
     // allow_warped_motion: never present either — the sequence header is
     // required to have enable_warped_motion == 0 above, so the frame header
     // condition `!enable_warped_motion` is always true and no bit is read.
-    require_bit(bits, true, "reduced_tx_set")?;
+    // reduced_tx_set (spec §5.9.2): selects between the full `get_tx_set`
+    // derivation and its reduced form; both are decoded here.
+    let reduced_tx_set = bits.read(1, "reduced_tx_set")? != 0;
     // global_motion_params(): every reference's motion type must be
     // IDENTITY (the default) for the translational-only bound; a non-default
     // affine/translation model would need extra syntax we do not parse.
@@ -651,6 +658,7 @@ fn parse_inter_frame_header(
         base_q_idx,
         loop_filter,
         tx_mode_select,
+        reduced_tx_set,
         interpolation_filter,
     })
 }
@@ -779,6 +787,7 @@ struct InterTileDecoder<'a> {
     motion_grid: Vec<Option<BlockMotion>>,
     base_q_idx: u8,
     tx_mode_select: bool,
+    reduced_tx_set: bool,
     tx_sizes: TxSizeGrid,
 }
 
@@ -849,6 +858,7 @@ impl<'a> InterTileDecoder<'a> {
             motion_grid: vec![None; contexts],
             base_q_idx: header.base_q_idx,
             tx_mode_select: header.tx_mode_select,
+            reduced_tx_set: header.reduced_tx_set,
             tx_sizes: TxSizeGrid::new(width, height),
         })
     }
@@ -1306,7 +1316,7 @@ impl<'a> InterTileDecoder<'a> {
             return Ok(());
         }
         let (coefficients, tx_type) =
-            self.decode_coefficients_nonlossless(x >> 2, y >> 2, tx_width)?;
+            self.decode_coefficients_nonlossless(x >> 2, y >> 2, tx_width, is_inter, intra_mode)?;
         let dc_quant = get_dc_quant(self.base_q_idx);
         let ac_quant = get_ac_quant(self.base_q_idx);
         let residuals = inverse_transform(&coefficients, tx_width, tx_type, dc_quant, ac_quant);
@@ -1457,39 +1467,55 @@ impl<'a> InterTileDecoder<'a> {
         Ok(levels)
     }
 
-    /// Decodes one non-lossless transform block's `tx_type` (spec §5.11.47
-    /// `read_tx_type`, restricted to this decoder's reduced intra/inter set,
-    /// `{IDTX, DCT_DCT}`; `ADST_ADST` is rejected as unsupported) and
-    /// dequantized-domain coefficient levels, returning coefficients in
-    /// row-major order ready for [`inverse_transform`].
+    /// Spec §5.11.48 `read_tx_type`: decodes the `tx_type` symbol for the
+    /// set [`cdf::get_tx_set`] derives from the transform size, whether the
+    /// block is inter-predicted, and the frame's `reduced_tx_set`. Intra
+    /// blocks additionally select the CDF by their `YMode`.
+    ///
+    /// `TX_SET_DCTONLY` codes no symbol. The half-identity `V_*`/`H_*`
+    /// types the larger sets contain have no kernel in this crate and are
+    /// rejected as unsupported.
+    fn read_tx_type(
+        &mut self,
+        tx_width: usize,
+        is_inter: bool,
+        intra_mode: Av1IntraMode,
+    ) -> Result<Av1TxType> {
+        let set = cdf::get_tx_set(tx_width, is_inter, self.reduced_tx_set);
+        let Some(tx_cdf) = cdf::tx_type_cdf(set, tx_width, intra_dir_index(intra_mode)) else {
+            return Ok(Av1TxType::DctDct);
+        };
+        let index = self.symbols.symbol(tx_cdf)?;
+        let (name, tx_type) = cdf::tx_type_inverse_set(set)[index];
+        tx_type.ok_or_else(|| {
+            unsupported(format!(
+                "AV1 inter decoder does not implement the {name} transform type"
+            ))
+        })
+    }
+
+    /// Decodes one non-lossless transform block's `tx_type` (spec §5.11.48
+    /// [`read_tx_type`](Self::read_tx_type)) and dequantized-domain
+    /// coefficient levels, returning coefficients in row-major order ready
+    /// for [`inverse_transform`].
     fn decode_coefficients_nonlossless(
         &mut self,
         x4: usize,
         y4: usize,
         tx_width: usize,
+        is_inter: bool,
+        intra_mode: Av1IntraMode,
     ) -> Result<(Vec<i32>, Av1TxType)> {
         let scan = cdf::up_right_diagonal_scan(tx_width.min(MAX_CODED_TX_WIDTH));
         let (coefficients, skipped) = self.decode_coefficient_levels(x4, y4, tx_width, &scan)?;
-        // read_tx_type() (spec §5.11.47): tx_type is only signaled for a
-        // transform block that actually has nonzero coefficients (a fully
-        // skipped block is implicitly DCT_DCT, though its value is
-        // irrelevant since inverse_transform of an all-zero input is zero
-        // regardless of tx_type).
+        // tx_type is only signaled for a transform block that actually has
+        // nonzero coefficients (a fully skipped block is implicitly
+        // DCT_DCT, though its value is irrelevant since inverse_transform
+        // of an all-zero input is zero regardless of tx_type).
         let tx_type = if skipped {
             Av1TxType::DctDct
-        } else if let Some(ext_tx) = cdf::ext_tx_cdf(tx_width) {
-            match self.symbols.symbol(ext_tx)? {
-                0 => Av1TxType::Idtx,
-                1 => Av1TxType::DctDct,
-                _ => {
-                    return Err(unsupported(
-                        "AV1 inter decoder does not support the ADST_ADST transform type",
-                    ));
-                }
-            }
         } else {
-            // TX_SET_DCTONLY (spec §5.11.47 `get_tx_set`): no symbol.
-            Av1TxType::DctDct
+            self.read_tx_type(tx_width, is_inter, intra_mode)?
         };
         Ok((coefficients, tx_type))
     }
@@ -2807,7 +2833,12 @@ mod tests {
                 e.symbol(&cdf::COEFF_BR[0][0], 3); // +3, keep extending
                 e.symbol(&cdf::COEFF_BR[0][0], 2); // +2, stop (level = 14)
                 e.symbol(&cdf::DC_SIGN[0][0], usize::from(block == 0)); // block 0 negative, block 3 positive
-                e.symbol(&cdf::EXT_TX_INTRA_REDUCED[1], 1); // DCT_DCT (8x8)
+                // TX_SET_INTRA_2 (reduced_tx_set = 1, 8x8, DC_PRED):
+                // {IDTX, DCT_DCT, ADST_ADST, ADST_DCT, DCT_ADST}.
+                e.symbol(
+                    cdf::tx_type_cdf(cdf::Av1TxSet::Intra2, 8, 0).unwrap(),
+                    1,
+                ); // DCT_DCT
             } else {
                 e.symbol(&cdf::TXB_SKIP[context], 1); // skipped -> all zero
             }
