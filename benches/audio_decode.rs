@@ -81,12 +81,12 @@ fn aac_decode(criterion: &mut Criterion) {
     decode_arm(
         &mut group,
         "access_units_stereo_48k",
-        support::bundled_aac_stereo(),
+        support::bundled_aac_track(),
     );
     decode_arm(
         &mut group,
         "access_units_mono_48k",
-        support::aac_mono_fixture(),
+        support::aac_mono_track(),
     );
     group.finish();
 }
@@ -94,11 +94,7 @@ fn aac_decode(criterion: &mut Criterion) {
 /// One channel layout's raw-decode arm.
 fn decode_arm(group: &mut BenchmarkGroup<'_, WallTime>, id: &str, track: &BundledAacTrack) {
     let packets = track.prefix(DECODE_PACKETS);
-    let work = AudioWork::new(
-        decoded_samples(packets),
-        track.sample_rate(),
-        track.channels(),
-    );
+    let work = AudioWork::new(covered_samples(packets), track.sample_rate, track.channels);
     let cancellation = CancellationToken::new();
     let mut decoder = NativeAacDecoder::new(&track.config, Limits::default())
         .expect("the fixture is AAC-LC mono or stereo, which the native backend accepts");
@@ -123,7 +119,7 @@ fn decode_arm(group: &mut BenchmarkGroup<'_, WallTime>, id: &str, track: &Bundle
 /// Reader requests that stay inside already-decoded packets, and the forward
 /// walk that crosses into new ones.
 fn aac_reader_sequential(criterion: &mut Criterion) {
-    let track = support::bundled_aac_stereo();
+    let track = support::bundled_aac_track();
     let cancellation = CancellationToken::new();
     let mut group = criterion.benchmark_group("aac_reader_sequential");
     group.sample_size(20);
@@ -134,8 +130,8 @@ fn aac_reader_sequential(criterion: &mut Criterion) {
     let cached_id = "cached_repeat_stereo_48k";
     let cached_work = AudioWork::new(
         SEQUENTIAL_READS * READ_SAMPLES,
-        track.sample_rate(),
-        track.channels(),
+        track.sample_rate,
+        track.channels,
     );
     let cached_range = range_at(SEQUENTIAL_START, READ_SAMPLES);
     let mut cached_reader = reader_for(track, track.timing.clone());
@@ -167,8 +163,8 @@ fn aac_reader_sequential(criterion: &mut Criterion) {
         .collect::<Vec<_>>();
     let forward_work = AudioWork::new(
         SEQUENTIAL_READS * READ_SAMPLES,
-        track.sample_rate(),
-        track.channels(),
+        track.sample_rate,
+        track.channels,
     );
     let mut forward_reader = reader_for(track, track.timing.clone());
     let mut forward_run = || {
@@ -194,7 +190,7 @@ fn aac_reader_sequential(criterion: &mut Criterion) {
 
 /// Random-access reads, each of which forces a seek and a preroll re-decode.
 fn aac_reader_seek(criterion: &mut Criterion) {
-    let track = support::bundled_aac_stereo();
+    let track = support::bundled_aac_track();
     let cancellation = CancellationToken::new();
     let mut reader = reader_for(track, track.timing.clone());
 
@@ -217,11 +213,7 @@ fn aac_reader_seek(criterion: &mut Criterion) {
         .collect::<Vec<_>>();
 
     let id = "random_seek_preroll_stereo_48k";
-    let work = AudioWork::new(
-        SEEK_READS * READ_SAMPLES,
-        track.sample_rate(),
-        track.channels(),
-    );
+    let work = AudioWork::new(SEEK_READS * READ_SAMPLES, track.sample_rate, track.channels);
     let mut run = || {
         for range in &ranges {
             black_box(
@@ -249,7 +241,7 @@ fn aac_reader_edits(criterion: &mut Criterion) {
 
     // The mono fixture carries a real `elst` whose media time is the decoder
     // priming, so its first and last presentation samples are the trimmed ones.
-    let mono = support::aac_mono_fixture();
+    let mono = support::aac_mono_track();
     let mono_id = "priming_padding_trim_mono_48k";
     let mut mono_reader = reader_for(mono, mono.timing.clone());
     let mono_length = mono_reader.presentation_length();
@@ -259,8 +251,8 @@ fn aac_reader_edits(criterion: &mut Criterion) {
     ];
     let mono_work = AudioWork::new(
         mono_ranges.len() as u64 * READ_SAMPLES,
-        mono.sample_rate(),
-        mono.channels(),
+        mono.sample_rate,
+        mono.channels,
     );
     let mut mono_run = || {
         for range in &mono_ranges {
@@ -278,9 +270,9 @@ fn aac_reader_edits(criterion: &mut Criterion) {
     // The bundled stereo sample has no edit list at all, so the multi-edit case
     // is built over its packets: an empty (silent) edit, two media edits that
     // are not adjacent in media time, and a whole-track presentation offset.
-    let stereo = support::bundled_aac_stereo();
+    let stereo = support::bundled_aac_track();
     let stereo_id = "edit_boundary_crossings_stereo_48k";
-    let timing = synthetic_edits(stereo.decoded_length);
+    let timing = synthetic_edits(stereo.decoded_samples);
     let boundaries = timing
         .edits
         .iter()
@@ -293,8 +285,8 @@ fn aac_reader_edits(criterion: &mut Criterion) {
     let mut stereo_reader = reader_for(stereo, timing);
     let stereo_work = AudioWork::new(
         boundaries.len() as u64 * READ_SAMPLES,
-        stereo.sample_rate(),
-        stereo.channels(),
+        stereo.sample_rate,
+        stereo.channels,
     );
     let mut stereo_run = || {
         for range in &boundaries {
@@ -325,8 +317,8 @@ fn reader_for(
     AacSampleReader::new(
         decoder,
         track.packets.clone(),
-        track.sample_rate(),
-        track.channels(),
+        track.sample_rate,
+        track.channels,
         timing,
         PREROLL_PACKETS,
         Limits::default(),
@@ -407,7 +399,7 @@ fn range_at(start: u64, length: u64) -> SampleRange {
 }
 
 /// Decoded samples covered by a run of contiguous access units.
-fn decoded_samples(packets: &[EncodedAudioSample]) -> u64 {
+fn covered_samples(packets: &[EncodedAudioSample]) -> u64 {
     match (packets.first(), packets.last()) {
         (Some(first), Some(last)) => last.decoded_range.end - first.decoded_range.start,
         _ => 0,
