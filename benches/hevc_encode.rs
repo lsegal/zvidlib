@@ -276,11 +276,11 @@ fn entropy_coding(criterion: &mut Criterion) {
         .map(|i| (i as u32).wrapping_mul(2_654_435_761) >> 11)
         .collect();
 
-    // These two workloads are bin and syntax-element streams, not pictures, so
-    // the megapixel figure `report_megapixels_per_second` prints is meaningless
-    // for them (it reads 0.0) and only criterion's own `elem/s` line applies.
-    // Counting bins and values as the elements makes that line read directly as
-    // bins/sec and syntax elements/sec.
+    // These two workloads are bin and syntax-element streams, not pictures.
+    // Counting bins and values as the elements makes criterion's `elem/s` line
+    // read directly as bins/sec and syntax elements/sec, and makes the harness's
+    // "Mpx/s" line read as millions of bins or values per second — the unit that
+    // is actually meaningful here.
     let cabac = IsaWorkload {
         sample_size: 20,
         ..IsaWorkload::new("hevc_encode_cabac", FrameWork::new(CABAC_BINS as u64, 1, 1))
