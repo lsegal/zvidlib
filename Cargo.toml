@@ -38,6 +38,15 @@ name = "audio_decode"
 path = "benches/audio_decode.rs"
 harness = false
 
+# The HEVC encoder benchmarks are their own target: they use only the synthetic
+# inputs from `benches/support`, never the decoded-fixture cache the `codec`
+# target exists to share, and the encoder's mode search is slow enough that it is
+# worth keeping out of that target's default run.
+[[bench]]
+name = "hevc_encode"
+path = "benches/hevc_encode.rs"
+harness = false
+
 # The audio write/read path is a separate target rather than another group in
 # `codec`: it shares `benches/support/` but none of `codec`'s decoded-frame
 # fixtures, and issue #153 specifies `cargo bench --bench audio_mux` as its
