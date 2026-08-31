@@ -72,6 +72,10 @@ pub(crate) struct FrameEncoder<'a> {
     /// The non-lossless reconstruction, `coded_w x coded_h`, which prediction reads exactly as
     /// the decoder reads its own. Empty for lossless frames, which predict from the source.
     recon: Vec<u8>,
+    /// Every `(size, tx_type)` pair actually written to the bitstream, in coding order, so tests
+    /// can assert what the round trip covered rather than assume it.
+    #[cfg(test)]
+    emitted: Vec<(usize, Av1TxType)>,
 }
 
 /// The block-local encoder state a speculative (non-emitting) trial mutates, saved so the trial
@@ -118,17 +122,32 @@ impl<'a> FrameEncoder<'a> {
             // Distortion is summed squared error in the sample domain and rate is counted in
             // bits, so the multiplier scales with the square of the quantization step, the
             // standard `lambda ~ q^2` relation. The divisor is a plain tuning constant.
-            lambda: (i64::from(ac_quant) * i64::from(ac_quant) / 24).max(1),
+            lambda: (i64::from(ac_quant) * i64::from(ac_quant) / 256).max(1),
             recon: if qindex == 0 {
                 Vec::new()
             } else {
                 vec![0; coded_w * coded_h]
             },
+            #[cfg(test)]
+            emitted: Vec::new(),
         }
     }
 
     /// Encodes the tile and returns the symbol-coded bytes (`decode_tile`, §5.11.2).
     pub(crate) fn encode(mut self) -> Vec<u8> {
+        self.encode_superblocks();
+        self.sym.finish()
+    }
+
+    /// [`Self::encode`] plus the `(size, tx_type)` of every transform block it wrote.
+    #[cfg(test)]
+    pub(crate) fn encode_with_trace(mut self) -> (Vec<u8>, Vec<(usize, Av1TxType)>) {
+        self.encode_superblocks();
+        let emitted = std::mem::take(&mut self.emitted);
+        (self.sym.finish(), emitted)
+    }
+
+    fn encode_superblocks(&mut self) {
         const SB4: usize = 16; // 64×64 superblock in MI units
         let mut r = 0;
         while r < self.mi_rows {
@@ -141,7 +160,6 @@ impl<'a> FrameEncoder<'a> {
             }
             r += SB4;
         }
-        self.sym.finish()
     }
 
     /// Padded (edge-replicated) source sample of `plane` at coded-grid position `(x, y)`.
@@ -415,6 +433,10 @@ impl<'a> FrameEncoder<'a> {
         }
 
         let coded = self.code_coefficients(x >> 2, y >> 2, size, &levels, &scan, emit);
+        #[cfg(test)]
+        if emit {
+            self.emitted.push((size, tx_type));
+        }
         // The decoder reads `tx_type` after the coefficients, and only for a block that was not
         // fully skipped; a skipped block's type is irrelevant because its residual is zero.
         if coded {

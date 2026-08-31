@@ -439,7 +439,7 @@ mod tests {
         }
     }
 
-    fn configuration() -> VideoEncoderConfig {
+    pub(super) fn configuration() -> VideoEncoderConfig {
         VideoEncoderConfig {
             codec: Codec::Av1,
             profile: CodecProfile::Av1Main,
@@ -567,5 +567,257 @@ mod tests {
         ))
         .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    }
+}
+
+#[cfg(test)]
+mod nonlossless_tests {
+    use super::*;
+    use crate::av1_intra::Av1TxType;
+    use crate::{
+        CancellationToken, CpuFrameSource, EncodedVideoSample, Plane, VideoDecoderConfig,
+        VideoDecoderFactory, VideoFrame, native_av1_video_decoder_factory,
+    };
+    use std::future::Future;
+    use std::pin::pin;
+    use std::task::{Context, Poll, Waker};
+
+    fn block_on<T>(future: impl Future<Output = T>) -> T {
+        let mut context = Context::from_waker(Waker::noop());
+        let mut future = pin!(future);
+        loop {
+            if let Poll::Ready(value) = future.as_mut().poll(&mut context) {
+                return value;
+            }
+        }
+    }
+
+    fn test_pattern(width: u32, height: u32) -> Vec<u8> {
+        (0..height)
+            .flat_map(|y| {
+                (0..width).map(move |x| {
+                    // A flat left half and a busy right half, so one frame exercises both the
+                    // large-transform and the split/small-transform sides of the search.
+                    if x < width / 2 {
+                        (60 + y / 8) as u8
+                    } else {
+                        ((x * 7 + y * 29) ^ (x * y)) as u8
+                    }
+                })
+            })
+            .collect()
+    }
+
+    fn encode(width: u32, height: u32, qindex: u8, pixels: &[u8]) -> Vec<u8> {
+        let limits = Limits::default();
+        let dimensions = VideoDimensions::new(width, height, &limits).unwrap();
+        let configuration = VideoEncoderConfig {
+            coded_dimensions: dimensions,
+            configuration: if qindex == 0 {
+                Vec::new()
+            } else {
+                vec![qindex]
+            },
+            ..super::tests::configuration()
+        };
+        let factory = native_av1_video_encoder_factory();
+        let mut encoder = factory.create(&configuration, &limits).unwrap();
+        let frame = VideoFrame::new(
+            dimensions,
+            PixelFormat::Gray8,
+            ColorRange::Full,
+            vec![Plane {
+                data: pixels.to_vec(),
+                stride: width as usize,
+            }],
+            &limits,
+        )
+        .unwrap();
+        block_on(encoder.encode(
+            FrameIndex(0),
+            FrameSource::Cpu(CpuFrameSource {
+                frame: &frame,
+                orientation: Orientation::TopLeft,
+            }),
+        ))
+        .unwrap()
+        .remove(0)
+        .data
+    }
+
+    /// Decodes one access unit with the crate's own AV1 decoder and returns its luma plane.
+    /// The decoder emits RGBA and the stream is monochrome with identity matrix coefficients, so
+    /// every luma sample is its pixel's R byte.
+    fn decode_luma(data: &[u8], width: u32, height: u32) -> Vec<u8> {
+        let limits = Limits::default();
+        let dimensions = VideoDimensions::new(width, height, &limits).unwrap();
+        let encoder = native_av1_video_encoder_factory()
+            .create(
+                &VideoEncoderConfig {
+                    coded_dimensions: dimensions,
+                    ..super::tests::configuration()
+                },
+                &limits,
+            )
+            .unwrap();
+        let mut decoder = native_av1_video_decoder_factory()
+            .create(
+                &VideoDecoderConfig {
+                    codec: Codec::Av1,
+                    profile: CodecProfile::Av1Main,
+                    coded_dimensions: dimensions,
+                    output_format: PixelFormat::Rgba8,
+                    color_range: ColorRange::Full,
+                    hardware: HardwarePreference::Avoid,
+                    configuration: encoder.config().decoder_config.clone(),
+                },
+                &limits,
+            )
+            .unwrap();
+        let cancellation = CancellationToken::new();
+        let mut frames = decoder
+            .submit(
+                &EncodedVideoSample {
+                    presentation_index: FrameIndex(0),
+                    random_access: true,
+                    data: data.to_vec(),
+                },
+                &cancellation,
+            )
+            .unwrap();
+        frames.extend(decoder.drain(&cancellation).unwrap());
+        assert_eq!(frames.len(), 1);
+        let frame = &frames[0].frame;
+        let plane = &frame.planes[0];
+        (0..height as usize)
+            .flat_map(|row| {
+                let start = row * plane.stride;
+                plane.data[start..start + width as usize * 4]
+                    .iter()
+                    .step_by(4)
+                    .copied()
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    fn psnr(source: &[u8], decoded: &[u8]) -> f64 {
+        let sse: f64 = source
+            .iter()
+            .zip(decoded)
+            .map(|(&a, &b)| {
+                let error = f64::from(i32::from(a) - i32::from(b));
+                error * error
+            })
+            .sum();
+        if sse == 0.0 {
+            return f64::INFINITY;
+        }
+        10.0 * (255.0 * 255.0 * source.len() as f64 / sse).log10()
+    }
+
+    /// The `(size, tx_type)` pairs the tile encoder wrote for `pixels`, checked against the
+    /// access unit the public encoder produced for the same frame so the trace describes the
+    /// stream that actually round-trips rather than a re-encode of it.
+    fn traced_transform_blocks(
+        width: u32,
+        height: u32,
+        qindex: u8,
+        pixels: &[u8],
+        access_unit: &[u8],
+    ) -> Vec<(usize, Av1TxType)> {
+        let (tile, emitted) =
+            tile::FrameEncoder::new(pixels, width as usize, height as usize, qindex)
+                .encode_with_trace();
+        assert!(
+            access_unit.ends_with(&tile),
+            "the traced tile is not the tile the encoder emitted"
+        );
+        emitted
+    }
+
+    /// Every `(size, tx_type)` combination the encoder is able to write: the reduced intra set
+    /// [`crate::av1_intra_decoder`] reads back is `{IDTX, DCT_DCT}` below 32x32 and
+    /// `TX_SET_DCTONLY` from 32x32 up, and `TX_64X64` has no forward kernel.
+    const EMITTABLE: [(usize, &str); 7] = [
+        (4, "DctDct"),
+        (4, "Idtx"),
+        (8, "DctDct"),
+        (8, "Idtx"),
+        (16, "DctDct"),
+        (16, "Idtx"),
+        (32, "DctDct"),
+    ];
+
+    #[test]
+    fn non_lossless_frames_round_trip_within_a_distortion_bound() {
+        let (width, height) = (96_u32, 80_u32);
+        let pixels = test_pattern(width, height);
+        let mut covered = std::collections::BTreeSet::new();
+        let mut previous: Option<(f64, usize)> = None;
+        // Measured floors with margin: the point is that a coarser quantizer keeps costing fewer
+        // bits and reconstructing worse, never that a particular decibel is hit exactly.
+        for (qindex, floor) in [
+            (1_u8, 48.0),
+            (8, 46.0),
+            (32, 40.0),
+            (80, 33.0),
+            (160, 23.0),
+            (200, 17.0),
+        ] {
+            let data = encode(width, height, qindex, &pixels);
+            let decoded = decode_luma(&data, width, height);
+            assert_eq!(decoded.len(), pixels.len());
+            let measured = psnr(&pixels, &decoded);
+            assert!(
+                measured >= floor,
+                "qindex {qindex} reconstructed at {measured:.2} dB, below the {floor} dB bound"
+            );
+            if let Some((previous_psnr, previous_bytes)) = previous {
+                assert!(
+                    measured < previous_psnr && data.len() < previous_bytes,
+                    "qindex {qindex} ({measured:.2} dB, {} bytes) did not trade quality for size \
+                     against the finer quantizer before it ({previous_psnr:.2} dB, \
+                     {previous_bytes} bytes)",
+                    data.len()
+                );
+            }
+            previous = Some((measured, data.len()));
+            covered.extend(
+                traced_transform_blocks(width, height, qindex, &pixels, &data)
+                    .into_iter()
+                    .map(|(size, tx_type)| (size, format!("{tx_type:?}"))),
+            );
+        }
+        assert_eq!(
+            covered,
+            EMITTABLE
+                .into_iter()
+                .map(|(size, tx_type)| (size, tx_type.to_owned()))
+                .collect(),
+            "the round trip did not cover every transform size and type the encoder can emit"
+        );
+    }
+
+    #[test]
+    fn lossless_output_is_unchanged_by_the_quantizer_plumbing() {
+        let (width, height) = (33_u32, 17_u32);
+        let pixels = test_pattern(width, height);
+        let data = encode(width, height, 0, &pixels);
+        assert_eq!(decode_luma(&data, width, height), pixels);
+    }
+
+    #[test]
+    fn the_configuration_surface_is_empty_or_one_byte() {
+        assert_eq!(parse_base_q_idx(&[]), Some(0));
+        assert_eq!(parse_base_q_idx(&[40]), Some(40));
+        assert_eq!(parse_base_q_idx(&[1, 2]), None);
+        let factory = native_av1_video_encoder_factory();
+        let mut invalid = super::tests::configuration();
+        invalid.configuration = vec![1, 2, 3];
+        assert!(matches!(
+            factory.capability(&invalid),
+            CodecSupport::InvalidConfiguration { .. }
+        ));
     }
 }
