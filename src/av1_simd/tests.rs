@@ -578,9 +578,16 @@ fn wide_deblocking_filters_actually_run_on_flat_content() {
         frame.y.data
     };
     assert_ne!(
+        uniform(16),
+        uniform(8),
+        "the 14-tap filter should reach samples the 8-tap filter does not"
+    );
+    // 32x32 and 16x16 transforms both clamp to §7.14.5's `filterSize == 16`,
+    // so they must deblock identically.
+    assert_eq!(
         uniform(32),
         uniform(16),
-        "the 14-tap filter should reach samples the 8-tap filter does not"
+        "filterSize clamps at 16, so 32x32 and 16x16 transforms filter alike"
     );
 }
 
