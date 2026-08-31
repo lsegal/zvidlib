@@ -1,11 +1,12 @@
 //! Default CDF tables (AV1 §9.4), the 4×4 scan (§9.2), and the constant context-offset tables
 //! (§8.3.2) needed by the M0 lossless encoder.
 //!
-//! Only the slices the encoder touches are included: `base_q_idx == 0` ⇒ coefficient-CDF quant
-//! context 0, and `TX_4X4` only. The symbols that only a non-lossless frame reads — the larger
-//! `eob_pt` classes, `tx_depth`, the general scan orders and context offsets, and `ext_tx` — are
-//! re-exported from [`crate::av1_cdf`] rather than duplicated here, so the encoder and
-//! [`crate::av1_intra_decoder`] necessarily agree on every table they share. CDFs are stored in the spec's cumulative form (rising to 32768)
+//! Only the tables with no decoder-side counterpart are defined here. Every coefficient CDF —
+//! `txb_skip`, `eob_pt`, `eob_extra`, `coeff_base`, `coeff_base_eob`, `coeff_br` and `dc_sign` —
+//! along with `tx_depth`, the scan orders, the context offsets and `ext_tx`, is reached through
+//! the accessors re-exported from [`crate::av1_cdf`] at the bottom of this module, so the
+//! encoder and [`crate::av1_intra_decoder`] necessarily agree on every table they share and on
+//! the quantizer and transform-size context each symbol is selected by. CDFs are stored in the spec's cumulative form (rising to 32768)
 //! with the trailing adaptation-count element dropped, so each row is ready to pass straight to
 //! [`gamut_bitstream::SymbolEncoder::encode_symbol`] (the M0 frame sets `disable_cdf_update = 1`,
 //! so the tables are never adapted). These values are extracted verbatim from the specification.
@@ -84,218 +85,6 @@ pub static UV_MODE_CFL_ALLOWED_DC: [u16; 14] = [
 ];
 
 // --- Coefficient CDFs (quant context 0, TX_4X4). ---
-/// `Default_Txb_Skip_Cdf[0][TX_4X4]`, indexed [ctx].
-pub static TXB_SKIP: [[u16; 2]; 13] = [
-    [31849, 32768],
-    [5892, 32768],
-    [12112, 32768],
-    [21935, 32768],
-    [20289, 32768],
-    [27473, 32768],
-    [32487, 32768],
-    [7654, 32768],
-    [19473, 32768],
-    [29984, 32768],
-    [9961, 32768],
-    [30242, 32768],
-    [32117, 32768],
-];
-/// `Default_Eob_Pt_16_Cdf[0]`, indexed [ptype][ctx].
-pub static EOB_PT_16: [[[u16; 5]; 2]; 2] = [
-    [
-        [840, 1039, 1980, 4895, 32768],
-        [370, 671, 1883, 4471, 32768],
-    ],
-    [
-        [3247, 4950, 9688, 14563, 32768],
-        [1904, 3354, 7763, 14647, 32768],
-    ],
-];
-/// `Default_Eob_Extra_Cdf[0][TX_4X4]`, indexed [ptype][eobPt-3].
-pub static EOB_EXTRA: [[[u16; 2]; 9]; 2] = [
-    [
-        [16961, 32768],
-        [17223, 32768],
-        [7621, 32768],
-        [16384, 32768],
-        [16384, 32768],
-        [16384, 32768],
-        [16384, 32768],
-        [16384, 32768],
-        [16384, 32768],
-    ],
-    [
-        [19069, 32768],
-        [22525, 32768],
-        [13377, 32768],
-        [16384, 32768],
-        [16384, 32768],
-        [16384, 32768],
-        [16384, 32768],
-        [16384, 32768],
-        [16384, 32768],
-    ],
-];
-/// `Default_Dc_Sign_Cdf[0]`, indexed [ptype][ctx].
-pub static DC_SIGN: [[[u16; 2]; 3]; 2] = [
-    [[16000, 32768], [13056, 32768], [18816, 32768]],
-    [[15232, 32768], [12928, 32768], [17280, 32768]],
-];
-/// `Default_Coeff_Base_Eob_Cdf[0][TX_4X4]`, indexed [ptype][ctx].
-pub static COEFF_BASE_EOB: [[[u16; 3]; 4]; 2] = [
-    [
-        [17837, 29055, 32768],
-        [29600, 31446, 32768],
-        [30844, 31878, 32768],
-        [24926, 28948, 32768],
-    ],
-    [
-        [21365, 30026, 32768],
-        [30512, 32423, 32768],
-        [31658, 32621, 32768],
-        [29630, 31881, 32768],
-    ],
-];
-/// `Default_Coeff_Base_Cdf[0][TX_4X4]`, indexed [ptype][ctx] (42 contexts).
-pub static COEFF_BASE: [[[u16; 4]; 42]; 2] = [
-    [
-        [4034, 8930, 12727, 32768],
-        [18082, 29741, 31877, 32768],
-        [12596, 26124, 30493, 32768],
-        [9446, 21118, 27005, 32768],
-        [6308, 15141, 21279, 32768],
-        [2463, 6357, 9783, 32768],
-        [20667, 30546, 31929, 32768],
-        [13043, 26123, 30134, 32768],
-        [8151, 18757, 24778, 32768],
-        [5255, 12839, 18632, 32768],
-        [2820, 7206, 11161, 32768],
-        [8192, 16384, 24576, 32768],
-        [8192, 16384, 24576, 32768],
-        [8192, 16384, 24576, 32768],
-        [8192, 16384, 24576, 32768],
-        [8192, 16384, 24576, 32768],
-        [8192, 16384, 24576, 32768],
-        [8192, 16384, 24576, 32768],
-        [8192, 16384, 24576, 32768],
-        [8192, 16384, 24576, 32768],
-        [8192, 16384, 24576, 32768],
-        [15736, 27553, 30604, 32768],
-        [11210, 23794, 28787, 32768],
-        [5947, 13874, 19701, 32768],
-        [4215, 9323, 13891, 32768],
-        [2833, 6462, 10059, 32768],
-        [19605, 30393, 31582, 32768],
-        [13523, 26252, 30248, 32768],
-        [8446, 18622, 24512, 32768],
-        [3818, 10343, 15974, 32768],
-        [1481, 4117, 6796, 32768],
-        [22649, 31302, 32190, 32768],
-        [14829, 27127, 30449, 32768],
-        [8313, 17702, 23304, 32768],
-        [3022, 8301, 12786, 32768],
-        [1536, 4412, 7184, 32768],
-        [22354, 29774, 31372, 32768],
-        [14723, 25472, 29214, 32768],
-        [6673, 13745, 18662, 32768],
-        [2068, 5766, 9322, 32768],
-        [8192, 16384, 24576, 32768],
-        [8192, 16384, 24576, 32768],
-    ],
-    [
-        [6302, 16444, 21761, 32768],
-        [23040, 31538, 32475, 32768],
-        [15196, 28452, 31496, 32768],
-        [10020, 22946, 28514, 32768],
-        [6533, 16862, 23501, 32768],
-        [3538, 9816, 15076, 32768],
-        [24444, 31875, 32525, 32768],
-        [15881, 28924, 31635, 32768],
-        [9922, 22873, 28466, 32768],
-        [6527, 16966, 23691, 32768],
-        [4114, 11303, 17220, 32768],
-        [8192, 16384, 24576, 32768],
-        [8192, 16384, 24576, 32768],
-        [8192, 16384, 24576, 32768],
-        [8192, 16384, 24576, 32768],
-        [8192, 16384, 24576, 32768],
-        [8192, 16384, 24576, 32768],
-        [8192, 16384, 24576, 32768],
-        [8192, 16384, 24576, 32768],
-        [8192, 16384, 24576, 32768],
-        [8192, 16384, 24576, 32768],
-        [20201, 30770, 32209, 32768],
-        [14754, 28071, 31258, 32768],
-        [8378, 20186, 26517, 32768],
-        [5916, 15299, 21978, 32768],
-        [4268, 11583, 17901, 32768],
-        [24361, 32025, 32581, 32768],
-        [18673, 30105, 31943, 32768],
-        [10196, 22244, 27576, 32768],
-        [5495, 14349, 20417, 32768],
-        [2676, 7415, 11498, 32768],
-        [24678, 31958, 32585, 32768],
-        [18629, 29906, 31831, 32768],
-        [9364, 20724, 26315, 32768],
-        [4641, 12318, 18094, 32768],
-        [2758, 7387, 11579, 32768],
-        [25433, 31842, 32469, 32768],
-        [18795, 29289, 31411, 32768],
-        [7644, 17584, 23592, 32768],
-        [3408, 9014, 15047, 32768],
-        [8192, 16384, 24576, 32768],
-        [8192, 16384, 24576, 32768],
-    ],
-];
-/// `Default_Coeff_Br_Cdf[0][TX_4X4]`, indexed [ptype][ctx] (21 level contexts).
-pub static COEFF_BR: [[[u16; 4]; 21]; 2] = [
-    [
-        [14298, 20718, 24174, 32768],
-        [12536, 19601, 23789, 32768],
-        [8712, 15051, 19503, 32768],
-        [6170, 11327, 15434, 32768],
-        [4742, 8926, 12538, 32768],
-        [3803, 7317, 10546, 32768],
-        [1696, 3317, 4871, 32768],
-        [14392, 19951, 22756, 32768],
-        [15978, 23218, 26818, 32768],
-        [12187, 19474, 23889, 32768],
-        [9176, 15640, 20259, 32768],
-        [7068, 12655, 17028, 32768],
-        [5656, 10442, 14472, 32768],
-        [2580, 4992, 7244, 32768],
-        [12136, 18049, 21426, 32768],
-        [13784, 20721, 24481, 32768],
-        [10836, 17621, 21900, 32768],
-        [8372, 14444, 18847, 32768],
-        [6523, 11779, 16000, 32768],
-        [5337, 9898, 13760, 32768],
-        [3034, 5860, 8462, 32768],
-    ],
-    [
-        [15967, 22905, 26286, 32768],
-        [13534, 20654, 24579, 32768],
-        [9504, 16092, 20535, 32768],
-        [6975, 12568, 16903, 32768],
-        [5364, 10091, 14020, 32768],
-        [4357, 8370, 11857, 32768],
-        [2506, 4934, 7218, 32768],
-        [23032, 28815, 30936, 32768],
-        [19540, 26704, 29719, 32768],
-        [15158, 22969, 27097, 32768],
-        [11408, 18865, 23650, 32768],
-        [8885, 15448, 20250, 32768],
-        [7108, 12853, 17416, 32768],
-        [4231, 8041, 11480, 32768],
-        [19823, 26490, 29156, 32768],
-        [18890, 25929, 28932, 32768],
-        [15660, 23491, 27433, 32768],
-        [12147, 19776, 24488, 32768],
-        [9728, 16774, 21649, 32768],
-        [7919, 14277, 19066, 32768],
-        [5440, 10170, 14185, 32768],
-    ],
-];
 
 /// `Default_Scan_4x4` (§9.2): up-right diagonal scan order over the 16 positions.
 pub static DEFAULT_SCAN_4X4: [usize; 16] = [0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15];
@@ -315,8 +104,13 @@ pub static SIG_REF_DIFF_OFFSET_2D: [(usize, usize); 5] = [(0, 1), (1, 0), (1, 1)
 /// `Mag_Ref_Offset_With_Tx_Class[TX_CLASS_2D]` (§8.3.2): neighbour offsets for `coeff_br`.
 pub static MAG_REF_OFFSET_2D: [(usize, usize); 3] = [(0, 1), (1, 0), (1, 1)];
 
-// --- Non-lossless symbols, shared verbatim with the decoder. ---
+// --- Symbols shared verbatim with the decoder. ---
+//
+// The coefficient CDFs are reached through these accessors rather than through the
+// `qctx = 0`, `TX_4X4` copies above, so the encoder selects the specification's real quantizer
+// and transform-size contexts exactly as the decoders do.
 pub use crate::av1_cdf::{
-    coeff_base_ctx_offset, eob_pt_cdf, get_tx_set, tx_depth_cdf, tx_type_cdf, tx_type_inverse_set,
-    up_right_diagonal_scan,
+    coeff_base_cdf, coeff_base_ctx_offset, coeff_base_eob_cdf, coeff_br_cdf, coeff_qctx,
+    coeff_tx_size_ctx, dc_sign_cdf, eob_extra_cdf, eob_pt_cdf, get_tx_set, tx_depth_cdf,
+    tx_type_cdf, tx_type_inverse_set, txb_skip_cdf, up_right_diagonal_scan,
 };
