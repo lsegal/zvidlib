@@ -112,6 +112,7 @@ fn av1_simd_speedup_on_a_representative_frame() {
     let mut dct8 = Vec::new();
     let mut dct16 = Vec::new();
     let mut dct32 = Vec::new();
+    let mut dct64 = Vec::new();
     let mut adst8 = Vec::new();
     let mut adst16 = Vec::new();
     let mut fdct4 = Vec::new();
@@ -208,6 +209,7 @@ fn av1_simd_speedup_on_a_representative_frame() {
             (&mut dct8, 8, Av1TxType::DctDct),
             (&mut dct16, 16, Av1TxType::DctDct),
             (&mut dct32, 32, Av1TxType::DctDct),
+            (&mut dct64, 64, Av1TxType::DctDct),
             (&mut adst8, 8, Av1TxType::AdstAdst),
             (&mut adst16, 16, Av1TxType::FlipadstAdst),
         ] {
@@ -271,6 +273,7 @@ fn av1_simd_speedup_on_a_representative_frame() {
     report("inverse dct 8x8 (frame)", &dct8);
     report("inverse dct 16x16 (frame)", &dct16);
     report("inverse dct 32x32 (frame)", &dct32);
+    report("inverse dct 64x64 (frame)", &dct64);
     report("inverse adst 8x8 (frame)", &adst8);
     report("flip-adst 16x16 (frame)", &adst16);
     report("forward dct 4x4 (frame)", &fdct4);

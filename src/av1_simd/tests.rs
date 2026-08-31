@@ -147,10 +147,10 @@ fn out_of_range_walsh_hadamard_blocks_fall_back_to_scalar() {
 }
 
 /// Every transform type this crate implements, paired with the sizes it is
-/// defined at. ADST has no 32-point kernel in AV1.
+/// defined at. ADST has no 32- or 64-point kernel in AV1.
 const TX_TYPES: [(Av1TxType, &[usize]); 10] = [
-    (Av1TxType::Idtx, &[4, 8, 16, 32]),
-    (Av1TxType::DctDct, &[4, 8, 16, 32]),
+    (Av1TxType::Idtx, &[4, 8, 16, 32, 64]),
+    (Av1TxType::DctDct, &[4, 8, 16, 32, 64]),
     (Av1TxType::AdstDct, &[4, 8, 16]),
     (Av1TxType::DctAdst, &[4, 8, 16]),
     (Av1TxType::AdstAdst, &[4, 8, 16]),
@@ -240,7 +240,7 @@ fn inverse_transforms_stay_bit_exact_at_the_documented_input_limit() {
 
 #[test]
 fn out_of_range_transform_blocks_fall_back_to_scalar() {
-    for size in [4usize, 8, 16, 32] {
+    for size in [4usize, 8, 16, 32, 64] {
         let over = transforms::input_limit(size) as i64 + 1;
         let coefficients: Vec<i32> = (0..size * size)
             .map(|index| if index == 3 { over as i32 } else { 1 })
@@ -264,6 +264,45 @@ fn out_of_range_transform_blocks_fall_back_to_scalar() {
     }
 }
 
+/// A bit-exactness comparison passes vacuously if every backend quietly took
+/// the scalar path, so pin down that each size really is dispatched to a
+/// vector kernel for ordinary coefficient magnitudes.
+#[test]
+fn every_transform_size_reaches_a_vector_kernel() {
+    let mut rng = Lcg(0x5eed_0120_0000_0005);
+    for (tx_type, sizes) in TX_TYPES {
+        if tx_type == Av1TxType::Idtx {
+            // The identity transform has no butterfly pass and never
+            // dispatches.
+            continue;
+        }
+        let (column, row, lr_flip, ud_flip) = tx_type.kernels();
+        for &size in sizes {
+            let coefficients: Vec<i32> = (0..size * size).map(|_| rng.in_range(600)).collect();
+            for (isa, vectorized) in for_each_isa(|isa| {
+                let mut out = vec![0i16; size * size];
+                inverse_transform_simd(
+                    isa,
+                    &coefficients,
+                    size,
+                    column,
+                    row,
+                    lr_flip,
+                    ud_flip,
+                    &mut out,
+                )
+            }) {
+                assert_eq!(
+                    vectorized,
+                    isa != SimdIsa::Scalar,
+                    "{tx_type:?} {size}x{size} on {}",
+                    isa.name()
+                );
+            }
+        }
+    }
+}
+
 /// The fixed-point butterflies must actually compute the transforms they
 /// claim to: `idctN` is the AV1/VP9-lineage DCT-III, `iadst4` is the DST-VII
 /// the `sinpi` constants encode, and `iadst8`/`iadst16` are DST-IV. Checking
@@ -273,7 +312,7 @@ fn out_of_range_transform_blocks_fall_back_to_scalar() {
 fn scalar_kernels_match_the_mathematical_transforms() {
     use std::f64::consts::{PI, SQRT_2};
 
-    for size in [4usize, 8, 16, 32] {
+    for size in [4usize, 8, 16, 32, 64] {
         for basis in 0..size {
             let mut coefficients = vec![0i32; size * size];
             // A single row coefficient, so the column pass only scales the DC
@@ -539,12 +578,78 @@ fn wide_deblocking_filters_actually_run_on_flat_content() {
     );
 }
 
+/// Verifies wide-filter output against spec-derived values rather than
+/// against this crate's own scalar path, on every instruction set.
+///
+/// The plane is a single step edge: columns `0..16` hold 100 and columns
+/// `16..20` hold 110, with a frame-wide 32x32 transform grid so §7.14.5
+/// selects the 14-tap filter. Height 4 leaves no horizontal edge, and the
+/// vertical edges at x = 4, 8 and 12 see an all-100 window, which any filter
+/// whose weights sum to its rounding shift leaves unchanged. Only the last
+/// edge, x = 16, actually filters, so no cascade obscures its output.
+///
+/// The expected samples come from §7.14.6.4 directly: with p6..p0 = 100 and
+/// q0..q6 = 110 (the taps past the right border replicate column 19), output
+/// `k` is `Round2(100 * (16 - w) + 110 * w, 4)` where `w` is the row's q-side
+/// weight sum, i.e. `(1608 + 10 * w) >> 4`. The q-side weight sums read off
+/// the spec's tap lists are 1, 2, 3, 4, 5, 7, 9, 11, 12, 13, 14 and 15.
+#[test]
+fn wide_deblocking_output_matches_spec_derived_vectors() {
+    const WIDTH: usize = 20;
+    const HEIGHT: usize = 4;
+    // Written at columns 10..=21; the last two land outside the plane.
+    const Q_WEIGHT_SUMS: [i32; 12] = [1, 2, 3, 4, 5, 7, 9, 11, 12, 13, 14, 15];
+
+    let mut expected: Vec<u8> = (0..WIDTH)
+        .map(|x| if x < 16 { 100u8 } else { 110u8 })
+        .collect();
+    for (offset, weight) in Q_WEIGHT_SUMS.into_iter().enumerate() {
+        let column = 10 + offset;
+        if column < WIDTH {
+            expected[column] = ((1608 + 10 * weight) >> 4) as u8;
+        }
+    }
+    let expected: Vec<u8> = expected.repeat(HEIGHT);
+
+    let mut grid = TxSizeGrid::new(WIDTH, HEIGHT);
+    grid.set_block(0, 0, 32, 32);
+    let results = for_each_isa(|_| {
+        let data: Vec<u8> = (0..WIDTH * HEIGHT)
+            .map(|index| if index % WIDTH < 16 { 100u8 } else { 110u8 })
+            .collect();
+        let plane = FilterPlane::from_samples(WIDTH, HEIGHT, data, &Limits::default()).unwrap();
+        let mut frame = FilterFrame::new_monochrome(plane);
+        deblock_frame(&mut frame, &deblock_params(40, 0), Some(&grid)).unwrap();
+        frame.y.data
+    });
+    for (isa, data) in &results {
+        assert_eq!(
+            data,
+            &expected,
+            "{} wide-filter output should match the spec's filter14 constants",
+            isa.name()
+        );
+    }
+}
+
 #[test]
 fn deblocking_at_frame_borders_matches_the_scalar_reference() {
     // Planes small enough that every edge position's filter window leaves the
     // plane on at least one side, and whose dimensions are not a multiple of
     // any lane count, so every run is a partial one.
-    for (width, height) in [(5usize, 5usize), (9, 3), (3, 9), (6, 13), (17, 6)] {
+    // `(9, 8)` and `(17, 12)` additionally give the vertical edges a whole
+    // final chunk whose last lane is the plane's last row, which is the
+    // narrow kernel's unclamped row-word path running right up against the
+    // end of the sample buffer.
+    for (width, height) in [
+        (5usize, 5usize),
+        (9, 3),
+        (3, 9),
+        (6, 13),
+        (17, 6),
+        (9, 8),
+        (17, 12),
+    ] {
         for tx in [false, true] {
             let grid = tx.then(|| mixed_tx_grid(width, height));
             let results = for_each_isa(|_| {
@@ -644,6 +749,131 @@ fn unsupported_override_falls_back_to_scalar() {
 }
 
 // ---------------------------------------------------------------------
+// Vector primitives
+// ---------------------------------------------------------------------
+
+/// Lane values for the packed-store checks, chosen so each vector width sees
+/// negatives, both ends of `0..=255`, and magnitudes that a saturating
+/// 32 -> 16 -> 8 bit pack chain would mishandle if it dropped the range clamp
+/// (65536 saturates to `0xffff`, which reads back as a *negative* 16-bit lane).
+const PACK_CASES: [[i32; MAX_LANES]; 3] = [
+    [-300, -1, 0, 1, 128, 254, 255, 400],
+    [255, 256, 65535, 65536, -1, 70000, 42, 0],
+    [i32::MIN, i32::MAX, 0, 255, 1, 200, -70000, 65536],
+];
+
+/// Checks the byte-packing store and the row-word load/store pair the narrow
+/// deblocking kernels use against straightforward scalar equivalents.
+///
+/// # Safety
+/// `V`'s instruction set must be available on this host.
+unsafe fn check_vector_byte_paths<V: vector::I32x>() {
+    unsafe {
+        for case in PACK_CASES {
+            let value = V::load(&case);
+
+            // `store_u8_clamped` must equal a per-lane `clamp(0, 255)`.
+            let mut packed = [0u8; MAX_LANES];
+            value.store_u8_clamped(&mut packed);
+            for (lane, &input) in case.iter().enumerate().take(V::LANES) {
+                assert_eq!(
+                    packed[lane],
+                    input.clamp(0, 255) as u8,
+                    "store_u8_clamped lane {lane} of {case:?}"
+                );
+            }
+
+            // ... and so must every partial count, which takes the staged path.
+            for count in 0..=V::LANES {
+                let mut masked = [0xaau8; MAX_LANES];
+                value.store_u8_clamped_masked(&mut masked, count);
+                for (lane, &input) in case.iter().enumerate().take(V::LANES) {
+                    let expected = if lane < count {
+                        input.clamp(0, 255) as u8
+                    } else {
+                        0xaa
+                    };
+                    assert_eq!(
+                        masked[lane], expected,
+                        "masked store lane {lane}, {count} of {case:?}"
+                    );
+                }
+            }
+        }
+
+        // Row words: `LANES` rows of `stride` bytes, four of which per row are
+        // the window the narrow vertical-edge filter reads and writes.
+        const STRIDE: usize = 11;
+        const BASE: usize = 3;
+        let mut buffer: Vec<u8> = (0..STRIDE * MAX_LANES).map(|i| (i * 7 + 1) as u8).collect();
+        let original = buffer.clone();
+
+        let loaded = V::load_u32_rows(&buffer, BASE, STRIDE);
+        let mut lanes = [0i32; MAX_LANES];
+        loaded.store(&mut lanes);
+        for (lane, &word) in lanes.iter().enumerate().take(V::LANES) {
+            let at = BASE + lane * STRIDE;
+            let expected =
+                i32::from_le_bytes([buffer[at], buffer[at + 1], buffer[at + 2], buffer[at + 3]]);
+            assert_eq!(word, expected, "load_u32_rows lane {lane}");
+        }
+
+        // Storing the loaded words back is the identity, and storing something
+        // else touches exactly the four bytes of each row's window.
+        loaded.store_u32_rows(&mut buffer, BASE, STRIDE);
+        assert_eq!(buffer, original, "store_u32_rows should round-trip");
+
+        let replacement = V::splat(0x0403_0201);
+        replacement.store_u32_rows(&mut buffer, BASE, STRIDE);
+        for index in 0..buffer.len() {
+            let lane = index.checked_sub(BASE).map(|offset| offset / STRIDE);
+            let column = index.wrapping_sub(BASE) % STRIDE;
+            let inside = index >= BASE && column < 4 && lane.is_some_and(|lane| lane < V::LANES);
+            let expected = if inside {
+                (column + 1) as u8
+            } else {
+                original[index]
+            };
+            assert_eq!(buffer[index], expected, "store_u32_rows byte {index}");
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn neon_byte_paths_match_the_scalar_reference() {
+    if !std::arch::is_aarch64_feature_detected!("neon") {
+        return;
+    }
+    unsafe { check_vector_byte_paths::<vector::Neon>() };
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn sse41_byte_paths_match_the_scalar_reference() {
+    #[target_feature(enable = "sse4.1")]
+    unsafe fn run() {
+        unsafe { check_vector_byte_paths::<vector::Sse4>() };
+    }
+    if !std::arch::is_x86_feature_detected!("sse4.1") {
+        return;
+    }
+    unsafe { run() };
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn avx2_byte_paths_match_the_scalar_reference() {
+    #[target_feature(enable = "avx2")]
+    unsafe fn run() {
+        unsafe { check_vector_byte_paths::<vector::Avx2>() };
+    }
+    if !std::arch::is_x86_feature_detected!("avx2") {
+        return;
+    }
+    unsafe { run() };
+}
+// ---------------------------------------------------------------------
 // Forward transforms (issue #140)
 // ---------------------------------------------------------------------
 
@@ -652,6 +882,11 @@ fn forward_transforms_match_the_scalar_reference_at_every_size_and_type() {
     let mut rng = Lcg(0x5eed_0140_0000_0001);
     for (tx_type, sizes) in TX_TYPES {
         for &size in sizes {
+            // The forward kernels stop at 32 points; AV1 defines no 64-point
+            // forward transform, so skip the inverse-only 64x64 entries.
+            if size > 32 {
+                continue;
+            }
             for _ in 0..40 {
                 let residual: Vec<i32> = (0..size * size).map(|_| rng.in_range(255)).collect();
                 let results = for_each_isa(|_| forward_transform(&residual, size, tx_type));
@@ -672,6 +907,11 @@ fn forward_transforms_stay_bit_exact_at_the_documented_input_limit() {
     let mut rng = Lcg(0x5eed_0140_0000_0002);
     for (tx_type, sizes) in TX_TYPES {
         for &size in sizes {
+            // The forward kernels stop at 32 points; AV1 defines no 64-point
+            // forward transform, so skip the inverse-only 64x64 entries.
+            if size > 32 {
+                continue;
+            }
             let extreme = crate::av1_encoder::transform::input_limit(size);
             for pattern in 0..6 {
                 let residual: Vec<i32> = (0..size * size)
@@ -775,6 +1015,11 @@ fn vectorized_round_trip_reproduces_the_residual() {
     let mut rng = Lcg(0x5eed_0140_0000_0003);
     for (tx_type, sizes) in TX_TYPES {
         for &size in sizes {
+            // The forward kernels stop at 32 points; AV1 defines no 64-point
+            // forward transform, so skip the inverse-only 64x64 entries.
+            if size > 32 {
+                continue;
+            }
             let residual: Vec<i32> = (0..size * size).map(|_| rng.in_range(255)).collect();
             let results = for_each_isa(|_| {
                 let coefficients = forward_transform(&residual, size, tx_type);

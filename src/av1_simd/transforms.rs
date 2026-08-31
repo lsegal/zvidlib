@@ -2,8 +2,8 @@
 //!
 //! Covers the lossless 4x4 Walsh-Hadamard transform in both directions
 //! ([`crate::av1_encoder`]) and the whole non-lossless inverse transform set
-//! used by [`crate::av1_intra::inverse_transform`]: the 4-, 8-, 16-, and
-//! 32-point inverse DCT and the 4-, 8-, and 16-point inverse ADST, in every
+//! used by [`crate::av1_intra::inverse_transform`]: the 4-, 8-, 16-, 32-, and
+//! 64-point inverse DCT and the 4-, 8-, and 16-point inverse ADST, in every
 //! vertical/horizontal combination including the flipped-ADST output
 //! reversals.
 //!
@@ -57,7 +57,10 @@ fn pass_gain(size: usize) -> i32 {
         4 => 4,
         8 => 7,
         16 => 12,
-        _ => 22,
+        32 => 22,
+        // The 64-point gain is `40.95`, the same `2N/pi` trend the smaller
+        // sizes follow, with the same ~7% margin the 32-point bound carries.
+        _ => 44,
     }
 }
 
@@ -67,7 +70,7 @@ fn pass_gain(size: usize) -> i32 {
 /// Two passes multiply magnitudes by at most `pass_gain(size)` each, and the
 /// spare factor of four covers the rounding slack [`dot_rs14`] adds to its
 /// high half. Compare the old product-limited bound of 30000: this is 2^25 at
-/// 4 points and still 2^20 at 32 points.
+/// 4 points, still 2^20 at 32 points, and 2^18 (277309) at 64.
 pub(crate) fn input_limit(size: usize) -> i32 {
     let gain = pass_gain(size);
     (i32::MAX / 4) / (gain * gain)
@@ -1167,6 +1170,99 @@ unsafe fn store_i16_clamped<V: I32x>(row: V, out: &mut [i16]) {
     }
 }
 
+/// [`crate::av1_intra::COSPI_128`], narrowed to the lane width so the scalar
+/// and vector 64-point kernels cannot drift apart.
+const COSPI_128: [i32; 65] = {
+    let source = crate::av1_intra::COSPI_128;
+    let mut table = [0i32; 65];
+    let mut index = 0;
+    while index < 65 {
+        table[index] = source[index] as i32;
+        index += 1;
+    }
+    table
+};
+
+/// Vector form of `av1_intra::dct_iv2_1d`.
+#[inline(always)]
+unsafe fn dct_iv2<V: I32x>(input: [V; 2]) -> [V; 2] {
+    unsafe {
+        [
+            dot_rs14([(input[0], COSPI_128[16]), (input[1], COSPI_128[48])]),
+            dot_rs14([(input[0], COSPI_128[48]), (input[1], -COSPI_128[16])]),
+        ]
+    }
+}
+
+/// Vector form of the `av1_intra::dct_iv_kernel!` recursion, which documents
+/// the even/odd split and the rotation angles.
+macro_rules! dct_iv_kernel {
+    ($name:ident, $m:literal, $half:ident) => {
+        #[doc = concat!("Vector form of `av1_intra::dct_iv", stringify!($m), "_1d`.")]
+        #[inline(always)]
+        unsafe fn $name<V: I32x>(input: [V; $m]) -> [V; $m] {
+            unsafe {
+                const HALF: usize = $m / 2;
+                const STEP: usize = 128 / (4 * $m);
+                let mut p = [V::zero(); HALF];
+                let mut q = [V::zero(); HALF];
+                for j in 0..HALF {
+                    let index = (2 * j + 1) * STEP;
+                    let (cosine, sine) = (COSPI_128[index], COSPI_128[64 - index]);
+                    let (first, second) = (input[j], input[$m - 1 - j]);
+                    p[j] = dot_rs14([(first, cosine), (second, -sine)]);
+                    let rotated = dot_rs14([(first, sine), (second, cosine)]);
+                    q[j] = if j % 2 == 0 {
+                        rotated
+                    } else {
+                        V::zero().sub(rotated)
+                    };
+                }
+                let p = $half(p);
+                let q = $half(q);
+                let mut output = [V::zero(); $m];
+                for m in 0..HALF {
+                    let odd = q[HALF - 1 - m];
+                    output[2 * m] = p[m].add(odd);
+                    output[2 * m + 1] = p[m].sub(odd);
+                }
+                output
+            }
+        }
+    };
+}
+
+dct_iv_kernel!(dct_iv4, 4, dct_iv2);
+dct_iv_kernel!(dct_iv8, 8, dct_iv4);
+dct_iv_kernel!(dct_iv16, 16, dct_iv8);
+dct_iv_kernel!(dct_iv32, 32, dct_iv16);
+
+/// Vector form of `av1_intra::inverse_dct64_1d`.
+///
+/// The same even/odd split the scalar kernel documents: the even-indexed
+/// coefficients are a 32-point inverse DCT and the odd-indexed ones a 32-point
+/// DCT-IV, whose sum and difference give the two output halves.
+#[inline(always)]
+unsafe fn dct64<V: I32x>(input: [V; 64]) -> [V; 64] {
+    unsafe {
+        let mut even = [V::zero(); 32];
+        let mut odd = [V::zero(); 32];
+        for j in 0..32 {
+            even[j] = input[2 * j];
+            odd[j] = input[2 * j + 1];
+        }
+        let even = dct32(even);
+        let odd = dct_iv32(odd);
+
+        let mut output = [V::zero(); 64];
+        for n in 0..32 {
+            output[n] = even[n].add(odd[n]);
+            output[63 - n] = even[n].sub(odd[n]);
+        }
+        output
+    }
+}
+
 /// Runs one separable pass of an `N x N` block.
 ///
 /// Reads `$src` row-major, transforms each row with the kernel `$kind`
@@ -1204,8 +1300,8 @@ macro_rules! separable_pass {
 
 /// Defines the `N x N` inverse transform driver for one block size.
 ///
-/// `$adst` is the ADST kernel at that size, or the DCT kernel again at 32
-/// points where AV1 defines no ADST (the dispatcher normalizes the request
+/// `$adst` is the ADST kernel at that size, or the DCT kernel again at 32 and
+/// 64 points where AV1 defines no ADST (the dispatcher normalizes the request
 /// before calling in, so that arm is unreachable).
 macro_rules! inverse_transform_driver {
     ($name:ident, $n:literal, $shift:literal, $dct:ident, $adst:ident) => {
@@ -1266,6 +1362,7 @@ inverse_transform_driver!(inverse_transform4, 4, 4, dct4, adst4);
 inverse_transform_driver!(inverse_transform8, 8, 5, dct8, adst8);
 inverse_transform_driver!(inverse_transform16, 16, 6, dct16, adst16);
 inverse_transform_driver!(inverse_transform32, 32, 6, dct32, dct32);
+inverse_transform_driver!(inverse_transform64, 64, 6, dct64, dct64);
 
 // ---------------------------------------------------------------------
 // Forward transforms (issue #140)
