@@ -37,8 +37,8 @@
 
 use crate::hevc::engine::binarization::PartMode;
 use crate::hevc::engine::deblock::{DeblockCu, DeblockCuDesc, DeblockCuParams, NoFilterMap};
-use crate::hevc::engine::encoder::recon_simd::{self, EdgeStats};
 use crate::hevc::engine::encoder::rdo::PictureDecision;
+use crate::hevc::engine::encoder::recon_simd::{self, EdgeStats};
 use crate::hevc::engine::motion::{MotionCell, MotionField};
 use crate::hevc::engine::picture::{Picture, Plane};
 use crate::hevc::engine::sao::{ResolvedSao, ResolvedSaoComponent};

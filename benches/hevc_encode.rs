@@ -24,19 +24,22 @@
 //!
 //! ## The SIMD axis, and where it is expected to read flat
 //!
-//! `hevc_rdcost` — the SAD and SATD distortion metrics the mode search calls —
-//! is the encoder's *only* SIMD dispatch family. Bitstream writing, CABAC, and
-//! the RGBA-to-YUV420 conversion have no vector path, so their arms are
-//! expected to read the same under every instruction set. That is the measured
-//! result the issue asks for, not a broken benchmark: it says the next
-//! encoder-side vectorization target is entropy coding or color conversion, and
-//! it is why every group asserts through `simd::active_by_site()` that the
-//! override landed rather than inferring it from the clock.
+//! The encoder has two SIMD dispatch families of its own: `hevc_rdcost`, the
+//! SAD and SATD distortion metrics the mode search calls, and `hevc_recon`,
+//! the §8.6.6 reconstruction loop and the encode-side §8.7.3 SAO parameter
+//! search. Bitstream writing, CABAC, and the RGBA-to-YUV420 conversion have no
+//! vector path, so their arms are expected to read the same under every
+//! instruction set. That is the measured result the issue asks for, not a
+//! broken benchmark: it says the next encoder-side vectorization target is
+//! entropy coding or color conversion, and it is why every group asserts
+//! through `simd::active_by_site()` that the override landed rather than
+//! inferring it from the clock.
 //!
-//! The one exception is the reconstruction group. It runs the decoder's own
-//! §8.7.2 deblocking and §8.7.3 SAO kernels over the encoder's reconstructed
-//! picture, and those *are* vectorized, so it is the one encoder-side group
-//! outside mode search that is expected to move with the instruction set.
+//! The exception is the reconstruction group. It runs `hevc_recon` over every
+//! partition and every CTB, and then the decoder's own vectorized §8.7.2
+//! deblocking and §8.7.3 SAO filter kernels over the result, so it is the one
+//! encoder-side group outside mode search that is expected to move with the
+//! instruction set.
 //!
 //! ## Stages this encoder does not have yet
 //!
@@ -95,9 +98,9 @@ fn report_absent_stages(_: &mut Criterion) {
          # no quantization to measure. The stages benchmarked below are mode search/RDO,\n\
          # encode-side reconstruction + in-loop filtering, CABAC + bitwriting, whole-picture PCM\n\
          # access-unit writing, and the RGBA8->YUV420 input conversion.\n\
-         # hevc_encode: hevc_rdcost is the encoder's only SIMD dispatch family of its own, so\n\
-         # apart from the mode-search and reconstruction groups (the latter running the decoder's\n\
-         # vectorized in-loop filter kernels) the arms are expected to read flat across\n\
+         # hevc_encode: hevc_rdcost and hevc_recon are the encoder's own SIMD dispatch families,\n\
+         # so apart from the mode-search and reconstruction groups (the latter also running the\n\
+         # decoder's vectorized in-loop filter kernels) the arms are expected to read flat across\n\
          # instruction sets, which is the measured result, not a broken bench."
     );
 }

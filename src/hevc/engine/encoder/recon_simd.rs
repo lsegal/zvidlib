@@ -137,7 +137,11 @@ pub(crate) fn isa() -> Isa {
 /// Panics unless all three slices have the same length.
 pub(crate) fn reconstruct_row(dst: &mut [i32], src: &[u8], pred: &[u8]) {
     assert_eq!(dst.len(), src.len(), "destination and source rows differ");
-    assert_eq!(dst.len(), pred.len(), "destination and prediction rows differ");
+    assert_eq!(
+        dst.len(),
+        pred.len(),
+        "destination and prediction rows differ"
+    );
     match isa_code() {
         #[cfg(target_arch = "x86_64")]
         ISA_AVX2 => {
@@ -304,7 +308,11 @@ mod x86 {
             let n = dst.len();
             let mut i = 0;
             while i + 8 <= n {
-                reconstruct8_sse41(dst.as_mut_ptr().add(i), src.as_ptr().add(i), pred.as_ptr().add(i));
+                reconstruct8_sse41(
+                    dst.as_mut_ptr().add(i),
+                    src.as_ptr().add(i),
+                    pred.as_ptr().add(i),
+                );
                 i += 8;
             }
             super::reconstruct_row_scalar(&mut dst[i..], &src[i..], &pred[i..]);
@@ -336,7 +344,11 @@ mod x86 {
                 i += 16;
             }
             while i + 8 <= n {
-                reconstruct8_sse41(dst.as_mut_ptr().add(i), src.as_ptr().add(i), pred.as_ptr().add(i));
+                reconstruct8_sse41(
+                    dst.as_mut_ptr().add(i),
+                    src.as_ptr().add(i),
+                    pred.as_ptr().add(i),
+                );
                 i += 8;
             }
             super::reconstruct_row_scalar(&mut dst[i..], &src[i..], &pred[i..]);
@@ -437,8 +449,7 @@ mod x86 {
                 let vsrc = _mm256_cvtepu8_epi32(_mm_cvtsi64_si128(packed as i64));
                 let error = _mm256_sub_epi32(vsrc, vh);
                 for c in 0..4 {
-                    let hit =
-                        _mm256_cmpeq_epi32(edge, _mm256_set1_epi32(EDGE_IDX_BY_CATEGORY[c]));
+                    let hit = _mm256_cmpeq_epi32(edge, _mm256_set1_epi32(EDGE_IDX_BY_CATEGORY[c]));
                     sums[c] = _mm256_add_epi32(sums[c], _mm256_and_si256(error, hit));
                     counts[c] = _mm256_sub_epi32(counts[c], hit);
                 }
@@ -477,7 +488,10 @@ mod neon {
                 let p = vld1q_u8(pred.as_ptr().add(i));
                 let s = vld1q_u8(src.as_ptr().add(i));
                 let out = dst.as_mut_ptr().add(i);
-                let halves = [(vget_low_u8(p), vget_low_u8(s)), (vget_high_u8(p), vget_high_u8(s))];
+                let halves = [
+                    (vget_low_u8(p), vget_low_u8(s)),
+                    (vget_high_u8(p), vget_high_u8(s)),
+                ];
                 for (half, (p8, s8)) in halves.into_iter().enumerate() {
                     let pv = vreinterpretq_s16_u16(vmovl_u8(p8));
                     let sv = vreinterpretq_s16_u16(vmovl_u8(s8));
@@ -592,7 +606,12 @@ mod tests {
                 simd::set_override(Some(isa));
                 let mut got = vec![0i32; n];
                 reconstruct_row(&mut got, &src, &pred);
-                assert_eq!(got, expected, "{} reconstruction of {n} samples", isa.name());
+                assert_eq!(
+                    got,
+                    expected,
+                    "{} reconstruction of {n} samples",
+                    isa.name()
+                );
             }
         }
         simd::set_override(None);
