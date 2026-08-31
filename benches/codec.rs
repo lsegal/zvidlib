@@ -16,7 +16,7 @@ use zvidlib::av1_filters::{FilterFrame, FilterPlane, LoopFilterParams, deblock_f
 use zvidlib::av1_mc::{InterpFilter, McContext, RefPlane};
 use zvidlib::{
     Av1InterDecoder, CancellationToken, ExactFrameReader, FrameDigest, FrameIndex, Limits,
-    VideoDecoderFactory, decode_av1_lossless_intra, native_hevc_video_decoder_factory,
+    TxSizeGrid, VideoDecoderFactory, decode_av1_lossless_intra, native_hevc_video_decoder_factory,
 };
 
 use support::isa::{IsaWorkload, bench_across_isas};
@@ -202,6 +202,69 @@ fn av1_deblock_by_isa(criterion: &mut Criterion) {
     });
 }
 
+/// The synthetic 4:2:0 chroma planes, decoded once and reused.
+fn isa_chroma_planes() -> &'static (Vec<u8>, Vec<u8>) {
+    static PLANES: std::sync::OnceLock<(Vec<u8>, Vec<u8>)> = std::sync::OnceLock::new();
+    PLANES.get_or_init(|| {
+        let mut planes = support::synthetic_yuv420_sequence(ISA_WIDTH as u32, ISA_HEIGHT as u32, 1)
+            .remove(0)
+            .planes;
+        let v = planes.remove(2).data;
+        let u = planes.remove(1).data;
+        (u, v)
+    })
+}
+
+/// AV1 chroma deblocking with transform-size metadata present, which is what
+/// makes §7.14.5 select the 6-tap chroma filter.
+///
+/// The luma levels are zero and only the chroma planes are filtered, so this
+/// isolates the chroma edge kernels from [`av1_deblock_by_isa`]'s luma work.
+/// The 16x16 luma grid subsamples to 8x8 chroma transforms, so every interior
+/// chroma edge takes the 6-tap path rather than the narrow one.
+fn av1_deblock_chroma_by_isa(criterion: &mut Criterion) {
+    const CHROMA_WIDTH: usize = ISA_WIDTH / 2;
+    const CHROMA_HEIGHT: usize = ISA_HEIGHT / 2;
+
+    let luma = isa_luma_plane();
+    let (u_data, v_data) = isa_chroma_planes();
+    let params = LoopFilterParams {
+        y_vertical_level: 0,
+        y_horizontal_level: 0,
+        u_level: 24,
+        v_level: 24,
+        sharpness: 0,
+    };
+    let mut grid = TxSizeGrid::new(ISA_WIDTH, ISA_HEIGHT);
+    for y in (0..ISA_HEIGHT).step_by(16) {
+        for x in (0..ISA_WIDTH).step_by(16) {
+            grid.set_block(x, y, 16, 16);
+        }
+    }
+    let workload = IsaWorkload::new(
+        "av1_deblock_chroma",
+        FrameWork::new(1, CHROMA_WIDTH as u64, 2 * CHROMA_HEIGHT as u64),
+    );
+    bench_across_isas(criterion, &workload, || {
+        let limits = Limits::default();
+        let mut y = FilterPlane::new(ISA_WIDTH, ISA_HEIGHT, &limits)
+            .expect("the synthetic plane fits the default limits");
+        y.data.copy_from_slice(luma);
+        let mut u = FilterPlane::new(CHROMA_WIDTH, CHROMA_HEIGHT, &limits)
+            .expect("the synthetic chroma plane fits the default limits");
+        u.data.copy_from_slice(u_data);
+        let mut v = FilterPlane::new(CHROMA_WIDTH, CHROMA_HEIGHT, &limits)
+            .expect("the synthetic chroma plane fits the default limits");
+        v.data.copy_from_slice(v_data);
+        let mut frame =
+            FilterFrame::new_yuv(y, u, v, true, true).expect("the synthetic frame is 4:2:0");
+        deblock_frame(&mut frame, &params, Some(&grid)).expect("deblocking succeeds");
+        let mut out = frame.u.expect("the frame has a U plane").data;
+        out.extend_from_slice(&frame.v.expect("the frame has a V plane").data);
+        out
+    });
+}
+
 /// AV1 sub-pel motion compensation: the arm that exercises `av1_mc`, reached
 /// through `McContext::new`, which honours the crate-wide override.
 fn av1_motion_compensation_by_isa(criterion: &mut Criterion) {
@@ -299,6 +362,7 @@ criterion_group!(
     encoder_input,
     hevc_decode_1080p,
     av1_deblock_by_isa,
+    av1_deblock_chroma_by_isa,
     av1_motion_compensation_by_isa,
     hevc_decode_by_isa
 );
