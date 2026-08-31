@@ -746,7 +746,11 @@ impl<'a> FrameEncoder<'a> {
     }
 
     fn restore(&mut self, snapshot: Snapshot) {
-        for (row, chunk) in snapshot.recon.chunks(snapshot.recon_width.max(1)).enumerate() {
+        for (row, chunk) in snapshot
+            .recon
+            .chunks(snapshot.recon_width.max(1))
+            .enumerate()
+        {
             let start = (snapshot.y0 + row) * self.coded_w + snapshot.x0;
             self.recon[start..start + chunk.len()].copy_from_slice(chunk);
         }

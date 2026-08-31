@@ -392,8 +392,9 @@ impl NativeAv1Encoder {
             order_hint,
             self.base_q_idx,
         );
-        frame_payload
-            .extend_from_slice(&FrameEncoder::new(&packed, width, height, self.base_q_idx).encode());
+        frame_payload.extend_from_slice(
+            &FrameEncoder::new(&packed, width, height, self.base_q_idx).encode(),
+        );
         let data = headers::assemble_temporal_unit(&sequence, &frame_payload);
         if u64::try_from(data.len()).unwrap_or(u64::MAX) > self.limits.max_allocation_bytes {
             return Err(Error::new(
