@@ -249,9 +249,16 @@ impl HevcStageInputs {
                     BIT_DEPTH,
                 )
                 .expect("the block lies inside the plane");
-                let combined =
-                    default_weighted_pred(&l0, &l1, true, true, INTER_BLOCK, INTER_BLOCK, BIT_DEPTH)
-                        .expect("both lists are the block's size");
+                let combined = default_weighted_pred(
+                    &l0,
+                    &l1,
+                    true,
+                    true,
+                    INTER_BLOCK,
+                    INTER_BLOCK,
+                    BIT_DEPTH,
+                )
+                .expect("both lists are the block's size");
                 digest.push_all(&combined);
             }
         }
@@ -403,7 +410,7 @@ impl HevcStageInputs {
 /// run covers a frame-scale number of samples rather than a handful of blocks.
 fn build_intra_blocks() -> Vec<(ReferenceSamples, IntraPredParams)> {
     const REPEATS: usize = 24;
-    let mut rng = Lcg::new(0x1_7AB_5EED);
+    let mut rng = Lcg::new(0x17AB_5EED);
     let mut blocks = Vec::new();
     for _ in 0..REPEATS {
         for n_tbs in TX_SIZES {

@@ -293,7 +293,6 @@ fn hevc_decode_by_isa(criterion: &mut Criterion) {
     });
 }
 
-
 /// The prepared per-stage HEVC inputs, built once per process.
 ///
 /// Construction allocates a 1080p luma plane, a full 4:2:0 picture, several
