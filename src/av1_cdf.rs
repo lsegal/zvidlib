@@ -387,10 +387,11 @@ pub fn get_tx_set(tx_size: usize, is_inter: bool, reduced_tx_set: bool) -> Av1Tx
 /// `Tx_Type_Intra_Inv_Set*` / `Tx_Type_Inter_Inv_Set*`): the specification's
 /// name for the transform type, and the kernel this crate implements for it.
 ///
-/// The half-identity `V_*`/`H_*` types (identity along one axis, DCT/ADST
-/// along the other) have no [`Av1TxType`] and no kernel in this crate, so
-/// they carry `None` and are rejected as unsupported when a bitstream
-/// signals them.
+/// Every entry of every set has a kernel here, including the half-identity
+/// `V_*`/`H_*` types (identity along one axis, DCT/ADST along the other), so
+/// the `Option` is always `Some`. It is kept so a transform type added to the
+/// spec's tables ahead of its kernel can be carried as `None` and rejected as
+/// unsupported rather than silently aliased onto another type.
 pub type TxTypeSlot = (&'static str, Option<Av1TxType>);
 
 const IDTX: TxTypeSlot = ("IDTX", Some(Av1TxType::Idtx));
@@ -403,12 +404,12 @@ const DCT_FLIPADST: TxTypeSlot = ("DCT_FLIPADST", Some(Av1TxType::DctFlipadst));
 const FLIPADST_FLIPADST: TxTypeSlot = ("FLIPADST_FLIPADST", Some(Av1TxType::FlipadstFlipadst));
 const ADST_FLIPADST: TxTypeSlot = ("ADST_FLIPADST", Some(Av1TxType::AdstFlipadst));
 const FLIPADST_ADST: TxTypeSlot = ("FLIPADST_ADST", Some(Av1TxType::FlipadstAdst));
-const V_DCT: TxTypeSlot = ("V_DCT", None);
-const H_DCT: TxTypeSlot = ("H_DCT", None);
-const V_ADST: TxTypeSlot = ("V_ADST", None);
-const H_ADST: TxTypeSlot = ("H_ADST", None);
-const V_FLIPADST: TxTypeSlot = ("V_FLIPADST", None);
-const H_FLIPADST: TxTypeSlot = ("H_FLIPADST", None);
+const V_DCT: TxTypeSlot = ("V_DCT", Some(Av1TxType::VDct));
+const H_DCT: TxTypeSlot = ("H_DCT", Some(Av1TxType::HDct));
+const V_ADST: TxTypeSlot = ("V_ADST", Some(Av1TxType::VAdst));
+const H_ADST: TxTypeSlot = ("H_ADST", Some(Av1TxType::HAdst));
+const V_FLIPADST: TxTypeSlot = ("V_FLIPADST", Some(Av1TxType::VFlipadst));
+const H_FLIPADST: TxTypeSlot = ("H_FLIPADST", Some(Av1TxType::HFlipadst));
 
 static TX_TYPE_DCT_ONLY: [TxTypeSlot; 1] = [DCT_DCT];
 
@@ -909,35 +910,38 @@ mod tests {
         assert_ne!(dc, tx_type_cdf(Av1TxSet::Intra2, 16, 0).unwrap());
     }
 
-    /// The `V_*`/`H_*` half-identity types have no kernel in this crate and
-    /// must be reported as absent rather than silently aliased onto another
-    /// transform type.
+    /// Every entry of every set must carry a kernel: a `None` slot is a
+    /// transform type a conforming stream can signal and this decoder would
+    /// reject, and there are none left.
     #[test]
-    fn inverse_sets_mark_the_unimplemented_half_identity_types() {
-        assert_eq!(
-            tx_type_inverse_set(Av1TxSet::Intra1)
+    fn every_inverse_set_entry_has_a_kernel() {
+        use Av1TxSet::{DctOnly, Inter1, Inter2, Inter3, Intra1, Intra2};
+        for set in [DctOnly, Intra1, Intra2, Inter1, Inter2, Inter3] {
+            let missing: Vec<&str> = tx_type_inverse_set(set)
                 .iter()
                 .filter(|(_, kernel)| kernel.is_none())
                 .map(|(name, _)| *name)
-                .collect::<Vec<_>>(),
-            ["V_DCT", "H_DCT"]
-        );
-        assert!(
-            tx_type_inverse_set(Av1TxSet::Intra2)
-                .iter()
-                .all(|(_, kernel)| kernel.is_some())
-        );
-        assert!(
-            tx_type_inverse_set(Av1TxSet::Inter3)
-                .iter()
-                .all(|(_, kernel)| kernel.is_some())
-        );
-        assert_eq!(
-            tx_type_inverse_set(Av1TxSet::Inter1)
-                .iter()
-                .filter(|(_, kernel)| kernel.is_none())
-                .count(),
-            6
-        );
+                .collect();
+            assert!(missing.is_empty(), "{set:?} has no kernel for {missing:?}");
+        }
+    }
+
+    /// No set may name two entries the same kernel: the inverse tables are
+    /// how a decoded symbol index becomes a transform, so an aliased entry
+    /// would silently decode one type as another.
+    #[test]
+    fn no_inverse_set_maps_two_symbols_to_one_kernel() {
+        use Av1TxSet::{DctOnly, Inter1, Inter2, Inter3, Intra1, Intra2};
+        for set in [DctOnly, Intra1, Intra2, Inter1, Inter2, Inter3] {
+            let entries = tx_type_inverse_set(set);
+            for (index, (name, kernel)) in entries.iter().enumerate() {
+                assert!(
+                    !entries[..index]
+                        .iter()
+                        .any(|(_, earlier)| earlier == kernel),
+                    "{set:?} maps {name} onto an earlier entry's kernel"
+                );
+            }
+        }
     }
 }

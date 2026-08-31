@@ -296,11 +296,13 @@ fn inverse_wht_1d(values: [i64; 4], shift: u32) -> [i64; 4] {
 // equivalent up to rounding convention. AV1's 64-point inverse DCT is
 // specified against a *different* 12-bit `cospi_arr(cos_bit)` contract; this
 // crate keeps the single 14-bit lineage there too, extended to the 1/128
-// angular resolution 64 points need (see `COSPI_ODD_128`). The inverse identity
-// transform
-// (`IDTX`) is implemented here as a pure pass-through (no additional
-// row/column scaling), a deliberate simplification of the AV1 spec's
-// scaled identity transform.
+// angular resolution 64 points need (see `COSPI_ODD_128`). The 2-D inverse
+// identity transform (`IDTX`) is implemented here as a pure pass-through (no
+// additional row/column scaling), a deliberate simplification of the AV1
+// spec's scaled identity transform; the one-axis identity of the
+// half-identity `V_*`/`H_*` types does carry the spec's scale (see
+// `identity_scale`), because there it shares a block with a butterfly pass
+// whose gain it has to match.
 #[rustfmt::skip]
 const DC_QLOOKUP: [i32; 256] = [
     4,    8,    8,    9,   10,   11,   12,   12,   13,   14,
@@ -373,14 +375,17 @@ pub fn get_ac_quant(qindex: u8) -> i32 {
     AC_QLOOKUP[qindex as usize]
 }
 
-/// A supported non-lossless transform type (AV1 spec §5.11.47 `TxType`,
-/// restricted to the entries this crate implements: the identity transform
-/// plus every combination of the DCT, ADST, and flipped-ADST kernels).
+/// A non-lossless transform type (AV1 spec §5.11.47 `TxType`).
 ///
-/// The decoders signal these through the full `get_tx_set`/`read_tx_type`
-/// derivation (spec §5.11.47, §5.11.48). The half-identity `V_*`/`H_*`
-/// types the larger sets also contain have no kernel here and are rejected
-/// as unsupported when a bitstream signals them.
+/// Every entry of every transform set the decoders can derive is covered:
+/// the 2-D identity, every combination of the DCT, ADST, and flipped-ADST
+/// kernels, and the half-identity `V_*`/`H_*` types, which run one of those
+/// kernels along one axis and the identity along the other. The decoders
+/// signal these through the full `get_tx_set`/`read_tx_type` derivation
+/// (spec §5.11.47, §5.11.48).
+///
+/// The spec names a type after its vertical kernel first: `V_DCT` is the DCT
+/// vertically and the identity horizontally, `H_DCT` the other way round.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Av1TxType {
     DctDct,
@@ -393,6 +398,12 @@ pub enum Av1TxType {
     FlipadstFlipadst,
     AdstFlipadst,
     FlipadstAdst,
+    VDct,
+    HDct,
+    VAdst,
+    HAdst,
+    VFlipadst,
+    HFlipadst,
 }
 
 /// One of the two separable 1-D kernels an [`Av1TxType`] applies.
@@ -408,6 +419,37 @@ pub enum Tx1d {
     /// Inverse ADST. Defined for 4, 8, and 16 points; a 32- or 64-point block
     /// always uses the DCT.
     Adst,
+    /// The identity, the kernel the half-identity `V_*`/`H_*` types apply
+    /// along their other axis. It carries no butterfly, only the
+    /// [`identity_scale`] gain that keeps it on the same scale as the DCT and
+    /// ADST passes of its size, so a block that is identity along one axis
+    /// reconstructs at the same magnitude as one that is not. Defined at
+    /// every transform size.
+    Identity,
+}
+
+/// `round(2^14 * sqrt(points / 2))`: the gain one identity pass applies, in
+/// the same 14-bit fixed point the butterflies multiply in.
+///
+/// This is AV1's own identity scale (`sqrt(2)` at 4 points through `4` at 32),
+/// and it is what makes the identity interchangeable with a DCT or ADST pass
+/// here: the DCT and ADST kernels of an `N`-point block each carry a gain of
+/// `sqrt(N / 2)` that [`transform_shift`] divides back out over two passes,
+/// so an identity pass has to carry the same gain or a half-identity block
+/// would come out two to four times too small. The 4-point entry is exactly
+/// `2 * COSPI_16_64`, the same `sqrt(2)` the butterflies already use.
+///
+/// The 2-D [`Av1TxType::Idtx`] is unaffected: it keeps its own short path and
+/// stays the unscaled pass-through this crate has always implemented.
+#[must_use]
+pub(crate) const fn identity_scale(points: usize) -> i64 {
+    match points {
+        4 => 23170,
+        8 => 32768,
+        16 => 46341,
+        32 => 65536,
+        _ => 92682,
+    }
 }
 
 /// The block's `YMode` as spec §5.11.48 indexes `Default_Intra_Ext_Tx_Cdf`
@@ -440,10 +482,12 @@ impl Av1TxType {
     /// block is reversed left-to-right and/or top-to-bottom.
     ///
     /// [`Av1TxType::Idtx`] has no butterfly pass at all and reports the DCT
-    /// pair; [`inverse_transform`] handles it before consulting this.
+    /// pair; [`inverse_transform`] handles it before consulting this. The
+    /// half-identity types report [`Tx1d::Identity`] along the axis the spec
+    /// leaves untransformed.
     #[must_use]
     pub fn kernels(self) -> (Tx1d, Tx1d, bool, bool) {
-        use Tx1d::{Adst, Dct};
+        use Tx1d::{Adst, Dct, Identity};
         match self {
             Av1TxType::DctDct | Av1TxType::Idtx => (Dct, Dct, false, false),
             Av1TxType::AdstDct => (Adst, Dct, false, false),
@@ -454,6 +498,12 @@ impl Av1TxType {
             Av1TxType::FlipadstFlipadst => (Adst, Adst, true, true),
             Av1TxType::AdstFlipadst => (Adst, Adst, true, false),
             Av1TxType::FlipadstAdst => (Adst, Adst, false, true),
+            Av1TxType::VDct => (Dct, Identity, false, false),
+            Av1TxType::HDct => (Identity, Dct, false, false),
+            Av1TxType::VAdst => (Adst, Identity, false, false),
+            Av1TxType::HAdst => (Identity, Adst, false, false),
+            Av1TxType::VFlipadst => (Adst, Identity, false, true),
+            Av1TxType::HFlipadst => (Identity, Adst, true, false),
         }
     }
 }
@@ -1444,6 +1494,10 @@ pub(crate) fn inverse_transform_1d(kind: Tx1d, values: &[i64]) -> Vec<i64> {
         (Tx1d::Adst, 4) => inverse_adst4_1d(values.try_into().unwrap()).to_vec(),
         (Tx1d::Adst, 8) => inverse_adst8_1d(values.try_into().unwrap()).to_vec(),
         (Tx1d::Adst, 16) => inverse_adst16_1d(values.try_into().unwrap()).to_vec(),
+        (Tx1d::Identity, points) => values
+            .iter()
+            .map(|&value| dct_round_shift(value * identity_scale(points)))
+            .collect(),
         _ => values.to_vec(),
     }
 }
@@ -1468,9 +1522,10 @@ pub(crate) fn transform_shift(size: usize) -> u32 {
 /// row-major residual samples.
 ///
 /// `size` must be 4, 8, 16, 32, or 64. The ADST kernels are only defined for
-/// 4, 8, and 16 points, so a 32- or 64-point block runs the DCT along both
-/// axes regardless of `tx_type`. An unsupported `size` leaves the dequantized
-/// coefficients untransformed rather than panicking.
+/// 4, 8, and 16 points, so a 32- or 64-point block runs the DCT in place of
+/// any ADST pass `tx_type` names; the identity pass of a half-identity type
+/// is defined at every size and is kept. An unsupported `size` leaves the
+/// dequantized coefficients untransformed rather than panicking.
 pub fn inverse_transform(
     coefficients: &[i32],
     size: usize,
@@ -1496,8 +1551,14 @@ pub fn inverse_transform(
 
     let (mut column, mut row, lr_flip, ud_flip) = tx_type.kernels();
     if size >= 32 {
-        column = Tx1d::Dct;
-        row = Tx1d::Dct;
+        // No 32- or 64-point ADST exists; the identity is defined at every
+        // size, so only the ADST passes fall back to the DCT.
+        if column == Tx1d::Adst {
+            column = Tx1d::Dct;
+        }
+        if row == Tx1d::Adst {
+            row = Tx1d::Dct;
+        }
     }
 
     // The vectorized kernels work in 32-bit lanes and decline blocks whose
