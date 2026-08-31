@@ -62,8 +62,9 @@ const READ_SAMPLES: u64 = 1024;
 const SEQUENTIAL_READS: u64 = 32;
 
 /// Requests per iteration of the seek group. Each one re-decodes, so this is
-/// deliberately far smaller than the sequential count.
-const SEEK_READS: u64 = 8;
+/// smaller than the sequential count - but not so small that a single slow
+/// iteration dominates the sample, which at eight reads it did.
+const SEEK_READS: u64 = 16;
 
 /// Where the sequential walk starts, ten seconds into the bundled sample, so
 /// it measures steady-state playback rather than the first-packet case.
@@ -231,7 +232,7 @@ fn aac_reader_seek(criterion: &mut Criterion) {
         }
     };
     let mut group = criterion.benchmark_group("aac_reader_seek");
-    group.sample_size(10);
+    group.sample_size(20);
     report_realtime(id, work, &mut run);
     report_audio_throughput(&mut group, id, work);
     group.bench_function(id, |bencher| bencher.iter(&mut run));
