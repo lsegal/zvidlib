@@ -96,16 +96,11 @@ fn frame_work() -> FrameWork {
 fn av1_decode_frame(criterion: &mut Criterion) {
     let stream = support::synthetic_av1_stream();
     let factory = native_av1_video_decoder_factory();
+    let frames = support::AV1_STREAM_FRAMES as u64;
+    let work = FrameWork::new(frames, stream.width, stream.height);
     let workload = IsaWorkload {
         measurement_time: Duration::from_secs(10),
-        ..IsaWorkload::new(
-            "av1_decode_frame",
-            FrameWork::new(
-                support::AV1_STREAM_FRAMES as u64,
-                stream.width,
-                stream.height,
-            ),
-        )
+        ..IsaWorkload::new("av1_decode_frame", work)
     };
     bench_across_isas(criterion, &workload, || {
         let mut decoder = factory
@@ -169,14 +164,10 @@ fn av1_inverse_transforms(criterion: &mut Criterion) {
             .map(|index| (index as i32 * 37) % 121 - 60)
             .collect();
         let blocks = (WIDTH / size) * (HEIGHT / size);
-        let workload = kernel_workload(
-            name,
-            FrameWork::new(
-                1,
-                (WIDTH / size * size) as u64,
-                (HEIGHT / size * size) as u64,
-            ),
-        );
+        let covered_width = (WIDTH / size * size) as u64;
+        let covered_height = (HEIGHT / size * size) as u64;
+        let work = FrameWork::new(1, covered_width, covered_height);
+        let workload = kernel_workload(name, work);
         bench_across_isas(criterion, &workload, || {
             let mut digest = 0u64;
             for _ in 0..blocks {
@@ -239,10 +230,8 @@ fn av1_deblock_boundary(criterion: &mut Criterion) {
     const PLANES: usize = 64;
 
     let small = support::av1_flat_blocks_plane(SMALL_WIDTH, SMALL_HEIGHT);
-    let workload = kernel_workload(
-        "av1_deblock_boundary",
-        FrameWork::new(PLANES as u64, SMALL_WIDTH as u64, SMALL_HEIGHT as u64),
-    );
+    let work = FrameWork::new(PLANES as u64, SMALL_WIDTH as u64, SMALL_HEIGHT as u64);
+    let workload = kernel_workload("av1_deblock_boundary", work);
     bench_across_isas(criterion, &workload, || {
         let mut out = Vec::with_capacity(PLANES * SMALL_WIDTH * SMALL_HEIGHT);
         for _ in 0..PLANES {
@@ -301,10 +290,8 @@ fn av1_self_guided(criterion: &mut Criterion) {
         eps: [12, 30],
         weight: [40, 24],
     };
-    let workload = kernel_workload(
-        "av1_self_guided",
-        FrameWork::new(1, UNIT as u64, UNIT as u64),
-    );
+    let work = FrameWork::new(1, UNIT as u64, UNIT as u64);
+    let workload = kernel_workload("av1_self_guided", work);
     bench_across_isas(criterion, &workload, || {
         let mut plane = source.clone();
         apply_restoration_unit(&mut plane, &unit, 0, 0, UNIT, UNIT)
@@ -329,37 +316,63 @@ fn mc_blocks() -> (usize, usize) {
     ((WIDTH / MC_BLOCK) - 1, (HEIGHT / MC_BLOCK) - 1)
 }
 
+/// The frame-scale [`FrameWork`] the motion-compensation groups cover.
+fn mc_work() -> FrameWork {
+    let (blocks_x, blocks_y) = mc_blocks();
+    let covered_width = (blocks_x * MC_BLOCK) as u64;
+    let covered_height = (blocks_y * MC_BLOCK) as u64;
+    FrameWork::new(1, covered_width, covered_height)
+}
+
+/// The sub-pel phase and filter one block is predicted at.
+///
+/// Deliberately varied per block so the sweep exercises every phase of the
+/// 8-tap filter rather than one lucky one, and never lands on the whole-pel
+/// copy path.
+fn mc_phase(bx: usize, by: usize) -> (usize, usize) {
+    ((bx % 16).max(1), (by % 16).max(1))
+}
+
+/// Predicts one block's pair of compound references.
+///
+/// The two arms deliberately differ in filter and phase: a compound block whose
+/// halves were predicted identically would let the blend read from one warm
+/// buffer twice.
+fn predict_pair(
+    context: &mut McContext,
+    refp: RefPlane<'_>,
+    bx: usize,
+    by: usize,
+    pred0: &mut [i16],
+    pred1: &mut [i16],
+) {
+    // Every buffer here is one `MC_BLOCK`-wide block with no padding, so a
+    // single short local stands in for every width, height and stride argument.
+    let n = MC_BLOCK;
+    let (x, y) = ((bx * n) as i32, (by * n) as i32);
+    let (x1, y1) = (x + 1, y + 1);
+    let (sx, sy) = mc_phase(bx, by);
+    context.predict_compound(refp, x, y, n, n, sx, sy, InterpFilter::Regular, pred0, n);
+    context.predict_compound(refp, x1, y1, n, n, sy, sx, InterpFilter::Smooth, pred1, n);
+}
+
 /// A frame's worth of 8-tap sub-pel single-reference prediction.
 fn av1_mc_single(criterion: &mut Criterion) {
     let plane = support::av1_structured_plane(WIDTH, HEIGHT);
     let (blocks_x, blocks_y) = mc_blocks();
-    let workload = kernel_workload(
-        "av1_mc_single",
-        FrameWork::new(
-            1,
-            (blocks_x * MC_BLOCK) as u64,
-            (blocks_y * MC_BLOCK) as u64,
-        ),
-    );
+    let workload = kernel_workload("av1_mc_single", mc_work());
     bench_across_isas(criterion, &workload, || {
+        let n = MC_BLOCK;
         let mut context = McContext::new();
-        let reference = RefPlane::new(&plane.data, WIDTH, HEIGHT);
-        let mut dst = vec![0u8; blocks_x * blocks_y * MC_BLOCK * MC_BLOCK];
+        let refp = RefPlane::new(&plane.data, WIDTH, HEIGHT);
+        let mut dst = vec![0u8; blocks_x * blocks_y * n * n];
         for by in 0..blocks_y {
             for bx in 0..blocks_x {
-                let offset = (by * blocks_x + bx) * MC_BLOCK * MC_BLOCK;
-                context.predict_single(
-                    reference,
-                    (bx * MC_BLOCK) as i32,
-                    (by * MC_BLOCK) as i32,
-                    MC_BLOCK,
-                    MC_BLOCK,
-                    (bx % 16).max(1),
-                    (by % 16).max(1),
-                    InterpFilter::Regular,
-                    &mut dst[offset..offset + MC_BLOCK * MC_BLOCK],
-                    MC_BLOCK,
-                );
+                let offset = (by * blocks_x + bx) * n * n;
+                let block = &mut dst[offset..offset + n * n];
+                let (x, y) = ((bx * n) as i32, (by * n) as i32);
+                let (sx, sy) = mc_phase(bx, by);
+                context.predict_single(refp, x, y, n, n, sx, sy, InterpFilter::Regular, block, n);
             }
         }
         dst
@@ -371,59 +384,21 @@ fn av1_mc_single(criterion: &mut Criterion) {
 fn av1_mc_compound_average(criterion: &mut Criterion) {
     let plane = support::av1_structured_plane(WIDTH, HEIGHT);
     let (blocks_x, blocks_y) = mc_blocks();
-    let workload = kernel_workload(
-        "av1_mc_compound_average",
-        FrameWork::new(
-            1,
-            (blocks_x * MC_BLOCK) as u64,
-            (blocks_y * MC_BLOCK) as u64,
-        ),
-    );
+    let workload = kernel_workload("av1_mc_compound_average", mc_work());
     bench_across_isas(criterion, &workload, || {
+        let n = MC_BLOCK;
         let level = default_level();
         let mut context = McContext::new();
-        let reference = RefPlane::new(&plane.data, WIDTH, HEIGHT);
-        let mut pred0 = vec![0i16; MC_BLOCK * MC_BLOCK];
-        let mut pred1 = vec![0i16; MC_BLOCK * MC_BLOCK];
-        let mut dst = vec![0u8; blocks_x * blocks_y * MC_BLOCK * MC_BLOCK];
+        let refp = RefPlane::new(&plane.data, WIDTH, HEIGHT);
+        let mut pred0 = vec![0i16; n * n];
+        let mut pred1 = vec![0i16; n * n];
+        let mut dst = vec![0u8; blocks_x * blocks_y * n * n];
         for by in 0..blocks_y {
             for bx in 0..blocks_x {
-                let offset = (by * blocks_x + bx) * MC_BLOCK * MC_BLOCK;
-                context.predict_compound(
-                    reference,
-                    (bx * MC_BLOCK) as i32,
-                    (by * MC_BLOCK) as i32,
-                    MC_BLOCK,
-                    MC_BLOCK,
-                    (bx % 16).max(1),
-                    (by % 16).max(1),
-                    InterpFilter::Regular,
-                    &mut pred0,
-                    MC_BLOCK,
-                );
-                context.predict_compound(
-                    reference,
-                    (bx * MC_BLOCK) as i32 + 1,
-                    (by * MC_BLOCK) as i32 + 1,
-                    MC_BLOCK,
-                    MC_BLOCK,
-                    (by % 16).max(1),
-                    (bx % 16).max(1),
-                    InterpFilter::Smooth,
-                    &mut pred1,
-                    MC_BLOCK,
-                );
-                blend_average(
-                    level,
-                    &pred0,
-                    MC_BLOCK,
-                    &pred1,
-                    MC_BLOCK,
-                    MC_BLOCK,
-                    MC_BLOCK,
-                    &mut dst[offset..offset + MC_BLOCK * MC_BLOCK],
-                    MC_BLOCK,
-                );
+                let offset = (by * blocks_x + bx) * n * n;
+                let block = &mut dst[offset..offset + n * n];
+                predict_pair(&mut context, refp, bx, by, &mut pred0, &mut pred1);
+                blend_average(level, &pred0, n, &pred1, n, n, n, block, n);
             }
         }
         dst
@@ -432,70 +407,28 @@ fn av1_mc_compound_average(criterion: &mut Criterion) {
 
 /// The masked compound blend, over a difference mask built from the same two
 /// predictions. Separated from the average blend because it is a different
-/// kernel with a per-sample mask read.
+/// kernel with a per-sample mask read, and because building the mask is itself
+/// part of what a difference-weighted compound block costs.
 fn av1_mc_blend_mask(criterion: &mut Criterion) {
     let plane = support::av1_structured_plane(WIDTH, HEIGHT);
     let (blocks_x, blocks_y) = mc_blocks();
-    let workload = kernel_workload(
-        "av1_mc_blend_mask",
-        FrameWork::new(
-            1,
-            (blocks_x * MC_BLOCK) as u64,
-            (blocks_y * MC_BLOCK) as u64,
-        ),
-    );
+    let workload = kernel_workload("av1_mc_blend_mask", mc_work());
     bench_across_isas(criterion, &workload, || {
+        let n = MC_BLOCK;
         let level = default_level();
         let mut context = McContext::new();
-        let reference = RefPlane::new(&plane.data, WIDTH, HEIGHT);
-        let mut pred0 = vec![0i16; MC_BLOCK * MC_BLOCK];
-        let mut pred1 = vec![0i16; MC_BLOCK * MC_BLOCK];
-        let mut mask = vec![0u8; MC_BLOCK * MC_BLOCK];
-        let mut dst = vec![0u8; blocks_x * blocks_y * MC_BLOCK * MC_BLOCK];
+        let refp = RefPlane::new(&plane.data, WIDTH, HEIGHT);
+        let mut pred0 = vec![0i16; n * n];
+        let mut pred1 = vec![0i16; n * n];
+        let mut mask = vec![0u8; n * n];
+        let mut dst = vec![0u8; blocks_x * blocks_y * n * n];
         for by in 0..blocks_y {
             for bx in 0..blocks_x {
-                let offset = (by * blocks_x + bx) * MC_BLOCK * MC_BLOCK;
-                context.predict_compound(
-                    reference,
-                    (bx * MC_BLOCK) as i32,
-                    (by * MC_BLOCK) as i32,
-                    MC_BLOCK,
-                    MC_BLOCK,
-                    (bx % 16).max(1),
-                    (by % 16).max(1),
-                    InterpFilter::Regular,
-                    &mut pred0,
-                    MC_BLOCK,
-                );
-                context.predict_compound(
-                    reference,
-                    (bx * MC_BLOCK) as i32 + 1,
-                    (by * MC_BLOCK) as i32 + 1,
-                    MC_BLOCK,
-                    MC_BLOCK,
-                    (by % 16).max(1),
-                    (bx % 16).max(1),
-                    InterpFilter::Smooth,
-                    &mut pred1,
-                    MC_BLOCK,
-                );
-                build_difference_mask(
-                    &pred0, MC_BLOCK, &pred1, MC_BLOCK, MC_BLOCK, MC_BLOCK, false, &mut mask,
-                    MC_BLOCK,
-                );
-                blend_mask(
-                    level,
-                    &pred0,
-                    MC_BLOCK,
-                    &pred1,
-                    MC_BLOCK,
-                    &mask,
-                    MC_BLOCK,
-                    MC_BLOCK,
-                    MC_BLOCK,
-                    &mut dst[offset..offset + MC_BLOCK * MC_BLOCK],
-                    MC_BLOCK,
-                );
+                let offset = (by * blocks_x + bx) * n * n;
+                let block = &mut dst[offset..offset + n * n];
+                predict_pair(&mut context, refp, bx, by, &mut pred0, &mut pred1);
+                build_difference_mask(&pred0, n, &pred1, n, n, n, false, &mut mask, n);
+                blend_mask(level, &pred0, n, &pred1, n, &mask, n, n, n, block, n);
             }
         }
         dst
@@ -641,12 +574,10 @@ fn av1_entropy_symbol(criterion: &mut Criterion) {
 
     // Symbols, not pixels: this stage's rate is symbols per second, so the
     // harness's megapixel line reads as millions of symbols per second.
+    let work = FrameWork::new(1, ENTROPY_SYMBOLS as u64, 1);
     let workload = IsaWorkload {
         sample_size: 20,
-        ..kernel_workload(
-            "av1_entropy_symbol",
-            FrameWork::new(1, ENTROPY_SYMBOLS as u64, 1),
-        )
+        ..kernel_workload("av1_entropy_symbol", work)
     };
     bench_across_isas(criterion, &workload, || {
         let mut decoder =
