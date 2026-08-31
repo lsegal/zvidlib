@@ -571,7 +571,9 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+// Gated off wasm32: every test here round-trips through the in-tree AV1 decoder, whose factory
+// is itself native-only.
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod nonlossless_tests {
     use super::*;
     use crate::av1_intra::Av1TxType;

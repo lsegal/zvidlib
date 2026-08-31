@@ -140,7 +140,7 @@ impl<'a> FrameEncoder<'a> {
     }
 
     /// [`Self::encode`] plus the `(size, tx_type)` of every transform block it wrote.
-    #[cfg(test)]
+    #[cfg(all(test, not(target_arch = "wasm32")))]
     pub(crate) fn encode_with_trace(mut self) -> (Vec<u8>, Vec<(usize, Av1TxType)>) {
         self.encode_superblocks();
         let emitted = std::mem::take(&mut self.emitted);
