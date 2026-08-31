@@ -2527,24 +2527,43 @@ pub(crate) mod in_loop {
                 }
             };
 
-            // Each round times one scalar and one vector pass of each
-            // filter, and every figure reported below is the *minimum*
+            // Each round times one pass of each filter on every backend the
+            // host offers, and every figure reported below is the *minimum*
             // over the rounds. A single timed pass on a machine that is
             // doing anything else swings by more than 2x — enough to
             // report a real speedup as a regression — so one pass is not
             // a measurement of the kernel at all. The minimum is the round
             // that suffered least interference, which is as close to the
-            // kernel's own cost as wall-clock timing gets. Scalar and
-            // vector alternate inside the round so a burst of interference
-            // cannot land on only one of them.
+            // kernel's own cost as wall-clock timing gets. The backends
+            // alternate inside the round so a burst of interference cannot
+            // land on only one of them.
+            //
+            // Every available instruction set gets its own arm rather than
+            // only the detected one: on an AVX2 host that is the only way to
+            // read the SSE4.1 kernels, and §8.7.2 deblocking deliberately
+            // runs the same 128-bit kernel on both, so the two arms
+            // agreeing is itself the expected result there.
             let rounds = 5;
             let reps = 10;
-            let mut sao = [Duration::MAX; 2];
-            let mut deblock = [Duration::MAX; 2];
+            let isas = crate::simd::available();
+            let mut sao = vec![Duration::MAX; isas.len()];
+            let mut deblock = vec![Duration::MAX; isas.len()];
             let guard = crate::simd::test_lock();
             for _ in 0..rounds {
-                for (slot, force_scalar) in [(0usize, true), (1, false)] {
-                    FORCE_SCALAR.store(force_scalar, Ordering::SeqCst);
+                for (slot, &pinned) in isas.iter().enumerate() {
+                    crate::simd::set_override(Some(pinned));
+                    // A timing arm is only meaningful if the pin reached these
+                    // kernels: on a host whose scalar code auto-vectorizes,
+                    // "the override did not land" and "the vector path is not
+                    // faster here" produce the same numbers.
+                    assert_eq!(
+                        crate::simd::active_by_site()
+                            .into_iter()
+                            .find(|(site, _)| *site == "hevc_prediction_filters")
+                            .map(|(_, isa)| isa),
+                        Some(pinned),
+                        "override did not reach the in-loop filters"
+                    );
                     let t = Instant::now();
                     for _ in 0..reps {
                         std::hint::black_box(sao_pass());
@@ -2557,23 +2576,30 @@ pub(crate) mod in_loop {
                     deblock[slot] = deblock[slot].min(t.elapsed());
                 }
             }
-            FORCE_SCALAR.store(false, Ordering::SeqCst);
+            crate::simd::set_override(None);
             drop(guard);
 
             let ratio =
                 |a: Duration, b: Duration| a.as_secs_f64() / b.as_secs_f64().max(f64::EPSILON);
             println!(
                 "in-loop filter benchmark, {W}x{H} luma, best of {rounds} rounds x {reps} frames, \
-                 isa={}",
+                 detected isa={}",
                 isa()
             );
-            for (name, [scalar, vector]) in [("SAO     ", sao), ("deblock ", deblock)] {
-                println!(
-                    "  {name} scalar {:>9.3?} / vector {:>9.3?}  => {:.2}x",
-                    scalar / reps,
-                    vector / reps,
-                    ratio(scalar, vector)
-                );
+            let scalar_slot = isas
+                .iter()
+                .position(|i| *i == crate::simd::SimdIsa::Scalar)
+                .unwrap_or(0);
+            for (name, times) in [("SAO     ", &sao), ("deblock ", &deblock)] {
+                let baseline = times[scalar_slot];
+                for (isa, &t) in isas.iter().zip(times.iter()) {
+                    println!(
+                        "  {name} {:>7} {:>9.3?}  => {:.2}x",
+                        isa.name(),
+                        t / reps,
+                        ratio(baseline, t)
+                    );
+                }
             }
         }
     }

@@ -1,0 +1,35 @@
+name: x86_64 SIMD benchmark (temporary, issue #188)
+
+on:
+  push:
+    branches: [fix/issue-188-x86-simd-bench]
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    name: HEVC SIMD kernels on x86_64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show CPU
+        run: lscpu; grep -o 'avx2\|sse4_1\|avx512f' /proc/cpuinfo | sort -u
+      - name: Install Rust toolchain
+        run: rustup show
+      - name: Install native audio dependencies
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - name: Build benches
+        run: cargo test --release --features native --lib --no-run
+      - name: Inter-prediction kernels
+        run: |
+          for i in 1 2 3; do
+            echo "=== inter-pred run $i ==="
+            cargo test --release --features native --lib simd_inter_pred_benchmark -- --ignored --nocapture
+          done
+      - name: In-loop filters
+        run: |
+          for i in 1 2 3; do
+            echo "=== in-loop run $i ==="
+            cargo test --release --features native --lib bench_in_loop_filters -- --ignored --nocapture
+          done
