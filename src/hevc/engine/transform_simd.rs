@@ -594,8 +594,18 @@ mod aarch64 {
     use super::DequantParams;
     use core::arch::aarch64::*;
 
-    /// NEON [`super::transform_1d`]: eight `i32` output lanes per tile,
-    /// held in two `vmlaq_s32` register accumulators.
+    /// NEON [`super::transform_1d`]: up to thirty-two `i32` output
+    /// lanes per tile, held in `vmlaq_s32` register accumulators for the
+    /// whole `j` sweep.
+    ///
+    /// The tile is as wide as the remaining output, because the `j` loop
+    /// is re-run once per tile: every extra tile re-reads the whole
+    /// `input`, re-tests each entry against zero, and re-broadcasts it.
+    /// At `nTbS == 32` an 8-lane tile pays that four times over, which
+    /// was enough to put the kernel behind the auto-vectorized scalar
+    /// loop at the largest transform size — the widest tile costs eight
+    /// accumulator registers out of aarch64's thirty-two and scans the
+    /// input once. See `bench_inverse_transform_and_dequant`.
     ///
     /// # Safety
     /// The host must support NEON (guaranteed on aarch64). `basis` must
@@ -612,36 +622,36 @@ mod aarch64 {
             let n = out.len();
             let row_stride = row_step * basis_stride;
             let mut base = 0;
-            while base + 8 <= n {
-                let mut acc0 = vdupq_n_s32(0);
-                let mut acc1 = vdupq_n_s32(0);
-                for (j, &xj) in input.iter().enumerate() {
-                    if xj == 0 {
-                        continue;
+
+            // Widest tile first: 32 lanes, then 16, 8 and 4, then the
+            // sub-vector tail. Block sides are always 4/8/16/32, so in
+            // practice exactly one of these runs once.
+            macro_rules! tile {
+                ($width:literal, $accs:literal) => {
+                    while base + $width <= n {
+                        let mut acc = [vdupq_n_s32(0); $accs];
+                        for (j, &xj) in input.iter().enumerate() {
+                            if xj == 0 {
+                                continue;
+                            }
+                            let row = basis.as_ptr().add(j * row_stride + base);
+                            let s = vdupq_n_s32(xj);
+                            for (k, a) in acc.iter_mut().enumerate() {
+                                *a = vmlaq_s32(*a, vld1q_s32(row.add(k * 4)), s);
+                            }
+                        }
+                        for (k, a) in acc.iter().enumerate() {
+                            vst1q_s32(out.as_mut_ptr().add(base + k * 4), *a);
+                        }
+                        base += $width;
                     }
-                    let row = basis.as_ptr().add(j * row_stride + base);
-                    let s = vdupq_n_s32(xj);
-                    acc0 = vmlaq_s32(acc0, vld1q_s32(row), s);
-                    acc1 = vmlaq_s32(acc1, vld1q_s32(row.add(4)), s);
-                }
-                vst1q_s32(out.as_mut_ptr().add(base), acc0);
-                vst1q_s32(out.as_mut_ptr().add(base + 4), acc1);
-                base += 8;
+                };
             }
-            while base + 4 <= n {
-                let mut acc = vdupq_n_s32(0);
-                for (j, &xj) in input.iter().enumerate() {
-                    if xj != 0 {
-                        acc = vmlaq_s32(
-                            acc,
-                            vld1q_s32(basis.as_ptr().add(j * row_stride + base)),
-                            vdupq_n_s32(xj),
-                        );
-                    }
-                }
-                vst1q_s32(out.as_mut_ptr().add(base), acc);
-                base += 4;
-            }
+            tile!(32, 8);
+            tile!(16, 4);
+            tile!(8, 2);
+            tile!(4, 1);
+
             while base < n {
                 let mut acc = 0i32;
                 for (j, &xj) in input.iter().enumerate() {
