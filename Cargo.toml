@@ -29,6 +29,15 @@ name = "codec"
 path = "benches/codec.rs"
 harness = false
 
+# The AV1 software decoder's own scalar-vs-SIMD suite. It is a separate target
+# because its per-stage groups and its whole-frame decode are slower than the
+# shared fast groups above and deserve to be runnable on their own; it shares
+# `benches/support/` with them.
+[[bench]]
+name = "av1_decode"
+path = "benches/av1_decode.rs"
+harness = false
+
 [features]
 default = []
 # Additive, off by default. The crate's SIMD kernels dispatch at run time rather
