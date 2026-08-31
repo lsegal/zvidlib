@@ -22,6 +22,36 @@
 //! architecturally guaranteed on aarch64. Every other target — and every
 //! input outside a backend's exactness preconditions — falls back to the
 //! scalar path.
+//!
+//! # What the aarch64 kernels measure
+//!
+//! Apple silicon, `--release` (`lto = "fat"`, `codegen-units = 1`), best
+//! of five interleaved rounds against [`Backend::Scalar`], from
+//! `bench_inverse_transform_and_dequant`. Both `transform_1d` columns
+//! are the kernel alone over an L1-resident buffer; "block path" is
+//! [`inverse_transform_with_backend`], which allocates a `Vec` per block
+//! and per intermediate and so compresses every ratio towards 1.00x.
+//!
+//! | `nTbS` | `dequant_block` | `transform_1d` dense | `transform_1d` sparse | block path |
+//! | --- | --- | --- | --- | --- |
+//! | 4 | 1.07x | 2.9-3.1x | 2.9-3.0x | 1.2-1.5x |
+//! | 8 | 1.07x | 6.0x | 1.8-2.0x | 1.4-1.5x |
+//! | 16 | 1.06x | 3.6-3.9x | 2.2x | 1.7-1.8x |
+//! | 32 | 1.04-1.06x | 4.0-4.2x | 3.4x | 2.1-2.2x |
+//!
+//! The "sparse" `transform_1d` column is the one that matters: a column
+//! of a dequantized block is mostly zero and both kernels skip zero
+//! inputs outright, so it does less vector work per call while paying
+//! the same per-call overhead. It is also where the pre-#202 8-lane-tile
+//! kernel failed — 0.86-0.92x at `nTbS == 32`, i.e. slower than the
+//! scalar loop LLVM had already vectorized. See `transform_1d_neon` for
+//! why, and #179 for the same measurement method applied to §8.5.3.3.
+//!
+//! `dequant_block`'s ~1.06x is near parity and stays that way: equation
+//! 8-309 is a widening multiply, an add, a shift and a clamp per
+//! coefficient, with no reduction or shuffle for a hand kernel to
+//! express that the auto-vectorizer cannot. It is kept because it is at
+//! or above parity at every size, not because it is a win.
 
 use core::sync::atomic::{AtomicU8, Ordering};
 
