@@ -345,7 +345,8 @@ mod tests {
     }
 
     /// Every 1-D kernel this module defines, paired with the sizes it covers.
-    const KERNELS: [(Tx1d, &[usize]); 2] = [(Tx1d::Dct, &[4, 8, 16, 32]), (Tx1d::Adst, &[4, 8, 16])];
+    const KERNELS: [(Tx1d, &[usize]); 2] =
+        [(Tx1d::Dct, &[4, 8, 16, 32]), (Tx1d::Adst, &[4, 8, 16])];
 
     /// The forward basis must be the transpose of the inverse kernels', or
     /// "forward/inverse round trip" means nothing. Feeding the inverse kernel
@@ -406,9 +407,9 @@ mod tests {
                                 (2.0 * 2f64.sqrt() / 3.0)
                                     * (PI * (2.0 * k64 + 1.0) * (n64 + 1.0) / 9.0).sin()
                             }
-                            (Tx1d::Adst, _) => (PI * (2.0 * k64 + 1.0) * (2.0 * n64 + 1.0)
-                                / (4.0 * points))
-                                .sin(),
+                            (Tx1d::Adst, _) => {
+                                (PI * (2.0 * k64 + 1.0) * (2.0 * n64 + 1.0) / (4.0 * points)).sin()
+                            }
                         };
                         let expected = (exact * 16384.0).round() as i32;
                         assert!(
@@ -465,8 +466,7 @@ mod tests {
             for &size in sizes {
                 let mut worst = 0i32;
                 for _ in 0..40 {
-                    let residual: Vec<i32> =
-                        (0..size * size).map(|_| rng.in_range(255)).collect();
+                    let residual: Vec<i32> = (0..size * size).map(|_| rng.in_range(255)).collect();
                     let coefficients = forward_transform(&residual, size, tx_type);
                     let reconstructed = inverse_transform(&coefficients, size, tx_type, 1, 1);
                     for (&want, &got) in residual.iter().zip(reconstructed.iter()) {
