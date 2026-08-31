@@ -91,9 +91,10 @@ fn report_absent_stages(_: &mut Criterion) {
          # no quantization, and no encoder-side reconstruction or in-loop filtering to measure.\n\
          # The stages benchmarked below are mode search/RDO, CABAC + bitwriting, whole-picture\n\
          # PCM access-unit writing, and the RGBA8->YUV420 input conversion.\n\
-         # hevc_encode: hevc_rdcost is the encoder's only SIMD dispatch family, so only the\n\
-         # mode-search groups can show an instruction-set delta; the others are expected to be\n\
-         # flat across arms, which is the measured result, not a broken bench."
+         # hevc_encode: hevc_rdcost and hevc_colorconv are the encoder's only SIMD dispatch\n\
+         # families, so only the mode-search and RGBA8->YUV420 groups can show an\n\
+         # instruction-set delta; CABAC, the bitwriter and PCM access-unit writing are\n\
+         # expected to be flat across arms, which is the measured result, not a broken bench."
     );
 }
 
