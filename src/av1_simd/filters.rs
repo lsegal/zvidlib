@@ -186,6 +186,11 @@ const WIDE_TAPS: usize = 14;
 /// Samples the widest filter writes: offsets `-6..=5`, which is a superset of
 /// what the 8-tap (`-3..=2`) and narrow (`-2..=1`) filters write.
 const WIDE_OUTPUTS: usize = 12;
+/// Samples chroma's 6-tap filter (§7.14.6.3 `filter6`) reads: `p2..q2`, offsets
+/// `-3..=2` around the edge.
+const SIX_TAPS: usize = 6;
+/// Index of the sample at offset `0` (`q0`) within a [`SIX_TAPS`] window.
+const SIX_EDGE: usize = 3;
 /// Tap index of the sample at offset `0` (`q0`).
 const EDGE: usize = 7;
 /// Threshold (8-bit sample domain) used by the flatness checks that gate the
@@ -348,6 +353,48 @@ unsafe fn wide_filter_output<V: I32x>(taps: &[V], weights: &[i32], shift: i32) -
     }
 }
 
+/// Applies the narrow (4-tap) filter and chroma's 6-tap filter (§7.14.6.3
+/// `filter6`) to `V::LANES` edge positions, returning the new
+/// `(p1, p0, q0, q1)` alongside the shared boundary mask.
+///
+/// `window` holds `p2..q2` — every sample either filter reads — and `sizes`
+/// each position's §7.14.5 filter length. Lanes whose gates fail come back as
+/// their original samples, so the caller can store the window unconditionally.
+#[inline(always)]
+unsafe fn narrow_and_six_lanes<V: I32x>(
+    window: &[V; SIX_TAPS],
+    sizes: V,
+    limit: i32,
+    blimit: i32,
+    thresh: i32,
+) -> ([V; 4], V) {
+    unsafe {
+        let (p2, p1, p0) = (window[0], window[1], window[2]);
+        let (q0, q1, q2) = (window[3], window[4], window[5]);
+
+        let (dp, dq) = edge_deltas(p1, p0, q0, q1);
+        let mask = filter_mask_lanes(dp, dq, p1, p0, q0, q1, limit, blimit);
+        let mut out = narrow_filter_lanes(mask, dp, dq, p1, p0, q0, q1, thresh);
+
+        // The 6-tap filter writes the same four samples the narrow filter
+        // does, so it selects over them. Its gates stop at p2/q2, which the
+        // shared masks express by standing p2/q2 in for the p3/q3 taps,
+        // exactly as the scalar path does.
+        let is6 = sizes.gt(V::splat(7)).andnot(sizes.gt(V::splat(5)));
+        let wide6 = mask
+            .and(is6)
+            .and(filter_mask_wide_lanes(p2, p2, p1, q1, q2, q2, limit))
+            .and(flat_mask_lanes(p0, p1, p2, p2, q0, q1, q2, q2));
+        if wide6.any() {
+            for (weights, slot) in WIDE_FILTER6_WEIGHTS.iter().zip(out.iter_mut()) {
+                let filtered = wide_filter_output(&window[..], weights, WIDE_FILTER6_SHIFT);
+                *slot = V::select(wide6, filtered, *slot);
+            }
+        }
+        (out, mask)
+    }
+}
+
 /// Applies spec §7.14.6's filter cascade to `V::LANES` edge positions at once.
 ///
 /// `taps[k]` holds the samples at offset `k - 7` from the edge (so `taps[6]`
@@ -380,29 +427,14 @@ unsafe fn deblock_filter_lanes<V: I32x>(
             *slot = taps[index + 1];
         }
 
-        let (dp, dq) = edge_deltas(p1, p0, q0, q1);
-        let mask = filter_mask_lanes(dp, dq, p1, p0, q0, q1, limit, blimit);
-        let narrow = narrow_filter_lanes(mask, dp, dq, p1, p0, q0, q1, thresh);
+        // The narrow and 6-tap filters share this window and write the same
+        // four samples. A 6 never appears alongside an 8 or a 14 (one is
+        // chroma, the others luma), so the wide cascade below cannot overwrite
+        // a 6-tap result — chunks that only need this much are filtered by the
+        // 6-tap chunk paths instead, without loading the wide window at all.
+        let window = [p2, p1, p0, q0, q1, q2];
+        let (narrow, mask) = narrow_and_six_lanes(&window, sizes, limit, blimit, thresh);
         out[4..8].copy_from_slice(&narrow);
-
-        // Chroma's 6-tap filter (§7.14.6.3 `filter6`) writes the same four
-        // samples the narrow filter does, so it selects over them. Its gates
-        // stop at p2/q2, which the shared masks express by standing p2/q2 in
-        // for the p3/q3 taps, exactly as the scalar path does. A 6 never
-        // appears alongside an 8 or a 14 (one is chroma, the others luma), so
-        // the wide cascade below cannot overwrite it.
-        let is6 = sizes.gt(V::splat(7)).andnot(sizes.gt(V::splat(5)));
-        let wide6 = mask
-            .and(is6)
-            .and(filter_mask_wide_lanes(p2, p2, p1, q1, q2, q2, limit))
-            .and(flat_mask_lanes(p0, p1, p2, p2, q0, q1, q2, q2));
-        if wide6.any() {
-            let window = &taps[EDGE - 3..EDGE + 3];
-            for (weights, slot) in WIDE_FILTER6_WEIGHTS.iter().zip(out[4..8].iter_mut()) {
-                let filtered = wide_filter_output(window, weights, WIDE_FILTER6_SHIFT);
-                *slot = V::select(wide6, filtered, *slot);
-            }
-        }
 
         // Both wide filters need the boundary mask, a filter length that
         // reaches that far, and their flatness gate; the 14-tap filter is a
@@ -467,8 +499,9 @@ unsafe fn store_edge_row<V: I32x>(
     }
 }
 
-/// The per-lane filter lengths of the `count` positions at `offset`, and
-/// whether any of them exceeds the narrow filter.
+/// The per-lane filter lengths of the `count` positions at `offset`, and the
+/// longest of them, which selects the chunk's path: 4 needs only the narrow
+/// window, 6 only chroma's `p2..q2`, and 8 or 14 the full wide window.
 ///
 /// `sizes` is either empty (no transform-size metadata, so every edge is
 /// narrow) or padded to a whole number of vectors so a chunk always loads.
@@ -476,13 +509,17 @@ unsafe fn store_edge_row<V: I32x>(
 /// # Safety
 /// `V`'s instruction set must be available.
 #[inline(always)]
-unsafe fn chunk_sizes<V: I32x>(sizes: &[i32], offset: usize, count: usize) -> (V, bool) {
+unsafe fn chunk_sizes<V: I32x>(sizes: &[i32], offset: usize, count: usize) -> (V, i32) {
     unsafe {
         if sizes.is_empty() {
-            return (V::splat(4), false);
+            return (V::splat(4), 4);
         }
-        let wide = sizes[offset..offset + count].iter().any(|&size| size > 4);
-        (V::load(&sizes[offset..]), wide)
+        let longest = sizes[offset..offset + count]
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(4);
+        (V::load(&sizes[offset..]), longest)
     }
 }
 
@@ -614,6 +651,75 @@ unsafe fn narrow_chunk_vertical<V: I32x>(
     }
 }
 
+/// Filters one chunk of a horizontal edge whose longest filter is chroma's
+/// 6-tap one. `filter6` reads only `p2..q2`, so this loads six rows where the
+/// wide path loads fourteen, and writes back only the four rows either filter
+/// can touch — rows `y - 2 ..= y + 1`, which the caller's edge grid keeps
+/// inside the plane.
+///
+/// # Safety
+/// `V`'s instruction set must be available, `lanes <= V::LANES`,
+/// `x + lanes <= geom.width`, `2 <= y` and `y + 1 < geom.height`.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+unsafe fn six_chunk_horizontal<V: I32x>(
+    data: &mut [u8],
+    geom: Geometry,
+    x: usize,
+    y: usize,
+    lanes: usize,
+    sizes: V,
+    limit: i32,
+    blimit: i32,
+    thresh: i32,
+) {
+    unsafe {
+        let mut window = [V::zero(); SIX_TAPS];
+        for (index, tap) in window.iter_mut().enumerate() {
+            let row = y as isize + index as isize - SIX_EDGE as isize;
+            *tap = load_row::<V>(data, geom, x as isize, row);
+        }
+        let (out, _) = narrow_and_six_lanes(&window, sizes, limit, blimit, thresh);
+        for (index, value) in out.into_iter().enumerate() {
+            let base = (y - 2 + index) * geom.stride + x;
+            value.store_u8_clamped_masked(&mut data[base..], lanes);
+        }
+    }
+}
+
+/// Filters one chunk of a vertical edge whose longest filter is chroma's
+/// 6-tap one, gathering the six columns `x - 3 ..= x + 2` instead of the wide
+/// path's fourteen and scattering back the four columns either filter writes.
+///
+/// # Safety
+/// `V`'s instruction set must be available, `lanes <= V::LANES`,
+/// `y + lanes <= geom.height`, `2 <= x` and `x + 1 < geom.width`.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+unsafe fn six_chunk_vertical<V: I32x>(
+    data: &mut [u8],
+    geom: Geometry,
+    x: usize,
+    y: usize,
+    lanes: usize,
+    sizes: V,
+    limit: i32,
+    blimit: i32,
+    thresh: i32,
+) {
+    unsafe {
+        let mut window = [V::zero(); SIX_TAPS];
+        for (index, tap) in window.iter_mut().enumerate() {
+            let column = x as isize + index as isize - SIX_EDGE as isize;
+            *tap = gather_column::<V>(data, geom, column, y);
+        }
+        let (out, _) = narrow_and_six_lanes(&window, sizes, limit, blimit, thresh);
+        for (index, value) in out.into_iter().enumerate() {
+            scatter_column(value, data, geom, x - 2 + index, y, lanes);
+        }
+    }
+}
+
 /// Filters `count` consecutive positions of the horizontal edge above row `y`,
 /// starting at column `x0`. Each tap lives in its own row, so every load is a
 /// contiguous byte run; rows outside the plane replicate the nearest edge row
@@ -654,8 +760,8 @@ pub(crate) unsafe fn deblock_edge_horizontal<V: I32x>(
         while done < count {
             let x = x0 + done;
             let lanes = V::LANES.min(count - done);
-            let (sizes_lanes, wide) = chunk_sizes::<V>(sizes, done, lanes);
-            if !wide {
+            let (sizes_lanes, longest) = chunk_sizes::<V>(sizes, done, lanes);
+            if longest <= 4 {
                 narrow_chunk_horizontal::<V>(
                     data,
                     geom,
@@ -663,6 +769,21 @@ pub(crate) unsafe fn deblock_edge_horizontal<V: I32x>(
                     x,
                     lanes,
                     lanes == V::LANES,
+                    limit,
+                    blimit,
+                    thresh,
+                );
+                done += lanes;
+                continue;
+            }
+            if longest <= 6 {
+                six_chunk_horizontal::<V>(
+                    data,
+                    geom,
+                    x,
+                    y,
+                    lanes,
+                    sizes_lanes,
                     limit,
                     blimit,
                     thresh,
@@ -713,8 +834,8 @@ pub(crate) unsafe fn deblock_edge_vertical<V: I32x>(
         while done < count {
             let y = y0 + done;
             let lanes = V::LANES.min(count - done);
-            let (sizes_lanes, wide) = chunk_sizes::<V>(sizes, done, lanes);
-            if !wide {
+            let (sizes_lanes, longest) = chunk_sizes::<V>(sizes, done, lanes);
+            if longest <= 4 {
                 narrow_chunk_vertical::<V>(
                     data,
                     geom,
@@ -722,6 +843,21 @@ pub(crate) unsafe fn deblock_edge_vertical<V: I32x>(
                     y,
                     lanes,
                     lanes == V::LANES,
+                    limit,
+                    blimit,
+                    thresh,
+                );
+                done += lanes;
+                continue;
+            }
+            if longest <= 6 {
+                six_chunk_vertical::<V>(
+                    data,
+                    geom,
+                    x,
+                    y,
+                    lanes,
+                    sizes_lanes,
                     limit,
                     blimit,
                     thresh,
