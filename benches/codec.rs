@@ -14,6 +14,7 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 use zvidlib::av1_filters::{FilterFrame, FilterPlane, LoopFilterParams, deblock_frame};
 use zvidlib::av1_mc::{InterpFilter, McContext, RefPlane};
+use zvidlib::hevc_stage_bench::HevcStageInputs;
 use zvidlib::{
     Av1InterDecoder, CancellationToken, ExactFrameReader, FrameDigest, FrameIndex, Limits,
     VideoDecoderFactory, decode_av1_lossless_intra, native_hevc_video_decoder_factory,
@@ -292,6 +293,96 @@ fn hevc_decode_by_isa(criterion: &mut Criterion) {
     });
 }
 
+
+/// The prepared per-stage HEVC inputs, built once per process.
+///
+/// Construction allocates a 1080p luma plane, a full 4:2:0 picture, several
+/// thousand intra reference arrays and coefficient blocks, and the CABAC
+/// buffer. That is setup, not measurement, so it is cached here rather than
+/// repeated per group — and it is deliberately outside every timed loop.
+fn hevc_stage_inputs() -> &'static HevcStageInputs {
+    static INPUTS: std::sync::OnceLock<HevcStageInputs> = std::sync::OnceLock::new();
+    INPUTS.get_or_init(|| HevcStageInputs::new(ISA_WIDTH, ISA_HEIGHT))
+}
+
+/// A per-stage HEVC group: one arm per available instruction set, sized by the
+/// samples that stage actually touches.
+///
+/// The stages are timed separately from the whole-frame group so a regression
+/// can be attributed to a kernel rather than only observed at the frame level,
+/// and so the ratio between a stage's vector speedup and the whole-frame
+/// speedup is readable directly off one report.
+fn hevc_stage_group<F>(criterion: &mut Criterion, name: &str, samples: u64, run: F)
+where
+    F: Fn(&'static HevcStageInputs) -> Vec<u8>,
+{
+    let inputs = hevc_stage_inputs();
+    let workload = IsaWorkload {
+        sample_size: 20,
+        measurement_time: std::time::Duration::from_secs(5),
+        ..IsaWorkload::new(name, FrameWork::new(1, samples, 1))
+    };
+    bench_across_isas(criterion, &workload, || run(inputs));
+}
+
+/// §8.5.3.3 inter prediction: the 8-tap luma interpolation and the weighted
+/// combine, the two `engine::simd` primitives.
+fn hevc_inter_pred_by_isa(criterion: &mut Criterion) {
+    let samples = hevc_stage_inputs().inter_pred_samples();
+    hevc_stage_group(criterion, "hevc_inter_pred", samples, |inputs| {
+        inputs.run_inter_pred()
+    });
+}
+
+/// §8.4.4.2 intra prediction: reference smoothing plus the planar, DC and
+/// angular predictors, over all 35 modes at 4x4 through 32x32.
+fn hevc_intra_pred_by_isa(criterion: &mut Criterion) {
+    let samples = hevc_stage_inputs().intra_pred_samples();
+    hevc_stage_group(criterion, "hevc_intra_pred", samples, |inputs| {
+        inputs.run_intra_pred()
+    });
+}
+
+/// §8.7.2 deblocking: every vertical luma edge segment of a 1080p frame.
+///
+/// The plane alternates textured and flat bands, because the wide filter is
+/// gated on the §8.7.2.5.3 flatness check — a purely textured input would time
+/// only the narrow path and silently under-report the kernel.
+fn hevc_deblock_by_isa(criterion: &mut Criterion) {
+    let samples = hevc_stage_inputs().deblock_samples();
+    hevc_stage_group(criterion, "hevc_deblock", samples, |inputs| {
+        inputs.run_deblock()
+    });
+}
+
+/// §8.7.3 SAO over a full 4:2:0 picture, with both the band and the edge
+/// classifier (all four edge classes) present in the CTB grid.
+fn hevc_sao_by_isa(criterion: &mut Criterion) {
+    let samples = hevc_stage_inputs().sao_samples();
+    hevc_stage_group(criterion, "hevc_sao", samples, |inputs| inputs.run_sao());
+}
+
+/// §8.6 dequantization and the inverse transform at every block size.
+fn hevc_inverse_transform_by_isa(criterion: &mut Criterion) {
+    let samples = hevc_stage_inputs().inverse_transform_samples();
+    hevc_stage_group(criterion, "hevc_inverse_transform", samples, |inputs| {
+        inputs.run_inverse_transform()
+    });
+}
+
+/// §9.3.4 CABAC bin decoding — the serial stage, measured for the ceiling it
+/// puts on everything else.
+///
+/// It has no vector path and is not expected to grow one, so its arms should
+/// come out equal. That is the point: whatever fraction of a whole-frame decode
+/// this stage owns is the fraction no amount of SIMD elsewhere can remove, and
+/// the number is only meaningful next to the other stages in the same report.
+/// The "samples" axis here is bins, so its Mpx/s line reads as megabins/sec.
+fn hevc_cabac_by_isa(criterion: &mut Criterion) {
+    let bins = hevc_stage_inputs().cabac_bins();
+    hevc_stage_group(criterion, "hevc_cabac", bins, |inputs| inputs.run_cabac());
+}
+
 criterion_group!(
     benches,
     smoke,
@@ -300,6 +391,12 @@ criterion_group!(
     hevc_decode_1080p,
     av1_deblock_by_isa,
     av1_motion_compensation_by_isa,
-    hevc_decode_by_isa
+    hevc_decode_by_isa,
+    hevc_inter_pred_by_isa,
+    hevc_intra_pred_by_isa,
+    hevc_deblock_by_isa,
+    hevc_sao_by_isa,
+    hevc_inverse_transform_by_isa,
+    hevc_cabac_by_isa
 );
 criterion_main!(benches);
