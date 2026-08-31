@@ -5,7 +5,8 @@
 //! transforms and in-loop filters ([`crate::av1_simd`]), AV1 inter prediction
 //! ([`crate::av1_mc`]), AV1 intra prediction ([`crate::av1_intra_pred`]), and
 //! the HEVC engine's inter/intra prediction, in-loop filters, inverse
-//! transforms, and encoder-side distortion metrics. Each of those sites caches
+//! transforms, encoder-side distortion metrics, and encoder-side color
+//! conversion. Each of those sites caches
 //! its own CPU feature probe, which is what you want in production but makes
 //! "run this workload with SIMD off" impossible to express from outside the
 //! crate.
@@ -129,7 +130,7 @@ pub fn active_by_site() -> Vec<(&'static str, SimdIsa)> {
     ];
     #[cfg(not(target_arch = "wasm32"))]
     {
-        use crate::hevc::engine::encoder::rdcost;
+        use crate::hevc::engine::encoder::{colorconv, rdcost};
         use crate::hevc::engine::{simd as hevc_simd, transform_simd};
         sites.push((
             "hevc_prediction_filters",
@@ -140,6 +141,7 @@ pub fn active_by_site() -> Vec<(&'static str, SimdIsa)> {
             from_hevc_backend(transform_simd::detected()),
         ));
         sites.push(("hevc_rdcost", from_rdcost_isa(rdcost::isa())));
+        sites.push(("hevc_colorconv", from_colorconv_isa(colorconv::isa())));
     }
     sites
 }
@@ -195,6 +197,20 @@ fn from_hevc_backend(backend: crate::hevc::engine::transform_simd::Backend) -> S
 #[cfg(not(target_arch = "wasm32"))]
 fn from_rdcost_isa(isa: crate::hevc::engine::encoder::rdcost::Isa) -> SimdIsa {
     use crate::hevc::engine::encoder::rdcost::Isa;
+    match isa {
+        Isa::Scalar => SimdIsa::Scalar,
+        #[cfg(target_arch = "x86_64")]
+        Isa::Sse41 => SimdIsa::Sse41,
+        #[cfg(target_arch = "x86_64")]
+        Isa::Avx2 => SimdIsa::Avx2,
+        #[cfg(target_arch = "aarch64")]
+        Isa::Neon => SimdIsa::Neon,
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn from_colorconv_isa(isa: crate::hevc::engine::encoder::colorconv::Isa) -> SimdIsa {
+    use crate::hevc::engine::encoder::colorconv::Isa;
     match isa {
         Isa::Scalar => SimdIsa::Scalar,
         #[cfg(target_arch = "x86_64")]
@@ -287,7 +303,7 @@ mod tests {
     fn pinning_scalar_reaches_every_dispatch_site() {
         use crate::av1_intra_pred::{Av1IntraSimd, av1_intra_simd};
         use crate::av1_mc::{McContext, SimdLevel, default_level};
-        use crate::hevc::engine::encoder::rdcost;
+        use crate::hevc::engine::encoder::{colorconv, rdcost};
         use crate::hevc::engine::{simd as hevc_simd, transform_simd};
 
         let _guard = lock();
@@ -307,6 +323,8 @@ mod tests {
         assert_eq!(transform_simd::detected(), transform_simd::Backend::Scalar);
         // HEVC encoder-side distortion metrics.
         assert_eq!(rdcost::isa(), rdcost::Isa::Scalar);
+        // HEVC encoder-side RGBA8 to YUV420 input conversion.
+        assert_eq!(colorconv::isa(), colorconv::Isa::Scalar);
 
         set_override(None);
     }

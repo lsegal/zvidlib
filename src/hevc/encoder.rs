@@ -209,49 +209,40 @@ fn encode_with_rdo_backend(
 fn blank_planes(w: usize, h: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     (vec![16; w * h], vec![128; w * h / 4], vec![128; w * h / 4])
 }
+/// Converts an interleaved RGBA8 frame to planar 8-bit YUV 4:2:0.
+///
+/// The per-row arithmetic runs through [`super::engine::encoder::colorconv`], which
+/// dispatches it to a vector kernel where the host has one; `orientation` only decides which
+/// source row a destination row reads, so a bottom-up frame is vectorized exactly like a
+/// top-down one.
 pub(super) fn rgba_to_yuv420(
     frame: &crate::VideoFrame,
     orientation: crate::Orientation,
 ) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+    use super::engine::encoder::colorconv;
     let w = frame.dimensions.width as usize;
     let h = frame.dimensions.height as usize;
     let p = &frame.planes[0];
-    let px = |x: usize, y: usize| {
+    let row = |y: usize| {
         let y = match orientation {
             crate::Orientation::TopLeft => y,
             crate::Orientation::BottomLeft => h - 1 - y,
         };
-        let at = y * p.stride + x * 4;
-        (
-            p.data[at] as i32,
-            p.data[at + 1] as i32,
-            p.data[at + 2] as i32,
-        )
+        &p.data[y * p.stride..][..w * 4]
     };
     let mut y = vec![0; w * h];
     let mut cb = vec![0; w * h / 4];
     let mut cr = vec![0; w * h / 4];
-    for py in 0..h {
-        for x in 0..w {
-            let (r, g, b) = px(x, py);
-            y[py * w + x] = (((66 * r + 129 * g + 25 * b + 128) >> 8) + 16).clamp(16, 235) as u8;
-        }
+    for (py, out) in y.chunks_exact_mut(w).enumerate() {
+        colorconv::luma_row(row(py), out);
     }
-    for py in (0..h).step_by(2) {
-        for x in (0..w).step_by(2) {
-            let (mut r, mut g, mut b) = (0, 0, 0);
-            for dy in 0..2 {
-                for dx in 0..2 {
-                    let q = px(x + dx, py + dy);
-                    r += q.0;
-                    g += q.1;
-                    b += q.2;
-                }
-            }
-            let at = (py / 2) * (w / 2) + x / 2;
-            cb[at] = ((-38 * r - 74 * g + 112 * b + 131_584) >> 10).clamp(16, 240) as u8;
-            cr[at] = ((112 * r - 94 * g - 18 * b + 131_584) >> 10).clamp(16, 240) as u8;
-        }
+    let chroma_w = w / 2;
+    for (cy, (u, v)) in cb
+        .chunks_exact_mut(chroma_w)
+        .zip(cr.chunks_exact_mut(chroma_w))
+        .enumerate()
+    {
+        colorconv::chroma_row_pair(row(cy * 2), row(cy * 2 + 1), u, v);
     }
     Ok((y, cb, cr))
 }
