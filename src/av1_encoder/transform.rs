@@ -337,7 +337,7 @@ pub fn forward_transform(residual: &[i32], size: usize, tx_type: Av1TxType) -> V
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::av1_intra::{inverse_transform, inverse_transform_1d};
+    use crate::av1_intra::{dq_denom, inverse_transform, inverse_transform_1d};
 
     /// Small deterministic LCG, matching the style used elsewhere in the crate.
     struct Lcg(u64);
@@ -485,7 +485,7 @@ mod tests {
                 for _ in 0..40 {
                     let residual: Vec<i32> = (0..size * size).map(|_| rng.in_range(255)).collect();
                     let coefficients = forward_transform(&residual, size, tx_type);
-                    let reconstructed = inverse_transform(&coefficients, size, tx_type, 1, 1);
+                    let reconstructed = inverse_transform(&coefficients, size, tx_type, dq_denom(size), dq_denom(size));
                     for (&want, &got) in residual.iter().zip(reconstructed.iter()) {
                         worst = worst.max((want - i32::from(got)).abs());
                     }
@@ -532,7 +532,7 @@ mod tests {
                         })
                         .collect();
                     let coefficients = forward_transform(&residual, size, tx_type);
-                    let reconstructed = inverse_transform(&coefficients, size, tx_type, 1, 1);
+                    let reconstructed = inverse_transform(&coefficients, size, tx_type, dq_denom(size), dq_denom(size));
                     for (&want, &got) in residual.iter().zip(reconstructed.iter()) {
                         assert!(
                             (want - i32::from(got)).abs() <= ROUND_TRIP_TOLERANCE,
@@ -544,18 +544,66 @@ mod tests {
         }
     }
 
-    /// `IDTX` has no butterfly pass and no scaling in either direction, so its
-    /// round trip is exact rather than merely close.
+    /// `IDTX` is the scaled identity pass of spec §7.13.3 along *both* axes,
+    /// not a pass-through: each pass carries the same `sqrt(N / 2)` gain the
+    /// butterflies do, so the forward output is a fixed multiple of the
+    /// residual rather than the residual itself, and only the round trip
+    /// comes back to where it started.
+    ///
+    /// An encoder that skipped the scale would agree with a decoder that
+    /// skipped it too and disagree with every other decoder, which is exactly
+    /// how ffmpeg reconstructed noise from this crate's `IDTX` blocks.
     #[test]
-    fn identity_transform_round_trips_exactly() {
+    fn identity_transform_carries_the_specifications_scale() {
         let mut rng = Lcg(0x5eed_0140_0000_0002);
         for size in [4usize, 8, 16, 32] {
             let residual: Vec<i32> = (0..size * size).map(|_| rng.in_range(255)).collect();
             let coefficients = forward_transform(&residual, size, Av1TxType::Idtx);
-            assert_eq!(coefficients, residual);
-            let reconstructed = inverse_transform(&coefficients, size, Av1TxType::Idtx, 1, 1);
-            let reconstructed: Vec<i32> = reconstructed.into_iter().map(i32::from).collect();
-            assert_eq!(reconstructed, residual);
+            // Both passes are the scaled identity, so the coefficients must be
+            // exactly what running `forward_1d(Identity)` over the rows and
+            // then the columns produces - never the residual itself.
+            assert_ne!(
+                coefficients, residual,
+                "{size}x{size} IDTX is an unscaled pass-through"
+            );
+            let mut staged = vec![0i64; size * size];
+            let mut scratch = vec![0i64; size];
+            let mid = mid_shift(size);
+            for r in 0..size {
+                let source: Vec<i64> = (0..size)
+                    .map(|c| i64::from(residual[r * size + c]) << pre_shift(size))
+                    .collect();
+                forward_1d(Tx1d::Identity, &source, &mut scratch);
+                for c in 0..size {
+                    staged[r * size + c] = (scratch[c] + ((1 << mid) >> 1)) >> mid;
+                }
+            }
+            for c in 0..size {
+                let source: Vec<i64> = (0..size).map(|r| staged[r * size + c]).collect();
+                forward_1d(Tx1d::Identity, &source, &mut scratch);
+                for (r, &want) in scratch.iter().enumerate() {
+                    assert_eq!(
+                        i64::from(coefficients[r * size + c]),
+                        want,
+                        "{size}x{size} IDTX at ({r}, {c})"
+                    );
+                }
+            }
+            let reconstructed = inverse_transform(
+                &coefficients,
+                size,
+                Av1TxType::Idtx,
+                dq_denom(size),
+                dq_denom(size),
+            );
+            let mut worst = 0i32;
+            for (&want, &got) in residual.iter().zip(reconstructed.iter()) {
+                worst = worst.max((want - i32::from(got)).abs());
+            }
+            assert!(
+                worst <= ROUND_TRIP_TOLERANCE,
+                "{size}x{size} IDTX round trip is off by {worst}"
+            );
         }
     }
 
@@ -603,3 +651,4 @@ mod tests {
         }
     }
 }
+

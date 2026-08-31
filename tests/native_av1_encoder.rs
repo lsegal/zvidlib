@@ -376,16 +376,14 @@ fn non_lossless_output_reconstructs_through_independent_ffmpeg() {
                 ("edges", edges_pattern(width, height)),
             ] {
                 let psnr = nonlossless_ffmpeg_psnr(width, height, base_q_idx, &pixels)
-                    .unwrap_or_else(|_error| { -1.0 });
-                let _ = |error: Error| -> f64 {
+                    .unwrap_or_else(|error| {
                         panic!(
                             "ffmpeg could not decode {width}x{height} {name} at \
                              base_q_idx {base_q_idx}: {error}"
                         )
-                    };
-                eprintln!("MATRIX {width}x{height} {name} q={base_q_idx}: {psnr:.2} dB");
+                    });
                 assert!(
-                    true || psnr >= PSNR_FLOOR,
+                    psnr >= PSNR_FLOOR,
                     "{width}x{height} {name} at base_q_idx {base_q_idx} reconstructed at \
                      {psnr:.2} dB, below the {PSNR_FLOOR} dB floor"
                 );
@@ -441,7 +439,7 @@ fn native_av1_passes_the_shared_encoder_conformance_runner() {
             codec: Codec::Av1,
             profile: CodecProfile::Av1Main,
             coded_dimensions: dimensions,
-            output_format: PixelFormat::Rgba8,
+            output_format: PixelFormat::Gray8,
             color_range: ColorRange::Full,
             hardware: HardwarePreference::Avoid,
             configuration: Vec::new(),
@@ -567,19 +565,6 @@ fn native_av1_round_trips_through_the_native_decoder() {
                     [luma, luma, luma, 255],
                     "frame {index} pixel ({x}, {y}) did not round-trip losslessly"
                 );
-            }
-        }
-    }
-}
-#[test]
-fn sweep_diagnostic() {
-    if !ffmpeg_available() { return; }
-    for (w, h) in [(48u32,48u32),(64,64),(128,128)] {
-        for q in [32u8, 80, 128, 200] {
-            let px = gradient_pattern(w, h);
-            match nonlossless_ffmpeg_psnr(w, h, q, &px) {
-                Ok(v) => eprintln!("SWEEP {w}x{h} q={q}: {v:.2}"),
-                Err(e) => eprintln!("SWEEP {w}x{h} q={q}: ERR {e}"),
             }
         }
     }

@@ -598,11 +598,11 @@ mod tests {
 
     #[test]
     fn tx_depth_cdf_symbol_counts_match_the_spec_depth_cap() {
-        assert_eq!(tx_depth_cdf(8).0.len(), 2);
-        assert_eq!(tx_depth_cdf(8).1, 1);
+        assert_eq!(tx_depth_cdf(8, 0).0.len(), 2);
+        assert_eq!(tx_depth_cdf(8, 0).1, 1);
         for width in [16usize, 32, 64] {
-            assert_eq!(tx_depth_cdf(width).0.len(), 3);
-            assert_eq!(tx_depth_cdf(width).1, 2);
+            assert_eq!(tx_depth_cdf(width, 0).0.len(), 3);
+            assert_eq!(tx_depth_cdf(width, 0).1, 2);
         }
     }
 
@@ -1042,7 +1042,7 @@ mod tests {
             }
         }
         for width in [8usize, 16, 32, 64] {
-            check(tx_depth_cdf(width).0, "tx_depth");
+            check(tx_depth_cdf(width, 0).0, "tx_depth");
         }
         assert!(checked > 2000, "expected the full tables to be walked");
     }
@@ -1051,9 +1051,9 @@ mod tests {
     /// coding-block size, and only the 8x8 category codes a single bit.
     #[test]
     fn tx_depth_cdfs_are_selected_per_block_size() {
-        assert_eq!(tx_depth_cdf(8), (&[19968u16, 32768][..], 1));
-        assert_eq!(tx_depth_cdf(16), (&[12272u16, 30172, 32768][..], 2));
-        assert_eq!(tx_depth_cdf(32), (&[12986u16, 15180, 32768][..], 2));
-        assert_eq!(tx_depth_cdf(64), (&[5782u16, 11475, 32768][..], 2));
+        assert_eq!(tx_depth_cdf(8, 0), (&[19968u16, 32768][..], 1));
+        assert_eq!(tx_depth_cdf(16, 0), (&[12272u16, 30172, 32768][..], 2));
+        assert_eq!(tx_depth_cdf(32, 0), (&[12986u16, 15180, 32768][..], 2));
+        assert_eq!(tx_depth_cdf(64, 0), (&[5782u16, 11475, 32768][..], 2));
     }
 }

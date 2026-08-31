@@ -1787,14 +1787,24 @@ mod tests {
         }
     }
 
+    /// Spec §7.13.3 runs the *scaled* identity pass along each axis for
+    /// `IDTX`, exactly as it does for a half-identity type; the block is then
+    /// downshifted by [`transform_shift`] like every other transform. This
+    /// crate used to return the dequantized coefficients unchanged, which
+    /// agrees with a decoder that makes the same mistake and with no other:
+    /// ffmpeg reconstructed noise from every `IDTX` block this encoder wrote.
+    ///
+    /// A dequantized 20 therefore becomes 3, not 20: two `identity_scale(4)`
+    /// passes multiply by `sqrt(2)` each and `transform_shift(4)` divides by
+    /// 16. The position is still the identity's - only the scale changed.
     #[test]
-    fn idtx_dequantizes_without_extra_scaling() {
+    fn idtx_carries_the_identity_scale_on_both_axes() {
         let mut coefficients = [0; 16];
         coefficients[0] = 5;
         coefficients[1] = -3;
         let residuals = inverse_transform(&coefficients, 4, Av1TxType::Idtx, 4, 4);
-        assert_eq!(residuals[0], 20);
-        assert_eq!(residuals[1], -12);
+        assert_eq!(residuals[0], 3);
+        assert_eq!(residuals[1], -1);
         assert_eq!(residuals[2..], [0; 14]);
     }
 

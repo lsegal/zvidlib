@@ -790,7 +790,7 @@ impl<'a> LosslessTileDecoder<'a> {
         y4: usize,
         block_width: usize,
     ) -> Result<[i32; 16]> {
-        let (coefficients, _tx_type) =
+        let (coefficients, _skipped, _tx_type) =
             self.decode_coefficient_levels(x4, y4, block_width, 4, &cdf::DEFAULT_SCAN_4X4, None)?;
         let mut levels = [0i32; 16];
         levels.copy_from_slice(&coefficients);
@@ -836,7 +836,7 @@ impl<'a> LosslessTileDecoder<'a> {
         // only signalled for a transform block that actually has nonzero coefficients; a fully
         // skipped block is implicitly DCT_DCT, and its value is irrelevant anyway because the
         // inverse transform of an all-zero input is zero for every type.
-        let (coefficients, tx_type) =
+        let (coefficients, _skipped, tx_type) =
             self.decode_coefficient_levels(x4, y4, block_width, tx_width, &scan, Some(mode))?;
         Ok((coefficients, tx_type.unwrap_or(Av1TxType::DctDct)))
     }
@@ -850,7 +850,7 @@ impl<'a> LosslessTileDecoder<'a> {
         size: usize,
         scan: &[usize],
         tx_type_mode: Option<Av1IntraMode>,
-    ) -> Result<(Vec<i32>, Option<Av1TxType>)> {
+    ) -> Result<(Vec<i32>, bool, Option<Av1TxType>)> {
         let plane_type = 0;
         // The specification selects every coefficient CDF below by a
         // quantizer context derived from `base_q_idx` and (except for
@@ -873,7 +873,7 @@ impl<'a> LosslessTileDecoder<'a> {
             == 1
         {
             self.set_coefficient_context(x4, y4, units, 0, 0);
-            return Ok((vec![0; count], None));
+            return Ok((vec![0; count], true, None));
         }
         // §5.11.39 reads `transform_type()` here: after `all_zero`, before `eob_pt`.
         let tx_type = match tx_type_mode {
@@ -980,7 +980,7 @@ impl<'a> LosslessTileDecoder<'a> {
         };
         self.set_coefficient_context(x4, y4, units, cumulative, dc);
         if coded == size {
-            return Ok((levels, tx_type));
+            return Ok((levels, false, tx_type));
         }
         // Scatter the coded quadrant into the full transform block.
         let mut coefficients = vec![0i32; count];
@@ -988,7 +988,7 @@ impl<'a> LosslessTileDecoder<'a> {
             coefficients[row * size..row * size + coded]
                 .copy_from_slice(&levels[row * coded..(row + 1) * coded]);
         }
-        Ok((coefficients, tx_type))
+        Ok((coefficients, false, tx_type))
     }
 
     fn decode_golomb(&mut self) -> Result<u32> {
@@ -1704,7 +1704,7 @@ mod tests {
     fn tx_mode_select_signals_a_32_point_transform_and_reconstructs_through_it() {
         let mut e = SymbolEncoder::new();
         superblock_prefix(&mut e);
-        e.symbol(cdf::tx_depth_cdf(64).0, 1); // tx_depth = 1 -> TX_32X32
+        e.symbol(cdf::tx_depth_cdf(64, 0).0, 1); // tx_depth = 1 -> TX_32X32
         // The first of the block's four 32x32 transforms carries a DC
         // coefficient; the other three are TXB_SKIP. Their skip contexts
         // follow the same `set_coefficient_context` recurrence the decoder
@@ -1749,7 +1749,7 @@ mod tests {
     fn tx_mode_select_depth_two_signals_16x16_transforms() {
         let mut e = SymbolEncoder::new();
         superblock_prefix(&mut e);
-        e.symbol(cdf::tx_depth_cdf(64).0, 2); // tx_depth = 2 -> TX_16X16
+        e.symbol(cdf::tx_depth_cdf(64, 0).0, 2); // tx_depth = 2 -> TX_16X16
         // All sixteen 16x16 transforms are skipped, so every one of them
         // sees zeroed level contexts and codes at skip context 1.
         for _ in 0..16 {
@@ -1879,8 +1879,8 @@ mod coefficient_level_tests {
         let mut decoder =
             LosslessTileDecoder::new(&bytes, 16, 16, 4, 4, 40, false, true, &limits).unwrap();
         let scan = cdf::up_right_diagonal_scan(8);
-        let (levels, skipped) = decoder
-            .decode_coefficient_levels(0, 0, 16, 8, &scan)
+        let (levels, skipped, _) = decoder
+            .decode_coefficient_levels(0, 0, 16, 8, &scan, None)
             .unwrap();
         assert!(!skipped);
         assert_eq!(levels[0], -14);
@@ -1912,8 +1912,8 @@ mod coefficient_level_tests {
         let bytes = encode(0);
         let mut decoder =
             LosslessTileDecoder::new(&bytes, 16, 16, 4, 4, 40, false, true, &limits).unwrap();
-        let (levels, skipped) = decoder
-            .decode_coefficient_levels(0, 0, 8, 8, &scan)
+        let (levels, skipped, _) = decoder
+            .decode_coefficient_levels(0, 0, 8, 8, &scan, None)
             .unwrap();
         assert!(!skipped);
         assert_eq!(levels[0], 1);
@@ -1923,8 +1923,8 @@ mod coefficient_level_tests {
         let bytes = encode(1);
         let mut decoder =
             LosslessTileDecoder::new(&bytes, 16, 16, 4, 4, 40, false, true, &limits).unwrap();
-        let (levels, skipped) = decoder
-            .decode_coefficient_levels(0, 0, 16, 8, &scan)
+        let (levels, skipped, _) = decoder
+            .decode_coefficient_levels(0, 0, 16, 8, &scan, None)
             .unwrap();
         assert!(!skipped);
         assert_eq!(levels[0], 1);

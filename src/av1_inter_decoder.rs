@@ -1528,7 +1528,7 @@ impl<'a> InterTileDecoder<'a> {
         y4: usize,
         block_width: usize,
     ) -> Result<[i32; 16]> {
-        let (coefficients, _tx_type) =
+        let (coefficients, _skipped, _tx_type) =
             self.decode_coefficient_levels(x4, y4, block_width, 4, &cdf::DEFAULT_SCAN_4X4, None)?;
         let mut levels = [0i32; 16];
         levels.copy_from_slice(&coefficients);
@@ -1581,7 +1581,7 @@ impl<'a> InterTileDecoder<'a> {
         // only signalled for a transform block that actually has nonzero coefficients; a fully
         // skipped block is implicitly DCT_DCT, and its value is irrelevant anyway because the
         // inverse transform of an all-zero input is zero for every type.
-        let (coefficients, tx_type) = self.decode_coefficient_levels(
+        let (coefficients, _skipped, tx_type) = self.decode_coefficient_levels(
             x4,
             y4,
             block_width,
@@ -1601,7 +1601,7 @@ impl<'a> InterTileDecoder<'a> {
         size: usize,
         scan: &[usize],
         tx_type_block: Option<(bool, Av1IntraMode)>,
-    ) -> Result<(Vec<i32>, Option<Av1TxType>)> {
+    ) -> Result<(Vec<i32>, bool, Option<Av1TxType>)> {
         let plane_type = 0;
         // The specification selects every coefficient CDF below by a
         // quantizer context derived from `base_q_idx` and (except for
@@ -1624,7 +1624,7 @@ impl<'a> InterTileDecoder<'a> {
             == 1
         {
             self.set_coefficient_context(x4, y4, units, 0, 0);
-            return Ok((vec![0; count], None));
+            return Ok((vec![0; count], true, None));
         }
         // §5.11.39 reads `transform_type()` here: after `all_zero`, before `eob_pt`.
         let tx_type = match tx_type_block {
@@ -1731,7 +1731,7 @@ impl<'a> InterTileDecoder<'a> {
         };
         self.set_coefficient_context(x4, y4, units, cumulative, dc);
         if coded == size {
-            return Ok((levels, tx_type));
+            return Ok((levels, false, tx_type));
         }
         // Scatter the coded quadrant into the full transform block.
         let mut coefficients = vec![0i32; count];
@@ -1739,7 +1739,7 @@ impl<'a> InterTileDecoder<'a> {
             coefficients[row * size..row * size + coded]
                 .copy_from_slice(&levels[row * coded..(row + 1) * coded]);
         }
-        Ok((coefficients, tx_type))
+        Ok((coefficients, false, tx_type))
     }
 
     fn decode_golomb(&mut self) -> Result<u32> {
@@ -3206,7 +3206,7 @@ mod tests {
         e.symbol(&cdf::SINGLE_REF_P4, 0);
         e.symbol(&cdf::NEW_MV, 1);
         e.symbol(&cdf::ZERO_MV, 0); // GLOBALMV
-        e.symbol(cdf::tx_depth_cdf(16).0, 1); // TX_16X16 >> 1 = TX_8X8
+        e.symbol(cdf::tx_depth_cdf(16, 0).0, 1); // TX_16X16 >> 1 = TX_8X8
         // Four 8x8 transforms inside a 16x16 coding block, so no transform
         // covers the whole block and the neighbour-derived context 1
         // applies to all four.
