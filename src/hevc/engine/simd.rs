@@ -883,8 +883,11 @@ mod tests {
         let taps4: [&[i32]; 4] = std::array::from_fn(|t| src[t].as_slice());
         let c8 = [-1, 4, -11, 40, 40, -11, 4, -1];
         let c4 = [-2, 58, 10, -2];
-        // Widths that exercise the 8-, 4- and 1-wide code paths.
-        for len in [1usize, 2, 3, 4, 5, 7, 8, 12, 16, 31, 64, 200] {
+        // Widths that exercise the 8-, 4- and 1-wide code paths, plus the
+        // lengths that straddle each vector step and leave a partial tail.
+        for len in [
+            1usize, 2, 3, 4, 5, 7, 8, 12, 16, 17, 20, 24, 31, 33, 48, 64, 200,
+        ] {
             for shift in [0i32, 2, 4, 6] {
                 let mut reference = vec![0i32; len];
                 filter_taps(Isa::Scalar, &taps8, &c8, shift, &mut reference);
@@ -906,7 +909,7 @@ mod tests {
     fn every_backend_matches_scalar_combine_weighted() {
         let a = samples(3, 200, 30_000);
         let b = samples(11, 200, 30_000);
-        for len in [1usize, 3, 4, 5, 8, 13, 16, 64, 200] {
+        for len in [1usize, 3, 4, 5, 8, 13, 16, 17, 20, 24, 33, 48, 64, 200] {
             for (weights, round, shift, post) in [
                 ([1, 1], 32, 6, 0),
                 ([1, 1], 64, 7, 0),
