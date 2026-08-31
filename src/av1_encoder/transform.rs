@@ -53,7 +53,7 @@
 //! so `inverse_transform(forward_transform(r), .., 1, 1) == r` up to the
 //! kernels' own rounding error, which the round-trip tests bound.
 
-use crate::av1_intra::{Av1TxType, Tx1d};
+use crate::av1_intra::{Av1TxType, Tx1d, identity_scale};
 
 /// `round(2^14 * cos(j * pi / 64))` for `j` in `0..=32`. Entries 1 through 31
 /// are the `COSPI_j_64` constants the inverse kernels use, unchanged.
@@ -224,6 +224,14 @@ fn round_shift14(value: i64) -> i64 {
 /// One forward 1-D pass over `input`, writing `size` coefficients.
 fn forward_1d(kind: Tx1d, input: &[i64], output: &mut [i64]) {
     let points = input.len();
+    if kind == Tx1d::Identity {
+        // The same scale the inverse identity pass applies, so a round trip
+        // through a half-identity type cancels exactly as the butterflies do.
+        for (coefficient, &value) in output.iter_mut().zip(input.iter()) {
+            *coefficient = round_shift14(value * identity_scale(points));
+        }
+        return;
+    }
     let Some(table) = basis(kind, points) else {
         output.copy_from_slice(input);
         return;
@@ -244,8 +252,8 @@ fn forward_1d(kind: Tx1d, input: &[i64], output: &mut [i64]) {
 ///
 /// `size` must be 4, 8, 16, or 32, and `residual` is that many samples in
 /// row-major order. The ADST kernels are only defined for 4, 8, and 16
-/// points, so a 32-point block runs the DCT along both axes regardless of
-/// `tx_type`, matching [`crate::av1_intra::inverse_transform`].
+/// points, so a 32-point block runs the DCT in place of any ADST pass
+/// `tx_type` names, matching [`crate::av1_intra::inverse_transform`].
 ///
 /// This is the exact counterpart of that inverse: with unit quantizers,
 /// `inverse_transform(&forward_transform(r, n, t), n, t, 1, 1)` reproduces
@@ -262,8 +270,14 @@ pub fn forward_transform(residual: &[i32], size: usize, tx_type: Av1TxType) -> V
 
     let (mut column, mut row, lr_flip, ud_flip) = tx_type.kernels();
     if size == 32 {
-        column = Tx1d::Dct;
-        row = Tx1d::Dct;
+        // As on the inverse side, only the ADST passes fall back to the DCT;
+        // the identity is defined at every size.
+        if column == Tx1d::Adst {
+            column = Tx1d::Dct;
+        }
+        if row == Tx1d::Adst {
+            row = Tx1d::Dct;
+        }
     }
 
     // The vectorized kernels work in 32-bit lanes and decline residuals whose
@@ -410,6 +424,9 @@ mod tests {
                             (Tx1d::Adst, _) => {
                                 (PI * (2.0 * k64 + 1.0) * (2.0 * n64 + 1.0) / (4.0 * points)).sin()
                             }
+                            // The identity carries a scale rather than a basis
+                            // table, so `KERNELS` does not list it.
+                            (Tx1d::Identity, _) => unreachable!(),
                         };
                         let expected = (exact * 16384.0).round() as i32;
                         assert!(
@@ -444,7 +461,7 @@ mod tests {
     }
 
     /// Every transform type, paired with the sizes it is defined at.
-    const TX_TYPES: [(Av1TxType, &[usize]); 10] = [
+    const TX_TYPES: [(Av1TxType, &[usize]); 16] = [
         (Av1TxType::Idtx, &[4, 8, 16, 32]),
         (Av1TxType::DctDct, &[4, 8, 16, 32]),
         (Av1TxType::AdstDct, &[4, 8, 16]),
@@ -455,6 +472,12 @@ mod tests {
         (Av1TxType::FlipadstFlipadst, &[4, 8, 16]),
         (Av1TxType::AdstFlipadst, &[4, 8, 16]),
         (Av1TxType::FlipadstAdst, &[4, 8, 16]),
+        (Av1TxType::VDct, &[4, 8, 16, 32]),
+        (Av1TxType::HDct, &[4, 8, 16, 32]),
+        (Av1TxType::VAdst, &[4, 8, 16]),
+        (Av1TxType::HAdst, &[4, 8, 16]),
+        (Av1TxType::VFlipadst, &[4, 8, 16]),
+        (Av1TxType::HFlipadst, &[4, 8, 16]),
     ];
 
     /// The reason these kernels exist: with unit quantizers the forward and
