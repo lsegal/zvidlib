@@ -9,6 +9,11 @@ readme = "README.md"
 keywords = ["video", "audio", "webassembly", "webgl", "mp4"]
 categories = ["multimedia", "wasm"]
 publish = false
+# `benches/hevc_hardware.rs` is a *module* of the `codec` bench target, not a
+# target of its own (see the `[[bench]]` note below). Cargo would otherwise
+# auto-discover it as a second, libtest-harnessed bench target and try to
+# compile it standalone.
+autobenches = false
 
 [lib]
 crate-type = ["rlib", "cdylib"]

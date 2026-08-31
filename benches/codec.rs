@@ -6,6 +6,7 @@
 //! `zvidlib::simd`'s process-wide instruction-set override. See
 //! `benches/README.md` for how to run and filter it.
 
+mod hevc_hardware;
 mod support;
 
 use std::time::Instant;
@@ -300,6 +301,7 @@ criterion_group!(
     hevc_decode_1080p,
     av1_deblock_by_isa,
     av1_motion_compensation_by_isa,
-    hevc_decode_by_isa
+    hevc_decode_by_isa,
+    hevc_hardware::hevc_hardware
 );
 criterion_main!(benches);
