@@ -39,8 +39,9 @@
 //! directions contribute `2 * log2( nTbS ) + 24` bits of gain and the
 //! four shifts remove exactly that many. Intermediates are clipped to
 //! the 16-bit dynamic range the decoder's `coeffMin` / `coeffMax` also
-//! use, so no stage can hand the next one a value it could not have
-//! parsed from a bitstream.
+//! use (widened by `extended_precision_processing_flag` exactly as
+//! §8.6.3 widens it), so no stage can hand the next one a value it could
+//! not have parsed from a bitstream.
 //!
 //! ## Scope
 //!
@@ -138,13 +139,6 @@ pub fn use_dst(n_tbs: usize, pred_mode: PredMode, component: Component) -> bool 
     n_tbs == 4 && matches!(pred_mode, PredMode::Intra) && !component.is_chroma()
 }
 
-/// The dynamic range the forward transform's intermediate pass is
-/// clipped to, matching the fixed `[ −32768, 32767 ]` coefficient range
-/// of §7.4.5 without `extended_precision_processing_flag`.
-const INTERMEDIATE_MIN: i32 = -32768;
-/// Upper bound of [`INTERMEDIATE_MIN`]'s range.
-const INTERMEDIATE_MAX: i32 = 32767;
-
 /// Forward (analysis) transform for one residual block.
 ///
 /// `residual` is the `(nTbS)x(nTbS)` residual array, row-major by `y`,
@@ -232,8 +226,11 @@ pub fn forward_transform_with_backend(
         }
         transform_simd::transform_1d(backend, &column, &mut pass, basis, n_tbs, 1);
         for (u, &v) in pass.iter().enumerate() {
-            intermediate[u * n_tbs + x] =
-                ((v + round1) >> shift1).clamp(INTERMEDIATE_MIN, INTERMEDIATE_MAX);
+            // Both passes clip to the same `[ coeffMin, coeffMax ]`
+            // range §8.6.3 clips the decoder's scaled coefficients to,
+            // so neither stage can hand the next one a value that could
+            // not have come out of a bitstream.
+            intermediate[u * n_tbs + x] = ((v + round1) >> shift1).clamp(coeff_min, coeff_max);
         }
     }
 
