@@ -314,6 +314,25 @@ pub fn detected_level() -> SimdLevel {
     })
 }
 
+/// The level a freshly constructed [`McContext`] runs on: the crate-wide
+/// [`crate::simd::set_override`] value when one is pinned, otherwise
+/// [`detected_level`].
+///
+/// The override is consulted on every call rather than cached, so switching it
+/// mid-process changes what subsequently created contexts use.
+/// [`McContext::with_level`] remains the explicit per-context escape hatch and
+/// ignores the override entirely.
+#[must_use]
+pub fn default_level() -> SimdLevel {
+    match crate::simd::override_isa() {
+        Some(crate::simd::SimdIsa::Scalar) => SimdLevel::Scalar,
+        Some(crate::simd::SimdIsa::Sse41) => SimdLevel::Sse41,
+        Some(crate::simd::SimdIsa::Avx2) => SimdLevel::Avx2,
+        Some(crate::simd::SimdIsa::Neon) => SimdLevel::Neon,
+        None => detected_level(),
+    }
+}
+
 /// Every backend this host can execute, best first. Always ends with
 /// [`SimdLevel::Scalar`].
 pub fn available_levels() -> Vec<SimdLevel> {
@@ -377,7 +396,7 @@ impl Default for McContext {
 impl McContext {
     /// Creates a context bound to the best backend this host supports.
     pub fn new() -> McContext {
-        McContext::with_level(detected_level())
+        McContext::with_level(default_level())
     }
 
     /// Creates a context pinned to `level`, falling back to

@@ -6,11 +6,17 @@
 //! nothing else. Fixtures are the ones already checked into the repository: the
 //! bundled `examples/media/BigBuckBunny.mp4` HEVC Main sample and the AV1
 //! elementary streams under `tests/fixtures/codec/`.
+//!
+//! [`isa`] adds the scalar-vs-SIMD axis on top: it runs a workload once per
+//! instruction set `zvidlib::simd::available()` reports, asserts every arm is
+//! bit-exact with scalar before timing it, and names the arms `<codec>/<isa>`.
 
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::OnceLock;
 use std::task::{Context, Poll, Waker};
+
+pub mod isa;
 
 use criterion::Throughput;
 use zvidlib::io::MemorySource;

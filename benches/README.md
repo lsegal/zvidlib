@@ -52,6 +52,85 @@ Every criterion group name ends in the arm it was measured under —
 `hevc_decode_1080p/simd=off` versus `hevc_decode_1080p/simd=on` — so the two
 builds record separately and stay comparable in one report.
 
+## Scalar versus SIMD
+
+The `simd` feature above distinguishes two *builds*. The instruction set is a
+separate, finer axis, and it is the one a SIMD comparison actually turns on:
+zvidlib's kernels are chosen by runtime CPU feature detection, so scalar and
+vector arms can both be measured in a single run.
+
+`zvidlib::simd` is the process-wide switch that makes that possible:
+
+```rust
+use zvidlib::simd::{self, SimdIsa};
+
+simd::set_override(Some(SimdIsa::Scalar)); // every kernel, HEVC and AV1
+// ... run the workload ...
+simd::set_override(None);                  // back to per-host detection
+```
+
+`set_override` reaches every dispatch family at once: the AV1 transforms and
+in-loop filters, AV1 motion compensation, AV1 intra prediction, and every HEVC
+engine kernel (inter/intra prediction, in-loop filters, inverse transforms, and
+encoder-side distortion metrics). An instruction set this host cannot execute is
+clamped to `SimdIsa::Scalar` rather than silently ignored, so the arm you asked
+for is always a defined one. `simd::active()` reports what is in force and
+`simd::available()` lists what this host can run.
+
+Groups built through `support::isa::bench_across_isas` run once per entry in
+`simd::available()` and are named `<codec>/<isa>`, so criterion compares the
+arms directly:
+
+```
+av1_deblock/scalar
+av1_deblock/neon
+av1_motion_compensation/scalar
+av1_motion_compensation/neon
+```
+
+On an `x86_64` host with AVX2 the arms are `scalar`, `sse4.1`, and `avx2`
+instead. These groups deliberately carry the instruction set in the name rather
+than the `simd=on`/`simd=off` build tag: the instruction set *is* the measured
+axis here, and both arms always appear in the same run.
+
+Filter to one of them the same way as any other group:
+
+```sh
+cargo bench --bench codec -- av1_deblock
+cargo bench --bench codec -- 'av1_deblock/scalar'
+```
+
+The per-ISA HEVC group decodes the bundled 1080p sample, so it sits behind the
+same `ZVIDLIB_BENCH_LARGE=1` opt-in as the other 1080p group.
+
+### Correctness guard
+
+Every per-ISA group runs `assert_bit_exact_across_isas` before timing anything:
+each arm's output must be byte-identical to the scalar arm's. This is not
+optional ceremony. Every vector backend in the crate is documented as bit-exact
+with its scalar reference, and a speedup produced by a kernel that quietly
+diverged would look like progress. If a backend disagrees, the benchmark panics
+instead of reporting a number.
+
+### Reading a null result
+
+`simd::active_by_site()` reports what each dispatch family resolved to
+individually:
+
+```rust
+for (site, isa) in zvidlib::simd::active_by_site() {
+    println!("{site}: {}", isa.name());
+}
+```
+
+The harness asserts on this before every timed arm, and you should too if you
+are interpreting a surprising result. **A timing difference is not proof the
+switch landed, and the absence of one is not proof it did not.** Some kernels
+are near parity with their scalar reference on some hosts — the HEVC arms come
+out roughly even on Apple Silicon, where LLVM auto-vectorizes the scalar code
+well under `lto = "fat"`, while AV1 deblocking and motion compensation on the
+same host are 2.4-4.9x. `active_by_site()` answers the question directly.
+
 ## Fixtures
 
 `benches/support/` loads only fixtures already checked into the repository:
@@ -85,3 +164,8 @@ without the whole-crate optimization that shipped builds get.
 Benchmarks are native-only. They are declared as an explicit `[[bench]]` target
 and criterion is a `cfg(not(target_arch = "wasm32"))` dev-dependency, so the
 `wasm32` builds neither resolve nor compile them.
+
+`benches/support/` holds everything that is not the measurement: fixtures and
+synthetic inputs in `support`, and the scalar-vs-SIMD axis in `support::isa`
+(`bench_across_isas`, the bit-exactness guard, and the per-site override
+assertion).
