@@ -552,6 +552,23 @@ unsafe fn filter_taps_sse41<const N: usize>(
         let count = out.len();
         let sh = _mm_cvtsi32_si128(shift);
         let mut i = 0usize;
+        // Four independent accumulator chains, as in `filter_taps_neon`.
+        while i + 16 <= count {
+            let mut a = [_mm_setzero_si128(); 4];
+            for (&c, tap) in coeffs.iter().zip(taps.iter()) {
+                let q = tap.as_ptr().add(i);
+                let cv = _mm_set1_epi32(c);
+                for (k, acc) in a.iter_mut().enumerate() {
+                    let v = _mm_loadu_si128(q.add(k * 4).cast());
+                    *acc = _mm_add_epi32(*acc, _mm_mullo_epi32(v, cv));
+                }
+            }
+            let o = out.as_mut_ptr().add(i);
+            for (k, acc) in a.into_iter().enumerate() {
+                _mm_storeu_si128(o.add(k * 4).cast(), _mm_sra_epi32(acc, sh));
+            }
+            i += 16;
+        }
         while i + 4 <= count {
             let mut acc = _mm_setzero_si128();
             for (&c, tap) in coeffs.iter().zip(taps.iter()) {
@@ -577,6 +594,22 @@ unsafe fn filter_taps_avx2<const N: usize>(
         let count = out.len();
         let sh = _mm_cvtsi32_si128(shift);
         let mut i = 0usize;
+        while i + 32 <= count {
+            let mut a = [_mm256_setzero_si256(); 4];
+            for (&c, tap) in coeffs.iter().zip(taps.iter()) {
+                let q = tap.as_ptr().add(i);
+                let cv = _mm256_set1_epi32(c);
+                for (k, acc) in a.iter_mut().enumerate() {
+                    let v = _mm256_loadu_si256(q.add(k * 8).cast());
+                    *acc = _mm256_add_epi32(*acc, _mm256_mullo_epi32(v, cv));
+                }
+            }
+            let o = out.as_mut_ptr().add(i);
+            for (k, acc) in a.into_iter().enumerate() {
+                _mm256_storeu_si256(o.add(k * 8).cast(), _mm256_sra_epi32(acc, sh));
+            }
+            i += 32;
+        }
         while i + 8 <= count {
             let mut acc = _mm256_setzero_si256();
             for (&c, tap) in coeffs.iter().zip(taps.iter()) {
@@ -612,6 +645,30 @@ unsafe fn filter_taps_neon<const N: usize>(
         // A negative `vshlq_s32` amount is an arithmetic right shift.
         let sh = vdupq_n_s32(-shift);
         let mut i = 0usize;
+        // Four independent accumulator chains per iteration. One chain of
+        // `N` dependent multiply-accumulates cannot keep the vector units
+        // busy — the per-lane latency, not the throughput, sets the pace —
+        // so a 16-sample step is what pulls this ahead of the
+        // auto-vectorized scalar loop rather than level with it.
+        while i + 16 <= count {
+            let mut a0 = vdupq_n_s32(0);
+            let mut a1 = vdupq_n_s32(0);
+            let mut a2 = vdupq_n_s32(0);
+            let mut a3 = vdupq_n_s32(0);
+            for (&c, tap) in coeffs.iter().zip(taps.iter()) {
+                let p = tap.as_ptr().add(i);
+                a0 = vmlaq_n_s32(a0, vld1q_s32(p), c);
+                a1 = vmlaq_n_s32(a1, vld1q_s32(p.add(4)), c);
+                a2 = vmlaq_n_s32(a2, vld1q_s32(p.add(8)), c);
+                a3 = vmlaq_n_s32(a3, vld1q_s32(p.add(12)), c);
+            }
+            let o = out.as_mut_ptr().add(i);
+            vst1q_s32(o, vshlq_s32(a0, sh));
+            vst1q_s32(o.add(4), vshlq_s32(a1, sh));
+            vst1q_s32(o.add(8), vshlq_s32(a2, sh));
+            vst1q_s32(o.add(12), vshlq_s32(a3, sh));
+            i += 16;
+        }
         while i + 4 <= count {
             let mut acc = vdupq_n_s32(0);
             for (&c, tap) in coeffs.iter().zip(taps.iter()) {
@@ -740,6 +797,23 @@ unsafe fn combine_weighted_sse41<const N: usize>(
         let lo = _mm_setzero_si128();
         let hi = _mm_set1_epi32(p.max_val);
         let mut i = 0usize;
+        while i + 16 <= count {
+            let mut a = [round; 4];
+            for (&w, tap) in weights.iter().zip(taps.iter()) {
+                let q = tap.as_ptr().add(i);
+                let wv = _mm_set1_epi32(w);
+                for (k, acc) in a.iter_mut().enumerate() {
+                    let v = _mm_loadu_si128(q.add(k * 4).cast());
+                    *acc = _mm_add_epi32(*acc, _mm_mullo_epi32(v, wv));
+                }
+            }
+            let o = out.as_mut_ptr().add(i);
+            for (k, acc) in a.into_iter().enumerate() {
+                let v = _mm_add_epi32(_mm_sra_epi32(acc, sh), post);
+                _mm_storeu_si128(o.add(k * 4).cast(), _mm_min_epi32(_mm_max_epi32(v, lo), hi));
+            }
+            i += 16;
+        }
         while i + 4 <= count {
             let mut acc = round;
             for (&w, tap) in weights.iter().zip(taps.iter()) {
@@ -771,6 +845,26 @@ unsafe fn combine_weighted_avx2<const N: usize>(
         let lo = _mm256_setzero_si256();
         let hi = _mm256_set1_epi32(p.max_val);
         let mut i = 0usize;
+        while i + 32 <= count {
+            let mut a = [round; 4];
+            for (&w, tap) in weights.iter().zip(taps.iter()) {
+                let q = tap.as_ptr().add(i);
+                let wv = _mm256_set1_epi32(w);
+                for (k, acc) in a.iter_mut().enumerate() {
+                    let v = _mm256_loadu_si256(q.add(k * 8).cast());
+                    *acc = _mm256_add_epi32(*acc, _mm256_mullo_epi32(v, wv));
+                }
+            }
+            let o = out.as_mut_ptr().add(i);
+            for (k, acc) in a.into_iter().enumerate() {
+                let v = _mm256_add_epi32(_mm256_sra_epi32(acc, sh), post);
+                _mm256_storeu_si256(
+                    o.add(k * 8).cast(),
+                    _mm256_min_epi32(_mm256_max_epi32(v, lo), hi),
+                );
+            }
+            i += 32;
+        }
         while i + 8 <= count {
             let mut acc = round;
             for (&w, tap) in weights.iter().zip(taps.iter()) {
@@ -802,6 +896,29 @@ unsafe fn combine_weighted_neon<const N: usize>(
         let lo = vdupq_n_s32(0);
         let hi = vdupq_n_s32(p.max_val);
         let mut i = 0usize;
+        // Same four-chain unroll as `filter_taps_neon`: the combine is one
+        // or two multiply-accumulates deep, so a 4-lane step spends most of
+        // its time on the shift / clamp / store dependency chain instead of
+        // on useful width.
+        while i + 16 <= count {
+            let mut a0 = round;
+            let mut a1 = round;
+            let mut a2 = round;
+            let mut a3 = round;
+            for (&w, tap) in weights.iter().zip(taps.iter()) {
+                let q = tap.as_ptr().add(i);
+                a0 = vmlaq_n_s32(a0, vld1q_s32(q), w);
+                a1 = vmlaq_n_s32(a1, vld1q_s32(q.add(4)), w);
+                a2 = vmlaq_n_s32(a2, vld1q_s32(q.add(8)), w);
+                a3 = vmlaq_n_s32(a3, vld1q_s32(q.add(12)), w);
+            }
+            let o = out.as_mut_ptr().add(i);
+            for (k, acc) in [a0, a1, a2, a3].into_iter().enumerate() {
+                let v = vaddq_s32(vshlq_s32(acc, sh), post);
+                vst1q_s32(o.add(k * 4), vminq_s32(vmaxq_s32(v, lo), hi));
+            }
+            i += 16;
+        }
         while i + 4 <= count {
             let mut acc = round;
             for (&w, tap) in weights.iter().zip(taps.iter()) {
