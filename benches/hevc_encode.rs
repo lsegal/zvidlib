@@ -38,14 +38,15 @@
 //! picture, and those *are* vectorized, so it is the one encoder-side group
 //! outside mode search that is expected to move with the instruction set.
 //!
-//! ## Stages this encoder does not have yet
+//! ## Stage coverage
 //!
-//! The encoder is a lossless PCM bootstrap writer: it has no forward transform
-//! and no quantization, so there is no residual to transform or quantize and
-//! nothing here measures either. Those stages are named in the tracking issue
-//! but cannot be benchmarked until they exist; [`report_absent_stages`] prints
-//! that explicitly on every run so a missing group is never read as a stage
-//! that costs nothing.
+//! Every stage of the encoder's pipeline now has a group: mode search / RDO,
+//! the §8.6.4 forward transform, §8.6.3 quantization, encode-side
+//! reconstruction with in-loop filtering, CABAC and bitwriting, whole-picture
+//! access-unit writing for both the PCM and the residual writer, and the input
+//! colour conversion. [`report_stage_coverage`] prints that list on every run,
+//! so a group that is missing from the output is read as a broken run rather
+//! than as a stage that costs nothing.
 
 mod support;
 
@@ -89,12 +90,13 @@ const WHOLE_FRAME_FRAMES: usize = 2;
 ///
 /// A benchmark suite reports what it measured; the stages it *could not* measure
 /// have to be reported too, or their absence reads as zero cost.
-fn report_absent_stages(_: &mut Criterion) {
+fn report_stage_coverage(_: &mut Criterion) {
     println!(
-        "# hevc_encode: the encoder is a lossless PCM writer, so it has no forward transform and\n\
-         # no quantization to measure. The stages benchmarked below are mode search/RDO,\n\
-         # encode-side reconstruction + in-loop filtering, CABAC + bitwriting, whole-picture PCM\n\
-         # access-unit writing, and the RGBA8->YUV420 input conversion.\n\
+        "# hevc_encode: every encoder pipeline stage is measured below - mode search/RDO, the\n\
+         # forward transform, quantization, encode-side reconstruction + in-loop filtering (both\n\
+         # with an exact and with a quantized residual), CABAC + bitwriting, whole-picture PCM and\n\
+         # residual access-unit writing, and the RGBA8->YUV420 input conversion. No stage of the\n\
+         # pipeline is absent from this target.\n\
          # hevc_encode: hevc_rdcost is the encoder's only SIMD dispatch family of its own, so\n\
          # apart from the mode-search and reconstruction groups (the latter running the decoder's\n\
          # vectorized in-loop filter kernels) the arms are expected to read flat across\n\
@@ -316,6 +318,96 @@ fn pcm_write(criterion: &mut Criterion, size: (u32, u32), group_prefix: &str) {
     });
 }
 
+/// The transform-block side the forward-transform and quantization groups
+/// tile the picture with — the size the residual writer's coding units use
+/// (one 16x16 luma transform block per 16-sample CTB).
+const TRANSFORM_BLOCK: usize = 16;
+
+/// The §8.6.4 forward transform, over one picture's worth of residual.
+///
+/// Separate from the quantization group below because the two stages scale
+/// completely differently: the transform is `O(nTbS)` basis multiplies per
+/// coefficient and the quantizer is a single multiply-shift, so a combined
+/// number would say nothing about which of them to vectorize first. Neither
+/// has a SIMD path today, so both arms are expected to read flat — which is
+/// exactly the measurement that identifies them as targets.
+fn forward_transform(criterion: &mut Criterion, size: (u32, u32), group_prefix: &str) {
+    let residual = residual_picture(size);
+    let (width, height) = (size.0 as usize, size.1 as usize);
+    let name = format!("{group_prefix}_forward_transform");
+    let workload = IsaWorkload::new(
+        &name,
+        FrameWork::new(1, u64::from(size.0), u64::from(size.1)),
+    );
+    bench_across_isas(criterion, &workload, || {
+        encoder_bench::forward_transform_picture(&residual, width, height, TRANSFORM_BLOCK, true)
+    });
+}
+
+/// The §8.6.3 quantization, over one picture's worth of transform
+/// coefficients. The coefficients are produced in setup, so this times the
+/// quantizer rather than re-timing the transform above.
+fn quantize(criterion: &mut Criterion, size: (u32, u32), group_prefix: &str) {
+    let (width, height) = (size.0 as usize, size.1 as usize);
+    let coefficients = encoder_bench::forward_transform_coefficients(
+        &residual_picture(size),
+        width,
+        height,
+        TRANSFORM_BLOCK,
+        true,
+    );
+    let qp = zvidlib_rdo_defaults().0 as u32;
+    let name = format!("{group_prefix}_quantize");
+    let workload = IsaWorkload::new(
+        &name,
+        FrameWork::new(1, u64::from(size.0), u64::from(size.1)),
+    );
+    bench_across_isas(criterion, &workload, || {
+        encoder_bench::quantize_picture(&coefficients, width, height, TRANSFORM_BLOCK, qp, true)
+    });
+}
+
+/// Whole-picture bitstream writing for the *residual* writer: intra
+/// prediction, forward transform, quantization, the decoder's own
+/// reconstruction, and the §7.3.8.11 entropy coding of the levels.
+///
+/// The counterpart of [`pcm_write`]: comparing the two is what separates the
+/// cost of coding a quantized residual from the cost of writing a bitstream at
+/// all, and the residual writer's access unit is a fraction of the PCM one's
+/// size, so the two also differ in how much entropy coding they do.
+fn residual_write(criterion: &mut Criterion, size: (u32, u32), group_prefix: &str) {
+    let (current, _) = planes_pair(size.0, size.1);
+    let qp = zvidlib_rdo_defaults().0;
+    let name = format!("{group_prefix}_residual_write");
+    let workload = IsaWorkload::new(
+        &name,
+        FrameWork::new(1, u64::from(size.0), u64::from(size.1)),
+    );
+    bench_across_isas(criterion, &workload, || {
+        encoder_bench::write_idr_residual_access_unit(
+            &current.y,
+            &current.cb,
+            &current.cr,
+            current.width,
+            current.height,
+            qp,
+        )
+    });
+}
+
+/// One picture's worth of residual for the transform and quantization groups:
+/// the difference between two frames of the synthetic sequence, which is what
+/// the encoder's inter path actually hands the transform.
+fn residual_picture(size: (u32, u32)) -> Vec<i32> {
+    let (reference, current) = planes_sequence(size.0, size.1);
+    current
+        .y
+        .iter()
+        .zip(&reference.y)
+        .map(|(&a, &b)| i32::from(a) - i32::from(b))
+        .collect()
+}
+
 /// Bins per CABAC iteration. Roughly the CU-syntax bin count of a small
 /// picture, large enough that per-call setup is negligible.
 const CABAC_BINS: usize = 1 << 18;
@@ -398,8 +490,11 @@ fn hevc_encode_large(criterion: &mut Criterion) {
 
 fn hevc_encode_stages_small(criterion: &mut Criterion) {
     mode_search(criterion, SMALL, "hevc_encode_640x352");
+    forward_transform(criterion, SMALL, "hevc_encode_640x352");
+    quantize(criterion, SMALL, "hevc_encode_640x352");
     reconstruct(criterion, SMALL, "hevc_encode_640x352");
     pcm_write(criterion, SMALL, "hevc_encode_640x352");
+    residual_write(criterion, SMALL, "hevc_encode_640x352");
     color_conversion(criterion, SMALL, "hevc_encode_640x352");
 }
 
@@ -408,14 +503,17 @@ fn hevc_encode_stages_large(criterion: &mut Criterion) {
         return;
     }
     mode_search(criterion, LARGE, "hevc_encode_1920x1088");
+    forward_transform(criterion, LARGE, "hevc_encode_1920x1088");
+    quantize(criterion, LARGE, "hevc_encode_1920x1088");
     reconstruct(criterion, LARGE, "hevc_encode_1920x1088");
     pcm_write(criterion, LARGE, "hevc_encode_1920x1088");
+    residual_write(criterion, LARGE, "hevc_encode_1920x1088");
     color_conversion(criterion, LARGE, "hevc_encode_1920x1088");
 }
 
 criterion_group!(
     benches,
-    report_absent_stages,
+    report_stage_coverage,
     hevc_encode_small,
     hevc_encode_stages_small,
     entropy_coding,
