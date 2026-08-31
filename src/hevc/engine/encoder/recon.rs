@@ -531,3 +531,203 @@ fn plane_to_u8(pic: &Picture, plane: Plane) -> Vec<u8> {
         .map(|&v| v.clamp(0, 255) as u8)
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hevc::engine::encoder::rdo::{DecisionConfig, decide_picture};
+
+    const W: usize = 64;
+    const H: usize = 32;
+
+    /// A deterministic picture with flat coding blocks separated by small
+    /// steps.
+    ///
+    /// The §8.7.2.5.3 decision only filters an edge whose two sides are flat
+    /// enough (`d < β`), so a picture of hard high-contrast edges would be
+    /// left entirely alone and would say nothing about whether the filters
+    /// ran. Flat blocks with a modest step across each coding-block boundary
+    /// are what the deblocking filter is for.
+    fn source(shift: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let mut y = vec![0u8; W * H];
+        for row in 0..H {
+            for col in 0..W {
+                let block = ((col + shift * CTB) / CTB + row / CTB) % 4;
+                y[row * W + col] = (96 + block * 9) as u8;
+            }
+        }
+        let mut cb = vec![0u8; (W / 2) * (H / 2)];
+        let mut cr = vec![0u8; (W / 2) * (H / 2)];
+        for row in 0..H / 2 {
+            for col in 0..W / 2 {
+                let block = ((col + shift * CTB / 2) / (CTB / 2) + row / (CTB / 2)) % 4;
+                cb[row * (W / 2) + col] = (110 + block * 7) as u8;
+                cr[row * (W / 2) + col] = (140 - block * 7) as u8;
+            }
+        }
+        (y, cb, cr)
+    }
+
+    fn planes<'a>(p: &'a (Vec<u8>, Vec<u8>, Vec<u8>)) -> SourcePlanes<'a> {
+        SourcePlanes {
+            y: &p.0,
+            cb: &p.1,
+            cr: &p.2,
+            width: W,
+            height: H,
+        }
+    }
+
+    fn plan(src: &(Vec<u8>, Vec<u8>, Vec<u8>), reference: Option<&[u8]>) -> PictureDecision {
+        decide_picture(&src.0, W, W, H, reference, DecisionConfig::default())
+    }
+
+    fn sse(a: &[u8], b: &[u8]) -> u64 {
+        a.iter()
+            .zip(b)
+            .map(|(&x, &y)| {
+                let d = i64::from(x) - i64::from(y);
+                (d * d) as u64
+            })
+            .sum()
+    }
+
+    #[test]
+    fn reconstruction_is_the_source_while_the_writer_codes_pcm_losslessly() {
+        // The shipped access unit neutralizes both loop filters, so the
+        // reconstruction a decoder derives is the source picture bit for bit —
+        // both for the intra picture and for one coded against a reference.
+        let src = source(0);
+        let intra = reconstruct_picture(planes(&src), None, &plan(&src, None), ReconConfig::default());
+        assert_eq!(intra.y, src.0);
+        assert_eq!(intra.cb, src.1);
+        assert_eq!(intra.cr, src.2);
+
+        let next = source(3);
+        let inter = reconstruct_picture(
+            planes(&next),
+            Some(&intra),
+            &plan(&next, Some(&intra.y)),
+            ReconConfig::default(),
+        );
+        assert_eq!(inter.y, next.0);
+        assert_eq!(inter.cb, next.1);
+        assert_eq!(inter.cr, next.2);
+    }
+
+    #[test]
+    fn pcm_suppression_keeps_enabled_filters_from_touching_the_reconstruction() {
+        // §8.7.2.5.4 / §8.7.3.1: every coding unit here is a PCM block, so
+        // `pcm_loop_filter_disabled_flag == 1` must leave every sample alone
+        // even with both filters enabled in the PPS / slice header.
+        let src = source(0);
+        let suppressed = reconstruct_picture(
+            planes(&src),
+            None,
+            &plan(&src, None),
+            ReconConfig {
+                deblocking: true,
+                sao_luma: true,
+                sao_chroma: true,
+                ..ReconConfig::default()
+            },
+        );
+        assert_eq!(suppressed.y, src.0);
+        assert_eq!(suppressed.cb, src.1);
+        assert_eq!(suppressed.cr, src.2);
+    }
+
+    #[test]
+    fn enabled_in_loop_filters_modify_the_reconstruction() {
+        let src = source(0);
+        let filtered = reconstruct_picture(
+            planes(&src),
+            None,
+            &plan(&src, None),
+            ReconConfig {
+                deblocking: true,
+                sao_luma: true,
+                sao_chroma: true,
+                pcm_loop_filter_disabled: false,
+                ..ReconConfig::default()
+            },
+        );
+        assert_ne!(
+            filtered.y, src.0,
+            "an enabled deblocking + SAO pass must reach the reconstructed luma"
+        );
+        assert_eq!(filtered.y.len(), src.0.len());
+        assert_eq!(filtered.cb.len(), src.1.len());
+    }
+
+    #[test]
+    fn sao_estimation_does_not_increase_distortion_against_the_source() {
+        // The estimator picks per-CTB edge offsets by the SSE reduction they
+        // buy, and refuses a class that buys none, so enabling SAO on top of
+        // the deblocked reconstruction can only move it towards the source.
+        let src = source(0);
+        let deblocked = reconstruct_picture(
+            planes(&src),
+            None,
+            &plan(&src, None),
+            ReconConfig {
+                deblocking: true,
+                pcm_loop_filter_disabled: false,
+                ..ReconConfig::default()
+            },
+        );
+        let with_sao = reconstruct_picture(
+            planes(&src),
+            None,
+            &plan(&src, None),
+            ReconConfig {
+                deblocking: true,
+                sao_luma: true,
+                sao_chroma: true,
+                pcm_loop_filter_disabled: false,
+                ..ReconConfig::default()
+            },
+        );
+        assert!(
+            sse(&with_sao.y, &src.0) < sse(&deblocked.y, &src.0),
+            "SAO estimation found no offsets on a deblocked picture that needs them"
+        );
+        assert!(sse(&with_sao.cb, &src.1) <= sse(&deblocked.cb, &src.1));
+    }
+
+    #[test]
+    fn inter_reconstruction_predicts_from_the_reference_not_the_source() {
+        // A reference that is not the source picture still reconstructs to the
+        // source, because the residual is coded against whatever prediction
+        // the reference produced — which is exactly the property that keeps
+        // the encoder's reference and the decoder's in step.
+        let src = source(0);
+        let mut reference = reconstruct_picture(
+            planes(&src),
+            None,
+            &plan(&src, None),
+            ReconConfig::default(),
+        );
+        for sample in &mut reference.y {
+            *sample = sample.saturating_add(9);
+        }
+        let next = source(2);
+        let out = reconstruct_picture(
+            planes(&next),
+            Some(&reference),
+            &plan(&next, Some(&reference.y)),
+            ReconConfig::default(),
+        );
+        assert_eq!(out.y, next.0);
+    }
+
+    #[test]
+    fn every_ctb_gets_a_deblocking_descriptor_with_picture_edges_excluded() {
+        let cus = deblock_descriptors(W, H, 26);
+        assert_eq!(cus.len(), (W / CTB) * (H / CTB));
+        assert!(!cus[0].filter_left && !cus[0].filter_top);
+        assert!(cus[1].filter_left && !cus[1].filter_top);
+        let second_row = &cus[W / CTB];
+        assert!(!second_row.filter_left && second_row.filter_top);
+    }
+}
