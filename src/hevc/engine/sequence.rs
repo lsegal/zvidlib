@@ -202,7 +202,15 @@ impl SequenceDecoder {
     /// unspecified after an error.
     pub fn push_annexb(&mut self, data: &[u8]) -> Result<(), SequenceError> {
         for unit in NalIter::new(data) {
-            self.push_nal_unit(unit?)?;
+            let unit = {
+                // Issue #189 stage attribution: start-code scan and §7.3.1.1
+                // emulation-prevention unescaping.
+                let _profile = crate::hevc::engine::profile::scope(
+                    crate::hevc::engine::profile::Stage::HeaderParse,
+                );
+                unit?
+            };
+            self.push_nal_unit(unit)?;
         }
         Ok(())
     }
@@ -212,11 +220,6 @@ impl SequenceDecoder {
     /// # Errors
     /// Any parse / decode error.
     pub fn push_nal_unit(&mut self, unit: NalUnit) -> Result<(), SequenceError> {
-        // Issue #189 stage attribution: header work for this NAL. The picture
-        // decode a `finish_picture` inside can trigger opens its own scopes,
-        // so those nest out of this one rather than inflating it.
-        let _profile =
-            crate::hevc::engine::profile::scope(crate::hevc::engine::profile::Stage::HeaderParse);
         let NalUnit {
             header,
             rbsp,
@@ -229,6 +232,10 @@ impl SequenceDecoder {
             if first_in_pic {
                 self.finish_picture()?;
             }
+            // Issue #189 stage attribution: §7.3.6 slice segment header.
+            let _profile = crate::hevc::engine::profile::scope(
+                crate::hevc::engine::profile::Stage::HeaderParse,
+            );
             let pps_id = peek_slice_pps_id(&rbsp, header.nal_unit_type)?;
             let pps = self
                 .pps
@@ -274,6 +281,9 @@ impl SequenceDecoder {
                 if header.nuh_layer_id == 0 {
                     self.finish_picture()?;
                 }
+                let _profile = crate::hevc::engine::profile::scope(
+                    crate::hevc::engine::profile::Stage::HeaderParse,
+                );
                 let sps = SeqParameterSet::parse(&rbsp)?;
                 self.sps.insert(sps.sps_id, sps);
             }
@@ -281,6 +291,9 @@ impl SequenceDecoder {
                 if header.nuh_layer_id == 0 {
                     self.finish_picture()?;
                 }
+                let _profile = crate::hevc::engine::profile::scope(
+                    crate::hevc::engine::profile::Stage::HeaderParse,
+                );
                 let pps = PicParameterSet::parse(&rbsp)?;
                 self.pps.insert(pps.pps_id, pps);
             }

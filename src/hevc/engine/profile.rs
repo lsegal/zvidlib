@@ -63,6 +63,8 @@ pub enum Stage {
     IntraPred = 4,
     /// §8.5.3.3 inter prediction: interpolation and the weighted combine.
     InterPred = 5,
+    /// §8.5.3.2 motion-vector derivation: merge and AMVP candidate lists.
+    MotionDerive = 10,
     /// §8.7.2 in-loop deblocking.
     Deblock = 6,
     /// §8.7.3 sample adaptive offset.
@@ -74,7 +76,7 @@ pub enum Stage {
 }
 
 /// Number of [`Stage`] variants — the width of every accumulator array here.
-pub const STAGE_COUNT: usize = 10;
+pub const STAGE_COUNT: usize = 11;
 
 /// Every [`Stage`], in declaration order, for reporting.
 pub const STAGES: [Stage; STAGE_COUNT] = [
@@ -84,6 +86,7 @@ pub const STAGES: [Stage; STAGE_COUNT] = [
     Stage::InverseTransform,
     Stage::IntraPred,
     Stage::InterPred,
+    Stage::MotionDerive,
     Stage::Deblock,
     Stage::Sao,
     Stage::DpbOutput,
@@ -101,6 +104,7 @@ impl Stage {
             Stage::InverseTransform => "inverse_transform",
             Stage::IntraPred => "intra_pred",
             Stage::InterPred => "inter_pred",
+            Stage::MotionDerive => "motion_derive",
             Stage::Deblock => "deblock",
             Stage::Sao => "sao",
             Stage::DpbOutput => "dpb_output",

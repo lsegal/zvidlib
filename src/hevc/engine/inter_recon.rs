@@ -352,7 +352,15 @@ pub fn resolve_and_reconstruct_inter_cu(
         n_cb_s,
         part_mode: cu.part_mode.into(),
     };
-    let motions = resolve_cu_motion(field, desc, pus, ctx, available);
+    // Issue #189 stage attribution: §8.5.3.2 candidate-list construction is
+    // pointer-chasing over the neighbour motion field rather than arithmetic
+    // over sample arrays, so it is its own stage and not part of `inter_pred`.
+    let motions = {
+        let _profile = crate::hevc::engine::profile::scope(
+            crate::hevc::engine::profile::Stage::MotionDerive,
+        );
+        resolve_cu_motion(field, desc, pus, ctx, available)
+    };
     let rects = crate::hevc::engine::pu_mv::pu_partitions(
         cu.x0 as usize,
         cu.y0 as usize,
