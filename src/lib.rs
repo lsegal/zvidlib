@@ -111,6 +111,14 @@ pub use transfer::{
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use av1_decoder::native_av1_video_decoder_factory;
+/// Prepared per-stage HEVC decoder workloads for the benchmark suite.
+///
+/// The HEVC engine is crate-private, so `benches/codec.rs` — an external crate —
+/// cannot time its individual decode stages directly the way it times the public
+/// AV1 kernels. This is the narrow surface that lets it: one prepared workload
+/// per hot stage, with input construction separated from the kernel under test.
+#[cfg(not(target_arch = "wasm32"))]
+pub use hevc::stage_bench as hevc_stage_bench;
 #[cfg(not(target_arch = "wasm32"))]
 pub use hevc::native_hevc_video_decoder_factory;
 #[cfg(not(target_arch = "wasm32"))]
