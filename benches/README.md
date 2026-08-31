@@ -1,21 +1,25 @@
 # Benchmarks
 
 zvidlib's benchmarks run under [criterion](https://docs.rs/criterion) with
-`harness = false`, across five bench targets that share `benches/support/`:
+`harness = false`, across six bench targets that share `benches/support/`:
 
 | Target | Measures |
 | --- | --- |
 | `benches/codec.rs` | codec work: decode, encoder inputs, and the per-ISA SIMD groups |
 | `benches/av1_decode.rs` | the AV1 software decoder: whole-frame decode and every hot stage, scalar versus SIMD |
+| `benches/av1_encode.rs` | the AV1 encoder's kernels: the forward transforms, scalar versus SIMD |
 | `benches/audio_decode.rs` | the audio decode path: AAC access units and `AacSampleReader` range/seek reads |
 | `benches/audio_mux.rs` | the audio container path: MP4 muxing, sample-table growth, demux, and gapless timing |
 | `benches/hevc_encode.rs` | the pure-Rust HEVC encoder, whole-frame and per-stage |
 
 Each target loads and decodes its fixtures once per process, so every iteration
 measures the work under test and nothing else. `codec` is one target rather than
-several because its groups share the same decoded-frame cache; the AV1 decoder
-suite, the two audio targets and `hevc_encode` share none of those fixtures and
-are separately runnable. The encoder target is separate for a second reason too:
+several because its groups share the same decoded-frame cache; the two AV1
+suites, the two audio targets and `hevc_encode` share none of those fixtures and
+are separately runnable. The AV1 decode and encode suites are separate targets
+from each other so neither one's name overstates what it measures: encoder
+kernels are not decoder stages, even where both reach the same `av1_simd`
+dispatch site. The encoder target is separate for a second reason too:
 its mode search is slow enough that keeping it out of the default
 `cargo bench --bench codec` run is worth more than sharing a process.
 
@@ -25,6 +29,7 @@ its mode search is slow enough that keeping it out of the default
 cargo bench                       # the default, fast groups in every target
 cargo bench --bench codec         # codec work only
 cargo bench --bench av1_decode    # the AV1 software decoder only
+cargo bench --bench av1_encode    # the AV1 encoder kernels only
 cargo bench --bench audio_decode  # the audio decode path only
 cargo bench --bench audio_mux     # the audio container path only
 cargo bench --bench hevc_encode   # the HEVC encoder groups only
@@ -144,6 +149,11 @@ There is no separate CDF-adaptation measurement because both AV1 decoders in the
 crate require `disable_cdf_update = 1`, so `src/av1_cdf.rs`'s tables are read but
 never adapted.
 
+The forward transforms are not in this table. They are encoder kernels and are
+measured by [the AV1 encoder suite](#the-av1-encoder-suite---bench-av1_encode)
+instead, even though they reach the same `av1_simd` dispatch site as the inverse
+transforms above.
+
 This target replaces the ad-hoc, `#[ignore]`d `tests/av1_simd_bench.rs`: its
 input generators are now `support::av1_structured_plane`,
 `support::av1_flat_blocks_plane`, and `support::av1_wide_tx_grid`, and its
@@ -163,6 +173,27 @@ Filter to one of them the same way as any other group:
 cargo bench --bench codec -- av1_deblock
 cargo bench --bench av1_decode -- 'av1_deblock/scalar'
 cargo bench --bench av1_decode -- av1_inverse   # every inverse-transform group
+```
+
+## The AV1 encoder suite (`--bench av1_encode`)
+
+`benches/av1_encode.rs` measures AV1's encoder-side kernels. Today that is the
+forward transform set:
+
+| Group | Stage |
+| --- | --- |
+| `av1_forward_dct_{4x4,8x8,16x16,32x32}` | forward DCT, `src/av1_encoder/transform.rs` through `zvidlib::forward_transform` |
+| `av1_forward_adst_8x8`, `av1_forward_flipadst_16x16` | the forward ADST family, including a flipped type |
+
+They run once per available instruction set through
+`support::isa::bench_across_isas`, under the same bit-exactness and
+`active_by_site()` guards as every other per-ISA group, and over the same
+1920x1080 block counts and coefficient generator as the inverse-transform
+groups in `av1_decode` — so the two directions stay directly comparable:
+
+```sh
+cargo bench --bench av1_encode -- av1_forward
+cargo bench --bench av1_encode -- 'av1_forward_dct_16x16/scalar'
 ```
 
 Note that the correctness guard below runs for every group in a target
@@ -212,6 +243,99 @@ Each `run_*` returns an eight-byte FNV-1a fold over every sample the stage
 produced rather than the samples themselves, which keeps a multi-megabyte
 allocation out of the timed loop while still letting the bit-exactness guard
 catch a backend that diverged anywhere.
+
+### Where HEVC decode time actually goes
+
+The per-stage groups above time each kernel on a workload of its own, which
+bounds what vectorizing that stage *could* buy. It does not say what it *does*
+buy, because it does not say how much of a real frame goes through the stage.
+Issue #189 is that gap: `hevc_decode/<isa>` moves only ~1.06x between the
+`scalar` and `neon` arms while §8.5.3.3 luma interpolation measures 1.6-1.7x,
+§8.7.3 SAO 2.4x and §8.7.2 deblocking 1.3x in isolation.
+
+`examples/hevc_decode_profile.rs` closes it. It decodes the bundled sample
+through the ordinary public decoder with `zvidlib::hevc_decode_profile` running,
+which charges wall time to a stage *exclusively* — the §7.3.8.11 residual parse
+nested inside the §7.3.8 slice-data walk is subtracted from it rather than
+counted twice — and prints each stage's share:
+
+```sh
+cargo run --release --features native --example hevc_decode_profile
+cargo run --release --features native --example hevc_decode_profile -- 120
+cargo run --release --features native --example hevc_decode_profile -- 48 scalar
+```
+
+The second positional argument is a frame count and the third pins an
+instruction set. `native` gates no code in the example; it is what keeps the
+wasm build, which has no HEVC decoder, from compiling a native-only target.
+
+It is an example rather than a criterion group because the question is how one
+decode divides, which is a composition rather than a number to regress against.
+Run it under `--release`: at `opt-level = 2` the stage mix is not the shipped
+build's.
+
+#### The breakdown
+
+48 frames of `examples/media/BigBuckBunny.mp4` (1920x1080, HEVC Main 8-bit
+4:2:0) on an Apple Silicon host, `--release`, `scalar` arm, 37.4 ms/frame. The
+`neon` arm gives the same shares to within a point, which is itself the finding
+the ~1.06x number was pointing at.
+
+| Stage | Share of total | Share of decode | ms/frame | Vectorized |
+| --- | ---: | ---: | ---: | --- |
+| `color_convert` | 33.5% | n/a | 12.54 | no |
+| `inter_pred` | 22.9% | 34.4% | 8.57 | yes |
+| `sao` | 8.9% | 13.4% | 3.34 | yes |
+| `deblock` | 8.0% | 12.0% | 2.98 | yes |
+| `intra_pred` | 3.8% | 5.7% | 1.41 | yes |
+| `residual_cabac` | 3.5% | 5.3% | 1.32 | no |
+| `motion_derive` | 3.3% | 4.9% | 1.23 | no |
+| `inverse_transform` | 2.8% | 4.2% | 1.04 | yes |
+| `slice_data_cabac` | 2.0% | 2.9% | 0.73 | no |
+| `dpb_output` | 1.8% | 2.7% | 0.67 | no |
+| `header_parse` | 0.0% | 0.0% | 0.01 | no |
+| _unattributed_ | 9.5% | 14.3% | 3.55 | n/a |
+
+"Share of decode" divides by the total minus `color_convert`, because colour
+conversion is not decoding: it is the YUV420-to-RGBA pass every whole-frame
+measurement takes on the way out of the decoder. Both denominators are reported
+because the two answer different questions and are easy to confuse.
+
+_unattributed_ is real work in no instrumented scope — the coding-quadtree and
+CTU walks, the per-CU residual extraction glue, and allocation between stages.
+It is left as its own row rather than spread across the stages, so no share is
+inflated by work it does not do. The profiler's own cost is under 1% of the
+total at ~327k scopes; the example prints that bound on every run.
+
+#### What it says
+
+**The issue's hypothesis was wrong.** Entropy decoding is not where the time
+goes. `slice_data_cabac` and `residual_cabac` together are **5.5% of the total
+and 8.2% of decode proper** — the §9.3.4 arithmetic decoder is serial and has no
+vector path, but it is nowhere near large enough to be the reason whole-frame
+SIMD reads flat.
+
+**Vectorized stages cover 46.3% of the measured total and 69.6% of decode
+proper.** By Amdahl, infinitely fast vector kernels would move the measured
+whole-frame number 1.86x, a uniform 2x on those stages gives 1.30x, and a
+uniform 4x gives 1.53x. So the kernels are *not* a minority of decode time — the
+ceiling is high enough that the observed ~1.06x is a shortfall against it, not a
+consequence of it.
+
+**The single largest item is not decoding at all.** `color_convert` is a third
+of everything the whole-frame groups measure, it is on the path of both
+`hevc_decode_1080p` and `hevc_decode/<isa>`, and it has no vector kernel: it is
+the per-sample BT.601/709 integer conversion in `picture_to_rgba`. Every
+whole-frame SIMD number is diluted by roughly a third for a stage no HEVC kernel
+touches.
+
+**The next target is therefore colour conversion, not CABAC.** It is the largest
+single stage, it is embarrassingly parallel per sample, and it is the one place
+where a new kernel would move the headline number by more than any further work
+on the existing ones. Second is `inter_pred`, which at 34% of decode proper is
+the largest true decode stage — but it is already vectorized, so the work there
+is the #166 / #202 question of why its measured arms sit near parity on this
+host rather than a question of coverage.
 
 ### Correctness guard
 
