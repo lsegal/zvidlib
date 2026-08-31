@@ -23,9 +23,9 @@
 //!   (`TX_SET_INTRA_1`/`TX_SET_INTRA_2` for intra blocks and
 //!   `TX_SET_INTER_1`/`TX_SET_INTER_2`/`TX_SET_INTER_3` for inter blocks,
 //!   as `reduced_tx_set` and the transform size select, and
-//!   `TX_SET_DCTONLY` above `TX_32X32`; the half-identity `V_*`/`H_*`
-//!   types the larger sets contain have no kernel here and are rejected as
-//!   unsupported), coefficients are dequantized
+//!   `TX_SET_DCTONLY` above `TX_32X32`, including the half-identity
+//!   `V_*`/`H_*` types the larger sets contain), coefficients are
+//!   dequantized
 //!   ([`crate::av1_intra::get_dc_quant`]/[`crate::av1_intra::get_ac_quant`])
 //!   and inverse transformed ([`crate::av1_intra::inverse_transform`]),
 //!   `loop_filter_params` is parsed, and the chosen per-block transform
@@ -1504,9 +1504,9 @@ impl<'a> InterTileDecoder<'a> {
     /// block is inter-predicted, and the frame's `reduced_tx_set`. Intra
     /// blocks additionally select the CDF by their `YMode`.
     ///
-    /// `TX_SET_DCTONLY` codes no symbol. The half-identity `V_*`/`H_*`
-    /// types the larger sets contain have no kernel in this crate and are
-    /// rejected as unsupported.
+    /// `TX_SET_DCTONLY` codes no symbol. Every other entry of every set has
+    /// a kernel, so a symbol only fails here if a future set entry is added
+    /// ahead of its kernel.
     fn read_tx_type(
         &mut self,
         tx_width: usize,
@@ -3065,9 +3065,12 @@ mod tests {
             // TX_SET_INTER_3 (reduced_tx_set = 1): {IDTX, DCT_DCT}.
             (true, 0, Av1TxType::Idtx),
             (true, 1, Av1TxType::DctDct),
-            // TX_SET_INTER_2 (16x16, reduced_tx_set = 0), skipping the
-            // V_DCT/H_DCT entries at symbol indices 1 and 2.
+            // TX_SET_INTER_2 (16x16, reduced_tx_set = 0), including the
+            // half-identity V_DCT/H_DCT entries only it and TX_SET_INTER_1
+            // contain.
             (false, 0, Av1TxType::Idtx),
+            (false, 1, Av1TxType::VDct),
+            (false, 2, Av1TxType::HDct),
             (false, 3, Av1TxType::DctDct),
             (false, 4, Av1TxType::AdstDct),
             (false, 5, Av1TxType::DctAdst),
@@ -3139,12 +3142,74 @@ mod tests {
         }
     }
 
-    /// `TX_SET_INTER_2` also contains the half-identity `V_DCT`/`H_DCT`
-    /// types, which have no kernel here and must be an explicit
-    /// `Unsupported` rather than a silent substitution.
+    /// The same inter frame as [`non_lossless_inter_temporal_unit`], but
+    /// under `TX_MODE_SELECT` with `tx_depth = 1`, so the 16x16 coding block
+    /// carries four 8x8 transform blocks and `get_tx_set` derives
+    /// `TX_SET_INTER_1` - the only set containing `V_ADST`, `H_ADST`,
+    /// `V_FLIPADST` and `H_FLIPADST`.
+    ///
+    /// Only the last transform block (the bottom-right 8x8, at luma (8, 8))
+    /// codes a coefficient; the other three are skipped, which leaves every
+    /// level and DC context zero, so all four `txb_skip` symbols use context
+    /// 1 just as the single 16x16 block does.
+    fn non_lossless_inter_8x8_temporal_unit(tx_type_symbol: usize) -> Vec<u8> {
+        let mut e = SymbolEncoder::new();
+        e.symbol(&cdf::PARTITION_W16[0], 0); // one 16x16 block
+        e.symbol(&cdf::SKIP[0], 0);
+        e.symbol(&cdf::IS_INTER, 1);
+        e.symbol(&cdf::SINGLE_REF_P1, 0);
+        e.symbol(&cdf::SINGLE_REF_P3, 0);
+        e.symbol(&cdf::SINGLE_REF_P4, 0);
+        e.symbol(&cdf::NEW_MV, 1);
+        e.symbol(&cdf::ZERO_MV, 0); // GLOBALMV
+        e.symbol(cdf::tx_depth_cdf(16).0, 1); // TX_16X16 >> 1 = TX_8X8
+        for _ in 0..3 {
+            e.symbol(&cdf::TXB_SKIP[1], 1); // skipped, no coefficients
+        }
+        e.symbol(&cdf::TXB_SKIP[1], 0); // not skipped
+        e.symbol(cdf::eob_pt_cdf(8, 0), 0); // eob_point = 1 -> eob = 1
+        e.symbol(&cdf::COEFF_BASE_EOB[0][0], 2); // level = 3 (max base)
+        e.symbol(&cdf::COEFF_BR[0][0], 1); // +1, stop (level = 4)
+        e.symbol(&cdf::DC_SIGN[0][0], 0); // positive
+        e.symbol(
+            cdf::tx_type_cdf(cdf::Av1TxSet::Inter1, 8, 0).unwrap(),
+            tx_type_symbol,
+        );
+
+        let mi = 2 * FRAME_DIM.div_ceil(8) as usize;
+        let mut payload = FrameHeaderBuilder::inter_frame(3, 1, 0x01, [0; 7], None)
+            .finish_common_with_quantizer(
+                false,
+                false,
+                mi,
+                mi,
+                40,
+                Some((0, 0, 0, 0, 0)),
+                true,
+                false,
+            );
+        payload.extend_from_slice(&e.finish());
+
+        let mut stream = Vec::new();
+        push_obu(&mut stream, 2, &[]); // temporal delimiter
+        push_obu(&mut stream, 6, &payload); // Frame OBU
+        stream
+    }
+
+    /// `TX_SET_INTER_1` is the widest set in the specification, and the only
+    /// one carrying the half-identity ADST types. Every one of its sixteen
+    /// entries must reach its kernel from an 8x8 inter transform block.
     #[test]
-    fn signalling_a_half_identity_inter_transform_type_is_unsupported() {
-        for symbol in [1usize, 2] {
+    fn every_signalled_inter_1_transform_type_reconstructs_through_its_kernel() {
+        let reference = non_lossless_reference_luma();
+        let mut coefficients = vec![0i32; 8 * 8];
+        coefficients[0] = 4;
+        let mut seen: Vec<(Av1TxType, Vec<u8>)> = Vec::new();
+        for (symbol, (name, tx_type)) in cdf::tx_type_inverse_set(cdf::Av1TxSet::Inter1)
+            .iter()
+            .enumerate()
+        {
+            let tx_type = tx_type.expect("every TX_SET_INTER_1 entry has a kernel");
             let mut decoder = Av1InterDecoder::new(Limits::default()).unwrap();
             decoder
                 .decode_temporal_unit(&non_lossless_key_frame_temporal_unit(
@@ -3155,16 +3220,48 @@ mod tests {
                     1,
                 ))
                 .unwrap();
+            let frame = decoder
+                .decode_temporal_unit(&non_lossless_inter_8x8_temporal_unit(symbol))
+                .unwrap();
+            let residuals = inverse_transform(
+                &coefficients,
+                8,
+                tx_type,
+                get_dc_quant(40),
+                get_ac_quant(40),
+            );
+            let stride = frame.planes[0].stride;
+            // The coded transform block is the coding block's bottom-right
+            // 8x8, at luma (8, 8).
+            let expected: Vec<u8> = (8..16)
+                .flat_map(|row| (8..16).map(move |column| (row, column)).collect::<Vec<_>>())
+                .map(|(row, column)| {
+                    let predicted = i32::from(reference[row * stride + column]);
+                    let residual = residuals[(row - 8) * 8 + (column - 8)];
+                    (predicted + i32::from(residual)).clamp(0, 255) as u8
+                })
+                .collect();
+            let decoded: Vec<u8> = (8..16)
+                .flat_map(|row| frame.planes[0].data[row * stride + 8..row * stride + 16].to_vec())
+                .collect();
+            assert_eq!(decoded, expected, "{name}");
+            // The three skipped transform blocks must be untouched
+            // prediction, or the fixture is not decoding what it claims.
             assert_eq!(
-                decoder
-                    .decode_temporal_unit(&non_lossless_inter_temporal_unit(
-                        false,
-                        cdf::Av1TxSet::Inter2,
-                        symbol,
-                    ))
-                    .unwrap_err()
-                    .kind(),
-                ErrorKind::Unsupported
+                frame.planes[0].data[..stride],
+                reference[..stride],
+                "{name} perturbed a skipped transform block"
+            );
+            seen.push((tx_type, decoded));
+        }
+        // Each distinct kernel must produce a distinct block, or the
+        // assertions above would pass on a decoder that ignored tx_type.
+        for (index, (tx_type, block)) in seen.iter().enumerate() {
+            assert!(
+                !seen[..index]
+                    .iter()
+                    .any(|(other, earlier)| other != tx_type && earlier == block),
+                "{tx_type:?} is not distinguishable from an earlier transform type"
             );
         }
     }

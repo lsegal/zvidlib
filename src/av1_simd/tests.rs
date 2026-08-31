@@ -148,7 +148,7 @@ fn out_of_range_walsh_hadamard_blocks_fall_back_to_scalar() {
 
 /// Every transform type this crate implements, paired with the sizes it is
 /// defined at. ADST has no 32- or 64-point kernel in AV1.
-const TX_TYPES: [(Av1TxType, &[usize]); 10] = [
+const TX_TYPES: [(Av1TxType, &[usize]); 16] = [
     (Av1TxType::Idtx, &[4, 8, 16, 32, 64]),
     (Av1TxType::DctDct, &[4, 8, 16, 32, 64]),
     (Av1TxType::AdstDct, &[4, 8, 16]),
@@ -159,6 +159,12 @@ const TX_TYPES: [(Av1TxType, &[usize]); 10] = [
     (Av1TxType::FlipadstFlipadst, &[4, 8, 16]),
     (Av1TxType::AdstFlipadst, &[4, 8, 16]),
     (Av1TxType::FlipadstAdst, &[4, 8, 16]),
+    (Av1TxType::VDct, &[4, 8, 16, 32, 64]),
+    (Av1TxType::HDct, &[4, 8, 16, 32, 64]),
+    (Av1TxType::VAdst, &[4, 8, 16]),
+    (Av1TxType::HAdst, &[4, 8, 16]),
+    (Av1TxType::VFlipadst, &[4, 8, 16]),
+    (Av1TxType::HFlipadst, &[4, 8, 16]),
 ];
 
 #[test]
