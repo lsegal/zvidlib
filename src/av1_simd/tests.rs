@@ -698,7 +698,10 @@ unsafe fn check_vector_byte_paths<V: vector::I32x>() {
                     } else {
                         0xaa
                     };
-                    assert_eq!(masked[lane], expected, "masked store lane {lane}, {count} of {case:?}");
+                    assert_eq!(
+                        masked[lane], expected,
+                        "masked store lane {lane}, {count} of {case:?}"
+                    );
                 }
             }
         }
@@ -715,12 +718,8 @@ unsafe fn check_vector_byte_paths<V: vector::I32x>() {
         loaded.store(&mut lanes);
         for (lane, &word) in lanes.iter().enumerate().take(V::LANES) {
             let at = BASE + lane * STRIDE;
-            let expected = i32::from_le_bytes([
-                buffer[at],
-                buffer[at + 1],
-                buffer[at + 2],
-                buffer[at + 3],
-            ]);
+            let expected =
+                i32::from_le_bytes([buffer[at], buffer[at + 1], buffer[at + 2], buffer[at + 3]]);
             assert_eq!(word, expected, "load_u32_rows lane {lane}");
         }
 
@@ -734,8 +733,7 @@ unsafe fn check_vector_byte_paths<V: vector::I32x>() {
         for index in 0..buffer.len() {
             let lane = index.checked_sub(BASE).map(|offset| offset / STRIDE);
             let column = index.wrapping_sub(BASE) % STRIDE;
-            let inside =
-                index >= BASE && column < 4 && lane.is_some_and(|lane| lane < V::LANES);
+            let inside = index >= BASE && column < 4 && lane.is_some_and(|lane| lane < V::LANES);
             let expected = if inside {
                 (column + 1) as u8
             } else {
