@@ -2019,38 +2019,52 @@ mod tests {
         let p0 = intermediates(31, combine_len, 8);
         let p1 = intermediates(32, combine_len, 8);
 
+        // Every figure below is the *minimum* over `rounds` timed passes,
+        // and the backends are measured round-robin inside each round. A
+        // single timed pass on a loaded machine swings by more than 2x,
+        // which is enough to report a real speedup as a regression; the
+        // minimum is the pass that suffered least interference and is the
+        // closest this can get to the kernel's own cost.
+        let rounds = 5;
+        let isas = simd::available_isas();
         println!(
-            "\ninter-prediction kernels, {} 16x16 blocks/pass",
+            "\ninter-prediction kernels, {} 16x16 blocks/pass, best of {rounds} rounds",
             blocks.len()
         );
-        let mut baselines = [0f64; 3];
-        for (i, isa) in simd::available_isas().into_iter().enumerate() {
-            let start = Instant::now();
-            let mut sink = 0i64;
-            for &(x, y) in &blocks {
-                let b = interp_luma_block_with(isa, &plane, x, y, 2, 3, 16, 16, 8).unwrap();
-                sink += b[0] as i64;
-            }
-            let luma = start.elapsed().as_secs_f64();
+        let mut best = vec![[f64::INFINITY; 3]; isas.len()];
+        let mut sink = 0i64;
+        for _ in 0..rounds {
+            for (i, &isa) in isas.iter().enumerate() {
+                let start = Instant::now();
+                for &(x, y) in &blocks {
+                    let b = interp_luma_block_with(isa, &plane, x, y, 2, 3, 16, 16, 8).unwrap();
+                    sink += b[0] as i64;
+                }
+                let luma = start.elapsed().as_secs_f64();
 
-            let start = Instant::now();
-            for &(x, y) in &blocks {
-                let b = interp_chroma_block_with(isa, &plane, x / 2, y / 2, 5, 3, 8, 8, 8).unwrap();
-                sink += b[0] as i64;
-            }
-            let chroma = start.elapsed().as_secs_f64();
+                let start = Instant::now();
+                for &(x, y) in &blocks {
+                    let b =
+                        interp_chroma_block_with(isa, &plane, x / 2, y / 2, 5, 3, 8, 8, 8).unwrap();
+                    sink += b[0] as i64;
+                }
+                let chroma = start.elapsed().as_secs_f64();
 
-            let start = Instant::now();
-            for _ in &blocks {
-                let b = default_weighted_pred_with(isa, &p0, &p1, true, true, 16, 16, 8).unwrap();
-                sink += b[0] as i64;
-            }
-            let combine = start.elapsed().as_secs_f64();
+                let start = Instant::now();
+                for _ in &blocks {
+                    let b =
+                        default_weighted_pred_with(isa, &p0, &p1, true, true, 16, 16, 8).unwrap();
+                    sink += b[0] as i64;
+                }
+                let combine = start.elapsed().as_secs_f64();
 
-            let timings = [luma, chroma, combine];
-            if i == 0 {
-                baselines = timings;
+                for (slot, t) in best[i].iter_mut().zip([luma, chroma, combine]) {
+                    *slot = slot.min(t);
+                }
             }
+        }
+        let baselines = best[0];
+        for (isa, [luma, chroma, combine]) in isas.iter().zip(best.iter().copied()) {
             println!(
                 "  {:>8}  luma 8-tap 2D {:7.2} ms ({:4.2}x)  chroma 4-tap 2D {:7.2} ms ({:4.2}x)  \
                  bi combine {:7.2} ms ({:4.2}x){}",

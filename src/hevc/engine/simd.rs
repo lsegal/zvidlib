@@ -669,6 +669,21 @@ unsafe fn filter_taps_neon<const N: usize>(
             vst1q_s32(o.add(12), vshlq_s32(a3, sh));
             i += 16;
         }
+        // An 8-wide step keeps two chains alive for the 8-sample rows the
+        // chroma filter and the narrow luma partitions produce.
+        while i + 8 <= count {
+            let mut a0 = vdupq_n_s32(0);
+            let mut a1 = vdupq_n_s32(0);
+            for (&c, tap) in coeffs.iter().zip(taps.iter()) {
+                let p = tap.as_ptr().add(i);
+                a0 = vmlaq_n_s32(a0, vld1q_s32(p), c);
+                a1 = vmlaq_n_s32(a1, vld1q_s32(p.add(4)), c);
+            }
+            let o = out.as_mut_ptr().add(i);
+            vst1q_s32(o, vshlq_s32(a0, sh));
+            vst1q_s32(o.add(4), vshlq_s32(a1, sh));
+            i += 8;
+        }
         while i + 4 <= count {
             let mut acc = vdupq_n_s32(0);
             for (&c, tap) in coeffs.iter().zip(taps.iter()) {
@@ -918,6 +933,21 @@ unsafe fn combine_weighted_neon<const N: usize>(
                 vst1q_s32(o.add(k * 4), vminq_s32(vmaxq_s32(v, lo), hi));
             }
             i += 16;
+        }
+        while i + 8 <= count {
+            let mut a0 = round;
+            let mut a1 = round;
+            for (&w, tap) in weights.iter().zip(taps.iter()) {
+                let q = tap.as_ptr().add(i);
+                a0 = vmlaq_n_s32(a0, vld1q_s32(q), w);
+                a1 = vmlaq_n_s32(a1, vld1q_s32(q.add(4)), w);
+            }
+            let o = out.as_mut_ptr().add(i);
+            for (k, acc) in [a0, a1].into_iter().enumerate() {
+                let v = vaddq_s32(vshlq_s32(acc, sh), post);
+                vst1q_s32(o.add(k * 4), vminq_s32(vmaxq_s32(v, lo), hi));
+            }
+            i += 8;
         }
         while i + 4 <= count {
             let mut acc = round;
@@ -2524,7 +2554,7 @@ pub(crate) mod in_loop {
         #[test]
         #[ignore = "benchmark; run explicitly with --ignored --nocapture"]
         fn bench_in_loop_filters() {
-            use std::time::Instant;
+            use std::time::{Duration, Instant};
             const W: usize = 1920;
             const H: usize = 1080;
             const CTB: usize = 64;
@@ -2617,51 +2647,53 @@ pub(crate) mod in_loop {
                 }
             };
 
+            // Each round times one scalar and one vector pass of each
+            // filter, and every reported figure is the *minimum* over the
+            // rounds rather than the mean of a single run. A single timed
+            // pass on a loaded machine swings by more than 2x — enough to
+            // invert a real speedup — so the mean of one run is not a
+            // measurement of the kernel at all. The minimum is the round
+            // that suffered least interference, which is the closest this
+            // can get to the kernel's own cost.
+            let rounds = 5;
             let reps = 10;
+            let mut sao = [Duration::MAX; 2];
+            let mut deblock = [Duration::MAX; 2];
             let guard = crate::simd::test_lock();
-            FORCE_SCALAR.store(true, Ordering::SeqCst);
-            let t = Instant::now();
-            for _ in 0..reps {
-                std::hint::black_box(sao_pass());
+            for _ in 0..rounds {
+                // Scalar and vector alternate inside the round so a burst
+                // of interference cannot land on only one of them.
+                for (slot, force_scalar) in [(0usize, true), (1, false)] {
+                    FORCE_SCALAR.store(force_scalar, Ordering::SeqCst);
+                    let t = Instant::now();
+                    for _ in 0..reps {
+                        std::hint::black_box(sao_pass());
+                    }
+                    sao[slot] = sao[slot].min(t.elapsed());
+                    let t = Instant::now();
+                    for _ in 0..reps {
+                        deblock_pass();
+                    }
+                    deblock[slot] = deblock[slot].min(t.elapsed());
+                }
             }
-            let sao_scalar = t.elapsed();
-            let t = Instant::now();
-            for _ in 0..reps {
-                deblock_pass();
-            }
-            let deblock_scalar = t.elapsed();
             FORCE_SCALAR.store(false, Ordering::SeqCst);
-            let t = Instant::now();
-            for _ in 0..reps {
-                std::hint::black_box(sao_pass());
-            }
-            let sao_simd = t.elapsed();
-            let t = Instant::now();
-            for _ in 0..reps {
-                deblock_pass();
-            }
-            let deblock_simd = t.elapsed();
             drop(guard);
 
-            let ratio = |a: std::time::Duration, b: std::time::Duration| {
-                a.as_secs_f64() / b.as_secs_f64().max(f64::EPSILON)
-            };
+            let ratio =
+                |a: Duration, b: Duration| a.as_secs_f64() / b.as_secs_f64().max(f64::EPSILON);
             println!(
-                "in-loop filter benchmark, {W}x{H} luma, {reps} frames, isa={}",
+                "in-loop filter benchmark, {W}x{H} luma, best of {rounds} rounds \u{d7} {reps} frames, isa={}",
                 isa()
             );
-            println!(
-                "  SAO      scalar {:>9.3?} / vector {:>9.3?}  => {:.2}x",
-                sao_scalar / reps,
-                sao_simd / reps,
-                ratio(sao_scalar, sao_simd)
-            );
-            println!(
-                "  deblock  scalar {:>9.3?} / vector {:>9.3?}  => {:.2}x",
-                deblock_scalar / reps,
-                deblock_simd / reps,
-                ratio(deblock_scalar, deblock_simd)
-            );
+            for (name, [scalar, simd]) in [("SAO     ", sao), ("deblock ", deblock)] {
+                println!(
+                    "  {name} scalar {:>9.3?} / vector {:>9.3?}  => {:.2}x",
+                    scalar / reps,
+                    simd / reps,
+                    ratio(scalar, simd)
+                );
+            }
         }
     }
 }
