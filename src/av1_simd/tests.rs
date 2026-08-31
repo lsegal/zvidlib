@@ -12,8 +12,10 @@
 
 use std::sync::MutexGuard;
 
+use super::forward_transform as forward_transform_simd;
 use super::inverse_transform as inverse_transform_simd;
 use super::*;
+use crate::av1_encoder::transform::forward_transform;
 use crate::av1_encoder::wht::{fwht4x4_scalar, iwht4x4_scalar};
 use crate::av1_filters::{
     CdefStrength, FilterFrame, FilterPlane, LoopFilterParams, RestorationUnit,
@@ -681,6 +683,109 @@ fn chroma_wide_deblocking_actually_runs_on_flat_content() {
     );
 }
 
+/// A grid of 16x16 luma transforms, whose subsampled 8x8 chroma transforms make
+/// §7.14.5 select the 6-tap filter on every interior chroma edge.
+fn luma_16x16_grid(width: usize, height: usize) -> TxSizeGrid {
+    let mut grid = TxSizeGrid::new(width, height);
+    for y in (0..height).step_by(16) {
+        for x in (0..width).step_by(16) {
+            grid.set_block(x, y, 16, 16);
+        }
+    }
+    grid
+}
+
+/// The 6-tap chunk path loads only `p2..q2`, which is sound exactly because
+/// `filter6` and its gates read nothing else. This pins that down from the
+/// outside: perturbing every chroma row the window does not cover must leave
+/// the four rows the edge writes bit-identical.
+///
+/// The chroma planes are `24x16` with 8x8 chroma transforms, so the only
+/// interior horizontal chroma edge is at `y = 8`; its window is rows `5..=10`
+/// and it writes rows `6..=9`. Each row is constant across the plane, so the
+/// vertical chroma edges see flat windows and leave the samples alone, and the
+/// perturbation stays outside the window on both sides.
+#[test]
+fn chroma_six_tap_output_depends_only_on_the_six_taps() {
+    const CW: usize = 24;
+    const CH: usize = 16;
+    /// Rows the 6-tap window covers, and the rows the edge writes.
+    const WINDOW: [usize; 2] = [5, 10];
+    const WRITTEN: [usize; 2] = [6, 10];
+
+    let deblocked = |row_value: &dyn Fn(usize) -> u8| {
+        let grid = luma_16x16_grid(2 * CW, 2 * CH);
+        let chroma = || {
+            let data: Vec<u8> = (0..CW * CH).map(|index| row_value(index / CW)).collect();
+            FilterPlane::from_samples(CW, CH, data, &Limits::default()).unwrap()
+        };
+        let mut frame = FilterFrame::new_yuv(
+            plane(2 * CW, 2 * CH, 0x77aa),
+            chroma(),
+            chroma(),
+            true,
+            true,
+        )
+        .unwrap();
+        deblock_frame(&mut frame, &deblock_params(40, 0), Some(&grid)).unwrap();
+        frame.u.unwrap().data
+    };
+    let rows = |data: &[u8], range: [usize; 2]| data[range[0] * CW..range[1] * CW].to_vec();
+
+    let base = |row: usize| if row < 8 { 100u8 } else { 110u8 };
+    let perturbed = |row: usize| {
+        if (WINDOW[0]..=WINDOW[1]).contains(&row) {
+            base(row)
+        } else {
+            base(row) ^ 0x5a
+        }
+    };
+
+    let results = for_each_isa(|_| (deblocked(&base), deblocked(&perturbed)));
+    for (isa, (plain, poisoned)) in &results {
+        assert_eq!(
+            rows(plain, WRITTEN),
+            rows(poisoned, WRITTEN),
+            "{} 6-tap chroma output should not depend on samples outside p2..q2",
+            isa.name()
+        );
+        // Neither half of the comparison may be vacuous: the perturbation has
+        // to reach the plane, and the 6-tap edge has to have filtered.
+        assert_ne!(
+            rows(plain, [0, 5]),
+            rows(poisoned, [0, 5]),
+            "{} the poisoned rows should differ, or nothing was perturbed",
+            isa.name()
+        );
+        let unfiltered: Vec<u8> = (WRITTEN[0]..WRITTEN[1])
+            .flat_map(|row| vec![base(row); CW])
+            .collect();
+        assert_ne!(
+            rows(plain, WRITTEN),
+            unfiltered,
+            "{} the 6-tap chroma edge should have filtered",
+            isa.name()
+        );
+    }
+}
+
+/// Chroma planes whose 6-tap window runs off the plane: with 8x8 chroma
+/// transforms the horizontal edge at `y = 8` reads up to row 10, so a chroma
+/// height of 10 or 11 puts `q2` outside the plane and the reduced-window path
+/// must replicate the nearest in-plane sample exactly as the scalar path does.
+#[test]
+fn chroma_six_tap_at_plane_borders_matches_the_scalar_reference() {
+    for (width, height) in [(40usize, 20usize), (36, 22), (34, 19), (22, 21)] {
+        let grid = luma_16x16_grid(width, height);
+        let results = for_each_isa(|_| {
+            let mut frame = flat_blocks_frame(width, height, 0x60_1de5);
+            deblock_frame(&mut frame, &deblock_params(40, 0), Some(&grid)).unwrap();
+            (frame.u.unwrap().data, frame.v.unwrap().data)
+        });
+        assert_all_match(&results, "deblocked chroma planes at plane borders");
+    }
+}
+
 /// Verifies 6-tap chroma output against spec-derived values rather than this
 /// crate's own scalar path, on every instruction set.
 ///
@@ -989,4 +1094,169 @@ fn avx2_byte_paths_match_the_scalar_reference() {
         return;
     }
     unsafe { run() };
+}
+// ---------------------------------------------------------------------
+// Forward transforms (issue #140)
+// ---------------------------------------------------------------------
+
+#[test]
+fn forward_transforms_match_the_scalar_reference_at_every_size_and_type() {
+    let mut rng = Lcg(0x5eed_0140_0000_0001);
+    for (tx_type, sizes) in TX_TYPES {
+        for &size in sizes {
+            // The forward kernels stop at 32 points; AV1 defines no 64-point
+            // forward transform, so skip the inverse-only 64x64 entries.
+            if size > 32 {
+                continue;
+            }
+            for _ in 0..40 {
+                let residual: Vec<i32> = (0..size * size).map(|_| rng.in_range(255)).collect();
+                let results = for_each_isa(|_| forward_transform(&residual, size, tx_type));
+                assert_all_match(
+                    &results,
+                    &format!("forward {tx_type:?} {size}x{size} output"),
+                );
+            }
+        }
+    }
+}
+
+/// The same input-limit sweep the inverse transforms get: the forward bound is
+/// only worth documenting if the vector kernels stay bit-exact right at it, in
+/// the sign patterns that maximize each pass.
+#[test]
+fn forward_transforms_stay_bit_exact_at_the_documented_input_limit() {
+    let mut rng = Lcg(0x5eed_0140_0000_0002);
+    for (tx_type, sizes) in TX_TYPES {
+        for &size in sizes {
+            // The forward kernels stop at 32 points; AV1 defines no 64-point
+            // forward transform, so skip the inverse-only 64x64 entries.
+            if size > 32 {
+                continue;
+            }
+            let extreme = crate::av1_encoder::transform::input_limit(size);
+            for pattern in 0..6 {
+                let residual: Vec<i32> = (0..size * size)
+                    .map(|index| {
+                        let sign = match pattern {
+                            0 => 1,
+                            1 => -1,
+                            2 => {
+                                if index % 2 == 0 {
+                                    1
+                                } else {
+                                    -1
+                                }
+                            }
+                            3 => {
+                                if (index / size) % 2 == 0 {
+                                    1
+                                } else {
+                                    -1
+                                }
+                            }
+                            4 => {
+                                if index % size < size / 2 {
+                                    1
+                                } else {
+                                    -1
+                                }
+                            }
+                            _ => {
+                                if rng.next() & 1 == 0 {
+                                    1
+                                } else {
+                                    -1
+                                }
+                            }
+                        };
+                        sign * extreme
+                    })
+                    .collect();
+                let results = for_each_isa(|_| forward_transform(&residual, size, tx_type));
+                assert_all_match(
+                    &results,
+                    &format!("forward {tx_type:?} {size}x{size} at the input limit"),
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn out_of_range_forward_transform_blocks_fall_back_to_scalar() {
+    for size in [4usize, 8, 16, 32] {
+        let over = i64::from(crate::av1_encoder::transform::input_limit(size)) + 1;
+        let residual: Vec<i32> = (0..size * size)
+            .map(|index| if index == 3 { over as i32 } else { 1 })
+            .collect();
+        let results = for_each_isa(|isa| {
+            let mut out = vec![0i32; size * size];
+            let vectorized = forward_transform_simd(
+                isa,
+                &residual,
+                size,
+                Tx1d::Dct,
+                Tx1d::Dct,
+                false,
+                false,
+                &mut out,
+            );
+            assert!(!vectorized, "the range guard must reject this block");
+            // The comparison above is only meaningful if an in-range block
+            // does reach the vector kernels, so check that here too.
+            let in_range = vec![1i32; size * size];
+            let accepted = forward_transform_simd(
+                isa,
+                &in_range,
+                size,
+                Tx1d::Dct,
+                Tx1d::Dct,
+                false,
+                false,
+                &mut out,
+            );
+            assert_eq!(
+                accepted,
+                isa != SimdIsa::Scalar,
+                "{} should{} vectorize an in-range {size}x{size} block",
+                isa.name(),
+                if isa == SimdIsa::Scalar { " not" } else { "" }
+            );
+            forward_transform(&residual, size, Av1TxType::DctDct)
+        });
+        assert_all_match(&results, "out-of-range forward transform output");
+    }
+}
+
+/// The forward and inverse vector kernels have to agree with each other, not
+/// just each with its own scalar reference: a round trip run entirely on one
+/// instruction set must reproduce the residual as closely as the scalar pair.
+#[test]
+fn vectorized_round_trip_reproduces_the_residual() {
+    let mut rng = Lcg(0x5eed_0140_0000_0003);
+    for (tx_type, sizes) in TX_TYPES {
+        for &size in sizes {
+            // The forward kernels stop at 32 points; AV1 defines no 64-point
+            // forward transform, so skip the inverse-only 64x64 entries.
+            if size > 32 {
+                continue;
+            }
+            let residual: Vec<i32> = (0..size * size).map(|_| rng.in_range(255)).collect();
+            let results = for_each_isa(|_| {
+                let coefficients = forward_transform(&residual, size, tx_type);
+                inverse_transform(&coefficients, size, tx_type, 1, 1)
+            });
+            for (isa, reconstructed) in &results {
+                for (&want, &got) in residual.iter().zip(reconstructed.iter()) {
+                    assert!(
+                        (want - i32::from(got)).abs() <= 4,
+                        "{} {tx_type:?} {size}x{size} round trip: {want} became {got}",
+                        isa.name()
+                    );
+                }
+            }
+            assert_all_match(&results, &format!("{tx_type:?} {size}x{size} round trip"));
+        }
+    }
 }

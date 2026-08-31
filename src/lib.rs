@@ -38,6 +38,23 @@ mod av1_decoder;
 #[cfg(not(target_arch = "wasm32"))]
 mod hevc;
 
+/// Per-stage access to the HEVC encoder for the criterion benchmark suite.
+///
+/// Internal and unstable: the encoder's stages are not otherwise reachable from
+/// a benchmark, which is a separate crate. See `benches/hevc_encode.rs`.
+#[cfg(not(target_arch = "wasm32"))]
+#[doc(hidden)]
+pub use hevc::bench as hevc_encoder_bench;
+
+/// Per-stage access to the HEVC decoder for the criterion benchmark suite.
+///
+/// Internal and unstable, and the counterpart to [`hevc_encoder_bench`]: the
+/// decoder's stages are not otherwise reachable from a benchmark, which is a
+/// separate crate. See `benches/hevc_decode.rs`.
+#[cfg(not(target_arch = "wasm32"))]
+#[doc(hidden)]
+pub use hevc::decode_bench as hevc_decoder_bench;
+
 #[cfg(not(target_arch = "wasm32"))]
 mod native_audio;
 
@@ -58,6 +75,7 @@ pub use av1::{
     Av1TileGroup,
 };
 pub use av1_encoder::native_av1_video_encoder_factory;
+pub use av1_encoder::transform::forward_transform;
 pub use av1_entropy::{AV1_CDF_MAX, Av1SymbolDecoder, validate_cdf};
 pub use av1_filters::{
     CdefStrength, FilmGrainParams, FilterFrame, FilterPlane, LoopFilterParams, MatrixCoefficients,
@@ -115,13 +133,5 @@ pub use av1_decoder::native_av1_video_decoder_factory;
 pub use hevc::native_hevc_video_decoder_factory;
 #[cfg(not(target_arch = "wasm32"))]
 pub use hevc::native_hevc_video_encoder_factory;
-/// Prepared per-stage HEVC decoder workloads for the benchmark suite.
-///
-/// The HEVC engine is crate-private, so `benches/codec.rs` — an external crate —
-/// cannot time its individual decode stages directly the way it times the public
-/// AV1 kernels. This is the narrow surface that lets it: one prepared workload
-/// per hot stage, with input construction separated from the kernel under test.
-#[cfg(not(target_arch = "wasm32"))]
-pub use hevc::stage_bench as hevc_stage_bench;
 #[cfg(not(target_arch = "wasm32"))]
 pub use native_audio::{DefaultAudioOutput, NativeAacDecoder};
