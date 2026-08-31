@@ -2019,38 +2019,97 @@ mod tests {
         let p0 = intermediates(31, combine_len, 8);
         let p1 = intermediates(32, combine_len, 8);
 
+        // Every figure below is the *minimum* over `rounds` timed passes,
+        // and the backends are measured round-robin inside each round. A
+        // single timed pass on a loaded machine swings by more than 2x,
+        // which is enough to report a real speedup as a regression; the
+        // minimum is the pass that suffered least interference and is the
+        // closest this can get to the kernel's own cost.
+        let rounds = 5;
+        let isas = simd::available_isas();
         println!(
-            "\ninter-prediction kernels, {} 16x16 blocks/pass",
+            "\ninter-prediction kernels, {} 16x16 blocks/pass, best of {rounds} rounds",
             blocks.len()
         );
-        let mut baselines = [0f64; 3];
-        for (i, isa) in simd::available_isas().into_iter().enumerate() {
-            let start = Instant::now();
-            let mut sink = 0i64;
-            for &(x, y) in &blocks {
-                let b = interp_luma_block_with(isa, &plane, x, y, 2, 3, 16, 16, 8).unwrap();
-                sink += b[0] as i64;
-            }
-            let luma = start.elapsed().as_secs_f64();
+        let mut best = vec![[f64::INFINITY; 3]; isas.len()];
+        let mut sink = 0i64;
+        for _ in 0..rounds {
+            for (i, &isa) in isas.iter().enumerate() {
+                let start = Instant::now();
+                for &(x, y) in &blocks {
+                    let b = interp_luma_block_with(isa, &plane, x, y, 2, 3, 16, 16, 8).unwrap();
+                    sink += b[0] as i64;
+                }
+                let luma = start.elapsed().as_secs_f64();
 
-            let start = Instant::now();
-            for &(x, y) in &blocks {
-                let b = interp_chroma_block_with(isa, &plane, x / 2, y / 2, 5, 3, 8, 8, 8).unwrap();
-                sink += b[0] as i64;
-            }
-            let chroma = start.elapsed().as_secs_f64();
+                let start = Instant::now();
+                for &(x, y) in &blocks {
+                    let b =
+                        interp_chroma_block_with(isa, &plane, x / 2, y / 2, 5, 3, 8, 8, 8).unwrap();
+                    sink += b[0] as i64;
+                }
+                let chroma = start.elapsed().as_secs_f64();
 
-            let start = Instant::now();
-            for _ in &blocks {
-                let b = default_weighted_pred_with(isa, &p0, &p1, true, true, 16, 16, 8).unwrap();
-                sink += b[0] as i64;
-            }
-            let combine = start.elapsed().as_secs_f64();
+                let start = Instant::now();
+                for _ in &blocks {
+                    let b =
+                        default_weighted_pred_with(isa, &p0, &p1, true, true, 16, 16, 8).unwrap();
+                    sink += b[0] as i64;
+                }
+                let combine = start.elapsed().as_secs_f64();
 
-            let timings = [luma, chroma, combine];
-            if i == 0 {
-                baselines = timings;
+                for (slot, t) in best[i].iter_mut().zip([luma, chroma, combine]) {
+                    *slot = slot.min(t);
+                }
             }
+        }
+        // The three stages above measure the whole §8.5.3.3 block path,
+        // which allocates and zeroes a result `Vec` per block. That
+        // allocation is the same work on every backend, so it compresses
+        // every ratio towards 1.00x — most visibly for the combine, whose
+        // kernel is only two multiply-accumulates per sample and so does
+        // less work than the allocation that surrounds it. These two arms
+        // time the kernels alone over one large buffer to show what the
+        // backend itself is worth, with no allocator in the measurement.
+        // Sized to stay resident in L1 the way a real block does: a
+        // 256 KiB buffer would make both backends memory-bound and report
+        // 1.00x for reasons that have nothing to do with the kernels.
+        let kernel_len = 2048;
+        let a = intermediates(41, kernel_len, 8);
+        let b = intermediates(42, kernel_len, 8);
+        let mut kernel_out = vec![0i32; kernel_len];
+        let mut kernel_best = vec![[f64::INFINITY; 2]; isas.len()];
+        for _ in 0..rounds {
+            for (i, &isa) in isas.iter().enumerate() {
+                let taps8: [&[i32]; 8] = std::array::from_fn(|t| &a[t..t + kernel_len - 8]);
+                let start = Instant::now();
+                for _ in 0..1024 {
+                    simd::filter_taps(
+                        isa,
+                        &taps8,
+                        &LUMA_FILTER[2],
+                        6,
+                        &mut kernel_out[..kernel_len - 8],
+                    );
+                }
+                let taps = start.elapsed().as_secs_f64();
+                sink += kernel_out[0] as i64;
+
+                let start = Instant::now();
+                for _ in 0..1024 {
+                    simd::combine_weighted(isa, &[&a, &b], &[1, 1], 64, 7, 0, 255, &mut kernel_out);
+                }
+                let combine = start.elapsed().as_secs_f64();
+                sink += kernel_out[0] as i64;
+
+                for (slot, t) in kernel_best[i].iter_mut().zip([taps, combine]) {
+                    *slot = slot.min(t);
+                }
+            }
+        }
+
+        let baselines = best[0];
+        for (isa, [luma, chroma, combine]) in isas.iter().zip(best.iter().copied()) {
             println!(
                 "  {:>8}  luma 8-tap 2D {:7.2} ms ({:4.2}x)  chroma 4-tap 2D {:7.2} ms ({:4.2}x)  \
                  bi combine {:7.2} ms ({:4.2}x){}",
@@ -2062,6 +2121,19 @@ mod tests {
                 combine * 1e3,
                 baselines[2] / combine,
                 if sink == i64::MIN { "!" } else { "" },
+            );
+        }
+        println!("  kernels alone, {kernel_len} L1-resident samples x 1024 passes:");
+        let kernel_baselines = kernel_best[0];
+        for (isa, [taps, combine]) in isas.iter().zip(kernel_best.iter().copied()) {
+            println!(
+                "  {:>8}  filter_taps 8-tap {:7.2} ms ({:4.2}x)  combine_weighted bi {:7.2} ms \
+                 ({:4.2}x)",
+                format!("{isa:?}"),
+                taps * 1e3,
+                kernel_baselines[0] / taps,
+                combine * 1e3,
+                kernel_baselines[1] / combine,
             );
         }
     }
