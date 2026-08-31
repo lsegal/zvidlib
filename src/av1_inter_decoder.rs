@@ -14,9 +14,13 @@
 //!   `base_q_idx == 0` (`CodedLossless`) reconstructs every 4x4 block with
 //!   the normative inverse Walsh-Hadamard transform and never signals
 //!   `loop_filter_params` (spec §5.9.11 forces every level to 0); otherwise
-//!   each coding block signals its own `tx_size` (`TX_4X4` or `TX_8X8`, this
-//!   decoder's bounded `TX_MODE_LARGEST`-equivalent subset) and `tx_type`
-//!   (`DCT_DCT` or `IDTX`), coefficients are dequantized
+//!   each coding block signals its own `tx_size` through spec §5.11.16
+//!   `read_tx_size` over the square transforms this crate's kernels
+//!   implement (`TX_4X4` through `TX_64X64`), under either
+//!   `TX_MODE_LARGEST` or `TX_MODE_SELECT` as the frame header's
+//!   `tx_mode_select` bit selects, and its `tx_type` (`DCT_DCT` or `IDTX`,
+//!   and `DCT_DCT` only from `TX_32X32` up, where the transform set is
+//!   `TX_SET_DCTONLY`), coefficients are dequantized
 //!   ([`crate::av1_intra::get_dc_quant`]/[`crate::av1_intra::get_ac_quant`])
 //!   and inverse transformed ([`crate::av1_intra::inverse_transform`]),
 //!   `loop_filter_params` is parsed, and the chosen per-block transform
@@ -57,6 +61,13 @@ use crate::{
 const NUM_REF_FRAMES: usize = 8;
 const NUM_BASE_LEVELS: i32 = 2;
 const COEFF_BASE_PLUS_RANGE: i32 = 14;
+/// The widest square transform this crate's kernels implement
+/// (`TX_64X64`), which is also AV1's largest transform.
+const MAX_TX_WIDTH: usize = 64;
+/// AV1 codes coefficients only inside a transform block's upper-left
+/// 32x32 quadrant (spec §5.11.39 clamps the coded extent to 32 samples);
+/// every position outside it reconstructs as zero.
+const MAX_CODED_TX_WIDTH: usize = 32;
 /// `PRIMARY_REF_NONE` (AV1 §6.8.2).
 const PRIMARY_REF_NONE: u8 = 7;
 
@@ -120,16 +131,11 @@ impl Av1InterDecoder {
     /// `show_existing_frame` (which reconstructs nothing new, so there is
     /// no metadata for the frame it shows).
     ///
-    /// Every block in the grid is currently the AV1 spec's mandatory
-    /// `TX_4X4` transform size: this decoder only accepts `CodedLossless`
-    /// streams (`base_q_idx == 0`), and the spec forces
+    /// Every block in a `CodedLossless` frame's grid is the AV1 spec's
+    /// mandatory `TX_4X4` transform size, because the spec forces
     /// `TX_MODE_ONLY_4X4` whenever `CodedLossless` is true (see
-    /// `parse_inter_frame_header`'s `read_tx_mode` comment). The per-block
-    /// value is still threaded through explicitly here, rather than left
-    /// at [`TxSizeGrid::new`]'s default, so extending this decoder to
-    /// non-lossless streams in the future only needs to change what gets
-    /// recorded at each transform block, not how the grid reaches the
-    /// deblocking filter.
+    /// `parse_inter_frame_header`'s `read_tx_mode` comment). Non-lossless
+    /// frames record the real per-block `read_tx_size` choice instead.
     pub fn last_frame_tx_sizes(&self) -> Option<&TxSizeGrid> {
         self.last_tx_sizes.as_ref()
     }
@@ -424,6 +430,10 @@ struct InterFrameHeader {
     height: usize,
     base_q_idx: u8,
     loop_filter: LoopFilterParams,
+    /// `tx_mode == TX_MODE_SELECT` (spec §5.9.20 `read_tx_mode`); `false`
+    /// is `TX_MODE_LARGEST`, and lossless frames force `TX_MODE_ONLY_4X4`
+    /// with no bit read.
+    tx_mode_select: bool,
     interpolation_filter: InterpFilter,
 }
 
@@ -589,9 +599,15 @@ fn parse_inter_frame_header(
     };
     // cdef_params(), lr_params(): skipped because the sequence header
     // requires enable_cdef == 0 and enable_restoration == 0.
-    // read_tx_mode(): the non-lossless path implements this bounded
-    // decoder's TX_MODE_LARGEST-equivalent subset (see `decode_block`), so
-    // no explicit tx_mode symbol is read.
+    // read_tx_mode() (spec §5.9.20): CodedLossless forces TX_MODE_ONLY_4X4
+    // with no bit read at all; otherwise a single `tx_mode_select` bit
+    // chooses between TX_MODE_LARGEST and TX_MODE_SELECT (see
+    // `InterTileDecoder::read_tx_size`).
+    let tx_mode_select = if base_q_idx == 0 {
+        false
+    } else {
+        bits.read(1, "tx_mode_select")? != 0
+    };
     // frame_reference_mode(): intra frames imply single reference; inter
     // frames may signal per-block single or compound prediction.
     let reference_select = if is_intra {
@@ -634,6 +650,7 @@ fn parse_inter_frame_header(
         height,
         base_q_idx,
         loop_filter,
+        tx_mode_select,
         interpolation_filter,
     })
 }
@@ -761,6 +778,7 @@ struct InterTileDecoder<'a> {
     compound: [Vec<i16>; 2],
     motion_grid: Vec<Option<BlockMotion>>,
     base_q_idx: u8,
+    tx_mode_select: bool,
     tx_sizes: TxSizeGrid,
 }
 
@@ -830,6 +848,7 @@ impl<'a> InterTileDecoder<'a> {
             compound: [Vec::new(), Vec::new()],
             motion_grid: vec![None; contexts],
             base_q_idx: header.base_q_idx,
+            tx_mode_select: header.tx_mode_select,
             tx_sizes: TxSizeGrid::new(width, height),
         })
     }
@@ -967,17 +986,7 @@ impl<'a> InterTileDecoder<'a> {
                 }
             }
         }
-        // TX_MODE_LARGEST-equivalent selection (spec §5.11.16 `read_tx_size`
-        // when `tx_mode == TX_MODE_LARGEST`), mirroring the intra decoder:
-        // one transform per coding block, sized as large as this decoder's
-        // bounded {TX_4X4, TX_8X8} set allows (TX_8X8 for an 8x8-or-larger
-        // block, TX_4X4 otherwise). The lossless path is unaffected: it
-        // always uses TX_MODE_ONLY_4X4, per spec §5.9.20.
-        let tx_width = if self.base_q_idx != 0 && block_width >= 8 {
-            8
-        } else {
-            4
-        };
+        let tx_width = self.read_tx_size(block_width)?;
         let step = tx_width / 4;
         let mut transform_y = 0;
         while transform_y < units {
@@ -986,6 +995,16 @@ impl<'a> InterTileDecoder<'a> {
                 let x = column * 4 + transform_x * 4;
                 let y = row * 4 + transform_y * 4;
                 if x < self.coded_width && y < self.coded_height {
+                    // Reconstruction writes the whole transform block, and
+                    // this decoder's frame buffer is only MI-aligned rather
+                    // than superblock-aligned, so a transform that would
+                    // hang off the coded frame is rejected instead of
+                    // clipped, mirroring the intra decoder.
+                    if x + tx_width > self.coded_width || y + tx_width > self.coded_height {
+                        return Err(unsupported(
+                            "AV1 transform block extends past the coded frame",
+                        ));
+                    }
                     self.decode_transform_block(x, y, tx_width, prediction.is_some(), intra_mode)?;
                 }
                 transform_x += step;
@@ -1238,6 +1257,26 @@ impl<'a> InterTileDecoder<'a> {
         Ok(())
     }
 
+    /// `read_tx_size` (spec §5.11.16) for a square `block_width` coding
+    /// block, over the square transform sizes this crate's inverse
+    /// transform kernels implement (`TX_4X4` through `TX_64X64`); see
+    /// [`crate::av1_intra_decoder`]'s identically shaped implementation.
+    fn read_tx_size(&mut self, block_width: usize) -> Result<usize> {
+        if self.base_q_idx == 0 {
+            return Ok(4);
+        }
+        let largest = block_width.min(MAX_TX_WIDTH);
+        if largest <= 4 || !self.tx_mode_select {
+            return Ok(largest);
+        }
+        let (depth_cdf, max_depth) = cdf::tx_depth_cdf(block_width);
+        let depth = self.symbols.symbol(depth_cdf)?;
+        if depth > max_depth {
+            return Err(malformed("AV1 tx_depth exceeds the block maximum"));
+        }
+        Ok((largest >> depth).max(4))
+    }
+
     fn decode_transform_block(
         &mut self,
         x: usize,
@@ -1429,7 +1468,7 @@ impl<'a> InterTileDecoder<'a> {
         y4: usize,
         tx_width: usize,
     ) -> Result<(Vec<i32>, Av1TxType)> {
-        let scan = cdf::up_right_diagonal_scan(tx_width);
+        let scan = cdf::up_right_diagonal_scan(tx_width.min(MAX_CODED_TX_WIDTH));
         let (coefficients, skipped) = self.decode_coefficient_levels(x4, y4, tx_width, &scan)?;
         // read_tx_type() (spec §5.11.47): tx_type is only signaled for a
         // transform block that actually has nonzero coefficients (a fully
@@ -1438,9 +1477,8 @@ impl<'a> InterTileDecoder<'a> {
         // regardless of tx_type).
         let tx_type = if skipped {
             Av1TxType::DctDct
-        } else {
-            let is_8x8 = usize::from(tx_width == 8);
-            match self.symbols.symbol(&cdf::EXT_TX_INTRA_REDUCED[is_8x8])? {
+        } else if let Some(ext_tx) = cdf::ext_tx_cdf(tx_width) {
+            match self.symbols.symbol(ext_tx)? {
                 0 => Av1TxType::Idtx,
                 1 => Av1TxType::DctDct,
                 _ => {
@@ -1449,6 +1487,9 @@ impl<'a> InterTileDecoder<'a> {
                     ));
                 }
             }
+        } else {
+            // TX_SET_DCTONLY (spec §5.11.47 `get_tx_set`): no symbol.
+            Av1TxType::DctDct
         };
         Ok((coefficients, tx_type))
     }
@@ -1463,16 +1504,19 @@ impl<'a> InterTileDecoder<'a> {
     ) -> Result<(Vec<i32>, bool)> {
         let plane_type = 0;
         let count = size * size;
-        let skip_context = self.txb_skip_context(x4, y4, size * 4);
+        let units = (size / 4).max(1);
+        // Coefficients are coded only in the transform block's upper-left
+        // 32x32 quadrant, so a 64x64 transform reads a 32x32 coefficient
+        // block (with 32x32 scan order and contexts) and zeroes the rest.
+        let coded = size.min(MAX_CODED_TX_WIDTH);
+        let coded_count = coded * coded;
+        debug_assert_eq!(scan.len(), coded_count);
+        let skip_context = self.txb_skip_context(x4, y4, units);
         if self.symbols.symbol(&cdf::TXB_SKIP[skip_context])? == 1 {
-            self.set_coefficient_context(x4, y4, 0, 0);
+            self.set_coefficient_context(x4, y4, units, 0, 0);
             return Ok((vec![0; count], true));
         }
-        let eob_point = if size <= 4 {
-            self.symbols.symbol(&cdf::EOB_PT_16[plane_type][0])? + 1
-        } else {
-            self.symbols.symbol(&cdf::EOB_PT_64[plane_type][0])? + 1
-        };
+        let eob_point = self.symbols.symbol(cdf::eob_pt_cdf(coded, plane_type))? + 1;
         let eob = if eob_point < 2 {
             eob_point
         } else {
@@ -1490,29 +1534,30 @@ impl<'a> InterTileDecoder<'a> {
             }
             (1usize << (eob_point - 2)) + 1 + extra
         };
-        if eob == 0 || eob > count {
+        if eob == 0 || eob > coded_count {
             return Err(malformed(
                 "AV1 coefficient EOB is outside the transform block",
             ));
         }
-        let mut levels = vec![0i32; count];
+        let mut levels = vec![0i32; coded_count];
         for coefficient in (0..eob).rev() {
             let position = scan[coefficient];
             let mut level = if coefficient == eob - 1 {
                 i32::try_from(
                     self.symbols.symbol(
-                        &cdf::COEFF_BASE_EOB[plane_type][coeff_base_eob_context(coefficient)],
+                        &cdf::COEFF_BASE_EOB[plane_type]
+                            [coeff_base_eob_context(coefficient, coded_count)],
                     )? + 1,
                 )
                 .expect("coefficient base level fits i32")
             } else {
                 i32::try_from(self.symbols.symbol(
-                    &cdf::COEFF_BASE[plane_type][coeff_base_context(position, &levels, size)],
+                    &cdf::COEFF_BASE[plane_type][coeff_base_context(position, &levels, coded)],
                 )?)
                 .expect("coefficient base level fits i32")
             };
             if level > NUM_BASE_LEVELS {
-                let context = coeff_br_context(position, &levels, size);
+                let context = coeff_br_context(position, &levels, coded);
                 for _ in 0..4 {
                     let value =
                         i32::try_from(self.symbols.symbol(&cdf::COEFF_BR[plane_type][context])?)
@@ -1531,7 +1576,7 @@ impl<'a> InterTileDecoder<'a> {
             }
             let negative = if coefficient == 0 {
                 self.symbols
-                    .symbol(&cdf::DC_SIGN[plane_type][self.dc_sign_context(x4, y4)])?
+                    .symbol(&cdf::DC_SIGN[plane_type][self.dc_sign_context(x4, y4, units)])?
                     != 0
             } else {
                 self.symbols.literal(1)? != 0
@@ -1553,8 +1598,17 @@ impl<'a> InterTileDecoder<'a> {
         } else {
             2
         };
-        self.set_coefficient_context(x4, y4, cumulative, dc);
-        Ok((levels, false))
+        self.set_coefficient_context(x4, y4, units, cumulative, dc);
+        if coded == size {
+            return Ok((levels, false));
+        }
+        // Scatter the coded quadrant into the full transform block.
+        let mut coefficients = vec![0i32; count];
+        for row in 0..coded {
+            coefficients[row * size..row * size + coded]
+                .copy_from_slice(&levels[row * coded..(row + 1) * coded]);
+        }
+        Ok((coefficients, false))
     }
 
     fn decode_golomb(&mut self) -> Result<u32> {
@@ -1575,19 +1629,34 @@ impl<'a> InterTileDecoder<'a> {
         Ok((1u32 << leading) | suffix)
     }
 
-    fn set_coefficient_context(&mut self, x4: usize, y4: usize, level: u8, dc: u8) {
-        self.above_level[x4] = level;
-        self.above_dc[x4] = dc;
-        self.left_level[y4] = level;
-        self.left_dc[y4] = dc;
+    /// Spec §5.11.39's trailing context update: a transform block leaves
+    /// its cumulative level and DC sign category behind on *every* 4x4
+    /// column and row it covers, not just its first.
+    fn set_coefficient_context(&mut self, x4: usize, y4: usize, units: usize, level: u8, dc: u8) {
+        for column in x4..(x4 + units).min(self.mi_cols) {
+            self.above_level[column] = level;
+            self.above_dc[column] = dc;
+        }
+        for row in y4..(y4 + units).min(self.mi_rows) {
+            self.left_level[row] = level;
+            self.left_dc[row] = dc;
+        }
     }
 
-    fn txb_skip_context(&self, x4: usize, y4: usize, block_width: usize) -> usize {
-        if block_width == 4 {
-            return 0;
-        }
-        let top = i32::from(self.above_level[x4]);
-        let left = i32::from(self.left_level[y4]);
+    /// `getTXBSkipCtx` (spec §8.3.2), whose `top`/`left` are the maxima of
+    /// the neighbouring level contexts across the transform block's own
+    /// width and height in 4x4 units.
+    fn txb_skip_context(&self, x4: usize, y4: usize, units: usize) -> usize {
+        let top = self.above_level[x4..(x4 + units).min(self.mi_cols)]
+            .iter()
+            .copied()
+            .max()
+            .map_or(0, i32::from);
+        let left = self.left_level[y4..(y4 + units).min(self.mi_rows)]
+            .iter()
+            .copied()
+            .max()
+            .map_or(0, i32::from);
         if top == 0 && left == 0 {
             1
         } else if top == 0 || left == 0 {
@@ -1601,9 +1670,13 @@ impl<'a> InterTileDecoder<'a> {
         }
     }
 
-    fn dc_sign_context(&self, x4: usize, y4: usize) -> usize {
+    /// `getDcSignCtx` (spec §8.3.2), summed over every 4x4 column and row
+    /// the transform block covers.
+    fn dc_sign_context(&self, x4: usize, y4: usize, units: usize) -> usize {
         let mut sum = 0i32;
-        for &category in &[self.above_dc[x4], self.left_dc[y4]] {
+        let above = &self.above_dc[x4..(x4 + units).min(self.mi_cols)];
+        let left = &self.left_dc[y4..(y4 + units).min(self.mi_rows)];
+        for &category in above.iter().chain(left.iter()) {
             if category == 1 {
                 sum -= 1;
             } else if category == 2 {
@@ -1649,12 +1722,16 @@ fn split_or_vert_cdf(cdf: &[u16]) -> [u16; 2] {
     [32_768 - probability, 32_768]
 }
 
-fn coeff_base_eob_context(coefficient: usize) -> usize {
+/// `get_lower_levels_ctx_eob` (spec §8.3.2): the last coded coefficient's
+/// context is chosen by where it falls in the block's scan, so the
+/// thresholds scale with the block's coefficient `count` rather than being
+/// fixed at TX_4X4's 2 and 4.
+fn coeff_base_eob_context(coefficient: usize, count: usize) -> usize {
     if coefficient == 0 {
         0
-    } else if coefficient <= 2 {
+    } else if coefficient <= count / 8 {
         1
-    } else if coefficient <= 4 {
+    } else if coefficient <= count / 4 {
         2
     } else {
         3
@@ -1674,7 +1751,7 @@ fn coeff_base_context(position: usize, levels: &[i32], size: usize) -> usize {
     if row == 0 && column == 0 {
         0
     } else {
-        context + usize::from(cdf::COEFF_BASE_CTX_OFFSET_4X4[row.min(4)][column.min(4)])
+        context + cdf::coeff_base_ctx_offset(row, column)
     }
 }
 
@@ -2035,10 +2112,12 @@ mod tests {
         w.bits(0, 5); // seq_level_idx (<= 7, so no seq_tier bit)
         // decoder_model_info_present_flag is false, so no per-op model bit;
         // initial_display_delay_present_flag is false, so no per-op delay bit.
-        w.bits(3, 4); // frame_width_bits_minus_1 = 3 -> 4 width bits
-        w.bits(3, 4); // frame_height_bits_minus_1 = 3 -> 4 height bits
-        w.bits(width - 1, 4); // max_frame_width_minus_1
-        w.bits(height - 1, 4); // max_frame_height_minus_1
+        let width_bits = (u32::BITS - (width - 1).leading_zeros()).max(1) as usize;
+        let height_bits = (u32::BITS - (height - 1).leading_zeros()).max(1) as usize;
+        w.bits(width_bits as u32 - 1, 4); // frame_width_bits_minus_1
+        w.bits(height_bits as u32 - 1, 4); // frame_height_bits_minus_1
+        w.bits(width - 1, width_bits); // max_frame_width_minus_1
+        w.bits(height - 1, height_bits); // max_frame_height_minus_1
         w.bits(0, 1); // frame_id_numbers_present_flag
         w.bits(0, 1); // use_128x128_superblock
         w.bits(0, 1); // enable_filter_intra
@@ -2144,7 +2223,15 @@ mod tests {
             mi_cols: usize,
             mi_rows: usize,
         ) -> Vec<u8> {
-            self.finish_common_with_quantizer(is_intra, reference_select, mi_cols, mi_rows, 0, None)
+            self.finish_common_with_quantizer(
+                is_intra,
+                reference_select,
+                mi_cols,
+                mi_rows,
+                0,
+                None,
+                false,
+            )
         }
 
         #[allow(clippy::too_many_arguments)]
@@ -2156,6 +2243,7 @@ mod tests {
             mi_rows: usize,
             base_q_idx: u8,
             loop_filter: Option<(u8, u8, u8, u8, u8)>,
+            tx_mode_select: bool,
         ) -> Vec<u8> {
             // tile_info(): uniform spacing, one tile (mi_cols/mi_rows <= 64
             // superblock units here, so no increment bits are read).
@@ -2177,6 +2265,9 @@ mod tests {
                 }
                 self.w.bits(sharpness.into(), 3);
                 self.w.bits(0, 1); // loop_filter_delta_enabled
+                // read_tx_mode(): only present when the frame is not
+                // CodedLossless.
+                self.w.bits(tx_mode_select.into(), 1);
             }
             if !is_intra {
                 self.w.bits(reference_select.into(), 1);
@@ -2522,6 +2613,7 @@ mod tests {
             height: 16,
             base_q_idx: 0,
             loop_filter: LoopFilterParams::DISABLED,
+            tx_mode_select: false,
             interpolation_filter: InterpFilter::Regular,
         };
         let refs: [Option<RefSlot>; 8] = std::array::from_fn(|index| {
@@ -2594,6 +2686,7 @@ mod tests {
             height: 16,
             base_q_idx: 0,
             loop_filter: LoopFilterParams::DISABLED,
+            tx_mode_select: false,
             interpolation_filter: InterpFilter::Regular,
         };
         let mut symbols = SymbolEncoder::new();
@@ -2736,6 +2829,7 @@ mod tests {
             mi,
             base_q_idx,
             loop_filter,
+            false,
         );
         let mut payload = header;
         payload.extend_from_slice(&non_lossless_key_frame_tile());
@@ -2815,5 +2909,88 @@ mod tests {
         );
         deblock_frame(&mut filter_frame, &header.loop_filter, Some(&tx_sizes)).unwrap();
         assert_eq!(filter_frame.y.data, frame.planes[0].data);
+    }
+
+    /// A frame exactly one 64x64 superblock across, so `PARTITION_NONE`
+    /// yields a single 64x64 coding block and `read_tx_size` can reach the
+    /// largest transform this crate's kernels implement.
+    const SUPERBLOCK_DIM: u32 = 64;
+    /// The quantizer index the large-transform fixture below codes at.
+    const SUPERBLOCK_Q: u8 = 40;
+
+    /// A single-superblock non-lossless key frame whose one 64x64 coding
+    /// block signals `TX_64X64` under `TX_MODE_LARGEST` and carries a
+    /// single positive DC coefficient of level 4. Coefficients are coded
+    /// in the transform's upper-left 32x32 quadrant only (hence the
+    /// 32-wide `eob_pt` class) and `TX_64X64`'s transform set is
+    /// `TX_SET_DCTONLY`, so no `tx_type` symbol follows them.
+    fn superblock_64x64_temporal_unit() -> Vec<u8> {
+        let mut e = SymbolEncoder::new();
+        e.symbol(&cdf::PARTITION_W64[0], 0); // PARTITION_NONE
+        e.symbol(&cdf::SKIP[0], 0); // skip = 0
+        e.symbol(&cdf::INTRA_FRAME_Y_MODE_DC_DC, 0); // DC_PRED
+        e.symbol(&cdf::TXB_SKIP[1], 0); // not skipped, no neighbours yet
+        e.symbol(cdf::eob_pt_cdf(32, 0), 0); // eob_point = 1 -> eob = 1
+        e.symbol(&cdf::COEFF_BASE_EOB[0][0], 2); // level = 3 (max base)
+        e.symbol(&cdf::COEFF_BR[0][0], 1); // +1, stop (level = 4)
+        e.symbol(&cdf::DC_SIGN[0][0], 0); // positive
+
+        let mi = 2 * SUPERBLOCK_DIM.div_ceil(8) as usize;
+        let mut payload = FrameHeaderBuilder::key_frame(3).finish_common_with_quantizer(
+            true,
+            false,
+            mi,
+            mi,
+            SUPERBLOCK_Q,
+            Some((0, 0, 0, 0, 0)), // every filter level 0: deblocking is a no-op
+            false,                 // TX_MODE_LARGEST
+        );
+        payload.extend_from_slice(&e.finish());
+
+        let mut stream = Vec::new();
+        push_obu(&mut stream, 2, &[]); // temporal delimiter
+        push_obu(
+            &mut stream,
+            1,
+            &sequence_header_payload(SUPERBLOCK_DIM, SUPERBLOCK_DIM),
+        );
+        push_obu(&mut stream, 6, &payload); // Frame OBU
+        stream
+    }
+
+    #[test]
+    fn tx_mode_largest_reaches_the_64_point_kernel_from_a_bitstream() {
+        let limits = Limits::default();
+        let mut decoder = Av1InterDecoder::new(limits).unwrap();
+        let frame = decoder
+            .decode_temporal_unit(&superblock_64x64_temporal_unit())
+            .unwrap();
+        assert_eq!(
+            (frame.dimensions.width, frame.dimensions.height),
+            (SUPERBLOCK_DIM, SUPERBLOCK_DIM)
+        );
+
+        let mut expected_grid = TxSizeGrid::new(SUPERBLOCK_DIM as usize, SUPERBLOCK_DIM as usize);
+        expected_grid.set_block(0, 0, 64, 64);
+        assert_eq!(decoder.last_frame_tx_sizes(), Some(&expected_grid));
+
+        // The plane really came through the 64-point inverse DCT: a lone
+        // DC coefficient spreads a constant offset over all 64x64 samples
+        // on top of the 128 DC prediction an unbordered block starts from.
+        let mut coefficients = vec![0i32; 64 * 64];
+        coefficients[0] = 4;
+        let residuals = inverse_transform(
+            &coefficients,
+            64,
+            Av1TxType::DctDct,
+            get_dc_quant(SUPERBLOCK_Q),
+            get_ac_quant(SUPERBLOCK_Q),
+        );
+        let expected: Vec<u8> = residuals
+            .iter()
+            .map(|&residual| (128 + i32::from(residual)).clamp(0, 255) as u8)
+            .collect();
+        assert_eq!(frame.planes[0].data, expected);
+        assert_ne!(frame.planes[0].data[0], 128);
     }
 }
