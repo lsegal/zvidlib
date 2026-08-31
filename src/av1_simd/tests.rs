@@ -630,6 +630,125 @@ fn wide_deblocking_output_matches_spec_derived_vectors() {
     }
 }
 
+/// A 4:2:0 frame whose luma and chroma planes are both near-flat blocks, so
+/// the chroma flatness gate opens and the 6-tap filter actually runs.
+fn flat_blocks_frame(width: usize, height: usize, seed: u64) -> FilterFrame {
+    let (cw, ch) = (width.div_ceil(2), height.div_ceil(2));
+    FilterFrame::new_yuv(
+        flat_blocks_plane(width, height, seed),
+        flat_blocks_plane(cw, ch, seed ^ 0x11),
+        flat_blocks_plane(cw, ch, seed ^ 0x22),
+        true,
+        true,
+    )
+    .unwrap()
+}
+
+#[test]
+fn chroma_deblocking_matches_the_scalar_reference() {
+    // Chroma planes take the 6-tap filter where the subsampled transform
+    // sizes select it, so both the vector kernel's 6-tap lane path and the
+    // scalar fallback must agree on every instruction set.
+    for (width, height) in [(96usize, 96usize), (67, 71), (33, 18), (9, 7)] {
+        for (level, sharpness) in [(16u8, 0u8), (40, 2), (63, 7)] {
+            let grid = mixed_tx_grid(width, height);
+            let results = for_each_isa(|_| {
+                let mut frame = flat_blocks_frame(width, height, 0x5eed);
+                deblock_frame(&mut frame, &deblock_params(level, sharpness), Some(&grid)).unwrap();
+                let u = frame.u.unwrap().data;
+                let v = frame.v.unwrap().data;
+                (u, v)
+            });
+            assert_all_match(&results, "deblocked chroma planes");
+        }
+    }
+}
+
+#[test]
+fn chroma_wide_deblocking_actually_runs_on_flat_content() {
+    // Guards the coverage above: without this the chroma comparison could
+    // pass with the 6-tap path never selected.
+    let (width, height) = (96usize, 96usize);
+    let grid = mixed_tx_grid(width, height);
+    let mut wide = flat_blocks_frame(width, height, 0x5eed);
+    deblock_frame(&mut wide, &deblock_params(40, 2), Some(&grid)).unwrap();
+    let mut narrow = flat_blocks_frame(width, height, 0x5eed);
+    deblock_frame(&mut narrow, &deblock_params(40, 2), None).unwrap();
+    assert_ne!(
+        wide.u.unwrap().data,
+        narrow.u.unwrap().data,
+        "the 6-tap chroma filter should change samples the narrow filter does not"
+    );
+}
+
+/// Verifies 6-tap chroma output against spec-derived values rather than this
+/// crate's own scalar path, on every instruction set.
+///
+/// The 4:2:0 chroma planes are a single step edge: columns `0..16` hold 100
+/// and `16..20` hold 110, with 16x16 luma transforms everywhere so the
+/// subsampled 8x8 chroma transforms make §7.14.5 select the 6-tap filter. The
+/// chroma height of 4 leaves no horizontal chroma edge, and the vertical
+/// edges at x = 4, 8 and 12 see an all-100 window that any filter whose
+/// weights sum to its rounding shift leaves unchanged, so only the edge at
+/// x = 16 filters.
+///
+/// The expected samples come from §7.14.6.3's 6-tap tap lists directly:
+/// output `k` is `Round2(100 * (8 - w) + 110 * w, 3)` where `w` is that row's
+/// q-side weight sum, i.e. `(804 + 10 * w) >> 3`. The q-side weight sums read
+/// off the spec's tap lists are 1, 3, 5 and 7.
+#[test]
+fn chroma_wide_deblocking_output_matches_spec_derived_vectors() {
+    const WIDTH: usize = 20;
+    const HEIGHT: usize = 4;
+    const Q_WEIGHT_SUMS: [i32; 4] = [1, 3, 5, 7];
+
+    let mut expected: Vec<u8> = (0..WIDTH)
+        .map(|x| if x < 16 { 100u8 } else { 110u8 })
+        .collect();
+    for (offset, weight) in Q_WEIGHT_SUMS.into_iter().enumerate() {
+        expected[14 + offset] = ((804 + 10 * weight) >> 3) as u8;
+    }
+    let expected: Vec<u8> = expected.repeat(HEIGHT);
+
+    let mut grid = TxSizeGrid::new(2 * WIDTH, 2 * HEIGHT);
+    for x in (0..2 * WIDTH).step_by(16) {
+        grid.set_block(x, 0, 16, 16);
+    }
+    let params = LoopFilterParams {
+        y_vertical_level: 0,
+        y_horizontal_level: 0,
+        u_level: 40,
+        v_level: 40,
+        sharpness: 0,
+    };
+    let results = for_each_isa(|_| {
+        let chroma = || {
+            let data: Vec<u8> = (0..WIDTH * HEIGHT)
+                .map(|index| if index % WIDTH < 16 { 100u8 } else { 110u8 })
+                .collect();
+            FilterPlane::from_samples(WIDTH, HEIGHT, data, &Limits::default()).unwrap()
+        };
+        let mut frame = FilterFrame::new_yuv(
+            plane(2 * WIDTH, 2 * HEIGHT, 0x1122),
+            chroma(),
+            chroma(),
+            true,
+            true,
+        )
+        .unwrap();
+        deblock_frame(&mut frame, &params, Some(&grid)).unwrap();
+        frame.u.unwrap().data
+    });
+    for (isa, data) in &results {
+        assert_eq!(
+            data,
+            &expected,
+            "{} chroma output should match the spec's 6-tap filter constants",
+            isa.name()
+        );
+    }
+}
+
 #[test]
 fn deblocking_at_frame_borders_matches_the_scalar_reference() {
     // Planes small enough that every edge position's filter window leaves the
