@@ -438,8 +438,7 @@ fn best_edge_offset(
                 let Some(category) = edge_category(samples, pw, ph, x, y, h0, v0, h1, v1) else {
                     continue;
                 };
-                let error = i64::from(source[y * src_stride + x])
-                    - i64::from(samples[y * pw + x]);
+                let error = i64::from(source[y * src_stride + x]) - i64::from(samples[y * pw + x]);
                 sums[category] += error;
                 counts[category] += 1;
             }
@@ -598,7 +597,12 @@ mod tests {
         // reconstruction a decoder derives is the source picture bit for bit —
         // both for the intra picture and for one coded against a reference.
         let src = source(0);
-        let intra = reconstruct_picture(planes(&src), None, &plan(&src, None), ReconConfig::default());
+        let intra = reconstruct_picture(
+            planes(&src),
+            None,
+            &plan(&src, None),
+            ReconConfig::default(),
+        );
         assert_eq!(intra.y, src.0);
         assert_eq!(intra.cb, src.1);
         assert_eq!(intra.cr, src.2);

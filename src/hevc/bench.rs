@@ -181,6 +181,123 @@ pub fn rgba_to_yuv420_planes(frame: &crate::VideoFrame) -> (Vec<u8>, Vec<u8>, Ve
         .expect("benchmark frames are RGBA8")
 }
 
+/// A picture-reconstruction workload with its mode-search plan already built.
+///
+/// The reconstruction stage consumes the decisions the mode search produced,
+/// and mode search costs an order of magnitude more than everything else in
+/// the encoder. Building the plan here, once, keeps it out of the timed loop
+/// so `hevc_encode_*_reconstruct` measures reconstruction and the in-loop
+/// filters rather than re-measuring `hevc_encode_*_rdo_inter`.
+///
+/// Opaque on purpose: the decision plan and the reconstructed-picture types
+/// are crate-internal, and this surface promises nothing about them.
+pub struct ReconstructWorkload {
+    y: Vec<u8>,
+    cb: Vec<u8>,
+    cr: Vec<u8>,
+    width: usize,
+    height: usize,
+    reference: Option<ReconstructedPicture>,
+    decision: PictureDecision,
+}
+
+/// Builds a [`ReconstructWorkload`] over one 4:2:0 8-bit picture.
+///
+/// `reference` is the previous picture's `(y, cb, cr)` planes, which stand in
+/// for the previous *reconstruction*: passing them enables the inter
+/// prediction path through the reconstruction loop, and `None` measures the
+/// intra path. `qp` and `search_radius` configure the mode search that runs
+/// here, in setup.
+///
+/// # Panics
+///
+/// Panics if the planes do not describe a 4:2:0 picture of `width * height`
+/// with whole 16-sample CTBs.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn plan_reconstruct(
+    y: &[u8],
+    cb: &[u8],
+    cr: &[u8],
+    width: usize,
+    height: usize,
+    reference: Option<(&[u8], &[u8], &[u8])>,
+    qp: i32,
+    search_radius: i32,
+) -> ReconstructWorkload {
+    let reference = reference.map(|(ry, rcb, rcr)| ReconstructedPicture {
+        y: ry.to_vec(),
+        cb: rcb.to_vec(),
+        cr: rcr.to_vec(),
+        width,
+        height,
+    });
+    let decision = decide_picture(
+        y,
+        width,
+        width,
+        height,
+        reference.as_ref().map(|r| r.y.as_slice()),
+        DecisionConfig {
+            qp,
+            search_radius,
+            ..DecisionConfig::default()
+        },
+    );
+    ReconstructWorkload {
+        y: y.to_vec(),
+        cb: cb.to_vec(),
+        cr: cr.to_vec(),
+        width,
+        height,
+        reference,
+        decision,
+    }
+}
+
+/// Runs the encoder's reconstruction and in-loop filter stage over a planned
+/// picture, returning the reconstructed 4:2:0 planes.
+///
+/// This is the stage that reaches the decoder's already-vectorized §8.7.2
+/// deblocking and §8.7.3 SAO kernels from the encode side: `deblocking` and
+/// `sao` select the loop-filter shape of the access unit being modelled, and
+/// with both set the reconstruction runs the same filters a decoder would.
+/// The returned planes are the stage's own output, so the bit-exactness guard
+/// covers every filtered sample.
+#[must_use]
+pub fn reconstruct_encoded_picture(
+    workload: &ReconstructWorkload,
+    deblocking: bool,
+    sao: bool,
+) -> Vec<u8> {
+    let reconstructed = reconstruct_picture(
+        SourcePlanes {
+            y: &workload.y,
+            cb: &workload.cb,
+            cr: &workload.cr,
+            width: workload.width,
+            height: workload.height,
+        },
+        workload.reference.as_ref(),
+        &workload.decision,
+        ReconConfig {
+            deblocking,
+            sao_luma: sao,
+            sao_chroma: sao,
+            // The filters are being measured, so model an access unit that
+            // does not suppress them on its PCM coding units
+            // (`pcm_loop_filter_disabled_flag == 0`, which
+            // `PcmAuOptions::pcm_loop_filter_disabled == false` writes).
+            pcm_loop_filter_disabled: !(deblocking || sao),
+            ..ReconConfig::default()
+        },
+    );
+    let mut out = reconstructed.y;
+    out.extend_from_slice(&reconstructed.cb);
+    out.extend_from_slice(&reconstructed.cr);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,120 +450,4 @@ mod tests {
         // Limited-range luma stays inside the spec's 16..=235 window.
         assert!(y.iter().all(|&sample| (16..=235).contains(&sample)));
     }
-}
-
-/// A picture-reconstruction workload with its mode-search plan already built.
-///
-/// The reconstruction stage consumes the decisions the mode search produced,
-/// and mode search costs an order of magnitude more than everything else in
-/// the encoder. Building the plan here, once, keeps it out of the timed loop
-/// so `hevc_encode_*_reconstruct` measures reconstruction and the in-loop
-/// filters rather than re-measuring `hevc_encode_*_rdo_inter`.
-///
-/// Opaque on purpose: the decision plan and the reconstructed-picture types
-/// are crate-internal, and this surface promises nothing about them.
-pub struct ReconstructWorkload {
-    y: Vec<u8>,
-    cb: Vec<u8>,
-    cr: Vec<u8>,
-    width: usize,
-    height: usize,
-    reference: Option<ReconstructedPicture>,
-    decision: PictureDecision,
-}
-
-/// Builds a [`ReconstructWorkload`] over one 4:2:0 8-bit picture.
-///
-/// `reference` is the previous picture's `(y, cb, cr)` planes, which stand in
-/// for the previous *reconstruction*: passing them enables the inter
-/// prediction path through the reconstruction loop, and `None` measures the
-/// intra path. `qp` and `search_radius` configure the mode search that runs
-/// here, in setup.
-///
-/// # Panics
-///
-/// Panics if the planes do not describe a 4:2:0 picture of `width * height`
-/// with whole 16-sample CTBs.
-#[must_use]
-pub fn plan_reconstruct(
-    y: &[u8],
-    cb: &[u8],
-    cr: &[u8],
-    width: usize,
-    height: usize,
-    reference: Option<(&[u8], &[u8], &[u8])>,
-    qp: i32,
-    search_radius: i32,
-) -> ReconstructWorkload {
-    let reference = reference.map(|(ry, rcb, rcr)| ReconstructedPicture {
-        y: ry.to_vec(),
-        cb: rcb.to_vec(),
-        cr: rcr.to_vec(),
-        width,
-        height,
-    });
-    let decision = decide_picture(
-        y,
-        width,
-        width,
-        height,
-        reference.as_ref().map(|r| r.y.as_slice()),
-        DecisionConfig {
-            qp,
-            search_radius,
-            ..DecisionConfig::default()
-        },
-    );
-    ReconstructWorkload {
-        y: y.to_vec(),
-        cb: cb.to_vec(),
-        cr: cr.to_vec(),
-        width,
-        height,
-        reference,
-        decision,
-    }
-}
-
-/// Runs the encoder's reconstruction and in-loop filter stage over a planned
-/// picture, returning the reconstructed 4:2:0 planes.
-///
-/// This is the stage that reaches the decoder's already-vectorized §8.7.2
-/// deblocking and §8.7.3 SAO kernels from the encode side: `deblocking` and
-/// `sao` select the loop-filter shape of the access unit being modelled, and
-/// with both set the reconstruction runs the same filters a decoder would.
-/// The returned planes are the stage's own output, so the bit-exactness guard
-/// covers every filtered sample.
-#[must_use]
-pub fn reconstruct_encoded_picture(
-    workload: &ReconstructWorkload,
-    deblocking: bool,
-    sao: bool,
-) -> Vec<u8> {
-    let reconstructed = reconstruct_picture(
-        SourcePlanes {
-            y: &workload.y,
-            cb: &workload.cb,
-            cr: &workload.cr,
-            width: workload.width,
-            height: workload.height,
-        },
-        workload.reference.as_ref(),
-        &workload.decision,
-        ReconConfig {
-            deblocking,
-            sao_luma: sao,
-            sao_chroma: sao,
-            // The filters are being measured, so model an access unit that
-            // does not suppress them on its PCM coding units
-            // (`pcm_loop_filter_disabled_flag == 0`, which
-            // `PcmAuOptions::pcm_loop_filter_disabled == false` writes).
-            pcm_loop_filter_disabled: !(deblocking || sao),
-            ..ReconConfig::default()
-        },
-    );
-    let mut out = reconstructed.y;
-    out.extend_from_slice(&reconstructed.cb);
-    out.extend_from_slice(&reconstructed.cr);
-    out
 }
