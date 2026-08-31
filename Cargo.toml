@@ -29,6 +29,15 @@ name = "codec"
 path = "benches/codec.rs"
 harness = false
 
+# The HEVC encoder benchmarks are their own target: they use only the synthetic
+# inputs from `benches/support`, never the decoded-fixture cache the `codec`
+# target exists to share, and the encoder's mode search is slow enough that it is
+# worth keeping out of that target's default run.
+[[bench]]
+name = "hevc_encode"
+path = "benches/hevc_encode.rs"
+harness = false
+
 [features]
 default = []
 # Additive, off by default. The crate's SIMD kernels dispatch at run time rather

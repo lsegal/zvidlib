@@ -11,6 +11,10 @@
 //! instruction set `zvidlib::simd::available()` reports, asserts every arm is
 //! bit-exact with scalar before timing it, and names the arms `<codec>/<isa>`.
 
+// Two bench targets share this module (`codec` and `hevc_encode`); each uses a
+// subset of the fixtures, so unused helpers are expected in either one.
+#![allow(dead_code)]
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::OnceLock;
@@ -114,7 +118,7 @@ pub fn report_throughput<M: criterion::measurement::Measurement>(
 }
 
 /// Minimal executor for the crate's `async` I/O entry points.
-fn block_on<T>(future: impl Future<Output = T>) -> T {
+pub fn block_on<T>(future: impl Future<Output = T>) -> T {
     let waker = Waker::noop();
     let mut context = Context::from_waker(waker);
     let mut future = Box::pin(future);
@@ -312,6 +316,55 @@ pub fn synthetic_yuv420_sequence(width: u32, height: u32, frames: usize) -> Vec<
                 &limits,
             )
             .expect("synthetic YUV420 frames are valid")
+        })
+        .collect()
+}
+
+/// Builds a deterministic synthetic RGBA8 frame sequence for encoder inputs.
+///
+/// [`synthetic_yuv420_sequence`] is the right input for the encoder's *later*
+/// stages, which consume YUV420 planes. The public HEVC encoder's own input
+/// format is RGBA8, so a whole-frame encode benchmark needs the same content in
+/// that format: the same moving gradient plus low-amplitude noise, so neither
+/// prediction nor entropy coding degenerates into an unrepresentative best case,
+/// and still no decode cost folded into the measurement.
+pub fn synthetic_rgba8_sequence(width: u32, height: u32, frames: usize) -> Vec<VideoFrame> {
+    let limits = Limits::default();
+    let dimensions =
+        VideoDimensions::new(width, height, &limits).expect("synthetic dimensions are valid");
+    let (w, h) = (width as usize, height as usize);
+    (0..frames)
+        .map(|frame| {
+            let mut state = 0x2545_f491_4f6c_dd1d_u64 ^ frame as u64;
+            let mut next_noise = || {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (state >> 58) as i32
+            };
+            let shift = (frame * 3) as i32;
+            let mut data = Vec::with_capacity(w * h * 4);
+            for y in 0..h {
+                for x in 0..w {
+                    let gradient = (x as i32 + y as i32 + shift) / 2;
+                    let noise = next_noise();
+                    data.push(((gradient + noise) & 0xff) as u8);
+                    data.push(((gradient / 2 + (x as i32 - y as i32 + shift)) & 0xff) as u8);
+                    data.push(((gradient / 3 + noise * 2) & 0xff) as u8);
+                    data.push(0xff);
+                }
+            }
+            VideoFrame::new(
+                dimensions,
+                PixelFormat::Rgba8,
+                ColorRange::Limited,
+                vec![Plane {
+                    data,
+                    stride: w * 4,
+                }],
+                &limits,
+            )
+            .expect("synthetic RGBA8 frames are valid")
         })
         .collect()
 }
