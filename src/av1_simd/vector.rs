@@ -38,6 +38,15 @@ pub(crate) trait I32x: Copy {
     unsafe fn store(self, dst: &mut [i32]);
     /// Zero-extends `LANES` bytes from the front of `src` (`src.len() >= LANES`).
     unsafe fn load_u8(src: &[u8]) -> Self;
+    /// Clamps to `0..=255` and stores all `LANES` lanes as consecutive bytes at
+    /// the front of `dst` (`dst.len() >= LANES`).
+    ///
+    /// Every implementation narrows 32-bit lanes to bytes with its own
+    /// saturating pack instructions (`packus`, `vqmovun`/`vqmovn`) and writes
+    /// the result as one machine word, so the whole-vector store never goes
+    /// through a stack scratch buffer. This is the store the deblocking,
+    /// CDEF and Wiener kernels take for all but a plane's trailing positions.
+    unsafe fn store_u8_clamped(self, dst: &mut [u8]);
 
     unsafe fn add(self, other: Self) -> Self;
     unsafe fn sub(self, other: Self) -> Self;
@@ -51,6 +60,12 @@ pub(crate) trait I32x: Copy {
     unsafe fn abs(self) -> Self;
     /// Arithmetic right shift by a compile-time constant in `0..32`.
     unsafe fn sra<const N: i32>(self) -> Self;
+    /// Logical (zero-filling) shift right by a constant, used to pull the
+    /// individual bytes out of a packed 32-bit row word.
+    unsafe fn srl<const N: i32>(self) -> Self;
+    /// Shift left by a constant, the inverse of [`I32x::srl`] used to pack
+    /// filtered bytes back into a row word.
+    unsafe fn sll<const N: i32>(self) -> Self;
     /// Arithmetic right shift by a runtime-uniform amount in `0..32`.
     unsafe fn sra_var(self, bits: i32) -> Self;
     /// Lane mask: all ones where `self > other`, zero elsewhere.
@@ -128,28 +143,54 @@ pub(crate) trait I32x: Copy {
 
     /// Clamps to `0..=255` and stores the first `count` lanes as bytes.
     ///
-    /// Packing 32-bit lanes down to bytes differs enough between the three
-    /// instruction sets (and AVX2's `packus` crosses its 128-bit halves) that
-    /// this goes through a small stack buffer instead; the kernels here load far
-    /// more than they store, so the load paths are the ones written natively.
+    /// A whole vector - every position but a plane's trailing ones - goes
+    /// straight to [`I32x::store_u8_clamped`]'s native saturating pack. Only a
+    /// partial tail stages through a stack buffer, because masking a packed
+    /// byte store differs enough between the three instruction sets (and
+    /// AVX2's `packus` crosses its 128-bit halves) not to be worth writing
+    /// three times for the last few positions of a row.
     #[inline(always)]
     unsafe fn store_u8_clamped_masked(self, dst: &mut [u8], count: usize) {
         unsafe {
+            if count == Self::LANES {
+                self.store_u8_clamped(dst);
+                return;
+            }
             let mut scratch = [0i32; MAX_LANES];
             self.clamp(Self::zero(), Self::splat(255))
                 .store(&mut scratch);
-            // Splitting the whole-vector case out keeps its byte copy a
-            // constant-length one, which is what lets it stay unrolled; only a
-            // plane's trailing positions take the variable-length loop.
-            if count == Self::LANES {
-                for (out, &value) in dst.iter_mut().zip(scratch.iter()).take(Self::LANES) {
-                    *out = value as u8;
-                }
-                return;
-            }
             for (out, &value) in dst.iter_mut().zip(scratch.iter()).take(count) {
                 *out = value as u8;
             }
+        }
+    }
+
+    /// Loads one little-endian 32-bit word per lane, lane `i` taking the four
+    /// bytes at `src[base + i * stride..]`.
+    ///
+    /// This is how a kernel whose filter window is four consecutive bytes of
+    /// each of `LANES` rows - the narrow vertical-edge deblocking filter -
+    /// reads its window: one word per row instead of one byte per tap per row,
+    /// with [`I32x::srl`] separating the taps afterwards.
+    #[inline(always)]
+    unsafe fn load_u32_rows(src: &[u8], base: usize, stride: usize) -> Self {
+        let mut words = [0i32; MAX_LANES];
+        for (lane, slot) in words.iter_mut().enumerate().take(Self::LANES) {
+            let at = base + lane * stride;
+            *slot = i32::from_le_bytes([src[at], src[at + 1], src[at + 2], src[at + 3]]);
+        }
+        unsafe { Self::load(&words) }
+    }
+
+    /// Writes each lane back as the little-endian 32-bit word at
+    /// `dst[base + i * stride..]`, the inverse of [`I32x::load_u32_rows`].
+    #[inline(always)]
+    unsafe fn store_u32_rows(self, dst: &mut [u8], base: usize, stride: usize) {
+        let mut words = [0i32; MAX_LANES];
+        unsafe { self.store(&mut words) };
+        for (lane, &word) in words.iter().enumerate().take(Self::LANES) {
+            let at = base + lane * stride;
+            dst[at..at + 4].copy_from_slice(&word.to_le_bytes());
         }
     }
 }
@@ -239,6 +280,30 @@ mod x86 {
         #[inline(always)]
         unsafe fn sra<const N: i32>(self) -> Self {
             unsafe { Self(_mm_srai_epi32::<N>(self.0)) }
+        }
+        #[inline(always)]
+        unsafe fn srl<const N: i32>(self) -> Self {
+            unsafe { Self(_mm_srli_epi32::<N>(self.0)) }
+        }
+        #[inline(always)]
+        unsafe fn sll<const N: i32>(self) -> Self {
+            unsafe { Self(_mm_slli_epi32::<N>(self.0)) }
+        }
+        #[inline(always)]
+        unsafe fn store_u8_clamped(self, dst: &mut [u8]) {
+            unsafe {
+                // `packus_epi16` reads its inputs as *signed* 16-bit, so the
+                // range clamp has to happen before the first pack rather than
+                // being left to it.
+                let clamped = _mm_min_epi32(
+                    _mm_max_epi32(self.0, _mm_setzero_si128()),
+                    _mm_set1_epi32(255),
+                );
+                let halves = _mm_packus_epi32(clamped, clamped);
+                let bytes = _mm_packus_epi16(halves, halves);
+                let word = _mm_cvtsi128_si32(bytes) as u32;
+                dst[..4].copy_from_slice(&word.to_le_bytes());
+            }
         }
         #[inline(always)]
         unsafe fn sra_var(self, bits: i32) -> Self {
@@ -348,6 +413,32 @@ mod x86 {
         #[inline(always)]
         unsafe fn sra<const N: i32>(self) -> Self {
             unsafe { Self(_mm256_srai_epi32::<N>(self.0)) }
+        }
+        #[inline(always)]
+        unsafe fn srl<const N: i32>(self) -> Self {
+            unsafe { Self(_mm256_srli_epi32::<N>(self.0)) }
+        }
+        #[inline(always)]
+        unsafe fn sll<const N: i32>(self) -> Self {
+            unsafe { Self(_mm256_slli_epi32::<N>(self.0)) }
+        }
+        #[inline(always)]
+        unsafe fn store_u8_clamped(self, dst: &mut [u8]) {
+            unsafe {
+                let clamped = _mm256_min_epi32(
+                    _mm256_max_epi32(self.0, _mm256_setzero_si256()),
+                    _mm256_set1_epi32(255),
+                );
+                // Packing the two 128-bit halves against each other rather than
+                // `clamped` against itself is what keeps the eight bytes in
+                // lane order despite `packus` working within each half.
+                let lo = _mm256_castsi256_si128(clamped);
+                let hi = _mm256_extracti128_si256::<1>(clamped);
+                let halves = _mm_packus_epi32(lo, hi);
+                let bytes = _mm_packus_epi16(halves, halves);
+                let word = _mm_cvtsi128_si64(bytes) as u64;
+                dst[..8].copy_from_slice(&word.to_le_bytes());
+            }
         }
         #[inline(always)]
         unsafe fn sra_var(self, bits: i32) -> Self {
@@ -462,6 +553,29 @@ mod arm {
                 } else {
                     Self(vshlq_s32(self.0, vdupq_n_s32(-N)))
                 }
+            }
+        }
+        #[inline(always)]
+        unsafe fn srl<const N: i32>(self) -> Self {
+            unsafe {
+                let lanes = vreinterpretq_u32_s32(self.0);
+                Self(vreinterpretq_s32_u32(vshrq_n_u32::<N>(lanes)))
+            }
+        }
+        #[inline(always)]
+        unsafe fn sll<const N: i32>(self) -> Self {
+            unsafe { Self(vshlq_n_s32::<N>(self.0)) }
+        }
+        #[inline(always)]
+        unsafe fn store_u8_clamped(self, dst: &mut [u8]) {
+            unsafe {
+                // `vqmovun_s32` saturates a negative lane to 0 and anything
+                // above 65535 to 65535, and `vqmovn_u16` then saturates to
+                // 255, so the pair performs the `0..=255` clamp itself.
+                let halves = vqmovun_s32(self.0);
+                let bytes = vqmovn_u16(vcombine_u16(halves, halves));
+                let word = vget_lane_u32::<0>(vreinterpret_u32_u8(bytes));
+                dst[..4].copy_from_slice(&word.to_le_bytes());
             }
         }
         #[inline(always)]

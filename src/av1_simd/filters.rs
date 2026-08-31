@@ -551,6 +551,42 @@ unsafe fn narrow_chunk_vertical<V: I32x>(
     thresh: i32,
 ) {
     unsafe {
+        // The four taps of one lane are four *consecutive* bytes of one row,
+        // and consecutive lanes are one row stride apart. So when the whole
+        // chunk is inside the plane the window is `LANES` unaligned 32-bit
+        // words, and shifting the loaded words apart yields the tap vectors
+        // without touching memory once per tap per lane. Repacking the filtered
+        // bytes into words stores the same way. That replaces the
+        // `4 * LANES` byte loads, `4 * LANES` byte stores and four scratch-
+        // buffer round trips the staged path below performs with `LANES` word
+        // loads, `LANES` word stores and a handful of shifts.
+        let byte = V::splat(0xff);
+        if full && lanes == V::LANES {
+            let base = y * geom.stride + x - 2;
+            let words = V::load_u32_rows(data, base, geom.stride);
+            let taps = [
+                words.and(byte),
+                words.srl::<8>().and(byte),
+                words.srl::<16>().and(byte),
+                words.srl::<24>(),
+            ];
+            let (dp, dq) = edge_deltas(taps[0], taps[1], taps[2], taps[3]);
+            let mask = filter_mask_lanes(dp, dq, taps[0], taps[1], taps[2], taps[3], limit, blimit);
+            let out = narrow_filter_lanes(mask, dp, dq, taps[0], taps[1], taps[2], taps[3], thresh);
+            // Every output is either an untouched input sample or a
+            // `clamp_pixel` result, so each already occupies exactly one byte
+            // and the packed word needs no further masking.
+            let packed = out[0]
+                .or(out[1].sll::<8>())
+                .or(out[2].sll::<16>())
+                .or(out[3].sll::<24>());
+            packed.store_u32_rows(data, base, geom.stride);
+            return;
+        }
+
+        // The last chunk of a column, which either runs past the plane's final
+        // row (so lanes repeat the clamped edge row and are not a fixed stride
+        // apart) or writes fewer than `LANES` rows.
         let mut staged = [[0u8; MAX_LANES]; 4];
         for lane in 0..V::LANES {
             let row = if full {
