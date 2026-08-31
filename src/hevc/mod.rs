@@ -1,7 +1,7 @@
 //! Native HEVC/H.265 decoding with platform acceleration and a dependency-free software fallback.
 
 mod encoder;
-mod engine;
+pub(crate) mod engine;
 #[cfg(all(any(windows, target_os = "linux"), target_pointer_width = "64"))]
 mod nvdec;
 #[cfg(target_os = "macos")]

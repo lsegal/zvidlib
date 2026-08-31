@@ -28,6 +28,7 @@ pub mod mp4;
 pub mod mp4_demux;
 pub mod output;
 pub mod playback;
+pub mod simd;
 pub mod timeline;
 pub mod transfer;
 

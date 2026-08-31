@@ -20,7 +20,8 @@
 
 use super::vector::{I32x, MAX_LANES};
 use crate::av1_filters::{
-    WIDE_FILTER8_SHIFT, WIDE_FILTER8_WEIGHTS, WIDE_FILTER14_SHIFT, WIDE_FILTER14_WEIGHTS,
+    WIDE_FILTER6_SHIFT, WIDE_FILTER6_WEIGHTS, WIDE_FILTER8_SHIFT, WIDE_FILTER8_WEIGHTS,
+    WIDE_FILTER14_SHIFT, WIDE_FILTER14_WEIGHTS,
 };
 
 /// The plane geometry a kernel needs to reproduce the scalar path's edge
@@ -351,7 +352,8 @@ unsafe fn wide_filter_output<V: I32x>(taps: &[V], weights: &[i32], shift: i32) -
 ///
 /// `taps[k]` holds the samples at offset `k - 7` from the edge (so `taps[6]`
 /// and `taps[7]` are `p0`/`q0`), and `sizes` holds each position's filter
-/// length from §7.14.5 (4, 8, or 14) — per lane, because a run of positions can
+/// length from §7.14.5 (4, 6, 8, or 14; 6 only on chroma planes and 8/14 only
+/// on luma) — per lane, because a run of positions can
 /// straddle transform blocks of different sizes. The result holds the new
 /// samples for offsets `-6..=5`; lanes and offsets that the selected filter
 /// does not write come back as the original sample, so the caller can store the
@@ -382,6 +384,25 @@ unsafe fn deblock_filter_lanes<V: I32x>(
         let mask = filter_mask_lanes(dp, dq, p1, p0, q0, q1, limit, blimit);
         let narrow = narrow_filter_lanes(mask, dp, dq, p1, p0, q0, q1, thresh);
         out[4..8].copy_from_slice(&narrow);
+
+        // Chroma's 6-tap filter (§7.14.6.3 `filter6`) writes the same four
+        // samples the narrow filter does, so it selects over them. Its gates
+        // stop at p2/q2, which the shared masks express by standing p2/q2 in
+        // for the p3/q3 taps, exactly as the scalar path does. A 6 never
+        // appears alongside an 8 or a 14 (one is chroma, the others luma), so
+        // the wide cascade below cannot overwrite it.
+        let is6 = sizes.gt(V::splat(7)).andnot(sizes.gt(V::splat(5)));
+        let wide6 = mask
+            .and(is6)
+            .and(filter_mask_wide_lanes(p2, p2, p1, q1, q2, q2, limit))
+            .and(flat_mask_lanes(p0, p1, p2, p2, q0, q1, q2, q2));
+        if wide6.any() {
+            let window = &taps[EDGE - 3..EDGE + 3];
+            for (weights, slot) in WIDE_FILTER6_WEIGHTS.iter().zip(out[4..8].iter_mut()) {
+                let filtered = wide_filter_output(window, weights, WIDE_FILTER6_SHIFT);
+                *slot = V::select(wide6, filtered, *slot);
+            }
+        }
 
         // Both wide filters need the boundary mask, a filter length that
         // reaches that far, and their flatness gate; the 14-tap filter is a
