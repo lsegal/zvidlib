@@ -1381,6 +1381,10 @@ mod tests {
             e.symbol(&cdf::INTRA_FRAME_Y_MODE_DC_DC, 0); // DC_PRED
             if block == 0 || block == 3 {
                 e.symbol(cdf::txb_skip_cdf(qctx, tx_ctx, context), 0); // not skipped
+                // read_tx_type: §5.11.39 reads `transform_type()` right after
+                // `all_zero` and before `eob_pt`, so an 8x8 DC_PRED block's
+                // set-appropriate `tx_type` symbol comes here.
+                e.symbol(cdf::tx_type_cdf(tx_set, 8, 0).unwrap(), tx_type_symbol);
                 e.symbol(cdf::eob_pt_cdf(qctx, 8, 0), 0); // eob_point = 1 -> eob = 1
                 e.symbol(cdf::coeff_base_eob_cdf(qctx, tx_ctx, 0, 0), 2); // level = 3 (max base)
                 e.symbol(cdf::coeff_br_cdf(qctx, tx_ctx, 0, 0), 3); // +3, keep extending
@@ -1389,9 +1393,6 @@ mod tests {
                 e.symbol(cdf::coeff_br_cdf(qctx, tx_ctx, 0, 0), 2); // +2, stop (level = 14)
                 // block 0 negative, block 3 positive
                 e.symbol(cdf::dc_sign_cdf(qctx, 0, 0), usize::from(block == 0));
-                // read_tx_type: an 8x8 DC_PRED block's set-appropriate
-                // `tx_type` symbol.
-                e.symbol(cdf::tx_type_cdf(tx_set, 8, 0).unwrap(), tx_type_symbol);
             } else {
                 e.symbol(cdf::txb_skip_cdf(qctx, tx_ctx, context), 1); // skipped -> all zero
             }
@@ -1643,22 +1644,38 @@ mod tests {
     /// coefficient CDFs' transform-size context and (capped at 32, since a
     /// 64x64 transform codes only its upper-left quadrant) the `eob_pt`
     /// class.
-    fn encode_dc_only_transform_block(e: &mut SymbolEncoder, skip_context: usize, size: usize) {
+    fn encode_dc_only_transform_block(
+        e: &mut SymbolEncoder,
+        skip_context: usize,
+        size: usize,
+        level: i32,
+    ) {
+        assert!((3..=14).contains(&level), "level is coded without a golomb tail");
         let qctx = cdf::coeff_qctx(SUPERBLOCK_Q);
         let tx_ctx = cdf::coeff_tx_size_ctx(size);
         e.symbol(cdf::txb_skip_cdf(qctx, tx_ctx, skip_context), 0); // not skipped
         // eob_point = 1 -> eob = 1
         e.symbol(cdf::eob_pt_cdf(qctx, size.min(32), 0), 0);
         e.symbol(cdf::coeff_base_eob_cdf(qctx, tx_ctx, 0, 0), 2); // level = 3 (max base)
-        e.symbol(cdf::coeff_br_cdf(qctx, tx_ctx, 0, 0), 1); // +1, stop (level = 4)
+        // The base-range extension carries the rest, three at a time.
+        let mut remaining = level - 3;
+        for _ in 0..4 {
+            let increment = remaining.min(3);
+            e.symbol(cdf::coeff_br_cdf(qctx, tx_ctx, 0, 0), increment as usize);
+            remaining -= increment;
+            if increment < 3 {
+                break;
+            }
+        }
+        assert_eq!(remaining, 0, "the base range covers this level");
         e.symbol(cdf::dc_sign_cdf(qctx, 0, 0), 0); // positive
     }
 
     /// The reconstruction a `size x size` transform carrying DC level 4
     /// produces on top of the 128 DC prediction an unbordered block gets.
-    fn dc_only_reconstruction(size: usize) -> Vec<u8> {
+    fn dc_only_reconstruction(size: usize, level: i32) -> Vec<u8> {
         let mut coefficients = vec![0i32; size * size];
-        coefficients[0] = 4;
+        coefficients[0] = level;
         let residuals = inverse_transform(
             &coefficients,
             size,
@@ -1682,7 +1699,7 @@ mod tests {
         // and TX_64X64's transform set is TX_SET_DCTONLY, so no tx_type
         // symbol follows the coefficients either. The transform covers the
         // whole coding block, so `getTXBSkipCtx` is 0.
-        encode_dc_only_transform_block(&mut e, 0, 64);
+        encode_dc_only_transform_block(&mut e, 0, 64, 14);
         let stream = superblock_temporal_unit(&e.finish(), false);
 
         let limits = Limits::default();
@@ -1696,7 +1713,7 @@ mod tests {
         assert_eq!(tx_sizes, expected);
         // The plane really came through the 64-point inverse DCT: a lone
         // DC coefficient spreads a constant offset over all 64x64 samples.
-        assert_eq!(frame.planes[0].data, dc_only_reconstruction(64));
+        assert_eq!(frame.planes[0].data, dc_only_reconstruction(64, 14));
         assert_ne!(frame.planes[0].data[0], 128);
     }
 
@@ -1712,7 +1729,7 @@ mod tests {
         // (4) on 4x4 columns/rows 0..8, so the transforms to its right and
         // below each see exactly one nonzero, greater-than-3 neighbour
         // (context 3), and the last one sees neither (context 1).
-        encode_dc_only_transform_block(&mut e, 1, 32);
+        encode_dc_only_transform_block(&mut e, 1, 32, 4);
         for context in [3, 3, 1] {
             // skipped -> all zero
             e.symbol(
@@ -1734,7 +1751,7 @@ mod tests {
         }
         assert_eq!(tx_sizes, expected);
 
-        let reconstruction = dc_only_reconstruction(32);
+        let reconstruction = dc_only_reconstruction(32, 4);
         let width = SUPERBLOCK_DIM as usize;
         for row in 0..32 {
             assert_eq!(
@@ -1830,7 +1847,7 @@ mod tests {
         // TX_64X64 would write outside the reconstruction buffer.
         let mut e = SymbolEncoder::new();
         superblock_prefix(&mut e);
-        encode_dc_only_transform_block(&mut e, 0, 64);
+        encode_dc_only_transform_block(&mut e, 0, 64, 14);
         let tile = e.finish();
         let mut payload = frame_header_payload(SUPERBLOCK_Q, Some((0, 0, 0, 0, 0)), false, true);
         payload.extend_from_slice(&tile);

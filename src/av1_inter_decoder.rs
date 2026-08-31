@@ -2967,6 +2967,9 @@ mod tests {
             e.symbol(&cdf::INTRA_FRAME_Y_MODE_DC_DC, 0); // DC_PRED
             if block == 0 || block == 3 {
                 e.symbol(cdf::txb_skip_cdf(qctx, tx_ctx, context), 0); // not skipped
+                // read_tx_type: §5.11.39 reads `transform_type()` right after
+                // `all_zero` and before `eob_pt`.
+                e.symbol(cdf::tx_type_cdf(tx_set, 8, 0).unwrap(), tx_type_symbol);
                 e.symbol(cdf::eob_pt_cdf(qctx, 8, 0), 0); // eob_point = 1 -> eob = 1
                 e.symbol(cdf::coeff_base_eob_cdf(qctx, tx_ctx, 0, 0), 2); // level = 3 (max base)
                 e.symbol(cdf::coeff_br_cdf(qctx, tx_ctx, 0, 0), 3); // +3, keep extending
@@ -2975,9 +2978,6 @@ mod tests {
                 e.symbol(cdf::coeff_br_cdf(qctx, tx_ctx, 0, 0), 2); // +2, stop (level = 14)
                 // block 0 negative, block 3 positive
                 e.symbol(cdf::dc_sign_cdf(qctx, 0, 0), usize::from(block == 0));
-                // read_tx_type: an 8x8 DC_PRED block's set-appropriate
-                // `tx_type` symbol.
-                e.symbol(cdf::tx_type_cdf(tx_set, 8, 0).unwrap(), tx_type_symbol);
             } else {
                 e.symbol(cdf::txb_skip_cdf(qctx, tx_ctx, context), 1); // skipped -> all zero
             }
@@ -3051,11 +3051,12 @@ mod tests {
         let qctx = cdf::coeff_qctx(40);
         let tx_ctx = cdf::coeff_tx_size_ctx(16);
         e.symbol(cdf::txb_skip_cdf(qctx, tx_ctx, 0), 0); // not skipped
+        // §5.11.39 reads `transform_type()` right after `all_zero`.
+        e.symbol(cdf::tx_type_cdf(tx_set, 16, 0).unwrap(), tx_type_symbol);
         e.symbol(cdf::eob_pt_cdf(qctx, 16, 0), 0); // eob_point = 1 -> eob = 1
         e.symbol(cdf::coeff_base_eob_cdf(qctx, tx_ctx, 0, 0), 2); // level = 3 (max base)
         e.symbol(cdf::coeff_br_cdf(qctx, tx_ctx, 0, 0), 1); // +1, stop (level = 4)
         e.symbol(cdf::dc_sign_cdf(qctx, 0, 0), 0); // positive
-        e.symbol(cdf::tx_type_cdf(tx_set, 16, 0).unwrap(), tx_type_symbol);
 
         let mi = 2 * FRAME_DIM.div_ceil(8) as usize;
         let mut payload = FrameHeaderBuilder::inter_frame(3, 1, 0x01, [0; 7], None)
@@ -3216,14 +3217,15 @@ mod tests {
             e.symbol(cdf::txb_skip_cdf(qctx, tx_ctx, 1), 1); // skipped, no coefficients
         }
         e.symbol(cdf::txb_skip_cdf(qctx, tx_ctx, 1), 0); // not skipped
-        e.symbol(cdf::eob_pt_cdf(qctx, 8, 0), 0); // eob_point = 1 -> eob = 1
-        e.symbol(cdf::coeff_base_eob_cdf(qctx, tx_ctx, 0, 0), 2); // level = 3 (max base)
-        e.symbol(cdf::coeff_br_cdf(qctx, tx_ctx, 0, 0), 1); // +1, stop (level = 4)
-        e.symbol(cdf::dc_sign_cdf(qctx, 0, 0), 0); // positive
+        // §5.11.39 reads `transform_type()` right after `all_zero`.
         e.symbol(
             cdf::tx_type_cdf(cdf::Av1TxSet::Inter1, 8, 0).unwrap(),
             tx_type_symbol,
         );
+        e.symbol(cdf::eob_pt_cdf(qctx, 8, 0), 0); // eob_point = 1 -> eob = 1
+        e.symbol(cdf::coeff_base_eob_cdf(qctx, tx_ctx, 0, 0), 2); // level = 3 (max base)
+        e.symbol(cdf::coeff_br_cdf(qctx, tx_ctx, 0, 0), 1); // +1, stop (level = 4)
+        e.symbol(cdf::dc_sign_cdf(qctx, 0, 0), 0); // positive
 
         let mi = 2 * FRAME_DIM.div_ceil(8) as usize;
         let mut payload = FrameHeaderBuilder::inter_frame(3, 1, 0x01, [0; 7], None)
@@ -3412,7 +3414,11 @@ mod tests {
         e.symbol(cdf::txb_skip_cdf(qctx, tx_ctx, 0), 0); // not skipped
         e.symbol(cdf::eob_pt_cdf(qctx, 32, 0), 0); // eob_point = 1 -> eob = 1
         e.symbol(cdf::coeff_base_eob_cdf(qctx, tx_ctx, 0, 0), 2); // level = 3 (max base)
-        e.symbol(cdf::coeff_br_cdf(qctx, tx_ctx, 0, 0), 1); // +1, stop (level = 4)
+        // `Dq_Denom[TX_64X64]` is 4 (spec §7.12.3), so a level of 4 rounds
+        // away entirely; the base range carries this one up to 14 instead.
+        for increment in [3, 3, 3, 2] {
+            e.symbol(cdf::coeff_br_cdf(qctx, tx_ctx, 0, 0), increment); // level = 14
+        }
         e.symbol(cdf::dc_sign_cdf(qctx, 0, 0), 0); // positive
 
         let mi = 2 * SUPERBLOCK_DIM.div_ceil(8) as usize;
@@ -3459,7 +3465,7 @@ mod tests {
         // DC coefficient spreads a constant offset over all 64x64 samples
         // on top of the 128 DC prediction an unbordered block starts from.
         let mut coefficients = vec![0i32; 64 * 64];
-        coefficients[0] = 4;
+        coefficients[0] = 14;
         let residuals = inverse_transform(
             &coefficients,
             64,
