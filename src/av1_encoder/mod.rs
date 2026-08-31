@@ -756,6 +756,29 @@ mod nonlossless_tests {
     }
 
     #[test]
+    fn zz_probe() {
+        let (width, height) = (640_u32, 352_u32);
+        let pixels = test_pattern(width, height);
+        for q in [1_u8, 32, 80, 160] {
+            let start = std::time::Instant::now();
+            let data = encode(width, height, q, &pixels);
+            let elapsed = start.elapsed();
+            let mut hash: u64 = 0xcbf29ce484222325;
+            for &b in &data {
+                hash ^= u64::from(b);
+                hash = hash.wrapping_mul(0x100000001b3);
+            }
+            let decoded = decode_luma(&data, width, height);
+            println!(
+                "PROBE q={q} bytes={} hash={hash:016x} psnr={:.4} ms={:.1}",
+                data.len(),
+                psnr(&pixels, &decoded),
+                elapsed.as_secs_f64() * 1000.0
+            );
+        }
+    }
+
+    #[test]
     fn non_lossless_frames_round_trip_within_a_distortion_bound() {
         let (width, height) = (96_u32, 80_u32);
         let pixels = test_pattern(width, height);

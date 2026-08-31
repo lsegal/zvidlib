@@ -39,6 +39,18 @@ const COEFF_BASE_PLUS_RANGE: i32 = 14;
 /// inverse kernel but no forward one, so a 64x64 coding block always signals a `tx_depth` of at
 /// least 1.
 const MAX_FORWARD_TX: usize = 32;
+/// Sentinel for an unfilled memo slot; every real answer encodes as a smaller byte.
+const MEMO_UNSET: u8 = u8::MAX;
+/// Partition-tree levels the memos cover, one per `Mi_Width_Log2` a coding block can have
+/// (`bw` of 8, 16, 32 and 64, so `bsl` 1 through 4).
+const MEMO_LEVELS: usize = 5;
+
+/// Bits [`estimate_rate`] charges a block whose levels are all zero: the `all_zero` flag alone.
+const ZERO_BLOCK_BITS: i64 = 1;
+/// Bits [`estimate_rate`] charges the cheapest block it can charge that is *not* all zero: the
+/// `all_zero` flag, a one-position end-of-block, and one magnitude-1 coefficient with its sign.
+const MIN_CODED_BLOCK_BITS: i64 = 7;
+
 /// Smallest coding block the non-lossless partition search will produce. A 16x16 block can still
 /// signal `TX_16X16`, `TX_8X8`, or `TX_4X4`, so every transform size this encoder emits stays
 /// reachable without searching partitions all the way down to 8x8.
@@ -76,6 +88,16 @@ pub(crate) struct FrameEncoder<'a> {
     /// can assert what the round trip covered rather than assume it.
     #[cfg(test)]
     emitted: Vec<(usize, Av1TxType)>,
+    /// Memoized `decide_split` answers, one slot per `(block size, MI position)`.
+    ///
+    /// A block at `(r, c, bw)` is only ever searched from one encoder state per frame: every
+    /// speculative trial rolls the state back with [`Snapshot`] before the next one, and the
+    /// emitting pass walks the same decision tree in the same order, so it reaches each block
+    /// with exactly the state its trial saw. Without the memo the emitting pass re-runs the
+    /// whole subtree search that the trial just ran, once per level of the partition tree.
+    split_memo: Vec<u8>,
+    /// Memoized `choose_tx_size` answers, in the same slot layout as [`Self::split_memo`].
+    tx_size_memo: Vec<u8>,
 }
 
 /// One transform type considered for a block, with everything the winner needs to be written:
@@ -141,6 +163,8 @@ impl<'a> FrameEncoder<'a> {
             },
             #[cfg(test)]
             emitted: Vec::new(),
+            split_memo: vec![MEMO_UNSET; MEMO_LEVELS * mi_cols * mi_rows],
+            tx_size_memo: vec![MEMO_UNSET; MEMO_LEVELS * mi_cols * mi_rows],
         }
     }
 
@@ -252,6 +276,10 @@ impl<'a> FrameEncoder<'a> {
         if bw <= MIN_PARTITION_WIDTH {
             return false;
         }
+        let slot = self.memo_slot(r, c, bw);
+        if self.split_memo[slot] != MEMO_UNSET {
+            return self.split_memo[slot] != 0;
+        }
         let snapshot = self.snapshot(r, c, bw);
         let whole = self.encode_block(r, c, bw, false);
         self.restore(snapshot);
@@ -268,7 +296,16 @@ impl<'a> FrameEncoder<'a> {
         // Four sub-blocks each pay their own partition, skip, mode, and tx_size symbols; charging
         // a flat header cost keeps the search from splitting for a negligible distortion win.
         const SPLIT_HEADER_BITS: i64 = 24;
-        split + self.lambda * SPLIT_HEADER_BITS < whole
+        let chosen = split + self.lambda * SPLIT_HEADER_BITS < whole;
+        self.split_memo[slot] = u8::from(chosen);
+        chosen
+    }
+
+    /// Slot in [`Self::split_memo`] and [`Self::tx_size_memo`] for the `bw x bw` block at
+    /// `(r, c)`.
+    fn memo_slot(&self, r: usize, c: usize, bw: usize) -> usize {
+        let bsl = (bw / 4).trailing_zeros() as usize;
+        (bsl.min(MEMO_LEVELS - 1) * self.mi_rows + r) * self.mi_cols + c
     }
 
     fn partition_ctx(&self, r: usize, c: usize, bsl: usize) -> usize {
@@ -330,6 +367,10 @@ impl<'a> FrameEncoder<'a> {
     /// Picks the transform size for a `bw x bw` coding block by trial-coding every size
     /// `read_tx_size` can signal for it and keeping the cheapest.
     fn choose_tx_size(&mut self, r: usize, c: usize, bw: usize) -> usize {
+        let slot = self.memo_slot(r, c, bw);
+        if self.tx_size_memo[slot] != MEMO_UNSET {
+            return 4 << self.tx_size_memo[slot];
+        }
         let largest = bw.min(MAX_TX_WIDTH);
         let (_, max_depth) = cdf::tx_depth_cdf(bw);
         let mut best = (0usize, i64::MAX);
@@ -349,6 +390,7 @@ impl<'a> FrameEncoder<'a> {
             }
         }
         debug_assert_ne!(best.0, 0, "every coding block has one legal transform size");
+        self.tx_size_memo[slot] = (best.0 / 4).trailing_zeros() as u8;
         best.0
     }
 
