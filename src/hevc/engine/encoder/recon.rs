@@ -401,8 +401,7 @@ fn reconstruct_component(
             } else {
                 PredMode::Intra
             };
-            let coefficients =
-                forward_transform(&residual, n_tbs, pred_mode, component, BIT_DEPTH);
+            let coefficients = forward_transform(&residual, n_tbs, pred_mode, component, BIT_DEPTH);
             let levels = quantize(
                 &coefficients,
                 n_tbs,

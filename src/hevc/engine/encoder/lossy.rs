@@ -118,10 +118,10 @@ pub fn encode_idr_residual_au(
     let (rbsp, recon) = write_idr_residual_slice(y, cb, cr, width, height, qp);
     let level_idc = level_idc_for(width * height);
     let units = vec![
-        nal_unit(32, 0, 0, &write_vps(level_idc)),                       // VPS_NUT
+        nal_unit(32, 0, 0, &write_vps(level_idc)), // VPS_NUT
         nal_unit(33, 0, 0, &write_sps(width, height, level_idc, false, true)), // SPS_NUT
-        nal_unit(34, 0, 0, &write_pps(false, false, None)),              // PPS_NUT
-        nal_unit(20, 0, 0, &rbsp),                                       // IDR_N_LP
+        nal_unit(34, 0, 0, &write_pps(false, false, None)), // PPS_NUT
+        nal_unit(20, 0, 0, &rbsp),                 // IDR_N_LP
     ];
     Ok((annexb(&units), recon))
 }
@@ -487,9 +487,8 @@ mod tests {
         // access unit must be a fraction of the raw sample payload.
         let (width, height) = (64, 48);
         let (y, cb, cr) = picture(width, height);
-        let pcm =
-            crate::hevc::engine::encoder::pcm::encode_idr_pcm_au(&y, &cb, &cr, width, height)
-                .unwrap();
+        let pcm = crate::hevc::engine::encoder::pcm::encode_idr_pcm_au(&y, &cb, &cr, width, height)
+            .unwrap();
         let (lossy, _) = encode_idr_residual_au(&y, &cb, &cr, width, height, 32).unwrap();
         assert!(
             lossy.len() * 2 < pcm.len(),

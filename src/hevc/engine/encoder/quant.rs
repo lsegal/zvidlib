@@ -38,8 +38,8 @@
 //! from it.
 
 use crate::hevc::engine::transform::{
-    BlockParams, Component, PredMode, TransformError, coeff_range, forward_dct_1d,
-    forward_dst4_1d, residual_block,
+    BlockParams, Component, PredMode, TransformError, coeff_range, forward_dct_1d, forward_dst4_1d,
+    residual_block,
 };
 
 /// `MAX_TR_DYNAMIC_RANGE` — the coefficient dynamic range the §8.6.3 /
@@ -110,7 +110,11 @@ pub(crate) fn forward_transform(
     bit_depth: u8,
 ) -> Vec<i32> {
     let log2 = log2_tbs(n_tbs).expect("forward_transform called with an illegal nTbS");
-    assert_eq!(residual.len(), n_tbs * n_tbs, "residual block size mismatch");
+    assert_eq!(
+        residual.len(),
+        n_tbs * n_tbs,
+        "residual block size mismatch"
+    );
     let dst = uses_dst(n_tbs, pred_mode, component);
     let (coeff_min, coeff_max) = coeff_range(bit_depth, false);
     let (lo, hi) = (i64::from(coeff_min), i64::from(coeff_max));
@@ -186,7 +190,13 @@ pub(crate) fn quantize(
     let q_bits = QUANT_SHIFT + (q_p / 6) as i32 + transform_shift;
     debug_assert!(q_bits > 0);
     let scale = QUANT_SCALE[(q_p % 6) as usize];
-    let offset = ((1i64 << (q_bits - 1)) * if intra { INTRA_ROUNDING } else { INTER_ROUNDING }) / 512;
+    let offset = ((1i64 << (q_bits - 1))
+        * if intra {
+            INTRA_ROUNDING
+        } else {
+            INTER_ROUNDING
+        })
+        / 512;
     let (coeff_min, coeff_max) = coeff_range(bit_depth, false);
 
     coefficients

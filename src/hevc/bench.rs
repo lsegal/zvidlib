@@ -209,7 +209,11 @@ pub fn forward_transform_coefficients(
         width % n_tbs == 0 && height % n_tbs == 0,
         "picture must tile into whole transform blocks"
     );
-    let pred_mode = if intra { PredMode::Intra } else { PredMode::Inter };
+    let pred_mode = if intra {
+        PredMode::Intra
+    } else {
+        PredMode::Inter
+    };
     let mut out = vec![0i32; width * height];
     let mut block = vec![0i32; n_tbs * n_tbs];
     for by in (0..height).step_by(n_tbs) {
@@ -219,8 +223,7 @@ pub fn forward_transform_coefficients(
                     block[row * n_tbs + col] = residual[(by + row) * width + bx + col];
                 }
             }
-            let coefficients =
-                forward_transform(&block, n_tbs, pred_mode, Component::Luma, 8);
+            let coefficients = forward_transform(&block, n_tbs, pred_mode, Component::Luma, 8);
             for row in 0..n_tbs {
                 for col in 0..n_tbs {
                     out[(by + row) * width + bx + col] = coefficients[row * n_tbs + col];
@@ -287,7 +290,11 @@ pub fn quantize_picture(
     qp: u32,
     intra: bool,
 ) -> Vec<u8> {
-    assert_eq!(coefficients.len(), width * height, "coefficient size mismatch");
+    assert_eq!(
+        coefficients.len(),
+        width * height,
+        "coefficient size mismatch"
+    );
     assert!(
         width % n_tbs == 0 && height % n_tbs == 0,
         "picture must tile into whole transform blocks"

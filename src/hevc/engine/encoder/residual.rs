@@ -31,12 +31,12 @@
 
 use crate::hevc::engine::binarization::{
     COEFF_ABS_LEVEL_REMAINING_TR_PREFIX_ESCAPE_LEN, Greater1State,
-    coeff_abs_level_greater2_flag_ctx_inc, coeff_abs_level_remaining_c_max_eq_9_26,
-    coeff_abs_level_remaining_c_rice_param_eq_9_24, coded_sub_block_flag_ctx_inc_with_edge,
+    coded_sub_block_flag_ctx_inc_with_edge, coeff_abs_level_greater2_flag_ctx_inc,
+    coeff_abs_level_remaining_c_max_eq_9_26, coeff_abs_level_remaining_c_rice_param_eq_9_24,
     last_sig_coeff_position, last_sig_coeff_prefix_cmax, last_sig_coeff_prefix_ctx_inc,
     last_sig_coeff_prefix_ctx_offset_shift, last_sig_coeff_suffix_n_bits,
-    sig_coeff_flag_ctx_inc_from_sig_ctx, sig_coeff_flag_sig_ctx_dc,
-    sig_coeff_flag_sig_ctx_general, sig_coeff_flag_sig_ctx_log2_2,
+    sig_coeff_flag_ctx_inc_from_sig_ctx, sig_coeff_flag_sig_ctx_dc, sig_coeff_flag_sig_ctx_general,
+    sig_coeff_flag_sig_ctx_log2_2,
 };
 use crate::hevc::engine::cabac::ContextModel;
 use crate::hevc::engine::encoder::bitwriter::BitWriter;
@@ -253,8 +253,8 @@ pub(crate) fn write_residual_coding<S: ResidualBinSink>(
 
         // sig_coeff_flag pass, indexed by in-sub-block scan position.
         let mut sig = [0u8; 16];
-        for n in 0..16 {
-            sig[n] = u8::from(level_at(n) != 0);
+        for (n, flag) in sig.iter_mut().enumerate() {
+            *flag = u8::from(level_at(n) != 0);
         }
         if is_last_sb {
             // Significant by definition, and not coded.
