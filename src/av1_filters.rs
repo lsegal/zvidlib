@@ -39,7 +39,10 @@
 //! take the spec's 6-tap wide filter (§7.14.6.3 `filter6`,
 //! `WIDE_FILTER6_WEIGHTS`) where §7.14.5 selects it, from a chroma
 //! transform-size grid derived from the luma grid and the frame's
-//! subsampling.
+//! subsampling. Which of those filters an edge takes is §7.14.5's
+//! `filterSize = Min(16, Min(txDim, prevTxDim))` in both planes
+//! (`filter_length_for_edge`), so the first wide luma filter engages at an
+//! 8-sample perpendicular transform, not a 16-sample one.
 //!
 //! One normative piece is still reproduced from published reference tables
 //! rather than derived here:
