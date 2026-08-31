@@ -262,12 +262,6 @@ fn forward_1d(kind: Tx1d, input: &[i64], output: &mut [i64]) {
 pub fn forward_transform(residual: &[i32], size: usize, tx_type: Av1TxType) -> Vec<i32> {
     debug_assert_eq!(residual.len(), size * size);
     debug_assert!(matches!(size, 4 | 8 | 16 | 32));
-    if tx_type == Av1TxType::Idtx {
-        // The 2-D identity has no butterfly pass and no scaling, mirroring
-        // the inverse identity's short path.
-        return residual.to_vec();
-    }
-
     let (mut column, mut row, lr_flip, ud_flip) = tx_type.kernels();
     if size == 32 {
         // As on the inverse side, only the ADST passes fall back to the DCT;
@@ -550,18 +544,42 @@ mod tests {
         }
     }
 
-    /// `IDTX` has no butterfly pass and no scaling in either direction, so its
-    /// round trip is exact rather than merely close.
+    /// `IDTX` now runs the spec's scaled identity on both axes rather than
+    /// passing coefficients through untouched, so its round trip is no longer
+    /// exact - it rounds once per pass like every other type. What still has
+    /// to hold is that the transform is diagonal: a coefficient stays in its
+    /// own position, scaled, instead of spreading the way a butterfly does.
     #[test]
-    fn identity_transform_round_trips_exactly() {
+    fn identity_transform_round_trips_within_the_shared_tolerance() {
         let mut rng = Lcg(0x5eed_0140_0000_0002);
         for size in [4usize, 8, 16, 32] {
             let residual: Vec<i32> = (0..size * size).map(|_| rng.in_range(255)).collect();
             let coefficients = forward_transform(&residual, size, Av1TxType::Idtx);
-            assert_eq!(coefficients, residual);
+            assert_ne!(
+                coefficients, residual,
+                "{size}: IDTX is scaled, not a pass-through"
+            );
             let reconstructed = inverse_transform(&coefficients, size, Av1TxType::Idtx, 1, 1);
-            let reconstructed: Vec<i32> = reconstructed.into_iter().map(i32::from).collect();
-            assert_eq!(reconstructed, residual);
+            for (index, (&want, &got)) in residual.iter().zip(reconstructed.iter()).enumerate() {
+                assert!(
+                    (want - i32::from(got)).abs() <= ROUND_TRIP_TOLERANCE,
+                    "{size} position {index}: {want} became {got}"
+                );
+            }
+
+            // Diagonal: one non-zero residual produces exactly one non-zero
+            // coefficient, in the same position.
+            let mut single = vec![0i32; size * size];
+            single[size + 1] = 200;
+            let coefficients = forward_transform(&single, size, Av1TxType::Idtx);
+            assert!(coefficients[size + 1] != 0);
+            assert!(
+                coefficients
+                    .iter()
+                    .enumerate()
+                    .all(|(index, &value)| index == size + 1 || value == 0),
+                "{size}: IDTX spread a residual off its own position"
+            );
         }
     }
 
