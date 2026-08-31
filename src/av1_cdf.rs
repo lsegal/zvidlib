@@ -567,24 +567,26 @@ pub static INTRA_TX_TYPE_SET2: [[[u16; 5]; INTRA_MODES]; 3] = [
 /// `Default_Inter_Ext_Tx_Cdf[TX_SET_INTER_1]` (spec §9.4), indexed by
 /// `txSzSqr` (`0` = `TX_4X4`, `1` = `TX_8X8`).
 pub static INTER_TX_TYPE_SET1: [[u16; 16]; 2] = [
-    [4458, 5560, 7695, 9709, 13330, 14789, 17537, 20266, 21504, 22848, 23934, 25474, 27727, 28915, 30631, 32768],
-    [1645, 2573, 4778, 5711, 7807, 8622, 10522, 15357, 17674, 20408, 22517, 25010, 27116, 28856, 30749, 32768],
+    [
+        4458, 5560, 7695, 9709, 13330, 14789, 17537, 20266, 21504, 22848, 23934, 25474, 27727,
+        28915, 30631, 32768,
+    ],
+    [
+        1645, 2573, 4778, 5711, 7807, 8622, 10522, 15357, 17674, 20408, 22517, 25010, 27116, 28856,
+        30749, 32768,
+    ],
 ];
 
 /// `Default_Inter_Ext_Tx_Cdf[TX_SET_INTER_2]` (spec §9.4); only `TX_16X16`
 /// selects this set, so only that `txSzSqr` row is kept here.
-pub static INTER_TX_TYPE_SET2: [[u16; 12]; 1] = [
-    [770, 2421, 5225, 12907, 15819, 18927, 21561, 24089, 26595, 28526, 30529, 32768],
-];
+pub static INTER_TX_TYPE_SET2: [[u16; 12]; 1] = [[
+    770, 2421, 5225, 12907, 15819, 18927, 21561, 24089, 26595, 28526, 30529, 32768,
+]];
 
 /// `Default_Inter_Ext_Tx_Cdf[TX_SET_INTER_3]` (spec §9.4), indexed by
 /// `txSzSqr` (`0` = `TX_4X4` .. `3` = `TX_32X32`).
-pub static INTER_TX_TYPE_SET3: [[u16; 2]; 4] = [
-    [16384, 32768],
-    [4167, 32768],
-    [1998, 32768],
-    [748, 32768],
-];
+pub static INTER_TX_TYPE_SET3: [[u16; 2]; 4] =
+    [[16384, 32768], [4167, 32768], [1998, 32768], [748, 32768]];
 
 /// `txSzSqr` as a table row index: `TX_4X4` is 0 through `TX_32X32` at 3.
 fn tx_size_sqr_index(tx_size: usize) -> usize {
@@ -940,13 +942,34 @@ mod tests {
 
     /// `Default_Intra_Ext_Tx_Cdf` is indexed by intra direction as well as
     /// by transform size, so the rows must actually differ or that indexing
-    /// would be unobservable.
+    /// would be unobservable. `TX_SET_INTRA_1` varies on both axes; the
+    /// specification leaves `TX_SET_INTRA_2`'s `TX_4X4`/`TX_8X8` rows uniform
+    /// (only `TX_16X16`, or `reduced_tx_set`, reaches that set in practice),
+    /// so its direction dependence is checked on the `TX_16X16` row.
     #[test]
     fn intra_tx_type_cdfs_vary_by_size_and_intra_direction() {
-        let dc = tx_type_cdf(Av1TxSet::Intra2, 8, 0).unwrap();
-        let paeth = tx_type_cdf(Av1TxSet::Intra2, 8, INTRA_MODES - 1).unwrap();
+        let dc = tx_type_cdf(Av1TxSet::Intra1, 4, 0).unwrap();
+        let paeth = tx_type_cdf(Av1TxSet::Intra1, 4, INTRA_MODES - 1).unwrap();
         assert_ne!(dc, paeth);
-        assert_ne!(dc, tx_type_cdf(Av1TxSet::Intra2, 16, 0).unwrap());
+        assert_ne!(dc, tx_type_cdf(Av1TxSet::Intra1, 8, 0).unwrap());
+
+        let dc16 = tx_type_cdf(Av1TxSet::Intra2, 16, 0).unwrap();
+        assert_ne!(
+            dc16,
+            tx_type_cdf(Av1TxSet::Intra2, 16, INTRA_MODES - 1).unwrap()
+        );
+    }
+
+    /// The single `TX_SET_INTER_2` row kept here is the specification's
+    /// `TX_16X16` row, the only `txSzSqr` that selects that set. The spec
+    /// leaves the other three rows uniform, so a wrong row would silently
+    /// degrade to a uniform model.
+    #[test]
+    fn inter_tx_type_set2_row_is_the_tx_16x16_row() {
+        let cdf = tx_type_cdf(Av1TxSet::Inter2, 16, 0).unwrap();
+        assert_eq!(cdf[0], 770);
+        assert_eq!(cdf[1], 2421);
+        assert_eq!(cdf[cdf.len() - 2], 30529);
     }
 
     /// The `V_*`/`H_*` half-identity types have no kernel in this crate and
