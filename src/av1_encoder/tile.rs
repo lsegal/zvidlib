@@ -60,6 +60,10 @@ pub(crate) struct FrameEncoder<'a> {
     left_dc: Vec<u8>,
     /// `Mi_Width_Log2` of the block covering each MI cell (for the partition context).
     mi_bsl: Vec<u8>,
+    /// `AboveTxWidth`/`LeftTxHeight` (§9.3's `tx_depth` context): the transform width and height
+    /// the last coded block left on each MI column and row.
+    above_tx_width: Vec<u8>,
+    left_tx_height: Vec<u8>,
     /// `base_q_idx`; `0` is the lossless WHT profile.
     qindex: u8,
     /// `get_dc_quant(qindex)` / `get_ac_quant(qindex)`, the dequantization steps the decoder
@@ -127,6 +131,8 @@ impl<'a> FrameEncoder<'a> {
             left_level: vec![0; mi_rows],
             left_dc: vec![0; mi_rows],
             mi_bsl: vec![0; mi_cols * mi_rows],
+            above_tx_width: vec![0; mi_cols],
+            left_tx_height: vec![0; mi_rows],
             qindex,
             dc_quant: get_dc_quant(qindex),
             ac_quant,
@@ -164,6 +170,7 @@ impl<'a> FrameEncoder<'a> {
         while r < self.mi_rows {
             self.left_level.fill(0);
             self.left_dc.fill(0);
+            self.left_tx_height.fill(0);
             let mut c = 0;
             while c < self.mi_cols {
                 self.encode_partition(r, c, 64, true);
@@ -271,6 +278,28 @@ impl<'a> FrameEncoder<'a> {
         split + self.lambda * SPLIT_HEADER_BITS < whole
     }
 
+    /// The `tx_depth` context (§9.3): how many of the above and left neighbours already carry a
+    /// transform at least as large as this block's `Max_Tx_Size_Rect`. Every block this encoder
+    /// codes is intra and unskipped, so the neighbour value is always the neighbour's own
+    /// transform extent rather than its block size.
+    fn tx_depth_ctx(&self, r: usize, c: usize, max_tx: usize) -> usize {
+        let above = r > 0 && usize::from(self.above_tx_width[c]) >= max_tx;
+        let left = c > 0 && usize::from(self.left_tx_height[r]) >= max_tx;
+        usize::from(above) + usize::from(left)
+    }
+
+    /// `set_txfm_ctxs`: a coding block leaves its transform extent on every MI column and row it
+    /// covers, for the next block's [`Self::tx_depth_ctx`].
+    fn set_tx_ctx(&mut self, r: usize, c: usize, units: usize, tx_width: usize) {
+        let extent = u8::try_from(tx_width).unwrap_or(u8::MAX);
+        for column in c..(c + units).min(self.mi_cols) {
+            self.above_tx_width[column] = extent;
+        }
+        for row in r..(r + units).min(self.mi_rows) {
+            self.left_tx_height[row] = extent;
+        }
+    }
+
     fn partition_ctx(&self, r: usize, c: usize, bsl: usize) -> usize {
         let above = r > 0 && usize::from(self.mi_bsl[(r - 1) * self.mi_cols + c]) < bsl;
         let left = c > 0 && usize::from(self.mi_bsl[r * self.mi_cols + (c - 1)]) < bsl;
@@ -319,10 +348,12 @@ impl<'a> FrameEncoder<'a> {
             // `Max_Tx_Size_Rect[MiSize]` down to the chosen size.
             let largest = bw.min(MAX_TX_WIDTH);
             if largest > 4 {
-                let (depth_cdf, _) = cdf::tx_depth_cdf(bw);
+                let ctx = self.tx_depth_ctx(r, c, largest);
+                let (depth_cdf, _) = cdf::tx_depth_cdf(bw, ctx);
                 let depth = (largest / tx_width).trailing_zeros() as usize;
                 self.sym.encode_symbol(depth, depth_cdf);
             }
+            self.set_tx_ctx(r, c, n4, tx_width);
         }
         self.code_block_transforms(r, c, bw, tx_width, emit)
     }
@@ -331,7 +362,8 @@ impl<'a> FrameEncoder<'a> {
     /// `read_tx_size` can signal for it and keeping the cheapest.
     fn choose_tx_size(&mut self, r: usize, c: usize, bw: usize) -> usize {
         let largest = bw.min(MAX_TX_WIDTH);
-        let (_, max_depth) = cdf::tx_depth_cdf(bw);
+        // Only the depth cap is needed here; it does not vary with the neighbour context.
+        let (_, max_depth) = cdf::tx_depth_cdf(bw, 0);
         let mut best = (0usize, i64::MAX);
         for depth in 0..=max_depth {
             let tx_width = (largest >> depth).max(4);
@@ -399,6 +431,7 @@ impl<'a> FrameEncoder<'a> {
             4,
             &quant,
             &cdf::DEFAULT_SCAN_4X4,
+            None,
             true,
         );
     }
@@ -475,18 +508,23 @@ impl<'a> FrameEncoder<'a> {
             add_residual_row(&reconstructed[row * size..(row + 1) * size], destination);
         }
 
-        let coded = self.code_coefficients(x >> 2, y >> 2, block_width, size, &levels, &scan, emit);
+        // §5.11.39 `coeffs` reads `transform_type()` immediately after `all_zero` and before
+        // `eob_pt`, so the symbol goes to the coefficient coder rather than after it. DC_PRED is
+        // the only y_mode this encoder signals, so the CDF's intra direction is 0.
+        let tx_type_symbol = cdf::tx_type_cdf(set, size, 0).map(|tx_cdf| (symbol, tx_cdf));
+        self.code_coefficients(
+            x >> 2,
+            y >> 2,
+            block_width,
+            size,
+            &levels,
+            &scan,
+            tx_type_symbol,
+            emit,
+        );
         #[cfg(test)]
         if emit {
             self.emitted.push((size, tx_type));
-        }
-        // The decoder reads `tx_type` after the coefficients, and only for a block that was not
-        // fully skipped; a skipped block's type is irrelevant because its residual is zero.
-        if coded && emit {
-            // DC_PRED is the only y_mode this encoder signals, so the CDF's intra direction is 0.
-            if let Some(tx_cdf) = cdf::tx_type_cdf(set, size, 0) {
-                self.sym.encode_symbol(symbol, tx_cdf);
-            }
         }
         cost
     }
@@ -582,6 +620,7 @@ impl<'a> FrameEncoder<'a> {
         size: usize,
         quant: &[i32],
         scan: &[usize],
+        tx_type_symbol: Option<(usize, &'static [u16])>,
         emit: bool,
     ) -> bool {
         let ptype = 0;
@@ -612,6 +651,13 @@ impl<'a> FrameEncoder<'a> {
         if eob == 0 {
             self.set_ctx(x4, y4, units, 0, 0);
             return false;
+        }
+
+        // §5.11.39 reads `transform_type()` here: after `all_zero`, before `eob_pt`.
+        if emit {
+            if let Some((symbol, tx_cdf)) = tx_type_symbol {
+                self.sym.encode_symbol(symbol, tx_cdf);
+            }
         }
 
         // eob position (TX_CLASS_2D ⇒ eob_pt context 0).

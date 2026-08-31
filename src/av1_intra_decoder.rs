@@ -374,6 +374,9 @@ struct LosslessTileDecoder<'a> {
     above_dc: Vec<u8>,
     left_level: Vec<u8>,
     left_dc: Vec<u8>,
+    /// `AboveTxWidth`/`LeftTxHeight` (§9.3's `tx_depth` context).
+    above_tx_width: Vec<u8>,
+    left_tx_height: Vec<u8>,
     mi_bsl: Vec<u8>,
     tx_sizes: TxSizeGrid,
     decoded_blocks: u32,
@@ -431,6 +434,8 @@ impl<'a> LosslessTileDecoder<'a> {
             above_dc: vec![0; mi_cols],
             left_level: vec![0; mi_rows],
             left_dc: vec![0; mi_rows],
+            above_tx_width: vec![0; mi_cols],
+            left_tx_height: vec![0; mi_rows],
             mi_bsl: vec![0; contexts],
             tx_sizes: TxSizeGrid::new(width, height),
             decoded_blocks: 0,
@@ -444,6 +449,7 @@ impl<'a> LosslessTileDecoder<'a> {
         while row < self.mi_rows {
             self.left_level.fill(0);
             self.left_dc.fill(0);
+            self.left_tx_height.fill(0);
             let mut column = 0;
             while column < self.mi_cols {
                 self.decode_partition(row, column, 64)?;
@@ -544,7 +550,8 @@ impl<'a> LosslessTileDecoder<'a> {
                 }
             }
         }
-        let tx_width = self.read_tx_size(block_width)?;
+        let tx_width = self.read_tx_size(row, column, block_width)?;
+        self.set_tx_context(row, column, units, tx_width);
         let step = tx_width / 4;
         let mut transform_y = 0;
         while transform_y < units {
@@ -574,6 +581,27 @@ impl<'a> LosslessTileDecoder<'a> {
         Ok(())
     }
 
+    /// The `tx_depth` context (§9.3): how many of the above and left neighbours already carry a
+    /// transform at least as large as this block's `Max_Tx_Size_Rect`. Every block this decoder
+    /// reconstructs is an unskipped intra block, so the neighbour value is its transform extent.
+    fn tx_depth_context(&self, row: usize, column: usize, max_tx: usize) -> usize {
+        let above = row > 0 && usize::from(self.above_tx_width[column]) >= max_tx;
+        let left = column > 0 && usize::from(self.left_tx_height[row]) >= max_tx;
+        usize::from(above) + usize::from(left)
+    }
+
+    /// `set_txfm_ctxs`: a coding block leaves its transform extent on every MI column and row it
+    /// covers, for the next block's [`Self::tx_depth_context`].
+    fn set_tx_context(&mut self, row: usize, column: usize, units: usize, tx_width: usize) {
+        let extent = u8::try_from(tx_width).unwrap_or(u8::MAX);
+        for mi_column in column..(column + units).min(self.mi_cols) {
+            self.above_tx_width[mi_column] = extent;
+        }
+        for mi_row in row..(row + units).min(self.mi_rows) {
+            self.left_tx_height[mi_row] = extent;
+        }
+    }
+
     /// `read_tx_size` (spec §5.11.16) for a square `block_width` coding
     /// block, over the square transform sizes this crate's inverse
     /// transform kernels implement (`TX_4X4` through `TX_64X64`).
@@ -585,7 +613,7 @@ impl<'a> LosslessTileDecoder<'a> {
     /// answer with no symbol read; under `TX_MODE_SELECT` a `tx_depth`
     /// symbol halves it once (8x8 blocks, whose `Max_Tx_Depth` is 1) or up
     /// to twice (larger blocks, where the spec caps the coded depth at 2).
-    fn read_tx_size(&mut self, block_width: usize) -> Result<usize> {
+    fn read_tx_size(&mut self, row: usize, column: usize, block_width: usize) -> Result<usize> {
         if self.base_q_idx == 0 {
             return Ok(4);
         }
@@ -593,7 +621,8 @@ impl<'a> LosslessTileDecoder<'a> {
         if largest <= 4 || !self.tx_mode_select {
             return Ok(largest);
         }
-        let (depth_cdf, max_depth) = cdf::tx_depth_cdf(block_width);
+        let ctx = self.tx_depth_context(row, column, largest);
+        let (depth_cdf, max_depth) = cdf::tx_depth_cdf(block_width, ctx);
         let depth = self.symbols.symbol(depth_cdf)?;
         if depth > max_depth {
             return Err(malformed_error("AV1 tx_depth exceeds the block maximum"));
@@ -761,8 +790,8 @@ impl<'a> LosslessTileDecoder<'a> {
         y4: usize,
         block_width: usize,
     ) -> Result<[i32; 16]> {
-        let (coefficients, _skipped) =
-            self.decode_coefficient_levels(x4, y4, block_width, 4, &cdf::DEFAULT_SCAN_4X4)?;
+        let (coefficients, _tx_type) =
+            self.decode_coefficient_levels(x4, y4, block_width, 4, &cdf::DEFAULT_SCAN_4X4, None)?;
         let mut levels = [0i32; 16];
         levels.copy_from_slice(&coefficients);
         Ok(levels)
@@ -802,18 +831,14 @@ impl<'a> LosslessTileDecoder<'a> {
         mode: Av1IntraMode,
     ) -> Result<(Vec<i32>, Av1TxType)> {
         let scan = cdf::up_right_diagonal_scan(tx_width.min(MAX_CODED_TX_WIDTH));
-        let (coefficients, skipped) =
-            self.decode_coefficient_levels(x4, y4, block_width, tx_width, &scan)?;
-        // tx_type is only signaled for a transform block that actually has
-        // nonzero coefficients (a fully skipped block is implicitly
-        // DCT_DCT, though its value is irrelevant since inverse_transform
-        // of an all-zero input is zero regardless of tx_type).
-        let tx_type = if skipped {
-            Av1TxType::DctDct
-        } else {
-            self.read_tx_type(tx_width, mode)?
-        };
-        Ok((coefficients, tx_type))
+        // §5.11.39 `coeffs` reads `transform_type()` immediately after `all_zero` and before
+        // `eob_pt`, so the read happens inside the coefficient loop rather than after it. It is
+        // only signalled for a transform block that actually has nonzero coefficients; a fully
+        // skipped block is implicitly DCT_DCT, and its value is irrelevant anyway because the
+        // inverse transform of an all-zero input is zero for every type.
+        let (coefficients, tx_type) =
+            self.decode_coefficient_levels(x4, y4, block_width, tx_width, &scan, Some(mode))?;
+        Ok((coefficients, tx_type.unwrap_or(Av1TxType::DctDct)))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -824,7 +849,8 @@ impl<'a> LosslessTileDecoder<'a> {
         block_width: usize,
         size: usize,
         scan: &[usize],
-    ) -> Result<(Vec<i32>, bool)> {
+        tx_type_mode: Option<Av1IntraMode>,
+    ) -> Result<(Vec<i32>, Option<Av1TxType>)> {
         let plane_type = 0;
         // The specification selects every coefficient CDF below by a
         // quantizer context derived from `base_q_idx` and (except for
@@ -847,8 +873,13 @@ impl<'a> LosslessTileDecoder<'a> {
             == 1
         {
             self.set_coefficient_context(x4, y4, units, 0, 0);
-            return Ok((vec![0; count], true));
+            return Ok((vec![0; count], None));
         }
+        // §5.11.39 reads `transform_type()` here: after `all_zero`, before `eob_pt`.
+        let tx_type = match tx_type_mode {
+            Some(mode) => Some(self.read_tx_type(size, mode)?),
+            None => None,
+        };
         let eob_point = self
             .symbols
             .symbol(cdf::eob_pt_cdf(qctx, coded, plane_type))?
@@ -949,7 +980,7 @@ impl<'a> LosslessTileDecoder<'a> {
         };
         self.set_coefficient_context(x4, y4, units, cumulative, dc);
         if coded == size {
-            return Ok((levels, false));
+            return Ok((levels, tx_type));
         }
         // Scatter the coded quadrant into the full transform block.
         let mut coefficients = vec![0i32; count];
@@ -957,7 +988,7 @@ impl<'a> LosslessTileDecoder<'a> {
             coefficients[row * size..row * size + coded]
                 .copy_from_slice(&levels[row * coded..(row + 1) * coded]);
         }
-        Ok((coefficients, false))
+        Ok((coefficients, tx_type))
     }
 
     fn decode_golomb(&mut self) -> Result<u32> {
