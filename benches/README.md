@@ -1,14 +1,23 @@
 # Benchmarks
 
 zvidlib's benchmarks run under [criterion](https://docs.rs/criterion) with
-`harness = false`. The whole suite lives in a single bench target
-(`benches/codec.rs`) so the shared fixture cache in `benches/support/` is loaded
-and decoded once per process and each iteration measures codec work only.
+`harness = false`, across two targets that share the fixture cache in
+`benches/support/`:
+
+| Target | Covers |
+| --- | --- |
+| `benches/codec.rs` | decode-side groups and the shared smoke/throughput checks |
+| `benches/av1_encode.rs` | the native AV1 encoder, whole-frame and per-stage |
+
+Everything expensive in `benches/support/` is loaded and decoded once per
+process, so each iteration measures codec work only.
 
 ## Running
 
 ```sh
-cargo bench                       # the default, fast groups
+cargo bench                       # the default, fast groups in both targets
+cargo bench --bench codec         # decode side only
+cargo bench --bench av1_encode    # the AV1 encoder only
 cargo bench --features simd       # the same groups, recorded under `simd=on`
 cargo bench --no-run              # compile only
 ```
@@ -98,6 +107,7 @@ Filter to one of them the same way as any other group:
 ```sh
 cargo bench --bench codec -- av1_deblock
 cargo bench --bench codec -- 'av1_deblock/scalar'
+cargo bench --bench av1_encode -- av1_encode_tile
 ```
 
 The per-ISA HEVC group decodes the bundled 1080p sample, so it sits behind the
@@ -131,6 +141,50 @@ out roughly even on Apple Silicon, where LLVM auto-vectorizes the scalar code
 well under `lto = "fat"`, while AV1 deblocking and motion compensation on the
 same host are 2.4-4.9x. `active_by_site()` answers the question directly.
 
+## The AV1 encoder target
+
+`cargo bench --bench av1_encode` measures `zvidlib::av1_encoder`, the lossless
+all-intra `Gray8` AV1 encoder, on two axes at once.
+
+**Whole-frame**, through the public `native_av1_video_encoder_factory`, at two
+resolutions:
+
+```
+av1_encode_640x360/<isa>
+av1_encode_1920x1080/<isa>
+```
+
+**Per stage**, so the whole-frame number can be attributed rather than only
+observed:
+
+| Group | Module |
+| --- | --- |
+| `av1_encode_wht` | `src/av1_encoder/wht.rs` |
+| `av1_encode_symbol` | `src/av1_encoder/symbol.rs`, `cdf.rs` |
+| `av1_encode_tile` | `src/av1_encoder/tile.rs` |
+| `av1_encode_bitstream` | `src/av1_encoder/bitwriter.rs`, `headers.rs`, `leb128.rs` |
+
+Every group runs once per `simd::available()` instruction set through the same
+`support::isa::bench_across_isas` runner the decode groups use, with the same
+bit-exactness guard and per-site override assertion.
+
+### Why the scalar-looking arms are still reported
+
+Only the forward WHT dispatches to a vector kernel today; vectorization to date
+targeted the decode side. The symbol coder, the tile encoder's context
+derivation, and the bitstream writers are scalar, so their arms read
+identically. That is the measurement rather than a hole in it: it says where the
+encoder's time actually sits and what a vectorization effort would have to
+attack, and omitting the arms would hide it.
+
+The bitstream group writes its headers 512 times per iteration, because a frame's
+headers are a few hundred bytes against a tile payload measured in tens of
+kilobytes. Read it as a per-frame fixed cost divided by that count, not as a
+share of the whole-frame number.
+
+The encoder takes `Gray8` input, so its inputs are the luma plane of the shared
+`synthetic_yuv420_sequence` — the same content the rest of the suite uses.
+
 ## Fixtures
 
 `benches/support/` loads only fixtures already checked into the repository:
@@ -161,7 +215,7 @@ without the whole-crate optimization that shipped builds get.
 
 ## Targets
 
-Benchmarks are native-only. They are declared as an explicit `[[bench]]` target
+Benchmarks are native-only. They are declared as explicit `[[bench]]` targets
 and criterion is a `cfg(not(target_arch = "wasm32"))` dev-dependency, so the
 `wasm32` builds neither resolve nor compile them.
 

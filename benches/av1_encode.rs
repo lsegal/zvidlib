@@ -70,7 +70,14 @@ const STAGE_HEIGHT: usize = 360;
 fn gray8_planes(width: u32, height: u32, frames: usize) -> Vec<Vec<u8>> {
     support::synthetic_yuv420_sequence(width, height, frames)
         .into_iter()
-        .map(|frame| frame.planes.into_iter().next().expect("YUV420 has luma").data)
+        .map(|frame| {
+            frame
+                .planes
+                .into_iter()
+                .next()
+                .expect("YUV420 has luma")
+                .data
+        })
         .collect()
 }
 
@@ -185,7 +192,9 @@ fn av1_encode_wht(criterion: &mut Criterion) {
                     }
                 }
                 for coefficient in fwht4x4(black_box(&residual)) {
-                    accumulator = accumulator.wrapping_mul(31).wrapping_add(i64::from(coefficient));
+                    accumulator = accumulator
+                        .wrapping_mul(31)
+                        .wrapping_add(i64::from(coefficient));
                 }
             }
         }
