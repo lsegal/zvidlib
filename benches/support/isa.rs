@@ -23,6 +23,10 @@
 //! measured axis and is named directly, so both arms of a comparison always
 //! appear in the same run.
 
+// Compiled separately by each bench target; `audio_decode.rs` has no
+// scalar-vs-SIMD axis and uses none of this module.
+#![allow(dead_code)]
+
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 

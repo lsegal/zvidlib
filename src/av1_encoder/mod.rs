@@ -15,6 +15,7 @@ mod leb128;
 #[allow(dead_code)]
 mod symbol;
 mod tile;
+pub(crate) mod transform;
 #[allow(dead_code)]
 pub(crate) mod wht;
 

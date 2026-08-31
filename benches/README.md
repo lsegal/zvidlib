@@ -6,22 +6,24 @@ zvidlib's benchmarks run under [criterion](https://docs.rs/criterion) with
 | Target | Measures |
 | --- | --- |
 | `benches/codec.rs` | codec work: decode, encoder inputs, and the per-ISA SIMD groups |
+| `benches/audio_decode.rs` | the audio decode path: AAC access units and `AacSampleReader` range/seek reads |
 | `benches/audio_mux.rs` | the audio container path: MP4 muxing, sample-table growth, demux, and gapless timing |
 | `benches/hevc_encode.rs` | the pure-Rust HEVC encoder, whole-frame and per-stage |
 
 Each target loads and decodes its fixtures once per process, so every iteration
 measures the work under test and nothing else. `codec` is one target rather than
-several because its groups share the same decoded-frame cache; `audio_mux` and
-`hevc_encode` share none of those fixtures and are separately runnable. The
-encoder target is separate for a second reason too: its mode search is slow
-enough that keeping it out of the default `cargo bench --bench codec` run is
-worth more than sharing a process.
+several because its groups share the same decoded-frame cache; the two audio
+targets and `hevc_encode` share none of those fixtures and are separately
+runnable. The encoder target is separate for a second reason too: its mode
+search is slow enough that keeping it out of the default
+`cargo bench --bench codec` run is worth more than sharing a process.
 
 ## Running
 
 ```sh
-cargo bench                       # the default, fast groups in all targets
+cargo bench                       # the default, fast groups in every target
 cargo bench --bench codec         # codec work only
+cargo bench --bench audio_decode  # the audio decode path only
 cargo bench --bench audio_mux     # the audio container path only
 cargo bench --bench hevc_encode   # the HEVC encoder groups only
 cargo bench --features simd       # the same groups, recorded under `simd=on`
@@ -206,7 +208,8 @@ because that tag records which *build* produced a number, not which kernel ran.
 | `av1_lossless_intra_stream` / `av1_lossless_intra_frame` | `tests/fixtures/codec/av1_lossless_17x9.hex` |
 | `av1_inter_stream` / `av1_inter_temporal_units` | `tests/fixtures/codec/av1_inter_show_existing_16x16.hex` |
 | `bundled_hevc_sample` | `examples/media/BigBuckBunny.mp4` |
-| `bundled_aac_track` / `bundled_mp4_bytes` | `examples/media/BigBuckBunny.mp4` (its AAC track) |
+| `bundled_aac_track` / `bundled_mp4_bytes` | `examples/media/BigBuckBunny.mp4` (its AAC-LC stereo track) |
+| `aac_mono_track` | `tests/fixtures/codec/aac_lc_mono_48k.m4a` |
 | `synthetic_yuv420_sequence` | generated; encoder-stage inputs without decoding first |
 | `synthetic_rgba8_sequence` | generated; whole-frame encoder inputs (the public encoder takes RGBA8) |
 
@@ -228,6 +231,10 @@ both sides of the read path use it, so mux, demux, and AAC decode numbers stay
 directly comparable. A benchmark that touches no samples (`audio_timing`, which is
 O(edits)) deliberately registers no throughput rather than reporting a fabricated
 sample rate.
+
+The `audio_decode` groups additionally print their own `NNNx realtime` line from a
+single separately timed pass, because x-realtime is the figure a playback path is
+judged by and criterion has no unit for it.
 
 ## The HEVC encoder target
 
@@ -312,5 +319,37 @@ target over helpers another target depends on.
 `benches/support/` holds everything that is not the measurement: fixtures and
 synthetic inputs in `support`, and the scalar-vs-SIMD axis in `support::isa`
 (`bench_across_isas`, the bit-exactness guard, and the per-site override
-assertion). Both bench targets share it, so each one leaves some of its helpers
-unused; the module allows `dead_code` for that reason.
+assertion).
+
+## Audio groups
+
+`benches/audio_decode.rs` measures two layers, and keeps them in separate groups
+on purpose:
+
+| Group | What it measures |
+| --- | --- |
+| `aac_decode` | `NativeAacDecoder::decode` over a fixed run of access units, mono and stereo |
+| `aac_reader_sequential` | `AacSampleReader::get_range` re-reading a resident range, and walking forward |
+| `aac_reader_seek` | random-access ranges, each forcing a decoder reset and a preroll re-decode |
+| `aac_reader_edits` | reads crossing edit-list boundaries and gapless priming/padding trims |
+
+`AacSampleReader` keeps decoded packets in a `BTreeMap`, so the same call costs
+two very different things depending on whether the requested media range is
+already resident. `cached_repeat_stereo_48k` is the pure hit path — no decode at
+all — and everything in `aac_reader_seek` is the cold path. Reporting them
+together would average the seek cost away, and the seek cost is the one that
+shows up as an audible stall.
+
+These groups carry **no `simd=` tag and no per-ISA arms**. AAC decoding is
+delegated to the third-party `symphonia-codec-aac` crate, `zvidlib::simd`'s
+override does not reach it, and the crate has no audio SIMD kernels of its own,
+so a scalar arm and a vector arm would be the same code reported twice.
+
+The mono fixture exists because the bundled sample is stereo and carries no edit
+list, while `NativeAacDecoder` accepts AAC-LC mono as well (and rejects
+everything beyond stereo, so mono and stereo are its entire supported input
+space). It also supplies the real `elst` and decoder-priming timing the bundled
+sample does not have.
+
+Every bench target shares `benches/support/`, so each one leaves some of its
+helpers unused; the module allows `dead_code` for that reason.
