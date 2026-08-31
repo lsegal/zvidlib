@@ -209,7 +209,7 @@ fn encode_with_rdo_backend(
 fn blank_planes(w: usize, h: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     (vec![16; w * h], vec![128; w * h / 4], vec![128; w * h / 4])
 }
-fn rgba_to_yuv420(
+pub(super) fn rgba_to_yuv420(
     frame: &crate::VideoFrame,
     orientation: crate::Orientation,
 ) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
