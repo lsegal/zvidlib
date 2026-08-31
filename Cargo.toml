@@ -38,6 +38,15 @@ name = "av1_decode"
 path = "benches/av1_decode.rs"
 harness = false
 
+# The AV1 encoder's own scalar-vs-SIMD suite. Encoder kernels are measured
+# separately from `av1_decode` so neither target's name overstates its scope,
+# and separately from `codec` because it shares none of that target's
+# decoded-frame fixtures.
+[[bench]]
+name = "av1_encode"
+path = "benches/av1_encode.rs"
+harness = false
+
 [[bench]]
 name = "hevc_decode"
 path = "benches/hevc_decode.rs"
