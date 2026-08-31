@@ -29,6 +29,11 @@ name = "codec"
 path = "benches/codec.rs"
 harness = false
 
+[[bench]]
+name = "audio_decode"
+path = "benches/audio_decode.rs"
+harness = false
+
 [features]
 default = []
 # Additive, off by default. The crate's SIMD kernels dispatch at run time rather

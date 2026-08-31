@@ -11,6 +11,11 @@
 //! instruction set `zvidlib::simd::available()` reports, asserts every arm is
 //! bit-exact with scalar before timing it, and names the arms `<codec>/<isa>`.
 
+// Two bench targets (`codec.rs` and `audio_decode.rs`) each compile their own
+// copy of this module and use a different subset of it, so items unused by one
+// target are not dead code.
+#![allow(dead_code)]
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::OnceLock;
@@ -21,8 +26,9 @@ pub mod isa;
 use criterion::Throughput;
 use zvidlib::io::MemorySource;
 use zvidlib::{
-    Codec, CodecProfile, ColorRange, EncodedVideoSample, Limits, Mp4Demuxer, Mp4DemuxerOptions,
-    PixelFormat, Plane, VideoDecoderConfig, VideoDimensions, VideoFrame, decode_av1_lossless_intra,
+    AacTrackConfig, AudioTrackTiming, Codec, CodecProfile, ColorRange, EncodedAudioSample,
+    EncodedVideoSample, Limits, Mp4Demuxer, Mp4DemuxerOptions, PixelFormat, Plane, TrackKind,
+    VideoDecoderConfig, VideoDimensions, VideoFrame, decode_av1_lossless_intra,
 };
 
 /// Whether the crate was built with the additive `simd` cargo feature.
@@ -314,4 +320,181 @@ pub fn synthetic_yuv420_sequence(width: u32, height: u32, frames: usize) -> Vec<
             .expect("synthetic YUV420 frames are valid")
         })
         .collect()
+}
+
+/// The amount of audio work one benchmark iteration performs.
+///
+/// The video benchmarks measure pixels; audio has no equivalent scale, so the
+/// unit here is the decoded PCM sample (one per channel-independent frame of
+/// audio). Criterion is given `Throughput::Elements(samples)` so it prints
+/// decoded samples per second, and [`AudioWork::realtime_factor`] converts the
+/// same measurement into the number that actually decides whether playback can
+/// keep up: how many seconds of audio are produced per second of wall time.
+#[derive(Clone, Copy, Debug)]
+pub struct AudioWork {
+    /// Decoded samples per channel that one iteration produces.
+    pub samples: u64,
+    pub sample_rate: u32,
+    pub channels: u16,
+}
+
+impl AudioWork {
+    pub fn new(samples: u64, sample_rate: u32, channels: u16) -> Self {
+        Self {
+            samples,
+            sample_rate,
+            channels,
+        }
+    }
+
+    /// Decoded samples per iteration, which criterion turns into a rate.
+    pub fn elements(&self) -> Throughput {
+        Throughput::Elements(self.samples)
+    }
+
+    /// Seconds of audio one iteration covers.
+    pub fn seconds(&self) -> f64 {
+        if self.sample_rate == 0 {
+            return 0.0;
+        }
+        self.samples as f64 / f64::from(self.sample_rate)
+    }
+
+    /// Seconds of audio produced per second of wall time.
+    ///
+    /// This is the playback-relevant figure: anything at or below 1.0 cannot
+    /// sustain real-time output, and the margin above it is the headroom the
+    /// decode path leaves for everything else on the thread.
+    pub fn realtime_factor(&self, per_iteration: std::time::Duration) -> f64 {
+        let elapsed = per_iteration.as_secs_f64();
+        if elapsed <= 0.0 {
+            return f64::INFINITY;
+        }
+        self.seconds() / elapsed
+    }
+
+    /// Decoded samples per second for a measured per-iteration duration.
+    pub fn samples_per_second(&self, per_iteration: std::time::Duration) -> f64 {
+        let elapsed = per_iteration.as_secs_f64();
+        if elapsed <= 0.0 {
+            return f64::INFINITY;
+        }
+        self.samples as f64 / elapsed
+    }
+}
+
+/// Registers an audio benchmark's throughput and prints the realtime scale
+/// criterion's own `elem/s` line does not carry.
+///
+/// `samples/s / sample_rate = x-realtime`, so printing the sample rate and the
+/// per-iteration audio duration once per benchmark makes every reported rate
+/// convertible without re-deriving the fixture's format.
+pub fn report_audio_throughput<M: criterion::measurement::Measurement>(
+    group: &mut criterion::BenchmarkGroup<'_, M>,
+    id: &str,
+    work: AudioWork,
+) {
+    group.throughput(work.elements());
+    println!(
+        "# {id}: {} sample(s)/iter at {} Hz x {} ch = {:.4}s of audio/iter (samples/s / {} = x-realtime)",
+        work.samples,
+        work.sample_rate,
+        work.channels,
+        work.seconds(),
+        work.sample_rate,
+    );
+}
+
+/// One demuxed AAC-LC track: its decoder configuration, its access units on the
+/// decoded sample clock, and its presentation timing.
+pub struct BundledAacTrack {
+    pub config: AacTrackConfig,
+    pub packets: Vec<EncodedAudioSample>,
+    pub timing: AudioTrackTiming,
+    /// End of the last packet's decoded interval, i.e. the media duration.
+    pub decoded_length: u64,
+}
+
+impl BundledAacTrack {
+    pub fn sample_rate(&self) -> u32 {
+        self.config.sample_rate
+    }
+
+    pub fn channels(&self) -> u16 {
+        self.config.channels
+    }
+
+    /// The first `count` access units, or all of them when the track is shorter.
+    pub fn prefix(&self, count: usize) -> &[EncodedAudioSample] {
+        &self.packets[..count.min(self.packets.len())]
+    }
+
+    /// Decoded samples covered by [`BundledAacTrack::prefix`].
+    pub fn prefix_samples(&self, count: usize) -> u64 {
+        self.prefix(count)
+            .last()
+            .map_or(0, |packet| packet.decoded_range.end)
+    }
+}
+
+/// Demuxes the single AAC track out of an in-memory MP4.
+fn demux_aac_track(bytes: Vec<u8>, label: &str) -> BundledAacTrack {
+    let source = MemorySource::new(bytes);
+    let movie = block_on(Mp4Demuxer::open(&source, Mp4DemuxerOptions::default()))
+        .unwrap_or_else(|error| panic!("{label} is a readable MP4: {error}"));
+    let track = movie
+        .tracks
+        .iter()
+        .find(|track| track.kind == TrackKind::Audio)
+        .unwrap_or_else(|| panic!("{label} has an audio track"));
+    let config = track
+        .aac_config()
+        .unwrap_or_else(|error| panic!("{label} carries an AAC AudioSpecificConfig: {error}"));
+    let packets = block_on(track.to_encoded_audio_samples(&source, &Limits::default()))
+        .unwrap_or_else(|error| panic!("{label}'s AAC access units are readable: {error}"));
+    let timing = track
+        .audio_timing(movie.movie_timescale)
+        .unwrap_or_else(|error| panic!("{label}'s edit list maps to the sample clock: {error}"));
+    let decoded_length = packets
+        .last()
+        .expect("a demuxed AAC track has at least one packet")
+        .decoded_range
+        .end;
+    BundledAacTrack {
+        config,
+        packets,
+        timing,
+        decoded_length,
+    }
+}
+
+/// The stereo 48 kHz AAC-LC track of the bundled `BigBuckBunny.mp4` sample.
+///
+/// 1501 access units, 32 seconds, and no edit list, so it is the plain
+/// gapless-only timing case as well as the stereo decode fixture.
+pub fn bundled_aac_stereo() -> &'static BundledAacTrack {
+    static TRACK: OnceLock<BundledAacTrack> = OnceLock::new();
+    TRACK.get_or_init(|| {
+        demux_aac_track(
+            include_bytes!("../../examples/media/BigBuckBunny.mp4").to_vec(),
+            "the bundled BigBuckBunny sample",
+        )
+    })
+}
+
+/// A mono 48 kHz AAC-LC fixture with a real priming edit list.
+///
+/// The bundled sample is stereo and carries no `elst`, but
+/// `NativeAacDecoder` accepts AAC-LC mono as well and rejects everything beyond
+/// stereo, so mono is the other half of the backend's entire supported input
+/// space. This fixture also supplies the edit-list and priming/padding timing
+/// the bundled sample does not have.
+pub fn aac_mono_fixture() -> &'static BundledAacTrack {
+    static TRACK: OnceLock<BundledAacTrack> = OnceLock::new();
+    TRACK.get_or_init(|| {
+        demux_aac_track(
+            include_bytes!("../../tests/fixtures/codec/aac_lc_mono_48k.m4a").to_vec(),
+            "the mono AAC-LC fixture",
+        )
+    })
 }
