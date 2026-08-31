@@ -114,17 +114,22 @@ fn main() {
     print!("{}", report.markdown_table(decoded));
     println!();
 
-    let vectorized = report.vectorized_share();
     println!(
-        "Vectorized stages cover {:.1}% of decode time.",
-        vectorized * 100.0
+        "Vectorized stages cover {:.1}% of the measured total, and {:.1}% of decode \
+         proper (total minus `color_convert`, which is output conversion, not decoding).",
+        report.vectorized_share() * 100.0,
+        report.vectorized_decode_share() * 100.0,
     );
     println!(
-        "Amdahl ceiling: infinitely fast vector kernels would decode {:.2}x faster; \
-         a uniform 2x on those stages gives {:.2}x, a uniform 4x gives {:.2}x.",
+        "Amdahl ceiling on the measured total: infinitely fast vector kernels would run \
+         {:.2}x faster; a uniform 2x on those stages gives {:.2}x, a uniform 4x gives {:.2}x.",
         report.max_whole_frame_speedup(),
         report.speedup_at(2.0),
         report.speedup_at(4.0),
+    );
+    println!(
+        "`color_convert` alone is {:.1}% of the measured total and has no vector kernel.",
+        report.share(profile::Stage::ColorConvert) * 100.0,
     );
     println!(
         "Serial entropy decoding (`slice_data_cabac` + `residual_cabac`) is {:.1}% of the total.",

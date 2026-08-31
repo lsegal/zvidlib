@@ -437,8 +437,7 @@ fn picture_to_rgba(
     configuration: &VideoDecoderConfig,
     limits: &Limits,
 ) -> Result<VideoFrame> {
-    let _profile =
-        engine::profile::scope(engine::profile::Stage::ColorConvert);
+    let _profile = engine::profile::scope(engine::profile::Stage::ColorConvert);
     if picture.chroma_array_type() != 1
         || picture.bit_depth_luma() != 8
         || picture.bit_depth_chroma() != 8

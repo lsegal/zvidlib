@@ -453,9 +453,8 @@ impl SequenceDecoder {
             // Issue #189 stage attribution: the §8.3.1-§8.3.5 per-picture
             // reference derivation, which is DPB bookkeeping rather than
             // sample work.
-            let _profile = crate::hevc::engine::profile::scope(
-                crate::hevc::engine::profile::Stage::DpbOutput,
-            );
+            let _profile =
+                crate::hevc::engine::profile::scope(crate::hevc::engine::profile::Stage::DpbOutput);
             self.state.begin_picture(&header_info, &slice_ref)
         };
         let lists = ref_state.ref_pic_lists.clone().unwrap_or(RefPicLists {

@@ -356,9 +356,8 @@ pub fn resolve_and_reconstruct_inter_cu(
     // pointer-chasing over the neighbour motion field rather than arithmetic
     // over sample arrays, so it is its own stage and not part of `inter_pred`.
     let motions = {
-        let _profile = crate::hevc::engine::profile::scope(
-            crate::hevc::engine::profile::Stage::MotionDerive,
-        );
+        let _profile =
+            crate::hevc::engine::profile::scope(crate::hevc::engine::profile::Stage::MotionDerive);
         resolve_cu_motion(field, desc, pus, ctx, available)
     };
     let rects = crate::hevc::engine::pu_mv::pu_partitions(

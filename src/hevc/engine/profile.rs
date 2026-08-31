@@ -36,10 +36,10 @@
 //! rather than returning zeroed timings that read as a measurement.
 
 use std::cell::{Cell, RefCell};
-#[cfg(not(target_arch = "wasm32"))]
-use std::time::{Duration, Instant};
 #[cfg(target_arch = "wasm32")]
 use std::time::Duration;
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::{Duration, Instant};
 
 /// A stage of the decode pipeline, in the order issue #189 names them.
 ///
@@ -336,6 +336,28 @@ impl Report {
         self.nanos[stage as usize] as f64 / total as f64
     }
 
+    /// Profiled time other than [`Stage::ColorConvert`].
+    ///
+    /// Colour conversion is on the path every whole-frame measurement takes
+    /// but is not decoding, and it is large enough on this crate's sample to
+    /// move every other stage's share materially. Reporting both denominators
+    /// keeps "share of what the benchmark measures" and "share of the decoder"
+    /// from being confused for each other.
+    #[must_use]
+    pub fn decode_total(&self) -> Duration {
+        self.total.saturating_sub(self.stage(Stage::ColorConvert))
+    }
+
+    /// `stage`'s share of [`Report::decode_total`], in `0.0..=1.0`.
+    #[must_use]
+    pub fn decode_share(&self, stage: Stage) -> f64 {
+        let total = self.decode_total().as_nanos();
+        if total == 0 || stage == Stage::ColorConvert {
+            return 0.0;
+        }
+        self.nanos[stage as usize] as f64 / total as f64
+    }
+
     /// The combined share of every stage with a vector kernel.
     ///
     /// This is the fraction of a decode SIMD can touch at all: by Amdahl, a
@@ -350,12 +372,26 @@ impl Report {
             .sum()
     }
 
+    /// [`Report::vectorized_share`] against [`Report::decode_total`].
+    #[must_use]
+    pub fn vectorized_decode_share(&self) -> f64 {
+        STAGES
+            .iter()
+            .filter(|stage| stage.is_vectorized())
+            .map(|stage| self.decode_share(*stage))
+            .sum()
+    }
+
     /// The largest whole-frame speedup vectorized stages could ever produce,
     /// even if every one of them became infinitely fast.
     #[must_use]
     pub fn max_whole_frame_speedup(&self) -> f64 {
         let serial = 1.0 - self.vectorized_share();
-        if serial <= 0.0 { f64::INFINITY } else { 1.0 / serial }
+        if serial <= 0.0 {
+            f64::INFINITY
+        } else {
+            1.0 / serial
+        }
     }
 
     /// Whole-frame speedup implied by making every vectorized stage `factor`
@@ -397,28 +433,40 @@ impl Report {
             .iter()
             .map(|stage| (*stage, self.nanos[*stage as usize]))
             .collect();
-        rows.sort_by(|left, right| right.1.cmp(&left.1));
+        rows.sort_by_key(|(_, nanos)| std::cmp::Reverse(*nanos));
         let divisor = frames.max(1) as f64;
         let mut out = String::from(
-            "| Stage | Share | ms/frame | Vectorized |\n| --- | ---: | ---: | --- |\n",
+            "| Stage | Share of total | Share of decode | ms/frame | Vectorized |\n\
+             | --- | ---: | ---: | ---: | --- |\n",
         );
         for (stage, nanos) in rows {
+            let decode_share = if stage == Stage::ColorConvert {
+                "n/a".to_string()
+            } else {
+                format!("{:.1}%", self.decode_share(stage) * 100.0)
+            };
             out.push_str(&format!(
-                "| `{}` | {:.1}% | {:.2} | {} |\n",
+                "| `{}` | {:.1}% | {decode_share} | {:.2} | {} |\n",
                 stage.name(),
                 self.share(stage) * 100.0,
                 nanos as f64 / 1e6 / divisor,
                 if stage.is_vectorized() { "yes" } else { "no" },
             ));
         }
+        let unattributed = self.unattributed().as_nanos() as f64;
         out.push_str(&format!(
-            "| _unattributed_ | {:.1}% | {:.2} | n/a |\n",
+            "| _unattributed_ | {:.1}% | {:.1}% | {:.2} | n/a |\n",
             if self.total.as_nanos() == 0 {
                 0.0
             } else {
-                self.unattributed().as_nanos() as f64 / self.total.as_nanos() as f64 * 100.0
+                unattributed / self.total.as_nanos() as f64 * 100.0
             },
-            self.unattributed().as_nanos() as f64 / 1e6 / divisor,
+            if self.decode_total().as_nanos() == 0 {
+                0.0
+            } else {
+                unattributed / self.decode_total().as_nanos() as f64 * 100.0
+            },
+            unattributed / 1e6 / divisor,
         ));
         out
     }
@@ -498,6 +546,10 @@ mod tests {
         // ~25% of the profile is in a vectorized stage, so the ceiling on any
         // whole-frame speedup from SIMD is ~1/(1 - 0.25).
         assert!((0.15..0.35).contains(&vector), "vectorized share {vector}");
+        // No colour conversion was profiled, so both denominators agree.
+        assert!((report.vectorized_decode_share() - vector).abs() < 1e-9);
+        assert_eq!(report.decode_total(), report.total());
+        assert!(report.markdown_table(1).contains("`residual_cabac`"));
         assert!(report.max_whole_frame_speedup() > 1.0);
         assert!(report.speedup_at(2.0) < report.max_whole_frame_speedup());
         assert!((report.speedup_at(1.0) - 1.0).abs() < 1e-9);
