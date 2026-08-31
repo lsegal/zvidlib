@@ -10,18 +10,25 @@
 //! the decoder's own kernels. The result is the reference picture the next
 //! frame's mode search in [`crate::hevc::engine::encoder::rdo`] predicts from.
 //!
-//! ## What "reconstruction" means for the current writer
+//! ## Lossless and lossy reconstruction
 //!
-//! The bitstream writer in [`crate::hevc::engine::encoder::pcm`] still codes
-//! every coding unit as a `pcm_flag == 1` PCM block, so the residual it codes
-//! is exact and the reconstruction of a block is bit-identical to its source
-//! samples. The loop here is nevertheless the real one — predict, add residual,
-//! clip — rather than a plane copy, because that is the *only* difference
-//! between this and a lossy writer: quantize the residual before
-//! [`reconstruct_partition`] adds it back and the reconstructed reference
-//! starts diverging from the source with no other change to this module. It is
-//! also what makes the in-loop filter stage below meaningful, since those
-//! filters run on the reconstruction, not on the source.
+//! [`ReconConfig::quantized_residual`] selects which writer this
+//! reconstruction models. Cleared, the residual is coded exactly, matching the
+//! PCM writer in [`crate::hevc::engine::encoder::pcm`] whose coding units are
+//! all `pcm_flag == 1` blocks: the reconstruction is then bit-identical to the
+//! source. Set, the residual is round-tripped through the §8.6.4 forward
+//! transform and §8.6.3 quantization in
+//! [`crate::hevc::engine::encoder::quant`] and back through the decoder's own
+//! scaling and inverse transform, which is what the residual writer in
+//! [`crate::hevc::engine::encoder::lossy`] codes — and the reconstructed
+//! reference then genuinely diverges from the source, so the mode search in
+//! [`crate::hevc::engine::encoder::rdo`] predicts from a lossy picture the way
+//! a real encoder's does.
+//!
+//! Either way the loop here is the real one — predict, add the coded residual,
+//! clip — rather than a plane copy. That is also what makes the in-loop filter
+//! stage below meaningful, since those filters run on the reconstruction, not
+//! on the source.
 //!
 //! ## What the in-loop filters do here
 //!
@@ -36,11 +43,14 @@
 //! the decoder's do, including the §8.7.2.5.4 / §8.7.3.1 PCM suppression map.
 
 use crate::hevc::engine::binarization::PartMode;
+use crate::hevc::engine::deblock::chroma_qpc_420;
 use crate::hevc::engine::deblock::{DeblockCu, DeblockCuDesc, DeblockCuParams, NoFilterMap};
+use crate::hevc::engine::encoder::quant::{forward_transform, quantize, reconstruct_residual};
 use crate::hevc::engine::encoder::rdo::PictureDecision;
 use crate::hevc::engine::motion::{MotionCell, MotionField};
 use crate::hevc::engine::picture::{Picture, Plane, clip1};
 use crate::hevc::engine::sao::{ResolvedSao, ResolvedSaoComponent};
+use crate::hevc::engine::transform::{Component as TfComponent, PredMode};
 
 /// `CtbLog2SizeY` of the encoder's fixed geometry (16-sample CTBs), matching
 /// the PCM writer's `CTB_LOG2`.
@@ -74,8 +84,15 @@ pub(crate) struct ReconConfig {
     /// leave every reconstructed sample alone.
     pub pcm_loop_filter_disabled: bool,
     /// `SliceQpY`, the q-side QP the §8.7.2.5.3 β / t<sub>C</sub> derivation
-    /// reads.
+    /// reads, and the `qP` the residual round trip quantizes at when
+    /// [`Self::quantized_residual`] is set.
     pub qp: i32,
+    /// Model a writer that codes *quantized* residual rather than the exact
+    /// one a PCM block carries: every transform block of every partition goes
+    /// through forward transform, quantization, and the decoder's own §8.6.2
+    /// reconstruction at [`Self::qp`]. Cleared, the residual is exact and the
+    /// reconstruction is the source picture.
+    pub quantized_residual: bool,
 }
 
 impl Default for ReconConfig {
@@ -88,6 +105,7 @@ impl Default for ReconConfig {
             sao_chroma: false,
             pcm_loop_filter_disabled: true,
             qp: 26,
+            quantized_residual: false,
         }
     }
 }
@@ -173,6 +191,7 @@ pub(crate) fn reconstruct_picture(
                 partition.h,
                 mv_x,
                 mv_y,
+                cfg.quantized_residual.then_some(cfg.qp as u32),
             );
             field.fill_rect(
                 partition.x,
@@ -181,9 +200,9 @@ pub(crate) fn reconstruct_picture(
                 partition.h,
                 MotionCell {
                     is_intra: coded_as_pcm,
-                    // The residual is coded exactly, so every block that
-                    // differs from its prediction carries coded levels — the
-                    // §8.7.2.4 `cbf` test.
+                    // The §8.7.2.4 `cbf` test. An exactly-coded residual
+                    // always carries levels; a quantized one is assumed to,
+                    // which only ever over-filters a boundary.
                     has_nonzero_coeff: true,
                     pred_flag_l0: !coded_as_pcm,
                     pred_flag_l1: false,
@@ -240,14 +259,15 @@ pub(crate) fn reconstruct_picture(
 }
 
 /// Reconstruct one prediction partition: form the prediction, code the
-/// residual against it, and add the residual back (§8.6.6
+/// residual against it, and add the coded residual back (§8.6.6
 /// `recSamples = Clip1( predSamples + resSamples )`).
 ///
-/// The residual is `source − prediction` because this writer codes it
-/// losslessly. A writer that quantizes would round-trip the residual through
-/// its forward and inverse transform here; nothing else about the loop would
-/// change, and the reconstruction would then differ from `src`, which is the
-/// entire reason the reference picture is kept separately at all.
+/// With `quant` set to `None` the residual is `source − prediction` coded
+/// exactly, as a PCM block carries it, and the reconstruction is the source.
+/// With a `qP`, the residual is instead round-tripped through the §8.6.4
+/// forward transform and §8.6.3 quantization and back through the decoder's
+/// own §8.6.2 reconstruction — which is what makes the reference picture
+/// differ from the source, and the entire reason it is kept separately at all.
 #[allow(clippy::too_many_arguments)]
 fn reconstruct_partition(
     pic: &mut Picture,
@@ -259,6 +279,7 @@ fn reconstruct_partition(
     h: usize,
     mv_x: i32,
     mv_y: i32,
+    quant: Option<u32>,
 ) {
     reconstruct_component(
         pic,
@@ -272,14 +293,26 @@ fn reconstruct_partition(
         h,
         mv_x,
         mv_y,
+        quant,
+        TfComponent::Luma,
     );
     // 4:2:0 — the chroma partition is the luma one halved, and the motion
     // vector with it (§8.5.3.3.3.3 whole-sample part; this search is
     // whole-pel, so the halved vector needs no fractional interpolation).
     let (cw, chh) = (src.width / 2, src.height / 2);
-    for (plane, source, reference_plane) in [
-        (Plane::Cb, src.cb, reference.map(|r| r.cb.as_slice())),
-        (Plane::Cr, src.cr, reference.map(|r| r.cr.as_slice())),
+    for (plane, source, reference_plane, component) in [
+        (
+            Plane::Cb,
+            src.cb,
+            reference.map(|r| r.cb.as_slice()),
+            TfComponent::Cb,
+        ),
+        (
+            Plane::Cr,
+            src.cr,
+            reference.map(|r| r.cr.as_slice()),
+            TfComponent::Cr,
+        ),
     ] {
         reconstruct_component(
             pic,
@@ -293,6 +326,10 @@ fn reconstruct_partition(
             (h / 2).max(1),
             mv_x / 2,
             mv_y / 2,
+            // §8.6.1 with the writer's zero chroma QP offsets: the chroma
+            // blocks quantize at the Table 8-10 mapping of the luma QP.
+            quant.map(|qp| chroma_qpc_420(qp as i32) as u32),
+            component,
         );
     }
 }
@@ -311,24 +348,98 @@ fn reconstruct_component(
     h: usize,
     mv_x: i32,
     mv_y: i32,
+    quant: Option<u32>,
+    component: TfComponent,
 ) {
-    for row in 0..h {
-        for col in 0..w {
-            let (sx, sy) = (x + col, y + row);
-            let predicted = match reference {
-                // §8.5.3.3.2 reference-sample clamping: a vector that leaves
-                // the picture reads the edge sample.
-                Some((reference, rw, rh)) => {
-                    let rx = (sx as i32 + mv_x).clamp(0, rw as i32 - 1) as usize;
-                    let ry = (sy as i32 + mv_y).clamp(0, rh as i32 - 1) as usize;
-                    i32::from(reference[ry * rw + rx])
+    let predict = |sx: usize, sy: usize| -> i32 {
+        match reference {
+            // §8.5.3.3.2 reference-sample clamping: a vector that leaves the
+            // picture reads the edge sample.
+            Some((reference, rw, rh)) => {
+                let rx = (sx as i32 + mv_x).clamp(0, rw as i32 - 1) as usize;
+                let ry = (sy as i32 + mv_y).clamp(0, rh as i32 - 1) as usize;
+                i32::from(reference[ry * rw + rx])
+            }
+            None => NEUTRAL_LUMA,
+        }
+    };
+    let Some(q_p) = quant else {
+        // The residual is coded exactly, so the reconstruction is the source.
+        for row in 0..h {
+            for col in 0..w {
+                let (sx, sy) = (x + col, y + row);
+                let predicted = predict(sx, sy);
+                let residual = i32::from(source[sy * src_stride + sx]) - predicted;
+                pic.set_sample(plane, sx, sy, clip1(predicted + residual, BIT_DEPTH));
+            }
+        }
+        return;
+    };
+
+    // §7.3.8.8: the residual of a partition is coded as square transform
+    // blocks. This geometry's partitions are whole or halved CTBs, so tiling
+    // by the largest legal square that fits is the transform tree a writer
+    // would build for them.
+    let n_tbs = transform_block_size(w, h);
+    let mut prediction = vec![0i32; n_tbs * n_tbs];
+    let mut residual = vec![0i32; n_tbs * n_tbs];
+    for by in (0..h).step_by(n_tbs) {
+        for bx in (0..w).step_by(n_tbs) {
+            for row in 0..n_tbs {
+                for col in 0..n_tbs {
+                    let (sx, sy) = (x + bx + col, y + by + row);
+                    let predicted = predict(sx, sy);
+                    prediction[row * n_tbs + col] = predicted;
+                    residual[row * n_tbs + col] =
+                        i32::from(source[sy * src_stride + sx]) - predicted;
                 }
-                None => NEUTRAL_LUMA,
+            }
+            // Forward transform → quantize → the decoder's own §8.6.2
+            // reconstruction of the levels that survived.
+            let pred_mode = if reference.is_some() {
+                PredMode::Inter
+            } else {
+                PredMode::Intra
             };
-            let residual = i32::from(source[sy * src_stride + sx]) - predicted;
-            pic.set_sample(plane, sx, sy, clip1(predicted + residual, BIT_DEPTH));
+            let coefficients =
+                forward_transform(&residual, n_tbs, pred_mode, component, BIT_DEPTH);
+            let levels = quantize(
+                &coefficients,
+                n_tbs,
+                q_p,
+                BIT_DEPTH,
+                matches!(pred_mode, PredMode::Intra),
+            );
+            // An all-zero level block codes `cbf == 0` and carries no
+            // residual at all, which is what a decoder reconstructs.
+            let coded = if levels.iter().any(|&l| l != 0) {
+                reconstruct_residual(&levels, n_tbs, q_p, pred_mode, component, BIT_DEPTH)
+                    .expect("encoder-sized transform block")
+            } else {
+                vec![0i32; n_tbs * n_tbs]
+            };
+            for row in 0..n_tbs {
+                for col in 0..n_tbs {
+                    let i = row * n_tbs + col;
+                    pic.set_sample(
+                        plane,
+                        x + bx + col,
+                        y + by + row,
+                        clip1(prediction[i] + coded[i], BIT_DEPTH),
+                    );
+                }
+            }
         }
     }
+}
+
+/// The largest legal square transform block that tiles a `w` x `h` partition:
+/// the largest power of two no greater than either side, clamped to the
+/// §7.4.3.2.1 4..=32 transform-block range.
+fn transform_block_size(w: usize, h: usize) -> usize {
+    let side = w.min(h);
+    let log2 = (usize::BITS - 1 - side.leading_zeros()).clamp(2, 5);
+    1usize << log2
 }
 
 /// One §8.7.2 descriptor per coding unit. Every CTB is one unsplit,
@@ -723,6 +834,84 @@ mod tests {
             ReconConfig::default(),
         );
         assert_eq!(out.y, next.0);
+    }
+
+    #[test]
+    fn a_quantized_residual_makes_the_reconstruction_diverge_from_the_source() {
+        // The property the lossy path exists for: once the residual is coded
+        // through the transform and quantizer, the encoder's reference is no
+        // longer the picture it was handed, and it drifts further as the step
+        // coarsens.
+        let src = source(0);
+        let lossless = reconstruct_picture(
+            planes(&src),
+            None,
+            &plan(&src, None),
+            ReconConfig::default(),
+        );
+        assert_eq!(lossless.y, src.0, "the exact-residual path must stay exact");
+
+        // The blocks in `source` are flat, so a fine step still reproduces
+        // their DC-only residual exactly; the distortion is required to be
+        // monotone in qP and strictly non-zero by the coarsest step.
+        let mut previous = 0u64;
+        for qp in [20i32, 34, 47] {
+            let lossy = reconstruct_picture(
+                planes(&src),
+                None,
+                &plan(&src, None),
+                ReconConfig {
+                    quantized_residual: true,
+                    qp,
+                    ..ReconConfig::default()
+                },
+            );
+            let error = sse(&lossy.y, &src.0);
+            assert!(
+                error >= previous,
+                "qP {qp} cost less distortion than the finer step"
+            );
+            previous = error;
+            assert_eq!(lossy.y.len(), src.0.len());
+            assert_eq!(lossy.cb.len(), src.1.len());
+        }
+        assert!(
+            previous > 0,
+            "a quantized reconstruction reproduced the source exactly"
+        );
+    }
+
+    #[test]
+    fn a_quantized_inter_reconstruction_predicts_from_the_lossy_reference() {
+        // The reconstruction of an inter picture coded against a lossy
+        // reference must differ from its source too — the drift the RDO
+        // search is supposed to see accumulates picture over picture.
+        let first = source(0);
+        let cfg = ReconConfig {
+            quantized_residual: true,
+            qp: 34,
+            ..ReconConfig::default()
+        };
+        let reference = reconstruct_picture(planes(&first), None, &plan(&first, None), cfg);
+        let next = source(2);
+        let out = reconstruct_picture(
+            planes(&next),
+            Some(&reference),
+            &plan(&next, Some(&reference.y)),
+            cfg,
+        );
+        assert_ne!(out.y, next.0, "the inter reconstruction stayed lossless");
+        assert_eq!(out.y.len(), next.0.len());
+    }
+
+    #[test]
+    fn partitions_tile_into_the_largest_legal_square_transform_block() {
+        assert_eq!(transform_block_size(16, 16), 16);
+        assert_eq!(transform_block_size(16, 8), 8);
+        assert_eq!(transform_block_size(8, 4), 4);
+        // Below the 4x4 minimum and above the 32x32 maximum both clamp.
+        assert_eq!(transform_block_size(2, 2), 4);
+        assert_eq!(transform_block_size(64, 64), 32);
     }
 
     #[test]
