@@ -2640,6 +2640,7 @@ mod tests {
             base_q_idx: 0,
             loop_filter: LoopFilterParams::DISABLED,
             tx_mode_select: false,
+            reduced_tx_set: true,
             interpolation_filter: InterpFilter::Regular,
         };
         let refs: [Option<RefSlot>; 8] = std::array::from_fn(|index| {
@@ -2713,6 +2714,7 @@ mod tests {
             base_q_idx: 0,
             loop_filter: LoopFilterParams::DISABLED,
             tx_mode_select: false,
+            reduced_tx_set: true,
             interpolation_filter: InterpFilter::Regular,
         };
         let mut symbols = SymbolEncoder::new();

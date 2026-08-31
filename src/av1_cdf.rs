@@ -832,11 +832,114 @@ mod tests {
     }
 
     #[test]
-    fn ext_tx_cdf_is_absent_for_the_dct_only_transform_sets() {
-        assert!(ext_tx_cdf(4).is_some());
-        assert!(ext_tx_cdf(8).is_some());
-        assert!(ext_tx_cdf(16).is_some());
-        assert!(ext_tx_cdf(32).is_none());
-        assert!(ext_tx_cdf(64).is_none());
+    fn get_tx_set_follows_the_spec_derivation() {
+        use Av1TxSet::{DctOnly, Inter1, Inter2, Inter3, Intra1, Intra2};
+        // Intra, reduced_tx_set = 0.
+        assert_eq!(get_tx_set(4, false, false), Intra1);
+        assert_eq!(get_tx_set(8, false, false), Intra1);
+        assert_eq!(get_tx_set(16, false, false), Intra2);
+        assert_eq!(get_tx_set(32, false, false), DctOnly);
+        assert_eq!(get_tx_set(64, false, false), DctOnly);
+        // Inter, reduced_tx_set = 0.
+        assert_eq!(get_tx_set(4, true, false), Inter1);
+        assert_eq!(get_tx_set(8, true, false), Inter1);
+        assert_eq!(get_tx_set(16, true, false), Inter2);
+        assert_eq!(get_tx_set(32, true, false), Inter3);
+        assert_eq!(get_tx_set(64, true, false), DctOnly);
+        // reduced_tx_set = 1 collapses to the two reduced sets.
+        for size in [4usize, 8, 16] {
+            assert_eq!(get_tx_set(size, false, true), Intra2);
+            assert_eq!(get_tx_set(size, true, true), Inter3);
+        }
+        assert_eq!(get_tx_set(32, false, true), DctOnly);
+        assert_eq!(get_tx_set(32, true, true), Inter3);
+    }
+
+    #[test]
+    fn tx_type_cdf_is_absent_only_for_the_dct_only_set() {
+        assert!(tx_type_cdf(Av1TxSet::DctOnly, 32, 0).is_none());
+        assert!(tx_type_cdf(Av1TxSet::DctOnly, 64, 0).is_none());
+        for (set, size) in [
+            (Av1TxSet::Intra1, 4usize),
+            (Av1TxSet::Intra1, 8),
+            (Av1TxSet::Intra2, 16),
+            (Av1TxSet::Inter1, 4),
+            (Av1TxSet::Inter2, 16),
+            (Av1TxSet::Inter3, 32),
+        ] {
+            assert!(tx_type_cdf(set, size, 0).is_some());
+        }
+    }
+
+    /// Every `tx_type` CDF must be a valid probability model (strictly
+    /// increasing, ending at 32768) and must have exactly as many symbols
+    /// as its set's inverse table has entries, since `read_tx_type` indexes
+    /// one by the symbol decoded from the other.
+    #[test]
+    fn tx_type_cdfs_are_valid_and_match_their_inverse_sets() {
+        for (set, sizes) in [
+            (Av1TxSet::Intra1, &[4usize, 8][..]),
+            (Av1TxSet::Intra2, &[4, 8, 16][..]),
+            (Av1TxSet::Inter1, &[4, 8][..]),
+            (Av1TxSet::Inter2, &[16][..]),
+            (Av1TxSet::Inter3, &[4, 8, 16, 32][..]),
+        ] {
+            let inverse = tx_type_inverse_set(set);
+            for &size in sizes {
+                for direction in 0..INTRA_MODES {
+                    let cdf = tx_type_cdf(set, size, direction).unwrap();
+                    assert_eq!(cdf.len(), inverse.len(), "{set:?} {size} {direction}");
+                    assert_eq!(*cdf.last().unwrap(), 32768);
+                    assert!(cdf[0] > 0);
+                    assert!(
+                        cdf.windows(2).all(|pair| pair[0] < pair[1]),
+                        "{set:?} {size} {direction} is not strictly increasing"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `Default_Intra_Ext_Tx_Cdf` is indexed by intra direction as well as
+    /// by transform size, so the rows must actually differ or that indexing
+    /// would be unobservable.
+    #[test]
+    fn intra_tx_type_cdfs_vary_by_size_and_intra_direction() {
+        let dc = tx_type_cdf(Av1TxSet::Intra2, 8, 0).unwrap();
+        let paeth = tx_type_cdf(Av1TxSet::Intra2, 8, INTRA_MODES - 1).unwrap();
+        assert_ne!(dc, paeth);
+        assert_ne!(dc, tx_type_cdf(Av1TxSet::Intra2, 16, 0).unwrap());
+    }
+
+    /// The `V_*`/`H_*` half-identity types have no kernel in this crate and
+    /// must be reported as absent rather than silently aliased onto another
+    /// transform type.
+    #[test]
+    fn inverse_sets_mark_the_unimplemented_half_identity_types() {
+        assert_eq!(
+            tx_type_inverse_set(Av1TxSet::Intra1)
+                .iter()
+                .filter(|(_, kernel)| kernel.is_none())
+                .map(|(name, _)| *name)
+                .collect::<Vec<_>>(),
+            ["V_DCT", "H_DCT"]
+        );
+        assert!(
+            tx_type_inverse_set(Av1TxSet::Intra2)
+                .iter()
+                .all(|(_, kernel)| kernel.is_some())
+        );
+        assert!(
+            tx_type_inverse_set(Av1TxSet::Inter3)
+                .iter()
+                .all(|(_, kernel)| kernel.is_some())
+        );
+        assert_eq!(
+            tx_type_inverse_set(Av1TxSet::Inter1)
+                .iter()
+                .filter(|(_, kernel)| kernel.is_none())
+                .count(),
+            6
+        );
     }
 }
