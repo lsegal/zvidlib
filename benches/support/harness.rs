@@ -77,17 +77,32 @@ where
     group.throughput(Throughput::Elements(workload.frames_per_iteration));
     for isa in simd::available() {
         simd::set_override(Some(isa));
-        assert_eq!(
-            simd::active(),
-            isa,
-            "the SIMD override must reach every kernel before timing {}",
-            workload.codec
-        );
+        assert_reached_every_site(workload.codec, isa);
         report_megapixels_per_second(workload, isa, &run);
         group.bench_function(isa.name(), |bencher| bencher.iter(|| black_box(run())));
     }
     simd::set_override(None);
     group.finish();
+}
+
+/// Asserts the override actually landed in every dispatch family.
+///
+/// This is the check that makes a scalar arm trustworthy. A timing difference
+/// cannot distinguish "the override never reached this kernel" from "this
+/// kernel's vector path is not faster on this host" — and the latter really
+/// happens, notably for HEVC on hosts where the scalar reference
+/// auto-vectorizes well under `lto = "fat"`. Reading each site's own selector
+/// back through [`simd::active_by_site`] settles it directly.
+fn assert_reached_every_site(codec: &str, isa: SimdIsa) {
+    for (site, site_isa) in simd::active_by_site() {
+        assert_eq!(
+            site_isa,
+            isa,
+            "{codec}: pinning {} left the {site} kernels on {}",
+            isa.name(),
+            site_isa.name()
+        );
+    }
 }
 
 /// Times one pass of `run` and prints its megapixel throughput.
@@ -137,6 +152,7 @@ where
             continue;
         }
         simd::set_override(Some(isa));
+        assert_reached_every_site(label, isa);
         let actual = run();
         assert_eq!(
             actual.len(),

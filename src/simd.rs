@@ -92,6 +92,120 @@ pub fn available() -> Vec<SimdIsa> {
     crate::av1_simd::available_isas()
 }
 
+/// The instruction set every individual dispatch site resolves to right now,
+/// paired with a stable name for that site.
+///
+/// [`active`] reports what the override *asks* for; this reports what each
+/// family of kernels will *actually* run, read back from that family's own
+/// selector. The two agreeing is the property that makes a scalar-vs-SIMD
+/// benchmark meaningful, and on a host where the scalar reference happens to
+/// auto-vectorize well it is the only way to confirm the switch landed —
+/// timings alone cannot distinguish "the override did not reach this kernel"
+/// from "this kernel's vector path is not faster here".
+///
+/// The site names are stable and safe to assert on:
+///
+/// | Site | Kernels |
+/// | --- | --- |
+/// | `av1_simd` | AV1 transforms and in-loop filters |
+/// | `av1_mc` | AV1 motion compensation (the level [`crate::av1_mc::McContext::new`] picks) |
+/// | `av1_intra_pred` | AV1 intra prediction and residual reconstruction |
+/// | `hevc_prediction_filters` | HEVC inter/intra prediction and in-loop filters |
+/// | `hevc_transforms` | HEVC inverse transforms and dequantization |
+/// | `hevc_rdcost` | HEVC encoder-side distortion metrics |
+///
+/// The `hevc_*` sites are absent on `wasm32`, which does not build the HEVC
+/// engine.
+#[must_use]
+pub fn active_by_site() -> Vec<(&'static str, SimdIsa)> {
+    #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
+    let mut sites = vec![
+        ("av1_simd", crate::av1_simd::active_isa()),
+        ("av1_mc", from_mc_level(crate::av1_mc::default_level())),
+        (
+            "av1_intra_pred",
+            from_intra_simd(crate::av1_intra_pred::av1_intra_simd()),
+        ),
+    ];
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use crate::hevc::engine::encoder::rdcost;
+        use crate::hevc::engine::{simd as hevc_simd, transform_simd};
+        sites.push((
+            "hevc_prediction_filters",
+            from_hevc_isa(hevc_simd::detected_isa()),
+        ));
+        sites.push((
+            "hevc_transforms",
+            from_hevc_backend(transform_simd::detected()),
+        ));
+        sites.push(("hevc_rdcost", from_rdcost_isa(rdcost::isa())));
+    }
+    sites
+}
+
+fn from_mc_level(level: crate::av1_mc::SimdLevel) -> SimdIsa {
+    use crate::av1_mc::SimdLevel;
+    match level {
+        SimdLevel::Scalar => SimdIsa::Scalar,
+        SimdLevel::Sse41 => SimdIsa::Sse41,
+        SimdLevel::Avx2 => SimdIsa::Avx2,
+        SimdLevel::Neon => SimdIsa::Neon,
+    }
+}
+
+fn from_intra_simd(simd: crate::av1_intra_pred::Av1IntraSimd) -> SimdIsa {
+    use crate::av1_intra_pred::Av1IntraSimd;
+    match simd {
+        Av1IntraSimd::Scalar => SimdIsa::Scalar,
+        Av1IntraSimd::Sse41 => SimdIsa::Sse41,
+        Av1IntraSimd::Avx2 => SimdIsa::Avx2,
+        Av1IntraSimd::Neon => SimdIsa::Neon,
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn from_hevc_isa(isa: crate::hevc::engine::simd::Isa) -> SimdIsa {
+    use crate::hevc::engine::simd::Isa;
+    match isa {
+        Isa::Scalar => SimdIsa::Scalar,
+        #[cfg(target_arch = "x86_64")]
+        Isa::Sse41 => SimdIsa::Sse41,
+        #[cfg(target_arch = "x86_64")]
+        Isa::Avx2 => SimdIsa::Avx2,
+        #[cfg(target_arch = "aarch64")]
+        Isa::Neon => SimdIsa::Neon,
+    }
+}
+
+/// SSE4.2 is SSE4.1 plus the 64-bit compare the dequantization clip needs; the
+/// crate-wide vocabulary has no separate name for it, so both report as
+/// [`SimdIsa::Sse41`].
+#[cfg(not(target_arch = "wasm32"))]
+fn from_hevc_backend(backend: crate::hevc::engine::transform_simd::Backend) -> SimdIsa {
+    use crate::hevc::engine::transform_simd::Backend;
+    match backend {
+        Backend::Scalar => SimdIsa::Scalar,
+        Backend::Sse41 | Backend::Sse42 => SimdIsa::Sse41,
+        Backend::Avx2 => SimdIsa::Avx2,
+        Backend::Neon => SimdIsa::Neon,
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn from_rdcost_isa(isa: crate::hevc::engine::encoder::rdcost::Isa) -> SimdIsa {
+    use crate::hevc::engine::encoder::rdcost::Isa;
+    match isa {
+        Isa::Scalar => SimdIsa::Scalar,
+        #[cfg(target_arch = "x86_64")]
+        Isa::Sse41 => SimdIsa::Sse41,
+        #[cfg(target_arch = "x86_64")]
+        Isa::Avx2 => SimdIsa::Avx2,
+        #[cfg(target_arch = "aarch64")]
+        Isa::Neon => SimdIsa::Neon,
+    }
+}
+
 /// The active override, or `None` when detection is in charge.
 ///
 /// Every dispatch site in the crate consults this *before* its own cached
@@ -103,15 +217,23 @@ pub(crate) fn override_isa() -> Option<SimdIsa> {
     SimdIsa::from_code(OVERRIDE.load(Ordering::Relaxed))
 }
 
+/// Serializes every test that pins the process-wide override.
+///
+/// The override is one global now, so tests that used to pin four independent
+/// switches (in `av1_simd`, the HEVC in-loop filter dispatcher, and here) can
+/// no longer each hold their own mutex — they would swap the instruction set
+/// out from under each other. They all take this one instead.
+#[cfg(test)]
+pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Serializes the tests that pin the process-wide override.
-    fn lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
+    use super::test_lock as lock;
 
     #[test]
     fn available_always_includes_scalar_and_contains_the_detected_set() {
@@ -155,6 +277,87 @@ mod tests {
             assert_eq!(active(), SimdIsa::Scalar, "{}", isa.name());
         }
         set_override(None);
+    }
+
+    /// The override is only useful if it actually reaches the kernels, and
+    /// each dispatch family resolves its instruction set through a different
+    /// selector. This pins every one of them at once.
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn pinning_scalar_reaches_every_dispatch_site() {
+        use crate::av1_intra_pred::{Av1IntraSimd, av1_intra_simd};
+        use crate::av1_mc::{McContext, SimdLevel, default_level};
+        use crate::hevc::engine::encoder::rdcost;
+        use crate::hevc::engine::{simd as hevc_simd, transform_simd};
+
+        let _guard = lock();
+        set_override(Some(SimdIsa::Scalar));
+
+        // AV1 transforms and in-loop filters.
+        assert_eq!(crate::av1_simd::active_isa(), SimdIsa::Scalar);
+        // AV1 intra prediction, whose `OnceLock` detection may already have
+        // resolved to a vector backend in an earlier test.
+        assert_eq!(av1_intra_simd(), Av1IntraSimd::Scalar);
+        // AV1 motion compensation, through the level `McContext::new` picks.
+        assert_eq!(default_level(), SimdLevel::Scalar);
+        assert_eq!(McContext::new().level(), SimdLevel::Scalar);
+        // HEVC inter/intra prediction and in-loop filters.
+        assert_eq!(hevc_simd::detected_isa(), hevc_simd::Isa::Scalar);
+        // HEVC inverse transforms and dequantization.
+        assert_eq!(transform_simd::detected(), transform_simd::Backend::Scalar);
+        // HEVC encoder-side distortion metrics.
+        assert_eq!(rdcost::isa(), rdcost::Isa::Scalar);
+
+        set_override(None);
+    }
+
+    /// Clearing the override has to hand every site back to its own detection,
+    /// not leave it pinned to whatever the last test asked for.
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn clearing_the_override_restores_per_site_detection() {
+        use crate::av1_intra_pred::{Av1IntraSimd, av1_intra_simd};
+        use crate::av1_mc::default_level;
+        use crate::hevc::engine::{simd as hevc_simd, transform_simd};
+
+        let _guard = lock();
+        set_override(Some(SimdIsa::Scalar));
+        set_override(None);
+
+        let vectorized = detected() != SimdIsa::Scalar;
+        assert_eq!(crate::av1_simd::active_isa(), detected());
+        assert_eq!(av1_intra_simd() != Av1IntraSimd::Scalar, vectorized);
+        assert_eq!(
+            default_level() != crate::av1_mc::SimdLevel::Scalar,
+            vectorized
+        );
+        assert_eq!(
+            hevc_simd::detected_isa() != hevc_simd::Isa::Scalar,
+            vectorized
+        );
+        assert_eq!(
+            transform_simd::detected() != transform_simd::Backend::Scalar,
+            vectorized
+        );
+    }
+
+    #[test]
+    fn every_site_reports_the_pinned_instruction_set() {
+        let _guard = lock();
+        for isa in available() {
+            set_override(Some(isa));
+            for (site, site_isa) in active_by_site() {
+                assert_eq!(site_isa, isa, "site {site} did not follow the override");
+            }
+        }
+        set_override(None);
+        for (site, site_isa) in active_by_site() {
+            assert_eq!(
+                site_isa,
+                detected(),
+                "site {site} did not fall back to detection"
+            );
+        }
     }
 
     #[test]

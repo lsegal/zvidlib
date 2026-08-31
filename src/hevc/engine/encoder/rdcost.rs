@@ -1042,6 +1042,9 @@ mod tests {
 
     #[test]
     fn the_detected_instruction_set_is_the_best_one_this_machine_supports() {
+        // `isa()` follows the crate-wide SIMD override, so this has to
+        // exclude the tests that pin one.
+        let _guard = crate::simd::test_lock();
         let detected = isa();
         #[cfg(target_arch = "x86_64")]
         {

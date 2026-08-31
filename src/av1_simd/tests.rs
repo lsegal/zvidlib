@@ -7,9 +7,10 @@
 //! the dispatch conditions in `av1_filters` (run eligibility, edge handling,
 //! and the scalar tail) as well as the kernels themselves. They share
 //! [`ISA_LOCK`] so a pinned instruction set is not swapped out underneath a
-//! test by a concurrently running one.
+//! test by a concurrently running one - and, since the override is now
+//! crate-wide, by the HEVC tests that pin the scalar path as well.
 
-use std::sync::{Mutex, MutexGuard};
+use std::sync::MutexGuard;
 
 use super::inverse_transform as inverse_transform_simd;
 use super::*;
@@ -21,12 +22,11 @@ use crate::av1_filters::{
 use crate::av1_intra::{Av1TxType, Tx1d, inverse_transform};
 use crate::{Limits, TxSizeGrid};
 
-static ISA_LOCK: Mutex<()> = Mutex::new(());
-
+/// Delegates to the crate-wide override lock: pinning an instruction set now
+/// changes every codec's kernels, not just this module's, so the HEVC tests
+/// that pin the scalar path have to exclude these too.
 fn lock_isa() -> MutexGuard<'static, ()> {
-    ISA_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    crate::simd::test_lock()
 }
 
 /// Small deterministic LCG, matching the style used elsewhere in the crate.

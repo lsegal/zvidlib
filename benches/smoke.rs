@@ -12,7 +12,12 @@
 //!    visibly changes timings for HEVC *and* for all three AV1 dispatch
 //!    families (transforms/in-loop filters, motion compensation, and intra
 //!    prediction), which is exactly the property a scalar-vs-SIMD comparison
-//!    depends on and which no single pre-existing toggle had.
+//!    depends on and which no single pre-existing toggle had. Whether that
+//!    shows up as a *timing* difference is host- and kernel-dependent - the
+//!    HEVC arms come out near parity on an Apple Silicon host, where the
+//!    scalar reference auto-vectorizes well under `lto = "fat"` - so the
+//!    harness also asserts, through `zvidlib::simd::active_by_site`, that
+//!    every dispatch family really did follow the override.
 //!
 //! Every group also runs `support::harness::assert_bit_exact_across_isas`
 //! before timing, so a divergent kernel fails the benchmark instead of
@@ -43,11 +48,10 @@ use support::{fixtures, synth};
 
 /// Frames of the bundled sample one HEVC iteration decodes.
 ///
-/// Two is enough to cover a key frame plus an inter frame (so inter
-/// prediction, the in-loop filters, and the inverse transforms all run) while
-/// keeping a criterion sample inside a few hundred milliseconds on the
-/// software decoder.
-const HEVC_FRAMES: u64 = 2;
+/// Enough to cover a key frame plus a run of inter frames, so inter
+/// prediction, the in-loop filters, and the inverse transforms all run, while
+/// keeping one criterion sample under a second on the software decoder.
+const HEVC_FRAMES: u64 = 8;
 
 /// Luma dimensions for the synthetic AV1 kernel workloads. One 1080p plane is
 /// large enough that per-call dispatch overhead is negligible next to the

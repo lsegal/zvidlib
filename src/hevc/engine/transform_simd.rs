@@ -743,6 +743,9 @@ mod tests {
     /// backend for another architecture.
     #[test]
     fn detected_backend_is_supported() {
+        // `detected()` follows the crate-wide SIMD override, so this has to
+        // exclude the tests that pin one.
+        let _guard = crate::simd::test_lock();
         assert!(detected().supported());
         let backends = supported_backends();
         assert_eq!(backends[0], Backend::Scalar);
