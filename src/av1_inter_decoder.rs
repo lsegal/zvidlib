@@ -3163,14 +3163,19 @@ mod tests {
         e.symbol(&cdf::NEW_MV, 1);
         e.symbol(&cdf::ZERO_MV, 0); // GLOBALMV
         e.symbol(cdf::tx_depth_cdf(16).0, 1); // TX_16X16 >> 1 = TX_8X8
+        // Four 8x8 transforms inside a 16x16 coding block, so no transform
+        // covers the whole block and the neighbour-derived context 1
+        // applies to all four.
+        let qctx = cdf::coeff_qctx(40);
+        let tx_ctx = cdf::coeff_tx_size_ctx(8);
         for _ in 0..3 {
-            e.symbol(&cdf::TXB_SKIP[1], 1); // skipped, no coefficients
+            e.symbol(cdf::txb_skip_cdf(qctx, tx_ctx, 1), 1); // skipped, no coefficients
         }
-        e.symbol(&cdf::TXB_SKIP[1], 0); // not skipped
-        e.symbol(cdf::eob_pt_cdf(8, 0), 0); // eob_point = 1 -> eob = 1
-        e.symbol(&cdf::COEFF_BASE_EOB[0][0], 2); // level = 3 (max base)
-        e.symbol(&cdf::COEFF_BR[0][0], 1); // +1, stop (level = 4)
-        e.symbol(&cdf::DC_SIGN[0][0], 0); // positive
+        e.symbol(cdf::txb_skip_cdf(qctx, tx_ctx, 1), 0); // not skipped
+        e.symbol(cdf::eob_pt_cdf(qctx, 8, 0), 0); // eob_point = 1 -> eob = 1
+        e.symbol(cdf::coeff_base_eob_cdf(qctx, tx_ctx, 0, 0), 2); // level = 3 (max base)
+        e.symbol(cdf::coeff_br_cdf(qctx, tx_ctx, 0, 0), 1); // +1, stop (level = 4)
+        e.symbol(cdf::dc_sign_cdf(qctx, 0, 0), 0); // positive
         e.symbol(
             cdf::tx_type_cdf(cdf::Av1TxSet::Inter1, 8, 0).unwrap(),
             tx_type_symbol,
