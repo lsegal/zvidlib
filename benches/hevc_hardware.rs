@@ -59,21 +59,17 @@ use zvidlib::{
 
 use super::support::{self, FrameWork, group_name};
 
-/// Frames one steady-state hardware iteration decodes past the first.
+/// Frames one steady-state iteration decodes past the first.
 ///
-/// Large enough that the per-iteration `iter_custom` bookkeeping and the first
-/// frame excluded from the clock are both negligible, small enough that one
-/// iteration stays well under a second on a backend decoding 1080p faster than
-/// real time.
-const HARDWARE_FRAMES: u64 = 32;
-
-/// Frames one steady-state software iteration decodes past the first.
-///
-/// The software decoder runs single-digit fps on the bundled 1080p sample, so
-/// it measures a shorter window than the hardware arm. Both arms report
-/// megapixels per second, which is resolution- and count-independent, so the
-/// ratio stays meaningful across the two window sizes.
-const SOFTWARE_FRAMES: u64 = 4;
+/// Both arms decode the *same* window, which is what makes the ratio they
+/// produce a ratio and not an estimate: the bundled sample's frames are not
+/// equally expensive to decode (a key frame costs far more than the hierarchical
+/// B-frames that follow it, and the clip opens on near-static content), so two
+/// arms measured over different frame counts would be comparing different work.
+/// Thirty-two frames is long enough that the excluded first frame and the
+/// `iter_custom` bookkeeping are both negligible, and short enough that even the
+/// software decoder finishes an iteration in a few seconds.
+const COMPARISON_FRAMES: u64 = 32;
 
 /// Environment variable that opts into the slow software comparison arm.
 ///
@@ -164,9 +160,14 @@ fn bench_arm(
 
     let (setup, steady) = timed_decode(&factory, configuration, samples, frames);
     let rate = work.megapixels_per_second(steady);
+    // This pass is the process's first session on this backend, so its setup
+    // number carries one-time framework/driver initialization that the criterion
+    // benchmark below - which builds a session per iteration, after that
+    // initialization has already happened - does not. Both are real: a caller
+    // pays the cold one once and the warm one on every seek-driven reset.
     println!(
-        "# {label}: session setup to first frame {:.1} ms; {frames} further frame(s) in {:.4}s \
-         => {:.1} fps, {rate:.1} Mpx/s",
+        "# {label}: cold session setup to first frame {:.1} ms; {frames} further frame(s) in \
+         {:.4}s => {:.1} fps, {rate:.1} Mpx/s",
         setup.as_secs_f64() * 1e3,
         steady.as_secs_f64(),
         frames as f64 / steady.as_secs_f64(),
@@ -175,8 +176,11 @@ fn bench_arm(
     group.throughput(setup_work.elements());
     group.bench_function(format!("{label}/session_setup_to_first_frame"), |bencher| {
         bencher.iter_custom(|iterations| {
+            // Zero further frames: this arm times construction through the
+            // first delivered frame and nothing after it, so it does not pay
+            // for a full steady-state window it would then discard.
             (0..iterations)
-                .map(|_| timed_decode(&factory, configuration, samples, frames).0)
+                .map(|_| timed_decode(&factory, configuration, samples, 0).0)
                 .sum()
         });
     });
@@ -232,7 +236,7 @@ pub fn hevc_hardware(criterion: &mut Criterion) {
     group.sample_size(10);
     group.warm_up_time(Duration::from_millis(500));
     group.measurement_time(Duration::from_secs(5));
-    let hardware_rate = bench_arm(&mut group, "hardware", &hardware, HARDWARE_FRAMES);
+    let hardware_rate = bench_arm(&mut group, "hardware", &hardware, COMPARISON_FRAMES);
     group.finish();
 
     if std::env::var_os(LARGE_GROUP_ENV).is_none() {
@@ -247,8 +251,8 @@ pub fn hevc_hardware(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group(group_name("hevc_hardware_software_baseline"));
     group.sample_size(10);
     group.warm_up_time(Duration::from_millis(500));
-    group.measurement_time(Duration::from_secs(20));
-    let software_rate = bench_arm(&mut group, "software", &software, SOFTWARE_FRAMES);
+    group.measurement_time(Duration::from_secs(60));
+    let software_rate = bench_arm(&mut group, "software", &software, COMPARISON_FRAMES);
     group.finish();
 
     if software_rate > 0.0 {
