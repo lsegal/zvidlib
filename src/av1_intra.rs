@@ -380,7 +380,7 @@ pub fn get_ac_quant(qindex: u8) -> i32 {
 /// The decoders signal these through the full `get_tx_set`/`read_tx_type`
 /// derivation (spec §5.11.47, §5.11.48). The half-identity `V_*`/`H_*`
 /// types the larger sets also contain have no kernel here and are rejected
-/// as unsupported by [`crate::av1_cdf::tx_type_inverse_set`]'s callers.
+/// as unsupported when a bitstream signals them.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Av1TxType {
     DctDct,

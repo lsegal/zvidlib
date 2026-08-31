@@ -170,8 +170,48 @@ regardless of the filter — it is not a criterion benchmark and criterion's
 filter does not reach it — so filtering shortens the *timed* part of a run, not
 all of it.
 
-The per-ISA HEVC group decodes the bundled 1080p sample, so it sits behind the
-same `ZVIDLIB_BENCH_LARGE=1` opt-in as the other 1080p group.
+The whole-frame per-ISA HEVC group (`hevc_decode`) decodes the bundled 1080p
+sample, so it sits behind the same `ZVIDLIB_BENCH_LARGE=1` opt-in as the other
+1080p group.
+
+### The HEVC per-stage groups
+
+`hevc_decode` answers "how fast is a frame". The per-stage groups answer "which
+kernel changed", so a regression can be attributed rather than only observed:
+
+| Group | Stage | Vectorized |
+| --- | --- | --- |
+| `hevc_inter_pred` | §8.5.3.3 8-tap luma interpolation + the weighted combine | yes |
+| `hevc_intra_pred` | §8.4.4.2 reference smoothing, planar / DC / angular | yes |
+| `hevc_deblock` | §8.7.2 luma block-edge deblocking | yes |
+| `hevc_sao` | §8.7.3 sample adaptive offset, band and edge | yes |
+| `hevc_inverse_transform` | §8.6 dequantization + inverse DCT/DST | yes |
+| `hevc_cabac` | §9.3.4 arithmetic bin decoding | no, by design |
+
+They run unconditionally — none of them touches the bundled sample, so none of
+them needs the `ZVIDLIB_BENCH_LARGE=1` opt-in — and each runs once per available
+instruction set under the same bit-exactness and per-site override guards as
+every other per-ISA group.
+
+`hevc_cabac` is in the list precisely because it is *not* vectorized. The
+arithmetic decoder is inherently serial (each bin's range update depends on the
+previous one's), so whatever fraction of a decode it owns is the fraction no
+amount of SIMD elsewhere can remove. Its arms should come out equal; the number
+is meaningful next to the other stages, as the Amdahl ceiling on the whole-frame
+group. Its throughput axis counts bins, so its `Mpx/s` line reads as
+megabins/sec.
+
+The inputs come from `zvidlib::hevc_decoder_bench`, a narrow public surface over
+the otherwise crate-private HEVC engine. Its `HevcStageInputs::new` does all the
+allocation and content generation; only the kernel under test runs inside
+`run_*`. The content deliberately mixes textured and flat regions: the wide
+deblocking filter is gated on the §8.7.2.5.3 flatness check, so a purely
+textured plane would time only the narrow path and under-report the kernel.
+
+Each `run_*` returns an eight-byte FNV-1a fold over every sample the stage
+produced rather than the samples themselves, which keeps a multi-megabyte
+allocation out of the timed loop while still letting the bit-exactness guard
+catch a backend that diverged anywhere.
 
 ### Correctness guard
 
@@ -229,10 +269,13 @@ groups.
 `AudioEncoder` (`src/codec.rs`) is a trait with no implementation in the crate.
 Its only implementor anywhere in the tree is `PcmFixtureEncoder` in
 `tests/indexed_mp4_output.rs`, a test double that packages PCM without
-compressing anything. "Benchmark the audio encoder" therefore has no subject, and
-this target does not invent one -- whether the crate should grow a native AAC-LC
-encoder, delegate to a platform encoder (AudioToolbox / Media Foundation), or
-leave the trait for platform and web backends to fill is a product decision.
+compressing anything. "Benchmark the audio encoder" therefore has no subject.
+
+That question is now closed rather than open. zvidlib ships no audio encoder by
+decision: the trait is the seam that platform and browser backends fill, and the
+rationale is recorded on `AudioEncoder` in `src/codec.rs` and in the README. So
+there is no audio-encode target pending for this suite, and none of the audio
+groups below are placeholders waiting on one.
 
 The bench-local `PcmBenchEncoder` is the same kind of pass-through double, and it
 is bench-local on purpose: holding codec work at effectively zero is what makes
@@ -301,6 +344,7 @@ mistaken for bitstream-writing cost:
 | Group | Stage |
 | --- | --- |
 | `..._rdo_intra` / `..._rdo_inter` | mode search / RDO (`engine::encoder::rdo`), without and with a reference picture |
+| `..._reconstruct` | encode-side reconstruction (predict + add residual per coded block) plus the §8.7.2 deblocking filter and §8.7.3 SAO over the reconstructed picture |
 | `..._pcm_write` | whole-picture access-unit writing: parameter sets, slice header, CABAC-coded CU syntax, PCM samples |
 | `hevc_encode_cabac` | the §9.3.5 arithmetic encoder alone, over a synthetic bin stream |
 | `hevc_encode_bitwriter` | the raw fixed-length / `ue(v)` / `se(v)` writer alone |
@@ -318,19 +362,28 @@ not encodable — these are the nearest valid sizes at the same scale.
 
 ### Stages this encoder does not have yet
 
-The encoder is a lossless PCM bootstrap writer. It has **no forward transform,
-no quantization, and no encoder-side reconstruction or in-loop filtering**: PCM
-samples are written verbatim, so there is no residual to transform and no
-reconstructed picture that could differ from the source. Those stages have no
-group here because they do not exist yet, and the target prints that on every
-run so a missing group is never read as a stage that costs nothing.
+The encoder is a lossless PCM bootstrap writer. It has **no forward transform
+and no quantization**: PCM samples are written verbatim, so there is no residual
+to transform or quantize. Those stages have no group here because they do not
+exist yet, and the target prints that on every run so a missing group is never
+read as a stage that costs nothing.
+
+`..._reconstruct` does exist, and it is the one stage whose measured shape
+depends on the access unit being modelled. The reconstruction loop always runs
+(predict, add the coded residual, clip); the in-loop filters only modify samples
+when the access unit leaves them enabled on its PCM coding units
+(`pcm_loop_filter_disabled_flag == 0`), which is the shape this group models,
+because the filters are what it exists to measure. The shipped writer neutralizes
+them, which is what keeps its PCM encode exactly lossless.
 
 ### Where the SIMD axis reads flat, and why that is the result
 
 `hevc_rdcost` — the SAD and SATD distortion metrics the mode search calls — is
-the encoder's **only** SIMD dispatch family. Bitstream writing, CABAC, and the
-RGBA-to-YUV420 conversion have no vector path at all, so their arms are expected
-to read the same under every instruction set. That is a measured result, not a
+the encoder's **only** SIMD dispatch family of its own. The one other group that
+moves with the instruction set is `..._reconstruct`, which reaches the decoder's
+already-vectorized deblocking and SAO kernels rather than an encoder-side one.
+Bitstream writing, CABAC, and the RGBA-to-YUV420 conversion have no vector path
+at all, so their arms are expected to read the same under every instruction set. That is a measured result, not a
 broken benchmark: it says the next encoder-side vectorization targets are
 entropy coding and color conversion. It is also why every group asserts through
 `simd::active_by_site()` that the override landed rather than inferring it from
