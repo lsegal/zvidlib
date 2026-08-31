@@ -20,6 +20,7 @@ use zvidlib::av1_filters::{
 };
 use zvidlib::av1_intra::{Av1TxType, inverse_transform};
 use zvidlib::av1_simd::{SimdIsa, available_isas, set_active_isa};
+use zvidlib::forward_transform;
 
 const WIDTH: usize = 1920;
 const HEIGHT: usize = 1080;
@@ -114,6 +115,12 @@ fn av1_simd_speedup_on_a_representative_frame() {
     let mut dct64 = Vec::new();
     let mut adst8 = Vec::new();
     let mut adst16 = Vec::new();
+    let mut fdct4 = Vec::new();
+    let mut fdct8 = Vec::new();
+    let mut fdct16 = Vec::new();
+    let mut fdct32 = Vec::new();
+    let mut fadst8 = Vec::new();
+    let mut fadst16 = Vec::new();
 
     for isa in isas {
         set_active_isa(Some(isa));
@@ -222,6 +229,33 @@ fn av1_simd_speedup_on_a_representative_frame() {
                 }),
             ));
         }
+
+        // The encoder-side forward transforms (issue #140), over the same
+        // block counts as the inverse sweep above.
+        for (slot, size, tx_type) in [
+            (&mut fdct4, 4usize, Av1TxType::DctDct),
+            (&mut fdct8, 8, Av1TxType::DctDct),
+            (&mut fdct16, 16, Av1TxType::DctDct),
+            (&mut fdct32, 32, Av1TxType::DctDct),
+            (&mut fadst8, 8, Av1TxType::AdstAdst),
+            (&mut fadst16, 16, Av1TxType::FlipadstAdst),
+        ] {
+            let residual: Vec<i32> = (0..size * size)
+                .map(|index| (index as i32 * 53) % 511 - 255)
+                .collect();
+            let blocks = (WIDTH / size) * (HEIGHT / size);
+            slot.push((
+                isa,
+                measure(|| {
+                    let mut checksum = 0i64;
+                    for _ in 0..blocks {
+                        let coefficients = forward_transform(&residual, size, tx_type);
+                        checksum += i64::from(coefficients[0]);
+                    }
+                    assert_ne!(checksum, i64::MIN);
+                }),
+            ));
+        }
     }
     set_active_isa(None);
 
@@ -242,4 +276,10 @@ fn av1_simd_speedup_on_a_representative_frame() {
     report("inverse dct 64x64 (frame)", &dct64);
     report("inverse adst 8x8 (frame)", &adst8);
     report("flip-adst 16x16 (frame)", &adst16);
+    report("forward dct 4x4 (frame)", &fdct4);
+    report("forward dct 8x8 (frame)", &fdct8);
+    report("forward dct 16x16 (frame)", &fdct16);
+    report("forward dct 32x32 (frame)", &fdct32);
+    report("forward adst 8x8 (frame)", &fadst8);
+    report("fwd flip-adst 16x16 (frame)", &fadst16);
 }

@@ -263,6 +263,34 @@ simd_entry_points! {
     ) -> bool = transforms::inverse_transform64, avx2 = Sse4;
 }
 simd_entry_points! {
+    #[allow(clippy::fn_params_excessive_bools)]
+    fn [fwd4_sse41, fwd4_avx2, fwd4_neon](
+        residual: &[i32], column: Tx1d, row: Tx1d,
+        lr_flip: bool, ud_flip: bool, out: &mut [i32]
+    ) -> bool = transforms::forward_transform4, avx2 = Sse4;
+}
+simd_entry_points! {
+    #[allow(clippy::fn_params_excessive_bools)]
+    fn [fwd8_sse41, fwd8_avx2, fwd8_neon](
+        residual: &[i32], column: Tx1d, row: Tx1d,
+        lr_flip: bool, ud_flip: bool, out: &mut [i32]
+    ) -> bool = transforms::forward_transform8, avx2 = Sse4;
+}
+simd_entry_points! {
+    #[allow(clippy::fn_params_excessive_bools)]
+    fn [fwd16_sse41, fwd16_avx2, fwd16_neon](
+        residual: &[i32], column: Tx1d, row: Tx1d,
+        lr_flip: bool, ud_flip: bool, out: &mut [i32]
+    ) -> bool = transforms::forward_transform16, avx2 = Sse4;
+}
+simd_entry_points! {
+    #[allow(clippy::fn_params_excessive_bools)]
+    fn [fwd32_sse41, fwd32_avx2, fwd32_neon](
+        residual: &[i32], column: Tx1d, row: Tx1d,
+        lr_flip: bool, ud_flip: bool, out: &mut [i32]
+    ) -> bool = transforms::forward_transform32, avx2 = Sse4;
+}
+simd_entry_points! {
     #[allow(clippy::too_many_arguments)]
     fn [deblock_h_sse41, deblock_h_avx2, deblock_h_neon](
         data: &mut [u8], geom: filters::Geometry, x0: usize, y: usize, count: usize,
@@ -435,6 +463,83 @@ pub(crate) fn inverse_transform(
         64 => dispatch!(
             isa,
             [tx64_sse41, tx64_avx2, tx64_neon](
+                arguments.0,
+                arguments.1,
+                arguments.2,
+                arguments.3,
+                arguments.4,
+                arguments.5
+            ),
+            false
+        ),
+        _ => false,
+    }
+}
+
+/// Vectorized non-lossless forward transform for one `size x size` block.
+///
+/// The encoder-side counterpart of [`inverse_transform`]: `column` and `row`
+/// are the vertical and horizontal 1-D kernels and `lr_flip`/`ud_flip` the
+/// flipped-ADST reversals, as reported by
+/// [`crate::av1_intra::Av1TxType::kernels`]. Returns `false` (leaving `out`
+/// untouched) when the caller should use the scalar path: an unsupported
+/// size, an instruction set this build cannot reach, or a residual large
+/// enough that a 32-bit lane could overflow.
+#[allow(clippy::fn_params_excessive_bools, clippy::too_many_arguments)]
+pub(crate) fn forward_transform(
+    isa: SimdIsa,
+    residual: &[i32],
+    size: usize,
+    column: Tx1d,
+    row: Tx1d,
+    lr_flip: bool,
+    ud_flip: bool,
+    out: &mut [i32],
+) -> bool {
+    if !transforms::within_limit(residual, crate::av1_encoder::transform::input_limit(size)) {
+        return false;
+    }
+    let arguments = (residual, column, row, lr_flip, ud_flip, out);
+    match size {
+        4 => dispatch!(
+            isa,
+            [fwd4_sse41, fwd4_avx2, fwd4_neon](
+                arguments.0,
+                arguments.1,
+                arguments.2,
+                arguments.3,
+                arguments.4,
+                arguments.5
+            ),
+            false
+        ),
+        8 => dispatch!(
+            isa,
+            [fwd8_sse41, fwd8_avx2, fwd8_neon](
+                arguments.0,
+                arguments.1,
+                arguments.2,
+                arguments.3,
+                arguments.4,
+                arguments.5
+            ),
+            false
+        ),
+        16 => dispatch!(
+            isa,
+            [fwd16_sse41, fwd16_avx2, fwd16_neon](
+                arguments.0,
+                arguments.1,
+                arguments.2,
+                arguments.3,
+                arguments.4,
+                arguments.5
+            ),
+            false
+        ),
+        32 => dispatch!(
+            isa,
+            [fwd32_sse41, fwd32_avx2, fwd32_neon](
                 arguments.0,
                 arguments.1,
                 arguments.2,
