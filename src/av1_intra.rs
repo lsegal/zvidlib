@@ -296,13 +296,12 @@ fn inverse_wht_1d(values: [i64; 4], shift: u32) -> [i64; 4] {
 // equivalent up to rounding convention. AV1's 64-point inverse DCT is
 // specified against a *different* 12-bit `cospi_arr(cos_bit)` contract; this
 // crate keeps the single 14-bit lineage there too, extended to the 1/128
-// angular resolution 64 points need (see `COSPI_ODD_128`). The 2-D inverse
-// identity transform (`IDTX`) is implemented here as a pure pass-through (no
-// additional row/column scaling), a deliberate simplification of the AV1
-// spec's scaled identity transform; the one-axis identity of the
-// half-identity `V_*`/`H_*` types does carry the spec's scale (see
-// `identity_scale`), because there it shares a block with a butterfly pass
-// whose gain it has to match.
+// angular resolution 64 points need (see `COSPI_ODD_128`). The 2-D identity
+// transform (`IDTX`) runs the same scaled identity pass (see
+// `identity_scale`) on both axes and the same `transform_shift` as every
+// other type, so it is on the scale a conforming decoder reconstructs it at
+// and on the scale the one-axis identity of the half-identity `V_*`/`H_*`
+// types already carried.
 #[rustfmt::skip]
 const DC_QLOOKUP: [i32; 256] = [
     4,    8,    8,    9,   10,   11,   12,   12,   13,   14,
@@ -439,8 +438,8 @@ pub enum Tx1d {
 /// would come out two to four times too small. The 4-point entry is exactly
 /// `2 * COSPI_16_64`, the same `sqrt(2)` the butterflies already use.
 ///
-/// The 2-D [`Av1TxType::Idtx`] is unaffected: it keeps its own short path and
-/// stays the unscaled pass-through this crate has always implemented.
+/// [`Av1TxType::Idtx`] is the same pass on both axes: two of these gains and
+/// one [`transform_shift`], exactly as a DCT or ADST pair of its size.
 #[must_use]
 pub(crate) const fn identity_scale(points: usize) -> i64 {
     match points {
@@ -481,15 +480,15 @@ impl Av1TxType {
     /// The vertical kernel, the horizontal kernel, and whether the finished
     /// block is reversed left-to-right and/or top-to-bottom.
     ///
-    /// [`Av1TxType::Idtx`] has no butterfly pass at all and reports the DCT
-    /// pair; [`inverse_transform`] handles it before consulting this. The
-    /// half-identity types report [`Tx1d::Identity`] along the axis the spec
-    /// leaves untransformed.
+    /// [`Av1TxType::Idtx`] has no butterfly pass at all and reports the
+    /// identity along both axes; the half-identity types report
+    /// [`Tx1d::Identity`] along the axis the spec leaves untransformed.
     #[must_use]
     pub fn kernels(self) -> (Tx1d, Tx1d, bool, bool) {
         use Tx1d::{Adst, Dct, Identity};
         match self {
-            Av1TxType::DctDct | Av1TxType::Idtx => (Dct, Dct, false, false),
+            Av1TxType::DctDct => (Dct, Dct, false, false),
+            Av1TxType::Idtx => (Identity, Identity, false, false),
             Av1TxType::AdstDct => (Adst, Dct, false, false),
             Av1TxType::DctAdst => (Dct, Adst, false, false),
             Av1TxType::AdstAdst => (Adst, Adst, false, false),
@@ -1540,15 +1539,6 @@ pub fn inverse_transform(
         let quant = if index == 0 { dc_quant } else { ac_quant };
         *value = i64::from(coefficients[index]) * i64::from(quant);
     }
-    if tx_type == Av1TxType::Idtx {
-        // The 2-D identity is the one type with no butterfly pass and no
-        // output downshift, so it keeps its own short path.
-        return dequantized
-            .into_iter()
-            .map(|value| value.clamp(i64::from(i16::MIN), i64::from(i16::MAX)) as i16)
-            .collect();
-    }
-
     let (mut column, mut row, lr_flip, ud_flip) = tx_type.kernels();
     if size >= 32 {
         // No 32- or 64-point ADST exists; the identity is defined at every
@@ -1780,15 +1770,33 @@ mod tests {
         }
     }
 
+    /// `IDTX` runs the scaled identity on both axes, so a dequantized
+    /// coefficient reaches the output multiplied by `identity_scale(size)`
+    /// twice and divided by `transform_shift(size)` - the same net gain the
+    /// DCT pair of that size carries - and still spreads into no other
+    /// position.
     #[test]
-    fn idtx_dequantizes_without_extra_scaling() {
-        let mut coefficients = [0; 16];
-        coefficients[0] = 5;
-        coefficients[1] = -3;
-        let residuals = inverse_transform(&coefficients, 4, Av1TxType::Idtx, 4, 4);
-        assert_eq!(residuals[0], 20);
-        assert_eq!(residuals[1], -12);
-        assert_eq!(residuals[2..], [0; 14]);
+    fn idtx_applies_the_scaled_identity_on_both_axes() {
+        for size in [4usize, 8, 16, 32] {
+            let mut coefficients = vec![0i32; size * size];
+            coefficients[0] = 5;
+            coefficients[1] = -3;
+            let residuals = inverse_transform(&coefficients, size, Av1TxType::Idtx, 4, 4);
+            let scale = identity_scale(size);
+            let expect = |coefficient: i64| -> i64 {
+                let dequantized = coefficient * 4;
+                let row = dct_round_shift(dequantized * scale);
+                let column = dct_round_shift(row * scale);
+                let shift = transform_shift(size);
+                (column + (1 << (shift - 1))) >> shift
+            };
+            assert_eq!(i64::from(residuals[0]), expect(5), "{size}");
+            assert_eq!(i64::from(residuals[1]), expect(-3), "{size}");
+            assert!(
+                residuals[2..].iter().all(|&value| value == 0),
+                "IDTX spread a coefficient at {size}"
+            );
+        }
     }
 
     #[test]
