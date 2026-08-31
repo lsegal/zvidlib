@@ -389,6 +389,24 @@ fn transform_1d_into(input: &[i64], n_tbs: usize, tr_type: bool, out: &mut [i64]
     }
 }
 
+/// Encoder-side forward DST-VII 1-D over the §8.6.4.2 equation-8-316
+/// basis: `y[ u ] = Σ_x DST4[ u ][ x ] * x[ x ]` — the transpose of the
+/// [`transform_1d`] `trType == 1` analysis, and the counterpart of
+/// [`forward_dct_1d`] for the 4x4 intra luma block the spec codes with
+/// the alternate transform.
+pub(crate) fn forward_dst4_1d(input: &[i64]) -> Vec<i64> {
+    debug_assert_eq!(input.len(), 4);
+    (0..4)
+        .map(|u| {
+            input
+                .iter()
+                .enumerate()
+                .map(|(x, &xv)| DST4[u][x] as i64 * xv)
+                .sum()
+        })
+        .collect()
+}
+
 /// Encoder-side forward DCT-II 1-D over the same §8.6.4.2 basis the
 /// inverse synthesizes from: `y[ u ] = Σ_x DCT32[ u * stride ][ x ] *
 /// x[ x ]` — the transpose of the [`transform_1d`] `trType == 0`
