@@ -142,14 +142,19 @@ pub fn cabac_encode_bins(bins: &[u8], contexts: usize) -> Vec<u8> {
 /// The parameter sets and slice headers of every access unit go through these
 /// fixed-length, `ue(v)` and `se(v)` writers, so measuring them separately
 /// separates raw bitwriting cost from the CABAC engine's.
+///
+/// Each value is reduced into the range the corresponding syntax elements
+/// actually occupy, so the codeword lengths — which are what the writer's cost
+/// scales with — stay representative instead of being dominated by pathological
+/// 32-bit Exp-Golomb codes.
 #[must_use]
 pub fn bitwriter_write_syntax(values: &[u32]) -> Vec<u8> {
     let mut writer = BitWriter::new();
     for (index, &value) in values.iter().enumerate() {
         match index % 3 {
             0 => writer.put_bits(value & 0xffff, 16),
-            1 => writer.ue(value),
-            _ => writer.se(value as i32 - (u32::MAX / 2) as i32),
+            1 => writer.ue(value % 4096),
+            _ => writer.se((value % 2048) as i32 - 1024),
         }
     }
     writer.rbsp_trailing_bits();
@@ -171,4 +176,158 @@ pub fn bitwriter_write_syntax(values: &[u32]) -> Vec<u8> {
 pub fn rgba_to_yuv420_planes(frame: &crate::VideoFrame) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     super::encoder::rgba_to_yuv420(frame, crate::Orientation::TopLeft)
         .expect("benchmark frames are RGBA8")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::simd::{self, SimdIsa, test_lock};
+
+    /// A picture whose dimensions the PCM writer and the mode search accept
+    /// (both require multiples of 16), filled with a moving gradient plus
+    /// low-amplitude noise so no stage sees a degenerate best case.
+    fn picture(width: usize, height: usize, phase: i32) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let mut state = 0x2545_f491_4f6c_dd1d_u64 ^ phase as u64;
+        let mut noise = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 58) as i32
+        };
+        let y = (0..height)
+            .flat_map(|row| (0..width).map(move |col| (col, row)))
+            .map(|(col, row)| (((col as i32 + row as i32 + phase) / 2 + noise()) & 0xff) as u8)
+            .collect();
+        let chroma = |offset: i32| {
+            (0..height / 2)
+                .flat_map(|row| (0..width / 2).map(move |col| (col, row)))
+                .map(|(col, row)| {
+                    (128 + ((col as i32 - row as i32 + phase + offset) % 24) - 12) as u8
+                })
+                .collect::<Vec<u8>>()
+        };
+        (y, chroma(0), chroma(7))
+    }
+
+    /// The guard the benchmark's `bench_across_isas` relies on: every wrapper
+    /// must return the same bytes under every instruction set the host can run.
+    ///
+    /// The encoder's only SIMD dispatch family is the mode search's distortion
+    /// metrics, so this is where a divergence would surface as a *different mode
+    /// decision* rather than a different picture — which a bit-exactness check
+    /// on decoded pixels would never see.
+    #[test]
+    fn every_stage_wrapper_is_bit_exact_across_instruction_sets() {
+        let _guard = test_lock();
+        let (y, cb, cr) = picture(64, 32, 0);
+        let (reference, _, _) = picture(64, 32, 3);
+        let bins: Vec<u8> = (0..2048)
+            .map(|i| ((i * 2_654_435_761u64) >> 13) as u8)
+            .collect();
+        let values: Vec<u32> = (0..1024)
+            .map(|i: u32| i.wrapping_mul(2_654_435_761))
+            .collect();
+
+        simd::set_override(Some(SimdIsa::Scalar));
+        let expected = (
+            rdo_decide_picture(&y, 64, 64, 32, None, 26, 4),
+            rdo_decide_picture(&y, 64, 64, 32, Some(&reference), 26, 4),
+            write_idr_pcm_access_unit(&y, &cb, &cr, 64, 32),
+            cabac_encode_bins(&bins, 64),
+            bitwriter_write_syntax(&values),
+        );
+        for isa in simd::available() {
+            simd::set_override(Some(isa));
+            let name = isa.name();
+            assert_eq!(
+                rdo_decide_picture(&y, 64, 64, 32, None, 26, 4),
+                expected.0,
+                "{name}: intra mode search diverged from scalar"
+            );
+            assert_eq!(
+                rdo_decide_picture(&y, 64, 64, 32, Some(&reference), 26, 4),
+                expected.1,
+                "{name}: inter mode search diverged from scalar"
+            );
+            assert_eq!(
+                write_idr_pcm_access_unit(&y, &cb, &cr, 64, 32),
+                expected.2,
+                "{name}: the written access unit diverged from scalar"
+            );
+            assert_eq!(
+                cabac_encode_bins(&bins, 64),
+                expected.3,
+                "{name}: the CABAC codeword diverged from scalar"
+            );
+            assert_eq!(
+                bitwriter_write_syntax(&values),
+                expected.4,
+                "{name}: the written syntax elements diverged from scalar"
+            );
+        }
+        simd::set_override(None);
+    }
+
+    /// The bit-exactness guard above is only meaningful if the bytes each
+    /// wrapper returns actually depend on its input. A wrapper that returned a
+    /// constant would pass every comparison in the benchmark harness while
+    /// measuring nothing, so pin that each one is input-sensitive.
+    #[test]
+    fn every_stage_wrapper_returns_bytes_that_depend_on_its_input() {
+        let _guard = test_lock();
+        simd::set_override(None);
+        let (y, cb, cr) = picture(64, 32, 0);
+        let (other, other_cb, other_cr) = picture(64, 32, 11);
+
+        assert_ne!(
+            rdo_decide_picture(&y, 64, 64, 32, None, 26, 4),
+            rdo_decide_picture(&other, 64, 64, 32, None, 26, 4),
+            "the serialized mode-search decisions ignore the picture"
+        );
+        assert_ne!(
+            rdo_decide_picture(&y, 64, 64, 32, None, 26, 4),
+            rdo_decide_picture(&y, 64, 64, 32, Some(&other), 26, 4),
+            "the serialized mode-search decisions ignore the reference picture"
+        );
+        assert_ne!(
+            write_idr_pcm_access_unit(&y, &cb, &cr, 64, 32),
+            write_idr_pcm_access_unit(&other, &other_cb, &other_cr, 64, 32),
+            "the written access unit ignores the picture"
+        );
+        assert_ne!(
+            cabac_encode_bins(&[1, 0, 1, 1, 0, 0, 1, 0], 4),
+            cabac_encode_bins(&[0, 1, 0, 0, 1, 1, 0, 1], 4),
+            "the CABAC codeword ignores the bins"
+        );
+        assert_ne!(
+            bitwriter_write_syntax(&[1, 2, 3, 4]),
+            bitwriter_write_syntax(&[9, 8, 7, 6]),
+            "the written syntax elements ignore their values"
+        );
+    }
+
+    /// The RGBA8 conversion wrapper produces the plane sizes the later stages
+    /// index into, so a benchmark cannot silently feed them a short buffer.
+    #[test]
+    fn the_rgba_conversion_wrapper_produces_correctly_sized_yuv420_planes() {
+        let limits = crate::Limits::default();
+        let dimensions = crate::VideoDimensions::new(64, 32, &limits).unwrap();
+        let frame = crate::VideoFrame::new(
+            dimensions,
+            crate::PixelFormat::Rgba8,
+            crate::ColorRange::Limited,
+            vec![crate::Plane {
+                data: (0..64 * 32 * 4).map(|i| (i % 251) as u8).collect(),
+                stride: 64 * 4,
+            }],
+            &limits,
+        )
+        .unwrap();
+        let (y, cb, cr) = rgba_to_yuv420_planes(&frame);
+        assert_eq!(y.len(), 64 * 32);
+        assert_eq!(cb.len(), 64 * 32 / 4);
+        assert_eq!(cr.len(), 64 * 32 / 4);
+        // Limited-range luma stays inside the spec's 16..=235 window.
+        assert!(y.iter().all(|&sample| (16..=235).contains(&sample)));
+    }
 }
