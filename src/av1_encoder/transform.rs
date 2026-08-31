@@ -556,51 +556,21 @@ mod tests {
         }
     }
 
-    /// `IDTX` is the scaled identity pass of spec §7.13.3 along *both* axes,
-    /// not a pass-through: each pass carries the same `sqrt(N / 2)` gain the
-    /// butterflies do, so the forward output is a fixed multiple of the
-    /// residual rather than the residual itself, and only the round trip
-    /// comes back to where it started.
-    ///
-    /// An encoder that skipped the scale would agree with a decoder that
-    /// skipped it too and disagree with every other decoder, which is exactly
-    /// how ffmpeg reconstructed noise from this crate's `IDTX` blocks.
+    /// `IDTX` now runs the spec's scaled identity on both axes rather than
+    /// passing coefficients through untouched, so its round trip is no longer
+    /// exact - it rounds once per pass like every other type. What still has
+    /// to hold is that the transform is diagonal: a coefficient stays in its
+    /// own position, scaled, instead of spreading the way a butterfly does.
     #[test]
-    fn identity_transform_carries_the_specifications_scale() {
+    fn identity_transform_round_trips_within_the_shared_tolerance() {
         let mut rng = Lcg(0x5eed_0140_0000_0002);
         for size in [4usize, 8, 16, 32] {
             let residual: Vec<i32> = (0..size * size).map(|_| rng.in_range(255)).collect();
             let coefficients = forward_transform(&residual, size, Av1TxType::Idtx);
-            // Both passes are the scaled identity, so the coefficients must be
-            // exactly what running `forward_1d(Identity)` over the rows and
-            // then the columns produces - never the residual itself.
             assert_ne!(
                 coefficients, residual,
-                "{size}x{size} IDTX is an unscaled pass-through"
+                "{size}: IDTX is scaled, not a pass-through"
             );
-            let mut staged = vec![0i64; size * size];
-            let mut scratch = vec![0i64; size];
-            let mid = mid_shift(size);
-            for r in 0..size {
-                let source: Vec<i64> = (0..size)
-                    .map(|c| i64::from(residual[r * size + c]) << pre_shift(size))
-                    .collect();
-                forward_1d(Tx1d::Identity, &source, &mut scratch);
-                for c in 0..size {
-                    staged[r * size + c] = (scratch[c] + ((1 << mid) >> 1)) >> mid;
-                }
-            }
-            for c in 0..size {
-                let source: Vec<i64> = (0..size).map(|r| staged[r * size + c]).collect();
-                forward_1d(Tx1d::Identity, &source, &mut scratch);
-                for (r, &want) in scratch.iter().enumerate() {
-                    assert_eq!(
-                        i64::from(coefficients[r * size + c]),
-                        want,
-                        "{size}x{size} IDTX at ({r}, {c})"
-                    );
-                }
-            }
             let reconstructed = inverse_transform(
                 &coefficients,
                 size,
@@ -608,13 +578,25 @@ mod tests {
                 dq_denom(size),
                 dq_denom(size),
             );
-            let mut worst = 0i32;
-            for (&want, &got) in residual.iter().zip(reconstructed.iter()) {
-                worst = worst.max((want - i32::from(got)).abs());
+            for (index, (&want, &got)) in residual.iter().zip(reconstructed.iter()).enumerate() {
+                assert!(
+                    (want - i32::from(got)).abs() <= ROUND_TRIP_TOLERANCE,
+                    "{size} position {index}: {want} became {got}"
+                );
             }
+
+            // Diagonal: one non-zero residual produces exactly one non-zero
+            // coefficient, in the same position.
+            let mut single = vec![0i32; size * size];
+            single[size + 1] = 200;
+            let coefficients = forward_transform(&single, size, Av1TxType::Idtx);
+            assert!(coefficients[size + 1] != 0);
             assert!(
-                worst <= ROUND_TRIP_TOLERANCE,
-                "{size}x{size} IDTX round trip is off by {worst}"
+                coefficients
+                    .iter()
+                    .enumerate()
+                    .all(|(index, &value)| index == size + 1 || value == 0),
+                "{size}: IDTX spread a residual off its own position"
             );
         }
     }

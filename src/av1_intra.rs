@@ -296,13 +296,12 @@ fn inverse_wht_1d(values: [i64; 4], shift: u32) -> [i64; 4] {
 // equivalent up to rounding convention. AV1's 64-point inverse DCT is
 // specified against a *different* 12-bit `cospi_arr(cos_bit)` contract; this
 // crate keeps the single 14-bit lineage there too, extended to the 1/128
-// angular resolution 64 points need (see `COSPI_ODD_128`). The 2-D inverse
-// identity transform (`IDTX`) is implemented here as a pure pass-through (no
-// additional row/column scaling), a deliberate simplification of the AV1
-// spec's scaled identity transform; the one-axis identity of the
-// half-identity `V_*`/`H_*` types does carry the spec's scale (see
-// `identity_scale`), because there it shares a block with a butterfly pass
-// whose gain it has to match.
+// angular resolution 64 points need (see `COSPI_ODD_128`). The 2-D identity
+// transform (`IDTX`) runs the same scaled identity pass (see
+// `identity_scale`) on both axes and the same `transform_shift` as every
+// other type, so it is on the scale a conforming decoder reconstructs it at
+// and on the scale the one-axis identity of the half-identity `V_*`/`H_*`
+// types already carried.
 #[rustfmt::skip]
 const DC_QLOOKUP: [i32; 256] = [
     4,    8,    8,    9,   10,   11,   12,   12,   13,   14,
@@ -439,8 +438,8 @@ pub enum Tx1d {
 /// would come out two to four times too small. The 4-point entry is exactly
 /// `2 * COSPI_16_64`, the same `sqrt(2)` the butterflies already use.
 ///
-/// The 2-D [`Av1TxType::Idtx`] is exactly an identity pass along each axis, so it carries this
-/// scale twice; it is not the unscaled pass-through it may look like.
+/// [`Av1TxType::Idtx`] is the same pass on both axes: two of these gains and
+/// one [`transform_shift`], exactly as a DCT or ADST pair of its size.
 #[must_use]
 pub(crate) const fn identity_scale(points: usize) -> i64 {
     match points {
@@ -481,10 +480,9 @@ impl Av1TxType {
     /// The vertical kernel, the horizontal kernel, and whether the finished
     /// block is reversed left-to-right and/or top-to-bottom.
     ///
-    /// [`Av1TxType::Idtx`] is the identity along *both* axes (spec §7.13.3
-    /// runs the scaled identity pass in each direction, not a pass-through);
-    /// the half-identity types report [`Tx1d::Identity`] along the one axis
-    /// the spec leaves untransformed.
+    /// [`Av1TxType::Idtx`] has no butterfly pass at all and reports the
+    /// identity along both axes; the half-identity types report
+    /// [`Tx1d::Identity`] along the axis the spec leaves untransformed.
     #[must_use]
     pub fn kernels(self) -> (Tx1d, Tx1d, bool, bool) {
         use Tx1d::{Adst, Dct, Identity};
@@ -1503,6 +1501,18 @@ pub(crate) fn inverse_transform_1d(kind: Tx1d, values: &[i64]) -> Vec<i64> {
     }
 }
 
+/// `Dq_Denom[txSz]` (spec §7.12.3): the divisor the reconstruction applies to every dequantized
+/// coefficient, which keeps the larger transforms' intermediate magnitudes in range. It is `1`
+/// for `TX_4X4` through `TX_16X16`, `2` for `TX_32X32`, and `4` for `TX_64X64`.
+#[must_use]
+pub fn dq_denom(size: usize) -> i32 {
+    match size {
+        0..=16 => 1,
+        32 => 2,
+        _ => 4,
+    }
+}
+
 /// Downshift applied to the column pass output for a `size x size` block.
 ///
 /// The 64-point size keeps the 32-point shift: both 1-D passes have unit
@@ -1515,18 +1525,6 @@ pub(crate) fn transform_shift(size: usize) -> u32 {
         4 => 4,
         8 => 5,
         _ => 6,
-    }
-}
-
-/// `Dq_Denom[txSz]` (spec §7.12.3): the divisor the reconstruction applies to every dequantized
-/// coefficient, which keeps the larger transforms' intermediate magnitudes in range. It is `1`
-/// for `TX_4X4` through `TX_16X16`, `2` for `TX_32X32`, and `4` for `TX_64X64`.
-#[must_use]
-pub fn dq_denom(size: usize) -> i32 {
-    match size {
-        0..=16 => 1,
-        32 => 2,
-        _ => 4,
     }
 }
 
@@ -1787,25 +1785,34 @@ mod tests {
         }
     }
 
-    /// Spec §7.13.3 runs the *scaled* identity pass along each axis for
-    /// `IDTX`, exactly as it does for a half-identity type; the block is then
-    /// downshifted by [`transform_shift`] like every other transform. This
-    /// crate used to return the dequantized coefficients unchanged, which
-    /// agrees with a decoder that makes the same mistake and with no other:
-    /// ffmpeg reconstructed noise from every `IDTX` block this encoder wrote.
-    ///
-    /// A dequantized 20 therefore becomes 3, not 20: two `identity_scale(4)`
-    /// passes multiply by `sqrt(2)` each and `transform_shift(4)` divides by
-    /// 16. The position is still the identity's - only the scale changed.
+    /// `IDTX` runs the scaled identity on both axes, so a dequantized
+    /// coefficient reaches the output multiplied by `identity_scale(size)`
+    /// twice and divided by `transform_shift(size)` - the same net gain the
+    /// DCT pair of that size carries - and still spreads into no other
+    /// position.
     #[test]
-    fn idtx_carries_the_identity_scale_on_both_axes() {
-        let mut coefficients = [0; 16];
-        coefficients[0] = 5;
-        coefficients[1] = -3;
-        let residuals = inverse_transform(&coefficients, 4, Av1TxType::Idtx, 4, 4);
-        assert_eq!(residuals[0], 3);
-        assert_eq!(residuals[1], -1);
-        assert_eq!(residuals[2..], [0; 14]);
+    fn idtx_applies_the_scaled_identity_on_both_axes() {
+        for size in [4usize, 8, 16, 32] {
+            let mut coefficients = vec![0i32; size * size];
+            coefficients[0] = 5;
+            coefficients[1] = -3;
+            let residuals = inverse_transform(&coefficients, size, Av1TxType::Idtx, 4, 4);
+            let scale = identity_scale(size);
+            let expect = |coefficient: i64| -> i64 {
+                // §7.12.3 divides the dequantized coefficient by `Dq_Denom[txSz]`.
+                let dequantized = coefficient * 4 / i64::from(dq_denom(size));
+                let row = dct_round_shift(dequantized * scale);
+                let column = dct_round_shift(row * scale);
+                let shift = transform_shift(size);
+                (column + (1 << (shift - 1))) >> shift
+            };
+            assert_eq!(i64::from(residuals[0]), expect(5), "{size}");
+            assert_eq!(i64::from(residuals[1]), expect(-3), "{size}");
+            assert!(
+                residuals[2..].iter().all(|&value| value == 0),
+                "IDTX spread a coefficient at {size}"
+            );
+        }
     }
 
     #[test]

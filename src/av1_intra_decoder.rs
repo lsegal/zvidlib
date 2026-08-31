@@ -1508,6 +1508,58 @@ mod tests {
         }
     }
 
+    /// An `IDTX` stream must reconstruct at the spec's scaled-identity
+    /// magnitude, not at the raw dequantized one this crate used to emit.
+    ///
+    /// The expected block is derived here from `identity_scale` and
+    /// `transform_shift` directly rather than by calling `inverse_transform`,
+    /// so a regression that reverted both the kernel and its caller would
+    /// still fail this. The fixture is the one above: block (0,0) predicts a
+    /// flat 128 and the tile codes a single DC coefficient at level -14, so
+    /// only that block's first sample carries the transform's output.
+    #[test]
+    fn an_idtx_stream_reconstructs_at_the_scaled_identity_magnitude() {
+        let limits = Limits::default();
+        let stream = non_lossless_key_frame_temporal_unit(
+            40,
+            Some((0, 0, 0, 0, 0)),
+            true,
+            cdf::Av1TxSet::Intra2,
+            0, // TX_SET_INTRA_2 symbol 0 is IDTX.
+        );
+        let frame = decode_av1_lossless_intra(&stream, &limits).unwrap();
+
+        let scale = crate::av1_intra::identity_scale(8);
+        let shift = crate::av1_intra::transform_shift(8);
+        let dequantized = -14i64 * i64::from(get_dc_quant(40));
+        let row = (dequantized * scale + (1 << 13)) >> 14;
+        let column = (row * scale + (1 << 13)) >> 14;
+        let residual = (column + (1 << (shift - 1))) >> shift;
+        // The old unscaled pass-through would have reconstructed the
+        // dequantized coefficient itself.
+        assert_ne!(residual, dequantized);
+
+        let stride = frame.planes[0].stride;
+        assert_eq!(
+            i32::from(frame.planes[0].data[0]),
+            (128 + residual as i32).clamp(0, 255)
+        );
+        // The identity spreads nothing, so the rest of the block is the
+        // prediction alone.
+        for row_index in 0..8 {
+            for column_index in 0..8 {
+                if (row_index, column_index) == (0, 0) {
+                    continue;
+                }
+                assert_eq!(
+                    frame.planes[0].data[row_index * stride + column_index],
+                    128,
+                    "IDTX spread its DC coefficient to ({row_index}, {column_index})"
+                );
+            }
+        }
+    }
+
     #[test]
     fn non_lossless_stream_decodes_with_an_8x8_transform_and_nonzero_dc() {
         let limits = Limits::default();
