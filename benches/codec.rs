@@ -19,6 +19,8 @@ use zvidlib::{
     VideoDecoderFactory, decode_av1_lossless_intra, native_hevc_video_decoder_factory,
 };
 
+use zvidlib::simd;
+
 use support::isa::{IsaWorkload, bench_across_isas};
 use support::{FrameWork, group_name, report_throughput};
 
@@ -31,6 +33,29 @@ const LARGE_GROUP_ENV: &str = "ZVIDLIB_BENCH_LARGE";
 
 /// The number of 1080p frames the long-running group decodes per iteration.
 const LARGE_GROUP_FRAMES: u64 = 4;
+
+/// Logs what this host can actually execute, before anything is timed.
+///
+/// The per-ISA groups run one arm per entry in [`simd::available`], so a runner
+/// without AVX2 simply has no `avx2` arm rather than reporting scalar numbers
+/// under a vector label. That is the right behaviour, but it is invisible in a
+/// results table: `av1_deblock/avx2` being absent and `av1_deblock/avx2` being
+/// slow look the same from the outside. CI captures this line so a baseline is
+/// attributable to a host, and so a run whose vector arms vanished because the
+/// runner pool changed is diagnosable rather than mysterious.
+///
+/// [`simd::active_by_site`] is logged alongside it because "this host supports
+/// AVX2" and "every dispatch family agrees to use it" are separate claims; the
+/// per-ISA groups assert the second one, and this prints its starting state.
+fn host_isas(_criterion: &mut Criterion) {
+    let available = simd::available();
+    let names: Vec<&str> = available.iter().map(|isa| isa.name()).collect();
+    println!("# host instruction sets: {}", names.join(", "));
+    println!("# widest detected instruction set: {}", simd::active().name());
+    for (site, isa) in simd::active_by_site() {
+        println!("# dispatch site {site}: {}", isa.name());
+    }
+}
 
 /// Smoke benchmark: end-to-end proof that fixture loading, decoding, and
 /// throughput reporting all work.
@@ -294,6 +319,7 @@ fn hevc_decode_by_isa(criterion: &mut Criterion) {
 
 criterion_group!(
     benches,
+    host_isas,
     smoke,
     av1_decode,
     encoder_input,
