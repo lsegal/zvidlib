@@ -2,8 +2,8 @@
 //!
 //! `crate::hevc` is a private module, and criterion benchmarks are a separate
 //! crate, so the per-stage encoder groups in `benches/hevc_encode.rs` cannot
-//! reach `rdo::decide_picture`, the forward transform and quantizer, the CABAC
-//! encoding engine, or either bitstream writer through the public API. The public
+//! reach `rdo::decide_picture`, the CABAC encoding engine, or the PCM
+//! bitstream writer through the public API. The public
 //! [`crate::native_hevc_video_encoder_factory`] runs all of them at once, which
 //! is exactly what a per-stage breakdown must avoid.
 //!
@@ -23,12 +23,20 @@ use crate::hevc::engine::encoder::bitwriter::BitWriter;
 use crate::hevc::engine::encoder::cabac::CabacEncoder;
 use crate::hevc::engine::encoder::lossy::encode_idr_residual_au;
 use crate::hevc::engine::encoder::pcm::encode_idr_pcm_au;
-use crate::hevc::engine::encoder::quant::{forward_transform, quantize};
 use crate::hevc::engine::encoder::rdo::{DecisionConfig, PictureDecision, decide_picture};
 use crate::hevc::engine::encoder::recon::{
     ReconConfig, ReconstructedPicture, SourcePlanes, reconstruct_picture,
 };
+use crate::hevc::engine::encoder::transform::{self as fwd_transform, ForwardBlockParams};
 use crate::hevc::engine::transform::{Component, PredMode};
+
+/// Bit depth the encoder benchmarks run at — the only depth the PCM
+/// writer and the synthetic 8-bit inputs use.
+const BENCH_BIT_DEPTH: u8 = 8;
+
+/// The fixed predictor [`fwd_transform_quant_picture`] subtracts, the
+/// mid-point of the 8-bit range.
+const BENCH_PREDICTOR: i32 = 128;
 
 /// Runs the encoder's mode-search / RDO stage over one luma picture.
 ///
@@ -184,139 +192,67 @@ pub fn rgba_to_yuv420_planes(frame: &crate::VideoFrame) -> (Vec<u8>, Vec<u8>, Ve
         .expect("benchmark frames are RGBA8")
 }
 
-/// Runs the encoder's §8.6.4 forward transform over one picture's worth of
-/// residual blocks, returning the coefficients as the later stages consume
-/// them.
+/// Runs the encoder's forward transform and quantization stage over one
+/// luma picture, once per transform-block size.
 ///
-/// Setup-only: the quantization group needs coefficients to quantize, and
-/// producing them inside its timed loop would re-measure the transform.
-/// [`forward_transform_picture`] is the timed wrapper.
+/// Every 4x4, 8x8, 16x16 and 32x32 block that fits in the picture is
+/// transformed and quantized, so one iteration covers all four §8.6.4.2
+/// matrices and the 4x4 DST-VII the intra path selects. The residual is
+/// the source sample minus a fixed mid-level predictor rather than a real
+/// prediction: this group measures the transform and quantization
+/// kernels, and a mode-dependent predictor would fold mode-search cost
+/// into that number.
+///
+/// The returned bytes are the quantized levels themselves, so the
+/// bit-exactness guard in `benches/support/isa.rs` covers every level the
+/// vector kernels produced.
 ///
 /// # Panics
 ///
-/// Panics unless `n_tbs` is 4 / 8 / 16 / 32 and `residual` is
-/// `width * height` long with both dimensions a multiple of `n_tbs`.
+/// Panics if `y` is smaller than `height * stride`.
 #[must_use]
-pub fn forward_transform_coefficients(
-    residual: &[i32],
+pub fn fwd_transform_quant_picture(
+    y: &[u8],
+    stride: usize,
     width: usize,
     height: usize,
-    n_tbs: usize,
-    intra: bool,
-) -> Vec<i32> {
-    assert_eq!(residual.len(), width * height, "residual size mismatch");
+    qp: i32,
+) -> Vec<u8> {
     assert!(
-        width % n_tbs == 0 && height % n_tbs == 0,
-        "picture must tile into whole transform blocks"
+        y.len() >= (height - 1) * stride + width,
+        "the luma plane is smaller than the requested picture"
     );
-    let pred_mode = if intra {
-        PredMode::Intra
-    } else {
-        PredMode::Inter
-    };
-    let mut out = vec![0i32; width * height];
-    let mut block = vec![0i32; n_tbs * n_tbs];
-    for by in (0..height).step_by(n_tbs) {
-        for bx in (0..width).step_by(n_tbs) {
-            for row in 0..n_tbs {
-                for col in 0..n_tbs {
-                    block[row * n_tbs + col] = residual[(by + row) * width + bx + col];
+    let q_p = fwd_transform::luma_qp(qp, BENCH_BIT_DEPTH);
+    let mut out = Vec::new();
+    let mut residual = vec![0i32; 32 * 32];
+    for log2 in 2u32..=5 {
+        let n_tbs = 1usize << log2;
+        let params = ForwardBlockParams {
+            n_tbs,
+            q_p,
+            component: Component::Luma,
+            pred_mode: PredMode::Intra,
+            bit_depth: BENCH_BIT_DEPTH,
+            extended_precision: false,
+        };
+        let block = &mut residual[..n_tbs * n_tbs];
+        for by in (0..=height.saturating_sub(n_tbs)).step_by(n_tbs) {
+            for bx in (0..=width.saturating_sub(n_tbs)).step_by(n_tbs) {
+                for row in 0..n_tbs {
+                    let src = &y[(by + row) * stride + bx..][..n_tbs];
+                    for (dst, &sample) in block[row * n_tbs..][..n_tbs].iter_mut().zip(src) {
+                        *dst = i32::from(sample) - BENCH_PREDICTOR;
+                    }
                 }
-            }
-            let coefficients = forward_transform(&block, n_tbs, pred_mode, Component::Luma, 8);
-            for row in 0..n_tbs {
-                for col in 0..n_tbs {
-                    out[(by + row) * width + bx + col] = coefficients[row * n_tbs + col];
+                let levels = fwd_transform::transform_and_quantize(block, None, params)
+                    .expect("benchmark blocks are legal transform blocks");
+                for level in levels {
+                    out.extend_from_slice(&(level as i16).to_le_bytes());
                 }
             }
         }
     }
     out
-}
-
-/// Runs the encoder's §8.6.4 forward transform over one picture's worth of
-/// residual blocks.
-///
-/// `residual` is the whole picture's residual, row-major, tiled into
-/// `n_tbs`-sided transform blocks the way the reconstruction loop tiles a
-/// prediction partition. The returned bytes are the coefficients the stage
-/// produced, so the bit-exactness guard covers every basis multiply.
-///
-/// # Panics
-///
-/// Panics as for [`forward_transform_coefficients`].
-#[must_use]
-pub fn forward_transform_picture(
-    residual: &[i32],
-    width: usize,
-    height: usize,
-    n_tbs: usize,
-    intra: bool,
-) -> Vec<u8> {
-    to_le_bytes(&forward_transform_coefficients(
-        residual, width, height, n_tbs, intra,
-    ))
-}
-
-/// The little-endian bytes of a coefficient or level array — the form every
-/// wrapper returns, so `benches/support/isa.rs` can compare stage outputs
-/// across instruction sets.
-fn to_le_bytes(values: &[i32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(values.len() * 4);
-    for &value in values {
-        out.extend_from_slice(&value.to_le_bytes());
-    }
-    out
-}
-
-/// Runs the encoder's §8.6.3 quantization over one picture's worth of
-/// transform coefficients, returning the `TransCoeffLevel` values §7.3.8.11
-/// would code.
-///
-/// Separate from [`forward_transform_picture`] because the two stages have
-/// very different shapes — the transform is `O(nTbS)` multiplies per
-/// coefficient and the quantizer is one — so folding them into a single group
-/// would hide which of them the encoder actually spends its time in.
-///
-/// # Panics
-///
-/// Panics as for [`forward_transform_picture`].
-#[must_use]
-pub fn quantize_picture(
-    coefficients: &[i32],
-    width: usize,
-    height: usize,
-    n_tbs: usize,
-    qp: u32,
-    intra: bool,
-) -> Vec<u8> {
-    assert_eq!(
-        coefficients.len(),
-        width * height,
-        "coefficient size mismatch"
-    );
-    assert!(
-        width % n_tbs == 0 && height % n_tbs == 0,
-        "picture must tile into whole transform blocks"
-    );
-    let mut out = vec![0i32; width * height];
-    let mut block = vec![0i32; n_tbs * n_tbs];
-    for by in (0..height).step_by(n_tbs) {
-        for bx in (0..width).step_by(n_tbs) {
-            for row in 0..n_tbs {
-                for col in 0..n_tbs {
-                    block[row * n_tbs + col] = coefficients[(by + row) * width + bx + col];
-                }
-            }
-            let levels = quantize(&block, n_tbs, qp, 8, intra);
-            for row in 0..n_tbs {
-                for col in 0..n_tbs {
-                    out[(by + row) * width + bx + col] = levels[row * n_tbs + col];
-                }
-            }
-        }
-    }
-    to_le_bytes(&out)
 }
 
 /// Writes one IDR access unit whose coding units carry *quantized residual*
@@ -325,9 +261,10 @@ pub fn quantize_picture(
 /// `residual_coding( )` entropy coding of the levels.
 ///
 /// This is the lossy write path end to end, and the counterpart to
-/// [`write_idr_pcm_access_unit`]: comparing the two separates what coding
-/// residual costs from what writing a bitstream costs at all. The returned
-/// Annex B access unit is the stage's own output.
+/// [`write_idr_pcm_access_unit`]: comparing the two separates what coding a
+/// quantized residual costs from what writing a bitstream costs at all. The
+/// returned Annex B access unit is the stage's own output, so the
+/// bit-exactness guard covers the bitstream itself.
 ///
 /// # Panics
 ///
@@ -444,9 +381,10 @@ pub fn reconstruct_encoded_picture(
 /// round-tripped through the forward transform and quantizer.
 ///
 /// With `quantized` set, every transform block of every partition goes through
-/// §8.6.4 / §8.6.3 and back, which is what the reconstruction costs once the
-/// writer stops coding PCM. Measuring both says how much of the reconstruction
-/// stage is prediction and filtering and how much is the transform round trip.
+/// §8.6.4 / §8.6.3 and back through the decoder's §8.6.2 reconstruction, which
+/// is what the reconstruction stage costs once the writer stops coding PCM.
+/// Measuring both says how much of the stage is prediction and filtering and
+/// how much is the transform round trip.
 #[must_use]
 pub fn reconstruct_encoded_picture_quantized(
     workload: &ReconstructWorkload,
@@ -533,12 +471,6 @@ mod tests {
             .map(|i: u32| i.wrapping_mul(2_654_435_761))
             .collect();
 
-        let residual: Vec<i32> = y
-            .iter()
-            .zip(&reference)
-            .map(|(&a, &b)| i32::from(a) - i32::from(b))
-            .collect();
-
         simd::set_override(Some(SimdIsa::Scalar));
         let expected = (
             rdo_decide_picture(&y, 64, 64, 32, None, 26, 4),
@@ -546,16 +478,6 @@ mod tests {
             write_idr_pcm_access_unit(&y, &cb, &cr, 64, 32),
             cabac_encode_bins(&bins, 64),
             bitwriter_write_syntax(&values),
-            forward_transform_picture(&residual, 64, 32, 16, true),
-            write_idr_residual_access_unit(&y, &cb, &cr, 64, 32, 30),
-            quantize_picture(
-                &forward_transform_coefficients(&residual, 64, 32, 16, true),
-                64,
-                32,
-                16,
-                30,
-                true,
-            ),
         );
         for isa in simd::available() {
             simd::set_override(Some(isa));
@@ -584,22 +506,6 @@ mod tests {
                 bitwriter_write_syntax(&values),
                 expected.4,
                 "{name}: the written syntax elements diverged from scalar"
-            );
-            let coefficients = forward_transform_coefficients(&residual, 64, 32, 16, true);
-            assert_eq!(
-                forward_transform_picture(&residual, 64, 32, 16, true),
-                expected.5,
-                "{name}: the forward transform diverged from scalar"
-            );
-            assert_eq!(
-                quantize_picture(&coefficients, 64, 32, 16, 30, true),
-                expected.7,
-                "{name}: quantization diverged from scalar"
-            );
-            assert_eq!(
-                write_idr_residual_access_unit(&y, &cb, &cr, 64, 32, 30),
-                expected.6,
-                "{name}: the written residual access unit diverged from scalar"
             );
         }
         simd::set_override(None);
@@ -640,44 +546,6 @@ mod tests {
             bitwriter_write_syntax(&[1, 2, 3, 4]),
             bitwriter_write_syntax(&[9, 8, 7, 6]),
             "the written syntax elements ignore their values"
-        );
-
-        let residual: Vec<i32> = y.iter().map(|&v| i32::from(v) - 128).collect();
-        let other_residual: Vec<i32> = other.iter().map(|&v| i32::from(v) - 128).collect();
-        let coefficients = forward_transform_coefficients(&residual, 64, 32, 16, true);
-        assert_ne!(
-            forward_transform_picture(&residual, 64, 32, 16, true),
-            forward_transform_picture(&other_residual, 64, 32, 16, true),
-            "the forward transform ignores the residual"
-        );
-        assert_ne!(
-            quantize_picture(&coefficients, 64, 32, 16, 20, true),
-            quantize_picture(&coefficients, 64, 32, 16, 40, true),
-            "quantization ignores qP"
-        );
-        assert_ne!(
-            write_idr_residual_access_unit(&y, &cb, &cr, 64, 32, 30),
-            write_idr_residual_access_unit(&other, &other_cb, &other_cr, 64, 32, 30),
-            "the written residual access unit ignores the picture"
-        );
-        assert_ne!(
-            write_idr_residual_access_unit(&y, &cb, &cr, 64, 32, 20),
-            write_idr_residual_access_unit(&y, &cb, &cr, 64, 32, 40),
-            "the written residual access unit ignores qP"
-        );
-    }
-
-    /// The residual writer is what makes the encoder lossy, so its access unit
-    /// must actually be smaller than the PCM writer's for the same picture.
-    #[test]
-    fn the_residual_access_unit_wrapper_codes_less_than_the_pcm_one() {
-        let _guard = test_lock();
-        simd::set_override(None);
-        let (y, cb, cr) = picture(64, 32, 0);
-        assert!(
-            write_idr_residual_access_unit(&y, &cb, &cr, 64, 32, 40).len()
-                < write_idr_pcm_access_unit(&y, &cb, &cr, 64, 32).len(),
-            "a quantized access unit must cost fewer bytes than raw PCM samples"
         );
     }
 

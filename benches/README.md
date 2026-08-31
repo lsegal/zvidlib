@@ -1,21 +1,25 @@
 # Benchmarks
 
 zvidlib's benchmarks run under [criterion](https://docs.rs/criterion) with
-`harness = false`, across five bench targets that share `benches/support/`:
+`harness = false`, across six bench targets that share `benches/support/`:
 
 | Target | Measures |
 | --- | --- |
 | `benches/codec.rs` | codec work: decode, encoder inputs, and the per-ISA SIMD groups |
 | `benches/av1_decode.rs` | the AV1 software decoder: whole-frame decode and every hot stage, scalar versus SIMD |
+| `benches/av1_encode.rs` | the AV1 encoder's kernels: the forward transforms, scalar versus SIMD |
 | `benches/audio_decode.rs` | the audio decode path: AAC access units and `AacSampleReader` range/seek reads |
 | `benches/audio_mux.rs` | the audio container path: MP4 muxing, sample-table growth, demux, and gapless timing |
 | `benches/hevc_encode.rs` | the pure-Rust HEVC encoder, whole-frame and per-stage |
 
 Each target loads and decodes its fixtures once per process, so every iteration
 measures the work under test and nothing else. `codec` is one target rather than
-several because its groups share the same decoded-frame cache; the AV1 decoder
-suite, the two audio targets and `hevc_encode` share none of those fixtures and
-are separately runnable. The encoder target is separate for a second reason too:
+several because its groups share the same decoded-frame cache; the two AV1
+suites, the two audio targets and `hevc_encode` share none of those fixtures and
+are separately runnable. The AV1 decode and encode suites are separate targets
+from each other so neither one's name overstates what it measures: encoder
+kernels are not decoder stages, even where both reach the same `av1_simd`
+dispatch site. The encoder target is separate for a second reason too:
 its mode search is slow enough that keeping it out of the default
 `cargo bench --bench codec` run is worth more than sharing a process.
 
@@ -25,6 +29,7 @@ its mode search is slow enough that keeping it out of the default
 cargo bench                       # the default, fast groups in every target
 cargo bench --bench codec         # codec work only
 cargo bench --bench av1_decode    # the AV1 software decoder only
+cargo bench --bench av1_encode    # the AV1 encoder kernels only
 cargo bench --bench audio_decode  # the audio decode path only
 cargo bench --bench audio_mux     # the audio container path only
 cargo bench --bench hevc_encode   # the HEVC encoder groups only
@@ -144,6 +149,11 @@ There is no separate CDF-adaptation measurement because both AV1 decoders in the
 crate require `disable_cdf_update = 1`, so `src/av1_cdf.rs`'s tables are read but
 never adapted.
 
+The forward transforms are not in this table. They are encoder kernels and are
+measured by [the AV1 encoder suite](#the-av1-encoder-suite---bench-av1_encode)
+instead, even though they reach the same `av1_simd` dispatch site as the inverse
+transforms above.
+
 This target replaces the ad-hoc, `#[ignore]`d `tests/av1_simd_bench.rs`: its
 input generators are now `support::av1_structured_plane`,
 `support::av1_flat_blocks_plane`, and `support::av1_wide_tx_grid`, and its
@@ -163,6 +173,27 @@ Filter to one of them the same way as any other group:
 cargo bench --bench codec -- av1_deblock
 cargo bench --bench av1_decode -- 'av1_deblock/scalar'
 cargo bench --bench av1_decode -- av1_inverse   # every inverse-transform group
+```
+
+## The AV1 encoder suite (`--bench av1_encode`)
+
+`benches/av1_encode.rs` measures AV1's encoder-side kernels. Today that is the
+forward transform set:
+
+| Group | Stage |
+| --- | --- |
+| `av1_forward_dct_{4x4,8x8,16x16,32x32}` | forward DCT, `src/av1_encoder/transform.rs` through `zvidlib::forward_transform` |
+| `av1_forward_adst_8x8`, `av1_forward_flipadst_16x16` | the forward ADST family, including a flipped type |
+
+They run once per available instruction set through
+`support::isa::bench_across_isas`, under the same bit-exactness and
+`active_by_site()` guards as every other per-ISA group, and over the same
+1920x1080 block counts and coefficient generator as the inverse-transform
+groups in `av1_decode` — so the two directions stay directly comparable:
+
+```sh
+cargo bench --bench av1_encode -- av1_forward
+cargo bench --bench av1_encode -- 'av1_forward_dct_16x16/scalar'
 ```
 
 Note that the correctness guard below runs for every group in a target

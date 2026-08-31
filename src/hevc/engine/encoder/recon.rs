@@ -18,8 +18,8 @@
 //! all `pcm_flag == 1` blocks: the reconstruction is then bit-identical to the
 //! source. Set, the residual is round-tripped through the §8.6.4 forward
 //! transform and §8.6.3 quantization in
-//! [`crate::hevc::engine::encoder::quant`] and back through the decoder's own
-//! scaling and inverse transform, which is what the residual writer in
+//! [`crate::hevc::engine::encoder::transform`] and back through the decoder's
+//! own scaling and inverse transform, which is what the residual writer in
 //! [`crate::hevc::engine::encoder::lossy`] codes — and the reconstructed
 //! reference then genuinely diverges from the source, so the mode search in
 //! [`crate::hevc::engine::encoder::rdo`] predicts from a lossy picture the way
@@ -43,14 +43,17 @@
 //! the decoder's do, including the §8.7.2.5.4 / §8.7.3.1 PCM suppression map.
 
 use crate::hevc::engine::binarization::PartMode;
-use crate::hevc::engine::deblock::chroma_qpc_420;
 use crate::hevc::engine::deblock::{DeblockCu, DeblockCuDesc, DeblockCuParams, NoFilterMap};
-use crate::hevc::engine::encoder::quant::{forward_transform, quantize, reconstruct_residual};
 use crate::hevc::engine::encoder::rdo::PictureDecision;
+use crate::hevc::engine::encoder::transform::{
+    ForwardBlockParams, chroma_qp, luma_qp, transform_and_quantize,
+};
 use crate::hevc::engine::motion::{MotionCell, MotionField};
 use crate::hevc::engine::picture::{Picture, Plane, clip1};
 use crate::hevc::engine::sao::{ResolvedSao, ResolvedSaoComponent};
-use crate::hevc::engine::transform::{Component as TfComponent, PredMode};
+use crate::hevc::engine::transform::{
+    BlockParams, Component as TfComponent, PredMode, residual_block,
+};
 
 /// `CtbLog2SizeY` of the encoder's fixed geometry (16-sample CTBs), matching
 /// the PCM writer's `CTB_LOG2`.
@@ -191,7 +194,7 @@ pub(crate) fn reconstruct_picture(
                 partition.h,
                 mv_x,
                 mv_y,
-                cfg.quantized_residual.then_some(cfg.qp as u32),
+                cfg.quantized_residual.then_some(cfg.qp),
             );
             field.fill_rect(
                 partition.x,
@@ -279,7 +282,7 @@ fn reconstruct_partition(
     h: usize,
     mv_x: i32,
     mv_y: i32,
-    quant: Option<u32>,
+    quant: Option<i32>,
 ) {
     reconstruct_component(
         pic,
@@ -293,7 +296,8 @@ fn reconstruct_partition(
         h,
         mv_x,
         mv_y,
-        quant,
+        // §8.6.1 eq. 8-284 — the luma `qP` from `SliceQpY`.
+        quant.map(|qp| luma_qp(qp, BIT_DEPTH)),
         TfComponent::Luma,
     );
     // 4:2:0 — the chroma partition is the luma one halved, and the motion
@@ -328,7 +332,7 @@ fn reconstruct_partition(
             mv_y / 2,
             // §8.6.1 with the writer's zero chroma QP offsets: the chroma
             // blocks quantize at the Table 8-10 mapping of the luma QP.
-            quant.map(|qp| chroma_qpc_420(qp as i32) as u32),
+            quant.map(|qp| chroma_qp(qp, 0, BIT_DEPTH, CHROMA_ARRAY_TYPE)),
             component,
         );
     }
@@ -401,19 +405,38 @@ fn reconstruct_component(
             } else {
                 PredMode::Intra
             };
-            let coefficients = forward_transform(&residual, n_tbs, pred_mode, component, BIT_DEPTH);
-            let levels = quantize(
-                &coefficients,
-                n_tbs,
-                q_p,
-                BIT_DEPTH,
-                matches!(pred_mode, PredMode::Intra),
-            );
+            let levels = transform_and_quantize(
+                &residual,
+                None,
+                ForwardBlockParams {
+                    n_tbs,
+                    q_p,
+                    component,
+                    pred_mode,
+                    bit_depth: BIT_DEPTH,
+                    extended_precision: false,
+                },
+            )
+            .expect("encoder-sized transform block");
             // An all-zero level block codes `cbf == 0` and carries no
             // residual at all, which is what a decoder reconstructs.
             let coded = if levels.iter().any(|&l| l != 0) {
-                reconstruct_residual(&levels, n_tbs, q_p, pred_mode, component, BIT_DEPTH)
-                    .expect("encoder-sized transform block")
+                residual_block(
+                    &levels,
+                    None,
+                    BlockParams {
+                        n_tbs,
+                        q_p,
+                        component,
+                        pred_mode,
+                        bit_depth: BIT_DEPTH,
+                        extended_precision: false,
+                        transquant_bypass: false,
+                        transform_skip: false,
+                        transform_skip_rotation_enabled: false,
+                    },
+                )
+                .expect("encoder-sized transform block")
             } else {
                 vec![0i32; n_tbs * n_tbs]
             };

@@ -135,7 +135,7 @@ impl std::error::Error for TransformError {}
 /// `log2( nTbS )` for a legal transform-block side, or `None` if `n_tbs`
 /// is not 4 / 8 / 16 / 32.
 #[inline]
-fn log2_tbs(n_tbs: usize) -> Option<u32> {
+pub(crate) fn log2_tbs(n_tbs: usize) -> Option<u32> {
     match n_tbs {
         4 => Some(2),
         8 => Some(3),
@@ -270,7 +270,7 @@ pub fn scale_coefficients(
 /// §8.6.4.2 equation 8-316 — the `trType == 1` 4x4 alternate (DST-VII)
 /// transform matrix, `transMatrix[ i ][ j ]`, row-major.
 #[rustfmt::skip]
-const DST4: [[i32; 4]; 4] = [
+pub(crate) const DST4: [[i32; 4]; 4] = [
     [29,  55,  74,  84],
     [74,  74,   0, -74],
     [84, -29, -74,  55],
@@ -282,7 +282,7 @@ const DST4: [[i32; 4]; 4] = [
 /// row-major. The smaller 4 / 8 / 16 transforms subsample column `n`
 /// at stride `1 << ( 5 − log2( nTbS ) )` per equation 8-317.
 #[rustfmt::skip]
-const DCT32: [[i32; 32]; 32] = [
+pub(crate) const DCT32: [[i32; 32]; 32] = [
     [64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64],
     [90, 90, 88, 85, 82, 78, 73, 67, 61, 54, 46, 38, 31, 22, 13, 4, -4, -13, -22, -31, -38, -46, -54, -61, -67, -73, -78, -82, -85, -88, -90, -90],
     [90, 87, 80, 70, 57, 43, 25, 9, -9, -25, -43, -57, -70, -80, -87, -90, -90, -87, -80, -70, -57, -43, -25, -9, 9, 25, 43, 57, 70, 80, 87, 90],
@@ -387,43 +387,6 @@ fn transform_1d_into(input: &[i64], n_tbs: usize, tr_type: bool, out: &mut [i64]
             *oi = acc;
         }
     }
-}
-
-/// Encoder-side forward DST-VII 1-D over the §8.6.4.2 equation-8-316
-/// basis: `y[ u ] = Σ_x DST4[ u ][ x ] * x[ x ]` — the transpose of the
-/// [`transform_1d`] `trType == 1` analysis, and the counterpart of
-/// [`forward_dct_1d`] for the 4x4 intra luma block the spec codes with
-/// the alternate transform.
-pub(crate) fn forward_dst4_1d(input: &[i64]) -> Vec<i64> {
-    debug_assert_eq!(input.len(), 4);
-    (0..4)
-        .map(|u| {
-            input
-                .iter()
-                .enumerate()
-                .map(|(x, &xv)| DST4[u][x] as i64 * xv)
-                .sum()
-        })
-        .collect()
-}
-
-/// Encoder-side forward DCT-II 1-D over the same §8.6.4.2 basis the
-/// inverse synthesizes from: `y[ u ] = Σ_x DCT32[ u * stride ][ x ] *
-/// x[ x ]` — the transpose of the [`transform_1d`] `trType == 0`
-/// analysis, so an inverse-transformed forward output reproduces the
-/// input up to the normalization shifts the encoder applies.
-pub(crate) fn forward_dct_1d(input: &[i64], n_tbs: usize) -> Vec<i64> {
-    let log2 = log2_tbs(n_tbs).expect("forward_dct_1d called with non-2^k nTbS");
-    let stride = 1usize << (5 - log2);
-    (0..n_tbs)
-        .map(|u| {
-            input
-                .iter()
-                .enumerate()
-                .map(|(x, &xv)| DCT32[u * stride][x] as i64 * xv)
-                .sum()
-        })
-        .collect()
 }
 
 /// §8.6.4 — transformation process for scaled transform coefficients.

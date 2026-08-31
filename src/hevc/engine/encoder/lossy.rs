@@ -35,17 +35,18 @@
 
 use crate::hevc::engine::cabac::init_type;
 use crate::hevc::engine::ctx_init::SliceContexts;
-use crate::hevc::engine::deblock::chroma_qpc_420;
 use crate::hevc::engine::encoder::bitwriter::BitWriter;
 use crate::hevc::engine::encoder::cabac::CabacEncoder;
 use crate::hevc::engine::encoder::nal::{annexb, nal_unit};
 use crate::hevc::engine::encoder::pcm::{
     PcmEncodeError, level_idc_for, write_pps, write_sps, write_vps,
 };
-use crate::hevc::engine::encoder::quant::{forward_transform, quantize, reconstruct_residual};
 use crate::hevc::engine::encoder::recon::ReconstructedPicture;
 use crate::hevc::engine::encoder::residual::{
     EngineResidualBinSink, ResidualWriteParams, has_coded_levels, write_residual_coding,
+};
+use crate::hevc::engine::encoder::transform::{
+    ForwardBlockParams, chroma_qp, luma_qp, transform_and_quantize,
 };
 use crate::hevc::engine::intra_pred::{
     Component as IpComponent, IntraPredParams, MarkedReferenceSamples,
@@ -53,7 +54,9 @@ use crate::hevc::engine::intra_pred::{
 };
 use crate::hevc::engine::picture::clip1;
 use crate::hevc::engine::scan::ScanIdx;
-use crate::hevc::engine::transform::{Component as TfComponent, PredMode};
+use crate::hevc::engine::transform::{
+    BlockParams, Component as TfComponent, PredMode, residual_block,
+};
 
 /// `CtbLog2SizeY` of the writer's fixed geometry, matching the PCM writer's.
 const CTB_LOG2: u32 = 4;
@@ -61,6 +64,8 @@ const CTB_LOG2: u32 = 4;
 const CTB: usize = 1 << CTB_LOG2;
 /// `BitDepthY` / `BitDepthC`.
 const BIT_DEPTH: u8 = 8;
+/// `ChromaArrayType` — 4:2:0, the only format this writer emits.
+const CHROMA_ARRAY_TYPE: u8 = 1;
 /// `INTRA_DC` (Table 8-1 mode 1) — the only mode this writer codes.
 const INTRA_DC: u8 = 1;
 /// The valid `SliceQpY` range at 8-bit depth (`QpBdOffsetY == 0`).
@@ -159,10 +164,10 @@ fn write_idr_residual_slice(
         height,
     };
 
-    // §8.6.1: at 8-bit depth QpBdOffset is 0, so qP is SliceQpY for luma and
-    // the Table 8-10 mapping of it for chroma (both PPS offsets are 0).
-    let qp_luma = qp as u32;
-    let qp_chroma = chroma_qpc_420(qp) as u32;
+    // §8.6.1: the luma and Table 8-10 chroma `qP` derivations, with the PPS
+    // and slice chroma QP offsets this writer emits (both 0).
+    let qp_luma = luma_qp(qp, BIT_DEPTH);
+    let qp_chroma = chroma_qp(qp, 0, BIT_DEPTH, CHROMA_ARRAY_TYPE);
 
     let ctbs_x = width / CTB;
     let ctbs_y = height / CTB;
@@ -295,15 +300,40 @@ fn code_block(
             residual[row * n_tbs + col] = source - prediction[row * n_tbs + col];
         }
     }
-    let coefficients = forward_transform(&residual, n_tbs, PredMode::Intra, component, BIT_DEPTH);
-    let levels = quantize(&coefficients, n_tbs, q_p, BIT_DEPTH, true);
+    let levels = transform_and_quantize(
+        &residual,
+        None,
+        ForwardBlockParams {
+            n_tbs,
+            q_p,
+            component,
+            pred_mode: PredMode::Intra,
+            bit_depth: BIT_DEPTH,
+            extended_precision: false,
+        },
+    )
+    .expect("encoder-sized transform block");
 
     // §8.6.6: recSamples = Clip1( predSamples + resSamples ), with the
     // residual reconstructed exactly as the decoder will — and skipped
     // entirely when `cbf == 0`, which is what the decoder infers.
     let reconstructed = if has_coded_levels(&levels) {
-        reconstruct_residual(&levels, n_tbs, q_p, PredMode::Intra, component, BIT_DEPTH)
-            .expect("encoder-sized transform block")
+        residual_block(
+            &levels,
+            None,
+            BlockParams {
+                n_tbs,
+                q_p,
+                component,
+                pred_mode: PredMode::Intra,
+                bit_depth: BIT_DEPTH,
+                extended_precision: false,
+                transquant_bypass: false,
+                transform_skip: false,
+                transform_skip_rotation_enabled: false,
+            },
+        )
+        .expect("encoder-sized transform block")
     } else {
         vec![0i32; n_tbs * n_tbs]
     };
