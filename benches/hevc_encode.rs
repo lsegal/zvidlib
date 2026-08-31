@@ -25,13 +25,15 @@
 //! ## The SIMD axis, and where it is expected to read flat
 //!
 //! `hevc_rdcost` — the SAD and SATD distortion metrics the mode search calls —
-//! is the encoder's *only* SIMD dispatch family. Bitstream writing, CABAC, and
-//! the RGBA-to-YUV420 conversion have no vector path, so their arms are
-//! expected to read the same under every instruction set. That is the measured
-//! result the issue asks for, not a broken benchmark: it says the next
-//! encoder-side vectorization target is entropy coding or color conversion, and
-//! it is why every group asserts through `simd::active_by_site()` that the
-//! override landed rather than inferring it from the clock.
+//! and `hevc_fwd_transform_quant` — the forward transform's butterfly and the
+//! quantization loop — are the encoder's two SIMD dispatch families. Bitstream
+//! writing, CABAC, and the RGBA-to-YUV420 conversion have no vector path, so
+//! their arms are expected to read the same under every instruction set. That
+//! is the measured result the issue asks for, not a broken benchmark: it says
+//! the next encoder-side vectorization target is entropy coding or color
+//! conversion, and it is why every group asserts through
+//! `simd::active_by_site()` that the override landed rather than inferring it
+//! from the clock.
 //!
 //! The one exception is the reconstruction group. It runs the decoder's own
 //! §8.7.2 deblocking and §8.7.3 SAO kernels over the encoder's reconstructed
@@ -40,12 +42,12 @@
 //!
 //! ## Stages this encoder does not have yet
 //!
-//! The encoder is a lossless PCM bootstrap writer: it has no forward transform
-//! and no quantization, so there is no residual to transform or quantize and
-//! nothing here measures either. Those stages are named in the tracking issue
-//! but cannot be benchmarked until they exist; [`report_absent_stages`] prints
-//! that explicitly on every run so a missing group is never read as a stage
-//! that costs nothing.
+//! Every stage the tracking issue names is now benchmarked, but the encoder's
+//! access-unit writer is still a lossless PCM bootstrap writer: it does not
+//! call the forward transform + quantization stage or the encode-side
+//! reconstruction path, both of which are measured here directly rather than
+//! through it. [`report_absent_stages`] prints that on every run so a group is
+//! never read as covering more of the encoder than it does.
 
 mod support;
 
@@ -91,14 +93,17 @@ const WHOLE_FRAME_FRAMES: usize = 2;
 /// have to be reported too, or their absence reads as zero cost.
 fn report_absent_stages(_: &mut Criterion) {
     println!(
-        "# hevc_encode: the encoder is a lossless PCM writer, so it has no forward transform and\n\
-         # no quantization to measure. The stages benchmarked below are mode search/RDO,\n\
-         # encode-side reconstruction + in-loop filtering, CABAC + bitwriting, whole-picture PCM\n\
-         # access-unit writing, and the RGBA8->YUV420 input conversion.\n\
-         # hevc_encode: hevc_rdcost is the encoder's only SIMD dispatch family of its own, so\n\
-         # apart from the mode-search and reconstruction groups (the latter running the decoder's\n\
-         # vectorized in-loop filter kernels) the arms are expected to read flat across\n\
-         # instruction sets, which is the measured result, not a broken bench."
+        "# hevc_encode: every stage the tracking issue names is benchmarked below: mode\n\
+         # search/RDO, forward transform + quantization, encode-side reconstruction + in-loop\n\
+         # filtering, CABAC + bitwriting, whole-picture PCM access-unit writing, and the\n\
+         # RGBA8->YUV420 input conversion. The access-unit writer is still a lossless PCM\n\
+         # writer, so it reaches neither the transform/quantization nor the reconstruction\n\
+         # stage; both are measured directly instead.\n\
+         # hevc_encode: hevc_rdcost and hevc_fwd_transform_quant are the encoder's two SIMD\n\
+         # dispatch families, so apart from the mode-search, forward-transform and\n\
+         # reconstruction groups (the last running the decoder's vectorized in-loop filter\n\
+         # kernels) the arms are expected to read flat across instruction sets, which is the\n\
+         # measured result, not a broken bench."
     );
 }
 
@@ -316,6 +321,32 @@ fn pcm_write(criterion: &mut Criterion, size: (u32, u32), group_prefix: &str) {
     });
 }
 
+/// The forward transform and quantization stage, over every transform size.
+///
+/// One iteration transforms and quantizes the whole picture four times, once
+/// per 4x4 / 8x8 / 16x16 / 32x32 block size, so all four §8.6.4.2 matrices and
+/// the 4x4 DST-VII the intra path selects are covered. This is the encoder's
+/// second SIMD dispatch family, so its arms are expected to move with the
+/// instruction set the way the mode-search groups do.
+fn fwd_transform_quant(criterion: &mut Criterion, size: (u32, u32), group_prefix: &str) {
+    let (current, _) = planes_pair(size.0, size.1);
+    let name = format!("{group_prefix}_fwd_transform_quant");
+    let workload = IsaWorkload::new(
+        &name,
+        FrameWork::new(1, u64::from(size.0), u64::from(size.1)),
+    );
+    let qp = zvidlib_rdo_defaults().0;
+    bench_across_isas(criterion, &workload, || {
+        encoder_bench::fwd_transform_quant_picture(
+            &current.y,
+            current.width,
+            current.width,
+            current.height,
+            qp,
+        )
+    });
+}
+
 /// Bins per CABAC iteration. Roughly the CU-syntax bin count of a small
 /// picture, large enough that per-call setup is negligible.
 const CABAC_BINS: usize = 1 << 18;
@@ -398,6 +429,7 @@ fn hevc_encode_large(criterion: &mut Criterion) {
 
 fn hevc_encode_stages_small(criterion: &mut Criterion) {
     mode_search(criterion, SMALL, "hevc_encode_640x352");
+    fwd_transform_quant(criterion, SMALL, "hevc_encode_640x352");
     reconstruct(criterion, SMALL, "hevc_encode_640x352");
     pcm_write(criterion, SMALL, "hevc_encode_640x352");
     color_conversion(criterion, SMALL, "hevc_encode_640x352");
@@ -408,6 +440,7 @@ fn hevc_encode_stages_large(criterion: &mut Criterion) {
         return;
     }
     mode_search(criterion, LARGE, "hevc_encode_1920x1088");
+    fwd_transform_quant(criterion, LARGE, "hevc_encode_1920x1088");
     reconstruct(criterion, LARGE, "hevc_encode_1920x1088");
     pcm_write(criterion, LARGE, "hevc_encode_1920x1088");
     color_conversion(criterion, LARGE, "hevc_encode_1920x1088");
