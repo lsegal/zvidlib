@@ -35,9 +35,11 @@
 //! (§7.14.6.3/§7.14.6.4) apply the spec's exact `filter8`/`filter14`
 //! weighted-sum constants (`WIDE_FILTER8_WEIGHTS` / `WIDE_FILTER14_WEIGHTS`,
 //! applied by `filter8` / `filter14`), replacing the symmetric
-//! triangular-weighted average that earlier stood in for them. Chroma still
-//! always takes the narrow 4-tap filter rather than the spec's 6-tap wide
-//! chroma filter; that scope reduction is documented in `deblock_frame`.
+//! triangular-weighted average that earlier stood in for them. Chroma edges
+//! take the spec's 6-tap wide filter (§7.14.6.3 `filter6`,
+//! `WIDE_FILTER6_WEIGHTS`) where §7.14.5 selects it, from a chroma
+//! transform-size grid derived from the luma grid and the frame's
+//! subsampling.
 //!
 //! One normative piece is still reproduced from published reference tables
 //! rather than derived here:
@@ -286,6 +288,31 @@ impl TxSizeGrid {
         }
     }
 
+    /// Derives the transform-size grid of a chroma plane of `width x height`
+    /// samples from this luma grid, per the spec's chroma transform-size
+    /// derivation: a chroma transform covers the same picture area as the
+    /// luma transform above it, so its dimensions are the luma dimensions
+    /// scaled down by the plane's subsampling, floored at the 4-sample
+    /// minimum transform size.
+    pub fn for_chroma(
+        &self,
+        width: usize,
+        height: usize,
+        subsampling_x: bool,
+        subsampling_y: bool,
+    ) -> Self {
+        let (shift_x, shift_y) = (usize::from(subsampling_x), usize::from(subsampling_y));
+        let mut chroma = Self::new(width, height);
+        for row in 0..chroma.rows {
+            for col in 0..chroma.cols {
+                let (w, h) = self.dims_at(col << shift_x, row << shift_y);
+                chroma.dims[row * chroma.cols + col] =
+                    ((w >> shift_x).max(4), (h >> shift_y).max(4));
+            }
+        }
+        chroma
+    }
+
     fn dims_at(&self, col: usize, row: usize) -> (u16, u16) {
         let col = col.min(self.cols.saturating_sub(1));
         let row = row.min(self.rows.saturating_sub(1));
@@ -293,11 +320,21 @@ impl TxSizeGrid {
     }
 }
 
-/// Selects the deblocking filter length (4/8/14) for the edge at `(x, y)`
-/// per spec §7.14.5: the wide filters only apply when both transform
-/// blocks straddling the edge are at least as large, in the direction
-/// perpendicular to the edge, as the filter's reach.
-fn filter_length_for_edge(tx_sizes: &TxSizeGrid, x: usize, y: usize, vertical: bool) -> usize {
+/// Selects the deblocking filter length for the edge at `(x, y)` per spec
+/// §7.14.5. Luma chooses between the narrow 4-tap filter and the wide 8-tap
+/// and 14-tap filters; the wide ones only apply when both transform blocks
+/// straddling the edge are at least as large, in the direction perpendicular
+/// to the edge, as the filter's reach. Chroma chooses between the narrow
+/// 4-tap filter and the single wide 6-tap filter, which §7.14.5 selects
+/// whenever both chroma transform blocks are at least 8 samples across
+/// perpendicular to the edge.
+fn filter_length_for_edge(
+    tx_sizes: &TxSizeGrid,
+    x: usize,
+    y: usize,
+    vertical: bool,
+    chroma: bool,
+) -> usize {
     let (p_col, p_row) = if vertical {
         ((x - 4) / 4, y / 4)
     } else {
@@ -307,6 +344,9 @@ fn filter_length_for_edge(tx_sizes: &TxSizeGrid, x: usize, y: usize, vertical: b
     let (p_w, p_h) = tx_sizes.dims_at(p_col, p_row);
     let (q_w, q_h) = tx_sizes.dims_at(q_col, q_row);
     let perpendicular = if vertical { p_w.min(q_w) } else { p_h.min(q_h) };
+    if chroma {
+        return if perpendicular >= 8 { 6 } else { 4 };
+    }
     if perpendicular >= 32 {
         14
     } else if perpendicular >= 16 {
@@ -322,11 +362,11 @@ fn filter_length_for_edge(tx_sizes: &TxSizeGrid, x: usize, y: usize, vertical: b
 /// selects its filter length from `luma_tx_sizes` (spec §7.14.5); when
 /// `luma_tx_sizes` is `None`, every luma edge uses the narrow 4-tap filter
 /// (§7.14.6.2), matching this function's original narrow-only behavior.
-/// Chroma always uses the narrow 4-tap filter: the spec's wide chroma
-/// filter is a smaller (6-tap) refinement than luma's, and is intentionally
-/// out of scope here (a documented scope reduction, not a bug — chroma
-/// output remains bitstream-valid, it just leaves some smoothing on the
-/// table for wide chroma transform blocks).
+/// Chroma edges select between the narrow 4-tap filter and the spec's wide
+/// 6-tap filter (§7.14.6.3 `filter6`) from a chroma transform-size grid
+/// derived from `luma_tx_sizes` and the frame's subsampling
+/// ([`TxSizeGrid::for_chroma`]); with `luma_tx_sizes` set to `None` chroma,
+/// like luma, stays entirely on the narrow filter.
 ///
 /// A level of `0` (the AV1 default meaning "disabled") skips filtering for
 /// that plane/direction entirely, matching spec §7.14.1's initial early-out.
@@ -336,6 +376,18 @@ pub fn deblock_frame(
     luma_tx_sizes: Option<&TxSizeGrid>,
 ) -> Result<()> {
     params.validate()?;
+    // Derived once for both chroma planes, which share the frame's transform
+    // sizes and differ only in their loop filter level.
+    let chroma_tx_sizes = luma_tx_sizes.and_then(|grid| {
+        let u = frame.u.as_ref()?;
+        Some(grid.for_chroma(
+            u.width,
+            u.height,
+            frame.subsampling_x,
+            frame.subsampling_y,
+        ))
+    });
+    let chroma_tx_sizes = chroma_tx_sizes.as_ref();
     if params.y_vertical_level > 0 {
         deblock_plane_edges(
             &mut frame.y,
@@ -343,6 +395,7 @@ pub fn deblock_frame(
             params.sharpness,
             true,
             luma_tx_sizes,
+            false,
         );
     }
     if params.y_horizontal_level > 0 {
@@ -352,29 +405,46 @@ pub fn deblock_frame(
             params.sharpness,
             false,
             luma_tx_sizes,
+            false,
         );
     }
     if let Some(u) = frame.u.as_mut() {
         if params.u_level > 0 {
-            deblock_plane_edges(u, params.u_level, params.sharpness, true, None);
-            deblock_plane_edges(u, params.u_level, params.sharpness, false, None);
+            deblock_plane_edges(u, params.u_level, params.sharpness, true, chroma_tx_sizes, true);
+            deblock_plane_edges(
+                u,
+                params.u_level,
+                params.sharpness,
+                false,
+                chroma_tx_sizes,
+                true,
+            );
         }
     }
     if let Some(v) = frame.v.as_mut() {
         if params.v_level > 0 {
-            deblock_plane_edges(v, params.v_level, params.sharpness, true, None);
-            deblock_plane_edges(v, params.v_level, params.sharpness, false, None);
+            deblock_plane_edges(v, params.v_level, params.sharpness, true, chroma_tx_sizes, true);
+            deblock_plane_edges(
+                v,
+                params.v_level,
+                params.sharpness,
+                false,
+                chroma_tx_sizes,
+                true,
+            );
         }
     }
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn deblock_plane_edges(
     plane: &mut FilterPlane,
     level: u8,
     sharpness: u8,
     vertical: bool,
     tx_sizes: Option<&TxSizeGrid>,
+    chroma: bool,
 ) {
     let (limit, blimit, thresh) = adaptive_filter_strength(level, sharpness);
     let width = plane.width;
@@ -399,7 +469,7 @@ fn deblock_plane_edges(
         let mut x = 4;
         while x + 1 < width {
             if lanes > 0 {
-                fill_filter_sizes(&mut sizes, tx_sizes, x, 0, height, true);
+                fill_filter_sizes(&mut sizes, tx_sizes, x, 0, height, true, chroma);
                 crate::av1_simd::deblock_edge_vertical(
                     isa,
                     &mut plane.data,
@@ -417,7 +487,7 @@ fn deblock_plane_edges(
             }
             for y in 0..height {
                 let filter_size = tx_sizes
-                    .map(|grid| filter_length_for_edge(grid, x, y, true))
+                    .map(|grid| filter_length_for_edge(grid, x, y, true, chroma))
                     .unwrap_or(4);
                 filter_edge_at(plane, x, y, 1, 0, limit, blimit, thresh, filter_size);
             }
@@ -428,7 +498,7 @@ fn deblock_plane_edges(
         let mut y = 4;
         while y + 1 < height {
             if lanes > 0 {
-                fill_filter_sizes(&mut sizes, tx_sizes, 0, y, width, false);
+                fill_filter_sizes(&mut sizes, tx_sizes, 0, y, width, false, chroma);
                 crate::av1_simd::deblock_edge_horizontal(
                     isa,
                     &mut plane.data,
@@ -446,7 +516,7 @@ fn deblock_plane_edges(
             }
             for x in 0..width {
                 let filter_size = tx_sizes
-                    .map(|grid| filter_length_for_edge(grid, x, y, false))
+                    .map(|grid| filter_length_for_edge(grid, x, y, false, chroma))
                     .unwrap_or(4);
                 filter_edge_at(plane, x, y, 0, 1, limit, blimit, thresh, filter_size);
             }
@@ -455,10 +525,11 @@ fn deblock_plane_edges(
     }
 }
 
-/// Collects the per-position §7.14.5 filter lengths of the `count` edge
+/// Collects the per-position §7.14.5 filter lengths (4, 6, 8, or 14) of the `count` edge
 /// positions starting at `(x, y)`, padded to a whole number of vector lanes so
 /// the kernel can load a chunk unconditionally. Without a transform-size grid
 /// every edge is narrow, which the kernel represents as an empty slice.
+#[allow(clippy::too_many_arguments)]
 fn fill_filter_sizes(
     sizes: &mut Vec<i32>,
     tx_sizes: Option<&TxSizeGrid>,
@@ -466,6 +537,7 @@ fn fill_filter_sizes(
     y: usize,
     count: usize,
     vertical: bool,
+    chroma: bool,
 ) {
     sizes.clear();
     let Some(grid) = tx_sizes else {
@@ -478,15 +550,16 @@ fn fill_filter_sizes(
         } else {
             (x + offset, y)
         };
-        sizes.push(filter_length_for_edge(grid, px, py, vertical) as i32);
+        sizes.push(filter_length_for_edge(grid, px, py, vertical, chroma) as i32);
     }
     sizes.resize(count.next_multiple_of(crate::av1_simd::MAX_LANES), 4);
 }
 
 /// Filters the edge crossing the boundary at `(x, y)` along the axis given
-/// by `(dx, dy)`, using the narrow 4-tap filter (§7.14.6.2), the wide 8-tap
-/// filter (§7.14.6.3), or the wide 14-tap filter (§7.14.6.4) depending on
-/// `filter_size` (4, 8, or 14) and the flatness of the samples either side
+/// by `(dx, dy)`, using the narrow 4-tap filter (§7.14.6.2), the wide 6-tap
+/// chroma filter or wide 8-tap filter (§7.14.6.3), or the wide 14-tap filter
+/// (§7.14.6.4) depending on
+/// `filter_size` (4, 6, 8, or 14) and the flatness of the samples either side
 /// of the edge, per spec §7.14.6.1's "Filter mask process" / "Flat mask
 /// process": a wide filter is only used when the boundary mask and the
 /// corresponding flatness check both pass, falling back one step (14 -> 8
@@ -526,6 +599,25 @@ fn filter_edge_at(
     let q1 = at(1);
     if !filter_mask(limit, blimit, p1, p0, q0, q1) {
         return;
+    }
+
+    if filter_size == 6 {
+        // The 6-tap chroma filter reads and writes one sample less on each
+        // side than the 8-tap luma filter, so its boundary and flatness gates
+        // stop at p2/q2. Passing p2/q2 where the shared masks expect p3/q3
+        // makes their outermost comparisons trivially true, leaving exactly
+        // the §7.14.6.1 checks the 6-tap case calls for.
+        let p2 = at(-3);
+        let q2 = at(2);
+        if filter_mask_wide(limit, p2, p2, p1, q1, q2, q2)
+            && flat_mask(FLAT_THRESH, p0, p1, p2, p2, q0, q1, q2, q2)
+        {
+            let taps = [p2, p1, p0, q0, q1, q2];
+            for (k, value) in filter6(&taps).into_iter().enumerate() {
+                put(plane, k as isize - 2, value);
+            }
+            return;
+        }
     }
 
     if filter_size >= 8 {
@@ -603,6 +695,26 @@ fn flat_mask(
         && (q_c - q0).abs() <= thresh
 }
 
+/// Spec §7.14.6.3 `filter6`, the wide filter chroma edges take: the
+/// coefficient each of the six taps `[p2, p1, p0, q0, q1, q2]` contributes
+/// to output `i`, where output `0` is the new `p1` and output `3` is the new
+/// `q1`. The two outermost taps (`p2`/`q2`) are read but never written.
+/// Every row sums to `1 << WIDE_FILTER6_SHIFT`, so a run of equal samples
+/// passes through unchanged.
+pub(crate) const WIDE_FILTER6_WEIGHTS: [[i32; 6]; 4] = [
+    // p1' = p2*3 + p1*2 + p0*2 + q0
+    [3, 2, 2, 1, 0, 0],
+    // p0' = p2 + p1*2 + p0*2 + q0*2 + q1
+    [1, 2, 2, 2, 1, 0],
+    // q0' = p1 + p0*2 + q0*2 + q1*2 + q2
+    [0, 1, 2, 2, 2, 1],
+    // q1' = p0 + q0*2 + q1*2 + q2*3
+    [0, 0, 1, 2, 2, 3],
+];
+
+/// Rounding shift of the 6-tap weighted sums (the weights sum to 8).
+pub(crate) const WIDE_FILTER6_SHIFT: i32 = 3;
+
 /// Spec §7.14.6.3 `filter8`: the coefficient each of the eight taps
 /// `[p3, p2, p1, p0, q0, q1, q2, q3]` contributes to output `i`, where
 /// output `0` is the new `p2` and output `5` is the new `q2`. The two
@@ -675,6 +787,13 @@ fn wide_filter<const TAPS: usize, const OUTPUTS: usize>(
         *value = (sum + (1 << (shift - 1))) >> shift;
     }
     out
+}
+
+/// Spec §7.14.6.3 "Wide filter process", 6-tap chroma case. `taps` holds
+/// `[p2, p1, p0, q0, q1, q2]`; the result holds the four written samples
+/// `p1'..q1'`, nearest-`p`-first.
+fn filter6(taps: &[i32; 6]) -> [i32; 4] {
+    wide_filter(taps, &WIDE_FILTER6_WEIGHTS, WIDE_FILTER6_SHIFT)
 }
 
 /// Spec §7.14.6.3 "Wide filter process", 8-tap case. `taps` holds
