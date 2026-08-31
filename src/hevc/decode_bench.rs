@@ -56,8 +56,19 @@ impl Digest {
         }
     }
 
+    /// Folds a byte buffer eight bytes at a time.
+    ///
+    /// The colour-conversion stage produces megabytes of RGBA per run, and a
+    /// byte-at-a-time fold over that is several times the cost of the kernel it
+    /// is there to identify. Folding whole words still depends on every output
+    /// byte, and on its position, which is all the bit-exactness guard needs.
     fn push_bytes(&mut self, values: &[u8]) {
-        for &byte in values {
+        let mut words = values.chunks_exact(8);
+        for word in &mut words {
+            self.0 ^= u64::from_le_bytes(word.try_into().expect("an eight-byte chunk"));
+            self.0 = self.0.wrapping_mul(0x1000_0000_01b3);
+        }
+        for &byte in words.remainder() {
             self.0 ^= u64::from(byte);
             self.0 = self.0.wrapping_mul(0x1000_0000_01b3);
         }
