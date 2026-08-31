@@ -21,11 +21,22 @@
 use crate::hevc::engine::cabac::ContextModel;
 use crate::hevc::engine::encoder::bitwriter::BitWriter;
 use crate::hevc::engine::encoder::cabac::CabacEncoder;
+use crate::hevc::engine::encoder::lossy::encode_idr_residual_au;
 use crate::hevc::engine::encoder::pcm::encode_idr_pcm_au;
 use crate::hevc::engine::encoder::rdo::{DecisionConfig, PictureDecision, decide_picture};
 use crate::hevc::engine::encoder::recon::{
     ReconConfig, ReconstructedPicture, SourcePlanes, reconstruct_picture,
 };
+use crate::hevc::engine::encoder::transform::{self as fwd_transform, ForwardBlockParams};
+use crate::hevc::engine::transform::{Component, PredMode};
+
+/// Bit depth the encoder benchmarks run at — the only depth the PCM
+/// writer and the synthetic 8-bit inputs use.
+const BENCH_BIT_DEPTH: u8 = 8;
+
+/// The fixed predictor [`fwd_transform_quant_picture`] subtracts, the
+/// mid-point of the 8-bit range.
+const BENCH_PREDICTOR: i32 = 128;
 
 /// Runs the encoder's mode-search / RDO stage over one luma picture.
 ///
@@ -181,6 +192,99 @@ pub fn rgba_to_yuv420_planes(frame: &crate::VideoFrame) -> (Vec<u8>, Vec<u8>, Ve
         .expect("benchmark frames are RGBA8")
 }
 
+/// Runs the encoder's forward transform and quantization stage over one
+/// luma picture, once per transform-block size.
+///
+/// Every 4x4, 8x8, 16x16 and 32x32 block that fits in the picture is
+/// transformed and quantized, so one iteration covers all four §8.6.4.2
+/// matrices and the 4x4 DST-VII the intra path selects. The residual is
+/// the source sample minus a fixed mid-level predictor rather than a real
+/// prediction: this group measures the transform and quantization
+/// kernels, and a mode-dependent predictor would fold mode-search cost
+/// into that number.
+///
+/// The returned bytes are the quantized levels themselves, so the
+/// bit-exactness guard in `benches/support/isa.rs` covers every level the
+/// vector kernels produced.
+///
+/// # Panics
+///
+/// Panics if `y` is smaller than `height * stride`.
+#[must_use]
+pub fn fwd_transform_quant_picture(
+    y: &[u8],
+    stride: usize,
+    width: usize,
+    height: usize,
+    qp: i32,
+) -> Vec<u8> {
+    assert!(
+        y.len() >= (height - 1) * stride + width,
+        "the luma plane is smaller than the requested picture"
+    );
+    let q_p = fwd_transform::luma_qp(qp, BENCH_BIT_DEPTH);
+    let mut out = Vec::new();
+    let mut residual = vec![0i32; 32 * 32];
+    for log2 in 2u32..=5 {
+        let n_tbs = 1usize << log2;
+        let params = ForwardBlockParams {
+            n_tbs,
+            q_p,
+            component: Component::Luma,
+            pred_mode: PredMode::Intra,
+            bit_depth: BENCH_BIT_DEPTH,
+            extended_precision: false,
+        };
+        let block = &mut residual[..n_tbs * n_tbs];
+        for by in (0..=height.saturating_sub(n_tbs)).step_by(n_tbs) {
+            for bx in (0..=width.saturating_sub(n_tbs)).step_by(n_tbs) {
+                for row in 0..n_tbs {
+                    let src = &y[(by + row) * stride + bx..][..n_tbs];
+                    for (dst, &sample) in block[row * n_tbs..][..n_tbs].iter_mut().zip(src) {
+                        *dst = i32::from(sample) - BENCH_PREDICTOR;
+                    }
+                }
+                let levels = fwd_transform::transform_and_quantize(block, None, params)
+                    .expect("benchmark blocks are legal transform blocks");
+                for level in levels {
+                    out.extend_from_slice(&(level as i16).to_le_bytes());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Writes one IDR access unit whose coding units carry *quantized residual*
+/// rather than raw PCM samples: intra prediction, forward transform,
+/// quantization, the decoder's own reconstruction, and the §7.3.8.11
+/// `residual_coding( )` entropy coding of the levels.
+///
+/// This is the lossy write path end to end, and the counterpart to
+/// [`write_idr_pcm_access_unit`]: comparing the two separates what coding a
+/// quantized residual costs from what writing a bitstream costs at all. The
+/// returned Annex B access unit is the stage's own output, so the
+/// bit-exactness guard covers the bitstream itself.
+///
+/// # Panics
+///
+/// Panics if the picture does not satisfy the writer's requirements
+/// (dimensions divisible by 16, correctly sized planes, `qp` in 0..=51),
+/// which a benchmark input always does.
+#[must_use]
+pub fn write_idr_residual_access_unit(
+    y: &[u8],
+    cb: &[u8],
+    cr: &[u8],
+    width: usize,
+    height: usize,
+    qp: i32,
+) -> Vec<u8> {
+    encode_idr_residual_au(y, cb, cr, width, height, qp)
+        .expect("benchmark pictures are writable as residual")
+        .0
+}
+
 /// A picture-reconstruction workload with its mode-search plan already built.
 ///
 /// The reconstruction stage consumes the decisions the mode search produced,
@@ -270,6 +374,24 @@ pub fn reconstruct_encoded_picture(
     deblocking: bool,
     sao: bool,
 ) -> Vec<u8> {
+    reconstruct_encoded_picture_quantized(workload, deblocking, sao, false)
+}
+
+/// [`reconstruct_encoded_picture`] with control over whether the residual is
+/// round-tripped through the forward transform and quantizer.
+///
+/// With `quantized` set, every transform block of every partition goes through
+/// §8.6.4 / §8.6.3 and back through the decoder's §8.6.2 reconstruction, which
+/// is what the reconstruction stage costs once the writer stops coding PCM.
+/// Measuring both says how much of the stage is prediction and filtering and
+/// how much is the transform round trip.
+#[must_use]
+pub fn reconstruct_encoded_picture_quantized(
+    workload: &ReconstructWorkload,
+    deblocking: bool,
+    sao: bool,
+    quantized: bool,
+) -> Vec<u8> {
     let reconstructed = reconstruct_picture(
         SourcePlanes {
             y: &workload.y,
@@ -289,6 +411,7 @@ pub fn reconstruct_encoded_picture(
             // (`pcm_loop_filter_disabled_flag == 0`, which
             // `PcmAuOptions::pcm_loop_filter_disabled == false` writes).
             pcm_loop_filter_disabled: !(deblocking || sao),
+            quantized_residual: quantized,
             ..ReconConfig::default()
         },
     );
