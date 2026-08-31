@@ -690,6 +690,109 @@ fn chroma_wide_deblocking_actually_runs_on_flat_content() {
     );
 }
 
+/// A grid of 16x16 luma transforms, whose subsampled 8x8 chroma transforms make
+/// §7.14.5 select the 6-tap filter on every interior chroma edge.
+fn luma_16x16_grid(width: usize, height: usize) -> TxSizeGrid {
+    let mut grid = TxSizeGrid::new(width, height);
+    for y in (0..height).step_by(16) {
+        for x in (0..width).step_by(16) {
+            grid.set_block(x, y, 16, 16);
+        }
+    }
+    grid
+}
+
+/// The 6-tap chunk path loads only `p2..q2`, which is sound exactly because
+/// `filter6` and its gates read nothing else. This pins that down from the
+/// outside: perturbing every chroma row the window does not cover must leave
+/// the four rows the edge writes bit-identical.
+///
+/// The chroma planes are `24x16` with 8x8 chroma transforms, so the only
+/// interior horizontal chroma edge is at `y = 8`; its window is rows `5..=10`
+/// and it writes rows `6..=9`. Each row is constant across the plane, so the
+/// vertical chroma edges see flat windows and leave the samples alone, and the
+/// perturbation stays outside the window on both sides.
+#[test]
+fn chroma_six_tap_output_depends_only_on_the_six_taps() {
+    const CW: usize = 24;
+    const CH: usize = 16;
+    /// Rows the 6-tap window covers, and the rows the edge writes.
+    const WINDOW: [usize; 2] = [5, 10];
+    const WRITTEN: [usize; 2] = [6, 10];
+
+    let deblocked = |row_value: &dyn Fn(usize) -> u8| {
+        let grid = luma_16x16_grid(2 * CW, 2 * CH);
+        let chroma = || {
+            let data: Vec<u8> = (0..CW * CH).map(|index| row_value(index / CW)).collect();
+            FilterPlane::from_samples(CW, CH, data, &Limits::default()).unwrap()
+        };
+        let mut frame = FilterFrame::new_yuv(
+            plane(2 * CW, 2 * CH, 0x77aa),
+            chroma(),
+            chroma(),
+            true,
+            true,
+        )
+        .unwrap();
+        deblock_frame(&mut frame, &deblock_params(40, 0), Some(&grid)).unwrap();
+        frame.u.unwrap().data
+    };
+    let rows = |data: &[u8], range: [usize; 2]| data[range[0] * CW..range[1] * CW].to_vec();
+
+    let base = |row: usize| if row < 8 { 100u8 } else { 110u8 };
+    let perturbed = |row: usize| {
+        if (WINDOW[0]..=WINDOW[1]).contains(&row) {
+            base(row)
+        } else {
+            base(row) ^ 0x5a
+        }
+    };
+
+    let results = for_each_isa(|_| (deblocked(&base), deblocked(&perturbed)));
+    for (isa, (plain, poisoned)) in &results {
+        assert_eq!(
+            rows(plain, WRITTEN),
+            rows(poisoned, WRITTEN),
+            "{} 6-tap chroma output should not depend on samples outside p2..q2",
+            isa.name()
+        );
+        // Neither half of the comparison may be vacuous: the perturbation has
+        // to reach the plane, and the 6-tap edge has to have filtered.
+        assert_ne!(
+            rows(plain, [0, 5]),
+            rows(poisoned, [0, 5]),
+            "{} the poisoned rows should differ, or nothing was perturbed",
+            isa.name()
+        );
+        let unfiltered: Vec<u8> = (WRITTEN[0]..WRITTEN[1])
+            .flat_map(|row| vec![base(row); CW])
+            .collect();
+        assert_ne!(
+            rows(plain, WRITTEN),
+            unfiltered,
+            "{} the 6-tap chroma edge should have filtered",
+            isa.name()
+        );
+    }
+}
+
+/// Chroma planes whose 6-tap window runs off the plane: with 8x8 chroma
+/// transforms the horizontal edge at `y = 8` reads up to row 10, so a chroma
+/// height of 10 or 11 puts `q2` outside the plane and the reduced-window path
+/// must replicate the nearest in-plane sample exactly as the scalar path does.
+#[test]
+fn chroma_six_tap_at_plane_borders_matches_the_scalar_reference() {
+    for (width, height) in [(40usize, 20usize), (36, 22), (34, 19), (22, 21)] {
+        let grid = luma_16x16_grid(width, height);
+        let results = for_each_isa(|_| {
+            let mut frame = flat_blocks_frame(width, height, 0x60_1de5);
+            deblock_frame(&mut frame, &deblock_params(40, 0), Some(&grid)).unwrap();
+            (frame.u.unwrap().data, frame.v.unwrap().data)
+        });
+        assert_all_match(&results, "deblocked chroma planes at plane borders");
+    }
+}
+
 /// Verifies 6-tap chroma output against spec-derived values rather than this
 /// crate's own scalar path, on every instruction set.
 ///
