@@ -421,7 +421,7 @@ pub enum Tx1d {
     Adst,
     /// The identity, the kernel the half-identity `V_*`/`H_*` types apply
     /// along their other axis. It carries no butterfly, only the
-    /// [`identity_scale`] gain that keeps it on the same scale as the DCT and
+    /// `sqrt(points / 2)` gain that keeps it on the same scale as the DCT and
     /// ADST passes of its size, so a block that is identity along one axis
     /// reconstructs at the same magnitude as one that is not. Defined at
     /// every transform size.
