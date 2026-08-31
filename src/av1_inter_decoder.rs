@@ -2112,10 +2112,12 @@ mod tests {
         w.bits(0, 5); // seq_level_idx (<= 7, so no seq_tier bit)
         // decoder_model_info_present_flag is false, so no per-op model bit;
         // initial_display_delay_present_flag is false, so no per-op delay bit.
-        w.bits(3, 4); // frame_width_bits_minus_1 = 3 -> 4 width bits
-        w.bits(3, 4); // frame_height_bits_minus_1 = 3 -> 4 height bits
-        w.bits(width - 1, 4); // max_frame_width_minus_1
-        w.bits(height - 1, 4); // max_frame_height_minus_1
+        let width_bits = (u32::BITS - (width - 1).leading_zeros()).max(1) as usize;
+        let height_bits = (u32::BITS - (height - 1).leading_zeros()).max(1) as usize;
+        w.bits(width_bits as u32 - 1, 4); // frame_width_bits_minus_1
+        w.bits(height_bits as u32 - 1, 4); // frame_height_bits_minus_1
+        w.bits(width - 1, width_bits); // max_frame_width_minus_1
+        w.bits(height - 1, height_bits); // max_frame_height_minus_1
         w.bits(0, 1); // frame_id_numbers_present_flag
         w.bits(0, 1); // use_128x128_superblock
         w.bits(0, 1); // enable_filter_intra
@@ -2907,5 +2909,88 @@ mod tests {
         );
         deblock_frame(&mut filter_frame, &header.loop_filter, Some(&tx_sizes)).unwrap();
         assert_eq!(filter_frame.y.data, frame.planes[0].data);
+    }
+
+    /// A frame exactly one 64x64 superblock across, so `PARTITION_NONE`
+    /// yields a single 64x64 coding block and `read_tx_size` can reach the
+    /// largest transform this crate's kernels implement.
+    const SUPERBLOCK_DIM: u32 = 64;
+    /// The quantizer index the large-transform fixture below codes at.
+    const SUPERBLOCK_Q: u8 = 40;
+
+    /// A single-superblock non-lossless key frame whose one 64x64 coding
+    /// block signals `TX_64X64` under `TX_MODE_LARGEST` and carries a
+    /// single positive DC coefficient of level 4. Coefficients are coded
+    /// in the transform's upper-left 32x32 quadrant only (hence the
+    /// 32-wide `eob_pt` class) and `TX_64X64`'s transform set is
+    /// `TX_SET_DCTONLY`, so no `tx_type` symbol follows them.
+    fn superblock_64x64_temporal_unit() -> Vec<u8> {
+        let mut e = SymbolEncoder::new();
+        e.symbol(&cdf::PARTITION_W64[0], 0); // PARTITION_NONE
+        e.symbol(&cdf::SKIP[0], 0); // skip = 0
+        e.symbol(&cdf::INTRA_FRAME_Y_MODE_DC_DC, 0); // DC_PRED
+        e.symbol(&cdf::TXB_SKIP[1], 0); // not skipped, no neighbours yet
+        e.symbol(cdf::eob_pt_cdf(32, 0), 0); // eob_point = 1 -> eob = 1
+        e.symbol(&cdf::COEFF_BASE_EOB[0][0], 2); // level = 3 (max base)
+        e.symbol(&cdf::COEFF_BR[0][0], 1); // +1, stop (level = 4)
+        e.symbol(&cdf::DC_SIGN[0][0], 0); // positive
+
+        let mi = 2 * SUPERBLOCK_DIM.div_ceil(8) as usize;
+        let mut payload = FrameHeaderBuilder::key_frame(3).finish_common_with_quantizer(
+            true,
+            false,
+            mi,
+            mi,
+            SUPERBLOCK_Q,
+            Some((0, 0, 0, 0, 0)), // every filter level 0: deblocking is a no-op
+            false,                 // TX_MODE_LARGEST
+        );
+        payload.extend_from_slice(&e.finish());
+
+        let mut stream = Vec::new();
+        push_obu(&mut stream, 2, &[]); // temporal delimiter
+        push_obu(
+            &mut stream,
+            1,
+            &sequence_header_payload(SUPERBLOCK_DIM, SUPERBLOCK_DIM),
+        );
+        push_obu(&mut stream, 6, &payload); // Frame OBU
+        stream
+    }
+
+    #[test]
+    fn tx_mode_largest_reaches_the_64_point_kernel_from_a_bitstream() {
+        let limits = Limits::default();
+        let mut decoder = Av1InterDecoder::new(limits).unwrap();
+        let frame = decoder
+            .decode_temporal_unit(&superblock_64x64_temporal_unit())
+            .unwrap();
+        assert_eq!(
+            (frame.dimensions.width, frame.dimensions.height),
+            (SUPERBLOCK_DIM, SUPERBLOCK_DIM)
+        );
+
+        let mut expected_grid = TxSizeGrid::new(SUPERBLOCK_DIM as usize, SUPERBLOCK_DIM as usize);
+        expected_grid.set_block(0, 0, 64, 64);
+        assert_eq!(decoder.last_frame_tx_sizes(), Some(&expected_grid));
+
+        // The plane really came through the 64-point inverse DCT: a lone
+        // DC coefficient spreads a constant offset over all 64x64 samples
+        // on top of the 128 DC prediction an unbordered block starts from.
+        let mut coefficients = vec![0i32; 64 * 64];
+        coefficients[0] = 4;
+        let residuals = inverse_transform(
+            &coefficients,
+            64,
+            Av1TxType::DctDct,
+            get_dc_quant(SUPERBLOCK_Q),
+            get_ac_quant(SUPERBLOCK_Q),
+        );
+        let expected: Vec<u8> = residuals
+            .iter()
+            .map(|&residual| (128 + i32::from(residual)).clamp(0, 255) as u8)
+            .collect();
+        assert_eq!(frame.planes[0].data, expected);
+        assert_ne!(frame.planes[0].data[0], 128);
     }
 }

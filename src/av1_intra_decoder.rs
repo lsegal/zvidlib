@@ -360,6 +360,7 @@ struct LosslessTileDecoder<'a> {
 }
 
 impl<'a> LosslessTileDecoder<'a> {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         tile: &'a [u8],
         width: usize,
@@ -1141,10 +1142,12 @@ mod tests {
         w.bits(1, 1); // still_picture
         w.bits(1, 1); // reduced_still_picture_header
         w.bits(0, 5); // seq_level_idx (<= 7, so no seq_tier bit)
-        w.bits(3, 4); // frame_width_bits_minus_1 = 3 -> 4 width bits
-        w.bits(3, 4); // frame_height_bits_minus_1 = 3 -> 4 height bits
-        w.bits(width - 1, 4); // max_frame_width_minus_1
-        w.bits(height - 1, 4); // max_frame_height_minus_1
+        let width_bits = (u32::BITS - (width - 1).leading_zeros()).max(1) as usize;
+        let height_bits = (u32::BITS - (height - 1).leading_zeros()).max(1) as usize;
+        w.bits(width_bits as u32 - 1, 4); // frame_width_bits_minus_1
+        w.bits(height_bits as u32 - 1, 4); // frame_height_bits_minus_1
+        w.bits(width - 1, width_bits); // max_frame_width_minus_1
+        w.bits(height - 1, height_bits); // max_frame_height_minus_1
         w.bits(0, 1); // use_128x128_superblock
         w.bits(0, 1); // enable_filter_intra
         w.bits(0, 1); // enable_intra_edge_filter
@@ -1355,6 +1358,183 @@ mod tests {
         deblock_frame(&mut filter_frame, &header.loop_filter, Some(&tx_sizes)).unwrap();
         assert_eq!(filter_frame.y.data, frame.planes[0].data);
     }
+
+    /// A frame exactly one 64x64 superblock across, so `PARTITION_NONE`
+    /// yields a single 64x64 coding block and `read_tx_size` can reach
+    /// every transform size this crate's kernels implement.
+    const SUPERBLOCK_DIM: u32 = 64;
+    /// The quantizer index the large-transform fixtures below code at.
+    const SUPERBLOCK_Q: u8 = 40;
+
+    /// Wraps a hand-authored single-superblock tile into a complete
+    /// low-overhead temporal unit at [`SUPERBLOCK_DIM`], with every loop
+    /// filter level 0 so `deblock_frame` is a no-op and the assertions
+    /// below see the raw reconstruction.
+    fn superblock_temporal_unit(tile: &[u8], tx_mode_select: bool) -> Vec<u8> {
+        let mut payload = frame_header_payload(SUPERBLOCK_Q, Some((0, 0, 0, 0, 0)), tx_mode_select);
+        payload.extend_from_slice(tile);
+        let mut stream = Vec::new();
+        push_obu(&mut stream, 2, &[]); // temporal delimiter
+        push_obu(
+            &mut stream,
+            1,
+            &sequence_header_payload(SUPERBLOCK_DIM, SUPERBLOCK_DIM),
+        );
+        push_obu(&mut stream, 6, &payload); // Frame OBU
+        stream
+    }
+
+    /// The symbols shared by every fixture below: one `PARTITION_NONE`
+    /// 64x64 coding block, not skipped, `DC_PRED`.
+    fn superblock_prefix(e: &mut SymbolEncoder) {
+        e.symbol(&cdf::PARTITION_W64[0], 0); // PARTITION_NONE
+        e.symbol(&cdf::SKIP[0], 0); // skip = 0
+        e.symbol(&cdf::INTRA_FRAME_Y_MODE_DC_DC, 0); // DC_PRED
+    }
+
+    /// Codes one transform block holding a single positive DC coefficient
+    /// of level 4 (`COEFF_BASE_EOB` = 3, then one `COEFF_BR` increment of
+    /// 1, which is below 3 and so terminates the range extension).
+    fn encode_dc_only_transform_block(e: &mut SymbolEncoder, skip_context: usize, coded: usize) {
+        e.symbol(&cdf::TXB_SKIP[skip_context], 0); // not skipped
+        e.symbol(cdf::eob_pt_cdf(coded, 0), 0); // eob_point = 1 -> eob = 1
+        e.symbol(&cdf::COEFF_BASE_EOB[0][0], 2); // level = 3 (max base)
+        e.symbol(&cdf::COEFF_BR[0][0], 1); // +1, stop (level = 4)
+        e.symbol(&cdf::DC_SIGN[0][0], 0); // positive
+    }
+
+    /// The reconstruction a `size x size` transform carrying DC level 4
+    /// produces on top of the 128 DC prediction an unbordered block gets.
+    fn dc_only_reconstruction(size: usize) -> Vec<u8> {
+        let mut coefficients = vec![0i32; size * size];
+        coefficients[0] = 4;
+        let residuals = inverse_transform(
+            &coefficients,
+            size,
+            Av1TxType::DctDct,
+            get_dc_quant(SUPERBLOCK_Q),
+            get_ac_quant(SUPERBLOCK_Q),
+        );
+        residuals
+            .iter()
+            .map(|&residual| (128 + i32::from(residual)).clamp(0, 255) as u8)
+            .collect()
+    }
+
+    #[test]
+    fn tx_mode_largest_reaches_the_64_point_kernel_from_a_bitstream() {
+        let mut e = SymbolEncoder::new();
+        superblock_prefix(&mut e);
+        // TX_MODE_LARGEST: no tx_depth symbol, so Max_Tx_Size_Rect for a
+        // 64x64 block selects TX_64X64. Its coefficients are coded in the
+        // upper-left 32x32 quadrant only, hence the 32-wide eob_pt class,
+        // and TX_64X64's transform set is TX_SET_DCTONLY, so no tx_type
+        // symbol follows the coefficients either.
+        encode_dc_only_transform_block(&mut e, 1, 32);
+        let stream = superblock_temporal_unit(&e.finish(), false);
+
+        let limits = Limits::default();
+        let (frame, tx_sizes) = decode_av1_lossless_intra_with_tx_sizes(&stream, &limits).unwrap();
+        assert_eq!(
+            (frame.dimensions.width, frame.dimensions.height),
+            (SUPERBLOCK_DIM, SUPERBLOCK_DIM)
+        );
+        let mut expected = TxSizeGrid::new(SUPERBLOCK_DIM as usize, SUPERBLOCK_DIM as usize);
+        expected.set_block(0, 0, 64, 64);
+        assert_eq!(tx_sizes, expected);
+        // The plane really came through the 64-point inverse DCT: a lone
+        // DC coefficient spreads a constant offset over all 64x64 samples.
+        assert_eq!(frame.planes[0].data, dc_only_reconstruction(64));
+        assert_ne!(frame.planes[0].data[0], 128);
+    }
+
+    #[test]
+    fn tx_mode_select_signals_a_32_point_transform_and_reconstructs_through_it() {
+        let mut e = SymbolEncoder::new();
+        superblock_prefix(&mut e);
+        e.symbol(cdf::tx_depth_cdf(64).0, 1); // tx_depth = 1 -> TX_32X32
+        // The first of the block's four 32x32 transforms carries a DC
+        // coefficient; the other three are TXB_SKIP. Their skip contexts
+        // follow the same `set_coefficient_context` recurrence the decoder
+        // walks: the coded transform leaves its clamped cumulative level
+        // (4) on 4x4 columns/rows 0..8, so the transforms to its right and
+        // below each see exactly one nonzero, greater-than-3 neighbour
+        // (context 3), and the last one sees neither (context 1).
+        encode_dc_only_transform_block(&mut e, 1, 32);
+        for context in [3, 3, 1] {
+            e.symbol(&cdf::TXB_SKIP[context], 1); // skipped -> all zero
+        }
+        let stream = superblock_temporal_unit(&e.finish(), true);
+
+        let limits = Limits::default();
+        let (frame, tx_sizes) = decode_av1_lossless_intra_with_tx_sizes(&stream, &limits).unwrap();
+        let mut expected = TxSizeGrid::new(SUPERBLOCK_DIM as usize, SUPERBLOCK_DIM as usize);
+        for (x, y) in [(0, 0), (32, 0), (0, 32), (32, 32)] {
+            expected.set_block(x, y, 32, 32);
+        }
+        assert_eq!(tx_sizes, expected);
+
+        let reconstruction = dc_only_reconstruction(32);
+        let width = SUPERBLOCK_DIM as usize;
+        for row in 0..32 {
+            assert_eq!(
+                &frame.planes[0].data[row * width..row * width + 32],
+                &reconstruction[row * 32..row * 32 + 32],
+                "row {row}"
+            );
+        }
+    }
+
+    #[test]
+    fn tx_mode_select_depth_two_signals_16x16_transforms() {
+        let mut e = SymbolEncoder::new();
+        superblock_prefix(&mut e);
+        e.symbol(cdf::tx_depth_cdf(64).0, 2); // tx_depth = 2 -> TX_16X16
+        // All sixteen 16x16 transforms are skipped, so every one of them
+        // sees zeroed level contexts and codes at skip context 1.
+        for _ in 0..16 {
+            e.symbol(&cdf::TXB_SKIP[1], 1);
+        }
+        let stream = superblock_temporal_unit(&e.finish(), true);
+
+        let limits = Limits::default();
+        let (frame, tx_sizes) = decode_av1_lossless_intra_with_tx_sizes(&stream, &limits).unwrap();
+        let mut expected = TxSizeGrid::new(SUPERBLOCK_DIM as usize, SUPERBLOCK_DIM as usize);
+        for y in (0..64).step_by(16) {
+            for x in (0..64).step_by(16) {
+                expected.set_block(x, y, 16, 16);
+            }
+        }
+        assert_eq!(tx_sizes, expected);
+        // Every transform block is skipped, so the frame is the flat 128
+        // DC prediction an unbordered first block starts from.
+        assert!(frame.planes[0].data.iter().all(|&sample| sample == 128));
+    }
+
+    #[test]
+    fn a_transform_block_hanging_off_the_coded_frame_is_rejected() {
+        // A 40x40 frame is 10 MI units across, so the forced-split rules
+        // still let a 64x64 PARTITION_NONE block through (8 < 10) even
+        // though the coded plane is only 40 samples wide. The resulting
+        // TX_64X64 would write outside the reconstruction buffer.
+        let mut e = SymbolEncoder::new();
+        superblock_prefix(&mut e);
+        encode_dc_only_transform_block(&mut e, 1, 32);
+        let tile = e.finish();
+        let mut payload = frame_header_payload(SUPERBLOCK_Q, Some((0, 0, 0, 0, 0)), false);
+        payload.extend_from_slice(&tile);
+        let mut stream = Vec::new();
+        push_obu(&mut stream, 2, &[]);
+        push_obu(&mut stream, 1, &sequence_header_payload(40, 40));
+        push_obu(&mut stream, 6, &payload);
+
+        assert_eq!(
+            decode_av1_lossless_intra(&stream, &Limits::default())
+                .unwrap_err()
+                .kind(),
+            ErrorKind::Unsupported
+        );
+    }
 }
 
 /// Focused, lower-level tests of [`LosslessTileDecoder::decode_coefficient_levels`]
@@ -1380,7 +1560,8 @@ mod coefficient_level_tests {
         e.symbol(&cdf::DC_SIGN[0][0], 1); // negative
         let bytes = e.finish();
         let limits = Limits::default();
-        let mut decoder = LosslessTileDecoder::new(&bytes, 16, 16, 4, 4, 40, false, &limits).unwrap();
+        let mut decoder =
+            LosslessTileDecoder::new(&bytes, 16, 16, 4, 4, 40, false, &limits).unwrap();
         let scan = cdf::up_right_diagonal_scan(8);
         let (levels, skipped) = decoder.decode_coefficient_levels(0, 0, 8, &scan).unwrap();
         assert!(!skipped);

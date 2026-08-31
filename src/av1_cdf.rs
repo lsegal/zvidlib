@@ -2,7 +2,8 @@
 //! (§8.3.2) needed by the lossless intra decoder.
 //!
 //! Only the slices the bounded decoder touches are included: `base_q_idx == 0` ⇒ coefficient-CDF quant
-//! context 0, and `TX_4X4` only. CDFs are stored in the spec's cumulative form (rising to 32768)
+//! context 0, and the `TX_4X4` coefficient tables, which the non-lossless additions at the bottom of
+//! this module extend to the larger square transforms. CDFs are stored in the spec's cumulative form (rising to 32768)
 //! with the trailing adaptation-count element dropped, so each row is ready to pass straight to
 //! [`gamut_bitstream::SymbolEncoder::encode_symbol`] (the M0 frame sets `disable_cdf_update = 1`,
 //! so the tables are never adapted). These values are extracted verbatim from the specification.
@@ -311,13 +312,16 @@ pub static SIG_REF_DIFF_OFFSET_2D: [(usize, usize); 5] = [(0, 1), (1, 0), (1, 1)
 /// `Mag_Ref_Offset_With_Tx_Class[TX_CLASS_2D]` (§8.3.2): neighbour offsets for `coeff_br`.
 pub static MAG_REF_OFFSET_2D: [(usize, usize); 3] = [(0, 1), (1, 0), (1, 1)];
 
-// --- Non-lossless (`base_q_idx != 0`) additions: TX_4X4/TX_8X8 only. ---
+// --- Non-lossless (`base_q_idx != 0`) additions: the square transforms
+// TX_4X4 through TX_64X64 that this crate's inverse transform kernels
+// implement. ---
 //
 // Unlike the tables above (extracted verbatim from the specification), the
 // CDFs in this section are placeholder-but-valid default probability models
 // for symbols this crate did not previously decode at all (`read_tx_type`'s
-// `TX_SET_INTRA_2`/`TX_SET_INTER_3` choice, and the larger `eob_pt` range
-// needed once transform blocks can hold more than 16 coefficients). Unlike
+// `TX_SET_INTRA_2`/`TX_SET_INTER_3` choice, `read_tx_size`'s `tx_depth`,
+// and the larger `eob_pt` ranges needed once transform blocks can hold
+// more than 16 coefficients). Unlike
 // the *dequantization* step (a direct multiply that must match the spec's
 // tables to produce correct pixel values), a symbol's *CDF* only affects
 // entropy-coding efficiency, not decode correctness, as long as the same
@@ -564,14 +568,14 @@ mod tests {
 
     #[test]
     fn coeff_base_ctx_offset_reproduces_the_tx_4x4_table() {
-        for row in 0..4 {
-            for column in 0..4 {
+        for (row, offsets) in COEFF_BASE_CTX_OFFSET_4X4.iter().enumerate().take(4) {
+            for (column, &offset) in offsets.iter().enumerate().take(4) {
                 if row == 0 && column == 0 {
                     continue; // the DC position never consults the offset
                 }
                 assert_eq!(
                     coeff_base_ctx_offset(row, column),
-                    usize::from(COEFF_BASE_CTX_OFFSET_4X4[row][column]),
+                    usize::from(offset),
                     "row {row}, column {column}"
                 );
             }
