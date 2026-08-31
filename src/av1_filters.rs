@@ -2258,37 +2258,178 @@ mod tests {
         // Every unit defaults to a 4x4 transform, so the narrow filter is
         // selected until wider transforms are recorded on both sides.
         let grid = TxSizeGrid::new(64, 64);
-        assert_eq!(filter_length_for_edge(&grid, 32, 0, true), 4);
+        assert_eq!(filter_length_for_edge(&grid, 32, 0, true, false), 4);
 
         // 16x16 transforms on both sides of the x=32 edge select the 8-tap
         // filter (spec §7.14.5: perpendicular tx size >= 16).
         let mut grid = TxSizeGrid::new(64, 64);
         grid.set_block(16, 0, 16, 16);
         grid.set_block(32, 0, 16, 16);
-        assert_eq!(filter_length_for_edge(&grid, 32, 0, true), 8);
+        assert_eq!(filter_length_for_edge(&grid, 32, 0, true, false), 8);
 
         // 32x32 transforms on both sides select the 14-tap filter.
         let mut grid = TxSizeGrid::new(64, 64);
         grid.set_block(0, 0, 32, 32);
         grid.set_block(32, 0, 32, 32);
-        assert_eq!(filter_length_for_edge(&grid, 32, 0, true), 14);
+        assert_eq!(filter_length_for_edge(&grid, 32, 0, true, false), 14);
 
         // A narrow transform on just one side of the edge caps the filter
         // length at 4, even though the other side is a 32x32 transform.
         let mut grid = TxSizeGrid::new(64, 64);
         grid.set_block(0, 0, 32, 32);
         grid.set_block(32, 0, 4, 4);
-        assert_eq!(filter_length_for_edge(&grid, 32, 0, true), 4);
+        assert_eq!(filter_length_for_edge(&grid, 32, 0, true, false), 4);
 
         // Horizontal edges select on transform height, not width.
         let mut grid = TxSizeGrid::new(64, 64);
         grid.set_block(0, 16, 4, 32);
         grid.set_block(0, 32, 4, 32);
-        assert_eq!(filter_length_for_edge(&grid, 0, 32, false), 14);
+        assert_eq!(filter_length_for_edge(&grid, 0, 32, false, false), 14);
+    }
+
+    #[test]
+    fn chroma_filter_length_selection_follows_the_chroma_transform_size() {
+        // 4x4 luma transforms give 4x4 chroma transforms, which stay narrow.
+        let grid = TxSizeGrid::new(64, 64).for_chroma(32, 32, true, true);
+        assert_eq!(filter_length_for_edge(&grid, 16, 0, true, true), 4);
+
+        // 16x16 luma transforms subsample to 8x8 chroma transforms, which is
+        // exactly where §7.14.5 selects the 6-tap chroma filter.
+        let mut luma = TxSizeGrid::new(64, 64);
+        luma.set_block(0, 0, 16, 16);
+        luma.set_block(16, 0, 16, 16);
+        let grid = luma.for_chroma(32, 32, true, true);
+        assert_eq!(filter_length_for_edge(&grid, 8, 0, true, true), 6);
+
+        // Without subsampling the chroma transform keeps the luma size, so an
+        // 8x8 luma transform already reaches the 6-tap filter.
+        let mut luma = TxSizeGrid::new(64, 64);
+        luma.set_block(0, 0, 8, 8);
+        luma.set_block(8, 0, 8, 8);
+        let grid = luma.for_chroma(64, 64, false, false);
+        assert_eq!(filter_length_for_edge(&grid, 8, 0, true, true), 6);
+        // The same grid stays narrow for luma: this module's luma thresholds
+        // are more conservative than §7.14.5's, which is pre-existing
+        // behavior the chroma path deliberately does not copy.
+        assert_eq!(filter_length_for_edge(&grid, 8, 0, true, false), 4);
+
+        // A narrow transform on one side of the edge still caps chroma at the
+        // narrow filter.
+        let mut luma = TxSizeGrid::new(64, 64);
+        luma.set_block(0, 0, 32, 32);
+        luma.set_block(32, 0, 4, 4);
+        let grid = luma.for_chroma(32, 32, true, true);
+        assert_eq!(filter_length_for_edge(&grid, 16, 0, true, true), 4);
+    }
+
+    #[test]
+    fn chroma_grid_halves_transform_sizes_and_floors_at_the_minimum() {
+        let mut luma = TxSizeGrid::new(64, 64);
+        luma.set_block(0, 0, 32, 16);
+        luma.set_block(32, 0, 4, 4);
+        let grid = luma.for_chroma(32, 32, true, true);
+        // 32x16 luma -> 16x8 chroma; 4x4 luma floors at the 4x4 minimum.
+        assert_eq!(grid.dims_at(0, 0), (16, 8));
+        assert_eq!(grid.dims_at(4, 0), (4, 4));
+        // 4:2:2 subsamples horizontally only.
+        let grid = luma.for_chroma(32, 64, true, false);
+        assert_eq!(grid.dims_at(0, 0), (16, 16));
+    }
+
+    #[test]
+    fn chroma_wide_filter_matches_spec_derived_vectors() {
+        // A 40x8 luma frame with 4:2:0 chroma gives 20x4 chroma planes, whose
+        // only real vertical edge is at x = 16: columns 0..16 hold 100 and
+        // 16..20 hold 110, so p2..p0 = 100 and q0..q2 = 110 there. The height
+        // of 4 leaves no horizontal chroma edge, and the earlier vertical
+        // edges see an all-100 window that any filter whose weights sum to
+        // its rounding shift leaves unchanged.
+        //
+        // The expected samples come from §7.14.6.3's `filter6` tap lists
+        // directly: output k is `Round2(100 * (8 - w) + 110 * w, 3)` where w
+        // is that row's q-side weight sum, and those sums are 1, 3, 5 and 7.
+        let l = limits();
+        let chroma = |seed: u8| {
+            let data: Vec<u8> = (0..20 * 4)
+                .map(|index| if index % 20 < 16 { 100u8 } else { 110u8 })
+                .collect();
+            let _ = seed;
+            FilterPlane::from_samples(20, 4, data, &l).unwrap()
+        };
+        let mut frame =
+            FilterFrame::new_yuv(flat_plane(40, 8, 100, &l), chroma(0), chroma(1), true, true)
+                .unwrap();
+
+        // 16x16 luma transforms everywhere subsample to 8x8 chroma
+        // transforms, which is what §7.14.5 needs to select the 6-tap filter.
+        let mut grid = TxSizeGrid::new(40, 8);
+        for x in (0..40).step_by(16) {
+            grid.set_block(x, 0, 16, 16);
+        }
+        let params = LoopFilterParams {
+            y_vertical_level: 0,
+            y_horizontal_level: 0,
+            u_level: 40,
+            v_level: 40,
+            sharpness: 0,
+        };
+        deblock_frame(&mut frame, &params, Some(&grid)).unwrap();
+
+        let mut expected_row: Vec<u8> = (0..20)
+            .map(|x| if x < 16 { 100u8 } else { 110u8 })
+            .collect();
+        for (offset, weight) in [1i32, 3, 5, 7].into_iter().enumerate() {
+            expected_row[14 + offset] = (((800 + 10 * weight) + 4) >> 3) as u8;
+        }
+        assert_eq!(expected_row[14..18], [101, 104, 106, 109]);
+        let expected: Vec<u8> = expected_row.repeat(4);
+        assert_eq!(frame.u.as_ref().unwrap().data, expected);
+        assert_eq!(frame.v.as_ref().unwrap().data, expected);
+    }
+
+    #[test]
+    fn chroma_wide_filter_needs_transform_size_metadata() {
+        // The same frame with no transform sizes keeps every chroma edge on
+        // the narrow filter, which writes p1..q1 rather than reaching p1'/q1'
+        // through the 6-tap weights.
+        let l = limits();
+        let chroma = || {
+            let data: Vec<u8> = (0..20 * 4)
+                .map(|index| if index % 20 < 16 { 100u8 } else { 110u8 })
+                .collect();
+            FilterPlane::from_samples(20, 4, data, &l).unwrap()
+        };
+        let params = LoopFilterParams {
+            y_vertical_level: 0,
+            y_horizontal_level: 0,
+            u_level: 40,
+            v_level: 40,
+            sharpness: 0,
+        };
+        let mut grid = TxSizeGrid::new(40, 8);
+        for x in (0..40).step_by(16) {
+            grid.set_block(x, 0, 16, 16);
+        }
+        let mut wide =
+            FilterFrame::new_yuv(flat_plane(40, 8, 100, &l), chroma(), chroma(), true, true)
+                .unwrap();
+        deblock_frame(&mut wide, &params, Some(&grid)).unwrap();
+        let mut narrow =
+            FilterFrame::new_yuv(flat_plane(40, 8, 100, &l), chroma(), chroma(), true, true)
+                .unwrap();
+        deblock_frame(&mut narrow, &params, None).unwrap();
+        assert_ne!(
+            wide.u.as_ref().unwrap().data,
+            narrow.u.as_ref().unwrap().data,
+            "the 6-tap chroma filter should reach samples the narrow filter does not"
+        );
     }
 
     #[test]
     fn spec_wide_filter_weights_sum_to_their_rounding_shift() {
+        for row in WIDE_FILTER6_WEIGHTS {
+            assert_eq!(row.iter().sum::<i32>(), 1 << WIDE_FILTER6_SHIFT);
+        }
         for row in WIDE_FILTER8_WEIGHTS {
             assert_eq!(row.iter().sum::<i32>(), 1 << WIDE_FILTER8_SHIFT);
         }
@@ -2301,6 +2442,10 @@ mod tests {
     fn spec_wide_filter_weights_are_symmetric() {
         // §7.14.6.3/§7.14.6.4 are mirror-symmetric about the edge: the row
         // producing q_k is the p_k row read right-to-left.
+        for (i, row) in WIDE_FILTER6_WEIGHTS.iter().enumerate() {
+            let mirrored = WIDE_FILTER6_WEIGHTS[3 - i];
+            assert!(row.iter().rev().eq(mirrored.iter()));
+        }
         for (i, row) in WIDE_FILTER8_WEIGHTS.iter().enumerate() {
             let mirrored = WIDE_FILTER8_WEIGHTS[5 - i];
             assert!(row.iter().rev().eq(mirrored.iter()));
@@ -2315,6 +2460,7 @@ mod tests {
     fn spec_wide_filters_leave_flat_input_unchanged() {
         assert_eq!(filter14(&[50i32; 14]), [50i32; 12]);
         assert_eq!(filter8(&[77i32; 8]), [77i32; 6]);
+        assert_eq!(filter6(&[91i32; 6]), [91i32; 4]);
     }
 
     #[test]
@@ -2326,6 +2472,11 @@ mod tests {
         // input, output k is 16 * (sum of the q-side weights of row k) >>
         // shift, and the q-side weight sums come straight from the spec's
         // tap lists.
+        let mut taps6 = [0i32; 6];
+        taps6[3..].fill(8);
+        // q-side weight sums per the §7.14.6.3 6-tap rows: 1, 3, 5, 7 out of 8.
+        assert_eq!(filter6(&taps6), [1, 3, 5, 7]);
+
         let mut taps8 = [0i32; 8];
         taps8[4..].fill(16);
         // q-side weight sums per §7.14.6.3 row: 1, 2, 3, 5, 6, 7 out of 8.
