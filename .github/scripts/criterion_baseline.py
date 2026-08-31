@@ -14,6 +14,13 @@ percentage threshold on the median is the honest instrument for that.
 
     collect --criterion-dir target/criterion --out baseline.json
     compare --previous old.json --current new.json --out report.md
+    table --baseline run1.json run2.json --host 'Apple M1' --out table.md
+
+`table` renders the committed scalar-vs-ISA table in `benches/README.md`. It
+takes the elementwise *minimum* across however many baselines it is given,
+because a contended host can only ever make a measurement slower: the fastest
+observed time for an arm is the closest any of the runs got to the uncontended
+one. That is also why it wants several runs rather than one.
 """
 
 from __future__ import annotations
@@ -209,6 +216,76 @@ def compare(args: argparse.Namespace) -> int:
     return 0
 
 
+def table(args: argparse.Namespace) -> int:
+    """Render the committed scalar-vs-ISA table from one or more baselines.
+
+    Only the groups whose arms are instruction sets are in scope: those are the
+    ones `bench_across_isas` builds, and they are the only ones for which
+    "scalar vs each ISA" is a question. Everything else in the suite is a single
+    arm with nothing to compare it against, and listing it here would suggest a
+    comparison that does not exist.
+    """
+    merged: dict[str, float] = {}
+    hosts: list[str] = []
+    for path in args.baseline:
+        baseline = json.loads(pathlib.Path(path).read_text())
+        recorded = baseline.get("host")
+        if recorded and recorded not in hosts:
+            hosts.append(recorded)
+        for identifier, entry in baseline.get("benchmarks", {}).items():
+            median = entry.get("median_ns")
+            if not isinstance(median, (int, float)):
+                continue
+            # Minimum, not mean: contention only ever adds time, so the fastest
+            # observation is the least contaminated one.
+            if identifier not in merged or median < merged[identifier]:
+                merged[identifier] = float(median)
+
+    isa_names = ["scalar", "sse41", "avx2", "neon"]
+    groups: dict[str, dict[str, float]] = {}
+    for identifier, median in merged.items():
+        group, _, arm = identifier.rpartition("/")
+        if arm in isa_names and group:
+            groups.setdefault(group, {})[arm] = median
+
+    if not groups:
+        print("error: no per-instruction-set groups in the given baselines", file=sys.stderr)
+        return 1
+
+    present = [isa for isa in isa_names if any(isa in arms for arms in groups.values())]
+    host = args.host or (hosts[0] if hosts else "unknown host")
+
+    lines = [
+        f"Measured on **{host}**.",
+        "",
+        "| Group | " + " | ".join(f"`{isa}`" for isa in present) + " | Best |",
+        "| --- | " + " | ".join("---:" for _ in present) + " | ---: |",
+    ]
+    for group in sorted(groups):
+        arms = groups[group]
+        scalar = arms.get("scalar")
+        cells = []
+        for isa in present:
+            median = arms.get(isa)
+            if median is None:
+                cells.append("—")
+            elif isa == "scalar" or scalar is None:
+                cells.append(_duration(median))
+            else:
+                cells.append(f"{_duration(median)} ({scalar / median:.2f}x)")
+        vector = {isa: arms[isa] for isa in present if isa != "scalar" and isa in arms}
+        if scalar and vector:
+            fastest = min(vector, key=lambda isa: vector[isa])
+            best = f"{scalar / vector[fastest]:.2f}x `{fastest}`"
+        else:
+            best = "—"
+        lines.append(f"| `{group}` | " + " | ".join(cells) + f" | {best} |")
+    lines.append("")
+
+    _write(args.out, lines)
+    return 0
+
+
 def _duration(nanoseconds: float | None) -> str:
     if nanoseconds is None:
         return "—"
@@ -246,6 +323,12 @@ def main(argv: list[str]) -> int:
     comparer.add_argument("--threshold", type=float, default=15.0)
     comparer.add_argument("--fail-on-regression", action="store_true")
     comparer.set_defaults(handler=compare)
+
+    tabler = subcommands.add_parser("table", help="render the committed baseline table")
+    tabler.add_argument("--baseline", nargs="+", required=True)
+    tabler.add_argument("--host", default="")
+    tabler.add_argument("--out")
+    tabler.set_defaults(handler=table)
 
     args = parser.parse_args(argv)
     return args.handler(args)

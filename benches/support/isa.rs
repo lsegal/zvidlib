@@ -58,7 +58,10 @@ use super::FrameWork;
 pub fn log_host_isas(_criterion: &mut Criterion) {
     let names: Vec<&str> = simd::available().iter().map(|isa| isa.name()).collect();
     println!("# host instruction sets: {}", names.join(", "));
-    println!("# widest detected instruction set: {}", simd::active().name());
+    println!(
+        "# widest detected instruction set: {}",
+        simd::active().name()
+    );
     for (site, isa) in simd::active_by_site() {
         println!("# dispatch site {site}: {}", isa.name());
     }
