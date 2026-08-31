@@ -7,10 +7,14 @@
 //! anywhere in the tree. Its only implementor is `PcmFixtureEncoder` in
 //! `tests/indexed_mp4_output.rs`, a test double that packages PCM sample ranges
 //! into `EncodedSample`s without compressing anything. So "benchmark the audio
-//! encoder" has no subject, and this target deliberately does not invent one:
-//! whether the crate should grow a native AAC-LC encoder, delegate to a platform
-//! encoder, or leave the trait for platform and web backends to fill is a
-//! product question, not a benchmarking one.
+//! encoder" has no subject.
+//!
+//! That is now settled rather than open: the crate ships no audio encoder on
+//! purpose, and `AudioEncoder` stays the seam that platform and browser backends
+//! fill. The rationale is recorded on the trait itself in `src/codec.rs` and in
+//! the README. The practical consequence for this suite is that there will be no
+//! audio-encode target to add later unless that decision is revisited, so nothing
+//! here is a placeholder waiting on one.
 //!
 //! What *does* exist on the audio write path is the container work, and that is
 //! what is measured here. [`PcmBenchEncoder`] below is the same kind of pass-
