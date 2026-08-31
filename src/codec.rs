@@ -111,6 +111,35 @@ pub trait VideoEncoder {
 }
 
 /// Backend-neutral audio encoder contract.
+///
+/// # zvidlib does not implement this trait
+///
+/// This crate ships **no audio encoder**, and that is a deliberate, recorded
+/// decision (issue #174), not an oversight or an unfinished corner. `AudioEncoder`
+/// exists as the seam that platform and browser backends fill; the only
+/// implementations in the tree are the pass-through PCM doubles used by
+/// `tests/indexed_mp4_output.rs` and `benches/audio_mux.rs`, which package sample
+/// ranges into [`EncodedSample`]s without compressing anything.
+///
+/// The reasoning:
+///
+/// * A pure-Rust AAC-LC encoder is a large subsystem in its own right -- filter
+///   bank, psychoacoustic model, quantization and rate control, bitstream writer
+///   -- and its output quality, not its throughput, is what would have to be
+///   defended. A mediocre encoder shipped under this crate's name is worse for
+///   callers than no encoder at all, because it is harder to route around.
+/// * Every target zvidlib runs on already has a good AAC encoder. Browsers expose
+///   `WebCodecs` `AudioEncoder`; macOS has AudioToolbox and Windows has Media
+///   Foundation. Delegating to any one of them is per-platform work that still
+///   leaves other platforms uncovered, so it answers no portability question that
+///   this trait does not already answer better.
+/// * The crate's subject is frame-accurate video and synchronized audio *I/O*.
+///   [`crate::MediaOutput`] can already mux an audio track given any
+///   `AudioEncoder`, so the write path is complete up to the codec, and the codec
+///   is the part callers are best positioned to choose.
+///
+/// If that calculus changes, adding an implementation is additive and breaks no
+/// caller: everything downstream of this trait is already written against it.
 pub trait AudioEncoder {
     fn config(&self) -> &EncoderConfig;
     fn format(&self) -> AudioEncoderFormat;
