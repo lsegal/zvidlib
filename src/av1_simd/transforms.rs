@@ -152,35 +152,6 @@ unsafe fn dot_rs14<V: I32x, const N: usize>(terms: [(V, i32); N]) -> V {
     }
 }
 
-/// Bit-exact vector form of `av1_intra::dct_round_shift(sum(x_i * k_i))` for a
-/// dot product with more terms than [`dot_rs14`] can hold.
-///
-/// [`dot_rs14`] bounds its low accumulator by `N * 2^28`, which leaves a lane
-/// past seven terms; the 64-point kernel's odd half needs 32. Folding the low
-/// accumulator's carry into the high one - `x == (x >> 14) * 2^14 + (x &
-/// 0x3fff)` holds for negative values too, so `2^14 * high + low` is invariant
-/// under it - caps the low half at `4 * 2^28` for any `N`. Renormalizing every
-/// fourth term rather than every term keeps the cost near two extra operations
-/// per output instead of two per term.
-#[inline(always)]
-unsafe fn dot_rs14_wide<V: I32x, const N: usize>(values: &[V; N], coefficients: &[i32; N]) -> V {
-    unsafe {
-        let mask = V::splat(0x3fff);
-        let mut high = V::zero();
-        let mut low = V::zero();
-        for (index, (value, &coefficient)) in values.iter().zip(coefficients.iter()).enumerate() {
-            let scale = V::splat(coefficient);
-            high = high.add(value.sra::<14>().mul(scale));
-            low = low.add(value.and(mask).mul(scale));
-            if index % 4 == 3 {
-                high = high.add(low.sra::<14>());
-                low = low.and(mask);
-            }
-        }
-        high.add(round_shift14(low))
-    }
-}
-
 /// Vector form of `av1_intra::inverse_dct8_1d`.
 #[inline(always)]
 unsafe fn dct8<V: I32x>(input: [V; 8]) -> [V; 8] {
@@ -1196,22 +1167,72 @@ unsafe fn store_i16_clamped<V: I32x>(row: V, out: &mut [i16]) {
     }
 }
 
-/// The 32x32 DCT-IV matrix of the 64-point inverse DCT's odd half, narrowed
-/// from the scalar path's table so the two cannot drift apart.
-const DCT4_32: [[i32; 32]; 32] = {
-    let source = crate::av1_intra::DCT4_32;
-    let mut table = [[0i32; 32]; 32];
-    let mut n = 0;
-    while n < 32 {
-        let mut j = 0;
-        while j < 32 {
-            table[n][j] = source[n][j] as i32;
-            j += 1;
-        }
-        n += 1;
+/// [`crate::av1_intra::COSPI_128`], narrowed to the lane width so the scalar
+/// and vector 64-point kernels cannot drift apart.
+const COSPI_128: [i32; 65] = {
+    let source = crate::av1_intra::COSPI_128;
+    let mut table = [0i32; 65];
+    let mut index = 0;
+    while index < 65 {
+        table[index] = source[index] as i32;
+        index += 1;
     }
     table
 };
+
+/// Vector form of `av1_intra::dct_iv2_1d`.
+#[inline(always)]
+unsafe fn dct_iv2<V: I32x>(input: [V; 2]) -> [V; 2] {
+    unsafe {
+        [
+            dot_rs14([(input[0], COSPI_128[16]), (input[1], COSPI_128[48])]),
+            dot_rs14([(input[0], COSPI_128[48]), (input[1], -COSPI_128[16])]),
+        ]
+    }
+}
+
+/// Vector form of the `av1_intra::dct_iv_kernel!` recursion, which documents
+/// the even/odd split and the rotation angles.
+macro_rules! dct_iv_kernel {
+    ($name:ident, $m:literal, $half:ident) => {
+        #[doc = concat!("Vector form of `av1_intra::dct_iv", stringify!($m), "_1d`.")]
+        #[inline(always)]
+        unsafe fn $name<V: I32x>(input: [V; $m]) -> [V; $m] {
+            unsafe {
+                const HALF: usize = $m / 2;
+                const STEP: usize = 128 / (4 * $m);
+                let mut p = [V::zero(); HALF];
+                let mut q = [V::zero(); HALF];
+                for j in 0..HALF {
+                    let index = (2 * j + 1) * STEP;
+                    let (cosine, sine) = (COSPI_128[index], COSPI_128[64 - index]);
+                    let (first, second) = (input[j], input[$m - 1 - j]);
+                    p[j] = dot_rs14([(first, cosine), (second, -sine)]);
+                    let rotated = dot_rs14([(first, sine), (second, cosine)]);
+                    q[j] = if j % 2 == 0 {
+                        rotated
+                    } else {
+                        V::zero().sub(rotated)
+                    };
+                }
+                let p = $half(p);
+                let q = $half(q);
+                let mut output = [V::zero(); $m];
+                for m in 0..HALF {
+                    let odd = q[HALF - 1 - m];
+                    output[2 * m] = p[m].add(odd);
+                    output[2 * m + 1] = p[m].sub(odd);
+                }
+                output
+            }
+        }
+    };
+}
+
+dct_iv_kernel!(dct_iv4, 4, dct_iv2);
+dct_iv_kernel!(dct_iv8, 8, dct_iv4);
+dct_iv_kernel!(dct_iv16, 16, dct_iv8);
+dct_iv_kernel!(dct_iv32, 32, dct_iv16);
 
 /// Vector form of `av1_intra::inverse_dct64_1d`.
 ///
@@ -1228,12 +1249,12 @@ unsafe fn dct64<V: I32x>(input: [V; 64]) -> [V; 64] {
             odd[j] = input[2 * j + 1];
         }
         let even = dct32(even);
+        let odd = dct_iv32(odd);
 
         let mut output = [V::zero(); 64];
-        for (n, basis) in DCT4_32.iter().enumerate() {
-            let half = dot_rs14_wide(&odd, basis);
-            output[n] = even[n].add(half);
-            output[63 - n] = even[n].sub(half);
+        for n in 0..32 {
+            output[n] = even[n].add(odd[n]);
+            output[63 - n] = even[n].sub(odd[n]);
         }
         output
     }

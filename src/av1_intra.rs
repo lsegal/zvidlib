@@ -293,7 +293,11 @@ fn inverse_wht_1d(values: [i64; 4], shift: u32) -> [i64; 4] {
 // integer partial-butterfly structure (14-bit fixed point, shared across
 // the VP9/AV1 codec family) rather than literally transcribing the AV1
 // spec's `cos128`/`B()` stage notation; the two are mathematically
-// equivalent up to rounding convention. The inverse identity transform
+// equivalent up to rounding convention. AV1's 64-point inverse DCT is
+// specified against a *different* 12-bit `cospi_arr(cos_bit)` contract; this
+// crate keeps the single 14-bit lineage there too, extended to the 1/128
+// angular resolution 64 points need (see `COSPI_ODD_128`). The inverse identity
+// transform
 // (`IDTX`) is implemented here as a pure pass-through (no additional
 // row/column scaling), a deliberate simplification of the AV1 spec's
 // scaled identity transform.
@@ -1023,8 +1027,8 @@ fn inverse_dct32_1d(input: [i64; 32]) -> [i64; 32] {
     output
 }
 
-/// `round(cos(m * pi / 128) * 2^14)` for the odd `m` a 64-point transform
-/// needs, at the same 14-bit scale as the `COSPI_*_64` constants above.
+/// `round(cos(m * pi / 128) * 2^14)` for `m` in `0..=64`: one 14-bit cosine
+/// table at the angular resolution a 64-point transform needs.
 ///
 /// # Lineage
 ///
@@ -1032,61 +1036,98 @@ fn inverse_dct32_1d(input: [i64; 32]) -> [i64; 32] {
 /// `cospi_arr(cos_bit)` table and a per-stage `av1_round_shift_array`
 /// schedule, which is a different fixed-point contract from the 14-bit
 /// VP9-lineage butterflies the rest of this module uses. Introducing that
-/// second lineage would leave two rounding conventions in one crate, so this
-/// kernel extends the existing one instead: `COSPI_k_64` is exactly
-/// `round(cos(2k * pi / 128) * 2^14)`, so the constants below are the missing
-/// *odd* multiples of `pi / 128` at that same scale, and the two tables
-/// together are one 14-bit table at the 1/128 angular resolution 64 points
-/// require. The 4-, 8-, 16-, and 32-point kernels therefore do **not**
-/// migrate, `dct_round_shift` stays the single rounding step, and there is no
-/// second lineage to coexist with.
+/// second lineage would leave two rounding conventions in one crate, so the
+/// 64-point kernel extends the existing one instead: the `COSPI_*_64`
+/// constants above are exactly `round(cos(2k * pi / 128) * 2^14)`, so this is
+/// the same table sampled twice as finely, and `COSPI_128[2 * k]` equals
+/// `COSPI_k_64` entry for entry (asserted by
+/// `tests::the_cosine_tables_are_one_lineage`). The 4-, 8-,
+/// 16-, and 32-point kernels therefore do **not** migrate,
+/// [`dct_round_shift`] stays the single rounding step, and there is no second
+/// lineage to coexist with.
 #[rustfmt::skip]
-const COSPI_ODD_128: [i64; 32] = [
-    16379, 16340, 16261, 16143, 15986, 15791, 15557, 15286,
-    14978, 14635, 14256, 13842, 13395, 12916, 12406, 11866,
-    11297, 10702, 10080,  9434,  8765,  8076,  7366,  6639,
-     5897,  5139,  4370,  3590,  2801,  2006,  1205,   402,
+pub(crate) const COSPI_128: [i64; 65] = [
+    16384,  16379,  16364,  16340,  16305,  16261,  16207,  16143,
+    16069,  15986,  15893,  15791,  15679,  15557,  15426,  15286,
+    15137,  14978,  14811,  14635,  14449,  14256,  14053,  13842,
+    13623,  13395,  13160,  12916,  12665,  12406,  12140,  11866,
+    11585,  11297,  11003,  10702,  10394,  10080,   9760,   9434,
+     9102,   8765,   8423,   8076,   7723,   7366,   7005,   6639,
+     6270,   5897,   5520,   5139,   4756,   4370,   3981,   3590,
+     3196,   2801,   2404,   2006,   1606,   1205,    804,    402,
+        0,
 ];
 
-/// `round(cos((2n + 1)(2j + 1) * pi / 128) * 2^14)`, folded into the first
-/// quadrant of [`COSPI_ODD_128`].
-const fn cospi_odd_128(n: usize, j: usize) -> i64 {
-    // `(2n + 1)(2j + 1)` is odd, so the folded angle never lands on a
-    // quadrant boundary and every arm below indexes an odd multiple of
-    // `pi / 128`.
-    let r = ((2 * n + 1) * (2 * j + 1)) % 256;
-    if r < 64 {
-        COSPI_ODD_128[(r - 1) / 2]
-    } else if r < 128 {
-        -COSPI_ODD_128[(127 - r) / 2]
-    } else if r < 192 {
-        -COSPI_ODD_128[(r - 129) / 2]
-    } else {
-        COSPI_ODD_128[(255 - r) / 2]
-    }
+/// The 2-point DCT-IV, the base case of the recursion below:
+/// `out[n] = sum_j in[j] * cos(pi * (2n + 1) * (2j + 1) / 8)`, whose four
+/// angles are `pi/8` and `3pi/8` up to sign.
+fn dct_iv2_1d(input: [i64; 2]) -> [i64; 2] {
+    [
+        dct_round_shift(input[0] * COSPI_128[16] + input[1] * COSPI_128[48]),
+        dct_round_shift(input[0] * COSPI_128[48] - input[1] * COSPI_128[16]),
+    ]
 }
 
-/// The 32x32 DCT-IV matrix the odd half of the 64-point inverse DCT applies.
-pub(crate) const DCT4_32: [[i64; 32]; 32] = {
-    let mut table = [[0i64; 32]; 32];
-    let mut n = 0;
-    while n < 32 {
-        let mut j = 0;
-        while j < 32 {
-            table[n][j] = cospi_odd_128(n, j);
-            j += 1;
+/// Defines the `M`-point DCT-IV as a rotation stage over two `M/2`-point
+/// DCT-IVs.
+///
+/// Pairing input `j` with input `M - 1 - j` and splitting the output index
+/// into even and odd gives, with `B_j = pi * (2j + 1) / (4M)`,
+///
+/// ```text
+/// p[j] = in[j] * cos(B_j) - in[M - 1 - j] * sin(B_j)
+/// q[j] = in[j] * sin(B_j) + in[M - 1 - j] * cos(B_j)
+/// out[2m]     = DCT-IV(p)[m] + DST-IV(q)[m]
+/// out[2m + 1] = DCT-IV(p)[m] - DST-IV(q)[m]
+/// ```
+///
+/// where both half-size transforms are over `M/2` points. `DST-IV(q)[m]` is
+/// `DCT-IV(q~)[M/2 - 1 - m]` with `q~[j] = (-1)^j q[j]`, so the sign
+/// alternation is folded into `q` and both halves run the same kernel. Every
+/// angle is a multiple of `pi / 128` at these sizes, so all of them come from
+/// [`COSPI_128`], and each rotation is a two-term dot product with one
+/// [`dct_round_shift`] - the same shape as every other butterfly here.
+macro_rules! dct_iv_kernel {
+    ($name:ident, $m:literal, $half:ident) => {
+        #[doc = concat!("The ", stringify!($m), "-point DCT-IV.")]
+        fn $name(input: [i64; $m]) -> [i64; $m] {
+            const HALF: usize = $m / 2;
+            // `B_j = pi * (2j + 1) / (4M)`, indexed in units of `pi / 128`.
+            const STEP: usize = 128 / (4 * $m);
+            let mut p = [0i64; HALF];
+            let mut q = [0i64; HALF];
+            for j in 0..HALF {
+                let index = (2 * j + 1) * STEP;
+                let (cosine, sine) = (COSPI_128[index], COSPI_128[64 - index]);
+                let (first, second) = (input[j], input[$m - 1 - j]);
+                p[j] = dct_round_shift(first * cosine - second * sine);
+                let rotated = dct_round_shift(first * sine + second * cosine);
+                q[j] = if j % 2 == 0 { rotated } else { -rotated };
+            }
+            let p = $half(p);
+            let q = $half(q);
+            let mut output = [0i64; $m];
+            for m in 0..HALF {
+                let odd = q[HALF - 1 - m];
+                output[2 * m] = p[m] + odd;
+                output[2 * m + 1] = p[m] - odd;
+            }
+            output
         }
-        n += 1;
-    }
-    table
-};
+    };
+}
+
+dct_iv_kernel!(dct_iv4_1d, 4, dct_iv2_1d);
+dct_iv_kernel!(dct_iv8_1d, 8, dct_iv4_1d);
+dct_iv_kernel!(dct_iv16_1d, 16, dct_iv8_1d);
+dct_iv_kernel!(dct_iv32_1d, 32, dct_iv16_1d);
 
 /// The 64-point inverse DCT, in the same 14-bit lineage as the smaller sizes
-/// (see [`COSPI_ODD_128`]).
+/// (see [`COSPI_128`]).
 ///
 /// Written as the textbook even/odd split of the DCT-III rather than as a
 /// twelve-stage partial butterfly: the even-indexed coefficients are exactly a
-/// 32-point inverse DCT, and the odd-indexed ones a 32-point DCT-IV, so
+/// 32-point inverse DCT and the odd-indexed ones a 32-point DCT-IV, so
 ///
 /// ```text
 /// out[n]      = even(n) + odd(n)
@@ -1094,12 +1135,7 @@ pub(crate) const DCT4_32: [[i64; 32]; 32] = {
 /// ```
 ///
 /// for `n` in `0..32`. That reuses [`inverse_dct32_1d`] unchanged and leaves
-/// only the DCT-IV half to define, which is applied here as a direct
-/// 32-term dot product with one [`dct_round_shift`] per output. The dot
-/// product costs more multiplies than a fully factored butterfly would, but it
-/// is the part the vectorized kernels in [`crate::av1_simd`] parallelize, and
-/// keeping the rounding to a single step per output makes the scalar and
-/// vector paths bit-exact by construction.
+/// only [`dct_iv32_1d`] to define.
 fn inverse_dct64_1d(input: [i64; 64]) -> [i64; 64] {
     let mut even = [0i64; 32];
     for (j, slot) in even.iter_mut().enumerate() {
@@ -1107,19 +1143,19 @@ fn inverse_dct64_1d(input: [i64; 64]) -> [i64; 64] {
     }
     let even = inverse_dct32_1d(even);
 
+    let mut odd = [0i64; 32];
+    for (j, slot) in odd.iter_mut().enumerate() {
+        *slot = input[2 * j + 1];
+    }
+    let odd = dct_iv32_1d(odd);
+
     let mut output = [0i64; 64];
-    for (n, &basis) in DCT4_32.iter().enumerate() {
-        let mut sum = 0i64;
-        for (j, &coefficient) in basis.iter().enumerate() {
-            sum += input[2 * j + 1] * coefficient;
-        }
-        let odd = dct_round_shift(sum);
-        output[n] = even[n] + odd;
-        output[63 - n] = even[n] - odd;
+    for n in 0..32 {
+        output[n] = even[n] + odd[n];
+        output[63 - n] = even[n] - odd[n];
     }
     output
 }
-
 
 /// The AV1/VP9-lineage 4-point inverse ADST partial butterfly.
 fn inverse_adst4_1d(input: [i64; 4]) -> [i64; 4] {
@@ -1502,6 +1538,37 @@ fn limit(message: &str) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The 64-point kernel's table must really be the existing 14-bit table at
+    /// twice the angular resolution, not a second lineage wearing the same
+    /// name: every even entry has to equal the `COSPI_k_64` constant the
+    /// smaller kernels use, and every entry has to be the rounded cosine it
+    /// claims to be.
+    #[test]
+    fn the_cosine_tables_are_one_lineage() {
+        #[rustfmt::skip]
+        let legacy = [
+            COSPI_1_64, COSPI_2_64, COSPI_3_64, COSPI_4_64, COSPI_5_64, COSPI_6_64,
+            COSPI_7_64, COSPI_8_64, COSPI_9_64, COSPI_10_64, COSPI_11_64, COSPI_12_64,
+            COSPI_13_64, COSPI_14_64, COSPI_15_64, COSPI_16_64, COSPI_17_64, COSPI_18_64,
+            COSPI_19_64, COSPI_20_64, COSPI_21_64, COSPI_22_64, COSPI_23_64, COSPI_24_64,
+            COSPI_25_64, COSPI_26_64, COSPI_27_64, COSPI_28_64, COSPI_29_64, COSPI_30_64,
+            COSPI_31_64,
+        ];
+        for (index, value) in legacy.into_iter().enumerate() {
+            let k = index + 1;
+            assert_eq!(
+                COSPI_128[2 * k],
+                value,
+                "COSPI_128[{}] must equal COSPI_{k}_64",
+                2 * k
+            );
+        }
+        for (m, &value) in COSPI_128.iter().enumerate() {
+            let exact = (m as f64 * std::f64::consts::PI / 128.0).cos() * f64::from(1 << 14);
+            assert_eq!(value, exact.round() as i64, "COSPI_128[{m}]");
+        }
+    }
 
     #[test]
     fn reconstruction_is_bounded_and_exports_valid_yuv() {
