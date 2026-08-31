@@ -380,12 +380,7 @@ pub fn deblock_frame(
     // sizes and differ only in their loop filter level.
     let chroma_tx_sizes = luma_tx_sizes.and_then(|grid| {
         let u = frame.u.as_ref()?;
-        Some(grid.for_chroma(
-            u.width,
-            u.height,
-            frame.subsampling_x,
-            frame.subsampling_y,
-        ))
+        Some(grid.for_chroma(u.width, u.height, frame.subsampling_x, frame.subsampling_y))
     });
     let chroma_tx_sizes = chroma_tx_sizes.as_ref();
     if params.y_vertical_level > 0 {
@@ -410,7 +405,14 @@ pub fn deblock_frame(
     }
     if let Some(u) = frame.u.as_mut() {
         if params.u_level > 0 {
-            deblock_plane_edges(u, params.u_level, params.sharpness, true, chroma_tx_sizes, true);
+            deblock_plane_edges(
+                u,
+                params.u_level,
+                params.sharpness,
+                true,
+                chroma_tx_sizes,
+                true,
+            );
             deblock_plane_edges(
                 u,
                 params.u_level,
@@ -423,7 +425,14 @@ pub fn deblock_frame(
     }
     if let Some(v) = frame.v.as_mut() {
         if params.v_level > 0 {
-            deblock_plane_edges(v, params.v_level, params.sharpness, true, chroma_tx_sizes, true);
+            deblock_plane_edges(
+                v,
+                params.v_level,
+                params.sharpness,
+                true,
+                chroma_tx_sizes,
+                true,
+            );
             deblock_plane_edges(
                 v,
                 params.v_level,
