@@ -72,6 +72,23 @@ cannot execute is clamped to `SimdIsa::Scalar` rather than silently ignored, so
 the arm you asked for is always a defined one. `simd::active()` reports what is
 in force and `simd::available()` lists what this host can run.
 
+`simd::active_by_site()` reports what each dispatch family resolved to
+individually:
+
+```rust
+for (site, isa) in zvidlib::simd::active_by_site() {
+    println!("{site}: {}", isa.name());
+}
+```
+
+The harness asserts on this before every timed arm, and you should too if you
+are interpreting a surprising result. **A timing difference is not proof the
+switch landed, and the absence of one is not proof it did not.** Some kernels
+are near parity with their scalar reference on some hosts — the HEVC arms come
+out roughly even on Apple Silicon, where LLVM auto-vectorizes the scalar code
+well under `lto = "fat"`, while AV1 deblocking and motion compensation on the
+same host are 3-5x. `active_by_site()` answers the question directly.
+
 ## Build profile
 
 `[profile.bench]` inherits from `[profile.release]`, so benchmarks are built
