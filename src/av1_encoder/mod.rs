@@ -757,24 +757,39 @@ mod nonlossless_tests {
 
     #[test]
     fn zz_probe() {
-        let (width, height) = (640_u32, 352_u32);
-        let pixels = test_pattern(width, height);
-        for q in [1_u8, 32, 80, 160] {
-            let start = std::time::Instant::now();
-            let data = encode(width, height, q, &pixels);
-            let elapsed = start.elapsed();
-            let mut hash: u64 = 0xcbf29ce484222325;
-            for &b in &data {
-                hash ^= u64::from(b);
-                hash = hash.wrapping_mul(0x100000001b3);
+        for (width, height) in [(96_usize, 80_usize), (640, 352)] {
+            let pixels = test_pattern(width as u32, height as u32);
+            for q in [1_u8, 8, 32, 80, 160, 200] {
+                let start = std::time::Instant::now();
+                let fast = tile::FrameEncoder::new(&pixels, width, height, q).encode_with_report();
+                let fast_ms = start.elapsed().as_secs_f64() * 1000.0;
+                let start = std::time::Instant::now();
+                let slow = tile::FrameEncoder::new(&pixels, width, height, q)
+                    .without_search_shortcuts()
+                    .encode_with_report();
+                let slow_ms = start.elapsed().as_secs_f64() * 1000.0;
+                let quality = |report: &tile::SearchReport| {
+                    let recon: Vec<u8> = (0..height)
+                        .flat_map(|row| {
+                            report.reconstruction[row * report.coded_width..][..width].to_vec()
+                        })
+                        .collect();
+                    psnr(&pixels, &recon)
+                };
+                println!(
+                    "PROBE {width}x{height} q={q} bytes {} vs {} ({:+.2}%) psnr {:.3} vs {:.3} ({:+.3}) cand {} vs {} ms {:.1} vs {:.1}",
+                    fast.tile.len(),
+                    slow.tile.len(),
+                    100.0 * (fast.tile.len() as f64 / slow.tile.len() as f64 - 1.0),
+                    quality(&fast),
+                    quality(&slow),
+                    quality(&fast) - quality(&slow),
+                    fast.candidates_evaluated,
+                    slow.candidates_evaluated,
+                    fast_ms,
+                    slow_ms,
+                );
             }
-            let decoded = decode_luma(&data, width, height);
-            println!(
-                "PROBE q={q} bytes={} hash={hash:016x} psnr={:.4} ms={:.1}",
-                data.len(),
-                psnr(&pixels, &decoded),
-                elapsed.as_secs_f64() * 1000.0
-            );
         }
     }
 
@@ -837,8 +852,95 @@ mod nonlossless_tests {
                 .map(|(_, tx_type)| tx_type.clone())
                 .collect::<std::collections::BTreeSet<_>>()
         };
-        assert_eq!(sizes(&covered), sizes(&emittable));
+        // Every transform *type* the set names still wins some block. Every transform *size* it
+        // names is still writable, but the shipped search ranks sizes on the set's DCT alone
+        // (see `tile.rs`), and TX_4X4's wins were exactly the ones the per-block type search
+        // earned it - so the size coverage is asserted against the exhaustive search that
+        // shortcut stands in for, over the same emitting path.
         assert_eq!(types(&covered), types(&emittable));
+        assert!(
+            sizes(&covered).is_subset(&sizes(&emittable)),
+            "the encoder wrote a transform size the decoder cannot read back"
+        );
+        let exhaustively_covered: std::collections::BTreeSet<(usize, String)> =
+            [1_u8, 8, 32, 80, 160, 200]
+                .into_iter()
+                .flat_map(|qindex| {
+                    tile::FrameEncoder::new(&pixels, width as usize, height as usize, qindex)
+                        .without_search_shortcuts()
+                        .encode_with_report()
+                        .trace
+                        .into_iter()
+                        .map(|(size, tx_type)| (size, format!("{tx_type:?}")))
+                })
+                .collect();
+        assert_eq!(sizes(&exhaustively_covered), sizes(&emittable));
+        assert_eq!(types(&exhaustively_covered), types(&emittable));
+    }
+
+    /// The stated bound on what the search shortcuts cost.
+    ///
+    /// Two of the three are exact - a block whose residual cannot pay for one coefficient, and a
+    /// partition whose unsplit cost is already below the split's header charge, are decided by
+    /// the cost function itself rather than by a trial. The third ranks transform sizes and
+    /// partitions on the set's DCT alone instead of on all five types, which is an approximation,
+    /// so this is the assertion that says how large an approximation it is allowed to be.
+    #[test]
+    fn the_search_shortcuts_stay_within_their_rate_and_distortion_bound() {
+        let (width, height) = (96_usize, 80_usize);
+        let pixels = test_pattern(width as u32, height as u32);
+        for qindex in [1_u8, 8, 32, 80, 160, 200] {
+            let fast = tile::FrameEncoder::new(&pixels, width, height, qindex).encode_with_report();
+            let exhaustive = tile::FrameEncoder::new(&pixels, width, height, qindex)
+                .without_search_shortcuts()
+                .encode_with_report();
+            let quality = |report: &tile::SearchReport| {
+                let reconstruction: Vec<u8> = (0..height)
+                    .flat_map(|row| {
+                        report.reconstruction[row * report.coded_width..][..width].to_vec()
+                    })
+                    .collect();
+                psnr(&pixels, &reconstruction)
+            };
+            let (fast_psnr, exhaustive_psnr) = (quality(&fast), quality(&exhaustive));
+            assert!(
+                fast_psnr >= exhaustive_psnr - 0.25,
+                "qindex {qindex} reconstructed at {fast_psnr:.3} dB against the exhaustive \
+                 search's {exhaustive_psnr:.3} dB"
+            );
+            let growth = fast.tile.len() as f64 / exhaustive.tile.len() as f64 - 1.0;
+            assert!(
+                growth <= 0.02,
+                "qindex {qindex} spent {} bytes against the exhaustive search's {} ({:+.2}%)",
+                fast.tile.len(),
+                exhaustive.tile.len(),
+                growth * 100.0
+            );
+            assert!(
+                fast.candidates_evaluated * 4 < exhaustive.candidates_evaluated,
+                "qindex {qindex} evaluated {} transform-type candidates against the exhaustive \
+                 search's {}, which is not the reduction the shortcuts exist for",
+                fast.candidates_evaluated,
+                exhaustive.candidates_evaluated
+            );
+        }
+    }
+
+    /// A frame flat enough that no transform can pay for a single coefficient is coded without
+    /// running any transform at all: the residual is dropped, every block is skipped, and the
+    /// decoder reconstructs the DC prediction it predicted from.
+    #[test]
+    fn a_flat_frame_skips_the_transform_search_entirely() {
+        let (width, height) = (64_usize, 64_usize);
+        let pixels = vec![128_u8; width * height];
+        let report = tile::FrameEncoder::new(&pixels, width, height, 160).encode_with_report();
+        assert_eq!(
+            report.candidates_evaluated, 0,
+            "a flat frame still evaluated {} transform-type candidates",
+            report.candidates_evaluated
+        );
+        let data = encode(width as u32, height as u32, 160, &pixels);
+        assert_eq!(decode_luma(&data, width as u32, height as u32), pixels);
     }
 
     #[test]

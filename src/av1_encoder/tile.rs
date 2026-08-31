@@ -98,6 +98,24 @@ pub(crate) struct FrameEncoder<'a> {
     split_memo: Vec<u8>,
     /// Memoized `choose_tx_size` answers, in the same slot layout as [`Self::split_memo`].
     tx_size_memo: Vec<u8>,
+    /// Set by [`Self::without_search_shortcuts`] to restore the original exhaustive search, so a
+    /// test can compare the shortcuts against the search they stand in for.
+    #[cfg(test)]
+    exhaustive: bool,
+    /// Transform-type candidates actually transformed, quantized and reconstructed, which is the
+    /// work the shortcuts exist to remove.
+    #[cfg(test)]
+    candidates_evaluated: u64,
+}
+
+/// What one encode of a tile did, for the tests that compare two searches against each other.
+#[cfg(test)]
+pub(crate) struct SearchReport {
+    pub(crate) tile: Vec<u8>,
+    pub(crate) reconstruction: Vec<u8>,
+    pub(crate) coded_width: usize,
+    pub(crate) trace: Vec<(usize, Av1TxType)>,
+    pub(crate) candidates_evaluated: u64,
 }
 
 /// One transform type considered for a block, with everything the winner needs to be written:
@@ -165,13 +183,54 @@ impl<'a> FrameEncoder<'a> {
             emitted: Vec::new(),
             split_memo: vec![MEMO_UNSET; MEMO_LEVELS * mi_cols * mi_rows],
             tx_size_memo: vec![MEMO_UNSET; MEMO_LEVELS * mi_cols * mi_rows],
+            #[cfg(test)]
+            exhaustive: false,
+            #[cfg(test)]
+            candidates_evaluated: 0,
         }
+    }
+
+    /// Turns off every search shortcut, leaving the exhaustive `sse + lambda * bits` search over
+    /// all partitions, sizes and types. Only the memoization stays on, because it answers from
+    /// the search rather than in place of it.
+    #[cfg(test)]
+    pub(crate) fn without_search_shortcuts(mut self) -> Self {
+        self.exhaustive = true;
+        self
+    }
+
+    /// Whether the search shortcuts are on. Always, outside tests.
+    #[cfg(test)]
+    fn shortcuts(&self) -> bool {
+        !self.exhaustive
+    }
+
+    /// Whether the search shortcuts are on. Always, outside tests.
+    #[cfg(not(test))]
+    fn shortcuts(&self) -> bool {
+        true
     }
 
     /// Encodes the tile and returns the symbol-coded bytes (`decode_tile`, §5.11.2).
     pub(crate) fn encode(mut self) -> Vec<u8> {
         self.encode_superblocks();
         self.sym.finish()
+    }
+
+    /// Encodes the tile and returns its bytes, the reconstruction a decoder rebuilds from them
+    /// (`coded_w x coded_h`), the `(size, tx_type)` trace, and the number of transform-type
+    /// candidates the searches evaluated - everything a test needs to compare one search against
+    /// another on rate, distortion, coverage and cost at once.
+    #[cfg(test)]
+    pub(crate) fn encode_with_report(mut self) -> SearchReport {
+        self.encode_superblocks();
+        SearchReport {
+            reconstruction: std::mem::take(&mut self.recon),
+            coded_width: self.coded_w,
+            trace: std::mem::take(&mut self.emitted),
+            candidates_evaluated: self.candidates_evaluated,
+            tile: self.sym.finish(),
+        }
     }
 
     /// [`Self::encode`] plus the `(size, tx_type)` of every transform block it wrote.
@@ -284,6 +343,18 @@ impl<'a> FrameEncoder<'a> {
         let whole = self.encode_block(r, c, bw, false);
         self.restore(snapshot);
 
+        // Four sub-blocks each pay their own partition, skip, mode, and tx_size symbols; charging
+        // a flat header cost keeps the search from splitting for a negligible distortion win.
+        const SPLIT_HEADER_BITS: i64 = 24;
+        // A split subtree's cost is a sum of squared errors and positive bit counts, so it is
+        // never negative: once the whole block costs no more than the header the split would
+        // pay, the comparison below cannot come out in the split's favour and the four subtree
+        // searches are pure waste. This is the search's own arithmetic, not an approximation.
+        if self.shortcuts() && whole <= self.lambda * SPLIT_HEADER_BITS {
+            self.split_memo[slot] = 0;
+            return false;
+        }
+
         let half = (bw / 4) >> 1;
         let h = bw / 2;
         let snapshot = self.snapshot(r, c, bw);
@@ -293,9 +364,6 @@ impl<'a> FrameEncoder<'a> {
             + self.encode_partition(r + half, c + half, h, false);
         self.restore(snapshot);
 
-        // Four sub-blocks each pay their own partition, skip, mode, and tx_size symbols; charging
-        // a flat header cost keeps the search from splitting for a negligible distortion win.
-        const SPLIT_HEADER_BITS: i64 = 24;
         let chosen = split + self.lambda * SPLIT_HEADER_BITS < whole;
         self.split_memo[slot] = u8::from(chosen);
         chosen
@@ -471,14 +539,48 @@ impl<'a> FrameEncoder<'a> {
         // this crate has a kernel for is a candidate, and its symbol is its index in the set.
         let set = cdf::get_tx_set(size, false, true);
         let inverse = cdf::tx_type_inverse_set(set);
-        let candidates: Vec<(usize, Av1TxType)> = inverse
+        let mut candidates: Vec<(usize, Av1TxType)> = inverse
             .iter()
             .enumerate()
             .filter_map(|(symbol, &(_, tx_type))| Some((symbol, tx_type?)))
             .collect();
         let scan = cdf::up_right_diagonal_scan(size);
+
+        // Coding nothing costs the residual's own energy plus the single `all_zero` bit, and any
+        // block that codes even one coefficient costs at least `MIN_CODED_BLOCK_BITS`. When the
+        // former is already cheaper, no transform type can win, whatever it does to the
+        // coefficients — so the whole search is skipped and the all-zero block written directly.
+        // This is an exact consequence of the cost function, not an approximation of it: it is
+        // the flat regions of a picture, where most of the exhaustive search was being spent.
+        let energy: i64 = residual
+            .iter()
+            .map(|&sample| i64::from(sample) * i64::from(sample))
+            .sum();
+        if self.shortcuts()
+            && energy + self.lambda * ZERO_BLOCK_BITS < self.lambda * MIN_CODED_BLOCK_BITS
+        {
+            return self.write_zero_block(x, y, block_width, size, prediction, &scan, energy, emit);
+        }
+
+        // Searching every type on every trial multiplies the transform-size and partition
+        // searches by the size of the type set, and those trials only rank *sizes* and
+        // *partitions*: the type each block finally writes is picked by the full search below on
+        // the emitting pass. Ranking the trials on the set's DCT alone is what keeps the search
+        // linear in the number of candidates rather than a product of them.
+        if self.shortcuts() && !emit && candidates.len() > 1 {
+            let representative = candidates
+                .iter()
+                .position(|&(_, tx_type)| tx_type == Av1TxType::DctDct)
+                .unwrap_or(0);
+            candidates = vec![candidates[representative]];
+        }
+
         let mut best: Option<TxCandidate> = None;
         for &(symbol, tx_type) in &candidates {
+            #[cfg(test)]
+            {
+                self.candidates_evaluated += 1;
+            }
             let coefficients = forward_transform(&residual, size, tx_type);
             let levels = self.quantize(&coefficients);
             let reconstructed =
@@ -531,6 +633,36 @@ impl<'a> FrameEncoder<'a> {
             }
         }
         cost
+    }
+
+    /// Writes the all-zero coefficient block whose cost the type search cannot beat, updating
+    /// the reconstruction (which is the prediction, the residual being dropped entirely) and the
+    /// coefficient contexts exactly as a searched block does.
+    #[allow(clippy::too_many_arguments)]
+    fn write_zero_block(
+        &mut self,
+        x: usize,
+        y: usize,
+        block_width: usize,
+        size: usize,
+        prediction: u8,
+        scan: &[usize],
+        energy: i64,
+        emit: bool,
+    ) -> i64 {
+        for row in 0..size {
+            let start = (y + row) * self.coded_w + x;
+            self.recon[start..start + size].fill(prediction);
+        }
+        let levels = vec![0i32; size * size];
+        self.code_coefficients(x >> 2, y >> 2, block_width, size, &levels, scan, emit);
+        #[cfg(test)]
+        if emit {
+            // No `tx_type` symbol follows a block the decoder reads as fully skipped, so the
+            // pair the trace records is the one the search would have defaulted to.
+            self.emitted.push((size, Av1TxType::DctDct));
+        }
+        energy + self.lambda * ZERO_BLOCK_BITS
     }
 
     /// Forward quantization: the exact inverse of the `level * q` dequantization
