@@ -303,7 +303,7 @@ mod tests {
     fn pinning_scalar_reaches_every_dispatch_site() {
         use crate::av1_intra_pred::{Av1IntraSimd, av1_intra_simd};
         use crate::av1_mc::{McContext, SimdLevel, default_level};
-        use crate::hevc::engine::encoder::{rdcost, recon_simd};
+        use crate::hevc::engine::encoder::rdcost;
         use crate::hevc::engine::{simd as hevc_simd, transform_simd};
 
         let _guard = lock();

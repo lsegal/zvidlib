@@ -546,3 +546,185 @@ mod neon {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::simd::{self, SimdIsa};
+
+    /// A small xorshift so the fixtures are deterministic without a dependency.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next_u8(&mut self) -> u8 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 >> 33) as u8
+        }
+    }
+
+    fn bytes(seed: u64, n: usize) -> Vec<u8> {
+        let mut rng = Rng(seed);
+        (0..n).map(|_| rng.next_u8()).collect()
+    }
+
+    /// Reconstruction inputs are 8-bit samples, but the SAO search reads the
+    /// reconstruction as `i32`, so the fixture keeps that width while staying
+    /// in the range a reconstructed picture can actually hold.
+    fn samples(seed: u64, n: usize) -> Vec<i32> {
+        bytes(seed, n).into_iter().map(i32::from).collect()
+    }
+
+    /// Every run length that exercises a full vector body, a partial one, and
+    /// the scalar tail of each backend, plus lengths shorter than one vector.
+    const RUNS: &[usize] = &[0, 1, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 64, 65];
+
+    #[test]
+    fn reconstruction_matches_the_scalar_reference_on_every_instruction_set() {
+        let _guard = simd::test_lock();
+        for &n in RUNS {
+            let src = bytes(0xdead_beef_cafe_f00d, n);
+            let pred = bytes(0x0123_4567_89ab_cdef, n);
+            let mut expected = vec![0i32; n];
+            reconstruct_row_scalar(&mut expected, &src, &pred);
+            for isa in simd::available() {
+                simd::set_override(Some(isa));
+                let mut got = vec![0i32; n];
+                reconstruct_row(&mut got, &src, &pred);
+                assert_eq!(got, expected, "{} reconstruction of {n} samples", isa.name());
+            }
+        }
+        simd::set_override(None);
+    }
+
+    #[test]
+    fn the_reconstruction_of_an_8_bit_source_is_the_source() {
+        // `pred + (src − pred)` is `src`, and `src` is already inside the
+        // 8-bit range, so the clip never fires. This is the property the
+        // lossless PCM writer's reconstruction depends on, and it is checked
+        // here against the dispatched kernel rather than the reference.
+        let _guard = simd::test_lock();
+        let src = bytes(0x5151_2626_3737_4848, 67);
+        let pred = bytes(0x9999_1111_2222_3333, 67);
+        for isa in simd::available() {
+            simd::set_override(Some(isa));
+            let mut got = vec![0i32; src.len()];
+            reconstruct_row(&mut got, &src, &pred);
+            let expected: Vec<i32> = src.iter().map(|&s| i32::from(s)).collect();
+            assert_eq!(got, expected, "{}", isa.name());
+        }
+        simd::set_override(None);
+    }
+
+    #[test]
+    fn the_edge_offset_search_matches_the_scalar_reference_on_every_instruction_set() {
+        let _guard = simd::test_lock();
+        for &n in RUNS {
+            let here = samples(0x1111_2222_3333_4444, n);
+            // Neighbours drawn from an overlapping window of the same fixture
+            // so that all five `edgeIdx` values, including the skipped
+            // category 0, occur rather than only the extremes.
+            let a = samples(0x1111_2222_3333_4445, n);
+            let b = samples(0x1111_2222_3333_4446, n);
+            let src = bytes(0xfeed_face_dead_10cc, n);
+            let mut expected = EdgeStats::default();
+            edge_offset_row_scalar(&here, &a, &b, &src, &mut expected);
+            for isa in simd::available() {
+                simd::set_override(Some(isa));
+                let mut got = EdgeStats::default();
+                edge_offset_row(&here, &a, &b, &src, &mut got);
+                assert_eq!(got, expected, "{} edge search over {n} samples", isa.name());
+            }
+        }
+        simd::set_override(None);
+    }
+
+    #[test]
+    fn every_edge_category_is_reachable_and_counted_once() {
+        // One sample per `edgeIdx` 0..=4, in order, so every arm of the
+        // §8.7.3.2 mapping is exercised including the dropped category 0.
+        let here = [10, 10, 10, 10, 10];
+        let a = [20, 20, 10, 10, 5];
+        let b = [20, 10, 10, 5, 5];
+        let src = [12u8, 13, 14, 15, 16];
+        let mut stats = EdgeStats::default();
+        edge_offset_row_scalar(&here, &a, &b, &src, &mut stats);
+        // edgeIdx 0, 1, 2, 3, 4 => categories 1, 2, (dropped), 3, 4.
+        assert_eq!(stats.counts, [0, 1, 1, 1, 1]);
+        assert_eq!(stats.sums, [0, 2, 3, 5, 6]);
+    }
+
+    #[test]
+    fn the_detected_instruction_set_is_the_best_one_this_machine_supports() {
+        let _guard = simd::test_lock();
+        simd::set_override(None);
+        let expected = match simd::detected() {
+            SimdIsa::Scalar => Isa::Scalar,
+            #[cfg(target_arch = "x86_64")]
+            SimdIsa::Sse41 => Isa::Sse41,
+            #[cfg(target_arch = "x86_64")]
+            SimdIsa::Avx2 => Isa::Avx2,
+            #[cfg(target_arch = "aarch64")]
+            SimdIsa::Neon => Isa::Neon,
+            #[allow(unreachable_patterns)]
+            _ => Isa::Scalar,
+        };
+        assert_eq!(isa(), expected);
+    }
+
+    /// Each vectorized implementation is checked directly rather than only
+    /// through dispatch, so a machine that selects AVX2 still validates the
+    /// SSE4.1 code as well.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn every_supported_x86_implementation_matches_the_scalar_reference() {
+        for &n in RUNS {
+            let src = bytes(0xabcd_ef01_2345_6789, n);
+            let pred = bytes(0x1357_9bdf_0246_8ace, n);
+            let here = samples(0x2222_3333_4444_5555, n);
+            let a = samples(0x2222_3333_4444_5556, n);
+            let b = samples(0x2222_3333_4444_5557, n);
+            let mut recon_expected = vec![0i32; n];
+            reconstruct_row_scalar(&mut recon_expected, &src, &pred);
+            let mut sao_expected = EdgeStats::default();
+            edge_offset_row_scalar(&here, &a, &b, &src, &mut sao_expected);
+            if is_x86_feature_detected!("sse4.1") {
+                let mut got = vec![0i32; n];
+                let mut stats = EdgeStats::default();
+                // SAFETY: the feature was just detected and every slice is `n` long.
+                unsafe {
+                    x86::reconstruct_row_sse41(&mut got, &src, &pred);
+                    x86::edge_offset_row_sse41(&here, &a, &b, &src, &mut stats);
+                }
+                assert_eq!(got, recon_expected, "SSE4.1 reconstruction of {n}");
+                assert_eq!(stats, sao_expected, "SSE4.1 edge search over {n}");
+            }
+            if is_x86_feature_detected!("avx2") {
+                let mut got = vec![0i32; n];
+                let mut stats = EdgeStats::default();
+                // SAFETY: the feature was just detected and every slice is `n` long.
+                unsafe {
+                    x86::reconstruct_row_avx2(&mut got, &src, &pred);
+                    x86::edge_offset_row_avx2(&here, &a, &b, &src, &mut stats);
+                }
+                assert_eq!(got, recon_expected, "AVX2 reconstruction of {n}");
+                assert_eq!(stats, sao_expected, "AVX2 edge search over {n}");
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "destination and prediction rows differ")]
+    fn a_prediction_row_of_the_wrong_length_is_rejected() {
+        let mut dst = [0i32; 8];
+        reconstruct_row(&mut dst, &[0u8; 8], &[0u8; 7]);
+    }
+
+    #[test]
+    #[should_panic(expected = "run and second neighbour differ")]
+    fn a_neighbour_run_of_the_wrong_length_is_rejected() {
+        let mut stats = EdgeStats::default();
+        edge_offset_row(&[0i32; 8], &[0i32; 8], &[0i32; 7], &[0u8; 8], &mut stats);
+    }
+}

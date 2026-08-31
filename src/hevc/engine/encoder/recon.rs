@@ -662,6 +662,45 @@ mod tests {
     }
 
     #[test]
+    fn the_whole_reconstruction_is_identical_on_every_instruction_set() {
+        // The §8.6.6 loop and the SAO parameter search both dispatch through
+        // `hevc_recon`, so pinning each available instruction set in turn has
+        // to leave the reconstructed picture — and the SAO decisions that
+        // shaped it — bit for bit the same.
+        let _guard = crate::simd::test_lock();
+        let cfg = ReconConfig {
+            deblocking: true,
+            sao_luma: true,
+            sao_chroma: true,
+            pcm_loop_filter_disabled: false,
+            ..ReconConfig::default()
+        };
+        let src = source(0);
+        let next = source(3);
+        crate::simd::set_override(Some(crate::simd::SimdIsa::Scalar));
+        let reference = reconstruct_picture(planes(&src), None, &plan(&src, None), cfg);
+        let expected_inter = reconstruct_picture(
+            planes(&next),
+            Some(&reference),
+            &plan(&next, Some(&reference.y)),
+            cfg,
+        );
+        for isa in crate::simd::available() {
+            crate::simd::set_override(Some(isa));
+            let intra = reconstruct_picture(planes(&src), None, &plan(&src, None), cfg);
+            assert_eq!(intra, reference, "{} intra reconstruction", isa.name());
+            let inter = reconstruct_picture(
+                planes(&next),
+                Some(&reference),
+                &plan(&next, Some(&reference.y)),
+                cfg,
+            );
+            assert_eq!(inter, expected_inter, "{} inter reconstruction", isa.name());
+        }
+        crate::simd::set_override(None);
+    }
+
+    #[test]
     fn sao_estimation_does_not_increase_distortion_against_the_source() {
         // The estimator picks per-CTB edge offsets by the SSE reduction they
         // buy, and refuses a class that buys none, so enabling SAO on top of
