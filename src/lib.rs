@@ -10,6 +10,7 @@ pub mod api;
 pub mod audio;
 pub mod av1;
 mod av1_cdf;
+mod av1_cdf_tables;
 mod av1_encoder;
 pub mod av1_entropy;
 pub mod av1_filters;

@@ -557,7 +557,7 @@ impl<'a> LosslessTileDecoder<'a> {
                             "AV1 transform block extends past the coded frame",
                         ));
                     }
-                    self.decode_transform_block(x, y, tx_width, mode)?;
+                    self.decode_transform_block(x, y, block_width, tx_width, mode)?;
                 }
                 transform_x += step;
             }
@@ -597,6 +597,7 @@ impl<'a> LosslessTileDecoder<'a> {
         &mut self,
         x: usize,
         y: usize,
+        block_width: usize,
         tx_width: usize,
         mode: Av1IntraMode,
     ) -> Result<()> {
@@ -610,14 +611,14 @@ impl<'a> LosslessTileDecoder<'a> {
             ));
         }
         if self.base_q_idx == 0 {
-            let coefficients = self.decode_coefficients_4x4(x >> 2, y >> 2)?;
+            let coefficients = self.decode_coefficients_4x4(x >> 2, y >> 2, block_width)?;
             let residuals = inverse_wht_4x4(&coefficients);
             self.apply_intra_prediction(x, y, 4, mode, &residuals);
             self.tx_sizes.set_block(x, y, 4, 4);
             return Ok(());
         }
         let (coefficients, tx_type) =
-            self.decode_coefficients_nonlossless(x >> 2, y >> 2, tx_width, mode)?;
+            self.decode_coefficients_nonlossless(x >> 2, y >> 2, block_width, tx_width, mode)?;
         let dc_quant = get_dc_quant(self.base_q_idx);
         let ac_quant = get_ac_quant(self.base_q_idx);
         let residuals = inverse_transform(&coefficients, tx_width, tx_type, dc_quant, ac_quant);
@@ -746,9 +747,14 @@ impl<'a> LosslessTileDecoder<'a> {
         }
     }
 
-    fn decode_coefficients_4x4(&mut self, x4: usize, y4: usize) -> Result<[i32; 16]> {
+    fn decode_coefficients_4x4(
+        &mut self,
+        x4: usize,
+        y4: usize,
+        block_width: usize,
+    ) -> Result<[i32; 16]> {
         let (coefficients, _skipped) =
-            self.decode_coefficient_levels(x4, y4, 4, &cdf::DEFAULT_SCAN_4X4)?;
+            self.decode_coefficient_levels(x4, y4, block_width, 4, &cdf::DEFAULT_SCAN_4X4)?;
         let mut levels = [0i32; 16];
         levels.copy_from_slice(&coefficients);
         Ok(levels)
@@ -784,11 +790,13 @@ impl<'a> LosslessTileDecoder<'a> {
         &mut self,
         x4: usize,
         y4: usize,
+        block_width: usize,
         tx_width: usize,
         mode: Av1IntraMode,
     ) -> Result<(Vec<i32>, Av1TxType)> {
         let scan = cdf::up_right_diagonal_scan(tx_width.min(MAX_CODED_TX_WIDTH));
-        let (coefficients, skipped) = self.decode_coefficient_levels(x4, y4, tx_width, &scan)?;
+        let (coefficients, skipped) =
+            self.decode_coefficient_levels(x4, y4, block_width, tx_width, &scan)?;
         // tx_type is only signaled for a transform block that actually has
         // nonzero coefficients (a fully skipped block is implicitly
         // DCT_DCT, though its value is irrelevant since inverse_transform
@@ -806,10 +814,17 @@ impl<'a> LosslessTileDecoder<'a> {
         &mut self,
         x4: usize,
         y4: usize,
+        block_width: usize,
         size: usize,
         scan: &[usize],
     ) -> Result<(Vec<i32>, bool)> {
         let plane_type = 0;
+        // The specification selects every coefficient CDF below by a
+        // quantizer context derived from `base_q_idx` and (except for
+        // `dc_sign`) by a transform-size context. A lossless TX_4X4 stream
+        // lands on `qctx = 0`, `txSzCtx = 0`.
+        let qctx = cdf::coeff_qctx(self.base_q_idx);
+        let tx_size_ctx = cdf::coeff_tx_size_ctx(size);
         let count = size * size;
         let units = (size / 4).max(1);
         // Coefficients are coded only in the transform block's upper-left
@@ -818,12 +833,16 @@ impl<'a> LosslessTileDecoder<'a> {
         let coded = size.min(MAX_CODED_TX_WIDTH);
         let coded_count = coded * coded;
         debug_assert_eq!(scan.len(), coded_count);
-        let skip_context = self.txb_skip_context(x4, y4, units);
-        if self.symbols.symbol(&cdf::TXB_SKIP[skip_context])? == 1 {
+        let skip_context = self.txb_skip_context(x4, y4, units, block_width, size);
+        if self
+            .symbols
+            .symbol(cdf::txb_skip_cdf(qctx, tx_size_ctx, skip_context))?
+            == 1
+        {
             self.set_coefficient_context(x4, y4, units, 0, 0);
             return Ok((vec![0; count], true));
         }
-        let eob_point = self.symbols.symbol(cdf::eob_pt_cdf(coded, plane_type))? + 1;
+        let eob_point = self.symbols.symbol(cdf::eob_pt_cdf(qctx, coded, plane_type))? + 1;
         let eob = if eob_point < 2 {
             eob_point
         } else {
@@ -832,7 +851,12 @@ impl<'a> LosslessTileDecoder<'a> {
             if eob_point >= 3 {
                 extra = self
                     .symbols
-                    .symbol(&cdf::EOB_EXTRA[plane_type][eob_point - 3])?
+                    .symbol(cdf::eob_extra_cdf(
+                        qctx,
+                        tx_size_ctx,
+                        plane_type,
+                        eob_point - 3,
+                    ))?
                     << (bit_count - 1);
                 if bit_count > 1 {
                     extra |= usize::try_from(self.symbols.literal((bit_count - 1) as u8)?)
@@ -851,24 +875,33 @@ impl<'a> LosslessTileDecoder<'a> {
             let position = scan[coefficient];
             let mut level = if coefficient == eob - 1 {
                 i32::try_from(
-                    self.symbols.symbol(
-                        &cdf::COEFF_BASE_EOB[plane_type]
-                            [coeff_base_eob_context(coefficient, coded_count)],
-                    )? + 1,
+                    self.symbols.symbol(cdf::coeff_base_eob_cdf(
+                        qctx,
+                        tx_size_ctx,
+                        plane_type,
+                        coeff_base_eob_context(coefficient, coded_count),
+                    ))? + 1,
                 )
                 .expect("coefficient base level fits i32")
             } else {
-                i32::try_from(self.symbols.symbol(
-                    &cdf::COEFF_BASE[plane_type][coeff_base_context(position, &levels, coded)],
-                )?)
+                i32::try_from(self.symbols.symbol(cdf::coeff_base_cdf(
+                    qctx,
+                    tx_size_ctx,
+                    plane_type,
+                    coeff_base_context(position, &levels, coded),
+                ))?)
                 .expect("coefficient base level fits i32")
             };
             if level > NUM_BASE_LEVELS {
                 let context = coeff_br_context(position, &levels, coded);
                 for _ in 0..4 {
-                    let value =
-                        i32::try_from(self.symbols.symbol(&cdf::COEFF_BR[plane_type][context])?)
-                            .expect("coefficient range value fits i32");
+                    let value = i32::try_from(self.symbols.symbol(cdf::coeff_br_cdf(
+                        qctx,
+                        tx_size_ctx,
+                        plane_type,
+                        context,
+                    ))?)
+                    .expect("coefficient range value fits i32");
                     level += value;
                     if value < 3 {
                         break;
@@ -882,9 +915,11 @@ impl<'a> LosslessTileDecoder<'a> {
                 continue;
             }
             let negative = if coefficient == 0 {
-                self.symbols
-                    .symbol(&cdf::DC_SIGN[plane_type][self.dc_sign_context(x4, y4, units)])?
-                    != 0
+                self.symbols.symbol(cdf::dc_sign_cdf(
+                    qctx,
+                    plane_type,
+                    self.dc_sign_context(x4, y4, units),
+                ))? != 0
             } else {
                 self.symbols.literal(1)? != 0
             };
@@ -953,7 +988,25 @@ impl<'a> LosslessTileDecoder<'a> {
     /// `getTXBSkipCtx` (spec §8.3.2), whose `top`/`left` are the maxima of
     /// the neighbouring level contexts across the transform block's own
     /// width and height in 4x4 units.
-    fn txb_skip_context(&self, x4: usize, y4: usize, units: usize) -> usize {
+    ///
+    /// The specification's first case returns context 0 outright when the
+    /// transform covers the whole coding block, without consulting a
+    /// neighbour at all. Every coding block this decoder codes is square,
+    /// so that is exactly `tx_width == block_width`. It cannot fire on a
+    /// lossless stream, whose transforms are all 4x4 while `decode_partition`
+    /// never splits below an 8x8 coding block, but it fires constantly once
+    /// `TX_MODE_LARGEST` gives a block a single block-sized transform.
+    fn txb_skip_context(
+        &self,
+        x4: usize,
+        y4: usize,
+        units: usize,
+        block_width: usize,
+        tx_width: usize,
+    ) -> usize {
+        if tx_width >= block_width {
+            return 0;
+        }
         let top = self.above_level[x4..(x4 + units).min(self.mi_cols)]
             .iter()
             .copied()
