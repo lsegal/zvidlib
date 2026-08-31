@@ -5,6 +5,7 @@ pub mod cabac;
 pub mod nal;
 pub mod pcm;
 pub mod quant;
+pub mod residual;
 pub mod rdcost;
 pub mod rdo;
 pub mod recon;
