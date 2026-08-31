@@ -22,6 +22,8 @@
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use std::sync::OnceLock;
 
+use crate::simd::SimdIsa;
+
 /// The kernel implementation selected for this process.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Av1IntraSimd {
@@ -37,9 +39,19 @@ pub enum Av1IntraSimd {
 
 /// Reports which intra-prediction kernel implementation this process uses.
 ///
-/// The answer is fixed for the lifetime of the process; CPU feature detection
-/// runs at most once.
+/// CPU feature detection runs at most once, but a [`crate::simd::set_override`]
+/// override is consulted *ahead of* that cache on every call, so pinning an
+/// instruction set (notably [`SimdIsa::Scalar`]) takes effect immediately even
+/// after detection has already resolved.
 pub fn av1_intra_simd() -> Av1IntraSimd {
+    if let Some(isa) = crate::simd::override_isa() {
+        return match isa {
+            SimdIsa::Scalar => Av1IntraSimd::Scalar,
+            SimdIsa::Sse41 => Av1IntraSimd::Sse41,
+            SimdIsa::Avx2 => Av1IntraSimd::Avx2,
+            SimdIsa::Neon => Av1IntraSimd::Neon,
+        };
+    }
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
         static DETECTED: OnceLock<Av1IntraSimd> = OnceLock::new();

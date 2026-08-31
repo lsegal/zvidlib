@@ -68,6 +68,28 @@ impl Backend {
     }
 }
 
+/// Maps the crate-wide SIMD override, if any, onto this module's [`Backend`].
+///
+/// The override names SSE4.1, so an x86_64 host that also has SSE4.2 gets
+/// [`Backend::Sse42`] — the strict superset this module prefers, and the only
+/// SSE backend that can run the vector dequantization clip.
+#[inline]
+fn overridden_backend() -> Option<Backend> {
+    use crate::simd::SimdIsa;
+    Some(match crate::simd::override_isa()? {
+        SimdIsa::Scalar => Backend::Scalar,
+        SimdIsa::Sse41 => {
+            if Backend::Sse42.supported() {
+                Backend::Sse42
+            } else {
+                Backend::Sse41
+            }
+        }
+        SimdIsa::Avx2 => Backend::Avx2,
+        SimdIsa::Neon => Backend::Neon,
+    })
+}
+
 /// Cache for [`detected`]: `0` = not probed yet, otherwise `1 +` the
 /// backend's index in [`PRIORITY`].
 static DETECTED: AtomicU8 = AtomicU8::new(0);
@@ -82,8 +104,15 @@ const PRIORITY: [Backend; 4] = [Backend::Avx2, Backend::Neon, Backend::Sse42, Ba
 ///
 /// The CPU feature probe runs once and is cached; the result never
 /// changes for the lifetime of the process.
+///
+/// A [`crate::simd::set_override`] override wins over the cache and is
+/// re-read on every call, so an instruction set pinned after the first probe
+/// still reaches the inverse transform and dequantization kernels.
 #[must_use]
 pub fn detected() -> Backend {
+    if let Some(backend) = overridden_backend() {
+        return backend;
+    }
     let cached = DETECTED.load(Ordering::Relaxed);
     if cached != 0 {
         return PRIORITY

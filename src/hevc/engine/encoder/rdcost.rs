@@ -64,7 +64,29 @@ fn detect_isa() -> u8 {
     ISA_SCALAR
 }
 
+/// Maps the crate-wide SIMD override, if any, onto this module's ISA codes.
+#[inline]
+fn overridden_isa_code() -> Option<u8> {
+    use crate::simd::SimdIsa;
+    Some(match crate::simd::override_isa()? {
+        SimdIsa::Scalar => ISA_SCALAR,
+        #[cfg(target_arch = "x86_64")]
+        SimdIsa::Sse41 => ISA_SSE41,
+        #[cfg(target_arch = "x86_64")]
+        SimdIsa::Avx2 => ISA_AVX2,
+        #[cfg(target_arch = "aarch64")]
+        SimdIsa::Neon => ISA_NEON,
+        #[allow(unreachable_patterns)]
+        _ => ISA_SCALAR,
+    })
+}
+
+/// The cached ISA code, with any [`crate::simd::set_override`] override taking
+/// precedence so it applies even after detection has resolved.
 fn isa_code() -> u8 {
+    if let Some(code) = overridden_isa_code() {
+        return code;
+    }
     let cached = DETECTED_ISA.load(Ordering::Relaxed);
     if cached != ISA_UNDETECTED {
         return cached;

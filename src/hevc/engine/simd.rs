@@ -63,10 +63,39 @@ pub enum Isa {
 /// [`Isa::Neon`] unconditionally; `x86_64` probes AVX2 then SSE4.1 at
 /// runtime; every other target (including `wasm32`) reports
 /// [`Isa::Scalar`].
+///
+/// A [`crate::simd::set_override`] override is consulted ahead of the cache on
+/// every call, so pinning an instruction set still reaches these kernels after
+/// detection has resolved.
 #[must_use]
 pub fn detected_isa() -> Isa {
+    if let Some(isa) = overridden_isa() {
+        return isa;
+    }
     static ISA: OnceLock<Isa> = OnceLock::new();
     *ISA.get_or_init(detect)
+}
+
+/// Maps the crate-wide SIMD override, if any, onto this module's [`Isa`].
+///
+/// Variants the target architecture does not compile in collapse to
+/// [`Isa::Scalar`]; [`crate::simd::set_override`] already refuses to pin an
+/// instruction set the host cannot execute, so that arm is unreachable in
+/// practice and only exists to keep the mapping total.
+#[inline]
+fn overridden_isa() -> Option<Isa> {
+    use crate::simd::SimdIsa;
+    Some(match crate::simd::override_isa()? {
+        SimdIsa::Scalar => Isa::Scalar,
+        #[cfg(target_arch = "x86_64")]
+        SimdIsa::Sse41 => Isa::Sse41,
+        #[cfg(target_arch = "x86_64")]
+        SimdIsa::Avx2 => Isa::Avx2,
+        #[cfg(target_arch = "aarch64")]
+        SimdIsa::Neon => Isa::Neon,
+        #[allow(unreachable_patterns)]
+        _ => Isa::Scalar,
+    })
 }
 
 fn detect() -> Isa {
@@ -975,19 +1004,29 @@ pub(crate) mod in_loop {
 
     static ISA: AtomicU8 = AtomicU8::new(ISA_UNKNOWN);
 
-    /// Test-only switch that forces the scalar path, so the benchmark can
-    /// time both families in one process and the bit-exactness tests can pin
-    /// the reference side.
-    #[cfg(test)]
+    /// Switch that forces the scalar path, so a benchmark can time both
+    /// families in one process and the bit-exactness tests can pin the
+    /// reference side.
+    ///
+    /// Kept as an in-crate shorthand for the public
+    /// [`crate::simd::set_override`]`(Some(SimdIsa::Scalar))`, which the
+    /// dispatcher honours as well; it is no longer `#[cfg(test)]`-gated
+    /// because the in-loop filter kernels have to be switchable from an
+    /// external `benches/` target too.
     pub(crate) static FORCE_SCALAR: core::sync::atomic::AtomicBool =
         core::sync::atomic::AtomicBool::new(false);
 
     /// Probe (once) and return the kernel family to use.
+    ///
+    /// The crate-wide override and [`FORCE_SCALAR`] are both checked ahead of
+    /// the cached probe, so either one takes effect immediately.
     #[inline]
     fn isa() -> u8 {
-        #[cfg(test)]
         if FORCE_SCALAR.load(Ordering::Relaxed) {
             return ISA_SCALAR;
+        }
+        if let Some(isa) = overridden_isa_code() {
+            return isa;
         }
         let cached = ISA.load(Ordering::Relaxed);
         if cached != ISA_UNKNOWN {
@@ -1018,6 +1057,24 @@ pub(crate) mod in_loop {
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     fn detect() -> u8 {
         ISA_SCALAR
+    }
+
+    /// Maps the crate-wide SIMD override, if any, onto this module's kernel
+    /// family codes.
+    #[inline]
+    fn overridden_isa_code() -> Option<u8> {
+        use crate::simd::SimdIsa;
+        Some(match crate::simd::override_isa()? {
+            SimdIsa::Scalar => ISA_SCALAR,
+            #[cfg(target_arch = "x86_64")]
+            SimdIsa::Sse41 => ISA_SSE41,
+            #[cfg(target_arch = "x86_64")]
+            SimdIsa::Avx2 => ISA_AVX2,
+            #[cfg(target_arch = "aarch64")]
+            SimdIsa::Neon => ISA_NEON,
+            #[allow(unreachable_patterns)]
+            _ => ISA_SCALAR,
+        })
     }
 
     // ---------------------------------------------------------------------------
