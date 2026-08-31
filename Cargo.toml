@@ -29,6 +29,15 @@ name = "codec"
 path = "benches/codec.rs"
 harness = false
 
+# The AV1 encoder groups are their own target: they are the only ones that reach
+# into `zvidlib::av1_encoder`'s per-stage modules, and keeping them separate lets
+# `cargo bench --bench av1_encode` measure the encoder without also paying for the
+# decode-side fixtures `codec` loads. Both targets share `benches/support/`.
+[[bench]]
+name = "av1_encode"
+path = "benches/av1_encode.rs"
+harness = false
+
 [features]
 default = []
 # Additive, off by default. The crate's SIMD kernels dispatch at run time rather

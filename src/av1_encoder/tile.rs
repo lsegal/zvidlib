@@ -1,5 +1,5 @@
 //! The single-tile, all-intra, lossless encoder: superblock/partition iteration (§5.11.2/.4),
-//! DC intra prediction (§7.11.2.5), the forward 4×4 WHT (via `gamut-dsp`), and coefficient coding
+//! DC intra prediction (§7.11.2.5), the forward 4×4 WHT (via [`super::wht::fwht4x4`]), and coefficient coding
 //! with full context derivation (§5.11.39, §8.3.2).
 //!
 //! All coded blocks are square `DC_PRED` intra blocks; partitions are `PARTITION_NONE` except at
@@ -18,7 +18,7 @@ const NUM_BASE_LEVELS: i32 = 2;
 const COEFF_BASE_PLUS_RANGE: i32 = 14;
 
 /// Encoder for the single tile that spans the whole frame.
-pub(crate) struct FrameEncoder<'a> {
+pub struct FrameEncoder<'a> {
     plane: &'a [u8],
     width: usize,
     height: usize,
@@ -37,7 +37,7 @@ pub(crate) struct FrameEncoder<'a> {
 
 impl<'a> FrameEncoder<'a> {
     /// Creates an encoder over one tightly packed 8-bit monochrome plane.
-    pub(crate) fn new(plane: &'a [u8], width: usize, height: usize) -> Self {
+    pub fn new(plane: &'a [u8], width: usize, height: usize) -> Self {
         let mi_cols = 2 * ((width + 7) >> 3);
         let mi_rows = 2 * ((height + 7) >> 3);
         Self {
@@ -58,7 +58,7 @@ impl<'a> FrameEncoder<'a> {
     }
 
     /// Encodes the tile and returns the symbol-coded bytes (`decode_tile`, §5.11.2).
-    pub(crate) fn encode(mut self) -> Vec<u8> {
+    pub fn encode(mut self) -> Vec<u8> {
         const SB4: usize = 16; // 64×64 superblock in MI units
         let mut r = 0;
         while r < self.mi_rows {

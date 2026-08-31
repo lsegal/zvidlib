@@ -5,18 +5,13 @@
 //! unit containing a sequence header and key frame, so MP4 random access does
 //! not depend on encoder-private state.
 
-#[allow(dead_code)]
-mod bitwriter;
-#[allow(dead_code)]
-mod cdf;
-mod headers;
-#[allow(dead_code)]
-mod leb128;
-#[allow(dead_code)]
-mod symbol;
-mod tile;
-#[allow(dead_code)]
-pub(crate) mod wht;
+pub mod bitwriter;
+pub mod cdf;
+pub mod headers;
+pub mod leb128;
+pub mod symbol;
+pub mod tile;
+pub mod wht;
 
 use crate::{
     Codec, CodecImplementation, CodecProfile, CodecSupport, ColorRange, EncodedSample,

@@ -4,7 +4,7 @@
 //! Only the slices the encoder touches are included: `base_q_idx == 0` ⇒ coefficient-CDF quant
 //! context 0, and `TX_4X4` only. CDFs are stored in the spec's cumulative form (rising to 32768)
 //! with the trailing adaptation-count element dropped, so each row is ready to pass straight to
-//! [`gamut_bitstream::SymbolEncoder::encode_symbol`] (the M0 frame sets `disable_cdf_update = 1`,
+//! [`SymbolEncoder::encode_symbol`](super::symbol::SymbolEncoder::encode_symbol) (the M0 frame sets `disable_cdf_update = 1`,
 //! so the tables are never adapted). These values are extracted verbatim from the specification.
 
 // --- Partition CDFs (Default_Partition_W*_Cdf), indexed [ctx]. ---

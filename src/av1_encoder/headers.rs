@@ -16,11 +16,11 @@ use crate::{Error, ErrorKind, Result};
 /// `OBU_SEQUENCE_HEADER`.
 const OBU_SEQUENCE_HEADER: u8 = 1;
 /// `OBU_FRAME` (frame header + tile group in one OBU).
-pub(crate) const OBU_FRAME: u8 = 6;
+pub const OBU_FRAME: u8 = 6;
 /// `order_hint_bits_minus_1 + 1`: enough range for any reasonable seek distance while every
 /// frame stays an independent key frame (`refresh_frame_flags` is always implied `0xff`, so the
 /// actual order-hint value never affects reference selection).
-pub(crate) const ORDER_HINT_BITS: u32 = 3;
+pub const ORDER_HINT_BITS: u32 = 3;
 
 /// The sequence-header field values that `gamut-avif` must mirror into `av1C` and `colr`
 /// (AV1-ISOBMFF v1.3.0 §2.3.4). Fixed by the M0 config except `seq_level_idx_0`, which depends on
@@ -106,7 +106,7 @@ fn tile_log2(blk_size: u32, target: u32) -> u32 {
 }
 
 /// Appends an OBU (header byte, `obu_has_size_field = 1`, LEB128 size, payload) to `out`.
-pub(crate) fn write_obu(out: &mut Vec<u8>, obu_type: u8, payload: &[u8]) {
+pub fn write_obu(out: &mut Vec<u8>, obu_type: u8, payload: &[u8]) {
     // obu_forbidden_bit=0, obu_type, obu_extension_flag=0, obu_has_size_field=1, reserved=0.
     out.push((obu_type << 3) | 0b10);
     write_leb128(out, payload.len() as u64);
@@ -118,7 +118,7 @@ pub(crate) fn write_obu(out: &mut Vec<u8>, obu_type: u8, payload: &[u8]) {
 /// (AV1 §5.2, §5.3.4). Non-reduced (rather than a reduced still-picture header) is required so
 /// [`crate::av1_inter_decoder::Av1InterDecoder`] can decode this encoder's own output natively —
 /// see the module documentation.
-pub(crate) fn sequence_header_payload(cfg: &Av1StillConfig, width: u32, height: u32) -> Vec<u8> {
+pub fn sequence_header_payload(cfg: &Av1StillConfig, width: u32, height: u32) -> Vec<u8> {
     let mut w = BitWriter::new();
     w.put_bits(u32::from(cfg.seq_profile), 3); // seq_profile
     w.put_bit(0); // still_picture
@@ -186,7 +186,7 @@ pub(crate) fn sequence_header_payload(cfg: &Av1StillConfig, width: u32, height: 
 ///
 /// The returned bytes precede the tile (symbol-coded) data; together they form the frame OBU
 /// payload (AV1 §5.10).
-pub(crate) fn frame_header_payload(
+pub fn frame_header_payload(
     width: u32,
     height: u32,
     mi_cols: u32,
@@ -241,7 +241,7 @@ pub(crate) fn frame_header_payload(
 }
 
 /// Wraps the sequence-header and frame OBUs into the temporal unit placed in `mdat`.
-pub(crate) fn assemble_temporal_unit(seq_payload: &[u8], frame_payload: &[u8]) -> Vec<u8> {
+pub fn assemble_temporal_unit(seq_payload: &[u8], frame_payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     write_obu(&mut out, OBU_SEQUENCE_HEADER, seq_payload);
     write_obu(&mut out, OBU_FRAME, frame_payload);

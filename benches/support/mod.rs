@@ -114,7 +114,7 @@ pub fn report_throughput<M: criterion::measurement::Measurement>(
 }
 
 /// Minimal executor for the crate's `async` I/O entry points.
-fn block_on<T>(future: impl Future<Output = T>) -> T {
+pub fn block_on<T>(future: impl Future<Output = T>) -> T {
     let waker = Waker::noop();
     let mut context = Context::from_waker(waker);
     let mut future = Box::pin(future);
