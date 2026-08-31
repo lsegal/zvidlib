@@ -238,7 +238,15 @@ pub(crate) fn frame_header_payload(
     w.put_bit(0); // using_qmatrix = 0
 
     w.put_bit(0); // segmentation_enabled = 0
-    // delta_q_params / delta_lf_params: never signalled, matching the decoder's parse.
+    // delta_q_params() (spec §5.9.17): `delta_q_present` is read for every frame with
+    // base_q_idx > 0, gated on the quantizer alone rather than on segmentation. Omitting it
+    // left every non-lossless frame header one bit short from here on, which an independent
+    // decoder (ffmpeg 7.1's dav1d) rejects while parsing the header. This encoder signals no
+    // per-block delta-Q, so the bit is 0 and delta_lf_params() (§5.9.18) is then absent
+    // entirely, being gated on `delta_q_present`.
+    if base_q_idx != 0 {
+        w.put_bit(0); // delta_q_present = 0
+    }
     // cdef_params / lr_params: the sequence header disables both, so neither emits bits.
     if base_q_idx != 0 {
         // loop_filter_params() (§5.9.11): both luma levels 0, which suppresses the chroma

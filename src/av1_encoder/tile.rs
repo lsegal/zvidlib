@@ -307,7 +307,7 @@ impl<'a> FrameEncoder<'a> {
                     if sx >= self.coded_w || sy >= self.coded_h {
                         continue; // transform block entirely outside the frame
                     }
-                    self.lossless_transform_block(sx, sy);
+                    self.lossless_transform_block(sx, sy, bw);
                 }
             }
             return 0;
@@ -372,7 +372,7 @@ impl<'a> FrameEncoder<'a> {
                 let x = c * 4 + tx * 4;
                 let y = r * 4 + ty * 4;
                 if x < self.coded_w && y < self.coded_h {
-                    cost += self.transform_block(x, y, tx_width, emit);
+                    cost += self.transform_block(x, y, bw, tx_width, emit);
                 }
                 tx += step;
             }
@@ -383,7 +383,7 @@ impl<'a> FrameEncoder<'a> {
 
     /// Lossless 4x4 transform block: the WHT of the source residual against a DC prediction
     /// taken from the (padded) source, which is the reconstruction under lossless coding.
-    fn lossless_transform_block(&mut self, sx: usize, sy: usize) {
+    fn lossless_transform_block(&mut self, sx: usize, sy: usize, block_width: usize) {
         let avg = self.lossless_dc_avg(sx, sy);
         let mut res = [0i32; 16];
         for i in 0..4 {
@@ -392,14 +392,29 @@ impl<'a> FrameEncoder<'a> {
             }
         }
         let quant = fwht4x4(&res);
-        self.code_coefficients(sx >> 2, sy >> 2, 4, &quant, &cdf::DEFAULT_SCAN_4X4, true);
+        self.code_coefficients(
+            sx >> 2,
+            sy >> 2,
+            block_width,
+            4,
+            &quant,
+            &cdf::DEFAULT_SCAN_4X4,
+            true,
+        );
     }
 
     /// Non-lossless transform block: DC prediction from the reconstruction, then the cheapest
     /// `tx_type` of the reduced set the decoder reads back. Returns the block's cost and leaves
     /// the reconstruction and coefficient contexts updated whether or not symbols were emitted,
     /// because later blocks in the same trial depend on both.
-    fn transform_block(&mut self, x: usize, y: usize, size: usize, emit: bool) -> i64 {
+    fn transform_block(
+        &mut self,
+        x: usize,
+        y: usize,
+        block_width: usize,
+        size: usize,
+        emit: bool,
+    ) -> i64 {
         let prediction = self.dc_prediction(x, y, size);
         let mut residual = vec![0i32; size * size];
         for row in 0..size {
@@ -460,7 +475,7 @@ impl<'a> FrameEncoder<'a> {
             add_residual_row(&reconstructed[row * size..(row + 1) * size], destination);
         }
 
-        let coded = self.code_coefficients(x >> 2, y >> 2, size, &levels, &scan, emit);
+        let coded = self.code_coefficients(x >> 2, y >> 2, block_width, size, &levels, &scan, emit);
         #[cfg(test)]
         if emit {
             self.emitted.push((size, tx_type));
@@ -558,17 +573,23 @@ impl<'a> FrameEncoder<'a> {
     /// block carried any (`false` means `all_zero` was signalled). The coefficient contexts are
     /// updated either way; only the symbol writes are suppressed when `emit` is false, so a
     /// speculative trial and the replay that follows it derive identical contexts.
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     fn code_coefficients(
         &mut self,
         x4: usize,
         y4: usize,
+        block_width: usize,
         size: usize,
         quant: &[i32],
         scan: &[usize],
         emit: bool,
     ) -> bool {
         let ptype = 0;
+        // The specification selects every coefficient CDF below by a quantizer context derived
+        // from `base_q_idx` and (except for `dc_sign`) by a transform-size context, exactly as
+        // the decoders do. A lossless TX_4X4 frame lands on `qctx = 0`, `txSzCtx = 0`.
+        let qctx = cdf::coeff_qctx(self.qindex);
+        let tx_ctx = cdf::coeff_tx_size_ctx(size);
         let units = size / 4;
         let count = size * size;
         debug_assert_eq!(quant.len(), count);
@@ -581,10 +602,12 @@ impl<'a> FrameEncoder<'a> {
             }
         }
 
-        let txb_ctx = self.txb_skip_ctx(x4, y4, units);
+        let txb_ctx = self.txb_skip_ctx(x4, y4, units, block_width, size);
         if emit {
-            self.sym
-                .encode_symbol(usize::from(eob == 0), &cdf::TXB_SKIP[txb_ctx]);
+            self.sym.encode_symbol(
+                usize::from(eob == 0),
+                cdf::txb_skip_cdf(qctx, tx_ctx, txb_ctx),
+            );
         }
         if eob == 0 {
             self.set_ctx(x4, y4, units, 0, 0);
@@ -595,7 +618,7 @@ impl<'a> FrameEncoder<'a> {
         let eobpt = eobpt_from_eob(eob);
         if emit {
             self.sym
-                .encode_symbol(eobpt - 1, cdf::eob_pt_cdf(size, ptype));
+                .encode_symbol(eobpt - 1, cdf::eob_pt_cdf(qctx, size, ptype));
         }
         if eobpt >= 3 {
             let nbits = eobpt - 2;
@@ -604,7 +627,7 @@ impl<'a> FrameEncoder<'a> {
             if emit {
                 self.sym.encode_symbol(
                     (extra >> (nbits - 1)) & 1,
-                    &cdf::EOB_EXTRA[ptype][eobpt - 3],
+                    cdf::eob_extra_cdf(qctx, tx_ctx, ptype, eobpt - 3),
                 );
                 let mut i = nbits as isize - 2;
                 while i >= 0 {
@@ -624,14 +647,16 @@ impl<'a> FrameEncoder<'a> {
                 if emit {
                     self.sym.encode_symbol(
                         (level.min(3) - 1) as usize,
-                        &cdf::COEFF_BASE_EOB[ptype][ctx],
+                        cdf::coeff_base_eob_cdf(qctx, tx_ctx, ptype, ctx),
                     );
                 }
             } else {
                 let ctx = coeff_base_ctx(pos, &levels, size);
                 if emit {
-                    self.sym
-                        .encode_symbol(level.min(3) as usize, &cdf::COEFF_BASE[ptype][ctx]);
+                    self.sym.encode_symbol(
+                        level.min(3) as usize,
+                        cdf::coeff_base_cdf(qctx, tx_ctx, ptype, ctx),
+                    );
                 }
             }
             if level > NUM_BASE_LEVELS {
@@ -640,8 +665,10 @@ impl<'a> FrameEncoder<'a> {
                 for _ in 0..4 {
                     let brv = rem.min(3);
                     if emit {
-                        self.sym
-                            .encode_symbol(brv as usize, &cdf::COEFF_BR[ptype][br_ctx]);
+                        self.sym.encode_symbol(
+                            brv as usize,
+                            cdf::coeff_br_cdf(qctx, tx_ctx, ptype, br_ctx),
+                        );
                     }
                     rem -= brv;
                     if brv < 3 {
@@ -661,7 +688,7 @@ impl<'a> FrameEncoder<'a> {
                     if c == 0 {
                         let ctx = self.dc_sign_ctx(x4, y4, units);
                         self.sym
-                            .encode_symbol(usize::from(neg), &cdf::DC_SIGN[ptype][ctx]);
+                            .encode_symbol(usize::from(neg), cdf::dc_sign_cdf(qctx, ptype, ctx));
                     } else {
                         self.sym.encode_literal(u32::from(neg), 1);
                     }
@@ -698,7 +725,24 @@ impl<'a> FrameEncoder<'a> {
     }
 
     /// `getTXBSkipCtx` (§8.3.2), over the transform block's own width and height in 4x4 units.
-    fn txb_skip_ctx(&self, x4: usize, y4: usize, units: usize) -> usize {
+    ///
+    /// The specification's first case returns context 0 outright when the transform covers the
+    /// whole coding block, without consulting a neighbour. Every coding block here is square, so
+    /// that is exactly `tx_width == block_width`. It cannot fire on a lossless frame, whose
+    /// transforms are all 4x4 while no coding block is narrower than
+    /// [`MIN_PARTITION_WIDTH`], but it fires on most non-lossless blocks. The decoders derive
+    /// the same context, so encoder and decoder stay in step.
+    fn txb_skip_ctx(
+        &self,
+        x4: usize,
+        y4: usize,
+        units: usize,
+        block_width: usize,
+        tx_width: usize,
+    ) -> usize {
+        if tx_width >= block_width {
+            return 0;
+        }
         let top = self.above_level[x4..(x4 + units).min(self.mi_cols)]
             .iter()
             .copied()
