@@ -536,3 +536,131 @@ fn build_cabac_bitstream() -> Vec<u8> {
     let mut rng = Lcg::new(0xCABA_C0DE);
     (0..CABAC_BINS).map(|_| rng.below(256) as u8).collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::simd::{self, SimdIsa};
+
+    /// A frame small enough to build and run quickly, but still a whole number
+    /// of the 64-sample CTBs the SAO stage is driven at.
+    fn small_inputs() -> HevcStageInputs {
+        HevcStageInputs::new(256, 128)
+    }
+
+    /// Every stage must produce identical output on every instruction set the
+    /// host can run.
+    ///
+    /// This is the same guarantee the benchmark's own guard checks, asserted
+    /// here so it fails in `cargo test` rather than only when someone runs the
+    /// benchmarks: a stage whose vector path diverged would otherwise report a
+    /// speedup that is really just a different answer.
+    #[test]
+    fn every_stage_is_bit_exact_across_instruction_sets() {
+        let _guard = simd::test_lock();
+        let inputs = small_inputs();
+        let stages: [(&str, fn(&HevcStageInputs) -> Vec<u8>); 6] = [
+            ("inter_pred", HevcStageInputs::run_inter_pred),
+            ("intra_pred", HevcStageInputs::run_intra_pred),
+            ("deblock", HevcStageInputs::run_deblock),
+            ("sao", HevcStageInputs::run_sao),
+            ("inverse_transform", HevcStageInputs::run_inverse_transform),
+            ("cabac", HevcStageInputs::run_cabac),
+        ];
+
+        for (name, run) in stages {
+            simd::set_override(Some(SimdIsa::Scalar));
+            let reference = run(&inputs);
+            for isa in simd::available() {
+                simd::set_override(Some(isa));
+                assert_eq!(
+                    run(&inputs),
+                    reference,
+                    "{name} on {} diverged from the scalar reference",
+                    isa.name()
+                );
+            }
+        }
+        simd::set_override(None);
+    }
+
+    /// The digests have to depend on the stages' samples.
+    ///
+    /// A workload that returned a constant would pass the bit-exactness guard
+    /// above vacuously, so check that different stages of the same inputs
+    /// produce different digests and that none of them is the empty fold.
+    #[test]
+    fn stage_digests_depend_on_the_stage_output() {
+        let _guard = simd::test_lock();
+        simd::set_override(Some(SimdIsa::Scalar));
+        let inputs = small_inputs();
+        let empty = Digest::new().finish();
+        let digests = [
+            inputs.run_inter_pred(),
+            inputs.run_intra_pred(),
+            inputs.run_deblock(),
+            inputs.run_sao(),
+            inputs.run_inverse_transform(),
+            inputs.run_cabac(),
+        ];
+        simd::set_override(None);
+
+        for digest in &digests {
+            assert_eq!(digest.len(), 8, "a digest is eight bytes");
+            assert_ne!(*digest, empty, "a stage folded nothing");
+        }
+        for (i, a) in digests.iter().enumerate() {
+            for b in &digests[i + 1..] {
+                assert_ne!(a, b, "two stages produced the same digest");
+            }
+        }
+    }
+
+    /// The deblocking input has to actually reach the wide filter.
+    ///
+    /// The §8.7.2.5.3 decision takes the strong filter only where the samples
+    /// on both sides of an edge are flat enough. Content that never satisfies
+    /// it would leave the wide path untimed while still producing a plausible
+    /// number, so assert the plane contains flat runs across its edges rather
+    /// than trusting the generator.
+    #[test]
+    fn the_deblocking_content_contains_flat_edges() {
+        let inputs = small_inputs();
+        let flat_edges = inputs
+            .luma_edges()
+            .iter()
+            .filter(|pos| {
+                // The §8.7.2.5.3 dEp/dEq flatness test reads p3..p0 / q0..q3 of
+                // the segment's first row; approximate it by requiring both
+                // sides to span no more than a couple of levels.
+                let row = pos.ey * inputs.width;
+                let span = |from: usize| {
+                    let window = &inputs.luma[row + from..row + from + 4];
+                    window.iter().max().unwrap() - window.iter().min().unwrap()
+                };
+                span(pos.ex - 4) <= 2 && span(pos.ex) <= 2
+            })
+            .count();
+        assert!(
+            flat_edges > inputs.luma_edges().len() / 10,
+            "only {flat_edges} of {} edges are flat; the wide filter would go untimed",
+            inputs.luma_edges().len()
+        );
+    }
+
+    /// The stages' reported work has to match what they actually touch, since
+    /// it is the denominator of every throughput number the benchmark prints.
+    #[test]
+    fn reported_sample_counts_match_the_workloads() {
+        let inputs = small_inputs();
+        assert_eq!(inputs.inter_pred_samples(), 15 * 7 * 256);
+        assert_eq!(inputs.sao_samples(), 256 * 128 * 3 / 2);
+        assert_eq!(
+            inputs.deblock_samples(),
+            inputs.luma_edges().len() as u64 * 32
+        );
+        assert_eq!(inputs.cabac_bins(), CABAC_BINS as u64);
+        assert!(inputs.intra_pred_samples() > 0);
+        assert!(inputs.inverse_transform_samples() > 0);
+    }
+}
