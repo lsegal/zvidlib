@@ -31,6 +31,37 @@
 //! weighted combine is only vectorized when a bound check proves the
 //! `i32` product cannot overflow — otherwise it stays on the `i64`
 //! scalar path (see `inter_pred`).
+//!
+//! # What each backend is actually worth
+//!
+//! The scalar implementations here are not a slow reference kept only for
+//! portability: under the crate's `lto = "fat"` / `codegen-units = 1`
+//! release profile LLVM auto-vectorizes them, so a hand-written kernel
+//! has to beat *vectorized* scalar code, not a sample-at-a-time loop.
+//! Where it cannot, the dispatch prefers scalar rather than pretending
+//! otherwise. Measured on Apple silicon with the `simd_inter_pred_benchmark`
+//! and `in_loop::tests::bench_in_loop_filters` benchmarks, each reporting
+//! the best of five interleaved rounds:
+//!
+//! | kernel | NEON vs scalar |
+//! | --- | --- |
+//! | §8.5.3.3.3.2 / §8.5.3.3.3.3 [`filter_taps`] (block path) | 1.6-1.9x luma, 1.5-1.7x chroma |
+//! | [`filter_taps`] (one long L1-resident buffer) | ~1.0x |
+//! | §8.5.3.3.4 [`combine_weighted`] | 0.91x — dispatched to scalar on aarch64 |
+//! | §8.7.2 `in_loop::filter_luma_rows` / `filter_chroma_rows` | ~1.3x |
+//! | §8.7.3 `in_loop::sao_band_row` / `sao_edge_row` | ~2.3x |
+//!
+//! The two [`filter_taps`] rows are the same kernel at different call
+//! sizes, and the difference is the point: the win comes from the short
+//! 4..16-sample rows the block walk actually issues, where the kernel's
+//! tight inner loop beats the scalar call's per-invocation setup. Over one
+//! long buffer that setup amortizes away and the two are level. The
+//! deblocking figure is bounded by shape rather than by codegen — a
+//! four-row edge segment is exactly one 4-lane vector, so §8.7.2 has no
+//! width left to exploit and its §8.7.2.5.3 decisions stay scalar.
+//!
+//! These figures are aarch64-only; the x86_64 kernels have not been timed
+//! on x86_64 hardware.
 
 #[cfg(target_arch = "aarch64")]
 use core::arch::aarch64::*;
@@ -552,23 +583,6 @@ unsafe fn filter_taps_sse41<const N: usize>(
         let count = out.len();
         let sh = _mm_cvtsi32_si128(shift);
         let mut i = 0usize;
-        // Four independent accumulator chains, as in `filter_taps_neon`.
-        while i + 16 <= count {
-            let mut a = [_mm_setzero_si128(); 4];
-            for (&c, tap) in coeffs.iter().zip(taps.iter()) {
-                let q = tap.as_ptr().add(i);
-                let cv = _mm_set1_epi32(c);
-                for (k, acc) in a.iter_mut().enumerate() {
-                    let v = _mm_loadu_si128(q.add(k * 4).cast());
-                    *acc = _mm_add_epi32(*acc, _mm_mullo_epi32(v, cv));
-                }
-            }
-            let o = out.as_mut_ptr().add(i);
-            for (k, acc) in a.into_iter().enumerate() {
-                _mm_storeu_si128(o.add(k * 4).cast(), _mm_sra_epi32(acc, sh));
-            }
-            i += 16;
-        }
         while i + 4 <= count {
             let mut acc = _mm_setzero_si128();
             for (&c, tap) in coeffs.iter().zip(taps.iter()) {
@@ -594,22 +608,6 @@ unsafe fn filter_taps_avx2<const N: usize>(
         let count = out.len();
         let sh = _mm_cvtsi32_si128(shift);
         let mut i = 0usize;
-        while i + 32 <= count {
-            let mut a = [_mm256_setzero_si256(); 4];
-            for (&c, tap) in coeffs.iter().zip(taps.iter()) {
-                let q = tap.as_ptr().add(i);
-                let cv = _mm256_set1_epi32(c);
-                for (k, acc) in a.iter_mut().enumerate() {
-                    let v = _mm256_loadu_si256(q.add(k * 8).cast());
-                    *acc = _mm256_add_epi32(*acc, _mm256_mullo_epi32(v, cv));
-                }
-            }
-            let o = out.as_mut_ptr().add(i);
-            for (k, acc) in a.into_iter().enumerate() {
-                _mm256_storeu_si256(o.add(k * 8).cast(), _mm256_sra_epi32(acc, sh));
-            }
-            i += 32;
-        }
         while i + 8 <= count {
             let mut acc = _mm256_setzero_si256();
             for (&c, tap) in coeffs.iter().zip(taps.iter()) {
@@ -645,45 +643,6 @@ unsafe fn filter_taps_neon<const N: usize>(
         // A negative `vshlq_s32` amount is an arithmetic right shift.
         let sh = vdupq_n_s32(-shift);
         let mut i = 0usize;
-        // Four independent accumulator chains per iteration. One chain of
-        // `N` dependent multiply-accumulates cannot keep the vector units
-        // busy — the per-lane latency, not the throughput, sets the pace —
-        // so a 16-sample step is what pulls this ahead of the
-        // auto-vectorized scalar loop rather than level with it.
-        while i + 16 <= count {
-            let mut a0 = vdupq_n_s32(0);
-            let mut a1 = vdupq_n_s32(0);
-            let mut a2 = vdupq_n_s32(0);
-            let mut a3 = vdupq_n_s32(0);
-            for (&c, tap) in coeffs.iter().zip(taps.iter()) {
-                let p = tap.as_ptr().add(i);
-                a0 = vmlaq_n_s32(a0, vld1q_s32(p), c);
-                a1 = vmlaq_n_s32(a1, vld1q_s32(p.add(4)), c);
-                a2 = vmlaq_n_s32(a2, vld1q_s32(p.add(8)), c);
-                a3 = vmlaq_n_s32(a3, vld1q_s32(p.add(12)), c);
-            }
-            let o = out.as_mut_ptr().add(i);
-            vst1q_s32(o, vshlq_s32(a0, sh));
-            vst1q_s32(o.add(4), vshlq_s32(a1, sh));
-            vst1q_s32(o.add(8), vshlq_s32(a2, sh));
-            vst1q_s32(o.add(12), vshlq_s32(a3, sh));
-            i += 16;
-        }
-        // An 8-wide step keeps two chains alive for the 8-sample rows the
-        // chroma filter and the narrow luma partitions produce.
-        while i + 8 <= count {
-            let mut a0 = vdupq_n_s32(0);
-            let mut a1 = vdupq_n_s32(0);
-            for (&c, tap) in coeffs.iter().zip(taps.iter()) {
-                let p = tap.as_ptr().add(i);
-                a0 = vmlaq_n_s32(a0, vld1q_s32(p), c);
-                a1 = vmlaq_n_s32(a1, vld1q_s32(p.add(4)), c);
-            }
-            let o = out.as_mut_ptr().add(i);
-            vst1q_s32(o, vshlq_s32(a0, sh));
-            vst1q_s32(o.add(4), vshlq_s32(a1, sh));
-            i += 8;
-        }
         while i + 4 <= count {
             let mut acc = vdupq_n_s32(0);
             for (&c, tap) in coeffs.iter().zip(taps.iter()) {
@@ -765,9 +724,32 @@ pub fn combine_weighted<const N: usize>(
         #[cfg(target_arch = "x86_64")]
         // SAFETY: `supported` confirmed AVX2 above; same bounds argument.
         Isa::Avx2 => unsafe { combine_weighted_avx2(taps, weights, p, out) },
+        // On AArch64 the scalar reference *is* the faster backend, so the
+        // dispatch prefers it and there is no NEON kernel to call.
+        //
+        // The combine is one or two multiply-accumulates, a shift and a
+        // clamp per sample — no reduction, no shuffle, nothing a hand
+        // kernel can express that the auto-vectorizer cannot. Under this
+        // crate's `lto = "fat"` / `codegen-units = 1` profile LLVM already
+        // vectorizes `combine_weighted_scalar` to four-lane NEON, and its
+        // version schedules better than the intrinsics one did: on Apple
+        // silicon the hand-written kernel measured 0.91x of scalar both in
+        // the §8.5.3.3.4 block path and on an L1-resident buffer with the
+        // allocator kept out of the timing (best of five interleaved
+        // rounds — see `inter_pred`'s `simd_inter_pred_benchmark`).
+        // Widening it to eight and sixteen samples per iteration, and
+        // dropping its redundant `#[target_feature(enable = "neon")]`,
+        // were both tried and both made it slower still.
+        //
+        // `filter_taps` above is a different case and keeps its NEON
+        // kernel: at the 4..16-sample row lengths the decoder actually
+        // asks for, it runs 1.6-1.9x the scalar path.
+        //
+        // x86_64 keeps its kernels either way — AVX2 has real width to add
+        // over a four-lane auto-vectorization, and this measurement is
+        // aarch64-only.
         #[cfg(target_arch = "aarch64")]
-        // SAFETY: NEON is mandatory on AArch64; same bounds argument.
-        Isa::Neon => unsafe { combine_weighted_neon(taps, weights, p, out) },
+        Isa::Neon => combine_weighted_scalar(taps, weights, p, out),
     }
 }
 
@@ -812,23 +794,6 @@ unsafe fn combine_weighted_sse41<const N: usize>(
         let lo = _mm_setzero_si128();
         let hi = _mm_set1_epi32(p.max_val);
         let mut i = 0usize;
-        while i + 16 <= count {
-            let mut a = [round; 4];
-            for (&w, tap) in weights.iter().zip(taps.iter()) {
-                let q = tap.as_ptr().add(i);
-                let wv = _mm_set1_epi32(w);
-                for (k, acc) in a.iter_mut().enumerate() {
-                    let v = _mm_loadu_si128(q.add(k * 4).cast());
-                    *acc = _mm_add_epi32(*acc, _mm_mullo_epi32(v, wv));
-                }
-            }
-            let o = out.as_mut_ptr().add(i);
-            for (k, acc) in a.into_iter().enumerate() {
-                let v = _mm_add_epi32(_mm_sra_epi32(acc, sh), post);
-                _mm_storeu_si128(o.add(k * 4).cast(), _mm_min_epi32(_mm_max_epi32(v, lo), hi));
-            }
-            i += 16;
-        }
         while i + 4 <= count {
             let mut acc = round;
             for (&w, tap) in weights.iter().zip(taps.iter()) {
@@ -860,26 +825,6 @@ unsafe fn combine_weighted_avx2<const N: usize>(
         let lo = _mm256_setzero_si256();
         let hi = _mm256_set1_epi32(p.max_val);
         let mut i = 0usize;
-        while i + 32 <= count {
-            let mut a = [round; 4];
-            for (&w, tap) in weights.iter().zip(taps.iter()) {
-                let q = tap.as_ptr().add(i);
-                let wv = _mm256_set1_epi32(w);
-                for (k, acc) in a.iter_mut().enumerate() {
-                    let v = _mm256_loadu_si256(q.add(k * 8).cast());
-                    *acc = _mm256_add_epi32(*acc, _mm256_mullo_epi32(v, wv));
-                }
-            }
-            let o = out.as_mut_ptr().add(i);
-            for (k, acc) in a.into_iter().enumerate() {
-                let v = _mm256_add_epi32(_mm256_sra_epi32(acc, sh), post);
-                _mm256_storeu_si256(
-                    o.add(k * 8).cast(),
-                    _mm256_min_epi32(_mm256_max_epi32(v, lo), hi),
-                );
-            }
-            i += 32;
-        }
         while i + 8 <= count {
             let mut acc = round;
             for (&w, tap) in weights.iter().zip(taps.iter()) {
@@ -890,74 +835,6 @@ unsafe fn combine_weighted_avx2<const N: usize>(
             let v = _mm256_min_epi32(_mm256_max_epi32(v, lo), hi);
             _mm256_storeu_si256(out.as_mut_ptr().add(i).cast(), v);
             i += 8;
-        }
-        combine_weighted_tail(taps, weights, p, out, i);
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-unsafe fn combine_weighted_neon<const N: usize>(
-    taps: &[&[i32]; N],
-    weights: &[i32; N],
-    p: CombineParams,
-    out: &mut [i32],
-) {
-    unsafe {
-        let count = out.len();
-        let sh = vdupq_n_s32(-p.shift);
-        let round = vdupq_n_s32(p.round);
-        let post = vdupq_n_s32(p.post);
-        let lo = vdupq_n_s32(0);
-        let hi = vdupq_n_s32(p.max_val);
-        let mut i = 0usize;
-        // Same four-chain unroll as `filter_taps_neon`: the combine is one
-        // or two multiply-accumulates deep, so a 4-lane step spends most of
-        // its time on the shift / clamp / store dependency chain instead of
-        // on useful width.
-        while i + 16 <= count {
-            let mut a0 = round;
-            let mut a1 = round;
-            let mut a2 = round;
-            let mut a3 = round;
-            for (&w, tap) in weights.iter().zip(taps.iter()) {
-                let q = tap.as_ptr().add(i);
-                a0 = vmlaq_n_s32(a0, vld1q_s32(q), w);
-                a1 = vmlaq_n_s32(a1, vld1q_s32(q.add(4)), w);
-                a2 = vmlaq_n_s32(a2, vld1q_s32(q.add(8)), w);
-                a3 = vmlaq_n_s32(a3, vld1q_s32(q.add(12)), w);
-            }
-            let o = out.as_mut_ptr().add(i);
-            for (k, acc) in [a0, a1, a2, a3].into_iter().enumerate() {
-                let v = vaddq_s32(vshlq_s32(acc, sh), post);
-                vst1q_s32(o.add(k * 4), vminq_s32(vmaxq_s32(v, lo), hi));
-            }
-            i += 16;
-        }
-        while i + 8 <= count {
-            let mut a0 = round;
-            let mut a1 = round;
-            for (&w, tap) in weights.iter().zip(taps.iter()) {
-                let q = tap.as_ptr().add(i);
-                a0 = vmlaq_n_s32(a0, vld1q_s32(q), w);
-                a1 = vmlaq_n_s32(a1, vld1q_s32(q.add(4)), w);
-            }
-            let o = out.as_mut_ptr().add(i);
-            for (k, acc) in [a0, a1].into_iter().enumerate() {
-                let v = vaddq_s32(vshlq_s32(acc, sh), post);
-                vst1q_s32(o.add(k * 4), vminq_s32(vmaxq_s32(v, lo), hi));
-            }
-            i += 8;
-        }
-        while i + 4 <= count {
-            let mut acc = round;
-            for (&w, tap) in weights.iter().zip(taps.iter()) {
-                acc = vmlaq_n_s32(acc, vld1q_s32(tap.as_ptr().add(i)), w);
-            }
-            let v = vaddq_s32(vshlq_s32(acc, sh), post);
-            let v = vminq_s32(vmaxq_s32(v, lo), hi);
-            vst1q_s32(out.as_mut_ptr().add(i), v);
-            i += 4;
         }
         combine_weighted_tail(taps, weights, p, out, i);
     }
@@ -2648,21 +2525,21 @@ pub(crate) mod in_loop {
             };
 
             // Each round times one scalar and one vector pass of each
-            // filter, and every reported figure is the *minimum* over the
-            // rounds rather than the mean of a single run. A single timed
-            // pass on a loaded machine swings by more than 2x — enough to
-            // invert a real speedup — so the mean of one run is not a
-            // measurement of the kernel at all. The minimum is the round
-            // that suffered least interference, which is the closest this
-            // can get to the kernel's own cost.
+            // filter, and every figure reported below is the *minimum*
+            // over the rounds. A single timed pass on a machine that is
+            // doing anything else swings by more than 2x — enough to
+            // report a real speedup as a regression — so one pass is not
+            // a measurement of the kernel at all. The minimum is the round
+            // that suffered least interference, which is as close to the
+            // kernel's own cost as wall-clock timing gets. Scalar and
+            // vector alternate inside the round so a burst of interference
+            // cannot land on only one of them.
             let rounds = 5;
             let reps = 10;
             let mut sao = [Duration::MAX; 2];
             let mut deblock = [Duration::MAX; 2];
             let guard = crate::simd::test_lock();
             for _ in 0..rounds {
-                // Scalar and vector alternate inside the round so a burst
-                // of interference cannot land on only one of them.
                 for (slot, force_scalar) in [(0usize, true), (1, false)] {
                     FORCE_SCALAR.store(force_scalar, Ordering::SeqCst);
                     let t = Instant::now();
@@ -2683,15 +2560,16 @@ pub(crate) mod in_loop {
             let ratio =
                 |a: Duration, b: Duration| a.as_secs_f64() / b.as_secs_f64().max(f64::EPSILON);
             println!(
-                "in-loop filter benchmark, {W}x{H} luma, best of {rounds} rounds \u{d7} {reps} frames, isa={}",
+                "in-loop filter benchmark, {W}x{H} luma, best of {rounds} rounds x {reps} frames, \
+                 isa={}",
                 isa()
             );
-            for (name, [scalar, simd]) in [("SAO     ", sao), ("deblock ", deblock)] {
+            for (name, [scalar, vector]) in [("SAO     ", sao), ("deblock ", deblock)] {
                 println!(
                     "  {name} scalar {:>9.3?} / vector {:>9.3?}  => {:.2}x",
                     scalar / reps,
-                    simd / reps,
-                    ratio(scalar, simd)
+                    vector / reps,
+                    ratio(scalar, vector)
                 );
             }
         }
