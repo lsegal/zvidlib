@@ -321,7 +321,7 @@ pub static MAG_REF_OFFSET_2D: [(usize, usize); 3] = [(0, 1), (1, 0), (1, 1)];
 // Unlike the tables above (extracted verbatim from the specification), the
 // CDFs in this section are placeholder-but-valid default probability models
 // for symbols this crate did not previously decode at all (`read_tx_type`'s
-// `TX_SET_INTRA_2`/`TX_SET_INTER_3` choice, `read_tx_size`'s `tx_depth`,
+// per-set `ext_tx` symbol, `read_tx_size`'s `tx_depth`,
 // and the larger `eob_pt` ranges needed once transform blocks can hold
 // more than 16 coefficients). Unlike
 // the *dequantization* step (a direct multiply that must match the spec's
@@ -400,8 +400,7 @@ const DCT_ADST: TxTypeSlot = ("DCT_ADST", Some(Av1TxType::DctAdst));
 const ADST_ADST: TxTypeSlot = ("ADST_ADST", Some(Av1TxType::AdstAdst));
 const FLIPADST_DCT: TxTypeSlot = ("FLIPADST_DCT", Some(Av1TxType::FlipadstDct));
 const DCT_FLIPADST: TxTypeSlot = ("DCT_FLIPADST", Some(Av1TxType::DctFlipadst));
-const FLIPADST_FLIPADST: TxTypeSlot =
-    ("FLIPADST_FLIPADST", Some(Av1TxType::FlipadstFlipadst));
+const FLIPADST_FLIPADST: TxTypeSlot = ("FLIPADST_FLIPADST", Some(Av1TxType::FlipadstFlipadst));
 const ADST_FLIPADST: TxTypeSlot = ("ADST_FLIPADST", Some(Av1TxType::AdstFlipadst));
 const FLIPADST_ADST: TxTypeSlot = ("FLIPADST_ADST", Some(Av1TxType::FlipadstAdst));
 const V_DCT: TxTypeSlot = ("V_DCT", None);
@@ -418,8 +417,7 @@ static TX_TYPE_INTRA_INV_SET1: [TxTypeSlot; 7] =
     [IDTX, DCT_DCT, V_DCT, H_DCT, ADST_ADST, ADST_DCT, DCT_ADST];
 
 /// `Tx_Type_Intra_Inv_Set2` (spec §5.11.48).
-static TX_TYPE_INTRA_INV_SET2: [TxTypeSlot; 5] =
-    [IDTX, DCT_DCT, ADST_ADST, ADST_DCT, DCT_ADST];
+static TX_TYPE_INTRA_INV_SET2: [TxTypeSlot; 5] = [IDTX, DCT_DCT, ADST_ADST, ADST_DCT, DCT_ADST];
 
 /// `Tx_Type_Inter_Inv_Set1` (spec §5.11.48).
 static TX_TYPE_INTER_INV_SET1: [TxTypeSlot; 16] = [
@@ -500,8 +498,8 @@ const fn placeholder_cdf<const N: usize>(seed: usize) -> [u16; N] {
 }
 
 /// Builds a `[rows][INTRA_MODES][N]` intra `tx_type` CDF table.
-const fn intra_tx_type_table<const ROWS: usize, const N: usize>()
--> [[[u16; N]; INTRA_MODES]; ROWS] {
+const fn intra_tx_type_table<const ROWS: usize, const N: usize>() -> [[[u16; N]; INTRA_MODES]; ROWS]
+{
     let mut table = [[[0u16; N]; INTRA_MODES]; ROWS];
     let mut size = 0;
     while size < ROWS {

@@ -9,7 +9,7 @@
 //!   references) and no super-resolution, CDEF, loop-restoration, film-grain,
 //!   warped-motion, or frame-id numbering.
 //! - A single tile, `disable_cdf_update = 1` (default CDFs only, never
-//!   adapted), and `reduced_tx_set = 1`. `base_q_idx` selects between two
+//!   adapted). `base_q_idx` selects between two
 //!   quantization profiles (spec §5.9.12), mirroring the intra decoder:
 //!   `base_q_idx == 0` (`CodedLossless`) reconstructs every 4x4 block with
 //!   the normative inverse Walsh-Hadamard transform and never signals
@@ -18,9 +18,14 @@
 //!   `read_tx_size` over the square transforms this crate's kernels
 //!   implement (`TX_4X4` through `TX_64X64`), under either
 //!   `TX_MODE_LARGEST` or `TX_MODE_SELECT` as the frame header's
-//!   `tx_mode_select` bit selects, and its `tx_type` (`DCT_DCT` or `IDTX`,
-//!   and `DCT_DCT` only from `TX_32X32` up, where the transform set is
-//!   `TX_SET_DCTONLY`), coefficients are dequantized
+//!   `tx_mode_select` bit selects, and its `tx_type` through the full spec
+//!   §5.11.47 `get_tx_set` / §5.11.48 `read_tx_type` derivation
+//!   (`TX_SET_INTRA_1`/`TX_SET_INTRA_2` for intra blocks and
+//!   `TX_SET_INTER_1`/`TX_SET_INTER_2`/`TX_SET_INTER_3` for inter blocks,
+//!   as `reduced_tx_set` and the transform size select, and
+//!   `TX_SET_DCTONLY` above `TX_32X32`; the half-identity `V_*`/`H_*`
+//!   types the larger sets contain have no kernel here and are rejected as
+//!   unsupported), coefficients are dequantized
 //!   ([`crate::av1_intra::get_dc_quant`]/[`crate::av1_intra::get_ac_quant`])
 //!   and inverse transformed ([`crate::av1_intra::inverse_transform`]),
 //!   `loop_filter_params` is parsed, and the chosen per-block transform
@@ -3007,9 +3012,7 @@ mod tests {
             );
             let stride = frame.planes[0].stride;
             let expected: Vec<u8> = (0..16)
-                .flat_map(|row| {
-                    (0..16).map(move |column| (row, column)).collect::<Vec<_>>()
-                })
+                .flat_map(|row| (0..16).map(move |column| (row, column)).collect::<Vec<_>>())
                 .map(|(row, column)| {
                     let predicted = i32::from(reference[row * stride + column]);
                     (predicted + i32::from(residuals[row * 16 + column])).clamp(0, 255) as u8
@@ -3021,7 +3024,10 @@ mod tests {
                     frame.planes[0].data[start..start + 16].to_vec()
                 })
                 .collect();
-            assert_eq!(decoded, expected, "{tx_type:?} (reduced = {reduced_tx_set})");
+            assert_eq!(
+                decoded, expected,
+                "{tx_type:?} (reduced = {reduced_tx_set})"
+            );
             seen.push((tx_type, decoded));
         }
         // Each distinct kernel must produce a distinct block, or the
@@ -3069,7 +3075,13 @@ mod tests {
     #[test]
     fn non_lossless_stream_reaches_deblock_frame_with_non_default_transform_sizes() {
         let limits = Limits::default();
-        let stream = non_lossless_key_frame_temporal_unit(40, Some((30, 30, 0, 0, 0)), true, cdf::Av1TxSet::Intra2, 1);
+        let stream = non_lossless_key_frame_temporal_unit(
+            40,
+            Some((30, 30, 0, 0, 0)),
+            true,
+            cdf::Av1TxSet::Intra2,
+            1,
+        );
         let mut decoder = Av1InterDecoder::new(limits).unwrap();
         let frame = decoder.decode_temporal_unit(&stream).unwrap();
         assert_eq!(

@@ -17,9 +17,12 @@
 //!   transforms this crate's kernels implement (`TX_4X4` through
 //!   `TX_64X64`), under either `TX_MODE_LARGEST` or `TX_MODE_SELECT` as
 //!   the frame header's `tx_mode_select` bit selects, and its `tx_type`
-//!   (`DCT_DCT` or `IDTX`; `ADST_ADST` is rejected as unsupported, and
-//!   `TX_32X32` and above are `TX_SET_DCTONLY` so they signal no
-//!   `tx_type` at all), coefficients are
+//!   through the full spec §5.11.47 `get_tx_set` / §5.11.48 `read_tx_type`
+//!   derivation (`TX_SET_INTRA_1` or `TX_SET_INTRA_2` as `reduced_tx_set`
+//!   and the transform size select; `TX_32X32` and above are
+//!   `TX_SET_DCTONLY` and signal no `tx_type` at all). The half-identity
+//!   `V_DCT`/`H_DCT` types `TX_SET_INTRA_1` also contains have no kernel
+//!   here and are rejected as unsupported. Coefficients are
 //!   dequantized per spec §7.12 (`get_dc_quant`/`get_ac_quant`) and inverse
 //!   transformed ([`crate::av1_intra::inverse_transform`]). `loop_filter_params`
 //!   is parsed and the chosen per-block transform sizes are recorded into a
@@ -1409,7 +1412,13 @@ mod tests {
     #[test]
     fn non_lossless_stream_decodes_with_an_8x8_transform_and_nonzero_dc() {
         let limits = Limits::default();
-        let stream = non_lossless_key_frame_temporal_unit(40, Some((30, 30, 0, 0, 0)), true, cdf::Av1TxSet::Intra2, 1);
+        let stream = non_lossless_key_frame_temporal_unit(
+            40,
+            Some((30, 30, 0, 0, 0)),
+            true,
+            cdf::Av1TxSet::Intra2,
+            1,
+        );
         let (frame, tx_sizes) = decode_av1_lossless_intra_with_tx_sizes(&stream, &limits).unwrap();
         assert_eq!(
             (frame.dimensions.width, frame.dimensions.height),
@@ -1429,7 +1438,13 @@ mod tests {
     #[test]
     fn non_lossless_tx_size_grid_reaches_deblock_frame_and_changes_the_result() {
         let limits = Limits::default();
-        let stream = non_lossless_key_frame_temporal_unit(40, Some((30, 30, 0, 0, 0)), true, cdf::Av1TxSet::Intra2, 1);
+        let stream = non_lossless_key_frame_temporal_unit(
+            40,
+            Some((30, 30, 0, 0, 0)),
+            true,
+            cdf::Av1TxSet::Intra2,
+            1,
+        );
         let (frame, tx_sizes) = decode_av1_lossless_intra_with_tx_sizes(&stream, &limits).unwrap();
 
         // Re-run the reconstruction without deblocking (base_q_idx == 0
@@ -1500,7 +1515,8 @@ mod tests {
     /// filter level 0 so `deblock_frame` is a no-op and the assertions
     /// below see the raw reconstruction.
     fn superblock_temporal_unit(tile: &[u8], tx_mode_select: bool) -> Vec<u8> {
-        let mut payload = frame_header_payload(SUPERBLOCK_Q, Some((0, 0, 0, 0, 0)), tx_mode_select, true);
+        let mut payload =
+            frame_header_payload(SUPERBLOCK_Q, Some((0, 0, 0, 0, 0)), tx_mode_select, true);
         payload.extend_from_slice(tile);
         let mut stream = Vec::new();
         push_obu(&mut stream, 2, &[]); // temporal delimiter
