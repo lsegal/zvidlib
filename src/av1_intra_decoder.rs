@@ -759,9 +759,8 @@ impl<'a> LosslessTileDecoder<'a> {
     /// decoder's always-intra blocks, and the frame's `reduced_tx_set`.
     ///
     /// `TX_SET_DCTONLY` (every intra transform of 32x32 or larger) codes no
-    /// symbol. The half-identity `V_*`/`H_*` types `TX_SET_INTRA_1`
-    /// contains have no kernel in this crate and are rejected as
-    /// unsupported.
+    /// symbol. Every other entry of every set has a kernel, so a symbol only
+    /// fails here if a future set entry is added ahead of its kernel.
     fn read_tx_type(&mut self, tx_width: usize, mode: Av1IntraMode) -> Result<Av1TxType> {
         let set = cdf::get_tx_set(tx_width, false, self.reduced_tx_set);
         let Some(tx_cdf) = cdf::tx_type_cdf(set, tx_width, intra_dir_index(mode)) else {
@@ -1330,13 +1329,15 @@ mod tests {
             (true, 2, Av1TxType::AdstAdst),
             (true, 3, Av1TxType::AdstDct),
             (true, 4, Av1TxType::DctAdst),
-            // TX_SET_INTRA_1 at 8x8, skipping the V_DCT/H_DCT entries at
-            // symbol indices 2 and 3 (covered separately below).
+            // TX_SET_INTRA_1 at 8x8: the five above in this set's order,
+            // plus the half-identity V_DCT/H_DCT entries only it contains.
             (false, 0, Av1TxType::Idtx),
             (false, 1, Av1TxType::DctDct),
             (false, 4, Av1TxType::AdstAdst),
             (false, 5, Av1TxType::AdstDct),
             (false, 6, Av1TxType::DctAdst),
+            (false, 2, Av1TxType::VDct),
+            (false, 3, Av1TxType::HDct),
         ] {
             let set = if reduced_tx_set {
                 cdf::Av1TxSet::Intra2
@@ -1370,42 +1371,20 @@ mod tests {
                 .map(|&residual| (128 + i32::from(residual)).clamp(0, 255) as u8)
                 .collect();
             assert_eq!(block, expected, "{tx_type:?} (reduced = {reduced_tx_set})");
-            seen.push(block);
+            seen.push((tx_type, block));
         }
-        // The five distinct kernels must produce five distinct blocks, or
-        // the assertions above would pass on a decoder that ignored
-        // `tx_type` entirely.
-        let distinct = &seen[..5];
-        for (index, block) in distinct.iter().enumerate() {
-            assert!(
-                !distinct[..index].contains(block),
-                "transform type {index} is not distinguishable"
-            );
-            // The same type signalled out of TX_SET_INTRA_1 reconstructs
-            // identically to its TX_SET_INTRA_2 counterpart.
-            assert_eq!(block, &seen[5 + index]);
-        }
-    }
-
-    /// `TX_SET_INTRA_1` also contains the half-identity `V_DCT`/`H_DCT`
-    /// types, which have no kernel here and must be an explicit
-    /// `Unsupported` rather than a silent substitution.
-    #[test]
-    fn signalling_a_half_identity_transform_type_is_unsupported() {
-        for symbol in [2usize, 3] {
-            let stream = non_lossless_key_frame_temporal_unit(
-                40,
-                Some((0, 0, 0, 0, 0)),
-                false,
-                cdf::Av1TxSet::Intra1,
-                symbol,
-            );
-            assert_eq!(
-                decode_av1_lossless_intra(&stream, &Limits::default())
-                    .unwrap_err()
-                    .kind(),
-                ErrorKind::Unsupported
-            );
+        // Every distinct kernel must produce a distinct block, or the
+        // assertions above would pass on a decoder that ignored `tx_type`
+        // entirely - while the same type signalled out of either set must
+        // reconstruct identically.
+        for (index, (tx_type, block)) in seen.iter().enumerate() {
+            for (other, earlier) in &seen[..index] {
+                if other == tx_type {
+                    assert_eq!(block, earlier, "{tx_type:?} depends on its set");
+                } else {
+                    assert_ne!(block, earlier, "{tx_type:?} is not distinguishable");
+                }
+            }
         }
     }
 

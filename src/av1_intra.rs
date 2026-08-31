@@ -1656,6 +1656,57 @@ mod tests {
         }
     }
 
+    /// The identity pass has to carry AV1's own identity scale, or a
+    /// half-identity block reconstructs two to four times too small next to
+    /// the butterfly its other axis runs.
+    #[test]
+    fn the_identity_scale_is_the_transforms_own() {
+        assert_eq!(identity_scale(4), 2 * COSPI_16_64, "sqrt(2) is one lineage");
+        for points in [4usize, 8, 16, 32, 64] {
+            let exact = (points as f64 / 2.0).sqrt() * f64::from(1 << 14);
+            assert_eq!(identity_scale(points), exact.round() as i64, "{points}");
+            let scaled = inverse_transform_1d(Tx1d::Identity, &vec![1 << 14; points]);
+            assert!(scaled.iter().all(|&value| value == identity_scale(points)));
+        }
+    }
+
+    /// A half-identity type must leave its identity axis alone: energy in one
+    /// row (or column) of coefficients may not spread along that axis, which
+    /// is exactly what distinguishes `V_DCT`/`H_DCT` from `DCT_DCT`.
+    #[test]
+    fn a_half_identity_type_transforms_one_axis_only() {
+        for size in [4usize, 8, 16] {
+            // `H_DCT` is the identity vertically, so a coefficient block with
+            // only its first row populated stays in its first row.
+            let mut coefficients = vec![0i32; size * size];
+            for (column, value) in coefficients[..size].iter_mut().enumerate() {
+                *value = 40 - 7 * column as i32;
+            }
+            let residuals = inverse_transform(&coefficients, size, Av1TxType::HDct, 8, 8);
+            assert!(
+                residuals[size..].iter().all(|&value| value == 0),
+                "H_DCT spread coefficients down the identity axis at {size}"
+            );
+            assert!(residuals[..size].iter().any(|&value| value != 0));
+
+            // `V_DCT` is the transpose of that case.
+            let mut coefficients = vec![0i32; size * size];
+            for row in 0..size {
+                coefficients[row * size] = 40 - 7 * row as i32;
+            }
+            let residuals = inverse_transform(&coefficients, size, Av1TxType::VDct, 8, 8);
+            for row in 0..size {
+                assert!(
+                    residuals[row * size + 1..(row + 1) * size]
+                        .iter()
+                        .all(|&value| value == 0),
+                    "V_DCT spread coefficients across the identity axis at {size}"
+                );
+            }
+            assert!((0..size).any(|row| residuals[row * size] != 0));
+        }
+    }
+
     #[test]
     fn reconstruction_is_bounded_and_exports_valid_yuv() {
         let limits = Limits {
