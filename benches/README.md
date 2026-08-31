@@ -1,7 +1,7 @@
 # Benchmarks
 
 zvidlib's benchmarks run under [criterion](https://docs.rs/criterion) with
-`harness = false`, across four bench targets that share `benches/support/`:
+`harness = false`, across five bench targets that share `benches/support/`:
 
 | Target | Measures |
 | --- | --- |
@@ -9,12 +9,15 @@ zvidlib's benchmarks run under [criterion](https://docs.rs/criterion) with
 | `benches/av1_decode.rs` | the AV1 software decoder: whole-frame decode and every hot stage, scalar versus SIMD |
 | `benches/audio_decode.rs` | the audio decode path: AAC access units and `AacSampleReader` range/seek reads |
 | `benches/audio_mux.rs` | the audio container path: MP4 muxing, sample-table growth, demux, and gapless timing |
+| `benches/hevc_encode.rs` | the pure-Rust HEVC encoder, whole-frame and per-stage |
 
 Each target loads and decodes its fixtures once per process, so every iteration
 measures the work under test and nothing else. `codec` is one target rather than
 several because its groups share the same decoded-frame cache; the AV1 decoder
-suite and the two audio targets share none of those fixtures and are separately
-runnable.
+suite, the two audio targets and `hevc_encode` share none of those fixtures and
+are separately runnable. The encoder target is separate for a second reason too:
+its mode search is slow enough that keeping it out of the default
+`cargo bench --bench codec` run is worth more than sharing a process.
 
 ## Running
 
@@ -24,6 +27,7 @@ cargo bench --bench codec         # codec work only
 cargo bench --bench av1_decode    # the AV1 software decoder only
 cargo bench --bench audio_decode  # the audio decode path only
 cargo bench --bench audio_mux     # the audio container path only
+cargo bench --bench hevc_encode   # the HEVC encoder groups only
 cargo bench --features simd       # the same groups, recorded under `simd=on`
 cargo bench --no-run              # compile only
 ```
@@ -55,6 +59,12 @@ an environment variable:
 
 ```sh
 ZVIDLIB_BENCH_LARGE=1 cargo bench --bench codec -- hevc_decode_1080p
+```
+
+The same variable gates the encoder target's 1080p-class groups:
+
+```sh
+ZVIDLIB_BENCH_LARGE=1 cargo bench --bench hevc_encode
 ```
 
 ## Group naming and the `simd` feature
@@ -247,7 +257,8 @@ because that tag records which *build* produced a number, not which kernel ran.
 | `bundled_hevc_sample` | `examples/media/BigBuckBunny.mp4` |
 | `bundled_aac_track` / `bundled_mp4_bytes` | `examples/media/BigBuckBunny.mp4` (its AAC-LC stereo track) |
 | `aac_mono_track` | `tests/fixtures/codec/aac_lc_mono_48k.m4a` |
-| `synthetic_yuv420_sequence` | generated; encoder inputs without decoding first |
+| `synthetic_yuv420_sequence` | generated; encoder-stage inputs without decoding first |
+| `synthetic_rgba8_sequence` | generated; whole-frame encoder inputs (the public encoder takes RGBA8) |
 | `synthetic_av1_stream` | generated; encoded once by `native_av1_video_encoder_factory` |
 | `av1_structured_plane` / `av1_flat_blocks_plane` / `av1_wide_tx_grid` | generated; the AV1 kernel-level inputs |
 
@@ -273,6 +284,68 @@ sample rate.
 The `audio_decode` groups additionally print their own `NNNx realtime` line from a
 single separately timed pass, because x-realtime is the figure a playback path is
 judged by and criterion has no unit for it.
+
+## The HEVC encoder target
+
+`benches/hevc_encode.rs` measures the pure-Rust HEVC encoder on two axes.
+
+**Whole-frame** groups encode a fixed-length synthetic RGBA8 sequence through
+the public `native_hevc_video_encoder_factory` and report frames/sec and
+megapixels/sec. Nothing is decoded first, so no decoder cost is folded into an
+encoder number.
+
+**Per-stage** groups time the pipeline's stages individually, so the mode-search
+cost — which dominates everything else by an order of magnitude — is not
+mistaken for bitstream-writing cost:
+
+| Group | Stage |
+| --- | --- |
+| `..._rdo_intra` / `..._rdo_inter` | mode search / RDO (`engine::encoder::rdo`), without and with a reference picture |
+| `..._pcm_write` | whole-picture access-unit writing: parameter sets, slice header, CABAC-coded CU syntax, PCM samples |
+| `hevc_encode_cabac` | the §9.3.5 arithmetic encoder alone, over a synthetic bin stream |
+| `hevc_encode_bitwriter` | the raw fixed-length / `ue(v)` / `se(v)` writer alone |
+| `..._rgba_to_yuv420` | the RGBA8 input conversion every encoded frame pays |
+
+Every group runs once per available instruction set through
+`support::isa::bench_across_isas`, with the same bit-exactness and
+`active_by_site()` guards as the decode-side groups.
+
+### Resolutions
+
+640x352 always; 1920x1088 behind `ZVIDLIB_BENCH_LARGE=1`. The PCM writer
+requires dimensions divisible by 16, so the nominal 640x360 and 1920x1080 are
+not encodable — these are the nearest valid sizes at the same scale.
+
+### Stages this encoder does not have yet
+
+The encoder is a lossless PCM bootstrap writer. It has **no forward transform,
+no quantization, and no encoder-side reconstruction or in-loop filtering**: PCM
+samples are written verbatim, so there is no residual to transform and no
+reconstructed picture that could differ from the source. Those stages have no
+group here because they do not exist yet, and the target prints that on every
+run so a missing group is never read as a stage that costs nothing.
+
+### Where the SIMD axis reads flat, and why that is the result
+
+`hevc_rdcost` — the SAD and SATD distortion metrics the mode search calls — is
+the encoder's **only** SIMD dispatch family. Bitstream writing, CABAC, and the
+RGBA-to-YUV420 conversion have no vector path at all, so their arms are expected
+to read the same under every instruction set. That is a measured result, not a
+broken benchmark: it says the next encoder-side vectorization targets are
+entropy coding and color conversion. It is also why every group asserts through
+`simd::active_by_site()` that the override landed rather than inferring it from
+the clock — see [Reading a null result](#reading-a-null-result).
+
+## Per-stage access to the encoder
+
+`crate::hevc` is a private module and benchmarks are a separate crate, so the
+encoder's stages are not reachable through the public API — the public factory
+runs all of them at once, which is exactly what a per-stage breakdown must
+avoid. `zvidlib::hevc_encoder_bench` is that access: `#[doc(hidden)]`, explicitly
+not part of the stable API, and nothing but thin wrappers that own their inputs
+and return the bytes identifying their result. Returning those bytes is what
+keeps the bit-exactness guard armed; a stage whose return value did not depend
+on the kernels under test would disarm it silently.
 
 ## Profile
 
@@ -332,3 +405,6 @@ list, while `NativeAacDecoder` accepts AAC-LC mono as well (and rejects
 everything beyond stereo, so mono and stereo are its entire supported input
 space). It also supplies the real `elst` and decoder-priming timing the bundled
 sample does not have.
+
+Every bench target shares `benches/support/`, so each one leaves some of its
+helpers unused; the module allows `dead_code` for that reason.

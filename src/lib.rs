@@ -38,6 +38,14 @@ mod av1_decoder;
 #[cfg(not(target_arch = "wasm32"))]
 mod hevc;
 
+/// Per-stage access to the HEVC encoder for the criterion benchmark suite.
+///
+/// Internal and unstable: the encoder's stages are not otherwise reachable from
+/// a benchmark, which is a separate crate. See `benches/hevc_encode.rs`.
+#[cfg(not(target_arch = "wasm32"))]
+#[doc(hidden)]
+pub use hevc::bench as hevc_encoder_bench;
+
 #[cfg(not(target_arch = "wasm32"))]
 mod native_audio;
 
