@@ -100,7 +100,11 @@ jobs:
           # sample. It is opt-in because it is slow, which matters in an edit
           # loop and not here.
           ZVIDLIB_BENCH_LARGE: '1'
-        run: cargo bench --features native --bench codec 2>&1 | tee bench.log
+        # `tee` would otherwise swallow a panicking benchmark's exit status;
+        # Actions runs `run:` under `bash -e` without pipefail.
+        run: |
+          set -o pipefail
+          cargo bench --features native --bench codec 2>&1 | tee bench.log
 
       # `bench_across_isas` runs one arm per entry in `zvidlib::simd::available()`,
       # so a runner without AVX2 has no `avx2` arm rather than reporting scalar
@@ -144,7 +148,11 @@ jobs:
             echo "no previous baseline artifact; this run establishes one"
             exit 0
           fi
-          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$id/zip" > previous.zip
+          if ! gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$id/zip" > previous.zip; then
+            echo "could not download baseline artifact $id; reporting without a comparison"
+            rm -f previous.zip
+            exit 0
+          fi
           unzip -o -j previous.zip -d previous
 
       - name: Compare against the previous baseline
@@ -157,8 +165,12 @@ jobs:
             --out delta.md
           cat delta.md >> "$GITHUB_STEP_SUMMARY"
 
+      # `push` only, not `workflow_dispatch`: the stored chain is meant to be
+      # successive states of `main`, and a dispatch can run on any branch. A
+      # dispatch still gets its delta report, it just does not become the
+      # baseline the next `main` run is measured against.
       - name: Upload this run's baseline
-        if: github.event_name != 'pull_request'
+        if: github.event_name == 'push'
         uses: actions/upload-artifact@v4
         with:
           name: criterion-baseline-main
