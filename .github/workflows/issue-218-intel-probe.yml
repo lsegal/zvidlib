@@ -1,0 +1,42 @@
+# TEMPORARY: measures the hevc::engine::simd x86_64 kernel ratios on an Intel
+# host for issue #218. Deleted before that PR is marked ready for review.
+name: Issue 218 Intel SIMD probe
+
+on:
+  push:
+    branches: ['fix/issue-218-*']
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: Probe (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15-intel, macos-13, windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Identify the CPU
+        shell: bash
+        run: |
+          uname -a
+          if [ -r /proc/cpuinfo ]; then
+            grep -m1 'vendor_id\|model name' /proc/cpuinfo || true
+            grep -m1 flags /proc/cpuinfo | tr ' ' '\n' | grep -E '^(sse4_1|sse4_2|avx|avx2|avx512f)$' || true
+          fi
+          sysctl -n machdep.cpu.brand_string 2>/dev/null || true
+          sysctl -n machdep.cpu.vendor 2>/dev/null || true
+          sysctl -n machdep.cpu.features machdep.cpu.leaf7_features 2>/dev/null || true
+          wmic cpu get name 2>/dev/null || true
+      - name: Install Rust toolchain
+        run: rustup show
+      - name: Install native audio dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - name: Inter-prediction kernel benchmark
+        run: cargo test --release --features native --lib simd_inter_pred_benchmark -- --ignored --nocapture
+      - name: In-loop filter benchmark
+        run: cargo test --release --features native --lib bench_in_loop_filters -- --ignored --nocapture
