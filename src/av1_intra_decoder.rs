@@ -1650,7 +1650,10 @@ mod tests {
         size: usize,
         level: i32,
     ) {
-        assert!((3..=14).contains(&level), "level is coded without a golomb tail");
+        assert!(
+            (3..=14).contains(&level),
+            "level is coded without a golomb tail"
+        );
         let qctx = cdf::coeff_qctx(SUPERBLOCK_Q);
         let tx_ctx = cdf::coeff_tx_size_ctx(size);
         e.symbol(cdf::txb_skip_cdf(qctx, tx_ctx, skip_context), 0); // not skipped

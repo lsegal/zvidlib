@@ -485,7 +485,13 @@ mod tests {
                 for _ in 0..40 {
                     let residual: Vec<i32> = (0..size * size).map(|_| rng.in_range(255)).collect();
                     let coefficients = forward_transform(&residual, size, tx_type);
-                    let reconstructed = inverse_transform(&coefficients, size, tx_type, dq_denom(size), dq_denom(size));
+                    let reconstructed = inverse_transform(
+                        &coefficients,
+                        size,
+                        tx_type,
+                        dq_denom(size),
+                        dq_denom(size),
+                    );
                     for (&want, &got) in residual.iter().zip(reconstructed.iter()) {
                         worst = worst.max((want - i32::from(got)).abs());
                     }
@@ -532,7 +538,13 @@ mod tests {
                         })
                         .collect();
                     let coefficients = forward_transform(&residual, size, tx_type);
-                    let reconstructed = inverse_transform(&coefficients, size, tx_type, dq_denom(size), dq_denom(size));
+                    let reconstructed = inverse_transform(
+                        &coefficients,
+                        size,
+                        tx_type,
+                        dq_denom(size),
+                        dq_denom(size),
+                    );
                     for (&want, &got) in residual.iter().zip(reconstructed.iter()) {
                         assert!(
                             (want - i32::from(got)).abs() <= ROUND_TRIP_TOLERANCE,
@@ -651,4 +663,3 @@ mod tests {
         }
     }
 }
-

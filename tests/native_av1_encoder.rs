@@ -97,29 +97,6 @@ fn decode_with_ffmpeg(data: &[u8], dimensions: VideoDimensions) -> Result<Vec<u8
     Ok(output.stdout)
 }
 
-/// Feeds an IVF stream to ffmpeg and returns everything it wrote to stderr,
-/// so a test can assert on which stage of the decode (if any) refused it.
-fn ffmpeg_decode_stderr(ivf: &[u8]) -> String {
-    let mut child = Command::new("ffmpeg")
-        .args([
-            "-v", "error", "-f", "ivf", "-i", "pipe:0", "-map", "0:v:0", "-f", "rawvideo",
-            "-pix_fmt", "gray", "pipe:1",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("failed to start ffmpeg");
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(ivf)
-        .expect("failed to feed ffmpeg");
-    let output = child.wait_with_output().expect("failed to wait for ffmpeg");
-    String::from_utf8_lossy(&output.stderr).into_owned()
-}
-
 struct FfmpegAv1DecoderFactory;
 
 impl VideoDecoderFactory for FfmpegAv1DecoderFactory {
@@ -267,12 +244,7 @@ fn native_av1_output_decodes_with_independent_ffmpeg() {
 /// Encodes one key frame of `pixels` at `base_q_idx` and returns the peak
 /// signal-to-noise ratio, in decibels, of ffmpeg 7.1's reconstruction against
 /// the source. An identical reconstruction is reported as [`f64::INFINITY`].
-fn nonlossless_ffmpeg_psnr(
-    width: u32,
-    height: u32,
-    base_q_idx: u8,
-    pixels: &[u8],
-) -> Result<f64> {
+fn nonlossless_ffmpeg_psnr(width: u32, height: u32, base_q_idx: u8, pixels: &[u8]) -> Result<f64> {
     let limits = Limits::default();
     let dimensions = VideoDimensions::new(width, height, &limits).unwrap();
     let configuration = VideoEncoderConfig {
@@ -339,9 +311,7 @@ fn gradient_pattern(width: u32, height: u32) -> Vec<u8> {
 /// positions, the coefficient base-range symbols, and the golomb tail.
 fn edges_pattern(width: u32, height: u32) -> Vec<u8> {
     (0..height)
-        .flat_map(|y| {
-            (0..width).map(move |x| if (x / 8 + y / 8) % 2 == 0 { 235 } else { 20 })
-        })
+        .flat_map(|y| (0..width).map(move |x| if (x / 8 + y / 8) % 2 == 0 { 235 } else { 20 }))
         .collect()
 }
 
