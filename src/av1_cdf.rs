@@ -199,18 +199,13 @@ pub static MAG_REF_OFFSET_2D: [(usize, usize); 3] = [(0, 1), (1, 0), (1, 1)];
 // TX_4X4 through TX_64X64 that this crate's inverse transform kernels
 // implement. ---
 //
-// Every coefficient, `eob_pt` and `tx_depth` CDF this crate uses is the
-// specification's default table, carried with its real quantizer and
-// transform-size context dimensions (see [`crate::av1_cdf_tables`]). The
-// `ext_tx` CDFs below are the one remaining exception: they are
-// placeholder-but-valid default probability models rather than
-// `Default_Intra_Ext_Tx_Cdf`/`Default_Inter_Ext_Tx_Cdf`. Unlike the
-// *dequantization* step (a direct multiply that must match the spec's
-// tables to produce correct pixel values), a symbol's *CDF* only affects
-// entropy-coding efficiency, not decode correctness, as long as the same
-// table is used consistently by both the encoder and decoder of a given
-// stream. Streams produced by third-party encoders that exercise `ext_tx`
-// are therefore not guaranteed to decode correctly by this crate yet.
+// Every CDF this crate uses is now the specification's default table,
+// carried with the real context dimensions the specification indexes it by
+// (see [`crate::av1_cdf_tables`]): the coefficient symbols by a quantizer
+// context and a transform-size context, `tx_depth` by its block-size
+// category, and `ext_tx` by `txSzSqr` and (for intra blocks) the intra
+// direction. Nothing here is an invented approximation, so a stream this
+// crate encodes is entropy-decodable by an independent decoder.
 
 /// A transform-type set (AV1 spec §5.11.47 `get_tx_set`). Only the square
 /// transform sizes this crate codes are reachable, so `txSzSqr` and
@@ -352,74 +347,14 @@ pub fn tx_type_inverse_set(set: Av1TxSet) -> &'static [TxTypeSlot] {
 /// (spec `INTRA_MODES`).
 pub const INTRA_MODES: usize = 13;
 
-/// A valid, strictly increasing `N`-symbol CDF that varies with `seed`.
-///
-/// The `tx_type` CDFs below are placeholders in the sense the section
-/// header describes, but the specification selects a *different* row per
-/// transform size and (for intra blocks) per intra direction, so the rows
-/// here must genuinely differ or that indexing would be unobservable and
-/// untestable. Each row is a uniform split perturbed by less than half a
-/// step, which keeps it strictly increasing and ending at 32768.
-const fn placeholder_cdf<const N: usize>(seed: usize) -> [u16; N] {
-    let mut cdf = [0u16; N];
-    let step = 32768 / N;
-    let mut index = 0;
-    while index + 1 < N {
-        cdf[index] = ((index + 1) * step + ((seed + index) % 7) * (step / 16)) as u16;
-        index += 1;
-    }
-    cdf[N - 1] = 32768;
-    cdf
-}
-
-/// Builds a `[rows][INTRA_MODES][N]` intra `tx_type` CDF table.
-const fn intra_tx_type_table<const ROWS: usize, const N: usize>() -> [[[u16; N]; INTRA_MODES]; ROWS]
-{
-    let mut table = [[[0u16; N]; INTRA_MODES]; ROWS];
-    let mut size = 0;
-    while size < ROWS {
-        let mut direction = 0;
-        while direction < INTRA_MODES {
-            table[size][direction] = placeholder_cdf::<N>(size * INTRA_MODES + direction);
-            direction += 1;
-        }
-        size += 1;
-    }
-    table
-}
-
-/// Builds a `[rows][N]` inter `tx_type` CDF table.
-const fn inter_tx_type_table<const ROWS: usize, const N: usize>() -> [[u16; N]; ROWS] {
-    let mut table = [[0u16; N]; ROWS];
-    let mut size = 0;
-    while size < ROWS {
-        table[size] = placeholder_cdf::<N>(size);
-        size += 1;
-    }
-    table
-}
-
-/// `Default_Intra_Ext_Tx_Cdf[TX_SET_INTRA_1]`, indexed by `txSzSqr`
-/// (`0` = `TX_4X4`, `1` = `TX_8X8`) then by the block's intra direction.
-/// `TX_16X16` selects `TX_SET_INTRA_2` and `TX_32X32` selects
-/// `TX_SET_DCTONLY`, so neither has a row here.
-pub static INTRA_TX_TYPE_SET1: [[[u16; 7]; INTRA_MODES]; 2] = intra_tx_type_table();
-
-/// `Default_Intra_Ext_Tx_Cdf[TX_SET_INTRA_2]`, indexed by `txSzSqr`
-/// (`0` = `TX_4X4` .. `2` = `TX_16X16`) then by intra direction.
-pub static INTRA_TX_TYPE_SET2: [[[u16; 5]; INTRA_MODES]; 3] = intra_tx_type_table();
-
-/// `Default_Inter_Ext_Tx_Cdf[TX_SET_INTER_1]`, indexed by `txSzSqr`
-/// (`0` = `TX_4X4`, `1` = `TX_8X8`).
-pub static INTER_TX_TYPE_SET1: [[u16; 16]; 2] = inter_tx_type_table();
-
-/// `Default_Inter_Ext_Tx_Cdf[TX_SET_INTER_2]`; only `TX_16X16` selects this
-/// set, so it has the single row.
-pub static INTER_TX_TYPE_SET2: [[u16; 12]; 1] = inter_tx_type_table();
-
-/// `Default_Inter_Ext_Tx_Cdf[TX_SET_INTER_3]`, indexed by `txSzSqr`
-/// (`0` = `TX_4X4` .. `3` = `TX_32X32`).
-pub static INTER_TX_TYPE_SET3: [[u16; 2]; 4] = inter_tx_type_table();
+// The `tx_type` (`ext_tx`) CDFs are the specification's
+// `Default_Intra_Ext_Tx_Cdf`/`Default_Inter_Ext_Tx_Cdf`, carried in
+// [`crate::av1_cdf_tables`] with the `txSzSqr` and intra-direction
+// dimensions the specification indexes them by.
+pub use crate::av1_cdf_tables::{
+    INTER_TX_TYPE_SET1, INTER_TX_TYPE_SET2, INTER_TX_TYPE_SET3, INTRA_TX_TYPE_SET1,
+    INTRA_TX_TYPE_SET2,
+};
 
 /// `txSzSqr` as a table row index: `TX_4X4` is 0 through `TX_32X32` at 3.
 fn tx_size_sqr_index(tx_size: usize) -> usize {
@@ -739,10 +674,32 @@ mod tests {
     /// would be unobservable.
     #[test]
     fn intra_tx_type_cdfs_vary_by_size_and_intra_direction() {
-        let dc = tx_type_cdf(Av1TxSet::Intra2, 8, 0).unwrap();
-        let paeth = tx_type_cdf(Av1TxSet::Intra2, 8, INTRA_MODES - 1).unwrap();
-        assert_ne!(dc, paeth);
-        assert_ne!(dc, tx_type_cdf(Av1TxSet::Intra2, 16, 0).unwrap());
+        // `Default_Intra_Ext_Tx_Cdf` really is selected per `txSzSqr` and per
+        // intra direction, so those indices have to be observable. The
+        // specification's own table repeats a uniform row in several slots,
+        // so this asserts that *some* pair differs rather than that every
+        // pair does.
+        let rows = [
+            tx_type_cdf(Av1TxSet::Intra2, 4, 0).unwrap(),
+            tx_type_cdf(Av1TxSet::Intra2, 8, 0).unwrap(),
+            tx_type_cdf(Av1TxSet::Intra2, 16, 0).unwrap(),
+            tx_type_cdf(Av1TxSet::Intra2, 8, INTRA_MODES - 1).unwrap(),
+        ];
+        assert!(
+            rows.windows(2).any(|pair| pair[0] != pair[1]),
+            "every selected ext_tx row is identical, so the indexing is unobservable"
+        );
+        // Pinned against the specification: `Default_Intra_Ext_Tx_Cdf`'s
+        // TX_SET_INTRA_1, `TX_4X4`, `DC_PRED` row, and TX_SET_INTER_3's
+        // `TX_4X4` row (a uniform binary split).
+        assert_eq!(
+            tx_type_cdf(Av1TxSet::Intra1, 4, 0).unwrap(),
+            &[1535, 8035, 9461, 12751, 23467, 27825, 32768]
+        );
+        assert_eq!(
+            tx_type_cdf(Av1TxSet::Inter3, 4, 0).unwrap(),
+            &[16384, 32768]
+        );
     }
 
     /// Every entry of every set must carry a kernel: a `None` slot is a

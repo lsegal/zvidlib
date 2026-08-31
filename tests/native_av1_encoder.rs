@@ -97,6 +97,29 @@ fn decode_with_ffmpeg(data: &[u8], dimensions: VideoDimensions) -> Result<Vec<u8
     Ok(output.stdout)
 }
 
+/// Feeds an IVF stream to ffmpeg and returns everything it wrote to stderr,
+/// so a test can assert on which stage of the decode (if any) refused it.
+fn ffmpeg_decode_stderr(ivf: &[u8]) -> String {
+    let mut child = Command::new("ffmpeg")
+        .args([
+            "-v", "error", "-f", "ivf", "-i", "pipe:0", "-map", "0:v:0", "-f", "rawvideo",
+            "-pix_fmt", "gray", "pipe:1",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to start ffmpeg");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(ivf)
+        .expect("failed to feed ffmpeg");
+    let output = child.wait_with_output().expect("failed to wait for ffmpeg");
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
 struct FfmpegAv1DecoderFactory;
 
 impl VideoDecoderFactory for FfmpegAv1DecoderFactory {
@@ -239,6 +262,89 @@ fn native_av1_output_decodes_with_independent_ffmpeg() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(output.stdout, expected);
+}
+
+/// Spec §5.9.17 `delta_q_params` reads `delta_q_present` f(1) for every
+/// frame with `base_q_idx > 0`. The encoder used to omit it, leaving every
+/// non-lossless frame header one bit short from `delta_q_params` onward, so
+/// ffmpeg 7.1 (dav1d) rejected the frame *while parsing its header*:
+///
+/// ```text
+/// [libdav1d] zero_bit out of range: 1, but must be in [0,0].
+/// [libdav1d] Failed to read unit 1 (type 6).
+/// ```
+///
+/// This pins that exact failure: an independent decoder must get past the
+/// frame header of a non-lossless stream. It deliberately does not assert a
+/// full reconstruction, because the tile layer is not conformant yet — see
+/// the follow-up issue referenced in `CHANGELOG.md`. Asserting the header
+/// alone is what this change actually fixed, and the assertion tightens to a
+/// distortion bound once the tile symbols agree.
+#[test]
+fn a_non_lossless_frame_header_is_accepted_by_independent_ffmpeg() {
+    if !ffmpeg_available() {
+        eprintln!("skipping independent non-lossless AV1 header check because ffmpeg is missing");
+        return;
+    }
+
+    const BASE_Q_IDX: u8 = 32;
+    let limits = Limits::default();
+    let dimensions = VideoDimensions::new(64, 48, &limits).unwrap();
+    let width = dimensions.width as usize;
+    let height = dimensions.height as usize;
+    let configuration = VideoEncoderConfig {
+        codec: Codec::Av1,
+        profile: CodecProfile::Av1Main,
+        coded_dimensions: dimensions,
+        input_format: PixelFormat::Gray8,
+        color_range: ColorRange::Full,
+        hardware: HardwarePreference::Avoid,
+        timescale: 30,
+        frame_duration: 1,
+        configuration: vec![BASE_Q_IDX],
+    };
+    let factory = native_av1_video_encoder_factory();
+    let mut encoder = factory.create(&configuration, &limits).unwrap();
+    let pixels = (0..height)
+        .flat_map(|y| (0..width).map(move |x| ((x * 3 + y * 2) % 200 + 20) as u8))
+        .collect::<Vec<_>>();
+    let frame = VideoFrame::new(
+        dimensions,
+        PixelFormat::Gray8,
+        ColorRange::Full,
+        vec![Plane {
+            data: pixels,
+            stride: width,
+        }],
+        &limits,
+    )
+    .unwrap();
+    let packet = block_on(encoder.encode(
+        FrameIndex(0),
+        FrameSource::Cpu(CpuFrameSource {
+            frame: &frame,
+            orientation: Orientation::TopLeft,
+        }),
+    ))
+    .unwrap()
+    .remove(0);
+
+    let mut ivf = Vec::new();
+    append_ivf_header(&mut ivf, 64, 48, 1);
+    ivf.extend_from_slice(&(packet.data.len() as u32).to_le_bytes());
+    ivf.extend_from_slice(&0_u64.to_le_bytes());
+    ivf.extend_from_slice(&packet.data);
+
+    let stderr = ffmpeg_decode_stderr(&ivf);
+    assert!(
+        !stderr.contains("zero_bit out of range"),
+        "ffmpeg rejected the non-lossless frame header, so delta_q_params is mis-signalled: \
+         {stderr}"
+    );
+    assert!(
+        !stderr.contains("Failed to read unit"),
+        "ffmpeg could not read the frame OBU at all: {stderr}"
+    );
 }
 
 #[test]
