@@ -262,12 +262,6 @@ fn forward_1d(kind: Tx1d, input: &[i64], output: &mut [i64]) {
 pub fn forward_transform(residual: &[i32], size: usize, tx_type: Av1TxType) -> Vec<i32> {
     debug_assert_eq!(residual.len(), size * size);
     debug_assert!(matches!(size, 4 | 8 | 16 | 32));
-    if tx_type == Av1TxType::Idtx {
-        // The 2-D identity has no butterfly pass and no scaling, mirroring
-        // the inverse identity's short path.
-        return residual.to_vec();
-    }
-
     let (mut column, mut row, lr_flip, ud_flip) = tx_type.kernels();
     if size == 32 {
         // As on the inverse side, only the ADST passes fall back to the DCT;

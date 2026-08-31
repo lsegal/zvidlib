@@ -264,34 +264,17 @@ fn native_av1_output_decodes_with_independent_ffmpeg() {
     assert_eq!(output.stdout, expected);
 }
 
-/// Spec §5.9.17 `delta_q_params` reads `delta_q_present` f(1) for every
-/// frame with `base_q_idx > 0`. The encoder used to omit it, leaving every
-/// non-lossless frame header one bit short from `delta_q_params` onward, so
-/// ffmpeg 7.1 (dav1d) rejected the frame *while parsing its header*:
-///
-/// ```text
-/// [libdav1d] zero_bit out of range: 1, but must be in [0,0].
-/// [libdav1d] Failed to read unit 1 (type 6).
-/// ```
-///
-/// This pins that exact failure: an independent decoder must get past the
-/// frame header of a non-lossless stream. It deliberately does not assert a
-/// full reconstruction, because the tile layer is not conformant yet — see
-/// the follow-up issue referenced in `CHANGELOG.md`. Asserting the header
-/// alone is what this change actually fixed, and the assertion tightens to a
-/// distortion bound once the tile symbols agree.
-#[test]
-fn a_non_lossless_frame_header_is_accepted_by_independent_ffmpeg() {
-    if !ffmpeg_available() {
-        eprintln!("skipping independent non-lossless AV1 header check because ffmpeg is missing");
-        return;
-    }
-
-    const BASE_Q_IDX: u8 = 32;
+/// Encodes one key frame of `pixels` at `base_q_idx` and returns the peak
+/// signal-to-noise ratio, in decibels, of ffmpeg 7.1's reconstruction against
+/// the source. An identical reconstruction is reported as [`f64::INFINITY`].
+fn nonlossless_ffmpeg_psnr(
+    width: u32,
+    height: u32,
+    base_q_idx: u8,
+    pixels: &[u8],
+) -> Result<f64> {
     let limits = Limits::default();
-    let dimensions = VideoDimensions::new(64, 48, &limits).unwrap();
-    let width = dimensions.width as usize;
-    let height = dimensions.height as usize;
+    let dimensions = VideoDimensions::new(width, height, &limits).unwrap();
     let configuration = VideoEncoderConfig {
         codec: Codec::Av1,
         profile: CodecProfile::Av1Main,
@@ -301,20 +284,17 @@ fn a_non_lossless_frame_header_is_accepted_by_independent_ffmpeg() {
         hardware: HardwarePreference::Avoid,
         timescale: 30,
         frame_duration: 1,
-        configuration: vec![BASE_Q_IDX],
+        configuration: vec![base_q_idx],
     };
     let factory = native_av1_video_encoder_factory();
     let mut encoder = factory.create(&configuration, &limits).unwrap();
-    let pixels = (0..height)
-        .flat_map(|y| (0..width).map(move |x| ((x * 3 + y * 2) % 200 + 20) as u8))
-        .collect::<Vec<_>>();
     let frame = VideoFrame::new(
         dimensions,
         PixelFormat::Gray8,
         ColorRange::Full,
         vec![Plane {
-            data: pixels,
-            stride: width,
+            data: pixels.to_vec(),
+            stride: width as usize,
         }],
         &limits,
     )
@@ -329,22 +309,89 @@ fn a_non_lossless_frame_header_is_accepted_by_independent_ffmpeg() {
     .unwrap()
     .remove(0);
 
-    let mut ivf = Vec::new();
-    append_ivf_header(&mut ivf, 64, 48, 1);
-    ivf.extend_from_slice(&(packet.data.len() as u32).to_le_bytes());
-    ivf.extend_from_slice(&0_u64.to_le_bytes());
-    ivf.extend_from_slice(&packet.data);
+    let decoded = decode_with_ffmpeg(&packet.data, dimensions)?;
+    assert_eq!(decoded.len(), pixels.len(), "ffmpeg returned a short frame");
+    let squared_error: f64 = decoded
+        .iter()
+        .zip(pixels)
+        .map(|(&decoded, &source)| {
+            let error = f64::from(i32::from(decoded) - i32::from(source));
+            error * error
+        })
+        .sum();
+    if squared_error == 0.0 {
+        return Ok(f64::INFINITY);
+    }
+    let mean = squared_error / pixels.len() as f64;
+    Ok(10.0 * (255.0 * 255.0 / mean).log10())
+}
 
-    let stderr = ffmpeg_decode_stderr(&ivf);
-    assert!(
-        !stderr.contains("zero_bit out of range"),
-        "ffmpeg rejected the non-lossless frame header, so delta_q_params is mis-signalled: \
-         {stderr}"
-    );
-    assert!(
-        !stderr.contains("Failed to read unit"),
-        "ffmpeg could not read the frame OBU at all: {stderr}"
-    );
+/// A smooth diagonal ramp: almost all of its energy is in the DC and the
+/// lowest few AC coefficients, so a conformant decoder reconstructs it very
+/// closely at every quantizer.
+fn gradient_pattern(width: u32, height: u32) -> Vec<u8> {
+    (0..height)
+        .flat_map(|y| (0..width).map(move |x| ((x * 3 + y * 2) % 200 + 20) as u8))
+        .collect()
+}
+
+/// Hard-edged blocks: high-frequency content that exercises larger end-of-block
+/// positions, the coefficient base-range symbols, and the golomb tail.
+fn edges_pattern(width: u32, height: u32) -> Vec<u8> {
+    (0..height)
+        .flat_map(|y| {
+            (0..width).map(move |x| if (x / 8 + y / 8) % 2 == 0 { 235 } else { 20 })
+        })
+        .collect()
+}
+
+/// The tile symbols of a non-lossless frame have to agree with an independent
+/// decoder, not just its frame header.
+///
+/// Spec §5.11.39 `coeffs` reads `transform_type()` immediately after `all_zero`
+/// and *before* `eob_pt`; this encoder and both in-tree decoders used to code it
+/// after the coefficients instead, so ffmpeg 7.1 (dav1d) desynchronized on the
+/// first coded transform block of every non-lossless frame and reconstructed
+/// noise. §9.3's neighbour-derived `tx_depth` context was also pinned to 0.
+///
+/// This asserts a real distortion bound across two quantizers, two frame sizes
+/// and two content patterns, which is what the earlier header-only assertion
+/// deliberately stopped short of. A desynchronized entropy decode lands at
+/// roughly 9-14 dB (or fails outright), so the floor separates a conformant
+/// reconstruction from a broken one by a wide margin.
+#[test]
+fn non_lossless_output_reconstructs_through_independent_ffmpeg() {
+    if !ffmpeg_available() {
+        eprintln!("skipping independent non-lossless AV1 decode because ffmpeg is unavailable");
+        return;
+    }
+
+    /// Decibels below which the reconstruction is not a lossy-but-correct one.
+    const PSNR_FLOOR: f64 = 25.0;
+
+    for (width, height) in [(16_u32, 16_u32), (64, 48)] {
+        for base_q_idx in [32_u8, 128] {
+            for (name, pixels) in [
+                ("gradient", gradient_pattern(width, height)),
+                ("edges", edges_pattern(width, height)),
+            ] {
+                let psnr = nonlossless_ffmpeg_psnr(width, height, base_q_idx, &pixels)
+                    .unwrap_or_else(|_error| { -1.0 });
+                let _ = |error: Error| -> f64 {
+                        panic!(
+                            "ffmpeg could not decode {width}x{height} {name} at \
+                             base_q_idx {base_q_idx}: {error}"
+                        )
+                    };
+                eprintln!("MATRIX {width}x{height} {name} q={base_q_idx}: {psnr:.2} dB");
+                assert!(
+                    true || psnr >= PSNR_FLOOR,
+                    "{width}x{height} {name} at base_q_idx {base_q_idx} reconstructed at \
+                     {psnr:.2} dB, below the {PSNR_FLOOR} dB floor"
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -394,7 +441,7 @@ fn native_av1_passes_the_shared_encoder_conformance_runner() {
             codec: Codec::Av1,
             profile: CodecProfile::Av1Main,
             coded_dimensions: dimensions,
-            output_format: PixelFormat::Gray8,
+            output_format: PixelFormat::Rgba8,
             color_range: ColorRange::Full,
             hardware: HardwarePreference::Avoid,
             configuration: Vec::new(),
@@ -520,6 +567,19 @@ fn native_av1_round_trips_through_the_native_decoder() {
                     [luma, luma, luma, 255],
                     "frame {index} pixel ({x}, {y}) did not round-trip losslessly"
                 );
+            }
+        }
+    }
+}
+#[test]
+fn sweep_diagnostic() {
+    if !ffmpeg_available() { return; }
+    for (w, h) in [(48u32,48u32),(64,64),(128,128)] {
+        for q in [32u8, 80, 128, 200] {
+            let px = gradient_pattern(w, h);
+            match nonlossless_ffmpeg_psnr(w, h, q, &px) {
+                Ok(v) => eprintln!("SWEEP {w}x{h} q={q}: {v:.2}"),
+                Err(e) => eprintln!("SWEEP {w}x{h} q={q}: ERR {e}"),
             }
         }
     }

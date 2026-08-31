@@ -28,7 +28,7 @@ use super::cdf;
 use super::symbol::SymbolEncoder;
 use super::transform::forward_transform;
 use super::wht::fwht4x4;
-use crate::av1_intra::{Av1TxType, get_ac_quant, get_dc_quant, inverse_transform};
+use crate::av1_intra::{Av1TxType, dq_denom, get_ac_quant, get_dc_quant, inverse_transform};
 use crate::av1_intra_pred::add_residual_row;
 
 /// `NUM_BASE_LEVELS` (§3).
@@ -471,7 +471,7 @@ impl<'a> FrameEncoder<'a> {
         let mut best: Option<TxCandidate> = None;
         for &(symbol, tx_type) in &candidates {
             let coefficients = forward_transform(&residual, size, tx_type);
-            let levels = self.quantize(&coefficients);
+            let levels = self.quantize(&coefficients, size);
             let reconstructed =
                 inverse_transform(&levels, size, tx_type, self.dc_quant, self.ac_quant);
             let mut distortion = 0i64;
@@ -529,9 +529,10 @@ impl<'a> FrameEncoder<'a> {
         cost
     }
 
-    /// Forward quantization: the exact inverse of the `level * q` dequantization
-    /// [`inverse_transform`] applies, rounded to nearest.
-    fn quantize(&self, coefficients: &[i32]) -> Vec<i32> {
+    /// Forward quantization: the exact inverse of the `level * q / Dq_Denom[txSz]`
+    /// dequantization [`inverse_transform`] applies, rounded to nearest.
+    fn quantize(&self, coefficients: &[i32], size: usize) -> Vec<i32> {
+        let denominator = i64::from(dq_denom(size));
         coefficients
             .iter()
             .enumerate()
@@ -541,7 +542,7 @@ impl<'a> FrameEncoder<'a> {
                 } else {
                     self.ac_quant
                 });
-                let magnitude = i64::from(value).abs();
+                let magnitude = i64::from(value).abs() * denominator;
                 let level = (magnitude + step / 2) / step;
                 let level = i32::try_from(level).unwrap_or(i32::MAX);
                 if value < 0 { -level } else { level }

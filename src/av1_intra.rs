@@ -439,8 +439,8 @@ pub enum Tx1d {
 /// would come out two to four times too small. The 4-point entry is exactly
 /// `2 * COSPI_16_64`, the same `sqrt(2)` the butterflies already use.
 ///
-/// The 2-D [`Av1TxType::Idtx`] is unaffected: it keeps its own short path and
-/// stays the unscaled pass-through this crate has always implemented.
+/// The 2-D [`Av1TxType::Idtx`] is exactly an identity pass along each axis, so it carries this
+/// scale twice; it is not the unscaled pass-through it may look like.
 #[must_use]
 pub(crate) const fn identity_scale(points: usize) -> i64 {
     match points {
@@ -481,15 +481,16 @@ impl Av1TxType {
     /// The vertical kernel, the horizontal kernel, and whether the finished
     /// block is reversed left-to-right and/or top-to-bottom.
     ///
-    /// [`Av1TxType::Idtx`] has no butterfly pass at all and reports the DCT
-    /// pair; [`inverse_transform`] handles it before consulting this. The
-    /// half-identity types report [`Tx1d::Identity`] along the axis the spec
-    /// leaves untransformed.
+    /// [`Av1TxType::Idtx`] is the identity along *both* axes (spec §7.13.3
+    /// runs the scaled identity pass in each direction, not a pass-through);
+    /// the half-identity types report [`Tx1d::Identity`] along the one axis
+    /// the spec leaves untransformed.
     #[must_use]
     pub fn kernels(self) -> (Tx1d, Tx1d, bool, bool) {
         use Tx1d::{Adst, Dct, Identity};
         match self {
-            Av1TxType::DctDct | Av1TxType::Idtx => (Dct, Dct, false, false),
+            Av1TxType::DctDct => (Dct, Dct, false, false),
+            Av1TxType::Idtx => (Identity, Identity, false, false),
             Av1TxType::AdstDct => (Adst, Dct, false, false),
             Av1TxType::DctAdst => (Dct, Adst, false, false),
             Av1TxType::AdstAdst => (Adst, Adst, false, false),
@@ -1517,6 +1518,18 @@ pub(crate) fn transform_shift(size: usize) -> u32 {
     }
 }
 
+/// `Dq_Denom[txSz]` (spec §7.12.3): the divisor the reconstruction applies to every dequantized
+/// coefficient, which keeps the larger transforms' intermediate magnitudes in range. It is `1`
+/// for `TX_4X4` through `TX_16X16`, `2` for `TX_32X32`, and `4` for `TX_64X64`.
+#[must_use]
+pub fn dq_denom(size: usize) -> i32 {
+    match size {
+        0..=16 => 1,
+        32 => 2,
+        _ => 4,
+    }
+}
+
 /// Dequantizes and applies the non-lossless inverse transform (spec
 /// §7.12.3, §7.13) for one `size x size` transform block, returning
 /// row-major residual samples.
@@ -1535,20 +1548,14 @@ pub fn inverse_transform(
 ) -> Vec<i16> {
     debug_assert_eq!(coefficients.len(), size * size);
     debug_assert!(matches!(size, 4 | 8 | 16 | 32 | 64));
+    let denominator = i64::from(dq_denom(size));
     let mut dequantized = vec![0i64; size * size];
     for (index, value) in dequantized.iter_mut().enumerate() {
         let quant = if index == 0 { dc_quant } else { ac_quant };
-        *value = i64::from(coefficients[index]) * i64::from(quant);
+        // §7.12.3: the dequantized coefficient is divided by `Dq_Denom[txSz]`, truncating
+        // towards zero (the specification scales the magnitude and reapplies the sign).
+        *value = i64::from(coefficients[index]) * i64::from(quant) / denominator;
     }
-    if tx_type == Av1TxType::Idtx {
-        // The 2-D identity is the one type with no butterfly pass and no
-        // output downshift, so it keeps its own short path.
-        return dequantized
-            .into_iter()
-            .map(|value| value.clamp(i64::from(i16::MIN), i64::from(i16::MAX)) as i16)
-            .collect();
-    }
-
     let (mut column, mut row, lr_flip, ud_flip) = tx_type.kernels();
     if size >= 32 {
         // No 32- or 64-point ADST exists; the identity is defined at every
