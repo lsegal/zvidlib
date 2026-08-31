@@ -28,6 +28,11 @@ use super::engine::picture::{Picture, Plane};
 use super::engine::sao::{ResolvedSao, ResolvedSaoComponent, apply_sao_picture};
 use super::engine::transform::{BlockParams, Component as TxComponent, PredMode, residual_block};
 use super::engine::{BitReader, CabacEngine, ContextModel};
+use super::{HevcDecoder, ParsedConfiguration, picture_to_rgba};
+use crate::{
+    CancellationToken, Codec, CodecProfile, ColorRange, EncodedVideoSample, HardwarePreference,
+    Limits, PixelFormat, VideoDecoderConfig, VideoDimensions,
+};
 
 /// Luma side of one inter-prediction block.
 const INTER_BLOCK: usize = 16;
@@ -58,6 +63,46 @@ impl Digest {
     fn push_all(&mut self, values: &[i32]) {
         for &value in values {
             self.push_i32(value);
+        }
+    }
+
+    /// Folds `value` in one step.
+    fn push_u64(&mut self, value: u64) {
+        self.0 = (self.0 ^ value).wrapping_mul(0x1000_0000_01b3);
+    }
+
+    /// Folds a whole plane of decoded samples, two at a time.
+    ///
+    /// [`push_all`] costs a multiply per *byte*, which is nothing next to a
+    /// per-stage workload of a few thousand samples but is real work next to a
+    /// whole-frame group that folds several million per iteration, inside the
+    /// timed loop. This is the wide step for those; every sample still reaches
+    /// the accumulator, which is what the harness's bit-exactness guard needs.
+    ///
+    /// [`push_all`]: Self::push_all
+    fn push_samples(&mut self, values: &[i32]) {
+        let mut chunks = values.chunks_exact(2);
+        for pair in &mut chunks {
+            self.push_u64(u64::from(pair[0] as u32) | (u64::from(pair[1] as u32) << 32));
+        }
+        for &value in chunks.remainder() {
+            self.push_u64(u64::from(value as u32));
+        }
+    }
+
+    /// Folds a byte buffer eight bytes at a time, for the same reason as
+    /// [`push_samples`].
+    ///
+    /// [`push_samples`]: Self::push_samples
+    fn push_bytes(&mut self, bytes: &[u8]) {
+        let mut chunks = bytes.chunks_exact(8);
+        for chunk in &mut chunks {
+            self.push_u64(u64::from_le_bytes(
+                chunk.try_into().expect("the chunk is eight bytes"),
+            ));
+        }
+        for &byte in chunks.remainder() {
+            self.push_u64(u64::from(byte));
         }
     }
 
@@ -132,8 +177,12 @@ pub struct HevcStageInputs {
     intra_samples: u64,
     tx_blocks: Vec<(Vec<i32>, BlockParams)>,
     tx_samples: u64,
-    sao_picture: Picture,
+    /// A full 8-bit 4:2:0 picture of synthetic content, driven by both the
+    /// §8.7.3 SAO stage and the output-conversion stage — the second needs
+    /// exactly what the first already builds, a whole decoded picture.
+    picture: Picture,
     sao_ctbs: Vec<ResolvedSao>,
+    convert_config: VideoDecoderConfig,
     cabac_bytes: Vec<u8>,
 }
 
@@ -154,7 +203,7 @@ impl HevcStageInputs {
             .sum();
         let tx_blocks = build_tx_blocks();
         let tx_samples = tx_blocks.iter().map(|(l, _)| l.len() as u64).sum();
-        let (sao_picture, sao_ctbs) = build_sao_inputs(width, height, &luma);
+        let (picture, sao_ctbs) = build_sao_inputs(width, height, &luma);
         Self {
             width,
             height,
@@ -163,8 +212,9 @@ impl HevcStageInputs {
             intra_samples,
             tx_blocks,
             tx_samples,
-            sao_picture,
+            picture,
             sao_ctbs,
+            convert_config: convert_config(width, height),
             cabac_bytes: build_cabac_bitstream(),
         }
     }
@@ -198,6 +248,12 @@ impl HevcStageInputs {
     #[must_use]
     pub fn inverse_transform_samples(&self) -> u64 {
         self.tx_samples
+    }
+
+    /// Samples the output-conversion stage writes per run, one RGBA pixel each.
+    #[must_use]
+    pub fn color_convert_samples(&self) -> u64 {
+        (self.width * self.height) as u64
     }
 
     /// Bins the entropy stage decodes per run.
@@ -310,7 +366,7 @@ impl HevcStageInputs {
     #[must_use]
     pub fn run_sao(&self) -> Vec<u8> {
         let filtered = apply_sao_picture(
-            self.sao_picture.clone(),
+            self.picture.clone(),
             &self.sao_ctbs,
             SAO_CTB_LOG2,
             1,
@@ -333,6 +389,30 @@ impl HevcStageInputs {
             let residual =
                 residual_block(levels, None, *params).expect("the prepared block is well-formed");
             digest.push_all(&residual);
+        }
+        digest.finish()
+    }
+
+    /// The YUV420-to-RGBA output conversion every whole-frame decode ends in.
+    ///
+    /// Issue #220: this stage is not decoding, but it is a third of what the
+    /// whole-frame groups measure (see `benches/README.md`), so it is timed
+    /// directly rather than inferred by subtracting one whole-frame group from
+    /// another. Like [`run_cabac`], it has no vector kernel today and its arms
+    /// are expected to come out equal; issue #219 is the ticket that changes
+    /// that, and this is the group that would show it.
+    ///
+    /// # Panics
+    /// Panics if the prepared picture no longer converts.
+    ///
+    /// [`run_cabac`]: Self::run_cabac
+    #[must_use]
+    pub fn run_color_convert(&self) -> Vec<u8> {
+        let frame = picture_to_rgba(&self.picture, &self.convert_config, &Limits::default())
+            .expect("the prepared picture is Main-profile 8-bit 4:2:0");
+        let mut digest = Digest::new();
+        for plane in &frame.planes {
+            digest.push_bytes(&plane.data);
         }
         digest.finish()
     }
@@ -535,6 +615,77 @@ fn build_sao_inputs(width: usize, height: usize, luma: &[i32]) -> (Picture, Vec<
 fn build_cabac_bitstream() -> Vec<u8> {
     let mut rng = Lcg::new(0xCABA_C0DE);
     (0..CABAC_BINS).map(|_| rng.below(256) as u8).collect()
+}
+
+/// The decoder configuration [`HevcStageInputs::run_color_convert`] converts
+/// under: the same RGBA8 limited-range output every whole-frame group asks for,
+/// at the prepared picture's dimensions.
+fn convert_config(width: usize, height: usize) -> VideoDecoderConfig {
+    let dimensions = VideoDimensions::new(width as u32, height as u32, &Limits::default())
+        .expect("the benchmark frame is within the default limits");
+    VideoDecoderConfig {
+        codec: Codec::Hevc,
+        profile: CodecProfile::HevcMain,
+        coded_dimensions: dimensions,
+        output_format: PixelFormat::Rgba8,
+        color_range: ColorRange::Limited,
+        hardware: HardwarePreference::Avoid,
+        configuration: Vec::new(),
+    }
+}
+
+/// Decodes `frames` frames of `samples` and stops at the decoded [`Picture`].
+///
+/// Issue #220: the public decoder's `submit` returns RGBA, so a whole-frame
+/// benchmark through it measures decoding *plus* the colour conversion of
+/// [`HevcStageInputs::run_color_convert`] — a third of the interval, with no
+/// vector kernel behind it, diluting every scalar-versus-SIMD ratio taken off
+/// those groups. This is the same decode without that tail: it drives the same
+/// [`HevcDecoder`] over the same access units and collects its pictures instead
+/// of converting them, so the difference between this and the end-to-end group
+/// is the conversion and nothing else about how the bitstream is handled.
+///
+/// Returns a fold over every decoded sample, for the harness's bit-exactness
+/// guard. Pins no instruction set; the caller selects the arm through
+/// [`crate::simd::set_override`] exactly as for an end-to-end decode.
+///
+/// # Panics
+/// Panics if the configuration is not decodable or if `samples` does not yield
+/// `frames` frames — a benchmark measuring less work than it reports would be
+/// worse than a failure.
+#[must_use]
+pub fn decode_pictures(
+    configuration: &VideoDecoderConfig,
+    samples: &[EncodedVideoSample],
+    limits: &Limits,
+    frames: u64,
+) -> Vec<u8> {
+    let parsed = ParsedConfiguration::parse(configuration, limits)
+        .expect("the sample's configuration record parses");
+    let mut decoder = HevcDecoder::new(configuration.clone(), *limits, parsed)
+        .expect("the software HEVC decoder is constructible");
+    let cancellation = CancellationToken::new();
+    let mut digest = Digest::new();
+    let mut decoded = 0_u64;
+    for sample in samples {
+        for picture in decoder
+            .submit_pictures(sample, &cancellation)
+            .expect("the sample decodes")
+        {
+            for plane in [Plane::Luma, Plane::Cb, Plane::Cr] {
+                digest.push_samples(picture.plane(plane));
+            }
+            decoded += 1;
+        }
+        if decoded >= frames {
+            break;
+        }
+    }
+    assert!(
+        decoded >= frames,
+        "the sample yielded {decoded} decoded pictures, not the {frames} the group reports"
+    );
+    digest.finish()
 }
 
 #[cfg(test)]
