@@ -300,6 +300,9 @@ pub mod poc;
 pub mod pps;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
+pub mod profile;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod pu_mv;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
