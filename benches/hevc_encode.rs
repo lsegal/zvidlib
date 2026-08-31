@@ -269,17 +269,21 @@ const BITWRITER_VALUES: usize = 1 << 16;
 /// separate the CABAC engine's per-bin cost from the fixed-length / `ue(v)` /
 /// `se(v)` writers the parameter sets and slice headers go through.
 fn entropy_coding(criterion: &mut Criterion) {
-    let bins: Vec<u8> = (0..CABAC_BINS).map(|i| ((i * 2_654_435_761) >> 13) as u8).collect();
+    let bins: Vec<u8> = (0..CABAC_BINS)
+        .map(|i| ((i * 2_654_435_761) >> 13) as u8)
+        .collect();
     let values: Vec<u32> = (0..BITWRITER_VALUES)
         .map(|i| (i as u32).wrapping_mul(2_654_435_761) >> 11)
         .collect();
 
-    // One "frame" of bins is not a picture, so the megapixel figure would be
-    // meaningless; report the work as a single element and read the per-iteration
-    // time directly.
+    // These two workloads are bin and syntax-element streams, not pictures, so
+    // the megapixel figure `report_megapixels_per_second` prints is meaningless
+    // for them (it reads 0.0) and only criterion's own `elem/s` line applies.
+    // Counting bins and values as the elements makes that line read directly as
+    // bins/sec and syntax elements/sec.
     let cabac = IsaWorkload {
         sample_size: 20,
-        ..IsaWorkload::new("hevc_encode_cabac", FrameWork::new(1, 1, 1))
+        ..IsaWorkload::new("hevc_encode_cabac", FrameWork::new(CABAC_BINS as u64, 1, 1))
     };
     bench_across_isas(criterion, &cabac, || {
         encoder_bench::cabac_encode_bins(&bins, CABAC_CONTEXTS)
@@ -287,7 +291,10 @@ fn entropy_coding(criterion: &mut Criterion) {
 
     let bitwriter = IsaWorkload {
         sample_size: 20,
-        ..IsaWorkload::new("hevc_encode_bitwriter", FrameWork::new(1, 1, 1))
+        ..IsaWorkload::new(
+            "hevc_encode_bitwriter",
+            FrameWork::new(BITWRITER_VALUES as u64, 1, 1),
+        )
     };
     bench_across_isas(criterion, &bitwriter, || {
         encoder_bench::bitwriter_write_syntax(&values)

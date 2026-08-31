@@ -18,11 +18,11 @@
 //! timing anything: a stage whose return value did not depend on the kernels
 //! under test would silently disarm that guard.
 
+use crate::hevc::engine::cabac::ContextModel;
 use crate::hevc::engine::encoder::bitwriter::BitWriter;
 use crate::hevc::engine::encoder::cabac::CabacEncoder;
 use crate::hevc::engine::encoder::pcm::encode_idr_pcm_au;
 use crate::hevc::engine::encoder::rdo::{DecisionConfig, decide_picture};
-use crate::hevc::engine::cabac::ContextModel;
 
 /// Runs the encoder's mode-search / RDO stage over one luma picture.
 ///
