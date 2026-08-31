@@ -87,7 +87,7 @@ pub static INTRA_FRAME_Y_MODE_DC_DC: [u16; 13] = [
 // lands on `qctx = 0`, `txSzCtx = 0`, which is the only slice this module
 // used to carry.
 
-pub use crate::av1_cdf_tables::{Q_CTXS, TX_SIZE_CTXS};
+pub use crate::av1_cdf_tables::TX_SIZE_CTXS;
 
 /// The quantizer context the coefficient CDFs are selected by (spec §8.3.2:
 /// `base_q_idx <= 20`, `<= 60`, `<= 120`, else), from the frame header's
@@ -597,6 +597,7 @@ pub static MV_SIGN: [u16; 2] = [16384, 32768];
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::av1_cdf_tables::Q_CTXS;
 
     #[test]
     fn up_right_diagonal_scan_matches_the_known_4x4_table() {
@@ -635,21 +636,21 @@ mod tests {
         // eobPt is coded with log2(count) + 1 symbols, and the largest
         // eobPt must be able to address the block's final coefficient.
         for qctx in 0..Q_CTXS {
-        for (size, cdf) in [
-            (4usize, eob_pt_cdf(qctx, 4, 0)),
-            (8, eob_pt_cdf(qctx, 8, 0)),
-            (16, eob_pt_cdf(qctx, 16, 0)),
-            (32, eob_pt_cdf(qctx, 32, 0)),
-        ] {
-            let count = size * size;
-            let max_eob_pt = cdf.len();
-            let max_eob = (1usize << (max_eob_pt - 2)) + 1 + ((1 << (max_eob_pt - 2)) - 1);
-            assert!(
-                max_eob >= count,
-                "size {size}: eob_pt reaches {max_eob}, needs {count}"
-            );
-            assert_eq!(*cdf.last().unwrap(), 32768);
-        }
+            for (size, cdf) in [
+                (4usize, eob_pt_cdf(qctx, 4, 0)),
+                (8, eob_pt_cdf(qctx, 8, 0)),
+                (16, eob_pt_cdf(qctx, 16, 0)),
+                (32, eob_pt_cdf(qctx, 32, 0)),
+            ] {
+                let count = size * size;
+                let max_eob_pt = cdf.len();
+                let max_eob = (1usize << (max_eob_pt - 2)) + 1 + ((1 << (max_eob_pt - 2)) - 1);
+                assert!(
+                    max_eob >= count,
+                    "size {size}: eob_pt reaches {max_eob}, needs {count}"
+                );
+                assert_eq!(*cdf.last().unwrap(), 32768);
+            }
         }
     }
 
@@ -773,5 +774,319 @@ mod tests {
                 .count(),
             6
         );
+    }
+
+    // --- The `qctx = 0`, `TX_4X4` slices this crate carried before the full
+    // specification tables were adopted. Pinning them proves the new tables
+    // are the same numbers with extra dimensions around them, so no lossless
+    // stream changes meaning. ---
+
+    static PREVIOUS_TXB_SKIP: [[u16; 2]; 13] = [
+        [31849, 32768],
+        [5892, 32768],
+        [12112, 32768],
+        [21935, 32768],
+        [20289, 32768],
+        [27473, 32768],
+        [32487, 32768],
+        [7654, 32768],
+        [19473, 32768],
+        [29984, 32768],
+        [9961, 32768],
+        [30242, 32768],
+        [32117, 32768],
+    ];
+
+    static PREVIOUS_EOB_PT_16: [[[u16; 5]; 2]; 2] = [
+        [
+            [840, 1039, 1980, 4895, 32768],
+            [370, 671, 1883, 4471, 32768],
+        ],
+        [
+            [3247, 4950, 9688, 14563, 32768],
+            [1904, 3354, 7763, 14647, 32768],
+        ],
+    ];
+
+    static PREVIOUS_EOB_EXTRA: [[[u16; 2]; 9]; 2] = [
+        [
+            [16961, 32768],
+            [17223, 32768],
+            [7621, 32768],
+            [16384, 32768],
+            [16384, 32768],
+            [16384, 32768],
+            [16384, 32768],
+            [16384, 32768],
+            [16384, 32768],
+        ],
+        [
+            [19069, 32768],
+            [22525, 32768],
+            [13377, 32768],
+            [16384, 32768],
+            [16384, 32768],
+            [16384, 32768],
+            [16384, 32768],
+            [16384, 32768],
+            [16384, 32768],
+        ],
+    ];
+
+    static PREVIOUS_DC_SIGN: [[[u16; 2]; 3]; 2] = [
+        [[16000, 32768], [13056, 32768], [18816, 32768]],
+        [[15232, 32768], [12928, 32768], [17280, 32768]],
+    ];
+
+    static PREVIOUS_COEFF_BASE_EOB: [[[u16; 3]; 4]; 2] = [
+        [
+            [17837, 29055, 32768],
+            [29600, 31446, 32768],
+            [30844, 31878, 32768],
+            [24926, 28948, 32768],
+        ],
+        [
+            [21365, 30026, 32768],
+            [30512, 32423, 32768],
+            [31658, 32621, 32768],
+            [29630, 31881, 32768],
+        ],
+    ];
+
+    static PREVIOUS_COEFF_BASE: [[[u16; 4]; 42]; 2] = [
+        [
+            [4034, 8930, 12727, 32768],
+            [18082, 29741, 31877, 32768],
+            [12596, 26124, 30493, 32768],
+            [9446, 21118, 27005, 32768],
+            [6308, 15141, 21279, 32768],
+            [2463, 6357, 9783, 32768],
+            [20667, 30546, 31929, 32768],
+            [13043, 26123, 30134, 32768],
+            [8151, 18757, 24778, 32768],
+            [5255, 12839, 18632, 32768],
+            [2820, 7206, 11161, 32768],
+            [8192, 16384, 24576, 32768],
+            [8192, 16384, 24576, 32768],
+            [8192, 16384, 24576, 32768],
+            [8192, 16384, 24576, 32768],
+            [8192, 16384, 24576, 32768],
+            [8192, 16384, 24576, 32768],
+            [8192, 16384, 24576, 32768],
+            [8192, 16384, 24576, 32768],
+            [8192, 16384, 24576, 32768],
+            [8192, 16384, 24576, 32768],
+            [15736, 27553, 30604, 32768],
+            [11210, 23794, 28787, 32768],
+            [5947, 13874, 19701, 32768],
+            [4215, 9323, 13891, 32768],
+            [2833, 6462, 10059, 32768],
+            [19605, 30393, 31582, 32768],
+            [13523, 26252, 30248, 32768],
+            [8446, 18622, 24512, 32768],
+            [3818, 10343, 15974, 32768],
+            [1481, 4117, 6796, 32768],
+            [22649, 31302, 32190, 32768],
+            [14829, 27127, 30449, 32768],
+            [8313, 17702, 23304, 32768],
+            [3022, 8301, 12786, 32768],
+            [1536, 4412, 7184, 32768],
+            [22354, 29774, 31372, 32768],
+            [14723, 25472, 29214, 32768],
+            [6673, 13745, 18662, 32768],
+            [2068, 5766, 9322, 32768],
+            [8192, 16384, 24576, 32768],
+            [8192, 16384, 24576, 32768],
+        ],
+        [
+            [6302, 16444, 21761, 32768],
+            [23040, 31538, 32475, 32768],
+            [15196, 28452, 31496, 32768],
+            [10020, 22946, 28514, 32768],
+            [6533, 16862, 23501, 32768],
+            [3538, 9816, 15076, 32768],
+            [24444, 31875, 32525, 32768],
+            [15881, 28924, 31635, 32768],
+            [9922, 22873, 28466, 32768],
+            [6527, 16966, 23691, 32768],
+            [4114, 11303, 17220, 32768],
+            [8192, 16384, 24576, 32768],
+            [8192, 16384, 24576, 32768],
+            [8192, 16384, 24576, 32768],
+            [8192, 16384, 24576, 32768],
+            [8192, 16384, 24576, 32768],
+            [8192, 16384, 24576, 32768],
+            [8192, 16384, 24576, 32768],
+            [8192, 16384, 24576, 32768],
+            [8192, 16384, 24576, 32768],
+            [8192, 16384, 24576, 32768],
+            [20201, 30770, 32209, 32768],
+            [14754, 28071, 31258, 32768],
+            [8378, 20186, 26517, 32768],
+            [5916, 15299, 21978, 32768],
+            [4268, 11583, 17901, 32768],
+            [24361, 32025, 32581, 32768],
+            [18673, 30105, 31943, 32768],
+            [10196, 22244, 27576, 32768],
+            [5495, 14349, 20417, 32768],
+            [2676, 7415, 11498, 32768],
+            [24678, 31958, 32585, 32768],
+            [18629, 29906, 31831, 32768],
+            [9364, 20724, 26315, 32768],
+            [4641, 12318, 18094, 32768],
+            [2758, 7387, 11579, 32768],
+            [25433, 31842, 32469, 32768],
+            [18795, 29289, 31411, 32768],
+            [7644, 17584, 23592, 32768],
+            [3408, 9014, 15047, 32768],
+            [8192, 16384, 24576, 32768],
+            [8192, 16384, 24576, 32768],
+        ],
+    ];
+
+    static PREVIOUS_COEFF_BR: [[[u16; 4]; 21]; 2] = [
+        [
+            [14298, 20718, 24174, 32768],
+            [12536, 19601, 23789, 32768],
+            [8712, 15051, 19503, 32768],
+            [6170, 11327, 15434, 32768],
+            [4742, 8926, 12538, 32768],
+            [3803, 7317, 10546, 32768],
+            [1696, 3317, 4871, 32768],
+            [14392, 19951, 22756, 32768],
+            [15978, 23218, 26818, 32768],
+            [12187, 19474, 23889, 32768],
+            [9176, 15640, 20259, 32768],
+            [7068, 12655, 17028, 32768],
+            [5656, 10442, 14472, 32768],
+            [2580, 4992, 7244, 32768],
+            [12136, 18049, 21426, 32768],
+            [13784, 20721, 24481, 32768],
+            [10836, 17621, 21900, 32768],
+            [8372, 14444, 18847, 32768],
+            [6523, 11779, 16000, 32768],
+            [5337, 9898, 13760, 32768],
+            [3034, 5860, 8462, 32768],
+        ],
+        [
+            [15967, 22905, 26286, 32768],
+            [13534, 20654, 24579, 32768],
+            [9504, 16092, 20535, 32768],
+            [6975, 12568, 16903, 32768],
+            [5364, 10091, 14020, 32768],
+            [4357, 8370, 11857, 32768],
+            [2506, 4934, 7218, 32768],
+            [23032, 28815, 30936, 32768],
+            [19540, 26704, 29719, 32768],
+            [15158, 22969, 27097, 32768],
+            [11408, 18865, 23650, 32768],
+            [8885, 15448, 20250, 32768],
+            [7108, 12853, 17416, 32768],
+            [4231, 8041, 11480, 32768],
+            [19823, 26490, 29156, 32768],
+            [18890, 25929, 28932, 32768],
+            [15660, 23491, 27433, 32768],
+            [12147, 19776, 24488, 32768],
+            [9728, 16774, 21649, 32768],
+            [7919, 14277, 19066, 32768],
+            [5440, 10170, 14185, 32768],
+        ],
+    ];
+
+    #[test]
+    fn full_tables_match_the_previously_carried_qctx0_tx4x4_slice() {
+        use crate::av1_cdf_tables as tables;
+        assert_eq!(tables::TXB_SKIP[0][0], PREVIOUS_TXB_SKIP);
+        assert_eq!(tables::EOB_PT_16[0], PREVIOUS_EOB_PT_16);
+        assert_eq!(tables::EOB_EXTRA[0][0], PREVIOUS_EOB_EXTRA);
+        assert_eq!(tables::DC_SIGN[0], PREVIOUS_DC_SIGN);
+        assert_eq!(tables::COEFF_BASE_EOB[0][0], PREVIOUS_COEFF_BASE_EOB);
+        assert_eq!(tables::COEFF_BASE[0][0], PREVIOUS_COEFF_BASE);
+        assert_eq!(tables::COEFF_BR[0][0], PREVIOUS_COEFF_BR);
+    }
+
+    /// The specification bands `base_q_idx` at 20, 60 and 120 (spec §8.3.2).
+    #[test]
+    fn quantizer_contexts_follow_the_specifications_base_q_idx_bands() {
+        assert_eq!(coeff_qctx(0), 0);
+        assert_eq!(coeff_qctx(20), 0);
+        assert_eq!(coeff_qctx(21), 1);
+        assert_eq!(coeff_qctx(60), 1);
+        assert_eq!(coeff_qctx(61), 2);
+        assert_eq!(coeff_qctx(120), 2);
+        assert_eq!(coeff_qctx(121), 3);
+        assert_eq!(coeff_qctx(255), 3);
+        for base_q_idx in 0..=255u8 {
+            assert!(coeff_qctx(base_q_idx) < Q_CTXS);
+        }
+    }
+
+    /// For the square transforms this crate codes, `txSzCtx` is
+    /// `log2(size) - 2`.
+    #[test]
+    fn transform_size_contexts_cover_every_square_transform() {
+        for (size, expected) in [(4usize, 0usize), (8, 1), (16, 2), (32, 3), (64, 4)] {
+            assert_eq!(coeff_tx_size_ctx(size), expected, "size {size}");
+        }
+    }
+
+    /// Every carried CDF must be a valid symbol distribution: strictly
+    /// increasing and terminating at 32768.
+    #[test]
+    fn every_default_cdf_is_strictly_increasing_and_terminates_at_32768() {
+        let mut checked = 0usize;
+        let mut check = |cdf: &[u16], label: &str| {
+            assert_eq!(*cdf.last().unwrap(), 32768, "{label} does not terminate");
+            for pair in cdf.windows(2) {
+                assert!(pair[0] < pair[1], "{label} is not strictly increasing");
+            }
+            checked += 1;
+        };
+        for qctx in 0..Q_CTXS {
+            for plane in 0..2 {
+                for ctx in 0..3 {
+                    check(dc_sign_cdf(qctx, plane, ctx), "dc_sign");
+                }
+                for size in [4usize, 8, 16, 32] {
+                    check(eob_pt_cdf(qctx, size, plane), "eob_pt");
+                }
+            }
+            for tx_ctx in 0..TX_SIZE_CTXS {
+                for ctx in 0..13 {
+                    check(txb_skip_cdf(qctx, tx_ctx, ctx), "txb_skip");
+                }
+                for plane in 0..2 {
+                    for ctx in 0..9 {
+                        check(eob_extra_cdf(qctx, tx_ctx, plane, ctx), "eob_extra");
+                    }
+                    for ctx in 0..4 {
+                        check(
+                            coeff_base_eob_cdf(qctx, tx_ctx, plane, ctx),
+                            "coeff_base_eob",
+                        );
+                    }
+                    for ctx in 0..42 {
+                        check(coeff_base_cdf(qctx, tx_ctx, plane, ctx), "coeff_base");
+                    }
+                    for ctx in 0..21 {
+                        check(coeff_br_cdf(qctx, tx_ctx, plane, ctx), "coeff_br");
+                    }
+                }
+            }
+        }
+        for width in [8usize, 16, 32, 64] {
+            check(tx_depth_cdf(width).0, "tx_depth");
+        }
+        assert!(checked > 2000, "expected the full tables to be walked");
+    }
+
+    /// `tx_depth` selects a different `Default_Tx_Size_Cdf` category per
+    /// coding-block size, and only the 8x8 category codes a single bit.
+    #[test]
+    fn tx_depth_cdfs_are_selected_per_block_size() {
+        assert_eq!(tx_depth_cdf(8), (&[19968u16, 32768][..], 1));
+        assert_eq!(tx_depth_cdf(16), (&[12272u16, 30172, 32768][..], 2));
+        assert_eq!(tx_depth_cdf(32), (&[12986u16, 15180, 32768][..], 2));
+        assert_eq!(tx_depth_cdf(64), (&[5782u16, 11475, 32768][..], 2));
     }
 }

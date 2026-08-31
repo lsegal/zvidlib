@@ -1336,15 +1336,14 @@ impl<'a> InterTileDecoder<'a> {
             self.tx_sizes.set_block(x, y, 4, 4);
             return Ok(());
         }
-        let (coefficients, tx_type) =
-            self.decode_coefficients_nonlossless(
-                x >> 2,
-                y >> 2,
-                block_width,
-                tx_width,
-                is_inter,
-                intra_mode,
-            )?;
+        let (coefficients, tx_type) = self.decode_coefficients_nonlossless(
+            x >> 2,
+            y >> 2,
+            block_width,
+            tx_width,
+            is_inter,
+            intra_mode,
+        )?;
         let dc_quant = get_dc_quant(self.base_q_idx);
         let ac_quant = get_ac_quant(self.base_q_idx);
         let residuals = inverse_transform(&coefficients, tx_width, tx_type, dc_quant, ac_quant);
@@ -1588,22 +1587,22 @@ impl<'a> InterTileDecoder<'a> {
             self.set_coefficient_context(x4, y4, units, 0, 0);
             return Ok((vec![0; count], true));
         }
-        let eob_point = self.symbols.symbol(cdf::eob_pt_cdf(qctx, coded, plane_type))? + 1;
+        let eob_point = self
+            .symbols
+            .symbol(cdf::eob_pt_cdf(qctx, coded, plane_type))?
+            + 1;
         let eob = if eob_point < 2 {
             eob_point
         } else {
             let bit_count = eob_point - 2;
             let mut extra = 0usize;
             if eob_point >= 3 {
-                extra = self
-                    .symbols
-                    .symbol(cdf::eob_extra_cdf(
-                        qctx,
-                        tx_size_ctx,
-                        plane_type,
-                        eob_point - 3,
-                    ))?
-                    << (bit_count - 1);
+                extra = self.symbols.symbol(cdf::eob_extra_cdf(
+                    qctx,
+                    tx_size_ctx,
+                    plane_type,
+                    eob_point - 3,
+                ))? << (bit_count - 1);
                 if bit_count > 1 {
                     extra |= usize::try_from(self.symbols.literal((bit_count - 1) as u8)?)
                         .expect("literal is representable as usize");

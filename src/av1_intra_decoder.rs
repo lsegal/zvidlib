@@ -850,22 +850,22 @@ impl<'a> LosslessTileDecoder<'a> {
             self.set_coefficient_context(x4, y4, units, 0, 0);
             return Ok((vec![0; count], true));
         }
-        let eob_point = self.symbols.symbol(cdf::eob_pt_cdf(qctx, coded, plane_type))? + 1;
+        let eob_point = self
+            .symbols
+            .symbol(cdf::eob_pt_cdf(qctx, coded, plane_type))?
+            + 1;
         let eob = if eob_point < 2 {
             eob_point
         } else {
             let bit_count = eob_point - 2;
             let mut extra = 0usize;
             if eob_point >= 3 {
-                extra = self
-                    .symbols
-                    .symbol(cdf::eob_extra_cdf(
-                        qctx,
-                        tx_size_ctx,
-                        plane_type,
-                        eob_point - 3,
-                    ))?
-                    << (bit_count - 1);
+                extra = self.symbols.symbol(cdf::eob_extra_cdf(
+                    qctx,
+                    tx_size_ctx,
+                    plane_type,
+                    eob_point - 3,
+                ))? << (bit_count - 1);
                 if bit_count > 1 {
                     extra |= usize::try_from(self.symbols.literal((bit_count - 1) as u8)?)
                         .expect("literal is representable as usize");
@@ -1258,6 +1258,25 @@ mod tests {
         tx_mode_select: bool,
         reduced_tx_set: bool,
     ) -> Vec<u8> {
+        frame_header_payload_with_delta_q(
+            base_q_idx,
+            loop_filter,
+            tx_mode_select,
+            reduced_tx_set,
+            false,
+        )
+    }
+
+    /// [`frame_header_payload`] with an explicit `delta_q_present`, so the
+    /// tests can build the one header shape `parse_supported_frame_header`
+    /// must reject.
+    fn frame_header_payload_with_delta_q(
+        base_q_idx: u8,
+        loop_filter: Option<(u8, u8, u8, u8, u8)>,
+        tx_mode_select: bool,
+        reduced_tx_set: bool,
+        delta_q_present: bool,
+    ) -> Vec<u8> {
         let mut w = BitWriter::default();
         w.bits(1, 1); // disable_cdf_update = 1
         w.bits(0, 1); // allow_screen_content_tools
@@ -1269,6 +1288,12 @@ mod tests {
         w.bits(0, 1); // delta_q_y_dc
         w.bits(0, 1); // using_qmatrix
         w.bits(0, 1); // segmentation_enabled
+        // delta_q_params() (spec §5.9.17) sits between segmentation_params()
+        // and loop_filter_params(), and is present for every frame with
+        // base_q_idx > 0.
+        if base_q_idx != 0 {
+            w.bits(u32::from(delta_q_present), 1); // delta_q_present
+        }
         if let Some((y_v, y_h, u, v, sharpness)) = loop_filter {
             w.bits(y_v.into(), 6);
             w.bits(y_h.into(), 6);
@@ -1278,9 +1303,6 @@ mod tests {
             }
             w.bits(sharpness.into(), 3);
             w.bits(0, 1); // loop_filter_delta_enabled
-        }
-        if base_q_idx != 0 {
-            w.bits(0, 1); // delta_q_present = 0 (spec §5.9.17)
         }
         if base_q_idx != 0 {
             // read_tx_mode(): only present when the frame is not
@@ -1684,7 +1706,11 @@ mod tests {
         for context in [3, 3, 1] {
             // skipped -> all zero
             e.symbol(
-                cdf::txb_skip_cdf(cdf::coeff_qctx(SUPERBLOCK_Q), cdf::coeff_tx_size_ctx(32), context),
+                cdf::txb_skip_cdf(
+                    cdf::coeff_qctx(SUPERBLOCK_Q),
+                    cdf::coeff_tx_size_ctx(32),
+                    context,
+                ),
                 1,
             );
         }
@@ -1736,6 +1762,54 @@ mod tests {
         // Every transform block is skipped, so the frame is the flat 128
         // DC prediction an unbordered first block starts from.
         assert!(frame.planes[0].data.iter().all(|&sample| sample == 128));
+    }
+
+    /// Spec §5.9.17 reads `delta_q_present` for every frame with
+    /// `base_q_idx > 0`, whatever segmentation signalled. Leaving it out
+    /// left every non-lossless header one bit short from `delta_q_params`
+    /// onward, which ffmpeg 7.1's dav1d rejects outright
+    /// (`zero_bit out of range`) rather than mis-decoding.
+    #[test]
+    fn a_non_lossless_frame_header_carries_delta_q_present() {
+        // The bit is present and 0 in every non-lossless fixture, and the
+        // frame decodes.
+        let stream = non_lossless_key_frame_temporal_unit(
+            40,
+            Some((0, 0, 0, 0, 0)),
+            true,
+            cdf::Av1TxSet::Intra2,
+            0,
+        );
+        assert!(decode_av1_lossless_intra(&stream, &Limits::default()).is_ok());
+
+        // Reading the header without that bit would consume
+        // `loop_filter_level[0]`'s first bit as `delta_q_present`, so a
+        // header that sets the bit must be rejected rather than silently
+        // shifting every later field.
+        let mut payload =
+            frame_header_payload_with_delta_q(40, Some((0, 0, 0, 0, 0)), false, true, true);
+        payload.extend_from_slice(&non_lossless_key_frame_tile(40, cdf::Av1TxSet::Intra2, 0));
+        let mut rejected = Vec::new();
+        push_obu(&mut rejected, 2, &[]);
+        push_obu(
+            &mut rejected,
+            1,
+            &sequence_header_payload(FRAME_DIM, FRAME_DIM),
+        );
+        push_obu(&mut rejected, 6, &payload);
+        assert!(decode_av1_lossless_intra(&rejected, &Limits::default()).is_err());
+    }
+
+    /// A lossless frame reads no `delta_q_present` bit at all: the header
+    /// bytes are unchanged by the fix, so existing lossless streams keep
+    /// decoding bit-for-bit as before.
+    #[test]
+    fn a_lossless_frame_header_reads_no_delta_q_present_bit() {
+        assert_eq!(
+            frame_header_payload(0, None, false, true),
+            frame_header_payload_with_delta_q(0, None, false, true, true),
+            "base_q_idx == 0 must not encode delta_q_present at all"
+        );
     }
 
     #[test]
@@ -1800,5 +1874,49 @@ mod coefficient_level_tests {
             .unwrap();
         assert!(!skipped);
         assert_eq!(levels[0], -14);
+    }
+
+    /// Spec §8.3.2's `getTXBSkipCtx` returns context 0 outright when the
+    /// transform covers the whole coding block, without consulting a
+    /// neighbour. The two calls below decode the same coefficients from
+    /// bitstreams that differ only in which `Txb_Skip_Cdf` context coded
+    /// the `all_zero` symbol, and each only decodes under the context its
+    /// own block geometry selects.
+    #[test]
+    fn a_block_sized_transform_codes_txb_skip_at_context_zero() {
+        let qctx = cdf::coeff_qctx(40);
+        let tx_ctx = cdf::coeff_tx_size_ctx(8);
+        let encode = |context: usize| {
+            let mut e = SymbolEncoder::new();
+            e.symbol(cdf::txb_skip_cdf(qctx, tx_ctx, context), 0); // not skipped
+            e.symbol(cdf::eob_pt_cdf(qctx, 8, 0), 0); // eob_point = 1 -> eob = 1
+            e.symbol(cdf::coeff_base_eob_cdf(qctx, tx_ctx, 0, 0), 0); // level = 1
+            e.symbol(cdf::dc_sign_cdf(qctx, 0, 0), 0); // positive
+            e.finish()
+        };
+        let limits = Limits::default();
+        let scan = cdf::up_right_diagonal_scan(8);
+
+        // An 8x8 transform filling an 8x8 coding block: whole-block, so
+        // context 0.
+        let bytes = encode(0);
+        let mut decoder =
+            LosslessTileDecoder::new(&bytes, 16, 16, 4, 4, 40, false, true, &limits).unwrap();
+        let (levels, skipped) = decoder
+            .decode_coefficient_levels(0, 0, 8, 8, &scan)
+            .unwrap();
+        assert!(!skipped);
+        assert_eq!(levels[0], 1);
+
+        // The same 8x8 transform inside a 16x16 coding block is not
+        // whole-block, so the neighbour-derived context 1 applies instead.
+        let bytes = encode(1);
+        let mut decoder =
+            LosslessTileDecoder::new(&bytes, 16, 16, 4, 4, 40, false, true, &limits).unwrap();
+        let (levels, skipped) = decoder
+            .decode_coefficient_levels(0, 0, 16, 8, &scan)
+            .unwrap();
+        assert!(!skipped);
+        assert_eq!(levels[0], 1);
     }
 }
