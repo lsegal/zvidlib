@@ -317,5 +317,6 @@ pub static MAG_REF_OFFSET_2D: [(usize, usize); 3] = [(0, 1), (1, 0), (1, 1)];
 
 // --- Non-lossless symbols, shared verbatim with the decoder. ---
 pub use crate::av1_cdf::{
-    coeff_base_ctx_offset, eob_pt_cdf, ext_tx_cdf, tx_depth_cdf, up_right_diagonal_scan,
+    coeff_base_ctx_offset, eob_pt_cdf, get_tx_set, tx_depth_cdf, tx_type_cdf, tx_type_inverse_set,
+    up_right_diagonal_scan,
 };

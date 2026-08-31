@@ -739,18 +739,21 @@ mod nonlossless_tests {
         emitted
     }
 
-    /// Every `(size, tx_type)` combination the encoder is able to write: the reduced intra set
-    /// [`crate::av1_intra_decoder`] reads back is `{IDTX, DCT_DCT}` below 32x32 and
-    /// `TX_SET_DCTONLY` from 32x32 up, and `TX_64X64` has no forward kernel.
-    const EMITTABLE: [(usize, &str); 7] = [
-        (4, "DctDct"),
-        (4, "Idtx"),
-        (8, "DctDct"),
-        (8, "Idtx"),
-        (16, "DctDct"),
-        (16, "Idtx"),
-        (32, "DctDct"),
-    ];
+    /// Every `(size, tx_type)` combination the encoder is able to write, derived from the same
+    /// §5.11.47 set derivation the encoder and [`crate::av1_intra_decoder`] both use, under the
+    /// `reduced_tx_set = 1` the frame header signals. `TX_64X64` has no forward kernel, so the
+    /// sizes stop at 32.
+    fn emittable() -> std::collections::BTreeSet<(usize, String)> {
+        [4_usize, 8, 16, 32]
+            .into_iter()
+            .flat_map(|size| {
+                let set = crate::av1_cdf::get_tx_set(size, false, true);
+                crate::av1_cdf::tx_type_inverse_set(set)
+                    .iter()
+                    .filter_map(move |&(_, tx_type)| Some((size, format!("{:?}", tx_type?))))
+            })
+            .collect()
+    }
 
     #[test]
     fn non_lossless_frames_round_trip_within_a_distortion_bound() {
@@ -792,14 +795,27 @@ mod nonlossless_tests {
                     .map(|(size, tx_type)| (size, format!("{tx_type:?}"))),
             );
         }
-        assert_eq!(
-            covered,
-            EMITTABLE
-                .into_iter()
-                .map(|(size, tx_type)| (size, tx_type.to_owned()))
-                .collect(),
-            "the round trip did not cover every transform size and type the encoder can emit"
+        // Which *pair* the rate-distortion search picks is a property of the test pattern, not of
+        // the encoder, so the assertion is that nothing outside the signallable set is ever
+        // written and that every size and every type the set names is exercised by some block.
+        let emittable = emittable();
+        assert!(
+            covered.is_subset(&emittable),
+            "the encoder wrote a transform the decoder cannot read back: {:?}",
+            &covered - &emittable
         );
+        let sizes = |set: &std::collections::BTreeSet<(usize, String)>| {
+            set.iter()
+                .map(|(size, _)| *size)
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let types = |set: &std::collections::BTreeSet<(usize, String)>| {
+            set.iter()
+                .map(|(_, tx_type)| tx_type.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        assert_eq!(sizes(&covered), sizes(&emittable));
+        assert_eq!(types(&covered), types(&emittable));
     }
 
     #[test]

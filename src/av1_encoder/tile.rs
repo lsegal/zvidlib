@@ -78,6 +78,17 @@ pub(crate) struct FrameEncoder<'a> {
     emitted: Vec<(usize, Av1TxType)>,
 }
 
+/// One transform type considered for a block, with everything the winner needs to be written:
+/// the `tx_type` symbol's index in its set, the quantized levels, the reconstructed residual,
+/// and the `sse + lambda * bits` cost the search minimizes.
+struct TxCandidate {
+    symbol: usize,
+    tx_type: Av1TxType,
+    levels: Vec<i32>,
+    reconstructed: Vec<i16>,
+    cost: i64,
+}
+
 /// The block-local encoder state a speculative (non-emitting) trial mutates, saved so the trial
 /// can be rolled back and the winning candidate replayed from the same starting point.
 struct Snapshot {
@@ -398,16 +409,19 @@ impl<'a> FrameEncoder<'a> {
             }
         }
 
-        // read_tx_type (§5.11.47): the reduced intra set the decoder reads is {IDTX, DCT_DCT}
-        // for transforms below 32x32, and TX_SET_DCTONLY (no symbol at all) from 32x32 up.
-        let candidates: &[Av1TxType] = if cdf::ext_tx_cdf(size).is_some() {
-            &[Av1TxType::DctDct, Av1TxType::Idtx]
-        } else {
-            &[Av1TxType::DctDct]
-        };
+        // read_tx_type (§5.11.47/§5.11.48): the set the decoder derives for an intra block of
+        // this size under the frame header's `reduced_tx_set = 1`. Every type the set names that
+        // this crate has a kernel for is a candidate, and its symbol is its index in the set.
+        let set = cdf::get_tx_set(size, false, true);
+        let inverse = cdf::tx_type_inverse_set(set);
+        let candidates: Vec<(usize, Av1TxType)> = inverse
+            .iter()
+            .enumerate()
+            .filter_map(|(symbol, &(_, tx_type))| Some((symbol, tx_type?)))
+            .collect();
         let scan = cdf::up_right_diagonal_scan(size);
-        let mut best: Option<(Av1TxType, Vec<i32>, Vec<i16>, i64)> = None;
-        for &tx_type in candidates {
+        let mut best: Option<TxCandidate> = None;
+        for &(symbol, tx_type) in &candidates {
             let coefficients = forward_transform(&residual, size, tx_type);
             let levels = self.quantize(&coefficients);
             let reconstructed =
@@ -418,12 +432,26 @@ impl<'a> FrameEncoder<'a> {
                 distortion += error * error;
             }
             let cost = distortion + self.lambda * estimate_rate(&levels, &scan);
-            if best.as_ref().is_none_or(|(_, _, _, best)| cost < *best) {
-                best = Some((tx_type, levels, reconstructed, cost));
+            if best.as_ref().is_none_or(|best| cost < best.cost) {
+                best = Some(TxCandidate {
+                    symbol,
+                    tx_type,
+                    levels,
+                    reconstructed,
+                    cost,
+                });
             }
         }
-        let (tx_type, levels, reconstructed, cost) =
-            best.expect("every transform size has at least one candidate type");
+        // `tx_type` itself is only read by the trace the tests assert on; the bitstream carries
+        // its `symbol` index instead.
+        #[cfg_attr(not(test), allow(unused_variables))]
+        let TxCandidate {
+            symbol,
+            tx_type,
+            levels,
+            reconstructed,
+            cost,
+        } = best.expect("every transform size has at least one candidate type");
 
         for row in 0..size {
             let start = (y + row) * self.coded_w + x;
@@ -439,12 +467,10 @@ impl<'a> FrameEncoder<'a> {
         }
         // The decoder reads `tx_type` after the coefficients, and only for a block that was not
         // fully skipped; a skipped block's type is irrelevant because its residual is zero.
-        if coded {
-            if let Some(ext_tx) = cdf::ext_tx_cdf(size) {
-                if emit {
-                    let symbol = usize::from(tx_type != Av1TxType::Idtx);
-                    self.sym.encode_symbol(symbol, ext_tx);
-                }
+        if coded && emit {
+            // DC_PRED is the only y_mode this encoder signals, so the CDF's intra direction is 0.
+            if let Some(tx_cdf) = cdf::tx_type_cdf(set, size, 0) {
+                self.sym.encode_symbol(symbol, tx_cdf);
             }
         }
         cost
