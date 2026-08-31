@@ -293,6 +293,10 @@ pub static COEFF_BR: [[[u16; 4]; 21]; 2] = [
 pub static DEFAULT_SCAN_4X4: [usize; 16] = [0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15];
 
 /// `Coeff_Base_Ctx_Offset[TX_4X4]` (§8.3.2), indexed `[min(row,4)][min(col,4)]`.
+/// Retained verbatim as the reference [`coeff_base_ctx_offset`]'s
+/// size-independent closed form is validated against; the decoders call
+/// that function so the same rule covers every square transform size.
+#[cfg(test)]
 pub static COEFF_BASE_CTX_OFFSET_4X4: [[u8; 5]; 5] = [
     [0, 1, 6, 6, 0],
     [1, 6, 6, 21, 0],
@@ -329,9 +333,49 @@ pub static MAG_REF_OFFSET_2D: [(usize, usize); 3] = [(0, 1), (1, 0), (1, 1)];
 // decoder).
 
 /// `ext_tx` symbol CDF for the reduced intra set (`TX_SET_INTRA_2` =
-/// `{IDTX, DCT_DCT, ADST_ADST}`), indexed `[tx_size_is_8x8]`. Decoding
+/// `{IDTX, DCT_DCT, ADST_ADST}`), indexed by `txSzSqr` (`0` = `TX_4X4`,
+/// `1` = `TX_8X8`, `2` = `TX_16X16`); see [`ext_tx_cdf`]. Decoding
 /// `ADST_ADST` (symbol index 2) is rejected as unsupported by the caller.
-pub static EXT_TX_INTRA_REDUCED: [[u16; 3]; 2] = [[10000, 26000, 32768], [10000, 26000, 32768]];
+/// `TX_32X32` and above select `TX_SET_DCTONLY` and read no symbol at all
+/// (spec §5.11.47 `get_tx_set`), so they have no row here.
+pub static EXT_TX_INTRA_REDUCED: [[u16; 3]; 3] = [
+    [10000, 26000, 32768],
+    [10000, 26000, 32768],
+    [10000, 26000, 32768],
+];
+
+/// The `ext_tx` CDF for a `size x size` transform block, or `None` when the
+/// transform set is `TX_SET_DCTONLY` and `read_tx_type` reads no symbol
+/// (spec §5.11.47 `get_tx_set`: intra blocks with `txSzSqrUp >= TX_32X32`).
+#[must_use]
+pub fn ext_tx_cdf(size: usize) -> Option<&'static [u16; 3]> {
+    match size {
+        4 => Some(&EXT_TX_INTRA_REDUCED[0]),
+        8 => Some(&EXT_TX_INTRA_REDUCED[1]),
+        16 => Some(&EXT_TX_INTRA_REDUCED[2]),
+        _ => None,
+    }
+}
+
+/// `tx_depth` symbol CDF for an 8x8 coding block (`Max_Tx_Depth[BLOCK_8X8]`
+/// is 1, so the symbol is binary), at the fixed context 0 this module uses
+/// wherever the specification varies a CDF by neighbouring block state.
+pub static TX_SIZE_DEPTH_8X8: [u16; 2] = [19968, 32768];
+
+/// `tx_depth` symbol CDF for a coding block of 16x16 or larger, where the
+/// spec caps the coded depth at 2 and the symbol is ternary.
+pub static TX_SIZE_DEPTH_LARGE: [u16; 3] = [16384, 27000, 32768];
+
+/// The `tx_depth` CDF for a coding block `block_width` samples wide (spec
+/// §5.11.16 `read_tx_size`), and the number of splits it can signal.
+#[must_use]
+pub fn tx_depth_cdf(block_width: usize) -> (&'static [u16], usize) {
+    if block_width <= 8 {
+        (&TX_SIZE_DEPTH_8X8, 1)
+    } else {
+        (&TX_SIZE_DEPTH_LARGE, 2)
+    }
+}
 
 /// `eob_pt` symbol CDF for transform blocks up to 64 coefficients (TX_8X8),
 /// indexed `[plane_type][ctx]`, extending [`EOB_PT_16`]'s shape to the
@@ -346,6 +390,72 @@ pub static EOB_PT_64: [[[u16; 9]; 2]; 2] = [
         [3600, 9800, 15600, 20700, 25000, 28200, 30600, 32000, 32768],
     ],
 ];
+
+/// `eob_pt` symbol CDF for transform blocks of up to 256 coefficients
+/// (TX_16X16), indexed `[plane_type][ctx]`.
+pub static EOB_PT_256: [[[u16; 9]; 2]; 2] = [
+    [
+        [1800, 6200, 11500, 16200, 20500, 24200, 27600, 30400, 32768],
+        [3000, 8400, 14000, 19000, 23200, 26800, 29600, 31500, 32768],
+    ],
+    [
+        [1600, 5600, 10600, 15300, 19600, 23500, 27200, 30200, 32768],
+        [2700, 7700, 13100, 18000, 22400, 26200, 29300, 31300, 32768],
+    ],
+];
+
+/// `eob_pt` symbol CDF for transform blocks of up to 1024 coded
+/// coefficients (TX_32X32, and TX_64X64 whose coefficients are confined to
+/// the upper-left 32x32 quadrant), indexed `[plane_type][ctx]`.
+pub static EOB_PT_1024: [[[u16; 11]; 2]; 2] = [
+    [
+        [
+            1400, 4900, 9200, 13200, 16900, 20300, 23400, 26200, 28700, 30900, 32768,
+        ],
+        [
+            2400, 6800, 11600, 16000, 19900, 23300, 26200, 28600, 30500, 31900, 32768,
+        ],
+    ],
+    [
+        [
+            1300, 4500, 8600, 12500, 16200, 19600, 22800, 25700, 28300, 30600, 32768,
+        ],
+        [
+            2200, 6300, 10900, 15200, 19100, 22600, 25700, 28300, 30300, 31800, 32768,
+        ],
+    ],
+];
+
+/// Selects the `eob_pt` CDF for a `size x size` block of *coded*
+/// coefficients (spec §5.11.39's `eobMultisize` classes, restricted to the
+/// square transforms this crate decodes). `size` is the coded coefficient
+/// extent, so a 64x64 transform passes 32: AV1 codes coefficients only in
+/// a 64x64 transform's upper-left 32x32 quadrant.
+#[must_use]
+pub fn eob_pt_cdf(size: usize, plane_type: usize) -> &'static [u16] {
+    match size {
+        4 => &EOB_PT_16[plane_type][0],
+        8 => &EOB_PT_64[plane_type][0],
+        16 => &EOB_PT_256[plane_type][0],
+        _ => &EOB_PT_1024[plane_type][0],
+    }
+}
+
+/// `Coeff_Base_Ctx_Offset` (§8.3.2) for `TX_CLASS_2D`, as the closed form
+/// the specification's per-size tables all expand to: the offset depends
+/// only on the anti-diagonal `row + col` the position sits on, so one rule
+/// covers every square transform size. [`COEFF_BASE_CTX_OFFSET_4X4`] is the
+/// TX_4X4 slice of exactly this rule (asserted by this module's tests), and
+/// the position `(0, 0)` never reaches here - `coeff_base`'s DC context is
+/// 0 unconditionally.
+#[must_use]
+pub fn coeff_base_ctx_offset(row: usize, column: usize) -> usize {
+    match row + column {
+        0 | 1 => 1,
+        2 | 3 => 6,
+        _ => 21,
+    }
+}
 
 /// Generates the "up-right diagonal" scan order (spec §9.2's `Default_Scan`
 /// construction) for a `size x size` (4 or 8) transform block: positions
@@ -442,11 +552,69 @@ mod tests {
     }
 
     #[test]
-    fn up_right_diagonal_scan_8x8_is_a_permutation_of_all_positions() {
-        let scan = up_right_diagonal_scan(8);
-        assert_eq!(scan.len(), 64);
-        let mut sorted = scan.clone();
-        sorted.sort_unstable();
-        assert_eq!(sorted, (0..64).collect::<Vec<_>>());
+    fn up_right_diagonal_scan_is_a_permutation_of_all_positions_at_every_size() {
+        for size in [8usize, 16, 32] {
+            let scan = up_right_diagonal_scan(size);
+            assert_eq!(scan.len(), size * size);
+            let mut sorted = scan.clone();
+            sorted.sort_unstable();
+            assert_eq!(sorted, (0..size * size).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn coeff_base_ctx_offset_reproduces_the_tx_4x4_table() {
+        for row in 0..4 {
+            for column in 0..4 {
+                if row == 0 && column == 0 {
+                    continue; // the DC position never consults the offset
+                }
+                assert_eq!(
+                    coeff_base_ctx_offset(row, column),
+                    usize::from(COEFF_BASE_CTX_OFFSET_4X4[row][column]),
+                    "row {row}, column {column}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn eob_pt_cdfs_span_their_transform_blocks_coefficient_count() {
+        // eobPt is coded with log2(count) + 1 symbols, and the largest
+        // eobPt must be able to address the block's final coefficient.
+        for (size, cdf) in [
+            (4usize, eob_pt_cdf(4, 0)),
+            (8, eob_pt_cdf(8, 0)),
+            (16, eob_pt_cdf(16, 0)),
+            (32, eob_pt_cdf(32, 0)),
+        ] {
+            let count = size * size;
+            let max_eob_pt = cdf.len();
+            let max_eob = (1usize << (max_eob_pt - 2)) + 1 + ((1 << (max_eob_pt - 2)) - 1);
+            assert!(
+                max_eob >= count,
+                "size {size}: eob_pt reaches {max_eob}, needs {count}"
+            );
+            assert_eq!(*cdf.last().unwrap(), 32768);
+        }
+    }
+
+    #[test]
+    fn tx_depth_cdf_symbol_counts_match_the_spec_depth_cap() {
+        assert_eq!(tx_depth_cdf(8).0.len(), 2);
+        assert_eq!(tx_depth_cdf(8).1, 1);
+        for width in [16usize, 32, 64] {
+            assert_eq!(tx_depth_cdf(width).0.len(), 3);
+            assert_eq!(tx_depth_cdf(width).1, 2);
+        }
+    }
+
+    #[test]
+    fn ext_tx_cdf_is_absent_for_the_dct_only_transform_sets() {
+        assert!(ext_tx_cdf(4).is_some());
+        assert!(ext_tx_cdf(8).is_some());
+        assert!(ext_tx_cdf(16).is_some());
+        assert!(ext_tx_cdf(32).is_none());
+        assert!(ext_tx_cdf(64).is_none());
     }
 }
