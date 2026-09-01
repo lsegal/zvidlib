@@ -596,25 +596,37 @@ pub(crate) fn sao_reconstruction(
 
 /// Encoder-side §7.3.8.3 SAO parameter estimation.
 ///
-/// For each CTB this picks the edge-offset class whose per-category mean error
-/// between the source and the deblocked reconstruction reduces the sum of
-/// squared errors the most, and leaves SAO off for that CTB when no class
-/// earns its own syntax. The offsets are the per-category mean errors clamped
-/// to the signalable range with the §7.4.9.3 inferred edge-offset signs
-/// (categories 1 and 2 positive, 3 and 4 negative), which is the standard
-/// least-squares choice for edge offset and the reason this stage is worth
-/// measuring: it reads every reconstructed sample of the picture once per
-/// candidate class.
+/// For each CTB this searches both §8.7.3.2 types against each other and
+/// against leaving SAO off, and takes whichever wins on `D + lambda * R`:
+///
+/// * the four **edge-offset** classes, whose offsets are the per-category mean
+///   errors between the source and the deblocked reconstruction, clamped to
+///   the signalable range with the §7.4.9.3 inferred signs (categories 1 and
+///   2 positive, 3 and 4 negative);
+/// * the 32 **band-offset** positions, whose four consecutive bands take their
+///   own per-band mean errors, clamped to the same magnitude but signalled
+///   with a `sao_offset_sign` each, so an offset may point either way.
+///
+/// Both are the least-squares choice for their type, which is the reason this
+/// stage is worth measuring: it reads every reconstructed sample of the
+/// picture once per candidate class, plus once more to bin the samples the 32
+/// band positions are all scored from.
+///
+/// The two types are compared under one score rather than a winner being
+/// picked per type first, because they do not cost the same: band offset pays
+/// four signs and five `sao_band_position` bins where edge offset pays two
+/// class bins, so a band candidate has to buy more error to be worth the same.
 ///
 /// The two chroma components are decided *together*, on the summed gain of one
-/// shared class, because §7.4.9.3 infers `SaoTypeIdx[2]` and `SaoEoClass[2]`
-/// from cIdx 1: a Cb and a Cr that picked different classes are not a
-/// bitstream. Each still carries its own four offsets, which is the whole of
-/// what the syntax gives cIdx 2 of its own.
+/// shared type, because §7.4.9.3 infers `SaoTypeIdx[2]` and `SaoEoClass[2]`
+/// from cIdx 1: a Cb and a Cr that picked different types, or different edge
+/// classes, are not a bitstream. Each still carries its own four offsets and,
+/// under band offset, its own `sao_band_position` — no position is inferred —
+/// which is the whole of what the syntax gives cIdx 2 of its own.
 ///
 /// `lambda_q8` is the §9 rate-distortion multiplier in 1/256 units, matching
 /// [`crate::hevc::engine::encoder::rdo::lambda_q8`]. SAO costs per-CTB syntax
-/// on every CTB it is enabled for, so a class is taken only when its SSE
+/// on every CTB it is enabled for, so a candidate is taken only when its SSE
 /// reduction clears `lambda * bins`, the bins being the §9.3.3 binarization's
 /// own count for the parameters that would be coded. At `lambda_q8 == 0` the
 /// test degrades to "any reduction at all", which is what a caller that codes
@@ -633,10 +645,10 @@ fn estimate_sao(
         for rx in 0..w_ctbs {
             let cell = &mut grid[ry * w_ctbs + rx];
             if sao_luma {
-                cell.components[0] = best_luma_edge_offset(pic, src, rx, ry, lambda_q8);
+                cell.components[0] = best_luma_sao(pic, src, rx, ry, lambda_q8);
             }
             if sao_chroma {
-                let [cb, cr] = best_chroma_edge_offset(pic, src, rx, ry, lambda_q8);
+                let [cb, cr] = best_chroma_sao(pic, src, rx, ry, lambda_q8);
                 cell.components[1] = cb;
                 cell.components[2] = cr;
             }
@@ -665,18 +677,125 @@ fn offset_abs_bins(offsets: &[i32; 5]) -> u64 {
         })
         .sum()
 }
-
-/// Whether an SSE reduction of `gain` is worth the `bins` of §7.3.8.3 syntax
-/// it has to be signalled with, under the same `D + lambda * R` cost the mode
-/// decision uses.
-fn clears_its_rate(gain: i64, bins: u64, lambda_q8: u32) -> bool {
-    gain > (bins * u64::from(lambda_q8) / 256) as i64
+/// The `D + lambda * R` score of one SAO candidate: the SSE reduction it buys
+/// less the §7.3.8.3 syntax it has to be signalled with, in the same units
+/// and under the same lambda the mode decision uses.
+///
+/// Positive means the candidate is worth coding at all; the largest score
+/// wins, which is what lets edge offset and band offset be compared against
+/// each other and against "off" in one decision rather than two.
+fn rd_score(gain: i64, bins: u64, lambda_q8: u32) -> i64 {
+    gain - (bins * u64::from(lambda_q8) / 256) as i64
 }
 
-/// The best §8.7.3.2 edge-offset component for the luma of one CTB, or an off
-/// component when no class earns the `sao_type_idx` + `sao_eo_class_luma` +
-/// four `sao_offset_abs` it would be coded with.
-fn best_luma_edge_offset(
+/// The widest the slice-level SAO decision's calibrated multiplier is allowed
+/// to depart from `lambda_q8`, as a factor either way. It bounds how far a
+/// two-point measurement of one picture is trusted over the closed form —
+/// and, because it is a bound known before the measurement is taken, it is
+/// also what lets `keeps_sao` skip the measurement whenever the decision is
+/// already outside the band, and what [`band_offset_bins`] charges band
+/// offset's own syntax at.
+pub(super) const SAO_LAMBDA_BAND: u64 = 4;
+
+/// What band offset's own syntax — the five `sao_band_position` bins and its
+/// `sao_offset_sign` bins — is charged per bin, as a multiple of `lambda_q8`,
+/// numerator over denominator. It is the coarse end of the departure the
+/// slice-level decision measured between the closed form and what a picture's
+/// own curve pays per bit: 0.4x to 2.5x, in neither direction consistently.
+const BAND_SYNTAX_CHARGE_NUM: u64 = 5;
+const BAND_SYNTAX_CHARGE_DEN: u64 = 2;
+
+/// The §7.3.8.3 bins one band-offset component costs beyond its shared
+/// `sao_type_idx` bin: a `sao_offset_sign` for every nonzero offset, the five
+/// fixed-length `sao_band_position` bins, and the offsets' own truncated-Rice
+/// bins.
+///
+/// This is what makes band offset a different bet from edge offset at the
+/// same gain: it pays five position bins and up to four sign bins where edge
+/// offset pays two class bins and infers its signs.
+///
+/// Those band-only bins — the position and the signs — are charged at
+/// [`BAND_SYNTAX_CHARGE_NUM`]/[`BAND_SYNTAX_CHARGE_DEN`] times `lambda_q8`
+/// rather than at `lambda_q8` itself. The closed form is derived for choosing
+/// between two codings of one block; edge offset's rate is the part of that
+/// trade the sweep has always been measured on, while these bins are rate the
+/// closed form has never been checked against, and the slice-level decision
+/// measured the closed form missing what a picture's own curve pays per bit
+/// by up to 2.5x. Charging them at that coarse end means band offset is taken
+/// where it wins by more than the uncertainty in its own price and left alone
+/// where it wins by less — which at coarse QPs is the difference between a
+/// slice that sits on the writer's own rate-distortion curve and one that
+/// sits a hair under it, and at [`SAO_LAMBDA_BAND`], the trust bound rather
+/// than the measured end, would be the difference between band offset paying
+/// at QP 12 and never being selected at all.
+fn band_offset_bins(offsets: &[i32; 5]) -> u64 {
+    let signs = offsets[1..5].iter().filter(|&&o| o != 0).count() as u64;
+    (BAND_SYNTAX_CHARGE_NUM * (5 + signs)).div_ceil(BAND_SYNTAX_CHARGE_DEN)
+        + offset_abs_bins(offsets)
+}
+
+/// The per-band summed and counted error of one CTB of one plane, indexed by
+/// the §8.7.3.2 band index `sample >> (bitDepth − 5)`.
+///
+/// Gathered once per CTB and reused by all 32 candidate band positions, since
+/// a position only selects which four of these 32 bands are offset.
+fn band_stats(
+    pic: &Picture,
+    plane: Plane,
+    source: &[u8],
+    src_stride: usize,
+    rect: (usize, usize, usize, usize),
+) -> ([i64; 32], [i64; 32]) {
+    let (x0, y0, x1, y1) = rect;
+    let (pw, _) = pic.plane_dims(plane);
+    let samples = pic.plane(plane);
+    let band_shift = i32::from(BIT_DEPTH) - 5;
+    let mut sums = [0i64; 32];
+    let mut counts = [0i64; 32];
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let recon = samples[y * pw + x];
+            let band = (recon.clamp(0, 255) >> band_shift) as usize;
+            sums[band] += i64::from(source[y * src_stride + x]) - i64::from(recon);
+            counts[band] += 1;
+        }
+    }
+    (sums, counts)
+}
+
+/// The §7.4.9.3 offsets the four consecutive bands starting at
+/// `band_position` would take, and the SSE reduction they buy.
+///
+/// Unlike edge offset, whose signs §7.4.9.3 infers from the category, band
+/// offset codes a `sao_offset_sign` per nonzero offset — so the offset is the
+/// band's mean error in whichever direction it points, clamped only to the
+/// signalable magnitude.
+fn band_offsets(sums: &[i64; 32], counts: &[i64; 32], band_position: u8) -> (i64, [i32; 5]) {
+    let mut offsets = [0i32; 5];
+    let mut gain = 0i64;
+    for k in 0..4usize {
+        // §8.7.3.2 equation 8-414: the four bands wrap the 32-band range.
+        let band = (usize::from(band_position) + k) & 31;
+        if counts[band] == 0 {
+            continue;
+        }
+        let offset = div_round(sums[band], counts[band]).clamp(-SAO_OFFSET_MAX, SAO_OFFSET_MAX);
+        offsets[k + 1] = offset;
+        // The SSE reduction of adding a constant `o` to `n` samples whose
+        // summed error is `s`: 2*o*s − n*o^2.
+        gain += 2 * i64::from(offset) * sums[band]
+            - counts[band] * i64::from(offset) * i64::from(offset);
+    }
+    (gain, offsets)
+}
+
+/// The best SAO component for the luma of one CTB, or an off component when
+/// nothing earns the syntax it would be coded with.
+///
+/// The four §8.7.3.2 edge-offset classes and the 32 band positions are scored
+/// against each other under one [`rd_score`], so the type is chosen by what it
+/// buys net of what it costs rather than by picking a winner per type first.
+fn best_luma_sao(
     pic: &Picture,
     src: SourcePlanes<'_>,
     rx: usize,
@@ -685,14 +804,14 @@ fn best_luma_edge_offset(
 ) -> ResolvedSaoComponent {
     let rect = ctb_rect(pic, Plane::Luma, rx, ry);
     let mut best = ResolvedSaoComponent::off();
-    let mut best_gain = 0i64;
+    let mut best_score = 0i64;
     for eo_class in 0..4u8 {
         let (gain, offsets) = class_offsets(pic, Plane::Luma, src.y, src.width, rect, eo_class);
         // One `sao_type_idx_luma` bin beyond the "off" bin, two
         // `sao_eo_class_luma` bins, and the offsets' own.
-        let bins = 1 + 2 + offset_abs_bins(&offsets);
-        if gain > best_gain && clears_its_rate(gain, bins, lambda_q8) {
-            best_gain = gain;
+        let score = rd_score(gain, 1 + 2 + offset_abs_bins(&offsets), lambda_q8);
+        if score > best_score {
+            best_score = score;
             best = ResolvedSaoComponent {
                 sao_type_idx: 2,
                 offset_val: offsets,
@@ -701,12 +820,34 @@ fn best_luma_edge_offset(
             };
         }
     }
+    let (sums, counts) = band_stats(pic, Plane::Luma, src.y, src.width, rect);
+    for band_position in 0..32u8 {
+        let (gain, offsets) = band_offsets(&sums, &counts, band_position);
+        // One `sao_type_idx_luma` bin beyond the "off" bin, then the band
+        // path's own signs, position and offsets.
+        let score = rd_score(gain, 1 + band_offset_bins(&offsets), lambda_q8);
+        if score > best_score {
+            best_score = score;
+            best = ResolvedSaoComponent {
+                sao_type_idx: 1,
+                offset_val: offsets,
+                band_position,
+                eo_class: 0,
+            };
+        }
+    }
     best
 }
 
-/// The best §8.7.3.2 edge-offset components for the Cb and Cr of one CTB,
-/// sharing the one class the §7.4.9.3 inference leaves them.
-fn best_chroma_edge_offset(
+/// The best SAO components for the Cb and Cr of one CTB, sharing the one type
+/// the §7.4.9.3 inference leaves them.
+///
+/// `SaoTypeIdx[2]` and `SaoEoClass[2]` are inferred from cIdx 1, so the two
+/// components are decided together on the summed gain of one shared type —
+/// and, for edge offset, one shared class. Band offset infers no position, so
+/// each component still picks the four bands that suit it, exactly as each
+/// picks its own four offsets.
+fn best_chroma_sao(
     pic: &Picture,
     src: SourcePlanes<'_>,
     rx: usize,
@@ -719,19 +860,19 @@ fn best_chroma_edge_offset(
     );
     let chroma_stride = src.width / 2;
     let mut best = [ResolvedSaoComponent::off(); 2];
-    let mut best_gain = 0i64;
+    let mut best_score = 0i64;
     for eo_class in 0..4u8 {
         let (cb_gain, cb_offsets) =
             class_offsets(pic, Plane::Cb, src.cb, chroma_stride, cb_rect, eo_class);
         let (cr_gain, cr_offsets) =
             class_offsets(pic, Plane::Cr, src.cr, chroma_stride, cr_rect, eo_class);
-        let gain = cb_gain + cr_gain;
         // One `sao_type_idx_chroma` bin beyond the "off" bin, two
         // `sao_eo_class_chroma` bins, and both components' offsets — cIdx 2
         // codes neither a type nor a class of its own.
         let bins = 1 + 2 + offset_abs_bins(&cb_offsets) + offset_abs_bins(&cr_offsets);
-        if gain > best_gain && clears_its_rate(gain, bins, lambda_q8) {
-            best_gain = gain;
+        let score = rd_score(cb_gain + cr_gain, bins, lambda_q8);
+        if score > best_score {
+            best_score = score;
             best = [
                 ResolvedSaoComponent {
                     sao_type_idx: 2,
@@ -746,6 +887,54 @@ fn best_chroma_edge_offset(
                     eo_class,
                 },
             ];
+        }
+    }
+    let cb = best_band_component(pic, Plane::Cb, src.cb, chroma_stride, cb_rect, lambda_q8);
+    let cr = best_band_component(pic, Plane::Cr, src.cr, chroma_stride, cr_rect, lambda_q8);
+    // The shared `sao_type_idx_chroma` bin is paid once for the pair.
+    let bins = 1 + band_offset_bins(&cb.1) + band_offset_bins(&cr.1);
+    let score = rd_score(cb.0 + cr.0, bins, lambda_q8);
+    if score > best_score {
+        best = [
+            ResolvedSaoComponent {
+                sao_type_idx: 1,
+                offset_val: cb.1,
+                band_position: cb.2,
+                eo_class: 0,
+            },
+            ResolvedSaoComponent {
+                sao_type_idx: 1,
+                offset_val: cr.1,
+                band_position: cr.2,
+                eo_class: 0,
+            },
+        ];
+    }
+    best
+}
+
+/// The band position of one chroma component that scores best on its own
+/// share of the band path's rate, with the gain and offsets it buys.
+///
+/// The pair's shared `sao_type_idx_chroma` bin is not charged here, because it
+/// is paid once for both components by the caller.
+fn best_band_component(
+    pic: &Picture,
+    plane: Plane,
+    source: &[u8],
+    src_stride: usize,
+    rect: (usize, usize, usize, usize),
+    lambda_q8: u32,
+) -> (i64, [i32; 5], u8) {
+    let (sums, counts) = band_stats(pic, plane, source, src_stride, rect);
+    let mut best = (0i64, [0i32; 5], 0u8);
+    let mut best_score = i64::MIN;
+    for band_position in 0..32u8 {
+        let (gain, offsets) = band_offsets(&sums, &counts, band_position);
+        let score = rd_score(gain, band_offset_bins(&offsets), lambda_q8);
+        if score > best_score {
+            best_score = score;
+            best = (gain, offsets, band_position);
         }
     }
     best
@@ -914,6 +1103,60 @@ mod tests {
                 (d * d) as u64
             })
             .sum()
+    }
+
+    #[test]
+    fn the_search_takes_band_offset_where_the_bias_is_a_value_range() {
+        // The case §8.7.3.2 edge offset cannot reach: two flat regions, one of
+        // which the "quantizer" biased 3 low. Every interior sample of a flat
+        // region is edge category 0, so no edge class has anything to offset —
+        // but every one of those samples sits in the same value band, which is
+        // precisely what band offset selects on.
+        let mut pic = Picture::new(W, H, CHROMA_ARRAY_TYPE, BIT_DEPTH, BIT_DEPTH);
+        let (buf, _) = pic.plane_mut(Plane::Luma);
+        for row in 0..H {
+            for col in 0..W {
+                buf[row * W + col] = if col < W / 2 { 100 } else { 200 };
+            }
+        }
+        for plane in [Plane::Cb, Plane::Cr] {
+            let (buf, _) = pic.plane_mut(plane);
+            buf.fill(128);
+        }
+        let y: Vec<u8> = (0..W * H)
+            .map(|i| if i % W < W / 2 { 103 } else { 200 })
+            .collect();
+        let chroma = vec![128u8; (W / 2) * (H / 2)];
+        let src = SourcePlanes {
+            y: &y,
+            cb: &chroma,
+            cr: &chroma,
+            width: W,
+            height: H,
+        };
+
+        let grid = estimate_sao(&pic, src, true, true, 32);
+        // The first CTB lies wholly inside the biased region.
+        let luma = grid[0].components[0];
+        assert_eq!(
+            luma.sao_type_idx, 1,
+            "the search picked type {} where only band offset can reach the error",
+            luma.sao_type_idx
+        );
+        // Band 12 is where sample 100 lives at 8-bit depth (100 >> 3), and the
+        // four signalled bands wrap the 32-band range from `band_position`.
+        let position = usize::from(luma.band_position);
+        let k = (12 + 32 - position) % 32;
+        assert!(
+            k < 4,
+            "band 12 is outside the four bands at position {position}"
+        );
+        assert_eq!(
+            luma.offset_val[k + 1],
+            3,
+            "the band carrying the bias was offset by {} rather than its mean error",
+            luma.offset_val[k + 1]
+        );
     }
 
     #[test]
