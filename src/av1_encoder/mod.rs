@@ -1162,6 +1162,28 @@ mod nonlossless_tests {
         println!("exhaustive,{exhaustive_best:.4},{exhaustive_candidates}");
     }
 
+    /// Summed squared error of a report's reconstruction against the source frame, over the
+    /// visible `width x height` region rather than the coded one.
+    fn sse_against(
+        report: &tile::SearchReport,
+        pixels: &[u8],
+        width: usize,
+        height: usize,
+    ) -> i64 {
+        (0..height)
+            .flat_map(|row| {
+                report.reconstruction[row * report.coded_width..][..width]
+                    .iter()
+                    .enumerate()
+                    .map(move |(column, &value)| (row * width + column, value))
+            })
+            .map(|(index, value)| {
+                let error = i64::from(i32::from(pixels[index]) - i32::from(value));
+                error * error
+            })
+            .sum()
+    }
+
     /// Sweeps the recency window the per-size gain ratio is accumulated over.
     ///
     /// Prints, per frame and quantizer, the sampled estimator's `sse + lambda * bits` at each
@@ -1217,6 +1239,102 @@ mod nonlossless_tests {
                     println!("{name},{qindex},{memory},{penalty:+.2},{bytes},{candidates}");
                 }
             }
+        }
+    }
+
+    /// Sweeps where a trial that did not probe reads its gain ratio back from.
+    ///
+    /// [`tile::TYPE_GAIN_MEMORY`] ages the running accumulator, but the ageing is in *probe
+    /// order*: the size searches are visited in superblock raster order, so a window of four
+    /// probes spans a horizontal run of coding blocks and carries nothing about the block
+    /// directly above. This prints, per frame and quantizer, the sampled estimator's
+    /// `sse + lambda * bits` against the same estimator probing every size search, for the
+    /// running accumulator alone (what #272 shipped), the per-superblock-column accumulator
+    /// alone, and the two summed, which is what `GainLocality::Blended` ships.
+    #[test]
+    #[ignore = "measurement sweep, not an assertion"]
+    fn measure_type_gain_locality() {
+        for (width, height) in [(128_usize, 96_usize), (192, 160)] {
+            measure_type_gain_locality_at(width, height);
+        }
+    }
+
+    fn measure_type_gain_locality_at(width: usize, height: usize) {
+        let mut frames = content_frames(width as u32, height as u32);
+        frames.push(("test_pattern", test_pattern(width as u32, height as u32)));
+        let arms = [
+            ("running", tile::GainLocality::Running),
+            ("column", tile::GainLocality::Column),
+            ("blended", tile::GainLocality::Blended),
+        ];
+        println!("size,{width}x{height}");
+        println!("frame,qindex,locality,penalty_percent,bytes,candidates");
+        for (name, pixels) in &frames {
+            for qindex in [1_u8, 8, 32, 80, 160, 200] {
+                let ac = i64::from(crate::av1_intra::get_ac_quant(qindex));
+                let lambda = (ac * ac / 256).max(1);
+                let cost = |interval: usize, locality: tile::GainLocality| {
+                    let report = tile::FrameEncoder::new(pixels, width, height, qindex)
+                        .with_type_gain_interval(interval)
+                        .with_type_gain_locality(locality)
+                        .encode_with_report();
+                    (
+                        sse_against(&report, pixels, width, height)
+                            + lambda * report.tile.len() as i64 * 8,
+                        report.tile.len(),
+                        report.candidates_evaluated,
+                    )
+                };
+                let (unsampled, _, _) = cost(1, tile::GainLocality::Running);
+                for (label, locality) in arms {
+                    let (sampled, bytes, candidates) =
+                        cost(tile::TYPE_GAIN_SAMPLE_INTERVAL, locality);
+                    let penalty = sampled as f64 / unsampled as f64 * 100.0 - 100.0;
+                    println!("{name},{qindex},{label},{penalty:+.2},{bytes},{candidates}");
+                }
+            }
+        }
+    }
+
+    /// What the locality blend costs in encode time, against each accumulator on its own.
+    ///
+    /// Interleaved rounds with the minimum taken per arm: a single pass would attribute this
+    /// host's own load to whichever arm happened to run under it.
+    #[test]
+    #[ignore = "measurement sweep, not an assertion"]
+    fn measure_type_gain_locality_cost() {
+        use std::time::Instant;
+        let (width, height) = (192_usize, 160_usize);
+        let mut frames = content_frames(width as u32, height as u32);
+        frames.push(("test_pattern", test_pattern(width as u32, height as u32)));
+        let arms = [
+            ("running", tile::GainLocality::Running),
+            ("column", tile::GainLocality::Column),
+            ("blended", tile::GainLocality::Blended),
+        ];
+        let mut best = std::collections::BTreeMap::new();
+        let mut candidates = std::collections::BTreeMap::new();
+        for _ in 0..5 {
+            for (label, locality) in arms {
+                let start = Instant::now();
+                let mut total = 0_u64;
+                for (_, pixels) in &frames {
+                    for qindex in [1_u8, 8, 32, 80, 160, 200] {
+                        let report = tile::FrameEncoder::new(pixels, width, height, qindex)
+                            .with_type_gain_locality(locality)
+                            .encode_with_report();
+                        total += report.candidates_evaluated;
+                    }
+                }
+                let elapsed = start.elapsed().as_secs_f64();
+                let slot = best.entry(label).or_insert(f64::MAX);
+                *slot = slot.min(elapsed);
+                candidates.insert(label, total);
+            }
+        }
+        println!("locality,seconds,candidates");
+        for (label, _) in arms {
+            println!("{label},{:.4},{}", best[label], candidates[label]);
         }
     }
 

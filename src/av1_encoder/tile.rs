@@ -45,6 +45,11 @@ const MEMO_UNSET: u8 = u8::MAX;
 /// (`bw` of 8, 16, 32 and 64, so `bsl` 1 through 4).
 const MEMO_LEVELS: usize = 5;
 
+/// A 64x64 superblock's side in MI (4-sample) units, which is the grid
+/// [`FrameEncoder::encode_superblocks`] walks and the one the per-column transform-gain
+/// accumulators are indexed on.
+const SB4: usize = 16;
+
 /// Bits [`estimate_rate`] charges a block whose levels are all zero: the `all_zero` flag alone.
 const ZERO_BLOCK_BITS: i64 = 1;
 /// Bits [`estimate_rate`] charges the cheapest block it can charge that is *not* all zero: the
@@ -160,6 +165,23 @@ struct TypeGain {
     best_cost: i64,
 }
 
+/// Where a trial that did not probe reads its gain ratio back from.
+///
+/// Shipped encodes always use [`GainLocality::Blended`]; the other arms exist so
+/// `measure_type_gain_locality` can measure it against them on the same frames.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GainLocality {
+    /// The running accumulator alone, which is what #272 shipped: recency in probe order, so a
+    /// window of [`TYPE_GAIN_MEMORY`] probes spans a horizontal run of coding blocks.
+    Running,
+    /// The superblock column's accumulator alone, whose most recent probes before the current
+    /// superblock are the ones directly above it.
+    Column,
+    /// Both, summed, so the ratio a block reads back is measured on its own neighbourhood in
+    /// both axes.
+    Blended,
+}
+
 /// Slot in [`FrameEncoder::type_gain`] for a transform of `tx_width` samples a side.
 fn type_gain_slot(tx_width: usize) -> usize {
     (tx_width / 4).trailing_zeros() as usize
@@ -221,6 +243,14 @@ pub(crate) struct FrameEncoder<'a> {
     /// probe reads it back, so a size's gain is measured on a sample of its trials rather than on
     /// all of them.
     type_gain: [TypeGain; TYPE_GAIN_SIZES],
+    /// The same measurement kept per superblock column, one [`TYPE_GAIN_SIZES`] block per column
+    /// of the frame. A probe joins its own column's accumulator as well as the running one, and
+    /// because a column is only revisited a superblock row later, the probes it still remembers
+    /// when a superblock starts are the ones directly above it.
+    column_gain: Vec<TypeGain>,
+    /// Superblock column of the coding block whose size search is running, which is the
+    /// [`Self::column_gain`] block that search probes into and reads back.
+    gain_column: usize,
     /// The current trial's own probe measurement, or a zeroed pair when it did not probe. A
     /// trial that probed is corrected by what it measured itself, exactly as every trial was
     /// before the measurement was sampled; only the trials that skip the probe fall back to
@@ -246,6 +276,10 @@ pub(crate) struct FrameEncoder<'a> {
     /// [`TYPE_GAIN_MEMORY`] is read directly.
     #[cfg(test)]
     type_gain_memory: usize,
+    /// The locality arm in force, so a test can measure the shipped one against the accumulators
+    /// it blends. [`GainLocality::Blended`] outside tests.
+    #[cfg(test)]
+    type_gain_locality: GainLocality,
     /// Transform-type candidates actually transformed, quantized and reconstructed, which is the
     /// work the shortcuts exist to remove.
     #[cfg(test)]
@@ -329,6 +363,8 @@ impl<'a> FrameEncoder<'a> {
             tx_size_memo: vec![MEMO_UNSET; MEMO_LEVELS * mi_cols * mi_rows],
             probe_budget: 0,
             type_gain: [TypeGain::default(); TYPE_GAIN_SIZES],
+            column_gain: vec![TypeGain::default(); mi_cols.div_ceil(SB4) * TYPE_GAIN_SIZES],
+            gain_column: 0,
             probe_dct_cost: 0,
             probe_best_cost: 0,
             size_searches: 0,
@@ -339,6 +375,8 @@ impl<'a> FrameEncoder<'a> {
             type_gain_interval: TYPE_GAIN_SAMPLE_INTERVAL,
             #[cfg(test)]
             type_gain_memory: TYPE_GAIN_MEMORY,
+            #[cfg(test)]
+            type_gain_locality: GainLocality::Blended,
             #[cfg(test)]
             candidates_evaluated: 0,
         }
@@ -416,6 +454,28 @@ impl<'a> FrameEncoder<'a> {
         TYPE_GAIN_MEMORY
     }
 
+    /// Overrides where a trial reads its gain ratio back from, so a test can measure the shipped
+    /// blend against each accumulator on its own.
+    #[cfg(test)]
+    pub(crate) fn with_type_gain_locality(mut self, locality: GainLocality) -> Self {
+        self.type_gain_locality = locality;
+        self
+    }
+
+    /// The locality arm in force. [`GainLocality::Blended`] outside tests, where nothing can
+    /// override it.
+    #[cfg(test)]
+    fn type_gain_locality(&self) -> GainLocality {
+        self.type_gain_locality
+    }
+
+    /// The locality arm in force. [`GainLocality::Blended`] outside tests, where nothing can
+    /// override it.
+    #[cfg(not(test))]
+    fn type_gain_locality(&self) -> GainLocality {
+        GainLocality::Blended
+    }
+
     /// Encodes the tile and returns the symbol-coded bytes (`decode_tile`, §5.11.2).
     pub(crate) fn encode(mut self) -> Vec<u8> {
         self.encode_superblocks();
@@ -447,7 +507,6 @@ impl<'a> FrameEncoder<'a> {
     }
 
     fn encode_superblocks(&mut self) {
-        const SB4: usize = 16; // 64×64 superblock in MI units
         let mut r = 0;
         while r < self.mi_rows {
             self.left_level.fill(0);
@@ -657,6 +716,7 @@ impl<'a> FrameEncoder<'a> {
         }
         let largest = bw.min(MAX_TX_WIDTH);
         let (_, max_depth) = cdf::tx_depth_cdf(bw);
+        self.gain_column = c / SB4;
         let probing = self.shortcuts() && self.sample_type_gain();
         let mut best = (0usize, i64::MAX);
         for depth in 0..=max_depth {
@@ -709,8 +769,17 @@ impl<'a> FrameEncoder<'a> {
         let (dct, best) = if self.probe_dct_cost > 0 {
             (self.probe_dct_cost, self.probe_best_cost)
         } else {
-            let gain = self.type_gain[type_gain_slot(tx_width)];
-            (gain.dct_cost, gain.best_cost)
+            let slot = type_gain_slot(tx_width);
+            let running = self.type_gain[slot];
+            let column = self.column_gain[self.gain_column * TYPE_GAIN_SIZES + slot];
+            match self.type_gain_locality() {
+                GainLocality::Running => (running.dct_cost, running.best_cost),
+                GainLocality::Column => (column.dct_cost, column.best_cost),
+                GainLocality::Blended => (
+                    running.dct_cost + column.dct_cost,
+                    running.best_cost + column.best_cost,
+                ),
+            }
         };
         if dct <= 0 {
             return cost;
@@ -897,7 +966,12 @@ impl<'a> FrameEncoder<'a> {
             self.probe_dct_cost += dct;
             self.probe_best_cost += best_of_set;
             let memory = self.type_gain_memory();
-            let gain = &mut self.type_gain[type_gain_slot(size)];
+            let slot = type_gain_slot(size);
+            let column = self.gain_column * TYPE_GAIN_SIZES + slot;
+            for gain in [
+                &mut self.type_gain[slot],
+                &mut self.column_gain[column],
+            ] {
             // Recency weighting: what the accumulator already holds is aged by `(n-1)/n` before
             // the new probe joins it, so a probe's influence decays away over the following `n`
             // and the ratio a block reads back is the one its own neighbourhood measured. One
@@ -905,13 +979,14 @@ impl<'a> FrameEncoder<'a> {
             //
             // `usize::MAX` is the sentinel for no decay at all, which is the frame-wide
             // accumulation this replaced; a test sweeps it as the far end of the window.
-            if memory != usize::MAX {
-                let (num, den) = (memory as i64 - 1, memory as i64);
-                gain.dct_cost = gain.dct_cost * num / den;
-                gain.best_cost = gain.best_cost * num / den;
+                if memory != usize::MAX {
+                    let (num, den) = (memory as i64 - 1, memory as i64);
+                    gain.dct_cost = gain.dct_cost * num / den;
+                    gain.best_cost = gain.best_cost * num / den;
+                }
+                gain.dct_cost += dct;
+                gain.best_cost += best_of_set;
             }
-            gain.dct_cost += dct;
-            gain.best_cost += best_of_set;
         }
         // `tx_type` itself is only read by the trace the tests assert on; the bitstream carries
         // its `symbol` index instead.
