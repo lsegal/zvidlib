@@ -1,0 +1,48 @@
+# Temporary: re-takes the Coffee Lake column of the `hevc::engine::simd`
+# module table (issue #326) on the only Coffee Lake host in the runner
+# pool. Deleted before this branch merges.
+name: Issue 326 Coffee Lake SIMD column
+
+on:
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: 'Independent benchmark runs inside this draw'
+        required: false
+        default: '3'
+
+permissions:
+  contents: read
+
+jobs:
+  cfl:
+    name: Coffee Lake SIMD benchmarks
+    runs-on: macos-15-intel
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: rustup show
+      - name: Identify the host
+        run: |
+          sysctl -n machdep.cpu.brand_string
+          sysctl -n machdep.cpu.family machdep.cpu.model machdep.cpu.stepping
+          sysctl -n hw.physicalcpu hw.logicalcpu
+          uname -m
+      - name: Build the release test binary
+        run: cargo test --release --features native --lib --no-run
+      # Issue #327: the release test binary carries an unresolvable
+      # @rpath/libswiftCore.dylib reference on macos-15-intel, so it aborts
+      # before running a test without this. Remove once #327 lands.
+      - name: Run the SIMD benchmarks
+        env:
+          DYLD_FALLBACK_LIBRARY_PATH: /usr/lib/swift:/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/macosx
+        run: |
+          for i in $(seq 1 ${{ inputs.runs || 3 }}); do
+            echo "===== run $i: simd_inter_pred_benchmark ====="
+            cargo test --release --features native --lib \
+              simd_inter_pred_benchmark -- --ignored --nocapture
+            echo "===== run $i: bench_in_loop_filters ====="
+            cargo test --release --features native --lib \
+              hevc::engine::simd::in_loop::tests::bench_in_loop_filters -- --ignored --nocapture
+          done
