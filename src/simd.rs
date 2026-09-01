@@ -115,6 +115,7 @@ pub fn available() -> Vec<SimdIsa> {
 /// | `hevc_prediction_filters` | HEVC inter/intra prediction and in-loop filters |
 /// | `hevc_transforms` | HEVC inverse transforms and dequantization |
 /// | `hevc_rdcost` | HEVC encoder-side distortion metrics |
+/// | `hevc_recon` | HEVC encoder-side reconstruction and SAO parameter search |
 /// | `hevc_fwd_transform_quant` | HEVC encoder-side forward transform and quantization |
 /// | `hevc_colorconv` | HEVC encoder-side RGBA8 to YUV420 input conversion |
 /// | `hevc_color_convert` | HEVC decoder output YUV420-to-RGBA conversion |
@@ -136,7 +137,7 @@ pub fn active_by_site() -> Vec<(&'static str, SimdIsa)> {
     #[cfg(not(target_arch = "wasm32"))]
     {
         use crate::hevc::color_convert;
-        use crate::hevc::engine::encoder::{colorconv, rdcost};
+        use crate::hevc::engine::encoder::{colorconv, rdcost, recon_simd};
         use crate::hevc::engine::{simd as hevc_simd, transform_simd};
         sites.push((
             "hevc_prediction_filters",
@@ -147,6 +148,7 @@ pub fn active_by_site() -> Vec<(&'static str, SimdIsa)> {
             from_hevc_backend(transform_simd::detected()),
         ));
         sites.push(("hevc_rdcost", from_rdcost_isa(rdcost::isa())));
+        sites.push(("hevc_recon", from_recon_isa(recon_simd::isa())));
         sites.push((
             "hevc_fwd_transform_quant",
             from_hevc_backend(crate::hevc::engine::encoder::quant_simd::detected()),
@@ -211,6 +213,20 @@ fn from_hevc_backend(backend: crate::hevc::engine::transform_simd::Backend) -> S
 #[cfg(not(target_arch = "wasm32"))]
 fn from_color_convert_isa(isa: crate::hevc::color_convert::Isa) -> SimdIsa {
     use crate::hevc::color_convert::Isa;
+    match isa {
+        Isa::Scalar => SimdIsa::Scalar,
+        #[cfg(target_arch = "x86_64")]
+        Isa::Sse41 => SimdIsa::Sse41,
+        #[cfg(target_arch = "x86_64")]
+        Isa::Avx2 => SimdIsa::Avx2,
+        #[cfg(target_arch = "aarch64")]
+        Isa::Neon => SimdIsa::Neon,
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn from_recon_isa(isa: crate::hevc::engine::encoder::recon_simd::Isa) -> SimdIsa {
+    use crate::hevc::engine::encoder::recon_simd::Isa;
     match isa {
         Isa::Scalar => SimdIsa::Scalar,
         #[cfg(target_arch = "x86_64")]
@@ -332,7 +348,7 @@ mod tests {
         use crate::av1_intra_pred::{Av1IntraSimd, av1_intra_simd};
         use crate::av1_mc::{McContext, SimdLevel, default_level};
         use crate::hevc::color_convert;
-        use crate::hevc::engine::encoder::{colorconv, quant_simd, rdcost};
+        use crate::hevc::engine::encoder::{colorconv, quant_simd, rdcost, recon_simd};
         use crate::hevc::engine::{simd as hevc_simd, transform_simd};
 
         let _guard = lock();
@@ -355,6 +371,8 @@ mod tests {
         assert_eq!(transform_simd::detected(), transform_simd::Backend::Scalar);
         // HEVC encoder-side distortion metrics.
         assert_eq!(rdcost::isa(), rdcost::Isa::Scalar);
+        // HEVC encoder-side reconstruction and SAO parameter search.
+        assert_eq!(recon_simd::isa(), recon_simd::Isa::Scalar);
         // HEVC encoder-side forward transform and quantization.
         assert_eq!(quant_simd::detected(), transform_simd::Backend::Scalar);
         // HEVC encoder-side RGBA8 to YUV420 input conversion.
@@ -373,6 +391,7 @@ mod tests {
             "hevc_prediction_filters",
             "hevc_transforms",
             "hevc_rdcost",
+            "hevc_recon",
             "hevc_fwd_transform_quant",
             "hevc_colorconv",
             "hevc_color_convert",
@@ -415,7 +434,7 @@ mod tests {
         use crate::av1_intra_pred::{Av1IntraSimd, av1_intra_simd};
         use crate::av1_mc::default_level;
         use crate::hevc::color_convert;
-        use crate::hevc::engine::encoder::{colorconv, quant_simd, rdcost};
+        use crate::hevc::engine::encoder::{colorconv, quant_simd, rdcost, recon_simd};
         use crate::hevc::engine::{simd as hevc_simd, transform_simd};
 
         let _guard = lock();
@@ -449,6 +468,8 @@ mod tests {
         );
         // HEVC encoder-side distortion metrics.
         assert_eq!(rdcost::isa() != rdcost::Isa::Scalar, vectorized);
+        // HEVC encoder-side reconstruction and SAO parameter search.
+        assert_eq!(recon_simd::isa() != recon_simd::Isa::Scalar, vectorized);
         // HEVC encoder-side forward transform and quantization.
         assert_eq!(
             quant_simd::detected() != transform_simd::Backend::Scalar,
@@ -474,6 +495,7 @@ mod tests {
             "hevc_prediction_filters",
             "hevc_transforms",
             "hevc_rdcost",
+            "hevc_recon",
             "hevc_fwd_transform_quant",
             "hevc_colorconv",
             "hevc_color_convert",
