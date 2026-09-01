@@ -569,6 +569,85 @@ group asserts through `simd::active_by_site()` that the override landed rather
 than inferring it from the clock — see
 [Reading a null result](#reading-a-null-result).
 
+### Why the CABAC arithmetic encoder stays serial
+
+`hevc_encode_cabac` reads flat under every instruction set and is expected to
+keep doing so. The §9.3.5 arithmetic encoder is serial by construction — each
+bin's renormalization reads the interval the previous bin left — so nothing
+vectorizes here and any speedup would have to come from a bin-parallel or
+speculative *algorithm*. It was measured to decide whether such an algorithm is
+worth its complexity. It is not, and this section is the record of why, so the
+question does not have to be re-derived.
+
+Two things were measured on an Apple Silicon host, both as the best of nine
+interleaved rounds per arm and reproduced across three separate runs, because
+this machine routinely runs several concurrent builds and a single run of
+anything on it is worth several times its own value in noise.
+
+**First, where a bin's time goes.** The same 262,144-bin mixed workload
+`hevc_encode_cabac` uses — alternating context-coded and bypass bins over 64
+context models — run through the shipped engine with its bit sink progressively
+removed:
+
+| Arm | Throughput | vs shipped |
+| --- | --- | --- |
+| the shipped engine, writing through `BitWriter` | 74.5 Mbin/s | 1.00x |
+| the same engine over a word-accumulating bit sink | 84.9 Mbin/s | 1.14x |
+| the same engine emitting no bits at all | 129.8 Mbin/s | 1.75x |
+| the per-context §9.3.4.3.2.2 state transitions alone | 275.5 Mbin/s | 3.70x |
+
+The last row is the ceiling on the whole question. A bin-parallel formulation
+attacks the interval arithmetic and the renormalization; the table prices making
+*all* of it, and every bit of output with it, entirely free at **3.7x** — and
+what is left over at that point is another serial dependence chain, because a
+context's state after bin *k* is what bin *k+1* codes against. Every one of
+those 3.7x has to be paid for in speculation, rollback, and the merging of
+per-segment carries and outstanding-bit runs, whose per-bin bookkeeping is
+comparable to the four table lookups and two shifts it would be replacing.
+
+**Second, what the stage is worth at the frame level.** Ablating the three
+CABAC entry points out of the access-unit writers at 640x352, so every other
+stage still runs:
+
+| Writer | Per access unit | CABAC's share | Bins per access unit |
+| --- | --- | --- | --- |
+| `encode_idr_pcm_au` (lossless) | 10.5–11.7 ms | 4–10% | 55,068 |
+| `encode_idr_residual_au` (lossy, QP 26) | 37.5–42.1 ms | 64–66% | 1,472,210 |
+
+For scale, the mode search over the same picture is 1.6–1.7 ms intra and
+39–42 ms inter per frame.
+
+This corrects the premise the question was filed under. On the lossless PCM path
+CABAC really is a rounding error — the bins are a few per coding unit and the
+other 90%+ of that writer is raw sample bytes going through the
+`put_bit`-at-a-time loop, which is the bitwriter's problem and not the arithmetic
+coder's. But on the lossy residual path the encoder gained in #227, CABAC is
+about **two thirds** of the access-unit write, so the stage is worth working on
+after all. What does not follow is that bin-parallelism is the way to work on
+it.
+
+**What to do instead.** Two ordinary serial changes take most of the reachable
+headroom, exactly, with no speculation:
+
+1. **Encode a bypass *run* in one step.** §9.3.5.5 unrolled over `n` bins is
+   `ivlLow = ( ivlLow << n ) + ivlCurrRange * value` followed by the same
+   carry-controlled emission of the top `n` bits, which is an identity rather
+   than an approximation: it was checked byte-identical against the
+   bin-at-a-time engine for every run length from 1 to 24, and measured
+   **1.73x** on a workload of runs (64.4–65.5 -> 110.5–113.4 Mbin/s). The lossy
+   writer's coefficient sign bits and Golomb-Rice suffixes are exactly such
+   runs, and **62%** of its bins are bypass bins. `hevc_encode_cabac` itself
+   would not move, because its bypass bins are single and interleaved with
+   context-coded ones by construction.
+2. **Widen the bit sink**, which the first table prices at 1.14x for this stage
+   on its own. That is the same rewrite the `..._pcm_write` and
+   `hevc_encode_bitwriter` groups want.
+
+Neither is a bin-parallel algorithm, and neither changes a single bit of output.
+Whatever headroom a speculative formulation might still hold after both is
+smaller than the 3.7x ceiling above and costs far more to hold onto, which is
+why the arithmetic encoder stays serial.
+
 ## Per-stage access to the encoder
 
 `crate::hevc` is a private module and benchmarks are a separate crate, so the
