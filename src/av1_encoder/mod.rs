@@ -13,6 +13,7 @@
 
 #[allow(dead_code)]
 mod bitwriter;
+pub mod bench;
 #[allow(dead_code)]
 mod cdf;
 mod headers;
