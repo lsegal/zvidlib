@@ -110,26 +110,65 @@ impl BitWriter {
         }
     }
 
+    /// Largest `codeNum` a `ue(v)` codeword may carry: `2^32 - 2`, the
+    /// cap §9.2 states and [`BitReader::ue`] enforces
+    /// ([`BitReaderError::ExpGolombOverflow`] above it). `2^32 - 1`
+    /// would need a 33-bit codeword with a 32-zero prefix, which is
+    /// outside the range the spec allows and which no conforming
+    /// decoder — this crate's reader included — accepts.
+    ///
+    /// [`BitReader::ue`]: crate::hevc::engine::bitreader::BitReader::ue
+    /// [`BitReaderError::ExpGolombOverflow`]:
+    ///     crate::hevc::engine::bitreader::BitReaderError::ExpGolombOverflow
+    pub const MAX_UE: u32 = u32::MAX - 1;
+
+    /// Most negative value `se(v)` can carry. Table 9-3 maps it to
+    /// `codeNum == 2 * 2^31 - 2 ==` [`Self::MAX_UE`]; `i32::MIN` itself
+    /// would map to `2^32`, one past the cap.
+    pub const MIN_SE: i32 = i32::MIN + 1;
+
+    /// Most positive value `se(v)` can carry, mapping to
+    /// `codeNum == 2^32 - 3`, comfortably inside [`Self::MAX_UE`].
+    pub const MAX_SE: i32 = i32::MAX;
+
     /// §9.2 — 0-th order Exp-Golomb, unsigned (`ue(v)`).
+    ///
+    /// # Panics
+    ///
+    /// If `value` exceeds [`Self::MAX_UE`]. That is a caller contract
+    /// violation rather than bad input data: every `ue(v)` field the
+    /// HEVC syntax defines is bounded far below the cap, so reaching it
+    /// means the caller computed a field value wrongly. Emitting the
+    /// out-of-contract codeword instead would put a codeword in the
+    /// bitstream that no conforming decoder can read back.
     pub fn ue(&mut self, value: u32) {
+        assert!(
+            value <= Self::MAX_UE,
+            "ue(v) codeNum {value} exceeds the §9.2 cap of {}",
+            Self::MAX_UE
+        );
         // codeNum = value; the codeword is `leadingZeroBits` zeros, a
-        // one, then `leadingZeroBits` LSBs of (codeNum + 1).
-        let code_num = value as u64 + 1;
-        let bits = 64 - code_num.leading_zeros() as u8; // >= 1
+        // one, then `leadingZeroBits` LSBs of (codeNum + 1). The cap
+        // keeps `codeNum + 1` inside `u32` and the codeword at 63 bits
+        // or fewer, so the payload always fits `put_bits`' 32-bit field.
+        let code_num = value + 1;
+        let bits = 32 - code_num.leading_zeros() as u8; // 1..=32
         self.put_bits(0, bits - 1);
-        if bits > 32 {
-            // `value == u32::MAX` needs 33 bits; split off the MSB so the
-            // rest fits `put_bits`' 32-bit field.
-            self.put_bit(((code_num >> 32) & 1) as u8);
-            self.put_bits(code_num as u32, 32);
-        } else {
-            self.put_bits(code_num as u32, bits);
-        }
+        self.put_bits(code_num, bits);
     }
 
     /// §9.2.2 — 0-th order Exp-Golomb, signed (`se(v)`):
     /// `codeNum = value > 0 ? 2*value − 1 : −2*value`.
+    ///
+    /// # Panics
+    ///
+    /// If `value` is below [`Self::MIN_SE`] — that is, `i32::MIN`, the
+    /// one `i32` whose Table 9-3 `codeNum` is past [`Self::MAX_UE`].
     pub fn se(&mut self, value: i32) {
+        assert!(
+            value >= Self::MIN_SE,
+            "se(v) value {value} maps to a codeNum past the §9.2 cap"
+        );
         let code_num = if value > 0 {
             2 * value as u32 - 1
         } else {
@@ -173,7 +212,7 @@ impl BitWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hevc::engine::bitreader::BitReader;
+    use crate::hevc::engine::bitreader::{BitReader, BitReaderError};
 
     #[test]
     fn bits_pack_msb_first() {
@@ -272,16 +311,15 @@ mod tests {
         }
     }
 
-    /// `ue(u32::MAX)` is a 33-bit codeword, one wider than `put_bits`
-    /// takes, so `ue` splits off its top bit. The codeword must stay the
-    /// bit-at-a-time one. (`BitReader::ue` rejects codewords this wide
-    /// with `ExpGolombOverflow`, so this checks the bits directly rather
-    /// than roundtripping.)
+    /// The widest codewords the §9.2 cap permits must still be the
+    /// bit-at-a-time reference codeword, and must read back through
+    /// [`BitReader::ue`] — the writer's bound and the reader's are the
+    /// same bound.
     #[test]
-    fn ue_emits_the_reference_codeword_at_the_33_bit_boundary() {
+    fn ue_emits_the_reference_codeword_up_to_the_code_num_cap() {
         for v in [
-            u32::MAX,
-            u32::MAX - 1,
+            BitWriter::MAX_UE,
+            BitWriter::MAX_UE - 1,
             1 << 31,
             (1 << 31) - 1,
             (1 << 16) - 2,
@@ -302,8 +340,65 @@ mod tests {
             let bit_len = w.bit_len();
             w.align_zero();
             assert_eq!(bit_len, usize::from(2 * bits - 1), "ue({v}) length");
-            assert_eq!(w.finish(), expected.finish(), "ue({v}) bits");
+            let bytes = w.finish();
+            assert_eq!(bytes, expected.finish(), "ue({v}) bits");
+
+            let mut r = BitReader::new(&bytes);
+            assert_eq!(r.ue().unwrap(), v, "ue({v}) roundtrip");
         }
+    }
+
+    /// The boundary in both directions: `2^32 - 2` is the largest
+    /// `codeNum` the writer emits and the reader accepts; `2^32 - 1` is
+    /// the first one neither may produce.
+    #[test]
+    fn ue_cap_matches_the_reader() {
+        let mut w = BitWriter::new();
+        w.ue(BitWriter::MAX_UE);
+        w.align_zero();
+        let bytes = w.finish();
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(r.ue().unwrap(), BitWriter::MAX_UE);
+
+        // The codeword one past the cap — 32 zeros, a one, then 32 more
+        // bits — is what the writer used to emit for `u32::MAX`. The
+        // reader rejects it, which is why the writer must not write it.
+        let mut hand_rolled = BitWriter::new();
+        for _ in 0..32 {
+            hand_rolled.put_bit(0);
+        }
+        hand_rolled.put_bit(1);
+        hand_rolled.put_bits(0, 32);
+        hand_rolled.align_zero();
+        let over_cap = hand_rolled.finish();
+        let mut r = BitReader::new(&over_cap);
+        assert_eq!(r.ue(), Err(BitReaderError::ExpGolombOverflow));
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds the §9.2 cap")]
+    fn ue_rejects_the_first_code_num_past_the_cap() {
+        BitWriter::new().ue(u32::MAX);
+    }
+
+    /// `se`'s own extremes map onto the same `ue` cap: `i32::MIN + 1`
+    /// lands exactly on it and must round-trip, `i32::MIN` is one past.
+    #[test]
+    fn se_roundtrips_its_extreme_values() {
+        for v in [BitWriter::MIN_SE, BitWriter::MAX_SE, -1, 1] {
+            let mut w = BitWriter::new();
+            w.se(v);
+            w.align_zero();
+            let bytes = w.finish();
+            let mut r = BitReader::new(&bytes);
+            assert_eq!(r.se().unwrap(), v, "se({v})");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "past the §9.2 cap")]
+    fn se_rejects_i32_min() {
+        BitWriter::new().se(i32::MIN);
     }
 
     /// `put_bytes` is a bulk copy when aligned and MSB-first packing when
