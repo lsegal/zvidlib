@@ -953,10 +953,10 @@ mod nonlossless_tests {
     /// These are constants of the format, not of the machine that produced them: regenerate them
     /// only alongside a deliberate change to what the encoder emits, never to make a host pass.
     const FIXED_FRAME_DIGESTS: [(usize, u64); 6] = [
-        (5417, 0x7b83_6e95_6bad_aae1),
-        (4298, 0xa4c4_6a5e_8ef1_57c0),
-        (3022, 0xba87_1a3d_44c1_4f33),
-        (2238, 0xc29d_7d70_a472_3158),
+        (5422, 0x1352_b9db_7d3b_3d4c),
+        (4289, 0xa74c_990b_3340_f8ce),
+        (3005, 0xcd2f_1c69_1785_039e),
+        (2214, 0xc7e0_a641_51f5_70e4),
         (1264, 0xc8cd_fcf5_8882_a86c),
         (752, 0x73f1_c047_f3cf_211f),
     ];
@@ -1079,7 +1079,15 @@ mod nonlossless_tests {
     #[test]
     #[ignore = "measurement sweep, not an assertion"]
     fn measure_type_gain_sampling_intervals() {
-        let (width, height) = (192_usize, 160_usize);
+        // Both sizes the interval is judged at: 192x160, where the trade is measured, and 128x96,
+        // where `the_type_gain_sampling_interval_holds_on_content_it_was_not_tuned_on` sets its
+        // per-frame ceilings from these same penalties.
+        for (width, height) in [(192_usize, 160_usize), (128, 96)] {
+            measure_type_gain_sampling_intervals_at(width, height);
+        }
+    }
+
+    fn measure_type_gain_sampling_intervals_at(width: usize, height: usize) {
         let mut frames = content_frames(width as u32, height as u32);
         frames.push(("test_pattern", test_pattern(width as u32, height as u32)));
         let quality = |report: &tile::SearchReport, pixels: &[u8]| {
@@ -1102,6 +1110,7 @@ mod nonlossless_tests {
                 })
                 .sum()
         };
+        println!("size,{width}x{height}");
         println!(
             "frame,qindex,interval,fast_psnr,exhaustive_psnr,fast_bytes,exh_bytes,candidates,lambda,fast_rd,exh_rd"
         );
@@ -1192,6 +1201,140 @@ mod nonlossless_tests {
                 reachable,
                 sizes.join(" "),
             );
+        }
+    }
+
+    /// Why `TX_4X4` coverage depends on the sampling interval's *phase* against the block raster
+    /// and not only on its rate, and what the guarantee that would remove it costs (#323).
+    ///
+    /// The first table is the mechanism. `TYPE_GAIN_SAMPLE_INTERVAL` counts *coding blocks*, and
+    /// which transform sizes a size search can reach is a property of the coding block's width -
+    /// `read_tx_size` signals a depth off `Max_Tx_Size_Rect`, so only a 16x16 or smaller block
+    /// trials `TX_4X4` at all. The natural reading of the issue is that some strides never land on
+    /// one of those, and that is not what happens: 30 of the 96x80 pattern's 37 size searches can
+    /// reach `TX_4X4` and every stride from 1 to 16 probes at least one of them, so the per-size
+    /// accumulator is never empty at any interval. What the strides differ on is *which* blocks
+    /// they sample, and that is what decides the size, because a trial that probed is corrected by
+    /// its own measurement at full strength while a trial that did not is corrected by the
+    /// remembered ratio shrunk to [`tile::TYPE_GAIN_TRUST`] sixteenths - eight times weaker, and
+    /// the sixteen-fold extrapolation `TX_4X4` needs does not survive the shrinkage. So `TX_4X4`
+    /// is selectable exactly at coding blocks whose own size search probed. On this frame there
+    /// are precisely two such blocks, at MI positions `(0, 12)` and `(16, 12)`; the second table
+    /// prints every position that chose the size together with whether that search probed, and it
+    /// is `true` in every row at every interval. Whether a stride keeps the size is therefore the
+    /// question of whether those two search indices are multiples of it - 1 and 2 reach both, 4
+    /// and 8 reach `(0, 12)`, and 3, 5, 6, 7 and 9 upwards reach neither. Sharing a factor with a
+    /// trials-per-coding-block count has nothing to do with it.
+    ///
+    /// The third table prices the guarantee. Probing every size search that can reach the smallest
+    /// transform - `with_forced_smallest_size_probes`, the cheapest rule that makes the size
+    /// selectable independently of the stride - does restore it at every interval from 1 to 16, at
+    /// 28-70% more transform-type candidate evaluations and about 10% more encode time. It also
+    /// *loses* rate-distortion: +12.4% on `smooth` at 640x352 and `base_q_idx` 8, +10.0% at
+    /// 192x160, +5.0% on `bands`, +1.7% on `scene_edge`, because the un-shrunk own-probe
+    /// correction overshoots towards the smaller size - the same effect
+    /// `measure_type_gain_sampling_intervals` already records as the sampled estimator costing
+    /// *less* than the unsampled one. Paying a third more search to reconstruct worse is not a
+    /// guarantee worth having, so nothing ships it, and what pins the size instead is
+    /// `the_smallest_transform_is_selected_at_every_sampling_interval` over twelve frames rather
+    /// than the one this aliasing shows up on.
+    #[test]
+    #[ignore = "measurement sweep, not an assertion"]
+    fn measure_type_gain_phase_aliasing() {
+        let (width, height) = (96_usize, 80_usize);
+        let pixels = test_pattern(width as u32, height as u32);
+        let quantizers = [1_u8, 8, 32, 80, 160, 200];
+
+        println!("interval,searches,reachable_4,probed_4,reachable_8,probed_8,selects_tx4x4_at");
+        for interval in 1_usize..=16 {
+            let report = tile::FrameEncoder::new(&pixels, width, height, 32)
+                .with_type_gain_interval(interval)
+                .encode_with_report();
+            let count = |smallest: usize| {
+                let reachable = report
+                    .size_search_probes
+                    .iter()
+                    .filter(|&&(size, _)| size <= smallest)
+                    .count();
+                let probed = report
+                    .size_search_probes
+                    .iter()
+                    .filter(|&&(size, probing)| size <= smallest && probing)
+                    .count();
+                (reachable, probed)
+            };
+            let (reachable4, probed4) = count(4);
+            let (reachable8, probed8) = count(8);
+            let selecting: Vec<u8> = quantizers
+                .into_iter()
+                .filter(|&qindex| {
+                    tile::FrameEncoder::new(&pixels, width, height, qindex)
+                        .with_type_gain_interval(interval)
+                        .encode_with_report()
+                        .trace
+                        .iter()
+                        .any(|&(size, _)| size == 4)
+                })
+                .collect();
+            println!(
+                "{interval},{},{reachable4},{probed4},{reachable8},{probed8},{selecting:?}",
+                report.size_search_probes.len()
+            );
+        }
+
+        println!("interval,qindex,positions_choosing_tx4x4_and_whether_that_search_probed");
+        for interval in 1_usize..=16 {
+            for qindex in quantizers {
+                let report = tile::FrameEncoder::new(&pixels, width, height, qindex)
+                    .with_type_gain_interval(interval)
+                    .encode_with_report();
+                // `size_choices` and `size_search_probes` are both pushed once per size search,
+                // in search order, so the two zip position by position.
+                let chose: Vec<(usize, usize, bool)> = report
+                    .size_choices
+                    .iter()
+                    .zip(report.size_search_probes.iter())
+                    .filter(|((_, _, _, chosen), _)| *chosen == 4)
+                    .map(|((r, c, _, _), (_, probing))| (*r, *c, *probing))
+                    .collect();
+                if !chose.is_empty() {
+                    println!("{interval},{qindex},{chose:?}");
+                }
+            }
+        }
+
+        println!("size,frame,qindex,candidates,forced_candidates,cost_percent,forced_selects_4");
+        for (width, height) in [(128_usize, 96_usize), (192, 160), (640, 352)] {
+            let mut frames = content_frames(width as u32, height as u32);
+            frames.push(("test_pattern", test_pattern(width as u32, height as u32)));
+            for (name, pixels) in &frames {
+                for qindex in [8_u8, 32, 160] {
+                    let ac = i64::from(crate::av1_intra::get_ac_quant(qindex));
+                    let lambda = (ac * ac / 256).max(1);
+                    let run = |forced: bool| {
+                        let encoder = tile::FrameEncoder::new(pixels, width, height, qindex);
+                        let encoder = if forced {
+                            encoder.with_forced_smallest_size_probes()
+                        } else {
+                            encoder
+                        };
+                        let report = encoder.encode_with_report();
+                        let cost = sse_against(&report, pixels, width, height)
+                            + lambda * report.tile.len() as i64 * 8;
+                        let selects = report.trace.iter().any(|&(size, _)| size == 4);
+                        (report.candidates_evaluated, cost, selects)
+                    };
+                    let sampled = run(false);
+                    let forced = run(true);
+                    println!(
+                        "{width}x{height},{name},{qindex},{},{},{:+.3},{}",
+                        sampled.0,
+                        forced.0,
+                        (forced.1 as f64 / sampled.1 as f64 - 1.0) * 100.0,
+                        forced.2
+                    );
+                }
+            }
         }
     }
 
@@ -1357,6 +1500,12 @@ mod nonlossless_tests {
     /// looks like: it scales with the trial's block count, so inflating it favours the size with
     /// more blocks. This prints the penalty against the unsampled estimator as the remembered
     /// correction is shrunk from full (`16`) to none (`0`).
+    ///
+    /// The exhaustive search is printed alongside because the unsampled estimator is not a strict
+    /// upper bound on quality: a trial that probes is corrected in full by its own measurement,
+    /// so `16` is the only trust the interval-1 arm can express and the reference carries the
+    /// over-large correction on every trial. Comparing both arms against the search that takes no
+    /// shortcut at all separates what the shrinkage is worth from what the sampling costs.
     #[test]
     #[ignore = "measurement sweep, not an assertion"]
     fn measure_type_gain_trust() {
@@ -1364,7 +1513,7 @@ mod nonlossless_tests {
             let mut frames = content_frames(width as u32, height as u32);
             frames.push(("test_pattern", test_pattern(width as u32, height as u32)));
             println!("size,{width}x{height}");
-            println!("frame,qindex,trust,penalty_percent,bytes,candidates");
+            println!("frame,qindex,trust,penalty_percent,exhaustive_percent,bytes,candidates");
             for (name, pixels) in &frames {
                 for qindex in [1_u8, 8, 32, 80, 160, 200] {
                     let ac = i64::from(crate::av1_intra::get_ac_quant(qindex));
@@ -1381,12 +1530,29 @@ mod nonlossless_tests {
                             report.candidates_evaluated,
                         )
                     };
+                    let exhaustive = {
+                        let report = tile::FrameEncoder::new(pixels, width, height, qindex)
+                            .without_search_shortcuts()
+                            .encode_with_report();
+                        sse_against(&report, pixels, width, height)
+                            + lambda * report.tile.len() as i64 * 8
+                    };
                     let (unsampled, _, _) = cost(1, 16);
+                    let against =
+                        |cost: i64, reference: i64| cost as f64 / reference as f64 * 100.0 - 100.0;
+                    println!(
+                        "{name},{qindex},unsampled,{:+.2},{:+.2},,",
+                        0.0,
+                        against(unsampled, exhaustive)
+                    );
                     for trust in [0_i64, 1, 2, 3, 4, 5, 6, 8, 12, 16] {
                         let (sampled, bytes, candidates) =
                             cost(tile::TYPE_GAIN_SAMPLE_INTERVAL, trust);
-                        let penalty = sampled as f64 / unsampled as f64 * 100.0 - 100.0;
-                        println!("{name},{qindex},{trust},{penalty:+.2},{bytes},{candidates}");
+                        let penalty = against(sampled, unsampled);
+                        let versus = against(sampled, exhaustive);
+                        println!(
+                            "{name},{qindex},{trust},{penalty:+.2},{versus:+.2},{bytes},{candidates}"
+                        );
                     }
                 }
             }
@@ -1560,6 +1726,14 @@ mod nonlossless_tests {
     /// found from - it measured +2.13% there against +9.32% at the larger size - so the larger
     /// one is in the assertion rather than in the `#[ignore]`d sweeps alone, which is what let
     /// that penalty sit unnoticed. The ceilings are the measured penalties with margin.
+    ///
+    /// #278 re-measured the interval against the shrunken estimator and moved it from 2 to 8, and
+    /// the ceilings move with it: `bands` to 4%, from +3.43% at 128x96, and `scene_edge` down to
+    /// 1% from +0.20%, the frame that used to set the loosest ceiling here now setting one of the
+    /// tightest. Every other frame stays at 1% and none of them reaches half of it. That `bands`
+    /// is now the worst frame rather than `scene_edge` is the shrinkage working as intended: what
+    /// is left to pay for is content that changes faster than the sample can follow, not content
+    /// that changes once and is then averaged across.
     #[test]
     fn the_type_gain_sampling_interval_holds_on_content_it_was_not_tuned_on() {
         for (width, height) in [(128_usize, 96_usize), (192, 160)] {
@@ -1570,8 +1744,8 @@ mod nonlossless_tests {
                 ("smooth", 1.0),
                 ("diagonals", 1.0),
                 ("quadrants", 1.0),
-                ("scene_edge", 2.5),
-                ("bands", 1.0),
+                ("scene_edge", 1.0),
+                ("bands", 4.0),
                 ("mosaic", 1.0),
                 ("test_pattern", 1.0),
             ]);
@@ -1599,6 +1773,148 @@ mod nonlossless_tests {
                 }
             }
         }
+    }
+
+    /// The smallest transform stays selectable whatever the sampling interval is, on frames with
+    /// more than a couple of coding blocks where it wins.
+    ///
+    /// `the_type_gain_sampling_interval_is_the_longest_that_keeps_tx_4x4` pins the shipped
+    /// interval on the 96x80 `test_pattern`, and #323 established what that frame is really
+    /// measuring: the size is chosen there at exactly two coding blocks, and only ever by a search
+    /// that probed, because a trial that probed is corrected by its own measurement at full
+    /// strength while every other trial's correction is shrunk to [`tile::TYPE_GAIN_TRUST`]
+    /// sixteenths. Whether an interval keeps the size on that frame is therefore the question of
+    /// whether those two search indices are multiples of it, which is why 3, 6 and 12 lose a size
+    /// the longer 4 and 8 keep. It is not a probe-coverage failure - every interval from 1 to 16
+    /// probes some of the 30 searches that can reach `TX_4X4`, so the per-size accumulator is
+    /// never empty - and `measure_type_gain_phase_aliasing` prices the only guarantee that removes
+    /// the dependence at 28-70% more transform-type candidates for up to +12.4% worse
+    /// rate-distortion. So the sampler is left alone and this widens what the property rests on.
+    ///
+    /// On content with enough blocks where the smallest transform wins - a smooth gradient,
+    /// horizontal bands, and four flat quadrants - it is selected at *every* interval from 2 to 16
+    /// at frame sizes from 96x80 to 640x352, so the size surviving is a property of the content
+    /// and the estimator rather than of the stride's phase against one 37-search frame. A change
+    /// to superblock traversal, to the partition search, or to which trials are enumerated moves
+    /// which strides alias on any one frame; it cannot take the size away from nine frame-and-size
+    /// pairs at fifteen intervals each without having broken the correction itself.
+    ///
+    /// Two exclusions, both of them the same effect this test exists to bound rather than
+    /// exceptions to it. `1` is not an interval but the unsampled estimator: it probes every
+    /// search and corrects every trial by its own measurement, and that overshoot selects the size
+    /// at no quantizer on `quadrants` and `mosaic` at 96x80, where every sampled interval selects
+    /// it at some. And `quadrants` at 96x80 - the smallest frame of the smallest set of blocks
+    /// that wins - loses it at `13` alone, which is the phase dependence again on a frame small
+    /// enough to show it, so that pair is left to the frames large enough not to.
+    #[test]
+    fn the_smallest_transform_is_selected_at_every_sampling_interval() {
+        for (width, height) in [(96_usize, 80_usize), (128, 96), (192, 160), (640, 352)] {
+            for (name, pixels) in content_frames(width as u32, height as u32) {
+                // `quadrants` at 96x80 is excluded above; at 640x352 only the frame the size
+                // wins most of - a smooth gradient - is run, because a large frame's encode is
+                // slow enough in a test build that three of them would dominate the suite.
+                let covered = match name {
+                    "smooth" => true,
+                    "bands" => width < 640,
+                    "quadrants" => (97..640).contains(&width),
+                    _ => false,
+                };
+                if !covered {
+                    continue;
+                }
+                for interval in 2_usize..=16 {
+                    let selected = [1_u8, 8, 32, 80, 160, 200].into_iter().any(|qindex| {
+                        tile::FrameEncoder::new(&pixels, width, height, qindex)
+                            .with_type_gain_interval(interval)
+                            .encode_with_report()
+                            .trace
+                            .iter()
+                            .any(|&(size, _)| size == 4)
+                    });
+                    assert!(
+                        selected,
+                        "no quantizer selected TX_4X4 on {name} at {width}x{height} with a \
+                         sampling interval of {interval}, so the per-size correction reaching the \
+                         smallest transform is back to depending on which coding blocks the \
+                         stride happens to sample"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `TYPE_GAIN_SAMPLE_INTERVAL` is the largest interval that keeps the smallest transform
+    /// reachable, and that - not the rate-distortion penalty - is what fixes it.
+    ///
+    /// The interval used to be bounded from above by accuracy: under the frame-wide accumulator
+    /// it was calibrated against, the worst frame's penalty climbed to +85.8% by `16`, so the
+    /// value had to stay small. `TYPE_GAIN_TRUST` removed that bound - every interval from `1` to
+    /// `64` now lands within +3.5% of the unsampled estimator, and the mean cost against the
+    /// exhaustive search is *better* than the unsampled estimator's at every interval past `1`,
+    /// because a trial that probes is corrected in full and so the unsampled arm carries the
+    /// un-shrunk correction everywhere ([`tile::TYPE_GAIN_TRUST`] decomposes it) - so the penalty
+    /// column no longer chooses between them.
+    ///
+    /// What chooses is coverage. The per-size correction is what makes `TX_4X4` selectable at all:
+    /// coding a block as sixteen 4x4 transforms pays for its extra header bits because the type
+    /// search gets sixteen chances to beat DCT, and only a probe measures that. On the 96x80
+    /// pattern - a frame small enough to have few coding blocks - `16` loses the size outright,
+    /// and so do `3`, `6` and `12`; `8` is the largest value that holds it.
+    ///
+    /// So this pins the constant from the side that actually binds it: the shipped interval
+    /// selects the smallest transform, and doubling it does not. Raising the constant on the
+    /// strength of its candidate count fails here.
+    ///
+    /// #323 asked what the non-monotone column is, since `3`, `6` and `12` failing while the
+    /// longer `4` and `8` pass cannot be a sampling *rate* result, and
+    /// `measure_type_gain_phase_aliasing` answers it. It is not that a long interval never probes
+    /// a trial carrying the smallest size: 30 of this frame's 37 size searches can reach `TX_4X4`
+    /// and every interval from `1` to `16` probes between 1 and 30 of them, so the per-size
+    /// accumulator is populated at every interval, including the ones that lose the size. What
+    /// differs is *which* coding blocks are sampled, and that decides the outcome because a trial
+    /// that probed is corrected by its own measurement at full strength while every other trial's
+    /// is shrunk to [`tile::TYPE_GAIN_TRUST`] sixteenths - so `TX_4X4` is selectable only at a
+    /// coding block whose own size search probed. This frame has exactly two of them, at MI
+    /// positions `(0, 12)` and `(16, 12)`, and every interval that keeps the size does so through
+    /// one of those two: `1` and `2` sample both, `4` and `8` sample `(0, 12)`, and `3`, `5`, `6`,
+    /// `7` and everything from `9` up sample neither. The column is a phase against two search
+    /// indices, not a stride sharing a factor with a trials-per-coding-block count.
+    ///
+    /// That leaves this assertion resting on two blocks of one frame, so it is no longer the only
+    /// thing holding the size: `the_smallest_transform_is_selected_at_every_sampling_interval`
+    /// asserts the same property across nine frame-and-size pairs at every interval from `2` to
+    /// `16`, where it does not depend on the phase at all. The guarantee that would remove the
+    /// dependence here too - probing every size search that can reach the smallest transform - was
+    /// measured and rejected in the same sweep: 28-70% more transform-type candidates, about 10%
+    /// more encode time, and up to +12.4% *worse* rate-distortion, because the un-shrunk
+    /// own-probe correction overshoots towards the smaller size.
+    #[test]
+    fn the_type_gain_sampling_interval_is_the_longest_that_keeps_tx_4x4() {
+        let (width, height) = (96_usize, 80_usize);
+        let pixels = test_pattern(width as u32, height as u32);
+        let selects_smallest = |interval: usize| {
+            [1_u8, 8, 32, 80, 160, 200].into_iter().any(|qindex| {
+                tile::FrameEncoder::new(&pixels, width, height, qindex)
+                    .with_type_gain_interval(interval)
+                    .encode_with_report()
+                    .trace
+                    .iter()
+                    .any(|&(size, _)| size == 4)
+            })
+        };
+        assert!(
+            selects_smallest(tile::TYPE_GAIN_SAMPLE_INTERVAL),
+            "no quantizer selected TX_4X4 at the shipped interval of {}, so the per-size \
+             correction no longer reaches the smallest transform",
+            tile::TYPE_GAIN_SAMPLE_INTERVAL
+        );
+        let doubled = tile::TYPE_GAIN_SAMPLE_INTERVAL * 2;
+        assert!(
+            !selects_smallest(doubled),
+            "interval {doubled} also selected TX_4X4, so {} is no longer the largest interval \
+             the smallest transform survives and the constant is leaving candidate savings unclaimed",
+            tile::TYPE_GAIN_SAMPLE_INTERVAL
+        );
     }
 
     /// The stated bound on what the search shortcuts cost.
