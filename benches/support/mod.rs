@@ -11,12 +11,12 @@
 //! instruction set `zvidlib::simd::available()` reports, asserts every arm is
 //! bit-exact with scalar before timing it, and names the arms `<codec>/<isa>`.
 
-// Each bench target (`benches/codec.rs`, `benches/audio_decode.rs`,
-// `benches/audio_mux.rs`, `benches/hevc_encode.rs`) is its own crate root and
-// compiles this whole module, but uses only the fixtures its own measurements
-// need. Unused-here is not dead: `cargo clippy --all-targets` would otherwise
-// fail one target for
-// helpers another target depends on.
+// Each bench target (`benches/codec.rs`, `benches/av1_decode.rs`,
+// `benches/audio_decode.rs`, `benches/audio_mux.rs`, `benches/hevc_encode.rs`)
+// is its own crate root and compiles this whole module, but uses only the
+// fixtures its own measurements need. Unused-here is not dead:
+// `cargo clippy --all-targets` would otherwise fail one target for helpers
+// another target depends on.
 #![allow(dead_code)]
 
 use std::future::Future;
@@ -30,8 +30,9 @@ use criterion::Throughput;
 use zvidlib::io::MemorySource;
 use zvidlib::{
     AacTrackConfig, AudioTrackTiming, Codec, CodecProfile, ColorRange, EncodedAudioSample,
-    EncodedVideoSample, Limits, Mp4Demuxer, Mp4DemuxerOptions, Mp4Track, PixelFormat, Plane,
-    TrackKind, VideoDecoderConfig, VideoDimensions, VideoFrame, decode_av1_lossless_intra,
+    EncodedVideoSample, FilterPlane, Limits, Mp4Demuxer, Mp4DemuxerOptions, Mp4Track, PixelFormat,
+    Plane, TrackKind, TxSizeGrid, VideoDecoderConfig, VideoDimensions, VideoFrame,
+    decode_av1_lossless_intra,
 };
 
 /// Whether the crate was built with the additive `simd` cargo feature.
@@ -323,6 +324,196 @@ pub fn synthetic_yuv420_sequence(width: u32, height: u32, frames: usize) -> Vec<
             .expect("synthetic YUV420 frames are valid")
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// AV1 software decoder fixtures.
+//
+// The AV1 groups need two kinds of input the fixtures above do not provide: a
+// whole AV1 stream at a resolution where per-frame overhead is negligible, and
+// the structured synthetic planes the kernel-level measurements run on. The
+// checked-in AV1 vectors are 17x9 and 16x16 conformance streams — correct, but
+// far too small to time a decoder with — so the stream below is produced by the
+// crate's own AV1 encoder once per process and the planes are generated.
+// ---------------------------------------------------------------------------
+
+/// Luma width of [`synthetic_av1_stream`].
+pub const AV1_STREAM_WIDTH: u32 = 320;
+/// Luma height of [`synthetic_av1_stream`].
+pub const AV1_STREAM_HEIGHT: u32 = 180;
+/// Frames in [`synthetic_av1_stream`].
+///
+/// Enough that per-call decoder setup is a small share of one iteration, while
+/// keeping a criterion sample well under a second on the software decoder.
+pub const AV1_STREAM_FRAMES: usize = 8;
+
+/// An AV1 elementary stream and the decoder configuration that decodes it.
+pub struct SyntheticAv1Stream {
+    pub configuration: VideoDecoderConfig,
+    pub samples: Vec<EncodedVideoSample>,
+    pub width: u64,
+    pub height: u64,
+}
+
+/// Encodes a deterministic monochrome sequence with the crate's native AV1
+/// encoder, once per process.
+///
+/// The native AV1 decoder implements the bounded Main-profile 8-bit lossless
+/// monochrome subset its module documents, so a "representative stream" for it
+/// is one this crate's own encoder produces. Encoding is hoisted here — a
+/// `OnceLock` outside every timed loop — so a decode benchmark measures decode
+/// and nothing else.
+pub fn synthetic_av1_stream() -> &'static SyntheticAv1Stream {
+    use zvidlib::{
+        CpuFrameSource, FrameIndex, FrameSource, HardwarePreference, Orientation, VideoDimensions,
+        VideoEncoderConfig, VideoEncoderFactory, native_av1_video_encoder_factory,
+    };
+
+    static STREAM: OnceLock<SyntheticAv1Stream> = OnceLock::new();
+    STREAM.get_or_init(|| {
+        let limits = Limits::default();
+        let dimensions = VideoDimensions::new(AV1_STREAM_WIDTH, AV1_STREAM_HEIGHT, &limits)
+            .expect("the synthetic AV1 dimensions are valid");
+        let mut encoder = native_av1_video_encoder_factory()
+            .create(
+                &VideoEncoderConfig {
+                    codec: Codec::Av1,
+                    profile: CodecProfile::Av1Main,
+                    coded_dimensions: dimensions,
+                    input_format: PixelFormat::Gray8,
+                    color_range: ColorRange::Full,
+                    hardware: HardwarePreference::Avoid,
+                    timescale: 30,
+                    frame_duration: 1,
+                    configuration: Vec::new(),
+                },
+                &limits,
+            )
+            .expect("the native AV1 encoder is constructible");
+
+        let mut packets = Vec::new();
+        for (index, luma) in
+            av1_gray8_planes(AV1_STREAM_WIDTH, AV1_STREAM_HEIGHT, AV1_STREAM_FRAMES)
+                .into_iter()
+                .enumerate()
+        {
+            let frame = VideoFrame::new(
+                dimensions,
+                PixelFormat::Gray8,
+                ColorRange::Full,
+                vec![Plane {
+                    data: luma,
+                    stride: AV1_STREAM_WIDTH as usize,
+                }],
+                &limits,
+            )
+            .expect("synthetic monochrome frames are valid");
+            packets.extend(
+                block_on(encoder.encode(
+                    FrameIndex(index as u64),
+                    FrameSource::Cpu(CpuFrameSource {
+                        frame: &frame,
+                        orientation: Orientation::TopLeft,
+                    }),
+                ))
+                .expect("the synthetic frame encodes"),
+            );
+        }
+        packets.extend(block_on(encoder.finish()).expect("the encoder finishes"));
+        assert_eq!(
+            packets.len(),
+            AV1_STREAM_FRAMES,
+            "the encoder emits one packet per submitted frame"
+        );
+
+        SyntheticAv1Stream {
+            configuration: VideoDecoderConfig {
+                codec: Codec::Av1,
+                profile: CodecProfile::Av1Main,
+                coded_dimensions: dimensions,
+                output_format: PixelFormat::Rgba8,
+                color_range: ColorRange::Full,
+                hardware: HardwarePreference::Avoid,
+                configuration: encoder.config().decoder_config.clone(),
+            },
+            samples: packets
+                .into_iter()
+                .enumerate()
+                .map(|(index, packet)| EncodedVideoSample {
+                    presentation_index: FrameIndex(index as u64),
+                    random_access: packet.is_sync,
+                    data: packet.data,
+                })
+                .collect(),
+            width: u64::from(AV1_STREAM_WIDTH),
+            height: u64::from(AV1_STREAM_HEIGHT),
+        }
+    })
+}
+
+/// Deterministic 8-bit monochrome planes for the AV1 encoder.
+///
+/// Borrows [`synthetic_yuv420_sequence`]'s luma so the encoded stream carries
+/// the same moving gradient plus low-amplitude noise every other synthetic
+/// fixture does, rather than content that degenerates into a best case.
+fn av1_gray8_planes(width: u32, height: u32, frames: usize) -> Vec<Vec<u8>> {
+    synthetic_yuv420_sequence(width, height, frames)
+        .into_iter()
+        .map(|frame| frame.planes.into_iter().next().expect("luma plane").data)
+        .collect()
+}
+
+/// Deterministic frame content with enough local structure that the in-loop
+/// filters' data-dependent branches are actually taken.
+///
+/// Ported from the ad-hoc `tests/av1_simd_bench.rs` this suite replaces; the
+/// generators there were the useful part of that file.
+pub fn av1_structured_plane(width: usize, height: usize) -> FilterPlane {
+    let mut state = 0x2545_f491_4f6c_dd1d_u64;
+    let mut data = Vec::with_capacity(width * height);
+    for index in 0..width * height {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let noise = (state >> 56) as i32 & 0x1f;
+        let gradient = ((index % width) / 8 + (index / width) / 8) as i32;
+        data.push(((gradient + noise) & 0xff) as u8);
+    }
+    FilterPlane::from_samples(width, height, data, &Limits::default())
+        .expect("the structured plane fits the default limits")
+}
+
+/// Near-flat block content.
+///
+/// The wide (8-tap and 14-tap) deblocking filters are gated on a flatness
+/// check, so they only do work on content like this — which is exactly why
+/// this generator, not [`av1_structured_plane`], is the input to the wide-filter
+/// measurement.
+pub fn av1_flat_blocks_plane(width: usize, height: usize) -> FilterPlane {
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut data = Vec::with_capacity(width * height);
+    for index in 0..width * height {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let (x, y) = (index % width, index / width);
+        let block = ((x / 32 + y / 32) % 5) as i32;
+        data.push((100 + block * 6 + ((state >> 60) as i32 & 1)) as u8);
+    }
+    FilterPlane::from_samples(width, height, data, &Limits::default())
+        .expect("the flat-block plane fits the default limits")
+}
+
+/// A frame-wide grid of 32x32 transform blocks, which is what makes every luma
+/// edge select the 14-tap deblocking filter (AV1 spec §7.14.5).
+pub fn av1_wide_tx_grid(width: usize, height: usize) -> TxSizeGrid {
+    let mut grid = TxSizeGrid::new(width, height);
+    for y in (0..height).step_by(32) {
+        for x in (0..width).step_by(32) {
+            grid.set_block(x, y, 32, 32);
+        }
+    }
+    grid
 }
 
 /// The amount of audio work one benchmark iteration performs.

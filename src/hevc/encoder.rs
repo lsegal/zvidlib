@@ -4,6 +4,7 @@ use super::engine::{
     encoder::{
         pcm::encode_idr_pcm_au,
         rdo::{DecisionConfig, decide_picture},
+        recon::{ReconConfig, ReconstructedPicture, SourcePlanes, reconstruct_picture},
     },
     nal::collect_nal_units,
 };
@@ -82,7 +83,7 @@ impl VideoEncoderFactory for HevcEncoderFactory {
             },
             next_index: 0,
             limits: *limits,
-            previous_y: None,
+            reference: None,
         }))
     }
 }
@@ -91,7 +92,11 @@ struct HevcEncoder {
     config: EncoderConfig,
     next_index: u64,
     limits: Limits,
-    previous_y: Option<Vec<u8>>,
+    /// The previous picture as a *decoder* would hold it: prediction plus
+    /// coded residual, with the in-loop filters applied per [`ReconConfig`].
+    /// The mode search predicts from this, never from the source picture it
+    /// was handed — see [`super::engine::encoder::recon`].
+    reference: Option<ReconstructedPicture>,
 }
 impl VideoEncoder for HevcEncoder {
     fn config(&self) -> &EncoderConfig {
@@ -134,12 +139,12 @@ impl VideoEncoder for HevcEncoder {
             }
             let (y, cb, cr) = rgba_to_yuv420(frame, source.orientation)?;
             let d = self.configuration.coded_dimensions;
-            let _decision = decide_picture(
+            let decision = decide_picture(
                 &y,
                 d.width as usize,
                 d.width as usize,
                 d.height as usize,
-                self.previous_y.as_deref(),
+                self.reference.as_ref().map(|r| r.y.as_slice()),
                 DecisionConfig::default(),
             );
             let au = encode_idr_pcm_au(&y, &cb, &cr, d.width as usize, d.height as usize)
@@ -156,7 +161,23 @@ impl VideoEncoder for HevcEncoder {
                 .ok_or_else(|| limit("HEVC timeline overflows"))?;
             let tick = i64::try_from(tick).map_err(|_| limit("HEVC timeline overflows"))?;
             self.next_index += 1;
-            self.previous_y = Some(y);
+            // The reference for the next picture is the reconstruction of
+            // this one, not its source. Both are identical while the writer
+            // codes PCM losslessly with the loop filters neutralized; keeping
+            // the reconstruction is what makes that stay true when it does
+            // not.
+            self.reference = Some(reconstruct_picture(
+                SourcePlanes {
+                    y: &y,
+                    cb: &cb,
+                    cr: &cr,
+                    width: d.width as usize,
+                    height: d.height as usize,
+                },
+                self.reference.as_ref(),
+                &decision,
+                ReconConfig::default(),
+            ));
             Ok(vec![EncodedSample {
                 data,
                 dts: tick,

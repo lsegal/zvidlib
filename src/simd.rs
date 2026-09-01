@@ -114,6 +114,7 @@ pub fn available() -> Vec<SimdIsa> {
 /// | `hevc_prediction_filters` | HEVC inter/intra prediction and in-loop filters |
 /// | `hevc_transforms` | HEVC inverse transforms and dequantization |
 /// | `hevc_rdcost` | HEVC encoder-side distortion metrics |
+/// | `hevc_colorconv` | HEVC encoder-side RGBA8 to YUV420 input conversion |
 ///
 /// The `hevc_*` sites are absent on `wasm32`, which does not build the HEVC
 /// engine.
@@ -141,6 +142,10 @@ pub fn active_by_site() -> Vec<(&'static str, SimdIsa)> {
             from_hevc_backend(transform_simd::detected()),
         ));
         sites.push(("hevc_rdcost", from_rdcost_isa(rdcost::isa())));
+        sites.push((
+            "hevc_fwd_transform_quant",
+            from_hevc_backend(crate::hevc::engine::encoder::quant_simd::detected()),
+        ));
         sites.push(("hevc_colorconv", from_colorconv_isa(colorconv::isa())));
     }
     sites

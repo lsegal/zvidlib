@@ -17,9 +17,12 @@
 //!   transforms this crate's kernels implement (`TX_4X4` through
 //!   `TX_64X64`), under either `TX_MODE_LARGEST` or `TX_MODE_SELECT` as
 //!   the frame header's `tx_mode_select` bit selects, and its `tx_type`
-//!   (`DCT_DCT` or `IDTX`; `ADST_ADST` is rejected as unsupported, and
-//!   `TX_32X32` and above are `TX_SET_DCTONLY` so they signal no
-//!   `tx_type` at all), coefficients are
+//!   through the full spec §5.11.47 `get_tx_set` / §5.11.48 `read_tx_type`
+//!   derivation (`TX_SET_INTRA_1` or `TX_SET_INTRA_2` as `reduced_tx_set`
+//!   and the transform size select; `TX_32X32` and above are
+//!   `TX_SET_DCTONLY` and signal no `tx_type` at all), including the
+//!   half-identity `V_DCT`/`H_DCT` types `TX_SET_INTRA_1` also contains.
+//!   Coefficients are
 //!   dequantized per spec §7.12 (`get_dc_quant`/`get_ac_quant`) and inverse
 //!   transformed ([`crate::av1_intra::inverse_transform`]). `loop_filter_params`
 //!   is parsed and the chosen per-block transform sizes are recorded into a
@@ -30,7 +33,9 @@
 
 use crate::av1_cdf as cdf;
 use crate::av1_filters::{FilterFrame, FilterPlane, LoopFilterParams, TxSizeGrid, deblock_frame};
-use crate::av1_intra::{Av1IntraMode, Av1TxType, get_ac_quant, get_dc_quant, inverse_transform};
+use crate::av1_intra::{
+    Av1IntraMode, Av1TxType, get_ac_quant, get_dc_quant, intra_dir_index, inverse_transform,
+};
 use crate::av1_intra_pred::{
     SmoothMode, add_residual_row, directional_row, paeth_row, smooth_row, sum_samples,
 };
@@ -161,6 +166,7 @@ pub fn decode_av1_lossless_intra_with_tx_sizes(
         mi_rows,
         header.base_q_idx,
         header.tx_mode_select,
+        header.reduced_tx_set,
         limits,
     )?;
     let luma = decoder.decode()?;
@@ -194,6 +200,9 @@ struct SupportedFrameHeader {
     /// is `TX_MODE_LARGEST`, and lossless frames force `TX_MODE_ONLY_4X4`
     /// with no bit read.
     tx_mode_select: bool,
+    /// `reduced_tx_set` (spec §5.9.2), the frame-level input to
+    /// [`cdf::get_tx_set`].
+    reduced_tx_set: bool,
     tile_offset: usize,
 }
 
@@ -226,9 +235,17 @@ fn parse_supported_frame_header(
     require_bit(&mut bits, false, "using_qmatrix")?;
     // segmentation_params()
     require_bit(&mut bits, false, "segmentation_enabled")?;
-    // delta_q_params()/delta_lf_params(): both are only present when
-    // base_q_idx > 0, and even then only when segmentation/delta-Q are
-    // enabled; this decoder never signals either, so no bits are read.
+    // delta_q_params() (spec §5.9.17): `delta_q_present` is read for *every*
+    // frame with `base_q_idx > 0`, whatever segmentation signaled - it is
+    // gated on the quantizer alone. Missing it left every non-lossless frame
+    // header one bit short from this point on, which an independent decoder
+    // (ffmpeg 7.1's dav1d) rejects while parsing the header rather than
+    // silently mis-decoding. This decoder never signals per-block delta-Q, so
+    // the bit is required to be 0, and delta_lf_params() (§5.9.18) is then
+    // absent entirely because it is gated on `delta_q_present`.
+    if base_q_idx > 0 {
+        require_bit(&mut bits, false, "delta_q_present")?;
+    }
     // loop_filter_params() (spec §5.9.11): `CodedLossless` (base_q_idx == 0
     // with every delta-Q field 0, which is exactly this decoder's lossless
     // path) forces every filter level to 0 with no bits read at all. The
@@ -276,7 +293,9 @@ fn parse_supported_frame_header(
     } else {
         bits.read(1, "tx_mode_select")? != 0
     };
-    require_bit(&mut bits, true, "reduced_tx_set")?;
+    // reduced_tx_set (spec §5.9.2): selects between the full `get_tx_set`
+    // derivation and its reduced form; both are decoded here.
+    let reduced_tx_set = bits.read(1, "reduced_tx_set")? != 0;
     while bits.position() & 7 != 0 {
         require_bit(&mut bits, false, "frame header byte alignment")?;
     }
@@ -284,6 +303,7 @@ fn parse_supported_frame_header(
         base_q_idx,
         loop_filter,
         tx_mode_select,
+        reduced_tx_set,
         tile_offset: bits.position() / 8,
     })
 }
@@ -348,6 +368,7 @@ struct LosslessTileDecoder<'a> {
     coded_height: usize,
     base_q_idx: u8,
     tx_mode_select: bool,
+    reduced_tx_set: bool,
     pixels: Vec<u8>,
     above_level: Vec<u8>,
     above_dc: Vec<u8>,
@@ -369,6 +390,7 @@ impl<'a> LosslessTileDecoder<'a> {
         mi_rows: usize,
         base_q_idx: u8,
         tx_mode_select: bool,
+        reduced_tx_set: bool,
         limits: &Limits,
     ) -> Result<Self> {
         let coded_width = mi_cols
@@ -403,6 +425,7 @@ impl<'a> LosslessTileDecoder<'a> {
             coded_height,
             base_q_idx,
             tx_mode_select,
+            reduced_tx_set,
             pixels: vec![0; pixels],
             above_level: vec![0; mi_cols],
             above_dc: vec![0; mi_cols],
@@ -542,7 +565,7 @@ impl<'a> LosslessTileDecoder<'a> {
                             "AV1 transform block extends past the coded frame",
                         ));
                     }
-                    self.decode_transform_block(x, y, tx_width, mode)?;
+                    self.decode_transform_block(x, y, block_width, tx_width, mode)?;
                 }
                 transform_x += step;
             }
@@ -582,6 +605,7 @@ impl<'a> LosslessTileDecoder<'a> {
         &mut self,
         x: usize,
         y: usize,
+        block_width: usize,
         tx_width: usize,
         mode: Av1IntraMode,
     ) -> Result<()> {
@@ -595,14 +619,14 @@ impl<'a> LosslessTileDecoder<'a> {
             ));
         }
         if self.base_q_idx == 0 {
-            let coefficients = self.decode_coefficients_4x4(x >> 2, y >> 2)?;
+            let coefficients = self.decode_coefficients_4x4(x >> 2, y >> 2, block_width)?;
             let residuals = inverse_wht_4x4(&coefficients);
             self.apply_intra_prediction(x, y, 4, mode, &residuals);
             self.tx_sizes.set_block(x, y, 4, 4);
             return Ok(());
         }
         let (coefficients, tx_type) =
-            self.decode_coefficients_nonlossless(x >> 2, y >> 2, tx_width)?;
+            self.decode_coefficients_nonlossless(x >> 2, y >> 2, block_width, tx_width, mode)?;
         let dc_quant = get_dc_quant(self.base_q_idx);
         let ac_quant = get_ac_quant(self.base_q_idx);
         let residuals = inverse_transform(&coefficients, tx_width, tx_type, dc_quant, ac_quant);
@@ -731,48 +755,63 @@ impl<'a> LosslessTileDecoder<'a> {
         }
     }
 
-    fn decode_coefficients_4x4(&mut self, x4: usize, y4: usize) -> Result<[i32; 16]> {
+    fn decode_coefficients_4x4(
+        &mut self,
+        x4: usize,
+        y4: usize,
+        block_width: usize,
+    ) -> Result<[i32; 16]> {
         let (coefficients, _skipped) =
-            self.decode_coefficient_levels(x4, y4, 4, &cdf::DEFAULT_SCAN_4X4)?;
+            self.decode_coefficient_levels(x4, y4, block_width, 4, &cdf::DEFAULT_SCAN_4X4)?;
         let mut levels = [0i32; 16];
         levels.copy_from_slice(&coefficients);
         Ok(levels)
     }
 
-    /// Decodes one non-lossless transform block's `tx_type` (spec §5.11.47
-    /// `read_tx_type`, restricted to this decoder's reduced intra set,
-    /// `{IDTX, DCT_DCT}`; `ADST_ADST` is rejected as unsupported) and
-    /// dequantized-domain coefficient levels, returning coefficients in
-    /// row-major order ready for [`inverse_transform`].
+    /// Spec §5.11.48 `read_tx_type`: decodes the `tx_type` symbol for the
+    /// set [`cdf::get_tx_set`] derives from the transform size, this
+    /// decoder's always-intra blocks, and the frame's `reduced_tx_set`.
+    ///
+    /// `TX_SET_DCTONLY` (every intra transform of 32x32 or larger) codes no
+    /// symbol. Every other entry of every set has a kernel, so a symbol only
+    /// fails here if a future set entry is added ahead of its kernel.
+    fn read_tx_type(&mut self, tx_width: usize, mode: Av1IntraMode) -> Result<Av1TxType> {
+        let set = cdf::get_tx_set(tx_width, false, self.reduced_tx_set);
+        let Some(tx_cdf) = cdf::tx_type_cdf(set, tx_width, intra_dir_index(mode)) else {
+            return Ok(Av1TxType::DctDct);
+        };
+        let index = self.symbols.symbol(tx_cdf)?;
+        let (name, tx_type) = cdf::tx_type_inverse_set(set)[index];
+        tx_type.ok_or_else(|| {
+            unsupported(format!(
+                "AV1 intra decoder does not implement the {name} transform type"
+            ))
+        })
+    }
+
+    /// Decodes one non-lossless transform block's `tx_type` (spec §5.11.48
+    /// [`read_tx_type`](Self::read_tx_type)) and dequantized-domain
+    /// coefficient levels, returning coefficients in row-major order ready
+    /// for [`inverse_transform`].
     fn decode_coefficients_nonlossless(
         &mut self,
         x4: usize,
         y4: usize,
+        block_width: usize,
         tx_width: usize,
+        mode: Av1IntraMode,
     ) -> Result<(Vec<i32>, Av1TxType)> {
         let scan = cdf::up_right_diagonal_scan(tx_width.min(MAX_CODED_TX_WIDTH));
-        let (coefficients, skipped) = self.decode_coefficient_levels(x4, y4, tx_width, &scan)?;
-        // read_tx_type() (spec §5.11.47): tx_type is only signaled for a
-        // transform block that actually has nonzero coefficients (a fully
-        // skipped block is implicitly DCT_DCT, though its value is
-        // irrelevant since inverse_transform of an all-zero input is zero
-        // regardless of tx_type), and only when `get_tx_set` is not
-        // TX_SET_DCTONLY — which for intra blocks excludes every transform
-        // of 32x32 or larger.
+        let (coefficients, skipped) =
+            self.decode_coefficient_levels(x4, y4, block_width, tx_width, &scan)?;
+        // tx_type is only signaled for a transform block that actually has
+        // nonzero coefficients (a fully skipped block is implicitly
+        // DCT_DCT, though its value is irrelevant since inverse_transform
+        // of an all-zero input is zero regardless of tx_type).
         let tx_type = if skipped {
             Av1TxType::DctDct
-        } else if let Some(ext_tx) = cdf::ext_tx_cdf(tx_width) {
-            match self.symbols.symbol(ext_tx)? {
-                0 => Av1TxType::Idtx,
-                1 => Av1TxType::DctDct,
-                _ => {
-                    return Err(unsupported(
-                        "AV1 intra decoder does not support the ADST_ADST transform type",
-                    ));
-                }
-            }
         } else {
-            Av1TxType::DctDct
+            self.read_tx_type(tx_width, mode)?
         };
         Ok((coefficients, tx_type))
     }
@@ -782,10 +821,17 @@ impl<'a> LosslessTileDecoder<'a> {
         &mut self,
         x4: usize,
         y4: usize,
+        block_width: usize,
         size: usize,
         scan: &[usize],
     ) -> Result<(Vec<i32>, bool)> {
         let plane_type = 0;
+        // The specification selects every coefficient CDF below by a
+        // quantizer context derived from `base_q_idx` and (except for
+        // `dc_sign`) by a transform-size context. A lossless TX_4X4 stream
+        // lands on `qctx = 0`, `txSzCtx = 0`.
+        let qctx = cdf::coeff_qctx(self.base_q_idx);
+        let tx_size_ctx = cdf::coeff_tx_size_ctx(size);
         let count = size * size;
         let units = (size / 4).max(1);
         // Coefficients are coded only in the transform block's upper-left
@@ -794,22 +840,31 @@ impl<'a> LosslessTileDecoder<'a> {
         let coded = size.min(MAX_CODED_TX_WIDTH);
         let coded_count = coded * coded;
         debug_assert_eq!(scan.len(), coded_count);
-        let skip_context = self.txb_skip_context(x4, y4, units);
-        if self.symbols.symbol(&cdf::TXB_SKIP[skip_context])? == 1 {
+        let skip_context = self.txb_skip_context(x4, y4, units, block_width, size);
+        if self
+            .symbols
+            .symbol(cdf::txb_skip_cdf(qctx, tx_size_ctx, skip_context))?
+            == 1
+        {
             self.set_coefficient_context(x4, y4, units, 0, 0);
             return Ok((vec![0; count], true));
         }
-        let eob_point = self.symbols.symbol(cdf::eob_pt_cdf(coded, plane_type))? + 1;
+        let eob_point = self
+            .symbols
+            .symbol(cdf::eob_pt_cdf(qctx, coded, plane_type))?
+            + 1;
         let eob = if eob_point < 2 {
             eob_point
         } else {
             let bit_count = eob_point - 2;
             let mut extra = 0usize;
             if eob_point >= 3 {
-                extra = self
-                    .symbols
-                    .symbol(&cdf::EOB_EXTRA[plane_type][eob_point - 3])?
-                    << (bit_count - 1);
+                extra = self.symbols.symbol(cdf::eob_extra_cdf(
+                    qctx,
+                    tx_size_ctx,
+                    plane_type,
+                    eob_point - 3,
+                ))? << (bit_count - 1);
                 if bit_count > 1 {
                     extra |= usize::try_from(self.symbols.literal((bit_count - 1) as u8)?)
                         .expect("literal is representable as usize");
@@ -827,24 +882,33 @@ impl<'a> LosslessTileDecoder<'a> {
             let position = scan[coefficient];
             let mut level = if coefficient == eob - 1 {
                 i32::try_from(
-                    self.symbols.symbol(
-                        &cdf::COEFF_BASE_EOB[plane_type]
-                            [coeff_base_eob_context(coefficient, coded_count)],
-                    )? + 1,
+                    self.symbols.symbol(cdf::coeff_base_eob_cdf(
+                        qctx,
+                        tx_size_ctx,
+                        plane_type,
+                        coeff_base_eob_context(coefficient, coded_count),
+                    ))? + 1,
                 )
                 .expect("coefficient base level fits i32")
             } else {
-                i32::try_from(self.symbols.symbol(
-                    &cdf::COEFF_BASE[plane_type][coeff_base_context(position, &levels, coded)],
-                )?)
+                i32::try_from(self.symbols.symbol(cdf::coeff_base_cdf(
+                    qctx,
+                    tx_size_ctx,
+                    plane_type,
+                    coeff_base_context(position, &levels, coded),
+                ))?)
                 .expect("coefficient base level fits i32")
             };
             if level > NUM_BASE_LEVELS {
                 let context = coeff_br_context(position, &levels, coded);
                 for _ in 0..4 {
-                    let value =
-                        i32::try_from(self.symbols.symbol(&cdf::COEFF_BR[plane_type][context])?)
-                            .expect("coefficient range value fits i32");
+                    let value = i32::try_from(self.symbols.symbol(cdf::coeff_br_cdf(
+                        qctx,
+                        tx_size_ctx,
+                        plane_type,
+                        context,
+                    ))?)
+                    .expect("coefficient range value fits i32");
                     level += value;
                     if value < 3 {
                         break;
@@ -858,9 +922,11 @@ impl<'a> LosslessTileDecoder<'a> {
                 continue;
             }
             let negative = if coefficient == 0 {
-                self.symbols
-                    .symbol(&cdf::DC_SIGN[plane_type][self.dc_sign_context(x4, y4, units)])?
-                    != 0
+                self.symbols.symbol(cdf::dc_sign_cdf(
+                    qctx,
+                    plane_type,
+                    self.dc_sign_context(x4, y4, units),
+                ))? != 0
             } else {
                 self.symbols.literal(1)? != 0
             };
@@ -929,7 +995,25 @@ impl<'a> LosslessTileDecoder<'a> {
     /// `getTXBSkipCtx` (spec §8.3.2), whose `top`/`left` are the maxima of
     /// the neighbouring level contexts across the transform block's own
     /// width and height in 4x4 units.
-    fn txb_skip_context(&self, x4: usize, y4: usize, units: usize) -> usize {
+    ///
+    /// The specification's first case returns context 0 outright when the
+    /// transform covers the whole coding block, without consulting a
+    /// neighbour at all. Every coding block this decoder codes is square,
+    /// so that is exactly `tx_width == block_width`. It cannot fire on a
+    /// lossless stream, whose transforms are all 4x4 while `decode_partition`
+    /// never splits below an 8x8 coding block, but it fires constantly once
+    /// `TX_MODE_LARGEST` gives a block a single block-sized transform.
+    fn txb_skip_context(
+        &self,
+        x4: usize,
+        y4: usize,
+        units: usize,
+        block_width: usize,
+        tx_width: usize,
+    ) -> usize {
+        if tx_width >= block_width {
+            return 0;
+        }
         let top = self.above_level[x4..(x4 + units).min(self.mi_cols)]
             .iter()
             .copied()
@@ -1171,6 +1255,26 @@ mod tests {
         base_q_idx: u8,
         loop_filter: Option<(u8, u8, u8, u8, u8)>,
         tx_mode_select: bool,
+        reduced_tx_set: bool,
+    ) -> Vec<u8> {
+        frame_header_payload_with_delta_q(
+            base_q_idx,
+            loop_filter,
+            tx_mode_select,
+            reduced_tx_set,
+            false,
+        )
+    }
+
+    /// [`frame_header_payload`] with an explicit `delta_q_present`, so the
+    /// tests can build the one header shape `parse_supported_frame_header`
+    /// must reject.
+    fn frame_header_payload_with_delta_q(
+        base_q_idx: u8,
+        loop_filter: Option<(u8, u8, u8, u8, u8)>,
+        tx_mode_select: bool,
+        reduced_tx_set: bool,
+        delta_q_present: bool,
     ) -> Vec<u8> {
         let mut w = BitWriter::default();
         w.bits(1, 1); // disable_cdf_update = 1
@@ -1183,6 +1287,12 @@ mod tests {
         w.bits(0, 1); // delta_q_y_dc
         w.bits(0, 1); // using_qmatrix
         w.bits(0, 1); // segmentation_enabled
+        // delta_q_params() (spec §5.9.17) sits between segmentation_params()
+        // and loop_filter_params(), and is present for every frame with
+        // base_q_idx > 0.
+        if base_q_idx != 0 {
+            w.bits(u32::from(delta_q_present), 1); // delta_q_present
+        }
         if let Some((y_v, y_h, u, v, sharpness)) = loop_filter {
             w.bits(y_v.into(), 6);
             w.bits(y_h.into(), 6);
@@ -1198,7 +1308,7 @@ mod tests {
             // CodedLossless.
             w.bits(u32::from(tx_mode_select), 1);
         }
-        w.bits(1, 1); // reduced_tx_set
+        w.bits(u32::from(reduced_tx_set), 1); // reduced_tx_set
         w.byte_align();
         w.into_bytes()
     }
@@ -1219,22 +1329,19 @@ mod tests {
     /// neighbors is block (0,0) directly) keeps a real, non-cascading step
     /// edge in the final reconstruction for [`deblock_frame`] to smooth.
     ///
-    /// `txb_skip_context` at 8x8 depends on `above_level`/`left_level` left
-    /// behind by earlier blocks in the same row/column, precomputed here by
-    /// walking the same recurrence `LosslessTileDecoder::txb_skip_context`/
-    /// `set_coefficient_context` use, in decode order (blocks visited in mi
-    /// order (0,0), (0,2), (2,0), (2,2), each an 8x8 block spanning a 2x2 mi
-    /// footprint, `x4`/`y4` at mi-column/row 0 or 2): block (0,0) sees no
-    /// neighbors set yet (`top == 0 && left == 0` -> context 1), leaving
-    /// `above_level[0]` and `left_level[0]` both at the clamped cumulative
-    /// level (`14`, from the large DC coefficient below). Block (0,2) then
-    /// sees `above_level[2] == 0`, `left_level[0] == 14` (one zero
-    /// neighbor, `max > 3`) -> context 3; block (2,0) sees the symmetric
-    /// `above_level[0] == 14`, `left_level[2] == 0` -> context 3. Both are
-    /// skipped, so they reset `above_level[2]`/`left_level[2]` back to 0,
-    /// leaving block (2,2) with both neighbors 0 -> context 1 again.
-    fn non_lossless_key_frame_tile() -> Vec<u8> {
-        const CONTEXTS: [usize; 4] = [1, 3, 3, 1];
+    /// Each 8x8 block holds a single 8x8 transform, so the transform covers
+    /// the whole coding block and `getTXBSkipCtx` (spec §8.3.2) returns
+    /// context 0 for every one of them without consulting a neighbour - the
+    /// `above_level`/`left_level` recurrence never gets a say.
+    fn non_lossless_key_frame_tile(
+        base_q_idx: u8,
+        tx_set: cdf::Av1TxSet,
+        tx_type_symbol: usize,
+    ) -> Vec<u8> {
+        // The transform covers the whole 8x8 coding block.
+        const CONTEXTS: [usize; 4] = [0, 0, 0, 0];
+        let qctx = cdf::coeff_qctx(base_q_idx);
+        let tx_ctx = cdf::coeff_tx_size_ctx(8);
         let mut e = SymbolEncoder::new();
         e.symbol(&cdf::PARTITION_W16[0], 3); // SPLIT into four 8x8 blocks
         for (block, &context) in CONTEXTS.iter().enumerate() {
@@ -1242,17 +1349,20 @@ mod tests {
             e.symbol(&cdf::SKIP[0], 0); // skip = 0
             e.symbol(&cdf::INTRA_FRAME_Y_MODE_DC_DC, 0); // DC_PRED
             if block == 0 || block == 3 {
-                e.symbol(&cdf::TXB_SKIP[context], 0); // not skipped
-                e.symbol(&cdf::EOB_PT_64[0][0], 0); // eob_point = 1 -> eob = 1
-                e.symbol(&cdf::COEFF_BASE_EOB[0][0], 2); // level = 3 (max base)
-                e.symbol(&cdf::COEFF_BR[0][0], 3); // +3, keep extending
-                e.symbol(&cdf::COEFF_BR[0][0], 3); // +3, keep extending
-                e.symbol(&cdf::COEFF_BR[0][0], 3); // +3, keep extending
-                e.symbol(&cdf::COEFF_BR[0][0], 2); // +2, stop (level = 14)
-                e.symbol(&cdf::DC_SIGN[0][0], usize::from(block == 0)); // block 0 negative, block 3 positive
-                e.symbol(&cdf::EXT_TX_INTRA_REDUCED[1], 1); // DCT_DCT (8x8)
+                e.symbol(cdf::txb_skip_cdf(qctx, tx_ctx, context), 0); // not skipped
+                e.symbol(cdf::eob_pt_cdf(qctx, 8, 0), 0); // eob_point = 1 -> eob = 1
+                e.symbol(cdf::coeff_base_eob_cdf(qctx, tx_ctx, 0, 0), 2); // level = 3 (max base)
+                e.symbol(cdf::coeff_br_cdf(qctx, tx_ctx, 0, 0), 3); // +3, keep extending
+                e.symbol(cdf::coeff_br_cdf(qctx, tx_ctx, 0, 0), 3); // +3, keep extending
+                e.symbol(cdf::coeff_br_cdf(qctx, tx_ctx, 0, 0), 3); // +3, keep extending
+                e.symbol(cdf::coeff_br_cdf(qctx, tx_ctx, 0, 0), 2); // +2, stop (level = 14)
+                // block 0 negative, block 3 positive
+                e.symbol(cdf::dc_sign_cdf(qctx, 0, 0), usize::from(block == 0));
+                // read_tx_type: an 8x8 DC_PRED block's set-appropriate
+                // `tx_type` symbol.
+                e.symbol(cdf::tx_type_cdf(tx_set, 8, 0).unwrap(), tx_type_symbol);
             } else {
-                e.symbol(&cdf::TXB_SKIP[context], 1); // skipped -> all zero
+                e.symbol(cdf::txb_skip_cdf(qctx, tx_ctx, context), 1); // skipped -> all zero
             }
         }
         e.finish()
@@ -1263,9 +1373,16 @@ mod tests {
     fn non_lossless_key_frame_temporal_unit(
         base_q_idx: u8,
         loop_filter: Option<(u8, u8, u8, u8, u8)>,
+        reduced_tx_set: bool,
+        tx_set: cdf::Av1TxSet,
+        tx_type_symbol: usize,
     ) -> Vec<u8> {
-        let mut payload = frame_header_payload(base_q_idx, loop_filter, false);
-        payload.extend_from_slice(&non_lossless_key_frame_tile());
+        let mut payload = frame_header_payload(base_q_idx, loop_filter, false, reduced_tx_set);
+        payload.extend_from_slice(&non_lossless_key_frame_tile(
+            base_q_idx,
+            tx_set,
+            tx_type_symbol,
+        ));
 
         let mut stream = Vec::new();
         push_obu(&mut stream, 2, &[]); // temporal delimiter
@@ -1278,10 +1395,149 @@ mod tests {
         stream
     }
 
+    /// Every transform type the intra sets of spec §5.11.48 can signal and
+    /// this crate has a kernel for must reach that kernel from a bitstream.
+    ///
+    /// The fixture's block (0,0) is the frame's first 8x8 block: `DC_PRED`
+    /// with no neighbours predicts a flat 128, and the tile codes a single
+    /// DC coefficient at level -14, so the block's reconstruction is
+    /// exactly `128 + inverse_transform(..., tx_type, ...)` for whichever
+    /// type was signalled. Every loop filter level is 0 so `deblock_frame`
+    /// leaves the raw reconstruction alone.
+    #[test]
+    fn every_signalled_intra_transform_type_reconstructs_through_its_kernel() {
+        let limits = Limits::default();
+        let mut coefficients = vec![0i32; 64];
+        coefficients[0] = -14;
+        let mut seen = Vec::new();
+        for (reduced_tx_set, symbol, tx_type) in [
+            // TX_SET_INTRA_2: {IDTX, DCT_DCT, ADST_ADST, ADST_DCT, DCT_ADST}.
+            (true, 0, Av1TxType::Idtx),
+            (true, 1, Av1TxType::DctDct),
+            (true, 2, Av1TxType::AdstAdst),
+            (true, 3, Av1TxType::AdstDct),
+            (true, 4, Av1TxType::DctAdst),
+            // TX_SET_INTRA_1 at 8x8: the five above in this set's order,
+            // plus the half-identity V_DCT/H_DCT entries only it contains.
+            (false, 0, Av1TxType::Idtx),
+            (false, 1, Av1TxType::DctDct),
+            (false, 4, Av1TxType::AdstAdst),
+            (false, 5, Av1TxType::AdstDct),
+            (false, 6, Av1TxType::DctAdst),
+            (false, 2, Av1TxType::VDct),
+            (false, 3, Av1TxType::HDct),
+        ] {
+            let set = if reduced_tx_set {
+                cdf::Av1TxSet::Intra2
+            } else {
+                cdf::Av1TxSet::Intra1
+            };
+            let stream = non_lossless_key_frame_temporal_unit(
+                40,
+                Some((0, 0, 0, 0, 0)),
+                reduced_tx_set,
+                set,
+                symbol,
+            );
+            let frame = decode_av1_lossless_intra(&stream, &limits).unwrap();
+            let residuals = inverse_transform(
+                &coefficients,
+                8,
+                tx_type,
+                get_dc_quant(40),
+                get_ac_quant(40),
+            );
+            let stride = frame.planes[0].stride;
+            let block: Vec<u8> = (0..8)
+                .flat_map(|row| {
+                    let start = row * stride;
+                    frame.planes[0].data[start..start + 8].to_vec()
+                })
+                .collect();
+            let expected: Vec<u8> = residuals
+                .iter()
+                .map(|&residual| (128 + i32::from(residual)).clamp(0, 255) as u8)
+                .collect();
+            assert_eq!(block, expected, "{tx_type:?} (reduced = {reduced_tx_set})");
+            seen.push((tx_type, block));
+        }
+        // Every distinct kernel must produce a distinct block, or the
+        // assertions above would pass on a decoder that ignored `tx_type`
+        // entirely - while the same type signalled out of either set must
+        // reconstruct identically.
+        for (index, (tx_type, block)) in seen.iter().enumerate() {
+            for (other, earlier) in &seen[..index] {
+                if other == tx_type {
+                    assert_eq!(block, earlier, "{tx_type:?} depends on its set");
+                } else {
+                    assert_ne!(block, earlier, "{tx_type:?} is not distinguishable");
+                }
+            }
+        }
+    }
+
+    /// An `IDTX` stream must reconstruct at the spec's scaled-identity
+    /// magnitude, not at the raw dequantized one this crate used to emit.
+    ///
+    /// The expected block is derived here from `identity_scale` and
+    /// `transform_shift` directly rather than by calling `inverse_transform`,
+    /// so a regression that reverted both the kernel and its caller would
+    /// still fail this. The fixture is the one above: block (0,0) predicts a
+    /// flat 128 and the tile codes a single DC coefficient at level -14, so
+    /// only that block's first sample carries the transform's output.
+    #[test]
+    fn an_idtx_stream_reconstructs_at_the_scaled_identity_magnitude() {
+        let limits = Limits::default();
+        let stream = non_lossless_key_frame_temporal_unit(
+            40,
+            Some((0, 0, 0, 0, 0)),
+            true,
+            cdf::Av1TxSet::Intra2,
+            0, // TX_SET_INTRA_2 symbol 0 is IDTX.
+        );
+        let frame = decode_av1_lossless_intra(&stream, &limits).unwrap();
+
+        let scale = crate::av1_intra::identity_scale(8);
+        let shift = crate::av1_intra::transform_shift(8);
+        let dequantized = -14i64 * i64::from(get_dc_quant(40));
+        let row = (dequantized * scale + (1 << 13)) >> 14;
+        let column = (row * scale + (1 << 13)) >> 14;
+        let residual = (column + (1 << (shift - 1))) >> shift;
+        // The old unscaled pass-through would have reconstructed the
+        // dequantized coefficient itself.
+        assert_ne!(residual, dequantized);
+
+        let stride = frame.planes[0].stride;
+        assert_eq!(
+            i32::from(frame.planes[0].data[0]),
+            (128 + residual as i32).clamp(0, 255)
+        );
+        // The identity spreads nothing, so the rest of the block is the
+        // prediction alone.
+        for row_index in 0..8 {
+            for column_index in 0..8 {
+                if (row_index, column_index) == (0, 0) {
+                    continue;
+                }
+                assert_eq!(
+                    frame.planes[0].data[row_index * stride + column_index],
+                    128,
+                    "IDTX spread its DC coefficient to ({row_index}, {column_index})"
+                );
+            }
+        }
+    }
+
     #[test]
     fn non_lossless_stream_decodes_with_an_8x8_transform_and_nonzero_dc() {
         let limits = Limits::default();
-        let stream = non_lossless_key_frame_temporal_unit(40, Some((30, 30, 0, 0, 0)));
+        let stream = non_lossless_key_frame_temporal_unit(
+            40,
+            Some((30, 30, 0, 0, 0)),
+            true,
+            cdf::Av1TxSet::Intra2,
+            1,
+        );
         let (frame, tx_sizes) = decode_av1_lossless_intra_with_tx_sizes(&stream, &limits).unwrap();
         assert_eq!(
             (frame.dimensions.width, frame.dimensions.height),
@@ -1301,7 +1557,13 @@ mod tests {
     #[test]
     fn non_lossless_tx_size_grid_reaches_deblock_frame_and_changes_the_result() {
         let limits = Limits::default();
-        let stream = non_lossless_key_frame_temporal_unit(40, Some((30, 30, 0, 0, 0)));
+        let stream = non_lossless_key_frame_temporal_unit(
+            40,
+            Some((30, 30, 0, 0, 0)),
+            true,
+            cdf::Av1TxSet::Intra2,
+            1,
+        );
         let (frame, tx_sizes) = decode_av1_lossless_intra_with_tx_sizes(&stream, &limits).unwrap();
 
         // Re-run the reconstruction without deblocking (base_q_idx == 0
@@ -1341,6 +1603,7 @@ mod tests {
             mi_rows,
             header.base_q_idx,
             header.tx_mode_select,
+            header.reduced_tx_set,
             &limits,
         )
         .unwrap();
@@ -1371,7 +1634,8 @@ mod tests {
     /// filter level 0 so `deblock_frame` is a no-op and the assertions
     /// below see the raw reconstruction.
     fn superblock_temporal_unit(tile: &[u8], tx_mode_select: bool) -> Vec<u8> {
-        let mut payload = frame_header_payload(SUPERBLOCK_Q, Some((0, 0, 0, 0, 0)), tx_mode_select);
+        let mut payload =
+            frame_header_payload(SUPERBLOCK_Q, Some((0, 0, 0, 0, 0)), tx_mode_select, true);
         payload.extend_from_slice(tile);
         let mut stream = Vec::new();
         push_obu(&mut stream, 2, &[]); // temporal delimiter
@@ -1395,12 +1659,20 @@ mod tests {
     /// Codes one transform block holding a single positive DC coefficient
     /// of level 4 (`COEFF_BASE_EOB` = 3, then one `COEFF_BR` increment of
     /// 1, which is below 3 and so terminates the range extension).
-    fn encode_dc_only_transform_block(e: &mut SymbolEncoder, skip_context: usize, coded: usize) {
-        e.symbol(&cdf::TXB_SKIP[skip_context], 0); // not skipped
-        e.symbol(cdf::eob_pt_cdf(coded, 0), 0); // eob_point = 1 -> eob = 1
-        e.symbol(&cdf::COEFF_BASE_EOB[0][0], 2); // level = 3 (max base)
-        e.symbol(&cdf::COEFF_BR[0][0], 1); // +1, stop (level = 4)
-        e.symbol(&cdf::DC_SIGN[0][0], 0); // positive
+    ///
+    /// `size` is the transform's own side length, which selects both the
+    /// coefficient CDFs' transform-size context and (capped at 32, since a
+    /// 64x64 transform codes only its upper-left quadrant) the `eob_pt`
+    /// class.
+    fn encode_dc_only_transform_block(e: &mut SymbolEncoder, skip_context: usize, size: usize) {
+        let qctx = cdf::coeff_qctx(SUPERBLOCK_Q);
+        let tx_ctx = cdf::coeff_tx_size_ctx(size);
+        e.symbol(cdf::txb_skip_cdf(qctx, tx_ctx, skip_context), 0); // not skipped
+        // eob_point = 1 -> eob = 1
+        e.symbol(cdf::eob_pt_cdf(qctx, size.min(32), 0), 0);
+        e.symbol(cdf::coeff_base_eob_cdf(qctx, tx_ctx, 0, 0), 2); // level = 3 (max base)
+        e.symbol(cdf::coeff_br_cdf(qctx, tx_ctx, 0, 0), 1); // +1, stop (level = 4)
+        e.symbol(cdf::dc_sign_cdf(qctx, 0, 0), 0); // positive
     }
 
     /// The reconstruction a `size x size` transform carrying DC level 4
@@ -1429,8 +1701,9 @@ mod tests {
         // 64x64 block selects TX_64X64. Its coefficients are coded in the
         // upper-left 32x32 quadrant only, hence the 32-wide eob_pt class,
         // and TX_64X64's transform set is TX_SET_DCTONLY, so no tx_type
-        // symbol follows the coefficients either.
-        encode_dc_only_transform_block(&mut e, 1, 32);
+        // symbol follows the coefficients either. The transform covers the
+        // whole coding block, so `getTXBSkipCtx` is 0.
+        encode_dc_only_transform_block(&mut e, 0, 64);
         let stream = superblock_temporal_unit(&e.finish(), false);
 
         let limits = Limits::default();
@@ -1462,7 +1735,15 @@ mod tests {
         // (context 3), and the last one sees neither (context 1).
         encode_dc_only_transform_block(&mut e, 1, 32);
         for context in [3, 3, 1] {
-            e.symbol(&cdf::TXB_SKIP[context], 1); // skipped -> all zero
+            // skipped -> all zero
+            e.symbol(
+                cdf::txb_skip_cdf(
+                    cdf::coeff_qctx(SUPERBLOCK_Q),
+                    cdf::coeff_tx_size_ctx(32),
+                    context,
+                ),
+                1,
+            );
         }
         let stream = superblock_temporal_unit(&e.finish(), true);
 
@@ -1493,7 +1774,10 @@ mod tests {
         // All sixteen 16x16 transforms are skipped, so every one of them
         // sees zeroed level contexts and codes at skip context 1.
         for _ in 0..16 {
-            e.symbol(&cdf::TXB_SKIP[1], 1);
+            e.symbol(
+                cdf::txb_skip_cdf(cdf::coeff_qctx(SUPERBLOCK_Q), cdf::coeff_tx_size_ctx(16), 1),
+                1,
+            );
         }
         let stream = superblock_temporal_unit(&e.finish(), true);
 
@@ -1511,6 +1795,54 @@ mod tests {
         assert!(frame.planes[0].data.iter().all(|&sample| sample == 128));
     }
 
+    /// Spec §5.9.17 reads `delta_q_present` for every frame with
+    /// `base_q_idx > 0`, whatever segmentation signalled. Leaving it out
+    /// left every non-lossless header one bit short from `delta_q_params`
+    /// onward, which ffmpeg 7.1's dav1d rejects outright
+    /// (`zero_bit out of range`) rather than mis-decoding.
+    #[test]
+    fn a_non_lossless_frame_header_carries_delta_q_present() {
+        // The bit is present and 0 in every non-lossless fixture, and the
+        // frame decodes.
+        let stream = non_lossless_key_frame_temporal_unit(
+            40,
+            Some((0, 0, 0, 0, 0)),
+            true,
+            cdf::Av1TxSet::Intra2,
+            0,
+        );
+        assert!(decode_av1_lossless_intra(&stream, &Limits::default()).is_ok());
+
+        // Reading the header without that bit would consume
+        // `loop_filter_level[0]`'s first bit as `delta_q_present`, so a
+        // header that sets the bit must be rejected rather than silently
+        // shifting every later field.
+        let mut payload =
+            frame_header_payload_with_delta_q(40, Some((0, 0, 0, 0, 0)), false, true, true);
+        payload.extend_from_slice(&non_lossless_key_frame_tile(40, cdf::Av1TxSet::Intra2, 0));
+        let mut rejected = Vec::new();
+        push_obu(&mut rejected, 2, &[]);
+        push_obu(
+            &mut rejected,
+            1,
+            &sequence_header_payload(FRAME_DIM, FRAME_DIM),
+        );
+        push_obu(&mut rejected, 6, &payload);
+        assert!(decode_av1_lossless_intra(&rejected, &Limits::default()).is_err());
+    }
+
+    /// A lossless frame reads no `delta_q_present` bit at all: the header
+    /// bytes are unchanged by the fix, so existing lossless streams keep
+    /// decoding bit-for-bit as before.
+    #[test]
+    fn a_lossless_frame_header_reads_no_delta_q_present_bit() {
+        assert_eq!(
+            frame_header_payload(0, None, false, true),
+            frame_header_payload_with_delta_q(0, None, false, true, true),
+            "base_q_idx == 0 must not encode delta_q_present at all"
+        );
+    }
+
     #[test]
     fn a_transform_block_hanging_off_the_coded_frame_is_rejected() {
         // A 40x40 frame is 10 MI units across, so the forced-split rules
@@ -1519,9 +1851,9 @@ mod tests {
         // TX_64X64 would write outside the reconstruction buffer.
         let mut e = SymbolEncoder::new();
         superblock_prefix(&mut e);
-        encode_dc_only_transform_block(&mut e, 1, 32);
+        encode_dc_only_transform_block(&mut e, 0, 64);
         let tile = e.finish();
-        let mut payload = frame_header_payload(SUPERBLOCK_Q, Some((0, 0, 0, 0, 0)), false);
+        let mut payload = frame_header_payload(SUPERBLOCK_Q, Some((0, 0, 0, 0, 0)), false, true);
         payload.extend_from_slice(&tile);
         let mut stream = Vec::new();
         push_obu(&mut stream, 2, &[]);
@@ -1550,21 +1882,72 @@ mod coefficient_level_tests {
     #[test]
     fn decodes_a_golomb_extended_negative_dc_coefficient() {
         let mut e = SymbolEncoder::new();
-        e.symbol(&cdf::TXB_SKIP[1], 0); // not skipped
-        e.symbol(&cdf::EOB_PT_64[0][0], 0); // eob_point = 1 -> eob = 1
-        e.symbol(&cdf::COEFF_BASE_EOB[0][0], 2); // level = 3 (max base)
-        e.symbol(&cdf::COEFF_BR[0][0], 3); // +3, keep extending
-        e.symbol(&cdf::COEFF_BR[0][0], 3); // +3, keep extending
-        e.symbol(&cdf::COEFF_BR[0][0], 3); // +3, keep extending
-        e.symbol(&cdf::COEFF_BR[0][0], 2); // +2, stop (level = 14)
-        e.symbol(&cdf::DC_SIGN[0][0], 1); // negative
+        // A 16x16 coding block holding an 8x8 transform, so the transform
+        // does not cover the block and the neighbour-derived skip context 1
+        // (no nonzero neighbour yet) applies.
+        let qctx = cdf::coeff_qctx(40);
+        let tx_ctx = cdf::coeff_tx_size_ctx(8);
+        e.symbol(cdf::txb_skip_cdf(qctx, tx_ctx, 1), 0); // not skipped
+        e.symbol(cdf::eob_pt_cdf(qctx, 8, 0), 0); // eob_point = 1 -> eob = 1
+        e.symbol(cdf::coeff_base_eob_cdf(qctx, tx_ctx, 0, 0), 2); // level = 3 (max base)
+        e.symbol(cdf::coeff_br_cdf(qctx, tx_ctx, 0, 0), 3); // +3, keep extending
+        e.symbol(cdf::coeff_br_cdf(qctx, tx_ctx, 0, 0), 3); // +3, keep extending
+        e.symbol(cdf::coeff_br_cdf(qctx, tx_ctx, 0, 0), 3); // +3, keep extending
+        e.symbol(cdf::coeff_br_cdf(qctx, tx_ctx, 0, 0), 2); // +2, stop (level = 14)
+        e.symbol(cdf::dc_sign_cdf(qctx, 0, 1), 1); // negative
         let bytes = e.finish();
         let limits = Limits::default();
         let mut decoder =
-            LosslessTileDecoder::new(&bytes, 16, 16, 4, 4, 40, false, &limits).unwrap();
+            LosslessTileDecoder::new(&bytes, 16, 16, 4, 4, 40, false, true, &limits).unwrap();
         let scan = cdf::up_right_diagonal_scan(8);
-        let (levels, skipped) = decoder.decode_coefficient_levels(0, 0, 8, &scan).unwrap();
+        let (levels, skipped) = decoder
+            .decode_coefficient_levels(0, 0, 16, 8, &scan)
+            .unwrap();
         assert!(!skipped);
         assert_eq!(levels[0], -14);
+    }
+
+    /// Spec §8.3.2's `getTXBSkipCtx` returns context 0 outright when the
+    /// transform covers the whole coding block, without consulting a
+    /// neighbour. The two calls below decode the same coefficients from
+    /// bitstreams that differ only in which `Txb_Skip_Cdf` context coded
+    /// the `all_zero` symbol, and each only decodes under the context its
+    /// own block geometry selects.
+    #[test]
+    fn a_block_sized_transform_codes_txb_skip_at_context_zero() {
+        let qctx = cdf::coeff_qctx(40);
+        let tx_ctx = cdf::coeff_tx_size_ctx(8);
+        let encode = |context: usize| {
+            let mut e = SymbolEncoder::new();
+            e.symbol(cdf::txb_skip_cdf(qctx, tx_ctx, context), 0); // not skipped
+            e.symbol(cdf::eob_pt_cdf(qctx, 8, 0), 0); // eob_point = 1 -> eob = 1
+            e.symbol(cdf::coeff_base_eob_cdf(qctx, tx_ctx, 0, 0), 0); // level = 1
+            e.symbol(cdf::dc_sign_cdf(qctx, 0, 0), 0); // positive
+            e.finish()
+        };
+        let limits = Limits::default();
+        let scan = cdf::up_right_diagonal_scan(8);
+
+        // An 8x8 transform filling an 8x8 coding block: whole-block, so
+        // context 0.
+        let bytes = encode(0);
+        let mut decoder =
+            LosslessTileDecoder::new(&bytes, 16, 16, 4, 4, 40, false, true, &limits).unwrap();
+        let (levels, skipped) = decoder
+            .decode_coefficient_levels(0, 0, 8, 8, &scan)
+            .unwrap();
+        assert!(!skipped);
+        assert_eq!(levels[0], 1);
+
+        // The same 8x8 transform inside a 16x16 coding block is not
+        // whole-block, so the neighbour-derived context 1 applies instead.
+        let bytes = encode(1);
+        let mut decoder =
+            LosslessTileDecoder::new(&bytes, 16, 16, 4, 4, 40, false, true, &limits).unwrap();
+        let (levels, skipped) = decoder
+            .decode_coefficient_levels(0, 0, 16, 8, &scan)
+            .unwrap();
+        assert!(!skipped);
+        assert_eq!(levels[0], 1);
     }
 }

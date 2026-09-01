@@ -42,7 +42,7 @@ use super::vector::{I32x, Transpose4};
 use crate::av1_encoder::transform::{
     FADST4, FADST8, FADST16, FDCT4, FDCT8, FDCT16, FDCT32, staged_limit as forward_staged_limit,
 };
-use crate::av1_intra::Tx1d;
+use crate::av1_intra::{Tx1d, identity_scale};
 
 /// Largest input magnitude for which the `i32` Walsh-Hadamard butterflies
 /// cannot overflow. The transform grows a value by at most a factor of 4 per
@@ -1288,6 +1288,7 @@ macro_rules! separable_pass {
             let transformed = match $kind {
                 Tx1d::Dct => $dct(lanes),
                 Tx1d::Adst => $adst(lanes),
+                Tx1d::Identity => identity_pass::<V, $n>(lanes),
             };
             // `transformed[k]` lane j is element k of row `4 * group + j`,
             // which is exactly column `4 * group + j` of output row k.
@@ -1296,6 +1297,23 @@ macro_rules! separable_pass {
             }
         }
     }};
+}
+
+/// Vector form of the identity 1-D pass both `av1_intra::inverse_transform_1d`
+/// and `av1_encoder::transform::forward_1d` apply for a half-identity type:
+/// every element scaled by `av1_intra::identity_scale` at its size, in the
+/// same 14-bit fixed point the butterflies use, and in the same
+/// split-accumulator form so a wide input cannot overflow a lane.
+#[inline(always)]
+unsafe fn identity_pass<V: I32x, const N: usize>(input: [V; N]) -> [V; N] {
+    unsafe {
+        let scale = identity_scale(N) as i32;
+        let mut output = [V::zero(); N];
+        for (slot, value) in output.iter_mut().zip(input) {
+            *slot = dot_rs14([(value, scale)]);
+        }
+        output
+    }
 }
 
 /// Defines the `N x N` inverse transform driver for one block size.
