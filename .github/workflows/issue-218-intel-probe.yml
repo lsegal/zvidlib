@@ -15,20 +15,26 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-15-intel]
+        os: [macos-15-intel, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     # The macOS 15 Intel image links the crate's apple-cf dependency against a
     # Swift runtime it does not stage next to the test binary, so add the
     # system Swift runtime directory to the binary's rpath.
     env:
-      RUSTFLAGS: -C link-arg=-Wl,-rpath,/usr/lib/swift
+      RUSTFLAGS: ${{ runner.os == 'macOS' && '-C link-arg=-Wl,-rpath,/usr/lib/swift' || '' }}
     steps:
       - uses: actions/checkout@v4
+      - name: Install native audio dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - name: Identify the CPU
         shell: bash
         run: |
           uname -a
           sw_vers || true
+          if [ -r /proc/cpuinfo ]; then
+            grep -m1 'vendor_id\|model name' /proc/cpuinfo || true
+          fi
           sysctl -n machdep.cpu.brand_string 2>/dev/null || true
           sysctl -n machdep.cpu.vendor 2>/dev/null || true
           sysctl -n machdep.cpu.features machdep.cpu.leaf7_features 2>/dev/null || true

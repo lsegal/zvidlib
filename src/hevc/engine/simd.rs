@@ -742,7 +742,12 @@ pub fn combine_weighted<const N: usize>(
         // auto-vectorization does not reach, and it measured 1.38x in the
         // block path and 2.2x on a bare buffer on the same host.
         #[cfg(target_arch = "x86_64")]
-        Isa::Sse41 => combine_weighted_scalar(taps, weights, p, out),
+        // PROBE (issue #218): temporarily dispatched to the four-lane kernel
+        // so the benchmark can time it against scalar on an Intel host. The
+        // final dispatch is decided by that measurement.
+        // SAFETY: `supported` confirmed SSE4.1 above, and the tap slices are
+        // at least `out.len()` long so every load stays in bounds.
+        Isa::Sse41 => unsafe { combine_weighted_sse41(taps, weights, p, out) },
         #[cfg(target_arch = "x86_64")]
         // SAFETY: `supported` confirmed AVX2 above, and the tap slices are at
         // least `out.len()` long so every load stays in bounds.
@@ -799,6 +804,37 @@ fn combine_weighted_scalar<const N: usize>(
             acc += w * tap[i];
         }
         *o = ((acc >> p.shift) + p.post).clamp(0, p.max_val);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.1")]
+unsafe fn combine_weighted_sse41<const N: usize>(
+    taps: &[&[i32]; N],
+    weights: &[i32; N],
+    p: CombineParams,
+    out: &mut [i32],
+) {
+    unsafe {
+        let count = out.len();
+        let sh = _mm_cvtsi32_si128(p.shift);
+        let round = _mm_set1_epi32(p.round);
+        let post = _mm_set1_epi32(p.post);
+        let lo = _mm_setzero_si128();
+        let hi = _mm_set1_epi32(p.max_val);
+        let mut i = 0usize;
+        while i + 4 <= count {
+            let mut acc = round;
+            for (&w, tap) in weights.iter().zip(taps.iter()) {
+                let v = _mm_loadu_si128(tap.as_ptr().add(i).cast());
+                acc = _mm_add_epi32(acc, _mm_mullo_epi32(v, _mm_set1_epi32(w)));
+            }
+            let v = _mm_add_epi32(_mm_sra_epi32(acc, sh), post);
+            let v = _mm_min_epi32(_mm_max_epi32(v, lo), hi);
+            _mm_storeu_si128(out.as_mut_ptr().add(i).cast(), v);
+            i += 4;
+        }
+        combine_weighted_tail(taps, weights, p, out, i);
     }
 }
 
