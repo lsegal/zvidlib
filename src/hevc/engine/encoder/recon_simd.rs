@@ -174,6 +174,61 @@ pub(crate) fn reconstruct_row_scalar(dst: &mut [i32], src: &[u8], pred: &[u8]) {
     }
 }
 
+/// One row of §8.6.6 reconstruction from an already-coded residual:
+/// `dst = Clip1( pred + coded )`.
+///
+/// This is the quantizing writer's half of the same §8.6.6 loop
+/// [`reconstruct_row`] runs for the lossless one. There the residual is the
+/// exact `src − pred` and can be recovered from two byte runs; here it has
+/// already been round-tripped through the §8.6.4 forward transform, §8.6.3
+/// quantization and the decoder's own §8.6.2 reconstruction, so both operands
+/// arrive as `i32` runs and the sum no longer fits the 16-bit lanes
+/// [`reconstruct_row`] uses. The kernels below therefore stay in 32-bit lanes,
+/// which is exact for any `coded` a decoder can produce.
+///
+/// # Panics
+/// Panics unless all three slices have the same length.
+pub(crate) fn add_clip_row(dst: &mut [i32], pred: &[i32], coded: &[i32]) {
+    assert_eq!(
+        dst.len(),
+        pred.len(),
+        "destination and prediction rows differ"
+    );
+    assert_eq!(
+        dst.len(),
+        coded.len(),
+        "destination and residual rows differ"
+    );
+    match isa_code() {
+        #[cfg(target_arch = "x86_64")]
+        ISA_AVX2 => {
+            // SAFETY: the lengths agree, and this arm is only reachable after
+            // `is_x86_feature_detected!("avx2")` or an override clamped to an
+            // available instruction set.
+            unsafe { x86::add_clip_row_avx2(dst, pred, coded) }
+        }
+        #[cfg(target_arch = "x86_64")]
+        ISA_SSE41 => {
+            // SAFETY: as above, with SSE4.1 detected.
+            unsafe { x86::add_clip_row_sse41(dst, pred, coded) }
+        }
+        #[cfg(target_arch = "aarch64")]
+        ISA_NEON => {
+            // SAFETY: the lengths agree, and NEON is part of the aarch64
+            // baseline this code is compiled for.
+            unsafe { neon::add_clip_row(dst, pred, coded) }
+        }
+        _ => add_clip_row_scalar(dst, pred, coded),
+    }
+}
+
+/// The portable reference for [`add_clip_row`].
+pub(crate) fn add_clip_row_scalar(dst: &mut [i32], pred: &[i32], coded: &[i32]) {
+    for ((d, &p), &c) in dst.iter_mut().zip(pred.iter()).zip(coded.iter()) {
+        *d = (p + c).clamp(0, BIT_DEPTH_MAX);
+    }
+}
+
 /// Per-category error sums and sample counts for one run of the §8.7.3.2
 /// edge-offset classification, indexed by `SaoOffsetVal` category `1..=4`.
 ///
@@ -355,6 +410,66 @@ mod x86 {
         }
     }
 
+    /// `Clip1(pred + coded)` over four `i32` lanes.
+    #[inline]
+    #[target_feature(enable = "sse4.1")]
+    unsafe fn add_clip4_sse41(dst: *mut i32, pred: *const i32, coded: *const i32) {
+        unsafe {
+            let p = _mm_loadu_si128(pred.cast());
+            let c = _mm_loadu_si128(coded.cast());
+            let sum = _mm_add_epi32(p, c);
+            let clipped = _mm_min_epi32(
+                _mm_max_epi32(sum, _mm_setzero_si128()),
+                _mm_set1_epi32(BIT_DEPTH_MAX),
+            );
+            _mm_storeu_si128(dst.cast(), clipped);
+        }
+    }
+
+    #[target_feature(enable = "sse4.1")]
+    pub(super) unsafe fn add_clip_row_sse41(dst: &mut [i32], pred: &[i32], coded: &[i32]) {
+        unsafe {
+            let n = dst.len();
+            let mut i = 0;
+            while i + 4 <= n {
+                add_clip4_sse41(
+                    dst.as_mut_ptr().add(i),
+                    pred.as_ptr().add(i),
+                    coded.as_ptr().add(i),
+                );
+                i += 4;
+            }
+            super::add_clip_row_scalar(&mut dst[i..], &pred[i..], &coded[i..]);
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn add_clip_row_avx2(dst: &mut [i32], pred: &[i32], coded: &[i32]) {
+        unsafe {
+            let n = dst.len();
+            let zero = _mm256_setzero_si256();
+            let max = _mm256_set1_epi32(BIT_DEPTH_MAX);
+            let mut i = 0;
+            while i + 8 <= n {
+                let p = _mm256_loadu_si256(pred.as_ptr().add(i).cast());
+                let c = _mm256_loadu_si256(coded.as_ptr().add(i).cast());
+                let sum = _mm256_add_epi32(p, c);
+                let clipped = _mm256_min_epi32(_mm256_max_epi32(sum, zero), max);
+                _mm256_storeu_si256(dst.as_mut_ptr().add(i).cast(), clipped);
+                i += 8;
+            }
+            while i + 4 <= n {
+                add_clip4_sse41(
+                    dst.as_mut_ptr().add(i),
+                    pred.as_ptr().add(i),
+                    coded.as_ptr().add(i),
+                );
+                i += 4;
+            }
+            super::add_clip_row_scalar(&mut dst[i..], &pred[i..], &coded[i..]);
+        }
+    }
+
     /// `(here − other).signum()` over four `i32` lanes.
     #[inline]
     #[target_feature(enable = "sse4.1")]
@@ -508,6 +623,25 @@ mod neon {
         }
     }
 
+    #[target_feature(enable = "neon")]
+    pub(super) unsafe fn add_clip_row(dst: &mut [i32], pred: &[i32], coded: &[i32]) {
+        unsafe {
+            let n = dst.len();
+            let zero = vdupq_n_s32(0);
+            let max = vdupq_n_s32(BIT_DEPTH_MAX);
+            let mut i = 0;
+            while i + 4 <= n {
+                let p = vld1q_s32(pred.as_ptr().add(i));
+                let c = vld1q_s32(coded.as_ptr().add(i));
+                let sum = vaddq_s32(p, c);
+                let clipped = vminq_s32(vmaxq_s32(sum, zero), max);
+                vst1q_s32(dst.as_mut_ptr().add(i), clipped);
+                i += 4;
+            }
+            super::add_clip_row_scalar(&mut dst[i..], &pred[i..], &coded[i..]);
+        }
+    }
+
     /// `(here − other).signum()` over four `i32` lanes.
     #[inline]
     #[target_feature(enable = "neon")]
@@ -588,6 +722,17 @@ mod tests {
     /// in the range a reconstructed picture can actually hold.
     fn samples(seed: u64, n: usize) -> Vec<i32> {
         bytes(seed, n).into_iter().map(i32::from).collect()
+    }
+
+    /// Coded-residual fixtures for the quantized path: signed values wide
+    /// enough that `pred + coded` leaves the 8-bit range in both directions,
+    /// so every run exercises the clip at 0 and at 255 as well as the samples
+    /// that pass through untouched.
+    fn residuals(seed: u64, n: usize) -> Vec<i32> {
+        bytes(seed, n)
+            .into_iter()
+            .map(|b| i32::from(b) * 4 - 480)
+            .collect()
     }
 
     /// Every run length that exercises a full vector body, a partial one, and
@@ -675,6 +820,42 @@ mod tests {
     }
 
     #[test]
+    fn the_coded_add_and_clip_matches_the_scalar_reference_on_every_instruction_set() {
+        let _guard = simd::test_lock();
+        for &n in RUNS {
+            let pred = samples(0x1a2b_3c4d_5e6f_7081, n);
+            let coded = residuals(0x7fff_0001_2345_6789, n);
+            let mut expected = vec![0i32; n];
+            add_clip_row_scalar(&mut expected, &pred, &coded);
+            for isa in simd::available() {
+                simd::set_override(Some(isa));
+                let mut got = vec![0i32; n];
+                add_clip_row(&mut got, &pred, &coded);
+                assert_eq!(got, expected, "{} add-and-clip of {n} samples", isa.name());
+            }
+        }
+        simd::set_override(None);
+    }
+
+    #[test]
+    fn the_coded_add_and_clip_saturates_at_both_ends_of_the_8_bit_range() {
+        // The fixture above is only a bit-exactness check against the scalar
+        // reference; this pins the §8.6.6 clip itself, including a residual
+        // far outside the range any single sample could reach unclipped.
+        let _guard = simd::test_lock();
+        let pred = [0i32, 128, 255, 200, 40, 128, 128];
+        let coded = [-1i32, -200, 1, 100, -100, 32_767, -32_768];
+        let expected = [0i32, 0, 255, 255, 0, 255, 0];
+        for isa in simd::available() {
+            simd::set_override(Some(isa));
+            let mut got = [0i32; 7];
+            add_clip_row(&mut got, &pred, &coded);
+            assert_eq!(got, expected, "{}", isa.name());
+        }
+        simd::set_override(None);
+    }
+
+    #[test]
     fn the_detected_instruction_set_is_the_best_one_this_machine_supports() {
         let _guard = simd::test_lock();
         simd::set_override(None);
@@ -706,6 +887,9 @@ mod tests {
             let b = samples(0x2222_3333_4444_5557, n);
             let mut recon_expected = vec![0i32; n];
             reconstruct_row_scalar(&mut recon_expected, &src, &pred);
+            let coded = residuals(0x0f1e_2d3c_4b5a_6978, n);
+            let mut add_clip_expected = vec![0i32; n];
+            add_clip_row_scalar(&mut add_clip_expected, &here, &coded);
             let mut sao_expected = EdgeStats::default();
             edge_offset_row_scalar(&here, &a, &b, &src, &mut sao_expected);
             if is_x86_feature_detected!("sse4.1") {
@@ -716,7 +900,14 @@ mod tests {
                     x86::reconstruct_row_sse41(&mut got, &src, &pred);
                     x86::edge_offset_row_sse41(&here, &a, &b, &src, &mut stats);
                 }
+                let mut got_add_clip = vec![0i32; n];
+                // SAFETY: as above.
+                unsafe { x86::add_clip_row_sse41(&mut got_add_clip, &here, &coded) }
                 assert_eq!(got, recon_expected, "SSE4.1 reconstruction of {n}");
+                assert_eq!(
+                    got_add_clip, add_clip_expected,
+                    "SSE4.1 add-and-clip of {n}"
+                );
                 assert_eq!(stats, sao_expected, "SSE4.1 edge search over {n}");
             }
             if is_x86_feature_detected!("avx2") {
@@ -727,7 +918,11 @@ mod tests {
                     x86::reconstruct_row_avx2(&mut got, &src, &pred);
                     x86::edge_offset_row_avx2(&here, &a, &b, &src, &mut stats);
                 }
+                let mut got_add_clip = vec![0i32; n];
+                // SAFETY: as above.
+                unsafe { x86::add_clip_row_avx2(&mut got_add_clip, &here, &coded) }
                 assert_eq!(got, recon_expected, "AVX2 reconstruction of {n}");
+                assert_eq!(got_add_clip, add_clip_expected, "AVX2 add-and-clip of {n}");
                 assert_eq!(stats, sao_expected, "AVX2 edge search over {n}");
             }
         }
@@ -738,6 +933,13 @@ mod tests {
     fn a_prediction_row_of_the_wrong_length_is_rejected() {
         let mut dst = [0i32; 8];
         reconstruct_row(&mut dst, &[0u8; 8], &[0u8; 7]);
+    }
+
+    #[test]
+    #[should_panic(expected = "destination and residual rows differ")]
+    fn a_coded_residual_row_of_the_wrong_length_is_rejected() {
+        let mut dst = [0i32; 8];
+        add_clip_row(&mut dst, &[0i32; 8], &[0i32; 7]);
     }
 
     #[test]
