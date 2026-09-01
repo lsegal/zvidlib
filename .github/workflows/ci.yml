@@ -41,6 +41,13 @@ jobs:
       # every one of them is reachable from a [[bench]] target.
       - name: Check every bench source is compiled
         run: cargo test --features native --test bench_sources_compile
+      # `criterion_baseline.py` renders the committed table in
+      # `benches/README.md`, and its failure mode is a plausible table with a
+      # column silently missing rather than a crash - the arm name it matched
+      # drifted from the one `SimdIsa` prints and every SSE4.1 measurement was
+      # dropped. Nothing else in CI executes this script's `table` path.
+      - name: Test the benchmark baseline script
+        run: python3 -m unittest discover -s .github/scripts -p 'test_*.py' -v
       - name: Test AV1 SIMD kernels against the scalar path
         run: cargo test --features native --lib av1_simd -- --nocapture
       - name: Test library units
