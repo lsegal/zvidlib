@@ -104,8 +104,10 @@ const TYPE_GAIN_PROBES: usize = 1;
 /// this magnitude which neighbourhood a block reads back comes down to where its probes happened
 /// to fall. The mean against the exhaustive search is *negative* at every interval past `1`: on
 /// this set the sampled estimator reconstructs at slightly better rate-distortion than probing
-/// every size search, the probes it skips having been worth less than the shrunken correction
-/// that stands in for them.
+/// every size search. That is [`TYPE_GAIN_TRUST`] rather than the sampling - a trial that probes
+/// is corrected in full, so interval `1` is the un-shrunk correction on every trial and measures
+/// *worse* than the exhaustive search; see the decomposition under that constant. It also means
+/// the unsampled estimator this column is taken against is not a strict upper bound on quality.
 ///
 /// So the interval is chosen on coverage and cost instead. Coverage binds it: the per-size
 /// correction is what makes `TX_4X4` selectable at all, and on the 96x80 pattern - few enough
@@ -220,34 +222,87 @@ pub(crate) enum GainRatio {
 /// less a ratio measured on other blocks is worth than one measured on this block. Sixteenths of
 /// the remembered gain, as each frame's worst penalty in `sse + lambda * bits` against the same
 /// estimator probing every size search, over the `content_frames` set plus `test_pattern` at the
-/// six quantizers:
+/// six quantizers.
 ///
-/// | trust | scene_edge 128x96 | smooth 128x96 | scene_edge 192x160 | smooth 192x160 | test_pattern 192x160 | candidates |
-/// |------:|------------------:|--------------:|-------------------:|---------------:|---------------------:|-----------:|
-/// | 0     | +0.10%            | +0.47%        | +1.27%             | +0.54%         | +0.00%               | 150,680    |
-/// | 1     | +0.10%            | +0.00%        | +1.27%             | +0.08%         | +0.00%               | 150,827    |
-/// | 2     | +0.10%            | +0.00%        | +1.27%             | +0.08%         | +0.00%               | 151,019    |
-/// | 4     | +0.10%            | +0.00%        | +1.27%             | +0.08%         | +0.37%               | 152,176    |
-/// | 6     | +0.10%            | +0.00%        | +8.42%             | +0.08%         | +0.37%               | 153,872    |
-/// | 8     | +1.37%            | +1.16%        | +8.42%             | +0.53%         | +0.37%               | 154,617    |
-/// | 16    | +2.13%            | +1.15%        | +9.32%             | +0.52%         | +0.37%               | 155,392    |
+/// This value was first derived while [`TYPE_GAIN_SAMPLE_INTERVAL`] was `2`; #278 moved the
+/// interval to `8` and the two are coupled, because the interval sets what fraction of size
+/// trials read a *remembered* ratio and so how much of the search this shrinkage governs. At an
+/// interval of `2` about half the coding blocks probed, at `8` about an eighth do, so the sweep
+/// below is re-taken at the shipped interval and it is what `measure_type_gain_trust` now prints:
 ///
-/// (`noise`, `diagonals` and `quadrants` are +0.00% at every value and are left out; the
-/// candidate column is 192x160.) `2` is the middle of the `1..=3` plateau where every frame is
-/// at its own minimum, with a value either side of it before anything moves: `0` gives up
-/// `smooth`'s +0.47% by discarding the remembered correction entirely, and `4` starts trading
-/// `test_pattern` back. It takes the scene edge from +9.32% to +1.27% at 192x160 and from
-/// +2.13% to +0.10% at 128x96, and
+/// | trust | scene_edge 128x96 | smooth 128x96 | bands 128x96 | scene_edge 192x160 | smooth 192x160 | mosaic 192x160 | candidates |
+/// |------:|------------------:|--------------:|-------------:|-------------------:|---------------:|---------------:|-----------:|
+/// | 0     | +0.10%            | +1.05%        | +3.43%       | +0.11%             | +1.00%         | +0.72%         | 172,747    |
+/// | 1     | +0.10%            | +0.58%        | +3.43%       | +0.11%             | +0.31%         | +0.72%         | 173,042    |
+/// | 2     | +0.10%            | +0.00%        | +3.43%       | +0.11%             | +0.08%         | +0.72%         | 174,638    |
+/// | 3     | +0.10%            | +0.00%        | +3.43%       | +0.11%             | +0.08%         | +0.72%         | 175,968    |
+/// | 4     | +0.46%            | +2.96%        | +3.43%       | +0.11%             | +1.08%         | +0.72%         | 178,778    |
+/// | 5     | +0.46%            | +2.96%        | +3.30%       | +14.45%            | +1.08%         | +0.72%         | 179,018    |
+/// | 6     | +0.97%            | +4.09%        | +3.30%       | +21.60%            | +2.26%         | +0.72%         | 179,575    |
+/// | 8     | +1.28%            | +4.09%        | +3.21%       | +35.89%            | +2.68%         | +0.72%         | 179,920    |
+/// | 12    | +41.51%           | +4.09%        | +3.11%       | +78.70%            | +2.68%         | +0.72%         | 180,472    |
+/// | 16    | +55.52%           | +4.45%        | +6.01%       | +78.70%            | +2.68%         | +6.33%         | 181,380    |
+///
+/// (`noise` and `diagonals` are +0.00% at every value and `quadrants` is +0.69% at every value at
+/// 192x160 and +0.00% at 128x96, so all three are left out; `test_pattern` is +0.00% through `4`
+/// and +2.13% at 128x96 / +1.42% at 192x160 above it; the candidate column is 192x160.)
+///
+/// `2` still measures out best and the sweep now covers the interval it ships at. It is the lower
+/// of the `2..=3` plateau where every frame but `bands` is at its own minimum, with a value
+/// either side of it before something moves: `1` gives up `smooth`'s +0.58% / +0.31% and `0`
+/// its +1.05% / +1.00% by discarding more of the remembered correction than the estimate can
+/// spare, and `4` starts trading `smooth` back at both sizes and `scene_edge` at 128x96. `bands`
+/// is the one frame that would rather have less shrinkage still, but only by 0.32 points, and its
+/// own minimum sits at `12` where the scene edge has already run to +41.51%. `3` measures
+/// identically to `2` on every frame and is not preferred to it.
+///
+/// What did move is how much the value now buys. At the old interval the worst frame reached
+/// +9.32% un-shrunk; at `8` it reaches +78.70%, because seven trials in eight rather than one in
+/// two are reading the remembered ratio back. The shrinkage is doing several times more work than
+/// it was when it was derived, so the same value is held to a much larger penalty - it takes the
+/// scene edge from +78.70% to +0.11% at 192x160 and from +55.52% to +0.10% at 128x96, and
 /// `the_type_gain_sampling_interval_holds_on_content_it_was_not_tuned_on` asserts both sizes.
 ///
-/// The correction exists to be cheap and stays so. The shrinkage is one multiply and one divide
-/// on the trials that did not probe, and because a smaller correction stops promoting small
-/// transform sizes it evaluates 151,019 transform-type candidates against the un-shrunk 155,392,
-/// 2.8% *fewer*, against the exhaustive search's 700,004. Fewer candidates but slightly more
-/// time: from the minimum of five interleaved rounds per arm in `measure_type_gain_trust_cost`
-/// over the six frames at six quantizers, 0.686 s against 0.677 s un-shrunk, +1.3%. The
-/// candidates it stops evaluating are the cheapest ones - a 4x4 or 8x8 transform of a block it
-/// now codes whole - so removing them does not pay for the larger transforms it codes instead.
+/// The correction exists to be cheap and stays so, and at this interval it no longer costs time
+/// to shrink it. The shrinkage is one multiply and one divide on the trials that did not probe,
+/// and because a smaller correction stops promoting small transform sizes it evaluates 174,638
+/// transform-type candidates against the un-shrunk 181,380, 3.7% *fewer* - up from the 2.8% it
+/// saved at the old interval - against the exhaustive search's 920,503. From the minimum of five
+/// interleaved rounds per arm in `measure_type_gain_trust_cost`, over three whole runs of it,
+/// 0.5605 s against 0.5615 s un-shrunk: the +1.3% the shrinkage used to cost is gone, the extra
+/// candidates now paying for themselves, though at 0.2% the two arms are really only
+/// indistinguishable. The candidates it stops evaluating are still the cheapest ones - a 4x4 or
+/// 8x8 transform of a block it now codes whole - so it is not that removing them got cheaper but
+/// that there are half again as many of them to remove.
+///
+/// ## Why the sampled estimator beats the unsampled one
+///
+/// [`TYPE_GAIN_SAMPLE_INTERVAL`]'s table records a *negative* mean cost against the exhaustive
+/// search at every interval past `1`, which reads like the sampling improving on the thing it
+/// approximates. It is not the sampling. A trial that probes is corrected in full by its own
+/// measurement - [`FrameEncoder::corrected_trial_cost`] only applies the shrinkage on the
+/// remembered branch - so the interval-1 arm is the *un-shrunk* correction expressed on every
+/// trial, and it is the only trust that arm can express. `measure_type_gain_trust` prints the
+/// mean against the exhaustive search alongside the penalty, and it moves with the trust rather
+/// than with the sampling:
+///
+/// | arm                    | 128x96 | 192x160 |
+/// |:-----------------------|-------:|--------:|
+/// | unsampled (interval 1) | +0.10% | +0.19%  |
+/// | interval 8, trust 16   | +1.69% | +1.67%  |
+/// | interval 8, trust 8    | -0.14% | +0.59%  |
+/// | interval 8, trust 2    | -0.42% | -0.41%  |
+/// | interval 8, trust 0    | -0.46% | -0.44%  |
+///
+/// So the unsampled estimator is *worse* than the exhaustive search, by about the same margin at
+/// both sizes, and the sampled one is better only once the remembered correction is shrunk: at
+/// `16` it is worse than the unsampled arm again. The exhaustive search is an upper bound on what
+/// the *search* can find, but the correction is a bias added on top of a DCT-only ranking, and an
+/// over-large bias moves the ranking away from what the exhaustive search would have chosen. The
+/// unsampled estimator therefore is not an upper bound on quality and was never a strict one; the
+/// negative mean is the measurement saying this constant is on the right side of it. That the
+/// mean is nearly flat from `0` to `2` while the per-frame worst case is not is why the value is
+/// chosen on the per-frame column: what the last two sixteenths buy is `smooth`, not the mean.
 pub(super) const TYPE_GAIN_TRUST: i64 = 2;
 
 /// [`TYPE_GAIN_TRUST`] denominator: the un-shrunk correction.
