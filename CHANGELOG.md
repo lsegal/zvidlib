@@ -23,10 +23,11 @@ All notable changes to zvidlib will be documented in this file.
   the coefficients hidden from the optimizer, which is the kernel-against-kernel
   comparison: across four `ubuntu-latest` draws and a `macos-15-intel` one the
   vector kernels' absolute times are identical between the two arms, and only
-  the scalar baseline moves - by 2.4-2.7x on Zen 3, Zen 4 and an Intel Xeon
-  6973P-C, and not at all on Coffee Lake, whose single shuffle port retires the
-  folded loop's shuffle traffic either way. On the Intel `avx512f` host the
-  SSE4.1 buffer arm reads 0.87x folded and 2.36x opaque. No call shape
+  the scalar baseline moves - by 2.4-2.8x on Zen 3, Zen 4, the 8573C itself and
+  a Xeon 6973P-C, and not at all on Coffee Lake, whose single shuffle port
+  retires the folded loop's shuffle traffic either way. A fresh draw of the
+  8573C reproduces #301's number exactly, 0.85x on the folded arm, and reads
+  2.33-2.36x on the opaque one. No call shape
   §8.5.3.3.3 issues can reach the folded form, so the SSE4.1 dispatch is
   unchanged and the `hevc::engine::simd` table now carries both arms with the
   cause written down. Re-measurement also moved one recorded number: the Coffee
