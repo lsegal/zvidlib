@@ -86,8 +86,18 @@ pub enum Stage {
     MotionDerive = 10,
     /// §8.7.2 in-loop deblocking.
     Deblock = 6,
-    /// §8.7.3 sample adaptive offset.
+    /// §8.7.3 sample adaptive offset, *excluding* the two sub-stages below:
+    /// the §7.4.9.3 `SaoOffsetVal` resolution over the CTB grid and the
+    /// §8.7.3.1 boundary-constraint grids built for it. Reached by no vector
+    /// kernel.
     Sao = 7,
+    /// The §8.7.3.1 `saoPicture = recPicture` snapshot the CTB loop classifies
+    /// against — a whole-picture copy, per picture. Inside SAO, reached by no
+    /// vector kernel.
+    SaoSnapshot = 13,
+    /// §8.7.3.2 the per-CTB modification process itself — the band and edge
+    /// classifiers the `engine::simd::in_loop` kernels are.
+    SaoFilter = 14,
     /// §8.3 reference marking, DPB insertion and reorder/output handling.
     DpbOutput = 8,
     /// Decoded-picture to RGBA conversion on the way out of the decoder.
@@ -95,7 +105,7 @@ pub enum Stage {
 }
 
 /// Number of [`Stage`] variants — the width of every accumulator array here.
-pub const STAGE_COUNT: usize = 13;
+pub const STAGE_COUNT: usize = 15;
 
 /// Every [`Stage`], in declaration order, for reporting.
 pub const STAGES: [Stage; STAGE_COUNT] = [
@@ -110,6 +120,8 @@ pub const STAGES: [Stage; STAGE_COUNT] = [
     Stage::MotionDerive,
     Stage::Deblock,
     Stage::Sao,
+    Stage::SaoSnapshot,
+    Stage::SaoFilter,
     Stage::DpbOutput,
     Stage::ColorConvert,
 ];
@@ -129,7 +141,9 @@ impl Stage {
             Stage::InterPredWrite => "inter_pred_write",
             Stage::MotionDerive => "motion_derive",
             Stage::Deblock => "deblock",
-            Stage::Sao => "sao",
+            Stage::Sao => "sao_setup",
+            Stage::SaoSnapshot => "sao_snapshot",
+            Stage::SaoFilter => "sao_filter",
             Stage::DpbOutput => "dpb_output",
             Stage::ColorConvert => "color_convert",
         }
@@ -155,7 +169,7 @@ impl Stage {
                 | Stage::IntraPred
                 | Stage::InterPredFilter
                 | Stage::Deblock
-                | Stage::Sao
+                | Stage::SaoFilter
                 | Stage::ColorConvert
         )
     }
@@ -565,7 +579,7 @@ mod tests {
             spin(Duration::from_millis(30));
         }
         {
-            let _vector = scope(Stage::Sao);
+            let _vector = scope(Stage::SaoFilter);
             spin(Duration::from_millis(10));
         }
         let report = finish().expect("profile was started");
@@ -581,7 +595,8 @@ mod tests {
         assert!(report.speedup_at(2.0) < report.max_whole_frame_speedup());
         assert!((report.speedup_at(1.0) - 1.0).abs() < 1e-9);
         assert!(!Stage::Residual.is_vectorized());
-        assert!(Stage::Sao.is_vectorized());
+        assert!(Stage::SaoFilter.is_vectorized());
+        assert!(!Stage::Sao.is_vectorized());
         assert!(Stage::ColorConvert.is_vectorized());
     }
 }
