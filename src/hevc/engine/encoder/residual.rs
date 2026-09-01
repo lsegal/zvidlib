@@ -100,13 +100,6 @@ impl ResidualBinSink for EngineResidualBinSink<'_, '_, '_> {
     fn bypass(&mut self, bin: u8) {
         self.cabac.encode_bypass(self.writer, bin);
     }
-
-    /// The run-at-a-time §9.3.5.5 step, rather than the default
-    /// bin-at-a-time loop: 62% of this writer's bins are bypass bins and
-    /// they arrive in the contiguous runs the callers below batch.
-    fn bypass_bits(&mut self, value: u32, n: u8) {
-        self.cabac.encode_bypass_run(self.writer, value, n);
-    }
 }
 
 /// The caller-derived inputs to one `residual_coding( )` invocation the writer
@@ -351,19 +344,11 @@ pub(crate) fn write_residual_coding<S: ResidualBinSink>(
         }
 
         // coeff_sign_flag pass (bypass): one per significant position, since
-        // sign data hiding is off in every stream this writer emits. The
-        // whole pass is one contiguous bypass run — up to 16 bins — so it
-        // is packed MSB-first and coded in a single step.
-        let mut signs: u32 = 0;
-        let mut num_signs: u8 = 0;
+        // sign data hiding is off in every stream this writer emits.
         for n in (0..16).rev() {
             if sig[n] == 1 {
-                signs = (signs << 1) | u32::from(level_at(n) < 0);
-                num_signs += 1;
+                sink.bypass(u8::from(level_at(n) < 0));
             }
-        }
-        if num_signs > 0 {
-            sink.bypass_bits(signs, num_signs);
         }
 
         // Level pass: coeff_abs_level_remaining with the §9.3.3.11 eq.-9-24
@@ -458,43 +443,34 @@ fn write_coeff_abs_level_remaining<S: ResidualBinSink>(
     let c_max = coeff_abs_level_remaining_c_max_eq_9_26(c_rice_param);
     if value < c_max {
         // §9.3.3.2 TR: a unary prefix of `value >> cRiceParam` ones, the
-        // terminating zero, then the `cRiceParam`-bit remainder. The zero
-        // and the remainder are one contiguous run whose leading bin is
-        // the zero, so they go out in a single step.
+        // terminating zero, then the `cRiceParam`-bit remainder.
         let prefix_len = value >> c_rice_param;
         debug_assert!(prefix_len < COEFF_ABS_LEVEL_REMAINING_TR_PREFIX_ESCAPE_LEN);
-        write_bypass_ones(sink, prefix_len);
-        sink.bypass_bits(value & ((1 << c_rice_param) - 1), c_rice_param as u8 + 1);
+        for _ in 0..prefix_len {
+            sink.bypass(1);
+        }
+        sink.bypass(0);
+        if c_rice_param > 0 {
+            sink.bypass_bits(value & ((1 << c_rice_param) - 1), c_rice_param as u8);
+        }
         return;
     }
-    // Escape: the all-ones TR prefix, then §9.3.3.3 EGk. The two unary
-    // prefixes are adjacent, so they are one run of ones.
+    // Escape: the all-ones TR prefix, then §9.3.3.3 EGk.
+    for _ in 0..COEFF_ABS_LEVEL_REMAINING_TR_PREFIX_ESCAPE_LEN {
+        sink.bypass(1);
+    }
     let k = c_rice_param + 1;
     let rest = u64::from(value - c_max);
     let mut prefix_ones: u32 = 0;
     while rest >= (((1u64 << (prefix_ones + 1)) - 1) << k) {
         prefix_ones += 1;
     }
-    write_bypass_ones(
-        sink,
-        COEFF_ABS_LEVEL_REMAINING_TR_PREFIX_ESCAPE_LEN + prefix_ones,
-    );
+    for _ in 0..prefix_ones {
+        sink.bypass(1);
+    }
+    sink.bypass(0);
     let suffix = rest - (((1u64 << prefix_ones) - 1) << k);
-    // The terminating zero of the EGk prefix leads the suffix run.
-    sink.bypass_bits(suffix as u32, (prefix_ones + k) as u8 + 1);
-}
-
-/// `count` bypass bins equal to 1, in as few runs as a `u32`-wide field
-/// allows. Unary prefixes are the writer's other contiguous bypass runs.
-fn write_bypass_ones<S: ResidualBinSink>(sink: &mut S, count: u32) {
-    let mut left = count;
-    while left >= 32 {
-        sink.bypass_bits(u32::MAX, 32);
-        left -= 32;
-    }
-    if left > 0 {
-        sink.bypass_bits(u32::MAX >> (32 - left), left as u8);
-    }
+    sink.bypass_bits(suffix as u32, (prefix_ones + k) as u8);
 }
 
 #[cfg(test)]
@@ -606,111 +582,6 @@ mod tests {
         for scan in [ScanIdx::Horizontal, ScanIdx::Vertical] {
             roundtrip(2, false, scan, &levels(2));
             roundtrip(3, true, scan, &levels(3));
-        }
-    }
-
-    /// The pre-#246 sink: every bypass bin through
-    /// [`CabacEncoder::encode_bypass`], one at a time, via the trait's
-    /// default `bypass_bits`. The reference the run-at-a-time writer must
-    /// be byte-identical to.
-    struct BinAtATimeBinSink<'w, 'e, 'c> {
-        writer: &'w mut BitWriter,
-        cabac: &'e mut CabacEncoder,
-        contexts: &'c mut ResidualContexts,
-    }
-
-    impl ResidualBinSink for BinAtATimeBinSink<'_, '_, '_> {
-        fn decision(&mut self, element: ResidualElement, ctx_inc: u32, bin: u8) {
-            EngineResidualBinSink {
-                writer: self.writer,
-                cabac: self.cabac,
-                contexts: self.contexts,
-            }
-            .decision(element, ctx_inc, bin);
-        }
-
-        fn bypass(&mut self, bin: u8) {
-            self.cabac.encode_bypass(self.writer, bin);
-        }
-    }
-
-    /// The writer's bytes and its final engine and context state, coded
-    /// with the shipped sink and with the bin-at-a-time reference.
-    fn write_both_ways(
-        log2: u32,
-        is_chroma: bool,
-        scan_idx: ScanIdx,
-        qp: i32,
-        levels: &[i32],
-    ) -> ((Vec<u8>, ResidualContexts), (Vec<u8>, ResidualContexts)) {
-        let params = ResidualWriteParams {
-            log2_trafo_size: log2,
-            is_chroma,
-            scan_idx,
-        };
-        let run = {
-            let mut writer = BitWriter::new();
-            let mut cabac = CabacEncoder::new();
-            let mut ctx = ResidualContexts::init(0, qp);
-            write_residual_coding(
-                &mut EngineResidualBinSink {
-                    writer: &mut writer,
-                    cabac: &mut cabac,
-                    contexts: &mut ctx,
-                },
-                &params,
-                levels,
-            );
-            cabac.encode_terminate(&mut writer, 1);
-            writer.align_zero();
-            (writer.finish(), ctx)
-        };
-        let bin = {
-            let mut writer = BitWriter::new();
-            let mut cabac = CabacEncoder::new();
-            let mut ctx = ResidualContexts::init(0, qp);
-            write_residual_coding(
-                &mut BinAtATimeBinSink {
-                    writer: &mut writer,
-                    cabac: &mut cabac,
-                    contexts: &mut ctx,
-                },
-                &params,
-                levels,
-            );
-            cabac.encode_terminate(&mut writer, 1);
-            writer.align_zero();
-            (writer.finish(), ctx)
-        };
-        (run, bin)
-    }
-
-    /// #246: coding the bypass runs a run at a time must not move a single
-    /// bit of the lossy residual writer's output, at any QP.
-    #[test]
-    fn bypass_runs_are_byte_identical_to_bin_at_a_time() {
-        let size4 = 1usize << 4;
-        let dense: Vec<i32> = (0..size4 * size4)
-            .map(|i| {
-                let magnitude = 1 + (i as i32 * 37) % 400;
-                if i % 3 == 0 { -magnitude } else { magnitude }
-            })
-            .collect();
-        for qp in [0, 12, 26, 37, 51] {
-            for log2 in 2..=5u32 {
-                for is_chroma in [false, true] {
-                    for scan in [ScanIdx::Diagonal, ScanIdx::Horizontal, ScanIdx::Vertical] {
-                        let (run, bin) = write_both_ways(log2, is_chroma, scan, qp, &levels(log2));
-                        assert_eq!(run.0, bin.0, "bytes: qp {qp} log2 {log2} chroma {is_chroma}");
-                        assert_eq!(run.1, bin.1, "contexts: qp {qp} log2 {log2}");
-                    }
-                }
-            }
-            // The dense block drives the long escape suffixes and the
-            // full 16-bin `coeff_sign_flag` runs.
-            let (run, bin) = write_both_ways(4, false, ScanIdx::Diagonal, qp, &dense);
-            assert_eq!(run.0, bin.0, "dense bytes: qp {qp}");
-            assert_eq!(run.1, bin.1, "dense contexts: qp {qp}");
         }
     }
 

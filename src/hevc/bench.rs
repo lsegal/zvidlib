@@ -159,9 +159,14 @@ pub fn cabac_encode_bins(bins: &[u8], contexts: usize) -> Vec<u8> {
 /// contiguous `n`-bin bypass field of the kind `coeff_sign_flag`, the
 /// Golomb-Rice suffix of `coeff_abs_level_remaining` and the
 /// `last_sig_coeff_*` suffixes emit, coded through
-/// [`CabacEncoder::encode_bypass_run`]. The returned bytes are the
+/// [`CabacEncoder::encode_bypass_bits`]. The returned bytes are the
 /// arithmetic codeword, so the bit writer the runs go through is measured
 /// with them.
+///
+/// See `benches/README.md`'s "Why the CABAC arithmetic encoder stays serial"
+/// for what this group was added to settle: the §9.3.5.5 step unrolled over a
+/// whole run is an exact identity, but it is not a speedup with the present
+/// `put_bit`-at-a-time sink.
 ///
 /// # Panics
 ///
@@ -172,7 +177,7 @@ pub fn cabac_encode_bypass_runs(runs: &[(u32, u8)]) -> Vec<u8> {
     let mut cabac = CabacEncoder::new();
     for &(value, n) in runs {
         assert!(n <= 32, "a bypass run is at most one u32 wide");
-        cabac.encode_bypass_run(&mut writer, value, n);
+        cabac.encode_bypass_bits(&mut writer, value, n);
     }
     cabac.encode_terminate(&mut writer, 1);
     writer.finish()
