@@ -495,7 +495,98 @@ threshold anything is checked against — the CI job compares each `main` run
 against the previous one, not against this table. A number without a stated CPU
 is not comparable to anything, so the host is part of every row.
 
-@@BASELINE_TABLE@@
+The table is generated, not hand-typed: `criterion_baseline.py table` renders it
+from the same baseline JSON the CI job collects, so refreshing it is a
+measurement rather than an edit.
+
+```sh
+for round in 1 2 3; do
+  for target in codec av1_decode av1_encode hevc_decode hevc_encode; do
+    cargo bench --features native --bench "$target"
+  done
+  python3 .github/scripts/criterion_baseline.py collect \
+    --criterion-dir target/criterion --out "baseline-$round.json"
+done
+python3 .github/scripts/criterion_baseline.py table \
+  --baseline baseline-*.json --host 'Apple M1 (macOS 15, aarch64)'
+```
+
+Three rounds and not one, because `table` takes the elementwise **minimum**
+across the baselines it is given. Contention only ever makes a measurement
+slower, so the fastest observation of an arm is the closest any round got to an
+uncontended one; averaging would fold every neighbour process into the number
+instead.
+
+Only the groups `bench_across_isas` builds appear, because they are the only
+ones where "scalar vs each ISA" is a question — the rest of the suite is a single
+arm with nothing to compare against.
+
+Measured on **Apple M1 (macOS 15, aarch64)**.
+
+| Group | `scalar` | `neon` | Best |
+| --- | ---: | ---: | ---: |
+| `av1_cdef` | 78.006 ms | 55.751 ms (1.40x) | 1.40x `neon` |
+| `av1_deblock` | 22.246 ms | 3.235 ms (6.88x) | 6.88x `neon` |
+| `av1_deblock_boundary` | 279.170 µs | 76.742 µs (3.64x) | 3.64x `neon` |
+| `av1_deblock_chroma` | 10.867 ms | 4.396 ms (2.47x) | 2.47x `neon` |
+| `av1_deblock_wide` | 109.926 ms | 29.844 ms (3.68x) | 3.68x `neon` |
+| `av1_decode_frame` | 73.244 ms | 71.782 ms (1.02x) | 1.02x `neon` |
+| `av1_entropy_symbol` | 3.572 ms | 4.144 ms (0.86x) | 0.86x `neon` |
+| `av1_forward_adst_8x8` | 30.877 ms | 7.418 ms (4.16x) | 4.16x `neon` |
+| `av1_forward_dct_16x16` | 32.129 ms | 11.688 ms (2.75x) | 2.75x `neon` |
+| `av1_forward_dct_32x32` | 51.060 ms | 65.708 ms (0.78x) | 0.78x `neon` |
+| `av1_forward_dct_4x4` | 36.620 ms | 6.350 ms (5.77x) | 5.77x `neon` |
+| `av1_forward_dct_8x8` | 28.571 ms | 6.809 ms (4.20x) | 4.20x `neon` |
+| `av1_forward_flipadst_16x16` | 32.671 ms | 10.035 ms (3.26x) | 3.26x `neon` |
+| `av1_intra_directional` | 36.220 ms | 32.079 ms (1.13x) | 1.13x `neon` |
+| `av1_intra_paeth` | 3.207 ms | 4.130 ms (0.78x) | 0.78x `neon` |
+| `av1_intra_smooth` | 4.240 ms | 4.241 ms (1.00x) | 1.00x `neon` |
+| `av1_inverse_adst_8x8` | 42.668 ms | 18.330 ms (2.33x) | 2.33x `neon` |
+| `av1_inverse_dct_16x16` | 18.777 ms | 9.011 ms (2.08x) | 2.08x `neon` |
+| `av1_inverse_dct_32x32` | 14.976 ms | 10.236 ms (1.46x) | 1.46x `neon` |
+| `av1_inverse_dct_4x4` | 57.421 ms | 20.382 ms (2.82x) | 2.82x `neon` |
+| `av1_inverse_dct_64x64` | 22.831 ms | 11.588 ms (1.97x) | 1.97x `neon` |
+| `av1_inverse_dct_8x8` | 28.992 ms | 12.296 ms (2.36x) | 2.36x `neon` |
+| `av1_inverse_flipadst_16x16` | 27.388 ms | 13.001 ms (2.11x) | 2.11x `neon` |
+| `av1_mc_blend_mask` | 37.193 ms | 11.426 ms (3.26x) | 3.26x `neon` |
+| `av1_mc_compound_average` | 31.513 ms | 15.393 ms (2.05x) | 2.05x `neon` |
+| `av1_mc_single` | 23.414 ms | 7.569 ms (3.09x) | 3.09x `neon` |
+| `av1_motion_compensation` | 12.388 ms | 7.821 ms (1.58x) | 1.58x `neon` |
+| `av1_self_guided` | 12.093 ms | 4.684 ms (2.58x) | 2.58x `neon` |
+| `av1_wiener` | 15.983 ms | 8.544 ms (1.87x) | 1.87x `neon` |
+| `hevc_cabac` | 1.941 ms | 1.952 ms (0.99x) | 0.99x `neon` |
+| `hevc_deblock` | 15.234 ms | 15.467 ms (0.98x) | 0.98x `neon` |
+| `hevc_encode_640x352` | 91.716 ms | 51.913 ms (1.77x) | 1.77x `neon` |
+| `hevc_encode_640x352_fwd_transform_quant` | 11.426 ms | 7.102 ms (1.61x) | 1.61x `neon` |
+| `hevc_encode_640x352_pcm_write` | 7.319 ms | 7.338 ms (1.00x) | 1.00x `neon` |
+| `hevc_encode_640x352_rdo_inter` | 62.488 ms | 23.460 ms (2.66x) | 2.66x `neon` |
+| `hevc_encode_640x352_rdo_intra` | 3.201 ms | 1.391 ms (2.30x) | 2.30x `neon` |
+| `hevc_encode_640x352_reconstruct` | 9.525 ms | 9.476 ms (1.01x) | 1.01x `neon` |
+| `hevc_encode_640x352_residual_write` | 23.391 ms | 21.498 ms (1.09x) | 1.09x `neon` |
+| `hevc_encode_640x352_rgba_to_yuv420` | 620.339 µs | 609.074 µs (1.02x) | 1.02x `neon` |
+| `hevc_encode_bitwriter` | 3.102 ms | 3.110 ms (1.00x) | 1.00x `neon` |
+| `hevc_encode_cabac` | 1.543 ms | 1.550 ms (1.00x) | 1.00x `neon` |
+| `hevc_inter_pred` | 29.685 ms | 18.150 ms (1.64x) | 1.64x `neon` |
+| `hevc_intra_pred` | 7.925 ms | 12.796 ms (0.62x) | 0.62x `neon` |
+| `hevc_inverse_transform` | 7.073 ms | 7.000 ms (1.01x) | 1.01x `neon` |
+| `hevc_sao` | 26.753 ms | 20.132 ms (1.33x) | 1.33x `neon` |
+
+The rows below `1.00x` are the point of committing this. `av1_entropy_symbol`
+(0.86x) is expected: the range decoder is serial and has no vector path, so its
+arms differ only by measurement noise. `hevc_cabac`, `hevc_deblock`,
+`hevc_inverse_transform`, `hevc_encode_bitwriter`, `hevc_encode_cabac`,
+`hevc_encode_640x352_pcm_write`, `hevc_encode_640x352_reconstruct` and
+`hevc_encode_640x352_rgba_to_yuv420` sitting at parity is the
+same story this file tells above: LLVM auto-vectorizes the scalar reference well
+under `lto = "fat"`, and `#228` tracks re-measuring the inverse transform on
+x86_64 where the tile shape differs. `hevc_intra_pred` (0.62x),
+`av1_intra_paeth` (0.78x) and `av1_forward_dct_32x32` (0.78x) are not explained
+by either and are genuinely slower under NEON than scalar on this host; they are
+tracked as their own tickets.
+
+An arm being absent from a row means the host could not execute it, not that it
+was not measured: an Apple Silicon host has no `sse41` or `avx2` column at all,
+which is why the x86_64 arms do not appear here yet.
 
 ## Fixtures
 
