@@ -1999,6 +1999,149 @@ mod tests {
     /// on the scalar reference and on every SIMD backend the host CPU
     /// offers.
     ///
+    /// Times the two-dimensional 8-tap luma path's horizontal and
+    /// vertical passes separately, per block size and per backend.
+    ///
+    /// Issue #280 inferred from the shape of its block-size sweep that
+    /// the `w x ( h + 7 )` intermediate the two-dimensional path
+    /// materializes is what erodes the kernel's advantage at 32x32 and
+    /// 64x64. This measures the two passes apart instead of inferring
+    /// it, alongside the one-dimensional phases that have no
+    /// intermediate at all, so the mechanism is read off the numbers.
+    ///
+    /// Ignored by default because it is a timing measurement, not an
+    /// assertion. Run it with
+    /// `cargo test --release --features native --lib
+    /// measure_interp_pass_split -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "benchmark; run with --ignored --nocapture"]
+    fn measure_interp_pass_split() {
+        use std::time::Instant;
+
+        const N: usize = 8;
+        let (pw, ph) = (1920usize, 1088usize);
+        let plane_samples = pseudo_random(7, pw * ph, 255);
+        let plane = RefPlane::new(&plane_samples, pw, ph).unwrap();
+        let isas = simd::available_isas();
+        let rounds = 5;
+        let shift1 = interp_shift1(8);
+        let halo = N as i32 / 2 - 1;
+        let hk = &LUMA_FILTER[2];
+        let vk = &LUMA_FILTER[3];
+
+        println!("\n2D 8-tap luma pass split, best of {rounds} interleaved rounds");
+        println!(
+            "  size      isa    horiz-pass   vert-pass    2D total   H-only   V-only  full-pel"
+        );
+        for &size in &[8usize, 16, 32, 64] {
+            // One 1080p frame's worth of `size` x `size` luma blocks, so
+            // every row of the table does the same sample count.
+            let cols = pw / size;
+            let rows_of_blocks = ph / size;
+            let blocks: Vec<(i32, i32)> = (0..rows_of_blocks)
+                .flat_map(|by| (0..cols).map(move |bx| ((bx * size) as i32, (by * size) as i32)))
+                .collect();
+            let (w, h) = (size, size);
+            let span = w + N - 1;
+            let src_rows = h + N - 1;
+            let mut best = vec![[f64::INFINITY; 6]; isas.len()];
+            let mut sink = 0i64;
+            for _ in 0..rounds {
+                for (i, &isa) in isas.iter().enumerate() {
+                    // Horizontal pass alone: the `h + 7` filtered rows the
+                    // vertical pass consumes, written to a fresh buffer.
+                    let mut horizontal = vec![0i32; w * src_rows];
+                    let mut scratch = vec![0i32; span];
+                    let start = Instant::now();
+                    for &(x, y) in &blocks {
+                        for row in 0..src_rows {
+                            let src = plane.row_window(
+                                x - halo,
+                                span,
+                                y - halo + row as i32,
+                                &mut scratch,
+                            );
+                            let taps: [&[i32]; N] = std::array::from_fn(|t| &src[t..t + w]);
+                            simd::filter_taps(
+                                isa,
+                                &taps,
+                                hk,
+                                shift1,
+                                &mut horizontal[row * w..(row + 1) * w],
+                            );
+                        }
+                        sink += horizontal[0] as i64;
+                    }
+                    let horiz = start.elapsed().as_secs_f64();
+
+                    // Vertical pass alone: the same intermediate, already
+                    // populated, filtered down the columns into `out`.
+                    let mut out = vec![0i32; w * h];
+                    let start = Instant::now();
+                    for _ in &blocks {
+                        for y in 0..h {
+                            let taps: [&[i32]; N] = std::array::from_fn(|t| {
+                                &horizontal[(y + t) * w..(y + t + 1) * w]
+                            });
+                            simd::filter_taps(isa, &taps, vk, 6, &mut out[y * w..(y + 1) * w]);
+                        }
+                        sink += out[0] as i64;
+                    }
+                    let vert = start.elapsed().as_secs_f64();
+
+                    let start = Instant::now();
+                    for &(x, y) in &blocks {
+                        let b = interp_luma_block_with(isa, &plane, x, y, 2, 3, w, h, 8).unwrap();
+                        sink += b[0] as i64;
+                    }
+                    let both = start.elapsed().as_secs_f64();
+
+                    let start = Instant::now();
+                    for &(x, y) in &blocks {
+                        let b = interp_luma_block_with(isa, &plane, x, y, 2, 0, w, h, 8).unwrap();
+                        sink += b[0] as i64;
+                    }
+                    let h_only = start.elapsed().as_secs_f64();
+
+                    let start = Instant::now();
+                    for &(x, y) in &blocks {
+                        let b = interp_luma_block_with(isa, &plane, x, y, 0, 3, w, h, 8).unwrap();
+                        sink += b[0] as i64;
+                    }
+                    let v_only = start.elapsed().as_secs_f64();
+
+                    let start = Instant::now();
+                    for &(x, y) in &blocks {
+                        let b = interp_luma_block_with(isa, &plane, x, y, 0, 0, w, h, 8).unwrap();
+                        sink += b[0] as i64;
+                    }
+                    let full_pel = start.elapsed().as_secs_f64();
+
+                    for (slot, t) in best[i]
+                        .iter_mut()
+                        .zip([horiz, vert, both, h_only, v_only, full_pel])
+                    {
+                        *slot = slot.min(t);
+                    }
+                }
+            }
+            let base = best[0];
+            for (isa, times) in isas.iter().zip(best.iter().copied()) {
+                let cells: String = times
+                    .iter()
+                    .zip(base.iter())
+                    .map(|(t, b)| format!("{:7.2} ({:4.2}x)", t * 1e3, b / t))
+                    .collect::<Vec<_>>()
+                    .join("  ");
+                println!(
+                    "  {size:>4}  {:>7}  {cells}{}",
+                    format!("{isa:?}"),
+                    if sink == i64::MIN { "!" } else { "" },
+                );
+            }
+        }
+    }
+
     /// Ignored by default because it is a timing measurement, not an
     /// assertion. Run it with
     /// `cargo test --release --features native --lib
