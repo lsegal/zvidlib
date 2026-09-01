@@ -39,7 +39,10 @@
 //! with no separate transpose step.
 
 use super::vector::{I32x, Transpose4};
-use crate::av1_intra::Tx1d;
+use crate::av1_encoder::transform::{
+    FADST4, FADST8, FADST16, FDCT4, FDCT8, FDCT16, FDCT32, staged_limit as forward_staged_limit,
+};
+use crate::av1_intra::{Tx1d, identity_scale};
 
 /// Largest input magnitude for which the `i32` Walsh-Hadamard butterflies
 /// cannot overflow. The transform grows a value by at most a factor of 4 per
@@ -1285,6 +1288,7 @@ macro_rules! separable_pass {
             let transformed = match $kind {
                 Tx1d::Dct => $dct(lanes),
                 Tx1d::Adst => $adst(lanes),
+                Tx1d::Identity => identity_pass::<V, $n>(lanes),
             };
             // `transformed[k]` lane j is element k of row `4 * group + j`,
             // which is exactly column `4 * group + j` of output row k.
@@ -1293,6 +1297,23 @@ macro_rules! separable_pass {
             }
         }
     }};
+}
+
+/// Vector form of the identity 1-D pass both `av1_intra::inverse_transform_1d`
+/// and `av1_encoder::transform::forward_1d` apply for a half-identity type:
+/// every element scaled by `av1_intra::identity_scale` at its size, in the
+/// same 14-bit fixed point the butterflies use, and in the same
+/// split-accumulator form so a wide input cannot overflow a lane.
+#[inline(always)]
+unsafe fn identity_pass<V: I32x, const N: usize>(input: [V; N]) -> [V; N] {
+    unsafe {
+        let scale = identity_scale(N) as i32;
+        let mut output = [V::zero(); N];
+        for (slot, value) in output.iter_mut().zip(input) {
+            *slot = dot_rs14([(value, scale)]);
+        }
+        output
+    }
 }
 
 /// Defines the `N x N` inverse transform driver for one block size.
@@ -1360,3 +1381,123 @@ inverse_transform_driver!(inverse_transform8, 8, 5, dct8, adst8);
 inverse_transform_driver!(inverse_transform16, 16, 6, dct16, adst16);
 inverse_transform_driver!(inverse_transform32, 32, 6, dct32, dct32);
 inverse_transform_driver!(inverse_transform64, 64, 6, dct64, dct64);
+
+// ---------------------------------------------------------------------
+// Forward transforms (issue #140)
+// ---------------------------------------------------------------------
+
+/// Bit-exact vector form of one row of `av1_encoder::transform::forward_1d`:
+/// `dct_round_shift(sum_n basis[n] * input[n])`.
+///
+/// Same split-around-bit-14 accumulator as [`dot_rs14`], but a forward basis
+/// row has up to 32 terms rather than the butterflies' seven, which would
+/// overflow the low half. Folding the low accumulator's completed high bits
+/// into `high` every four terms is exact - `x == (x >> 14) * 2^14 + (x &
+/// 0x3fff)` holds for negative `x` too - and keeps the low half under `2^30`.
+#[inline(always)]
+unsafe fn basis_row_rs14<V: I32x, const N: usize>(input: &[V; N], basis: &[i32]) -> V {
+    unsafe {
+        let mask = V::splat(0x3fff);
+        let mut high = V::zero();
+        let mut low = V::zero();
+        for (index, (&value, &coefficient)) in input.iter().zip(basis.iter()).enumerate() {
+            let scale = V::splat(coefficient);
+            high = high.add(value.sra::<14>().mul(scale));
+            low = low.add(value.and(mask).mul(scale));
+            if index % 4 == 3 {
+                high = high.add(low.sra::<14>());
+                low = low.and(mask);
+            }
+        }
+        high.add(round_shift14(low))
+    }
+}
+
+/// Defines the vector form of one forward 1-D kernel from its basis table.
+macro_rules! forward_kernel {
+    ($name:ident, $n:literal, $basis:ident) => {
+        /// Vector form of the matching `av1_encoder::transform` forward pass.
+        #[inline(always)]
+        unsafe fn $name<V: I32x>(input: [V; $n]) -> [V; $n] {
+            unsafe {
+                let mut output = [V::zero(); $n];
+                for (k, slot) in output.iter_mut().enumerate() {
+                    *slot = basis_row_rs14(&input, &$basis[k * $n..(k + 1) * $n]);
+                }
+                output
+            }
+        }
+    };
+}
+
+forward_kernel!(fdct4, 4, FDCT4);
+forward_kernel!(fdct8, 8, FDCT8);
+forward_kernel!(fdct16, 16, FDCT16);
+forward_kernel!(fdct32, 32, FDCT32);
+forward_kernel!(fadst4, 4, FADST4);
+forward_kernel!(fadst8, 8, FADST8);
+forward_kernel!(fadst16, 16, FADST16);
+
+/// Defines the `N x N` forward transform driver for one block size.
+///
+/// `$pre` and `$mid` are that size's input left shift and inter-pass rounding
+/// right shift (see `av1_encoder::transform`); `$adst` is the DCT kernel again
+/// at 32 points, where AV1 defines no ADST and the dispatcher has already
+/// normalized the request.
+macro_rules! forward_transform_driver {
+    ($name:ident, $n:literal, $pre:literal, $mid:literal, $dct:ident, $adst:ident) => {
+        /// Bit-exact vector form of `av1_encoder::transform::forward_transform`
+        /// for one
+        #[doc = concat!(stringify!($n), "x", stringify!($n), " block.")]
+        ///
+        /// # Safety
+        /// The caller must have verified `V`'s instruction set is available
+        /// and that `residual` is within `input_limit`.
+        pub(crate) unsafe fn $name<V: I32x + Transpose4>(
+            residual: &[i32],
+            column: Tx1d,
+            row: Tx1d,
+            lr_flip: bool,
+            ud_flip: bool,
+            out: &mut [i32],
+        ) -> bool {
+            unsafe {
+                // `FLIPADST` reverses the inverse transform's output along an
+                // axis, so the forward transform reverses its input instead.
+                let mut source = [0i32; $n * $n];
+                for target_row in 0..$n {
+                    let source_row = if ud_flip {
+                        $n - 1 - target_row
+                    } else {
+                        target_row
+                    };
+                    for target_column in 0..$n {
+                        let source_column = if lr_flip {
+                            $n - 1 - target_column
+                        } else {
+                            target_column
+                        };
+                        source[target_row * $n + target_column] =
+                            residual[source_row * $n + source_column] << $pre;
+                    }
+                }
+
+                let mut staged = [0i32; $n * $n];
+                separable_pass!(V, $n, row, source, staged, $dct, $adst);
+                if !within_limit(&staged, forward_staged_limit($n)) {
+                    return false;
+                }
+                for value in &mut staged {
+                    *value = (*value + ((1 << $mid) >> 1)) >> $mid;
+                }
+                separable_pass!(V, $n, column, staged, out, $dct, $adst);
+                true
+            }
+        }
+    };
+}
+
+forward_transform_driver!(forward_transform4, 4, 2, 0, fdct4, fadst4);
+forward_transform_driver!(forward_transform8, 8, 1, 0, fdct8, fadst8);
+forward_transform_driver!(forward_transform16, 16, 0, 0, fdct16, fadst16);
+forward_transform_driver!(forward_transform32, 32, 0, 2, fdct32, fdct32);

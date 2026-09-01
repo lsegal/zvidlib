@@ -28,6 +28,11 @@ jobs:
         run: cargo check --all-targets --features native
       - name: Lint native target
         run: cargo clippy --all-targets --features native -- -D warnings
+      # The checks above only cover files some target actually compiles, so an
+      # undeclared file under benches/ passes them by being skipped. This asserts
+      # every one of them is reachable from a [[bench]] target.
+      - name: Check every bench source is compiled
+        run: cargo test --features native --test bench_sources_compile
       - name: Test AV1 SIMD kernels against the scalar path
         run: cargo test --features native --lib av1_simd -- --nocapture
       - name: Test library units

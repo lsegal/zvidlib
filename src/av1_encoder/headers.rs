@@ -16,11 +16,11 @@ use crate::{Error, ErrorKind, Result};
 /// `OBU_SEQUENCE_HEADER`.
 const OBU_SEQUENCE_HEADER: u8 = 1;
 /// `OBU_FRAME` (frame header + tile group in one OBU).
-pub const OBU_FRAME: u8 = 6;
+pub(crate) const OBU_FRAME: u8 = 6;
 /// `order_hint_bits_minus_1 + 1`: enough range for any reasonable seek distance while every
 /// frame stays an independent key frame (`refresh_frame_flags` is always implied `0xff`, so the
 /// actual order-hint value never affects reference selection).
-pub const ORDER_HINT_BITS: u32 = 3;
+pub(crate) const ORDER_HINT_BITS: u32 = 3;
 
 /// The sequence-header field values that `gamut-avif` must mirror into `av1C` and `colr`
 /// (AV1-ISOBMFF v1.3.0 §2.3.4). Fixed by the M0 config except `seq_level_idx_0`, which depends on
@@ -106,7 +106,7 @@ fn tile_log2(blk_size: u32, target: u32) -> u32 {
 }
 
 /// Appends an OBU (header byte, `obu_has_size_field = 1`, LEB128 size, payload) to `out`.
-pub fn write_obu(out: &mut Vec<u8>, obu_type: u8, payload: &[u8]) {
+pub(crate) fn write_obu(out: &mut Vec<u8>, obu_type: u8, payload: &[u8]) {
     // obu_forbidden_bit=0, obu_type, obu_extension_flag=0, obu_has_size_field=1, reserved=0.
     out.push((obu_type << 3) | 0b10);
     write_leb128(out, payload.len() as u64);
@@ -118,7 +118,7 @@ pub fn write_obu(out: &mut Vec<u8>, obu_type: u8, payload: &[u8]) {
 /// (AV1 §5.2, §5.3.4). Non-reduced (rather than a reduced still-picture header) is required so
 /// [`crate::av1_inter_decoder::Av1InterDecoder`] can decode this encoder's own output natively —
 /// see the module documentation.
-pub fn sequence_header_payload(cfg: &Av1StillConfig, width: u32, height: u32) -> Vec<u8> {
+pub(crate) fn sequence_header_payload(cfg: &Av1StillConfig, width: u32, height: u32) -> Vec<u8> {
     let mut w = BitWriter::new();
     w.put_bits(u32::from(cfg.seq_profile), 3); // seq_profile
     w.put_bit(0); // still_picture
@@ -177,21 +177,29 @@ pub fn sequence_header_payload(cfg: &Av1StillConfig, width: u32, height: u32) ->
     w.into_bytes()
 }
 
-/// Builds the uncompressed frame header for a lossless intra keyframe (AV1 §5.9.2), byte-aligned
+/// Builds the uncompressed frame header for an intra keyframe (AV1 §5.9.2), byte-aligned
 /// (`byte_alignment`, no trailing one — the tile data follows in the same `OBU_FRAME`).
 ///
 /// `order_hint` is the frame's `order_hint` field value (taken mod `2^ORDER_HINT_BITS` by the
 /// caller); every frame is an independent shown key frame, so the actual value never affects
 /// decoding, but a real, incrementing value keeps the stream honest about frame order.
 ///
+/// `base_q_idx` selects the two quantization profiles the crate implements (§5.9.12): `0` is
+/// `CodedLossless`, which suppresses `loop_filter_params` and `read_tx_mode` entirely, and any
+/// other value is the non-lossless profile, which signals both. The loop filter is always
+/// signalled off — the encoder reconstructs without deblocking, so a nonzero level would make
+/// its reconstruction disagree with the decoder's — and `tx_mode_select` is always
+/// `TX_MODE_SELECT`, since the encoder chooses a transform size per coding block.
+///
 /// The returned bytes precede the tile (symbol-coded) data; together they form the frame OBU
 /// payload (AV1 §5.10).
-pub fn frame_header_payload(
+pub(crate) fn frame_header_payload(
     width: u32,
     height: u32,
     mi_cols: u32,
     mi_rows: u32,
     order_hint: u32,
+    base_q_idx: u8,
 ) -> Vec<u8> {
     let mut w = BitWriter::new();
     w.put_bit(0); // show_existing_frame = 0
@@ -224,14 +232,32 @@ pub fn frame_header_payload(
     }
     // TileColsLog2 == TileRowsLog2 == 0 ⇒ no context_update_tile_id / tile_size_bytes.
 
-    // quantization_params(): base_q_idx = 0 ⇒ CodedLossless.
-    w.put_bits(0, 8); // base_q_idx
+    // quantization_params(): base_q_idx == 0 ⇒ CodedLossless.
+    w.put_bits(u32::from(base_q_idx), 8); // base_q_idx
     w.put_bit(0); // DeltaQYDc: delta_coded = 0
     w.put_bit(0); // using_qmatrix = 0
 
     w.put_bit(0); // segmentation_enabled = 0
-    // delta_q_params / delta_lf_params: base_q_idx == 0 ⇒ no bits.
-    // CodedLossless ⇒ loop_filter / cdef / lr / tx_mode emit nothing.
+    // delta_q_params() (spec §5.9.17): `delta_q_present` is read for every frame with
+    // base_q_idx > 0, gated on the quantizer alone rather than on segmentation. Omitting it
+    // left every non-lossless frame header one bit short from here on, which an independent
+    // decoder (ffmpeg 7.1's dav1d) rejects while parsing the header. This encoder signals no
+    // per-block delta-Q, so the bit is 0 and delta_lf_params() (§5.9.18) is then absent
+    // entirely, being gated on `delta_q_present`.
+    if base_q_idx != 0 {
+        w.put_bit(0); // delta_q_present = 0
+    }
+    // cdef_params / lr_params: the sequence header disables both, so neither emits bits.
+    if base_q_idx != 0 {
+        // loop_filter_params() (§5.9.11): both luma levels 0, which suppresses the chroma
+        // levels, then sharpness and the (unused) per-reference delta switch.
+        w.put_bits(0, 6); // loop_filter_level[0]
+        w.put_bits(0, 6); // loop_filter_level[1]
+        w.put_bits(0, 3); // loop_filter_sharpness
+        w.put_bit(0); // loop_filter_delta_enabled = 0
+        w.put_bit(1); // tx_mode_select = 1 (TX_MODE_SELECT)
+    }
+    // CodedLossless ⇒ loop_filter / tx_mode emit nothing at all.
     // frame_reference_mode / skip_mode_params (intra) ⇒ no bits. allow_warped_motion=0.
     w.put_bit(1); // reduced_tx_set = 1
     // global_motion_params / film_grain_params (intra, not present) ⇒ no bits.
@@ -241,7 +267,7 @@ pub fn frame_header_payload(
 }
 
 /// Wraps the sequence-header and frame OBUs into the temporal unit placed in `mdat`.
-pub fn assemble_temporal_unit(seq_payload: &[u8], frame_payload: &[u8]) -> Vec<u8> {
+pub(crate) fn assemble_temporal_unit(seq_payload: &[u8], frame_payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     write_obu(&mut out, OBU_SEQUENCE_HEADER, seq_payload);
     write_obu(&mut out, OBU_FRAME, frame_payload);

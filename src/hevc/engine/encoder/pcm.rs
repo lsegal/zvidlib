@@ -239,7 +239,7 @@ pub(crate) fn write_vps_cfg(
 }
 
 /// §7.3.2.2 — the fixed-geometry SPS (4:2:0, 8-bit, CTB 16, PCM on).
-fn write_sps(
+pub(crate) fn write_sps(
     width: usize,
     height: usize,
     level_idc: u8,
