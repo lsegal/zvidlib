@@ -262,16 +262,58 @@ this host's round-to-round spread, which is why `av1_encode_stage_tile` and
 `av1_encode_frame_q0` still read within noise of each other and of the same two
 groups built from `main`.
 
-A `sample` profile of the lossless tile encode says where the rest goes: of
-14,411 samples inside `FrameEncoder::encode`, 9,164 — 64% — are in
+A `sample` profile of the lossless tile encode said where the rest went: of
+14,411 samples inside `FrameEncoder::encode`, 9,164 — 64% — were in
 `SymbolEncoder::encode_symbol`. Coefficient coding is indeed the whole frame,
 but what is left of it once the contexts are vectorized is the range coder, and
 that is serial by construction in exactly the way
 [the HEVC CABAC encoder](#why-the-cabac-arithmetic-encoder-stays-serial) is:
 each symbol renormalizes against the interval the previous one left. No vector
-kernel addresses it. The remaining headroom in AV1 lossless encoding is
+kernel addresses it. The remaining headroom in AV1 lossless encoding was
 therefore a *serial* question — widening the bit sink, and unrolling the
 literal-bit runs the coefficient loop writes — not another dispatch family.
+
+#### What the serial work bought
+
+Both of those changes have since been made, and the 64% figure above is the
+state before them rather than the state now. `src/av1_encoder/symbol.rs` no
+longer buffers each output byte as a `u16` and resolves the pending carries in a
+second reverse pass over the whole stream at `finish`; it normalizes each byte
+as it arrives, which halves the sink and drops the pass. And the equiprobable
+literal bits — coefficient signs, the `eob` extra bits, the exp-Golomb tails —
+are coded as runs rather than one `encode_symbol` call per bit, against a
+specialization of the interval update for the one CDF `read_bool` ever uses. The
+Golomb tail in particular is a single run: `len - 1` zeros followed by `x` in
+`len` bits is just `x` written as one `2 * len - 1`-bit field.
+
+Same host, same method — `--release`, best of interleaved rounds per arm, five
+rounds at 640x352 and seven at 1920x1080, against the `main` these numbers were
+measured next to:
+
+| Group | main | with the serial work | |
+| --- | --- | --- | --- |
+| `av1_encode_stage_symbol` | 2.20 ms | 1.77 ms | 1.24x |
+| `av1_encode_stage_tile/neon` | 36.5 ms | 33.0 ms | 1.11x |
+| `av1_encode_frame_q0/neon` | 38.4 ms | 34.9 ms | 1.10x |
+| `av1_encode_stage_symbol_1080p` | 21.4 ms | 16.7 ms | 1.29x |
+| `av1_encode_stage_tile_1080p/neon` | 400 ms | 310 ms | 1.29x |
+| `av1_encode_frame_q0_1080p/neon` | 442 ms | 318 ms | 1.39x |
+
+The two `stage_symbol` rows are quoted as the best of both arms rather than one
+of them, because that group is scalar on both and its arms differ only by this
+host's spread; the tile and whole-frame rows are the `neon` arm, which is what
+this host actually runs.
+
+The shape of the result is the point. This is the first change to move
+`av1_encode_stage_tile` and `av1_encode_frame_q0` at all — the vectorized
+contexts could not, at 9% of a tile encode — and it moves them by roughly what
+their range-coder share predicts, which is the confirmation that the profile was
+reading the right thing. It also does not touch the bitstream: every group's
+`bench_across_isas` guard sees the same output byte count it saw before
+(264,392 for a 640x352 tile, 2,474,396 for a 1080p frame), and the encoder's
+`a_fixed_frame_encodes_to_the_same_bytes_on_every_host` digests are unchanged.
+The range coder is still serial, and still the largest single item in a lossless
+frame; it is now a smaller one.
 
 The kernel-level `av1_forward_*` groups run once per available instruction set
 through
