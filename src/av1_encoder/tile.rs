@@ -30,6 +30,7 @@ use super::transform::forward_transform;
 use super::wht::fwht4x4;
 use crate::av1_intra::{Av1TxType, get_ac_quant, get_dc_quant, inverse_transform};
 use crate::av1_intra_pred::add_residual_row;
+use crate::av1_simd::coeff;
 
 /// `NUM_BASE_LEVELS` (§3).
 const NUM_BASE_LEVELS: i32 = 2;
@@ -279,6 +280,8 @@ pub(crate) struct FrameEncoder<'a> {
     /// work the shortcuts exist to remove.
     #[cfg(test)]
     candidates_evaluated: u64,
+    /// Reused buffers for the per-block coefficient context pass.
+    coeff_ctx: CoeffScratch,
     /// Exact `sse + lambda * bits` ties the transform-type and transform-size searches had to
     /// settle, so a test can show the tie-break is reached on real content rather than assert an
     /// order-independence that holds only because nothing ever tied.
@@ -309,6 +312,65 @@ struct TxCandidate {
     levels: Vec<i32>,
     reconstructed: Vec<i16>,
     cost: i64,
+}
+
+/// Reusable buffers for one transform block's §8.3.2 coefficient contexts.
+///
+/// The contexts are derived for the whole block in a single pass before the serial symbol loop
+/// runs, which is legal because every neighbour `coeff_base` and `coeff_br` consult lies later in
+/// the up-right diagonal scan than the position consulting it, and the loop walks that scan
+/// backwards — so those neighbours are already final (or, past the end-of-block, zero) before the
+/// first symbol is written. See [`crate::av1_simd::coeff`] for the vector kernel that pass
+/// dispatches to.
+///
+/// The buffers live on the encoder rather than the block so a frame's hundreds of thousands of
+/// transform blocks share one allocation each. The padded plane's zero border is written once per
+/// size and never again, so a block only overwrites its own `size * size` interior.
+#[derive(Default)]
+pub(crate) struct CoeffScratch {
+    /// The size the buffers below are currently shaped for; `0` before the first block.
+    size: usize,
+    /// Clamped magnitudes in the zero-padded layout `crate::av1_simd::coeff` reads.
+    plane: Vec<i32>,
+    /// `coeff_base` context per raster position.
+    pub(crate) base: Vec<i32>,
+    /// `coeff_br` context per raster position.
+    pub(crate) br: Vec<i32>,
+}
+
+impl CoeffScratch {
+    /// Reshapes the buffers for a `size x size` block, rewriting the padded plane's zero border
+    /// only when the size actually changed.
+    fn resize(&mut self, size: usize) {
+        if self.size == size {
+            return;
+        }
+        self.size = size;
+        coeff::reset_padded_plane(&mut self.plane, size);
+        self.base.clear();
+        self.base.resize(size * size, 0);
+        self.br.clear();
+        self.br.resize(size * size, 0);
+    }
+
+    /// Fills [`Self::base`] and [`Self::br`] for every position of a block whose quantized
+    /// coefficients are `quant`, through the vector kernel when the active instruction set has
+    /// one and through `tile.rs`'s scalar reference otherwise.
+    pub(crate) fn derive(&mut self, quant: &[i32], size: usize) {
+        self.resize(size);
+        let isa = coeff::active_isa();
+        if coeff::has_vector_kernel(isa) {
+            coeff::fill_padded_levels(&mut self.plane, quant, size);
+            if crate::av1_simd::coeff_contexts(isa, &self.plane, size, &mut self.base, &mut self.br)
+            {
+                return;
+            }
+        }
+        for pos in 0..size * size {
+            self.base[pos] = coeff_base_ctx(pos, quant, size) as i32;
+            self.br[pos] = coeff_br_ctx(pos, quant, size) as i32;
+        }
+    }
 }
 
 /// The block-local encoder state a speculative (non-emitting) trial mutates, saved so the trial
@@ -384,6 +446,7 @@ impl<'a> FrameEncoder<'a> {
             type_gain_memory: TYPE_GAIN_MEMORY,
             #[cfg(test)]
             candidates_evaluated: 0,
+            coeff_ctx: CoeffScratch::default(),
             #[cfg(test)]
             cost_ties: 0,
         }
@@ -1317,46 +1380,45 @@ impl<'a> FrameEncoder<'a> {
             }
         }
 
-        // Base levels + base range, scanned from the last coefficient back to DC.
-        let mut levels = vec![0i32; count];
-        for c in (0..eob).rev() {
-            let pos = scan[c];
-            let level = quant[pos].abs();
-            if c == eob - 1 {
-                let ctx = coeff_base_eob_ctx(c, count);
-                if emit {
+        // Base levels + base range, scanned from the last coefficient back to DC. Every context
+        // the loop needs is derived for the whole block up front (see `CoeffScratch`), and only
+        // the emitting pass consults them, so a speculative trial skips the derivation outright.
+        if emit {
+            let mut scratch = std::mem::take(&mut self.coeff_ctx);
+            scratch.derive(quant, size);
+            for c in (0..eob).rev() {
+                let pos = scan[c];
+                let level = quant[pos].abs();
+                if c == eob - 1 {
+                    let ctx = coeff_base_eob_ctx(c, count);
                     self.sym.encode_symbol(
                         (level.min(3) - 1) as usize,
                         cdf::coeff_base_eob_cdf(qctx, tx_ctx, ptype, ctx),
                     );
-                }
-            } else {
-                let ctx = coeff_base_ctx(pos, &levels, size);
-                if emit {
+                } else {
+                    let ctx = scratch.base[pos] as usize;
                     self.sym.encode_symbol(
                         level.min(3) as usize,
                         cdf::coeff_base_cdf(qctx, tx_ctx, ptype, ctx),
                     );
                 }
-            }
-            if level > NUM_BASE_LEVELS {
-                let br_ctx = coeff_br_ctx(pos, &levels, size);
-                let mut rem = level - 3;
-                for _ in 0..4 {
-                    let brv = rem.min(3);
-                    if emit {
+                if level > NUM_BASE_LEVELS {
+                    let br_ctx = scratch.br[pos] as usize;
+                    let mut rem = level - 3;
+                    for _ in 0..4 {
+                        let brv = rem.min(3);
                         self.sym.encode_symbol(
                             brv as usize,
                             cdf::coeff_br_cdf(qctx, tx_ctx, ptype, br_ctx),
                         );
-                    }
-                    rem -= brv;
-                    if brv < 3 {
-                        break;
+                        rem -= brv;
+                        if brv < 3 {
+                            break;
+                        }
                     }
                 }
             }
-            levels[pos] = level;
+            self.coeff_ctx = scratch;
         }
 
         // Signs (DC sign is CDF-coded; the rest are raw bits) and golomb tails.
@@ -1379,7 +1441,9 @@ impl<'a> FrameEncoder<'a> {
             }
         }
 
-        let cul = levels.iter().sum::<i32>().min(63) as u8;
+        // Every coefficient at or past the end-of-block is zero by the definition of `eob`, so
+        // summing the whole block's magnitudes is the same `culLevel` the scanned levels gave.
+        let cul = quant.iter().map(|value| value.abs()).sum::<i32>().min(63) as u8;
         let dc_cat = if quant[0] == 0 {
             0
         } else if quant[0] < 0 {
@@ -1602,6 +1666,9 @@ fn coeff_base_eob_ctx(c: usize, count: usize) -> usize {
     }
 }
 
+/// `getCoeffBaseCtx` (§8.3.2) for `TX_CLASS_2D`: the scalar reference
+/// [`crate::av1_simd::coeff::block_contexts`] is a lane-by-lane transliteration of. `levels` holds
+/// the block's quantized coefficients; only their magnitudes are read.
 fn coeff_base_ctx(pos: usize, levels: &[i32], size: usize) -> usize {
     let (row, col) = (pos / size, pos % size);
     let mut mag = 0i32;
@@ -1618,6 +1685,8 @@ fn coeff_base_ctx(pos: usize, levels: &[i32], size: usize) -> usize {
     ctx + cdf::coeff_base_ctx_offset(row, col)
 }
 
+/// `getCoeffBrCtx` (§8.3.2) for `TX_CLASS_2D`, the other half of the scalar reference described
+/// on [`coeff_base_ctx`].
 fn coeff_br_ctx(pos: usize, levels: &[i32], size: usize) -> usize {
     let (row, col) = (pos / size, pos % size);
     let mut mag = 0i32;
@@ -1650,5 +1719,163 @@ fn golomb(sym: &mut SymbolEncoder, x: u32) {
     } else {
         sym.encode_literal(0, len - 1);
         sym.encode_literal(x, len);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::simd::{self, SimdIsa};
+
+    /// Small deterministic LCG, matching the style used elsewhere in the crate.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            self.0 >> 33
+        }
+    }
+
+    /// Quantized coefficients spanning the ranges the contexts distinguish: zeros, the base
+    /// levels, the base-range cap, and magnitudes past the golomb threshold, in both signs.
+    fn coefficients(size: usize, seed: u64) -> Vec<i32> {
+        let mut rng = Lcg(seed);
+        (0..size * size)
+            .map(|_| {
+                let magnitude = match rng.next() % 5 {
+                    0 => 0,
+                    1 => (rng.next() % 3) as i32,
+                    2 => (rng.next() % 16) as i32,
+                    3 => (rng.next() % 64) as i32,
+                    _ => (rng.next() % 4096) as i32,
+                };
+                if rng.next() % 2 == 0 {
+                    magnitude
+                } else {
+                    -magnitude
+                }
+            })
+            .collect()
+    }
+
+    /// The widths worth covering: every one from a single coefficient up past two full AVX2
+    /// vectors, so a partial trailing vector is exercised at both lane counts, plus the large
+    /// transform sizes the non-lossless encoder actually codes.
+    const WIDTHS: [usize; 20] = [
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 32, 64,
+    ];
+
+    /// The whole point of the vector kernel: it must agree with `tile.rs`'s scalar §8.3.2
+    /// reference lane for lane, at every width and on every instruction set the host has.
+    #[test]
+    fn the_context_pass_matches_the_scalar_reference_on_every_instruction_set() {
+        let _guard = simd::test_lock();
+        for &size in &WIDTHS {
+            for seed in 0..4u64 {
+                let quant = coefficients(size, seed * 977 + size as u64);
+                let mut expected_base = vec![0i32; size * size];
+                let mut expected_br = vec![0i32; size * size];
+                for pos in 0..size * size {
+                    expected_base[pos] = coeff_base_ctx(pos, &quant, size) as i32;
+                    expected_br[pos] = coeff_br_ctx(pos, &quant, size) as i32;
+                }
+                for isa in simd::available() {
+                    simd::set_override(Some(isa));
+                    assert_eq!(
+                        coeff::active_isa(),
+                        isa,
+                        "the coefficient context site did not follow the override"
+                    );
+                    let mut scratch = CoeffScratch::default();
+                    scratch.derive(&quant, size);
+                    assert_eq!(
+                        scratch.base,
+                        expected_base,
+                        "coeff_base at size {size}, seed {seed}, isa {}",
+                        isa.name()
+                    );
+                    assert_eq!(
+                        scratch.br,
+                        expected_br,
+                        "coeff_br at size {size}, seed {seed}, isa {}",
+                        isa.name()
+                    );
+                }
+            }
+        }
+        simd::set_override(None);
+    }
+
+    /// Deriving the contexts up front is only legal because the backwards scan never consults a
+    /// neighbour it has not already coded, and never consults a non-zero one past the
+    /// end-of-block. Replay the incremental derivation the coding loop used to do and check it
+    /// against the one-pass answer, for every end-of-block a block can have.
+    #[test]
+    fn the_one_pass_derivation_matches_the_incremental_scan_order_one() {
+        let _guard = simd::test_lock();
+        simd::set_override(Some(SimdIsa::Scalar));
+        for &size in &[4usize, 8, 16, 32] {
+            let count = size * size;
+            let scan = cdf::up_right_diagonal_scan(size);
+            let dense = coefficients(size, 31 + size as u64);
+            for eob in 1..=count {
+                // Past the end-of-block every coefficient is zero by the definition of `eob`,
+                // which is the property the one-pass derivation leans on.
+                let mut quant = vec![0i32; count];
+                for &pos in scan.iter().take(eob) {
+                    quant[pos] = dense[pos];
+                }
+                let mut scratch = CoeffScratch::default();
+                scratch.derive(&quant, size);
+
+                let mut levels = vec![0i32; count];
+                for c in (0..eob).rev() {
+                    let pos = scan[c];
+                    assert_eq!(
+                        coeff_base_ctx(pos, &levels, size) as i32,
+                        scratch.base[pos],
+                        "coeff_base at size {size}, eob {eob}, scan index {c}"
+                    );
+                    assert_eq!(
+                        coeff_br_ctx(pos, &levels, size) as i32,
+                        scratch.br[pos],
+                        "coeff_br at size {size}, eob {eob}, scan index {c}"
+                    );
+                    levels[pos] = quant[pos].abs();
+                }
+            }
+        }
+        simd::set_override(None);
+    }
+
+    /// The encoded bitstream is the contract: a vector context pass that changed a single symbol
+    /// would produce a different tile, so every instruction set must emit the same bytes.
+    #[test]
+    fn the_encoded_tile_is_byte_identical_on_every_instruction_set() {
+        let _guard = simd::test_lock();
+        let (width, height) = (61usize, 37usize);
+        let mut rng = Lcg(0x5eed);
+        let plane: Vec<u8> = (0..width * height)
+            .map(|_| (rng.next() & 0xff) as u8)
+            .collect();
+        for qindex in [0u8, 40, 160] {
+            simd::set_override(Some(SimdIsa::Scalar));
+            let reference = FrameEncoder::new(&plane, width, height, qindex).encode();
+            for isa in simd::available() {
+                simd::set_override(Some(isa));
+                let coded = FrameEncoder::new(&plane, width, height, qindex).encode();
+                assert_eq!(
+                    coded,
+                    reference,
+                    "tile bytes differ at qindex {qindex} on {}",
+                    isa.name()
+                );
+            }
+        }
+        simd::set_override(None);
     }
 }
