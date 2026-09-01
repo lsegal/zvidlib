@@ -15,7 +15,7 @@ pub mod bench;
 #[allow(dead_code)]
 mod bitwriter;
 #[allow(dead_code)]
-mod cdf;
+pub(crate) mod cdf;
 mod headers;
 #[allow(dead_code)]
 mod leb128;
