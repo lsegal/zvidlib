@@ -569,6 +569,23 @@ group asserts through `simd::active_by_site()` that the override landed rather
 than inferring it from the clock — see
 [Reading a null result](#reading-a-null-result).
 
+That widening rewrite has since happened, and `..._pcm_write` and
+`hevc_encode_bitwriter` still read flat on the SIMD axis — deliberately. The
+rewrite widened `BitWriter::put_bits` to move a chunk of a field at a time and
+gave byte-aligned §7.3.8.7 PCM sample data a bulk path that bypasses the bit
+accumulator entirely; neither is a vector kernel, so neither added a
+`simd::active_by_site()` site and neither arm moves when the instruction set is
+pinned. **A flat SIMD arm here does not mean no work was done.** The win is on
+the scalar axis and has to be read as a before/after against the previous
+implementation rather than as a scalar-versus-NEON ratio within one run:
+measured on a contended Apple Silicon host as the best of seven interleaved
+rounds per arm, `hevc_encode_bitwriter` went 3.43 ms -> 0.58 ms (~5.9x) and
+`hevc_encode_640x352_pcm_write` 8.32 ms -> 0.35 ms (~23x), with the scalar and
+NEON arms of each group staying level with each other throughout, exactly as
+this section predicts. Output is byte-identical either way; `tests/hevc_
+bitstream_byte_identity.rs` pins the produced access units to digests captured
+from the pre-rewrite writer.
+
 ## Per-stage access to the encoder
 
 `crate::hevc` is a private module and benchmarks are a separate crate, so the

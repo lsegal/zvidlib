@@ -279,7 +279,13 @@ mod tests {
     /// than roundtripping.)
     #[test]
     fn ue_emits_the_reference_codeword_at_the_33_bit_boundary() {
-        for v in [u32::MAX, u32::MAX - 1, 1 << 31, (1 << 31) - 1, (1 << 16) - 2] {
+        for v in [
+            u32::MAX,
+            u32::MAX - 1,
+            1 << 31,
+            (1 << 31) - 1,
+            (1 << 16) - 2,
+        ] {
             let code_num = u64::from(v) + 1;
             let bits = 64 - code_num.leading_zeros() as u8;
             let mut expected = BitWriter::new();
@@ -304,7 +310,9 @@ mod tests {
     /// not; both must equal the per-byte `put_bits` path it replaces.
     #[test]
     fn put_bytes_matches_per_byte_writes_aligned_and_unaligned() {
-        let data: Vec<u8> = (0..64u32).map(|i| (i.wrapping_mul(37) ^ 0x5A) as u8).collect();
+        let data: Vec<u8> = (0..64u32)
+            .map(|i| (i.wrapping_mul(37) ^ 0x5A) as u8)
+            .collect();
         for offset in 0..8u8 {
             let mut bulk = BitWriter::new();
             let mut per_byte = BitWriter::new();
@@ -314,7 +322,11 @@ mod tests {
             for &b in &data {
                 per_byte.put_bits(u32::from(b), 8);
             }
-            assert_eq!(bulk.bit_len(), per_byte.bit_len(), "bit_len at offset {offset}");
+            assert_eq!(
+                bulk.bit_len(),
+                per_byte.bit_len(),
+                "bit_len at offset {offset}"
+            );
             assert_eq!(bulk.finish(), per_byte.finish(), "bytes at offset {offset}");
         }
     }

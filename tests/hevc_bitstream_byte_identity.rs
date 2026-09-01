@@ -28,8 +28,12 @@ fn planes(width: usize, height: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
         .collect();
     let chroma_len = (width / 2) * (height / 2);
-    let cb = (0..chroma_len).map(|i| (i.wrapping_mul(97) ^ 0x5A) as u8).collect();
-    let cr = (0..chroma_len).map(|i| (i.wrapping_mul(131) ^ 0xA5) as u8).collect();
+    let cb = (0..chroma_len)
+        .map(|i| (i.wrapping_mul(97) ^ 0x5A) as u8)
+        .collect();
+    let cr = (0..chroma_len)
+        .map(|i| (i.wrapping_mul(131) ^ 0xA5) as u8)
+        .collect();
     (y, cb, cr)
 }
 
@@ -57,5 +61,9 @@ fn syntax_writes_are_byte_identical_to_the_bit_at_a_time_writer() {
         .map(|i| i.wrapping_mul(2_654_435_761) >> 11)
         .collect();
     let bytes = encoder_bench::bitwriter_write_syntax(&values);
-    assert_eq!(digest(&bytes), 0x5464_09b1_d575_7999u64, "syntax bitstream changed");
+    assert_eq!(
+        digest(&bytes),
+        0x5464_09b1_d575_7999u64,
+        "syntax bitstream changed"
+    );
 }
