@@ -56,6 +56,9 @@ const MIN_CODED_BLOCK_BITS: i64 = 7;
 /// worth at that size before extrapolating it over the trial's remaining blocks.
 const TYPE_GAIN_PROBES: usize = 1;
 
+/// [`TYPE_GAIN_PROBES`] for a size search that can reach a transform whose `Dq_Denom` is not 1.
+const LARGE_TYPE_GAIN_PROBES: usize = 4;
+
 /// Coding blocks between two whose size search probes.
 ///
 /// What a probe measures is a ratio between the whole type set's cost and DCT's on the same
@@ -605,7 +608,14 @@ impl<'a> FrameEncoder<'a> {
         let largest = bw.min(MAX_TX_WIDTH);
         // Only the depth cap is needed here; it does not vary with the neighbour context.
         let (_, max_depth) = cdf::tx_depth_cdf(bw, 0);
-        let probing = self.shortcuts() && self.sample_type_gain();
+        // §7.12.3's `Dq_Denom` makes a 32x32 transform's coefficients twice the magnitude of a
+        // smaller one's for the same reconstruction, so its DCT-vs-set gain has a different
+        // scale from theirs and a sampled measurement of it does not carry. A size search that
+        // can reach 32x32 therefore always probes, and probes the whole trial rather than one
+        // block of it.
+        let sampled = self.sample_type_gain();
+        let large = largest.min(MAX_FORWARD_TX) >= 32;
+        let probing = self.shortcuts() && (sampled || large);
         let mut best = (0usize, i64::MAX);
         for depth in 0..=max_depth {
             let tx_width = (largest >> depth).max(4);
@@ -613,7 +623,11 @@ impl<'a> FrameEncoder<'a> {
                 continue;
             }
             let snapshot = self.snapshot(r, c, bw);
-            self.probe_budget = if probing { TYPE_GAIN_PROBES } else { 0 };
+            self.probe_budget = match (probing, large) {
+                (true, true) => LARGE_TYPE_GAIN_PROBES,
+                (true, false) => TYPE_GAIN_PROBES,
+                (false, _) => 0,
+            };
             self.probe_dct_cost = 0;
             self.probe_best_cost = 0;
             self.trial_searched_cost = 0;
