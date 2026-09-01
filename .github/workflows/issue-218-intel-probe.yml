@@ -15,28 +15,35 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-15-intel, macos-13, windows-latest, ubuntu-latest]
+        os: [macos-15-intel]
     runs-on: ${{ matrix.os }}
+    # The macOS 15 Intel image links the crate's apple-cf dependency against a
+    # Swift runtime it does not stage next to the test binary, so add the
+    # system Swift runtime directory to the binary's rpath.
+    env:
+      RUSTFLAGS: -C link-arg=-Wl,-rpath,/usr/lib/swift
     steps:
       - uses: actions/checkout@v4
       - name: Identify the CPU
         shell: bash
         run: |
           uname -a
-          if [ -r /proc/cpuinfo ]; then
-            grep -m1 'vendor_id\|model name' /proc/cpuinfo || true
-            grep -m1 flags /proc/cpuinfo | tr ' ' '\n' | grep -E '^(sse4_1|sse4_2|avx|avx2|avx512f)$' || true
-          fi
+          sw_vers || true
           sysctl -n machdep.cpu.brand_string 2>/dev/null || true
           sysctl -n machdep.cpu.vendor 2>/dev/null || true
           sysctl -n machdep.cpu.features machdep.cpu.leaf7_features 2>/dev/null || true
-          wmic cpu get name 2>/dev/null || true
+          ls /usr/lib/swift 2>/dev/null | head -5 || true
       - name: Install Rust toolchain
         run: rustup show
-      - name: Install native audio dependencies
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - name: Inter-prediction kernel benchmark
-        run: cargo test --release --features native --lib simd_inter_pred_benchmark -- --ignored --nocapture
+        run: |
+          for round in 1 2 3; do
+            echo "=== inter-pred round $round ==="
+            cargo test --release --features native --lib simd_inter_pred_benchmark -- --ignored --nocapture
+          done
       - name: In-loop filter benchmark
-        run: cargo test --release --features native --lib bench_in_loop_filters -- --ignored --nocapture
+        run: |
+          for round in 1 2 3; do
+            echo "=== in-loop round $round ==="
+            cargo test --release --features native --lib bench_in_loop_filters -- --ignored --nocapture
+          done
