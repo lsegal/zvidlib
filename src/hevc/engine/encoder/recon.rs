@@ -375,19 +375,30 @@ fn reconstruct_component(
     };
 
     // §7.3.8.8: the residual of a partition is coded as square transform
-    // blocks. This geometry's partitions are whole or halved CTBs, so tiling
-    // by the largest legal square that fits is the transform tree a writer
-    // would build for them.
+    // blocks, the smallest of which is 4x4. An asymmetric partition can be as
+    // narrow as four luma samples, and its 4:2:0 chroma half then measures two
+    // — less than one transform block, and not a whole number of them in the
+    // other direction either. Tiling by the largest legal square that fits and
+    // clipping each block to the partition is what a writer does there: the
+    // samples past the edge carry no residual, so they are coded as zero and
+    // never written back.
     let n_tbs = transform_block_size(w, h);
     let mut prediction = vec![0i32; n_tbs * n_tbs];
     let mut residual = vec![0i32; n_tbs * n_tbs];
     let mut pred_row = vec![0u8; n_tbs];
     for by in (0..h).step_by(n_tbs) {
         for bx in (0..w).step_by(n_tbs) {
-            for row in 0..n_tbs {
+            let block_h = n_tbs.min(h - by);
+            let block_w = n_tbs.min(w - bx);
+            if block_h != n_tbs || block_w != n_tbs {
+                // Only the clipped blocks need the padding zeroed; a whole one
+                // overwrites every position below.
+                residual.fill(0);
+            }
+            for row in 0..block_h {
                 let sy = y + by + row;
-                gather_prediction_row(&mut pred_row, reference, x + bx, sy, mv_x, mv_y);
-                for col in 0..n_tbs {
+                gather_prediction_row(&mut pred_row[..block_w], reference, x + bx, sy, mv_x, mv_y);
+                for col in 0..block_w {
                     let predicted = i32::from(pred_row[col]);
                     prediction[row * n_tbs + col] = predicted;
                     residual[row * n_tbs + col] =
@@ -441,12 +452,12 @@ fn reconstruct_component(
             // through the vector kernel whole rather than one `set_sample` at
             // a time.
             let (dst, dst_stride) = pic.plane_mut(plane);
-            for row in 0..n_tbs {
+            for row in 0..block_h {
                 let start = (y + by + row) * dst_stride + x + bx;
                 recon_simd::add_clip_row(
-                    &mut dst[start..start + n_tbs],
-                    &prediction[row * n_tbs..(row + 1) * n_tbs],
-                    &coded[row * n_tbs..(row + 1) * n_tbs],
+                    &mut dst[start..start + block_w],
+                    &prediction[row * n_tbs..row * n_tbs + block_w],
+                    &coded[row * n_tbs..row * n_tbs + block_w],
                 );
             }
         }
@@ -488,9 +499,14 @@ fn gather_prediction_row(
     }
 }
 
-/// The largest legal square transform block that tiles a `w` x `h` partition:
-/// the largest power of two no greater than either side, clamped to the
+/// The largest legal square transform block for a `w` x `h` partition: the
+/// largest power of two no greater than either side, clamped to the
 /// §7.4.3.2.1 4..=32 transform-block range.
+///
+/// The clamp at 4 means the result does not always divide the partition — an
+/// asymmetric partition's 4:2:0 chroma half can be as short as two samples —
+/// so the caller clips the last block of each row and column to the partition
+/// rather than assuming a whole tiling.
 fn transform_block_size(w: usize, h: usize) -> usize {
     let side = w.min(h);
     let log2 = (usize::BITS - 1 - side.leading_zeros()).clamp(2, 5);
@@ -1061,7 +1077,9 @@ fn plane_to_u8(pic: &Picture, plane: Plane) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hevc::engine::encoder::rdo::{DecisionConfig, decide_picture};
+    use crate::hevc::engine::encoder::rdo::{
+        BlockDecision, DecisionConfig, PartitionDecision, decide_picture,
+    };
 
     const W: usize = 64;
     const H: usize = 32;
@@ -1323,6 +1341,72 @@ mod tests {
                 );
                 assert_eq!(inter, expected_inter, "{} inter at qp {qp}", isa.name());
             }
+        }
+        crate::simd::set_override(None);
+    }
+
+    #[test]
+    fn an_asymmetric_partitions_chroma_half_reconstructs_inside_the_plane() {
+        // §7.3.8.8 transform blocks bottom out at 4x4, but the 4:2:0 chroma
+        // half of the 16x4 and 16x12 asymmetric partitions the mode search can
+        // pick measures 8x2 and 8x6 — neither a whole number of 4x4 blocks.
+        // The residual coding has to clip its last block to the partition
+        // instead of running off the end of the plane.
+        let src = source(0);
+        let (width, height) = (W, H);
+        let partition = |x, y, w, h| PartitionDecision {
+            x,
+            y,
+            w,
+            h,
+            mv_x: 0,
+            mv_y: 0,
+            sad: 0,
+            satd: 0,
+            bit_cost: 0,
+            rd_cost: 0,
+        };
+        let mut blocks = Vec::new();
+        for y0 in (0..height).step_by(CTB) {
+            for x0 in (0..width).step_by(CTB) {
+                blocks.push(BlockDecision {
+                    x: x0,
+                    y: y0,
+                    size: CTB,
+                    // 16x4 over 16x12, so both the two-sample-tall chroma half
+                    // and the six-sample-tall one are coded.
+                    partitions: vec![
+                        partition(x0, y0, CTB, 4),
+                        partition(x0, y0 + 4, CTB, CTB - 4),
+                    ],
+                    rd_cost: 0,
+                    pcm_cost: u64::MAX,
+                });
+            }
+        }
+        let decision = PictureDecision {
+            blocks,
+            rd_cost: 0,
+            pcm_blocks: 0,
+        };
+        let cfg = ReconConfig {
+            quantized_residual: true,
+            qp: 32,
+            ..ReconConfig::default()
+        };
+        let _guard = crate::simd::test_lock();
+        crate::simd::set_override(Some(crate::simd::SimdIsa::Scalar));
+        let expected = reconstruct_picture(planes(&src), None, &decision, cfg);
+        assert_eq!(expected.y.len(), src.0.len());
+        assert_eq!(expected.cb.len(), src.1.len());
+        assert_eq!(expected.cr.len(), src.2.len());
+        // The clipped blocks go through the same vector kernel as the whole
+        // ones, over a partial run, so they are pinned across instruction sets
+        // too.
+        for isa in crate::simd::available() {
+            crate::simd::set_override(Some(isa));
+            let lossy = reconstruct_picture(planes(&src), None, &decision, cfg);
+            assert_eq!(lossy, expected, "{}", isa.name());
         }
         crate::simd::set_override(None);
     }
