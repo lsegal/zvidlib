@@ -868,6 +868,22 @@ group asserts through `simd::active_by_site()` that the override landed rather
 than inferring it from the clock — see
 [Reading a null result](#reading-a-null-result).
 
+That widening rewrite has since happened, and `..._pcm_write` and
+`hevc_encode_bitwriter` still read flat on the SIMD axis — deliberately. The
+rewrite widened `BitWriter::put_bits` to move a chunk of a field at a time and
+gave byte-aligned §7.3.8.7 PCM sample data a bulk path that bypasses the bit
+accumulator entirely; neither is a vector kernel, so neither added a
+`simd::active_by_site()` site and neither arm moves when the instruction set is
+pinned. **A flat SIMD arm here does not mean no work was done.** The win is on
+the scalar axis and has to be read as a before/after against the previous
+implementation rather than as a scalar-versus-NEON ratio within one run:
+measured on a contended Apple Silicon host as the best of seven interleaved
+rounds per arm, `hevc_encode_bitwriter` went 3.43 ms -> 0.58 ms (~5.9x) and
+`hevc_encode_640x352_pcm_write` 8.32 ms -> 0.35 ms (~23x), with the scalar and
+NEON arms of each group staying level with each other throughout, exactly as
+this section predicts. Output is byte-identical either way; `tests/hevc_
+bitstream_byte_identity.rs` pins the produced access units to digests captured
+from the pre-rewrite writer.
 ### Why the CABAC arithmetic encoder stays serial
 
 `hevc_encode_cabac` reads flat under every instruction set and is expected to
@@ -961,9 +977,10 @@ the second has not been tried yet.
    byte-at-a-time `put_bits`, was measured too and did not move the ratio
    either.
 2. **Widen the bit sink**, which the first table prices at 1.14x for this stage
-   on its own. That is the same rewrite the `..._pcm_write` and
-   `hevc_encode_bitwriter` groups want, it is what the run-at-a-time result
-   above points back at, and it is #233.
+   on its own. That is the rewrite the `..._pcm_write` and
+   `hevc_encode_bitwriter` groups took (#233, recorded above), it is what the
+   run-at-a-time result above points back at, and the arithmetic encoder keeps
+   only the share of it that its own bit writing is worth.
 
 Neither is a bin-parallel algorithm, and neither changes a single bit of output.
 Whatever headroom a speculative formulation might still hold after both is
