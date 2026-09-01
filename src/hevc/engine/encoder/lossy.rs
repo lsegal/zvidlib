@@ -104,16 +104,27 @@
 //! not hold: it declined 30 of these points and accepted two others that sat
 //! 0.08 and 0.14 dB below that curve.
 //!
-//! Band offset is what the two new operating points are: with only the edge
-//! classes searched, the noise picture at QP 12 bought +0.04 dB and at QP 20
-//! nothing at all. Searching both types it buys +0.14 dB for +0.5% of slice at
-//! 64x48 and +0.15 dB for +0.2% at 128x96, and at QP 20 +0.09 dB for +0.6% and
-//! +0.13 dB for +0.2%. It is never selected on the smooth picture at any QP —
-//! that content's error is edge-shaped, and adding the band candidates only
-//! moves its slice by a byte, from the type now being chosen on rate-distortion
-//! rather than on gain alone. Two coarse noise points give back 0.001 to
-//! 0.003 dB for two to three bytes, which is that same comparison paying for
-//! itself; that is on the record rather than papered over.
+//! Band offset is what the finest end of the noise picture's sweep is. With
+//! only the edge classes searched the slice-level test declines the pass on
+//! that picture at QP 12 at 64x48 outright; searching both types it is taken
+//! and buys +0.100 dB for +0.5% of slice. At 128x96 it improves five points
+//! the edge-only search already took, each for one to eight bytes more:
+//! +0.106 to +0.120 dB at QP 12, +0.184 to +0.190 at QP 13, +0.156 to +0.167
+//! at QP 14, +0.110 to +0.118 at QP 17, and +0.100 to +0.127 at QP 19. Every
+//! other point of the sweep is byte-identical to the edge-only search, no
+//! point regresses, and every accepted point still sits on or above the
+//! SAO-off writer's own curve. It is never selected on the smooth picture at
+//! any QP — that content's error is edge-shaped, which is what §8.7.3.2 is
+//! for — nor at any QP coarse enough that the four signs and five position
+//! bins outweigh what a value-range bias is worth.
+//!
+//! Those band-only bins are charged at 2.5x `lambda_q8`, the coarse end of
+//! the departure the calibration measured, because they are rate the closed
+//! form has never been checked against. At the closed form itself the search
+//! takes band offset at one coarse CTB whose slice then sits 0.003 dB *under*
+//! the curve above; at `SAO_LAMBDA_BAND`, the trust bound rather than the
+//! measured end, band offset stops being selected anywhere and all of the
+//! gains above are given back.
 //!
 //! ## Why the writer runs two passes
 //!
@@ -2027,7 +2038,7 @@ mod tests {
              was measured to buy"
         );
         assert!(
-            on_bytes < 1980,
+            on_bytes < 1960,
             "the band-offset slice cost {on_bytes} bytes, above what it was measured to cost"
         );
     }
