@@ -34,6 +34,7 @@ use windows::Win32::System::Com::{
 use windows::core::Interface;
 
 use super::engine::hvcc::{HvccRecord, split_length_prefixed};
+use super::readback;
 use crate::{
     CancellationToken, DecodedVideoFrame, EncodedVideoSample, Error, ErrorKind, FrameIndex, Limits,
     PixelFormat, Plane, Result, VideoDecoder, VideoDecoderConfig, VideoDimensions, VideoFrame,
@@ -641,6 +642,10 @@ fn copy_nv12_to_rgba(
         CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
         MiscFlags: 0,
     };
+    // Media Foundation's surface-copy phase is the staging round trip: a
+    // CPU-readable texture, the copy into it, and the map that makes it
+    // addressable. The decoded texture itself is never CPU-readable.
+    let surface_copy = readback::Timer::start();
     let mut staging = None;
     unsafe {
         device
@@ -661,6 +666,8 @@ fn copy_nv12_to_rgba(
         unsafe { context.Unmap(&staging, 0) };
         return Err(codec("mapped HEVC readback texture was null"));
     }
+    surface_copy.record(readback::Phase::SurfaceCopy);
+    let color_convert = readback::Timer::start();
     let row_pitch = mapped.RowPitch as usize;
     let width = dimensions.width as usize;
     let height = dimensions.height as usize;
@@ -686,6 +693,8 @@ fn copy_nv12_to_rgba(
             rgba[at + 3] = 255;
         }
     }
+    color_convert.record(readback::Phase::ColorConvert);
+    readback::count_frame();
     unsafe { context.Unmap(&staging, 0) };
     VideoFrame::new(
         dimensions,
