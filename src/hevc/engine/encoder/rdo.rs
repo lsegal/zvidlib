@@ -5,6 +5,7 @@
 //! writer can consume, while the bootstrap encoder can already run the same
 //! deterministic search to exercise the SIMD distortion kernels end to end.
 
+use crate::hevc::engine::binarization::INTRA_PRED_MODE_MAX;
 use crate::hevc::engine::encoder::rdcost;
 
 const CTB: usize = 16;
@@ -347,6 +348,76 @@ fn candidate_partitions(size: usize) -> &'static [&'static [(usize, usize, usize
         32 => SHAPES_32,
         64 => SHAPES_64,
         _ => &[],
+    }
+}
+
+/// The intra luma mode chosen for one block, with the cost that chose it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct IntraModeDecision {
+    /// The selected Table 8-1 `predModeIntra` (0..=34).
+    pub mode: u8,
+    /// The winning mode's SATD against the source block.
+    pub satd: u32,
+    /// `satd + lambda * signalling bits`, the value that selected it.
+    pub rd_cost: u64,
+}
+
+/// Rate-distortion search over the 35 Table 8-1 intra luma modes for one
+/// square block.
+///
+/// `predict` returns the §8.4.4.2.1 prediction for a mode, so the caller
+/// supplies the reference samples it will actually code against — for the
+/// residual writer that is the partially reconstructed picture, which is what
+/// makes the decision consistent with the reconstruction the writer returns.
+///
+/// The rate term is the §7.3.8.5 luma mode signalling itself: a most-probable
+/// mode costs `prev_intra_luma_pred_flag` plus its `mpm_idx` bins, and any
+/// other mode costs the flag plus the five `rem_intra_luma_pred_mode` bins.
+/// `candidates` is the §8.4.2 `candModeList`. Ties go to the lower mode index,
+/// so the search is deterministic.
+pub(crate) fn decide_intra_luma_mode(
+    source: &[u8],
+    source_stride: usize,
+    n_tbs: usize,
+    candidates: [u8; 3],
+    qp: i32,
+    backend: DistortionBackend,
+    mut predict: impl FnMut(u8) -> Vec<i32>,
+) -> IntraModeDecision {
+    let lambda = lambda_q8(qp);
+    let mut pred = vec![0u8; n_tbs * n_tbs];
+    let mut best = IntraModeDecision {
+        mode: 0,
+        satd: u32::MAX,
+        rd_cost: u64::MAX,
+    };
+    for mode in 0..=INTRA_PRED_MODE_MAX {
+        let samples = predict(mode);
+        for (dst, &src) in pred.iter_mut().zip(samples.iter()) {
+            *dst = src as u8;
+        }
+        let satd = metric_satd(source, source_stride, &pred, n_tbs, n_tbs, n_tbs, backend);
+        let bits = u64::from(intra_mode_bit_cost(mode, candidates));
+        let rd_cost = u64::from(satd).saturating_add(bits * u64::from(lambda) / 256);
+        if rd_cost < best.rd_cost {
+            best = IntraModeDecision {
+                mode,
+                satd,
+                rd_cost,
+            };
+        }
+    }
+    best
+}
+
+/// §7.3.8.5 bin count for signalling one luma intra mode: the
+/// `prev_intra_luma_pred_flag` bin plus either the TR (`cMax` 2) `mpm_idx`
+/// bins or the five FL `rem_intra_luma_pred_mode` bins.
+fn intra_mode_bit_cost(mode: u8, candidates: [u8; 3]) -> u32 {
+    match candidates.iter().position(|&c| c == mode) {
+        Some(0) => 2,
+        Some(_) => 3,
+        None => 6,
     }
 }
 

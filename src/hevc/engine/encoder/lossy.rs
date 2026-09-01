@@ -22,17 +22,23 @@
 //!
 //! ## What is coded
 //!
-//! Every coding unit is intra DC (`prev_intra_luma_pred_flag == 1`,
-//! `mpm_idx == 1` — with every neighbour also DC, the §8.4.2 candidate list is
-//! `{ Planar, DC, Angular26 }`) with `intra_chroma_pred_mode == 4` (derived
-//! from luma). Mode search over the 35 intra directions is a separate concern
-//! from having a residual path at all, and belongs with the RDO work in
-//! [`crate::hevc::engine::encoder::rdo`].
+//! Every coding unit carries the intra luma mode
+//! [`crate::hevc::engine::encoder::rdo::decide_intra_luma_mode`] picked for it
+//! out of all 35 Table 8-1 directions, searched against the same reference
+//! samples the block is then coded from, and signalled per §7.3.8.5: a
+//! `prev_intra_luma_pred_flag == 1` plus `mpm_idx` when the mode is in the
+//! §8.4.2 candidate list, and `rem_intra_luma_pred_mode` otherwise. The
+//! candidate list is derived from the left coding unit's mode, since the above
+//! neighbour of a CU that fills its CTB always lies in the CTB row above and
+//! §8.4.2 reduces it to `INTRA_DC`. Chroma stays at
+//! `intra_chroma_pred_mode == 4`, so it is predicted with the luma mode too.
 //!
 //! In-loop filters are neutralized exactly as the PCM writer does it: SAO off
 //! in the SPS and deblocking disabled in the PPS, so the reconstruction below
-//! is the decoder's without a filter pass.
+//! is the decoder's without a filter pass. Enabling them is a separate
+//! decision from mode search and is deliberately not made here.
 
+use crate::hevc::engine::binarization::intra_luma_cand_mode_list;
 use crate::hevc::engine::cabac::init_type;
 use crate::hevc::engine::ctx_init::SliceContexts;
 use crate::hevc::engine::encoder::bitwriter::BitWriter;
@@ -42,6 +48,7 @@ use crate::hevc::engine::encoder::pcm::{
     PcmEncodeError, level_idc_for, write_pps, write_sps, write_vps,
 };
 use crate::hevc::engine::encoder::recon::ReconstructedPicture;
+use crate::hevc::engine::encoder::rdo::{DistortionBackend, decide_intra_luma_mode};
 use crate::hevc::engine::encoder::residual::{
     EngineResidualBinSink, ResidualWriteParams, has_coded_levels, write_residual_coding,
 };
@@ -49,8 +56,8 @@ use crate::hevc::engine::encoder::transform::{
     ForwardBlockParams, chroma_qp, luma_qp, transform_and_quantize,
 };
 use crate::hevc::engine::intra_pred::{
-    Component as IpComponent, IntraPredParams, MarkedReferenceSamples,
-    intra_predict_with_substitution,
+    Component as IpComponent, IntraPredParams, MarkedReferenceSamples, ReferenceSamples,
+    intra_predict, substitute_reference_samples,
 };
 use crate::hevc::engine::picture::clip1;
 use crate::hevc::engine::scan::ScanIdx;
@@ -66,7 +73,8 @@ const CTB: usize = 1 << CTB_LOG2;
 const BIT_DEPTH: u8 = 8;
 /// `ChromaArrayType` — 4:2:0, the only format this writer emits.
 const CHROMA_ARRAY_TYPE: u8 = 1;
-/// `INTRA_DC` (Table 8-1 mode 1) — the only mode this writer codes.
+/// `INTRA_DC` (Table 8-1 mode 1) — the §8.4.2 substitute for an unavailable
+/// neighbour's mode.
 const INTRA_DC: u8 = 1;
 /// The valid `SliceQpY` range at 8-bit depth (`QpBdOffsetY == 0`).
 const QP_RANGE: core::ops::RangeInclusive<i32> = 0..=51;
@@ -172,19 +180,42 @@ fn write_idr_residual_slice(
     let ctbs_x = width / CTB;
     let ctbs_y = height / CTB;
     let total = ctbs_x * ctbs_y;
+    // `IntraPredModeY` of the coding unit coded immediately before this one,
+    // which is the left neighbour whenever there is one.
+    let mut left_mode = INTRA_DC;
     for addr in 0..total {
         let x0 = (addr % ctbs_x) * CTB;
         let y0 = (addr / ctbs_x) * CTB;
 
-        // ---- coding_unit(): PART_2Nx2N, pcm_flag == 0, intra DC ----
+        // §8.4.2 step 2: candIntraPredModeB is INTRA_DC for every coding unit
+        // here, because one CU fills the CTB and so the above neighbour always
+        // lies in the CTB row above. candIntraPredModeA is the left CU's mode,
+        // reduced to INTRA_DC at the left picture edge where it is unavailable.
+        let cand_a = if x0 > 0 { left_mode } else { INTRA_DC };
+        let candidates = intra_luma_cand_mode_list(cand_a, INTRA_DC);
+
+        // The mode search reads the same partially reconstructed neighbours
+        // the block is then coded from, so the winning mode's prediction is
+        // exactly the one the reconstruction below is built on.
+        let luma_refs = reference_samples(&recon.y, width, height, x0, y0, CTB);
+        let mode = decide_intra_luma_mode(
+            &y[y0 * width + x0..],
+            width,
+            CTB,
+            candidates,
+            qp,
+            DistortionBackend::Dispatched,
+            |mode| predict(&luma_refs, mode, TfComponent::Luma),
+        )
+        .mode;
+        left_mode = mode;
+
+        // ---- coding_unit(): PART_2Nx2N, pcm_flag == 0 ----
         cabac.encode_decision(&mut w, &mut ctxs.part_mode[0], 1);
         cabac.encode_terminate(&mut w, 0); // pcm_flag = 0
-        // prev_intra_luma_pred_flag = 1 with mpm_idx = 1: with every
-        // neighbour DC the §8.4.2 candidate list is { Planar, DC, 26 }.
-        cabac.encode_decision(&mut w, &mut ctxs.prev_intra_luma_pred_flag[0], 1);
-        cabac.encode_bypass(&mut w, 1); // mpm_idx, TR(cMax 2): "10" == 1
-        cabac.encode_bypass(&mut w, 0);
-        // intra_chroma_pred_mode = 4 (derived from luma): a single 0 bin.
+        write_luma_intra_mode(&mut w, &mut cabac, &mut ctxs, mode, candidates);
+        // intra_chroma_pred_mode = 4 (derived from luma): a single 0 bin, so
+        // IntraPredModeC is the luma mode chosen above.
         cabac.encode_decision(&mut w, &mut ctxs.intra_chroma_pred_mode[0], 0);
 
         // ---- transform_tree(): split_transform_flag is absent because
@@ -202,8 +233,11 @@ fn write_idr_residual_slice(
             CTB,
             qp_luma,
             TfComponent::Luma,
+            &predict(&luma_refs, mode, TfComponent::Luma),
         );
         let (cx, cy) = (x0 / 2, y0 / 2);
+        let chroma_refs = |plane: &[u8]| reference_samples(plane, cw, ch, cx, cy, CTB / 2);
+        let cb_pred = predict(&chroma_refs(&recon.cb), mode, TfComponent::Cb);
         let chroma_cb = code_block(
             Plane {
                 source: cb,
@@ -216,7 +250,9 @@ fn write_idr_residual_slice(
             CTB / 2,
             qp_chroma,
             TfComponent::Cb,
+            &cb_pred,
         );
+        let cr_pred = predict(&chroma_refs(&recon.cr), mode, TfComponent::Cr);
         let chroma_cr = code_block(
             Plane {
                 source: cr,
@@ -229,6 +265,7 @@ fn write_idr_residual_slice(
             CTB / 2,
             qp_chroma,
             TfComponent::Cr,
+            &cr_pred,
         );
 
         // §7.3.8.8 order: cbf_cb, cbf_cr (ctxInc = trafoDepth = 0), then
@@ -275,14 +312,15 @@ fn write_idr_residual_slice(
     (w.finish(), recon)
 }
 
-/// Code one transform block: predict from the reconstruction so far, transform
-/// and quantize the residual, write the reconstruction back, and return the
-/// quantized levels the caller will code.
+/// Code one transform block from the `prediction` the caller derived for the
+/// mode it coded: transform and quantize the residual, write the
+/// reconstruction back, and return the quantized levels the caller will code.
 ///
 /// The reconstruction step deliberately runs the decoder's own §8.6.2 process
 /// on the quantized levels rather than the encoder's un-quantized residual, so
 /// `recon` holds what a decoder will hold and the next block predicts from the
 /// same samples the decoder will.
+#[allow(clippy::too_many_arguments)]
 fn code_block(
     plane: Plane<'_>,
     recon: &mut [u8],
@@ -291,8 +329,8 @@ fn code_block(
     n_tbs: usize,
     q_p: u32,
     component: TfComponent,
+    prediction: &[i32],
 ) -> Vec<i32> {
-    let prediction = predict_dc(recon, plane.width, plane.height, x0, y0, n_tbs, component);
     let mut residual = vec![0i32; n_tbs * n_tbs];
     for row in 0..n_tbs {
         for col in 0..n_tbs {
@@ -347,8 +385,8 @@ fn code_block(
     levels
 }
 
-/// §8.4.4.2 intra DC prediction for one transform block, reading its
-/// neighbours out of the partially reconstructed plane.
+/// §8.4.4.2.2 — the substituted reference-sample array for one transform
+/// block, read out of the partially reconstructed plane.
 ///
 /// The §6.4.1 z-scan availability for this geometry — one unsplit coding unit
 /// per CTB, coded in raster order, one slice, no tiles — is: the left column
@@ -357,15 +395,14 @@ fn code_block(
 /// exists when the block is not at the top edge, and extends `nTbS` samples to
 /// the right as long as those stay inside the picture, because the
 /// above-right block was coded on the previous CTB row.
-fn predict_dc(
+fn reference_samples(
     recon: &[u8],
     width: usize,
     height: usize,
     x0: usize,
     y0: usize,
     n_tbs: usize,
-    component: TfComponent,
-) -> Vec<i32> {
+) -> ReferenceSamples {
     let sample = |x: usize, y: usize| i32::from(recon[y * width + x]);
     let has_left = x0 > 0;
     let has_top = y0 > 0;
@@ -396,10 +433,18 @@ fn predict_dc(
     };
     let marked = MarkedReferenceSamples::new(n_tbs, corner, left, top)
         .expect("encoder-sized reference array");
-    intra_predict_with_substitution(
-        &marked,
+    substitute_reference_samples(&marked, BIT_DEPTH).expect("encoder-sized reference array")
+}
+
+/// §8.4.4.2.1 steps 1 and 2 — the prediction one mode produces from an
+/// already-substituted reference array. The SPS this writer emits leaves
+/// `intra_smoothing_disabled_flag` and `strong_intra_smoothing_enabled_flag`
+/// both 0, which is what these parameters mirror.
+fn predict(p: &ReferenceSamples, mode: u8, component: TfComponent) -> Vec<i32> {
+    intra_predict(
+        p,
         &IntraPredParams {
-            pred_mode_intra: INTRA_DC,
+            pred_mode_intra: mode,
             cidx: match component {
                 TfComponent::Luma => IpComponent::Luma,
                 TfComponent::Cb => IpComponent::Cb,
@@ -413,7 +458,58 @@ fn predict_dc(
             disable_boundary_filter: false,
         },
     )
-    .expect("intra DC prediction")
+    .expect("Table 8-1 intra mode")
+}
+
+/// §7.3.8.5 — write one coding unit's luma intra mode against the §8.4.2
+/// `candModeList` the decoder will derive for it.
+///
+/// A mode in the list costs `prev_intra_luma_pred_flag == 1` plus the TR
+/// (`cMax` 2) `mpm_idx` bins; any other costs the flag plus the five FL
+/// `rem_intra_luma_pred_mode` bins, whose value is the §8.4.2 step-4
+/// re-injection run backwards: the three most-probable modes are removed from
+/// the 35-mode space by decrementing past each sorted candidate the mode
+/// exceeds, high candidate first.
+fn write_luma_intra_mode(
+    w: &mut BitWriter,
+    cabac: &mut CabacEncoder,
+    ctxs: &mut SliceContexts,
+    mode: u8,
+    candidates: [u8; 3],
+) {
+    if let Some(mpm_idx) = candidates.iter().position(|&c| c == mode) {
+        cabac.encode_decision(w, &mut ctxs.prev_intra_luma_pred_flag[0], 1);
+        // mpm_idx, TR(cMax 2, cRiceParam 0): "0", "10", "11".
+        if mpm_idx == 0 {
+            cabac.encode_bypass(w, 0);
+        } else {
+            cabac.encode_bypass(w, 1);
+            cabac.encode_bypass(w, u8::from(mpm_idx == 2));
+        }
+        return;
+    }
+    cabac.encode_decision(w, &mut ctxs.prev_intra_luma_pred_flag[0], 0);
+    let mut sorted = candidates;
+    sorted.sort_unstable();
+    let mut rem = mode;
+    for candidate in sorted.iter().rev() {
+        if rem > *candidate {
+            rem -= 1;
+        }
+    }
+    debug_assert_eq!(
+        crate::hevc::engine::binarization::derive_intra_pred_mode_y(
+            candidates,
+            crate::hevc::engine::binarization::LumaIntraModeSource::Remaining,
+            rem,
+        ),
+        mode,
+        "rem_intra_luma_pred_mode does not decode back to the coded mode"
+    );
+    // rem_intra_luma_pred_mode, FL(cMax 31): five bypass bins, MSB first.
+    for shift in (0..5).rev() {
+        cabac.encode_bypass(w, (rem >> shift) & 1);
+    }
 }
 
 #[cfg(test)]
