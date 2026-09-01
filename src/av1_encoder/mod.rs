@@ -1301,6 +1301,99 @@ mod nonlossless_tests {
         }
     }
 
+    /// Candidate content for whether the recency window still separates under the shrinkage.
+    ///
+    /// `content_frames` changes its statistics once (`scene_edge`) or four times (`quadrants`).
+    /// These change far more often, in both axes, and continuously, which is the content a
+    /// window over the last few probes could plausibly see where a single boundary cannot.
+    fn window_stress_frames(width: u32, height: u32) -> Vec<(&'static str, Vec<u8>)> {
+        let pixel = |f: &dyn Fn(u32, u32) -> u8| -> Vec<u8> {
+            (0..height)
+                .flat_map(|y| (0..width).map(move |x| f(x, y)).collect::<Vec<_>>())
+                .collect()
+        };
+        // Bands: smooth and high-frequency alternating every 16 rows, so the statistics change
+        // faster than any accumulation longer than a superblock row can follow.
+        let bands = pixel(&|x, y| {
+            if (y / 16) % 2 == 0 {
+                (100 + ((x * 5 + y * 3) % 17)) as u8
+            } else {
+                (((x / 2) ^ (y / 2)) % 2 * 255) as u8
+            }
+        });
+        // Mosaic: the same two statistics on a 32x32 checkerboard, so boundaries run in both
+        // axes rather than only across rows.
+        let mosaic = pixel(&|x, y| {
+            if ((x / 32) + (y / 32)) % 2 == 0 {
+                (100 + ((x * 5 + y * 3) % 17)) as u8
+            } else {
+                (((x / 2) ^ (y / 2)) % 2 * 255) as u8
+            }
+        });
+        // Chirp: spatial frequency rising continuously across the frame, so the ratio a probe
+        // measures is stale by a little at every block rather than by a lot at one boundary.
+        let chirp = pixel(&|x, y| {
+            let period = 2 + (x * 24) / width.max(1);
+            if (x / period + y / period) % 2 == 0 { 40 } else { 210 }
+        });
+        // Fine bands: the same alternation as `bands` every 4 rows, faster than one coding
+        // block, which is the shortest thing a window could track at all.
+        let fine = pixel(&|x, y| {
+            if (y / 4) % 2 == 0 {
+                (100 + ((x * 5 + y * 3) % 17)) as u8
+            } else {
+                (((x / 2) ^ (y / 2)) % 2 * 255) as u8
+            }
+        });
+        vec![
+            ("bands", bands),
+            ("mosaic", mosaic),
+            ("chirp", chirp),
+            ("fine_bands", fine),
+        ]
+    }
+
+    /// Sweeps the recency window on [`window_stress_frames`] plus `scene_edge`, at three sizes.
+    #[test]
+    #[ignore = "measurement sweep, not an assertion"]
+    fn measure_type_gain_memory_windows_on_stress_content() {
+        for (width, height) in [(128_usize, 96_usize), (192, 160), (320, 256)] {
+            let mut frames = window_stress_frames(width as u32, height as u32);
+            let edge = content_frames(width as u32, height as u32)
+                .into_iter()
+                .find(|(name, _)| *name == "scene_edge")
+                .unwrap();
+            frames.push(edge);
+            println!("size,{width}x{height}");
+            println!("frame,qindex,memory,penalty_percent,bytes,candidates");
+            for (name, pixels) in &frames {
+                for qindex in [1_u8, 8, 32, 80, 160, 200] {
+                    let ac = i64::from(crate::av1_intra::get_ac_quant(qindex));
+                    let lambda = (ac * ac / 256).max(1);
+                    let cost = |interval: usize, memory: usize| {
+                        let report = tile::FrameEncoder::new(pixels, width, height, qindex)
+                            .with_type_gain_interval(interval)
+                            .with_type_gain_memory(memory)
+                            .encode_with_report();
+                        (
+                            sse_against(&report, pixels, width, height)
+                                + lambda * report.tile.len() as i64 * 8,
+                            report.tile.len(),
+                            report.candidates_evaluated,
+                        )
+                    };
+                    let (unsampled, _, _) = cost(1, usize::MAX);
+                    for memory in [1_usize, 2, 4, 8, 16, 32, usize::MAX] {
+                        let (sampled, bytes, candidates) =
+                            cost(tile::TYPE_GAIN_SAMPLE_INTERVAL, memory);
+                        let penalty = sampled as f64 / unsampled as f64 * 100.0 - 100.0;
+                        println!("{name},{qindex},{memory},{penalty:+.2},{bytes},{candidates}");
+                    }
+                }
+            }
+        }
+    }
+
     /// Sweeps where a trial that did not probe reads its gain ratio back from.
     ///
     /// [`tile::TYPE_GAIN_MEMORY`] ages the running accumulator, but the ageing is in *probe
