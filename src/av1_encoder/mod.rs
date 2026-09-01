@@ -1648,8 +1648,10 @@ mod nonlossless_tests {
     /// it was calibrated against, the worst frame's penalty climbed to +85.8% by `16`, so the
     /// value had to stay small. `TYPE_GAIN_TRUST` removed that bound - every interval from `1` to
     /// `64` now lands within +3.5% of the unsampled estimator, and the mean cost against the
-    /// exhaustive search is *better* than the unsampled estimator's at every interval past `1` -
-    /// so the penalty column no longer chooses between them.
+    /// exhaustive search is *better* than the unsampled estimator's at every interval past `1`,
+    /// because a trial that probes is corrected in full and so the unsampled arm carries the
+    /// un-shrunk correction everywhere ([`tile::TYPE_GAIN_TRUST`] decomposes it) - so the penalty
+    /// column no longer chooses between them.
     ///
     /// What chooses is coverage. The per-size correction is what makes `TX_4X4` selectable at all:
     /// coding a block as sixteen 4x4 transforms pays for its extra header bits because the type
