@@ -35,6 +35,13 @@
 //! `simd::active_by_site()` that the override landed rather than inferring it
 //! from the clock.
 //!
+//! `hevc_encode_cabac`'s flat arm is a settled question rather than an open
+//! one. The §9.3.5 arithmetic encoder is serial by construction, and
+//! `benches/README.md`'s "Why the CABAC arithmetic encoder stays serial"
+//! records the measurements behind the decision not to pursue a bin-parallel
+//! formulation of it — including the 3.7x ceiling such a formulation would be
+//! chasing, and the two exact serial changes that take most of it instead.
+//!
 //! The one exception is the reconstruction group. It runs the decoder's own
 //! §8.7.2 deblocking and §8.7.3 SAO kernels over the encoder's reconstructed
 //! picture, and those *are* vectorized, so it is the one encoder-side group
