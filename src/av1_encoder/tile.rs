@@ -140,8 +140,10 @@ pub(super) const TYPE_GAIN_SAMPLE_INTERVAL: usize = 2;
 /// The correction exists to be cheap and stays so. The decay is one multiply and one divide per
 /// accumulator, paid only on the sampled trials, and it evaluates 155,392 transform-type
 /// candidates against the frame-wide accumulation's 155,143 - 0.16% more, against the exhaustive
-/// search's 700,004. `measure_type_gain_memory_cost` measures no encode-time difference outside
-/// the host's own run-to-run spread.
+/// search's 700,004. In wall-clock terms, from the minimum of five interleaved rounds per window
+/// in `measure_type_gain_memory_cost` over the six frames at six quantizers, 0.971 s at `4`
+/// against 0.954 s un-decayed: +1.8%, which is the extra candidates plus the arithmetic, and
+/// which the whole window sweep spans (0.954-0.975 s) from end to end.
 pub(super) const TYPE_GAIN_MEMORY: usize = 4;
 
 /// Transform sizes [`FrameEncoder::type_gain`] accumulates over: `TX_4X4` through `TX_32X32`,
