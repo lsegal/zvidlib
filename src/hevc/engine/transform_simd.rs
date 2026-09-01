@@ -348,10 +348,22 @@ mod x86 {
     use super::DequantParams;
     use core::arch::x86_64::*;
 
-    /// AVX2 [`super::transform_1d`]: sixteen `i32` output lanes per
-    /// tile, `vpmulld` + `vpaddd` into register accumulators, narrowing
-    /// to 8- and 4-wide tiles and finally a scalar one for widths the
-    /// widest tile cannot cover.
+    /// AVX2 [`super::transform_1d`]: the whole output row is held in
+    /// `vpmulld`/`vpaddd` register accumulators across the entire `j`
+    /// sweep, so the input is scanned exactly once.
+    ///
+    /// The width is chosen by an exact match on `nTbS` rather than by a
+    /// descending chain of tile widths, for the reasons
+    /// `transform_1d_neon` documents: a tile walked across the output
+    /// row re-runs the `j` loop once per tile, and every extra pass
+    /// re-reads the whole `input`, re-tests each entry against zero and
+    /// re-broadcasts it — which on a sparse column is most of the cost.
+    /// Four `__m256i` accumulators out of x86_64's sixteen `ymm`
+    /// registers cover `nTbS == 32` in one sweep.
+    ///
+    /// Any other length (there is none in §8.6, which defines
+    /// `nTbS ∈ { 4, 8, 16, 32 }`) falls back to a descending tile chain
+    /// plus a scalar tail. See `bench_inverse_transform_and_dequant`.
     ///
     /// # Safety
     /// The host must support AVX2. `basis` must cover every addressed row.
@@ -366,73 +378,96 @@ mod x86 {
         unsafe {
             let n = out.len();
             let row_stride = row_step * basis_stride;
-            let mut base = 0;
-            while base + 16 <= n {
-                let mut acc0 = _mm256_setzero_si256();
-                let mut acc1 = _mm256_setzero_si256();
-                for (j, &xj) in input.iter().enumerate() {
-                    if xj == 0 {
-                        continue;
-                    }
-                    let row = basis.as_ptr().add(j * row_stride + base);
-                    let s = _mm256_set1_epi32(xj);
-                    acc0 = _mm256_add_epi32(
-                        acc0,
-                        _mm256_mullo_epi32(_mm256_loadu_si256(row.cast()), s),
-                    );
-                    acc1 = _mm256_add_epi32(
-                        acc1,
-                        _mm256_mullo_epi32(_mm256_loadu_si256(row.add(8).cast()), s),
-                    );
-                }
-                _mm256_storeu_si256(out.as_mut_ptr().add(base).cast(), acc0);
-                _mm256_storeu_si256(out.as_mut_ptr().add(base + 8).cast(), acc1);
-                base += 16;
-            }
-            while base + 8 <= n {
-                let mut acc = _mm256_setzero_si256();
-                for (j, &xj) in input.iter().enumerate() {
-                    if xj != 0 {
+
+            /// One straight-line pass: `$accs` 8-lane accumulators
+            /// covering `8 * $accs` output lanes starting at `$base`,
+            /// filled by one sweep of the non-zero `input` entries.
+            macro_rules! tile256 {
+                ($base:expr, $accs:literal) => {{
+                    let base = $base;
+                    let mut acc = [_mm256_setzero_si256(); $accs];
+                    for (j, &xj) in input.iter().enumerate() {
+                        if xj == 0 {
+                            continue;
+                        }
                         let row = basis.as_ptr().add(j * row_stride + base);
-                        acc = _mm256_add_epi32(
-                            acc,
-                            _mm256_mullo_epi32(
-                                _mm256_loadu_si256(row.cast()),
-                                _mm256_set1_epi32(xj),
-                            ),
-                        );
+                        let s = _mm256_set1_epi32(xj);
+                        for (k, a) in acc.iter_mut().enumerate() {
+                            *a = _mm256_add_epi32(
+                                *a,
+                                _mm256_mullo_epi32(_mm256_loadu_si256(row.add(k * 8).cast()), s),
+                            );
+                        }
                     }
-                }
-                _mm256_storeu_si256(out.as_mut_ptr().add(base).cast(), acc);
-                base += 8;
+                    for (k, a) in acc.iter().enumerate() {
+                        _mm256_storeu_si256(out.as_mut_ptr().add(base + k * 8).cast(), *a);
+                    }
+                }};
             }
-            while base + 4 <= n {
-                let mut acc = _mm_setzero_si128();
-                for (j, &xj) in input.iter().enumerate() {
-                    if xj != 0 {
+
+            /// As `tile256!`, in 4-lane `xmm` accumulators, for the
+            /// `nTbS == 4` row a 256-bit load would overrun.
+            macro_rules! tile128 {
+                ($base:expr, $accs:literal) => {{
+                    let base = $base;
+                    let mut acc = [_mm_setzero_si128(); $accs];
+                    for (j, &xj) in input.iter().enumerate() {
+                        if xj == 0 {
+                            continue;
+                        }
                         let row = basis.as_ptr().add(j * row_stride + base);
-                        acc = _mm_add_epi32(
-                            acc,
-                            _mm_mullo_epi32(_mm_loadu_si128(row.cast()), _mm_set1_epi32(xj)),
-                        );
+                        let s = _mm_set1_epi32(xj);
+                        for (k, a) in acc.iter_mut().enumerate() {
+                            *a = _mm_add_epi32(
+                                *a,
+                                _mm_mullo_epi32(_mm_loadu_si128(row.add(k * 4).cast()), s),
+                            );
+                        }
+                    }
+                    for (k, a) in acc.iter().enumerate() {
+                        _mm_storeu_si128(out.as_mut_ptr().add(base + k * 4).cast(), *a);
+                    }
+                }};
+            }
+
+            match n {
+                32 => tile256!(0, 4),
+                16 => tile256!(0, 2),
+                8 => tile256!(0, 1),
+                4 => tile128!(0, 1),
+                // Unreachable from §8.6, which defines nTbS as 4/8/16/32.
+                // Kept correct rather than deleted so the kernel stays a
+                // total function of its slice lengths.
+                _ => {
+                    let mut base = 0;
+                    while base + 8 <= n {
+                        tile256!(base, 1);
+                        base += 8;
+                    }
+                    while base + 4 <= n {
+                        tile128!(base, 1);
+                        base += 4;
+                    }
+                    while base < n {
+                        let mut acc = 0i32;
+                        for (j, &xj) in input.iter().enumerate() {
+                            acc += xj * *basis.as_ptr().add(j * row_stride + base);
+                        }
+                        out[base] = acc;
+                        base += 1;
                     }
                 }
-                _mm_storeu_si128(out.as_mut_ptr().add(base).cast(), acc);
-                base += 4;
-            }
-            while base < n {
-                let mut acc = 0i32;
-                for (j, &xj) in input.iter().enumerate() {
-                    acc += xj * *basis.as_ptr().add(j * row_stride + base);
-                }
-                out[base] = acc;
-                base += 1;
             }
         }
     }
 
-    /// SSE4.1 [`super::transform_1d`]: eight `i32` output lanes per
-    /// tile, held in two register accumulators.
+    /// SSE4.1 [`super::transform_1d`]: the whole output row is held in
+    /// 4-lane register accumulators across the entire `j` sweep, so the
+    /// input is scanned exactly once.
+    ///
+    /// Same shape and same reasoning as [`transform_1d_avx2`]; at
+    /// `nTbS == 32` this is eight of x86_64's sixteen `xmm` registers,
+    /// replacing four passes over the input with one.
     ///
     /// # Safety
     /// The host must support SSE4.1. `basis` must cover every addressed row.
@@ -447,45 +482,54 @@ mod x86 {
         unsafe {
             let n = out.len();
             let row_stride = row_step * basis_stride;
-            let mut base = 0;
-            while base + 8 <= n {
-                let mut acc0 = _mm_setzero_si128();
-                let mut acc1 = _mm_setzero_si128();
-                for (j, &xj) in input.iter().enumerate() {
-                    if xj == 0 {
-                        continue;
-                    }
-                    let row = basis.as_ptr().add(j * row_stride + base);
-                    let s = _mm_set1_epi32(xj);
-                    acc0 = _mm_add_epi32(acc0, _mm_mullo_epi32(_mm_loadu_si128(row.cast()), s));
-                    acc1 =
-                        _mm_add_epi32(acc1, _mm_mullo_epi32(_mm_loadu_si128(row.add(4).cast()), s));
-                }
-                _mm_storeu_si128(out.as_mut_ptr().add(base).cast(), acc0);
-                _mm_storeu_si128(out.as_mut_ptr().add(base + 4).cast(), acc1);
-                base += 8;
-            }
-            while base + 4 <= n {
-                let mut acc = _mm_setzero_si128();
-                for (j, &xj) in input.iter().enumerate() {
-                    if xj != 0 {
+
+            /// One straight-line pass: `$accs` 4-lane accumulators
+            /// covering `4 * $accs` output lanes starting at `$base`,
+            /// filled by one sweep of the non-zero `input` entries.
+            macro_rules! tile {
+                ($base:expr, $accs:literal) => {{
+                    let base = $base;
+                    let mut acc = [_mm_setzero_si128(); $accs];
+                    for (j, &xj) in input.iter().enumerate() {
+                        if xj == 0 {
+                            continue;
+                        }
                         let row = basis.as_ptr().add(j * row_stride + base);
-                        acc = _mm_add_epi32(
-                            acc,
-                            _mm_mullo_epi32(_mm_loadu_si128(row.cast()), _mm_set1_epi32(xj)),
-                        );
+                        let s = _mm_set1_epi32(xj);
+                        for (k, a) in acc.iter_mut().enumerate() {
+                            *a = _mm_add_epi32(
+                                *a,
+                                _mm_mullo_epi32(_mm_loadu_si128(row.add(k * 4).cast()), s),
+                            );
+                        }
+                    }
+                    for (k, a) in acc.iter().enumerate() {
+                        _mm_storeu_si128(out.as_mut_ptr().add(base + k * 4).cast(), *a);
+                    }
+                }};
+            }
+
+            match n {
+                32 => tile!(0, 8),
+                16 => tile!(0, 4),
+                8 => tile!(0, 2),
+                4 => tile!(0, 1),
+                // Unreachable from §8.6; see `transform_1d_avx2`.
+                _ => {
+                    let mut base = 0;
+                    while base + 4 <= n {
+                        tile!(base, 1);
+                        base += 4;
+                    }
+                    while base < n {
+                        let mut acc = 0i32;
+                        for (j, &xj) in input.iter().enumerate() {
+                            acc += xj * *basis.as_ptr().add(j * row_stride + base);
+                        }
+                        out[base] = acc;
+                        base += 1;
                     }
                 }
-                _mm_storeu_si128(out.as_mut_ptr().add(base).cast(), acc);
-                base += 4;
-            }
-            while base < n {
-                let mut acc = 0i32;
-                for (j, &xj) in input.iter().enumerate() {
-                    acc += xj * *basis.as_ptr().add(j * row_stride + base);
-                }
-                out[base] = acc;
-                base += 1;
             }
         }
     }
