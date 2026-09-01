@@ -909,8 +909,8 @@ mod nonlossless_tests {
         let pixels = test_pattern(width as u32, height as u32);
         let mut selected_at = Vec::new();
         for qindex in [1_u8, 8, 32, 80, 160, 200] {
-            let report = tile::FrameEncoder::new(&pixels, width, height, qindex)
-                .encode_with_report();
+            let report =
+                tile::FrameEncoder::new(&pixels, width, height, qindex).encode_with_report();
             if report.trace.iter().any(|&(size, _)| size == 4) {
                 selected_at.push(qindex);
             }
@@ -961,4 +961,3 @@ mod nonlossless_tests {
         ));
     }
 }
-
