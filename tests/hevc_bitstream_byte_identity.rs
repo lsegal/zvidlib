@@ -1,3 +1,8 @@
+// `zvidlib::hevc_encoder_bench` is itself gated to non-wasm targets, so this
+// guard keeps `wasm-pack test`'s `cargo build --tests` from failing to resolve
+// it, the way the other native-only integration tests do.
+#![cfg(not(target_arch = "wasm32"))]
+
 //! The widened bit writer changes throughput, never bits.
 //!
 //! Issue #233 widened `BitWriter::put_bits` and gave §7.3.8.7 PCM sample data a
