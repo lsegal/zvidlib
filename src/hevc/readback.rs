@@ -227,7 +227,7 @@ mod tests {
         assert!(report.color_convert >= Duration::from_millis(2));
 
         reset();
-        assert_eq!(report(), Report::default());
+        assert_eq!(super::report(), Report::default());
     }
 
     #[test]

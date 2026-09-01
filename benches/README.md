@@ -863,6 +863,17 @@ run to produce it. The seam counts frames as well as nanoseconds, and the group
 asserts the count matches the window, so a backend that stopped reporting reads
 as a failed run rather than as free readback.
 
+Measured on an Apple Silicon host through VideoToolbox, over the same 32-frame
+window: the surface copy is ~3 us/frame and the colour conversion ~10 ms/frame,
+so readback is roughly two thirds to three quarters of what the `steady_state`
+arm reports as hardware decode (13-15 ms/frame, moving with the host's other
+work). The split is the useful part of that: on unified memory there is no
+transfer to remove, and the host round trip is almost entirely the crate's own
+NV12-to-RGBA pass — the same conversion that is the largest single item in a
+*software* decode. A discrete-GPU host is expected to read differently, with a
+real PCIe transfer in `surface_copy`; `#228`'s x86_64 measurement is where that
+number will come from.
+
 There is no readback arm on the software baseline. The seam covers the
 fixed-function backends; the software decoder's own conversion is already the
 `color_convert` stage in [the decode breakdown](#where-hevc-decode-time-actually-goes)
