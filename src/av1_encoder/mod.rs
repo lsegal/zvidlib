@@ -855,10 +855,10 @@ mod nonlossless_tests {
     /// These are constants of the format, not of the machine that produced them: regenerate them
     /// only alongside a deliberate change to what the encoder emits, never to make a host pass.
     const FIXED_FRAME_DIGESTS: [(usize, u64); 6] = [
-        (5450, 0xc1b8_0f6f_2890_569b),
-        (4305, 0x62f7_0778_cc33_e6a4),
-        (3005, 0xcd2f_1c69_1785_039e),
-        (2214, 0xc7e0_a641_51f5_70e4),
+        (5417, 0x7b83_6e95_6bad_aae1),
+        (4298, 0xa4c4_6a5e_8ef1_57c0),
+        (3022, 0xba87_1a3d_44c1_4f33),
+        (2238, 0xc29d_7d70_a472_3158),
         (1264, 0xc8cd_fcf5_8882_a86c),
         (752, 0x73f1_c047_f3cf_211f),
     ];

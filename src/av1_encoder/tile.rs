@@ -669,11 +669,14 @@ impl<'a> FrameEncoder<'a> {
             //
             // The keep test is strictly less, so an exact tie keeps the earlier candidate and the
             // winner is a function of `candidates` order alone. Ties are not hypothetical: on the
-            // 96x80 test pattern an 8x8 block scores `IDTX` and `DCT_DCT` at exactly the same
-            // cost, and the set order is what decides it. That zero margin is what issue #231 was
-            // about - a one-unit cost difference there flips which type the block writes - so the
+            // 96x80 test pattern of `nonlossless_tests` the smallest emitting-pass margins are 4
+            // (a 4x4 block between `DCT_DCT` and `IDTX`) and 0 (a 4x4 block between `ADST_ADST`
+            // and `DCT_DCT`), where the set order alone decides it. That is the margin issue #231
+            // was about: a one-unit cost difference flips which type such a block writes, so the
             // comparison has to be a total order over a fixed candidate order rather than
-            // anything that depends on evaluation order or on the host.
+            // anything that depends on evaluation order or on the host. Which type wins there is
+            // therefore a property of the pattern, not of the encoder, and is not asserted; that
+            // the *bitstream* comes out the same everywhere is, in `nonlossless_tests`.
             let keep = if probing {
                 tx_type == Av1TxType::DctDct || best.is_none()
             } else {
