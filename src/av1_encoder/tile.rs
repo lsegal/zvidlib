@@ -30,6 +30,7 @@ use super::transform::forward_transform;
 use super::wht::fwht4x4;
 use crate::av1_intra::{Av1TxType, get_ac_quant, get_dc_quant, inverse_transform};
 use crate::av1_intra_pred::add_residual_row;
+use crate::av1_simd::coeff;
 
 /// `NUM_BASE_LEVELS` (§3).
 const NUM_BASE_LEVELS: i32 = 2;
@@ -44,6 +45,11 @@ const MEMO_UNSET: u8 = u8::MAX;
 /// Partition-tree levels the memos cover, one per `Mi_Width_Log2` a coding block can have
 /// (`bw` of 8, 16, 32 and 64, so `bsl` 1 through 4).
 const MEMO_LEVELS: usize = 5;
+
+/// A 64x64 superblock's side in MI (4-sample) units, which is the grid
+/// [`FrameEncoder::encode_superblocks`] walks and the one the per-column transform-gain
+/// accumulators are indexed on.
+const SB4: usize = 16;
 
 /// Bits [`estimate_rate`] charges a block whose levels are all zero: the `all_zero` flag alone.
 const ZERO_BLOCK_BITS: i64 = 1;
@@ -92,73 +98,19 @@ const TYPE_GAIN_PROBES: usize = 1;
 /// four-fold reduction the shortcuts exist for and
 /// `the_search_shortcuts_stay_within_their_rate_and_distortion_bound` asserts; `2` clears it with
 /// 155,143. What remains at `2` is the estimator mixing statistics across regions rather than the
-/// sampling rate, which no interval fixes; [`TYPE_GAIN_MEMORY`] is what addresses that, and the
-/// worst-penalty column above is the frame-wide accumulation it replaced.
+/// sampling rate, which no interval fixes; [`TYPE_GAIN_TRUST`] is what addresses that, and the
+/// worst-penalty column above is the uncorrected estimator it shrinks.
 pub(super) const TYPE_GAIN_SAMPLE_INTERVAL: usize = 2;
-
-/// Probes a transform size's accumulated gain ratio remembers, as the window of an exponential
-/// recency weighting.
-///
-/// The ratio a probe measures is a property of the *content around the block it was measured on*,
-/// not of the frame: on a frame whose statistics change across it, a block corrected by a ratio
-/// measured on the other side of that change can have two close sizes ranked the wrong way round.
-/// Accumulating every probe of a size equally over the whole frame is what made the correction
-/// frame-wide, and #266 established that no [`TYPE_GAIN_SAMPLE_INTERVAL`] fixes it - `2`, `3` and
-/// `4` all carry the same penalty, because re-measuring more often does not stop the older
-/// measurements from outvoting the new ones.
-///
-/// So each accumulator is aged by `(n-1)/n` before a new probe joins it. A probe's weight decays
-/// geometrically over the following `n` probes, which - since the size searches that probe are
-/// visited in the decoder's superblock raster order - makes the ratio a block reads back the one
-/// its own neighbourhood measured, and lets it follow the content across a region boundary within
-/// a few coding blocks instead of never. This was chosen over a per-superblock-row reset (too
-/// coarse: a 64-row band is most of a small frame, and it discards the correction entirely at the
-/// start of each band) and over keeping a ratio per spatial region (which needs a region map the
-/// encoder does not have and memory proportional to the frame).
-///
-/// `4` is where it measured out, on the `content_frames` set plus `test_pattern` at both 128x96
-/// and 192x160 over the six quantizers, as each frame's worst penalty in `sse + lambda * bits`
-/// against the same estimator probing every size search. `frame` is the un-decayed accumulation
-/// this replaced:
-///
-/// | window     | scene_edge | quadrants | smooth | test_pattern | candidates |
-/// |-----------:|-----------:|----------:|-------:|-------------:|-----------:|
-/// | 1          | +8.26%     | +0.86%    | +0.08% | +3.12%       | 155,725    |
-/// | 2          | +9.11%     | +1.49%    | +0.52% | +0.37%       | 155,696    |
-/// | 4          | +9.32%     | +0.00%    | +0.52% | +0.37%       | 155,392    |
-/// | 8          | +16.36%    | +0.00%    | +0.52% | +0.37%       | 155,357    |
-/// | 32         | +29.96%    | +0.00%    | +0.52% | +0.37%       | 155,109    |
-/// | frame      | +44.14%    | +0.00%    | +0.52% | +0.37%       | 155,143    |
-///
-/// (`noise` and `diagonals` are 0.00% at every window and are left out of the table.) `4` is the
-/// largest window that gives up none of the improvement - it cuts the scene edge's penalty by a
-/// factor of 4.7 at 192x160 and from +30.04% to +2.13% at 128x96 - while regressing no other
-/// frame against the frame-wide accumulation. Shorter windows start trading it back: `2` costs
-/// `quadrants` +1.49% and `1`, which remembers only the last probe, costs `test_pattern` +3.12%,
-/// because a single probe is too noisy an estimate to rank a size on.
-///
-/// The correction exists to be cheap and stays so. The decay is one multiply and one divide per
-/// accumulator, paid only on the sampled trials, and it evaluates 155,392 transform-type
-/// candidates against the frame-wide accumulation's 155,143 - 0.16% more, against the exhaustive
-/// search's 700,004. In wall-clock terms, from the minimum of five interleaved rounds per window
-/// in `measure_type_gain_memory_cost` over the six frames at six quantizers, 0.971 s at `4`
-/// against 0.954 s un-decayed: +1.8%, which is the extra candidates plus the arithmetic, and
-/// which the whole window sweep spans (0.954-0.975 s) from end to end.
-pub(super) const TYPE_GAIN_MEMORY: usize = 4;
 
 /// Transform sizes [`FrameEncoder::type_gain`] accumulates over: `TX_4X4` through `TX_32X32`,
 /// which is every size [`super::transform::forward_transform`] implements.
 const TYPE_GAIN_SIZES: usize = 4;
 
-/// What a probed transform block's full-set result is keyed to: its position on the coded grid,
-/// its transform size, and the DC prediction it was measured against.
-///
-/// Those four values determine the block's residual - the source samples are fixed, so the
-/// residual is `sample - prediction` over a known rectangle - and the residual plus the size
-/// determines everything the search derives from it: the candidate set, the forward transform,
-/// the quantized levels, the reconstruction and the `sse + lambda * bits` cost. Nothing else the
-/// encoder carries can change the answer, so a key that matches is not merely a plausible match
-/// but the same computation.
+/// What a probed transform block is identified by: its position on the coded grid, its transform
+/// size, and the DC prediction it was measured against - the four values that determine its
+/// residual and so everything the search derives from it. Only the coverage measurement in
+/// `measure_probe_reuse_coverage` reads these back; see [`FrameEncoder::probe_keys`].
+#[cfg(test)]
 type ProbeKey = (usize, usize, usize, u8);
 
 /// One transform size's accumulated probe measurement for the frame.
@@ -169,7 +121,121 @@ struct TypeGain {
     /// Summed best-of-set cost of the same blocks, so `dct_cost - best_cost` is what the type
     /// search has been measured to be worth at this size.
     best_cost: i64,
+    /// Probes accumulated, which [`Self::ratio`]'s mean divides by. Only the sweep that
+    /// measured the unweighted mean against the shipped ratio of sums reads that.
+    #[cfg(test)]
+    probes: i64,
+    /// The same measurement as the mean of the probes' *own* ratios, in [`GAIN_RATIO_ONE`]
+    /// units, so an expensive probe does not outweigh a cheap one. Measured and rejected; kept
+    /// for [`GainRatio`].
+    #[cfg(test)]
+    ratio: i64,
 }
+
+/// Where a trial that did not probe reads its gain ratio back from.
+///
+/// Shipped encodes always use [`GainLocality::Blended`]; the other arms exist so
+/// `measure_type_gain_locality` can measure it against them on the same frames.
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GainLocality {
+    /// The running accumulator alone, which is what #272 shipped: probe order, so the probes
+    /// nearest a block are a horizontal run of coding blocks.
+    Running,
+    /// The superblock column's accumulator alone, whose most recent probes before the current
+    /// superblock are the ones directly above it.
+    Column,
+    /// Both, summed, so the ratio a block reads back is measured on its own neighbourhood in
+    /// both axes.
+    Blended,
+}
+
+/// How a remembered gain ratio is averaged over the probes it remembers.
+///
+/// Shipped encodes always use [`GainRatio::Mean`]; [`GainRatio::Weighted`] is what #272 shipped
+/// and is kept so `measure_type_gain_ratio` can measure the two against each other.
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GainRatio {
+    /// Ratio of the summed costs, which weights each probe by how expensive its block was.
+    Weighted,
+    /// Mean of the probes' own ratios, which weights every probe equally.
+    Mean,
+}
+
+/// How much of a *remembered* gain a trial that did not probe is corrected by, in
+/// [`TYPE_GAIN_TRUST_ONE`] sixteenths. A trial that probed is corrected in full by what it
+/// measured on its own block; only an estimate carried from other blocks is shrunk.
+///
+/// #272's recency weighting (`TYPE_GAIN_MEMORY`, a window of four probes, removed by #308 once
+/// this shrinkage made it unmeasurable) left `scene_edge` at +9.32% against the unsampled
+/// estimator at 192x160, an order of magnitude above every other frame, and issue #279 asked
+/// whether what was left was spatial locality in the axis a window over probe order cannot see -
+/// probes are visited in superblock raster order, so a window of four spanned a horizontal run
+/// of coding blocks. It is not, and three measurements say so.
+///
+/// `measure_type_gain_locality` keeps a second accumulator per *superblock column*, whose most
+/// recent probes when a superblock starts are the ones directly above it. Reading that back
+/// instead of the running accumulator measures +9.92% and blending the two +9.32%: the other axis
+/// carries no information the running accumulator was missing. (`scene_edge`'s boundary is
+/// horizontal, so a column's own history crosses it too.)
+///
+/// `measure_type_gain_probes` steadies the estimate instead, from one probed block per trial to
+/// sixteen. At 192x160 the frame sits between +9.32% and +9.48% throughout, so it is not the
+/// noise in a one-block estimate either, and the extra probes cost 154,300 more candidates at
+/// sixteen.
+///
+/// `measure_scene_edge_size_choices` names it. The whole penalty is at one quantizer (160), where
+/// 29 of the frame's 156 transform-size decisions differ from the unsampled estimator's, spread
+/// over the entire frame, top region and bottom alike, rather than gathered at the boundary, and
+/// 27 of the 29 go the same way: the sampled estimator codes the block in *smaller* transforms.
+/// That is what an over-large correction looks like rather than a mislocated one. The correction
+/// is `gain * sum(dct)` over the trial's searched blocks, so it grows with the trial's block
+/// count; inflate the gain and the size with more blocks wins. The frame's cost moves
+/// accordingly: 189 bytes more for 38,624 less squared error at a `lambda` that charges 548,856
+/// for them.
+///
+/// So the estimate is shrunk toward no correction at all, which is a plain statement of how much
+/// less a ratio measured on other blocks is worth than one measured on this block. Sixteenths of
+/// the remembered gain, as each frame's worst penalty in `sse + lambda * bits` against the same
+/// estimator probing every size search, over the `content_frames` set plus `test_pattern` at the
+/// six quantizers:
+///
+/// | trust | scene_edge 128x96 | smooth 128x96 | scene_edge 192x160 | smooth 192x160 | test_pattern 192x160 | candidates |
+/// |------:|------------------:|--------------:|-------------------:|---------------:|---------------------:|-----------:|
+/// | 0     | +0.10%            | +0.47%        | +1.27%             | +0.54%         | +0.00%               | 150,680    |
+/// | 1     | +0.10%            | +0.00%        | +1.27%             | +0.08%         | +0.00%               | 150,827    |
+/// | 2     | +0.10%            | +0.00%        | +1.27%             | +0.08%         | +0.00%               | 151,019    |
+/// | 4     | +0.10%            | +0.00%        | +1.27%             | +0.08%         | +0.37%               | 152,176    |
+/// | 6     | +0.10%            | +0.00%        | +8.42%             | +0.08%         | +0.37%               | 153,872    |
+/// | 8     | +1.37%            | +1.16%        | +8.42%             | +0.53%         | +0.37%               | 154,617    |
+/// | 16    | +2.13%            | +1.15%        | +9.32%             | +0.52%         | +0.37%               | 155,392    |
+///
+/// (`noise`, `diagonals` and `quadrants` are +0.00% at every value and are left out; the
+/// candidate column is 192x160.) `2` is the middle of the `1..=3` plateau where every frame is
+/// at its own minimum, with a value either side of it before anything moves: `0` gives up
+/// `smooth`'s +0.47% by discarding the remembered correction entirely, and `4` starts trading
+/// `test_pattern` back. It takes the scene edge from +9.32% to +1.27% at 192x160 and from
+/// +2.13% to +0.10% at 128x96, and
+/// `the_type_gain_sampling_interval_holds_on_content_it_was_not_tuned_on` asserts both sizes.
+///
+/// The correction exists to be cheap and stays so. The shrinkage is one multiply and one divide
+/// on the trials that did not probe, and because a smaller correction stops promoting small
+/// transform sizes it evaluates 151,019 transform-type candidates against the un-shrunk 155,392,
+/// 2.8% *fewer*, against the exhaustive search's 700,004. Fewer candidates but slightly more
+/// time: from the minimum of five interleaved rounds per arm in `measure_type_gain_trust_cost`
+/// over the six frames at six quantizers, 0.686 s against 0.677 s un-shrunk, +1.3%. The
+/// candidates it stops evaluating are the cheapest ones - a 4x4 or 8x8 transform of a block it
+/// now codes whole - so removing them does not pay for the larger transforms it codes instead.
+pub(super) const TYPE_GAIN_TRUST: i64 = 2;
+
+/// [`TYPE_GAIN_TRUST`] denominator: the un-shrunk correction.
+const TYPE_GAIN_TRUST_ONE: i64 = 16;
+
+/// Fixed-point scale of [`TypeGain::ratio`], which is a fraction in `0..=1` and needs the
+/// resolution an integer ratio of costs would otherwise lose.
+#[cfg(test)]
+const GAIN_RATIO_ONE: i64 = 1 << 20;
 
 /// Slot in [`FrameEncoder::type_gain`] for a transform of `tx_width` samples a side.
 fn type_gain_slot(tx_width: usize) -> usize {
@@ -232,6 +298,18 @@ pub(crate) struct FrameEncoder<'a> {
     /// probe reads it back, so a size's gain is measured on a sample of its trials rather than on
     /// all of them.
     type_gain: [TypeGain; TYPE_GAIN_SIZES],
+    /// The same measurement kept per superblock column, one [`TYPE_GAIN_SIZES`] block per column
+    /// of the frame. A probe joins its own column's accumulator as well as the running one, and
+    /// because a column is only revisited a superblock row later, the probes it still remembers
+    /// when a superblock starts are the ones directly above it. Measured and rejected - it does
+    /// not move the frame #272's recency weighting left behind - so only [`GainLocality`] reads
+    /// it and nothing outside tests maintains it.
+    #[cfg(test)]
+    column_gain: Vec<TypeGain>,
+    /// Superblock column of the coding block whose size search is running, which is the
+    /// [`Self::column_gain`] block that search probes into and reads back.
+    #[cfg(test)]
+    gain_column: usize,
     /// The current trial's own probe measurement, or a zeroed pair when it did not probe. A
     /// trial that probed is corrected by what it measured itself, exactly as every trial was
     /// before the measurement was sampled; only the trials that skip the probe fall back to
@@ -244,23 +322,10 @@ pub(crate) struct FrameEncoder<'a> {
     /// the measured gain is extrapolated over. Zero-skipped blocks are excluded: no transform type
     /// can improve a block that codes no coefficients.
     trial_searched_cost: i64,
-    /// Full-set winners a size trial's probe already computed, by [`ProbeKey`].
-    ///
-    /// A probe runs the whole type search and then throws its winner away so the trial keeps
-    /// DCT's reconstruction and contexts. The winner is still exactly what the emitting pass
-    /// would recompute for that block, though, provided the emitting pass reaches it under the
-    /// same key - which it does for the size the search selects, and only for that size, because
-    /// the emitting pass replays the winning trial's state. Entries under any other key are never
-    /// read; an entry is removed as it is consumed.
-    probed: std::collections::HashMap<ProbeKey, TxCandidate>,
     /// Set by [`Self::without_search_shortcuts`] to restore the original exhaustive search, so a
     /// test can compare the shortcuts against the search they stand in for.
     #[cfg(test)]
     exhaustive: bool,
-    /// Cleared by [`Self::without_probe_reuse`] to make the emitting pass re-run every search a
-    /// probe already did, so a test can measure what reading the probe back saves.
-    #[cfg(test)]
-    reuse_probes: bool,
     /// Set by [`Self::with_reversed_candidate_order`] to walk the transform-type and
     /// transform-size candidates backwards, so a test can prove no decision depends on the order
     /// they are evaluated in.
@@ -271,19 +336,59 @@ pub(crate) struct FrameEncoder<'a> {
     /// right. Outside tests the constant is read directly.
     #[cfg(test)]
     type_gain_interval: usize,
-    /// The recency window in force, so a test can sweep it the same way. Outside tests
-    /// [`TYPE_GAIN_MEMORY`] is read directly.
+    /// The locality arm in force, so a test can measure the shipped one against the accumulators
+    /// it blends. [`GainLocality::Blended`] outside tests.
     #[cfg(test)]
-    type_gain_memory: usize,
+    type_gain_locality: GainLocality,
+    /// Transform blocks a probing size trial measures with the whole type set, so a test can
+    /// sweep it. [`TYPE_GAIN_PROBES`] outside tests.
+    #[cfg(test)]
+    type_gain_probes: usize,
+    /// How a remembered ratio is averaged, so a test can sweep it. [`GainRatio::Mean`] outside
+    /// tests.
+    #[cfg(test)]
+    type_gain_ratio: GainRatio,
+    /// The shrinkage in force, in the units of [`TYPE_GAIN_TRUST`], so a test can sweep it.
+    #[cfg(test)]
+    type_gain_trust: i64,
     /// Transform-type candidates actually transformed, quantized and reconstructed, which is the
     /// work the shortcuts exist to remove.
     #[cfg(test)]
     candidates_evaluated: u64,
+    /// Every transform-size decision this frame's searches made, for [`SearchReport`].
+    #[cfg(test)]
+    size_choices: Vec<(usize, usize, usize, usize)>,
+    /// Reused buffers for the per-block coefficient context pass.
+    coeff_ctx: CoeffScratch,
     /// Exact `sse + lambda * bits` ties the transform-type and transform-size searches had to
     /// settle, so a test can show the tie-break is reached on real content rather than assert an
     /// order-independence that holds only because nothing ever tied.
     #[cfg(test)]
     cost_ties: u64,
+    /// Every [`ProbeKey`] a size trial probed, in the order they were measured, against the key
+    /// the emitting pass actually reached at each transform block's position. How far the two
+    /// sets overlap is what any reuse of a probe's result could ever have covered, which
+    /// `measure_probe_reuse_coverage` reports and #291 closed on.
+    #[cfg(test)]
+    probe_keys: Vec<ProbeKey>,
+    /// `(size, prediction)` of every transform block the emitting pass wrote, by its position.
+    #[cfg(test)]
+    emitted_blocks: std::collections::HashMap<(usize, usize), (usize, u8)>,
+    /// Coding blocks the emitting pass wrote, which bounds how many probes could ever be read
+    /// back: a size trial probes one block, so no emitted coding block can consume more than one.
+    #[cfg(test)]
+    emitted_coding_blocks: u64,
+    /// Size searches that probed, which bounds it further under the sampling interval.
+    #[cfg(test)]
+    probing_size_searches: u64,
+    /// Emitted blocks the zero-block shortcut decided, which no probe ever ran on.
+    #[cfg(test)]
+    zero_skipped_emitted: u64,
+    /// Emitted blocks that ran a transform-type search over more than one candidate, which is
+    /// every emitted block a probe could ever have stood in for: a zero-skipped block never
+    /// searches, and a size whose derived set names one type has nothing to choose between.
+    #[cfg(test)]
+    reusable_emitted: u64,
 }
 
 /// What one encode of a tile did, for the tests that compare two searches against each other.
@@ -294,13 +399,24 @@ pub(crate) struct SearchReport {
     pub(crate) coded_width: usize,
     pub(crate) trace: Vec<(usize, Av1TxType)>,
     pub(crate) candidates_evaluated: u64,
+    /// Every transform-size decision the frame's searches made, as `(row, column, block width,
+    /// chosen transform width)` in MI units, so a measurement can attribute a difference between
+    /// two searches to a place in the frame rather than to a position in the trace.
+    pub(crate) size_choices: Vec<(usize, usize, usize, usize)>,
     pub(crate) cost_ties: u64,
+    /// The probe and emit key sets and the counts that bound their overlap, for
+    /// `measure_probe_reuse_coverage`.
+    pub(crate) probe_keys: Vec<(usize, usize, usize, u8)>,
+    pub(crate) emitted_blocks: std::collections::HashMap<(usize, usize), (usize, u8)>,
+    pub(crate) emitted_coding_blocks: u64,
+    pub(crate) probing_size_searches: u64,
+    pub(crate) zero_skipped_emitted: u64,
+    pub(crate) reusable_emitted: u64,
 }
 
 /// One transform type considered for a block, with everything the winner needs to be written:
 /// the `tx_type` symbol's index in its set, the quantized levels, the reconstructed residual,
 /// and the `sse + lambda * bits` cost the search minimizes.
-#[derive(Clone)]
 struct TxCandidate {
     symbol: usize,
     /// Only the trace the tests assert on reads this back; the bitstream carries `symbol`.
@@ -309,6 +425,65 @@ struct TxCandidate {
     levels: Vec<i32>,
     reconstructed: Vec<i16>,
     cost: i64,
+}
+
+/// Reusable buffers for one transform block's §8.3.2 coefficient contexts.
+///
+/// The contexts are derived for the whole block in a single pass before the serial symbol loop
+/// runs, which is legal because every neighbour `coeff_base` and `coeff_br` consult lies later in
+/// the up-right diagonal scan than the position consulting it, and the loop walks that scan
+/// backwards — so those neighbours are already final (or, past the end-of-block, zero) before the
+/// first symbol is written. See [`crate::av1_simd::coeff`] for the vector kernel that pass
+/// dispatches to.
+///
+/// The buffers live on the encoder rather than the block so a frame's hundreds of thousands of
+/// transform blocks share one allocation each. The padded plane's zero border is written once per
+/// size and never again, so a block only overwrites its own `size * size` interior.
+#[derive(Default)]
+pub(crate) struct CoeffScratch {
+    /// The size the buffers below are currently shaped for; `0` before the first block.
+    size: usize,
+    /// Clamped magnitudes in the zero-padded layout `crate::av1_simd::coeff` reads.
+    plane: Vec<i32>,
+    /// `coeff_base` context per raster position.
+    pub(crate) base: Vec<i32>,
+    /// `coeff_br` context per raster position.
+    pub(crate) br: Vec<i32>,
+}
+
+impl CoeffScratch {
+    /// Reshapes the buffers for a `size x size` block, rewriting the padded plane's zero border
+    /// only when the size actually changed.
+    fn resize(&mut self, size: usize) {
+        if self.size == size {
+            return;
+        }
+        self.size = size;
+        coeff::reset_padded_plane(&mut self.plane, size);
+        self.base.clear();
+        self.base.resize(size * size, 0);
+        self.br.clear();
+        self.br.resize(size * size, 0);
+    }
+
+    /// Fills [`Self::base`] and [`Self::br`] for every position of a block whose quantized
+    /// coefficients are `quant`, through the vector kernel when the active instruction set has
+    /// one and through `tile.rs`'s scalar reference otherwise.
+    pub(crate) fn derive(&mut self, quant: &[i32], size: usize) {
+        self.resize(size);
+        let isa = coeff::active_isa();
+        if coeff::has_vector_kernel(isa) {
+            coeff::fill_padded_levels(&mut self.plane, quant, size);
+            if crate::av1_simd::coeff_contexts(isa, &self.plane, size, &mut self.base, &mut self.br)
+            {
+                return;
+            }
+        }
+        for pos in 0..size * size {
+            self.base[pos] = coeff_base_ctx(pos, quant, size) as i32;
+            self.br[pos] = coeff_br_ctx(pos, quant, size) as i32;
+        }
+    }
 }
 
 /// The block-local encoder state a speculative (non-emitting) trial mutates, saved so the trial
@@ -367,25 +542,47 @@ impl<'a> FrameEncoder<'a> {
             tx_size_memo: vec![MEMO_UNSET; MEMO_LEVELS * mi_cols * mi_rows],
             probe_budget: 0,
             type_gain: [TypeGain::default(); TYPE_GAIN_SIZES],
+            #[cfg(test)]
+            column_gain: vec![TypeGain::default(); mi_cols.div_ceil(SB4) * TYPE_GAIN_SIZES],
+            #[cfg(test)]
+            gain_column: 0,
             probe_dct_cost: 0,
             probe_best_cost: 0,
             size_searches: 0,
             trial_searched_cost: 0,
-            probed: std::collections::HashMap::new(),
             #[cfg(test)]
             exhaustive: false,
-            #[cfg(test)]
-            reuse_probes: true,
             #[cfg(test)]
             reversed_candidates: false,
             #[cfg(test)]
             type_gain_interval: TYPE_GAIN_SAMPLE_INTERVAL,
             #[cfg(test)]
-            type_gain_memory: TYPE_GAIN_MEMORY,
+            type_gain_locality: GainLocality::Running,
+            #[cfg(test)]
+            type_gain_probes: TYPE_GAIN_PROBES,
+            #[cfg(test)]
+            type_gain_ratio: GainRatio::Weighted,
+            #[cfg(test)]
+            type_gain_trust: TYPE_GAIN_TRUST,
             #[cfg(test)]
             candidates_evaluated: 0,
             #[cfg(test)]
+            size_choices: Vec::new(),
+            coeff_ctx: CoeffScratch::default(),
+            #[cfg(test)]
             cost_ties: 0,
+            #[cfg(test)]
+            probe_keys: Vec::new(),
+            #[cfg(test)]
+            emitted_blocks: std::collections::HashMap::new(),
+            #[cfg(test)]
+            emitted_coding_blocks: 0,
+            #[cfg(test)]
+            probing_size_searches: 0,
+            #[cfg(test)]
+            zero_skipped_emitted: 0,
+            #[cfg(test)]
+            reusable_emitted: 0,
         }
     }
 
@@ -420,27 +617,6 @@ impl<'a> FrameEncoder<'a> {
         true
     }
 
-    /// Makes the emitting pass search every block from scratch, including the ones a size trial's
-    /// probe already searched. The result is the same bitstream at a higher candidate count,
-    /// which is what a test compares against.
-    #[cfg(test)]
-    pub(crate) fn without_probe_reuse(mut self) -> Self {
-        self.reuse_probes = false;
-        self
-    }
-
-    /// Whether the emitting pass reads a probe's cached result back. Always, outside tests.
-    #[cfg(test)]
-    fn reuse_probes(&self) -> bool {
-        self.reuse_probes
-    }
-
-    /// Whether the emitting pass reads a probe's cached result back. Always, outside tests.
-    #[cfg(not(test))]
-    fn reuse_probes(&self) -> bool {
-        true
-    }
-
     /// Overrides the probe sampling interval, so a test can measure the estimator at intervals
     /// other than the shipped one. `1` probes every size search, which is the unsampled search
     /// the shipped interval approximates.
@@ -465,31 +641,82 @@ impl<'a> FrameEncoder<'a> {
         TYPE_GAIN_SAMPLE_INTERVAL
     }
 
-    /// Overrides the recency window, so a test can measure the estimator between remembering one
-    /// probe and remembering the whole frame. `usize::MAX` disables the decay, which is the
-    /// frame-wide accumulation this replaced.
+    /// Overrides where a trial reads its gain ratio back from, so a test can measure the shipped
+    /// blend against each accumulator on its own.
     #[cfg(test)]
-    pub(crate) fn with_type_gain_memory(mut self, memory: usize) -> Self {
-        assert!(
-            memory >= 1,
-            "a window of 0 would divide the accumulator by zero"
-        );
-        self.type_gain_memory = memory;
+    pub(crate) fn with_type_gain_locality(mut self, locality: GainLocality) -> Self {
+        self.type_gain_locality = locality;
         self
     }
 
-    /// Probes a size's gain ratio remembers. [`TYPE_GAIN_MEMORY`] outside tests, where nothing
-    /// can override it.
+    /// The locality arm in force. Only a test can select anything but
+    /// [`GainLocality::Running`], which is what the encoder does.
     #[cfg(test)]
-    fn type_gain_memory(&self) -> usize {
-        self.type_gain_memory
+    fn type_gain_locality(&self) -> GainLocality {
+        self.type_gain_locality
     }
 
-    /// Probes a size's gain ratio remembers. [`TYPE_GAIN_MEMORY`] outside tests, where nothing
-    /// can override it.
+    /// Overrides how many of a probing trial's blocks are measured with the whole type set, so a
+    /// test can measure what a noisier or steadier probe is worth.
+    #[cfg(test)]
+    pub(crate) fn with_type_gain_probes(mut self, probes: usize) -> Self {
+        assert!(
+            probes >= 1,
+            "a trial that probes measures at least one block"
+        );
+        self.type_gain_probes = probes;
+        self
+    }
+
+    /// Blocks a probing trial measures. [`TYPE_GAIN_PROBES`] outside tests.
+    #[cfg(test)]
+    fn type_gain_probes(&self) -> usize {
+        self.type_gain_probes
+    }
+
+    /// Blocks a probing trial measures. [`TYPE_GAIN_PROBES`] outside tests.
     #[cfg(not(test))]
-    fn type_gain_memory(&self) -> usize {
-        TYPE_GAIN_MEMORY
+    fn type_gain_probes(&self) -> usize {
+        TYPE_GAIN_PROBES
+    }
+
+    /// Overrides how a remembered ratio is averaged, so a test can measure the shipped mean
+    /// against the cost-weighted ratio of sums it replaced.
+    #[cfg(test)]
+    pub(crate) fn with_type_gain_ratio(mut self, ratio: GainRatio) -> Self {
+        self.type_gain_ratio = ratio;
+        self
+    }
+
+    /// How a remembered ratio is averaged. Only a test can select anything but
+    /// [`GainRatio::Weighted`], which is what the encoder does.
+    #[cfg(test)]
+    fn type_gain_ratio(&self) -> GainRatio {
+        self.type_gain_ratio
+    }
+
+    /// Overrides how far a remembered gain is shrunk toward no correction at all, so a test can
+    /// sweep it. `16` is the un-shrunk correction and `0` no correction.
+    #[cfg(test)]
+    pub(crate) fn with_type_gain_trust(mut self, trust: i64) -> Self {
+        assert!(
+            (0..=TYPE_GAIN_TRUST_ONE).contains(&trust),
+            "shrinkage is a fraction"
+        );
+        self.type_gain_trust = trust;
+        self
+    }
+
+    /// The shrinkage in force. [`TYPE_GAIN_TRUST`] outside tests.
+    #[cfg(test)]
+    fn type_gain_trust(&self) -> i64 {
+        self.type_gain_trust
+    }
+
+    /// The shrinkage in force. [`TYPE_GAIN_TRUST`] outside tests.
+    #[cfg(not(test))]
+    fn type_gain_trust(&self) -> i64 {
+        TYPE_GAIN_TRUST
     }
 
     /// Encodes the tile and returns the symbol-coded bytes (`decode_tile`, §5.11.2).
@@ -510,7 +737,14 @@ impl<'a> FrameEncoder<'a> {
             coded_width: self.coded_w,
             trace: std::mem::take(&mut self.emitted),
             candidates_evaluated: self.candidates_evaluated,
+            size_choices: std::mem::take(&mut self.size_choices),
             cost_ties: self.cost_ties,
+            probe_keys: std::mem::take(&mut self.probe_keys),
+            emitted_blocks: std::mem::take(&mut self.emitted_blocks),
+            emitted_coding_blocks: self.emitted_coding_blocks,
+            probing_size_searches: self.probing_size_searches,
+            zero_skipped_emitted: self.zero_skipped_emitted,
+            reusable_emitted: self.reusable_emitted,
             tile: self.sym.finish(),
         }
     }
@@ -524,18 +758,12 @@ impl<'a> FrameEncoder<'a> {
     }
 
     fn encode_superblocks(&mut self) {
-        const SB4: usize = 16; // 64×64 superblock in MI units
         let mut r = 0;
         while r < self.mi_rows {
             self.left_level.fill(0);
             self.left_dc.fill(0);
             let mut c = 0;
             while c < self.mi_cols {
-                // A probe is only ever read back inside the superblock that measured it - the
-                // emitting pass reaches a probed block while the trial that probed it is still
-                // the state it replays - so the cache is dropped at each superblock boundary
-                // rather than accumulating every speculative trial of the frame.
-                self.probed.clear();
                 self.encode_partition(r, c, 64, true);
                 c += SB4;
             }
@@ -744,6 +972,10 @@ impl<'a> FrameEncoder<'a> {
         }
         let largest = bw.min(MAX_TX_WIDTH);
         let (_, max_depth) = cdf::tx_depth_cdf(bw);
+        #[cfg(test)]
+        {
+            self.gain_column = c / SB4;
+        }
         // The sizes `read_tx_size` can signal for this block, in increasing depth order, which is
         // increasing symbol order: depth `d` is the symbol the decoder reads.
         let mut widths = Vec::new();
@@ -761,10 +993,14 @@ impl<'a> FrameEncoder<'a> {
             widths.reverse();
         }
         let probing = self.shortcuts() && self.sample_type_gain();
+        #[cfg(test)]
+        if probing {
+            self.probing_size_searches += 1;
+        }
         let mut best = (0usize, i64::MAX);
         for &tx_width in &widths {
             let snapshot = self.snapshot(r, c, bw);
-            self.probe_budget = if probing { TYPE_GAIN_PROBES } else { 0 };
+            self.probe_budget = if probing { self.type_gain_probes() } else { 0 };
             self.probe_dct_cost = 0;
             self.probe_best_cost = 0;
             self.trial_searched_cost = 0;
@@ -789,6 +1025,8 @@ impl<'a> FrameEncoder<'a> {
         // set's DCT alone, which is where the shortcut's speedup comes from.
         self.probe_budget = 0;
         debug_assert_ne!(best.0, 0, "every coding block has one legal transform size");
+        #[cfg(test)]
+        self.size_choices.push((r, c, bw, best.0));
         self.tx_size_memo[slot] = (best.0 / 4).trailing_zeros() as u8;
         best.0
     }
@@ -799,6 +1037,67 @@ impl<'a> FrameEncoder<'a> {
         let sample = self.size_searches % self.type_gain_interval() == 0;
         self.size_searches += 1;
         sample
+    }
+
+    /// Joins a probe to one accumulator, which is the frame's running sum at that size.
+    ///
+    /// #272 aged each accumulator by `(n-1)/n` first, so a probe's weight decayed over the
+    /// following `TYPE_GAIN_MEMORY` probes and a block read back the ratio its own neighbourhood
+    /// measured rather than the frame's. [`TYPE_GAIN_TRUST`] then shrank a *remembered* ratio to
+    /// an eighth, and under that shrinkage the window stopped being measurable: issue #308 swept
+    /// every window from `1` to the un-decayed sum on `scene_edge`, on three frames built to
+    /// separate them - statistics alternating every 16 rows, the same two statistics on a 32x32
+    /// checkerboard so boundaries run in both axes, and a spatial frequency rising continuously
+    /// across the frame - at 128x96, 192x160 and 320x256, and every window from `2` upwards
+    /// measured the identical penalty on all fifteen frame-and-size pairs. Only `1`, which
+    /// remembers a single probe, moved anything at all, and only on one of them. So the decay is
+    /// gone and this is a sum again; what it was carrying is carried by the shrinkage.
+    fn accumulate(gain: &mut TypeGain, dct: i64, best_of_set: i64) {
+        #[cfg(test)]
+        {
+            let probe_ratio = if dct > 0 {
+                (dct - best_of_set) * GAIN_RATIO_ONE / dct
+            } else {
+                0
+            };
+            gain.ratio = (gain.ratio * gain.probes + probe_ratio) / (gain.probes + 1);
+            gain.probes += 1;
+        }
+        gain.dct_cost += dct;
+        gain.best_cost += best_of_set;
+    }
+
+    /// What a trial that did not probe reads back, under the arm [`Self::type_gain_locality`]
+    /// and [`Self::type_gain_ratio`] select. Outside tests there is only the running
+    /// accumulator's ratio of sums, which is what the sweeps measured every arm against.
+    #[cfg(test)]
+    fn remembered_gain(&self, running: TypeGain, slot: usize) -> (i64, i64) {
+        let column = self.column_gain[self.gain_column * TYPE_GAIN_SIZES + slot];
+        let (dct, best) = match self.type_gain_locality() {
+            GainLocality::Running => (running.dct_cost, running.best_cost),
+            GainLocality::Column => (column.dct_cost, column.best_cost),
+            GainLocality::Blended => (
+                running.dct_cost + column.dct_cost,
+                running.best_cost + column.best_cost,
+            ),
+        };
+        match self.type_gain_ratio() {
+            GainRatio::Weighted => (dct, best),
+            // The mean is already a ratio, so it is handed back over `GAIN_RATIO_ONE` and the
+            // subtraction in `corrected_trial_cost` is the same either way.
+            GainRatio::Mean => {
+                let ratio = match self.type_gain_locality() {
+                    GainLocality::Running => running.ratio,
+                    GainLocality::Column => column.ratio,
+                    GainLocality::Blended => (running.ratio + column.ratio) / 2,
+                };
+                if dct <= 0 {
+                    (0, 0)
+                } else {
+                    (GAIN_RATIO_ONE, GAIN_RATIO_ONE - ratio)
+                }
+            }
+        }
     }
 
     /// Discounts a size trial's DCT-only cost by what the type search has been measured to be
@@ -815,13 +1114,24 @@ impl<'a> FrameEncoder<'a> {
         let (dct, best) = if self.probe_dct_cost > 0 {
             (self.probe_dct_cost, self.probe_best_cost)
         } else {
-            let gain = self.type_gain[type_gain_slot(tx_width)];
-            (gain.dct_cost, gain.best_cost)
+            let slot = type_gain_slot(tx_width);
+            let running = self.type_gain[slot];
+            #[cfg(not(test))]
+            {
+                (running.dct_cost, running.best_cost)
+            }
+            #[cfg(test)]
+            {
+                self.remembered_gain(running, slot)
+            }
         };
         if dct <= 0 {
             return cost;
         }
-        let measured = dct - best;
+        let mut measured = dct - best;
+        if self.probe_dct_cost <= 0 {
+            measured = measured * self.type_gain_trust() / TYPE_GAIN_TRUST_ONE;
+        }
         cost - measured.saturating_mul(self.trial_searched_cost) / dct
     }
 
@@ -837,6 +1147,10 @@ impl<'a> FrameEncoder<'a> {
     ) -> i64 {
         let units = bw / 4;
         let step = tx_width / 4;
+        #[cfg(test)]
+        if emit {
+            self.emitted_coding_blocks += 1;
+        }
         let mut cost = 0;
         let mut ty = 0;
         while ty < units {
@@ -889,31 +1203,9 @@ impl<'a> FrameEncoder<'a> {
         emit: bool,
     ) -> i64 {
         let prediction = self.dc_prediction(x, y, size);
-
-        // A size trial's probe already ran this exact search. Its winner was discarded so the
-        // trial would reconstruct like a DCT-only one, but the answer it computed is a function
-        // of `(x, y, size, prediction)` alone (see [`ProbeKey`]), so when the emitting pass
-        // reaches the block under the same key - which happens for the size the search selects,
-        // whose trial's state the emitting pass replays - recomputing it can only produce the
-        // same candidate. It is written straight out instead. Every other state misses the key
-        // and searches below as before.
-        //
-        // The zero-block shortcut needs no re-check either: it is decided by the residual, and a
-        // probe only ever ran on a block whose residual already failed it.
-        if emit && self.reuse_probes() {
-            if let Some(candidate) = self.probed.remove(&(x, y, size, prediction)) {
-                let scan = cdf::up_right_diagonal_scan(size);
-                return self.write_candidate(
-                    x,
-                    y,
-                    block_width,
-                    size,
-                    prediction,
-                    &candidate,
-                    &scan,
-                    true,
-                );
-            }
+        #[cfg(test)]
+        if emit {
+            self.emitted_blocks.insert((x, y), (size, prediction));
         }
 
         let mut residual = vec![0i32; size * size];
@@ -953,6 +1245,10 @@ impl<'a> FrameEncoder<'a> {
         if self.shortcuts()
             && energy + self.lambda * ZERO_BLOCK_BITS < self.lambda * MIN_CODED_BLOCK_BITS
         {
+            #[cfg(test)]
+            if emit {
+                self.zero_skipped_emitted += 1;
+            }
             return self.write_zero_block(x, y, block_width, size, prediction, &scan, energy, emit);
         }
 
@@ -967,6 +1263,10 @@ impl<'a> FrameEncoder<'a> {
         // measures: the block still keeps DCT's result, so the trial's reconstruction, contexts
         // and cost are exactly the ones a DCT-only trial produces, and the measurement is applied
         // to the trial as a whole in `corrected_trial_cost`.
+        #[cfg(test)]
+        if emit && candidates.len() > 1 {
+            self.reusable_emitted += 1;
+        }
         let trial = self.shortcuts() && !emit;
         let mut probing = false;
         if trial && candidates.len() > 1 {
@@ -983,9 +1283,6 @@ impl<'a> FrameEncoder<'a> {
         }
 
         let mut best: Option<TxCandidate> = None;
-        // The whole set's winner, kept only by a probe: it is what the emitting pass would
-        // recompute for this block, and caching it is what spares that pass the repeat.
-        let mut full_set: Option<TxCandidate> = None;
         let mut cheapest = i64::MAX;
         for &(symbol, tx_type) in &candidates {
             #[cfg(test)]
@@ -1030,23 +1327,11 @@ impl<'a> FrameEncoder<'a> {
                 cost,
             };
             if probing {
-                // The probe ranks the whole set by the emitting pass's own rule - the same total
-                // order over `(cost, symbol)` - so the cached winner is the one that pass would
-                // have arrived at, not merely one of equal cost. The trial itself still keeps
-                // DCT, so a candidate is only ever copied when it is both, which is the one case
-                // the two rankings agree on.
-                let keeps_set = full_set.as_ref().is_none_or(|winner: &TxCandidate| {
-                    (cost, symbol) < (winner.cost, winner.symbol)
-                });
-                let keeps_trial = tx_type == Av1TxType::DctDct || best.is_none();
-                match (keeps_set, keeps_trial) {
-                    (true, true) => {
-                        full_set = Some(candidate.clone());
-                        best = Some(candidate);
-                    }
-                    (true, false) => full_set = Some(candidate),
-                    (false, true) => best = Some(candidate),
-                    (false, false) => {}
+                // A probe measures and nothing more: the block keeps DCT's result so the trial's
+                // reconstruction, contexts and cost are exactly a DCT-only trial's, and what the
+                // whole set was worth is carried out of the loop by `cheapest` alone.
+                if tx_type == Av1TxType::DctDct || best.is_none() {
+                    best = Some(candidate);
                 }
             } else if best
                 .as_ref()
@@ -1060,25 +1345,15 @@ impl<'a> FrameEncoder<'a> {
             let best_of_set = cheapest.min(dct);
             self.probe_dct_cost += dct;
             self.probe_best_cost += best_of_set;
-            let memory = self.type_gain_memory();
-            let gain = &mut self.type_gain[type_gain_slot(size)];
-            // Recency weighting: what the accumulator already holds is aged by `(n-1)/n` before
-            // the new probe joins it, so a probe's influence decays away over the following `n`
-            // and the ratio a block reads back is the one its own neighbourhood measured. One
-            // multiply and one divide per accumulator, on the sampled trials only.
-            //
-            // `usize::MAX` is the sentinel for no decay at all, which is the frame-wide
-            // accumulation this replaced; a test sweeps it as the far end of the window.
-            if memory != usize::MAX {
-                let (num, den) = (memory as i64 - 1, memory as i64);
-                gain.dct_cost = gain.dct_cost * num / den;
-                gain.best_cost = gain.best_cost * num / den;
+            let slot = type_gain_slot(size);
+            Self::accumulate(&mut self.type_gain[slot], dct, best_of_set);
+            #[cfg(test)]
+            {
+                let column = self.gain_column * TYPE_GAIN_SIZES + slot;
+                Self::accumulate(&mut self.column_gain[column], dct, best_of_set);
             }
-            gain.dct_cost += dct;
-            gain.best_cost += best_of_set;
-            if let Some(winner) = full_set {
-                self.probed.insert((x, y, size, prediction), winner);
-            }
+            #[cfg(test)]
+            self.probe_keys.push((x, y, size, prediction));
         }
         let winner = best.expect("every transform size has at least one candidate type");
         let cost = self.write_candidate(x, y, block_width, size, prediction, &winner, &scan, emit);
@@ -1091,9 +1366,8 @@ impl<'a> FrameEncoder<'a> {
     /// Reconstructs a transform block from the type the search picked and codes its coefficients,
     /// returning the candidate's cost.
     ///
-    /// This is the whole of a transform block's output: it runs identically whether the winner
-    /// came from a search just now or from a probe's cached result, which is what makes the reuse
-    /// exact rather than a second path that has to be kept in step with the first.
+    /// This is the whole of a transform block's output, shared by the searched winner and by the
+    /// zero-block shortcut's forced all-zero block, so neither can drift from the other.
     #[allow(clippy::too_many_arguments)]
     fn write_candidate(
         &mut self,
@@ -1311,54 +1585,51 @@ impl<'a> FrameEncoder<'a> {
                     (extra >> (nbits - 1)) & 1,
                     cdf::eob_extra_cdf(qctx, tx_ctx, ptype, eobpt - 3),
                 );
-                let mut i = nbits as isize - 2;
-                while i >= 0 {
-                    self.sym.encode_literal(((extra >> i) & 1) as u32, 1);
-                    i -= 1;
-                }
+                // The remaining `nbits - 1` bits are equiprobable literals in MSB-first order,
+                // which is one literal run rather than one call per bit.
+                self.sym.encode_literal(extra as u32, nbits as u32 - 1);
             }
         }
 
-        // Base levels + base range, scanned from the last coefficient back to DC.
-        let mut levels = vec![0i32; count];
-        for c in (0..eob).rev() {
-            let pos = scan[c];
-            let level = quant[pos].abs();
-            if c == eob - 1 {
-                let ctx = coeff_base_eob_ctx(c, count);
-                if emit {
+        // Base levels + base range, scanned from the last coefficient back to DC. Every context
+        // the loop needs is derived for the whole block up front (see `CoeffScratch`), and only
+        // the emitting pass consults them, so a speculative trial skips the derivation outright.
+        if emit {
+            let mut scratch = std::mem::take(&mut self.coeff_ctx);
+            scratch.derive(quant, size);
+            for c in (0..eob).rev() {
+                let pos = scan[c];
+                let level = quant[pos].abs();
+                if c == eob - 1 {
+                    let ctx = coeff_base_eob_ctx(c, count);
                     self.sym.encode_symbol(
                         (level.min(3) - 1) as usize,
                         cdf::coeff_base_eob_cdf(qctx, tx_ctx, ptype, ctx),
                     );
-                }
-            } else {
-                let ctx = coeff_base_ctx(pos, &levels, size);
-                if emit {
+                } else {
+                    let ctx = scratch.base[pos] as usize;
                     self.sym.encode_symbol(
                         level.min(3) as usize,
                         cdf::coeff_base_cdf(qctx, tx_ctx, ptype, ctx),
                     );
                 }
-            }
-            if level > NUM_BASE_LEVELS {
-                let br_ctx = coeff_br_ctx(pos, &levels, size);
-                let mut rem = level - 3;
-                for _ in 0..4 {
-                    let brv = rem.min(3);
-                    if emit {
+                if level > NUM_BASE_LEVELS {
+                    let br_ctx = scratch.br[pos] as usize;
+                    let mut rem = level - 3;
+                    for _ in 0..4 {
+                        let brv = rem.min(3);
                         self.sym.encode_symbol(
                             brv as usize,
                             cdf::coeff_br_cdf(qctx, tx_ctx, ptype, br_ctx),
                         );
-                    }
-                    rem -= brv;
-                    if brv < 3 {
-                        break;
+                        rem -= brv;
+                        if brv < 3 {
+                            break;
+                        }
                     }
                 }
             }
-            levels[pos] = level;
+            self.coeff_ctx = scratch;
         }
 
         // Signs (DC sign is CDF-coded; the rest are raw bits) and golomb tails.
@@ -1381,7 +1652,9 @@ impl<'a> FrameEncoder<'a> {
             }
         }
 
-        let cul = levels.iter().sum::<i32>().min(63) as u8;
+        // Every coefficient at or past the end-of-block is zero by the definition of `eob`, so
+        // summing the whole block's magnitudes is the same `culLevel` the scanned levels gave.
+        let cul = quant.iter().map(|value| value.abs()).sum::<i32>().min(63) as u8;
         let dc_cat = if quant[0] == 0 {
             0
         } else if quant[0] < 0 {
@@ -1604,6 +1877,9 @@ fn coeff_base_eob_ctx(c: usize, count: usize) -> usize {
     }
 }
 
+/// `getCoeffBaseCtx` (§8.3.2) for `TX_CLASS_2D`: the scalar reference
+/// [`crate::av1_simd::coeff::block_contexts`] is a lane-by-lane transliteration of. `levels` holds
+/// the block's quantized coefficients; only their magnitudes are read.
 fn coeff_base_ctx(pos: usize, levels: &[i32], size: usize) -> usize {
     let (row, col) = (pos / size, pos % size);
     let mut mag = 0i32;
@@ -1620,6 +1896,8 @@ fn coeff_base_ctx(pos: usize, levels: &[i32], size: usize) -> usize {
     ctx + cdf::coeff_base_ctx_offset(row, col)
 }
 
+/// `getCoeffBrCtx` (§8.3.2) for `TX_CLASS_2D`, the other half of the scalar reference described
+/// on [`coeff_base_ctx`].
 fn coeff_br_ctx(pos: usize, levels: &[i32], size: usize) -> usize {
     let (row, col) = (pos / size, pos % size);
     let mut mag = 0i32;
@@ -1642,13 +1920,173 @@ fn coeff_br_ctx(pos: usize, levels: &[i32], size: usize) -> usize {
 /// Exp-Golomb tail used for coefficient magnitudes above the base-range cap (§5.11.39).
 fn golomb(sym: &mut SymbolEncoder, x: u32) {
     let len = 32 - x.leading_zeros(); // bit length, x >= 1
-    for _ in 0..(len - 1) {
-        sym.encode_literal(0, 1);
+    // The code is `len - 1` zeros followed by `x` itself in `len` bits, and `x`'s top bit is set,
+    // so the whole thing is `x` written as one `2 * len - 1`-bit literal: the leading zeros are
+    // just the field's own padding. That is one literal run instead of `2 * len - 1` single-bit
+    // calls whenever the field fits in a `u32`.
+    let bits = 2 * len - 1;
+    if bits <= 32 {
+        sym.encode_literal(x, bits);
+    } else {
+        sym.encode_literal(0, len - 1);
+        sym.encode_literal(x, len);
     }
-    sym.encode_literal(1, 1);
-    let mut i = len as isize - 2;
-    while i >= 0 {
-        sym.encode_literal((x >> i) & 1, 1);
-        i -= 1;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::simd::{self, SimdIsa};
+
+    /// Small deterministic LCG, matching the style used elsewhere in the crate.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            self.0 >> 33
+        }
+    }
+
+    /// Quantized coefficients spanning the ranges the contexts distinguish: zeros, the base
+    /// levels, the base-range cap, and magnitudes past the golomb threshold, in both signs.
+    fn coefficients(size: usize, seed: u64) -> Vec<i32> {
+        let mut rng = Lcg(seed);
+        (0..size * size)
+            .map(|_| {
+                let magnitude = match rng.next() % 5 {
+                    0 => 0,
+                    1 => (rng.next() % 3) as i32,
+                    2 => (rng.next() % 16) as i32,
+                    3 => (rng.next() % 64) as i32,
+                    _ => (rng.next() % 4096) as i32,
+                };
+                if rng.next() % 2 == 0 {
+                    magnitude
+                } else {
+                    -magnitude
+                }
+            })
+            .collect()
+    }
+
+    /// The widths worth covering: every one from a single coefficient up past two full AVX2
+    /// vectors, so a partial trailing vector is exercised at both lane counts, plus the large
+    /// transform sizes the non-lossless encoder actually codes.
+    const WIDTHS: [usize; 20] = [
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 32, 64,
+    ];
+
+    /// The whole point of the vector kernel: it must agree with `tile.rs`'s scalar §8.3.2
+    /// reference lane for lane, at every width and on every instruction set the host has.
+    #[test]
+    fn the_context_pass_matches_the_scalar_reference_on_every_instruction_set() {
+        let _guard = simd::test_lock();
+        for &size in &WIDTHS {
+            for seed in 0..4u64 {
+                let quant = coefficients(size, seed * 977 + size as u64);
+                let mut expected_base = vec![0i32; size * size];
+                let mut expected_br = vec![0i32; size * size];
+                for pos in 0..size * size {
+                    expected_base[pos] = coeff_base_ctx(pos, &quant, size) as i32;
+                    expected_br[pos] = coeff_br_ctx(pos, &quant, size) as i32;
+                }
+                for isa in simd::available() {
+                    simd::set_override(Some(isa));
+                    assert_eq!(
+                        coeff::active_isa(),
+                        isa,
+                        "the coefficient context site did not follow the override"
+                    );
+                    let mut scratch = CoeffScratch::default();
+                    scratch.derive(&quant, size);
+                    assert_eq!(
+                        scratch.base,
+                        expected_base,
+                        "coeff_base at size {size}, seed {seed}, isa {}",
+                        isa.name()
+                    );
+                    assert_eq!(
+                        scratch.br,
+                        expected_br,
+                        "coeff_br at size {size}, seed {seed}, isa {}",
+                        isa.name()
+                    );
+                }
+            }
+        }
+        simd::set_override(None);
+    }
+
+    /// Deriving the contexts up front is only legal because the backwards scan never consults a
+    /// neighbour it has not already coded, and never consults a non-zero one past the
+    /// end-of-block. Replay the incremental derivation the coding loop used to do and check it
+    /// against the one-pass answer, for every end-of-block a block can have.
+    #[test]
+    fn the_one_pass_derivation_matches_the_incremental_scan_order_one() {
+        let _guard = simd::test_lock();
+        simd::set_override(Some(SimdIsa::Scalar));
+        for &size in &[4usize, 8, 16, 32] {
+            let count = size * size;
+            let scan = cdf::up_right_diagonal_scan(size);
+            let dense = coefficients(size, 31 + size as u64);
+            for eob in 1..=count {
+                // Past the end-of-block every coefficient is zero by the definition of `eob`,
+                // which is the property the one-pass derivation leans on.
+                let mut quant = vec![0i32; count];
+                for &pos in scan.iter().take(eob) {
+                    quant[pos] = dense[pos];
+                }
+                let mut scratch = CoeffScratch::default();
+                scratch.derive(&quant, size);
+
+                let mut levels = vec![0i32; count];
+                for c in (0..eob).rev() {
+                    let pos = scan[c];
+                    assert_eq!(
+                        coeff_base_ctx(pos, &levels, size) as i32,
+                        scratch.base[pos],
+                        "coeff_base at size {size}, eob {eob}, scan index {c}"
+                    );
+                    assert_eq!(
+                        coeff_br_ctx(pos, &levels, size) as i32,
+                        scratch.br[pos],
+                        "coeff_br at size {size}, eob {eob}, scan index {c}"
+                    );
+                    levels[pos] = quant[pos].abs();
+                }
+            }
+        }
+        simd::set_override(None);
+    }
+
+    /// The encoded bitstream is the contract: a vector context pass that changed a single symbol
+    /// would produce a different tile, so every instruction set must emit the same bytes.
+    #[test]
+    fn the_encoded_tile_is_byte_identical_on_every_instruction_set() {
+        let _guard = simd::test_lock();
+        let (width, height) = (61usize, 37usize);
+        let mut rng = Lcg(0x5eed);
+        let plane: Vec<u8> = (0..width * height)
+            .map(|_| (rng.next() & 0xff) as u8)
+            .collect();
+        for qindex in [0u8, 40, 160] {
+            simd::set_override(Some(SimdIsa::Scalar));
+            let reference = FrameEncoder::new(&plane, width, height, qindex).encode();
+            for isa in simd::available() {
+                simd::set_override(Some(isa));
+                let coded = FrameEncoder::new(&plane, width, height, qindex).encode();
+                assert_eq!(
+                    coded,
+                    reference,
+                    "tile bytes differ at qindex {qindex} on {}",
+                    isa.name()
+                );
+            }
+        }
+        simd::set_override(None);
     }
 }

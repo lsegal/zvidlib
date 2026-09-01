@@ -101,6 +101,22 @@
 //! it is. It is recorded because the table would otherwise imply the
 //! SSE4.1 buffer arm is a win everywhere, and it is not.
 //!
+//! # The block-path rows are a *small*-block figure
+//!
+//! The two [`filter_taps`] block-path rows are measured over the small blocks
+//! the §8.5.3.3 benchmark used to issue, and issue #280 measured what happens
+//! as the block grows. On aarch64, all bi-predicted and luma only, the 8-tap
+//! luma kernel reads **1.43x at 8x8, 1.25x at 16x16, 1.10x at 32x32 and 1.04x
+//! at 64x64** — a monotonic walk from the block-path figure towards the buffer
+//! one, and for the reason the paragraph below gives: a 64x64 two-dimensional
+//! 8-tap needs a 64x71 intermediate, so it is the buffer case wearing a block's
+//! name. That matters because it is the *large* end real content spends its
+//! time at: 48 frames of the bundled 1080p sample put 62% of predicted luma
+//! samples in 64x64 units and 31% in 32x32, so the mix reads 1.09x rather than
+//! the 1.6-1.9x above. Read the block-path row as what the kernel is worth on a
+//! small block, not as what it is worth to a decode; `benches/README.md` has
+//! the sweep, the measured prediction-unit mix and the whole-frame accounting.
+//!
 //! The two [`filter_taps`] block-path rows and the buffer row are the same
 //! kernel at different call sizes, and on NEON the difference is the point:
 //! the win comes from the short 4..16-sample rows the block walk actually
