@@ -76,18 +76,19 @@ const TYPE_GAIN_PROBES: usize = 1;
 /// unsampled search this interval approximates. Cost is the encoder's own `sse + lambda * bits`,
 /// summed over the frame and compared at equal quantizer:
 ///
-/// | interval | worst frame penalty vs unsampled | mean penalty vs exhaustive | candidates | time |
-/// |---------:|---------------------------------:|---------------------------:|-----------:|-----:|
-/// | 1        | 0.0%                             | +0.25%                     | 181,557    | 0.644 s |
-/// | 2        | +44.1%                           | +1.05%                     | 155,143    | 0.607 s |
-/// | 4        | +64.6%                           | +1.70%                     | 142,372    | 0.574 s |
-/// | 8        | +78.7%                           | +1.97%                     | 136,250    | 0.565 s |
-/// | 16       | +85.8%                           | +2.29%                     | 128,035    | 0.557 s |
+/// | interval | worst penalty vs unsampled | mean vs exhaustive | candidates | time |
+/// |---------:|---------------------------:|-------------------:|-----------:|--------:|
+/// | 1        | 0.0%                       | +0.25%             | 181,557    | 0.644 s |
+/// | 2        | +44.1%                     | +1.05%             | 155,143    | 0.607 s |
+/// | 4        | +64.6%                     | +1.70%             | 142,372    | 0.574 s |
+/// | 8        | +78.7%                     | +1.97%             | 136,250    | 0.565 s |
+/// | 16       | +85.8%                     | +2.29%             | 128,035    | 0.557 s |
 ///
 /// Every worst case is the same frame and quantizer - the hard scene edge at `qindex` 160, whose
-/// two halves have unrelated statistics - and the original value of `8` doubled the error there
-/// against `2` while saving 7% of the encode. `1` is not the value because it evaluates 181,557
-/// transform-type candidates against the exhaustive search's 700,004, which no longer clears the
+/// two halves have unrelated statistics - and the original value of `8` carried nearly twice
+/// the error there against `2` while saving 7% of the encode. `1` is not the value because it
+/// evaluates 181,557 transform-type candidates against the exhaustive search's 700,004, which
+/// no longer clears the
 /// four-fold reduction the shortcuts exist for and
 /// `the_search_shortcuts_stay_within_their_rate_and_distortion_bound` asserts; `2` clears it with
 /// 155,143. What remains at `2` is the estimator mixing statistics across regions rather than the
