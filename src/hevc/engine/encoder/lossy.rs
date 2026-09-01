@@ -406,8 +406,22 @@ fn write_idr_residual_slice(
     // §8.7.3 runs behind §8.7.2 and returns the per-CTB parameters the
     // bitstream pass below codes, so the decoder resolves the same grid this
     // reconstruction was filtered with.
-    let sao = filter.sao().then(|| {
-        sao_reconstruction(
+    //
+    // Then the slice-level half of the decision. Every CTB the search leaves
+    // unfiltered still costs its `sao( )` structure — one merge flag, in the
+    // best case — so a picture SAO finds nothing in pays for the search's
+    // silence on every CTB of it. `slice_sao_luma_flag` /
+    // `slice_sao_chroma_flag` are what make that optional: with both 0,
+    // §7.3.8.3 codes nothing at all and the whole cost is the two header bits.
+    // So the pass is kept only when the SSE it actually removed clears the
+    // bins it would actually be coded with, under the same `D + lambda * R`
+    // the mode decision uses; otherwise the reconstruction reverts to the
+    // deblocked one and the slice says so.
+    let lambda = u64::from(lambda_q8(qp));
+    let mut sao = None;
+    if filter.sao() {
+        let deblocked = recon.clone();
+        let grid = sao_reconstruction(
             &mut recon,
             SourcePlanes {
                 y,
@@ -417,8 +431,14 @@ fn write_idr_residual_slice(
                 height,
             },
             lambda_q8(qp),
-        )
-    });
+        );
+        let gain = picture_sse(&deblocked, y, cb, cr).saturating_sub(picture_sse(&recon, y, cb, cr));
+        if gain > sao_syntax_bins(&grid, ctbs_x) * lambda / 256 {
+            sao = Some(grid);
+        } else {
+            recon = deblocked;
+        }
+    }
 
     // ---- the bitstream pass: code the recorded decisions ----
     let mut w = BitWriter::new();
@@ -429,13 +449,15 @@ fn write_idr_residual_slice(
     w.ue(2); // slice_type = I
     if filter.sao() {
         // §7.3.6.1, present because the SPS carries
-        // sample_adaptive_offset_enabled_flag == 1. Both passes run, so both
-        // flags are 1 and every CTB codes a sao( ) structure.
-        w.put_bit(1); // slice_sao_luma_flag
-        w.put_bit(1); // slice_sao_chroma_flag (ChromaArrayType != 0)
+        // sample_adaptive_offset_enabled_flag == 1. Both passes are decided
+        // together, so the pair is 1/1 when the picture kept SAO and 0/0 when
+        // it did not — and 0/0 suppresses every CTB's sao( ) structure.
+        let on = u8::from(sao.is_some());
+        w.put_bit(on); // slice_sao_luma_flag
+        w.put_bit(on); // slice_sao_chroma_flag (ChromaArrayType != 0)
     }
     w.se(qp - 26); // slice_qp_delta over init_qp_minus26 == 0
-    if filter.deblocking() || filter.sao() {
+    if filter.deblocking() || sao.is_some() {
         // §7.3.6.1: present because pps_loop_filter_across_slices_enabled_flag
         // is 1 and at least one in-loop filter runs on this slice. One slice
         // fills the picture, so the value only has to be legal, not
@@ -451,7 +473,16 @@ fn write_idr_residual_slice(
     for (addr, record) in records.iter().enumerate() {
         // ---- coding_tree_unit(): sao( ) first, then the coding quadtree.
         if let Some(grid) = &sao {
-            write_sao(&mut w, &mut cabac, &mut ctxs, grid, addr, ctbs_x);
+            code_sao(
+                &mut SaoWriter {
+                    writer: &mut w,
+                    cabac: &mut cabac,
+                    contexts: &mut ctxs,
+                },
+                grid,
+                addr,
+                ctbs_x,
+            );
         }
 
         // ---- coding_unit(): PART_2Nx2N, pcm_flag == 0 ----
@@ -530,22 +561,75 @@ fn write_idr_residual_slice(
 /// 8-bit depth: `(1 << (Min(bitDepth, 10) − 5)) − 1`.
 const SAO_OFFSET_ABS_CMAX: u32 = 7;
 
-/// §7.3.8.3 `sao( rx, ry )` for one CTB, coded out of the resolved grid the
+/// Which Table 9-48 context a context-coded §7.3.8.3 bin uses.
+#[derive(Clone, Copy)]
+enum SaoCtx {
+    /// `sao_merge_left_flag` / `sao_merge_up_flag` (Table 9-5, one context).
+    MergeFlag,
+    /// `sao_type_idx_luma` / `sao_type_idx_chroma` bin 0 (Table 9-6, shared).
+    TypeIdx,
+}
+
+/// Where [`code_sao`] puts the bins it derives.
+///
+/// The §7.3.8.3 structure is walked once for the bitstream and once for the
+/// bin count the slice-level decision below is taken on, and the two must not
+/// be allowed to disagree — so there is one walk and two sinks rather than a
+/// writer and a separate cost model.
+trait SaoBinSink {
+    /// One context-coded bin.
+    fn ctx(&mut self, ctx: SaoCtx, bin: u8);
+    /// One bypass bin.
+    fn bypass(&mut self, bin: u8);
+}
+
+/// The sink that codes the bins into the slice.
+struct SaoWriter<'a> {
+    writer: &'a mut BitWriter,
+    cabac: &'a mut CabacEncoder,
+    contexts: &'a mut SliceContexts,
+}
+
+impl SaoBinSink for SaoWriter<'_> {
+    fn ctx(&mut self, ctx: SaoCtx, bin: u8) {
+        let model = match ctx {
+            SaoCtx::MergeFlag => &mut self.contexts.sao_merge_flag[0],
+            SaoCtx::TypeIdx => &mut self.contexts.sao_type_idx[0],
+        };
+        self.cabac.encode_decision(self.writer, model, bin);
+    }
+
+    fn bypass(&mut self, bin: u8) {
+        self.cabac.encode_bypass(self.writer, bin);
+    }
+}
+
+/// The sink that only counts them.
+#[derive(Default)]
+struct SaoBinCounter {
+    bins: u64,
+}
+
+impl SaoBinSink for SaoBinCounter {
+    fn ctx(&mut self, _ctx: SaoCtx, _bin: u8) {
+        self.bins += 1;
+    }
+
+    fn bypass(&mut self, _bin: u8) {
+        self.bins += 1;
+    }
+}
+
+/// §7.3.8.3 `sao( rx, ry )` for one CTB, derived from the resolved grid the
 /// §8.7.3 pass filtered the reconstruction with.
 ///
-/// A CTB whose resolved parameters are exactly its left (or above) neighbour's
-/// codes one merge flag in place of the whole structure. Merging is taken only
-/// on exact equality of all three components, so what the decoder resolves out
-/// of the bitstream is the grid the encoder filtered with, CTB for CTB — which
-/// includes the common case of two neighbouring CTBs that both left SAO off.
-fn write_sao(
-    w: &mut BitWriter,
-    cabac: &mut CabacEncoder,
-    ctxs: &mut SliceContexts,
-    grid: &[ResolvedSao],
-    addr: usize,
-    ctbs_x: usize,
-) {
+/// A CTB whose resolved parameters are exactly its left (or above)
+/// neighbour's codes one merge flag in place of the whole structure. Merging
+/// is taken only on exact equality of all three components, so what a decoder
+/// resolves out of the bitstream is the grid the encoder filtered with, CTB
+/// for CTB — and that covers the common case of two neighbouring CTBs which
+/// both left SAO off, which is the whole of what an unfiltered CTB pays.
+fn code_sao<S: SaoBinSink>(sink: &mut S, grid: &[ResolvedSao], addr: usize, ctbs_x: usize) {
     let (rx, ry) = (addr % ctbs_x, addr / ctbs_x);
     let here = grid[addr];
     // The §7.3.8.3 presence conditions: one slice and one tile fill the
@@ -555,11 +639,11 @@ fn write_sao(
     let above = (ry > 0).then(|| grid[addr - ctbs_x]);
     let merge_left = left == Some(here);
     if left.is_some() {
-        cabac.encode_decision(w, &mut ctxs.sao_merge_flag[0], u8::from(merge_left));
+        sink.ctx(SaoCtx::MergeFlag, u8::from(merge_left));
     }
     let merge_up = !merge_left && above == Some(here);
     if above.is_some() && !merge_left {
-        cabac.encode_decision(w, &mut ctxs.sao_merge_flag[0], u8::from(merge_up));
+        sink.ctx(SaoCtx::MergeFlag, u8::from(merge_up));
     }
     if merge_left || merge_up {
         return;
@@ -571,9 +655,9 @@ fn write_sao(
             // sao_type_idx_luma / sao_type_idx_chroma, Table 9-43 TR
             // (cMax 2): bin 0 context-coded, bin 1 bypass.
             let applied = u8::from(component.sao_type_idx != 0);
-            cabac.encode_decision(w, &mut ctxs.sao_type_idx[0], applied);
+            sink.ctx(SaoCtx::TypeIdx, applied);
             if applied == 1 {
-                cabac.encode_bypass(w, u8::from(component.sao_type_idx == 2));
+                sink.bypass(u8::from(component.sao_type_idx == 2));
             }
         } else {
             // §7.4.9.3 infers SaoTypeIdx[2] from cIdx 1, so the estimation is
@@ -584,25 +668,25 @@ fn write_sao(
             continue;
         }
         for offset in &component.offset_val[1..5] {
-            write_sao_offset_abs(w, cabac, offset.unsigned_abs());
+            code_sao_offset_abs(sink, offset.unsigned_abs());
         }
         if component.sao_type_idx == 1 {
             // Band offset: the sign of every nonzero offset, then the band.
             for offset in &component.offset_val[1..5] {
                 if *offset != 0 {
-                    cabac.encode_bypass(w, u8::from(*offset < 0));
+                    sink.bypass(u8::from(*offset < 0));
                 }
             }
             // sao_band_position, Table 9-43 FL (cMax 31): five bypass bins,
             // MSB first.
             for shift in (0..5).rev() {
-                cabac.encode_bypass(w, (component.band_position >> shift) & 1);
+                sink.bypass((component.band_position >> shift) & 1);
             }
         } else if c_idx < 2 {
             // sao_eo_class_luma / sao_eo_class_chroma, Table 9-43 FL
             // (cMax 3): two bypass bins, MSB first.
             for shift in (0..2).rev() {
-                cabac.encode_bypass(w, (component.eo_class >> shift) & 1);
+                sink.bypass((component.eo_class >> shift) & 1);
             }
         } else {
             debug_assert_eq!(component.eo_class, here.components[1].eo_class);
@@ -612,16 +696,39 @@ fn write_sao(
 
 /// `sao_offset_abs`, Table 9-43 TR with `cMax == 7` and `cRiceParam == 0` —
 /// truncated unary, every bin bypass (Table 9-48).
-fn write_sao_offset_abs(w: &mut BitWriter, cabac: &mut CabacEncoder, value: u32) {
+fn code_sao_offset_abs<S: SaoBinSink>(sink: &mut S, value: u32) {
     let value = value.min(SAO_OFFSET_ABS_CMAX);
     for _ in 0..value {
-        cabac.encode_bypass(w, 1);
+        sink.bypass(1);
     }
     if value < SAO_OFFSET_ABS_CMAX {
-        cabac.encode_bypass(w, 0);
+        sink.bypass(0);
     }
 }
 
+/// Every §7.3.8.3 bin the whole picture's SAO grid would be coded with.
+fn sao_syntax_bins(grid: &[ResolvedSao], ctbs_x: usize) -> u64 {
+    let mut counter = SaoBinCounter::default();
+    for addr in 0..grid.len() {
+        code_sao(&mut counter, grid, addr, ctbs_x);
+    }
+    counter.bins
+}
+
+/// The sum of squared errors between a reconstruction and the source it was
+/// coded from, over all three planes.
+fn picture_sse(recon: &ReconstructedPicture, y: &[u8], cb: &[u8], cr: &[u8]) -> u64 {
+    let plane = |a: &[u8], b: &[u8]| -> u64 {
+        a.iter()
+            .zip(b)
+            .map(|(&p, &q)| {
+                let d = i64::from(p) - i64::from(q);
+                (d * d) as u64
+            })
+            .sum()
+    };
+    plane(&recon.y, y) + plane(&recon.cb, cb) + plane(&recon.cr, cr)
+}
 
 /// Pick the luma intra mode for one coding unit and return it with the block
 /// it codes to.
@@ -1085,14 +1192,23 @@ mod tests {
         // rounded away, the encoder's reference picture and the decoder's
         // output agree on it sample for sample. A mismatch here means the
         // next picture would predict from something no decoder holds.
+        //
+        // Both pictures, because the two in-loop filters engage on opposite
+        // content: the smooth one is where §8.7.3 actually codes offsets at a
+        // fine QP, and a `sao( )` structure the decoder resolves differently
+        // than the encoder filtered with would show up here and nowhere else.
         let (width, height) = (64, 48);
-        let (y, cb, cr) = picture(width, height);
-        for qp in [0i32, 12, 26, 37, 51] {
-            let (au, recon) = encode_idr_residual_au(&y, &cb, &cr, width, height, qp).unwrap();
-            let (dy, dcb, dcr) = decode(&au, width, height);
-            assert_eq!(dy, recon.y, "qp {qp}: luma diverged");
-            assert_eq!(dcb, recon.cb, "qp {qp}: Cb diverged");
-            assert_eq!(dcr, recon.cr, "qp {qp}: Cr diverged");
+        for (name, (y, cb, cr)) in [
+            ("noise", picture(width, height)),
+            ("smooth", smooth_picture(width, height)),
+        ] {
+            for qp in [0i32, 12, 26, 37, 51] {
+                let (au, recon) = encode_idr_residual_au(&y, &cb, &cr, width, height, qp).unwrap();
+                let (dy, dcb, dcr) = decode(&au, width, height);
+                assert_eq!(dy, recon.y, "{name} qp {qp}: luma diverged");
+                assert_eq!(dcb, recon.cb, "{name} qp {qp}: Cb diverged");
+                assert_eq!(dcr, recon.cr, "{name} qp {qp}: Cr diverged");
+            }
         }
     }
 
@@ -1361,7 +1477,7 @@ mod tests {
                 height,
                 qp,
                 ModeSearch::Rdo,
-                LoopFilter::Deblock,
+                LoopFilter::DeblockSao,
             );
             assert!(
                 au.windows(rbsp.len()).any(|window| window == rbsp),
@@ -1509,6 +1625,138 @@ mod tests {
         assert!(
             !parsed.deblocking.disabled_flag,
             "the writer's PPS still disables deblocking"
+        );
+    }
+
+    /// Whole-picture PSNR and slice size at one QP with SAO on and off, from
+    /// the same coding loop and the same mode decisions — the measurement the
+    /// module documentation and the changelog record.
+    fn sao_on_off(
+        y: &[u8],
+        cb: &[u8],
+        cr: &[u8],
+        width: usize,
+        height: usize,
+        qp: i32,
+    ) -> ((usize, f64), (usize, f64)) {
+        let source = [y.to_vec(), cb.to_vec(), cr.to_vec()].concat();
+        let encode = |filter| {
+            let (slice, recon, _) =
+                write_idr_residual_slice(y, cb, cr, width, height, qp, ModeSearch::Rdo, filter);
+            let psnr = psnr_db(
+                &source,
+                &[recon.y.clone(), recon.cb.clone(), recon.cr.clone()].concat(),
+            );
+            (slice.len(), psnr)
+        };
+        (encode(LoopFilter::Deblock), encode(LoopFilter::DeblockSao))
+    }
+
+    #[test]
+    fn the_sao_pass_is_worth_taking_where_the_writer_takes_it() {
+        // The gain the changelog records, at the two operating points the
+        // decision actually accepts: a fine QP on smooth content, where the
+        // quantizer leaves ringing along every edge for edge offset to pull
+        // back, and a coarse one on the noise-carrying picture, where §8.7.2
+        // declined most edges and left the error for §8.7.3.
+        for (name, (y, cb, cr), qp, floor) in [
+            ("smooth 64x48", smooth_picture(64, 48), 12i32, 0.5f64),
+            ("smooth 128x96", smooth_picture(128, 96), 12, 0.7),
+            ("noise 64x48", picture(64, 48), 37, 0.2),
+            ("noise 128x96", picture(128, 96), 37, 0.3),
+        ] {
+            let (width, height) = if name.ends_with("128x96") {
+                (128, 96)
+            } else {
+                (64, 48)
+            };
+            let ((off_bytes, off_psnr), (on_bytes, on_psnr)) =
+                sao_on_off(&y, &cb, &cr, width, height, qp);
+            let gain = on_psnr - off_psnr;
+            assert!(
+                gain > floor,
+                "{name} qp {qp}: SAO moved whole-picture PSNR by only {gain:+.3} dB"
+            );
+            assert!(
+                on_bytes > off_bytes,
+                "{name} qp {qp}: SAO coded {on_bytes} bytes against {off_bytes} without paying \
+                 for its own syntax — the sao( ) structures are not reaching the slice"
+            );
+        }
+    }
+
+    #[test]
+    fn the_sao_pass_is_declined_when_it_would_not_clear_its_own_syntax() {
+        // The other half of the decision, and the reason SAO can be left on
+        // unconditionally. Every CTB pays a sao( ) structure whether or not
+        // the search found anything for it, so a picture the search finds
+        // nothing in must come out as the deblocked one did, to the byte:
+        // `slice_sao_luma_flag == 0` suppresses §7.3.8.3 entirely.
+        let (width, height) = (64, 48);
+        let (y, cb, cr) = smooth_picture(width, height);
+        let mut declined = 0;
+        for qp in [26i32, 37, 44, 51] {
+            let ((off_bytes, off_psnr), (on_bytes, on_psnr)) =
+                sao_on_off(&y, &cb, &cr, width, height, qp);
+            if on_bytes == off_bytes {
+                declined += 1;
+                assert_eq!(
+                    on_psnr, off_psnr,
+                    "qp {qp}: the slice is the deblocked one's size but not its picture"
+                );
+            }
+        }
+        assert!(
+            declined > 0,
+            "the slice-level decision never declined SAO — the rate test is not reached"
+        );
+    }
+
+    #[test]
+    fn the_sao_pass_never_costs_the_writer_quality() {
+        // Whatever the decision does, it may not make the picture worse: the
+        // per-CTB search only signals offsets that reduce that CTB's squared
+        // error, and the slice-level test reverts the whole pass when the
+        // total does not clear its rate.
+        for (name, (y, cb, cr)) in [
+            ("noise", picture(64, 48)),
+            ("smooth", smooth_picture(64, 48)),
+        ] {
+            for qp in [12i32, 20, 26, 32, 37, 44, 51] {
+                let ((off_bytes, off_psnr), (on_bytes, on_psnr)) =
+                    sao_on_off(&y, &cb, &cr, 64, 48, qp);
+                assert!(
+                    on_psnr >= off_psnr,
+                    "{name} qp {qp}: SAO cost {:+.3} dB of whole-picture PSNR",
+                    on_psnr - off_psnr
+                );
+                assert!(
+                    on_bytes as f64 <= off_bytes as f64 * 1.15,
+                    "{name} qp {qp}: SAO cost {on_bytes} bytes against {off_bytes}, more than the \
+                     measured worst case"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_access_unit_signals_sao_as_enabled() {
+        // The reconstruction is only the decoder's if the parameter sets ask
+        // the decoder for the same filter, so read the flag back off the
+        // emitted SPS rather than trusting the writer.
+        let (width, height) = (64, 48);
+        let (y, cb, cr) = smooth_picture(width, height);
+        let (au, _) = encode_idr_residual_au(&y, &cb, &cr, width, height, 12).unwrap();
+        let sps = crate::hevc::engine::nal::collect_nal_units(&au)
+            .expect("the access unit parses")
+            .into_iter()
+            .find(|nal| nal.header.nal_unit_type == 33)
+            .expect("the access unit carries an SPS");
+        let parsed =
+            crate::hevc::engine::sps::SeqParameterSet::parse(&sps.rbsp).expect("SPS parses");
+        assert!(
+            parsed.sample_adaptive_offset_enabled_flag,
+            "the writer's SPS still disables SAO"
         );
     }
 
