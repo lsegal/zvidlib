@@ -72,6 +72,17 @@ const TYPE_GAIN_SAMPLE_INTERVAL: usize = 8;
 /// which is every size [`super::transform::forward_transform`] implements.
 const TYPE_GAIN_SIZES: usize = 4;
 
+/// What a probed transform block's full-set result is keyed to: its position on the coded grid,
+/// its transform size, and the DC prediction it was measured against.
+///
+/// Those four values determine the block's residual - the source samples are fixed, so the
+/// residual is `sample - prediction` over a known rectangle - and the residual plus the size
+/// determines everything the search derives from it: the candidate set, the forward transform,
+/// the quantized levels, the reconstruction and the `sse + lambda * bits` cost. Nothing else the
+/// encoder carries can change the answer, so a key that matches is not merely a plausible match
+/// but the same computation.
+type ProbeKey = (usize, usize, usize, u8);
+
 /// One transform size's accumulated probe measurement for the frame.
 #[derive(Clone, Copy, Default)]
 struct TypeGain {
@@ -155,6 +166,15 @@ pub(crate) struct FrameEncoder<'a> {
     /// the measured gain is extrapolated over. Zero-skipped blocks are excluded: no transform type
     /// can improve a block that codes no coefficients.
     trial_searched_cost: i64,
+    /// Full-set winners a size trial's probe already computed, by [`ProbeKey`].
+    ///
+    /// A probe runs the whole type search and then throws its winner away so the trial keeps
+    /// DCT's reconstruction and contexts. The winner is still exactly what the emitting pass
+    /// would recompute for that block, though, provided the emitting pass reaches it under the
+    /// same key - which it does for the size the search selects, and only for that size, because
+    /// the emitting pass replays the winning trial's state. Entries under any other key are never
+    /// read; an entry is removed as it is consumed.
+    probed: std::collections::HashMap<ProbeKey, TxCandidate>,
     /// Set by [`Self::without_search_shortcuts`] to restore the original exhaustive search, so a
     /// test can compare the shortcuts against the search they stand in for.
     #[cfg(test)]
@@ -178,8 +198,11 @@ pub(crate) struct SearchReport {
 /// One transform type considered for a block, with everything the winner needs to be written:
 /// the `tx_type` symbol's index in its set, the quantized levels, the reconstructed residual,
 /// and the `sse + lambda * bits` cost the search minimizes.
+#[derive(Clone)]
 struct TxCandidate {
     symbol: usize,
+    /// Only the trace the tests assert on reads this back; the bitstream carries `symbol`.
+    #[cfg_attr(not(test), allow(dead_code))]
     tx_type: Av1TxType,
     levels: Vec<i32>,
     reconstructed: Vec<i16>,
@@ -246,6 +269,7 @@ impl<'a> FrameEncoder<'a> {
             probe_best_cost: 0,
             size_searches: 0,
             trial_searched_cost: 0,
+            probed: std::collections::HashMap::new(),
             #[cfg(test)]
             exhaustive: false,
             #[cfg(test)]
@@ -641,6 +665,33 @@ impl<'a> FrameEncoder<'a> {
         emit: bool,
     ) -> i64 {
         let prediction = self.dc_prediction(x, y, size);
+
+        // A size trial's probe already ran this exact search. Its winner was discarded so the
+        // trial would reconstruct like a DCT-only one, but the answer it computed is a function
+        // of `(x, y, size, prediction)` alone (see [`ProbeKey`]), so when the emitting pass
+        // reaches the block under the same key - which happens for the size the search selects,
+        // whose trial's state the emitting pass replays - recomputing it can only produce the
+        // same candidate. It is written straight out instead. Every other state misses the key
+        // and searches below as before.
+        //
+        // The zero-block shortcut needs no re-check either: it is decided by the residual, and a
+        // probe only ever ran on a block whose residual already failed it.
+        if emit {
+            if let Some(candidate) = self.probed.remove(&(x, y, size, prediction)) {
+                let scan = cdf::up_right_diagonal_scan(size);
+                return self.write_candidate(
+                    x,
+                    y,
+                    block_width,
+                    size,
+                    prediction,
+                    &candidate,
+                    &scan,
+                    true,
+                );
+            }
+        }
+
         let mut residual = vec![0i32; size * size];
         for row in 0..size {
             for column in 0..size {
@@ -704,6 +755,9 @@ impl<'a> FrameEncoder<'a> {
         }
 
         let mut best: Option<TxCandidate> = None;
+        // The whole set's winner, kept only by a probe: it is what the emitting pass would
+        // recompute for this block, and caching it is what spares that pass the repeat.
+        let mut full_set: Option<TxCandidate> = None;
         let mut cheapest = i64::MAX;
         for &(symbol, tx_type) in &candidates {
             #[cfg(test)]
@@ -734,19 +788,28 @@ impl<'a> FrameEncoder<'a> {
             // anything that depends on evaluation order or on the host. Which type wins there is
             // therefore a property of the pattern, not of the encoder, and is not asserted; that
             // the *bitstream* comes out the same everywhere is, in `nonlossless_tests`.
-            let keep = if probing {
-                tx_type == Av1TxType::DctDct || best.is_none()
-            } else {
-                best.as_ref().is_none_or(|best| cost < best.cost)
+            let candidate = TxCandidate {
+                symbol,
+                tx_type,
+                levels,
+                reconstructed,
+                cost,
             };
-            if keep {
-                best = Some(TxCandidate {
-                    symbol,
-                    tx_type,
-                    levels,
-                    reconstructed,
-                    cost,
-                });
+            if probing {
+                // The probe ranks the whole set by the emitting pass's own rule - candidates in
+                // set order, strictly-less keep - so the cached winner is the one that pass
+                // would have arrived at, not merely one of equal cost.
+                if full_set
+                    .as_ref()
+                    .is_none_or(|winner: &TxCandidate| cost < winner.cost)
+                {
+                    full_set = Some(candidate.clone());
+                }
+                if tx_type == Av1TxType::DctDct || best.is_none() {
+                    best = Some(candidate);
+                }
+            } else if best.as_ref().is_none_or(|best| cost < best.cost) {
+                best = Some(candidate);
             }
         }
         if probing {
@@ -757,42 +820,71 @@ impl<'a> FrameEncoder<'a> {
             let gain = &mut self.type_gain[type_gain_slot(size)];
             gain.dct_cost += dct;
             gain.best_cost += best_of_set;
+            if let Some(winner) = full_set {
+                self.probed.insert((x, y, size, prediction), winner);
+            }
         }
-        // `tx_type` itself is only read by the trace the tests assert on; the bitstream carries
-        // its `symbol` index instead.
-        #[cfg_attr(not(test), allow(unused_variables))]
-        let TxCandidate {
-            symbol,
-            tx_type,
-            levels,
-            reconstructed,
-            cost,
-        } = best.expect("every transform size has at least one candidate type");
+        let winner = best.expect("every transform size has at least one candidate type");
+        let cost = self.write_candidate(x, y, block_width, size, prediction, &winner, &scan, emit);
+        if trial {
+            self.trial_searched_cost += cost;
+        }
+        cost
+    }
 
+    /// Reconstructs a transform block from the type the search picked and codes its coefficients,
+    /// returning the candidate's cost.
+    ///
+    /// This is the whole of a transform block's output: it runs identically whether the winner
+    /// came from a search just now or from a probe's cached result, which is what makes the reuse
+    /// exact rather than a second path that has to be kept in step with the first.
+    #[allow(clippy::too_many_arguments)]
+    fn write_candidate(
+        &mut self,
+        x: usize,
+        y: usize,
+        block_width: usize,
+        size: usize,
+        prediction: u8,
+        candidate: &TxCandidate,
+        scan: &[usize],
+        emit: bool,
+    ) -> i64 {
         for row in 0..size {
             let start = (y + row) * self.coded_w + x;
             let destination = &mut self.recon[start..start + size];
             destination.fill(prediction);
-            add_residual_row(&reconstructed[row * size..(row + 1) * size], destination);
+            add_residual_row(
+                &candidate.reconstructed[row * size..(row + 1) * size],
+                destination,
+            );
         }
 
-        let coded = self.code_coefficients(x >> 2, y >> 2, block_width, size, &levels, &scan, emit);
+        let coded = self.code_coefficients(
+            x >> 2,
+            y >> 2,
+            block_width,
+            size,
+            &candidate.levels,
+            scan,
+            emit,
+        );
+        // `tx_type` itself is only read by the trace the tests assert on; the bitstream carries
+        // its `symbol` index instead.
         #[cfg(test)]
         if emit {
-            self.emitted.push((size, tx_type));
+            self.emitted.push((size, candidate.tx_type));
         }
         // The decoder reads `tx_type` after the coefficients, and only for a block that was not
         // fully skipped; a skipped block's type is irrelevant because its residual is zero.
         if coded && emit {
             // DC_PRED is the only y_mode this encoder signals, so the CDF's intra direction is 0.
+            let set = cdf::get_tx_set(size, false, true);
             if let Some(tx_cdf) = cdf::tx_type_cdf(set, size, 0) {
-                self.sym.encode_symbol(symbol, tx_cdf);
+                self.sym.encode_symbol(candidate.symbol, tx_cdf);
             }
         }
-        if trial {
-            self.trial_searched_cost += cost;
-        }
-        cost
+        candidate.cost
     }
 
     /// Writes the all-zero coefficient block whose cost the type search cannot beat, updating
