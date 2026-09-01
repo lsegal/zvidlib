@@ -7,7 +7,7 @@ zvidlib's benchmarks run under [criterion](https://docs.rs/criterion) with
 | --- | --- |
 | `benches/codec.rs` | codec work: decode, encoder inputs, and the per-ISA SIMD groups |
 | `benches/av1_decode.rs` | the AV1 software decoder: whole-frame decode and every hot stage, scalar versus SIMD |
-| `benches/av1_encode.rs` | the AV1 encoder's kernels: the forward transforms, scalar versus SIMD |
+| `benches/av1_encode.rs` | the native AV1 encoder: whole-frame encode, every stage, and the forward-transform kernels, scalar versus SIMD |
 | `benches/audio_decode.rs` | the audio decode path: AAC access units and `AacSampleReader` range/seek reads |
 | `benches/audio_mux.rs` | the audio container path: MP4 muxing, sample-table growth, demux, and gapless timing |
 | `benches/hevc_encode.rs` | the pure-Rust HEVC encoder, whole-frame and per-stage |
@@ -29,7 +29,7 @@ its mode search is slow enough that keeping it out of the default
 cargo bench                       # the default, fast groups in every target
 cargo bench --bench codec         # codec work only
 cargo bench --bench av1_decode    # the AV1 software decoder only
-cargo bench --bench av1_encode    # the AV1 encoder kernels only
+cargo bench --bench av1_encode    # the AV1 encoder, whole-frame and per-stage
 cargo bench --bench audio_decode  # the audio decode path only
 cargo bench --bench audio_mux     # the audio container path only
 cargo bench --bench hevc_encode   # the HEVC encoder groups only
@@ -177,15 +177,56 @@ cargo bench --bench av1_decode -- av1_inverse   # every inverse-transform group
 
 ## The AV1 encoder suite (`--bench av1_encode`)
 
-`benches/av1_encode.rs` measures AV1's encoder-side kernels. Today that is the
-forward transform set:
+`benches/av1_encode.rs` measures the native AV1 encoder on two axes: whole-frame
+versus per-stage, and instruction set.
+
+The whole-frame groups encode a synthetic monochrome frame through the public
+`zvidlib::native_av1_video_encoder_factory` at three quantizer settings and
+report frames/sec and megapixels/sec. The per-stage groups run each stage on its
+own through `zvidlib::av1_encoder_bench`, the `#[doc(hidden)]` per-stage access
+that is the AV1 counterpart to `hevc_encoder_bench`, so the tile encoder's cost
+is not mistaken for bitstream-writing cost. Both default to 640x352 and add a
+1920x1080 pass behind `ZVIDLIB_BENCH_LARGE=1`:
 
 | Group | Stage |
 | --- | --- |
+| `av1_encode_frame_q{0,32,160}` | one whole frame through the public encoder, `src/av1_encoder/tile.rs` |
+| `av1_encode_stage_wht` | the forward 4x4 WHT, `src/av1_encoder/wht.rs` |
+| `av1_encode_stage_symbol` | symbol coding over the static CDF tables, `src/av1_encoder/symbol.rs` and `cdf.rs` |
+| `av1_encode_stage_tile` | tile encoding: superblock iteration, `DC_PRED`, coefficient coding, `src/av1_encoder/tile.rs` |
+| `av1_encode_stage_bitstream` | headers, bit writing and OBU LEB128 framing, `src/av1_encoder/{bitwriter,headers,leb128}.rs` |
 | `av1_forward_dct_{4x4,8x8,16x16,32x32}` | forward DCT, `src/av1_encoder/transform.rs` through `zvidlib::forward_transform` |
 | `av1_forward_adst_8x8`, `av1_forward_flipadst_16x16` | the forward ADST family, including a flipped type |
 
-They run once per available instruction set through
+The per-stage groups run at `base_q_idx = 0`, the lossless WHT profile, so they
+decompose the same work `av1_encode_frame_q0` measures end to end. The
+non-lossless search the `q32` and `q160` groups show is a whole-frame property
+rather than a stage of its own, which is why it has no per-stage counterpart.
+
+The stage breakdown is the point of the per-stage groups, and it is lopsided:
+tile encoding is within a small factor of the whole-frame number, the forward
+WHT and the symbol coder are each an order of magnitude cheaper than that, and
+header writing with its LEB128 framing is two to three orders cheaper again —
+microseconds against a 1080p tile encode's hundreds of milliseconds. Coefficient
+coding and its context derivation inside `tile.rs`, not the transform, are what a
+faster lossless encoder has to attack next.
+
+The forward transforms and the forward WHT are this encoder's only vectorized
+kernels. Symbol coding, CDF handling and bitstream writing are scalar and
+expected to stay that way, so those arms read the same under every instruction
+set. That flatness is a measured result rather than a broken run, which is why
+each group asserts through `simd::active_by_site()` that the override landed
+instead of inferring it from the clock. `report_stage_coverage` prints the stage
+list on every run, so a group that stops being measured reads as a broken run
+rather than as a stage that costs nothing.
+
+```sh
+cargo bench --bench av1_encode -- av1_encode_stage    # the per-stage groups only
+ZVIDLIB_BENCH_LARGE=1 cargo bench --bench av1_encode  # add the 1080p pass
+```
+
+The kernel-level `av1_forward_*` groups run once per available instruction set
+through
 `support::isa::bench_across_isas`, under the same bit-exactness and
 `active_by_site()` guards as every other per-ISA group, and over the same
 1920x1080 block counts and coefficient generator as the inverse-transform

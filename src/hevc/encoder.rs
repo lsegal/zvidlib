@@ -2,6 +2,7 @@
 use super::engine::encoder::rdo::DistortionBackend;
 use super::engine::{
     encoder::{
+        lossy::encode_idr_residual_au,
         pcm::encode_idr_pcm_au,
         rdo::{DecisionConfig, decide_picture},
         recon::{ReconConfig, ReconstructedPicture, SourcePlanes, reconstruct_picture},
@@ -38,16 +39,14 @@ impl VideoEncoderFactory for HevcEncoderFactory {
         if c.color_range != ColorRange::Limited {
             return invalid("native HEVC Main encoding requires limited-range input");
         }
-        if !c.configuration.is_empty() {
-            return invalid(
-                "native HEVC encoding does not accept pre-existing codec configuration",
-            );
+        if parse_operating_point(&c.configuration).is_none() {
+            return invalid(OPERATING_POINT_HELP);
         }
         if c.timescale == 0 || c.frame_duration == 0 {
             return invalid("native HEVC encoding requires nonzero timescale and frame duration");
         }
         if c.coded_dimensions.width % 16 != 0 || c.coded_dimensions.height % 16 != 0 {
-            return invalid("native HEVC PCM encoding requires dimensions divisible by 16");
+            return invalid("native HEVC encoding requires dimensions divisible by 16");
         }
         CodecSupport::Supported {
             implementation: CodecImplementation::Software,
@@ -71,11 +70,26 @@ impl VideoEncoderFactory for HevcEncoderFactory {
         {
             return Err(limit("HEVC frame exceeds configured allocation limit"));
         }
+        let operating_point = parse_operating_point(&c.configuration)
+            .ok_or_else(|| invalid_input(OPERATING_POINT_HELP))?;
         let (y, cb, cr) = blank_planes(d.width as usize, d.height as usize);
-        let au = encode_idr_pcm_au(&y, &cb, &cr, d.width as usize, d.height as usize)
-            .map_err(|e| invalid_input(e.to_string()))?;
+        // The declared `hvcC` has to carry the parameter sets the samples
+        // actually reference, so probe with the writer this encoder will use
+        // rather than always the PCM one. The two writers agree on every
+        // parameter set at this fixed geometry today, but that is their
+        // coincidence to keep, not something the factory should assume.
+        let au = encode_operating_point(
+            operating_point,
+            &y,
+            &cb,
+            &cr,
+            d.width as usize,
+            d.height as usize,
+        )?
+        .0;
         Ok(Box::new(HevcEncoder {
             configuration: c.clone(),
+            operating_point,
             config: EncoderConfig {
                 codec: Codec::Hevc,
                 timescale: c.timescale,
@@ -89,6 +103,9 @@ impl VideoEncoderFactory for HevcEncoderFactory {
 }
 struct HevcEncoder {
     configuration: VideoEncoderConfig,
+    /// Which access-unit writer every sample goes through, decided once at
+    /// creation from [`VideoEncoderConfig::configuration`].
+    operating_point: OperatingPoint,
     config: EncoderConfig,
     next_index: u64,
     limits: Limits,
@@ -139,16 +156,14 @@ impl VideoEncoder for HevcEncoder {
             }
             let (y, cb, cr) = rgba_to_yuv420(frame, source.orientation)?;
             let d = self.configuration.coded_dimensions;
-            let decision = decide_picture(
+            let (au, reconstruction) = encode_operating_point(
+                self.operating_point,
                 &y,
-                d.width as usize,
+                &cb,
+                &cr,
                 d.width as usize,
                 d.height as usize,
-                self.reference.as_ref().map(|r| r.y.as_slice()),
-                DecisionConfig::default(),
-            );
-            let au = encode_idr_pcm_au(&y, &cb, &cr, d.width as usize, d.height as usize)
-                .map_err(|e| invalid_input(e.to_string()))?;
+            )?;
             let data = length_prefixed_vcl(&au)?;
             if data.len() as u64 > self.limits.max_allocation_bytes {
                 return Err(limit(
@@ -162,22 +177,36 @@ impl VideoEncoder for HevcEncoder {
             let tick = i64::try_from(tick).map_err(|_| limit("HEVC timeline overflows"))?;
             self.next_index += 1;
             // The reference for the next picture is the reconstruction of
-            // this one, not its source. Both are identical while the writer
-            // codes PCM losslessly with the loop filters neutralized; keeping
-            // the reconstruction is what makes that stay true when it does
-            // not.
-            self.reference = Some(reconstruct_picture(
-                SourcePlanes {
-                    y: &y,
-                    cb: &cb,
-                    cr: &cr,
-                    width: d.width as usize,
-                    height: d.height as usize,
-                },
-                self.reference.as_ref(),
-                &decision,
-                ReconConfig::default(),
-            ));
+            // this one, not its source. The residual writer reconstructs as it
+            // codes and hands that picture back, because a lossy stream's
+            // reconstruction cannot be recovered from the source. The PCM
+            // writer does not: its output is the source, so the reconstruction
+            // is rebuilt here from the mode decision.
+            self.reference = Some(match reconstruction {
+                Some(reconstruction) => reconstruction,
+                None => {
+                    let decision = decide_picture(
+                        &y,
+                        d.width as usize,
+                        d.width as usize,
+                        d.height as usize,
+                        self.reference.as_ref().map(|r| r.y.as_slice()),
+                        DecisionConfig::default(),
+                    );
+                    reconstruct_picture(
+                        SourcePlanes {
+                            y: &y,
+                            cb: &cb,
+                            cr: &cr,
+                            width: d.width as usize,
+                            height: d.height as usize,
+                        },
+                        self.reference.as_ref(),
+                        &decision,
+                        ReconConfig::default(),
+                    )
+                }
+            });
             Ok(vec![EncodedSample {
                 data,
                 dts: tick,
@@ -227,6 +256,76 @@ fn encode_with_rdo_backend(
     }
     Ok(data)
 }
+/// Which access-unit writer the public factory routes a stream through.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OperatingPoint {
+    /// Every coding unit is a `pcm_flag == 1` PCM block, so the coded picture
+    /// is exactly the source. This is the default and what every release
+    /// before this one emitted.
+    LosslessPcm,
+    /// Every coding unit carries §7.3.8.11 quantized residual coded at this
+    /// `SliceQpY`.
+    Lossy {
+        /// `SliceQpY`, in 0..=51.
+        qp: i32,
+    },
+}
+
+/// The `SliceQpY` range this encoder accepts, at 8-bit depth
+/// (`QpBdOffsetY == 0`).
+const QP_RANGE: core::ops::RangeInclusive<u8> = 0..=51;
+
+const OPERATING_POINT_HELP: &str = "the native HEVC encoder's configuration is either empty \
+     (lossless PCM) or a single SliceQpY byte in 0..=51 selecting lossy residual coding";
+
+/// The backend-private configuration this encoder accepts, following the
+/// precedent [`crate::native_av1_video_encoder_factory`] set with `base_q_idx`.
+///
+/// An empty configuration is [`OperatingPoint::LosslessPcm`], the lossless PCM
+/// profile every earlier release emitted; it stays the default precisely
+/// because changing what an unconfigured caller gets is a policy change, and
+/// callers that ask for nothing keep byte-identical output. A one-byte
+/// configuration is `SliceQpY`, so `vec![26]` asks for lossy residual coding at
+/// QP 26. Unlike AV1's `base_q_idx`, `0` is not a lossless request: HEVC QP 0 is
+/// simply the finest quantizer step, and `vec![0]` still takes the residual
+/// path, whose reconstruction is close to but not identical to the source.
+/// Anything else is rejected, so the whole surface is `configuration.is_empty()`
+/// or not.
+///
+/// Lossy streams decode through [`crate::native_hevc_video_decoder_factory`],
+/// the crate's own decoder, with distortion that tracks the requested QP. The
+/// writer codes every coding unit as intra DC with the in-loop filters
+/// neutralized; intra mode search is a separate concern that belongs with the
+/// RDO work, so quality at a given QP is not yet what a rate-distortion-optimal
+/// encoder would reach.
+fn parse_operating_point(configuration: &[u8]) -> Option<OperatingPoint> {
+    match configuration {
+        [] => Some(OperatingPoint::LosslessPcm),
+        [qp] if QP_RANGE.contains(qp) => Some(OperatingPoint::Lossy { qp: i32::from(*qp) }),
+        _ => None,
+    }
+}
+
+/// Encode one access unit through the writer `point` selects, with the
+/// reconstruction that writer produced when it produces one.
+fn encode_operating_point(
+    point: OperatingPoint,
+    y: &[u8],
+    cb: &[u8],
+    cr: &[u8],
+    width: usize,
+    height: usize,
+) -> Result<(Vec<u8>, Option<ReconstructedPicture>)> {
+    match point {
+        OperatingPoint::LosslessPcm => encode_idr_pcm_au(y, cb, cr, width, height)
+            .map(|au| (au, None))
+            .map_err(|e| invalid_input(e.to_string())),
+        OperatingPoint::Lossy { qp } => encode_idr_residual_au(y, cb, cr, width, height, qp)
+            .map(|(au, reconstruction)| (au, Some(reconstruction)))
+            .map_err(|e| invalid_input(e.to_string())),
+    }
+}
+
 fn blank_planes(w: usize, h: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     (vec![16; w * h], vec![128; w * h / 4], vec![128; w * h / 4])
 }
@@ -486,6 +585,214 @@ mod tests {
         )
         .unwrap();
         assert_eq!(scalar, dispatched);
+    }
+
+    /// Builds a deterministic RGBA8 test frame with structure in both
+    /// dimensions, so quantization has something to lose.
+    fn test_frame(side: u32) -> (VideoFrame, crate::VideoDimensions, Limits) {
+        let limits = Limits::default();
+        let dimensions = crate::VideoDimensions::new(side, side, &limits).unwrap();
+        let side = side as usize;
+        let mut pixels = vec![0_u8; side * side * 4];
+        for (index, pixel) in pixels.chunks_exact_mut(4).enumerate() {
+            let (x, y) = (index % side, index / side);
+            let value = (24 + (x * 11 + y * 5) % 200) as u8;
+            pixel.copy_from_slice([value, value.wrapping_add(31), value / 2 + 40, 255].as_slice());
+        }
+        let frame = VideoFrame::new(
+            dimensions,
+            PixelFormat::Rgba8,
+            ColorRange::Limited,
+            vec![Plane {
+                data: pixels,
+                stride: side * 4,
+            }],
+            &limits,
+        )
+        .unwrap();
+        (frame, dimensions, limits)
+    }
+
+    fn encoder_config(
+        dimensions: crate::VideoDimensions,
+        configuration: Vec<u8>,
+    ) -> VideoEncoderConfig {
+        VideoEncoderConfig {
+            codec: Codec::Hevc,
+            profile: CodecProfile::HevcMain,
+            coded_dimensions: dimensions,
+            input_format: PixelFormat::Rgba8,
+            color_range: ColorRange::Limited,
+            hardware: HardwarePreference::Avoid,
+            timescale: 30_000,
+            frame_duration: 1_001,
+            configuration,
+        }
+    }
+
+    /// Round-trips one frame through the public factory and the crate's own
+    /// HEVC decoder, returning the worst observed PSNR.
+    fn round_trip_psnr(
+        frame: &VideoFrame,
+        dimensions: crate::VideoDimensions,
+        limits: Limits,
+        configuration: Vec<u8>,
+    ) -> f64 {
+        let vector = VideoEncoderConformanceVector {
+            name: "native hevc operating point".into(),
+            configuration: encoder_config(dimensions, configuration),
+            decoder_configuration: VideoDecoderConfig {
+                codec: Codec::Hevc,
+                profile: CodecProfile::HevcMain,
+                coded_dimensions: dimensions,
+                output_format: PixelFormat::Rgba8,
+                color_range: ColorRange::Limited,
+                hardware: HardwarePreference::Avoid,
+                configuration: Vec::new(),
+            },
+            frames: vec![frame.clone()],
+            minimum_psnr_db: 0.0,
+        };
+        block_on(verify_video_encoder_conformance(
+            &native_hevc_video_encoder_factory(),
+            &native_hevc_video_decoder_factory(),
+            &vector,
+            limits,
+        ))
+        .unwrap()
+        .minimum_observed_psnr_db
+    }
+
+    #[test]
+    fn configuration_selects_the_pcm_or_residual_operating_point() {
+        assert_eq!(
+            parse_operating_point(&[]),
+            Some(OperatingPoint::LosslessPcm),
+            "an empty configuration stays the lossless PCM default"
+        );
+        assert_eq!(
+            parse_operating_point(&[0]),
+            Some(OperatingPoint::Lossy { qp: 0 }),
+            "QP 0 is the finest residual step, not a lossless request"
+        );
+        assert_eq!(
+            parse_operating_point(&[51]),
+            Some(OperatingPoint::Lossy { qp: 51 })
+        );
+        assert_eq!(
+            parse_operating_point(&[52]),
+            None,
+            "SliceQpY tops out at 51"
+        );
+        assert_eq!(parse_operating_point(&[26, 0]), None);
+    }
+
+    #[test]
+    fn capability_accepts_a_qp_byte_and_rejects_anything_else() {
+        let limits = Limits::default();
+        let dimensions = crate::VideoDimensions::new(16, 16, &limits).unwrap();
+        let factory = native_hevc_video_encoder_factory();
+        for configuration in [Vec::new(), vec![0], vec![26], vec![51]] {
+            assert!(
+                factory
+                    .capability(&encoder_config(dimensions, configuration.clone()))
+                    .is_supported(),
+                "{configuration:?} should select an operating point"
+            );
+        }
+        for configuration in [vec![52], vec![255], vec![26, 26]] {
+            assert!(
+                matches!(
+                    factory.capability(&encoder_config(dimensions, configuration.clone())),
+                    CodecSupport::InvalidConfiguration { .. }
+                ),
+                "{configuration:?} is not an operating point"
+            );
+        }
+    }
+
+    /// The acceptance criterion that existing callers are untouched: an empty
+    /// configuration must still produce exactly the PCM bytes it did before
+    /// the residual path became reachable.
+    #[test]
+    fn an_empty_configuration_still_emits_byte_identical_pcm_output() {
+        let (frame, dimensions, limits) = test_frame(32);
+        let mut encoder = native_hevc_video_encoder_factory()
+            .create(&encoder_config(dimensions, Vec::new()), &limits)
+            .unwrap();
+        let samples = block_on(encoder.encode(
+            FrameIndex(0),
+            FrameSource::Cpu(crate::CpuFrameSource {
+                frame: &frame,
+                orientation: crate::Orientation::TopLeft,
+            }),
+        ))
+        .unwrap();
+        let (y, cb, cr) = rgba_to_yuv420(&frame, crate::Orientation::TopLeft).unwrap();
+        let expected =
+            length_prefixed_vcl(&encode_idr_pcm_au(&y, &cb, &cr, 32, 32).unwrap()).unwrap();
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].data, expected);
+        let pcm_config = encoder.config().decoder_config.clone();
+        let blank = blank_planes(32, 32);
+        assert_eq!(
+            pcm_config,
+            hvcc_box(&encode_idr_pcm_au(&blank.0, &blank.1, &blank.2, 32, 32).unwrap()).unwrap(),
+            "the declared hvcC is unchanged for unconfigured callers"
+        );
+    }
+
+    /// A QP byte reaches the residual writer through the public factory alone,
+    /// the output decodes with this crate's own HEVC decoder, and distortion
+    /// tracks the requested operating point.
+    #[test]
+    fn a_qp_byte_encodes_lossy_hevc_whose_distortion_tracks_the_operating_point() {
+        let (frame, dimensions, limits) = test_frame(32);
+        let fine = round_trip_psnr(&frame, dimensions, limits, vec![12]);
+        let coarse = round_trip_psnr(&frame, dimensions, limits, vec![37]);
+        assert!(
+            fine.is_finite(),
+            "QP 12 is lossy, so PSNR against the source is finite: {fine}"
+        );
+        assert!(
+            fine > coarse + 1.0,
+            "a finer quantizer must distort less: QP 12 gave {fine:.2} dB, QP 37 gave \
+             {coarse:.2} dB"
+        );
+        assert!(
+            coarse > 20.0,
+            "even the coarse operating point should stay recognizable: {coarse:.2} dB"
+        );
+    }
+
+    /// A lossy stream must declare the parameter sets its own writer emits,
+    /// because `create` probes with the selected writer rather than the PCM
+    /// one.
+    #[test]
+    fn a_lossy_stream_declares_the_parameter_sets_its_own_writer_emits() {
+        let (frame, dimensions, limits) = test_frame(16);
+        let lossy = native_hevc_video_encoder_factory()
+            .create(&encoder_config(dimensions, vec![26]), &limits)
+            .unwrap();
+        let declared = parse_hvcc(&lossy.config().decoder_config[8..]).unwrap();
+        let (y, cb, cr) = rgba_to_yuv420(&frame, crate::Orientation::TopLeft).unwrap();
+        let (au, _) = encode_idr_residual_au(&y, &cb, &cr, 16, 16, 26).unwrap();
+        let written = collect_nal_units(&au).unwrap();
+        for kind in [32_u8, 33, 34] {
+            let declared = declared
+                .nal_units
+                .iter()
+                .find(|unit| unit.header.nal_unit_type == kind)
+                .unwrap_or_else(|| panic!("lossy hvcC omitted parameter set {kind}"));
+            let written = written
+                .iter()
+                .find(|unit| unit.header.nal_unit_type == kind)
+                .unwrap_or_else(|| panic!("lossy access unit omitted parameter set {kind}"));
+            assert_eq!(
+                declared.escaped, written.escaped,
+                "declared parameter set {kind} differs from the one the residual writer emits"
+            );
+        }
     }
 
     fn block_on<T>(future: impl Future<Output = T>) -> T {
