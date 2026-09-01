@@ -117,6 +117,7 @@ use crate::hevc::engine::binarization::{
     sig_coeff_flag_sig_ctx_transform_skip, signed_level_from_sign_flag,
 };
 use crate::hevc::engine::cabac::{CabacEngine, CabacError, ContextModel};
+use crate::hevc::engine::profile::{Stage as ProfStage, scope as prof_scope};
 use crate::hevc::engine::scan::{ScanIdx, ScanOrderError, scan_order};
 
 // ---------------------------------------------------------------------
@@ -980,6 +981,11 @@ pub fn decode_residual_coding(
     contexts: &mut ResidualContexts,
     params: &ResidualCodingParams,
 ) -> Result<ResidualBlock, ResidualCodingError> {
+    // Issue #189 stage attribution: charged separately from the rest of the
+    // slice-data CABAC walk it nests inside, because coefficient parsing is
+    // the part of §7.3.8 that scales with residual density rather than with
+    // block count.
+    let _profile = prof_scope(ProfStage::Residual);
     let mut bins = EngineResidualBinSource { engine, contexts };
     decode_residual_coding_with(params, &mut bins)
 }

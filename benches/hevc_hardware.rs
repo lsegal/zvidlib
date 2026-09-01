@@ -1,5 +1,9 @@
 //! The platform hardware HEVC decoders measured against the software decoder.
 //!
+//! Its own `[[bench]]` target, like the other per-codec targets: it shares
+//! `benches/support/` with them but none of their decoded-frame fixtures, and
+//! `cargo bench --bench hevc_hardware` is its entry point.
+//!
 //! zvidlib ships three fixed-function HEVC backends behind
 //! `native_hevc_video_decoder_factory` — NVDEC (`src/hevc/nvdec.rs`), Windows
 //! Media Foundation (`src/hevc/windows_mf.rs`), and VideoToolbox
@@ -51,13 +55,15 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use criterion::measurement::WallTime;
-use criterion::{BenchmarkGroup, Criterion};
+use criterion::{BenchmarkGroup, Criterion, criterion_group, criterion_main};
 use zvidlib::{
     CancellationToken, CodecSupport, EncodedVideoSample, HardwarePreference, Limits,
     VideoDecoderConfig, VideoDecoderFactory, native_hevc_video_decoder_factory,
 };
 
-use super::support::{self, FrameWork, group_name};
+mod support;
+
+use support::{FrameWork, group_name};
 
 /// Frames one steady-state iteration decodes past the first.
 ///
@@ -74,7 +80,7 @@ const COMPARISON_FRAMES: u64 = 32;
 /// Environment variable that opts into the slow software comparison arm.
 ///
 /// Shared with the other groups that decode the bundled 1080p sample through
-/// the software decoder; see `benches/codec.rs`.
+/// the software decoder; see `benches/hevc_decode.rs`.
 const LARGE_GROUP_ENV: &str = "ZVIDLIB_BENCH_LARGE";
 
 /// The backends compiled in for this target, for the group's log lines.
@@ -203,7 +209,7 @@ fn bench_arm(
 /// Skips with a message rather than failing when the host has no hardware
 /// decoder, the way `tests/native_hevc_hardware.rs` does: a dev box without
 /// NVDEC must still be able to run `cargo bench`.
-pub fn hevc_hardware(criterion: &mut Criterion) {
+fn hevc_hardware(criterion: &mut Criterion) {
     let factory = native_hevc_video_decoder_factory();
     let hardware = configuration(HardwarePreference::Require);
     if factory.capability(&hardware)
@@ -265,3 +271,6 @@ pub fn hevc_hardware(criterion: &mut Criterion) {
         );
     }
 }
+
+criterion_group!(benches, hevc_hardware);
+criterion_main!(benches);

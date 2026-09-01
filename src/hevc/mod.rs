@@ -1,5 +1,12 @@
 //! Native HEVC/H.265 decoding with platform acceleration and a dependency-free software fallback.
 
+// internal — exposed for the criterion benchmark suite; not part of the stable API
+#[doc(hidden)]
+pub mod bench;
+pub mod decode_bench;
+// internal — exposed for the stage-attribution example; not part of the stable API
+#[doc(hidden)]
+pub use engine::profile as decode_profile;
 mod encoder;
 pub(crate) mod engine;
 #[cfg(all(any(windows, target_os = "linux"), target_pointer_width = "64"))]
@@ -345,6 +352,28 @@ impl HevcDecoder {
     }
 
     fn collect(&mut self, flush: bool) -> Result<Vec<DecodedVideoFrame>> {
+        let pictures = self.collect_pictures(flush)?;
+        let mut output = Vec::with_capacity(pictures.len());
+        for (presentation_index, picture) in pictures {
+            output.push(DecodedVideoFrame {
+                presentation_index,
+                frame: picture_to_rgba(&picture, &self.configuration, &self.limits)?,
+            });
+        }
+        Ok(output)
+    }
+
+    /// The output pictures ready at this point, in presentation order, before
+    /// colour conversion.
+    ///
+    /// Issue #220: this is the decoder's own product. [`collect`] converts each
+    /// one to RGBA, which is the round trip an application pays but is not
+    /// decoding, and `hevc_decoder_bench` times the two intervals separately so
+    /// a whole-frame SIMD ratio is not diluted by a stage no HEVC kernel
+    /// touches.
+    ///
+    /// [`collect`]: Self::collect
+    fn collect_pictures(&mut self, flush: bool) -> Result<Vec<(FrameIndex, Picture)>> {
         self.reorder.extend(self.sequence.take_decoded());
         self.reorder
             .sort_by_key(|frame| (frame.cvs_index, frame.poc));
@@ -368,21 +397,22 @@ impl HevcDecoder {
                     malformed("HEVC decoder produced a picture without a submitted identity")
                 })?
                 .0;
-            output.push(DecodedVideoFrame {
-                presentation_index,
-                frame: picture_to_rgba(&decoded.picture, &self.configuration, &self.limits)?,
-            });
+            output.push((presentation_index, decoded.picture));
         }
         Ok(output)
     }
-}
 
-impl VideoDecoder for HevcDecoder {
-    fn submit(
+    /// Parses one access unit into the sequence decoder, without collecting
+    /// anything it made ready.
+    ///
+    /// The push and the collect are separate so [`VideoDecoder::submit`] and
+    /// the benchmark surface's picture-only path share exactly the same
+    /// bitstream handling and differ only in what they do with the result.
+    fn push_sample(
         &mut self,
         sample: &EncodedVideoSample,
         cancellation: &CancellationToken,
-    ) -> Result<Vec<DecodedVideoFrame>> {
+    ) -> Result<()> {
         check_cancelled(cancellation)?;
         if sample.data.len() as u64 > self.limits.max_allocation_bytes {
             return Err(limit("HEVC access unit exceeds the allocation limit"));
@@ -398,12 +428,40 @@ impl VideoDecoder for HevcDecoder {
             Ok::<(), SequenceError>(())
         }));
         match result {
-            Ok(Ok(())) => self.collect(false),
+            Ok(Ok(())) => Ok(()),
             Ok(Err(error)) => Err(sequence_error(error)),
             Err(_) => Err(malformed(
                 "HEVC bitstream triggered an invalid decoder state",
             )),
         }
+    }
+
+    /// Decodes one access unit and stops at the decoded pictures.
+    ///
+    /// The picture-only half of the issue #220 split, used by
+    /// [`crate::hevc_decoder_bench`].
+    fn submit_pictures(
+        &mut self,
+        sample: &EncodedVideoSample,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<Picture>> {
+        self.push_sample(sample, cancellation)?;
+        Ok(self
+            .collect_pictures(false)?
+            .into_iter()
+            .map(|(_, picture)| picture)
+            .collect())
+    }
+}
+
+impl VideoDecoder for HevcDecoder {
+    fn submit(
+        &mut self,
+        sample: &EncodedVideoSample,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<DecodedVideoFrame>> {
+        self.push_sample(sample, cancellation)?;
+        self.collect(false)
     }
 
     fn drain(&mut self, cancellation: &CancellationToken) -> Result<Vec<DecodedVideoFrame>> {
@@ -422,11 +480,15 @@ impl VideoDecoder for HevcDecoder {
     }
 }
 
+/// Issue #189 stage attribution: colour conversion is not decoding, but it is
+/// on the path every whole-frame measurement takes, so it is reported as its
+/// own stage rather than left in the unattributed remainder.
 fn picture_to_rgba(
     picture: &Picture,
     configuration: &VideoDecoderConfig,
     limits: &Limits,
 ) -> Result<VideoFrame> {
+    let _profile = engine::profile::scope(engine::profile::Stage::ColorConvert);
     if picture.chroma_array_type() != 1
         || picture.bit_depth_luma() != 8
         || picture.bit_depth_chroma() != 8

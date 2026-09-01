@@ -10,6 +10,7 @@ pub mod api;
 pub mod audio;
 pub mod av1;
 mod av1_cdf;
+mod av1_cdf_tables;
 mod av1_encoder;
 pub mod av1_entropy;
 pub mod av1_filters;
@@ -38,6 +39,34 @@ mod av1_decoder;
 #[cfg(not(target_arch = "wasm32"))]
 mod hevc;
 
+/// Per-stage access to the HEVC encoder for the criterion benchmark suite.
+///
+/// Internal and unstable: the encoder's stages are not otherwise reachable from
+/// a benchmark, which is a separate crate. See `benches/hevc_encode.rs`.
+#[cfg(not(target_arch = "wasm32"))]
+#[doc(hidden)]
+pub use hevc::bench as hevc_encoder_bench;
+
+/// Per-stage access to the HEVC decoder for the criterion benchmark suite.
+///
+/// Internal and unstable, and the counterpart to [`hevc_encoder_bench`]: the
+/// decoder's stages are not otherwise reachable from a benchmark, which is a
+/// separate crate. See `benches/hevc_decode.rs`.
+#[cfg(not(target_arch = "wasm32"))]
+#[doc(hidden)]
+pub use hevc::decode_bench as hevc_decoder_bench;
+
+/// Stage attribution for a whole-frame HEVC decode.
+///
+/// Internal and unstable. [`hevc_decoder_bench`] measures each kernel in
+/// isolation, which bounds what vectorizing a stage could buy; this reports
+/// what a real decode actually spends in each stage, which is what says whether
+/// that ceiling is worth reaching for. See `examples/hevc_decode_profile.rs`
+/// and the breakdown recorded in `benches/README.md`.
+#[cfg(not(target_arch = "wasm32"))]
+#[doc(hidden)]
+pub use hevc::decode_profile as hevc_decode_profile;
+
 #[cfg(not(target_arch = "wasm32"))]
 mod native_audio;
 
@@ -57,7 +86,17 @@ pub use av1::{
     Av1ObuHeader, Av1ObuType, Av1OperatingPoint, Av1Parser, Av1SequenceHeader, Av1SyntaxSupport,
     Av1TileGroup,
 };
+/// Per-stage access to the native AV1 encoder for the criterion benchmark
+/// suite.
+///
+/// Internal and unstable, and the AV1 counterpart to [`hevc_encoder_bench`]:
+/// the encoder's forward WHT, symbol coder, tile encoder and bitstream writers
+/// are not otherwise reachable from a benchmark, which is a separate crate.
+/// See `benches/av1_encode.rs`.
+#[doc(hidden)]
+pub use av1_encoder::bench as av1_encoder_bench;
 pub use av1_encoder::native_av1_video_encoder_factory;
+pub use av1_encoder::transform::forward_transform;
 pub use av1_entropy::{AV1_CDF_MAX, Av1SymbolDecoder, validate_cdf};
 pub use av1_filters::{
     CdefStrength, FilmGrainParams, FilterFrame, FilterPlane, LoopFilterParams, MatrixCoefficients,

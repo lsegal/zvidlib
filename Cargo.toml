@@ -9,11 +9,6 @@ readme = "README.md"
 keywords = ["video", "audio", "webassembly", "webgl", "mp4"]
 categories = ["multimedia", "wasm"]
 publish = false
-# `benches/hevc_hardware.rs` is a *module* of the `codec` bench target, not a
-# target of its own (see the `[[bench]]` note below). Cargo would otherwise
-# auto-discover it as a second, libtest-harnessed bench target and try to
-# compile it standalone.
-autobenches = false
 
 [lib]
 crate-type = ["rlib", "cdylib"]
@@ -26,12 +21,81 @@ required-features = ["native"]
 # `cargo test --features native --example native_gl` run them.
 test = true
 
-# Criterion drives its own harness (`harness = false`), so the bench target must
-# not link libtest. The whole benchmark suite lives in one target so the shared
+# The HEVC decoder and its stage profiler are `cfg(not(target_arch = "wasm32"))`,
+# and the wasm test job builds every example, so this one is gated behind
+# `native` exactly as `native_gl` is. The feature gates no code of its own; it is
+# only what keeps a wasm build from trying to compile a native-only target.
+[[example]]
+name = "hevc_decode_profile"
+path = "examples/hevc_decode_profile.rs"
+required-features = ["native"]
+
+# Criterion drives its own harness (`harness = false`), so the bench targets must
+# not link libtest. Every codec group lives in this one target so the shared
 # `benches/support/` fixture cache is loaded and decoded once per process.
 [[bench]]
 name = "codec"
 path = "benches/codec.rs"
+harness = false
+
+# The AV1 software decoder's own scalar-vs-SIMD suite. It is a separate target
+# because its per-stage groups and its whole-frame decode are slower than the
+# shared fast groups above and deserve to be runnable on their own; it shares
+# `benches/support/` with them.
+[[bench]]
+name = "av1_decode"
+path = "benches/av1_decode.rs"
+harness = false
+
+# The AV1 encoder's own scalar-vs-SIMD suite. Encoder kernels are measured
+# separately from `av1_decode` so neither target's name overstates its scope,
+# and separately from `codec` because it shares none of that target's
+# decoded-frame fixtures.
+[[bench]]
+name = "av1_encode"
+path = "benches/av1_encode.rs"
+harness = false
+
+[[bench]]
+name = "hevc_decode"
+path = "benches/hevc_decode.rs"
+harness = false
+
+# The audio decode path is a separate target rather than another group in
+# `codec`: it shares `benches/support/` but none of `codec`'s decoded-frame
+# fixtures, and issue #152 specifies `cargo bench --bench audio_decode` as its
+# entry point.
+[[bench]]
+name = "audio_decode"
+path = "benches/audio_decode.rs"
+harness = false
+
+# The HEVC encoder benchmarks are their own target: they use only the synthetic
+# inputs from `benches/support`, never the decoded-fixture cache the `codec`
+# target exists to share, and the encoder's mode search is slow enough that it is
+# worth keeping out of that target's default run.
+[[bench]]
+name = "hevc_encode"
+path = "benches/hevc_encode.rs"
+harness = false
+
+# The audio write/read path is a separate target rather than another group in
+# `codec`: it shares `benches/support/` but none of `codec`'s decoded-frame
+# fixtures, and issue #153 specifies `cargo bench --bench audio_mux` as its
+# entry point. Container work is cheap enough that its default run stays fast.
+[[bench]]
+name = "audio_mux"
+path = "benches/audio_mux.rs"
+harness = false
+
+# The platform hardware HEVC decoders against the software one. A separate
+# target because it measures the OS/driver decoders rather than any of the
+# crate's own kernels, so it shares none of the scalar-vs-SIMD machinery the
+# other targets are built around, and because it is the only target that skips
+# itself outright on a host without the hardware it measures.
+[[bench]]
+name = "hevc_hardware"
+path = "benches/hevc_hardware.rs"
 harness = false
 
 [features]
@@ -118,8 +182,12 @@ opt-level = 2
 
 # LTO + a single codegen unit let the optimizer inline and specialize across
 # the (crate-internal) hevc decoder's module boundaries, which matters a lot
-# for the many small hot per-sample/per-block functions in the decode path
-# (measured ~2.7 -> ~3.7 fps, +37%, decoding the bundled 1080p sample).
+# for the many small hot per-sample/per-block functions in the decode path.
+# The benchmark owns the numbers rather than this comment: run
+# `ZVIDLIB_BENCH_LARGE=1 cargo bench --bench codec -- hevc_decode` for the
+# whole-frame fps of the bundled 1080p sample per instruction set, and
+# `cargo bench --bench codec -- hevc_` for the per-stage breakdown that says
+# which kernel a change moved. See benches/README.md.
 [profile.release]
 lto = "fat"
 codegen-units = 1
