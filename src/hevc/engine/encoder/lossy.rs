@@ -954,8 +954,7 @@ fn keeps_sao(
 /// just under the curve — measured, four of them over the sweep, the worst
 /// 0.08 dB below.
 fn calibrated_sao_lambda_q8(fine: CurvePoint, coarse: CurvePoint, qp: i32, sao_bits: u64) -> u32 {
-    let fixed = u64::from(lambda_q8(qp));
-    let fallback = lambda_q8(qp);
+    let fixed = lambda_q8(qp);
     // The coded point is `coarse` at every QP but 0, where there is no finer
     // point to probe and the writer's own point is `fine` instead. Either way
     // the interpolation runs from the coded point towards the other one.
@@ -965,23 +964,24 @@ fn calibrated_sao_lambda_q8(fine: CurvePoint, coarse: CurvePoint, qp: i32, sao_b
         (fine, coarse)
     };
     if coded.sse == 0 || coded.bits == 0 || other.sse == 0 || sao_bits == 0 {
-        return fallback;
+        return fixed;
     }
     let rate_ratio = other.bits as f64 / coded.bits as f64;
     let sse_ratio = other.sse as f64 / coded.sse as f64;
     // A probe that coded the same bits as the writer, or that did not move
     // the reconstruction the way a quantizer step must, describes no curve.
     if (rate_ratio - 1.0).abs() < 1e-9 || (sse_ratio - 1.0).abs() < 1e-9 {
-        return fallback;
+        return fixed;
     }
     if (rate_ratio > 1.0) != (sse_ratio < 1.0) {
-        return fallback;
+        return fixed;
     }
     let t = (1.0 + sao_bits as f64 / coded.bits as f64).ln() / rate_ratio.ln();
     let reachable = coded.sse as f64 * (1.0 - sse_ratio.powf(t));
     if !reachable.is_finite() || reachable <= 0.0 {
-        return fallback;
+        return fixed;
     }
+    let fixed = u64::from(fixed);
     let measured = (reachable * 256.0 / sao_bits as f64).round().max(0.0) as u64;
     measured.clamp((fixed / SAO_LAMBDA_BAND).max(1), fixed * SAO_LAMBDA_BAND) as u32
 }
