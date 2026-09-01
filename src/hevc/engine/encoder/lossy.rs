@@ -33,10 +33,22 @@
 //! §8.4.2 reduces it to `INTRA_DC`. Chroma stays at
 //! `intra_chroma_pred_mode == 4`, so it is predicted with the luma mode too.
 //!
-//! In-loop filters are neutralized exactly as the PCM writer does it: SAO off
-//! in the SPS and deblocking disabled in the PPS, so the reconstruction below
-//! is the decoder's without a filter pass. Enabling them is a separate
-//! decision from mode search and is deliberately not made here.
+//! ## In-loop filtering
+//!
+//! The §8.7.2 deblocking filter runs: the PPS carries
+//! `pps_deblocking_filter_disabled_flag == 0` and the writer runs the
+//! decoder's own §8.7.2 driver over its reconstruction, so what
+//! [`write_idr_residual_slice`] returns is still exactly what a decoder holds.
+//! It runs as a whole-picture pass after the last coding unit is coded rather
+//! than interleaved into coding order, because §8.4.4.2.2 intra prediction
+//! reads its neighbouring samples *prior to* the in-loop filter process — the
+//! filtered samples are the picture's output and the next picture's reference,
+//! never this picture's own prediction input. See
+//! [`crate::hevc::engine::encoder::recon::deblock_reconstruction`].
+//!
+//! SAO stays off (`sample_adaptive_offset_enabled_flag == 0` in the SPS). It
+//! is a per-CTB parameter search plus §7.3.8.3 syntax in the slice data, a
+//! decision independent of deblocking, and it is deliberately not made here.
 
 use crate::hevc::engine::binarization::{derive_intra_pred_mode_c, intra_luma_cand_mode_list};
 use crate::hevc::engine::cabac::init_type;
@@ -50,7 +62,7 @@ use crate::hevc::engine::encoder::pcm::{
 use crate::hevc::engine::encoder::rdo::{
     DistortionBackend, intra_mode_bit_cost, lambda_q8, shortlist_intra_luma_modes,
 };
-use crate::hevc::engine::encoder::recon::ReconstructedPicture;
+use crate::hevc::engine::encoder::recon::{ReconstructedPicture, deblock_reconstruction};
 use crate::hevc::engine::encoder::residual::{
     EngineResidualBinSink, ResidualWriteParams, has_coded_levels, write_residual_coding,
 };
@@ -103,6 +115,19 @@ enum ModeSearch {
     DcOnly,
 }
 
+/// Whether the writer's reconstruction carries the §8.7.2 in-loop deblocking
+/// filter, matching the `pps_deblocking_filter_disabled_flag` of the parameter
+/// sets the slice is emitted with.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LoopFilter {
+    /// `pps_deblocking_filter_disabled_flag == 0` — what the writer emits.
+    Deblock,
+    /// The filter neutralized, as the writer emitted before deblocking landed.
+    /// Kept as the baseline the filter's gain is measured against.
+    #[cfg(test)]
+    Off,
+}
+
 /// One colour component's geometry inside the picture being coded.
 #[derive(Clone, Copy)]
 struct Plane<'a> {
@@ -153,12 +178,12 @@ pub fn encode_idr_residual_au(
     check("cr", cr, width * height / 4)?;
 
     let (rbsp, recon, _modes) =
-        write_idr_residual_slice(y, cb, cr, width, height, qp, ModeSearch::Rdo);
+        write_idr_residual_slice(y, cb, cr, width, height, qp, ModeSearch::Rdo, LoopFilter::Deblock);
     let level_idc = level_idc_for(width * height);
     let units = vec![
         nal_unit(32, 0, 0, &write_vps(level_idc)), // VPS_NUT
         nal_unit(33, 0, 0, &write_sps(width, height, level_idc, false, true)), // SPS_NUT
-        nal_unit(34, 0, 0, &write_pps(false, false, None)), // PPS_NUT
+        nal_unit(34, 0, 0, &write_pps(false, true, None)), // PPS_NUT
         nal_unit(20, 0, 0, &rbsp),                 // IDR_N_LP
     ];
     Ok((annexb(&units), recon))
@@ -168,6 +193,11 @@ pub fn encode_idr_residual_au(
 /// residual-coded intra coding unit. Returns the slice RBSP, the picture
 /// reconstructed alongside it, and the luma intra mode coded for each CTB in
 /// coding order.
+///
+/// `filter` must match the `pps_deblocking_filter_disabled_flag` of the PPS
+/// the slice is emitted with, or the returned reconstruction stops being the
+/// decoder's.
+#[allow(clippy::too_many_arguments)]
 fn write_idr_residual_slice(
     y: &[u8],
     cb: &[u8],
@@ -176,6 +206,7 @@ fn write_idr_residual_slice(
     height: usize,
     qp: i32,
     search: ModeSearch,
+    filter: LoopFilter,
 ) -> (Vec<u8>, ReconstructedPicture, Vec<u8>) {
     let mut w = BitWriter::new();
     // ---- slice_segment_header() ----
@@ -184,6 +215,12 @@ fn write_idr_residual_slice(
     w.ue(0); // slice_pic_parameter_set_id
     w.ue(2); // slice_type = I
     w.se(qp - 26); // slice_qp_delta over init_qp_minus26 == 0
+    if filter == LoopFilter::Deblock {
+        // §7.3.6.1: present because pps_loop_filter_across_slices_enabled_flag
+        // is 1 and slice_deblocking_filter_disabled_flag is 0. One slice fills
+        // the picture, so the value only has to be legal, not restrictive.
+        w.put_bit(1); // slice_loop_filter_across_slices_enabled_flag
+    }
     w.rbsp_trailing_bits(); // byte_alignment() before slice data
 
     // §9.3.2.2 initialization: initType 0 (I slice, equation 9-7) at SliceQpY.
@@ -331,6 +368,13 @@ fn write_idr_residual_slice(
     }
     // The final terminate-1 flush wrote the rbsp_stop_one_bit.
     w.align_zero();
+
+    // §8.7.1 — the in-loop filter stage, after the whole picture is coded.
+    // Nothing above may read the filtered samples: every block predicted from
+    // the unfiltered reconstruction, which is what §8.4.4.2.2 specifies.
+    if filter == LoopFilter::Deblock {
+        deblock_reconstruction(&mut recon, qp);
+    }
     (w.finish(), recon, modes)
 }
 
@@ -853,7 +897,7 @@ mod tests {
         qp: i32,
     ) -> (Vec<u8>, ReconstructedPicture) {
         let (rbsp, recon, _) =
-            write_idr_residual_slice(y, cb, cr, width, height, qp, ModeSearch::DcOnly);
+            write_idr_residual_slice(y, cb, cr, width, height, qp, ModeSearch::DcOnly, LoopFilter::Deblock);
         (rbsp, recon)
     }
 
@@ -879,7 +923,7 @@ mod tests {
         let (width, height) = (64, 48);
         let (y, cb, cr) = picture(width, height);
         let (_, _, modes) =
-            write_idr_residual_slice(&y, &cb, &cr, width, height, 26, ModeSearch::Rdo);
+            write_idr_residual_slice(&y, &cb, &cr, width, height, 26, ModeSearch::Rdo, LoopFilter::Deblock);
         assert_eq!(modes.len(), (width / CTB) * (height / CTB));
         let distinct: std::collections::BTreeSet<u8> = modes.iter().copied().collect();
         assert!(
@@ -903,9 +947,9 @@ mod tests {
         let (y, cb, cr) = picture(width, height);
         for qp in [12i32, 26, 37] {
             let (searched_slice, searched, _) =
-                write_idr_residual_slice(&y, &cb, &cr, width, height, qp, ModeSearch::Rdo);
+                write_idr_residual_slice(&y, &cb, &cr, width, height, qp, ModeSearch::Rdo, LoopFilter::Deblock);
             let (baseline_slice, baseline, _) =
-                write_idr_residual_slice(&y, &cb, &cr, width, height, qp, ModeSearch::DcOnly);
+                write_idr_residual_slice(&y, &cb, &cr, width, height, qp, ModeSearch::DcOnly, LoopFilter::Deblock);
             let luma = (psnr_db(&y, &searched.y), psnr_db(&y, &baseline.y));
             assert!(
                 luma.0 > luma.1,
@@ -932,6 +976,55 @@ mod tests {
                 baseline_slice.len()
             );
         }
+    }
+
+    #[test]
+    fn the_deblocking_filter_improves_round_trip_psnr() {
+        // The gain the changelog records. Both reconstructions come out of the
+        // same coding loop, at the same QP, with the same mode decisions: the
+        // only difference is the §8.7.2 pass over the finished picture, so the
+        // delta is the filter's and nothing else's.
+        let (width, height) = (64, 48);
+        let (y, cb, cr) = picture(width, height);
+        for qp in [26i32, 32, 37, 44] {
+            let (_, filtered, _) = write_idr_residual_slice(
+                &y, &cb, &cr, width, height, qp, ModeSearch::Rdo, LoopFilter::Deblock,
+            );
+            let (_, unfiltered, _) = write_idr_residual_slice(
+                &y, &cb, &cr, width, height, qp, ModeSearch::Rdo, LoopFilter::Off,
+            );
+            assert_ne!(
+                filtered.y, unfiltered.y,
+                "qp {qp}: the filter left every luma sample alone"
+            );
+            let gain = psnr_db(&y, &filtered.y) - psnr_db(&y, &unfiltered.y);
+            assert!(
+                gain > 0.0,
+                "qp {qp}: deblocking cost {gain:.3} dB of luma PSNR instead of gaining any"
+            );
+        }
+    }
+
+    #[test]
+    fn the_access_unit_signals_the_deblocking_filter_as_enabled() {
+        // The reconstruction is only the decoder's if the parameter sets ask
+        // the decoder for the same filter, so read the flag back off the
+        // emitted PPS rather than trusting the writer.
+        let (width, height) = (32, 32);
+        let (y, cb, cr) = picture(width, height);
+        let (au, _) = encode_idr_residual_au(&y, &cb, &cr, width, height, 32).unwrap();
+        let pps = crate::hevc::engine::nal::collect_nal_units(&au)
+            .expect("the access unit parses")
+            .into_iter()
+            .find(|nal| nal.header.nal_unit_type == 34)
+            .expect("the access unit carries a PPS");
+        let parsed =
+            crate::hevc::engine::pps::PicParameterSet::parse(&pps.rbsp).expect("PPS parses");
+        assert!(parsed.deblocking_filter_control_present_flag);
+        assert!(
+            !parsed.deblocking.disabled_flag,
+            "the writer's PPS still disables deblocking"
+        );
     }
 
     #[test]
