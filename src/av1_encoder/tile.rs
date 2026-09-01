@@ -95,6 +95,12 @@ const TYPE_GAIN_PROBES: usize = 1;
 /// sampling rate, which no interval fixes.
 pub(super) const TYPE_GAIN_SAMPLE_INTERVAL: usize = 2;
 
+/// Probes a transform size's accumulated gain ratio remembers, as the window of an exponential
+/// recency weighting.
+///
+/// PLACEHOLDER_DOC
+pub(super) const TYPE_GAIN_MEMORY: usize = 8;
+
 /// Transform sizes [`FrameEncoder::type_gain`] accumulates over: `TX_4X4` through `TX_32X32`,
 /// which is every size [`super::transform::forward_transform`] implements.
 const TYPE_GAIN_SIZES: usize = 4;
@@ -191,6 +197,10 @@ pub(crate) struct FrameEncoder<'a> {
     /// right. Outside tests the constant is read directly.
     #[cfg(test)]
     type_gain_interval: usize,
+    /// The recency window in force, so a test can sweep it the same way. Outside tests
+    /// [`TYPE_GAIN_MEMORY`] is read directly.
+    #[cfg(test)]
+    type_gain_memory: usize,
     /// Transform-type candidates actually transformed, quantized and reconstructed, which is the
     /// work the shortcuts exist to remove.
     #[cfg(test)]
@@ -283,6 +293,8 @@ impl<'a> FrameEncoder<'a> {
             #[cfg(test)]
             type_gain_interval: TYPE_GAIN_SAMPLE_INTERVAL,
             #[cfg(test)]
+            type_gain_memory: TYPE_GAIN_MEMORY,
+            #[cfg(test)]
             candidates_evaluated: 0,
         }
     }
@@ -330,6 +342,30 @@ impl<'a> FrameEncoder<'a> {
     #[cfg(not(test))]
     fn type_gain_interval(&self) -> usize {
         TYPE_GAIN_SAMPLE_INTERVAL
+    }
+
+    /// Overrides the recency window, so a test can measure the estimator between remembering one
+    /// probe and remembering the whole frame. `usize::MAX` disables the decay, which is the
+    /// frame-wide accumulation this replaced.
+    #[cfg(test)]
+    pub(crate) fn with_type_gain_memory(mut self, memory: usize) -> Self {
+        assert!(memory >= 1, "a window of 0 remembers nothing, not even the probe just taken");
+        self.type_gain_memory = memory;
+        self
+    }
+
+    /// Probes a size's gain ratio remembers. [`TYPE_GAIN_MEMORY`] outside tests, where nothing
+    /// can override it.
+    #[cfg(test)]
+    fn type_gain_memory(&self) -> usize {
+        self.type_gain_memory
+    }
+
+    /// Probes a size's gain ratio remembers. [`TYPE_GAIN_MEMORY`] outside tests, where nothing
+    /// can override it.
+    #[cfg(not(test))]
+    fn type_gain_memory(&self) -> usize {
+        TYPE_GAIN_MEMORY
     }
 
     /// Encodes the tile and returns the symbol-coded bytes (`decode_tile`, §5.11.2).
@@ -812,7 +848,20 @@ impl<'a> FrameEncoder<'a> {
             let best_of_set = cheapest.min(dct);
             self.probe_dct_cost += dct;
             self.probe_best_cost += best_of_set;
+            let memory = self.type_gain_memory();
             let gain = &mut self.type_gain[type_gain_slot(size)];
+            // Recency weighting: what the accumulator already holds is aged by `(n-1)/n` before
+            // the new probe joins it, so a probe's influence decays away over the following `n`
+            // and the ratio a block reads back is the one its own neighbourhood measured. One
+            // multiply and one divide per accumulator, on the sampled trials only.
+            //
+            // `usize::MAX` is the sentinel for no decay at all, which is the frame-wide
+            // accumulation this replaced; a test sweeps it as the far end of the window.
+            if memory != usize::MAX {
+                let (num, den) = (memory as i64 - 1, memory as i64);
+                gain.dct_cost = gain.dct_cost * num / den;
+                gain.best_cost = gain.best_cost * num / den;
+            }
             gain.dct_cost += dct;
             gain.best_cost += best_of_set;
         }

@@ -1162,6 +1162,58 @@ mod nonlossless_tests {
         println!("exhaustive,{exhaustive_best:.4},{exhaustive_candidates}");
     }
 
+    /// Sweeps the recency window the per-size gain ratio is accumulated over.
+    ///
+    /// Prints, per frame and quantizer, the sampled estimator's `sse + lambda * bits` at each
+    /// window against the same estimator probing every size search, which is what
+    /// `TYPE_GAIN_MEMORY` is chosen from. `usize::MAX` is the frame-wide accumulation.
+    #[test]
+    #[ignore = "measurement sweep, not an assertion"]
+    fn measure_type_gain_memory_windows() {
+        let (width, height) = (128_usize, 96_usize);
+        let mut frames = content_frames(width as u32, height as u32);
+        frames.push(("test_pattern", test_pattern(width as u32, height as u32)));
+        let sse = |report: &tile::SearchReport, pixels: &[u8]| -> i64 {
+            (0..height)
+                .flat_map(|row| {
+                    report.reconstruction[row * report.coded_width..][..width]
+                        .iter()
+                        .enumerate()
+                        .map(move |(column, &value)| (row * width + column, value))
+                })
+                .map(|(index, value)| {
+                    let error = i64::from(i32::from(pixels[index]) - i32::from(value));
+                    error * error
+                })
+                .sum()
+        };
+        println!("frame,qindex,memory,penalty_percent,bytes,candidates");
+        for (name, pixels) in &frames {
+            for qindex in [1_u8, 8, 32, 80, 160, 200] {
+                let ac = i64::from(crate::av1_intra::get_ac_quant(qindex));
+                let lambda = (ac * ac / 256).max(1);
+                let cost = |interval: usize, memory: usize| {
+                    let report = tile::FrameEncoder::new(pixels, width, height, qindex)
+                        .with_type_gain_interval(interval)
+                        .with_type_gain_memory(memory)
+                        .encode_with_report();
+                    (
+                        sse(&report, pixels) + lambda * report.tile.len() as i64 * 8,
+                        report.tile.len(),
+                        report.candidates_evaluated,
+                    )
+                };
+                let (unsampled, _, _) = cost(1, usize::MAX);
+                for memory in [1_usize, 2, 3, 4, 6, 8, 12, 16, 24, 32, 64, usize::MAX] {
+                    let (sampled, bytes, candidates) =
+                        cost(tile::TYPE_GAIN_SAMPLE_INTERVAL, memory);
+                    let penalty = sampled as f64 / unsampled as f64 * 100.0 - 100.0;
+                    println!("{name},{qindex},{memory},{penalty:+.2},{bytes},{candidates}");
+                }
+            }
+        }
+    }
+
     /// What the sampled transform-gain estimator costs on content it was not tuned on.
     ///
     /// `TYPE_GAIN_SAMPLE_INTERVAL` probes one coding block's size search in every `n` and
