@@ -5,6 +5,7 @@
 //! writer can consume, while the bootstrap encoder can already run the same
 //! deterministic search to exercise the SIMD distortion kernels end to end.
 
+use crate::hevc::engine::binarization::INTRA_PRED_MODE_MAX;
 use crate::hevc::engine::encoder::rdcost;
 
 const CTB: usize = 16;
@@ -350,7 +351,92 @@ fn candidate_partitions(size: usize) -> &'static [&'static [(usize, usize, usize
     }
 }
 
-fn lambda_q8(qp: i32) -> u32 {
+/// The intra luma mode chosen for one block, with the cost that chose it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct IntraModeDecision {
+    /// The selected Table 8-1 `predModeIntra` (0..=34).
+    pub mode: u8,
+    /// The winning mode's SATD against the source block.
+    pub satd: u32,
+    /// `satd + lambda * signalling bits`, the value that selected it.
+    pub rd_cost: u64,
+}
+
+/// Rough-mode-decision pass over the 35 Table 8-1 intra luma modes for one
+/// square block: returns the `shortlist` cheapest, best first.
+///
+/// `predict` returns the §8.4.4.2.1 prediction for a mode, so the caller
+/// supplies the reference samples it will actually code against — for the
+/// residual writer that is the partially reconstructed picture, which is what
+/// makes the decision consistent with the reconstruction the writer returns.
+///
+/// Distortion is the prediction's SATD, which needs no transform per mode, and
+/// the rate term is the §7.3.8.5 luma mode signalling: a most-probable mode
+/// costs `prev_intra_luma_pred_flag` plus its `mpm_idx` bins, and any other
+/// mode costs the flag plus the five `rem_intra_luma_pred_mode` bins.
+/// `candidates` is the §8.4.2 `candModeList`. Ties go to the lower mode index,
+/// so the search is deterministic.
+///
+/// Ranking on the prediction alone is only an approximation of what the block
+/// costs once it is quantized, so a caller that can afford it re-scores this
+/// shortlist on the reconstruction it will actually code, keeping
+/// [`intra_mode_bit_cost`] as the rate half of that second pass.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn shortlist_intra_luma_modes(
+    source: &[u8],
+    source_stride: usize,
+    n_tbs: usize,
+    candidates: [u8; 3],
+    qp: i32,
+    backend: DistortionBackend,
+    shortlist: usize,
+    mut predict: impl FnMut(u8) -> Vec<i32>,
+) -> Vec<IntraModeDecision> {
+    // The rough pass measures a sum of absolute differences, not squared
+    // error, so it trades against the square root of the SSD-domain lambda.
+    let lambda = lambda_satd_q8(qp);
+    let mut pred = vec![0u8; n_tbs * n_tbs];
+    let mut ranked = Vec::with_capacity(usize::from(INTRA_PRED_MODE_MAX) + 1);
+    for mode in 0..=INTRA_PRED_MODE_MAX {
+        let samples = predict(mode);
+        for (dst, &src) in pred.iter_mut().zip(samples.iter()) {
+            *dst = src as u8;
+        }
+        let satd = metric_satd(source, source_stride, &pred, n_tbs, n_tbs, n_tbs, backend);
+        let bits = u64::from(intra_mode_bit_cost(mode, candidates));
+        ranked.push(IntraModeDecision {
+            mode,
+            satd,
+            rd_cost: u64::from(satd).saturating_add(bits * u64::from(lambda) / 256),
+        });
+    }
+    // `sort_by_key` is stable, so equal costs keep the lower mode index.
+    ranked.sort_by_key(|decision| decision.rd_cost);
+    ranked.truncate(shortlist.max(1));
+    ranked
+}
+
+/// §7.3.8.5 bin count for signalling one luma intra mode: the
+/// `prev_intra_luma_pred_flag` bin plus either the TR (`cMax` 2) `mpm_idx`
+/// bins or the five FL `rem_intra_luma_pred_mode` bins.
+pub(crate) fn intra_mode_bit_cost(mode: u8, candidates: [u8; 3]) -> u32 {
+    match candidates.iter().position(|&c| c == mode) {
+        Some(0) => 2,
+        Some(_) => 3,
+        None => 6,
+    }
+}
+
+/// The rough pass's lambda: [`lambda_q8`] taken into the SATD domain, where
+/// distortion is a first-order metric rather than a squared one.
+pub(crate) fn lambda_satd_q8(qp: i32) -> u32 {
+    let lambda = f64::from(lambda_q8(qp)) / 256.0;
+    (lambda.sqrt() * 256.0).round().max(1.0) as u32
+}
+
+/// The lambda the searches above trade distortion against rate with,
+/// `0.57 * 2 ^ ( ( QP - 12 ) / 3 )` in Q8 fixed point.
+pub(crate) fn lambda_q8(qp: i32) -> u32 {
     let qp = qp.clamp(0, 51);
     let q = 2f64.powf((qp as f64 - 12.0) / 3.0);
     (0.57 * q * 256.0).round().max(1.0) as u32
