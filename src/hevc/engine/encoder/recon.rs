@@ -10,18 +10,25 @@
 //! the decoder's own kernels. The result is the reference picture the next
 //! frame's mode search in [`crate::hevc::engine::encoder::rdo`] predicts from.
 //!
-//! ## What "reconstruction" means for the current writer
+//! ## Lossless and lossy reconstruction
 //!
-//! The bitstream writer in [`crate::hevc::engine::encoder::pcm`] still codes
-//! every coding unit as a `pcm_flag == 1` PCM block, so the residual it codes
-//! is exact and the reconstruction of a block is bit-identical to its source
-//! samples. The loop here is nevertheless the real one — predict, add residual,
-//! clip — rather than a plane copy, because that is the *only* difference
-//! between this and a lossy writer: quantize the residual before
-//! [`reconstruct_partition`] adds it back and the reconstructed reference
-//! starts diverging from the source with no other change to this module. It is
-//! also what makes the in-loop filter stage below meaningful, since those
-//! filters run on the reconstruction, not on the source.
+//! [`ReconConfig::quantized_residual`] selects which writer this
+//! reconstruction models. Cleared, the residual is coded exactly, matching the
+//! PCM writer in [`crate::hevc::engine::encoder::pcm`] whose coding units are
+//! all `pcm_flag == 1` blocks: the reconstruction is then bit-identical to the
+//! source. Set, the residual is round-tripped through the §8.6.4 forward
+//! transform and §8.6.3 quantization in
+//! [`crate::hevc::engine::encoder::transform`] and back through the decoder's
+//! own scaling and inverse transform, which is what the residual writer in
+//! [`crate::hevc::engine::encoder::lossy`] codes — and the reconstructed
+//! reference then genuinely diverges from the source, so the mode search in
+//! [`crate::hevc::engine::encoder::rdo`] predicts from a lossy picture the way
+//! a real encoder's does.
+//!
+//! Either way the loop here is the real one — predict, add the coded residual,
+//! clip — rather than a plane copy. That is also what makes the in-loop filter
+//! stage below meaningful, since those filters run on the reconstruction, not
+//! on the source.
 //!
 //! ## What the in-loop filters do here
 //!
@@ -39,9 +46,15 @@ use crate::hevc::engine::binarization::PartMode;
 use crate::hevc::engine::deblock::{DeblockCu, DeblockCuDesc, DeblockCuParams, NoFilterMap};
 use crate::hevc::engine::encoder::rdo::PictureDecision;
 use crate::hevc::engine::encoder::recon_simd::{self, EdgeStats};
+use crate::hevc::engine::encoder::transform::{
+    ForwardBlockParams, chroma_qp, luma_qp, transform_and_quantize,
+};
 use crate::hevc::engine::motion::{MotionCell, MotionField};
-use crate::hevc::engine::picture::{Picture, Plane};
+use crate::hevc::engine::picture::{Picture, Plane, clip1};
 use crate::hevc::engine::sao::{ResolvedSao, ResolvedSaoComponent};
+use crate::hevc::engine::transform::{
+    BlockParams, Component as TfComponent, PredMode, residual_block,
+};
 
 /// `CtbLog2SizeY` of the encoder's fixed geometry (16-sample CTBs), matching
 /// the PCM writer's `CTB_LOG2`.
@@ -75,8 +88,15 @@ pub(crate) struct ReconConfig {
     /// leave every reconstructed sample alone.
     pub pcm_loop_filter_disabled: bool,
     /// `SliceQpY`, the q-side QP the §8.7.2.5.3 β / t<sub>C</sub> derivation
-    /// reads.
+    /// reads, and the `qP` the residual round trip quantizes at when
+    /// [`Self::quantized_residual`] is set.
     pub qp: i32,
+    /// Model a writer that codes *quantized* residual rather than the exact
+    /// one a PCM block carries: every transform block of every partition goes
+    /// through forward transform, quantization, and the decoder's own §8.6.2
+    /// reconstruction at [`Self::qp`]. Cleared, the residual is exact and the
+    /// reconstruction is the source picture.
+    pub quantized_residual: bool,
 }
 
 impl Default for ReconConfig {
@@ -89,6 +109,7 @@ impl Default for ReconConfig {
             sao_chroma: false,
             pcm_loop_filter_disabled: true,
             qp: 26,
+            quantized_residual: false,
         }
     }
 }
@@ -174,6 +195,7 @@ pub(crate) fn reconstruct_picture(
                 partition.h,
                 mv_x,
                 mv_y,
+                cfg.quantized_residual.then_some(cfg.qp),
             );
             field.fill_rect(
                 partition.x,
@@ -182,9 +204,9 @@ pub(crate) fn reconstruct_picture(
                 partition.h,
                 MotionCell {
                     is_intra: coded_as_pcm,
-                    // The residual is coded exactly, so every block that
-                    // differs from its prediction carries coded levels — the
-                    // §8.7.2.4 `cbf` test.
+                    // The §8.7.2.4 `cbf` test. An exactly-coded residual
+                    // always carries levels; a quantized one is assumed to,
+                    // which only ever over-filters a boundary.
                     has_nonzero_coeff: true,
                     pred_flag_l0: !coded_as_pcm,
                     pred_flag_l1: false,
@@ -218,7 +240,9 @@ pub(crate) fn reconstruct_picture(
     }
 
     if cfg.sao_luma || cfg.sao_chroma {
-        let grid = estimate_sao(&pic, src, cfg);
+        // No §7.3.8.3 syntax is written for this reconstruction, so the
+        // decision is distortion-only.
+        let grid = estimate_sao(&pic, src, cfg.sao_luma, cfg.sao_chroma, 0);
         pic = crate::hevc::engine::sao::apply_sao_picture_full(
             pic,
             &grid,
@@ -241,14 +265,15 @@ pub(crate) fn reconstruct_picture(
 }
 
 /// Reconstruct one prediction partition: form the prediction, code the
-/// residual against it, and add the residual back (§8.6.6
+/// residual against it, and add the coded residual back (§8.6.6
 /// `recSamples = Clip1( predSamples + resSamples )`).
 ///
-/// The residual is `source − prediction` because this writer codes it
-/// losslessly. A writer that quantizes would round-trip the residual through
-/// its forward and inverse transform here; nothing else about the loop would
-/// change, and the reconstruction would then differ from `src`, which is the
-/// entire reason the reference picture is kept separately at all.
+/// With `quant` set to `None` the residual is `source − prediction` coded
+/// exactly, as a PCM block carries it, and the reconstruction is the source.
+/// With a `qP`, the residual is instead round-tripped through the §8.6.4
+/// forward transform and §8.6.3 quantization and back through the decoder's
+/// own §8.6.2 reconstruction — which is what makes the reference picture
+/// differ from the source, and the entire reason it is kept separately at all.
 #[allow(clippy::too_many_arguments)]
 fn reconstruct_partition(
     pic: &mut Picture,
@@ -260,6 +285,7 @@ fn reconstruct_partition(
     h: usize,
     mv_x: i32,
     mv_y: i32,
+    quant: Option<i32>,
 ) {
     reconstruct_component(
         pic,
@@ -273,14 +299,27 @@ fn reconstruct_partition(
         h,
         mv_x,
         mv_y,
+        // §8.6.1 eq. 8-284 — the luma `qP` from `SliceQpY`.
+        quant.map(|qp| luma_qp(qp, BIT_DEPTH)),
+        TfComponent::Luma,
     );
     // 4:2:0 — the chroma partition is the luma one halved, and the motion
     // vector with it (§8.5.3.3.3.3 whole-sample part; this search is
     // whole-pel, so the halved vector needs no fractional interpolation).
     let (cw, chh) = (src.width / 2, src.height / 2);
-    for (plane, source, reference_plane) in [
-        (Plane::Cb, src.cb, reference.map(|r| r.cb.as_slice())),
-        (Plane::Cr, src.cr, reference.map(|r| r.cr.as_slice())),
+    for (plane, source, reference_plane, component) in [
+        (
+            Plane::Cb,
+            src.cb,
+            reference.map(|r| r.cb.as_slice()),
+            TfComponent::Cb,
+        ),
+        (
+            Plane::Cr,
+            src.cr,
+            reference.map(|r| r.cr.as_slice()),
+            TfComponent::Cr,
+        ),
     ] {
         reconstruct_component(
             pic,
@@ -294,6 +333,10 @@ fn reconstruct_partition(
             (h / 2).max(1),
             mv_x / 2,
             mv_y / 2,
+            // §8.6.1 with the writer's zero chroma QP offsets: the chroma
+            // blocks quantize at the Table 8-10 mapping of the luma QP.
+            quant.map(|qp| chroma_qp(qp, 0, BIT_DEPTH, CHROMA_ARRAY_TYPE)),
+            component,
         );
     }
 }
@@ -312,37 +355,144 @@ fn reconstruct_component(
     h: usize,
     mv_x: i32,
     mv_y: i32,
+    quant: Option<u32>,
+    component: TfComponent,
 ) {
-    // The prediction of a row is gathered once, contiguously, so the §8.6.6
-    // add-and-clip that follows is a straight-line run the vector kernel can
-    // take whole. The gather is a plain copy whenever the motion vector keeps
-    // the row inside the reference, which is the common case; only a row that
-    // hangs off an edge falls back to the per-sample §8.5.3.3.2 clamp.
-    let mut prediction = vec![0u8; w];
-    let (dst, dst_stride) = pic.plane_mut(plane);
-    for row in 0..h {
-        let sy = y + row;
-        match reference {
-            Some((reference, rw, rh)) => {
-                let ry = (sy as i32 + mv_y).clamp(0, rh as i32 - 1) as usize;
-                let base = ry * rw;
-                let left = x as i32 + mv_x;
-                if left >= 0 && left + w as i32 <= rw as i32 {
-                    let start = base + left as usize;
-                    prediction.copy_from_slice(&reference[start..start + w]);
-                } else {
-                    for (col, sample) in prediction.iter_mut().enumerate() {
-                        let rx = (left + col as i32).clamp(0, rw as i32 - 1) as usize;
-                        *sample = reference[base + rx];
-                    }
+    let Some(q_p) = quant else {
+        // The residual is coded exactly, so the reconstruction is the source,
+        // and the §8.6.6 add-and-clip of a whole row is a straight-line run
+        // the vector kernel can take whole once the prediction is gathered.
+        let mut prediction = vec![0u8; w];
+        let (dst, dst_stride) = pic.plane_mut(plane);
+        for row in 0..h {
+            let sy = y + row;
+            gather_prediction_row(&mut prediction, reference, x, sy, mv_x, mv_y);
+            let src_row = &source[sy * src_stride + x..sy * src_stride + x + w];
+            let dst_row = &mut dst[sy * dst_stride + x..sy * dst_stride + x + w];
+            recon_simd::reconstruct_row(dst_row, src_row, &prediction);
+        }
+        return;
+    };
+
+    // §7.3.8.8: the residual of a partition is coded as square transform
+    // blocks. This geometry's partitions are whole or halved CTBs, so tiling
+    // by the largest legal square that fits is the transform tree a writer
+    // would build for them.
+    let n_tbs = transform_block_size(w, h);
+    let mut prediction = vec![0i32; n_tbs * n_tbs];
+    let mut residual = vec![0i32; n_tbs * n_tbs];
+    let mut pred_row = vec![0u8; n_tbs];
+    for by in (0..h).step_by(n_tbs) {
+        for bx in (0..w).step_by(n_tbs) {
+            for row in 0..n_tbs {
+                let sy = y + by + row;
+                gather_prediction_row(&mut pred_row, reference, x + bx, sy, mv_x, mv_y);
+                for col in 0..n_tbs {
+                    let predicted = i32::from(pred_row[col]);
+                    prediction[row * n_tbs + col] = predicted;
+                    residual[row * n_tbs + col] =
+                        i32::from(source[sy * src_stride + x + bx + col]) - predicted;
                 }
             }
-            None => prediction.fill(NEUTRAL_LUMA as u8),
+            // Forward transform → quantize → the decoder's own §8.6.2
+            // reconstruction of the levels that survived.
+            let pred_mode = if reference.is_some() {
+                PredMode::Inter
+            } else {
+                PredMode::Intra
+            };
+            let levels = transform_and_quantize(
+                &residual,
+                None,
+                ForwardBlockParams {
+                    n_tbs,
+                    q_p,
+                    component,
+                    pred_mode,
+                    bit_depth: BIT_DEPTH,
+                    extended_precision: false,
+                },
+            )
+            .expect("encoder-sized transform block");
+            // An all-zero level block codes `cbf == 0` and carries no
+            // residual at all, which is what a decoder reconstructs.
+            let coded = if levels.iter().any(|&l| l != 0) {
+                residual_block(
+                    &levels,
+                    None,
+                    BlockParams {
+                        n_tbs,
+                        q_p,
+                        component,
+                        pred_mode,
+                        bit_depth: BIT_DEPTH,
+                        extended_precision: false,
+                        transquant_bypass: false,
+                        transform_skip: false,
+                        transform_skip_rotation_enabled: false,
+                    },
+                )
+                .expect("encoder-sized transform block")
+            } else {
+                vec![0i32; n_tbs * n_tbs]
+            };
+            for row in 0..n_tbs {
+                for col in 0..n_tbs {
+                    let i = row * n_tbs + col;
+                    pic.set_sample(
+                        plane,
+                        x + bx + col,
+                        y + by + row,
+                        clip1(prediction[i] + coded[i], BIT_DEPTH),
+                    );
+                }
+            }
         }
-        let src_row = &source[sy * src_stride + x..sy * src_stride + x + w];
-        let dst_row = &mut dst[sy * dst_stride + x..sy * dst_stride + x + w];
-        recon_simd::reconstruct_row(dst_row, src_row, &prediction);
     }
+}
+
+/// Gathers the §8.5.3.3.2 prediction of one row of a partition contiguously,
+/// so the add-and-clip that consumes it is a straight-line run.
+///
+/// The gather is a plain copy whenever the motion vector keeps the row inside
+/// the reference, which is the common case; only a row that hangs off an edge
+/// falls back to the per-sample reference-sample clamp. `prediction.len()` is
+/// the run length.
+fn gather_prediction_row(
+    prediction: &mut [u8],
+    reference: Option<(&[u8], usize, usize)>,
+    x: usize,
+    sy: usize,
+    mv_x: i32,
+    mv_y: i32,
+) {
+    let w = prediction.len();
+    match reference {
+        Some((reference, rw, rh)) => {
+            let ry = (sy as i32 + mv_y).clamp(0, rh as i32 - 1) as usize;
+            let base = ry * rw;
+            let left = x as i32 + mv_x;
+            if left >= 0 && left + w as i32 <= rw as i32 {
+                let start = base + left as usize;
+                prediction.copy_from_slice(&reference[start..start + w]);
+            } else {
+                for (col, sample) in prediction.iter_mut().enumerate() {
+                    let rx = (left + col as i32).clamp(0, rw as i32 - 1) as usize;
+                    *sample = reference[base + rx];
+                }
+            }
+        }
+        None => prediction.fill(NEUTRAL_LUMA as u8),
+    }
+}
+
+/// The largest legal square transform block that tiles a `w` x `h` partition:
+/// the largest power of two no greater than either side, clamped to the
+/// §7.4.3.2.1 4..=32 transform-block range.
+fn transform_block_size(w: usize, h: usize) -> usize {
+    let side = w.min(h);
+    let log2 = (usize::BITS - 1 - side.leading_zeros()).clamp(2, 5);
+    1usize << log2
 }
 
 /// One §8.7.2 descriptor per coding unit. Every CTB is one unsplit,
@@ -383,119 +533,194 @@ fn deblock_descriptors(width: usize, height: usize, qp: i32) -> Vec<DeblockCuDes
     cus
 }
 
+/// §8.7.2 — run the in-loop deblocking filter over a finished
+/// reconstruction, in place.
+///
+/// The residual writer in [`crate::hevc::engine::encoder::lossy`] builds its
+/// reconstruction block by block as it codes, because §8.4.4.2.2 intra
+/// prediction reads the neighbouring samples *prior to* the in-loop filter
+/// process. Deblocking is therefore a whole-picture pass run once the last
+/// coding unit of the picture is coded — the §8.7.1 ordering the decoder
+/// itself uses — and not something interleaved into coding order.
+///
+/// Every coding unit the writer emits is one 16×16 intra `PART_2Nx2N` block
+/// with an unsplit transform tree, coded at `SliceQpY`, so the descriptors are
+/// exactly the ones [`deblock_descriptors`] builds. Because every unit is
+/// intra, the §8.7.2.4 boundary strength is 2 at every filtered edge and the
+/// `has_nonzero_coeff` / motion fields of the [`MotionField`] are never read —
+/// its all-intra default is the whole of what this picture's field says.
+pub(crate) fn deblock_reconstruction(recon: &mut ReconstructedPicture, qp: i32) {
+    let (width, height) = (recon.width, recon.height);
+    let mut pic = Picture::new(width, height, CHROMA_ARRAY_TYPE, BIT_DEPTH, BIT_DEPTH);
+    for (plane, samples) in [
+        (Plane::Luma, &recon.y),
+        (Plane::Cb, &recon.cb),
+        (Plane::Cr, &recon.cr),
+    ] {
+        let (buf, _) = pic.plane_mut(plane);
+        for (dst, &src) in buf.iter_mut().zip(samples) {
+            *dst = i32::from(src);
+        }
+    }
+    let field = MotionField::new(width, height);
+    let cus = deblock_descriptors(width, height, qp);
+    crate::hevc::engine::deblock::deblock_picture(&mut pic, &field, &cus);
+    recon.y = plane_to_u8(&pic, Plane::Luma);
+    recon.cb = plane_to_u8(&pic, Plane::Cb);
+    recon.cr = plane_to_u8(&pic, Plane::Cr);
+}
+
 /// The largest magnitude a `sao_offset_abs` can carry at 8-bit depth
-/// (§7.4.9.3: `(1 << (Min(bitDepth, 10) − 5)) − 1`).
-const SAO_OFFSET_MAX: i32 = 7;
+/// (§7.4.9.3: `(1 << (Min(bitDepth, 10) − 5)) − 1`), which is also the `cMax`
+/// of its Table 9-43 truncated-Rice binarization — `pub(crate)` so the writer
+/// codes against the same bound the search clamps to.
+pub(crate) const SAO_OFFSET_MAX: i32 = 7;
+
+/// §8.7.3 — estimate SAO parameters for a finished, already-deblocked
+/// reconstruction, apply them in place, and return the per-CTB grid the
+/// writer has to code as §7.3.8.3 syntax.
+///
+/// The counterpart of [`deblock_reconstruction`] for the second in-loop
+/// filter, and run after it: §8.7.1 orders SAO behind deblocking, and the
+/// parameter search is only meaningful against the samples SAO will actually
+/// see. Like deblocking it is a whole-picture pass, because §8.4.4.2.2 intra
+/// prediction reads the *unfiltered* neighbours — the grid returned here
+/// describes the picture's output, never this picture's own prediction input.
+///
+/// `lambda_q8` is passed through to [`estimate_sao`], which is what makes the
+/// per-CTB decision charge for the syntax the caller then writes.
+pub(crate) fn sao_reconstruction(
+    recon: &mut ReconstructedPicture,
+    src: SourcePlanes<'_>,
+    lambda_q8: u32,
+) -> Vec<ResolvedSao> {
+    let (width, height) = (recon.width, recon.height);
+    let mut pic = Picture::new(width, height, CHROMA_ARRAY_TYPE, BIT_DEPTH, BIT_DEPTH);
+    for (plane, samples) in [
+        (Plane::Luma, &recon.y),
+        (Plane::Cb, &recon.cb),
+        (Plane::Cr, &recon.cr),
+    ] {
+        let (buf, _) = pic.plane_mut(plane);
+        for (dst, &src) in buf.iter_mut().zip(samples) {
+            *dst = i32::from(src);
+        }
+    }
+    let grid = estimate_sao(&pic, src, true, true, lambda_q8);
+    let pic = crate::hevc::engine::sao::apply_sao_picture_full(
+        pic,
+        &grid,
+        CTB_LOG2,
+        CHROMA_ARRAY_TYPE,
+        true,
+        true,
+        None,
+        None,
+    );
+    recon.y = plane_to_u8(&pic, Plane::Luma);
+    recon.cb = plane_to_u8(&pic, Plane::Cb);
+    recon.cr = plane_to_u8(&pic, Plane::Cr);
+    grid
+}
 
 /// Encoder-side §7.3.8.3 SAO parameter estimation.
 ///
-/// For each CTB and each component this picks the edge-offset class whose
-/// per-category mean error between the source and the deblocked reconstruction
-/// reduces the sum of squared errors the most, and leaves SAO off for that CTB
-/// when no class does. The offsets are the per-category mean errors clamped to
-/// the signalable range with the §7.4.9.3 inferred edge-offset signs
+/// For each CTB this picks the edge-offset class whose per-category mean error
+/// between the source and the deblocked reconstruction reduces the sum of
+/// squared errors the most, and leaves SAO off for that CTB when no class
+/// earns its own syntax. The offsets are the per-category mean errors clamped
+/// to the signalable range with the §7.4.9.3 inferred edge-offset signs
 /// (categories 1 and 2 positive, 3 and 4 negative), which is the standard
 /// least-squares choice for edge offset and the reason this stage is worth
 /// measuring: it reads every reconstructed sample of the picture once per
 /// candidate class.
-fn estimate_sao(pic: &Picture, src: SourcePlanes<'_>, cfg: ReconConfig) -> Vec<ResolvedSao> {
+///
+/// The two chroma components are decided *together*, on the summed gain of one
+/// shared class, because §7.4.9.3 infers `SaoTypeIdx[2]` and `SaoEoClass[2]`
+/// from cIdx 1: a Cb and a Cr that picked different classes are not a
+/// bitstream. Each still carries its own four offsets, which is the whole of
+/// what the syntax gives cIdx 2 of its own.
+///
+/// `lambda_q8` is the §9 rate-distortion multiplier in 1/256 units, matching
+/// [`crate::hevc::engine::encoder::rdo::lambda_q8`]. SAO costs per-CTB syntax
+/// on every CTB it is enabled for, so a class is taken only when its SSE
+/// reduction clears `lambda * bins`, the bins being the §9.3.3 binarization's
+/// own count for the parameters that would be coded. At `lambda_q8 == 0` the
+/// test degrades to "any reduction at all", which is what a caller that codes
+/// no syntax for the decision wants.
+fn estimate_sao(
+    pic: &Picture,
+    src: SourcePlanes<'_>,
+    sao_luma: bool,
+    sao_chroma: bool,
+    lambda_q8: u32,
+) -> Vec<ResolvedSao> {
     let w_ctbs = src.width.div_ceil(CTB);
     let h_ctbs = src.height.div_ceil(CTB);
     let mut grid = vec![ResolvedSao::off(); w_ctbs * h_ctbs];
-    let components: [(Plane, &[u8], bool); 3] = [
-        (Plane::Luma, src.y, cfg.sao_luma),
-        (Plane::Cb, src.cb, cfg.sao_chroma),
-        (Plane::Cr, src.cr, cfg.sao_chroma),
-    ];
-    for (c_idx, (plane, source, enabled)) in components.into_iter().enumerate() {
-        if !enabled {
-            continue;
-        }
-        let (pw, ph) = pic.plane_dims(plane);
-        let step = if plane == Plane::Luma { CTB } else { CTB / 2 };
-        for ry in 0..h_ctbs {
-            for rx in 0..w_ctbs {
-                let (x0, y0) = (rx * step, ry * step);
-                let (x1, y1) = ((x0 + step).min(pw), (y0 + step).min(ph));
-                grid[ry * w_ctbs + rx].components[c_idx] =
-                    best_edge_offset(pic, plane, source, pw, x0, y0, x1, y1);
+    for ry in 0..h_ctbs {
+        for rx in 0..w_ctbs {
+            let cell = &mut grid[ry * w_ctbs + rx];
+            if sao_luma {
+                cell.components[0] = best_luma_edge_offset(pic, src, rx, ry, lambda_q8);
+            }
+            if sao_chroma {
+                let [cb, cr] = best_chroma_edge_offset(pic, src, rx, ry, lambda_q8);
+                cell.components[1] = cb;
+                cell.components[2] = cr;
             }
         }
     }
     grid
 }
 
-/// The best §8.7.3.2 edge-offset component for one CTB of one plane, or an
-/// off component when none of the four classes reduces the distortion.
-#[allow(clippy::too_many_arguments)]
-fn best_edge_offset(
-    pic: &Picture,
-    plane: Plane,
-    source: &[u8],
-    src_stride: usize,
-    x0: usize,
-    y0: usize,
-    x1: usize,
-    y1: usize,
-) -> ResolvedSaoComponent {
+/// The CTB at `(rx, ry)` as a half-open rectangle in one plane's own sample
+/// grid, clipped to the plane.
+fn ctb_rect(pic: &Picture, plane: Plane, rx: usize, ry: usize) -> (usize, usize, usize, usize) {
     let (pw, ph) = pic.plane_dims(plane);
-    let samples = pic.plane(plane);
+    let step = if plane == Plane::Luma { CTB } else { CTB / 2 };
+    let (x0, y0) = (rx * step, ry * step);
+    (x0, y0, (x0 + step).min(pw), (y0 + step).min(ph))
+}
+
+/// The §9.3.3 bin count of the four `sao_offset_abs` values of one component —
+/// Table 9-43 TR with `cMax == 7` and `cRiceParam == 0`, i.e. truncated unary.
+fn offset_abs_bins(offsets: &[i32; 5]) -> u64 {
+    offsets[1..5]
+        .iter()
+        .map(|&o| {
+            let v = u64::from(o.unsigned_abs()).min(SAO_OFFSET_MAX as u64);
+            if v < SAO_OFFSET_MAX as u64 { v + 1 } else { v }
+        })
+        .sum()
+}
+
+/// Whether an SSE reduction of `gain` is worth the `bins` of §7.3.8.3 syntax
+/// it has to be signalled with, under the same `D + lambda * R` cost the mode
+/// decision uses.
+fn clears_its_rate(gain: i64, bins: u64, lambda_q8: u32) -> bool {
+    gain > (bins * u64::from(lambda_q8) / 256) as i64
+}
+
+/// The best §8.7.3.2 edge-offset component for the luma of one CTB, or an off
+/// component when no class earns the `sao_type_idx` + `sao_eo_class_luma` +
+/// four `sao_offset_abs` it would be coded with.
+fn best_luma_edge_offset(
+    pic: &Picture,
+    src: SourcePlanes<'_>,
+    rx: usize,
+    ry: usize,
+    lambda_q8: u32,
+) -> ResolvedSaoComponent {
+    let rect = ctb_rect(pic, Plane::Luma, rx, ry);
     let mut best = ResolvedSaoComponent::off();
     let mut best_gain = 0i64;
     for eo_class in 0..4u8 {
-        let (h0, v0, h1, v1) = crate::hevc::engine::sao::eo_pos(eo_class);
-        // Per §8.7.3.2 category (1..4), the summed and counted error. The
-        // neighbour bounds test is hoisted out of the sample loop and turned
-        // into a row range: a sample is classifiable exactly when both of its
-        // neighbours are inside the plane, and for a fixed class that is a
-        // whole-row condition vertically and a contiguous run horizontally.
-        // Everything left in the run is a straight-line accumulation the
-        // vector kernel can take whole.
-        let mut stats = EdgeStats::default();
-        for y in y0..y1 {
-            let (ay, by) = (y as i32 + v0, y as i32 + v1);
-            if ay < 0 || by < 0 || ay >= ph as i32 || by >= ph as i32 {
-                continue;
-            }
-            let lo = (x0 as i32).max(-h0).max(-h1).max(0);
-            let hi = (x1 as i32).min(pw as i32 - h0).min(pw as i32 - h1);
-            if hi <= lo {
-                continue;
-            }
-            let (lo, run) = (lo as usize, (hi - lo) as usize);
-            let here = &samples[y * pw + lo..y * pw + lo + run];
-            let a_start = (ay as usize) * pw + (lo as i32 + h0) as usize;
-            let b_start = (by as usize) * pw + (lo as i32 + h1) as usize;
-            recon_simd::edge_offset_row(
-                here,
-                &samples[a_start..a_start + run],
-                &samples[b_start..b_start + run],
-                &source[y * src_stride + lo..y * src_stride + lo + run],
-                &mut stats,
-            );
-        }
-        let (sums, counts) = (stats.sums, stats.counts);
-        let mut offsets = [0i32; 5];
-        let mut gain = 0i64;
-        for category in 1..5 {
-            if counts[category] == 0 {
-                continue;
-            }
-            let mean = div_round(sums[category], counts[category]);
-            // §7.4.9.3 infers the sign per category, so a mean that points the
-            // other way is not signalable and the offset stays 0.
-            let offset = if category <= 2 {
-                mean.clamp(0, SAO_OFFSET_MAX)
-            } else {
-                mean.clamp(-SAO_OFFSET_MAX, 0)
-            };
-            offsets[category] = offset;
-            // The SSE reduction of adding a constant `o` to `n` samples whose
-            // summed error is `s`: 2*o*s − n*o^2.
-            gain += 2 * i64::from(offset) * sums[category]
-                - counts[category] * i64::from(offset) * i64::from(offset);
-        }
-        if gain > best_gain {
+        let (gain, offsets) = class_offsets(pic, Plane::Luma, src.y, src.width, rect, eo_class);
+        // One `sao_type_idx_luma` bin beyond the "off" bin, two
+        // `sao_eo_class_luma` bins, and the offsets' own.
+        let bins = 1 + 2 + offset_abs_bins(&offsets);
+        if gain > best_gain && clears_its_rate(gain, bins, lambda_q8) {
             best_gain = gain;
             best = ResolvedSaoComponent {
                 sao_type_idx: 2,
@@ -506,6 +731,120 @@ fn best_edge_offset(
         }
     }
     best
+}
+
+/// The best §8.7.3.2 edge-offset components for the Cb and Cr of one CTB,
+/// sharing the one class the §7.4.9.3 inference leaves them.
+fn best_chroma_edge_offset(
+    pic: &Picture,
+    src: SourcePlanes<'_>,
+    rx: usize,
+    ry: usize,
+    lambda_q8: u32,
+) -> [ResolvedSaoComponent; 2] {
+    let (cb_rect, cr_rect) = (
+        ctb_rect(pic, Plane::Cb, rx, ry),
+        ctb_rect(pic, Plane::Cr, rx, ry),
+    );
+    let chroma_stride = src.width / 2;
+    let mut best = [ResolvedSaoComponent::off(); 2];
+    let mut best_gain = 0i64;
+    for eo_class in 0..4u8 {
+        let (cb_gain, cb_offsets) =
+            class_offsets(pic, Plane::Cb, src.cb, chroma_stride, cb_rect, eo_class);
+        let (cr_gain, cr_offsets) =
+            class_offsets(pic, Plane::Cr, src.cr, chroma_stride, cr_rect, eo_class);
+        let gain = cb_gain + cr_gain;
+        // One `sao_type_idx_chroma` bin beyond the "off" bin, two
+        // `sao_eo_class_chroma` bins, and both components' offsets — cIdx 2
+        // codes neither a type nor a class of its own.
+        let bins = 1 + 2 + offset_abs_bins(&cb_offsets) + offset_abs_bins(&cr_offsets);
+        if gain > best_gain && clears_its_rate(gain, bins, lambda_q8) {
+            best_gain = gain;
+            best = [
+                ResolvedSaoComponent {
+                    sao_type_idx: 2,
+                    offset_val: cb_offsets,
+                    band_position: 0,
+                    eo_class,
+                },
+                ResolvedSaoComponent {
+                    sao_type_idx: 2,
+                    offset_val: cr_offsets,
+                    band_position: 0,
+                    eo_class,
+                },
+            ];
+        }
+    }
+    best
+}
+
+/// The §7.4.9.3 offsets one edge-offset class would take on one CTB of one
+/// plane, and the SSE reduction they buy.
+fn class_offsets(
+    pic: &Picture,
+    plane: Plane,
+    source: &[u8],
+    src_stride: usize,
+    rect: (usize, usize, usize, usize),
+    eo_class: u8,
+) -> (i64, [i32; 5]) {
+    let (x0, y0, x1, y1) = rect;
+    let (pw, ph) = pic.plane_dims(plane);
+    let samples = pic.plane(plane);
+    let (h0, v0, h1, v1) = crate::hevc::engine::sao::eo_pos(eo_class);
+    // Per §8.7.3.2 category (1..4), the summed and counted error. The
+    // neighbour bounds test is hoisted out of the sample loop and turned into
+    // a row range: a sample is classifiable exactly when both of its
+    // neighbours are inside the plane, and for a fixed class that is a
+    // whole-row condition vertically and a contiguous run horizontally.
+    // Everything left in the run is a straight-line accumulation the vector
+    // kernel can take whole.
+    let mut stats = EdgeStats::default();
+    for y in y0..y1 {
+        let (ay, by) = (y as i32 + v0, y as i32 + v1);
+        if ay < 0 || by < 0 || ay >= ph as i32 || by >= ph as i32 {
+            continue;
+        }
+        let lo = (x0 as i32).max(-h0).max(-h1);
+        let hi = (x1 as i32).min(pw as i32 - h0).min(pw as i32 - h1);
+        if hi <= lo {
+            continue;
+        }
+        let (lo, run) = (lo as usize, (hi - lo) as usize);
+        let a_start = (ay as usize) * pw + (lo as i32 + h0) as usize;
+        let b_start = (by as usize) * pw + (lo as i32 + h1) as usize;
+        recon_simd::edge_offset_row(
+            &samples[y * pw + lo..y * pw + lo + run],
+            &samples[a_start..a_start + run],
+            &samples[b_start..b_start + run],
+            &source[y * src_stride + lo..y * src_stride + lo + run],
+            &mut stats,
+        );
+    }
+    let (sums, counts) = (stats.sums, stats.counts);
+    let mut offsets = [0i32; 5];
+    let mut gain = 0i64;
+    for category in 1..5 {
+        if counts[category] == 0 {
+            continue;
+        }
+        let mean = div_round(sums[category], counts[category]);
+        // §7.4.9.3 infers the sign per category, so a mean that points the
+        // other way is not signalable and the offset stays 0.
+        let offset = if category <= 2 {
+            mean.clamp(0, SAO_OFFSET_MAX)
+        } else {
+            mean.clamp(-SAO_OFFSET_MAX, 0)
+        };
+        offsets[category] = offset;
+        // The SSE reduction of adding a constant `o` to `n` samples whose
+        // summed error is `s`: 2*o*s − n*o^2.
+        gain += 2 * i64::from(offset) * sums[category]
+            - counts[category] * i64::from(offset) * i64::from(offset);
+    }
+    (gain, offsets)
 }
 
 /// Round-half-away-from-zero integer division.
@@ -759,6 +1098,84 @@ mod tests {
             ReconConfig::default(),
         );
         assert_eq!(out.y, next.0);
+    }
+
+    #[test]
+    fn a_quantized_residual_makes_the_reconstruction_diverge_from_the_source() {
+        // The property the lossy path exists for: once the residual is coded
+        // through the transform and quantizer, the encoder's reference is no
+        // longer the picture it was handed, and it drifts further as the step
+        // coarsens.
+        let src = source(0);
+        let lossless = reconstruct_picture(
+            planes(&src),
+            None,
+            &plan(&src, None),
+            ReconConfig::default(),
+        );
+        assert_eq!(lossless.y, src.0, "the exact-residual path must stay exact");
+
+        // The blocks in `source` are flat, so a fine step still reproduces
+        // their DC-only residual exactly; the distortion is required to be
+        // monotone in qP and strictly non-zero by the coarsest step.
+        let mut previous = 0u64;
+        for qp in [20i32, 34, 47] {
+            let lossy = reconstruct_picture(
+                planes(&src),
+                None,
+                &plan(&src, None),
+                ReconConfig {
+                    quantized_residual: true,
+                    qp,
+                    ..ReconConfig::default()
+                },
+            );
+            let error = sse(&lossy.y, &src.0);
+            assert!(
+                error >= previous,
+                "qP {qp} cost less distortion than the finer step"
+            );
+            previous = error;
+            assert_eq!(lossy.y.len(), src.0.len());
+            assert_eq!(lossy.cb.len(), src.1.len());
+        }
+        assert!(
+            previous > 0,
+            "a quantized reconstruction reproduced the source exactly"
+        );
+    }
+
+    #[test]
+    fn a_quantized_inter_reconstruction_predicts_from_the_lossy_reference() {
+        // The reconstruction of an inter picture coded against a lossy
+        // reference must differ from its source too — the drift the RDO
+        // search is supposed to see accumulates picture over picture.
+        let first = source(0);
+        let cfg = ReconConfig {
+            quantized_residual: true,
+            qp: 34,
+            ..ReconConfig::default()
+        };
+        let reference = reconstruct_picture(planes(&first), None, &plan(&first, None), cfg);
+        let next = source(2);
+        let out = reconstruct_picture(
+            planes(&next),
+            Some(&reference),
+            &plan(&next, Some(&reference.y)),
+            cfg,
+        );
+        assert_ne!(out.y, next.0, "the inter reconstruction stayed lossless");
+        assert_eq!(out.y.len(), next.0.len());
+    }
+
+    #[test]
+    fn partitions_tile_into_the_largest_legal_square_transform_block() {
+        assert_eq!(transform_block_size(16, 16), 16);
+        assert_eq!(transform_block_size(16, 8), 8);
+        assert_eq!(transform_block_size(8, 4), 4);
+        // Below the 4x4 minimum and above the 32x32 maximum both clamp.
+        assert_eq!(transform_block_size(2, 2), 4);
+        assert_eq!(transform_block_size(64, 64), 32);
     }
 
     #[test]

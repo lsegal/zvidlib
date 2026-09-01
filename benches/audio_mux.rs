@@ -50,6 +50,8 @@
 
 mod support;
 
+use support::isa::log_host_isas;
+
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -490,5 +492,5 @@ fn audio_demux(criterion: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, audio_mux, audio_demux);
+criterion_group!(benches, log_host_isas, audio_mux, audio_demux);
 criterion_main!(benches);
