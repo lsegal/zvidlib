@@ -100,7 +100,7 @@ const TYPE_GAIN_PROBES: usize = 1;
 /// 155,143. What remains at `2` is the estimator mixing statistics across regions rather than the
 /// sampling rate, which no interval fixes; [`TYPE_GAIN_TRUST`] is what addresses that, and the
 /// worst-penalty column above is the uncorrected estimator it shrinks.
-pub(super) const TYPE_GAIN_SAMPLE_INTERVAL: usize = 2;
+pub(super) const TYPE_GAIN_SAMPLE_INTERVAL: usize = 8;
 
 /// Transform sizes [`FrameEncoder::type_gain`] accumulates over: `TX_4X4` through `TX_32X32`,
 /// which is every size [`super::transform::forward_transform`] implements.

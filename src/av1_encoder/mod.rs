@@ -1079,7 +1079,15 @@ mod nonlossless_tests {
     #[test]
     #[ignore = "measurement sweep, not an assertion"]
     fn measure_type_gain_sampling_intervals() {
-        let (width, height) = (192_usize, 160_usize);
+        // Both sizes the interval is judged at: 192x160, where the trade is measured, and 128x96,
+        // where `the_type_gain_sampling_interval_holds_on_content_it_was_not_tuned_on` sets its
+        // per-frame ceilings from these same penalties.
+        for (width, height) in [(192_usize, 160_usize), (128, 96)] {
+            measure_type_gain_sampling_intervals_at(width, height);
+        }
+    }
+
+    fn measure_type_gain_sampling_intervals_at(width: usize, height: usize) {
         let mut frames = content_frames(width as u32, height as u32);
         frames.push(("test_pattern", test_pattern(width as u32, height as u32)));
         let quality = |report: &tile::SearchReport, pixels: &[u8]| {
@@ -1102,6 +1110,7 @@ mod nonlossless_tests {
                 })
                 .sum()
         };
+        println!("size,{width}x{height}");
         println!(
             "frame,qindex,interval,fast_psnr,exhaustive_psnr,fast_bytes,exh_bytes,candidates,lambda,fast_rd,exh_rd"
         );
@@ -1570,8 +1579,8 @@ mod nonlossless_tests {
                 ("smooth", 1.0),
                 ("diagonals", 1.0),
                 ("quadrants", 1.0),
-                ("scene_edge", 2.5),
-                ("bands", 1.0),
+                ("scene_edge", 1.0),
+                ("bands", 4.0),
                 ("mosaic", 1.0),
                 ("test_pattern", 1.0),
             ]);
@@ -1601,65 +1610,53 @@ mod nonlossless_tests {
         }
     }
 
-    /// A longer sampling interval is not the trade it was under the frame-wide accumulator.
+    /// `TYPE_GAIN_SAMPLE_INTERVAL` is the largest interval that keeps the smallest transform
+    /// reachable, and that - not the rate-distortion penalty - is what fixes it.
     ///
-    /// `TYPE_GAIN_SAMPLE_INTERVAL` was chosen against a per-size gain accumulated equally over
-    /// the whole frame, where the penalty grew slowly and monotonically with the interval and the
-    /// candidate saving above `2` looked close to free. `TYPE_GAIN_MEMORY` changed that: the
-    /// window is counted in *probes*, not in coding blocks, so raising the interval stretches the
-    /// same window over proportionally more of the frame and hands back the regional accuracy the
-    /// weighting bought. Re-measured on the frame the trade is decided on - the hard scene edge at
-    /// 192x160 and `qindex` 160, whose two halves have unrelated statistics - `2` costs +9.3%
-    /// against the same estimator probing every size search where the frame-wide accumulation cost
-    /// +44.1%, and `4` costs +23.0%: 2.5x, against the 1.5x the old curve showed.
+    /// The interval used to be bounded from above by accuracy: under the frame-wide accumulator
+    /// it was calibrated against, the worst frame's penalty climbed to +85.8% by `16`, so the
+    /// value had to stay small. `TYPE_GAIN_TRUST` removed that bound - every interval from `1` to
+    /// `64` now lands within +3.5% of the unsampled estimator, and the mean cost against the
+    /// exhaustive search is *better* than the unsampled estimator's at every interval past `1` -
+    /// so the penalty column no longer chooses between them.
     ///
-    /// So this asserts both halves of that: the shipped interval stays near what it measured, and
-    /// doubling it is materially worse rather than nearly free. Raising the constant for its
-    /// candidate count alone fails here.
+    /// What chooses is coverage. The per-size correction is what makes `TX_4X4` selectable at all:
+    /// coding a block as sixteen 4x4 transforms pays for its extra header bits because the type
+    /// search gets sixteen chances to beat DCT, and only a probe measures that. On the 96x80
+    /// pattern - a frame small enough to have few coding blocks - a long enough interval never
+    /// probes a trial carrying the smallest size, the correction for `TX_4X4` is never measured,
+    /// and the size goes unselected exactly as it did before the correction existed. `16` loses it
+    /// outright, and so do `3`, `6` and `12`, which alias against the block raster the sample walks
+    /// in; `8` is the largest value that holds it.
+    ///
+    /// So this pins the constant from the side that actually binds it: the shipped interval
+    /// selects the smallest transform, and doubling it does not. Raising the constant on the
+    /// strength of its candidate count fails here.
     #[test]
-    fn the_type_gain_sampling_interval_does_not_pay_to_be_longer() {
-        let (width, height) = (192_usize, 160_usize);
-        let (name, pixels) = content_frames(width as u32, height as u32)
-            .into_iter()
-            .find(|(name, _)| *name == "scene_edge")
-            .expect("the scene edge is the frame this trade is decided on");
-        let qindex = 160_u8;
-        let ac = i64::from(crate::av1_intra::get_ac_quant(qindex));
-        let lambda = (ac * ac / 256).max(1);
-        let cost = |interval: usize| -> i64 {
-            let report = tile::FrameEncoder::new(&pixels, width, height, qindex)
-                .with_type_gain_interval(interval)
-                .encode_with_report();
-            let sse: i64 = (0..height)
-                .flat_map(|row| {
-                    report.reconstruction[row * report.coded_width..][..width]
-                        .iter()
-                        .enumerate()
-                        .map(move |(column, &value)| (row * width + column, value))
-                })
-                .map(|(index, value)| {
-                    let error = i64::from(i32::from(pixels[index]) - i32::from(value));
-                    error * error
-                })
-                .sum();
-            sse + lambda * report.tile.len() as i64 * 8
+    fn the_type_gain_sampling_interval_is_the_longest_that_keeps_tx_4x4() {
+        let (width, height) = (96_usize, 80_usize);
+        let pixels = test_pattern(width as u32, height as u32);
+        let selects_smallest = |interval: usize| {
+            [1_u8, 8, 32, 80, 160, 200].into_iter().any(|qindex| {
+                tile::FrameEncoder::new(&pixels, width, height, qindex)
+                    .with_type_gain_interval(interval)
+                    .encode_with_report()
+                    .trace
+                    .iter()
+                    .any(|&(size, _)| size == 4)
+            })
         };
-        let unsampled = cost(1);
-        let penalty = |interval: usize| cost(interval) as f64 / unsampled as f64 * 100.0 - 100.0;
-        let shipped = penalty(tile::TYPE_GAIN_SAMPLE_INTERVAL);
         assert!(
-            shipped <= 12.0,
-            "{name} at qindex {qindex} cost {shipped:+.2}% against the unsampled estimator at \
-             interval {}, past the 12% the re-measured +9.3% is allowed to drift to",
+            selects_smallest(tile::TYPE_GAIN_SAMPLE_INTERVAL),
+            "no quantizer selected TX_4X4 at the shipped interval of {}, so the per-size \
+             correction no longer reaches the smallest transform",
             tile::TYPE_GAIN_SAMPLE_INTERVAL
         );
-        let doubled = penalty(tile::TYPE_GAIN_SAMPLE_INTERVAL * 2);
+        let doubled = tile::TYPE_GAIN_SAMPLE_INTERVAL * 2;
         assert!(
-            doubled >= shipped * 1.5,
-            "doubling the interval to {} cost {doubled:+.2}% against interval {}'s \
-             {shipped:+.2}%, so the recency weighting no longer makes a longer interval the \
-             worse trade this constant was re-chosen on",
-            tile::TYPE_GAIN_SAMPLE_INTERVAL * 2,
+            !selects_smallest(doubled),
+            "interval {doubled} also selected TX_4X4, so {} is no longer the largest interval \
+             the smallest transform survives and the constant is leaving candidate savings unclaimed",
             tile::TYPE_GAIN_SAMPLE_INTERVAL
         );
     }
