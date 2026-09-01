@@ -809,13 +809,12 @@ fn build_sao_inputs(width: usize, height: usize, luma: &[i32]) -> (Picture, Vec<
     // shares, and Cb / Cr share the chroma row's — and take the same class as
     // each other, as §7.3.8.3 signals them as one.
     let mut emitted = [[0u64; 6]; 2];
-    let mut total = 0u64;
     for i in 0..ctbs_x * ctbs_y {
+        let total = i as u64;
         let luma_class = sao_class_for(&SAO_CTB_MIX[0], &emitted[0], total);
         let chroma_class = sao_class_for(&SAO_CTB_MIX[1], &emitted[1], total);
         emitted[0][luma_class] += 1;
         emitted[1][chroma_class] += 1;
-        total += 1;
         grid.push(ResolvedSao {
             components: [
                 sao_component_for(luma_class, i, 0),
@@ -1126,8 +1125,7 @@ mod tests {
         let total = inputs.sao_ctbs.len() as f64;
         assert!(total > 0.0, "the grid has CTBs");
         for (row, cidx) in [(0usize, 0usize), (1, 1), (1, 2)] {
-            for class in 0..6 {
-                let want = SAO_CTB_MIX[row][class];
+            for (class, &want) in SAO_CTB_MIX[row].iter().enumerate() {
                 let got = inputs
                     .sao_ctbs
                     .iter()

@@ -57,6 +57,15 @@
 //! | §8.7.2 `in_loop::filter_luma_rows` / `filter_chroma_rows` | 1.2-1.3x / 1.3-1.4x | 1.2-1.3x / 1.3-1.4x | ~1.3x |
 //! | §8.7.3 `in_loop::sao_band_row` / `sao_edge_row` | 4.6-5.4x / 2.7-2.8x | 6.3-7.4x / 3.0x | ~2.3x |
 //!
+//! Two rows here are throughput on a workload the decoder does not run, and are
+//! not what the kernel is worth to a decode. `filter_taps`'s block-path row is
+//! measured on short rows, and its margin decays with block size until 93% of a
+//! real decode's luma samples sit where it has almost none (issue #280). The SAO
+//! row is measured over saturated rows, and a real decode leaves **86.7% of luma
+//! and 94.4% of chroma coding tree blocks with `SaoTypeIdx == 0`**, filtering
+//! none of their samples at all (issue #310). `benches/README.md` carries both
+//! measurements and what each stage contributes to a whole frame.
+//!
 //! # What the vendor split does and does not change
 //!
 //! Every kernel is on the same side of 1.00x on both vendors, so no
