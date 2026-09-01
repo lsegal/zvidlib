@@ -1,8 +1,10 @@
 //! Scalar-versus-SIMD benchmarks for zvidlib's pure-Rust HEVC software decoder.
 //!
 //! The companion to `benches/av1_decode.rs`, for the other software decoder.
-//! It answers two questions separately: how fast a whole 1080p HEVC frame
-//! decodes end to end, and where that time goes. Every group runs once per
+//! It answers three questions separately: how fast a whole 1080p HEVC frame
+//! decodes, how much of that is the decoder's own work rather than the RGBA
+//! output conversion every application pays on the way out, and where the time
+//! inside a decode goes. Every group runs once per
 //! instruction set `zvidlib::simd::available()` reports, through the crate-wide
 //! override in [`zvidlib::simd`], and `benches/support/isa.rs` asserts both that
 //! each arm is bit-exact with scalar before timing it and that the override
@@ -14,16 +16,32 @@
 //! | Group | Stage | Vectorized |
 //! | --- | --- | --- |
 //! | `hevc_decode_1080p` | whole-frame decode through `ExactFrameReader` | n/a |
-//! | `hevc_decode` | whole-frame decode, one arm per instruction set | n/a |
+//! | `hevc_decode` | whole-frame `submit`-to-RGBA round trip, one arm per instruction set | n/a |
+//! | `hevc_decode_to_picture` | the same decode stopping at the decoded `Picture` | n/a |
 //! | `hevc_inter_pred` | §8.5.3.3 8-tap luma interpolation + weighted combine | yes |
 //! | `hevc_intra_pred` | §8.4.4.2 reference smoothing, planar / DC / angular | yes |
 //! | `hevc_deblock` | §8.7.2 luma block-edge deblocking | yes |
 //! | `hevc_sao` | §8.7.3 sample adaptive offset, band and edge | yes |
 //! | `hevc_inverse_transform` | §8.6 dequantization + inverse DCT/DST | yes |
+//! | `hevc_color_convert` | YUV420-to-RGBA output conversion | no, today |
 //! | `hevc_cabac` | §9.3.4 arithmetic bin decoding | no, by design |
 //!
-//! The two whole-frame groups need the bundled sample and so sit behind
+//! The three whole-frame groups need the bundled sample and so sit behind
 //! `ZVIDLIB_BENCH_LARGE=1`; the per-stage groups do not and always run.
+//!
+//! # Decode is not the round trip
+//!
+//! `hevc_decode` measures `submit` to RGBA, which is what an application pays
+//! per frame and so is worth keeping. It is not, however, a decode: the
+//! `picture_to_rgba` pass at the end of it is a third of the interval (issue
+//! #189's stage attribution, recorded in `benches/README.md`) and no HEVC
+//! kernel touches it, so a scalar-versus-SIMD ratio taken off that group has a
+//! third of its denominator pinned no matter how fast the kernels get.
+//! `hevc_decode_to_picture` is the same decode over the same access units,
+//! collecting the decoded pictures instead of converting them, and is the group
+//! to read a decode ratio off. `hevc_color_convert` times the conversion
+//! itself, so the stage is measured directly rather than inferred by
+//! subtracting one whole-frame group from another.
 //!
 //! A whole-frame group makes a regression *observable*; the per-stage groups
 //! make it *attributable*. `hevc_cabac` is here precisely because it has no
@@ -42,10 +60,9 @@ mod support;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
-use zvidlib::hevc_decoder_bench::HevcStageInputs;
+use zvidlib::hevc_decoder_bench::{HevcStageInputs, decode_frames, decode_pictures};
 use zvidlib::{
-    CancellationToken, ExactFrameReader, FrameDigest, FrameIndex, Limits, VideoDecoderFactory,
-    native_hevc_video_decoder_factory,
+    CancellationToken, ExactFrameReader, FrameIndex, Limits, native_hevc_video_decoder_factory,
 };
 
 use support::isa::{IsaWorkload, bench_across_isas};
@@ -72,7 +89,17 @@ const ISA_HEIGHT: usize = 1080;
 /// the in-loop filters, and the inverse transforms all run.
 const ISA_HEVC_FRAMES: u64 = 8;
 
-/// The bundled 1080p HEVC sample. Opt-in; see [`LARGE_GROUP_ENV`].
+/// The bundled 1080p HEVC sample, decoded both ways. Opt-in; see
+/// [`LARGE_GROUP_ENV`].
+///
+/// `sequential_from_keyframe` is the round trip an application pays, through
+/// the public reader and out to RGBA. `sequential_from_keyframe_to_picture`
+/// decodes the same leading frames and stops at the decoded picture, so the
+/// decoder's own work is visible without the output conversion on top of it.
+/// The two are not a subtraction — the reader arm carries seek and index
+/// bookkeeping the direct arm does not, and each carries its own output fold —
+/// but they bracket the decode, and `hevc_color_convert` measures the
+/// conversion itself.
 fn hevc_decode_1080p(criterion: &mut Criterion) {
     if std::env::var_os(LARGE_GROUP_ENV).is_none() {
         println!("# skipping the 1080p HEVC group; set {LARGE_GROUP_ENV}=1 to run it",);
@@ -103,14 +130,35 @@ fn hevc_decode_1080p(criterion: &mut Criterion) {
             }
         });
     });
+    report_throughput(
+        &mut group,
+        "sequential_from_keyframe_to_picture",
+        FrameWork::new(LARGE_GROUP_FRAMES, sample.width, sample.height),
+    );
+    group.bench_function("sequential_from_keyframe_to_picture", |bencher| {
+        bencher.iter(|| {
+            black_box(decode_pictures(
+                &sample.configuration,
+                &sample.samples,
+                &Limits::default(),
+                LARGE_GROUP_FRAMES,
+            ))
+        });
+    });
     group.finish();
 }
 
 /// The bundled 1080p HEVC sample decoded through zvidlib's own software
 /// decoder, once per instruction set.
 ///
-/// This is the group the issue's "the switch actually reaches the HEVC kernels"
-/// requirement rides on. Whether it shows a *timing* difference is host- and
+/// This is the round trip an application pays per frame: decode plus the
+/// `picture_to_rgba` output conversion, which issue #189's attribution put at a
+/// third of it. [`hevc_decode_to_picture_by_isa`] is the same decode without
+/// that tail, and is the group to read a decode ratio off; this one is kept
+/// because the round-trip cost is real.
+///
+/// It is also the group the issue's "the switch actually reaches the HEVC
+/// kernels" requirement rides on. Whether it shows a *timing* difference is host- and
 /// kernel-dependent — it comes out near parity on Apple Silicon, where LLVM
 /// auto-vectorizes the scalar reference well under `lto = "fat"` — so
 /// `bench_across_isas` asserts the override landed rather than inferring it
@@ -122,7 +170,6 @@ fn hevc_decode_by_isa(criterion: &mut Criterion) {
         return;
     }
     let sample = support::bundled_hevc_sample();
-    let factory = native_hevc_video_decoder_factory();
     let workload = IsaWorkload {
         measurement_time: std::time::Duration::from_secs(10),
         ..IsaWorkload::new(
@@ -131,32 +178,46 @@ fn hevc_decode_by_isa(criterion: &mut Criterion) {
         )
     };
     bench_across_isas(criterion, &workload, || {
-        let mut decoder = factory
-            .create(&sample.configuration, &Limits::default())
-            .expect("the software HEVC decoder is constructible");
-        let cancellation = CancellationToken::new();
-        let mut digests = Vec::new();
-        for encoded in &sample.samples {
-            for decoded in decoder
-                .submit(encoded, &cancellation)
-                .expect("the bundled sample decodes")
-            {
-                digests.extend_from_slice(
-                    FrameDigest::from_frame(&decoded.frame)
-                        .expect("a decoded frame digests")
-                        .to_hex()
-                        .as_bytes(),
-                );
-            }
-            if digests.len() as u64 >= ISA_HEVC_FRAMES * 64 {
-                break;
-            }
-        }
-        assert!(
-            digests.len() as u64 >= ISA_HEVC_FRAMES * 64,
-            "the bundled sample yields at least {ISA_HEVC_FRAMES} decoded frames"
-        );
-        digests
+        decode_frames(
+            &sample.configuration,
+            &sample.samples,
+            &Limits::default(),
+            ISA_HEVC_FRAMES,
+        )
+    });
+}
+
+/// The bundled 1080p sample decoded to the `Picture` — no output conversion —
+/// once per instruction set.
+///
+/// Issue #220: this is the group a decode ratio is read off. [`hevc_decode`]
+/// includes `picture_to_rgba`, which issue #189's attribution put at a third of
+/// that interval with no vector kernel behind it, so its scalar-versus-SIMD
+/// ratio is structurally understated by a stage no HEVC kernel can move. Same
+/// sample, same access units, same frame count as that group; the only
+/// difference is what happens to the decoded picture.
+///
+/// [`hevc_decode`]: hevc_decode_by_isa
+fn hevc_decode_to_picture_by_isa(criterion: &mut Criterion) {
+    if std::env::var_os(LARGE_GROUP_ENV).is_none() {
+        println!("# skipping the picture-only 1080p HEVC group; set {LARGE_GROUP_ENV}=1 to run it");
+        return;
+    }
+    let sample = support::bundled_hevc_sample();
+    let workload = IsaWorkload {
+        measurement_time: std::time::Duration::from_secs(10),
+        ..IsaWorkload::new(
+            "hevc_decode_to_picture",
+            FrameWork::new(ISA_HEVC_FRAMES, sample.width, sample.height),
+        )
+    };
+    bench_across_isas(criterion, &workload, || {
+        decode_pictures(
+            &sample.configuration,
+            &sample.samples,
+            &Limits::default(),
+            ISA_HEVC_FRAMES,
+        )
     });
 }
 
@@ -236,6 +297,20 @@ fn hevc_inverse_transform_by_isa(criterion: &mut Criterion) {
     });
 }
 
+/// The YUV420-to-RGBA output conversion, the stage that separates
+/// `hevc_decode` from `hevc_decode_to_picture`.
+///
+/// It has no vector path today, so its arms are expected to come out equal —
+/// which is the finding: it is the single largest item in a whole-frame
+/// measurement and none of the HEVC kernels reach it. Issue #219 is the ticket
+/// that vectorizes it, and this is the group that would show the difference.
+fn hevc_color_convert_by_isa(criterion: &mut Criterion) {
+    let samples = hevc_stage_inputs().color_convert_samples();
+    hevc_stage_group(criterion, "hevc_color_convert", samples, |inputs| {
+        inputs.run_color_convert()
+    });
+}
+
 /// §9.3.4 CABAC bin decoding — the serial stage, measured for the ceiling it
 /// puts on everything else.
 ///
@@ -253,11 +328,13 @@ criterion_group!(
     benches,
     hevc_decode_1080p,
     hevc_decode_by_isa,
+    hevc_decode_to_picture_by_isa,
     hevc_inter_pred_by_isa,
     hevc_intra_pred_by_isa,
     hevc_deblock_by_isa,
     hevc_sao_by_isa,
     hevc_inverse_transform_by_isa,
+    hevc_color_convert_by_isa,
     hevc_cabac_by_isa
 );
 criterion_main!(benches);
