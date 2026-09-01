@@ -357,6 +357,18 @@ pub(crate) struct FrameEncoder<'a> {
     /// right. Outside tests the constant is read directly.
     #[cfg(test)]
     type_gain_interval: usize,
+    /// Whether every size search that can reach the smallest transform probes, whatever the
+    /// stride says. This is the guarantee #323 weighed against the phase dependence it would
+    /// remove; `measure_type_gain_phase_aliasing` prices it and nothing ships it, so it is off
+    /// outside that measurement.
+    #[cfg(test)]
+    force_smallest_size_probes: bool,
+    /// One entry per size search this frame, in the order they ran: the smallest transform width
+    /// the search could have chosen, and whether it probed. Together they say which strides ever
+    /// probe a trial that carries a given size, which is what `measure_type_gain_phase_aliasing`
+    /// reports.
+    #[cfg(test)]
+    size_search_probes: Vec<(usize, bool)>,
     /// The locality arm in force, so a test can measure the shipped one against the accumulators
     /// it blends. [`GainLocality::Blended`] outside tests.
     #[cfg(test)]
@@ -431,6 +443,9 @@ pub(crate) struct SearchReport {
     pub(crate) emitted_blocks: std::collections::HashMap<(usize, usize), (usize, u8)>,
     pub(crate) emitted_coding_blocks: u64,
     pub(crate) probing_size_searches: u64,
+    /// Every size search's smallest reachable transform width and whether it probed, in search
+    /// order, for `measure_type_gain_phase_aliasing`.
+    pub(crate) size_search_probes: Vec<(usize, bool)>,
     pub(crate) zero_skipped_emitted: u64,
     pub(crate) reusable_emitted: u64,
 }
@@ -578,6 +593,10 @@ impl<'a> FrameEncoder<'a> {
             #[cfg(test)]
             type_gain_interval: TYPE_GAIN_SAMPLE_INTERVAL,
             #[cfg(test)]
+            force_smallest_size_probes: false,
+            #[cfg(test)]
+            size_search_probes: Vec::new(),
+            #[cfg(test)]
             type_gain_locality: GainLocality::Running,
             #[cfg(test)]
             type_gain_probes: TYPE_GAIN_PROBES,
@@ -660,6 +679,30 @@ impl<'a> FrameEncoder<'a> {
     #[cfg(not(test))]
     fn type_gain_interval(&self) -> usize {
         TYPE_GAIN_SAMPLE_INTERVAL
+    }
+
+    /// Probes every size search that can reach the smallest transform, on top of the ones the
+    /// stride samples. This is the structural guarantee #323 asked for, kept only so
+    /// `measure_type_gain_phase_aliasing` can price what it costs; a shipped encode samples on
+    /// the stride alone.
+    #[cfg(test)]
+    pub(crate) fn with_forced_smallest_size_probes(mut self) -> Self {
+        self.force_smallest_size_probes = true;
+        self
+    }
+
+    /// Whether a size search that can reach the smallest transform probes whatever the stride
+    /// says. Never, outside the measurement that priced it.
+    #[cfg(test)]
+    fn force_smallest_size_probes(&self) -> bool {
+        self.force_smallest_size_probes
+    }
+
+    /// Whether a size search that can reach the smallest transform probes whatever the stride
+    /// says. Never, outside the measurement that priced it.
+    #[cfg(not(test))]
+    fn force_smallest_size_probes(&self) -> bool {
+        false
     }
 
     /// Overrides where a trial reads its gain ratio back from, so a test can measure the shipped
@@ -764,6 +807,7 @@ impl<'a> FrameEncoder<'a> {
             emitted_blocks: std::mem::take(&mut self.emitted_blocks),
             emitted_coding_blocks: self.emitted_coding_blocks,
             probing_size_searches: self.probing_size_searches,
+            size_search_probes: std::mem::take(&mut self.size_search_probes),
             zero_skipped_emitted: self.zero_skipped_emitted,
             reusable_emitted: self.reusable_emitted,
             tile: self.sym.finish(),
@@ -1013,10 +1057,26 @@ impl<'a> FrameEncoder<'a> {
         if self.reversed_candidates {
             widths.reverse();
         }
-        let probing = self.shortcuts() && self.sample_type_gain();
+        // The stride samples coding blocks, not transform sizes, and which sizes a search can
+        // even reach is a property of the coding block's width - only a 16x16 or smaller block
+        // trials `TX_4X4` at all. Whether the smallest transform is *selected* somewhere in a
+        // frame therefore depends on whether the particular block it wins at was itself sampled,
+        // because a trial that probed is corrected by its own measurement at full strength while
+        // every other trial's is shrunk to [`TYPE_GAIN_TRUST`] sixteenths. That is the phase
+        // dependence #323 recorded, and it is left standing deliberately: the only guarantee that
+        // removes it - `with_forced_smallest_size_probes` - is measured there to cost 28-70% more
+        // transform-type candidates and up to +12.4% rate-distortion, for an outcome the sampled
+        // estimator is not worse than.
+        let probing = self.shortcuts()
+            && (self.sample_type_gain()
+                || (self.force_smallest_size_probes() && widths.last() == Some(&4)));
         #[cfg(test)]
-        if probing {
-            self.probing_size_searches += 1;
+        {
+            let smallest = widths.iter().copied().min().unwrap_or(0);
+            self.size_search_probes.push((smallest, probing));
+            if probing {
+                self.probing_size_searches += 1;
+            }
         }
         let mut best = (0usize, i64::MAX);
         for &tx_width in &widths {

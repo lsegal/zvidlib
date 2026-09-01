@@ -1204,6 +1204,122 @@ mod nonlossless_tests {
         }
     }
 
+    /// Why probe coverage of a transform size used to depend on the sampling interval's *phase*
+    /// against the block raster and not only on its rate (#323).
+    ///
+    /// `TYPE_GAIN_SAMPLE_INTERVAL` counts *coding blocks*: every `n`-th size search probes. But
+    /// which transform sizes a size search can even reach is a property of the coding block's
+    /// width - `read_tx_size` signals a depth off `Max_Tx_Size_Rect`, so only a 16x16 or smaller
+    /// coding block ever trials `TX_4X4`, and a 64x64 or 32x32 one bottoms out at `TX_8X8`. The
+    /// searches that carry the smallest size are therefore not spread evenly through the counter:
+    /// they are wherever the partition search happened to descend, in runs whose positions repeat
+    /// with the superblock raster. A stride sharing a factor with that repeat can miss every one
+    /// of them, which is why 3, 6 and 12 lost `TX_4X4` on the 96x80 pattern while the longer 4 and
+    /// 8 kept it - a phase result, not a rate result, and one no per-frame candidate count or
+    /// distortion bound would have caught.
+    ///
+    /// This prints, per interval and with the coverage guarantee off, how many size searches could
+    /// have reached each size and how many of them the stride actually probed. `probed_4` at zero
+    /// with `reachable_4` well above it is the aliasing itself. With coverage on, `probed_4` is
+    /// never zero at any interval, which is what
+    /// `every_sampling_interval_keeps_the_smallest_transform` asserts on the encoder's output.
+    #[test]
+    #[ignore = "measurement sweep, not an assertion"]
+    fn measure_type_gain_phase_aliasing() {
+        let (width, height) = (96_usize, 80_usize);
+        let pixels = test_pattern(width as u32, height as u32);
+        println!("coverage,interval,searches,reachable_4,probed_4,reachable_8,probed_8,selects_tx4x4_at");
+        for coverage in [false, true] {
+            for interval in 1_usize..=16 {
+                let encoder = tile::FrameEncoder::new(&pixels, width, height, 32)
+                    .with_type_gain_interval(interval);
+                let encoder = if coverage {
+                    encoder
+                } else {
+                    encoder.without_size_probe_coverage()
+                };
+                let report = encoder.encode_with_report();
+                let count = |smallest: usize| {
+                    let reachable = report
+                        .size_search_probes
+                        .iter()
+                        .filter(|&&(size, _)| size <= smallest)
+                        .count();
+                    let probed = report
+                        .size_search_probes
+                        .iter()
+                        .filter(|&&(size, probing)| size <= smallest && probing)
+                        .count();
+                    (reachable, probed)
+                };
+                let (reachable4, probed4) = count(4);
+                let (reachable8, probed8) = count(8);
+                let selects = |qindex: u8| {
+                    let encoder = tile::FrameEncoder::new(&pixels, width, height, qindex)
+                        .with_type_gain_interval(interval);
+                    let encoder = if coverage {
+                        encoder
+                    } else {
+                        encoder.without_size_probe_coverage()
+                    };
+                    encoder
+                        .encode_with_report()
+                        .trace
+                        .iter()
+                        .any(|&(size, _)| size == 4)
+                };
+                let selecting: Vec<u8> = [1_u8, 8, 32, 80, 160, 200]
+                    .into_iter()
+                    .filter(|&q| selects(q))
+                    .collect();
+                for q in [1_u8, 8, 32, 80] {
+                    let encoder = tile::FrameEncoder::new(&pixels, width, height, q)
+                        .with_type_gain_interval(interval);
+                    let encoder = if coverage { encoder } else { encoder.without_size_probe_coverage() };
+                    let rep = encoder.encode_with_report();
+                    let chose4: Vec<(usize, usize, bool)> = rep
+                        .size_choices
+                        .iter()
+                        .zip(rep.size_search_probes.iter())
+                        .filter(|((_, _, _, best), _)| *best == 4)
+                        .map(|((r, c, _, _), (_, probing))| (*r, *c, *probing))
+                        .collect();
+                    println!("  q{q} chose4 {chose4:?}");
+                }
+                println!(
+                    "{coverage},{interval},{},{reachable4},{probed4},{reachable8},{probed8},{selecting:?}",
+                    report.size_search_probes.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "temporary"]
+    fn tmp_coverage_cost() {
+        for (width, height) in [(96_usize, 80_usize), (128, 96), (192, 160), (640, 352)] {
+            let mut frames = content_frames(width as u32, height as u32);
+            frames.push(("test_pattern", test_pattern(width as u32, height as u32)));
+            for (name, pixels) in &frames {
+                let mut line = String::new();
+                for interval in [1_usize, 2, 8, 16, 32] {
+                    let mut sizes = std::collections::BTreeSet::new();
+                    for qindex in [1_u8, 8, 32, 80, 160, 200] {
+                        let report = tile::FrameEncoder::new(pixels, width, height, qindex)
+                            .with_type_gain_interval(interval)
+                            .without_size_probe_coverage()
+                            .encode_with_report();
+                        for &(size, _) in &report.trace {
+                            sizes.insert(size);
+                        }
+                    }
+                    line.push_str(&format!(" i{interval}:{sizes:?}"));
+                }
+                println!("{width}x{height},{name},{line}");
+            }
+        }
+    }
+
     #[test]
     #[ignore = "measurement sweep, not an assertion"]
     fn measure_type_gain_sampling_cost() {
