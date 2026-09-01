@@ -282,6 +282,12 @@ fn zvidlib_rdo_defaults() -> (i32, i32) {
 /// `hevc_prediction_filters`, which is why this is the one non-mode-search
 /// encoder group that can show an instruction-set delta.
 ///
+/// Two arms are measured over the same plan: `_reconstruct` codes the residual
+/// exactly, the way the PCM writer does, and `_reconstruct_quantized` round-trips
+/// it through the §8.6.4 forward transform and §8.6.3 quantizer the way the
+/// residual writer does. Only the latter exercises the coded add-and-clip that
+/// a real encode pays for.
+///
 /// The mode-search plan the reconstruction consumes is built in setup, not in
 /// the timed loop — mode search costs an order of magnitude more than
 /// everything else and would swamp the measurement.
@@ -304,14 +310,24 @@ fn reconstruct(criterion: &mut Criterion, size: (u32, u32), group_prefix: &str) 
         config.1,
     );
 
-    let name = format!("{group_prefix}_reconstruct");
-    let isa_workload = IsaWorkload::new(
-        &name,
-        FrameWork::new(1, u64::from(size.0), u64::from(size.1)),
-    );
-    bench_across_isas(criterion, &isa_workload, || {
-        encoder_bench::reconstruct_encoded_picture(&workload, true, true)
-    });
+    // Both residual paths run over the same planned picture. The exact one is
+    // the PCM writer's; the quantized one is the residual writer's, and it is
+    // the path a real encode takes, so it needs its own arm or its §8.6.6
+    // add-and-clip is never measured.
+    for quantized in [false, true] {
+        let name = if quantized {
+            format!("{group_prefix}_reconstruct_quantized")
+        } else {
+            format!("{group_prefix}_reconstruct")
+        };
+        let isa_workload = IsaWorkload::new(
+            &name,
+            FrameWork::new(1, u64::from(size.0), u64::from(size.1)),
+        );
+        bench_across_isas(criterion, &isa_workload, || {
+            encoder_bench::reconstruct_encoded_picture_quantized(&workload, true, true, quantized)
+        });
+    }
 }
 
 /// Whole-picture bitstream writing: parameter sets, slice header, and the

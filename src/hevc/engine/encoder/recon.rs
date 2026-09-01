@@ -436,16 +436,18 @@ fn reconstruct_component(
             } else {
                 vec![0i32; n_tbs * n_tbs]
             };
+            // The §8.6.6 add-and-clip of a transform block is `n_tbs`
+            // straight-line runs over two `i32` operands, so each row goes
+            // through the vector kernel whole rather than one `set_sample` at
+            // a time.
+            let (dst, dst_stride) = pic.plane_mut(plane);
             for row in 0..n_tbs {
-                for col in 0..n_tbs {
-                    let i = row * n_tbs + col;
-                    pic.set_sample(
-                        plane,
-                        x + bx + col,
-                        y + by + row,
-                        clip1(prediction[i] + coded[i], BIT_DEPTH),
-                    );
-                }
+                let start = (y + by + row) * dst_stride + x + bx;
+                recon_simd::add_clip_row(
+                    &mut dst[start..start + n_tbs],
+                    &prediction[row * n_tbs..(row + 1) * n_tbs],
+                    &coded[row * n_tbs..(row + 1) * n_tbs],
+                );
             }
         }
     }
