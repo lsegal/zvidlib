@@ -45,7 +45,7 @@
 use crate::hevc::engine::binarization::PartMode;
 use crate::hevc::engine::deblock::{DeblockCu, DeblockCuDesc, DeblockCuParams, NoFilterMap};
 use crate::hevc::engine::encoder::rdo::PictureDecision;
-use crate::hevc::engine::encoder::recon_simd::{self, EdgeStats};
+use crate::hevc::engine::encoder::recon_simd::{self, BandStats, EdgeStats};
 use crate::hevc::engine::encoder::transform::{
     ForwardBlockParams, chroma_qp, luma_qp, transform_and_quantize,
 };
@@ -778,18 +778,15 @@ fn band_stats(
     let (x0, y0, x1, y1) = rect;
     let (pw, _) = pic.plane_dims(plane);
     let samples = pic.plane(plane);
-    let band_shift = i32::from(BIT_DEPTH) - 5;
-    let mut sums = [0i64; 32];
-    let mut counts = [0i64; 32];
+    // The kernel's band shift is fixed to this module's 8-bit geometry.
+    debug_assert_eq!(BIT_DEPTH, 8, "band classification assumes 8-bit samples");
+    let mut stats = BandStats::default();
     for y in y0..y1 {
-        for x in x0..x1 {
-            let recon = samples[y * pw + x];
-            let band = (recon.clamp(0, 255) >> band_shift) as usize;
-            sums[band] += i64::from(source[y * src_stride + x]) - i64::from(recon);
-            counts[band] += 1;
-        }
+        let recon = &samples[y * pw + x0..y * pw + x1];
+        let src = &source[y * src_stride + x0..y * src_stride + x1];
+        recon_simd::band_offset_row(recon, src, &mut stats);
     }
-    (sums, counts)
+    (stats.sums, stats.counts)
 }
 
 /// The §7.4.9.3 offsets the four consecutive bands starting at

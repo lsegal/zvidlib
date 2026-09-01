@@ -263,12 +263,143 @@ pub(crate) fn edge_offset_row_scalar(
     }
 }
 
+/// Per-band error sums and sample counts for one run of the §8.7.3.2
+/// band-offset classification, indexed by the band index
+/// `sample >> (bitDepth − 5)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BandStats {
+    /// Summed `source − reconstruction` error per band.
+    pub sums: [i64; 32],
+    /// Number of samples per band.
+    pub counts: [i64; 32],
+}
+
+impl Default for BandStats {
+    fn default() -> Self {
+        Self {
+            sums: [0; 32],
+            counts: [0; 32],
+        }
+    }
+}
+
+/// §8.7.3.2 `bandShift`: the reconstruction's top five bits index the 32 bands,
+/// which at this module's fixed 8-bit geometry is a shift of three.
+const BAND_SHIFT: i32 = 3;
+
+/// How many samples the vectorized band kernels classify into the staging
+/// buffers before scattering them. Two AVX2 vectors' worth, so the staged run
+/// stays in L1 and the fixed cost of entering and leaving the loop is amortized
+/// over a useful number of samples.
+const BAND_CHUNK: usize = 16;
+
+/// Classifies one horizontal run of reconstructed samples into §8.7.3.2 bands
+/// and accumulates the source-versus-reconstruction error of each into `stats`.
+///
+/// `here` is the run of reconstructed samples and `src` the co-located source
+/// samples. Every sample lands in exactly one of the 32 bands, so unlike
+/// [`edge_offset_row`] nothing is dropped and the counts sum to the run length.
+///
+/// The band index clamps the reconstruction into the 8-bit range before
+/// shifting, but the error is taken against the unclamped sample, exactly as
+/// the scalar reference does.
+///
+/// # Panics
+/// Panics unless both slices have the same length.
+pub(crate) fn band_offset_row(here: &[i32], src: &[u8], stats: &mut BandStats) {
+    assert_eq!(here.len(), src.len(), "run and source differ");
+    match isa_code() {
+        #[cfg(target_arch = "x86_64")]
+        ISA_AVX2 => {
+            // SAFETY: the lengths agree, and this arm is only reachable with
+            // AVX2 available.
+            unsafe { x86::band_offset_row_avx2(here, src, stats) }
+        }
+        #[cfg(target_arch = "x86_64")]
+        ISA_SSE41 => {
+            // SAFETY: as above, with SSE4.1 detected.
+            unsafe { x86::band_offset_row_sse41(here, src, stats) }
+        }
+        #[cfg(target_arch = "aarch64")]
+        ISA_NEON => {
+            // SAFETY: the lengths agree, and NEON is part of the aarch64
+            // baseline this code is compiled for.
+            unsafe { neon::band_offset_row(here, src, stats) }
+        }
+        _ => band_offset_row_scalar(here, src, stats),
+    }
+}
+
+/// The portable reference for [`band_offset_row`].
+pub(crate) fn band_offset_row_scalar(here: &[i32], src: &[u8], stats: &mut BandStats) {
+    for i in 0..here.len() {
+        let recon = here[i];
+        let band = (recon.clamp(0, BIT_DEPTH_MAX) >> BAND_SHIFT) as usize;
+        stats.sums[band] += i64::from(src[i]) - i64::from(recon);
+        stats.counts[band] += 1;
+    }
+}
+
+/// Scatters a staged run of band indices and errors into `stats`.
+///
+/// This is the half of the band search that stays scalar on every instruction
+/// set. A band index is a 32-way scatter, which none of the vector extensions
+/// this module targets can express — SSE4.1, AVX2 and NEON have no scatter, and
+/// masking 32 accumulators per vector would cost far more than the eight
+/// dependent read-modify-writes it replaces. What the vector path buys is the
+/// *classification*: the clamp, the shift and the widened subtraction that
+/// produce `bands` and `errors` are done a vector at a time, leaving this loop
+/// with nothing but the two accumulations.
+///
+/// The accumulators are alternated between two halves of a doubled table so
+/// that a run of samples landing in the same band does not serialize on
+/// store-to-load forwarding; the halves are folded together by the caller.
+#[inline]
+fn scatter_bands(
+    bands: &[u32; BAND_CHUNK],
+    errors: &[i32; BAND_CHUNK],
+    n: usize,
+    tables: &mut BandTables,
+) {
+    for i in 0..n {
+        let slot = (bands[i] as usize) | ((i & 1) << 5);
+        tables.sums[slot] += errors[i] as i64;
+        tables.counts[slot] += 1;
+    }
+}
+
+/// The doubled accumulator table [`scatter_bands`] alternates between.
+struct BandTables {
+    sums: [i64; 64],
+    counts: [i64; 64],
+}
+
+impl BandTables {
+    fn new() -> Self {
+        Self {
+            sums: [0; 64],
+            counts: [0; 64],
+        }
+    }
+
+    /// Folds both halves of the doubled table into `stats`.
+    fn fold_into(&self, stats: &mut BandStats) {
+        for band in 0..32 {
+            stats.sums[band] += self.sums[band] + self.sums[band + 32];
+            stats.counts[band] += self.counts[band] + self.counts[band + 32];
+        }
+    }
+}
+
 /// The `edgeIdx` values that map to categories 1, 2, 3 and 4, in that order.
 const EDGE_IDX_BY_CATEGORY: [i32; 4] = [0, 1, 3, 4];
 
 #[cfg(target_arch = "x86_64")]
 mod x86 {
-    use super::{BIT_DEPTH_MAX, EDGE_IDX_BY_CATEGORY, EdgeStats};
+    use super::{
+        BAND_CHUNK, BAND_SHIFT, BIT_DEPTH_MAX, BandStats, BandTables, EDGE_IDX_BY_CATEGORY,
+        EdgeStats,
+    };
     use std::arch::x86_64::*;
 
     /// Sum of the four `i32` lanes.
@@ -470,11 +601,77 @@ mod x86 {
             super::edge_offset_row_scalar(&here[i..], &a[i..], &b[i..], &src[i..], stats);
         }
     }
+    /// Classifies and stages `LANES`-wide chunks of a run into band indices and
+    /// errors, scattering each staged chunk before refilling the buffers.
+    #[target_feature(enable = "sse4.1")]
+    pub(super) unsafe fn band_offset_row_sse41(here: &[i32], src: &[u8], stats: &mut BandStats) {
+        unsafe {
+            let n = here.len();
+            let zero = _mm_setzero_si128();
+            let max = _mm_set1_epi32(BIT_DEPTH_MAX);
+            let mut tables = BandTables::new();
+            let mut bands = [0u32; BAND_CHUNK];
+            let mut errors = [0i32; BAND_CHUNK];
+            let mut i = 0;
+            while i + 4 <= n {
+                let take = BAND_CHUNK.min((n - i) & !3);
+                let mut k = 0;
+                while k < take {
+                    let vh = _mm_loadu_si128(here.as_ptr().add(i + k).cast());
+                    let clamped = _mm_min_epi32(_mm_max_epi32(vh, zero), max);
+                    let band = _mm_srli_epi32::<BAND_SHIFT>(clamped);
+                    let error = _mm_sub_epi32(load4_u8_epi32(src.as_ptr().add(i + k)), vh);
+                    _mm_storeu_si128(bands.as_mut_ptr().add(k).cast(), band);
+                    _mm_storeu_si128(errors.as_mut_ptr().add(k).cast(), error);
+                    k += 4;
+                }
+                super::scatter_bands(&bands, &errors, take, &mut tables);
+                i += take;
+            }
+            tables.fold_into(stats);
+            super::band_offset_row_scalar(&here[i..], &src[i..], stats);
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn band_offset_row_avx2(here: &[i32], src: &[u8], stats: &mut BandStats) {
+        unsafe {
+            let n = here.len();
+            let zero = _mm256_setzero_si256();
+            let max = _mm256_set1_epi32(BIT_DEPTH_MAX);
+            let mut tables = BandTables::new();
+            let mut bands = [0u32; BAND_CHUNK];
+            let mut errors = [0i32; BAND_CHUNK];
+            let mut i = 0;
+            while i + 8 <= n {
+                let take = BAND_CHUNK.min((n - i) & !7);
+                let mut k = 0;
+                while k < take {
+                    let vh = _mm256_loadu_si256(here.as_ptr().add(i + k).cast());
+                    let clamped = _mm256_min_epi32(_mm256_max_epi32(vh, zero), max);
+                    let band = _mm256_srli_epi32::<BAND_SHIFT>(clamped);
+                    let packed = src.as_ptr().add(i + k).cast::<u64>().read_unaligned();
+                    let vsrc = _mm256_cvtepu8_epi32(_mm_cvtsi64_si128(packed as i64));
+                    let error = _mm256_sub_epi32(vsrc, vh);
+                    _mm256_storeu_si256(bands.as_mut_ptr().add(k).cast(), band);
+                    _mm256_storeu_si256(errors.as_mut_ptr().add(k).cast(), error);
+                    k += 8;
+                }
+                super::scatter_bands(&bands, &errors, take, &mut tables);
+                i += take;
+            }
+            tables.fold_into(stats);
+            super::band_offset_row_scalar(&here[i..], &src[i..], stats);
+        }
+    }
 }
 
 #[cfg(target_arch = "aarch64")]
 mod neon {
-    use super::{BIT_DEPTH_MAX, EDGE_IDX_BY_CATEGORY, EdgeStats};
+    use super::{
+        BAND_CHUNK, BAND_SHIFT, BIT_DEPTH_MAX, BandStats, BandTables, EDGE_IDX_BY_CATEGORY,
+        EdgeStats,
+    };
     use std::arch::aarch64::*;
 
     #[target_feature(enable = "neon")]
@@ -557,6 +754,38 @@ mod neon {
                 stats.counts[c + 1] += i64::from(vaddvq_s32(counts[c]));
             }
             super::edge_offset_row_scalar(&here[i..], &a[i..], &b[i..], &src[i..], stats);
+        }
+    }
+    #[target_feature(enable = "neon")]
+    pub(super) unsafe fn band_offset_row(here: &[i32], src: &[u8], stats: &mut BandStats) {
+        unsafe {
+            let n = here.len();
+            let zero = vdupq_n_s32(0);
+            let max = vdupq_n_s32(BIT_DEPTH_MAX);
+            let mut tables = BandTables::new();
+            let mut bands = [0u32; BAND_CHUNK];
+            let mut errors = [0i32; BAND_CHUNK];
+            let mut i = 0;
+            while i + 4 <= n {
+                let take = BAND_CHUNK.min((n - i) & !3);
+                let mut k = 0;
+                while k < take {
+                    let vh = vld1q_s32(here.as_ptr().add(i + k));
+                    let clamped = vminq_s32(vmaxq_s32(vh, zero), max);
+                    let band = vreinterpretq_u32_s32(vshrq_n_s32::<BAND_SHIFT>(clamped));
+                    let packed = src.as_ptr().add(i + k).cast::<u32>().read_unaligned();
+                    let bytes = vreinterpret_u8_u32(vdup_n_u32(packed));
+                    let vsrc = vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(vmovl_u8(bytes))));
+                    let error = vsubq_s32(vsrc, vh);
+                    vst1q_u32(bands.as_mut_ptr().add(k), band);
+                    vst1q_s32(errors.as_mut_ptr().add(k), error);
+                    k += 4;
+                }
+                super::scatter_bands(&bands, &errors, take, &mut tables);
+                i += take;
+            }
+            tables.fold_into(stats);
+            super::band_offset_row_scalar(&here[i..], &src[i..], stats);
         }
     }
 }
@@ -660,6 +889,87 @@ mod tests {
     }
 
     #[test]
+    fn the_band_offset_search_matches_the_scalar_reference_on_every_instruction_set() {
+        let _guard = simd::test_lock();
+        for &n in RUNS {
+            // A reconstruction spanning the full 8-bit range so every one of
+            // the 32 bands is reachable, plus samples outside it so the
+            // kernel's clamp is exercised alongside the unclamped error.
+            let mut here = samples(0x7777_8888_9999_aaaa, n);
+            for (i, h) in here.iter_mut().enumerate() {
+                match i % 8 {
+                    0 => *h = -7,
+                    1 => *h = 262,
+                    _ => {}
+                }
+            }
+            let src = bytes(0xc0ff_ee00_1234_5678, n);
+            let mut expected = BandStats::default();
+            band_offset_row_scalar(&here, &src, &mut expected);
+            assert_eq!(
+                expected.counts.iter().sum::<i64>(),
+                n as i64,
+                "every sample lands in exactly one band"
+            );
+            for isa in simd::available() {
+                simd::set_override(Some(isa));
+                let mut got = BandStats::default();
+                band_offset_row(&here, &src, &mut got);
+                assert_eq!(got, expected, "{} band search over {n} samples", isa.name());
+            }
+        }
+        simd::set_override(None);
+    }
+
+    #[test]
+    fn the_band_search_accumulates_into_existing_stats() {
+        // `band_stats` gathers a whole CTB by calling the kernel once per row,
+        // so a second call has to add to the first rather than replace it.
+        let _guard = simd::test_lock();
+        let here = samples(0x3131_4141_5151_6161, 37);
+        let src = bytes(0x2020_3030_4040_5050, 37);
+        let mut expected = BandStats::default();
+        band_offset_row_scalar(&here, &src, &mut expected);
+        band_offset_row_scalar(&here, &src, &mut expected);
+        for isa in simd::available() {
+            simd::set_override(Some(isa));
+            let mut got = BandStats::default();
+            band_offset_row(&here, &src, &mut got);
+            band_offset_row(&here, &src, &mut got);
+            assert_eq!(got, expected, "{}", isa.name());
+        }
+        simd::set_override(None);
+    }
+
+    #[test]
+    fn every_band_is_reachable_and_counted_once() {
+        // One sample per band, at the low edge of each, so the §8.7.3.2
+        // `sample >> (bitDepth - 5)` mapping is exercised end to end.
+        let here: Vec<i32> = (0..32).map(|b| b * 8).collect();
+        let src = vec![0u8; 32];
+        let mut stats = BandStats::default();
+        band_offset_row_scalar(&here, &src, &mut stats);
+        assert_eq!(stats.counts, [1i64; 32]);
+        let expected: Vec<i64> = (0..32).map(|b| -(b as i64) * 8).collect();
+        assert_eq!(stats.sums.to_vec(), expected);
+    }
+
+    #[test]
+    fn a_sample_outside_the_8_bit_range_still_lands_in_an_end_band() {
+        // The reconstruction is clipped before it reaches the search, but the
+        // kernel clamps anyway so an out-of-range sample cannot index past the
+        // 32-band table. The error stays unclamped, matching the reference.
+        let here = [-9i32, 300];
+        let src = [4u8, 4];
+        let mut stats = BandStats::default();
+        band_offset_row_scalar(&here, &src, &mut stats);
+        assert_eq!(stats.counts[0], 1);
+        assert_eq!(stats.counts[31], 1);
+        assert_eq!(stats.sums[0], 13);
+        assert_eq!(stats.sums[31], -296);
+    }
+
+    #[test]
     fn every_edge_category_is_reachable_and_counted_once() {
         // One sample per `edgeIdx` 0..=4, in order, so every arm of the
         // §8.7.3.2 mapping is exercised including the dropped category 0.
@@ -708,27 +1018,35 @@ mod tests {
             reconstruct_row_scalar(&mut recon_expected, &src, &pred);
             let mut sao_expected = EdgeStats::default();
             edge_offset_row_scalar(&here, &a, &b, &src, &mut sao_expected);
+            let mut band_expected = BandStats::default();
+            band_offset_row_scalar(&here, &src, &mut band_expected);
             if is_x86_feature_detected!("sse4.1") {
                 let mut got = vec![0i32; n];
                 let mut stats = EdgeStats::default();
+                let mut bands = BandStats::default();
                 // SAFETY: the feature was just detected and every slice is `n` long.
                 unsafe {
                     x86::reconstruct_row_sse41(&mut got, &src, &pred);
                     x86::edge_offset_row_sse41(&here, &a, &b, &src, &mut stats);
+                    x86::band_offset_row_sse41(&here, &src, &mut bands);
                 }
                 assert_eq!(got, recon_expected, "SSE4.1 reconstruction of {n}");
                 assert_eq!(stats, sao_expected, "SSE4.1 edge search over {n}");
+                assert_eq!(bands, band_expected, "SSE4.1 band search over {n}");
             }
             if is_x86_feature_detected!("avx2") {
                 let mut got = vec![0i32; n];
                 let mut stats = EdgeStats::default();
+                let mut bands = BandStats::default();
                 // SAFETY: the feature was just detected and every slice is `n` long.
                 unsafe {
                     x86::reconstruct_row_avx2(&mut got, &src, &pred);
                     x86::edge_offset_row_avx2(&here, &a, &b, &src, &mut stats);
+                    x86::band_offset_row_avx2(&here, &src, &mut bands);
                 }
                 assert_eq!(got, recon_expected, "AVX2 reconstruction of {n}");
                 assert_eq!(stats, sao_expected, "AVX2 edge search over {n}");
+                assert_eq!(bands, band_expected, "AVX2 band search over {n}");
             }
         }
     }
@@ -738,6 +1056,13 @@ mod tests {
     fn a_prediction_row_of_the_wrong_length_is_rejected() {
         let mut dst = [0i32; 8];
         reconstruct_row(&mut dst, &[0u8; 8], &[0u8; 7]);
+    }
+
+    #[test]
+    #[should_panic(expected = "run and source differ")]
+    fn a_band_source_run_of_the_wrong_length_is_rejected() {
+        let mut stats = BandStats::default();
+        band_offset_row(&[0i32; 8], &[0u8; 7], &mut stats);
     }
 
     #[test]
