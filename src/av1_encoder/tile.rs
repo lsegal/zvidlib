@@ -109,11 +109,24 @@ const TYPE_GAIN_PROBES: usize = 1;
 ///
 /// So the interval is chosen on coverage and cost instead. Coverage binds it: the per-size
 /// correction is what makes `TX_4X4` selectable at all, and on the 96x80 pattern - few enough
-/// coding blocks that a long interval never probes a trial carrying the smallest size - `16`
-/// loses the size outright, as do `3`, `6` and `12`, which alias against the block raster the
-/// sample walks in. `8` is the largest interval that keeps it, which
+/// coding blocks that the size is won at only two of them - `16` loses the size outright, as do
+/// `3`, `6` and `12`. `8` is the largest interval that keeps it, which
 /// `the_type_gain_sampling_interval_is_the_longest_that_keeps_tx_4x4` and
-/// `non_lossless_frames_round_trip_within_a_distortion_bound` both hold it to. Within that bound
+/// `non_lossless_frames_round_trip_within_a_distortion_bound` both hold it to.
+///
+/// That column is a *phase* rather than a rate, and #323 measured out which one.
+/// `measure_type_gain_phase_aliasing` shows the per-size accumulator is populated at every
+/// interval - 30 of the frame's 37 size searches can reach `TX_4X4` and every interval from `1`
+/// to `16` probes some of them - so what decides the size is which coding blocks are sampled, not
+/// whether the size is. A trial that probed is corrected by its own measurement at full strength
+/// while every other trial's is shrunk to [`TYPE_GAIN_TRUST`] sixteenths, so `TX_4X4` is
+/// selectable only where the block's own search probed, and on this frame that is the two blocks
+/// at MI `(0, 12)` and `(16, 12)`: `4` and `8` sample the first, `1` and `2` sample both, and
+/// `3`, `6` and `12` sample neither. Probing every size search that could reach the smallest
+/// transform would remove the dependence and is measured in the same sweep at 28-70% more
+/// transform-type candidates for up to +12.4% worse rate-distortion, so the sampler stays as it
+/// is and `the_smallest_transform_is_selected_at_every_sampling_interval` holds the size across
+/// nine frame-and-size pairs where no interval from `2` to `16` loses it. Within that bound
 /// it takes the whole available saving: 174,638 transform-type candidates against `2`'s 203,477
 /// and the exhaustive search's 920,503 - 14% fewer than the previous value for 6% less encode
 /// time, and comfortably inside the four-fold reduction
