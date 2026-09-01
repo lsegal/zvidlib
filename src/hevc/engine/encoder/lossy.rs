@@ -22,17 +22,23 @@
 //!
 //! ## What is coded
 //!
-//! Every coding unit is intra DC (`prev_intra_luma_pred_flag == 1`,
-//! `mpm_idx == 1` — with every neighbour also DC, the §8.4.2 candidate list is
-//! `{ Planar, DC, Angular26 }`) with `intra_chroma_pred_mode == 4` (derived
-//! from luma). Mode search over the 35 intra directions is a separate concern
-//! from having a residual path at all, and belongs with the RDO work in
-//! [`crate::hevc::engine::encoder::rdo`].
+//! Every coding unit carries the intra luma mode
+//! [`crate::hevc::engine::encoder::rdo::decide_intra_luma_mode`] picked for it
+//! out of all 35 Table 8-1 directions, searched against the same reference
+//! samples the block is then coded from, and signalled per §7.3.8.5: a
+//! `prev_intra_luma_pred_flag == 1` plus `mpm_idx` when the mode is in the
+//! §8.4.2 candidate list, and `rem_intra_luma_pred_mode` otherwise. The
+//! candidate list is derived from the left coding unit's mode, since the above
+//! neighbour of a CU that fills its CTB always lies in the CTB row above and
+//! §8.4.2 reduces it to `INTRA_DC`. Chroma stays at
+//! `intra_chroma_pred_mode == 4`, so it is predicted with the luma mode too.
 //!
 //! In-loop filters are neutralized exactly as the PCM writer does it: SAO off
 //! in the SPS and deblocking disabled in the PPS, so the reconstruction below
-//! is the decoder's without a filter pass.
+//! is the decoder's without a filter pass. Enabling them is a separate
+//! decision from mode search and is deliberately not made here.
 
+use crate::hevc::engine::binarization::{derive_intra_pred_mode_c, intra_luma_cand_mode_list};
 use crate::hevc::engine::cabac::init_type;
 use crate::hevc::engine::ctx_init::SliceContexts;
 use crate::hevc::engine::encoder::bitwriter::BitWriter;
@@ -40,6 +46,10 @@ use crate::hevc::engine::encoder::cabac::CabacEncoder;
 use crate::hevc::engine::encoder::nal::{annexb, nal_unit};
 use crate::hevc::engine::encoder::pcm::{
     PcmEncodeError, level_idc_for, write_pps, write_sps, write_vps,
+};
+use crate::hevc::engine::encoder::rdo::{
+    DistortionBackend, intra_mode_bit_cost, lambda_q8, residual_rate_bits,
+    shortlist_intra_luma_modes,
 };
 use crate::hevc::engine::encoder::recon::ReconstructedPicture;
 use crate::hevc::engine::encoder::residual::{
@@ -49,8 +59,8 @@ use crate::hevc::engine::encoder::transform::{
     ForwardBlockParams, chroma_qp, luma_qp, transform_and_quantize,
 };
 use crate::hevc::engine::intra_pred::{
-    Component as IpComponent, IntraPredParams, MarkedReferenceSamples,
-    intra_predict_with_substitution,
+    Component as IpComponent, IntraPredParams, MarkedReferenceSamples, ReferenceSamples,
+    intra_predict, substitute_reference_samples,
 };
 use crate::hevc::engine::picture::clip1;
 use crate::hevc::engine::scan::ScanIdx;
@@ -66,10 +76,54 @@ const CTB: usize = 1 << CTB_LOG2;
 const BIT_DEPTH: u8 = 8;
 /// `ChromaArrayType` — 4:2:0, the only format this writer emits.
 const CHROMA_ARRAY_TYPE: u8 = 1;
-/// `INTRA_DC` (Table 8-1 mode 1) — the only mode this writer codes.
+/// `INTRA_DC` (Table 8-1 mode 1) — the §8.4.2 substitute for an unavailable
+/// neighbour's mode.
 const INTRA_DC: u8 = 1;
+/// How many of the rough-mode-decision's ranked modes are re-scored on their
+/// actual quantized reconstruction. Four covers the planar / DC / horizontal /
+/// vertical spread the rough pass confuses most often without paying for 35
+/// transforms per coding unit.
+const MODE_SHORTLIST: usize = 4;
+/// Table 9-46 value 4 — `intra_chroma_pred_mode` deriving chroma from the
+/// coding unit's own luma mode.
+const CHROMA_MODE_DERIVED: u8 = 4;
 /// The valid `SliceQpY` range at 8-bit depth (`QpBdOffsetY == 0`).
 const QP_RANGE: core::ops::RangeInclusive<i32> = 0..=51;
+
+/// Which intra modes the writer is allowed to code, and what the decision that
+/// picks between them optimizes — the operating point.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ModeSearch {
+    /// The fixed-QP operating point: [`shortlist_intra_luma_modes`] over all
+    /// 35 luma modes, re-scored on the quantized reconstruction against the
+    /// mode's own signalling only, and the §8.4.3 chroma mode picked the same
+    /// way. With no bitrate to hit, the writer's job at a given QP is the
+    /// closest picture, so the residual's own rate is left out of the cost.
+    Rdo,
+    /// The rate-constrained operating point: the same search, with the
+    /// residual's estimated rate ([`residual_rate_bits`]) added to each
+    /// candidate's rate term, so the decision minimizes the full
+    /// `D + lambda * R` rather than distortion against signalling alone.
+    ///
+    /// This is what a rate-controlled encoder needs; the writer has no
+    /// bitrate target to hit yet, so nothing outside the tests that measure
+    /// the two operating points against each other selects it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    RateDistortion,
+    /// Every coding unit pinned to `INTRA_DC` with chroma derived from it —
+    /// the writer's behaviour before the mode search, kept as the baseline the
+    /// search is measured against.
+    #[cfg(test)]
+    DcOnly,
+}
+
+impl ModeSearch {
+    /// Whether the second-pass cost charges each candidate for the bins its
+    /// own residual would code, on top of the mode signalling.
+    fn charges_residual_rate(self) -> bool {
+        self == ModeSearch::RateDistortion
+    }
+}
 
 /// One colour component's geometry inside the picture being coded.
 #[derive(Clone, Copy)]
@@ -99,6 +153,45 @@ pub fn encode_idr_residual_au(
     height: usize,
     qp: i32,
 ) -> Result<(Vec<u8>, ReconstructedPicture), PcmEncodeError> {
+    encode_idr_residual_au_at(y, cb, cr, width, height, qp, ModeSearch::Rdo)
+}
+
+/// [`encode_idr_residual_au`] at the rate-constrained operating point: the
+/// intra decision minimizes the full `D + lambda * R`, residual bits included,
+/// so the same QP buys fewer bits and slightly more distortion than the
+/// fixed-QP writer above — a better trade at equal rate, and the one a bitrate
+/// target needs.
+///
+/// Nothing outside the tests that measure the two operating points against
+/// each other selects this yet: with no bitrate to hit there is nothing for
+/// the saved bits to be spent on, and the public factory's job at a given QP
+/// stays the closest picture.
+///
+/// # Errors
+/// As [`encode_idr_residual_au`].
+#[cfg(test)]
+pub(crate) fn encode_idr_residual_au_rate_constrained(
+    y: &[u8],
+    cb: &[u8],
+    cr: &[u8],
+    width: usize,
+    height: usize,
+    qp: i32,
+) -> Result<(Vec<u8>, ReconstructedPicture), PcmEncodeError> {
+    encode_idr_residual_au_at(y, cb, cr, width, height, qp, ModeSearch::RateDistortion)
+}
+
+/// The body both operating points share: validate the request, run the coding
+/// loop under `search`, and wrap the slice in the parameter sets.
+fn encode_idr_residual_au_at(
+    y: &[u8],
+    cb: &[u8],
+    cr: &[u8],
+    width: usize,
+    height: usize,
+    qp: i32,
+    search: ModeSearch,
+) -> Result<(Vec<u8>, ReconstructedPicture), PcmEncodeError> {
     if width == 0 || height == 0 || width % CTB != 0 || height % CTB != 0 {
         return Err(PcmEncodeError::BadDimensions { width, height });
     }
@@ -120,7 +213,7 @@ pub fn encode_idr_residual_au(
     check("cb", cb, width * height / 4)?;
     check("cr", cr, width * height / 4)?;
 
-    let (rbsp, recon) = write_idr_residual_slice(y, cb, cr, width, height, qp);
+    let (rbsp, recon, _modes) = write_idr_residual_slice(y, cb, cr, width, height, qp, search);
     let level_idc = level_idc_for(width * height);
     let units = vec![
         nal_unit(32, 0, 0, &write_vps(level_idc)), // VPS_NUT
@@ -132,8 +225,9 @@ pub fn encode_idr_residual_au(
 }
 
 /// §7.3.6.1 + §7.3.8.1 — the picture's single I slice segment, every CTB one
-/// residual-coded intra coding unit. Returns the slice RBSP and the picture
-/// reconstructed alongside it.
+/// residual-coded intra coding unit. Returns the slice RBSP, the picture
+/// reconstructed alongside it, and the luma intra mode coded for each CTB in
+/// coding order.
 fn write_idr_residual_slice(
     y: &[u8],
     cb: &[u8],
@@ -141,7 +235,8 @@ fn write_idr_residual_slice(
     width: usize,
     height: usize,
     qp: i32,
-) -> (Vec<u8>, ReconstructedPicture) {
+    search: ModeSearch,
+) -> (Vec<u8>, ReconstructedPicture, Vec<u8>) {
     let mut w = BitWriter::new();
     // ---- slice_segment_header() ----
     w.put_bit(1); // first_slice_segment_in_pic_flag
@@ -172,64 +267,88 @@ fn write_idr_residual_slice(
     let ctbs_x = width / CTB;
     let ctbs_y = height / CTB;
     let total = ctbs_x * ctbs_y;
+    // `IntraPredModeY` of the coding unit coded immediately before this one,
+    // which is the left neighbour whenever there is one.
+    let mut left_mode = INTRA_DC;
+    let mut modes = Vec::with_capacity(total);
     for addr in 0..total {
         let x0 = (addr % ctbs_x) * CTB;
         let y0 = (addr / ctbs_x) * CTB;
 
-        // ---- coding_unit(): PART_2Nx2N, pcm_flag == 0, intra DC ----
+        // §8.4.2 step 2: candIntraPredModeB is INTRA_DC for every coding unit
+        // here, because one CU fills the CTB and so the above neighbour always
+        // lies in the CTB row above. candIntraPredModeA is the left CU's mode,
+        // reduced to INTRA_DC at the left picture edge where it is unavailable.
+        let cand_a = if x0 > 0 { left_mode } else { INTRA_DC };
+        let candidates = intra_luma_cand_mode_list(cand_a, INTRA_DC);
+
+        // The mode search reads the same partially reconstructed neighbours
+        // the block is then coded from, so the winning mode's prediction is
+        // exactly the one the reconstruction below is built on.
+        let luma_plane = Plane {
+            source: y,
+            width,
+            height,
+        };
+        let (mode, luma_coded) = decide_luma_mode(
+            luma_plane, &recon.y, x0, y0, qp, qp_luma, candidates, search,
+        );
+        left_mode = mode;
+        modes.push(mode);
+
+        // ---- coding_unit(): PART_2Nx2N, pcm_flag == 0 ----
         cabac.encode_decision(&mut w, &mut ctxs.part_mode[0], 1);
         cabac.encode_terminate(&mut w, 0); // pcm_flag = 0
-        // prev_intra_luma_pred_flag = 1 with mpm_idx = 1: with every
-        // neighbour DC the §8.4.2 candidate list is { Planar, DC, 26 }.
-        cabac.encode_decision(&mut w, &mut ctxs.prev_intra_luma_pred_flag[0], 1);
-        cabac.encode_bypass(&mut w, 1); // mpm_idx, TR(cMax 2): "10" == 1
-        cabac.encode_bypass(&mut w, 0);
-        // intra_chroma_pred_mode = 4 (derived from luma): a single 0 bin.
-        cabac.encode_decision(&mut w, &mut ctxs.intra_chroma_pred_mode[0], 0);
+        write_luma_intra_mode(&mut w, &mut cabac, &mut ctxs, mode, candidates);
+
+        let (cx, cy) = (x0 / 2, y0 / 2);
+        let chroma_planes = [
+            (
+                Plane {
+                    source: cb,
+                    width: cw,
+                    height: ch,
+                },
+                TfComponent::Cb,
+            ),
+            (
+                Plane {
+                    source: cr,
+                    width: cw,
+                    height: ch,
+                },
+                TfComponent::Cr,
+            ),
+        ];
+        let (signalled_chroma, chroma_coded) = decide_chroma_mode(
+            chroma_planes,
+            [&recon.cb, &recon.cr],
+            cx,
+            cy,
+            qp,
+            qp_chroma,
+            mode,
+            search,
+        );
+        // §9.3.3.8 / Table 9-46: value 4 (chroma derived from luma) is the
+        // single context-coded 0 bin; 0..=3 is a 1 bin plus two FL bypass bins.
+        if signalled_chroma == CHROMA_MODE_DERIVED {
+            cabac.encode_decision(&mut w, &mut ctxs.intra_chroma_pred_mode[0], 0);
+        } else {
+            cabac.encode_decision(&mut w, &mut ctxs.intra_chroma_pred_mode[0], 1);
+            cabac.encode_bypass(&mut w, (signalled_chroma >> 1) & 1);
+            cabac.encode_bypass(&mut w, signalled_chroma & 1);
+        }
 
         // ---- transform_tree(): split_transform_flag is absent because
         // max_transform_hierarchy_depth_intra == 0, so MaxTrafoDepth == 0
         // and the flag is inferred 0 (one 16x16 luma TB, two 8x8 chroma).
-        let luma = code_block(
-            Plane {
-                source: y,
-                width,
-                height,
-            },
-            &mut recon.y,
-            x0,
-            y0,
-            CTB,
-            qp_luma,
-            TfComponent::Luma,
-        );
-        let (cx, cy) = (x0 / 2, y0 / 2);
-        let chroma_cb = code_block(
-            Plane {
-                source: cb,
-                width: cw,
-                height: ch,
-            },
-            &mut recon.cb,
-            cx,
-            cy,
-            CTB / 2,
-            qp_chroma,
-            TfComponent::Cb,
-        );
-        let chroma_cr = code_block(
-            Plane {
-                source: cr,
-                width: cw,
-                height: ch,
-            },
-            &mut recon.cr,
-            cx,
-            cy,
-            CTB / 2,
-            qp_chroma,
-            TfComponent::Cr,
-        );
+        write_back(&mut recon.y, width, x0, y0, CTB, &luma_coded.samples);
+        let luma = luma_coded.levels;
+        let [coded_cb, coded_cr] = chroma_coded;
+        write_back(&mut recon.cb, cw, cx, cy, CTB / 2, &coded_cb.samples);
+        write_back(&mut recon.cr, cw, cx, cy, CTB / 2, &coded_cr.samples);
+        let (chroma_cb, chroma_cr) = (coded_cb.levels, coded_cr.levels);
 
         // §7.3.8.8 order: cbf_cb, cbf_cr (ctxInc = trafoDepth = 0), then
         // cbf_luma (ctxInc = 1 at trafoDepth 0).
@@ -272,27 +391,216 @@ fn write_idr_residual_slice(
     }
     // The final terminate-1 flush wrote the rbsp_stop_one_bit.
     w.align_zero();
-    (w.finish(), recon)
+    (w.finish(), recon, modes)
 }
 
-/// Code one transform block: predict from the reconstruction so far, transform
-/// and quantize the residual, write the reconstruction back, and return the
-/// quantized levels the caller will code.
+/// Pick the luma intra mode for one coding unit and return it with the block
+/// it codes to.
+///
+/// Two passes. [`shortlist_intra_luma_modes`] ranks all 35 Table 8-1 modes on
+/// the prediction's SATD, which costs no transform; the shortlist is then
+/// re-scored on what each mode actually costs after quantization: the
+/// reconstruction's squared error against the source, traded against the rate
+/// the operating point charges. At [`ModeSearch::Rdo`] that rate is the mode's
+/// own §7.3.8.5 signalling only — this writer has no bitrate target, so its
+/// job at a given QP is the closest picture, and a better prediction shrinks
+/// the residual on its own. At [`ModeSearch::RateDistortion`] the residual's
+/// own estimated bins join it, which is the cost a rate-controlled encoder
+/// has to minimize. The winner's `CodedBlock` is the one the caller commits,
+/// so the mode that is coded is the mode that was measured.
+#[allow(clippy::too_many_arguments)]
+fn decide_luma_mode(
+    plane: Plane<'_>,
+    recon: &[u8],
+    x0: usize,
+    y0: usize,
+    qp: i32,
+    qp_luma: u32,
+    candidates: [u8; 3],
+    search: ModeSearch,
+) -> (u8, CodedBlock) {
+    let refs = reference_samples(recon, plane.width, plane.height, x0, y0, CTB);
+    let code = |mode: u8| {
+        code_block(
+            plane,
+            x0,
+            y0,
+            CTB,
+            qp_luma,
+            TfComponent::Luma,
+            &predict(&refs, mode, TfComponent::Luma),
+        )
+    };
+    #[cfg(test)]
+    if search == ModeSearch::DcOnly {
+        return (INTRA_DC, code(INTRA_DC));
+    }
+    let _ = search;
+
+    let shortlist = shortlist_intra_luma_modes(
+        &plane.source[y0 * plane.width + x0..],
+        plane.width,
+        CTB,
+        candidates,
+        qp,
+        DistortionBackend::Dispatched,
+        MODE_SHORTLIST,
+        |mode| predict(&refs, mode, TfComponent::Luma),
+    );
+    let lambda = u64::from(lambda_q8(qp));
+    let mut best: Option<(u64, u8, CodedBlock)> = None;
+    for candidate in &shortlist {
+        let coded = code(candidate.mode);
+        let bits = u64::from(intra_mode_bit_cost(candidate.mode, candidates))
+            + residual_rate(search, &coded.levels, CTB_LOG2, false);
+        let cost = sum_squared_error(plane, x0, y0, CTB, &coded.samples)
+            .saturating_add(bits * lambda / 256);
+        if best
+            .as_ref()
+            .is_none_or(|(best_cost, ..)| cost < *best_cost)
+        {
+            best = Some((cost, candidate.mode, coded));
+        }
+    }
+    let (_, mode, coded) = best.expect("the shortlist is never empty");
+    (mode, coded)
+}
+
+/// Pick the `intra_chroma_pred_mode` for one coding unit and return it with
+/// the Cb and Cr blocks it codes to.
+///
+/// One syntax element covers both chroma blocks, so the five Table 9-46 values
+/// are scored on the pair's joint squared error, against the same rate term
+/// [`decide_luma_mode`] uses at this operating point — the mode signalling
+/// alone, or that plus both blocks' residual bins. Value 4 (`IntraPredModeC == IntraPredModeY`) is one of them, so this
+/// can only improve on deriving chroma from luma unconditionally — which
+/// matters here because the luma mode is chosen on luma alone and the chroma
+/// planes need not share its orientation.
+#[allow(clippy::too_many_arguments)]
+fn decide_chroma_mode(
+    planes: [(Plane<'_>, TfComponent); 2],
+    recon: [&[u8]; 2],
+    cx: usize,
+    cy: usize,
+    qp: i32,
+    qp_chroma: u32,
+    luma_mode: u8,
+    search: ModeSearch,
+) -> (u8, [CodedBlock; 2]) {
+    let n_tbs = CTB / 2;
+    let refs: Vec<ReferenceSamples> = recon
+        .iter()
+        .map(|plane| reference_samples(plane, planes[0].0.width, planes[0].0.height, cx, cy, n_tbs))
+        .collect();
+    let code = |signalled: u8| {
+        let mode = derive_intra_pred_mode_c(signalled, luma_mode, false);
+        let coded: Vec<CodedBlock> = planes
+            .iter()
+            .zip(&refs)
+            .map(|(&(plane, component), refs)| {
+                code_block(
+                    plane,
+                    cx,
+                    cy,
+                    n_tbs,
+                    qp_chroma,
+                    component,
+                    &predict(refs, mode, component),
+                )
+            })
+            .collect();
+        let [cb, cr]: [CodedBlock; 2] = coded.try_into().ok().expect("two chroma blocks");
+        [cb, cr]
+    };
+    #[cfg(test)]
+    if search == ModeSearch::DcOnly {
+        return (CHROMA_MODE_DERIVED, code(CHROMA_MODE_DERIVED));
+    }
+    let _ = search;
+
+    let lambda = u64::from(lambda_q8(qp));
+    let mut best: Option<(u64, u8, [CodedBlock; 2])> = None;
+    for signalled in 0..=CHROMA_MODE_DERIVED {
+        let coded = code(signalled);
+        let bits = u64::from(chroma_mode_bit_cost(signalled))
+            + coded
+                .iter()
+                .map(|block| residual_rate(search, &block.levels, CTB_LOG2 - 1, true))
+                .sum::<u64>();
+        let distortion = coded
+            .iter()
+            .zip(&planes)
+            .map(|(block, &(plane, _))| sum_squared_error(plane, cx, cy, n_tbs, &block.samples))
+            .sum::<u64>();
+        let cost = distortion.saturating_add(bits * lambda / 256);
+        if best
+            .as_ref()
+            .is_none_or(|(best_cost, ..)| cost < *best_cost)
+        {
+            best = Some((cost, signalled, coded));
+        }
+    }
+    let (_, signalled, coded) = best.expect("value 4 is always evaluated");
+    (signalled, coded)
+}
+
+/// §9.3.3.8 bin count for one `intra_chroma_pred_mode`: the single bin for
+/// value 4, or that bin plus the two FL bypass bins for 0..=3.
+fn chroma_mode_bit_cost(signalled: u8) -> u32 {
+    if signalled == CHROMA_MODE_DERIVED {
+        1
+    } else {
+        3
+    }
+}
+
+/// The rate this operating point charges a candidate for its own residual: the
+/// bins §7.3.8.11 `residual_coding( )` would emit for `levels`, or nothing at
+/// the fixed-QP operating point that does not model residual rate at all.
+///
+/// The scan is the one [`write_idr_residual_slice`] codes with — §7.4.9.11's
+/// mode-dependent scans need a smaller block than either of the two sizes here.
+fn residual_rate(search: ModeSearch, levels: &[i32], log2_trafo_size: u32, is_chroma: bool) -> u64 {
+    if !search.charges_residual_rate() {
+        return 0;
+    }
+    u64::from(residual_rate_bits(
+        levels,
+        &ResidualWriteParams {
+            log2_trafo_size,
+            is_chroma,
+            scan_idx: ScanIdx::Diagonal,
+        },
+    ))
+}
+
+/// One transform block coded against a candidate prediction: the levels the
+/// bitstream would carry and the samples a decoder would reconstruct.
+struct CodedBlock {
+    levels: Vec<i32>,
+    /// `n_tbs * n_tbs` reconstructed samples, row-major.
+    samples: Vec<u8>,
+}
+
+/// Code one transform block from the `prediction` the caller derived for a
+/// candidate mode: transform and quantize the residual and reconstruct from
+/// the quantized levels, without touching the picture. The caller commits the
+/// winning candidate with [`write_back`].
 ///
 /// The reconstruction step deliberately runs the decoder's own §8.6.2 process
 /// on the quantized levels rather than the encoder's un-quantized residual, so
-/// `recon` holds what a decoder will hold and the next block predicts from the
-/// same samples the decoder will.
+/// the committed samples are what a decoder will hold and the next block
+/// predicts from the same samples the decoder will.
+#[allow(clippy::too_many_arguments)]
 fn code_block(
     plane: Plane<'_>,
-    recon: &mut [u8],
     x0: usize,
     y0: usize,
     n_tbs: usize,
     q_p: u32,
     component: TfComponent,
-) -> Vec<i32> {
-    let prediction = predict_dc(recon, plane.width, plane.height, x0, y0, n_tbs, component);
+    prediction: &[i32],
+) -> CodedBlock {
     let mut residual = vec![0i32; n_tbs * n_tbs];
     for row in 0..n_tbs {
         for col in 0..n_tbs {
@@ -337,18 +645,37 @@ fn code_block(
     } else {
         vec![0i32; n_tbs * n_tbs]
     };
-    for row in 0..n_tbs {
-        for col in 0..n_tbs {
-            let i = row * n_tbs + col;
-            let sample = clip1(prediction[i] + reconstructed[i], BIT_DEPTH);
-            recon[(y0 + row) * plane.width + x0 + col] = sample as u8;
-        }
-    }
-    levels
+    let samples = (0..n_tbs * n_tbs)
+        .map(|i| clip1(prediction[i] + reconstructed[i], BIT_DEPTH) as u8)
+        .collect();
+    CodedBlock { levels, samples }
 }
 
-/// §8.4.4.2 intra DC prediction for one transform block, reading its
-/// neighbours out of the partially reconstructed plane.
+/// Commit a coded block's reconstructed samples into the picture the next
+/// block predicts from.
+fn write_back(recon: &mut [u8], width: usize, x0: usize, y0: usize, n_tbs: usize, samples: &[u8]) {
+    for row in 0..n_tbs {
+        let start = (y0 + row) * width + x0;
+        recon[start..start + n_tbs].copy_from_slice(&samples[row * n_tbs..(row + 1) * n_tbs]);
+    }
+}
+
+/// Squared error between a coded block's reconstruction and the source it was
+/// coded from — the distortion half of the second RDO pass.
+fn sum_squared_error(plane: Plane<'_>, x0: usize, y0: usize, n_tbs: usize, samples: &[u8]) -> u64 {
+    let mut sse = 0u64;
+    for row in 0..n_tbs {
+        for col in 0..n_tbs {
+            let source = i64::from(plane.source[(y0 + row) * plane.width + x0 + col]);
+            let d = source - i64::from(samples[row * n_tbs + col]);
+            sse += (d * d) as u64;
+        }
+    }
+    sse
+}
+
+/// §8.4.4.2.2 — the substituted reference-sample array for one transform
+/// block, read out of the partially reconstructed plane.
 ///
 /// The §6.4.1 z-scan availability for this geometry — one unsplit coding unit
 /// per CTB, coded in raster order, one slice, no tiles — is: the left column
@@ -357,15 +684,14 @@ fn code_block(
 /// exists when the block is not at the top edge, and extends `nTbS` samples to
 /// the right as long as those stay inside the picture, because the
 /// above-right block was coded on the previous CTB row.
-fn predict_dc(
+fn reference_samples(
     recon: &[u8],
     width: usize,
     height: usize,
     x0: usize,
     y0: usize,
     n_tbs: usize,
-    component: TfComponent,
-) -> Vec<i32> {
+) -> ReferenceSamples {
     let sample = |x: usize, y: usize| i32::from(recon[y * width + x]);
     let has_left = x0 > 0;
     let has_top = y0 > 0;
@@ -396,10 +722,18 @@ fn predict_dc(
     };
     let marked = MarkedReferenceSamples::new(n_tbs, corner, left, top)
         .expect("encoder-sized reference array");
-    intra_predict_with_substitution(
-        &marked,
+    substitute_reference_samples(&marked, BIT_DEPTH).expect("encoder-sized reference array")
+}
+
+/// §8.4.4.2.1 steps 1 and 2 — the prediction one mode produces from an
+/// already-substituted reference array. The SPS this writer emits leaves
+/// `intra_smoothing_disabled_flag` and `strong_intra_smoothing_enabled_flag`
+/// both 0, which is what these parameters mirror.
+fn predict(p: &ReferenceSamples, mode: u8, component: TfComponent) -> Vec<i32> {
+    intra_predict(
+        p,
         &IntraPredParams {
-            pred_mode_intra: INTRA_DC,
+            pred_mode_intra: mode,
             cidx: match component {
                 TfComponent::Luma => IpComponent::Luma,
                 TfComponent::Cb => IpComponent::Cb,
@@ -413,7 +747,58 @@ fn predict_dc(
             disable_boundary_filter: false,
         },
     )
-    .expect("intra DC prediction")
+    .expect("Table 8-1 intra mode")
+}
+
+/// §7.3.8.5 — write one coding unit's luma intra mode against the §8.4.2
+/// `candModeList` the decoder will derive for it.
+///
+/// A mode in the list costs `prev_intra_luma_pred_flag == 1` plus the TR
+/// (`cMax` 2) `mpm_idx` bins; any other costs the flag plus the five FL
+/// `rem_intra_luma_pred_mode` bins, whose value is the §8.4.2 step-4
+/// re-injection run backwards: the three most-probable modes are removed from
+/// the 35-mode space by decrementing past each sorted candidate the mode
+/// exceeds, high candidate first.
+fn write_luma_intra_mode(
+    w: &mut BitWriter,
+    cabac: &mut CabacEncoder,
+    ctxs: &mut SliceContexts,
+    mode: u8,
+    candidates: [u8; 3],
+) {
+    if let Some(mpm_idx) = candidates.iter().position(|&c| c == mode) {
+        cabac.encode_decision(w, &mut ctxs.prev_intra_luma_pred_flag[0], 1);
+        // mpm_idx, TR(cMax 2, cRiceParam 0): "0", "10", "11".
+        if mpm_idx == 0 {
+            cabac.encode_bypass(w, 0);
+        } else {
+            cabac.encode_bypass(w, 1);
+            cabac.encode_bypass(w, u8::from(mpm_idx == 2));
+        }
+        return;
+    }
+    cabac.encode_decision(w, &mut ctxs.prev_intra_luma_pred_flag[0], 0);
+    let mut sorted = candidates;
+    sorted.sort_unstable();
+    let mut rem = mode;
+    for candidate in sorted.iter().rev() {
+        if rem > *candidate {
+            rem -= 1;
+        }
+    }
+    debug_assert_eq!(
+        crate::hevc::engine::binarization::derive_intra_pred_mode_y(
+            candidates,
+            crate::hevc::engine::binarization::LumaIntraModeSource::Remaining,
+            rem,
+        ),
+        mode,
+        "rem_intra_luma_pred_mode does not decode back to the coded mode"
+    );
+    // rem_intra_luma_pred_mode, FL(cMax 31): five bypass bins, MSB first.
+    for shift in (0..5).rev() {
+        cabac.encode_bypass(w, (rem >> shift) & 1);
+    }
 }
 
 #[cfg(test)]
@@ -543,6 +928,186 @@ mod tests {
         // The first block has no neighbours, so it predicts 128 and codes the
         // difference; every later block predicts its neighbour exactly.
         assert!(recon.y[width * height - 1].abs_diff(120) <= 1);
+    }
+
+    /// The writer's pre-RDO behaviour: the same coding loop with every mode
+    /// pinned to `INTRA_DC` and chroma derived from it.
+    fn dc_only(
+        y: &[u8],
+        cb: &[u8],
+        cr: &[u8],
+        width: usize,
+        height: usize,
+        qp: i32,
+    ) -> (Vec<u8>, ReconstructedPicture) {
+        let (rbsp, recon, _) =
+            write_idr_residual_slice(y, cb, cr, width, height, qp, ModeSearch::DcOnly);
+        (rbsp, recon)
+    }
+
+    fn psnr_db(source: &[u8], recon: &[u8]) -> f64 {
+        let sse: f64 = source
+            .iter()
+            .zip(recon)
+            .map(|(&a, &b)| {
+                let d = f64::from(a) - f64::from(b);
+                d * d
+            })
+            .sum();
+        if sse == 0.0 {
+            return f64::INFINITY;
+        }
+        10.0 * (255.0f64.powi(2) * source.len() as f64 / sse).log10()
+    }
+
+    #[test]
+    fn the_writer_codes_more_than_one_intra_mode() {
+        // The whole point of the mode search: a picture with structure at
+        // several orientations must not come out uniformly DC.
+        let (width, height) = (64, 48);
+        let (y, cb, cr) = picture(width, height);
+        let (_, _, modes) =
+            write_idr_residual_slice(&y, &cb, &cr, width, height, 26, ModeSearch::Rdo);
+        assert_eq!(modes.len(), (width / CTB) * (height / CTB));
+        let distinct: std::collections::BTreeSet<u8> = modes.iter().copied().collect();
+        assert!(
+            distinct.len() > 1,
+            "the writer coded a single mode {distinct:?} — the search is not reaching the \
+             bitstream"
+        );
+        assert!(
+            modes.iter().any(|&m| m != INTRA_DC),
+            "every coding unit is still DC"
+        );
+    }
+
+    #[test]
+    fn the_mode_search_beats_the_dc_only_writer_on_quality_and_rate() {
+        // The gain the changelog records. Both slices come out of the same
+        // coding loop at the same QP, so the difference is the mode decision
+        // and nothing else: the picture is closer to the source *and* costs
+        // fewer bits, which is what a rate-distortion decision is for.
+        let (width, height) = (64, 48);
+        let (y, cb, cr) = picture(width, height);
+        for qp in [12i32, 26, 37] {
+            let (searched_slice, searched, _) =
+                write_idr_residual_slice(&y, &cb, &cr, width, height, qp, ModeSearch::Rdo);
+            let (baseline_slice, baseline, _) =
+                write_idr_residual_slice(&y, &cb, &cr, width, height, qp, ModeSearch::DcOnly);
+            let luma = (psnr_db(&y, &searched.y), psnr_db(&y, &baseline.y));
+            assert!(
+                luma.0 > luma.1,
+                "qp {qp}: mode search gave {:.2} dB luma, DC-only gave {:.2} dB",
+                luma.0,
+                luma.1
+            );
+            let picture_psnr = |recon: &ReconstructedPicture| {
+                psnr_db(
+                    &[y.clone(), cb.clone(), cr.clone()].concat(),
+                    &[recon.y.clone(), recon.cb.clone(), recon.cr.clone()].concat(),
+                )
+            };
+            assert!(
+                picture_psnr(&searched) > picture_psnr(&baseline),
+                "qp {qp}: whole-picture PSNR {:.2} dB did not beat the DC-only {:.2} dB",
+                picture_psnr(&searched),
+                picture_psnr(&baseline)
+            );
+            assert!(
+                searched_slice.len() < baseline_slice.len(),
+                "qp {qp}: the searched slice is {} bytes against the DC-only {}",
+                searched_slice.len(),
+                baseline_slice.len()
+            );
+        }
+    }
+
+    /// The rate-constrained operating point has to buy its bits back: at the
+    /// same QP it must code a smaller slice than the fixed-QP decision, and the
+    /// point it lands on must sit above the fixed-QP writer's own
+    /// rate-distortion curve rather than merely further down it.
+    ///
+    /// The curve is interpolated in log-rate against PSNR between the two
+    /// fixed-QP points that bracket the rate-constrained slice's size, which is
+    /// the Bjontegaard construction reduced to the one point being tested.
+    #[test]
+    fn the_rate_distortion_cost_beats_the_fixed_qp_decision_at_equal_rate() {
+        let (width, height) = (64, 48);
+        let (y, cb, cr) = picture(width, height);
+        let full = |recon: &ReconstructedPicture| {
+            psnr_db(
+                &[y.clone(), cb.clone(), cr.clone()].concat(),
+                &[recon.y.clone(), recon.cb.clone(), recon.cr.clone()].concat(),
+            )
+        };
+        let encode = |qp: i32, search: ModeSearch| {
+            let (slice, recon, _) =
+                write_idr_residual_slice(&y, &cb, &cr, width, height, qp, search);
+            (slice.len() as f64, full(&recon))
+        };
+
+        // The fixed-QP writer's curve, finest first, to interpolate against.
+        let ladder: Vec<(f64, f64)> = [8i32, 12, 18, 22, 26, 32, 37, 42, 47]
+            .iter()
+            .map(|&qp| encode(qp, ModeSearch::Rdo))
+            .collect();
+
+        for qp in [12i32, 18, 26, 32, 37] {
+            let (bytes, psnr) = encode(qp, ModeSearch::RateDistortion);
+            let (fixed_bytes, _) = encode(qp, ModeSearch::Rdo);
+            assert!(
+                bytes < fixed_bytes,
+                "qp {qp}: charging the residual's rate did not shrink the slice: {bytes} against \
+                 {fixed_bytes} bytes"
+            );
+            // Where the fixed-QP curve is at this slice size.
+            let upper = ladder
+                .windows(2)
+                .find(|pair| pair[1].0 <= bytes && bytes <= pair[0].0)
+                .unwrap_or_else(|| panic!("qp {qp}: {bytes} bytes is off the measured ladder"));
+            let (bigger, smaller) = (upper[0], upper[1]);
+            let t = (bigger.0.ln() - bytes.ln()) / (bigger.0.ln() - smaller.0.ln());
+            let interpolated = bigger.1 + t * (smaller.1 - bigger.1);
+            assert!(
+                psnr > interpolated,
+                "qp {qp}: the rate-constrained point ({bytes} bytes, {psnr:.3} dB) is below the \
+                 fixed-QP curve's {interpolated:.3} dB at the same rate"
+            );
+        }
+    }
+
+    /// Charging the residual's rate must not cost the fixed-QP operating point
+    /// anything: the public writer still takes the closest-picture decision.
+    #[test]
+    fn the_fixed_qp_operating_point_is_still_the_one_the_public_writer_codes() {
+        let (width, height) = (64, 48);
+        let (y, cb, cr) = picture(width, height);
+        for qp in [12i32, 26, 37] {
+            let (au, _) = encode_idr_residual_au(&y, &cb, &cr, width, height, qp).unwrap();
+            let (rbsp, _, _) =
+                write_idr_residual_slice(&y, &cb, &cr, width, height, qp, ModeSearch::Rdo);
+            assert!(
+                au.windows(rbsp.len()).any(|window| window == rbsp),
+                "qp {qp}: the public entry point no longer codes the fixed-QP slice"
+            );
+        }
+    }
+
+    /// The rate-constrained writer is still a conforming encoder: whatever its
+    /// decision gave up in distortion, the decoder's picture and the encoder's
+    /// reference still agree sample for sample.
+    #[test]
+    fn the_rate_constrained_stream_decodes_to_the_encoders_own_reconstruction() {
+        let (width, height) = (64, 48);
+        let (y, cb, cr) = picture(width, height);
+        for qp in [0i32, 12, 26, 37, 51] {
+            let (au, recon) =
+                encode_idr_residual_au_rate_constrained(&y, &cb, &cr, width, height, qp).unwrap();
+            let (dy, dcb, dcr) = decode(&au, width, height);
+            assert_eq!(dy, recon.y, "qp {qp}: luma diverged");
+            assert_eq!(dcb, recon.cb, "qp {qp}: Cb diverged");
+            assert_eq!(dcr, recon.cr, "qp {qp}: Cr diverged");
+        }
     }
 
     #[test]

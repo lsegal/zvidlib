@@ -8,6 +8,14 @@ on:
   pull_request:
     paths-ignore:
       - '**/*.md'
+  # Timed runs are `main`-only, so this is the way to measure a branch on
+  # demand without merging it first.
+  workflow_dispatch:
+    inputs:
+      threshold:
+        description: 'Regression threshold, in percent, for the delta report'
+        required: false
+        default: '15'
 
 permissions:
   contents: read
@@ -33,6 +41,11 @@ jobs:
       # every one of them is reachable from a [[bench]] target.
       - name: Check every bench source is compiled
         run: cargo test --features native --test bench_sources_compile
+      # `criterion_baseline.py` is where a benchmark regression threshold is
+      # justified from, and it runs in a job that takes two hours to reach it.
+      # Standard library only, so this needs no install step.
+      - name: Test the benchmark baseline script
+        run: python3 -m unittest discover -s .github/scripts -v
       - name: Test AV1 SIMD kernels against the scalar path
         run: cargo test --features native --lib av1_simd -- --nocapture
       - name: Test library units
@@ -55,6 +68,138 @@ jobs:
         run: wasm-pack build --target web --out-dir pkg --no-default-features --features web
       - name: Test in headless Chrome
         run: wasm-pack test --headless --chrome --no-default-features --features web
+
+  # Benchmarks are measured, not gated. On a pull request this job only compiles
+  # the suite: `cargo bench --no-run` costs one build and catches bench-code
+  # rot, which is how benchmark suites usually die - the code stops compiling
+  # against the crate and nobody notices for months. It deliberately does not
+  # time anything on a pull request. GitHub's shared runners vary by an order of
+  # magnitude more than the regressions worth catching, so a PR gate on those
+  # timings would fail on noise until someone disabled it.
+  #
+  # Timed runs happen on `main` pushes and `workflow_dispatch`, where successive
+  # runs are comparable enough to be worth storing: each one saves a baseline
+  # artifact and reports its deltas against the previous one in the job summary.
+  benchmarks:
+    name: Benchmarks
+    runs-on: ubuntu-latest
+    # `actions: read` is for listing and downloading the previous run's baseline
+    # artifact through the API; `actions/download-artifact` only reaches within
+    # a single run.
+    permissions:
+      contents: read
+      actions: read
+    # `[profile.bench]` is `lto = "fat"` with `codegen-units = 1`, so the build
+    # alone is slow, and the timed run adds one arm per available instruction
+    # set on top of it.
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: rustup show
+      - name: Install native audio dependencies
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      # Every `[[bench]]` target, not one of them: the suite is seven targets
+      # (`codec`, `av1_decode`, `av1_encode`, `hevc_decode`, `hevc_encode`,
+      # `audio_decode`, `audio_mux`) and naming one would let the other six rot
+      # unnoticed, which is the exact failure this step exists to catch.
+      - name: Compile the benchmark suite
+        run: cargo bench --features native --benches --no-run
+
+      - name: Run the benchmarks
+        if: github.event_name != 'pull_request'
+        env:
+          # The whole-frame 1080p groups are the ones that prove the
+          # crate-wide SIMD override reaches the HEVC kernels on real decode
+          # work. They are opt-in because they are slow, which matters in an
+          # edit loop and not here.
+          ZVIDLIB_BENCH_LARGE: '1'
+        # `tee` would otherwise swallow a panicking benchmark's exit status;
+        # Actions runs `run:` under `bash -e` without pipefail.
+        run: |
+          set -o pipefail
+          cargo bench --features native --benches 2>&1 | tee bench.log
+
+      # `bench_across_isas` runs one arm per entry in `zvidlib::simd::available()`,
+      # so a runner without AVX2 has no `avx2` arm rather than reporting scalar
+      # numbers under a vector label. Surfacing the list makes a baseline
+      # attributable to a host: an arm that vanished because the runner pool
+      # changed looks exactly like an arm that never existed.
+      - name: Report the host's instruction sets
+        if: github.event_name != 'pull_request'
+        run: |
+          {
+            echo '## Benchmark host'
+            echo
+            echo '```'
+            grep -hE '^# (host instruction sets|widest detected|dispatch site)' bench.log \
+              | sort -u || echo 'no instruction-set log found in the benchmark output'
+            echo '```'
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Collect this run's baseline
+        if: github.event_name != 'pull_request'
+        run: |
+          python3 .github/scripts/criterion_baseline.py collect \
+            --criterion-dir target/criterion \
+            --out baseline/criterion-baseline.json \
+            --commit "$GITHUB_SHA" \
+            --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --host "$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | xargs) ($RUNNER_OS/$RUNNER_ARCH)"
+
+      # The newest non-expired baseline uploaded by a `main` run. Absent on the
+      # very first run, and after the 90-day retention window lapses; the
+      # comparison step reports "no previous baseline" rather than failing.
+      - name: Download the previous main baseline
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          id="$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=criterion-baseline-main&per_page=100" \
+            --jq '[.artifacts[] | select(.expired == false) | select(.workflow_run.head_branch == "main")][0].id')"
+          if [ -z "$id" ] || [ "$id" = "null" ]; then
+            echo "no previous baseline artifact; this run establishes one"
+            exit 0
+          fi
+          if ! gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$id/zip" > previous.zip; then
+            echo "could not download baseline artifact $id; reporting without a comparison"
+            rm -f previous.zip
+            exit 0
+          fi
+          unzip -o -j previous.zip -d previous
+
+      - name: Compare against the previous baseline
+        if: github.event_name != 'pull_request'
+        run: |
+          python3 .github/scripts/criterion_baseline.py compare \
+            --previous previous/criterion-baseline.json \
+            --current baseline/criterion-baseline.json \
+            --threshold '${{ inputs.threshold || 15 }}' \
+            --out delta.md
+          cat delta.md >> "$GITHUB_STEP_SUMMARY"
+
+      # `push` only, not `workflow_dispatch`: the stored chain is meant to be
+      # successive states of `main`, and a dispatch can run on any branch. A
+      # dispatch still gets its delta report, it just does not become the
+      # baseline the next `main` run is measured against.
+      - name: Upload this run's baseline
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-baseline-main
+          path: baseline/criterion-baseline.json
+          retention-days: 90
+
+      - name: Upload the full benchmark log
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-report-${{ github.run_id }}
+          path: |
+            bench.log
+            target/criterion/**/new/estimates.json
+          retention-days: 30
 
   native-platforms:
     name: Native checks (${{ matrix.os }})

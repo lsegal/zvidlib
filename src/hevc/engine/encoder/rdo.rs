@@ -5,7 +5,12 @@
 //! writer can consume, while the bootstrap encoder can already run the same
 //! deterministic search to exercise the SIMD distortion kernels end to end.
 
+use crate::hevc::engine::binarization::INTRA_PRED_MODE_MAX;
 use crate::hevc::engine::encoder::rdcost;
+use crate::hevc::engine::encoder::residual::{
+    ResidualBinSink, ResidualWriteParams, has_coded_levels, write_residual_coding,
+};
+use crate::hevc::engine::residual::ResidualElement;
 
 const CTB: usize = 16;
 const NEUTRAL_LUMA: u8 = 128;
@@ -350,7 +355,140 @@ fn candidate_partitions(size: usize) -> &'static [&'static [(usize, usize, usize
     }
 }
 
-fn lambda_q8(qp: i32) -> u32 {
+/// The intra luma mode chosen for one block, with the cost that chose it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct IntraModeDecision {
+    /// The selected Table 8-1 `predModeIntra` (0..=34).
+    pub mode: u8,
+    /// The winning mode's SATD against the source block.
+    pub satd: u32,
+    /// `satd + lambda * signalling bits`, the value that selected it.
+    pub rd_cost: u64,
+}
+
+/// Rough-mode-decision pass over the 35 Table 8-1 intra luma modes for one
+/// square block: returns the `shortlist` cheapest, best first.
+///
+/// `predict` returns the §8.4.4.2.1 prediction for a mode, so the caller
+/// supplies the reference samples it will actually code against — for the
+/// residual writer that is the partially reconstructed picture, which is what
+/// makes the decision consistent with the reconstruction the writer returns.
+///
+/// Distortion is the prediction's SATD, which needs no transform per mode, and
+/// the rate term is the §7.3.8.5 luma mode signalling: a most-probable mode
+/// costs `prev_intra_luma_pred_flag` plus its `mpm_idx` bins, and any other
+/// mode costs the flag plus the five `rem_intra_luma_pred_mode` bins.
+/// `candidates` is the §8.4.2 `candModeList`. Ties go to the lower mode index,
+/// so the search is deterministic.
+///
+/// Ranking on the prediction alone is only an approximation of what the block
+/// costs once it is quantized, so a caller that can afford it re-scores this
+/// shortlist on the reconstruction it will actually code, keeping
+/// [`intra_mode_bit_cost`] as the rate half of that second pass.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn shortlist_intra_luma_modes(
+    source: &[u8],
+    source_stride: usize,
+    n_tbs: usize,
+    candidates: [u8; 3],
+    qp: i32,
+    backend: DistortionBackend,
+    shortlist: usize,
+    mut predict: impl FnMut(u8) -> Vec<i32>,
+) -> Vec<IntraModeDecision> {
+    // The rough pass measures a sum of absolute differences, not squared
+    // error, so it trades against the square root of the SSD-domain lambda.
+    let lambda = lambda_satd_q8(qp);
+    let mut pred = vec![0u8; n_tbs * n_tbs];
+    let mut ranked = Vec::with_capacity(usize::from(INTRA_PRED_MODE_MAX) + 1);
+    for mode in 0..=INTRA_PRED_MODE_MAX {
+        let samples = predict(mode);
+        for (dst, &src) in pred.iter_mut().zip(samples.iter()) {
+            *dst = src as u8;
+        }
+        let satd = metric_satd(source, source_stride, &pred, n_tbs, n_tbs, n_tbs, backend);
+        let bits = u64::from(intra_mode_bit_cost(mode, candidates));
+        ranked.push(IntraModeDecision {
+            mode,
+            satd,
+            rd_cost: u64::from(satd).saturating_add(bits * u64::from(lambda) / 256),
+        });
+    }
+    // `sort_by_key` is stable, so equal costs keep the lower mode index.
+    ranked.sort_by_key(|decision| decision.rd_cost);
+    ranked.truncate(shortlist.max(1));
+    ranked
+}
+
+/// A [`ResidualBinSink`] that writes nothing and counts what it was asked to
+/// write — the rate half of a full rate-distortion cost, without an
+/// arithmetic coder or a bitstream.
+struct BinCounter {
+    bins: u32,
+}
+
+impl ResidualBinSink for BinCounter {
+    fn decision(&mut self, _element: ResidualElement, _ctx_inc: u32, _bin: u8) {
+        self.bins += 1;
+    }
+
+    fn bypass(&mut self, _bin: u8) {
+        self.bins += 1;
+    }
+}
+
+/// Estimated rate, in bits, of the residual one transform block would code:
+/// the number of CABAC bins §7.3.8.11 `residual_coding( )` emits for `levels`,
+/// counted by running the real writer's walk against a sink that only tallies.
+///
+/// Counting bins rather than modelling each one's arithmetic-coded length
+/// charges a context-coded bin a full bit, which overstates the well-modelled
+/// ones — a `sig_coeff_flag` in a context that has settled costs a fraction of
+/// a bit. What it preserves is the ordering: every bin the writer emits is
+/// counted exactly once, in the same walk, so two candidate residuals for the
+/// same block size and component are compared on the same scale. That is the
+/// property a mode decision needs, and it is what the levels themselves cost,
+/// as opposed to the mode signalling [`intra_mode_bit_cost`] covers.
+///
+/// A block whose levels are all zero codes no `residual_coding( )` at all —
+/// the decoder infers it from `cbf == 0` — so its residual rate is zero. The
+/// `cbf` bin itself is not counted here: it is coded for every block either
+/// way, so it cannot separate two candidates.
+///
+/// # Panics
+/// Panics through [`write_residual_coding`] if `levels` does not match
+/// `params.log2_trafo_size`.
+#[must_use]
+pub(crate) fn residual_rate_bits(levels: &[i32], params: &ResidualWriteParams) -> u32 {
+    if !has_coded_levels(levels) {
+        return 0;
+    }
+    let mut counter = BinCounter { bins: 0 };
+    write_residual_coding(&mut counter, params, levels);
+    counter.bins
+}
+
+/// §7.3.8.5 bin count for signalling one luma intra mode: the
+/// `prev_intra_luma_pred_flag` bin plus either the TR (`cMax` 2) `mpm_idx`
+/// bins or the five FL `rem_intra_luma_pred_mode` bins.
+pub(crate) fn intra_mode_bit_cost(mode: u8, candidates: [u8; 3]) -> u32 {
+    match candidates.iter().position(|&c| c == mode) {
+        Some(0) => 2,
+        Some(_) => 3,
+        None => 6,
+    }
+}
+
+/// The rough pass's lambda: [`lambda_q8`] taken into the SATD domain, where
+/// distortion is a first-order metric rather than a squared one.
+pub(crate) fn lambda_satd_q8(qp: i32) -> u32 {
+    let lambda = f64::from(lambda_q8(qp)) / 256.0;
+    (lambda.sqrt() * 256.0).round().max(1.0) as u32
+}
+
+/// The lambda the searches above trade distortion against rate with,
+/// `0.57 * 2 ^ ( ( QP - 12 ) / 3 )` in Q8 fixed point.
+pub(crate) fn lambda_q8(qp: i32) -> u32 {
     let qp = qp.clamp(0, 51);
     let q = 2f64.powf((qp as f64 - 12.0) / 3.0);
     (0.57 * q * 256.0).round().max(1.0) as u32
@@ -442,6 +580,81 @@ mod tests {
                 .iter()
                 .any(|partition| partition.sad > 0 && partition.satd > 0)
         }));
+    }
+
+    /// The residual rate estimate has to order two candidate residuals the
+    /// same way the bitstream does, which is the only property a mode decision
+    /// asks of it.
+    #[test]
+    fn the_residual_rate_estimate_orders_blocks_the_way_the_writer_does() {
+        use crate::hevc::engine::cabac::init_type;
+        use crate::hevc::engine::ctx_init::SliceContexts;
+        use crate::hevc::engine::encoder::bitwriter::BitWriter;
+        use crate::hevc::engine::encoder::cabac::CabacEncoder;
+        use crate::hevc::engine::encoder::residual::EngineResidualBinSink;
+        use crate::hevc::engine::scan::ScanIdx;
+
+        let params = ResidualWriteParams {
+            log2_trafo_size: 4,
+            is_chroma: false,
+            scan_idx: ScanIdx::Diagonal,
+        };
+        // A block the decoder infers from `cbf == 0` codes no
+        // `residual_coding( )` at all, so it costs nothing to carry.
+        assert_eq!(residual_rate_bits(&[0i32; 256], &params), 0);
+
+        // Progressively more expensive residuals: one DC level, the same
+        // level pushed further from the DC corner, a spread of levels, and
+        // large levels that spill into `coeff_abs_level_remaining`.
+        let block = |fill: &dyn Fn(usize, usize) -> i32| -> Vec<i32> {
+            (0..256).map(|i| fill(i % 16, i / 16)).collect()
+        };
+        let candidates = [
+            block(&|x, y| i32::from(x == 0 && y == 0)),
+            block(&|x, y| i32::from(x == 3 && y == 2)),
+            block(&|x, y| if x < 4 && y < 4 { 1 } else { 0 }),
+            block(&|x, y| if x < 4 && y < 4 { 40 } else { 0 }),
+        ];
+
+        // What each one really costs: the arithmetic-coded length the writer
+        // emits from a freshly initialized I-slice context bank.
+        let coded_bits = |levels: &[i32]| -> usize {
+            let mut w = BitWriter::new();
+            let mut cabac = CabacEncoder::new();
+            let mut ctxs = SliceContexts::init(init_type(2, false), 26);
+            write_residual_coding(
+                &mut EngineResidualBinSink {
+                    writer: &mut w,
+                    cabac: &mut cabac,
+                    contexts: &mut ctxs.residual,
+                },
+                &params,
+                levels,
+            );
+            w.finish().len() * 8
+        };
+
+        let estimates: Vec<u32> = candidates
+            .iter()
+            .map(|levels| residual_rate_bits(levels, &params))
+            .collect();
+        let coded: Vec<usize> = candidates.iter().map(|levels| coded_bits(levels)).collect();
+        for i in 1..candidates.len() {
+            assert!(
+                estimates[i] > estimates[i - 1],
+                "candidate {i} estimated {} bins against candidate {}'s {}",
+                estimates[i],
+                i - 1,
+                estimates[i - 1]
+            );
+            assert!(
+                coded[i] >= coded[i - 1],
+                "the estimate ordered candidates {} and {i} the writer does not: {:?} vs {:?}",
+                i - 1,
+                estimates,
+                coded
+            );
+        }
     }
 
     #[test]
