@@ -284,6 +284,28 @@ pub(crate) struct FrameEncoder<'a> {
     /// order-independence that holds only because nothing ever tied.
     #[cfg(test)]
     cost_ties: u64,
+    /// Every [`ProbeKey`] a size trial's probe measured a full-set winner under, in the order
+    /// they were measured, and the key the emitting pass actually reached at each transform
+    /// block's position. The two sets are what a probe's reuse coverage *is*, so a test can
+    /// measure where they diverge rather than infer it from the candidate count.
+    #[cfg(test)]
+    probe_keys: Vec<ProbeKey>,
+    /// `(size, prediction)` of every transform block the emitting pass wrote, by its position.
+    #[cfg(test)]
+    emitted_blocks: std::collections::HashMap<(usize, usize), (usize, u8)>,
+    /// Coding blocks the emitting pass wrote, which bounds how many probes could ever be read
+    /// back: a size trial probes one block, so no emitted coding block can consume more than one.
+    #[cfg(test)]
+    emitted_coding_blocks: u64,
+    /// Size searches that probed, which bounds it further under the sampling interval.
+    #[cfg(test)]
+    probing_size_searches: u64,
+    /// Emitted blocks the zero-block shortcut decided, which no probe ever ran on.
+    #[cfg(test)]
+    zero_skipped_emitted: u64,
+    /// Emitted blocks written from a probe's cached result instead of a search.
+    #[cfg(test)]
+    reused_blocks: u64,
 }
 
 /// What one encode of a tile did, for the tests that compare two searches against each other.
@@ -295,6 +317,14 @@ pub(crate) struct SearchReport {
     pub(crate) trace: Vec<(usize, Av1TxType)>,
     pub(crate) candidates_evaluated: u64,
     pub(crate) cost_ties: u64,
+    /// The probe and emit key sets and the counts that bound their overlap, for
+    /// `measure_probe_reuse_coverage`.
+    pub(crate) probe_keys: Vec<(usize, usize, usize, u8)>,
+    pub(crate) emitted_blocks: std::collections::HashMap<(usize, usize), (usize, u8)>,
+    pub(crate) emitted_coding_blocks: u64,
+    pub(crate) probing_size_searches: u64,
+    pub(crate) zero_skipped_emitted: u64,
+    pub(crate) reused_blocks: u64,
 }
 
 /// One transform type considered for a block, with everything the winner needs to be written:
@@ -386,6 +416,18 @@ impl<'a> FrameEncoder<'a> {
             candidates_evaluated: 0,
             #[cfg(test)]
             cost_ties: 0,
+            #[cfg(test)]
+            probe_keys: Vec::new(),
+            #[cfg(test)]
+            emitted_blocks: std::collections::HashMap::new(),
+            #[cfg(test)]
+            emitted_coding_blocks: 0,
+            #[cfg(test)]
+            probing_size_searches: 0,
+            #[cfg(test)]
+            zero_skipped_emitted: 0,
+            #[cfg(test)]
+            reused_blocks: 0,
         }
     }
 
@@ -511,6 +553,12 @@ impl<'a> FrameEncoder<'a> {
             trace: std::mem::take(&mut self.emitted),
             candidates_evaluated: self.candidates_evaluated,
             cost_ties: self.cost_ties,
+            probe_keys: std::mem::take(&mut self.probe_keys),
+            emitted_blocks: std::mem::take(&mut self.emitted_blocks),
+            emitted_coding_blocks: self.emitted_coding_blocks,
+            probing_size_searches: self.probing_size_searches,
+            zero_skipped_emitted: self.zero_skipped_emitted,
+            reused_blocks: self.reused_blocks,
             tile: self.sym.finish(),
         }
     }
@@ -761,6 +809,10 @@ impl<'a> FrameEncoder<'a> {
             widths.reverse();
         }
         let probing = self.shortcuts() && self.sample_type_gain();
+        #[cfg(test)]
+        if probing {
+            self.probing_size_searches += 1;
+        }
         let mut best = (0usize, i64::MAX);
         for &tx_width in &widths {
             let snapshot = self.snapshot(r, c, bw);
@@ -837,6 +889,10 @@ impl<'a> FrameEncoder<'a> {
     ) -> i64 {
         let units = bw / 4;
         let step = tx_width / 4;
+        #[cfg(test)]
+        if emit {
+            self.emitted_coding_blocks += 1;
+        }
         let mut cost = 0;
         let mut ty = 0;
         while ty < units {
@@ -889,6 +945,10 @@ impl<'a> FrameEncoder<'a> {
         emit: bool,
     ) -> i64 {
         let prediction = self.dc_prediction(x, y, size);
+        #[cfg(test)]
+        if emit {
+            self.emitted_blocks.insert((x, y), (size, prediction));
+        }
 
         // A size trial's probe already ran this exact search. Its winner was discarded so the
         // trial would reconstruct like a DCT-only one, but the answer it computed is a function
@@ -902,6 +962,10 @@ impl<'a> FrameEncoder<'a> {
         // probe only ever ran on a block whose residual already failed it.
         if emit && self.reuse_probes() {
             if let Some(candidate) = self.probed.remove(&(x, y, size, prediction)) {
+                #[cfg(test)]
+                {
+                    self.reused_blocks += 1;
+                }
                 let scan = cdf::up_right_diagonal_scan(size);
                 return self.write_candidate(
                     x,
@@ -953,6 +1017,10 @@ impl<'a> FrameEncoder<'a> {
         if self.shortcuts()
             && energy + self.lambda * ZERO_BLOCK_BITS < self.lambda * MIN_CODED_BLOCK_BITS
         {
+            #[cfg(test)]
+            if emit {
+                self.zero_skipped_emitted += 1;
+            }
             return self.write_zero_block(x, y, block_width, size, prediction, &scan, energy, emit);
         }
 
@@ -1077,6 +1145,8 @@ impl<'a> FrameEncoder<'a> {
             gain.dct_cost += dct;
             gain.best_cost += best_of_set;
             if let Some(winner) = full_set {
+                #[cfg(test)]
+                self.probe_keys.push((x, y, size, prediction));
                 self.probed.insert((x, y, size, prediction), winner);
             }
         }

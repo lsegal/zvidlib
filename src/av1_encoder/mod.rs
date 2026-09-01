@@ -1154,6 +1154,55 @@ mod nonlossless_tests {
         }
     }
 
+    /// Where the probed and the emitted transform-block key sets actually diverge.
+    ///
+    /// The reuse in `tile.rs` can only fire when a size trial's probe measured a block under the
+    /// exact `(position, size, prediction)` the emitting pass later reaches. This classifies every
+    /// probe of the 640x352 frame at `base_q_idx` 32 and 160 against the blocks that pass wrote -
+    /// consumed, a losing size trial (the position is emitted at another size), a losing partition
+    /// candidate (the position is emitted at this size against another prediction, or is not the
+    /// start of an emitted block at all) - and prints the counts that bound the overlap from the
+    /// other side: a size trial probes `TYPE_GAIN_PROBES` block, so no emitted coding block can
+    /// ever consume more than one probe, whatever the sampling rate.
+    #[test]
+    #[ignore = "measurement sweep, not an assertion"]
+    fn measure_probe_reuse_coverage() {
+        let (width, height) = (640_usize, 352_usize);
+        let pixels = test_pattern(width as u32, height as u32);
+        println!(
+            "qindex,emitted_blocks,zero_skipped,emitted_coding_blocks,probing_size_searches,probes,distinct_probes,reused,losing_size,losing_partition,unemitted_position"
+        );
+        for qindex in [32_u8, 160] {
+            let report = tile::FrameEncoder::new(&pixels, width, height, qindex).encode_with_report();
+            let distinct: std::collections::BTreeSet<_> = report.probe_keys.iter().copied().collect();
+            let (mut hit, mut losing_size, mut losing_partition, mut unemitted) = (0, 0, 0, 0);
+            for &(x, y, size, prediction) in &distinct {
+                match report.emitted_blocks.get(&(x, y)) {
+                    None => unemitted += 1,
+                    Some(&(emitted_size, _)) if emitted_size != size => losing_size += 1,
+                    Some(&(_, emitted_prediction)) if emitted_prediction != prediction => {
+                        losing_partition += 1
+                    }
+                    Some(_) => hit += 1,
+                }
+            }
+            assert_eq!(
+                hit, report.reused_blocks,
+                "every probe whose key the emitting pass reached should have been read back"
+            );
+            println!(
+                "{qindex},{},{},{},{},{},{},{},{losing_size},{losing_partition},{unemitted}",
+                report.emitted_blocks.len(),
+                report.zero_skipped_emitted,
+                report.emitted_coding_blocks,
+                report.probing_size_searches,
+                report.probe_keys.len(),
+                distinct.len(),
+                report.reused_blocks,
+            );
+        }
+    }
+
     #[test]
     #[ignore = "measurement sweep, not an assertion"]
     fn measure_type_gain_sampling_cost() {
