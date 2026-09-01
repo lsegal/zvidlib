@@ -1,0 +1,43 @@
+name: Intel probe (temporary, issue 285)
+
+on:
+  push:
+    branches: ['fix/issue-285-**']
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        draw: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report CPU
+        run: |
+          grep -m1 'model name' /proc/cpuinfo
+          grep -m1 'vendor_id' /proc/cpuinfo
+          grep -m1 -E '^(cpu family|model|stepping)' /proc/cpuinfo || true
+          awk '/^model|^cpu family|^stepping/ {print; c++} c>=6 {exit}' /proc/cpuinfo
+          grep -m1 flags /proc/cpuinfo | tr ' ' '\n' | grep -E '^(avx2|avx512f|avx512vnni|sse4_1)$' | tr '\n' ' '; echo
+  probe-win:
+    strategy:
+      fail-fast: false
+      matrix:
+        draw: [1, 2, 3, 4]
+    runs-on: windows-latest
+    steps:
+      - name: Report CPU
+        shell: pwsh
+        run: Get-CimInstance Win32_Processor | Select-Object Name, Manufacturer, Description | Format-List
+  probe-mac:
+    strategy:
+      fail-fast: false
+      matrix:
+        draw: [1, 2]
+    runs-on: macos-15-intel
+    steps:
+      - name: Report CPU
+        run: sysctl -n machdep.cpu.brand_string; sysctl -n machdep.cpu.family machdep.cpu.model
