@@ -127,7 +127,9 @@ fn schedule_inter_pus(width: usize, height: usize) -> Vec<InterPu> {
             let class = (0..INTER_PU_MIX.len())
                 .max_by(|&a, &b| {
                     let deficit = |i: usize| {
-                        INTER_PU_MIX[i].2.mul_add(total as f64, -(emitted[i] as f64))
+                        INTER_PU_MIX[i]
+                            .2
+                            .mul_add(total as f64, -(emitted[i] as f64))
                     };
                     deficit(a)
                         .partial_cmp(&deficit(b))
@@ -425,9 +427,8 @@ impl HevcStageInputs {
             } else {
                 Vec::new()
             };
-            let combined =
-                default_weighted_pred(&l0, &l1, true, pu.bi, n, n, BIT_DEPTH)
-                    .expect("both lists are the unit's size");
+            let combined = default_weighted_pred(&l0, &l1, true, pu.bi, n, n, BIT_DEPTH)
+                .expect("both lists are the unit's size");
             digest.push_all(&combined);
 
             // §8.5.3.3.3.3: the chroma units are half the luma unit's side at
@@ -930,7 +931,8 @@ mod tests {
         // And the workload predicts chroma: every unit is at least 8x8 luma,
         // so every unit has a 4:2:0 chroma unit of at least 4x4 to filter.
         assert!(
-            pus.iter().all(|pu| pu.n >= 8 && pu.x % 2 == 0 && pu.y % 2 == 0),
+            pus.iter()
+                .all(|pu| pu.n >= 8 && pu.x % 2 == 0 && pu.y % 2 == 0),
             "a unit has no whole 4:2:0 chroma unit"
         );
     }

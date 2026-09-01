@@ -290,7 +290,7 @@ observed:
 
 | Group | Stage | Vectorized |
 | --- | --- | --- |
-| `hevc_inter_pred` | §8.5.3.3 8-tap luma interpolation + the weighted combine | yes |
+| `hevc_inter_pred` | §8.5.3.3 interpolation + the weighted combine, over the measured prediction-unit mix | yes |
 | `hevc_intra_pred` | §8.4.4.2 reference smoothing, planar / DC / angular | yes |
 | `hevc_deblock` | §8.7.2 luma block-edge deblocking | yes |
 | `hevc_sao` | §8.7.3 sample adaptive offset, band and edge | yes |
