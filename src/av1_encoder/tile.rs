@@ -92,14 +92,57 @@ const TYPE_GAIN_PROBES: usize = 1;
 /// four-fold reduction the shortcuts exist for and
 /// `the_search_shortcuts_stay_within_their_rate_and_distortion_bound` asserts; `2` clears it with
 /// 155,143. What remains at `2` is the estimator mixing statistics across regions rather than the
-/// sampling rate, which no interval fixes.
+/// sampling rate, which no interval fixes; [`TYPE_GAIN_MEMORY`] is what addresses that, and the
+/// worst-penalty column above is the frame-wide accumulation it replaced.
 pub(super) const TYPE_GAIN_SAMPLE_INTERVAL: usize = 2;
 
 /// Probes a transform size's accumulated gain ratio remembers, as the window of an exponential
 /// recency weighting.
 ///
-/// PLACEHOLDER_DOC
-pub(super) const TYPE_GAIN_MEMORY: usize = 8;
+/// The ratio a probe measures is a property of the *content around the block it was measured on*,
+/// not of the frame: on a frame whose statistics change across it, a block corrected by a ratio
+/// measured on the other side of that change can have two close sizes ranked the wrong way round.
+/// Accumulating every probe of a size equally over the whole frame is what made the correction
+/// frame-wide, and #266 established that no [`TYPE_GAIN_SAMPLE_INTERVAL`] fixes it - `2`, `3` and
+/// `4` all carry the same penalty, because re-measuring more often does not stop the older
+/// measurements from outvoting the new ones.
+///
+/// So each accumulator is aged by `(n-1)/n` before a new probe joins it. A probe's weight decays
+/// geometrically over the following `n` probes, which - since the size searches that probe are
+/// visited in the decoder's superblock raster order - makes the ratio a block reads back the one
+/// its own neighbourhood measured, and lets it follow the content across a region boundary within
+/// a few coding blocks instead of never. This was chosen over a per-superblock-row reset (too
+/// coarse: a 64-row band is most of a small frame, and it discards the correction entirely at the
+/// start of each band) and over keeping a ratio per spatial region (which needs a region map the
+/// encoder does not have and memory proportional to the frame).
+///
+/// `4` is where it measured out, on the `content_frames` set plus `test_pattern` at both 128x96
+/// and 192x160 over the six quantizers, as each frame's worst penalty in `sse + lambda * bits`
+/// against the same estimator probing every size search. `frame` is the un-decayed accumulation
+/// this replaced:
+///
+/// | window     | scene_edge | quadrants | smooth | test_pattern | candidates |
+/// |-----------:|-----------:|----------:|-------:|-------------:|-----------:|
+/// | 1          | +8.26%     | +0.86%    | +0.08% | +3.12%       | 155,725    |
+/// | 2          | +9.11%     | +1.49%    | +0.52% | +0.37%       | 155,696    |
+/// | 4          | +9.32%     | +0.00%    | +0.52% | +0.37%       | 155,392    |
+/// | 8          | +16.36%    | +0.00%    | +0.52% | +0.37%       | 155,357    |
+/// | 32         | +29.96%    | +0.00%    | +0.52% | +0.37%       | 155,109    |
+/// | frame      | +44.14%    | +0.00%    | +0.52% | +0.37%       | 155,143    |
+///
+/// (`noise` and `diagonals` are 0.00% at every window and are left out of the table.) `4` is the
+/// largest window that gives up none of the improvement - it cuts the scene edge's penalty by a
+/// factor of 4.7 at 192x160 and from +30.04% to +2.13% at 128x96 - while regressing no other
+/// frame against the frame-wide accumulation. Shorter windows start trading it back: `2` costs
+/// `quadrants` +1.49% and `1`, which remembers only the last probe, costs `test_pattern` +3.12%,
+/// because a single probe is too noisy an estimate to rank a size on.
+///
+/// The correction exists to be cheap and stays so. The decay is one multiply and one divide per
+/// accumulator, paid only on the sampled trials, and it evaluates 155,392 transform-type
+/// candidates against the frame-wide accumulation's 155,143 - 0.16% more, against the exhaustive
+/// search's 700,004. `measure_type_gain_memory_cost` measures no encode-time difference outside
+/// the host's own run-to-run spread.
+pub(super) const TYPE_GAIN_MEMORY: usize = 4;
 
 /// Transform sizes [`FrameEncoder::type_gain`] accumulates over: `TX_4X4` through `TX_32X32`,
 /// which is every size [`super::transform::forward_transform`] implements.
@@ -349,7 +392,10 @@ impl<'a> FrameEncoder<'a> {
     /// frame-wide accumulation this replaced.
     #[cfg(test)]
     pub(crate) fn with_type_gain_memory(mut self, memory: usize) -> Self {
-        assert!(memory >= 1, "a window of 0 remembers nothing, not even the probe just taken");
+        assert!(
+            memory >= 1,
+            "a window of 0 would divide the accumulator by zero"
+        );
         self.type_gain_memory = memory;
         self
     }

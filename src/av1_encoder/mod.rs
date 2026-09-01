@@ -1170,7 +1170,12 @@ mod nonlossless_tests {
     #[test]
     #[ignore = "measurement sweep, not an assertion"]
     fn measure_type_gain_memory_windows() {
-        let (width, height) = (128_usize, 96_usize);
+        for (width, height) in [(128_usize, 96_usize), (192, 160)] {
+            measure_type_gain_memory_windows_at(width, height);
+        }
+    }
+
+    fn measure_type_gain_memory_windows_at(width: usize, height: usize) {
         let mut frames = content_frames(width as u32, height as u32);
         frames.push(("test_pattern", test_pattern(width as u32, height as u32)));
         let sse = |report: &tile::SearchReport, pixels: &[u8]| -> i64 {
@@ -1187,6 +1192,7 @@ mod nonlossless_tests {
                 })
                 .sum()
         };
+        println!("size,{width}x{height}");
         println!("frame,qindex,memory,penalty_percent,bytes,candidates");
         for (name, pixels) in &frames {
             for qindex in [1_u8, 8, 32, 80, 160, 200] {
@@ -1214,6 +1220,45 @@ mod nonlossless_tests {
         }
     }
 
+    /// What the recency weighting costs in encode time.
+    ///
+    /// The correction exists to be cheap, so this is the check that ageing the accumulator did
+    /// not make it expensive. Interleaved rounds with the minimum taken per arm: a single pass
+    /// would attribute this host's own load to whichever arm happened to run under it.
+    #[test]
+    #[ignore = "measurement sweep, not an assertion"]
+    fn measure_type_gain_memory_cost() {
+        use std::time::Instant;
+        let (width, height) = (192_usize, 160_usize);
+        let mut frames = content_frames(width as u32, height as u32);
+        frames.push(("test_pattern", test_pattern(width as u32, height as u32)));
+        let windows = [1_usize, 2, 4, 8, 32, usize::MAX];
+        let mut best = std::collections::BTreeMap::new();
+        let mut candidates = std::collections::BTreeMap::new();
+        for _ in 0..5 {
+            for memory in windows {
+                let start = Instant::now();
+                let mut total = 0_u64;
+                for (_, pixels) in &frames {
+                    for qindex in [1_u8, 8, 32, 80, 160, 200] {
+                        let report = tile::FrameEncoder::new(pixels, width, height, qindex)
+                            .with_type_gain_memory(memory)
+                            .encode_with_report();
+                        total += report.candidates_evaluated;
+                    }
+                }
+                let elapsed = start.elapsed().as_secs_f64();
+                let slot = best.entry(memory).or_insert(f64::MAX);
+                *slot = slot.min(elapsed);
+                candidates.insert(memory, total);
+            }
+        }
+        println!("memory,seconds,candidates");
+        for memory in windows {
+            println!("{memory},{:.4},{}", best[&memory], candidates[&memory]);
+        }
+    }
+
     /// What the sampled transform-gain estimator costs on content it was not tuned on.
     ///
     /// `TYPE_GAIN_SAMPLE_INTERVAL` probes one coding block's size search in every `n` and
@@ -1231,9 +1276,11 @@ mod nonlossless_tests {
     /// `test_pattern` +2.1%), so a regression of the constant fails here on three frames rather
     /// than passing unnoticed as it did on 96x80 alone.
     ///
-    /// `scene_edge`'s remaining 30% is the estimator mixing two regions' statistics rather than
-    /// the sampling rate - every interval from 2 to 4 measures the same penalty on it - and is
-    /// tracked separately.
+    /// `scene_edge`'s ceiling was 40% while the per-size ratio was accumulated over the whole
+    /// frame: every interval from 2 to 4 measured the same penalty on it, because what it was
+    /// paying for was the estimator mixing two regions' statistics rather than the sampling rate.
+    /// `TYPE_GAIN_MEMORY` ages that accumulation so a block reads back its own neighbourhood's
+    /// ratio, which brings the frame to +2.13% here and takes the ceiling to 4%.
     #[test]
     fn the_type_gain_sampling_interval_holds_on_content_it_was_not_tuned_on() {
         let (width, height) = (128_usize, 96_usize);
@@ -1244,7 +1291,7 @@ mod nonlossless_tests {
             ("smooth", 2.5),
             ("diagonals", 1.0),
             ("quadrants", 1.0),
-            ("scene_edge", 40.0),
+            ("scene_edge", 4.0),
             ("test_pattern", 1.0),
         ]);
         let sse = |report: &tile::SearchReport, pixels: &[u8]| -> i64 {
