@@ -8,36 +8,33 @@ permissions:
   contents: read
 
 jobs:
-  probe:
+  bench:
     strategy:
       fail-fast: false
       matrix:
-        draw: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        draw: [1, 2, 3, 4, 5, 6, 7, 8]
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
+      - uses: actions/checkout@v4
       - name: Report CPU
         run: |
           grep -m1 'model name' /proc/cpuinfo
           grep -m1 'vendor_id' /proc/cpuinfo
-          grep -m1 -E '^(cpu family|model|stepping)' /proc/cpuinfo || true
-          awk '/^model|^cpu family|^stepping/ {print; c++} c>=6 {exit}' /proc/cpuinfo
-          grep -m1 flags /proc/cpuinfo | tr ' ' '\n' | grep -E '^(avx2|avx512f|avx512vnni|sse4_1)$' | tr '\n' ' '; echo
-  probe-win:
-    strategy:
-      fail-fast: false
-      matrix:
-        draw: [1, 2, 3, 4]
-    runs-on: windows-latest
-    steps:
-      - name: Report CPU
-        shell: pwsh
-        run: Get-CimInstance Win32_Processor | Select-Object Name, Manufacturer, Description | Format-List
-  probe-mac:
-    strategy:
-      fail-fast: false
-      matrix:
-        draw: [1, 2]
-    runs-on: macos-15-intel
-    steps:
-      - name: Report CPU
-        run: sysctl -n machdep.cpu.brand_string; sysctl -n machdep.cpu.family machdep.cpu.model
+          awk -F': ' '/^cpu family|^model\t|^model  |^stepping/ {print $0} /^stepping/ {exit}' /proc/cpuinfo
+          grep -m1 flags /proc/cpuinfo | tr ' ' '\n' | grep -E '^(avx2|avx512f|sse4_1)$' | tr '\n' ' '; echo
+          nproc
+      - name: Install Rust toolchain
+        run: rustup show
+      - name: Install native audio dependencies
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - name: Build the benchmark
+        run: cargo test --release --features native --lib simd_inter_pred_benchmark --no-run
+      - name: Run the benchmark three times
+        run: |
+          for run in 1 2 3; do
+            echo "=== run $run on $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | xargs) ==="
+            cargo test --release --features native --lib simd_inter_pred_benchmark -- --ignored --nocapture
+          done
+      - name: Backend bit-exactness
+        run: cargo test --release --features native --lib every_backend_matches_scalar -- --nocapture
