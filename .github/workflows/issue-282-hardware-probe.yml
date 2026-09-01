@@ -1,0 +1,76 @@
+name: Issue 282 hardware HEVC probe
+
+# Temporary: measures `benches/hevc_hardware.rs` on a Linux and a Windows host
+# for issue #282. Removed before the pull request is marked ready.
+on:
+  push:
+    branches: [fix/issue-282-nvdec-mf-bench-rows]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-nvdec
+          - os: windows-latest
+            name: windows-mf
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: rustup show
+      - name: Install native audio dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - name: Describe the host
+        shell: bash
+        run: |
+          echo "== uname =="; uname -a || true
+          echo "== nvidia driver libraries =="
+          ldconfig -p 2>/dev/null | grep -Ei 'libcuda|libnvcuvid' || echo 'no libcuda.so.1 / libnvcuvid.so.1 on the loader path'
+          echo "== nvidia-smi =="; nvidia-smi || echo 'no nvidia-smi'
+          echo "== pci display devices =="; lspci 2>/dev/null | grep -Ei 'vga|3d|display' || echo 'no lspci'
+      - name: Describe the Windows host
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Get-CimInstance Win32_VideoController | Format-List Name,VideoProcessor,DriverVersion,AdapterCompatibility
+          Write-Host "== nvcuda.dll / nvcuvid.dll =="
+          foreach ($d in 'nvcuda.dll','nvcuvid.dll') {
+            $p = Join-Path $env:SystemRoot "System32\$d"
+            if (Test-Path $p) { Write-Host "$d present" } else { Write-Host "$d absent" }
+          }
+          Write-Host "== HEVC decoder MFT registration =="
+          $k = 'HKLM:\SOFTWARE\Classes\CLSID\{420A51A3-D605-430C-B4FC-45274FA6C562}'
+          if (Test-Path $k) { Write-Host 'CLSID_MSH265DecoderMFT registered' } else { Write-Host 'CLSID_MSH265DecoderMFT not registered' }
+      - name: Run the hardware HEVC benchmark
+        shell: bash
+        env:
+          ZVIDLIB_BENCH_LARGE: '1'
+        run: |
+          set -o pipefail
+          cargo bench --features native --bench hevc_hardware 2>&1 | tee bench-${{ matrix.name }}.log
+      - name: Summarize
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## ${{ matrix.name }} (${{ matrix.os }})"
+            echo
+            echo '```'
+            grep -E '^#' bench-${{ matrix.name }}.log 2>/dev/null || echo 'no log'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-${{ matrix.name }}
+          path: bench-${{ matrix.name }}.log
+          if-no-files-found: warn
