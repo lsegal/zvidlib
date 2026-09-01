@@ -51,6 +51,11 @@ const ZERO_BLOCK_BITS: i64 = 1;
 /// `all_zero` flag, a one-position end-of-block, and one magnitude-1 coefficient with its sign.
 const MIN_CODED_BLOCK_BITS: i64 = 7;
 
+/// Transform blocks per size trial that [`FrameEncoder::choose_tx_size`] searches with the whole
+/// transform-type set instead of the set's DCT alone, to measure what the type search is worth at
+/// that size before extrapolating it over the trial's remaining blocks.
+const TYPE_GAIN_PROBES: usize = 1;
+
 /// Smallest coding block the non-lossless partition search will produce. A 16x16 block can still
 /// signal `TX_16X16`, `TX_8X8`, or `TX_4X4`, so every transform size this encoder emits stays
 /// reachable without searching partitions all the way down to 8x8.
@@ -98,6 +103,19 @@ pub(crate) struct FrameEncoder<'a> {
     split_memo: Vec<u8>,
     /// Memoized `choose_tx_size` answers, in the same slot layout as [`Self::split_memo`].
     tx_size_memo: Vec<u8>,
+    /// Transform blocks the current size trial may still probe with the whole type set. Zero
+    /// outside a [`FrameEncoder::choose_tx_size`] trial, which is what keeps every other
+    /// speculative pass on the set's DCT alone.
+    probe_budget: usize,
+    /// Summed DCT-only cost of the current trial's probed blocks.
+    probe_dct_cost: i64,
+    /// Summed best-of-set cost of the same blocks, so `probe_dct_cost - probe_best_cost` is what
+    /// the type search was measured to be worth over them.
+    probe_best_cost: i64,
+    /// Summed DCT-only cost of every block the current trial actually searched, which is the base
+    /// the measured gain is extrapolated over. Zero-skipped blocks are excluded: no transform type
+    /// can improve a block that codes no coefficients.
+    trial_searched_cost: i64,
     /// Set by [`Self::without_search_shortcuts`] to restore the original exhaustive search, so a
     /// test can compare the shortcuts against the search they stand in for.
     #[cfg(test)]
@@ -183,6 +201,10 @@ impl<'a> FrameEncoder<'a> {
             emitted: Vec::new(),
             split_memo: vec![MEMO_UNSET; MEMO_LEVELS * mi_cols * mi_rows],
             tx_size_memo: vec![MEMO_UNSET; MEMO_LEVELS * mi_cols * mi_rows],
+            probe_budget: 0,
+            probe_dct_cost: 0,
+            probe_best_cost: 0,
+            trial_searched_cost: 0,
             #[cfg(test)]
             exhaustive: false,
             #[cfg(test)]
@@ -434,6 +456,15 @@ impl<'a> FrameEncoder<'a> {
 
     /// Picks the transform size for a `bw x bw` coding block by trial-coding every size
     /// `read_tx_size` can signal for it and keeping the cheapest.
+    ///
+    /// The trials themselves rank on the set's DCT alone, which on its own is not a fair
+    /// comparison *between sizes*: coding the block as sixteen 4x4 transforms gives the emitting
+    /// pass's type search sixteen chances to beat DCT against one for a single 16x16 transform,
+    /// and a DCT-only ranking throws that advantage away. Each trial therefore also probes
+    /// [`TYPE_GAIN_PROBES`] of its blocks with the whole type set, and the measured gain is
+    /// extrapolated over the rest in [`Self::corrected_trial_cost`] - so the correction grows
+    /// with the trial's block count, as the type search's real advantage does, at a cost that
+    /// does not.
     fn choose_tx_size(&mut self, r: usize, c: usize, bw: usize) -> usize {
         let slot = self.memo_slot(r, c, bw);
         if self.tx_size_memo[slot] != MEMO_UNSET {
@@ -448,8 +479,17 @@ impl<'a> FrameEncoder<'a> {
                 continue;
             }
             let snapshot = self.snapshot(r, c, bw);
+            self.probe_budget = if self.shortcuts() {
+                TYPE_GAIN_PROBES
+            } else {
+                0
+            };
+            self.probe_dct_cost = 0;
+            self.probe_best_cost = 0;
+            self.trial_searched_cost = 0;
             let cost = self.code_block_transforms(r, c, bw, tx_width, false);
             self.restore(snapshot);
+            let cost = self.corrected_trial_cost(cost);
             if cost < best.1 {
                 best = (tx_width, cost);
             }
@@ -457,9 +497,27 @@ impl<'a> FrameEncoder<'a> {
                 break;
             }
         }
+        // Nothing outside a size trial may probe: every other speculative pass stays on the
+        // set's DCT alone, which is where the shortcut's speedup comes from.
+        self.probe_budget = 0;
         debug_assert_ne!(best.0, 0, "every coding block has one legal transform size");
         self.tx_size_memo[slot] = (best.0 / 4).trailing_zeros() as u8;
         best.0
+    }
+
+    /// Discounts a size trial's DCT-only cost by what the type search was measured to be worth on
+    /// the blocks this trial probed.
+    ///
+    /// With `p` the probed blocks and `s` every searched block, the estimate is
+    /// `sum(best_p)/sum(dct_p)` applied to `sum(dct_s)`, which reduces to subtracting
+    /// `(dct_p - best_p) * dct_s / dct_p`. Blocks the zero-block shortcut decided are not in `s`:
+    /// no transform type improves a block that codes no coefficients.
+    fn corrected_trial_cost(&self, cost: i64) -> i64 {
+        if self.probe_dct_cost <= 0 {
+            return cost;
+        }
+        let gain = self.probe_dct_cost - self.probe_best_cost;
+        cost - gain.saturating_mul(self.trial_searched_cost) / self.probe_dct_cost
     }
 
     /// Walks a coding block's transform blocks in the decoder's raster order, reconstructing
@@ -567,15 +625,29 @@ impl<'a> FrameEncoder<'a> {
         // *partitions*: the type each block finally writes is picked by the full search below on
         // the emitting pass. Ranking the trials on the set's DCT alone is what keeps the search
         // linear in the number of candidates rather than a product of them.
-        if self.shortcuts() && !emit && candidates.len() > 1 {
-            let representative = candidates
-                .iter()
-                .position(|&(_, tx_type)| tx_type == Av1TxType::DctDct)
-                .unwrap_or(0);
-            candidates = vec![candidates[representative]];
+        //
+        // A size trial gets to probe its first [`TYPE_GAIN_PROBES`] searched blocks with the
+        // whole set anyway, to measure what the type search is worth at that size. The probe only
+        // measures: the block still keeps DCT's result, so the trial's reconstruction, contexts
+        // and cost are exactly the ones a DCT-only trial produces, and the measurement is applied
+        // to the trial as a whole in `corrected_trial_cost`.
+        let trial = self.shortcuts() && !emit;
+        let mut probing = false;
+        if trial && candidates.len() > 1 {
+            if self.probe_budget > 0 {
+                self.probe_budget -= 1;
+                probing = true;
+            } else {
+                let representative = candidates
+                    .iter()
+                    .position(|&(_, tx_type)| tx_type == Av1TxType::DctDct)
+                    .unwrap_or(0);
+                candidates = vec![candidates[representative]];
+            }
         }
 
         let mut best: Option<TxCandidate> = None;
+        let mut cheapest = i64::MAX;
         for &(symbol, tx_type) in &candidates {
             #[cfg(test)]
             {
@@ -591,14 +663,23 @@ impl<'a> FrameEncoder<'a> {
                 distortion += error * error;
             }
             let cost = distortion + self.lambda * estimate_rate(&levels, &scan);
-            // Strictly less, so an exact tie keeps the earlier candidate and the winner is a
-            // function of `candidates` order alone. Ties are not hypothetical: on the 96x80 test
-            // pattern an 8x8 block scores `IDTX` and `DCT_DCT` at exactly the same cost, and the
-            // set order is what decides it. That is the whole margin issue #231 was about - a
-            // one-unit cost difference there would flip which type the block writes - so the
+            cheapest = cheapest.min(cost);
+            // A probe ranks the block on DCT like any other trial block; every other pass keeps
+            // the cheapest type, which on the emitting pass is the type actually written.
+            //
+            // The keep test is strictly less, so an exact tie keeps the earlier candidate and the
+            // winner is a function of `candidates` order alone. Ties are not hypothetical: on the
+            // 96x80 test pattern an 8x8 block scores `IDTX` and `DCT_DCT` at exactly the same
+            // cost, and the set order is what decides it. That zero margin is what issue #231 was
+            // about - a one-unit cost difference there flips which type the block writes - so the
             // comparison has to be a total order over a fixed candidate order rather than
             // anything that depends on evaluation order or on the host.
-            if best.as_ref().is_none_or(|best| cost < best.cost) {
+            let keep = if probing {
+                tx_type == Av1TxType::DctDct || best.is_none()
+            } else {
+                best.as_ref().is_none_or(|best| cost < best.cost)
+            };
+            if keep {
                 best = Some(TxCandidate {
                     symbol,
                     tx_type,
@@ -607,6 +688,11 @@ impl<'a> FrameEncoder<'a> {
                     cost,
                 });
             }
+        }
+        if probing {
+            let dct = best.as_ref().map_or(0, |best| best.cost);
+            self.probe_dct_cost += dct;
+            self.probe_best_cost += cheapest.min(dct);
         }
         // `tx_type` itself is only read by the trace the tests assert on; the bitstream carries
         // its `symbol` index instead.
@@ -638,6 +724,9 @@ impl<'a> FrameEncoder<'a> {
             if let Some(tx_cdf) = cdf::tx_type_cdf(set, size, 0) {
                 self.sym.encode_symbol(symbol, tx_cdf);
             }
+        }
+        if trial {
+            self.trial_searched_cost += cost;
         }
         cost
     }
