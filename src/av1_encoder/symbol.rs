@@ -37,8 +37,14 @@ pub struct SymbolEncoder {
     rng: u32,
     /// Bit counter; starts at `-9` so the first carry/byte crosses zero at the right moment.
     cnt: i32,
-    /// Output bytes, each held as a `u16` so a pending carry lives in bit 8 until `finish`.
-    precarry: Vec<u16>,
+    /// Coded bytes, already carry-resolved. `od_ec` buffers every byte as a `u16` and resolves the
+    /// pending carries in a second reverse pass over the whole stream at `finish`; this keeps the
+    /// sink half as wide and drops that pass by normalising each byte as it arrives (see
+    /// [`SymbolEncoder::push_byte`]).
+    out: Vec<u8>,
+    /// Length of the run of `0xFF` bytes at the end of `out`, which is exactly the span an
+    /// incoming carry has to sweep before it lands.
+    ff_run: usize,
 }
 
 impl Default for SymbolEncoder {
@@ -55,7 +61,8 @@ impl SymbolEncoder {
             low: 0,
             rng: CDF_PROB_TOP,
             cnt: -9,
-            precarry: Vec::new(),
+            out: Vec::new(),
+            ff_run: 0,
         }
     }
 
@@ -84,10 +91,57 @@ impl SymbolEncoder {
     /// This is the inverse of the decoder's `read_literal(n)` (AV1 §8.2.5), which itself calls
     /// `read_bool()` (§8.2.3) with the fixed CDF `{1 << 14, 1 << 15}`.
     pub fn encode_literal(&mut self, value: u32, n: u32) {
-        const BOOL_CDF: [u16; 2] = [1 << 14, 1 << 15];
-        for i in (0..n).rev() {
-            self.encode_symbol(((value >> i) & 1) as usize, &BOOL_CDF);
+        debug_assert!(n <= 32);
+        if n == 0 {
+            return;
         }
+        // Specialisation of `encode_q15` for the fixed CDF `{1 << 14, 1 << 15}`, which is the only
+        // one `read_bool` ever uses. With `nsyms = 2` both branches collapse onto the same
+        // split point
+        //
+        //     w = ((rng >> 8) << 7) + EC_MIN_PROB
+        //
+        // because `fh >> EC_PROB_SHIFT` is `256` for a zero bit and the `EC_MIN_PROB` term is `4`
+        // either way: a zero bit keeps `low` and takes `rng - w`, a one bit adds `rng - w` to `low`
+        // and takes `w`. That is bit-for-bit what the CDF path computes, so the stream is
+        // unchanged; what the run buys is keeping `low`, `rng` and `cnt` in registers across the
+        // whole run instead of reloading them, and dropping the CDF slice indexing and the
+        // per-symbol branch on `fl < CDF_PROB_TOP`.
+        let mut low = self.low;
+        let mut rng = self.rng;
+        let mut cnt = self.cnt;
+        for i in (0..n).rev() {
+            debug_assert!(rng >= CDF_PROB_TOP);
+            let w = ((rng >> 8) << 7) + EC_MIN_PROB;
+            if (value >> i) & 1 == 0 {
+                rng -= w;
+            } else {
+                low += u64::from(rng - w);
+                rng = w;
+            }
+            // `normalize`, inlined so the state stays in locals for the next bit.
+            let d = rng.leading_zeros() - 16;
+            let mut s = cnt + d as i32;
+            if s >= 0 {
+                cnt += 16;
+                let mut m = (1u64 << cnt) - 1;
+                if s >= 8 {
+                    self.push_byte((low >> cnt) as u16);
+                    low &= m;
+                    cnt -= 8;
+                    m = (1u64 << cnt) - 1;
+                }
+                self.push_byte((low >> cnt) as u16);
+                s = cnt + d as i32 - 24;
+                low &= m;
+            }
+            low <<= d;
+            rng <<= d;
+            cnt = s;
+        }
+        self.low = low;
+        self.rng = rng;
+        self.cnt = cnt;
     }
 
     /// Core interval update for one symbol; `fl`/`fh` are the inverse-CDF brackets, `s` the symbol,
@@ -126,12 +180,12 @@ impl SymbolEncoder {
             c += 16;
             let mut m = (1u64 << c) - 1;
             if s >= 8 {
-                self.precarry.push((low >> c) as u16);
+                self.push_byte((low >> c) as u16);
                 low &= m;
                 c -= 8;
                 m = (1u64 << c) - 1;
             }
-            self.precarry.push((low >> c) as u16);
+            self.push_byte((low >> c) as u16);
             s = c + d as i32 - 24;
             low &= m;
         }
@@ -140,9 +194,37 @@ impl SymbolEncoder {
         self.cnt = s;
     }
 
+    /// Appends one nine-bit `od_ec` output digit, resolving its carry immediately.
+    ///
+    /// The buffered stream is a base-256 numeral whose digits arrive most-significant first, so a
+    /// digit above `0xFF` carries one into the byte already written. `out` is kept normalised, so
+    /// that carry can only sweep the trailing run of `0xFF` bytes — which is what `ff_run` tracks —
+    /// before landing on a byte that can absorb it. Each `0xFF` is pushed once and swept at most
+    /// once, so the sweep is amortised constant time. A carry off the front of the stream is
+    /// discarded, exactly as `od_ec_enc_done`'s reverse pass discards it.
+    fn push_byte(&mut self, value: u16) {
+        debug_assert!(value <= 0x1ff, "od_ec output digits are nine bits wide");
+        if value > 0xff {
+            let end = self.out.len();
+            let start = end - self.ff_run;
+            self.out[start..end].fill(0);
+            if start > 0 {
+                self.out[start - 1] += 1;
+            }
+            self.ff_run = 0;
+        }
+        let byte = (value & 0xff) as u8;
+        self.out.push(byte);
+        if byte == 0xff {
+            self.ff_run += 1;
+        } else {
+            self.ff_run = 0;
+        }
+    }
+
     /// Flushes the coder and returns the coded bytes. Mirrors `od_ec_enc_done`: it emits the
-    /// minimum number of bits that decode correctly regardless of trailing padding, then resolves
-    /// the buffered carries into a big-endian byte stream.
+    /// minimum number of bits that decode correctly regardless of trailing padding. The carries
+    /// are already resolved by [`SymbolEncoder::push_byte`], so no second pass is needed.
     #[must_use]
     pub fn finish(mut self) -> Vec<u8> {
         let l = self.low;
@@ -153,7 +235,7 @@ impl SymbolEncoder {
         if s > 0 {
             let mut n = (1u64 << (c + 16)) - 1;
             loop {
-                self.precarry.push((e >> (c + 16)) as u16);
+                self.push_byte((e >> (c + 16)) as u16);
                 e &= n;
                 s -= 8;
                 c -= 8;
@@ -163,15 +245,7 @@ impl SymbolEncoder {
                 }
             }
         }
-        // Resolve carries from least- to most-significant byte (big-endian output).
-        let mut out = vec![0u8; self.precarry.len()];
-        let mut carry: u32 = 0;
-        for i in (0..self.precarry.len()).rev() {
-            let val = u32::from(self.precarry[i]) + carry;
-            out[i] = (val & 0xff) as u8;
-            carry = val >> 8;
-        }
-        out
+        self.out
     }
 }
 
@@ -351,6 +425,161 @@ mod tests {
         let mut dec = SymbolDecoder::new(&bytes);
         for (v, n) in events {
             assert_eq!(dec.read_literal(n), v);
+        }
+    }
+
+    /// Bit-at-a-time reference for [`SymbolEncoder::encode_literal`]: the fixed-CDF `read_bool`
+    /// path the AV1 spec defines `read_literal(n)` in terms of (§8.2.5, §8.2.3).
+    fn encode_literal_bit_at_a_time(enc: &mut SymbolEncoder, value: u32, n: u32) {
+        const BOOL_CDF: [u16; 2] = [1 << 14, 1 << 15];
+        for i in (0..n).rev() {
+            enc.encode_symbol(((value >> i) & 1) as usize, &BOOL_CDF);
+        }
+    }
+
+    #[test]
+    fn unrolled_literal_run_matches_bit_at_a_time_at_every_run_length() {
+        // Every run length the coefficient path can produce (signs are 1, golomb tails run up to
+        // the 2 * len - 1 field width), each checked byte-identical against the reference engine.
+        let mut rng = Lcg(0xa5a5_1234_dead_0001);
+        for n in 1..=24u32 {
+            let mask = if n == 32 { u32::MAX } else { (1u32 << n) - 1 };
+            // Exhaustive for the narrow widths, sampled plus the extremes for the wide ones.
+            let values: Vec<u32> = if n <= 10 {
+                (0..=mask).collect()
+            } else {
+                let mut v = vec![0, 1, mask, mask >> 1, mask ^ 1];
+                v.extend((0..256).map(|_| rng.next_u32() & mask));
+                v
+            };
+            for &value in &values {
+                let mut fast = SymbolEncoder::new();
+                fast.encode_literal(value, n);
+                let mut reference = SymbolEncoder::new();
+                encode_literal_bit_at_a_time(&mut reference, value, n);
+                assert_eq!(
+                    fast.finish(),
+                    reference.finish(),
+                    "run length {n}, value {value:#x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unrolled_literal_runs_match_bit_at_a_time_when_interleaved_with_symbols() {
+        // A single run in isolation starts from the initial state; the coefficient path reaches
+        // `encode_literal` at arbitrary `(low, rng, cnt)`, including with carries pending, so drive
+        // both engines through the same long mixed stream and compare the whole bitstream.
+        let mut rng = Lcg(0x1357_9bdf_2468_ace0);
+        let cdfs: Vec<Vec<u16>> = (2..=14).map(|n| random_cdf(&mut rng, n)).collect();
+        let mut fast = SymbolEncoder::new();
+        let mut reference = SymbolEncoder::new();
+        for _ in 0..50_000 {
+            if rng.next_u32() & 1 == 0 {
+                let cdf = &cdfs[rng.below(cdfs.len() as u32) as usize];
+                let s = rng.below(cdf.len() as u32) as usize;
+                fast.encode_symbol(s, cdf);
+                reference.encode_symbol(s, cdf);
+            } else {
+                let n = 1 + rng.below(24);
+                let value = rng.next_u32() & ((1u32 << n) - 1);
+                fast.encode_literal(value, n);
+                encode_literal_bit_at_a_time(&mut reference, value, n);
+            }
+        }
+        assert_eq!(fast.finish(), reference.finish());
+    }
+
+    /// `od_ec_enc_done`'s original carry resolution: buffer every nine-bit digit, then sweep the
+    /// whole stream from the end. This is the oracle the eager sink has to match exactly.
+    fn resolve_carries_reference(digits: &[u16]) -> Vec<u8> {
+        let mut out = vec![0u8; digits.len()];
+        let mut carry: u32 = 0;
+        for i in (0..digits.len()).rev() {
+            let val = u32::from(digits[i]) + carry;
+            out[i] = (val & 0xff) as u8;
+            carry = val >> 8;
+        }
+        out
+    }
+
+    #[test]
+    fn eager_carry_sink_matches_the_reverse_pass() {
+        let mut rng = Lcg(0xffff_0000_ffff_0001);
+        let mut cases: Vec<Vec<u16>> = vec![
+            vec![],
+            vec![0x000],
+            // A carry off the front of the stream, which both engines discard.
+            vec![0x1ff],
+            vec![0x0ff, 0x1ff],
+            // A carry sweeping a long run of 0xFF bytes back onto a byte that can absorb it.
+            {
+                let mut v = vec![0x012];
+                v.extend(std::iter::repeat_n(0x0ff, 64));
+                v.push(0x1ab);
+                v
+            },
+            // The same run, but with nothing in front of it to absorb the carry.
+            {
+                let mut v = vec![0x0ff; 32];
+                v.push(0x100);
+                v
+            },
+            // Back-to-back carries, so a digit is swept more than once across the stream.
+            {
+                let mut v = vec![0x001];
+                for _ in 0..16 {
+                    v.extend([0x0ff, 0x0ff, 0x1fe]);
+                }
+                v
+            },
+        ];
+        // Plus random digit streams biased toward the values that make carries interesting.
+        for _ in 0..200 {
+            let len = 1 + rng.below(128) as usize;
+            cases.push(
+                (0..len)
+                    .map(|_| match rng.below(4) {
+                        0 => 0x0ff,
+                        1 => 0x100 + rng.below(0x100) as u16,
+                        _ => rng.below(0x100) as u16,
+                    })
+                    .collect(),
+            );
+        }
+        for digits in &cases {
+            let mut enc = SymbolEncoder::new();
+            for &d in digits {
+                enc.push_byte(d);
+            }
+            assert_eq!(
+                enc.out,
+                resolve_carries_reference(digits),
+                "digits {digits:x?}"
+            );
+        }
+    }
+
+    #[test]
+    fn carry_heavy_streams_roundtrip() {
+        // A CDF skewed hard toward the symbol that grows `low` is what drives carries through the
+        // sink in real coding, so check the decoder still reads such a stream back exactly.
+        let mut rng = Lcg(0x2468_ace0_1357_9bdf);
+        for &(lo, bound) in &[(4u16, 64u32), (32764, 3), (16384, 2)] {
+            let skewed: Vec<u16> = vec![lo, 32768];
+            let mut enc = SymbolEncoder::new();
+            let mut events = Vec::new();
+            for _ in 0..20_000 {
+                let s = usize::from(rng.below(bound) != 0);
+                enc.encode_symbol(s, &skewed);
+                events.push(s);
+            }
+            let bytes = enc.finish();
+            let mut dec = SymbolDecoder::new(&bytes);
+            for (i, s) in events.iter().enumerate() {
+                assert_eq!(dec.read_symbol(&skewed), *s, "lo={lo} event {i}");
+            }
         }
     }
 

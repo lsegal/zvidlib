@@ -18,7 +18,7 @@
 //! | `hevc_decode_1080p` | whole-frame decode through `ExactFrameReader` | n/a |
 //! | `hevc_decode` | whole-frame `submit`-to-RGBA round trip, one arm per instruction set | n/a |
 //! | `hevc_decode_to_picture` | the same decode stopping at the decoded `Picture` | n/a |
-//! | `hevc_inter_pred` | §8.5.3.3 8-tap luma interpolation + weighted combine | yes |
+//! | `hevc_inter_pred` | §8.5.3.3 interpolation + weighted combine, over the measured prediction-unit mix | yes |
 //! | `hevc_intra_pred` | §8.4.4.2 reference smoothing, planar / DC / angular | yes |
 //! | `hevc_deblock` | §8.7.2 luma block-edge deblocking | yes |
 //! | `hevc_sao` | §8.7.3 sample adaptive offset, band and edge | yes |
@@ -253,8 +253,13 @@ where
     bench_across_isas(criterion, &workload, || run(inputs));
 }
 
-/// §8.5.3.3 inter prediction: the 8-tap luma interpolation and the weighted
-/// combine, the two `engine::simd` primitives.
+/// §8.5.3.3 inter prediction: the 8-tap luma and 4-tap chroma interpolation and
+/// the weighted combine, the two `engine::simd` primitives.
+///
+/// The workload is the prediction-unit mix issue #280 measured off a real
+/// 1080p decode — sizes, the uni/bi split and chroma — rather than the uniform
+/// 16x16 bi-predicted luma-only grid it used to be. See
+/// `crate::hevc::decode_bench::INTER_PU_MIX` for what that grid was missing.
 fn hevc_inter_pred_by_isa(criterion: &mut Criterion) {
     let samples = hevc_stage_inputs().inter_pred_samples();
     hevc_stage_group(criterion, "hevc_inter_pred", samples, |inputs| {
