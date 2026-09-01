@@ -48,6 +48,13 @@ pub struct AacSampleReader<D> {
     decoder: D,
     packets: Vec<EncodedAudioSample>,
     decoded: BTreeMap<u64, AudioBuffer>,
+    /// Inclusive packet-index bounds of the contiguous run held in `decoded`.
+    ///
+    /// The run is exactly what the decoder has produced since its last reset,
+    /// minus any packets evicted from its front, so `resident.1 + 1` is the
+    /// packet the decoder is positioned to decode next without a reset.
+    resident: Option<(usize, usize)>,
+    resident_bytes: u64,
     timing: AudioTrackTiming,
     sample_rate: u32,
     channels: u16,
@@ -110,6 +117,8 @@ impl<D: AacDecoder> AacSampleReader<D> {
             decoder,
             packets,
             decoded: BTreeMap::new(),
+            resident: None,
+            resident_bytes: 0,
             timing,
             sample_rate,
             channels,
@@ -183,8 +192,40 @@ impl<D: AacDecoder> AacSampleReader<D> {
     /// Cancels are caller-owned; reset drops queued decode state before a seek.
     pub fn reset(&mut self) -> Result<()> {
         self.decoder.reset()?;
-        self.decoded.clear();
+        self.discard_resident();
         Ok(())
+    }
+
+    fn discard_resident(&mut self) {
+        self.decoded.clear();
+        self.resident = None;
+        self.resident_bytes = 0;
+    }
+
+    /// Packets retained behind the request are dropped once the resident run
+    /// exceeds either bound `Limits` already defines for a decode: at most
+    /// `max_decode_samples_per_seek` packets, holding at most
+    /// `max_allocation_bytes` of decoded samples. Only packets before
+    /// `keep_from` are eligible, so a request never evicts what it just
+    /// decoded for itself.
+    fn evict_behind(&mut self, keep_from: usize) {
+        let Some((mut start, end)) = self.resident else {
+            return;
+        };
+        let max_packets = self.limits.max_decode_samples_per_seek as usize;
+        while start < keep_from
+            && (end - start + 1 > max_packets
+                || self.resident_bytes > self.limits.max_allocation_bytes)
+        {
+            if let Some(buffer) = self
+                .decoded
+                .remove(&self.packets[start].decoded_range.start)
+            {
+                self.resident_bytes = self.resident_bytes.saturating_sub(buffer_bytes(&buffer));
+            }
+            start += 1;
+        }
+        self.resident = Some((start, end));
     }
 
     fn mappings(&self, request: SampleRange) -> Result<Vec<Mapping>> {
@@ -231,22 +272,36 @@ impl<D: AacDecoder> AacSampleReader<D> {
             .iter()
             .rposition(|packet| packet.decoded_range.start < range.end)
             .ok_or_else(|| invalid("audio edit maps before decoded AAC samples"))?;
-        let decode_start = first.saturating_sub(self.preroll_packets);
-        let decode_work = last - decode_start + 1;
-        if decode_work > self.limits.max_decode_samples_per_seek as usize {
+        let seek_start = first.saturating_sub(self.preroll_packets);
+        if last - seek_start + 1 > self.limits.max_decode_samples_per_seek as usize {
             return Err(limit(
                 "AAC request exceeded the configured decode-work limit",
             ));
         }
-        if (first..=last).all(|index| {
-            self.decoded
-                .contains_key(&self.packets[index].decoded_range.start)
-        }) {
-            return Ok(());
-        }
-        self.decoder.reset()?;
-        self.decoded.clear();
-        for index in decode_start..=last {
+        // A request whose window sits inside the resident run needs nothing. A
+        // request that starts inside it, or immediately after it, and reaches
+        // past its end is the forward-sequential playback case: the decoder is
+        // already positioned on the next packet, so extend the run in place
+        // rather than resetting and re-decoding the preroll. Anything else -
+        // cold, backwards, or separated by a gap - takes the reset path, which
+        // is what a real seek needs.
+        let decode_from = match self.resident {
+            Some((resident_start, resident_end))
+                if first >= resident_start && first <= resident_end + 1 =>
+            {
+                if last <= resident_end {
+                    self.evict_behind(first);
+                    return Ok(());
+                }
+                resident_end + 1
+            }
+            _ => {
+                self.decoder.reset()?;
+                self.discard_resident();
+                seek_start
+            }
+        };
+        for index in decode_from..=last {
             if cancellation.is_cancelled() {
                 return Err(cancelled());
             }
@@ -261,14 +316,28 @@ impl<D: AacDecoder> AacSampleReader<D> {
                     "AAC decoder output does not match its packet interval or format",
                 ));
             }
+            self.resident_bytes = self.resident_bytes.saturating_add(buffer_bytes(&buffer));
             self.decoded.insert(buffer.range.start, buffer);
+            self.resident = Some((self.resident.map_or(index, |(start, _)| start), index));
         }
+        self.evict_behind(first);
         Ok(())
     }
 
     fn copy_media(&self, range: SampleRange, output_offset: u64, output: &mut [f32]) -> Result<()> {
         let channels = usize::from(self.channels);
-        for buffer in self.decoded.values() {
+        // Walk back from the last packet that can overlap. The resident run
+        // now spans more than one request, so visiting every buffer would make
+        // each read cost the size of the cache instead of the size of the read.
+        for buffer in self
+            .decoded
+            .range(..range.end)
+            .rev()
+            .map(|(_, buffer)| buffer)
+        {
+            if buffer.range.end <= range.start {
+                break;
+            }
             let start = range.start.max(buffer.range.start);
             let end = range.end.min(buffer.range.end);
             if start >= end {
@@ -400,6 +469,10 @@ fn shifted_edit(edit: AudioEdit, offset: i64) -> Result<Option<AudioEdit>> {
     }))
 }
 
+fn buffer_bytes(buffer: &AudioBuffer) -> u64 {
+    buffer.samples.len() as u64 * std::mem::size_of::<f32>() as u64
+}
+
 fn invalid(message: &str) -> Error {
     Error::new(ErrorKind::InvalidInput, message)
 }
@@ -414,9 +487,15 @@ fn cancelled() -> Error {
 mod tests {
     use super::*;
 
+    #[derive(Clone, Default)]
+    struct DecoderCounts {
+        resets: std::rc::Rc<std::cell::Cell<usize>>,
+        decodes: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
     #[derive(Default)]
     struct FixtureDecoder {
-        resets: usize,
+        counts: DecoderCounts,
     }
 
     impl AacDecoder for FixtureDecoder {
@@ -428,6 +507,7 @@ mod tests {
             if cancellation.is_cancelled() {
                 return Err(cancelled());
             }
+            self.counts.decodes.set(self.counts.decodes.get() + 1);
             let values = (sample.decoded_range.start..sample.decoded_range.end)
                 .map(|value| value as f32)
                 .collect();
@@ -435,9 +515,39 @@ mod tests {
         }
 
         fn reset(&mut self) -> Result<()> {
-            self.resets += 1;
+            self.counts.resets.set(self.counts.resets.get() + 1);
             Ok(())
         }
+    }
+
+    fn packets_of(count: u64) -> Vec<EncodedAudioSample> {
+        (0..count)
+            .map(|index| EncodedAudioSample {
+                decoded_range: SampleRange::new(index * 4, index * 4 + 4).unwrap(),
+                data: vec![index as u8],
+            })
+            .collect()
+    }
+
+    /// A counted reader over `count` four-sample packets and no gapless trims.
+    fn counted_reader(
+        count: u64,
+        preroll: usize,
+        limits: Limits,
+    ) -> (AacSampleReader<FixtureDecoder>, DecoderCounts) {
+        let decoder = FixtureDecoder::default();
+        let counts = decoder.counts.clone();
+        let reader = AacSampleReader::new(
+            decoder,
+            packets_of(count),
+            48_000,
+            1,
+            AudioTrackTiming::default(),
+            preroll,
+            limits,
+        )
+        .unwrap();
+        (reader, counts)
     }
 
     fn packets() -> Vec<EncodedAudioSample> {
@@ -530,5 +640,84 @@ mod tests {
             .get_range(SampleRange::new(0, 1).unwrap(), &cancellation)
             .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Cancelled);
+    }
+
+    #[test]
+    fn forward_sequential_reads_decode_each_packet_once() {
+        let (mut reader, counts) = counted_reader(8, 2, Limits::default());
+        let cancellation = CancellationToken::new();
+        // Start past the preroll depth so the first read pays for it, then
+        // walk forward one packet at a time.
+        for step in 3..8 {
+            let range = SampleRange::new(step * 4, step * 4 + 4).unwrap();
+            let buffer = reader.get_range(range, &cancellation).unwrap();
+            assert_eq!(
+                buffer.samples,
+                (step * 4..step * 4 + 4)
+                    .map(|v| v as f32)
+                    .collect::<Vec<_>>()
+            );
+        }
+        // Packets 1 through 7: the two preroll units ahead of packet 3 plus
+        // each requested unit, decoded once each and never re-decoded.
+        assert_eq!(counts.decodes.get(), 7);
+        assert_eq!(counts.resets.get(), 1);
+    }
+
+    #[test]
+    fn backward_and_distant_requests_still_reset_with_preroll() {
+        let (mut reader, counts) = counted_reader(8, 1, Limits::default());
+        let cancellation = CancellationToken::new();
+        reader
+            .get_range(SampleRange::new(12, 16).unwrap(), &cancellation)
+            .unwrap();
+        assert_eq!(counts.resets.get(), 1);
+        // Backwards of the resident run.
+        reader
+            .get_range(SampleRange::new(0, 4).unwrap(), &cancellation)
+            .unwrap();
+        assert_eq!(counts.resets.get(), 2);
+        // Forward but separated by a gap from the resident run.
+        let buffer = reader
+            .get_range(SampleRange::new(28, 32).unwrap(), &cancellation)
+            .unwrap();
+        assert_eq!(counts.resets.get(), 3);
+        assert_eq!(buffer.samples, vec![28.0, 29.0, 30.0, 31.0]);
+    }
+
+    #[test]
+    fn resident_packets_stay_within_the_configured_bound() {
+        let limits = Limits {
+            max_decode_samples_per_seek: 3,
+            ..Limits::default()
+        };
+        let (mut reader, _) = counted_reader(16, 0, limits);
+        let cancellation = CancellationToken::new();
+        for step in 0..16 {
+            reader
+                .get_range(
+                    SampleRange::new(step * 4, step * 4 + 4).unwrap(),
+                    &cancellation,
+                )
+                .unwrap();
+            assert!(reader.decoded.len() <= 3, "resident run grew unbounded");
+        }
+        // The allocation bound evicts too, independently of the packet count.
+        let limits = Limits {
+            // One four-sample packet is 16 bytes, so the request itself fits
+            // but a second resident packet does not.
+            max_allocation_bytes: 16,
+            ..Limits::default()
+        };
+        let (mut reader, _) = counted_reader(16, 0, limits);
+        for step in 0..16 {
+            reader
+                .get_range(
+                    SampleRange::new(step * 4, step * 4 + 4).unwrap(),
+                    &cancellation,
+                )
+                .unwrap();
+            assert!(reader.decoded.len() <= 2, "allocation bound did not evict");
+        }
     }
 }

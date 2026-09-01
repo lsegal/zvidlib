@@ -11,11 +11,12 @@
 //!    scale lines, as a realtime factor - the number that decides whether
 //!    playback can keep up.
 //! 2. [`AacSampleReader::get_range`], where the non-trivial work lives. Its
-//!    `decoded: BTreeMap` cache makes the same call cost two very different
+//!    `decoded: BTreeMap` cache makes the same call cost very different
 //!    things depending on whether the requested media range is already
-//!    resident, so the cache-hit path, the sequential playback walk, and the
-//!    random-access path that forces a decoder reset plus a preroll re-decode
-//!    are three separate groups. Averaging them together would hide the seek
+//!    resident, follows the resident run, or lands away from it - so the
+//!    cache-hit path, the sequential playback walk, and the random-access path
+//!    that forces a decoder reset plus a preroll re-decode are three separate
+//!    groups. Averaging them together would hide the seek
 //!    cost entirely, which is the one that shows up as an audible stall.
 //!
 //! # No scalar-versus-SIMD axis
@@ -153,12 +154,12 @@ fn aac_reader_sequential(criterion: &mut Criterion) {
     report_audio_throughput(&mut group, cached_id, cached_work);
     group.bench_function(cached_id, |bencher| bencher.iter(&mut cached_run));
 
-    // The playback path: consecutive forward ranges. `ensure_decoded` clears
-    // the whole cache whenever the requested packets are not all resident, so
-    // at this read size a request that advances past the previous one does not
-    // extend the cache - it discards it and re-decodes with preroll. That is
-    // why this arm measures close to the seek group rather than to the cached
-    // one, and it is a property of the reader, not of the fixture.
+    // The playback path: consecutive forward ranges. `ensure_decoded` extends
+    // the resident run when the requested packets follow the ones already
+    // decoded, so at this read size a request that advances past the previous
+    // one decodes only the access units it newly covers and pays no decoder
+    // reset or preroll. That is why this arm measures far below the seek
+    // group, and it is a property of the reader, not of the fixture.
     let forward_id = "forward_walk_stereo_48k";
     let forward_ranges = (0..SEQUENTIAL_READS)
         .map(|step| range_at(SEQUENTIAL_START + step * READ_SAMPLES, READ_SAMPLES))
