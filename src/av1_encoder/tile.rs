@@ -531,6 +531,11 @@ impl<'a> FrameEncoder<'a> {
             self.left_dc.fill(0);
             let mut c = 0;
             while c < self.mi_cols {
+                // A probe is only ever read back inside the superblock that measured it - the
+                // emitting pass reaches a probed block while the trial that probed it is still
+                // the state it replays - so the cache is dropped at each superblock boundary
+                // rather than accumulating every speculative trial of the frame.
+                self.probed.clear();
                 self.encode_partition(r, c, 64, true);
                 c += SB4;
             }

@@ -1108,6 +1108,52 @@ mod nonlossless_tests {
         }
     }
 
+    /// What reading a size trial's probe back on the emitting pass saves.
+    ///
+    /// Prints transform-type candidate evaluations and wall-clock seconds at 640x352, the frame
+    /// `av1_encode_frame_q{32,160}` measures, with the reuse on and off. Interleaved rounds with
+    /// the minimum taken per arm, because a single pass would attribute this host's own load to
+    /// whichever arm happened to run under it.
+    #[test]
+    #[ignore = "measurement sweep, not an assertion"]
+    fn measure_probe_reuse_cost() {
+        use std::time::Instant;
+        let (width, height) = (640_usize, 352_usize);
+        let pixels = test_pattern(width as u32, height as u32);
+        let mut seconds = std::collections::BTreeMap::new();
+        let mut candidates = std::collections::BTreeMap::new();
+        let mut bytes = std::collections::BTreeMap::new();
+        for _ in 0..8 {
+            for qindex in [32_u8, 160] {
+                for reuse in [true, false] {
+                    let start = Instant::now();
+                    let encoder = tile::FrameEncoder::new(&pixels, width, height, qindex);
+                    let report = if reuse {
+                        encoder.encode_with_report()
+                    } else {
+                        encoder.without_probe_reuse().encode_with_report()
+                    };
+                    let elapsed = start.elapsed().as_secs_f64();
+                    let slot = seconds.entry((qindex, reuse)).or_insert(f64::MAX);
+                    *slot = slot.min(elapsed);
+                    candidates.insert((qindex, reuse), report.candidates_evaluated);
+                    bytes.insert((qindex, reuse), report.tile.len());
+                }
+            }
+        }
+        println!("qindex,reuse,seconds,candidates,bytes");
+        for qindex in [32_u8, 160] {
+            for reuse in [true, false] {
+                println!(
+                    "{qindex},{reuse},{:.4},{},{}",
+                    seconds[&(qindex, reuse)],
+                    candidates[&(qindex, reuse)],
+                    bytes[&(qindex, reuse)]
+                );
+            }
+        }
+    }
+
     #[test]
     #[ignore = "measurement sweep, not an assertion"]
     fn measure_type_gain_sampling_cost() {
