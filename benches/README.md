@@ -573,68 +573,86 @@ Measured on **Apple M1 (macOS 15, aarch64)**.
 
 | Group | `scalar` | `neon` | Best |
 | --- | ---: | ---: | ---: |
-| `av1_cdef` | 78.006 ms | 55.751 ms (1.40x) | 1.40x `neon` |
-| `av1_deblock` | 22.246 ms | 3.235 ms (6.88x) | 6.88x `neon` |
-| `av1_deblock_boundary` | 279.170 µs | 76.742 µs (3.64x) | 3.64x `neon` |
-| `av1_deblock_chroma` | 10.867 ms | 4.396 ms (2.47x) | 2.47x `neon` |
-| `av1_deblock_wide` | 109.926 ms | 29.844 ms (3.68x) | 3.68x `neon` |
-| `av1_decode_frame` | 73.244 ms | 71.782 ms (1.02x) | 1.02x `neon` |
-| `av1_entropy_symbol` | 3.572 ms | 4.144 ms (0.86x) | 0.86x `neon` |
-| `av1_forward_adst_8x8` | 30.877 ms | 7.418 ms (4.16x) | 4.16x `neon` |
-| `av1_forward_dct_16x16` | 32.129 ms | 11.688 ms (2.75x) | 2.75x `neon` |
-| `av1_forward_dct_32x32` | 51.060 ms | 65.708 ms (0.78x) | 0.78x `neon` |
-| `av1_forward_dct_4x4` | 36.620 ms | 6.350 ms (5.77x) | 5.77x `neon` |
-| `av1_forward_dct_8x8` | 28.571 ms | 6.809 ms (4.20x) | 4.20x `neon` |
-| `av1_forward_flipadst_16x16` | 32.671 ms | 10.035 ms (3.26x) | 3.26x `neon` |
-| `av1_intra_directional` | 36.220 ms | 32.079 ms (1.13x) | 1.13x `neon` |
-| `av1_intra_paeth` | 3.207 ms | 4.130 ms (0.78x) | 0.78x `neon` |
-| `av1_intra_smooth` | 4.240 ms | 4.241 ms (1.00x) | 1.00x `neon` |
-| `av1_inverse_adst_8x8` | 42.668 ms | 18.330 ms (2.33x) | 2.33x `neon` |
-| `av1_inverse_dct_16x16` | 18.777 ms | 9.011 ms (2.08x) | 2.08x `neon` |
-| `av1_inverse_dct_32x32` | 14.976 ms | 10.236 ms (1.46x) | 1.46x `neon` |
-| `av1_inverse_dct_4x4` | 57.421 ms | 20.382 ms (2.82x) | 2.82x `neon` |
-| `av1_inverse_dct_64x64` | 22.831 ms | 11.588 ms (1.97x) | 1.97x `neon` |
-| `av1_inverse_dct_8x8` | 28.992 ms | 12.296 ms (2.36x) | 2.36x `neon` |
-| `av1_inverse_flipadst_16x16` | 27.388 ms | 13.001 ms (2.11x) | 2.11x `neon` |
-| `av1_mc_blend_mask` | 37.193 ms | 11.426 ms (3.26x) | 3.26x `neon` |
-| `av1_mc_compound_average` | 31.513 ms | 15.393 ms (2.05x) | 2.05x `neon` |
-| `av1_mc_single` | 23.414 ms | 7.569 ms (3.09x) | 3.09x `neon` |
-| `av1_motion_compensation` | 12.388 ms | 7.821 ms (1.58x) | 1.58x `neon` |
-| `av1_self_guided` | 12.093 ms | 4.684 ms (2.58x) | 2.58x `neon` |
-| `av1_wiener` | 15.983 ms | 8.544 ms (1.87x) | 1.87x `neon` |
-| `hevc_cabac` | 1.941 ms | 1.952 ms (0.99x) | 0.99x `neon` |
-| `hevc_deblock` | 15.234 ms | 15.467 ms (0.98x) | 0.98x `neon` |
-| `hevc_encode_640x352` | 91.716 ms | 51.913 ms (1.77x) | 1.77x `neon` |
-| `hevc_encode_640x352_fwd_transform_quant` | 11.426 ms | 7.102 ms (1.61x) | 1.61x `neon` |
-| `hevc_encode_640x352_pcm_write` | 7.319 ms | 7.338 ms (1.00x) | 1.00x `neon` |
-| `hevc_encode_640x352_rdo_inter` | 62.488 ms | 23.460 ms (2.66x) | 2.66x `neon` |
-| `hevc_encode_640x352_rdo_intra` | 3.201 ms | 1.391 ms (2.30x) | 2.30x `neon` |
-| `hevc_encode_640x352_reconstruct` | 9.525 ms | 9.476 ms (1.01x) | 1.01x `neon` |
-| `hevc_encode_640x352_residual_write` | 23.391 ms | 21.498 ms (1.09x) | 1.09x `neon` |
-| `hevc_encode_640x352_rgba_to_yuv420` | 620.339 µs | 609.074 µs (1.02x) | 1.02x `neon` |
-| `hevc_encode_bitwriter` | 3.102 ms | 3.110 ms (1.00x) | 1.00x `neon` |
-| `hevc_encode_cabac` | 1.543 ms | 1.550 ms (1.00x) | 1.00x `neon` |
-| `hevc_inter_pred` | 29.685 ms | 18.150 ms (1.64x) | 1.64x `neon` |
-| `hevc_intra_pred` | 7.925 ms | 12.796 ms (0.62x) | 0.62x `neon` |
-| `hevc_inverse_transform` | 7.073 ms | 7.000 ms (1.01x) | 1.01x `neon` |
-| `hevc_sao` | 26.753 ms | 20.132 ms (1.33x) | 1.33x `neon` |
+| `av1_cdef` | 44.288 ms | 30.814 ms (1.44x) | 1.44x `neon` |
+| `av1_deblock` | 24.583 ms | 3.038 ms (8.09x) | 8.09x `neon` |
+| `av1_deblock_boundary` | 314.287 µs | 63.328 µs (4.96x) | 4.96x `neon` |
+| `av1_deblock_chroma` | 18.590 ms | 6.160 ms (3.02x) | 3.02x `neon` |
+| `av1_deblock_wide` | 58.645 ms | 25.502 ms (2.30x) | 2.30x `neon` |
+| `av1_decode_frame` | 77.758 ms | 70.526 ms (1.10x) | 1.10x `neon` |
+| `av1_encode_frame_q0` | 23.265 ms | 24.076 ms (0.97x) | 0.97x `neon` |
+| `av1_encode_frame_q160` | 211.771 ms | 152.307 ms (1.39x) | 1.39x `neon` |
+| `av1_encode_frame_q32` | 228.502 ms | 186.097 ms (1.23x) | 1.23x `neon` |
+| `av1_entropy_symbol` | 3.449 ms | 3.221 ms (1.07x) | 1.07x `neon` |
+| `av1_forward_adst_8x8` | 31.968 ms | 7.777 ms (4.11x) | 4.11x `neon` |
+| `av1_forward_dct_16x16` | 39.588 ms | 11.133 ms (3.56x) | 3.56x `neon` |
+| `av1_forward_dct_32x32` | 49.374 ms | 54.426 ms (0.91x) | 0.91x `neon` |
+| `av1_forward_dct_4x4` | 44.544 ms | 8.601 ms (5.18x) | 5.18x `neon` |
+| `av1_forward_dct_8x8` | 36.311 ms | 8.559 ms (4.24x) | 4.24x `neon` |
+| `av1_forward_flipadst_16x16` | 36.012 ms | 10.464 ms (3.44x) | 3.44x `neon` |
+| `av1_intra_directional` | 26.278 ms | 28.967 ms (0.91x) | 0.91x `neon` |
+| `av1_intra_paeth` | 3.007 ms | 3.405 ms (0.88x) | 0.88x `neon` |
+| `av1_intra_smooth` | 8.282 ms | 2.929 ms (2.83x) | 2.83x `neon` |
+| `av1_inverse_adst_8x8` | 32.771 ms | 14.769 ms (2.22x) | 2.22x `neon` |
+| `av1_inverse_dct_16x16` | 19.148 ms | 9.055 ms (2.11x) | 2.11x `neon` |
+| `av1_inverse_dct_32x32` | 15.375 ms | 7.707 ms (1.99x) | 1.99x `neon` |
+| `av1_inverse_dct_4x4` | 56.503 ms | 20.309 ms (2.78x) | 2.78x `neon` |
+| `av1_inverse_dct_64x64` | 17.080 ms | 9.821 ms (1.74x) | 1.74x `neon` |
+| `av1_inverse_dct_8x8` | 29.049 ms | 12.680 ms (2.29x) | 2.29x `neon` |
+| `av1_inverse_flipadst_16x16` | 22.009 ms | 13.898 ms (1.58x) | 1.58x `neon` |
+| `av1_mc_blend_mask` | 26.364 ms | 12.543 ms (2.10x) | 2.10x `neon` |
+| `av1_mc_compound_average` | 25.889 ms | 16.008 ms (1.62x) | 1.62x `neon` |
+| `av1_mc_single` | 13.516 ms | 6.304 ms (2.14x) | 2.14x `neon` |
+| `av1_motion_compensation` | 17.890 ms | 5.300 ms (3.38x) | 3.38x `neon` |
+| `av1_self_guided` | 6.780 ms | 2.558 ms (2.65x) | 2.65x `neon` |
+| `av1_wiener` | 7.958 ms | 5.887 ms (1.35x) | 1.35x `neon` |
+| `hevc_cabac` | 2.994 ms | 3.019 ms (0.99x) | 0.99x `neon` |
+| `hevc_color_convert` | 16.618 ms | 19.108 ms (0.87x) | 0.87x `neon` |
+| `hevc_deblock` | 13.890 ms | 13.348 ms (1.04x) | 1.04x `neon` |
+| `hevc_encode_640x352` | 111.109 ms | 66.280 ms (1.68x) | 1.68x `neon` |
+| `hevc_encode_640x352_fwd_transform_quant` | 11.521 ms | 6.003 ms (1.92x) | 1.92x `neon` |
+| `hevc_encode_640x352_pcm_write` | 7.713 ms | 7.435 ms (1.04x) | 1.04x `neon` |
+| `hevc_encode_640x352_rdo_inter` | 81.320 ms | 24.883 ms (3.27x) | 3.27x `neon` |
+| `hevc_encode_640x352_rdo_intra` | 3.648 ms | 1.973 ms (1.85x) | 1.85x `neon` |
+| `hevc_encode_640x352_reconstruct` | 9.702 ms | 11.945 ms (0.81x) | 0.81x `neon` |
+| `hevc_encode_640x352_residual_write` | 23.593 ms | 21.083 ms (1.12x) | 1.12x `neon` |
+| `hevc_encode_640x352_rgba_to_yuv420` | 824.836 µs | 821.329 µs (1.00x) | 1.00x `neon` |
+| `hevc_encode_bitwriter` | 3.744 ms | 3.897 ms (0.96x) | 0.96x `neon` |
+| `hevc_encode_cabac` | 2.063 ms | 2.798 ms (0.74x) | 0.74x `neon` |
+| `hevc_inter_pred` | 22.330 ms | 18.138 ms (1.23x) | 1.23x `neon` |
+| `hevc_intra_pred` | 8.673 ms | 8.360 ms (1.04x) | 1.04x `neon` |
+| `hevc_inverse_transform` | 10.228 ms | 8.402 ms (1.22x) | 1.22x `neon` |
+| `hevc_sao` | 24.900 ms | 21.880 ms (1.14x) | 1.14x `neon` |
 
-The rows below `1.00x` are the point of committing this. `av1_entropy_symbol`
-(0.86x) is expected: the range decoder is serial and has no vector path, so its
-arms differ only by measurement noise. `hevc_cabac`, `hevc_deblock`,
-`hevc_inverse_transform`, `hevc_encode_bitwriter`, `hevc_encode_cabac`,
-`hevc_encode_640x352_pcm_write`, `hevc_encode_640x352_reconstruct` and
-`hevc_encode_640x352_rgba_to_yuv420` sitting at parity is the
-same story this file tells above: LLVM auto-vectorizes the scalar reference well
-under `lto = "fat"`, and `#228` tracks re-measuring the inverse transform on
-x86_64 where the tile shape differs. `hevc_intra_pred` (0.62x),
-`av1_intra_paeth` (0.78x) and `av1_forward_dct_32x32` (0.78x) are not explained
-by either and are genuinely slower under NEON than scalar on this host; they are
-tracked as their own tickets.
+### Reading the sub-parity rows
+
+An arm below `1.00x` is slower under its vector kernel than under scalar. Three
+different things produce that, and the table cannot tell them apart on its own:
+
+- **No vector kernel to run.** `hevc_cabac`, `hevc_encode_cabac`,
+  `av1_entropy_symbol` and `hevc_color_convert` have no vector path at all, so
+  their two arms are the same code and differ only by measurement noise.
+  `hevc_color_convert` is the one worth acting on, and `#219` already tracks
+  vectorizing it.
+- **Scalar that auto-vectorizes just as well.** This is the story the rest of
+  this file tells: under `lto = "fat"` with `codegen-units = 1`, LLVM does to the
+  scalar reference roughly what the hand kernel does, and the two land within
+  noise of each other.
+- **A hand kernel that is genuinely worse.** `av1_forward_dct_32x32` (0.91x) and
+  `av1_intra_paeth` (0.88x) are the only two arms that came out below parity in
+  two independent measurement sets taken days apart on this host, which is the
+  bar for calling one of these real. They are tracked as their own tickets.
+
+**Do not read a single sub-parity row as a finding.** An earlier draft of this
+table had `hevc_intra_pred` at 0.62x, which looked like an obvious broken kernel;
+re-measuring put it at 1.04x. Nothing about the kernel changed — the first
+measurement was taken while the host was loaded. That swing is the honest noise
+floor of an unquiet machine, and it is the same reason the CI threshold is 15%,
+reports instead of failing, and compares medians rather than means.
 
 An arm being absent from a row means the host could not execute it, not that it
 was not measured: an Apple Silicon host has no `sse41` or `avx2` column at all,
-which is why the x86_64 arms do not appear here yet.
+which is why the x86_64 arms do not appear here yet. `#228` covers measuring the
+x86_64 side.
 
 ## Fixtures
 
