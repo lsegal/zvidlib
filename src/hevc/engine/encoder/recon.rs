@@ -688,6 +688,23 @@ fn rd_score(gain: i64, bins: u64, lambda_q8: u32) -> i64 {
     gain - (bins * u64::from(lambda_q8) / 256) as i64
 }
 
+/// The widest the slice-level SAO decision's calibrated multiplier is allowed
+/// to depart from `lambda_q8`, as a factor either way. It bounds how far a
+/// two-point measurement of one picture is trusted over the closed form —
+/// and, because it is a bound known before the measurement is taken, it is
+/// also what lets `keeps_sao` skip the measurement whenever the decision is
+/// already outside the band, and what [`band_offset_bins`] charges band
+/// offset's own syntax at.
+pub(super) const SAO_LAMBDA_BAND: u64 = 4;
+
+/// What band offset's own syntax — the five `sao_band_position` bins and its
+/// `sao_offset_sign` bins — is charged per bin, as a multiple of `lambda_q8`,
+/// numerator over denominator. It is the coarse end of the departure the
+/// slice-level decision measured between the closed form and what a picture's
+/// own curve pays per bit: 0.4x to 2.5x, in neither direction consistently.
+const BAND_SYNTAX_CHARGE_NUM: u64 = 5;
+const BAND_SYNTAX_CHARGE_DEN: u64 = 2;
+
 /// The §7.3.8.3 bins one band-offset component costs beyond its shared
 /// `sao_type_idx` bin: a `sao_offset_sign` for every nonzero offset, the five
 /// fixed-length `sao_band_position` bins, and the offsets' own truncated-Rice
@@ -696,9 +713,25 @@ fn rd_score(gain: i64, bins: u64, lambda_q8: u32) -> i64 {
 /// This is what makes band offset a different bet from edge offset at the
 /// same gain: it pays five position bins and up to four sign bins where edge
 /// offset pays two class bins and infers its signs.
+///
+/// Those band-only bins — the position and the signs — are charged at
+/// [`BAND_SYNTAX_CHARGE_NUM`]/[`BAND_SYNTAX_CHARGE_DEN`] times `lambda_q8`
+/// rather than at `lambda_q8` itself. The closed form is derived for choosing
+/// between two codings of one block; edge offset's rate is the part of that
+/// trade the sweep has always been measured on, while these bins are rate the
+/// closed form has never been checked against, and the slice-level decision
+/// measured the closed form missing what a picture's own curve pays per bit
+/// by up to 2.5x. Charging them at that coarse end means band offset is taken
+/// where it wins by more than the uncertainty in its own price and left alone
+/// where it wins by less — which at coarse QPs is the difference between a
+/// slice that sits on the writer's own rate-distortion curve and one that
+/// sits a hair under it, and at [`SAO_LAMBDA_BAND`], the trust bound rather
+/// than the measured end, would be the difference between band offset paying
+/// at QP 12 and never being selected at all.
 fn band_offset_bins(offsets: &[i32; 5]) -> u64 {
     let signs = offsets[1..5].iter().filter(|&&o| o != 0).count() as u64;
-    5 + signs + offset_abs_bins(offsets)
+    (BAND_SYNTAX_CHARGE_NUM * (5 + signs)).div_ceil(BAND_SYNTAX_CHARGE_DEN)
+        + offset_abs_bins(offsets)
 }
 
 /// The per-band summed and counted error of one CTB of one plane, indexed by
