@@ -366,71 +366,81 @@ build's.
 #### The breakdown
 
 48 frames of `examples/media/BigBuckBunny.mp4` (1920x1080, HEVC Main 8-bit
-4:2:0) on an Apple Silicon host, `--release`, best of three interleaved rounds
-per arm. Both arms are reported side by side because since issue #219 gave
-`color_convert` a kernel of its own they no longer agree to within a point: the
-`scalar` arm runs 30.20 ms/frame and the `neon` arm 21.39 ms/frame, a 1.41x
-whole-frame ratio where the pre-#219 measurement read ~1.06x.
+4:2:0) on an Apple Silicon host (M1, 8 cores), `--release`, minimum of six
+interleaved rounds per arm. Both arms are reported side by side because since
+issue #219 gave `color_convert` a kernel of its own they no longer agree to
+within a point: the `scalar` arm runs 27.23 ms/frame and the `neon` arm 19.32
+ms/frame, a 1.41x whole-frame ratio.
 
-`scalar` arm, 30.20 ms/frame:
-
-| Stage | Share of total | Share of decode | ms/frame | Vectorized |
-| --- | ---: | ---: | ---: | --- |
-| `color_convert` | 32.7% | n/a | 9.86 | yes |
-| `inter_pred` | 23.1% | 34.3% | 6.98 | yes |
-| `sao` | 9.2% | 13.7% | 2.78 | yes |
-| `deblock` | 8.0% | 11.9% | 2.43 | yes |
-| `intra_pred` | 3.9% | 5.7% | 1.16 | yes |
-| `residual_cabac` | 3.7% | 5.5% | 1.12 | no |
-| `motion_derive` | 3.3% | 4.9% | 1.00 | no |
-| `inverse_transform` | 2.9% | 4.2% | 0.86 | yes |
-| `slice_data_cabac` | 2.1% | 3.1% | 0.62 | no |
-| `dpb_output` | 1.8% | 2.6% | 0.53 | no |
-| `header_parse` | 0.0% | 0.0% | 0.01 | no |
-| _unattributed_ | 9.4% | 14.0% | 2.85 | n/a |
-
-`neon` arm, 21.39 ms/frame:
+`scalar` arm, 27.23 ms/frame:
 
 | Stage | Share of total | Share of decode | ms/frame | Vectorized |
 | --- | ---: | ---: | ---: | --- |
-| `inter_pred` | 29.6% | 32.6% | 6.33 | yes |
-| `sao` | 13.0% | 14.3% | 2.77 | yes |
-| `deblock` | 10.6% | 11.7% | 2.27 | yes |
-| `color_convert` | 9.3% | n/a | 1.98 | yes |
-| `residual_cabac` | 5.3% | 5.8% | 1.12 | no |
-| `intra_pred` | 5.2% | 5.7% | 1.12 | yes |
-| `inverse_transform` | 5.2% | 5.7% | 1.10 | yes |
-| `motion_derive` | 4.4% | 4.8% | 0.93 | no |
-| `slice_data_cabac` | 2.8% | 3.1% | 0.61 | no |
-| `dpb_output` | 2.2% | 2.4% | 0.47 | no |
+| `color_convert` | 33.6% | n/a | 9.16 | yes |
+| `inter_pred_filter` | 16.5% | 24.9% | 4.46 | yes |
+| `sao` | 9.5% | 14.4% | 2.57 | yes |
+| `deblock` | 8.2% | 12.4% | 2.24 | yes |
+| `intra_pred` | 4.0% | 6.0% | 1.08 | yes |
+| `residual_cabac` | 3.8% | 5.8% | 1.04 | no |
+| `inter_pred_write` | 3.6% | 5.5% | 0.98 | no |
+| `motion_derive` | 3.3% | 5.0% | 0.90 | no |
+| `inverse_transform` | 3.0% | 4.5% | 0.81 | yes |
+| `slice_data_cabac` | 2.1% | 3.2% | 0.57 | no |
+| `dpb_output` | 1.8% | 2.7% | 0.46 | no |
+| `inter_pred_setup` | 0.9% | 1.4% | 0.25 | no |
 | `header_parse` | 0.0% | 0.0% | 0.00 | no |
-| _unattributed_ | 12.5% | 13.8% | 2.68 | n/a |
+| _unattributed_ | 9.5% | 14.3% | 2.57 | n/a |
+
+`neon` arm, 19.32 ms/frame:
+
+| Stage | Share of total | Share of decode | ms/frame | Vectorized |
+| --- | ---: | ---: | ---: | --- |
+| `inter_pred_filter` | 21.5% | 23.8% | 4.15 | yes |
+| `sao` | 13.3% | 14.7% | 2.59 | yes |
+| `deblock` | 11.0% | 12.1% | 2.13 | yes |
+| `color_convert` | 9.6% | n/a | 1.86 | yes |
+| `intra_pred` | 5.5% | 6.2% | 1.08 | yes |
+| `residual_cabac` | 5.4% | 6.0% | 1.04 | no |
+| `inter_pred_write` | 5.2% | 5.7% | 0.97 | no |
+| `motion_derive` | 4.7% | 5.2% | 0.89 | no |
+| `inverse_transform` | 3.8% | 4.2% | 0.73 | yes |
+| `slice_data_cabac` | 2.9% | 3.2% | 0.57 | no |
+| `dpb_output` | 2.5% | 2.7% | 0.46 | no |
+| `inter_pred_setup` | 1.3% | 1.4% | 0.25 | no |
+| `header_parse` | 0.0% | 0.0% | 0.00 | no |
+| _unattributed_ | 13.2% | 14.6% | 2.56 | n/a |
 
 "Share of decode" divides by the total minus `color_convert`, because colour
 conversion is not decoding: it is the YUV420-to-RGBA pass every whole-frame
 measurement takes on the way out of the decoder. Both denominators are reported
 because the two answer different questions and are easy to confuse.
 
+§8.5.3.3 inter prediction is three rows rather than one as of issue #280, which
+is most of what that issue turned out to be about — see below. `inter_pred_filter`
+is the interpolation and the weighted combine, the part `engine::simd` is;
+`inter_pred_write` is the §8.4.4.1 `Clip1( pred + res )` write-back into the
+picture; `inter_pred_setup` is the §8.5.3.3.2 reference-plane setup and the
+per-prediction-unit allocation the other two happen between. Only the first
+reaches a vector kernel.
+
 _unattributed_ is real work in no instrumented scope — the coding-quadtree and
 CTU walks, the per-CU residual extraction glue, and allocation between stages.
 It is left as its own row rather than spread across the stages, so no share is
-inflated by work it does not do. The profiler's own cost is under 1% of the
-total at ~327k scopes; the example prints that bound on every run.
+inflated by work it does not do. The profiler's own cost is under 3% of the
+total at ~492k scopes; the example prints that bound on every run.
 
 #### What it says
 
 **The issue's hypothesis was wrong.** Entropy decoding is not where the time
-goes. `slice_data_cabac` and `residual_cabac` together are **5.8% of the total
-and 8.6% of decode proper** — the §9.3.4 arithmetic decoder is serial and has no
+goes. `slice_data_cabac` and `residual_cabac` together are **9.2% of decode
+proper on the `neon` arm** — the §9.3.4 arithmetic decoder is serial and has no
 vector path, but it is nowhere near large enough to be the reason whole-frame
 SIMD reads flat.
 
-**Vectorized stages cover 79.7% of the measured total and 69.9% of decode
+**Vectorized stages cover 65.0% of the measured total and 61.2% of decode
 proper.** By Amdahl, infinitely fast vector kernels would move the measured
-whole-frame number 4.93x, a uniform 2x on those stages gives 1.66x, and a
-uniform 4x gives 2.49x. So the kernels are *not* a minority of decode time — the
-ceiling is high enough that the observed whole-frame ratio is a shortfall
-against it, not a consequence of it.
+whole-frame number 2.85x, a uniform 2x on those stages gives 1.48x, and a
+uniform 4x gives 1.95x. So the kernels are *not* a minority of decode time.
 
 **The largest item was not decoding at all, and it now has a kernel.**
 `color_convert` — the per-sample BT.601/709 integer conversion in
@@ -438,17 +448,83 @@ against it, not a consequence of it.
 with no vector path whatsoever, so every whole-frame SIMD number was diluted by
 roughly a third for a stage no HEVC kernel touched. Issue #219 vectorized it
 (`src/hevc/color_convert.rs`, timed by the `hevc_color_convert` group), and it
-falls from **9.86 ms/frame to 1.98 ms/frame — 5.0x** — which is most of why the
+falls from **9.16 ms/frame to 1.86 ms/frame — 4.9x** — which is most of why the
 whole-frame ratio moved from ~1.06x to 1.41x on this host. It is still a third
 of the `scalar` arm, because that arm is what a *scalar* colour conversion
-costs; on the `neon` arm it is 9.3%.
+costs; on the `neon` arm it is 9.6%.
 
-**The next target is `inter_pred`.** At 32.6% of decode proper on the `neon`
-arm it is now comfortably the largest stage, and it is already vectorized — so
-the work there is the #166 / #202 question of why its measured arms sit closer
-to parity on this host than its isolated kernel numbers suggest, rather than a
-question of coverage. Entropy decoding is still not the answer: `slice_data_cabac`
-and `residual_cabac` together are 5.8% of the `scalar` total.
+#### `inter_pred`: the isolated ratio and the in-decode one, reconciled
+
+Issue #280 asked why §8.5.3.3 inter prediction — the largest stage of decode
+proper on the `neon` arm — moves the whole-frame arms so much less than its
+isolated kernel numbers suggest. The answer is two things, both measured on this
+host, and neither of them a slow kernel.
+
+**A third of the stage was never a kernel.** What this file used to report as one
+`inter_pred` row, at 32.6% of decode proper and marked "vectorized", is the three
+rows above. Before the repair below, on the `neon` arm: `inter_pred_filter` 4.18
+ms/frame, `inter_pred_write` 1.89 ms/frame, `inter_pred_setup` 0.21 ms/frame —
+34.2% of decode proper, of which **11.4 points, a third of the stage, reached no
+vector kernel at all**. An isolated group that times only the kernels cannot
+predict a stage ratio a third of which is fixed cost, however accurate it is
+about the kernels: with the kernel at 1.25x and 33% of the stage invariant, the
+stage's ceiling is 1.15x.
+
+The write-back was also the cheapest thing here to fix. `Clip1( pred + res )` was
+a per-sample loop calling `Picture::set_sample`, which re-resolved the plane and
+re-derived its stride for every output sample, with the `Option` residual
+branched on per sample. Resolving the plane once per prediction unit and hoisting
+the residual branch out of the row loop leaves two row slices of known equal
+length that LLVM vectorizes on its own: **1.89 → 0.97 ms/frame on the `neon` arm
+(1.95x) and 1.84 → 0.98 on the `scalar` arm (1.88x)**, taking the whole decode
+from 20.33 to 19.32 ms/frame on `neon` (5.0% faster) and 28.10 to 27.23 on
+`scalar`, and the whole-frame ratio from 1.38x to 1.41x. The arithmetic is
+unchanged and `tests/codec_conformance.rs` passes on its committed per-frame
+SHA-256 digests, which is what says the samples written are the same ones.
+
+**The isolated benchmark was measuring the wrong blocks.** `hevc_inter_pred` ran
+a uniform grid of 16x16 bi-predicted *luma-only* blocks. A real decode does not:
+48 frames of the bundled sample reconstruct 89,213 prediction units over
+100,156,544 luma samples, and weighted by sample they are **62.1% 64x64, 31.1%
+32x32, 5.3% 16x16 and 1.4% 8x8** — 61.6% bi-predicted, 38.4% uni-predicted, and
+at 4:2:0 every luma sample brings half a chroma sample through the
+§8.5.3.3.3.3 4-tap filter. (The clip codes 2Nx2N units throughout, so every size
+is square; a stream using the §7.3.8.5 asymmetric partitions would add
+rectangular units and this would be re-measured.)
+
+That matters because **the 8-tap kernel's advantage over the auto-vectorized
+scalar reference is a function of block size**, and it runs the wrong way from
+what the ticket assumed. Timing the same workload restricted to one size at a
+time, all bi-predicted, luma only, minimum of three interleaved rounds per arm:
+
+| Luma block | `scalar` | `neon` | ratio | share of real luma samples |
+| --- | ---: | ---: | ---: | ---: |
+| 8x8 | 515.10 µs | 359.47 µs | 1.43x | 1.4% |
+| 16x16 | 1.2935 ms | 1.0343 ms | 1.25x | 5.3% |
+| 32x32 | 5.8375 ms | 5.2920 ms | 1.10x | 31.1% |
+| 64x64 | 10.121 ms | 9.7011 ms | 1.04x | 62.1% |
+
+This is the same effect the `engine::simd` table already records from the other
+direction: `filter_taps` reads 1.6-1.9x on aarch64 in the *block* path and ~1.0x
+over one long L1-resident buffer. A 64x64 two-dimensional 8-tap needs a 64x71
+intermediate, so it behaves like the buffer case; a 16x16 block does not. The old
+grid was the second-best size on that table and carried 5.3% of the real work.
+
+Sample-weighting the sweep predicts 1.07x for the measured mix, and the rebuilt
+group measures **1.09x against the old grid's 1.25x** on this host on the same
+day (24.449 / 22.433 ms against 25.713 / 20.494 ms, minimum of four interleaved
+rounds per arm). The other two differences turn out not to matter: at the
+measured sizes, all bi-predicted and luma only reads 1.09x, adding the uni/bi
+split reads 1.07x, and adding chroma reads 1.09x. **Block size accounts for the
+whole of it.**
+
+So the two measurements were consistent and the expectation was wrong. The
+in-decode kernel arm reads 1.07x (4.46 / 4.15 ms/frame) and the isolated group,
+now that it runs the blocks a decode actually runs, reads 1.09x. There is no
+remaining gap between them to explain: what there was, was a benchmark timing
+16x16 blocks for a decoder that spends 93% of its interpolation on 32x32 and
+64x64 ones, plus a third of the stage that was never vectorized in the first
+place.
 
 ### Correctness guard
 
@@ -741,7 +817,7 @@ Measured on **Apple M1 (macOS 15, aarch64)**, at `b6655bad215f`.
 | `hevc_encode_640x352_rgba_to_yuv420` | 628.049 µs | 151.822 µs (4.14x) | 4.14x `neon` |
 | `hevc_encode_bitwriter` | 4.208 ms | 4.060 ms (1.04x) | 1.04x `neon` |
 | `hevc_encode_cabac` | 2.256 ms | 2.195 ms (1.03x) | 1.03x `neon` |
-| `hevc_inter_pred` | 24.460 ms | 20.344 ms (1.20x) | 1.20x `neon` |
+| `hevc_inter_pred` | 24.449 ms | 22.433 ms (1.09x) | 1.09x `neon` |
 | `hevc_intra_pred` | 8.569 ms | 8.396 ms (1.02x) | 1.02x `neon` |
 | `hevc_inverse_transform` | 8.278 ms | 7.636 ms (1.08x) | 1.08x `neon` |
 | `hevc_sao` | 35.250 ms | 22.443 ms (1.57x) | 1.57x `neon` |

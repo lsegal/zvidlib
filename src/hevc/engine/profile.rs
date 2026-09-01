@@ -27,6 +27,16 @@
 //! per scope stay small against the work they bracket. [`Report::overhead`]
 //! quantifies what is left.
 //!
+//! # Sub-stages
+//!
+//! Three variants — [`Stage::InterPred`], [`Stage::InterPredFilter`] and
+//! [`Stage::InterPredWrite`] — decompose one stage rather than naming three,
+//! because issue #280 found that the single `inter_pred` row this used to
+//! report was a third work no vector kernel touches. Exclusive attribution
+//! makes that decomposition free to read: the two inner scopes take their own
+//! time and [`Stage::InterPred`] keeps the remainder, so the three sum to what
+//! the one row used to say and each is separately actionable.
+//!
 //! # Threads and wasm
 //!
 //! State is thread-local, so a profile covers the decode work that happens on
