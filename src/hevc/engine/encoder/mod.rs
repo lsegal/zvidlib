@@ -7,6 +7,7 @@ pub mod lossy;
 pub mod nal;
 pub mod pcm;
 pub mod quant_simd;
+pub mod ratecontrol;
 pub mod rdcost;
 pub mod rdo;
 pub mod recon;
