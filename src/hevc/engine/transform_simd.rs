@@ -22,6 +22,69 @@
 //! architecturally guaranteed on aarch64. Every other target — and every
 //! input outside a backend's exactness preconditions — falls back to the
 //! scalar path.
+//!
+//! # What the aarch64 kernels measure
+//!
+//! Apple silicon, `--release` (`lto = "fat"`, `codegen-units = 1`), best
+//! of five interleaved rounds against [`Backend::Scalar`], from
+//! `bench_inverse_transform_and_dequant`. Both `transform_1d` columns
+//! are the kernel alone over an L1-resident buffer; "block path" is
+//! [`inverse_transform_with_backend`], which allocates a `Vec` per block
+//! and per intermediate and so compresses every ratio towards 1.00x.
+//!
+//! | `nTbS` | `dequant_block` | `transform_1d` dense | `transform_1d` sparse | block path |
+//! | --- | --- | --- | --- | --- |
+//! | 4 | 1.07x | 2.9-3.1x | 2.9-3.0x | 1.2-1.5x |
+//! | 8 | 1.07x | 6.0x | 1.8-2.0x | 1.4-1.5x |
+//! | 16 | 1.06x | 3.6-3.9x | 2.2x | 1.7-1.8x |
+//! | 32 | 1.04-1.06x | 4.0-4.2x | 3.4x | 2.1-2.2x |
+//!
+//! The "sparse" `transform_1d` column is the one that matters: a column
+//! of a dequantized block is mostly zero and both kernels skip zero
+//! inputs outright, so it does less vector work per call while paying
+//! the same per-call overhead. It is also where the pre-#202 8-lane-tile
+//! kernel failed — 0.86-0.92x at `nTbS == 32`, i.e. slower than the
+//! scalar loop LLVM had already vectorized. See `transform_1d_neon` for
+//! why, and #179 for the same measurement method applied to §8.5.3.3.
+//!
+//! # What the x86_64 kernels measure
+//!
+//! AMD EPYC 7763 (a GitHub Actions `ubuntu-latest` runner — this
+//! project's development hosts are aarch64 and Rosetta does not
+//! implement AVX2, so x86_64 figures are taken there), `--release`,
+//! same harness and same best-of-five interleaving. SSE4.1 and SSE4.2
+//! share the butterfly kernel and differ only in `dequant_block`, which
+//! needs SSE4.2's `pcmpgtq` and is scalar on plain SSE4.1 — hence its
+//! flat 1.00x.
+//!
+//! | `nTbS` | backend | `dequant_block` | `transform_1d` dense | `transform_1d` sparse | block path |
+//! | --- | --- | --- | --- | --- | --- |
+//! | 4 | AVX2 | 1.98x | 1.93x | 1.93x | 1.31x |
+//! | 4 | SSE4.2 | 1.35x | 2.00x | 2.00x | 1.32x |
+//! | 8 | AVX2 | 2.46x | 2.14x | 1.55x | 1.30x |
+//! | 8 | SSE4.2 | 1.39x | 1.87x | 1.54x | 1.27x |
+//! | 16 | AVX2 | 2.45x | 3.24x | 2.57x | 1.80x |
+//! | 16 | SSE4.2 | 1.36x | 2.31x | 1.97x | 1.57x |
+//! | 32 | AVX2 | 2.54x | 3.98x | 3.67x | 2.43x |
+//! | 32 | SSE4.2 | 1.42x | 2.79x | 2.41x | 1.92x |
+//!
+//! Unlike NEON's, the x86_64 butterfly was never actually *below*
+//! scalar with the old tile-walking shape — measured at 2.18x (AVX2)
+//! and 1.09x (SSE) on the sparse 32-column, and 1.37x/1.33x at
+//! `nTbS == 4`. But the redundant input sweeps and the tile-width guard
+//! chain cost the same fraction they cost NEON, and removing them is
+//! worth 1.7x on the sparse 32-column for AVX2 and 2.2x for SSE, taking
+//! the whole §8.6 block path from 1.01x to 1.9x on SSE where it was
+//! sitting at parity.
+//!
+//! `dequant_block`'s ~1.06x is near parity and stays that way: equation
+//! 8-309 is a widening multiply, an add, a shift and a clamp per
+//! coefficient, with no reduction or shuffle for a hand kernel to
+//! express that the auto-vectorizer cannot. It is kept because it is at
+//! or above parity at every size, not because it is a win. The same
+//! kernel is a real win on x86_64, where it measures 2.0-2.5x on AVX2
+//! and 1.35-1.42x on SSE4.2; only the aarch64 figure is the marginal
+//! one.
 
 use core::sync::atomic::{AtomicU8, Ordering};
 
@@ -318,10 +381,22 @@ mod x86 {
     use super::DequantParams;
     use core::arch::x86_64::*;
 
-    /// AVX2 [`super::transform_1d`]: sixteen `i32` output lanes per
-    /// tile, `vpmulld` + `vpaddd` into register accumulators, narrowing
-    /// to 8- and 4-wide tiles and finally a scalar one for widths the
-    /// widest tile cannot cover.
+    /// AVX2 [`super::transform_1d`]: the whole output row is held in
+    /// `vpmulld`/`vpaddd` register accumulators across the entire `j`
+    /// sweep, so the input is scanned exactly once.
+    ///
+    /// The width is chosen by an exact match on `nTbS` rather than by a
+    /// descending chain of tile widths, for the reasons
+    /// `transform_1d_neon` documents: a tile walked across the output
+    /// row re-runs the `j` loop once per tile, and every extra pass
+    /// re-reads the whole `input`, re-tests each entry against zero and
+    /// re-broadcasts it — which on a sparse column is most of the cost.
+    /// Four `__m256i` accumulators out of x86_64's sixteen `ymm`
+    /// registers cover `nTbS == 32` in one sweep.
+    ///
+    /// Any other length (there is none in §8.6, which defines
+    /// `nTbS ∈ { 4, 8, 16, 32 }`) falls back to a descending tile chain
+    /// plus a scalar tail. See `bench_inverse_transform_and_dequant`.
     ///
     /// # Safety
     /// The host must support AVX2. `basis` must cover every addressed row.
@@ -336,73 +411,96 @@ mod x86 {
         unsafe {
             let n = out.len();
             let row_stride = row_step * basis_stride;
-            let mut base = 0;
-            while base + 16 <= n {
-                let mut acc0 = _mm256_setzero_si256();
-                let mut acc1 = _mm256_setzero_si256();
-                for (j, &xj) in input.iter().enumerate() {
-                    if xj == 0 {
-                        continue;
-                    }
-                    let row = basis.as_ptr().add(j * row_stride + base);
-                    let s = _mm256_set1_epi32(xj);
-                    acc0 = _mm256_add_epi32(
-                        acc0,
-                        _mm256_mullo_epi32(_mm256_loadu_si256(row.cast()), s),
-                    );
-                    acc1 = _mm256_add_epi32(
-                        acc1,
-                        _mm256_mullo_epi32(_mm256_loadu_si256(row.add(8).cast()), s),
-                    );
-                }
-                _mm256_storeu_si256(out.as_mut_ptr().add(base).cast(), acc0);
-                _mm256_storeu_si256(out.as_mut_ptr().add(base + 8).cast(), acc1);
-                base += 16;
-            }
-            while base + 8 <= n {
-                let mut acc = _mm256_setzero_si256();
-                for (j, &xj) in input.iter().enumerate() {
-                    if xj != 0 {
+
+            /// One straight-line pass: `$accs` 8-lane accumulators
+            /// covering `8 * $accs` output lanes starting at `$base`,
+            /// filled by one sweep of the non-zero `input` entries.
+            macro_rules! tile256 {
+                ($base:expr, $accs:literal) => {{
+                    let base = $base;
+                    let mut acc = [_mm256_setzero_si256(); $accs];
+                    for (j, &xj) in input.iter().enumerate() {
+                        if xj == 0 {
+                            continue;
+                        }
                         let row = basis.as_ptr().add(j * row_stride + base);
-                        acc = _mm256_add_epi32(
-                            acc,
-                            _mm256_mullo_epi32(
-                                _mm256_loadu_si256(row.cast()),
-                                _mm256_set1_epi32(xj),
-                            ),
-                        );
+                        let s = _mm256_set1_epi32(xj);
+                        for (k, a) in acc.iter_mut().enumerate() {
+                            *a = _mm256_add_epi32(
+                                *a,
+                                _mm256_mullo_epi32(_mm256_loadu_si256(row.add(k * 8).cast()), s),
+                            );
+                        }
                     }
-                }
-                _mm256_storeu_si256(out.as_mut_ptr().add(base).cast(), acc);
-                base += 8;
+                    for (k, a) in acc.iter().enumerate() {
+                        _mm256_storeu_si256(out.as_mut_ptr().add(base + k * 8).cast(), *a);
+                    }
+                }};
             }
-            while base + 4 <= n {
-                let mut acc = _mm_setzero_si128();
-                for (j, &xj) in input.iter().enumerate() {
-                    if xj != 0 {
+
+            /// As `tile256!`, in 4-lane `xmm` accumulators, for the
+            /// `nTbS == 4` row a 256-bit load would overrun.
+            macro_rules! tile128 {
+                ($base:expr, $accs:literal) => {{
+                    let base = $base;
+                    let mut acc = [_mm_setzero_si128(); $accs];
+                    for (j, &xj) in input.iter().enumerate() {
+                        if xj == 0 {
+                            continue;
+                        }
                         let row = basis.as_ptr().add(j * row_stride + base);
-                        acc = _mm_add_epi32(
-                            acc,
-                            _mm_mullo_epi32(_mm_loadu_si128(row.cast()), _mm_set1_epi32(xj)),
-                        );
+                        let s = _mm_set1_epi32(xj);
+                        for (k, a) in acc.iter_mut().enumerate() {
+                            *a = _mm_add_epi32(
+                                *a,
+                                _mm_mullo_epi32(_mm_loadu_si128(row.add(k * 4).cast()), s),
+                            );
+                        }
+                    }
+                    for (k, a) in acc.iter().enumerate() {
+                        _mm_storeu_si128(out.as_mut_ptr().add(base + k * 4).cast(), *a);
+                    }
+                }};
+            }
+
+            match n {
+                32 => tile256!(0, 4),
+                16 => tile256!(0, 2),
+                8 => tile256!(0, 1),
+                4 => tile128!(0, 1),
+                // Unreachable from §8.6, which defines nTbS as 4/8/16/32.
+                // Kept correct rather than deleted so the kernel stays a
+                // total function of its slice lengths.
+                _ => {
+                    let mut base = 0;
+                    while base + 8 <= n {
+                        tile256!(base, 1);
+                        base += 8;
+                    }
+                    while base + 4 <= n {
+                        tile128!(base, 1);
+                        base += 4;
+                    }
+                    while base < n {
+                        let mut acc = 0i32;
+                        for (j, &xj) in input.iter().enumerate() {
+                            acc += xj * *basis.as_ptr().add(j * row_stride + base);
+                        }
+                        out[base] = acc;
+                        base += 1;
                     }
                 }
-                _mm_storeu_si128(out.as_mut_ptr().add(base).cast(), acc);
-                base += 4;
-            }
-            while base < n {
-                let mut acc = 0i32;
-                for (j, &xj) in input.iter().enumerate() {
-                    acc += xj * *basis.as_ptr().add(j * row_stride + base);
-                }
-                out[base] = acc;
-                base += 1;
             }
         }
     }
 
-    /// SSE4.1 [`super::transform_1d`]: eight `i32` output lanes per
-    /// tile, held in two register accumulators.
+    /// SSE4.1 [`super::transform_1d`]: the whole output row is held in
+    /// 4-lane register accumulators across the entire `j` sweep, so the
+    /// input is scanned exactly once.
+    ///
+    /// Same shape and same reasoning as [`transform_1d_avx2`]; at
+    /// `nTbS == 32` this is eight of x86_64's sixteen `xmm` registers,
+    /// replacing four passes over the input with one.
     ///
     /// # Safety
     /// The host must support SSE4.1. `basis` must cover every addressed row.
@@ -417,45 +515,54 @@ mod x86 {
         unsafe {
             let n = out.len();
             let row_stride = row_step * basis_stride;
-            let mut base = 0;
-            while base + 8 <= n {
-                let mut acc0 = _mm_setzero_si128();
-                let mut acc1 = _mm_setzero_si128();
-                for (j, &xj) in input.iter().enumerate() {
-                    if xj == 0 {
-                        continue;
-                    }
-                    let row = basis.as_ptr().add(j * row_stride + base);
-                    let s = _mm_set1_epi32(xj);
-                    acc0 = _mm_add_epi32(acc0, _mm_mullo_epi32(_mm_loadu_si128(row.cast()), s));
-                    acc1 =
-                        _mm_add_epi32(acc1, _mm_mullo_epi32(_mm_loadu_si128(row.add(4).cast()), s));
-                }
-                _mm_storeu_si128(out.as_mut_ptr().add(base).cast(), acc0);
-                _mm_storeu_si128(out.as_mut_ptr().add(base + 4).cast(), acc1);
-                base += 8;
-            }
-            while base + 4 <= n {
-                let mut acc = _mm_setzero_si128();
-                for (j, &xj) in input.iter().enumerate() {
-                    if xj != 0 {
+
+            /// One straight-line pass: `$accs` 4-lane accumulators
+            /// covering `4 * $accs` output lanes starting at `$base`,
+            /// filled by one sweep of the non-zero `input` entries.
+            macro_rules! tile {
+                ($base:expr, $accs:literal) => {{
+                    let base = $base;
+                    let mut acc = [_mm_setzero_si128(); $accs];
+                    for (j, &xj) in input.iter().enumerate() {
+                        if xj == 0 {
+                            continue;
+                        }
                         let row = basis.as_ptr().add(j * row_stride + base);
-                        acc = _mm_add_epi32(
-                            acc,
-                            _mm_mullo_epi32(_mm_loadu_si128(row.cast()), _mm_set1_epi32(xj)),
-                        );
+                        let s = _mm_set1_epi32(xj);
+                        for (k, a) in acc.iter_mut().enumerate() {
+                            *a = _mm_add_epi32(
+                                *a,
+                                _mm_mullo_epi32(_mm_loadu_si128(row.add(k * 4).cast()), s),
+                            );
+                        }
+                    }
+                    for (k, a) in acc.iter().enumerate() {
+                        _mm_storeu_si128(out.as_mut_ptr().add(base + k * 4).cast(), *a);
+                    }
+                }};
+            }
+
+            match n {
+                32 => tile!(0, 8),
+                16 => tile!(0, 4),
+                8 => tile!(0, 2),
+                4 => tile!(0, 1),
+                // Unreachable from §8.6; see `transform_1d_avx2`.
+                _ => {
+                    let mut base = 0;
+                    while base + 4 <= n {
+                        tile!(base, 1);
+                        base += 4;
+                    }
+                    while base < n {
+                        let mut acc = 0i32;
+                        for (j, &xj) in input.iter().enumerate() {
+                            acc += xj * *basis.as_ptr().add(j * row_stride + base);
+                        }
+                        out[base] = acc;
+                        base += 1;
                     }
                 }
-                _mm_storeu_si128(out.as_mut_ptr().add(base).cast(), acc);
-                base += 4;
-            }
-            while base < n {
-                let mut acc = 0i32;
-                for (j, &xj) in input.iter().enumerate() {
-                    acc += xj * *basis.as_ptr().add(j * row_stride + base);
-                }
-                out[base] = acc;
-                base += 1;
             }
         }
     }
@@ -594,8 +701,30 @@ mod aarch64 {
     use super::DequantParams;
     use core::arch::aarch64::*;
 
-    /// NEON [`super::transform_1d`]: eight `i32` output lanes per tile,
-    /// held in two `vmlaq_s32` register accumulators.
+    /// NEON [`super::transform_1d`]: the whole output row is held in
+    /// `vmlaq_s32` register accumulators across the entire `j` sweep, so
+    /// the input is scanned exactly once.
+    ///
+    /// The width is chosen by an exact match on `nTbS` rather than by a
+    /// descending chain of tile widths, and that shape matters twice
+    /// over:
+    ///
+    /// * **Wide enough at 32.** The `j` loop is re-run once per tile,
+    ///   and every extra tile re-reads the whole `input`, re-tests each
+    ///   entry against zero and re-broadcasts it. An 8-lane tile pays
+    ///   that four times over at `nTbS == 32`, which was enough to put
+    ///   the kernel *behind* the auto-vectorized scalar loop on a sparse
+    ///   column (0.91x). Eight accumulators out of aarch64's thirty-two
+    ///   registers buys 3.3x instead.
+    /// * **Not a chain at 4 and 8.** Reaching the narrow tiles through
+    ///   `while base + 32 <= n` / `+ 16` / `+ 8` guards costs 30-45% at
+    ///   the two smallest sizes — which are also the most common ones in
+    ///   a real stream — even though the guards are trivially false.
+    ///   Dispatching straight to the right width avoids that entirely.
+    ///
+    /// Any other length (there is none in §8.6, which defines
+    /// `nTbS ∈ { 4, 8, 16, 32 }`) falls back to a descending tile chain
+    /// plus a scalar tail. See `bench_inverse_transform_and_dequant`.
     ///
     /// # Safety
     /// The host must support NEON (guaranteed on aarch64). `basis` must
@@ -611,44 +740,53 @@ mod aarch64 {
         unsafe {
             let n = out.len();
             let row_stride = row_step * basis_stride;
-            let mut base = 0;
-            while base + 8 <= n {
-                let mut acc0 = vdupq_n_s32(0);
-                let mut acc1 = vdupq_n_s32(0);
-                for (j, &xj) in input.iter().enumerate() {
-                    if xj == 0 {
-                        continue;
+
+            /// One straight-line pass: `$accs` accumulators covering
+            /// `4 * $accs` output lanes starting at `$base`, filled by
+            /// one sweep of the non-zero `input` entries.
+            macro_rules! tile {
+                ($base:expr, $accs:literal) => {{
+                    let base = $base;
+                    let mut acc = [vdupq_n_s32(0); $accs];
+                    for (j, &xj) in input.iter().enumerate() {
+                        if xj == 0 {
+                            continue;
+                        }
+                        let row = basis.as_ptr().add(j * row_stride + base);
+                        let s = vdupq_n_s32(xj);
+                        for (k, a) in acc.iter_mut().enumerate() {
+                            *a = vmlaq_s32(*a, vld1q_s32(row.add(k * 4)), s);
+                        }
                     }
-                    let row = basis.as_ptr().add(j * row_stride + base);
-                    let s = vdupq_n_s32(xj);
-                    acc0 = vmlaq_s32(acc0, vld1q_s32(row), s);
-                    acc1 = vmlaq_s32(acc1, vld1q_s32(row.add(4)), s);
-                }
-                vst1q_s32(out.as_mut_ptr().add(base), acc0);
-                vst1q_s32(out.as_mut_ptr().add(base + 4), acc1);
-                base += 8;
+                    for (k, a) in acc.iter().enumerate() {
+                        vst1q_s32(out.as_mut_ptr().add(base + k * 4), *a);
+                    }
+                }};
             }
-            while base + 4 <= n {
-                let mut acc = vdupq_n_s32(0);
-                for (j, &xj) in input.iter().enumerate() {
-                    if xj != 0 {
-                        acc = vmlaq_s32(
-                            acc,
-                            vld1q_s32(basis.as_ptr().add(j * row_stride + base)),
-                            vdupq_n_s32(xj),
-                        );
+
+            match n {
+                32 => tile!(0, 8),
+                16 => tile!(0, 4),
+                8 => tile!(0, 2),
+                4 => tile!(0, 1),
+                // Unreachable from §8.6, which defines nTbS as 4/8/16/32.
+                // Kept correct rather than deleted so the kernel stays a
+                // total function of its slice lengths.
+                _ => {
+                    let mut base = 0;
+                    while base + 4 <= n {
+                        tile!(base, 1);
+                        base += 4;
+                    }
+                    while base < n {
+                        let mut acc = 0i32;
+                        for (j, &xj) in input.iter().enumerate() {
+                            acc += xj * *basis.as_ptr().add(j * row_stride + base);
+                        }
+                        out[base] = acc;
+                        base += 1;
                     }
                 }
-                vst1q_s32(out.as_mut_ptr().add(base), acc);
-                base += 4;
-            }
-            while base < n {
-                let mut acc = 0i32;
-                for (j, &xj) in input.iter().enumerate() {
-                    acc += xj * *basis.as_ptr().add(j * row_stride + base);
-                }
-                out[base] = acc;
-                base += 1;
             }
         }
     }
@@ -987,138 +1125,218 @@ mod tests {
         }
     }
 
-    /// Benchmark for the two vectorized kernels across the four HEVC
-    /// transform sizes, reported per backend against the scalar path.
+    /// Micro-benchmark for the two §8.6 kernels, per transform size,
+    /// on the scalar reference and on every SIMD backend the host
+    /// offers.
+    ///
+    /// Four arms, because they answer different questions:
+    ///
+    /// * [`dequant_block`] and [`transform_1d`] **alone**, over one
+    ///   L1-resident block reused across many passes, with no allocator
+    ///   in the timing. This is what a backend is actually worth.
+    /// * The butterfly arm is split into a **dense** and a **sparse**
+    ///   input. Both kernels skip zero inputs outright, and a column of
+    ///   a dequantized block is mostly zero while the equation-8-314 `g`
+    ///   between the passes is not, so the two can disagree: the sparse
+    ///   case does less vector work per call while paying the same
+    ///   per-call overhead.
+    /// * The whole §8.6 **block path**,
+    ///   [`inverse_transform_with_backend`]. That path allocates and
+    ///   zeroes a `Vec` per block and per intermediate — identical work
+    ///   on every backend — which compresses every ratio towards 1.00x.
+    ///   It is here to show that compression, not to stand in for the
+    ///   kernel figures.
+    ///
+    /// Every figure is the *minimum* over [`BENCH_ROUNDS`] timed passes,
+    /// with the backends measured round-robin inside each round. A single
+    /// timed pass on a loaded machine swings by more than the effect being
+    /// measured, which is enough to report a real speedup as a regression;
+    /// the minimum is the pass that suffered least interference and is the
+    /// closest this can get to the kernel's own cost. This is the method
+    /// `inter_pred`'s `simd_inter_pred_benchmark` introduced, for the same
+    /// reason.
     ///
     /// Ignored by default because it only measures; run it with
     /// `cargo test --release --features native --lib \
-    ///  transform_simd::tests::bench -- --ignored --nocapture`.
+    ///  bench_inverse_transform_and_dequant -- --ignored --nocapture`.
     #[test]
     #[ignore = "benchmark; run explicitly with --ignored --nocapture"]
     fn bench_inverse_transform_and_dequant() {
+        use super::super::transform::transform_basis;
         use std::time::Instant;
 
-        let bit_depth = 8u8;
-        let (coeff_min, coeff_max) = coeff_range(bit_depth, false);
-        println!(
-            "host backend: {:?} (available: {:?})",
-            detected(),
-            supported_backends()
-        );
-        for n_tbs in [4usize, 8, 16, 32] {
-            let count = n_tbs * n_tbs;
-            let mut rng = Lcg(0x1234_5678);
-            // A realistically sparse dequantized block: a low-frequency
-            // cluster plus scattered high-frequency levels.
-            let d: Vec<i32> = (0..count)
-                .map(|i| {
-                    let (x, y) = (i % n_tbs, i / n_tbs);
-                    if x + y < 4 || rng.next_u32() % 16 == 0 {
-                        rng.signed(coeff_max)
-                    } else {
-                        0
-                    }
-                })
-                .collect();
-            let levels = d.clone();
-            // Enough repetitions that each timed section runs for
-            // ~100ms, plus an untimed warmup, so the numbers are not
-            // dominated by first-touch and loop-entry noise.
-            let iterations = 20_000_000 / count;
-            let warmup = iterations / 8;
+        /// Timed passes per arm; every reported figure is the best of these.
+        const BENCH_ROUNDS: usize = 5;
+        /// Transform-block sides §8.6 is defined over.
+        const SIZES: [usize; 4] = [4, 8, 16, 32];
+        /// Coefficients each isolated arm touches per timed pass, held
+        /// constant across sizes so the sizes are comparable to one
+        /// another and not only to their own scalar baseline.
+        const KERNEL_COEFFS: usize = 1 << 21;
+        /// Blocks per timed pass in the block-path arm.
+        const PATH_BLOCKS: usize = 2048;
+        const BIT_DEPTH: u8 = 8;
 
-            // Baseline: the unreassociated i64 reference this change
-            // replaced, so the table shows the end-to-end speedup and not
-            // just backend-to-backend deltas.
-            let mut sink = 0i64;
-            for _ in 0..warmup {
-                sink += i64::from(
-                    inverse_transform_reference(
-                        &d,
-                        n_tbs,
-                        PredMode::Inter,
-                        Component::Luma,
-                        bit_depth,
-                        false,
-                    )
-                    .expect("valid transform inputs")[0],
-                );
-            }
-            let start = Instant::now();
-            for _ in 0..iterations {
-                let r = inverse_transform_reference(
-                    &d,
+        /// Per-size inputs, built once so no arm pays for generating them.
+        struct SizeInputs {
+            n_tbs: usize,
+            /// A realistically sparse level block: a low-frequency
+            /// cluster plus scattered high-frequency levels, as a coded
+            /// sub-block group would leave.
+            levels: Vec<i32>,
+            params: DequantParams,
+            /// A column of `d`, non-zero only in its low-frequency rows.
+            sparse: Vec<i32>,
+            /// A row of the equation-8-314 `g` between the two passes.
+            dense: Vec<i32>,
+            basis: &'static [i32],
+            basis_stride: usize,
+            row_step: usize,
+        }
+
+        let (coeff_min, coeff_max) = coeff_range(BIT_DEPTH, false);
+        let backends = supported_backends();
+        let mut rng = Lcg(0x1234_5678);
+        let inputs: Vec<SizeInputs> = SIZES
+            .iter()
+            .map(|&n_tbs| {
+                let count = n_tbs * n_tbs;
+                let levels = (0..count)
+                    .map(|i| {
+                        let (x, y) = (i % n_tbs, i / n_tbs);
+                        if x + y < 4 || rng.next_u32() % 16 == 0 {
+                            rng.signed(coeff_max)
+                        } else {
+                            0
+                        }
+                    })
+                    .collect();
+                let coded = (n_tbs / 2).max(4);
+                let sparse = (0..n_tbs)
+                    .map(|y| if y < coded { rng.signed(1 << 12) } else { 0 })
+                    .collect();
+                let dense = (0..n_tbs).map(|_| rng.signed(1 << 12)).collect();
+                let (basis, basis_stride, row_step) = transform_basis(n_tbs, false);
+                let log2_tbs = n_tbs.trailing_zeros() as i32;
+                SizeInputs {
                     n_tbs,
-                    PredMode::Inter,
-                    Component::Luma,
-                    bit_depth,
-                    false,
-                )
-                .expect("valid transform inputs");
-                sink += i64::from(r[0]);
-            }
-            let baseline = start.elapsed();
-            println!(
-                "{n_tbs:>2}x{n_tbs:<2} i64 reference: inverse transform {:>9.2} ns/block",
-                baseline.as_nanos() as f64 / iterations as f64,
-            );
+                    levels,
+                    params: DequantParams {
+                        level_scale: 51,
+                        qp_div6: 5,
+                        bd_shift: (i32::from(BIT_DEPTH) + log2_tbs + 10 - 15) as u32,
+                        coeff_min,
+                        coeff_max,
+                    },
+                    sparse,
+                    dense,
+                    basis,
+                    basis_stride,
+                    row_step,
+                }
+            })
+            .collect();
 
-            for backend in supported_backends() {
-                for _ in 0..warmup {
-                    sink += i64::from(
-                        inverse_transform_with_backend(
+        // best[size][backend] = [dequant, butterfly dense, butterfly
+        // sparse, block path], in seconds.
+        let mut best = vec![vec![[f64::INFINITY; 4]; backends.len()]; SIZES.len()];
+        let mut block_out = vec![0i32; 32 * 32];
+        let mut lane = [0i32; 32];
+        let mut sink = 0i64;
+        for _ in 0..BENCH_ROUNDS {
+            for (s, input) in inputs.iter().enumerate() {
+                let n = input.n_tbs;
+                let count = n * n;
+                let block_passes = KERNEL_COEFFS / count;
+                let lane_passes = KERNEL_COEFFS / n;
+                for (b, &backend) in backends.iter().enumerate() {
+                    let out = &mut block_out[..count];
+                    let start = Instant::now();
+                    for _ in 0..block_passes {
+                        dequant_block(backend, out, &input.levels, None, input.params);
+                    }
+                    let dequant = start.elapsed().as_secs_f64();
+                    sink += i64::from(out[0]);
+
+                    let lanes = &mut lane[..n];
+                    let start = Instant::now();
+                    for _ in 0..lane_passes {
+                        transform_1d(
                             backend,
-                            &d,
-                            n_tbs,
+                            &input.dense,
+                            lanes,
+                            input.basis,
+                            input.basis_stride,
+                            input.row_step,
+                        );
+                    }
+                    let dense = start.elapsed().as_secs_f64();
+                    sink += i64::from(lanes[0]);
+
+                    let start = Instant::now();
+                    for _ in 0..lane_passes {
+                        transform_1d(
+                            backend,
+                            &input.sparse,
+                            lanes,
+                            input.basis,
+                            input.basis_stride,
+                            input.row_step,
+                        );
+                    }
+                    let sparse = start.elapsed().as_secs_f64();
+                    sink += i64::from(lanes[0]);
+
+                    let start = Instant::now();
+                    for _ in 0..PATH_BLOCKS {
+                        let r = inverse_transform_with_backend(
+                            backend,
+                            &input.levels,
+                            n,
                             PredMode::Inter,
                             Component::Luma,
-                            bit_depth,
+                            BIT_DEPTH,
                             false,
                         )
-                        .expect("valid transform inputs")[0],
-                    );
-                }
-                let start = Instant::now();
-                for _ in 0..iterations {
-                    let r = inverse_transform_with_backend(
-                        backend,
-                        &d,
-                        n_tbs,
-                        PredMode::Inter,
-                        Component::Luma,
-                        bit_depth,
-                        false,
-                    )
-                    .expect("valid transform inputs");
-                    sink += i64::from(r[0]);
-                }
-                let transform = start.elapsed();
+                        .expect("valid transform inputs");
+                        sink += i64::from(r[0]);
+                    }
+                    let path = start.elapsed().as_secs_f64();
 
-                let params = DequantParams {
-                    level_scale: 51,
-                    qp_div6: 5,
-                    bd_shift: 7,
-                    coeff_min,
-                    coeff_max,
-                };
-                let mut out = vec![0i32; count];
-                for _ in 0..warmup {
-                    dequant_block(backend, &mut out, &levels, None, params);
-                    sink += i64::from(out[0]);
+                    for (slot, t) in best[s][b].iter_mut().zip([dequant, dense, sparse, path]) {
+                        *slot = slot.min(t);
+                    }
                 }
-                let start = Instant::now();
-                for _ in 0..iterations {
-                    dequant_block(backend, &mut out, &levels, None, params);
-                    sink += i64::from(out[0]);
-                }
-                let dequant = start.elapsed();
+            }
+        }
 
+        println!(
+            "\n§8.6 kernels, best of {BENCH_ROUNDS} interleaved rounds (host backend {:?}){}",
+            detected(),
+            if sink == i64::MIN { "!" } else { "" }
+        );
+        println!(
+            "  isolated arms: {KERNEL_COEFFS} coefficients/pass, L1-resident, no allocation\n  \
+             block path: {PATH_BLOCKS} blocks/pass through inverse_transform_with_backend"
+        );
+        for (s, input) in inputs.iter().enumerate() {
+            let baseline = best[s][0];
+            for (b, &backend) in backends.iter().enumerate() {
+                let [dequant, dense, sparse, path] = best[s][b];
                 println!(
-                    "{n_tbs:>2}x{n_tbs:<2} {backend:?}: inverse transform {:>9.2} ns/block \
-                     ({:.2}x baseline), dequant {:>9.2} ns/block (checksum {sink})",
-                    transform.as_nanos() as f64 / iterations as f64,
-                    baseline.as_secs_f64() / transform.as_secs_f64(),
-                    dequant.as_nanos() as f64 / iterations as f64,
+                    "  {n:>2}x{n:<2} {:>8}  dequant_block {:7.2} ms ({:4.2}x)  transform_1d dense \
+                     {:7.2} ms ({:4.2}x)  sparse {:7.2} ms ({:4.2}x)  block path {:7.2} ms \
+                     ({:4.2}x)",
+                    format!("{backend:?}"),
+                    dequant * 1e3,
+                    baseline[0] / dequant,
+                    dense * 1e3,
+                    baseline[1] / dense,
+                    sparse * 1e3,
+                    baseline[2] / sparse,
+                    path * 1e3,
+                    baseline[3] / path,
+                    n = input.n_tbs,
                 );
             }
         }

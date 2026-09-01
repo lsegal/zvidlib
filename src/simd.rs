@@ -5,7 +5,8 @@
 //! transforms and in-loop filters ([`crate::av1_simd`]), AV1 inter prediction
 //! ([`crate::av1_mc`]), AV1 intra prediction ([`crate::av1_intra_pred`]), and
 //! the HEVC engine's inter/intra prediction, in-loop filters, inverse
-//! transforms, and encoder-side distortion metrics. Each of those sites caches
+//! transforms, encoder-side distortion metrics, and encoder-side color
+//! conversion. Each of those sites caches
 //! its own CPU feature probe, which is what you want in production but makes
 //! "run this workload with SIMD off" impossible to express from outside the
 //! crate.
@@ -113,6 +114,8 @@ pub fn available() -> Vec<SimdIsa> {
 /// | `hevc_prediction_filters` | HEVC inter/intra prediction and in-loop filters |
 /// | `hevc_transforms` | HEVC inverse transforms and dequantization |
 /// | `hevc_rdcost` | HEVC encoder-side distortion metrics |
+/// | `hevc_fwd_transform_quant` | HEVC encoder-side forward transform and quantization |
+/// | `hevc_colorconv` | HEVC encoder-side RGBA8 to YUV420 input conversion |
 ///
 /// The `hevc_*` sites are absent on `wasm32`, which does not build the HEVC
 /// engine.
@@ -129,7 +132,7 @@ pub fn active_by_site() -> Vec<(&'static str, SimdIsa)> {
     ];
     #[cfg(not(target_arch = "wasm32"))]
     {
-        use crate::hevc::engine::encoder::rdcost;
+        use crate::hevc::engine::encoder::{colorconv, rdcost};
         use crate::hevc::engine::{simd as hevc_simd, transform_simd};
         sites.push((
             "hevc_prediction_filters",
@@ -144,6 +147,7 @@ pub fn active_by_site() -> Vec<(&'static str, SimdIsa)> {
             "hevc_fwd_transform_quant",
             from_hevc_backend(crate::hevc::engine::encoder::quant_simd::detected()),
         ));
+        sites.push(("hevc_colorconv", from_colorconv_isa(colorconv::isa())));
     }
     sites
 }
@@ -199,6 +203,20 @@ fn from_hevc_backend(backend: crate::hevc::engine::transform_simd::Backend) -> S
 #[cfg(not(target_arch = "wasm32"))]
 fn from_rdcost_isa(isa: crate::hevc::engine::encoder::rdcost::Isa) -> SimdIsa {
     use crate::hevc::engine::encoder::rdcost::Isa;
+    match isa {
+        Isa::Scalar => SimdIsa::Scalar,
+        #[cfg(target_arch = "x86_64")]
+        Isa::Sse41 => SimdIsa::Sse41,
+        #[cfg(target_arch = "x86_64")]
+        Isa::Avx2 => SimdIsa::Avx2,
+        #[cfg(target_arch = "aarch64")]
+        Isa::Neon => SimdIsa::Neon,
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn from_colorconv_isa(isa: crate::hevc::engine::encoder::colorconv::Isa) -> SimdIsa {
+    use crate::hevc::engine::encoder::colorconv::Isa;
     match isa {
         Isa::Scalar => SimdIsa::Scalar,
         #[cfg(target_arch = "x86_64")]
@@ -291,7 +309,7 @@ mod tests {
     fn pinning_scalar_reaches_every_dispatch_site() {
         use crate::av1_intra_pred::{Av1IntraSimd, av1_intra_simd};
         use crate::av1_mc::{McContext, SimdLevel, default_level};
-        use crate::hevc::engine::encoder::rdcost;
+        use crate::hevc::engine::encoder::{colorconv, quant_simd, rdcost};
         use crate::hevc::engine::{simd as hevc_simd, transform_simd};
 
         let _guard = lock();
@@ -311,8 +329,52 @@ mod tests {
         assert_eq!(transform_simd::detected(), transform_simd::Backend::Scalar);
         // HEVC encoder-side distortion metrics.
         assert_eq!(rdcost::isa(), rdcost::Isa::Scalar);
+        // HEVC encoder-side forward transform and quantization.
+        assert_eq!(quant_simd::detected(), transform_simd::Backend::Scalar);
+        // HEVC encoder-side RGBA8 to YUV420 input conversion.
+        assert_eq!(colorconv::isa(), colorconv::Isa::Scalar);
+
+        // The list above is written out by hand, one selector per site, so it
+        // only stays exhaustive as long as it matches `active_by_site`. A new
+        // site added there has to fail here rather than quietly go unchecked.
+        let checked = [
+            "av1_simd",
+            "av1_mc",
+            "av1_intra_pred",
+            "hevc_prediction_filters",
+            "hevc_transforms",
+            "hevc_rdcost",
+            "hevc_fwd_transform_quant",
+            "hevc_colorconv",
+        ];
+        let sites: Vec<&str> = active_by_site().into_iter().map(|(site, _)| site).collect();
+        assert_eq!(sites, checked);
 
         set_override(None);
+    }
+
+    /// The site table in the `active_by_site` rustdoc promises the names are
+    /// "stable and safe to assert on", which is only true if it lists them
+    /// all. Read the table back out of this file and compare.
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn the_documented_site_table_lists_every_dispatch_site() {
+        let source = include_str!("simd.rs");
+        let table = source
+            .split_once("/// | Site | Kernels |")
+            .expect("site table")
+            .1;
+        let documented: Vec<&str> = table
+            .lines()
+            .skip(1)
+            .map(str::trim_start)
+            .take_while(|line| line.starts_with("///"))
+            .filter_map(|line| line.strip_prefix("/// | `"))
+            .filter_map(|row| row.split_once('`'))
+            .map(|(site, _)| site)
+            .collect();
+        let sites: Vec<&str> = active_by_site().into_iter().map(|(site, _)| site).collect();
+        assert_eq!(documented, sites);
     }
 
     /// Clearing the override has to hand every site back to its own detection,
@@ -322,6 +384,7 @@ mod tests {
     fn clearing_the_override_restores_per_site_detection() {
         use crate::av1_intra_pred::{Av1IntraSimd, av1_intra_simd};
         use crate::av1_mc::default_level;
+        use crate::hevc::engine::encoder::{colorconv, quant_simd, rdcost};
         use crate::hevc::engine::{simd as hevc_simd, transform_simd};
 
         let _guard = lock();
@@ -329,20 +392,51 @@ mod tests {
         set_override(None);
 
         let vectorized = detected() != SimdIsa::Scalar;
+        // AV1 transforms and in-loop filters.
         assert_eq!(crate::av1_simd::active_isa(), detected());
+        // AV1 intra prediction.
         assert_eq!(av1_intra_simd() != Av1IntraSimd::Scalar, vectorized);
+        // AV1 motion compensation.
         assert_eq!(
             default_level() != crate::av1_mc::SimdLevel::Scalar,
             vectorized
         );
+        // HEVC inter/intra prediction and in-loop filters.
         assert_eq!(
             hevc_simd::detected_isa() != hevc_simd::Isa::Scalar,
             vectorized
         );
+        // HEVC inverse transforms and dequantization.
         assert_eq!(
             transform_simd::detected() != transform_simd::Backend::Scalar,
             vectorized
         );
+        // HEVC encoder-side distortion metrics.
+        assert_eq!(rdcost::isa() != rdcost::Isa::Scalar, vectorized);
+        // HEVC encoder-side forward transform and quantization.
+        assert_eq!(
+            quant_simd::detected() != transform_simd::Backend::Scalar,
+            vectorized
+        );
+        // HEVC encoder-side RGBA8 to YUV420 input conversion.
+        assert_eq!(colorconv::isa() != colorconv::Isa::Scalar, vectorized);
+
+        // As in `pinning_scalar_reaches_every_dispatch_site`, the list above is
+        // written out by hand, one selector per site, so it only stays
+        // exhaustive as long as it matches `active_by_site`. A new site added
+        // there has to fail here rather than quietly go unchecked.
+        let checked = [
+            "av1_simd",
+            "av1_mc",
+            "av1_intra_pred",
+            "hevc_prediction_filters",
+            "hevc_transforms",
+            "hevc_rdcost",
+            "hevc_fwd_transform_quant",
+            "hevc_colorconv",
+        ];
+        let sites: Vec<&str> = active_by_site().into_iter().map(|(site, _)| site).collect();
+        assert_eq!(sites, checked);
     }
 
     #[test]

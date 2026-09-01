@@ -585,16 +585,30 @@ fn transform_1d_i32_into(
 ) {
     debug_assert_eq!(input.len(), n_tbs);
     debug_assert_eq!(out.len(), n_tbs);
+    let (basis, basis_stride, row_step) = transform_basis(n_tbs, tr_type);
+    transform_simd::transform_1d(backend, input, out, basis, basis_stride, row_step);
+}
+
+/// The §8.6.4.2 basis table a block of side `n_tbs` reads, as the
+/// `( basis, basis_stride, row_step )` triple
+/// [`transform_simd::transform_1d`] takes.
+///
+/// `trType == 1` selects equation 8-315/8-316's 4x4 DST, which is only
+/// ever invoked with `nTbS == 4`, so consecutive basis rows are
+/// consecutive [`DST4`] rows. Otherwise equation 8-317 reads [`DCT32`]
+/// with a `1 << ( 5 − log2( nTbS ) )` row stride.
+///
+/// Split out so the transform benchmark can time the butterfly in
+/// isolation against exactly the table the decoder feeds it.
+///
+/// # Panics
+/// Panics if `n_tbs` is not a power of two in `4..=32`.
+pub(crate) fn transform_basis(n_tbs: usize, tr_type: bool) -> (&'static [i32], usize, usize) {
     if tr_type {
-        // §8.6.4.2 eq. 8-315/8-316, the 4x4 DST. trType == 1 is only
-        // ever invoked with nTbS == 4, so consecutive basis rows are
-        // consecutive DST4 rows.
-        transform_simd::transform_1d(backend, input, out, DST4.as_flattened(), 4, 1);
+        (DST4.as_flattened(), 4, 1)
     } else {
-        // §8.6.4.2 eq. 8-317, stride = 1 << (5 - log2(nTbS)).
         let log2 = log2_tbs(n_tbs).expect("transform_1d called with non-2^k nTbS");
-        let stride = 1usize << (5 - log2);
-        transform_simd::transform_1d(backend, input, out, DCT32.as_flattened(), 32, stride);
+        (DCT32.as_flattened(), 32, 1usize << (5 - log2))
     }
 }
 
