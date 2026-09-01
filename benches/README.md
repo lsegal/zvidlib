@@ -782,6 +782,64 @@ An arm being absent from a row means the host could not execute it, not that it
 was not measured: an Apple Silicon host has no `sse41` or `avx2` column at all,
 which is why the x86_64 arms do not appear here yet. `#228` covers measuring the
 x86_64 side.
+## Hardware HEVC decoders
+
+`benches/hevc_hardware.rs` is its own `[[bench]]` target. It
+measures whichever platform fixed-function HEVC decoder the host provides —
+NVDEC, Windows Media Foundation, or VideoToolbox — against the pure-Rust
+software decoder on the bundled 1080p sample.
+
+```sh
+cargo bench --bench hevc_hardware                     # hardware arms only
+ZVIDLIB_BENCH_LARGE=1 cargo bench --bench hevc_hardware  # plus the software baseline
+```
+
+Three things make this target different from the rest of the suite:
+
+- **No scalar-vs-SIMD arms.** These are opaque drivers and OS frameworks;
+  `zvidlib::simd`'s process-wide override does not reach an instruction they
+  execute, so scalar and vector arms would differ only by noise. The group name
+  also carries no `simd=on`/`simd=off` build tag, since the hardware numbers are
+  identical in both builds. The software baseline group does carry it.
+- **Setup latency is a separate benchmark from throughput.** A backend pays a
+  real one-time cost — a CUDA context and parser, an MFT and its D3D11 device, a
+  VideoToolbox decompression session — and averaging it into a throughput figure
+  misrepresents both. `<arm>/session_setup_to_first_frame` times construction
+  through the first delivered frame; `<arm>/steady_state` starts its clock only
+  after that frame is out. Both use `Bencher::iter_custom` to draw the line.
+- **It skips, it does not fail.** With no hardware decoder the group prints why
+  and returns, so `cargo bench` works on a dev box without one — the same policy
+  as the `#[ignore]`d `tests/native_hevc_hardware.rs`.
+
+The software baseline sits behind `ZVIDLIB_BENCH_LARGE=1` like every other group
+that puts the 1080p sample through the software decoder. Both arms decode the
+same 32-frame window, which is what makes their ratio a ratio: the sample's
+frames are not equally expensive (a key frame costs far more than the
+hierarchical B-frames after it), so arms measured over different frame counts
+would be comparing different work. The run prints the ratio directly.
+
+Read the ratio as an order of magnitude, not a two-digit figure. The hardware
+arm is stable run to run — a fixed-function block decoding a fixed window — while
+the software arm is a long single-threaded workload and varies several-fold on a
+loaded host, so the ratio moves with the host's other work rather than with
+anything the decoders did. Measured on an idle Apple Silicon host: 167 Mpx/s on
+VideoToolbox against 15 Mpx/s in software, about 11x.
+
+The setup arm reports the *warm* per-session cost, since criterion builds a
+session per iteration after the framework has already initialized. The single
+untimed pass printed above the criterion output reports the cold one, which
+includes one-time driver/framework initialization; a caller pays that once and
+the warm cost on every seek-driven reset.
+
+### Frame readback
+
+There is no separate readback arm. `VideoDecoder` hands back a host-side
+`VideoFrame`, the HEVC decoder configuration only accepts `PixelFormat::Rgba8`,
+and each backend maps its own surface and converts to RGBA inside `submit`, so
+there is no public seam between "the fixed-function block finished" and "the
+pixels are in a `Vec<u8>`". A readback number measured any other way would be a
+reimplemented stand-in rather than the code that runs, so the group reports the
+two as inseparable instead of reporting a proxy.
 
 ## Fixtures
 
