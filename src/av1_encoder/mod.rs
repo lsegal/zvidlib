@@ -1353,7 +1353,10 @@ mod nonlossless_tests {
     #[ignore = "measurement sweep, not an assertion"]
     fn measure_type_gain_intervals_past_sixteen() {
         let quantizers = [1_u8, 8, 32, 80, 160, 200];
-        let intervals = [2_usize, 4, 8, 12, 16, 20, 24, 32, 48, 64];
+        let coverage_intervals: Vec<usize> = (2..=64).collect();
+        let intervals = [
+            2_usize, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 16, 20, 24, 32, 48, 64,
+        ];
 
         println!("size,frame,interval,selects_tx4x4,candidates");
         for (width, height) in [(96_usize, 80_usize), (128, 96), (192, 160), (640, 352)] {
@@ -1368,7 +1371,7 @@ mod nonlossless_tests {
                 if !covered {
                     continue;
                 }
-                for interval in intervals {
+                for &interval in &coverage_intervals {
                     let selected = quantizers.into_iter().any(|qindex| {
                         tile::FrameEncoder::new(&pixels, width, height, qindex)
                             .with_type_gain_interval(interval)
