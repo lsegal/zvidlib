@@ -612,6 +612,81 @@ mod nonlossless_tests {
             .collect()
     }
 
+    /// Deterministic 32-bit LCG, so a generated frame is the same on every host and run.
+    fn lcg(state: &mut u32) -> u32 {
+        *state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        *state
+    }
+
+    /// Frames whose content statistics differ sharply from [`test_pattern`], which is the single
+    /// frame the transform-gain sampling interval was originally calibrated on.
+    ///
+    /// The point of the set is *variation*, not difficulty: the sampled estimator reuses one
+    /// frame's accumulated per-size gain ratio across the blocks it does not probe, so it is
+    /// safe exactly while that ratio is stable over a frame. `quadrants` and `scene_edge` are
+    /// the frames where it is not - their halves have deliberately unrelated statistics - and
+    /// `noise`, `smooth` and `diagonals` pin the stationary extremes on either side of
+    /// `test_pattern`.
+    fn content_frames(width: u32, height: u32) -> Vec<(&'static str, Vec<u8>)> {
+        let pixel = |f: &dyn Fn(u32, u32) -> u8| -> Vec<u8> {
+            (0..height)
+                .flat_map(|y| (0..width).map(move |x| f(x, y)).collect::<Vec<_>>())
+                .collect()
+        };
+        // Full-range noise: no correlation for any transform to compact, so every size's type
+        // gain is near zero and the ratio is measured off very small differences.
+        let mut state = 0x1234_5678_u32;
+        let noise: Vec<u8> = (0..width * height)
+            .map(|_| (lcg(&mut state) >> 24) as u8)
+            .collect();
+        // Smooth: a slowly varying surface the largest transforms code almost for free.
+        let smooth = pixel(&|x, y| (110 + (x * 3 + y * 2) / 5 % 40) as u8);
+        // Diagonals: strongly directional edges, which is where the non-DCT types in the set
+        // earn their keep and the gain ratio is at its largest.
+        let diagonals = pixel(&|x, y| if (x + y) % 12 < 6 { 30 } else { 220 });
+        // Quadrants: four unrelated statistics in one frame, so the frame-wide accumulated ratio
+        // is never representative of the quadrant a block is in.
+        let mut quad_state = 0x9E37_79B9_u32;
+        let quadrants: Vec<u8> = (0..height)
+            .flat_map(|y| {
+                let mut row = Vec::with_capacity(width as usize);
+                for x in 0..width {
+                    let left = x < width / 2;
+                    let top = y < height / 2;
+                    row.push(match (top, left) {
+                        (true, true) => 128, // flat
+                        (true, false) => {
+                            if x % 8 < 4 {
+                                40
+                            } else {
+                                200
+                            }
+                        } // vertical stripes
+                        (false, true) => (16 + (x + y) % 224) as u8, // ramp
+                        (false, false) => (lcg(&mut quad_state) >> 24) as u8, // noise
+                    });
+                }
+                row
+            })
+            .collect();
+        // Scene edge: a low-contrast textured region meeting a high-frequency synthetic one at a
+        // hard horizontal boundary, the case a frame-wide ratio is least able to represent.
+        let scene_edge = pixel(&|x, y| {
+            if y < height * 3 / 5 {
+                (100 + ((x * 5 + y * 3) % 17)) as u8
+            } else {
+                (((x / 2) ^ (y / 2)) % 2 * 255) as u8
+            }
+        });
+        vec![
+            ("noise", noise),
+            ("smooth", smooth),
+            ("diagonals", diagonals),
+            ("quadrants", quadrants),
+            ("scene_edge", scene_edge),
+        ]
+    }
+
     fn encode(width: u32, height: u32, qindex: u8, pixels: &[u8]) -> Vec<u8> {
         let limits = Limits::default();
         let dimensions = VideoDimensions::new(width, height, &limits).unwrap();
@@ -976,6 +1051,46 @@ mod nonlossless_tests {
                 .collect();
         assert_eq!(sizes(&exhaustively_covered), sizes(&emittable));
         assert_eq!(types(&exhaustively_covered), types(&emittable));
+    }
+
+    #[test]
+    #[ignore = "measurement sweep, not an assertion"]
+    fn measure_type_gain_sampling_intervals() {
+        let (width, height) = (192_usize, 160_usize);
+        let mut frames = content_frames(width as u32, height as u32);
+        frames.push(("test_pattern", test_pattern(width as u32, height as u32)));
+        let quality = |report: &tile::SearchReport, pixels: &[u8]| {
+            let reconstruction: Vec<u8> = (0..height)
+                .flat_map(|row| report.reconstruction[row * report.coded_width..][..width].to_vec())
+                .collect();
+            psnr(pixels, &reconstruction)
+        };
+        println!(
+            "frame,qindex,interval,fast_psnr,exhaustive_psnr,d_psnr,fast_bytes,exh_bytes,growth_pct,candidates"
+        );
+        for (name, pixels) in &frames {
+            for qindex in [1_u8, 8, 32, 80, 160, 200] {
+                let exhaustive = tile::FrameEncoder::new(pixels, width, height, qindex)
+                    .without_search_shortcuts()
+                    .encode_with_report();
+                let exh_psnr = quality(&exhaustive, pixels);
+                for interval in [1_usize, 2, 4, 8, 12, 16, 24, 32, 64] {
+                    let fast = tile::FrameEncoder::new(pixels, width, height, qindex)
+                        .with_type_gain_interval(interval)
+                        .encode_with_report();
+                    let fp = quality(&fast, pixels);
+                    let growth =
+                        fast.tile.len() as f64 / exhaustive.tile.len() as f64 * 100.0 - 100.0;
+                    println!(
+                        "{name},{qindex},{interval},{fp:.4},{exh_psnr:.4},{:+.4},{},{},{growth:+.4},{}",
+                        fp - exh_psnr,
+                        fast.tile.len(),
+                        exhaustive.tile.len(),
+                        fast.candidates_evaluated,
+                    );
+                }
+            }
+        }
     }
 
     /// The stated bound on what the search shortcuts cost.

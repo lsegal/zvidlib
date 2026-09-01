@@ -159,6 +159,11 @@ pub(crate) struct FrameEncoder<'a> {
     /// test can compare the shortcuts against the search they stand in for.
     #[cfg(test)]
     exhaustive: bool,
+    /// The sampling interval in force, so a test can sweep it and measure what
+    /// [`TYPE_GAIN_SAMPLE_INTERVAL`] costs at each value instead of asserting the shipped one is
+    /// right. Outside tests the constant is read directly.
+    #[cfg(test)]
+    type_gain_interval: usize,
     /// Transform-type candidates actually transformed, quantized and reconstructed, which is the
     /// work the shortcuts exist to remove.
     #[cfg(test)]
@@ -249,6 +254,8 @@ impl<'a> FrameEncoder<'a> {
             #[cfg(test)]
             exhaustive: false,
             #[cfg(test)]
+            type_gain_interval: TYPE_GAIN_SAMPLE_INTERVAL,
+            #[cfg(test)]
             candidates_evaluated: 0,
         }
     }
@@ -272,6 +279,30 @@ impl<'a> FrameEncoder<'a> {
     #[cfg(not(test))]
     fn shortcuts(&self) -> bool {
         true
+    }
+
+    /// Overrides the probe sampling interval, so a test can measure the estimator at intervals
+    /// other than the shipped one. `1` probes every size search, which is the unsampled search
+    /// the shipped interval approximates.
+    #[cfg(test)]
+    pub(crate) fn with_type_gain_interval(mut self, interval: usize) -> Self {
+        assert!(interval >= 1, "a sampling interval of 0 samples nothing");
+        self.type_gain_interval = interval;
+        self
+    }
+
+    /// Coding blocks between two whose size search probes. [`TYPE_GAIN_SAMPLE_INTERVAL`] outside
+    /// tests, where nothing can override it.
+    #[cfg(test)]
+    fn type_gain_interval(&self) -> usize {
+        self.type_gain_interval
+    }
+
+    /// Coding blocks between two whose size search probes. [`TYPE_GAIN_SAMPLE_INTERVAL`] outside
+    /// tests, where nothing can override it.
+    #[cfg(not(test))]
+    fn type_gain_interval(&self) -> usize {
+        TYPE_GAIN_SAMPLE_INTERVAL
     }
 
     /// Encodes the tile and returns the symbol-coded bytes (`decode_tile`, §5.11.2).
@@ -548,7 +579,7 @@ impl<'a> FrameEncoder<'a> {
     /// Whether this coding block's size search probes, which every
     /// [`TYPE_GAIN_SAMPLE_INTERVAL`]-th one does, counting the frame's first.
     fn sample_type_gain(&mut self) -> bool {
-        let sample = self.size_searches % TYPE_GAIN_SAMPLE_INTERVAL == 0;
+        let sample = self.size_searches % self.type_gain_interval() == 0;
         self.size_searches += 1;
         sample
     }
