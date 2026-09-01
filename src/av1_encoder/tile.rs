@@ -45,11 +45,19 @@ const MEMO_UNSET: u8 = u8::MAX;
 /// (`bw` of 8, 16, 32 and 64, so `bsl` 1 through 4).
 const MEMO_LEVELS: usize = 5;
 
-/// Bits [`estimate_rate`] charges a block whose levels are all zero: the `all_zero` flag alone.
-const ZERO_BLOCK_BITS: i64 = 1;
+/// Bits [`estimate_rate`] charges one CDF-coded symbol.
+///
+/// The estimator ranks candidates rather than predicting the arithmetic coder's fractional
+/// output, so every symbol §5.11.39 writes is charged the same nominal cost and the *shape* of
+/// the estimate comes from how many symbols a level costs rather than from any one symbol's
+/// probability. `2` keeps that nominal cost on the scale the raw bits in the same expression are
+/// already on, so a symbol and a literal are comparable.
+const SYMBOL_BITS: i64 = 2;
+/// Bits [`estimate_rate`] charges a block whose levels are all zero: the `all_zero` symbol alone.
+const ZERO_BLOCK_BITS: i64 = SYMBOL_BITS;
 /// Bits [`estimate_rate`] charges the cheapest block it can charge that is *not* all zero: the
-/// `all_zero` flag, a one-position end-of-block, and one magnitude-1 coefficient with its sign.
-const MIN_CODED_BLOCK_BITS: i64 = 7;
+/// `all_zero` symbol, a one-position end-of-block, and one magnitude-1 coefficient with its sign.
+const MIN_CODED_BLOCK_BITS: i64 = ZERO_BLOCK_BITS + SYMBOL_BITS + 3;
 
 /// Transform blocks per probing size trial that [`FrameEncoder::choose_tx_size`] searches with the
 /// whole transform-type set instead of the set's DCT alone, to measure what the type search is
@@ -147,7 +155,7 @@ pub(super) const TYPE_GAIN_SAMPLE_INTERVAL: usize = 2;
 /// in `measure_type_gain_memory_cost` over the six frames at six quantizers, 0.971 s at `4`
 /// against 0.954 s un-decayed: +1.8%, which is the extra candidates plus the arithmetic, and
 /// which the whole window sweep spans (0.954-0.975 s) from end to end.
-pub(super) const TYPE_GAIN_MEMORY: usize = 4;
+pub(super) const TYPE_GAIN_MEMORY: usize = 2;
 
 /// Transform sizes [`FrameEncoder::type_gain`] accumulates over: `TX_4X4` through `TX_32X32`,
 /// which is every size [`super::transform::forward_transform`] implements.
@@ -1451,10 +1459,46 @@ impl<'a> FrameEncoder<'a> {
 /// `Max_Tx_Size_Rect` cap the decoder's `read_tx_size` applies (`TX_64X64`).
 const MAX_TX_WIDTH: usize = 64;
 
-/// Bits a coefficient block is estimated to cost, as the `all_zero` flag plus, when the block is
-/// coded, the end-of-block position and an exp-Golomb-shaped magnitude and sign per coefficient.
-/// Only the relative ordering of candidates matters, so this stays a closed form over the
-/// quantized levels rather than a trial arithmetic encode.
+/// Bits §5.11.39's coefficient coder spends on one quantized magnitude, counted as the symbols
+/// and raw bits it actually writes.
+///
+/// `coeff_base` (or `coeff_base_eob` at the last position) carries the level up to
+/// [`NUM_BASE_LEVELS`]; above that, up to four `coeff_br` symbols carry three more each, so the
+/// cost grows *linearly* with the level through the base range; only past
+/// [`COEFF_BASE_PLUS_RANGE`] does it flatten to the exp-Golomb tail's `2 * bit_length(x) - 1`
+/// raw bits. A nonzero level also carries a sign.
+///
+/// This shape is the whole point of the function. A closed `2 + 2 * bit_length(level)` charge is
+/// logarithmic everywhere and prices a doubled level at two more bits at every magnitude, which
+/// is only true in the golomb tail. §7.12.3's `Dq_Denom` makes every `TX_32X32` level twice a
+/// smaller transform's for the same reconstruction, so a logarithmic charge under-prices a
+/// 32x32 trial by the whole width of the base range - which is where most coefficients on
+/// ordinary content sit - and the size search buys 32x32's lower distortion with bits the
+/// estimate never charged it for.
+fn coefficient_bits(level: u32) -> i64 {
+    // The base symbol is written for every coefficient below the end-of-block, zero or not.
+    let mut bits = SYMBOL_BITS;
+    if level == 0 {
+        return bits;
+    }
+    bits += 1; // sign
+    if level as i32 > NUM_BASE_LEVELS {
+        // `rem = level - 3` in steps of 3, at most four symbols, exactly as `code_coefficients`
+        // writes them.
+        let remainder = level - NUM_BASE_LEVELS as u32 - 1;
+        bits += SYMBOL_BITS * i64::from((remainder / 3 + 1).min(4));
+    }
+    if level as i32 > COEFF_BASE_PLUS_RANGE {
+        let tail = level - COEFF_BASE_PLUS_RANGE as u32;
+        bits += 2 * i64::from(bit_length(tail)) - 1;
+    }
+    bits
+}
+
+/// Bits a coefficient block is estimated to cost: the `all_zero` symbol plus, when the block is
+/// coded, the end-of-block position and [`coefficient_bits`] per coefficient up to it. Only the
+/// relative ordering of candidates matters, so this stays a closed form over the quantized levels
+/// rather than a trial arithmetic encode.
 fn estimate_rate(levels: &[i32], scan: &[usize]) -> i64 {
     let mut eob = 0usize;
     for (index, &position) in scan.iter().enumerate() {
@@ -1463,16 +1507,16 @@ fn estimate_rate(levels: &[i32], scan: &[usize]) -> i64 {
         }
     }
     if eob == 0 {
-        return 1;
+        return ZERO_BLOCK_BITS;
     }
-    let mut bits = 1 + 2 * i64::from(bit_length(eob as u32));
+    // `eob_pt` is one symbol; `eob_extra` above it is one symbol and `eobPt - 3` raw bits.
+    let eobpt = eobpt_from_eob(eob);
+    let mut bits = ZERO_BLOCK_BITS + SYMBOL_BITS;
+    if eobpt >= 3 {
+        bits += SYMBOL_BITS + eobpt as i64 - 3;
+    }
     for &position in scan.iter().take(eob) {
-        let level = levels[position].unsigned_abs();
-        bits += if level == 0 {
-            1
-        } else {
-            2 + 2 * i64::from(bit_length(level))
-        };
+        bits += coefficient_bits(levels[position].unsigned_abs());
     }
     bits
 }

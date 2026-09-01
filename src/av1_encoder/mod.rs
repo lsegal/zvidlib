@@ -1331,6 +1331,50 @@ mod nonlossless_tests {
         }
     }
 
+    /// What each of the four shortcut bounds actually measures, at every quantizer and on more
+    /// than the one frame the bounds are asserted on.
+    ///
+    /// `the_search_shortcuts_stay_within_their_rate_and_distortion_bound` asserts a single
+    /// number per quantizer on 96x80 `test_pattern`; this prints the whole surface so a bound is
+    /// re-derived from a measurement rather than from whichever quantizer happened to fail.
+    #[test]
+    #[ignore = "measurement sweep, not an assertion"]
+    fn measure_search_shortcut_bounds() {
+        for (width, height) in [(96_usize, 80_usize), (128, 96), (192, 160)] {
+            let mut frames = content_frames(width as u32, height as u32);
+            frames.push(("test_pattern", test_pattern(width as u32, height as u32)));
+            println!("frame,width,height,qindex,fast_psnr,exh_psnr,d_psnr,fast_bytes,exh_bytes,rate_growth,fast_candidates,exh_candidates,reduction");
+            for (name, pixels) in &frames {
+                for qindex in [1_u8, 8, 32, 80, 160, 200] {
+                    let fast =
+                        tile::FrameEncoder::new(pixels, width, height, qindex).encode_with_report();
+                    let exhaustive = tile::FrameEncoder::new(pixels, width, height, qindex)
+                        .without_search_shortcuts()
+                        .encode_with_report();
+                    let quality = |report: &tile::SearchReport| {
+                        let reconstruction: Vec<u8> = (0..height)
+                            .flat_map(|row| {
+                                report.reconstruction[row * report.coded_width..][..width].to_vec()
+                            })
+                            .collect();
+                        psnr(pixels, &reconstruction)
+                    };
+                    let (fast_psnr, exh_psnr) = (quality(&fast), quality(&exhaustive));
+                    println!(
+                        "{name},{width},{height},{qindex},{fast_psnr:.4},{exh_psnr:.4},{:+.4},{},{},{:+.4},{},{},{:.2}",
+                        fast_psnr - exh_psnr,
+                        fast.tile.len(),
+                        exhaustive.tile.len(),
+                        fast.tile.len() as f64 / exhaustive.tile.len() as f64 - 1.0,
+                        fast.candidates_evaluated,
+                        exhaustive.candidates_evaluated,
+                        exhaustive.candidates_evaluated as f64 / fast.candidates_evaluated as f64,
+                    );
+                }
+            }
+        }
+    }
+
     /// The stated bound on what the search shortcuts cost.
     ///
     /// Two of the three are exact - a block whose residual cannot pay for one coefficient, and a
