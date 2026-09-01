@@ -866,18 +866,77 @@ frames are not equally expensive (a key frame costs far more than the
 hierarchical B-frames after it), so arms measured over different frame counts
 would be comparing different work. The run prints the ratio directly.
 
-Read the ratio as an order of magnitude, not a two-digit figure. The hardware
-arm is stable run to run — a fixed-function block decoding a fixed window — while
-the software arm is a long single-threaded workload and varies several-fold on a
-loaded host, so the ratio moves with the host's other work rather than with
-anything the decoders did. Measured on an idle Apple Silicon host: 167 Mpx/s on
-VideoToolbox against 15 Mpx/s in software, about 11x.
-
 The setup arm reports the *warm* per-session cost, since criterion builds a
 session per iteration after the framework has already initialized. The single
 untimed pass printed above the criterion output reports the cold one, which
 includes one-time driver/framework initialization; a caller pays that once and
 the warm cost on every seek-driven reset.
+
+### Measured backends
+
+One row per measurement run, naming the host it was taken on. `Steady state` and
+`Warm setup` are the criterion `<arm>/steady_state` and
+`<arm>/session_setup_to_first_frame` figures; `Cold setup` is the single untimed
+pass. The software column is the `ZVIDLIB_BENCH_LARGE=1` baseline arm from the
+*same* run, which is what makes the ratio a ratio rather than a comparison
+across hosts.
+
+| Backend | Host | Steady state | Warm setup | Cold setup | Software, same host | Ratio |
+| --- | --- | --- | --- | --- | --- | --- |
+| VideoToolbox | idle Apple Silicon (#170) | 167 Mpx/s | not recorded | not recorded | 15 Mpx/s | ~11x |
+| VideoToolbox | Apple M1, macOS 26.5 (#282) | 163 Mpx/s, 78.6 fps | 16.7 ms | 114 ms | 38.5 Mpx/s, 18.6 fps | ~4x |
+| NVDEC | `ubuntu-latest`, Azure VM, x86_64 (#282) | not measured | — | — | — | — |
+| Media Foundation | `windows-latest`, Hyper-V Video adapter (#282) | not measured | — | — | — | — |
+
+Read the ratio as an order of magnitude, not a two-digit figure. The hardware
+arm is stable run to run — a fixed-function block decoding a fixed window — while
+the software arm is a long single-threaded workload and varies several-fold on a
+loaded host, so the ratio moves with the host's other work rather than with
+anything the decoders did. The two VideoToolbox rows are exactly that: their
+hardware numbers agree to within a few percent and their software numbers differ
+by 2.5x, which is where the whole gap between ~11x and ~4x lives. Neither row is
+the wrong one; the ratio is a property of the host as much as of the decoders.
+
+The #282 row is the minimum of two back-to-back runs on the same host rather
+than either run's own reading. The second run came out 40% slower on the
+*hardware* arm — the arm this file calls stable — which is the host announcing
+contention rather than anything the decoder did, so the slower run is discarded
+on that evidence instead of averaged in.
+
+### Backends that could not be measured
+
+NVDEC and Media Foundation both have code in the tree
+(`src/hevc/nvdec.rs`, `src/hevc/windows_mf.rs`) and both compile and run the
+benchmark, but no host with the fixed-function hardware behind either one was
+available. The bench needed no changes to reach that conclusion on either
+platform: it built and skipped cleanly, exactly as designed.
+
+- **NVDEC**, on `ubuntu-latest`: no NVIDIA GPU and no driver. The probe reports
+  `NVDEC: NVIDIA CUDA driver is unavailable: libcuda.so.1: cannot open shared
+  object file`. GitHub's standard hosted Linux runners are Azure VMs with no
+  attached GPU — `nvidia-smi` is absent and neither `libcuda.so.1` nor
+  `libnvcuvid.so.1` is on the loader path — so no configuration of a standard
+  runner reaches this backend. Measuring it needs a self-hosted or GPU-class
+  runner, or a physical NVIDIA host.
+- **Media Foundation**, on `windows-latest`: no D3D11 video device. The probe
+  reports `Media Foundation: D3D11 video decode is unavailable: No such
+  interface supported (0x80004002)` — the runner's only display adapter is
+  `Microsoft Hyper-V Video`, a paravirtualized adapter that exposes no
+  `ID3D11VideoDevice`, so the `D3D_DRIVER_TYPE_HARDWARE` device
+  `windows_mf::is_available` requires cannot be created. `CLSID_MSH265DecoderMFT`
+  is not registered on the image either, so even a software MFT fallback is
+  absent. Measuring it needs a Windows host with a real GPU.
+- The same Windows run also found NVDEC unavailable there
+  (`NVIDIA CUDA driver is unavailable: LoadLibraryExW failed`; `nvcuda.dll` and
+  `nvcuvid.dll` are both absent from the image), so neither of that platform's
+  two candidate backends is reachable on a hosted runner.
+
+Both numbers stay open until a host with the hardware runs the benchmark. The
+Windows run is worth one note of its own beyond the missing row: it is the first
+time the crate has been built and run on Windows in CI at all — `.github/workflows/ci.yml`
+has only ever had Linux jobs — and the `windows` and `libloading` target
+dependencies, the Media Foundation backend, and the benchmark suite all compiled
+without a warning.
 
 ### Frame readback
 
