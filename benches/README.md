@@ -502,6 +502,209 @@ run on the detected instruction set only and do not use `bench_across_isas`. The
 still carry the `simd=off` / `simd=on` build tag every group name carries,
 because that tag records which *build* produced a number, not which kernel ran.
 
+## Continuous integration
+
+The `Benchmarks` job in `.github/workflows/ci.yml` treats the suite as two
+different things depending on the event.
+
+**On every pull request** it runs `cargo bench --no-run` and stops. That is one
+build and no measurement. It exists because the usual way a benchmark suite dies
+is not a bad number, it is rotting: the bench code stops compiling against the
+crate, nobody runs it locally, and the decay is only discovered when someone
+needs a measurement months later. Compiling on every PR makes that failure
+immediate and cheap.
+
+It deliberately does **not** time anything on a pull request. GitHub's shared
+runners differ in CPU model, neighbour load, and thermal state between two runs
+of the same commit by far more than the regressions worth catching. A PR gate on
+those timings would fail on noise, and a check that fails on noise gets disabled.
+
+**On `main` pushes and `workflow_dispatch`** it runs the full suite with
+`ZVIDLIB_BENCH_LARGE=1`, so the per-ISA HEVC group — the one that proves the
+crate-wide override reaches the HEVC kernels — is included. Then it:
+
+1. writes `bench.log` and puts the host's instruction sets into the job summary;
+2. reduces `target/criterion/` to one small JSON baseline through
+   `.github/scripts/criterion_baseline.py collect`;
+3. downloads the newest baseline artifact from a previous `main` run and diffs
+   the two with `criterion_baseline.py compare`, writing a per-group delta table
+   to the job summary;
+4. uploads its own baseline as the `criterion-baseline-main` artifact (90-day
+   retention) for the next run to compare against.
+
+`workflow_dispatch` is how to measure a branch on demand without merging it, and
+it takes a `threshold` input.
+
+### The threshold, and why it is only a report
+
+The comparison flags anything that moved more than **15%** and writes it into
+the job summary. It does not fail the job.
+
+15% is deliberately loose and deliberately provisional. Nobody knows this
+suite's real run-to-run variance on the GitHub runner pool yet, and a threshold
+guessed tighter than the noise floor produces false regressions immediately —
+which is the same failure mode as gating PRs on timings, just slower. The
+intended path is to leave it reporting for a few weeks, read the actual spread
+off successive `main` runs, and then tighten it, and only then consider making it
+fail. Raising the alarm before the alarm is calibrated trains everyone to ignore
+it.
+
+The comparison uses criterion's **median** point estimate rather than the mean,
+because one descheduled iteration on a shared runner moves the mean and leaves
+the median alone. It compares point estimates rather than running criterion's
+own change detection, which needs both runs' raw sample data in one
+`target/criterion/` directory and assumes the same machine produced both.
+
+### Reading a flagged delta
+
+A red row is a prompt to look, not a verdict. Successive `main` runs land on
+different physical machines, and an arm can also disappear entirely — see the
+instruction-set log below. Reproduce on a quiet host before treating a flagged
+row as a real regression, and note that the crate's own measurements are quoted
+from an Apple Silicon host while CI measures `x86_64` Linux, so the two are not
+directly comparable to each other either.
+
+### Why the host's instruction sets are logged
+
+Groups built through `bench_across_isas` run one arm per entry in
+`simd::available()`, so a runner without AVX2 simply has no `avx2` arm. That is
+the correct behaviour — the alternative is scalar numbers filed under a vector
+label — but it is invisible in a results table: an absent `av1_deblock/avx2` and
+a slow one look the same from the outside, and GitHub's runner pool is not
+uniform in AVX2 availability. The bench target therefore prints
+`simd::available()`, the widest detected instruction set, and
+`simd::active_by_site()` before anything is timed, and the job lifts those lines
+into its summary. A baseline is only comparable to another baseline measured on
+the same arms.
+
+## Committed baselines
+
+The numbers below are a reference point for the ratios between arms, not a
+threshold anything is checked against — the CI job compares each `main` run
+against the previous one, not against this table. A number without a stated CPU
+is not comparable to anything, so the host is part of every row.
+
+The table is generated, not hand-typed: `criterion_baseline.py table` renders it
+from the same baseline JSON the CI job collects, so refreshing it is a
+measurement rather than an edit.
+
+```sh
+for round in 1 2 3; do
+  for target in codec av1_decode av1_encode hevc_decode hevc_encode; do
+    cargo bench --features native --bench "$target"
+  done
+  python3 .github/scripts/criterion_baseline.py collect \
+    --criterion-dir target/criterion --out "baseline-$round.json"
+done
+python3 .github/scripts/criterion_baseline.py table \
+  --baseline baseline-*.json --host 'Apple M1 (macOS 15, aarch64)'
+```
+
+Three rounds and not one, because `table` takes the elementwise **minimum**
+across the baselines it is given. Contention only ever makes a measurement
+slower, so the fastest observation of an arm is the closest any round got to an
+uncontended one; averaging would fold every neighbour process into the number
+instead.
+
+Only the groups `bench_across_isas` builds appear, because they are the only
+ones where "scalar vs each ISA" is a question — the rest of the suite is a single
+arm with nothing to compare against.
+
+Measured on **Apple M1 (macOS 15, aarch64)**, at `b6655bad215f`.
+
+| Group | `scalar` | `neon` | Best |
+| --- | ---: | ---: | ---: |
+| `av1_cdef` | 46.615 ms | 32.865 ms (1.42x) | 1.42x `neon` |
+| `av1_deblock` | 25.088 ms | 4.497 ms (5.58x) | 5.58x `neon` |
+| `av1_deblock_boundary` | 362.401 µs | 62.127 µs (5.83x) | 5.83x `neon` |
+| `av1_deblock_chroma` | 12.448 ms | 4.838 ms (2.57x) | 2.57x `neon` |
+| `av1_deblock_wide` | 78.324 ms | 40.843 ms (1.92x) | 1.92x `neon` |
+| `av1_decode_frame` | 82.680 ms | 88.976 ms (0.93x) | 0.93x `neon` |
+| `av1_encode_frame_q0` | 22.174 ms | 24.314 ms (0.91x) | 0.91x `neon` |
+| `av1_encode_frame_q160` | 344.933 ms | 153.918 ms (2.24x) | 2.24x `neon` |
+| `av1_encode_frame_q32` | 275.371 ms | 170.418 ms (1.62x) | 1.62x `neon` |
+| `av1_encode_stage_bitstream` | 17.426 µs | 17.517 µs (0.99x) | 0.99x `neon` |
+| `av1_encode_stage_symbol` | 1.558 ms | 1.940 ms (0.80x) | 0.80x `neon` |
+| `av1_encode_stage_tile` | 30.144 ms | 31.441 ms (0.96x) | 0.96x `neon` |
+| `av1_encode_stage_wht` | 981.525 µs | 360.850 µs (2.72x) | 2.72x `neon` |
+| `av1_entropy_symbol` | 3.449 ms | 3.422 ms (1.01x) | 1.01x `neon` |
+| `av1_forward_adst_8x8` | 33.915 ms | 8.722 ms (3.89x) | 3.89x `neon` |
+| `av1_forward_dct_16x16` | 45.538 ms | 12.369 ms (3.68x) | 3.68x `neon` |
+| `av1_forward_dct_32x32` | 60.160 ms | 63.603 ms (0.95x) | 0.95x `neon` |
+| `av1_forward_dct_4x4` | 50.984 ms | 7.889 ms (6.46x) | 6.46x `neon` |
+| `av1_forward_dct_8x8` | 33.702 ms | 8.557 ms (3.94x) | 3.94x `neon` |
+| `av1_forward_flipadst_16x16` | 36.556 ms | 12.258 ms (2.98x) | 2.98x `neon` |
+| `av1_intra_directional` | 26.145 ms | 27.222 ms (0.96x) | 0.96x `neon` |
+| `av1_intra_paeth` | 3.376 ms | 3.442 ms (0.98x) | 0.98x `neon` |
+| `av1_intra_smooth` | 3.564 ms | 3.410 ms (1.05x) | 1.05x `neon` |
+| `av1_inverse_adst_8x8` | 50.591 ms | 17.851 ms (2.83x) | 2.83x `neon` |
+| `av1_inverse_dct_16x16` | 24.143 ms | 11.105 ms (2.17x) | 2.17x `neon` |
+| `av1_inverse_dct_32x32` | 17.398 ms | 11.327 ms (1.54x) | 1.54x `neon` |
+| `av1_inverse_dct_4x4` | 78.638 ms | 28.663 ms (2.74x) | 2.74x `neon` |
+| `av1_inverse_dct_64x64` | 27.862 ms | 13.821 ms (2.02x) | 2.02x `neon` |
+| `av1_inverse_dct_8x8` | 42.501 ms | 17.817 ms (2.39x) | 2.39x `neon` |
+| `av1_inverse_flipadst_16x16` | 28.316 ms | 12.777 ms (2.22x) | 2.22x `neon` |
+| `av1_mc_blend_mask` | 26.063 ms | 12.135 ms (2.15x) | 2.15x `neon` |
+| `av1_mc_compound_average` | 25.797 ms | 11.882 ms (2.17x) | 2.17x `neon` |
+| `av1_mc_single` | 16.269 ms | 5.961 ms (2.73x) | 2.73x `neon` |
+| `av1_motion_compensation` | 14.660 ms | 5.442 ms (2.69x) | 2.69x `neon` |
+| `av1_self_guided` | 8.473 ms | 3.310 ms (2.56x) | 2.56x `neon` |
+| `av1_wiener` | 9.564 ms | 7.196 ms (1.33x) | 1.33x `neon` |
+| `hevc_cabac` | 2.559 ms | 2.250 ms (1.14x) | 1.14x `neon` |
+| `hevc_color_convert` | 15.095 ms | 11.926 ms (1.27x) | 1.27x `neon` |
+| `hevc_deblock` | 15.124 ms | 14.748 ms (1.03x) | 1.03x `neon` |
+| `hevc_encode_640x352` | 104.222 ms | 57.448 ms (1.81x) | 1.81x `neon` |
+| `hevc_encode_640x352_fwd_transform_quant` | 13.874 ms | 7.306 ms (1.90x) | 1.90x `neon` |
+| `hevc_encode_640x352_pcm_write` | 10.279 ms | 10.003 ms (1.03x) | 1.03x `neon` |
+| `hevc_encode_640x352_rdo_inter` | 77.838 ms | 27.887 ms (2.79x) | 2.79x `neon` |
+| `hevc_encode_640x352_rdo_intra` | 3.631 ms | 1.554 ms (2.34x) | 2.34x `neon` |
+| `hevc_encode_640x352_reconstruct` | 13.469 ms | 13.733 ms (0.98x) | 0.98x `neon` |
+| `hevc_encode_640x352_residual_write` | 34.563 ms | 33.620 ms (1.03x) | 1.03x `neon` |
+| `hevc_encode_640x352_rgba_to_yuv420` | 628.049 µs | 151.822 µs (4.14x) | 4.14x `neon` |
+| `hevc_encode_bitwriter` | 4.208 ms | 4.060 ms (1.04x) | 1.04x `neon` |
+| `hevc_encode_cabac` | 2.256 ms | 2.195 ms (1.03x) | 1.03x `neon` |
+| `hevc_inter_pred` | 24.460 ms | 20.344 ms (1.20x) | 1.20x `neon` |
+| `hevc_intra_pred` | 8.569 ms | 8.396 ms (1.02x) | 1.02x `neon` |
+| `hevc_inverse_transform` | 8.278 ms | 7.636 ms (1.08x) | 1.08x `neon` |
+| `hevc_sao` | 35.250 ms | 22.443 ms (1.57x) | 1.57x `neon` |
+
+### Reading the sub-parity rows
+
+An arm below `1.00x` is slower under its vector kernel than under scalar. Before
+treating one as a defect, note what three independent measurement sets of this
+same table did to the candidates:
+
+| Group | set 1 | set 2 | set 3 |
+| --- | ---: | ---: | ---: |
+| `hevc_intra_pred` | 0.62x | 1.04x | 1.09x |
+| `av1_intra_paeth` | 0.78x | 0.88x | 0.98x |
+| `av1_forward_dct_32x32` | 0.78x | 0.91x | 0.95x |
+
+No kernel changed between set 2 and set 3. What changed was the load average on
+the measuring host, and every candidate walked towards parity as the machine got
+quieter. **On this host, at this noise level, no arm is reliably below parity
+except the ones with no vector kernel at all** — `av1_encode_stage_symbol`,
+`av1_encode_stage_bitstream`, `hevc_cabac`, `hevc_encode_cabac`,
+`av1_entropy_symbol` and `hevc_color_convert`, where the two arms are the same
+code and differ only by measurement noise. Of those, `hevc_color_convert` is the
+one worth acting on, and `#219` already tracks vectorizing it.
+
+The rest of the near-parity rows are the story this file tells above: under
+`lto = "fat"` with `codegen-units = 1`, LLVM does to the scalar reference roughly
+what the hand kernel does, and the two land within noise of each other.
+
+This is the single most useful thing the committed table records. A one-off
+measurement of any of the three rows above would have looked like a broken
+kernel and sent someone rewriting code that was fine. It is also why the CI job
+compares medians rather than means, sets its threshold at a deliberately loose
+15%, and reports instead of failing: a shared runner is a noisier host than this
+one, not a quieter one.
+
+An arm being absent from a row means the host could not execute it, not that it
+was not measured: an Apple Silicon host has no `sse41` or `avx2` column at all,
+which is why the x86_64 arms do not appear here yet. `#228` covers measuring the
+x86_64 side.
+
 ## Fixtures
 
 `benches/support/` loads only fixtures already checked into the repository:

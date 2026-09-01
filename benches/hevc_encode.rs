@@ -70,7 +70,7 @@ use zvidlib::{
 };
 
 use support::FrameWork;
-use support::isa::{IsaWorkload, bench_across_isas};
+use support::isa::{IsaWorkload, bench_across_isas, log_host_isas};
 
 /// Environment variable that opts into the 1080p-scale groups.
 ///
@@ -523,6 +523,7 @@ fn hevc_encode_stages_large(criterion: &mut Criterion) {
 
 criterion_group!(
     benches,
+    log_host_isas,
     report_stage_coverage,
     hevc_encode_small,
     hevc_encode_stages_small,
