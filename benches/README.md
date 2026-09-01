@@ -193,6 +193,7 @@ is not mistaken for bitstream-writing cost. Both default to 640x352 and add a
 | `av1_encode_frame_q{0,32,160}` | one whole frame through the public encoder, `src/av1_encoder/tile.rs` |
 | `av1_encode_stage_wht` | the forward 4x4 WHT, `src/av1_encoder/wht.rs` |
 | `av1_encode_stage_symbol` | symbol coding over the static CDF tables, `src/av1_encoder/symbol.rs` and `cdf.rs` |
+| `av1_encode_stage_coeff_ctx` | the §8.3.2 `coeff_base`/`coeff_br` context derivation on its own, `src/av1_simd/coeff.rs` |
 | `av1_encode_stage_tile` | tile encoding: superblock iteration, `DC_PRED`, coefficient coding and its vectorized §8.3.2 context derivation, `src/av1_encoder/tile.rs` and `src/av1_simd/coeff.rs` |
 | `av1_encode_stage_bitstream` | headers, bit writing and OBU LEB128 framing, `src/av1_encoder/{bitwriter,headers,leb128}.rs` |
 | `av1_forward_dct_{4x4,8x8,16x16,32x32}` | forward DCT, `src/av1_encoder/transform.rs` through `zvidlib::forward_transform` |
@@ -208,19 +209,21 @@ tile encoding is within a small factor of the whole-frame number, the forward
 WHT and the symbol coder are each an order of magnitude cheaper than that, and
 header writing with its LEB128 framing is two to three orders cheaper again —
 microseconds against a 1080p tile encode's hundreds of milliseconds. Coefficient
-coding and its context derivation inside `tile.rs`, not the transform, are what a
-faster lossless encoder has to attack, and the §8.3.2 context derivation half of
-that is now vectorized (see below), which is why `av1_encode_stage_tile` and
-`av1_encode_frame_q0` are no longer flat across instruction sets.
+coding, not the transform, is what a faster lossless encoder has to attack — and
+the §8.3.2 context derivation half of it is now vectorized, which
+`av1_encode_stage_coeff_ctx` measures directly. `av1_encode_stage_tile` still
+reads close to flat anyway; [Why the tile group barely moves](#why-the-tile-group-barely-moves)
+is the measurement that says why, and what the remaining target is.
 
 This encoder's vectorized kernels are the forward transforms, the forward WHT,
 and the `coeff_base` / `coeff_br` context derivation the coefficient coding loop
 runs on (§8.3.2, `src/av1_simd/coeff.rs`, the `av1_coeff_ctx` dispatch site).
-The last of those is what makes `av1_encode_stage_tile` move with the
-instruction set at all: the whole block's contexts are derived in one
-data-parallel pass ahead of the serial symbol loop, which is legal because the
-loop walks the up-right diagonal scan backwards and every neighbour a position
-consults is therefore already final.
+The last of those derives a whole block's contexts in one data-parallel pass
+ahead of the serial symbol loop, which is legal because the loop walks the
+up-right diagonal scan backwards, so every neighbour a position consults is
+already final — or zero, past the end-of-block. `av1_encode_stage_coeff_ctx` is
+that pass on its own, and is the group its scalar-versus-vector delta is visible
+in.
 
 Symbol coding itself, CDF handling and bitstream writing remain scalar and are
 expected to stay that way — the range coder is serial by construction, since
@@ -237,6 +240,38 @@ rather than as a stage that costs nothing.
 cargo bench --bench av1_encode -- av1_encode_stage    # the per-stage groups only
 ZVIDLIB_BENCH_LARGE=1 cargo bench --bench av1_encode  # add the 1080p pass
 ```
+
+### Why the tile group barely moves
+
+`av1_encode_stage_coeff_ctx` wins and `av1_encode_stage_tile` does not, and the
+gap between those two facts is the useful measurement here.
+
+On an Apple Silicon host at 640x352, `--release`, as the best of interleaved
+rounds per arm — this machine routinely runs several concurrent builds, so a
+single round is meaningless and the minimum is the statistic (see
+[Reading a null result](#reading-a-null-result)):
+
+| Group | scalar | neon |
+| --- | --- | --- |
+| `av1_encode_stage_coeff_ctx` | 3.05 ms | 1.69 ms |
+| `av1_encode_stage_tile` | 33.8 ms | 31.3 ms |
+
+The kernel is 1.8x, and it is real. It is also only about 9% of the tile encode
+it was factored out of, so removing 45% of *that* is under 4% end to end — below
+this host's round-to-round spread, which is why `av1_encode_stage_tile` and
+`av1_encode_frame_q0` still read within noise of each other and of the same two
+groups built from `main`.
+
+A `sample` profile of the lossless tile encode says where the rest goes: of
+14,411 samples inside `FrameEncoder::encode`, 9,164 — 64% — are in
+`SymbolEncoder::encode_symbol`. Coefficient coding is indeed the whole frame,
+but what is left of it once the contexts are vectorized is the range coder, and
+that is serial by construction in exactly the way
+[the HEVC CABAC encoder](#why-the-cabac-arithmetic-encoder-stays-serial) is:
+each symbol renormalizes against the interval the previous one left. No vector
+kernel addresses it. The remaining headroom in AV1 lossless encoding is
+therefore a *serial* question — widening the bit sink, and unrolling the
+literal-bit runs the coefficient loop writes — not another dispatch family.
 
 The kernel-level `av1_forward_*` groups run once per available instruction set
 through
