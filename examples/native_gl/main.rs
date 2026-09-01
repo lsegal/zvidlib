@@ -634,6 +634,9 @@ where
                 // made a single pass across the bar queue hundreds of decodes (issue #319).
                 if self.dragging {
                     let fraction = self.horizontal_fraction(position.x);
+                    // A drag keeps the marker under the pointer even once it has slid off the
+                    // bar vertically, since it is still scrubbing.
+                    self.timeline_hover = Some(fraction);
                     self.scrub_preview(fraction);
                 } else if let Some(state) = self.state.as_ref() {
                     state.window.request_redraw();
