@@ -41,6 +41,11 @@ jobs:
       # every one of them is reachable from a [[bench]] target.
       - name: Check every bench source is compiled
         run: cargo test --features native --test bench_sources_compile
+      # `criterion_baseline.py` is where a benchmark regression threshold is
+      # justified from, and it runs in a job that takes two hours to reach it.
+      # Standard library only, so this needs no install step.
+      - name: Test the benchmark baseline script
+        run: python3 -m unittest discover -s .github/scripts -v
       - name: Test AV1 SIMD kernels against the scalar path
         run: cargo test --features native --lib av1_simd -- --nocapture
       - name: Test library units

@@ -540,20 +540,74 @@ it takes a `threshold` input.
 The comparison flags anything that moved more than **15%** and writes it into
 the job summary. It does not fail the job.
 
-15% is deliberately loose and deliberately provisional. Nobody knows this
-suite's real run-to-run variance on the GitHub runner pool yet, and a threshold
-guessed tighter than the noise floor produces false regressions immediately —
-which is the same failure mode as gating PRs on timings, just slower. The
-intended path is to leave it reporting for a few weeks, read the actual spread
-off successive `main` runs, and then tighten it, and only then consider making it
-fail. Raising the alarm before the alarm is calibrated trains everyone to ignore
-it.
+15% is deliberately loose and deliberately provisional. A threshold guessed
+tighter than the noise floor produces false regressions immediately — the same
+failure mode as gating PRs on timings, just slower — so it was picked wide
+enough to be quiet until there was something to calibrate it against.
+
+**It has not been calibrated yet, because the data does not exist yet.** The
+timed job that stores baselines landed with the delta report itself; calibrating
+it needs a run of consecutive `main` pushes measured through that job, and those
+accumulate at the rate `main` moves. Until then 15% stands as a guess that
+nobody has checked, not as a number the suite's measured spread supports. Do not
+quote it as if it were the latter, and do not tighten it on a hunch: a threshold
+moved without data is the same guess at a different value.
 
 The comparison uses criterion's **median** point estimate rather than the mean,
 because one descheduled iteration on a shared runner moves the mean and leaves
 the median alone. It compares point estimates rather than running criterion's
 own change detection, which needs both runs' raw sample data in one
 `target/criterion/` directory and assumes the same machine produced both.
+
+### Calibrating it
+
+The measurement is a command rather than a project. `criterion_baseline.py
+variance` takes the stored baselines in chronological order and reports, per
+group, how far a benchmark moves between two runs when nothing about it
+changed — the same `|median|` delta the report thresholds, over pairs where the
+code did not change meaningfully.
+
+```sh
+# Every stored main baseline, oldest first. They expire after 90 days.
+n=0
+gh api 'repos/lsegal/zvidlib/actions/artifacts?name=criterion-baseline-main&per_page=100' \
+  --jq '[.artifacts[] | select(.expired == false)] | reverse | .[] | [.id, .workflow_run.head_sha] | @tsv' \
+  | while IFS=$'\t' read -r id sha; do
+      # Numbered, not named after the commit: `variance` reads chronological
+      # order off the argument order, and a `$sha` glob sorts alphabetically.
+      n=$((n + 1))
+      dir="$(printf 'run-%03d-%s' "$n" "$sha")"
+      gh api "repos/lsegal/zvidlib/actions/artifacts/$id/zip" > "$id.zip"
+      unzip -o -j "$id.zip" -d "$dir"
+    done
+
+python3 .github/scripts/criterion_baseline.py variance \
+  --baseline run-*/criterion-baseline.json --out variance.md
+```
+
+Per group and not one number for the suite, because a whole-frame 1080p group
+and a microbenchmark do not share a noise floor and a single global threshold
+may be the wrong shape for both. The report's suggested threshold is the
+smallest whole 5% step above the worst delta in the sample: a floor on a
+defensible number, not a recommendation, since a sample that happened to miss a
+bad run suggests a threshold the next bad run will cross. Below ten pairs the
+report marks itself provisional and its p95 column should be ignored — with a
+handful of samples the p95 is just the worst thing seen so far.
+
+Reading a tighter threshold off that report is the point of collecting it. A
+per-group threshold is a legitimate outcome. So is recording that 15% survived
+contact with the data; what is not an outcome is leaving this section saying the
+same thing in a year.
+
+### Gating
+
+`--fail-on-regression` exists in `criterion_baseline.py` and is deliberately
+unused. Gating a group requires more than a threshold: the group's whole
+observed spread has to fit under the gate, and its arms have to be present in
+every run — a group whose `avx2` arm comes and goes with the runner pool cannot
+be gated on at any threshold, because the disappearance is not a percentage.
+`variance` reports both, and neither question can be answered before the
+baselines above exist.
 
 ### Reading a flagged delta
 
