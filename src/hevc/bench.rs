@@ -159,7 +159,7 @@ pub fn cabac_encode_bins(bins: &[u8], contexts: usize) -> Vec<u8> {
 /// contiguous `n`-bin bypass field of the kind `coeff_sign_flag`, the
 /// Golomb-Rice suffix of `coeff_abs_level_remaining` and the
 /// `last_sig_coeff_*` suffixes emit, coded through
-/// [`CabacEncoder::encode_bypass_bits`]. The returned bytes are the
+/// `CabacEncoder::encode_bypass_bits`. The returned bytes are the
 /// arithmetic codeword, so the bit writer the runs go through is measured
 /// with them.
 ///
