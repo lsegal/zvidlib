@@ -87,24 +87,24 @@ const LARGE_TYPE_GAIN_PROBES: usize = 4;
 /// unsampled search this interval approximates. Cost is the encoder's own `sse + lambda * bits`,
 /// summed over the frame and compared at equal quantizer:
 ///
-/// | interval | worst penalty vs unsampled | mean vs exhaustive | candidates | time |
-/// |---------:|---------------------------:|-------------------:|-----------:|--------:|
-/// | 1        | 0.0%                       | +0.25%             | 181,557    | 0.644 s |
-/// | 2        | +44.1%                     | +1.05%             | 155,143    | 0.607 s |
-/// | 4        | +64.6%                     | +1.70%             | 142,372    | 0.574 s |
-/// | 8        | +78.7%                     | +1.97%             | 136,250    | 0.565 s |
-/// | 16       | +85.8%                     | +2.29%             | 128,035    | 0.557 s |
+/// | interval | worst penalty vs unsampled | mean vs exhaustive | candidates |
+/// |---------:|---------------------------:|-------------------:|-----------:|
+/// | 1        | 0.00%                      | +0.63%             | 228,743    |
+/// | 2        | +1.15%                     | +0.61%             | 207,352    |
+/// | 3        | +1.17%                     | +0.63%             | 198,964    |
+/// | 4        | +3.26%                     | +0.66%             | 197,196    |
+/// | 8        | +3.97%                     | +0.69%             | 190,714    |
+/// | 16       | +3.97%                     | +0.57%             | 184,954    |
 ///
-/// Every worst case is the same frame and quantizer - the hard scene edge at `qindex` 160, whose
-/// two halves have unrelated statistics - and the original value of `8` carried nearly twice
-/// the error there against `2` while saving 7% of the encode. `1` is not the value because it
-/// evaluates 181,557 transform-type candidates against the exhaustive search's 700,004, which
-/// no longer clears the
-/// four-fold reduction the shortcuts exist for and
-/// `the_search_shortcuts_stay_within_their_rate_and_distortion_bound` asserts; `2` clears it with
-/// 155,143. What remains at `2` is the estimator mixing statistics across regions rather than the
-/// sampling rate, which no interval fixes; [`TYPE_GAIN_MEMORY`] is what addresses that, and the
-/// worst-penalty column above is the frame-wide accumulation it replaced.
+/// The whole surface is an order of magnitude flatter than it was when this constant was first
+/// derived, because [`estimate_rate`] now prices a level the way §5.11.39 codes one: what used to
+/// read as the sampling rate mixing regions' statistics was mostly the rate model mispricing the
+/// large levels a region boundary produces. `2` remains the value - it is within 0.02 points of
+/// the unsampled estimator's worst case and saves 9% of the candidates, and every interval past
+/// it gives up two to four times as much for another 5%. `1` is not the value: it evaluates
+/// 228,743 transform-type candidates, which is where the four-fold reduction
+/// `the_search_shortcuts_stay_within_their_rate_and_distortion_bound` asserts stops being
+/// comfortable.
 pub(super) const TYPE_GAIN_SAMPLE_INTERVAL: usize = 2;
 
 /// Probes a transform size's accumulated gain ratio remembers, as the window of an exponential
@@ -127,34 +127,32 @@ pub(super) const TYPE_GAIN_SAMPLE_INTERVAL: usize = 2;
 /// start of each band) and over keeping a ratio per spatial region (which needs a region map the
 /// encoder does not have and memory proportional to the frame).
 ///
-/// `4` is where it measured out, on the `content_frames` set plus `test_pattern` at both 128x96
+/// `2` is where it measured out, on the `content_frames` set plus `test_pattern` at both 128x96
 /// and 192x160 over the six quantizers, as each frame's worst penalty in `sse + lambda * bits`
 /// against the same estimator probing every size search. `frame` is the un-decayed accumulation
-/// this replaced:
+/// this replaced, and each cell is the worse of the two frame sizes:
 ///
-/// | window     | scene_edge | quadrants | smooth | test_pattern | candidates |
-/// |-----------:|-----------:|----------:|-------:|-------------:|-----------:|
-/// | 1          | +8.26%     | +0.86%    | +0.08% | +3.12%       | 155,725    |
-/// | 2          | +9.11%     | +1.49%    | +0.52% | +0.37%       | 155,696    |
-/// | 4          | +9.32%     | +0.00%    | +0.52% | +0.37%       | 155,392    |
-/// | 8          | +16.36%    | +0.00%    | +0.52% | +0.37%       | 155,357    |
-/// | 32         | +29.96%    | +0.00%    | +0.52% | +0.37%       | 155,109    |
-/// | frame      | +44.14%    | +0.00%    | +0.52% | +0.37%       | 155,143    |
+/// | window | scene_edge | quadrants | smooth  | test_pattern | noise  |
+/// |-------:|-----------:|----------:|--------:|-------------:|-------:|
+/// | 1      | +1.37%     | +0.33%    | +12.97% | +0.29%       | +0.05% |
+/// | 2      | +1.13%     | +0.45%    | +1.62%  | +0.29%       | +0.05% |
+/// | 3      | +1.60%     | +0.45%    | +1.62%  | +0.29%       | +0.05% |
+/// | 4      | +1.80%     | +0.42%    | +0.04%  | +0.29%       | +0.05% |
+/// | 8      | +1.99%     | +0.20%    | +0.04%  | +0.29%       | +0.05% |
+/// | 32     | +2.07%     | +0.33%    | +0.04%  | +0.29%       | +0.05% |
+/// | frame  | +1.99%     | +0.20%    | +0.04%  | +0.29%       | +0.19% |
 ///
-/// (`noise` and `diagonals` are 0.00% at every window and are left out of the table.) `4` is the
-/// largest window that gives up none of the improvement - it cuts the scene edge's penalty by a
-/// factor of 4.7 at 192x160 and from +30.04% to +2.13% at 128x96 - while regressing no other
-/// frame against the frame-wide accumulation. Shorter windows start trading it back: `2` costs
-/// `quadrants` +1.49% and `1`, which remembers only the last probe, costs `test_pattern` +3.12%,
-/// because a single probe is too noisy an estimate to rank a size on.
+/// (`diagonals` is 0.00% at every window and is left out of the table.) This was `4` while
+/// [`estimate_rate`] charged a level `2 + 2 * bit_length(level)`; re-derived against the rate
+/// model that replaced it, the surface is both far flatter - no window is past +13% where the
+/// old one reached +44% - and differently shaped, and `2` now has the lowest worst case of any
+/// window at either frame size (+1.62% against `4`'s +1.80%). It is the shortest window that
+/// still averages more than one probe: `1` remembers only the last probe, which is too noisy an
+/// estimate to rank a size on and costs `smooth` +12.97%.
 ///
-/// The correction exists to be cheap and stays so. The decay is one multiply and one divide per
-/// accumulator, paid only on the sampled trials, and it evaluates 155,392 transform-type
-/// candidates against the frame-wide accumulation's 155,143 - 0.16% more, against the exhaustive
-/// search's 700,004. In wall-clock terms, from the minimum of five interleaved rounds per window
-/// in `measure_type_gain_memory_cost` over the six frames at six quantizers, 0.971 s at `4`
-/// against 0.954 s un-decayed: +1.8%, which is the extra candidates plus the arithmetic, and
-/// which the whole window sweep spans (0.954-0.975 s) from end to end.
+/// The correction exists to be cheap and stays so: the decay is one multiply and one divide per
+/// accumulator, paid only on the sampled trials, and the whole window sweep spans 0.5% of the
+/// candidate count from `1` to `frame`.
 pub(super) const TYPE_GAIN_MEMORY: usize = 2;
 
 /// Transform sizes [`FrameEncoder::type_gain`] accumulates over: `TX_4X4` through `TX_32X32`,
