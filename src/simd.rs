@@ -408,6 +408,7 @@ mod tests {
     fn clearing_the_override_restores_per_site_detection() {
         use crate::av1_intra_pred::{Av1IntraSimd, av1_intra_simd};
         use crate::av1_mc::default_level;
+        use crate::hevc::color_convert;
         use crate::hevc::engine::encoder::{colorconv, quant_simd, rdcost};
         use crate::hevc::engine::{simd as hevc_simd, transform_simd};
 
@@ -444,6 +445,11 @@ mod tests {
         );
         // HEVC encoder-side RGBA8 to YUV420 input conversion.
         assert_eq!(colorconv::isa() != colorconv::Isa::Scalar, vectorized);
+        // The HEVC decoder's YUV420-to-RGBA output conversion.
+        assert_eq!(
+            color_convert::detected_isa() != color_convert::Isa::Scalar,
+            vectorized
+        );
 
         // As in `pinning_scalar_reaches_every_dispatch_site`, the list above is
         // written out by hand, one selector per site, so it only stays
@@ -458,6 +464,7 @@ mod tests {
             "hevc_rdcost",
             "hevc_fwd_transform_quant",
             "hevc_colorconv",
+            "hevc_color_convert",
         ];
         let sites: Vec<&str> = active_by_site().into_iter().map(|(site, _)| site).collect();
         assert_eq!(sites, checked);
