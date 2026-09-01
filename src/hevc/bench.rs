@@ -150,6 +150,39 @@ pub fn cabac_encode_bins(bins: &[u8], contexts: usize) -> Vec<u8> {
     writer.finish()
 }
 
+/// Drives the §9.3.5 CABAC arithmetic encoder over *runs* of bypass bins,
+/// the shape the lossy residual writer's bins actually have.
+///
+/// `cabac_encode_bins` above interleaves single bypass bins with
+/// context-coded ones, so it cannot see a run-at-a-time bypass step at all.
+/// This one is the complementary workload: each `(value, n)` pair is one
+/// contiguous `n`-bin bypass field of the kind `coeff_sign_flag`, the
+/// Golomb-Rice suffix of `coeff_abs_level_remaining` and the
+/// `last_sig_coeff_*` suffixes emit, coded through
+/// `CabacEncoder::encode_bypass_bits`. The returned bytes are the
+/// arithmetic codeword, so the bit writer the runs go through is measured
+/// with them.
+///
+/// See `benches/README.md`'s "Why the CABAC arithmetic encoder stays serial"
+/// for what this group was added to settle: the §9.3.5.5 step unrolled over a
+/// whole run is an exact identity, but it is not a speedup with the present
+/// `put_bit`-at-a-time sink.
+///
+/// # Panics
+///
+/// Panics if any run is wider than 32 bins.
+#[must_use]
+pub fn cabac_encode_bypass_runs(runs: &[(u32, u8)]) -> Vec<u8> {
+    let mut writer = BitWriter::new();
+    let mut cabac = CabacEncoder::new();
+    for &(value, n) in runs {
+        assert!(n <= 32, "a bypass run is at most one u32 wide");
+        cabac.encode_bypass_bits(&mut writer, value, n);
+    }
+    cabac.encode_terminate(&mut writer, 1);
+    writer.finish()
+}
+
 /// Writes a deterministic syntax-element sequence through the raw bit writer,
 /// with no arithmetic coding on top.
 ///
@@ -455,10 +488,11 @@ mod tests {
     /// The guard the benchmark's `bench_across_isas` relies on: every wrapper
     /// must return the same bytes under every instruction set the host can run.
     ///
-    /// The encoder's only SIMD dispatch family is the mode search's distortion
-    /// metrics, so this is where a divergence would surface as a *different mode
-    /// decision* rather than a different picture — which a bit-exactness check
-    /// on decoded pixels would never see.
+    /// The encoder's SIMD dispatch families are the mode search's distortion
+    /// metrics and the RGBA8 to YUV420 input conversion. The distortion metrics are
+    /// where a divergence would surface as a *different mode decision* rather than a
+    /// different picture — which a bit-exactness check on decoded pixels would never
+    /// see.
     #[test]
     fn every_stage_wrapper_is_bit_exact_across_instruction_sets() {
         let _guard = test_lock();
