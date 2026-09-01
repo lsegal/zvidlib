@@ -59,7 +59,7 @@ use zvidlib::{
 };
 
 use support::FrameWork;
-use support::isa::{IsaWorkload, bench_across_isas, checksum};
+use support::isa::{IsaWorkload, bench_across_isas, checksum, log_host_isas};
 
 /// Luma dimensions the kernel-level groups run over. One 1080p plane is large
 /// enough that per-call dispatch overhead is negligible next to the vectorized
@@ -604,6 +604,7 @@ fn av1_entropy_symbol(criterion: &mut Criterion) {
 
 criterion_group!(
     benches,
+    log_host_isas,
     av1_decode_frame,
     av1_inverse_transforms,
     av1_deblock,

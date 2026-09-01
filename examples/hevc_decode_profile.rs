@@ -131,7 +131,8 @@ fn main() {
         report.speedup_at(4.0),
     );
     println!(
-        "`color_convert` alone is {:.1}% of the measured total and has no vector kernel.",
+        "`color_convert` alone is {:.1}% of the measured total; it is output conversion \
+         rather than decoding, and since issue #219 it has a vector kernel of its own.",
         report.share(profile::Stage::ColorConvert) * 100.0,
     );
     println!(

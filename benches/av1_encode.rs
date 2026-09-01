@@ -70,7 +70,7 @@ use zvidlib::{
 };
 
 use support::FrameWork;
-use support::isa::{IsaWorkload, bench_across_isas, checksum};
+use support::isa::{IsaWorkload, bench_across_isas, checksum, log_host_isas};
 
 /// Luma dimensions the kernel-level groups run over, matching
 /// `benches/av1_decode.rs`. One 1080p plane is large enough that per-call
@@ -383,6 +383,7 @@ fn av1_encode_stages(criterion: &mut Criterion) {
 
 criterion_group!(
     benches,
+    log_host_isas,
     report_stage_coverage,
     av1_encode_whole_frame,
     av1_encode_stages,

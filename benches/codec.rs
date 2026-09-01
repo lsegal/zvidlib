@@ -20,7 +20,7 @@ use zvidlib::av1_filters::{FilterFrame, FilterPlane, LoopFilterParams, deblock_f
 use zvidlib::av1_mc::{InterpFilter, McContext, RefPlane};
 use zvidlib::{Av1InterDecoder, Limits, TxSizeGrid, decode_av1_lossless_intra};
 
-use support::isa::{IsaWorkload, bench_across_isas};
+use support::isa::{IsaWorkload, bench_across_isas, log_host_isas};
 use support::{FrameWork, group_name, report_throughput};
 
 /// Smoke benchmark: end-to-end proof that fixture loading, decoding, and
@@ -253,6 +253,7 @@ fn av1_motion_compensation_by_isa(criterion: &mut Criterion) {
 
 criterion_group!(
     benches,
+    log_host_isas,
     smoke,
     av1_decode,
     encoder_input,
