@@ -30,6 +30,7 @@ use super::transform::forward_transform;
 use super::wht::fwht4x4;
 use crate::av1_intra::{Av1TxType, get_ac_quant, get_dc_quant, inverse_transform};
 use crate::av1_intra_pred::add_residual_row;
+use crate::av1_simd::coeff;
 
 /// `NUM_BASE_LEVELS` (§3).
 const NUM_BASE_LEVELS: i32 = 2;
@@ -161,6 +162,13 @@ pub(super) const TYPE_GAIN_MEMORY: usize = 4;
 /// Transform sizes [`FrameEncoder::type_gain`] accumulates over: `TX_4X4` through `TX_32X32`,
 /// which is every size [`super::transform::forward_transform`] implements.
 const TYPE_GAIN_SIZES: usize = 4;
+
+/// What a probed transform block is identified by: its position on the coded grid, its transform
+/// size, and the DC prediction it was measured against - the four values that determine its
+/// residual and so everything the search derives from it. Only the coverage measurement in
+/// `measure_probe_reuse_coverage` reads these back; see [`FrameEncoder::probe_keys`].
+#[cfg(test)]
+type ProbeKey = (usize, usize, usize, u8);
 
 /// One transform size's accumulated probe measurement for the frame.
 #[derive(Clone, Copy, Default)]
@@ -374,6 +382,11 @@ pub(crate) struct FrameEncoder<'a> {
     /// test can compare the shortcuts against the search they stand in for.
     #[cfg(test)]
     exhaustive: bool,
+    /// Set by [`Self::with_reversed_candidate_order`] to walk the transform-type and
+    /// transform-size candidates backwards, so a test can prove no decision depends on the order
+    /// they are evaluated in.
+    #[cfg(test)]
+    reversed_candidates: bool,
     /// The sampling interval in force, so a test can sweep it and measure what
     /// [`TYPE_GAIN_SAMPLE_INTERVAL`] costs at each value instead of asserting the shipped one is
     /// right. Outside tests the constant is read directly.
@@ -405,6 +418,37 @@ pub(crate) struct FrameEncoder<'a> {
     /// Every transform-size decision this frame's searches made, for [`SearchReport`].
     #[cfg(test)]
     size_choices: Vec<(usize, usize, usize, usize)>,
+    /// Reused buffers for the per-block coefficient context pass.
+    coeff_ctx: CoeffScratch,
+    /// Exact `sse + lambda * bits` ties the transform-type and transform-size searches had to
+    /// settle, so a test can show the tie-break is reached on real content rather than assert an
+    /// order-independence that holds only because nothing ever tied.
+    #[cfg(test)]
+    cost_ties: u64,
+    /// Every [`ProbeKey`] a size trial probed, in the order they were measured, against the key
+    /// the emitting pass actually reached at each transform block's position. How far the two
+    /// sets overlap is what any reuse of a probe's result could ever have covered, which
+    /// `measure_probe_reuse_coverage` reports and #291 closed on.
+    #[cfg(test)]
+    probe_keys: Vec<ProbeKey>,
+    /// `(size, prediction)` of every transform block the emitting pass wrote, by its position.
+    #[cfg(test)]
+    emitted_blocks: std::collections::HashMap<(usize, usize), (usize, u8)>,
+    /// Coding blocks the emitting pass wrote, which bounds how many probes could ever be read
+    /// back: a size trial probes one block, so no emitted coding block can consume more than one.
+    #[cfg(test)]
+    emitted_coding_blocks: u64,
+    /// Size searches that probed, which bounds it further under the sampling interval.
+    #[cfg(test)]
+    probing_size_searches: u64,
+    /// Emitted blocks the zero-block shortcut decided, which no probe ever ran on.
+    #[cfg(test)]
+    zero_skipped_emitted: u64,
+    /// Emitted blocks that ran a transform-type search over more than one candidate, which is
+    /// every emitted block a probe could ever have stood in for: a zero-skipped block never
+    /// searches, and a size whose derived set names one type has nothing to choose between.
+    #[cfg(test)]
+    reusable_emitted: u64,
 }
 
 /// What one encode of a tile did, for the tests that compare two searches against each other.
@@ -419,6 +463,15 @@ pub(crate) struct SearchReport {
     /// chosen transform width)` in MI units, so a measurement can attribute a difference between
     /// two searches to a place in the frame rather than to a position in the trace.
     pub(crate) size_choices: Vec<(usize, usize, usize, usize)>,
+    pub(crate) cost_ties: u64,
+    /// The probe and emit key sets and the counts that bound their overlap, for
+    /// `measure_probe_reuse_coverage`.
+    pub(crate) probe_keys: Vec<(usize, usize, usize, u8)>,
+    pub(crate) emitted_blocks: std::collections::HashMap<(usize, usize), (usize, u8)>,
+    pub(crate) emitted_coding_blocks: u64,
+    pub(crate) probing_size_searches: u64,
+    pub(crate) zero_skipped_emitted: u64,
+    pub(crate) reusable_emitted: u64,
 }
 
 /// One transform type considered for a block, with everything the winner needs to be written:
@@ -426,10 +479,71 @@ pub(crate) struct SearchReport {
 /// and the `sse + lambda * bits` cost the search minimizes.
 struct TxCandidate {
     symbol: usize,
+    /// Only the trace the tests assert on reads this back; the bitstream carries `symbol`.
+    #[cfg_attr(not(test), allow(dead_code))]
     tx_type: Av1TxType,
     levels: Vec<i32>,
     reconstructed: Vec<i16>,
     cost: i64,
+}
+
+/// Reusable buffers for one transform block's §8.3.2 coefficient contexts.
+///
+/// The contexts are derived for the whole block in a single pass before the serial symbol loop
+/// runs, which is legal because every neighbour `coeff_base` and `coeff_br` consult lies later in
+/// the up-right diagonal scan than the position consulting it, and the loop walks that scan
+/// backwards — so those neighbours are already final (or, past the end-of-block, zero) before the
+/// first symbol is written. See [`crate::av1_simd::coeff`] for the vector kernel that pass
+/// dispatches to.
+///
+/// The buffers live on the encoder rather than the block so a frame's hundreds of thousands of
+/// transform blocks share one allocation each. The padded plane's zero border is written once per
+/// size and never again, so a block only overwrites its own `size * size` interior.
+#[derive(Default)]
+pub(crate) struct CoeffScratch {
+    /// The size the buffers below are currently shaped for; `0` before the first block.
+    size: usize,
+    /// Clamped magnitudes in the zero-padded layout `crate::av1_simd::coeff` reads.
+    plane: Vec<i32>,
+    /// `coeff_base` context per raster position.
+    pub(crate) base: Vec<i32>,
+    /// `coeff_br` context per raster position.
+    pub(crate) br: Vec<i32>,
+}
+
+impl CoeffScratch {
+    /// Reshapes the buffers for a `size x size` block, rewriting the padded plane's zero border
+    /// only when the size actually changed.
+    fn resize(&mut self, size: usize) {
+        if self.size == size {
+            return;
+        }
+        self.size = size;
+        coeff::reset_padded_plane(&mut self.plane, size);
+        self.base.clear();
+        self.base.resize(size * size, 0);
+        self.br.clear();
+        self.br.resize(size * size, 0);
+    }
+
+    /// Fills [`Self::base`] and [`Self::br`] for every position of a block whose quantized
+    /// coefficients are `quant`, through the vector kernel when the active instruction set has
+    /// one and through `tile.rs`'s scalar reference otherwise.
+    pub(crate) fn derive(&mut self, quant: &[i32], size: usize) {
+        self.resize(size);
+        let isa = coeff::active_isa();
+        if coeff::has_vector_kernel(isa) {
+            coeff::fill_padded_levels(&mut self.plane, quant, size);
+            if crate::av1_simd::coeff_contexts(isa, &self.plane, size, &mut self.base, &mut self.br)
+            {
+                return;
+            }
+        }
+        for pos in 0..size * size {
+            self.base[pos] = coeff_base_ctx(pos, quant, size) as i32;
+            self.br[pos] = coeff_br_ctx(pos, quant, size) as i32;
+        }
+    }
 }
 
 /// The block-local encoder state a speculative (non-emitting) trial mutates, saved so the trial
@@ -499,6 +613,8 @@ impl<'a> FrameEncoder<'a> {
             #[cfg(test)]
             exhaustive: false,
             #[cfg(test)]
+            reversed_candidates: false,
+            #[cfg(test)]
             type_gain_interval: TYPE_GAIN_SAMPLE_INTERVAL,
             #[cfg(test)]
             type_gain_memory: TYPE_GAIN_MEMORY,
@@ -514,6 +630,21 @@ impl<'a> FrameEncoder<'a> {
             candidates_evaluated: 0,
             #[cfg(test)]
             size_choices: Vec::new(),
+            coeff_ctx: CoeffScratch::default(),
+            #[cfg(test)]
+            cost_ties: 0,
+            #[cfg(test)]
+            probe_keys: Vec::new(),
+            #[cfg(test)]
+            emitted_blocks: std::collections::HashMap::new(),
+            #[cfg(test)]
+            emitted_coding_blocks: 0,
+            #[cfg(test)]
+            probing_size_searches: 0,
+            #[cfg(test)]
+            zero_skipped_emitted: 0,
+            #[cfg(test)]
+            reusable_emitted: 0,
         }
     }
 
@@ -523,6 +654,16 @@ impl<'a> FrameEncoder<'a> {
     #[cfg(test)]
     pub(crate) fn without_search_shortcuts(mut self) -> Self {
         self.exhaustive = true;
+        self
+    }
+
+    /// Evaluates every transform-type and transform-size candidate in the reverse of the order
+    /// the searches normally walk. A search whose ties are settled by a total order over the
+    /// candidates encodes identically either way; one that keeps whichever equal-cost candidate
+    /// it happened to see first does not.
+    #[cfg(test)]
+    pub(crate) fn with_reversed_candidate_order(mut self) -> Self {
+        self.reversed_candidates = true;
         self
     }
 
@@ -686,6 +827,13 @@ impl<'a> FrameEncoder<'a> {
             trace: std::mem::take(&mut self.emitted),
             candidates_evaluated: self.candidates_evaluated,
             size_choices: std::mem::take(&mut self.size_choices),
+            cost_ties: self.cost_ties,
+            probe_keys: std::mem::take(&mut self.probe_keys),
+            emitted_blocks: std::mem::take(&mut self.emitted_blocks),
+            emitted_coding_blocks: self.emitted_coding_blocks,
+            probing_size_searches: self.probing_size_searches,
+            zero_skipped_emitted: self.zero_skipped_emitted,
+            reusable_emitted: self.reusable_emitted,
             tile: self.sym.finish(),
         }
     }
@@ -820,6 +968,11 @@ impl<'a> FrameEncoder<'a> {
             + self.encode_partition(r + half, c + half, h, false);
         self.restore(snapshot);
 
+        // Strictly less, so a split that only ties the whole block does not happen: the tie goes
+        // to `PARTITION_NONE`, the cheaper of the two to signal (one partition symbol against
+        // five, plus four sub-blocks' own headers). Unlike the type and size searches this
+        // comparison is between two named alternatives rather than a scan, so the preference is
+        // the whole tie-break; there is no candidate order it could otherwise fall back on.
         let chosen = split + self.lambda * SPLIT_HEADER_BITS < whole;
         self.split_memo[slot] = u8::from(chosen);
         chosen
@@ -912,13 +1065,29 @@ impl<'a> FrameEncoder<'a> {
         {
             self.gain_column = c / SB4;
         }
-        let probing = self.shortcuts() && self.sample_type_gain();
-        let mut best = (0usize, i64::MAX);
+        // The sizes `read_tx_size` can signal for this block, in increasing depth order, which is
+        // increasing symbol order: depth `d` is the symbol the decoder reads.
+        let mut widths = Vec::new();
         for depth in 0..=max_depth {
             let tx_width = (largest >> depth).max(4);
-            if tx_width > MAX_FORWARD_TX {
-                continue;
+            if tx_width <= MAX_FORWARD_TX {
+                widths.push(tx_width);
             }
+            if tx_width == 4 {
+                break;
+            }
+        }
+        #[cfg(test)]
+        if self.reversed_candidates {
+            widths.reverse();
+        }
+        let probing = self.shortcuts() && self.sample_type_gain();
+        #[cfg(test)]
+        if probing {
+            self.probing_size_searches += 1;
+        }
+        let mut best = (0usize, i64::MAX);
+        for &tx_width in &widths {
             let snapshot = self.snapshot(r, c, bw);
             self.probe_budget = if probing { self.type_gain_probes() } else { 0 };
             self.probe_dct_cost = 0;
@@ -927,11 +1096,18 @@ impl<'a> FrameEncoder<'a> {
             let cost = self.code_block_transforms(r, c, bw, tx_width, false);
             self.restore(snapshot);
             let cost = self.corrected_trial_cost(cost, tx_width);
-            if cost < best.1 {
-                best = (tx_width, cost);
+            // Sizes are ranked by the same total order the type search uses: cost first, and an
+            // exact tie broken towards the cheaper size to signal, which is the largest one -
+            // its depth, and so its `read_tx_size` symbol, is the smallest. Deciding a tie by the
+            // loop's order instead would make the answer a property of how this search happens to
+            // enumerate, not of the block;
+            // `the_search_is_independent_of_the_order_candidates_are_evaluated_in` pins that down.
+            #[cfg(test)]
+            if cost == best.1 && best.0 != 0 {
+                self.cost_ties += 1;
             }
-            if tx_width == 4 {
-                break;
+            if cost < best.1 || (cost == best.1 && tx_width > best.0) {
+                best = (tx_width, cost);
             }
         }
         // Nothing outside a size trial may probe: every other speculative pass stays on the
@@ -1065,6 +1241,10 @@ impl<'a> FrameEncoder<'a> {
     ) -> i64 {
         let units = bw / 4;
         let step = tx_width / 4;
+        #[cfg(test)]
+        if emit {
+            self.emitted_coding_blocks += 1;
+        }
         let mut cost = 0;
         let mut ty = 0;
         while ty < units {
@@ -1117,6 +1297,11 @@ impl<'a> FrameEncoder<'a> {
         emit: bool,
     ) -> i64 {
         let prediction = self.dc_prediction(x, y, size);
+        #[cfg(test)]
+        if emit {
+            self.emitted_blocks.insert((x, y), (size, prediction));
+        }
+
         let mut residual = vec![0i32; size * size];
         for row in 0..size {
             for column in 0..size {
@@ -1135,6 +1320,10 @@ impl<'a> FrameEncoder<'a> {
             .enumerate()
             .filter_map(|(symbol, &(_, tx_type))| Some((symbol, tx_type?)))
             .collect();
+        #[cfg(test)]
+        if self.reversed_candidates {
+            candidates.reverse();
+        }
         let scan = cdf::up_right_diagonal_scan(size);
 
         // Coding nothing costs the residual's own energy plus the single `all_zero` bit, and any
@@ -1150,6 +1339,10 @@ impl<'a> FrameEncoder<'a> {
         if self.shortcuts()
             && energy + self.lambda * ZERO_BLOCK_BITS < self.lambda * MIN_CODED_BLOCK_BITS
         {
+            #[cfg(test)]
+            if emit {
+                self.zero_skipped_emitted += 1;
+            }
             return self.write_zero_block(x, y, block_width, size, prediction, &scan, energy, emit);
         }
 
@@ -1164,6 +1357,10 @@ impl<'a> FrameEncoder<'a> {
         // measures: the block still keeps DCT's result, so the trial's reconstruction, contexts
         // and cost are exactly the ones a DCT-only trial produces, and the measurement is applied
         // to the trial as a whole in `corrected_trial_cost`.
+        #[cfg(test)]
+        if emit && candidates.len() > 1 {
+            self.reusable_emitted += 1;
+        }
         let trial = self.shortcuts() && !emit;
         let mut probing = false;
         if trial && candidates.len() > 1 {
@@ -1200,29 +1397,41 @@ impl<'a> FrameEncoder<'a> {
             // A probe ranks the block on DCT like any other trial block; every other pass keeps
             // the cheapest type, which on the emitting pass is the type actually written.
             //
-            // The keep test is strictly less, so an exact tie keeps the earlier candidate and the
-            // winner is a function of `candidates` order alone. Ties are not hypothetical: on the
-            // 96x80 test pattern of `nonlossless_tests` the smallest emitting-pass margins are 4
-            // (a 4x4 block between `DCT_DCT` and `IDTX`) and 0 (a 4x4 block between `ADST_ADST`
-            // and `DCT_DCT`), where the set order alone decides it. That is the margin issue #231
-            // was about: a one-unit cost difference flips which type such a block writes, so the
-            // comparison has to be a total order over a fixed candidate order rather than
-            // anything that depends on evaluation order or on the host. Which type wins there is
-            // therefore a property of the pattern, not of the encoder, and is not asserted; that
-            // the *bitstream* comes out the same everywhere is, in `nonlossless_tests`.
-            let keep = if probing {
-                tx_type == Av1TxType::DctDct || best.is_none()
-            } else {
-                best.as_ref().is_none_or(|best| cost < best.cost)
+            // Ties are not hypothetical: on the 96x80 test pattern of `nonlossless_tests` the
+            // smallest emitting-pass margins are 4 (a 4x4 block between `DCT_DCT` and `IDTX`) and
+            // 0 (a 4x4 block whose `ADST_ADST` and `DCT_DCT` costs are exactly equal). A strict
+            // `<` would settle that block by whichever type `tx_type_inverse_set` lists first,
+            // making the winner a property of a table's order and of this loop's direction rather
+            // than of the block. The comparison is therefore a total order over
+            // `(cost, symbol)`: equal cost is broken towards the smaller `tx_type` symbol, the
+            // one the decoder reads earliest in the derived set and the cheaper of the two to
+            // signal under `tx_type_cdf`, whose probabilities are ordered by symbol. That leaves
+            // no dependence on evaluation order at all, which
+            // `the_search_is_independent_of_the_order_candidates_are_evaluated_in` asserts
+            // directly and `equal_cost_ties_are_reached_by_a_normal_encode` shows is not vacuous.
+            #[cfg(test)]
+            if !probing && best.as_ref().is_some_and(|best| best.cost == cost) {
+                self.cost_ties += 1;
+            }
+            let candidate = TxCandidate {
+                symbol,
+                tx_type,
+                levels,
+                reconstructed,
+                cost,
             };
-            if keep {
-                best = Some(TxCandidate {
-                    symbol,
-                    tx_type,
-                    levels,
-                    reconstructed,
-                    cost,
-                });
+            if probing {
+                // A probe measures and nothing more: the block keeps DCT's result so the trial's
+                // reconstruction, contexts and cost are exactly a DCT-only trial's, and what the
+                // whole set was worth is carried out of the loop by `cheapest` alone.
+                if tx_type == Av1TxType::DctDct || best.is_none() {
+                    best = Some(candidate);
+                }
+            } else if best
+                .as_ref()
+                .is_none_or(|best| (cost, symbol) < (best.cost, best.symbol))
+            {
+                best = Some(candidate);
             }
         }
         if probing {
@@ -1238,42 +1447,69 @@ impl<'a> FrameEncoder<'a> {
                 let column = self.gain_column * TYPE_GAIN_SIZES + slot;
                 Self::accumulate(&mut self.column_gain[column], memory, dct, best_of_set);
             }
+            #[cfg(test)]
+            self.probe_keys.push((x, y, size, prediction));
         }
-        // `tx_type` itself is only read by the trace the tests assert on; the bitstream carries
-        // its `symbol` index instead.
-        #[cfg_attr(not(test), allow(unused_variables))]
-        let TxCandidate {
-            symbol,
-            tx_type,
-            levels,
-            reconstructed,
-            cost,
-        } = best.expect("every transform size has at least one candidate type");
+        let winner = best.expect("every transform size has at least one candidate type");
+        let cost = self.write_candidate(x, y, block_width, size, prediction, &winner, &scan, emit);
+        if trial {
+            self.trial_searched_cost += cost;
+        }
+        cost
+    }
 
+    /// Reconstructs a transform block from the type the search picked and codes its coefficients,
+    /// returning the candidate's cost.
+    ///
+    /// This is the whole of a transform block's output, shared by the searched winner and by the
+    /// zero-block shortcut's forced all-zero block, so neither can drift from the other.
+    #[allow(clippy::too_many_arguments)]
+    fn write_candidate(
+        &mut self,
+        x: usize,
+        y: usize,
+        block_width: usize,
+        size: usize,
+        prediction: u8,
+        candidate: &TxCandidate,
+        scan: &[usize],
+        emit: bool,
+    ) -> i64 {
         for row in 0..size {
             let start = (y + row) * self.coded_w + x;
             let destination = &mut self.recon[start..start + size];
             destination.fill(prediction);
-            add_residual_row(&reconstructed[row * size..(row + 1) * size], destination);
+            add_residual_row(
+                &candidate.reconstructed[row * size..(row + 1) * size],
+                destination,
+            );
         }
 
-        let coded = self.code_coefficients(x >> 2, y >> 2, block_width, size, &levels, &scan, emit);
+        let coded = self.code_coefficients(
+            x >> 2,
+            y >> 2,
+            block_width,
+            size,
+            &candidate.levels,
+            scan,
+            emit,
+        );
+        // `tx_type` itself is only read by the trace the tests assert on; the bitstream carries
+        // its `symbol` index instead.
         #[cfg(test)]
         if emit {
-            self.emitted.push((size, tx_type));
+            self.emitted.push((size, candidate.tx_type));
         }
         // The decoder reads `tx_type` after the coefficients, and only for a block that was not
         // fully skipped; a skipped block's type is irrelevant because its residual is zero.
         if coded && emit {
             // DC_PRED is the only y_mode this encoder signals, so the CDF's intra direction is 0.
+            let set = cdf::get_tx_set(size, false, true);
             if let Some(tx_cdf) = cdf::tx_type_cdf(set, size, 0) {
-                self.sym.encode_symbol(symbol, tx_cdf);
+                self.sym.encode_symbol(candidate.symbol, tx_cdf);
             }
         }
-        if trial {
-            self.trial_searched_cost += cost;
-        }
-        cost
+        candidate.cost
     }
 
     /// Writes the all-zero coefficient block whose cost the type search cannot beat, updating
@@ -1444,54 +1680,51 @@ impl<'a> FrameEncoder<'a> {
                     (extra >> (nbits - 1)) & 1,
                     cdf::eob_extra_cdf(qctx, tx_ctx, ptype, eobpt - 3),
                 );
-                let mut i = nbits as isize - 2;
-                while i >= 0 {
-                    self.sym.encode_literal(((extra >> i) & 1) as u32, 1);
-                    i -= 1;
-                }
+                // The remaining `nbits - 1` bits are equiprobable literals in MSB-first order,
+                // which is one literal run rather than one call per bit.
+                self.sym.encode_literal(extra as u32, nbits as u32 - 1);
             }
         }
 
-        // Base levels + base range, scanned from the last coefficient back to DC.
-        let mut levels = vec![0i32; count];
-        for c in (0..eob).rev() {
-            let pos = scan[c];
-            let level = quant[pos].abs();
-            if c == eob - 1 {
-                let ctx = coeff_base_eob_ctx(c, count);
-                if emit {
+        // Base levels + base range, scanned from the last coefficient back to DC. Every context
+        // the loop needs is derived for the whole block up front (see `CoeffScratch`), and only
+        // the emitting pass consults them, so a speculative trial skips the derivation outright.
+        if emit {
+            let mut scratch = std::mem::take(&mut self.coeff_ctx);
+            scratch.derive(quant, size);
+            for c in (0..eob).rev() {
+                let pos = scan[c];
+                let level = quant[pos].abs();
+                if c == eob - 1 {
+                    let ctx = coeff_base_eob_ctx(c, count);
                     self.sym.encode_symbol(
                         (level.min(3) - 1) as usize,
                         cdf::coeff_base_eob_cdf(qctx, tx_ctx, ptype, ctx),
                     );
-                }
-            } else {
-                let ctx = coeff_base_ctx(pos, &levels, size);
-                if emit {
+                } else {
+                    let ctx = scratch.base[pos] as usize;
                     self.sym.encode_symbol(
                         level.min(3) as usize,
                         cdf::coeff_base_cdf(qctx, tx_ctx, ptype, ctx),
                     );
                 }
-            }
-            if level > NUM_BASE_LEVELS {
-                let br_ctx = coeff_br_ctx(pos, &levels, size);
-                let mut rem = level - 3;
-                for _ in 0..4 {
-                    let brv = rem.min(3);
-                    if emit {
+                if level > NUM_BASE_LEVELS {
+                    let br_ctx = scratch.br[pos] as usize;
+                    let mut rem = level - 3;
+                    for _ in 0..4 {
+                        let brv = rem.min(3);
                         self.sym.encode_symbol(
                             brv as usize,
                             cdf::coeff_br_cdf(qctx, tx_ctx, ptype, br_ctx),
                         );
-                    }
-                    rem -= brv;
-                    if brv < 3 {
-                        break;
+                        rem -= brv;
+                        if brv < 3 {
+                            break;
+                        }
                     }
                 }
             }
-            levels[pos] = level;
+            self.coeff_ctx = scratch;
         }
 
         // Signs (DC sign is CDF-coded; the rest are raw bits) and golomb tails.
@@ -1514,7 +1747,9 @@ impl<'a> FrameEncoder<'a> {
             }
         }
 
-        let cul = levels.iter().sum::<i32>().min(63) as u8;
+        // Every coefficient at or past the end-of-block is zero by the definition of `eob`, so
+        // summing the whole block's magnitudes is the same `culLevel` the scanned levels gave.
+        let cul = quant.iter().map(|value| value.abs()).sum::<i32>().min(63) as u8;
         let dc_cat = if quant[0] == 0 {
             0
         } else if quant[0] < 0 {
@@ -1737,6 +1972,9 @@ fn coeff_base_eob_ctx(c: usize, count: usize) -> usize {
     }
 }
 
+/// `getCoeffBaseCtx` (§8.3.2) for `TX_CLASS_2D`: the scalar reference
+/// [`crate::av1_simd::coeff::block_contexts`] is a lane-by-lane transliteration of. `levels` holds
+/// the block's quantized coefficients; only their magnitudes are read.
 fn coeff_base_ctx(pos: usize, levels: &[i32], size: usize) -> usize {
     let (row, col) = (pos / size, pos % size);
     let mut mag = 0i32;
@@ -1753,6 +1991,8 @@ fn coeff_base_ctx(pos: usize, levels: &[i32], size: usize) -> usize {
     ctx + cdf::coeff_base_ctx_offset(row, col)
 }
 
+/// `getCoeffBrCtx` (§8.3.2) for `TX_CLASS_2D`, the other half of the scalar reference described
+/// on [`coeff_base_ctx`].
 fn coeff_br_ctx(pos: usize, levels: &[i32], size: usize) -> usize {
     let (row, col) = (pos / size, pos % size);
     let mut mag = 0i32;
@@ -1775,13 +2015,173 @@ fn coeff_br_ctx(pos: usize, levels: &[i32], size: usize) -> usize {
 /// Exp-Golomb tail used for coefficient magnitudes above the base-range cap (§5.11.39).
 fn golomb(sym: &mut SymbolEncoder, x: u32) {
     let len = 32 - x.leading_zeros(); // bit length, x >= 1
-    for _ in 0..(len - 1) {
-        sym.encode_literal(0, 1);
+    // The code is `len - 1` zeros followed by `x` itself in `len` bits, and `x`'s top bit is set,
+    // so the whole thing is `x` written as one `2 * len - 1`-bit literal: the leading zeros are
+    // just the field's own padding. That is one literal run instead of `2 * len - 1` single-bit
+    // calls whenever the field fits in a `u32`.
+    let bits = 2 * len - 1;
+    if bits <= 32 {
+        sym.encode_literal(x, bits);
+    } else {
+        sym.encode_literal(0, len - 1);
+        sym.encode_literal(x, len);
     }
-    sym.encode_literal(1, 1);
-    let mut i = len as isize - 2;
-    while i >= 0 {
-        sym.encode_literal((x >> i) & 1, 1);
-        i -= 1;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::simd::{self, SimdIsa};
+
+    /// Small deterministic LCG, matching the style used elsewhere in the crate.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            self.0 >> 33
+        }
+    }
+
+    /// Quantized coefficients spanning the ranges the contexts distinguish: zeros, the base
+    /// levels, the base-range cap, and magnitudes past the golomb threshold, in both signs.
+    fn coefficients(size: usize, seed: u64) -> Vec<i32> {
+        let mut rng = Lcg(seed);
+        (0..size * size)
+            .map(|_| {
+                let magnitude = match rng.next() % 5 {
+                    0 => 0,
+                    1 => (rng.next() % 3) as i32,
+                    2 => (rng.next() % 16) as i32,
+                    3 => (rng.next() % 64) as i32,
+                    _ => (rng.next() % 4096) as i32,
+                };
+                if rng.next() % 2 == 0 {
+                    magnitude
+                } else {
+                    -magnitude
+                }
+            })
+            .collect()
+    }
+
+    /// The widths worth covering: every one from a single coefficient up past two full AVX2
+    /// vectors, so a partial trailing vector is exercised at both lane counts, plus the large
+    /// transform sizes the non-lossless encoder actually codes.
+    const WIDTHS: [usize; 20] = [
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 32, 64,
+    ];
+
+    /// The whole point of the vector kernel: it must agree with `tile.rs`'s scalar §8.3.2
+    /// reference lane for lane, at every width and on every instruction set the host has.
+    #[test]
+    fn the_context_pass_matches_the_scalar_reference_on_every_instruction_set() {
+        let _guard = simd::test_lock();
+        for &size in &WIDTHS {
+            for seed in 0..4u64 {
+                let quant = coefficients(size, seed * 977 + size as u64);
+                let mut expected_base = vec![0i32; size * size];
+                let mut expected_br = vec![0i32; size * size];
+                for pos in 0..size * size {
+                    expected_base[pos] = coeff_base_ctx(pos, &quant, size) as i32;
+                    expected_br[pos] = coeff_br_ctx(pos, &quant, size) as i32;
+                }
+                for isa in simd::available() {
+                    simd::set_override(Some(isa));
+                    assert_eq!(
+                        coeff::active_isa(),
+                        isa,
+                        "the coefficient context site did not follow the override"
+                    );
+                    let mut scratch = CoeffScratch::default();
+                    scratch.derive(&quant, size);
+                    assert_eq!(
+                        scratch.base,
+                        expected_base,
+                        "coeff_base at size {size}, seed {seed}, isa {}",
+                        isa.name()
+                    );
+                    assert_eq!(
+                        scratch.br,
+                        expected_br,
+                        "coeff_br at size {size}, seed {seed}, isa {}",
+                        isa.name()
+                    );
+                }
+            }
+        }
+        simd::set_override(None);
+    }
+
+    /// Deriving the contexts up front is only legal because the backwards scan never consults a
+    /// neighbour it has not already coded, and never consults a non-zero one past the
+    /// end-of-block. Replay the incremental derivation the coding loop used to do and check it
+    /// against the one-pass answer, for every end-of-block a block can have.
+    #[test]
+    fn the_one_pass_derivation_matches_the_incremental_scan_order_one() {
+        let _guard = simd::test_lock();
+        simd::set_override(Some(SimdIsa::Scalar));
+        for &size in &[4usize, 8, 16, 32] {
+            let count = size * size;
+            let scan = cdf::up_right_diagonal_scan(size);
+            let dense = coefficients(size, 31 + size as u64);
+            for eob in 1..=count {
+                // Past the end-of-block every coefficient is zero by the definition of `eob`,
+                // which is the property the one-pass derivation leans on.
+                let mut quant = vec![0i32; count];
+                for &pos in scan.iter().take(eob) {
+                    quant[pos] = dense[pos];
+                }
+                let mut scratch = CoeffScratch::default();
+                scratch.derive(&quant, size);
+
+                let mut levels = vec![0i32; count];
+                for c in (0..eob).rev() {
+                    let pos = scan[c];
+                    assert_eq!(
+                        coeff_base_ctx(pos, &levels, size) as i32,
+                        scratch.base[pos],
+                        "coeff_base at size {size}, eob {eob}, scan index {c}"
+                    );
+                    assert_eq!(
+                        coeff_br_ctx(pos, &levels, size) as i32,
+                        scratch.br[pos],
+                        "coeff_br at size {size}, eob {eob}, scan index {c}"
+                    );
+                    levels[pos] = quant[pos].abs();
+                }
+            }
+        }
+        simd::set_override(None);
+    }
+
+    /// The encoded bitstream is the contract: a vector context pass that changed a single symbol
+    /// would produce a different tile, so every instruction set must emit the same bytes.
+    #[test]
+    fn the_encoded_tile_is_byte_identical_on_every_instruction_set() {
+        let _guard = simd::test_lock();
+        let (width, height) = (61usize, 37usize);
+        let mut rng = Lcg(0x5eed);
+        let plane: Vec<u8> = (0..width * height)
+            .map(|_| (rng.next() & 0xff) as u8)
+            .collect();
+        for qindex in [0u8, 40, 160] {
+            simd::set_override(Some(SimdIsa::Scalar));
+            let reference = FrameEncoder::new(&plane, width, height, qindex).encode();
+            for isa in simd::available() {
+                simd::set_override(Some(isa));
+                let coded = FrameEncoder::new(&plane, width, height, qindex).encode();
+                assert_eq!(
+                    coded,
+                    reference,
+                    "tile bytes differ at qindex {qindex} on {}",
+                    isa.name()
+                );
+            }
+        }
+        simd::set_override(None);
     }
 }

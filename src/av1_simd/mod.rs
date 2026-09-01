@@ -41,6 +41,7 @@
 
 use crate::av1_intra::Tx1d;
 
+pub(crate) mod coeff;
 pub(crate) mod filters;
 pub(crate) mod transforms;
 pub(crate) mod vector;
@@ -333,6 +334,11 @@ simd_entry_points! {
     ) = filters::wiener_vertical_row, avx2 = Avx2;
 }
 simd_entry_points! {
+    fn [coeff_ctx_sse41, coeff_ctx_avx2, coeff_ctx_neon](
+        plane: &[i32], size: usize, base_out: &mut [i32], br_out: &mut [i32]
+    ) = coeff::block_contexts, avx2 = Avx2;
+}
+simd_entry_points! {
     #[allow(clippy::too_many_arguments)]
     fn [box_stats_sse41, box_stats_avx2, box_stats_neon](
         data: &[u8], geom: filters::Geometry, x0: usize, y: usize, count: usize,
@@ -359,6 +365,30 @@ macro_rules! dispatch {
 // ---------------------------------------------------------------------
 // Safe dispatchers used by the AV1 transform and filter modules
 // ---------------------------------------------------------------------
+
+/// Vectorized §8.3.2 `coeff_base` / `coeff_br` context derivation for one
+/// `size x size` transform block, reading the padded level plane
+/// [`coeff::fill_padded_levels`] wrote.
+///
+/// Returns `false` without touching the outputs when `isa` has no vector kernel
+/// in this build and the caller should derive the contexts scalar-side.
+pub(crate) fn coeff_contexts(
+    isa: SimdIsa,
+    plane: &[i32],
+    size: usize,
+    base_out: &mut [i32],
+    br_out: &mut [i32],
+) -> bool {
+    debug_assert_eq!(plane.len(), coeff::padded_len(size));
+    debug_assert_eq!(base_out.len(), size * size);
+    debug_assert_eq!(br_out.len(), size * size);
+    dispatch!(
+        isa,
+        [coeff_ctx_sse41, coeff_ctx_avx2, coeff_ctx_neon](plane, size, base_out, br_out),
+        return false
+    );
+    true
+}
 
 /// Vectorized [`crate::av1_encoder`] inverse WHT, or `None` when the caller
 /// should use the scalar path.

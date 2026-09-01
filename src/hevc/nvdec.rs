@@ -10,6 +10,7 @@ use std::thread::{self, JoinHandle};
 use libloading::Library;
 
 use super::engine::hvcc::{HvccRecord, split_length_prefixed};
+use super::readback;
 use crate::{
     CancellationToken, DecodedVideoFrame, EncodedVideoSample, Error, ErrorKind, FrameIndex, Limits,
     PixelFormat, Plane, Result, VideoDecoder, VideoDecoderConfig, VideoDimensions, VideoFrame,
@@ -660,6 +661,10 @@ unsafe extern "system" fn display_callback(
         };
         let mut device_pointer = 0_u64;
         let mut pitch = 0_u32;
+        // NVDEC's surface-copy phase is the whole map/`cuMemcpyDtoH`/unmap
+        // sequence: on a discrete GPU this is the PCIe transfer, and it is the
+        // half of readback the colour conversion below cannot account for.
+        let surface_copy = readback::Timer::start();
         let mapped = unsafe {
             (state.api.cuvid_map_video_frame)(
                 state.decoder,
@@ -695,6 +700,7 @@ unsafe extern "system" fn display_callback(
         if unmapped != CUDA_SUCCESS {
             return Err(format!("NVDEC frame unmap failed: CUDA error {unmapped}"));
         }
+        surface_copy.record(readback::Phase::SurfaceCopy);
         state.frames.push(RawNv12Frame {
             pitch: pitch as usize,
             data,
@@ -740,6 +746,7 @@ fn nv12_to_rgba(
             "HEVC RGBA output exceeds the allocation limit",
         ));
     }
+    let color_convert = readback::Timer::start();
     let mut rgba = vec![0_u8; length];
     for y in 0..height {
         let luma = &raw.data[y * raw.pitch..y * raw.pitch + width];
@@ -761,6 +768,8 @@ fn nv12_to_rgba(
             rgba[at + 3] = 255;
         }
     }
+    color_convert.record(readback::Phase::ColorConvert);
+    readback::count_frame();
     VideoFrame::new(
         configuration.coded_dimensions,
         PixelFormat::Rgba8,

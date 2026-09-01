@@ -15,7 +15,7 @@ pub mod bench;
 #[allow(dead_code)]
 mod bitwriter;
 #[allow(dead_code)]
-mod cdf;
+pub(crate) mod cdf;
 mod headers;
 #[allow(dead_code)]
 mod leb128;
@@ -1108,6 +1108,70 @@ mod nonlossless_tests {
         }
     }
 
+    /// Where the probed and the emitted transform-block key sets diverge, which is what any reuse
+    /// of a size trial's probe on the emitting pass could ever have covered.
+    ///
+    /// A probe's result is only readable by the emitting pass when it was measured under the exact
+    /// `(position, size, prediction)` that pass later reaches. This classifies every probe of the
+    /// 640x352 frame at `base_q_idx` 32 and 160 against the blocks that pass wrote - reachable, a
+    /// losing size trial (the position is emitted at another size), a losing partition candidate
+    /// (the position is emitted at this size against another prediction), or a position that is
+    /// not the start of an emitted block at all - and prints what bounds the overlap from the
+    /// emitting side: `reusable_emitted`, the blocks that pass searches over more than one
+    /// candidate at all. That column is what closed #291: 44 of 1,870 emitted blocks at
+    /// `base_q_idx` 32 and 0 of 220 at 160, because the zero-block shortcut decides 1,716 of them
+    /// and every 32x32 block's derived set names a single type. The removed reuse reached 21 of
+    /// those 44, and covering all of them would have saved 220 of the frame's 18,957
+    /// transform-type candidate evaluations - 1.2%, against 0% at 160.
+    #[test]
+    #[ignore = "measurement sweep, not an assertion"]
+    fn measure_probe_reuse_coverage() {
+        let (width, height) = (640_usize, 352_usize);
+        let pixels = test_pattern(width as u32, height as u32);
+        println!(
+            "qindex,emitted_blocks,zero_skipped,reusable_emitted,emitted_coding_blocks,probing_size_searches,probes,distinct_probes,reachable,losing_size,losing_partition,unemitted_position,emitted_sizes"
+        );
+        for qindex in [32_u8, 160] {
+            let report =
+                tile::FrameEncoder::new(&pixels, width, height, qindex).encode_with_report();
+            let distinct: std::collections::BTreeSet<_> =
+                report.probe_keys.iter().copied().collect();
+            let (mut reachable, mut losing_size, mut losing_partition, mut unemitted) =
+                (0, 0, 0, 0);
+            for &(x, y, size, prediction) in &distinct {
+                match report.emitted_blocks.get(&(x, y)) {
+                    None => unemitted += 1,
+                    Some(&(emitted_size, _)) if emitted_size != size => losing_size += 1,
+                    Some(&(_, emitted_prediction)) if emitted_prediction != prediction => {
+                        losing_partition += 1
+                    }
+                    Some(_) => reachable += 1,
+                }
+            }
+            let mut sizes: std::collections::BTreeMap<usize, usize> =
+                std::collections::BTreeMap::new();
+            for &(size, _) in report.emitted_blocks.values() {
+                *sizes.entry(size).or_default() += 1;
+            }
+            let sizes: Vec<String> = sizes
+                .iter()
+                .map(|(size, count)| format!("{size}x{size}:{count}"))
+                .collect();
+            println!(
+                "{qindex},{},{},{},{},{},{},{},{},{losing_size},{losing_partition},{unemitted},{}",
+                report.emitted_blocks.len(),
+                report.zero_skipped_emitted,
+                report.reusable_emitted,
+                report.emitted_coding_blocks,
+                report.probing_size_searches,
+                report.probe_keys.len(),
+                distinct.len(),
+                reachable,
+                sizes.join(" "),
+            );
+        }
+    }
+
     #[test]
     #[ignore = "measurement sweep, not an assertion"]
     fn measure_type_gain_sampling_cost() {
@@ -1655,6 +1719,69 @@ mod nonlossless_tests {
                 exhaustive.candidates_evaluated
             );
         }
+    }
+
+    /// Neither the transform-type nor the transform-size search may depend on the order it walks
+    /// its candidates in: both settle an exact `sse + lambda * bits` tie by a total order over
+    /// the candidate itself - the smaller `tx_type` symbol, the larger transform - so evaluating
+    /// the same candidates backwards has to produce the same bitstream, the same trace and the
+    /// same reconstruction. With the strict `<` this replaces, a tied block kept whichever
+    /// candidate came first and this test fails.
+    #[test]
+    fn the_search_is_independent_of_the_order_candidates_are_evaluated_in() {
+        let (width, height) = (96_usize, 80_usize);
+        let pixels = test_pattern(width as u32, height as u32);
+        for qindex in [1_u8, 8, 32, 80, 160, 200] {
+            for exhaustive in [false, true] {
+                let build = || {
+                    let encoder = tile::FrameEncoder::new(&pixels, width, height, qindex);
+                    if exhaustive {
+                        encoder.without_search_shortcuts()
+                    } else {
+                        encoder
+                    }
+                };
+                let forward = build().encode_with_report();
+                let reversed = build().with_reversed_candidate_order().encode_with_report();
+                assert_eq!(
+                    forward.tile, reversed.tile,
+                    "qindex {qindex} (exhaustive {exhaustive}) emitted different bytes when the \
+                     candidates were evaluated in reverse order"
+                );
+                assert_eq!(
+                    forward.trace, reversed.trace,
+                    "qindex {qindex} (exhaustive {exhaustive}) chose different transforms when \
+                     the candidates were evaluated in reverse order"
+                );
+                assert_eq!(
+                    forward.reconstruction, reversed.reconstruction,
+                    "qindex {qindex} (exhaustive {exhaustive}) reconstructed differently when \
+                     the candidates were evaluated in reverse order"
+                );
+            }
+        }
+    }
+
+    /// The tie-break above is reached on ordinary content, so the order-independence it buys is
+    /// not the vacuous kind that holds because nothing ever ties. Issue #249 measured exactly
+    /// zero margin between `ADST_ADST` and `DCT_DCT` on a 4x4 block of this pattern.
+    #[test]
+    fn equal_cost_ties_are_reached_by_a_normal_encode() {
+        let (width, height) = (96_usize, 80_usize);
+        let pixels = test_pattern(width as u32, height as u32);
+        let ties: u64 = [1_u8, 8, 32, 80, 160, 200]
+            .into_iter()
+            .map(|qindex| {
+                tile::FrameEncoder::new(&pixels, width, height, qindex)
+                    .encode_with_report()
+                    .cost_ties
+            })
+            .sum();
+        assert!(
+            ties > 0,
+            "no transform search on this pattern ever had to settle an exact cost tie, so \
+             the_search_is_independent_of_the_order_candidates_are_evaluated_in proves nothing"
+        );
     }
 
     /// `TX_4X4` is a size the shipped search *selects*, not just one the emitting path could
