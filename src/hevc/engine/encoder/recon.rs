@@ -799,7 +799,6 @@ fn class_offsets(
     (gain, offsets)
 }
 
-
 /// §8.7.3.2 `edgeIdx` remapped to the `SaoOffsetVal` category index
 /// (1..4), or `None` for category 0 (no offset) and for samples whose
 /// neighbours leave the plane.

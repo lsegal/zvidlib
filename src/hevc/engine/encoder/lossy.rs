@@ -46,9 +46,49 @@
 //! never this picture's own prediction input. See
 //! [`crate::hevc::engine::encoder::recon::deblock_reconstruction`].
 //!
-//! SAO stays off (`sample_adaptive_offset_enabled_flag == 0` in the SPS). It
-//! is a per-CTB parameter search plus §7.3.8.3 syntax in the slice data, a
-//! decision independent of deblocking, and it is deliberately not made here.
+//! §8.7.3 SAO runs behind it, in the §8.7.1 order: the SPS carries
+//! `sample_adaptive_offset_enabled_flag == 1`, the writer searches an
+//! edge-offset class per CTB over the *deblocked* reconstruction
+//! ([`crate::hevc::engine::encoder::recon::sao_reconstruction`]) and codes the
+//! §7.3.8.3 `sao( )` structure it found at the head of each CTB's slice data.
+//!
+//! ## Why SAO is on, and when the writer turns it off again
+//!
+//! SAO is not free the way deblocking is: deblocking is signalled once in the
+//! PPS, while SAO costs a `sao( )` structure on *every* CTB, including every
+//! CTB it does nothing to. So the decision is taken twice, both against the
+//! same `D + lambda * R` the mode search uses. Per CTB, a class is signalled
+//! only when the squared error it removes clears the §9.3.3 bins it would be
+//! coded with. Per slice, the whole pass is kept only when the error it
+//! actually removed clears the bins the whole grid would be coded with —
+//! otherwise the reconstruction reverts to the deblocked one and
+//! `slice_sao_luma_flag` / `slice_sao_chroma_flag` go out as 0, which
+//! §7.3.8.3 reads as "code nothing", leaving the cost at the two header bits.
+//!
+//! Measured against the same writer with SAO off, same QP, same mode
+//! decisions, whole-picture PSNR and slice size: on smooth content at QP 12
+//! the pass is taken and buys +0.73 dB for +11.4% of the slice at 64x48 and
+//! +0.89 dB for +13.4% at 128x96; on the noise-carrying picture it is taken
+//! from QP 32 to 37 and buys +0.22 to +0.35 dB for +3.5% to +7.5%. At every
+//! other point of the QP 12 to 51 sweep the slice-level test declines it and
+//! the slice is the deblocked writer's to the byte, or within one byte of it.
+//! Two of the accepted points — the noise picture at QP 32 — sit 0.08 to
+//! 0.14 dB *below* what the same bits buy as a finer QP on the SAO-off
+//! rate-distortion curve, which is the fixed lambda being a heuristic rather
+//! than SAO being a loss; the clear wins are 0.38 to 0.43 dB above that same
+//! curve.
+//!
+//! ## Why the writer runs two passes
+//!
+//! §7.3.8.3 puts a CTB's SAO parameters at the head of that CTB's slice data,
+//! but §8.7.1 only lets them be searched once the whole picture is coded and
+//! deblocked. So the coding loop is split: a decision pass that searches every
+//! coding unit and builds the reconstruction, then the filters, then a
+//! bitstream pass that codes the recorded decisions with the `sao( )` syntax
+//! in front of each. Nothing a decision depends on changes in between —
+//! §8.4.4.2.2 intra prediction reads the unfiltered reconstruction, which the
+//! decision pass has already built — so the picture that is coded is exactly
+//! the picture that was searched.
 
 use crate::hevc::engine::binarization::{derive_intra_pred_mode_c, intra_luma_cand_mode_list};
 use crate::hevc::engine::cabac::init_type;
@@ -265,7 +305,12 @@ fn encode_idr_residual_au_at(
     let level_idc = level_idc_for(width * height);
     let units = vec![
         nal_unit(32, 0, 0, &write_vps(level_idc)), // VPS_NUT
-        nal_unit(33, 0, 0, &write_sps(width, height, level_idc, filter.sao(), true)), // SPS_NUT
+        nal_unit(
+            33,
+            0,
+            0,
+            &write_sps(width, height, level_idc, filter.sao(), true),
+        ), // SPS_NUT
         nal_unit(34, 0, 0, &write_pps(false, true, None)), // PPS_NUT
         nal_unit(20, 0, 0, &rbsp),                 // IDR_N_LP
     ];
@@ -432,7 +477,8 @@ fn write_idr_residual_slice(
             },
             lambda_q8(qp),
         );
-        let gain = picture_sse(&deblocked, y, cb, cr).saturating_sub(picture_sse(&recon, y, cb, cr));
+        let gain =
+            picture_sse(&deblocked, y, cb, cr).saturating_sub(picture_sse(&recon, y, cb, cr));
         if gain > sao_syntax_bins(&grid, ctbs_x) * lambda / 256 {
             sao = Some(grid);
         } else {
