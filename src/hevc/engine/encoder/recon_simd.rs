@@ -306,19 +306,27 @@ const BAND_SHIFT: i32 = 3;
 /// the widened subtraction — which is a minority of the work.
 ///
 /// Both shapes that leaves were written and measured on an Apple Silicon host,
-/// against this scalar reference over an L1-resident 64-sample run, best of
-/// three interleaved rounds:
+/// against this scalar reference over L1-resident runs of 16, 64, 256 and 1024
+/// samples, best of interleaved rounds, and measured a second time from a
+/// standalone harness to check the first:
 ///
 /// | NEON shape | ratio to scalar |
 /// |---|---|
-/// | classify into staging buffers, then scatter the buffers | 0.49-0.82x |
-/// | classify and scatter straight out of the vector lanes | 0.90-1.24x |
+/// | classify into staging buffers, then scatter the buffers | 0.42-1.30x |
+/// | classify and scatter straight out of the vector lanes | 0.44-1.24x |
 ///
-/// The staging round trip costs more than the classification it vectorizes.
-/// Extracting the lanes instead lands on parity, straddling 1.00x by less than
-/// the run-to-run spread — not a win, and the same answer the whole-picture
-/// `hevc_encode_640x352_reconstruct` group gave, where the NEON arm did not
-/// improve. Neither was worth landing, so this dispatches to scalar the way
+/// Neither shape separates from the scalar reference. Both straddle 1.00x by
+/// less than the spread between repeats of the same measurement on this
+/// contended host — the ranges above are run-to-run noise around parity, not a
+/// speedup at one run length and a slowdown at another, and repeating the
+/// 64-sample point alone moved each shape across most of its range. That is
+/// the same answer the whole-picture `hevc_encode_640x352_reconstruct` group
+/// gave, where the NEON arm did not improve.
+///
+/// The staging round trip in particular costs more than the classification it
+/// vectorizes, and extracting the lanes only replaces four stores with four
+/// lane reads in front of the same four dependent read-modify-writes. Neither
+/// was worth landing, so this dispatches to scalar the way
 /// [`crate::hevc::engine::simd::combine_weighted`] does on the instruction sets
 /// where its kernel measured below parity.
 ///
