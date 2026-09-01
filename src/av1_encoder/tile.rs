@@ -163,15 +163,15 @@ struct TxCandidate {
 /// transform blocks share one allocation each. The padded plane's zero border is written once per
 /// size and never again, so a block only overwrites its own `size * size` interior.
 #[derive(Default)]
-struct CoeffScratch {
+pub(crate) struct CoeffScratch {
     /// The size the buffers below are currently shaped for; `0` before the first block.
     size: usize,
     /// Clamped magnitudes in the zero-padded layout `crate::av1_simd::coeff` reads.
     plane: Vec<i32>,
     /// `coeff_base` context per raster position.
-    base: Vec<i32>,
+    pub(crate) base: Vec<i32>,
     /// `coeff_br` context per raster position.
-    br: Vec<i32>,
+    pub(crate) br: Vec<i32>,
 }
 
 impl CoeffScratch {
@@ -192,7 +192,7 @@ impl CoeffScratch {
     /// Fills [`Self::base`] and [`Self::br`] for every position of a block whose quantized
     /// coefficients are `quant`, through the vector kernel when the active instruction set has
     /// one and through `tile.rs`'s scalar reference otherwise.
-    fn derive(&mut self, quant: &[i32], size: usize) {
+    pub(crate) fn derive(&mut self, quant: &[i32], size: usize) {
         self.resize(size);
         let isa = coeff::active_isa();
         if coeff::has_vector_kernel(isa) {

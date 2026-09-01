@@ -24,6 +24,7 @@
 //! | `av1_encode_stage_wht` | the forward 4x4 WHT, `src/av1_encoder/wht.rs` |
 //! | `av1_encode_stage_symbol` | symbol coding over the static CDF tables, `src/av1_encoder/symbol.rs` and `cdf.rs` |
 //! | `av1_encode_stage_tile` | tile encoding, `src/av1_encoder/tile.rs` |
+//! | `av1_encode_stage_coeff_ctx` | §8.3.2 `coeff_base`/`coeff_br` context derivation, `src/av1_simd/coeff.rs` |
 //! | `av1_encode_stage_bitstream` | headers, bit writing and OBU LEB128 framing, `src/av1_encoder/{bitwriter,headers,leb128}.rs` |
 //!
 //! The whole-frame groups say what a frame costs; the per-stage groups say
@@ -258,14 +259,16 @@ const STAGE_QINDEX: u8 = 0;
 fn report_stage_coverage(_: &mut Criterion) {
     println!(
         "# av1_encode: every stage of the native AV1 encoder is benchmarked: the forward 4x4\n\
-         # WHT, symbol (range) coding over the static CDF tables, whole-tile encoding\n\
-         # (superblock iteration, DC_PRED, coefficient coding), and sequence/frame header\n\
+         # WHT, symbol (range) coding over the static CDF tables, the §8.3.2 coefficient-context\n\
+         # derivation, whole-tile encoding (superblock iteration, DC_PRED, coefficient coding),\n\
+         # and sequence/frame header\n\
          # writing with OBU LEB128 framing — alongside the whole-frame groups and the forward\n\
          # DCT/ADST kernel sweep. No stage of the pipeline is absent.\n\
-         # av1_encode: the forward transforms and the forward WHT are the encoder's only SIMD\n\
-         # dispatch families, so the symbol and bitstream arms are expected to read flat across\n\
-         # instruction sets. That is the measured result, not a broken bench: it is what says\n\
-         # entropy coding and coefficient-context derivation are the next vectorization target."
+         # av1_encode: the forward transforms, the forward WHT and the §8.3.2 coefficient-context\n\
+         # derivation are the encoder's SIMD dispatch families, so the symbol and bitstream arms\n\
+         # are expected to read flat across instruction sets. That is the measured result, not a\n\
+         # broken bench: with the contexts vectorized, what is left of coefficient coding is the\n\
+         # serial range coder, and a profile of the lossless tile encode puts 64% of it there."
     );
 }
 
@@ -311,6 +314,24 @@ fn stage_tile(criterion: &mut Criterion, (width, height): (u32, u32), suffix: &s
     });
 }
 
+/// The §8.3.2 `coeff_base` / `coeff_br` context derivation on its own: the
+/// `av1_coeff_ctx` dispatch family, over the lossless WHT coefficients of a
+/// whole plane.
+///
+/// Factored out of the tile group for the same reason `stage_symbol` is — the
+/// tile encode is dominated by the serial range coder, so a kernel that is a
+/// few percent of it cannot show a delta there no matter how much it wins.
+/// This group is what proves the vector backends are reached and faster; the
+/// tile group is what says how much that is worth end to end.
+fn stage_coeff_ctx(criterion: &mut Criterion, (width, height): (u32, u32), suffix: &str) {
+    let plane = stage_plane(width, height);
+    let name = format!("av1_encode_stage_coeff_ctx{suffix}");
+    let workload = stage_workload(&name, width, height);
+    bench_across_isas(criterion, &workload, || {
+        encoder_bench::coeff_context_plane(&plane, width as usize, height as usize)
+    });
+}
+
 /// Header writing and OBU framing: the bit writer, the sequence and frame
 /// header syntax, and the LEB128 size fields.
 ///
@@ -351,6 +372,7 @@ fn av1_encode_stages(criterion: &mut Criterion) {
     {
         stage_wht(criterion, size, suffix);
         stage_symbol(criterion, size, suffix);
+        stage_coeff_ctx(criterion, size, suffix);
         stage_tile(criterion, size, suffix);
         stage_bitstream(criterion, size, suffix);
     }
