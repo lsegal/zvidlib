@@ -104,7 +104,7 @@ use crate::hevc::engine::encoder::rdo::{
     shortlist_intra_luma_modes,
 };
 use crate::hevc::engine::encoder::recon::{
-    ReconstructedPicture, SourcePlanes, deblock_reconstruction, sao_reconstruction,
+    ReconstructedPicture, SAO_OFFSET_MAX, SourcePlanes, deblock_reconstruction, sao_reconstruction,
 };
 use crate::hevc::engine::encoder::residual::{
     EngineResidualBinSink, ResidualWriteParams, has_coded_levels, write_residual_coding,
@@ -603,9 +603,10 @@ fn write_idr_residual_slice(
     (w.finish(), recon, modes)
 }
 
-/// `cMax` of the Table 9-43 truncated-Rice `sao_offset_abs` binarization at
-/// 8-bit depth: `(1 << (Min(bitDepth, 10) − 5)) − 1`.
-const SAO_OFFSET_ABS_CMAX: u32 = 7;
+/// `cMax` of the Table 9-43 truncated-Rice `sao_offset_abs` binarization —
+/// the same §7.4.9.3 bound [`estimate_sao`] clamps its offsets to, so the
+/// writer can never be handed a magnitude the binarization cannot carry.
+const SAO_OFFSET_ABS_CMAX: u32 = SAO_OFFSET_MAX as u32;
 
 /// Which Table 9-48 context a context-coded §7.3.8.3 bin uses.
 #[derive(Clone, Copy)]

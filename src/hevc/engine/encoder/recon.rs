@@ -542,8 +542,10 @@ pub(crate) fn deblock_reconstruction(recon: &mut ReconstructedPicture, qp: i32) 
 }
 
 /// The largest magnitude a `sao_offset_abs` can carry at 8-bit depth
-/// (§7.4.9.3: `(1 << (Min(bitDepth, 10) − 5)) − 1`).
-const SAO_OFFSET_MAX: i32 = 7;
+/// (§7.4.9.3: `(1 << (Min(bitDepth, 10) − 5)) − 1`), which is also the `cMax`
+/// of its Table 9-43 truncated-Rice binarization — `pub(crate)` so the writer
+/// codes against the same bound the search clamps to.
+pub(crate) const SAO_OFFSET_MAX: i32 = 7;
 
 /// §8.7.3 — estimate SAO parameters for a finished, already-deblocked
 /// reconstruction, apply them in place, and return the per-CTB grid the
