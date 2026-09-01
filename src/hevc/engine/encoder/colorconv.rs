@@ -279,29 +279,25 @@ mod x86 {
     /// `((66R + 129G + 25B + 128) >> 8) + 16` over four pixels' worth of `i32` lanes.
     #[target_feature(enable = "ssse3", enable = "sse4.1")]
     unsafe fn luma_lanes(r: __m128i, g: __m128i, b: __m128i) -> __m128i {
-        unsafe {
-            let acc = _mm_mullo_epi32(r, _mm_set1_epi32(66));
-            let acc = _mm_add_epi32(acc, _mm_mullo_epi32(g, _mm_set1_epi32(129)));
-            let acc = _mm_add_epi32(acc, _mm_mullo_epi32(b, _mm_set1_epi32(25)));
-            let acc = _mm_add_epi32(acc, _mm_set1_epi32(128));
-            _mm_add_epi32(_mm_srai_epi32(acc, 8), _mm_set1_epi32(16))
-        }
+        let acc = _mm_mullo_epi32(r, _mm_set1_epi32(66));
+        let acc = _mm_add_epi32(acc, _mm_mullo_epi32(g, _mm_set1_epi32(129)));
+        let acc = _mm_add_epi32(acc, _mm_mullo_epi32(b, _mm_set1_epi32(25)));
+        let acc = _mm_add_epi32(acc, _mm_set1_epi32(128));
+        _mm_add_epi32(_mm_srai_epi32(acc, 8), _mm_set1_epi32(16))
     }
 
     /// `(-38R - 74G + 112B + 131584) >> 10` over four chroma samples' worth of 2x2 channel
     /// sums, and the same for Cr's `(112R - 94G - 18B + 131584) >> 10`.
     #[target_feature(enable = "ssse3", enable = "sse4.1")]
     unsafe fn chroma_lanes(r: __m128i, g: __m128i, b: __m128i) -> (__m128i, __m128i) {
-        unsafe {
-            let bias = _mm_set1_epi32(131_584);
-            let cb = _mm_add_epi32(bias, _mm_mullo_epi32(b, _mm_set1_epi32(112)));
-            let cb = _mm_sub_epi32(cb, _mm_mullo_epi32(r, _mm_set1_epi32(38)));
-            let cb = _mm_sub_epi32(cb, _mm_mullo_epi32(g, _mm_set1_epi32(74)));
-            let cr = _mm_add_epi32(bias, _mm_mullo_epi32(r, _mm_set1_epi32(112)));
-            let cr = _mm_sub_epi32(cr, _mm_mullo_epi32(g, _mm_set1_epi32(94)));
-            let cr = _mm_sub_epi32(cr, _mm_mullo_epi32(b, _mm_set1_epi32(18)));
-            (_mm_srai_epi32(cb, 10), _mm_srai_epi32(cr, 10))
-        }
+        let bias = _mm_set1_epi32(131_584);
+        let cb = _mm_add_epi32(bias, _mm_mullo_epi32(b, _mm_set1_epi32(112)));
+        let cb = _mm_sub_epi32(cb, _mm_mullo_epi32(r, _mm_set1_epi32(38)));
+        let cb = _mm_sub_epi32(cb, _mm_mullo_epi32(g, _mm_set1_epi32(74)));
+        let cr = _mm_add_epi32(bias, _mm_mullo_epi32(r, _mm_set1_epi32(112)));
+        let cr = _mm_sub_epi32(cr, _mm_mullo_epi32(g, _mm_set1_epi32(94)));
+        let cr = _mm_sub_epi32(cr, _mm_mullo_epi32(b, _mm_set1_epi32(18)));
+        (_mm_srai_epi32(cb, 10), _mm_srai_epi32(cr, 10))
     }
 
     /// Writes four `i32` lanes, each already inside `0..=255`, as four bytes at `out`.
