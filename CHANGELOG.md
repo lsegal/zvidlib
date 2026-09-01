@@ -4,6 +4,33 @@ All notable changes to zvidlib will be documented in this file.
 
 ## Unreleased
 
+- Fix the release-profile test binary aborting at launch on x86_64 macOS with
+  `dyld: Library not loaded: @rpath/libswiftCore.dylib`, so
+  `cargo test --release --features native --lib` runs on a `macos-15-intel`
+  host with no `DYLD_FALLBACK_LIBRARY_PATH` set by the caller - the workaround
+  #321 needed to re-measure the Coffee Lake column. The macOS hardware decode
+  path links `apple-cf`'s statically-built Swift bridge, which leaves
+  `@rpath/libswiftCore.dylib` and twelve sibling references in whatever links
+  it. `apple-cf`'s build script does emit `-Wl,-rpath,/usr/lib/swift` for them,
+  but `cargo:rustc-link-arg` applies only to the emitting package's own
+  binaries, tests, examples, benches and cdylibs and is not passed on to
+  dependents, so every `zvidlib` target linked with no `LC_RPATH` at all and
+  dyld killed the process before `main`. A `build.rs` re-emits the same rpaths
+  for this crate's targets, which is a link-time fix rather than an environment
+  variable someone has to remember.
+
+  The missing rpath was never arch-specific - an `aarch64` release test binary
+  carries no `LC_RPATH` either, and `otool -L` shows it referencing
+  `@rpath/libswiftCore.dylib` exactly as the x86_64 one does. Apple silicon's
+  dyld resolves the runtime out of the shared cache regardless, which is the
+  whole reason CI's `macos-latest` job stayed green while the Intel column
+  could only be measured by hand and by hand meant discovering this. The
+  shipped `cdylib` carried the same unresolved reference and is fixed by the
+  same change; `macos_swift_runtime_rpath` asserts the baked-in rpath on both
+  the test binary and `libzvidlib.dylib`, and `native-platforms` now runs
+  `macos-15-intel` alongside `macos-latest` so the arm is covered rather than
+  reached by accident.
+
 - Establish why the AV1 encoder's `TYPE_GAIN_SAMPLE_INTERVAL` keeps `TX_4X4` at `4` and `8` but loses it at `3`, `6` and `12` on the 96x80 test pattern, and stop that single frame being the only thing holding the smallest transform. The non-monotone column is not the sampling-rate result it reads as, and it is not the probe-coverage failure it was assumed to be either: 30 of that frame's 37 size searches can reach `TX_4X4` and every interval from `1` to `16` probes between 1 and 30 of them, so the per-size accumulator is populated even at the intervals that lose the size. What differs is *which* coding blocks are sampled, and that decides the outcome because a trial that probed is corrected by its own measurement at full strength while every other trial's correction is shrunk to `TYPE_GAIN_TRUST` sixteenths - eight times weaker than the sixteen-fold extrapolation `TX_4X4` needs. The size is therefore selectable only at a coding block whose own size search probed, and this frame has exactly two of them, at MI `(0, 12)` and `(16, 12)`: `1` and `2` sample both, `4` and `8` sample the first, and `3`, `5`, `6`, `7` and everything from `9` up sample neither. The column is a phase against two search indices, and nothing about a stride sharing a factor with a trials-per-coding-block count. `measure_type_gain_phase_aliasing` is that measurement, printing per interval how many searches could reach each size, how many were probed, and every position that chose `TX_4X4` together with whether its search probed - `true` in every row of every interval and quantizer, which is the mechanism stated as data.
 
   The sampler is left alone, because the guarantee that would remove the dependence is worth less than it costs. Probing every size search that can reach the smallest transform - the cheapest rule that makes coverage a property of the sampler rather than of the interval's phase, kept as `with_forced_smallest_size_probes` so the rejection stays reproducible - does restore `TX_4X4` at every interval from `1` to `16`, at 28-70% more transform-type candidate evaluations, about 10% more encode time, and *worse* rate-distortion: +12.4% on `smooth` at 640x352 and `base_q_idx` 8, +10.0% at 192x160, +5.0% on `bands`, +1.7% on `scene_edge`, because the un-shrunk own-probe correction overshoots towards the smaller size - the same effect `measure_type_gain_sampling_intervals` already records as the sampled estimator costing less than the unsampled one. What changes instead is what the property rests on: `the_smallest_transform_is_selected_at_every_sampling_interval` asserts the smallest transform is selected at *every* interval from `2` to `16` across nine frame-and-size pairs from 96x80 to 640x352 - a smooth gradient, horizontal bands and four flat quadrants - so a change to superblock traversal, to the partition search, or to which trials are enumerated can move which strides alias on one frame without silently taking the size away. Both #278 bounds and the shipped constant are unchanged and no encode moves: the sampler is untouched outside tests, so the emitted bitstream is byte-identical and `a_fixed_frame_encodes_to_the_same_bytes_on_every_host` passes on its committed digests without regeneration.

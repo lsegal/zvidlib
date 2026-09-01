@@ -25,7 +25,11 @@ fn baked_rpaths(path: &std::path::Path) -> Vec<String> {
         .arg(path)
         .output()
         .expect("otool is part of the Xcode command line tools this crate already builds with");
-    assert!(output.status.success(), "otool -l {} failed", path.display());
+    assert!(
+        output.status.success(),
+        "otool -l {} failed",
+        path.display()
+    );
     let listing = String::from_utf8_lossy(&output.stdout);
 
     let mut rpaths = Vec::new();
