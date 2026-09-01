@@ -47,10 +47,19 @@
 //! [`crate::hevc::engine::encoder::recon::deblock_reconstruction`].
 //!
 //! §8.7.3 SAO runs behind it, in the §8.7.1 order: the SPS carries
-//! `sample_adaptive_offset_enabled_flag == 1`, the writer searches an
-//! edge-offset class per CTB over the *deblocked* reconstruction
+//! `sample_adaptive_offset_enabled_flag == 1`, the writer searches both
+//! §8.7.3.2 types per CTB over the *deblocked* reconstruction
 //! ([`crate::hevc::engine::encoder::recon::sao_reconstruction`]) and codes the
 //! §7.3.8.3 `sao( )` structure it found at the head of each CTB's slice data.
+//! Both types, because they reach different error: the four edge-offset
+//! classes shape the error around a local edge, while band offset shapes it
+//! over a *value range*, which is what a CTB whose reconstruction is uniformly
+//! biased across some part of the sample range needs and no edge class can
+//! deliver. They are searched together and scored against each other under one
+//! `D + lambda * R` comparison, so the type is chosen by what it buys net of
+//! what it costs — band offset pays four `sao_offset_sign` bins and five
+//! `sao_band_position` bins where edge offset pays two class bins and infers
+//! its signs.
 //!
 //! ## Why SAO is on, and when the writer turns it off again
 //!
@@ -95,6 +104,28 @@
 //! not hold: it declined 30 of these points and accepted two others that sat
 //! 0.08 and 0.14 dB below that curve.
 //!
+//! Band offset is what the finest end of the noise picture's sweep is. With
+//! only the edge classes searched the slice-level test declines the pass on
+//! that picture at QP 12 at 64x48 outright; searching both types it is taken
+//! and buys +0.100 dB for +0.5% of slice. At 128x96 it improves five points
+//! the edge-only search already took, each for one to eight bytes more:
+//! +0.106 to +0.120 dB at QP 12, +0.184 to +0.190 at QP 13, +0.156 to +0.167
+//! at QP 14, +0.110 to +0.118 at QP 17, and +0.100 to +0.127 at QP 19. Every
+//! other point of the sweep is byte-identical to the edge-only search, no
+//! point regresses, and every accepted point still sits on or above the
+//! SAO-off writer's own curve. It is never selected on the smooth picture at
+//! any QP — that content's error is edge-shaped, which is what §8.7.3.2 is
+//! for — nor at any QP coarse enough that the four signs and five position
+//! bins outweigh what a value-range bias is worth.
+//!
+//! Those band-only bins are charged at 2.5x `lambda_q8`, the coarse end of
+//! the departure the calibration measured, because they are rate the closed
+//! form has never been checked against. At the closed form itself the search
+//! takes band offset at one coarse CTB whose slice then sits 0.003 dB *under*
+//! the curve above; at `SAO_LAMBDA_BAND`, the trust bound rather than the
+//! measured end, band offset stops being selected anywhere and all of the
+//! gains above are given back.
+//!
 //! ## Why the writer runs two passes
 //!
 //! §7.3.8.3 puts a CTB's SAO parameters at the head of that CTB's slice data,
@@ -126,7 +157,8 @@ use crate::hevc::engine::encoder::rdo::{
     shortlist_intra_luma_modes,
 };
 use crate::hevc::engine::encoder::recon::{
-    ReconstructedPicture, SAO_OFFSET_MAX, SourcePlanes, deblock_reconstruction, sao_reconstruction,
+    ReconstructedPicture, SAO_LAMBDA_BAND, SAO_OFFSET_MAX, SourcePlanes, deblock_reconstruction,
+    sao_reconstruction,
 };
 use crate::hevc::engine::encoder::residual::{
     EngineResidualBinSink, ResidualWriteParams, has_coded_levels, write_residual_coding,
@@ -878,14 +910,6 @@ fn curve_point(src: SourcePlanes<'_>, qp: i32, search: ModeSearch, deblocking: b
         bits: code_slice_data(&records, None, qp, src.width / CTB).len() as u64 * 8,
     }
 }
-
-/// The widest the calibrated multiplier is allowed to depart from
-/// [`lambda_q8`], as a factor either way. It bounds how far a two-point
-/// measurement of one picture is trusted over the closed form — and, because
-/// it is a bound known before the measurement is taken, it is also what lets
-/// [`keeps_sao`] skip the measurement whenever the decision is already
-/// outside the band.
-const SAO_LAMBDA_BAND: u64 = 4;
 
 /// The slice-level half of the SAO decision: whether a grid that removed
 /// `gain` of squared error is worth the `sao_bits` it would be coded with.
@@ -1921,6 +1945,102 @@ mod tests {
             (slice.len(), psnr)
         };
         (encode(LoopFilter::Deblock), encode(LoopFilter::DeblockSao))
+    }
+
+    /// The §7.3.8.3 grid the writer would code for one picture at one QP —
+    /// the same [`sao_reconstruction`] call the coding loop makes, on the same
+    /// deblocked reconstruction and with the same lambda, so what it returns
+    /// is what the slice carries.
+    fn sao_grid(
+        y: &[u8],
+        cb: &[u8],
+        cr: &[u8],
+        width: usize,
+        height: usize,
+        qp: i32,
+    ) -> Vec<ResolvedSao> {
+        let (_, mut deblocked, _) = write_idr_residual_slice(
+            y,
+            cb,
+            cr,
+            width,
+            height,
+            qp,
+            ModeSearch::Rdo,
+            LoopFilter::Deblock,
+        );
+        sao_reconstruction(
+            &mut deblocked,
+            SourcePlanes {
+                y,
+                cb,
+                cr,
+                width,
+                height,
+            },
+            lambda_q8(qp),
+        )
+    }
+
+    #[test]
+    fn the_search_picks_band_offset_where_it_beats_every_edge_class() {
+        // The band path of §7.3.8.3 — four `sao_offset_sign` bins and a
+        // five-bin `sao_band_position` — is only ever written when the search
+        // picks `SaoTypeIdx == 1`, so pin a picture and a QP where it does.
+        // The noise-carrying picture at a fine QP is the case: its error is
+        // spread over a value range rather than shaped around a local edge,
+        // which is exactly what edge offset cannot reach.
+        let (width, height) = (64, 48);
+        let (y, cb, cr) = picture(width, height);
+        let grid = sao_grid(&y, &cb, &cr, width, height, 12);
+        let band = grid
+            .iter()
+            .flat_map(|cell| cell.components.iter())
+            .filter(|c| c.sao_type_idx == 1)
+            .count();
+        assert!(
+            band > 0,
+            "the search never chose band offset, so the writer's band path is still dead code"
+        );
+
+        // And it is the writer's own decision, not just the search's: the
+        // slice-level test kept the pass, so those `sao( )` structures reached
+        // the bitstream and a decoder resolved them back into the same
+        // picture.
+        let ((off_bytes, off_psnr), (on_bytes, on_psnr)) =
+            sao_on_off(&y, &cb, &cr, width, height, 12);
+        assert!(
+            on_bytes > off_bytes && on_psnr > off_psnr,
+            "the slice-level test declined the pass band offset was chosen in: \
+             {off_bytes} -> {on_bytes} bytes, {off_psnr:.3} -> {on_psnr:.3} dB"
+        );
+        let (au, recon) = encode_idr_residual_au(&y, &cb, &cr, width, height, 12).unwrap();
+        let (dy, dcb, dcr) = decode(&au, width, height);
+        assert_eq!(dy, recon.y, "luma diverged over a band-offset slice");
+        assert_eq!(dcb, recon.cb, "Cb diverged over a band-offset slice");
+        assert_eq!(dcr, recon.cr, "Cr diverged over a band-offset slice");
+    }
+
+    #[test]
+    fn band_offset_earns_its_rate_where_the_search_takes_it() {
+        // The measurement the changelog records: band offset is worth more
+        // than the four signs and five position bins it costs beyond edge
+        // offset. Both numbers come from the same coding loop at the same QP,
+        // so the only difference is which types the search was allowed to
+        // consider — here, that the noise picture at QP 12 gains 0.10 dB of
+        // whole-picture PSNR for half a percent of slice.
+        let (width, height) = (64, 48);
+        let (y, cb, cr) = picture(width, height);
+        let (_, (on_bytes, on_psnr)) = sao_on_off(&y, &cb, &cr, width, height, 12);
+        assert!(
+            on_psnr > 51.10,
+            "the noise picture at QP 12 reconstructed at {on_psnr:.3} dB, below what band offset \
+             was measured to buy"
+        );
+        assert!(
+            on_bytes < 1960,
+            "the band-offset slice cost {on_bytes} bytes, above what it was measured to cost"
+        );
     }
 
     /// Where every SAO point the writer accepts sits relative to the SAO-off
