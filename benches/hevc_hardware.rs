@@ -42,20 +42,40 @@
 //! # Frame readback
 //!
 //! The issue this module closes asks for the surface-copy cost as its own arm
-//! "where the backend exposes one". None of the three do today: `VideoDecoder`
-//! hands back a host-side [`zvidlib::VideoFrame`], the decoder configuration
-//! only accepts `PixelFormat::Rgba8` (`src/hevc/mod.rs`), and each backend maps
-//! its own surface and converts to RGBA inside `submit`. There is no public
-//! seam between "the fixed-function block finished" and "the pixels are in a
-//! `Vec<u8>`", so a separate readback number would have to be a reimplemented
-//! stand-in rather than a measurement of the code that runs. The group reports
-//! that the two are inseparable instead of reporting a proxy.
+//! "where the backend exposes one". No backend exposed one, because the whole
+//! readback happens inside `submit`: `VideoDecoder` hands back a host-side
+//! [`zvidlib::VideoFrame`], the decoder configuration only accepts
+//! `PixelFormat::Rgba8` (`src/hevc/mod.rs`), and each backend maps its own
+//! surface and converts to RGBA before returning. Issue #283 settled what to do
+//! about that: not a public zero-copy output path — three platform handle types
+//! and an NV12 output family the crate cannot keep stable across drivers it
+//! does not own — but a measurement seam, `zvidlib::hevc_hardware_readback`,
+//! which times the copy that actually runs rather than a reimplemented
+//! stand-in.
+//!
+//! [`readback`] is that group. It reports the two halves separately, because
+//! they answer different questions and scale differently by host:
+//! `surface_copy` is the map plus the device-to-host transfer (a PCIe copy on a
+//! discrete GPU, closer to a lock on unified memory), and `color_convert` is
+//! the NV12-to-RGBA pass over the host bytes. Both are charged per frame by the
+//! backend itself, so the group measures attribution rather than wall clock:
+//! one criterion iteration decodes the same [`COMPARISON_FRAMES`] window
+//! [`steady_state`] does and reports only the nanoseconds that window spent in
+//! the phase under test. Its wall time is therefore longer than the number it
+//! prints, by exactly the decode it had to run to produce it.
+//!
+//! There is no readback arm for the software comparison arm. The seam covers
+//! the fixed-function backends; the software decoder's own conversion cost is
+//! already attributed by `zvidlib::hevc_decode_profile`'s `color_convert`
+//! stage and measured directly by `hevc_color_convert` in
+//! `benches/hevc_decode.rs`.
 
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use criterion::measurement::WallTime;
 use criterion::{BenchmarkGroup, Criterion, criterion_group, criterion_main};
+use zvidlib::hevc_hardware_readback as readback;
 use zvidlib::{
     CancellationToken, CodecSupport, EncodedVideoSample, HardwarePreference, Limits,
     VideoDecoderConfig, VideoDecoderFactory, native_hevc_video_decoder_factory,
@@ -203,6 +223,96 @@ fn bench_arm(
     rate
 }
 
+/// Decodes the same window [`timed_decode`] does, returning what the backend
+/// charged to readback over it and the wall time that window took.
+///
+/// The accumulators are reset *after* the first frame is delivered, for the
+/// same reason [`steady_state`] starts its clock there: the first frame's
+/// readback is paid on a cold session, alongside the driver allocations the
+/// setup arm already reports. What is left covers exactly `frames` frames, so
+/// the report divides by a known count.
+fn readback_decode(
+    factory: &dyn VideoDecoderFactory,
+    configuration: &VideoDecoderConfig,
+    samples: &[EncodedVideoSample],
+    frames: u64,
+) -> (readback::Report, Duration) {
+    let cancellation = CancellationToken::new();
+    let mut decoder = factory
+        .create(configuration, &Limits::default())
+        .expect("the decoder is constructible after its capability was checked");
+    let mut delivered = 0_u64;
+    let mut started = Instant::now();
+    for sample in samples {
+        for decoded in decoder
+            .submit(sample, &cancellation)
+            .expect("the bundled sample decodes")
+        {
+            black_box(&decoded.frame);
+            if delivered == 0 {
+                readback::reset();
+                started = Instant::now();
+            }
+            delivered += 1;
+            if delivered > frames {
+                return (readback::report(), started.elapsed());
+            }
+        }
+    }
+    panic!("the bundled sample yields at least {frames} frames past the first");
+}
+
+/// Registers the readback group: the surface copy and the colour conversion
+/// the hardware arm pays inside its decode number.
+fn bench_readback(criterion: &mut Criterion, configuration: &VideoDecoderConfig, frames: u64) {
+    let factory = native_hevc_video_decoder_factory();
+    let sample = support::bundled_hevc_sample();
+    let samples = &sample.samples;
+    let work = FrameWork::new(frames, sample.width, sample.height);
+
+    let (report, steady) = readback_decode(&factory, configuration, samples, frames);
+    assert_eq!(
+        report.frames, frames,
+        "the readback seam attributed a different frame count than the window decoded"
+    );
+    // The share is what the issue asks for: how much of a hardware decode is
+    // the host round trip rather than the fixed-function block.
+    println!(
+        "# hardware readback over {frames} frame(s): surface copy {:.2} ms/frame, colour convert \
+         {:.2} ms/frame, {:.2} ms/frame total = {:.1}% of the {:.2} ms/frame decode",
+        report.surface_copy.as_secs_f64() * 1e3 / frames as f64,
+        report.color_convert.as_secs_f64() * 1e3 / frames as f64,
+        report.total_per_frame().as_secs_f64() * 1e3,
+        100.0 * report.total().as_secs_f64() / steady.as_secs_f64().max(f64::MIN_POSITIVE),
+        steady.as_secs_f64() * 1e3 / frames as f64,
+    );
+
+    let mut group = criterion.benchmark_group("hevc_hardware_readback");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(500));
+    group.measurement_time(Duration::from_secs(5));
+    group.throughput(work.elements());
+    for (phase, select) in [
+        (
+            readback::Phase::SurfaceCopy,
+            (|report| report.surface_copy) as fn(readback::Report) -> Duration,
+        ),
+        (
+            readback::Phase::ColorConvert,
+            (|report| report.color_convert) as fn(readback::Report) -> Duration,
+        ),
+    ] {
+        group.bench_function(format!("hardware/{}", phase.name()), |bencher| {
+            bencher.iter_custom(|iterations| {
+                (0..iterations)
+                    .map(|_| select(readback_decode(&factory, configuration, samples, frames).0))
+                    .sum()
+            });
+        });
+    }
+    group.finish();
+}
+
 /// Hardware HEVC decode against the software decoder on the bundled 1080p
 /// sample.
 ///
@@ -234,8 +344,9 @@ fn hevc_hardware(criterion: &mut Criterion) {
         compiled_backends()
     );
     println!(
-        "# frame readback is not a separate arm: every backend maps its own surface and converts \
-         to RGBA inside `submit`, so the copy is inside the decode number by construction"
+        "# frame readback is a separate group: the backend charges each frame's surface copy and \
+         RGBA conversion to `zvidlib::hevc_hardware_readback`, so both are reported out of the \
+         decode number they are part of"
     );
 
     let mut group = criterion.benchmark_group("hevc_hardware");
@@ -244,6 +355,8 @@ fn hevc_hardware(criterion: &mut Criterion) {
     group.measurement_time(Duration::from_secs(5));
     let hardware_rate = bench_arm(&mut group, "hardware", &hardware, COMPARISON_FRAMES);
     group.finish();
+
+    bench_readback(criterion, &hardware, COMPARISON_FRAMES);
 
     if std::env::var_os(LARGE_GROUP_ENV).is_none() {
         println!(

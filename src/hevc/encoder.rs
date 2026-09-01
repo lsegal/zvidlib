@@ -2,8 +2,9 @@
 use super::engine::encoder::rdo::DistortionBackend;
 use super::engine::{
     encoder::{
-        lossy::encode_idr_residual_au,
+        lossy::{encode_idr_residual_au, encode_idr_residual_au_rate_constrained},
         pcm::encode_idr_pcm_au,
+        ratecontrol::RateController,
         rdo::{DecisionConfig, decide_picture},
         recon::{ReconConfig, ReconstructedPicture, SourcePlanes, reconstruct_picture},
     },
@@ -72,14 +73,18 @@ impl VideoEncoderFactory for HevcEncoderFactory {
         }
         let operating_point = parse_operating_point(&c.configuration)
             .ok_or_else(|| invalid_input(OPERATING_POINT_HELP))?;
+        // A target bitrate leaves the QP to rate control, which needs the
+        // frame rate the configuration declares and the picture it is
+        // spreading the budget over.
+        let mode = EncoderMode::new(operating_point, c.timescale, c.frame_duration, pixels);
         let (y, cb, cr) = blank_planes(d.width as usize, d.height as usize);
         // The declared `hvcC` has to carry the parameter sets the samples
         // actually reference, so probe with the writer this encoder will use
         // rather than always the PCM one. The two writers agree on every
         // parameter set at this fixed geometry today, but that is their
         // coincidence to keep, not something the factory should assume.
-        let au = encode_operating_point(
-            operating_point,
+        let au = encode_picture(
+            mode.writer(),
             &y,
             &cb,
             &cr,
@@ -89,7 +94,7 @@ impl VideoEncoderFactory for HevcEncoderFactory {
         .0;
         Ok(Box::new(HevcEncoder {
             configuration: c.clone(),
-            operating_point,
+            mode,
             config: EncoderConfig {
                 codec: Codec::Hevc,
                 timescale: c.timescale,
@@ -103,9 +108,10 @@ impl VideoEncoderFactory for HevcEncoderFactory {
 }
 struct HevcEncoder {
     configuration: VideoEncoderConfig,
-    /// Which access-unit writer every sample goes through, decided once at
-    /// creation from [`VideoEncoderConfig::configuration`].
-    operating_point: OperatingPoint,
+    /// Which writer every sample goes through and, at the target-bitrate
+    /// operating point, the rate control that keeps choosing its QP. Decided
+    /// once at creation from [`VideoEncoderConfig::configuration`].
+    mode: EncoderMode,
     config: EncoderConfig,
     next_index: u64,
     limits: Limits,
@@ -156,8 +162,8 @@ impl VideoEncoder for HevcEncoder {
             }
             let (y, cb, cr) = rgba_to_yuv420(frame, source.orientation)?;
             let d = self.configuration.coded_dimensions;
-            let (au, reconstruction) = encode_operating_point(
-                self.operating_point,
+            let (au, reconstruction) = encode_picture(
+                self.mode.writer(),
                 &y,
                 &cb,
                 &cr,
@@ -165,6 +171,11 @@ impl VideoEncoder for HevcEncoder {
                 d.height as usize,
             )?;
             let data = length_prefixed_vcl(&au)?;
+            // Close the loop on what the picture actually cost the stream,
+            // which is the sample the muxer writes rather than the whole
+            // access unit: the parameter sets ahead of it are declared once in
+            // the `hvcC` and are not what a bitrate is spent on.
+            self.mode.observe(data.len() as u64 * 8);
             if data.len() as u64 > self.limits.max_allocation_bytes {
                 return Err(limit(
                     "HEVC access unit exceeds configured allocation limit",
@@ -269,6 +280,69 @@ enum OperatingPoint {
         /// `SliceQpY`, in 0..=51.
         qp: i32,
     },
+    /// Every coding unit carries §7.3.8.11 quantized residual, at a
+    /// `SliceQpY` [`RateController`] picks per picture so the stream tracks
+    /// this bitrate, and with the mode decision that charges each candidate
+    /// for the residual bits it would cost.
+    TargetBitrate {
+        /// The target, in bits a second. Nonzero.
+        bits_per_second: u32,
+    },
+}
+
+/// An [`OperatingPoint`] with whatever state it carries between pictures —
+/// the resolved form the encoder holds, so that "has a bitrate target" and
+/// "has a rate controller" cannot disagree.
+#[derive(Clone, Copy, Debug)]
+enum EncoderMode {
+    /// [`OperatingPoint::LosslessPcm`], which carries nothing.
+    Pcm,
+    /// [`OperatingPoint::Lossy`], whose QP is the caller's for every picture.
+    FixedQp(i32),
+    /// [`OperatingPoint::TargetBitrate`], whose QP is the loop's.
+    RateControlled(RateController),
+}
+
+impl EncoderMode {
+    fn new(point: OperatingPoint, timescale: u32, frame_duration: u32, pixels: u64) -> Self {
+        match point {
+            OperatingPoint::LosslessPcm => Self::Pcm,
+            OperatingPoint::Lossy { qp } => Self::FixedQp(qp),
+            OperatingPoint::TargetBitrate { bits_per_second } => Self::RateControlled(
+                RateController::new(bits_per_second, timescale, frame_duration, pixels),
+            ),
+        }
+    }
+
+    /// The writer the next picture goes through.
+    fn writer(&self) -> PictureWriter {
+        match self {
+            Self::Pcm => PictureWriter::Pcm,
+            Self::FixedQp(qp) => PictureWriter::FixedQp(*qp),
+            Self::RateControlled(rate_control) => PictureWriter::RateConstrained(rate_control.qp()),
+        }
+    }
+
+    /// Fold what a picture cost back into the QP the next one uses, where
+    /// there is a loop to close.
+    fn observe(&mut self, coded_bits: u64) {
+        if let Self::RateControlled(rate_control) = self {
+            rate_control.observe(coded_bits);
+        }
+    }
+}
+
+/// The writer one picture goes through, once rate control has resolved the QP
+/// its operating point leaves open.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PictureWriter {
+    /// [`OperatingPoint::LosslessPcm`].
+    Pcm,
+    /// [`OperatingPoint::Lossy`] — the closest picture at a named QP.
+    FixedQp(i32),
+    /// [`OperatingPoint::TargetBitrate`] at the QP rate control chose, with
+    /// the residual's own rate in the mode decision's cost.
+    RateConstrained(i32),
 }
 
 /// The `SliceQpY` range this encoder accepts, at 8-bit depth
@@ -276,7 +350,8 @@ enum OperatingPoint {
 const QP_RANGE: core::ops::RangeInclusive<u8> = 0..=51;
 
 const OPERATING_POINT_HELP: &str = "the native HEVC encoder's configuration is either empty \
-     (lossless PCM) or a single SliceQpY byte in 0..=51 selecting lossy residual coding";
+     (lossless PCM), a single SliceQpY byte in 0..=51 selecting lossy residual coding at that \
+     fixed quantizer, or four big-endian bytes giving a nonzero target bitrate in bits a second";
 
 /// The backend-private configuration this encoder accepts, following the
 /// precedent [`crate::native_av1_video_encoder_factory`] set with `base_q_idx`.
@@ -292,37 +367,61 @@ const OPERATING_POINT_HELP: &str = "the native HEVC encoder's configuration is e
 /// Anything else is rejected, so the whole surface is `configuration.is_empty()`
 /// or not.
 ///
+/// A four-byte configuration is a big-endian target bitrate in bits a second,
+/// so `1_000_000_u32.to_be_bytes()` asks for a megabit a second and the
+/// encoder picks `SliceQpY` per picture to hit it. Zero is rejected rather
+/// than treated as "no target", because a caller that reaches for the bitrate
+/// form is asking for a rate and there is no rate that means "whatever you
+/// like". The two lossy forms differ in more than who picks the QP: the
+/// fixed-QP form optimizes each intra decision for the closest picture,
+/// because a caller naming a QP is asking for a picture, while the bitrate
+/// form charges every candidate for the residual bits it would code, because
+/// with a rate to hit the bits a decision saves are bits the next picture's QP
+/// can spend where they buy more.
+///
+/// The lengths discriminate, so the whole surface is the configuration's
+/// length and anything else is rejected.
+///
 /// Lossy streams decode through [`crate::native_hevc_video_decoder_factory`],
 /// the crate's own decoder, with distortion that tracks the requested QP. The
 /// writer searches the §8.4.2 intra modes per coding unit and runs the §8.7.2
-/// in-loop deblocking filter; §8.7.3 SAO is still off in the SPS, and there is
-/// no rate control, so quality at a given QP is not yet what a
-/// rate-distortion-optimal encoder would reach.
+/// in-loop deblocking filter and the §8.7.3 SAO pass wherever SAO earns the
+/// syntax it costs; the bitrate form additionally picks its QP against what the
+/// previous picture cost.
 fn parse_operating_point(configuration: &[u8]) -> Option<OperatingPoint> {
     match configuration {
         [] => Some(OperatingPoint::LosslessPcm),
         [qp] if QP_RANGE.contains(qp) => Some(OperatingPoint::Lossy { qp: i32::from(*qp) }),
+        [a, b, c, d] => match u32::from_be_bytes([*a, *b, *c, *d]) {
+            0 => None,
+            bits_per_second => Some(OperatingPoint::TargetBitrate { bits_per_second }),
+        },
         _ => None,
     }
 }
 
-/// Encode one access unit through the writer `point` selects, with the
-/// reconstruction that writer produced when it produces one.
-fn encode_operating_point(
-    point: OperatingPoint,
+/// Encode one access unit through `writer`, with the reconstruction that
+/// writer produced when it produces one.
+fn encode_picture(
+    writer: PictureWriter,
     y: &[u8],
     cb: &[u8],
     cr: &[u8],
     width: usize,
     height: usize,
 ) -> Result<(Vec<u8>, Option<ReconstructedPicture>)> {
-    match point {
-        OperatingPoint::LosslessPcm => encode_idr_pcm_au(y, cb, cr, width, height)
+    match writer {
+        PictureWriter::Pcm => encode_idr_pcm_au(y, cb, cr, width, height)
             .map(|au| (au, None))
             .map_err(|e| invalid_input(e.to_string())),
-        OperatingPoint::Lossy { qp } => encode_idr_residual_au(y, cb, cr, width, height, qp)
+        PictureWriter::FixedQp(qp) => encode_idr_residual_au(y, cb, cr, width, height, qp)
             .map(|(au, reconstruction)| (au, Some(reconstruction)))
             .map_err(|e| invalid_input(e.to_string())),
+        PictureWriter::RateConstrained(qp) => {
+            encode_idr_residual_au_rate_constrained(y, cb, cr, width, height, qp)
+                .map(|(au, reconstruction)| (au, Some(reconstruction)))
+                .map_err(|e| invalid_input(e.to_string()))
+        }
     }
 }
 
@@ -687,6 +786,20 @@ mod tests {
             "SliceQpY tops out at 51"
         );
         assert_eq!(parse_operating_point(&[26, 0]), None);
+        assert_eq!(
+            parse_operating_point(&1_000_000_u32.to_be_bytes()),
+            Some(OperatingPoint::TargetBitrate {
+                bits_per_second: 1_000_000
+            }),
+            "four bytes are a big-endian target bitrate"
+        );
+        assert_eq!(
+            parse_operating_point(&0_u32.to_be_bytes()),
+            None,
+            "there is no bitrate that means no target"
+        );
+        assert_eq!(parse_operating_point(&[0, 0, 1]), None);
+        assert_eq!(parse_operating_point(&[0, 0, 0, 1, 0]), None);
     }
 
     #[test]
@@ -694,7 +807,13 @@ mod tests {
         let limits = Limits::default();
         let dimensions = crate::VideoDimensions::new(16, 16, &limits).unwrap();
         let factory = native_hevc_video_encoder_factory();
-        for configuration in [Vec::new(), vec![0], vec![26], vec![51]] {
+        for configuration in [
+            Vec::new(),
+            vec![0],
+            vec![26],
+            vec![51],
+            1_000_000_u32.to_be_bytes().to_vec(),
+        ] {
             assert!(
                 factory
                     .capability(&encoder_config(dimensions, configuration.clone()))
@@ -702,7 +821,13 @@ mod tests {
                 "{configuration:?} should select an operating point"
             );
         }
-        for configuration in [vec![52], vec![255], vec![26, 26]] {
+        for configuration in [
+            vec![52],
+            vec![255],
+            vec![26, 26],
+            0_u32.to_be_bytes().to_vec(),
+            vec![0, 0, 0, 1, 0],
+        ] {
             assert!(
                 matches!(
                     factory.capability(&encoder_config(dimensions, configuration.clone())),
@@ -872,6 +997,167 @@ mod tests {
                  the fixed-QP curve's {interpolated:.3} dB at the same rate"
             );
         }
+    }
+
+    /// Encodes `count` copies of one frame through the public factory at
+    /// `configuration`, returning each coded sample's size in bytes.
+    fn coded_sizes(
+        frame: &VideoFrame,
+        dimensions: crate::VideoDimensions,
+        limits: Limits,
+        configuration: Vec<u8>,
+        count: u64,
+    ) -> Vec<usize> {
+        let mut encoder = native_hevc_video_encoder_factory()
+            .create(&encoder_config(dimensions, configuration), &limits)
+            .unwrap();
+        (0..count)
+            .map(|index| {
+                let samples = block_on(encoder.encode(
+                    FrameIndex(index),
+                    FrameSource::Cpu(crate::CpuFrameSource {
+                        frame,
+                        orientation: crate::Orientation::TopLeft,
+                    }),
+                ))
+                .unwrap();
+                assert_eq!(samples.len(), 1);
+                samples[0].data.len()
+            })
+            .collect()
+    }
+
+    /// The bits a picture is allowed at `bits_per_second`, for the timescale
+    /// and frame duration [`encoder_config`] declares.
+    fn picture_budget_bits(bits_per_second: u64) -> u64 {
+        bits_per_second * 1_001 / 30_000
+    }
+
+    /// The acceptance criterion for the target-bitrate operating point: a
+    /// caller asks the public factory for a rate and the stream tracks it.
+    ///
+    /// The target is not guessed — it is one picture's actual cost at QP 26,
+    /// turned into a bitrate — so the assertion is about the loop converging
+    /// rather than about this writer's absolute efficiency. The tolerance is
+    /// 25 percent of the per-picture budget: `SliceQpY` is an integer and one
+    /// step of it is worth about 12 percent of the rate, so no feedback loop
+    /// that picks a QP per picture can promise tighter than a couple of steps
+    /// on a source it cannot split.
+    #[test]
+    fn a_bitrate_configuration_codes_a_stream_whose_size_tracks_the_target() {
+        let (frame, dimensions, limits) = test_frame(64);
+        let at_qp_26 = coded_sizes(&frame, dimensions, limits, vec![26], 1)[0];
+        let bits_per_second = (at_qp_26 as u64 * 8) * 30_000 / 1_001;
+        let budget = picture_budget_bits(bits_per_second);
+
+        let sizes = coded_sizes(
+            &frame,
+            dimensions,
+            limits,
+            (bits_per_second as u32).to_be_bytes().to_vec(),
+            12,
+        );
+        // The opening picture is coded before the loop has an observation, so
+        // the rate it tracks is the steady state after it.
+        let settled = &sizes[6..];
+        let mean_bits = settled.iter().map(|&b| b as u64 * 8).sum::<u64>() / settled.len() as u64;
+        let ratio = mean_bits as f64 / budget as f64;
+        assert!(
+            (0.75..=1.25).contains(&ratio),
+            "the stream settled at {mean_bits} bits a picture against a {budget}-bit budget \
+             ({ratio:.3}x), from {sizes:?}"
+        );
+
+        // A target the loop can also reach from the other side: half the rate
+        // must code visibly smaller, not merely differently.
+        let half = coded_sizes(
+            &frame,
+            dimensions,
+            limits,
+            ((bits_per_second / 2) as u32).to_be_bytes().to_vec(),
+            12,
+        );
+        let half_mean = half[6..].iter().sum::<usize>() / half[6..].len();
+        let mean = settled.iter().sum::<usize>() / settled.len();
+        assert!(
+            half_mean < mean,
+            "halving the target did not shrink the stream: {half_mean} against {mean} bytes"
+        );
+        let half_ratio = (half_mean as f64 * 8.0) / picture_budget_bits(bits_per_second / 2) as f64;
+        assert!(
+            (0.75..=1.25).contains(&half_ratio),
+            "the halved target settled at {half_ratio:.3}x its budget, from {half:?}"
+        );
+    }
+
+    /// A bitrate-configured stream is still a stream: it decodes through
+    /// [`native_hevc_video_decoder_factory`] with distortion a lossy encode
+    /// should have.
+    #[test]
+    fn a_bitrate_configured_stream_decodes_through_the_crates_own_decoder() {
+        let (frame, dimensions, limits) = test_frame(64);
+        let at_qp_26 = coded_sizes(&frame, dimensions, limits, vec![26], 1)[0];
+        let bits_per_second = ((at_qp_26 as u64 * 8) * 30_000 / 1_001) as u32;
+        let psnr = round_trip_psnr(
+            &frame,
+            dimensions,
+            limits,
+            bits_per_second.to_be_bytes().to_vec(),
+        );
+        assert!(
+            psnr.is_finite() && psnr > 25.0,
+            "a bitrate-targeted stream should decode recognizably: {psnr:.2} dB"
+        );
+    }
+
+    /// The other half of the issue: the bitrate path is what puts
+    /// `ModeSearch::RateDistortion` into production. Its first picture must be
+    /// exactly the rate-constrained writer's at the QP rate control opens on,
+    /// and not the fixed-QP writer's at that same QP.
+    #[test]
+    fn the_bitrate_operating_point_codes_the_rate_constrained_decision() {
+        let (frame, dimensions, limits) = test_frame(64);
+        let bits_per_second = 400_000_u32;
+        let opening_qp = RateController::new(bits_per_second, 30_000, 1_001, 64 * 64).qp();
+        let sample = {
+            let mut encoder = native_hevc_video_encoder_factory()
+                .create(
+                    &encoder_config(dimensions, bits_per_second.to_be_bytes().to_vec()),
+                    &limits,
+                )
+                .unwrap();
+            block_on(encoder.encode(
+                FrameIndex(0),
+                FrameSource::Cpu(crate::CpuFrameSource {
+                    frame: &frame,
+                    orientation: crate::Orientation::TopLeft,
+                }),
+            ))
+            .unwrap()[0]
+                .data
+                .clone()
+        };
+        let (y, cb, cr) = rgba_to_yuv420(&frame, crate::Orientation::TopLeft).unwrap();
+        let rate_constrained = length_prefixed_vcl(
+            &encode_idr_residual_au_rate_constrained(&y, &cb, &cr, 64, 64, opening_qp)
+                .unwrap()
+                .0,
+        )
+        .unwrap();
+        assert_eq!(
+            sample, rate_constrained,
+            "the bitrate path did not code the rate-constrained decision at QP {opening_qp}"
+        );
+        let fixed = length_prefixed_vcl(
+            &encode_idr_residual_au(&y, &cb, &cr, 64, 64, opening_qp)
+                .unwrap()
+                .0,
+        )
+        .unwrap();
+        assert_ne!(
+            sample, fixed,
+            "the rate-constrained decision made no difference at QP {opening_qp}"
+        );
     }
 
     /// A lossy stream must declare the parameter sets its own writer emits,
