@@ -19,7 +19,6 @@
 //! [`crate::simd::set_override`], so the caller selects the arm exactly as it
 //! does for a whole-frame decode.
 
-use super::color_convert::convert_yuv420_to_rgba;
 use super::engine::deblock::{EdgePos, EdgeQp, EdgeType, SamplePlane, filter_luma_block_edge};
 use super::engine::inter_pred::{RefPlane, default_weighted_pred, interp_luma_block};
 use super::engine::intra_pred::{
@@ -29,6 +28,11 @@ use super::engine::picture::{Picture, Plane};
 use super::engine::sao::{ResolvedSao, ResolvedSaoComponent, apply_sao_picture};
 use super::engine::transform::{BlockParams, Component as TxComponent, PredMode, residual_block};
 use super::engine::{BitReader, CabacEngine, ContextModel};
+use super::{HevcDecoder, ParsedConfiguration, picture_to_rgba};
+use crate::{
+    CancellationToken, Codec, CodecProfile, ColorRange, EncodedVideoSample, HardwarePreference,
+    Limits, PixelFormat, VideoDecoder, VideoDecoderConfig, VideoDimensions,
+};
 
 /// Luma side of one inter-prediction block.
 const INTER_BLOCK: usize = 16;
@@ -56,27 +60,49 @@ impl Digest {
         }
     }
 
-    /// Folds a byte buffer eight bytes at a time.
-    ///
-    /// The colour-conversion stage produces megabytes of RGBA per run, and a
-    /// byte-at-a-time fold over that is several times the cost of the kernel it
-    /// is there to identify. Folding whole words still depends on every output
-    /// byte, and on its position, which is all the bit-exactness guard needs.
-    fn push_bytes(&mut self, values: &[u8]) {
-        let mut words = values.chunks_exact(8);
-        for word in &mut words {
-            self.0 ^= u64::from_le_bytes(word.try_into().expect("an eight-byte chunk"));
-            self.0 = self.0.wrapping_mul(0x1000_0000_01b3);
-        }
-        for &byte in words.remainder() {
-            self.0 ^= u64::from(byte);
-            self.0 = self.0.wrapping_mul(0x1000_0000_01b3);
-        }
-    }
-
     fn push_all(&mut self, values: &[i32]) {
         for &value in values {
             self.push_i32(value);
+        }
+    }
+
+    /// Folds `value` in one step.
+    fn push_u64(&mut self, value: u64) {
+        self.0 = (self.0 ^ value).wrapping_mul(0x1000_0000_01b3);
+    }
+
+    /// Folds a whole plane of decoded samples, two at a time.
+    ///
+    /// [`push_all`] costs a multiply per *byte*, which is nothing next to a
+    /// per-stage workload of a few thousand samples but is real work next to a
+    /// whole-frame group that folds several million per iteration, inside the
+    /// timed loop. This is the wide step for those; every sample still reaches
+    /// the accumulator, which is what the harness's bit-exactness guard needs.
+    ///
+    /// [`push_all`]: Self::push_all
+    fn push_samples(&mut self, values: &[i32]) {
+        let mut chunks = values.chunks_exact(2);
+        for pair in &mut chunks {
+            self.push_u64(u64::from(pair[0] as u32) | (u64::from(pair[1] as u32) << 32));
+        }
+        for &value in chunks.remainder() {
+            self.push_u64(u64::from(value as u32));
+        }
+    }
+
+    /// Folds a byte buffer eight bytes at a time, for the same reason as
+    /// [`push_samples`].
+    ///
+    /// [`push_samples`]: Self::push_samples
+    fn push_bytes(&mut self, bytes: &[u8]) {
+        let mut chunks = bytes.chunks_exact(8);
+        for chunk in &mut chunks {
+            self.push_u64(u64::from_le_bytes(
+                chunk.try_into().expect("the chunk is eight bytes"),
+            ));
+        }
+        for &byte in chunks.remainder() {
+            self.push_u64(u64::from(byte));
         }
     }
 
@@ -151,8 +177,12 @@ pub struct HevcStageInputs {
     intra_samples: u64,
     tx_blocks: Vec<(Vec<i32>, BlockParams)>,
     tx_samples: u64,
-    sao_picture: Picture,
+    /// A full 8-bit 4:2:0 picture of synthetic content, driven by both the
+    /// §8.7.3 SAO stage and the output-conversion stage — the second needs
+    /// exactly what the first already builds, a whole decoded picture.
+    picture: Picture,
     sao_ctbs: Vec<ResolvedSao>,
+    convert_config: VideoDecoderConfig,
     cabac_bytes: Vec<u8>,
 }
 
@@ -173,7 +203,7 @@ impl HevcStageInputs {
             .sum();
         let tx_blocks = build_tx_blocks();
         let tx_samples = tx_blocks.iter().map(|(l, _)| l.len() as u64).sum();
-        let (sao_picture, sao_ctbs) = build_sao_inputs(width, height, &luma);
+        let (picture, sao_ctbs) = build_sao_inputs(width, height, &luma);
         Self {
             width,
             height,
@@ -182,8 +212,9 @@ impl HevcStageInputs {
             intra_samples,
             tx_blocks,
             tx_samples,
-            sao_picture,
+            picture,
             sao_ctbs,
+            convert_config: convert_config(width, height),
             cabac_bytes: build_cabac_bitstream(),
         }
     }
@@ -207,12 +238,6 @@ impl HevcStageInputs {
         (self.luma_edges().len() * 4 * 8) as u64
     }
 
-    /// RGBA pixels the colour-conversion stage writes per run.
-    #[must_use]
-    pub fn color_convert_samples(&self) -> u64 {
-        (self.width * self.height) as u64
-    }
-
     /// Samples the SAO stage reads and writes per run, luma plus chroma.
     #[must_use]
     pub fn sao_samples(&self) -> u64 {
@@ -223,6 +248,12 @@ impl HevcStageInputs {
     #[must_use]
     pub fn inverse_transform_samples(&self) -> u64 {
         self.tx_samples
+    }
+
+    /// Samples the output-conversion stage writes per run, one RGBA pixel each.
+    #[must_use]
+    pub fn color_convert_samples(&self) -> u64 {
+        (self.width * self.height) as u64
     }
 
     /// Bins the entropy stage decodes per run.
@@ -335,7 +366,7 @@ impl HevcStageInputs {
     #[must_use]
     pub fn run_sao(&self) -> Vec<u8> {
         let filtered = apply_sao_picture(
-            self.sao_picture.clone(),
+            self.picture.clone(),
             &self.sao_ctbs,
             SAO_CTB_LOG2,
             1,
@@ -349,35 +380,6 @@ impl HevcStageInputs {
         digest.finish()
     }
 
-    /// The decoder's 8-bit 4:2:0 YUV-to-RGBA output conversion, over a full
-    /// picture.
-    ///
-    /// Not a decoding stage, but the largest single item in a whole-frame
-    /// decode (see `benches/README.md`), and on the path of both whole-frame
-    /// groups. The destination buffer is allocated inside the measured region
-    /// because `picture_to_rgba` allocates one per frame too, and the profiler
-    /// scope this group corresponds to covers that allocation.
-    #[must_use]
-    pub fn run_color_convert(&self) -> Vec<u8> {
-        let picture = &self.sao_picture;
-        let chroma_width = picture.plane_dims(Plane::Cb).0;
-        let mut rgba = vec![0_u8; self.width * self.height * 4];
-        convert_yuv420_to_rgba(
-            picture.plane(Plane::Luma),
-            picture.width_luma(),
-            picture.plane(Plane::Cb),
-            picture.plane(Plane::Cr),
-            chroma_width,
-            self.width,
-            self.height,
-            &mut rgba,
-            self.width * 4,
-        );
-        let mut digest = Digest::new();
-        digest.push_bytes(&rgba);
-        digest.finish()
-    }
-
     /// §8.6.2 / §8.6.3 / §8.6.4 — dequantization and the inverse transform, at
     /// every transform-block size and for both the DCT and the 4x4 intra DST.
     #[must_use]
@@ -387,6 +389,30 @@ impl HevcStageInputs {
             let residual =
                 residual_block(levels, None, *params).expect("the prepared block is well-formed");
             digest.push_all(&residual);
+        }
+        digest.finish()
+    }
+
+    /// The YUV420-to-RGBA output conversion every whole-frame decode ends in.
+    ///
+    /// Issue #220: this stage is not decoding, but it was a third of what the
+    /// whole-frame groups measure (see `benches/README.md`), so it is timed
+    /// directly rather than inferred by subtracting one whole-frame group from
+    /// another. Issue #219 gave it the [`color_convert`] kernel family, so its
+    /// arms now separate by instruction set like the decoding stages do, and
+    /// this group is what reports that.
+    ///
+    /// # Panics
+    /// Panics if the prepared picture no longer converts.
+    ///
+    /// [`color_convert`]: super::color_convert
+    #[must_use]
+    pub fn run_color_convert(&self) -> Vec<u8> {
+        let frame = picture_to_rgba(&self.picture, &self.convert_config, &Limits::default())
+            .expect("the prepared picture is Main-profile 8-bit 4:2:0");
+        let mut digest = Digest::new();
+        for plane in &frame.planes {
+            digest.push_bytes(&plane.data);
         }
         digest.finish()
     }
@@ -591,6 +617,132 @@ fn build_cabac_bitstream() -> Vec<u8> {
     (0..CABAC_BINS).map(|_| rng.below(256) as u8).collect()
 }
 
+/// The decoder configuration [`HevcStageInputs::run_color_convert`] converts
+/// under: the same RGBA8 limited-range output every whole-frame group asks for,
+/// at the prepared picture's dimensions.
+fn convert_config(width: usize, height: usize) -> VideoDecoderConfig {
+    let dimensions = VideoDimensions::new(width as u32, height as u32, &Limits::default())
+        .expect("the benchmark frame is within the default limits");
+    VideoDecoderConfig {
+        codec: Codec::Hevc,
+        profile: CodecProfile::HevcMain,
+        coded_dimensions: dimensions,
+        output_format: PixelFormat::Rgba8,
+        color_range: ColorRange::Limited,
+        hardware: HardwarePreference::Avoid,
+        configuration: Vec::new(),
+    }
+}
+
+/// Decodes `frames` frames of `samples` and stops at the decoded `Picture`.
+///
+/// Issue #220: the public decoder's `submit` returns RGBA, so a whole-frame
+/// benchmark through it measures decoding *plus* the colour conversion of
+/// [`HevcStageInputs::run_color_convert`] — a third of the interval, which
+/// until issue #219 gave it a kernel had no vector path at all and diluted
+/// every scalar-versus-SIMD ratio taken off those groups. This is the same
+/// decode without that tail: it drives the same
+/// `HevcDecoder` over the same access units and collects its pictures instead
+/// of converting them, so the difference between this and the end-to-end group
+/// is the conversion and nothing else about how the bitstream is handled.
+///
+/// Returns a fold over every decoded sample, for the harness's bit-exactness
+/// guard — the same fold [`decode_frames`] applies to the converted bytes, so
+/// neither group pays for identifying its output more than the other does. Pins no instruction set; the caller selects the arm through
+/// [`crate::simd::set_override`] exactly as for an end-to-end decode.
+///
+/// # Panics
+/// Panics if the configuration is not decodable or if `samples` does not yield
+/// `frames` frames — a benchmark measuring less work than it reports would be
+/// worse than a failure.
+/// Decodes `frames` frames of `samples` all the way out to RGBA.
+///
+/// The end-to-end half of the issue #220 split, and the counterpart to
+/// [`decode_pictures`]: same decoder, same access units, same frame count, same
+/// output fold — the only difference is the `picture_to_rgba` pass on each
+/// decoded picture, which is what makes the gap between the two groups the
+/// conversion rather than an artefact of how each arm identifies its output.
+///
+/// # Panics
+/// Panics under the same conditions as [`decode_pictures`].
+#[must_use]
+pub fn decode_frames(
+    configuration: &VideoDecoderConfig,
+    samples: &[EncodedVideoSample],
+    limits: &Limits,
+    frames: u64,
+) -> Vec<u8> {
+    let mut decoder = bench_decoder(configuration, limits);
+    let cancellation = CancellationToken::new();
+    let mut digest = Digest::new();
+    let mut decoded = 0_u64;
+    for sample in samples {
+        for frame in decoder
+            .submit(sample, &cancellation)
+            .expect("the sample decodes")
+        {
+            for plane in &frame.frame.planes {
+                digest.push_bytes(&plane.data);
+            }
+            decoded += 1;
+        }
+        if decoded >= frames {
+            break;
+        }
+    }
+    assert_frame_count(decoded, frames);
+    digest.finish()
+}
+
+/// The software decoder the whole-frame benchmark surface drives.
+///
+/// # Panics
+/// Panics if the configuration is not decodable.
+fn bench_decoder(configuration: &VideoDecoderConfig, limits: &Limits) -> HevcDecoder {
+    let parsed = ParsedConfiguration::parse(configuration, limits)
+        .expect("the sample's configuration record parses");
+    HevcDecoder::new(configuration.clone(), *limits, parsed)
+        .expect("the software HEVC decoder is constructible")
+}
+
+/// A benchmark measuring less work than it reports would be worse than a
+/// failure.
+fn assert_frame_count(decoded: u64, frames: u64) {
+    assert!(
+        decoded >= frames,
+        "the sample yielded {decoded} decoded pictures, not the {frames} the group reports"
+    );
+}
+
+#[must_use]
+pub fn decode_pictures(
+    configuration: &VideoDecoderConfig,
+    samples: &[EncodedVideoSample],
+    limits: &Limits,
+    frames: u64,
+) -> Vec<u8> {
+    let mut decoder = bench_decoder(configuration, limits);
+    let cancellation = CancellationToken::new();
+    let mut digest = Digest::new();
+    let mut decoded = 0_u64;
+    for sample in samples {
+        for picture in decoder
+            .submit_pictures(sample, &cancellation)
+            .expect("the sample decodes")
+        {
+            for plane in [Plane::Luma, Plane::Cb, Plane::Cr] {
+                digest.push_samples(picture.plane(plane));
+            }
+            decoded += 1;
+        }
+        if decoded >= frames {
+            break;
+        }
+    }
+    assert_frame_count(decoded, frames);
+    digest.finish()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -615,12 +767,13 @@ mod tests {
         let inputs = small_inputs();
         /// One stage's name and the entry point that runs it.
         type Stage = (&'static str, fn(&HevcStageInputs) -> Vec<u8>);
-        let stages: [Stage; 6] = [
+        let stages: [Stage; 7] = [
             ("inter_pred", HevcStageInputs::run_inter_pred),
             ("intra_pred", HevcStageInputs::run_intra_pred),
             ("deblock", HevcStageInputs::run_deblock),
             ("sao", HevcStageInputs::run_sao),
             ("inverse_transform", HevcStageInputs::run_inverse_transform),
+            ("color_convert", HevcStageInputs::run_color_convert),
             ("cabac", HevcStageInputs::run_cabac),
         ];
 
@@ -657,6 +810,7 @@ mod tests {
             inputs.run_deblock(),
             inputs.run_sao(),
             inputs.run_inverse_transform(),
+            inputs.run_color_convert(),
             inputs.run_cabac(),
         ];
         simd::set_override(None);
@@ -718,5 +872,111 @@ mod tests {
         assert_eq!(inputs.cabac_bins(), CABAC_BINS as u64);
         assert!(inputs.intra_pred_samples() > 0);
         assert!(inputs.inverse_transform_samples() > 0);
+    }
+
+    /// The picture-only path exists so a whole-frame benchmark can leave the
+    /// output conversion out of the measured interval — which is only sound if
+    /// it is otherwise the same decode. Converting what it collects has to
+    /// reproduce, frame for frame and byte for byte, what the public
+    /// `submit` returns.
+    #[test]
+    fn the_picture_only_path_decodes_what_the_rgba_path_decodes() {
+        let (configuration, samples) = pcm_stream();
+        let limits = Limits::default();
+        let cancellation = CancellationToken::new();
+
+        let mut rgba_decoder = new_decoder(&configuration, &limits);
+        let mut expected = Vec::new();
+        for sample in &samples {
+            for frame in rgba_decoder.submit(sample, &cancellation).unwrap() {
+                expected.push(frame.frame);
+            }
+        }
+        assert!(
+            !expected.is_empty(),
+            "the generated stream has to produce output frames for this to test anything"
+        );
+
+        let mut picture_decoder = new_decoder(&configuration, &limits);
+        let mut actual = Vec::new();
+        for sample in &samples {
+            for picture in picture_decoder
+                .submit_pictures(sample, &cancellation)
+                .unwrap()
+            {
+                actual.push(picture_to_rgba(&picture, &configuration, &limits).unwrap());
+            }
+        }
+        assert_eq!(actual, expected);
+    }
+
+    /// The digest the picture-only whole-frame group returns is what the
+    /// harness compares across instruction sets, so it has to depend on the
+    /// decoded samples and be reproducible.
+    #[test]
+    fn decode_pictures_folds_the_decoded_samples_reproducibly() {
+        let (configuration, samples) = pcm_stream();
+        let limits = Limits::default();
+        let one = decode_pictures(&configuration, &samples, &limits, 1);
+        assert_eq!(one, decode_pictures(&configuration, &samples, &limits, 1));
+        assert_ne!(one, decode_pictures(&configuration, &samples, &limits, 2));
+        assert_ne!(one, Digest::new().finish());
+    }
+
+    /// The two whole-frame surfaces have to decode the same frames, so the
+    /// interval between them is the conversion and not a different workload.
+    #[test]
+    fn the_two_whole_frame_paths_fold_the_same_number_of_frames() {
+        let (configuration, samples) = pcm_stream();
+        let limits = Limits::default();
+        let frames = decode_frames(&configuration, &samples, &limits, 2);
+        assert_eq!(frames, decode_frames(&configuration, &samples, &limits, 2));
+        assert_ne!(
+            frames,
+            decode_pictures(&configuration, &samples, &limits, 2)
+        );
+        assert_ne!(frames, Digest::new().finish());
+    }
+
+    /// The conversion stage folds a real converted frame, and folds a
+    /// different one for different content.
+    #[test]
+    fn color_convert_folds_the_converted_frame() {
+        let inputs = small_inputs();
+        let converted = inputs.run_color_convert();
+        assert_eq!(converted, inputs.run_color_convert());
+        assert_ne!(converted, HevcStageInputs::new(128, 64).run_color_convert());
+        assert_eq!(inputs.color_convert_samples(), 256 * 128);
+    }
+
+    /// A short PCM-coded stream, built with the crate's own HEVC encoder so
+    /// the decode-side tests run on a real bitstream without a fixture.
+    fn pcm_stream() -> (VideoDecoderConfig, Vec<EncodedVideoSample>) {
+        use super::super::encoder::{hvcc_box, length_prefixed_vcl};
+        use super::super::engine::encoder::pcm::encode_idr_pcm_au;
+        use crate::FrameIndex;
+
+        const SIDE: usize = 16;
+        const FRAMES: u64 = 4;
+        let mut rng = Lcg::new(0x8EEF_0220);
+        let y: Vec<u8> = (0..SIDE * SIDE).map(|_| rng.below(256) as u8).collect();
+        let chroma: Vec<u8> = (0..SIDE * SIDE / 4).map(|_| rng.below(256) as u8).collect();
+        let au = encode_idr_pcm_au(&y, &chroma, &chroma, SIDE, SIDE).unwrap();
+        let data = length_prefixed_vcl(&au).unwrap();
+        let mut configuration = convert_config(SIDE, SIDE);
+        configuration.configuration = hvcc_box(&au).unwrap();
+        let samples = (0..FRAMES)
+            .map(|index| EncodedVideoSample {
+                presentation_index: FrameIndex(index),
+                random_access: true,
+                data: data.clone(),
+            })
+            .collect();
+        (configuration, samples)
+    }
+
+    fn new_decoder(configuration: &VideoDecoderConfig, limits: &Limits) -> HevcDecoder {
+        let parsed = ParsedConfiguration::parse(configuration, limits).unwrap();
+        HevcDecoder::new(configuration.clone(), *limits, parsed).unwrap()
     }
 }
