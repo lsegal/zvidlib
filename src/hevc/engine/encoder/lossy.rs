@@ -177,8 +177,16 @@ pub fn encode_idr_residual_au(
     check("cb", cb, width * height / 4)?;
     check("cr", cr, width * height / 4)?;
 
-    let (rbsp, recon, _modes) =
-        write_idr_residual_slice(y, cb, cr, width, height, qp, ModeSearch::Rdo, LoopFilter::Deblock);
+    let (rbsp, recon, _modes) = write_idr_residual_slice(
+        y,
+        cb,
+        cr,
+        width,
+        height,
+        qp,
+        ModeSearch::Rdo,
+        LoopFilter::Deblock,
+    );
     let level_idc = level_idc_for(width * height);
     let units = vec![
         nal_unit(32, 0, 0, &write_vps(level_idc)), // VPS_NUT
@@ -896,8 +904,16 @@ mod tests {
         height: usize,
         qp: i32,
     ) -> (Vec<u8>, ReconstructedPicture) {
-        let (rbsp, recon, _) =
-            write_idr_residual_slice(y, cb, cr, width, height, qp, ModeSearch::DcOnly, LoopFilter::Deblock);
+        let (rbsp, recon, _) = write_idr_residual_slice(
+            y,
+            cb,
+            cr,
+            width,
+            height,
+            qp,
+            ModeSearch::DcOnly,
+            LoopFilter::Deblock,
+        );
         (rbsp, recon)
     }
 
@@ -922,8 +938,16 @@ mod tests {
         // several orientations must not come out uniformly DC.
         let (width, height) = (64, 48);
         let (y, cb, cr) = picture(width, height);
-        let (_, _, modes) =
-            write_idr_residual_slice(&y, &cb, &cr, width, height, 26, ModeSearch::Rdo, LoopFilter::Deblock);
+        let (_, _, modes) = write_idr_residual_slice(
+            &y,
+            &cb,
+            &cr,
+            width,
+            height,
+            26,
+            ModeSearch::Rdo,
+            LoopFilter::Deblock,
+        );
         assert_eq!(modes.len(), (width / CTB) * (height / CTB));
         let distinct: std::collections::BTreeSet<u8> = modes.iter().copied().collect();
         assert!(
@@ -946,10 +970,26 @@ mod tests {
         let (width, height) = (64, 48);
         let (y, cb, cr) = picture(width, height);
         for qp in [12i32, 26, 37] {
-            let (searched_slice, searched, _) =
-                write_idr_residual_slice(&y, &cb, &cr, width, height, qp, ModeSearch::Rdo, LoopFilter::Deblock);
-            let (baseline_slice, baseline, _) =
-                write_idr_residual_slice(&y, &cb, &cr, width, height, qp, ModeSearch::DcOnly, LoopFilter::Deblock);
+            let (searched_slice, searched, _) = write_idr_residual_slice(
+                &y,
+                &cb,
+                &cr,
+                width,
+                height,
+                qp,
+                ModeSearch::Rdo,
+                LoopFilter::Deblock,
+            );
+            let (baseline_slice, baseline, _) = write_idr_residual_slice(
+                &y,
+                &cb,
+                &cr,
+                width,
+                height,
+                qp,
+                ModeSearch::DcOnly,
+                LoopFilter::Deblock,
+            );
             let luma = (psnr_db(&y, &searched.y), psnr_db(&y, &baseline.y));
             assert!(
                 luma.0 > luma.1,
@@ -1009,10 +1049,24 @@ mod tests {
         let (y, cb, cr) = smooth_picture(width, height);
         for qp in [20i32, 26, 32, 37, 44, 51] {
             let (_, filtered, _) = write_idr_residual_slice(
-                &y, &cb, &cr, width, height, qp, ModeSearch::Rdo, LoopFilter::Deblock,
+                &y,
+                &cb,
+                &cr,
+                width,
+                height,
+                qp,
+                ModeSearch::Rdo,
+                LoopFilter::Deblock,
             );
             let (_, unfiltered, _) = write_idr_residual_slice(
-                &y, &cb, &cr, width, height, qp, ModeSearch::Rdo, LoopFilter::Off,
+                &y,
+                &cb,
+                &cr,
+                width,
+                height,
+                qp,
+                ModeSearch::Rdo,
+                LoopFilter::Off,
             );
             assert_ne!(
                 filtered.y, unfiltered.y,
@@ -1037,10 +1091,24 @@ mod tests {
         let source = [y.clone(), cb.clone(), cr.clone()].concat();
         for qp in [12i32, 26, 37, 51] {
             let (_, filtered, _) = write_idr_residual_slice(
-                &y, &cb, &cr, width, height, qp, ModeSearch::Rdo, LoopFilter::Deblock,
+                &y,
+                &cb,
+                &cr,
+                width,
+                height,
+                qp,
+                ModeSearch::Rdo,
+                LoopFilter::Deblock,
             );
             let (_, unfiltered, _) = write_idr_residual_slice(
-                &y, &cb, &cr, width, height, qp, ModeSearch::Rdo, LoopFilter::Off,
+                &y,
+                &cb,
+                &cr,
+                width,
+                height,
+                qp,
+                ModeSearch::Rdo,
+                LoopFilter::Off,
             );
             let whole = |r: &ReconstructedPicture| {
                 psnr_db(&source, &[r.y.clone(), r.cb.clone(), r.cr.clone()].concat())
