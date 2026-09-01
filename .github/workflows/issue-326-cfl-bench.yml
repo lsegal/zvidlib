@@ -4,6 +4,10 @@
 name: Issue 326 Coffee Lake SIMD column
 
 on:
+  # Registers the workflow so `workflow_dispatch` can reach it on this
+  # branch; removed again in the next commit.
+  pull_request:
+    branches: [main]
   workflow_dispatch:
     inputs:
       runs:
