@@ -47,11 +47,11 @@ use crate::hevc::engine::encoder::nal::{annexb, nal_unit};
 use crate::hevc::engine::encoder::pcm::{
     PcmEncodeError, level_idc_for, write_pps, write_sps, write_vps,
 };
-use crate::hevc::engine::encoder::recon::ReconstructedPicture;
 use crate::hevc::engine::encoder::rdo::{
     DistortionBackend, intra_mode_bit_cost, lambda_q8, residual_bit_cost,
     shortlist_intra_luma_modes,
 };
+use crate::hevc::engine::encoder::recon::ReconstructedPicture;
 use crate::hevc::engine::encoder::residual::{
     EngineResidualBinSink, ResidualWriteParams, has_coded_levels, write_residual_coding,
 };
@@ -232,14 +232,7 @@ fn write_idr_residual_slice(
             height,
         };
         let (mode, luma_coded) = decide_luma_mode(
-            luma_plane,
-            &recon.y,
-            x0,
-            y0,
-            qp,
-            qp_luma,
-            candidates,
-            search,
+            luma_plane, &recon.y, x0, y0, qp, qp_luma, candidates, search,
         );
         left_mode = mode;
         modes.push(mode);
@@ -399,7 +392,10 @@ fn decide_luma_mode(
             + u64::from(residual_bit_cost(&coded.levels));
         let cost = sum_squared_error(plane, x0, y0, CTB, &coded.samples)
             .saturating_add(bits * lambda / 256);
-        if best.as_ref().is_none_or(|(best_cost, ..)| cost < *best_cost) {
+        if best
+            .as_ref()
+            .is_none_or(|(best_cost, ..)| cost < *best_cost)
+        {
             best = Some((cost, candidate.mode, coded));
         }
     }
@@ -471,7 +467,10 @@ fn decide_chroma_mode(
             .map(|(block, &(plane, _))| sum_squared_error(plane, cx, cy, n_tbs, &block.samples))
             .sum::<u64>();
         let cost = distortion.saturating_add(bits * lambda / 256);
-        if best.as_ref().is_none_or(|(best_cost, ..)| cost < *best_cost) {
+        if best
+            .as_ref()
+            .is_none_or(|(best_cost, ..)| cost < *best_cost)
+        {
             best = Some((cost, signalled, coded));
         }
     }
@@ -482,7 +481,11 @@ fn decide_chroma_mode(
 /// §9.3.3.8 bin count for one `intra_chroma_pred_mode`: the single bin for
 /// value 4, or that bin plus the two FL bypass bins for 0..=3.
 fn chroma_mode_bit_cost(signalled: u8) -> u32 {
-    if signalled == CHROMA_MODE_DERIVED { 1 } else { 3 }
+    if signalled == CHROMA_MODE_DERIVED {
+        1
+    } else {
+        3
+    }
 }
 
 /// One transform block coded against a candidate prediction: the levels the
@@ -573,13 +576,7 @@ fn write_back(recon: &mut [u8], width: usize, x0: usize, y0: usize, n_tbs: usize
 
 /// Squared error between a coded block's reconstruction and the source it was
 /// coded from — the distortion half of the second RDO pass.
-fn sum_squared_error(
-    plane: Plane<'_>,
-    x0: usize,
-    y0: usize,
-    n_tbs: usize,
-    samples: &[u8],
-) -> u64 {
+fn sum_squared_error(plane: Plane<'_>, x0: usize, y0: usize, n_tbs: usize, samples: &[u8]) -> u64 {
     let mut sse = 0u64;
     for row in 0..n_tbs {
         for col in 0..n_tbs {

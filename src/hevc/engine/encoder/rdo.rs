@@ -382,6 +382,7 @@ pub(crate) struct IntraModeDecision {
 /// shortlist on the reconstruction it will actually code — see
 /// [`intra_mode_bit_cost`] and [`residual_bit_cost`] for the rate half of that
 /// second pass.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn shortlist_intra_luma_modes(
     source: &[u8],
     source_stride: usize,
