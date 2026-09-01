@@ -216,10 +216,10 @@ enum ModeSearch {
     /// candidate's rate term, so the decision minimizes the full
     /// `D + lambda * R` rather than distortion against signalling alone.
     ///
-    /// This is what a rate-controlled encoder needs; the writer has no
-    /// bitrate target to hit yet, so nothing outside the tests that measure
-    /// the two operating points against each other selects it.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// This is what a rate-controlled encoder needs, and what the public
+    /// factory's target-bitrate operating point codes at: with a bitrate to
+    /// hit, the bits this decision saves are bits the next picture's QP can
+    /// spend somewhere they buy more.
     RateDistortion,
     /// Every coding unit pinned to `INTRA_DC` with chroma derived from it —
     /// the writer's behaviour before the mode search, kept as the baseline the
@@ -304,15 +304,15 @@ pub fn encode_idr_residual_au(
 /// fixed-QP writer above — a better trade at equal rate, and the one a bitrate
 /// target needs.
 ///
-/// Nothing outside the tests that measure the two operating points against
-/// each other selects this yet: with no bitrate to hit there is nothing for
-/// the saved bits to be spent on, and the public factory's job at a given QP
-/// stays the closest picture.
+/// This is the writer the public factory's target-bitrate operating point
+/// codes every picture through, with `qp` chosen per picture by
+/// [`crate::hevc::engine::encoder::ratecontrol`]. The fixed-QP configuration
+/// stays on [`encode_idr_residual_au`]: a caller that names a QP is asking for
+/// a picture, not a rate.
 ///
 /// # Errors
 /// As [`encode_idr_residual_au`].
-#[cfg(test)]
-pub(crate) fn encode_idr_residual_au_rate_constrained(
+pub fn encode_idr_residual_au_rate_constrained(
     y: &[u8],
     cb: &[u8],
     cr: &[u8],
