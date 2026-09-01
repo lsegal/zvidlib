@@ -1022,7 +1022,6 @@ mod tests {
         }
     }
 
-
     /// The rate-constrained operating point has to buy its bits back: at the
     /// same QP it must code a smaller slice than the fixed-QP decision, and the
     /// point it lands on must sit above the fixed-QP writer's own
