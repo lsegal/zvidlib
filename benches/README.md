@@ -816,7 +816,8 @@ mistaken for bitstream-writing cost:
 | `..._rdo_intra` / `..._rdo_inter` | mode search / RDO (`engine::encoder::rdo`), without and with a reference picture |
 | `..._reconstruct` | encode-side reconstruction (predict + add residual per coded block) plus the §8.7.2 deblocking filter and §8.7.3 SAO over the reconstructed picture |
 | `..._pcm_write` | whole-picture access-unit writing: parameter sets, slice header, CABAC-coded CU syntax, PCM samples |
-| `hevc_encode_cabac` | the §9.3.5 arithmetic encoder alone, over a synthetic bin stream |
+| `hevc_encode_cabac` | the §9.3.5 arithmetic encoder alone, over a synthetic bin stream of single, interleaved bins |
+| `hevc_encode_cabac_bypass` | the same encoder over contiguous *bypass runs* — the shape 62% of the lossy residual writer's bins have |
 | `hevc_encode_bitwriter` | the raw fixed-length / `ue(v)` / `se(v)` writer alone |
 | `..._rgba_to_yuv420` | the RGBA8 input conversion every encoded frame pays (`engine::encoder::colorconv`) |
 
@@ -856,8 +857,8 @@ instruction set, but by reaching the decoder's already-vectorized deblocking and
 SAO kernels rather than an encoder-side one.
 
 **Bitstream writing and CABAC** have no vector path at all, so `..._pcm_write`,
-`hevc_encode_cabac` and `hevc_encode_bitwriter` are expected to read the same
-under every instruction set. That is a measured result, not a broken benchmark:
+`hevc_encode_cabac`, `hevc_encode_cabac_bypass` and `hevc_encode_bitwriter` are
+expected to read the same under every instruction set. That is a measured result, not a broken benchmark:
 it says the remaining encoder-side vectorization targets are entropy coding and
 the bitwriter — and that for the bitwriter, a widening rewrite of its
 `put_bit`-at-a-time inner loop is likely worth more than vector kernels, while
@@ -924,27 +925,53 @@ about **two thirds** of the access-unit write, so the stage is worth working on
 after all. What does not follow is that bin-parallelism is the way to work on
 it.
 
-**What to do instead.** Two ordinary serial changes take most of the reachable
-headroom, exactly, with no speculation:
+**What to do instead.** Two ordinary serial changes were expected to take most
+of the reachable headroom with no speculation. The first was tried and does not;
+the second has not been tried yet.
 
-1. **Encode a bypass *run* in one step.** §9.3.5.5 unrolled over `n` bins is
+1. **Encoding a bypass *run* in one step is an identity, and is not a speedup**
+   (#246). §9.3.5.5 unrolled over `n` bins is
    `ivlLow = ( ivlLow << n ) + ivlCurrRange * value` followed by the same
-   carry-controlled emission of the top `n` bits, which is an identity rather
-   than an approximation: it was checked byte-identical against the
-   bin-at-a-time engine for every run length from 1 to 24, and measured
-   **1.73x** on a workload of runs (64.4–65.5 -> 110.5–113.4 Mbin/s). The lossy
-   writer's coefficient sign bits and Golomb-Rice suffixes are exactly such
-   runs, and **62%** of its bins are bypass bins. `hevc_encode_cabac` itself
-   would not move, because its bypass bins are single and interleaved with
-   context-coded ones by construction.
+   carry-controlled emission of the top `n` bits, each tested against a window
+   scaled by the bins still below it. That part holds exactly: implemented and
+   run against the bin-at-a-time engine it is byte-identical, and leaves an
+   identical `ivlLow` and `bitsOutstanding`, for every run length from 1 to 32
+   from every primed engine state, and the lossy residual writer's output does
+   not move by a bit at any QP. What did not reproduce is the **1.73x** this
+   section previously recorded for it. Measured as the best of 25 rounds of the
+   two paths interleaved *in one process* — the only form of this comparison
+   that survives a host running several concurrent builds — over
+   `hevc_encode_cabac_bypass`'s 262,144-bin workload:
+
+   | Run length | bin at a time | run at a time | ratio |
+   | --- | --- | --- | --- |
+   | 2 | 182.8 Mbin/s | 166.7 Mbin/s | 0.91x |
+   | 4 | 278.1 Mbin/s | 249.1 Mbin/s | 0.90x |
+   | 8 | 281.7 Mbin/s | 298.0 Mbin/s | 1.06x |
+   | 16 | 135.4 Mbin/s | 132.4 Mbin/s | 0.98x |
+   | mixed 1–16 | 120.0 Mbin/s | 113.7 Mbin/s | 0.95x |
+
+   The ratio straddles 1.00 and never leaves the noise, so the unrolled step
+   was not taken. The reason it buys nothing is that it removes a shift and a
+   conditional add per bin, and neither is what a bypass bin costs: the
+   three-way, data-dependent Figure 9-13 decision — emit a bit, emit a
+   carry-resolving bit, or defer one — still runs once per bin, and the
+   `put_bit`-at-a-time sink under it still writes one bit at a time. Batching a
+   whole run's resolved bits into a single `BitWriter::put_bits`, over a
+   byte-at-a-time `put_bits`, was measured too and did not move the ratio
+   either.
 2. **Widen the bit sink**, which the first table prices at 1.14x for this stage
    on its own. That is the same rewrite the `..._pcm_write` and
-   `hevc_encode_bitwriter` groups want.
+   `hevc_encode_bitwriter` groups want, it is what the run-at-a-time result
+   above points back at, and it is #233.
 
 Neither is a bin-parallel algorithm, and neither changes a single bit of output.
 Whatever headroom a speculative formulation might still hold after both is
 smaller than the 3.7x ceiling above and costs far more to hold onto, which is
-why the arithmetic encoder stays serial.
+why the arithmetic encoder stays serial. `hevc_encode_cabac_bypass` exists so
+that the run-at-a-time question stays measured rather than re-derived: it is the
+same engine over contiguous bypass runs instead of single interleaved bins, and
+it is the group any future attempt at this has to move.
 
 ## Per-stage access to the encoder
 
