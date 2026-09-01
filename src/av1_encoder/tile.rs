@@ -67,33 +67,47 @@ const TYPE_GAIN_PROBES: usize = 1;
 /// against a remembered one. The frame's first size search probes, so a correction is available
 /// from the first block that needs one.
 ///
-/// The ratio is only stable frame-wide while the frame's content is, and the reuse is what costs
-/// accuracy when it is not: a block corrected by a ratio measured in a region unlike its own can
-/// have two close sizes ranked the wrong way round. `2` is where that trade was measured out, on
-/// the six-frame set in `measure_type_gain_sampling_intervals` at 192x160 - a hard scene edge, a
-/// four-quadrant frame, full-range noise, a smooth surface, directional edges, and the encoder's
-/// own `test_pattern` - against the same estimator probing every size search, which is the
-/// unsampled search this interval approximates. Cost is the encoder's own `sse + lambda * bits`,
-/// summed over the frame and compared at equal quantizer:
+/// The ratio is only stable across a neighbourhood while the content there is, and the reuse is
+/// what costs accuracy when it is not: a block corrected by a ratio measured in a region unlike
+/// its own can have two close sizes ranked the wrong way round. `2` is where that trade measures
+/// out, on the six-frame set in `measure_type_gain_sampling_intervals` at 192x160 - a hard scene
+/// edge, a four-quadrant frame, full-range noise, a smooth surface, directional edges, and the
+/// encoder's own `test_pattern` - against the same estimator probing every size search, which is
+/// the unsampled search this interval approximates. Cost is the encoder's own
+/// `sse + lambda * bits`, summed over the frame and compared at equal quantizer; the times are
+/// the minimum of five interleaved rounds per arm in `measure_type_gain_sampling_cost` over that
+/// set at six quantizers:
 ///
 /// | interval | worst penalty vs unsampled | mean vs exhaustive | candidates | time |
 /// |---------:|---------------------------:|-------------------:|-----------:|--------:|
-/// | 1        | 0.0%                       | +0.25%             | 181,557    | 0.644 s |
-/// | 2        | +44.1%                     | +1.05%             | 155,143    | 0.607 s |
-/// | 4        | +64.6%                     | +1.70%             | 142,372    | 0.574 s |
-/// | 8        | +78.7%                     | +1.97%             | 136,250    | 0.565 s |
-/// | 16       | +85.8%                     | +2.29%             | 128,035    | 0.557 s |
+/// | 1        | 0.0%                       | +0.25%             | 181,557    | 0.719 s |
+/// | 2        | +9.3%                      | +0.22%             | 155,392    | 0.667 s |
+/// | 4        | +23.0%                     | +0.54%             | 142,169    | 0.646 s |
+/// | 8        | +36.1%                     | +0.86%             | 136,452    | 0.614 s |
+/// | 16       | +71.6%                     | +1.89%             | 127,951    | 0.630 s |
 ///
-/// Every worst case is the same frame and quantizer - the hard scene edge at `qindex` 160, whose
-/// two halves have unrelated statistics - and the original value of `8` carried nearly twice
-/// the error there against `2` while saving 7% of the encode. `1` is not the value because it
-/// evaluates 181,557 transform-type candidates against the exhaustive search's 700,004, which
-/// no longer clears the
+/// That is the trade with [`TYPE_GAIN_MEMORY`] in force, and it is not the one this interval was
+/// first chosen from. Under the frame-wide accumulation the memory window replaced, `2` carried
+/// +44.1% here and the penalty then grew slowly and monotonically with the interval - +64.6% at
+/// `4`, +78.7% at `8`, +85.8% at `16` - so a longer interval looked like it was mostly free. It
+/// is not, and the recency weighting is why: the window is counted in *probes*, not in coding
+/// blocks, so raising the interval stretches the same four-probe memory over proportionally more
+/// of the frame and gives back exactly what the weighting bought. `4` costs 2.5x what `2` does
+/// rather than the 1.5x the frame-wide curve showed, and the curve is no longer even monotone -
+/// the intermediate intervals the sweep covers land at +37.0% (`3`), +43.6% (`6`), +57.1% (`12`),
+/// +35.7% (`24`) and +50.0% (`32` and `64`) - because once the memory spans a region boundary,
+/// which neighbourhood a block reads back comes down to where its probes happened to fall.
+///
+/// Every worst case is the same frame and quantizer: the hard scene edge at `qindex` 160, whose
+/// two halves have unrelated statistics. `1` is not the value, because it evaluates 181,557
+/// transform-type candidates against the exhaustive search's 700,004, which does not clear the
 /// four-fold reduction the shortcuts exist for and
 /// `the_search_shortcuts_stay_within_their_rate_and_distortion_bound` asserts; `2` clears it with
-/// 155,143. What remains at `2` is the estimator mixing statistics across regions rather than the
-/// sampling rate, which no interval fixes; [`TYPE_GAIN_MEMORY`] is what addresses that, and the
-/// worst-penalty column above is the frame-wide accumulation it replaced.
+/// 155,392, at 7% less encode time than `1` and at a mean cost against the exhaustive search that
+/// is, within this set, no worse than probing every size search. What remains at `2` is the
+/// estimator mixing statistics across regions, which no interval fixes and [`TYPE_GAIN_MEMORY`]
+/// is what addresses. `the_type_gain_sampling_interval_does_not_pay_to_be_longer` is what keeps
+/// the row below `2` from being taken on the strength of its candidate count.
 pub(super) const TYPE_GAIN_SAMPLE_INTERVAL: usize = 2;
 
 /// Probes a transform size's accumulated gain ratio remembers, as the window of an exponential

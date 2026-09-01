@@ -1331,6 +1331,69 @@ mod nonlossless_tests {
         }
     }
 
+    /// A longer sampling interval is not the trade it was under the frame-wide accumulator.
+    ///
+    /// `TYPE_GAIN_SAMPLE_INTERVAL` was chosen against a per-size gain accumulated equally over
+    /// the whole frame, where the penalty grew slowly and monotonically with the interval and the
+    /// candidate saving above `2` looked close to free. `TYPE_GAIN_MEMORY` changed that: the
+    /// window is counted in *probes*, not in coding blocks, so raising the interval stretches the
+    /// same window over proportionally more of the frame and hands back the regional accuracy the
+    /// weighting bought. Re-measured on the frame the trade is decided on - the hard scene edge at
+    /// 192x160 and `qindex` 160, whose two halves have unrelated statistics - `2` costs +9.3%
+    /// against the same estimator probing every size search where the frame-wide accumulation cost
+    /// +44.1%, and `4` costs +23.0%: 2.5x, against the 1.5x the old curve showed.
+    ///
+    /// So this asserts both halves of that: the shipped interval stays near what it measured, and
+    /// doubling it is materially worse rather than nearly free. Raising the constant for its
+    /// candidate count alone fails here.
+    #[test]
+    fn the_type_gain_sampling_interval_does_not_pay_to_be_longer() {
+        let (width, height) = (192_usize, 160_usize);
+        let (name, pixels) = content_frames(width as u32, height as u32)
+            .into_iter()
+            .find(|(name, _)| *name == "scene_edge")
+            .expect("the scene edge is the frame this trade is decided on");
+        let qindex = 160_u8;
+        let ac = i64::from(crate::av1_intra::get_ac_quant(qindex));
+        let lambda = (ac * ac / 256).max(1);
+        let cost = |interval: usize| -> i64 {
+            let report = tile::FrameEncoder::new(&pixels, width, height, qindex)
+                .with_type_gain_interval(interval)
+                .encode_with_report();
+            let sse: i64 = (0..height)
+                .flat_map(|row| {
+                    report.reconstruction[row * report.coded_width..][..width]
+                        .iter()
+                        .enumerate()
+                        .map(move |(column, &value)| (row * width + column, value))
+                })
+                .map(|(index, value)| {
+                    let error = i64::from(i32::from(pixels[index]) - i32::from(value));
+                    error * error
+                })
+                .sum();
+            sse + lambda * report.tile.len() as i64 * 8
+        };
+        let unsampled = cost(1);
+        let penalty = |interval: usize| cost(interval) as f64 / unsampled as f64 * 100.0 - 100.0;
+        let shipped = penalty(tile::TYPE_GAIN_SAMPLE_INTERVAL);
+        assert!(
+            shipped <= 12.0,
+            "{name} at qindex {qindex} cost {shipped:+.2}% against the unsampled estimator at \
+             interval {}, past the 12% the re-measured +9.3% is allowed to drift to",
+            tile::TYPE_GAIN_SAMPLE_INTERVAL
+        );
+        let doubled = penalty(tile::TYPE_GAIN_SAMPLE_INTERVAL * 2);
+        assert!(
+            doubled >= shipped * 1.5,
+            "doubling the interval to {} cost {doubled:+.2}% against interval {}'s \
+             {shipped:+.2}%, so the recency weighting no longer makes a longer interval the \
+             worse trade this constant was re-chosen on",
+            tile::TYPE_GAIN_SAMPLE_INTERVAL * 2,
+            tile::TYPE_GAIN_SAMPLE_INTERVAL
+        );
+    }
+
     /// The stated bound on what the search shortcuts cost.
     ///
     /// Two of the three are exact - a block whose residual cannot pay for one coefficient, and a
