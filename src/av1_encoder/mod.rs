@@ -930,12 +930,12 @@ mod nonlossless_tests {
     /// These are constants of the format, not of the machine that produced them: regenerate them
     /// only alongside a deliberate change to what the encoder emits, never to make a host pass.
     const FIXED_FRAME_DIGESTS: [(usize, u64); 6] = [
-        (6225, 0x96c9_520e_8ba7_f06c),
-        (5030, 0xeb9b_c441_857d_5cdb),
-        (3530, 0xb923_3656_11d1_9ce0),
-        (2609, 0x41ce_ea2a_568d_0f90),
-        (1520, 0xe3a6_ecf3_4e12_462f),
-        (993, 0xd1ef_bca9_08dc_aad6),
+        (6206, 0x190c_962c_83b3_0bbf),
+        (5034, 0xb0f9_4cc3_8610_6e7a),
+        (3496, 0x809b_f0bd_bfae_d7a0),
+        (2567, 0x2721_ab2e_2cbc_c324),
+        (1525, 0x7144_46e8_0c7d_b4a2),
+        (1018, 0x3795_6db2_ff1f_0400),
     ];
 
     /// [`one_frame_encodes_identically_under_every_instruction_set`] can only compare the
@@ -1327,6 +1327,52 @@ mod nonlossless_tests {
                     "{name} at qindex {qindex} cost {sampled} against the unsampled estimator's \
                      {unsampled} ({penalty:+.2}%), past the {ceiling}% this frame is allowed"
                 );
+            }
+        }
+    }
+
+    /// What each of the four shortcut bounds actually measures, at every quantizer and on more
+    /// than the one frame the bounds are asserted on.
+    ///
+    /// `the_search_shortcuts_stay_within_their_rate_and_distortion_bound` asserts a single
+    /// number per quantizer on 96x80 `test_pattern`; this prints the whole surface so a bound is
+    /// re-derived from a measurement rather than from whichever quantizer happened to fail.
+    #[test]
+    #[ignore = "measurement sweep, not an assertion"]
+    fn measure_search_shortcut_bounds() {
+        for (width, height) in [(96_usize, 80_usize), (128, 96), (192, 160)] {
+            let mut frames = content_frames(width as u32, height as u32);
+            frames.push(("test_pattern", test_pattern(width as u32, height as u32)));
+            println!(
+                "frame,width,height,qindex,fast_psnr,exh_psnr,d_psnr,fast_bytes,exh_bytes,rate_growth,fast_candidates,exh_candidates,reduction"
+            );
+            for (name, pixels) in &frames {
+                for qindex in [1_u8, 8, 32, 80, 160, 200] {
+                    let fast =
+                        tile::FrameEncoder::new(pixels, width, height, qindex).encode_with_report();
+                    let exhaustive = tile::FrameEncoder::new(pixels, width, height, qindex)
+                        .without_search_shortcuts()
+                        .encode_with_report();
+                    let quality = |report: &tile::SearchReport| {
+                        let reconstruction: Vec<u8> = (0..height)
+                            .flat_map(|row| {
+                                report.reconstruction[row * report.coded_width..][..width].to_vec()
+                            })
+                            .collect();
+                        psnr(pixels, &reconstruction)
+                    };
+                    let (fast_psnr, exh_psnr) = (quality(&fast), quality(&exhaustive));
+                    println!(
+                        "{name},{width},{height},{qindex},{fast_psnr:.4},{exh_psnr:.4},{:+.4},{},{},{:+.4},{},{},{:.2}",
+                        fast_psnr - exh_psnr,
+                        fast.tile.len(),
+                        exhaustive.tile.len(),
+                        fast.tile.len() as f64 / exhaustive.tile.len() as f64 - 1.0,
+                        fast.candidates_evaluated,
+                        exhaustive.candidates_evaluated,
+                        exhaustive.candidates_evaluated as f64 / fast.candidates_evaluated as f64,
+                    );
+                }
             }
         }
     }

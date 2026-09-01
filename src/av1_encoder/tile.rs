@@ -45,11 +45,19 @@ const MEMO_UNSET: u8 = u8::MAX;
 /// (`bw` of 8, 16, 32 and 64, so `bsl` 1 through 4).
 const MEMO_LEVELS: usize = 5;
 
-/// Bits [`estimate_rate`] charges a block whose levels are all zero: the `all_zero` flag alone.
-const ZERO_BLOCK_BITS: i64 = 1;
+/// Bits [`estimate_rate`] charges one CDF-coded symbol.
+///
+/// The estimator ranks candidates rather than predicting the arithmetic coder's fractional
+/// output, so every symbol §5.11.39 writes is charged the same nominal cost and the *shape* of
+/// the estimate comes from how many symbols a level costs rather than from any one symbol's
+/// probability. `2` keeps that nominal cost on the scale the raw bits in the same expression are
+/// already on, so a symbol and a literal are comparable.
+const SYMBOL_BITS: i64 = 2;
+/// Bits [`estimate_rate`] charges a block whose levels are all zero: the `all_zero` symbol alone.
+const ZERO_BLOCK_BITS: i64 = SYMBOL_BITS;
 /// Bits [`estimate_rate`] charges the cheapest block it can charge that is *not* all zero: the
-/// `all_zero` flag, a one-position end-of-block, and one magnitude-1 coefficient with its sign.
-const MIN_CODED_BLOCK_BITS: i64 = 7;
+/// `all_zero` symbol, a one-position end-of-block, and one magnitude-1 coefficient with its sign.
+const MIN_CODED_BLOCK_BITS: i64 = ZERO_BLOCK_BITS + SYMBOL_BITS + 3;
 
 /// Transform blocks per probing size trial that [`FrameEncoder::choose_tx_size`] searches with the
 /// whole transform-type set instead of the set's DCT alone, to measure what the type search is
@@ -79,24 +87,24 @@ const LARGE_TYPE_GAIN_PROBES: usize = 4;
 /// unsampled search this interval approximates. Cost is the encoder's own `sse + lambda * bits`,
 /// summed over the frame and compared at equal quantizer:
 ///
-/// | interval | worst penalty vs unsampled | mean vs exhaustive | candidates | time |
-/// |---------:|---------------------------:|-------------------:|-----------:|--------:|
-/// | 1        | 0.0%                       | +0.25%             | 181,557    | 0.644 s |
-/// | 2        | +44.1%                     | +1.05%             | 155,143    | 0.607 s |
-/// | 4        | +64.6%                     | +1.70%             | 142,372    | 0.574 s |
-/// | 8        | +78.7%                     | +1.97%             | 136,250    | 0.565 s |
-/// | 16       | +85.8%                     | +2.29%             | 128,035    | 0.557 s |
+/// | interval | worst penalty vs unsampled | mean vs exhaustive | candidates |
+/// |---------:|---------------------------:|-------------------:|-----------:|
+/// | 1        | 0.00%                      | +0.63%             | 228,743    |
+/// | 2        | +1.15%                     | +0.61%             | 207,352    |
+/// | 3        | +1.17%                     | +0.63%             | 198,964    |
+/// | 4        | +3.26%                     | +0.66%             | 197,196    |
+/// | 8        | +3.97%                     | +0.69%             | 190,714    |
+/// | 16       | +3.97%                     | +0.57%             | 184,954    |
 ///
-/// Every worst case is the same frame and quantizer - the hard scene edge at `qindex` 160, whose
-/// two halves have unrelated statistics - and the original value of `8` carried nearly twice
-/// the error there against `2` while saving 7% of the encode. `1` is not the value because it
-/// evaluates 181,557 transform-type candidates against the exhaustive search's 700,004, which
-/// no longer clears the
-/// four-fold reduction the shortcuts exist for and
-/// `the_search_shortcuts_stay_within_their_rate_and_distortion_bound` asserts; `2` clears it with
-/// 155,143. What remains at `2` is the estimator mixing statistics across regions rather than the
-/// sampling rate, which no interval fixes; [`TYPE_GAIN_MEMORY`] is what addresses that, and the
-/// worst-penalty column above is the frame-wide accumulation it replaced.
+/// The whole surface is an order of magnitude flatter than it was when this constant was first
+/// derived, because [`estimate_rate`] now prices a level the way §5.11.39 codes one: what used to
+/// read as the sampling rate mixing regions' statistics was mostly the rate model mispricing the
+/// large levels a region boundary produces. `2` remains the value - it is within 0.02 points of
+/// the unsampled estimator's worst case and saves 9% of the candidates, and every interval past
+/// it gives up two to four times as much for another 5%. `1` is not the value: it evaluates
+/// 228,743 transform-type candidates, which is where the four-fold reduction
+/// `the_search_shortcuts_stay_within_their_rate_and_distortion_bound` asserts stops being
+/// comfortable.
 pub(super) const TYPE_GAIN_SAMPLE_INTERVAL: usize = 2;
 
 /// Probes a transform size's accumulated gain ratio remembers, as the window of an exponential
@@ -119,35 +127,33 @@ pub(super) const TYPE_GAIN_SAMPLE_INTERVAL: usize = 2;
 /// start of each band) and over keeping a ratio per spatial region (which needs a region map the
 /// encoder does not have and memory proportional to the frame).
 ///
-/// `4` is where it measured out, on the `content_frames` set plus `test_pattern` at both 128x96
+/// `2` is where it measured out, on the `content_frames` set plus `test_pattern` at both 128x96
 /// and 192x160 over the six quantizers, as each frame's worst penalty in `sse + lambda * bits`
 /// against the same estimator probing every size search. `frame` is the un-decayed accumulation
-/// this replaced:
+/// this replaced, and each cell is the worse of the two frame sizes:
 ///
-/// | window     | scene_edge | quadrants | smooth | test_pattern | candidates |
-/// |-----------:|-----------:|----------:|-------:|-------------:|-----------:|
-/// | 1          | +8.26%     | +0.86%    | +0.08% | +3.12%       | 155,725    |
-/// | 2          | +9.11%     | +1.49%    | +0.52% | +0.37%       | 155,696    |
-/// | 4          | +9.32%     | +0.00%    | +0.52% | +0.37%       | 155,392    |
-/// | 8          | +16.36%    | +0.00%    | +0.52% | +0.37%       | 155,357    |
-/// | 32         | +29.96%    | +0.00%    | +0.52% | +0.37%       | 155,109    |
-/// | frame      | +44.14%    | +0.00%    | +0.52% | +0.37%       | 155,143    |
+/// | window | scene_edge | quadrants | smooth  | test_pattern | noise  |
+/// |-------:|-----------:|----------:|--------:|-------------:|-------:|
+/// | 1      | +1.37%     | +0.33%    | +12.97% | +0.29%       | +0.05% |
+/// | 2      | +1.13%     | +0.45%    | +1.62%  | +0.29%       | +0.05% |
+/// | 3      | +1.60%     | +0.45%    | +1.62%  | +0.29%       | +0.05% |
+/// | 4      | +1.80%     | +0.42%    | +0.04%  | +0.29%       | +0.05% |
+/// | 8      | +1.99%     | +0.20%    | +0.04%  | +0.29%       | +0.05% |
+/// | 32     | +2.07%     | +0.33%    | +0.04%  | +0.29%       | +0.05% |
+/// | frame  | +1.99%     | +0.20%    | +0.04%  | +0.29%       | +0.19% |
 ///
-/// (`noise` and `diagonals` are 0.00% at every window and are left out of the table.) `4` is the
-/// largest window that gives up none of the improvement - it cuts the scene edge's penalty by a
-/// factor of 4.7 at 192x160 and from +30.04% to +2.13% at 128x96 - while regressing no other
-/// frame against the frame-wide accumulation. Shorter windows start trading it back: `2` costs
-/// `quadrants` +1.49% and `1`, which remembers only the last probe, costs `test_pattern` +3.12%,
-/// because a single probe is too noisy an estimate to rank a size on.
+/// (`diagonals` is 0.00% at every window and is left out of the table.) This was `4` while
+/// [`estimate_rate`] charged a level `2 + 2 * bit_length(level)`; re-derived against the rate
+/// model that replaced it, the surface is both far flatter - no window is past +13% where the
+/// old one reached +44% - and differently shaped, and `2` now has the lowest worst case of any
+/// window at either frame size (+1.62% against `4`'s +1.80%). It is the shortest window that
+/// still averages more than one probe: `1` remembers only the last probe, which is too noisy an
+/// estimate to rank a size on and costs `smooth` +12.97%.
 ///
-/// The correction exists to be cheap and stays so. The decay is one multiply and one divide per
-/// accumulator, paid only on the sampled trials, and it evaluates 155,392 transform-type
-/// candidates against the frame-wide accumulation's 155,143 - 0.16% more, against the exhaustive
-/// search's 700,004. In wall-clock terms, from the minimum of five interleaved rounds per window
-/// in `measure_type_gain_memory_cost` over the six frames at six quantizers, 0.971 s at `4`
-/// against 0.954 s un-decayed: +1.8%, which is the extra candidates plus the arithmetic, and
-/// which the whole window sweep spans (0.954-0.975 s) from end to end.
-pub(super) const TYPE_GAIN_MEMORY: usize = 4;
+/// The correction exists to be cheap and stays so: the decay is one multiply and one divide per
+/// accumulator, paid only on the sampled trials, and the whole window sweep spans 0.5% of the
+/// candidate count from `1` to `frame`.
+pub(super) const TYPE_GAIN_MEMORY: usize = 2;
 
 /// Transform sizes [`FrameEncoder::type_gain`] accumulates over: `TX_4X4` through `TX_32X32`,
 /// which is every size [`super::transform::forward_transform`] implements.
@@ -1451,10 +1457,46 @@ impl<'a> FrameEncoder<'a> {
 /// `Max_Tx_Size_Rect` cap the decoder's `read_tx_size` applies (`TX_64X64`).
 const MAX_TX_WIDTH: usize = 64;
 
-/// Bits a coefficient block is estimated to cost, as the `all_zero` flag plus, when the block is
-/// coded, the end-of-block position and an exp-Golomb-shaped magnitude and sign per coefficient.
-/// Only the relative ordering of candidates matters, so this stays a closed form over the
-/// quantized levels rather than a trial arithmetic encode.
+/// Bits §5.11.39's coefficient coder spends on one quantized magnitude, counted as the symbols
+/// and raw bits it actually writes.
+///
+/// `coeff_base` (or `coeff_base_eob` at the last position) carries the level up to
+/// [`NUM_BASE_LEVELS`]; above that, up to four `coeff_br` symbols carry three more each, so the
+/// cost grows *linearly* with the level through the base range; only past
+/// [`COEFF_BASE_PLUS_RANGE`] does it flatten to the exp-Golomb tail's `2 * bit_length(x) - 1`
+/// raw bits. A nonzero level also carries a sign.
+///
+/// This shape is the whole point of the function. A closed `2 + 2 * bit_length(level)` charge is
+/// logarithmic everywhere and prices a doubled level at two more bits at every magnitude, which
+/// is only true in the golomb tail. §7.12.3's `Dq_Denom` makes every `TX_32X32` level twice a
+/// smaller transform's for the same reconstruction, so a logarithmic charge under-prices a
+/// 32x32 trial by the whole width of the base range - which is where most coefficients on
+/// ordinary content sit - and the size search buys 32x32's lower distortion with bits the
+/// estimate never charged it for.
+fn coefficient_bits(level: u32) -> i64 {
+    // The base symbol is written for every coefficient below the end-of-block, zero or not.
+    let mut bits = SYMBOL_BITS;
+    if level == 0 {
+        return bits;
+    }
+    bits += 1; // sign
+    if level as i32 > NUM_BASE_LEVELS {
+        // `rem = level - 3` in steps of 3, at most four symbols, exactly as `code_coefficients`
+        // writes them.
+        let remainder = level - NUM_BASE_LEVELS as u32 - 1;
+        bits += SYMBOL_BITS * i64::from((remainder / 3 + 1).min(4));
+    }
+    if level as i32 > COEFF_BASE_PLUS_RANGE {
+        let tail = level - COEFF_BASE_PLUS_RANGE as u32;
+        bits += 2 * i64::from(bit_length(tail)) - 1;
+    }
+    bits
+}
+
+/// Bits a coefficient block is estimated to cost: the `all_zero` symbol plus, when the block is
+/// coded, the end-of-block position and [`coefficient_bits`] per coefficient up to it. Only the
+/// relative ordering of candidates matters, so this stays a closed form over the quantized levels
+/// rather than a trial arithmetic encode.
 fn estimate_rate(levels: &[i32], scan: &[usize]) -> i64 {
     let mut eob = 0usize;
     for (index, &position) in scan.iter().enumerate() {
@@ -1463,16 +1505,16 @@ fn estimate_rate(levels: &[i32], scan: &[usize]) -> i64 {
         }
     }
     if eob == 0 {
-        return 1;
+        return ZERO_BLOCK_BITS;
     }
-    let mut bits = 1 + 2 * i64::from(bit_length(eob as u32));
+    // `eob_pt` is one symbol; `eob_extra` above it is one symbol and `eobPt - 3` raw bits.
+    let eobpt = eobpt_from_eob(eob);
+    let mut bits = ZERO_BLOCK_BITS + SYMBOL_BITS;
+    if eobpt >= 3 {
+        bits += SYMBOL_BITS + eobpt as i64 - 3;
+    }
     for &position in scan.iter().take(eob) {
-        let level = levels[position].unsigned_abs();
-        bits += if level == 0 {
-            1
-        } else {
-            2 + 2 * i64::from(bit_length(level))
-        };
+        bits += coefficient_bits(levels[position].unsigned_abs());
     }
     bits
 }
