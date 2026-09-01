@@ -738,11 +738,14 @@ pub fn reconstruct_inter_pu_weighted(
         bit_depth_luma: params.bit_depth_luma,
         bit_depth_chroma: params.bit_depth_chroma,
     };
-    let InterPrediction { luma, cb, cr } =
+    let InterPrediction { luma, cb, cr } = {
+        let _profile = prof_scope(ProfStage::InterPredFilter);
         crate::hevc::engine::inter_pred::predict_inter_pu_weighted(&lp0, &lp1, &geom, weights)
-            .map_err(ReconError::InterPred)?;
+            .map_err(ReconError::InterPred)?
+    };
 
     // §8.6.5 / §8.4.4.1: recSamples = Clip1( predSamples + resSamples ).
+    let _write_profile = prof_scope(ProfStage::InterPredWrite);
     write_inter_plane(
         pic,
         Plane::Luma,
@@ -767,6 +770,21 @@ pub fn reconstruct_inter_pu_weighted(
 
 /// Write one motion-compensated prediction plane plus its optional
 /// residual into `pic` with the §8.4.4.1 clip.
+///
+/// This is `recSamples = Clip1( predSamples + resSamples )` and nothing else,
+/// but issue #280 measured it at 10% of decode proper on a 1080p decode — a
+/// third of everything the `inter_pred` stage was charged with, and a third
+/// that no vector kernel touches. What cost that was the shape of the loop
+/// rather than the arithmetic: [`Picture::set_sample`] re-resolved the plane
+/// and re-derived its stride for every sample, and the `Option` residual was
+/// branched on per sample, so each output was a call, a match and a bounds
+/// check around one add and one clamp.
+///
+/// The plane and its stride are now resolved once per prediction unit and the
+/// residual branch hoisted out of the row loop, leaving two row slices of
+/// known equal length that LLVM vectorizes on its own. The arithmetic is
+/// unchanged and still in `i32` in the same order, so every sample written is
+/// the one the previous loop wrote.
 #[allow(clippy::too_many_arguments)]
 fn write_inter_plane(
     pic: &mut Picture,
@@ -778,12 +796,27 @@ fn write_inter_plane(
     pred: &[i32],
     residual: Option<&[i32]>,
 ) {
-    let bit_depth = pic.bit_depth(plane);
+    if w == 0 || h == 0 {
+        return;
+    }
+    let max = clip1(i32::MAX, pic.bit_depth(plane));
+    let (buf, stride) = pic.plane_mut(plane);
     for y in 0..h {
-        for x in 0..w {
-            let p = pred[y * w + x];
-            let r = residual.map_or(0, |r| r[y * w + x]);
-            pic.set_sample(plane, x0 + x, y0 + y, clip1(p + r, bit_depth));
+        let row = (y0 + y) * stride + x0;
+        let dst = &mut buf[row..row + w];
+        let pred_row = &pred[y * w..y * w + w];
+        match residual {
+            Some(residual) => {
+                let res_row = &residual[y * w..y * w + w];
+                for ((dst, pred), res) in dst.iter_mut().zip(pred_row).zip(res_row) {
+                    *dst = (*pred + *res).clamp(0, max);
+                }
+            }
+            None => {
+                for (dst, pred) in dst.iter_mut().zip(pred_row) {
+                    *dst = (*pred).clamp(0, max);
+                }
+            }
         }
     }
 }

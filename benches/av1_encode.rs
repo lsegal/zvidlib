@@ -268,7 +268,8 @@ fn report_stage_coverage(_: &mut Criterion) {
          # derivation are the encoder's SIMD dispatch families, so the symbol and bitstream arms\n\
          # are expected to read flat across instruction sets. That is the measured result, not a\n\
          # broken bench: with the contexts vectorized, what is left of coefficient coding is the\n\
-         # serial range coder, and a profile of the lossless tile encode puts 64% of it there."
+         # serial range coder, which took a serial optimization — a byte-wide carry-resolved sink\n\
+         # and unrolled literal-bit runs — rather than another dispatch family."
     );
 }
 

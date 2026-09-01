@@ -5,7 +5,9 @@ use crate::{
     ErrorKind, Limits, Result,
 };
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{FromSample, SampleFormat, SizedSample, Stream, StreamConfig};
+use cpal::{
+    FromSample, SampleFormat, SizedSample, Stream, StreamConfig, SupportedStreamConfigRange,
+};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -128,20 +130,28 @@ impl DefaultAudioOutput {
         let device = cpal::default_host()
             .default_output_device()
             .ok_or_else(|| unsupported("no default native audio output device is available"))?;
-        let supported = device
-            .supported_output_configs()
-            .map_err(|error| unsupported(format!("cannot query native audio output: {error}")))?
-            .find(|config| {
-                config.channels() == channels
-                    && config.min_sample_rate().0 <= sample_rate
-                    && config.max_sample_rate().0 >= sample_rate
-            })
-            .ok_or_else(|| {
+        let sample_format = select_output_format(
+            device.supported_output_configs().map_err(|error| {
+                unsupported(format!("cannot query native audio output: {error}"))
+            })?,
+            sample_rate,
+            channels,
+        )
+        .map_err(|offered| {
+            if offered.is_empty() {
                 unsupported(format!(
                     "default audio device does not support {sample_rate} Hz with {channels} channels"
                 ))
-            })?;
-        let sample_format = supported.sample_format();
+            } else {
+                let offered: Vec<String> =
+                    offered.iter().map(SampleFormat::to_string).collect();
+                unsupported(format!(
+                    "default audio device supports {sample_rate} Hz with {channels} channels \
+                     only in unsupported sample formats: {}",
+                    offered.join(", ")
+                ))
+            }
+        })?;
         let config = StreamConfig {
             channels,
             sample_rate: cpal::SampleRate(sample_rate),
@@ -156,7 +166,16 @@ impl DefaultAudioOutput {
         let stream = match sample_format {
             SampleFormat::F32 => build_stream::<f32>(&device, &config, &state, &clock, &failure)?,
             SampleFormat::I16 => build_stream::<i16>(&device, &config, &state, &clock, &failure)?,
+            SampleFormat::I32 => build_stream::<i32>(&device, &config, &state, &clock, &failure)?,
+            SampleFormat::F64 => build_stream::<f64>(&device, &config, &state, &clock, &failure)?,
             SampleFormat::U16 => build_stream::<u16>(&device, &config, &state, &clock, &failure)?,
+            SampleFormat::I8 => build_stream::<i8>(&device, &config, &state, &clock, &failure)?,
+            SampleFormat::U8 => build_stream::<u8>(&device, &config, &state, &clock, &failure)?,
+            SampleFormat::I64 => build_stream::<i64>(&device, &config, &state, &clock, &failure)?,
+            SampleFormat::U32 => build_stream::<u32>(&device, &config, &state, &clock, &failure)?,
+            SampleFormat::U64 => build_stream::<u64>(&device, &config, &state, &clock, &failure)?,
+            // `SampleFormat` is `#[non_exhaustive]`; `select_output_format` only ever
+            // returns a format listed above, so this arm is for a future `cpal` variant.
             other => {
                 return Err(unsupported(format!(
                     "default audio device sample format {other} is unsupported"
@@ -274,6 +293,57 @@ where
         .map_err(|error| unsupported(format!("cannot open native audio output: {error}")))
 }
 
+/// Output sample formats the PCM writer can convert an `f32` sample into, most
+/// preferred first.
+///
+/// `f32` leads because that is what the decoder already holds, so the device
+/// takes the samples unconverted; the integer formats follow in descending
+/// precision. Every format `cpal` can name is here, so a device is only turned
+/// away for its rate or channel count.
+const OUTPUT_SAMPLE_FORMATS: [SampleFormat; 10] = [
+    SampleFormat::F32,
+    SampleFormat::I16,
+    SampleFormat::I32,
+    SampleFormat::F64,
+    SampleFormat::U16,
+    SampleFormat::I8,
+    SampleFormat::U8,
+    SampleFormat::I64,
+    SampleFormat::U32,
+    SampleFormat::U64,
+];
+
+/// Picks the sample format to open the default device in.
+///
+/// A device advertises one configuration per sample format it accepts, in an
+/// order that is the platform's business and not a preference: Windows WASAPI
+/// can lead with `u8` on a device that also offers `f32`. So the configurations
+/// matching the media's rate and channel count are ranked by
+/// [`OUTPUT_SAMPLE_FORMATS`] rather than taken first-come.
+///
+/// The error carries the formats that did match the rate and channel count but
+/// that the writer cannot convert into, which is empty when nothing matched at
+/// all.
+fn select_output_format(
+    supported: impl IntoIterator<Item = SupportedStreamConfigRange>,
+    sample_rate: u32,
+    channels: u16,
+) -> std::result::Result<SampleFormat, Vec<SampleFormat>> {
+    let offered: Vec<SampleFormat> = supported
+        .into_iter()
+        .filter(|config| {
+            config.channels() == channels
+                && config.min_sample_rate().0 <= sample_rate
+                && config.max_sample_rate().0 >= sample_rate
+        })
+        .map(|config| config.sample_format())
+        .collect();
+    OUTPUT_SAMPLE_FORMATS
+        .into_iter()
+        .find(|format| offered.contains(format))
+        .ok_or(offered)
+}
+
 fn unsupported(message: impl Into<String>) -> Error {
     Error::new(ErrorKind::Unsupported, message)
 }
@@ -321,6 +391,63 @@ mod tests {
             decoder.decode(&packets[0], &cancellation).unwrap().range,
             packets[0].decoded_range
         );
+    }
+
+    fn config_range(
+        channels: u16,
+        min_rate: u32,
+        max_rate: u32,
+        format: SampleFormat,
+    ) -> SupportedStreamConfigRange {
+        SupportedStreamConfigRange::new(
+            channels,
+            cpal::SampleRate(min_rate),
+            cpal::SampleRate(max_rate),
+            cpal::SupportedBufferSize::Unknown,
+            format,
+        )
+    }
+
+    #[test]
+    fn output_format_ranks_by_preference_rather_than_by_the_device_enumeration_order() {
+        // A Windows device that lists `u8` first is still opened in `f32`;
+        // taking the first matching configuration turned that device away.
+        let supported = vec![
+            config_range(2, 48_000, 48_000, SampleFormat::U8),
+            config_range(2, 44_100, 48_000, SampleFormat::I16),
+            config_range(2, 8_000, 192_000, SampleFormat::F32),
+        ];
+        assert_eq!(
+            select_output_format(supported, 48_000, 2),
+            Ok(SampleFormat::F32)
+        );
+    }
+
+    #[test]
+    fn output_format_accepts_a_device_that_offers_only_one_narrow_format() {
+        for format in OUTPUT_SAMPLE_FORMATS {
+            let supported = vec![config_range(2, 48_000, 48_000, format)];
+            assert_eq!(select_output_format(supported, 48_000, 2), Ok(format));
+        }
+    }
+
+    #[test]
+    fn output_format_ignores_configs_with_the_wrong_rate_or_channel_count() {
+        let supported = vec![
+            config_range(1, 8_000, 192_000, SampleFormat::F32),
+            config_range(2, 8_000, 44_100, SampleFormat::F64),
+            config_range(2, 48_000, 48_000, SampleFormat::I16),
+        ];
+        assert_eq!(
+            select_output_format(supported, 48_000, 2),
+            Ok(SampleFormat::I16)
+        );
+    }
+
+    #[test]
+    fn output_format_reports_no_offered_format_when_the_rate_is_unavailable() {
+        let supported = vec![config_range(2, 8_000, 44_100, SampleFormat::F32)];
+        assert_eq!(select_output_format(supported, 48_000, 2), Err(Vec::new()));
     }
 
     fn block_on<F: Future>(future: F) -> F::Output {
