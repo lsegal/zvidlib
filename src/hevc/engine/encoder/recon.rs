@@ -1380,50 +1380,55 @@ mod tests {
         crate::simd::set_override(None);
     }
 
-    #[test]
-    fn an_asymmetric_partitions_chroma_half_reconstructs_inside_the_plane() {
-        // §7.3.8.8 transform blocks bottom out at 4x4, but the 4:2:0 chroma
-        // half of the 16x4 and 16x12 asymmetric partitions the mode search can
-        // pick measures 8x2 and 8x6 — neither a whole number of 4x4 blocks.
-        // The residual coding has to clip its last block to the partition
-        // instead of running off the end of the plane.
-        let src = source(0);
-        let (width, height) = (W, H);
-        let partition = |x, y, w, h| PartitionDecision {
-            x,
-            y,
-            w,
-            h,
-            mv_x: 0,
-            mv_y: 0,
-            sad: 0,
-            satd: 0,
-            bit_cost: 0,
-            rd_cost: 0,
-        };
+    /// A whole-picture decision whose every CTB is one coding unit split into
+    /// `shapes`, given as `(dx, dy, w, h)` offsets inside the CTB, all with a
+    /// zero motion vector.
+    fn decision_of(shapes: &[(usize, usize, usize, usize)]) -> PictureDecision {
         let mut blocks = Vec::new();
-        for y0 in (0..height).step_by(CTB) {
-            for x0 in (0..width).step_by(CTB) {
+        for y0 in (0..H).step_by(CTB) {
+            for x0 in (0..W).step_by(CTB) {
                 blocks.push(BlockDecision {
                     x: x0,
                     y: y0,
                     size: CTB,
-                    // 16x4 over 16x12, so both the two-sample-tall chroma half
-                    // and the six-sample-tall one are coded.
-                    partitions: vec![
-                        partition(x0, y0, CTB, 4),
-                        partition(x0, y0 + 4, CTB, CTB - 4),
-                    ],
+                    partitions: shapes
+                        .iter()
+                        .map(|&(dx, dy, w, h)| PartitionDecision {
+                            x: x0 + dx,
+                            y: y0 + dy,
+                            w,
+                            h,
+                            mv_x: 0,
+                            mv_y: 0,
+                            sad: 0,
+                            satd: 0,
+                            bit_cost: 0,
+                            rd_cost: 0,
+                        })
+                        .collect(),
                     rd_cost: 0,
                     pcm_cost: u64::MAX,
                 });
             }
         }
-        let decision = PictureDecision {
+        PictureDecision {
             blocks,
             rd_cost: 0,
             pcm_blocks: 0,
-        };
+        }
+    }
+
+    /// The 16x4-over-16x12 split, whose 4:2:0 chroma halves are 8x2 and 8x6 —
+    /// neither a whole number of the 4x4 blocks §7.3.8.8 bottoms out at.
+    const ASYMMETRIC: &[(usize, usize, usize, usize)] = &[(0, 0, CTB, 4), (0, 4, CTB, CTB - 4)];
+
+    #[test]
+    fn an_asymmetric_partitions_chroma_half_reconstructs_inside_the_plane() {
+        // The residual is coded over the coding unit's own transform tree, so
+        // an 8x2 chroma prediction partition never becomes a transform block
+        // and nothing indexes past the end of the chroma plane.
+        let src = source(0);
+        let decision = decision_of(ASYMMETRIC);
         let cfg = ReconConfig {
             quantized_residual: true,
             qp: 32,
@@ -1435,15 +1440,52 @@ mod tests {
         assert_eq!(expected.y.len(), src.0.len());
         assert_eq!(expected.cb.len(), src.1.len());
         assert_eq!(expected.cr.len(), src.2.len());
-        // The clipped blocks go through the same vector kernel as the whole
-        // ones, over a partial run, so they are pinned across instruction sets
-        // too.
+        // Every transform block is now a whole one, but the add-and-clip still
+        // goes through the vector kernel, so the result is pinned across
+        // instruction sets.
         for isa in crate::simd::available() {
             crate::simd::set_override(Some(isa));
             let lossy = reconstruct_picture(planes(&src), None, &decision, cfg);
             assert_eq!(lossy, expected, "{}", isa.name());
         }
         crate::simd::set_override(None);
+    }
+
+    #[test]
+    fn the_transform_tree_is_the_coding_units_however_the_prediction_is_partitioned() {
+        // §7.3.8.8 hangs the transform tree off the coding unit, so a 16x16 CU
+        // codes one 16x16 luma and two 8x8 chroma transform blocks no matter
+        // how its prediction is split. These partitionings all predict the
+        // same samples — every motion vector is zero and there is no reference
+        // — so if the residual is coded over the CU they must reconstruct
+        // identically. Tiling each *partition* instead did not: the asymmetric
+        // shapes fell to 8x8 and 4x4 luma blocks, and their chroma halves to
+        // zero-padded partial ones.
+        let src = source(0);
+        let cfg = ReconConfig {
+            quantized_residual: true,
+            qp: 32,
+            ..ReconConfig::default()
+        };
+        let whole = reconstruct_picture(planes(&src), None, &decision_of(&[(0, 0, CTB, CTB)]), cfg);
+        for shapes in [
+            ASYMMETRIC,
+            &[(0, 0, CTB, CTB - 4), (0, CTB - 4, CTB, 4)],
+            &[(0, 0, 4, CTB), (4, 0, CTB - 4, CTB)],
+            &[(0, 0, CTB / 2, CTB), (CTB / 2, 0, CTB / 2, CTB)],
+            &[
+                (0, 0, CTB / 2, CTB / 2),
+                (CTB / 2, 0, CTB / 2, CTB / 2),
+                (0, CTB / 2, CTB / 2, CTB / 2),
+                (CTB / 2, CTB / 2, CTB / 2, CTB / 2),
+            ],
+        ] {
+            let split = reconstruct_picture(planes(&src), None, &decision_of(shapes), cfg);
+            assert_eq!(
+                split, whole,
+                "{shapes:?} did not reconstruct through the coding unit's transform tree"
+            );
+        }
     }
 
     #[test]
@@ -1576,10 +1618,21 @@ mod tests {
     }
 
     #[test]
-    fn partitions_tile_into_the_largest_legal_square_transform_block() {
+    fn coding_blocks_tile_into_the_largest_legal_square_transform_block() {
+        // Every coding block this encoder codes, and every 4:2:0 chroma half
+        // of one, is a whole number of its own transform blocks.
+        for size in [8usize, 16, 32, 64] {
+            let n_tbs = transform_block_size(size, size);
+            assert_eq!(size % n_tbs, 0, "luma {size}");
+            let c_size = size / 2;
+            assert_eq!(
+                c_size % transform_block_size(c_size, c_size),
+                0,
+                "chroma {c_size}"
+            );
+        }
         assert_eq!(transform_block_size(16, 16), 16);
-        assert_eq!(transform_block_size(16, 8), 8);
-        assert_eq!(transform_block_size(8, 4), 4);
+        assert_eq!(transform_block_size(8, 8), 8);
         // Below the 4x4 minimum and above the 32x32 maximum both clamp.
         assert_eq!(transform_block_size(2, 2), 4);
         assert_eq!(transform_block_size(64, 64), 32);
