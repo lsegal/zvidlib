@@ -1366,6 +1366,12 @@ mod nonlossless_tests {
     /// looks like: it scales with the trial's block count, so inflating it favours the size with
     /// more blocks. This prints the penalty against the unsampled estimator as the remembered
     /// correction is shrunk from full (`16`) to none (`0`).
+    ///
+    /// The exhaustive search is printed alongside because the unsampled estimator is not a strict
+    /// upper bound on quality: a trial that probes is corrected in full by its own measurement,
+    /// so `16` is the only trust the interval-1 arm can express and the reference carries the
+    /// over-large correction on every trial. Comparing both arms against the search that takes no
+    /// shortcut at all separates what the shrinkage is worth from what the sampling costs.
     #[test]
     #[ignore = "measurement sweep, not an assertion"]
     fn measure_type_gain_trust() {
@@ -1373,7 +1379,7 @@ mod nonlossless_tests {
             let mut frames = content_frames(width as u32, height as u32);
             frames.push(("test_pattern", test_pattern(width as u32, height as u32)));
             println!("size,{width}x{height}");
-            println!("frame,qindex,trust,penalty_percent,bytes,candidates");
+            println!("frame,qindex,trust,penalty_percent,exhaustive_percent,bytes,candidates");
             for (name, pixels) in &frames {
                 for qindex in [1_u8, 8, 32, 80, 160, 200] {
                     let ac = i64::from(crate::av1_intra::get_ac_quant(qindex));
@@ -1390,12 +1396,29 @@ mod nonlossless_tests {
                             report.candidates_evaluated,
                         )
                     };
+                    let exhaustive = {
+                        let report = tile::FrameEncoder::new(pixels, width, height, qindex)
+                            .without_search_shortcuts()
+                            .encode_with_report();
+                        sse_against(&report, pixels, width, height)
+                            + lambda * report.tile.len() as i64 * 8
+                    };
                     let (unsampled, _, _) = cost(1, 16);
+                    let against =
+                        |cost: i64, reference: i64| cost as f64 / reference as f64 * 100.0 - 100.0;
+                    println!(
+                        "{name},{qindex},unsampled,{:+.2},{:+.2},,",
+                        0.0,
+                        against(unsampled, exhaustive)
+                    );
                     for trust in [0_i64, 1, 2, 3, 4, 5, 6, 8, 12, 16] {
                         let (sampled, bytes, candidates) =
                             cost(tile::TYPE_GAIN_SAMPLE_INTERVAL, trust);
-                        let penalty = sampled as f64 / unsampled as f64 * 100.0 - 100.0;
-                        println!("{name},{qindex},{trust},{penalty:+.2},{bytes},{candidates}");
+                        let penalty = against(sampled, unsampled);
+                        let versus = against(sampled, exhaustive);
+                        println!(
+                            "{name},{qindex},{trust},{penalty:+.2},{versus:+.2},{bytes},{candidates}"
+                        );
                     }
                 }
             }
