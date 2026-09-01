@@ -111,6 +111,7 @@ pub fn available() -> Vec<SimdIsa> {
 /// | `av1_simd` | AV1 transforms and in-loop filters |
 /// | `av1_mc` | AV1 motion compensation (the level [`crate::av1_mc::McContext::new`] picks) |
 /// | `av1_intra_pred` | AV1 intra prediction and residual reconstruction |
+/// | `av1_coeff_ctx` | AV1 encoder-side coefficient context derivation (§8.3.2) |
 /// | `hevc_prediction_filters` | HEVC inter/intra prediction and in-loop filters |
 /// | `hevc_transforms` | HEVC inverse transforms and dequantization |
 /// | `hevc_rdcost` | HEVC encoder-side distortion metrics |
@@ -131,6 +132,7 @@ pub fn active_by_site() -> Vec<(&'static str, SimdIsa)> {
             "av1_intra_pred",
             from_intra_simd(crate::av1_intra_pred::av1_intra_simd()),
         ),
+        ("av1_coeff_ctx", crate::av1_simd::coeff::active_isa()),
     ];
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -357,6 +359,9 @@ mod tests {
         // AV1 intra prediction, whose `OnceLock` detection may already have
         // resolved to a vector backend in an earlier test.
         assert_eq!(av1_intra_simd(), Av1IntraSimd::Scalar);
+        // AV1 encoder-side coefficient context derivation, whose `OnceLock`
+        // detection may likewise have already resolved to a vector backend.
+        assert_eq!(crate::av1_simd::coeff::active_isa(), SimdIsa::Scalar);
         // AV1 motion compensation, through the level `McContext::new` picks.
         assert_eq!(default_level(), SimdLevel::Scalar);
         assert_eq!(McContext::new().level(), SimdLevel::Scalar);
@@ -382,6 +387,7 @@ mod tests {
             "av1_simd",
             "av1_mc",
             "av1_intra_pred",
+            "av1_coeff_ctx",
             "hevc_prediction_filters",
             "hevc_transforms",
             "hevc_rdcost",
@@ -440,6 +446,11 @@ mod tests {
         assert_eq!(crate::av1_simd::active_isa(), detected());
         // AV1 intra prediction.
         assert_eq!(av1_intra_simd() != Av1IntraSimd::Scalar, vectorized);
+        // AV1 encoder-side coefficient context derivation.
+        assert_eq!(
+            crate::av1_simd::coeff::active_isa() != SimdIsa::Scalar,
+            vectorized
+        );
         // AV1 motion compensation.
         assert_eq!(
             default_level() != crate::av1_mc::SimdLevel::Scalar,
@@ -480,6 +491,7 @@ mod tests {
             "av1_simd",
             "av1_mc",
             "av1_intra_pred",
+            "av1_coeff_ctx",
             "hevc_prediction_filters",
             "hevc_transforms",
             "hevc_rdcost",
