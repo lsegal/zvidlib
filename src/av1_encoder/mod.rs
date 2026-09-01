@@ -1338,6 +1338,79 @@ mod nonlossless_tests {
         }
     }
 
+
+    /// How far the smallest transform and the per-frame rate-distortion ceilings survive past the
+    /// `16` the coverage assertions stop at (#329).
+    ///
+    /// `the_smallest_transform_is_selected_at_every_sampling_interval` holds `TX_4X4` across nine
+    /// frame-and-size pairs at every interval from `2` to `16`, and it passes at `16` precisely
+    /// because it is phase-independent - so it does not, on its own, say where the interval's
+    /// upper bound is. This carries both of the properties that could set one past that stop:
+    /// the coverage sweep out to `64`, and the per-frame penalty
+    /// `the_type_gain_sampling_interval_holds_on_content_it_was_not_tuned_on` sets its ceilings
+    /// from, over the same intervals. Whichever fails first is the bound.
+    #[test]
+    #[ignore = "measurement sweep, not an assertion"]
+    fn measure_type_gain_intervals_past_sixteen() {
+        let quantizers = [1_u8, 8, 32, 80, 160, 200];
+        let intervals = [2_usize, 4, 8, 12, 16, 20, 24, 32, 48, 64];
+
+        println!("size,frame,interval,selects_tx4x4,candidates");
+        for (width, height) in [(96_usize, 80_usize), (128, 96), (192, 160), (640, 352)] {
+            for (name, pixels) in content_frames(width as u32, height as u32) {
+                // The same nine pairs the coverage assertion runs, so the two columns compare.
+                let covered = match name {
+                    "smooth" => true,
+                    "bands" => width < 640,
+                    "quadrants" => (97..640).contains(&width),
+                    _ => false,
+                };
+                if !covered {
+                    continue;
+                }
+                for interval in intervals {
+                    let selected = quantizers.into_iter().any(|qindex| {
+                        tile::FrameEncoder::new(&pixels, width, height, qindex)
+                            .with_type_gain_interval(interval)
+                            .encode_with_report()
+                            .trace
+                            .iter()
+                            .any(|&(size, _)| size == 4)
+                    });
+                    let candidates = tile::FrameEncoder::new(&pixels, width, height, 32)
+                        .with_type_gain_interval(interval)
+                        .encode_with_report()
+                        .candidates_evaluated;
+                    println!("{width}x{height},{name},{interval},{selected},{candidates}");
+                }
+            }
+        }
+
+        println!("size,frame,qindex,interval,penalty_percent");
+        for (width, height) in [(128_usize, 96_usize), (192, 160)] {
+            let mut frames = content_frames(width as u32, height as u32);
+            frames.push(("test_pattern", test_pattern(width as u32, height as u32)));
+            for (name, pixels) in &frames {
+                for qindex in quantizers {
+                    let ac = i64::from(crate::av1_intra::get_ac_quant(qindex));
+                    let lambda = (ac * ac / 256).max(1);
+                    let cost = |interval: usize| {
+                        let report = tile::FrameEncoder::new(pixels, width, height, qindex)
+                            .with_type_gain_interval(interval)
+                            .encode_with_report();
+                        sse_against(&report, pixels, width, height)
+                            + lambda * report.tile.len() as i64 * 8
+                    };
+                    let unsampled = cost(1);
+                    for interval in intervals {
+                        let penalty = cost(interval) as f64 / unsampled as f64 * 100.0 - 100.0;
+                        println!("{width}x{height},{name},{qindex},{interval},{penalty:+.3}");
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     #[ignore = "measurement sweep, not an assertion"]
     fn measure_type_gain_sampling_cost() {
