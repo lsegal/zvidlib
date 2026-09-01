@@ -468,7 +468,7 @@ mistaken for bitstream-writing cost:
 | Group | Stage |
 | --- | --- |
 | `..._rdo_intra` / `..._rdo_inter` | mode search / RDO (`engine::encoder::rdo`), without and with a reference picture |
-| `..._reconstruct` | encode-side reconstruction (predict + add residual per coded block) plus the §8.7.2 deblocking filter and §8.7.3 SAO over the reconstructed picture |
+| `..._reconstruct` | encode-side reconstruction (predict + add residual per coded block, through `hevc_recon`) plus the §8.7.3 SAO parameter search and the §8.7.2 deblocking filter and §8.7.3 SAO over the reconstructed picture |
 | `..._pcm_write` | whole-picture access-unit writing: parameter sets, slice header, CABAC-coded CU syntax, PCM samples |
 | `hevc_encode_cabac` | the §9.3.5 arithmetic encoder alone, over a synthetic bin stream |
 | `hevc_encode_bitwriter` | the raw fixed-length / `ue(v)` / `se(v)` writer alone |
@@ -502,16 +502,26 @@ them, which is what keeps its PCM encode exactly lossless.
 
 ### Where the SIMD axis reads flat, and why that is the result
 
-`hevc_rdcost` — the SAD and SATD distortion metrics the mode search calls — is
-the encoder's **only** SIMD dispatch family of its own. The one other group that
-moves with the instruction set is `..._reconstruct`, which reaches the decoder's
-already-vectorized deblocking and SAO kernels rather than an encoder-side one.
-Bitstream writing, CABAC, and the RGBA-to-YUV420 conversion have no vector path
-at all, so their arms are expected to read the same under every instruction set. That is a measured result, not a
-broken benchmark: it says the next encoder-side vectorization targets are
+The encoder has three SIMD dispatch families of its own: `hevc_rdcost`, the SAD
+and SATD distortion metrics the mode search calls; `hevc_fwd_transform_quant`,
+the forward transform's butterfly and the quantization loop; and `hevc_recon`,
+the §8.6.6 reconstruction loop and the encode-side §8.7.3 SAO parameter search.
+`..._reconstruct` reaches `hevc_recon` and, after it, the decoder's
+already-vectorized deblocking and SAO filter kernels. Bitstream writing, CABAC,
+and the RGBA-to-YUV420 conversion have no vector path at all, so their arms are
+expected to read the same under every instruction set. That is a measured result,
+not a broken benchmark: it says the next encoder-side vectorization targets are
 entropy coding and color conversion. It is also why every group asserts through
 `simd::active_by_site()` that the override landed rather than inferring it from
 the clock — see [Reading a null result](#reading-a-null-result).
+
+`..._reconstruct` separated across instruction sets once `hevc_recon` existed.
+Measured on a contended Apple Silicon host, best of three interleaved rounds
+(treat these as a floor, and read the ratio rather than the absolute time):
+640x352 29.2 ms scalar against 11.0 ms NEON, and 1920x1088 121.4 ms scalar
+against 38.9 ms NEON. Before it, the same group read 11.2 ms scalar against
+9.6 ms NEON at 640x352 and did not separate at all at 1080p, because the in-loop
+filter kernels it called were a minority of its cost.
 
 ## Per-stage access to the encoder
 
