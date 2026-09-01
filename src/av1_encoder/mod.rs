@@ -1065,25 +1065,40 @@ mod nonlossless_tests {
                 .collect();
             psnr(pixels, &reconstruction)
         };
+        let sse = |report: &tile::SearchReport, pixels: &[u8]| -> i64 {
+            (0..height)
+                .flat_map(|row| {
+                    report.reconstruction[row * report.coded_width..][..width]
+                        .iter()
+                        .enumerate()
+                        .map(move |(column, &value)| (row * width + column, value))
+                })
+                .map(|(index, value)| {
+                    let error = i64::from(i32::from(pixels[index]) - i32::from(value));
+                    error * error
+                })
+                .sum()
+        };
         println!(
-            "frame,qindex,interval,fast_psnr,exhaustive_psnr,d_psnr,fast_bytes,exh_bytes,growth_pct,candidates"
+            "frame,qindex,interval,fast_psnr,exhaustive_psnr,fast_bytes,exh_bytes,candidates,lambda,fast_rd,exh_rd"
         );
         for (name, pixels) in &frames {
             for qindex in [1_u8, 8, 32, 80, 160, 200] {
+                let ac = i64::from(crate::av1_intra::get_ac_quant(qindex));
+                let lambda = (ac * ac / 256).max(1);
                 let exhaustive = tile::FrameEncoder::new(pixels, width, height, qindex)
                     .without_search_shortcuts()
                     .encode_with_report();
                 let exh_psnr = quality(&exhaustive, pixels);
-                for interval in [1_usize, 2, 4, 8, 12, 16, 24, 32, 64] {
+                let exh_rd = sse(&exhaustive, pixels) + lambda * exhaustive.tile.len() as i64 * 8;
+                for interval in [1_usize, 2, 3, 4, 6, 8, 12, 16, 24, 32, 64] {
                     let fast = tile::FrameEncoder::new(pixels, width, height, qindex)
                         .with_type_gain_interval(interval)
                         .encode_with_report();
-                    let fp = quality(&fast, pixels);
-                    let growth =
-                        fast.tile.len() as f64 / exhaustive.tile.len() as f64 * 100.0 - 100.0;
+                    let fast_rd = sse(&fast, pixels) + lambda * fast.tile.len() as i64 * 8;
                     println!(
-                        "{name},{qindex},{interval},{fp:.4},{exh_psnr:.4},{:+.4},{},{},{growth:+.4},{}",
-                        fp - exh_psnr,
+                        "{name},{qindex},{interval},{:.4},{exh_psnr:.4},{},{},{},{lambda},{fast_rd},{exh_rd}",
+                        quality(&fast, pixels),
                         fast.tile.len(),
                         exhaustive.tile.len(),
                         fast.candidates_evaluated,
@@ -1091,6 +1106,60 @@ mod nonlossless_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    #[ignore = "measurement sweep, not an assertion"]
+    fn measure_type_gain_sampling_cost() {
+        use std::time::Instant;
+        let (width, height) = (192_usize, 160_usize);
+        let mut frames = content_frames(width as u32, height as u32);
+        frames.push(("test_pattern", test_pattern(width as u32, height as u32)));
+        let intervals = [1_usize, 2, 4, 8, 16];
+        let mut best = std::collections::BTreeMap::new();
+        let mut candidates = std::collections::BTreeMap::new();
+        let mut exhaustive_candidates = 0_u64;
+        let mut exhaustive_best = f64::MAX;
+        // Interleaved rounds with the minimum taken per arm: a single pass would attribute this
+        // host's own load to whichever arm happened to run under it.
+        for _ in 0..5 {
+            for interval in intervals {
+                let start = Instant::now();
+                let mut total = 0_u64;
+                for (_, pixels) in &frames {
+                    for qindex in [1_u8, 8, 32, 80, 160, 200] {
+                        let report = tile::FrameEncoder::new(pixels, width, height, qindex)
+                            .with_type_gain_interval(interval)
+                            .encode_with_report();
+                        total += report.candidates_evaluated;
+                    }
+                }
+                let elapsed = start.elapsed().as_secs_f64();
+                let slot = best.entry(interval).or_insert(f64::MAX);
+                *slot = slot.min(elapsed);
+                candidates.insert(interval, total);
+            }
+            let start = Instant::now();
+            let mut total = 0_u64;
+            for (_, pixels) in &frames {
+                for qindex in [1_u8, 8, 32, 80, 160, 200] {
+                    let report = tile::FrameEncoder::new(pixels, width, height, qindex)
+                        .without_search_shortcuts()
+                        .encode_with_report();
+                    total += report.candidates_evaluated;
+                }
+            }
+            exhaustive_best = exhaustive_best.min(start.elapsed().as_secs_f64());
+            exhaustive_candidates = total;
+        }
+        println!("interval,seconds,candidates");
+        for interval in intervals {
+            println!(
+                "{interval},{:.4},{}",
+                best[&interval], candidates[&interval]
+            );
+        }
+        println!("exhaustive,{exhaustive_best:.4},{exhaustive_candidates}");
     }
 
     /// The stated bound on what the search shortcuts cost.
