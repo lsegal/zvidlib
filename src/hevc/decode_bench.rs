@@ -549,9 +549,31 @@ impl HevcStageInputs {
             true,
             Some(&self.sao_boundaries),
         );
+        // Fold only the CTBs the mix switches on, which is what the stage
+        // produced: a `SaoTypeIdx == 0` CTB is returned from before it reads a
+        // sample, so its samples are the input's and folding them would be
+        // folding the picture rather than the stage. It would also cost several
+        // times what the stage does — [`SAO_CTB_MIX`] leaves most of a picture
+        // switched off — and criterion would be timing this fold.
+        let ctb = 1usize << SAO_CTB_LOG2;
+        let ctbs_x = self.width.div_ceil(ctb);
         let mut digest = Digest::new();
-        for plane in [Plane::Luma, Plane::Cb, Plane::Cr] {
-            digest.push_all(filtered.plane(plane));
+        for (i, resolved) in self.sao_ctbs.iter().enumerate() {
+            let (rx, ry) = (i % ctbs_x, i / ctbs_x);
+            for (cidx, plane) in [Plane::Luma, Plane::Cb, Plane::Cr].into_iter().enumerate() {
+                if resolved.components[cidx].sao_type_idx == 0 {
+                    continue;
+                }
+                let step = if cidx == 0 { ctb } else { ctb / 2 };
+                let (pw, ph) = filtered.plane_dims(plane);
+                let (x0, y0) = (rx * step, ry * step);
+                let (w, h) = (step.min(pw - x0), step.min(ph - y0));
+                let samples = filtered.plane(plane);
+                for j in 0..h {
+                    let o = (y0 + j) * pw + x0;
+                    digest.push_samples(&samples[o..o + w]);
+                }
+            }
         }
         digest.finish()
     }
