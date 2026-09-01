@@ -186,6 +186,11 @@ jobs:
           path: baseline/criterion-baseline.json
           retention-days: 90
 
+      # This one is per-run rather than a chain, so it carries the collected
+      # baseline too. A `workflow_dispatch` run deliberately does not become the
+      # stored `main` baseline above, and without a copy here its numbers would
+      # be unrecoverable off the runner - which is exactly what refreshing the
+      # committed table in `benches/README.md` needs from a dispatched run.
       - name: Upload the full benchmark log
         if: github.event_name != 'pull_request'
         uses: actions/upload-artifact@v4
@@ -193,6 +198,7 @@ jobs:
           name: criterion-report-${{ github.run_id }}
           path: |
             bench.log
+            baseline/criterion-baseline.json
             target/criterion/**/new/estimates.json
           retention-days: 30
 
