@@ -953,10 +953,10 @@ mod nonlossless_tests {
     /// These are constants of the format, not of the machine that produced them: regenerate them
     /// only alongside a deliberate change to what the encoder emits, never to make a host pass.
     const FIXED_FRAME_DIGESTS: [(usize, u64); 6] = [
-        (5417, 0x7b83_6e95_6bad_aae1),
-        (4298, 0xa4c4_6a5e_8ef1_57c0),
-        (3022, 0xba87_1a3d_44c1_4f33),
-        (2238, 0xc29d_7d70_a472_3158),
+        (5422, 0x1352_b9db_7d3b_3d4c),
+        (4289, 0xa74c_990b_3340_f8ce),
+        (3005, 0xcd2f_1c69_1785_039e),
+        (2214, 0xc7e0_a641_51f5_70e4),
         (1264, 0xc8cd_fcf5_8882_a86c),
         (752, 0x73f1_c047_f3cf_211f),
     ];
@@ -1569,6 +1569,14 @@ mod nonlossless_tests {
     /// found from - it measured +2.13% there against +9.32% at the larger size - so the larger
     /// one is in the assertion rather than in the `#[ignore]`d sweeps alone, which is what let
     /// that penalty sit unnoticed. The ceilings are the measured penalties with margin.
+    ///
+    /// #278 re-measured the interval against the shrunken estimator and moved it from 2 to 8, and
+    /// the ceilings move with it: `bands` to 4%, from +3.43% at 128x96, and `scene_edge` down to
+    /// 1% from +0.20%, the frame that used to set the loosest ceiling here now setting one of the
+    /// tightest. Every other frame stays at 1% and none of them reaches half of it. That `bands`
+    /// is now the worst frame rather than `scene_edge` is the shrinkage working as intended: what
+    /// is left to pay for is content that changes faster than the sample can follow, not content
+    /// that changes once and is then averaged across.
     #[test]
     fn the_type_gain_sampling_interval_holds_on_content_it_was_not_tuned_on() {
         for (width, height) in [(128_usize, 96_usize), (192, 160)] {
