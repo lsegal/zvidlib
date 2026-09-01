@@ -978,15 +978,36 @@ mod tests {
         }
     }
 
+    /// Smooth, band-limited content: the case blocking artifacts are visible
+    /// in and the §8.7.2.5.3 `d < β` decision actually filters. The noisy
+    /// [`picture`] above is deliberately the opposite case.
+    fn smooth_picture(width: usize, height: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let y = (0..width * height)
+            .map(|i| {
+                let (x, r) = ((i % width) as f64, (i / width) as f64);
+                (110.0 + 60.0 * ((x / 37.0).sin() + (r / 23.0).cos())).clamp(0.0, 255.0) as u8
+            })
+            .collect();
+        let c = |offset: f64| {
+            (0..(width / 2) * (height / 2))
+                .map(|i| {
+                    let (x, r) = ((i % (width / 2)) as f64, (i / (width / 2)) as f64);
+                    (128.0 + 25.0 * ((x + r + offset) / 19.0).sin()).clamp(0.0, 255.0) as u8
+                })
+                .collect()
+        };
+        (y, c(0.0), c(7.0))
+    }
+
     #[test]
     fn the_deblocking_filter_improves_round_trip_psnr() {
         // The gain the changelog records. Both reconstructions come out of the
-        // same coding loop, at the same QP, with the same mode decisions: the
-        // only difference is the §8.7.2 pass over the finished picture, so the
-        // delta is the filter's and nothing else's.
+        // same coding loop at the same QP with the same mode decisions, so the
+        // only difference between them is the §8.7.2 pass over the finished
+        // picture.
         let (width, height) = (64, 48);
-        let (y, cb, cr) = picture(width, height);
-        for qp in [26i32, 32, 37, 44] {
+        let (y, cb, cr) = smooth_picture(width, height);
+        for qp in [20i32, 26, 32, 37, 44, 51] {
             let (_, filtered, _) = write_idr_residual_slice(
                 &y, &cb, &cr, width, height, qp, ModeSearch::Rdo, LoopFilter::Deblock,
             );
@@ -999,8 +1020,35 @@ mod tests {
             );
             let gain = psnr_db(&y, &filtered.y) - psnr_db(&y, &unfiltered.y);
             assert!(
-                gain > 0.0,
-                "qp {qp}: deblocking cost {gain:.3} dB of luma PSNR instead of gaining any"
+                gain > 0.3,
+                "qp {qp}: deblocking moved luma PSNR by only {gain:+.3} dB"
+            );
+        }
+    }
+
+    #[test]
+    fn the_deblocking_filter_does_not_cost_quality_on_noisy_content() {
+        // The §8.7.2.5.3 decision declines to filter an edge whose two sides
+        // are not flat, so on the noise-carrying picture the filter has almost
+        // nothing to do. What it must not do is smear the noise: the gain is
+        // allowed to be negligible, not negative.
+        let (width, height) = (64, 48);
+        let (y, cb, cr) = picture(width, height);
+        let source = [y.clone(), cb.clone(), cr.clone()].concat();
+        for qp in [12i32, 26, 37, 51] {
+            let (_, filtered, _) = write_idr_residual_slice(
+                &y, &cb, &cr, width, height, qp, ModeSearch::Rdo, LoopFilter::Deblock,
+            );
+            let (_, unfiltered, _) = write_idr_residual_slice(
+                &y, &cb, &cr, width, height, qp, ModeSearch::Rdo, LoopFilter::Off,
+            );
+            let whole = |r: &ReconstructedPicture| {
+                psnr_db(&source, &[r.y.clone(), r.cb.clone(), r.cr.clone()].concat())
+            };
+            let gain = whole(&filtered) - whole(&unfiltered);
+            assert!(
+                gain > -0.05,
+                "qp {qp}: deblocking cost {gain:+.3} dB of whole-picture PSNR"
             );
         }
     }
