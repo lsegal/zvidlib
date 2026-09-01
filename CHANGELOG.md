@@ -4,6 +4,35 @@ All notable changes to zvidlib will be documented in this file.
 
 ## Unreleased
 
+- Explain the SSE4.1 `filter_taps` reading that #301 recorded over one long
+  L1-resident buffer and could not account for: 1.1-1.3x on AMD Zen but
+  0.85-0.86x on an Intel Emerald Rapids Xeon Platinum 8573C, on a kernel that
+  reads 1.9-2.0x in the §8.5.3.3.3.2 block path on that same host. The cause is
+  the benchmark's scalar baseline, not the kernel and not the hardware. The
+  crate sets no `-C target-cpu`, so every host runs the same baseline-`x86-64`
+  code and nothing is compiled to AVX-512; what the arm actually compared was
+  two different computations. It passed the compile-time literal
+  `LUMA_FILTER[2]`, and `filter_taps` is `#[inline]`, so the scalar reference
+  inlined into the timing loop with the coefficients known and LLVM folded them:
+  the ±1 taps became `paddd`/`psubd`, the 4 taps `pslld $2`, and — the filter
+  being symmetric — the `-11` and `40` tap pairs were summed before being
+  multiplied, leaving two vector multiplies per four samples instead of eight.
+  The SSE4.1 arm calls the shared instantiation, which cannot be specialized
+  because §8.5.3.3.3 indexes the filter table by a run-time fractional position,
+  so it issues eight `pmulld`. The benchmark now times a second buffer arm with
+  the coefficients hidden from the optimizer, which is the kernel-against-kernel
+  comparison: across four `ubuntu-latest` draws and a `macos-15-intel` one the
+  vector kernels' absolute times are identical between the two arms, and only
+  the scalar baseline moves - by 2.4-2.7x on Zen 3, Zen 4 and an Intel Xeon
+  6973P-C, and not at all on Coffee Lake, whose single shuffle port retires the
+  folded loop's shuffle traffic either way. On the Intel `avx512f` host the
+  SSE4.1 buffer arm reads 0.87x folded and 2.36x opaque. No call shape
+  §8.5.3.3.3 issues can reach the folded form, so the SSE4.1 dispatch is
+  unchanged and the `hevc::engine::simd` table now carries both arms with the
+  cause written down. Re-measurement also moved one recorded number: the Coffee
+  Lake SSE4.1 buffer figure reads 0.92-0.94x today rather than the 1.3x #301
+  recorded, and the table carries the re-measured value.
+
 - Settle the AVX2 §8.5.3.3.4 `combine_weighted` regression that #224 recorded on Intel and could not explain, by measuring it on an Intel core newer than the one that produced it. #224 timed the kernel at 1.4x of scalar in the block path and 2.0-2.2x over an L1-resident buffer on an AMD EPYC-class `ubuntu-latest` runner but 0.93-0.95x and 0.92-0.93x on an Intel Coffee Lake `macos-15-intel` host, kept it dispatched to unconditionally on the strength of those two data points, and left open whether the loss was an Intel property or a Skylake-family one - `vpmulld` throughput changed on Ice Lake, and a Coffee Lake reading cannot tell the two apart. A third host answers it: an Intel Emerald Rapids Xeon Platinum 8573C (family 6 model 207, `sse4_1` + `avx2` + `avx512f`), drawn from the same `ubuntu-latest` pool that also yields the EPYC parts, reads 1.13-1.25x in the block path and 1.5-1.6x over the buffer - the same side of 1.00x as Zen - across four independent runner draws of three best-of-five-interleaved-round runs each. The regression is Skylake-family, not Intel, and the kernel stays dispatched to on every AVX2 host: two of the three microarchitectures measured profit, the third loses a few percent of a kernel that is a small share of §8.5.3.3, and a CPUID split would cost a second dispatch arm to keep bit-exact for one stale core generation. The `hevc::engine::simd` module table now carries three x86_64 columns instead of two vendor columns, with the §8.7.2 deblocking and §8.7.3 SAO rows re-taken on the new host as well (deblock 1.24-1.29x, SAO 4.2-4.5x, both nearer Zen than Coffee Lake), and the dispatch-site comment records the decision and what it now rests on. One row does change side and is called out rather than smoothed over: SSE4.1 `filter_taps` over the long L1-resident buffer reads 0.85x on Emerald Rapids against 1.1-1.3x on Zen and 1.3x on Coffee Lake, but that arm is a microbenchmark of one long run rather than a call shape §8.5.3.3.3 issues, and the same kernel reads 1.9-2.0x in the block path on that host, so no dispatch moves. `every_backend_matches_scalar_*` passes on every backend on the new host. No dispatch, kernel or decoded output changes; this is the measurement and the decision it justifies.
 - The native audio output now picks the sample format it opens the default device in, instead of taking whichever configuration the device enumerated first. `DefaultAudioOutput::open` matched a supported output configuration on channel count and sample rate alone and then built a stream only for `f32`, `i16` or `u16`, so a device whose first matching configuration was any other format was refused outright — which is what `cargo run --example native_gl --features native` hit on Windows, where WASAPI leads with `u8` on a device that also offers `f32` (issue #311). Selection is now ranked: the configurations that match the media's rate and channel count are ordered by a preference list headed by `f32`, the format the decoder already holds so the device takes its samples unconverted, and the writer builds a stream for every sample format `cpal` can name rather than three of them. A device is therefore only turned away for a rate or channel count it does not have, and the error for that case now names the formats it did offer. Nothing changes on a host that was already opening in `f32`.
 
