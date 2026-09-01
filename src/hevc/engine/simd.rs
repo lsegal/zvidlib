@@ -151,7 +151,7 @@
 //! | AMD EPYC 9V74 (Zen 4) | 1.38 ms | 3.38 ms | 1.37-1.39x / 3.26-3.27x |
 //! | Intel Xeon Platinum 8573C (Emerald Rapids) | 1.15-1.18 ms | 3.21-3.26 ms | 0.85x / 2.33-2.36x |
 //! | Intel Xeon 6973P-C (`avx512f`) | 1.01 ms | 2.75 ms | 0.87x / 2.36x |
-//! | Intel i7-8700B (Coffee Lake) | 1.41 ms | 1.42 ms | 0.92-0.94x / 0.93-0.95x |
+//! | Intel i7-8700B (Coffee Lake) | 1.22-1.76 ms | 1.22-1.75 ms | 0.88-1.01x / 0.90-0.98x |
 //!
 //! Folding the coefficients is worth 2.4-2.8x to the scalar loop on Zen and
 //! on the newer Intel server cores, and nothing at all on Coffee Lake, whose
@@ -160,7 +160,12 @@
 //! of the apparent sign flip: the SSE4.1 kernel is not slower on the newer
 //! Intel cores than on the older one — 1.35-1.40 ms on the 8573C against
 //! 1.51 ms on the i7-8700B — the baseline it is divided by is 2.8x faster
-//! there, in a way no §8.5.3.3.3 caller can reproduce. The 8573C itself
+//! there, in a way no §8.5.3.3.3 caller can reproduce. The Coffee Lake row
+//! spans five draws rather than one (#326), which is why its range is the
+//! widest in the table; what matters in it is that its two columns stay equal
+//! draw by draw — across fifteen runs the folded and opaque scalar arms never
+//! differ by more than 0.09 ms, against the 2.0 ms that separates them on
+//! Zen. The 8573C itself
 //! (family 6 model 207) was drawn again for this and reproduces #301's
 //! number exactly: 0.85x on the folded arm across three runs, and 2.33-2.36x
 //! on the opaque one. A Xeon 6973P-C drawn from the same pool reads 0.87x
@@ -181,8 +186,67 @@
 //! #301 gave the Coffee Lake SSE4.1 buffer figure as 1.3x, and a fresh
 //! `macos-15-intel` draw of the same i7-8700B reads 0.92-0.94x across three
 //! runs, with 0.93-0.95x on the opaque arm — consistent with folding buying
-//! that core nothing. The table carries the re-measured pair. Whether the
-//! rest of the Coffee Lake column drifted the same way is issue #326.
+//! that core nothing. The table carries the re-measured pair, widened by the
+//! five-draw re-take below. Whether the rest of that column had drifted the
+//! same way was issue #326, and the next section is the answer.
+//!
+//! # The Coffee Lake column, re-taken
+//!
+//! #301 recorded the Coffee Lake column from one `macos-15-intel` draw, and
+//! #321 found two of the four figures it happened to re-touch disagreeing with
+//! it in both directions. Issue #326 re-took the **whole** column: five
+//! independent `macos-15-intel` draws of the i7-8700B (family 6, `Intel(R)
+//! Core(TM) i7-8700B CPU @ 3.20GHz`), three runs of `simd_inter_pred_benchmark`
+//! and `in_loop::tests::bench_in_loop_filters` each, best of five interleaved
+//! rounds per run, on 2026-09-01 under rustc 1.98.0 (88d9e12ae). Fifteen runs
+//! per figure.
+//!
+//! | row | as recorded | re-taken (15 runs, 5 draws) | |
+//! | --- | --- | --- | --- |
+//! | §8.5.3.3.3.2 8-tap luma, SSE4.1 / AVX2 | 1.6-1.7x / 1.8-1.9x | 1.63-1.77x / 1.79-1.94x | confirmed |
+//! | §8.5.3.3.3.3 4-tap chroma, SSE4.1 / AVX2 | 1.5x / 1.4-1.5x | 1.47-1.54x / 1.37-1.56x | confirmed |
+//! | [`filter_taps`] buffer, SSE4.1 / AVX2 | 0.92-0.94x / 1.7-1.8x | 0.88-1.01x / 1.66-1.85x | confirmed |
+//! | [`filter_taps`] buffer opaque, SSE4.1 / AVX2 | 0.93-0.95x / 1.8x | 0.90-0.98x / 1.70-1.84x | confirmed |
+//! | §8.7.2 deblocking, SSE4.1 / AVX2 | 1.3-1.4x / 1.3-1.4x | 1.26-1.36x / 1.29-1.45x | confirmed |
+//! | §8.7.3 SAO, SSE4.1 / AVX2 | 2.7-2.8x / 3.0x | 2.62-3.08x / 2.98-3.36x | confirmed, wider |
+//! | §8.5.3.3.4 [`combine_weighted`] block, SSE4.1 / AVX2 | ~1.0x / 0.93-0.95x | 0.99-1.10x / 0.98-1.05x | **AVX2 moved** |
+//! | §8.5.3.3.4 [`combine_weighted`] buffer, SSE4.1 / AVX2 | 0.75x / 0.92-0.93x | 0.96-1.03x / 1.99-2.18x | **both moved** |
+//!
+//! Thirteen of the sixteen figures reproduced; the two SAO rows and the two
+//! deblocking rows widened by a few hundredths without changing what they say.
+//! Every figure that moved is a [`combine_weighted`] one, and the AVX2 buffer
+//! arm moved by more than a factor of two, from a loss to a win.
+//!
+//! **It is the recorded figures that moved, not the harness or the toolchain.**
+//! The same workflow, on the same day and the same rustc, drew an EPYC 9V74 and
+//! a Xeon Platinum 8573C from the `ubuntu-latest` pool and reproduced their
+//! recorded columns throughout: on the 9V74, SSE4.1 / AVX2 [`filter_taps`] over
+//! a buffer at 1.34-1.35x / 2.49-2.52x and opaque at 3.19-3.23x / 6.05-6.10x,
+//! AVX2 [`combine_weighted`] at 1.37-1.38x block and 2.02x buffer, SAO at
+//! 5.28-5.30x / 7.22-7.28x; on the 8573C, 0.85x / 1.61-1.64x and 2.35-2.36x /
+//! 4.52-4.59x, with AVX2 [`combine_weighted`] at 1.25-1.27x and 1.59-1.60x.
+//! Those are the AMD and Emerald Rapids columns above. A harness or codegen
+//! change would have moved them too.
+//!
+//! What the moved figures say is that Coffee Lake never had an AVX2
+//! [`combine_weighted`] regression to explain. The kernel is untouched since
+//! #127, and over a bare buffer it takes 0.28-0.41 ms against the scalar
+//! loop's 0.57-0.82 ms — eight lanes halving four, exactly as on Zen. The
+//! #224 reading of 0.92-0.93x is not reproducible on that host and is
+//! superseded. In the block path both arms sit at ~1.00x, where the
+//! per-block allocation dominates a kernel this small, which is what that
+//! arm reads on every host.
+//!
+//! **No dispatch decision moves.** AVX2 [`combine_weighted`] was already
+//! dispatched to unconditionally and now is so on a unanimous measurement
+//! instead of a two-of-three one; the SSE4.1 combine is confirmed at ~1.00x
+//! rather than 0.75x, which is still not a reason to write an SSE4.1 kernel,
+//! so its dispatch to the scalar reference stands. Every other kernel keeps
+//! the side of 1.00x it was recorded on. The one conclusion that had to be
+//! corrected is prose, not dispatch: "Coffee Lake reads lower than AMD Zen on
+//! everything bounded by vector width" was true of the figures as recorded and
+//! is not true of the re-taken ones, since AVX2 [`combine_weighted`] over a
+//! buffer now reads level with Zen.
 //!
 //! # The block-path rows are a *small*-block figure
 //!
@@ -216,11 +280,10 @@
 //! [`combine_weighted`] is the kernel that splits by vector *width* rather
 //! than by architecture. At four lanes — SSE4.1 and NEON alike — it only
 //! does what LLVM already does to the scalar loop, and measured at or below
-//! it on every host: below on Coffee Lake on either side of the comparison,
-//! level on Zen on a bare buffer and on Emerald Rapids on both arms — so
-//! both dispatch to the scalar reference. At AVX2's eight lanes it is a
-//! real win on Zen and on Emerald Rapids and is kept, at the small
-//! Skylake-family cost described above. §8.7.2 deblocking is bounded by
+//! it on every host: below on Zen in the block path, level on Zen on a bare
+//! buffer and on both arms on Coffee Lake and Emerald Rapids — so both
+//! dispatch to the scalar reference. At AVX2's eight lanes it is a real win
+//! on all three x86_64 hosts and is kept. §8.7.2 deblocking is bounded by
 //! shape rather than by codegen instead: a four-row edge segment is exactly
 //! one 4-lane vector, so there is no width left for AVX2 to exploit, which
 //! is why it deliberately runs the same 128-bit kernel as SSE4.1 and the two
@@ -892,7 +955,9 @@ pub fn combine_weighted<const N: usize>(
         // timed: on AMD EPYC it ran 0.93-0.95x of scalar in the §8.5.3.3.4
         // block path and level with it on an L1-resident buffer with the
         // allocator kept out of the timing, and on an Intel Coffee Lake
-        // i7-8700B it ran 1.00x in the block path and 0.75x on that buffer.
+        // i7-8700B it runs ~1.00x on both arms (0.99-1.10x block,
+        // 0.96-1.03x buffer over five `macos-15-intel` draws for #326,
+        // superseding the 1.00x / 0.75x #218 recorded from one draw).
         // Vendor was the open question (#218) and it does not move this
         // decision: the four-lane kernel is at or below scalar on both, and
         // reads ~1.00x on both arms on an Emerald Rapids Xeon Platinum
@@ -902,21 +967,20 @@ pub fn combine_weighted<const N: usize>(
         // AVX2 is dispatched to below, unconditionally, and #285 is why
         // that is now a positive result rather than a tolerated cost.
         // Eight lanes is width the four-lane auto-vectorization does not
-        // reach: the kernel measured 1.38x in the block path and 2.0-2.2x
-        // on a bare buffer on EPYC, but 0.93-0.95x and 0.92-0.93x on an
-        // Intel Coffee Lake i7-8700B, whose 256-bit `vpmulld` costs two
-        // uops. That looked like a vendor split until it was measured on a
-        // newer Intel core: on an Emerald Rapids Xeon Platinum 8573C
-        // (family 6 model 207, four independent `ubuntu-latest` draws,
-        // three runs each) it reads 1.13-1.25x in the block path and
-        // 1.5-1.6x on a bare buffer — the same side of 1.00x as Zen,
-        // because `vpmulld` is a single uop from Ice Lake onward. The
-        // regression is Skylake-family, not Intel. So the kernel stays
-        // dispatched to on every AVX2 host: two of the three measured
-        // profit, the third loses a few percent of one kernel that is
-        // itself a small share of §8.5.3.3, and a CPUID split would mean a
-        // second dispatch arm to hold bit-exact for a single stale core
-        // generation. See the module docs for the full per-host table.
+        // reach: the kernel measures 1.38x in the block path and 2.0-2.2x
+        // on a bare buffer on EPYC, and 1.13-1.25x / 1.5-1.6x on an
+        // Emerald Rapids Xeon Platinum 8573C (#285). #218 read 0.93-0.95x
+        // and 0.92-0.93x on an Intel Coffee Lake i7-8700B, and #301 built
+        // a Skylake-family `vpmulld` argument to explain it — 256-bit
+        // `vpmulld` costs two uops there against one from Ice Lake onward.
+        // That reading does not reproduce. Re-measured for #326 over five
+        // `macos-15-intel` draws of the same part, with this kernel
+        // unchanged, it reads ~1.00x in the block path and 2.0-2.2x on a
+        // bare buffer — level with Zen, and the eight-lane kernel simply
+        // halving the four-lane scalar loop. So the kernel stays dispatched
+        // to on every AVX2 host, now because all three measured
+        // microarchitectures profit rather than in spite of one that did
+        // not. See the module docs for the full per-host table.
         #[cfg(target_arch = "x86_64")]
         Isa::Sse41 => combine_weighted_scalar(taps, weights, p, out),
         #[cfg(target_arch = "x86_64")]
