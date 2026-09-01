@@ -220,26 +220,28 @@ pub(crate) enum GainRatio {
 /// an order of magnitude above every other frame, and issue #279 asked whether what was left was
 /// spatial locality in the axis the recency weighting cannot see - probes are visited in
 /// superblock raster order, so a window of four spans a horizontal run of coding blocks. It is
-/// not, and three measurements say so:
+/// not, and three measurements say so.
 ///
-/// - `measure_type_gain_locality` keeps a second accumulator per *superblock column*, whose
-///   most recent probes when a superblock starts are the ones directly above it. Reading that
-///   back instead of the running accumulator measures +9.92% and blending the two +9.32%: the
-///   other axis carries no information the running accumulator was missing. (`scene_edge`'s
-///   boundary is horizontal, so a column's own history crosses it too.)
-/// - `measure_type_gain_probes` steadies the estimate instead, from one probed block per trial
-///   to sixteen. At 192x160 the frame sits between +9.32% and +9.48% throughout, so it is not
-///   the noise in a one-block estimate either - and the extra probes cost 154,300 more
-///   candidates at sixteen.
-/// - `measure_scene_edge_size_choices` names it. The whole penalty is at one quantizer (160),
-///   where 29 of the frame's 156 transform-size decisions differ from the unsampled estimator's
-///   - spread over the entire frame, top region and bottom alike, not gathered at the boundary -
-///   and 27 of the 29 go the same way: the sampled estimator codes the block in *smaller*
-///   transforms. That is what an over-large correction looks like rather than a mislocated one.
-///   The correction is `gain * sum(dct)` over the trial's searched blocks, so it grows with the
-///   trial's block count; inflate the gain and the size with more blocks wins. The frame's cost
-///   moves accordingly - 189 bytes more for 38,624 less squared error at a `lambda` that charges
-///   548,856 for them.
+/// `measure_type_gain_locality` keeps a second accumulator per *superblock column*, whose most
+/// recent probes when a superblock starts are the ones directly above it. Reading that back
+/// instead of the running accumulator measures +9.92% and blending the two +9.32%: the other axis
+/// carries no information the running accumulator was missing. (`scene_edge`'s boundary is
+/// horizontal, so a column's own history crosses it too.)
+///
+/// `measure_type_gain_probes` steadies the estimate instead, from one probed block per trial to
+/// sixteen. At 192x160 the frame sits between +9.32% and +9.48% throughout, so it is not the
+/// noise in a one-block estimate either, and the extra probes cost 154,300 more candidates at
+/// sixteen.
+///
+/// `measure_scene_edge_size_choices` names it. The whole penalty is at one quantizer (160), where
+/// 29 of the frame's 156 transform-size decisions differ from the unsampled estimator's, spread
+/// over the entire frame, top region and bottom alike, rather than gathered at the boundary, and
+/// 27 of the 29 go the same way: the sampled estimator codes the block in *smaller* transforms.
+/// That is what an over-large correction looks like rather than a mislocated one. The correction
+/// is `gain * sum(dct)` over the trial's searched blocks, so it grows with the trial's block
+/// count; inflate the gain and the size with more blocks wins. The frame's cost moves
+/// accordingly: 189 bytes more for 38,624 less squared error at a `lambda` that charges 548,856
+/// for them.
 ///
 /// So the estimate is shrunk toward no correction at all, which is a plain statement of how much
 /// less a ratio measured on other blocks is worth than one measured on this block. Sixteenths of
@@ -267,8 +269,8 @@ pub(crate) enum GainRatio {
 ///
 /// The correction exists to be cheap and stays so. The shrinkage is one multiply and one divide
 /// on the trials that did not probe, and because a smaller correction stops promoting small
-/// transform sizes it evaluates 151,019 transform-type candidates against the un-shrunk 155,392
-/// - 2.8% *fewer*, against the exhaustive search's 700,004. Fewer candidates but slightly more
+/// transform sizes it evaluates 151,019 transform-type candidates against the un-shrunk 155,392,
+/// 2.8% *fewer*, against the exhaustive search's 700,004. Fewer candidates but slightly more
 /// time: from the minimum of five interleaved rounds per arm in `measure_type_gain_trust_cost`
 /// over the six frames at six quantizers, 1.060 s against 1.012 s un-shrunk, +4.7%. The
 /// candidates it stops evaluating are the cheapest ones - a 4x4 or 8x8 transform of a block it
@@ -606,7 +608,10 @@ impl<'a> FrameEncoder<'a> {
     /// test can measure what a noisier or steadier probe is worth.
     #[cfg(test)]
     pub(crate) fn with_type_gain_probes(mut self, probes: usize) -> Self {
-        assert!(probes >= 1, "a trial that probes measures at least one block");
+        assert!(
+            probes >= 1,
+            "a trial that probes measures at least one block"
+        );
         self.type_gain_probes = probes;
         self
     }
@@ -642,7 +647,10 @@ impl<'a> FrameEncoder<'a> {
     /// sweep it. `16` is the un-shrunk correction and `0` no correction.
     #[cfg(test)]
     pub(crate) fn with_type_gain_trust(mut self, trust: i64) -> Self {
-        assert!((0..=TYPE_GAIN_TRUST_ONE).contains(&trust), "shrinkage is a fraction");
+        assert!(
+            (0..=TYPE_GAIN_TRUST_ONE).contains(&trust),
+            "shrinkage is a fraction"
+        );
         self.type_gain_trust = trust;
         self
     }

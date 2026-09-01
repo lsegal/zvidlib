@@ -1164,12 +1164,7 @@ mod nonlossless_tests {
 
     /// Summed squared error of a report's reconstruction against the source frame, over the
     /// visible `width x height` region rather than the coded one.
-    fn sse_against(
-        report: &tile::SearchReport,
-        pixels: &[u8],
-        width: usize,
-        height: usize,
-    ) -> i64 {
+    fn sse_against(report: &tile::SearchReport, pixels: &[u8], width: usize, height: usize) -> i64 {
         (0..height)
             .flat_map(|row| {
                 report.reconstruction[row * report.coded_width..][..width]
@@ -1263,12 +1258,36 @@ mod nonlossless_tests {
         let mut frames = content_frames(width as u32, height as u32);
         frames.push(("test_pattern", test_pattern(width as u32, height as u32)));
         let arms = [
-            ("running/weighted", tile::GainLocality::Running, tile::GainRatio::Weighted),
-            ("column/weighted", tile::GainLocality::Column, tile::GainRatio::Weighted),
-            ("blended/weighted", tile::GainLocality::Blended, tile::GainRatio::Weighted),
-            ("running/mean", tile::GainLocality::Running, tile::GainRatio::Mean),
-            ("column/mean", tile::GainLocality::Column, tile::GainRatio::Mean),
-            ("blended/mean", tile::GainLocality::Blended, tile::GainRatio::Mean),
+            (
+                "running/weighted",
+                tile::GainLocality::Running,
+                tile::GainRatio::Weighted,
+            ),
+            (
+                "column/weighted",
+                tile::GainLocality::Column,
+                tile::GainRatio::Weighted,
+            ),
+            (
+                "blended/weighted",
+                tile::GainLocality::Blended,
+                tile::GainRatio::Weighted,
+            ),
+            (
+                "running/mean",
+                tile::GainLocality::Running,
+                tile::GainRatio::Mean,
+            ),
+            (
+                "column/mean",
+                tile::GainLocality::Column,
+                tile::GainRatio::Mean,
+            ),
+            (
+                "blended/mean",
+                tile::GainLocality::Blended,
+                tile::GainRatio::Mean,
+            ),
         ];
         println!("size,{width}x{height}");
         println!("frame,qindex,arm,penalty_percent,bytes,candidates");
@@ -1276,21 +1295,20 @@ mod nonlossless_tests {
             for qindex in [1_u8, 8, 32, 80, 160, 200] {
                 let ac = i64::from(crate::av1_intra::get_ac_quant(qindex));
                 let lambda = (ac * ac / 256).max(1);
-                let cost = |interval: usize,
-                            locality: tile::GainLocality,
-                            ratio: tile::GainRatio| {
-                    let report = tile::FrameEncoder::new(pixels, width, height, qindex)
-                        .with_type_gain_interval(interval)
-                        .with_type_gain_locality(locality)
-                        .with_type_gain_ratio(ratio)
-                        .encode_with_report();
-                    (
-                        sse_against(&report, pixels, width, height)
-                            + lambda * report.tile.len() as i64 * 8,
-                        report.tile.len(),
-                        report.candidates_evaluated,
-                    )
-                };
+                let cost =
+                    |interval: usize, locality: tile::GainLocality, ratio: tile::GainRatio| {
+                        let report = tile::FrameEncoder::new(pixels, width, height, qindex)
+                            .with_type_gain_interval(interval)
+                            .with_type_gain_locality(locality)
+                            .with_type_gain_ratio(ratio)
+                            .encode_with_report();
+                        (
+                            sse_against(&report, pixels, width, height)
+                                + lambda * report.tile.len() as i64 * 8,
+                            report.tile.len(),
+                            report.candidates_evaluated,
+                        )
+                    };
                 let (unsampled, _, _) =
                     cost(1, tile::GainLocality::Running, tile::GainRatio::Weighted);
                 for (label, locality, ratio) in arms {
