@@ -7,3 +7,4 @@
 !/examples/media/BigBuckBunny.mp4
 /examples/output/
 node_modules/
+__pycache__/

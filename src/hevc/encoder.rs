@@ -384,8 +384,10 @@ const OPERATING_POINT_HELP: &str = "the native HEVC encoder's configuration is e
 ///
 /// Lossy streams decode through [`crate::native_hevc_video_decoder_factory`],
 /// the crate's own decoder, with distortion that tracks the requested QP. The
-/// writer codes every coding unit as an intra prediction mode chosen by the
-/// mode search with the in-loop filters neutralized.
+/// writer searches the §8.4.2 intra modes per coding unit and runs the §8.7.2
+/// in-loop deblocking filter and the §8.7.3 SAO pass wherever SAO earns the
+/// syntax it costs; the bitrate form additionally picks its QP against what the
+/// previous picture cost.
 fn parse_operating_point(configuration: &[u8]) -> Option<OperatingPoint> {
     match configuration {
         [] => Some(OperatingPoint::LosslessPcm),
