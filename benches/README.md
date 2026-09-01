@@ -955,7 +955,7 @@ mistaken for bitstream-writing cost:
 | Group | Stage |
 | --- | --- |
 | `..._rdo_intra` / `..._rdo_inter` | mode search / RDO (`engine::encoder::rdo`), without and with a reference picture |
-| `..._reconstruct` | encode-side reconstruction (predict + add residual per coded block) plus the §8.7.2 deblocking filter and §8.7.3 SAO over the reconstructed picture |
+| `..._reconstruct` | encode-side reconstruction (predict + add residual per coded block, through `hevc_recon`) plus the §8.7.3 SAO parameter search and the §8.7.2 deblocking filter and §8.7.3 SAO over the reconstructed picture |
 | `..._pcm_write` | whole-picture access-unit writing: parameter sets, slice header, CABAC-coded CU syntax, PCM samples |
 | `hevc_encode_cabac` | the §9.3.5 arithmetic encoder alone, over a synthetic bin stream of single, interleaved bins |
 | `hevc_encode_cabac_bypass` | the same encoder over contiguous *bypass runs* — the shape 62% of the lossy residual writer's bins have |
@@ -990,12 +990,21 @@ them, which is what keeps its PCM encode exactly lossless.
 
 ### Where the SIMD axis reads flat, and why that is the result
 
-The encoder has three SIMD dispatch families of its own: `hevc_rdcost`, the SAD
+The encoder has four SIMD dispatch families of its own: `hevc_rdcost`, the SAD
 and SATD distortion metrics the mode search calls; `hevc_fwd_transform_quant`,
-the forward transform and quantization; and `hevc_colorconv`, the RGBA8 to
-YUV420 input conversion. A fourth group, `..._reconstruct`, also moves with the
-instruction set, but by reaching the decoder's already-vectorized deblocking and
-SAO kernels rather than an encoder-side one.
+the forward transform and quantization; `hevc_recon`, the §8.6.6 reconstruction
+loop and the encode-side §8.7.3 SAO parameter search; and `hevc_colorconv`, the
+RGBA8 to YUV420 input conversion. `..._reconstruct` reaches `hevc_recon` and,
+after it, the decoder's already-vectorized deblocking and SAO filter kernels.
+
+`..._reconstruct` only separated across instruction sets once `hevc_recon`
+existed. Before it, the group's arms barely moved — the in-loop filter kernels
+it called were a minority of its cost, while the reconstruction loop and the SAO
+parameter search in front of them were scalar. Measured on a contended Apple
+Silicon host, best of three interleaved rounds (a floor; read the ratio rather
+than the absolute time): 640x352 29.2 ms scalar against 11.0 ms NEON, and
+1920x1088 121.4 ms scalar against 38.9 ms NEON, where before it read 11.2 ms
+against 9.6 ms at 640x352 and did not separate at all at 1080p.
 
 **Bitstream writing and CABAC** have no vector path at all, so `..._pcm_write`,
 `hevc_encode_cabac`, `hevc_encode_cabac_bypass` and `hevc_encode_bitwriter` are
@@ -1130,6 +1139,14 @@ why the arithmetic encoder stays serial. `hevc_encode_cabac_bypass` exists so
 that the run-at-a-time question stays measured rather than re-derived: it is the
 same engine over contiguous bypass runs instead of single interleaved bins, and
 it is the group any future attempt at this has to move.
+
+`..._reconstruct` separated across instruction sets once `hevc_recon` existed.
+Measured on a contended Apple Silicon host, best of three interleaved rounds
+(treat these as a floor, and read the ratio rather than the absolute time):
+640x352 29.2 ms scalar against 11.0 ms NEON, and 1920x1088 121.4 ms scalar
+against 38.9 ms NEON. Before it, the same group read 11.2 ms scalar against
+9.6 ms NEON at 640x352 and did not separate at all at 1080p, because the in-loop
+filter kernels it called were a minority of its cost.
 
 ## Per-stage access to the encoder
 

@@ -45,6 +45,7 @@
 use crate::hevc::engine::binarization::PartMode;
 use crate::hevc::engine::deblock::{DeblockCu, DeblockCuDesc, DeblockCuParams, NoFilterMap};
 use crate::hevc::engine::encoder::rdo::PictureDecision;
+use crate::hevc::engine::encoder::recon_simd::{self, EdgeStats};
 use crate::hevc::engine::encoder::transform::{
     ForwardBlockParams, chroma_qp, luma_qp, transform_and_quantize,
 };
@@ -357,27 +358,18 @@ fn reconstruct_component(
     quant: Option<u32>,
     component: TfComponent,
 ) {
-    let predict = |sx: usize, sy: usize| -> i32 {
-        match reference {
-            // §8.5.3.3.2 reference-sample clamping: a vector that leaves the
-            // picture reads the edge sample.
-            Some((reference, rw, rh)) => {
-                let rx = (sx as i32 + mv_x).clamp(0, rw as i32 - 1) as usize;
-                let ry = (sy as i32 + mv_y).clamp(0, rh as i32 - 1) as usize;
-                i32::from(reference[ry * rw + rx])
-            }
-            None => NEUTRAL_LUMA,
-        }
-    };
     let Some(q_p) = quant else {
-        // The residual is coded exactly, so the reconstruction is the source.
+        // The residual is coded exactly, so the reconstruction is the source,
+        // and the §8.6.6 add-and-clip of a whole row is a straight-line run
+        // the vector kernel can take whole once the prediction is gathered.
+        let mut prediction = vec![0u8; w];
+        let (dst, dst_stride) = pic.plane_mut(plane);
         for row in 0..h {
-            for col in 0..w {
-                let (sx, sy) = (x + col, y + row);
-                let predicted = predict(sx, sy);
-                let residual = i32::from(source[sy * src_stride + sx]) - predicted;
-                pic.set_sample(plane, sx, sy, clip1(predicted + residual, BIT_DEPTH));
-            }
+            let sy = y + row;
+            gather_prediction_row(&mut prediction, reference, x, sy, mv_x, mv_y);
+            let src_row = &source[sy * src_stride + x..sy * src_stride + x + w];
+            let dst_row = &mut dst[sy * dst_stride + x..sy * dst_stride + x + w];
+            recon_simd::reconstruct_row(dst_row, src_row, &prediction);
         }
         return;
     };
@@ -389,15 +381,17 @@ fn reconstruct_component(
     let n_tbs = transform_block_size(w, h);
     let mut prediction = vec![0i32; n_tbs * n_tbs];
     let mut residual = vec![0i32; n_tbs * n_tbs];
+    let mut pred_row = vec![0u8; n_tbs];
     for by in (0..h).step_by(n_tbs) {
         for bx in (0..w).step_by(n_tbs) {
             for row in 0..n_tbs {
+                let sy = y + by + row;
+                gather_prediction_row(&mut pred_row, reference, x + bx, sy, mv_x, mv_y);
                 for col in 0..n_tbs {
-                    let (sx, sy) = (x + bx + col, y + by + row);
-                    let predicted = predict(sx, sy);
+                    let predicted = i32::from(pred_row[col]);
                     prediction[row * n_tbs + col] = predicted;
                     residual[row * n_tbs + col] =
-                        i32::from(source[sy * src_stride + sx]) - predicted;
+                        i32::from(source[sy * src_stride + x + bx + col]) - predicted;
                 }
             }
             // Forward transform → quantize → the decoder's own §8.6.2
@@ -454,6 +448,41 @@ fn reconstruct_component(
                 }
             }
         }
+    }
+}
+
+/// Gathers the §8.5.3.3.2 prediction of one row of a partition contiguously,
+/// so the add-and-clip that consumes it is a straight-line run.
+///
+/// The gather is a plain copy whenever the motion vector keeps the row inside
+/// the reference, which is the common case; only a row that hangs off an edge
+/// falls back to the per-sample reference-sample clamp. `prediction.len()` is
+/// the run length.
+fn gather_prediction_row(
+    prediction: &mut [u8],
+    reference: Option<(&[u8], usize, usize)>,
+    x: usize,
+    sy: usize,
+    mv_x: i32,
+    mv_y: i32,
+) {
+    let w = prediction.len();
+    match reference {
+        Some((reference, rw, rh)) => {
+            let ry = (sy as i32 + mv_y).clamp(0, rh as i32 - 1) as usize;
+            let base = ry * rw;
+            let left = x as i32 + mv_x;
+            if left >= 0 && left + w as i32 <= rw as i32 {
+                let start = base + left as usize;
+                prediction.copy_from_slice(&reference[start..start + w]);
+            } else {
+                for (col, sample) in prediction.iter_mut().enumerate() {
+                    let rx = (left + col as i32).clamp(0, rw as i32 - 1) as usize;
+                    *sample = reference[base + rx];
+                }
+            }
+        }
+        None => prediction.fill(NEUTRAL_LUMA as u8),
     }
 }
 
@@ -954,19 +983,36 @@ fn class_offsets(
     let (pw, ph) = pic.plane_dims(plane);
     let samples = pic.plane(plane);
     let (h0, v0, h1, v1) = crate::hevc::engine::sao::eo_pos(eo_class);
-    // Per §8.7.3.2 category (1..4), the summed and counted error.
-    let mut sums = [0i64; 5];
-    let mut counts = [0i64; 5];
+    // Per §8.7.3.2 category (1..4), the summed and counted error. The
+    // neighbour bounds test is hoisted out of the sample loop and turned into
+    // a row range: a sample is classifiable exactly when both of its
+    // neighbours are inside the plane, and for a fixed class that is a
+    // whole-row condition vertically and a contiguous run horizontally.
+    // Everything left in the run is a straight-line accumulation the vector
+    // kernel can take whole.
+    let mut stats = EdgeStats::default();
     for y in y0..y1 {
-        for x in x0..x1 {
-            let Some(category) = edge_category(samples, pw, ph, x, y, h0, v0, h1, v1) else {
-                continue;
-            };
-            let error = i64::from(source[y * src_stride + x]) - i64::from(samples[y * pw + x]);
-            sums[category] += error;
-            counts[category] += 1;
+        let (ay, by) = (y as i32 + v0, y as i32 + v1);
+        if ay < 0 || by < 0 || ay >= ph as i32 || by >= ph as i32 {
+            continue;
         }
+        let lo = (x0 as i32).max(-h0).max(-h1);
+        let hi = (x1 as i32).min(pw as i32 - h0).min(pw as i32 - h1);
+        if hi <= lo {
+            continue;
+        }
+        let (lo, run) = (lo as usize, (hi - lo) as usize);
+        let a_start = (ay as usize) * pw + (lo as i32 + h0) as usize;
+        let b_start = (by as usize) * pw + (lo as i32 + h1) as usize;
+        recon_simd::edge_offset_row(
+            &samples[y * pw + lo..y * pw + lo + run],
+            &samples[a_start..a_start + run],
+            &samples[b_start..b_start + run],
+            &source[y * src_stride + lo..y * src_stride + lo + run],
+            &mut stats,
+        );
     }
+    let (sums, counts) = (stats.sums, stats.counts);
     let mut offsets = [0i32; 5];
     let mut gain = 0i64;
     for category in 1..5 {
@@ -988,41 +1034,6 @@ fn class_offsets(
             - counts[category] * i64::from(offset) * i64::from(offset);
     }
     (gain, offsets)
-}
-
-/// §8.7.3.2 `edgeIdx` remapped to the `SaoOffsetVal` category index
-/// (1..4), or `None` for category 0 (no offset) and for samples whose
-/// neighbours leave the plane.
-#[allow(clippy::too_many_arguments)]
-fn edge_category(
-    samples: &[i32],
-    pw: usize,
-    ph: usize,
-    x: usize,
-    y: usize,
-    h0: i32,
-    v0: i32,
-    h1: i32,
-    v1: i32,
-) -> Option<usize> {
-    let at = |dx: i32, dy: i32| -> Option<i32> {
-        let nx = x as i32 + dx;
-        let ny = y as i32 + dy;
-        (nx >= 0 && ny >= 0 && (nx as usize) < pw && (ny as usize) < ph)
-            .then(|| samples[ny as usize * pw + nx as usize])
-    };
-    let here = samples[y * pw + x];
-    let a = at(h0, v0)?;
-    let b = at(h1, v1)?;
-    let edge_idx = 2 + (here - a).signum() + (here - b).signum();
-    // §8.7.3.2: edgeIdx 0/1/2/3/4 maps to categories 1, 2, 0, 3, 4.
-    match edge_idx {
-        0 => Some(1),
-        1 => Some(2),
-        3 => Some(3),
-        4 => Some(4),
-        _ => None,
-    }
 }
 
 /// Round-half-away-from-zero integer division.
@@ -1230,6 +1241,45 @@ mod tests {
         );
         assert_eq!(filtered.y.len(), src.0.len());
         assert_eq!(filtered.cb.len(), src.1.len());
+    }
+
+    #[test]
+    fn the_whole_reconstruction_is_identical_on_every_instruction_set() {
+        // The §8.6.6 loop and the SAO parameter search both dispatch through
+        // `hevc_recon`, so pinning each available instruction set in turn has
+        // to leave the reconstructed picture — and the SAO decisions that
+        // shaped it — bit for bit the same.
+        let _guard = crate::simd::test_lock();
+        let cfg = ReconConfig {
+            deblocking: true,
+            sao_luma: true,
+            sao_chroma: true,
+            pcm_loop_filter_disabled: false,
+            ..ReconConfig::default()
+        };
+        let src = source(0);
+        let next = source(3);
+        crate::simd::set_override(Some(crate::simd::SimdIsa::Scalar));
+        let reference = reconstruct_picture(planes(&src), None, &plan(&src, None), cfg);
+        let expected_inter = reconstruct_picture(
+            planes(&next),
+            Some(&reference),
+            &plan(&next, Some(&reference.y)),
+            cfg,
+        );
+        for isa in crate::simd::available() {
+            crate::simd::set_override(Some(isa));
+            let intra = reconstruct_picture(planes(&src), None, &plan(&src, None), cfg);
+            assert_eq!(intra, reference, "{} intra reconstruction", isa.name());
+            let inter = reconstruct_picture(
+                planes(&next),
+                Some(&reference),
+                &plan(&next, Some(&reference.y)),
+                cfg,
+            );
+            assert_eq!(inter, expected_inter, "{} inter reconstruction", isa.name());
+        }
+        crate::simd::set_override(None);
     }
 
     #[test]

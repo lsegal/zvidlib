@@ -24,16 +24,17 @@
 //!
 //! ## The SIMD axis, and where it is expected to read flat
 //!
-//! `hevc_rdcost` — the SAD and SATD distortion metrics the mode search calls —
-//! and `hevc_fwd_transform_quant` — the forward transform's butterfly and the
-//! quantization loop — are the encoder's two SIMD dispatch families. Bitstream
-//! writing, CABAC, and the RGBA-to-YUV420 conversion have no vector path, so
-//! their arms are expected to read the same under every instruction set. That
-//! is the measured result the issue asks for, not a broken benchmark: it says
-//! the next encoder-side vectorization target is entropy coding or color
-//! conversion, and it is why every group asserts through
-//! `simd::active_by_site()` that the override landed rather than inferring it
-//! from the clock.
+//! The encoder has four SIMD dispatch families of its own: `hevc_rdcost`, the
+//! SAD and SATD distortion metrics the mode search calls;
+//! `hevc_fwd_transform_quant`, the forward transform's butterfly and the
+//! quantization loop; `hevc_recon`, the §8.6.6 reconstruction loop and the
+//! encode-side §8.7.3 SAO parameter search; and `hevc_colorconv`, the RGBA8 to
+//! YUV420 input conversion. Bitstream writing and CABAC have no vector path,
+//! so their arms are expected to read the same under every instruction set.
+//! That is the measured result the issue asks for, not a broken benchmark: it
+//! says the next encoder-side vectorization target is entropy coding, and it
+//! is why every group asserts through `simd::active_by_site()` that the
+//! override landed rather than inferring it from the clock.
 //!
 //! `hevc_encode_cabac`'s flat arm is a settled question rather than an open
 //! one. The §9.3.5 arithmetic encoder is serial by construction, and
@@ -42,10 +43,11 @@
 //! formulation of it — including the 3.7x ceiling such a formulation would be
 //! chasing, and the two exact serial changes that take most of it instead.
 //!
-//! The one exception is the reconstruction group. It runs the decoder's own
-//! §8.7.2 deblocking and §8.7.3 SAO kernels over the encoder's reconstructed
-//! picture, and those *are* vectorized, so it is the one encoder-side group
-//! outside mode search that is expected to move with the instruction set.
+//! The exception is the reconstruction group. It runs `hevc_recon` over every
+//! partition and every CTB, and then the decoder's own vectorized §8.7.2
+//! deblocking and §8.7.3 SAO filter kernels over the result, so it is the one
+//! encoder-side group outside mode search that is expected to move with the
+//! instruction set.
 //!
 //! ## Stage coverage
 //!
@@ -108,9 +110,9 @@ fn report_stage_coverage(_: &mut Criterion) {
          # (with both an exact and a quantized residual), CABAC + bitwriting, whole-picture\n\
          # access-unit writing for both the lossless PCM writer and the lossy residual writer,\n\
          # and the RGBA8->YUV420 input conversion. No stage of the pipeline is absent.\n\
-         # hevc_encode: hevc_rdcost, hevc_fwd_transform_quant and hevc_colorconv are the\n\
-         # encoder's three SIMD dispatch families, so apart from the mode-search,\n\
-         # forward-transform, reconstruction (the last running the decoder's vectorized\n\
+         # hevc_encode: hevc_rdcost, hevc_recon, hevc_fwd_transform_quant and hevc_colorconv\n\
+         # are the encoder's four SIMD dispatch families, so apart from the mode-search,\n\
+         # forward-transform, reconstruction (the last also running the decoder's vectorized\n\
          # in-loop filter kernels) and RGBA8->YUV420 groups the arms are expected to read\n\
          # flat across instruction sets, which is the measured result, not a broken bench."
     );
@@ -273,10 +275,12 @@ fn zvidlib_rdo_defaults() -> (i32, i32) {
 ///
 /// The stage that makes the encoder predict from what a decoder will hold
 /// rather than from the source it was handed: every coded block is
-/// reconstructed (predict + add residual), then the §8.7.2 deblocking filter
-/// and §8.7.3 SAO run over the whole picture through the decoder's own
-/// kernels, which is why this is the one non-mode-search encoder group that
-/// can show an instruction-set delta.
+/// reconstructed (predict + add residual), then the §8.7.3 SAO parameters are
+/// searched and the §8.7.2 deblocking filter and §8.7.3 SAO run over the whole
+/// picture through the decoder's own kernels. The reconstruction loop and the
+/// SAO search dispatch through `hevc_recon` and the filters through
+/// `hevc_prediction_filters`, which is why this is the one non-mode-search
+/// encoder group that can show an instruction-set delta.
 ///
 /// The mode-search plan the reconstruction consumes is built in setup, not in
 /// the timed loop — mode search costs an order of magnitude more than
