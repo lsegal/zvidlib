@@ -678,12 +678,35 @@ mod nonlossless_tests {
                 (((x / 2) ^ (y / 2)) % 2 * 255) as u8
             }
         });
+        // Bands: the same two statistics as `scene_edge` alternating every 16 rows, so the
+        // content changes many times down the frame rather than once. Added by #308, which
+        // needed content changing faster than a per-size accumulation could follow to decide
+        // whether the recency weighting still separated from the un-decayed sum.
+        let bands = pixel(&|x, y| {
+            if (y / 16) % 2 == 0 {
+                (100 + ((x * 5 + y * 3) % 17)) as u8
+            } else {
+                (((x / 2) ^ (y / 2)) % 2 * 255) as u8
+            }
+        });
+        // Mosaic: those two statistics on a 32x32 checkerboard, so the boundaries run in both
+        // axes instead of only across rows, which is the other half of what #308 needed - every
+        // frame above changes along at most one axis at a time.
+        let mosaic = pixel(&|x, y| {
+            if ((x / 32) + (y / 32)) % 2 == 0 {
+                (100 + ((x * 5 + y * 3) % 17)) as u8
+            } else {
+                (((x / 2) ^ (y / 2)) % 2 * 255) as u8
+            }
+        });
         vec![
             ("noise", noise),
             ("smooth", smooth),
             ("diagonals", diagonals),
             ("quadrants", quadrants),
             ("scene_edge", scene_edge),
+            ("bands", bands),
+            ("mosaic", mosaic),
         ]
     }
 
@@ -1243,70 +1266,11 @@ mod nonlossless_tests {
             .sum()
     }
 
-    /// Sweeps the recency window the per-size gain ratio is accumulated over.
-    ///
-    /// Prints, per frame and quantizer, the sampled estimator's `sse + lambda * bits` at each
-    /// window against the same estimator probing every size search, which is what
-    /// `TYPE_GAIN_MEMORY` is chosen from. `usize::MAX` is the frame-wide accumulation.
-    #[test]
-    #[ignore = "measurement sweep, not an assertion"]
-    fn measure_type_gain_memory_windows() {
-        for (width, height) in [(128_usize, 96_usize), (192, 160)] {
-            measure_type_gain_memory_windows_at(width, height);
-        }
-    }
-
-    fn measure_type_gain_memory_windows_at(width: usize, height: usize) {
-        let mut frames = content_frames(width as u32, height as u32);
-        frames.push(("test_pattern", test_pattern(width as u32, height as u32)));
-        let sse = |report: &tile::SearchReport, pixels: &[u8]| -> i64 {
-            (0..height)
-                .flat_map(|row| {
-                    report.reconstruction[row * report.coded_width..][..width]
-                        .iter()
-                        .enumerate()
-                        .map(move |(column, &value)| (row * width + column, value))
-                })
-                .map(|(index, value)| {
-                    let error = i64::from(i32::from(pixels[index]) - i32::from(value));
-                    error * error
-                })
-                .sum()
-        };
-        println!("size,{width}x{height}");
-        println!("frame,qindex,memory,penalty_percent,bytes,candidates");
-        for (name, pixels) in &frames {
-            for qindex in [1_u8, 8, 32, 80, 160, 200] {
-                let ac = i64::from(crate::av1_intra::get_ac_quant(qindex));
-                let lambda = (ac * ac / 256).max(1);
-                let cost = |interval: usize, memory: usize| {
-                    let report = tile::FrameEncoder::new(pixels, width, height, qindex)
-                        .with_type_gain_interval(interval)
-                        .with_type_gain_memory(memory)
-                        .encode_with_report();
-                    (
-                        sse(&report, pixels) + lambda * report.tile.len() as i64 * 8,
-                        report.tile.len(),
-                        report.candidates_evaluated,
-                    )
-                };
-                let (unsampled, _, _) = cost(1, usize::MAX);
-                for memory in [1_usize, 2, 3, 4, 6, 8, 12, 16, 24, 32, 64, usize::MAX] {
-                    let (sampled, bytes, candidates) =
-                        cost(tile::TYPE_GAIN_SAMPLE_INTERVAL, memory);
-                    let penalty = sampled as f64 / unsampled as f64 * 100.0 - 100.0;
-                    println!("{name},{qindex},{memory},{penalty:+.2},{bytes},{candidates}");
-                }
-            }
-        }
-    }
-
     /// Sweeps where a trial that did not probe reads its gain ratio back from.
     ///
-    /// [`tile::TYPE_GAIN_MEMORY`] ages the running accumulator, but the ageing is in *probe
-    /// order*: the size searches are visited in superblock raster order, so a window of four
-    /// probes spans a horizontal run of coding blocks and carries nothing about the block
-    /// directly above. This prints, per frame and quantizer, the sampled estimator's
+    /// The running accumulator is filled in *probe order*: the size searches are visited in
+    /// superblock raster order, so the probes nearest a block are a horizontal run of coding
+    /// blocks and carry nothing about the block directly above. This prints, per frame and quantizer, the sampled estimator's
     /// `sse + lambda * bits` against the same estimator probing every size search, for the
     /// running accumulator alone (what #272 shipped), the per-superblock-column accumulator
     /// alone, and the two summed, which is what `GainLocality::Blended` ships.
@@ -1563,45 +1527,6 @@ mod nonlossless_tests {
         }
     }
 
-    /// What the recency weighting costs in encode time.
-    ///
-    /// The correction exists to be cheap, so this is the check that ageing the accumulator did
-    /// not make it expensive. Interleaved rounds with the minimum taken per arm: a single pass
-    /// would attribute this host's own load to whichever arm happened to run under it.
-    #[test]
-    #[ignore = "measurement sweep, not an assertion"]
-    fn measure_type_gain_memory_cost() {
-        use std::time::Instant;
-        let (width, height) = (192_usize, 160_usize);
-        let mut frames = content_frames(width as u32, height as u32);
-        frames.push(("test_pattern", test_pattern(width as u32, height as u32)));
-        let windows = [1_usize, 2, 4, 8, 32, usize::MAX];
-        let mut best = std::collections::BTreeMap::new();
-        let mut candidates = std::collections::BTreeMap::new();
-        for _ in 0..5 {
-            for memory in windows {
-                let start = Instant::now();
-                let mut total = 0_u64;
-                for (_, pixels) in &frames {
-                    for qindex in [1_u8, 8, 32, 80, 160, 200] {
-                        let report = tile::FrameEncoder::new(pixels, width, height, qindex)
-                            .with_type_gain_memory(memory)
-                            .encode_with_report();
-                        total += report.candidates_evaluated;
-                    }
-                }
-                let elapsed = start.elapsed().as_secs_f64();
-                let slot = best.entry(memory).or_insert(f64::MAX);
-                *slot = slot.min(elapsed);
-                candidates.insert(memory, total);
-            }
-        }
-        println!("memory,seconds,candidates");
-        for memory in windows {
-            println!("{memory},{:.4},{}", best[&memory], candidates[&memory]);
-        }
-    }
-
     /// What the sampled transform-gain estimator costs on content it was not tuned on.
     ///
     /// `TYPE_GAIN_SAMPLE_INTERVAL` probes one coding block's size search in every `n` and
@@ -1622,9 +1547,14 @@ mod nonlossless_tests {
     /// `scene_edge`'s ceiling was 40% while the per-size ratio was accumulated over the whole
     /// frame: every interval from 2 to 4 measured the same penalty on it, because what it was
     /// paying for was the estimator mixing two regions' statistics rather than the sampling rate.
-    /// [`tile::TYPE_GAIN_MEMORY`] ages that accumulation so a block reads back its own
-    /// neighbourhood's ratio and [`tile::TYPE_GAIN_TRUST`] shrinks what is left of a *remembered*
-    /// correction, which together bring the frame to +0.10% at 128x96 and +1.27% at 192x160.
+    /// #272 aged that accumulation so a block read back its own neighbourhood's ratio and
+    /// [`tile::TYPE_GAIN_TRUST`] then shrank what was left of a *remembered* correction, which
+    /// together brought the frame to +0.10% at 128x96 and +1.27% at 192x160. #308 measured the
+    /// ageing to be doing none of that under the shrinkage and removed it, leaving the same two
+    /// figures, and added `bands` and `mosaic` here - the same two statistics alternating every
+    /// 16 rows, and on a 32x32 checkerboard so the boundaries run in both axes - so that a
+    /// correction which needs the frame's content to hold still is asserted on content that
+    /// changes many times and in both directions, not only on one that changes once.
     ///
     /// Both sizes are asserted. 128x96 alone could not see the 192x160 penalty the shrinkage was
     /// found from - it measured +2.13% there against +9.32% at the larger size - so the larger
@@ -1641,6 +1571,8 @@ mod nonlossless_tests {
                 ("diagonals", 1.0),
                 ("quadrants", 1.0),
                 ("scene_edge", 2.5),
+                ("bands", 1.0),
+                ("mosaic", 1.0),
                 ("test_pattern", 1.0),
             ]);
             for (name, pixels) in &frames {
