@@ -455,10 +455,11 @@ mod tests {
     /// The guard the benchmark's `bench_across_isas` relies on: every wrapper
     /// must return the same bytes under every instruction set the host can run.
     ///
-    /// The encoder's only SIMD dispatch family is the mode search's distortion
-    /// metrics, so this is where a divergence would surface as a *different mode
-    /// decision* rather than a different picture — which a bit-exactness check
-    /// on decoded pixels would never see.
+    /// The encoder's SIMD dispatch families are the mode search's distortion
+    /// metrics and the RGBA8 to YUV420 input conversion. The distortion metrics are
+    /// where a divergence would surface as a *different mode decision* rather than a
+    /// different picture — which a bit-exactness check on decoded pixels would never
+    /// see.
     #[test]
     fn every_stage_wrapper_is_bit_exact_across_instruction_sets() {
         let _guard = test_lock();
