@@ -1571,8 +1571,8 @@ mod nonlossless_tests {
                 ("diagonals", 1.0),
                 ("quadrants", 1.0),
                 ("scene_edge", 2.5),
-                ("bands", 1.5),
-                ("mosaic", 1.5),
+                ("bands", 1.0),
+                ("mosaic", 1.0),
                 ("test_pattern", 1.0),
             ]);
             for (name, pixels) in &frames {
