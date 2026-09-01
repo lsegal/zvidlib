@@ -456,7 +456,7 @@ pub fn synthetic_av1_stream() -> &'static SyntheticAv1Stream {
 /// Borrows [`synthetic_yuv420_sequence`]'s luma so the encoded stream carries
 /// the same moving gradient plus low-amplitude noise every other synthetic
 /// fixture does, rather than content that degenerates into a best case.
-fn av1_gray8_planes(width: u32, height: u32, frames: usize) -> Vec<Vec<u8>> {
+pub fn av1_gray8_planes(width: u32, height: u32, frames: usize) -> Vec<Vec<u8>> {
     synthetic_yuv420_sequence(width, height, frames)
         .into_iter()
         .map(|frame| frame.planes.into_iter().next().expect("luma plane").data)
