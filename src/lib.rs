@@ -156,7 +156,3 @@ pub use hevc::native_hevc_video_decoder_factory;
 pub use hevc::native_hevc_video_encoder_factory;
 #[cfg(not(target_arch = "wasm32"))]
 pub use native_audio::{DefaultAudioOutput, NativeAacDecoder};
-
-/// TEMPORARY issue #280 measurement scaffolding. Removed before the fix lands.
-#[doc(hidden)]
-pub use hevc::engine::recon::tmp_pu_hist;

@@ -9,7 +9,7 @@ pub mod decode_bench;
 #[doc(hidden)]
 pub use engine::profile as decode_profile;
 mod encoder;
-pub mod engine;
+pub(crate) mod engine;
 #[cfg(all(any(windows, target_os = "linux"), target_pointer_width = "64"))]
 mod nvdec;
 #[cfg(target_os = "macos")]

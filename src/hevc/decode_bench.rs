@@ -878,6 +878,63 @@ mod tests {
         HevcStageInputs::new(256, 128)
     }
 
+    /// The §8.5.3.3 workload has to run the prediction-unit mix issue #280
+    /// measured, not a mix that happens to be close to it.
+    ///
+    /// The uniform 16x16 bi-predicted luma-only grid this replaced would fail
+    /// every assertion here: one size instead of four, no uni-predicted units,
+    /// and no chroma. A schedule that drifted back towards one of those — say
+    /// by rounding every cell to the largest class — would look like a faster
+    /// kernel rather than a narrower workload, which is the failure this
+    /// benchmark exists to avoid.
+    #[test]
+    fn the_inter_pred_schedule_runs_the_measured_prediction_unit_mix() {
+        // A frame large enough that each class gets whole cells to land in;
+        // the greedy schedule converges on the shares as cells accumulate.
+        let pus = schedule_inter_pus(1920, 1088);
+        let total: u64 = pus.iter().map(|pu| (pu.n * pu.n) as u64).sum();
+        assert!(total > 0, "the schedule emitted no prediction units");
+
+        for &(n, bi, share) in &INTER_PU_MIX {
+            let got: u64 = pus
+                .iter()
+                .filter(|pu| pu.n == n && pu.bi == bi)
+                .map(|pu| (pu.n * pu.n) as u64)
+                .sum();
+            let got = got as f64 / total as f64;
+            assert!(
+                (got - share).abs() < 0.01,
+                "{n}x{n} {} is {:.1}% of luma samples, measured {:.1}%",
+                if bi { "bi" } else { "uni" },
+                got * 100.0,
+                share * 100.0,
+            );
+        }
+
+        // Bi-prediction is the majority but not the whole of it, and every
+        // measured size is present — the three things the old grid collapsed.
+        let bi: u64 = pus
+            .iter()
+            .filter(|pu| pu.bi)
+            .map(|pu| (pu.n * pu.n) as u64)
+            .sum();
+        let bi = bi as f64 / total as f64;
+        assert!((0.55..0.70).contains(&bi), "bi-predicted share is {bi}");
+        for side in [8usize, 16, 32, 64] {
+            assert!(
+                pus.iter().any(|pu| pu.n == side),
+                "no {side}x{side} prediction unit was scheduled"
+            );
+        }
+
+        // And the workload predicts chroma: every unit is at least 8x8 luma,
+        // so every unit has a 4:2:0 chroma unit of at least 4x4 to filter.
+        assert!(
+            pus.iter().all(|pu| pu.n >= 8 && pu.x % 2 == 0 && pu.y % 2 == 0),
+            "a unit has no whole 4:2:0 chroma unit"
+        );
+    }
+
     /// Every stage must produce identical output on every instruction set the
     /// host can run.
     ///
@@ -987,7 +1044,10 @@ mod tests {
     #[test]
     fn reported_sample_counts_match_the_workloads() {
         let inputs = small_inputs();
-        assert_eq!(inputs.inter_pred_samples(), 15 * 7 * 256);
+        // Three 64x64 cells fit a 256x128 frame once the one-cell margin the
+        // second reference list needs is taken off each edge, and every cell
+        // is filled by prediction units of one class whatever that class is.
+        assert_eq!(inputs.inter_pred_samples(), 3 * 64 * 64);
         assert_eq!(inputs.sao_samples(), 256 * 128 * 3 / 2);
         assert_eq!(
             inputs.deblock_samples(),

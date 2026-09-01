@@ -725,7 +725,6 @@ pub fn reconstruct_inter_pu_weighted(
     // Issue #189 stage attribution: `reconstruct_inter_pu` delegates here, so
     // this one scope covers every inter prediction unit in a picture.
     let _profile = prof_scope(ProfStage::InterPred);
-    tmp_pu_hist::record(n_pb_w, n_pb_h, l0.pred_flag, l1.pred_flag);
     let cat = params.chroma_array_type;
     // Build the §8.5.3.3.2 reference planes for each used list.
     let lp0 = build_list_prediction(&l0, cat)?;
@@ -4016,37 +4015,3 @@ mod tests {
     }
 }
 
-
-/// TEMPORARY issue #280 measurement scaffolding: the prediction-unit size and
-/// uni/bi mix a real decode actually runs. Removed before the fix lands.
-pub mod tmp_pu_hist {
-    use std::collections::BTreeMap;
-    use std::sync::Mutex;
-    pub static HIST: Mutex<Option<BTreeMap<(usize, usize, bool), u64>>> = Mutex::new(None);
-    pub fn enable() {
-        *HIST.lock().unwrap() = Some(BTreeMap::new());
-    }
-    pub fn record(w: usize, h: usize, p0: bool, p1: bool) {
-        if let Ok(mut g) = HIST.lock()
-            && let Some(m) = g.as_mut()
-        {
-            *m.entry((w, h, p0 && p1)).or_insert(0) += 1;
-        }
-    }
-    pub fn dump() {
-        let g = HIST.lock().unwrap();
-        let Some(m) = g.as_ref() else { return };
-        let total: u64 = m.values().sum();
-        let samples: u64 = m.iter().map(|((w, h, _), n)| (w * h) as u64 * n).sum();
-        println!("PU histogram: {total} PUs, {samples} luma samples");
-        let mut rows: Vec<_> = m.iter().collect();
-        rows.sort_by_key(|(_, n)| std::cmp::Reverse(**n));
-        for ((w, h, bi), n) in rows {
-            let share = (w * h) as f64 * *n as f64 / samples as f64 * 100.0;
-            println!(
-                "  {w:>2}x{h:<2} {} {n:>7} PUs  {share:>5.1}% of samples",
-                if *bi { "bi " } else { "uni" }
-            );
-        }
-    }
-}
