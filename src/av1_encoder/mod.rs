@@ -815,17 +815,18 @@ mod nonlossless_tests {
                 .map(|(_, tx_type)| tx_type.clone())
                 .collect::<std::collections::BTreeSet<_>>()
         };
-        // Which sizes and types the shipped search *selects* is no longer a property worth
-        // asserting exactly. It ranks sizes and partitions on the set's DCT alone (see
-        // `tile.rs`), which leaves the wins that decide TX_4X4 and IDTX close enough together
-        // that they fall differently on different hosts. What the encoder can *write* is the
-        // property this test exists for, and that lives in the emitting path both searches
-        // share - so the coverage assertion runs against the exhaustive search the shortcut
-        // stands in for, and the shipped one keeps the assertion that it writes nothing outside
-        // the set.
-        assert!(
-            sizes(&covered).is_subset(&sizes(&emittable)),
-            "the encoder wrote a transform size the decoder cannot read back"
+        // Every size the decoder can read back is selected by the shipped search on this
+        // pattern, including `TX_4X4`: the size trials correct for what the transform-type
+        // search is worth at each size (see `tile.rs`), so the smallest size keeps the advantage
+        // its sixteen-chances-to-one type search gives it. Which *type* each block ends up with
+        // is still not asserted here - the DCT-only ranking leaves the wins that decide IDTX
+        // close enough together that they can fall either way - so type coverage runs against
+        // the exhaustive search the shortcut stands in for, and the shipped one keeps the
+        // assertion that it writes nothing outside the set.
+        assert_eq!(
+            sizes(&covered),
+            sizes(&emittable),
+            "the shipped search did not select every signallable transform size"
         );
         let exhaustively_covered: std::collections::BTreeSet<(usize, String)> =
             [1_u8, 8, 32, 80, 160, 200]
@@ -848,8 +849,12 @@ mod nonlossless_tests {
     /// Two of the three are exact - a block whose residual cannot pay for one coefficient, and a
     /// partition whose unsplit cost is already below the split's header charge, are decided by
     /// the cost function itself rather than by a trial. The third ranks transform sizes and
-    /// partitions on the set's DCT alone instead of on all five types, which is an approximation,
-    /// so this is the assertion that says how large an approximation it is allowed to be.
+    /// partitions on the set's DCT alone, corrected by what the type search measures out to be
+    /// worth on a probe block of each size, instead of on all five types everywhere - which is an
+    /// approximation, so this is the assertion that says how large an approximation it is allowed
+    /// to be. Both bounds were loosened for the DCT-only ranking and tightened again once the
+    /// per-size correction landed: the fast search now reconstructs no *worse* than the
+    /// exhaustive one at every quantizer here.
     #[test]
     fn the_search_shortcuts_stay_within_their_rate_and_distortion_bound() {
         let (width, height) = (96_usize, 80_usize);
@@ -869,13 +874,13 @@ mod nonlossless_tests {
             };
             let (fast_psnr, exhaustive_psnr) = (quality(&fast), quality(&exhaustive));
             assert!(
-                fast_psnr >= exhaustive_psnr - 0.25,
+                fast_psnr >= exhaustive_psnr - 0.05,
                 "qindex {qindex} reconstructed at {fast_psnr:.3} dB against the exhaustive \
                  search's {exhaustive_psnr:.3} dB"
             );
             let growth = fast.tile.len() as f64 / exhaustive.tile.len() as f64 - 1.0;
             assert!(
-                growth <= 0.02,
+                growth <= 0.015,
                 "qindex {qindex} spent {} bytes against the exhaustive search's {} ({:+.2}%)",
                 fast.tile.len(),
                 exhaustive.tile.len(),
@@ -889,6 +894,33 @@ mod nonlossless_tests {
                 exhaustive.candidates_evaluated
             );
         }
+    }
+
+    /// `TX_4X4` is a size the shipped search *selects*, not just one the emitting path could
+    /// write.
+    ///
+    /// Ranking size trials on the set's DCT alone made the smallest size unreachable: coding a
+    /// block as sixteen 4x4 transforms is worth its extra header bits because the type search
+    /// gets sixteen chances to beat DCT instead of one, and a DCT-only ranking cannot see that.
+    /// The per-size correction in `tile.rs` measures the gain on a probe block and extrapolates
+    /// it over the trial, so the advantage scales with block count again.
+    #[test]
+    fn the_size_search_selects_the_smallest_transform() {
+        let (width, height) = (96_usize, 80_usize);
+        let pixels = test_pattern(width as u32, height as u32);
+        let mut selected_at = Vec::new();
+        for qindex in [1_u8, 8, 32, 80, 160, 200] {
+            let report =
+                tile::FrameEncoder::new(&pixels, width, height, qindex).encode_with_report();
+            if report.trace.iter().any(|&(size, _)| size == 4) {
+                selected_at.push(qindex);
+            }
+        }
+        assert!(
+            !selected_at.is_empty(),
+            "no quantizer selected TX_4X4, so the smallest transform's emit path gets no \
+             coverage from a normal encode"
+        );
     }
 
     /// A frame flat enough that no transform can pay for a single coefficient is coded without
