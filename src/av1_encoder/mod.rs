@@ -756,6 +756,140 @@ mod nonlossless_tests {
             .collect()
     }
 
+    /// The quantizers the determinism tests sweep. The same six the round-trip bound uses, so
+    /// the reproducibility assertions cover exactly the operating points that test measures.
+    const DETERMINISM_QINDEXES: [u8; 6] = [1, 8, 32, 80, 160, 200];
+
+    /// FNV-1a over an access unit, so a divergence is reported as one digest rather than as a
+    /// diff of several thousand bytes.
+    fn digest(data: &[u8]) -> u64 {
+        data.iter().fold(0xcbf2_9ce4_8422_2325, |hash, &byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+    }
+
+    /// Everything one encode of `pixels` at `qindex` decides, as one comparable value: the
+    /// access unit bytes, and the `(size, tx_type)` trace of both the shipped search and the
+    /// exhaustive one it stands in for. The traces are where the transform-type divergence was
+    /// observed, and the bytes are where a divergence anywhere else in the encoder would show up.
+    #[derive(PartialEq, Eq)]
+    struct EncodeFingerprint {
+        access_unit: Vec<u8>,
+        shipped: Vec<(usize, Av1TxType)>,
+        exhaustive: Vec<(usize, Av1TxType)>,
+    }
+
+    fn encode_fingerprint(width: u32, height: u32, qindex: u8, pixels: &[u8]) -> EncodeFingerprint {
+        let access_unit = encode(width, height, qindex, pixels);
+        let shipped = traced_transform_blocks(width, height, qindex, pixels, &access_unit);
+        let exhaustive = tile::FrameEncoder::new(pixels, width as usize, height as usize, qindex)
+            .without_search_shortcuts()
+            .encode_with_report()
+            .trace;
+        EncodeFingerprint {
+            access_unit,
+            shipped,
+            exhaustive,
+        }
+    }
+
+    /// An encoder has to produce one bitstream for one input, and the rate-distortion search that
+    /// picks each block's transform size and type is decided by sums of squared errors that a
+    /// single-coefficient difference can reorder. Every one of those coefficients comes from
+    /// [`transform::forward_transform`] or [`crate::av1_intra::inverse_transform`], both of which
+    /// dispatch on the host's instruction set, so "the vector kernels are bit-exact with scalar"
+    /// is what makes the encoder reproducible - and until now nothing asserted it end to end.
+    ///
+    /// The crate-wide [`crate::simd`] override makes every instruction set the host offers
+    /// runnable in one process, so this pins each in turn and asserts the whole encode is
+    /// identical. It covers the dispatch as well as the kernels: an instruction set that fell
+    /// back to a different path, or a size the vector driver declined on one host and not
+    /// another, would show up here too.
+    #[test]
+    fn one_frame_encodes_identically_under_every_instruction_set() {
+        let _guard = crate::simd::test_lock();
+        let (width, height) = (96_u32, 80_u32);
+        let pixels = test_pattern(width, height);
+        for qindex in DETERMINISM_QINDEXES {
+            let mut reference: Option<(crate::simd::SimdIsa, EncodeFingerprint)> = None;
+            for isa in crate::simd::available() {
+                crate::simd::set_override(Some(isa));
+                assert_eq!(
+                    crate::simd::active(),
+                    isa,
+                    "the override should pin {isa:?}"
+                );
+                let fingerprint = encode_fingerprint(width, height, qindex, &pixels);
+                match &reference {
+                    None => reference = Some((isa, fingerprint)),
+                    Some((first, expected)) => {
+                        assert!(
+                            fingerprint.access_unit == expected.access_unit,
+                            "qindex {qindex}: {isa:?} encoded {} bytes (digest {:016x}) against \
+                             {first:?}'s {} bytes (digest {:016x})",
+                            fingerprint.access_unit.len(),
+                            digest(&fingerprint.access_unit),
+                            expected.access_unit.len(),
+                            digest(&expected.access_unit)
+                        );
+                        assert_eq!(
+                            fingerprint.shipped, expected.shipped,
+                            "qindex {qindex}: the shipped search picked different transform \
+                             blocks under {isa:?} than under {first:?}"
+                        );
+                        assert_eq!(
+                            fingerprint.exhaustive, expected.exhaustive,
+                            "qindex {qindex}: the exhaustive search picked different transform \
+                             blocks under {isa:?} than under {first:?}"
+                        );
+                    }
+                }
+            }
+            crate::simd::set_override(None);
+        }
+    }
+
+    /// The digests [`a_fixed_frame_encodes_to_the_same_bytes_on_every_host`] pins, one per entry
+    /// of [`DETERMINISM_QINDEXES`], for the 96x80 [`test_pattern`] frame.
+    ///
+    /// These are constants of the format, not of the machine that produced them: regenerate them
+    /// only alongside a deliberate change to what the encoder emits, never to make a host pass.
+    const FIXED_FRAME_DIGESTS: [(usize, u64); 6] = [
+        (5417, 0x7b83_6e95_6bad_aae1),
+        (4298, 0xa4c4_6a5e_8ef1_57c0),
+        (3022, 0xba87_1a3d_44c1_4f33),
+        (2238, 0xc29d_7d70_a472_3158),
+        (1264, 0xc8cd_fcf5_8882_a86c),
+        (752, 0x73f1_c047_f3cf_211f),
+    ];
+
+    /// [`one_frame_encodes_identically_under_every_instruction_set`] can only compare the
+    /// instruction sets *one* host offers, and the divergence this pair of tests exists for was
+    /// between hosts: the same commit and the same frame selected `IDTX` on one machine and not
+    /// on three CI runners. A per-host loop cannot see that. A committed digest can, because
+    /// every runner has to reproduce the same bytes.
+    ///
+    /// This is the assertion that makes "reproducible bitstream" a property of the encoder rather
+    /// than of the machine it was built on.
+    #[test]
+    fn a_fixed_frame_encodes_to_the_same_bytes_on_every_host() {
+        let (width, height) = (96_u32, 80_u32);
+        let pixels = test_pattern(width, height);
+        for (qindex, (length, expected)) in
+            DETERMINISM_QINDEXES.into_iter().zip(FIXED_FRAME_DIGESTS)
+        {
+            let data = encode(width, height, qindex, &pixels);
+            assert_eq!(
+                (data.len(), digest(&data)),
+                (length, expected),
+                "qindex {qindex} encoded to {} bytes with digest {:016x}, which is not what this \
+                 frame encodes to on other hosts",
+                data.len(),
+                digest(&data)
+            );
+        }
+    }
+
     #[test]
     fn non_lossless_frames_round_trip_within_a_distortion_bound() {
         let (width, height) = (96_u32, 80_u32);
