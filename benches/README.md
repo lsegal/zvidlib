@@ -1259,6 +1259,21 @@ than the absolute time): 640x352 29.2 ms scalar against 11.0 ms NEON, and
 1920x1088 121.4 ms scalar against 38.9 ms NEON, where before it read 11.2 ms
 against 9.6 ms at 640x352 and did not separate at all at 1080p.
 
+The SAO parameter search's band-offset half is *not* part of that separation,
+and that is a measured result rather than a gap. `band_offset_row` is a
+`hevc_recon` dispatch site whose every arm resolves to the scalar reference: a
+32-way scatter is not expressible in SSE4.1, AVX2 or NEON, so the only
+vectorizable work is the clamp, shift and widened subtraction in front of it.
+Measured on the same contended Apple Silicon host against the scalar reference
+over L1-resident runs of 16 to 1024 samples, best of interleaved rounds, and
+measured again from a standalone harness: staging the classification into
+buffers and then scattering them read 0.42-1.30x and scattering straight out of
+the vector lanes read 0.44-1.24x. Neither separates from scalar - both straddle
+1.00x by less than the spread between repeats of the same measurement, which is
+what this host's contention looks like. This group agreed: its NEON arm did not
+improve. Neither kernel was landed, the same call
+`combine_weighted` got at four lanes. x86_64 is untimed.
+
 **Bitstream writing and CABAC** have no vector path at all, so `..._pcm_write`,
 `hevc_encode_cabac`, `hevc_encode_cabac_bypass` and `hevc_encode_bitwriter` are
 expected to read the same under every instruction set. That is a measured result, not a broken benchmark:

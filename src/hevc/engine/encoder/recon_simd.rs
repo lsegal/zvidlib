@@ -11,6 +11,12 @@
 //!   edge-offset class — four full passes over the picture before the filter
 //!   itself runs.
 //!
+//! The search's band-offset half ([`band_offset_row`]) is a dispatch site here
+//! too, but every arm of it resolves to the scalar reference: its 32-way
+//! scatter is not something SSE4.1, AVX2 or NEON can express, and both vector
+//! shapes that leaves were written and measured below parity. That kernel's
+//! documentation carries the numbers.
+//!
 //! Both are dispatched here through cached runtime CPU feature detection
 //! ([`isa`]) to an SSE4.1 or AVX2 implementation on `x86_64`, a NEON
 //! implementation on `aarch64`, or the portable scalar reference everywhere
@@ -315,6 +321,90 @@ pub(crate) fn edge_offset_row_scalar(
         };
         stats.sums[category] += i64::from(src[i]) - i64::from(here[i]);
         stats.counts[category] += 1;
+    }
+}
+
+/// Per-band error sums and sample counts for one run of the §8.7.3.2
+/// band-offset classification, indexed by the band index
+/// `sample >> (bitDepth − 5)`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct BandStats {
+    /// Summed `source − reconstruction` error per band.
+    pub sums: [i64; 32],
+    /// Number of samples per band.
+    pub counts: [i64; 32],
+}
+
+/// §8.7.3.2 `bandShift`: the reconstruction's top five bits index the 32 bands,
+/// which at this module's fixed 8-bit geometry is a shift of three.
+const BAND_SHIFT: i32 = 3;
+
+/// Classifies one horizontal run of reconstructed samples into §8.7.3.2 bands
+/// and accumulates the source-versus-reconstruction error of each into `stats`.
+///
+/// `here` is the run of reconstructed samples and `src` the co-located source
+/// samples. Every sample lands in exactly one of the 32 bands, so unlike
+/// [`edge_offset_row`] nothing is dropped and the counts sum to the run length.
+///
+/// The band index clamps the reconstruction into the 8-bit range before
+/// shifting, but the error is taken against the unclamped sample.
+///
+/// # This is a dispatch site with no vector arm, and that is the measured result
+///
+/// Unlike [`edge_offset_row`], every arm below resolves to the scalar
+/// reference. The band search is not a 5-way classification like the edge
+/// search is — it is a 32-way *scatter*, and none of the instruction sets this
+/// module targets can express one. SSE4.1, AVX2 and NEON have no scatter, and
+/// masking 32 accumulators per vector costs far more than the four to eight
+/// dependent read-modify-writes it would replace. What is left to vectorize is
+/// only the classification in front of the scatter — the clamp, the shift and
+/// the widened subtraction — which is a minority of the work.
+///
+/// Both shapes that leaves were written and measured on an Apple Silicon host,
+/// against this scalar reference over L1-resident runs of 16, 64, 256 and 1024
+/// samples, best of interleaved rounds, and measured a second time from a
+/// standalone harness to check the first:
+///
+/// | NEON shape | ratio to scalar |
+/// |---|---|
+/// | classify into staging buffers, then scatter the buffers | 0.42-1.30x |
+/// | classify and scatter straight out of the vector lanes | 0.44-1.24x |
+///
+/// Neither shape separates from the scalar reference. Both straddle 1.00x by
+/// less than the spread between repeats of the same measurement on this
+/// contended host — the ranges above are run-to-run noise around parity, not a
+/// speedup at one run length and a slowdown at another, and repeating the
+/// 64-sample point alone moved each shape across most of its range. That is
+/// the same answer the whole-picture `hevc_encode_640x352_reconstruct` group
+/// gave, where the NEON arm did not improve.
+///
+/// The staging round trip in particular costs more than the classification it
+/// vectorizes, and extracting the lanes only replaces four stores with four
+/// lane reads in front of the same four dependent read-modify-writes. Neither
+/// was worth landing, so this dispatches to scalar the way
+/// [`crate::hevc::engine::simd::combine_weighted`] does on the instruction sets
+/// where its kernel measured below parity.
+///
+/// The site is kept rather than the call inlined into
+/// [`crate::hevc::engine::encoder::recon`] so the band search stays a named
+/// `hevc_recon` dispatch point: the reference is exercised under every
+/// `crate::simd::set_override` pin by the tests below, so a future kernel — an
+/// AVX-512 one, where `vpconflictd` and a real scatter change the arithmetic
+/// above — has a place to go and a bit-exactness harness already pointed at it.
+/// x86_64 is untimed here and tracked separately.
+pub(crate) fn band_offset_row(here: &[i32], src: &[u8], stats: &mut BandStats) {
+    assert_eq!(here.len(), src.len(), "run and source differ");
+    band_offset_row_scalar(here, src, stats)
+}
+
+/// The portable reference for [`band_offset_row`], and on every instruction set
+/// this module targets, the implementation it dispatches to.
+pub(crate) fn band_offset_row_scalar(here: &[i32], src: &[u8], stats: &mut BandStats) {
+    for i in 0..here.len() {
+        let recon = here[i];
+        let band = (recon.clamp(0, BIT_DEPTH_MAX) >> BAND_SHIFT) as usize;
+        stats.sums[band] += i64::from(src[i]) - i64::from(recon);
+        stats.counts[band] += 1;
     }
 }
 
@@ -805,6 +895,87 @@ mod tests {
     }
 
     #[test]
+    fn the_band_offset_search_matches_the_scalar_reference_on_every_instruction_set() {
+        let _guard = simd::test_lock();
+        for &n in RUNS {
+            // A reconstruction spanning the full 8-bit range so every one of
+            // the 32 bands is reachable, plus samples outside it so the
+            // kernel's clamp is exercised alongside the unclamped error.
+            let mut here = samples(0x7777_8888_9999_aaaa, n);
+            for (i, h) in here.iter_mut().enumerate() {
+                match i % 8 {
+                    0 => *h = -7,
+                    1 => *h = 262,
+                    _ => {}
+                }
+            }
+            let src = bytes(0xc0ff_ee00_1234_5678, n);
+            let mut expected = BandStats::default();
+            band_offset_row_scalar(&here, &src, &mut expected);
+            assert_eq!(
+                expected.counts.iter().sum::<i64>(),
+                n as i64,
+                "every sample lands in exactly one band"
+            );
+            for isa in simd::available() {
+                simd::set_override(Some(isa));
+                let mut got = BandStats::default();
+                band_offset_row(&here, &src, &mut got);
+                assert_eq!(got, expected, "{} band search over {n} samples", isa.name());
+            }
+        }
+        simd::set_override(None);
+    }
+
+    #[test]
+    fn the_band_search_accumulates_into_existing_stats() {
+        // `band_stats` gathers a whole CTB by calling the kernel once per row,
+        // so a second call has to add to the first rather than replace it.
+        let _guard = simd::test_lock();
+        let here = samples(0x3131_4141_5151_6161, 37);
+        let src = bytes(0x2020_3030_4040_5050, 37);
+        let mut expected = BandStats::default();
+        band_offset_row_scalar(&here, &src, &mut expected);
+        band_offset_row_scalar(&here, &src, &mut expected);
+        for isa in simd::available() {
+            simd::set_override(Some(isa));
+            let mut got = BandStats::default();
+            band_offset_row(&here, &src, &mut got);
+            band_offset_row(&here, &src, &mut got);
+            assert_eq!(got, expected, "{}", isa.name());
+        }
+        simd::set_override(None);
+    }
+
+    #[test]
+    fn every_band_is_reachable_and_counted_once() {
+        // One sample per band, at the low edge of each, so the §8.7.3.2
+        // `sample >> (bitDepth - 5)` mapping is exercised end to end.
+        let here: Vec<i32> = (0..32).map(|b| b * 8).collect();
+        let src = vec![0u8; 32];
+        let mut stats = BandStats::default();
+        band_offset_row_scalar(&here, &src, &mut stats);
+        assert_eq!(stats.counts, [1i64; 32]);
+        let expected: Vec<i64> = (0..32).map(|b| -(b as i64) * 8).collect();
+        assert_eq!(stats.sums.to_vec(), expected);
+    }
+
+    #[test]
+    fn a_sample_outside_the_8_bit_range_still_lands_in_an_end_band() {
+        // The reconstruction is clipped before it reaches the search, but the
+        // kernel clamps anyway so an out-of-range sample cannot index past the
+        // 32-band table. The error stays unclamped, matching the reference.
+        let here = [-9i32, 300];
+        let src = [4u8, 4];
+        let mut stats = BandStats::default();
+        band_offset_row_scalar(&here, &src, &mut stats);
+        assert_eq!(stats.counts[0], 1);
+        assert_eq!(stats.counts[31], 1);
+        assert_eq!(stats.sums[0], 13);
+        assert_eq!(stats.sums[31], -296);
+    }
+
+    #[test]
     fn every_edge_category_is_reachable_and_counted_once() {
         // One sample per `edgeIdx` 0..=4, in order, so every arm of the
         // §8.7.3.2 mapping is exercised including the dropped category 0.
@@ -933,6 +1104,13 @@ mod tests {
     fn a_prediction_row_of_the_wrong_length_is_rejected() {
         let mut dst = [0i32; 8];
         reconstruct_row(&mut dst, &[0u8; 8], &[0u8; 7]);
+    }
+
+    #[test]
+    #[should_panic(expected = "run and source differ")]
+    fn a_band_source_run_of_the_wrong_length_is_rejected() {
+        let mut stats = BandStats::default();
+        band_offset_row(&[0i32; 8], &[0u8; 7], &mut stats);
     }
 
     #[test]
