@@ -1263,20 +1263,26 @@ mod nonlossless_tests {
         let mut frames = content_frames(width as u32, height as u32);
         frames.push(("test_pattern", test_pattern(width as u32, height as u32)));
         let arms = [
-            ("running", tile::GainLocality::Running),
-            ("column", tile::GainLocality::Column),
-            ("blended", tile::GainLocality::Blended),
+            ("running/weighted", tile::GainLocality::Running, tile::GainRatio::Weighted),
+            ("column/weighted", tile::GainLocality::Column, tile::GainRatio::Weighted),
+            ("blended/weighted", tile::GainLocality::Blended, tile::GainRatio::Weighted),
+            ("running/mean", tile::GainLocality::Running, tile::GainRatio::Mean),
+            ("column/mean", tile::GainLocality::Column, tile::GainRatio::Mean),
+            ("blended/mean", tile::GainLocality::Blended, tile::GainRatio::Mean),
         ];
         println!("size,{width}x{height}");
-        println!("frame,qindex,locality,penalty_percent,bytes,candidates");
+        println!("frame,qindex,arm,penalty_percent,bytes,candidates");
         for (name, pixels) in &frames {
             for qindex in [1_u8, 8, 32, 80, 160, 200] {
                 let ac = i64::from(crate::av1_intra::get_ac_quant(qindex));
                 let lambda = (ac * ac / 256).max(1);
-                let cost = |interval: usize, locality: tile::GainLocality| {
+                let cost = |interval: usize,
+                            locality: tile::GainLocality,
+                            ratio: tile::GainRatio| {
                     let report = tile::FrameEncoder::new(pixels, width, height, qindex)
                         .with_type_gain_interval(interval)
                         .with_type_gain_locality(locality)
+                        .with_type_gain_ratio(ratio)
                         .encode_with_report();
                     (
                         sse_against(&report, pixels, width, height)
@@ -1285,12 +1291,57 @@ mod nonlossless_tests {
                         report.candidates_evaluated,
                     )
                 };
-                let (unsampled, _, _) = cost(1, tile::GainLocality::Running);
-                for (label, locality) in arms {
+                let (unsampled, _, _) =
+                    cost(1, tile::GainLocality::Running, tile::GainRatio::Weighted);
+                for (label, locality, ratio) in arms {
                     let (sampled, bytes, candidates) =
-                        cost(tile::TYPE_GAIN_SAMPLE_INTERVAL, locality);
+                        cost(tile::TYPE_GAIN_SAMPLE_INTERVAL, locality, ratio);
                     let penalty = sampled as f64 / unsampled as f64 * 100.0 - 100.0;
                     println!("{name},{qindex},{label},{penalty:+.2},{bytes},{candidates}");
+                }
+            }
+        }
+    }
+
+    /// Sweeps how much of a remembered gain a trial that did not probe is corrected by.
+    ///
+    /// Neither locality nor a steadier probe moves the residual `scene_edge` penalty at 192x160,
+    /// and the frame's flipped decisions are one-directional - the sampled estimator codes the
+    /// frame in smaller transforms than the unsampled one. That is what an over-large correction
+    /// looks like: it scales with the trial's block count, so inflating it favours the size with
+    /// more blocks. This prints the penalty against the unsampled estimator as the remembered
+    /// correction is shrunk from full (`16`) to none (`0`).
+    #[test]
+    #[ignore = "measurement sweep, not an assertion"]
+    fn measure_type_gain_trust() {
+        for (width, height) in [(128_usize, 96_usize), (192, 160)] {
+            let mut frames = content_frames(width as u32, height as u32);
+            frames.push(("test_pattern", test_pattern(width as u32, height as u32)));
+            println!("size,{width}x{height}");
+            println!("frame,qindex,trust,penalty_percent,bytes,candidates");
+            for (name, pixels) in &frames {
+                for qindex in [1_u8, 8, 32, 80, 160, 200] {
+                    let ac = i64::from(crate::av1_intra::get_ac_quant(qindex));
+                    let lambda = (ac * ac / 256).max(1);
+                    let cost = |interval: usize, trust: i64| {
+                        let report = tile::FrameEncoder::new(pixels, width, height, qindex)
+                            .with_type_gain_interval(interval)
+                            .with_type_gain_trust(trust)
+                            .encode_with_report();
+                        (
+                            sse_against(&report, pixels, width, height)
+                                + lambda * report.tile.len() as i64 * 8,
+                            report.tile.len(),
+                            report.candidates_evaluated,
+                        )
+                    };
+                    let (unsampled, _, _) = cost(1, 16);
+                    for trust in [0_i64, 1, 2, 3, 4, 5, 6, 8, 12, 16] {
+                        let (sampled, bytes, candidates) =
+                            cost(tile::TYPE_GAIN_SAMPLE_INTERVAL, trust);
+                        let penalty = sampled as f64 / unsampled as f64 * 100.0 - 100.0;
+                        println!("{name},{qindex},{trust},{penalty:+.2},{bytes},{candidates}");
+                    }
                 }
             }
         }

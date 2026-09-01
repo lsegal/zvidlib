@@ -163,6 +163,11 @@ struct TypeGain {
     /// Summed best-of-set cost of the same blocks, so `dct_cost - best_cost` is what the type
     /// search has been measured to be worth at this size.
     best_cost: i64,
+    /// Probes accumulated, which the un-decayed mean divides by.
+    probes: i64,
+    /// The same measurement as the recency-weighted mean of the probes' *own* ratios, in
+    /// [`GAIN_RATIO_ONE`] units, so an expensive probe does not outweigh a cheap one.
+    ratio: i64,
 }
 
 /// Where a trial that did not probe reads its gain ratio back from.
@@ -181,6 +186,30 @@ pub(crate) enum GainLocality {
     /// both axes.
     Blended,
 }
+
+/// How a remembered gain ratio is averaged over the probes it remembers.
+///
+/// Shipped encodes always use [`GainRatio::Mean`]; [`GainRatio::Weighted`] is what #272 shipped
+/// and is kept so `measure_type_gain_ratio` can measure the two against each other.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GainRatio {
+    /// Ratio of the summed costs, which weights each probe by how expensive its block was.
+    Weighted,
+    /// Mean of the probes' own ratios, which weights every probe equally.
+    Mean,
+}
+
+/// How much of a *remembered* gain a trial that did not probe is corrected by, in
+/// [`TYPE_GAIN_TRUST_ONE`] sixteenths. A trial that probed is always corrected in full by what
+/// it measured itself.
+pub(super) const TYPE_GAIN_TRUST: i64 = 16;
+
+/// [`TYPE_GAIN_TRUST`] denominator: the un-shrunk correction.
+const TYPE_GAIN_TRUST_ONE: i64 = 16;
+
+/// Fixed-point scale of [`TypeGain::ratio`], which is a fraction in `0..=1` and needs the
+/// resolution an integer ratio of costs would otherwise lose.
+const GAIN_RATIO_ONE: i64 = 1 << 20;
 
 /// Slot in [`FrameEncoder::type_gain`] for a transform of `tx_width` samples a side.
 fn type_gain_slot(tx_width: usize) -> usize {
@@ -280,10 +309,24 @@ pub(crate) struct FrameEncoder<'a> {
     /// it blends. [`GainLocality::Blended`] outside tests.
     #[cfg(test)]
     type_gain_locality: GainLocality,
+    /// Transform blocks a probing size trial measures with the whole type set, so a test can
+    /// sweep it. [`TYPE_GAIN_PROBES`] outside tests.
+    #[cfg(test)]
+    type_gain_probes: usize,
+    /// How a remembered ratio is averaged, so a test can sweep it. [`GainRatio::Mean`] outside
+    /// tests.
+    #[cfg(test)]
+    type_gain_ratio: GainRatio,
+    /// The shrinkage in force, in the units of [`TYPE_GAIN_TRUST`], so a test can sweep it.
+    #[cfg(test)]
+    type_gain_trust: i64,
     /// Transform-type candidates actually transformed, quantized and reconstructed, which is the
     /// work the shortcuts exist to remove.
     #[cfg(test)]
     candidates_evaluated: u64,
+    /// Every transform-size decision this frame's searches made, for [`SearchReport`].
+    #[cfg(test)]
+    size_choices: Vec<(usize, usize, usize, usize)>,
 }
 
 /// What one encode of a tile did, for the tests that compare two searches against each other.
@@ -294,6 +337,10 @@ pub(crate) struct SearchReport {
     pub(crate) coded_width: usize,
     pub(crate) trace: Vec<(usize, Av1TxType)>,
     pub(crate) candidates_evaluated: u64,
+    /// Every transform-size decision the frame's searches made, as `(row, column, block width,
+    /// chosen transform width)` in MI units, so a measurement can attribute a difference between
+    /// two searches to a place in the frame rather than to a position in the trace.
+    pub(crate) size_choices: Vec<(usize, usize, usize, usize)>,
 }
 
 /// One transform type considered for a block, with everything the winner needs to be written:
@@ -378,7 +425,15 @@ impl<'a> FrameEncoder<'a> {
             #[cfg(test)]
             type_gain_locality: GainLocality::Blended,
             #[cfg(test)]
+            type_gain_probes: TYPE_GAIN_PROBES,
+            #[cfg(test)]
+            type_gain_ratio: GainRatio::Weighted,
+            #[cfg(test)]
+            type_gain_trust: TYPE_GAIN_TRUST,
+            #[cfg(test)]
             candidates_evaluated: 0,
+            #[cfg(test)]
+            size_choices: Vec::new(),
         }
     }
 
@@ -476,6 +531,68 @@ impl<'a> FrameEncoder<'a> {
         GainLocality::Blended
     }
 
+    /// Overrides how many of a probing trial's blocks are measured with the whole type set, so a
+    /// test can measure what a noisier or steadier probe is worth.
+    #[cfg(test)]
+    pub(crate) fn with_type_gain_probes(mut self, probes: usize) -> Self {
+        assert!(probes >= 1, "a trial that probes measures at least one block");
+        self.type_gain_probes = probes;
+        self
+    }
+
+    /// Blocks a probing trial measures. [`TYPE_GAIN_PROBES`] outside tests.
+    #[cfg(test)]
+    fn type_gain_probes(&self) -> usize {
+        self.type_gain_probes
+    }
+
+    /// Blocks a probing trial measures. [`TYPE_GAIN_PROBES`] outside tests.
+    #[cfg(not(test))]
+    fn type_gain_probes(&self) -> usize {
+        TYPE_GAIN_PROBES
+    }
+
+    /// Overrides how a remembered ratio is averaged, so a test can measure the shipped mean
+    /// against the cost-weighted ratio of sums it replaced.
+    #[cfg(test)]
+    pub(crate) fn with_type_gain_ratio(mut self, ratio: GainRatio) -> Self {
+        self.type_gain_ratio = ratio;
+        self
+    }
+
+    /// How a remembered ratio is averaged. [`GainRatio::Mean`] outside tests.
+    #[cfg(test)]
+    fn type_gain_ratio(&self) -> GainRatio {
+        self.type_gain_ratio
+    }
+
+    /// How a remembered ratio is averaged. [`GainRatio::Mean`] outside tests.
+    #[cfg(not(test))]
+    fn type_gain_ratio(&self) -> GainRatio {
+        GainRatio::Weighted
+    }
+
+    /// Overrides how far a remembered gain is shrunk toward no correction at all, so a test can
+    /// sweep it. `16` is the un-shrunk correction and `0` no correction.
+    #[cfg(test)]
+    pub(crate) fn with_type_gain_trust(mut self, trust: i64) -> Self {
+        assert!((0..=TYPE_GAIN_TRUST_ONE).contains(&trust), "shrinkage is a fraction");
+        self.type_gain_trust = trust;
+        self
+    }
+
+    /// The shrinkage in force. [`TYPE_GAIN_TRUST`] outside tests.
+    #[cfg(test)]
+    fn type_gain_trust(&self) -> i64 {
+        self.type_gain_trust
+    }
+
+    /// The shrinkage in force. [`TYPE_GAIN_TRUST`] outside tests.
+    #[cfg(not(test))]
+    fn type_gain_trust(&self) -> i64 {
+        TYPE_GAIN_TRUST
+    }
+
     /// Encodes the tile and returns the symbol-coded bytes (`decode_tile`, §5.11.2).
     pub(crate) fn encode(mut self) -> Vec<u8> {
         self.encode_superblocks();
@@ -494,6 +611,7 @@ impl<'a> FrameEncoder<'a> {
             coded_width: self.coded_w,
             trace: std::mem::take(&mut self.emitted),
             candidates_evaluated: self.candidates_evaluated,
+            size_choices: std::mem::take(&mut self.size_choices),
             tile: self.sym.finish(),
         }
     }
@@ -725,7 +843,7 @@ impl<'a> FrameEncoder<'a> {
                 continue;
             }
             let snapshot = self.snapshot(r, c, bw);
-            self.probe_budget = if probing { TYPE_GAIN_PROBES } else { 0 };
+            self.probe_budget = if probing { self.type_gain_probes() } else { 0 };
             self.probe_dct_cost = 0;
             self.probe_best_cost = 0;
             self.trial_searched_cost = 0;
@@ -743,6 +861,8 @@ impl<'a> FrameEncoder<'a> {
         // set's DCT alone, which is where the shortcut's speedup comes from.
         self.probe_budget = 0;
         debug_assert_ne!(best.0, 0, "every coding block has one legal transform size");
+        #[cfg(test)]
+        self.size_choices.push((r, c, bw, best.0));
         self.tx_size_memo[slot] = (best.0 / 4).trailing_zeros() as u8;
         best.0
     }
@@ -772,19 +892,39 @@ impl<'a> FrameEncoder<'a> {
             let slot = type_gain_slot(tx_width);
             let running = self.type_gain[slot];
             let column = self.column_gain[self.gain_column * TYPE_GAIN_SIZES + slot];
-            match self.type_gain_locality() {
+            let (dct, best) = match self.type_gain_locality() {
                 GainLocality::Running => (running.dct_cost, running.best_cost),
                 GainLocality::Column => (column.dct_cost, column.best_cost),
                 GainLocality::Blended => (
                     running.dct_cost + column.dct_cost,
                     running.best_cost + column.best_cost,
                 ),
+            };
+            match self.type_gain_ratio() {
+                GainRatio::Weighted => (dct, best),
+                // The mean is already a ratio, so it is handed back over `GAIN_RATIO_ONE` and
+                // the arithmetic below is the same subtraction either way.
+                GainRatio::Mean => {
+                    let ratio = match self.type_gain_locality() {
+                        GainLocality::Running => running.ratio,
+                        GainLocality::Column => column.ratio,
+                        GainLocality::Blended => (running.ratio + column.ratio) / 2,
+                    };
+                    if dct <= 0 {
+                        (0, 0)
+                    } else {
+                        (GAIN_RATIO_ONE, GAIN_RATIO_ONE - ratio)
+                    }
+                }
             }
         };
         if dct <= 0 {
             return cost;
         }
-        let measured = dct - best;
+        let mut measured = dct - best;
+        if self.probe_dct_cost <= 0 {
+            measured = measured * self.type_gain_trust() / TYPE_GAIN_TRUST_ONE;
+        }
         cost - measured.saturating_mul(self.trial_searched_cost) / dct
     }
 
@@ -979,11 +1119,26 @@ impl<'a> FrameEncoder<'a> {
             //
             // `usize::MAX` is the sentinel for no decay at all, which is the frame-wide
             // accumulation this replaced; a test sweeps it as the far end of the window.
+                let probe_ratio = if dct > 0 {
+                    (dct - best_of_set) * GAIN_RATIO_ONE / dct
+                } else {
+                    0
+                };
                 if memory != usize::MAX {
                     let (num, den) = (memory as i64 - 1, memory as i64);
                     gain.dct_cost = gain.dct_cost * num / den;
                     gain.best_cost = gain.best_cost * num / den;
+                    // The mean is aged the same way, but a probe joins it as its own ratio
+                    // rather than as its costs, so a block that was expensive to code does not
+                    // count for more than a cheap one.
+                    gain.ratio = (gain.ratio * num + probe_ratio) / den;
+                } else if gain.probes == 0 {
+                    gain.ratio = probe_ratio;
+                } else {
+                    gain.ratio =
+                        (gain.ratio * gain.probes + probe_ratio) / (gain.probes + 1);
                 }
+                gain.probes += 1;
                 gain.dct_cost += dct;
                 gain.best_cost += best_of_set;
             }
