@@ -193,7 +193,7 @@ is not mistaken for bitstream-writing cost. Both default to 640x352 and add a
 | `av1_encode_frame_q{0,32,160}` | one whole frame through the public encoder, `src/av1_encoder/tile.rs` |
 | `av1_encode_stage_wht` | the forward 4x4 WHT, `src/av1_encoder/wht.rs` |
 | `av1_encode_stage_symbol` | symbol coding over the static CDF tables, `src/av1_encoder/symbol.rs` and `cdf.rs` |
-| `av1_encode_stage_tile` | tile encoding: superblock iteration, `DC_PRED`, coefficient coding, `src/av1_encoder/tile.rs` |
+| `av1_encode_stage_tile` | tile encoding: superblock iteration, `DC_PRED`, coefficient coding and its vectorized §8.3.2 context derivation, `src/av1_encoder/tile.rs` and `src/av1_simd/coeff.rs` |
 | `av1_encode_stage_bitstream` | headers, bit writing and OBU LEB128 framing, `src/av1_encoder/{bitwriter,headers,leb128}.rs` |
 | `av1_forward_dct_{4x4,8x8,16x16,32x32}` | forward DCT, `src/av1_encoder/transform.rs` through `zvidlib::forward_transform` |
 | `av1_forward_adst_8x8`, `av1_forward_flipadst_16x16` | the forward ADST family, including a flipped type |
@@ -209,12 +209,25 @@ WHT and the symbol coder are each an order of magnitude cheaper than that, and
 header writing with its LEB128 framing is two to three orders cheaper again —
 microseconds against a 1080p tile encode's hundreds of milliseconds. Coefficient
 coding and its context derivation inside `tile.rs`, not the transform, are what a
-faster lossless encoder has to attack next.
+faster lossless encoder has to attack, and the §8.3.2 context derivation half of
+that is now vectorized (see below), which is why `av1_encode_stage_tile` and
+`av1_encode_frame_q0` are no longer flat across instruction sets.
 
-The forward transforms and the forward WHT are this encoder's only vectorized
-kernels. Symbol coding, CDF handling and bitstream writing are scalar and
-expected to stay that way, so those arms read the same under every instruction
-set. That flatness is a measured result rather than a broken run, which is why
+This encoder's vectorized kernels are the forward transforms, the forward WHT,
+and the `coeff_base` / `coeff_br` context derivation the coefficient coding loop
+runs on (§8.3.2, `src/av1_simd/coeff.rs`, the `av1_coeff_ctx` dispatch site).
+The last of those is what makes `av1_encode_stage_tile` move with the
+instruction set at all: the whole block's contexts are derived in one
+data-parallel pass ahead of the serial symbol loop, which is legal because the
+loop walks the up-right diagonal scan backwards and every neighbour a position
+consults is therefore already final.
+
+Symbol coding itself, CDF handling and bitstream writing remain scalar and are
+expected to stay that way — the range coder is serial by construction, since
+every symbol updates the CDF and the coder state the next symbol is written
+against — so `av1_encode_stage_symbol` and `av1_encode_stage_bitstream` read the
+same under every instruction set. That flatness is a measured result rather than
+a broken run, which is why
 each group asserts through `simd::active_by_site()` that the override landed
 instead of inferring it from the clock. `report_stage_coverage` prints the stage
 list on every run, so a group that stops being measured reads as a broken run
