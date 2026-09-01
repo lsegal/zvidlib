@@ -272,21 +272,12 @@ pub(crate) fn edge_offset_row_scalar(
 /// Per-band error sums and sample counts for one run of the §8.7.3.2
 /// band-offset classification, indexed by the band index
 /// `sample >> (bitDepth − 5)`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct BandStats {
     /// Summed `source − reconstruction` error per band.
     pub sums: [i64; 32],
     /// Number of samples per band.
     pub counts: [i64; 32],
-}
-
-impl Default for BandStats {
-    fn default() -> Self {
-        Self {
-            sums: [0; 32],
-            counts: [0; 32],
-        }
-    }
 }
 
 /// §8.7.3.2 `bandShift`: the reconstruction's top five bits index the 32 bands,
