@@ -1030,6 +1030,58 @@ mod nonlossless_tests {
         }
     }
 
+    /// The emitting pass writes a probed block from the probe's own result instead of searching
+    /// it again, and writes exactly what searching it again would have written.
+    ///
+    /// A size trial probes one of its blocks with the whole transform-type set purely to measure
+    /// what the type search is worth at that size, then keeps DCT's result so the trial matches a
+    /// DCT-only one. For the size the search selects, the emitting pass reaches that block in the
+    /// state the trial saw, so the winner the probe already computed is the winner it would
+    /// recompute - and this asserts both halves of that: the bytes and the reconstruction are
+    /// identical to the same encoder with the reuse turned off, and strictly fewer
+    /// transform-type candidates are evaluated to produce them.
+    #[test]
+    fn the_emitting_pass_reuses_a_probe_it_can_key_exactly() {
+        let mut reused_somewhere = false;
+        // Two frame sizes, because whether a probed block is also the block the winning size
+        // emits depends on how the partition tree falls, which the frame's dimensions decide.
+        for ((width, height), qindex) in [(96_usize, 80_usize), (64, 64)]
+            .into_iter()
+            .flat_map(|size| [1_u8, 8, 32, 80, 160, 200].map(|qindex| (size, qindex)))
+        {
+            let pixels = test_pattern(width as u32, height as u32);
+            let reused =
+                tile::FrameEncoder::new(&pixels, width, height, qindex).encode_with_report();
+            let searched = tile::FrameEncoder::new(&pixels, width, height, qindex)
+                .without_probe_reuse()
+                .encode_with_report();
+            assert_eq!(
+                (reused.tile.len(), digest(&reused.tile)),
+                (searched.tile.len(), digest(&searched.tile)),
+                "qindex {qindex} encoded differently when the emitting pass reused a probe"
+            );
+            assert_eq!(
+                reused.reconstruction, searched.reconstruction,
+                "qindex {qindex} reconstructed differently when the emitting pass reused a probe"
+            );
+            assert_eq!(
+                reused.trace, searched.trace,
+                "qindex {qindex} wrote different transform blocks when the emitting pass reused                  a probe"
+            );
+            assert!(
+                reused.candidates_evaluated <= searched.candidates_evaluated,
+                "qindex {qindex} evaluated {} candidates with the reuse on against {} with it                  off, so reading a probe back cost work instead of saving it",
+                reused.candidates_evaluated,
+                searched.candidates_evaluated
+            );
+            reused_somewhere |= reused.candidates_evaluated < searched.candidates_evaluated;
+        }
+        assert!(
+            reused_somewhere,
+            "no quantizer reused a probe's result, so the emitting pass never found a key it              could match and the reuse gets no coverage"
+        );
+    }
+
     /// `TX_4X4` is a size the shipped search *selects*, not just one the emitting path could
     /// write.
     ///

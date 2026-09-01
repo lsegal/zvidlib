@@ -179,6 +179,10 @@ pub(crate) struct FrameEncoder<'a> {
     /// test can compare the shortcuts against the search they stand in for.
     #[cfg(test)]
     exhaustive: bool,
+    /// Cleared by [`Self::without_probe_reuse`] to make the emitting pass re-run every search a
+    /// probe already did, so a test can measure what reading the probe back saves.
+    #[cfg(test)]
+    reuse_probes: bool,
     /// Transform-type candidates actually transformed, quantized and reconstructed, which is the
     /// work the shortcuts exist to remove.
     #[cfg(test)]
@@ -273,6 +277,8 @@ impl<'a> FrameEncoder<'a> {
             #[cfg(test)]
             exhaustive: false,
             #[cfg(test)]
+            reuse_probes: true,
+            #[cfg(test)]
             candidates_evaluated: 0,
         }
     }
@@ -295,6 +301,27 @@ impl<'a> FrameEncoder<'a> {
     /// Whether the search shortcuts are on. Always, outside tests.
     #[cfg(not(test))]
     fn shortcuts(&self) -> bool {
+        true
+    }
+
+    /// Makes the emitting pass search every block from scratch, including the ones a size trial's
+    /// probe already searched. The result is the same bitstream at a higher candidate count,
+    /// which is what a test compares against.
+    #[cfg(test)]
+    pub(crate) fn without_probe_reuse(mut self) -> Self {
+        self.reuse_probes = false;
+        self
+    }
+
+    /// Whether the emitting pass reads a probe's cached result back. Always, outside tests.
+    #[cfg(test)]
+    fn reuse_probes(&self) -> bool {
+        self.reuse_probes
+    }
+
+    /// Whether the emitting pass reads a probe's cached result back. Always, outside tests.
+    #[cfg(not(test))]
+    fn reuse_probes(&self) -> bool {
         true
     }
 
@@ -676,7 +703,7 @@ impl<'a> FrameEncoder<'a> {
         //
         // The zero-block shortcut needs no re-check either: it is decided by the residual, and a
         // probe only ever ran on a block whose residual already failed it.
-        if emit {
+        if emit && self.reuse_probes() {
             if let Some(candidate) = self.probed.remove(&(x, y, size, prediction)) {
                 let scan = cdf::up_right_diagonal_scan(size);
                 return self.write_candidate(
