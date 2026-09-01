@@ -1343,7 +1343,9 @@ mod nonlossless_tests {
         for (width, height) in [(96_usize, 80_usize), (128, 96), (192, 160)] {
             let mut frames = content_frames(width as u32, height as u32);
             frames.push(("test_pattern", test_pattern(width as u32, height as u32)));
-            println!("frame,width,height,qindex,fast_psnr,exh_psnr,d_psnr,fast_bytes,exh_bytes,rate_growth,fast_candidates,exh_candidates,reduction");
+            println!(
+                "frame,width,height,qindex,fast_psnr,exh_psnr,d_psnr,fast_bytes,exh_bytes,rate_growth,fast_candidates,exh_candidates,reduction"
+            );
             for (name, pixels) in &frames {
                 for qindex in [1_u8, 8, 32, 80, 160, 200] {
                     let fast =
