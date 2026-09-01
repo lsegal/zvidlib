@@ -21,7 +21,7 @@ jobs:
     # Swift runtime it does not stage next to the test binary, so add the
     # system Swift runtime directory to the binary's rpath.
     env:
-      RUSTFLAGS: ${{ runner.os == 'macOS' && '-C link-arg=-Wl,-rpath,/usr/lib/swift' || '' }}
+      RUSTFLAGS: ${{ startsWith(matrix.os, 'macos') && '-C link-arg=-Wl,-rpath,/usr/lib/swift' || '' }}
     steps:
       - uses: actions/checkout@v4
       - name: Install native audio dependencies
