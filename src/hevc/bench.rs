@@ -39,7 +39,7 @@ const BENCH_PREDICTOR: i32 = 128;
 
 /// Runs the encoder's mode-search / RDO stage over one luma picture.
 ///
-/// This is the stage that reaches `hevc_rdcost`, one of the crate's two
+/// This is the stage that reaches `hevc_rdcost`, one of the crate's three
 /// encoder-side SIMD dispatch families, through its SAD and SATD distortion
 /// metrics.
 ///
