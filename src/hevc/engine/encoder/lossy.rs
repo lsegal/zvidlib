@@ -494,8 +494,8 @@ fn write_idr_residual_slice(
     if filter.deblocking() {
         deblock_reconstruction(&mut recon, qp);
     }
-    // §8.7.3 runs behind §8.7.2 and returns the per-CTB parameters the
-    // bitstream pass below codes, so the decoder resolves the same grid this
+    // §8.7.3 runs behind §8.7.2 and returns the per-CTB parameters the slice
+    // data below codes, so the decoder resolves the same grid this
     // reconstruction was filtered with.
     //
     // Then the slice-level half of the decision. Every CTB the search leaves
@@ -503,14 +503,15 @@ fn write_idr_residual_slice(
     // best case — so a picture SAO finds nothing in pays for the search's
     // silence on every CTB of it. `slice_sao_luma_flag` /
     // `slice_sao_chroma_flag` are what make that optional: with both 0,
-    // §7.3.8.3 codes nothing at all and the whole cost is the two header bits.
-    // So the pass is kept only when the SSE it actually removed clears the
-    // bins it would actually be coded with, under the same `D + lambda * R`
-    // the mode decision uses; otherwise the reconstruction reverts to the
-    // deblocked one and the slice says so.
-    // The slice data as it stands without SAO. If the decision below keeps
-    // the pass, the coded grid's own replaces it — either way what the
-    // decision measured is what the access unit carries, byte for byte.
+    // §7.3.8.3 codes nothing at all and the whole cost is the two header
+    // bits. So the pass is kept only when the error it actually removed
+    // clears the bits it actually costs, at what a bit is worth on this
+    // picture's own rate-distortion curve; otherwise the reconstruction
+    // reverts to the deblocked one and the slice says so.
+    //
+    // The slice data as it stands without SAO. If the decision keeps the
+    // pass, the coded grid's own replaces it — either way what the decision
+    // measured is what the access unit carries, byte for byte.
     let mut slice_data = code_slice_data(&records, None, qp, ctbs_x);
     let mut sao_kept = false;
     if filter.sao() {
@@ -542,9 +543,9 @@ fn write_idr_residual_slice(
         // front of each CTB, against the same slice data without them.
         let coded = code_slice_data(&records, Some(&grid), qp, ctbs_x);
         let sao_bits = (coded.len() as u64 * 8).saturating_sub(base.bits);
-        // The alternative SAO is weighed against is one step of the
-        // quantizer, so that is the point the probe codes: this same writer
-        // one QP finer, or one QP coarser at QP 0 where there is no finer.
+        // What SAO is weighed against is one step of the quantizer, so that
+        // is the point the probe codes: this same writer one QP finer, or one
+        // QP coarser at QP 0, where there is no finer.
         let probe = || {
             let point = |probe_qp| {
                 curve_point(
