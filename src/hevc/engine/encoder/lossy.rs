@@ -47,10 +47,19 @@
 //! [`crate::hevc::engine::encoder::recon::deblock_reconstruction`].
 //!
 //! §8.7.3 SAO runs behind it, in the §8.7.1 order: the SPS carries
-//! `sample_adaptive_offset_enabled_flag == 1`, the writer searches an
-//! edge-offset class per CTB over the *deblocked* reconstruction
+//! `sample_adaptive_offset_enabled_flag == 1`, the writer searches both
+//! §8.7.3.2 types per CTB over the *deblocked* reconstruction
 //! ([`crate::hevc::engine::encoder::recon::sao_reconstruction`]) and codes the
 //! §7.3.8.3 `sao( )` structure it found at the head of each CTB's slice data.
+//! Both types, because they reach different error: the four edge-offset
+//! classes shape the error around a local edge, while band offset shapes it
+//! over a *value range*, which is what a CTB whose reconstruction is uniformly
+//! biased across some part of the sample range needs and no edge class can
+//! deliver. They are searched together and scored against each other under one
+//! `D + lambda * R` comparison, so the type is chosen by what it buys net of
+//! what it costs — band offset pays four `sao_offset_sign` bins and five
+//! `sao_band_position` bins where edge offset pays two class bins and infers
+//! its signs.
 //!
 //! ## Why SAO is on, and when the writer turns it off again
 //!
@@ -67,16 +76,27 @@
 //!
 //! Measured against the same writer with SAO off, same QP, same mode
 //! decisions, whole-picture PSNR and slice size: on smooth content at QP 12
-//! the pass is taken and buys +0.73 dB for +11.4% of the slice at 64x48 and
-//! +0.89 dB for +13.4% at 128x96; on the noise-carrying picture it is taken
-//! from QP 32 to 37 and buys +0.22 to +0.35 dB for +3.5% to +7.5%. At every
-//! other point of the QP 12 to 51 sweep the slice-level test declines it and
-//! the slice is the deblocked writer's to the byte, or within one byte of it.
-//! Two of the accepted points — the noise picture at QP 32 — sit 0.08 to
+//! the pass is taken and buys +0.73 dB for +11.0% of the slice at 64x48 and
+//! +0.89 dB for +13.3% at 128x96; on the noise-carrying picture it is taken at
+//! QP 12, 20, 32 and 37 and buys +0.09 to +0.35 dB for +0.2% to +7.1%. At
+//! every other point of the QP 12 to 51 sweep the slice-level test declines it
+//! and the slice is the deblocked writer's to the byte, or within one byte of
+//! it. Two of the accepted points — the noise picture at QP 32 — sit 0.08 to
 //! 0.14 dB *below* what the same bits buy as a finer QP on the SAO-off
 //! rate-distortion curve, which is the fixed lambda being a heuristic rather
 //! than SAO being a loss; the clear wins are 0.38 to 0.43 dB above that same
 //! curve.
+//!
+//! Band offset is what the two new operating points are: with only the edge
+//! classes searched, the noise picture at QP 12 bought +0.04 dB and at QP 20
+//! nothing at all. Searching both types it buys +0.14 dB for +0.5% of slice at
+//! 64x48 and +0.15 dB for +0.2% at 128x96, and at QP 20 +0.09 dB for +0.6% and
+//! +0.13 dB for +0.2%. It is never selected on the smooth picture at any QP —
+//! that content's error is edge-shaped, and adding the band candidates only
+//! moves its slice by a byte, from the type now being chosen on rate-distortion
+//! rather than on gain alone. Two coarse noise points give back 0.001 to
+//! 0.003 dB for two to three bytes, which is that same comparison paying for
+//! itself; that is on the record rather than papered over.
 //!
 //! ## Why the writer runs two passes
 //!

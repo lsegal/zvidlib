@@ -596,25 +596,37 @@ pub(crate) fn sao_reconstruction(
 
 /// Encoder-side §7.3.8.3 SAO parameter estimation.
 ///
-/// For each CTB this picks the edge-offset class whose per-category mean error
-/// between the source and the deblocked reconstruction reduces the sum of
-/// squared errors the most, and leaves SAO off for that CTB when no class
-/// earns its own syntax. The offsets are the per-category mean errors clamped
-/// to the signalable range with the §7.4.9.3 inferred edge-offset signs
-/// (categories 1 and 2 positive, 3 and 4 negative), which is the standard
-/// least-squares choice for edge offset and the reason this stage is worth
-/// measuring: it reads every reconstructed sample of the picture once per
-/// candidate class.
+/// For each CTB this searches both §8.7.3.2 types against each other and
+/// against leaving SAO off, and takes whichever wins on `D + lambda * R`:
+///
+/// * the four **edge-offset** classes, whose offsets are the per-category mean
+///   errors between the source and the deblocked reconstruction, clamped to
+///   the signalable range with the §7.4.9.3 inferred signs (categories 1 and
+///   2 positive, 3 and 4 negative);
+/// * the 32 **band-offset** positions, whose four consecutive bands take their
+///   own per-band mean errors, clamped to the same magnitude but signalled
+///   with a `sao_offset_sign` each, so an offset may point either way.
+///
+/// Both are the least-squares choice for their type, which is the reason this
+/// stage is worth measuring: it reads every reconstructed sample of the
+/// picture once per candidate class, plus once more to bin the samples the 32
+/// band positions are all scored from.
+///
+/// The two types are compared under one score rather than a winner being
+/// picked per type first, because they do not cost the same: band offset pays
+/// four signs and five `sao_band_position` bins where edge offset pays two
+/// class bins, so a band candidate has to buy more error to be worth the same.
 ///
 /// The two chroma components are decided *together*, on the summed gain of one
-/// shared class, because §7.4.9.3 infers `SaoTypeIdx[2]` and `SaoEoClass[2]`
-/// from cIdx 1: a Cb and a Cr that picked different classes are not a
-/// bitstream. Each still carries its own four offsets, which is the whole of
-/// what the syntax gives cIdx 2 of its own.
+/// shared type, because §7.4.9.3 infers `SaoTypeIdx[2]` and `SaoEoClass[2]`
+/// from cIdx 1: a Cb and a Cr that picked different types, or different edge
+/// classes, are not a bitstream. Each still carries its own four offsets and,
+/// under band offset, its own `sao_band_position` — no position is inferred —
+/// which is the whole of what the syntax gives cIdx 2 of its own.
 ///
 /// `lambda_q8` is the §9 rate-distortion multiplier in 1/256 units, matching
 /// [`crate::hevc::engine::encoder::rdo::lambda_q8`]. SAO costs per-CTB syntax
-/// on every CTB it is enabled for, so a class is taken only when its SSE
+/// on every CTB it is enabled for, so a candidate is taken only when its SSE
 /// reduction clears `lambda * bins`, the bins being the §9.3.3 binarization's
 /// own count for the parameters that would be coded. At `lambda_q8 == 0` the
 /// test degrades to "any reduction at all", which is what a caller that codes
@@ -1058,6 +1070,60 @@ mod tests {
                 (d * d) as u64
             })
             .sum()
+    }
+
+    #[test]
+    fn the_search_takes_band_offset_where_the_bias_is_a_value_range() {
+        // The case §8.7.3.2 edge offset cannot reach: two flat regions, one of
+        // which the "quantizer" biased 3 low. Every interior sample of a flat
+        // region is edge category 0, so no edge class has anything to offset —
+        // but every one of those samples sits in the same value band, which is
+        // precisely what band offset selects on.
+        let mut pic = Picture::new(W, H, CHROMA_ARRAY_TYPE, BIT_DEPTH, BIT_DEPTH);
+        let (buf, _) = pic.plane_mut(Plane::Luma);
+        for row in 0..H {
+            for col in 0..W {
+                buf[row * W + col] = if col < W / 2 { 100 } else { 200 };
+            }
+        }
+        for plane in [Plane::Cb, Plane::Cr] {
+            let (buf, _) = pic.plane_mut(plane);
+            buf.fill(128);
+        }
+        let y: Vec<u8> = (0..W * H)
+            .map(|i| if i % W < W / 2 { 103 } else { 200 })
+            .collect();
+        let chroma = vec![128u8; (W / 2) * (H / 2)];
+        let src = SourcePlanes {
+            y: &y,
+            cb: &chroma,
+            cr: &chroma,
+            width: W,
+            height: H,
+        };
+
+        let grid = estimate_sao(&pic, src, true, true, 32);
+        // The first CTB lies wholly inside the biased region.
+        let luma = grid[0].components[0];
+        assert_eq!(
+            luma.sao_type_idx, 1,
+            "the search picked type {} where only band offset can reach the error",
+            luma.sao_type_idx
+        );
+        // Band 12 is where sample 100 lives at 8-bit depth (100 >> 3), and the
+        // four signalled bands wrap the 32-band range from `band_position`.
+        let position = usize::from(luma.band_position);
+        let k = (12 + 32 - position) % 32;
+        assert!(
+            k < 4,
+            "band 12 is outside the four bands at position {position}"
+        );
+        assert_eq!(
+            luma.offset_val[k + 1],
+            3,
+            "the band carrying the bias was offset by {} rather than its mean error",
+            luma.offset_val[k + 1]
+        );
     }
 
     #[test]
