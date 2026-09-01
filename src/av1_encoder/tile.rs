@@ -280,7 +280,7 @@ pub(crate) enum GainRatio {
 /// transform sizes it evaluates 151,019 transform-type candidates against the un-shrunk 155,392,
 /// 2.8% *fewer*, against the exhaustive search's 700,004. Fewer candidates but slightly more
 /// time: from the minimum of five interleaved rounds per arm in `measure_type_gain_trust_cost`
-/// over the six frames at six quantizers, 1.060 s against 1.012 s un-shrunk, +4.7%. The
+/// over the six frames at six quantizers, 0.686 s against 0.677 s un-shrunk, +1.3%. The
 /// candidates it stops evaluating are the cheapest ones - a 4x4 or 8x8 transform of a block it
 /// now codes whole - so removing them does not pay for the larger transforms it codes instead.
 pub(super) const TYPE_GAIN_TRUST: i64 = 2;
