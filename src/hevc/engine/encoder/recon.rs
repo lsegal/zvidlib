@@ -1285,6 +1285,49 @@ mod tests {
     }
 
     #[test]
+    fn the_quantized_reconstruction_is_identical_on_every_instruction_set_at_every_qp() {
+        // The lossy writer's §8.6.6 add-and-clip dispatches through
+        // `hevc_recon` too, over `i32` operands rather than the byte runs the
+        // exact-residual path carries. Every QP the round-trip tests cover has
+        // to reconstruct byte for byte the same on every instruction set, both
+        // intra and predicting from a lossy reference.
+        let _guard = crate::simd::test_lock();
+        let src = source(0);
+        let next = source(3);
+        for qp in [12i32, 20, 26, 34, 37, 47, 51] {
+            let cfg = ReconConfig {
+                deblocking: true,
+                sao_luma: true,
+                sao_chroma: true,
+                pcm_loop_filter_disabled: false,
+                quantized_residual: true,
+                qp,
+            };
+            crate::simd::set_override(Some(crate::simd::SimdIsa::Scalar));
+            let reference = reconstruct_picture(planes(&src), None, &plan(&src, None), cfg);
+            let expected_inter = reconstruct_picture(
+                planes(&next),
+                Some(&reference),
+                &plan(&next, Some(&reference.y)),
+                cfg,
+            );
+            for isa in crate::simd::available() {
+                crate::simd::set_override(Some(isa));
+                let intra = reconstruct_picture(planes(&src), None, &plan(&src, None), cfg);
+                assert_eq!(intra, reference, "{} intra at qp {qp}", isa.name());
+                let inter = reconstruct_picture(
+                    planes(&next),
+                    Some(&reference),
+                    &plan(&next, Some(&reference.y)),
+                    cfg,
+                );
+                assert_eq!(inter, expected_inter, "{} inter at qp {qp}", isa.name());
+            }
+        }
+        crate::simd::set_override(None);
+    }
+
+    #[test]
     fn sao_estimation_does_not_increase_distortion_against_the_source() {
         // The estimator picks per-CTB edge offsets by the SSE reduction they
         // buy, and refuses a class that buys none, so enabling SAO on top of
