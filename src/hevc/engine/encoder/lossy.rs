@@ -1699,6 +1699,102 @@ mod tests {
         (encode(LoopFilter::Deblock), encode(LoopFilter::DeblockSao))
     }
 
+    /// The §7.3.8.3 grid the writer would code for one picture at one QP —
+    /// the same [`sao_reconstruction`] call the coding loop makes, on the same
+    /// deblocked reconstruction and with the same lambda, so what it returns
+    /// is what the slice carries.
+    fn sao_grid(
+        y: &[u8],
+        cb: &[u8],
+        cr: &[u8],
+        width: usize,
+        height: usize,
+        qp: i32,
+    ) -> Vec<ResolvedSao> {
+        let (_, mut deblocked, _) = write_idr_residual_slice(
+            y,
+            cb,
+            cr,
+            width,
+            height,
+            qp,
+            ModeSearch::Rdo,
+            LoopFilter::Deblock,
+        );
+        sao_reconstruction(
+            &mut deblocked,
+            SourcePlanes {
+                y,
+                cb,
+                cr,
+                width,
+                height,
+            },
+            lambda_q8(qp),
+        )
+    }
+
+    #[test]
+    fn the_search_picks_band_offset_where_it_beats_every_edge_class() {
+        // The band path of §7.3.8.3 — four `sao_offset_sign` bins and a
+        // five-bin `sao_band_position` — is only ever written when the search
+        // picks `SaoTypeIdx == 1`, so pin a picture and a QP where it does.
+        // The noise-carrying picture at a fine QP is the case: its error is
+        // spread over a value range rather than shaped around a local edge,
+        // which is exactly what edge offset cannot reach.
+        let (width, height) = (64, 48);
+        let (y, cb, cr) = picture(width, height);
+        let grid = sao_grid(&y, &cb, &cr, width, height, 12);
+        let band = grid
+            .iter()
+            .flat_map(|cell| cell.components.iter())
+            .filter(|c| c.sao_type_idx == 1)
+            .count();
+        assert!(
+            band > 0,
+            "the search never chose band offset, so the writer's band path is still dead code"
+        );
+
+        // And it is the writer's own decision, not just the search's: the
+        // slice-level test kept the pass, so those `sao( )` structures reached
+        // the bitstream and a decoder resolved them back into the same
+        // picture.
+        let ((off_bytes, off_psnr), (on_bytes, on_psnr)) =
+            sao_on_off(&y, &cb, &cr, width, height, 12);
+        assert!(
+            on_bytes > off_bytes && on_psnr > off_psnr,
+            "the slice-level test declined the pass band offset was chosen in: \
+             {off_bytes} -> {on_bytes} bytes, {off_psnr:.3} -> {on_psnr:.3} dB"
+        );
+        let (au, recon) = encode_idr_residual_au(&y, &cb, &cr, width, height, 12).unwrap();
+        let (dy, dcb, dcr) = decode(&au, width, height);
+        assert_eq!(dy, recon.y, "luma diverged over a band-offset slice");
+        assert_eq!(dcb, recon.cb, "Cb diverged over a band-offset slice");
+        assert_eq!(dcr, recon.cr, "Cr diverged over a band-offset slice");
+    }
+
+    #[test]
+    fn band_offset_earns_its_rate_where_the_search_takes_it() {
+        // The measurement the changelog records: band offset is worth more
+        // than the four signs and five position bins it costs beyond edge
+        // offset. Both numbers come from the same coding loop at the same QP,
+        // so the only difference is which types the search was allowed to
+        // consider — here, that the noise picture at QP 12 gains 0.10 dB of
+        // whole-picture PSNR for half a percent of slice.
+        let (width, height) = (64, 48);
+        let (y, cb, cr) = picture(width, height);
+        let (_, (on_bytes, on_psnr)) = sao_on_off(&y, &cb, &cr, width, height, 12);
+        assert!(
+            on_psnr > 51.10,
+            "the noise picture at QP 12 reconstructed at {on_psnr:.3} dB, below what band offset \
+             was measured to buy"
+        );
+        assert!(
+            on_bytes < 1980,
+            "the band-offset slice cost {on_bytes} bytes, above what it was measured to cost"
+        );
+    }
+
     #[test]
     fn the_sao_pass_is_worth_taking_where_the_writer_takes_it() {
         // The gain the changelog records, at the two operating points the
