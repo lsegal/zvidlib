@@ -926,6 +926,65 @@ mod tests {
             .collect()
     }
 
+    /// Times [`filter_taps`] against the auto-vectorized scalar
+    /// reference as a function of the per-call row length alone.
+    ///
+    /// Issue #280 inferred, and issue #309 set out to confirm, that the
+    /// 8-tap luma kernel's advantage decays with prediction-unit size
+    /// because the two-dimensional path materializes a `w x ( h + 7 )`
+    /// intermediate between its two passes. This sweep removes the
+    /// intermediate, the block walk and the allocation from the picture
+    /// entirely: every row length reads the same L1-resident tap buffer,
+    /// writes the same output buffer and covers the same total sample
+    /// count, so the only variable left is how many samples one
+    /// `filter_taps` call is asked for.
+    ///
+    /// Ignored by default because it is a timing measurement, not an
+    /// assertion. Run it with
+    /// `cargo test --release --features native --lib
+    /// measure_filter_taps_by_row_length -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "benchmark; run with --ignored --nocapture"]
+    fn measure_filter_taps_by_row_length() {
+        use std::time::Instant;
+
+        // 4 KiB of taps: the whole working set stays in L1 at every row
+        // length, so a cache effect cannot masquerade as a length effect.
+        const BUF: usize = 1024;
+        const TOTAL: usize = 1 << 22;
+        let src: Vec<Vec<i32>> = (0..8).map(|t| samples(t + 11, BUF, 255)).collect();
+        let coeffs = [-1, 4, -11, 40, 40, -11, 4, -1];
+        let isas = available_isas();
+        let rounds = 9;
+
+        println!("\n8-tap filter_taps by row length, best of {rounds} interleaved rounds");
+        println!("  (same total sample count and same L1-resident buffer at every length)");
+        println!("   row   isa          ms   ratio");
+        for &len in &[4usize, 8, 16, 32, 64, 128, 256] {
+            let taps: [&[i32]; 8] = std::array::from_fn(|t| &src[t][..len]);
+            let calls = TOTAL / len;
+            let mut out = vec![0i32; len];
+            let mut best = vec![f64::INFINITY; isas.len()];
+            for _ in 0..rounds {
+                for (i, &isa) in isas.iter().enumerate() {
+                    let start = Instant::now();
+                    for _ in 0..calls {
+                        filter_taps(isa, &taps, &coeffs, 6, std::hint::black_box(&mut out));
+                    }
+                    best[i] = best[i].min(start.elapsed().as_secs_f64());
+                }
+            }
+            for (isa, t) in isas.iter().zip(best.iter().copied()) {
+                println!(
+                    "  {len:>4}  {:>7}  {:8.2}  {:5.2}x",
+                    format!("{isa:?}"),
+                    t * 1e3,
+                    best[0] / t
+                );
+            }
+        }
+    }
+
     #[test]
     fn every_backend_matches_scalar_filter_taps() {
         let src: Vec<Vec<i32>> = (0..8).map(|t| samples(t + 7, 200, 40_000)).collect();
