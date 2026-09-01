@@ -34,6 +34,14 @@
 use crate::hevc::engine::cabac::{ContextModel, RANGE_TAB_LPS, TRANS_IDX_LPS, TRANS_IDX_MPS};
 use crate::hevc::engine::encoder::bitwriter::BitWriter;
 
+/// Bins coded per unrolled [`CabacEncoder::encode_bypass_run`] step.
+///
+/// `ivlLow < 512` and `ivlCurrRange <= 510`, so `( ivlLow << n ) +
+/// ivlCurrRange * value` needs `n + 10` bits; 16 leaves ample headroom
+/// inside the `u32` register and covers a full 4x4 sub-block's
+/// `coeff_sign_flag` run in one step.
+const BYPASS_RUN_CHUNK_BINS: u8 = 16;
+
 /// §9.3.5 arithmetic encoding engine over a borrowed [`BitWriter`].
 #[derive(Debug)]
 pub struct CabacEncoder {
@@ -143,12 +151,70 @@ impl CabacEncoder {
         }
     }
 
+    /// §9.3.5.5 over a *run* of `n` bypass bins at once, MSB-first.
+    ///
+    /// The per-bin loop is `ivlLow = ivlLow * 2 + binVal * ivlCurrRange`
+    /// with a reduction after each bin, so unrolled over `n` bins it is
+    /// the single step
+    ///
+    /// ```text
+    /// ivlLow = ( ivlLow << n ) + ivlCurrRange * value
+    /// ```
+    ///
+    /// followed by the same Figure 9-12 PutBit emission of the top `n`
+    /// bits, each tested against a window scaled by the `i` bins still
+    /// below it. That is an identity and not an approximation: the two
+    /// paths agree bit for bit and leave identical `ivlLow` /
+    /// `bitsOutstanding`, because the only difference is *when* a carry
+    /// out of the lower bins is resolved — arithmetically here, through
+    /// the outstanding-bit deferral in the bin-at-a-time engine — and
+    /// both resolutions write the same bits. Pinned by
+    /// `bypass_run_matches_bin_at_a_time`.
+    ///
+    /// This is the entry point the residual writer's bypass runs use:
+    /// `coeff_sign_flag` (up to 16 in a row per sub-block), the
+    /// Golomb-Rice and Exp-Golomb parts of `coeff_abs_level_remaining`,
+    /// and the `last_sig_coeff_*` suffixes.
+    ///
+    /// `n <= 32`; the run is coded in [`BYPASS_RUN_CHUNK_BINS`]-bin
+    /// chunks so the unrolled `ivlLow` stays inside `u32`.
+    pub fn encode_bypass_run(&mut self, w: &mut BitWriter, value: u32, n: u8) {
+        debug_assert!(n <= 32, "a bypass run is at most one u32 wide");
+        let mut left = n;
+        while left > 0 {
+            let take = left.min(BYPASS_RUN_CHUNK_BINS);
+            left -= take;
+            let chunk = (value >> left) & ((1u32 << take) - 1);
+            self.encode_bypass_chunk(w, chunk, take);
+        }
+    }
+
+    /// One unrolled §9.3.5.5 step over `n <= BYPASS_RUN_CHUNK_BINS` bins.
+    fn encode_bypass_chunk(&mut self, w: &mut BitWriter, value: u32, n: u8) {
+        // `ivlLow < 512` and `ivlCurrRange <= 510` on entry, so this stays
+        // below `2 ** (n + 10)` — inside `u32` for `n <= 22`.
+        self.low = (self.low << n) + self.range * value;
+        for i in (0..n).rev() {
+            // The `i` bins still below this one scale the Figure 9-13
+            // window: `512 << i` is this bin's half, `1024 << i` its top.
+            let half = 512u32 << i;
+            if self.low >= half << 1 {
+                self.low -= half << 1;
+                self.put_bit(w, 1);
+            } else if self.low < half {
+                self.put_bit(w, 0);
+            } else {
+                self.low -= half;
+                self.outstanding += 1;
+            }
+        }
+    }
+
     /// MSB-first multi-bit bypass helper (the dual of
     /// [`crate::hevc::engine::cabac::CabacEngine::decode_bypass_bits`]).
+    /// Routed through [`CabacEncoder::encode_bypass_run`].
     pub fn encode_bypass_bits(&mut self, w: &mut BitWriter, value: u32, n: u8) {
-        for i in (0..n).rev() {
-            self.encode_bypass(w, ((value >> i) & 1) as u8);
-        }
+        self.encode_bypass_run(w, value, n);
     }
 
     /// §9.3.5.6 EncodeTerminate: `end_of_slice_segment_flag` /
@@ -245,6 +311,91 @@ mod tests {
         let mut dec = CabacEngine::new(BitReader::new(&bytes)).expect("init");
         assert_eq!(dec.decode_bypass_bits(32).unwrap(), pattern);
         assert_eq!(dec.decode_terminate().unwrap(), 1);
+    }
+
+    /// The run-at-a-time §9.3.5.5 path must be an exact identity for the
+    /// bin-at-a-time one: same bytes, same `ivlLow`, same
+    /// `bitsOutstanding`, same `firstBitFlag`, from every reachable
+    /// engine state and for every run length the writer can emit.
+    #[test]
+    fn bypass_run_matches_bin_at_a_time() {
+        // Prime the engine into a spread of distinct states first, so the
+        // comparison is not made from `InitEncoder` alone: the deferral
+        // that the two paths resolve differently only shows up when
+        // `ivlCurrRange` and `bitsOutstanding` are non-trivial.
+        let primers: [&[u8]; 6] = [
+            &[],
+            &[1],
+            &[0, 1, 1, 0, 1],
+            &[1; 17],
+            &[0; 17],
+            &[1, 1, 0, 0, 1, 0, 1, 1, 1, 0, 0, 0, 1],
+        ];
+        let mut x = 0x9E37_79B9u32;
+        for primer in primers {
+            for n in 1..=32u8 {
+                let mask = if n == 32 { u32::MAX } else { (1u32 << n) - 1 };
+                let mut values = vec![0u32, mask, mask >> 1, 1, mask ^ 1];
+                for _ in 0..16 {
+                    x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                    values.push(x & mask);
+                }
+                for value in values {
+                    let (run_bytes, run_enc) = {
+                        let mut w = BitWriter::new();
+                        let mut enc = CabacEncoder::new();
+                        let mut ctx = ContextModel::init(154, 26);
+                        for &b in primer {
+                            enc.encode_decision(&mut w, &mut ctx, b);
+                        }
+                        enc.encode_bypass_run(&mut w, value, n);
+                        (w, enc)
+                    };
+                    let (bin_bytes, bin_enc) = {
+                        let mut w = BitWriter::new();
+                        let mut enc = CabacEncoder::new();
+                        let mut ctx = ContextModel::init(154, 26);
+                        for &b in primer {
+                            enc.encode_decision(&mut w, &mut ctx, b);
+                        }
+                        for i in (0..n).rev() {
+                            enc.encode_bypass(&mut w, ((value >> i) & 1) as u8);
+                        }
+                        (w, enc)
+                    };
+                    let label = format!("primer {} n {n} value {value:#x}", primer.len());
+                    assert_eq!(run_bytes.bit_len(), bin_bytes.bit_len(), "bit length, {label}");
+                    assert_eq!(run_bytes.finish(), bin_bytes.finish(), "bytes, {label}");
+                    assert_eq!(run_enc.low, bin_enc.low, "ivlLow, {label}");
+                    assert_eq!(run_enc.range, bin_enc.range, "ivlCurrRange, {label}");
+                    assert_eq!(
+                        run_enc.outstanding, bin_enc.outstanding,
+                        "bitsOutstanding, {label}"
+                    );
+                    assert_eq!(run_enc.first_bit, bin_enc.first_bit, "firstBitFlag, {label}");
+                }
+            }
+        }
+    }
+
+    /// A run wider than one unrolled chunk still decodes back, so the
+    /// chunking that keeps `ivlLow` inside `u32` is transparent.
+    #[test]
+    fn long_bypass_runs_roundtrip() {
+        for n in [17u8, 24, 31, 32] {
+            let mask = if n == 32 { u32::MAX } else { (1u32 << n) - 1 };
+            let value = 0xC3A5_5A3Cu32 & mask;
+            let mut w = BitWriter::new();
+            let mut enc = CabacEncoder::new();
+            enc.encode_bypass_run(&mut w, value, n);
+            enc.encode_terminate(&mut w, 1);
+            w.align_zero();
+            let bytes = w.finish();
+
+            let mut dec = CabacEngine::new(BitReader::new(&bytes)).expect("init");
+            assert_eq!(dec.decode_bypass_bits(n).unwrap(), value, "n {n}");
+            assert_eq!(dec.decode_terminate().unwrap(), 1);
+        }
     }
 
     #[test]
