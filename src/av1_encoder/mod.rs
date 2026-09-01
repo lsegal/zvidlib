@@ -767,23 +767,29 @@ mod nonlossless_tests {
         })
     }
 
-    /// Everything one encode of `pixels` at `qindex` decides, as one comparable value: the access
-    /// unit bytes, and the `(size, tx_type)` trace of both the shipped search and the exhaustive
-    /// one it stands in for. The traces are what the transform-type divergence was observed in,
-    /// and the bytes are what a divergence anywhere else in the encoder would show up as.
-    fn encode_fingerprint(
-        width: u32,
-        height: u32,
-        qindex: u8,
-        pixels: &[u8],
-    ) -> (Vec<u8>, Vec<(usize, Av1TxType)>, Vec<(usize, Av1TxType)>) {
-        let data = encode(width, height, qindex, pixels);
-        let shipped = traced_transform_blocks(width, height, qindex, pixels, &data);
+    /// Everything one encode of `pixels` at `qindex` decides, as one comparable value: the
+    /// access unit bytes, and the `(size, tx_type)` trace of both the shipped search and the
+    /// exhaustive one it stands in for. The traces are where the transform-type divergence was
+    /// observed, and the bytes are where a divergence anywhere else in the encoder would show up.
+    #[derive(PartialEq, Eq)]
+    struct EncodeFingerprint {
+        access_unit: Vec<u8>,
+        shipped: Vec<(usize, Av1TxType)>,
+        exhaustive: Vec<(usize, Av1TxType)>,
+    }
+
+    fn encode_fingerprint(width: u32, height: u32, qindex: u8, pixels: &[u8]) -> EncodeFingerprint {
+        let access_unit = encode(width, height, qindex, pixels);
+        let shipped = traced_transform_blocks(width, height, qindex, pixels, &access_unit);
         let exhaustive = tile::FrameEncoder::new(pixels, width as usize, height as usize, qindex)
             .without_search_shortcuts()
             .encode_with_report()
             .trace;
-        (data, shipped, exhaustive)
+        EncodeFingerprint {
+            access_unit,
+            shipped,
+            exhaustive,
+        }
     }
 
     /// An encoder has to produce one bitstream for one input, and the rate-distortion search that
@@ -804,30 +810,34 @@ mod nonlossless_tests {
         let (width, height) = (96_u32, 80_u32);
         let pixels = test_pattern(width, height);
         for qindex in DETERMINISM_QINDEXES {
-            let mut reference: Option<(crate::simd::SimdIsa, _)> = None;
+            let mut reference: Option<(crate::simd::SimdIsa, EncodeFingerprint)> = None;
             for isa in crate::simd::available() {
                 crate::simd::set_override(Some(isa));
-                assert_eq!(crate::simd::active(), isa, "the override should pin {isa:?}");
+                assert_eq!(
+                    crate::simd::active(),
+                    isa,
+                    "the override should pin {isa:?}"
+                );
                 let fingerprint = encode_fingerprint(width, height, qindex, &pixels);
                 match &reference {
                     None => reference = Some((isa, fingerprint)),
                     Some((first, expected)) => {
                         assert!(
-                            fingerprint.0 == expected.0,
+                            fingerprint.access_unit == expected.access_unit,
                             "qindex {qindex}: {isa:?} encoded {} bytes (digest {:016x}) against \
                              {first:?}'s {} bytes (digest {:016x})",
-                            fingerprint.0.len(),
-                            digest(&fingerprint.0),
-                            expected.0.len(),
-                            digest(&expected.0)
+                            fingerprint.access_unit.len(),
+                            digest(&fingerprint.access_unit),
+                            expected.access_unit.len(),
+                            digest(&expected.access_unit)
                         );
                         assert_eq!(
-                            fingerprint.1, expected.1,
+                            fingerprint.shipped, expected.shipped,
                             "qindex {qindex}: the shipped search picked different transform \
                              blocks under {isa:?} than under {first:?}"
                         );
                         assert_eq!(
-                            fingerprint.2, expected.2,
+                            fingerprint.exhaustive, expected.exhaustive,
                             "qindex {qindex}: the exhaustive search picked different transform \
                              blocks under {isa:?} than under {first:?}"
                         );
@@ -864,9 +874,8 @@ mod nonlossless_tests {
     fn a_fixed_frame_encodes_to_the_same_bytes_on_every_host() {
         let (width, height) = (96_u32, 80_u32);
         let pixels = test_pattern(width, height);
-        for (qindex, (length, expected)) in DETERMINISM_QINDEXES
-            .into_iter()
-            .zip(FIXED_FRAME_DIGESTS)
+        for (qindex, (length, expected)) in
+            DETERMINISM_QINDEXES.into_iter().zip(FIXED_FRAME_DIGESTS)
         {
             let data = encode(width, height, qindex, &pixels);
             assert_eq!(
