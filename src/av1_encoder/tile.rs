@@ -825,15 +825,21 @@ impl<'a> FrameEncoder<'a> {
             if probing {
                 // The probe ranks the whole set by the emitting pass's own rule - candidates in
                 // set order, strictly-less keep - so the cached winner is the one that pass
-                // would have arrived at, not merely one of equal cost.
-                if full_set
+                // would have arrived at, not merely one of equal cost. The trial itself still
+                // keeps DCT, so a candidate is only ever copied when it is both, which is the
+                // one case the two rankings agree on.
+                let keeps_set = full_set
                     .as_ref()
-                    .is_none_or(|winner: &TxCandidate| cost < winner.cost)
-                {
-                    full_set = Some(candidate.clone());
-                }
-                if tx_type == Av1TxType::DctDct || best.is_none() {
-                    best = Some(candidate);
+                    .is_none_or(|winner: &TxCandidate| cost < winner.cost);
+                let keeps_trial = tx_type == Av1TxType::DctDct || best.is_none();
+                match (keeps_set, keeps_trial) {
+                    (true, true) => {
+                        full_set = Some(candidate.clone());
+                        best = Some(candidate);
+                    }
+                    (true, false) => full_set = Some(candidate),
+                    (false, true) => best = Some(candidate),
+                    (false, false) => {}
                 }
             } else if best.as_ref().is_none_or(|best| cost < best.cost) {
                 best = Some(candidate);
