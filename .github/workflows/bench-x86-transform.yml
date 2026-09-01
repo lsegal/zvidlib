@@ -1,0 +1,29 @@
+# Temporary: measures the §8.6 HEVC kernels on an x86_64 AVX2 runner for
+# issue #228. Removed before that PR merges.
+name: Bench x86 transform (issue 228)
+
+on:
+  push:
+    branches: ['fix/issue-228-*']
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    name: §8.6 kernels on x86_64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: rustup show
+      - name: Install native audio dependencies
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - name: Report host CPU
+        run: |
+          grep -m1 'model name' /proc/cpuinfo
+          grep -m1 -o 'avx2' /proc/cpuinfo || echo 'NO AVX2'
+      - name: Bench (run 1)
+        run: cargo test --release --features native --lib bench_inverse_transform_and_dequant -- --ignored --nocapture
+      - name: Bench (run 2)
+        run: cargo test --release --features native --lib bench_inverse_transform_and_dequant -- --ignored --nocapture
