@@ -47,36 +47,84 @@
 //! [`crate::hevc::engine::encoder::recon::deblock_reconstruction`].
 //!
 //! §8.7.3 SAO runs behind it, in the §8.7.1 order: the SPS carries
-//! `sample_adaptive_offset_enabled_flag == 1`, the writer searches an
-//! edge-offset class per CTB over the *deblocked* reconstruction
+//! `sample_adaptive_offset_enabled_flag == 1`, the writer searches both
+//! §8.7.3.2 types per CTB over the *deblocked* reconstruction
 //! ([`crate::hevc::engine::encoder::recon::sao_reconstruction`]) and codes the
 //! §7.3.8.3 `sao( )` structure it found at the head of each CTB's slice data.
+//! Both types, because they reach different error: the four edge-offset
+//! classes shape the error around a local edge, while band offset shapes it
+//! over a *value range*, which is what a CTB whose reconstruction is uniformly
+//! biased across some part of the sample range needs and no edge class can
+//! deliver. They are searched together and scored against each other under one
+//! `D + lambda * R` comparison, so the type is chosen by what it buys net of
+//! what it costs — band offset pays four `sao_offset_sign` bins and five
+//! `sao_band_position` bins where edge offset pays two class bins and infers
+//! its signs.
 //!
 //! ## Why SAO is on, and when the writer turns it off again
 //!
 //! SAO is not free the way deblocking is: deblocking is signalled once in the
 //! PPS, while SAO costs a `sao( )` structure on *every* CTB, including every
-//! CTB it does nothing to. So the decision is taken twice, both against the
-//! same `D + lambda * R` the mode search uses. Per CTB, a class is signalled
-//! only when the squared error it removes clears the §9.3.3 bins it would be
-//! coded with. Per slice, the whole pass is kept only when the error it
-//! actually removed clears the bins the whole grid would be coded with —
-//! otherwise the reconstruction reverts to the deblocked one and
-//! `slice_sao_luma_flag` / `slice_sao_chroma_flag` go out as 0, which
-//! §7.3.8.3 reads as "code nothing", leaving the cost at the two header bits.
+//! CTB it does nothing to. So the decision is taken twice. Per CTB, a class
+//! is signalled only when the squared error it removes clears the §9.3.3 bins
+//! it would be coded with, under the same `D + lambda * R` and the same
+//! closed-form `rdo::lambda_q8` the mode search uses — inside a picture
+//! already committed to the syntax, that is a choice between two codings of
+//! one CTB at one QP, which is the trade that multiplier is derived for.
+//!
+//! Per slice, the whole pass is kept only when the error it actually removed
+//! clears the bits the whole grid actually costs — and that one is not the
+//! same trade. It is a choice between spending bits on SAO and spending the
+//! same bits on a finer quantizer, so what those bits are worth is a property
+//! of the picture rather than of the QP, and the closed form misses this
+//! picture's own slope by 0.4x to 2.5x over the sweep. So it is measured:
+//! [`curve_point`] codes the same picture one QP finer, and
+//! [`calibrated_sao_lambda_q8`] reads off the curve through those two points
+//! what `sao_bits` more of it is worth. When SAO does not clear that, the
+//! reconstruction reverts to the deblocked one and `slice_sao_luma_flag` /
+//! `slice_sao_chroma_flag` go out as 0, which §7.3.8.3 reads as "code
+//! nothing", leaving the cost at the two header bits.
+//!
+//! The probe is a second decision pass, so [`keeps_sao`] takes it only where
+//! it can still change the answer — outside the band the calibrated
+//! multiplier is clamped to, the closed form settles the decision on its own,
+//! which over the sweep is half the pictures. Where the probe does run it
+//! costs the writer 127% to 148% of a picture; where it does not, the whole
+//! SAO stage costs 19% to 25%.
 //!
 //! Measured against the same writer with SAO off, same QP, same mode
-//! decisions, whole-picture PSNR and slice size: on smooth content at QP 12
-//! the pass is taken and buys +0.73 dB for +11.4% of the slice at 64x48 and
-//! +0.89 dB for +13.4% at 128x96; on the noise-carrying picture it is taken
-//! from QP 32 to 37 and buys +0.22 to +0.35 dB for +3.5% to +7.5%. At every
-//! other point of the QP 12 to 51 sweep the slice-level test declines it and
-//! the slice is the deblocked writer's to the byte, or within one byte of it.
-//! Two of the accepted points — the noise picture at QP 32 — sit 0.08 to
-//! 0.14 dB *below* what the same bits buy as a finer QP on the SAO-off
-//! rate-distortion curve, which is the fixed lambda being a heuristic rather
-//! than SAO being a loss; the clear wins are 0.38 to 0.43 dB above that same
-//! curve.
+//! decisions, whole-picture PSNR and slice size over the QP 12 to 51 sweep on
+//! both test pictures at 64x48 and 128x96, the pass is taken at 36 of those
+//! points and buys +0.07 to +0.89 dB for +0.4% to +13.4% of the slice. On
+//! smooth content at QP 12 it buys +0.73 dB for +11.4% at 64x48 and +0.89 dB
+//! for +13.4% at 128x96. Every accepted point, including those two, sits on
+//! or above the SAO-off writer's own rate-distortion curve interpolated in
+//! log-rate at the same slice size — from +0.001 dB at the closest to
+//! +0.55 dB at the two clear wins — which is what the fixed multiplier could
+//! not hold: it declined 30 of these points and accepted two others that sat
+//! 0.08 and 0.14 dB below that curve.
+//!
+//! Band offset is what the finest end of the noise picture's sweep is. With
+//! only the edge classes searched the slice-level test declines the pass on
+//! that picture at QP 12 at 64x48 outright; searching both types it is taken
+//! and buys +0.100 dB for +0.5% of slice. At 128x96 it improves five points
+//! the edge-only search already took, each for one to eight bytes more:
+//! +0.106 to +0.120 dB at QP 12, +0.184 to +0.190 at QP 13, +0.156 to +0.167
+//! at QP 14, +0.110 to +0.118 at QP 17, and +0.100 to +0.127 at QP 19. Every
+//! other point of the sweep is byte-identical to the edge-only search, no
+//! point regresses, and every accepted point still sits on or above the
+//! SAO-off writer's own curve. It is never selected on the smooth picture at
+//! any QP — that content's error is edge-shaped, which is what §8.7.3.2 is
+//! for — nor at any QP coarse enough that the four signs and five position
+//! bins outweigh what a value-range bias is worth.
+//!
+//! Those band-only bins are charged at 2.5x `lambda_q8`, the coarse end of
+//! the departure the calibration measured, because they are rate the closed
+//! form has never been checked against. At the closed form itself the search
+//! takes band offset at one coarse CTB whose slice then sits 0.003 dB *under*
+//! the curve above; at `SAO_LAMBDA_BAND`, the trust bound rather than the
+//! measured end, band offset stops being selected anywhere and all of the
+//! gains above are given back.
 //!
 //! ## Why the writer runs two passes
 //!
@@ -89,6 +137,11 @@
 //! §8.4.4.2.2 intra prediction reads the unfiltered reconstruction, which the
 //! decision pass has already built — so the picture that is coded is exactly
 //! the picture that was searched.
+//!
+//! The bitstream pass is also where the slice-level SAO decision is settled
+//! without coding anything twice: the slice data is coded once with the grid
+//! and once without, the decision compares their sizes, and the one it keeps
+//! is appended to the slice header verbatim.
 
 use crate::hevc::engine::binarization::{derive_intra_pred_mode_c, intra_luma_cand_mode_list};
 use crate::hevc::engine::cabac::init_type;
@@ -104,7 +157,8 @@ use crate::hevc::engine::encoder::rdo::{
     shortlist_intra_luma_modes,
 };
 use crate::hevc::engine::encoder::recon::{
-    ReconstructedPicture, SAO_OFFSET_MAX, SourcePlanes, deblock_reconstruction, sao_reconstruction,
+    ReconstructedPicture, SAO_LAMBDA_BAND, SAO_OFFSET_MAX, SourcePlanes, deblock_reconstruction,
+    sao_reconstruction,
 };
 use crate::hevc::engine::encoder::residual::{
     EngineResidualBinSink, ResidualWriteParams, has_coded_levels, write_residual_coding,
@@ -125,6 +179,8 @@ use crate::hevc::engine::transform::{
 
 /// `CtbLog2SizeY` of the writer's fixed geometry, matching the PCM writer's.
 const CTB_LOG2: u32 = 4;
+/// The coarsest `SliceQpY` §7.4.7.1 allows at this bit depth.
+const MAX_QP: i32 = 51;
 /// `CtbSizeY`.
 const CTB: usize = 1 << CTB_LOG2;
 /// `BitDepthY` / `BitDepthC`.
@@ -160,10 +216,10 @@ enum ModeSearch {
     /// candidate's rate term, so the decision minimizes the full
     /// `D + lambda * R` rather than distortion against signalling alone.
     ///
-    /// This is what a rate-controlled encoder needs; the writer has no
-    /// bitrate target to hit yet, so nothing outside the tests that measure
-    /// the two operating points against each other selects it.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// This is what a rate-controlled encoder needs, and what the public
+    /// factory's target-bitrate operating point codes at: with a bitrate to
+    /// hit, the bits this decision saves are bits the next picture's QP can
+    /// spend somewhere they buy more.
     RateDistortion,
     /// Every coding unit pinned to `INTRA_DC` with chroma derived from it —
     /// the writer's behaviour before the mode search, kept as the baseline the
@@ -248,15 +304,15 @@ pub fn encode_idr_residual_au(
 /// fixed-QP writer above — a better trade at equal rate, and the one a bitrate
 /// target needs.
 ///
-/// Nothing outside the tests that measure the two operating points against
-/// each other selects this yet: with no bitrate to hit there is nothing for
-/// the saved bits to be spent on, and the public factory's job at a given QP
-/// stays the closest picture.
+/// This is the writer the public factory's target-bitrate operating point
+/// codes every picture through, with `qp` chosen per picture by
+/// [`crate::hevc::engine::encoder::ratecontrol`]. The fixed-QP configuration
+/// stays on [`encode_idr_residual_au`]: a caller that names a QP is asking for
+/// a picture, not a rate.
 ///
 /// # Errors
 /// As [`encode_idr_residual_au`].
-#[cfg(test)]
-pub(crate) fn encode_idr_residual_au_rate_constrained(
+pub fn encode_idr_residual_au_rate_constrained(
     y: &[u8],
     cb: &[u8],
     cr: &[u8],
@@ -338,12 +394,14 @@ struct CtbRecord {
     levels: [Vec<i32>; 3],
 }
 
-/// §7.3.6.1 + §7.3.8.1 — the picture's single I slice segment, every CTB one
-/// residual-coded intra coding unit. Returns the slice RBSP, the picture
-/// reconstructed alongside it, and the luma intra mode coded for each CTB in
-/// coding order.
-#[allow(clippy::too_many_arguments)]
-fn write_idr_residual_slice(
+/// The decision pass: search every coding unit, reconstruct it, and return
+/// the committed decisions with the unfiltered reconstruction they built.
+///
+/// Split out of [`write_idr_residual_slice`] because it is also what a curve
+/// point costs: [`curve_point`] runs it at a neighbouring QP to measure the
+/// slope the SAO decision is taken against, and the bitstream pass and the
+/// in-loop filters are no part of that measurement.
+fn run_decision_pass(
     y: &[u8],
     cb: &[u8],
     cr: &[u8],
@@ -351,8 +409,7 @@ fn write_idr_residual_slice(
     height: usize,
     qp: i32,
     search: ModeSearch,
-    filter: LoopFilter,
-) -> (Vec<u8>, ReconstructedPicture, Vec<u8>) {
+) -> (Vec<CtbRecord>, ReconstructedPicture) {
     let (cw, ch) = (width / 2, height / 2);
     let mut recon = ReconstructedPicture {
         y: vec![0u8; width * height],
@@ -442,14 +499,35 @@ fn write_idr_residual_slice(
         });
     }
 
+    (records, recon)
+}
+
+/// §7.3.6.1 + §7.3.8.1 — the picture's single I slice segment, every CTB one
+/// residual-coded intra coding unit. Returns the slice RBSP, the picture
+/// reconstructed alongside it, and the luma intra mode coded for each CTB in
+/// coding order.
+#[allow(clippy::too_many_arguments)]
+fn write_idr_residual_slice(
+    y: &[u8],
+    cb: &[u8],
+    cr: &[u8],
+    width: usize,
+    height: usize,
+    qp: i32,
+    search: ModeSearch,
+    filter: LoopFilter,
+) -> (Vec<u8>, ReconstructedPicture, Vec<u8>) {
+    let ctbs_x = width / CTB;
+    let (records, mut recon) = run_decision_pass(y, cb, cr, width, height, qp, search);
+
     // §8.7.1 — the in-loop filter stage, after the whole picture is coded.
     // Nothing above may read the filtered samples: every block predicted from
     // the unfiltered reconstruction, which is what §8.4.4.2.2 specifies.
     if filter.deblocking() {
         deblock_reconstruction(&mut recon, qp);
     }
-    // §8.7.3 runs behind §8.7.2 and returns the per-CTB parameters the
-    // bitstream pass below codes, so the decoder resolves the same grid this
+    // §8.7.3 runs behind §8.7.2 and returns the per-CTB parameters the slice
+    // data below codes, so the decoder resolves the same grid this
     // reconstruction was filtered with.
     //
     // Then the slice-level half of the decision. Every CTB the search leaves
@@ -457,15 +535,25 @@ fn write_idr_residual_slice(
     // best case — so a picture SAO finds nothing in pays for the search's
     // silence on every CTB of it. `slice_sao_luma_flag` /
     // `slice_sao_chroma_flag` are what make that optional: with both 0,
-    // §7.3.8.3 codes nothing at all and the whole cost is the two header bits.
-    // So the pass is kept only when the SSE it actually removed clears the
-    // bins it would actually be coded with, under the same `D + lambda * R`
-    // the mode decision uses; otherwise the reconstruction reverts to the
-    // deblocked one and the slice says so.
-    let lambda = u64::from(lambda_q8(qp));
-    let mut sao = None;
+    // §7.3.8.3 codes nothing at all and the whole cost is the two header
+    // bits. So the pass is kept only when the error it actually removed
+    // clears the bits it actually costs, at what a bit is worth on this
+    // picture's own rate-distortion curve; otherwise the reconstruction
+    // reverts to the deblocked one and the slice says so.
+    //
+    // The slice data as it stands without SAO. If the decision keeps the
+    // pass, the coded grid's own replaces it — either way what the decision
+    // measured is what the access unit carries, byte for byte.
+    let mut slice_data = code_slice_data(&records, None, qp, ctbs_x);
+    let mut sao_kept = false;
     if filter.sao() {
         let deblocked = recon.clone();
+        // The per-CTB search keeps the closed-form multiplier: inside a
+        // picture already committed to coding `sao( )` on every CTB, that
+        // decision is between two codings of one CTB at one QP, which is the
+        // trade `lambda_q8` is derived for and where the picture cancels out
+        // of it. The slice-level test below is the one where it does not
+        // cancel, and that one is taken against the measured curve.
         let grid = sao_reconstruction(
             &mut recon,
             SourcePlanes {
@@ -477,10 +565,43 @@ fn write_idr_residual_slice(
             },
             lambda_q8(qp),
         );
-        let gain =
-            picture_sse(&deblocked, y, cb, cr).saturating_sub(picture_sse(&recon, y, cb, cr));
-        if gain > sao_syntax_bins(&grid, ctbs_x) * lambda / 256 {
-            sao = Some(grid);
+        let base = CurvePoint {
+            sse: picture_sse(&deblocked, y, cb, cr),
+            bits: slice_data.len() as u64 * 8,
+        };
+        let gain = base.sse.saturating_sub(picture_sse(&recon, y, cb, cr));
+        // What the grid costs, read off the coded slice rather than counted
+        // beside it: the same slice data with the `sao( )` structures in
+        // front of each CTB, against the same slice data without them.
+        let coded = code_slice_data(&records, Some(&grid), qp, ctbs_x);
+        let sao_bits = (coded.len() as u64 * 8).saturating_sub(base.bits);
+        // What SAO is weighed against is one step of the quantizer, so that
+        // is the point the probe codes: this same writer one QP finer, or one
+        // QP coarser at QP 0, where there is no finer.
+        let probe = || {
+            let point = |probe_qp| {
+                curve_point(
+                    SourcePlanes {
+                        y,
+                        cb,
+                        cr,
+                        width,
+                        height,
+                    },
+                    probe_qp,
+                    search,
+                    filter.deblocking(),
+                )
+            };
+            if qp > 0 {
+                (point(qp - 1), base)
+            } else {
+                (base, point(qp + 1))
+            }
+        };
+        if keeps_sao(gain, sao_bits, qp, probe) {
+            slice_data = coded;
+            sao_kept = true;
         } else {
             recon = deblocked;
         }
@@ -498,12 +619,12 @@ fn write_idr_residual_slice(
         // sample_adaptive_offset_enabled_flag == 1. Both passes are decided
         // together, so the pair is 1/1 when the picture kept SAO and 0/0 when
         // it did not — and 0/0 suppresses every CTB's sao( ) structure.
-        let on = u8::from(sao.is_some());
+        let on = u8::from(sao_kept);
         w.put_bit(on); // slice_sao_luma_flag
         w.put_bit(on); // slice_sao_chroma_flag (ChromaArrayType != 0)
     }
     w.se(qp - 26); // slice_qp_delta over init_qp_minus26 == 0
-    if filter.deblocking() || sao.is_some() {
+    if filter.deblocking() || sao_kept {
         // §7.3.6.1: present because pps_loop_filter_across_slices_enabled_flag
         // is 1 and at least one in-loop filter runs on this slice. One slice
         // fills the picture, so the value only has to be legal, not
@@ -512,95 +633,10 @@ fn write_idr_residual_slice(
     }
     w.rbsp_trailing_bits(); // byte_alignment() before slice data
 
-    // §9.3.2.2 initialization: initType 0 (I slice, equation 9-7) at SliceQpY.
-    let mut ctxs = SliceContexts::init(init_type(2, false), qp);
-    let mut cabac = CabacEncoder::new();
-
-    for (addr, record) in records.iter().enumerate() {
-        // ---- coding_tree_unit(): sao( ) first, then the coding quadtree.
-        if let Some(grid) = &sao {
-            code_sao(
-                &mut SaoWriter {
-                    writer: &mut w,
-                    cabac: &mut cabac,
-                    contexts: &mut ctxs,
-                },
-                grid,
-                addr,
-                ctbs_x,
-            );
-        }
-
-        // ---- coding_unit(): PART_2Nx2N, pcm_flag == 0 ----
-        cabac.encode_decision(&mut w, &mut ctxs.part_mode[0], 1);
-        cabac.encode_terminate(&mut w, 0); // pcm_flag = 0
-        write_luma_intra_mode(
-            &mut w,
-            &mut cabac,
-            &mut ctxs,
-            record.mode,
-            record.candidates,
-        );
-
-        // §9.3.3.8 / Table 9-46: value 4 (chroma derived from luma) is the
-        // single context-coded 0 bin; 0..=3 is a 1 bin plus two FL bypass bins.
-        if record.chroma_mode == CHROMA_MODE_DERIVED {
-            cabac.encode_decision(&mut w, &mut ctxs.intra_chroma_pred_mode[0], 0);
-        } else {
-            cabac.encode_decision(&mut w, &mut ctxs.intra_chroma_pred_mode[0], 1);
-            cabac.encode_bypass(&mut w, (record.chroma_mode >> 1) & 1);
-            cabac.encode_bypass(&mut w, record.chroma_mode & 1);
-        }
-
-        // ---- transform_tree(): split_transform_flag is absent because
-        // max_transform_hierarchy_depth_intra == 0, so MaxTrafoDepth == 0
-        // and the flag is inferred 0 (one 16x16 luma TB, two 8x8 chroma).
-        let [luma, chroma_cb, chroma_cr] = &record.levels;
-
-        // §7.3.8.8 order: cbf_cb, cbf_cr (ctxInc = trafoDepth = 0), then
-        // cbf_luma (ctxInc = 1 at trafoDepth 0).
-        let cbf_cb = u8::from(has_coded_levels(chroma_cb));
-        let cbf_cr = u8::from(has_coded_levels(chroma_cr));
-        let cbf_luma = u8::from(has_coded_levels(luma));
-        cabac.encode_decision(&mut w, &mut ctxs.cbf_chroma[0], cbf_cb);
-        cabac.encode_decision(&mut w, &mut ctxs.cbf_chroma[0], cbf_cr);
-        cabac.encode_decision(&mut w, &mut ctxs.cbf_luma[1], cbf_luma);
-
-        // ---- transform_unit(): the coded blocks, luma then Cb then Cr.
-        for (levels, log2, is_chroma) in [
-            (luma, CTB_LOG2, false),
-            (chroma_cb, CTB_LOG2 - 1, true),
-            (chroma_cr, CTB_LOG2 - 1, true),
-        ] {
-            if !has_coded_levels(levels) {
-                continue;
-            }
-            write_residual_coding(
-                &mut EngineResidualBinSink {
-                    writer: &mut w,
-                    cabac: &mut cabac,
-                    contexts: &mut ctxs.residual,
-                },
-                &ResidualWriteParams {
-                    log2_trafo_size: log2,
-                    is_chroma,
-                    // §7.4.9.11: the mode-dependent scans need
-                    // log2TrafoSize == 2 (or 3 for luma / 4:4:4), so both
-                    // block sizes here take the up-right diagonal scan.
-                    scan_idx: ScanIdx::Diagonal,
-                },
-                levels,
-            );
-        }
-
-        // end_of_slice_segment_flag: 1 only at the picture's last CTB.
-        cabac.encode_terminate(&mut w, u8::from(addr == total - 1));
-    }
-    // The final terminate-1 flush wrote the rbsp_stop_one_bit.
-    w.align_zero();
-
+    let mut rbsp = w.finish();
+    rbsp.extend_from_slice(&slice_data);
     let modes = records.iter().map(|record| record.mode).collect();
-    (w.finish(), recon, modes)
+    (rbsp, recon, modes)
 }
 
 /// `cMax` of the Table 9-43 truncated-Rice `sao_offset_abs` binarization —
@@ -617,27 +653,20 @@ enum SaoCtx {
     TypeIdx,
 }
 
-/// Where [`code_sao`] puts the bins it derives.
+/// The coder [`code_sao`] puts the bins it derives into.
 ///
-/// The §7.3.8.3 structure is walked once for the bitstream and once for the
-/// bin count the slice-level decision below is taken on, and the two must not
-/// be allowed to disagree — so there is one walk and two sinks rather than a
-/// writer and a separate cost model.
-trait SaoBinSink {
-    /// One context-coded bin.
-    fn ctx(&mut self, ctx: SaoCtx, bin: u8);
-    /// One bypass bin.
-    fn bypass(&mut self, bin: u8);
-}
-
-/// The sink that codes the bins into the slice.
+/// There is only one: the §7.3.8.3 structure is walked for the bitstream, and
+/// what it costs is read back off the coded slice by [`slice_data_bits`]
+/// rather than counted alongside it, so a cost model and the writer have no
+/// way to disagree in the first place.
 struct SaoWriter<'a> {
     writer: &'a mut BitWriter,
     cabac: &'a mut CabacEncoder,
     contexts: &'a mut SliceContexts,
 }
 
-impl SaoBinSink for SaoWriter<'_> {
+impl SaoWriter<'_> {
+    /// One context-coded bin.
     fn ctx(&mut self, ctx: SaoCtx, bin: u8) {
         let model = match ctx {
             SaoCtx::MergeFlag => &mut self.contexts.sao_merge_flag[0],
@@ -646,24 +675,9 @@ impl SaoBinSink for SaoWriter<'_> {
         self.cabac.encode_decision(self.writer, model, bin);
     }
 
+    /// One bypass bin.
     fn bypass(&mut self, bin: u8) {
         self.cabac.encode_bypass(self.writer, bin);
-    }
-}
-
-/// The sink that only counts them.
-#[derive(Default)]
-struct SaoBinCounter {
-    bins: u64,
-}
-
-impl SaoBinSink for SaoBinCounter {
-    fn ctx(&mut self, _ctx: SaoCtx, _bin: u8) {
-        self.bins += 1;
-    }
-
-    fn bypass(&mut self, _bin: u8) {
-        self.bins += 1;
     }
 }
 
@@ -676,7 +690,7 @@ impl SaoBinSink for SaoBinCounter {
 /// resolves out of the bitstream is the grid the encoder filtered with, CTB
 /// for CTB — and that covers the common case of two neighbouring CTBs which
 /// both left SAO off, which is the whole of what an unfiltered CTB pays.
-fn code_sao<S: SaoBinSink>(sink: &mut S, grid: &[ResolvedSao], addr: usize, ctbs_x: usize) {
+fn code_sao(sink: &mut SaoWriter<'_>, grid: &[ResolvedSao], addr: usize, ctbs_x: usize) {
     let (rx, ry) = (addr % ctbs_x, addr / ctbs_x);
     let here = grid[addr];
     // The §7.3.8.3 presence conditions: one slice and one tile fill the
@@ -743,7 +757,7 @@ fn code_sao<S: SaoBinSink>(sink: &mut S, grid: &[ResolvedSao], addr: usize, ctbs
 
 /// `sao_offset_abs`, Table 9-43 TR with `cMax == 7` and `cRiceParam == 0` —
 /// truncated unary, every bin bypass (Table 9-48).
-fn code_sao_offset_abs<S: SaoBinSink>(sink: &mut S, value: u32) {
+fn code_sao_offset_abs(sink: &mut SaoWriter<'_>, value: u32) {
     let value = value.min(SAO_OFFSET_ABS_CMAX);
     for _ in 0..value {
         sink.bypass(1);
@@ -753,13 +767,247 @@ fn code_sao_offset_abs<S: SaoBinSink>(sink: &mut S, value: u32) {
     }
 }
 
-/// Every §7.3.8.3 bin the whole picture's SAO grid would be coded with.
-fn sao_syntax_bins(grid: &[ResolvedSao], ctbs_x: usize) -> u64 {
-    let mut counter = SaoBinCounter::default();
-    for addr in 0..grid.len() {
-        code_sao(&mut counter, grid, addr, ctbs_x);
+/// §7.3.8.5 + §7.3.8.8 + §7.3.8.11 — one CTB's coding unit, from the recorded
+/// decisions the decision pass left for it.
+///
+/// Shared by the bitstream pass and by [`slice_data_bits`], so the rate a
+/// decision is measured against is the rate the same coder would emit.
+fn code_coding_unit(
+    w: &mut BitWriter,
+    cabac: &mut CabacEncoder,
+    ctxs: &mut SliceContexts,
+    record: &CtbRecord,
+) {
+    // ---- coding_unit(): PART_2Nx2N, pcm_flag == 0 ----
+    cabac.encode_decision(w, &mut ctxs.part_mode[0], 1);
+    cabac.encode_terminate(w, 0); // pcm_flag = 0
+    write_luma_intra_mode(w, cabac, ctxs, record.mode, record.candidates);
+
+    // §9.3.3.8 / Table 9-46: value 4 (chroma derived from luma) is the
+    // single context-coded 0 bin; 0..=3 is a 1 bin plus two FL bypass bins.
+    if record.chroma_mode == CHROMA_MODE_DERIVED {
+        cabac.encode_decision(w, &mut ctxs.intra_chroma_pred_mode[0], 0);
+    } else {
+        cabac.encode_decision(w, &mut ctxs.intra_chroma_pred_mode[0], 1);
+        cabac.encode_bypass(w, (record.chroma_mode >> 1) & 1);
+        cabac.encode_bypass(w, record.chroma_mode & 1);
     }
-    counter.bins
+
+    // ---- transform_tree(): split_transform_flag is absent because
+    // max_transform_hierarchy_depth_intra == 0, so MaxTrafoDepth == 0
+    // and the flag is inferred 0 (one 16x16 luma TB, two 8x8 chroma).
+    let [luma, chroma_cb, chroma_cr] = &record.levels;
+
+    // §7.3.8.8 order: cbf_cb, cbf_cr (ctxInc = trafoDepth = 0), then
+    // cbf_luma (ctxInc = 1 at trafoDepth 0).
+    let cbf_cb = u8::from(has_coded_levels(chroma_cb));
+    let cbf_cr = u8::from(has_coded_levels(chroma_cr));
+    let cbf_luma = u8::from(has_coded_levels(luma));
+    cabac.encode_decision(w, &mut ctxs.cbf_chroma[0], cbf_cb);
+    cabac.encode_decision(w, &mut ctxs.cbf_chroma[0], cbf_cr);
+    cabac.encode_decision(w, &mut ctxs.cbf_luma[1], cbf_luma);
+
+    // ---- transform_unit(): the coded blocks, luma then Cb then Cr.
+    for (levels, log2, is_chroma) in [
+        (luma, CTB_LOG2, false),
+        (chroma_cb, CTB_LOG2 - 1, true),
+        (chroma_cr, CTB_LOG2 - 1, true),
+    ] {
+        if !has_coded_levels(levels) {
+            continue;
+        }
+        write_residual_coding(
+            &mut EngineResidualBinSink {
+                writer: w,
+                cabac,
+                contexts: &mut ctxs.residual,
+            },
+            &ResidualWriteParams {
+                log2_trafo_size: log2,
+                is_chroma,
+                // §7.4.9.11: the mode-dependent scans need
+                // log2TrafoSize == 2 (or 3 for luma / 4:4:4), so both
+                // block sizes here take the up-right diagonal scan.
+                scan_idx: ScanIdx::Diagonal,
+            },
+            levels,
+        );
+    }
+}
+
+/// §7.3.8.1 `slice_segment_data( )`: every recorded coding unit, each
+/// optionally behind the §7.3.8.3 `sao( )` structure of its CTB.
+///
+/// The slice header ends on `byte_alignment( )` and §9.3.2.2 initializes the
+/// CABAC engine from `SliceQpY` and the init type alone, so this stands on
+/// its own: what it returns is appended to the header verbatim. It is also
+/// what every rate in the SAO decision is measured on — the two curve points
+/// [`calibrated_sao_lambda_q8`] interpolates between, and the grid's own cost
+/// as the difference between coding it and not — so all of them are the
+/// arithmetic coder's own output rather than a bin count standing in for it.
+/// A bin count would suit neither: the residual's bins are context-coded and
+/// far cheaper than a bit each, while the `sao( )` structure's are nearly all
+/// bypass, so a slope measured in bins and spent in bins compares two
+/// different currencies.
+fn code_slice_data(
+    records: &[CtbRecord],
+    sao: Option<&[ResolvedSao]>,
+    qp: i32,
+    ctbs_x: usize,
+) -> Vec<u8> {
+    let mut w = BitWriter::new();
+    let mut ctxs = SliceContexts::init(init_type(2, false), qp);
+    let mut cabac = CabacEncoder::new();
+    for (addr, record) in records.iter().enumerate() {
+        if let Some(grid) = sao {
+            code_sao(
+                &mut SaoWriter {
+                    writer: &mut w,
+                    cabac: &mut cabac,
+                    contexts: &mut ctxs,
+                },
+                grid,
+                addr,
+                ctbs_x,
+            );
+        }
+        code_coding_unit(&mut w, &mut cabac, &mut ctxs, record);
+        cabac.encode_terminate(&mut w, u8::from(addr == records.len() - 1));
+    }
+    w.align_zero();
+    w.finish()
+}
+
+/// One point on this picture's own rate-distortion curve: the whole-picture
+/// squared error of the deblocked reconstruction, and the bins the slice's
+/// coding units cost, both at one QP.
+#[derive(Clone, Copy)]
+struct CurvePoint {
+    /// Whole-picture SSE over all three planes, after §8.7.2 and before
+    /// §8.7.3 — the distortion the SAO decision is about to move.
+    sse: u64,
+    /// What the slice's coding units cost the CABAC coder, SAO syntax
+    /// excluded — [`slice_data_bits`] at this point's own QP, so two points'
+    /// rates are subtractable.
+    bits: u64,
+}
+
+/// The curve point this writer lands on at `qp`: run the decision pass, run
+/// the in-loop filter the base point carries, and measure both coordinates.
+///
+/// This is the probe [`calibrated_sao_lambda_q8`] takes its slope against. It
+/// is the decision pass and the deblocking filter only — no bitstream pass
+/// and no §8.7.3 — so it is not a second encode of the picture, and the
+/// recursion a probe of a probe would be cannot arise.
+fn curve_point(src: SourcePlanes<'_>, qp: i32, search: ModeSearch, deblocking: bool) -> CurvePoint {
+    let (records, mut recon) =
+        run_decision_pass(src.y, src.cb, src.cr, src.width, src.height, qp, search);
+    if deblocking {
+        deblock_reconstruction(&mut recon, qp);
+    }
+    CurvePoint {
+        sse: picture_sse(&recon, src.y, src.cb, src.cr),
+        bits: code_slice_data(&records, None, qp, src.width / CTB).len() as u64 * 8,
+    }
+}
+
+/// The slice-level half of the SAO decision: whether a grid that removed
+/// `gain` of squared error is worth the `sao_bits` it would be coded with.
+///
+/// The trade is `D + lambda * R` against the multiplier
+/// [`calibrated_sao_lambda_q8`] reads off this picture's own curve, which is
+/// what `probe` measures — so `probe` is called only when its answer can
+/// change the outcome. The calibrated multiplier is never outside a factor of
+/// [`SAO_LAMBDA_BAND`] either side of the closed-form one, so a gain that
+/// clears the band's coarse end already clears whatever the probe would have
+/// returned, and one that misses its fine end already misses it. Over the
+/// QP 12-51 sweep on the two test pictures that settles half the pictures
+/// without a probe, where SAO either found nothing the quantizer had left
+/// behind or found far more than a step of it recovers.
+fn keeps_sao(
+    gain: u64,
+    sao_bits: u64,
+    qp: i32,
+    probe: impl FnOnce() -> (CurvePoint, CurvePoint),
+) -> bool {
+    if sao_bits == 0 {
+        return gain > 0;
+    }
+    let clears = |lambda: u64| gain > sao_bits.saturating_mul(lambda) / 256;
+    let fixed = u64::from(lambda_q8(qp));
+    if clears(fixed.saturating_mul(SAO_LAMBDA_BAND)) {
+        return true;
+    }
+    if !clears((fixed / SAO_LAMBDA_BAND).max(1)) {
+        return false;
+    }
+    let (fine, coarse) = probe();
+    clears(u64::from(calibrated_sao_lambda_q8(
+        fine, coarse, qp, sao_bits,
+    )))
+}
+
+/// The multiplier the slice-level SAO decision trades distortion against rate
+/// with, in the Q8 units [`lambda_q8`] returns: what `sao_bits` more of this
+/// picture's own rate-distortion curve is worth, per bit.
+///
+/// `lambda_q8` is `0.57 * 2 ^ ( ( QP - 12 ) / 3 )`, a closed-form function of
+/// the quantizer alone. That is the right instrument for choosing between two
+/// codings of the same block at the same QP, where the picture cancels out of
+/// the comparison. It is the wrong one here, because this decision is not
+/// between two codings of a block but between spending bits on SAO and
+/// spending the same bits on a finer quantizer — and what those bits buy that
+/// way is a property of the content, not of the QP. Over the QP 12-51 sweep
+/// on the two test pictures the closed-form value misses the picture's own
+/// slope by 0.4x to 2.5x, in neither direction consistently, which is how
+/// #268's decision came to accept two points that sat below the curve.
+///
+/// So it is read off the curve. `fine` and `coarse` are two points on it —
+/// the writer's own coded point and [`curve_point`] one QP away — and the
+/// curve between them is taken as a straight line in log-rate against
+/// log-distortion, which is the interpolation the acceptance measurement uses
+/// and is very nearly straight over a single quantizer step. The distortion
+/// that line reaches `sao_bits` above the coded point is what SAO has to
+/// beat; what this returns is the per-bit form of it, so the caller's test
+/// stays the `D + lambda * R` one.
+///
+/// Interpolating rather than taking the secant's own slope is what makes the
+/// difference: SAO's rate is a fraction of a quantizer step's, the secant is
+/// the average slope over the whole step, and a curve this convex is steeper
+/// than its average at the near end. Charging SAO the average leaves points
+/// just under the curve — measured, four of them over the sweep, the worst
+/// 0.08 dB below.
+fn calibrated_sao_lambda_q8(fine: CurvePoint, coarse: CurvePoint, qp: i32, sao_bits: u64) -> u32 {
+    let fixed = lambda_q8(qp);
+    // The coded point is `coarse` at every QP but 0, where there is no finer
+    // point to probe and the writer's own point is `fine` instead. Either way
+    // the interpolation runs from the coded point towards the other one.
+    let (coded, other) = if qp > 0 {
+        (coarse, fine)
+    } else {
+        (fine, coarse)
+    };
+    if coded.sse == 0 || coded.bits == 0 || other.sse == 0 || sao_bits == 0 {
+        return fixed;
+    }
+    let rate_ratio = other.bits as f64 / coded.bits as f64;
+    let sse_ratio = other.sse as f64 / coded.sse as f64;
+    // A probe that coded the same bits as the writer, or that did not move
+    // the reconstruction the way a quantizer step must, describes no curve.
+    if (rate_ratio - 1.0).abs() < 1e-9 || (sse_ratio - 1.0).abs() < 1e-9 {
+        return fixed;
+    }
+    if (rate_ratio > 1.0) != (sse_ratio < 1.0) {
+        return fixed;
+    }
+    let t = (1.0 + sao_bits as f64 / coded.bits as f64).ln() / rate_ratio.ln();
+    let reachable = coded.sse as f64 * (1.0 - sse_ratio.powf(t));
+    if !reachable.is_finite() || reachable <= 0.0 {
+        return fixed;
+    }
+    let fixed = u64::from(fixed);
+    let measured = (reachable * 256.0 / sao_bits as f64).round().max(0.0) as u64;
+    measured.clamp((fixed / SAO_LAMBDA_BAND).max(1), fixed * SAO_LAMBDA_BAND) as u32
 }
 
 /// The sum of squared errors between a reconstruction and the source it was
@@ -1699,6 +1947,346 @@ mod tests {
         (encode(LoopFilter::Deblock), encode(LoopFilter::DeblockSao))
     }
 
+    /// The §7.3.8.3 grid the writer would code for one picture at one QP —
+    /// the same [`sao_reconstruction`] call the coding loop makes, on the same
+    /// deblocked reconstruction and with the same lambda, so what it returns
+    /// is what the slice carries.
+    fn sao_grid(
+        y: &[u8],
+        cb: &[u8],
+        cr: &[u8],
+        width: usize,
+        height: usize,
+        qp: i32,
+    ) -> Vec<ResolvedSao> {
+        let (_, mut deblocked, _) = write_idr_residual_slice(
+            y,
+            cb,
+            cr,
+            width,
+            height,
+            qp,
+            ModeSearch::Rdo,
+            LoopFilter::Deblock,
+        );
+        sao_reconstruction(
+            &mut deblocked,
+            SourcePlanes {
+                y,
+                cb,
+                cr,
+                width,
+                height,
+            },
+            lambda_q8(qp),
+        )
+    }
+
+    #[test]
+    fn the_search_picks_band_offset_where_it_beats_every_edge_class() {
+        // The band path of §7.3.8.3 — four `sao_offset_sign` bins and a
+        // five-bin `sao_band_position` — is only ever written when the search
+        // picks `SaoTypeIdx == 1`, so pin a picture and a QP where it does.
+        // The noise-carrying picture at a fine QP is the case: its error is
+        // spread over a value range rather than shaped around a local edge,
+        // which is exactly what edge offset cannot reach.
+        let (width, height) = (64, 48);
+        let (y, cb, cr) = picture(width, height);
+        let grid = sao_grid(&y, &cb, &cr, width, height, 12);
+        let band = grid
+            .iter()
+            .flat_map(|cell| cell.components.iter())
+            .filter(|c| c.sao_type_idx == 1)
+            .count();
+        assert!(
+            band > 0,
+            "the search never chose band offset, so the writer's band path is still dead code"
+        );
+
+        // And it is the writer's own decision, not just the search's: the
+        // slice-level test kept the pass, so those `sao( )` structures reached
+        // the bitstream and a decoder resolved them back into the same
+        // picture.
+        let ((off_bytes, off_psnr), (on_bytes, on_psnr)) =
+            sao_on_off(&y, &cb, &cr, width, height, 12);
+        assert!(
+            on_bytes > off_bytes && on_psnr > off_psnr,
+            "the slice-level test declined the pass band offset was chosen in: \
+             {off_bytes} -> {on_bytes} bytes, {off_psnr:.3} -> {on_psnr:.3} dB"
+        );
+        let (au, recon) = encode_idr_residual_au(&y, &cb, &cr, width, height, 12).unwrap();
+        let (dy, dcb, dcr) = decode(&au, width, height);
+        assert_eq!(dy, recon.y, "luma diverged over a band-offset slice");
+        assert_eq!(dcb, recon.cb, "Cb diverged over a band-offset slice");
+        assert_eq!(dcr, recon.cr, "Cr diverged over a band-offset slice");
+    }
+
+    #[test]
+    fn band_offset_earns_its_rate_where_the_search_takes_it() {
+        // The measurement the changelog records: band offset is worth more
+        // than the four signs and five position bins it costs beyond edge
+        // offset. Both numbers come from the same coding loop at the same QP,
+        // so the only difference is which types the search was allowed to
+        // consider — here, that the noise picture at QP 12 gains 0.10 dB of
+        // whole-picture PSNR for half a percent of slice.
+        let (width, height) = (64, 48);
+        let (y, cb, cr) = picture(width, height);
+        let (_, (on_bytes, on_psnr)) = sao_on_off(&y, &cb, &cr, width, height, 12);
+        assert!(
+            on_psnr > 51.10,
+            "the noise picture at QP 12 reconstructed at {on_psnr:.3} dB, below what band offset \
+             was measured to buy"
+        );
+        assert!(
+            on_bytes < 1960,
+            "the band-offset slice cost {on_bytes} bytes, above what it was measured to cost"
+        );
+    }
+
+    /// Where every SAO point the writer accepts sits relative to the SAO-off
+    /// writer's own rate-distortion curve, interpolated in log-rate at the
+    /// same slice size — the same construction
+    /// [`the_rate_distortion_cost_beats_the_fixed_qp_decision_at_equal_rate`]
+    /// uses, applied to the other decision.
+    ///
+    /// Returns one entry per QP at which the slice-level test accepted SAO:
+    /// the QP, the accepted slice size, and how far above the curve it landed
+    /// in dB.
+    fn sao_curve_offsets(
+        y: &[u8],
+        cb: &[u8],
+        cr: &[u8],
+        width: usize,
+        height: usize,
+        sweep: &[i32],
+    ) -> Vec<(i32, usize, f64)> {
+        let source = [y.to_vec(), cb.to_vec(), cr.to_vec()].concat();
+        let encode = |qp: i32, filter| {
+            let (slice, recon, _) =
+                write_idr_residual_slice(y, cb, cr, width, height, qp, ModeSearch::Rdo, filter);
+            let psnr = psnr_db(
+                &source,
+                &[recon.y.clone(), recon.cb.clone(), recon.cr.clone()].concat(),
+            );
+            (slice.len() as f64, psnr)
+        };
+        // The SAO-off writer's curve, finest first — the ladder
+        // [`the_rate_distortion_cost_beats_the_fixed_qp_decision_at_equal_rate`]
+        // interpolates against, widened at both ends to bracket the whole
+        // sweep. Its rungs are spaced widely on purpose: adjacent QPs differ
+        // by a handful of bytes on pictures this size, so a chord between
+        // them measures the byte rounding rather than the curve.
+        let ladder: Vec<(f64, f64)> = (0..=51).map(|qp| encode(qp, LoopFilter::Deblock)).collect();
+        let mut out = Vec::new();
+        for &qp in sweep {
+            let (_, off_psnr) = encode(qp, LoopFilter::Deblock);
+            let (bytes, psnr) = encode(qp, LoopFilter::DeblockSao);
+            if psnr <= off_psnr {
+                // The slice-level test declined the pass: the reconstruction
+                // reverted, and the slice is the deblocked one plus the two
+                // `slice_sao_*_flag` bits of header.
+                continue;
+            }
+            let pair = ladder
+                .windows(2)
+                .find(|pair| pair[1].0 <= bytes && bytes <= pair[0].0)
+                .unwrap_or_else(|| panic!("qp {qp}: {bytes} bytes is off the measured ladder"));
+            let (bigger, smaller) = (pair[0], pair[1]);
+            let t = (bigger.0.ln() - bytes.ln()) / (bigger.0.ln() - smaller.0.ln());
+            let interpolated = bigger.1 + t * (smaller.1 - bigger.1);
+            out.push((qp, bytes as usize, psnr - interpolated));
+        }
+        out
+    }
+
+    #[test]
+    #[ignore = "measurement: what the SAO stage costs the writer in wall clock"]
+    fn sao_decision_cost() {
+        // Interleaved rounds, elementwise minimum, because a shared host
+        // makes any single timed round an upper bound on somebody else's
+        // load rather than a measurement of this code.
+        let (width, height) = (128usize, 96usize);
+        for (name, (y, cb, cr)) in [
+            ("noise", picture(width, height)),
+            ("smooth", smooth_picture(width, height)),
+        ] {
+            for qp in [12i32, 26, 37] {
+                let run = |filter| {
+                    let start = std::time::Instant::now();
+                    let out = write_idr_residual_slice(
+                        &y,
+                        &cb,
+                        &cr,
+                        width,
+                        height,
+                        qp,
+                        ModeSearch::Rdo,
+                        filter,
+                    );
+                    std::hint::black_box(&out);
+                    start.elapsed()
+                };
+                let mut off = std::time::Duration::MAX;
+                let mut on = std::time::Duration::MAX;
+                for _ in 0..7 {
+                    off = off.min(run(LoopFilter::Deblock));
+                    on = on.min(run(LoopFilter::DeblockSao));
+                }
+                println!(
+                    "COST {name} qp {qp}: SAO off {:.2} ms, on {:.2} ms ({:+.0}%)",
+                    off.as_secs_f64() * 1e3,
+                    on.as_secs_f64() * 1e3,
+                    (on.as_secs_f64() / off.as_secs_f64() - 1.0) * 100.0
+                );
+            }
+        }
+    }
+
+    /// A point on a picture's curve, for the calibration's own unit tests.
+    fn curve(bits: u64, sse: u64) -> CurvePoint {
+        CurvePoint { sse, bits }
+    }
+
+    #[test]
+    fn the_calibrated_multiplier_charges_more_than_the_secant_it_is_read_off() {
+        // The whole reason the calibration interpolates instead of taking the
+        // secant's slope: SAO spends a fraction of a quantizer step's rate,
+        // and a convex curve is steeper near the coded point than the step's
+        // average. Charging the average is what left points under the curve.
+        let coded = curve(8_000, 100_000);
+        let finer = curve(10_000, 80_000);
+        let sao_bits = 400;
+        let secant = 256 * (coded.sse - finer.sse) / (finer.bits - coded.bits);
+        let calibrated = u64::from(calibrated_sao_lambda_q8(finer, coded, 26, sao_bits));
+        assert!(
+            calibrated > secant,
+            "the interpolated multiplier {calibrated} does not charge more than the secant's \
+             {secant}"
+        );
+        // ...and the closer to the coded point SAO stays, the steeper the
+        // stretch of curve it is charged for.
+        let nearer = u64::from(calibrated_sao_lambda_q8(finer, coded, 26, sao_bits / 4));
+        assert!(
+            nearer > calibrated,
+            "a smaller SAO rate was charged {nearer}, no more than the larger one's {calibrated}"
+        );
+    }
+
+    #[test]
+    fn a_probe_that_describes_no_curve_falls_back_to_the_closed_form() {
+        // Every degenerate two-point measurement: a probe that coded the same
+        // bits, one that reconstructed the same picture, one that moved both
+        // the wrong way, and an empty slice.
+        let coded = curve(8_000, 100_000);
+        let fixed = lambda_q8(26);
+        for (name, probe) in [
+            ("same rate", curve(8_000, 80_000)),
+            ("same distortion", curve(10_000, 100_000)),
+            ("more bits and more error", curve(10_000, 120_000)),
+            ("no slice at all", curve(0, 0)),
+        ] {
+            assert_eq!(
+                calibrated_sao_lambda_q8(probe, coded, 26, 400),
+                fixed,
+                "{name}: the calibration invented a slope out of it"
+            );
+        }
+        assert_eq!(
+            calibrated_sao_lambda_q8(curve(10_000, 80_000), coded, 26, 0),
+            fixed,
+            "a grid that costs nothing has no per-bit worth to calibrate"
+        );
+    }
+
+    #[test]
+    fn the_calibrated_multiplier_stays_inside_its_band() {
+        let fixed = u64::from(lambda_q8(26));
+        // A picture whose probe says one step of the quantizer buys almost
+        // nothing, and one whose probe says it buys nearly everything.
+        let flat = calibrated_sao_lambda_q8(curve(10_000, 99_999), curve(8_000, 100_000), 26, 400);
+        let steep = calibrated_sao_lambda_q8(curve(10_000, 1), curve(8_000, 100_000), 26, 400);
+        assert_eq!(u64::from(flat), (fixed / SAO_LAMBDA_BAND).max(1));
+        assert_eq!(u64::from(steep), fixed * SAO_LAMBDA_BAND);
+    }
+
+    #[test]
+    fn the_slice_level_test_only_probes_when_the_band_leaves_it_open() {
+        // The probe is a second decision pass, so it may only run where its
+        // answer can still change the decision — which is exactly where the
+        // gain falls inside the band the calibrated multiplier is clamped to.
+        let qp = 26;
+        let fixed = u64::from(lambda_q8(qp));
+        let sao_bits = 256;
+        let never = || panic!("the probe ran where the band had already settled the decision");
+        assert!(
+            keeps_sao(
+                sao_bits * fixed * SAO_LAMBDA_BAND / 256 + 1,
+                sao_bits,
+                qp,
+                never
+            ),
+            "a gain clearing the band's coarse end was not kept"
+        );
+        assert!(
+            !keeps_sao(
+                sao_bits * (fixed / SAO_LAMBDA_BAND) / 256,
+                sao_bits,
+                qp,
+                never
+            ),
+            "a gain missing the band's fine end was not declined"
+        );
+        // Between them the probe decides, and its answer is used.
+        let inside = sao_bits * fixed / 256;
+        let probed = std::cell::Cell::new(false);
+        let probe = || {
+            probed.set(true);
+            (curve(10_000, 80_000), curve(8_000, 100_000))
+        };
+        keeps_sao(inside, sao_bits, qp, probe);
+        assert!(
+            probed.get(),
+            "the probe was skipped where the band left it open"
+        );
+    }
+
+    #[test]
+    fn every_accepted_sao_point_sits_on_the_writers_own_curve() {
+        // The property the calibrated multiplier exists for, and the one the
+        // fixed lambda could not hold: wherever the writer decides SAO is
+        // worth its syntax, the point it lands on is at least as good as
+        // spending the same bits on a finer quantizer instead. Both pictures
+        // at both sizes over the whole sweep, because the fixed lambda's two
+        // failures were on one picture at one QP and a decision that is only
+        // right where it was measured is not a decision.
+        for (name, width, height, smooth) in [
+            ("smooth 64x48", 64usize, 48usize, true),
+            ("smooth 128x96", 128, 96, true),
+            ("noise 64x48", 64, 48, false),
+            ("noise 128x96", 128, 96, false),
+        ] {
+            let (y, cb, cr) = if smooth {
+                smooth_picture(width, height)
+            } else {
+                picture(width, height)
+            };
+            let sweep: Vec<i32> = (12..=51).collect();
+            let accepted = sao_curve_offsets(&y, &cb, &cr, width, height, &sweep);
+            assert!(
+                !accepted.is_empty(),
+                "{name}: the writer accepted SAO nowhere in the sweep, so the \
+                 measurement asserts nothing"
+            );
+            for (qp, bytes, delta) in accepted {
+                assert!(
+                    delta >= 0.0,
+                    "{name} qp {qp}: the accepted SAO point ({bytes} bytes) sits {delta:+.3} dB \
+                     below the SAO-off writer's own curve at the same rate"
+                );
+            }
+        }
+    }
+
     #[test]
     fn the_sao_pass_is_worth_taking_where_the_writer_takes_it() {
         // The gain the changelog records, at the two operating points the
@@ -1707,8 +2295,8 @@ mod tests {
         // back, and a coarse one on the noise-carrying picture, where §8.7.2
         // declined most edges and left the error for §8.7.3.
         for (name, (y, cb, cr), qp, floor) in [
-            ("smooth 64x48", smooth_picture(64, 48), 12i32, 0.5f64),
-            ("smooth 128x96", smooth_picture(128, 96), 12, 0.7),
+            ("smooth 64x48", smooth_picture(64, 48), 12i32, 0.7f64),
+            ("smooth 128x96", smooth_picture(128, 96), 12, 0.85),
             ("noise 64x48", picture(64, 48), 37, 0.2),
             ("noise 128x96", picture(128, 96), 37, 0.3),
         ] {
