@@ -27,7 +27,9 @@ use super::engine::intra_pred::{
     Component as IntraComponent, IntraPredParams, ReferenceSamples, intra_predict,
 };
 use super::engine::picture::{Picture, Plane};
-use super::engine::sao::{ResolvedSao, ResolvedSaoComponent, apply_sao_picture};
+use super::engine::sao::{
+    ResolvedSao, ResolvedSaoComponent, SaoBoundaries, apply_sao_picture_with_boundaries,
+};
 use super::engine::transform::{BlockParams, Component as TxComponent, PredMode, residual_block};
 use super::engine::{BitReader, CabacEngine, ContextModel};
 use super::{HevcDecoder, ParsedConfiguration, picture_to_rgba};
@@ -76,6 +78,29 @@ const INTER_PU_MIX: [(usize, bool, f64); 8] = [
     (16, true, 0.017),
     (8, false, 0.009),
     (8, true, 0.005),
+];
+/// The §7.3.8.3 SAO parameter mix a real decode runs, as issue #310 measured
+/// it: 48 frames of `examples/media/BigBuckBunny.mp4` at 1920x1080, all 26,520
+/// coding tree blocks the decoder resolved parameters for, counted per colour
+/// component.
+///
+/// Row 0 is luma, row 1 chroma — Cb and Cr came out identical CTB for CTB, as
+/// §7.3.8.3 signals one `sao_type_idx_chroma` and one `SaoEoClass` for the
+/// pair. Each row is the share of CTBs taking, in order: no SAO at all
+/// (`SaoTypeIdx == 0`), band offset, and the four edge-offset classes
+/// (0-degree, 90-degree, 135-degree, 45-degree).
+///
+/// The workload this drives replaced a grid that put band or edge offset on
+/// *every* CTB of *every* component, which is not what the stage runs on real
+/// content in the way that matters most to it: **SAO is off on 86.7% of luma
+/// CTBs and 94.4% of chroma CTBs**, and an off CTB costs nothing at all. The
+/// old grid therefore filtered about eight times the samples a 1080p frame
+/// actually puts through the classifiers, so its ratio was the kernels'
+/// throughput on a saturated picture rather than their worth to a decode.
+const SAO_CTB_MIX: [[f64; 6]; 2] = [
+    // off, band, EO 0-deg, EO 90-deg, EO 135-deg, EO 45-deg
+    [0.866780, 0.020362, 0.020777, 0.030656, 0.026697, 0.034729],
+    [0.944155, 0.009540, 0.001357, 0.004450, 0.015875, 0.024623],
 ];
 /// The CTB side the SAO stage is driven at, as `log2`.
 const SAO_CTB_LOG2: u32 = 6;
@@ -294,6 +319,16 @@ pub struct HevcStageInputs {
     /// exactly what the first already builds, a whole decoded picture.
     picture: Picture,
     sao_ctbs: Vec<ResolvedSao>,
+    /// The single-slice, single-tile §8.7.3.2 boundary grids the stage is
+    /// driven with. A decode always has these — whether a stream is
+    /// single-slice and single-tile is not known before it is parsed — so
+    /// running the stage without them (as this group did before issue #310)
+    /// measures a dispatch the decoder never takes.
+    sao_boundaries: SaoBoundaries,
+    /// Samples the SAO classifiers actually run over per run, luma plus
+    /// chroma: [`SAO_CTB_MIX`] leaves most CTBs with `SaoTypeIdx == 0`, and
+    /// those cost nothing.
+    sao_filtered_samples: u64,
     /// The §8.5.3.3 prediction units one run of the stage reconstructs, in
     /// raster order, built to [`INTER_PU_MIX`]. Scheduling them is setup, so
     /// it happens here rather than inside the timed loop.
@@ -321,6 +356,7 @@ impl HevcStageInputs {
         let tx_blocks = build_tx_blocks();
         let tx_samples = tx_blocks.iter().map(|(l, _)| l.len() as u64).sum();
         let (picture, sao_ctbs) = build_sao_inputs(width, height, &luma);
+        let (sao_boundaries, sao_filtered_samples) = build_sao_boundaries(width, height, &sao_ctbs);
         let inter_pus = schedule_inter_pus(width, height);
         let inter_luma_samples = inter_pus.iter().map(|pu| (pu.n * pu.n) as u64).sum();
         Self {
@@ -333,6 +369,8 @@ impl HevcStageInputs {
             tx_samples,
             picture,
             sao_ctbs,
+            sao_boundaries,
+            sao_filtered_samples,
             inter_pus,
             inter_luma_samples,
             convert_config: convert_config(width, height),
@@ -362,10 +400,15 @@ impl HevcStageInputs {
         (self.luma_edges().len() * 4 * 8) as u64
     }
 
-    /// Samples the SAO stage reads and writes per run, luma plus chroma.
+    /// Samples the SAO stage classifies per run, luma plus chroma.
+    ///
+    /// Counts only the CTBs [`SAO_CTB_MIX`] leaves switched on, since a CTB
+    /// with `SaoTypeIdx == 0` is returned from before it reads a sample. On the
+    /// measured mix that is a small minority of the picture, which is the
+    /// point: the throughput this divides is the classifiers', not the frame's.
     #[must_use]
     pub fn sao_samples(&self) -> u64 {
-        (self.width * self.height) as u64 * 3 / 2
+        self.sao_filtered_samples
     }
 
     /// Residual samples the inverse-transform stage produces per run.
@@ -497,13 +540,14 @@ impl HevcStageInputs {
     /// both the band-offset and the edge-offset classifiers in the grid.
     #[must_use]
     pub fn run_sao(&self) -> Vec<u8> {
-        let filtered = apply_sao_picture(
+        let filtered = apply_sao_picture_with_boundaries(
             self.picture.clone(),
             &self.sao_ctbs,
             SAO_CTB_LOG2,
             1,
             true,
             true,
+            Some(&self.sao_boundaries),
         );
         let mut digest = Digest::new();
         for plane in [Plane::Luma, Plane::Cb, Plane::Cr] {
@@ -687,8 +731,44 @@ fn build_tx_blocks() -> Vec<(Vec<i32>, BlockParams)> {
     blocks
 }
 
+/// Pick the class furthest below its target share of the CTBs emitted so far.
+///
+/// Greedy on the sample deficit, as [`schedule_inter_pus`] is, so the emitted
+/// mix converges on the measured one exactly rather than approximately and does
+/// so deterministically — which is what the benchmark's bit-exactness guard
+/// needs.
+fn sao_class_for(shares: &[f64; 6], emitted: &[u64; 6], total: u64) -> usize {
+    (0..6)
+        .max_by(|&a, &b| {
+            let deficit = |i: usize| shares[i].mul_add(total as f64, -(emitted[i] as f64));
+            deficit(a)
+                .partial_cmp(&deficit(b))
+                .expect("the shares are finite")
+        })
+        .expect("the mix is not empty")
+}
+
+/// The resolved SAO parameters of one [`SAO_CTB_MIX`] class.
+fn sao_component_for(class: usize, i: usize, cidx: usize) -> ResolvedSaoComponent {
+    match class {
+        0 => ResolvedSaoComponent::off(),
+        1 => ResolvedSaoComponent {
+            sao_type_idx: 1,
+            offset_val: [0, 3, -2, 1, -3],
+            band_position: ((i * 7 + cidx) % 28) as u8,
+            eo_class: 0,
+        },
+        _ => ResolvedSaoComponent {
+            sao_type_idx: 2,
+            offset_val: [0, 2, 1, -1, -2],
+            band_position: 0,
+            eo_class: (class - 2) as u8,
+        },
+    }
+}
+
 /// A full 4:2:0 picture of synthetic content plus a per-CTB SAO parameter grid
-/// that alternates band offset and the four edge-offset classes.
+/// built to the measured [`SAO_CTB_MIX`].
 fn build_sao_inputs(width: usize, height: usize, luma: &[i32]) -> (Picture, Vec<ResolvedSao>) {
     let mut picture = Picture::new(width, height, 1, BIT_DEPTH, BIT_DEPTH);
     let (y_plane, _) = picture.plane_mut(Plane::Luma);
@@ -703,32 +783,66 @@ fn build_sao_inputs(width: usize, height: usize, luma: &[i32]) -> (Picture, Vec<
     let ctbs_x = width.div_ceil(ctb);
     let ctbs_y = height.div_ceil(ctb);
     let mut grid = Vec::with_capacity(ctbs_x * ctbs_y);
+    // One deficit accumulator per row of the mix: luma is scheduled on its own
+    // shares, and Cb / Cr share the chroma row's — and take the same class as
+    // each other, as §7.3.8.3 signals them as one.
+    let mut emitted = [[0u64; 6]; 2];
+    let mut total = 0u64;
     for i in 0..ctbs_x * ctbs_y {
-        let mut components = [ResolvedSaoComponent::off(); 3];
-        for (cidx, component) in components.iter_mut().enumerate() {
-            // Alternate band offset (type 1) and edge offset (type 2), cycling
-            // the four edge classes, so both classifiers and all four
-            // directions run inside one picture.
-            let band = (i + cidx) % 5 == 0;
-            *component = if band {
-                ResolvedSaoComponent {
-                    sao_type_idx: 1,
-                    offset_val: [0, 3, -2, 1, -3],
-                    band_position: ((i * 7 + cidx) % 28) as u8,
-                    eo_class: 0,
-                }
-            } else {
-                ResolvedSaoComponent {
-                    sao_type_idx: 2,
-                    offset_val: [0, 2, 1, -1, -2],
-                    band_position: 0,
-                    eo_class: ((i + cidx) % 4) as u8,
-                }
-            };
-        }
-        grid.push(ResolvedSao { components });
+        let luma_class = sao_class_for(&SAO_CTB_MIX[0], &emitted[0], total);
+        let chroma_class = sao_class_for(&SAO_CTB_MIX[1], &emitted[1], total);
+        emitted[0][luma_class] += 1;
+        emitted[1][chroma_class] += 1;
+        total += 1;
+        grid.push(ResolvedSao {
+            components: [
+                sao_component_for(luma_class, i, 0),
+                sao_component_for(chroma_class, i, 1),
+                sao_component_for(chroma_class, i, 2),
+            ],
+        });
     }
     (picture, grid)
+}
+
+/// The §8.7.3.2 boundary grids for a single-slice, single-tile picture, plus
+/// the number of samples the grid's switched-on CTBs classify.
+///
+/// Every CTB is in slice 0 and tile 0, so nothing here denies a neighbour read
+/// — but the decoder still carries the grids, and the per-CTB
+/// [`SaoBoundaries::ctb_neighbourhood_unconstrained`] test that clears the
+/// vector path has to run over them. Passing them is what makes this group time
+/// the dispatch a decode takes.
+fn build_sao_boundaries(width: usize, height: usize, grid: &[ResolvedSao]) -> (SaoBoundaries, u64) {
+    let ctb = 1usize << SAO_CTB_LOG2;
+    let ctbs_x = width.div_ceil(ctb);
+    let ctbs_y = height.div_ceil(ctb);
+    let mut samples = 0u64;
+    for (i, resolved) in grid.iter().enumerate() {
+        let (rx, ry) = (i % ctbs_x, i / ctbs_x);
+        let w = ctb.min(width.saturating_sub(rx * ctb));
+        let h = ctb.min(height.saturating_sub(ry * ctb));
+        if resolved.components[0].sao_type_idx != 0 {
+            samples += (w * h) as u64;
+        }
+        for cidx in 1..3 {
+            if resolved.components[cidx].sao_type_idx != 0 {
+                samples += ((w / 2) * (h / 2)) as u64;
+            }
+        }
+    }
+    let n = ctbs_x * ctbs_y;
+    let boundaries = SaoBoundaries {
+        slice_addr_of_ctb: vec![0; n],
+        tile_id_of_ctb: vec![0; n],
+        pic_w_ctbs: ctbs_x,
+        ctb_log2_size_y: SAO_CTB_LOG2,
+        across_slices: true,
+        across_tiles: true,
+        filter_across_of_ctb: Some(vec![true; n]),
+        ctb_ts_of_rs: Some((0..n as u32).collect()),
+    };
+    (boundaries, samples)
 }
 
 /// A fixed pseudo-random byte buffer for the CABAC stage.
@@ -976,6 +1090,59 @@ mod tests {
         simd::set_override(None);
     }
 
+    /// The SAO grid has to run the §7.3.8.3 parameter mix issue #310 measured,
+    /// not a saturated picture.
+    ///
+    /// The share that matters most is the one that used to be zero: on real
+    /// content SAO is switched *off* on most CTBs, and an off CTB is returned
+    /// from before it reads a sample. A grid drifting back towards filtering
+    /// everything would read as a faster kernel when it is really a wider
+    /// workload, so the emitted mix is pinned rather than trusted.
+    #[test]
+    fn the_sao_grid_runs_the_measured_parameter_mix() {
+        let inputs = HevcStageInputs::new(1920, 1088);
+        let total = inputs.sao_ctbs.len() as f64;
+        assert!(total > 0.0, "the grid has CTBs");
+        for (row, cidx) in [(0usize, 0usize), (1, 1), (1, 2)] {
+            for class in 0..6 {
+                let want = SAO_CTB_MIX[row][class];
+                let got = inputs
+                    .sao_ctbs
+                    .iter()
+                    .filter(|r| {
+                        let c = &r.components[cidx];
+                        let seen = match c.sao_type_idx {
+                            0 => 0,
+                            1 => 1,
+                            _ => 2 + usize::from(c.eo_class),
+                        };
+                        seen == class
+                    })
+                    .count() as f64
+                    / total;
+                assert!(
+                    (got - want).abs() < 0.01,
+                    "component {cidx} class {class}: {got:.4} against the measured {want:.4}"
+                );
+            }
+        }
+        // Cb and Cr are signalled as one in §7.3.8.3, so they resolve alike.
+        assert!(
+            inputs.sao_ctbs.iter().all(|r| r.components[1].sao_type_idx
+                == r.components[2].sao_type_idx
+                && r.components[1].eo_class == r.components[2].eo_class),
+            "Cb and Cr take the same SAO type and class"
+        );
+        // Most of the picture is switched off, so the classifiers run over a
+        // fraction of it rather than all of it.
+        let all = (1920u64 * 1088) * 3 / 2;
+        assert!(
+            inputs.sao_samples() < all / 4,
+            "{} filtered samples against {all} in the picture",
+            inputs.sao_samples()
+        );
+    }
+
     /// The digests have to depend on the stages' samples.
     ///
     /// A workload that returned a constant would pass the bit-exactness guard
@@ -1050,7 +1217,13 @@ mod tests {
         // second reference list needs is taken off each edge, and every cell
         // is filled by prediction units of one class whatever that class is.
         assert_eq!(inputs.inter_pred_samples(), 3 * 64 * 64);
-        assert_eq!(inputs.sao_samples(), 256 * 128 * 3 / 2);
+        // Only the CTBs the measured mix leaves switched on are counted, so
+        // this is a fraction of the 256x128 4:2:0 picture rather than all of it.
+        assert!(
+            inputs.sao_samples() > 0 && inputs.sao_samples() < 256 * 128 * 3 / 2,
+            "sao_samples was {}",
+            inputs.sao_samples()
+        );
         assert_eq!(
             inputs.deblock_samples(),
             inputs.luma_edges().len() as u64 * 32

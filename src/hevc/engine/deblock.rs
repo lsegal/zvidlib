@@ -1462,7 +1462,13 @@ impl NoFilterMap<'_> {
     /// of the picture. Asking the question per region lets a caller keep its
     /// branch-free path everywhere the suppression does not actually reach.
     #[must_use]
-    pub fn any_in_luma_rect(&self, x_luma: usize, y_luma: usize, w_luma: usize, h_luma: usize) -> bool {
+    pub fn any_in_luma_rect(
+        &self,
+        x_luma: usize,
+        y_luma: usize,
+        w_luma: usize,
+        h_luma: usize,
+    ) -> bool {
         if w_luma == 0 || h_luma == 0 {
             return false;
         }
@@ -1472,7 +1478,12 @@ impl NoFilterMap<'_> {
         let cx1 = ((x_luma + w_luma - 1) >> 2).min(self.w_cells.saturating_sub(1));
         let cy1 = ((y_luma + h_luma - 1) >> 2).min(h_cells.saturating_sub(1));
         (cy0..=cy1).any(|cy| {
-            (cx0..=cx1).any(|cx| self.cells.get(cy * self.w_cells + cx).copied().unwrap_or(false))
+            (cx0..=cx1).any(|cx| {
+                self.cells
+                    .get(cy * self.w_cells + cx)
+                    .copied()
+                    .unwrap_or(false)
+            })
         })
     }
 }

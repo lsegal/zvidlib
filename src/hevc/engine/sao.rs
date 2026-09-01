@@ -620,6 +620,22 @@ pub fn apply_sao_picture_full(
     // buffer directly instead of a second full-picture clone — SAO
     // decodes a 1080p frame's worth of planes (~8MB+ luma/chroma), so an
     // extra clone here is a meaningful per-frame cost.
+    //
+    // The snapshot is skipped outright when the resolved grid switches SAO off
+    // everywhere it is enabled, because then the filter loop below writes
+    // nothing and `saoPicture` is `recPicture`. On real content most CTBs carry
+    // `SaoTypeIdx == 0` (issue #310 measured 86.7% of luma and 94.4% of chroma
+    // CTBs over 48 frames of the bundled sample), so whole pictures come out
+    // this way and a full-picture copy for them is pure waste.
+    let luma_on = slice_sao_luma_flag && ctb_sao.iter().any(|r| r.components[0].sao_type_idx != 0);
+    let chroma_on = chroma_array_type != 0
+        && slice_sao_chroma_flag
+        && ctb_sao
+            .iter()
+            .any(|r| r.components[1].sao_type_idx != 0 || r.components[2].sao_type_idx != 0);
+    if !luma_on && !chroma_on {
+        return pic;
+    }
     let rec = {
         let _profile = prof_scope(ProfStage::SaoSnapshot);
         pic.clone()
