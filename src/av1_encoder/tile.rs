@@ -591,6 +591,13 @@ impl<'a> FrameEncoder<'a> {
                 distortion += error * error;
             }
             let cost = distortion + self.lambda * estimate_rate(&levels, &scan);
+            // Strictly less, so an exact tie keeps the earlier candidate and the winner is a
+            // function of `candidates` order alone. Ties are not hypothetical: on the 96x80 test
+            // pattern an 8x8 block scores `IDTX` and `DCT_DCT` at exactly the same cost, and the
+            // set order is what decides it. That is the whole margin issue #231 was about - a
+            // one-unit cost difference there would flip which type the block writes - so the
+            // comparison has to be a total order over a fixed candidate order rather than
+            // anything that depends on evaluation order or on the host.
             if best.as_ref().is_none_or(|best| cost < best.cost) {
                 best = Some(TxCandidate {
                     symbol,
