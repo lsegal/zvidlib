@@ -66,7 +66,33 @@ const TYPE_GAIN_PROBES: usize = 1;
 /// be corrected by the same kind of estimate or the ranking compares a freshly measured size
 /// against a remembered one. The frame's first size search probes, so a correction is available
 /// from the first block that needs one.
-const TYPE_GAIN_SAMPLE_INTERVAL: usize = 8;
+///
+/// The ratio is only stable frame-wide while the frame's content is, and the reuse is what costs
+/// accuracy when it is not: a block corrected by a ratio measured in a region unlike its own can
+/// have two close sizes ranked the wrong way round. `2` is where that trade was measured out, on
+/// the six-frame set in `measure_type_gain_sampling_intervals` at 192x160 - a hard scene edge, a
+/// four-quadrant frame, full-range noise, a smooth surface, directional edges, and the encoder's
+/// own `test_pattern` - against the same estimator probing every size search, which is the
+/// unsampled search this interval approximates. Cost is the encoder's own `sse + lambda * bits`,
+/// summed over the frame and compared at equal quantizer:
+///
+/// | interval | worst frame penalty vs unsampled | mean penalty vs exhaustive | candidates | time |
+/// |---------:|---------------------------------:|---------------------------:|-----------:|-----:|
+/// | 1        | 0.0%                             | +0.25%                     | 181,557    | 0.644 s |
+/// | 2        | +44.1%                           | +1.05%                     | 155,143    | 0.607 s |
+/// | 4        | +64.6%                           | +1.70%                     | 142,372    | 0.574 s |
+/// | 8        | +78.7%                           | +1.97%                     | 136,250    | 0.565 s |
+/// | 16       | +85.8%                           | +2.29%                     | 128,035    | 0.557 s |
+///
+/// Every worst case is the same frame and quantizer - the hard scene edge at `qindex` 160, whose
+/// two halves have unrelated statistics - and the original value of `8` doubled the error there
+/// against `2` while saving 7% of the encode. `1` is not the value because it evaluates 181,557
+/// transform-type candidates against the exhaustive search's 700,004, which no longer clears the
+/// four-fold reduction the shortcuts exist for and
+/// `the_search_shortcuts_stay_within_their_rate_and_distortion_bound` asserts; `2` clears it with
+/// 155,143. What remains at `2` is the estimator mixing statistics across regions rather than the
+/// sampling rate, which no interval fixes.
+pub(super) const TYPE_GAIN_SAMPLE_INTERVAL: usize = 2;
 
 /// Transform sizes [`FrameEncoder::type_gain`] accumulates over: `TX_4X4` through `TX_32X32`,
 /// which is every size [`super::transform::forward_transform`] implements.

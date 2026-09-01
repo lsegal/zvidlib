@@ -930,10 +930,10 @@ mod nonlossless_tests {
     /// These are constants of the format, not of the machine that produced them: regenerate them
     /// only alongside a deliberate change to what the encoder emits, never to make a host pass.
     const FIXED_FRAME_DIGESTS: [(usize, u64); 6] = [
-        (5421, 0x2f47_5919_07ef_56f2),
-        (4289, 0xa74c_990b_3340_f8ce),
-        (3005, 0xcd2f_1c69_1785_039e),
-        (2214, 0xc7e0_a641_51f5_70e4),
+        (5417, 0x7b83_6e95_6bad_aae1),
+        (4298, 0xa4c4_6a5e_8ef1_57c0),
+        (3022, 0xba87_1a3d_44c1_4f33),
+        (2238, 0xc29d_7d70_a472_3158),
         (1264, 0xc8cd_fcf5_8882_a86c),
         (752, 0x73f1_c047_f3cf_211f),
     ];
@@ -1160,6 +1160,76 @@ mod nonlossless_tests {
             );
         }
         println!("exhaustive,{exhaustive_best:.4},{exhaustive_candidates}");
+    }
+
+    /// What the sampled transform-gain estimator costs on content it was not tuned on.
+    ///
+    /// `TYPE_GAIN_SAMPLE_INTERVAL` probes one coding block's size search in every `n` and
+    /// corrects the rest from the frame's accumulated per-size ratio, which is only representative
+    /// while the frame's content is. `test_pattern` at 96x80 - the frame the interval was
+    /// originally chosen on - cannot see the difference: every interval from 1 to 16 lands within
+    /// 0.03% of the unsampled estimator there, which is why this runs on a set of frames with
+    /// deliberately unlike statistics at a size large enough for the accumulated ratio to drift.
+    ///
+    /// The comparison is against the *same* estimator probing every size search, not against the
+    /// exhaustive search: that isolates what the sampling costs from what the other shortcuts do.
+    /// Cost is the encoder's own `sse + lambda * bits` at equal quantizer, and the ceilings are
+    /// the measured penalties with margin. They are not aspirations - each one is under what the
+    /// previous interval of 8 measured on the same frame (`scene_edge` +55.5%, `smooth` +4.4%,
+    /// `test_pattern` +2.1%), so a regression of the constant fails here on three frames rather
+    /// than passing unnoticed as it did on 96x80 alone.
+    ///
+    /// `scene_edge`'s remaining 30% is the estimator mixing two regions' statistics rather than
+    /// the sampling rate - every interval from 2 to 4 measures the same penalty on it - and is
+    /// tracked separately.
+    #[test]
+    fn the_type_gain_sampling_interval_holds_on_content_it_was_not_tuned_on() {
+        let (width, height) = (128_usize, 96_usize);
+        let mut frames = content_frames(width as u32, height as u32);
+        frames.push(("test_pattern", test_pattern(width as u32, height as u32)));
+        let ceilings = std::collections::BTreeMap::from([
+            ("noise", 1.0),
+            ("smooth", 2.5),
+            ("diagonals", 1.0),
+            ("quadrants", 1.0),
+            ("scene_edge", 40.0),
+            ("test_pattern", 1.0),
+        ]);
+        let sse = |report: &tile::SearchReport, pixels: &[u8]| -> i64 {
+            (0..height)
+                .flat_map(|row| {
+                    report.reconstruction[row * report.coded_width..][..width]
+                        .iter()
+                        .enumerate()
+                        .map(move |(column, &value)| (row * width + column, value))
+                })
+                .map(|(index, value)| {
+                    let error = i64::from(i32::from(pixels[index]) - i32::from(value));
+                    error * error
+                })
+                .sum()
+        };
+        for (name, pixels) in &frames {
+            let ceiling = ceilings[name];
+            for qindex in [1_u8, 8, 32, 80, 160, 200] {
+                let ac = i64::from(crate::av1_intra::get_ac_quant(qindex));
+                let lambda = (ac * ac / 256).max(1);
+                let cost = |interval: usize| {
+                    let report = tile::FrameEncoder::new(pixels, width, height, qindex)
+                        .with_type_gain_interval(interval)
+                        .encode_with_report();
+                    sse(&report, pixels) + lambda * report.tile.len() as i64 * 8
+                };
+                let sampled = cost(tile::TYPE_GAIN_SAMPLE_INTERVAL);
+                let unsampled = cost(1);
+                let penalty = sampled as f64 / unsampled as f64 * 100.0 - 100.0;
+                assert!(
+                    penalty <= ceiling,
+                    "{name} at qindex {qindex} cost {sampled} against the unsampled estimator's \
+                     {unsampled} ({penalty:+.2}%), past the {ceiling}% this frame is allowed"
+                );
+            }
+        }
     }
 
     /// The stated bound on what the search shortcuts cost.
