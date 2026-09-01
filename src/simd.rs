@@ -114,6 +114,7 @@ pub fn available() -> Vec<SimdIsa> {
 /// | `hevc_prediction_filters` | HEVC inter/intra prediction and in-loop filters |
 /// | `hevc_transforms` | HEVC inverse transforms and dequantization |
 /// | `hevc_rdcost` | HEVC encoder-side distortion metrics |
+/// | `hevc_fwd_transform_quant` | HEVC encoder-side forward transform and quantization |
 /// | `hevc_colorconv` | HEVC encoder-side RGBA8 to YUV420 input conversion |
 ///
 /// The `hevc_*` sites are absent on `wasm32`, which does not build the HEVC
@@ -308,7 +309,7 @@ mod tests {
     fn pinning_scalar_reaches_every_dispatch_site() {
         use crate::av1_intra_pred::{Av1IntraSimd, av1_intra_simd};
         use crate::av1_mc::{McContext, SimdLevel, default_level};
-        use crate::hevc::engine::encoder::{colorconv, rdcost};
+        use crate::hevc::engine::encoder::{colorconv, quant_simd, rdcost};
         use crate::hevc::engine::{simd as hevc_simd, transform_simd};
 
         let _guard = lock();
@@ -328,10 +329,51 @@ mod tests {
         assert_eq!(transform_simd::detected(), transform_simd::Backend::Scalar);
         // HEVC encoder-side distortion metrics.
         assert_eq!(rdcost::isa(), rdcost::Isa::Scalar);
+        // HEVC encoder-side forward transform and quantization.
+        assert_eq!(quant_simd::detected(), transform_simd::Backend::Scalar);
         // HEVC encoder-side RGBA8 to YUV420 input conversion.
         assert_eq!(colorconv::isa(), colorconv::Isa::Scalar);
 
+        // The list above is written out by hand, one selector per site, so it
+        // only stays exhaustive as long as it matches `active_by_site`. A new
+        // site added there has to fail here rather than quietly go unchecked.
+        let checked = [
+            "av1_simd",
+            "av1_mc",
+            "av1_intra_pred",
+            "hevc_prediction_filters",
+            "hevc_transforms",
+            "hevc_rdcost",
+            "hevc_fwd_transform_quant",
+            "hevc_colorconv",
+        ];
+        let sites: Vec<&str> = active_by_site().into_iter().map(|(site, _)| site).collect();
+        assert_eq!(sites, checked);
+
         set_override(None);
+    }
+
+    /// The site table in the `active_by_site` rustdoc promises the names are
+    /// "stable and safe to assert on", which is only true if it lists them
+    /// all. Read the table back out of this file and compare.
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn the_documented_site_table_lists_every_dispatch_site() {
+        let source = include_str!("simd.rs");
+        let table = source
+            .split_once("/// | Site | Kernels |")
+            .expect("site table")
+            .1;
+        let documented: Vec<&str> = table
+            .lines()
+            .map(str::trim_start)
+            .take_while(|line| line.starts_with("///"))
+            .filter_map(|line| line.strip_prefix("/// | `"))
+            .filter_map(|row| row.split_once('`'))
+            .map(|(site, _)| site)
+            .collect();
+        let sites: Vec<&str> = active_by_site().into_iter().map(|(site, _)| site).collect();
+        assert_eq!(documented, sites);
     }
 
     /// Clearing the override has to hand every site back to its own detection,
