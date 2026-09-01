@@ -5,6 +5,10 @@
 //! every group name carries, and the scalar-vs-SIMD groups built on
 //! `zvidlib::simd`'s process-wide instruction-set override. See
 //! `benches/README.md` for how to run and filter it.
+//!
+//! The per-codec targets own their own measurements: `benches/hevc_decode.rs`,
+//! `benches/av1_decode.rs`, `benches/hevc_encode.rs`, `benches/audio_decode.rs`
+//! and `benches/audio_mux.rs`.
 
 mod support;
 
@@ -14,23 +18,10 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 use zvidlib::av1_filters::{FilterFrame, FilterPlane, LoopFilterParams, deblock_frame};
 use zvidlib::av1_mc::{InterpFilter, McContext, RefPlane};
-use zvidlib::{
-    Av1InterDecoder, CancellationToken, ExactFrameReader, FrameDigest, FrameIndex, Limits,
-    TxSizeGrid, VideoDecoderFactory, decode_av1_lossless_intra, native_hevc_video_decoder_factory,
-};
+use zvidlib::{Av1InterDecoder, Limits, TxSizeGrid, decode_av1_lossless_intra};
 
-use support::isa::{IsaWorkload, bench_across_isas};
+use support::isa::{IsaWorkload, bench_across_isas, log_host_isas};
 use support::{FrameWork, group_name, report_throughput};
-
-/// Environment variable that opts into the long-running 1080p group.
-///
-/// The bundled sample is 768 frames of 1920x1080 through a pure-Rust decoder, so
-/// a default `cargo bench` would take minutes. Keeping it opt-in leaves the
-/// default run fast enough to be part of an ordinary edit loop.
-const LARGE_GROUP_ENV: &str = "ZVIDLIB_BENCH_LARGE";
-
-/// The number of 1080p frames the long-running group decodes per iteration.
-const LARGE_GROUP_FRAMES: u64 = 4;
 
 /// Smoke benchmark: end-to-end proof that fixture loading, decoding, and
 /// throughput reporting all work.
@@ -113,52 +104,11 @@ fn encoder_input(criterion: &mut Criterion) {
     group.finish();
 }
 
-/// The bundled 1080p HEVC sample. Opt-in; see [`LARGE_GROUP_ENV`].
-fn hevc_decode_1080p(criterion: &mut Criterion) {
-    if std::env::var_os(LARGE_GROUP_ENV).is_none() {
-        println!("# skipping the 1080p HEVC group; set {LARGE_GROUP_ENV}=1 to run it",);
-        return;
-    }
-
-    let sample = support::bundled_hevc_sample();
-    let name = group_name("hevc_decode_1080p");
-    let mut group = criterion.benchmark_group(&name);
-    group.sample_size(10);
-    report_throughput(
-        &mut group,
-        "sequential_from_keyframe",
-        FrameWork::new(LARGE_GROUP_FRAMES, sample.width, sample.height),
-    );
-    group.bench_function("sequential_from_keyframe", |bencher| {
-        bencher.iter(|| {
-            let mut reader = ExactFrameReader::new(
-                &native_hevc_video_decoder_factory(),
-                sample.configuration.clone(),
-                sample.samples.clone(),
-                Limits::default(),
-            )
-            .unwrap();
-            let cancellation = CancellationToken::new();
-            for index in 0..LARGE_GROUP_FRAMES {
-                black_box(reader.get(FrameIndex(index), &cancellation).unwrap());
-            }
-        });
-    });
-    group.finish();
-}
-
 /// Luma dimensions for the synthetic scalar-vs-SIMD workloads. One 1080p plane
 /// is large enough that per-call dispatch overhead is negligible next to the
 /// vectorized inner loops.
 const ISA_WIDTH: usize = 1920;
 const ISA_HEIGHT: usize = 1080;
-
-/// Frames of the bundled sample one HEVC scalar-vs-SIMD iteration decodes.
-///
-/// Enough to cover a key frame plus a run of inter frames, so inter prediction,
-/// the in-loop filters, and the inverse transforms all run, while keeping one
-/// criterion sample under a second on the software decoder.
-const ISA_HEVC_FRAMES: u64 = 8;
 
 /// A deterministic synthetic luma plane for the kernel-level groups.
 ///
@@ -301,69 +251,14 @@ fn av1_motion_compensation_by_isa(criterion: &mut Criterion) {
     });
 }
 
-/// The bundled 1080p HEVC sample decoded through zvidlib's own software
-/// decoder, once per instruction set.
-///
-/// This is the group the issue's "the switch actually reaches the HEVC kernels"
-/// requirement rides on. Whether it shows a *timing* difference is host- and
-/// kernel-dependent — it comes out near parity on Apple Silicon, where LLVM
-/// auto-vectorizes the scalar reference well under `lto = "fat"` — so
-/// `bench_across_isas` asserts the override landed rather than inferring it
-/// from the clock. Opt-in behind the same environment variable as the other
-/// 1080p group.
-fn hevc_decode_by_isa(criterion: &mut Criterion) {
-    if std::env::var_os(LARGE_GROUP_ENV).is_none() {
-        println!("# skipping the per-ISA 1080p HEVC group; set {LARGE_GROUP_ENV}=1 to run it");
-        return;
-    }
-    let sample = support::bundled_hevc_sample();
-    let factory = native_hevc_video_decoder_factory();
-    let workload = IsaWorkload {
-        measurement_time: std::time::Duration::from_secs(10),
-        ..IsaWorkload::new(
-            "hevc_decode",
-            FrameWork::new(ISA_HEVC_FRAMES, sample.width, sample.height),
-        )
-    };
-    bench_across_isas(criterion, &workload, || {
-        let mut decoder = factory
-            .create(&sample.configuration, &Limits::default())
-            .expect("the software HEVC decoder is constructible");
-        let cancellation = CancellationToken::new();
-        let mut digests = Vec::new();
-        for encoded in &sample.samples {
-            for decoded in decoder
-                .submit(encoded, &cancellation)
-                .expect("the bundled sample decodes")
-            {
-                digests.extend_from_slice(
-                    FrameDigest::from_frame(&decoded.frame)
-                        .expect("a decoded frame digests")
-                        .to_hex()
-                        .as_bytes(),
-                );
-            }
-            if digests.len() as u64 >= ISA_HEVC_FRAMES * 64 {
-                break;
-            }
-        }
-        assert!(
-            digests.len() as u64 >= ISA_HEVC_FRAMES * 64,
-            "the bundled sample yields at least {ISA_HEVC_FRAMES} decoded frames"
-        );
-        digests
-    });
-}
-
 criterion_group!(
     benches,
+    log_host_isas,
     smoke,
     av1_decode,
     encoder_input,
-    hevc_decode_1080p,
     av1_deblock_by_isa,
     av1_deblock_chroma_by_isa,
-    av1_motion_compensation_by_isa,
-    hevc_decode_by_isa
+    av1_motion_compensation_by_isa
 );
 criterion_main!(benches);

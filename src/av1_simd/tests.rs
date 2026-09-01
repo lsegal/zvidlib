@@ -148,7 +148,7 @@ fn out_of_range_walsh_hadamard_blocks_fall_back_to_scalar() {
 
 /// Every transform type this crate implements, paired with the sizes it is
 /// defined at. ADST has no 32- or 64-point kernel in AV1.
-const TX_TYPES: [(Av1TxType, &[usize]); 10] = [
+const TX_TYPES: [(Av1TxType, &[usize]); 16] = [
     (Av1TxType::Idtx, &[4, 8, 16, 32, 64]),
     (Av1TxType::DctDct, &[4, 8, 16, 32, 64]),
     (Av1TxType::AdstDct, &[4, 8, 16]),
@@ -159,6 +159,12 @@ const TX_TYPES: [(Av1TxType, &[usize]); 10] = [
     (Av1TxType::FlipadstFlipadst, &[4, 8, 16]),
     (Av1TxType::AdstFlipadst, &[4, 8, 16]),
     (Av1TxType::FlipadstAdst, &[4, 8, 16]),
+    (Av1TxType::VDct, &[4, 8, 16, 32, 64]),
+    (Av1TxType::HDct, &[4, 8, 16, 32, 64]),
+    (Av1TxType::VAdst, &[4, 8, 16]),
+    (Av1TxType::HAdst, &[4, 8, 16]),
+    (Av1TxType::VFlipadst, &[4, 8, 16]),
+    (Av1TxType::HFlipadst, &[4, 8, 16]),
 ];
 
 #[test]
@@ -271,11 +277,6 @@ fn out_of_range_transform_blocks_fall_back_to_scalar() {
 fn every_transform_size_reaches_a_vector_kernel() {
     let mut rng = Lcg(0x5eed_0120_0000_0005);
     for (tx_type, sizes) in TX_TYPES {
-        if tx_type == Av1TxType::Idtx {
-            // The identity transform has no butterfly pass and never
-            // dispatches.
-            continue;
-        }
         let (column, row, lr_flip, ud_flip) = tx_type.kernels();
         for &size in sizes {
             let coefficients: Vec<i32> = (0..size * size).map(|_| rng.in_range(600)).collect();
@@ -572,9 +573,16 @@ fn wide_deblocking_filters_actually_run_on_flat_content() {
         frame.y.data
     };
     assert_ne!(
+        uniform(16),
+        uniform(8),
+        "the 14-tap filter should reach samples the 8-tap filter does not"
+    );
+    // 32x32 and 16x16 transforms both clamp to §7.14.5's `filterSize == 16`,
+    // so they must deblock identically.
+    assert_eq!(
         uniform(32),
         uniform(16),
-        "the 14-tap filter should reach samples the 8-tap filter does not"
+        "filterSize clamps at 16, so 32x32 and 16x16 transforms filter alike"
     );
 }
 

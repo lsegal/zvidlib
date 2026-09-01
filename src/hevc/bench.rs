@@ -21,8 +21,22 @@
 use crate::hevc::engine::cabac::ContextModel;
 use crate::hevc::engine::encoder::bitwriter::BitWriter;
 use crate::hevc::engine::encoder::cabac::CabacEncoder;
+use crate::hevc::engine::encoder::lossy::encode_idr_residual_au;
 use crate::hevc::engine::encoder::pcm::encode_idr_pcm_au;
-use crate::hevc::engine::encoder::rdo::{DecisionConfig, decide_picture};
+use crate::hevc::engine::encoder::rdo::{DecisionConfig, PictureDecision, decide_picture};
+use crate::hevc::engine::encoder::recon::{
+    ReconConfig, ReconstructedPicture, SourcePlanes, reconstruct_picture,
+};
+use crate::hevc::engine::encoder::transform::{self as fwd_transform, ForwardBlockParams};
+use crate::hevc::engine::transform::{Component, PredMode};
+
+/// Bit depth the encoder benchmarks run at — the only depth the PCM
+/// writer and the synthetic 8-bit inputs use.
+const BENCH_BIT_DEPTH: u8 = 8;
+
+/// The fixed predictor [`fwd_transform_quant_picture`] subtracts, the
+/// mid-point of the 8-bit range.
+const BENCH_PREDICTOR: i32 = 128;
 
 /// Runs the encoder's mode-search / RDO stage over one luma picture.
 ///
@@ -136,6 +150,39 @@ pub fn cabac_encode_bins(bins: &[u8], contexts: usize) -> Vec<u8> {
     writer.finish()
 }
 
+/// Drives the §9.3.5 CABAC arithmetic encoder over *runs* of bypass bins,
+/// the shape the lossy residual writer's bins actually have.
+///
+/// `cabac_encode_bins` above interleaves single bypass bins with
+/// context-coded ones, so it cannot see a run-at-a-time bypass step at all.
+/// This one is the complementary workload: each `(value, n)` pair is one
+/// contiguous `n`-bin bypass field of the kind `coeff_sign_flag`, the
+/// Golomb-Rice suffix of `coeff_abs_level_remaining` and the
+/// `last_sig_coeff_*` suffixes emit, coded through
+/// `CabacEncoder::encode_bypass_bits`. The returned bytes are the
+/// arithmetic codeword, so the bit writer the runs go through is measured
+/// with them.
+///
+/// See `benches/README.md`'s "Why the CABAC arithmetic encoder stays serial"
+/// for what this group was added to settle: the §9.3.5.5 step unrolled over a
+/// whole run is an exact identity, but it is not a speedup with the present
+/// `put_bit`-at-a-time sink.
+///
+/// # Panics
+///
+/// Panics if any run is wider than 32 bins.
+#[must_use]
+pub fn cabac_encode_bypass_runs(runs: &[(u32, u8)]) -> Vec<u8> {
+    let mut writer = BitWriter::new();
+    let mut cabac = CabacEncoder::new();
+    for &(value, n) in runs {
+        assert!(n <= 32, "a bypass run is at most one u32 wide");
+        cabac.encode_bypass_bits(&mut writer, value, n);
+    }
+    cabac.encode_terminate(&mut writer, 1);
+    writer.finish()
+}
+
 /// Writes a deterministic syntax-element sequence through the raw bit writer,
 /// with no arithmetic coding on top.
 ///
@@ -178,6 +225,235 @@ pub fn rgba_to_yuv420_planes(frame: &crate::VideoFrame) -> (Vec<u8>, Vec<u8>, Ve
         .expect("benchmark frames are RGBA8")
 }
 
+/// Runs the encoder's forward transform and quantization stage over one
+/// luma picture, once per transform-block size.
+///
+/// Every 4x4, 8x8, 16x16 and 32x32 block that fits in the picture is
+/// transformed and quantized, so one iteration covers all four §8.6.4.2
+/// matrices and the 4x4 DST-VII the intra path selects. The residual is
+/// the source sample minus a fixed mid-level predictor rather than a real
+/// prediction: this group measures the transform and quantization
+/// kernels, and a mode-dependent predictor would fold mode-search cost
+/// into that number.
+///
+/// The returned bytes are the quantized levels themselves, so the
+/// bit-exactness guard in `benches/support/isa.rs` covers every level the
+/// vector kernels produced.
+///
+/// # Panics
+///
+/// Panics if `y` is smaller than `height * stride`.
+#[must_use]
+pub fn fwd_transform_quant_picture(
+    y: &[u8],
+    stride: usize,
+    width: usize,
+    height: usize,
+    qp: i32,
+) -> Vec<u8> {
+    assert!(
+        y.len() >= (height - 1) * stride + width,
+        "the luma plane is smaller than the requested picture"
+    );
+    let q_p = fwd_transform::luma_qp(qp, BENCH_BIT_DEPTH);
+    let mut out = Vec::new();
+    let mut residual = vec![0i32; 32 * 32];
+    for log2 in 2u32..=5 {
+        let n_tbs = 1usize << log2;
+        let params = ForwardBlockParams {
+            n_tbs,
+            q_p,
+            component: Component::Luma,
+            pred_mode: PredMode::Intra,
+            bit_depth: BENCH_BIT_DEPTH,
+            extended_precision: false,
+        };
+        let block = &mut residual[..n_tbs * n_tbs];
+        for by in (0..=height.saturating_sub(n_tbs)).step_by(n_tbs) {
+            for bx in (0..=width.saturating_sub(n_tbs)).step_by(n_tbs) {
+                for row in 0..n_tbs {
+                    let src = &y[(by + row) * stride + bx..][..n_tbs];
+                    for (dst, &sample) in block[row * n_tbs..][..n_tbs].iter_mut().zip(src) {
+                        *dst = i32::from(sample) - BENCH_PREDICTOR;
+                    }
+                }
+                let levels = fwd_transform::transform_and_quantize(block, None, params)
+                    .expect("benchmark blocks are legal transform blocks");
+                for level in levels {
+                    out.extend_from_slice(&(level as i16).to_le_bytes());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Writes one IDR access unit whose coding units carry *quantized residual*
+/// rather than raw PCM samples: intra prediction, forward transform,
+/// quantization, the decoder's own reconstruction, and the §7.3.8.11
+/// `residual_coding( )` entropy coding of the levels.
+///
+/// This is the lossy write path end to end, and the counterpart to
+/// [`write_idr_pcm_access_unit`]: comparing the two separates what coding a
+/// quantized residual costs from what writing a bitstream costs at all. The
+/// returned Annex B access unit is the stage's own output, so the
+/// bit-exactness guard covers the bitstream itself.
+///
+/// # Panics
+///
+/// Panics if the picture does not satisfy the writer's requirements
+/// (dimensions divisible by 16, correctly sized planes, `qp` in 0..=51),
+/// which a benchmark input always does.
+#[must_use]
+pub fn write_idr_residual_access_unit(
+    y: &[u8],
+    cb: &[u8],
+    cr: &[u8],
+    width: usize,
+    height: usize,
+    qp: i32,
+) -> Vec<u8> {
+    encode_idr_residual_au(y, cb, cr, width, height, qp)
+        .expect("benchmark pictures are writable as residual")
+        .0
+}
+
+/// A picture-reconstruction workload with its mode-search plan already built.
+///
+/// The reconstruction stage consumes the decisions the mode search produced,
+/// and mode search costs an order of magnitude more than everything else in
+/// the encoder. Building the plan here, once, keeps it out of the timed loop
+/// so `hevc_encode_*_reconstruct` measures reconstruction and the in-loop
+/// filters rather than re-measuring `hevc_encode_*_rdo_inter`.
+///
+/// Opaque on purpose: the decision plan and the reconstructed-picture types
+/// are crate-internal, and this surface promises nothing about them.
+pub struct ReconstructWorkload {
+    y: Vec<u8>,
+    cb: Vec<u8>,
+    cr: Vec<u8>,
+    width: usize,
+    height: usize,
+    reference: Option<ReconstructedPicture>,
+    decision: PictureDecision,
+}
+
+/// Builds a [`ReconstructWorkload`] over one 4:2:0 8-bit picture.
+///
+/// `reference` is the previous picture's `(y, cb, cr)` planes, which stand in
+/// for the previous *reconstruction*: passing them enables the inter
+/// prediction path through the reconstruction loop, and `None` measures the
+/// intra path. `qp` and `search_radius` configure the mode search that runs
+/// here, in setup.
+///
+/// # Panics
+///
+/// Panics if the planes do not describe a 4:2:0 picture of `width * height`
+/// with whole 16-sample CTBs.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn plan_reconstruct(
+    y: &[u8],
+    cb: &[u8],
+    cr: &[u8],
+    width: usize,
+    height: usize,
+    reference: Option<(&[u8], &[u8], &[u8])>,
+    qp: i32,
+    search_radius: i32,
+) -> ReconstructWorkload {
+    let reference = reference.map(|(ry, rcb, rcr)| ReconstructedPicture {
+        y: ry.to_vec(),
+        cb: rcb.to_vec(),
+        cr: rcr.to_vec(),
+        width,
+        height,
+    });
+    let decision = decide_picture(
+        y,
+        width,
+        width,
+        height,
+        reference.as_ref().map(|r| r.y.as_slice()),
+        DecisionConfig {
+            qp,
+            search_radius,
+            ..DecisionConfig::default()
+        },
+    );
+    ReconstructWorkload {
+        y: y.to_vec(),
+        cb: cb.to_vec(),
+        cr: cr.to_vec(),
+        width,
+        height,
+        reference,
+        decision,
+    }
+}
+
+/// Runs the encoder's reconstruction and in-loop filter stage over a planned
+/// picture, returning the reconstructed 4:2:0 planes.
+///
+/// This is the stage that reaches the decoder's already-vectorized §8.7.2
+/// deblocking and §8.7.3 SAO kernels from the encode side: `deblocking` and
+/// `sao` select the loop-filter shape of the access unit being modelled, and
+/// with both set the reconstruction runs the same filters a decoder would.
+/// The returned planes are the stage's own output, so the bit-exactness guard
+/// covers every filtered sample.
+#[must_use]
+pub fn reconstruct_encoded_picture(
+    workload: &ReconstructWorkload,
+    deblocking: bool,
+    sao: bool,
+) -> Vec<u8> {
+    reconstruct_encoded_picture_quantized(workload, deblocking, sao, false)
+}
+
+/// [`reconstruct_encoded_picture`] with control over whether the residual is
+/// round-tripped through the forward transform and quantizer.
+///
+/// With `quantized` set, every transform block of every partition goes through
+/// §8.6.4 / §8.6.3 and back through the decoder's §8.6.2 reconstruction, which
+/// is what the reconstruction stage costs once the writer stops coding PCM.
+/// Measuring both says how much of the stage is prediction and filtering and
+/// how much is the transform round trip.
+#[must_use]
+pub fn reconstruct_encoded_picture_quantized(
+    workload: &ReconstructWorkload,
+    deblocking: bool,
+    sao: bool,
+    quantized: bool,
+) -> Vec<u8> {
+    let reconstructed = reconstruct_picture(
+        SourcePlanes {
+            y: &workload.y,
+            cb: &workload.cb,
+            cr: &workload.cr,
+            width: workload.width,
+            height: workload.height,
+        },
+        workload.reference.as_ref(),
+        &workload.decision,
+        ReconConfig {
+            deblocking,
+            sao_luma: sao,
+            sao_chroma: sao,
+            // The filters are being measured, so model an access unit that
+            // does not suppress them on its PCM coding units
+            // (`pcm_loop_filter_disabled_flag == 0`, which
+            // `PcmAuOptions::pcm_loop_filter_disabled == false` writes).
+            pcm_loop_filter_disabled: !(deblocking || sao),
+            quantized_residual: quantized,
+            ..ReconConfig::default()
+        },
+    );
+    let mut out = reconstructed.y;
+    out.extend_from_slice(&reconstructed.cb);
+    out.extend_from_slice(&reconstructed.cr);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,10 +488,11 @@ mod tests {
     /// The guard the benchmark's `bench_across_isas` relies on: every wrapper
     /// must return the same bytes under every instruction set the host can run.
     ///
-    /// The encoder's only SIMD dispatch family is the mode search's distortion
-    /// metrics, so this is where a divergence would surface as a *different mode
-    /// decision* rather than a different picture — which a bit-exactness check
-    /// on decoded pixels would never see.
+    /// The encoder's SIMD dispatch families are the mode search's distortion
+    /// metrics and the RGBA8 to YUV420 input conversion. The distortion metrics are
+    /// where a divergence would surface as a *different mode decision* rather than a
+    /// different picture — which a bit-exactness check on decoded pixels would never
+    /// see.
     #[test]
     fn every_stage_wrapper_is_bit_exact_across_instruction_sets() {
         let _guard = test_lock();

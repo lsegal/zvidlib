@@ -32,6 +32,8 @@
 
 mod support;
 
+use support::isa::log_host_isas;
+
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -428,6 +430,6 @@ fn report_realtime<T>(id: &str, work: AudioWork, run: &mut impl FnMut() -> T) {
 criterion_group! {
     name = audio;
     config = main_criterion();
-    targets = aac_decode, aac_reader_sequential, aac_reader_seek, aac_reader_edits
+    targets = log_host_isas, aac_decode, aac_reader_sequential, aac_reader_seek, aac_reader_edits
 }
 criterion_main!(audio);
