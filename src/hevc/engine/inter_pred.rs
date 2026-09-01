@@ -2024,6 +2024,9 @@ mod tests {
         use std::time::Instant;
 
         /// The full-height intermediate this branch used before the ring.
+        // The arms have to be spelled the same way to be comparable, and
+        // this one mirrors `interp_block`'s own signature.
+        #[allow(clippy::too_many_arguments)]
         fn flat_2d(
             isa: Isa,
             plane: &RefPlane<'_>,
@@ -2192,9 +2195,8 @@ mod tests {
                     let start = Instant::now();
                     for _ in &blocks {
                         for y in 0..h {
-                            let taps: [&[i32]; N] = std::array::from_fn(|t| {
-                                &horizontal[(y + t) * w..(y + t + 1) * w]
-                            });
+                            let taps: [&[i32]; N] =
+                                std::array::from_fn(|t| &horizontal[(y + t) * w..(y + t + 1) * w]);
                             simd::filter_taps(isa, &taps, vk, 6, &mut out[y * w..(y + 1) * w]);
                         }
                         sink += out[0] as i64;
