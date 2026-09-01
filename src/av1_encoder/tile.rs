@@ -120,10 +120,20 @@ pub(crate) struct FrameEncoder<'a> {
     /// test can compare the shortcuts against the search they stand in for.
     #[cfg(test)]
     exhaustive: bool,
+    /// Set by [`Self::with_reversed_candidate_order`] to walk the transform-type and
+    /// transform-size candidates backwards, so a test can prove no decision depends on the order
+    /// they are evaluated in.
+    #[cfg(test)]
+    reversed_candidates: bool,
     /// Transform-type candidates actually transformed, quantized and reconstructed, which is the
     /// work the shortcuts exist to remove.
     #[cfg(test)]
     candidates_evaluated: u64,
+    /// Exact `sse + lambda * bits` ties the transform-type and transform-size searches had to
+    /// settle, so a test can show the tie-break is reached on real content rather than assert an
+    /// order-independence that holds only because nothing ever tied.
+    #[cfg(test)]
+    cost_ties: u64,
 }
 
 /// What one encode of a tile did, for the tests that compare two searches against each other.
@@ -134,6 +144,7 @@ pub(crate) struct SearchReport {
     pub(crate) coded_width: usize,
     pub(crate) trace: Vec<(usize, Av1TxType)>,
     pub(crate) candidates_evaluated: u64,
+    pub(crate) cost_ties: u64,
 }
 
 /// One transform type considered for a block, with everything the winner needs to be written:
@@ -208,7 +219,11 @@ impl<'a> FrameEncoder<'a> {
             #[cfg(test)]
             exhaustive: false,
             #[cfg(test)]
+            reversed_candidates: false,
+            #[cfg(test)]
             candidates_evaluated: 0,
+            #[cfg(test)]
+            cost_ties: 0,
         }
     }
 
@@ -218,6 +233,16 @@ impl<'a> FrameEncoder<'a> {
     #[cfg(test)]
     pub(crate) fn without_search_shortcuts(mut self) -> Self {
         self.exhaustive = true;
+        self
+    }
+
+    /// Evaluates every transform-type and transform-size candidate in the reverse of the order
+    /// the searches normally walk. A search whose ties are settled by a total order over the
+    /// candidates encodes identically either way; one that keeps whichever equal-cost candidate
+    /// it happened to see first does not.
+    #[cfg(test)]
+    pub(crate) fn with_reversed_candidate_order(mut self) -> Self {
+        self.reversed_candidates = true;
         self
     }
 
@@ -251,6 +276,7 @@ impl<'a> FrameEncoder<'a> {
             coded_width: self.coded_w,
             trace: std::mem::take(&mut self.emitted),
             candidates_evaluated: self.candidates_evaluated,
+            cost_ties: self.cost_ties,
             tile: self.sym.finish(),
         }
     }
@@ -386,6 +412,11 @@ impl<'a> FrameEncoder<'a> {
             + self.encode_partition(r + half, c + half, h, false);
         self.restore(snapshot);
 
+        // Strictly less, so a split that only ties the whole block does not happen: the tie goes
+        // to `PARTITION_NONE`, the cheaper of the two to signal (one partition symbol against
+        // five, plus four sub-blocks' own headers). Unlike the type and size searches this
+        // comparison is between two named alternatives rather than a scan, so the preference is
+        // the whole tie-break; there is no candidate order it could otherwise fall back on.
         let chosen = split + self.lambda * SPLIT_HEADER_BITS < whole;
         self.split_memo[slot] = u8::from(chosen);
         chosen
@@ -472,12 +503,24 @@ impl<'a> FrameEncoder<'a> {
         }
         let largest = bw.min(MAX_TX_WIDTH);
         let (_, max_depth) = cdf::tx_depth_cdf(bw);
-        let mut best = (0usize, i64::MAX);
+        // The sizes `read_tx_size` can signal for this block, in increasing depth order, which is
+        // increasing symbol order: depth `d` is the symbol the decoder reads.
+        let mut widths = Vec::new();
         for depth in 0..=max_depth {
             let tx_width = (largest >> depth).max(4);
-            if tx_width > MAX_FORWARD_TX {
-                continue;
+            if tx_width <= MAX_FORWARD_TX {
+                widths.push(tx_width);
             }
+            if tx_width == 4 {
+                break;
+            }
+        }
+        #[cfg(test)]
+        if self.reversed_candidates {
+            widths.reverse();
+        }
+        let mut best = (0usize, i64::MAX);
+        for &tx_width in &widths {
             let snapshot = self.snapshot(r, c, bw);
             self.probe_budget = if self.shortcuts() {
                 TYPE_GAIN_PROBES
@@ -490,11 +533,18 @@ impl<'a> FrameEncoder<'a> {
             let cost = self.code_block_transforms(r, c, bw, tx_width, false);
             self.restore(snapshot);
             let cost = self.corrected_trial_cost(cost);
-            if cost < best.1 {
-                best = (tx_width, cost);
+            // Sizes are ranked by the same total order the type search uses: cost first, and an
+            // exact tie broken towards the cheaper size to signal, which is the largest one -
+            // its depth, and so its `read_tx_size` symbol, is the smallest. Deciding a tie by the
+            // loop's order instead would make the answer a property of how this search happens to
+            // enumerate, not of the block;
+            // `the_search_is_independent_of_the_order_candidates_are_evaluated_in` pins that down.
+            #[cfg(test)]
+            if cost == best.1 && best.0 != 0 {
+                self.cost_ties += 1;
             }
-            if tx_width == 4 {
-                break;
+            if cost < best.1 || (cost == best.1 && tx_width > best.0) {
+                best = (tx_width, cost);
             }
         }
         // Nothing outside a size trial may probe: every other speculative pass stays on the
@@ -602,6 +652,10 @@ impl<'a> FrameEncoder<'a> {
             .enumerate()
             .filter_map(|(symbol, &(_, tx_type))| Some((symbol, tx_type?)))
             .collect();
+        #[cfg(test)]
+        if self.reversed_candidates {
+            candidates.reverse();
+        }
         let scan = cdf::up_right_diagonal_scan(size);
 
         // Coding nothing costs the residual's own energy plus the single `all_zero` bit, and any
@@ -667,20 +721,27 @@ impl<'a> FrameEncoder<'a> {
             // A probe ranks the block on DCT like any other trial block; every other pass keeps
             // the cheapest type, which on the emitting pass is the type actually written.
             //
-            // The keep test is strictly less, so an exact tie keeps the earlier candidate and the
-            // winner is a function of `candidates` order alone. Ties are not hypothetical: on the
-            // 96x80 test pattern of `nonlossless_tests` the smallest emitting-pass margins are 4
-            // (a 4x4 block between `DCT_DCT` and `IDTX`) and 0 (a 4x4 block between `ADST_ADST`
-            // and `DCT_DCT`), where the set order alone decides it. That is the margin issue #231
-            // was about: a one-unit cost difference flips which type such a block writes, so the
-            // comparison has to be a total order over a fixed candidate order rather than
-            // anything that depends on evaluation order or on the host. Which type wins there is
-            // therefore a property of the pattern, not of the encoder, and is not asserted; that
-            // the *bitstream* comes out the same everywhere is, in `nonlossless_tests`.
+            // Ties are not hypothetical: on the 96x80 test pattern of `nonlossless_tests` the
+            // smallest emitting-pass margins are 4 (a 4x4 block between `DCT_DCT` and `IDTX`) and
+            // 0 (a 4x4 block whose `ADST_ADST` and `DCT_DCT` costs are exactly equal). A strict
+            // `<` would settle that block by whichever type `tx_type_inverse_set` lists first,
+            // making the winner a property of a table's order and of this loop's direction rather
+            // than of the block. The comparison is therefore a total order over
+            // `(cost, symbol)`: equal cost is broken towards the smaller `tx_type` symbol, the
+            // one the decoder reads earliest in the derived set and the cheaper of the two to
+            // signal under `tx_type_cdf`, whose probabilities are ordered by symbol. That leaves
+            // no dependence on evaluation order at all, which
+            // `the_search_is_independent_of_the_order_candidates_are_evaluated_in` asserts
+            // directly and `equal_cost_ties_are_reached_by_a_normal_encode` shows is not vacuous.
+            #[cfg(test)]
+            if !probing && best.as_ref().is_some_and(|best| best.cost == cost) {
+                self.cost_ties += 1;
+            }
             let keep = if probing {
                 tx_type == Av1TxType::DctDct || best.is_none()
             } else {
-                best.as_ref().is_none_or(|best| cost < best.cost)
+                best.as_ref()
+                    .is_none_or(|best| (cost, symbol) < (best.cost, best.symbol))
             };
             if keep {
                 best = Some(TxCandidate {
