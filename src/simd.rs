@@ -427,11 +427,12 @@ mod tests {
         assert_eq!(crate::av1_simd::active_isa(), detected());
         // AV1 intra prediction.
         assert_eq!(av1_intra_simd() != Av1IntraSimd::Scalar, vectorized);
-        // AV1 motion compensation.
+        // AV1 encoder-side coefficient context derivation.
         assert_eq!(
             crate::av1_simd::coeff::active_isa() != SimdIsa::Scalar,
             vectorized
         );
+        // AV1 motion compensation.
         assert_eq!(
             default_level() != crate::av1_mc::SimdLevel::Scalar,
             vectorized
@@ -469,6 +470,7 @@ mod tests {
             "av1_simd",
             "av1_mc",
             "av1_intra_pred",
+            "av1_coeff_ctx",
             "hevc_prediction_filters",
             "hevc_transforms",
             "hevc_rdcost",
