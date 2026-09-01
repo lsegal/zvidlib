@@ -502,6 +502,43 @@ fn deblock_descriptors(width: usize, height: usize, qp: i32) -> Vec<DeblockCuDes
     cus
 }
 
+/// §8.7.2 — run the in-loop deblocking filter over a finished
+/// reconstruction, in place.
+///
+/// The residual writer in [`crate::hevc::engine::encoder::lossy`] builds its
+/// reconstruction block by block as it codes, because §8.4.4.2.2 intra
+/// prediction reads the neighbouring samples *prior to* the in-loop filter
+/// process. Deblocking is therefore a whole-picture pass run once the last
+/// coding unit of the picture is coded — the §8.7.1 ordering the decoder
+/// itself uses — and not something interleaved into coding order.
+///
+/// Every coding unit the writer emits is one 16×16 intra `PART_2Nx2N` block
+/// with an unsplit transform tree, coded at `SliceQpY`, so the descriptors are
+/// exactly the ones [`deblock_descriptors`] builds. Because every unit is
+/// intra, the §8.7.2.4 boundary strength is 2 at every filtered edge and the
+/// `has_nonzero_coeff` / motion fields of the [`MotionField`] are never read —
+/// its all-intra default is the whole of what this picture's field says.
+pub(crate) fn deblock_reconstruction(recon: &mut ReconstructedPicture, qp: i32) {
+    let (width, height) = (recon.width, recon.height);
+    let mut pic = Picture::new(width, height, CHROMA_ARRAY_TYPE, BIT_DEPTH, BIT_DEPTH);
+    for (plane, samples) in [
+        (Plane::Luma, &recon.y),
+        (Plane::Cb, &recon.cb),
+        (Plane::Cr, &recon.cr),
+    ] {
+        let (buf, _) = pic.plane_mut(plane);
+        for (dst, &src) in buf.iter_mut().zip(samples) {
+            *dst = i32::from(src);
+        }
+    }
+    let field = MotionField::new(width, height);
+    let cus = deblock_descriptors(width, height, qp);
+    crate::hevc::engine::deblock::deblock_picture(&mut pic, &field, &cus);
+    recon.y = plane_to_u8(&pic, Plane::Luma);
+    recon.cb = plane_to_u8(&pic, Plane::Cb);
+    recon.cr = plane_to_u8(&pic, Plane::Cr);
+}
+
 /// The largest magnitude a `sao_offset_abs` can carry at 8-bit depth
 /// (§7.4.9.3: `(1 << (Min(bitDepth, 10) − 5)) − 1`).
 const SAO_OFFSET_MAX: i32 = 7;
