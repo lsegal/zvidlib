@@ -47,11 +47,44 @@
 //! scalar loop LLVM had already vectorized. See `transform_1d_neon` for
 //! why, and #179 for the same measurement method applied to §8.5.3.3.
 //!
+//! # What the x86_64 kernels measure
+//!
+//! AMD EPYC 7763 (a GitHub Actions `ubuntu-latest` runner — this
+//! project's development hosts are aarch64 and Rosetta does not
+//! implement AVX2, so x86_64 figures are taken there), `--release`,
+//! same harness and same best-of-five interleaving. SSE4.1 and SSE4.2
+//! share the butterfly kernel and differ only in `dequant_block`, which
+//! needs SSE4.2's `pcmpgtq` and is scalar on plain SSE4.1 — hence its
+//! flat 1.00x.
+//!
+//! | `nTbS` | backend | `dequant_block` | `transform_1d` dense | `transform_1d` sparse | block path |
+//! | --- | --- | --- | --- | --- | --- |
+//! | 4 | AVX2 | 1.98x | 1.93x | 1.93x | 1.31x |
+//! | 4 | SSE4.2 | 1.35x | 2.00x | 2.00x | 1.32x |
+//! | 8 | AVX2 | 2.46x | 2.14x | 1.55x | 1.30x |
+//! | 8 | SSE4.2 | 1.39x | 1.87x | 1.54x | 1.27x |
+//! | 16 | AVX2 | 2.45x | 3.24x | 2.57x | 1.80x |
+//! | 16 | SSE4.2 | 1.36x | 2.31x | 1.97x | 1.57x |
+//! | 32 | AVX2 | 2.54x | 3.98x | 3.67x | 2.43x |
+//! | 32 | SSE4.2 | 1.42x | 2.79x | 2.41x | 1.92x |
+//!
+//! Unlike NEON's, the x86_64 butterfly was never actually *below*
+//! scalar with the old tile-walking shape — measured at 2.18x (AVX2)
+//! and 1.09x (SSE) on the sparse 32-column, and 1.37x/1.33x at
+//! `nTbS == 4`. But the redundant input sweeps and the tile-width guard
+//! chain cost the same fraction they cost NEON, and removing them is
+//! worth 1.7x on the sparse 32-column for AVX2 and 2.2x for SSE, taking
+//! the whole §8.6 block path from 1.01x to 1.9x on SSE where it was
+//! sitting at parity.
+//!
 //! `dequant_block`'s ~1.06x is near parity and stays that way: equation
 //! 8-309 is a widening multiply, an add, a shift and a clamp per
 //! coefficient, with no reduction or shuffle for a hand kernel to
 //! express that the auto-vectorizer cannot. It is kept because it is at
-//! or above parity at every size, not because it is a win.
+//! or above parity at every size, not because it is a win. The same
+//! kernel is a real win on x86_64, where it measures 2.0-2.5x on AVX2
+//! and 1.35-1.42x on SSE4.2; only the aarch64 figure is the marginal
+//! one.
 
 use core::sync::atomic::{AtomicU8, Ordering};
 
