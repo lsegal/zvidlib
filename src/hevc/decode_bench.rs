@@ -395,17 +395,17 @@ impl HevcStageInputs {
 
     /// The YUV420-to-RGBA output conversion every whole-frame decode ends in.
     ///
-    /// Issue #220: this stage is not decoding, but it is a third of what the
+    /// Issue #220: this stage is not decoding, but it was a third of what the
     /// whole-frame groups measure (see `benches/README.md`), so it is timed
     /// directly rather than inferred by subtracting one whole-frame group from
-    /// another. Like [`run_cabac`], it has no vector kernel today and its arms
-    /// are expected to come out equal; issue #219 is the ticket that changes
-    /// that, and this is the group that would show it.
+    /// another. Issue #219 gave it the [`color_convert`] kernel family, so its
+    /// arms now separate by instruction set like the decoding stages do, and
+    /// this group is what reports that.
     ///
     /// # Panics
     /// Panics if the prepared picture no longer converts.
     ///
-    /// [`run_cabac`]: Self::run_cabac
+    /// [`color_convert`]: super::color_convert
     #[must_use]
     pub fn run_color_convert(&self) -> Vec<u8> {
         let frame = picture_to_rgba(&self.picture, &self.convert_config, &Limits::default())
@@ -638,9 +638,10 @@ fn convert_config(width: usize, height: usize) -> VideoDecoderConfig {
 ///
 /// Issue #220: the public decoder's `submit` returns RGBA, so a whole-frame
 /// benchmark through it measures decoding *plus* the colour conversion of
-/// [`HevcStageInputs::run_color_convert`] — a third of the interval, with no
-/// vector kernel behind it, diluting every scalar-versus-SIMD ratio taken off
-/// those groups. This is the same decode without that tail: it drives the same
+/// [`HevcStageInputs::run_color_convert`] — a third of the interval, which
+/// until issue #219 gave it a kernel had no vector path at all and diluted
+/// every scalar-versus-SIMD ratio taken off those groups. This is the same
+/// decode without that tail: it drives the same
 /// `HevcDecoder` over the same access units and collects its pictures instead
 /// of converting them, so the difference between this and the end-to-end group
 /// is the conversion and nothing else about how the bitstream is handled.

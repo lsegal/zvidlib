@@ -1162,6 +1162,103 @@ mod nonlossless_tests {
         println!("exhaustive,{exhaustive_best:.4},{exhaustive_candidates}");
     }
 
+    /// Sweeps the recency window the per-size gain ratio is accumulated over.
+    ///
+    /// Prints, per frame and quantizer, the sampled estimator's `sse + lambda * bits` at each
+    /// window against the same estimator probing every size search, which is what
+    /// `TYPE_GAIN_MEMORY` is chosen from. `usize::MAX` is the frame-wide accumulation.
+    #[test]
+    #[ignore = "measurement sweep, not an assertion"]
+    fn measure_type_gain_memory_windows() {
+        for (width, height) in [(128_usize, 96_usize), (192, 160)] {
+            measure_type_gain_memory_windows_at(width, height);
+        }
+    }
+
+    fn measure_type_gain_memory_windows_at(width: usize, height: usize) {
+        let mut frames = content_frames(width as u32, height as u32);
+        frames.push(("test_pattern", test_pattern(width as u32, height as u32)));
+        let sse = |report: &tile::SearchReport, pixels: &[u8]| -> i64 {
+            (0..height)
+                .flat_map(|row| {
+                    report.reconstruction[row * report.coded_width..][..width]
+                        .iter()
+                        .enumerate()
+                        .map(move |(column, &value)| (row * width + column, value))
+                })
+                .map(|(index, value)| {
+                    let error = i64::from(i32::from(pixels[index]) - i32::from(value));
+                    error * error
+                })
+                .sum()
+        };
+        println!("size,{width}x{height}");
+        println!("frame,qindex,memory,penalty_percent,bytes,candidates");
+        for (name, pixels) in &frames {
+            for qindex in [1_u8, 8, 32, 80, 160, 200] {
+                let ac = i64::from(crate::av1_intra::get_ac_quant(qindex));
+                let lambda = (ac * ac / 256).max(1);
+                let cost = |interval: usize, memory: usize| {
+                    let report = tile::FrameEncoder::new(pixels, width, height, qindex)
+                        .with_type_gain_interval(interval)
+                        .with_type_gain_memory(memory)
+                        .encode_with_report();
+                    (
+                        sse(&report, pixels) + lambda * report.tile.len() as i64 * 8,
+                        report.tile.len(),
+                        report.candidates_evaluated,
+                    )
+                };
+                let (unsampled, _, _) = cost(1, usize::MAX);
+                for memory in [1_usize, 2, 3, 4, 6, 8, 12, 16, 24, 32, 64, usize::MAX] {
+                    let (sampled, bytes, candidates) =
+                        cost(tile::TYPE_GAIN_SAMPLE_INTERVAL, memory);
+                    let penalty = sampled as f64 / unsampled as f64 * 100.0 - 100.0;
+                    println!("{name},{qindex},{memory},{penalty:+.2},{bytes},{candidates}");
+                }
+            }
+        }
+    }
+
+    /// What the recency weighting costs in encode time.
+    ///
+    /// The correction exists to be cheap, so this is the check that ageing the accumulator did
+    /// not make it expensive. Interleaved rounds with the minimum taken per arm: a single pass
+    /// would attribute this host's own load to whichever arm happened to run under it.
+    #[test]
+    #[ignore = "measurement sweep, not an assertion"]
+    fn measure_type_gain_memory_cost() {
+        use std::time::Instant;
+        let (width, height) = (192_usize, 160_usize);
+        let mut frames = content_frames(width as u32, height as u32);
+        frames.push(("test_pattern", test_pattern(width as u32, height as u32)));
+        let windows = [1_usize, 2, 4, 8, 32, usize::MAX];
+        let mut best = std::collections::BTreeMap::new();
+        let mut candidates = std::collections::BTreeMap::new();
+        for _ in 0..5 {
+            for memory in windows {
+                let start = Instant::now();
+                let mut total = 0_u64;
+                for (_, pixels) in &frames {
+                    for qindex in [1_u8, 8, 32, 80, 160, 200] {
+                        let report = tile::FrameEncoder::new(pixels, width, height, qindex)
+                            .with_type_gain_memory(memory)
+                            .encode_with_report();
+                        total += report.candidates_evaluated;
+                    }
+                }
+                let elapsed = start.elapsed().as_secs_f64();
+                let slot = best.entry(memory).or_insert(f64::MAX);
+                *slot = slot.min(elapsed);
+                candidates.insert(memory, total);
+            }
+        }
+        println!("memory,seconds,candidates");
+        for memory in windows {
+            println!("{memory},{:.4},{}", best[&memory], candidates[&memory]);
+        }
+    }
+
     /// What the sampled transform-gain estimator costs on content it was not tuned on.
     ///
     /// `TYPE_GAIN_SAMPLE_INTERVAL` probes one coding block's size search in every `n` and
@@ -1179,9 +1276,11 @@ mod nonlossless_tests {
     /// `test_pattern` +2.1%), so a regression of the constant fails here on three frames rather
     /// than passing unnoticed as it did on 96x80 alone.
     ///
-    /// `scene_edge`'s remaining 30% is the estimator mixing two regions' statistics rather than
-    /// the sampling rate - every interval from 2 to 4 measures the same penalty on it - and is
-    /// tracked separately.
+    /// `scene_edge`'s ceiling was 40% while the per-size ratio was accumulated over the whole
+    /// frame: every interval from 2 to 4 measured the same penalty on it, because what it was
+    /// paying for was the estimator mixing two regions' statistics rather than the sampling rate.
+    /// `TYPE_GAIN_MEMORY` ages that accumulation so a block reads back its own neighbourhood's
+    /// ratio, which brings the frame to +2.13% here and takes the ceiling to 4%.
     #[test]
     fn the_type_gain_sampling_interval_holds_on_content_it_was_not_tuned_on() {
         let (width, height) = (128_usize, 96_usize);
@@ -1192,7 +1291,7 @@ mod nonlossless_tests {
             ("smooth", 2.5),
             ("diagonals", 1.0),
             ("quadrants", 1.0),
-            ("scene_edge", 40.0),
+            ("scene_edge", 4.0),
             ("test_pattern", 1.0),
         ]);
         let sse = |report: &tile::SearchReport, pixels: &[u8]| -> i64 {
@@ -1282,6 +1381,69 @@ mod nonlossless_tests {
                 exhaustive.candidates_evaluated
             );
         }
+    }
+
+    /// Neither the transform-type nor the transform-size search may depend on the order it walks
+    /// its candidates in: both settle an exact `sse + lambda * bits` tie by a total order over
+    /// the candidate itself - the smaller `tx_type` symbol, the larger transform - so evaluating
+    /// the same candidates backwards has to produce the same bitstream, the same trace and the
+    /// same reconstruction. With the strict `<` this replaces, a tied block kept whichever
+    /// candidate came first and this test fails.
+    #[test]
+    fn the_search_is_independent_of_the_order_candidates_are_evaluated_in() {
+        let (width, height) = (96_usize, 80_usize);
+        let pixels = test_pattern(width as u32, height as u32);
+        for qindex in [1_u8, 8, 32, 80, 160, 200] {
+            for exhaustive in [false, true] {
+                let build = || {
+                    let encoder = tile::FrameEncoder::new(&pixels, width, height, qindex);
+                    if exhaustive {
+                        encoder.without_search_shortcuts()
+                    } else {
+                        encoder
+                    }
+                };
+                let forward = build().encode_with_report();
+                let reversed = build().with_reversed_candidate_order().encode_with_report();
+                assert_eq!(
+                    forward.tile, reversed.tile,
+                    "qindex {qindex} (exhaustive {exhaustive}) emitted different bytes when the \
+                     candidates were evaluated in reverse order"
+                );
+                assert_eq!(
+                    forward.trace, reversed.trace,
+                    "qindex {qindex} (exhaustive {exhaustive}) chose different transforms when \
+                     the candidates were evaluated in reverse order"
+                );
+                assert_eq!(
+                    forward.reconstruction, reversed.reconstruction,
+                    "qindex {qindex} (exhaustive {exhaustive}) reconstructed differently when \
+                     the candidates were evaluated in reverse order"
+                );
+            }
+        }
+    }
+
+    /// The tie-break above is reached on ordinary content, so the order-independence it buys is
+    /// not the vacuous kind that holds because nothing ever ties. Issue #249 measured exactly
+    /// zero margin between `ADST_ADST` and `DCT_DCT` on a 4x4 block of this pattern.
+    #[test]
+    fn equal_cost_ties_are_reached_by_a_normal_encode() {
+        let (width, height) = (96_usize, 80_usize);
+        let pixels = test_pattern(width as u32, height as u32);
+        let ties: u64 = [1_u8, 8, 32, 80, 160, 200]
+            .into_iter()
+            .map(|qindex| {
+                tile::FrameEncoder::new(&pixels, width, height, qindex)
+                    .encode_with_report()
+                    .cost_ties
+            })
+            .sum();
+        assert!(
+            ties > 0,
+            "no transform search on this pattern ever had to settle an exact cost tie, so \
+             the_search_is_independent_of_the_order_candidates_are_evaluated_in proves nothing"
+        );
     }
 
     /// `TX_4X4` is a size the shipped search *selects*, not just one the emitting path could
