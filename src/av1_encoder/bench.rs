@@ -48,7 +48,10 @@ const BENCH_PREDICTOR: i32 = 128;
 /// bit-exactness guard keeps its teeth.
 #[must_use]
 pub fn fwht4x4_plane(plane: &[u8], width: usize, height: usize) -> Vec<u8> {
-    assert!(plane.len() >= width * height, "plane is shorter than its dimensions");
+    assert!(
+        plane.len() >= width * height,
+        "plane is shorter than its dimensions"
+    );
     let mut digest = 0xcbf2_9ce4_8422_2325_u64;
     let mut residual = [0i32; 16];
     for block_y in (0..height & !3).step_by(4) {
@@ -56,8 +59,7 @@ pub fn fwht4x4_plane(plane: &[u8], width: usize, height: usize) -> Vec<u8> {
             for row in 0..4 {
                 let start = (block_y + row) * width + block_x;
                 for column in 0..4 {
-                    residual[row * 4 + column] =
-                        i32::from(plane[start + column]) - BENCH_PREDICTOR;
+                    residual[row * 4 + column] = i32::from(plane[start + column]) - BENCH_PREDICTOR;
                 }
             }
             for coefficient in fwht4x4(&residual) {

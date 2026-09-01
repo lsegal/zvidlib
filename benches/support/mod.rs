@@ -326,6 +326,37 @@ pub fn synthetic_yuv420_sequence(width: u32, height: u32, frames: usize) -> Vec<
         .collect()
 }
 
+/// Builds a deterministic synthetic 8-bit monochrome frame sequence.
+///
+/// The native AV1 encoder takes `Gray8` input only, so it cannot be fed the
+/// YUV420 sequence above directly. This is that sequence's luma plane, and
+/// nothing else, so the AV1 and HEVC encoder benchmarks measure the same
+/// content: a moving gradient plus low-amplitude noise, which keeps neither
+/// prediction nor entropy coding in an unrepresentative best case.
+pub fn synthetic_gray8_sequence(width: u32, height: u32, frames: usize) -> Vec<VideoFrame> {
+    let limits = Limits::default();
+    let dimensions =
+        VideoDimensions::new(width, height, &limits).expect("synthetic dimensions are valid");
+    synthetic_yuv420_sequence(width, height, frames)
+        .into_iter()
+        .map(|frame| {
+            let luma = frame
+                .planes
+                .into_iter()
+                .next()
+                .expect("YUV420 has a luma plane");
+            VideoFrame::new(
+                dimensions,
+                PixelFormat::Gray8,
+                ColorRange::Limited,
+                vec![luma],
+                &limits,
+            )
+            .expect("synthetic Gray8 frames are valid")
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // AV1 software decoder fixtures.
 //

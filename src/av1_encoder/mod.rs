@@ -11,9 +11,9 @@
 //! carrying a nonzero `base_q_idx` encodes non-lossless, which is what gives
 //! [`transform::forward_transform`] a caller. See [`parse_base_q_idx`].
 
+pub mod bench;
 #[allow(dead_code)]
 mod bitwriter;
-pub mod bench;
 #[allow(dead_code)]
 mod cdf;
 mod headers;
