@@ -502,6 +502,263 @@ run on the detected instruction set only and do not use `bench_across_isas`. The
 still carry the `simd=off` / `simd=on` build tag every group name carries,
 because that tag records which *build* produced a number, not which kernel ran.
 
+## Continuous integration
+
+The `Benchmarks` job in `.github/workflows/ci.yml` treats the suite as two
+different things depending on the event.
+
+**On every pull request** it runs `cargo bench --no-run` and stops. That is one
+build and no measurement. It exists because the usual way a benchmark suite dies
+is not a bad number, it is rotting: the bench code stops compiling against the
+crate, nobody runs it locally, and the decay is only discovered when someone
+needs a measurement months later. Compiling on every PR makes that failure
+immediate and cheap.
+
+It deliberately does **not** time anything on a pull request. GitHub's shared
+runners differ in CPU model, neighbour load, and thermal state between two runs
+of the same commit by far more than the regressions worth catching. A PR gate on
+those timings would fail on noise, and a check that fails on noise gets disabled.
+
+**On `main` pushes and `workflow_dispatch`** it runs the full suite with
+`ZVIDLIB_BENCH_LARGE=1`, so the per-ISA HEVC group — the one that proves the
+crate-wide override reaches the HEVC kernels — is included. Then it:
+
+1. writes `bench.log` and puts the host's instruction sets into the job summary;
+2. reduces `target/criterion/` to one small JSON baseline through
+   `.github/scripts/criterion_baseline.py collect`;
+3. downloads the newest baseline artifact from a previous `main` run and diffs
+   the two with `criterion_baseline.py compare`, writing a per-group delta table
+   to the job summary;
+4. uploads its own baseline as the `criterion-baseline-main` artifact (90-day
+   retention) for the next run to compare against.
+
+`workflow_dispatch` is how to measure a branch on demand without merging it, and
+it takes a `threshold` input.
+
+### The threshold, and why it is only a report
+
+The comparison flags anything that moved more than **15%** and writes it into
+the job summary. It does not fail the job.
+
+15% is deliberately loose and deliberately provisional. A threshold guessed
+tighter than the noise floor produces false regressions immediately — the same
+failure mode as gating PRs on timings, just slower — so it was picked wide
+enough to be quiet until there was something to calibrate it against.
+
+**It has not been calibrated yet, because the data does not exist yet.** The
+timed job that stores baselines landed with the delta report itself; calibrating
+it needs a run of consecutive `main` pushes measured through that job, and those
+accumulate at the rate `main` moves. Until then 15% stands as a guess that
+nobody has checked, not as a number the suite's measured spread supports. Do not
+quote it as if it were the latter, and do not tighten it on a hunch: a threshold
+moved without data is the same guess at a different value.
+
+The comparison uses criterion's **median** point estimate rather than the mean,
+because one descheduled iteration on a shared runner moves the mean and leaves
+the median alone. It compares point estimates rather than running criterion's
+own change detection, which needs both runs' raw sample data in one
+`target/criterion/` directory and assumes the same machine produced both.
+
+### Calibrating it
+
+The measurement is a command rather than a project. `criterion_baseline.py
+variance` takes the stored baselines in chronological order and reports, per
+group, how far a benchmark moves between two runs when nothing about it
+changed — the same `|median|` delta the report thresholds, over pairs where the
+code did not change meaningfully.
+
+```sh
+# Every stored main baseline, oldest first. They expire after 90 days.
+n=0
+gh api 'repos/lsegal/zvidlib/actions/artifacts?name=criterion-baseline-main&per_page=100' \
+  --jq '[.artifacts[] | select(.expired == false)] | reverse | .[] | [.id, .workflow_run.head_sha] | @tsv' \
+  | while IFS=$'\t' read -r id sha; do
+      # Numbered, not named after the commit: `variance` reads chronological
+      # order off the argument order, and a `$sha` glob sorts alphabetically.
+      n=$((n + 1))
+      dir="$(printf 'run-%03d-%s' "$n" "$sha")"
+      gh api "repos/lsegal/zvidlib/actions/artifacts/$id/zip" > "$id.zip"
+      unzip -o -j "$id.zip" -d "$dir"
+    done
+
+python3 .github/scripts/criterion_baseline.py variance \
+  --baseline run-*/criterion-baseline.json --out variance.md
+```
+
+Per group and not one number for the suite, because a whole-frame 1080p group
+and a microbenchmark do not share a noise floor and a single global threshold
+may be the wrong shape for both. The report's suggested threshold is the
+smallest whole 5% step above the worst delta in the sample: a floor on a
+defensible number, not a recommendation, since a sample that happened to miss a
+bad run suggests a threshold the next bad run will cross. Below ten pairs the
+report marks itself provisional and its p95 column should be ignored — with a
+handful of samples the p95 is just the worst thing seen so far.
+
+Reading a tighter threshold off that report is the point of collecting it. A
+per-group threshold is a legitimate outcome. So is recording that 15% survived
+contact with the data; what is not an outcome is leaving this section saying the
+same thing in a year.
+
+### Gating
+
+`--fail-on-regression` exists in `criterion_baseline.py` and is deliberately
+unused. Gating a group requires more than a threshold: the group's whole
+observed spread has to fit under the gate, and its arms have to be present in
+every run — a group whose `avx2` arm comes and goes with the runner pool cannot
+be gated on at any threshold, because the disappearance is not a percentage.
+`variance` reports both, and neither question can be answered before the
+baselines above exist.
+
+### Reading a flagged delta
+
+A red row is a prompt to look, not a verdict. Successive `main` runs land on
+different physical machines, and an arm can also disappear entirely — see the
+instruction-set log below. Reproduce on a quiet host before treating a flagged
+row as a real regression, and note that the crate's own measurements are quoted
+from an Apple Silicon host while CI measures `x86_64` Linux, so the two are not
+directly comparable to each other either.
+
+### Why the host's instruction sets are logged
+
+Groups built through `bench_across_isas` run one arm per entry in
+`simd::available()`, so a runner without AVX2 simply has no `avx2` arm. That is
+the correct behaviour — the alternative is scalar numbers filed under a vector
+label — but it is invisible in a results table: an absent `av1_deblock/avx2` and
+a slow one look the same from the outside, and GitHub's runner pool is not
+uniform in AVX2 availability. The bench target therefore prints
+`simd::available()`, the widest detected instruction set, and
+`simd::active_by_site()` before anything is timed, and the job lifts those lines
+into its summary. A baseline is only comparable to another baseline measured on
+the same arms.
+
+## Committed baselines
+
+The numbers below are a reference point for the ratios between arms, not a
+threshold anything is checked against — the CI job compares each `main` run
+against the previous one, not against this table. A number without a stated CPU
+is not comparable to anything, so the host is part of every row.
+
+The table is generated, not hand-typed: `criterion_baseline.py table` renders it
+from the same baseline JSON the CI job collects, so refreshing it is a
+measurement rather than an edit.
+
+```sh
+for round in 1 2 3; do
+  for target in codec av1_decode av1_encode hevc_decode hevc_encode; do
+    cargo bench --features native --bench "$target"
+  done
+  python3 .github/scripts/criterion_baseline.py collect \
+    --criterion-dir target/criterion --out "baseline-$round.json"
+done
+python3 .github/scripts/criterion_baseline.py table \
+  --baseline baseline-*.json --host 'Apple M1 (macOS 15, aarch64)'
+```
+
+Three rounds and not one, because `table` takes the elementwise **minimum**
+across the baselines it is given. Contention only ever makes a measurement
+slower, so the fastest observation of an arm is the closest any round got to an
+uncontended one; averaging would fold every neighbour process into the number
+instead.
+
+Only the groups `bench_across_isas` builds appear, because they are the only
+ones where "scalar vs each ISA" is a question — the rest of the suite is a single
+arm with nothing to compare against.
+
+Measured on **Apple M1 (macOS 15, aarch64)**, at `b6655bad215f`.
+
+| Group | `scalar` | `neon` | Best |
+| --- | ---: | ---: | ---: |
+| `av1_cdef` | 46.615 ms | 32.865 ms (1.42x) | 1.42x `neon` |
+| `av1_deblock` | 25.088 ms | 4.497 ms (5.58x) | 5.58x `neon` |
+| `av1_deblock_boundary` | 362.401 µs | 62.127 µs (5.83x) | 5.83x `neon` |
+| `av1_deblock_chroma` | 12.448 ms | 4.838 ms (2.57x) | 2.57x `neon` |
+| `av1_deblock_wide` | 78.324 ms | 40.843 ms (1.92x) | 1.92x `neon` |
+| `av1_decode_frame` | 82.680 ms | 88.976 ms (0.93x) | 0.93x `neon` |
+| `av1_encode_frame_q0` | 22.174 ms | 24.314 ms (0.91x) | 0.91x `neon` |
+| `av1_encode_frame_q160` | 344.933 ms | 153.918 ms (2.24x) | 2.24x `neon` |
+| `av1_encode_frame_q32` | 275.371 ms | 170.418 ms (1.62x) | 1.62x `neon` |
+| `av1_encode_stage_bitstream` | 17.426 µs | 17.517 µs (0.99x) | 0.99x `neon` |
+| `av1_encode_stage_symbol` | 1.558 ms | 1.940 ms (0.80x) | 0.80x `neon` |
+| `av1_encode_stage_tile` | 30.144 ms | 31.441 ms (0.96x) | 0.96x `neon` |
+| `av1_encode_stage_wht` | 981.525 µs | 360.850 µs (2.72x) | 2.72x `neon` |
+| `av1_entropy_symbol` | 3.449 ms | 3.422 ms (1.01x) | 1.01x `neon` |
+| `av1_forward_adst_8x8` | 33.915 ms | 8.722 ms (3.89x) | 3.89x `neon` |
+| `av1_forward_dct_16x16` | 45.538 ms | 12.369 ms (3.68x) | 3.68x `neon` |
+| `av1_forward_dct_32x32` | 60.160 ms | 63.603 ms (0.95x) | 0.95x `neon` |
+| `av1_forward_dct_4x4` | 50.984 ms | 7.889 ms (6.46x) | 6.46x `neon` |
+| `av1_forward_dct_8x8` | 33.702 ms | 8.557 ms (3.94x) | 3.94x `neon` |
+| `av1_forward_flipadst_16x16` | 36.556 ms | 12.258 ms (2.98x) | 2.98x `neon` |
+| `av1_intra_directional` | 26.145 ms | 27.222 ms (0.96x) | 0.96x `neon` |
+| `av1_intra_paeth` | 3.376 ms | 3.442 ms (0.98x) | 0.98x `neon` |
+| `av1_intra_smooth` | 3.564 ms | 3.410 ms (1.05x) | 1.05x `neon` |
+| `av1_inverse_adst_8x8` | 50.591 ms | 17.851 ms (2.83x) | 2.83x `neon` |
+| `av1_inverse_dct_16x16` | 24.143 ms | 11.105 ms (2.17x) | 2.17x `neon` |
+| `av1_inverse_dct_32x32` | 17.398 ms | 11.327 ms (1.54x) | 1.54x `neon` |
+| `av1_inverse_dct_4x4` | 78.638 ms | 28.663 ms (2.74x) | 2.74x `neon` |
+| `av1_inverse_dct_64x64` | 27.862 ms | 13.821 ms (2.02x) | 2.02x `neon` |
+| `av1_inverse_dct_8x8` | 42.501 ms | 17.817 ms (2.39x) | 2.39x `neon` |
+| `av1_inverse_flipadst_16x16` | 28.316 ms | 12.777 ms (2.22x) | 2.22x `neon` |
+| `av1_mc_blend_mask` | 26.063 ms | 12.135 ms (2.15x) | 2.15x `neon` |
+| `av1_mc_compound_average` | 25.797 ms | 11.882 ms (2.17x) | 2.17x `neon` |
+| `av1_mc_single` | 16.269 ms | 5.961 ms (2.73x) | 2.73x `neon` |
+| `av1_motion_compensation` | 14.660 ms | 5.442 ms (2.69x) | 2.69x `neon` |
+| `av1_self_guided` | 8.473 ms | 3.310 ms (2.56x) | 2.56x `neon` |
+| `av1_wiener` | 9.564 ms | 7.196 ms (1.33x) | 1.33x `neon` |
+| `hevc_cabac` | 2.559 ms | 2.250 ms (1.14x) | 1.14x `neon` |
+| `hevc_color_convert` | 15.095 ms | 11.926 ms (1.27x) | 1.27x `neon` |
+| `hevc_deblock` | 15.124 ms | 14.748 ms (1.03x) | 1.03x `neon` |
+| `hevc_encode_640x352` | 104.222 ms | 57.448 ms (1.81x) | 1.81x `neon` |
+| `hevc_encode_640x352_fwd_transform_quant` | 13.874 ms | 7.306 ms (1.90x) | 1.90x `neon` |
+| `hevc_encode_640x352_pcm_write` | 10.279 ms | 10.003 ms (1.03x) | 1.03x `neon` |
+| `hevc_encode_640x352_rdo_inter` | 77.838 ms | 27.887 ms (2.79x) | 2.79x `neon` |
+| `hevc_encode_640x352_rdo_intra` | 3.631 ms | 1.554 ms (2.34x) | 2.34x `neon` |
+| `hevc_encode_640x352_reconstruct` | 13.469 ms | 13.733 ms (0.98x) | 0.98x `neon` |
+| `hevc_encode_640x352_residual_write` | 34.563 ms | 33.620 ms (1.03x) | 1.03x `neon` |
+| `hevc_encode_640x352_rgba_to_yuv420` | 628.049 µs | 151.822 µs (4.14x) | 4.14x `neon` |
+| `hevc_encode_bitwriter` | 4.208 ms | 4.060 ms (1.04x) | 1.04x `neon` |
+| `hevc_encode_cabac` | 2.256 ms | 2.195 ms (1.03x) | 1.03x `neon` |
+| `hevc_inter_pred` | 24.460 ms | 20.344 ms (1.20x) | 1.20x `neon` |
+| `hevc_intra_pred` | 8.569 ms | 8.396 ms (1.02x) | 1.02x `neon` |
+| `hevc_inverse_transform` | 8.278 ms | 7.636 ms (1.08x) | 1.08x `neon` |
+| `hevc_sao` | 35.250 ms | 22.443 ms (1.57x) | 1.57x `neon` |
+
+### Reading the sub-parity rows
+
+An arm below `1.00x` is slower under its vector kernel than under scalar. Before
+treating one as a defect, note what three independent measurement sets of this
+same table did to the candidates:
+
+| Group | set 1 | set 2 | set 3 |
+| --- | ---: | ---: | ---: |
+| `hevc_intra_pred` | 0.62x | 1.04x | 1.09x |
+| `av1_intra_paeth` | 0.78x | 0.88x | 0.98x |
+| `av1_forward_dct_32x32` | 0.78x | 0.91x | 0.95x |
+
+No kernel changed between set 2 and set 3. What changed was the load average on
+the measuring host, and every candidate walked towards parity as the machine got
+quieter. **On this host, at this noise level, no arm is reliably below parity
+except the ones with no vector kernel at all** — `av1_encode_stage_symbol`,
+`av1_encode_stage_bitstream`, `hevc_cabac`, `hevc_encode_cabac`,
+`av1_entropy_symbol` and `hevc_color_convert`, where the two arms are the same
+code and differ only by measurement noise. Of those, `hevc_color_convert` is the
+one worth acting on, and `#219` already tracks vectorizing it.
+
+The rest of the near-parity rows are the story this file tells above: under
+`lto = "fat"` with `codegen-units = 1`, LLVM does to the scalar reference roughly
+what the hand kernel does, and the two land within noise of each other.
+
+This is the single most useful thing the committed table records. A one-off
+measurement of any of the three rows above would have looked like a broken
+kernel and sent someone rewriting code that was fine. It is also why the CI job
+compares medians rather than means, sets its threshold at a deliberately loose
+15%, and reports instead of failing: a shared runner is a noisier host than this
+one, not a quieter one.
+
+An arm being absent from a row means the host could not execute it, not that it
+was not measured: an Apple Silicon host has no `sse41` or `avx2` column at all,
+which is why the x86_64 arms do not appear here yet. `#228` covers measuring the
+x86_64 side.
+
 ## Fixtures
 
 `benches/support/` loads only fixtures already checked into the repository:
@@ -559,7 +816,8 @@ mistaken for bitstream-writing cost:
 | `..._rdo_intra` / `..._rdo_inter` | mode search / RDO (`engine::encoder::rdo`), without and with a reference picture |
 | `..._reconstruct` | encode-side reconstruction (predict + add residual per coded block) plus the §8.7.2 deblocking filter and §8.7.3 SAO over the reconstructed picture |
 | `..._pcm_write` | whole-picture access-unit writing: parameter sets, slice header, CABAC-coded CU syntax, PCM samples |
-| `hevc_encode_cabac` | the §9.3.5 arithmetic encoder alone, over a synthetic bin stream |
+| `hevc_encode_cabac` | the §9.3.5 arithmetic encoder alone, over a synthetic bin stream of single, interleaved bins |
+| `hevc_encode_cabac_bypass` | the same encoder over contiguous *bypass runs* — the shape 62% of the lossy residual writer's bins have |
 | `hevc_encode_bitwriter` | the raw fixed-length / `ue(v)` / `se(v)` writer alone |
 | `..._rgba_to_yuv420` | the RGBA8 input conversion every encoded frame pays (`engine::encoder::colorconv`) |
 
@@ -599,8 +857,8 @@ instruction set, but by reaching the decoder's already-vectorized deblocking and
 SAO kernels rather than an encoder-side one.
 
 **Bitstream writing and CABAC** have no vector path at all, so `..._pcm_write`,
-`hevc_encode_cabac` and `hevc_encode_bitwriter` are expected to read the same
-under every instruction set. That is a measured result, not a broken benchmark:
+`hevc_encode_cabac`, `hevc_encode_cabac_bypass` and `hevc_encode_bitwriter` are
+expected to read the same under every instruction set. That is a measured result, not a broken benchmark:
 it says the remaining encoder-side vectorization targets are entropy coding and
 the bitwriter — and that for the bitwriter, a widening rewrite of its
 `put_bit`-at-a-time inner loop is likely worth more than vector kernels, while
@@ -610,6 +868,22 @@ group asserts through `simd::active_by_site()` that the override landed rather
 than inferring it from the clock — see
 [Reading a null result](#reading-a-null-result).
 
+That widening rewrite has since happened, and `..._pcm_write` and
+`hevc_encode_bitwriter` still read flat on the SIMD axis — deliberately. The
+rewrite widened `BitWriter::put_bits` to move a chunk of a field at a time and
+gave byte-aligned §7.3.8.7 PCM sample data a bulk path that bypasses the bit
+accumulator entirely; neither is a vector kernel, so neither added a
+`simd::active_by_site()` site and neither arm moves when the instruction set is
+pinned. **A flat SIMD arm here does not mean no work was done.** The win is on
+the scalar axis and has to be read as a before/after against the previous
+implementation rather than as a scalar-versus-NEON ratio within one run:
+measured on a contended Apple Silicon host as the best of seven interleaved
+rounds per arm, `hevc_encode_bitwriter` went 3.43 ms -> 0.58 ms (~5.9x) and
+`hevc_encode_640x352_pcm_write` 8.32 ms -> 0.35 ms (~23x), with the scalar and
+NEON arms of each group staying level with each other throughout, exactly as
+this section predicts. Output is byte-identical either way; `tests/hevc_
+bitstream_byte_identity.rs` pins the produced access units to digests captured
+from the pre-rewrite writer.
 ### Why the CABAC arithmetic encoder stays serial
 
 `hevc_encode_cabac` reads flat under every instruction set and is expected to
@@ -667,27 +941,54 @@ about **two thirds** of the access-unit write, so the stage is worth working on
 after all. What does not follow is that bin-parallelism is the way to work on
 it.
 
-**What to do instead.** Two ordinary serial changes take most of the reachable
-headroom, exactly, with no speculation:
+**What to do instead.** Two ordinary serial changes were expected to take most
+of the reachable headroom with no speculation. The first was tried and does not;
+the second has not been tried yet.
 
-1. **Encode a bypass *run* in one step.** §9.3.5.5 unrolled over `n` bins is
+1. **Encoding a bypass *run* in one step is an identity, and is not a speedup**
+   (#246). §9.3.5.5 unrolled over `n` bins is
    `ivlLow = ( ivlLow << n ) + ivlCurrRange * value` followed by the same
-   carry-controlled emission of the top `n` bits, which is an identity rather
-   than an approximation: it was checked byte-identical against the
-   bin-at-a-time engine for every run length from 1 to 24, and measured
-   **1.73x** on a workload of runs (64.4–65.5 -> 110.5–113.4 Mbin/s). The lossy
-   writer's coefficient sign bits and Golomb-Rice suffixes are exactly such
-   runs, and **62%** of its bins are bypass bins. `hevc_encode_cabac` itself
-   would not move, because its bypass bins are single and interleaved with
-   context-coded ones by construction.
+   carry-controlled emission of the top `n` bits, each tested against a window
+   scaled by the bins still below it. That part holds exactly: implemented and
+   run against the bin-at-a-time engine it is byte-identical, and leaves an
+   identical `ivlLow` and `bitsOutstanding`, for every run length from 1 to 32
+   from every primed engine state, and the lossy residual writer's output does
+   not move by a bit at any QP. What did not reproduce is the **1.73x** this
+   section previously recorded for it. Measured as the best of 25 rounds of the
+   two paths interleaved *in one process* — the only form of this comparison
+   that survives a host running several concurrent builds — over
+   `hevc_encode_cabac_bypass`'s 262,144-bin workload:
+
+   | Run length | bin at a time | run at a time | ratio |
+   | --- | --- | --- | --- |
+   | 2 | 182.8 Mbin/s | 166.7 Mbin/s | 0.91x |
+   | 4 | 278.1 Mbin/s | 249.1 Mbin/s | 0.90x |
+   | 8 | 281.7 Mbin/s | 298.0 Mbin/s | 1.06x |
+   | 16 | 135.4 Mbin/s | 132.4 Mbin/s | 0.98x |
+   | mixed 1–16 | 120.0 Mbin/s | 113.7 Mbin/s | 0.95x |
+
+   The ratio straddles 1.00 and never leaves the noise, so the unrolled step
+   was not taken. The reason it buys nothing is that it removes a shift and a
+   conditional add per bin, and neither is what a bypass bin costs: the
+   three-way, data-dependent Figure 9-13 decision — emit a bit, emit a
+   carry-resolving bit, or defer one — still runs once per bin, and the
+   `put_bit`-at-a-time sink under it still writes one bit at a time. Batching a
+   whole run's resolved bits into a single `BitWriter::put_bits`, over a
+   byte-at-a-time `put_bits`, was measured too and did not move the ratio
+   either.
 2. **Widen the bit sink**, which the first table prices at 1.14x for this stage
-   on its own. That is the same rewrite the `..._pcm_write` and
-   `hevc_encode_bitwriter` groups want.
+   on its own. That is the rewrite the `..._pcm_write` and
+   `hevc_encode_bitwriter` groups took (#233, recorded above), it is what the
+   run-at-a-time result above points back at, and the arithmetic encoder keeps
+   only the share of it that its own bit writing is worth.
 
 Neither is a bin-parallel algorithm, and neither changes a single bit of output.
 Whatever headroom a speculative formulation might still hold after both is
 smaller than the 3.7x ceiling above and costs far more to hold onto, which is
-why the arithmetic encoder stays serial.
+why the arithmetic encoder stays serial. `hevc_encode_cabac_bypass` exists so
+that the run-at-a-time question stays measured rather than re-derived: it is the
+same engine over contiguous bypass runs instead of single interleaved bins, and
+it is the group any future attempt at this has to move.
 
 ## Per-stage access to the encoder
 

@@ -35,6 +35,38 @@ use zvidlib::simd::{self, SimdIsa};
 
 use super::FrameWork;
 
+/// Logs what this host can actually execute, before anything is timed.
+///
+/// Every bench target starts with this, so a saved baseline names the arms it
+/// was measured on. Groups built through [`bench_across_isas`] run one arm per
+/// entry in [`simd::available`], so a runner without AVX2 simply has no `avx2`
+/// arm rather than reporting scalar numbers under a vector label. That is the
+/// right behaviour, but it is invisible in a results table: `av1_deblock/avx2`
+/// being absent and `av1_deblock/avx2` being slow look the same from the
+/// outside, and GitHub's runner pool is not uniform in AVX2 availability. CI
+/// lifts these lines into its job summary so a run whose vector arms vanished
+/// because the runner pool changed is diagnosable rather than mysterious.
+///
+/// [`simd::active_by_site`] is logged alongside it because "this host supports
+/// AVX2" and "every dispatch family agrees to use it" are separate claims;
+/// [`bench_across_isas`] asserts the second one per arm, and this prints its
+/// starting state.
+///
+/// It takes a `&mut Criterion` and measures nothing so that it can be listed in
+/// a target's `criterion_group!` like any other group, which is what guarantees
+/// it runs before the first timed arm.
+pub fn log_host_isas(_criterion: &mut Criterion) {
+    let names: Vec<&str> = simd::available().iter().map(|isa| isa.name()).collect();
+    println!("# host instruction sets: {}", names.join(", "));
+    println!(
+        "# widest detected instruction set: {}",
+        simd::active().name()
+    );
+    for (site, isa) in simd::active_by_site() {
+        println!("# dispatch site {site}: {}", isa.name());
+    }
+}
+
 /// How to measure one workload across instruction sets.
 pub struct IsaWorkload<'a> {
     /// Group name, conventionally `<codec>_<stage>` (e.g. `av1_deblock`).

@@ -51,10 +51,41 @@ const ZERO_BLOCK_BITS: i64 = 1;
 /// `all_zero` flag, a one-position end-of-block, and one magnitude-1 coefficient with its sign.
 const MIN_CODED_BLOCK_BITS: i64 = 7;
 
-/// Transform blocks per size trial that [`FrameEncoder::choose_tx_size`] searches with the whole
-/// transform-type set instead of the set's DCT alone, to measure what the type search is worth at
-/// that size before extrapolating it over the trial's remaining blocks.
+/// Transform blocks per probing size trial that [`FrameEncoder::choose_tx_size`] searches with the
+/// whole transform-type set instead of the set's DCT alone, to measure what the type search is
+/// worth at that size before extrapolating it over the trial's remaining blocks.
 const TYPE_GAIN_PROBES: usize = 1;
+
+/// Coding blocks between two whose size search probes.
+///
+/// What a probe measures is a ratio between the whole type set's cost and DCT's on the same
+/// block, and that ratio is a property of the frame's content and its quantizer far more than of
+/// the individual block - so it is measured on a sample of the size searches and reused across
+/// the rest, rather than re-measured on every one. The sample is taken per *coding block* rather
+/// than per size trial: a block ranks its sizes against each other, so all of its trials have to
+/// be corrected by the same kind of estimate or the ranking compares a freshly measured size
+/// against a remembered one. The frame's first size search probes, so a correction is available
+/// from the first block that needs one.
+const TYPE_GAIN_SAMPLE_INTERVAL: usize = 8;
+
+/// Transform sizes [`FrameEncoder::type_gain`] accumulates over: `TX_4X4` through `TX_32X32`,
+/// which is every size [`super::transform::forward_transform`] implements.
+const TYPE_GAIN_SIZES: usize = 4;
+
+/// One transform size's accumulated probe measurement for the frame.
+#[derive(Clone, Copy, Default)]
+struct TypeGain {
+    /// Summed DCT-only cost of every block probed at this size.
+    dct_cost: i64,
+    /// Summed best-of-set cost of the same blocks, so `dct_cost - best_cost` is what the type
+    /// search has been measured to be worth at this size.
+    best_cost: i64,
+}
+
+/// Slot in [`FrameEncoder::type_gain`] for a transform of `tx_width` samples a side.
+fn type_gain_slot(tx_width: usize) -> usize {
+    (tx_width / 4).trailing_zeros() as usize
+}
 
 /// Smallest coding block the non-lossless partition search will produce. A 16x16 block can still
 /// signal `TX_16X16`, `TX_8X8`, or `TX_4X4`, so every transform size this encoder emits stays
@@ -107,11 +138,19 @@ pub(crate) struct FrameEncoder<'a> {
     /// outside a [`FrameEncoder::choose_tx_size`] trial, which is what keeps every other
     /// speculative pass on the set's DCT alone.
     probe_budget: usize,
-    /// Summed DCT-only cost of the current trial's probed blocks.
+    /// What the type search has measured out to be worth at each transform size so far this
+    /// frame, one slot per [`type_gain_slot`]. Probes accumulate into it and a trial that did not
+    /// probe reads it back, so a size's gain is measured on a sample of its trials rather than on
+    /// all of them.
+    type_gain: [TypeGain; TYPE_GAIN_SIZES],
+    /// The current trial's own probe measurement, or a zeroed pair when it did not probe. A
+    /// trial that probed is corrected by what it measured itself, exactly as every trial was
+    /// before the measurement was sampled; only the trials that skip the probe fall back to
+    /// [`Self::type_gain`].
     probe_dct_cost: i64,
-    /// Summed best-of-set cost of the same blocks, so `probe_dct_cost - probe_best_cost` is what
-    /// the type search was measured to be worth over them.
     probe_best_cost: i64,
+    /// Size searches run so far this frame, which is what [`TYPE_GAIN_SAMPLE_INTERVAL`] samples.
+    size_searches: usize,
     /// Summed DCT-only cost of every block the current trial actually searched, which is the base
     /// the measured gain is extrapolated over. Zero-skipped blocks are excluded: no transform type
     /// can improve a block that codes no coefficients.
@@ -202,8 +241,10 @@ impl<'a> FrameEncoder<'a> {
             split_memo: vec![MEMO_UNSET; MEMO_LEVELS * mi_cols * mi_rows],
             tx_size_memo: vec![MEMO_UNSET; MEMO_LEVELS * mi_cols * mi_rows],
             probe_budget: 0,
+            type_gain: [TypeGain::default(); TYPE_GAIN_SIZES],
             probe_dct_cost: 0,
             probe_best_cost: 0,
+            size_searches: 0,
             trial_searched_cost: 0,
             #[cfg(test)]
             exhaustive: false,
@@ -460,11 +501,13 @@ impl<'a> FrameEncoder<'a> {
     /// The trials themselves rank on the set's DCT alone, which on its own is not a fair
     /// comparison *between sizes*: coding the block as sixteen 4x4 transforms gives the emitting
     /// pass's type search sixteen chances to beat DCT against one for a single 16x16 transform,
-    /// and a DCT-only ranking throws that advantage away. Each trial therefore also probes
-    /// [`TYPE_GAIN_PROBES`] of its blocks with the whole type set, and the measured gain is
-    /// extrapolated over the rest in [`Self::corrected_trial_cost`] - so the correction grows
-    /// with the trial's block count, as the type search's real advantage does, at a cost that
-    /// does not.
+    /// and a DCT-only ranking throws that advantage away. A sampled subset of the trials at each
+    /// size - every [`TYPE_GAIN_SAMPLE_INTERVAL`]-th, counting the first - therefore probes
+    /// [`TYPE_GAIN_PROBES`] of its blocks with the whole type set, and the gain that measures out
+    /// is extrapolated over every trial of that size in [`Self::corrected_trial_cost`] - so the
+    /// correction grows with the trial's block count, as the type search's real advantage does,
+    /// at a cost that does not, and that is paid on a sample of the trials rather than all of
+    /// them.
     fn choose_tx_size(&mut self, r: usize, c: usize, bw: usize) -> usize {
         let slot = self.memo_slot(r, c, bw);
         if self.tx_size_memo[slot] != MEMO_UNSET {
@@ -472,6 +515,7 @@ impl<'a> FrameEncoder<'a> {
         }
         let largest = bw.min(MAX_TX_WIDTH);
         let (_, max_depth) = cdf::tx_depth_cdf(bw);
+        let probing = self.shortcuts() && self.sample_type_gain();
         let mut best = (0usize, i64::MAX);
         for depth in 0..=max_depth {
             let tx_width = (largest >> depth).max(4);
@@ -479,17 +523,13 @@ impl<'a> FrameEncoder<'a> {
                 continue;
             }
             let snapshot = self.snapshot(r, c, bw);
-            self.probe_budget = if self.shortcuts() {
-                TYPE_GAIN_PROBES
-            } else {
-                0
-            };
+            self.probe_budget = if probing { TYPE_GAIN_PROBES } else { 0 };
             self.probe_dct_cost = 0;
             self.probe_best_cost = 0;
             self.trial_searched_cost = 0;
             let cost = self.code_block_transforms(r, c, bw, tx_width, false);
             self.restore(snapshot);
-            let cost = self.corrected_trial_cost(cost);
+            let cost = self.corrected_trial_cost(cost, tx_width);
             if cost < best.1 {
                 best = (tx_width, cost);
             }
@@ -505,19 +545,36 @@ impl<'a> FrameEncoder<'a> {
         best.0
     }
 
-    /// Discounts a size trial's DCT-only cost by what the type search was measured to be worth on
-    /// the blocks this trial probed.
+    /// Whether this coding block's size search probes, which every
+    /// [`TYPE_GAIN_SAMPLE_INTERVAL`]-th one does, counting the frame's first.
+    fn sample_type_gain(&mut self) -> bool {
+        let sample = self.size_searches % TYPE_GAIN_SAMPLE_INTERVAL == 0;
+        self.size_searches += 1;
+        sample
+    }
+
+    /// Discounts a size trial's DCT-only cost by what the type search has been measured to be
+    /// worth at this transform size.
     ///
-    /// With `p` the probed blocks and `s` every searched block, the estimate is
-    /// `sum(best_p)/sum(dct_p)` applied to `sum(dct_s)`, which reduces to subtracting
+    /// With `p` this size's probed blocks and `s` every block this trial searched, the estimate
+    /// is `sum(best_p)/sum(dct_p)` applied to `sum(dct_s)`, which reduces to subtracting
     /// `(dct_p - best_p) * dct_s / dct_p`. Blocks the zero-block shortcut decided are not in `s`:
-    /// no transform type improves a block that codes no coefficients.
-    fn corrected_trial_cost(&self, cost: i64) -> i64 {
-        if self.probe_dct_cost <= 0 {
+    /// no transform type improves a block that codes no coefficients. A trial that probed uses
+    /// its own `p`; one that skipped the probe uses every block sampled at that size so far this
+    /// frame instead, so it is still corrected - by the ratio a probe of its own would have been
+    /// measuring.
+    fn corrected_trial_cost(&self, cost: i64, tx_width: usize) -> i64 {
+        let (dct, best) = if self.probe_dct_cost > 0 {
+            (self.probe_dct_cost, self.probe_best_cost)
+        } else {
+            let gain = self.type_gain[type_gain_slot(tx_width)];
+            (gain.dct_cost, gain.best_cost)
+        };
+        if dct <= 0 {
             return cost;
         }
-        let gain = self.probe_dct_cost - self.probe_best_cost;
-        cost - gain.saturating_mul(self.trial_searched_cost) / self.probe_dct_cost
+        let measured = dct - best;
+        cost - measured.saturating_mul(self.trial_searched_cost) / dct
     }
 
     /// Walks a coding block's transform blocks in the decoder's raster order, reconstructing
@@ -694,8 +751,12 @@ impl<'a> FrameEncoder<'a> {
         }
         if probing {
             let dct = best.as_ref().map_or(0, |best| best.cost);
+            let best_of_set = cheapest.min(dct);
             self.probe_dct_cost += dct;
-            self.probe_best_cost += cheapest.min(dct);
+            self.probe_best_cost += best_of_set;
+            let gain = &mut self.type_gain[type_gain_slot(size)];
+            gain.dct_cost += dct;
+            gain.best_cost += best_of_set;
         }
         // `tx_type` itself is only read by the trace the tests assert on; the bitstream carries
         // its `symbol` index instead.
