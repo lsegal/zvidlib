@@ -7,7 +7,7 @@ zvidlib's benchmarks run under [criterion](https://docs.rs/criterion) with
 | --- | --- |
 | `benches/codec.rs` | codec work: decode, encoder inputs, and the per-ISA SIMD groups |
 | `benches/av1_decode.rs` | the AV1 software decoder: whole-frame decode and every hot stage, scalar versus SIMD |
-| `benches/av1_encode.rs` | the AV1 encoder's kernels: the forward transforms, scalar versus SIMD |
+| `benches/av1_encode.rs` | the native AV1 encoder: whole-frame encode, every stage, and the forward-transform kernels, scalar versus SIMD |
 | `benches/audio_decode.rs` | the audio decode path: AAC access units and `AacSampleReader` range/seek reads |
 | `benches/audio_mux.rs` | the audio container path: MP4 muxing, sample-table growth, demux, and gapless timing |
 | `benches/hevc_encode.rs` | the pure-Rust HEVC encoder, whole-frame and per-stage |
@@ -29,7 +29,7 @@ its mode search is slow enough that keeping it out of the default
 cargo bench                       # the default, fast groups in every target
 cargo bench --bench codec         # codec work only
 cargo bench --bench av1_decode    # the AV1 software decoder only
-cargo bench --bench av1_encode    # the AV1 encoder kernels only
+cargo bench --bench av1_encode    # the AV1 encoder, whole-frame and per-stage
 cargo bench --bench audio_decode  # the audio decode path only
 cargo bench --bench audio_mux     # the audio container path only
 cargo bench --bench hevc_encode   # the HEVC encoder groups only
@@ -177,15 +177,56 @@ cargo bench --bench av1_decode -- av1_inverse   # every inverse-transform group
 
 ## The AV1 encoder suite (`--bench av1_encode`)
 
-`benches/av1_encode.rs` measures AV1's encoder-side kernels. Today that is the
-forward transform set:
+`benches/av1_encode.rs` measures the native AV1 encoder on two axes: whole-frame
+versus per-stage, and instruction set.
+
+The whole-frame groups encode a synthetic monochrome frame through the public
+`zvidlib::native_av1_video_encoder_factory` at three quantizer settings and
+report frames/sec and megapixels/sec. The per-stage groups run each stage on its
+own through `zvidlib::av1_encoder_bench`, the `#[doc(hidden)]` per-stage access
+that is the AV1 counterpart to `hevc_encoder_bench`, so the tile encoder's cost
+is not mistaken for bitstream-writing cost. Both default to 640x352 and add a
+1920x1080 pass behind `ZVIDLIB_BENCH_LARGE=1`:
 
 | Group | Stage |
 | --- | --- |
+| `av1_encode_frame_q{0,32,160}` | one whole frame through the public encoder, `src/av1_encoder/tile.rs` |
+| `av1_encode_stage_wht` | the forward 4x4 WHT, `src/av1_encoder/wht.rs` |
+| `av1_encode_stage_symbol` | symbol coding over the static CDF tables, `src/av1_encoder/symbol.rs` and `cdf.rs` |
+| `av1_encode_stage_tile` | tile encoding: superblock iteration, `DC_PRED`, coefficient coding, `src/av1_encoder/tile.rs` |
+| `av1_encode_stage_bitstream` | headers, bit writing and OBU LEB128 framing, `src/av1_encoder/{bitwriter,headers,leb128}.rs` |
 | `av1_forward_dct_{4x4,8x8,16x16,32x32}` | forward DCT, `src/av1_encoder/transform.rs` through `zvidlib::forward_transform` |
 | `av1_forward_adst_8x8`, `av1_forward_flipadst_16x16` | the forward ADST family, including a flipped type |
 
-They run once per available instruction set through
+The per-stage groups run at `base_q_idx = 0`, the lossless WHT profile, so they
+decompose the same work `av1_encode_frame_q0` measures end to end. The
+non-lossless search the `q32` and `q160` groups show is a whole-frame property
+rather than a stage of its own, which is why it has no per-stage counterpart.
+
+The stage breakdown is the point of the per-stage groups, and it is lopsided:
+tile encoding is within a small factor of the whole-frame number, the forward
+WHT and the symbol coder are each an order of magnitude cheaper than that, and
+header writing with its LEB128 framing is two to three orders cheaper again —
+microseconds against a 1080p tile encode's hundreds of milliseconds. Coefficient
+coding and its context derivation inside `tile.rs`, not the transform, are what a
+faster lossless encoder has to attack next.
+
+The forward transforms and the forward WHT are this encoder's only vectorized
+kernels. Symbol coding, CDF handling and bitstream writing are scalar and
+expected to stay that way, so those arms read the same under every instruction
+set. That flatness is a measured result rather than a broken run, which is why
+each group asserts through `simd::active_by_site()` that the override landed
+instead of inferring it from the clock. `report_stage_coverage` prints the stage
+list on every run, so a group that stops being measured reads as a broken run
+rather than as a stage that costs nothing.
+
+```sh
+cargo bench --bench av1_encode -- av1_encode_stage    # the per-stage groups only
+ZVIDLIB_BENCH_LARGE=1 cargo bench --bench av1_encode  # add the 1080p pass
+```
+
+The kernel-level `av1_forward_*` groups run once per available instruction set
+through
 `support::isa::bench_across_isas`, under the same bit-exactness and
 `active_by_site()` guards as every other per-ISA group, and over the same
 1920x1080 block counts and coefficient generator as the inverse-transform
@@ -461,6 +502,209 @@ run on the detected instruction set only and do not use `bench_across_isas`. The
 still carry the `simd=off` / `simd=on` build tag every group name carries,
 because that tag records which *build* produced a number, not which kernel ran.
 
+## Continuous integration
+
+The `Benchmarks` job in `.github/workflows/ci.yml` treats the suite as two
+different things depending on the event.
+
+**On every pull request** it runs `cargo bench --no-run` and stops. That is one
+build and no measurement. It exists because the usual way a benchmark suite dies
+is not a bad number, it is rotting: the bench code stops compiling against the
+crate, nobody runs it locally, and the decay is only discovered when someone
+needs a measurement months later. Compiling on every PR makes that failure
+immediate and cheap.
+
+It deliberately does **not** time anything on a pull request. GitHub's shared
+runners differ in CPU model, neighbour load, and thermal state between two runs
+of the same commit by far more than the regressions worth catching. A PR gate on
+those timings would fail on noise, and a check that fails on noise gets disabled.
+
+**On `main` pushes and `workflow_dispatch`** it runs the full suite with
+`ZVIDLIB_BENCH_LARGE=1`, so the per-ISA HEVC group — the one that proves the
+crate-wide override reaches the HEVC kernels — is included. Then it:
+
+1. writes `bench.log` and puts the host's instruction sets into the job summary;
+2. reduces `target/criterion/` to one small JSON baseline through
+   `.github/scripts/criterion_baseline.py collect`;
+3. downloads the newest baseline artifact from a previous `main` run and diffs
+   the two with `criterion_baseline.py compare`, writing a per-group delta table
+   to the job summary;
+4. uploads its own baseline as the `criterion-baseline-main` artifact (90-day
+   retention) for the next run to compare against.
+
+`workflow_dispatch` is how to measure a branch on demand without merging it, and
+it takes a `threshold` input.
+
+### The threshold, and why it is only a report
+
+The comparison flags anything that moved more than **15%** and writes it into
+the job summary. It does not fail the job.
+
+15% is deliberately loose and deliberately provisional. Nobody knows this
+suite's real run-to-run variance on the GitHub runner pool yet, and a threshold
+guessed tighter than the noise floor produces false regressions immediately —
+which is the same failure mode as gating PRs on timings, just slower. The
+intended path is to leave it reporting for a few weeks, read the actual spread
+off successive `main` runs, and then tighten it, and only then consider making it
+fail. Raising the alarm before the alarm is calibrated trains everyone to ignore
+it.
+
+The comparison uses criterion's **median** point estimate rather than the mean,
+because one descheduled iteration on a shared runner moves the mean and leaves
+the median alone. It compares point estimates rather than running criterion's
+own change detection, which needs both runs' raw sample data in one
+`target/criterion/` directory and assumes the same machine produced both.
+
+### Reading a flagged delta
+
+A red row is a prompt to look, not a verdict. Successive `main` runs land on
+different physical machines, and an arm can also disappear entirely — see the
+instruction-set log below. Reproduce on a quiet host before treating a flagged
+row as a real regression, and note that the crate's own measurements are quoted
+from an Apple Silicon host while CI measures `x86_64` Linux, so the two are not
+directly comparable to each other either.
+
+### Why the host's instruction sets are logged
+
+Groups built through `bench_across_isas` run one arm per entry in
+`simd::available()`, so a runner without AVX2 simply has no `avx2` arm. That is
+the correct behaviour — the alternative is scalar numbers filed under a vector
+label — but it is invisible in a results table: an absent `av1_deblock/avx2` and
+a slow one look the same from the outside, and GitHub's runner pool is not
+uniform in AVX2 availability. The bench target therefore prints
+`simd::available()`, the widest detected instruction set, and
+`simd::active_by_site()` before anything is timed, and the job lifts those lines
+into its summary. A baseline is only comparable to another baseline measured on
+the same arms.
+
+## Committed baselines
+
+The numbers below are a reference point for the ratios between arms, not a
+threshold anything is checked against — the CI job compares each `main` run
+against the previous one, not against this table. A number without a stated CPU
+is not comparable to anything, so the host is part of every row.
+
+The table is generated, not hand-typed: `criterion_baseline.py table` renders it
+from the same baseline JSON the CI job collects, so refreshing it is a
+measurement rather than an edit.
+
+```sh
+for round in 1 2 3; do
+  for target in codec av1_decode av1_encode hevc_decode hevc_encode; do
+    cargo bench --features native --bench "$target"
+  done
+  python3 .github/scripts/criterion_baseline.py collect \
+    --criterion-dir target/criterion --out "baseline-$round.json"
+done
+python3 .github/scripts/criterion_baseline.py table \
+  --baseline baseline-*.json --host 'Apple M1 (macOS 15, aarch64)'
+```
+
+Three rounds and not one, because `table` takes the elementwise **minimum**
+across the baselines it is given. Contention only ever makes a measurement
+slower, so the fastest observation of an arm is the closest any round got to an
+uncontended one; averaging would fold every neighbour process into the number
+instead.
+
+Only the groups `bench_across_isas` builds appear, because they are the only
+ones where "scalar vs each ISA" is a question — the rest of the suite is a single
+arm with nothing to compare against.
+
+Measured on **Apple M1 (macOS 15, aarch64)**, at `b6655bad215f`.
+
+| Group | `scalar` | `neon` | Best |
+| --- | ---: | ---: | ---: |
+| `av1_cdef` | 46.615 ms | 32.865 ms (1.42x) | 1.42x `neon` |
+| `av1_deblock` | 25.088 ms | 4.497 ms (5.58x) | 5.58x `neon` |
+| `av1_deblock_boundary` | 362.401 µs | 62.127 µs (5.83x) | 5.83x `neon` |
+| `av1_deblock_chroma` | 12.448 ms | 4.838 ms (2.57x) | 2.57x `neon` |
+| `av1_deblock_wide` | 78.324 ms | 40.843 ms (1.92x) | 1.92x `neon` |
+| `av1_decode_frame` | 82.680 ms | 88.976 ms (0.93x) | 0.93x `neon` |
+| `av1_encode_frame_q0` | 22.174 ms | 24.314 ms (0.91x) | 0.91x `neon` |
+| `av1_encode_frame_q160` | 344.933 ms | 153.918 ms (2.24x) | 2.24x `neon` |
+| `av1_encode_frame_q32` | 275.371 ms | 170.418 ms (1.62x) | 1.62x `neon` |
+| `av1_encode_stage_bitstream` | 17.426 µs | 17.517 µs (0.99x) | 0.99x `neon` |
+| `av1_encode_stage_symbol` | 1.558 ms | 1.940 ms (0.80x) | 0.80x `neon` |
+| `av1_encode_stage_tile` | 30.144 ms | 31.441 ms (0.96x) | 0.96x `neon` |
+| `av1_encode_stage_wht` | 981.525 µs | 360.850 µs (2.72x) | 2.72x `neon` |
+| `av1_entropy_symbol` | 3.449 ms | 3.422 ms (1.01x) | 1.01x `neon` |
+| `av1_forward_adst_8x8` | 33.915 ms | 8.722 ms (3.89x) | 3.89x `neon` |
+| `av1_forward_dct_16x16` | 45.538 ms | 12.369 ms (3.68x) | 3.68x `neon` |
+| `av1_forward_dct_32x32` | 60.160 ms | 63.603 ms (0.95x) | 0.95x `neon` |
+| `av1_forward_dct_4x4` | 50.984 ms | 7.889 ms (6.46x) | 6.46x `neon` |
+| `av1_forward_dct_8x8` | 33.702 ms | 8.557 ms (3.94x) | 3.94x `neon` |
+| `av1_forward_flipadst_16x16` | 36.556 ms | 12.258 ms (2.98x) | 2.98x `neon` |
+| `av1_intra_directional` | 26.145 ms | 27.222 ms (0.96x) | 0.96x `neon` |
+| `av1_intra_paeth` | 3.376 ms | 3.442 ms (0.98x) | 0.98x `neon` |
+| `av1_intra_smooth` | 3.564 ms | 3.410 ms (1.05x) | 1.05x `neon` |
+| `av1_inverse_adst_8x8` | 50.591 ms | 17.851 ms (2.83x) | 2.83x `neon` |
+| `av1_inverse_dct_16x16` | 24.143 ms | 11.105 ms (2.17x) | 2.17x `neon` |
+| `av1_inverse_dct_32x32` | 17.398 ms | 11.327 ms (1.54x) | 1.54x `neon` |
+| `av1_inverse_dct_4x4` | 78.638 ms | 28.663 ms (2.74x) | 2.74x `neon` |
+| `av1_inverse_dct_64x64` | 27.862 ms | 13.821 ms (2.02x) | 2.02x `neon` |
+| `av1_inverse_dct_8x8` | 42.501 ms | 17.817 ms (2.39x) | 2.39x `neon` |
+| `av1_inverse_flipadst_16x16` | 28.316 ms | 12.777 ms (2.22x) | 2.22x `neon` |
+| `av1_mc_blend_mask` | 26.063 ms | 12.135 ms (2.15x) | 2.15x `neon` |
+| `av1_mc_compound_average` | 25.797 ms | 11.882 ms (2.17x) | 2.17x `neon` |
+| `av1_mc_single` | 16.269 ms | 5.961 ms (2.73x) | 2.73x `neon` |
+| `av1_motion_compensation` | 14.660 ms | 5.442 ms (2.69x) | 2.69x `neon` |
+| `av1_self_guided` | 8.473 ms | 3.310 ms (2.56x) | 2.56x `neon` |
+| `av1_wiener` | 9.564 ms | 7.196 ms (1.33x) | 1.33x `neon` |
+| `hevc_cabac` | 2.559 ms | 2.250 ms (1.14x) | 1.14x `neon` |
+| `hevc_color_convert` | 15.095 ms | 11.926 ms (1.27x) | 1.27x `neon` |
+| `hevc_deblock` | 15.124 ms | 14.748 ms (1.03x) | 1.03x `neon` |
+| `hevc_encode_640x352` | 104.222 ms | 57.448 ms (1.81x) | 1.81x `neon` |
+| `hevc_encode_640x352_fwd_transform_quant` | 13.874 ms | 7.306 ms (1.90x) | 1.90x `neon` |
+| `hevc_encode_640x352_pcm_write` | 10.279 ms | 10.003 ms (1.03x) | 1.03x `neon` |
+| `hevc_encode_640x352_rdo_inter` | 77.838 ms | 27.887 ms (2.79x) | 2.79x `neon` |
+| `hevc_encode_640x352_rdo_intra` | 3.631 ms | 1.554 ms (2.34x) | 2.34x `neon` |
+| `hevc_encode_640x352_reconstruct` | 13.469 ms | 13.733 ms (0.98x) | 0.98x `neon` |
+| `hevc_encode_640x352_residual_write` | 34.563 ms | 33.620 ms (1.03x) | 1.03x `neon` |
+| `hevc_encode_640x352_rgba_to_yuv420` | 628.049 µs | 151.822 µs (4.14x) | 4.14x `neon` |
+| `hevc_encode_bitwriter` | 4.208 ms | 4.060 ms (1.04x) | 1.04x `neon` |
+| `hevc_encode_cabac` | 2.256 ms | 2.195 ms (1.03x) | 1.03x `neon` |
+| `hevc_inter_pred` | 24.460 ms | 20.344 ms (1.20x) | 1.20x `neon` |
+| `hevc_intra_pred` | 8.569 ms | 8.396 ms (1.02x) | 1.02x `neon` |
+| `hevc_inverse_transform` | 8.278 ms | 7.636 ms (1.08x) | 1.08x `neon` |
+| `hevc_sao` | 35.250 ms | 22.443 ms (1.57x) | 1.57x `neon` |
+
+### Reading the sub-parity rows
+
+An arm below `1.00x` is slower under its vector kernel than under scalar. Before
+treating one as a defect, note what three independent measurement sets of this
+same table did to the candidates:
+
+| Group | set 1 | set 2 | set 3 |
+| --- | ---: | ---: | ---: |
+| `hevc_intra_pred` | 0.62x | 1.04x | 1.09x |
+| `av1_intra_paeth` | 0.78x | 0.88x | 0.98x |
+| `av1_forward_dct_32x32` | 0.78x | 0.91x | 0.95x |
+
+No kernel changed between set 2 and set 3. What changed was the load average on
+the measuring host, and every candidate walked towards parity as the machine got
+quieter. **On this host, at this noise level, no arm is reliably below parity
+except the ones with no vector kernel at all** — `av1_encode_stage_symbol`,
+`av1_encode_stage_bitstream`, `hevc_cabac`, `hevc_encode_cabac`,
+`av1_entropy_symbol` and `hevc_color_convert`, where the two arms are the same
+code and differ only by measurement noise. Of those, `hevc_color_convert` is the
+one worth acting on, and `#219` already tracks vectorizing it.
+
+The rest of the near-parity rows are the story this file tells above: under
+`lto = "fat"` with `codegen-units = 1`, LLVM does to the scalar reference roughly
+what the hand kernel does, and the two land within noise of each other.
+
+This is the single most useful thing the committed table records. A one-off
+measurement of any of the three rows above would have looked like a broken
+kernel and sent someone rewriting code that was fine. It is also why the CI job
+compares medians rather than means, sets its threshold at a deliberately loose
+15%, and reports instead of failing: a shared runner is a noisier host than this
+one, not a quieter one.
+
+An arm being absent from a row means the host could not execute it, not that it
+was not measured: an Apple Silicon host has no `sse41` or `avx2` column at all,
+which is why the x86_64 arms do not appear here yet. `#228` covers measuring the
+x86_64 side.
+
 ## Fixtures
 
 `benches/support/` loads only fixtures already checked into the repository:
@@ -585,6 +829,85 @@ NEON arms of each group staying level with each other throughout, exactly as
 this section predicts. Output is byte-identical either way; `tests/hevc_
 bitstream_byte_identity.rs` pins the produced access units to digests captured
 from the pre-rewrite writer.
+### Why the CABAC arithmetic encoder stays serial
+
+`hevc_encode_cabac` reads flat under every instruction set and is expected to
+keep doing so. The §9.3.5 arithmetic encoder is serial by construction — each
+bin's renormalization reads the interval the previous bin left — so nothing
+vectorizes here and any speedup would have to come from a bin-parallel or
+speculative *algorithm*. It was measured to decide whether such an algorithm is
+worth its complexity. It is not, and this section is the record of why, so the
+question does not have to be re-derived.
+
+Two things were measured on an Apple Silicon host, both as the best of nine
+interleaved rounds per arm and reproduced across three separate runs, because
+this machine routinely runs several concurrent builds and a single run of
+anything on it is worth several times its own value in noise.
+
+**First, where a bin's time goes.** The same 262,144-bin mixed workload
+`hevc_encode_cabac` uses — alternating context-coded and bypass bins over 64
+context models — run through the shipped engine with its bit sink progressively
+removed:
+
+| Arm | Throughput | vs shipped |
+| --- | --- | --- |
+| the shipped engine, writing through `BitWriter` | 74.5 Mbin/s | 1.00x |
+| the same engine over a word-accumulating bit sink | 84.9 Mbin/s | 1.14x |
+| the same engine emitting no bits at all | 129.8 Mbin/s | 1.75x |
+| the per-context §9.3.4.3.2.2 state transitions alone | 275.5 Mbin/s | 3.70x |
+
+The last row is the ceiling on the whole question. A bin-parallel formulation
+attacks the interval arithmetic and the renormalization; the table prices making
+*all* of it, and every bit of output with it, entirely free at **3.7x** — and
+what is left over at that point is another serial dependence chain, because a
+context's state after bin *k* is what bin *k+1* codes against. Every one of
+those 3.7x has to be paid for in speculation, rollback, and the merging of
+per-segment carries and outstanding-bit runs, whose per-bin bookkeeping is
+comparable to the four table lookups and two shifts it would be replacing.
+
+**Second, what the stage is worth at the frame level.** Ablating the three
+CABAC entry points out of the access-unit writers at 640x352, so every other
+stage still runs:
+
+| Writer | Per access unit | CABAC's share | Bins per access unit |
+| --- | --- | --- | --- |
+| `encode_idr_pcm_au` (lossless) | 10.5–11.7 ms | 4–10% | 55,068 |
+| `encode_idr_residual_au` (lossy, QP 26) | 37.5–42.1 ms | 64–66% | 1,472,210 |
+
+For scale, the mode search over the same picture is 1.6–1.7 ms intra and
+39–42 ms inter per frame.
+
+This corrects the premise the question was filed under. On the lossless PCM path
+CABAC really is a rounding error — the bins are a few per coding unit and the
+other 90%+ of that writer is raw sample bytes going through the
+`put_bit`-at-a-time loop, which is the bitwriter's problem and not the arithmetic
+coder's. But on the lossy residual path the encoder gained in #227, CABAC is
+about **two thirds** of the access-unit write, so the stage is worth working on
+after all. What does not follow is that bin-parallelism is the way to work on
+it.
+
+**What to do instead.** Two ordinary serial changes take most of the reachable
+headroom, exactly, with no speculation:
+
+1. **Encode a bypass *run* in one step.** §9.3.5.5 unrolled over `n` bins is
+   `ivlLow = ( ivlLow << n ) + ivlCurrRange * value` followed by the same
+   carry-controlled emission of the top `n` bits, which is an identity rather
+   than an approximation: it was checked byte-identical against the
+   bin-at-a-time engine for every run length from 1 to 24, and measured
+   **1.73x** on a workload of runs (64.4–65.5 -> 110.5–113.4 Mbin/s). The lossy
+   writer's coefficient sign bits and Golomb-Rice suffixes are exactly such
+   runs, and **62%** of its bins are bypass bins. `hevc_encode_cabac` itself
+   would not move, because its bypass bins are single and interleaved with
+   context-coded ones by construction.
+2. **Widen the bit sink**, which the first table prices at 1.14x for this stage
+   on its own. That is the rewrite the `..._pcm_write` and
+   `hevc_encode_bitwriter` groups took, recorded above; the arithmetic encoder
+   keeps only the share of it that its own bit writing is worth.
+
+Neither is a bin-parallel algorithm, and neither changes a single bit of output.
+Whatever headroom a speculative formulation might still hold after both is
+smaller than the 3.7x ceiling above and costs far more to hold onto, which is
+why the arithmetic encoder stays serial.
 
 ## Per-stage access to the encoder
 

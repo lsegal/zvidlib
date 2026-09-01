@@ -86,6 +86,15 @@ pub use av1::{
     Av1ObuHeader, Av1ObuType, Av1OperatingPoint, Av1Parser, Av1SequenceHeader, Av1SyntaxSupport,
     Av1TileGroup,
 };
+/// Per-stage access to the native AV1 encoder for the criterion benchmark
+/// suite.
+///
+/// Internal and unstable, and the AV1 counterpart to [`hevc_encoder_bench`]:
+/// the encoder's forward WHT, symbol coder, tile encoder and bitstream writers
+/// are not otherwise reachable from a benchmark, which is a separate crate.
+/// See `benches/av1_encode.rs`.
+#[doc(hidden)]
+pub use av1_encoder::bench as av1_encoder_bench;
 pub use av1_encoder::native_av1_video_encoder_factory;
 pub use av1_encoder::transform::forward_transform;
 pub use av1_entropy::{AV1_CDF_MAX, Av1SymbolDecoder, validate_cdf};
