@@ -1132,8 +1132,10 @@ mod nonlossless_tests {
             "qindex,emitted_blocks,zero_skipped,reusable_emitted,emitted_coding_blocks,probing_size_searches,probes,distinct_probes,reachable,losing_size,losing_partition,unemitted_position,emitted_sizes"
         );
         for qindex in [32_u8, 160] {
-            let report = tile::FrameEncoder::new(&pixels, width, height, qindex).encode_with_report();
-            let distinct: std::collections::BTreeSet<_> = report.probe_keys.iter().copied().collect();
+            let report =
+                tile::FrameEncoder::new(&pixels, width, height, qindex).encode_with_report();
+            let distinct: std::collections::BTreeSet<_> =
+                report.probe_keys.iter().copied().collect();
             let (mut reachable, mut losing_size, mut losing_partition, mut unemitted) =
                 (0, 0, 0, 0);
             for &(x, y, size, prediction) in &distinct {

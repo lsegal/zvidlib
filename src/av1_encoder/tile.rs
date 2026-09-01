@@ -315,7 +315,6 @@ pub(crate) struct SearchReport {
 /// One transform type considered for a block, with everything the winner needs to be written:
 /// the `tx_type` symbol's index in its set, the quantized levels, the reconstructed residual,
 /// and the `sse + lambda * bits` cost the search minimizes.
-#[derive(Clone)]
 struct TxCandidate {
     symbol: usize,
     /// Only the trace the tests assert on reads this back; the bitstream carries `symbol`.
