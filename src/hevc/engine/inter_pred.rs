@@ -2078,7 +2078,7 @@ mod tests {
         let a = intermediates(41, kernel_len, 8);
         let b = intermediates(42, kernel_len, 8);
         let mut kernel_out = vec![0i32; kernel_len];
-        let mut kernel_best = vec![[f64::INFINITY; 2]; isas.len()];
+        let mut kernel_best = vec![[f64::INFINITY; 3]; isas.len()];
         for _ in 0..rounds {
             for (i, &isa) in isas.iter().enumerate() {
                 let taps8: [&[i32]; 8] = std::array::from_fn(|t| &a[t..t + kernel_len - 8]);
@@ -2095,6 +2095,29 @@ mod tests {
                 let taps = start.elapsed().as_secs_f64();
                 sink += kernel_out[0] as i64;
 
+                // The arm above passes the compile-time literal
+                // `LUMA_FILTER[2]`, which is not what §8.5.3.3.3 does: the
+                // block path indexes `LUMA_FILTER` by a runtime fractional
+                // position, so its coefficients are opaque to the optimizer.
+                // That difference is not cosmetic — it decides what the
+                // *scalar* baseline compiles to, and so what the vector
+                // backends are being compared against (issue #321). This arm
+                // is the same call with the coefficients hidden, which is the
+                // kernel-against-kernel comparison; the one above is the
+                // kernel against a loop LLVM was allowed to specialize.
+                let start = Instant::now();
+                for _ in 0..1024 {
+                    simd::filter_taps(
+                        isa,
+                        &taps8,
+                        std::hint::black_box(&LUMA_FILTER[2]),
+                        6,
+                        &mut kernel_out[..kernel_len - 8],
+                    );
+                }
+                let taps_opaque = start.elapsed().as_secs_f64();
+                sink += kernel_out[0] as i64;
+
                 let start = Instant::now();
                 for _ in 0..1024 {
                     simd::combine_weighted(isa, &[&a, &b], &[1, 1], 64, 7, 0, 255, &mut kernel_out);
@@ -2102,7 +2125,7 @@ mod tests {
                 let combine = start.elapsed().as_secs_f64();
                 sink += kernel_out[0] as i64;
 
-                for (slot, t) in kernel_best[i].iter_mut().zip([taps, combine]) {
+                for (slot, t) in kernel_best[i].iter_mut().zip([taps, taps_opaque, combine]) {
                     *slot = slot.min(t);
                 }
             }
@@ -2125,15 +2148,17 @@ mod tests {
         }
         println!("  kernels alone, {kernel_len} L1-resident samples x 1024 passes:");
         let kernel_baselines = kernel_best[0];
-        for (isa, [taps, combine]) in isas.iter().zip(kernel_best.iter().copied()) {
+        for (isa, [taps, taps_opaque, combine]) in isas.iter().zip(kernel_best.iter().copied()) {
             println!(
-                "  {:>8}  filter_taps 8-tap {:7.2} ms ({:4.2}x)  combine_weighted bi {:7.2} ms \
-                 ({:4.2}x)",
+                "  {:>8}  filter_taps 8-tap {:7.2} ms ({:4.2}x)  filter_taps 8-tap opaque coeffs \
+                 {:7.2} ms ({:4.2}x)  combine_weighted bi {:7.2} ms ({:4.2}x)",
                 format!("{isa:?}"),
                 taps * 1e3,
                 kernel_baselines[0] / taps,
+                taps_opaque * 1e3,
+                kernel_baselines[1] / taps_opaque,
                 combine * 1e3,
-                kernel_baselines[1] / combine,
+                kernel_baselines[2] / combine,
             );
         }
     }
