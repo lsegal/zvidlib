@@ -557,17 +557,18 @@ fn write_pcm_ctu(
     cabac.encode_decision(w, &mut ctxs.part_mode[0], 1);
     cabac.encode_terminate(w, 1);
     w.align_zero();
+    // `pcm_alignment_zero_bit` above leaves the writer byte-aligned and the
+    // samples are 8-bit, so each CTB row is a contiguous byte run the writer
+    // can copy in bulk instead of pushing through the bit accumulator.
     for j in 0..CTB {
-        for i in 0..CTB {
-            w.put_bits(u32::from(y[(y0 + j) * width + x0 + i]), 8);
-        }
+        let row = (y0 + j) * width + x0;
+        w.put_bytes(&y[row..row + CTB]);
     }
     let (cx, cy) = (x0 / 2, y0 / 2);
     for plane in [cb, cr] {
         for j in 0..CTB / 2 {
-            for i in 0..CTB / 2 {
-                w.put_bits(u32::from(plane[(cy + j) * cw + cx + i]), 8);
-            }
+            let row = (cy + j) * cw + cx;
+            w.put_bytes(&plane[row..row + CTB / 2]);
         }
     }
     cabac.reinit();
