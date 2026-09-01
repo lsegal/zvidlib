@@ -239,7 +239,9 @@ pub(crate) fn reconstruct_picture(
     }
 
     if cfg.sao_luma || cfg.sao_chroma {
-        let grid = estimate_sao(&pic, src, cfg);
+        // No §7.3.8.3 syntax is written for this reconstruction, so the
+        // decision is distortion-only.
+        let grid = estimate_sao(&pic, src, cfg.sao_luma, cfg.sao_chroma, 0);
         pic = crate::hevc::engine::sao::apply_sao_picture_full(
             pic,
             &grid,
@@ -540,100 +542,156 @@ pub(crate) fn deblock_reconstruction(recon: &mut ReconstructedPicture, qp: i32) 
 }
 
 /// The largest magnitude a `sao_offset_abs` can carry at 8-bit depth
-/// (§7.4.9.3: `(1 << (Min(bitDepth, 10) − 5)) − 1`).
-const SAO_OFFSET_MAX: i32 = 7;
+/// (§7.4.9.3: `(1 << (Min(bitDepth, 10) − 5)) − 1`), which is also the `cMax`
+/// of its Table 9-43 truncated-Rice binarization — `pub(crate)` so the writer
+/// codes against the same bound the search clamps to.
+pub(crate) const SAO_OFFSET_MAX: i32 = 7;
+
+/// §8.7.3 — estimate SAO parameters for a finished, already-deblocked
+/// reconstruction, apply them in place, and return the per-CTB grid the
+/// writer has to code as §7.3.8.3 syntax.
+///
+/// The counterpart of [`deblock_reconstruction`] for the second in-loop
+/// filter, and run after it: §8.7.1 orders SAO behind deblocking, and the
+/// parameter search is only meaningful against the samples SAO will actually
+/// see. Like deblocking it is a whole-picture pass, because §8.4.4.2.2 intra
+/// prediction reads the *unfiltered* neighbours — the grid returned here
+/// describes the picture's output, never this picture's own prediction input.
+///
+/// `lambda_q8` is passed through to [`estimate_sao`], which is what makes the
+/// per-CTB decision charge for the syntax the caller then writes.
+pub(crate) fn sao_reconstruction(
+    recon: &mut ReconstructedPicture,
+    src: SourcePlanes<'_>,
+    lambda_q8: u32,
+) -> Vec<ResolvedSao> {
+    let (width, height) = (recon.width, recon.height);
+    let mut pic = Picture::new(width, height, CHROMA_ARRAY_TYPE, BIT_DEPTH, BIT_DEPTH);
+    for (plane, samples) in [
+        (Plane::Luma, &recon.y),
+        (Plane::Cb, &recon.cb),
+        (Plane::Cr, &recon.cr),
+    ] {
+        let (buf, _) = pic.plane_mut(plane);
+        for (dst, &src) in buf.iter_mut().zip(samples) {
+            *dst = i32::from(src);
+        }
+    }
+    let grid = estimate_sao(&pic, src, true, true, lambda_q8);
+    let pic = crate::hevc::engine::sao::apply_sao_picture_full(
+        pic,
+        &grid,
+        CTB_LOG2,
+        CHROMA_ARRAY_TYPE,
+        true,
+        true,
+        None,
+        None,
+    );
+    recon.y = plane_to_u8(&pic, Plane::Luma);
+    recon.cb = plane_to_u8(&pic, Plane::Cb);
+    recon.cr = plane_to_u8(&pic, Plane::Cr);
+    grid
+}
 
 /// Encoder-side §7.3.8.3 SAO parameter estimation.
 ///
-/// For each CTB and each component this picks the edge-offset class whose
-/// per-category mean error between the source and the deblocked reconstruction
-/// reduces the sum of squared errors the most, and leaves SAO off for that CTB
-/// when no class does. The offsets are the per-category mean errors clamped to
-/// the signalable range with the §7.4.9.3 inferred edge-offset signs
+/// For each CTB this picks the edge-offset class whose per-category mean error
+/// between the source and the deblocked reconstruction reduces the sum of
+/// squared errors the most, and leaves SAO off for that CTB when no class
+/// earns its own syntax. The offsets are the per-category mean errors clamped
+/// to the signalable range with the §7.4.9.3 inferred edge-offset signs
 /// (categories 1 and 2 positive, 3 and 4 negative), which is the standard
 /// least-squares choice for edge offset and the reason this stage is worth
 /// measuring: it reads every reconstructed sample of the picture once per
 /// candidate class.
-fn estimate_sao(pic: &Picture, src: SourcePlanes<'_>, cfg: ReconConfig) -> Vec<ResolvedSao> {
+///
+/// The two chroma components are decided *together*, on the summed gain of one
+/// shared class, because §7.4.9.3 infers `SaoTypeIdx[2]` and `SaoEoClass[2]`
+/// from cIdx 1: a Cb and a Cr that picked different classes are not a
+/// bitstream. Each still carries its own four offsets, which is the whole of
+/// what the syntax gives cIdx 2 of its own.
+///
+/// `lambda_q8` is the §9 rate-distortion multiplier in 1/256 units, matching
+/// [`crate::hevc::engine::encoder::rdo::lambda_q8`]. SAO costs per-CTB syntax
+/// on every CTB it is enabled for, so a class is taken only when its SSE
+/// reduction clears `lambda * bins`, the bins being the §9.3.3 binarization's
+/// own count for the parameters that would be coded. At `lambda_q8 == 0` the
+/// test degrades to "any reduction at all", which is what a caller that codes
+/// no syntax for the decision wants.
+fn estimate_sao(
+    pic: &Picture,
+    src: SourcePlanes<'_>,
+    sao_luma: bool,
+    sao_chroma: bool,
+    lambda_q8: u32,
+) -> Vec<ResolvedSao> {
     let w_ctbs = src.width.div_ceil(CTB);
     let h_ctbs = src.height.div_ceil(CTB);
     let mut grid = vec![ResolvedSao::off(); w_ctbs * h_ctbs];
-    let components: [(Plane, &[u8], bool); 3] = [
-        (Plane::Luma, src.y, cfg.sao_luma),
-        (Plane::Cb, src.cb, cfg.sao_chroma),
-        (Plane::Cr, src.cr, cfg.sao_chroma),
-    ];
-    for (c_idx, (plane, source, enabled)) in components.into_iter().enumerate() {
-        if !enabled {
-            continue;
-        }
-        let (pw, ph) = pic.plane_dims(plane);
-        let step = if plane == Plane::Luma { CTB } else { CTB / 2 };
-        for ry in 0..h_ctbs {
-            for rx in 0..w_ctbs {
-                let (x0, y0) = (rx * step, ry * step);
-                let (x1, y1) = ((x0 + step).min(pw), (y0 + step).min(ph));
-                grid[ry * w_ctbs + rx].components[c_idx] =
-                    best_edge_offset(pic, plane, source, pw, x0, y0, x1, y1);
+    for ry in 0..h_ctbs {
+        for rx in 0..w_ctbs {
+            let cell = &mut grid[ry * w_ctbs + rx];
+            if sao_luma {
+                cell.components[0] = best_luma_edge_offset(pic, src, rx, ry, lambda_q8);
+            }
+            if sao_chroma {
+                let [cb, cr] = best_chroma_edge_offset(pic, src, rx, ry, lambda_q8);
+                cell.components[1] = cb;
+                cell.components[2] = cr;
             }
         }
     }
     grid
 }
 
-/// The best §8.7.3.2 edge-offset component for one CTB of one plane, or an
-/// off component when none of the four classes reduces the distortion.
-#[allow(clippy::too_many_arguments)]
-fn best_edge_offset(
-    pic: &Picture,
-    plane: Plane,
-    source: &[u8],
-    src_stride: usize,
-    x0: usize,
-    y0: usize,
-    x1: usize,
-    y1: usize,
-) -> ResolvedSaoComponent {
+/// The CTB at `(rx, ry)` as a half-open rectangle in one plane's own sample
+/// grid, clipped to the plane.
+fn ctb_rect(pic: &Picture, plane: Plane, rx: usize, ry: usize) -> (usize, usize, usize, usize) {
     let (pw, ph) = pic.plane_dims(plane);
-    let samples = pic.plane(plane);
+    let step = if plane == Plane::Luma { CTB } else { CTB / 2 };
+    let (x0, y0) = (rx * step, ry * step);
+    (x0, y0, (x0 + step).min(pw), (y0 + step).min(ph))
+}
+
+/// The §9.3.3 bin count of the four `sao_offset_abs` values of one component —
+/// Table 9-43 TR with `cMax == 7` and `cRiceParam == 0`, i.e. truncated unary.
+fn offset_abs_bins(offsets: &[i32; 5]) -> u64 {
+    offsets[1..5]
+        .iter()
+        .map(|&o| {
+            let v = u64::from(o.unsigned_abs()).min(SAO_OFFSET_MAX as u64);
+            if v < SAO_OFFSET_MAX as u64 { v + 1 } else { v }
+        })
+        .sum()
+}
+
+/// Whether an SSE reduction of `gain` is worth the `bins` of §7.3.8.3 syntax
+/// it has to be signalled with, under the same `D + lambda * R` cost the mode
+/// decision uses.
+fn clears_its_rate(gain: i64, bins: u64, lambda_q8: u32) -> bool {
+    gain > (bins * u64::from(lambda_q8) / 256) as i64
+}
+
+/// The best §8.7.3.2 edge-offset component for the luma of one CTB, or an off
+/// component when no class earns the `sao_type_idx` + `sao_eo_class_luma` +
+/// four `sao_offset_abs` it would be coded with.
+fn best_luma_edge_offset(
+    pic: &Picture,
+    src: SourcePlanes<'_>,
+    rx: usize,
+    ry: usize,
+    lambda_q8: u32,
+) -> ResolvedSaoComponent {
+    let rect = ctb_rect(pic, Plane::Luma, rx, ry);
     let mut best = ResolvedSaoComponent::off();
     let mut best_gain = 0i64;
     for eo_class in 0..4u8 {
-        let (h0, v0, h1, v1) = crate::hevc::engine::sao::eo_pos(eo_class);
-        // Per §8.7.3.2 category (1..4), the summed and counted error.
-        let mut sums = [0i64; 5];
-        let mut counts = [0i64; 5];
-        for y in y0..y1 {
-            for x in x0..x1 {
-                let Some(category) = edge_category(samples, pw, ph, x, y, h0, v0, h1, v1) else {
-                    continue;
-                };
-                let error = i64::from(source[y * src_stride + x]) - i64::from(samples[y * pw + x]);
-                sums[category] += error;
-                counts[category] += 1;
-            }
-        }
-        let mut offsets = [0i32; 5];
-        let mut gain = 0i64;
-        for category in 1..5 {
-            if counts[category] == 0 {
-                continue;
-            }
-            let mean = div_round(sums[category], counts[category]);
-            // §7.4.9.3 infers the sign per category, so a mean that points the
-            // other way is not signalable and the offset stays 0.
-            let offset = if category <= 2 {
-                mean.clamp(0, SAO_OFFSET_MAX)
-            } else {
-                mean.clamp(-SAO_OFFSET_MAX, 0)
-            };
-            offsets[category] = offset;
-            // The SSE reduction of adding a constant `o` to `n` samples whose
-            // summed error is `s`: 2*o*s − n*o^2.
-            gain += 2 * i64::from(offset) * sums[category]
-                - counts[category] * i64::from(offset) * i64::from(offset);
-        }
-        if gain > best_gain {
+        let (gain, offsets) = class_offsets(pic, Plane::Luma, src.y, src.width, rect, eo_class);
+        // One `sao_type_idx_luma` bin beyond the "off" bin, two
+        // `sao_eo_class_luma` bins, and the offsets' own.
+        let bins = 1 + 2 + offset_abs_bins(&offsets);
+        if gain > best_gain && clears_its_rate(gain, bins, lambda_q8) {
             best_gain = gain;
             best = ResolvedSaoComponent {
                 sao_type_idx: 2,
@@ -644,6 +702,103 @@ fn best_edge_offset(
         }
     }
     best
+}
+
+/// The best §8.7.3.2 edge-offset components for the Cb and Cr of one CTB,
+/// sharing the one class the §7.4.9.3 inference leaves them.
+fn best_chroma_edge_offset(
+    pic: &Picture,
+    src: SourcePlanes<'_>,
+    rx: usize,
+    ry: usize,
+    lambda_q8: u32,
+) -> [ResolvedSaoComponent; 2] {
+    let (cb_rect, cr_rect) = (
+        ctb_rect(pic, Plane::Cb, rx, ry),
+        ctb_rect(pic, Plane::Cr, rx, ry),
+    );
+    let chroma_stride = src.width / 2;
+    let mut best = [ResolvedSaoComponent::off(); 2];
+    let mut best_gain = 0i64;
+    for eo_class in 0..4u8 {
+        let (cb_gain, cb_offsets) =
+            class_offsets(pic, Plane::Cb, src.cb, chroma_stride, cb_rect, eo_class);
+        let (cr_gain, cr_offsets) =
+            class_offsets(pic, Plane::Cr, src.cr, chroma_stride, cr_rect, eo_class);
+        let gain = cb_gain + cr_gain;
+        // One `sao_type_idx_chroma` bin beyond the "off" bin, two
+        // `sao_eo_class_chroma` bins, and both components' offsets — cIdx 2
+        // codes neither a type nor a class of its own.
+        let bins = 1 + 2 + offset_abs_bins(&cb_offsets) + offset_abs_bins(&cr_offsets);
+        if gain > best_gain && clears_its_rate(gain, bins, lambda_q8) {
+            best_gain = gain;
+            best = [
+                ResolvedSaoComponent {
+                    sao_type_idx: 2,
+                    offset_val: cb_offsets,
+                    band_position: 0,
+                    eo_class,
+                },
+                ResolvedSaoComponent {
+                    sao_type_idx: 2,
+                    offset_val: cr_offsets,
+                    band_position: 0,
+                    eo_class,
+                },
+            ];
+        }
+    }
+    best
+}
+
+/// The §7.4.9.3 offsets one edge-offset class would take on one CTB of one
+/// plane, and the SSE reduction they buy.
+fn class_offsets(
+    pic: &Picture,
+    plane: Plane,
+    source: &[u8],
+    src_stride: usize,
+    rect: (usize, usize, usize, usize),
+    eo_class: u8,
+) -> (i64, [i32; 5]) {
+    let (x0, y0, x1, y1) = rect;
+    let (pw, ph) = pic.plane_dims(plane);
+    let samples = pic.plane(plane);
+    let (h0, v0, h1, v1) = crate::hevc::engine::sao::eo_pos(eo_class);
+    // Per §8.7.3.2 category (1..4), the summed and counted error.
+    let mut sums = [0i64; 5];
+    let mut counts = [0i64; 5];
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let Some(category) = edge_category(samples, pw, ph, x, y, h0, v0, h1, v1) else {
+                continue;
+            };
+            let error = i64::from(source[y * src_stride + x]) - i64::from(samples[y * pw + x]);
+            sums[category] += error;
+            counts[category] += 1;
+        }
+    }
+    let mut offsets = [0i32; 5];
+    let mut gain = 0i64;
+    for category in 1..5 {
+        if counts[category] == 0 {
+            continue;
+        }
+        let mean = div_round(sums[category], counts[category]);
+        // §7.4.9.3 infers the sign per category, so a mean that points the
+        // other way is not signalable and the offset stays 0.
+        let offset = if category <= 2 {
+            mean.clamp(0, SAO_OFFSET_MAX)
+        } else {
+            mean.clamp(-SAO_OFFSET_MAX, 0)
+        };
+        offsets[category] = offset;
+        // The SSE reduction of adding a constant `o` to `n` samples whose
+        // summed error is `s`: 2*o*s − n*o^2.
+        gain += 2 * i64::from(offset) * sums[category]
+            - counts[category] * i64::from(offset) * i64::from(offset);
+    }
+    (gain, offsets)
 }
 
 /// §8.7.3.2 `edgeIdx` remapped to the `SaoOffsetVal` category index
