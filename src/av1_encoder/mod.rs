@@ -612,6 +612,81 @@ mod nonlossless_tests {
             .collect()
     }
 
+    /// Deterministic 32-bit LCG, so a generated frame is the same on every host and run.
+    fn lcg(state: &mut u32) -> u32 {
+        *state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        *state
+    }
+
+    /// Frames whose content statistics differ sharply from [`test_pattern`], which is the single
+    /// frame the transform-gain sampling interval was originally calibrated on.
+    ///
+    /// The point of the set is *variation*, not difficulty: the sampled estimator reuses one
+    /// frame's accumulated per-size gain ratio across the blocks it does not probe, so it is
+    /// safe exactly while that ratio is stable over a frame. `quadrants` and `scene_edge` are
+    /// the frames where it is not - their halves have deliberately unrelated statistics - and
+    /// `noise`, `smooth` and `diagonals` pin the stationary extremes on either side of
+    /// `test_pattern`.
+    fn content_frames(width: u32, height: u32) -> Vec<(&'static str, Vec<u8>)> {
+        let pixel = |f: &dyn Fn(u32, u32) -> u8| -> Vec<u8> {
+            (0..height)
+                .flat_map(|y| (0..width).map(move |x| f(x, y)).collect::<Vec<_>>())
+                .collect()
+        };
+        // Full-range noise: no correlation for any transform to compact, so every size's type
+        // gain is near zero and the ratio is measured off very small differences.
+        let mut state = 0x1234_5678_u32;
+        let noise: Vec<u8> = (0..width * height)
+            .map(|_| (lcg(&mut state) >> 24) as u8)
+            .collect();
+        // Smooth: a slowly varying surface the largest transforms code almost for free.
+        let smooth = pixel(&|x, y| (110 + (x * 3 + y * 2) / 5 % 40) as u8);
+        // Diagonals: strongly directional edges, which is where the non-DCT types in the set
+        // earn their keep and the gain ratio is at its largest.
+        let diagonals = pixel(&|x, y| if (x + y) % 12 < 6 { 30 } else { 220 });
+        // Quadrants: four unrelated statistics in one frame, so the frame-wide accumulated ratio
+        // is never representative of the quadrant a block is in.
+        let mut quad_state = 0x9E37_79B9_u32;
+        let quadrants: Vec<u8> = (0..height)
+            .flat_map(|y| {
+                let mut row = Vec::with_capacity(width as usize);
+                for x in 0..width {
+                    let left = x < width / 2;
+                    let top = y < height / 2;
+                    row.push(match (top, left) {
+                        (true, true) => 128, // flat
+                        (true, false) => {
+                            if x % 8 < 4 {
+                                40
+                            } else {
+                                200
+                            }
+                        } // vertical stripes
+                        (false, true) => (16 + (x + y) % 224) as u8, // ramp
+                        (false, false) => (lcg(&mut quad_state) >> 24) as u8, // noise
+                    });
+                }
+                row
+            })
+            .collect();
+        // Scene edge: a low-contrast textured region meeting a high-frequency synthetic one at a
+        // hard horizontal boundary, the case a frame-wide ratio is least able to represent.
+        let scene_edge = pixel(&|x, y| {
+            if y < height * 3 / 5 {
+                (100 + ((x * 5 + y * 3) % 17)) as u8
+            } else {
+                (((x / 2) ^ (y / 2)) % 2 * 255) as u8
+            }
+        });
+        vec![
+            ("noise", noise),
+            ("smooth", smooth),
+            ("diagonals", diagonals),
+            ("quadrants", quadrants),
+            ("scene_edge", scene_edge),
+        ]
+    }
+
     fn encode(width: u32, height: u32, qindex: u8, pixels: &[u8]) -> Vec<u8> {
         let limits = Limits::default();
         let dimensions = VideoDimensions::new(width, height, &limits).unwrap();
@@ -855,10 +930,10 @@ mod nonlossless_tests {
     /// These are constants of the format, not of the machine that produced them: regenerate them
     /// only alongside a deliberate change to what the encoder emits, never to make a host pass.
     const FIXED_FRAME_DIGESTS: [(usize, u64); 6] = [
-        (5421, 0x2f47_5919_07ef_56f2),
-        (4289, 0xa74c_990b_3340_f8ce),
-        (3005, 0xcd2f_1c69_1785_039e),
-        (2214, 0xc7e0_a641_51f5_70e4),
+        (5417, 0x7b83_6e95_6bad_aae1),
+        (4298, 0xa4c4_6a5e_8ef1_57c0),
+        (3022, 0xba87_1a3d_44c1_4f33),
+        (2238, 0xc29d_7d70_a472_3158),
         (1264, 0xc8cd_fcf5_8882_a86c),
         (752, 0x73f1_c047_f3cf_211f),
     ];
@@ -976,6 +1051,185 @@ mod nonlossless_tests {
                 .collect();
         assert_eq!(sizes(&exhaustively_covered), sizes(&emittable));
         assert_eq!(types(&exhaustively_covered), types(&emittable));
+    }
+
+    #[test]
+    #[ignore = "measurement sweep, not an assertion"]
+    fn measure_type_gain_sampling_intervals() {
+        let (width, height) = (192_usize, 160_usize);
+        let mut frames = content_frames(width as u32, height as u32);
+        frames.push(("test_pattern", test_pattern(width as u32, height as u32)));
+        let quality = |report: &tile::SearchReport, pixels: &[u8]| {
+            let reconstruction: Vec<u8> = (0..height)
+                .flat_map(|row| report.reconstruction[row * report.coded_width..][..width].to_vec())
+                .collect();
+            psnr(pixels, &reconstruction)
+        };
+        let sse = |report: &tile::SearchReport, pixels: &[u8]| -> i64 {
+            (0..height)
+                .flat_map(|row| {
+                    report.reconstruction[row * report.coded_width..][..width]
+                        .iter()
+                        .enumerate()
+                        .map(move |(column, &value)| (row * width + column, value))
+                })
+                .map(|(index, value)| {
+                    let error = i64::from(i32::from(pixels[index]) - i32::from(value));
+                    error * error
+                })
+                .sum()
+        };
+        println!(
+            "frame,qindex,interval,fast_psnr,exhaustive_psnr,fast_bytes,exh_bytes,candidates,lambda,fast_rd,exh_rd"
+        );
+        for (name, pixels) in &frames {
+            for qindex in [1_u8, 8, 32, 80, 160, 200] {
+                let ac = i64::from(crate::av1_intra::get_ac_quant(qindex));
+                let lambda = (ac * ac / 256).max(1);
+                let exhaustive = tile::FrameEncoder::new(pixels, width, height, qindex)
+                    .without_search_shortcuts()
+                    .encode_with_report();
+                let exh_psnr = quality(&exhaustive, pixels);
+                let exh_rd = sse(&exhaustive, pixels) + lambda * exhaustive.tile.len() as i64 * 8;
+                for interval in [1_usize, 2, 3, 4, 6, 8, 12, 16, 24, 32, 64] {
+                    let fast = tile::FrameEncoder::new(pixels, width, height, qindex)
+                        .with_type_gain_interval(interval)
+                        .encode_with_report();
+                    let fast_rd = sse(&fast, pixels) + lambda * fast.tile.len() as i64 * 8;
+                    println!(
+                        "{name},{qindex},{interval},{:.4},{exh_psnr:.4},{},{},{},{lambda},{fast_rd},{exh_rd}",
+                        quality(&fast, pixels),
+                        fast.tile.len(),
+                        exhaustive.tile.len(),
+                        fast.candidates_evaluated,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "measurement sweep, not an assertion"]
+    fn measure_type_gain_sampling_cost() {
+        use std::time::Instant;
+        let (width, height) = (192_usize, 160_usize);
+        let mut frames = content_frames(width as u32, height as u32);
+        frames.push(("test_pattern", test_pattern(width as u32, height as u32)));
+        let intervals = [1_usize, 2, 4, 8, 16];
+        let mut best = std::collections::BTreeMap::new();
+        let mut candidates = std::collections::BTreeMap::new();
+        let mut exhaustive_candidates = 0_u64;
+        let mut exhaustive_best = f64::MAX;
+        // Interleaved rounds with the minimum taken per arm: a single pass would attribute this
+        // host's own load to whichever arm happened to run under it.
+        for _ in 0..5 {
+            for interval in intervals {
+                let start = Instant::now();
+                let mut total = 0_u64;
+                for (_, pixels) in &frames {
+                    for qindex in [1_u8, 8, 32, 80, 160, 200] {
+                        let report = tile::FrameEncoder::new(pixels, width, height, qindex)
+                            .with_type_gain_interval(interval)
+                            .encode_with_report();
+                        total += report.candidates_evaluated;
+                    }
+                }
+                let elapsed = start.elapsed().as_secs_f64();
+                let slot = best.entry(interval).or_insert(f64::MAX);
+                *slot = slot.min(elapsed);
+                candidates.insert(interval, total);
+            }
+            let start = Instant::now();
+            let mut total = 0_u64;
+            for (_, pixels) in &frames {
+                for qindex in [1_u8, 8, 32, 80, 160, 200] {
+                    let report = tile::FrameEncoder::new(pixels, width, height, qindex)
+                        .without_search_shortcuts()
+                        .encode_with_report();
+                    total += report.candidates_evaluated;
+                }
+            }
+            exhaustive_best = exhaustive_best.min(start.elapsed().as_secs_f64());
+            exhaustive_candidates = total;
+        }
+        println!("interval,seconds,candidates");
+        for interval in intervals {
+            println!(
+                "{interval},{:.4},{}",
+                best[&interval], candidates[&interval]
+            );
+        }
+        println!("exhaustive,{exhaustive_best:.4},{exhaustive_candidates}");
+    }
+
+    /// What the sampled transform-gain estimator costs on content it was not tuned on.
+    ///
+    /// `TYPE_GAIN_SAMPLE_INTERVAL` probes one coding block's size search in every `n` and
+    /// corrects the rest from the frame's accumulated per-size ratio, which is only representative
+    /// while the frame's content is. `test_pattern` at 96x80 - the frame the interval was
+    /// originally chosen on - cannot see the difference: every interval from 1 to 16 lands within
+    /// 0.03% of the unsampled estimator there, which is why this runs on a set of frames with
+    /// deliberately unlike statistics at a size large enough for the accumulated ratio to drift.
+    ///
+    /// The comparison is against the *same* estimator probing every size search, not against the
+    /// exhaustive search: that isolates what the sampling costs from what the other shortcuts do.
+    /// Cost is the encoder's own `sse + lambda * bits` at equal quantizer, and the ceilings are
+    /// the measured penalties with margin. They are not aspirations - each one is under what the
+    /// previous interval of 8 measured on the same frame (`scene_edge` +55.5%, `smooth` +4.4%,
+    /// `test_pattern` +2.1%), so a regression of the constant fails here on three frames rather
+    /// than passing unnoticed as it did on 96x80 alone.
+    ///
+    /// `scene_edge`'s remaining 30% is the estimator mixing two regions' statistics rather than
+    /// the sampling rate - every interval from 2 to 4 measures the same penalty on it - and is
+    /// tracked separately.
+    #[test]
+    fn the_type_gain_sampling_interval_holds_on_content_it_was_not_tuned_on() {
+        let (width, height) = (128_usize, 96_usize);
+        let mut frames = content_frames(width as u32, height as u32);
+        frames.push(("test_pattern", test_pattern(width as u32, height as u32)));
+        let ceilings = std::collections::BTreeMap::from([
+            ("noise", 1.0),
+            ("smooth", 2.5),
+            ("diagonals", 1.0),
+            ("quadrants", 1.0),
+            ("scene_edge", 40.0),
+            ("test_pattern", 1.0),
+        ]);
+        let sse = |report: &tile::SearchReport, pixels: &[u8]| -> i64 {
+            (0..height)
+                .flat_map(|row| {
+                    report.reconstruction[row * report.coded_width..][..width]
+                        .iter()
+                        .enumerate()
+                        .map(move |(column, &value)| (row * width + column, value))
+                })
+                .map(|(index, value)| {
+                    let error = i64::from(i32::from(pixels[index]) - i32::from(value));
+                    error * error
+                })
+                .sum()
+        };
+        for (name, pixels) in &frames {
+            let ceiling = ceilings[name];
+            for qindex in [1_u8, 8, 32, 80, 160, 200] {
+                let ac = i64::from(crate::av1_intra::get_ac_quant(qindex));
+                let lambda = (ac * ac / 256).max(1);
+                let cost = |interval: usize| {
+                    let report = tile::FrameEncoder::new(pixels, width, height, qindex)
+                        .with_type_gain_interval(interval)
+                        .encode_with_report();
+                    sse(&report, pixels) + lambda * report.tile.len() as i64 * 8
+                };
+                let sampled = cost(tile::TYPE_GAIN_SAMPLE_INTERVAL);
+                let unsampled = cost(1);
+                let penalty = sampled as f64 / unsampled as f64 * 100.0 - 100.0;
+                assert!(
+                    penalty <= ceiling,
+                    "{name} at qindex {qindex} cost {sampled} against the unsampled estimator's \
+                     {unsampled} ({penalty:+.2}%), past the {ceiling}% this frame is allowed"
+                );
+            }
+        }
     }
 
     /// The stated bound on what the search shortcuts cost.
