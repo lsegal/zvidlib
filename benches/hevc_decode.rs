@@ -65,7 +65,7 @@ use zvidlib::{
     CancellationToken, ExactFrameReader, FrameIndex, Limits, native_hevc_video_decoder_factory,
 };
 
-use support::isa::{IsaWorkload, bench_across_isas};
+use support::isa::{IsaWorkload, bench_across_isas, log_host_isas};
 use support::{FrameWork, group_name, report_throughput};
 
 /// Environment variable that opts into the long-running 1080p groups.
@@ -326,6 +326,7 @@ fn hevc_cabac_by_isa(criterion: &mut Criterion) {
 
 criterion_group!(
     benches,
+    log_host_isas,
     hevc_decode_1080p,
     hevc_decode_by_isa,
     hevc_decode_to_picture_by_isa,
