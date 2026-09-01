@@ -1311,11 +1311,9 @@ impl<'a> FrameEncoder<'a> {
                     (extra >> (nbits - 1)) & 1,
                     cdf::eob_extra_cdf(qctx, tx_ctx, ptype, eobpt - 3),
                 );
-                let mut i = nbits as isize - 2;
-                while i >= 0 {
-                    self.sym.encode_literal(((extra >> i) & 1) as u32, 1);
-                    i -= 1;
-                }
+                // The remaining `nbits - 1` bits are equiprobable literals in MSB-first order,
+                // which is one literal run rather than one call per bit.
+                self.sym.encode_literal(extra as u32, nbits as u32 - 1);
             }
         }
 
@@ -1642,13 +1640,15 @@ fn coeff_br_ctx(pos: usize, levels: &[i32], size: usize) -> usize {
 /// Exp-Golomb tail used for coefficient magnitudes above the base-range cap (§5.11.39).
 fn golomb(sym: &mut SymbolEncoder, x: u32) {
     let len = 32 - x.leading_zeros(); // bit length, x >= 1
-    for _ in 0..(len - 1) {
-        sym.encode_literal(0, 1);
-    }
-    sym.encode_literal(1, 1);
-    let mut i = len as isize - 2;
-    while i >= 0 {
-        sym.encode_literal((x >> i) & 1, 1);
-        i -= 1;
+    // The code is `len - 1` zeros followed by `x` itself in `len` bits, and `x`'s top bit is set,
+    // so the whole thing is `x` written as one `2 * len - 1`-bit literal: the leading zeros are
+    // just the field's own padding. That is one literal run instead of `2 * len - 1` single-bit
+    // calls whenever the field fits in a `u32`.
+    let bits = 2 * len - 1;
+    if bits <= 32 {
+        sym.encode_literal(x, bits);
+    } else {
+        sym.encode_literal(0, len - 1);
+        sym.encode_literal(x, len);
     }
 }
