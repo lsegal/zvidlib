@@ -75,89 +75,68 @@ const TYPE_GAIN_PROBES: usize = 1;
 ///
 /// The ratio is only stable frame-wide while the frame's content is, and the reuse is what costs
 /// accuracy when it is not: a block corrected by a ratio measured in a region unlike its own can
-/// have two close sizes ranked the wrong way round. `2` is where that trade was measured out, on
-/// the six-frame set in `measure_type_gain_sampling_intervals` at 192x160 - a hard scene edge, a
-/// four-quadrant frame, full-range noise, a smooth surface, directional edges, and the encoder's
-/// own `test_pattern` - against the same estimator probing every size search, which is the
-/// unsampled search this interval approximates. Cost is the encoder's own `sse + lambda * bits`,
-/// summed over the frame and compared at equal quantizer:
+/// have two close sizes ranked the wrong way round. That used to be what bounded this constant
+/// from above. It is not any more, and `8` is chosen from a different column than the one that
+/// first set it.
+///
+/// Re-measured with [`TYPE_GAIN_TRUST`] in force, on the eight-frame set in
+/// `measure_type_gain_sampling_intervals` - a hard scene edge, a four-quadrant frame, full-range
+/// noise, a smooth surface, directional edges, bands, a mosaic, and the encoder's own
+/// `test_pattern` - at 192x160 and at the 128x96 the ceilings below are set from, against the
+/// same estimator probing every size search. Cost is the encoder's own `sse + lambda * bits`,
+/// summed over the frame and compared at equal quantizer; times are the minimum of five
+/// interleaved rounds per arm in `measure_type_gain_sampling_cost`, and candidates are the
+/// 192x160 set's:
 ///
 /// | interval | worst penalty vs unsampled | mean vs exhaustive | candidates | time |
 /// |---------:|---------------------------:|-------------------:|-----------:|--------:|
-/// | 1        | 0.0%                       | +0.25%             | 181,557    | 0.644 s |
-/// | 2        | +44.1%                     | +1.05%             | 155,143    | 0.607 s |
-/// | 4        | +64.6%                     | +1.70%             | 142,372    | 0.574 s |
-/// | 8        | +78.7%                     | +1.97%             | 136,250    | 0.565 s |
-/// | 16       | +85.8%                     | +2.29%             | 128,035    | 0.557 s |
+/// | 1        | 0.0%                       | +0.19%             | 243,694    | 0.640 s |
+/// | 2        | +1.3%                      | -0.36%             | 203,477    | 0.587 s |
+/// | 4        | +3.5%                      | -0.42%             | 183,677    | 0.563 s |
+/// | 8        | +3.4%                      | -0.41%             | 174,638    | 0.549 s |
+/// | 16       | +1.5%                      | -0.55%             | 167,546    | 0.542 s |
 ///
-/// Every worst case is the same frame and quantizer - the hard scene edge at `qindex` 160, whose
-/// two halves have unrelated statistics - and the original value of `8` carried nearly twice
-/// the error there against `2` while saving 7% of the encode. `1` is not the value because it
-/// evaluates 181,557 transform-type candidates against the exhaustive search's 700,004, which
-/// no longer clears the
-/// four-fold reduction the shortcuts exist for and
-/// `the_search_shortcuts_stay_within_their_rate_and_distortion_bound` asserts; `2` clears it with
-/// 155,143. What remains at `2` is the estimator mixing statistics across regions rather than the
-/// sampling rate, which no interval fixes; [`TYPE_GAIN_MEMORY`] is what addresses that, and the
-/// worst-penalty column above is the frame-wide accumulation it replaced.
-pub(super) const TYPE_GAIN_SAMPLE_INTERVAL: usize = 2;
-
-/// Probes a transform size's accumulated gain ratio remembers, as the window of an exponential
-/// recency weighting.
+/// The penalty column no longer chooses. Under the frame-wide accumulation this interval was
+/// calibrated against it ran +44.1% at `2` and +85.8% at `16`, which is what kept the value
+/// small; shrinking a remembered ratio to [`TYPE_GAIN_TRUST`] sixteenths collapsed it, and every
+/// interval from `1` to `64` now lands within +3.5% of the unsampled estimator across both sizes.
+/// What is left is not even monotone - `3` and `4` cost more than `8` and `16` do - because at
+/// this magnitude which neighbourhood a block reads back comes down to where its probes happened
+/// to fall. The mean against the exhaustive search is *negative* at every interval past `1`: on
+/// this set the sampled estimator reconstructs at slightly better rate-distortion than probing
+/// every size search. That is [`TYPE_GAIN_TRUST`] rather than the sampling - a trial that probes
+/// is corrected in full, so interval `1` is the un-shrunk correction on every trial and measures
+/// *worse* than the exhaustive search; see the decomposition under that constant. It also means
+/// the unsampled estimator this column is taken against is not a strict upper bound on quality.
 ///
-/// The ratio a probe measures is a property of the *content around the block it was measured on*,
-/// not of the frame: on a frame whose statistics change across it, a block corrected by a ratio
-/// measured on the other side of that change can have two close sizes ranked the wrong way round.
-/// Accumulating every probe of a size equally over the whole frame is what made the correction
-/// frame-wide, and #266 established that no [`TYPE_GAIN_SAMPLE_INTERVAL`] fixes it - `2`, `3` and
-/// `4` all carry the same penalty, because re-measuring more often does not stop the older
-/// measurements from outvoting the new ones.
+/// So the interval is chosen on coverage and cost instead. Coverage binds it: the per-size
+/// correction is what makes `TX_4X4` selectable at all, and on the 96x80 pattern - few enough
+/// coding blocks that the size is won at only two of them - `16` loses the size outright, as do
+/// `3`, `6` and `12`. `8` is the largest interval that keeps it, which
+/// `the_type_gain_sampling_interval_is_the_longest_that_keeps_tx_4x4` and
+/// `non_lossless_frames_round_trip_within_a_distortion_bound` both hold it to.
 ///
-/// So each accumulator is aged by `(n-1)/n` before a new probe joins it. A probe's weight decays
-/// geometrically over the following `n` probes, which - since the size searches that probe are
-/// visited in the decoder's superblock raster order - makes the ratio a block reads back the one
-/// its own neighbourhood measured, and lets it follow the content across a region boundary within
-/// a few coding blocks instead of never. This was chosen over a per-superblock-row reset (too
-/// coarse: a 64-row band is most of a small frame, and it discards the correction entirely at the
-/// start of each band) and over keeping a ratio per spatial region (which needs a region map the
-/// encoder does not have and memory proportional to the frame).
-///
-/// `4` is where it measured out, on the `content_frames` set plus `test_pattern` at both 128x96
-/// and 192x160 over the six quantizers, as each frame's worst penalty in `sse + lambda * bits`
-/// against the same estimator probing every size search. `frame` is the un-decayed accumulation
-/// this replaced. The table below was measured before [`TYPE_GAIN_TRUST`], which shrinks the
-/// remembered correction and is what took the `scene_edge` row's +9.32% down to +1.27%; `4` is
-/// still the window under the shrinkage, though it no longer separates on this set:
-/// `measure_type_gain_memory_windows` re-measured every window from `1` to the frame-wide
-/// accumulation at +0.10% (128x96) and +1.27% (192x160) on `scene_edge`, so what the window was
-/// carrying is now carried by the shrinkage instead. It is kept because the two answer different
-/// content - the shrinkage bounds how far *any* remembered ratio is trusted, the window bounds
-/// how old it is - and whether the window still earns its place is left to its own issue:
-///
-/// | window     | scene_edge | quadrants | smooth | test_pattern | candidates |
-/// |-----------:|-----------:|----------:|-------:|-------------:|-----------:|
-/// | 1          | +8.26%     | +0.86%    | +0.08% | +3.12%       | 155,725    |
-/// | 2          | +9.11%     | +1.49%    | +0.52% | +0.37%       | 155,696    |
-/// | 4          | +9.32%     | +0.00%    | +0.52% | +0.37%       | 155,392    |
-/// | 8          | +16.36%    | +0.00%    | +0.52% | +0.37%       | 155,357    |
-/// | 32         | +29.96%    | +0.00%    | +0.52% | +0.37%       | 155,109    |
-/// | frame      | +44.14%    | +0.00%    | +0.52% | +0.37%       | 155,143    |
-///
-/// (`noise` and `diagonals` are 0.00% at every window and are left out of the table.) `4` is the
-/// largest window that gives up none of the improvement - it cuts the scene edge's penalty by a
-/// factor of 4.7 at 192x160 and from +30.04% to +2.13% at 128x96 - while regressing no other
-/// frame against the frame-wide accumulation. Shorter windows start trading it back: `2` costs
-/// `quadrants` +1.49% and `1`, which remembers only the last probe, costs `test_pattern` +3.12%,
-/// because a single probe is too noisy an estimate to rank a size on.
-///
-/// The correction exists to be cheap and stays so. The decay is one multiply and one divide per
-/// accumulator, paid only on the sampled trials, and it evaluates 155,392 transform-type
-/// candidates against the frame-wide accumulation's 155,143 - 0.16% more, against the exhaustive
-/// search's 700,004. In wall-clock terms, from the minimum of five interleaved rounds per window
-/// in `measure_type_gain_memory_cost` over the six frames at six quantizers, 0.971 s at `4`
-/// against 0.954 s un-decayed: +1.8%, which is the extra candidates plus the arithmetic, and
-/// which the whole window sweep spans (0.954-0.975 s) from end to end.
-pub(super) const TYPE_GAIN_MEMORY: usize = 4;
+/// That column is a *phase* rather than a rate, and #323 measured out which one.
+/// `measure_type_gain_phase_aliasing` shows the per-size accumulator is populated at every
+/// interval - 30 of the frame's 37 size searches can reach `TX_4X4` and every interval from `1`
+/// to `16` probes some of them - so what decides the size is which coding blocks are sampled, not
+/// whether the size is. A trial that probed is corrected by its own measurement at full strength
+/// while every other trial's is shrunk to [`TYPE_GAIN_TRUST`] sixteenths, so `TX_4X4` is
+/// selectable only where the block's own search probed, and on this frame that is the two blocks
+/// at MI `(0, 12)` and `(16, 12)`: `4` and `8` sample the first, `1` and `2` sample both, and
+/// `3`, `6` and `12` sample neither. Probing every size search that could reach the smallest
+/// transform would remove the dependence and is measured in the same sweep at 28-70% more
+/// transform-type candidates for up to +12.4% worse rate-distortion, so the sampler stays as it
+/// is and `the_smallest_transform_is_selected_at_every_sampling_interval` holds the size across
+/// nine frame-and-size pairs where no interval from `2` to `16` loses it. Within that bound
+/// it takes the whole available saving: 174,638 transform-type candidates against `2`'s 203,477
+/// and the exhaustive search's 920,503 - 14% fewer than the previous value for 6% less encode
+/// time, and comfortably inside the four-fold reduction
+/// `the_search_shortcuts_stay_within_their_rate_and_distortion_bound` asserts, which only gets
+/// easier as the interval grows. The emitted bitstream moves accordingly, so the digests
+/// `a_fixed_frame_encodes_to_the_same_bytes_on_every_host` pins are regenerated; the 96x80
+/// pattern codes to fewer bytes at three of the six quantizers and the same at two.
+pub(super) const TYPE_GAIN_SAMPLE_INTERVAL: usize = 8;
 
 /// Transform sizes [`FrameEncoder::type_gain`] accumulates over: `TX_4X4` through `TX_32X32`,
 /// which is every size [`super::transform::forward_transform`] implements.
@@ -178,13 +157,13 @@ struct TypeGain {
     /// Summed best-of-set cost of the same blocks, so `dct_cost - best_cost` is what the type
     /// search has been measured to be worth at this size.
     best_cost: i64,
-    /// Probes accumulated, which the un-decayed mean divides by. Only the sweep that measured
-    /// the unweighted mean against the shipped ratio of sums reads it.
+    /// Probes accumulated, which [`Self::ratio`]'s mean divides by. Only the sweep that
+    /// measured the unweighted mean against the shipped ratio of sums reads that.
     #[cfg(test)]
     probes: i64,
-    /// The same measurement as the recency-weighted mean of the probes' *own* ratios, in
-    /// [`GAIN_RATIO_ONE`] units, so an expensive probe does not outweigh a cheap one. Measured
-    /// and rejected; kept for [`GainRatio`].
+    /// The same measurement as the mean of the probes' *own* ratios, in [`GAIN_RATIO_ONE`]
+    /// units, so an expensive probe does not outweigh a cheap one. Measured and rejected; kept
+    /// for [`GainRatio`].
     #[cfg(test)]
     ratio: i64,
 }
@@ -196,8 +175,8 @@ struct TypeGain {
 #[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GainLocality {
-    /// The running accumulator alone, which is what #272 shipped: recency in probe order, so a
-    /// window of [`TYPE_GAIN_MEMORY`] probes spans a horizontal run of coding blocks.
+    /// The running accumulator alone, which is what #272 shipped: probe order, so the probes
+    /// nearest a block are a horizontal run of coding blocks.
     Running,
     /// The superblock column's accumulator alone, whose most recent probes before the current
     /// superblock are the ones directly above it.
@@ -224,11 +203,12 @@ pub(crate) enum GainRatio {
 /// [`TYPE_GAIN_TRUST_ONE`] sixteenths. A trial that probed is corrected in full by what it
 /// measured on its own block; only an estimate carried from other blocks is shrunk.
 ///
-/// [`TYPE_GAIN_MEMORY`] left `scene_edge` at +9.32% against the unsampled estimator at 192x160,
-/// an order of magnitude above every other frame, and issue #279 asked whether what was left was
-/// spatial locality in the axis the recency weighting cannot see - probes are visited in
-/// superblock raster order, so a window of four spans a horizontal run of coding blocks. It is
-/// not, and three measurements say so.
+/// #272's recency weighting (`TYPE_GAIN_MEMORY`, a window of four probes, removed by #308 once
+/// this shrinkage made it unmeasurable) left `scene_edge` at +9.32% against the unsampled
+/// estimator at 192x160, an order of magnitude above every other frame, and issue #279 asked
+/// whether what was left was spatial locality in the axis a window over probe order cannot see -
+/// probes are visited in superblock raster order, so a window of four spanned a horizontal run
+/// of coding blocks. It is not, and three measurements say so.
 ///
 /// `measure_type_gain_locality` keeps a second accumulator per *superblock column*, whose most
 /// recent probes when a superblock starts are the ones directly above it. Reading that back
@@ -255,34 +235,87 @@ pub(crate) enum GainRatio {
 /// less a ratio measured on other blocks is worth than one measured on this block. Sixteenths of
 /// the remembered gain, as each frame's worst penalty in `sse + lambda * bits` against the same
 /// estimator probing every size search, over the `content_frames` set plus `test_pattern` at the
-/// six quantizers:
+/// six quantizers.
 ///
-/// | trust | scene_edge 128x96 | smooth 128x96 | scene_edge 192x160 | smooth 192x160 | test_pattern 192x160 | candidates |
-/// |------:|------------------:|--------------:|-------------------:|---------------:|---------------------:|-----------:|
-/// | 0     | +0.10%            | +0.47%        | +1.27%             | +0.54%         | +0.00%               | 150,680    |
-/// | 1     | +0.10%            | +0.00%        | +1.27%             | +0.08%         | +0.00%               | 150,827    |
-/// | 2     | +0.10%            | +0.00%        | +1.27%             | +0.08%         | +0.00%               | 151,019    |
-/// | 4     | +0.10%            | +0.00%        | +1.27%             | +0.08%         | +0.37%               | 152,176    |
-/// | 6     | +0.10%            | +0.00%        | +8.42%             | +0.08%         | +0.37%               | 153,872    |
-/// | 8     | +1.37%            | +1.16%        | +8.42%             | +0.53%         | +0.37%               | 154,617    |
-/// | 16    | +2.13%            | +1.15%        | +9.32%             | +0.52%         | +0.37%               | 155,392    |
+/// This value was first derived while [`TYPE_GAIN_SAMPLE_INTERVAL`] was `2`; #278 moved the
+/// interval to `8` and the two are coupled, because the interval sets what fraction of size
+/// trials read a *remembered* ratio and so how much of the search this shrinkage governs. At an
+/// interval of `2` about half the coding blocks probed, at `8` about an eighth do, so the sweep
+/// below is re-taken at the shipped interval and it is what `measure_type_gain_trust` now prints:
 ///
-/// (`noise`, `diagonals` and `quadrants` are +0.00% at every value and are left out; the
-/// candidate column is 192x160.) `2` is the middle of the `1..=3` plateau where every frame is
-/// at its own minimum, with a value either side of it before anything moves: `0` gives up
-/// `smooth`'s +0.47% by discarding the remembered correction entirely, and `4` starts trading
-/// `test_pattern` back. It takes the scene edge from +9.32% to +1.27% at 192x160 and from
-/// +2.13% to +0.10% at 128x96, and
+/// | trust | scene_edge 128x96 | smooth 128x96 | bands 128x96 | scene_edge 192x160 | smooth 192x160 | mosaic 192x160 | candidates |
+/// |------:|------------------:|--------------:|-------------:|-------------------:|---------------:|---------------:|-----------:|
+/// | 0     | +0.10%            | +1.05%        | +3.43%       | +0.11%             | +1.00%         | +0.72%         | 172,747    |
+/// | 1     | +0.10%            | +0.58%        | +3.43%       | +0.11%             | +0.31%         | +0.72%         | 173,042    |
+/// | 2     | +0.10%            | +0.00%        | +3.43%       | +0.11%             | +0.08%         | +0.72%         | 174,638    |
+/// | 3     | +0.10%            | +0.00%        | +3.43%       | +0.11%             | +0.08%         | +0.72%         | 175,968    |
+/// | 4     | +0.46%            | +2.96%        | +3.43%       | +0.11%             | +1.08%         | +0.72%         | 178,778    |
+/// | 5     | +0.46%            | +2.96%        | +3.30%       | +14.45%            | +1.08%         | +0.72%         | 179,018    |
+/// | 6     | +0.97%            | +4.09%        | +3.30%       | +21.60%            | +2.26%         | +0.72%         | 179,575    |
+/// | 8     | +1.28%            | +4.09%        | +3.21%       | +35.89%            | +2.68%         | +0.72%         | 179,920    |
+/// | 12    | +41.51%           | +4.09%        | +3.11%       | +78.70%            | +2.68%         | +0.72%         | 180,472    |
+/// | 16    | +55.52%           | +4.45%        | +6.01%       | +78.70%            | +2.68%         | +6.33%         | 181,380    |
+///
+/// (`noise` and `diagonals` are +0.00% at every value and `quadrants` is +0.69% at every value at
+/// 192x160 and +0.00% at 128x96, so all three are left out; `test_pattern` is +0.00% through `4`
+/// and +2.13% at 128x96 / +1.42% at 192x160 above it; the candidate column is 192x160.)
+///
+/// `2` still measures out best and the sweep now covers the interval it ships at. It is the lower
+/// of the `2..=3` plateau where every frame but `bands` is at its own minimum, with a value
+/// either side of it before something moves: `1` gives up `smooth`'s +0.58% / +0.31% and `0`
+/// its +1.05% / +1.00% by discarding more of the remembered correction than the estimate can
+/// spare, and `4` starts trading `smooth` back at both sizes and `scene_edge` at 128x96. `bands`
+/// is the one frame that would rather have less shrinkage still, but only by 0.32 points, and its
+/// own minimum sits at `12` where the scene edge has already run to +41.51%. `3` measures
+/// identically to `2` on every frame and is not preferred to it.
+///
+/// What did move is how much the value now buys. At the old interval the worst frame reached
+/// +9.32% un-shrunk; at `8` it reaches +78.70%, because seven trials in eight rather than one in
+/// two are reading the remembered ratio back. The shrinkage is doing several times more work than
+/// it was when it was derived, so the same value is held to a much larger penalty - it takes the
+/// scene edge from +78.70% to +0.11% at 192x160 and from +55.52% to +0.10% at 128x96, and
 /// `the_type_gain_sampling_interval_holds_on_content_it_was_not_tuned_on` asserts both sizes.
 ///
-/// The correction exists to be cheap and stays so. The shrinkage is one multiply and one divide
-/// on the trials that did not probe, and because a smaller correction stops promoting small
-/// transform sizes it evaluates 151,019 transform-type candidates against the un-shrunk 155,392,
-/// 2.8% *fewer*, against the exhaustive search's 700,004. Fewer candidates but slightly more
-/// time: from the minimum of five interleaved rounds per arm in `measure_type_gain_trust_cost`
-/// over the six frames at six quantizers, 0.686 s against 0.677 s un-shrunk, +1.3%. The
-/// candidates it stops evaluating are the cheapest ones - a 4x4 or 8x8 transform of a block it
-/// now codes whole - so removing them does not pay for the larger transforms it codes instead.
+/// The correction exists to be cheap and stays so, and at this interval it no longer costs time
+/// to shrink it. The shrinkage is one multiply and one divide on the trials that did not probe,
+/// and because a smaller correction stops promoting small transform sizes it evaluates 174,638
+/// transform-type candidates against the un-shrunk 181,380, 3.7% *fewer* - up from the 2.8% it
+/// saved at the old interval - against the exhaustive search's 920,503. From the minimum of five
+/// interleaved rounds per arm in `measure_type_gain_trust_cost`, over three whole runs of it,
+/// 0.5605 s against 0.5615 s un-shrunk: the +1.3% the shrinkage used to cost is gone, the extra
+/// candidates now paying for themselves, though at 0.2% the two arms are really only
+/// indistinguishable. The candidates it stops evaluating are still the cheapest ones - a 4x4 or
+/// 8x8 transform of a block it now codes whole - so it is not that removing them got cheaper but
+/// that there are half again as many of them to remove.
+///
+/// ## Why the sampled estimator beats the unsampled one
+///
+/// [`TYPE_GAIN_SAMPLE_INTERVAL`]'s table records a *negative* mean cost against the exhaustive
+/// search at every interval past `1`, which reads like the sampling improving on the thing it
+/// approximates. It is not the sampling. A trial that probes is corrected in full by its own
+/// measurement - [`FrameEncoder::corrected_trial_cost`] only applies the shrinkage on the
+/// remembered branch - so the interval-1 arm is the *un-shrunk* correction expressed on every
+/// trial, and it is the only trust that arm can express. `measure_type_gain_trust` prints the
+/// mean against the exhaustive search alongside the penalty, and it moves with the trust rather
+/// than with the sampling:
+///
+/// | arm                    | 128x96 | 192x160 |
+/// |:-----------------------|-------:|--------:|
+/// | unsampled (interval 1) | +0.10% | +0.19%  |
+/// | interval 8, trust 16   | +1.69% | +1.67%  |
+/// | interval 8, trust 8    | -0.14% | +0.59%  |
+/// | interval 8, trust 2    | -0.42% | -0.41%  |
+/// | interval 8, trust 0    | -0.46% | -0.44%  |
+///
+/// So the unsampled estimator is *worse* than the exhaustive search, by about the same margin at
+/// both sizes, and the sampled one is better only once the remembered correction is shrunk: at
+/// `16` it is worse than the unsampled arm again. The exhaustive search is an upper bound on what
+/// the *search* can find, but the correction is a bias added on top of a DCT-only ranking, and an
+/// over-large bias moves the ranking away from what the exhaustive search would have chosen. The
+/// unsampled estimator therefore is not an upper bound on quality and was never a strict one; the
+/// negative mean is the measurement saying this constant is on the right side of it. That the
+/// mean is nearly flat from `0` to `2` while the per-frame worst case is not is why the value is
+/// chosen on the per-frame column: what the last two sixteenths buy is `smooth`, not the mean.
 pub(super) const TYPE_GAIN_TRUST: i64 = 2;
 
 /// [`TYPE_GAIN_TRUST`] denominator: the un-shrunk correction.
@@ -358,7 +391,7 @@ pub(crate) struct FrameEncoder<'a> {
     /// of the frame. A probe joins its own column's accumulator as well as the running one, and
     /// because a column is only revisited a superblock row later, the probes it still remembers
     /// when a superblock starts are the ones directly above it. Measured and rejected - it does
-    /// not move the frame the recency weighting leaves behind - so only [`GainLocality`] reads
+    /// not move the frame #272's recency weighting left behind - so only [`GainLocality`] reads
     /// it and nothing outside tests maintains it.
     #[cfg(test)]
     column_gain: Vec<TypeGain>,
@@ -392,10 +425,18 @@ pub(crate) struct FrameEncoder<'a> {
     /// right. Outside tests the constant is read directly.
     #[cfg(test)]
     type_gain_interval: usize,
-    /// The recency window in force, so a test can sweep it the same way. Outside tests
-    /// [`TYPE_GAIN_MEMORY`] is read directly.
+    /// Whether every size search that can reach the smallest transform probes, whatever the
+    /// stride says. This is the guarantee #323 weighed against the phase dependence it would
+    /// remove; `measure_type_gain_phase_aliasing` prices it and nothing ships it, so it is off
+    /// outside that measurement.
     #[cfg(test)]
-    type_gain_memory: usize,
+    force_smallest_size_probes: bool,
+    /// One entry per size search this frame, in the order they ran: the smallest transform width
+    /// the search could have chosen, and whether it probed. Together they say which strides ever
+    /// probe a trial that carries a given size, which is what `measure_type_gain_phase_aliasing`
+    /// reports.
+    #[cfg(test)]
+    size_search_probes: Vec<(usize, bool)>,
     /// The locality arm in force, so a test can measure the shipped one against the accumulators
     /// it blends. [`GainLocality::Blended`] outside tests.
     #[cfg(test)]
@@ -470,6 +511,9 @@ pub(crate) struct SearchReport {
     pub(crate) emitted_blocks: std::collections::HashMap<(usize, usize), (usize, u8)>,
     pub(crate) emitted_coding_blocks: u64,
     pub(crate) probing_size_searches: u64,
+    /// Every size search's smallest reachable transform width and whether it probed, in search
+    /// order, for `measure_type_gain_phase_aliasing`.
+    pub(crate) size_search_probes: Vec<(usize, bool)>,
     pub(crate) zero_skipped_emitted: u64,
     pub(crate) reusable_emitted: u64,
 }
@@ -617,7 +661,9 @@ impl<'a> FrameEncoder<'a> {
             #[cfg(test)]
             type_gain_interval: TYPE_GAIN_SAMPLE_INTERVAL,
             #[cfg(test)]
-            type_gain_memory: TYPE_GAIN_MEMORY,
+            force_smallest_size_probes: false,
+            #[cfg(test)]
+            size_search_probes: Vec::new(),
             #[cfg(test)]
             type_gain_locality: GainLocality::Running,
             #[cfg(test)]
@@ -703,31 +749,28 @@ impl<'a> FrameEncoder<'a> {
         TYPE_GAIN_SAMPLE_INTERVAL
     }
 
-    /// Overrides the recency window, so a test can measure the estimator between remembering one
-    /// probe and remembering the whole frame. `usize::MAX` disables the decay, which is the
-    /// frame-wide accumulation this replaced.
+    /// Probes every size search that can reach the smallest transform, on top of the ones the
+    /// stride samples. This is the structural guarantee #323 asked for, kept only so
+    /// `measure_type_gain_phase_aliasing` can price what it costs; a shipped encode samples on
+    /// the stride alone.
     #[cfg(test)]
-    pub(crate) fn with_type_gain_memory(mut self, memory: usize) -> Self {
-        assert!(
-            memory >= 1,
-            "a window of 0 would divide the accumulator by zero"
-        );
-        self.type_gain_memory = memory;
+    pub(crate) fn with_forced_smallest_size_probes(mut self) -> Self {
+        self.force_smallest_size_probes = true;
         self
     }
 
-    /// Probes a size's gain ratio remembers. [`TYPE_GAIN_MEMORY`] outside tests, where nothing
-    /// can override it.
+    /// Whether a size search that can reach the smallest transform probes whatever the stride
+    /// says. Never, outside the measurement that priced it.
     #[cfg(test)]
-    fn type_gain_memory(&self) -> usize {
-        self.type_gain_memory
+    fn force_smallest_size_probes(&self) -> bool {
+        self.force_smallest_size_probes
     }
 
-    /// Probes a size's gain ratio remembers. [`TYPE_GAIN_MEMORY`] outside tests, where nothing
-    /// can override it.
+    /// Whether a size search that can reach the smallest transform probes whatever the stride
+    /// says. Never, outside the measurement that priced it.
     #[cfg(not(test))]
-    fn type_gain_memory(&self) -> usize {
-        TYPE_GAIN_MEMORY
+    fn force_smallest_size_probes(&self) -> bool {
+        false
     }
 
     /// Overrides where a trial reads its gain ratio back from, so a test can measure the shipped
@@ -832,6 +875,7 @@ impl<'a> FrameEncoder<'a> {
             emitted_blocks: std::mem::take(&mut self.emitted_blocks),
             emitted_coding_blocks: self.emitted_coding_blocks,
             probing_size_searches: self.probing_size_searches,
+            size_search_probes: std::mem::take(&mut self.size_search_probes),
             zero_skipped_emitted: self.zero_skipped_emitted,
             reusable_emitted: self.reusable_emitted,
             tile: self.sym.finish(),
@@ -1081,10 +1125,26 @@ impl<'a> FrameEncoder<'a> {
         if self.reversed_candidates {
             widths.reverse();
         }
-        let probing = self.shortcuts() && self.sample_type_gain();
+        // The stride samples coding blocks, not transform sizes, and which sizes a search can
+        // even reach is a property of the coding block's width - only a 16x16 or smaller block
+        // trials `TX_4X4` at all. Whether the smallest transform is *selected* somewhere in a
+        // frame therefore depends on whether the particular block it wins at was itself sampled,
+        // because a trial that probed is corrected by its own measurement at full strength while
+        // every other trial's is shrunk to [`TYPE_GAIN_TRUST`] sixteenths. That is the phase
+        // dependence #323 recorded, and it is left standing deliberately: the only guarantee that
+        // removes it - `with_forced_smallest_size_probes` - is measured there to cost 28-70% more
+        // transform-type candidates and up to +12.4% rate-distortion, for an outcome the sampled
+        // estimator is not worse than.
+        let probing = self.shortcuts()
+            && (self.sample_type_gain()
+                || (self.force_smallest_size_probes() && widths.last() == Some(&4)));
         #[cfg(test)]
-        if probing {
-            self.probing_size_searches += 1;
+        {
+            let smallest = widths.iter().copied().min().unwrap_or(0);
+            self.size_search_probes.push((smallest, probing));
+            if probing {
+                self.probing_size_searches += 1;
+            }
         }
         let mut best = (0usize, i64::MAX);
         for &tx_width in &widths {
@@ -1128,33 +1188,28 @@ impl<'a> FrameEncoder<'a> {
         sample
     }
 
-    /// Ages one accumulator by the recency window and joins a probe to it.
+    /// Joins a probe to one accumulator, which is the frame's running sum at that size.
     ///
-    /// The decay is one multiply and one divide per accumulator, paid only on the sampled
-    /// trials. `usize::MAX` is the sentinel for no decay at all, which is the frame-wide
-    /// accumulation `TYPE_GAIN_MEMORY` replaced; a test sweeps it as the far end of the window.
-    fn accumulate(gain: &mut TypeGain, memory: usize, dct: i64, best_of_set: i64) {
-        #[cfg(test)]
-        let probe_ratio = if dct > 0 {
-            (dct - best_of_set) * GAIN_RATIO_ONE / dct
-        } else {
-            0
-        };
-        if memory != usize::MAX {
-            let (num, den) = (memory as i64 - 1, memory as i64);
-            gain.dct_cost = gain.dct_cost * num / den;
-            gain.best_cost = gain.best_cost * num / den;
-            #[cfg(test)]
-            {
-                gain.ratio = (gain.ratio * num + probe_ratio) / den;
-            }
-        }
-        #[cfg(test)]
-        if memory == usize::MAX {
-            gain.ratio = (gain.ratio * gain.probes + probe_ratio) / (gain.probes + 1);
-        }
+    /// #272 aged each accumulator by `(n-1)/n` first, so a probe's weight decayed over the
+    /// following `TYPE_GAIN_MEMORY` probes and a block read back the ratio its own neighbourhood
+    /// measured rather than the frame's. [`TYPE_GAIN_TRUST`] then shrank a *remembered* ratio to
+    /// an eighth, and under that shrinkage the window stopped being measurable: issue #308 swept
+    /// every window from `1` to the un-decayed sum on `scene_edge`, on three frames built to
+    /// separate them - statistics alternating every 16 rows, the same two statistics on a 32x32
+    /// checkerboard so boundaries run in both axes, and a spatial frequency rising continuously
+    /// across the frame - at 128x96, 192x160 and 320x256, and every window from `2` upwards
+    /// measured the identical penalty on all fifteen frame-and-size pairs. Only `1`, which
+    /// remembers a single probe, moved anything at all, and only on one of them. So the decay is
+    /// gone and this is a sum again; what it was carrying is carried by the shrinkage.
+    fn accumulate(gain: &mut TypeGain, dct: i64, best_of_set: i64) {
         #[cfg(test)]
         {
+            let probe_ratio = if dct > 0 {
+                (dct - best_of_set) * GAIN_RATIO_ONE / dct
+            } else {
+                0
+            };
+            gain.ratio = (gain.ratio * gain.probes + probe_ratio) / (gain.probes + 1);
             gain.probes += 1;
         }
         gain.dct_cost += dct;
@@ -1439,13 +1494,12 @@ impl<'a> FrameEncoder<'a> {
             let best_of_set = cheapest.min(dct);
             self.probe_dct_cost += dct;
             self.probe_best_cost += best_of_set;
-            let memory = self.type_gain_memory();
             let slot = type_gain_slot(size);
-            Self::accumulate(&mut self.type_gain[slot], memory, dct, best_of_set);
+            Self::accumulate(&mut self.type_gain[slot], dct, best_of_set);
             #[cfg(test)]
             {
                 let column = self.gain_column * TYPE_GAIN_SIZES + slot;
-                Self::accumulate(&mut self.column_gain[column], memory, dct, best_of_set);
+                Self::accumulate(&mut self.column_gain[column], dct, best_of_set);
             }
             #[cfg(test)]
             self.probe_keys.push((x, y, size, prediction));

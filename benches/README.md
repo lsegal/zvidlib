@@ -1088,16 +1088,30 @@ run to produce it. The seam counts frames as well as nanoseconds, and the group
 asserts the count matches the window, so a backend that stopped reporting reads
 as a failed run rather than as free readback.
 
-Measured on an Apple Silicon host through VideoToolbox, over the same 32-frame
-window: the surface copy is ~3 us/frame and the colour conversion ~10 ms/frame,
-so readback is roughly two thirds to three quarters of what the `steady_state`
-arm reports as hardware decode (13-15 ms/frame, moving with the host's other
-work). The split is the useful part of that: on unified memory there is no
-transfer to remove, and the host round trip is almost entirely the crate's own
-NV12-to-RGBA pass — the same conversion that is the largest single item in a
-*software* decode. A discrete-GPU host is expected to read differently, with a
-real PCIe transfer in `surface_copy`; `#228`'s x86_64 measurement is where that
-number will come from.
+One host has run it so far, and each row names its own:
+
+| Host | Backend | `surface_copy` | `color_convert` | Share of `steady_state` |
+| --- | --- | --- | --- | --- |
+| Apple Silicon (unified memory) | VideoToolbox | ~3 us/frame | ~10 ms/frame | roughly two thirds to three quarters of 13-15 ms/frame |
+| discrete NVIDIA GPU | NVDEC | not yet measured (`#318`) | not yet measured | — |
+| Windows + D3D11 | Media Foundation | not yet measured (`#318`) | not yet measured | — |
+
+The Apple Silicon numbers are over the same 32-frame window `steady_state` uses,
+and its `steady_state` figure moves with the host's other work. The split is the
+useful part of that: on unified memory there is no transfer to remove — the
+`surface_copy` phase there is a `CVPixelBufferLockBaseAddress` and not a copy at
+all — and the host round trip is almost entirely the crate's own NV12-to-RGBA
+pass, the same conversion that is the largest single item in a *software*
+decode.
+
+That is one host's answer and not the general one. A discrete-GPU host is
+expected to read differently, with a real PCIe transfer in `surface_copy`
+(`cuvidMapVideoFrame` plus `cuMemcpyDtoH`, or the staging-texture
+`CopySubresourceRegion` plus `Map`) rather than a lock — which is the case the
+split was built to expose. `#300` corrected the stale pointer that used to stand
+here, and `#318` carries the measurement itself; it needs a host with the
+hardware, for the same reason the [hardware decoder
+table](#hardware-hevc-decoders) above still has empty rows.
 
 There is no readback arm on the software baseline. The seam covers the
 fixed-function backends; the software decoder's own conversion is already the
@@ -1120,6 +1134,14 @@ That was decided against, for now:
 - The benchmark that motivated it does not need it. A benchmark wants the cost
   of the copy that runs, not a way to avoid it, and the seam above measures
   exactly that code rather than a reimplemented stand-in.
+
+The third point is the one that is only known for unified memory. It rests on
+the recorded ratio, where the transfer is ~3 us against ~10 ms of conversion, so
+there is no round trip worth removing. A discrete-GPU host that reverses that
+ratio — a PCIe transfer dominating the conversion — would not settle the first
+two objections, but it would remove the third, and this decision should be
+re-read against that number rather than against the Apple Silicon one when
+`#318` produces it.
 
 The zero-copy path stays unbuilt until a caller needs it; the case for it would
 be a real GPU-side consumer, not a measurement. Until then
