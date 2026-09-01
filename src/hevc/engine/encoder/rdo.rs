@@ -7,6 +7,10 @@
 
 use crate::hevc::engine::binarization::INTRA_PRED_MODE_MAX;
 use crate::hevc::engine::encoder::rdcost;
+use crate::hevc::engine::encoder::residual::{
+    ResidualBinSink, ResidualWriteParams, has_coded_levels, write_residual_coding,
+};
+use crate::hevc::engine::residual::ResidualElement;
 
 const CTB: usize = 16;
 const NEUTRAL_LUMA: u8 = 128;
@@ -416,6 +420,54 @@ pub(crate) fn shortlist_intra_luma_modes(
     ranked
 }
 
+/// A [`ResidualBinSink`] that writes nothing and counts what it was asked to
+/// write — the rate half of a full rate-distortion cost, without an
+/// arithmetic coder or a bitstream.
+struct BinCounter {
+    bins: u32,
+}
+
+impl ResidualBinSink for BinCounter {
+    fn decision(&mut self, _element: ResidualElement, _ctx_inc: u32, _bin: u8) {
+        self.bins += 1;
+    }
+
+    fn bypass(&mut self, _bin: u8) {
+        self.bins += 1;
+    }
+}
+
+/// Estimated rate, in bits, of the residual one transform block would code:
+/// the number of CABAC bins §7.3.8.11 `residual_coding( )` emits for `levels`,
+/// counted by running the real writer's walk against a sink that only tallies.
+///
+/// Counting bins rather than modelling each one's arithmetic-coded length
+/// charges a context-coded bin a full bit, which overstates the well-modelled
+/// ones — a `sig_coeff_flag` in a context that has settled costs a fraction of
+/// a bit. What it preserves is the ordering: every bin the writer emits is
+/// counted exactly once, in the same walk, so two candidate residuals for the
+/// same block size and component are compared on the same scale. That is the
+/// property a mode decision needs, and it is what the levels themselves cost,
+/// as opposed to the mode signalling [`intra_mode_bit_cost`] covers.
+///
+/// A block whose levels are all zero codes no `residual_coding( )` at all —
+/// the decoder infers it from `cbf == 0` — so its residual rate is zero. The
+/// `cbf` bin itself is not counted here: it is coded for every block either
+/// way, so it cannot separate two candidates.
+///
+/// # Panics
+/// Panics through [`write_residual_coding`] if `levels` does not match
+/// `params.log2_trafo_size`.
+#[must_use]
+pub(crate) fn residual_rate_bits(levels: &[i32], params: &ResidualWriteParams) -> u32 {
+    if !has_coded_levels(levels) {
+        return 0;
+    }
+    let mut counter = BinCounter { bins: 0 };
+    write_residual_coding(&mut counter, params, levels);
+    counter.bins
+}
+
 /// §7.3.8.5 bin count for signalling one luma intra mode: the
 /// `prev_intra_luma_pred_flag` bin plus either the TR (`cMax` 2) `mpm_idx`
 /// bins or the five FL `rem_intra_luma_pred_mode` bins.
@@ -528,6 +580,81 @@ mod tests {
                 .iter()
                 .any(|partition| partition.sad > 0 && partition.satd > 0)
         }));
+    }
+
+    /// The residual rate estimate has to order two candidate residuals the
+    /// same way the bitstream does, which is the only property a mode decision
+    /// asks of it.
+    #[test]
+    fn the_residual_rate_estimate_orders_blocks_the_way_the_writer_does() {
+        use crate::hevc::engine::cabac::init_type;
+        use crate::hevc::engine::ctx_init::SliceContexts;
+        use crate::hevc::engine::encoder::bitwriter::BitWriter;
+        use crate::hevc::engine::encoder::cabac::CabacEncoder;
+        use crate::hevc::engine::encoder::residual::EngineResidualBinSink;
+        use crate::hevc::engine::scan::ScanIdx;
+
+        let params = ResidualWriteParams {
+            log2_trafo_size: 4,
+            is_chroma: false,
+            scan_idx: ScanIdx::Diagonal,
+        };
+        // A block the decoder infers from `cbf == 0` codes no
+        // `residual_coding( )` at all, so it costs nothing to carry.
+        assert_eq!(residual_rate_bits(&[0i32; 256], &params), 0);
+
+        // Progressively more expensive residuals: one DC level, the same
+        // level pushed further from the DC corner, a spread of levels, and
+        // large levels that spill into `coeff_abs_level_remaining`.
+        let block = |fill: &dyn Fn(usize, usize) -> i32| -> Vec<i32> {
+            (0..256).map(|i| fill(i % 16, i / 16)).collect()
+        };
+        let candidates = [
+            block(&|x, y| i32::from(x == 0 && y == 0)),
+            block(&|x, y| i32::from(x == 3 && y == 2)),
+            block(&|x, y| if x < 4 && y < 4 { 1 } else { 0 }),
+            block(&|x, y| if x < 4 && y < 4 { 40 } else { 0 }),
+        ];
+
+        // What each one really costs: the arithmetic-coded length the writer
+        // emits from a freshly initialized I-slice context bank.
+        let coded_bits = |levels: &[i32]| -> usize {
+            let mut w = BitWriter::new();
+            let mut cabac = CabacEncoder::new();
+            let mut ctxs = SliceContexts::init(init_type(2, false), 26);
+            write_residual_coding(
+                &mut EngineResidualBinSink {
+                    writer: &mut w,
+                    cabac: &mut cabac,
+                    contexts: &mut ctxs.residual,
+                },
+                &params,
+                levels,
+            );
+            w.finish().len() * 8
+        };
+
+        let estimates: Vec<u32> = candidates
+            .iter()
+            .map(|levels| residual_rate_bits(levels, &params))
+            .collect();
+        let coded: Vec<usize> = candidates.iter().map(|levels| coded_bits(levels)).collect();
+        for i in 1..candidates.len() {
+            assert!(
+                estimates[i] > estimates[i - 1],
+                "candidate {i} estimated {} bins against candidate {}'s {}",
+                estimates[i],
+                i - 1,
+                estimates[i - 1]
+            );
+            assert!(
+                coded[i] >= coded[i - 1],
+                "the estimate ordered candidates {} and {i} the writer does not: {:?} vs {:?}",
+                i - 1,
+                estimates,
+                coded
+            );
+        }
     }
 
     #[test]

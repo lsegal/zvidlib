@@ -15,18 +15,28 @@ percentage threshold on the median is the honest instrument for that.
     collect --criterion-dir target/criterion --out baseline.json
     compare --previous old.json --current new.json --out report.md
     table --baseline run1.json run2.json --host 'Apple M1' --out table.md
+    variance --baseline run1.json run2.json run3.json --out variance.md
 
 `table` renders the committed scalar-vs-ISA table in `benches/README.md`. It
 takes the elementwise *minimum* across however many baselines it is given,
 because a contended host can only ever make a measurement slower: the fastest
 observed time for an arm is the closest any of the runs got to the uncontended
 one. That is also why it wants several runs rather than one.
+
+`variance` answers the question `compare`'s threshold was guessed at: given the
+baselines from a run of consecutive `main` pushes, how far does a benchmark move
+between two runs when nothing about it changed? It reduces those baselines to
+the per-group spread of the same delta `compare` reports, so a threshold can be
+read off measured noise instead of picked. It reports per group rather than one
+number for the suite because a whole-frame 1080p group and a microbenchmark do
+not share a noise floor.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import pathlib
 import sys
@@ -302,6 +312,169 @@ def table(args: argparse.Namespace) -> int:
     return 0
 
 
+# Below this many consecutive-run pairs the tail of the distribution is not
+# measured, it is guessed: a p95 read off a handful of samples is the largest
+# thing that happened to be seen, which is not the same quantity. The report is
+# still rendered, and says so.
+MIN_PAIRS_FOR_A_TAIL = 10
+
+
+def _percentile(sorted_values: list[float], percentile: float) -> float:
+    """Nearest-rank percentile of an already-sorted list.
+
+    Nearest-rank rather than an interpolating definition because these are
+    observed deltas from a small sample; interpolating between two measurements
+    invents a number that was never measured.
+    """
+    if not sorted_values:
+        return 0.0
+    rank = max(1, math.ceil(percentile / 100.0 * len(sorted_values)))
+    return sorted_values[min(rank, len(sorted_values)) - 1]
+
+
+def _suggested_threshold(worst: float) -> int:
+    """The smallest whole 5% step strictly above the worst observed move.
+
+    A threshold sitting exactly on the worst observation flags it, so the step
+    is strict. Rounding to 5% rather than to the observation itself keeps the
+    number from reading as more precise than the sample behind it.
+    """
+    return int(math.floor(worst / 5.0) + 1) * 5
+
+
+def variance(args: argparse.Namespace) -> int:
+    """Report the per-group run-to-run spread across successive baselines.
+
+    Every consecutive pair of baselines contributes one delta per benchmark
+    present in both, which is exactly the quantity `compare` measures a
+    threshold against. Taking the absolute value folds the two directions
+    together on purpose: the threshold is symmetric, and a group that swings
+    -20% between two runs of the same code will swing +20% just as readily.
+    """
+    if len(args.baseline) < 2:
+        print("error: variance needs at least two baselines to form a pair", file=sys.stderr)
+        return 1
+
+    loaded: list[dict] = []
+    for path in args.baseline:
+        try:
+            loaded.append(json.loads(pathlib.Path(path).read_text()))
+        except (OSError, ValueError) as error:
+            print(f"error: could not read {path}: {error}", file=sys.stderr)
+            return 1
+
+    # Arms that come and go are not deltas and must not be averaged into one.
+    # They are reported separately because an arm that vanished when the runner
+    # pool changed is the one thing a percentage cannot express, and it settles
+    # whether a group can be gated on at all.
+    deltas: dict[str, list[float]] = {}
+    unstable: dict[str, set[str]] = {}
+    pairs = 0
+    for previous, current in zip(loaded, loaded[1:]):
+        pairs += 1
+        old = previous.get("benchmarks", {})
+        new = current.get("benchmarks", {})
+        for identifier in sorted(set(old) | set(new)):
+            group = _group_of(identifier)
+            before = old.get(identifier, {}).get("median_ns")
+            after = new.get(identifier, {}).get("median_ns")
+            if not before or after is None:
+                unstable.setdefault(group, set()).add(identifier)
+                continue
+            deltas.setdefault(group, []).append(abs((after - before) / before * 100.0))
+
+    if not deltas:
+        print("error: no benchmark appears in two consecutive baselines", file=sys.stderr)
+        return 1
+
+    everything = sorted(value for values in deltas.values() for value in values)
+    lines: list[str] = [
+        "## Benchmark run-to-run variance",
+        "",
+        f"{len(loaded)} baseline(s), {pairs} consecutive pair(s), "
+        f"{len(everything)} observed delta(s) across {len(deltas)} group(s).",
+        "",
+        "Each delta is one benchmark's `|median|` change between two successive "
+        "runs, the same quantity the delta report thresholds. Absolute value: "
+        "the threshold is symmetric.",
+        "",
+    ]
+    if pairs < args.min_pairs:
+        lines += [
+            f"> ⚠️ **Provisional.** {pairs} pair(s) is below the {args.min_pairs} "
+            "this report wants before its p95 column means anything. With this "
+            "few samples the p95 is just the worst thing seen so far, and a "
+            "threshold read off it will be too tight. Collect more `main` runs.",
+            "",
+        ]
+
+    lines += [
+        "| Group | n | Median | p95 | Max | Suggested threshold |",
+        "| --- | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    for group in sorted(deltas):
+        values = sorted(deltas[group])
+        worst = values[-1]
+        lines.append(
+            f"| `{group}` | {len(values)} | {_percentile(values, 50):.1f}% | "
+            f"{_percentile(values, 95):.1f}% | {worst:.1f}% | "
+            f"{_suggested_threshold(worst)}% |"
+        )
+    lines += [
+        f"| **whole suite** | {len(everything)} | {_percentile(everything, 50):.1f}% | "
+        f"{_percentile(everything, 95):.1f}% | {everything[-1]:.1f}% | "
+        f"{_suggested_threshold(everything[-1])}% |",
+        "",
+        "The suggested threshold is the smallest whole 5% step above the worst "
+        "delta observed for that group, so nothing in this sample would have "
+        "been flagged. It is a floor on a defensible threshold, not a "
+        "recommendation on its own: a sample that never saw a bad run suggests "
+        "a number a bad run will cross.",
+        "",
+    ]
+
+    # A group can only be gated on if its own noise fits under the gate, so this
+    # is the whole answer to "is anything stable enough for --fail-on-regression".
+    gateable = [
+        group
+        for group in sorted(deltas)
+        if group not in unstable and max(deltas[group]) < args.gate_at
+    ]
+    lines += [f"### Groups whose spread fits under {args.gate_at:g}%", ""]
+    if gateable:
+        lines += [f"- `{group}`" for group in gateable]
+        lines += [
+            "",
+            "Fitting under the gate in this sample is a precondition for "
+            "`--fail-on-regression`, not a reason to enable it.",
+            "",
+        ]
+    else:
+        lines += [
+            f"None. No group stayed inside {args.gate_at:g}% across every pair "
+            "in this sample, so nothing here is a candidate for gating yet.",
+            "",
+        ]
+
+    if unstable:
+        lines += [
+            "### Arms that appeared or disappeared",
+            "",
+            "These contribute no delta. An arm present in one run and absent "
+            "from the next usually means the runner pool changed instruction "
+            "sets, not that anything regressed — but a group that does this "
+            "cannot be gated on.",
+            "",
+        ]
+        for group in sorted(unstable):
+            for identifier in sorted(unstable[group]):
+                lines.append(f"- `{identifier}`")
+        lines.append("")
+
+    _write(args.out, lines)
+    return 0
+
+
 def _duration(nanoseconds: float | None) -> str:
     if nanoseconds is None:
         return "—"
@@ -345,6 +518,25 @@ def main(argv: list[str]) -> int:
     tabler.add_argument("--host", default="")
     tabler.add_argument("--out")
     tabler.set_defaults(handler=table)
+
+    variancer = subcommands.add_parser(
+        "variance", help="per-group run-to-run spread across successive baselines"
+    )
+    variancer.add_argument(
+        "--baseline",
+        nargs="+",
+        required=True,
+        help="baseline files in chronological order, oldest first",
+    )
+    variancer.add_argument("--out")
+    variancer.add_argument("--min-pairs", type=int, default=MIN_PAIRS_FOR_A_TAIL)
+    variancer.add_argument(
+        "--gate-at",
+        type=float,
+        default=15.0,
+        help="candidate gate, in percent, to test each group's spread against",
+    )
+    variancer.set_defaults(handler=variance)
 
     args = parser.parse_args(argv)
     return args.handler(args)

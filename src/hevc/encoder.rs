@@ -294,10 +294,10 @@ const OPERATING_POINT_HELP: &str = "the native HEVC encoder's configuration is e
 ///
 /// Lossy streams decode through [`crate::native_hevc_video_decoder_factory`],
 /// the crate's own decoder, with distortion that tracks the requested QP. The
-/// writer codes every coding unit as intra DC with the in-loop filters
-/// neutralized; intra mode search is a separate concern that belongs with the
-/// RDO work, so quality at a given QP is not yet what a rate-distortion-optimal
-/// encoder would reach.
+/// writer searches the §8.4.2 intra modes per coding unit and runs the §8.7.2
+/// in-loop deblocking filter; §8.7.3 SAO is still off in the SPS, and there is
+/// no rate control, so quality at a given QP is not yet what a
+/// rate-distortion-optimal encoder would reach.
 fn parse_operating_point(configuration: &[u8]) -> Option<OperatingPoint> {
     match configuration {
         [] => Some(OperatingPoint::LosslessPcm),
@@ -444,11 +444,13 @@ fn support_error(s: CodecSupport) -> Error {
 
 #[cfg(test)]
 mod tests {
+    use super::super::engine::encoder::lossy::encode_idr_residual_au_rate_constrained;
     use super::super::engine::hvcc::parse_hvcc;
     use super::*;
     use crate::{
-        Plane, VideoDecoderConfig, VideoEncoderConformanceVector, VideoFrame,
-        native_hevc_video_decoder_factory, verify_video_encoder_conformance,
+        CancellationToken, EncodedVideoSample, ExactFrameReader, Plane, VideoDecoderConfig,
+        VideoEncoderConformanceVector, VideoFrame, native_hevc_video_decoder_factory,
+        verify_video_encoder_conformance,
     };
     use std::future::Future;
     use std::pin::pin;
@@ -765,6 +767,111 @@ mod tests {
             coarse > 25.0,
             "even the coarse operating point should stay recognizable: {coarse:.2} dB"
         );
+    }
+
+    /// Decode one access unit through [`native_hevc_video_decoder_factory`] —
+    /// the same decoder the conformance round trip uses, reached directly so
+    /// the test can hand it a stream from either operating point rather than
+    /// only the one the configuration byte selects.
+    fn decode_through_the_factory(
+        au: &[u8],
+        dimensions: crate::VideoDimensions,
+        limits: Limits,
+    ) -> VideoFrame {
+        let configuration = VideoDecoderConfig {
+            codec: Codec::Hevc,
+            profile: CodecProfile::HevcMain,
+            coded_dimensions: dimensions,
+            output_format: PixelFormat::Rgba8,
+            color_range: ColorRange::Limited,
+            hardware: HardwarePreference::Avoid,
+            configuration: hvcc_box(au).unwrap(),
+        };
+        let samples = vec![EncodedVideoSample {
+            presentation_index: FrameIndex(0),
+            random_access: true,
+            data: length_prefixed_vcl(au).unwrap(),
+        }];
+        let mut reader = ExactFrameReader::new(
+            &native_hevc_video_decoder_factory(),
+            configuration,
+            samples,
+            limits,
+        )
+        .unwrap();
+        reader
+            .get(FrameIndex(0), &CancellationToken::new())
+            .unwrap()
+    }
+
+    /// PSNR of a decoded frame against the source it was encoded from, over
+    /// the RGBA samples both carry.
+    fn frame_psnr_db(source: &VideoFrame, decoded: &VideoFrame) -> f64 {
+        let (a, b) = (&source.planes[0].data, &decoded.planes[0].data);
+        assert_eq!(a.len(), b.len(), "the decoder changed the frame geometry");
+        let sse: f64 = a
+            .iter()
+            .zip(b)
+            .map(|(&p, &q)| {
+                let d = f64::from(p) - f64::from(q);
+                d * d
+            })
+            .sum();
+        assert!(sse > 0.0, "a lossy stream reproduced the source exactly");
+        10.0 * (255.0f64.powi(2) * a.len() as f64 / sse).log10()
+    }
+
+    /// The gain the rate-constrained operating point buys, measured where it
+    /// matters: through the crate's own decoder rather than the encoder's
+    /// reconstruction.
+    ///
+    /// Charging each intra candidate for the bins its residual would code
+    /// gives up a little distortion at any fixed QP, so the comparison that
+    /// means anything is at equal rate: the rate-constrained point must sit
+    /// above the fixed-QP writer's curve, interpolated in log-rate against
+    /// PSNR between the two fixed-QP encodes that bracket its size.
+    #[test]
+    fn the_rate_distortion_operating_point_beats_the_fixed_qp_curve_at_equal_rate() {
+        let (frame, dimensions, limits) = test_frame(64);
+        let (y, cb, cr) = rgba_to_yuv420(&frame, crate::Orientation::TopLeft).unwrap();
+        let (w, h) = (64, 64);
+        let point = |qp: i32, rate_constrained: bool| -> (f64, f64) {
+            let (au, _) = if rate_constrained {
+                encode_idr_residual_au_rate_constrained(&y, &cb, &cr, w, h, qp).unwrap()
+            } else {
+                encode_idr_residual_au(&y, &cb, &cr, w, h, qp).unwrap()
+            };
+            let decoded = decode_through_the_factory(&au, dimensions, limits);
+            (au.len() as f64, frame_psnr_db(&frame, &decoded))
+        };
+
+        // The fixed-QP curve to interpolate against, finest first.
+        let ladder: Vec<(f64, f64)> = [8i32, 12, 18, 22, 26, 32, 37, 42, 47]
+            .iter()
+            .map(|&qp| point(qp, false))
+            .collect();
+
+        for qp in [12i32, 18, 26, 32, 37] {
+            let (bytes, psnr) = point(qp, true);
+            let (fixed_bytes, _) = point(qp, false);
+            assert!(
+                bytes < fixed_bytes,
+                "qp {qp}: the rate-constrained decision did not reduce the access unit: \
+                 {bytes} against {fixed_bytes} bytes"
+            );
+            let bracket = ladder
+                .windows(2)
+                .find(|pair| pair[1].0 <= bytes && bytes <= pair[0].0)
+                .unwrap_or_else(|| panic!("qp {qp}: {bytes} bytes is off the measured ladder"));
+            let (bigger, smaller) = (bracket[0], bracket[1]);
+            let t = (bigger.0.ln() - bytes.ln()) / (bigger.0.ln() - smaller.0.ln());
+            let interpolated = bigger.1 + t * (smaller.1 - bigger.1);
+            assert!(
+                psnr > interpolated,
+                "qp {qp}: the rate-constrained point ({bytes} bytes, {psnr:.3} dB) decoded below \
+                 the fixed-QP curve's {interpolated:.3} dB at the same rate"
+            );
+        }
     }
 
     /// A lossy stream must declare the parameter sets its own writer emits,
