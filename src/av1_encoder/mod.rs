@@ -1108,49 +1108,67 @@ mod nonlossless_tests {
         }
     }
 
-    /// What reading a size trial's probe back on the emitting pass saves.
+    /// Where the probed and the emitted transform-block key sets diverge, which is what any reuse
+    /// of a size trial's probe on the emitting pass could ever have covered.
     ///
-    /// Prints transform-type candidate evaluations and wall-clock seconds at 640x352, the frame
-    /// `av1_encode_frame_q{32,160}` measures, with the reuse on and off. Interleaved rounds with
-    /// the minimum taken per arm, because a single pass would attribute this host's own load to
-    /// whichever arm happened to run under it.
+    /// A probe's result is only readable by the emitting pass when it was measured under the exact
+    /// `(position, size, prediction)` that pass later reaches. This classifies every probe of the
+    /// 640x352 frame at `base_q_idx` 32 and 160 against the blocks that pass wrote - reachable, a
+    /// losing size trial (the position is emitted at another size), a losing partition candidate
+    /// (the position is emitted at this size against another prediction), or a position that is
+    /// not the start of an emitted block at all - and prints what bounds the overlap from the
+    /// emitting side: `reusable_emitted`, the blocks that pass searches over more than one
+    /// candidate at all. That column is what closed #291: 44 of 1,870 emitted blocks at
+    /// `base_q_idx` 32 and 0 of 220 at 160, because the zero-block shortcut decides 1,716 of them
+    /// and every 32x32 block's derived set names a single type. The removed reuse reached 21 of
+    /// those 44, and covering all of them would have saved 220 of the frame's 18,957
+    /// transform-type candidate evaluations - 1.2%, against 0% at 160.
     #[test]
     #[ignore = "measurement sweep, not an assertion"]
-    fn measure_probe_reuse_cost() {
-        use std::time::Instant;
+    fn measure_probe_reuse_coverage() {
         let (width, height) = (640_usize, 352_usize);
         let pixels = test_pattern(width as u32, height as u32);
-        let mut seconds = std::collections::BTreeMap::new();
-        let mut candidates = std::collections::BTreeMap::new();
-        let mut bytes = std::collections::BTreeMap::new();
-        for _ in 0..8 {
-            for qindex in [32_u8, 160] {
-                for reuse in [true, false] {
-                    let start = Instant::now();
-                    let encoder = tile::FrameEncoder::new(&pixels, width, height, qindex);
-                    let report = if reuse {
-                        encoder.encode_with_report()
-                    } else {
-                        encoder.without_probe_reuse().encode_with_report()
-                    };
-                    let elapsed = start.elapsed().as_secs_f64();
-                    let slot = seconds.entry((qindex, reuse)).or_insert(f64::MAX);
-                    *slot = slot.min(elapsed);
-                    candidates.insert((qindex, reuse), report.candidates_evaluated);
-                    bytes.insert((qindex, reuse), report.tile.len());
+        println!(
+            "qindex,emitted_blocks,zero_skipped,reusable_emitted,emitted_coding_blocks,probing_size_searches,probes,distinct_probes,reachable,losing_size,losing_partition,unemitted_position,emitted_sizes"
+        );
+        for qindex in [32_u8, 160] {
+            let report =
+                tile::FrameEncoder::new(&pixels, width, height, qindex).encode_with_report();
+            let distinct: std::collections::BTreeSet<_> =
+                report.probe_keys.iter().copied().collect();
+            let (mut reachable, mut losing_size, mut losing_partition, mut unemitted) =
+                (0, 0, 0, 0);
+            for &(x, y, size, prediction) in &distinct {
+                match report.emitted_blocks.get(&(x, y)) {
+                    None => unemitted += 1,
+                    Some(&(emitted_size, _)) if emitted_size != size => losing_size += 1,
+                    Some(&(_, emitted_prediction)) if emitted_prediction != prediction => {
+                        losing_partition += 1
+                    }
+                    Some(_) => reachable += 1,
                 }
             }
-        }
-        println!("qindex,reuse,seconds,candidates,bytes");
-        for qindex in [32_u8, 160] {
-            for reuse in [true, false] {
-                println!(
-                    "{qindex},{reuse},{:.4},{},{}",
-                    seconds[&(qindex, reuse)],
-                    candidates[&(qindex, reuse)],
-                    bytes[&(qindex, reuse)]
-                );
+            let mut sizes: std::collections::BTreeMap<usize, usize> =
+                std::collections::BTreeMap::new();
+            for &(size, _) in report.emitted_blocks.values() {
+                *sizes.entry(size).or_default() += 1;
             }
+            let sizes: Vec<String> = sizes
+                .iter()
+                .map(|(size, count)| format!("{size}x{size}:{count}"))
+                .collect();
+            println!(
+                "{qindex},{},{},{},{},{},{},{},{},{losing_size},{losing_partition},{unemitted},{}",
+                report.emitted_blocks.len(),
+                report.zero_skipped_emitted,
+                report.reusable_emitted,
+                report.emitted_coding_blocks,
+                report.probing_size_searches,
+                report.probe_keys.len(),
+                distinct.len(),
+                reachable,
+                sizes.join(" "),
+            );
         }
     }
 
@@ -1427,58 +1445,6 @@ mod nonlossless_tests {
                 exhaustive.candidates_evaluated
             );
         }
-    }
-
-    /// The emitting pass writes a probed block from the probe's own result instead of searching
-    /// it again, and writes exactly what searching it again would have written.
-    ///
-    /// A size trial probes one of its blocks with the whole transform-type set purely to measure
-    /// what the type search is worth at that size, then keeps DCT's result so the trial matches a
-    /// DCT-only one. For the size the search selects, the emitting pass reaches that block in the
-    /// state the trial saw, so the winner the probe already computed is the winner it would
-    /// recompute - and this asserts both halves of that: the bytes and the reconstruction are
-    /// identical to the same encoder with the reuse turned off, and strictly fewer
-    /// transform-type candidates are evaluated to produce them.
-    #[test]
-    fn the_emitting_pass_reuses_a_probe_it_can_key_exactly() {
-        let mut reused_somewhere = false;
-        // Two frame sizes, because whether a probed block is also the block the winning size
-        // emits depends on how the partition tree falls, which the frame's dimensions decide.
-        for ((width, height), qindex) in [(96_usize, 80_usize), (64, 64)]
-            .into_iter()
-            .flat_map(|size| [1_u8, 8, 32, 80, 160, 200].map(|qindex| (size, qindex)))
-        {
-            let pixels = test_pattern(width as u32, height as u32);
-            let reused =
-                tile::FrameEncoder::new(&pixels, width, height, qindex).encode_with_report();
-            let searched = tile::FrameEncoder::new(&pixels, width, height, qindex)
-                .without_probe_reuse()
-                .encode_with_report();
-            assert_eq!(
-                (reused.tile.len(), digest(&reused.tile)),
-                (searched.tile.len(), digest(&searched.tile)),
-                "qindex {qindex} encoded differently when the emitting pass reused a probe"
-            );
-            assert_eq!(
-                reused.reconstruction, searched.reconstruction,
-                "qindex {qindex} reconstructed differently when the emitting pass reused a probe"
-            );
-            assert_eq!(
-                reused.trace, searched.trace,
-                "qindex {qindex} wrote different transform blocks when the emitting pass reused                  a probe"
-            );
-            assert!(
-                reused.candidates_evaluated <= searched.candidates_evaluated,
-                "qindex {qindex} evaluated {} candidates with the reuse on against {} with it                  off, so reading a probe back cost work instead of saving it",
-                reused.candidates_evaluated,
-                searched.candidates_evaluated
-            );
-            reused_somewhere |= reused.candidates_evaluated < searched.candidates_evaluated;
-        }
-        assert!(
-            reused_somewhere,
-            "no quantizer reused a probe's result, so the emitting pass never found a key it              could match and the reuse gets no coverage"
-        );
     }
 
     /// Neither the transform-type nor the transform-size search may depend on the order it walks
