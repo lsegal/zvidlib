@@ -12,6 +12,10 @@ mod encoder;
 pub(crate) mod engine;
 #[cfg(all(any(windows, target_os = "linux"), target_pointer_width = "64"))]
 mod nvdec;
+// internal — exposed for the hardware benchmark suite; not part of the stable API
+#[cfg(not(target_arch = "wasm32"))]
+#[doc(hidden)]
+pub mod readback;
 #[cfg(target_os = "macos")]
 mod videotoolbox;
 #[cfg(windows)]

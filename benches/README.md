@@ -193,7 +193,8 @@ is not mistaken for bitstream-writing cost. Both default to 640x352 and add a
 | `av1_encode_frame_q{0,32,160}` | one whole frame through the public encoder, `src/av1_encoder/tile.rs` |
 | `av1_encode_stage_wht` | the forward 4x4 WHT, `src/av1_encoder/wht.rs` |
 | `av1_encode_stage_symbol` | symbol coding over the static CDF tables, `src/av1_encoder/symbol.rs` and `cdf.rs` |
-| `av1_encode_stage_tile` | tile encoding: superblock iteration, `DC_PRED`, coefficient coding, `src/av1_encoder/tile.rs` |
+| `av1_encode_stage_coeff_ctx` | the §8.3.2 `coeff_base`/`coeff_br` context derivation on its own, `src/av1_simd/coeff.rs` |
+| `av1_encode_stage_tile` | tile encoding: superblock iteration, `DC_PRED`, coefficient coding and its vectorized §8.3.2 context derivation, `src/av1_encoder/tile.rs` and `src/av1_simd/coeff.rs` |
 | `av1_encode_stage_bitstream` | headers, bit writing and OBU LEB128 framing, `src/av1_encoder/{bitwriter,headers,leb128}.rs` |
 | `av1_forward_dct_{4x4,8x8,16x16,32x32}` | forward DCT, `src/av1_encoder/transform.rs` through `zvidlib::forward_transform` |
 | `av1_forward_adst_8x8`, `av1_forward_flipadst_16x16` | the forward ADST family, including a flipped type |
@@ -208,13 +209,28 @@ tile encoding is within a small factor of the whole-frame number, the forward
 WHT and the symbol coder are each an order of magnitude cheaper than that, and
 header writing with its LEB128 framing is two to three orders cheaper again —
 microseconds against a 1080p tile encode's hundreds of milliseconds. Coefficient
-coding and its context derivation inside `tile.rs`, not the transform, are what a
-faster lossless encoder has to attack next.
+coding, not the transform, is what a faster lossless encoder has to attack — and
+the §8.3.2 context derivation half of it is now vectorized, which
+`av1_encode_stage_coeff_ctx` measures directly. `av1_encode_stage_tile` still
+reads close to flat anyway; [Why the tile group barely moves](#why-the-tile-group-barely-moves)
+is the measurement that says why, and what the remaining target is.
 
-The forward transforms and the forward WHT are this encoder's only vectorized
-kernels. Symbol coding, CDF handling and bitstream writing are scalar and
-expected to stay that way, so those arms read the same under every instruction
-set. That flatness is a measured result rather than a broken run, which is why
+This encoder's vectorized kernels are the forward transforms, the forward WHT,
+and the `coeff_base` / `coeff_br` context derivation the coefficient coding loop
+runs on (§8.3.2, `src/av1_simd/coeff.rs`, the `av1_coeff_ctx` dispatch site).
+The last of those derives a whole block's contexts in one data-parallel pass
+ahead of the serial symbol loop, which is legal because the loop walks the
+up-right diagonal scan backwards, so every neighbour a position consults is
+already final — or zero, past the end-of-block. `av1_encode_stage_coeff_ctx` is
+that pass on its own, and is the group its scalar-versus-vector delta is visible
+in.
+
+Symbol coding itself, CDF handling and bitstream writing remain scalar and are
+expected to stay that way — the range coder is serial by construction, since
+every symbol updates the CDF and the coder state the next symbol is written
+against — so `av1_encode_stage_symbol` and `av1_encode_stage_bitstream` read the
+same under every instruction set. That flatness is a measured result rather than
+a broken run, which is why
 each group asserts through `simd::active_by_site()` that the override landed
 instead of inferring it from the clock. `report_stage_coverage` prints the stage
 list on every run, so a group that stops being measured reads as a broken run
@@ -224,6 +240,80 @@ rather than as a stage that costs nothing.
 cargo bench --bench av1_encode -- av1_encode_stage    # the per-stage groups only
 ZVIDLIB_BENCH_LARGE=1 cargo bench --bench av1_encode  # add the 1080p pass
 ```
+
+### Why the tile group barely moves
+
+`av1_encode_stage_coeff_ctx` wins and `av1_encode_stage_tile` does not, and the
+gap between those two facts is the useful measurement here.
+
+On an Apple Silicon host at 640x352, `--release`, as the best of interleaved
+rounds per arm — this machine routinely runs several concurrent builds, so a
+single round is meaningless and the minimum is the statistic (see
+[Reading a null result](#reading-a-null-result)):
+
+| Group | scalar | neon |
+| --- | --- | --- |
+| `av1_encode_stage_coeff_ctx` | 3.05 ms | 1.69 ms |
+| `av1_encode_stage_tile` | 33.8 ms | 31.3 ms |
+
+The kernel is 1.8x, and it is real. It is also only about 9% of the tile encode
+it was factored out of, so removing 45% of *that* is under 4% end to end — below
+this host's round-to-round spread, which is why `av1_encode_stage_tile` and
+`av1_encode_frame_q0` still read within noise of each other and of the same two
+groups built from `main`.
+
+A `sample` profile of the lossless tile encode said where the rest went: of
+14,411 samples inside `FrameEncoder::encode`, 9,164 — 64% — were in
+`SymbolEncoder::encode_symbol`. Coefficient coding is indeed the whole frame,
+but what is left of it once the contexts are vectorized is the range coder, and
+that is serial by construction in exactly the way
+[the HEVC CABAC encoder](#why-the-cabac-arithmetic-encoder-stays-serial) is:
+each symbol renormalizes against the interval the previous one left. No vector
+kernel addresses it. The remaining headroom in AV1 lossless encoding was
+therefore a *serial* question — widening the bit sink, and unrolling the
+literal-bit runs the coefficient loop writes — not another dispatch family.
+
+#### What the serial work bought
+
+Both of those changes have since been made, and the 64% figure above is the
+state before them rather than the state now. `src/av1_encoder/symbol.rs` no
+longer buffers each output byte as a `u16` and resolves the pending carries in a
+second reverse pass over the whole stream at `finish`; it normalizes each byte
+as it arrives, which halves the sink and drops the pass. And the equiprobable
+literal bits — coefficient signs, the `eob` extra bits, the exp-Golomb tails —
+are coded as runs rather than one `encode_symbol` call per bit, against a
+specialization of the interval update for the one CDF `read_bool` ever uses. The
+Golomb tail in particular is a single run: `len - 1` zeros followed by `x` in
+`len` bits is just `x` written as one `2 * len - 1`-bit field.
+
+Same host, same method — `--release`, best of interleaved rounds per arm, five
+rounds at 640x352 and seven at 1920x1080, against the `main` these numbers were
+measured next to:
+
+| Group | main | with the serial work | |
+| --- | --- | --- | --- |
+| `av1_encode_stage_symbol` | 2.20 ms | 1.77 ms | 1.24x |
+| `av1_encode_stage_tile/neon` | 36.5 ms | 33.0 ms | 1.11x |
+| `av1_encode_frame_q0/neon` | 38.4 ms | 34.9 ms | 1.10x |
+| `av1_encode_stage_symbol_1080p` | 21.4 ms | 16.7 ms | 1.29x |
+| `av1_encode_stage_tile_1080p/neon` | 400 ms | 310 ms | 1.29x |
+| `av1_encode_frame_q0_1080p/neon` | 442 ms | 318 ms | 1.39x |
+
+The two `stage_symbol` rows are quoted as the best of both arms rather than one
+of them, because that group is scalar on both and its arms differ only by this
+host's spread; the tile and whole-frame rows are the `neon` arm, which is what
+this host actually runs.
+
+The shape of the result is the point. This is the first change to move
+`av1_encode_stage_tile` and `av1_encode_frame_q0` at all — the vectorized
+contexts could not, at 9% of a tile encode — and it moves them by roughly what
+their range-coder share predicts, which is the confirmation that the profile was
+reading the right thing. It also does not touch the bitstream: every group's
+`bench_across_isas` guard sees the same output byte count it saw before
+(264,392 for a 640x352 tile, 2,474,396 for a 1080p frame), and the encoder's
+`a_fixed_frame_encodes_to_the_same_bytes_on_every_host` digests are unchanged.
+The range coder is still serial, and still the largest single item in a lossless
+frame; it is now a smaller one.
 
 The kernel-level `av1_forward_*` groups run once per available instruction set
 through
@@ -894,28 +984,152 @@ frames are not equally expensive (a key frame costs far more than the
 hierarchical B-frames after it), so arms measured over different frame counts
 would be comparing different work. The run prints the ratio directly.
 
-Read the ratio as an order of magnitude, not a two-digit figure. The hardware
-arm is stable run to run — a fixed-function block decoding a fixed window — while
-the software arm is a long single-threaded workload and varies several-fold on a
-loaded host, so the ratio moves with the host's other work rather than with
-anything the decoders did. Measured on an idle Apple Silicon host: 167 Mpx/s on
-VideoToolbox against 15 Mpx/s in software, about 11x.
-
 The setup arm reports the *warm* per-session cost, since criterion builds a
 session per iteration after the framework has already initialized. The single
 untimed pass printed above the criterion output reports the cold one, which
 includes one-time driver/framework initialization; a caller pays that once and
 the warm cost on every seek-driven reset.
 
+### Measured backends
+
+One row per measurement run, naming the host it was taken on. `Steady state` and
+`Warm setup` are the criterion `<arm>/steady_state` and
+`<arm>/session_setup_to_first_frame` figures; `Cold setup` is the single untimed
+pass. The software column is the `ZVIDLIB_BENCH_LARGE=1` baseline arm from the
+*same* run, which is what makes the ratio a ratio rather than a comparison
+across hosts.
+
+| Backend | Host | Steady state | Warm setup | Cold setup | Software, same host | Ratio |
+| --- | --- | --- | --- | --- | --- | --- |
+| VideoToolbox | idle Apple Silicon (#170) | 167 Mpx/s | not recorded | not recorded | 15 Mpx/s | ~11x |
+| VideoToolbox | Apple M1, macOS 26.5 (#282) | 163 Mpx/s, 78.6 fps | 16.7 ms | 114 ms | 38.5 Mpx/s, 18.6 fps | ~4x |
+| NVDEC | `ubuntu-latest`, Azure VM, x86_64 (#282) | not measured | — | — | — | — |
+| Media Foundation | `windows-latest`, Hyper-V Video adapter (#282) | not measured | — | — | — | — |
+
+Read the ratio as an order of magnitude, not a two-digit figure. The hardware
+arm is stable run to run — a fixed-function block decoding a fixed window — while
+the software arm is a long single-threaded workload and varies several-fold on a
+loaded host, so the ratio moves with the host's other work rather than with
+anything the decoders did. The two VideoToolbox rows are exactly that: their
+hardware numbers agree to within a few percent and their software numbers differ
+by 2.5x, which is where the whole gap between ~11x and ~4x lives. Neither row is
+the wrong one; the ratio is a property of the host as much as of the decoders.
+
+The #282 row is the minimum of two back-to-back runs on the same host rather
+than either run's own reading. The second run came out 40% slower on the
+*hardware* arm — the arm this file calls stable — which is the host announcing
+contention rather than anything the decoder did, so the slower run is discarded
+on that evidence instead of averaged in.
+
+### Backends that could not be measured
+
+NVDEC and Media Foundation both have code in the tree
+(`src/hevc/nvdec.rs`, `src/hevc/windows_mf.rs`) and both compile and run the
+benchmark, but no host with the fixed-function hardware behind either one was
+available. The bench needed no changes to reach that conclusion on either
+platform: it built and skipped cleanly, exactly as designed.
+
+- **NVDEC**, on `ubuntu-latest`: no NVIDIA GPU and no driver. The probe reports
+  `NVDEC: NVIDIA CUDA driver is unavailable: libcuda.so.1: cannot open shared
+  object file`. GitHub's standard hosted Linux runners are Azure VMs with no
+  attached GPU — `nvidia-smi` is absent and neither `libcuda.so.1` nor
+  `libnvcuvid.so.1` is on the loader path — so no configuration of a standard
+  runner reaches this backend. Measuring it needs a self-hosted or GPU-class
+  runner, or a physical NVIDIA host.
+- **Media Foundation**, on `windows-latest`: no D3D11 video device. The probe
+  reports `Media Foundation: D3D11 video decode is unavailable: No such
+  interface supported (0x80004002)` — the runner's only display adapter is
+  `Microsoft Hyper-V Video`, a paravirtualized adapter that exposes no
+  `ID3D11VideoDevice`, so the `D3D_DRIVER_TYPE_HARDWARE` device
+  `windows_mf::is_available` requires cannot be created. `CLSID_MSH265DecoderMFT`
+  is not registered on the image either, so even a software MFT fallback is
+  absent. Measuring it needs a Windows host with a real GPU.
+- The same Windows run also found NVDEC unavailable there
+  (`NVIDIA CUDA driver is unavailable: LoadLibraryExW failed`; `nvcuda.dll` and
+  `nvcuvid.dll` are both absent from the image), so neither of that platform's
+  two candidate backends is reachable on a hosted runner.
+
+Both numbers stay open until a host with the hardware runs the benchmark. The
+Windows run is worth one note of its own beyond the missing row: it is the first
+time the crate has been built and run on Windows in CI at all — `.github/workflows/ci.yml`
+has only ever had Linux jobs — and the `windows` and `libloading` target
+dependencies, the Media Foundation backend, and the benchmark suite all compiled
+without a warning.
+
 ### Frame readback
 
-There is no separate readback arm. `VideoDecoder` hands back a host-side
-`VideoFrame`, the HEVC decoder configuration only accepts `PixelFormat::Rgba8`,
-and each backend maps its own surface and converts to RGBA inside `submit`, so
-there is no public seam between "the fixed-function block finished" and "the
-pixels are in a `Vec<u8>`". A readback number measured any other way would be a
-reimplemented stand-in rather than the code that runs, so the group reports the
-two as inseparable instead of reporting a proxy.
+`VideoDecoder` hands back a host-side `VideoFrame`, the HEVC decoder
+configuration only accepts `PixelFormat::Rgba8`, and each backend maps its own
+surface and converts to RGBA inside `submit` — so a caller sees the
+fixed-function decode and the host round trip as one number. For a playback
+pipeline the round trip is often the part that bounds throughput, which is what
+made it worth separating (`#151`, `#170`, `#283`).
+
+`hevc_hardware_readback` is the group that separates it, and it runs whenever
+the hardware arm does:
+
+| Benchmark | What it measures |
+| --- | --- |
+| `hardware/surface_copy` | making the decoded surface CPU-readable: `cuvidMapVideoFrame` + `cuMemcpyDtoH` (NVDEC), the staging-texture `CopySubresourceRegion` + `Map` (Media Foundation), or `CVPixelBufferLockBaseAddress` (VideoToolbox) |
+| `hardware/color_convert` | the NV12-to-RGBA pass over those bytes and the RGBA allocation it fills |
+
+The two are split because they scale differently by host: the surface copy is a
+PCIe transfer on a discrete GPU and little more than a lock on unified memory,
+while the conversion is host CPU work everywhere. The run also prints both as
+ms/frame and as a percentage of the `steady_state` decode they are part of, which
+is the ratio the issues above asked for.
+
+These are attribution numbers, not wall-clock ones. Each backend charges its own
+per-frame phases to `zvidlib::hevc_hardware_readback`, and one criterion
+iteration decodes the same 32-frame window `steady_state` does and reports only
+the nanoseconds that window spent in the phase under test — so an iteration's
+wall time is longer than the number it prints, by exactly the decode it had to
+run to produce it. The seam counts frames as well as nanoseconds, and the group
+asserts the count matches the window, so a backend that stopped reporting reads
+as a failed run rather than as free readback.
+
+Measured on an Apple Silicon host through VideoToolbox, over the same 32-frame
+window: the surface copy is ~3 us/frame and the colour conversion ~10 ms/frame,
+so readback is roughly two thirds to three quarters of what the `steady_state`
+arm reports as hardware decode (13-15 ms/frame, moving with the host's other
+work). The split is the useful part of that: on unified memory there is no
+transfer to remove, and the host round trip is almost entirely the crate's own
+NV12-to-RGBA pass — the same conversion that is the largest single item in a
+*software* decode. A discrete-GPU host is expected to read differently, with a
+real PCIe transfer in `surface_copy`; `#228`'s x86_64 measurement is where that
+number will come from.
+
+There is no readback arm on the software baseline. The seam covers the
+fixed-function backends; the software decoder's own conversion is already the
+`color_convert` stage in [the decode breakdown](#where-hevc-decode-time-actually-goes)
+and the `hevc_color_convert` per-stage group.
+
+#### Why a measurement seam and not a zero-copy output path
+
+Issue #283 asked the broader question the measurement gap implied: should the
+decoder expose the decoded surface *before* readback, so a GPU-side consumer (a
+texture upload, a wgpu or WebGL path) could skip the host round trip entirely?
+That was decided against, for now:
+
+- It is three platform handle types (`CVPixelBuffer`, a `CUdeviceptr` plus its
+  context, an `ID3D11Texture2D` plus the device that owns it), each with its own
+  lifetime and threading contract, in a public API — and the crate does not own
+  the drivers or frameworks whose contracts it would be promising to keep.
+- It requires a second public `PixelFormat` family (NV12), since no backend
+  produces RGBA on the GPU today.
+- The benchmark that motivated it does not need it. A benchmark wants the cost
+  of the copy that runs, not a way to avoid it, and the seam above measures
+  exactly that code rather than a reimplemented stand-in.
+
+The zero-copy path stays unbuilt until a caller needs it; the case for it would
+be a real GPU-side consumer, not a measurement. Until then
+`zvidlib::hevc_hardware_readback` is `#[doc(hidden)]` and unstable, like
+`hevc_decoder_bench` and `hevc_decode_profile`, and its per-frame instrumentation
+is unconditional for the same reason theirs is: a feature-gated profiler measures
+a build nobody ships. It costs two `Instant::now()` reads and a relaxed
+`fetch_add` per phase per frame. Its accumulators are process-wide atomics rather
+than thread-locals because NVDEC and VideoToolbox deliver frames from a callback
+that need not run on the submitting thread.
 
 ## Fixtures
 
@@ -972,7 +1186,7 @@ mistaken for bitstream-writing cost:
 | Group | Stage |
 | --- | --- |
 | `..._rdo_intra` / `..._rdo_inter` | mode search / RDO (`engine::encoder::rdo`), without and with a reference picture |
-| `..._reconstruct` | encode-side reconstruction (predict + add residual per coded block) plus the §8.7.2 deblocking filter and §8.7.3 SAO over the reconstructed picture |
+| `..._reconstruct` | encode-side reconstruction (predict + add residual per coded block, through `hevc_recon`) plus the §8.7.3 SAO parameter search and the §8.7.2 deblocking filter and §8.7.3 SAO over the reconstructed picture |
 | `..._pcm_write` | whole-picture access-unit writing: parameter sets, slice header, CABAC-coded CU syntax, PCM samples |
 | `hevc_encode_cabac` | the §9.3.5 arithmetic encoder alone, over a synthetic bin stream of single, interleaved bins |
 | `hevc_encode_cabac_bypass` | the same encoder over contiguous *bypass runs* — the shape 62% of the lossy residual writer's bins have |
@@ -1007,12 +1221,21 @@ them, which is what keeps its PCM encode exactly lossless.
 
 ### Where the SIMD axis reads flat, and why that is the result
 
-The encoder has three SIMD dispatch families of its own: `hevc_rdcost`, the SAD
+The encoder has four SIMD dispatch families of its own: `hevc_rdcost`, the SAD
 and SATD distortion metrics the mode search calls; `hevc_fwd_transform_quant`,
-the forward transform and quantization; and `hevc_colorconv`, the RGBA8 to
-YUV420 input conversion. A fourth group, `..._reconstruct`, also moves with the
-instruction set, but by reaching the decoder's already-vectorized deblocking and
-SAO kernels rather than an encoder-side one.
+the forward transform and quantization; `hevc_recon`, the §8.6.6 reconstruction
+loop and the encode-side §8.7.3 SAO parameter search; and `hevc_colorconv`, the
+RGBA8 to YUV420 input conversion. `..._reconstruct` reaches `hevc_recon` and,
+after it, the decoder's already-vectorized deblocking and SAO filter kernels.
+
+`..._reconstruct` only separated across instruction sets once `hevc_recon`
+existed. Before it, the group's arms barely moved — the in-loop filter kernels
+it called were a minority of its cost, while the reconstruction loop and the SAO
+parameter search in front of them were scalar. Measured on a contended Apple
+Silicon host, best of three interleaved rounds (a floor; read the ratio rather
+than the absolute time): 640x352 29.2 ms scalar against 11.0 ms NEON, and
+1920x1088 121.4 ms scalar against 38.9 ms NEON, where before it read 11.2 ms
+against 9.6 ms at 640x352 and did not separate at all at 1080p.
 
 **Bitstream writing and CABAC** have no vector path at all, so `..._pcm_write`,
 `hevc_encode_cabac`, `hevc_encode_cabac_bypass` and `hevc_encode_bitwriter` are
@@ -1147,6 +1370,14 @@ why the arithmetic encoder stays serial. `hevc_encode_cabac_bypass` exists so
 that the run-at-a-time question stays measured rather than re-derived: it is the
 same engine over contiguous bypass runs instead of single interleaved bins, and
 it is the group any future attempt at this has to move.
+
+`..._reconstruct` separated across instruction sets once `hevc_recon` existed.
+Measured on a contended Apple Silicon host, best of three interleaved rounds
+(treat these as a floor, and read the ratio rather than the absolute time):
+640x352 29.2 ms scalar against 11.0 ms NEON, and 1920x1088 121.4 ms scalar
+against 38.9 ms NEON. Before it, the same group read 11.2 ms scalar against
+9.6 ms NEON at 640x352 and did not separate at all at 1080p, because the in-loop
+filter kernels it called were a minority of its cost.
 
 ## Per-stage access to the encoder
 

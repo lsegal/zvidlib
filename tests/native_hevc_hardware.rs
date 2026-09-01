@@ -3,8 +3,9 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use zvidlib::hevc_hardware_readback as readback;
 use zvidlib::io::MemorySource;
 use zvidlib::{CancellationToken, ExactFrameReader, FrameIndex};
 use zvidlib::{
@@ -171,5 +172,67 @@ fn accelerated_hevc_decodes_bundled_1080p_sample_at_source_rate() {
     assert!(
         fps >= 24.0,
         "accelerated decoder achieved {fps:.2} FPS, below the 24 FPS source rate"
+    );
+}
+
+/// The readback seam (issue #283) has to attribute real time to both phases of
+/// a hardware decode, or the benchmark group built on it silently reports
+/// zeros. Only a hardware backend charges it; the software decoder's conversion
+/// is attributed by `hevc_decode_profile` instead, so this asserts the seam is
+/// quiet for software and populated for hardware.
+#[test]
+fn hardware_readback_seam_attributes_each_decoded_frame() {
+    let mut vector = bundled_vector();
+    vector.configuration.hardware = HardwarePreference::Require;
+    let factory = native_hevc_video_decoder_factory();
+    if factory.capability(&vector.configuration) == CodecSupport::HardwareUnavailable {
+        let reason = factory
+            .create(&vector.configuration, &Limits::default())
+            .err()
+            .map_or_else(|| "unknown reason".into(), |error| error.to_string());
+        eprintln!("skipping: hardware HEVC unavailable: {reason}");
+        return;
+    }
+    let frames = 8_u64;
+    let mut reader = ExactFrameReader::new(
+        &factory,
+        vector.configuration,
+        vector.samples,
+        Limits::default(),
+    )
+    .unwrap();
+    let cancellation = CancellationToken::new();
+
+    readback::reset();
+    assert_eq!(readback::report(), readback::Report::default());
+    for index in 0..frames {
+        reader.get(FrameIndex(index), &cancellation).unwrap();
+    }
+    let report = readback::report();
+
+    // `ExactFrameReader` decodes from the preceding key frame, so it delivers at
+    // least the frames it was asked for and possibly more.
+    assert!(
+        report.frames >= frames,
+        "the seam attributed {} frames for {frames} requested",
+        report.frames
+    );
+    assert!(
+        report.color_convert > Duration::ZERO,
+        "a 1920x1080 NV12-to-RGBA pass cannot cost zero"
+    );
+    assert!(
+        report.total() >= report.color_convert,
+        "the total has to include both phases"
+    );
+    assert!(
+        report.total_per_frame() > Duration::ZERO && report.total_per_frame() <= report.total(),
+        "per-frame readback {:?} is not a share of {:?}",
+        report.total_per_frame(),
+        report.total()
+    );
+    eprintln!(
+        "readback over {} frames: surface copy {:?}, colour convert {:?}",
+        report.frames, report.surface_copy, report.color_convert
     );
 }
