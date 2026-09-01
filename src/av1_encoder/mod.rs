@@ -1347,45 +1347,137 @@ mod nonlossless_tests {
         }
     }
 
-    /// What the locality blend costs in encode time, against each accumulator on its own.
+    /// What the shrinkage costs in encode time, against the un-shrunk correction it replaced.
     ///
-    /// Interleaved rounds with the minimum taken per arm: a single pass would attribute this
-    /// host's own load to whichever arm happened to run under it.
+    /// The correction exists to be cheap, so this is the check that shrinking it did not make it
+    /// expensive. Interleaved rounds with the minimum taken per arm: a single pass would
+    /// attribute this host's own load to whichever arm happened to run under it.
     #[test]
     #[ignore = "measurement sweep, not an assertion"]
-    fn measure_type_gain_locality_cost() {
+    fn measure_type_gain_trust_cost() {
         use std::time::Instant;
         let (width, height) = (192_usize, 160_usize);
         let mut frames = content_frames(width as u32, height as u32);
         frames.push(("test_pattern", test_pattern(width as u32, height as u32)));
-        let arms = [
-            ("running", tile::GainLocality::Running),
-            ("column", tile::GainLocality::Column),
-            ("blended", tile::GainLocality::Blended),
-        ];
+        let arms = [0_i64, 2, 16];
         let mut best = std::collections::BTreeMap::new();
         let mut candidates = std::collections::BTreeMap::new();
         for _ in 0..5 {
-            for (label, locality) in arms {
+            for trust in arms {
                 let start = Instant::now();
                 let mut total = 0_u64;
                 for (_, pixels) in &frames {
                     for qindex in [1_u8, 8, 32, 80, 160, 200] {
                         let report = tile::FrameEncoder::new(pixels, width, height, qindex)
-                            .with_type_gain_locality(locality)
+                            .with_type_gain_trust(trust)
                             .encode_with_report();
                         total += report.candidates_evaluated;
                     }
                 }
                 let elapsed = start.elapsed().as_secs_f64();
-                let slot = best.entry(label).or_insert(f64::MAX);
+                let slot = best.entry(trust).or_insert(f64::MAX);
                 *slot = slot.min(elapsed);
-                candidates.insert(label, total);
+                candidates.insert(trust, total);
             }
         }
-        println!("locality,seconds,candidates");
-        for (label, _) in arms {
-            println!("{label},{:.4},{}", best[label], candidates[label]);
+        println!("trust,seconds,candidates");
+        for trust in arms {
+            println!("{trust},{:.4},{}", best[&trust], candidates[&trust]);
+        }
+    }
+
+    /// Sweeps how many blocks a probing size trial measures.
+    ///
+    /// If what is left of the `scene_edge` penalty were the *noise* in a one-block estimate
+    /// rather than its size, steadying the estimate would move it. It does not, at 192x160: the
+    /// frame sits at the same penalty from one probe per trial to sixteen.
+    #[test]
+    #[ignore = "measurement sweep, not an assertion"]
+    fn measure_type_gain_probes() {
+        for (width, height) in [(128_usize, 96_usize), (192, 160)] {
+            let mut frames = content_frames(width as u32, height as u32);
+            frames.push(("test_pattern", test_pattern(width as u32, height as u32)));
+            println!("size,{width}x{height}");
+            println!("frame,qindex,probes,penalty_percent,bytes,candidates");
+            for (name, pixels) in &frames {
+                for qindex in [1_u8, 8, 32, 80, 160, 200] {
+                    let ac = i64::from(crate::av1_intra::get_ac_quant(qindex));
+                    let lambda = (ac * ac / 256).max(1);
+                    let cost = |interval: usize, probes: usize, trust: i64| {
+                        let report = tile::FrameEncoder::new(pixels, width, height, qindex)
+                            .with_type_gain_interval(interval)
+                            .with_type_gain_probes(probes)
+                            .with_type_gain_trust(trust)
+                            .encode_with_report();
+                        (
+                            sse_against(&report, pixels, width, height)
+                                + lambda * report.tile.len() as i64 * 8,
+                            report.tile.len(),
+                            report.candidates_evaluated,
+                        )
+                    };
+                    let (unsampled, _, _) = cost(1, 1, 16);
+                    for probes in [1_usize, 2, 4, 8, 16] {
+                        // The un-shrunk correction, which is the state the diagnosis was made in.
+                        let (sampled, bytes, candidates) =
+                            cost(tile::TYPE_GAIN_SAMPLE_INTERVAL, probes, 16);
+                        let penalty = sampled as f64 / unsampled as f64 * 100.0 - 100.0;
+                        println!("{name},{qindex},{probes},{penalty:+.2},{bytes},{candidates}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Where in the frame the sampled estimator chooses a different transform size, which is the
+    /// measurement that named the residual `scene_edge` penalty.
+    ///
+    /// At 192x160, qindex 160 - the one quantizer the whole penalty lives at - the differences
+    /// are spread over the entire frame rather than gathered at the region boundary, and they
+    /// almost all run one way: the sampled estimator codes a block in smaller transforms than
+    /// the unsampled one. Neither is what a *locality* failure looks like.
+    #[test]
+    #[ignore = "measurement sweep, not an assertion"]
+    fn measure_scene_edge_size_choices() {
+        let (width, height) = (192_usize, 160_usize);
+        let pixels = content_frames(width as u32, height as u32)
+            .into_iter()
+            .find(|(name, _)| *name == "scene_edge")
+            .map(|(_, pixels)| pixels)
+            .unwrap();
+        let choices = |interval: usize, trust: i64| {
+            tile::FrameEncoder::new(&pixels, width, height, 160)
+                .with_type_gain_interval(interval)
+                .with_type_gain_trust(trust)
+                .encode_with_report()
+                .size_choices
+                .into_iter()
+                .map(|(r, c, bw, tx)| ((r, c, bw), tx))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let unsampled = choices(1, 16);
+        for trust in [16_i64, 2] {
+            let sampled = choices(tile::TYPE_GAIN_SAMPLE_INTERVAL, trust);
+            let (mut smaller, mut larger) = (0_usize, 0_usize);
+            println!("trust,{trust}");
+            println!("y,x,block_width,unsampled_tx,sampled_tx");
+            for (key, tx) in &unsampled {
+                if let Some(other) = sampled.get(key)
+                    && other != tx
+                {
+                    if other < tx {
+                        smaller += 1;
+                    } else {
+                        larger += 1;
+                    }
+                    println!("{},{},{},{tx},{other}", key.0 * 4, key.1 * 4, key.2);
+                }
+            }
+            println!(
+                "decisions {}, differing {}, of which smaller {smaller} and larger {larger}",
+                unsampled.len(),
+                smaller + larger
+            );
         }
     }
 
@@ -1448,54 +1540,49 @@ mod nonlossless_tests {
     /// `scene_edge`'s ceiling was 40% while the per-size ratio was accumulated over the whole
     /// frame: every interval from 2 to 4 measured the same penalty on it, because what it was
     /// paying for was the estimator mixing two regions' statistics rather than the sampling rate.
-    /// `TYPE_GAIN_MEMORY` ages that accumulation so a block reads back its own neighbourhood's
-    /// ratio, which brings the frame to +2.13% here and takes the ceiling to 4%.
+    /// [`tile::TYPE_GAIN_MEMORY`] ages that accumulation so a block reads back its own
+    /// neighbourhood's ratio and [`tile::TYPE_GAIN_TRUST`] shrinks what is left of a *remembered*
+    /// correction, which together bring the frame to +0.10% at 128x96 and +1.27% at 192x160.
+    ///
+    /// Both sizes are asserted. 128x96 alone could not see the 192x160 penalty the shrinkage was
+    /// found from - it measured +2.13% there against +9.32% at the larger size - so the larger
+    /// one is in the assertion rather than in the `#[ignore]`d sweeps alone, which is what let
+    /// that penalty sit unnoticed. The ceilings are the measured penalties with margin.
     #[test]
     fn the_type_gain_sampling_interval_holds_on_content_it_was_not_tuned_on() {
-        let (width, height) = (128_usize, 96_usize);
-        let mut frames = content_frames(width as u32, height as u32);
-        frames.push(("test_pattern", test_pattern(width as u32, height as u32)));
-        let ceilings = std::collections::BTreeMap::from([
-            ("noise", 1.0),
-            ("smooth", 2.5),
-            ("diagonals", 1.0),
-            ("quadrants", 1.0),
-            ("scene_edge", 4.0),
-            ("test_pattern", 1.0),
-        ]);
-        let sse = |report: &tile::SearchReport, pixels: &[u8]| -> i64 {
-            (0..height)
-                .flat_map(|row| {
-                    report.reconstruction[row * report.coded_width..][..width]
-                        .iter()
-                        .enumerate()
-                        .map(move |(column, &value)| (row * width + column, value))
-                })
-                .map(|(index, value)| {
-                    let error = i64::from(i32::from(pixels[index]) - i32::from(value));
-                    error * error
-                })
-                .sum()
-        };
-        for (name, pixels) in &frames {
-            let ceiling = ceilings[name];
-            for qindex in [1_u8, 8, 32, 80, 160, 200] {
-                let ac = i64::from(crate::av1_intra::get_ac_quant(qindex));
-                let lambda = (ac * ac / 256).max(1);
-                let cost = |interval: usize| {
-                    let report = tile::FrameEncoder::new(pixels, width, height, qindex)
-                        .with_type_gain_interval(interval)
-                        .encode_with_report();
-                    sse(&report, pixels) + lambda * report.tile.len() as i64 * 8
-                };
-                let sampled = cost(tile::TYPE_GAIN_SAMPLE_INTERVAL);
-                let unsampled = cost(1);
-                let penalty = sampled as f64 / unsampled as f64 * 100.0 - 100.0;
-                assert!(
-                    penalty <= ceiling,
-                    "{name} at qindex {qindex} cost {sampled} against the unsampled estimator's \
-                     {unsampled} ({penalty:+.2}%), past the {ceiling}% this frame is allowed"
-                );
+        for (width, height) in [(128_usize, 96_usize), (192, 160)] {
+            let mut frames = content_frames(width as u32, height as u32);
+            frames.push(("test_pattern", test_pattern(width as u32, height as u32)));
+            let ceilings = std::collections::BTreeMap::from([
+                ("noise", 1.0),
+                ("smooth", 1.0),
+                ("diagonals", 1.0),
+                ("quadrants", 1.0),
+                ("scene_edge", 2.5),
+                ("test_pattern", 1.0),
+            ]);
+            for (name, pixels) in &frames {
+                let ceiling = ceilings[name];
+                for qindex in [1_u8, 8, 32, 80, 160, 200] {
+                    let ac = i64::from(crate::av1_intra::get_ac_quant(qindex));
+                    let lambda = (ac * ac / 256).max(1);
+                    let cost = |interval: usize| {
+                        let report = tile::FrameEncoder::new(pixels, width, height, qindex)
+                            .with_type_gain_interval(interval)
+                            .encode_with_report();
+                        sse_against(&report, pixels, width, height)
+                            + lambda * report.tile.len() as i64 * 8
+                    };
+                    let sampled = cost(tile::TYPE_GAIN_SAMPLE_INTERVAL);
+                    let unsampled = cost(1);
+                    let penalty = sampled as f64 / unsampled as f64 * 100.0 - 100.0;
+                    assert!(
+                        penalty <= ceiling,
+                        "{name} at {width}x{height}, qindex {qindex}, cost {sampled} against \
+                         the unsampled estimator's {unsampled} ({penalty:+.2}%), past the \
+                         {ceiling}% this frame is allowed"
+                    );
+                }
             }
         }
     }
