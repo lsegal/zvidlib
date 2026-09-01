@@ -180,6 +180,19 @@ impl CabacEncoder {
     /// chunks so the unrolled `ivlLow` stays inside `u32`.
     pub fn encode_bypass_run(&mut self, w: &mut BitWriter, value: u32, n: u8) {
         debug_assert!(n <= 32, "a bypass run is at most one u32 wide");
+        // A one-bin "run" is the ordinary §9.3.5.5 step; going through the
+        // unrolled form would only add a multiply. The residual writer
+        // reaches this on every `cRiceParam == 0` remainder.
+        if n <= 1 {
+            if n == 1 {
+                self.encode_bypass(w, (value & 1) as u8);
+            }
+            return;
+        }
+        if n <= BYPASS_RUN_CHUNK_BINS {
+            self.encode_bypass_chunk(w, value & ((1u32 << n) - 1), n);
+            return;
+        }
         let mut left = n;
         while left > 0 {
             let take = left.min(BYPASS_RUN_CHUNK_BINS);
