@@ -1204,6 +1204,140 @@ mod nonlossless_tests {
         }
     }
 
+    /// Why `TX_4X4` coverage depends on the sampling interval's *phase* against the block raster
+    /// and not only on its rate, and what the guarantee that would remove it costs (#323).
+    ///
+    /// The first table is the mechanism. `TYPE_GAIN_SAMPLE_INTERVAL` counts *coding blocks*, and
+    /// which transform sizes a size search can reach is a property of the coding block's width -
+    /// `read_tx_size` signals a depth off `Max_Tx_Size_Rect`, so only a 16x16 or smaller block
+    /// trials `TX_4X4` at all. The natural reading of the issue is that some strides never land on
+    /// one of those, and that is not what happens: 30 of the 96x80 pattern's 37 size searches can
+    /// reach `TX_4X4` and every stride from 1 to 16 probes at least one of them, so the per-size
+    /// accumulator is never empty at any interval. What the strides differ on is *which* blocks
+    /// they sample, and that is what decides the size, because a trial that probed is corrected by
+    /// its own measurement at full strength while a trial that did not is corrected by the
+    /// remembered ratio shrunk to [`tile::TYPE_GAIN_TRUST`] sixteenths - eight times weaker, and
+    /// the sixteen-fold extrapolation `TX_4X4` needs does not survive the shrinkage. So `TX_4X4`
+    /// is selectable exactly at coding blocks whose own size search probed. On this frame there
+    /// are precisely two such blocks, at MI positions `(0, 12)` and `(16, 12)`; the second table
+    /// prints every position that chose the size together with whether that search probed, and it
+    /// is `true` in every row at every interval. Whether a stride keeps the size is therefore the
+    /// question of whether those two search indices are multiples of it - 1 and 2 reach both, 4
+    /// and 8 reach `(0, 12)`, and 3, 5, 6, 7 and 9 upwards reach neither. Sharing a factor with a
+    /// trials-per-coding-block count has nothing to do with it.
+    ///
+    /// The third table prices the guarantee. Probing every size search that can reach the smallest
+    /// transform - `with_forced_smallest_size_probes`, the cheapest rule that makes the size
+    /// selectable independently of the stride - does restore it at every interval from 1 to 16, at
+    /// 28-70% more transform-type candidate evaluations and about 10% more encode time. It also
+    /// *loses* rate-distortion: +12.4% on `smooth` at 640x352 and `base_q_idx` 8, +10.0% at
+    /// 192x160, +5.0% on `bands`, +1.7% on `scene_edge`, because the un-shrunk own-probe
+    /// correction overshoots towards the smaller size - the same effect
+    /// `measure_type_gain_sampling_intervals` already records as the sampled estimator costing
+    /// *less* than the unsampled one. Paying a third more search to reconstruct worse is not a
+    /// guarantee worth having, so nothing ships it, and what pins the size instead is
+    /// `the_smallest_transform_is_selected_at_every_sampling_interval` over twelve frames rather
+    /// than the one this aliasing shows up on.
+    #[test]
+    #[ignore = "measurement sweep, not an assertion"]
+    fn measure_type_gain_phase_aliasing() {
+        let (width, height) = (96_usize, 80_usize);
+        let pixels = test_pattern(width as u32, height as u32);
+        let quantizers = [1_u8, 8, 32, 80, 160, 200];
+
+        println!("interval,searches,reachable_4,probed_4,reachable_8,probed_8,selects_tx4x4_at");
+        for interval in 1_usize..=16 {
+            let report = tile::FrameEncoder::new(&pixels, width, height, 32)
+                .with_type_gain_interval(interval)
+                .encode_with_report();
+            let count = |smallest: usize| {
+                let reachable = report
+                    .size_search_probes
+                    .iter()
+                    .filter(|&&(size, _)| size <= smallest)
+                    .count();
+                let probed = report
+                    .size_search_probes
+                    .iter()
+                    .filter(|&&(size, probing)| size <= smallest && probing)
+                    .count();
+                (reachable, probed)
+            };
+            let (reachable4, probed4) = count(4);
+            let (reachable8, probed8) = count(8);
+            let selecting: Vec<u8> = quantizers
+                .into_iter()
+                .filter(|&qindex| {
+                    tile::FrameEncoder::new(&pixels, width, height, qindex)
+                        .with_type_gain_interval(interval)
+                        .encode_with_report()
+                        .trace
+                        .iter()
+                        .any(|&(size, _)| size == 4)
+                })
+                .collect();
+            println!(
+                "{interval},{},{reachable4},{probed4},{reachable8},{probed8},{selecting:?}",
+                report.size_search_probes.len()
+            );
+        }
+
+        println!("interval,qindex,positions_choosing_tx4x4_and_whether_that_search_probed");
+        for interval in 1_usize..=16 {
+            for qindex in quantizers {
+                let report = tile::FrameEncoder::new(&pixels, width, height, qindex)
+                    .with_type_gain_interval(interval)
+                    .encode_with_report();
+                // `size_choices` and `size_search_probes` are both pushed once per size search,
+                // in search order, so the two zip position by position.
+                let chose: Vec<(usize, usize, bool)> = report
+                    .size_choices
+                    .iter()
+                    .zip(report.size_search_probes.iter())
+                    .filter(|((_, _, _, chosen), _)| *chosen == 4)
+                    .map(|((r, c, _, _), (_, probing))| (*r, *c, *probing))
+                    .collect();
+                if !chose.is_empty() {
+                    println!("{interval},{qindex},{chose:?}");
+                }
+            }
+        }
+
+        println!("size,frame,qindex,candidates,forced_candidates,cost_percent,forced_selects_4");
+        for (width, height) in [(128_usize, 96_usize), (192, 160), (640, 352)] {
+            let mut frames = content_frames(width as u32, height as u32);
+            frames.push(("test_pattern", test_pattern(width as u32, height as u32)));
+            for (name, pixels) in &frames {
+                for qindex in [8_u8, 32, 160] {
+                    let ac = i64::from(crate::av1_intra::get_ac_quant(qindex));
+                    let lambda = (ac * ac / 256).max(1);
+                    let run = |forced: bool| {
+                        let encoder = tile::FrameEncoder::new(pixels, width, height, qindex);
+                        let encoder = if forced {
+                            encoder.with_forced_smallest_size_probes()
+                        } else {
+                            encoder
+                        };
+                        let report = encoder.encode_with_report();
+                        let cost = sse_against(&report, pixels, width, height)
+                            + lambda * report.tile.len() as i64 * 8;
+                        let selects = report.trace.iter().any(|&(size, _)| size == 4);
+                        (report.candidates_evaluated, cost, selects)
+                    };
+                    let sampled = run(false);
+                    let forced = run(true);
+                    println!(
+                        "{width}x{height},{name},{qindex},{},{},{:+.3},{}",
+                        sampled.0,
+                        forced.0,
+                        (forced.1 as f64 / sampled.1 as f64 - 1.0) * 100.0,
+                        forced.2
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     #[ignore = "measurement sweep, not an assertion"]
     fn measure_type_gain_sampling_cost() {
@@ -1641,6 +1775,74 @@ mod nonlossless_tests {
         }
     }
 
+    /// The smallest transform stays selectable whatever the sampling interval is, on frames with
+    /// more than a couple of coding blocks where it wins.
+    ///
+    /// `the_type_gain_sampling_interval_is_the_longest_that_keeps_tx_4x4` pins the shipped
+    /// interval on the 96x80 `test_pattern`, and #323 established what that frame is really
+    /// measuring: the size is chosen there at exactly two coding blocks, and only ever by a search
+    /// that probed, because a trial that probed is corrected by its own measurement at full
+    /// strength while every other trial's correction is shrunk to [`tile::TYPE_GAIN_TRUST`]
+    /// sixteenths. Whether an interval keeps the size on that frame is therefore the question of
+    /// whether those two search indices are multiples of it, which is why 3, 6 and 12 lose a size
+    /// the longer 4 and 8 keep. It is not a probe-coverage failure - every interval from 1 to 16
+    /// probes some of the 30 searches that can reach `TX_4X4`, so the per-size accumulator is
+    /// never empty - and `measure_type_gain_phase_aliasing` prices the only guarantee that removes
+    /// the dependence at 28-70% more transform-type candidates for up to +12.4% worse
+    /// rate-distortion. So the sampler is left alone and this widens what the property rests on.
+    ///
+    /// On content with enough blocks where the smallest transform wins - a smooth gradient,
+    /// horizontal bands, and four flat quadrants - it is selected at *every* interval from 2 to 16
+    /// at frame sizes from 96x80 to 640x352, so the size surviving is a property of the content
+    /// and the estimator rather than of the stride's phase against one 37-search frame. A change
+    /// to superblock traversal, to the partition search, or to which trials are enumerated moves
+    /// which strides alias on any one frame; it cannot take the size away from nine frame-and-size
+    /// pairs at fifteen intervals each without having broken the correction itself.
+    ///
+    /// Two exclusions, both of them the same effect this test exists to bound rather than
+    /// exceptions to it. `1` is not an interval but the unsampled estimator: it probes every
+    /// search and corrects every trial by its own measurement, and that overshoot selects the size
+    /// at no quantizer on `quadrants` and `mosaic` at 96x80, where every sampled interval selects
+    /// it at some. And `quadrants` at 96x80 - the smallest frame of the smallest set of blocks
+    /// that wins - loses it at `13` alone, which is the phase dependence again on a frame small
+    /// enough to show it, so that pair is left to the frames large enough not to.
+    #[test]
+    fn the_smallest_transform_is_selected_at_every_sampling_interval() {
+        for (width, height) in [(96_usize, 80_usize), (128, 96), (192, 160), (640, 352)] {
+            for (name, pixels) in content_frames(width as u32, height as u32) {
+                // `quadrants` at 96x80 is excluded above; at 640x352 only the frame the size
+                // wins most of - a smooth gradient - is run, because a large frame's encode is
+                // slow enough in a test build that three of them would dominate the suite.
+                let covered = match name {
+                    "smooth" => true,
+                    "bands" => width < 640,
+                    "quadrants" => (97..640).contains(&width),
+                    _ => false,
+                };
+                if !covered {
+                    continue;
+                }
+                for interval in 2_usize..=16 {
+                    let selected = [1_u8, 8, 32, 80, 160, 200].into_iter().any(|qindex| {
+                        tile::FrameEncoder::new(&pixels, width, height, qindex)
+                            .with_type_gain_interval(interval)
+                            .encode_with_report()
+                            .trace
+                            .iter()
+                            .any(|&(size, _)| size == 4)
+                    });
+                    assert!(
+                        selected,
+                        "no quantizer selected TX_4X4 on {name} at {width}x{height} with a \
+                         sampling interval of {interval}, so the per-size correction reaching the \
+                         smallest transform is back to depending on which coding blocks the \
+                         stride happens to sample"
+                    );
+                }
+            }
+        }
+    }
+
     /// `TYPE_GAIN_SAMPLE_INTERVAL` is the largest interval that keeps the smallest transform
     /// reachable, and that - not the rate-distortion penalty - is what fixes it.
     ///
@@ -1656,15 +1858,36 @@ mod nonlossless_tests {
     /// What chooses is coverage. The per-size correction is what makes `TX_4X4` selectable at all:
     /// coding a block as sixteen 4x4 transforms pays for its extra header bits because the type
     /// search gets sixteen chances to beat DCT, and only a probe measures that. On the 96x80
-    /// pattern - a frame small enough to have few coding blocks - a long enough interval never
-    /// probes a trial carrying the smallest size, the correction for `TX_4X4` is never measured,
-    /// and the size goes unselected exactly as it did before the correction existed. `16` loses it
-    /// outright, and so do `3`, `6` and `12`, which alias against the block raster the sample walks
-    /// in; `8` is the largest value that holds it.
+    /// pattern - a frame small enough to have few coding blocks - `16` loses the size outright,
+    /// and so do `3`, `6` and `12`; `8` is the largest value that holds it.
     ///
     /// So this pins the constant from the side that actually binds it: the shipped interval
     /// selects the smallest transform, and doubling it does not. Raising the constant on the
     /// strength of its candidate count fails here.
+    ///
+    /// #323 asked what the non-monotone column is, since `3`, `6` and `12` failing while the
+    /// longer `4` and `8` pass cannot be a sampling *rate* result, and
+    /// `measure_type_gain_phase_aliasing` answers it. It is not that a long interval never probes
+    /// a trial carrying the smallest size: 30 of this frame's 37 size searches can reach `TX_4X4`
+    /// and every interval from `1` to `16` probes between 1 and 30 of them, so the per-size
+    /// accumulator is populated at every interval, including the ones that lose the size. What
+    /// differs is *which* coding blocks are sampled, and that decides the outcome because a trial
+    /// that probed is corrected by its own measurement at full strength while every other trial's
+    /// is shrunk to [`tile::TYPE_GAIN_TRUST`] sixteenths - so `TX_4X4` is selectable only at a
+    /// coding block whose own size search probed. This frame has exactly two of them, at MI
+    /// positions `(0, 12)` and `(16, 12)`, and every interval that keeps the size does so through
+    /// one of those two: `1` and `2` sample both, `4` and `8` sample `(0, 12)`, and `3`, `5`, `6`,
+    /// `7` and everything from `9` up sample neither. The column is a phase against two search
+    /// indices, not a stride sharing a factor with a trials-per-coding-block count.
+    ///
+    /// That leaves this assertion resting on two blocks of one frame, so it is no longer the only
+    /// thing holding the size: `the_smallest_transform_is_selected_at_every_sampling_interval`
+    /// asserts the same property across nine frame-and-size pairs at every interval from `2` to
+    /// `16`, where it does not depend on the phase at all. The guarantee that would remove the
+    /// dependence here too - probing every size search that can reach the smallest transform - was
+    /// measured and rejected in the same sweep: 28-70% more transform-type candidates, about 10%
+    /// more encode time, and up to +12.4% *worse* rate-distortion, because the un-shrunk
+    /// own-probe correction overshoots towards the smaller size.
     #[test]
     fn the_type_gain_sampling_interval_is_the_longest_that_keeps_tx_4x4() {
         let (width, height) = (96_usize, 80_usize);
