@@ -393,6 +393,10 @@ const CABAC_BINS: usize = 1 << 18;
 /// Distinct context models the bin sequence cycles through.
 const CABAC_CONTEXTS: usize = 64;
 
+/// Bypass bins per `hevc_encode_cabac_bypass` iteration, matched to
+/// [`CABAC_BINS`] so the two CABAC groups' `elem/s` lines compare directly.
+const CABAC_BYPASS_BINS: usize = CABAC_BINS;
+
 /// Syntax elements per bitwriter iteration.
 const BITWRITER_VALUES: usize = 1 << 16;
 
@@ -408,6 +412,19 @@ fn entropy_coding(criterion: &mut Criterion) {
     let values: Vec<u32> = (0..BITWRITER_VALUES)
         .map(|i| (i as u32).wrapping_mul(2_654_435_761) >> 11)
         .collect();
+    // Run lengths spread over 1..=16 — the residual writer's range, from a
+    // one-bin Rice suffix to a full 16-coefficient `coeff_sign_flag` pass —
+    // so the workload is not one degenerate width.
+    let mut runs: Vec<(u32, u8)> = Vec::new();
+    let mut coded = 0usize;
+    let mut state = 0x2545_F491u32;
+    while coded < CABAC_BYPASS_BINS {
+        state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+        let remaining = CABAC_BYPASS_BINS - coded;
+        let n = ((1 + (state >> 20) % 16) as usize).min(remaining) as u8;
+        runs.push((state & ((1u32 << n) - 1), n));
+        coded += n as usize;
+    }
 
     // These two workloads are bin and syntax-element streams, not pictures.
     // Counting bins and values as the elements makes criterion's `elem/s` line
@@ -420,6 +437,22 @@ fn entropy_coding(criterion: &mut Criterion) {
     };
     bench_across_isas(criterion, &cabac, || {
         encoder_bench::cabac_encode_bins(&bins, CABAC_CONTEXTS)
+    });
+
+    // The complementary CABAC workload: contiguous bypass *runs* rather than
+    // single bypass bins interleaved with context-coded ones. This is the
+    // shape 62% of the lossy residual writer's bins have, and the only
+    // shape the run-at-a-time §9.3.5.5 step can be seen in — which is why
+    // `hevc_encode_cabac` above is expected not to move with it.
+    let bypass_runs = IsaWorkload {
+        sample_size: 20,
+        ..IsaWorkload::new(
+            "hevc_encode_cabac_bypass",
+            FrameWork::new(CABAC_BYPASS_BINS as u64, 1, 1),
+        )
+    };
+    bench_across_isas(criterion, &bypass_runs, || {
+        encoder_bench::cabac_encode_bypass_runs(&runs)
     });
 
     let bitwriter = IsaWorkload {
