@@ -63,6 +63,7 @@ fn main() {
     }
     let active = simd::active();
 
+    zvidlib::tmp_pu_hist::enable();
     let (configuration, samples) = bundled_sample();
     let factory = native_hevc_video_decoder_factory();
     let mut decoder = factory
@@ -115,6 +116,7 @@ fn main() {
     );
     println!();
     print!("{}", report.markdown_table(decoded));
+    zvidlib::tmp_pu_hist::dump();
     println!();
 
     println!(

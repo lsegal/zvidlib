@@ -61,8 +61,17 @@ pub enum Stage {
     InverseTransform = 3,
     /// §8.4.4.2 intra prediction, plus the §8.6.7 residual add and store.
     IntraPred = 4,
-    /// §8.5.3.3 inter prediction: interpolation and the weighted combine.
+    /// §8.5.3.3 inter prediction, *excluding* the two sub-stages below: the
+    /// §8.5.3.2 reference-plane setup and the per-prediction-unit allocation
+    /// that the interpolation and the write-back happen between.
     InterPred = 5,
+    /// §8.5.3.3.3 fractional-sample interpolation and the §8.5.3.3.4 weighted
+    /// combine — the part of inter prediction the `engine::simd` kernels are.
+    InterPredFilter = 11,
+    /// §8.4.4.1 `recSamples = Clip1( predSamples + resSamples )`: writing each
+    /// prediction unit's luma and chroma prediction, plus its residual, back
+    /// into the picture. Inside inter prediction, reached by no vector kernel.
+    InterPredWrite = 12,
     /// §8.5.3.2 motion-vector derivation: merge and AMVP candidate lists.
     MotionDerive = 10,
     /// §8.7.2 in-loop deblocking.
@@ -76,7 +85,7 @@ pub enum Stage {
 }
 
 /// Number of [`Stage`] variants — the width of every accumulator array here.
-pub const STAGE_COUNT: usize = 11;
+pub const STAGE_COUNT: usize = 13;
 
 /// Every [`Stage`], in declaration order, for reporting.
 pub const STAGES: [Stage; STAGE_COUNT] = [
@@ -86,6 +95,8 @@ pub const STAGES: [Stage; STAGE_COUNT] = [
     Stage::InverseTransform,
     Stage::IntraPred,
     Stage::InterPred,
+    Stage::InterPredFilter,
+    Stage::InterPredWrite,
     Stage::MotionDerive,
     Stage::Deblock,
     Stage::Sao,
@@ -103,7 +114,9 @@ impl Stage {
             Stage::Residual => "residual_cabac",
             Stage::InverseTransform => "inverse_transform",
             Stage::IntraPred => "intra_pred",
-            Stage::InterPred => "inter_pred",
+            Stage::InterPred => "inter_pred_setup",
+            Stage::InterPredFilter => "inter_pred_filter",
+            Stage::InterPredWrite => "inter_pred_write",
             Stage::MotionDerive => "motion_derive",
             Stage::Deblock => "deblock",
             Stage::Sao => "sao",
@@ -130,7 +143,7 @@ impl Stage {
             self,
             Stage::InverseTransform
                 | Stage::IntraPred
-                | Stage::InterPred
+                | Stage::InterPredFilter
                 | Stage::Deblock
                 | Stage::Sao
                 | Stage::ColorConvert
