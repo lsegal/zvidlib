@@ -1338,6 +1338,81 @@ mod nonlossless_tests {
         }
     }
 
+    /// How far the smallest transform and the per-frame rate-distortion ceilings survive past the
+    /// `16` the coverage assertions stop at (#329).
+    ///
+    /// `the_smallest_transform_is_selected_at_every_sampling_interval` holds `TX_4X4` across nine
+    /// frame-and-size pairs at every interval from `2` to `16`, and it passes at `16` precisely
+    /// because it is phase-independent - so it does not, on its own, say where the interval's
+    /// upper bound is. This carries both of the properties that could set one past that stop:
+    /// the coverage sweep out to `64`, and the per-frame penalty
+    /// `the_type_gain_sampling_interval_holds_on_content_it_was_not_tuned_on` sets its ceilings
+    /// from, over the same intervals. Whichever fails first is the bound.
+    #[test]
+    #[ignore = "measurement sweep, not an assertion"]
+    fn measure_type_gain_intervals_past_sixteen() {
+        let quantizers = [1_u8, 8, 32, 80, 160, 200];
+        let coverage_intervals: Vec<usize> = (2..=64).collect();
+        let intervals = [
+            2_usize, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 16, 20, 24, 32, 48, 64,
+        ];
+
+        println!("size,frame,interval,selects_tx4x4,candidates");
+        for (width, height) in [(96_usize, 80_usize), (128, 96), (192, 160), (640, 352)] {
+            for (name, pixels) in content_frames(width as u32, height as u32) {
+                // The same nine pairs the coverage assertion runs, so the two columns compare.
+                let covered = match name {
+                    "smooth" => true,
+                    "bands" => width < 640,
+                    "quadrants" => (97..640).contains(&width),
+                    _ => false,
+                };
+                if !covered {
+                    continue;
+                }
+                for &interval in &coverage_intervals {
+                    let selected = quantizers.into_iter().any(|qindex| {
+                        tile::FrameEncoder::new(&pixels, width, height, qindex)
+                            .with_type_gain_interval(interval)
+                            .encode_with_report()
+                            .trace
+                            .iter()
+                            .any(|&(size, _)| size == 4)
+                    });
+                    let candidates = tile::FrameEncoder::new(&pixels, width, height, 32)
+                        .with_type_gain_interval(interval)
+                        .encode_with_report()
+                        .candidates_evaluated;
+                    println!("{width}x{height},{name},{interval},{selected},{candidates}");
+                }
+            }
+        }
+
+        println!("size,frame,qindex,interval,penalty_percent");
+        for (width, height) in [(128_usize, 96_usize), (192, 160)] {
+            let mut frames = content_frames(width as u32, height as u32);
+            frames.push(("test_pattern", test_pattern(width as u32, height as u32)));
+            for (name, pixels) in &frames {
+                for qindex in quantizers {
+                    let ac = i64::from(crate::av1_intra::get_ac_quant(qindex));
+                    let lambda = (ac * ac / 256).max(1);
+                    let cost = |interval: usize| {
+                        let report = tile::FrameEncoder::new(pixels, width, height, qindex)
+                            .with_type_gain_interval(interval)
+                            .encode_with_report();
+                        sse_against(&report, pixels, width, height)
+                            + lambda * report.tile.len() as i64 * 8
+                    };
+                    let unsampled = cost(1);
+                    for interval in intervals {
+                        let penalty = cost(interval) as f64 / unsampled as f64 * 100.0 - 100.0;
+                        println!("{width}x{height},{name},{qindex},{interval},{penalty:+.3}");
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     #[ignore = "measurement sweep, not an assertion"]
     fn measure_type_gain_sampling_cost() {
@@ -1778,8 +1853,8 @@ mod nonlossless_tests {
     /// The smallest transform stays selectable whatever the sampling interval is, on frames with
     /// more than a couple of coding blocks where it wins.
     ///
-    /// `the_type_gain_sampling_interval_is_the_longest_that_keeps_tx_4x4` pins the shipped
-    /// interval on the 96x80 `test_pattern`, and #323 established what that frame is really
+    /// `the_type_gain_sampling_interval_is_the_longest_that_keeps_tx_4x4` used to pin the shipped
+    /// interval on the 96x80 `test_pattern`, and #323 established what that frame was really
     /// measuring: the size is chosen there at exactly two coding blocks, and only ever by a search
     /// that probed, because a trial that probed is corrected by its own measurement at full
     /// strength while every other trial's correction is shrunk to [`tile::TYPE_GAIN_TRUST`]
@@ -1790,6 +1865,9 @@ mod nonlossless_tests {
     /// never empty - and `measure_type_gain_phase_aliasing` prices the only guarantee that removes
     /// the dependence at 28-70% more transform-type candidates for up to +12.4% worse
     /// rate-distortion. So the sampler is left alone and this widens what the property rests on.
+    /// #329 retired that assertion outright in favour of
+    /// `the_type_gain_sampling_intervals_upper_bound_is_what_a_longer_one_buys`, so this is now
+    /// the only thing holding the smallest transform against the sampling interval at all.
     ///
     /// On content with enough blocks where the smallest transform wins - a smooth gradient,
     /// horizontal bands, and four flat quadrants - it is selected at *every* interval from 2 to 16
@@ -1806,6 +1884,11 @@ mod nonlossless_tests {
     /// it at some. And `quadrants` at 96x80 - the smallest frame of the smallest set of blocks
     /// that wins - loses it at `13` alone, which is the phase dependence again on a frame small
     /// enough to show it, so that pair is left to the frames large enough not to.
+    ///
+    /// The upper end is sampled rather than exhaustive. `measure_type_gain_intervals_past_sixteen`
+    /// ran all 567 cells of `2..=64` over these nine pairs without a failure; what runs here is
+    /// every interval to `16` and then `20`, `24`, `32`, `48` and `64`, because the 640x352 pair
+    /// costs six encodes a cell and the tail is where the property is least in doubt.
     #[test]
     fn the_smallest_transform_is_selected_at_every_sampling_interval() {
         for (width, height) in [(96_usize, 80_usize), (128, 96), (192, 160), (640, 352)] {
@@ -1822,7 +1905,11 @@ mod nonlossless_tests {
                 if !covered {
                     continue;
                 }
-                for interval in 2_usize..=16 {
+                // #329 swept every interval from 2 to 64 over these same nine pairs and found no
+                // cell that loses the size, so the stop at 16 was where the sweep stopped rather
+                // than where the property does. The long tail is sampled rather than exhaustive
+                // to keep the 640x352 pair's encode count down.
+                for interval in (2_usize..=16).chain([20, 24, 32, 48, 64]) {
                     let selected = [1_u8, 8, 32, 80, 160, 200].into_iter().any(|qindex| {
                         tile::FrameEncoder::new(&pixels, width, height, qindex)
                             .with_type_gain_interval(interval)
@@ -1843,78 +1930,115 @@ mod nonlossless_tests {
         }
     }
 
-    /// `TYPE_GAIN_SAMPLE_INTERVAL` is the largest interval that keeps the smallest transform
-    /// reachable, and that - not the rate-distortion penalty - is what fixes it.
+    /// What bounds `TYPE_GAIN_SAMPLE_INTERVAL` from above, now that neither coverage nor
+    /// rate-distortion does.
     ///
-    /// The interval used to be bounded from above by accuracy: under the frame-wide accumulator
-    /// it was calibrated against, the worst frame's penalty climbed to +85.8% by `16`, so the
-    /// value had to stay small. `TYPE_GAIN_TRUST` removed that bound - every interval from `1` to
-    /// `64` now lands within +3.5% of the unsampled estimator, and the mean cost against the
-    /// exhaustive search is *better* than the unsampled estimator's at every interval past `1`,
-    /// because a trial that probes is corrected in full and so the unsampled arm carries the
-    /// un-shrunk correction everywhere ([`tile::TYPE_GAIN_TRUST`] decomposes it) - so the penalty
-    /// column no longer chooses between them.
+    /// This assertion replaces `the_type_gain_sampling_interval_is_the_longest_that_keeps_tx_4x4`,
+    /// which held the constant by encoding the 96x80 `test_pattern` at the shipped interval and
+    /// at twice it and requiring the first to select `TX_4X4` and the second not to. #323 measured
+    /// what that was resting on and it was not a sampling rate: the size is chosen on that frame
+    /// at exactly two coding blocks, MI `(0, 12)` and `(16, 12)`, and only ever by a search that
+    /// probed, because a trial that probed is corrected by its own measurement at full strength
+    /// while every other trial's is shrunk to [`tile::TYPE_GAIN_TRUST`] sixteenths. Whether an
+    /// interval passed was therefore whether one of two search indices was a multiple of it - `4`
+    /// and `8` pass, `3`, `6`, `12` and `16` fail - so the upper bound on a shipped constant sat
+    /// on the sampling phase of two blocks of one frame.
     ///
-    /// What chooses is coverage. The per-size correction is what makes `TX_4X4` selectable at all:
-    /// coding a block as sixteen 4x4 transforms pays for its extra header bits because the type
-    /// search gets sixteen chances to beat DCT, and only a probe measures that. On the 96x80
-    /// pattern - a frame small enough to have few coding blocks - `16` loses the size outright,
-    /// and so do `3`, `6` and `12`; `8` is the largest value that holds it.
+    /// #328 made the coverage property phase-independent and #329 measured out what is left, over
+    /// every interval from `2` to `64` at 96x80, 128x96, 192x160 and 640x352. Three columns were
+    /// candidates for the bound and none of them is one:
     ///
-    /// So this pins the constant from the side that actually binds it: the shipped interval
-    /// selects the smallest transform, and doubling it does not. Raising the constant on the
-    /// strength of its candidate count fails here.
+    /// - **Coverage does not bind.** `TX_4X4` is selected at every interval from `2` to `64` on
+    ///   all nine frame-and-size pairs `the_smallest_transform_is_selected_at_every_sampling_interval`
+    ///   runs - 567 cells, no failures. The stop at `16` there was where the sweep stopped, not
+    ///   where the property does, so that test now runs past it.
+    /// - **Rate-distortion does not bind.** The worst per-frame cost against the unsampled
+    ///   estimator is `+3.48%` and it is a *level*, not a trend: `+1.27%` at `2`, `+3.48%` at `4`,
+    ///   `+3.43%` at `8`, `+1.47%` at `16`, `+1.47%` at `32`, `+3.27%` at `64`. Which frame pays
+    ///   moves - `bands` at `4` and `8`, `quadrants` at `12`, `24` and `64`, `smooth` and `mosaic`
+    ///   at `16` and `32` - but the envelope does not grow with the interval, so no interval in
+    ///   the range is disqualified by it. That is what the first half of this test asserts, and
+    ///   it is deliberately one bound over the whole range rather than a per-frame ceiling fitted
+    ///   at the shipped value: the per-frame ceilings in
+    ///   `the_type_gain_sampling_interval_holds_on_content_it_was_not_tuned_on` were set from the
+    ///   penalties measured *at* `8`, so only `4` and `8` clear them, and reading an upper bound
+    ///   off that would be the phase coincidence again in a second costume.
+    /// - **The saving does bind, by being exhausted.** #278 moved the interval from `2` to `8` for
+    ///   14% fewer transform-type candidates, and the issue's premise was that the saving keeps
+    ///   growing. It does, and it is not worth having: summed over six quantizers, going from `8`
+    ///   all the way to `64` buys between `2.8%` and `11.0%` fewer candidates per frame - `89.0%`
+    ///   of the shipped count on `smooth` at 128x96, its best case, and `97.2%` on `quadrants` -
+    ///   and `6.1%` over the whole 192x160 set, 174,638 against 163,933. Half of that is already
+    ///   claimed by `16`.
     ///
-    /// #323 asked what the non-monotone column is, since `3`, `6` and `12` failing while the
-    /// longer `4` and `8` pass cannot be a sampling *rate* result, and
-    /// `measure_type_gain_phase_aliasing` answers it. It is not that a long interval never probes
-    /// a trial carrying the smallest size: 30 of this frame's 37 size searches can reach `TX_4X4`
-    /// and every interval from `1` to `16` probes between 1 and 30 of them, so the per-size
-    /// accumulator is populated at every interval, including the ones that lose the size. What
-    /// differs is *which* coding blocks are sampled, and that decides the outcome because a trial
-    /// that probed is corrected by its own measurement at full strength while every other trial's
-    /// is shrunk to [`tile::TYPE_GAIN_TRUST`] sixteenths - so `TX_4X4` is selectable only at a
-    /// coding block whose own size search probed. This frame has exactly two of them, at MI
-    /// positions `(0, 12)` and `(16, 12)`, and every interval that keeps the size does so through
-    /// one of those two: `1` and `2` sample both, `4` and `8` sample `(0, 12)`, and `3`, `5`, `6`,
-    /// `7` and everything from `9` up sample neither. The column is a phase against two search
-    /// indices, not a stride sharing a factor with a trials-per-coding-block count.
-    ///
-    /// That leaves this assertion resting on two blocks of one frame, so it is no longer the only
-    /// thing holding the size: `the_smallest_transform_is_selected_at_every_sampling_interval`
-    /// asserts the same property across nine frame-and-size pairs at every interval from `2` to
-    /// `16`, where it does not depend on the phase at all. The guarantee that would remove the
-    /// dependence here too - probing every size search that can reach the smallest transform - was
-    /// measured and rejected in the same sweep: 28-70% more transform-type candidates, about 10%
-    /// more encode time, and up to +12.4% *worse* rate-distortion, because the un-shrunk
-    /// own-probe correction overshoots towards the smaller size.
+    /// So there is no upper bound in the sense the old assertion claimed one, and this states the
+    /// real position instead: the interval is safe over the whole swept range, and everything past
+    /// the shipped value is a re-roll of which frame draws the `+3.5%` phase for under a tenth of
+    /// the candidates. `8` is kept because moving it would move every digest
+    /// `a_fixed_frame_encodes_to_the_same_bytes_on_every_host` pins and every ceiling in
+    /// `the_type_gain_sampling_interval_holds_on_content_it_was_not_tuned_on` to buy that. What
+    /// this fails on is a real regression: an estimator change that makes a long interval start
+    /// costing, which breaks the level bound, or one that makes the remaining saving material,
+    /// which breaks the second - and either is a reason to revisit the constant that does not
+    /// depend on where two coding blocks of one frame happen to fall.
     #[test]
-    fn the_type_gain_sampling_interval_is_the_longest_that_keeps_tx_4x4() {
-        let (width, height) = (96_usize, 80_usize);
-        let pixels = test_pattern(width as u32, height as u32);
-        let selects_smallest = |interval: usize| {
-            [1_u8, 8, 32, 80, 160, 200].into_iter().any(|qindex| {
-                tile::FrameEncoder::new(&pixels, width, height, qindex)
-                    .with_type_gain_interval(interval)
-                    .encode_with_report()
-                    .trace
-                    .iter()
-                    .any(|&(size, _)| size == 4)
-            })
-        };
+    fn the_type_gain_sampling_intervals_upper_bound_is_what_a_longer_one_buys() {
+        // The shipped value and three multiples of it past where the coverage sweep used to stop,
+        // plus the value #278 moved off, so the range spans both sides of the constant.
+        let intervals = [2_usize, 8, 16, 32, 64];
         assert!(
-            selects_smallest(tile::TYPE_GAIN_SAMPLE_INTERVAL),
-            "no quantizer selected TX_4X4 at the shipped interval of {}, so the per-size \
-             correction no longer reaches the smallest transform",
+            intervals.contains(&tile::TYPE_GAIN_SAMPLE_INTERVAL),
+            "the shipped interval of {} is not in the swept set {intervals:?}, so this bounds              something other than the constant",
             tile::TYPE_GAIN_SAMPLE_INTERVAL
         );
-        let doubled = tile::TYPE_GAIN_SAMPLE_INTERVAL * 2;
-        assert!(
-            !selects_smallest(doubled),
-            "interval {doubled} also selected TX_4X4, so {} is no longer the largest interval \
-             the smallest transform survives and the constant is leaving candidate savings unclaimed",
-            tile::TYPE_GAIN_SAMPLE_INTERVAL
-        );
+        // One bound over the whole range, not a per-frame ceiling fitted at the shipped value:
+        // the measured worst is +3.48%, on `bands` at 128x96 and an interval of 4.
+        const SWEPT_CEILING: f64 = 4.0;
+        // The candidate count at the longest swept interval, as a percentage of the shipped
+        // interval's, summed over the quantizers. The measured worst case is 89.0%.
+        const LEAST_REMAINING: f64 = 85.0;
+        for (width, height) in [(128_usize, 96_usize), (192, 160)] {
+            let mut frames = content_frames(width as u32, height as u32);
+            frames.push(("test_pattern", test_pattern(width as u32, height as u32)));
+            for (name, pixels) in &frames {
+                let (mut shipped_candidates, mut longest_candidates) = (0_u64, 0_u64);
+                for qindex in [1_u8, 8, 32, 80, 160, 200] {
+                    let ac = i64::from(crate::av1_intra::get_ac_quant(qindex));
+                    let lambda = (ac * ac / 256).max(1);
+                    let run = |interval: usize| {
+                        let report = tile::FrameEncoder::new(pixels, width, height, qindex)
+                            .with_type_gain_interval(interval)
+                            .encode_with_report();
+                        let cost = sse_against(&report, pixels, width, height)
+                            + lambda * report.tile.len() as i64 * 8;
+                        (cost, report.candidates_evaluated)
+                    };
+                    let (unsampled, _) = run(1);
+                    for interval in intervals {
+                        let (cost, candidates) = run(interval);
+                        let penalty = cost as f64 / unsampled as f64 * 100.0 - 100.0;
+                        assert!(
+                            penalty <= SWEPT_CEILING,
+                            "{name} at {width}x{height}, qindex {qindex}, sampling interval                              {interval}: cost {cost} against the unsampled estimator's                              {unsampled} ({penalty:+.2}%), past the {SWEPT_CEILING}% the whole                              swept range is held to - so the sampling interval now has a                              rate-distortion upper bound, which it did not when this was written"
+                        );
+                        if interval == tile::TYPE_GAIN_SAMPLE_INTERVAL {
+                            shipped_candidates += candidates;
+                        }
+                        if interval == *intervals.last().unwrap() {
+                            longest_candidates += candidates;
+                        }
+                    }
+                }
+                let remaining = longest_candidates as f64 / shipped_candidates as f64 * 100.0;
+                assert!(
+                    remaining >= LEAST_REMAINING,
+                    "{name} at {width}x{height}: an interval of {} evaluates                      {longest_candidates} transform-type candidates against the shipped {}'s                      {shipped_candidates} ({remaining:.1}%), so more than the                      {:.0}% this leaves unclaimed is still on the table and the constant is worth                      re-deriving",
+                    intervals.last().unwrap(),
+                    tile::TYPE_GAIN_SAMPLE_INTERVAL,
+                    100.0 - LEAST_REMAINING
+                );
+            }
+        }
     }
 
     /// The stated bound on what the search shortcuts cost.
