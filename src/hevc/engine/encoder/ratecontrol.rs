@@ -147,7 +147,17 @@ mod tests {
 
     #[test]
     fn log2_q8_tracks_the_real_logarithm() {
-        for x in [1u64, 2, 3, 7, 100, 1_000, 65_535, 1 << 20, u64::from(u32::MAX)] {
+        for x in [
+            1u64,
+            2,
+            3,
+            7,
+            100,
+            1_000,
+            65_535,
+            1 << 20,
+            u64::from(u32::MAX),
+        ] {
             let approximated = f64::from(log2_q8(x)) / 256.0;
             let exact = (x as f64).log2();
             assert!(
@@ -268,4 +278,3 @@ mod tests {
         );
     }
 }
-

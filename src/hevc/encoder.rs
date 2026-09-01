@@ -1081,8 +1081,7 @@ mod tests {
             half_mean < mean,
             "halving the target did not shrink the stream: {half_mean} against {mean} bytes"
         );
-        let half_ratio =
-            (half_mean as f64 * 8.0) / picture_budget_bits(bits_per_second / 2) as f64;
+        let half_ratio = (half_mean as f64 * 8.0) / picture_budget_bits(bits_per_second / 2) as f64;
         assert!(
             (0.75..=1.25).contains(&half_ratio),
             "the halved target settled at {half_ratio:.3}x its budget, from {half:?}"
