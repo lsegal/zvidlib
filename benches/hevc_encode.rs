@@ -101,11 +101,11 @@ fn report_stage_coverage(_: &mut Criterion) {
          # (with both an exact and a quantized residual), CABAC + bitwriting, whole-picture\n\
          # access-unit writing for both the lossless PCM writer and the lossy residual writer,\n\
          # and the RGBA8->YUV420 input conversion. No stage of the pipeline is absent.\n\
-         # hevc_encode: hevc_rdcost and hevc_fwd_transform_quant are the encoder's two SIMD\n\
-         # dispatch families, so apart from the mode-search, forward-transform and\n\
-         # reconstruction groups (the last running the decoder's vectorized in-loop filter\n\
-         # kernels) the arms are expected to read flat across instruction sets, which is the\n\
-         # measured result, not a broken bench."
+         # hevc_encode: hevc_rdcost, hevc_fwd_transform_quant and hevc_colorconv are the\n\
+         # encoder's three SIMD dispatch families, so apart from the mode-search,\n\
+         # forward-transform, reconstruction (the last running the decoder's vectorized\n\
+         # in-loop filter kernels) and RGBA8->YUV420 groups the arms are expected to read\n\
+         # flat across instruction sets, which is the measured result, not a broken bench."
     );
 }
 
@@ -429,9 +429,10 @@ fn entropy_coding(criterion: &mut Criterion) {
 
 /// The RGBA8 to YUV420 conversion every encoded frame pays before mode search.
 ///
-/// Not one of the stages the tracking issue lists, and not a SIMD dispatch site,
-/// but it is real per-frame encoder cost: without it the per-stage groups do not
-/// add up to the whole-frame number.
+/// Real per-frame encoder cost — without it the per-stage groups do not add up
+/// to the whole-frame number — and, since `engine::encoder::colorconv`, the
+/// encoder's second SIMD dispatch site, so this group measures a scalar arm
+/// against a vector one rather than reading flat.
 fn color_conversion(criterion: &mut Criterion, size: (u32, u32), group_prefix: &str) {
     let frame = support::synthetic_rgba8_sequence(size.0, size.1, 1).remove(0);
     let name = format!("{group_prefix}_rgba_to_yuv420");

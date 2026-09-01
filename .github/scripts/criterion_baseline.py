@@ -227,11 +227,15 @@ def table(args: argparse.Namespace) -> int:
     """
     merged: dict[str, float] = {}
     hosts: list[str] = []
+    commits: list[str] = []
     for path in args.baseline:
         baseline = json.loads(pathlib.Path(path).read_text())
         recorded = baseline.get("host")
         if recorded and recorded not in hosts:
             hosts.append(recorded)
+        commit = baseline.get("commit")
+        if commit and commit not in commits:
+            commits.append(commit)
         for identifier, entry in baseline.get("benchmarks", {}).items():
             median = entry.get("median_ns")
             if not isinstance(median, (int, float)):
@@ -255,8 +259,20 @@ def table(args: argparse.Namespace) -> int:
     present = [isa for isa in isa_names if any(isa in arms for arms in groups.values())]
     host = args.host or (hosts[0] if hosts else "unknown host")
 
+    # The commit is part of the measurement, not decoration: kernels land often
+    # enough that a table without one cannot be told from a stale table.
+    if len(commits) == 1:
+        provenance = f"Measured on **{host}**, at `{commits[0][:12]}`."
+    elif commits:
+        provenance = (
+            f"Measured on **{host}**, across {len(commits)} commits "
+            f"(newest `{commits[-1][:12]}`)."
+        )
+    else:
+        provenance = f"Measured on **{host}**."
+
     lines = [
-        f"Measured on **{host}**.",
+        provenance,
         "",
         "| Group | " + " | ".join(f"`{isa}`" for isa in present) + " | Best |",
         "| --- | " + " | ".join("---:" for _ in present) + " | ---: |",
