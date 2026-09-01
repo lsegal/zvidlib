@@ -379,9 +379,8 @@ pub(crate) struct IntraModeDecision {
 ///
 /// Ranking on the prediction alone is only an approximation of what the block
 /// costs once it is quantized, so a caller that can afford it re-scores this
-/// shortlist on the reconstruction it will actually code — see
-/// [`intra_mode_bit_cost`] and [`residual_bit_cost`] for the rate half of that
-/// second pass.
+/// shortlist on the reconstruction it will actually code, keeping
+/// [`intra_mode_bit_cost`] as the rate half of that second pass.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn shortlist_intra_luma_modes(
     source: &[u8],
@@ -393,7 +392,9 @@ pub(crate) fn shortlist_intra_luma_modes(
     shortlist: usize,
     mut predict: impl FnMut(u8) -> Vec<i32>,
 ) -> Vec<IntraModeDecision> {
-    let lambda = lambda_q8(qp);
+    // The rough pass measures a sum of absolute differences, not squared
+    // error, so it trades against the square root of the SSD-domain lambda.
+    let lambda = lambda_satd_q8(qp);
     let mut pred = vec![0u8; n_tbs * n_tbs];
     let mut ranked = Vec::with_capacity(usize::from(INTRA_PRED_MODE_MAX) + 1);
     for mode in 0..=INTRA_PRED_MODE_MAX {
@@ -426,32 +427,12 @@ pub(crate) fn intra_mode_bit_cost(mode: u8, candidates: [u8; 3]) -> u32 {
     }
 }
 
-/// Bit estimate for one transform block's §7.3.8.11 `residual_coding( )`.
-///
-/// This is a cost model, not a bin count: an exp-Golomb length per coded level
-/// plus a sign bit, with a flat significance-map allowance per coded block. It
-/// only has to order two candidate mode's residuals against each other, which
-/// is all the second RDO pass asks of it.
-pub(crate) fn residual_bit_cost(levels: &[i32]) -> u32 {
-    let mut bits = 0u32;
-    let mut coded = 0u32;
-    for &level in levels {
-        if level == 0 {
-            continue;
-        }
-        coded += 1;
-        bits += exp_golomb_bits(level.unsigned_abs()) + 1;
-    }
-    if coded == 0 {
-        // cbf == 0: the block costs its coded-block flag and no more.
-        return 1;
-    }
-    bits + coded + SIGNIFICANCE_MAP_BITS
+/// The rough pass's lambda: [`lambda_q8`] taken into the SATD domain, where
+/// distortion is a first-order metric rather than a squared one.
+pub(crate) fn lambda_satd_q8(qp: i32) -> u32 {
+    let lambda = f64::from(lambda_q8(qp)) / 256.0;
+    (lambda.sqrt() * 256.0).round().max(1.0) as u32
 }
-
-/// Flat per-coded-block allowance for the last-position and significance-map
-/// syntax that precedes the levels.
-const SIGNIFICANCE_MAP_BITS: u32 = 12;
 
 /// The lambda the searches above trade distortion against rate with,
 /// `0.57 * 2 ^ ( ( QP - 12 ) / 3 )` in Q8 fixed point.

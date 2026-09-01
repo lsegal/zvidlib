@@ -48,8 +48,7 @@ use crate::hevc::engine::encoder::pcm::{
     PcmEncodeError, level_idc_for, write_pps, write_sps, write_vps,
 };
 use crate::hevc::engine::encoder::rdo::{
-    DistortionBackend, intra_mode_bit_cost, lambda_q8, residual_bit_cost,
-    shortlist_intra_luma_modes,
+    DistortionBackend, intra_mode_bit_cost, lambda_q8, shortlist_intra_luma_modes,
 };
 use crate::hevc::engine::encoder::recon::ReconstructedPicture;
 use crate::hevc::engine::encoder::residual::{
@@ -340,11 +339,13 @@ fn write_idr_residual_slice(
 ///
 /// Two passes. [`shortlist_intra_luma_modes`] ranks all 35 Table 8-1 modes on
 /// the prediction's SATD, which costs no transform; the shortlist is then
-/// re-scored on what each mode actually costs after quantization — the
+/// re-scored on what each mode actually costs after quantization: the
 /// reconstruction's squared error against the source, traded against the
-/// mode's §7.3.8.5 signalling and its residual. The winner's `CodedBlock` is
-/// the one the caller commits, so the mode that is coded is the mode that was
-/// measured.
+/// mode's own §7.3.8.5 signalling. The residual's rate is deliberately not in
+/// that second cost — this writer has no rate control, so its job at a given
+/// QP is the closest picture, and a better prediction shrinks the residual on
+/// its own. The winner's `CodedBlock` is the one the caller commits, so the
+/// mode that is coded is the mode that was measured.
 #[allow(clippy::too_many_arguments)]
 fn decide_luma_mode(
     plane: Plane<'_>,
@@ -388,8 +389,7 @@ fn decide_luma_mode(
     let mut best: Option<(u64, u8, CodedBlock)> = None;
     for candidate in &shortlist {
         let coded = code(candidate.mode);
-        let bits = u64::from(intra_mode_bit_cost(candidate.mode, candidates))
-            + u64::from(residual_bit_cost(&coded.levels));
+        let bits = u64::from(intra_mode_bit_cost(candidate.mode, candidates));
         let cost = sum_squared_error(plane, x0, y0, CTB, &coded.samples)
             .saturating_add(bits * lambda / 256);
         if best
@@ -407,8 +407,8 @@ fn decide_luma_mode(
 /// the Cb and Cr blocks it codes to.
 ///
 /// One syntax element covers both chroma blocks, so the five Table 9-46 values
-/// are scored on the pair's joint squared error against their joint residual
-/// cost. Value 4 (`IntraPredModeC == IntraPredModeY`) is one of them, so this
+/// are scored on the pair's joint squared error, against the same
+/// signalling-only rate term [`decide_luma_mode`] uses. Value 4 (`IntraPredModeC == IntraPredModeY`) is one of them, so this
 /// can only improve on deriving chroma from luma unconditionally — which
 /// matters here because the luma mode is chosen on luma alone and the chroma
 /// planes need not share its orientation.
@@ -458,9 +458,7 @@ fn decide_chroma_mode(
     let mut best: Option<(u64, u8, [CodedBlock; 2])> = None;
     for signalled in 0..=CHROMA_MODE_DERIVED {
         let coded = code(signalled);
-        let bits = u64::from(chroma_mode_bit_cost(signalled))
-            + u64::from(residual_bit_cost(&coded[0].levels))
-            + u64::from(residual_bit_cost(&coded[1].levels));
+        let bits = u64::from(chroma_mode_bit_cost(signalled));
         let distortion = coded
             .iter()
             .zip(&planes)

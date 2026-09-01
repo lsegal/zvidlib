@@ -759,8 +759,10 @@ mod tests {
             "a finer quantizer must distort less: QP 12 gave {fine:.2} dB, QP 37 gave \
              {coarse:.2} dB"
         );
+        // The DC-only residual writer reached 25.00 dB at this operating
+        // point; the RDO intra mode decision must not give that back.
         assert!(
-            coarse > 20.0,
+            coarse > 25.0,
             "even the coarse operating point should stay recognizable: {coarse:.2} dB"
         );
     }
