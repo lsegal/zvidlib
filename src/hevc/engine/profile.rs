@@ -117,6 +117,13 @@ impl Stage {
     /// This is the classification the Amdahl ceiling in [`Report`] is computed
     /// from: the sum of the vectorized stages' shares is the only part of a
     /// decode any amount of SIMD can move.
+    ///
+    /// [`Stage::ColorConvert`] counts here as of issue #219, which gave the
+    /// output conversion a kernel of its own — it is not decoding, but it is
+    /// on the path of every whole-frame measurement, so it is part of what
+    /// SIMD moves in the number those groups report. It still contributes
+    /// nothing to [`Report::vectorized_decode_share`], whose denominator
+    /// excludes it.
     #[must_use]
     pub fn is_vectorized(self) -> bool {
         matches!(
@@ -126,6 +133,7 @@ impl Stage {
                 | Stage::InterPred
                 | Stage::Deblock
                 | Stage::Sao
+                | Stage::ColorConvert
         )
     }
 }
@@ -551,5 +559,6 @@ mod tests {
         assert!((report.speedup_at(1.0) - 1.0).abs() < 1e-9);
         assert!(!Stage::Residual.is_vectorized());
         assert!(Stage::Sao.is_vectorized());
+        assert!(Stage::ColorConvert.is_vectorized());
     }
 }
