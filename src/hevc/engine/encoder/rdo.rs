@@ -582,6 +582,81 @@ mod tests {
         }));
     }
 
+    /// The residual rate estimate has to order two candidate residuals the
+    /// same way the bitstream does, which is the only property a mode decision
+    /// asks of it.
+    #[test]
+    fn the_residual_rate_estimate_orders_blocks_the_way_the_writer_does() {
+        use crate::hevc::engine::cabac::init_type;
+        use crate::hevc::engine::ctx_init::SliceContexts;
+        use crate::hevc::engine::encoder::bitwriter::BitWriter;
+        use crate::hevc::engine::encoder::cabac::CabacEncoder;
+        use crate::hevc::engine::encoder::residual::EngineResidualBinSink;
+        use crate::hevc::engine::scan::ScanIdx;
+
+        let params = ResidualWriteParams {
+            log2_trafo_size: 4,
+            is_chroma: false,
+            scan_idx: ScanIdx::Diagonal,
+        };
+        // A block the decoder infers from `cbf == 0` codes no
+        // `residual_coding( )` at all, so it costs nothing to carry.
+        assert_eq!(residual_rate_bits(&[0i32; 256], &params), 0);
+
+        // Progressively more expensive residuals: one DC level, the same
+        // level pushed further from the DC corner, a spread of levels, and
+        // large levels that spill into `coeff_abs_level_remaining`.
+        let block = |fill: &dyn Fn(usize, usize) -> i32| -> Vec<i32> {
+            (0..256).map(|i| fill(i % 16, i / 16)).collect()
+        };
+        let candidates = [
+            block(&|x, y| i32::from(x == 0 && y == 0)),
+            block(&|x, y| i32::from(x == 3 && y == 2)),
+            block(&|x, y| if x < 4 && y < 4 { 1 } else { 0 }),
+            block(&|x, y| if x < 4 && y < 4 { 40 } else { 0 }),
+        ];
+
+        // What each one really costs: the arithmetic-coded length the writer
+        // emits from a freshly initialized I-slice context bank.
+        let coded_bits = |levels: &[i32]| -> usize {
+            let mut w = BitWriter::new();
+            let mut cabac = CabacEncoder::new();
+            let mut ctxs = SliceContexts::init(init_type(2, false), 26);
+            write_residual_coding(
+                &mut EngineResidualBinSink {
+                    writer: &mut w,
+                    cabac: &mut cabac,
+                    contexts: &mut ctxs.residual,
+                },
+                &params,
+                levels,
+            );
+            w.finish().len() * 8
+        };
+
+        let estimates: Vec<u32> = candidates
+            .iter()
+            .map(|levels| residual_rate_bits(levels, &params))
+            .collect();
+        let coded: Vec<usize> = candidates.iter().map(|levels| coded_bits(levels)).collect();
+        for i in 1..candidates.len() {
+            assert!(
+                estimates[i] > estimates[i - 1],
+                "candidate {i} estimated {} bins against candidate {}'s {}",
+                estimates[i],
+                i - 1,
+                estimates[i - 1]
+            );
+            assert!(
+                coded[i] >= coded[i - 1],
+                "the estimate ordered candidates {} and {i} the writer does not: {:?} vs {:?}",
+                i - 1,
+                estimates,
+                coded
+            );
+        }
+    }
+
     #[test]
     fn candidate_table_covers_hevc_block_and_partition_shapes() {
         for size in [4usize, 8, 16, 32, 64] {
