@@ -48,7 +48,8 @@ use crate::hevc::engine::encoder::pcm::{
     PcmEncodeError, level_idc_for, write_pps, write_sps, write_vps,
 };
 use crate::hevc::engine::encoder::rdo::{
-    DistortionBackend, intra_mode_bit_cost, lambda_q8, shortlist_intra_luma_modes,
+    DistortionBackend, intra_mode_bit_cost, lambda_q8, residual_rate_bits,
+    shortlist_intra_luma_modes,
 };
 use crate::hevc::engine::encoder::recon::ReconstructedPicture;
 use crate::hevc::engine::encoder::residual::{
@@ -89,18 +90,39 @@ const CHROMA_MODE_DERIVED: u8 = 4;
 /// The valid `SliceQpY` range at 8-bit depth (`QpBdOffsetY == 0`).
 const QP_RANGE: core::ops::RangeInclusive<i32> = 0..=51;
 
-/// Which intra modes the writer is allowed to code.
+/// Which intra modes the writer is allowed to code, and what the decision that
+/// picks between them optimizes — the operating point.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ModeSearch {
-    /// The full decision: [`shortlist_intra_luma_modes`] over all 35 luma
-    /// modes, re-scored on the quantized reconstruction, and the §8.4.3 chroma
-    /// mode picked the same way.
+    /// The fixed-QP operating point: [`shortlist_intra_luma_modes`] over all
+    /// 35 luma modes, re-scored on the quantized reconstruction against the
+    /// mode's own signalling only, and the §8.4.3 chroma mode picked the same
+    /// way. With no bitrate to hit, the writer's job at a given QP is the
+    /// closest picture, so the residual's own rate is left out of the cost.
     Rdo,
+    /// The rate-constrained operating point: the same search, with the
+    /// residual's estimated rate ([`residual_rate_bits`]) added to each
+    /// candidate's rate term, so the decision minimizes the full
+    /// `D + lambda * R` rather than distortion against signalling alone.
+    ///
+    /// This is what a rate-controlled encoder needs; the writer has no
+    /// bitrate target to hit yet, so nothing outside the tests that measure
+    /// the two operating points against each other selects it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    RateDistortion,
     /// Every coding unit pinned to `INTRA_DC` with chroma derived from it —
     /// the writer's behaviour before the mode search, kept as the baseline the
     /// search is measured against.
     #[cfg(test)]
     DcOnly,
+}
+
+impl ModeSearch {
+    /// Whether the second-pass cost charges each candidate for the bins its
+    /// own residual would code, on top of the mode signalling.
+    fn charges_residual_rate(self) -> bool {
+        self == ModeSearch::RateDistortion
+    }
 }
 
 /// One colour component's geometry inside the picture being coded.
@@ -340,12 +362,14 @@ fn write_idr_residual_slice(
 /// Two passes. [`shortlist_intra_luma_modes`] ranks all 35 Table 8-1 modes on
 /// the prediction's SATD, which costs no transform; the shortlist is then
 /// re-scored on what each mode actually costs after quantization: the
-/// reconstruction's squared error against the source, traded against the
-/// mode's own §7.3.8.5 signalling. The residual's rate is deliberately not in
-/// that second cost — this writer has no rate control, so its job at a given
-/// QP is the closest picture, and a better prediction shrinks the residual on
-/// its own. The winner's `CodedBlock` is the one the caller commits, so the
-/// mode that is coded is the mode that was measured.
+/// reconstruction's squared error against the source, traded against the rate
+/// the operating point charges. At [`ModeSearch::Rdo`] that rate is the mode's
+/// own §7.3.8.5 signalling only — this writer has no bitrate target, so its
+/// job at a given QP is the closest picture, and a better prediction shrinks
+/// the residual on its own. At [`ModeSearch::RateDistortion`] the residual's
+/// own estimated bins join it, which is the cost a rate-controlled encoder
+/// has to minimize. The winner's `CodedBlock` is the one the caller commits,
+/// so the mode that is coded is the mode that was measured.
 #[allow(clippy::too_many_arguments)]
 fn decide_luma_mode(
     plane: Plane<'_>,
@@ -389,7 +413,8 @@ fn decide_luma_mode(
     let mut best: Option<(u64, u8, CodedBlock)> = None;
     for candidate in &shortlist {
         let coded = code(candidate.mode);
-        let bits = u64::from(intra_mode_bit_cost(candidate.mode, candidates));
+        let bits = u64::from(intra_mode_bit_cost(candidate.mode, candidates))
+            + residual_rate(search, &coded.levels, CTB_LOG2, false);
         let cost = sum_squared_error(plane, x0, y0, CTB, &coded.samples)
             .saturating_add(bits * lambda / 256);
         if best
@@ -407,8 +432,9 @@ fn decide_luma_mode(
 /// the Cb and Cr blocks it codes to.
 ///
 /// One syntax element covers both chroma blocks, so the five Table 9-46 values
-/// are scored on the pair's joint squared error, against the same
-/// signalling-only rate term [`decide_luma_mode`] uses. Value 4 (`IntraPredModeC == IntraPredModeY`) is one of them, so this
+/// are scored on the pair's joint squared error, against the same rate term
+/// [`decide_luma_mode`] uses at this operating point — the mode signalling
+/// alone, or that plus both blocks' residual bins. Value 4 (`IntraPredModeC == IntraPredModeY`) is one of them, so this
 /// can only improve on deriving chroma from luma unconditionally — which
 /// matters here because the luma mode is chosen on luma alone and the chroma
 /// planes need not share its orientation.
@@ -458,7 +484,11 @@ fn decide_chroma_mode(
     let mut best: Option<(u64, u8, [CodedBlock; 2])> = None;
     for signalled in 0..=CHROMA_MODE_DERIVED {
         let coded = code(signalled);
-        let bits = u64::from(chroma_mode_bit_cost(signalled));
+        let bits = u64::from(chroma_mode_bit_cost(signalled))
+            + coded
+                .iter()
+                .map(|block| residual_rate(search, &block.levels, CTB_LOG2 - 1, true))
+                .sum::<u64>();
         let distortion = coded
             .iter()
             .zip(&planes)
@@ -484,6 +514,26 @@ fn chroma_mode_bit_cost(signalled: u8) -> u32 {
     } else {
         3
     }
+}
+
+/// The rate this operating point charges a candidate for its own residual: the
+/// bins §7.3.8.11 `residual_coding( )` would emit for `levels`, or nothing at
+/// the fixed-QP operating point that does not model residual rate at all.
+///
+/// The scan is the one [`write_idr_residual_slice`] codes with — §7.4.9.11's
+/// mode-dependent scans need a smaller block than either of the two sizes here.
+fn residual_rate(search: ModeSearch, levels: &[i32], log2_trafo_size: u32, is_chroma: bool) -> u64 {
+    if !search.charges_residual_rate() {
+        return 0;
+    }
+    u64::from(residual_rate_bits(
+        levels,
+        &ResidualWriteParams {
+            log2_trafo_size,
+            is_chroma,
+            scan_idx: ScanIdx::Diagonal,
+        },
+    ))
 }
 
 /// One transform block coded against a candidate prediction: the levels the
