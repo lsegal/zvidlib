@@ -11,6 +11,12 @@
 //!   edge-offset class — four full passes over the picture before the filter
 //!   itself runs.
 //!
+//! The search's band-offset half ([`band_offset_row`]) is a dispatch site here
+//! too, but every arm of it resolves to the scalar reference: its 32-way
+//! scatter is not something SSE4.1, AVX2 or NEON can express, and both vector
+//! shapes that leaves were written and measured below parity. That kernel's
+//! documentation carries the numbers.
+//!
 //! Both are dispatched here through cached runtime CPU feature detection
 //! ([`isa`]) to an SSE4.1 or AVX2 implementation on `x86_64`, a NEON
 //! implementation on `aarch64`, or the portable scalar reference everywhere
@@ -174,6 +180,61 @@ pub(crate) fn reconstruct_row_scalar(dst: &mut [i32], src: &[u8], pred: &[u8]) {
     }
 }
 
+/// One row of §8.6.6 reconstruction from an already-coded residual:
+/// `dst = Clip1( pred + coded )`.
+///
+/// This is the quantizing writer's half of the same §8.6.6 loop
+/// [`reconstruct_row`] runs for the lossless one. There the residual is the
+/// exact `src − pred` and can be recovered from two byte runs; here it has
+/// already been round-tripped through the §8.6.4 forward transform, §8.6.3
+/// quantization and the decoder's own §8.6.2 reconstruction, so both operands
+/// arrive as `i32` runs and the sum no longer fits the 16-bit lanes
+/// [`reconstruct_row`] uses. The kernels below therefore stay in 32-bit lanes,
+/// which is exact for any `coded` a decoder can produce.
+///
+/// # Panics
+/// Panics unless all three slices have the same length.
+pub(crate) fn add_clip_row(dst: &mut [i32], pred: &[i32], coded: &[i32]) {
+    assert_eq!(
+        dst.len(),
+        pred.len(),
+        "destination and prediction rows differ"
+    );
+    assert_eq!(
+        dst.len(),
+        coded.len(),
+        "destination and residual rows differ"
+    );
+    match isa_code() {
+        #[cfg(target_arch = "x86_64")]
+        ISA_AVX2 => {
+            // SAFETY: the lengths agree, and this arm is only reachable after
+            // `is_x86_feature_detected!("avx2")` or an override clamped to an
+            // available instruction set.
+            unsafe { x86::add_clip_row_avx2(dst, pred, coded) }
+        }
+        #[cfg(target_arch = "x86_64")]
+        ISA_SSE41 => {
+            // SAFETY: as above, with SSE4.1 detected.
+            unsafe { x86::add_clip_row_sse41(dst, pred, coded) }
+        }
+        #[cfg(target_arch = "aarch64")]
+        ISA_NEON => {
+            // SAFETY: the lengths agree, and NEON is part of the aarch64
+            // baseline this code is compiled for.
+            unsafe { neon::add_clip_row(dst, pred, coded) }
+        }
+        _ => add_clip_row_scalar(dst, pred, coded),
+    }
+}
+
+/// The portable reference for [`add_clip_row`].
+pub(crate) fn add_clip_row_scalar(dst: &mut [i32], pred: &[i32], coded: &[i32]) {
+    for ((d, &p), &c) in dst.iter_mut().zip(pred.iter()).zip(coded.iter()) {
+        *d = (p + c).clamp(0, BIT_DEPTH_MAX);
+    }
+}
+
 /// Per-category error sums and sample counts for one run of the §8.7.3.2
 /// edge-offset classification, indexed by `SaoOffsetVal` category `1..=4`.
 ///
@@ -260,6 +321,90 @@ pub(crate) fn edge_offset_row_scalar(
         };
         stats.sums[category] += i64::from(src[i]) - i64::from(here[i]);
         stats.counts[category] += 1;
+    }
+}
+
+/// Per-band error sums and sample counts for one run of the §8.7.3.2
+/// band-offset classification, indexed by the band index
+/// `sample >> (bitDepth − 5)`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct BandStats {
+    /// Summed `source − reconstruction` error per band.
+    pub sums: [i64; 32],
+    /// Number of samples per band.
+    pub counts: [i64; 32],
+}
+
+/// §8.7.3.2 `bandShift`: the reconstruction's top five bits index the 32 bands,
+/// which at this module's fixed 8-bit geometry is a shift of three.
+const BAND_SHIFT: i32 = 3;
+
+/// Classifies one horizontal run of reconstructed samples into §8.7.3.2 bands
+/// and accumulates the source-versus-reconstruction error of each into `stats`.
+///
+/// `here` is the run of reconstructed samples and `src` the co-located source
+/// samples. Every sample lands in exactly one of the 32 bands, so unlike
+/// [`edge_offset_row`] nothing is dropped and the counts sum to the run length.
+///
+/// The band index clamps the reconstruction into the 8-bit range before
+/// shifting, but the error is taken against the unclamped sample.
+///
+/// # This is a dispatch site with no vector arm, and that is the measured result
+///
+/// Unlike [`edge_offset_row`], every arm below resolves to the scalar
+/// reference. The band search is not a 5-way classification like the edge
+/// search is — it is a 32-way *scatter*, and none of the instruction sets this
+/// module targets can express one. SSE4.1, AVX2 and NEON have no scatter, and
+/// masking 32 accumulators per vector costs far more than the four to eight
+/// dependent read-modify-writes it would replace. What is left to vectorize is
+/// only the classification in front of the scatter — the clamp, the shift and
+/// the widened subtraction — which is a minority of the work.
+///
+/// Both shapes that leaves were written and measured on an Apple Silicon host,
+/// against this scalar reference over L1-resident runs of 16, 64, 256 and 1024
+/// samples, best of interleaved rounds, and measured a second time from a
+/// standalone harness to check the first:
+///
+/// | NEON shape | ratio to scalar |
+/// |---|---|
+/// | classify into staging buffers, then scatter the buffers | 0.42-1.30x |
+/// | classify and scatter straight out of the vector lanes | 0.44-1.24x |
+///
+/// Neither shape separates from the scalar reference. Both straddle 1.00x by
+/// less than the spread between repeats of the same measurement on this
+/// contended host — the ranges above are run-to-run noise around parity, not a
+/// speedup at one run length and a slowdown at another, and repeating the
+/// 64-sample point alone moved each shape across most of its range. That is
+/// the same answer the whole-picture `hevc_encode_640x352_reconstruct` group
+/// gave, where the NEON arm did not improve.
+///
+/// The staging round trip in particular costs more than the classification it
+/// vectorizes, and extracting the lanes only replaces four stores with four
+/// lane reads in front of the same four dependent read-modify-writes. Neither
+/// was worth landing, so this dispatches to scalar the way
+/// [`crate::hevc::engine::simd::combine_weighted`] does on the instruction sets
+/// where its kernel measured below parity.
+///
+/// The site is kept rather than the call inlined into
+/// [`crate::hevc::engine::encoder::recon`] so the band search stays a named
+/// `hevc_recon` dispatch point: the reference is exercised under every
+/// `crate::simd::set_override` pin by the tests below, so a future kernel — an
+/// AVX-512 one, where `vpconflictd` and a real scatter change the arithmetic
+/// above — has a place to go and a bit-exactness harness already pointed at it.
+/// x86_64 is untimed here and tracked separately.
+pub(crate) fn band_offset_row(here: &[i32], src: &[u8], stats: &mut BandStats) {
+    assert_eq!(here.len(), src.len(), "run and source differ");
+    band_offset_row_scalar(here, src, stats)
+}
+
+/// The portable reference for [`band_offset_row`], and on every instruction set
+/// this module targets, the implementation it dispatches to.
+pub(crate) fn band_offset_row_scalar(here: &[i32], src: &[u8], stats: &mut BandStats) {
+    for i in 0..here.len() {
+        let recon = here[i];
+        let band = (recon.clamp(0, BIT_DEPTH_MAX) >> BAND_SHIFT) as usize;
+        stats.sums[band] += i64::from(src[i]) - i64::from(recon);
+        stats.counts[band] += 1;
     }
 }
 
@@ -352,6 +497,66 @@ mod x86 {
                 i += 8;
             }
             super::reconstruct_row_scalar(&mut dst[i..], &src[i..], &pred[i..]);
+        }
+    }
+
+    /// `Clip1(pred + coded)` over four `i32` lanes.
+    #[inline]
+    #[target_feature(enable = "sse4.1")]
+    unsafe fn add_clip4_sse41(dst: *mut i32, pred: *const i32, coded: *const i32) {
+        unsafe {
+            let p = _mm_loadu_si128(pred.cast());
+            let c = _mm_loadu_si128(coded.cast());
+            let sum = _mm_add_epi32(p, c);
+            let clipped = _mm_min_epi32(
+                _mm_max_epi32(sum, _mm_setzero_si128()),
+                _mm_set1_epi32(BIT_DEPTH_MAX),
+            );
+            _mm_storeu_si128(dst.cast(), clipped);
+        }
+    }
+
+    #[target_feature(enable = "sse4.1")]
+    pub(super) unsafe fn add_clip_row_sse41(dst: &mut [i32], pred: &[i32], coded: &[i32]) {
+        unsafe {
+            let n = dst.len();
+            let mut i = 0;
+            while i + 4 <= n {
+                add_clip4_sse41(
+                    dst.as_mut_ptr().add(i),
+                    pred.as_ptr().add(i),
+                    coded.as_ptr().add(i),
+                );
+                i += 4;
+            }
+            super::add_clip_row_scalar(&mut dst[i..], &pred[i..], &coded[i..]);
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn add_clip_row_avx2(dst: &mut [i32], pred: &[i32], coded: &[i32]) {
+        unsafe {
+            let n = dst.len();
+            let zero = _mm256_setzero_si256();
+            let max = _mm256_set1_epi32(BIT_DEPTH_MAX);
+            let mut i = 0;
+            while i + 8 <= n {
+                let p = _mm256_loadu_si256(pred.as_ptr().add(i).cast());
+                let c = _mm256_loadu_si256(coded.as_ptr().add(i).cast());
+                let sum = _mm256_add_epi32(p, c);
+                let clipped = _mm256_min_epi32(_mm256_max_epi32(sum, zero), max);
+                _mm256_storeu_si256(dst.as_mut_ptr().add(i).cast(), clipped);
+                i += 8;
+            }
+            while i + 4 <= n {
+                add_clip4_sse41(
+                    dst.as_mut_ptr().add(i),
+                    pred.as_ptr().add(i),
+                    coded.as_ptr().add(i),
+                );
+                i += 4;
+            }
+            super::add_clip_row_scalar(&mut dst[i..], &pred[i..], &coded[i..]);
         }
     }
 
@@ -508,6 +713,25 @@ mod neon {
         }
     }
 
+    #[target_feature(enable = "neon")]
+    pub(super) unsafe fn add_clip_row(dst: &mut [i32], pred: &[i32], coded: &[i32]) {
+        unsafe {
+            let n = dst.len();
+            let zero = vdupq_n_s32(0);
+            let max = vdupq_n_s32(BIT_DEPTH_MAX);
+            let mut i = 0;
+            while i + 4 <= n {
+                let p = vld1q_s32(pred.as_ptr().add(i));
+                let c = vld1q_s32(coded.as_ptr().add(i));
+                let sum = vaddq_s32(p, c);
+                let clipped = vminq_s32(vmaxq_s32(sum, zero), max);
+                vst1q_s32(dst.as_mut_ptr().add(i), clipped);
+                i += 4;
+            }
+            super::add_clip_row_scalar(&mut dst[i..], &pred[i..], &coded[i..]);
+        }
+    }
+
     /// `(here − other).signum()` over four `i32` lanes.
     #[inline]
     #[target_feature(enable = "neon")]
@@ -590,6 +814,17 @@ mod tests {
         bytes(seed, n).into_iter().map(i32::from).collect()
     }
 
+    /// Coded-residual fixtures for the quantized path: signed values wide
+    /// enough that `pred + coded` leaves the 8-bit range in both directions,
+    /// so every run exercises the clip at 0 and at 255 as well as the samples
+    /// that pass through untouched.
+    fn residuals(seed: u64, n: usize) -> Vec<i32> {
+        bytes(seed, n)
+            .into_iter()
+            .map(|b| i32::from(b) * 4 - 480)
+            .collect()
+    }
+
     /// Every run length that exercises a full vector body, a partial one, and
     /// the scalar tail of each backend, plus lengths shorter than one vector.
     const RUNS: &[usize] = &[0, 1, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 64, 65];
@@ -660,6 +895,87 @@ mod tests {
     }
 
     #[test]
+    fn the_band_offset_search_matches_the_scalar_reference_on_every_instruction_set() {
+        let _guard = simd::test_lock();
+        for &n in RUNS {
+            // A reconstruction spanning the full 8-bit range so every one of
+            // the 32 bands is reachable, plus samples outside it so the
+            // kernel's clamp is exercised alongside the unclamped error.
+            let mut here = samples(0x7777_8888_9999_aaaa, n);
+            for (i, h) in here.iter_mut().enumerate() {
+                match i % 8 {
+                    0 => *h = -7,
+                    1 => *h = 262,
+                    _ => {}
+                }
+            }
+            let src = bytes(0xc0ff_ee00_1234_5678, n);
+            let mut expected = BandStats::default();
+            band_offset_row_scalar(&here, &src, &mut expected);
+            assert_eq!(
+                expected.counts.iter().sum::<i64>(),
+                n as i64,
+                "every sample lands in exactly one band"
+            );
+            for isa in simd::available() {
+                simd::set_override(Some(isa));
+                let mut got = BandStats::default();
+                band_offset_row(&here, &src, &mut got);
+                assert_eq!(got, expected, "{} band search over {n} samples", isa.name());
+            }
+        }
+        simd::set_override(None);
+    }
+
+    #[test]
+    fn the_band_search_accumulates_into_existing_stats() {
+        // `band_stats` gathers a whole CTB by calling the kernel once per row,
+        // so a second call has to add to the first rather than replace it.
+        let _guard = simd::test_lock();
+        let here = samples(0x3131_4141_5151_6161, 37);
+        let src = bytes(0x2020_3030_4040_5050, 37);
+        let mut expected = BandStats::default();
+        band_offset_row_scalar(&here, &src, &mut expected);
+        band_offset_row_scalar(&here, &src, &mut expected);
+        for isa in simd::available() {
+            simd::set_override(Some(isa));
+            let mut got = BandStats::default();
+            band_offset_row(&here, &src, &mut got);
+            band_offset_row(&here, &src, &mut got);
+            assert_eq!(got, expected, "{}", isa.name());
+        }
+        simd::set_override(None);
+    }
+
+    #[test]
+    fn every_band_is_reachable_and_counted_once() {
+        // One sample per band, at the low edge of each, so the §8.7.3.2
+        // `sample >> (bitDepth - 5)` mapping is exercised end to end.
+        let here: Vec<i32> = (0..32).map(|b| b * 8).collect();
+        let src = vec![0u8; 32];
+        let mut stats = BandStats::default();
+        band_offset_row_scalar(&here, &src, &mut stats);
+        assert_eq!(stats.counts, [1i64; 32]);
+        let expected: Vec<i64> = (0..32).map(|b| -(b as i64) * 8).collect();
+        assert_eq!(stats.sums.to_vec(), expected);
+    }
+
+    #[test]
+    fn a_sample_outside_the_8_bit_range_still_lands_in_an_end_band() {
+        // The reconstruction is clipped before it reaches the search, but the
+        // kernel clamps anyway so an out-of-range sample cannot index past the
+        // 32-band table. The error stays unclamped, matching the reference.
+        let here = [-9i32, 300];
+        let src = [4u8, 4];
+        let mut stats = BandStats::default();
+        band_offset_row_scalar(&here, &src, &mut stats);
+        assert_eq!(stats.counts[0], 1);
+        assert_eq!(stats.counts[31], 1);
+        assert_eq!(stats.sums[0], 13);
+        assert_eq!(stats.sums[31], -296);
+    }
+
+    #[test]
     fn every_edge_category_is_reachable_and_counted_once() {
         // One sample per `edgeIdx` 0..=4, in order, so every arm of the
         // §8.7.3.2 mapping is exercised including the dropped category 0.
@@ -672,6 +988,42 @@ mod tests {
         // edgeIdx 0, 1, 2, 3, 4 => categories 1, 2, (dropped), 3, 4.
         assert_eq!(stats.counts, [0, 1, 1, 1, 1]);
         assert_eq!(stats.sums, [0, 2, 3, 5, 6]);
+    }
+
+    #[test]
+    fn the_coded_add_and_clip_matches_the_scalar_reference_on_every_instruction_set() {
+        let _guard = simd::test_lock();
+        for &n in RUNS {
+            let pred = samples(0x1a2b_3c4d_5e6f_7081, n);
+            let coded = residuals(0x7fff_0001_2345_6789, n);
+            let mut expected = vec![0i32; n];
+            add_clip_row_scalar(&mut expected, &pred, &coded);
+            for isa in simd::available() {
+                simd::set_override(Some(isa));
+                let mut got = vec![0i32; n];
+                add_clip_row(&mut got, &pred, &coded);
+                assert_eq!(got, expected, "{} add-and-clip of {n} samples", isa.name());
+            }
+        }
+        simd::set_override(None);
+    }
+
+    #[test]
+    fn the_coded_add_and_clip_saturates_at_both_ends_of_the_8_bit_range() {
+        // The fixture above is only a bit-exactness check against the scalar
+        // reference; this pins the §8.6.6 clip itself, including a residual
+        // far outside the range any single sample could reach unclipped.
+        let _guard = simd::test_lock();
+        let pred = [0i32, 128, 255, 200, 40, 128, 128];
+        let coded = [-1i32, -200, 1, 100, -100, 32_767, -32_768];
+        let expected = [0i32, 0, 255, 255, 0, 255, 0];
+        for isa in simd::available() {
+            simd::set_override(Some(isa));
+            let mut got = [0i32; 7];
+            add_clip_row(&mut got, &pred, &coded);
+            assert_eq!(got, expected, "{}", isa.name());
+        }
+        simd::set_override(None);
     }
 
     #[test]
@@ -706,6 +1058,9 @@ mod tests {
             let b = samples(0x2222_3333_4444_5557, n);
             let mut recon_expected = vec![0i32; n];
             reconstruct_row_scalar(&mut recon_expected, &src, &pred);
+            let coded = residuals(0x0f1e_2d3c_4b5a_6978, n);
+            let mut add_clip_expected = vec![0i32; n];
+            add_clip_row_scalar(&mut add_clip_expected, &here, &coded);
             let mut sao_expected = EdgeStats::default();
             edge_offset_row_scalar(&here, &a, &b, &src, &mut sao_expected);
             if is_x86_feature_detected!("sse4.1") {
@@ -716,7 +1071,14 @@ mod tests {
                     x86::reconstruct_row_sse41(&mut got, &src, &pred);
                     x86::edge_offset_row_sse41(&here, &a, &b, &src, &mut stats);
                 }
+                let mut got_add_clip = vec![0i32; n];
+                // SAFETY: as above.
+                unsafe { x86::add_clip_row_sse41(&mut got_add_clip, &here, &coded) }
                 assert_eq!(got, recon_expected, "SSE4.1 reconstruction of {n}");
+                assert_eq!(
+                    got_add_clip, add_clip_expected,
+                    "SSE4.1 add-and-clip of {n}"
+                );
                 assert_eq!(stats, sao_expected, "SSE4.1 edge search over {n}");
             }
             if is_x86_feature_detected!("avx2") {
@@ -727,7 +1089,11 @@ mod tests {
                     x86::reconstruct_row_avx2(&mut got, &src, &pred);
                     x86::edge_offset_row_avx2(&here, &a, &b, &src, &mut stats);
                 }
+                let mut got_add_clip = vec![0i32; n];
+                // SAFETY: as above.
+                unsafe { x86::add_clip_row_avx2(&mut got_add_clip, &here, &coded) }
                 assert_eq!(got, recon_expected, "AVX2 reconstruction of {n}");
+                assert_eq!(got_add_clip, add_clip_expected, "AVX2 add-and-clip of {n}");
                 assert_eq!(stats, sao_expected, "AVX2 edge search over {n}");
             }
         }
@@ -738,6 +1104,20 @@ mod tests {
     fn a_prediction_row_of_the_wrong_length_is_rejected() {
         let mut dst = [0i32; 8];
         reconstruct_row(&mut dst, &[0u8; 8], &[0u8; 7]);
+    }
+
+    #[test]
+    #[should_panic(expected = "run and source differ")]
+    fn a_band_source_run_of_the_wrong_length_is_rejected() {
+        let mut stats = BandStats::default();
+        band_offset_row(&[0i32; 8], &[0u8; 7], &mut stats);
+    }
+
+    #[test]
+    #[should_panic(expected = "destination and residual rows differ")]
+    fn a_coded_residual_row_of_the_wrong_length_is_rejected() {
+        let mut dst = [0i32; 8];
+        add_clip_row(&mut dst, &[0i32; 8], &[0i32; 7]);
     }
 
     #[test]

@@ -23,7 +23,7 @@ use super::headers::{
     sequence_header_payload,
 };
 use super::symbol::SymbolEncoder;
-use super::tile::FrameEncoder;
+use super::tile::{CoeffScratch, FrameEncoder};
 use super::wht::fwht4x4;
 use super::{cdf, stream_configuration};
 use crate::ColorRange;
@@ -107,6 +107,55 @@ pub fn symbol_encode(symbols: usize) -> Vec<u8> {
 #[must_use]
 pub fn tile_encode(plane: &[u8], width: usize, height: usize, qindex: u8) -> Vec<u8> {
     FrameEncoder::new(plane, width, height, qindex).encode()
+}
+
+/// Derives the §8.3.2 `coeff_base` and `coeff_br` contexts for every 4x4
+/// transform block of one 8-bit luma plane.
+///
+/// This is the pass `tile.rs` runs over a whole block before its serial symbol
+/// loop, and the only part of coefficient coding that is data-parallel — the
+/// range coder around it is serial by construction. It is benchmarked on its
+/// own because `av1_encode_stage_tile` cannot show it: the same profile that
+/// motivated this kernel puts 64% of a lossless tile encode inside
+/// `SymbolEncoder::encode_symbol`, which dilutes any context-derivation
+/// speedup to within run-to-run noise. This group is where the
+/// `av1_coeff_ctx` dispatch family's scalar-versus-vector delta is actually
+/// visible.
+///
+/// The coefficients fed to it are the plane's own lossless WHT output, so the
+/// magnitude distribution — and therefore the neighbour sums the contexts are
+/// made of — is the one the encoder really derives contexts over, not a
+/// synthetic one.
+///
+/// Returns an order-sensitive fold of every derived context rather than the
+/// contexts themselves, for the same reason [`fwht4x4_plane`] does: the fold
+/// depends on every value, so `benches/support/isa.rs`'s bit-exactness guard
+/// keeps its teeth without allocating a plane's worth of output per iteration.
+#[must_use]
+pub fn coeff_context_plane(plane: &[u8], width: usize, height: usize) -> Vec<u8> {
+    assert!(
+        plane.len() >= width * height,
+        "plane is shorter than its dimensions"
+    );
+    let mut digest = 0xcbf2_9ce4_8422_2325_u64;
+    let mut residual = [0i32; 16];
+    let mut scratch = CoeffScratch::default();
+    for block_y in (0..height & !3).step_by(4) {
+        for block_x in (0..width & !3).step_by(4) {
+            for row in 0..4 {
+                let start = (block_y + row) * width + block_x;
+                for column in 0..4 {
+                    residual[row * 4 + column] = i32::from(plane[start + column]) - BENCH_PREDICTOR;
+                }
+            }
+            scratch.derive(&fwht4x4(&residual), 4);
+            for &context in scratch.base.iter().chain(scratch.br.iter()) {
+                digest ^= context as u32 as u64;
+                digest = digest.wrapping_mul(0x1000_0000_01b3);
+            }
+        }
+    }
+    digest.to_le_bytes().to_vec()
 }
 
 /// Writes the sequence header, the frame header, and the OBU framing that
