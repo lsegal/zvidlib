@@ -366,6 +366,7 @@ mod tests {
             .1;
         let documented: Vec<&str> = table
             .lines()
+            .skip(1)
             .map(str::trim_start)
             .take_while(|line| line.starts_with("///"))
             .filter_map(|line| line.strip_prefix("/// | `"))
