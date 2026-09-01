@@ -88,6 +88,16 @@ name = "audio_mux"
 path = "benches/audio_mux.rs"
 harness = false
 
+# The platform hardware HEVC decoders against the software one. A separate
+# target because it measures the OS/driver decoders rather than any of the
+# crate's own kernels, so it shares none of the scalar-vs-SIMD machinery the
+# other targets are built around, and because it is the only target that skips
+# itself outright on a host without the hardware it measures.
+[[bench]]
+name = "hevc_hardware"
+path = "benches/hevc_hardware.rs"
+harness = false
+
 [features]
 default = []
 # Additive, off by default. The crate's SIMD kernels dispatch at run time rather

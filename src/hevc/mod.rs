@@ -3,6 +3,7 @@
 // internal — exposed for the criterion benchmark suite; not part of the stable API
 #[doc(hidden)]
 pub mod bench;
+pub(crate) mod color_convert;
 pub mod decode_bench;
 // internal — exposed for the stage-attribution example; not part of the stable API
 #[doc(hidden)]
@@ -519,23 +520,17 @@ fn picture_to_rgba(
     let cr = picture.plane(HevcPlane::Cr);
     let chroma_width = picture.plane_dims(HevcPlane::Cb).0;
     let mut rgba = vec![0_u8; length];
-    for y in 0..height {
-        for x in 0..width {
-            let y_scaled = luma[y * picture.width_luma() + x] * 8 - 128;
-            let u_scaled = cb[(y / 2) * chroma_width + x / 2] * 8 - 1024;
-            let v_scaled = cr[(y / 2) * chroma_width + x / 2] * 8 - 1024;
-            let y_term = multiply_high(y_scaled, 9_539);
-            let at = y * stride + x * 4;
-            rgba[at] = clip_u8(y_term.saturating_add(multiply_high(v_scaled, 13_075)));
-            rgba[at + 1] = clip_u8(
-                y_term
-                    .saturating_add(multiply_high(u_scaled, -3_209))
-                    .saturating_add(multiply_high(v_scaled, -6_660)),
-            );
-            rgba[at + 2] = clip_u8(y_term.saturating_add(multiply_high(u_scaled, 16_525)));
-            rgba[at + 3] = 255;
-        }
-    }
+    color_convert::convert_yuv420_to_rgba(
+        luma,
+        picture.width_luma(),
+        cb,
+        cr,
+        chroma_width,
+        width,
+        height,
+        &mut rgba,
+        stride,
+    );
     VideoFrame::new(
         configuration.coded_dimensions,
         PixelFormat::Rgba8,
@@ -543,14 +538,6 @@ fn picture_to_rgba(
         vec![Plane { data: rgba, stride }],
         limits,
     )
-}
-
-fn multiply_high(left: i32, right: i32) -> i32 {
-    left.saturating_mul(right) >> 16
-}
-
-fn clip_u8(value: i32) -> u8 {
-    value.clamp(0, 255) as u8
 }
 
 fn check_cancelled(cancellation: &CancellationToken) -> Result<()> {
@@ -601,6 +588,8 @@ mod tests {
 
     #[test]
     fn canonical_conversion_uses_decoder_integer_rounding() {
+        use color_convert::{clip_u8, multiply_high};
+
         assert_eq!(multiply_high(-8, -3_209), 0);
         assert_eq!(clip_u8(multiply_high(0, 9_539)), 0);
     }
