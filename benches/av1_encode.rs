@@ -1,22 +1,4 @@
-//! Criterion benchmarks for zvidlib's native AV1 encoder.
-//!
-//! Two axes, both required to read an encoder number correctly:
-//!
-//! * **Whole-frame versus per-stage.** The whole-frame groups encode a
-//!   synthetic monochrome sequence through the public
-//!   [`zvidlib::native_av1_video_encoder_factory`] at two resolutions and
-//!   report frames/sec and megapixels/sec. The per-stage groups time the
-//!   pipeline's individual stages through [`zvidlib::av1_encoder_bench`], so
-//!   the tile encoder's cost — which dominates — is not mistaken for
-//!   bitstream-writing cost. The kernel groups below them measure the forward
-//!   transforms on their own.
-//! * **Instruction set.** Every group runs once per entry in
-//!   `zvidlib::simd::available()` through `support::isa::bench_across_isas`,
-//!   which pins the crate-wide override, asserts it reached every dispatch
-//!   family, and checks each arm is bit-exact with scalar before timing it.
-//!
-//! Inputs are the synthetic sequences from `benches/support`, never a decoded
-//! file: decoding first would fold decoder cost into the encoder numbers.
+//! Scalar-versus-SIMD benchmarks for zvidlib's AV1 encoder-side kernels.
 //!
 //! The AV1 encoder's forward transforms are the counterpart to the inverse
 //! transforms `benches/av1_decode.rs` measures: the same block sizes, the same
@@ -25,41 +7,51 @@
 //! sweep because they are encoder work, and a decoder target that reports
 //! encoder numbers is a target whose scope cannot be read off its name.
 //!
+//! Every group runs once per instruction set `zvidlib::simd::available()`
+//! reports, through the crate-wide override in [`zvidlib::simd`], and
+//! `benches/support/isa.rs` asserts that each arm is bit-exact with scalar
+//! before timing it and that the override really landed in each dispatch
+//! family — so a reported speedup cannot come from a kernel that quietly
+//! diverged or from a switch that never took effect.
+//!
 //! # Groups
 //!
 //! | Group | Stage |
 //! | --- | --- |
-//! | `av1_encode_{640x360,1920x1080}` | whole-frame encode through the public factory |
-//! | `av1_encode_*_wht` | the forward 4x4 WHT, `src/av1_encoder/wht.rs` |
-//! | `av1_encode_*_symbol` | symbol coding over the static CDF tables, `src/av1_encoder/symbol.rs` and `cdf.rs` |
-//! | `av1_encode_*_tile` | tile encoding, `src/av1_encoder/tile.rs` |
-//! | `av1_encode_*_bitstream` | headers, bit writing and LEB128 framing, `src/av1_encoder/{bitwriter,headers,leb128}.rs` |
 //! | `av1_forward_dct_{4x4,8x8,16x16,32x32}` | forward DCT, `src/av1_encoder/transform.rs` through `zvidlib::forward_transform` |
 //! | `av1_forward_adst_8x8`, `av1_forward_flipadst_16x16` | the forward ADST family, including a flipped type |
+//! | `av1_encode_frame_q{0,32,160}` | one whole frame through the public encoder, `src/av1_encoder/tile.rs` |
+//! | `av1_encode_stage_wht` | the forward 4x4 WHT, `src/av1_encoder/wht.rs` |
+//! | `av1_encode_stage_symbol` | symbol coding over the static CDF tables, `src/av1_encoder/symbol.rs` and `cdf.rs` |
+//! | `av1_encode_stage_tile` | tile encoding, `src/av1_encoder/tile.rs` |
+//! | `av1_encode_stage_bitstream` | headers, bit writing and OBU LEB128 framing, `src/av1_encoder/{bitwriter,headers,leb128}.rs` |
 //!
-//! The kernel groups' block counts and coefficient generator are the ones they
-//! were introduced with (issue #140, in `tests/av1_simd_bench.rs`, and then in
-//! `benches/av1_decode.rs`), so their numbers stay directly comparable with the
+//! The whole-frame groups say what a frame costs; the per-stage groups say
+//! where that cost goes. They reach the encoder's individual stages through
+//! [`zvidlib::av1_encoder_bench`], the `#[doc(hidden)]` per-stage access that is
+//! the AV1 counterpart to `zvidlib::hevc_encoder_bench`, because a whole-frame
+//! number cannot distinguish tile-encoding cost from bitstream-writing cost —
+//! and the breakdown is lopsided enough that the distinction is the whole
+//! point. Both run at the same two sizes as the whole-frame groups.
+//!
+//! ## Where the SIMD axis reads flat, and why that is the measurement
+//!
+//! The forward transforms and the forward WHT are this encoder's only
+//! vectorized kernels. Symbol coding, CDF handling, header writing and OBU
+//! framing are scalar and are expected to stay that way, so those arms are
+//! expected to read identically under every instruction set. That is reported
+//! rather than omitted: it is what says where vectorizing the encoder would
+//! actually pay. [`report_stage_coverage`] prints the stage list on every run,
+//! so a group that stops being measured reads as a broken run rather than as a
+//! stage that costs nothing, and every group still asserts through
+//! `simd::active_by_site()` that the override landed rather than inferring it
+//! from the clock.
+//!
+//! The block counts and the coefficient generator are the ones the groups were
+//! introduced with (issue #140, in `tests/av1_simd_bench.rs`, and then in
+//! `benches/av1_decode.rs`), so the numbers stay directly comparable with the
 //! inverse-transform groups and with everything reported for them before the
 //! move.
-//!
-//! ## The SIMD axis, and where it is expected to read flat
-//!
-//! The forward transforms and the forward 4x4 WHT are this encoder's only
-//! vectorized kernels; they dispatch through `zvidlib::av1_simd`. Symbol
-//! coding, CDF handling, bitstream writing and OBU framing are scalar and are
-//! expected to stay that way, so those arms are expected to read identically
-//! under every instruction set. That is the measured result the issue asks
-//! for, not a broken benchmark: it says where the encoder's time actually goes
-//! and what is worth vectorizing next. It is also why every group asserts
-//! through `simd::active_by_site()` that the override landed rather than
-//! inferring it from the clock.
-//!
-//! ## Stage coverage
-//!
-//! [`report_stage_coverage`] prints the stage list on every run, so a group
-//! missing from the output reads as a broken run rather than as a stage that
-//! costs nothing.
 //!
 //! See `benches/README.md` for how to run and filter the suite.
 
@@ -71,212 +63,13 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use zvidlib::av1_encoder_bench as encoder_bench;
 use zvidlib::{
     Av1TxType, Codec, CodecProfile, ColorRange, CpuFrameSource, FrameIndex, FrameSource,
-    HardwarePreference, Limits, Orientation, PixelFormat, VideoDimensions, VideoEncoderConfig,
-    VideoEncoderFactory, VideoFrame, forward_transform, native_av1_video_encoder_factory,
+    HardwarePreference, Limits, Orientation, PixelFormat, Plane, VideoDimensions,
+    VideoEncoderConfig, VideoEncoderFactory, VideoFrame, forward_transform,
+    native_av1_video_encoder_factory,
 };
 
 use support::FrameWork;
 use support::isa::{IsaWorkload, bench_across_isas, checksum};
-
-/// The two resolutions the whole-frame and per-stage groups run, the ones the
-/// tracking issue names. Both are encodable as-is: the AV1 encoder pads to the
-/// 4x4 transform grid itself, so neither needs the divisibility adjustment
-/// `benches/hevc_encode.rs` documents.
-const SMALL: (u32, u32) = (640, 360);
-
-/// The 1080p resolution, the second of the two.
-const LARGE: (u32, u32) = (1920, 1080);
-
-/// Frames per whole-frame iteration. Small enough that one criterion sample of
-/// the 1080p group stays well inside the measurement window.
-const WHOLE_FRAME_FRAMES: usize = 2;
-
-/// CDF-coded symbols the symbol-coder group encodes per 4x4 block.
-///
-/// The tile encoder codes a partition, a skip flag and a mode symbol per block
-/// before its coefficients, so three per block keeps this group the same scale
-/// of work as the tile group it is factored out of — and, because it is
-/// per-block, keeps the two resolutions measuring proportionally different
-/// amounts of work rather than the same fixed count twice.
-const SYMBOLS_PER_BLOCK: usize = 3;
-
-/// The `base_q_idx` the per-stage groups encode at.
-///
-/// Zero is the lossless WHT profile, which is what the public encoder emits by
-/// default and therefore the path the whole-frame groups exercise.
-const BENCH_QINDEX: u8 = 0;
-
-/// Prints the stages this target measures.
-///
-/// A benchmark suite reports what it measured; a stage that silently stopped
-/// being measured has to read as a broken run, not as a stage that costs
-/// nothing.
-fn report_stage_coverage(_: &mut Criterion) {
-    println!(
-        "# av1_encode: every stage of the native AV1 encoder is benchmarked below: the forward\n\
-         # 4x4 WHT, symbol (range) coding over the static CDF tables, whole-tile encoding\n\
-         # (superblock iteration, DC_PRED, coefficient coding), sequence/frame header writing\n\
-         # with OBU LEB128 framing, and whole-frame encode through the public factory at\n\
-         # 640x360 and 1920x1080, alongside the forward DCT/ADST kernel sweep.\n\
-         # av1_encode: the forward transforms and the forward WHT are the encoder's only SIMD\n\
-         # dispatch families, so the symbol, bitstream and (dominantly scalar) tile arms are\n\
-         # expected to read flat across instruction sets. That is the measured result, not a\n\
-         # broken bench: it is what says entropy coding is the next vectorization target."
-    );
-}
-
-/// The encoder configuration the whole-frame groups measure.
-fn encoder_config(width: u32, height: u32) -> VideoEncoderConfig {
-    VideoEncoderConfig {
-        codec: Codec::Av1,
-        profile: CodecProfile::Av1Main,
-        coded_dimensions: VideoDimensions::new(width, height, &Limits::default())
-            .expect("benchmark dimensions are valid"),
-        input_format: PixelFormat::Gray8,
-        color_range: ColorRange::Limited,
-        // Measure the crate's own encode work, not whichever fixed-function
-        // block the host happens to ship.
-        hardware: HardwarePreference::Avoid,
-        timescale: 90_000,
-        frame_duration: 3_000,
-        // Empty selects the lossless WHT profile.
-        configuration: Vec::new(),
-    }
-}
-
-/// Encodes a fixed-length synthetic sequence through the public encoder, once
-/// per instruction set.
-fn whole_frame(criterion: &mut Criterion, (width, height): (u32, u32), group: &str) {
-    let frames = support::synthetic_gray8_sequence(width, height, WHOLE_FRAME_FRAMES);
-    let configuration = encoder_config(width, height);
-    let workload = IsaWorkload::new(
-        group,
-        FrameWork::new(
-            WHOLE_FRAME_FRAMES as u64,
-            u64::from(width),
-            u64::from(height),
-        ),
-    );
-    bench_across_isas(criterion, &workload, || {
-        let mut encoder = native_av1_video_encoder_factory()
-            .create(&configuration, &Limits::default())
-            .expect("the native AV1 encoder is constructible");
-        let mut bitstream = Vec::new();
-        for (index, frame) in frames.iter().enumerate() {
-            let source = FrameSource::Cpu(CpuFrameSource {
-                frame,
-                orientation: Orientation::TopLeft,
-            });
-            for sample in support::block_on(encoder.encode(FrameIndex(index as u64), source))
-                .expect("the synthetic sequence encodes")
-            {
-                bitstream.extend_from_slice(&sample.data);
-            }
-        }
-        for sample in support::block_on(encoder.finish()).expect("the encoder flushes") {
-            bitstream.extend_from_slice(&sample.data);
-        }
-        bitstream
-    });
-}
-
-/// One tightly packed 8-bit luma plane of the synthetic sequence, the input
-/// every per-stage group runs over.
-fn luma_plane(width: u32, height: u32) -> Vec<u8> {
-    let frame: VideoFrame = support::synthetic_gray8_sequence(width, height, 1)
-        .into_iter()
-        .next()
-        .expect("the synthetic sequence has one frame");
-    let plane = frame.planes.first().expect("Gray8 has one plane");
-    let width = width as usize;
-    (0..height as usize)
-        .flat_map(|row| plane.data[row * plane.stride..row * plane.stride + width].to_vec())
-        .collect()
-}
-
-/// The forward 4x4 WHT over a whole plane: the lossless path's transform, and
-/// the one per-stage group with a vector path.
-fn wht(criterion: &mut Criterion, (width, height): (u32, u32), group_prefix: &str) {
-    let plane = luma_plane(width, height);
-    let name = format!("{group_prefix}_wht");
-    let workload = IsaWorkload::new(
-        &name,
-        FrameWork::new(1, u64::from(width), u64::from(height)),
-    );
-    bench_across_isas(criterion, &workload, || {
-        encoder_bench::fwht4x4_plane(&plane, width as usize, height as usize)
-    });
-}
-
-/// Symbol coding and CDF handling, factored out of the tile encoder so the
-/// entropy coder's cost is visible on its own.
-fn symbol(criterion: &mut Criterion, (width, height): (u32, u32), group_prefix: &str) {
-    let symbols = (width as usize / 4) * (height as usize / 4) * SYMBOLS_PER_BLOCK;
-    let name = format!("{group_prefix}_symbol");
-    let workload = IsaWorkload::new(
-        &name,
-        FrameWork::new(1, u64::from(width), u64::from(height)),
-    );
-    bench_across_isas(criterion, &workload, || {
-        encoder_bench::symbol_encode(symbols)
-    });
-}
-
-/// Whole-tile encoding: superblock and partition iteration, DC intra
-/// prediction, the forward transform, and coefficient coding with full context
-/// derivation. This is where a whole-frame encode spends nearly all its time.
-fn tile(criterion: &mut Criterion, (width, height): (u32, u32), group_prefix: &str) {
-    let plane = luma_plane(width, height);
-    let name = format!("{group_prefix}_tile");
-    let workload = IsaWorkload::new(
-        &name,
-        FrameWork::new(1, u64::from(width), u64::from(height)),
-    );
-    bench_across_isas(criterion, &workload, || {
-        encoder_bench::tile_encode(&plane, width as usize, height as usize, BENCH_QINDEX)
-    });
-}
-
-/// Header writing and OBU framing: the bit writer, the sequence and frame
-/// header syntax, and the LEB128 size fields.
-///
-/// The tile payload is encoded once, outside the timed closure, so this group
-/// measures only the bitstream stage wrapped around it.
-fn bitstream(criterion: &mut Criterion, (width, height): (u32, u32), group_prefix: &str) {
-    let plane = luma_plane(width, height);
-    let tile_data =
-        encoder_bench::tile_encode(&plane, width as usize, height as usize, BENCH_QINDEX);
-    let name = format!("{group_prefix}_bitstream");
-    let mut workload = IsaWorkload::new(
-        &name,
-        FrameWork::new(1, u64::from(width), u64::from(height)),
-    );
-    // Header writing is microseconds of work next to a tile encode, so the
-    // default frame-scale windows would spend seconds resolving noise.
-    workload.measurement_time = Duration::from_secs(2);
-    workload.warm_up_time = Duration::from_millis(300);
-    workload.sample_size = 100;
-    bench_across_isas(criterion, &workload, || {
-        encoder_bench::write_temporal_unit(width, height, 0, BENCH_QINDEX, &tile_data)
-    });
-}
-
-fn av1_encode_whole_frame(criterion: &mut Criterion) {
-    whole_frame(criterion, SMALL, "av1_encode_640x360");
-    whole_frame(criterion, LARGE, "av1_encode_1920x1080");
-}
-
-fn av1_encode_stages(criterion: &mut Criterion) {
-    for (size, prefix) in [
-        (SMALL, "av1_encode_640x360"),
-        (LARGE, "av1_encode_1920x1080"),
-    ] {
-        wht(criterion, size, prefix);
-        symbol(criterion, size, prefix);
-        tile(criterion, size, prefix);
-        bitstream(criterion, size, prefix);
-    }
-}
 
 /// Luma dimensions the kernel-level groups run over, matching
 /// `benches/av1_decode.rs`. One 1080p plane is large enough that per-call
@@ -331,6 +124,238 @@ fn av1_forward_transforms(criterion: &mut Criterion) {
             }
             digest.to_le_bytes().to_vec()
         });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Whole-frame encode (src/av1_encoder/tile.rs)
+// ---------------------------------------------------------------------------
+
+/// Environment variable that opts into the 1080p-scale whole-frame group.
+///
+/// One 1080p non-lossless frame is most of a second of search work, so a
+/// default `cargo bench` would stretch out for minutes. Keeping the large size
+/// opt-in leaves the default run usable in an ordinary edit loop, the same way
+/// `benches/hevc_encode.rs` gates its 1080p groups.
+const LARGE_GROUP_ENV: &str = "ZVIDLIB_BENCH_LARGE";
+
+/// The size the whole-frame groups always run.
+const FRAME_SMALL: (u32, u32) = (640, 352);
+
+/// The 1080p-class size, behind [`LARGE_GROUP_ENV`].
+const FRAME_LARGE: (u32, u32) = (1920, 1080);
+
+/// `base_q_idx` values the whole-frame groups measure.
+///
+/// `0` is the lossless WHT path, which searches nothing; the others run the
+/// partition, transform-size and transform-type searches, which is where this
+/// encoder's time goes. Reading the two side by side is the point of the group:
+/// it is the ratio between them, not either number alone, that says what the
+/// search costs.
+const FRAME_QINDEXES: [u8; 3] = [0, 32, 160];
+
+/// Encodes one synthetic monochrome frame through the public AV1 encoder at
+/// each `base_q_idx`, once per instruction set.
+fn av1_encode_frames(criterion: &mut Criterion, (width, height): (u32, u32), suffix: &str) {
+    let limits = Limits::default();
+    let dimensions =
+        VideoDimensions::new(width, height, &limits).expect("benchmark dimensions are valid");
+    let luma = support::av1_gray8_planes(width, height, 1)
+        .pop()
+        .expect("one synthetic monochrome plane");
+    let frame = VideoFrame::new(
+        dimensions,
+        PixelFormat::Gray8,
+        ColorRange::Full,
+        vec![Plane {
+            data: luma,
+            stride: width as usize,
+        }],
+        &limits,
+    )
+    .expect("synthetic monochrome frames are valid");
+
+    for qindex in FRAME_QINDEXES {
+        let configuration = VideoEncoderConfig {
+            codec: Codec::Av1,
+            profile: CodecProfile::Av1Main,
+            coded_dimensions: dimensions,
+            input_format: PixelFormat::Gray8,
+            color_range: ColorRange::Full,
+            // Measure the crate's own encode work, not whichever fixed-function
+            // block the host happens to ship.
+            hardware: HardwarePreference::Avoid,
+            timescale: 30,
+            frame_duration: 1,
+            configuration: if qindex == 0 {
+                Vec::new()
+            } else {
+                vec![qindex]
+            },
+        };
+        let name = format!("av1_encode_frame_q{qindex}{suffix}");
+        let workload = IsaWorkload {
+            measurement_time: Duration::from_secs(5),
+            warm_up_time: Duration::from_millis(500),
+            ..IsaWorkload::new(
+                &name,
+                FrameWork::new(1, u64::from(width), u64::from(height)),
+            )
+        };
+        bench_across_isas(criterion, &workload, || {
+            let mut encoder = native_av1_video_encoder_factory()
+                .create(&configuration, &limits)
+                .expect("the native AV1 encoder is constructible");
+            let packets = support::block_on(encoder.encode(
+                FrameIndex(0),
+                FrameSource::Cpu(CpuFrameSource {
+                    frame: &frame,
+                    orientation: Orientation::TopLeft,
+                }),
+            ))
+            .expect("the synthetic frame encodes");
+            packets.into_iter().flat_map(|packet| packet.data).collect()
+        });
+    }
+}
+
+/// The whole-frame groups at [`FRAME_SMALL`], and at [`FRAME_LARGE`] when
+/// [`LARGE_GROUP_ENV`] is set.
+fn av1_encode_whole_frame(criterion: &mut Criterion) {
+    av1_encode_frames(criterion, FRAME_SMALL, "");
+    if std::env::var_os(LARGE_GROUP_ENV).is_some() {
+        av1_encode_frames(criterion, FRAME_LARGE, "_1080p");
+    } else {
+        println!("# skipping av1_encode_frame_*_1080p; set {LARGE_GROUP_ENV}=1 to run it");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-stage encoder groups (src/av1_encoder/, through zvidlib::av1_encoder_bench)
+// ---------------------------------------------------------------------------
+
+/// CDF-coded symbols the symbol group encodes per 4x4 block.
+///
+/// The tile encoder codes a partition, a skip flag and a mode symbol per block
+/// before its coefficients, so three per block keeps this group the same scale
+/// of work as the tile group it is factored out of — and, being per-block,
+/// keeps the two sizes measuring proportionally different work rather than the
+/// same fixed count twice.
+const SYMBOLS_PER_BLOCK: usize = 3;
+
+/// The `base_q_idx` the per-stage groups run at.
+///
+/// Zero is the lossless WHT profile, the one the public encoder emits by
+/// default; the non-lossless search the `av1_encode_frame_q{32,160}` groups
+/// measure is a whole-frame property rather than a stage of its own.
+const STAGE_QINDEX: u8 = 0;
+
+/// Prints the stages this target measures.
+///
+/// A benchmark suite reports what it measured; a stage that silently stopped
+/// being measured has to read as a broken run, not as a stage that costs
+/// nothing.
+fn report_stage_coverage(_: &mut Criterion) {
+    println!(
+        "# av1_encode: every stage of the native AV1 encoder is benchmarked: the forward 4x4\n\
+         # WHT, symbol (range) coding over the static CDF tables, whole-tile encoding\n\
+         # (superblock iteration, DC_PRED, coefficient coding), and sequence/frame header\n\
+         # writing with OBU LEB128 framing — alongside the whole-frame groups and the forward\n\
+         # DCT/ADST kernel sweep. No stage of the pipeline is absent.\n\
+         # av1_encode: the forward transforms and the forward WHT are the encoder's only SIMD\n\
+         # dispatch families, so the symbol and bitstream arms are expected to read flat across\n\
+         # instruction sets. That is the measured result, not a broken bench: it is what says\n\
+         # entropy coding and coefficient-context derivation are the next vectorization target."
+    );
+}
+
+/// One tightly packed 8-bit luma plane, the input every per-stage group runs
+/// over — the same synthetic content the whole-frame groups encode.
+fn stage_plane(width: u32, height: u32) -> Vec<u8> {
+    support::av1_gray8_planes(width, height, 1)
+        .pop()
+        .expect("one synthetic monochrome plane")
+}
+
+/// The forward 4x4 WHT over a whole plane: the lossless path's transform, and
+/// the one per-stage group with a vector path.
+fn stage_wht(criterion: &mut Criterion, (width, height): (u32, u32), suffix: &str) {
+    let plane = stage_plane(width, height);
+    let name = format!("av1_encode_stage_wht{suffix}");
+    let workload = stage_workload(&name, width, height);
+    bench_across_isas(criterion, &workload, || {
+        encoder_bench::fwht4x4_plane(&plane, width as usize, height as usize)
+    });
+}
+
+/// Symbol coding and CDF handling, factored out of the tile encoder so the
+/// entropy coder's cost is visible on its own.
+fn stage_symbol(criterion: &mut Criterion, (width, height): (u32, u32), suffix: &str) {
+    let symbols = (width as usize / 4) * (height as usize / 4) * SYMBOLS_PER_BLOCK;
+    let name = format!("av1_encode_stage_symbol{suffix}");
+    let workload = stage_workload(&name, width, height);
+    bench_across_isas(criterion, &workload, || {
+        encoder_bench::symbol_encode(symbols)
+    });
+}
+
+/// Whole-tile encoding: superblock and partition iteration, DC intra
+/// prediction, the forward transform, and coefficient coding with full context
+/// derivation. This is where a whole-frame encode spends nearly all its time.
+fn stage_tile(criterion: &mut Criterion, (width, height): (u32, u32), suffix: &str) {
+    let plane = stage_plane(width, height);
+    let name = format!("av1_encode_stage_tile{suffix}");
+    let workload = stage_workload(&name, width, height);
+    bench_across_isas(criterion, &workload, || {
+        encoder_bench::tile_encode(&plane, width as usize, height as usize, STAGE_QINDEX)
+    });
+}
+
+/// Header writing and OBU framing: the bit writer, the sequence and frame
+/// header syntax, and the LEB128 size fields.
+///
+/// The tile payload is encoded once, outside the timed closure, so this group
+/// measures only the bitstream stage wrapped around it.
+fn stage_bitstream(criterion: &mut Criterion, (width, height): (u32, u32), suffix: &str) {
+    let plane = stage_plane(width, height);
+    let tile_data =
+        encoder_bench::tile_encode(&plane, width as usize, height as usize, STAGE_QINDEX);
+    let name = format!("av1_encode_stage_bitstream{suffix}");
+    // Header writing is microseconds of work next to a tile encode, so the
+    // frame-scale windows the other stages use would spend seconds resolving
+    // noise.
+    let workload = IsaWorkload {
+        sample_size: 100,
+        measurement_time: Duration::from_secs(2),
+        warm_up_time: Duration::from_millis(300),
+        ..stage_workload(&name, width, height)
+    };
+    bench_across_isas(criterion, &workload, || {
+        encoder_bench::write_temporal_unit(width, height, 0, STAGE_QINDEX, &tile_data)
+    });
+}
+
+/// The criterion window the per-stage groups share: one frame's worth of work,
+/// measured at the same frame scale as the whole-frame groups.
+fn stage_workload<'a>(name: &'a str, width: u32, height: u32) -> IsaWorkload<'a> {
+    IsaWorkload::new(name, FrameWork::new(1, u64::from(width), u64::from(height)))
+}
+
+/// The per-stage groups at [`FRAME_SMALL`], and at [`FRAME_LARGE`] when
+/// [`LARGE_GROUP_ENV`] is set — the same gate the whole-frame groups use, since
+/// a 1080p tile encode is the same half-second of work either way.
+fn av1_encode_stages(criterion: &mut Criterion) {
+    for (size, suffix) in [(FRAME_SMALL, "")]
+        .into_iter()
+        .chain(std::env::var_os(LARGE_GROUP_ENV).map(|_| (FRAME_LARGE, "_1080p")))
+    {
+        stage_wht(criterion, size, suffix);
+        stage_symbol(criterion, size, suffix);
+        stage_tile(criterion, size, suffix);
+        stage_bitstream(criterion, size, suffix);
+    }
+    if std::env::var_os(LARGE_GROUP_ENV).is_none() {
+        println!("# skipping av1_encode_stage_*_1080p; set {LARGE_GROUP_ENV}=1 to run them");
     }
 }
 

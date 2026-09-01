@@ -180,37 +180,50 @@ cargo bench --bench av1_decode -- av1_inverse   # every inverse-transform group
 `benches/av1_encode.rs` measures the native AV1 encoder on two axes: whole-frame
 versus per-stage, and instruction set.
 
-The whole-frame groups encode a synthetic monochrome sequence through the public
-`zvidlib::native_av1_video_encoder_factory` and report frames/sec and
-megapixels/sec. The per-stage groups run each stage on its own through
-`zvidlib::av1_encoder_bench`, the `#[doc(hidden)]` per-stage access that is the
-AV1 counterpart to `hevc_encoder_bench`, so the tile encoder's cost is not
-mistaken for bitstream-writing cost. Both run at 640x360 and 1920x1080:
+The whole-frame groups encode a synthetic monochrome frame through the public
+`zvidlib::native_av1_video_encoder_factory` at three quantizer settings and
+report frames/sec and megapixels/sec. The per-stage groups run each stage on its
+own through `zvidlib::av1_encoder_bench`, the `#[doc(hidden)]` per-stage access
+that is the AV1 counterpart to `hevc_encoder_bench`, so the tile encoder's cost
+is not mistaken for bitstream-writing cost. Both default to 640x352 and add a
+1920x1080 pass behind `ZVIDLIB_BENCH_LARGE=1`:
 
 | Group | Stage |
 | --- | --- |
-| `av1_encode_{640x360,1920x1080}` | whole-frame encode through the public factory |
-| `av1_encode_*_wht` | the forward 4x4 WHT, `src/av1_encoder/wht.rs` |
-| `av1_encode_*_symbol` | symbol coding over the static CDF tables, `src/av1_encoder/symbol.rs` and `cdf.rs` |
-| `av1_encode_*_tile` | tile encoding: superblock iteration, `DC_PRED`, coefficient coding, `src/av1_encoder/tile.rs` |
-| `av1_encode_*_bitstream` | headers, bit writing and OBU LEB128 framing, `src/av1_encoder/{bitwriter,headers,leb128}.rs` |
+| `av1_encode_frame_q{0,32,160}` | one whole frame through the public encoder, `src/av1_encoder/tile.rs` |
+| `av1_encode_stage_wht` | the forward 4x4 WHT, `src/av1_encoder/wht.rs` |
+| `av1_encode_stage_symbol` | symbol coding over the static CDF tables, `src/av1_encoder/symbol.rs` and `cdf.rs` |
+| `av1_encode_stage_tile` | tile encoding: superblock iteration, `DC_PRED`, coefficient coding, `src/av1_encoder/tile.rs` |
+| `av1_encode_stage_bitstream` | headers, bit writing and OBU LEB128 framing, `src/av1_encoder/{bitwriter,headers,leb128}.rs` |
 | `av1_forward_dct_{4x4,8x8,16x16,32x32}` | forward DCT, `src/av1_encoder/transform.rs` through `zvidlib::forward_transform` |
 | `av1_forward_adst_8x8`, `av1_forward_flipadst_16x16` | the forward ADST family, including a flipped type |
+
+The per-stage groups run at `base_q_idx = 0`, the lossless WHT profile, so they
+decompose the same work `av1_encode_frame_q0` measures end to end. The
+non-lossless search the `q32` and `q160` groups show is a whole-frame property
+rather than a stage of its own, which is why it has no per-stage counterpart.
 
 The stage breakdown is the point of the per-stage groups, and it is lopsided:
 tile encoding is within a small factor of the whole-frame number, the forward
 WHT and the symbol coder are each an order of magnitude cheaper than that, and
-header writing with its LEB128 framing is two orders cheaper again — microseconds
-against a 1080p tile encode's hundreds of milliseconds. Coefficient coding and
-its context derivation inside `tile.rs`, not the transform, are what a faster
-encoder has to attack next.
+header writing with its LEB128 framing is two to three orders cheaper again —
+microseconds against a 1080p tile encode's hundreds of milliseconds. Coefficient
+coding and its context derivation inside `tile.rs`, not the transform, are what a
+faster lossless encoder has to attack next.
 
 The forward transforms and the forward WHT are this encoder's only vectorized
 kernels. Symbol coding, CDF handling and bitstream writing are scalar and
 expected to stay that way, so those arms read the same under every instruction
 set. That flatness is a measured result rather than a broken run, which is why
 each group asserts through `simd::active_by_site()` that the override landed
-instead of inferring it from the clock.
+instead of inferring it from the clock. `report_stage_coverage` prints the stage
+list on every run, so a group that stops being measured reads as a broken run
+rather than as a stage that costs nothing.
+
+```sh
+cargo bench --bench av1_encode -- av1_encode_stage    # the per-stage groups only
+ZVIDLIB_BENCH_LARGE=1 cargo bench --bench av1_encode  # add the 1080p pass
+```
 
 The kernel-level `av1_forward_*` groups run once per available instruction set
 through
@@ -548,7 +561,7 @@ mistaken for bitstream-writing cost:
 | `..._pcm_write` | whole-picture access-unit writing: parameter sets, slice header, CABAC-coded CU syntax, PCM samples |
 | `hevc_encode_cabac` | the §9.3.5 arithmetic encoder alone, over a synthetic bin stream |
 | `hevc_encode_bitwriter` | the raw fixed-length / `ue(v)` / `se(v)` writer alone |
-| `..._rgba_to_yuv420` | the RGBA8 input conversion every encoded frame pays |
+| `..._rgba_to_yuv420` | the RGBA8 input conversion every encoded frame pays (`engine::encoder::colorconv`) |
 
 Every group runs once per available instruction set through
 `support::isa::bench_across_isas`, with the same bit-exactness and
@@ -578,16 +591,24 @@ them, which is what keeps its PCM encode exactly lossless.
 
 ### Where the SIMD axis reads flat, and why that is the result
 
-`hevc_rdcost` — the SAD and SATD distortion metrics the mode search calls — is
-the encoder's **only** SIMD dispatch family of its own. The one other group that
-moves with the instruction set is `..._reconstruct`, which reaches the decoder's
-already-vectorized deblocking and SAO kernels rather than an encoder-side one.
-Bitstream writing, CABAC, and the RGBA-to-YUV420 conversion have no vector path
-at all, so their arms are expected to read the same under every instruction set. That is a measured result, not a
-broken benchmark: it says the next encoder-side vectorization targets are
-entropy coding and color conversion. It is also why every group asserts through
-`simd::active_by_site()` that the override landed rather than inferring it from
-the clock — see [Reading a null result](#reading-a-null-result).
+The encoder has three SIMD dispatch families of its own: `hevc_rdcost`, the SAD
+and SATD distortion metrics the mode search calls; `hevc_fwd_transform_quant`,
+the forward transform and quantization; and `hevc_colorconv`, the RGBA8 to
+YUV420 input conversion. A fourth group, `..._reconstruct`, also moves with the
+instruction set, but by reaching the decoder's already-vectorized deblocking and
+SAO kernels rather than an encoder-side one.
+
+**Bitstream writing and CABAC** have no vector path at all, so `..._pcm_write`,
+`hevc_encode_cabac` and `hevc_encode_bitwriter` are expected to read the same
+under every instruction set. That is a measured result, not a broken benchmark:
+it says the remaining encoder-side vectorization targets are entropy coding and
+the bitwriter — and that for the bitwriter, a widening rewrite of its
+`put_bit`-at-a-time inner loop is likely worth more than vector kernels, while
+CABAC's renormalization is serial by construction and is a
+bin-parallel-algorithm question rather than a kernel one. It is also why every
+group asserts through `simd::active_by_site()` that the override landed rather
+than inferring it from the clock — see
+[Reading a null result](#reading-a-null-result).
 
 ## Per-stage access to the encoder
 
