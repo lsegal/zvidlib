@@ -186,11 +186,7 @@ pub(crate) unsafe fn block_contexts<V: I32x>(
                 // The `coeff_br` offset splits on the top-left 2x2 corner.
                 let near = if row < 2 { columns.le(one) } else { V::zero() };
                 let br_offset = V::select(near, V::splat(BR_NEAR_OFFSET), V::splat(BR_FAR_OFFSET));
-                let br = br_mag
-                    .add(one)
-                    .sra::<1>()
-                    .min(V::splat(6))
-                    .add(br_offset);
+                let br = br_mag.add(one).sra::<1>().min(V::splat(6)).add(br_offset);
 
                 let count = (size - column).min(V::LANES);
                 base.store_masked(&mut base_out[row * size + column..], count);

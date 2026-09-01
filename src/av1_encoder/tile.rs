@@ -1312,3 +1312,161 @@ fn golomb(sym: &mut SymbolEncoder, x: u32) {
         i -= 1;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::simd::{self, SimdIsa};
+
+    /// Small deterministic LCG, matching the style used elsewhere in the crate.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            self.0 >> 33
+        }
+    }
+
+    /// Quantized coefficients spanning the ranges the contexts distinguish: zeros, the base
+    /// levels, the base-range cap, and magnitudes past the golomb threshold, in both signs.
+    fn coefficients(size: usize, seed: u64) -> Vec<i32> {
+        let mut rng = Lcg(seed);
+        (0..size * size)
+            .map(|_| {
+                let magnitude = match rng.next() % 5 {
+                    0 => 0,
+                    1 => (rng.next() % 3) as i32,
+                    2 => (rng.next() % 16) as i32,
+                    3 => (rng.next() % 64) as i32,
+                    _ => (rng.next() % 4096) as i32,
+                };
+                if rng.next() % 2 == 0 {
+                    magnitude
+                } else {
+                    -magnitude
+                }
+            })
+            .collect()
+    }
+
+    /// The widths worth covering: every one from a single coefficient up past two full AVX2
+    /// vectors, so a partial trailing vector is exercised at both lane counts, plus the large
+    /// transform sizes the non-lossless encoder actually codes.
+    const WIDTHS: [usize; 20] = [
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 32, 64,
+    ];
+
+    /// The whole point of the vector kernel: it must agree with `tile.rs`'s scalar §8.3.2
+    /// reference lane for lane, at every width and on every instruction set the host has.
+    #[test]
+    fn the_context_pass_matches_the_scalar_reference_on_every_instruction_set() {
+        let _guard = simd::test_lock();
+        for &size in &WIDTHS {
+            for seed in 0..4u64 {
+                let quant = coefficients(size, seed * 977 + size as u64);
+                let mut expected_base = vec![0i32; size * size];
+                let mut expected_br = vec![0i32; size * size];
+                for pos in 0..size * size {
+                    expected_base[pos] = coeff_base_ctx(pos, &quant, size) as i32;
+                    expected_br[pos] = coeff_br_ctx(pos, &quant, size) as i32;
+                }
+                for isa in simd::available() {
+                    simd::set_override(Some(isa));
+                    assert_eq!(
+                        coeff::active_isa(),
+                        isa,
+                        "the coefficient context site did not follow the override"
+                    );
+                    let mut scratch = CoeffScratch::default();
+                    scratch.derive(&quant, size);
+                    assert_eq!(
+                        scratch.base,
+                        expected_base,
+                        "coeff_base at size {size}, seed {seed}, isa {}",
+                        isa.name()
+                    );
+                    assert_eq!(
+                        scratch.br,
+                        expected_br,
+                        "coeff_br at size {size}, seed {seed}, isa {}",
+                        isa.name()
+                    );
+                }
+            }
+        }
+        simd::set_override(None);
+    }
+
+    /// Deriving the contexts up front is only legal because the backwards scan never consults a
+    /// neighbour it has not already coded, and never consults a non-zero one past the
+    /// end-of-block. Replay the incremental derivation the coding loop used to do and check it
+    /// against the one-pass answer, for every end-of-block a block can have.
+    #[test]
+    fn the_one_pass_derivation_matches_the_incremental_scan_order_one() {
+        let _guard = simd::test_lock();
+        simd::set_override(Some(SimdIsa::Scalar));
+        for &size in &[4usize, 8, 16, 32] {
+            let count = size * size;
+            let scan = cdf::up_right_diagonal_scan(size);
+            let dense = coefficients(size, 31 + size as u64);
+            for eob in 1..=count {
+                // Past the end-of-block every coefficient is zero by the definition of `eob`,
+                // which is the property the one-pass derivation leans on.
+                let mut quant = vec![0i32; count];
+                for &pos in scan.iter().take(eob) {
+                    quant[pos] = dense[pos];
+                }
+                let mut scratch = CoeffScratch::default();
+                scratch.derive(&quant, size);
+
+                let mut levels = vec![0i32; count];
+                for c in (0..eob).rev() {
+                    let pos = scan[c];
+                    assert_eq!(
+                        coeff_base_ctx(pos, &levels, size) as i32,
+                        scratch.base[pos],
+                        "coeff_base at size {size}, eob {eob}, scan index {c}"
+                    );
+                    assert_eq!(
+                        coeff_br_ctx(pos, &levels, size) as i32,
+                        scratch.br[pos],
+                        "coeff_br at size {size}, eob {eob}, scan index {c}"
+                    );
+                    levels[pos] = quant[pos].abs();
+                }
+            }
+        }
+        simd::set_override(None);
+    }
+
+    /// The encoded bitstream is the contract: a vector context pass that changed a single symbol
+    /// would produce a different tile, so every instruction set must emit the same bytes.
+    #[test]
+    fn the_encoded_tile_is_byte_identical_on_every_instruction_set() {
+        let _guard = simd::test_lock();
+        let (width, height) = (61usize, 37usize);
+        let mut rng = Lcg(0x5eed);
+        let plane: Vec<u8> = (0..width * height)
+            .map(|_| (rng.next() & 0xff) as u8)
+            .collect();
+        for qindex in [0u8, 40, 160] {
+            simd::set_override(Some(SimdIsa::Scalar));
+            let reference = FrameEncoder::new(&plane, width, height, qindex).encode();
+            for isa in simd::available() {
+                simd::set_override(Some(isa));
+                let coded = FrameEncoder::new(&plane, width, height, qindex).encode();
+                assert_eq!(
+                    coded,
+                    reference,
+                    "tile bytes differ at qindex {qindex} on {}",
+                    isa.name()
+                );
+            }
+        }
+        simd::set_override(None);
+    }
+}
