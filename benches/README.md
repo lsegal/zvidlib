@@ -892,13 +892,78 @@ without a warning.
 
 ### Frame readback
 
-There is no separate readback arm. `VideoDecoder` hands back a host-side
-`VideoFrame`, the HEVC decoder configuration only accepts `PixelFormat::Rgba8`,
-and each backend maps its own surface and converts to RGBA inside `submit`, so
-there is no public seam between "the fixed-function block finished" and "the
-pixels are in a `Vec<u8>`". A readback number measured any other way would be a
-reimplemented stand-in rather than the code that runs, so the group reports the
-two as inseparable instead of reporting a proxy.
+`VideoDecoder` hands back a host-side `VideoFrame`, the HEVC decoder
+configuration only accepts `PixelFormat::Rgba8`, and each backend maps its own
+surface and converts to RGBA inside `submit` — so a caller sees the
+fixed-function decode and the host round trip as one number. For a playback
+pipeline the round trip is often the part that bounds throughput, which is what
+made it worth separating (`#151`, `#170`, `#283`).
+
+`hevc_hardware_readback` is the group that separates it, and it runs whenever
+the hardware arm does:
+
+| Benchmark | What it measures |
+| --- | --- |
+| `hardware/surface_copy` | making the decoded surface CPU-readable: `cuvidMapVideoFrame` + `cuMemcpyDtoH` (NVDEC), the staging-texture `CopySubresourceRegion` + `Map` (Media Foundation), or `CVPixelBufferLockBaseAddress` (VideoToolbox) |
+| `hardware/color_convert` | the NV12-to-RGBA pass over those bytes and the RGBA allocation it fills |
+
+The two are split because they scale differently by host: the surface copy is a
+PCIe transfer on a discrete GPU and little more than a lock on unified memory,
+while the conversion is host CPU work everywhere. The run also prints both as
+ms/frame and as a percentage of the `steady_state` decode they are part of, which
+is the ratio the issues above asked for.
+
+These are attribution numbers, not wall-clock ones. Each backend charges its own
+per-frame phases to `zvidlib::hevc_hardware_readback`, and one criterion
+iteration decodes the same 32-frame window `steady_state` does and reports only
+the nanoseconds that window spent in the phase under test — so an iteration's
+wall time is longer than the number it prints, by exactly the decode it had to
+run to produce it. The seam counts frames as well as nanoseconds, and the group
+asserts the count matches the window, so a backend that stopped reporting reads
+as a failed run rather than as free readback.
+
+Measured on an Apple Silicon host through VideoToolbox, over the same 32-frame
+window: the surface copy is ~3 us/frame and the colour conversion ~10 ms/frame,
+so readback is roughly two thirds to three quarters of what the `steady_state`
+arm reports as hardware decode (13-15 ms/frame, moving with the host's other
+work). The split is the useful part of that: on unified memory there is no
+transfer to remove, and the host round trip is almost entirely the crate's own
+NV12-to-RGBA pass — the same conversion that is the largest single item in a
+*software* decode. A discrete-GPU host is expected to read differently, with a
+real PCIe transfer in `surface_copy`; `#228`'s x86_64 measurement is where that
+number will come from.
+
+There is no readback arm on the software baseline. The seam covers the
+fixed-function backends; the software decoder's own conversion is already the
+`color_convert` stage in [the decode breakdown](#where-hevc-decode-time-actually-goes)
+and the `hevc_color_convert` per-stage group.
+
+#### Why a measurement seam and not a zero-copy output path
+
+Issue #283 asked the broader question the measurement gap implied: should the
+decoder expose the decoded surface *before* readback, so a GPU-side consumer (a
+texture upload, a wgpu or WebGL path) could skip the host round trip entirely?
+That was decided against, for now:
+
+- It is three platform handle types (`CVPixelBuffer`, a `CUdeviceptr` plus its
+  context, an `ID3D11Texture2D` plus the device that owns it), each with its own
+  lifetime and threading contract, in a public API — and the crate does not own
+  the drivers or frameworks whose contracts it would be promising to keep.
+- It requires a second public `PixelFormat` family (NV12), since no backend
+  produces RGBA on the GPU today.
+- The benchmark that motivated it does not need it. A benchmark wants the cost
+  of the copy that runs, not a way to avoid it, and the seam above measures
+  exactly that code rather than a reimplemented stand-in.
+
+The zero-copy path stays unbuilt until a caller needs it; the case for it would
+be a real GPU-side consumer, not a measurement. Until then
+`zvidlib::hevc_hardware_readback` is `#[doc(hidden)]` and unstable, like
+`hevc_decoder_bench` and `hevc_decode_profile`, and its per-frame instrumentation
+is unconditional for the same reason theirs is: a feature-gated profiler measures
+a build nobody ships. It costs two `Instant::now()` reads and a relaxed
+`fetch_add` per phase per frame. Its accumulators are process-wide atomics rather
+than thread-locals because NVDEC and VideoToolbox deliver frames from a callback
+that need not run on the submitting thread.
 
 ## Fixtures
 
