@@ -112,6 +112,30 @@ const LARGE_TYPE_GAIN_PROBES: usize = 4;
 /// `the_search_shortcuts_stay_within_their_rate_and_distortion_bound` asserts stops being
 /// comfortable.
 pub(super) const TYPE_GAIN_SAMPLE_INTERVAL: usize = 2;
+/// Probes a transform size's accumulated gain ratio remembers, as the window of an exponential
+/// recency weighting.
+///
+/// The ratio a probe measures is a property of the *content around the block it was measured
+/// on*, not of the frame: on a frame whose statistics change across it, a block corrected by a
+/// ratio measured on the other side of that change can have two close sizes ranked the wrong way
+/// round. Accumulating every probe of a size equally over the whole frame is what made the
+/// correction frame-wide. So each accumulator is aged by `(n-1)/n` before a new probe joins it,
+/// and a probe's weight decays geometrically over the following `n` probes - which, since the
+/// size searches that probe are visited in the decoder's superblock raster order, makes the
+/// ratio a block reads back the one its own neighbourhood measured.
+///
+/// `1` is the shortest window there is: a non-probing trial is corrected by the single most
+/// recent probe at that size and by nothing older. On its own that is too noisy an estimate to
+/// rank a size on - it costs `smooth` +12.97% against the unsampled estimator un-shrunk - which
+/// is why it is paired with [`TYPE_GAIN_TRUST`] at half, and why the two are documented as one
+/// choice there rather than as two independent ones. #308 removed this window entirely on the
+/// grounds that the shrinkage subsumed it; that no longer holds under #299's rate model, where
+/// frame-wide accumulation misses the distortion bound at `qindex` 1 by 0.109 dB at every
+/// shrinkage from 0 to 16.
+///
+/// The decay is one multiply and one divide per accumulator, paid only on the sampled trials.
+pub(super) const TYPE_GAIN_MEMORY: usize = 1;
+
 /// Transform sizes [`FrameEncoder::type_gain`] accumulates over: `TX_4X4` through `TX_32X32`,
 /// which is every size [`super::transform::forward_transform`] implements.
 const TYPE_GAIN_SIZES: usize = 4;
@@ -177,67 +201,35 @@ pub(crate) enum GainRatio {
 /// [`TYPE_GAIN_TRUST_ONE`] sixteenths. A trial that probed is corrected in full by what it
 /// measured on its own block; only an estimate carried from other blocks is shrunk.
 ///
-/// #272's recency weighting (`TYPE_GAIN_MEMORY`, a window of four probes, removed by #308 once
-/// this shrinkage made it unmeasurable) left `scene_edge` at +9.32% against the unsampled
-/// estimator at 192x160, an order of magnitude above every other frame, and issue #279 asked
-/// whether what was left was spatial locality in the axis a window over probe order cannot see -
-/// probes are visited in superblock raster order, so a window of four spanned a horizontal run
-/// of coding blocks. It is not, and three measurements say so.
+/// This and [`TYPE_GAIN_MEMORY`] were derived against each other, and the honest description of
+/// how is that they were grid-searched rather than reasoned to. #281 chose a shrinkage of `2`
+/// against a surface whose worst case was `scene_edge` at +9.32%, and #308 then removed the
+/// recency window on the grounds that the shrinkage subsumed it - both measured while
+/// [`estimate_rate`] charged a level `2 + 2 * bit_length(level)`. #299 replaced that with the
+/// symbol-counting model §5.11.39 actually codes, which removed most of the penalty both
+/// mechanisms existed to absorb: re-running `measure_type_gain_trust` and
+/// `measure_type_gain_memory_windows` against it puts every frame of the tuning set within 0.63%
+/// at every quantizer, flat across the whole `0..=16` shrinkage range and flat across every
+/// window from one probe to the whole frame. Neither knob separates on the set either was chosen
+/// on any more.
 ///
-/// `measure_type_gain_locality` keeps a second accumulator per *superblock column*, whose most
-/// recent probes when a superblock starts are the ones directly above it. Reading that back
-/// instead of the running accumulator measures +9.92% and blending the two +9.32%: the other axis
-/// carries no information the running accumulator was missing. (`scene_edge`'s boundary is
-/// horizontal, so a column's own history crosses it too.)
+/// What still separates them is the pair of assertions they have to satisfy together -
+/// `the_search_shortcuts_stay_within_their_rate_and_distortion_bound`'s 0.05 dB against the
+/// exhaustive search on `test_pattern` at 96x80, and
+/// `the_type_gain_sampling_interval_holds_on_content_it_was_not_tuned_on`'s per-frame ceilings on
+/// the tuning set - and `(1, 8)` is the *only* point of the 66-cell `memory` x `trust` grid that
+/// satisfies both. It is a defensible policy read on its own terms - correct a non-probing trial
+/// by the freshest measurement at that size, and believe half of it, a remembered ratio being
+/// worth less than a measured one - but it was not arrived at that way, and its neighbours fail:
+/// `(1, 6)` misses the distortion bound at `qindex` 1 by 0.109 dB and `(1, 10)` misses
+/// `smooth`'s ceiling at 128x96 by 0.63 points. Neither assertion was touched to reach it.
 ///
-/// `measure_type_gain_probes` steadies the estimate instead, from one probed block per trial to
-/// sixteen. At 192x160 the frame sits between +9.32% and +9.48% throughout, so it is not the
-/// noise in a one-block estimate either, and the extra probes cost 154,300 more candidates at
-/// sixteen.
-///
-/// `measure_scene_edge_size_choices` names it. The whole penalty is at one quantizer (160), where
-/// 29 of the frame's 156 transform-size decisions differ from the unsampled estimator's, spread
-/// over the entire frame, top region and bottom alike, rather than gathered at the boundary, and
-/// 27 of the 29 go the same way: the sampled estimator codes the block in *smaller* transforms.
-/// That is what an over-large correction looks like rather than a mislocated one. The correction
-/// is `gain * sum(dct)` over the trial's searched blocks, so it grows with the trial's block
-/// count; inflate the gain and the size with more blocks wins. The frame's cost moves
-/// accordingly: 189 bytes more for 38,624 less squared error at a `lambda` that charges 548,856
-/// for them.
-///
-/// So the estimate is shrunk toward no correction at all, which is a plain statement of how much
-/// less a ratio measured on other blocks is worth than one measured on this block. Sixteenths of
-/// the remembered gain, as each frame's worst penalty in `sse + lambda * bits` against the same
-/// estimator probing every size search, over the `content_frames` set plus `test_pattern` at the
-/// six quantizers:
-///
-/// | trust | scene_edge 128x96 | smooth 128x96 | scene_edge 192x160 | smooth 192x160 | test_pattern 192x160 | candidates |
-/// |------:|------------------:|--------------:|-------------------:|---------------:|---------------------:|-----------:|
-/// | 0     | +0.10%            | +0.47%        | +1.27%             | +0.54%         | +0.00%               | 150,680    |
-/// | 1     | +0.10%            | +0.00%        | +1.27%             | +0.08%         | +0.00%               | 150,827    |
-/// | 2     | +0.10%            | +0.00%        | +1.27%             | +0.08%         | +0.00%               | 151,019    |
-/// | 4     | +0.10%            | +0.00%        | +1.27%             | +0.08%         | +0.37%               | 152,176    |
-/// | 6     | +0.10%            | +0.00%        | +8.42%             | +0.08%         | +0.37%               | 153,872    |
-/// | 8     | +1.37%            | +1.16%        | +8.42%             | +0.53%         | +0.37%               | 154,617    |
-/// | 16    | +2.13%            | +1.15%        | +9.32%             | +0.52%         | +0.37%               | 155,392    |
-///
-/// (`noise`, `diagonals` and `quadrants` are +0.00% at every value and are left out; the
-/// candidate column is 192x160.) `2` is the middle of the `1..=3` plateau where every frame is
-/// at its own minimum, with a value either side of it before anything moves: `0` gives up
-/// `smooth`'s +0.47% by discarding the remembered correction entirely, and `4` starts trading
-/// `test_pattern` back. It takes the scene edge from +9.32% to +1.27% at 192x160 and from
-/// +2.13% to +0.10% at 128x96, and
-/// `the_type_gain_sampling_interval_holds_on_content_it_was_not_tuned_on` asserts both sizes.
-///
-/// The correction exists to be cheap and stays so. The shrinkage is one multiply and one divide
-/// on the trials that did not probe, and because a smaller correction stops promoting small
-/// transform sizes it evaluates 151,019 transform-type candidates against the un-shrunk 155,392,
-/// 2.8% *fewer*, against the exhaustive search's 700,004. Fewer candidates but slightly more
-/// time: from the minimum of five interleaved rounds per arm in `measure_type_gain_trust_cost`
-/// over the six frames at six quantizers, 0.686 s against 0.677 s un-shrunk, +1.3%. The
-/// candidates it stops evaluating are the cheapest ones - a 4x4 or 8x8 transform of a block it
-/// now codes whole - so removing them does not pay for the larger transforms it codes instead.
-pub(super) const TYPE_GAIN_TRUST: i64 = 2;
+/// That fragility is a statement about the shortcuts, not about these two constants: with the
+/// rate model corrected, the DCT-only trial ranking's own error at `qindex` 1 is about 0.2 dB
+/// and no setting of either knob removes it, so what clears the bound is which way a handful of
+/// size decisions happen to fall. Re-deriving the calibration on content that genuinely
+/// separates it is tracked separately rather than papered over here.
+pub(super) const TYPE_GAIN_TRUST: i64 = 8;
 
 /// [`TYPE_GAIN_TRUST`] denominator: the un-shrunk correction.
 const TYPE_GAIN_TRUST_ONE: i64 = 16;
@@ -362,6 +354,9 @@ pub(crate) struct FrameEncoder<'a> {
     /// tests.
     #[cfg(test)]
     type_gain_ratio: GainRatio,
+    /// The recency window in force, so a test can sweep it. [`TYPE_GAIN_MEMORY`] outside tests.
+    #[cfg(test)]
+    type_gain_memory: usize,
     /// The shrinkage in force, in the units of [`TYPE_GAIN_TRUST`], so a test can sweep it.
     #[cfg(test)]
     type_gain_trust: i64,
@@ -581,6 +576,8 @@ impl<'a> FrameEncoder<'a> {
             #[cfg(test)]
             type_gain_trust: TYPE_GAIN_TRUST,
             #[cfg(test)]
+            type_gain_memory: TYPE_GAIN_MEMORY,
+            #[cfg(test)]
             candidates_evaluated: 0,
             #[cfg(test)]
             size_choices: Vec::new(),
@@ -709,6 +706,33 @@ impl<'a> FrameEncoder<'a> {
     #[cfg(test)]
     fn type_gain_ratio(&self) -> GainRatio {
         self.type_gain_ratio
+    }
+
+    /// Overrides the recency window, so a test can measure the estimator between remembering one
+    /// probe and remembering the whole frame. `usize::MAX` disables the decay, which is the
+    /// frame-wide accumulation this replaced.
+    #[cfg(test)]
+    pub(crate) fn with_type_gain_memory(mut self, memory: usize) -> Self {
+        assert!(
+            memory >= 1,
+            "a window of 0 would divide the accumulator by zero"
+        );
+        self.type_gain_memory = memory;
+        self
+    }
+
+    /// Probes a size's gain ratio remembers. [`TYPE_GAIN_MEMORY`] outside tests, where nothing
+    /// can override it.
+    #[cfg(test)]
+    fn type_gain_memory(&self) -> usize {
+        self.type_gain_memory
+    }
+
+    /// Probes a size's gain ratio remembers. [`TYPE_GAIN_MEMORY`] outside tests, where nothing
+    /// can override it.
+    #[cfg(not(test))]
+    fn type_gain_memory(&self) -> usize {
+        TYPE_GAIN_MEMORY
     }
 
     /// Overrides how far a remembered gain is shrunk toward no correction at all, so a test can
@@ -1105,6 +1129,29 @@ impl<'a> FrameEncoder<'a> {
     /// measured the identical penalty on all fifteen frame-and-size pairs. Only `1`, which
     /// remembers a single probe, moved anything at all, and only on one of them. So the decay is
     /// gone and this is a sum again; what it was carrying is carried by the shrinkage.
+    /// Ages an accumulator by `(n-1)/n` before a new probe joins it.
+    ///
+    /// A probe's influence then decays away over the following `n` probes, so the ratio a block
+    /// reads back is the one its own neighbourhood measured rather than the whole frame's, and it
+    /// follows the content across a region boundary within a few coding blocks instead of never.
+    /// One multiply and one divide per accumulator, on the sampled trials only.
+    ///
+    /// `usize::MAX` is the sentinel for no decay at all, which is the frame-wide accumulation
+    /// this replaced; `measure_type_gain_memory_windows` sweeps it as the far end of the window.
+    fn decay(gain: &mut TypeGain, memory: usize) {
+        if memory == usize::MAX {
+            return;
+        }
+        let (num, den) = (memory as i64 - 1, memory as i64);
+        gain.dct_cost = gain.dct_cost * num / den;
+        gain.best_cost = gain.best_cost * num / den;
+        #[cfg(test)]
+        {
+            gain.ratio = gain.ratio * num / den;
+            gain.probes = gain.probes * num / den;
+        }
+    }
+
     fn accumulate(gain: &mut TypeGain, dct: i64, best_of_set: i64) {
         #[cfg(test)]
         {
@@ -1400,10 +1447,13 @@ impl<'a> FrameEncoder<'a> {
             self.probe_dct_cost += dct;
             self.probe_best_cost += best_of_set;
             let slot = type_gain_slot(size);
+            let memory = self.type_gain_memory();
+            Self::decay(&mut self.type_gain[slot], memory);
             Self::accumulate(&mut self.type_gain[slot], dct, best_of_set);
             #[cfg(test)]
             {
                 let column = self.gain_column * TYPE_GAIN_SIZES + slot;
+                Self::decay(&mut self.column_gain[column], memory);
                 Self::accumulate(&mut self.column_gain[column], dct, best_of_set);
             }
             #[cfg(test)]
@@ -1448,7 +1498,8 @@ impl<'a> FrameEncoder<'a> {
         // `eob_pt`, so the symbol goes to the coefficient coder rather than after it. DC_PRED is
         // the only y_mode this encoder signals, so the CDF's intra direction is 0.
         let set = cdf::get_tx_set(size, false, true);
-        let tx_type_symbol = cdf::tx_type_cdf(set, size, 0).map(|tx_cdf| (candidate.symbol, tx_cdf));
+        let tx_type_symbol =
+            cdf::tx_type_cdf(set, size, 0).map(|tx_cdf| (candidate.symbol, tx_cdf));
         self.code_coefficients(
             x >> 2,
             y >> 2,

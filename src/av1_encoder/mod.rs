@@ -954,7 +954,7 @@ mod nonlossless_tests {
     /// only alongside a deliberate change to what the encoder emits, never to make a host pass.
     const FIXED_FRAME_DIGESTS: [(usize, u64); 6] = [
         (6206, 0x190c_962c_83b3_0bbf),
-        (5034, 0xb0f9_4cc3_8610_6e7a),
+        (5020, 0x4de7_3d2a_e1fa_ec4e),
         (3496, 0x809b_f0bd_bfae_d7a0),
         (2567, 0x2721_ab2e_2cbc_c324),
         (1525, 0x7144_46e8_0c7d_b4a2),
