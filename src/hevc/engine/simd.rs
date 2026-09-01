@@ -165,10 +165,9 @@
 //! widest in the table; what matters in it is that its two columns stay equal
 //! draw by draw — across fifteen runs the folded and opaque scalar arms never
 //! differ by more than 0.09 ms, against the 2.0 ms that separates them on
-//! Zen. The 8573C itself
-//! (family 6 model 207) was drawn again for this and reproduces #301's
-//! number exactly: 0.85x on the folded arm across three runs, and 2.33-2.36x
-//! on the opaque one. A Xeon 6973P-C drawn from the same pool reads 0.87x
+//! Zen. The 8573C itself (family 6 model 207) was drawn again for this and
+//! reproduces #301's number exactly: 0.85x on the folded arm across three
+//! runs, and 2.33-2.36x on the opaque one. A Xeon 6973P-C drawn from the same pool reads 0.87x
 //! and 2.36x, so this is a property of that class of Intel core rather than
 //! of one part number.
 //!
@@ -212,10 +211,12 @@
 //! | §8.5.3.3.4 [`combine_weighted`] block, SSE4.1 / AVX2 | ~1.0x / 0.93-0.95x | 0.99-1.10x / 0.98-1.05x | **AVX2 moved** |
 //! | §8.5.3.3.4 [`combine_weighted`] buffer, SSE4.1 / AVX2 | 0.75x / 0.92-0.93x | 0.96-1.03x / 1.99-2.18x | **both moved** |
 //!
-//! Thirteen of the sixteen figures reproduced; the two SAO rows and the two
-//! deblocking rows widened by a few hundredths without changing what they say.
-//! Every figure that moved is a [`combine_weighted`] one, and the AVX2 buffer
-//! arm moved by more than a factor of two, from a loss to a win.
+//! Thirteen of the sixteen figures reproduced. Five draws see more spread
+//! than one did, so several ranges widen at both ends — most of all SSE4.1
+//! SAO, whose 2.7-2.8x becomes 2.62-3.08x — but none of them changes which
+//! side of 1.00x the kernel is on or what the row says. Every figure that
+//! moved in the sense that matters is a [`combine_weighted`] one, and the
+//! AVX2 buffer arm moved by more than a factor of two, from a loss to a win.
 //!
 //! **It is the recorded figures that moved, not the harness or the toolchain.**
 //! The same workflow, on the same day and the same rustc, drew an EPYC 9V74 and
@@ -957,7 +958,7 @@ pub fn combine_weighted<const N: usize>(
         // allocator kept out of the timing, and on an Intel Coffee Lake
         // i7-8700B it runs ~1.00x on both arms (0.99-1.10x block,
         // 0.96-1.03x buffer over five `macos-15-intel` draws for #326,
-        // superseding the 1.00x / 0.75x #218 recorded from one draw).
+        // superseding the 1.00x / 0.75x #224 recorded from one draw).
         // Vendor was the open question (#218) and it does not move this
         // decision: the four-lane kernel is at or below scalar on both, and
         // reads ~1.00x on both arms on an Emerald Rapids Xeon Platinum
@@ -969,7 +970,7 @@ pub fn combine_weighted<const N: usize>(
         // Eight lanes is width the four-lane auto-vectorization does not
         // reach: the kernel measures 1.38x in the block path and 2.0-2.2x
         // on a bare buffer on EPYC, and 1.13-1.25x / 1.5-1.6x on an
-        // Emerald Rapids Xeon Platinum 8573C (#285). #218 read 0.93-0.95x
+        // Emerald Rapids Xeon Platinum 8573C (#285). #224 read 0.93-0.95x
         // and 0.92-0.93x on an Intel Coffee Lake i7-8700B, and #301 built
         // a Skylake-family `vpmulld` argument to explain it — 256-bit
         // `vpmulld` costs two uops there against one from Ice Lake onward.
