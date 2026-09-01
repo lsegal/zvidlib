@@ -75,32 +75,53 @@ const TYPE_GAIN_PROBES: usize = 1;
 ///
 /// The ratio is only stable frame-wide while the frame's content is, and the reuse is what costs
 /// accuracy when it is not: a block corrected by a ratio measured in a region unlike its own can
-/// have two close sizes ranked the wrong way round. `2` is where that trade was measured out, on
-/// the six-frame set in `measure_type_gain_sampling_intervals` at 192x160 - a hard scene edge, a
-/// four-quadrant frame, full-range noise, a smooth surface, directional edges, and the encoder's
-/// own `test_pattern` - against the same estimator probing every size search, which is the
-/// unsampled search this interval approximates. Cost is the encoder's own `sse + lambda * bits`,
-/// summed over the frame and compared at equal quantizer:
+/// have two close sizes ranked the wrong way round. That used to be what bounded this constant
+/// from above. It is not any more, and `8` is chosen from a different column than the one that
+/// first set it.
+///
+/// Re-measured with [`TYPE_GAIN_TRUST`] in force, on the eight-frame set in
+/// `measure_type_gain_sampling_intervals` - a hard scene edge, a four-quadrant frame, full-range
+/// noise, a smooth surface, directional edges, bands, a mosaic, and the encoder's own
+/// `test_pattern` - at 192x160 and at the 128x96 the ceilings below are set from, against the
+/// same estimator probing every size search. Cost is the encoder's own `sse + lambda * bits`,
+/// summed over the frame and compared at equal quantizer; times are the minimum of five
+/// interleaved rounds per arm in `measure_type_gain_sampling_cost`, and candidates are the
+/// 192x160 set's:
 ///
 /// | interval | worst penalty vs unsampled | mean vs exhaustive | candidates | time |
 /// |---------:|---------------------------:|-------------------:|-----------:|--------:|
-/// | 1        | 0.0%                       | +0.25%             | 181,557    | 0.644 s |
-/// | 2        | +44.1%                     | +1.05%             | 155,143    | 0.607 s |
-/// | 4        | +64.6%                     | +1.70%             | 142,372    | 0.574 s |
-/// | 8        | +78.7%                     | +1.97%             | 136,250    | 0.565 s |
-/// | 16       | +85.8%                     | +2.29%             | 128,035    | 0.557 s |
+/// | 1        | 0.0%                       | +0.19%             | 243,694    | 0.640 s |
+/// | 2        | +1.3%                      | -0.36%             | 203,477    | 0.587 s |
+/// | 4        | +3.5%                      | -0.42%             | 183,677    | 0.563 s |
+/// | 8        | +3.4%                      | -0.41%             | 174,638    | 0.549 s |
+/// | 16       | +1.5%                      | -0.55%             | 167,546    | 0.542 s |
 ///
-/// Every worst case is the same frame and quantizer - the hard scene edge at `qindex` 160, whose
-/// two halves have unrelated statistics - and the original value of `8` carried nearly twice
-/// the error there against `2` while saving 7% of the encode. `1` is not the value because it
-/// evaluates 181,557 transform-type candidates against the exhaustive search's 700,004, which
-/// no longer clears the
-/// four-fold reduction the shortcuts exist for and
-/// `the_search_shortcuts_stay_within_their_rate_and_distortion_bound` asserts; `2` clears it with
-/// 155,143. What remains at `2` is the estimator mixing statistics across regions rather than the
-/// sampling rate, which no interval fixes; [`TYPE_GAIN_TRUST`] is what addresses that, and the
-/// worst-penalty column above is the uncorrected estimator it shrinks.
-pub(super) const TYPE_GAIN_SAMPLE_INTERVAL: usize = 2;
+/// The penalty column no longer chooses. Under the frame-wide accumulation this interval was
+/// calibrated against it ran +44.1% at `2` and +85.8% at `16`, which is what kept the value
+/// small; shrinking a remembered ratio to [`TYPE_GAIN_TRUST`] sixteenths collapsed it, and every
+/// interval from `1` to `64` now lands within +3.5% of the unsampled estimator across both sizes.
+/// What is left is not even monotone - `3` and `4` cost more than `8` and `16` do - because at
+/// this magnitude which neighbourhood a block reads back comes down to where its probes happened
+/// to fall. The mean against the exhaustive search is *negative* at every interval past `1`: on
+/// this set the sampled estimator reconstructs at slightly better rate-distortion than probing
+/// every size search, the probes it skips having been worth less than the shrunken correction
+/// that stands in for them.
+///
+/// So the interval is chosen on coverage and cost instead. Coverage binds it: the per-size
+/// correction is what makes `TX_4X4` selectable at all, and on the 96x80 pattern - few enough
+/// coding blocks that a long interval never probes a trial carrying the smallest size - `16`
+/// loses the size outright, as do `3`, `6` and `12`, which alias against the block raster the
+/// sample walks in. `8` is the largest interval that keeps it, which
+/// `the_type_gain_sampling_interval_is_the_longest_that_keeps_tx_4x4` and
+/// `non_lossless_frames_round_trip_within_a_distortion_bound` both hold it to. Within that bound
+/// it takes the whole available saving: 174,638 transform-type candidates against `2`'s 203,477
+/// and the exhaustive search's 920,503 - 14% fewer than the previous value for 6% less encode
+/// time, and comfortably inside the four-fold reduction
+/// `the_search_shortcuts_stay_within_their_rate_and_distortion_bound` asserts, which only gets
+/// easier as the interval grows. The emitted bitstream moves accordingly, so the digests
+/// `a_fixed_frame_encodes_to_the_same_bytes_on_every_host` pins are regenerated; the 96x80
+/// pattern codes to fewer bytes at three of the six quantizers and the same at two.
+pub(super) const TYPE_GAIN_SAMPLE_INTERVAL: usize = 8;
 
 /// Transform sizes [`FrameEncoder::type_gain`] accumulates over: `TX_4X4` through `TX_32X32`,
 /// which is every size [`super::transform::forward_transform`] implements.

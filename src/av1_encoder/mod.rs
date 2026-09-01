@@ -953,10 +953,10 @@ mod nonlossless_tests {
     /// These are constants of the format, not of the machine that produced them: regenerate them
     /// only alongside a deliberate change to what the encoder emits, never to make a host pass.
     const FIXED_FRAME_DIGESTS: [(usize, u64); 6] = [
-        (5417, 0x7b83_6e95_6bad_aae1),
-        (4298, 0xa4c4_6a5e_8ef1_57c0),
-        (3022, 0xba87_1a3d_44c1_4f33),
-        (2238, 0xc29d_7d70_a472_3158),
+        (5422, 0x1352_b9db_7d3b_3d4c),
+        (4289, 0xa74c_990b_3340_f8ce),
+        (3005, 0xcd2f_1c69_1785_039e),
+        (2214, 0xc7e0_a641_51f5_70e4),
         (1264, 0xc8cd_fcf5_8882_a86c),
         (752, 0x73f1_c047_f3cf_211f),
     ];
@@ -1079,7 +1079,15 @@ mod nonlossless_tests {
     #[test]
     #[ignore = "measurement sweep, not an assertion"]
     fn measure_type_gain_sampling_intervals() {
-        let (width, height) = (192_usize, 160_usize);
+        // Both sizes the interval is judged at: 192x160, where the trade is measured, and 128x96,
+        // where `the_type_gain_sampling_interval_holds_on_content_it_was_not_tuned_on` sets its
+        // per-frame ceilings from these same penalties.
+        for (width, height) in [(192_usize, 160_usize), (128, 96)] {
+            measure_type_gain_sampling_intervals_at(width, height);
+        }
+    }
+
+    fn measure_type_gain_sampling_intervals_at(width: usize, height: usize) {
         let mut frames = content_frames(width as u32, height as u32);
         frames.push(("test_pattern", test_pattern(width as u32, height as u32)));
         let quality = |report: &tile::SearchReport, pixels: &[u8]| {
@@ -1102,6 +1110,7 @@ mod nonlossless_tests {
                 })
                 .sum()
         };
+        println!("size,{width}x{height}");
         println!(
             "frame,qindex,interval,fast_psnr,exhaustive_psnr,fast_bytes,exh_bytes,candidates,lambda,fast_rd,exh_rd"
         );
@@ -1560,6 +1569,14 @@ mod nonlossless_tests {
     /// found from - it measured +2.13% there against +9.32% at the larger size - so the larger
     /// one is in the assertion rather than in the `#[ignore]`d sweeps alone, which is what let
     /// that penalty sit unnoticed. The ceilings are the measured penalties with margin.
+    ///
+    /// #278 re-measured the interval against the shrunken estimator and moved it from 2 to 8, and
+    /// the ceilings move with it: `bands` to 4%, from +3.43% at 128x96, and `scene_edge` down to
+    /// 1% from +0.20%, the frame that used to set the loosest ceiling here now setting one of the
+    /// tightest. Every other frame stays at 1% and none of them reaches half of it. That `bands`
+    /// is now the worst frame rather than `scene_edge` is the shrinkage working as intended: what
+    /// is left to pay for is content that changes faster than the sample can follow, not content
+    /// that changes once and is then averaged across.
     #[test]
     fn the_type_gain_sampling_interval_holds_on_content_it_was_not_tuned_on() {
         for (width, height) in [(128_usize, 96_usize), (192, 160)] {
@@ -1570,8 +1587,8 @@ mod nonlossless_tests {
                 ("smooth", 1.0),
                 ("diagonals", 1.0),
                 ("quadrants", 1.0),
-                ("scene_edge", 2.5),
-                ("bands", 1.0),
+                ("scene_edge", 1.0),
+                ("bands", 4.0),
                 ("mosaic", 1.0),
                 ("test_pattern", 1.0),
             ]);
@@ -1599,6 +1616,57 @@ mod nonlossless_tests {
                 }
             }
         }
+    }
+
+    /// `TYPE_GAIN_SAMPLE_INTERVAL` is the largest interval that keeps the smallest transform
+    /// reachable, and that - not the rate-distortion penalty - is what fixes it.
+    ///
+    /// The interval used to be bounded from above by accuracy: under the frame-wide accumulator
+    /// it was calibrated against, the worst frame's penalty climbed to +85.8% by `16`, so the
+    /// value had to stay small. `TYPE_GAIN_TRUST` removed that bound - every interval from `1` to
+    /// `64` now lands within +3.5% of the unsampled estimator, and the mean cost against the
+    /// exhaustive search is *better* than the unsampled estimator's at every interval past `1` -
+    /// so the penalty column no longer chooses between them.
+    ///
+    /// What chooses is coverage. The per-size correction is what makes `TX_4X4` selectable at all:
+    /// coding a block as sixteen 4x4 transforms pays for its extra header bits because the type
+    /// search gets sixteen chances to beat DCT, and only a probe measures that. On the 96x80
+    /// pattern - a frame small enough to have few coding blocks - a long enough interval never
+    /// probes a trial carrying the smallest size, the correction for `TX_4X4` is never measured,
+    /// and the size goes unselected exactly as it did before the correction existed. `16` loses it
+    /// outright, and so do `3`, `6` and `12`, which alias against the block raster the sample walks
+    /// in; `8` is the largest value that holds it.
+    ///
+    /// So this pins the constant from the side that actually binds it: the shipped interval
+    /// selects the smallest transform, and doubling it does not. Raising the constant on the
+    /// strength of its candidate count fails here.
+    #[test]
+    fn the_type_gain_sampling_interval_is_the_longest_that_keeps_tx_4x4() {
+        let (width, height) = (96_usize, 80_usize);
+        let pixels = test_pattern(width as u32, height as u32);
+        let selects_smallest = |interval: usize| {
+            [1_u8, 8, 32, 80, 160, 200].into_iter().any(|qindex| {
+                tile::FrameEncoder::new(&pixels, width, height, qindex)
+                    .with_type_gain_interval(interval)
+                    .encode_with_report()
+                    .trace
+                    .iter()
+                    .any(|&(size, _)| size == 4)
+            })
+        };
+        assert!(
+            selects_smallest(tile::TYPE_GAIN_SAMPLE_INTERVAL),
+            "no quantizer selected TX_4X4 at the shipped interval of {}, so the per-size \
+             correction no longer reaches the smallest transform",
+            tile::TYPE_GAIN_SAMPLE_INTERVAL
+        );
+        let doubled = tile::TYPE_GAIN_SAMPLE_INTERVAL * 2;
+        assert!(
+            !selects_smallest(doubled),
+            "interval {doubled} also selected TX_4X4, so {} is no longer the largest interval \
+             the smallest transform survives and the constant is leaving candidate savings unclaimed",
+            tile::TYPE_GAIN_SAMPLE_INTERVAL
+        );
     }
 
     /// The stated bound on what the search shortcuts cost.
