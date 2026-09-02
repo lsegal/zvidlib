@@ -138,9 +138,11 @@ const TYPE_GAIN_PROBES: usize = 1;
 /// trend over the same range - `+1.27%` at `2`, `+3.48%` at `4`, `+3.43%` at `8`, `+1.47%` at
 /// `16` and at `32`, `+3.27%` at `64`, with only *which* frame pays moving - so nothing on the
 /// rate-distortion side disqualifies a longer interval either. The per-frame ceilings in
-/// `the_type_gain_sampling_interval_holds_on_content_it_was_not_tuned_on` are cleared by `4` and
-/// `8` alone, but they were set from the penalties measured at `8`, so reading an upper bound off
-/// them would restate the phase coincidence rather than replace it.
+/// `the_type_gain_per_frame_penalties_are_pinned_at_the_shipped_sampling_interval` are cleared by
+/// `4` and `8` alone, but they were set from the penalties measured at `8`, so reading an upper
+/// bound off them would restate the phase coincidence rather than replace it. #335 made that
+/// explicit: they are a regression pin on this constant's value, asserted only while it is `8`,
+/// and moving it means re-measuring them rather than failing them.
 ///
 /// What is left is that there is nothing further to buy. Summed over the six quantizers, going
 /// from `8` to `64` removes between `2.8%` and `11.0%` of a frame's transform-type candidates -
@@ -296,7 +298,8 @@ pub(crate) enum GainRatio {
 /// two are reading the remembered ratio back. The shrinkage is doing several times more work than
 /// it was when it was derived, so the same value is held to a much larger penalty - it takes the
 /// scene edge from +78.70% to +0.11% at 192x160 and from +55.52% to +0.10% at 128x96, and
-/// `the_type_gain_sampling_interval_holds_on_content_it_was_not_tuned_on` asserts both sizes.
+/// `the_type_gain_per_frame_penalties_are_pinned_at_the_shipped_sampling_interval` asserts both
+/// sizes.
 ///
 /// The correction exists to be cheap and stays so, and at this interval it no longer costs time
 /// to shrink it. The shrinkage is one multiply and one divide on the trials that did not probe,
