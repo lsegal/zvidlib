@@ -598,9 +598,102 @@ time, all bi-predicted, luma only, minimum of three interleaved rounds per arm:
 
 This is the same effect the `engine::simd` table already records from the other
 direction: `filter_taps` reads 1.6-1.9x on aarch64 in the *block* path and ~1.0x
-over one long L1-resident buffer. A 64x64 two-dimensional 8-tap needs a 64x71
-intermediate, so it behaves like the buffer case; a 16x16 block does not. The old
-grid was the second-best size on that table and carried 5.3% of the real work.
+over one long L1-resident buffer. The old grid was the second-best size on that
+table and carried 5.3% of the real work. #280 read the walk between those two
+figures as the `w x ( h + 7 )` intermediate the two-dimensional path
+materializes turning a large block into the buffer case; issue #309 measured it
+and that is not what it is. See below.
+
+#### What the block-size decay actually is (issue #309)
+
+#280 inferred the intermediate from the shape of the sweep without instrumenting
+the two passes separately. Doing so refutes it, three ways, all on the same
+aarch64 host in one process per measurement:
+
+**The decay is there with no intermediate.** `measure_interp_pass_split` times
+the two passes apart. The horizontal pass alone — which writes a fresh buffer
+nothing has yet read — decays 2.12x at 8x8, 1.53x at 16x16, 1.06x at 32x32,
+1.03x at 64x64, and the one-dimensional `x_frac == 0` / `y_frac == 0` phases,
+which build no intermediate at all, decay with it (horizontal-only 1.91x → 1.29x,
+vertical-only 1.38x → 1.21x). Whatever erodes the ratio is fully present when
+there is no intermediate to blame.
+
+**The variable is the per-call row length.** `measure_filter_taps_by_row_length`
+strips out the block walk, the allocations and the intermediate entirely: every
+row length reads the same 4 KiB L1-resident tap buffer, writes the same output
+buffer, and covers the same total sample count, so call size is the only thing
+that moves. It reproduces the whole decay:
+
+| Samples per `filter_taps` call | `scalar` | `neon` | ratio |
+| --- | ---: | ---: | ---: |
+| 4 | 12.99 ms | 3.38 ms | 3.84x |
+| 8 | 7.50 ms | 2.33 ms | 3.21x |
+| 16 | 3.96 ms | 1.92 ms | 2.06x |
+| 32 | 2.46 ms | 1.64 ms | 1.50x |
+| 64 | 1.92 ms | 1.44 ms | 1.33x |
+| 128 | 1.62 ms | 1.37 ms | 1.19x |
+| 256 | 1.46 ms | 1.33 ms | 1.10x |
+
+The block walk issues one `filter_taps` call per output row, so the call size
+*is* the block width, and the sweep over block sizes is this sweep. At 64x64 the
+intermediate is 64 x 71 x 4 = 18 KiB, which fits inside the M1's 128 KiB L1D; it
+was never spilling to begin with.
+
+**The ratio falls because the scalar reference gets better, not because the
+kernel gets worse.** Both arms improve with row length, but the auto-vectorized
+scalar loop improves 8.9x across the sweep (12.99 → 1.46 ms) against the kernel's
+2.5x (3.38 → 1.33 ms), and they converge. At 256-sample rows the kernel runs
+4.19M outputs x 8 taps — 8.4M `vmlaq_s32` — in 1.33 ms, about 6.3 G/s, or two per
+cycle at 3.2 GHz. That is the M1's integer SIMD multiply throughput. **The kernel
+is at the hardware limit at large block sizes, and the scalar loop reaches the
+same limit once its trip count is long enough to amortize its prologue.** The
+1.4-3.8x at small sizes is the scalar call's per-invocation setup, not kernel
+headroom that large blocks lose.
+
+##### The two repairs that were tried, and lost
+
+Tiling the two-dimensional path is what #309 proposed. It was implemented as a
+wrap-around ring carrying only the `N` horizontal rows the vertical pass has
+live, instead of all `h + N − 1` — the same total horizontal work with no
+redundant re-filtering, and a 2 KiB working set at 64 wide. A/B'd against the
+full-height intermediate in one process (`measure_2d_ring_vs_flat`, best of 15
+interleaved rounds), it lost at every size, on both arms:
+
+| Luma block | flat `neon` | ring `neon` | speedup | flat `scalar` | ring `scalar` | speedup |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8x8 | 8.87 ms | 15.79 ms | 0.56x | 17.89 ms | 19.96 ms | 0.90x |
+| 16x16 | 4.91 ms | 6.07 ms | 0.81x | 8.62 ms | 9.44 ms | 0.91x |
+| 32x32 | 3.40 ms | 3.69 ms | 0.92x | 4.69 ms | 4.87 ms | 0.96x |
+| 64x64 | 2.89 ms | 2.94 ms | 0.98x | 3.33 ms | 3.36 ms | 0.99x |
+
+Both arms are spelled out inside the test rather than one of them being the
+production path, and the test asserts they agree sample-for-sample with each
+other and with `interp_block` before it times anything, so the comparison stays
+runnable and honest after the revert.
+
+The modular slot index costs more than the intermediate does, and it replaces the
+flat buffer's constant row stride — which LLVM strength-reduces — with an address
+that jumps. Reverted; the flat intermediate stands.
+
+Folding the kernel's mirror taps was tried next, since the half-pel luma phase
+`[-1, 4, -11, 40, 40, -11, 4, -1]` and the half-pel chroma phase `[-4, 36, 36, -4]`
+are palindromes, so each pair can share one multiply: 4 multiplies and 4 adds
+instead of 8 multiplies, which should pay on an ALU-bound kernel. It measured
+*slower* at every row length (1.51 against 1.33 ms at 256 samples, 4.99 against
+3.38 at 4). Reverted.
+
+##### What is left, and why it is not this issue
+
+The remaining headroom is not in the kernel's instruction selection but in its
+operand width. The reference plane, the tap slices and the intermediate are all
+`i32`, four bytes per sample for eight-bit content, so every `vmlaq_s32` covers
+four samples where an `i16` formulation would cover eight. That is a change to
+how sample planes are represented across `engine`, not a change to `filter_taps`,
+and it is tracked separately rather than folded in here.
+
+Neither the decoded output nor any kernel changed in the course of this, so the
+sweep, the `hevc_inter_pred` ratio and the `inter_pred_filter` ms/frame rows
+above stand as re-measured.
 
 Sample-weighting the sweep predicts 1.07x for the measured mix, and the rebuilt
 group measures **1.09x against the old grid's 1.25x** on this host on the same
