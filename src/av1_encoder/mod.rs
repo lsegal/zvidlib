@@ -1080,8 +1080,9 @@ mod nonlossless_tests {
     #[ignore = "measurement sweep, not an assertion"]
     fn measure_type_gain_sampling_intervals() {
         // Both sizes the interval is judged at: 192x160, where the trade is measured, and 128x96,
-        // where `the_type_gain_sampling_interval_holds_on_content_it_was_not_tuned_on` sets its
-        // per-frame ceilings from these same penalties.
+        // where the per-frame penalties
+        // `the_type_gain_per_frame_penalties_are_pinned_at_the_shipped_sampling_interval` pins
+        // are read off.
         for (width, height) in [(192_usize, 160_usize), (128, 96)] {
             measure_type_gain_sampling_intervals_at(width, height);
         }
@@ -1346,8 +1347,9 @@ mod nonlossless_tests {
     /// because it is phase-independent - so it does not, on its own, say where the interval's
     /// upper bound is. This carries both of the properties that could set one past that stop:
     /// the coverage sweep out to `64`, and the per-frame penalty
-    /// `the_type_gain_sampling_interval_holds_on_content_it_was_not_tuned_on` sets its ceilings
-    /// from, over the same intervals. Whichever fails first is the bound.
+    /// `the_type_gain_per_frame_penalties_are_pinned_at_the_shipped_sampling_interval` pins at the
+    /// shipped value, over the same intervals. Whichever fails first is the bound. This is also
+    /// where those pinned values are re-measured from if the interval ever moves.
     #[test]
     #[ignore = "measurement sweep, not an assertion"]
     fn measure_type_gain_intervals_past_sixteen() {
@@ -1768,52 +1770,78 @@ mod nonlossless_tests {
         }
     }
 
-    /// What the sampled transform-gain estimator costs on content it was not tuned on.
+    /// The per-frame rate-distortion penalties the sampled transform-gain estimator measures at
+    /// the shipped [`tile::TYPE_GAIN_SAMPLE_INTERVAL`], pinned at the values they were measured
+    /// at.
     ///
-    /// `TYPE_GAIN_SAMPLE_INTERVAL` probes one coding block's size search in every `n` and
-    /// corrects the rest from the frame's accumulated per-size ratio, which is only representative
-    /// while the frame's content is. `test_pattern` at 96x80 - the frame the interval was
-    /// originally chosen on - cannot see the difference: every interval from 1 to 16 lands within
-    /// 0.03% of the unsampled estimator there, which is why this runs on a set of frames with
-    /// deliberately unlike statistics at a size large enough for the accumulated ratio to drift.
+    /// **These ceilings are fitted to the shipped interval. They are not a property of the
+    /// frames.** The value-fitting is intentional and is what this test is for, so the numbers
+    /// below should not be read as what banded or checkerboard content costs a sampled estimator:
+    /// `bands`'s 4% is what `bands` measured at an interval of `8`, and nothing more. #329 swept
+    /// every interval from `2` to `64` and only `4` and `8` clear these ceilings at all - the rest
+    /// exceed one or more of them by between +1.05% and +3.27%, with *which* frame pays moving
+    /// from `quadrants` to `smooth` to `mosaic` as the interval changes and no frame anywhere in
+    /// the range passing more than +3.48%. What separates the two intervals that pass from the 61
+    /// that do not is therefore the sampling phase `8` happens to draw, not content the estimator
+    /// handles versus content it does not.
     ///
-    /// The comparison is against the *same* estimator probing every size search, not against the
-    /// exhaustive search: that isolates what the sampling costs from what the other shortcuts do.
-    /// Cost is the encoder's own `sse + lambda * bits` at equal quantizer, and the ceilings are
-    /// the measured penalties with margin. They are not aspirations - each one is under what the
-    /// previous interval of 8 measured on the same frame (`scene_edge` +55.5%, `smooth` +4.4%,
-    /// `test_pattern` +2.1%), so a regression of the constant fails here on three frames rather
-    /// than passing unnoticed as it did on 96x80 alone.
+    /// The content property those numbers used to stand in for is held instead by
+    /// `the_type_gain_sampling_intervals_upper_bound_is_what_a_longer_one_buys`, as one `4.0%`
+    /// bound over the whole swept range rather than eight per-frame ceilings fitted at one point
+    /// in it. That is the test to change if the question is whether the estimator is sound; this
+    /// one is the regression pin underneath it.
     ///
-    /// `scene_edge`'s ceiling was 40% while the per-size ratio was accumulated over the whole
-    /// frame: every interval from 2 to 4 measured the same penalty on it, because what it was
-    /// paying for was the estimator mixing two regions' statistics rather than the sampling rate.
-    /// #272 aged that accumulation so a block read back its own neighbourhood's ratio and
-    /// [`tile::TYPE_GAIN_TRUST`] then shrank what was left of a *remembered* correction, which
-    /// together brought the frame to +0.10% at 128x96 and +1.27% at 192x160. #308 measured the
-    /// ageing to be doing none of that under the shrinkage and removed it, leaving the same two
-    /// figures, and added `bands` and `mosaic` here - the same two statistics alternating every
-    /// 16 rows, and on a 32x32 checkerboard so the boundaries run in both axes - so that a
-    /// correction which needs the frame's content to hold still is asserted on content that
-    /// changes many times and in both directions, not only on one that changes once.
+    /// What it pins, and what a failure means:
     ///
-    /// Both sizes are asserted. 128x96 alone could not see the 192x160 penalty the shrinkage was
-    /// found from - it measured +2.13% there against +9.32% at the larger size - so the larger
-    /// one is in the assertion rather than in the `#[ignore]`d sweeps alone, which is what let
-    /// that penalty sit unnoticed. The ceilings are the measured penalties with margin.
+    /// - **The shipped constant.** The ceilings are claimed only at `TYPE_GAIN_SAMPLE_INTERVAL`,
+    ///   and the assertion below refuses to run if that constant is no longer the `8` they were
+    ///   measured at. Moving it is not a defect here; it means these eight numbers must be
+    ///   re-measured from `measure_type_gain_intervals_past_sixteen` at the new value, exactly as
+    ///   #278 re-measured them when it moved the interval from `2` to `8`. Failing this test in
+    ///   that situation would say nothing about the new interval's quality - `4` would pass it and
+    ///   `5` would not, for +1.22% on `mosaic`.
+    /// - **The estimator underneath it.** With the constant held, every frame's penalty here is a
+    ///   deterministic function of the encoder's search, the [`tile::TYPE_GAIN_TRUST`] shrinkage
+    ///   and the per-size accumulation. A change to any of those that moves a frame past its
+    ///   recorded margin is a real regression in the thing this suite is about, caught per frame
+    ///   and per quantizer rather than only where it crosses the whole range's `4.0%`.
     ///
-    /// #278 re-measured the interval against the shrunken estimator and moved it from 2 to 8, and
-    /// the ceilings move with it: `bands` to 4%, from +3.43% at 128x96, and `scene_edge` down to
-    /// 1% from +0.20%, the frame that used to set the loosest ceiling here now setting one of the
-    /// tightest. Every other frame stays at 1% and none of them reaches half of it. That `bands`
-    /// is now the worst frame rather than `scene_edge` is the shrinkage working as intended: what
-    /// is left to pay for is content that changes faster than the sample can follow, not content
-    /// that changes once and is then averaged across.
+    /// Where the values come from. The comparison is against the *same* estimator probing every
+    /// size search, not against the exhaustive search: that isolates what the sampling costs from
+    /// what the other shortcuts do. Cost is the encoder's own `sse + lambda * bits` at equal
+    /// quantizer. `test_pattern` at 96x80 - the frame the interval was originally chosen on -
+    /// cannot see any of this, every interval from `1` to `16` landing within 0.03% of the
+    /// unsampled estimator there, which is why this runs on a set of frames with deliberately
+    /// unlike statistics at two sizes large enough for the accumulated ratio to drift. Both sizes
+    /// are asserted because 128x96 alone could not see the 192x160 penalty the `TYPE_GAIN_TRUST`
+    /// shrinkage was found from: it measured +2.13% there against +9.32% at the larger size, and
+    /// that penalty sat unnoticed for as long as the larger frame was only in an `#[ignore]`d
+    /// sweep. `bands` and `mosaic` - the scene edge's two statistics alternating every 16 rows,
+    /// and the same two on a 32x32 checkerboard so the boundaries run in both axes - were added by
+    /// #308 so that a correction which needs the frame's content to hold still is measured on
+    /// content that changes many times and in both directions, not only on content that changes
+    /// once. The current measurements at the shipped interval are `bands` +3.43% against its 4%,
+    /// and every other frame at or under +1.27% against its 1%.
     #[test]
-    fn the_type_gain_sampling_interval_holds_on_content_it_was_not_tuned_on() {
+    fn the_type_gain_per_frame_penalties_are_pinned_at_the_shipped_sampling_interval() {
+        // The interval the ceilings below were measured at. This is an equality, not a bound:
+        // the numbers are fitted to this value and mean nothing at another one, so a change to
+        // the constant has to come here and re-measure rather than be reported as a penalty
+        // regression on whichever frame the new phase happens to cost.
+        const PINNED_AT: usize = 8;
+        assert_eq!(
+            tile::TYPE_GAIN_SAMPLE_INTERVAL,
+            PINNED_AT,
+            "the per-frame ceilings here were fitted at a sampling interval of {PINNED_AT} and \
+             only {PINNED_AT} and 4 clear them out of the 63 intervals #329 swept, so they say \
+             nothing about the interval of {}: re-measure them at the new value from \
+             `measure_type_gain_intervals_past_sixteen` instead of relaxing them",
+            tile::TYPE_GAIN_SAMPLE_INTERVAL
+        );
         for (width, height) in [(128_usize, 96_usize), (192, 160)] {
             let mut frames = content_frames(width as u32, height as u32);
             frames.push(("test_pattern", test_pattern(width as u32, height as u32)));
+            // Measured at `PINNED_AT` with margin, not derived from the frames' content.
             let ceilings = std::collections::BTreeMap::from([
                 ("noise", 1.0),
                 ("smooth", 1.0),
@@ -1843,7 +1871,8 @@ mod nonlossless_tests {
                         penalty <= ceiling,
                         "{name} at {width}x{height}, qindex {qindex}, cost {sampled} against \
                          the unsampled estimator's {unsampled} ({penalty:+.2}%), past the \
-                         {ceiling}% this frame is allowed"
+                         {ceiling}% pinned for this frame at a sampling interval of {PINNED_AT} \
+                         - the estimator has moved, since the interval has not"
                     );
                 }
             }
@@ -1960,9 +1989,11 @@ mod nonlossless_tests {
     ///   the range is disqualified by it. That is what the first half of this test asserts, and
     ///   it is deliberately one bound over the whole range rather than a per-frame ceiling fitted
     ///   at the shipped value: the per-frame ceilings in
-    ///   `the_type_gain_sampling_interval_holds_on_content_it_was_not_tuned_on` were set from the
-    ///   penalties measured *at* `8`, so only `4` and `8` clear them, and reading an upper bound
-    ///   off that would be the phase coincidence again in a second costume.
+    ///   `the_type_gain_per_frame_penalties_are_pinned_at_the_shipped_sampling_interval` were set
+    ///   from the penalties measured *at* `8`, so only `4` and `8` clear them, and reading an
+    ///   upper bound off that would be the phase coincidence again in a second costume. That test
+    ///   now says so itself and refuses to run at another interval, so the two do not overlap:
+    ///   this is the estimator's bound, that one is the shipped value's regression pin.
     /// - **The saving does bind, by being exhausted.** #278 moved the interval from `2` to `8` for
     ///   14% fewer transform-type candidates, and the issue's premise was that the saving keeps
     ///   growing. It does, and it is not worth having: summed over six quantizers, going from `8`
@@ -1976,7 +2007,8 @@ mod nonlossless_tests {
     /// the shipped value is a re-roll of which frame draws the `+3.5%` phase for under a tenth of
     /// the candidates. `8` is kept because moving it would move every digest
     /// `a_fixed_frame_encodes_to_the_same_bytes_on_every_host` pins and every ceiling in
-    /// `the_type_gain_sampling_interval_holds_on_content_it_was_not_tuned_on` to buy that. What
+    /// `the_type_gain_per_frame_penalties_are_pinned_at_the_shipped_sampling_interval` to buy
+    /// that. What
     /// this fails on is a real regression: an estimator change that makes a long interval start
     /// costing, which breaks the level bound, or one that makes the remaining saving material,
     /// which breaks the second - and either is a reason to revisit the constant that does not

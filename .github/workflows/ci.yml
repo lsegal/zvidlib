@@ -43,7 +43,11 @@ jobs:
         run: cargo test --features native --test bench_sources_compile
       # `criterion_baseline.py` is where a benchmark regression threshold is
       # justified from, and it runs in a job that takes two hours to reach it.
-      # Standard library only, so this needs no install step.
+      # Standard library only, so this needs no install step. Its `table`
+      # subcommand is covered here too: that path's failure mode is a plausible
+      # table with a column silently missing rather than a crash - the arm name
+      # it matched drifted from the one `SimdIsa` prints and every SSE4.1
+      # measurement was dropped - and nothing else in CI executes it.
       - name: Test the benchmark baseline script
         run: python3 -m unittest discover -s .github/scripts -v
       - name: Test AV1 SIMD kernels against the scalar path
@@ -191,6 +195,11 @@ jobs:
           path: baseline/criterion-baseline.json
           retention-days: 90
 
+      # This one is per-run rather than a chain, so it carries the collected
+      # baseline too. A `workflow_dispatch` run deliberately does not become the
+      # stored `main` baseline above, and without a copy here its numbers would
+      # be unrecoverable off the runner - which is exactly what refreshing the
+      # committed table in `benches/README.md` needs from a dispatched run.
       - name: Upload the full benchmark log
         if: github.event_name != 'pull_request'
         uses: actions/upload-artifact@v4
@@ -198,6 +207,7 @@ jobs:
           name: criterion-report-${{ github.run_id }}
           path: |
             bench.log
+            baseline/criterion-baseline.json
             target/criterion/**/new/estimates.json
           retention-days: 30
 
