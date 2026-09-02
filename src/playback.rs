@@ -412,6 +412,20 @@ impl<V: PlaybackVideoSource, A: PlaybackAudioSource, O: PlaybackAudioOutput>
         ))
     }
 
+    /// Keeps the audio queue scheduled ahead without selecting or decoding a video frame.
+    ///
+    /// [`Self::present`] decodes the frame the audio clock currently calls for, which is exactly
+    /// what a caller that is displaying something else - a scrub preview decoded elsewhere - does
+    /// not want to pay for on its render thread. This tops up the same scheduling window
+    /// `present` would have, so audio keeps playing across a scrub without the video decode.
+    /// It is a no-op while paused.
+    pub fn pump_audio(&mut self) -> Result<()> {
+        if !self.playing {
+            return Ok(());
+        }
+        self.fill_audio()
+    }
+
     pub fn stop(&mut self) -> Result<()> {
         if self.playing {
             self.output.stop()?;
@@ -692,6 +706,56 @@ mod tests {
     #[test]
     fn web_audio_output_uses_the_same_seek_and_sync_contract() {
         exercise(AudioOutputKind::WebAudio);
+    }
+
+    #[test]
+    fn pumping_audio_schedules_ahead_without_requesting_a_video_frame() {
+        let requested = Arc::new(Mutex::new(Vec::new()));
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let clock = Arc::new(Mutex::new(0));
+        let scheduled = Arc::new(Mutex::new(Vec::new()));
+        let backend = FixtureBackend {
+            clock: clock.clone(),
+            scheduled: scheduled.clone(),
+            cancelled: Arc::new(Mutex::new(Vec::new())),
+        };
+        let timeline = Timeline::new(crate::FrameRate::new(30, 1).unwrap(), 48_000).unwrap();
+        let mut playback = PlaybackController::new(
+            FixtureVideo {
+                requested: requested.clone(),
+                resets: Arc::new(Mutex::new(0)),
+            },
+            FixtureAudio {
+                reads: reads.clone(),
+            },
+            NativeAudioOutput(backend),
+            timeline,
+            PlaybackOptions {
+                schedule_ahead_samples: 3_200,
+                preroll_samples: 800,
+            },
+        )
+        .unwrap();
+
+        playback.play().unwrap();
+        scheduled.lock().unwrap().clear();
+        *clock.lock().unwrap() = 3_300;
+        playback.pump_audio().unwrap();
+
+        // The same window `present` would have queued, and not one decoded frame with it.
+        assert!(reads.lock().unwrap().contains(&SampleRange {
+            start: 3_300,
+            end: 6_500
+        }));
+        assert!(!scheduled.lock().unwrap().is_empty());
+        assert!(requested.lock().unwrap().is_empty());
+
+        // Still nothing to schedule and nothing to decode once paused.
+        playback.pause().unwrap();
+        scheduled.lock().unwrap().clear();
+        playback.pump_audio().unwrap();
+        assert!(scheduled.lock().unwrap().is_empty());
+        assert!(requested.lock().unwrap().is_empty());
     }
 
     #[test]

@@ -337,7 +337,7 @@ pub fn forward_transform(residual: &[i32], size: usize, tx_type: Av1TxType) -> V
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::av1_intra::{inverse_transform, inverse_transform_1d};
+    use crate::av1_intra::{dq_denom, inverse_transform, inverse_transform_1d};
 
     /// Small deterministic LCG, matching the style used elsewhere in the crate.
     struct Lcg(u64);
@@ -485,7 +485,13 @@ mod tests {
                 for _ in 0..40 {
                     let residual: Vec<i32> = (0..size * size).map(|_| rng.in_range(255)).collect();
                     let coefficients = forward_transform(&residual, size, tx_type);
-                    let reconstructed = inverse_transform(&coefficients, size, tx_type, 1, 1);
+                    let reconstructed = inverse_transform(
+                        &coefficients,
+                        size,
+                        tx_type,
+                        dq_denom(size),
+                        dq_denom(size),
+                    );
                     for (&want, &got) in residual.iter().zip(reconstructed.iter()) {
                         worst = worst.max((want - i32::from(got)).abs());
                     }
@@ -532,7 +538,13 @@ mod tests {
                         })
                         .collect();
                     let coefficients = forward_transform(&residual, size, tx_type);
-                    let reconstructed = inverse_transform(&coefficients, size, tx_type, 1, 1);
+                    let reconstructed = inverse_transform(
+                        &coefficients,
+                        size,
+                        tx_type,
+                        dq_denom(size),
+                        dq_denom(size),
+                    );
                     for (&want, &got) in residual.iter().zip(reconstructed.iter()) {
                         assert!(
                             (want - i32::from(got)).abs() <= ROUND_TRIP_TOLERANCE,
@@ -559,7 +571,13 @@ mod tests {
                 coefficients, residual,
                 "{size}: IDTX is scaled, not a pass-through"
             );
-            let reconstructed = inverse_transform(&coefficients, size, Av1TxType::Idtx, 1, 1);
+            let reconstructed = inverse_transform(
+                &coefficients,
+                size,
+                Av1TxType::Idtx,
+                dq_denom(size),
+                dq_denom(size),
+            );
             for (index, (&want, &got)) in residual.iter().zip(reconstructed.iter()).enumerate() {
                 assert!(
                     (want - i32::from(got)).abs() <= ROUND_TRIP_TOLERANCE,

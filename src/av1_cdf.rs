@@ -89,6 +89,9 @@ pub static INTRA_FRAME_Y_MODE_DC_DC: [u16; 13] = [
 
 pub use crate::av1_cdf_tables::TX_SIZE_CTXS;
 
+/// `TX_SIZE_CONTEXTS`: the neighbour-derived contexts `tx_depth` is coded under.
+pub const TX_DEPTH_CTXS: usize = 3;
+
 /// The quantizer context the coefficient CDFs are selected by (spec §8.3.2:
 /// `base_q_idx <= 20`, `<= 60`, `<= 120`, else), from the frame header's
 /// `base_q_idx`.
@@ -390,13 +393,16 @@ pub fn tx_type_cdf(set: Av1TxSet, tx_size: usize, intra_dir: usize) -> Option<&'
 /// The `tx_depth` CDF for a coding block `block_width` samples wide (spec
 /// §5.11.16 `read_tx_size`), and the number of splits it can signal.
 ///
-/// The specification selects `Default_Tx_Size_Cdf[maxTxCat]`, where
+/// The specification selects `Default_Tx_Size_Cdf[maxTxCat][ctx]`, where
 /// `maxTxCat = Max_Tx_Depth[MiSize] - 1`, and codes `maxTxCat == 0` (an 8x8
 /// block) as a single bit and every larger category as a ternary symbol.
-/// The neighbour-derived context is 0 throughout this crate, which is the
-/// context every block gets when no neighbour has a larger transform.
+///
+/// `ctx` counts how many of the above and left neighbours already carry a
+/// transform at least as wide (respectively as tall) as this block's
+/// `Max_Tx_Size_Rect`, so it is `0` for a block with no coded neighbour and
+/// `2` when both neighbours match or exceed it. Values above `2` saturate.
 #[must_use]
-pub fn tx_depth_cdf(block_width: usize) -> (&'static [u16], usize) {
+pub fn tx_depth_cdf(block_width: usize, ctx: usize) -> (&'static [u16], usize) {
     let category = match block_width {
         0..=8 => 0,
         16 => 1,
@@ -405,7 +411,7 @@ pub fn tx_depth_cdf(block_width: usize) -> (&'static [u16], usize) {
     };
     let symbols = if category == 0 { 2 } else { 3 };
     (
-        &crate::av1_cdf_tables::TX_SIZE_DEPTH[category][0][..symbols],
+        &crate::av1_cdf_tables::TX_SIZE_DEPTH[category][ctx.min(TX_DEPTH_CTXS - 1)][..symbols],
         symbols - 1,
     )
 }
@@ -592,11 +598,11 @@ mod tests {
 
     #[test]
     fn tx_depth_cdf_symbol_counts_match_the_spec_depth_cap() {
-        assert_eq!(tx_depth_cdf(8).0.len(), 2);
-        assert_eq!(tx_depth_cdf(8).1, 1);
+        assert_eq!(tx_depth_cdf(8, 0).0.len(), 2);
+        assert_eq!(tx_depth_cdf(8, 0).1, 1);
         for width in [16usize, 32, 64] {
-            assert_eq!(tx_depth_cdf(width).0.len(), 3);
-            assert_eq!(tx_depth_cdf(width).1, 2);
+            assert_eq!(tx_depth_cdf(width, 0).0.len(), 3);
+            assert_eq!(tx_depth_cdf(width, 0).1, 2);
         }
     }
 
@@ -1036,7 +1042,7 @@ mod tests {
             }
         }
         for width in [8usize, 16, 32, 64] {
-            check(tx_depth_cdf(width).0, "tx_depth");
+            check(tx_depth_cdf(width, 0).0, "tx_depth");
         }
         assert!(checked > 2000, "expected the full tables to be walked");
     }
@@ -1045,9 +1051,9 @@ mod tests {
     /// coding-block size, and only the 8x8 category codes a single bit.
     #[test]
     fn tx_depth_cdfs_are_selected_per_block_size() {
-        assert_eq!(tx_depth_cdf(8), (&[19968u16, 32768][..], 1));
-        assert_eq!(tx_depth_cdf(16), (&[12272u16, 30172, 32768][..], 2));
-        assert_eq!(tx_depth_cdf(32), (&[12986u16, 15180, 32768][..], 2));
-        assert_eq!(tx_depth_cdf(64), (&[5782u16, 11475, 32768][..], 2));
+        assert_eq!(tx_depth_cdf(8, 0), (&[19968u16, 32768][..], 1));
+        assert_eq!(tx_depth_cdf(16, 0), (&[12272u16, 30172, 32768][..], 2));
+        assert_eq!(tx_depth_cdf(32, 0), (&[12986u16, 15180, 32768][..], 2));
+        assert_eq!(tx_depth_cdf(64, 0), (&[5782u16, 11475, 32768][..], 2));
     }
 }
