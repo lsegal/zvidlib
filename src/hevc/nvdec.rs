@@ -1113,7 +1113,10 @@ mod tests {
             vec![(0, 10), (3, 40)],
             "the frames after a suppressed picture must keep their own identities"
         );
-        assert!(heap.is_empty(), "every displayed picture claims an identity");
+        assert!(
+            heap.is_empty(),
+            "every displayed picture claims an identity"
+        );
     }
 
     #[test]
