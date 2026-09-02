@@ -20,8 +20,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-15-intel]
-        draw: [1, 2, 3]
+        os: [ubuntu-latest]
+        draw: [1, 2, 3, 4, 5, 6, 7, 8, 9]
+        include:
+          - os: macos-15-intel
+            draw: 1
+          - os: macos-15-intel
+            draw: 2
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
@@ -46,9 +51,24 @@ jobs:
       # The candidate kernels are asserted bit-exact before anything is timed,
       # so a number can never come from an arm that computes the wrong answer.
       - name: Assert the candidates against the scalar reference
+        env:
+          DYLD_FALLBACK_LIBRARY_PATH: /usr/lib/swift
         run: cargo test --release --lib recon_simd -- --nocapture
+      # `ubuntu-latest` is drawn at random from several CPU models, and the
+      # first three draws showed the answer depends on which one — so the model
+      # is printed into the timing output itself, and the draws are grouped by
+      # it rather than averaged across it.
       - name: Time the band-offset search
+        env:
+          # x86_64 macOS resolves `libswiftCore.dylib` through neither the
+          # build's rpath nor the dyld cache; the Swift runtime lives here.
+          DYLD_FALLBACK_LIBRARY_PATH: /usr/lib/swift
         run: |
+          if [ -r /proc/cpuinfo ]; then
+            echo "HOST-MODEL $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2-)"
+          else
+            echo "HOST-MODEL $(sysctl -n machdep.cpu.brand_string)"
+          fi
           cargo test --release --lib recon_simd::tests::bench_band_offset_row \
             -- --ignored --nocapture
 

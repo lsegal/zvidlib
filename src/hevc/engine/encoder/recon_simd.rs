@@ -779,6 +779,150 @@ mod x86 {
     }
 
     #[cfg(test)]
+    /// §8.7.3.2 band classification for sixteen samples, the AVX-512 form of
+    /// [`band_classify8_avx2`].
+    #[inline]
+    #[target_feature(enable = "avx512f")]
+    unsafe fn band_classify16_avx512(here: *const i32, src: *const u8) -> (__m512i, __m512i) {
+        unsafe {
+            let recon = _mm512_loadu_si512(here.cast());
+            let clamped = _mm512_min_epi32(
+                _mm512_max_epi32(recon, _mm512_setzero_si512()),
+                _mm512_set1_epi32(BIT_DEPTH_MAX),
+            );
+            let band = _mm512_srli_epi32::<{ BAND_SHIFT as u32 }>(clamped);
+            let s = _mm512_cvtepu8_epi32(_mm_loadu_si128(src.cast()));
+            (band, _mm512_sub_epi32(s, recon))
+        }
+    }
+
+    #[cfg(test)]
+    /// Candidate A at sixteen lanes: AVX-512 classification into staging
+    /// buffers, then the same scalar scatter the narrower staged candidates
+    /// use. Not dispatched to.
+    ///
+    /// This is the control for [`band_offset_row_avx512_conflict`]: it widens
+    /// the classification without touching the scatter, so the difference
+    /// between the two is the conflict resolution rather than the vector
+    /// width.
+    #[target_feature(enable = "avx512f")]
+    pub(super) unsafe fn band_offset_row_avx512_staged(
+        here: &[i32],
+        src: &[u8],
+        stats: &mut BandStats,
+    ) {
+        unsafe {
+            let n = here.len();
+            let mut bands = [0i32; 16];
+            let mut errs = [0i32; 16];
+            let mut i = 0;
+            while i + 16 <= n {
+                let (band, err) = band_classify16_avx512(here.as_ptr().add(i), src.as_ptr().add(i));
+                _mm512_storeu_si512(bands.as_mut_ptr().cast(), band);
+                _mm512_storeu_si512(errs.as_mut_ptr().cast(), err);
+                for k in 0..16 {
+                    let b = bands[k] as usize;
+                    stats.sums[b] += i64::from(errs[k]);
+                    stats.counts[b] += 1;
+                }
+                i += 16;
+            }
+            super::band_offset_row_scalar(&here[i..], &src[i..], stats);
+        }
+    }
+
+    #[cfg(test)]
+    /// Candidate C, the shape only AVX-512 can express: resolve the scatter's
+    /// duplicate indices *inside* the vector unit with `vpconflictd`, so the
+    /// scalar loop that follows performs one read-modify-write per **distinct**
+    /// band in the sixteen samples rather than one per sample.
+    ///
+    /// `vpconflictd` gives each lane the bitmask of earlier lanes that classify
+    /// into the same band. Pointer-jumping over that mask — four rounds, since
+    /// a conflict group is at most sixteen lanes — accumulates each group's
+    /// error sum and sample count into the group's *last* lane, and a lane is
+    /// last exactly when no other lane's conflict mask names it. Compressing
+    /// those lanes leaves one `(band, sum, count)` triple per distinct band,
+    /// which is what the scalar tail scatters.
+    ///
+    /// Not dispatched to; see [`band_offset_row_avx2_staged`]. Requires
+    /// AVX-512CD for `vpconflictd`/`vplzcntd`; the classification itself is
+    /// AVX-512F.
+    #[target_feature(enable = "avx512f,avx512cd")]
+    pub(super) unsafe fn band_offset_row_avx512_conflict(
+        here: &[i32],
+        src: &[u8],
+        stats: &mut BandStats,
+    ) {
+        unsafe {
+            let n = here.len();
+            let mut bands = [0i32; 16];
+            let mut group_sums = [0i32; 16];
+            let mut group_counts = [0i32; 16];
+            let mut i = 0;
+            while i + 16 <= n {
+                let (band, err) = band_classify16_avx512(here.as_ptr().add(i), src.as_ptr().add(i));
+
+                // Lane `j` of `conflicts` holds the bitmask of lanes before it
+                // that landed in the same band.
+                let conflicts = _mm512_conflict_epi32(band);
+                // A lane is the last of its group when no lane names it, so the
+                // union of every mask is exactly the set of non-last lanes.
+                let named = _mm512_reduce_or_epi32(conflicts) as u16;
+                let last = !named;
+
+                // `ptr` starts at the closest earlier lane in the same group —
+                // the highest set bit of that lane's mask — and doubles its
+                // reach each round; `valid` says whether such a lane exists.
+                let mut ptr = _mm512_and_si512(
+                    _mm512_sub_epi32(_mm512_set1_epi32(31), _mm512_lzcnt_epi32(conflicts)),
+                    _mm512_set1_epi32(15),
+                );
+                let mut valid =
+                    _mm512_maskz_set1_epi32(_mm512_test_epi32_mask(conflicts, conflicts), -1);
+                let mut sum = err;
+                let mut count = _mm512_set1_epi32(1);
+                // Four rounds reach sixteen lanes, the largest a group can be.
+                for _ in 0..4 {
+                    let live = _mm512_test_epi32_mask(valid, valid);
+                    if live == 0 {
+                        break;
+                    }
+                    sum = _mm512_mask_add_epi32(sum, live, sum, _mm512_permutexvar_epi32(ptr, sum));
+                    count = _mm512_mask_add_epi32(
+                        count,
+                        live,
+                        count,
+                        _mm512_permutexvar_epi32(ptr, count),
+                    );
+                    valid = _mm512_and_si512(valid, _mm512_permutexvar_epi32(ptr, valid));
+                    ptr = _mm512_permutexvar_epi32(ptr, ptr);
+                }
+
+                _mm512_storeu_si512(
+                    bands.as_mut_ptr().cast(),
+                    _mm512_maskz_compress_epi32(last, band),
+                );
+                _mm512_storeu_si512(
+                    group_sums.as_mut_ptr().cast(),
+                    _mm512_maskz_compress_epi32(last, sum),
+                );
+                _mm512_storeu_si512(
+                    group_counts.as_mut_ptr().cast(),
+                    _mm512_maskz_compress_epi32(last, count),
+                );
+                for k in 0..last.count_ones() as usize {
+                    let b = bands[k] as usize;
+                    stats.sums[b] += i64::from(group_sums[k]);
+                    stats.counts[b] += i64::from(group_counts[k]);
+                }
+                i += 16;
+            }
+            super::band_offset_row_scalar(&here[i..], &src[i..], stats);
+        }
+    }
+
+    #[cfg(test)]
     /// The four-lane classification behind the two SSE4.1 candidates.
     #[inline]
     #[target_feature(enable = "sse4.1")]
@@ -1342,6 +1486,15 @@ mod tests {
                     assert_eq!(got, expected, "{name} over {n} samples");
                 }
             }
+            if host_has_avx512_conflict() {
+                for (name, f) in x86_band_candidates_avx512() {
+                    let mut got = BandStats::default();
+                    // SAFETY: AVX-512F and AVX-512CD are detected, and the runs
+                    // are equal length.
+                    unsafe { f(&here, &src, &mut got) };
+                    assert_eq!(got, expected, "{name} over {n} samples");
+                }
+            }
         }
     }
 
@@ -1363,6 +1516,22 @@ mod tests {
             ("avx2 staged", x86::band_offset_row_avx2_staged),
             ("avx2 lanes", x86::band_offset_row_avx2_lanes),
         ]
+    }
+
+    /// The AVX-512 candidates, which need AVX-512CD for `vpconflictd` as well
+    /// as AVX-512F for the classification.
+    #[cfg(target_arch = "x86_64")]
+    fn x86_band_candidates_avx512() -> [(&'static str, BandKernel); 2] {
+        [
+            ("avx512 staged", x86::band_offset_row_avx512_staged),
+            ("avx512 conflict", x86::band_offset_row_avx512_conflict),
+        ]
+    }
+
+    /// Whether this host can run the AVX-512 candidates at all.
+    #[cfg(target_arch = "x86_64")]
+    fn host_has_avx512_conflict() -> bool {
+        is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512cd")
     }
 
     /// What the §8.7.3 band-offset search costs on x86_64, scalar reference
@@ -1427,6 +1596,9 @@ mod tests {
             }
             if is_x86_feature_detected!("avx2") {
                 arms.extend(x86_band_candidates_avx2());
+            }
+            if host_has_avx512_conflict() {
+                arms.extend(x86_band_candidates_avx512());
             }
 
             let mut best = vec![f64::INFINITY; arms.len()];
