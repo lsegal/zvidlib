@@ -649,12 +649,12 @@ mod tests {
             spin(Duration::from_millis(3));
         }
         {
-            let _vector = scope(Stage::Sao);
+            let _vector = scope(Stage::SaoFilter);
             spin(Duration::from_millis(1));
         }
         let report = finish().expect("profile was started");
         let total = report.total().as_secs_f64();
-        let expected = report.stage(Stage::Sao).as_secs_f64() / total;
+        let expected = report.stage(Stage::SaoFilter).as_secs_f64() / total;
         let vector = report.vectorized_share();
         assert!(
             (vector - expected).abs() < 1e-9,
@@ -679,7 +679,7 @@ mod tests {
         let report = report_of(
             &[
                 (Stage::ColorConvert, Duration::from_millis(20)),
-                (Stage::Sao, Duration::from_millis(40)),
+                (Stage::SaoFilter, Duration::from_millis(40)),
                 (Stage::Residual, Duration::from_millis(40)),
             ],
             Duration::from_millis(100),
@@ -688,8 +688,8 @@ mod tests {
         assert_eq!(report.unattributed(), Duration::ZERO);
         assert!((report.share(Stage::ColorConvert) - 0.2).abs() < 1e-9);
         assert!((report.decode_share(Stage::ColorConvert) - 0.0).abs() < 1e-9);
-        assert!((report.share(Stage::Sao) - 0.4).abs() < 1e-9);
-        assert!((report.decode_share(Stage::Sao) - 0.5).abs() < 1e-9);
+        assert!((report.share(Stage::SaoFilter) - 0.4).abs() < 1e-9);
+        assert!((report.decode_share(Stage::SaoFilter) - 0.5).abs() < 1e-9);
         // `ColorConvert` is vectorized, so it counts towards the share of the
         // total and drops out of the share of the decode.
         assert!((report.vectorized_share() - 0.6).abs() < 1e-9);
