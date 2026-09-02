@@ -618,9 +618,102 @@ time, all bi-predicted, luma only, minimum of three interleaved rounds per arm:
 
 This is the same effect the `engine::simd` table already records from the other
 direction: `filter_taps` reads 1.6-1.9x on aarch64 in the *block* path and ~1.0x
-over one long L1-resident buffer. A 64x64 two-dimensional 8-tap needs a 64x71
-intermediate, so it behaves like the buffer case; a 16x16 block does not. The old
-grid was the second-best size on that table and carried 5.3% of the real work.
+over one long L1-resident buffer. The old grid was the second-best size on that
+table and carried 5.3% of the real work. #280 read the walk between those two
+figures as the `w x ( h + 7 )` intermediate the two-dimensional path
+materializes turning a large block into the buffer case; issue #309 measured it
+and that is not what it is. See below.
+
+#### What the block-size decay actually is (issue #309)
+
+#280 inferred the intermediate from the shape of the sweep without instrumenting
+the two passes separately. Doing so refutes it, three ways, all on the same
+aarch64 host in one process per measurement:
+
+**The decay is there with no intermediate.** `measure_interp_pass_split` times
+the two passes apart. The horizontal pass alone — which writes a fresh buffer
+nothing has yet read — decays 2.12x at 8x8, 1.53x at 16x16, 1.06x at 32x32,
+1.03x at 64x64, and the one-dimensional `x_frac == 0` / `y_frac == 0` phases,
+which build no intermediate at all, decay with it (horizontal-only 1.91x → 1.29x,
+vertical-only 1.38x → 1.21x). Whatever erodes the ratio is fully present when
+there is no intermediate to blame.
+
+**The variable is the per-call row length.** `measure_filter_taps_by_row_length`
+strips out the block walk, the allocations and the intermediate entirely: every
+row length reads the same 4 KiB L1-resident tap buffer, writes the same output
+buffer, and covers the same total sample count, so call size is the only thing
+that moves. It reproduces the whole decay:
+
+| Samples per `filter_taps` call | `scalar` | `neon` | ratio |
+| --- | ---: | ---: | ---: |
+| 4 | 12.99 ms | 3.38 ms | 3.84x |
+| 8 | 7.50 ms | 2.33 ms | 3.21x |
+| 16 | 3.96 ms | 1.92 ms | 2.06x |
+| 32 | 2.46 ms | 1.64 ms | 1.50x |
+| 64 | 1.92 ms | 1.44 ms | 1.33x |
+| 128 | 1.62 ms | 1.37 ms | 1.19x |
+| 256 | 1.46 ms | 1.33 ms | 1.10x |
+
+The block walk issues one `filter_taps` call per output row, so the call size
+*is* the block width, and the sweep over block sizes is this sweep. At 64x64 the
+intermediate is 64 x 71 x 4 = 18 KiB, which fits inside the M1's 128 KiB L1D; it
+was never spilling to begin with.
+
+**The ratio falls because the scalar reference gets better, not because the
+kernel gets worse.** Both arms improve with row length, but the auto-vectorized
+scalar loop improves 8.9x across the sweep (12.99 → 1.46 ms) against the kernel's
+2.5x (3.38 → 1.33 ms), and they converge. At 256-sample rows the kernel runs
+4.19M outputs x 8 taps — 8.4M `vmlaq_s32` — in 1.33 ms, about 6.3 G/s, or two per
+cycle at 3.2 GHz. That is the M1's integer SIMD multiply throughput. **The kernel
+is at the hardware limit at large block sizes, and the scalar loop reaches the
+same limit once its trip count is long enough to amortize its prologue.** The
+1.4-3.8x at small sizes is the scalar call's per-invocation setup, not kernel
+headroom that large blocks lose.
+
+##### The two repairs that were tried, and lost
+
+Tiling the two-dimensional path is what #309 proposed. It was implemented as a
+wrap-around ring carrying only the `N` horizontal rows the vertical pass has
+live, instead of all `h + N − 1` — the same total horizontal work with no
+redundant re-filtering, and a 2 KiB working set at 64 wide. A/B'd against the
+full-height intermediate in one process (`measure_2d_ring_vs_flat`, best of 15
+interleaved rounds), it lost at every size, on both arms:
+
+| Luma block | flat `neon` | ring `neon` | speedup | flat `scalar` | ring `scalar` | speedup |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8x8 | 8.87 ms | 15.79 ms | 0.56x | 17.89 ms | 19.96 ms | 0.90x |
+| 16x16 | 4.91 ms | 6.07 ms | 0.81x | 8.62 ms | 9.44 ms | 0.91x |
+| 32x32 | 3.40 ms | 3.69 ms | 0.92x | 4.69 ms | 4.87 ms | 0.96x |
+| 64x64 | 2.89 ms | 2.94 ms | 0.98x | 3.33 ms | 3.36 ms | 0.99x |
+
+Both arms are spelled out inside the test rather than one of them being the
+production path, and the test asserts they agree sample-for-sample with each
+other and with `interp_block` before it times anything, so the comparison stays
+runnable and honest after the revert.
+
+The modular slot index costs more than the intermediate does, and it replaces the
+flat buffer's constant row stride — which LLVM strength-reduces — with an address
+that jumps. Reverted; the flat intermediate stands.
+
+Folding the kernel's mirror taps was tried next, since the half-pel luma phase
+`[-1, 4, -11, 40, 40, -11, 4, -1]` and the half-pel chroma phase `[-4, 36, 36, -4]`
+are palindromes, so each pair can share one multiply: 4 multiplies and 4 adds
+instead of 8 multiplies, which should pay on an ALU-bound kernel. It measured
+*slower* at every row length (1.51 against 1.33 ms at 256 samples, 4.99 against
+3.38 at 4). Reverted.
+
+##### What is left, and why it is not this issue
+
+The remaining headroom is not in the kernel's instruction selection but in its
+operand width. The reference plane, the tap slices and the intermediate are all
+`i32`, four bytes per sample for eight-bit content, so every `vmlaq_s32` covers
+four samples where an `i16` formulation would cover eight. That is a change to
+how sample planes are represented across `engine`, not a change to `filter_taps`,
+and it is tracked separately rather than folded in here.
+
+Neither the decoded output nor any kernel changed in the course of this, so the
+sweep, the `hevc_inter_pred` ratio and the `inter_pred_filter` ms/frame rows
+above stand as re-measured.
 
 Sample-weighting the sweep predicts 1.07x for the measured mix, and the rebuilt
 group measures **1.09x against the old grid's 1.25x** on this host on the same
@@ -1717,20 +1810,86 @@ than the absolute time): 640x352 29.2 ms scalar against 11.0 ms NEON, and
 1920x1088 121.4 ms scalar against 38.9 ms NEON, where before it read 11.2 ms
 against 9.6 ms at 640x352 and did not separate at all at 1080p.
 
-The SAO parameter search's band-offset half is *not* part of that separation,
-and that is a measured result rather than a gap. `band_offset_row` is a
-`hevc_recon` dispatch site whose every arm resolves to the scalar reference: a
-32-way scatter is not expressible in SSE4.1, AVX2 or NEON, so the only
-vectorizable work is the clamp, shift and widened subtraction in front of it.
-Measured on the same contended Apple Silicon host against the scalar reference
-over L1-resident runs of 16 to 1024 samples, best of interleaved rounds, and
-measured again from a standalone harness: staging the classification into
-buffers and then scattering them read 0.42-1.30x and scattering straight out of
-the vector lanes read 0.44-1.24x. Neither separates from scalar - both straddle
-1.00x by less than the spread between repeats of the same measurement, which is
-what this host's contention looks like. This group agreed: its NEON arm did not
-improve. Neither kernel was landed, the same call
-`combine_weighted` got at four lanes. x86_64 is untimed.
+The SAO parameter search's band-offset half is *not* part of that separation
+on any instruction set, and that is a measured result rather than a gap - on
+x86_64 it is a measured result that took two different benchmarks to reach.
+`band_offset_row` is a `hevc_recon` dispatch site whose 32-way scatter is not
+expressible in SSE4.1, AVX2 or NEON, so the only vectorizable work is the
+clamp, shift and widened subtraction in front of it.
+
+On NEON that is not enough even in isolation. Measured on the same contended
+Apple Silicon host against the scalar reference over L1-resident runs of 16 to
+1024 samples, best of interleaved rounds, and measured again from a standalone
+harness: staging the classification into buffers and then scattering them read
+0.42-1.30x and scattering straight out of the vector lanes read 0.44-1.24x.
+Neither separates from scalar - both straddle 1.00x by less than the spread
+between repeats of the same measurement, which is what this host's contention
+looks like. This group agreed: its NEON arm did not improve.
+
+On x86_64 the classification *does* pay in isolation, and the argument that it
+would not - that masking 32 accumulators costs more than the read-modify-writes
+it replaces - was an analytical one carried over from the NEON measurement.
+`bench_band_offset_row` timed it across five CPU models (nine `ubuntu-latest`
+draws plus two `macos-15-intel`), best of nine interleaved rounds per draw.
+**Group the draws by CPU model.** `ubuntu-latest` is drawn from several models
+and they disagree by more than the effect: the same AVX2 arm read 1.10x, 1.45x
+and 0.97x on the first three draws purely because they landed on three
+different CPUs. Within a model the ratio reproduces to about +/-0.02 across
+independent draws.
+
+Lane-scatter shape against the scalar reference, by run length:
+
+| CPU model | 16 | 64 | 256 | 1024 |
+|---|---|---|---|---|
+| Intel Xeon 6973P-C | 1.16x | 1.53x | 1.53x | 1.51x |
+| Intel Xeon Platinum 8573C | 1.16x | 1.28x | 1.44x | 1.39x |
+| Intel Core i7-8700B | 1.11x | 1.25x | 1.28x | 1.30x |
+| AMD EPYC 7763 | 1.24x | 1.13x | 1.10x | 1.10x |
+| AMD EPYC 9V74 | 1.23x | 0.97-1.02x | 1.01x | 0.97x |
+
+Four of the five models separate at every length, and the SSE4.1 shape is ahead
+of scalar on every model at every length (1.02-1.45x). **On that harness alone
+the kernel is worth landing. This group says it is not.**
+
+The whole-picture comparison is the one the decision was taken on, and it was
+run as a paired branch-against-base measurement rather than against a recorded
+figure: both trees built and timed on the same host, interleaved within a
+round, five rounds per draw, twelve draws across five models. The group's own
+`scalar` arm is the control - it resolves to the same scalar reference in both
+trees, so it has to read 1.00x, and it does to within +/-0.02 everywhere.
+
+| CPU model | draws | `avx2` | `sse4.1` | `scalar` (control) |
+|---|---|---|---|---|
+| Intel Xeon Platinum 8573C | 1 | 1.00x | 1.01x | 1.01x |
+| Intel Xeon Platinum 8370C | 2 | 1.01x | 1.00-1.02x | 1.00x |
+| Intel Core i7-8700B | 1 | 0.99-1.00x | 1.01-1.02x | 1.00-1.02x |
+| AMD EPYC 7763 | 5 | 0.97-0.99x | 0.95-0.98x | 0.99-1.00x |
+| AMD EPYC 9V74 | 3 | 0.94-0.95x | 0.95x | 1.00x |
+
+On the Intel parts the kernel is invisible against its own control; on both AMD
+parts it is a 2% to 6% regression, reproducing across independent draws with
+every round signed the same way and well outside what the control moves by. The
+two harnesses measure different things and the encoder's is the one that
+counts: `bench_band_offset_row` calls the kernel back-to-back over one
+L1-resident run of up to 1024 samples with `stats` hot and the call fully
+predicted, while the encoder calls it once per CTB row - 16 to 64 samples - in
+between the rest of reconstruction. **No x86_64 kernel is dispatched to.** Both
+x86 shapes stay `#[cfg(test)]` as the measurement apparatus, asserted bit-exact
+so the figures above are figures for kernels that would be correct to land.
+
+If you re-time this, re-time it the same way: a branch-against-base ratio taken
+on one host with the arms interleaved, with the `scalar` arm read as a control.
+A recorded absolute figure from another draw is not a comparison - the four
+models above differ by more than the effect.
+
+**AVX-512 was timed and does not separate even in isolation.**
+`ubuntu-latest` draws AVX-512CD hosts, so the `vpconflictd` shape #305 pointed
+at was reachable. Resolving the scatter's duplicate indices inside the vector
+unit reads **0.42-0.56x** on every host that can run it: the conflict-resolving
+pointer chase costs more than the read-modify-writes it removes, at 32 bands
+over 16 lanes where duplicates are rare. Merely widening the classification to
+512 bits reads 1.14-1.52x on the Intel parts but **0.21-0.30x** on Zen 5, whose
+double-pumped AVX-512 makes the wider classification a large loss.
 
 **Bitstream writing and CABAC** have no vector path at all, so `..._pcm_write`,
 `hevc_encode_cabac`, `hevc_encode_cabac_bypass` and `hevc_encode_bitwriter` are

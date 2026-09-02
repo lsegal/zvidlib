@@ -12,10 +12,12 @@
 //!   itself runs.
 //!
 //! The search's band-offset half ([`band_offset_row`]) is a dispatch site here
-//! too, but every arm of it resolves to the scalar reference: its 32-way
-//! scatter is not something SSE4.1, AVX2 or NEON can express, and both vector
-//! shapes that leaves were written and measured below parity. That kernel's
-//! documentation carries the numbers.
+//! too, and the answer there depends on the instruction set: its 32-way scatter
+//! is not something SSE4.1, AVX2 or NEON can express, so only the
+//! classification in front of it vectorizes. That is enough on x86_64, where
+//! the SSE4.1 and AVX2 kernels measured ahead of the reference, and not enough
+//! on NEON, where both shapes measured below parity and the arm stays scalar.
+//! That kernel's documentation carries the numbers for both.
 //!
 //! Both are dispatched here through cached runtime CPU feature detection
 //! ([`isa`]) to an SSE4.1 or AVX2 implementation on `x86_64`, a NEON
@@ -381,24 +383,101 @@ const BAND_SHIFT: i32 = 3;
 /// The staging round trip in particular costs more than the classification it
 /// vectorizes, and extracting the lanes only replaces four stores with four
 /// lane reads in front of the same four dependent read-modify-writes. Neither
-/// was worth landing, so this dispatches to scalar the way
+/// was worth landing on NEON, so `aarch64` still resolves to the scalar
+/// reference here, the way
 /// [`crate::hevc::engine::simd::combine_weighted`] does on the instruction sets
 /// where its kernel measured below parity.
 ///
-/// The site is kept rather than the call inlined into
-/// [`crate::hevc::engine::encoder::recon`] so the band search stays a named
-/// `hevc_recon` dispatch point: the reference is exercised under every
-/// `crate::simd::set_override` pin by the tests below, so a future kernel — an
-/// AVX-512 one, where `vpconflictd` and a real scatter change the arithmetic
-/// above — has a place to go and a bit-exactness harness already pointed at it.
-/// x86_64 is untimed here and tracked separately.
+/// # x86_64 separates in isolation and not in the encoder
+///
+/// The site was kept rather than the call inlined into
+/// [`crate::hevc::engine::encoder::recon`] so the band search stayed a named
+/// `hevc_recon` dispatch point with a bit-exactness harness pointed at it, on
+/// the argument that the NEON result was measured rather than universal. The
+/// same two shapes were therefore timed on x86_64, and the answer depends on
+/// which benchmark is asked.
+///
+/// **In isolation the classification does pay.** Timed by
+/// `bench_band_offset_row` across five CPU models, nine `ubuntu-latest` draws
+/// plus two `macos-15-intel` ones, best of nine interleaved rounds per draw and
+/// grouped by CPU model - the pool draws several models and they disagree by
+/// more than the effect, so an average across it answers nothing. Ratio of the
+/// lane-scatter shape to this scalar reference, at the run lengths #305 used:
+///
+/// | CPU model | 16 | 64 | 256 | 1024 |
+/// |---|---|---|---|---|
+/// | Intel Xeon 6973P-C (AVX2) | 1.16x | 1.53x | 1.53x | 1.51x |
+/// | Intel Xeon Platinum 8573C (AVX2) | 1.16x | 1.28x | 1.44x | 1.39x |
+/// | Intel Core i7-8700B (AVX2) | 1.11x | 1.25x | 1.28x | 1.30x |
+/// | AMD EPYC 7763 (AVX2) | 1.24x | 1.13x | 1.10x | 1.10x |
+/// | AMD EPYC 9V74 (AVX2) | 1.23x | 0.97-1.02x | 1.01x | 0.97x |
+///
+/// Each row reproduces to about ±0.02 across that model's independent draws.
+/// Four of the five models separate at every length, by 1.10x to 1.53x, and the
+/// SSE4.1 shape is ahead of scalar on every model at every length (1.02-1.45x).
+/// On that measurement alone the kernel is worth landing.
+///
+/// **In the encoder it does not.** The whole-picture
+/// `hevc_encode_640x352_reconstruct` group was then run as a paired
+/// branch-against-base comparison - both trees built and timed on the same
+/// host, interleaved within a round, five rounds per draw, twelve draws across
+/// five models - with the group's own scalar arm as the control, since that arm
+/// resolves to this reference in both trees and so has to read 1.00x. It does,
+/// to within ±0.02 everywhere. The kernel arms do not improve:
+///
+/// | CPU model | draws | `avx2` | `sse4.1` | `scalar` (control) |
+/// |---|---|---|---|---|
+/// | Intel Xeon Platinum 8573C | 1 | 1.00x | 1.01x | 1.01x |
+/// | Intel Xeon Platinum 8370C | 2 | 1.01x | 1.00-1.02x | 1.00x |
+/// | Intel Core i7-8700B | 1 | 0.99-1.00x | 1.01-1.02x | 1.00-1.02x |
+/// | AMD EPYC 7763 | 5 | 0.97-0.99x | 0.95-0.98x | 0.99-1.00x |
+/// | AMD EPYC 9V74 | 3 | 0.94-0.95x | 0.95x | 1.00x |
+///
+/// On the Intel parts the kernel is invisible against its own control; on both
+/// AMD parts it is a 2% to 6% *regression*, reproducing across independent
+/// draws with every round signed the same way, and well outside what the
+/// control moves by. So the shape that reads 1.10-1.53x in a loop of its own
+/// buys nothing where the encoder calls it, and on Zen costs more than it
+/// saves.
+///
+/// The two benchmarks measure different things, and the encoder's is the one
+/// that decides. `bench_band_offset_row` calls the kernel back-to-back over one
+/// L1-resident run of up to 1024 samples with `stats` hot and the call fully
+/// predicted; the encoder calls it once per CTB row, so 16 to 64 samples, in
+/// between the rest of reconstruction. The leading explanation for the
+/// remaining gap - that a `#[target_feature]` kernel cannot be inlined into the
+/// caller the way this reference can, so the per-call overhead lands on a run
+/// too short to amortize it - is consistent with the isolated win being
+/// smallest at 16 samples, but it was not itself measured and is not the reason
+/// the kernel is unlanded. The measured whole-picture result is.
+///
+/// **No x86_64 kernel is dispatched to**, the same call
+/// [`crate::hevc::engine::simd::combine_weighted`] got at four lanes and the
+/// same one #305 made for NEON. Both x86 shapes stay behind `#[cfg(test)]` as
+/// the measurement apparatus, asserted bit-exact so the figures above are
+/// figures for kernels that would be correct to land.
+///
+/// AVX-512 was timed too, since `ubuntu-latest` turned out to draw AVX-512CD
+/// hosts, and it does not separate even in isolation. Resolving the scatter's
+/// duplicate indices with `vpconflictd` reads **0.42-0.56x** on every host that
+/// can run it: the conflict-resolving pointer chase costs more than the
+/// read-modify-writes it removes, at 32 bands over 16 lanes where duplicates
+/// are rare. Merely widening the classification to 512 bits reads 1.14-1.52x on
+/// the Intel parts but **0.21-0.30x** on Zen 5, whose double-pumped AVX-512
+/// makes the wider classification a large loss.
+///
+/// # Panics
+/// Panics unless the run and the source are the same length.
 pub(crate) fn band_offset_row(here: &[i32], src: &[u8], stats: &mut BandStats) {
     assert_eq!(here.len(), src.len(), "run and source differ");
-    band_offset_row_scalar(here, src, stats)
+    // Every arm resolves here: NEON measured below parity in isolation, and the
+    // x86 kernels that do separate in isolation do not separate in the encoder.
+    // See above for both measurements.
+    band_offset_row_scalar(here, src, stats);
 }
 
-/// The portable reference for [`band_offset_row`], and on every instruction set
-/// this module targets, the implementation it dispatches to.
+/// The portable reference for [`band_offset_row`], and the implementation it
+/// dispatches to on every instruction set without a kernel of its own.
 pub(crate) fn band_offset_row_scalar(here: &[i32], src: &[u8], stats: &mut BandStats) {
     for i in 0..here.len() {
         let recon = here[i];
@@ -413,7 +492,7 @@ const EDGE_IDX_BY_CATEGORY: [i32; 4] = [0, 1, 3, 4];
 
 #[cfg(target_arch = "x86_64")]
 mod x86 {
-    use super::{BIT_DEPTH_MAX, EDGE_IDX_BY_CATEGORY, EdgeStats};
+    use super::{BAND_SHIFT, BIT_DEPTH_MAX, BandStats, EDGE_IDX_BY_CATEGORY, EdgeStats};
     use std::arch::x86_64::*;
 
     /// Sum of the four `i32` lanes.
@@ -673,6 +752,336 @@ mod x86 {
                 stats.counts[c + 1] += i64::from(hsum_epi32(count));
             }
             super::edge_offset_row_scalar(&here[i..], &a[i..], &b[i..], &src[i..], stats);
+        }
+    }
+
+    /// §8.7.3.2 band classification for eight samples: the eight band indices
+    /// `Clip3(0, 255, recon) >> bandShift`, and the eight `src − recon` errors
+    /// taken against the *unclamped* reconstruction the way the scalar
+    /// reference does.
+    ///
+    /// This is the whole of what a vector unit without a scatter can do for the
+    /// band search, and it is shared by both candidate shapes below so that the
+    /// measurement separates the scatter from the classification rather than
+    /// from two different classifications.
+    #[inline]
+    #[cfg(test)]
+    #[target_feature(enable = "avx2")]
+    unsafe fn band_classify8_avx2(here: *const i32, src: *const u8) -> (__m256i, __m256i) {
+        unsafe {
+            let recon = _mm256_loadu_si256(here.cast());
+            let clamped = _mm256_min_epi32(
+                _mm256_max_epi32(recon, _mm256_setzero_si256()),
+                _mm256_set1_epi32(BIT_DEPTH_MAX),
+            );
+            let band = _mm256_srli_epi32::<BAND_SHIFT>(clamped);
+            let s = _mm256_cvtepu8_epi32(_mm_loadl_epi64(src.cast()));
+            (band, _mm256_sub_epi32(s, recon))
+        }
+    }
+
+    #[cfg(test)]
+    /// Candidate A on AVX2: classify eight samples in the vector unit, store
+    /// the indices and errors to staging buffers, then scatter the buffers with
+    /// a scalar loop.
+    ///
+    /// Not dispatched to: it is the control the dispatched
+    /// [`band_offset_row_avx2_lanes`] was chosen against, kept because the
+    /// choice between the two shapes is what the measurement below decides. It
+    /// is compiled and asserted bit-exact against the scalar reference so the
+    /// number it produces is a number for a kernel that would be correct to
+    /// land.
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn band_offset_row_avx2_staged(
+        here: &[i32],
+        src: &[u8],
+        stats: &mut BandStats,
+    ) {
+        unsafe {
+            let n = here.len();
+            let mut bands = [0i32; 8];
+            let mut errs = [0i32; 8];
+            let mut i = 0;
+            while i + 8 <= n {
+                let (band, err) = band_classify8_avx2(here.as_ptr().add(i), src.as_ptr().add(i));
+                _mm256_storeu_si256(bands.as_mut_ptr().cast(), band);
+                _mm256_storeu_si256(errs.as_mut_ptr().cast(), err);
+                for k in 0..8 {
+                    let b = bands[k] as usize;
+                    stats.sums[b] += i64::from(errs[k]);
+                    stats.counts[b] += 1;
+                }
+                i += 8;
+            }
+            super::band_offset_row_scalar(&here[i..], &src[i..], stats);
+        }
+    }
+
+    #[cfg(test)]
+    /// Candidate B on AVX2: classify eight samples in the vector unit, then
+    /// scatter them straight out of the lanes with `vpextrd` rather than
+    /// through the staging buffers [`band_offset_row_avx2_staged`] uses.
+    ///
+    /// The better of the two x86 shapes - at or ahead of the staged one at
+    /// every run length on every CPU model timed - and still not dispatched to:
+    /// its isolated 1.10-1.53x does not reach the whole-picture group, which
+    /// reads 1.00x on Intel and 0.94-0.99x on AMD. See
+    /// [`super::band_offset_row`].
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn band_offset_row_avx2_lanes(
+        here: &[i32],
+        src: &[u8],
+        stats: &mut BandStats,
+    ) {
+        unsafe {
+            let n = here.len();
+            let mut i = 0;
+            while i + 8 <= n {
+                let (band, err) = band_classify8_avx2(here.as_ptr().add(i), src.as_ptr().add(i));
+                let lo_b = _mm256_castsi256_si128(band);
+                let hi_b = _mm256_extracti128_si256(band, 1);
+                let lo_e = _mm256_castsi256_si128(err);
+                let hi_e = _mm256_extracti128_si256(err, 1);
+                macro_rules! scatter {
+                    ($b:expr, $e:expr, $k:literal) => {{
+                        let idx = _mm_extract_epi32::<$k>($b) as usize;
+                        stats.sums[idx] += i64::from(_mm_extract_epi32::<$k>($e));
+                        stats.counts[idx] += 1;
+                    }};
+                }
+                scatter!(lo_b, lo_e, 0);
+                scatter!(lo_b, lo_e, 1);
+                scatter!(lo_b, lo_e, 2);
+                scatter!(lo_b, lo_e, 3);
+                scatter!(hi_b, hi_e, 0);
+                scatter!(hi_b, hi_e, 1);
+                scatter!(hi_b, hi_e, 2);
+                scatter!(hi_b, hi_e, 3);
+                i += 8;
+            }
+            super::band_offset_row_scalar(&here[i..], &src[i..], stats);
+        }
+    }
+
+    #[cfg(test)]
+    /// §8.7.3.2 band classification for sixteen samples, the AVX-512 form of
+    /// [`band_classify8_avx2`].
+    #[inline]
+    #[target_feature(enable = "avx512f")]
+    unsafe fn band_classify16_avx512(here: *const i32, src: *const u8) -> (__m512i, __m512i) {
+        unsafe {
+            let recon = _mm512_loadu_si512(here.cast());
+            let clamped = _mm512_min_epi32(
+                _mm512_max_epi32(recon, _mm512_setzero_si512()),
+                _mm512_set1_epi32(BIT_DEPTH_MAX),
+            );
+            let band = _mm512_srli_epi32::<{ BAND_SHIFT as u32 }>(clamped);
+            let s = _mm512_cvtepu8_epi32(_mm_loadu_si128(src.cast()));
+            (band, _mm512_sub_epi32(s, recon))
+        }
+    }
+
+    #[cfg(test)]
+    /// Candidate A at sixteen lanes: AVX-512 classification into staging
+    /// buffers, then the same scalar scatter the narrower staged candidates
+    /// use. Not dispatched to.
+    ///
+    /// This is the control for [`band_offset_row_avx512_conflict`]: it widens
+    /// the classification without touching the scatter, so the difference
+    /// between the two is the conflict resolution rather than the vector
+    /// width.
+    #[target_feature(enable = "avx512f")]
+    pub(super) unsafe fn band_offset_row_avx512_staged(
+        here: &[i32],
+        src: &[u8],
+        stats: &mut BandStats,
+    ) {
+        unsafe {
+            let n = here.len();
+            let mut bands = [0i32; 16];
+            let mut errs = [0i32; 16];
+            let mut i = 0;
+            while i + 16 <= n {
+                let (band, err) = band_classify16_avx512(here.as_ptr().add(i), src.as_ptr().add(i));
+                _mm512_storeu_si512(bands.as_mut_ptr().cast(), band);
+                _mm512_storeu_si512(errs.as_mut_ptr().cast(), err);
+                for k in 0..16 {
+                    let b = bands[k] as usize;
+                    stats.sums[b] += i64::from(errs[k]);
+                    stats.counts[b] += 1;
+                }
+                i += 16;
+            }
+            super::band_offset_row_scalar(&here[i..], &src[i..], stats);
+        }
+    }
+
+    #[cfg(test)]
+    /// Candidate C, the shape only AVX-512 can express: resolve the scatter's
+    /// duplicate indices *inside* the vector unit with `vpconflictd`, so the
+    /// scalar loop that follows performs one read-modify-write per **distinct**
+    /// band in the sixteen samples rather than one per sample.
+    ///
+    /// `vpconflictd` gives each lane the bitmask of earlier lanes that classify
+    /// into the same band. Pointer-jumping over that mask — four rounds, since
+    /// a conflict group is at most sixteen lanes — accumulates each group's
+    /// error sum and sample count into the group's *last* lane, and a lane is
+    /// last exactly when no other lane's conflict mask names it. Compressing
+    /// those lanes leaves one `(band, sum, count)` triple per distinct band,
+    /// which is what the scalar tail scatters.
+    ///
+    /// Not dispatched to; see [`band_offset_row_avx2_staged`]. Requires
+    /// AVX-512CD for `vpconflictd`/`vplzcntd`; the classification itself is
+    /// AVX-512F.
+    #[target_feature(enable = "avx512f,avx512cd")]
+    pub(super) unsafe fn band_offset_row_avx512_conflict(
+        here: &[i32],
+        src: &[u8],
+        stats: &mut BandStats,
+    ) {
+        unsafe {
+            let n = here.len();
+            let mut bands = [0i32; 16];
+            let mut group_sums = [0i32; 16];
+            let mut group_counts = [0i32; 16];
+            let mut i = 0;
+            while i + 16 <= n {
+                let (band, err) = band_classify16_avx512(here.as_ptr().add(i), src.as_ptr().add(i));
+
+                // Lane `j` of `conflicts` holds the bitmask of lanes before it
+                // that landed in the same band.
+                let conflicts = _mm512_conflict_epi32(band);
+                // A lane is the last of its group when no lane names it, so the
+                // union of every mask is exactly the set of non-last lanes.
+                let named = _mm512_reduce_or_epi32(conflicts) as u16;
+                let last = !named;
+
+                // `ptr` starts at the closest earlier lane in the same group —
+                // the highest set bit of that lane's mask — and doubles its
+                // reach each round; `valid` says whether such a lane exists.
+                let mut ptr = _mm512_and_si512(
+                    _mm512_sub_epi32(_mm512_set1_epi32(31), _mm512_lzcnt_epi32(conflicts)),
+                    _mm512_set1_epi32(15),
+                );
+                let mut valid =
+                    _mm512_maskz_set1_epi32(_mm512_test_epi32_mask(conflicts, conflicts), -1);
+                let mut sum = err;
+                let mut count = _mm512_set1_epi32(1);
+                // Four rounds reach sixteen lanes, the largest a group can be.
+                for _ in 0..4 {
+                    let live = _mm512_test_epi32_mask(valid, valid);
+                    if live == 0 {
+                        break;
+                    }
+                    sum = _mm512_mask_add_epi32(sum, live, sum, _mm512_permutexvar_epi32(ptr, sum));
+                    count = _mm512_mask_add_epi32(
+                        count,
+                        live,
+                        count,
+                        _mm512_permutexvar_epi32(ptr, count),
+                    );
+                    valid = _mm512_and_si512(valid, _mm512_permutexvar_epi32(ptr, valid));
+                    ptr = _mm512_permutexvar_epi32(ptr, ptr);
+                }
+
+                _mm512_storeu_si512(
+                    bands.as_mut_ptr().cast(),
+                    _mm512_maskz_compress_epi32(last, band),
+                );
+                _mm512_storeu_si512(
+                    group_sums.as_mut_ptr().cast(),
+                    _mm512_maskz_compress_epi32(last, sum),
+                );
+                _mm512_storeu_si512(
+                    group_counts.as_mut_ptr().cast(),
+                    _mm512_maskz_compress_epi32(last, count),
+                );
+                for k in 0..last.count_ones() as usize {
+                    let b = bands[k] as usize;
+                    stats.sums[b] += i64::from(group_sums[k]);
+                    stats.counts[b] += i64::from(group_counts[k]);
+                }
+                i += 16;
+            }
+            super::band_offset_row_scalar(&here[i..], &src[i..], stats);
+        }
+    }
+
+    /// The four-lane classification behind the two SSE4.1 candidates.
+    #[cfg(test)]
+    #[inline]
+    #[target_feature(enable = "sse4.1")]
+    unsafe fn band_classify4_sse41(here: *const i32, src: *const u8) -> (__m128i, __m128i) {
+        unsafe {
+            let recon = _mm_loadu_si128(here.cast());
+            let clamped = _mm_min_epi32(
+                _mm_max_epi32(recon, _mm_setzero_si128()),
+                _mm_set1_epi32(BIT_DEPTH_MAX),
+            );
+            let band = _mm_srli_epi32::<BAND_SHIFT>(clamped);
+            let s = _mm_cvtepu8_epi32(_mm_cvtsi32_si128(src.cast::<u32>().read_unaligned() as i32));
+            (band, _mm_sub_epi32(s, recon))
+        }
+    }
+
+    #[cfg(test)]
+    /// Candidate A at four lanes: SSE4.1 classification into staging buffers,
+    /// then a scalar scatter. Not dispatched to.
+    #[target_feature(enable = "sse4.1")]
+    pub(super) unsafe fn band_offset_row_sse41_staged(
+        here: &[i32],
+        src: &[u8],
+        stats: &mut BandStats,
+    ) {
+        unsafe {
+            let n = here.len();
+            let mut bands = [0i32; 4];
+            let mut errs = [0i32; 4];
+            let mut i = 0;
+            while i + 4 <= n {
+                let (band, err) = band_classify4_sse41(here.as_ptr().add(i), src.as_ptr().add(i));
+                _mm_storeu_si128(bands.as_mut_ptr().cast(), band);
+                _mm_storeu_si128(errs.as_mut_ptr().cast(), err);
+                for k in 0..4 {
+                    let b = bands[k] as usize;
+                    stats.sums[b] += i64::from(errs[k]);
+                    stats.counts[b] += 1;
+                }
+                i += 4;
+            }
+            super::band_offset_row_scalar(&here[i..], &src[i..], stats);
+        }
+    }
+
+    #[cfg(test)]
+    /// Candidate B at four lanes: the SSE4.1 classification scattered straight
+    /// out of the lanes, the narrower form of [`band_offset_row_avx2_lanes`].
+    /// Not dispatched to, for the same measured reason.
+    #[target_feature(enable = "sse4.1")]
+    pub(super) unsafe fn band_offset_row_sse41_lanes(
+        here: &[i32],
+        src: &[u8],
+        stats: &mut BandStats,
+    ) {
+        unsafe {
+            let n = here.len();
+            let mut i = 0;
+            while i + 4 <= n {
+                let (band, err) = band_classify4_sse41(here.as_ptr().add(i), src.as_ptr().add(i));
+                macro_rules! scatter {
+                    ($k:literal) => {{
+                        let idx = _mm_extract_epi32::<$k>(band) as usize;
+                        stats.sums[idx] += i64::from(_mm_extract_epi32::<$k>(err));
+                        stats.counts[idx] += 1;
+                    }};
+                }
+                scatter!(0);
+                scatter!(1);
+                scatter!(2);
+                scatter!(3);
+                i += 4;
+            }
+            super::band_offset_row_scalar(&here[i..], &src[i..], stats);
         }
     }
 }
@@ -1125,5 +1534,203 @@ mod tests {
     fn a_neighbour_run_of_the_wrong_length_is_rejected() {
         let mut stats = EdgeStats::default();
         edge_offset_row(&[0i32; 8], &[0i32; 8], &[0i32; 7], &[0u8; 8], &mut stats);
+    }
+
+    /// Both x86_64 candidate shapes for the band search, at both vector
+    /// widths, against the scalar reference. They are not dispatched to, so
+    /// this is what says the measurement below is a measurement of a kernel
+    /// that would be correct to land rather than of a faster wrong answer.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_x86_band_offset_candidates_match_the_scalar_reference() {
+        for &n in RUNS {
+            let mut here = samples(0x7777_8888_9999_aaaa, n);
+            for (i, h) in here.iter_mut().enumerate() {
+                match i % 8 {
+                    0 => *h = -7,
+                    1 => *h = 262,
+                    _ => {}
+                }
+            }
+            let src = bytes(0xc0ff_ee00_1234_5678, n);
+            let mut expected = BandStats::default();
+            band_offset_row_scalar(&here, &src, &mut expected);
+
+            if is_x86_feature_detected!("sse4.1") {
+                for (name, f) in x86_band_candidates_sse41() {
+                    let mut got = BandStats::default();
+                    // SAFETY: SSE4.1 is detected, and the runs are equal length.
+                    unsafe { f(&here, &src, &mut got) };
+                    assert_eq!(got, expected, "{name} over {n} samples");
+                }
+            }
+            if is_x86_feature_detected!("avx2") {
+                for (name, f) in x86_band_candidates_avx2() {
+                    let mut got = BandStats::default();
+                    // SAFETY: AVX2 is detected, and the runs are equal length.
+                    unsafe { f(&here, &src, &mut got) };
+                    assert_eq!(got, expected, "{name} over {n} samples");
+                }
+            }
+            if host_has_avx512_conflict() {
+                for (name, f) in x86_band_candidates_avx512() {
+                    let mut got = BandStats::default();
+                    // SAFETY: AVX-512F and AVX-512CD are detected, and the runs
+                    // are equal length.
+                    unsafe { f(&here, &src, &mut got) };
+                    assert_eq!(got, expected, "{name} over {n} samples");
+                }
+            }
+        }
+    }
+
+    /// The type every band-offset arm the measurement times shares.
+    #[cfg(target_arch = "x86_64")]
+    type BandKernel = unsafe fn(&[i32], &[u8], &mut BandStats);
+
+    #[cfg(target_arch = "x86_64")]
+    fn x86_band_candidates_sse41() -> [(&'static str, BandKernel); 2] {
+        [
+            ("sse41 staged", x86::band_offset_row_sse41_staged),
+            ("sse41 lanes", x86::band_offset_row_sse41_lanes),
+        ]
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn x86_band_candidates_avx2() -> [(&'static str, BandKernel); 2] {
+        [
+            ("avx2 staged", x86::band_offset_row_avx2_staged),
+            ("avx2 lanes", x86::band_offset_row_avx2_lanes),
+        ]
+    }
+
+    /// The AVX-512 candidates, which need AVX-512CD for `vpconflictd` as well
+    /// as AVX-512F for the classification.
+    #[cfg(target_arch = "x86_64")]
+    fn x86_band_candidates_avx512() -> [(&'static str, BandKernel); 2] {
+        [
+            ("avx512 staged", x86::band_offset_row_avx512_staged),
+            ("avx512 conflict", x86::band_offset_row_avx512_conflict),
+        ]
+    }
+
+    /// Whether this host can run the AVX-512 candidates at all.
+    #[cfg(target_arch = "x86_64")]
+    fn host_has_avx512_conflict() -> bool {
+        is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512cd")
+    }
+
+    /// What the §8.7.3 band-offset search costs on x86_64, scalar reference
+    /// against every candidate shape, at the run lengths #305's NEON
+    /// measurement used.
+    ///
+    /// Ignored by default because it measures rather than asserts; run it with
+    /// `cargo test --features native --release --lib
+    /// recon_simd::tests::bench_band_offset_row -- --ignored --nocapture`.
+    ///
+    /// The runs are L1-resident and the arms are interleaved within each round
+    /// — every arm is timed once per round, and the reported time is the
+    /// minimum across rounds — so a scheduling artefact has to hit the same arm
+    /// in every round to survive. The spread column is what separates a result
+    /// from noise: it is how far the *worst* round of an arm sat above its own
+    /// best, and a ratio nearer 1.00x than that spread has not separated from
+    /// the reference.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    #[ignore = "benchmark; run explicitly with --ignored --nocapture"]
+    fn bench_band_offset_row() {
+        use std::hint::black_box;
+
+        /// The run lengths #305 timed on NEON.
+        const LENGTHS: &[usize] = &[16, 64, 256, 1024];
+        const ROUNDS: usize = 9;
+        /// Samples classified per timed call, held constant across the run
+        /// lengths so a short run is not measured over less work than a long
+        /// one.
+        const SAMPLES_PER_CALL: usize = 1 << 20;
+
+        println!("# host instruction sets (band-offset measurement)");
+        for (name, present) in [
+            ("sse4.1", is_x86_feature_detected!("sse4.1")),
+            ("avx2", is_x86_feature_detected!("avx2")),
+            ("avx512f", is_x86_feature_detected!("avx512f")),
+            ("avx512cd", is_x86_feature_detected!("avx512cd")),
+            ("avx512bw", is_x86_feature_detected!("avx512bw")),
+            ("avx512vl", is_x86_feature_detected!("avx512vl")),
+        ] {
+            println!("#   {name}: {present}");
+        }
+        println!("# dispatch site hevc_recon detected: {:?}", isa());
+
+        for &n in LENGTHS {
+            let here = {
+                let mut v = samples(0x7777_8888_9999_aaaa, n);
+                for (i, h) in v.iter_mut().enumerate() {
+                    if i % 37 == 0 {
+                        *h = 262;
+                    }
+                }
+                v
+            };
+            let src = bytes(0xc0ff_ee00_1234_5678, n);
+            let calls = SAMPLES_PER_CALL / n;
+
+            let mut arms: Vec<(&'static str, BandKernel)> =
+                vec![("scalar", band_offset_row_scalar as BandKernel)];
+            if is_x86_feature_detected!("sse4.1") {
+                arms.extend(x86_band_candidates_sse41());
+            }
+            if is_x86_feature_detected!("avx2") {
+                arms.extend(x86_band_candidates_avx2());
+            }
+            if host_has_avx512_conflict() {
+                arms.extend(x86_band_candidates_avx512());
+            }
+
+            let mut best = vec![f64::INFINITY; arms.len()];
+            let mut worst = vec![0f64; arms.len()];
+            let reference = {
+                let mut stats = BandStats::default();
+                band_offset_row_scalar(&here, &src, &mut stats);
+                stats
+            };
+            for _ in 0..ROUNDS {
+                for (arm, (name, f)) in arms.iter().enumerate() {
+                    let mut stats = BandStats::default();
+                    let start = std::time::Instant::now();
+                    for _ in 0..calls {
+                        // SAFETY: every candidate's feature was detected above.
+                        unsafe { f(black_box(&here), black_box(&src), &mut stats) };
+                    }
+                    let secs = start.elapsed().as_secs_f64();
+                    black_box(&stats);
+                    assert_eq!(
+                        stats.counts.iter().sum::<i64>(),
+                        (n * calls) as i64,
+                        "{name} lost samples"
+                    );
+                    assert_eq!(stats.sums[0] / calls as i64, reference.sums[0], "{name}");
+                    best[arm] = best[arm].min(secs);
+                    worst[arm] = worst[arm].max(secs);
+                }
+            }
+
+            println!();
+            println!("run of {n} samples, {calls} calls per round, best of {ROUNDS} rounds");
+            println!(
+                "{:<14}{:>12}{:>12}{:>12}",
+                "arm", "Msamp/s", "ratio", "spread"
+            );
+            let samples_done = (n * calls) as f64;
+            for (arm, (name, _)) in arms.iter().enumerate() {
+                println!(
+                    "{:<14}{:>12.1}{:>11.2}x{:>11.1}%",
+                    name,
+                    samples_done / best[arm] / 1e6,
+                    best[0] / best[arm],
+                    100.0 * (worst[arm] / best[arm] - 1.0),
+                );
+            }
+        }
     }
 }
