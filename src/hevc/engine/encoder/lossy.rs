@@ -914,14 +914,59 @@ fn curve_point(src: SourcePlanes<'_>, qp: i32, search: ModeSearch, deblocking: b
 /// The slice-level half of the SAO decision: whether a grid that removed
 /// `gain` of squared error is worth the `sao_bits` it would be coded with.
 ///
-/// The trade is `D + lambda * R` against the multiplier
-/// [`calibrated_sao_lambda_q8`] reads off this picture's own curve, which is
-/// what `probe` measures — so `probe` is called only when its answer can
-/// change the outcome. The calibrated multiplier is never outside a factor of
-/// [`SAO_LAMBDA_BAND`] either side of the closed-form one, so a gain that
-/// clears the band's coarse end already clears whatever the probe would have
-/// returned, and one that misses its fine end already misses it. Over the
-/// QP 12-51 sweep on the two test pictures that settles half the pictures
+/// ## What is being decided
+///
+/// Not `D + lambda * R` against a price, whatever the shape of the arithmetic
+/// suggests. The decision is a comparison of two rate-distortion points at
+/// the *same* rate: SAO removed `gain` for `sao_bits`, and
+/// [`sao_threshold_sse`] says what those same bits would have removed spent
+/// on a finer quantizer instead, read off this picture's own curve through
+/// the two points `probe` measures. SAO is kept when it is the better of the
+/// two, which is exactly the property
+/// `every_accepted_sao_point_sits_on_the_writers_own_curve` measures.
+///
+/// It is stated as a threshold in squared error rather than as a multiplier
+/// on the rate because only the threshold form is monotone. The multiplier
+/// [`calibrated_sao_lambda_q8`] returns is the threshold divided by the rate
+/// being judged, and the threshold is concave, so the multiplier falls as the
+/// rate rises and a smaller grid appears to be charged a higher price per
+/// bit. #287 read that as the rule not being monotone in the grid: at noise
+/// 64x48 QP 12 a full grid gaining 75 for 104 bits was declined at a
+/// threshold of 77, while the subset grid gaining 54 for 72 bits was accepted
+/// at a threshold of about 54.
+///
+/// It is not. Those two decisions are consistent, and the threshold form is
+/// what makes that visible: the extra 32 bits raised the threshold by 23 and
+/// bought 21, so the extra components did *not* pay for themselves against
+/// the curve — they paid only against the constant multiplier the per-CTB
+/// search prices them with, which is a different instrument measuring a
+/// different trade. What a superset grid has to beat is the curve's marginal
+/// distortion at the rate being judged, not its average out to that rate, and
+/// a superset whose extra components clear that margin is accepted wherever
+/// its subset is, because [`sao_threshold_sse`] is nondecreasing in
+/// `sao_bits`. `the_slice_level_threshold_is_monotone_in_the_grid_it_judges`
+/// asserts that, and it is the only monotonicity the rule can have: the two
+/// grids sit at different rates, so no rule that compares a picture against
+/// its own curve can accept both a grid and a costlier one that buys less per
+/// bit than the curve does there.
+///
+/// ## What is not being decided
+///
+/// The comparison is between one measured quantity and one extrapolated one,
+/// and [`SAO_ACCEPTANCE_PRECISION_NUM`] is how far the extrapolated one can
+/// be wrong. A gain inside that of the threshold does not resolve the
+/// comparison in either direction, so it is not taken as clearing it. This is
+/// what stops the writer accepting a slice on a margin of a few parts in a
+/// thousand of a quantity it can only place to a few parts in a hundred.
+///
+/// ## When the probe runs
+///
+/// `probe` is a second decision pass, so it is called only when its answer
+/// can change the outcome. The threshold is never outside the band
+/// [`SAO_LAMBDA_BAND`] draws either side of the closed-form line, so a gain
+/// clearing the band's coarse end already clears whatever the probe would
+/// have returned, and one that misses its fine end already misses it. Over
+/// the QP 12-51 sweep on the two test pictures that settles half the pictures
 /// without a probe, where SAO either found nothing the quantizer had left
 /// behind or found far more than a step of it recovers.
 fn keeps_sao(
@@ -933,6 +978,10 @@ fn keeps_sao(
     if sao_bits == 0 {
         return gain > 0;
     }
+    // The band's two ends bound the threshold, so they settle every decision
+    // that falls outside them without the probe. They are compared against
+    // bare, without the precision margin: what the margin is about is the
+    // extrapolation, and neither end of the band is extrapolated.
     let clears = |lambda: u64| gain > sao_bits.saturating_mul(lambda) / 256;
     let fixed = u64::from(lambda_q8(qp));
     if clears(fixed.saturating_mul(SAO_LAMBDA_BAND)) {
@@ -942,9 +991,16 @@ fn keeps_sao(
         return false;
     }
     let (fine, coarse) = probe();
-    clears(u64::from(calibrated_sao_lambda_q8(
-        fine, coarse, qp, sao_bits,
-    )))
+    clears_sao_threshold(gain, sao_threshold_sse(fine, coarse, qp, sao_bits))
+}
+
+/// Whether `gain` clears `threshold` by more than the acceptance model's own
+/// resolution — see [`SAO_ACCEPTANCE_PRECISION_NUM`] for why clearing it at
+/// all is not enough.
+fn clears_sao_threshold(gain: u64, threshold: f64) -> bool {
+    let margin = threshold * SAO_ACCEPTANCE_PRECISION_NUM as f64
+        / SAO_ACCEPTANCE_PRECISION_DEN as f64;
+    gain as f64 > threshold + margin
 }
 
 /// The multiplier the slice-level SAO decision trades distortion against rate
@@ -979,6 +1035,29 @@ fn keeps_sao(
 /// 0.08 dB below.
 fn calibrated_sao_lambda_q8(fine: CurvePoint, coarse: CurvePoint, qp: i32, sao_bits: u64) -> u32 {
     let fixed = lambda_q8(qp);
+    let Some(reachable) = reachable_sse(fine, coarse, qp, sao_bits) else {
+        return fixed;
+    };
+    let fixed = u64::from(fixed);
+    let measured = (reachable * 256.0 / sao_bits as f64).round().max(0.0) as u64;
+    measured.clamp((fixed / SAO_LAMBDA_BAND).max(1), fixed * SAO_LAMBDA_BAND) as u32
+}
+
+/// The squared error this picture's own rate-distortion curve reaches
+/// `sao_bits` above the coded point — what those bits would remove if they
+/// were spent on a finer quantizer instead of on SAO.
+///
+/// This is the quantity the slice-level decision is actually about, and
+/// [`sao_threshold_sse`] is the decision. `fine` and `coarse` are the two
+/// measured points; the curve between them is taken as a straight line in
+/// log-rate against log-distortion, which is very nearly straight over a
+/// single quantizer step and is the same interpolation
+/// [`super::tests::sao_curve_offsets`] measures the accepted points against.
+///
+/// Returns `None` where the two points describe no curve — the same rate, the
+/// same distortion, both moving the same way, or an empty slice — leaving the
+/// caller to fall back to the closed form.
+fn reachable_sse(fine: CurvePoint, coarse: CurvePoint, qp: i32, sao_bits: u64) -> Option<f64> {
     // The coded point is `coarse` at every QP but 0, where there is no finer
     // point to probe and the writer's own point is `fine` instead. Either way
     // the interpolation runs from the coded point towards the other one.
@@ -988,26 +1067,82 @@ fn calibrated_sao_lambda_q8(fine: CurvePoint, coarse: CurvePoint, qp: i32, sao_b
         (fine, coarse)
     };
     if coded.sse == 0 || coded.bits == 0 || other.sse == 0 || sao_bits == 0 {
-        return fixed;
+        return None;
     }
     let rate_ratio = other.bits as f64 / coded.bits as f64;
     let sse_ratio = other.sse as f64 / coded.sse as f64;
     // A probe that coded the same bits as the writer, or that did not move
     // the reconstruction the way a quantizer step must, describes no curve.
     if (rate_ratio - 1.0).abs() < 1e-9 || (sse_ratio - 1.0).abs() < 1e-9 {
-        return fixed;
+        return None;
     }
     if (rate_ratio > 1.0) != (sse_ratio < 1.0) {
-        return fixed;
+        return None;
     }
     let t = (1.0 + sao_bits as f64 / coded.bits as f64).ln() / rate_ratio.ln();
     let reachable = coded.sse as f64 * (1.0 - sse_ratio.powf(t));
-    if !reachable.is_finite() || reachable <= 0.0 {
-        return fixed;
-    }
-    let fixed = u64::from(fixed);
-    let measured = (reachable * 256.0 / sao_bits as f64).round().max(0.0) as u64;
-    measured.clamp((fixed / SAO_LAMBDA_BAND).max(1), fixed * SAO_LAMBDA_BAND) as u32
+    (reachable.is_finite() && reachable > 0.0).then_some(reachable)
+}
+
+/// How far a slice-level SAO decision has to clear the curve before the
+/// writer is entitled to call it a decision, as a fraction of the distortion
+/// [`reachable_sse`] predicts.
+///
+/// The acceptance test compares two estimates of the same quantity — the
+/// squared error SAO removed, measured exactly, against the squared error a
+/// finer quantizer would remove, *extrapolated* from a two-point probe to a
+/// rate a fraction of a quantizer step above the coded one. Only the first is
+/// measured. `measure_sao_acceptance_precision` quantifies the second against
+/// the ladder [`super::tests::sao_curve_offsets`] interpolates, which is this
+/// same writer coded at every QP from 0 to 51, and the extrapolation's error
+/// there reaches 3.7% of the distortion it predicts over the QP 12-51 sweep
+/// on both test pictures at both sizes.
+///
+/// So a gain that clears the threshold by less than that is not measured to
+/// be above the curve; it is inside the model's own resolution, and #287
+/// found the writer taking exactly such a decision — accepting a slice at
+/// noise 128x96 QP 32 by 0.25% of its own gain, which
+/// `every_accepted_sao_point_sits_on_the_writers_own_curve` then measured
+/// 0.003 dB *below* the curve. Requiring the margin to exceed the model's
+/// resolution is what turns that from a decision taken into a decision
+/// recognised as unresolvable, and an unresolvable decision does not spend
+/// the bits.
+///
+/// The bound is the measured 3.7% rounded up to a figure the measurement
+/// supports rather than one fitted to a single point; see
+/// [`SaoLambda::band_q8`] for what it lets the band-syntax charge do.
+const SAO_ACCEPTANCE_PRECISION_NUM: u64 = 1;
+/// Denominator of [`SAO_ACCEPTANCE_PRECISION_NUM`] — 1/25 is 4%.
+const SAO_ACCEPTANCE_PRECISION_DEN: u64 = 25;
+
+/// The squared error the slice-level SAO decision has to beat, in the picture
+/// SSE units `gain` is measured in.
+///
+/// This is [`reachable_sse`] clamped to the same trust band
+/// [`calibrated_sao_lambda_q8`] clamps the per-bit form to, expressed as the
+/// two rate lines the band's ends draw rather than as multipliers. Stating it
+/// this way is what makes it a threshold rather than a price: `reachable_sse`
+/// is increasing in `sao_bits` and both lines are increasing in `sao_bits`,
+/// so a clamp between them is increasing too, and a grid can only ever be
+/// asked for more distortion by asking for more bits.
+///
+/// The per-bit form is not, and cannot be. The curve is convex, so the
+/// distortion reachable by `sao_bits` grows slower than `sao_bits` does, and
+/// dividing an increasing concave threshold by the rate gives a *decreasing*
+/// price — which is the sense in which a smaller grid is "charged more per
+/// bit". That is what a concave threshold looks like in per-bit units and not
+/// a defect in it; see [`keeps_sao`] for what it does and does not imply
+/// about supersets.
+fn sao_threshold_sse(fine: CurvePoint, coarse: CurvePoint, qp: i32, sao_bits: u64) -> f64 {
+    let fixed = u64::from(lambda_q8(qp));
+    let line = |lambda: u64| (sao_bits.saturating_mul(lambda) / 256) as f64;
+    let (lo, hi) = (
+        line((fixed / SAO_LAMBDA_BAND).max(1)),
+        line(fixed.saturating_mul(SAO_LAMBDA_BAND)),
+    );
+    reachable_sse(fine, coarse, qp, sao_bits)
+        .unwrap_or_else(|| line(fixed))
+        .clamp(lo, hi)
 }
 
 /// The sum of squared errors between a reconstruction and the source it was
