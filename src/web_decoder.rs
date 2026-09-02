@@ -6,7 +6,7 @@
 //! the portable, synchronous [`crate::codec::VideoDecoder`] trait; it is a
 //! browser-only bridge kept out of the portable core.
 
-use crate::codec::EncodedVideoSample;
+use crate::codec::{CancellationToken, EncodedVideoSample};
 use crate::codec_config::{box_payload, derive_codec_string};
 use crate::io::MemorySource;
 use crate::media::{Codec, VideoDimensions};
@@ -246,10 +246,17 @@ impl WebVideoDecodeSession {
     }
 
     /// Decodes and returns exactly the requested presentation frame as RGBA bytes.
+    ///
+    /// A single group of pictures can be hundreds of frames long, so a caller that has moved on -
+    /// a timeline scrub whose pointer is already somewhere else - cancels the request rather than
+    /// waiting for a frame it will not draw. The token is checked on every turn of the decode
+    /// loop, so cancelling stops the decode part-way through instead of after it.
     pub async fn get(
         &mut self,
         presentation_index: FrameIndex,
+        cancellation: &CancellationToken,
     ) -> Result<(VideoDimensions, Vec<u8>)> {
+        cancellation.check()?;
         if let Some(frame) = self.cache.get(&presentation_index) {
             return self.copy_frame_rgba(frame).await;
         }
@@ -303,6 +310,7 @@ impl WebVideoDecodeSession {
         let mut submitted = 0_u32;
         let mut drained_after_flush = false;
         loop {
+            cancellation.check()?;
             if let Some(message) = self.decode_error.borrow_mut().take() {
                 self.next_decode_position = None;
                 return Err(Error::new(ErrorKind::Codec, message));

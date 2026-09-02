@@ -40,9 +40,10 @@ use zvidlib::{
 /// How far apart the frames a walk publishes are.
 ///
 /// The reader decodes every sample in between either way, so this only sets how often the picture
-/// under a drag moves. Four frames is roughly twenty updates a second on the bundled 1080p sample
-/// and keeps the cost of cloning a decoded frame out of the walk's inner loop.
-const WALK_STRIDE: u64 = 4;
+/// under a drag moves - and asking for each frame in turn is what keeps that under the 30 ms the
+/// issue asks for, since a stride of four made the picture wait for four frames' decoding
+/// (measured at 20-97 ms on the bundled 1080p sample, against 13-27 ms at one).
+const WALK_STRIDE: u64 = 1;
 
 /// How many decoded frames the render thread can still collect.
 ///
@@ -125,7 +126,10 @@ impl Queue {
 
     /// The delivered frame with exactly this index, if the render thread has not passed it yet.
     fn take_exact(&mut self, frame: u64) -> Option<VideoFrame> {
-        let position = self.delivered.iter().position(|(index, _)| *index == frame)?;
+        let position = self
+            .delivered
+            .iter()
+            .position(|(index, _)| *index == frame)?;
         // Everything older than the frame being drawn is never asked for again.
         self.delivered.drain(..position);
         self.delivered.front().map(|(_, frame)| frame.clone())
@@ -533,7 +537,11 @@ mod tests {
                 .map(|frame| frame.planes[0].data[0])
                 .filter(|index| *index == 8)
         });
-        assert_eq!(drawn, Some(8), "the newest requested frame is the one drawn");
+        assert_eq!(
+            drawn,
+            Some(8),
+            "the newest requested frame is the one drawn"
+        );
     }
 
     #[test]
