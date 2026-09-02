@@ -139,6 +139,68 @@ fn accelerated_hevc_preserves_exact_frame_identity_and_seek_behavior() {
     assert_eq!(frames_verified, 40);
 }
 
+/// Issue #354: reaching the far end of the bundled sample's single group of pictures means
+/// decoding every frame before it, and on a hardware backend the NV12-to-RGBA pass over each of
+/// those pictures costs more than the decoding does. The reader now tells the decoder that the
+/// pictures it is walking past are wanted for reference only, and VideoToolbox skips them with
+/// `kVTDecodeFrame_DoNotOutputFrame`. The readback seam is what says the conversion really did
+/// not run, and the fixture digest is what says skipping it changed no frame that was asked for.
+#[test]
+fn a_hardware_walk_converts_only_the_frames_it_is_asked_for() {
+    let mut vector = bundled_vector();
+    vector.configuration.hardware = HardwarePreference::Require;
+    let factory = native_hevc_video_decoder_factory();
+    if factory.capability(&vector.configuration) == CodecSupport::HardwareUnavailable {
+        let reason = factory
+            .create(&vector.configuration, &Limits::default())
+            .err()
+            .map_or_else(|| "unknown reason".into(), |error| error.to_string());
+        eprintln!("skipping: hardware HEVC unavailable: {reason}");
+        return;
+    }
+    let target = 120_u64;
+    let mut reader = ExactFrameReader::new(
+        &factory,
+        vector.configuration.clone(),
+        vector.samples.clone(),
+        Limits::default(),
+    )
+    .unwrap();
+    let cancellation = CancellationToken::new();
+
+    readback::reset();
+    let frame = reader.get(FrameIndex(target), &cancellation).unwrap();
+    assert_eq!(
+        FrameDigest::from_frame(&frame).unwrap(),
+        vector.expected_frames[target as usize].digest,
+        "the frame the walk stops on is the fixture's frame"
+    );
+    let statistics = reader.statistics();
+    let converted = readback::report().frames;
+    assert!(
+        statistics.samples_skipped >= target / 2,
+        "the walk decoded {} samples and skipped only {}",
+        statistics.samples_submitted,
+        statistics.samples_skipped
+    );
+    assert!(
+        converted < statistics.samples_submitted,
+        "{converted} frames were converted for {} samples, so nothing was skipped",
+        statistics.samples_submitted
+    );
+
+    // The frames after it are still there to be decoded, and still exact: skipping a picture
+    // must not disturb the reference decoding the frames after it depend on.
+    for index in [target + 1, target + 8, target + 40] {
+        let frame = reader.get(FrameIndex(index), &cancellation).unwrap();
+        assert_eq!(
+            FrameDigest::from_frame(&frame).unwrap(),
+            vector.expected_frames[index as usize].digest,
+            "frame {index} after a skipped walk does not match the fixture"
+        );
+    }
+}
+
 #[test]
 #[ignore = "host-specific real-time playback benchmark"]
 fn accelerated_hevc_decodes_bundled_1080p_sample_at_source_rate() {
