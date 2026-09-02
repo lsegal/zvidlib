@@ -2142,6 +2142,50 @@ mod tests {
         }
     }
 
+    /// The QP 12-51 sweep on both test pictures at both sizes, which is what
+    /// #287's three numbers were read off: where each accepted SAO point sits
+    /// against the SAO-off writer's own curve, how many components the search
+    /// gave band offset, and what the pass bought.
+    ///
+    /// Re-run it against a candidate band-syntax charge to see the bracket
+    /// [`SaoLambda::band_q8`] records. Below 1.5x `lambda_q8` the `CURVE` line
+    /// for noise 128x96 QP 32 goes to -0.003 dB; at 4x the `SWEEP` lines lose
+    /// their band components entirely.
+    #[test]
+    #[ignore = "measurement: the QP 12-51 SAO sweep on both pictures at both sizes"]
+    fn sao_sweep() {
+        for (name, width, height, smooth) in [
+            ("smooth 64x48", 64usize, 48usize, true),
+            ("smooth 128x96", 128, 96, true),
+            ("noise 64x48", 64, 48, false),
+            ("noise 128x96", 128, 96, false),
+        ] {
+            let (y, cb, cr) = if smooth {
+                smooth_picture(width, height)
+            } else {
+                picture(width, height)
+            };
+            for qp in 12..=51 {
+                let ((off_bytes, off_psnr), (on_bytes, on_psnr)) =
+                    sao_on_off(&y, &cb, &cr, width, height, qp);
+                let band = sao_grid(&y, &cb, &cr, width, height, qp)
+                    .iter()
+                    .flat_map(|cell| cell.components.iter())
+                    .filter(|c| c.sao_type_idx == 1)
+                    .count();
+                println!(
+                    "SWEEP {name} qp {qp}: {off_bytes} -> {on_bytes} bytes, \
+                     {off_psnr:.3} -> {on_psnr:.3} dB ({:+.3}), band components {band}",
+                    on_psnr - off_psnr
+                );
+            }
+            let sweep: Vec<i32> = (12..=51).collect();
+            for (qp, bytes, delta) in sao_curve_offsets(&y, &cb, &cr, width, height, &sweep) {
+                println!("CURVE {name} qp {qp}: {bytes} bytes, {delta:+.3} dB off the curve");
+            }
+        }
+    }
+
     /// A point on a picture's curve, for the calibration's own unit tests.
     fn curve(bits: u64, sse: u64) -> CurvePoint {
         CurvePoint { sse, bits }

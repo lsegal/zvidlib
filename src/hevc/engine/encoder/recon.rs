@@ -242,7 +242,13 @@ pub(crate) fn reconstruct_picture(
     if cfg.sao_luma || cfg.sao_chroma {
         // No §7.3.8.3 syntax is written for this reconstruction, so the
         // decision is distortion-only.
-        let grid = estimate_sao(&pic, src, cfg.sao_luma, cfg.sao_chroma, SaoLambda::closed_form(0));
+        let grid = estimate_sao(
+            &pic,
+            src,
+            cfg.sao_luma,
+            cfg.sao_chroma,
+            SaoLambda::closed_form(0),
+        );
         pic = crate::hevc::engine::sao::apply_sao_picture_full(
             pic,
             &grid,
