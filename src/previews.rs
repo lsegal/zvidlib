@@ -31,6 +31,7 @@
 
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use crate::api::{Error, ErrorKind, Limits, Result};
 use crate::codec::{
@@ -239,11 +240,14 @@ impl PreviewIndex {
     /// returns once nothing more is coming rather than once every slot is full,
     /// and it returns immediately on a cancelled index.
     pub fn wait_for_coverage(&self) {
-        while !self.cancellation.is_cancelled() {
-            match self.worker.as_ref() {
-                Some(worker) if !worker.is_finished() => thread::yield_now(),
-                _ => return,
+        while let Some(worker) = self.worker.as_ref() {
+            if worker.is_finished() {
+                return;
             }
+            // The pass is decode-bound and takes seconds, so polling it is a
+            // millisecond of latency on a wait measured in thousands of them,
+            // against a spin that would take a core away from the decode.
+            thread::sleep(Duration::from_millis(1));
         }
     }
 
