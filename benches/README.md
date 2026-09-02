@@ -217,8 +217,9 @@ reads close to flat anyway; [Why the tile group barely moves](#why-the-tile-grou
 is the measurement that says why, and what the remaining target is.
 
 This encoder's vectorized kernels are the forward transforms, the forward WHT
-and its inverse, and the `coeff_base` / `coeff_br` context derivation the
-coefficient coding loop runs on (§8.3.2, `src/av1_simd/coeff.rs`, the `av1_coeff_ctx` dispatch site).
+and its inverse — both WHT directions on `neon` only, since each was measured
+under parity on x86_64 and routed to the scalar reference there — and the
+`coeff_base` / `coeff_br` context derivation the coefficient coding loop runs on (§8.3.2, `src/av1_simd/coeff.rs`, the `av1_coeff_ctx` dispatch site).
 The last of those derives a whole block's contexts in one data-parallel pass
 ahead of the serial symbol loop, which is legal because the loop walks the
 up-right diagonal scan backwards, so every neighbour a position consults is
@@ -1008,6 +1009,8 @@ workflow that measured it, which touches no crate code.
 | `av1_encode_stage_symbol_1080p` | 8.257 ms | 8.167 ms (1.01x) | 8.236 ms (1.00x) | 1.01x `sse4.1` |
 | `av1_encode_stage_tile` | 21.340 ms | 18.051 ms (1.18x) | 18.248 ms (1.17x) | 1.18x `sse4.1` |
 | `av1_encode_stage_tile_1080p` | 197.811 ms | 167.742 ms (1.18x) | 169.684 ms (1.17x) | 1.18x `sse4.1` |
+| `av1_encode_stage_iwht` † | 331.600 µs | 399.630 µs (0.83x) | 371.650 µs (0.89x) | 0.89x `avx2` |
+| `av1_encode_stage_iwht_1080p` † | 3.064 ms | 3.682 ms (0.83x) | 3.424 ms (0.89x) | 0.89x `avx2` |
 | `av1_encode_stage_wht` | 436.654 µs | 371.908 µs (1.17x) | 372.555 µs (1.17x) | 1.17x `sse4.1` |
 | `av1_encode_stage_wht_1080p` | 4.026 ms | 3.423 ms (1.18x) | 3.419 ms (1.18x) | 1.18x `avx2` |
 | `av1_entropy_symbol` | 3.767 ms | 3.767 ms (1.00x) | 3.766 ms (1.00x) | 1.00x `avx2` |
@@ -1064,9 +1067,22 @@ workflow that measured it, which touches no crate code.
 | `hevc_inverse_transform` | 9.291 ms | 7.079 ms (1.31x) | 6.396 ms (1.45x) | 1.45x `avx2` |
 | `hevc_sao` | 32.116 ms | 19.431 ms (1.65x) | 18.325 ms (1.75x) | 1.75x `avx2` |
 
+† The two `av1_encode_stage_iwht` rows come from a separate draw. The group did
+not exist when the rest of this table was measured — #342 added it — so it was
+measured on its own, by the same recipe: three rounds, elementwise minimum, on
+one AMD EPYC 7763 64-Core, the model this table names. Six draws were dispatched
+so that three sharing a model could be selected; two landed on an AMD EPYC 9V74
+80-Core and were discarded. That draw timed `av1_encode_stage_wht` alongside the
+inverse group and read it at 1.16x and 1.16x against the 1.17x and 1.18x above,
+which is the check that the two draws are comparable. Both rows are the state
+*before* the dispatch change they settled, and are the measurement rather than
+the current arms: `av1_simd::iwht4x4` now returns `None` on x86_64, so a re-take
+will read them the way `av1_encode_stage_wht` reads here.
+
 #### Reading the rows
 
-Not one row's `Best` arm is below parity. The lowest cells anywhere in the table
+Not one row's `Best` arm is below parity, except the two the footnote above
+marks as a pre-change measurement. The lowest cells anywhere in the table
 are 0.98x and 0.99x, and four of the five belong to groups whose arms are the
 same code: `av1_decode_frame`, `av1_encode_stage_bitstream`,
 `av1_encode_stage_symbol` and `hevc_encode_cabac` have no vector kernel, so
@@ -1099,6 +1115,17 @@ Two rows read at parity for a reason worth stating rather than as noise:
   that the x86_64 early return skips before the fallback — a few percent of a
   very small kernel, not a kernel difference. `neon` keeps the kernel and its
   2.72x, where the shuffle issue width is what makes it win.
+- `av1_encode_stage_iwht` at 0.83x and 0.89x is the other direction of that same
+  family, and #342 measured it rather than inferring it: the forward group could
+  not settle it, because the forward pass runs three `transpose4`s where the
+  inverse runs two, so the shuffle pressure that put `av1_encode_stage_wht`
+  under parity is not this kernel's shuffle pressure. It turns out to be enough
+  anyway. Two `transpose4`s are sixteen shuffle micro-operations contending for
+  one or two ports, against a scalar loop with none, and the row reads the same
+  0.83x / 0.89x pair at 320x180 and at 1080p — a property of the kernel, not of
+  the frame size or of a noisy round. `av1_simd::iwht4x4` therefore joins
+  `fwht4x4` on the scalar reference on x86_64 and keeps its kernel on `neon`,
+  and this is now a measured dispatch on both sides of the family.
 
 The rows with real vector work are now the ones with the largest ratios, which
 is what the old table could not show. `hevc_encode_*_rgba_to_yuv420` leads at

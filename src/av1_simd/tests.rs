@@ -110,11 +110,12 @@ fn assert_all_match<T: PartialEq + std::fmt::Debug>(results: &[(SimdIsa, T)], wh
 // Transforms
 // ---------------------------------------------------------------------
 
-/// Whether `fwht4x4` is expected to answer with a kernel result. The forward
-/// WHT is dispatched to the scalar reference on x86_64 (see `super::fwht4x4`),
-/// so there `None` is the documented answer for an in-range block rather than
-/// a fallback. The inverse still has a kernel everywhere.
-const FORWARD_WHT_HAS_KERNEL: bool = !cfg!(target_arch = "x86_64");
+/// Whether the WHT kernels are expected to answer with a kernel result. Both
+/// directions are dispatched to the scalar reference on x86_64 (see
+/// `super::fwht4x4` and `super::iwht4x4`), each on its own measurement, so
+/// there `None` is the documented answer for an in-range block rather than a
+/// fallback.
+const WHT_HAS_KERNEL: bool = !cfg!(target_arch = "x86_64");
 
 #[test]
 fn walsh_hadamard_kernels_match_the_scalar_reference() {
@@ -132,19 +133,22 @@ fn walsh_hadamard_kernels_match_the_scalar_reference() {
             let kernel = fwht4x4(isa, &residual);
             assert_eq!(
                 kernel.is_some(),
-                FORWARD_WHT_HAS_KERNEL,
+                WHT_HAS_KERNEL,
                 "{}: unexpected forward WHT dispatch",
                 isa.name()
             );
             let coefficients = kernel.unwrap_or(scalar_coefficients);
             assert_eq!(coefficients, scalar_coefficients, "{}", isa.name());
-            let reconstructed = iwht4x4(isa, &coefficients).expect("in-range block");
+            let scalar_reconstructed = iwht4x4_scalar(&coefficients);
+            let inverse_kernel = iwht4x4(isa, &coefficients);
             assert_eq!(
-                reconstructed,
-                iwht4x4_scalar(&coefficients),
-                "{}",
+                inverse_kernel.is_some(),
+                WHT_HAS_KERNEL,
+                "{}: unexpected inverse WHT dispatch",
                 isa.name()
             );
+            let reconstructed = inverse_kernel.unwrap_or(scalar_reconstructed);
+            assert_eq!(reconstructed, scalar_reconstructed, "{}", isa.name());
             assert_eq!(reconstructed, residual, "forward/inverse must round-trip");
         }
     }
