@@ -106,6 +106,34 @@ pub async fn video_frame_durations_ms(
         .collect()
 }
 
+/// Returns the presentation indices a decode can start from, ascending.
+///
+/// A scrub that has to move backwards cannot walk there frame by frame - the decoder only runs
+/// forwards - so it restarts at the random-access point at or before its target and walks
+/// forwards from there, drawing what it passes. Knowing where those points are is what lets the
+/// picture follow the pointer during such a drag instead of holding still for the whole decode.
+pub async fn video_random_access_points(
+    bytes: &[u8],
+    track_index: u32,
+    limits: &Limits,
+) -> Result<Vec<u64>> {
+    let source = MemorySource::new(bytes.to_vec());
+    let track = parse_video_track(&source, track_index, limits).await?;
+    let mut points: Vec<u64> = track
+        .presentation_order
+        .iter()
+        .enumerate()
+        .filter_map(|(presentation_index, &decode_index)| {
+            let sample = track.samples.get(decode_index)?;
+            sample.is_sync.then_some(presentation_index as u64)
+        })
+        .collect();
+    // Presentation order already sorts them, but a track whose samples reorder is exactly the
+    // case a caller binary-searches, so the ordering is asserted rather than assumed.
+    points.sort_unstable();
+    Ok(points)
+}
+
 /// A lazily-configured `WebCodecs` decode session for one input video track.
 pub struct WebVideoDecodeSession {
     samples: Vec<EncodedVideoSample>,
