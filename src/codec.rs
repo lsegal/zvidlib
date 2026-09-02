@@ -479,10 +479,19 @@ impl ExactFrameReader {
                 break;
             }
             // Nothing looks at a picture decoded on the way to the target, and skipping the
-            // colour conversion it would otherwise pay is most of what a long walk costs. The
-            // target's own sample is the first one whose picture is wanted: a reordering decoder
-            // may only emit that frame from a later sample, never from an earlier one.
-            self.set_output_wanted(position >= target_position);
+            // colour conversion it would otherwise pay is most of what a long walk costs.
+            //
+            // What "on the way" means is a *presentation*-order question, not a decode-order
+            // one. A walk arrives at its target from behind and carries on forwards, so a
+            // sample whose own frame is at or after the target is one the next request is
+            // likely to ask for, and producing it is what makes that request a cache hit. Only
+            // the frames the walk has already gone past are skipped. Deciding this by decode
+            // position instead discards exactly the reordered frames a walk over a stream with
+            // B-pictures asks for next: on the bundled sample every fourth request would then
+            // reset the decoder and walk the whole group of pictures again.
+            let wanted = position >= target_position
+                || self.samples[position].presentation_index >= presentation_index;
+            self.set_output_wanted(wanted);
             let suppressed = !self.output_wanted;
             let outputs = self.decoder.submit(&self.samples[position], cancellation)?;
             self.statistics.samples_submitted = self.statistics.samples_submitted.saturating_add(1);
@@ -758,6 +767,7 @@ impl VideoDecoder for UncompressedVideoDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     fn config() -> VideoDecoderConfig {
         VideoDecoderConfig {
@@ -885,6 +895,240 @@ mod tests {
         );
         assert!(reader.statistics().resets > first.resets);
         assert!(reader.cached_frames() <= 3);
+    }
+
+    /// Records what each sample was asked to produce, so a test can see the hint the reader
+    /// actually gave rather than only its effect.
+    struct HintFactory {
+        wanted: Arc<Mutex<Vec<(u64, bool)>>>,
+    }
+
+    struct HintDecoder {
+        configuration: VideoDecoderConfig,
+        limits: Limits,
+        wanted: Arc<Mutex<Vec<(u64, bool)>>>,
+        output_wanted: bool,
+    }
+
+    impl VideoDecoderFactory for HintFactory {
+        fn capability(&self, _: &VideoDecoderConfig) -> CodecSupport {
+            CodecSupport::Supported {
+                implementation: CodecImplementation::Software,
+            }
+        }
+
+        fn create(
+            &self,
+            configuration: &VideoDecoderConfig,
+            limits: &Limits,
+        ) -> Result<Box<dyn VideoDecoder>> {
+            Ok(Box::new(HintDecoder {
+                configuration: configuration.clone(),
+                limits: *limits,
+                wanted: Arc::clone(&self.wanted),
+                output_wanted: true,
+            }))
+        }
+    }
+
+    impl VideoDecoder for HintDecoder {
+        fn submit(
+            &mut self,
+            sample: &EncodedVideoSample,
+            cancellation: &CancellationToken,
+        ) -> Result<Vec<DecodedVideoFrame>> {
+            cancellation.check()?;
+            self.wanted
+                .lock()
+                .expect("hint log poisoned")
+                .push((sample.presentation_index.0, self.output_wanted));
+            if !self.output_wanted {
+                return Ok(Vec::new());
+            }
+            Ok(vec![DecodedVideoFrame {
+                presentation_index: sample.presentation_index,
+                frame: VideoFrame::new(
+                    self.configuration.coded_dimensions,
+                    PixelFormat::Gray8,
+                    ColorRange::Full,
+                    vec![Plane {
+                        data: sample.data.clone(),
+                        stride: 1,
+                    }],
+                    &self.limits,
+                )?,
+            }])
+        }
+
+        fn drain(&mut self, _: &CancellationToken) -> Result<Vec<DecodedVideoFrame>> {
+            Ok(Vec::new())
+        }
+
+        fn reset(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn set_output_wanted(&mut self, wanted: bool) {
+            self.output_wanted = wanted;
+        }
+    }
+
+    /// Ten frames behind one random-access point, as the bundled sample's single group of
+    /// pictures is, with `value == index * 10`.
+    fn single_group_of_pictures() -> Vec<EncodedVideoSample> {
+        (0..10)
+            .map(|index| sample(index, (index * 10) as u8, index == 0))
+            .collect()
+    }
+
+    #[test]
+    fn walking_to_a_distant_frame_does_not_ask_for_the_pictures_it_passes() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let factory = HintFactory {
+            wanted: Arc::clone(&log),
+        };
+        let mut reader = ExactFrameReader::new(
+            &factory,
+            config(),
+            single_group_of_pictures(),
+            Limits::default(),
+        )
+        .unwrap();
+        let cancellation = CancellationToken::new();
+
+        assert_eq!(
+            value(&reader.get(FrameIndex(8), &cancellation).unwrap()),
+            80
+        );
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec![
+                (0, false),
+                (1, false),
+                (2, false),
+                (3, false),
+                (4, false),
+                (5, false),
+                (6, false),
+                (7, false),
+                (8, true),
+            ],
+            "only the frame that was asked for is produced"
+        );
+        let statistics = reader.statistics();
+        assert_eq!(statistics.samples_submitted, 9);
+        assert_eq!(statistics.samples_skipped, 8);
+        assert_eq!(statistics.resets, 1, "the walk itself is one decode");
+    }
+
+    #[test]
+    fn a_frame_the_walk_went_past_is_decoded_again_rather_than_reported_missing() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let factory = HintFactory {
+            wanted: Arc::clone(&log),
+        };
+        let mut reader = ExactFrameReader::new(
+            &factory,
+            config(),
+            single_group_of_pictures(),
+            Limits::default(),
+        )
+        .unwrap();
+        let cancellation = CancellationToken::new();
+        reader.get(FrameIndex(8), &cancellation).unwrap();
+        let resets = reader.statistics().resets;
+
+        // Frame 4 was submitted with nothing wanting its picture, so this decoder will never
+        // emit it again. The reader has to notice that and start over, exactly as it does for a
+        // frame it published and then evicted.
+        assert_eq!(
+            value(&reader.get(FrameIndex(4), &cancellation).unwrap()),
+            40
+        );
+        assert_eq!(reader.statistics().resets, resets + 1);
+        // And having decoded it, it is a cached frame again rather than a second reset.
+        assert_eq!(
+            value(&reader.get(FrameIndex(4), &cancellation).unwrap()),
+            40
+        );
+        assert_eq!(reader.statistics().resets, resets + 1);
+    }
+
+    #[test]
+    fn a_reordered_frame_at_or_past_the_target_is_kept_for_the_request_that_follows() {
+        // Decode order 0, 4, 2, 1, 3: reaching frame 4 means submitting samples whose own
+        // frames are 2, 1 and 3, which is a walk *backwards* in presentation order. Skipping by
+        // decode position would discard them and make every following request a fresh walk.
+        let samples = vec![
+            sample(0, 0, true),
+            sample(4, 40, false),
+            sample(2, 20, false),
+            sample(1, 10, false),
+            sample(3, 30, false),
+            sample(8, 80, false),
+            sample(6, 60, false),
+            sample(5, 50, false),
+            sample(7, 70, false),
+        ];
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let factory = HintFactory {
+            wanted: Arc::clone(&log),
+        };
+        let mut reader =
+            ExactFrameReader::new(&factory, config(), samples, Limits::default()).unwrap();
+        let cancellation = CancellationToken::new();
+
+        assert_eq!(
+            value(&reader.get(FrameIndex(4), &cancellation).unwrap()),
+            40
+        );
+        let resets = reader.statistics().resets;
+        for (index, expected) in [(1_u64, 10_u8), (2, 20), (3, 30)] {
+            assert_eq!(
+                value(&reader.get(FrameIndex(index), &cancellation).unwrap()),
+                expected,
+                "frame {index} is still available"
+            );
+        }
+        assert_eq!(
+            reader.statistics().resets,
+            resets,
+            "a frame after the target in decode order is not skipped"
+        );
+        assert_eq!(
+            reader.statistics().samples_skipped,
+            1,
+            "only frame 0, the random-access point the walk starts from, is behind frame 4"
+        );
+    }
+
+    #[test]
+    fn a_decoder_that_ignores_the_hint_still_answers_every_frame() {
+        // `set_output_wanted` is advisory: `uncompressed_video_decoder_factory` does not
+        // implement it, and the reader has to be no less correct for that.
+        let factory = uncompressed_video_decoder_factory();
+        let mut reader = ExactFrameReader::new(
+            &factory,
+            config(),
+            single_group_of_pictures(),
+            Limits::default(),
+        )
+        .unwrap();
+        let cancellation = CancellationToken::new();
+        reader.get(FrameIndex(8), &cancellation).unwrap();
+        assert_eq!(reader.statistics().samples_skipped, 8);
+        for index in 0..9_u64 {
+            assert_eq!(
+                value(&reader.get(FrameIndex(index), &cancellation).unwrap()),
+                (index * 10) as u8,
+                "frame {index} came back from the decoder that ignored the hint"
+            );
+        }
+        assert_eq!(
+            reader.statistics().resets,
+            1,
+            "frames the decoder produced anyway are cached, not walked to again"
+        );
     }
 
     #[test]

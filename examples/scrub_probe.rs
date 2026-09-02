@@ -40,6 +40,25 @@ fn main() -> Result<()> {
     let token = CancellationToken::new();
     let mut reader = ExactFrameReader::new(&factory, configuration.clone(), samples.clone(), limits)?;
 
+    // Strided walk, as the drag does: only the published frames are converted.
+    for stride in [1u64, 4, 8, 16] {
+        let mut fresh = ExactFrameReader::new(&factory, configuration.clone(), samples.clone(), limits)?;
+        let target = 728u64;
+        let start = Instant::now();
+        let mut cursor = 0u64;
+        let mut worst_gap = 0f64;
+        loop {
+            let t = Instant::now();
+            fresh.get(FrameIndex(cursor), &token)?;
+            let gap = t.elapsed().as_secs_f64() * 1000.0;
+            if gap > worst_gap { worst_gap = gap; }
+            if cursor == target { break; }
+            cursor = target.min(cursor + stride);
+        }
+        println!("strided walk to {target} stride {stride}: {:.0} ms, worst published-frame gap {:.1} ms, stats {:?}",
+            start.elapsed().as_secs_f64()*1000.0, worst_gap, fresh.statistics());
+    }
+
     // Sequential forward walk, reporting per-frame cost at intervals.
     let mut worst = 0f64;
     let mut bucket = Instant::now();
