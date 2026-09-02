@@ -336,19 +336,12 @@ fn metric_sad_batch(
     backend: DistortionBackend,
 ) {
     match backend {
-        DistortionBackend::Dispatched => rdcost::sad_batch(
-            src, src_stride, plane, offsets, pred_stride, w, h, out,
-        ),
+        DistortionBackend::Dispatched => {
+            rdcost::sad_batch(src, src_stride, plane, offsets, pred_stride, w, h, out)
+        }
         DistortionBackend::Scalar => {
             for (slot, &offset) in out.iter_mut().zip(offsets) {
-                *slot = rdcost::sad_scalar(
-                    src,
-                    src_stride,
-                    &plane[offset..],
-                    pred_stride,
-                    w,
-                    h,
-                );
+                *slot = rdcost::sad_scalar(src, src_stride, &plane[offset..], pred_stride, w, h);
             }
         }
     }

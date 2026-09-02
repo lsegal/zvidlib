@@ -186,6 +186,7 @@ pub(crate) fn sad(
 /// candidate would produce, on every instruction set, so batching cannot move a mode decision.
 ///
 /// Panics if `out` is shorter than `offsets`, or if any block is too large for its plane.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn sad_batch(
     src: &[u8],
     src_stride: usize,
@@ -552,11 +553,9 @@ mod x86 {
     /// The two 64-bit halves of a `_mm_sad_epu8` accumulator, added.
     #[target_feature(enable = "sse4.1")]
     unsafe fn hsum_epu8_pair(v: __m128i) -> u32 {
-        unsafe {
-            let lo = _mm_cvtsi128_si32(v) as u32;
-            let hi = _mm_cvtsi128_si32(_mm_unpackhi_epi64(v, v)) as u32;
-            lo + hi
-        }
+        let lo = _mm_cvtsi128_si32(v) as u32;
+        let hi = _mm_cvtsi128_si32(_mm_unpackhi_epi64(v, v)) as u32;
+        lo + hi
     }
 
     /// AVX2 SAD over several candidate predictions of one source block.
@@ -634,7 +633,8 @@ mod x86 {
                         // Two 4-wide rows fill one qword, so a 4xN candidate needs h/2 steps
                         // rather than h. `sad_batch` only takes this path for even `h`.
                         for y in (0..h).step_by(2) {
-                            let s = _mm256_set1_epi64x(read_rows4(sp.add(y * src_stride), src_stride));
+                            let s =
+                                _mm256_set1_epi64x(read_rows4(sp.add(y * src_stride), src_stride));
                             let p = _mm256_set_epi64x(
                                 read_rows4(c[3].add(y * pred_stride), pred_stride),
                                 read_rows4(c[2].add(y * pred_stride), pred_stride),
@@ -654,14 +654,7 @@ mod x86 {
                 i += group;
             }
             for (slot, &offset) in out[i..offsets.len()].iter_mut().zip(&offsets[i..]) {
-                *slot = sad_avx2(
-                    src,
-                    src_stride,
-                    &plane[offset..],
-                    pred_stride,
-                    w,
-                    h,
-                );
+                *slot = sad_avx2(src, src_stride, &plane[offset..], pred_stride, w, h);
             }
         }
     }
@@ -1175,7 +1168,15 @@ mod tests {
         if !is_x86_feature_detected!("avx2") {
             return;
         }
-        for &(w, h) in &[(4usize, 4usize), (4, 8), (4, 16), (8, 4), (8, 8), (16, 16), (16, 8)] {
+        for &(w, h) in &[
+            (4usize, 4usize),
+            (4, 8),
+            (4, 16),
+            (8, 4),
+            (8, 8),
+            (16, 16),
+            (16, 8),
+        ] {
             let stride = MAX_BLOCK + 7;
             let src = plane(0x0f1e_2d3c_4b5a_6978, stride, h + 10);
             let reference = plane(0xfeed_face_dead_c0de, stride, h + 10);
