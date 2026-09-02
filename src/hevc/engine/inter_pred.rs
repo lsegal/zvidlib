@@ -503,7 +503,12 @@ fn interp_block<const N: usize>(
     // [`NARROW_MAX_SAMPLE`] times the coefficient sums. At nine bits and
     // above the pre-shift accumulator overflows `i16`, so those depths
     // keep the `i32` kernel.
-    let narrow = bit_depth == 8;
+    // A row narrower than eight samples never reaches the 16-bit vector
+    // loop — `measure_narrow_filter_taps` reads 0.51x at a row of four,
+    // where the whole call is the widening remainder plus the cost of
+    // having narrowed the source for it — so the narrow-width chroma
+    // blocks keep the `i32` kernel.
+    let narrow = bit_depth == 8 && w >= 8;
     let mut out = vec![0i32; w * h];
     match (hk, vk) {
         // Full-pel (Table 8-8 / 8-9 phase 0, 0): A << shift3.

@@ -1004,6 +1004,36 @@ unsafe fn filter_taps_narrow_sse41<const N: usize>(
             );
             i += 8;
         }
+        filter_taps_narrow_tail_sse41(taps, coeffs, shift, out, i);
+    }
+}
+
+/// The 4-sample remainder an `i16` vector cannot cover, at the widening
+/// `i16` -> `i32` accumulation: four lanes per multiply, the same as
+/// [`filter_taps_sse41`] issues, so this neither wins nor loses against
+/// the wide kernel — it only keeps a partial row off the scalar path.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.1")]
+unsafe fn filter_taps_narrow_tail_sse41<const N: usize>(
+    taps: &[&[i16]; N],
+    coeffs: &[i16; N],
+    shift: i32,
+    out: &mut [i32],
+    from: usize,
+) {
+    unsafe {
+        let count = out.len();
+        let sh = _mm_cvtsi32_si128(shift);
+        let mut i = from;
+        while i + 4 <= count {
+            let mut acc = _mm_setzero_si128();
+            for (&c, tap) in coeffs.iter().zip(taps.iter()) {
+                let v = _mm_cvtepi16_epi32(_mm_loadl_epi64(tap.as_ptr().add(i).cast()));
+                acc = _mm_add_epi32(acc, _mm_mullo_epi32(v, _mm_set1_epi32(i32::from(c))));
+            }
+            _mm_storeu_si128(out.as_mut_ptr().add(i).cast(), _mm_sra_epi32(acc, sh));
+            i += 4;
+        }
         filter_taps_narrow_scalar(taps, coeffs, shift, out, i);
     }
 }
@@ -1053,7 +1083,7 @@ unsafe fn filter_taps_narrow_avx2<const N: usize>(
             );
             i += 8;
         }
-        filter_taps_narrow_scalar(taps, coeffs, shift, out, i);
+        filter_taps_narrow_tail_sse41(taps, coeffs, shift, out, i);
     }
 }
 
@@ -1080,6 +1110,20 @@ unsafe fn filter_taps_narrow_neon<const N: usize>(
             vst1q_s32(dst, vmovl_s16(vget_low_s16(acc)));
             vst1q_s32(dst.add(4), vmovl_high_s16(acc));
             i += 8;
+        }
+        // The 4-sample remainder that an `i16` vector cannot cover, at
+        // the widening `i16 -> i32` accumulation: four lanes per
+        // multiply, the same as `filter_taps_neon` issues, so this
+        // neither wins nor loses against the wide kernel — it only keeps
+        // a partial row off the scalar path.
+        let sh32 = vdupq_n_s32(-shift);
+        while i + 4 <= count {
+            let mut acc = vdupq_n_s32(0);
+            for (&c, tap) in coeffs.iter().zip(taps.iter()) {
+                acc = vmlal_n_s16(acc, vld1_s16(tap.as_ptr().add(i)), c);
+            }
+            vst1q_s32(out.as_mut_ptr().add(i), vshlq_s32(acc, sh32));
+            i += 4;
         }
         filter_taps_narrow_scalar(taps, coeffs, shift, out, i);
     }
