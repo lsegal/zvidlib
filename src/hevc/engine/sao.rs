@@ -36,6 +36,7 @@
 //! follow-up that threads the per-sample slice / tile id.
 
 use crate::hevc::engine::picture::{Picture, Plane, sub_wh_c};
+use crate::hevc::engine::profile::{Stage as ProfStage, scope as prof_scope};
 use crate::hevc::engine::slice_data::{SaoComponent, SaoCtbParams};
 
 /// `Sign( x )` (§5, equation 5-18).
@@ -277,6 +278,51 @@ impl SaoBoundaries {
         }
         true
     }
+
+    /// Whether every §8.7.3.2 neighbour read from inside the CTB containing
+    /// luma position `(x_luma, y_luma)` is permitted — that is, the CTB and
+    /// each of its eight neighbours are mutually filterable.
+    ///
+    /// The edge-offset classifier reads at most one sample away, so a CTB whose
+    /// whole neighbourhood answers `true` here has no sample the per-sample
+    /// [`Self::neighbour_allowed`] test could deny, and the branch-free
+    /// vector path is bit-exact with the scalar one over it. Neighbours
+    /// outside the picture are skipped: the §8.7.3.2 picture-boundary guard
+    /// already forces `edgeIdx = 0` there, and both paths honour it.
+    ///
+    /// This is what makes the constraint pay for itself rather than for the
+    /// picture. The decoder builds a `SaoBoundaries` unconditionally — it
+    /// cannot know a stream is single-slice and single-tile before parsing it
+    /// — so gating the vector path on `boundaries.is_none()` sent every real
+    /// decode down the per-sample scalar path (issue #310).
+    #[must_use]
+    pub fn ctb_neighbourhood_unconstrained(&self, x_luma: usize, y_luma: usize) -> bool {
+        let size = 1usize << self.ctb_log2_size_y;
+        let rx = (x_luma >> self.ctb_log2_size_y) as i64;
+        let ry = (y_luma >> self.ctb_log2_size_y) as i64;
+        let n_ctbs = self.slice_addr_of_ctb.len() as i64;
+        let w = self.pic_w_ctbs as i64;
+        if w == 0 {
+            return true;
+        }
+        for dy in -1i64..=1 {
+            for dx in -1i64..=1 {
+                let (nx, ny) = (rx + dx, ry + dy);
+                if nx < 0 || ny < 0 || nx >= w || ny * w + nx >= n_ctbs {
+                    continue; // outside the picture: the boundary guard covers it
+                }
+                if !self.neighbour_allowed(
+                    rx as usize * size,
+                    ry as usize * size,
+                    nx as usize * size,
+                    ny as usize * size,
+                ) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
 }
 
 /// [`apply_sao_ctb`] with the optional §8.7.3.2 slice / tile boundary
@@ -331,13 +377,30 @@ pub fn apply_sao_ctb_full(
     let w = n_w.min(pw.saturating_sub(x_ctb));
     let h = n_h.min(ph.saturating_sub(y_ctb));
 
-    // Fast path: with no slice / tile boundary mask and no PCM /
-    // transquant-bypass suppression, whole runs of a row take the same
-    // branch-free treatment, so they go through the vectorized kernels
-    // in `super::simd` (which fall back to scalar on targets without a
-    // supported vector ISA). The results are bit-exact with the scalar
-    // code below, which stays the normative reference.
-    let vectorizable = boundaries.is_none() && no_filter.is_none() && w > 0 && h > 0;
+    // Fast path: where neither the slice / tile boundary mask nor the PCM /
+    // transquant-bypass suppression can reach this CTB, whole runs of a row
+    // take the same branch-free treatment, so they go through the vectorized
+    // kernels in `super::simd` (which fall back to scalar on targets without a
+    // supported vector ISA). The results are bit-exact with the scalar code
+    // below, which stays the normative reference.
+    //
+    // Both tests are asked about this CTB rather than about the picture
+    // (issue #310). The decoder passes a `SaoBoundaries` on every picture,
+    // because whether a stream is single-slice and single-tile is not known
+    // before it is parsed, and a `NoFilterMap` as soon as one coding unit
+    // anywhere is PCM or transquant-bypass; a picture-wide `is_none()` test
+    // therefore sent every real decode down the per-sample scalar path and no
+    // in-decode SAO sample ever reached a vector kernel at all.
+    let suppression_here = no_filter.is_some_and(|m| {
+        m.any_in_luma_rect(x_ctb * nf_sw, y_ctb * nf_sh, n_w * nf_sw, n_h * nf_sh)
+    });
+    // Band offset classifies each sample by its own value alone (equation
+    // 8-414), so it reads no neighbour and no boundary constraint can apply
+    // to it; only edge offset consults the CTB neighbourhood.
+    let boundary_here = comp.sao_type_idx == 2
+        && boundaries
+            .is_some_and(|b| !b.ctb_neighbourhood_unconstrained(x_ctb * nf_sw, y_ctb * nf_sh));
+    let vectorizable = !boundary_here && !suppression_here && w > 0 && h > 0;
 
     if vectorizable && comp.sao_type_idx == 2 {
         let (h0, v0, h1, v1) = eo_pos(comp.eo_class);
@@ -557,7 +620,26 @@ pub fn apply_sao_picture_full(
     // buffer directly instead of a second full-picture clone — SAO
     // decodes a 1080p frame's worth of planes (~8MB+ luma/chroma), so an
     // extra clone here is a meaningful per-frame cost.
-    let rec = pic.clone();
+    //
+    // The snapshot is skipped outright when the resolved grid switches SAO off
+    // everywhere it is enabled, because then the filter loop below writes
+    // nothing and `saoPicture` is `recPicture`. On real content most CTBs carry
+    // `SaoTypeIdx == 0` (issue #310 measured 86.7% of luma and 94.4% of chroma
+    // CTBs over 48 frames of the bundled sample), so whole pictures come out
+    // this way and a full-picture copy for them is pure waste.
+    let luma_on = slice_sao_luma_flag && ctb_sao.iter().any(|r| r.components[0].sao_type_idx != 0);
+    let chroma_on = chroma_array_type != 0
+        && slice_sao_chroma_flag
+        && ctb_sao
+            .iter()
+            .any(|r| r.components[1].sao_type_idx != 0 || r.components[2].sao_type_idx != 0);
+    if !luma_on && !chroma_on {
+        return pic;
+    }
+    let rec = {
+        let _profile = prof_scope(ProfStage::SaoSnapshot);
+        pic.clone()
+    };
     let mut out = pic;
 
     let (sw, sh) = if chroma_array_type == 0 {
@@ -568,6 +650,7 @@ pub fn apply_sao_picture_full(
     let n_ctb_chroma_w = ctb_size_y / sw;
     let n_ctb_chroma_h = ctb_size_y / sh;
 
+    let _profile = prof_scope(ProfStage::SaoFilter);
     for ry in 0..pic_height_in_ctbs {
         for rx in 0..pic_width_in_ctbs {
             let resolved = &ctb_sao[ry * pic_width_in_ctbs + rx];

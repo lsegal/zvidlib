@@ -729,6 +729,10 @@ pub fn reconstruct_inter_picture(
     // §8.7.3 — sample-adaptive offset (on the deblocked samples). Resolve
     // each CTB's §7.4.9.3 SAO parameters with left / above merge (denied
     // across slice boundaries), then run the picture-level filter.
+    // Issue #310 stage attribution: the §7.4.9.3 resolution and the boundary
+    // grids below reach no vector kernel, so they are their own row rather than
+    // part of what `sao_filter` reports.
+    let _sao_profile = prof_scope(ProfStage::Sao);
     let mut sao_grid = vec![crate::hevc::engine::sao::ResolvedSao::off(); pic_w_ctbs * pic_h_ctbs];
     for placed in ctus {
         let rx = (placed.x_ctb as usize) >> slice.ctb_log2_size_y;
@@ -767,7 +771,6 @@ pub fn reconstruct_inter_picture(
                 .collect(),
         ),
     };
-    let _sao_profile = prof_scope(ProfStage::Sao);
     let filtered = crate::hevc::engine::sao::apply_sao_picture_full(
         pic,
         &sao_grid,

@@ -385,7 +385,7 @@ observed:
 | `hevc_inter_pred` | §8.5.3.3 interpolation + the weighted combine, over the measured prediction-unit mix | yes |
 | `hevc_intra_pred` | §8.4.4.2 reference smoothing, planar / DC / angular | yes |
 | `hevc_deblock` | §8.7.2 luma block-edge deblocking | yes |
-| `hevc_sao` | §8.7.3 sample adaptive offset, band and edge | yes |
+| `hevc_sao` | §8.7.3 sample adaptive offset, over the measured per-CTB parameter mix | yes |
 | `hevc_inverse_transform` | §8.6 dequantization + inverse DCT/DST | yes |
 | `hevc_color_convert` | decoder output YUV420-to-RGBA conversion | yes |
 | `hevc_cabac` | §9.3.4 arithmetic bin decoding | no, by design |
@@ -432,7 +432,9 @@ Issue #189 was that gap: `hevc_decode/<isa>` moved only ~1.06x between the
 `scalar` and `neon` arms while §8.5.3.3 luma interpolation measures 1.6-1.7x,
 §8.7.3 SAO 2.4x and §8.7.2 deblocking 1.3x in isolation. The breakdown below is
 what identified the missing colour-conversion kernel (#219) as the largest
-single reason.
+single reason, and then, one stage at a time, why each of the other isolated
+figures did not predict what that stage moved (#280 for inter prediction, #310
+for SAO).
 
 `examples/hevc_decode_profile.rs` closes it. It decodes the bundled sample
 through the ordinary public decoder with `zvidlib::hevc_decode_profile` running,
@@ -470,7 +472,9 @@ ms/frame, a 1.41x whole-frame ratio.
 | --- | ---: | ---: | ---: | --- |
 | `color_convert` | 33.6% | n/a | 9.16 | yes |
 | `inter_pred_filter` | 16.5% | 24.9% | 4.46 | yes |
-| `sao` | 9.5% | 14.4% | 2.57 | yes |
+| `sao_filter` | 2.4% | 3.6% | 0.72 | yes |
+| `sao_snapshot` | 1.6% | 2.4% | 0.49 | no |
+| `sao_setup` | 0.1% | 0.1% | 0.02 | no |
 | `deblock` | 8.2% | 12.4% | 2.24 | yes |
 | `intra_pred` | 4.0% | 6.0% | 1.08 | yes |
 | `residual_cabac` | 3.8% | 5.8% | 1.04 | no |
@@ -488,7 +492,9 @@ ms/frame, a 1.41x whole-frame ratio.
 | Stage | Share of total | Share of decode | ms/frame | Vectorized |
 | --- | ---: | ---: | ---: | --- |
 | `inter_pred_filter` | 21.5% | 23.8% | 4.15 | yes |
-| `sao` | 13.3% | 14.7% | 2.59 | yes |
+| `sao_snapshot` | 2.7% | 3.0% | 0.52 | no |
+| `sao_filter` | 1.9% | 2.1% | 0.36 | yes |
+| `sao_setup` | 0.1% | 0.1% | 0.02 | no |
 | `deblock` | 11.0% | 12.1% | 2.13 | yes |
 | `color_convert` | 9.6% | n/a | 1.86 | yes |
 | `intra_pred` | 5.5% | 6.2% | 1.08 | yes |
@@ -506,6 +512,20 @@ ms/frame, a 1.41x whole-frame ratio.
 conversion is not decoding: it is the YUV420-to-RGBA pass every whole-frame
 measurement takes on the way out of the decoder. Both denominators are reported
 because the two answer different questions and are easy to confuse.
+
+The two `sao` tables above are the arms measured *after* issue #310; the rest of
+each table is the issue #280 measurement set, so the SAO rows are the only ones
+in them taken on a different day. What they replaced was a single `sao` row at
+2.57 ms/frame `scalar` against 2.59 `neon` — 14.4% and 14.7% of decode proper,
+at 0.99x — which is the reading issue #310 asked about; see below.
+
+§8.7.3 SAO is three rows rather than one as of issue #310, for the same reason
+inter prediction is: only one of the three reaches a vector kernel. `sao_filter`
+is the §8.7.3.2 per-CTB modification process, the band and edge classifiers the
+`engine::simd::in_loop` kernels are; `sao_snapshot` is the §8.7.3.1
+`saoPicture = recPicture` whole-picture copy the classification reads against;
+`sao_setup` is the §7.4.9.3 `SaoOffsetVal` resolution over the CTB grid and the
+§8.7.3.2 boundary grids built for it.
 
 §8.5.3.3 inter prediction is three rows rather than one as of issue #280, which
 is most of what that issue turned out to be about — see below. `inter_pred_filter`
@@ -710,6 +730,100 @@ remaining gap between them to explain: what there was, was a benchmark timing
 16x16 blocks for a decoder that spends 93% of its interpolation on 32x32 and
 64x64 ones, plus a third of the stage that was never vectorized in the first
 place.
+
+#### `sao`: the isolated ratio and the in-decode one, reconciled
+
+Issue #310 asked the same question of §8.7.3 SAO that #280 asked of inter
+prediction: `hevc_sao` measured 1.57x in isolation while the `sao` row of the
+breakdown read 2.57 ms/frame `scalar` against 2.59 `neon` — **0.99x** — on 14.7%
+of decode proper. Two answers, and this time the first one is not a matter of
+degree.
+
+**No in-decode SAO sample reached a vector kernel at all.** §8.7.3.2's
+per-sample edge classification has to deny a neighbour read that crosses a slice
+or tile boundary with filtering across it disabled, so `apply_sao_ctb_full` took
+its branch-free row path — the one that calls `sao_edge_row` / `sao_band_row` —
+only when the caller passed no `SaoBoundaries` at all. The decoder always passes
+one. It cannot do otherwise: whether a stream is single-slice and single-tile is
+not known before it is parsed, and the same held for the `NoFilterMap` that
+carries §8.7.3.1's PCM and transquant-bypass suppression, which is present for a
+whole picture as soon as one coding unit anywhere in it qualifies. So every
+picture the decoder filtered went down the per-sample scalar path, with a
+`neighbour_allowed` CTB-grid lookup, an in-picture test and a `Picture::sample` /
+`set_sample` plane resolution per sample — and both arms ran exactly the same
+code. 0.99x was not a slow kernel or a diluted stage; it was an unreached one,
+and no isolated measurement of the kernels could have predicted it.
+
+Both tests are now asked about the CTB rather than about the picture.
+`SaoBoundaries::ctb_neighbourhood_unconstrained` clears a CTB whose eight
+neighbours are all mutually filterable — the classifier reads at most one sample
+away, so no sample in such a CTB has a read the per-sample test could deny —
+and `NoFilterMap::any_in_luma_rect` clears one no suppressed cell reaches. Band
+offset (equation 8-414) classifies each sample by its own value and reads no
+neighbour, so no boundary constraint applies to it at all. A CTB that fails
+either test still takes the scalar path, which stays the normative reference; on
+a single-slice single-tile picture none do.
+
+**The isolated benchmark was filtering a picture a decode never filters.** The
+old `hevc_sao` grid put band or edge offset on **every CTB of every component**.
+Over the same 48 frames of the bundled sample, all 26,520 CTBs the decoder
+resolved parameters for:
+
+| | off | band | EO 0-deg | EO 90-deg | EO 135-deg | EO 45-deg |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| luma | **86.7%** | 2.0% | 2.1% | 3.1% | 2.7% | 3.5% |
+| chroma | **94.4%** | 1.0% | 0.1% | 0.4% | 1.6% | 2.5% |
+
+Cb and Cr came out identical CTB for CTB, as §7.3.8.3 signals one
+`sao_type_idx_chroma` and one `SaoEoClass` for the pair. A `SaoTypeIdx == 0` CTB
+is returned from before it reads a sample, so the old grid ran roughly nine times
+the classifier work a 1080p frame does — and it ran it through a dispatch the
+decoder never took. `SAO_CTB_MIX` is that table; the rebuilt group schedules to
+it greedily, exactly as `INTER_PU_MIX` does, passes the single-slice single-tile
+`SaoBoundaries` a decode carries, and folds only the switched-on CTBs, since the
+rest of the picture is not something the stage produced.
+
+**What the repair is worth.** 48 frames of the bundled 1920x1080 sample, Apple
+Silicon (M1), `--release`, minimum of six interleaved rounds per arm, the two
+builds run alternately in the same session:
+
+| | `scalar` | `neon` | ratio |
+| --- | ---: | ---: | ---: |
+| `sao` before | 3.07 ms/frame | 3.10 ms/frame | 0.99x |
+| `sao` after | 1.23 ms/frame | 0.90 ms/frame | 1.37x |
+| whole frame before | 32.54 ms/frame | 23.46 ms/frame | 1.39x |
+| whole frame after | 30.45 ms/frame | 21.95 ms/frame | 1.39x |
+
+The stage falls **3.4x on the `neon` arm and 2.5x on the `scalar` arm**, taking
+6.4% off a whole frame on both — the scalar arm gains too, because the row
+kernels' scalar fallbacks are still branch-free rows against a per-sample loop
+that re-resolved the plane for every sample. The whole-frame ratio is unchanged
+at 1.39x, which is what a stage moving on both arms looks like. The host was
+loaded while these were taken, so the absolute figures run above the `inter_pred`
+set in the tables further up; the before/after comparison is valid because the
+two builds were interleaved within it, and the arms are reported side by side
+rather than against the committed table.
+
+**And the two measurements now agree.** On the same host and the same day, in
+interleaved rounds: the rebuilt `hevc_sao` group reads **1.24x** (2.659 /
+2.149 ms) and the whole in-decode stage reads **1.37x**. The old grid re-measured
+alongside them reads 1.18x rather than the 1.57x the committed table records,
+which is the host, not a change — nothing in this work touches that build.
+
+What is left between the two is one whole-picture copy. `apply_sao_picture_full`
+snapshots `recPicture` so the classification always reads pre-SAO samples, and
+the group clones a fresh input picture on top of that; the decode's stage carries
+one such copy and the group carries two. Decomposed directly at 1920x1080 on the
+`neon` arm: 0.56 ms for the group's input clone, 0.56 ms for the snapshot inside
+the stage, ~0.75 ms for the classifiers, ~0.32 ms for the fold.
+
+That decomposition is also the interesting thing the split now shows.
+**`sao_snapshot` is larger than `sao_filter` on the `neon` arm** — 0.52 against
+0.36 ms/frame — so the majority of what is left of SAO is a whole-picture `memcpy`
+that reaches no kernel and never will. It is skipped outright when the resolved
+grid switches SAO off everywhere, which on this content some pictures do, but the
+general repair is a rolling band of pre-SAO rows rather than a picture, and that
+is its own issue rather than part of this one.
 
 ### Correctness guard
 
@@ -1015,7 +1129,7 @@ Measured on **Apple M1 (macOS 15, aarch64)**, at `b6655bad215f`.
 | `hevc_inter_pred` | 24.449 ms | 22.433 ms (1.09x) | 1.09x `neon` |
 | `hevc_intra_pred` | 8.569 ms | 8.396 ms (1.02x) | 1.02x `neon` |
 | `hevc_inverse_transform` | 8.278 ms | 7.636 ms (1.08x) | 1.08x `neon` |
-| `hevc_sao` | 35.250 ms | 22.443 ms (1.57x) | 1.57x `neon` |
+| `hevc_sao` | 2.659 ms | 2.149 ms (1.24x) | 1.24x `neon` |
 
 #### Reading the sub-parity rows
 
