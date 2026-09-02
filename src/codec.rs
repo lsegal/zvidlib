@@ -285,6 +285,28 @@ pub trait VideoDecoder: Send {
     ) -> Result<Vec<DecodedVideoFrame>>;
     fn drain(&mut self, cancellation: &CancellationToken) -> Result<Vec<DecodedVideoFrame>>;
     fn reset(&mut self) -> Result<()>;
+
+    /// Whether the caller wants the pictures the next samples decode to, or is only decoding
+    /// them because a later frame references them.
+    ///
+    /// Reaching a frame in the middle of a long group of pictures means decoding every sample
+    /// before it, and on the way there nothing looks at those pictures. What they cost is not
+    /// the decoding: a hardware backend hands back NV12 and every one of these decoders then
+    /// converts a whole picture to RGBA on the CPU and allocates the frame that holds it. On
+    /// the bundled 1080p sample that conversion is 6.6 ms of the 9.6 ms a frame takes through
+    /// VideoToolbox, so a seek that skips it for the frames it passes costs a third of what it
+    /// did.
+    ///
+    /// A decoder must still *decode* a suppressed sample - the frames after it reference the
+    /// picture - and must still account for its presentation identity; what it may skip is
+    /// producing the [`DecodedVideoFrame`], which it reports by returning fewer frames than it
+    /// was given samples.
+    ///
+    /// The default implementation ignores the hint, which is always correct: a decoder that
+    /// keeps producing every frame is a decoder that is merely no faster. [`ExactFrameReader`]
+    /// tracks what it was actually handed rather than what it asked for, so a backend that
+    /// implements this and one that does not answer the same frames.
+    fn set_output_wanted(&mut self, _wanted: bool) {}
 }
 
 /// Discovers and creates video decoders without exposing backend-specific types.
@@ -311,6 +333,9 @@ pub trait VideoEncoderFactory {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DecodeStatistics {
     pub samples_submitted: u64,
+    /// Of those, the ones submitted only so a later frame could reference them, with the
+    /// decoder told not to produce their pictures.
+    pub samples_skipped: u64,
     pub cache_hits: u64,
     pub resets: u64,
     pub drains: u64,
@@ -325,6 +350,13 @@ pub struct ExactFrameReader {
     cache: BTreeMap<FrameIndex, VideoFrame>,
     lru: VecDeque<FrameIndex>,
     published_since_reset: HashSet<FrameIndex>,
+    /// Frames whose sample was submitted while the decoder was told nothing wanted its picture,
+    /// so the decoder passed through them without producing one. Reaching one again needs the
+    /// same reset an evicted published frame does.
+    suppressed_since_reset: HashSet<FrameIndex>,
+    /// What the decoder was last told, so a walk toggles it once at the target rather than
+    /// on every sample.
+    output_wanted: bool,
     next_decode_position: Option<usize>,
     limits: Limits,
     statistics: DecodeStatistics,
@@ -380,6 +412,8 @@ impl ExactFrameReader {
             cache: BTreeMap::new(),
             lru: VecDeque::new(),
             published_since_reset: HashSet::new(),
+            suppressed_since_reset: HashSet::new(),
+            output_wanted: true,
             next_decode_position: None,
             limits,
             statistics: DecodeStatistics::default(),
@@ -413,14 +447,20 @@ impl ExactFrameReader {
         // requires a reset is when the frame was already published once and evicted from the
         // cache, since a decoder must never be asked to emit the same presentation frame twice
         // without an intervening reset (see `publish`).
+        //
+        // A frame the decoder walked past without producing is in the same position as one that
+        // was published and evicted: the decoder will not emit it again, so only a reset can
+        // reach it.
         let can_reuse = self
             .next_decode_position
             .is_some_and(|position| position >= random_access_position)
-            && !self.published_since_reset.contains(&presentation_index);
+            && !self.published_since_reset.contains(&presentation_index)
+            && !self.suppressed_since_reset.contains(&presentation_index);
         if !can_reuse {
             self.decoder.reset()?;
             self.statistics.resets = self.statistics.resets.saturating_add(1);
             self.published_since_reset.clear();
+            self.suppressed_since_reset.clear();
             self.next_decode_position = Some(random_access_position);
         }
 
@@ -434,11 +474,23 @@ impl ExactFrameReader {
                 ));
             }
             if position == self.samples.len() {
+                self.set_output_wanted(true);
                 self.drain_internal(cancellation)?;
                 break;
             }
+            // Nothing looks at a picture decoded on the way to the target, and skipping the
+            // colour conversion it would otherwise pay is most of what a long walk costs. The
+            // target's own sample is the first one whose picture is wanted: a reordering decoder
+            // may only emit that frame from a later sample, never from an earlier one.
+            self.set_output_wanted(position >= target_position);
+            let suppressed = !self.output_wanted;
             let outputs = self.decoder.submit(&self.samples[position], cancellation)?;
             self.statistics.samples_submitted = self.statistics.samples_submitted.saturating_add(1);
+            if suppressed {
+                self.statistics.samples_skipped = self.statistics.samples_skipped.saturating_add(1);
+                self.suppressed_since_reset
+                    .insert(self.samples[position].presentation_index);
+            }
             self.next_decode_position = Some(position + 1);
             work += 1;
             self.publish(outputs)?;
@@ -461,17 +513,28 @@ impl ExactFrameReader {
     /// Drains delayed output into the bounded presentation cache.
     pub fn drain(&mut self, cancellation: &CancellationToken) -> Result<usize> {
         cancellation.check()?;
+        self.set_output_wanted(true);
         self.drain_internal(cancellation)
+    }
+
+    /// Tells the decoder whether the next samples' pictures are wanted, when that has changed.
+    fn set_output_wanted(&mut self, wanted: bool) {
+        if self.output_wanted != wanted {
+            self.decoder.set_output_wanted(wanted);
+            self.output_wanted = wanted;
+        }
     }
 
     /// Clears decoder, reorder, and frame-cache state.
     pub fn reset(&mut self) -> Result<()> {
+        self.set_output_wanted(true);
         self.decoder.reset()?;
         self.statistics.resets = self.statistics.resets.saturating_add(1);
         self.next_decode_position = None;
         self.cache.clear();
         self.lru.clear();
         self.published_since_reset.clear();
+        self.suppressed_since_reset.clear();
         Ok(())
     }
 
@@ -501,6 +564,11 @@ impl ExactFrameReader {
 
     fn publish(&mut self, outputs: Vec<DecodedVideoFrame>) -> Result<()> {
         for output in outputs {
+            // A decoder that ignores the output hint, or one that only emits a suppressed
+            // sample's picture later, hands back a frame this reader had written off. What it
+            // was handed is what counts, so it is a cached frame again rather than a reset.
+            self.suppressed_since_reset
+                .remove(&output.presentation_index);
             if !self.published_since_reset.insert(output.presentation_index) {
                 return Err(Error::new(
                     ErrorKind::MalformedMedia,
