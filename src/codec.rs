@@ -1331,8 +1331,7 @@ mod tests {
         for step in &steps {
             reader.get_step(FrameIndex(*step), &cancellation).unwrap();
         }
-        let converted =
-            reader.statistics().samples_submitted - reader.statistics().samples_skipped;
+        let converted = reader.statistics().samples_submitted - reader.statistics().samples_skipped;
         assert_eq!(
             converted,
             steps.len() as u64,
