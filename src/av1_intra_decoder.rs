@@ -374,6 +374,9 @@ struct LosslessTileDecoder<'a> {
     above_dc: Vec<u8>,
     left_level: Vec<u8>,
     left_dc: Vec<u8>,
+    /// `AboveTxWidth`/`LeftTxHeight` (§9.3's `tx_depth` context).
+    above_tx_width: Vec<u8>,
+    left_tx_height: Vec<u8>,
     mi_bsl: Vec<u8>,
     tx_sizes: TxSizeGrid,
     decoded_blocks: u32,
@@ -431,6 +434,8 @@ impl<'a> LosslessTileDecoder<'a> {
             above_dc: vec![0; mi_cols],
             left_level: vec![0; mi_rows],
             left_dc: vec![0; mi_rows],
+            above_tx_width: vec![0; mi_cols],
+            left_tx_height: vec![0; mi_rows],
             mi_bsl: vec![0; contexts],
             tx_sizes: TxSizeGrid::new(width, height),
             decoded_blocks: 0,
@@ -444,6 +449,7 @@ impl<'a> LosslessTileDecoder<'a> {
         while row < self.mi_rows {
             self.left_level.fill(0);
             self.left_dc.fill(0);
+            self.left_tx_height.fill(0);
             let mut column = 0;
             while column < self.mi_cols {
                 self.decode_partition(row, column, 64)?;
@@ -544,7 +550,8 @@ impl<'a> LosslessTileDecoder<'a> {
                 }
             }
         }
-        let tx_width = self.read_tx_size(block_width)?;
+        let tx_width = self.read_tx_size(row, column, block_width)?;
+        self.set_tx_context(row, column, units, tx_width);
         let step = tx_width / 4;
         let mut transform_y = 0;
         while transform_y < units {
@@ -574,6 +581,27 @@ impl<'a> LosslessTileDecoder<'a> {
         Ok(())
     }
 
+    /// The `tx_depth` context (§9.3): how many of the above and left neighbours already carry a
+    /// transform at least as large as this block's `Max_Tx_Size_Rect`. Every block this decoder
+    /// reconstructs is an unskipped intra block, so the neighbour value is its transform extent.
+    fn tx_depth_context(&self, row: usize, column: usize, max_tx: usize) -> usize {
+        let above = row > 0 && usize::from(self.above_tx_width[column]) >= max_tx;
+        let left = column > 0 && usize::from(self.left_tx_height[row]) >= max_tx;
+        usize::from(above) + usize::from(left)
+    }
+
+    /// `set_txfm_ctxs`: a coding block leaves its transform extent on every MI column and row it
+    /// covers, for the next block's [`Self::tx_depth_context`].
+    fn set_tx_context(&mut self, row: usize, column: usize, units: usize, tx_width: usize) {
+        let extent = u8::try_from(tx_width).unwrap_or(u8::MAX);
+        for mi_column in column..(column + units).min(self.mi_cols) {
+            self.above_tx_width[mi_column] = extent;
+        }
+        for mi_row in row..(row + units).min(self.mi_rows) {
+            self.left_tx_height[mi_row] = extent;
+        }
+    }
+
     /// `read_tx_size` (spec §5.11.16) for a square `block_width` coding
     /// block, over the square transform sizes this crate's inverse
     /// transform kernels implement (`TX_4X4` through `TX_64X64`).
@@ -585,7 +613,7 @@ impl<'a> LosslessTileDecoder<'a> {
     /// answer with no symbol read; under `TX_MODE_SELECT` a `tx_depth`
     /// symbol halves it once (8x8 blocks, whose `Max_Tx_Depth` is 1) or up
     /// to twice (larger blocks, where the spec caps the coded depth at 2).
-    fn read_tx_size(&mut self, block_width: usize) -> Result<usize> {
+    fn read_tx_size(&mut self, row: usize, column: usize, block_width: usize) -> Result<usize> {
         if self.base_q_idx == 0 {
             return Ok(4);
         }
@@ -593,7 +621,8 @@ impl<'a> LosslessTileDecoder<'a> {
         if largest <= 4 || !self.tx_mode_select {
             return Ok(largest);
         }
-        let (depth_cdf, max_depth) = cdf::tx_depth_cdf(block_width);
+        let ctx = self.tx_depth_context(row, column, largest);
+        let (depth_cdf, max_depth) = cdf::tx_depth_cdf(block_width, ctx);
         let depth = self.symbols.symbol(depth_cdf)?;
         if depth > max_depth {
             return Err(malformed_error("AV1 tx_depth exceeds the block maximum"));
@@ -761,8 +790,8 @@ impl<'a> LosslessTileDecoder<'a> {
         y4: usize,
         block_width: usize,
     ) -> Result<[i32; 16]> {
-        let (coefficients, _skipped) =
-            self.decode_coefficient_levels(x4, y4, block_width, 4, &cdf::DEFAULT_SCAN_4X4)?;
+        let (coefficients, _skipped, _tx_type) =
+            self.decode_coefficient_levels(x4, y4, block_width, 4, &cdf::DEFAULT_SCAN_4X4, None)?;
         let mut levels = [0i32; 16];
         levels.copy_from_slice(&coefficients);
         Ok(levels)
@@ -802,18 +831,14 @@ impl<'a> LosslessTileDecoder<'a> {
         mode: Av1IntraMode,
     ) -> Result<(Vec<i32>, Av1TxType)> {
         let scan = cdf::up_right_diagonal_scan(tx_width.min(MAX_CODED_TX_WIDTH));
-        let (coefficients, skipped) =
-            self.decode_coefficient_levels(x4, y4, block_width, tx_width, &scan)?;
-        // tx_type is only signaled for a transform block that actually has
-        // nonzero coefficients (a fully skipped block is implicitly
-        // DCT_DCT, though its value is irrelevant since inverse_transform
-        // of an all-zero input is zero regardless of tx_type).
-        let tx_type = if skipped {
-            Av1TxType::DctDct
-        } else {
-            self.read_tx_type(tx_width, mode)?
-        };
-        Ok((coefficients, tx_type))
+        // §5.11.39 `coeffs` reads `transform_type()` immediately after `all_zero` and before
+        // `eob_pt`, so the read happens inside the coefficient loop rather than after it. It is
+        // only signalled for a transform block that actually has nonzero coefficients; a fully
+        // skipped block is implicitly DCT_DCT, and its value is irrelevant anyway because the
+        // inverse transform of an all-zero input is zero for every type.
+        let (coefficients, _skipped, tx_type) =
+            self.decode_coefficient_levels(x4, y4, block_width, tx_width, &scan, Some(mode))?;
+        Ok((coefficients, tx_type.unwrap_or(Av1TxType::DctDct)))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -824,7 +849,8 @@ impl<'a> LosslessTileDecoder<'a> {
         block_width: usize,
         size: usize,
         scan: &[usize],
-    ) -> Result<(Vec<i32>, bool)> {
+        tx_type_mode: Option<Av1IntraMode>,
+    ) -> Result<(Vec<i32>, bool, Option<Av1TxType>)> {
         let plane_type = 0;
         // The specification selects every coefficient CDF below by a
         // quantizer context derived from `base_q_idx` and (except for
@@ -847,8 +873,13 @@ impl<'a> LosslessTileDecoder<'a> {
             == 1
         {
             self.set_coefficient_context(x4, y4, units, 0, 0);
-            return Ok((vec![0; count], true));
+            return Ok((vec![0; count], true, None));
         }
+        // §5.11.39 reads `transform_type()` here: after `all_zero`, before `eob_pt`.
+        let tx_type = match tx_type_mode {
+            Some(mode) => Some(self.read_tx_type(size, mode)?),
+            None => None,
+        };
         let eob_point = self
             .symbols
             .symbol(cdf::eob_pt_cdf(qctx, coded, plane_type))?
@@ -949,7 +980,7 @@ impl<'a> LosslessTileDecoder<'a> {
         };
         self.set_coefficient_context(x4, y4, units, cumulative, dc);
         if coded == size {
-            return Ok((levels, false));
+            return Ok((levels, false, tx_type));
         }
         // Scatter the coded quadrant into the full transform block.
         let mut coefficients = vec![0i32; count];
@@ -957,7 +988,7 @@ impl<'a> LosslessTileDecoder<'a> {
             coefficients[row * size..row * size + coded]
                 .copy_from_slice(&levels[row * coded..(row + 1) * coded]);
         }
-        Ok((coefficients, false))
+        Ok((coefficients, false, tx_type))
     }
 
     fn decode_golomb(&mut self) -> Result<u32> {
@@ -1350,6 +1381,10 @@ mod tests {
             e.symbol(&cdf::INTRA_FRAME_Y_MODE_DC_DC, 0); // DC_PRED
             if block == 0 || block == 3 {
                 e.symbol(cdf::txb_skip_cdf(qctx, tx_ctx, context), 0); // not skipped
+                // read_tx_type: §5.11.39 reads `transform_type()` right after
+                // `all_zero` and before `eob_pt`, so an 8x8 DC_PRED block's
+                // set-appropriate `tx_type` symbol comes here.
+                e.symbol(cdf::tx_type_cdf(tx_set, 8, 0).unwrap(), tx_type_symbol);
                 e.symbol(cdf::eob_pt_cdf(qctx, 8, 0), 0); // eob_point = 1 -> eob = 1
                 e.symbol(cdf::coeff_base_eob_cdf(qctx, tx_ctx, 0, 0), 2); // level = 3 (max base)
                 e.symbol(cdf::coeff_br_cdf(qctx, tx_ctx, 0, 0), 3); // +3, keep extending
@@ -1358,9 +1393,6 @@ mod tests {
                 e.symbol(cdf::coeff_br_cdf(qctx, tx_ctx, 0, 0), 2); // +2, stop (level = 14)
                 // block 0 negative, block 3 positive
                 e.symbol(cdf::dc_sign_cdf(qctx, 0, 0), usize::from(block == 0));
-                // read_tx_type: an 8x8 DC_PRED block's set-appropriate
-                // `tx_type` symbol.
-                e.symbol(cdf::tx_type_cdf(tx_set, 8, 0).unwrap(), tx_type_symbol);
             } else {
                 e.symbol(cdf::txb_skip_cdf(qctx, tx_ctx, context), 1); // skipped -> all zero
             }
@@ -1664,22 +1696,41 @@ mod tests {
     /// coefficient CDFs' transform-size context and (capped at 32, since a
     /// 64x64 transform codes only its upper-left quadrant) the `eob_pt`
     /// class.
-    fn encode_dc_only_transform_block(e: &mut SymbolEncoder, skip_context: usize, size: usize) {
+    fn encode_dc_only_transform_block(
+        e: &mut SymbolEncoder,
+        skip_context: usize,
+        size: usize,
+        level: i32,
+    ) {
+        assert!(
+            (3..=14).contains(&level),
+            "level is coded without a golomb tail"
+        );
         let qctx = cdf::coeff_qctx(SUPERBLOCK_Q);
         let tx_ctx = cdf::coeff_tx_size_ctx(size);
         e.symbol(cdf::txb_skip_cdf(qctx, tx_ctx, skip_context), 0); // not skipped
         // eob_point = 1 -> eob = 1
         e.symbol(cdf::eob_pt_cdf(qctx, size.min(32), 0), 0);
         e.symbol(cdf::coeff_base_eob_cdf(qctx, tx_ctx, 0, 0), 2); // level = 3 (max base)
-        e.symbol(cdf::coeff_br_cdf(qctx, tx_ctx, 0, 0), 1); // +1, stop (level = 4)
+        // The base-range extension carries the rest, three at a time.
+        let mut remaining = level - 3;
+        for _ in 0..4 {
+            let increment = remaining.min(3);
+            e.symbol(cdf::coeff_br_cdf(qctx, tx_ctx, 0, 0), increment as usize);
+            remaining -= increment;
+            if increment < 3 {
+                break;
+            }
+        }
+        assert_eq!(remaining, 0, "the base range covers this level");
         e.symbol(cdf::dc_sign_cdf(qctx, 0, 0), 0); // positive
     }
 
     /// The reconstruction a `size x size` transform carrying DC level 4
     /// produces on top of the 128 DC prediction an unbordered block gets.
-    fn dc_only_reconstruction(size: usize) -> Vec<u8> {
+    fn dc_only_reconstruction(size: usize, level: i32) -> Vec<u8> {
         let mut coefficients = vec![0i32; size * size];
-        coefficients[0] = 4;
+        coefficients[0] = level;
         let residuals = inverse_transform(
             &coefficients,
             size,
@@ -1703,7 +1754,7 @@ mod tests {
         // and TX_64X64's transform set is TX_SET_DCTONLY, so no tx_type
         // symbol follows the coefficients either. The transform covers the
         // whole coding block, so `getTXBSkipCtx` is 0.
-        encode_dc_only_transform_block(&mut e, 0, 64);
+        encode_dc_only_transform_block(&mut e, 0, 64, 14);
         let stream = superblock_temporal_unit(&e.finish(), false);
 
         let limits = Limits::default();
@@ -1717,7 +1768,7 @@ mod tests {
         assert_eq!(tx_sizes, expected);
         // The plane really came through the 64-point inverse DCT: a lone
         // DC coefficient spreads a constant offset over all 64x64 samples.
-        assert_eq!(frame.planes[0].data, dc_only_reconstruction(64));
+        assert_eq!(frame.planes[0].data, dc_only_reconstruction(64, 14));
         assert_ne!(frame.planes[0].data[0], 128);
     }
 
@@ -1725,7 +1776,7 @@ mod tests {
     fn tx_mode_select_signals_a_32_point_transform_and_reconstructs_through_it() {
         let mut e = SymbolEncoder::new();
         superblock_prefix(&mut e);
-        e.symbol(cdf::tx_depth_cdf(64).0, 1); // tx_depth = 1 -> TX_32X32
+        e.symbol(cdf::tx_depth_cdf(64, 0).0, 1); // tx_depth = 1 -> TX_32X32
         // The first of the block's four 32x32 transforms carries a DC
         // coefficient; the other three are TXB_SKIP. Their skip contexts
         // follow the same `set_coefficient_context` recurrence the decoder
@@ -1733,7 +1784,7 @@ mod tests {
         // (4) on 4x4 columns/rows 0..8, so the transforms to its right and
         // below each see exactly one nonzero, greater-than-3 neighbour
         // (context 3), and the last one sees neither (context 1).
-        encode_dc_only_transform_block(&mut e, 1, 32);
+        encode_dc_only_transform_block(&mut e, 1, 32, 4);
         for context in [3, 3, 1] {
             // skipped -> all zero
             e.symbol(
@@ -1755,7 +1806,7 @@ mod tests {
         }
         assert_eq!(tx_sizes, expected);
 
-        let reconstruction = dc_only_reconstruction(32);
+        let reconstruction = dc_only_reconstruction(32, 4);
         let width = SUPERBLOCK_DIM as usize;
         for row in 0..32 {
             assert_eq!(
@@ -1770,7 +1821,7 @@ mod tests {
     fn tx_mode_select_depth_two_signals_16x16_transforms() {
         let mut e = SymbolEncoder::new();
         superblock_prefix(&mut e);
-        e.symbol(cdf::tx_depth_cdf(64).0, 2); // tx_depth = 2 -> TX_16X16
+        e.symbol(cdf::tx_depth_cdf(64, 0).0, 2); // tx_depth = 2 -> TX_16X16
         // All sixteen 16x16 transforms are skipped, so every one of them
         // sees zeroed level contexts and codes at skip context 1.
         for _ in 0..16 {
@@ -1851,7 +1902,7 @@ mod tests {
         // TX_64X64 would write outside the reconstruction buffer.
         let mut e = SymbolEncoder::new();
         superblock_prefix(&mut e);
-        encode_dc_only_transform_block(&mut e, 0, 64);
+        encode_dc_only_transform_block(&mut e, 0, 64, 14);
         let tile = e.finish();
         let mut payload = frame_header_payload(SUPERBLOCK_Q, Some((0, 0, 0, 0, 0)), false, true);
         payload.extend_from_slice(&tile);
@@ -1900,8 +1951,8 @@ mod coefficient_level_tests {
         let mut decoder =
             LosslessTileDecoder::new(&bytes, 16, 16, 4, 4, 40, false, true, &limits).unwrap();
         let scan = cdf::up_right_diagonal_scan(8);
-        let (levels, skipped) = decoder
-            .decode_coefficient_levels(0, 0, 16, 8, &scan)
+        let (levels, skipped, _) = decoder
+            .decode_coefficient_levels(0, 0, 16, 8, &scan, None)
             .unwrap();
         assert!(!skipped);
         assert_eq!(levels[0], -14);
@@ -1933,8 +1984,8 @@ mod coefficient_level_tests {
         let bytes = encode(0);
         let mut decoder =
             LosslessTileDecoder::new(&bytes, 16, 16, 4, 4, 40, false, true, &limits).unwrap();
-        let (levels, skipped) = decoder
-            .decode_coefficient_levels(0, 0, 8, 8, &scan)
+        let (levels, skipped, _) = decoder
+            .decode_coefficient_levels(0, 0, 8, 8, &scan, None)
             .unwrap();
         assert!(!skipped);
         assert_eq!(levels[0], 1);
@@ -1944,8 +1995,8 @@ mod coefficient_level_tests {
         let bytes = encode(1);
         let mut decoder =
             LosslessTileDecoder::new(&bytes, 16, 16, 4, 4, 40, false, true, &limits).unwrap();
-        let (levels, skipped) = decoder
-            .decode_coefficient_levels(0, 0, 16, 8, &scan)
+        let (levels, skipped, _) = decoder
+            .decode_coefficient_levels(0, 0, 16, 8, &scan, None)
             .unwrap();
         assert!(!skipped);
         assert_eq!(levels[0], 1);
