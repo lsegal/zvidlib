@@ -1805,6 +1805,220 @@ mod nonlossless_tests {
         }
     }
 
+    /// The transform-gain correction is a bias the size ranking needs, not an estimate of what a
+    /// trial's type set is worth - and this is the assertion that says so.
+    ///
+    /// #349 read the residual error at `qindex` 1 as the *extrapolation model*: the correction
+    /// credits a gain measured on [`tile::TYPE_GAIN_PROBES`] of a trial's blocks against every
+    /// block the trial searched, which assumes the type search's gain scales with a trial's
+    /// searched cost, and `measure_type_gain_probes_against_trust` had measured that a sharper
+    /// estimate of that ratio ranks *worse*. Replacing the model does not fix it.
+    /// `measure_type_gain_models` sweeps the replacements - a per-block ratio instead of a
+    /// per-cost one, a credit saturating in the trial's block count at twelve values, both
+    /// against an accumulator-only correction and against a probe that keeps what it won instead
+    /// of measuring and discarding it - and every one of the 21 model-by-probe-handling arms
+    /// reads the *same* +0.023 dB at one probe and lands between -0.13 dB and -0.41 dB at every
+    /// larger probe count. The credit's shape does not move the outcome at all.
+    ///
+    /// What this asserts is the reason. Give the correction each trial's *exact* type-set cost -
+    /// `with_full_probes`, which probes every block of every trial, so the ratio is measured on
+    /// the whole trial and the extrapolation is exact rather than a model of anything - and the
+    /// frame reconstructs *below* the one-probe estimate it replaces. An exact measurement of the
+    /// quantity the correction estimates produces a worse size ranking than a one-block sample of
+    /// it, so the one-block correction is not succeeding as an estimator: it is a bias, and
+    /// `TYPE_GAIN_TRUST` and `TYPE_GAIN_PROBE_TRUST` are its size.
+    ///
+    /// `measure_trial_type_gains` locates why. A size trial ranks a size by coding its blocks
+    /// with the set's DCT, and a probe measures the rest of the set against *that* reconstruction
+    /// and those contexts; the emitting pass will produce neither. At `qindex` 1 ranking on the
+    /// exact per-trial type-set cost agrees with the exhaustive search on 32 of 37 coding blocks,
+    /// against the DCT-only ranking's 29 - three decisions better and five still wrong, from a
+    /// measurement that cannot be sharpened any further. The remaining error is in what a trial
+    /// is, not in how its measurement is credited, so no replacement of the extrapolation removes
+    /// it and this test stands in the way of reading the next one as a fix.
+    #[test]
+    fn the_type_gain_correction_is_a_bias_rather_than_a_measurement() {
+        let (width, height) = (96_usize, 80_usize);
+        let pixels = test_pattern(width as u32, height as u32);
+        let quality = |report: &tile::SearchReport| {
+            let reconstruction: Vec<u8> = (0..height)
+                .flat_map(|row| report.reconstruction[row * report.coded_width..][..width].to_vec())
+                .collect();
+            psnr(&pixels, &reconstruction)
+        };
+        let shipped =
+            quality(&tile::FrameEncoder::new(&pixels, width, height, 1).encode_with_report());
+        let exact = quality(
+            &tile::FrameEncoder::new(&pixels, width, height, 1)
+                .with_full_probes()
+                .encode_with_report(),
+        );
+        assert!(
+            exact < shipped,
+            "measuring every trial's type set exactly reconstructed at {exact:.3} dB against the \
+             one-block correction's {shipped:.3} dB, so the correction *is* estimating what it \
+             claims to and #349's replacement of the extrapolation model is worth re-opening"
+        );
+    }
+
+    /// What a size trial's whole transform-type set is actually worth, against what the
+    /// correction credits it with.
+    ///
+    /// Probes every block of every trial, so `trial_gains` carries each trial's exact DCT-only
+    /// cost and exact best-of-set cost rather than a sample of them, and compares three rankings
+    /// of each coding block's sizes against the exhaustive search's own choice: the DCT-only cost
+    /// the trials rank on, and the trial's exact best-of-set cost - the quantity the correction
+    /// estimates, measured rather than extrapolated. A model can only be wrong in the way #349
+    /// describes if ranking on that truth reproduces the exhaustive search's decisions. It does
+    /// not: at `qindex` 1 it agrees on 32 of 37 coding blocks against the DCT-only ranking's 29,
+    /// so a measurement that cannot be sharpened any further still misses five of them.
+    #[test]
+    #[ignore = "measurement sweep, not an assertion"]
+    fn measure_trial_type_gains() {
+        let (width, height) = (96_usize, 80_usize);
+        let pixels = test_pattern(width as u32, height as u32);
+        println!("qindex,agree_dct,agree_truth,blocks");
+        for qindex in DETERMINISM_QINDEXES {
+            let exhaustive = tile::FrameEncoder::new(&pixels, width, height, qindex)
+                .without_search_shortcuts()
+                .encode_with_report();
+            let chosen: std::collections::BTreeMap<(usize, usize, usize), usize> = exhaustive
+                .size_choices
+                .iter()
+                .map(|&(r, c, bw, tx)| ((r, c, bw), tx))
+                .collect();
+            let full = tile::FrameEncoder::new(&pixels, width, height, qindex)
+                .with_full_probes()
+                .encode_with_report();
+            // Group the trials by the coding block they ranked sizes for: transform width,
+            // blocks searched, their DCT-only cost, probed blocks and that pair of sums.
+            type Trial = (usize, usize, i64, i64, i64, i64);
+            let mut by_block: std::collections::BTreeMap<(usize, usize, usize), Vec<Trial>> =
+                std::collections::BTreeMap::new();
+            for &(r, c, bw, tx, n, dct_s, p, dct_p, best_p) in &full.trial_gains {
+                by_block
+                    .entry((r, c, bw))
+                    .or_default()
+                    .push((tx, n, dct_s, p, dct_p, best_p));
+            }
+            let (mut agree_dct, mut agree_truth, mut blocks) = (0, 0, 0);
+            for (key, trials) in &by_block {
+                let Some(&want) = chosen.get(key) else {
+                    continue;
+                };
+                blocks += 1;
+                // Each ranking keeps the cheapest, ties broken towards the larger transform.
+                let pick = |score: &dyn Fn(&Trial) -> i64| {
+                    trials
+                        .iter()
+                        .map(|trial| (score(trial), std::cmp::Reverse(trial.0)))
+                        .min()
+                        .map(|(_, std::cmp::Reverse(tx))| tx)
+                        .unwrap_or(0)
+                };
+                // The DCT-only cost the trials rank on, and the same trial's exact type-set
+                // cost, which is that cost less everything the whole set won on its blocks.
+                let dct = pick(&|t| t.2);
+                let truth = pick(&|t| t.2 - (t.4 - t.5));
+                agree_dct += usize::from(dct == want);
+                agree_truth += usize::from(truth == want);
+            }
+            println!("{qindex},{agree_dct},{agree_truth},{blocks}");
+        }
+    }
+
+    /// Sweeps the model a measured gain is credited to a trial by, against the probe count.
+    ///
+    /// This is what chooses [`tile::TYPE_GAIN_MODEL`]. Every cell is the 96x80 `test_pattern` -
+    /// the frame `the_search_shortcuts_stay_within_their_rate_and_distortion_bound` asserts on -
+    /// against the exhaustive search: the worst quantizer's reconstruction, `qindex` 1's, the
+    /// worst rate growth and the worst candidate reduction. A model whose error is a model error
+    /// gets *worse* as the probe count rises, which is what
+    /// `measure_type_gain_probes_against_trust` measured of the linear one.
+    #[test]
+    #[ignore = "measurement sweep, not an assertion"]
+    fn measure_type_gain_models() {
+        let (width, height) = (96_usize, 80_usize);
+        let pixels = test_pattern(width as u32, height as u32);
+        let quality = |report: &tile::SearchReport| {
+            let reconstruction: Vec<u8> = (0..height)
+                .flat_map(|row| report.reconstruction[row * report.coded_width..][..width].to_vec())
+                .collect();
+            psnr(&pixels, &reconstruction)
+        };
+        let mut exhaustive = std::collections::BTreeMap::new();
+        for qindex in DETERMINISM_QINDEXES {
+            let report = tile::FrameEncoder::new(&pixels, width, height, qindex)
+                .without_search_shortcuts()
+                .encode_with_report();
+            exhaustive.insert(
+                qindex,
+                (
+                    quality(&report),
+                    report.candidates_evaluated,
+                    report.tile.len(),
+                ),
+            );
+        }
+        let mut models = vec![
+            ("linear".to_string(), tile::GainModel::Linear),
+            ("per_block".to_string(), tile::GainModel::PerBlock),
+        ];
+        for sat in [2_usize, 4, 8, 16, 32] {
+            models.push((format!("sat_{sat}"), tile::GainModel::Saturating(sat)));
+        }
+        println!(
+            "probe,model,probes,worst_delta,worst_qindex,qindex_1_delta,worst_growth,worst_reduction"
+        );
+        for (unified, adopted, probe_label) in [
+            (false, false, "shipped"),
+            (false, true, "adopted"),
+            (true, false, "unified"),
+        ] {
+            for (label, model) in &models {
+                for probes in [1_usize, 2, 3, 4, 6, 8, 12, 16] {
+                    let mut worst = f64::INFINITY;
+                    let mut worst_qindex = 0_u8;
+                    let mut first = 0.0;
+                    let mut worst_growth = f64::NEG_INFINITY;
+                    let mut worst_reduction = f64::INFINITY;
+                    for qindex in DETERMINISM_QINDEXES {
+                        let encoder = tile::FrameEncoder::new(&pixels, width, height, qindex)
+                            .with_type_gain_model(*model)
+                            .with_type_gain_probes(probes);
+                        let encoder = if adopted {
+                            encoder.with_adopted_probes()
+                        } else {
+                            encoder
+                        };
+                        let encoder = if unified {
+                            encoder.with_unified_type_gain()
+                        } else {
+                            encoder
+                        };
+                        let report = encoder.encode_with_report();
+                        let delta = quality(&report) - exhaustive[&qindex].0;
+                        if qindex == 1 {
+                            first = delta;
+                        }
+                        if delta < worst {
+                            worst = delta;
+                            worst_qindex = qindex;
+                        }
+                        worst_growth = worst_growth
+                            .max(report.tile.len() as f64 / exhaustive[&qindex].2 as f64 - 1.0);
+                        worst_reduction = worst_reduction
+                            .min(exhaustive[&qindex].1 as f64 / report.candidates_evaluated as f64);
+                    }
+                    println!(
+                        "{probe_label},{label},{probes},{worst:+.3},{worst_qindex},{first:+.3},{:+.2},{worst_reduction:.2}",
+                        worst_growth * 100.0
+                    );
+                }
+            }
+        }
+    }
+
     /// Whether the distortion bound is reachable over a range of shrinkages rather than at one
     /// point, as a function of how many blocks a probe measures.
     ///
