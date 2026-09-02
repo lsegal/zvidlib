@@ -86,32 +86,59 @@ const LARGE_TYPE_GAIN_PROBES: usize = 4;
 ///
 /// The ratio is only stable frame-wide while the frame's content is, and the reuse is what costs
 /// accuracy when it is not: a block corrected by a ratio measured in a region unlike its own can
-/// have two close sizes ranked the wrong way round. `2` is where that trade was measured out, on
-/// the six-frame set in `measure_type_gain_sampling_intervals` at 192x160 - a hard scene edge, a
-/// four-quadrant frame, full-range noise, a smooth surface, directional edges, and the encoder's
-/// own `test_pattern` - against the same estimator probing every size search, which is the
-/// unsampled search this interval approximates. Cost is the encoder's own `sse + lambda * bits`,
-/// summed over the frame and compared at equal quantizer:
+/// have two close sizes ranked the wrong way round. That used to be what bounded this constant
+/// from above. It is not any more, and `8` is chosen from a different column than the one that
+/// first set it.
 ///
-/// | interval | worst penalty vs unsampled | mean vs exhaustive | candidates |
-/// |---------:|---------------------------:|-------------------:|-----------:|
-/// | 1        | 0.00%                      | +0.63%             | 228,743    |
-/// | 2        | +1.15%                     | +0.61%             | 207,352    |
-/// | 3        | +1.17%                     | +0.63%             | 198,964    |
-/// | 4        | +3.26%                     | +0.66%             | 197,196    |
-/// | 8        | +3.97%                     | +0.69%             | 190,714    |
-/// | 16       | +3.97%                     | +0.57%             | 184,954    |
+/// Re-measured with [`TYPE_GAIN_TRUST`] in force, on the eight-frame set in
+/// `measure_type_gain_sampling_intervals` - a hard scene edge, a four-quadrant frame, full-range
+/// noise, a smooth surface, directional edges, bands, a mosaic, and the encoder's own
+/// `test_pattern` - at 192x160 and at the 128x96 the ceilings below are set from, against the
+/// same estimator probing every size search. Cost is the encoder's own `sse + lambda * bits`,
+/// summed over the frame and compared at equal quantizer; times are the minimum of five
+/// interleaved rounds per arm in `measure_type_gain_sampling_cost`, and candidates are the
+/// 192x160 set's:
 ///
-/// The whole surface is an order of magnitude flatter than it was when this constant was first
-/// derived, because [`estimate_rate`] now prices a level the way §5.11.39 codes one: what used to
-/// read as the sampling rate mixing regions' statistics was mostly the rate model mispricing the
-/// large levels a region boundary produces. `2` remains the value - it is within 0.02 points of
-/// the unsampled estimator's worst case and saves 9% of the candidates, and every interval past
-/// it gives up two to four times as much for another 5%. `1` is not the value: it evaluates
-/// 228,743 transform-type candidates, which is where the four-fold reduction
-/// `the_search_shortcuts_stay_within_their_rate_and_distortion_bound` asserts stops being
-/// comfortable.
+/// | interval | worst penalty vs unsampled | mean vs exhaustive | candidates | time |
+/// |---------:|---------------------------:|-------------------:|-----------:|--------:|
+/// | 1        | 0.0%                       | +0.19%             | 243,694    | 0.640 s |
+/// | 2        | +1.3%                      | -0.36%             | 203,477    | 0.587 s |
+/// | 4        | +3.5%                      | -0.42%             | 183,677    | 0.563 s |
+/// | 8        | +3.4%                      | -0.41%             | 174,638    | 0.549 s |
+/// | 16       | +1.5%                      | -0.55%             | 167,546    | 0.542 s |
+///
+/// The penalty column above was measured under the rate model #299 replaced, and it is what
+/// moved this constant to `8`: with `estimate_rate` charging a level `2 + 2 * bit_length(level)`,
+/// the sampled estimator's own error swamped the sampling rate, every interval from `1` to `64`
+/// landed within +3.5% of the unsampled estimator, and nothing on the rate-distortion side
+/// disqualified a longer stride. #278 took the candidate saving that was left, #323 and #329
+/// established that neither `TX_4X4` coverage nor rate-distortion bounded the value from above,
+/// and #332 replaced the assertion that used to pin it with one holding the swept range to a
+/// penalty bound and the remaining candidate saving to under a tenth.
+///
+/// #299 priced a level the way §5.11.39 codes one, and the ordinary upper bound came back. The
+/// interval is once again bounded by the distortion the shortcuts are allowed to cost, and
+/// sharply: on the 96x80 `test_pattern` the shipped `2` reconstructs within 0.033 dB of the
+/// exhaustive search at its worst quantizer, while `3`, `4`, `6`, `8`, `16`, `32` and `64` all
+/// sit at 0.203 dB - four times the 0.05 dB
+/// `the_search_shortcuts_stay_within_their_rate_and_distortion_bound` allows, flat across the
+/// whole range rather than drifting into it, so this is a property of the sampling and not of
+/// where a stride's phase happens to land. `1` is not the value either: it probes every size
+/// search and reconstructs *worse* than `2` at `qindex` 1, because a trial that probes is
+/// corrected in full and an over-large correction moves the ranking away from what the
+/// exhaustive search would have chosen.
+///
+/// So the value returns to `2` and the upper bound is asserted as what it now is, by
+/// `a_longer_type_gain_sampling_interval_costs_more_distortion_than_the_bound_allows`, which
+/// replaces #332's. The per-frame ceilings in
+/// `the_type_gain_per_frame_penalties_are_pinned_at_the_shipped_sampling_interval` are re-measured
+/// at `2` as that test's own rule requires; they come out *tighter* than they were at `8`, the
+/// whole set fitting under 1% except `scene_edge` at +1.99%, where `bands` had needed 4%. The
+/// candidate saving `8` was taken for is given back - it is not available at a distortion the
+/// shortcuts are allowed to spend - and the search still clears the four-fold reduction those
+/// bounds assert, at 4.26x.
 pub(super) const TYPE_GAIN_SAMPLE_INTERVAL: usize = 2;
+
 /// Probes a transform size's accumulated gain ratio remembers, as the window of an exponential
 /// recency weighting.
 ///
@@ -224,11 +251,32 @@ pub(crate) enum GainRatio {
 /// `(1, 6)` misses the distortion bound at `qindex` 1 by 0.109 dB and `(1, 10)` misses
 /// `smooth`'s ceiling at 128x96 by 0.63 points. Neither assertion was touched to reach it.
 ///
-/// That fragility is a statement about the shortcuts, not about these two constants: with the
-/// rate model corrected, the DCT-only trial ranking's own error at `qindex` 1 is about 0.2 dB
-/// and no setting of either knob removes it, so what clears the bound is which way a handful of
-/// size decisions happen to fall. Re-deriving the calibration on content that genuinely
-/// separates it is tracked separately rather than papered over here.
+/// Everything above was measured under the rate model #299 replaced, and none of it survives
+/// that change. Re-running `measure_type_gain_trust` against the symbol-counting model puts every
+/// frame of the tuning set within 0.63% of the unsampled estimator at every quantizer and *flat*
+/// across the whole `0..=16` range - `bands` -1.74% at `qindex` 160, `mosaic` +0.63% at 160,
+/// `test_pattern` +0.29% at 200 and +0.00% everywhere else, each identical at every value. The
+/// `scene_edge` penalty this shrinkage was derived to absorb was the rate model mispricing the
+/// large levels a region boundary produces, not the estimator carrying a ratio across one.
+/// `measure_type_gain_memory_windows` reads flat the same way, so [`TYPE_GAIN_MEMORY`] - which
+/// #308 removed on the grounds that this shrinkage subsumed it - is not separable from it either.
+///
+/// Neither constant is therefore chosen by its own sweep any more, and the honest description of
+/// how they *are* chosen is a grid search: `measure_type_gain_memory_against_trust` sweeps the
+/// pair against the two assertions they have to satisfy together, and at the shipped sampling
+/// interval `(memory 1, trust 8)` - correct a non-probing trial by the freshest measurement at
+/// that size and believe half of it - is one of four cells of the 66 that hold both the 0.05 dB
+/// distortion bound and the per-frame ceilings, and the only one of those four that is also a
+/// plateau in the window rather than in the shrinkage alone. Its neighbours fail: `(1, 6)` misses
+/// the distortion bound at `qindex` 1 by 0.109 dB and `(1, 10)` missed `smooth`'s ceiling by 0.63
+/// points at the ceilings fitted before the interval moved.
+///
+/// That fragility is a statement about the shortcuts rather than about these constants. With the
+/// rate model corrected, the DCT-only trial ranking's own error at `qindex` 1 is about 0.2 dB and
+/// no setting of either knob removes it, so what clears the bound is which way a handful of size
+/// decisions fall. Re-deriving the calibration on content that genuinely separates it is tracked
+/// separately rather than papered over here, and no bound, ceiling or test was relaxed to reach
+/// this pair.
 pub(super) const TYPE_GAIN_TRUST: i64 = 8;
 
 /// [`TYPE_GAIN_TRUST`] denominator: the un-shrunk correction.
@@ -342,6 +390,18 @@ pub(crate) struct FrameEncoder<'a> {
     /// right. Outside tests the constant is read directly.
     #[cfg(test)]
     type_gain_interval: usize,
+    /// Whether every size search that can reach the smallest transform probes, whatever the
+    /// stride says. This is the guarantee #323 weighed against the phase dependence it would
+    /// remove; `measure_type_gain_phase_aliasing` prices it and nothing ships it, so it is off
+    /// outside that measurement.
+    #[cfg(test)]
+    force_smallest_size_probes: bool,
+    /// One entry per size search this frame, in the order they ran: the smallest transform width
+    /// the search could have chosen, and whether it probed. Together they say which strides ever
+    /// probe a trial that carries a given size, which is what `measure_type_gain_phase_aliasing`
+    /// reports.
+    #[cfg(test)]
+    size_search_probes: Vec<(usize, bool)>,
     /// The locality arm in force, so a test can measure the shipped one against the accumulators
     /// it blends. [`GainLocality::Blended`] outside tests.
     #[cfg(test)]
@@ -419,6 +479,9 @@ pub(crate) struct SearchReport {
     pub(crate) emitted_blocks: std::collections::HashMap<(usize, usize), (usize, u8)>,
     pub(crate) emitted_coding_blocks: u64,
     pub(crate) probing_size_searches: u64,
+    /// Every size search's smallest reachable transform width and whether it probed, in search
+    /// order, for `measure_type_gain_phase_aliasing`.
+    pub(crate) size_search_probes: Vec<(usize, bool)>,
     pub(crate) zero_skipped_emitted: u64,
     pub(crate) reusable_emitted: u64,
 }
@@ -568,6 +631,10 @@ impl<'a> FrameEncoder<'a> {
             #[cfg(test)]
             type_gain_interval: TYPE_GAIN_SAMPLE_INTERVAL,
             #[cfg(test)]
+            force_smallest_size_probes: false,
+            #[cfg(test)]
+            size_search_probes: Vec::new(),
+            #[cfg(test)]
             type_gain_locality: GainLocality::Running,
             #[cfg(test)]
             type_gain_probes: TYPE_GAIN_PROBES,
@@ -652,6 +719,30 @@ impl<'a> FrameEncoder<'a> {
     #[cfg(not(test))]
     fn type_gain_interval(&self) -> usize {
         TYPE_GAIN_SAMPLE_INTERVAL
+    }
+
+    /// Probes every size search that can reach the smallest transform, on top of the ones the
+    /// stride samples. This is the structural guarantee #323 asked for, kept only so
+    /// `measure_type_gain_phase_aliasing` can price what it costs; a shipped encode samples on
+    /// the stride alone.
+    #[cfg(test)]
+    pub(crate) fn with_forced_smallest_size_probes(mut self) -> Self {
+        self.force_smallest_size_probes = true;
+        self
+    }
+
+    /// Whether a size search that can reach the smallest transform probes whatever the stride
+    /// says. Never, outside the measurement that priced it.
+    #[cfg(test)]
+    fn force_smallest_size_probes(&self) -> bool {
+        self.force_smallest_size_probes
+    }
+
+    /// Whether a size search that can reach the smallest transform probes whatever the stride
+    /// says. Never, outside the measurement that priced it.
+    #[cfg(not(test))]
+    fn force_smallest_size_probes(&self) -> bool {
+        false
     }
 
     /// Overrides where a trial reads its gain ratio back from, so a test can measure the shipped
@@ -783,6 +874,7 @@ impl<'a> FrameEncoder<'a> {
             emitted_blocks: std::mem::take(&mut self.emitted_blocks),
             emitted_coding_blocks: self.emitted_coding_blocks,
             probing_size_searches: self.probing_size_searches,
+            size_search_probes: std::mem::take(&mut self.size_search_probes),
             zero_skipped_emitted: self.zero_skipped_emitted,
             reusable_emitted: self.reusable_emitted,
             tile: self.sym.finish(),
@@ -1063,12 +1155,29 @@ impl<'a> FrameEncoder<'a> {
         // scale from theirs and a sampled measurement of it does not carry. A size search that
         // can reach 32x32 therefore always probes, and probes several of the trial's blocks
         // rather than one.
-        let sampled = self.sample_type_gain();
+        //
+        // The stride otherwise samples coding blocks, not transform sizes, and which sizes a
+        // search can even reach is a property of the coding block's width - only a 16x16 or
+        // smaller block trials `TX_4X4` at all. Whether the smallest transform is *selected*
+        // somewhere in a frame therefore depends on whether the particular block it wins at was
+        // itself sampled, because a trial that probed is corrected by its own measurement at full
+        // strength while every other trial's is shrunk to [`TYPE_GAIN_TRUST`] sixteenths. That is
+        // the phase dependence #323 recorded, and it is left standing deliberately: the only
+        // guarantee that removes it - `with_forced_smallest_size_probes` - is measured there to
+        // cost 28-70% more transform-type candidates and up to +12.4% rate-distortion, for an
+        // outcome the sampled estimator is not worse than.
         let large = largest.min(MAX_FORWARD_TX) >= 32;
-        let probing = self.shortcuts() && (sampled || large);
+        let probing = self.shortcuts()
+            && (self.sample_type_gain()
+                || large
+                || (self.force_smallest_size_probes() && widths.last() == Some(&4)));
         #[cfg(test)]
-        if probing {
-            self.probing_size_searches += 1;
+        {
+            let smallest = widths.iter().copied().min().unwrap_or(0);
+            self.size_search_probes.push((smallest, probing));
+            if probing {
+                self.probing_size_searches += 1;
+            }
         }
         let mut best = (0usize, i64::MAX);
         for &tx_width in &widths {
