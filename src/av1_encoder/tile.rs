@@ -422,6 +422,16 @@ pub(crate) enum GainModel {
     /// one block is credited what it measured and a trial of sixty-four is credited far less than
     /// sixty-four times it.
     Saturating,
+    /// The per-block gain over the trial's blocks, scaled by [`TYPE_GAIN_AMPLIFICATION`]
+    /// sixteenths: `(dct_p - best_p) * b * a / (p * 16)`.
+    ///
+    /// This is the only shape that can put the credit *above* what the type set was measured to
+    /// win, which is where the shipped estimator's one-block sample already puts it: a trial's
+    /// first block measures a larger gain than its mean, so the shipped correction over-credits
+    /// by an amount nothing states and every sharper measurement removes. `a` states it, so the
+    /// probe count only sharpens the per-block gain instead of also changing how much of it is
+    /// credited. `16` is [`PerBlock`](GainModel::PerBlock) exactly.
+    Amplified,
 }
 
 /// Blocks the [`GainModel::Saturating`] credit saturates at: the `s` of `e(b) = b * s / (b+s-1)`.
@@ -430,6 +440,9 @@ pub(crate) enum GainModel {
 /// is what makes the model's error at `base_q_idx` 1 stop depending on how much of a trial was
 /// probed.
 pub(super) const TYPE_GAIN_SATURATION: usize = 4;
+
+/// Sixteenths [`GainModel::Amplified`] credits the trial's measured per-block gain at.
+pub(super) const TYPE_GAIN_AMPLIFICATION: i64 = 16;
 
 /// The extrapolation shipped encodes use. Every other [`GainModel`] is reachable only from
 /// [`FrameEncoder::with_type_gain_model`].
@@ -609,6 +622,10 @@ pub(crate) struct FrameEncoder<'a> {
     /// [`TYPE_GAIN_SATURATION`] outside tests.
     #[cfg(test)]
     type_gain_saturation: usize,
+    /// The sixteenths [`GainModel::Amplified`] credits at, so a test can sweep it.
+    /// [`TYPE_GAIN_AMPLIFICATION`] outside tests.
+    #[cfg(test)]
+    type_gain_amplification: i64,
     /// Transform-type candidates actually transformed, quantized and reconstructed, which is the
     /// work the shortcuts exist to remove.
     #[cfg(test)]
@@ -845,6 +862,8 @@ impl<'a> FrameEncoder<'a> {
             type_gain_model: TYPE_GAIN_MODEL,
             #[cfg(test)]
             type_gain_saturation: TYPE_GAIN_SATURATION,
+            #[cfg(test)]
+            type_gain_amplification: TYPE_GAIN_AMPLIFICATION,
             #[cfg(test)]
             type_gain_memory: TYPE_GAIN_MEMORY,
             #[cfg(test)]
@@ -1189,6 +1208,28 @@ impl<'a> FrameEncoder<'a> {
     #[cfg(not(test))]
     fn type_gain_saturation(&self) -> i64 {
         TYPE_GAIN_SATURATION as i64
+    }
+
+    /// Overrides how far [`GainModel::Amplified`] credits a measured per-block gain, so a sweep
+    /// can choose it.
+    #[cfg(test)]
+    pub(crate) fn with_type_gain_amplification(mut self, sixteenths: i64) -> Self {
+        self.type_gain_amplification = sixteenths;
+        self
+    }
+
+    /// The sixteenths [`GainModel::Amplified`] credits at. [`TYPE_GAIN_AMPLIFICATION`] outside
+    /// tests.
+    #[cfg(test)]
+    fn type_gain_amplification(&self) -> i64 {
+        self.type_gain_amplification
+    }
+
+    /// The sixteenths [`GainModel::Amplified`] credits at. [`TYPE_GAIN_AMPLIFICATION`] outside
+    /// tests.
+    #[cfg(not(test))]
+    fn type_gain_amplification(&self) -> i64 {
+        TYPE_GAIN_AMPLIFICATION
     }
 
     /// Encodes the tile and returns the symbol-coded bytes (`decode_tile`, §5.11.2).
@@ -1703,7 +1744,9 @@ impl<'a> FrameEncoder<'a> {
                 self.remembered_gain(running, slot)
             }
         };
-        if dct <= 0 || probes <= 0 {
+        // A trial every block of which the zero-block shortcut decided has nothing to credit,
+        // and no probe or accumulator to credit it from.
+        if dct <= 0 || probes <= 0 || self.trial_searched_blocks <= 0 {
             return cost;
         }
         let mut measured = dct - best;
@@ -1717,6 +1760,13 @@ impl<'a> FrameEncoder<'a> {
         let credit = match self.type_gain_model() {
             GainModel::Linear => measured.saturating_mul(self.trial_searched_cost) / dct,
             GainModel::PerBlock => measured.saturating_mul(blocks) / probes,
+            GainModel::Amplified => {
+                let numerator = i128::from(measured)
+                    * i128::from(blocks)
+                    * i128::from(self.type_gain_amplification());
+                let denominator = i128::from(probes) * i128::from(TYPE_GAIN_TRUST_ONE);
+                (numerator / denominator) as i64
+            }
             GainModel::Saturating => {
                 // `e(b) = b * s / (b + s - 1)`, evaluated together with the `/ p` so the
                 // saturation is not rounded away on a trial of one or two blocks.
