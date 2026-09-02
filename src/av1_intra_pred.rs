@@ -152,16 +152,16 @@ pub fn smooth_row(mode: SmoothMode, top: &[u8], left: &[u8], row: usize, out: &m
     assert_eq!(top.len(), out.len());
     assert!(row < left.len());
     assert!(smooth_weights(top.len()).is_some() && smooth_weights(left.len()).is_some());
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    match av1_intra_simd() {
-        Av1IntraSimd::Avx2 => return unsafe { smooth_row_avx2(mode, top, left, row, out) },
-        Av1IntraSimd::Sse41 => return unsafe { smooth_row_sse41(mode, top, left, row, out) },
-        _ => {}
-    }
-    #[cfg(target_arch = "aarch64")]
-    if av1_intra_simd() == Av1IntraSimd::Neon {
-        return unsafe { smooth_row_neon(mode, top, left, row, out) };
-    }
+    // No per-instruction-set arm: the §7.11.2.6 weighted blend has no vector
+    // kernel yet, and routing it through one anyway is not free. A
+    // `#[target_feature]` function can never be inlined into a caller that
+    // does not carry the feature, so an arm that only forwards to
+    // `smooth_row_scalar` still costs a call that cannot be merged into this
+    // row loop - which on x86_64 measured 0.47-0.48x of calling the reference
+    // directly, on both SSE4.1 and AVX2, for identical arithmetic (issue
+    // #336). It read at parity on `neon` only because NEON is in the aarch64
+    // baseline, so the same wrapper adds no features and inlines away. A real
+    // kernel gets its arms back here; a placeholder does not earn them.
     smooth_row_scalar(mode, top, left, row, out);
 }
 
@@ -664,12 +664,6 @@ unsafe fn paeth_row_avx2(top_left: u8, top: &[u8], left: u8, out: &mut [u8]) {
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-#[target_feature(enable = "avx2")]
-unsafe fn smooth_row_avx2(mode: SmoothMode, top: &[u8], left: &[u8], row: usize, out: &mut [u8]) {
-    smooth_row_scalar(mode, top, left, row, out);
-}
-
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "sse4.1")]
 unsafe fn paeth_row_sse41(top_left: u8, top: &[u8], left: u8, out: &mut [u8]) {
     unsafe {
@@ -705,12 +699,6 @@ unsafe fn paeth_row_sse41(top_left: u8, top: &[u8], left: u8, out: &mut [u8]) {
         }
         paeth_row_scalar(top_left, &top[index..], left, &mut out[index..]);
     }
-}
-
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-#[target_feature(enable = "sse4.1")]
-unsafe fn smooth_row_sse41(mode: SmoothMode, top: &[u8], left: &[u8], row: usize, out: &mut [u8]) {
-    smooth_row_scalar(mode, top, left, row, out);
 }
 
 // ---------------------------------------------------------------------
@@ -793,12 +781,6 @@ unsafe fn paeth_row_neon(top_left: u8, top: &[u8], left: u8, out: &mut [u8]) {
         }
         paeth_row_scalar(top_left, &top[index..], left, &mut out[index..]);
     }
-}
-
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-unsafe fn smooth_row_neon(mode: SmoothMode, top: &[u8], left: &[u8], row: usize, out: &mut [u8]) {
-    smooth_row_scalar(mode, top, left, row, out);
 }
 
 #[cfg(test)]
