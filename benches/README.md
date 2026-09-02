@@ -1092,10 +1092,12 @@ python3 .github/scripts/criterion_baseline.py staleness --readme benches/README.
 It reads each stamp out of this file, reads the dispatch sites
 `zvidlib::simd::active_by_site` documents at that commit, diffs them against
 the sites registered now, and names the rows whose subject site did not exist
-when the table was drawn. Today that is three rows of the Apple M1 table —
-`hevc_color_convert`, `av1_encode_stage_tile` and
-`hevc_encode_640x352_reconstruct` — and nothing on the x86_64 one, which was
-drawn at a commit with the same eleven sites the crate has now.
+when the table was drawn. When #389 added it, that was three rows of the Apple
+M1 table — `hevc_color_convert`, `av1_encode_stage_tile` and
+`hevc_encode_640x352_reconstruct` — and nothing on the x86_64 one. #368 re-drew
+the Apple M1 table in answer, so both tables are clean today: each is stamped at
+a commit carrying the same eleven sites the crate has now, and the report flags
+nothing.
 
 Three things about how it reads the site set are worth stating, because each is
 a place a more obvious implementation does not work:
