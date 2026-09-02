@@ -1662,6 +1662,64 @@ mod nonlossless_tests {
         worst
     }
 
+    /// Whether the distortion bound is reachable over a *range* of shrinkages rather than at one
+    /// point, as a function of how many blocks a probe measures.
+    ///
+    /// The single passing cell #343 records is the symptom of an estimator with one sample in
+    /// it: [`tile::TYPE_GAIN_PROBES`] is `1`, so a trial's ratio is measured on one block and
+    /// extrapolated over all of them, and at `qindex` 1 - where nothing quantizes to zero and
+    /// every block is coded - that one block decides the ranking. This sweeps the probe count
+    /// against the shrinkage and prints, per cell, the 96x80 distortion delta and the `qindex` 1
+    /// delta that drives it, beside the candidate reduction the shortcuts have to keep.
+    #[test]
+    #[ignore = "measurement sweep, not an assertion"]
+    fn measure_type_gain_probes_against_trust() {
+        let (width, height) = (96_usize, 80_usize);
+        let pixels = test_pattern(width as u32, height as u32);
+        let quality = |report: &tile::SearchReport| {
+            let reconstruction: Vec<u8> = (0..height)
+                .flat_map(|row| report.reconstruction[row * report.coded_width..][..width].to_vec())
+                .collect();
+            psnr(&pixels, &reconstruction)
+        };
+        let mut exhaustive = std::collections::BTreeMap::new();
+        for qindex in DETERMINISM_QINDEXES {
+            let report = tile::FrameEncoder::new(&pixels, width, height, qindex)
+                .without_search_shortcuts()
+                .encode_with_report();
+            exhaustive.insert(qindex, (quality(&report), report.candidates_evaluated));
+        }
+        println!("probes,trust,worst_delta,worst_qindex,qindex_1_delta,worst_reduction");
+        for probes in [1_usize, 2, 3, 4, 6, 8] {
+            for trust in 0_i64..=16 {
+                let mut worst = f64::INFINITY;
+                let mut worst_qindex = 0_u8;
+                let mut first = 0.0;
+                let mut worst_reduction = f64::INFINITY;
+                for qindex in DETERMINISM_QINDEXES {
+                    let report = tile::FrameEncoder::new(&pixels, width, height, qindex)
+                        .with_type_gain_probes(probes)
+                        .with_type_gain_trust(trust)
+                        .encode_with_report();
+                    let delta = quality(&report) - exhaustive[&qindex].0;
+                    if qindex == 1 {
+                        first = delta;
+                    }
+                    if delta < worst {
+                        worst = delta;
+                        worst_qindex = qindex;
+                    }
+                    worst_reduction = worst_reduction.min(
+                        exhaustive[&qindex].1 as f64 / report.candidates_evaluated as f64,
+                    );
+                }
+                println!(
+                    "{probes},{trust},{worst:+.3},{worst_qindex},{first:+.3},{worst_reduction:.2}"
+                );
+            }
+        }
+    }
+
     /// How far a trial's *own* probe measurement should be believed.
     ///
     /// The correction extrapolates a ratio measured on [`tile::TYPE_GAIN_PROBES`] of a trial's
@@ -1698,101 +1756,31 @@ mod nonlossless_tests {
     ///
     /// `measure_type_gain_memory_against_trust` sweeps the same grid against the two assertions
     /// the pair has to satisfy together, which is a search for a cell that passes rather than a
-    /// measurement of the pair. This is the measurement: over `content_frames` *and*
-    /// [`gain_frames`] at both sizes and every quantizer, it reports what each cell costs against
+    /// measurement of the pair. This is the measurement: over the whole [`tuning_set`], including
+    /// the [`gain_frames`] that separate the type gain, it reports what each cell costs against
     /// the same estimator probing every size search - the worst frame and the mean - beside the
     /// 96x80 distortion delta. An optimum here is one the tuning set chose.
     #[test]
     #[ignore = "measurement sweep, not an assertion"]
     fn measure_type_gain_calibration() {
-        let (bw, bh) = (96_usize, 80_usize);
-        let bpix = test_pattern(bw as u32, bh as u32);
-        let quality = |report: &tile::SearchReport| {
-            let reconstruction: Vec<u8> = (0..bh)
-                .flat_map(|row| report.reconstruction[row * report.coded_width..][..bw].to_vec())
-                .collect();
-            psnr(&bpix, &reconstruction)
-        };
-        let mut exhaustive = std::collections::BTreeMap::new();
-        for qindex in DETERMINISM_QINDEXES {
-            let report = tile::FrameEncoder::new(&bpix, bw, bh, qindex)
-                .without_search_shortcuts()
-                .encode_with_report();
-            exhaustive.insert(qindex, quality(&report));
-        }
-        // The unsampled estimator each cell is measured against, which does not depend on the
-        // cell: a trial that probes is corrected by its own measurement whatever the shrinkage is.
-        let mut sets = Vec::new();
-        for (width, height) in [(128_usize, 96_usize), (192, 160)] {
-            let mut frames = content_frames(width as u32, height as u32);
-            frames.push(("test_pattern", test_pattern(width as u32, height as u32)));
-            frames.extend(gain_frames(width as u32, height as u32));
-            sets.push((width, height, frames));
-        }
-        let mut unsampled = std::collections::BTreeMap::new();
-        for (width, height, frames) in &sets {
-            for (name, pixels) in frames {
-                for qindex in [1_u8, 8, 32, 80, 160, 200] {
-                    let ac = i64::from(crate::av1_intra::get_ac_quant(qindex));
-                    let lambda = (ac * ac / 256).max(1);
-                    let report = tile::FrameEncoder::new(pixels, *width, *height, qindex)
-                        .with_type_gain_interval(1)
-                        .encode_with_report();
-                    let cost = sse_against(&report, pixels, *width, *height)
-                        + lambda * report.tile.len() as i64 * 8;
-                    unsampled.insert((*width, *name, qindex), cost);
-                }
-            }
-        }
+        let sets = tuning_set();
+        let unsampled = unsampled_costs(&sets);
         println!("memory,trust,worst_penalty,worst_frame,mean_penalty,bound_delta");
-        for memory in [1_usize, 2, 3, 4, 8, usize::MAX] {
+        for memory in [1_usize, 2, 3, 4, 6, 8, 16, usize::MAX] {
             for trust in [0_i64, 1, 2, 3, 4, 6, 8, 10, 12, 14, 16] {
-                let mut worst_delta = f64::INFINITY;
-                for qindex in DETERMINISM_QINDEXES {
-                    let fast = tile::FrameEncoder::new(&bpix, bw, bh, qindex)
-                        .with_type_gain_memory(memory)
-                        .with_type_gain_trust(trust)
-                        .encode_with_report();
-                    worst_delta = worst_delta.min(quality(&fast) - exhaustive[&qindex]);
-                }
-                let mut worst = f64::NEG_INFINITY;
-                let mut worst_name = String::new();
-                let mut total = 0.0;
-                let mut count = 0.0;
-                for (width, height, frames) in &sets {
-                    for (name, pixels) in frames {
-                        for qindex in [1_u8, 8, 32, 80, 160, 200] {
-                            let ac = i64::from(crate::av1_intra::get_ac_quant(qindex));
-                            let lambda = (ac * ac / 256).max(1);
-                            let report = tile::FrameEncoder::new(pixels, *width, *height, qindex)
-                                .with_type_gain_interval(tile::TYPE_GAIN_SAMPLE_INTERVAL)
-                                .with_type_gain_memory(memory)
-                                .with_type_gain_trust(trust)
-                                .encode_with_report();
-                            let cost = sse_against(&report, pixels, *width, *height)
-                                + lambda * report.tile.len() as i64 * 8;
-                            let penalty = cost as f64
-                                / unsampled[&(*width, *name, qindex)] as f64
-                                * 100.0
-                                - 100.0;
-                            if penalty > worst {
-                                worst = penalty;
-                                worst_name = format!("{name}@{width}x{height}q{qindex}");
-                            }
-                            total += penalty;
-                            count += 1.0;
-                        }
-                    }
-                }
+                let arm = GainArm {
+                    probe_trust: tile::TYPE_GAIN_PROBE_TRUST,
+                    trust,
+                    memory,
+                };
+                let (worst, worst_name, mean) = tuning_set_penalty(&sets, &unsampled, arm);
+                let delta = bound_delta(arm);
                 let window = if memory == usize::MAX {
                     "frame".to_string()
                 } else {
                     memory.to_string()
                 };
-                println!(
-                    "{window},{trust},{worst:+.3},{worst_name},{:+.3},{worst_delta:+.3}",
-                    total / count
-                );
+                println!("{window},{trust},{worst:+.3},{worst_name},{mean:+.3},{delta:+.3}");
             }
         }
     }
