@@ -1486,6 +1486,143 @@ mod nonlossless_tests {
             .sum()
     }
 
+    /// Candidate frames for a tuning set that separates the *type gain* rather than the residual
+    /// energy, which is what [`content_frames`] varies.
+    ///
+    /// Every frame in `content_frames` is built out of regions whose *energy* differs - flat
+    /// against noise, smooth against a checkerboard. That is the right axis for the sampling
+    /// interval, whose error is a stale cost, but it is the wrong one for the shrinkage and the
+    /// recency window: what those two carry across a region boundary is the ratio
+    /// `(dct - best) / dct`, and a boundary between two regions that both happen to have a near
+    /// zero type gain does not move it however sharply the energy jumps. That is why
+    /// `measure_type_gain_trust` and `measure_type_gain_memory_windows` read flat on the whole
+    /// set once #299 stopped mispricing the levels a boundary produces.
+    ///
+    /// These frames instead put a region the non-DCT types win on next to a region they cannot:
+    /// a sawtooth ramp and hard diagonal edges both leave a residual with a strong one-sided
+    /// trend under DC prediction, which is exactly what `ADST` transforms and `DCT` does not,
+    /// while full-range noise has no trend for any type to exploit and a type gain of nearly
+    /// zero. The ratio therefore genuinely changes across the boundary, at every quantizer.
+    fn gain_frames(width: u32, height: u32) -> Vec<(&'static str, Vec<u8>)> {
+        let pixel = |f: &dyn Fn(u32, u32) -> u8| -> Vec<u8> {
+            (0..height)
+                .flat_map(|y| (0..width).map(move |x| f(x, y)).collect::<Vec<_>>())
+                .collect()
+        };
+        // A region the type search wins on: a sawtooth ramp, whose residual against a DC
+        // prediction is monotone across the block.
+        let ramp = |x: u32, y: u32| (((x + y) % 32) * 8) as u8;
+        // A region it cannot: full-range noise, uncorrelated in both axes.
+        let mut state = 0xC0FF_EE01_u32;
+        let mut noisy = {
+            let values: Vec<u8> = (0..width * height)
+                .map(|_| (lcg(&mut state) >> 24) as u8)
+                .collect();
+            move |x: u32, y: u32| values[(y * width + x) as usize]
+        };
+        // Hard diagonal edges, the other content the non-DCT types are for.
+        let edges = |x: u32, y: u32| if (x + y) % 12 < 6 { 30 } else { 220 };
+        let gain_edge = pixel(&|x, y| {
+            if y < height / 2 {
+                ramp(x, y)
+            } else {
+                noisy(x, y)
+            }
+        });
+        let gain_bands = pixel(&|x, y| {
+            if (y / 16) % 2 == 0 {
+                ramp(x, y)
+            } else {
+                noisy(x, y)
+            }
+        });
+        let gain_mosaic = pixel(&|x, y| {
+            if ((x / 32) + (y / 32)) % 2 == 0 {
+                edges(x, y)
+            } else {
+                noisy(x, y)
+            }
+        });
+        vec![
+            ("gain_edge", gain_edge),
+            ("gain_bands", gain_bands),
+            ("gain_mosaic", gain_mosaic),
+        ]
+    }
+
+    /// Whether a frame separates the shrinkage and the recency window at all.
+    ///
+    /// Prints, per frame, the *spread* of the sampled estimator's penalty against the unsampled
+    /// one over the whole `0..=16` shrinkage range and over every recency window - the quantity
+    /// `measure_type_gain_trust` and `measure_type_gain_memory_windows` read flat on
+    /// [`content_frames`]. A frame whose spread is zero cannot choose either constant; a frame
+    /// whose spread is large is what a derivation needs.
+    #[test]
+    #[ignore = "measurement sweep, not an assertion"]
+    fn measure_type_gain_separation() {
+        for (width, height) in [(128_usize, 96_usize), (192, 160)] {
+            let mut frames = content_frames(width as u32, height as u32);
+            frames.push(("test_pattern", test_pattern(width as u32, height as u32)));
+            frames.extend(gain_frames(width as u32, height as u32));
+            println!("size,{width}x{height}");
+            println!("frame,qindex,trust_spread,memory_spread,best_trust,best_memory");
+            for (name, pixels) in &frames {
+                for qindex in [1_u8, 8, 32, 80, 160, 200] {
+                    let ac = i64::from(crate::av1_intra::get_ac_quant(qindex));
+                    let lambda = (ac * ac / 256).max(1);
+                    let cost = |trust: i64, memory: usize| {
+                        let report = tile::FrameEncoder::new(pixels, width, height, qindex)
+                            .with_type_gain_interval(tile::TYPE_GAIN_SAMPLE_INTERVAL)
+                            .with_type_gain_trust(trust)
+                            .with_type_gain_memory(memory)
+                            .encode_with_report();
+                        sse_against(&report, pixels, width, height)
+                            + lambda * report.tile.len() as i64 * 8
+                    };
+                    let unsampled = {
+                        let report = tile::FrameEncoder::new(pixels, width, height, qindex)
+                            .with_type_gain_interval(1)
+                            .encode_with_report();
+                        sse_against(&report, pixels, width, height)
+                            + lambda * report.tile.len() as i64 * 8
+                    };
+                    let against = |c: i64| c as f64 / unsampled as f64 * 100.0 - 100.0;
+                    let mut trust_lo = f64::INFINITY;
+                    let mut trust_hi = f64::NEG_INFINITY;
+                    let mut best_trust = 0_i64;
+                    for trust in 0_i64..=16 {
+                        let penalty = against(cost(trust, tile::TYPE_GAIN_MEMORY));
+                        if penalty < trust_lo {
+                            trust_lo = penalty;
+                            best_trust = trust;
+                        }
+                        trust_hi = trust_hi.max(penalty);
+                    }
+                    let mut memory_lo = f64::INFINITY;
+                    let mut memory_hi = f64::NEG_INFINITY;
+                    let mut best_memory = String::new();
+                    for memory in [1_usize, 2, 3, 4, 6, 8, 12, 16, 24, 32, 64, usize::MAX] {
+                        let penalty = against(cost(tile::TYPE_GAIN_TRUST, memory));
+                        if penalty < memory_lo {
+                            memory_lo = penalty;
+                            best_memory = if memory == usize::MAX {
+                                "frame".to_string()
+                            } else {
+                                memory.to_string()
+                            };
+                        }
+                        memory_hi = memory_hi.max(penalty);
+                    }
+                    println!(
+                        "{name},{qindex},{:.3},{:.3},{best_trust},{best_memory}",
+                        trust_hi - trust_lo,
+                        memory_hi - memory_lo
+                    );
+                }
+            }
+        }
+    }
+
     /// Sweeps where a trial that did not probe reads its gain ratio back from.
     ///
     /// The running accumulator is filled in *probe order*: the size searches are visited in
