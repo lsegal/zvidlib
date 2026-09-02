@@ -933,11 +933,19 @@ fn band_stats(
     // The kernel's band shift is fixed to this module's 8-bit geometry.
     debug_assert_eq!(BIT_DEPTH, 8, "band classification assumes 8-bit samples");
     let mut stats = BandStats::default();
-    for y in y0..y1 {
-        let recon = &samples[y * pw + x0..y * pw + x1];
-        let src = &source[y * src_stride + x0..y * src_stride + x1];
-        recon_simd::band_offset_row(recon, src, &mut stats);
-    }
+    // One dispatched call for the whole CTB rather than one per row: #382
+    // measured the per-row shape's `#[target_feature]` call overhead as the
+    // reason the isolated kernel win did not reach this group. See
+    // [`recon_simd::band_offset_rect`].
+    recon_simd::band_offset_rect(
+        &samples[y0 * pw + x0..],
+        pw,
+        &source[y0 * src_stride + x0..],
+        src_stride,
+        x1 - x0,
+        y1 - y0,
+        &mut stats,
+    );
     (stats.sums, stats.counts)
 }
 
