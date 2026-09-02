@@ -2089,6 +2089,53 @@ The `macos-15-intel` draw agrees on the share and should be read only for it:
 that host's round-to-round spread is 24-51%, against 1-6% on `ubuntu-latest`,
 so its minimum is a floor rather than a measurement.
 
+**The call shape is not the reason either.** That left the second explanation,
+which is testable directly: give the kernel a call shape whose per-call cost is
+amortized over a whole CTB instead of one row. `band_offset_rect` is that
+shape - the rows of a CTB are walked *inside* one `#[target_feature]` entry, so
+a 16x16 luma CTB pays one non-inlinable call rather than sixteen and an 8x8
+chroma CTB one rather than eight, over the same lane-scatter body #340 timed.
+Measured the same way the per-row shape was, as a paired branch-against-base
+comparison with both trees built and timed on one host and interleaved within a
+round, five rounds per draw:
+
+| CPU model | draws | `avx2` | `sse4.1` | `scalar` (control) |
+|---|---|---|---|---|
+| Intel Xeon Platinum 8573C | PENDING | | | |
+| Intel Core i7-8700B | PENDING | | | |
+| AMD EPYC 7763 | 3 | 0.976-0.982x | 0.992-1.004x | 1.001-1.009x |
+| AMD EPYC 9V74 | 3 | 0.872-0.891x | 0.976-0.988x | 1.006-1.008x |
+
+**It is worse, not better.** On Zen 5 the once-per-CTB shape reads 0.872-0.891x
+where the once-per-row shape read 0.94-0.95x: removing fifteen of every sixteen
+calls made the kernel *more* expensive, which is the opposite of what a
+call-overhead account predicts and enough on its own to refute it. On EPYC 7763
+it reproduces the per-row figure to within the control's own movement. Neither
+sits inside what the `scalar` control moves by, which is 1.001-1.009x across
+every draw.
+
+**So neither candidate cause survives, and the site is not the problem.** What
+the two measurements together say is that the isolated harness is not measuring
+the encoder's work: `bench_band_offset_row` runs one L1-resident run of up to
+1024 samples back to back with `stats` hot and the branch fully predicted, and
+the reconstruction loop runs the same classification over CTB windows of a
+picture-sized plane, interleaved with prediction, the transform round trip and
+two in-loop filters, with `stats` reloaded per CTB and the band histogram
+competing for cache with everything else in the stage. The 1.10-1.53x is a real
+figure for the loop it was taken in and does not transfer, and a third call
+shape is not what would make it transfer.
+
+**Do not spend another attempt on this dispatch site.** The remaining
+untested idea is not a call shape but a different decomposition - deriving the
+32-band histogram for a whole CTB in one pass that keeps its accumulators in
+registers across rows, rather than 32 memory accumulators re-read per row - and
+that is a different kernel, not this one re-shaped. `band_offset_rect` is kept
+as the site's entry point precisely so a future attempt starts from the
+once-per-CTB shape without re-deriving that the once-per-row one is not what is
+costing it; both x86 rect kernels stay `#[cfg(test)]` alongside the six
+once-per-row candidates, asserted bit-exact, as the apparatus these figures
+were taken with.
+
 **AVX-512 was timed and does not separate even in isolation.**
 `ubuntu-latest` draws AVX-512CD hosts, so the `vpconflictd` shape #305 pointed
 at was reachable. Resolving the scatter's duplicate indices inside the vector
