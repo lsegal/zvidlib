@@ -188,6 +188,17 @@ fn preview_lookup(criterion: &mut Criterion) {
     let track = &support::gop_cadence_tracks()[0];
     let factory = native_hevc_video_decoder_factory();
     let configuration = configuration(track, HardwarePreference::Prefer);
+    // Building the index is one forward decode of the whole track. That is
+    // seconds on a fixed-function backend and minutes on the software one, so a
+    // host without hardware only measures this when it has opted into the slow
+    // arms - the lookup itself is a lock and a clone and does not vary by
+    // backend anyway.
+    let hardware = cfg!(any(target_os = "macos", windows)) && supported(&configuration);
+    if !hardware && std::env::var_os(LARGE_GROUP_ENV).is_none() {
+        println!("# skipping preview_lookup: no hardware backend, and {LARGE_GROUP_ENV} is unset");
+        group.finish();
+        return;
+    }
     if !supported(&configuration) {
         println!("# skipping preview_lookup: no usable decoder");
         group.finish();
