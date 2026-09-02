@@ -947,7 +947,63 @@ one, not a quieter one.
 An arm being absent from a row means the host could not execute it, not that it
 was not measured: an Apple Silicon host has no `sse41` or `avx2` column at all,
 which is why the x86_64 arms do not appear here yet. `#228` covers measuring the
-x86_64 side.
+x86_64 side, and `#261` adds the generated x86_64 table alongside this one.
+
+### The x86_64 sub-parity arms, and what they turned out to be
+
+`#336` recorded eleven groups whose x86_64 vector arms measured *below* their
+own scalar arm, several of them far outside anything the noise discussion above
+covers - `av1_deblock_wide` at 0.13x under AVX2 is a kernel running roughly
+eight times slower than the code it replaces, and all three of its rounds
+agreed. The same groups were at or above parity on `neon`, so the cause was
+never the benchmark inputs.
+
+Nine of the eleven were one compiler defect, not nine kernels. A
+`#[target_feature]` attribute applies to the function it is written on and not
+to what that function calls, so `av1_simd`'s generic kernels were only compiled
+with their instruction set enabled when the inliner chose to inline them into
+the per-ISA wrapper. The large ones - the deblocking pair and the transform
+drivers - exceeded its size budget, and their wrappers became tail calls to
+copies built at the target's baseline instruction set, where every intrinsic is
+an out-of-line call through `core::core_arch`. NEON is in the aarch64 baseline
+and so lowered inline regardless, which is exactly why no aarch64 row ever
+showed it. Marking the kernel entry points `#[inline(always)]` fixes all nine
+at once; the ratios below are `sse4.1`/`avx2` against each group's own scalar
+arm, before and after, on `ubuntu-latest`:
+
+| Group | before | after |
+| --- | ---: | ---: |
+| `av1_deblock` | 0.84x / 0.24x | 6.73x / 7.89x |
+| `av1_deblock_wide` | 0.62x / 0.13x | 2.86x / 3.08x |
+| `av1_deblock_boundary` | 0.91x / 0.22x | 4.63x / 4.34x |
+| `av1_deblock_chroma` | 0.79x / 0.20x | 2.21x / 2.37x |
+| `av1_forward_dct_16x16` | 0.25x / 0.26x | 2.82x / 3.06x |
+| `av1_forward_dct_32x32` | 0.26x / 0.26x | 1.24x / 1.55x |
+| `av1_forward_flipadst_16x16` | 0.20x / 0.23x | 2.66x / 2.92x |
+| `av1_inverse_flipadst_16x16` | 0.49x / 0.49x | 1.44x / 1.55x |
+| `av1_inverse_adst_8x8` | 0.69x / 0.68x | 1.72x / 1.43x |
+| `av1_encode_frame_q32` | 0.52x | 1.43x / 1.52x |
+| `av1_encode_frame_q160` | 0.48x | 1.42x / 1.49x |
+
+The other two were not that defect. `av1_intra_smooth` (0.47x / 0.48x on
+x86_64, 1.05x on `neon`) ran *identical arithmetic* on every arm: the smooth
+predictor has no vector kernel and its per-ISA arms only forwarded to the
+scalar one, which on x86_64 costs a `#[target_feature]` call that can never be
+inlined into the caller and on aarch64 costs nothing, because the wrapper adds
+no feature over the baseline. Those placeholder arms are gone.
+`av1_encode_stage_wht` (0.67x / 0.69x before, 0.67x / 0.70x after) is the one
+row where the vector form genuinely loses: a 4x4 WHT is fourteen SSE2-baseline
+adds and shifts per pass that LLVM already auto-vectorizes out of the scalar
+reference, and the kernel adds three `transpose4`s on top of them. It is
+dispatched to the scalar path on x86_64 and kept on `neon`.
+
+The lesson this leaves next to the aarch64 sub-parity discussion above is the
+mirror of it. There, a row below `1.00x` was noise walking towards parity as
+the host quietened. Here, a row an order of magnitude below `1.00x`, agreeing
+across rounds and disagreeing with the same kernel on another architecture, was
+a real defect - and one in code generation rather than in any kernel, which is
+why reading the kernels found nothing and reading the emitted assembly found it
+immediately.
 ## Hardware HEVC decoders
 
 `benches/hevc_hardware.rs` is its own `[[bench]]` target. It

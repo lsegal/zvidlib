@@ -423,6 +423,22 @@ pub(crate) fn iwht4x4(isa: SimdIsa, quant: &[i32; 16]) -> Option<[i32; 16]> {
 /// Vectorized [`crate::av1_encoder`] forward WHT, or `None` when the caller
 /// should use the scalar path.
 pub(crate) fn fwht4x4(isa: SimdIsa, residual: &[i32; 16]) -> Option<[i32; 16]> {
+    // x86_64 stays on the scalar reference. This is the one kernel the #336
+    // codegen repair did not lift over parity: `av1_encode_stage_wht` read
+    // 0.67x of scalar at 320x180 and 0.70x at 1080p on an AMD EPYC 7763 after
+    // the repair, the same figures the pre-repair table recorded, so its arms
+    // were never the ones the inlining defect was costing. The shape says why.
+    // A 4x4 WHT is fourteen adds, subtracts and shifts per pass and nothing
+    // else, all of them SSE2-baseline operations that LLVM already
+    // auto-vectorizes out of `av1_encoder::wht`; what the hand kernel adds on
+    // top is three `transpose4`s, twenty-four shuffle micro-operations that
+    // contend for one or two shuffle ports, against a scalar loop that has no
+    // shuffles at all. `neon` keeps the kernel and its 2.72x, because a wider
+    // shuffle issue is exactly what that host has.
+    #[cfg(target_arch = "x86_64")]
+    if matches!(isa, SimdIsa::Sse41 | SimdIsa::Avx2) {
+        return None;
+    }
     if !transforms::within_limit(residual, transforms::WHT_INPUT_LIMIT) {
         return None;
     }
