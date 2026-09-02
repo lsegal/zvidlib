@@ -186,6 +186,22 @@ pub fn set_active_isa(isa: Option<SimdIsa>) {
 // they inline are only valid once the feature is known present, which the
 // dispatchers below establish through `active_isa`.
 //
+// Every kernel a wrapper names is `#[inline(always)]`, and that is a
+// correctness-of-codegen requirement rather than a speed hint. A
+// `#[target_feature]` attribute applies to the function it is written on, not
+// to what that function calls, so a generic kernel body is only compiled with
+// the feature enabled when it is inlined *into* the wrapper. A copy the
+// inliner declined - which is what happened to the large kernels, the
+// deblocking pair and the transform drivers, once they outgrew its size
+// budget - is instead built at the target's baseline instruction set. There
+// the intrinsics cannot be lowered inline and each becomes an out-of-line call
+// through `core::core_arch` with its operand spilled to the stack, so the
+// "vector" kernel runs several times slower than the scalar reference it
+// replaces. On `aarch64` this is invisible, because NEON is in the baseline
+// and every intrinsic lowers inline either way; on `x86_64` it cost the AVX2
+// deblocking arms roughly eight times scalar and the SSE4.1 transforms four
+// times (issue #336).
+//
 // The 4- and 8-point transforms have no useful 256-bit shape (a whole 8x8
 // coefficient block is four AVX2 registers), so AVX2 hosts run them through the
 // SSE4.1 path and spend the wider registers on the pixel filters instead.
