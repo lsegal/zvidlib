@@ -1,0 +1,93 @@
+# Temporary, for issue #393 only. Removed before this branch merges.
+#
+# The committed x86_64 table in `benches/README.md` is drawn from the
+# elementwise minimum of several rounds that all landed on the *same* CPU
+# model, and `ubuntu-latest` is a pool of several models. The `Benchmarks` job
+# in `ci.yml` can be dispatched, but `ci.yml`'s concurrency group serialises
+# runs on one ref, so six dispatches of it would run one after another. This
+# workflow exists to run the six rounds at once as a matrix, so that three
+# sharing a model can be selected afterwards.
+name: Bench redraw (#393)
+
+on:
+  workflow_dispatch:
+  # Temporary. `workflow_dispatch` does not resolve for a workflow that has
+  # never run on the branch, and this workflow is not on `main`; the
+  # pull_request trigger registers it. Every job below is dispatch-only, so a
+  # pull_request run does no work.
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  round:
+    name: Round ${{ matrix.round }}
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        round: [1, 2, 3, 4, 5, 6]
+    # One round is five bench targets with `ZVIDLIB_BENCH_LARGE=1` on top of a
+    # fat-LTO build, which is slower than `ci.yml`'s 120 minutes allows for.
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: rustup show
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Install native audio dependencies
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      # The model is recorded before anything is timed as well as after, so a
+      # round that cannot be attributed to a named host is visible without
+      # downloading its artifact.
+      - name: Report the host
+        run: |
+          {
+            echo '## Round ${{ matrix.round }} host'
+            echo
+            echo '```'
+            echo "# host cpu model: $(grep -m1 '^model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//')"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      # The recipe `benches/README.md` documents: one round is one pass over
+      # each `bench_across_isas` target, and only those targets, because they
+      # are the only ones the committed table has rows for.
+      - name: Run the round
+        env:
+          ZVIDLIB_BENCH_LARGE: '1'
+        run: |
+          set -o pipefail
+          for target in codec av1_decode av1_encode hevc_decode hevc_encode; do
+            cargo bench --features native --bench "$target" 2>&1 | tee -a bench.log
+          done
+      - name: Report the host's instruction sets
+        run: |
+          {
+            echo
+            echo '```'
+            grep -hE '^# (host instruction sets|widest detected|dispatch site)' bench.log \
+              | sort -u || echo 'no instruction-set log found in the benchmark output'
+            echo '```'
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Collect this round's baseline
+        run: |
+          python3 .github/scripts/criterion_baseline.py collect \
+            --criterion-dir target/criterion \
+            --out baseline/baseline-${{ matrix.round }}.json \
+            --commit "$GITHUB_SHA" \
+            --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --host "$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | xargs) ($RUNNER_OS/$RUNNER_ARCH)"
+      - name: Upload this round
+        uses: actions/upload-artifact@v4
+        with:
+          name: redraw-393-round-${{ matrix.round }}
+          path: |
+            bench.log
+            baseline/baseline-${{ matrix.round }}.json
+          retention-days: 30
