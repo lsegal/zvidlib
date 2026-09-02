@@ -959,113 +959,171 @@ one, not a quieter one.
 
 Measured on a GitHub `ubuntu-latest` runner rather than on this project's
 development machine, because no aarch64 host can produce these columns at all.
-The `Benchmarks` job was dispatched on the pull request's branch with
-`workflow_dispatch` and `ZVIDLIB_BENCH_LARGE=1`, and the elementwise minimum was
-taken across three rounds, exactly as the recipe above describes. That is also
+The rounds ran with `ZVIDLIB_BENCH_LARGE=1` and the elementwise minimum was
+taken across three of them, exactly as the recipe above describes. That is also
 why this table carries the `_1080p` rows the Apple M1 one does not.
 
 GitHub's `ubuntu-latest` pool is not uniform, so the CPU model is checked before
-a round is used: rounds that landed on an Intel Xeon Platinum 8573C, an Intel
-Xeon Platinum 8370C and an AMD EPYC 7763 were measured and discarded, because an
-elementwise minimum taken across different CPU models is attributable to no
-named host and the whole point of naming one is that the numbers are not
-interchangeable. Every merged round logged `scalar`, `sse4.1` and `avx2` in its
-`# host instruction sets:` line.
+a round is used: an elementwise minimum taken across different CPU models is
+attributable to no named host, and the whole point of naming one is that the
+numbers are not interchangeable. Six rounds were dispatched at once so that
+three sharing a model could be selected afterwards; the rounds that landed on an
+Intel Xeon 6973P-C, an Intel Xeon Platinum 8573C and an AMD EPYC 9V74 80-Core
+were measured and discarded. Every merged round logged `scalar`, `sse4.1` and
+`avx2` in its `# host instruction sets:` line, and `# dispatch site av1_simd:
+avx2` in its per-site log.
 
-Measured on **AMD EPYC 9V74 80-Core (Linux, x86_64)**, at `e115506f8bf6`.
+This table replaces the one #261 recorded at `e115506f8bf6` on an AMD EPYC 9V74.
+That draw predates the codegen repair in #337 (issue #336), so every `av1_*` row
+in it timed `av1_simd` kernels whose `#[target_feature]` wrappers had degenerated
+into tail calls to baseline-instruction-set copies — each intrinsic an
+out-of-line `core_arch` call with its operand spilled to the stack. It recorded
+`av1_deblock_wide` at 0.13x under `avx2` and `av1_forward_flipadst_16x16` at
+0.20x. Those figures described the compiler's output, not the kernels, and the
+kernels they described no longer exist.
+
+Measured on **AMD EPYC 7763 64-Core Processor (Linux, x86_64)**, at
+`b284c38a6391` — the #337 merge `b233f0a74f88` plus the temporary six-round
+workflow that measured it, which touches no crate code.
 
 | Group | `scalar` | `sse4.1` | `avx2` | Best |
 | --- | ---: | ---: | ---: | ---: |
-| `av1_cdef` | 76.185 ms | 31.149 ms (2.45x) | 26.431 ms (2.88x) | 2.88x `avx2` |
-| `av1_deblock` | 18.120 ms | 21.568 ms (0.84x) | 76.339 ms (0.24x) | 0.84x `sse4.1` |
-| `av1_deblock_boundary` | 309.987 µs | 339.339 µs (0.91x) | 1.398 ms (0.22x) | 0.91x `sse4.1` |
-| `av1_deblock_chroma` | 13.184 ms | 16.785 ms (0.79x) | 65.048 ms (0.20x) | 0.79x `sse4.1` |
-| `av1_deblock_wide` | 76.739 ms | 124.537 ms (0.62x) | 579.916 ms (0.13x) | 0.62x `sse4.1` |
-| `av1_decode_frame` | 75.568 ms | 75.795 ms (1.00x) | 76.018 ms (0.99x) | 1.00x `sse4.1` |
-| `av1_encode_frame_q0` | 18.589 ms | 18.641 ms (1.00x) | 18.651 ms (1.00x) | 1.00x `sse4.1` |
-| `av1_encode_frame_q0_1080p` | 173.271 ms | 173.690 ms (1.00x) | 173.565 ms (1.00x) | 1.00x `avx2` |
-| `av1_encode_frame_q160` | 201.460 ms | 427.087 ms (0.47x) | 423.817 ms (0.48x) | 0.48x `avx2` |
-| `av1_encode_frame_q160_1080p` | 1.865 s | 3.952 s (0.47x) | 3.811 s (0.49x) | 0.49x `avx2` |
-| `av1_encode_frame_q32` | 215.320 ms | 413.500 ms (0.52x) | 443.480 ms (0.49x) | 0.52x `sse4.1` |
-| `av1_encode_frame_q32_1080p` | 1.961 s | 3.977 s (0.49x) | 4.067 s (0.48x) | 0.49x `sse4.1` |
-| `av1_encode_stage_bitstream` | 10.845 µs | 10.863 µs (1.00x) | 10.847 µs (1.00x) | 1.00x `avx2` |
-| `av1_encode_stage_bitstream_1080p` | 115.832 µs | 115.723 µs (1.00x) | 115.753 µs (1.00x) | 1.00x `sse4.1` |
-| `av1_encode_stage_symbol` | 525.527 µs | 525.131 µs (1.00x) | 525.208 µs (1.00x) | 1.00x `sse4.1` |
-| `av1_encode_stage_symbol_1080p` | 4.830 ms | 4.831 ms (1.00x) | 4.833 ms (1.00x) | 1.00x `sse4.1` |
-| `av1_encode_stage_tile` | 18.160 ms | 18.185 ms (1.00x) | 18.180 ms (1.00x) | 1.00x `avx2` |
-| `av1_encode_stage_tile_1080p` | 169.005 ms | 169.444 ms (1.00x) | 169.311 ms (1.00x) | 1.00x `avx2` |
-| `av1_encode_stage_wht` | 344.040 µs | 515.585 µs (0.67x) | 495.798 µs (0.69x) | 0.69x `avx2` |
-| `av1_encode_stage_wht_1080p` | 3.181 ms | 4.751 ms (0.67x) | 4.568 ms (0.70x) | 0.70x `avx2` |
-| `av1_entropy_symbol` | 2.889 ms | 2.890 ms (1.00x) | 2.889 ms (1.00x) | 1.00x `avx2` |
-| `av1_forward_adst_8x8` | 27.526 ms | 33.728 ms (0.82x) | 33.699 ms (0.82x) | 0.82x `avx2` |
-| `av1_forward_dct_16x16` | 32.891 ms | 133.774 ms (0.25x) | 128.395 ms (0.26x) | 0.26x `avx2` |
-| `av1_forward_dct_32x32` | 49.007 ms | 189.768 ms (0.26x) | 190.014 ms (0.26x) | 0.26x `sse4.1` |
-| `av1_forward_dct_4x4` | 36.620 ms | 20.392 ms (1.80x) | 20.700 ms (1.77x) | 1.80x `sse4.1` |
-| `av1_forward_dct_8x8` | 27.504 ms | 33.107 ms (0.83x) | 32.994 ms (0.83x) | 0.83x `avx2` |
-| `av1_forward_flipadst_16x16` | 31.484 ms | 160.449 ms (0.20x) | 136.955 ms (0.23x) | 0.23x `avx2` |
-| `av1_intra_directional` | 28.713 ms | 28.680 ms (1.00x) | 28.727 ms (1.00x) | 1.00x `sse4.1` |
-| `av1_intra_paeth` | 2.719 ms | 2.709 ms (1.00x) | 2.534 ms (1.07x) | 1.07x `avx2` |
-| `av1_intra_smooth` | 2.713 ms | 5.707 ms (0.48x) | 5.713 ms (0.47x) | 0.48x `sse4.1` |
-| `av1_inverse_adst_8x8` | 24.882 ms | 36.311 ms (0.69x) | 36.674 ms (0.68x) | 0.69x `sse4.1` |
-| `av1_inverse_dct_16x16` | 17.682 ms | 20.558 ms (0.86x) | 20.204 ms (0.88x) | 0.88x `avx2` |
-| `av1_inverse_dct_32x32` | 15.391 ms | 22.715 ms (0.68x) | 23.146 ms (0.66x) | 0.68x `sse4.1` |
-| `av1_inverse_dct_4x4` | 40.728 ms | 27.222 ms (1.50x) | 28.265 ms (1.44x) | 1.50x `sse4.1` |
-| `av1_inverse_dct_64x64` | 20.718 ms | 34.786 ms (0.60x) | 34.826 ms (0.59x) | 0.60x `sse4.1` |
-| `av1_inverse_dct_8x8` | 23.637 ms | 21.267 ms (1.11x) | 20.937 ms (1.13x) | 1.13x `avx2` |
-| `av1_inverse_flipadst_16x16` | 20.179 ms | 41.130 ms (0.49x) | 41.013 ms (0.49x) | 0.49x `avx2` |
-| `av1_mc_blend_mask` | 20.894 ms | 11.718 ms (1.78x) | 9.313 ms (2.24x) | 2.24x `avx2` |
-| `av1_mc_compound_average` | 20.898 ms | 12.633 ms (1.65x) | 9.649 ms (2.17x) | 2.17x `avx2` |
-| `av1_mc_single` | 10.594 ms | 5.551 ms (1.91x) | 4.095 ms (2.59x) | 2.59x `avx2` |
-| `av1_motion_compensation` | 10.726 ms | 5.642 ms (1.90x) | 4.368 ms (2.46x) | 2.46x `avx2` |
-| `av1_self_guided` | 9.145 ms | 2.941 ms (3.11x) | 2.560 ms (3.57x) | 3.57x `avx2` |
-| `av1_wiener` | 9.612 ms | 5.742 ms (1.67x) | 4.972 ms (1.93x) | 1.93x `avx2` |
-| `hevc_cabac` | 1.870 ms | 1.869 ms (1.00x) | 1.869 ms (1.00x) | 1.00x `avx2` |
-| `hevc_color_convert` | 11.310 ms | 11.324 ms (1.00x) | 11.327 ms (1.00x) | 1.00x `sse4.1` |
-| `hevc_deblock` | 12.039 ms | 11.525 ms (1.04x) | 11.522 ms (1.04x) | 1.04x `avx2` |
-| `hevc_decode` | 603.241 ms | 573.302 ms (1.05x) | 556.864 ms (1.08x) | 1.08x `avx2` |
-| `hevc_decode_to_picture` | 527.559 ms | 492.643 ms (1.07x) | 475.663 ms (1.11x) | 1.11x `avx2` |
-| `hevc_encode_1920x1088` | 1.002 s | 707.898 ms (1.41x) | 729.573 ms (1.37x) | 1.41x `sse4.1` |
-| `hevc_encode_1920x1088_fwd_transform_quant` | 120.170 ms | 78.394 ms (1.53x) | 74.754 ms (1.61x) | 1.61x `avx2` |
-| `hevc_encode_1920x1088_pcm_write` | 68.360 ms | 68.355 ms (1.00x) | 68.366 ms (1.00x) | 1.00x `sse4.1` |
-| `hevc_encode_1920x1088_rdo_inter` | 700.909 ms | 429.733 ms (1.63x) | 451.347 ms (1.55x) | 1.63x `sse4.1` |
-| `hevc_encode_1920x1088_rdo_intra` | 42.890 ms | 28.327 ms (1.51x) | 28.199 ms (1.52x) | 1.52x `avx2` |
-| `hevc_encode_1920x1088_reconstruct` | 114.789 ms | 114.324 ms (1.00x) | 114.405 ms (1.00x) | 1.00x `sse4.1` |
-| `hevc_encode_1920x1088_residual_write` | 800.762 ms | 614.578 ms (1.30x) | 580.694 ms (1.38x) | 1.38x `avx2` |
-| `hevc_encode_1920x1088_rgba_to_yuv420` | 4.727 ms | 1.052 ms (4.49x) | 783.851 µs (6.03x) | 6.03x `avx2` |
-| `hevc_encode_640x352` | 104.916 ms | 73.520 ms (1.43x) | 75.876 ms (1.38x) | 1.43x `sse4.1` |
-| `hevc_encode_640x352_fwd_transform_quant` | 12.810 ms | 8.236 ms (1.56x) | 8.024 ms (1.60x) | 1.60x `avx2` |
-| `hevc_encode_640x352_pcm_write` | 7.376 ms | 7.369 ms (1.00x) | 7.371 ms (1.00x) | 1.00x `sse4.1` |
-| `hevc_encode_640x352_rdo_inter` | 73.863 ms | 45.204 ms (1.63x) | 47.701 ms (1.55x) | 1.63x `sse4.1` |
-| `hevc_encode_640x352_rdo_intra` | 4.622 ms | 3.044 ms (1.52x) | 3.037 ms (1.52x) | 1.52x `avx2` |
-| `hevc_encode_640x352_reconstruct` | 12.216 ms | 12.158 ms (1.00x) | 12.131 ms (1.01x) | 1.01x `avx2` |
-| `hevc_encode_640x352_residual_write` | 87.058 ms | 66.159 ms (1.32x) | 61.894 ms (1.41x) | 1.41x `avx2` |
-| `hevc_encode_640x352_rgba_to_yuv420` | 513.135 µs | 113.036 µs (4.54x) | 85.231 µs (6.02x) | 6.02x `avx2` |
-| `hevc_encode_bitwriter` | 2.985 ms | 2.977 ms (1.00x) | 2.977 ms (1.00x) | 1.00x `avx2` |
-| `hevc_encode_cabac` | 1.193 ms | 1.205 ms (0.99x) | 1.205 ms (0.99x) | 0.99x `sse4.1` |
-| `hevc_inter_pred` | 28.411 ms | 18.280 ms (1.55x) | 16.895 ms (1.68x) | 1.68x `avx2` |
-| `hevc_intra_pred` | 6.965 ms | 7.003 ms (0.99x) | 6.711 ms (1.04x) | 1.04x `avx2` |
-| `hevc_inverse_transform` | 7.689 ms | 5.975 ms (1.29x) | 5.375 ms (1.43x) | 1.43x `avx2` |
-| `hevc_sao` | 27.920 ms | 16.729 ms (1.67x) | 16.182 ms (1.73x) | 1.73x `avx2` |
+| `av1_cdef` | 89.226 ms | 38.801 ms (2.30x) | 31.241 ms (2.86x) | 2.86x `avx2` |
+| `av1_deblock` | 21.506 ms | 3.974 ms (5.41x) | 3.424 ms (6.28x) | 6.28x `avx2` |
+| `av1_deblock_boundary` | 370.488 µs | 75.674 µs (4.90x) | 78.676 µs (4.71x) | 4.90x `sse4.1` |
+| `av1_deblock_chroma` | 16.036 ms | 6.091 ms (2.63x) | 6.336 ms (2.53x) | 2.63x `sse4.1` |
+| `av1_deblock_wide` | 104.338 ms | 36.634 ms (2.85x) | 31.647 ms (3.30x) | 3.30x `avx2` |
+| `av1_decode_frame` | 98.518 ms | 98.855 ms (1.00x) | 99.331 ms (0.99x) | 1.00x `sse4.1` |
+| `av1_encode_frame_q0` | 22.029 ms | 18.612 ms (1.18x) | 18.816 ms (1.17x) | 1.18x `sse4.1` |
+| `av1_encode_frame_q0_1080p` | 206.988 ms | 176.980 ms (1.17x) | 178.784 ms (1.16x) | 1.17x `sse4.1` |
+| `av1_encode_frame_q160` | 284.968 ms | 193.387 ms (1.47x) | 185.702 ms (1.53x) | 1.53x `avx2` |
+| `av1_encode_frame_q160_1080p` | 2.617 s | 1.780 s (1.47x) | 1.715 s (1.53x) | 1.53x `avx2` |
+| `av1_encode_frame_q32` | 316.545 ms | 217.592 ms (1.45x) | 212.056 ms (1.49x) | 1.49x `avx2` |
+| `av1_encode_frame_q32_1080p` | 2.902 s | 2.008 s (1.44x) | 1.942 s (1.49x) | 1.49x `avx2` |
+| `av1_encode_stage_bitstream` | 14.023 µs | 13.480 µs (1.04x) | 14.136 µs (0.99x) | 1.04x `sse4.1` |
+| `av1_encode_stage_bitstream_1080p` | 126.152 µs | 126.368 µs (1.00x) | 126.356 µs (1.00x) | 1.00x `avx2` |
+| `av1_encode_stage_coeff_ctx` | 4.305 ms | 1.415 ms (3.04x) | 1.725 ms (2.50x) | 3.04x `sse4.1` |
+| `av1_encode_stage_coeff_ctx_1080p` | 39.301 ms | 13.042 ms (3.01x) | 15.838 ms (2.48x) | 3.01x `sse4.1` |
+| `av1_encode_stage_symbol` | 874.188 µs | 878.248 µs (1.00x) | 880.264 µs (0.99x) | 1.00x `sse4.1` |
+| `av1_encode_stage_symbol_1080p` | 8.257 ms | 8.167 ms (1.01x) | 8.236 ms (1.00x) | 1.01x `sse4.1` |
+| `av1_encode_stage_tile` | 21.340 ms | 18.051 ms (1.18x) | 18.248 ms (1.17x) | 1.18x `sse4.1` |
+| `av1_encode_stage_tile_1080p` | 197.811 ms | 167.742 ms (1.18x) | 169.684 ms (1.17x) | 1.18x `sse4.1` |
+| `av1_encode_stage_wht` | 436.654 µs | 371.908 µs (1.17x) | 372.555 µs (1.17x) | 1.17x `sse4.1` |
+| `av1_encode_stage_wht_1080p` | 4.026 ms | 3.423 ms (1.18x) | 3.419 ms (1.18x) | 1.18x `avx2` |
+| `av1_entropy_symbol` | 3.767 ms | 3.767 ms (1.00x) | 3.766 ms (1.00x) | 1.00x `avx2` |
+| `av1_forward_adst_8x8` | 32.313 ms | 9.663 ms (3.34x) | 9.213 ms (3.51x) | 3.51x `avx2` |
+| `av1_forward_dct_16x16` | 41.498 ms | 13.372 ms (3.10x) | 12.227 ms (3.39x) | 3.39x `avx2` |
+| `av1_forward_dct_32x32` | 56.890 ms | 43.147 ms (1.32x) | 38.382 ms (1.48x) | 1.48x `avx2` |
+| `av1_forward_dct_4x4` | 42.591 ms | 7.670 ms (5.55x) | 7.774 ms (5.48x) | 5.55x `sse4.1` |
+| `av1_forward_dct_8x8` | 32.806 ms | 10.046 ms (3.27x) | 9.275 ms (3.54x) | 3.54x `avx2` |
+| `av1_forward_flipadst_16x16` | 38.322 ms | 13.948 ms (2.75x) | 12.354 ms (3.10x) | 3.10x `avx2` |
+| `av1_intra_directional` | 35.603 ms | 35.580 ms (1.00x) | 35.582 ms (1.00x) | 1.00x `sse4.1` |
+| `av1_intra_paeth` | 3.106 ms | 3.163 ms (0.98x) | 2.953 ms (1.05x) | 1.05x `avx2` |
+| `av1_intra_smooth` | 3.078 ms | 3.079 ms (1.00x) | 3.078 ms (1.00x) | 1.00x `avx2` |
+| `av1_inverse_adst_8x8` | 34.830 ms | 22.214 ms (1.57x) | 21.862 ms (1.59x) | 1.59x `avx2` |
+| `av1_inverse_dct_16x16` | 25.175 ms | 15.434 ms (1.63x) | 14.931 ms (1.69x) | 1.69x `avx2` |
+| `av1_inverse_dct_32x32` | 21.299 ms | 13.771 ms (1.55x) | 13.410 ms (1.59x) | 1.59x `avx2` |
+| `av1_inverse_dct_4x4` | 53.750 ms | 25.005 ms (2.15x) | 25.732 ms (2.09x) | 2.15x `sse4.1` |
+| `av1_inverse_dct_64x64` | 27.276 ms | 18.297 ms (1.49x) | 17.765 ms (1.54x) | 1.54x `avx2` |
+| `av1_inverse_dct_8x8` | 33.400 ms | 18.343 ms (1.82x) | 17.920 ms (1.86x) | 1.86x `avx2` |
+| `av1_inverse_flipadst_16x16` | 28.593 ms | 19.693 ms (1.45x) | 18.760 ms (1.52x) | 1.52x `avx2` |
+| `av1_mc_blend_mask` | 26.056 ms | 14.137 ms (1.84x) | 11.179 ms (2.33x) | 2.33x `avx2` |
+| `av1_mc_compound_average` | 26.135 ms | 15.448 ms (1.69x) | 11.533 ms (2.27x) | 2.27x `avx2` |
+| `av1_mc_single` | 13.372 ms | 6.742 ms (1.98x) | 5.044 ms (2.65x) | 2.65x `avx2` |
+| `av1_motion_compensation` | 13.154 ms | 6.845 ms (1.92x) | 5.324 ms (2.47x) | 2.47x `avx2` |
+| `av1_self_guided` | 10.743 ms | 3.859 ms (2.78x) | 3.077 ms (3.49x) | 3.49x `avx2` |
+| `av1_wiener` | 11.655 ms | 8.438 ms (1.38x) | 6.213 ms (1.88x) | 1.88x `avx2` |
+| `hevc_cabac` | 2.201 ms | 2.201 ms (1.00x) | 2.201 ms (1.00x) | 1.00x `avx2` |
+| `hevc_color_convert` | 11.827 ms | 3.124 ms (3.79x) | 2.483 ms (4.76x) | 4.76x `avx2` |
+| `hevc_deblock` | 14.063 ms | 13.462 ms (1.04x) | 13.451 ms (1.05x) | 1.05x `avx2` |
+| `hevc_decode` | 700.695 ms | 599.583 ms (1.17x) | 578.868 ms (1.21x) | 1.21x `avx2` |
+| `hevc_decode_to_picture` | 626.111 ms | 586.569 ms (1.07x) | 562.726 ms (1.11x) | 1.11x `avx2` |
+| `hevc_encode_1920x1088` | 978.101 ms | 621.336 ms (1.57x) | 646.477 ms (1.51x) | 1.57x `sse4.1` |
+| `hevc_encode_1920x1088_fwd_transform_quant` | 148.217 ms | 96.906 ms (1.53x) | 93.307 ms (1.59x) | 1.59x `avx2` |
+| `hevc_encode_1920x1088_pcm_write` | 6.511 ms | 6.510 ms (1.00x) | 6.518 ms (1.00x) | 1.00x `sse4.1` |
+| `hevc_encode_1920x1088_rdo_inter` | 851.069 ms | 520.861 ms (1.63x) | 547.481 ms (1.55x) | 1.63x `sse4.1` |
+| `hevc_encode_1920x1088_rdo_intra` | 51.430 ms | 34.466 ms (1.49x) | 34.307 ms (1.50x) | 1.50x `avx2` |
+| `hevc_encode_1920x1088_reconstruct` | 97.670 ms | 50.193 ms (1.95x) | 45.805 ms (2.13x) | 2.13x `avx2` |
+| `hevc_encode_1920x1088_reconstruct_quantized` | 223.384 ms | 119.493 ms (1.87x) | 111.925 ms (2.00x) | 2.00x `avx2` |
+| `hevc_encode_1920x1088_residual_write` | 2.332 s | 1.805 s (1.29x) | 1.687 s (1.38x) | 1.38x `avx2` |
+| `hevc_encode_1920x1088_rgba_to_yuv420` | 5.822 ms | 1.172 ms (4.97x) | 928.249 µs (6.27x) | 6.27x `avx2` |
+| `hevc_encode_640x352` | 101.668 ms | 64.354 ms (1.58x) | 67.101 ms (1.52x) | 1.58x `sse4.1` |
+| `hevc_encode_640x352_fwd_transform_quant` | 15.923 ms | 10.409 ms (1.53x) | 9.841 ms (1.62x) | 1.62x `avx2` |
+| `hevc_encode_640x352_pcm_write` | 726.265 µs | 727.603 µs (1.00x) | 726.733 µs (1.00x) | 1.00x `avx2` |
+| `hevc_encode_640x352_rdo_inter` | 89.626 ms | 54.769 ms (1.64x) | 57.659 ms (1.55x) | 1.64x `sse4.1` |
+| `hevc_encode_640x352_rdo_intra` | 5.518 ms | 3.707 ms (1.49x) | 3.700 ms (1.49x) | 1.49x `avx2` |
+| `hevc_encode_640x352_reconstruct` | 10.120 ms | 5.109 ms (1.98x) | 4.748 ms (2.13x) | 2.13x `avx2` |
+| `hevc_encode_640x352_reconstruct_quantized` | 23.300 ms | 12.547 ms (1.86x) | 11.732 ms (1.99x) | 1.99x `avx2` |
+| `hevc_encode_640x352_residual_write` | 248.489 ms | 193.174 ms (1.29x) | 181.059 ms (1.37x) | 1.37x `avx2` |
+| `hevc_encode_640x352_rgba_to_yuv420` | 645.519 µs | 135.292 µs (4.77x) | 106.489 µs (6.06x) | 6.06x `avx2` |
+| `hevc_encode_bitwriter` | 703.320 µs | 703.788 µs (1.00x) | 703.451 µs (1.00x) | 1.00x `avx2` |
+| `hevc_encode_cabac` | 1.683 ms | 1.694 ms (0.99x) | 1.686 ms (1.00x) | 1.00x `avx2` |
+| `hevc_encode_cabac_bypass` | 2.053 ms | 2.052 ms (1.00x) | 2.054 ms (1.00x) | 1.00x `sse4.1` |
+| `hevc_inter_pred` | 29.145 ms | 21.996 ms (1.32x) | 19.735 ms (1.48x) | 1.48x `avx2` |
+| `hevc_intra_pred` | 8.304 ms | 8.296 ms (1.00x) | 7.887 ms (1.05x) | 1.05x `avx2` |
+| `hevc_inverse_transform` | 9.291 ms | 7.079 ms (1.31x) | 6.396 ms (1.45x) | 1.45x `avx2` |
+| `hevc_sao` | 32.116 ms | 19.431 ms (1.65x) | 18.325 ms (1.75x) | 1.75x `avx2` |
 
-#### Reading the sub-parity rows
+#### Reading the rows
 
-The aarch64 discussion above is about rows a *noisy host* pushed just under
-`1.00x`, and it does not explain this table. These rounds ran on a dedicated
-runner and agreed with each other, and several rows here are not near parity in
-either direction: `av1_deblock_wide` is 0.13x under `avx2`,
-`av1_forward_flipadst_16x16` is 0.20x, and `av1_forward_dct_{16x16,32x32}` are
-0.25x. A kernel four to eight times slower than the scalar reference it is meant
-to replace is a defect in the kernel, not measurement noise, and the AV1 encoder
-whole-frame groups pay for it: `av1_encode_frame_q32` is 0.52x on x86_64 while
-the same group is 1.62x on the Apple M1.
+Not one row's `Best` arm is below parity. The lowest cells anywhere in the table
+are 0.98x and 0.99x, and four of the five belong to groups whose arms are the
+same code: `av1_decode_frame`, `av1_encode_stage_bitstream`,
+`av1_encode_stage_symbol` and `hevc_encode_cabac` have no vector kernel, so
+their columns differ only by measurement noise, exactly as the aarch64
+discussion above describes. The same holds for `av1_entropy_symbol`,
+`av1_intra_directional`, `hevc_cabac`, `hevc_encode_bitwriter`,
+`hevc_encode_cabac_bypass` and both `pcm_write` rows, which land on `1.00x` from
+the same cause. The fifth is `av1_intra_paeth`'s `sse4.1` arm at 0.98x, which
+does have a kernel; its `avx2` arm reads 1.05x on the same row, and the aarch64
+table records the same group walking from 0.78x to 0.98x across three draws with
+no code change, so this is the near-parity band that discussion is about rather
+than a kernel to act on.
 
-Recording that is what this table is for; fixing it is out of scope here and is
-tracked separately. The rows that do behave are the ones with real vector work
-and no per-call setup cost dominating it — `hevc_encode_*_rgba_to_yuv420` at
-6.03x, `av1_self_guided` at 3.57x, `av1_cdef` at 2.88x, and the motion
-compensation family between 2.2x and 2.6x.
+Two rows read at parity for a reason worth stating rather than as noise:
 
-`#228` re-checks specific x86_64 kernel ratios against this recorded set.
+- `av1_intra_smooth` is `1.00x` under both vector arms because #337 removed the
+  placeholder `smooth_row_{sse41,avx2}` arms. The §7.11.2.6 smooth predictor has
+  no vector kernel; those arms only forwarded to `smooth_row_scalar`, and on
+  x86_64 a `#[target_feature]` wrapper cannot be inlined into a row loop that
+  does not carry the feature, so the forwarding cost a call the aarch64 build
+  never paid. That is what the old table's 0.48x was. All three arms now call
+  the reference directly, and the row is flat until a real kernel earns the arms
+  back.
+- `av1_encode_stage_wht` at 1.17x is not a vector win either. #337 routes
+  `av1_simd::fwht4x4` to `None` on x86_64 (see #342), because the 4x4 WHT is
+  fourteen SSE2-baseline adds, subtracts and shifts that LLVM already
+  auto-vectorizes out of `av1_encoder::wht`, against three `transpose4`s of
+  shuffle micro-operations the hand kernel adds on top. So all three arms
+  execute the same scalar transform, and the ratio is only the input-limit scan
+  that the x86_64 early return skips before the fallback — a few percent of a
+  very small kernel, not a kernel difference. `neon` keeps the kernel and its
+  2.72x, where the shuffle issue width is what makes it win.
+
+The rows with real vector work are now the ones with the largest ratios, which
+is what the old table could not show. `hevc_encode_*_rgba_to_yuv420` leads at
+6.27x and 6.06x, followed by `av1_deblock` at 6.28x, `av1_forward_dct_4x4` at
+5.55x, `av1_deblock_boundary` at 4.90x and `hevc_color_convert` at 4.76x — that
+last one read `1.00x` in the previous table, and is the one move here this
+re-take does not attribute: the #337 repair did not touch
+`hevc::color_convert`, so something between #261's draw and this one changed
+what that group measures, and `#361` finds out what. The AV1 forward transforms
+sit between 3.1x and 3.5x, `av1_self_guided` at 3.49x and `av1_cdef` at 2.86x,
+and the motion-compensation family between 2.3x and 2.7x.
+
+The whole-frame encoder groups are the practical consequence.
+`av1_encode_frame_q32` reads 1.49x and `av1_encode_frame_q160` 1.53x here,
+against 0.52x and 0.48x in the table this one replaces: an x86_64 user of the
+AV1 encoder stops paying roughly twice over for having a vector path and starts
+getting about 1.5x back for it. The `_1080p` variants agree to two decimal
+places, so the ratio is a property of the kernels rather than of the frame size.
+
+`sse4.1` beats `avx2` on a minority of rows, and by enough on two of them to be
+more than noise: `av1_encode_stage_coeff_ctx` is 3.04x under `sse4.1` against
+2.50x under `avx2`, and the `rdo_inter` pair is 1.63x/1.64x against 1.55x. The
+`Best` column already records `sse4.1` for these, but the dispatch site prefers
+`avx2` when the host has it, so a real encode takes the slower arm. Why the
+wider kernel is slower is not answered by this table; `#362` answers it.
 
 ## Hardware HEVC decoders
 
