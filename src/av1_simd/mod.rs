@@ -390,6 +390,41 @@ macro_rules! dispatch {
 // Safe dispatchers used by the AV1 transform and filter modules
 // ---------------------------------------------------------------------
 
+/// The instruction set [`coeff_contexts`] runs a `size x size` block under,
+/// which is `isa` itself everywhere except the one case below.
+///
+/// x86_64 blocks narrower than AVX2's eight lanes run the SSE4.1 kernel even on
+/// an AVX2 host, the way [`fwht4x4`] keeps x86_64 on its scalar reference for
+/// #337 / #342. The kernel steps along a *row* of the block, so a row shorter
+/// than the vector cannot be split across more than one iteration however wide
+/// the vector is: a 4x4 block is one iteration per row under SSE4.1 *and* under
+/// AVX2, four of AVX2's eight lanes idle in every one of them. Identical work
+/// at twice the width is at best a tie, and it is not even that here, because
+/// the tail store is the one thing the widths do not share. `store_masked`
+/// forwards a full vector straight to the store instruction and stages a
+/// partial one through a stack buffer; `count` is `min(size, LANES)`, so at
+/// `size == 4` SSE4.1's four lanes are exactly full and take the native store
+/// while AVX2 is partial and pays a 32-byte spill plus a 16-byte copy on
+/// *every* store, twice a row, for `base_out` and `br_out` alike. That is the
+/// 3.04x-against-2.50x of #362, and `av1_encode_stage_coeff_ctx` reproduces it
+/// so cleanly because [`crate::av1_encoder::bench::coeff_context_plane`]
+/// derives contexts for 4x4 blocks and nothing else.
+///
+/// From `size == 8` up the two arms stop being the same work: AVX2 halves the
+/// iterations per row and its stores are full vectors, so the wider kernel is
+/// kept for every size the encoder's `choose_tx_size` can also pick.
+#[cfg_attr(not(target_arch = "x86_64"), allow(unused_variables))]
+fn coeff_ctx_isa(isa: SimdIsa, size: usize) -> SimdIsa {
+    #[cfg(target_arch = "x86_64")]
+    if isa == SimdIsa::Avx2 && size < 8 && std::is_x86_feature_detected!("sse4.1") {
+        // AVX2 implies SSE4.1 on every CPU that has ever shipped, but the probe
+        // is a cached load next to a whole block's context derivation, so the
+        // redirect is checked rather than assumed.
+        return SimdIsa::Sse41;
+    }
+    isa
+}
+
 /// Vectorized §8.3.2 `coeff_base` / `coeff_br` context derivation for one
 /// `size x size` transform block, reading the padded level plane
 /// [`coeff::fill_padded_levels`] wrote.
@@ -407,7 +442,7 @@ pub(crate) fn coeff_contexts(
     debug_assert_eq!(base_out.len(), size * size);
     debug_assert_eq!(br_out.len(), size * size);
     dispatch!(
-        isa,
+        coeff_ctx_isa(isa, size),
         [coeff_ctx_sse41, coeff_ctx_avx2, coeff_ctx_neon](plane, size, base_out, br_out),
         return false
     );
