@@ -166,6 +166,36 @@ impl<'a> RefPlane<'a> {
         &scratch[..len]
     }
 
+    /// The [`RefPlane::row_window`] window of row `y`, narrowed into
+    /// `dst` for the 16-bit interpolation path.
+    ///
+    /// `scratch` is the same edge-extension staging buffer
+    /// [`RefPlane::row_window`] takes; `dst` must be at least `len` long.
+    #[inline]
+    fn row_window_narrow(
+        &self,
+        x_start: i32,
+        len: usize,
+        y: i32,
+        scratch: &mut [i32],
+        dst: &mut [i16],
+    ) {
+        let src = self.row_window(x_start, len, y, scratch);
+        narrow_samples(&src[..len], &mut dst[..len]);
+    }
+
+    /// [`RefPlane::gather`] narrowed to `i16` for the 16-bit
+    /// interpolation path.
+    fn gather_narrow(&self, x0: i32, y0: i32, w: usize, h: usize) -> Vec<i16> {
+        let mut scratch = vec![0i32; w];
+        let mut buf = vec![0i16; w * h];
+        for (r, row) in buf.chunks_exact_mut(w).enumerate() {
+            self.copy_row(x0, y0 + r as i32, &mut scratch);
+            narrow_samples(&scratch, row);
+        }
+        buf
+    }
+
     /// Gathers the edge-extended `w` x `h` region whose top-left
     /// full-sample location is `( x0, y0 )`, row-major.
     fn gather(&self, x0: i32, y0: i32, w: usize, h: usize) -> Vec<i32> {
@@ -174,6 +204,35 @@ impl<'a> RefPlane<'a> {
             self.copy_row(x0, y0 + r as i32, row);
         }
         buf
+    }
+}
+
+/// The largest tap magnitude the `i16` accumulator of
+/// [`simd::filter_taps_narrow`] stays in range for, given the
+/// §8.5.3.3.3.2 and §8.5.3.3.3.3 coefficient sets.
+///
+/// The widest kernel is `[ −1, 4, −11, 40, 40, −11, 4, −1 ]`, whose
+/// positive coefficients sum to 88; a partial sum taken in tap order is
+/// a subset sum, so `88 · 255 = 22440` bounds it and `−24 · 255 = −6120`
+/// bounds it below. Both sit inside `i16`, and neither does at nine bits
+/// (`88 · 511 = 44968`).
+const NARROW_MAX_SAMPLE: u8 = 255;
+
+/// Copies eight-bit plane samples into a 16-bit buffer for
+/// [`simd::filter_taps_narrow`].
+///
+/// The `i16` accumulator that kernel uses is only in range for samples
+/// the caller has already established are eight-bit, which is why
+/// [`interp_block`] takes the narrow path only at `bit_depth == 8`; the
+/// `debug_assert` is what holds a caller to that.
+#[inline]
+fn narrow_samples(src: &[i32], dst: &mut [i16]) {
+    for (d, &s) in dst.iter_mut().zip(src.iter()) {
+        debug_assert!(
+            (0..=i32::from(NARROW_MAX_SAMPLE)).contains(&s),
+            "sample {s} is outside the eight-bit range the narrow interpolation path requires"
+        );
+        *d = s as i16;
     }
 }
 
@@ -439,6 +498,12 @@ fn interp_block<const N: usize>(
     let shift1 = interp_shift1(bit_depth);
     let halo = N as i32 / 2 - 1;
     let span = w + N - 1;
+    // The 16-bit accumulation is only in range for eight-bit samples:
+    // `shift1` is zero there, so the tap accumulation is bounded by
+    // [`NARROW_MAX_SAMPLE`] times the coefficient sums. At nine bits and
+    // above the pre-shift accumulator overflows `i16`, so those depths
+    // keep the `i32` kernel.
+    let narrow = bit_depth == 8;
     let mut out = vec![0i32; w * h];
     match (hk, vk) {
         // Full-pel (Table 8-8 / 8-9 phase 0, 0): A << shift3.
@@ -455,6 +520,22 @@ fn interp_block<const N: usize>(
         // Horizontal-only (a/b/c, aX): one source window per output row.
         (Some(hk), None) => {
             let mut scratch = vec![0i32; span];
+            if narrow {
+                let hk16: [i16; N] = std::array::from_fn(|t| hk[t] as i16);
+                let mut win = vec![0i16; span];
+                for y in 0..h {
+                    plane.row_window_narrow(
+                        x_int - halo,
+                        span,
+                        y_int + y as i32,
+                        &mut scratch,
+                        &mut win,
+                    );
+                    let taps: [&[i16]; N] = std::array::from_fn(|t| &win[t..t + w]);
+                    simd::filter_taps_narrow(isa, &taps, &hk16, shift1, &mut out[y * w..(y + 1) * w]);
+                }
+                return out;
+            }
             for y in 0..h {
                 let src = plane.row_window(x_int - halo, span, y_int + y as i32, &mut scratch);
                 let taps: [&[i32]; N] = std::array::from_fn(|t| &src[t..t + w]);
@@ -465,6 +546,16 @@ fn interp_block<const N: usize>(
         // once, then accumulate down the columns — the tap slices are
         // consecutive rows, so the loads stay contiguous.
         (None, Some(vk)) => {
+            if narrow {
+                let vk16: [i16; N] = std::array::from_fn(|t| vk[t] as i16);
+                let src = plane.gather_narrow(x_int, y_int - halo, w, h + N - 1);
+                for y in 0..h {
+                    let taps: [&[i16]; N] =
+                        std::array::from_fn(|t| &src[(y + t) * w..(y + t + 1) * w]);
+                    simd::filter_taps_narrow(isa, &taps, &vk16, shift1, &mut out[y * w..(y + 1) * w]);
+                }
+                return out;
+            }
             let src = plane.gather(x_int, y_int - halo, w, h + N - 1);
             for y in 0..h {
                 let taps: [&[i32]; N] = std::array::from_fn(|t| &src[(y + t) * w..(y + t + 1) * w]);
@@ -486,17 +577,53 @@ fn interp_block<const N: usize>(
             let rows = h + N - 1;
             let mut horizontal = vec![0i32; w * rows];
             let mut scratch = vec![0i32; span];
-            for row in 0..rows {
-                let src =
-                    plane.row_window(x_int - halo, span, y_int - halo + row as i32, &mut scratch);
-                let taps: [&[i32]; N] = std::array::from_fn(|t| &src[t..t + w]);
-                simd::filter_taps(
-                    isa,
-                    &taps,
-                    hk,
-                    shift1,
-                    &mut horizontal[row * w..(row + 1) * w],
-                );
+            if narrow {
+                // Only the horizontal pass narrows. Its own output is
+                // `i16`-ranged, but the vertical pass multiplies it by a
+                // coefficient of up to 58 and needs an `i32`
+                // accumulator, which on every vector unit here is the
+                // same four (NEON / SSE4.1) or eight (AVX2) lanes per
+                // multiply the `i32` kernel already issues — see
+                // `measure_narrow_filter_taps`, where the widening
+                // formulation reads 1.00x at long rows. So the
+                // intermediate stays `i32` and the vertical pass stays
+                // on [`simd::filter_taps`] unchanged.
+                let hk16: [i16; N] = std::array::from_fn(|t| hk[t] as i16);
+                let mut win = vec![0i16; span];
+                for row in 0..rows {
+                    plane.row_window_narrow(
+                        x_int - halo,
+                        span,
+                        y_int - halo + row as i32,
+                        &mut scratch,
+                        &mut win,
+                    );
+                    let taps: [&[i16]; N] = std::array::from_fn(|t| &win[t..t + w]);
+                    simd::filter_taps_narrow(
+                        isa,
+                        &taps,
+                        &hk16,
+                        shift1,
+                        &mut horizontal[row * w..(row + 1) * w],
+                    );
+                }
+            } else {
+                for row in 0..rows {
+                    let src = plane.row_window(
+                        x_int - halo,
+                        span,
+                        y_int - halo + row as i32,
+                        &mut scratch,
+                    );
+                    let taps: [&[i32]; N] = std::array::from_fn(|t| &src[t..t + w]);
+                    simd::filter_taps(
+                        isa,
+                        &taps,
+                        hk,
+                        shift1,
+                        &mut horizontal[row * w..(row + 1) * w],
+                    );
+                }
             }
             for y in 0..h {
                 let taps: [&[i32]; N] =

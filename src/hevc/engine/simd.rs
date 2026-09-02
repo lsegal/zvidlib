@@ -905,6 +905,186 @@ unsafe fn filter_taps_neon<const N: usize>(
     }
 }
 
+/// `out[i] = ( Σ coeffs[t] · taps[t][i] ) >> shift` for every `i` in
+/// `out`, accumulated at 16-bit width from 16-bit taps and widened to
+/// `i32` on store.
+///
+/// The narrow counterpart of [`filter_taps`]. It exists because the
+/// separable interpolation filters are multiply-throughput-bound, and
+/// every vector unit here multiplies twice as many `i16` lanes per
+/// instruction as `i32` lanes: `vmlaq_n_s16` covers eight samples where
+/// `vmlaq_s32` covers four, and `_mm256_mullo_epi16` sixteen where
+/// `_mm256_mullo_epi32` covers eight.
+///
+/// # Range
+///
+/// The accumulator is `i16`, so the caller owes the kernel a guarantee
+/// that no partial sum leaves `−32768..=32767`. A partial sum of
+/// `Σ coeffs[t] · taps[t][i]` taken in tap order is a subset sum, so it
+/// is bounded by the all-negative and all-positive subsets: with taps in
+/// `0..=255` and the §8.5.3.3.3.2 kernels, whose positive coefficients
+/// sum to at most 88 and negative to at most −24, the widest reachable
+/// interval is `−6120..=22440`. See [`super::inter_pred`], which is why
+/// the narrow path is taken only for eight-bit content. Out-of-range
+/// taps wrap rather than trap; `debug_assert` catches them where the
+/// caller narrows.
+#[inline]
+pub fn filter_taps_narrow<const N: usize>(
+    isa: Isa,
+    taps: &[&[i16]; N],
+    coeffs: &[i16; N],
+    shift: i32,
+    out: &mut [i32],
+) {
+    debug_assert!((0..16).contains(&shift));
+    debug_assert!(taps.iter().all(|t| t.len() >= out.len()));
+    if !supported(isa) {
+        return filter_taps_narrow_scalar(taps, coeffs, shift, out, 0);
+    }
+    match isa {
+        Isa::Scalar => filter_taps_narrow_scalar(taps, coeffs, shift, out, 0),
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: `supported` confirmed SSE4.1 above, and the tap slices
+        // are at least `out.len()` long so every load stays in bounds.
+        Isa::Sse41 => unsafe { filter_taps_narrow_sse41(taps, coeffs, shift, out) },
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: `supported` confirmed AVX2 above; same bounds argument.
+        Isa::Avx2 => unsafe { filter_taps_narrow_avx2(taps, coeffs, shift, out) },
+        #[cfg(target_arch = "aarch64")]
+        // SAFETY: NEON is mandatory on AArch64; same bounds argument.
+        Isa::Neon => unsafe { filter_taps_narrow_neon(taps, coeffs, shift, out) },
+    }
+}
+
+/// The scalar body of [`filter_taps_narrow`], also its vector kernels'
+/// `out.len() % lanes` tail. Accumulates in `i32`: inside the documented
+/// range the two widths agree exactly, and outside it this is the
+/// definition the `i16` kernels are held against.
+#[inline]
+fn filter_taps_narrow_scalar<const N: usize>(
+    taps: &[&[i16]; N],
+    coeffs: &[i16; N],
+    shift: i32,
+    out: &mut [i32],
+    from: usize,
+) {
+    for i in from..out.len() {
+        let mut acc = 0i32;
+        for (&c, tap) in coeffs.iter().zip(taps.iter()) {
+            acc += i32::from(c) * i32::from(tap[i]);
+        }
+        out[i] = acc >> shift;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.1")]
+unsafe fn filter_taps_narrow_sse41<const N: usize>(
+    taps: &[&[i16]; N],
+    coeffs: &[i16; N],
+    shift: i32,
+    out: &mut [i32],
+) {
+    unsafe {
+        let count = out.len();
+        let sh = _mm_cvtsi32_si128(shift);
+        let mut i = 0usize;
+        while i + 8 <= count {
+            let mut acc = _mm_setzero_si128();
+            for (&c, tap) in coeffs.iter().zip(taps.iter()) {
+                let v = _mm_loadu_si128(tap.as_ptr().add(i).cast());
+                acc = _mm_add_epi16(acc, _mm_mullo_epi16(v, _mm_set1_epi16(c)));
+            }
+            let acc = _mm_sra_epi16(acc, sh);
+            let dst = out.as_mut_ptr().add(i);
+            _mm_storeu_si128(dst.cast(), _mm_cvtepi16_epi32(acc));
+            _mm_storeu_si128(
+                dst.add(4).cast(),
+                _mm_cvtepi16_epi32(_mm_srli_si128(acc, 8)),
+            );
+            i += 8;
+        }
+        filter_taps_narrow_scalar(taps, coeffs, shift, out, i);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn filter_taps_narrow_avx2<const N: usize>(
+    taps: &[&[i16]; N],
+    coeffs: &[i16; N],
+    shift: i32,
+    out: &mut [i32],
+) {
+    unsafe {
+        let count = out.len();
+        let sh = _mm_cvtsi32_si128(shift);
+        let mut i = 0usize;
+        while i + 16 <= count {
+            let mut acc = _mm256_setzero_si256();
+            for (&c, tap) in coeffs.iter().zip(taps.iter()) {
+                let v = _mm256_loadu_si256(tap.as_ptr().add(i).cast());
+                acc = _mm256_add_epi16(acc, _mm256_mullo_epi16(v, _mm256_set1_epi16(c)));
+            }
+            let acc = _mm256_sra_epi16(acc, sh);
+            let dst = out.as_mut_ptr().add(i);
+            _mm256_storeu_si256(
+                dst.cast(),
+                _mm256_cvtepi16_epi32(_mm256_castsi256_si128(acc)),
+            );
+            _mm256_storeu_si256(
+                dst.add(8).cast(),
+                _mm256_cvtepi16_epi32(_mm256_extracti128_si256(acc, 1)),
+            );
+            i += 16;
+        }
+        while i + 8 <= count {
+            let mut acc = _mm_setzero_si128();
+            for (&c, tap) in coeffs.iter().zip(taps.iter()) {
+                let v = _mm_loadu_si128(tap.as_ptr().add(i).cast());
+                acc = _mm_add_epi16(acc, _mm_mullo_epi16(v, _mm_set1_epi16(c)));
+            }
+            let acc = _mm_sra_epi16(acc, sh);
+            let dst = out.as_mut_ptr().add(i);
+            _mm_storeu_si128(dst.cast(), _mm_cvtepi16_epi32(acc));
+            _mm_storeu_si128(
+                dst.add(4).cast(),
+                _mm_cvtepi16_epi32(_mm_srli_si128(acc, 8)),
+            );
+            i += 8;
+        }
+        filter_taps_narrow_scalar(taps, coeffs, shift, out, i);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn filter_taps_narrow_neon<const N: usize>(
+    taps: &[&[i16]; N],
+    coeffs: &[i16; N],
+    shift: i32,
+    out: &mut [i32],
+) {
+    unsafe {
+        let count = out.len();
+        // A negative `vshlq_s16` amount is an arithmetic right shift.
+        let sh = vdupq_n_s16(-(shift as i16));
+        let mut i = 0usize;
+        while i + 8 <= count {
+            let mut acc = vdupq_n_s16(0);
+            for (&c, tap) in coeffs.iter().zip(taps.iter()) {
+                acc = vmlaq_n_s16(acc, vld1q_s16(tap.as_ptr().add(i)), c);
+            }
+            let acc = vshlq_s16(acc, sh);
+            let dst = out.as_mut_ptr().add(i);
+            vst1q_s32(dst, vmovl_s16(vget_low_s16(acc)));
+            vst1q_s32(dst.add(4), vmovl_high_s16(acc));
+            i += 8;
+        }
+        filter_taps_narrow_scalar(taps, coeffs, shift, out, i);
+    }
+}
+
 /// The scalar remainder of a vector kernel, for the `out.len() % lanes`
 /// samples the vector loops could not cover.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
