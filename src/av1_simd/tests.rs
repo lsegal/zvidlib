@@ -1289,3 +1289,29 @@ fn vectorized_round_trip_reproduces_the_residual() {
         }
     }
 }
+
+/// #362: the coefficient-context site must not hand a 4x4 block to the AVX2
+/// kernel. A row shorter than eight lanes is one iteration under either width,
+/// so the wide arm does the same work with half its lanes idle and pays a
+/// staged partial store on top - measured at 2.50x of scalar against SSE4.1's
+/// 3.04x. Blocks from 8 wide up keep AVX2, where it genuinely halves the
+/// iterations per row. Nothing on a non-x86_64 host is redirected at all.
+#[test]
+fn the_coefficient_context_site_keeps_narrow_blocks_off_avx2() {
+    let narrow = [1usize, 2, 3, 4, 5, 6, 7];
+    let wide = [8usize, 9, 16, 32, 64];
+    for isa in available_isas() {
+        for size in narrow.into_iter().chain(wide) {
+            let routed = coeff_ctx_isa(isa, size);
+            let redirected = cfg!(target_arch = "x86_64") && isa == SimdIsa::Avx2 && size < 8;
+            let want = if redirected { SimdIsa::Sse41 } else { isa };
+            assert_eq!(
+                routed,
+                want,
+                "{} at size {size} routed to {}",
+                isa.name(),
+                routed.name()
+            );
+        }
+    }
+}
