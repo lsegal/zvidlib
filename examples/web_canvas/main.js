@@ -312,14 +312,11 @@ async function main() {
   fastForwardButton.addEventListener("click", () => seekByMilliseconds(5000));
   previousFrameButton.addEventListener("click", () => stepFrame(-1));
   nextFrameButton.addEventListener("click", () => stepFrame(1));
+  // The range input's `input` event fires on a click and throughout a drag, and only then.
+  // Scrubbing on a bare `mousemove` as well meant merely crossing the bar queued a seek per
+  // pointer sample, each one re-running the decoder (issue #319). Superseded positions are still
+  // dropped by `requestSeek`, so a fast drag decodes the newest one rather than all of them.
   timeline.addEventListener("input", () => requestSeek(Number(timeline.value)));
-  // The issue asks for a bar that scrubs as the pointer moves across it, so hovering seeks
-  // whether or not a button is held; playback (audio included) keeps running while it does.
-  timeline.addEventListener("mousemove", (event) => {
-    const rect = timeline.getBoundingClientRect();
-    const fraction = Math.min(Math.max((event.clientX - rect.left) / rect.width, 0), 1);
-    requestSeek(Math.round(fraction * lastFrameIndex));
-  });
 
   if (decodedFrame) {
     uploadFrame(decodedFrame.pixels, decodedFrame.width, decodedFrame.height);
