@@ -265,11 +265,10 @@ pub(crate) enum GainRatio {
 /// how they *are* chosen is a grid search: `measure_type_gain_memory_against_trust` sweeps the
 /// pair against the two assertions they have to satisfy together, and at the shipped sampling
 /// interval `(memory 1, trust 8)` - correct a non-probing trial by the freshest measurement at
-/// that size and believe half of it - is one of four cells of the 66 that hold both the 0.05 dB
-/// distortion bound and the per-frame ceilings, and the only one of those four that is also a
-/// plateau in the window rather than in the shrinkage alone. Its neighbours fail: `(1, 6)` misses
-/// the distortion bound at `qindex` 1 by 0.109 dB and `(1, 10)` missed `smooth`'s ceiling by 0.63
-/// points at the ceilings fitted before the interval moved.
+/// that size and believe half of it - is the *only* cell of that 66-cell grid holding both the
+/// 0.05 dB distortion bound and the per-frame ceilings at once. Its neighbours fail on one side
+/// or the other: `(1, 6)` misses the distortion bound at `qindex` 1 by 0.109 dB, and `(1, 10)`,
+/// `(2, 14)` and `(2, 16)` clear the distortion bound but overshoot a per-frame ceiling.
 ///
 /// That fragility is a statement about the shortcuts rather than about these constants. With the
 /// rate model corrected, the DCT-only trial ranking's own error at `qindex` 1 is about 0.2 dB and

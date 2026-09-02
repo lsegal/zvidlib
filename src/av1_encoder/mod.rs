@@ -1770,6 +1770,191 @@ mod nonlossless_tests {
         }
     }
 
+    /// Sweeps the recency window the per-size gain ratio is accumulated over.
+    ///
+    /// Prints, per frame and quantizer, the sampled estimator's `sse + lambda * bits` at each
+    /// window against the same estimator probing every size search, which is what
+    /// `TYPE_GAIN_MEMORY` is chosen from. `usize::MAX` is the frame-wide accumulation.
+    #[test]
+    #[ignore = "measurement sweep, not an assertion"]
+    fn measure_type_gain_memory_windows() {
+        for (width, height) in [(128_usize, 96_usize), (192, 160)] {
+            measure_type_gain_memory_windows_at(width, height);
+        }
+    }
+
+    fn measure_type_gain_memory_windows_at(width: usize, height: usize) {
+        let mut frames = content_frames(width as u32, height as u32);
+        frames.push(("test_pattern", test_pattern(width as u32, height as u32)));
+        let sse = |report: &tile::SearchReport, pixels: &[u8]| -> i64 {
+            (0..height)
+                .flat_map(|row| {
+                    report.reconstruction[row * report.coded_width..][..width]
+                        .iter()
+                        .enumerate()
+                        .map(move |(column, &value)| (row * width + column, value))
+                })
+                .map(|(index, value)| {
+                    let error = i64::from(i32::from(pixels[index]) - i32::from(value));
+                    error * error
+                })
+                .sum()
+        };
+        println!("size,{width}x{height}");
+        println!("frame,qindex,memory,penalty_percent,bytes,candidates");
+        for (name, pixels) in &frames {
+            for qindex in [1_u8, 8, 32, 80, 160, 200] {
+                let ac = i64::from(crate::av1_intra::get_ac_quant(qindex));
+                let lambda = (ac * ac / 256).max(1);
+                let cost = |interval: usize, memory: usize| {
+                    let report = tile::FrameEncoder::new(pixels, width, height, qindex)
+                        .with_type_gain_interval(interval)
+                        .with_type_gain_memory(memory)
+                        .encode_with_report();
+                    (
+                        sse(&report, pixels) + lambda * report.tile.len() as i64 * 8,
+                        report.tile.len(),
+                        report.candidates_evaluated,
+                    )
+                };
+                let (unsampled, _, _) = cost(1, usize::MAX);
+                for memory in [1_usize, 2, 3, 4, 6, 8, 12, 16, 24, 32, 64, usize::MAX] {
+                    let (sampled, bytes, candidates) =
+                        cost(tile::TYPE_GAIN_SAMPLE_INTERVAL, memory);
+                    let penalty = sampled as f64 / unsampled as f64 * 100.0 - 100.0;
+                    println!("{name},{qindex},{memory},{penalty:+.2},{bytes},{candidates}");
+                }
+            }
+        }
+    }
+
+    /// What the recency weighting costs in encode time.
+    ///
+    /// The correction exists to be cheap, so this is the check that ageing the accumulator did
+    /// not make it expensive. Interleaved rounds with the minimum taken per arm: a single pass
+    /// would attribute this host's own load to whichever arm happened to run under it.
+    #[test]
+    #[ignore = "measurement sweep, not an assertion"]
+    fn measure_type_gain_memory_cost() {
+        use std::time::Instant;
+        let (width, height) = (192_usize, 160_usize);
+        let mut frames = content_frames(width as u32, height as u32);
+        frames.push(("test_pattern", test_pattern(width as u32, height as u32)));
+        let windows = [1_usize, 2, 4, 8, 32, usize::MAX];
+        let mut best = std::collections::BTreeMap::new();
+        let mut candidates = std::collections::BTreeMap::new();
+        for _ in 0..5 {
+            for memory in windows {
+                let start = Instant::now();
+                let mut total = 0_u64;
+                for (_, pixels) in &frames {
+                    for qindex in [1_u8, 8, 32, 80, 160, 200] {
+                        let report = tile::FrameEncoder::new(pixels, width, height, qindex)
+                            .with_type_gain_memory(memory)
+                            .encode_with_report();
+                        total += report.candidates_evaluated;
+                    }
+                }
+                let elapsed = start.elapsed().as_secs_f64();
+                let slot = best.entry(memory).or_insert(f64::MAX);
+                *slot = slot.min(elapsed);
+                candidates.insert(memory, total);
+            }
+        }
+        println!("memory,seconds,candidates");
+        for memory in windows {
+            println!("{memory},{:.4},{}", best[&memory], candidates[&memory]);
+        }
+    }
+
+    /// Sweeps the recency window against the shrinkage, which is how the pair was chosen.
+    ///
+    /// [`tile::TYPE_GAIN_MEMORY`] and [`tile::TYPE_GAIN_TRUST`] stopped being separable once
+    /// #299 corrected the rate model: `measure_type_gain_memory_windows` and
+    /// `measure_type_gain_trust` each read flat on the tuning set, so neither sweep on its own
+    /// picks a value any more. What still discriminates is the pair of assertions the two have
+    /// to satisfy together, so this measures both at once over the whole grid: the worst margin
+    /// against `the_search_shortcuts_stay_within_their_rate_and_distortion_bound`'s 0.05 dB on
+    /// `test_pattern` at 96x80, and the worst overshoot of
+    /// `the_type_gain_sampling_interval_holds_on_content_it_was_not_tuned_on`'s per-frame
+    /// ceilings on the tuning set. A cell ships only if `worst_bound_delta >= -0.05` and
+    /// `worst_ceiling_overshoot <= 0`, and `(1, 8)` is the only one of the 66 that is.
+    ///
+    /// This is deliberately a grid search and is documented as one on the constants themselves.
+    /// It is here so the claim is reproducible rather than asserted, and so the next change to
+    /// the rate model can re-run it instead of inheriting a pair of numbers with no measurement
+    /// behind them.
+    #[test]
+    #[ignore = "measurement sweep, not an assertion"]
+    fn measure_type_gain_memory_against_trust() {
+        let (bw, bh) = (96_usize, 80_usize);
+        let bpix = test_pattern(bw as u32, bh as u32);
+        let quality = |report: &tile::SearchReport| {
+            let reconstruction: Vec<u8> = (0..bh)
+                .flat_map(|row| report.reconstruction[row * report.coded_width..][..bw].to_vec())
+                .collect();
+            psnr(&bpix, &reconstruction)
+        };
+        let mut exhaustive = std::collections::BTreeMap::new();
+        for qindex in DETERMINISM_QINDEXES {
+            let report = tile::FrameEncoder::new(&bpix, bw, bh, qindex)
+                .without_search_shortcuts()
+                .encode_with_report();
+            exhaustive.insert(qindex, quality(&report));
+        }
+        println!("memory,trust,worst_bound_delta,worst_ceiling_frame,worst_ceiling_overshoot");
+        for memory in [1_usize, 2, 3, 4, 8, usize::MAX] {
+            for trust in [0_i64, 1, 2, 3, 4, 6, 8, 10, 12, 14, 16] {
+                let mut worst_delta = f64::INFINITY;
+                for qindex in DETERMINISM_QINDEXES {
+                    let fast = tile::FrameEncoder::new(&bpix, bw, bh, qindex)
+                        .with_type_gain_memory(memory)
+                        .with_type_gain_trust(trust)
+                        .encode_with_report();
+                    worst_delta = worst_delta.min(quality(&fast) - exhaustive[&qindex]);
+                }
+                let mut worst_overshoot = f64::NEG_INFINITY;
+                let mut worst_name = String::new();
+                for (width, height) in [(128_usize, 96_usize), (192, 160)] {
+                    let mut frames = content_frames(width as u32, height as u32);
+                    frames.push(("test_pattern", test_pattern(width as u32, height as u32)));
+                    for (name, pixels) in &frames {
+                        for qindex in [1_u8, 8, 32, 80, 160, 200] {
+                            let ac = i64::from(crate::av1_intra::get_ac_quant(qindex));
+                            let lambda = (ac * ac / 256).max(1);
+                            let cost = |interval: usize| {
+                                let report = tile::FrameEncoder::new(pixels, width, height, qindex)
+                                    .with_type_gain_interval(interval)
+                                    .with_type_gain_memory(memory)
+                                    .with_type_gain_trust(trust)
+                                    .encode_with_report();
+                                sse_against(&report, pixels, width, height)
+                                    + lambda * report.tile.len() as i64 * 8
+                            };
+                            let penalty = cost(tile::TYPE_GAIN_SAMPLE_INTERVAL) as f64
+                                / cost(1) as f64
+                                * 100.0
+                                - 100.0;
+                            // The ceilings `the_type_gain_sampling_interval_holds_on_content_it_
+                            // was_not_tuned_on` asserts, as an overshoot so the worst is a max.
+                            let ceiling = if *name == "scene_edge" { 2.5 } else { 1.0 };
+                            if penalty - ceiling > worst_overshoot {
+                                worst_overshoot = penalty - ceiling;
+                                worst_name = format!("{name}@{width}x{height}");
+                            }
+                        }
+                    }
+                }
+                let window = if memory == usize::MAX {
+                    "frame".to_string()
+                } else {
+                    memory.to_string()
+                };
+                println!("{window},{trust},{worst_delta:+.3},{worst_name},{worst_overshoot:+.2}");
+            }
+        }
+    }
+
     /// The per-frame rate-distortion penalties the sampled transform-gain estimator measures at
     /// the shipped [`tile::TYPE_GAIN_SAMPLE_INTERVAL`], pinned at the values they were measured
     /// at.
@@ -2012,6 +2197,52 @@ mod nonlossless_tests {
                 "a sampling interval of {interval} reconstructs within {worst:+.3} dB of the                  exhaustive search at its worst quantizer ({worst_qindex}), inside the {BOUND} dB                  the shortcuts are allowed - so the distortion bound no longer holds the shipped                  interval of {} from above and something else has to",
                 tile::TYPE_GAIN_SAMPLE_INTERVAL
             );
+        }
+    }
+
+    /// What each of the four shortcut bounds actually measures, at every quantizer and on more
+    /// than the one frame the bounds are asserted on.
+    ///
+    /// `the_search_shortcuts_stay_within_their_rate_and_distortion_bound` asserts a single
+    /// number per quantizer on 96x80 `test_pattern`; this prints the whole surface so a bound is
+    /// re-derived from a measurement rather than from whichever quantizer happened to fail.
+    #[test]
+    #[ignore = "measurement sweep, not an assertion"]
+    fn measure_search_shortcut_bounds() {
+        for (width, height) in [(96_usize, 80_usize), (128, 96), (192, 160)] {
+            let mut frames = content_frames(width as u32, height as u32);
+            frames.push(("test_pattern", test_pattern(width as u32, height as u32)));
+            println!(
+                "frame,width,height,qindex,fast_psnr,exh_psnr,d_psnr,fast_bytes,exh_bytes,rate_growth,fast_candidates,exh_candidates,reduction"
+            );
+            for (name, pixels) in &frames {
+                for qindex in [1_u8, 8, 32, 80, 160, 200] {
+                    let fast =
+                        tile::FrameEncoder::new(pixels, width, height, qindex).encode_with_report();
+                    let exhaustive = tile::FrameEncoder::new(pixels, width, height, qindex)
+                        .without_search_shortcuts()
+                        .encode_with_report();
+                    let quality = |report: &tile::SearchReport| {
+                        let reconstruction: Vec<u8> = (0..height)
+                            .flat_map(|row| {
+                                report.reconstruction[row * report.coded_width..][..width].to_vec()
+                            })
+                            .collect();
+                        psnr(pixels, &reconstruction)
+                    };
+                    let (fast_psnr, exh_psnr) = (quality(&fast), quality(&exhaustive));
+                    println!(
+                        "{name},{width},{height},{qindex},{fast_psnr:.4},{exh_psnr:.4},{:+.4},{},{},{:+.4},{},{},{:.2}",
+                        fast_psnr - exh_psnr,
+                        fast.tile.len(),
+                        exhaustive.tile.len(),
+                        fast.tile.len() as f64 / exhaustive.tile.len() as f64 - 1.0,
+                        fast.candidates_evaluated,
+                        exhaustive.candidates_evaluated,
+                        exhaustive.candidates_evaluated as f64 / fast.candidates_evaluated as f64,
+                    );
+                }
+            }
         }
     }
 
