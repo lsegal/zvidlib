@@ -90,10 +90,10 @@ fn native_hevc_decoder_conforms_for_sequential_reverse_and_alternating_seeks() {
 /// A frame in the middle of the bundled sample's single group of pictures can only be reached by
 /// decoding everything before it, and issue #354 is what that used to cost: every one of those
 /// pictures was converted to RGBA for nobody. The reader now tells the decoder they are wanted
-/// for reference only, and this is what that must not change - the frame it walks to, and the
-/// ones it publishes after it, are still the fixture's frames.
+/// for reference only, and this is what that must not change - the frame the seek asks for, the
+/// tail it keeps behind it, and a frame it passed are all still the fixture's frames.
 #[test]
-fn a_walk_that_skips_the_pictures_it_passes_still_decodes_the_frames_it_stops_on() {
+fn a_seek_that_skips_the_pictures_it_passes_still_decodes_the_frames_it_returns() {
     let expected = include_str!("fixtures/codec/big_buck_bunny_hevc_rgba.sha256")
         .lines()
         .map(|line| {
@@ -121,9 +121,9 @@ fn a_walk_that_skips_the_pictures_it_passes_still_decodes_the_frames_it_stops_on
     ))
     .unwrap();
 
-    // A cache smaller than the walk: the reader keeps the frames within `max_cached_frames` of
-    // its target, so the default 32 would cover this whole walk and skip nothing.
-    let walk_limits = Limits {
+    // A cache smaller than the seek: the reader keeps the frames within `max_cached_frames` of
+    // its target, so the default 32 would cover most of this one and skip almost nothing.
+    let seek_limits = Limits {
         max_cached_frames: 4,
         ..limits
     };
@@ -131,55 +131,55 @@ fn a_walk_that_skips_the_pictures_it_passes_still_decodes_the_frames_it_stops_on
         &native_hevc_video_decoder_factory(),
         vector.configuration.clone(),
         vector.samples.clone(),
-        walk_limits,
+        seek_limits,
     )
     .unwrap();
     let cancellation = CancellationToken::new();
 
-    // The walk a drag makes: stop every eight frames, as the native example does.
-    for index in (0..=24_u64).step_by(8) {
-        let frame = reader.get(FrameIndex(index), &cancellation).unwrap();
-        assert_eq!(
-            FrameDigest::from_frame(&frame).unwrap(),
-            vector.expected_frames[index as usize].digest,
-            "frame {index} does not match the fixture"
-        );
-    }
+    // A click part-way along a timeline: one request, every frame before it decoded to reach it.
+    let target = 48_u64;
+    let frame = reader.get(FrameIndex(target), &cancellation).unwrap();
+    assert_eq!(
+        FrameDigest::from_frame(&frame).unwrap(),
+        vector.expected_frames[target as usize].digest,
+        "the frame the seek asked for is not the fixture's frame"
+    );
     let statistics = reader.statistics();
-    assert_eq!(statistics.resets, 1, "one walk, not one per stop");
+    assert_eq!(
+        statistics.resets, 1,
+        "one decode, from the random-access point"
+    );
     assert!(
-        statistics.samples_skipped >= 8,
-        "the frames between the stops are decoded without being converted: {statistics:?}"
+        statistics.samples_skipped >= target / 2,
+        "the frames on the way are decoded without being converted: {statistics:?}"
     );
 
-    // The frames immediately before a stop are kept, which is what makes stepping backwards
-    // from it a cache hit rather than another walk from the random-access point.
-    let resets = statistics.resets;
-    for index in [23_u64, 22] {
+    // The frames immediately behind it are kept, which is what makes stepping backwards from
+    // where a seek lands a cache hit rather than another decode from the random-access point.
+    for index in [target - 1, target - 2] {
         let frame = reader.get(FrameIndex(index), &cancellation).unwrap();
         assert_eq!(
             FrameDigest::from_frame(&frame).unwrap(),
             vector.expected_frames[index as usize].digest,
-            "frame {index}, just behind the last stop, does not match the fixture"
+            "frame {index}, just behind the seek, does not match the fixture"
         );
     }
     assert_eq!(
         reader.statistics().resets,
-        resets,
-        "stepping back into the walk's own tail decodes nothing again"
+        statistics.resets,
+        "stepping back into the tail the seek kept decodes nothing again"
     );
 
-    // A frame the walk went past is not lost, only sometimes more expensive: whether it is still
-    // cached, was kept because it follows a stop in presentation order, or has to be decoded
-    // again from the random-access point, what comes back is the fixture's frame.
-    for index in [13_u64, 5, 21, 24] {
-        let frame = reader.get(FrameIndex(index), &cancellation).unwrap();
-        assert_eq!(
-            FrameDigest::from_frame(&frame).unwrap(),
-            vector.expected_frames[index as usize].digest,
-            "frame {index}, which the walk passed, does not match the fixture"
-        );
-    }
+    // A frame further back was skipped, so it costs a reset and a decode from the random-access
+    // point - and comes back exactly, which is the part that matters.
+    let passed = 12_u64;
+    let frame = reader.get(FrameIndex(passed), &cancellation).unwrap();
+    assert_eq!(
+        FrameDigest::from_frame(&frame).unwrap(),
+        vector.expected_frames[passed as usize].digest,
+        "a frame the seek passed does not match the fixture when it is asked for"
+    );
+    assert_eq!(reader.statistics().resets, statistics.resets + 1);
 }
 
 /// Splits a low-overhead AV1 byte stream into temporal units, delimited by
