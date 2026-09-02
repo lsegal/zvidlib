@@ -2053,6 +2053,149 @@ mod nonlossless_tests {
         }
     }
 
+    /// The candidate cost of a context-consistent size trial across the tuning set, so the
+    /// answer #356 records is a property of the trial rather than of the 96x80 `test_pattern`
+    /// the ranking comparison is run on.
+    ///
+    /// `consistent_ratio` is the exhaustive search's candidate count over the context-consistent
+    /// trial's, against the `4x`
+    /// `the_search_shortcuts_stay_within_their_rate_and_distortion_bound` requires, and
+    /// `shipped_ratio` is the same for the shipped estimator.
+    #[test]
+    #[ignore = "measurement sweep, not an assertion"]
+    fn measure_context_consistent_trial_cost() {
+        let (width, height) = (128_usize, 96_usize);
+        let mut frames = content_frames(width as u32, height as u32);
+        frames.push(("test_pattern", test_pattern(width as u32, height as u32)));
+        println!("frame,qindex,exhaustive,shipped,consistent,shipped_ratio,consistent_ratio");
+        for (name, pixels) in &frames {
+            for qindex in DETERMINISM_QINDEXES {
+                let exhaustive = tile::FrameEncoder::new(pixels, width, height, qindex)
+                    .without_search_shortcuts()
+                    .encode_with_report()
+                    .candidates_evaluated;
+                let shipped = tile::FrameEncoder::new(pixels, width, height, qindex)
+                    .encode_with_report()
+                    .candidates_evaluated;
+                let consistent = tile::FrameEncoder::new(pixels, width, height, qindex)
+                    .with_context_consistent_trials()
+                    .encode_with_report()
+                    .candidates_evaluated;
+                println!(
+                    "{name},{qindex},{exhaustive},{shipped},{consistent},{:.2},{:.2}",
+                    exhaustive as f64 / shipped as f64,
+                    exhaustive as f64 / consistent as f64
+                );
+            }
+        }
+    }
+
+    /// A transform-size trial that codes each block with the type the emitting pass would pick
+    /// reproduces the exhaustive search's size decisions exactly, and costs what the exhaustive
+    /// search costs.
+    ///
+    /// This is the answer to #356, asserted rather than left in a sweep, and it settles two
+    /// things at once.
+    ///
+    /// **The counterfactual is the whole of the residual error.** The shipped trial ranks a size
+    /// on the set's `DCT_DCT` and probes a sample of its blocks purely to measure - the block
+    /// keeps DCT's result, so the trial's cost and coefficient contexts are a DCT-only trial's,
+    /// which is not what the emitting pass goes on to produce. Remove that and nothing else -
+    /// every block of every size candidate runs the full type set and *keeps* the winner, with no
+    /// correction applied on top - and the size ranking becomes the exhaustive search's, on every
+    /// coding block, at every quantizer here, to identical bytes and 0.000 dB. Not a better
+    /// ranking: the same one. That is why #349 found no shape of credit that moved a single size
+    /// decision, and why [`tile::TYPE_GAIN_TRUST`] is documented as a bias rather than a
+    /// shrinkage - it damps a measurement of the wrong quantity, and the right one is not cheaper
+    /// to estimate than to compute.
+    ///
+    /// **It cannot ship.** A context-consistent trial is the exhaustive type search, run once per
+    /// size candidate instead of once per emitted block, so it buys a candidate reduction of only
+    /// 1.69x-1.93x where `the_search_shortcuts_stay_within_their_rate_and_distortion_bound`
+    /// requires 4x - between 2.2x and 2.9x more transform-type candidates than the shipped
+    /// estimator. The bound is asserted here in the failing direction on purpose: if some later
+    /// change ever makes a context-consistent trial fit inside `4x`, this test fails and says so,
+    /// which is the outcome worth being told about.
+    ///
+    /// The shipped estimator's disagreement at `base_q_idx` 1 is asserted too, so the comparison
+    /// is not vacuous - a frame where every arm already agreed would pass the first half of this
+    /// test without measuring anything.
+    #[test]
+    fn a_context_consistent_size_trial_ranks_like_the_exhaustive_search_and_costs_like_it() {
+        let (width, height) = (96_usize, 80_usize);
+        let pixels = test_pattern(width as u32, height as u32);
+        let quality = |report: &tile::SearchReport| {
+            let reconstruction: Vec<u8> = (0..height)
+                .flat_map(|row| report.reconstruction[row * report.coded_width..][..width].to_vec())
+                .collect();
+            psnr(&pixels, &reconstruction)
+        };
+        for qindex in DETERMINISM_QINDEXES {
+            let exhaustive = tile::FrameEncoder::new(&pixels, width, height, qindex)
+                .without_search_shortcuts()
+                .encode_with_report();
+            let decisions: std::collections::BTreeMap<_, _> = exhaustive
+                .size_choices
+                .iter()
+                .map(|&(r, c, bw, chosen)| ((r, c, bw), chosen))
+                .collect();
+            let agreeing = |report: &tile::SearchReport| {
+                report
+                    .size_choices
+                    .iter()
+                    .filter(|&&(r, c, bw, chosen)| decisions.get(&(r, c, bw)) == Some(&chosen))
+                    .count()
+            };
+            let consistent = tile::FrameEncoder::new(&pixels, width, height, qindex)
+                .with_context_consistent_trials()
+                .encode_with_report();
+            assert_eq!(
+                agreeing(&consistent),
+                consistent.size_choices.len(),
+                "qindex {qindex}: a context-consistent trial agreed with the exhaustive search on                  {} of its {} size decisions, so removing the counterfactual is no longer the                  whole of the ranking error",
+                agreeing(&consistent),
+                consistent.size_choices.len()
+            );
+            assert_eq!(
+                consistent.tile,
+                exhaustive.tile,
+                "qindex {qindex}: a context-consistent trial emitted {} bytes against the                  exhaustive search's {}",
+                consistent.tile.len(),
+                exhaustive.tile.len()
+            );
+            assert!(
+                (quality(&consistent) - quality(&exhaustive)).abs() < 0.001,
+                "qindex {qindex}: a context-consistent trial reconstructed at {:.3} dB against                  the exhaustive search's {:.3} dB",
+                quality(&consistent),
+                quality(&exhaustive)
+            );
+            // The reason it does not ship, in the direction that reports the good news as a
+            // failure: this is the 4x reduction the shortcut bound requires, and a
+            // context-consistent trial is well under it.
+            assert!(
+                consistent.candidates_evaluated * 4 >= exhaustive.candidates_evaluated,
+                "qindex {qindex}: a context-consistent trial evaluated {} transform-type                  candidates against the exhaustive search's {}, which is inside the 4x reduction                  `the_search_shortcuts_stay_within_their_rate_and_distortion_bound` requires - if                  that is genuinely so, it can replace the DCT-only ranking and the transform-gain                  correction with it",
+                consistent.candidates_evaluated,
+                exhaustive.candidates_evaluated
+            );
+            let shipped =
+                tile::FrameEncoder::new(&pixels, width, height, qindex).encode_with_report();
+            assert!(
+                shipped.candidates_evaluated < consistent.candidates_evaluated,
+                "qindex {qindex}: the shipped estimator evaluated {} candidates against a                  context-consistent trial's {}, so the trial costs nothing and should be shipped",
+                shipped.candidates_evaluated,
+                consistent.candidates_evaluated
+            );
+            if qindex == 1 {
+                assert!(
+                    agreeing(&shipped) < shipped.size_choices.len(),
+                    "qindex 1: the shipped estimator already agrees with the exhaustive search on                      every one of its {} size decisions, so this frame no longer separates the                      two rankings and the comparison above measures nothing",
+                    shipped.size_choices.len()
+                );
+            }
+        }
+    }
+
     /// The per-frame rate-distortion penalties the sampled transform-gain estimator measures at
     /// the shipped [`tile::TYPE_GAIN_SAMPLE_INTERVAL`], pinned at the values they were measured
     /// at.

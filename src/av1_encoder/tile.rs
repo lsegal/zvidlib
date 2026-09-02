@@ -276,6 +276,33 @@ pub(crate) enum GainRatio {
 /// decisions fall. Re-deriving the calibration on content that genuinely separates it is tracked
 /// separately rather than papered over here, and no bound, ceiling or test was relaxed to reach
 /// this pair.
+///
+/// # This is a bias, not an estimator's shrinkage
+///
+/// A shrinkage presumes there is a quantity being estimated and that the estimate is noisy. That
+/// is not the situation here, and #356 measured why. What a probe measures is the type set's gain
+/// against a DCT-only trial's reconstruction and coefficient contexts, and the emitting pass
+/// produces neither: it writes the type its own search picks and reconstructs from it. A size
+/// trial's cost is therefore a counterfactual the encoder never emits, and every ranking built on
+/// it - corrected or not - inherits that, which is why #349 found no shape of credit that moved a
+/// single size decision.
+///
+/// `a_context_consistent_size_trial_ranks_like_the_exhaustive_search_and_costs_like_it` shows the
+/// counterfactual is the whole of the residual: a trial that codes each of its blocks with the
+/// type the emitting pass would pick, and keeps it, reproduces the exhaustive search's size
+/// decisions *exactly* at every quantizer measured, byte for byte and to 0.000 dB - not three
+/// decisions better, but all of them. It also costs a candidate reduction of only 1.69x-1.93x
+/// against the exhaustive search, where `the_search_shortcuts_stay_within_their_rate_and_
+/// distortion_bound` requires 4x, so it cannot ship at any setting of anything here.
+///
+/// So this constant is not shrinking a noisy measurement of the right quantity towards its mean.
+/// It is damping a measurement of the *wrong* quantity - one taken in contexts the frame will not
+/// have - because damping it happens to cost less than believing it. That makes it a bias term,
+/// permanently and by construction rather than until a better estimator arrives, and the grid
+/// search above is the honest way to pick a bias: sweep it against the assertions it has to hold
+/// and take the cell that holds them. Read `8` as "believe half of a measurement known to be of
+/// the wrong thing", and re-derive it by re-running that grid whenever the rate model, the
+/// quantizer or the type set moves - not by reasoning about how noisy a probe is.
 pub(super) const TYPE_GAIN_TRUST: i64 = 8;
 
 /// [`TYPE_GAIN_TRUST`] denominator: the un-shrunk correction.
