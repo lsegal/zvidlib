@@ -791,8 +791,15 @@ fn rd_score(gain: i64, bins: u64, band_bins: u64, lambda: SaoLambda) -> i64 {
 pub(super) const SAO_LAMBDA_BAND: u64 = 4;
 
 /// What band offset's own syntax is charged per bin, as a multiple of
-/// `lambda_q8`, numerator over denominator — see [`SaoLambda::band_q8`] for
-/// what the multiple is and what the sweep says about it.
+/// `lambda_q8`, numerator over denominator.
+///
+/// 5/2 is 2.47x rounded to the precision one sweep supports: the merge a band
+/// component forfeits, measured over the QP 12-51 sweep on both test pictures
+/// at both sizes as 2517 coded bins spent against 1018 band-syntax bins
+/// charged. See [`SaoLambda::band_q8`] for the derivation and
+/// `the_band_syntax_charge_is_the_merge_a_band_component_forfeits` for the
+/// measurement. The sweep is byte-identical at 247/100 and at 5/2, so the
+/// rounding is not a decision.
 const BAND_SYNTAX_CHARGE_NUM: u32 = 5;
 const BAND_SYNTAX_CHARGE_DEN: u32 = 2;
 
@@ -844,25 +851,78 @@ pub(crate) struct SaoLambda {
     /// QP 32 slice lands the same 2079 bytes the same 0.003 dB under its own
     /// curve, byte for byte and millibel for millibel, on the repaired rule
     /// and on the one before it alike. The charge is therefore not standing
-    /// in for anything the slice-level rule was getting wrong, and it stays
-    /// at 2.5x rather than moving to the 1.5x that also holds — a constant
-    /// sitting on the exact boundary where the invariant is next measured to
-    /// break is fitted to that boundary, not derived, and doubling the QPs
-    /// that carry band components from 13 to 27 is not worth buying at that
-    /// price.
+    /// in for anything the slice-level rule was getting wrong, and #344
+    /// concluded that what closes the gap has to be a price on the search.
     ///
-    /// What it is standing in for is the acceptance rule's own resolution.
-    /// The rule is monotone in the grid — `keeps_sao` states why, and #287's
-    /// non-monotone reading is a property of restating a concave threshold as
-    /// a per-bit multiplier rather than of the decision — but monotone is not precise, and at
-    /// these operating points it decides on margins of a few parts in a
-    /// thousand. `SAO_ACCEPTANCE_RESOLUTION_NUM` is how far it can actually
-    /// see: the two-point extrapolation the rule rests on is measured wrong
-    /// by tens of percent of the distortion it predicts, 0.13 dB at this very
-    /// picture and QP, which is forty times the 0.003 dB the invariant fails
-    /// by here. The invariant is measuring something the acceptance rule
-    /// cannot resolve, so what closes that gap has to be a charge on the
-    /// search rather than a tolerance on the rule, and this constant is it.
+    /// # What the search misprices is §7.3.8.3's merge
+    ///
+    /// It is not a bit the band component codes; it is a structure its
+    /// neighbours stop being able to elide. `code_sao` writes one
+    /// `sao_merge_left_flag` or `sao_merge_up_flag` in place of a whole
+    /// `sao( )` structure whenever a CTB's three components are exactly its
+    /// left or above neighbour's. The per-CTB search never sees that: it
+    /// scores every candidate against the structure it would code standalone,
+    /// so a CTB that was about to cost one flag and a CTB that was about to
+    /// cost twenty bins look the same to it.
+    ///
+    /// The blindness is not symmetric between the two types, which is what
+    /// puts the whole of it on band offset. An edge component picks one of
+    /// four classes and lets §7.4.9.3 infer its four signs, so two
+    /// neighbouring CTBs of one kind of content resolve to identical
+    /// parameters routinely — 29 of the 48 CTBs of the noise picture at
+    /// 128x96 and QP 12 merge. A band component picks one of 32 positions and
+    /// four signed offsets per component, so two neighbours essentially never
+    /// do: pricing band offset at the closed form on that same picture takes
+    /// the band components from 2 to 10 and the merges from 29 to 22. Seven
+    /// whole structures were coded where seven flags had been, and not one
+    /// bin of that is a bin the band components code.
+    ///
+    /// # The charge is that merge, measured
+    ///
+    /// [`coding_bins`] is the search's own rate model made exact — the flags
+    /// `code_sao` codes for a cell, and the structure it codes only when
+    /// neither merge fires — and
+    /// `the_coded_rate_model_agrees_with_what_the_writer_spends` holds it
+    /// against the bits the writer actually spends, worst 9.5% over six
+    /// operating points, the residual being the merge and type-idx bins that
+    /// are context-coded and cost less than a bin each. Summed over a grid by
+    /// [`grid_bins`], it says what band offset costs a whole picture:
+    ///
+    /// ```text
+    /// charge = ( bins with band offset available
+    ///            - bins with band offset priced out at SAO_LAMBDA_BAND )
+    ///          / band-syntax bins the band components code
+    /// ```
+    ///
+    /// The numerator is every bin band offset costs, forfeited merges
+    /// included; the denominator is the part of it the search can see. Over
+    /// the QP 12-51 sweep on both test pictures at both sizes that is 2517
+    /// bins against 1018, or **2.47x** — which is the fitted 2.5x, derived.
+    /// The constant does not move: `sao_sweep` is byte-identical at 247/100
+    /// and at 5/2, so what changed is that the value is now a measurement of
+    /// the merge rather than a fit to the boundary where the invariant is
+    /// next measured to break.
+    ///
+    /// It is far above the 1.1x-1.4x the two-point probe measures a marginal
+    /// bit at, and that is the expected answer rather than a discrepancy: the
+    /// probe prices a bit of *this slice's own coded rate*, and the forfeited
+    /// merge is not one. Per-QP the ratio runs from 0.50x to 4.00x — a
+    /// constant is the right shape only in aggregate, because how much merge
+    /// a band component destroys is a property of how much its neighbours
+    /// agreed with each other, which is content and not rate.
+    ///
+    /// What is *not* landed is the obvious next step, giving the search
+    /// [`coding_bins`] directly instead of a constant standing in for it.
+    /// That was built and swept: it raises the merges on that picture from 29
+    /// to 32, keeps every #274 operating point, and prices SAO correctly
+    /// enough that the slice-level rule then accepts it at QPs it used to
+    /// decline — and two of those acceptances land 0.001 dB and 0.011 dB
+    /// under the writer's own curve, at CTBs carrying no band component at
+    /// all. That is `SAO_ACCEPTANCE_RESOLUTION_NUM` again, a rule deciding on
+    /// margins forty times finer than it can resolve, and it is the same
+    /// blocker #344 recorded rather than anything about band offset. It is
+    /// tracked separately.
+    ///
     pub(crate) band_q8: u32,
 }
 
