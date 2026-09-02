@@ -340,3 +340,254 @@ fn walk_start(position: Option<u64>, target: u64, keyframes: &KeyframeIndex) -> 
         _ => keyframes.at_or_before(target),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+    use zvidlib::{
+        CodecProfile, CodecSupport, ColorRange, DecodedVideoFrame, PixelFormat, Plane,
+        VideoDecoder, VideoDimensions,
+    };
+
+    fn samples(count: u64, keyframe_every: u64) -> Vec<EncodedVideoSample> {
+        (0..count)
+            .map(|index| EncodedVideoSample {
+                presentation_index: FrameIndex(index),
+                random_access: index % keyframe_every == 0,
+                data: vec![index as u8],
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_target_snaps_back_to_the_random_access_point_that_decodes_it() {
+        let index = KeyframeIndex::from_samples(&samples(12, 4));
+        assert_eq!(index.at_or_before(0), 0);
+        assert_eq!(index.at_or_before(3), 0);
+        assert_eq!(index.at_or_before(4), 4);
+        assert_eq!(index.at_or_before(7), 4);
+        assert_eq!(index.at_or_before(11), 8);
+        // Past the last indexed frame the caller's own target is the best answer available.
+        assert_eq!(index.at_or_before(40), 8);
+    }
+
+    #[test]
+    fn a_track_without_a_leading_random_access_point_returns_the_target_itself() {
+        let mut without = samples(4, 1);
+        for sample in &mut without {
+            sample.random_access = false;
+        }
+        let index = KeyframeIndex::from_samples(&without);
+        assert_eq!(index.at_or_before(2), 2);
+    }
+
+    #[test]
+    fn a_timeline_fraction_selects_the_frame_it_points_at() {
+        assert_eq!(target_frame(0.0, 101), 0);
+        assert_eq!(target_frame(0.5, 101), 50);
+        assert_eq!(target_frame(1.0, 101), 100);
+        // Out-of-range fractions clamp to the track rather than indexing past it.
+        assert_eq!(target_frame(-1.0, 101), 0);
+        assert_eq!(target_frame(2.0, 101), 100);
+        assert_eq!(target_frame(0.5, 0), 0);
+    }
+
+    #[test]
+    fn a_walk_continues_forwards_and_restarts_from_a_random_access_point_otherwise() {
+        let keyframes = KeyframeIndex::from_samples(&samples(64, 16));
+        // Nothing decoded yet, or a target behind the reader: start where the decode has to.
+        assert_eq!(walk_start(None, 40, &keyframes), 32);
+        assert_eq!(walk_start(Some(50), 40, &keyframes), 32);
+        // Ahead of the reader: continue from it, one stride at a time, without overshooting.
+        assert_eq!(walk_start(Some(32), 40, &keyframes), 32 + WALK_STRIDE);
+        assert_eq!(walk_start(Some(39), 40, &keyframes), 40);
+        assert_eq!(walk_start(Some(40), 40, &keyframes), 40);
+    }
+
+    /// How many samples a decoder may still decode before it blocks, so a test can hold a walk
+    /// part-way through and see what it has published so far.
+    type Gate = Arc<(Mutex<u32>, Condvar)>;
+
+    fn gate(permits: u32) -> Gate {
+        Arc::new((Mutex::new(permits), Condvar::new()))
+    }
+
+    fn grant(gate: &Gate, permits: u32) {
+        *gate.0.lock().expect("gate poisoned") += permits;
+        gate.1.notify_all();
+    }
+
+    /// Emits the frame it is handed, with the presentation index in the first pixel.
+    struct IndexedDecoder {
+        gate: Option<Gate>,
+    }
+
+    impl VideoDecoder for IndexedDecoder {
+        fn submit(
+            &mut self,
+            sample: &EncodedVideoSample,
+            _: &CancellationToken,
+        ) -> Result<Vec<DecodedVideoFrame>> {
+            if let Some(gate) = self.gate.as_ref() {
+                let (lock, condvar) = &**gate;
+                let mut permits = lock.lock().expect("gate poisoned");
+                while *permits == 0 {
+                    permits = condvar.wait(permits).expect("gate poisoned");
+                }
+                *permits -= 1;
+            }
+            Ok(vec![DecodedVideoFrame {
+                presentation_index: sample.presentation_index,
+                frame: VideoFrame::new(
+                    VideoDimensions::new(1, 1, &Limits::default())?,
+                    PixelFormat::Rgba8,
+                    ColorRange::Limited,
+                    vec![Plane {
+                        data: vec![sample.presentation_index.0 as u8, 0, 0, 255],
+                        stride: 4,
+                    }],
+                    &Limits::default(),
+                )?,
+            }])
+        }
+
+        fn drain(&mut self, _: &CancellationToken) -> Result<Vec<DecodedVideoFrame>> {
+            Ok(Vec::new())
+        }
+
+        fn reset(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct IndexedFactory {
+        gate: Option<Gate>,
+    }
+
+    impl VideoDecoderFactory for IndexedFactory {
+        fn capability(&self, _: &VideoDecoderConfig) -> CodecSupport {
+            CodecSupport::Supported {
+                implementation: zvidlib::CodecImplementation::Software,
+            }
+        }
+
+        fn create(&self, _: &VideoDecoderConfig, _: &Limits) -> Result<Box<dyn VideoDecoder>> {
+            Ok(Box::new(IndexedDecoder {
+                gate: self.gate.clone(),
+            }))
+        }
+    }
+
+    fn configuration() -> VideoDecoderConfig {
+        VideoDecoderConfig {
+            codec: zvidlib::Codec::Hevc,
+            profile: CodecProfile::HevcMain,
+            coded_dimensions: VideoDimensions::new(1, 1, &Limits::default()).unwrap(),
+            output_format: PixelFormat::Rgba8,
+            color_range: ColorRange::Limited,
+            hardware: zvidlib::HardwarePreference::Avoid,
+            configuration: Vec::new(),
+        }
+    }
+
+    fn open(gate: Option<Gate>, samples: Vec<EncodedVideoSample>) -> FrameService {
+        FrameService::new(
+            &IndexedFactory { gate },
+            configuration(),
+            samples,
+            Limits::default(),
+        )
+        .unwrap()
+    }
+
+    /// Polls `poll` until it answers, or gives up after ten seconds.
+    fn wait_for<T>(mut poll: impl FnMut() -> Option<T>) -> Option<T> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if let Some(value) = poll() {
+                return Some(value);
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        None
+    }
+
+    #[test]
+    fn requesting_a_frame_does_not_wait_for_it_and_the_newest_target_wins() {
+        let gate = gate(0);
+        let mut frames = open(Some(Arc::clone(&gate)), samples(12, 4));
+
+        // Every request returns while the decoder is still blocked, and nothing has been drawn.
+        assert!(frames.request(0));
+        assert!(frames.take_latest().is_none());
+        // An unchanged target is not re-requested, and a changed one redirects the walk.
+        assert!(!frames.request(0));
+        assert!(frames.request(8));
+
+        grant(&gate, u32::MAX / 2);
+
+        let drawn = wait_for(|| {
+            frames
+                .take_latest()
+                .map(|frame| frame.planes[0].data[0])
+                .filter(|index| *index == 8)
+        });
+        assert_eq!(drawn, Some(8), "the newest requested frame is the one drawn");
+    }
+
+    #[test]
+    fn playback_is_told_a_frame_is_still_decoding_rather_than_being_made_to_wait() {
+        let gate = gate(0);
+        let frames = open(Some(Arc::clone(&gate)), samples(12, 4));
+        let mut source = frames.source();
+        let token = CancellationToken::new();
+
+        // The very first read returns immediately, with the decoder still blocked on frame 0.
+        let start = Instant::now();
+        let pending = source.get_exact(FrameIndex(4), &token);
+        assert!(start.elapsed() < Duration::from_secs(1), "get_exact waited");
+        assert_eq!(
+            pending.map(|_| ()).unwrap_err().kind(),
+            ErrorKind::WouldBlock
+        );
+
+        grant(&gate, u32::MAX / 2);
+
+        let frame = wait_for(|| source.get_exact(FrameIndex(4), &token).ok());
+        assert_eq!(
+            frame.map(|frame| frame.planes[0].data[0]),
+            Some(4),
+            "the frame is delivered once it has decoded"
+        );
+    }
+
+    #[test]
+    fn a_walk_through_a_single_group_of_pictures_draws_the_frames_it_passes() {
+        // One random-access point, as the bundled sample has: reaching frame 9 means decoding
+        // every frame from 0, and a scrub that showed nothing until it arrived is the freeze.
+        let mut single_gop = samples(12, 1);
+        for sample in single_gop.iter_mut().skip(1) {
+            sample.random_access = false;
+        }
+        let gate = gate(0);
+        let mut frames = open(Some(Arc::clone(&gate)), single_gop);
+        frames.request(9);
+
+        // One sample's worth of decoding is enough to publish something: the walk starts at the
+        // random-access point rather than at the target, so the window has a picture long before
+        // the nine frames the target needs have been decoded.
+        grant(&gate, 1);
+        let first = wait_for(|| frames.take_latest()).map(|frame| frame.planes[0].data[0]);
+        assert_eq!(first, Some(0), "the walk draws where it starts");
+
+        grant(&gate, u32::MAX / 2);
+        let arrived = wait_for(|| {
+            frames
+                .take_latest()
+                .map(|frame| frame.planes[0].data[0])
+                .filter(|index| *index == 9)
+        });
+        assert_eq!(arrived, Some(9), "and then walks on to the target");
+    }
+}
