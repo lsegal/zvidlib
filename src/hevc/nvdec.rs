@@ -97,6 +97,10 @@ enum Command {
     Reset {
         response: SyncSender<Result<Vec<DecodedVideoFrame>>>,
     },
+    SetOutputWanted {
+        wanted: bool,
+        response: SyncSender<Result<Vec<DecodedVideoFrame>>>,
+    },
     Stop,
 }
 
@@ -183,6 +187,14 @@ impl VideoDecoder for NvDecoder {
         self.request(|response| Command::Reset { response })
             .map(|_| ())
     }
+
+    /// Forwards the hint to the worker and waits for it, so that a sample submitted after this
+    /// returns is decoded under the setting the caller asked for. The command channel is FIFO,
+    /// so the wait is not what orders it; it is what keeps a dropped worker visible here rather
+    /// than silently leaving the decoder converting frames nobody wants.
+    fn set_output_wanted(&mut self, wanted: bool) {
+        let _ = self.request(|response| Command::SetOutputWanted { wanted, response });
+    }
 }
 
 impl Drop for NvDecoder {
@@ -212,6 +224,10 @@ fn run_worker(mut core: NvDecoderCore, commands: Receiver<Command>) {
             }
             Command::Reset { response } => {
                 let _ = response.send(core.reset().map(|()| Vec::new()));
+            }
+            Command::SetOutputWanted { wanted, response } => {
+                core.set_output_wanted(wanted);
+                let _ = response.send(Ok(Vec::new()));
             }
             Command::Stop => return,
         }
@@ -245,6 +261,7 @@ impl NvDecoderCore {
             decoder: ptr::null_mut(),
             dimensions: configuration.coded_dimensions,
             max_allocation_bytes: limits.max_allocation_bytes,
+            output_wanted: true,
             frames: Vec::new(),
             error: None,
         });
@@ -305,6 +322,10 @@ impl NvDecoderCore {
         self.take_frames()
     }
 
+    fn set_output_wanted(&mut self, wanted: bool) {
+        self.callback_state.output_wanted = wanted;
+    }
+
     fn reset(&mut self) -> Result<()> {
         self.destroy_parser_and_decoder();
         self.callback_state.frames.clear();
@@ -327,14 +348,10 @@ impl NvDecoderCore {
 
     fn take_frames(&mut self) -> Result<Vec<DecodedVideoFrame>> {
         let raw_frames = std::mem::take(&mut self.callback_state.frames);
-        raw_frames
+        let wanted = claim_identities(raw_frames, &mut self.presentation_indexes)?;
+        wanted
             .into_iter()
-            .map(|raw| {
-                let presentation_index = self
-                    .presentation_indexes
-                    .pop()
-                    .ok_or_else(|| codec("NVDEC produced a frame without a submitted identity"))?
-                    .0;
+            .map(|(presentation_index, raw)| {
                 Ok(DecodedVideoFrame {
                     presentation_index,
                     frame: nv12_to_rgba(raw, &self.configuration, &self.limits)?,
@@ -518,7 +535,14 @@ struct CallbackState {
     decoder: *mut c_void,
     dimensions: VideoDimensions,
     max_allocation_bytes: u64,
-    frames: Vec<RawNv12Frame>,
+    /// Whether the pictures arriving at the display callback are wanted as frames. A suppressed
+    /// picture is still decoded, and still reaches the callback; what it skips is the readback.
+    output_wanted: bool,
+    /// One entry per displayed picture, in display order. A suppressed picture leaves `None`,
+    /// which `take_frames` needs in order to consume that picture's presentation identity: the
+    /// identities are popped one per displayed picture, so dropping an entry outright would
+    /// hand every later frame the index of the one before it.
+    frames: Vec<Option<RawNv12Frame>>,
     error: Option<String>,
 }
 
@@ -652,6 +676,13 @@ unsafe extern "system" fn display_callback(
         if state.decoder.is_null() {
             return Err("NVDEC display callback has no decoder".to_owned());
         }
+        // The picture was decoded and remains a reference for the frames after it; skipping the
+        // map/copy-back/convert below is the whole saving. The placeholder still records that a
+        // picture was displayed, which is what keeps the presentation identities aligned.
+        if !state.output_wanted {
+            state.frames.push(None);
+            return Ok(());
+        }
         let mut processing = CuvidProcParams {
             progressive_frame: display.progressive_frame,
             second_field: 0,
@@ -701,10 +732,10 @@ unsafe extern "system" fn display_callback(
             return Err(format!("NVDEC frame unmap failed: CUDA error {unmapped}"));
         }
         surface_copy.record(readback::Phase::SurfaceCopy);
-        state.frames.push(RawNv12Frame {
+        state.frames.push(Some(RawNv12Frame {
             pitch: pitch as usize,
             data,
-        });
+        }));
         Ok(())
     })();
     match result {
@@ -714,6 +745,31 @@ unsafe extern "system" fn display_callback(
             0
         }
     }
+}
+
+/// Pairs each displayed picture with the presentation identity it owns, dropping the suppressed
+/// ones.
+///
+/// Identities are popped one per *displayed* picture, not one per delivered frame, because that
+/// is the order NVDEC displays them in. A suppressed picture was displayed - the callback saw it
+/// and chose not to read it back - so it consumes the identity at the front of the heap just as a
+/// converted one does. Dropping the entry instead would shift every later frame onto the identity
+/// of the picture before it, which is silent corruption rather than an error: the frames would
+/// still be well-formed, just labelled wrong.
+fn claim_identities(
+    displayed: Vec<Option<RawNv12Frame>>,
+    identities: &mut BinaryHeap<Reverse<FrameIndex>>,
+) -> Result<Vec<(FrameIndex, RawNv12Frame)>> {
+    let mut wanted = Vec::new();
+    for picture in displayed {
+        let Some(Reverse(presentation_index)) = identities.pop() else {
+            return Err(codec("NVDEC produced a frame without a submitted identity"));
+        };
+        if let Some(raw) = picture {
+            wanted.push((presentation_index, raw));
+        }
+    }
+    Ok(wanted)
 }
 
 fn nv12_to_rgba(
@@ -1020,5 +1076,83 @@ struct CuvidProcParams {
 impl CuvidProcParams {
     fn zeroed() -> Self {
         unsafe { std::mem::zeroed() }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn identities(indexes: &[u64]) -> BinaryHeap<Reverse<FrameIndex>> {
+        indexes.iter().map(|&i| Reverse(FrameIndex(i))).collect()
+    }
+
+    fn picture(byte: u8) -> RawNv12Frame {
+        RawNv12Frame {
+            pitch: 2,
+            data: vec![byte; 6],
+        }
+    }
+
+    /// The hazard the suppressed path introduces: a picture that was displayed but not read back
+    /// still owns an identity, so the frames after it must keep their own rather than sliding
+    /// onto the identity of the picture before them.
+    #[test]
+    fn a_suppressed_picture_consumes_its_own_identity() {
+        let mut heap = identities(&[0, 1, 2, 3]);
+        let displayed = vec![Some(picture(10)), None, None, Some(picture(40))];
+
+        let wanted = claim_identities(displayed, &mut heap).unwrap();
+
+        let pairs = wanted
+            .iter()
+            .map(|(index, raw)| (index.0, raw.data[0]))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pairs,
+            vec![(0, 10), (3, 40)],
+            "the frames after a suppressed picture must keep their own identities"
+        );
+        assert!(
+            heap.is_empty(),
+            "every displayed picture claims an identity"
+        );
+    }
+
+    #[test]
+    fn every_picture_wanted_pairs_in_display_order() {
+        let mut heap = identities(&[0, 1, 2]);
+        let displayed = vec![Some(picture(1)), Some(picture(2)), Some(picture(3))];
+
+        let wanted = claim_identities(displayed, &mut heap).unwrap();
+
+        assert_eq!(
+            wanted
+                .iter()
+                .map(|(index, raw)| (index.0, raw.data[0]))
+                .collect::<Vec<_>>(),
+            vec![(0, 1), (1, 2), (2, 3)]
+        );
+    }
+
+    /// A whole walk suppressed: nothing is delivered, and the identities are still all consumed,
+    /// so the next request starts from an empty heap rather than a stale one.
+    #[test]
+    fn a_fully_suppressed_walk_delivers_nothing_and_leaves_no_identities() {
+        let mut heap = identities(&[0, 1, 2]);
+
+        let wanted = claim_identities(vec![None, None, None], &mut heap).unwrap();
+
+        assert!(wanted.is_empty());
+        assert!(heap.is_empty());
+    }
+
+    #[test]
+    fn a_picture_without_a_submitted_identity_is_an_error() {
+        let mut heap = identities(&[0]);
+
+        let error = claim_identities(vec![Some(picture(1)), Some(picture(2))], &mut heap);
+
+        assert!(error.is_err());
     }
 }

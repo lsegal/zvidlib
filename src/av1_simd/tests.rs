@@ -21,7 +21,7 @@ use crate::av1_filters::{
     CdefStrength, FilterFrame, FilterPlane, LoopFilterParams, RestorationUnit,
     apply_restoration_unit, cdef_frame, deblock_frame,
 };
-use crate::av1_intra::{Av1TxType, Tx1d, inverse_transform};
+use crate::av1_intra::{Av1TxType, Tx1d, dq_denom, inverse_transform};
 use crate::{Limits, TxSizeGrid};
 
 /// Delegates to the crate-wide override lock: pinning an instruction set now
@@ -110,6 +110,13 @@ fn assert_all_match<T: PartialEq + std::fmt::Debug>(results: &[(SimdIsa, T)], wh
 // Transforms
 // ---------------------------------------------------------------------
 
+/// Whether the WHT kernels are expected to answer with a kernel result. Both
+/// directions are dispatched to the scalar reference on x86_64 (see
+/// `super::fwht4x4` and `super::iwht4x4`), each on its own measurement, so
+/// there `None` is the documented answer for an in-range block rather than a
+/// fallback.
+const WHT_HAS_KERNEL: bool = !cfg!(target_arch = "x86_64");
+
 #[test]
 fn walsh_hadamard_kernels_match_the_scalar_reference() {
     let mut rng = Lcg(0x5eed_0120_0000_0001);
@@ -122,15 +129,26 @@ fn walsh_hadamard_kernels_match_the_scalar_reference() {
             for value in &mut residual {
                 *value = rng.in_range(255);
             }
-            let coefficients = fwht4x4(isa, &residual).expect("in-range block is vectorizable");
-            assert_eq!(coefficients, fwht4x4_scalar(&residual), "{}", isa.name());
-            let reconstructed = iwht4x4(isa, &coefficients).expect("in-range block");
+            let scalar_coefficients = fwht4x4_scalar(&residual);
+            let kernel = fwht4x4(isa, &residual);
             assert_eq!(
-                reconstructed,
-                iwht4x4_scalar(&coefficients),
-                "{}",
+                kernel.is_some(),
+                WHT_HAS_KERNEL,
+                "{}: unexpected forward WHT dispatch",
                 isa.name()
             );
+            let coefficients = kernel.unwrap_or(scalar_coefficients);
+            assert_eq!(coefficients, scalar_coefficients, "{}", isa.name());
+            let scalar_reconstructed = iwht4x4_scalar(&coefficients);
+            let inverse_kernel = iwht4x4(isa, &coefficients);
+            assert_eq!(
+                inverse_kernel.is_some(),
+                WHT_HAS_KERNEL,
+                "{}: unexpected inverse WHT dispatch",
+                isa.name()
+            );
+            let reconstructed = inverse_kernel.unwrap_or(scalar_reconstructed);
+            assert_eq!(reconstructed, scalar_reconstructed, "{}", isa.name());
             assert_eq!(reconstructed, residual, "forward/inverse must round-trip");
         }
     }
@@ -320,7 +338,14 @@ fn scalar_kernels_match_the_mathematical_transforms() {
             // basis and the row pass is what is being measured.
             coefficients[basis] = 1;
             let residual =
-                inverse_transform(&coefficients, size, Av1TxType::DctDct, 1 << 12, 1 << 12);
+                // Unit dequantization is `q == Dq_Denom[txSz]`, so the kernel sees `1 << 12`.
+            inverse_transform(
+                &coefficients,
+                size,
+                Av1TxType::DctDct,
+                (1 << 12) * dq_denom(size),
+                (1 << 12) * dq_denom(size),
+            );
             let column_gain = 1.0 / SQRT_2;
             let shift = f64::from(1 << crate::av1_intra::transform_shift(size));
             for (n, &sample) in residual.iter().take(size).enumerate() {
@@ -1253,7 +1278,7 @@ fn vectorized_round_trip_reproduces_the_residual() {
             let residual: Vec<i32> = (0..size * size).map(|_| rng.in_range(255)).collect();
             let results = for_each_isa(|_| {
                 let coefficients = forward_transform(&residual, size, tx_type);
-                inverse_transform(&coefficients, size, tx_type, 1, 1)
+                inverse_transform(&coefficients, size, tx_type, dq_denom(size), dq_denom(size))
             });
             for (isa, reconstructed) in &results {
                 for (&want, &got) in residual.iter().zip(reconstructed.iter()) {
