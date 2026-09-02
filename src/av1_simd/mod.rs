@@ -189,6 +189,15 @@ pub fn set_active_isa(isa: Option<SimdIsa>) {
 // The 4- and 8-point transforms have no useful 256-bit shape (a whole 8x8
 // coefficient block is four AVX2 registers), so AVX2 hosts run them through the
 // SSE4.1 path and spend the wider registers on the pixel filters instead.
+//
+// Every kernel named below must be `#[inline(always)]`. The attribute widens
+// the wrapper, not what the wrapper calls, so a kernel the inliner declines to
+// absorb is compiled at the target's baseline instruction set: #336 measured
+// `deblock_edge_vertical::<Avx2>` in that state at 961 out-of-line intrinsic
+// calls, not one AVX2 instruction, and 0.13-0.24x of the scalar reference it
+// replaces. The kernels stay bit-exact either way, so no test here notices;
+// `.github/scripts/check_simd_target_features.py` reads it off the emitted
+// assembly instead, and CI runs it on the x86_64 job.
 // ---------------------------------------------------------------------
 
 macro_rules! simd_entry_points {
