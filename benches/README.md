@@ -2101,18 +2101,23 @@ round, five rounds per draw:
 
 | CPU model | draws | `avx2` | `sse4.1` | `scalar` (control) |
 |---|---|---|---|---|
-| Intel Xeon Platinum 8573C | PENDING | | | |
-| Intel Core i7-8700B | PENDING | | | |
-| AMD EPYC 7763 | 3 | 0.976-0.982x | 0.992-1.004x | 1.001-1.009x |
-| AMD EPYC 9V74 | 3 | 0.872-0.891x | 0.976-0.988x | 1.006-1.008x |
+| Intel Xeon Platinum 8573C | 1 | 1.023x | 1.015x | 1.010x |
+| AMD EPYC 7763 | 6 | 0.966-1.003x | 0.993-1.007x | 1.001-1.015x |
+| AMD EPYC 9V74 | 5 | 0.872-0.891x | 0.974-0.992x | 1.006-1.008x |
 
 **It is worse, not better.** On Zen 5 the once-per-CTB shape reads 0.872-0.891x
-where the once-per-row shape read 0.94-0.95x: removing fifteen of every sixteen
-calls made the kernel *more* expensive, which is the opposite of what a
-call-overhead account predicts and enough on its own to refute it. On EPYC 7763
-it reproduces the per-row figure to within the control's own movement. Neither
-sits inside what the `scalar` control moves by, which is 1.001-1.009x across
-every draw.
+across five independent draws where the once-per-row shape read 0.94-0.95x:
+removing fifteen of every sixteen calls made the kernel *more* expensive, which
+is the opposite of what a call-overhead account predicts and enough on its own
+to refute it. On EPYC 7763 it reproduces the per-row figure, sitting 1-4% under
+that draw's own control. On the one readable Intel draw it is 1.023x against a
+1.010x control - no separation, the same answer the per-row shape's 1.00x gave.
+
+A twelfth draw, on `macos-15-intel` (Intel Core i7-8700B), is **discarded rather
+than reported**: its `scalar` control read 1.172x, and a control that moves 17%
+where it must read 1.00x says the host was not quiet enough for a several-percent
+effect. That is the control doing its job. The same host's spread disqualified it
+from the share table above for the same reason.
 
 **So neither candidate cause survives, and the site is not the problem.** What
 the two measurements together say is that the isolated harness is not measuring

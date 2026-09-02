@@ -514,13 +514,16 @@ pub(crate) fn band_offset_row(here: &[i32], src: &[u8], stats: &mut BandStats) {
 ///
 /// | CPU model | draws | `avx2` | `sse4.1` | `scalar` (control) |
 /// |---|---|---|---|---|
-/// | AMD EPYC 7763 | 3 | 0.976-0.982x | 0.992-1.004x | 1.001-1.009x |
-/// | AMD EPYC 9V74 | 3 | 0.872-0.891x | 0.976-0.988x | 1.006-1.008x |
+/// | Intel Xeon Platinum 8573C | 1 | 1.023x | 1.015x | 1.010x |
+/// | AMD EPYC 7763 | 6 | 0.966-1.003x | 0.993-1.007x | 1.001-1.015x |
+/// | AMD EPYC 9V74 | 5 | 0.872-0.891x | 0.974-0.992x | 1.006-1.008x |
 ///
 /// **It is worse, not better.** On Zen 5 the once-per-CTB shape reads
-/// 0.872-0.891x where the once-per-row shape read 0.94-0.95x: removing fifteen
-/// of every sixteen calls made the kernel *more* expensive, which is the
-/// opposite of what a call-overhead account predicts.
+/// 0.872-0.891x across five draws where the once-per-row shape read
+/// 0.94-0.95x: removing fifteen of every sixteen calls made the kernel *more*
+/// expensive, which is the opposite of what a call-overhead account predicts.
+/// On Intel it does not separate from its own control, the same answer the
+/// per-row shape gave.
 ///
 /// So the site is not what is costing the kernel its isolated win. What the two
 /// measurements together say is that `bench_band_offset_row` does not measure
