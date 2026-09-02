@@ -735,6 +735,13 @@ unsafe fn six_chunk_vertical<V: I32x>(
 /// `2 <= y` and `y + 1 < geom.height`, and `sizes` must be empty or at least
 /// `count` rounded up to a whole number of vectors long.
 #[allow(clippy::too_many_arguments)]
+// `#[inline(always)]`, not a hint: this kernel is only ever reached
+// through a `#[target_feature]` wrapper in [`super`], and it is only
+// compiled *with* that feature when it is inlined into the wrapper. A
+// copy LLVM declined to inline is built at the target's baseline
+// instead, where every intrinsic it uses is an out-of-line call - see
+// the codegen note in [`super`].
+#[inline(always)]
 pub(crate) unsafe fn deblock_edge_horizontal<V: I32x>(
     data: &mut [u8],
     geom: Geometry,
@@ -818,6 +825,13 @@ pub(crate) unsafe fn deblock_edge_horizontal<V: I32x>(
 /// `2 <= x` and `x + 1 < geom.width`, and `sizes` must be empty or at least
 /// `count` rounded up to a whole number of vectors long.
 #[allow(clippy::too_many_arguments)]
+// `#[inline(always)]`, not a hint: this kernel is only ever reached
+// through a `#[target_feature]` wrapper in [`super`], and it is only
+// compiled *with* that feature when it is inlined into the wrapper. A
+// copy LLVM declined to inline is built at the target's baseline
+// instead, where every intrinsic it uses is an out-of-line call - see
+// the codegen note in [`super`].
+#[inline(always)]
 pub(crate) unsafe fn deblock_edge_vertical<V: I32x>(
     data: &mut [u8],
     geom: Geometry,
@@ -898,6 +912,13 @@ pub(crate) unsafe fn deblock_edge_vertical<V: I32x>(
 ///
 /// # Safety
 /// `V`'s instruction set must be available.
+// `#[inline(always)]`, not a hint: this kernel is only ever reached
+// through a `#[target_feature]` wrapper in [`super`], and it is only
+// compiled *with* that feature when it is inlined into the wrapper. A
+// copy LLVM declined to inline is built at the target's baseline
+// instead, where every intrinsic it uses is an out-of-line call - see
+// the codegen note in [`super`].
+#[inline(always)]
 pub(crate) unsafe fn cdef_direction_stats<V: I32x>(
     data: &[u8],
     geom: Geometry,
@@ -956,6 +977,13 @@ pub(crate) fn constrain_damping_adjustment(threshold: i32, damping: i32) -> i32 
 /// `V`'s instruction set must be available and `dst` must hold at least `count`
 /// bytes.
 #[allow(clippy::too_many_arguments)]
+// `#[inline(always)]`, not a hint: this kernel is only ever reached
+// through a `#[target_feature]` wrapper in [`super`], and it is only
+// compiled *with* that feature when it is inlined into the wrapper. A
+// copy LLVM declined to inline is built at the target's baseline
+// instead, where every intrinsic it uses is an out-of-line call - see
+// the codegen note in [`super`].
+#[inline(always)]
 pub(crate) unsafe fn cdef_filter_row<V: I32x>(
     data: &[u8],
     geom: Geometry,
@@ -1019,6 +1047,13 @@ pub(crate) unsafe fn cdef_filter_row<V: I32x>(
 /// `V`'s instruction set must be available and `out` must hold at least `count`
 /// values.
 #[allow(clippy::too_many_arguments)]
+// `#[inline(always)]`, not a hint: this kernel is only ever reached
+// through a `#[target_feature]` wrapper in [`super`], and it is only
+// compiled *with* that feature when it is inlined into the wrapper. A
+// copy LLVM declined to inline is built at the target's baseline
+// instead, where every intrinsic it uses is an out-of-line call - see
+// the codegen note in [`super`].
+#[inline(always)]
 pub(crate) unsafe fn wiener_horizontal_row<V: I32x>(
     data: &[u8],
     geom: Geometry,
@@ -1063,6 +1098,13 @@ pub(crate) unsafe fn wiener_horizontal_row<V: I32x>(
 /// `V`'s instruction set must be available, `column + count <= width`, and
 /// `dst` must hold at least `count` bytes.
 #[allow(clippy::too_many_arguments)]
+// `#[inline(always)]`, not a hint: this kernel is only ever reached
+// through a `#[target_feature]` wrapper in [`super`], and it is only
+// compiled *with* that feature when it is inlined into the wrapper. A
+// copy LLVM declined to inline is built at the target's baseline
+// instead, where every intrinsic it uses is an out-of-line call - see
+// the codegen note in [`super`].
+#[inline(always)]
 pub(crate) unsafe fn wiener_vertical_row<V: I32x>(
     intermediate: &[i32],
     width: usize,
@@ -1130,6 +1172,13 @@ pub(crate) unsafe fn wiener_vertical_row<V: I32x>(
 /// `V`'s instruction set must be available and `sums` / `sums_sq` must hold at
 /// least `count` values.
 #[allow(clippy::too_many_arguments)]
+// `#[inline(always)]`, not a hint: this kernel is only ever reached
+// through a `#[target_feature]` wrapper in [`super`], and it is only
+// compiled *with* that feature when it is inlined into the wrapper. A
+// copy LLVM declined to inline is built at the target's baseline
+// instead, where every intrinsic it uses is an out-of-line call - see
+// the codegen note in [`super`].
+#[inline(always)]
 pub(crate) unsafe fn box_stats_row<V: I32x>(
     data: &[u8],
     geom: Geometry,

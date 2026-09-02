@@ -222,6 +222,60 @@ async function main() {
     }
   }
 
+  // Dropping a superseded position is not the same as stopping the decode it started. A group of
+  // pictures is 768 frames in the bundled sample - its `stss` names one sync sample - so the seek
+  // already under way holds the decoder for seconds while the pointer has long moved on, and the
+  // newest position only starts once it finishes (issue #333). Scrubbing therefore aborts the
+  // request it is replacing: `video.get` takes an `AbortSignal` and checks it on every turn of
+  // its decode loop, so the decoder is freed part-way through rather than after.
+  //
+  // Walking forwards is the other half. A target ahead of the frame on screen is reached one
+  // frame at a time, drawing each, because the decoder is already positioned there and each step
+  // costs one frame instead of the whole span - so the picture tracks the pointer during a drag
+  // instead of holding still until the target arrives.
+  let scrubTarget = null;
+  let scrubbing = false;
+  let scrubAbort = null;
+  async function scrubTo(index) {
+    // Without a browser HEVC decoder there is nothing to walk through: the synthetic frames are
+    // generated from the index, so the ordinary seek draws them at once.
+    if (!useRealDecode) return requestSeek(index, false);
+    scrubTarget = Math.min(Math.max(index, 0), lastFrameIndex);
+    if (scrubbing) {
+      scrubAbort?.abort();
+      return;
+    }
+    scrubbing = true;
+    playing = false;
+    playButton.textContent = "Play";
+    if (audioState) stopAudio(audioState);
+    try {
+      while (scrubTarget !== null) {
+        const target = scrubTarget;
+        const next = frameIndex < target ? frameIndex + 1 : target;
+        scrubAbort = new AbortController();
+        try {
+          const frame = await video.get(BigInt(next), scrubAbort.signal);
+          uploadFrame(frame.pixels, frame.width, frame.height);
+          frameIndex = next;
+          pausedMediaTimeMs = mediaTimeForFrame(frameIndex);
+        } catch (error) {
+          // An aborted step is the newest position taking over, not a failure; anything else
+          // leaves the picture where it is and ends the scrub.
+          if (errorCode(error) !== "CANCELLED") {
+            scrubTarget = null;
+            break;
+          }
+        }
+        if (scrubTarget === target && frameIndex === target) scrubTarget = null;
+      }
+    } finally {
+      scrubbing = false;
+      scrubAbort = null;
+      syncTimeline();
+    }
+  }
+
   async function seekByMilliseconds(deltaMs) {
     const targetTime = ((currentMediaTimeMs() + deltaMs) % mediaDurationMs + mediaDurationMs) % mediaDurationMs;
     await requestSeek(frameForMediaTime(targetTime));
@@ -314,9 +368,8 @@ async function main() {
   nextFrameButton.addEventListener("click", () => stepFrame(1));
   // The range input's `input` event fires on a click and throughout a drag, and only then.
   // Scrubbing on a bare `mousemove` as well meant merely crossing the bar queued a seek per
-  // pointer sample, each one re-running the decoder (issue #319). Superseded positions are still
-  // dropped by `requestSeek`, so a fast drag decodes the newest one rather than all of them.
-  timeline.addEventListener("input", () => requestSeek(Number(timeline.value)));
+  // pointer sample, each one re-running the decoder (issue #319).
+  timeline.addEventListener("input", () => scrubTo(Number(timeline.value)));
 
   if (decodedFrame) {
     uploadFrame(decodedFrame.pixels, decodedFrame.width, decodedFrame.height);
