@@ -150,8 +150,8 @@ const SATD_AVX2_MIN_W: usize = 16;
 /// search itself — its candidate ordering, its early termination, and the
 /// bit-exactness of the mode decision that follows from them — for a metric
 /// whose 128-bit body is already the one being executed. Routing is the smaller
-/// complete repair and it is what recovers the gap; the batched kernel is filed
-/// separately as the optimization it is.
+/// complete repair and it is what recovers the gap; #387 carries the batched
+/// kernel as the optimization it is.
 ///
 /// From `avx2_min_w` up the two arms stop being the same work and AVX2 keeps
 /// the block.
