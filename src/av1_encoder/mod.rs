@@ -1955,6 +1955,104 @@ mod nonlossless_tests {
         }
     }
 
+    /// What a transform-size trial would have to reconstruct for its ranking to be the emitting
+    /// pass's own, and what that costs.
+    ///
+    /// #299 corrected the rate model and #343 re-derived the calibration on top of it, and about
+    /// 0.2 dB of ranking error survived both at `base_q_idx` 1. #349 established that the error is
+    /// not in how a probe's measurement is *credited*: every shape of credit it crossed - linear
+    /// in the trial's searched cost, per block, saturating in the block count, accumulator-only,
+    /// and a probe that keeps what the set won - read the identical figure at the shipped one
+    /// probe and got monotonically worse with more probes. This measures the remaining candidate:
+    /// that the residual is in what a size trial *is*.
+    ///
+    /// A shipped trial codes its blocks with the set's `DCT_DCT` and probes a sample of them with
+    /// the rest of the set to measure only - the block keeps DCT's result, so the trial's cost and
+    /// coefficient contexts are a DCT-only trial's. The emitting pass writes the type its own
+    /// search picks and reconstructs from it. The two are therefore ranking different encodes, and
+    /// no correction applied on top of a DCT-only ranking can reach that, because the correction
+    /// is a scalar on a cost measured in the wrong contexts.
+    ///
+    /// `with_context_consistent_trials` removes the counterfactual completely: every block of
+    /// every size candidate runs the full type set and *keeps* the winner, so the trial is the
+    /// emitting pass block for block and nothing is corrected afterwards. Three arms are reported
+    /// against the exhaustive search on the 96x80 `test_pattern` - the shipped estimator, the
+    /// same search with the correction switched off entirely (`with_type_gain_trust(0)` and no
+    /// probing, which is the bare DCT-only ranking), and the context-consistent trial - as
+    /// reconstruction quality, emitted bytes, transform-type candidates, and how many of the
+    /// frame's size decisions agree with the exhaustive search's.
+    ///
+    /// The last column is the one the answer is in. `candidates_ratio` is the exhaustive search's
+    /// candidate count over the arm's, which is the reduction
+    /// `the_search_shortcuts_stay_within_their_rate_and_distortion_bound` requires to stay above
+    /// `4x`.
+    #[test]
+    #[ignore = "measurement sweep, not an assertion"]
+    fn measure_context_consistent_trials() {
+        let (width, height) = (96_usize, 80_usize);
+        let pixels = test_pattern(width as u32, height as u32);
+        let quality = |report: &tile::SearchReport| {
+            let reconstruction: Vec<u8> = (0..height)
+                .flat_map(|row| report.reconstruction[row * report.coded_width..][..width].to_vec())
+                .collect();
+            psnr(&pixels, &reconstruction)
+        };
+        println!("qindex,arm,psnr,delta_db,bytes,candidates,candidates_ratio,sizes_agreeing,sizes");
+        for qindex in DETERMINISM_QINDEXES {
+            let exhaustive = tile::FrameEncoder::new(&pixels, width, height, qindex)
+                .without_search_shortcuts()
+                .encode_with_report();
+            let reference = quality(&exhaustive);
+            let decisions: std::collections::BTreeMap<_, _> = exhaustive
+                .size_choices
+                .iter()
+                .map(|&(r, c, bw, chosen)| ((r, c, bw), chosen))
+                .collect();
+            let arms = [
+                (
+                    "shipped",
+                    tile::FrameEncoder::new(&pixels, width, height, qindex).encode_with_report(),
+                ),
+                (
+                    "dct_only",
+                    tile::FrameEncoder::new(&pixels, width, height, qindex)
+                        .without_type_gain_correction()
+                        .encode_with_report(),
+                ),
+                (
+                    "consistent",
+                    tile::FrameEncoder::new(&pixels, width, height, qindex)
+                        .with_context_consistent_trials()
+                        .encode_with_report(),
+                ),
+            ];
+            for (name, report) in &arms {
+                let agreeing = report
+                    .size_choices
+                    .iter()
+                    .filter(|&&(r, c, bw, chosen)| decisions.get(&(r, c, bw)) == Some(&chosen))
+                    .count();
+                let ratio =
+                    exhaustive.candidates_evaluated as f64 / report.candidates_evaluated as f64;
+                println!(
+                    "{qindex},{name},{:.3},{:+.3},{},{},{ratio:.2},{agreeing},{}",
+                    quality(report),
+                    quality(report) - reference,
+                    report.tile.len(),
+                    report.candidates_evaluated,
+                    report.size_choices.len()
+                );
+            }
+            println!(
+                "{qindex},exhaustive,{reference:.3},+0.000,{},{},1.00,{},{}",
+                exhaustive.tile.len(),
+                exhaustive.candidates_evaluated,
+                exhaustive.size_choices.len(),
+                exhaustive.size_choices.len()
+            );
+        }
+    }
+
     /// The per-frame rate-distortion penalties the sampled transform-gain estimator measures at
     /// the shipped [`tile::TYPE_GAIN_SAMPLE_INTERVAL`], pinned at the values they were measured
     /// at.
