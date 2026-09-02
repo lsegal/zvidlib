@@ -162,6 +162,7 @@ use crate::hevc::engine::encoder::rdo::{
 };
 use crate::hevc::engine::encoder::recon::{
     ReconstructedPicture, SAO_LAMBDA_BAND, SAO_OFFSET_MAX, SaoLambda, SourcePlanes,
+    band_syntax_bins, grid_bins,
     deblock_reconstruction, sao_reconstruction,
 };
 use crate::hevc::engine::encoder::residual::{
@@ -2124,51 +2125,256 @@ mod tests {
         )
     }
 
+    /// The grid the search returns at a chosen band-syntax charge, for the
+    /// derivation below — the same deblocked reconstruction
+    /// [`sao_grid`] estimates on, priced differently.
+    fn sao_grid_at(
+        y: &[u8],
+        cb: &[u8],
+        cr: &[u8],
+        width: usize,
+        height: usize,
+        qp: i32,
+        band_q8: u32,
+    ) -> Vec<ResolvedSao> {
+        let (_, mut deblocked, _) = write_idr_residual_slice(
+            y,
+            cb,
+            cr,
+            width,
+            height,
+            qp,
+            ModeSearch::Rdo,
+            LoopFilter::Deblock,
+        );
+        sao_reconstruction(
+            &mut deblocked,
+            SourcePlanes {
+                y,
+                cb,
+                cr,
+                width,
+                height,
+            },
+            SaoLambda {
+                mode_q8: lambda_q8(qp),
+                band_q8,
+            },
+        )
+    }
+
+    /// What a band component actually costs the writer, against what the
+    /// search charges it — the measurement [`BAND_SYNTAX_CHARGE_NUM`] is
+    /// derived from, and the half of #344 that was left open.
+    ///
+    /// #344 settled that the remaining defect cannot be repaired at the
+    /// slice-level acceptance rule, and left the band-syntax charge sitting
+    /// at a fitted 2.5x with no derivation behind it. What the search
+    /// misprices is §7.3.8.3's **merge**. `code_sao` codes one
+    /// `sao_merge_left_flag` or `sao_merge_up_flag` in place of a whole
+    /// `sao( )` structure whenever a CTB's three components are exactly its
+    /// left or above neighbour's, and the per-CTB search never sees that: it
+    /// charges every candidate the structure it would code standalone.
+    ///
+    /// The mispricing is not symmetric between the two types, which is why it
+    /// lands on band offset alone. An edge component picks one of four
+    /// classes and lets §7.4.9.3 infer its four signs, so two neighbouring
+    /// CTBs of one kind of content resolve to identical parameters routinely.
+    /// A band component picks one of 32 positions and four signed offsets per
+    /// component, so two neighbours essentially never do — taking one
+    /// forfeits the merge for this CTB *and* for whichever neighbours would
+    /// have merged with it, and not one bin of that is a bin the band
+    /// component codes.
+    ///
+    /// So the charge is derived as a ratio of coded bins, both sides read off
+    /// [`grid_bins`], which counts exactly what `code_sao` writes:
+    ///
+    /// ```text
+    /// charge = ( bins with band offset available
+    ///            - bins with band offset priced out )
+    ///          / band-syntax bins the band components code
+    /// ```
+    ///
+    /// The numerator is every bin band offset costs the picture, forfeited
+    /// merges included; the denominator is the part of it the search can see.
+    /// Their ratio is what a per-bin charge on `sao_band_position` and
+    /// `sao_offset_sign` has to be for the search's total to come out right.
     #[test]
-    #[ignore = "scratch"]
-    fn scratch_points() {
+    #[ignore = "measurement: what a band component costs the writer against what the search charges"]
+    fn the_band_syntax_charge_is_the_merge_a_band_component_forfeits() {
+        let (mut total_extra, mut total_own) = (0u64, 0u64);
+        for (name, width, height, smooth) in [
+            ("smooth 64x48", 64usize, 48usize, true),
+            ("smooth 128x96", 128, 96, true),
+            ("noise 64x48", 64, 48, false),
+            ("noise 128x96", 128, 96, false),
+        ] {
+            let (y, cb, cr) = if smooth {
+                smooth_picture(width, height)
+            } else {
+                picture(width, height)
+            };
+            let ctbs_x = width.div_ceil(CTB);
+            for qp in 12..=51 {
+                let lambda = lambda_q8(qp);
+                // Band offset at the closed form, which is the charge the
+                // search would carry if its own rate model were right, and
+                // band offset priced out of the search entirely at the trust
+                // bound, which is what `SaoLambda::band_q8` records
+                // `SAO_LAMBDA_BAND` does.
+                let with = sao_grid_at(&y, &cb, &cr, width, height, qp, lambda);
+                let without = sao_grid_at(
+                    &y,
+                    &cb,
+                    &cr,
+                    width,
+                    height,
+                    qp,
+                    lambda * SAO_LAMBDA_BAND as u32,
+                );
+                let own: u64 = with
+                    .iter()
+                    .flat_map(|cell| cell.components.iter())
+                    .filter(|c| c.sao_type_idx == 1)
+                    .map(|c| band_syntax_bins(&c.offset_val))
+                    .sum();
+                if own == 0 {
+                    continue;
+                }
+                let (with_mode, with_band) = grid_bins(&with, ctbs_x);
+                let (without_mode, without_band) = grid_bins(&without, ctbs_x);
+                let extra =
+                    (with_mode + with_band).saturating_sub(without_mode + without_band);
+                total_extra += extra;
+                total_own += own;
+                println!(
+                    "CHARGE {name} qp {qp}: {own} band-syntax bins charged, {extra} bins spent                      ({:.2}x)",
+                    extra as f64 / own as f64
+                );
+            }
+        }
+        assert!(total_own > 0, "no band component was selected anywhere");
+        println!(
+            "CHARGE all: {total_own} band-syntax bins charged, {total_extra} bins spent ({:.2}x)",
+            total_extra as f64 / total_own as f64
+        );
+    }
+
+    #[test]
+    fn the_coded_rate_model_agrees_with_what_the_writer_spends() {
+        // `grid_bins` is the instrument the band-syntax charge is now derived
+        // on, so what it says has to be what `code_sao` actually writes.
+        // Both sides here come from the writer: the model walks the same grid
+        // the slice carries, and the truth is the difference between the
+        // slice coded with the `sao( )` structures and the same slice coded
+        // without them.
+        //
+        // They are not the same currency to the bit — the merge and type-idx
+        // bins are context-coded and cost less than one each, while every
+        // other bin in the structure is bypass and costs exactly one — so the
+        // model is held to a margin rather than to equality. The worst
+        // measured over these six points is 9.5%.
         for (name, width, height, smooth, qp) in [
             ("smooth 64x48", 64usize, 48usize, true, 12i32),
             ("smooth 128x96", 128, 96, true, 12),
+            ("noise 64x48", 64, 48, false, 12),
             ("noise 64x48", 64, 48, false, 37),
+            ("noise 128x96", 128, 96, false, 12),
             ("noise 128x96", 128, 96, false, 37),
-            ("noise 128x96", 128, 96, false, 30),
-            ("noise 128x96", 128, 96, false, 32),
         ] {
-            let (y, cb, cr) = if smooth { smooth_picture(width, height) } else { picture(width, height) };
-            let ((ob, op), (nb, np)) = sao_on_off(&y, &cb, &cr, width, height, qp);
-            println!("POINT {name} qp {qp}: {ob} -> {nb} bytes, {op:.3} -> {np:.3} dB ({:+.3})", np - op);
+            let (y, cb, cr) = if smooth {
+                smooth_picture(width, height)
+            } else {
+                picture(width, height)
+            };
+            let grid = sao_grid(&y, &cb, &cr, width, height, qp);
+            let (mode, band) = grid_bins(&grid, width.div_ceil(CTB));
+            let ((off_bytes, _), (on_bytes, _)) =
+                sao_on_off(&y, &cb, &cr, width, height, qp);
+            let bits = (on_bytes as i64 - off_bytes as i64) * 8;
+            assert!(bits > 0, "{name} qp {qp}: the slice-level test declined the pass");
+            let ratio = (mode + band) as f64 / bits as f64;
+            assert!(
+                (0.85..=1.15).contains(&ratio),
+                "{name} qp {qp}: the model says {} bins where the writer spent {bits} bits                  ({ratio:.3}x)",
+                mode + band
+            );
         }
     }
 
     #[test]
-    #[ignore = "scratch"]
-    fn scratch_merge_census() {
-        for (name, width, height, smooth, qps) in [
-            ("noise 64x48", 64usize, 48usize, false, vec![12i32, 32, 37]),
-            ("noise 128x96", 128, 96, false, vec![12, 32, 37]),
-            ("smooth 128x96", 128, 96, true, vec![12, 32]),
-        ] {
-            let (y, cb, cr) = if smooth { smooth_picture(width, height) } else { picture(width, height) };
-            for qp in qps {
-                let grid = sao_grid(&y, &cb, &cr, width, height, qp);
-                let ctbs_x = width.div_ceil(64);
-                let n = grid.len();
-                let mut merged = 0;
-                let mut band = 0;
-                let mut off = 0;
-                for addr in 0..n {
+    fn a_band_component_forfeits_a_merge_that_no_bin_it_codes_pays_for() {
+        // The mechanism the band-syntax charge is derived from, at one
+        // operating point and in the small.
+        //
+        // Priced at the closed form, the search takes band components the
+        // 2.5x charge refuses. Every one of them makes its CTB unmergeable —
+        // §7.3.8.3 merges only on exact equality of all three components, and
+        // no neighbour lands on the same one of 32 positions with the same
+        // four signed offsets — so the grid loses merges its neighbours were
+        // relying on, and the picture pays whole `sao( )` structures that
+        // were one flag before. None of that is a bin the band component
+        // codes, which is exactly why a per-bin charge on its own syntax has
+        // to be a multiple of that syntax rather than the price of a bit.
+        let (width, height) = (128usize, 96usize);
+        let (y, cb, cr) = picture(width, height);
+        let qp = 12;
+        let ctbs_x = width.div_ceil(CTB);
+        let lambda = lambda_q8(qp);
+        let with = sao_grid_at(&y, &cb, &cr, width, height, qp, lambda);
+        let without = sao_grid_at(
+            &y,
+            &cb,
+            &cr,
+            width,
+            height,
+            qp,
+            lambda * SAO_LAMBDA_BAND as u32,
+        );
+
+        let merges = |grid: &[ResolvedSao]| {
+            (0..grid.len())
+                .filter(|&addr| {
                     let (rx, ry) = (addr % ctbs_x, addr / ctbs_x);
-                    let here = grid[addr];
-                    let left = (rx > 0).then(|| grid[addr - 1]);
-                    let above = (ry > 0).then(|| grid[addr - ctbs_x]);
-                    if left == Some(here) || above == Some(here) { merged += 1; }
-                    if here.components.iter().any(|c| c.sao_type_idx == 1) { band += 1; }
-                    if here.components.iter().all(|c| c.sao_type_idx == 0) { off += 1; }
-                }
-                println!("CENSUS {name} qp {qp}: {n} ctbs, merged {merged}, any-band {band}, all-off {off}");
-            }
-        }
+                    (rx > 0 && grid[addr - 1] == grid[addr])
+                        || (ry > 0 && grid[addr - ctbs_x] == grid[addr])
+                })
+                .count()
+        };
+        let band_components = |grid: &[ResolvedSao]| {
+            grid.iter()
+                .flat_map(|cell| cell.components.iter())
+                .filter(|c| c.sao_type_idx == 1)
+                .count()
+        };
+        assert_eq!(
+            band_components(&without),
+            0,
+            "band offset was still selected at the trust bound, so this is not the contrast"
+        );
+        let taken = band_components(&with);
+        assert!(taken > 0, "the closed form took no band component to measure");
+        assert!(
+            merges(&with) < merges(&without),
+            "taking {taken} band components cost no merge: {} against {}",
+            merges(&with),
+            merges(&without)
+        );
+
+        // And what they cost the writer is more than the syntax they code.
+        let own: u64 = with
+            .iter()
+            .flat_map(|cell| cell.components.iter())
+            .filter(|c| c.sao_type_idx == 1)
+            .map(|c| band_syntax_bins(&c.offset_val))
+            .sum();
+        let (with_mode, with_band) = grid_bins(&with, ctbs_x);
+        let (without_mode, without_band) = grid_bins(&without, ctbs_x);
+        let spent = (with_mode + with_band) - (without_mode + without_band);
+        assert!(
+            spent > own,
+            "{taken} band components coded {own} band-syntax bins and cost the picture only              {spent}, so there is nothing for a charge above 1x to be made of"
+        );
     }
 
     #[test]
