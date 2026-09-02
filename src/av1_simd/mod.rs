@@ -451,7 +451,12 @@ fn coeff_ctx_row_pairs(isa: SimdIsa, size: usize) -> bool {
 ///
 /// #371 removes both halves of that at size 4 rather than routing around them:
 /// the row-pair kernel does a whole block-row-pair per iteration and stores it
-/// with one native full-width store, so AVX2 keeps size 4 on its own kernel.
+/// with one native full-width store, so AVX2 keeps size 4 on its own kernel —
+/// on its own measurement, which is what the redirect was taken on. On an AMD
+/// EPYC 9V74 80-Core, `av1_encode_stage_coeff_ctx` reads 937.520 µs under
+/// `avx2` against 1.165 ms under `sse4.1`, and 8.643 ms against 10.738 ms at
+/// 1080p: 24% at both sizes, where #362's round had the two arms 0.13% apart
+/// because they were the same kernel. `benches/README.md` carries the round.
 /// The sizes below 8 that remain redirected — 1 to 3 and 5 to 7 — are shapes
 /// the encoder never codes and no vector width fits, so they stay on SSE4.1.
 ///
