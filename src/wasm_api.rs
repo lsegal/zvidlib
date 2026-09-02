@@ -60,6 +60,7 @@ fn error_code_for_kind(kind: ErrorKind) -> &'static str {
         ErrorKind::Cancelled => "CANCELLED",
         ErrorKind::InvalidState => "INVALID_STATE",
         ErrorKind::Internal => "INTERNAL",
+        ErrorKind::WouldBlock => "WOULD_BLOCK",
     }
 }
 
