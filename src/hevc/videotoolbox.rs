@@ -47,6 +47,13 @@ struct VideoToolboxDecoder {
     output: OutputQueue,
     output_wanted: OutputWanted,
     session: Option<DecompressionSession>,
+    /// Whether samples have been handed to the session that nothing has waited for yet.
+    ///
+    /// A reference-only sample is submitted and not waited on, so the session decodes it while
+    /// the caller is already building the next one. Anything that needs the session quiet again -
+    /// a picture that is actually wanted, a drain, a reset - waits once for the whole backlog
+    /// rather than once per sample.
+    pending_async: bool,
 }
 
 impl VideoToolboxDecoder {
@@ -68,6 +75,7 @@ impl VideoToolboxDecoder {
             output,
             output_wanted,
             session: Some(session),
+            pending_async: false,
         })
     }
 
@@ -83,6 +91,17 @@ impl VideoToolboxDecoder {
             .lock()
             .map_err(|_| codec("VideoToolbox output queue is unavailable"))?;
         std::mem::take(&mut *queue).into_iter().collect()
+    }
+
+    /// Waits out every sample handed to the session that nothing has waited for yet.
+    fn wait_for_pending(&mut self) -> Result<()> {
+        if !self.pending_async {
+            return Ok(());
+        }
+        self.pending_async = false;
+        self.session()?
+            .wait_for_async_frames()
+            .map_err(|error| codec(format!("VideoToolbox did not finish HEVC input: {error}")))
     }
 
     fn clear_output(&self) -> Result<()> {
@@ -108,40 +127,48 @@ impl VideoDecoder for VideoToolboxDecoder {
         // `kVTDecodeFrame_DoNotOutputFrame` is VideoToolbox's own name for this: the sample is
         // decoded, and stays a reference for the frames after it, but no picture comes back and
         // the callback has nothing to lock or convert.
-        let flags = if self.output_wanted.load(Ordering::Acquire) {
-            0
-        } else {
-            videotoolbox::ffi::kVTDecodeFrame_DoNotOutputFrame
-        };
-        self.session().and_then(|session| {
-            session
-                .decode_with_options(&sample_buffer, flags, None)
-                .map_err(|error| codec(format!("VideoToolbox rejected HEVC input: {error}")))?;
-            session
-                .wait_for_async_frames()
-                .map_err(|error| codec(format!("VideoToolbox did not finish HEVC input: {error}")))
-        })?;
+        //
+        // `kVTDecodeFrame_EnableAsynchronousDecompression` is the permission to return before the
+        // picture is ready. Without it the session is entitled to decode synchronously, and the
+        // wait below made it do so on every sample regardless: a submit / block round trip per
+        // frame, which is the whole of a long walk when none of those pictures is wanted.
+        let wanted = self.output_wanted.load(Ordering::Acquire);
+        let mut flags = videotoolbox::ffi::kVTDecodeFrame_EnableAsynchronousDecompression;
+        if !wanted {
+            flags |= videotoolbox::ffi::kVTDecodeFrame_DoNotOutputFrame;
+        }
+        self.session()?
+            .decode_with_options(&sample_buffer, flags, None)
+            .map_err(|error| codec(format!("VideoToolbox rejected HEVC input: {error}")))?;
+        self.pending_async = true;
+        // A picture nobody will look at is worth nothing until the one that was asked for
+        // arrives, so a suppressed sample returns to the caller with the session still working.
+        // A wanted one has to be waited for - it is the frame the caller is asking about - and
+        // that wait covers every suppressed sample still in flight behind it.
+        if !wanted {
+            return Ok(Vec::new());
+        }
+        self.wait_for_pending()?;
         check_cancelled(cancellation)?;
         self.take_output()
     }
 
     fn drain(&mut self, cancellation: &CancellationToken) -> Result<Vec<DecodedVideoFrame>> {
         check_cancelled(cancellation)?;
-        self.session().and_then(|session| {
-            session.finish_delayed_frames().map_err(|error| {
-                codec(format!("VideoToolbox could not drain HEVC output: {error}"))
-            })?;
-            session.wait_for_async_frames().map_err(|error| {
-                codec(format!(
-                    "VideoToolbox did not finish draining HEVC output: {error}"
-                ))
-            })
-        })?;
+        self.session()?
+            .finish_delayed_frames()
+            .map_err(|error| codec(format!("VideoToolbox could not drain HEVC output: {error}")))?;
+        self.pending_async = true;
+        self.wait_for_pending()?;
         check_cancelled(cancellation)?;
         self.take_output()
     }
 
     fn reset(&mut self) -> Result<()> {
+        // Tearing a session down under frames it has not finished is undefined; the backlog a
+        // suppressed walk leaves behind has to be waited out first, even though every picture in
+        // it is about to be discarded.
+        self.wait_for_pending()?;
         self.session.take();
         self.clear_output()?;
         self.session = Some(create_session(
@@ -155,7 +182,26 @@ impl VideoDecoder for VideoToolboxDecoder {
     }
 
     fn set_output_wanted(&mut self, wanted: bool) {
+        // The callback reads this flag, and a suppressed sample still in flight would read the
+        // new value rather than the one it was submitted under - a picture the reader has already
+        // written off, or worse a callback with no image buffer taken down the conversion path.
+        // Turning output back on therefore waits the backlog out first, so every frame in flight
+        // is one submitted under the flag it is about to be judged by. Turning it off needs no
+        // barrier: the frames behind it were wanted and are already queued.
+        if wanted && !self.output_wanted.load(Ordering::Acquire) {
+            // Nothing here can report a failure, and a wait that fails leaves the session in the
+            // state the next `submit` will fail on anyway.
+            let _ = self.wait_for_pending();
+        }
         self.output_wanted.store(wanted, Ordering::Release);
+    }
+}
+
+impl Drop for VideoToolboxDecoder {
+    fn drop(&mut self) {
+        // Same rule as `reset`: the session must not be torn down under frames it has not
+        // finished, and a walk that was cancelled part-way leaves exactly that.
+        let _ = self.wait_for_pending();
     }
 }
 

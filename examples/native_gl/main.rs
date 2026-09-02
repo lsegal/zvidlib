@@ -52,9 +52,11 @@ use zvidlib::{
 };
 
 mod gl_window;
+mod previews;
 mod scrub;
 
 use gl_window::{CONTROL_LEGEND, FpsCounter, GlWindowAdapter, LegendVisibility};
+use previews::PreviewIndex;
 use scrub::{FrameService, target_frame};
 
 const TEXTURE_HANDLE: u64 = 1;
@@ -121,7 +123,17 @@ fn run() -> Result<()> {
     let support = factory.capability(&configuration);
     // Every frame the window draws comes off this one worker thread, playback's included: a
     // decode on the event-loop thread is what froze the window for seconds after a scrub.
-    let frames = FrameService::new(&factory, configuration, video_samples, limits)?;
+    let frames = FrameService::new(
+        &factory,
+        configuration.clone(),
+        video_samples.clone(),
+        limits,
+    )?;
+    // Issue #374: this sample's 768 frames are one group of pictures, so the frame under a
+    // pointer at the far end of the bar is a second of hardware decoding away however the walk to
+    // it is arranged. A background pass keeps a shrunk picture every few frames, so the drag has
+    // something to draw for any position immediately while that walk runs.
+    let previews = PreviewIndex::new(&factory, configuration, video_samples, limits)?;
     let video_reader = frames.source();
     let audio_decoder = NativeAacDecoder::new(&audio_config, Limits::default())?;
     let audio_reader = AacSampleReader::new(
@@ -170,6 +182,7 @@ fn run() -> Result<()> {
         frame_count,
         frames_per_five_seconds,
         frames,
+        previews,
     );
     let event_loop = EventLoop::new()
         .map_err(|error| invalid(format!("could not create the event loop: {error}")))?;
@@ -183,6 +196,10 @@ fn run() -> Result<()> {
 /// Drives the `winit` window, owns the `glutin` GL context, and renders looping frames.
 struct App<P> {
     dimensions: VideoDimensions,
+    /// The size of the picture the texture currently holds, which is the source's for a decoded
+    /// frame and the preview's for a scrub preview. The video quad is laid out from this, and a
+    /// preview keeps the source's aspect ratio, so a preview fills the same rectangle.
+    displayed: VideoDimensions,
     playback: P,
     frame_count: u64,
     frames_per_five_seconds: u64,
@@ -195,6 +212,9 @@ struct App<P> {
     dragging: bool,
     /// The exact frame the drag is pointing at, committed when the pointer is released.
     scrub_target: Option<u64>,
+    /// Pictures decoded ahead of time, one every few frames, so a drag draws the right part of
+    /// the movie before the walk to the exact frame under it finishes.
+    previews: PreviewIndex,
     legend: LegendVisibility,
     fps: FpsCounter,
     state: Option<WindowState>,
@@ -220,9 +240,11 @@ where
         frame_count: u64,
         frames_per_five_seconds: u64,
         frames: FrameService,
+        previews: PreviewIndex,
     ) -> Self {
         Self {
             dimensions,
+            displayed: dimensions,
             playback,
             frame_count,
             frames_per_five_seconds,
@@ -231,6 +253,7 @@ where
             frames,
             dragging: false,
             scrub_target: None,
+            previews,
             legend: LegendVisibility::new(Instant::now()),
             fps: FpsCounter::new(),
             state: None,
@@ -319,6 +342,12 @@ where
     fn scrub_preview(&mut self, fraction: f32) {
         let target = target_frame(fraction, self.frame_count);
         self.scrub_target = Some(target);
+        // Drawn here rather than left to the worker: this is a lookup and a texture upload over
+        // a picture that was decoded minutes ago, so the picture is right for wherever the
+        // pointer now is within a frame of the window's, whatever the walk behind it is doing.
+        if let Some(preview) = self.previews.nearest(target) {
+            let _ = self.upload_frame_at(preview.dimensions, &preview);
+        }
         self.frames.request(target);
         if let Some(state) = self.state.as_ref() {
             state.window.request_redraw();
@@ -419,7 +448,7 @@ where
         let state = self.state.as_mut().expect("state exists");
         state.adapter.draw(
             TEXTURE_HANDLE,
-            self.dimensions,
+            self.displayed,
             fps,
             progress,
             self.timeline_hover,
@@ -445,8 +474,22 @@ where
     }
 
     fn upload_frame(&mut self, event_loop: &ActiveEventLoop, frame: &zvidlib::VideoFrame) {
+        if let Err(error) = self.upload_frame_at(frame.dimensions, frame) {
+            self.fail(event_loop, error);
+        }
+    }
+
+    /// Uploads `frame` as the video texture at its own size.
+    ///
+    /// A scrub preview is a quarter of the source on each axis, so the size the texture is
+    /// declared at has to come from the picture rather than from the track.
+    fn upload_frame_at(
+        &mut self,
+        dimensions: VideoDimensions,
+        frame: &zvidlib::VideoFrame,
+    ) -> Result<()> {
         let Some(state) = self.state.as_mut() else {
-            return;
+            return Ok(());
         };
         let resource = GraphicsResource::new(
             GraphicsApi::NativeOpenGl,
@@ -454,13 +497,13 @@ where
             state.adapter.execution_owner(),
             ResourceKind::Texture2d,
             TEXTURE_HANDLE,
-            self.dimensions,
+            dimensions,
             PixelFormat::Rgba8,
             ColorRange::Limited,
             Orientation::TopLeft,
             ResourceOwnership::Caller,
         );
-        if let Err(error) = execute_transfer(
+        execute_transfer(
             Some(&mut state.adapter),
             FrameSource::Cpu(CpuFrameSource {
                 frame,
@@ -468,9 +511,9 @@ where
             }),
             FrameDestination::Graphics(resource),
             TransferPolicy::any(),
-        ) {
-            self.fail(event_loop, error);
-        }
+        )?;
+        self.displayed = dimensions;
+        Ok(())
     }
 }
 
