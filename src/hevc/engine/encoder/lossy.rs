@@ -124,7 +124,11 @@
 //! takes band offset at one coarse CTB whose slice then sits 0.003 dB *under*
 //! the curve above; at `SAO_LAMBDA_BAND`, the trust bound rather than the
 //! measured end, band offset stops being selected anywhere and all of the
-//! gains above are given back.
+//! gains above are given back. What the constant is standing in for is not a
+//! mispriced bit but the resolution of the slice-level rule below — see
+//! [`SAO_ACCEPTANCE_RESOLUTION_NUM`], and [`SaoLambda::band_q8`] for the
+//! window it is bracketed inside and why re-taking the sweep against the
+//! repaired rule does not move it.
 //!
 //! ## Why the writer runs two passes
 //!
@@ -2289,6 +2293,15 @@ mod tests {
     /// [`SaoLambda::band_q8`] records. Below 1.5x `lambda_q8` the `CURVE` line
     /// for noise 128x96 QP 32 goes to -0.003 dB; at 4x the `SWEEP` lines lose
     /// their band components entirely.
+    ///
+    /// #344 re-took it at 1.4x and 1.1x — the two ends of what the probe
+    /// measures a marginal bit at — against the repaired slice-level rule and
+    /// against the one before it. All four runs agree to the byte: that same
+    /// slice lands 2079 bytes and -0.003 dB, so the floor of the bracket is
+    /// not something the rule's own restatement moves. At 1.5x the invariant
+    /// holds and the QPs carrying band components go from 13 to 27, which is
+    /// the whole of what lowering the charge would buy and is refused for
+    /// sitting on the boundary the measurement puts the failure just beyond.
     #[test]
     #[ignore = "measurement: the QP 12-51 SAO sweep on both pictures at both sizes"]
     fn sao_sweep() {
@@ -2405,7 +2418,9 @@ mod tests {
                 // The same error where the invariant measures it: how far the
                 // predicted reconstruction sits from the measured one.
                 let db = 10.0
-                    * ((coded.sse as f64 - predicted).max(1.0) / held.sse as f64).log10().abs();
+                    * ((coded.sse as f64 - predicted).max(1.0) / held.sse as f64)
+                        .log10()
+                        .abs();
                 println!(
                     "PRECISION {name} qp {qp}: {sao_bits} bits, reachable {truth:.0} measured, \
                      {predicted:.0} predicted ({:+.2}%, {db:.4} dB)",
