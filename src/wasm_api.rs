@@ -7,9 +7,9 @@
 use crate::io::MemorySource;
 use crate::web_decoder::{WebVideoDecodeSession, video_frame_durations_ms};
 use crate::{
-    AudioBuffer as CoreAudioBuffer, ColorRange, ErrorKind, FrameIndex as CoreFrameIndex, FrameRate,
-    Limits, PixelFormat, Plane, Rational as CoreRational, SampleRange as CoreSampleRange, Timeline,
-    VideoDimensions, VideoFrame as CoreVideoFrame,
+    AudioBuffer as CoreAudioBuffer, CancellationToken, ColorRange, ErrorKind,
+    FrameIndex as CoreFrameIndex, FrameRate, Limits, PixelFormat, Plane, Rational as CoreRational,
+    SampleRange as CoreSampleRange, Timeline, VideoDimensions, VideoFrame as CoreVideoFrame,
 };
 use js_sys::{BigInt, Float32Array, Promise, Reflect, Uint8Array};
 use std::cell::{Cell, RefCell};
@@ -60,6 +60,7 @@ fn error_code_for_kind(kind: ErrorKind) -> &'static str {
         ErrorKind::Cancelled => "CANCELLED",
         ErrorKind::InvalidState => "INVALID_STATE",
         ErrorKind::Internal => "INTERNAL",
+        ErrorKind::WouldBlock => "WOULD_BLOCK",
     }
 }
 
@@ -82,6 +83,17 @@ fn normalize_browser_error(error: JsValue, context: &str) -> JsValue {
             .unwrap_or_else(|| "browser operation failed".to_owned());
         js_error(ErrorKind::Io, format!("{context}: {detail}"))
     }
+}
+
+/// Cancels `cancellation` when `signal` aborts, so a decode already under way stops there.
+///
+/// The returned closure is the live `abort` listener and has to outlive the operation it is
+/// cancelling; dropping it removes the listener.
+fn cancel_on_abort(signal: &AbortSignal, cancellation: &CancellationToken) -> Closure<dyn FnMut()> {
+    let cancellation = cancellation.clone();
+    let listener = Closure::<dyn FnMut()>::new(move || cancellation.cancel());
+    signal.set_onabort(Some(listener.as_ref().unchecked_ref()));
+    listener
 }
 
 fn check_signal(signal: Option<&AbortSignal>) -> Result<(), JsValue> {
@@ -753,7 +765,15 @@ impl WasmVideoStream {
             }
             let mut session = session.expect("just populated above");
             check_signal(signal.as_ref())?;
-            let result = session.get(frame_index).await;
+            // Aborting has to reach inside the decode, not just bracket it: one group of pictures
+            // is hundreds of frames on real content, and a scrub that aborts a request it has
+            // already moved past must free the decoder for the newest position rather than
+            // leaving it to finish the stale one first (issue #333).
+            let cancellation = CancellationToken::new();
+            let _abort = signal
+                .as_ref()
+                .map(|signal| cancel_on_abort(signal, &cancellation));
+            let result = session.get(frame_index, &cancellation).await;
             *decode_session.borrow_mut() = Some(session);
             let (dimensions, rgba) =
                 result.map_err(|error| js_error(error.kind(), error.message()))?;
@@ -1249,6 +1269,21 @@ mod tests {
     fn assert_error_code(error: &JsValue, expected: &str) {
         assert_eq!(error_code(error).as_deref(), Some(expected));
         assert!(error.is_instance_of::<js_sys::Error>());
+    }
+
+    #[wasm_bindgen_test]
+    fn aborting_cancels_the_decode_already_under_way() {
+        // `check_signal` only brackets an operation. A scrub that replaces a request needs the
+        // decode inside it to stop, which is what the bridged token gives the decode loop.
+        let controller = AbortController::new().unwrap();
+        let cancellation = CancellationToken::new();
+        let _listener = cancel_on_abort(&controller.signal(), &cancellation);
+        assert!(!cancellation.is_cancelled());
+        controller.abort();
+        assert!(
+            cancellation.is_cancelled(),
+            "aborting the signal cancels the decode it was passed to"
+        );
     }
 
     #[wasm_bindgen_test]
