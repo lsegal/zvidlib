@@ -1443,7 +1443,12 @@ mod tests {
     #[test]
     fn the_narrow_kernel_agrees_with_the_wide_one_on_eight_bit_taps() {
         let wide: Vec<Vec<i32>> = (0..8)
-            .map(|t| samples(t + 3, 137, 255).into_iter().map(|v| v.rem_euclid(256)).collect())
+            .map(|t| {
+                samples(t + 3, 137, 255)
+                    .into_iter()
+                    .map(|v| v.rem_euclid(256))
+                    .collect()
+            })
             .collect();
         let narrow: Vec<Vec<i16>> = wide
             .iter()
@@ -1514,7 +1519,12 @@ mod tests {
         const BUF: usize = 1024;
         const TOTAL: usize = 1 << 22;
         let wide: Vec<Vec<i32>> = (0..8)
-            .map(|t| samples(t + 11, BUF, 255).into_iter().map(|v| v.rem_euclid(256)).collect())
+            .map(|t| {
+                samples(t + 11, BUF, 255)
+                    .into_iter()
+                    .map(|v| v.rem_euclid(256))
+                    .collect()
+            })
             .collect();
         let narrow: Vec<Vec<i16>> = wide
             .iter()
@@ -1525,7 +1535,9 @@ mod tests {
         let isas = available_isas();
         let rounds = 9;
 
-        println!("\n8-tap filter_taps: i32 vs i16 accumulation, best of {rounds} interleaved rounds");
+        println!(
+            "\n8-tap filter_taps: i32 vs i16 accumulation, best of {rounds} interleaved rounds"
+        );
         println!("  (same total sample count and same L1-resident buffer at every length)");
         println!("   row   isa         i32 ms   i16 ms   narrow");
         for &len in &[4usize, 8, 16, 32, 64, 128, 256] {

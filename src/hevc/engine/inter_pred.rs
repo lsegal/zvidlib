@@ -532,7 +532,13 @@ fn interp_block<const N: usize>(
                         &mut win,
                     );
                     let taps: [&[i16]; N] = std::array::from_fn(|t| &win[t..t + w]);
-                    simd::filter_taps_narrow(isa, &taps, &hk16, shift1, &mut out[y * w..(y + 1) * w]);
+                    simd::filter_taps_narrow(
+                        isa,
+                        &taps,
+                        &hk16,
+                        shift1,
+                        &mut out[y * w..(y + 1) * w],
+                    );
                 }
                 return out;
             }
@@ -552,7 +558,13 @@ fn interp_block<const N: usize>(
                 for y in 0..h {
                     let taps: [&[i16]; N] =
                         std::array::from_fn(|t| &src[(y + t) * w..(y + t + 1) * w]);
-                    simd::filter_taps_narrow(isa, &taps, &vk16, shift1, &mut out[y * w..(y + 1) * w]);
+                    simd::filter_taps_narrow(
+                        isa,
+                        &taps,
+                        &vk16,
+                        shift1,
+                        &mut out[y * w..(y + 1) * w],
+                    );
                 }
                 return out;
             }
@@ -1984,9 +1996,8 @@ mod tests {
             for &(x_int, y_int) in &ORIGINS {
                 for x_frac in 0..4 {
                     for y_frac in 0..4 {
-                        let got =
-                            interp_luma_block(&plane, x_int, y_int, x_frac, y_frac, w, h, 8)
-                                .unwrap();
+                        let got = interp_luma_block(&plane, x_int, y_int, x_frac, y_frac, w, h, 8)
+                            .unwrap();
                         let want = (0..h as i32)
                             .flat_map(|y| {
                                 (0..w as i32).map(move |x| {
