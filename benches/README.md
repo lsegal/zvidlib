@@ -1118,11 +1118,47 @@ getting about 1.5x back for it. The `_1080p` variants agree to two decimal
 places, so the ratio is a property of the kernels rather than of the frame size.
 
 `sse4.1` beats `avx2` on a minority of rows, and by enough on two of them to be
-more than noise: `av1_encode_stage_coeff_ctx` is 3.04x under `sse4.1` against
+more than noise: `av1_encode_stage_coeff_ctx` was 3.04x under `sse4.1` against
 2.50x under `avx2`, and the `rdo_inter` pair is 1.63x/1.64x against 1.55x. The
-`Best` column already records `sse4.1` for these, but the dispatch site prefers
-`avx2` when the host has it, so a real encode takes the slower arm. Why the
-wider kernel is slower is not answered by this table; `#362` answers it.
+`Best` column already recorded `sse4.1` for these, but the dispatch site
+preferred `avx2` when the host had it, so a real encode took the slower arm.
+#362 answers why, and the answer is the same one for both rows: **the wide arm
+never reaches its width on the block shapes these workloads actually use.** Not
+lane-crossing, not downclocking, not the context gather. The detail differs.
+
+- `av1_encode_stage_coeff_ctx`. `src/av1_simd/coeff.rs` steps along a *row* of
+  the transform block, and a row shorter than the vector cannot be split across
+  more than one iteration however wide the vector is. A 4x4 block is one
+  iteration per row under `sse4.1` *and* under `avx2`, four of AVX2's eight
+  lanes idle in every one of them, so the wide arm does identical work at twice
+  the width — at best a tie. It is not even a tie, because the tail store is the
+  one thing the widths do not share: `I32x::store_masked` forwards a full vector
+  straight to the store instruction and stages a partial one through a stack
+  buffer, and `count` is `min(size, LANES)`. At size 4 SSE4.1's four lanes are
+  exactly full and take the native store, while AVX2 is partial and pays a
+  32-byte spill plus a 16-byte copy on *every* store, twice a row, for
+  `base_out` and `br_out` alike. The group reproduces it so cleanly because
+  `coeff_context_plane` derives contexts for 4x4 blocks and nothing else. #362
+  routes blocks narrower than eight lanes to the SSE4.1 kernel at the
+  `av1_coeff_ctx` dispatch site, the way #342 routed `fwht4x4`, and keeps AVX2
+  from size 8 up where it halves the iterations per row and stores whole
+  vectors. The `avx2` column of this group is consequently the SSE4.1 kernel's
+  number from here on, in the same sense `av1_encode_stage_wht`'s three columns
+  are all the scalar transform.
+- `hevc_encode_*_rdo_inter`. The same family, a different mechanism, and *not*
+  the same fix. `rdcost::sad_avx2`'s 256-bit loop needs `w >= 32` and
+  `satd_avx2`'s vector pair needs `w >= 16`, but `rdo.rs` searches a `CTB` of 16
+  and its candidate partitions subdivide that, so the 32-wide SAD branch is
+  never taken at all and every sub-partition of width 8 or 4 falls through to
+  `satd_8x8_sse41`. Both AVX2 metrics therefore execute the same 128-bit body as
+  their SSE4.1 counterparts, plus a 256-bit zero, a `vextracti128` fold and the
+  `vzeroupper` an AVX2 `#[target_feature]` function emits on return — a fixed
+  per-call cost, on a motion search that issues 81 SAD calls per candidate, which
+  is exactly the loop where a per-call cost cannot amortize. So it is a
+  per-call setup the wider step does not pay for rather than idle lanes and a
+  staged store, and the repair is to widen what the search hands the kernel (or
+  to route these two the way `coeff_ctx` is now routed) rather than anything
+  #362 changes. #370 carries it.
 
 ## Hardware HEVC decoders
 
