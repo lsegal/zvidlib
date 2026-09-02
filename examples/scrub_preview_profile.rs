@@ -53,7 +53,7 @@ use zvidlib::{
 #[path = "native_gl/scrub.rs"]
 mod scrub;
 
-use scrub::FrameService;
+use scrub::{FrameService, target_frame};
 
 /// Runs of each arm when the caller names no count.
 ///
@@ -78,8 +78,14 @@ const POLL_INTERVAL: Duration = Duration::from_millis(2);
 struct Walk {
     /// Time from the request to the target frame being collected.
     arrival: Duration,
-    /// Pictures the walk published, the target itself included.
-    published: usize,
+    /// Pictures the walk published, the target itself included. Counted by the service rather
+    /// than by what this harness collected: a picture the render thread never draws still cost
+    /// its conversion, and a poll that finds two only draws the newer.
+    published: u64,
+    /// Pictures the walk converted to RGBA. A published picture converts the frames behind it
+    /// that fit in the reader's cache as well as itself, so this is the larger number and it is
+    /// the one the time is actually going into.
+    converted: u64,
 }
 
 fn main() {
@@ -101,7 +107,7 @@ fn main() {
     let frame_count = samples.len() as u64;
     // The far end of the bar: the frame a drag released against the right edge asks for, and the
     // one #354 and #363 both quote their seconds for.
-    let target = frame_count.saturating_sub(1);
+    let target = target_frame(1.0, frame_count);
     println!(
         "{} frames, {:?} through {:?}; walking to frame {target} from cold, {runs} run(s) each",
         frame_count,
@@ -110,7 +116,7 @@ fn main() {
     );
 
     let baseline = (0..runs)
-        .map(|_| exact_walk(&*factory, &configuration, &samples, target))
+        .map(|_| exact_walk(&factory, &configuration, &samples, target))
         .min()
         .expect("at least one run");
     println!(
@@ -119,28 +125,39 @@ fn main() {
         baseline.as_secs_f64() * 1000.0,
     );
 
+    // `spacing` is what issue #363 actually asked for - how often the picture under the pointer
+    // moves - and `per convert` is what the time is going into. The interval is a budget for a
+    // stride, not the spacing itself: a stride is capped, and a published picture converts the
+    // cache tail behind it as well as itself, so neither column follows the interval directly.
     println!(
-        "\n{:>9}  {:>10}  {:>9}  {:>10}  {:>13}",
-        "interval", "arrival", "published", "overhead", "per picture"
+        "\n{:>9}  {:>10}  {:>9}  {:>9}  {:>9}  {:>9}  {:>11}",
+        "interval", "arrival", "published", "spacing", "converted", "overhead", "per convert"
     );
     for milliseconds in intervals {
         let interval = Duration::from_millis(milliseconds);
         let walk = (0..runs)
-            .map(|_| preview_walk(&*factory, &configuration, &samples, target, interval))
+            .map(|_| preview_walk(&factory, &configuration, &samples, target, interval))
             .min_by_key(|walk| walk.arrival)
             .expect("at least one run");
         let overhead = walk.arrival.saturating_sub(baseline);
-        // Everything the cadence costs is charged to the pictures it published, which is the
-        // conversion each one runs plus whatever the publish itself gets in the walk's way.
-        let per_picture = overhead
-            .checked_div(walk.published.max(1) as u32)
+        // The cadence's whole cost divided by the pictures it converted, which is the unit that
+        // stays put across the sweep: what a published picture costs depends on how many frames
+        // behind it the reader converts with it, and that varies with the stride.
+        let per_convert = overhead
+            .checked_div(u32::try_from(walk.converted.max(1)).unwrap_or(u32::MAX))
+            .unwrap_or_default();
+        let spacing = walk
+            .arrival
+            .checked_div(u32::try_from(walk.published.max(1)).unwrap_or(u32::MAX))
             .unwrap_or_default();
         println!(
-            "{milliseconds:>6} ms  {:>7.0} ms  {:>9}  {:>9.1}%  {:>10.1} ms",
+            "{milliseconds:>6} ms  {:>7.0} ms  {:>9}  {:>6.0} ms  {:>9}  {:>8.0}%  {:>8.1} ms",
             walk.arrival.as_secs_f64() * 1000.0,
             walk.published,
+            spacing.as_secs_f64() * 1000.0,
+            walk.converted,
             overhead.as_secs_f64() / baseline.as_secs_f64() * 100.0,
-            per_picture.as_secs_f64() * 1000.0,
+            per_convert.as_secs_f64() * 1000.0,
         );
     }
 }
@@ -163,20 +180,22 @@ fn preview_walk(
     .expect("the frame service opens over the bundled sample");
     let started = Instant::now();
     frames.request(target);
-    let mut published = 0;
     loop {
-        // Collecting is what the render thread does with a picture: one is only published if
-        // something takes it, so a harness that never collected would not be timing a drag.
+        // Collecting is what the render thread does with a picture, and it is what frees the
+        // delivery queue, so a harness that never collected would not be timing a drag.
         match frames.take_latest() {
-            Some((index, _frame)) => {
-                published += 1;
-                if index == target {
-                    return Walk {
-                        arrival: started.elapsed(),
-                        published,
-                    };
-                }
+            Some((index, _frame)) if index == target => {
+                let arrival = started.elapsed();
+                let (published, statistics) = frames.published();
+                return Walk {
+                    arrival,
+                    published,
+                    converted: statistics
+                        .samples_submitted
+                        .saturating_sub(statistics.samples_skipped),
+                };
             }
+            Some(_) => {}
             None => thread::sleep(POLL_INTERVAL),
         }
     }
