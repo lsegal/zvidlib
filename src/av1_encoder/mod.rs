@@ -1592,10 +1592,13 @@ mod nonlossless_tests {
         }
     }
 
+    /// One size of the tuning set: its dimensions and the frames measured at them.
+    type TuningFrames = (usize, usize, Vec<(&'static str, Vec<u8>)>);
+
     /// The frames a calibration sweep runs on, at both sizes: [`content_frames`] - which since
     /// #343 carries the three `gain_*` frames that separate the type gain - and the encoder's own
     /// `test_pattern`.
-    fn tuning_set() -> Vec<(usize, usize, Vec<(&'static str, Vec<u8>)>)> {
+    fn tuning_set() -> Vec<TuningFrames> {
         [(128_usize, 96_usize), (192, 160)]
             .into_iter()
             .map(|(width, height)| {
@@ -1609,7 +1612,7 @@ mod nonlossless_tests {
     /// The cost of the same estimator probing *every* size search, which is what a sampled arm's
     /// penalty is measured against and does not itself depend on any of the constants.
     fn unsampled_costs(
-        sets: &[(usize, usize, Vec<(&'static str, Vec<u8>)>)],
+        sets: &[TuningFrames],
     ) -> std::collections::BTreeMap<(usize, &'static str, u8), i64> {
         let mut costs = std::collections::BTreeMap::new();
         for (width, height, frames) in sets {
@@ -1632,7 +1635,7 @@ mod nonlossless_tests {
     /// The worst frame's and the mean penalty an arm costs over [`tuning_set`], against the
     /// unsampled estimator.
     fn tuning_set_penalty(
-        sets: &[(usize, usize, Vec<(&'static str, Vec<u8>)>)],
+        sets: &[TuningFrames],
         unsampled: &std::collections::BTreeMap<(usize, &'static str, u8), i64>,
         arm: GainArm,
     ) -> (f64, String, f64) {
@@ -2541,8 +2544,16 @@ mod nonlossless_tests {
     /// and the same two on a 32x32 checkerboard so the boundaries run in both axes - were added by
     /// #308 so that a correction which needs the frame's content to hold still is measured on
     /// content that changes many times and in both directions, not only on content that changes
-    /// once. The current measurements at the shipped interval are `bands` +3.43% against its 4%,
-    /// and every other frame at or under +1.27% against its 1%.
+    /// once. The three `gain_*` frames were added by #343 for the other half of that: they change
+    /// the *type gain* across a boundary rather than the residual energy, which is what the
+    /// shrinkages carry and what none of the frames above move at all.
+    ///
+    /// The ceilings were last re-measured for #343, which shrank a trial's own probe correction
+    /// by [`tile::TYPE_GAIN_PROBE_TRUST`]. They came out tighter, not looser: `scene_edge` falls
+    /// from the 2.5% it had needed to 1%, the whole set fits under 1% except `mosaic` at +1.22%
+    /// and the new `gain_bands` at +1.44%, and the worst frame of the tuning set falls from
+    /// +1.99% to +1.44%. They live in [`type_gain_ceilings`] so this assertion and
+    /// `measure_type_gain_memory_against_trust` cannot drift apart.
     #[test]
     fn the_type_gain_per_frame_penalties_are_pinned_at_the_shipped_sampling_interval() {
         // The interval the ceilings below were measured at. This is an equality, not a bound:
