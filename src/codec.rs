@@ -354,6 +354,11 @@ pub struct ExactFrameReader {
     /// so the decoder passed through them without producing one. Reaching one again needs the
     /// same reset an evicted published frame does.
     suppressed_since_reset: HashSet<FrameIndex>,
+    /// Frames whose sample has been submitted and whose picture has not come back yet, because a
+    /// reordering decoder holds one until the samples after it arrive. They are the frames a
+    /// decoder may drop the moment output stops being wanted, so turning it off writes them off
+    /// with the rest.
+    in_flight_since_reset: HashSet<FrameIndex>,
     /// What the decoder was last told, so a walk toggles it once at the target rather than
     /// on every sample.
     output_wanted: bool,
@@ -413,6 +418,7 @@ impl ExactFrameReader {
             lru: VecDeque::new(),
             published_since_reset: HashSet::new(),
             suppressed_since_reset: HashSet::new(),
+            in_flight_since_reset: HashSet::new(),
             output_wanted: true,
             next_decode_position: None,
             limits,
@@ -461,6 +467,7 @@ impl ExactFrameReader {
             self.statistics.resets = self.statistics.resets.saturating_add(1);
             self.published_since_reset.clear();
             self.suppressed_since_reset.clear();
+            self.in_flight_since_reset.clear();
             self.next_decode_position = Some(random_access_position);
         }
 
@@ -508,6 +515,9 @@ impl ExactFrameReader {
                 self.statistics.samples_skipped = self.statistics.samples_skipped.saturating_add(1);
                 self.suppressed_since_reset
                     .insert(self.samples[position].presentation_index);
+            } else {
+                self.in_flight_since_reset
+                    .insert(self.samples[position].presentation_index);
             }
             self.next_decode_position = Some(position + 1);
             work += 1;
@@ -536,11 +546,27 @@ impl ExactFrameReader {
     }
 
     /// Tells the decoder whether the next samples' pictures are wanted, when that has changed.
+    ///
+    /// Turning output off writes off the frames the decoder is still holding as well as the ones
+    /// it is about to be handed. A reordering decoder releases a picture several samples after
+    /// the one that carried it, so a frame submitted while output was wanted can come out - and
+    /// be dropped - during the suppressed stretch that follows. Not writing those off is a
+    /// decoder that will never produce them and a reader that still believes it can ask, which
+    /// ends in `decoder did not produce the requested presentation frame`. A picture that does
+    /// arrive after all takes itself back off the list in [`publish`].
+    ///
+    /// [`publish`]: Self::publish
     fn set_output_wanted(&mut self, wanted: bool) {
-        if self.output_wanted != wanted {
-            self.decoder.set_output_wanted(wanted);
-            self.output_wanted = wanted;
+        if self.output_wanted == wanted {
+            return;
         }
+        if !wanted {
+            for frame in self.in_flight_since_reset.drain() {
+                self.suppressed_since_reset.insert(frame);
+            }
+        }
+        self.decoder.set_output_wanted(wanted);
+        self.output_wanted = wanted;
     }
 
     /// Clears decoder, reorder, and frame-cache state.
@@ -553,6 +579,7 @@ impl ExactFrameReader {
         self.lru.clear();
         self.published_since_reset.clear();
         self.suppressed_since_reset.clear();
+        self.in_flight_since_reset.clear();
         Ok(())
     }
 
@@ -586,6 +613,8 @@ impl ExactFrameReader {
             // sample's picture later, hands back a frame this reader had written off. What it
             // was handed is what counts, so it is a cached frame again rather than a reset.
             self.suppressed_since_reset
+                .remove(&output.presentation_index);
+            self.in_flight_since_reset
                 .remove(&output.presentation_index);
             if !self.published_since_reset.insert(output.presentation_index) {
                 return Err(Error::new(
@@ -1160,6 +1189,122 @@ mod tests {
         assert_eq!(
             reader.statistics().samples_submitted,
             after_walk.samples_submitted
+        );
+    }
+
+    /// A decoder that releases each picture one sample late, and drops whatever it is holding
+    /// when nothing wants its output - which is what a reordering decoder does.
+    struct LateFactory;
+
+    struct LateDecoder {
+        configuration: VideoDecoderConfig,
+        limits: Limits,
+        held: Option<EncodedVideoSample>,
+        output_wanted: bool,
+    }
+
+    impl VideoDecoderFactory for LateFactory {
+        fn capability(&self, _: &VideoDecoderConfig) -> CodecSupport {
+            CodecSupport::Supported {
+                implementation: CodecImplementation::Software,
+            }
+        }
+
+        fn create(
+            &self,
+            configuration: &VideoDecoderConfig,
+            limits: &Limits,
+        ) -> Result<Box<dyn VideoDecoder>> {
+            Ok(Box::new(LateDecoder {
+                configuration: configuration.clone(),
+                limits: *limits,
+                held: None,
+                output_wanted: true,
+            }))
+        }
+    }
+
+    impl LateDecoder {
+        fn release(&self, sample: EncodedVideoSample) -> Result<Vec<DecodedVideoFrame>> {
+            if !self.output_wanted {
+                return Ok(Vec::new());
+            }
+            Ok(vec![DecodedVideoFrame {
+                presentation_index: sample.presentation_index,
+                frame: VideoFrame::new(
+                    self.configuration.coded_dimensions,
+                    PixelFormat::Gray8,
+                    ColorRange::Full,
+                    vec![Plane {
+                        data: sample.data,
+                        stride: 1,
+                    }],
+                    &self.limits,
+                )?,
+            }])
+        }
+    }
+
+    impl VideoDecoder for LateDecoder {
+        fn submit(
+            &mut self,
+            sample: &EncodedVideoSample,
+            cancellation: &CancellationToken,
+        ) -> Result<Vec<DecodedVideoFrame>> {
+            cancellation.check()?;
+            match self.held.replace(sample.clone()) {
+                Some(previous) => self.release(previous),
+                None => Ok(Vec::new()),
+            }
+        }
+
+        fn drain(&mut self, _: &CancellationToken) -> Result<Vec<DecodedVideoFrame>> {
+            match self.held.take() {
+                Some(held) => self.release(held),
+                None => Ok(Vec::new()),
+            }
+        }
+
+        fn reset(&mut self) -> Result<()> {
+            self.held = None;
+            Ok(())
+        }
+
+        fn set_output_wanted(&mut self, wanted: bool) {
+            self.output_wanted = wanted;
+        }
+    }
+
+    #[test]
+    fn a_frame_still_inside_a_reordering_decoder_when_output_stops_is_written_off_too() {
+        // The frame a decoder is holding when output stops being wanted comes out during the
+        // suppressed stretch and is dropped, even though its own sample was submitted while
+        // output was still wanted. A reader that does not write it off believes it can still be
+        // asked for and reports the decoder as malformed when it never arrives.
+        let mut reader = ExactFrameReader::new(
+            &LateFactory,
+            config(),
+            single_group_of_pictures(),
+            small_cache(),
+        )
+        .unwrap();
+        let cancellation = CancellationToken::new();
+
+        // Reaching frame 4 means submitting frame 5's sample to release it, so the decoder is
+        // left holding frame 5 - which it releases, and drops, on the first suppressed submit of
+        // the request that follows.
+        assert_eq!(
+            value(&reader.get(FrameIndex(4), &cancellation).unwrap()),
+            40
+        );
+        assert_eq!(
+            value(&reader.get(FrameIndex(9), &cancellation).unwrap()),
+            90
+        );
+        assert_eq!(
+            value(&reader.get(FrameIndex(5), &cancellation).unwrap()),
+            50,
+            "the frame that was dropped in flight is decoded again, not reported missing"
         );
     }
 
