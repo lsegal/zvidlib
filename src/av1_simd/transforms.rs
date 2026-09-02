@@ -1114,6 +1114,7 @@ unsafe fn store_rows4<V: I32x>(rows: [V; 4], block: &mut [i32]) {
 /// # Safety
 /// The caller must have verified `V`'s instruction set is available, and every
 /// entry of `quant` must satisfy `|q| <= WHT_INPUT_LIMIT`.
+#[inline(always)]
 pub(crate) unsafe fn iwht4x4<V: I32x + Transpose4>(quant: &[i32; 16]) -> [i32; 16] {
     unsafe {
         let rows = load_rows4::<V>(quant);
@@ -1143,6 +1144,7 @@ pub(crate) unsafe fn iwht4x4<V: I32x + Transpose4>(quant: &[i32; 16]) -> [i32; 1
 /// # Safety
 /// The caller must have verified `V`'s instruction set is available, and every
 /// entry of `residual` must satisfy `|r| <= WHT_INPUT_LIMIT`.
+#[inline(always)]
 pub(crate) unsafe fn fwht4x4<V: I32x + Transpose4>(residual: &[i32; 16]) -> [i32; 16] {
     unsafe {
         // The forward transform undoes the decoder's column pass first, and the
@@ -1329,6 +1331,7 @@ macro_rules! inverse_transform_driver {
         /// # Safety
         /// The caller must have verified `V`'s instruction set is available
         /// and that `dequantized` is within `input_limit`.
+        #[inline(always)]
         pub(crate) unsafe fn $name<V: I32x + Transpose4>(
             dequantized: &[i32],
             column: Tx1d,
@@ -1453,6 +1456,7 @@ macro_rules! forward_transform_driver {
         /// # Safety
         /// The caller must have verified `V`'s instruction set is available
         /// and that `residual` is within `input_limit`.
+        #[inline(always)]
         pub(crate) unsafe fn $name<V: I32x + Transpose4>(
             residual: &[i32],
             column: Tx1d,

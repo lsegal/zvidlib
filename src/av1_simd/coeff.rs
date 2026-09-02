@@ -138,6 +138,7 @@ pub(crate) fn fill_padded_levels(plane: &mut [i32], coefficients: &[i32], size: 
 /// # Safety
 ///
 /// Only callable from a wrapper that has verified `V`'s CPU feature.
+#[inline(always)]
 pub(crate) unsafe fn block_contexts<V: I32x>(
     plane: &[i32],
     size: usize,
