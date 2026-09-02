@@ -991,11 +991,21 @@ predictor has no vector kernel and its per-ISA arms only forwarded to the
 scalar one, which on x86_64 costs a `#[target_feature]` call that can never be
 inlined into the caller and on aarch64 costs nothing, because the wrapper adds
 no feature over the baseline. Those placeholder arms are gone.
-`av1_encode_stage_wht` (0.67x / 0.69x before, 0.67x / 0.70x after) is the one
-row where the vector form genuinely loses: a 4x4 WHT is fourteen SSE2-baseline
-adds and shifts per pass that LLVM already auto-vectorizes out of the scalar
-reference, and the kernel adds three `transpose4`s on top of them. It is
-dispatched to the scalar path on x86_64 and kept on `neon`.
+`av1_encode_stage_wht` (0.67x / 0.69x before the repair, 0.67x / 0.70x after
+it, over three rounds on two CPU models) is the one row where the vector form
+genuinely loses: a 4x4 WHT is fourteen SSE2-baseline adds and shifts per pass
+that LLVM already auto-vectorizes out of the scalar reference, and the kernel
+adds three `transpose4`s - twenty-four shuffle micro-operations - on top of
+them. It is dispatched to the scalar path on x86_64 and kept on `neon`, after
+which the group reads 1.30x / 1.24x, which is one implementation under three
+labels and should be read as the null result the section above describes rather
+than as a win.
+
+Every row above was re-confirmed on an **AMD EPYC 9V74**, the part the
+sub-parity table was drawn on, and not only on the other `ubuntu-latest` models
+the pool offers: `av1_encode_frame_q32` reads 1.45x / 1.54x and
+`av1_encode_frame_q160` 1.46x / 1.54x there, against the 0.52x and 0.48x they
+recorded before.
 
 The lesson this leaves next to the aarch64 sub-parity discussion above is the
 mirror of it. There, a row below `1.00x` was noise walking towards parity as
