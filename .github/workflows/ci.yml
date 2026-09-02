@@ -43,7 +43,11 @@ jobs:
         run: cargo test --features native --test bench_sources_compile
       # `criterion_baseline.py` is where a benchmark regression threshold is
       # justified from, and it runs in a job that takes two hours to reach it.
-      # Standard library only, so this needs no install step.
+      # Standard library only, so this needs no install step. Its `table`
+      # subcommand is covered here too: that path's failure mode is a plausible
+      # table with a column silently missing rather than a crash - the arm name
+      # it matched drifted from the one `SimdIsa` prints and every SSE4.1
+      # measurement was dropped - and nothing else in CI executes it.
       - name: Test the benchmark baseline script
         run: python3 -m unittest discover -s .github/scripts -v
       - name: Test AV1 SIMD kernels against the scalar path
@@ -52,6 +56,19 @@ jobs:
         run: cargo test --features native --lib
       - name: Test AV1 SIMD motion compensation
         run: cargo test --features native --lib av1_mc -- --nocapture
+      # `--release` is the profile #327 was reported against: nothing about the
+      # missing rpath is profile-specific, but this is the invocation the issue
+      # names and the one the Intel benchmark column is measured with, so it is
+      # the one worth asserting launches unaided. `cargo build` first so the
+      # shipped cdylib exists for the rpath test to check as well - `cargo test`
+      # alone links the library as an rlib and never produces it. Neither step
+      # sets a `DYLD_*` variable, which is the point.
+      - name: Test the macOS Swift runtime rpath
+        if: runner.os == 'macOS'
+        run: |
+          cargo build --release --features native
+          cargo test --release --features native --test macos_swift_runtime_rpath -- --nocapture
+          cargo test --release --features native --lib
       - name: Test native_gl example overlays
         run: cargo test --features native --example native_gl
       # The HEVC/AV1 engine unit tests are pure numerics, and the inter-prediction
@@ -191,6 +208,11 @@ jobs:
           path: baseline/criterion-baseline.json
           retention-days: 90
 
+      # This one is per-run rather than a chain, so it carries the collected
+      # baseline too. A `workflow_dispatch` run deliberately does not become the
+      # stored `main` baseline above, and without a copy here its numbers would
+      # be unrecoverable off the runner - which is exactly what refreshing the
+      # committed table in `benches/README.md` needs from a dispatched run.
       - name: Upload the full benchmark log
         if: github.event_name != 'pull_request'
         uses: actions/upload-artifact@v4
@@ -198,6 +220,7 @@ jobs:
           name: criterion-report-${{ github.run_id }}
           path: |
             bench.log
+            baseline/criterion-baseline.json
             target/criterion/**/new/estimates.json
           retention-days: 30
 
@@ -206,7 +229,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest]
+        # `macos-latest` is aarch64, and Apple silicon's dyld shared cache
+        # resolves the Swift runtime the `apple-cf` bridge references whether or
+        # not the binary carries an rpath for it. x86_64 macOS does not, so a
+        # missing rpath is a launch failure there and invisible here (#327);
+        # `macos-15-intel` is what makes that arm covered rather than only ever
+        # reached by hand when someone measures the Intel benchmark column.
+        os: [windows-latest, macos-latest, macos-15-intel]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -228,3 +257,16 @@ jobs:
         run: cargo test --features native --test native_hevc_hardware -- --nocapture
       - name: Test AV1 SIMD motion compensation
         run: cargo test --features native --lib av1_mc -- --nocapture
+      # `--release` is the profile #327 was reported against: nothing about the
+      # missing rpath is profile-specific, but this is the invocation the issue
+      # names and the one the Intel benchmark column is measured with, so it is
+      # the one worth asserting launches unaided. `cargo build` first so the
+      # shipped cdylib exists for the rpath test to check as well - `cargo test`
+      # alone links the library as an rlib and never produces it. Neither step
+      # sets a `DYLD_*` variable, which is the point.
+      - name: Test the macOS Swift runtime rpath
+        if: runner.os == 'macOS'
+        run: |
+          cargo build --release --features native
+          cargo test --release --features native --test macos_swift_runtime_rpath -- --nocapture
+          cargo test --release --features native --lib
