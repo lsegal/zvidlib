@@ -1,0 +1,59 @@
+# Temporary: the x86_64 measurement for issue #342, removed before this branch
+# merges. `ci.yml`'s timed benchmark run is `main`-only and its concurrency
+# group serializes one dispatch per ref, so drawing several `ubuntu-latest`
+# hosts at once from a branch needs its own workflow. Six draws are dispatched
+# so that three sharing a CPU model can be selected afterwards, exactly the way
+# #351 re-took the committed table.
+name: Measure #342 (inverse 4x4 WHT on x86_64)
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/measure-342.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  wht:
+    name: WHT groups (draw ${{ matrix.draw }})
+    strategy:
+      fail-fast: false
+      matrix:
+        draw: [1, 2, 3, 4, 5, 6]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: rustup show
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Install native audio dependencies
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      # The committed table names the CPU model it was measured on, so the
+      # model has to be in each draw's own record: an elementwise minimum
+      # across two models is attributable to no named host.
+      - name: Report the host
+        run: |
+          grep -m1 'model name' /proc/cpuinfo
+          grep -m1 '^flags' /proc/cpuinfo | tr ' ' '\n' | grep -E '^(sse4_1|avx2)$' || true
+      # Both directions of the same dispatch family, at both sizes. The forward
+      # group is measured alongside the inverse one so the two are comparable
+      # within a draw rather than across tables.
+      - name: Time the forward and inverse WHT groups
+        env:
+          ZVIDLIB_BENCH_LARGE: '1'
+        run: |
+          set -o pipefail
+          cargo bench --features native --bench av1_encode -- \
+            'av1_encode_stage_(wht|iwht)' 2>&1 | tee wht.log
+      - name: Upload the log
+        uses: actions/upload-artifact@v4
+        with:
+          name: wht-draw-${{ matrix.draw }}
+          path: wht.log
+          retention-days: 7
