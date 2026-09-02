@@ -11,7 +11,11 @@
 //! legend is drawn above the timeline bar until it fades out (press `H` to show or hide it).
 //!
 //! Dragging the timeline bar decodes its previews on a background thread (see [`scrub`]), so the
-//! window keeps drawing and keeps its audio scheduled while the pointer moves.
+//! window keeps drawing and keeps its audio scheduled while the pointer moves. What it draws
+//! while that decode runs comes from [`previews`], a background pass that keeps a shrunk picture
+//! every half second of the track: the bundled sample is one group of pictures, so the frame at
+//! the far end of the bar is a second of hardware decoding away however the walk to it is
+//! arranged, and only a picture that was decoded already can answer a drag immediately.
 //!
 //! Run with:
 //!
