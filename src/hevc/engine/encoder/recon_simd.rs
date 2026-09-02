@@ -12,10 +12,12 @@
 //!   itself runs.
 //!
 //! The search's band-offset half ([`band_offset_row`]) is a dispatch site here
-//! too, but every arm of it resolves to the scalar reference: its 32-way
-//! scatter is not something SSE4.1, AVX2 or NEON can express, and both vector
-//! shapes that leaves were written and measured below parity. That kernel's
-//! documentation carries the numbers.
+//! too, and the answer there depends on the instruction set: its 32-way scatter
+//! is not something SSE4.1, AVX2 or NEON can express, so only the
+//! classification in front of it vectorizes. That is enough on x86_64, where
+//! the SSE4.1 and AVX2 kernels measured ahead of the reference, and not enough
+//! on NEON, where both shapes measured below parity and the arm stays scalar.
+//! That kernel's documentation carries the numbers for both.
 //!
 //! Both are dispatched here through cached runtime CPU feature detection
 //! ([`isa`]) to an SSE4.1 or AVX2 implementation on `x86_64`, a NEON
@@ -381,24 +383,79 @@ const BAND_SHIFT: i32 = 3;
 /// The staging round trip in particular costs more than the classification it
 /// vectorizes, and extracting the lanes only replaces four stores with four
 /// lane reads in front of the same four dependent read-modify-writes. Neither
-/// was worth landing, so this dispatches to scalar the way
+/// was worth landing on NEON, so `aarch64` still resolves to the scalar
+/// reference here, the way
 /// [`crate::hevc::engine::simd::combine_weighted`] does on the instruction sets
 /// where its kernel measured below parity.
 ///
-/// The site is kept rather than the call inlined into
-/// [`crate::hevc::engine::encoder::recon`] so the band search stays a named
-/// `hevc_recon` dispatch point: the reference is exercised under every
-/// `crate::simd::set_override` pin by the tests below, so a future kernel — an
-/// AVX-512 one, where `vpconflictd` and a real scatter change the arithmetic
-/// above — has a place to go and a bit-exactness harness already pointed at it.
-/// x86_64 is untimed here and tracked separately.
+/// # x86_64 does separate, and that is why the site was kept
+///
+/// The site was kept rather than the call inlined into
+/// [`crate::hevc::engine::encoder::recon`] so the band search stayed a named
+/// `hevc_recon` dispatch point with a bit-exactness harness pointed at it, on
+/// the argument that the NEON result was measured rather than universal. It is
+/// not universal. The same two shapes were timed on x86_64 across five CPU
+/// models, nine `ubuntu-latest` draws plus two `macos-15-intel` ones, best of
+/// nine interleaved rounds per draw and grouped by CPU model — the pool draws
+/// several models and they disagree by more than the effect, so an average
+/// across the pool answers nothing. Ratio of the lane-scatter shape to this
+/// scalar reference, at the run lengths #305 used:
+///
+/// | CPU model | 16 | 64 | 256 | 1024 |
+/// |---|---|---|---|---|
+/// | Intel Xeon 6973P-C (AVX2) | 1.16x | 1.53x | 1.53x | 1.51x |
+/// | Intel Xeon Platinum 8573C (AVX2) | 1.16x | 1.28x | 1.44x | 1.39x |
+/// | Intel Core i7-8700B (AVX2) | 1.11x | 1.25x | 1.28x | 1.30x |
+/// | AMD EPYC 7763 (AVX2) | 1.24x | 1.13x | 1.10x | 1.10x |
+/// | AMD EPYC 9V74 (AVX2) | 1.23x | 0.97-1.02x | 1.01x | 0.97x |
+///
+/// Each row reproduces to about ±0.02 across that model's independent draws,
+/// which is the noise floor the decision is taken against; the per-round spread
+/// printed by the harness is dominated by interference on a shared runner and
+/// cancels in the ratio, since the arms are interleaved within a round.
+///
+/// So the classification *is* worth vectorizing on x86_64 even though the
+/// scatter behind it is not: four of the five models separate at every length,
+/// by 1.10x to 1.53x. Only Zen 5 does not, and there the kernel is a wash
+/// rather than a regression at the lengths this call actually sees — a run here
+/// is one CTB row, so 16 to 64 samples, never the 1024 where Zen 5 reads 0.97x.
+/// The SSE4.1 kernel is ahead of scalar on every model at every length
+/// (1.02-1.45x), so a host without AVX2 gets the narrower one.
+///
+/// AVX-512 was timed too, since `ubuntu-latest` turned out to draw AVX-512CD
+/// hosts. Neither shape is landed. Resolving the scatter's duplicate indices
+/// with `vpconflictd` reads **0.42-0.56x** on every host that can run it: the
+/// conflict-resolving pointer chase costs more than the read-modify-writes it
+/// removes, at 32 bands over 16 lanes where duplicates are rare. Merely
+/// widening the classification to 512 bits reads 1.14-1.52x on the Intel parts
+/// but **0.21-0.30x** on Zen 5, whose double-pumped AVX-512 makes the wider
+/// classification a large loss, so the 256-bit kernel is the one that is safe
+/// everywhere.
+///
+/// # Panics
+/// Panics unless the run and the source are the same length.
 pub(crate) fn band_offset_row(here: &[i32], src: &[u8], stats: &mut BandStats) {
     assert_eq!(here.len(), src.len(), "run and source differ");
-    band_offset_row_scalar(here, src, stats)
+    match isa_code() {
+        #[cfg(target_arch = "x86_64")]
+        ISA_AVX2 => {
+            // SAFETY: the lengths agree, and this arm is only reachable after
+            // `is_x86_feature_detected!("avx2")` or an override clamped to an
+            // available instruction set.
+            unsafe { x86::band_offset_row_avx2_lanes(here, src, stats) }
+        }
+        #[cfg(target_arch = "x86_64")]
+        ISA_SSE41 => {
+            // SAFETY: as above, with SSE4.1 detected.
+            unsafe { x86::band_offset_row_sse41_lanes(here, src, stats) }
+        }
+        // NEON measured below parity for both shapes; see above.
+        _ => band_offset_row_scalar(here, src, stats),
+    }
 }
 
-/// The portable reference for [`band_offset_row`], and on every instruction set
-/// this module targets, the implementation it dispatches to.
+/// The portable reference for [`band_offset_row`], and the implementation it
+/// dispatches to on every instruction set without a kernel of its own.
 pub(crate) fn band_offset_row_scalar(here: &[i32], src: &[u8], stats: &mut BandStats) {
     for i in 0..here.len() {
         let recon = here[i];
@@ -676,7 +733,6 @@ mod x86 {
         }
     }
 
-    #[cfg(test)]
     /// §8.7.3.2 band classification for eight samples: the eight band indices
     /// `Clip3(0, 255, recon) >> bandShift`, and the eight `src − recon` errors
     /// taken against the *unclamped* reconstruction the way the scalar
@@ -706,10 +762,11 @@ mod x86 {
     /// the indices and errors to staging buffers, then scatter the buffers with
     /// a scalar loop.
     ///
-    /// Not dispatched to. This is one of the two shapes
-    /// [`super::band_offset_row`] records a measurement for; it is compiled and
-    /// asserted bit-exact against the scalar reference so the number it
-    /// produces is a number for a kernel that would actually be correct to
+    /// Not dispatched to: it is the control the dispatched
+    /// [`band_offset_row_avx2_lanes`] was chosen against, kept because the
+    /// choice between the two shapes is what the measurement below decides. It
+    /// is compiled and asserted bit-exact against the scalar reference so the
+    /// number it produces is a number for a kernel that would be correct to
     /// land.
     #[target_feature(enable = "avx2")]
     pub(super) unsafe fn band_offset_row_avx2_staged(
@@ -737,11 +794,13 @@ mod x86 {
         }
     }
 
-    #[cfg(test)]
-    /// Candidate B on AVX2: the same classification, scattered straight out of
-    /// the vector lanes with `vpextrd` instead of through staging buffers.
+    /// The AVX2 band-offset kernel: classify eight samples in the vector unit,
+    /// then scatter them straight out of the lanes with `vpextrd` rather than
+    /// through the staging buffers [`band_offset_row_avx2_staged`] uses.
     ///
-    /// Not dispatched to; see [`band_offset_row_avx2_staged`].
+    /// This is the arm [`super::band_offset_row`] dispatches to on an AVX2
+    /// host. It measured at or ahead of the staged shape at every run length on
+    /// every CPU model timed, and it is the simpler of the two.
     #[target_feature(enable = "avx2")]
     pub(super) unsafe fn band_offset_row_avx2_lanes(
         here: &[i32],
@@ -922,7 +981,6 @@ mod x86 {
         }
     }
 
-    #[cfg(test)]
     /// The four-lane classification behind the two SSE4.1 candidates.
     #[inline]
     #[target_feature(enable = "sse4.1")]
@@ -968,9 +1026,10 @@ mod x86 {
         }
     }
 
-    #[cfg(test)]
-    /// Candidate B at four lanes: SSE4.1 classification scattered straight out
-    /// of the lanes. Not dispatched to.
+    /// The SSE4.1 band-offset kernel: the four-lane classification scattered
+    /// straight out of the lanes, the narrower form of
+    /// [`band_offset_row_avx2_lanes`] and the arm
+    /// [`super::band_offset_row`] dispatches to on a host without AVX2.
     #[target_feature(enable = "sse4.1")]
     pub(super) unsafe fn band_offset_row_sse41_lanes(
         here: &[i32],

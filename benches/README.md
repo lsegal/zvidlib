@@ -1259,20 +1259,62 @@ than the absolute time): 640x352 29.2 ms scalar against 11.0 ms NEON, and
 1920x1088 121.4 ms scalar against 38.9 ms NEON, where before it read 11.2 ms
 against 9.6 ms at 640x352 and did not separate at all at 1080p.
 
-The SAO parameter search's band-offset half is *not* part of that separation,
-and that is a measured result rather than a gap. `band_offset_row` is a
-`hevc_recon` dispatch site whose every arm resolves to the scalar reference: a
-32-way scatter is not expressible in SSE4.1, AVX2 or NEON, so the only
-vectorizable work is the clamp, shift and widened subtraction in front of it.
-Measured on the same contended Apple Silicon host against the scalar reference
-over L1-resident runs of 16 to 1024 samples, best of interleaved rounds, and
-measured again from a standalone harness: staging the classification into
-buffers and then scattering them read 0.42-1.30x and scattering straight out of
-the vector lanes read 0.44-1.24x. Neither separates from scalar - both straddle
-1.00x by less than the spread between repeats of the same measurement, which is
-what this host's contention looks like. This group agreed: its NEON arm did not
-improve. Neither kernel was landed, the same call
-`combine_weighted` got at four lanes. x86_64 is untimed.
+The SAO parameter search's band-offset half separates on x86_64 and not on
+NEON, and both halves of that are measured results rather than gaps.
+`band_offset_row` is a `hevc_recon` dispatch site whose 32-way scatter is not
+expressible in SSE4.1, AVX2 or NEON, so the only vectorizable work is the
+clamp, shift and widened subtraction in front of it.
+
+On NEON that is not enough. Measured on the same contended Apple Silicon host
+against the scalar reference over L1-resident runs of 16 to 1024 samples, best
+of interleaved rounds, and measured again from a standalone harness: staging
+the classification into buffers and then scattering them read 0.42-1.30x and
+scattering straight out of the vector lanes read 0.44-1.24x. Neither separates
+from scalar - both straddle 1.00x by less than the spread between repeats of
+the same measurement, which is what this host's contention looks like. This
+group agreed: its NEON arm did not improve. Neither kernel was landed, the same
+call `combine_weighted` got at four lanes.
+
+On x86_64 it is enough, and the argument that it would not be - that masking 32
+accumulators costs more than the read-modify-writes it replaces - was an
+analytical one carried over from the NEON measurement. Timed across five CPU
+models (nine `ubuntu-latest` draws plus two `macos-15-intel`), best of nine
+interleaved rounds per draw. **Group the draws by CPU model.** `ubuntu-latest`
+is drawn from several models and they disagree by more than the effect: the
+same AVX2 arm read 1.10x, 1.45x and 0.97x on the first three draws purely
+because they landed on three different CPUs. Within a model the ratio
+reproduces to about +/-0.02 across independent draws, and that is the noise
+floor the decision was taken against - the per-round spread the harness prints
+is dominated by interference on a shared runner and cancels in the ratio, since
+the arms are interleaved within a round.
+
+Lane-scatter shape against the scalar reference, by run length:
+
+| CPU model | 16 | 64 | 256 | 1024 |
+|---|---|---|---|---|
+| Intel Xeon 6973P-C | 1.16x | 1.53x | 1.53x | 1.51x |
+| Intel Xeon Platinum 8573C | 1.16x | 1.28x | 1.44x | 1.39x |
+| Intel Core i7-8700B | 1.11x | 1.25x | 1.28x | 1.30x |
+| AMD EPYC 7763 | 1.24x | 1.13x | 1.10x | 1.10x |
+| AMD EPYC 9V74 | 1.23x | 0.97-1.02x | 1.01x | 0.97x |
+
+Four of the five models separate at every length. Only Zen 5 does not, and
+there the kernel is a wash rather than a regression at the lengths this call
+sees - a run is one CTB row, 16 to 64 samples, never the 1024 where it reads
+0.97x. The AVX2 lane-scatter kernel is therefore dispatched to, with the SSE4.1
+one (1.02-1.45x on every model at every length) behind it for hosts without
+AVX2. The staged shape was the control and measured at or behind the lane
+scatter everywhere.
+
+**AVX-512 was timed and neither shape landed.** `ubuntu-latest` draws AVX-512CD
+hosts, so the `vpconflictd` shape #305 pointed at was reachable. Resolving the
+scatter's duplicate indices inside the vector unit reads **0.42-0.56x** on every
+host that can run it: the conflict-resolving pointer chase costs more than the
+read-modify-writes it removes, at 32 bands over 16 lanes where duplicates are
+rare. Merely widening the classification to 512 bits reads 1.14-1.52x on the
+Intel parts but **0.21-0.30x** on Zen 5, whose double-pumped AVX-512 makes the
+wider classification a large loss - so the 256-bit kernel is the one that is
+safe on every model, and there is no AVX-512 arm.
 
 **Bitstream writing and CABAC** have no vector path at all, so `..._pcm_write`,
 `hevc_encode_cabac`, `hevc_encode_cabac_bypass` and `hevc_encode_bitwriter` are
