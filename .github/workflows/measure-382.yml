@@ -83,3 +83,79 @@ jobs:
           name: measure-382-${{ matrix.os }}-${{ matrix.draw }}
           path: rounds/
           retention-days: 7
+
+  paired:
+    name: Paired branch-against-base (${{ matrix.os }} draw ${{ matrix.draw }})
+    if: github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        draw: [1, 2, 3, 4, 5, 6]
+        include:
+          - os: macos-15-intel
+            draw: 1
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out the branch
+        uses: actions/checkout@v4
+        with:
+          path: branch
+      - name: Check out the base
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          path: base
+      - name: Install Rust toolchain
+        run: rustup show
+        working-directory: branch
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          workspaces: |
+            branch
+            base
+          key: paired-382-${{ matrix.os }}
+      - name: Install native audio dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - name: Report the host CPU model
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            model="$(grep -m1 '^model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//')"
+          else
+            model="$(sysctl -n machdep.cpu.brand_string)"
+          fi
+          echo "HOST_MODEL=$model" >> "$GITHUB_ENV"
+      - name: Build both trees
+        run: |
+          for tree in branch base; do
+            (cd "$tree" && cargo bench --features native --bench hevc_encode --no-run)
+          done
+      # Interleaved within a round: base then branch, five rounds, per-benchmark
+      # minimum. The two trees are built and timed on the same host, which is
+      # what #340 established as the only comparison this effect is readable
+      # against -- an absolute figure from a separate draw is not one.
+      - name: Run the interleaved rounds
+        run: |
+          set -o pipefail
+          mkdir -p rounds
+          for round in $(seq 1 '${{ inputs.rounds || 5 }}'); do
+            for tree in base branch; do
+              (cd "$tree" && cargo bench --features native --bench hevc_encode -- \
+                'hevc_encode_640x352_reconstruct' > /dev/null 2>&1)
+              python3 branch/.github/scripts/criterion_baseline.py collect \
+                --criterion-dir "$tree/target/criterion" \
+                --out "rounds/$tree-round-$round.json" \
+                --host "$HOST_MODEL"
+            done
+          done
+      - name: Report the paired ratio
+        run: python3 branch/.github/scripts/paired_ratio.py rounds "$HOST_MODEL" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Upload the round data
+        uses: actions/upload-artifact@v4
+        with:
+          name: paired-382-${{ matrix.os }}-${{ matrix.draw }}
+          path: rounds/
+          retention-days: 7
