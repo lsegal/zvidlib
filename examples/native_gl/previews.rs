@@ -42,14 +42,14 @@ use zvidlib::{
 /// replaces it within a second anyway.
 const PREVIEW_SCALE: u32 = 4;
 
-/// How far apart the previews are, when memory allows it: half a second of playback.
+/// How many previews a second of playback gets, when memory allows it.
 ///
 /// Closer together is a finer scrub but a longer pass - every preview is a full-resolution
 /// picture the reader has to convert before it can be shrunk, and until the pass reaches the far
-/// end of the bar a drag there falls back to an earlier picture. Half a second is about as coarse
-/// as a scrub can be before the picture stops answering "which shot is this", and it keeps the
-/// pass over the bundled sample to a couple of seconds.
-const PREVIEW_SECONDS: u64 = 2;
+/// end of the bar a drag there falls back to an earlier picture. Half a second apart is about as
+/// coarse as a scrub can be before the picture stops answering "which shot is this", and it keeps
+/// the pass over the bundled sample to a couple of seconds.
+const PREVIEWS_PER_SECOND: u64 = 2;
 
 /// A ceiling on what the whole index may hold.
 ///
@@ -191,7 +191,7 @@ fn preview_stride(dimensions: &VideoDimensions, frame_count: u64, frames_per_sec
     let bytes = preview_bytes(dimensions).max(1);
     let affordable = (PREVIEW_BUDGET_BYTES / bytes).max(1);
     let budgeted = frame_count.div_ceil(affordable);
-    let wanted = frames_per_second.div_ceil(PREVIEW_SECONDS);
+    let wanted = frames_per_second.div_ceil(PREVIEWS_PER_SECOND);
     budgeted.max(wanted).max(1)
 }
 
