@@ -16,6 +16,7 @@ percentage threshold on the median is the honest instrument for that.
     compare --previous old.json --current new.json --out report.md
     table --baseline run1.json run2.json --host 'Apple M1' --out table.md
     variance --baseline run1.json run2.json run3.json --out variance.md
+    staleness --readme benches/README.md --out staleness.md
 
 `table` renders the committed scalar-vs-ISA table in `benches/README.md`. It
 takes the elementwise *minimum* across however many baselines it is given,
@@ -35,10 +36,13 @@ not share a noise floor.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import math
 import os
 import pathlib
+import re
+import subprocess
 import sys
 
 SCHEMA = 1
@@ -46,6 +50,9 @@ SCHEMA = 1
 # Median rather than mean: a single descheduled iteration on a shared runner
 # drags the mean and leaves the median alone.
 METRIC = "median"
+
+# The dispatch-site registry `staleness` reads, at HEAD and at a table's stamp.
+SIMD_SOURCE = "src/simd.rs"
 
 
 def _point_estimate(estimates: dict, metric: str) -> float | None:
@@ -495,6 +502,248 @@ def variance(args: argparse.Namespace) -> int:
     return 0
 
 
+# The dispatch sites `zvidlib::simd::active_by_site` registers, mapped to the
+# benchmark groups whose row in a committed table *is* that site's own number.
+#
+# Whole-frame groups are deliberately absent. `av1_decode_frame` or
+# `hevc_encode_640x352` cross every site at once, so a landed kernel moves them
+# by an amount no single row can be attributed to, and naming them would bury
+# the rows that can be. So are the groups with no vector kernel at all
+# (`hevc_cabac`, `av1_encode_stage_symbol`): they are the same code on both
+# arms whatever lands.
+#
+# Prefixes, not exact names, because the transform families are one site each
+# spread over a row per size. `test_criterion_baseline.py` asserts every site
+# documented in `src/simd.rs` appears here, so a new dispatch site cannot be
+# added without deciding which rows it invalidates - the same guard
+# `the_documented_site_table_lists_every_dispatch_site` puts on the site table
+# itself.
+SITE_GROUP_PREFIXES: dict[str, tuple[str, ...]] = {
+    "av1_simd": (
+        "av1_cdef",
+        "av1_deblock",
+        "av1_wiener",
+        "av1_self_guided",
+        "av1_inverse_",
+        "av1_forward_",
+        "av1_encode_stage_wht",
+        "av1_encode_stage_iwht",
+    ),
+    "av1_mc": ("av1_mc_", "av1_motion_compensation"),
+    "av1_intra_pred": ("av1_intra_",),
+    "av1_coeff_ctx": ("av1_encode_stage_coeff_ctx", "av1_encode_stage_tile"),
+    "hevc_prediction_filters": (
+        "hevc_inter_pred",
+        "hevc_intra_pred",
+        "hevc_deblock",
+        "hevc_sao",
+    ),
+    "hevc_transforms": ("hevc_inverse_transform",),
+    "hevc_rdcost": ("hevc_encode_640x352_rdo_",),
+    "hevc_recon": ("hevc_encode_640x352_reconstruct",),
+    "hevc_fwd_transform_quant": ("hevc_encode_640x352_fwd_transform_quant",),
+    "hevc_colorconv": ("hevc_encode_640x352_rgba_to_yuv420",),
+    "hevc_color_convert": ("hevc_color_convert",),
+}
+
+# `Measured on **<host>**, at `<sha>`.` - the line `table` renders above every
+# committed baseline. The host is bolded there and nowhere else in the file,
+# which is what keeps this from matching the prose that discusses *superseded*
+# draws by commit ("the one #261 recorded at `e115506f8bf6`").
+_STAMP = re.compile(r"Measured on \*\*(?P<host>[^*]+)\*\*,\s+at\s+`(?P<commit>[0-9a-f]{7,40})`")
+
+# The `| Site | Kernels |` table in `active_by_site`'s rustdoc. A dispatch site
+# is a Rust value, and reading it out of a build would mean building every
+# commit a table is stamped with; the doc table is the same set by test, and it
+# can be read out of a blob.
+_SITE_ROW = re.compile(r"^///\s*\|\s*`(?P<site>[a-z0-9_]+)`\s*\|")
+
+
+def _documented_dispatch_sites(source: str) -> list[str]:
+    """The site names `active_by_site`'s rustdoc table lists, in order."""
+    sites: list[str] = []
+    for line in source.splitlines():
+        match = _SITE_ROW.match(line)
+        if match:
+            site = match.group("site")
+            if site not in sites:
+                sites.append(site)
+    return sites
+
+
+def _table_rows(readme: str, start: int) -> list[str]:
+    """The group names of the first `| Group |` table at or after `start`."""
+    rows: list[str] = []
+    seen_header = False
+    for line in readme[start:].splitlines():
+        stripped = line.strip()
+        if not seen_header:
+            if stripped.startswith("| Group |"):
+                seen_header = True
+            continue
+        if not stripped.startswith("|"):
+            break
+        cell = stripped.split("|")[1].strip()
+        if cell.startswith("`") and cell.endswith("`"):
+            rows.append(cell.strip("`"))
+    return rows
+
+
+def _committed_tables(readme: str) -> list[dict]:
+    return [
+        {
+            "host": match.group("host"),
+            "commit": match.group("commit"),
+            "groups": _table_rows(readme, match.end()),
+        }
+        for match in _STAMP.finditer(readme)
+    ]
+
+
+def _sites_at_commit(commit: str, repo_root: pathlib.Path, slug: str | None) -> list[str] | None:
+    """`src/simd.rs`'s documented sites as of `commit`, or None if unreadable.
+
+    Local git first, then the GitHub contents API. The fallback is not a
+    convenience: a table is stamped with the commit that measured it, and that
+    is routinely a checkpoint commit on a branch whose ref is deleted at merge,
+    so `git show` fails on exactly the commits this check exists to read. Both
+    tables committed today are such a commit.
+    """
+    source = _run(["git", "-C", str(repo_root), "show", f"{commit}:{SIMD_SOURCE}"])
+    if source is not None:
+        return _documented_dispatch_sites(source)
+    if not slug:
+        return None
+    encoded = _run(
+        ["gh", "api", f"repos/{slug}/contents/{SIMD_SOURCE}?ref={commit}", "--jq", ".content"]
+    )
+    if encoded is None:
+        return None
+    try:
+        return _documented_dispatch_sites(base64.b64decode(encoded).decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+
+
+def _run(command: list[str]) -> str | None:
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+    except OSError:
+        return None
+    return result.stdout if result.returncode == 0 else None
+
+
+def _repository_slug(repo_root: pathlib.Path) -> str | None:
+    url = _run(["git", "-C", str(repo_root), "remote", "get-url", "origin"])
+    if not url:
+        return None
+    match = re.search(r"github\.com[:/](?P<slug>[^/]+/[^/\s]+?)(?:\.git)?\s*$", url)
+    return match.group("slug") if match else None
+
+
+def staleness(args: argparse.Namespace) -> int:
+    """Report committed baseline rows whose dispatch site postdates the table.
+
+    Each table in `benches/README.md` is stamped with the commit it was measured
+    at, and nothing until now compared that commit's dispatch-site set against
+    the one the crate has today. A row silently stops describing the crate the
+    moment a kernel family lands under it, and the only signal was somebody
+    noticing a ratio that moved for no attributable reason - which is the whole
+    of the work issue #361 turned out to be.
+
+    This reports and never fails, in the same spirit as the delta report's 15%
+    threshold: a stale table is a measurement to redraw, not a broken build.
+    """
+    repo_root = pathlib.Path(args.repo_root)
+    readme = pathlib.Path(args.readme).read_text()
+    head_sites = _documented_dispatch_sites((repo_root / SIMD_SOURCE).read_text())
+    tables = _committed_tables(readme)
+
+    lines = ["## Committed baseline staleness", ""]
+    if not head_sites:
+        print(f"error: no dispatch sites documented in {SIMD_SOURCE}", file=sys.stderr)
+        return 1
+    if not tables:
+        print(f"error: no stamped baseline tables in {args.readme}", file=sys.stderr)
+        return 1
+
+    slug = _repository_slug(repo_root)
+    flagged = 0
+    for entry in tables:
+        commit, host = entry["commit"], entry["host"]
+        lines.append(f"### {host} — `{commit}`")
+        lines.append("")
+        then = _sites_at_commit(commit, repo_root, slug)
+        if then is None:
+            lines.append(
+                f"Could not read `{SIMD_SOURCE}` at `{commit}`: neither this "
+                "clone nor the GitHub contents API has that commit. The table "
+                "is unverified rather than clean."
+            )
+            lines.append("")
+            continue
+
+        landed = [site for site in head_sites if site not in then]
+        retired = [site for site in then if site not in head_sites]
+        if not landed and not retired:
+            lines.append(
+                f"Clean: the same {len(then)} dispatch sites are registered now "
+                "as when this table was measured."
+            )
+            lines.append("")
+            continue
+
+        if retired:
+            lines.append(
+                "Dispatch sites present at the stamp and gone now: "
+                + ", ".join(f"`{site}`" for site in retired)
+                + "."
+            )
+            lines.append("")
+        if landed:
+            lines.append(
+                f"{len(landed)} dispatch site(s) landed after this table was "
+                "measured: " + ", ".join(f"`{site}`" for site in landed) + "."
+            )
+            lines.append("")
+            affected = [
+                (group, site)
+                for group in entry["groups"]
+                for site in landed
+                if _group_matches_site(group, site)
+            ]
+            if affected:
+                flagged += len(affected)
+                lines.append("| Row | Dispatch site that landed after the stamp |")
+                lines.append("| --- | --- |")
+                lines.extend(f"| `{group}` | `{site}` |" for group, site in affected)
+            else:
+                lines.append(
+                    "No row of this table is attributed to any of them, so the "
+                    "rows it does have still describe the crate."
+                )
+            lines.append("")
+
+    lines.append(
+        f"{flagged} row(s) flagged. A flagged row was measured before the "
+        "dispatch site it names existed, so its ratio describes code that is "
+        "no longer there; redrawing the table is what clears it. This is a "
+        "report, not a gate."
+    )
+    _write(args.out, lines)
+    return 0
+
+
+def _group_matches_site(group: str, site: str) -> bool:
+    """Does `group` measure `site`?
+
+    The `_1080p` variants are the same group over a larger frame, so they are
+    stripped rather than listed twice.
+    """
+    name = group[: -len("_1080p")] if group.endswith("_1080p") else group
+    return any(name.startswith(prefix) for prefix in SITE_GROUP_PREFIXES.get(site, ()))
+
+
 def _duration(nanoseconds: float | None) -> str:
     if nanoseconds is None:
         return "—"
@@ -557,6 +806,18 @@ def main(argv: list[str]) -> int:
         help="candidate gate, in percent, to test each group's spread against",
     )
     variancer.set_defaults(handler=variance)
+
+    staler = subcommands.add_parser(
+        "staleness", help="flag committed table rows that predate a dispatch site"
+    )
+    staler.add_argument("--readme", default="benches/README.md")
+    staler.add_argument(
+        "--repo-root",
+        default=".",
+        help="the checkout to read src/simd.rs and the stamped commits from",
+    )
+    staler.add_argument("--out")
+    staler.set_defaults(handler=staleness)
 
     args = parser.parse_args(argv)
     return args.handler(args)
