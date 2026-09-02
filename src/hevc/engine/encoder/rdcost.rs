@@ -112,6 +112,63 @@ pub(crate) fn isa() -> Isa {
 /// Largest block edge the metrics accept, matching HEVC's largest coding block.
 const MAX_BLOCK: usize = 64;
 
+/// Narrowest block [`x86::sad_avx2`] runs its 256-bit loop on. Below this every
+/// byte of every row is consumed by the same `_mm_sad_epu8` 16-wide, 8-wide and
+/// scalar remainder steps [`x86::sad_sse41`] uses.
+const SAD_AVX2_MIN_W: usize = 32;
+
+/// Narrowest block [`x86::satd_avx2`] runs `satd_8x8_pair_avx2` on. Below this
+/// every 8x8 tile falls through into `satd_8x8_sse41`.
+const SATD_AVX2_MIN_W: usize = 16;
+
+/// The ISA code a `w`-wide block is actually measured under, which is `code`
+/// itself everywhere except the one case below.
+///
+/// On x86_64, a block narrower than the requesting metric's `avx2_min_w` runs
+/// the SSE4.1 kernel even on an AVX2 host, the way #362 routed `av1_coeff_ctx`
+/// and #342 routed `fwht4x4`. Both AVX2 kernels above widen only once the block
+/// is wide enough to fill a 256-bit vector — `sad_avx2` at `w >= 32` and
+/// `satd_avx2` at `w >= 16` — and fall back to their SSE4.1 counterpart's exact
+/// 128-bit body for everything narrower. `rdo.rs` searches a `CTB` of 16 and
+/// `candidate_partitions` subdivides it, so this encoder never reaches the
+/// 32-wide SAD branch at all and drops every width-8 and width-4 sub-partition
+/// through `satd_avx2`'s pair loop into `satd_8x8_sse41`.
+///
+/// Identical work is at best a tie, and it is not even that, because the AVX2
+/// arm adds a fixed epilogue the SSE4.1 arm does not have: a 256-bit zero, a
+/// `vextracti128` fold and the `vzeroupper` an `avx2` `#[target_feature]`
+/// function emits on return. `motion_search` issues `(2 * radius + 1)^2` = 81
+/// SAD calls per candidate partition plus its refinement passes, which is
+/// exactly the shape where a per-call cost cannot amortize — 1.63x/1.64x of
+/// scalar under `sse4.1` against 1.55x under `avx2` for the
+/// `hevc_encode_*_rdo_inter` pair in #370.
+///
+/// The other repair #370 weighed was restructuring the search so the AVX2 arm
+/// is handed work at a width it can use, by batching several search candidates
+/// of one block into a single 256-bit call. That is where an AVX2 SAD would
+/// genuinely win rather than merely stop losing, but it is a change to the
+/// search itself — its candidate ordering, its early termination, and the
+/// bit-exactness of the mode decision that follows from them — for a metric
+/// whose 128-bit body is already the one being executed. Routing is the smaller
+/// complete repair and it is what recovers the gap; #387 carries the batched
+/// kernel as the optimization it is.
+///
+/// From `avx2_min_w` up the two arms stop being the same work and AVX2 keeps
+/// the block.
+#[cfg_attr(not(target_arch = "x86_64"), allow(unused_variables))]
+fn metric_isa_code(code: u8, w: usize, avx2_min_w: usize) -> u8 {
+    #[cfg(target_arch = "x86_64")]
+    if code == ISA_AVX2 && w < avx2_min_w && is_x86_feature_detected!("sse4.1") {
+        // AVX2 implies SSE4.1 on every CPU that has ever shipped, but the probe
+        // is a cached load next to a whole block's distortion metric, and
+        // `isa_code` can also return `ISA_AVX2` from a `set_override` that
+        // detection never validated, so the redirect is checked rather than
+        // assumed.
+        return ISA_SSE41;
+    }
+    code
+}
+
 /// Panics unless `plane` holds a `w` x `h` block at `stride`, so the vectorized paths below
 /// can read whole rows through raw pointers without re-checking bounds per row.
 fn check_block(plane: &[u8], stride: usize, w: usize, h: usize) {
@@ -146,7 +203,7 @@ pub(crate) fn sad(
 ) -> u32 {
     check_block(src, src_stride, w, h);
     check_block(pred, pred_stride, w, h);
-    match isa_code() {
+    match metric_isa_code(isa_code(), w, SAD_AVX2_MIN_W) {
         #[cfg(target_arch = "x86_64")]
         ISA_AVX2 => {
             // SAFETY: `check_block` proved both blocks are fully in bounds, and the dispatch
@@ -155,7 +212,8 @@ pub(crate) fn sad(
         }
         #[cfg(target_arch = "x86_64")]
         ISA_SSE41 => {
-            // SAFETY: as above, with SSE4.1 detected.
+            // SAFETY: as above, with SSE4.1 detected — either by `detect_isa` or by
+            // `metric_isa_code`'s own probe when it redirected a narrow block off AVX2.
             unsafe { x86::sad_sse41(src, src_stride, pred, pred_stride, w, h) }
         }
         #[cfg(target_arch = "aarch64")]
@@ -192,7 +250,7 @@ pub(crate) fn satd(
         // scalar form is already short enough that vectorizing it buys nothing measurable.
         return satd_4x4_tiles_scalar(src, src_stride, pred, pred_stride, w, h);
     }
-    match isa_code() {
+    match metric_isa_code(isa_code(), w, SATD_AVX2_MIN_W) {
         #[cfg(target_arch = "x86_64")]
         ISA_AVX2 => {
             // SAFETY: `check_block` proved both blocks are fully in bounds, and the dispatch
@@ -201,7 +259,8 @@ pub(crate) fn satd(
         }
         #[cfg(target_arch = "x86_64")]
         ISA_SSE41 => {
-            // SAFETY: as above, with SSE4.1 detected.
+            // SAFETY: as above, with SSE4.1 detected — either by `detect_isa` or by
+            // `metric_isa_code`'s own probe when it redirected a narrow block off AVX2.
             unsafe { x86::satd_sse41(src, src_stride, pred, pred_stride, w, h) }
         }
         #[cfg(target_arch = "aarch64")]
@@ -1030,6 +1089,71 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// #370: neither AVX2 metric widens on the block shapes an HEVC motion
+    /// search actually issues. `sad_avx2` enters its 256-bit loop only at
+    /// `w >= 32` and `satd_avx2` its vector pair only at `w >= 16`, so below
+    /// those widths both run their SSE4.1 counterpart's exact 128-bit body and
+    /// add a 256-bit zero, a `vextracti128` fold and a `vzeroupper` on top of
+    /// it. Each metric is routed off AVX2 below its own threshold, and neither
+    /// threshold moves the other's blocks or anything on a non-x86_64 host.
+    #[test]
+    fn each_metric_keeps_blocks_narrower_than_its_avx2_body_off_avx2() {
+        let mut codes = vec![ISA_UNDETECTED, ISA_SCALAR];
+        #[cfg(target_arch = "x86_64")]
+        codes.extend([ISA_SSE41, ISA_AVX2]);
+        #[cfg(target_arch = "aarch64")]
+        codes.push(ISA_NEON);
+        let widths = [4usize, 8, 12, 16, 24, 32, 48, 64];
+        for code in codes {
+            for w in widths {
+                for (min_w, metric) in [(SAD_AVX2_MIN_W, "SAD"), (SATD_AVX2_MIN_W, "SATD")] {
+                    let routed = metric_isa_code(code, w, min_w);
+                    #[cfg(target_arch = "x86_64")]
+                    let want =
+                        if code == ISA_AVX2 && w < min_w && is_x86_feature_detected!("sse4.1") {
+                            ISA_SSE41
+                        } else {
+                            code
+                        };
+                    #[cfg(not(target_arch = "x86_64"))]
+                    let want = code;
+                    assert_eq!(routed, want, "{metric} code {code} at width {w}");
+                }
+            }
+        }
+        assert_eq!(SAD_AVX2_MIN_W, 32, "SAD widens at its 256-bit loop");
+        assert_eq!(SATD_AVX2_MIN_W, 16, "SATD widens at its 8x8 vector pair");
+    }
+
+    /// Every instruction set this build offers produces the scalar result for
+    /// every shape, including the narrow ones #370 now routes off AVX2, so the
+    /// redirect cannot change a mode decision.
+    #[test]
+    fn every_instruction_set_matches_the_scalar_reference_through_dispatch() {
+        let _guard = crate::simd::test_lock();
+        for isa in crate::simd::available() {
+            crate::simd::set_override(Some(isa));
+            for &(w, h) in SHAPES {
+                let (src_stride, pred_stride) = (w + 5, w + 1);
+                let src = plane(0x51ad_7e57_0000_0001, src_stride, h);
+                let pred = plane(0x0000_0002_51ad_7e57, pred_stride, h);
+                assert_eq!(
+                    sad(&src, src_stride, &pred, pred_stride, w, h),
+                    sad_scalar(&src, src_stride, &pred, pred_stride, w, h),
+                    "{w}x{h} SAD under {}",
+                    isa.name()
+                );
+                assert_eq!(
+                    satd(&src, src_stride, &pred, pred_stride, w, h),
+                    satd_scalar(&src, src_stride, &pred, pred_stride, w, h),
+                    "{w}x{h} SATD under {}",
+                    isa.name()
+                );
+            }
+        }
+        crate::simd::set_override(None);
     }
 
     #[test]

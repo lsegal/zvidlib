@@ -43,6 +43,8 @@
 //! and the encoder's own round-trip tests assert.
 
 use super::SimdIsa;
+#[cfg(target_arch = "x86_64")]
+use super::vector::HalfPairs;
 use super::vector::{I32x, MAX_LANES};
 use crate::av1_encoder::cdf::{MAG_REF_OFFSET_2D, SIG_REF_DIFF_OFFSET_2D};
 use std::sync::OnceLock;
@@ -210,6 +212,114 @@ pub(crate) unsafe fn block_contexts<V: I32x>(
     }
 }
 
+/// The same derivation as [`block_contexts`], stepping **two rows at a time**
+/// for a block whose row is exactly half the vector's width.
+///
+/// [`block_contexts`] walks a row at a time, so a block narrower than the
+/// vector cannot fill it: a 4-wide row is one iteration under SSE4.1's four
+/// lanes *and* under AVX2's eight, four of them idle, and the tail store stages
+/// through a stack buffer because `count` is short of `LANES` (issue #362).
+/// Neither is a property of the width - both are a property of treating one
+/// vector as one row. The outputs of adjacent rows are already contiguous
+/// (`base_out` and `br_out` are indexed `row * size + column` with no padding),
+/// so rows `r` and `r + 1` of a 4x4 block are eight consecutive `i32`s that one
+/// full-width store covers, and the staged partial store disappears with them.
+///
+/// What changes against the row-at-a-time kernel is only where the operands
+/// come from:
+///
+/// * the neighbour loads are no longer contiguous across the halves - the
+///   padded stride is 14 at size 4 - so each becomes the two 128-bit loads and
+///   the `vinserti128` of [`HalfPairs::load_halves`], amortized over the five
+///   `SIG_REF_DIFF_OFFSET_2D` plus three `MAG_REF_OFFSET_2D` neighbours an
+///   iteration reads;
+/// * the row-dependent terms become per-half vector constants rather than
+///   scalars: the anti-diagonal adds `[row; 4] ++ [row + 1; 4]`, and the
+///   `coeff_br` near-corner predicate `row < 2` resolves per half through the
+///   same vector instead of a branch.
+///
+/// Everything else - the clamped sums, the `(mag + 1) >> 1` saturation, the
+/// folded offsets and the DC fixup - is the same arithmetic in the same order,
+/// which is what keeps it bit-exact with the scalar reference.
+///
+/// # Safety
+///
+/// Only callable from a wrapper that has verified `V`'s CPU feature, and only
+/// with `size * 2 == V::LANES`.
+// `#[inline(always)]` for the codegen reason in [`block_contexts`].
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub(crate) unsafe fn block_contexts_row_pairs<V: HalfPairs>(
+    plane: &[i32],
+    size: usize,
+    base_out: &mut [i32],
+    br_out: &mut [i32],
+) {
+    debug_assert_eq!(
+        size * 2,
+        V::LANES,
+        "a row pair must fill the vector exactly"
+    );
+    unsafe {
+        let stride = padded_stride(size);
+        let one = V::splat(1);
+        let three = V::splat(3);
+        let fifteen = V::splat(15);
+        // Both halves cover the same columns, so this is loop-invariant where
+        // the row-at-a-time kernel rebuilds it per iteration.
+        let mut lanes = [0i32; MAX_LANES];
+        for (lane, slot) in lanes.iter_mut().enumerate().take(V::LANES) {
+            *slot = (lane % size) as i32;
+        }
+        let columns = V::load(&lanes);
+
+        let mut row = 0usize;
+        while row < size {
+            let rows = V::splat_halves(row as i32, (row + 1) as i32);
+
+            let mut base_mag = V::zero();
+            for &(dr, dc) in &SIG_REF_DIFF_OFFSET_2D {
+                let at = (row + dr) * stride + dc;
+                let neighbour = V::load_halves(&plane[at..], &plane[at + stride..]);
+                base_mag = base_mag.add(neighbour.min(three));
+            }
+            let mut br_mag = V::zero();
+            for &(dr, dc) in &MAG_REF_OFFSET_2D {
+                let at = (row + dr) * stride + dc;
+                let neighbour = V::load_halves(&plane[at..], &plane[at + stride..]);
+                br_mag = br_mag.add(neighbour.min(fifteen));
+            }
+
+            let diagonal = columns.add(rows);
+            let base_offset = V::select(
+                diagonal.le(one),
+                V::splat(1),
+                V::select(diagonal.le(V::splat(3)), V::splat(6), V::splat(21)),
+            );
+            let base = base_mag
+                .add(one)
+                .sra::<1>()
+                .min(V::splat(4))
+                .add(base_offset);
+
+            // `row < 2 && column <= 1`, the same top-left 2x2 corner the
+            // row-at-a-time kernel tests with a scalar `if` on the row.
+            let near = rows.le(one).and(columns.le(one));
+            let br_offset = V::select(near, V::splat(BR_NEAR_OFFSET), V::splat(BR_FAR_OFFSET));
+            let br = br_mag.add(one).sra::<1>().min(V::splat(6)).add(br_offset);
+
+            // A row pair is `2 * size == LANES` contiguous outputs: one native
+            // full-width store each, never a staged partial one.
+            base.store(&mut base_out[row * size..]);
+            br.store(&mut br_out[row * size..]);
+            row += 2;
+        }
+        // The DC fixup of [`block_contexts`], for the same reason.
+        base_out[0] = 0;
+        br_out[0] -= BR_NEAR_OFFSET;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,6 +343,48 @@ mod tests {
                     "row {row}, column {column}"
                 );
             }
+        }
+    }
+
+    /// The row-pair kernel is a second implementation of the same derivation,
+    /// so it has to agree with the first one lane for lane — and it has to keep
+    /// agreeing even if the dispatch site stops routing size 4 to it, which is
+    /// why this checks the kernels directly rather than through
+    /// [`super::super::coeff_contexts`].
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_row_pair_kernel_matches_the_row_at_a_time_kernel_at_size_four() {
+        // Through the `#[target_feature]` wrappers, not the kernels directly:
+        // a kernel called from a baseline context is the #336 defect, and here
+        // it would also be measuring something the dispatcher never runs.
+        use super::super::{coeff_ctx_pairs_avx2, coeff_ctx_sse41};
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        const SIZE: usize = 4;
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            (state >> 33) as i32
+        };
+        for _ in 0..64 {
+            // Magnitudes across every range the two sums distinguish: zero, the
+            // base levels, the base-range cap and past it.
+            let levels: Vec<i32> = (0..SIZE * SIZE).map(|_| next() % 40 - 20).collect();
+            let mut plane = Vec::new();
+            reset_padded_plane(&mut plane, SIZE);
+            fill_padded_levels(&mut plane, &levels, SIZE);
+
+            let (mut base, mut br) = (vec![0i32; SIZE * SIZE], vec![0i32; SIZE * SIZE]);
+            let (mut pair_base, mut pair_br) = (vec![0i32; SIZE * SIZE], vec![0i32; SIZE * SIZE]);
+            unsafe {
+                coeff_ctx_sse41(&plane, SIZE, &mut base, &mut br);
+                coeff_ctx_pairs_avx2(&plane, SIZE, &mut pair_base, &mut pair_br);
+            }
+            assert_eq!(pair_base, base, "coeff_base for levels {levels:?}");
+            assert_eq!(pair_br, br, "coeff_br for levels {levels:?}");
         }
     }
 
