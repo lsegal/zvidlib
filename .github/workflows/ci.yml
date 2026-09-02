@@ -20,6 +20,17 @@ on:
 permissions:
   contents: read
 
+# Superseded pull-request runs are cancelled, because the scarce resource here
+# is the runner pool rather than the minutes: a run for a commit that has
+# already been pushed over sits in the same queue as the run somebody is
+# waiting on, and this repository pushes to a branch several times before it is
+# reviewed. `main` pushes and `workflow_dispatch` runs are never cancelled -
+# the benchmark job's stored baseline is a chain, and a cancelled link is a
+# missing comparison for the run after it.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   rust:
     name: Rust checks
@@ -28,6 +39,16 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
         run: rustup show
+      # This job rebuilt every dependency from a cold `target/` on every run
+      # before this step existed (#352). The cache is keyed on the job, the
+      # runner, the toolchain and the manifest, so the `[profile.bench]`
+      # fat-LTO artifacts and the `[profile.dev]` ones never share an entry;
+      # `cache-on-failure` keeps a failed run's dependency build, since the
+      # dependencies are not what failed.
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       - name: Install native audio dependencies
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - name: Check formatting
@@ -41,6 +62,10 @@ jobs:
       # every one of them is reachable from a [[bench]] target.
       - name: Check every bench source is compiled
         run: cargo test --features native --test bench_sources_compile
+      # The caching this workflow depends on is opt-in per job, so a job added
+      # without it is slow in a way nothing else here would report.
+      - name: Check every cargo CI job is cached
+        run: cargo test --features native --test ci_workflows_cache_cargo
       # `criterion_baseline.py` is where a benchmark regression threshold is
       # justified from, and it runs in a job that takes two hours to reach it.
       # Standard library only, so this needs no install step. Its `table`
@@ -91,8 +116,20 @@ jobs:
         run: "cargo test --features native --lib -- hevc::engine:: av1"
       - name: Check WebAssembly target
         run: cargo check --target wasm32-unknown-unknown --no-default-features --features web
+      # The published musl binary rather than `cargo install wasm-pack`, which
+      # compiled the tool and its dependency tree from source on every run for
+      # a build that is not this crate's. The version is still pinned, and the
+      # download is a release asset of the same tag `--version` named.
       - name: Install wasm-pack
-        run: cargo install wasm-pack --version 0.15.0 --locked
+        env:
+          WASM_PACK_VERSION: '0.15.0'
+        run: |
+          target="wasm-pack-v${WASM_PACK_VERSION}-x86_64-unknown-linux-musl"
+          mkdir -p "$RUNNER_TEMP/wasm-pack"
+          curl -sSfL "https://github.com/rustwasm/wasm-pack/releases/download/v${WASM_PACK_VERSION}/${target}.tar.gz" \
+            | tar -xz --strip-components=1 -C "$RUNNER_TEMP/wasm-pack" "${target}/wasm-pack"
+          "$RUNNER_TEMP/wasm-pack/wasm-pack" --version
+          echo "$RUNNER_TEMP/wasm-pack" >> "$GITHUB_PATH"
       - name: Build browser package
         run: wasm-pack build --target web --out-dir pkg --no-default-features --features web
       - name: Test in headless Chrome
@@ -126,6 +163,16 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
         run: rustup show
+      # This job rebuilt every dependency from a cold `target/` on every run
+      # before this step existed (#352). The cache is keyed on the job, the
+      # runner, the toolchain and the manifest, so the `[profile.bench]`
+      # fat-LTO artifacts and the `[profile.dev]` ones never share an entry;
+      # `cache-on-failure` keeps a failed run's dependency build, since the
+      # dependencies are not what failed.
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       - name: Install native audio dependencies
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       # Every `[[bench]]` target, not one of them: the suite is seven targets
@@ -253,6 +300,16 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
         run: rustup show
+      # This job rebuilt every dependency from a cold `target/` on every run
+      # before this step existed (#352). The cache is keyed on the job, the
+      # runner, the toolchain and the manifest, so the `[profile.bench]`
+      # fat-LTO artifacts and the `[profile.dev]` ones never share an entry;
+      # `cache-on-failure` keeps a failed run's dependency build, since the
+      # dependencies are not what failed.
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       - name: Check native target
         run: cargo check --all-targets --features native
       # The `cfg(windows)` half of the tree - `src/hevc/windows_mf.rs`, the

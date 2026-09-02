@@ -1114,6 +1114,12 @@ unsafe fn store_rows4<V: I32x>(rows: [V; 4], block: &mut [i32]) {
 /// # Safety
 /// The caller must have verified `V`'s instruction set is available, and every
 /// entry of `quant` must satisfy `|q| <= WHT_INPUT_LIMIT`.
+// `#[inline(always)]`, not a hint: this kernel is only ever reached
+// through a `#[target_feature]` wrapper in [`super`], and it is only
+// compiled *with* that feature when it is inlined into the wrapper. A
+// copy LLVM declined to inline is built at the target's baseline
+// instead, where every intrinsic it uses is an out-of-line call - see
+// the codegen note in [`super`].
 #[inline(always)]
 pub(crate) unsafe fn iwht4x4<V: I32x + Transpose4>(quant: &[i32; 16]) -> [i32; 16] {
     unsafe {
@@ -1144,6 +1150,12 @@ pub(crate) unsafe fn iwht4x4<V: I32x + Transpose4>(quant: &[i32; 16]) -> [i32; 1
 /// # Safety
 /// The caller must have verified `V`'s instruction set is available, and every
 /// entry of `residual` must satisfy `|r| <= WHT_INPUT_LIMIT`.
+// `#[inline(always)]`, not a hint: this kernel is only ever reached
+// through a `#[target_feature]` wrapper in [`super`], and it is only
+// compiled *with* that feature when it is inlined into the wrapper. A
+// copy LLVM declined to inline is built at the target's baseline
+// instead, where every intrinsic it uses is an out-of-line call - see
+// the codegen note in [`super`].
 #[inline(always)]
 pub(crate) unsafe fn fwht4x4<V: I32x + Transpose4>(residual: &[i32; 16]) -> [i32; 16] {
     unsafe {
@@ -1331,6 +1343,8 @@ macro_rules! inverse_transform_driver {
         /// # Safety
         /// The caller must have verified `V`'s instruction set is available
         /// and that `dequantized` is within `input_limit`.
+        // Inlined into its `#[target_feature]` wrapper unconditionally; see
+        // the codegen note in [`super`].
         #[inline(always)]
         pub(crate) unsafe fn $name<V: I32x + Transpose4>(
             dequantized: &[i32],
@@ -1456,6 +1470,8 @@ macro_rules! forward_transform_driver {
         /// # Safety
         /// The caller must have verified `V`'s instruction set is available
         /// and that `residual` is within `input_limit`.
+        // Inlined into its `#[target_feature]` wrapper unconditionally; see
+        // the codegen note in [`super`].
         #[inline(always)]
         pub(crate) unsafe fn $name<V: I32x + Transpose4>(
             residual: &[i32],
