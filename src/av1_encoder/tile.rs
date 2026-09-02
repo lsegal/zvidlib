@@ -606,6 +606,23 @@ pub(crate) struct FrameEncoder<'a> {
     /// How many blocks that cost is summed over, which is the base a per-block gain is
     /// extrapolated over. Zero-skipped blocks are excluded from it for the same reason.
     trial_searched_blocks: i64,
+    /// Cost a running size trial may reach before it is abandoned, or [`i64::MAX`] when nothing
+    /// is being trialled. A trial's cost is a sum of squared errors and `lambda * bits`, so it
+    /// only grows: once the partial sum passes what the incumbent size already costs, no
+    /// remaining block can bring it back and the rest of the trial cannot change the answer.
+    /// [`FrameEncoder::choose_tx_size`] sets it from the incumbent, and only for a
+    /// context-consistent trial, whose ranking cost *is* the sum this bounds.
+    trial_ceiling: i64,
+    /// Whether the pass now running is a [`FrameEncoder::choose_tx_size`] size trial, as opposed
+    /// to one of the partition search's own measurement passes. Context-consistency is a
+    /// property of the size trial alone: it is the size ranking the counterfactual distorts, and
+    /// making every other speculative pass code the full type set as well is what made it cost
+    /// the exhaustive search.
+    in_size_trial: bool,
+    /// Set when the trial [`Self::trial_ceiling`] bounds gave up part-way, so
+    /// [`FrameEncoder::choose_tx_size`] knows the cost it got back is a partial sum that must not
+    /// be ranked.
+    trial_abandoned: bool,
     /// Set by [`Self::without_search_shortcuts`] to restore the original exhaustive search, so a
     /// test can compare the shortcuts against the search they stand in for.
     #[cfg(test)]
@@ -697,6 +714,10 @@ pub(crate) struct FrameEncoder<'a> {
     /// order-independence that holds only because nothing ever tied.
     #[cfg(test)]
     cost_ties: u64,
+    /// Size trials [`Self::trial_ceiling`] abandoned part-way, so a test can show the bound is
+    /// reached on real content rather than assert a saving that never fires.
+    #[cfg(test)]
+    abandoned_trials: u64,
     /// Every [`ProbeKey`] a size trial probed, in the order they were measured, against the key
     /// the emitting pass actually reached at each transform block's position. How far the two
     /// sets overlap is what any reuse of a probe's result could ever have covered, which
@@ -736,6 +757,8 @@ pub(crate) struct SearchReport {
     /// two searches to a place in the frame rather than to a position in the trace.
     pub(crate) size_choices: Vec<(usize, usize, usize, usize)>,
     pub(crate) cost_ties: u64,
+    /// Size trials the context-consistent trial's cost bound abandoned part-way.
+    pub(crate) abandoned_trials: u64,
     /// The probe and emit key sets and the counts that bound their overlap, for
     /// `measure_probe_reuse_coverage`.
     pub(crate) probe_keys: Vec<(usize, usize, usize, u8)>,
@@ -889,6 +912,9 @@ impl<'a> FrameEncoder<'a> {
             size_searches: 0,
             trial_searched_cost: 0,
             trial_searched_blocks: 0,
+            trial_ceiling: i64::MAX,
+            in_size_trial: false,
+            trial_abandoned: false,
             #[cfg(test)]
             exhaustive: false,
             #[cfg(test)]
@@ -930,6 +956,8 @@ impl<'a> FrameEncoder<'a> {
             coeff_ctx: CoeffScratch::default(),
             #[cfg(test)]
             cost_ties: 0,
+            #[cfg(test)]
+            abandoned_trials: 0,
             #[cfg(test)]
             probe_keys: Vec::new(),
             #[cfg(test)]
@@ -1312,6 +1340,7 @@ impl<'a> FrameEncoder<'a> {
             candidates_evaluated: self.candidates_evaluated,
             size_choices: std::mem::take(&mut self.size_choices),
             cost_ties: self.cost_ties,
+            abandoned_trials: self.abandoned_trials,
             probe_keys: std::mem::take(&mut self.probe_keys),
             emitted_blocks: std::mem::take(&mut self.emitted_blocks),
             emitted_coding_blocks: self.emitted_coding_blocks,
@@ -1639,8 +1668,37 @@ impl<'a> FrameEncoder<'a> {
             self.probe_blocks = 0;
             self.trial_searched_cost = 0;
             self.trial_searched_blocks = 0;
+            // Only a context-consistent trial may be abandoned part-way. Its ranking cost is the
+            // sum `code_block_transforms` accumulates, so a partial sum above the incumbent is
+            // already a proof that the size loses. The shipped trial's is not: it ranks on
+            // `corrected_trial_cost(cost, ...)`, which subtracts a credit the trial has not
+            // finished measuring, so a partial sum above the incumbent proves nothing there.
+            self.trial_ceiling = if consistent {
+                // The incumbent's cost is reachable only by a size that also wins the tie, which
+                // is the larger transform; a smaller one has to come in strictly under it.
+                if tx_width > best.0 {
+                    best.1
+                } else {
+                    best.1 - 1
+                }
+            } else {
+                i64::MAX
+            };
+            self.trial_abandoned = false;
+            self.in_size_trial = true;
             let cost = self.code_block_transforms(r, c, bw, tx_width, false);
+            self.in_size_trial = false;
+            let abandoned = self.trial_abandoned;
+            self.trial_ceiling = i64::MAX;
+            self.trial_abandoned = false;
             self.restore(snapshot);
+            if abandoned {
+                #[cfg(test)]
+                {
+                    self.abandoned_trials += 1;
+                }
+                continue;
+            }
             // Correcting a context-consistent trial would double-count: the type search's gain is
             // already in the cost it just measured, on every block rather than on a sample.
             let cost = if consistent || !self.type_gain_correction() {
@@ -1865,6 +1923,14 @@ impl<'a> FrameEncoder<'a> {
                 if x < self.coded_w && y < self.coded_h {
                     cost += self.transform_block(x, y, bw, tx_width, emit);
                 }
+                // A transform block's cost is `sse + lambda * bits`, both non-negative, so this
+                // sum is monotone and a trial that has already passed its ceiling can only end
+                // above it. Abandoning it here skips the type search on every block it has not
+                // reached yet; the caller discards the partial sum rather than ranking on it.
+                if cost > self.trial_ceiling {
+                    self.trial_abandoned = true;
+                    return cost;
+                }
                 tx += step;
             }
             ty += step;
@@ -1974,7 +2040,8 @@ impl<'a> FrameEncoder<'a> {
         }
         let trial = self.shortcuts() && !emit;
         let mut probing = false;
-        if trial && candidates.len() > 1 && !self.context_consistent_trials() {
+        let consistent_here = self.context_consistent_trials() && self.in_size_trial;
+        if trial && candidates.len() > 1 && !consistent_here {
             if self.probe_budget > 0 {
                 self.probe_budget -= 1;
                 probing = true;
