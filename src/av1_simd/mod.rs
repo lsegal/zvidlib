@@ -447,7 +447,10 @@ fn coeff_ctx_row_pairs(isa: SimdIsa, size: usize) -> bool {
 /// instruction and stages a partial one through a stack buffer, so at
 /// `size == 4` SSE4.1's four lanes are exactly full while AVX2 pays a 32-byte
 /// spill plus a 16-byte copy on *every* store, twice a row. That is the
-/// 3.04x-against-2.50x of #362.
+/// 3.04x-against-2.50x #362 was reported against, in the x86_64 table drawn at
+/// `b284c38a6391`; the table that replaces it reads this group at 3.66x `avx2`
+/// against 3.07x `sse4.1`, which is the row-pair kernel below rather than the
+/// redirect.
 ///
 /// #371 removes both halves of that at size 4 rather than routing around them:
 /// the row-pair kernel does a whole block-row-pair per iteration and stores it
@@ -456,7 +459,9 @@ fn coeff_ctx_row_pairs(isa: SimdIsa, size: usize) -> bool {
 /// EPYC 9V74 80-Core, `av1_encode_stage_coeff_ctx` reads 937.520 µs under
 /// `avx2` against 1.165 ms under `sse4.1`, and 8.643 ms against 10.738 ms at
 /// 1080p: 24% at both sizes, where #362's round had the two arms 0.13% apart
-/// because they were the same kernel. `benches/README.md` carries the round.
+/// because they were the same kernel. `benches/README.md` carries the round, and
+/// its committed x86_64 table now carries the result on its own host as well:
+/// 1.181 ms `avx2` against 1.409 ms `sse4.1`, a 19% gap on an AMD EPYC 7763.
 /// The sizes below 8 that remain redirected — 1 to 3 and 5 to 7 — are shapes
 /// the encoder never codes and no vector width fits, so they stay on SSE4.1.
 ///

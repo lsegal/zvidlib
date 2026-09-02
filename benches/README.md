@@ -1189,6 +1189,14 @@ the Apple M1 table in answer, so both tables are clean today: each is stamped at
 a commit carrying the same eleven sites the crate has now, and the report flags
 nothing.
 
+Reporting nothing is not the same as being current, and the x86_64 table is
+where that showed. It was clean by this check for its whole life — no site
+landed under it — while four repairs to kernels behind sites that already
+existed moved six of its rows anyway, which is what #393 re-drew it for. This
+check answers "does a row name a site that did not exist yet"; it cannot answer
+"did the kernel behind an existing site change", because that needs the commit
+built rather than read.
+
 Three things about how it reads the site set are worth stating, because each is
 a place a more obvious implementation does not work:
 
@@ -1215,7 +1223,8 @@ It answers the site-set half of what can go stale. The `Vectorized` column in
 it is not checked here: a site can exist and still resolve to the scalar
 reference on every arm — `hevc_recon` does — so "is there a dispatch site" and
 "is there a vector kernel" are different questions, and only the first can be
-answered from a commit that is not built.
+answered from a commit that is not built. "Is it the *same* vector kernel" is a
+third, and the one the x86_64 re-draw above turned on.
 
 ### Apple M1 (aarch64)
 
