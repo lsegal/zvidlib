@@ -505,20 +505,67 @@ fn interp_block<const N: usize>(
     h: usize,
     bit_depth: u8,
 ) -> Vec<i32> {
+    interp_block_with_width::<N>(
+        isa,
+        plane,
+        x_int,
+        y_int,
+        hk,
+        vk,
+        w,
+        h,
+        bit_depth,
+        narrows(isa, bit_depth, w),
+    )
+}
+
+/// Whether [`interp_block`] takes the 16-bit accumulation for this
+/// backend, `bit_depth` and block width.
+///
+/// Three conditions, and the narrow path is only faster when all of
+/// them hold:
+///
+/// * **Eight-bit content.** The 16-bit accumulator is only in range
+///   there: `shift1` is zero, so the tap accumulation is bounded by
+///   [`NARROW_MAX_SAMPLE`] times the coefficient sums. At nine bits and
+///   above the pre-shift accumulator overflows `i16`.
+/// * **A vector backend.** The whole point is that a vector unit
+///   multiplies twice as many `i16` lanes per instruction as `i32`
+///   lanes. [`Isa::Scalar`] multiplies one either way, so for it the
+///   narrowing pass over the source is cost with nothing behind it —
+///   `measure_narrow_vs_wide_block` reads it below parity.
+/// * **A row of at least eight samples.** A shorter row never reaches
+///   the 16-bit vector loop at all: `measure_narrow_filter_taps` reads
+///   0.76x at a row of four, where the whole call is the widening
+///   remainder plus the cost of having narrowed the source for it. So
+///   the narrow-width chroma blocks keep the `i32` kernel too.
+#[inline]
+fn narrows(isa: Isa, bit_depth: u8, w: usize) -> bool {
+    bit_depth == 8 && isa != Isa::Scalar && w >= 8
+}
+
+/// [`interp_block`] with the 16-bit accumulation forced on or off.
+///
+/// Separate from [`interp_block`] only so `measure_narrow_vs_wide_block`
+/// can A/B the two arms in one process; the decoder always reaches this
+/// through [`interp_block`], which decides with [`narrows`].
+#[allow(clippy::too_many_arguments)]
+fn interp_block_with_width<const N: usize>(
+    isa: Isa,
+    plane: &RefPlane<'_>,
+    x_int: i32,
+    y_int: i32,
+    hk: Option<&[i32; N]>,
+    vk: Option<&[i32; N]>,
+    w: usize,
+    h: usize,
+    bit_depth: u8,
+    narrow: bool,
+) -> Vec<i32> {
+    debug_assert!(!narrow || narrows(isa, bit_depth, w));
     let shift1 = interp_shift1(bit_depth);
     let halo = N as i32 / 2 - 1;
     let span = w + N - 1;
-    // The 16-bit accumulation is only in range for eight-bit samples:
-    // `shift1` is zero there, so the tap accumulation is bounded by
-    // [`NARROW_MAX_SAMPLE`] times the coefficient sums. At nine bits and
-    // above the pre-shift accumulator overflows `i16`, so those depths
-    // keep the `i32` kernel.
-    // A row narrower than eight samples never reaches the 16-bit vector
-    // loop — `measure_narrow_filter_taps` reads 0.51x at a row of four,
-    // where the whole call is the widening remainder plus the cost of
-    // having narrowed the source for it — so the narrow-width chroma
-    // blocks keep the `i32` kernel.
-    let narrow = bit_depth == 8 && w >= 8;
     let mut out = vec![0i32; w * h];
     match (hk, vk) {
         // Full-pel (Table 8-8 / 8-9 phase 0, 0): A << shift3.
@@ -2225,6 +2272,98 @@ mod tests {
     /// on the scalar reference and on every SIMD backend the host CPU
     /// offers.
     ///
+    /// A/Bs the 16-bit accumulation issue #378 landed against the 32-bit
+    /// one it replaces, over the §8.5.3.3.3.2 two-dimensional luma path
+    /// at every prediction-unit size, with the block walk, the source
+    /// narrowing and the allocations all included.
+    ///
+    /// `simd::measure_narrow_filter_taps` times the kernel alone and is
+    /// the ceiling; this is what a block actually gets, because the
+    /// narrow arm has to convert its source window to `i16` first, and
+    /// only the horizontal pass of the two-dimensional case narrows —
+    /// the vertical pass multiplies a 16-bit intermediate by a
+    /// coefficient of up to 58 and needs a 32-bit accumulator either way.
+    ///
+    /// Both arms run in one process, interleaved, best of many rounds:
+    /// separate benchmark processes on this host disagree with each
+    /// other by more than the effect being measured. The two arms are
+    /// asserted to agree sample-for-sample before anything is timed.
+    ///
+    /// Ignored by default because it is a timing measurement, not an
+    /// assertion. Run it with
+    /// `cargo test --release --features native --lib
+    /// measure_narrow_vs_wide_block -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "benchmark; run with --ignored --nocapture"]
+    fn measure_narrow_vs_wide_block() {
+        use std::time::Instant;
+
+        let (pw, ph) = (256usize, 256usize);
+        let plane_samples = pseudo_random(8, pw * ph, 255);
+        let plane = RefPlane::new(&plane_samples, pw, ph).unwrap();
+        let isa = simd::detected_isa();
+        // The half-pel phase in both dimensions: the two-dimensional
+        // path, which is what a decode spends its interpolation on.
+        let hk = &LUMA_FILTER[2];
+        let vk = &LUMA_FILTER[2];
+        let rounds = 15;
+
+        println!("\n8-tap luma interp_block, i32 vs i16 accumulation, {isa:?}, best of {rounds}");
+        println!("  (equal total sample count at every block size)");
+        println!("  block     i32 ms   i16 ms   narrow");
+        for &(w, h) in &[(8usize, 8usize), (16, 16), (32, 32), (64, 64)] {
+            let calls = (1 << 22) / (w * h);
+            let wide =
+                interp_block_with_width::<8>(isa, &plane, 4, 4, Some(hk), Some(vk), w, h, 8, false);
+            let narrow =
+                interp_block_with_width::<8>(isa, &plane, 4, 4, Some(hk), Some(vk), w, h, 8, true);
+            assert_eq!(wide, narrow, "the two arms disagree at {w}x{h}");
+
+            let (mut bw, mut bn) = (f64::INFINITY, f64::INFINITY);
+            for _ in 0..rounds {
+                let start = Instant::now();
+                for _ in 0..calls {
+                    std::hint::black_box(interp_block_with_width::<8>(
+                        isa,
+                        &plane,
+                        4,
+                        4,
+                        Some(hk),
+                        Some(vk),
+                        w,
+                        h,
+                        8,
+                        false,
+                    ));
+                }
+                bw = bw.min(start.elapsed().as_secs_f64());
+                let start = Instant::now();
+                for _ in 0..calls {
+                    std::hint::black_box(interp_block_with_width::<8>(
+                        isa,
+                        &plane,
+                        4,
+                        4,
+                        Some(hk),
+                        Some(vk),
+                        w,
+                        h,
+                        8,
+                        true,
+                    ));
+                }
+                bn = bn.min(start.elapsed().as_secs_f64());
+            }
+            println!(
+                "  {:>5}  {:9.2} {:8.2}  {:5.2}x",
+                format!("{w}x{h}"),
+                bw * 1e3,
+                bn * 1e3,
+                bw / bn
+            );
+        }
+    }
+
     /// A/Bs the full-height `w x ( h + 7 )` intermediate the
     /// two-dimensional 8-tap luma path uses against the wrap-around ring
     /// issue #309 proposed in its place, which keeps only the eight
