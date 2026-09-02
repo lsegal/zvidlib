@@ -1821,11 +1821,15 @@ mod nonlossless_tests {
     /// reduction falls from 4.26x through 4.11x to 3.57x, under the 4x
     /// `the_search_shortcuts_stay_within_their_rate_and_distortion_bound` requires. A better
     /// estimate of the ratio produces a worse size ranking, so what the error at `qindex` 1
-    /// measures is not the sampling: it is the extrapolation model itself. The correction assumes
-    /// the type search's gain scales with a trial's searched cost, which over-credits the
-    /// smallest size where every block is coded, and no number of probes and no setting of the
-    /// three constants removes a model error. That is why the shrinkages are what hold the bound,
-    /// and why they are shrinkages rather than a sharper estimator.
+    /// measures is not the sampling.
+    ///
+    /// It is not the extrapolation either, which is how #349 read it.
+    /// `measure_type_gain_models` sweeps this same probe count against every shape the credit
+    /// could have and finds the shape moves nothing: what a sharper probe removes is an
+    /// *over*-credit, and the over-credit is the whole of what the correction is worth. See
+    /// [`tile::GainModel`] and `the_type_gain_credit_is_a_magnitude_rather_than_a_shape`. That is
+    /// why the shrinkages are what hold the bound, and why they are biases rather than a sharper
+    /// estimator.
     #[test]
     #[ignore = "measurement sweep, not an assertion"]
     fn measure_type_gain_probes_against_trust() {
@@ -2045,8 +2049,7 @@ mod nonlossless_tests {
         // A credit that saturates at one block does not depend on how much of the trial was
         // probed, so a larger probe count only sharpens the per-block gain it credits - and it
         // reconstructs where crediting nothing does.
-        let flat = probe_counts
-            .map(|probes| arm(tile::GainModel::Saturating, 1, 16, probes).0);
+        let flat = probe_counts.map(|probes| arm(tile::GainModel::Saturating, 1, 16, probes).0);
         for (probes, delta) in probe_counts.iter().zip(flat.iter()) {
             assert!(
                 *delta >= flat[0] - 0.001,

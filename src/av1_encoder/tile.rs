@@ -289,11 +289,15 @@ pub(crate) enum GainRatio {
 /// and `measure_type_gain_probes_against_trust` is what establishes that: measuring the ratio on
 /// *more* blocks makes it monotonically worse - -0.344 dB at two probes, -0.460 dB at six - while
 /// the candidate reduction falls under the 4x the bound requires. A sharper estimate of the ratio
-/// produces a worse size ranking, so what that error measures is the extrapolation model, not the
-/// sampling: the correction assumes the type search's gain scales with a trial's searched cost,
-/// which over-credits the smallest size at a quantizer where every block is coded. No number of
-/// probes and no setting of these constants removes a model error, which is why they are
-/// shrinkages rather than a sharper estimator. Replacing the model is #349.
+/// produces a worse size ranking. #349 read that as the extrapolation model - the correction
+/// assumes the type search's gain scales with a trial's searched cost, which over-credits the
+/// smallest size at a quantizer where every block is coded - and built every replacement that
+/// reading asks for. The over-credit is not the error: it is what the correction is *worth*. A
+/// credit that does not depend on how much of the trial was probed is flat in the probe count,
+/// which is the monotonicity a model error would have to lose, and it reconstructs exactly where
+/// crediting nothing does. See [`GainModel`], where the sweep and its four corners are recorded.
+/// So no number of probes and no setting of these constants reaches the residual, and they are
+/// biases rather than a sharper estimator.
 ///
 /// No bound, ceiling or test was relaxed to reach this pair. The per-frame ceilings were
 /// re-measured at the new constants as that test's own rule requires: `scene_edge` *tightens*
@@ -349,7 +353,9 @@ pub(super) const TYPE_GAIN_TRUST: i64 = 8;
 /// corrected in full and no ratio is ever remembered, reconstructs 0.344 dB *below* the exhaustive
 /// search at `qindex` 1 on the 96x80 `test_pattern`, against the sampled estimator's +0.023 dB.
 /// The extrapolation over-credits, and it over-credits most where a trial has the most blocks to
-/// extrapolate over, which is the smallest size.
+/// extrapolate over, which is the smallest size - and #349 measured that the over-credit is the
+/// correction's whole value rather than its error, which is why this constant damps it rather
+/// than the model being replaced. [`GainModel`] records that sweep.
 ///
 /// `measure_type_gain_probe_trust` sweeps this against [`TYPE_GAIN_TRUST`] over the whole tuning
 /// set - `content_frames` including the three `gain_*` frames added for #343, plus `test_pattern`,
@@ -404,6 +410,50 @@ const TYPE_GAIN_TRUST_ONE: i64 = 16;
 ///
 /// Only the shipped [`TYPE_GAIN_MODEL`] is constructed outside tests; the others are reachable
 /// from [`FrameEncoder::with_type_gain_model`], which a non-test build does not have.
+///
+/// # Shipped encodes use [`GainModel::Linear`], and #349 is why
+///
+/// #349 read the residual at `base_q_idx` 1 as this extrapolation: the credit grows linearly in
+/// the trial's searched cost, so it over-credits the size with the most blocks to extrapolate
+/// over, and a sharper probe ranks monotonically worse, which is what a model error looks like.
+/// The three replacements that reading asks for are the other variants here, and
+/// `measure_type_gain_models` crosses them with the probe count on the 96x80 `test_pattern`.
+/// What it measures is that the credit has no useful freedom in its shape, only in its
+/// magnitude, and that the two bounds fix that magnitude from opposite sides:
+///
+/// | credit | `qindex` 1 at 1 probe | at 64 probes | worst reduction |
+/// |:-------|----------------------:|-------------:|----------------:|
+/// | none (the DCT-only ranking) | -0.203 dB | -0.203 dB | 4.77x |
+/// | [`Linear`](GainModel::Linear), shipped | +0.023 dB | -0.125 dB | 4.26x |
+/// | [`PerBlock`](GainModel::PerBlock) | +0.023 dB | -0.125 dB | 4.26x |
+/// | [`Saturating`](GainModel::Saturating) at one block | -0.203 dB | -0.203 dB | 4.77x |
+/// | [`Amplified`](GainModel::Amplified) at 48 sixteenths | +0.324 dB | +0.105 dB | 2.46x |
+///
+/// Read across, that is one number in four disguises. Counting the gain per block rather than
+/// per unit of searched cost moves nothing at any probe count, so the cost weighting is not the
+/// axis the residual lives on. Making the credit independent of how much of the trial was
+/// probed, which is what a saturation does and what the monotonicity #349 asks for requires,
+/// satisfies that monotonicity exactly - and satisfies it by crediting nothing: it lands on the
+/// bare DCT-only ranking at every probe count. And the value the shipped credit does buy comes
+/// from *over*-crediting: a trial's first block measures a larger gain than the trial's mean,
+/// and the linear extrapolation multiplies that one-block sample over every block of the trial.
+/// Probing more blocks removes the over-credit, which is why a sharper estimate ranks worse.
+///
+/// [`Amplified`](GainModel::Amplified) is that over-credit stated rather than sampled into
+/// existence: about three times the trial's own measured per-block gain, credited whatever the
+/// probe count, so the probe count only sharpens the measurement. It restores `base_q_idx` 1
+/// with every block of every trial probed - and takes the candidate reduction to 2.46x, against
+/// the 4x `the_search_shortcuts_stay_within_their_rate_and_distortion_bound` requires, because
+/// the credit that keeps the smallest size reachable is also what makes it expensive.
+///
+/// So the ranking wants more credit at `base_q_idx` 1, the candidate bound wants less, and the
+/// shipped configuration is the cell where the two meet.
+/// `the_type_gain_credit_is_a_magnitude_rather_than_a_shape` asserts all four corners of that,
+/// so a future change to the shape has to move those numbers rather than restate the reading.
+/// It is also what #356 predicts: the correction is a scalar credit against a cost measured in
+/// contexts the emitting pass will not have, and the only degree of freedom such a credit has is
+/// how much of it to believe. [`TYPE_GAIN_TRUST`] and [`TYPE_GAIN_PROBE_TRUST`] therefore stay,
+/// and stay biases.
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum GainModel {
@@ -437,15 +487,22 @@ pub(crate) enum GainModel {
 /// Blocks the [`GainModel::Saturating`] credit saturates at: the `s` of `e(b) = b * s / (b+s-1)`.
 ///
 /// This is the one number in the model that says how far a probe's measurement carries, and it
-/// is what makes the model's error at `base_q_idx` 1 stop depending on how much of a trial was
-/// probed.
+/// is what makes the credit stop depending on how much of a trial was probed - the monotonicity
+/// #349 asks for, which [`GainModel`] records is bought by crediting nothing. Nothing ships it,
+/// so `4` is only the value `measure_type_gain_models` sweeps around.
 pub(super) const TYPE_GAIN_SATURATION: usize = 4;
 
 /// Sixteenths [`GainModel::Amplified`] credits the trial's measured per-block gain at.
+///
+/// `16` is the trial's own measurement, un-amplified. `48` is where the shipped estimator's
+/// one-block sample already puts the credit, and is the value [`GainModel`]'s table and
+/// `the_type_gain_credit_is_a_magnitude_rather_than_a_shape` read the model at; nothing ships
+/// either, so this is only the value `measure_type_gain_models` sweeps around.
 pub(super) const TYPE_GAIN_AMPLIFICATION: i64 = 16;
 
-/// The extrapolation shipped encodes use. Every other [`GainModel`] is reachable only from
-/// [`FrameEncoder::with_type_gain_model`].
+/// The extrapolation shipped encodes use, which is the one #349 measured the alternatives
+/// against and did not displace. Every other [`GainModel`] is reachable only from
+/// [`FrameEncoder::with_type_gain_model`], which a non-test build does not have.
 pub(super) const TYPE_GAIN_MODEL: GainModel = GainModel::Linear;
 
 /// Fixed-point scale of [`TypeGain::ratio`], which is a fraction in `0..=1` and needs the
@@ -1191,7 +1248,10 @@ impl<'a> FrameEncoder<'a> {
     /// Overrides where [`GainModel::Saturating`]'s credit saturates, so a sweep can choose it.
     #[cfg(test)]
     pub(crate) fn with_type_gain_saturation(mut self, blocks: usize) -> Self {
-        assert!(blocks >= 1, "a credit saturating at no blocks credits nothing");
+        assert!(
+            blocks >= 1,
+            "a credit saturating at no blocks credits nothing"
+        );
         self.type_gain_saturation = blocks;
         self
     }
