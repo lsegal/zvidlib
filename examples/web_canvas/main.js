@@ -124,6 +124,16 @@ async function main() {
     lines.push(`AAC audio unavailable (${errorCode(error) ?? error?.name ?? "ERROR"}): playback will be silent.`);
   }
   const frameStarts = await buildFrameStarts(video);
+  // Where a decode can start from, which is what a backwards scrub walks forwards from (see
+  // `scrubTo`). A track this build cannot read the sync samples of scrubs from frame zero, which
+  // is the only start every track has.
+  let randomAccessPoints = [0];
+  try {
+    randomAccessPoints = (await video.randomAccessPoints()).map(Number);
+    if (randomAccessPoints.length === 0) randomAccessPoints = [0];
+  } catch (error) {
+    lines.push(`video.randomAccessPoints() rejected with ${errorCode(error)}: scrubbing backwards restarts at frame 0.`);
+  }
   const mediaDurationMs = frameStarts[frameStarts.length - 1] || 1;
   const lastFrameIndex = Math.max(0, frameStarts.length - 2);
   timeline.max = String(lastFrameIndex);
@@ -173,6 +183,19 @@ async function main() {
       else high = mid - 1;
     }
     return Math.min(low, frameStarts.length - 1);
+  }
+
+  // The newest random-access frame at or before `index`, or `index` itself when the track
+  // indexes none before it - the same rule `native_gl`'s `KeyframeIndex` follows.
+  function randomAccessPointAtOrBefore(index) {
+    let low = 0;
+    let high = randomAccessPoints.length;
+    while (low < high) {
+      const mid = Math.floor((low + high) / 2);
+      if (randomAccessPoints[mid] <= index) low = mid + 1;
+      else high = mid;
+    }
+    return low === 0 ? index : randomAccessPoints[low - 1];
   }
 
   function mediaTimeForFrame(index) {
@@ -229,49 +252,81 @@ async function main() {
   // request it is replacing: `video.get` takes an `AbortSignal` and checks it on every turn of
   // its decode loop, so the decoder is freed part-way through rather than after.
   //
-  // Walking forwards is the other half. A target ahead of the frame on screen is reached one
-  // frame at a time, drawing each, because the decoder is already positioned there and each step
-  // costs one frame instead of the whole span - so the picture tracks the pointer during a drag
-  // instead of holding still until the target arrives.
+  // Which request it may abort is the first half of tracking the pointer (issue #363). A decode
+  // still on the way to the newest position is work that position needs: cancelling it throws
+  // the decoder's place away and sends the walk back to a random-access point, so only a step
+  // the pointer has already moved *behind* is aborted.
+  //
+  // Walking is the other half, and it always runs forwards, because decoding does. A target
+  // ahead of the frame on screen is reached one frame at a time, drawing each, since the decoder
+  // is already positioned there and each step costs one frame instead of the whole span. A
+  // target behind it cannot be reached that way, so the walk restarts at the random-access point
+  // at or before the target and draws every frame from there - asking for the target directly
+  // instead decodes that same span while drawing nothing, and the next pointer sample aborted it
+  // before it landed, which is what left a backwards drag frozen. Either way the picture tracks
+  // the pointer during a drag instead of holding still until the target arrives.
   let scrubTarget = null;
   let scrubbing = false;
   let scrubAbort = null;
+  // The frame the in-flight decode is for, so a newer target can tell whether it has passed it.
+  let scrubStep = null;
+  // Where the last drawn frame left the decoder, or null when a cancelled step left it between
+  // frames and the next walk has to start over at a random-access point.
+  let scrubPosition = null;
+
+  function scrubWalkStart(target) {
+    if (scrubPosition === null) return randomAccessPointAtOrBefore(target);
+    if (scrubPosition < target) return scrubPosition + 1;
+    if (scrubPosition === target) return target;
+    return randomAccessPointAtOrBefore(target);
+  }
+
   async function scrubTo(index) {
     // Without a browser HEVC decoder there is nothing to walk through: the synthetic frames are
     // generated from the index, so the ordinary seek draws them at once.
     if (!useRealDecode) return requestSeek(index, false);
     scrubTarget = Math.min(Math.max(index, 0), lastFrameIndex);
     if (scrubbing) {
-      scrubAbort?.abort();
+      if (scrubStep !== null && scrubStep > scrubTarget) scrubAbort?.abort();
       return;
     }
     scrubbing = true;
+    scrubPosition = frameIndex;
     playing = false;
     playButton.textContent = "Play";
     if (audioState) stopAudio(audioState);
     try {
       while (scrubTarget !== null) {
         const target = scrubTarget;
-        const next = frameIndex < target ? frameIndex + 1 : target;
+        const next = scrubWalkStart(target);
         scrubAbort = new AbortController();
+        scrubStep = next;
         try {
           const frame = await video.get(BigInt(next), scrubAbort.signal);
           uploadFrame(frame.pixels, frame.width, frame.height);
           frameIndex = next;
+          scrubPosition = next;
           pausedMediaTimeMs = mediaTimeForFrame(frameIndex);
         } catch (error) {
-          // An aborted step is the newest position taking over, not a failure; anything else
-          // leaves the picture where it is and ends the scrub.
+          // An aborted step is the newest position taking over, not a failure, but it stopped the
+          // decoder between frames, so the next walk starts from a random-access point rather
+          // than from nowhere. Anything else leaves the picture where it is and ends the scrub.
           if (errorCode(error) !== "CANCELLED") {
             scrubTarget = null;
             break;
           }
+          scrubPosition = null;
+        } finally {
+          scrubStep = null;
         }
+        // Arriving clears the target rather than holding it, so a drag that comes back to this
+        // frame asks for it afresh - out of the decoder's cache, for nothing.
         if (scrubTarget === target && frameIndex === target) scrubTarget = null;
       }
     } finally {
       scrubbing = false;
       scrubAbort = null;
+      scrubStep = null;
       syncTimeline();
     }
   }
