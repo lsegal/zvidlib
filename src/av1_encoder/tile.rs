@@ -109,12 +109,13 @@ const TYPE_GAIN_PROBES: usize = 1;
 /// *worse* than the exhaustive search; see the decomposition under that constant. It also means
 /// the unsampled estimator this column is taken against is not a strict upper bound on quality.
 ///
-/// So the interval is chosen on coverage and cost instead. Coverage binds it: the per-size
-/// correction is what makes `TX_4X4` selectable at all, and on the 96x80 pattern - few enough
-/// coding blocks that the size is won at only two of them - `16` loses the size outright, as do
-/// `3`, `6` and `12`. `8` is the largest interval that keeps it, which
-/// `the_type_gain_sampling_interval_is_the_longest_that_keeps_tx_4x4` and
-/// `non_lossless_frames_round_trip_within_a_distortion_bound` both hold it to.
+/// Coverage does not bind it either, though for a long time it read as though it did. The
+/// per-size correction is what makes `TX_4X4` selectable at all, and on the 96x80 pattern - few
+/// enough coding blocks that the size is won at only two of them - `16` loses the size outright,
+/// as do `3`, `6` and `12`, so `8` read as the largest interval that keeps it and
+/// `the_type_gain_sampling_interval_is_the_longest_that_keeps_tx_4x4` held it there.
+/// `non_lossless_frames_round_trip_within_a_distortion_bound` still asserts the size is selected
+/// on that frame at the shipped interval, which is #278's bound and unaffected by any of this.
 ///
 /// That column is a *phase* rather than a rate, and #323 measured out which one.
 /// `measure_type_gain_phase_aliasing` shows the per-size accumulator is populated at every
@@ -128,14 +129,35 @@ const TYPE_GAIN_PROBES: usize = 1;
 /// transform would remove the dependence and is measured in the same sweep at 28-70% more
 /// transform-type candidates for up to +12.4% worse rate-distortion, so the sampler stays as it
 /// is and `the_smallest_transform_is_selected_at_every_sampling_interval` holds the size across
-/// nine frame-and-size pairs where no interval from `2` to `16` loses it. Within that bound
-/// it takes the whole available saving: 174,638 transform-type candidates against `2`'s 203,477
-/// and the exhaustive search's 920,503 - 14% fewer than the previous value for 6% less encode
-/// time, and comfortably inside the four-fold reduction
+/// nine frame-and-size pairs where the phase does not enter.
+///
+/// #329 swept both properties past the `16` those tests stopped at, and neither bounds the
+/// constant from above. `measure_type_gain_intervals_past_sixteen` runs all 567 cells of `2..=64`
+/// over those nine pairs and none loses the size, so the coverage stop at `16` was where the
+/// sweep ended rather than where the property does. The penalty column is a *level* rather than a
+/// trend over the same range - `+1.27%` at `2`, `+3.48%` at `4`, `+3.43%` at `8`, `+1.47%` at
+/// `16` and at `32`, `+3.27%` at `64`, with only *which* frame pays moving - so nothing on the
+/// rate-distortion side disqualifies a longer interval either. The per-frame ceilings in
+/// `the_type_gain_sampling_interval_holds_on_content_it_was_not_tuned_on` are cleared by `4` and
+/// `8` alone, but they were set from the penalties measured at `8`, so reading an upper bound off
+/// them would restate the phase coincidence rather than replace it.
+///
+/// What is left is that there is nothing further to buy. Summed over the six quantizers, going
+/// from `8` to `64` removes between `2.8%` and `11.0%` of a frame's transform-type candidates -
+/// `6.1%` over the whole 192x160 set, 174,638 against 163,933, half of it already claimed by
+/// `16` - against `8` itself having been worth 14% over the previous value of `2`. So the value
+/// stays where #278 put it, and the assertion that used to pin it from above is replaced by
+/// `the_type_gain_sampling_intervals_upper_bound_is_what_a_longer_one_buys`, which holds the
+/// whole swept range to one penalty bound and holds the remaining candidate saving to under a
+/// tenth: both fail on a real change to the estimator, and neither on a stride's phase.
+///
+/// At `8` the sampler takes the saving that was worth taking: 174,638 transform-type candidates
+/// against `2`'s 203,477 and the exhaustive search's 920,503 - 14% fewer than the previous value
+/// for 6% less encode time, and comfortably inside the four-fold reduction
 /// `the_search_shortcuts_stay_within_their_rate_and_distortion_bound` asserts, which only gets
-/// easier as the interval grows. The emitted bitstream moves accordingly, so the digests
-/// `a_fixed_frame_encodes_to_the_same_bytes_on_every_host` pins are regenerated; the 96x80
-/// pattern codes to fewer bytes at three of the six quantizers and the same at two.
+/// easier as the interval grows. The emitted bitstream moved accordingly when #278 landed, so the
+/// digests `a_fixed_frame_encodes_to_the_same_bytes_on_every_host` pins were regenerated then;
+/// the 96x80 pattern codes to fewer bytes at three of the six quantizers and the same at two.
 pub(super) const TYPE_GAIN_SAMPLE_INTERVAL: usize = 8;
 
 /// Transform sizes [`FrameEncoder::type_gain`] accumulates over: `TX_4X4` through `TX_32X32`,
