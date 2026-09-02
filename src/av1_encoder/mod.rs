@@ -699,6 +699,54 @@ mod nonlossless_tests {
                 (((x / 2) ^ (y / 2)) % 2 * 255) as u8
             }
         });
+        // The three frames above vary the residual *energy* across a boundary, which is the
+        // right axis for the sampling interval - its error is a stale cost - and the wrong one
+        // for the shrinkage and the recency window. What those two carry across a boundary is
+        // the ratio `(dct - best) / dct`, and a boundary between two regions that both happen to
+        // have a near-zero type gain does not move it however sharply the energy jumps. That is
+        // why `measure_type_gain_trust` and `measure_type_gain_memory_windows` read flat on the
+        // whole set above once #299 stopped mispricing the levels a boundary produces, which is
+        // what #343 recorded: neither constant was chosen by a measurement of its own any more.
+        //
+        // The three below put a region the non-DCT types win on next to a region they cannot. A
+        // sawtooth ramp and hard diagonal edges both leave a residual with a strong one-sided
+        // trend under DC prediction, which is what the `ADST` kernels are for and `DCT` is not,
+        // while full-range noise has no trend for any type to exploit and a type gain of nearly
+        // zero. The ratio therefore genuinely changes across the boundary, at every quantizer,
+        // and `measure_type_gain_separation` is what says so: on `gain_edge` and `gain_bands` the
+        // shrinkage moves the frame's penalty by 0.03% to 2.2% at almost every quantizer and both
+        // sizes, against the 0.000% every frame above reads at all but two of the twelve.
+        let ramp = |x: u32, y: u32| (((x + y) % 32) * 8) as u8;
+        let mut gain_state = 0xC0FF_EE01_u32;
+        let gain_noise: Vec<u8> = (0..width * height)
+            .map(|_| (lcg(&mut gain_state) >> 24) as u8)
+            .collect();
+        let gain_noise = |x: u32, y: u32| gain_noise[(y * width + x) as usize];
+        let edges = |x: u32, y: u32| if (x + y) % 12 < 6 { 30 } else { 220 };
+        // One boundary, across rows.
+        let gain_edge = pixel(&|x, y| {
+            if y < height / 2 {
+                ramp(x, y)
+            } else {
+                gain_noise(x, y)
+            }
+        });
+        // The same two statistics alternating every 16 rows, so the gain changes many times.
+        let gain_bands = pixel(&|x, y| {
+            if (y / 16) % 2 == 0 {
+                ramp(x, y)
+            } else {
+                gain_noise(x, y)
+            }
+        });
+        // Boundaries in both axes, on a 32x32 checkerboard.
+        let gain_mosaic = pixel(&|x, y| {
+            if ((x / 32) + (y / 32)) % 2 == 0 {
+                edges(x, y)
+            } else {
+                gain_noise(x, y)
+            }
+        });
         vec![
             ("noise", noise),
             ("smooth", smooth),
@@ -707,6 +755,9 @@ mod nonlossless_tests {
             ("scene_edge", scene_edge),
             ("bands", bands),
             ("mosaic", mosaic),
+            ("gain_edge", gain_edge),
+            ("gain_bands", gain_bands),
+            ("gain_mosaic", gain_mosaic),
         ]
     }
 
@@ -1486,103 +1537,55 @@ mod nonlossless_tests {
             .sum()
     }
 
-    /// Candidate frames for a tuning set that separates the *type gain* rather than the residual
-    /// energy, which is what [`content_frames`] varies.
-    ///
-    /// Every frame in `content_frames` is built out of regions whose *energy* differs - flat
-    /// against noise, smooth against a checkerboard. That is the right axis for the sampling
-    /// interval, whose error is a stale cost, but it is the wrong one for the shrinkage and the
-    /// recency window: what those two carry across a region boundary is the ratio
-    /// `(dct - best) / dct`, and a boundary between two regions that both happen to have a near
-    /// zero type gain does not move it however sharply the energy jumps. That is why
-    /// `measure_type_gain_trust` and `measure_type_gain_memory_windows` read flat on the whole
-    /// set once #299 stopped mispricing the levels a boundary produces.
-    ///
-    /// These frames instead put a region the non-DCT types win on next to a region they cannot:
-    /// a sawtooth ramp and hard diagonal edges both leave a residual with a strong one-sided
-    /// trend under DC prediction, which is exactly what `ADST` transforms and `DCT` does not,
-    /// while full-range noise has no trend for any type to exploit and a type gain of nearly
-    /// zero. The ratio therefore genuinely changes across the boundary, at every quantizer.
-    fn gain_frames(width: u32, height: u32) -> Vec<(&'static str, Vec<u8>)> {
-        let pixel = |f: &dyn Fn(u32, u32) -> u8| -> Vec<u8> {
-            (0..height)
-                .flat_map(|y| (0..width).map(move |x| f(x, y)).collect::<Vec<_>>())
-                .collect()
-        };
-        // A region the type search wins on: a sawtooth ramp, whose residual against a DC
-        // prediction is monotone across the block.
-        let ramp = |x: u32, y: u32| (((x + y) % 32) * 8) as u8;
-        // A region it cannot: full-range noise, uncorrelated in both axes.
-        let mut state = 0xC0FF_EE01_u32;
-        let noisy = {
-            let values: Vec<u8> = (0..width * height)
-                .map(|_| (lcg(&mut state) >> 24) as u8)
-                .collect();
-            move |x: u32, y: u32| values[(y * width + x) as usize]
-        };
-        // Hard diagonal edges, the other content the non-DCT types are for.
-        let edges = |x: u32, y: u32| if (x + y) % 12 < 6 { 30 } else { 220 };
-        let gain_edge = pixel(&|x, y| {
-            if y < height / 2 {
-                ramp(x, y)
-            } else {
-                noisy(x, y)
-            }
-        });
-        let gain_bands = pixel(&|x, y| {
-            if (y / 16) % 2 == 0 {
-                ramp(x, y)
-            } else {
-                noisy(x, y)
-            }
-        });
-        let gain_mosaic = pixel(&|x, y| {
-            if ((x / 32) + (y / 32)) % 2 == 0 {
-                edges(x, y)
-            } else {
-                noisy(x, y)
-            }
-        });
-        vec![
-            ("gain_edge", gain_edge),
-            ("gain_bands", gain_bands),
-            ("gain_mosaic", gain_mosaic),
-        ]
-    }
-
-    /// One cell of a calibration sweep: the three knobs whose values it varies.
+    /// One cell of a calibration sweep: the knobs whose values it varies.
     #[derive(Clone, Copy)]
     struct GainArm {
         probe_trust: i64,
         trust: i64,
         memory: usize,
+        unified: bool,
     }
 
     impl GainArm {
         fn apply<'a>(self, encoder: tile::FrameEncoder<'a>) -> tile::FrameEncoder<'a> {
-            encoder
+            let encoder = encoder
                 .with_type_gain_probe_trust(self.probe_trust)
                 .with_type_gain_trust(self.trust)
-                .with_type_gain_memory(self.memory)
+                .with_type_gain_memory(self.memory);
+            if self.unified {
+                encoder.with_unified_type_gain()
+            } else {
+                encoder
+            }
+        }
+
+        /// The shipped calibration, which is what a sweep varies one knob of at a time.
+        fn shipped() -> Self {
+            Self {
+                probe_trust: tile::TYPE_GAIN_PROBE_TRUST,
+                trust: tile::TYPE_GAIN_TRUST,
+                memory: tile::TYPE_GAIN_MEMORY,
+                unified: false,
+            }
         }
     }
 
-    /// The frames a calibration sweep runs on, at both sizes: [`content_frames`], the encoder's
-    /// own `test_pattern`, and the [`gain_frames`] that separate the type gain.
+    /// The frames a calibration sweep runs on, at both sizes: [`content_frames`] - which since
+    /// #343 carries the three `gain_*` frames that separate the type gain - and the encoder's own
+    /// `test_pattern`.
     fn tuning_set() -> Vec<(usize, usize, Vec<(&'static str, Vec<u8>)>)> {
         [(128_usize, 96_usize), (192, 160)]
             .into_iter()
             .map(|(width, height)| {
                 let mut frames = content_frames(width as u32, height as u32);
                 frames.push(("test_pattern", test_pattern(width as u32, height as u32)));
-                frames.extend(gain_frames(width as u32, height as u32));
                 (width, height, frames)
             })
             .collect()
     }
 
-    /// The cost of the same estimator probing *every* size search, which is what a sampled
-    /// arm's penalty is measured against and does not itself depend on any of the constants.
+    /// The cost of the same estimator probing *every* size search, which is what a sampled arm's
+    /// penalty is measured against and does not itself depend on any of the constants.
     fn unsampled_costs(
         sets: &[(usize, usize, Vec<(&'static str, Vec<u8>)>)],
     ) -> std::collections::BTreeMap<(usize, &'static str, u8), i64> {
@@ -1662,15 +1665,142 @@ mod nonlossless_tests {
         worst
     }
 
-    /// Whether the distortion bound is reachable over a *range* of shrinkages rather than at one
+    /// How far a trial's *own* probe measurement should be believed, which is where
+    /// [`tile::TYPE_GAIN_PROBE_TRUST`] comes from.
+    ///
+    /// A trial that probed used to be corrected by the ratio it measured in full - not because
+    /// anything measured that it should be, but because the ratio was the trial's own. That was
+    /// the last unmeasured assumption in the correction, and it is the one that decides the
+    /// distortion bound: `measure_dct_only_ranking_error` shows an estimator probing *every* size
+    /// search, where every trial is corrected in full and no ratio is ever remembered,
+    /// reconstructing 0.344 dB *below* the exhaustive search at `qindex` 1, against the sampled
+    /// estimator's +0.023 dB.
+    ///
+    /// This sweeps that shrinkage against the one on a remembered correction, over the whole
+    /// [`tuning_set`], and it is what chose `14`. At the shipped shrinkage of `8` the worst frame
+    /// falls from +1.99% at the un-shrunk `16` to +1.67% at `14` and `15` and back to +1.86% at
+    /// `13`, the mean improves from -0.085% to -0.145%, and the 0.05 dB bound holds over the
+    /// whole `13..=16` by `trust` `8..=10` region rather than at the single cell #343 recorded.
+    /// Below `13` the bound goes with it: `12` misses at 0.117 dB and `8` at 0.117 dB.
+    #[test]
+    #[ignore = "measurement sweep, not an assertion"]
+    fn measure_type_gain_probe_trust() {
+        let sets = tuning_set();
+        let unsampled = unsampled_costs(&sets);
+        println!("probe_trust,trust,worst_penalty,worst_frame,mean_penalty,bound_delta");
+        for probe_trust in 0_i64..=16 {
+            for trust in [0_i64, 2, 4, 6, 8, 10, 12, 16] {
+                let arm = GainArm {
+                    probe_trust,
+                    trust,
+                    ..GainArm::shipped()
+                };
+                let (worst, worst_name, mean) = tuning_set_penalty(&sets, &unsampled, arm);
+                let delta = bound_delta(arm);
+                println!("{probe_trust},{trust},{worst:+.3},{worst_name},{mean:+.3},{delta:+.3}");
+            }
+        }
+    }
+
+    /// The shrinkage and the recency window swept together on the set that separates them.
+    ///
+    /// `measure_type_gain_memory_against_trust` sweeps the same grid against the two assertions
+    /// the pair has to satisfy together, which is a search for a cell that passes rather than a
+    /// measurement of the pair. This is the measurement: over the whole [`tuning_set`] it reports
+    /// what each cell costs against the same estimator probing every size search - the worst
+    /// frame and the mean - beside the 96x80 distortion delta.
+    #[test]
+    #[ignore = "measurement sweep, not an assertion"]
+    fn measure_type_gain_calibration() {
+        let sets = tuning_set();
+        let unsampled = unsampled_costs(&sets);
+        println!("memory,trust,worst_penalty,worst_frame,mean_penalty,bound_delta");
+        for memory in [1_usize, 2, 3, 4, 6, 8, 16, usize::MAX] {
+            for trust in [0_i64, 1, 2, 3, 4, 6, 8, 10, 12, 14, 16] {
+                let arm = GainArm {
+                    trust,
+                    memory,
+                    ..GainArm::shipped()
+                };
+                let (worst, worst_name, mean) = tuning_set_penalty(&sets, &unsampled, arm);
+                let delta = bound_delta(arm);
+                let window = if memory == usize::MAX {
+                    "frame".to_string()
+                } else {
+                    memory.to_string()
+                };
+                println!("{window},{trust},{worst:+.3},{worst_name},{mean:+.3},{delta:+.3}");
+            }
+        }
+    }
+
+    /// What the probing asymmetry is worth, measured rather than assumed.
+    ///
+    /// A trial that probed is corrected by the ratio it measured on its own blocks; every other
+    /// trial is corrected by a remembered one, shrunk further. Two adjacent coding blocks are
+    /// therefore ranked by corrections of different strengths, and which of them the stride
+    /// sampled decides which sizes stay selectable - the phase dependence #323 recorded, and the
+    /// obvious suspect for the single passing cell #343 found. `with_unified_type_gain` removes
+    /// the asymmetry: every trial reads the accumulator, which a probing trial has already
+    /// contributed to, and one shrinkage applies to all of them.
+    ///
+    /// It is decisively worse, which is why the asymmetry stays. Unified, the worst frame of the
+    /// tuning set costs between +6.4% and +37.9% at every window and shrinkage, against +1.2% to
+    /// +1.8% for the shipped arrangement, and the distortion bound is missed at 0.203 dB almost
+    /// everywhere. A ratio a trial measured on its own blocks is a genuinely better estimator
+    /// than one carried from elsewhere in the frame, which is the policy
+    /// [`tile::TYPE_GAIN_TRUST`] states; this is the measurement of it.
+    #[test]
+    #[ignore = "measurement sweep, not an assertion"]
+    fn measure_unified_type_gain() {
+        let sets = tuning_set();
+        let unsampled = unsampled_costs(&sets);
+        println!("unified,memory,trust,worst_penalty,worst_frame,mean_penalty,bound_delta");
+        for unified in [false, true] {
+            for memory in [1_usize, 2, 4, usize::MAX] {
+                for trust in [0_i64, 2, 4, 6, 8, 10, 12, 14, 16] {
+                    let arm = GainArm {
+                        trust,
+                        memory,
+                        unified,
+                        ..GainArm::shipped()
+                    };
+                    let (worst, worst_name, mean) = tuning_set_penalty(&sets, &unsampled, arm);
+                    let delta = bound_delta(arm);
+                    let window = if memory == usize::MAX {
+                        "frame".to_string()
+                    } else {
+                        memory.to_string()
+                    };
+                    println!(
+                        "{unified},{window},{trust},{worst:+.3},{worst_name},{mean:+.3},{delta:+.3}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Whether the distortion bound is reachable over a range of shrinkages rather than at one
     /// point, as a function of how many blocks a probe measures.
     ///
-    /// The single passing cell #343 records is the symptom of an estimator with one sample in
-    /// it: [`tile::TYPE_GAIN_PROBES`] is `1`, so a trial's ratio is measured on one block and
+    /// The obvious reading of a single passing cell is an estimator with one sample in it:
+    /// [`tile::TYPE_GAIN_PROBES`] is `1`, so a trial's ratio is measured on one block and
     /// extrapolated over all of them, and at `qindex` 1 - where nothing quantizes to zero and
     /// every block is coded - that one block decides the ranking. This sweeps the probe count
-    /// against the shrinkage and prints, per cell, the 96x80 distortion delta and the `qindex` 1
-    /// delta that drives it, beside the candidate reduction the shortcuts have to keep.
+    /// against the shrinkage and prints, per cell, the 96x80 distortion delta, the `qindex` 1
+    /// delta that drives it, and the candidate reduction the shortcuts have to keep.
+    ///
+    /// That reading is wrong, and this is what says so. Measuring the ratio on *more* blocks
+    /// makes `qindex` 1 monotonically worse - `1` probe reaches +0.023 dB, `2` and `3` sit at
+    /// -0.344 dB at every shrinkage, `4` and `6` at -0.418 and -0.460 dB - while the candidate
+    /// reduction falls from 4.26x through 4.11x to 3.57x, under the 4x
+    /// `the_search_shortcuts_stay_within_their_rate_and_distortion_bound` requires. A better
+    /// estimate of the ratio produces a worse size ranking, so what the error at `qindex` 1
+    /// measures is not the sampling: it is the extrapolation model itself. The correction assumes
+    /// the type search's gain scales with a trial's searched cost, which over-credits the
+    /// smallest size where every block is coded, and no number of probes and no setting of the
+    /// three constants removes a model error. That is why the shrinkages are what hold the bound,
+    /// and why they are shrinkages rather than a sharper estimator.
     #[test]
     #[ignore = "measurement sweep, not an assertion"]
     fn measure_type_gain_probes_against_trust() {
@@ -1709,78 +1839,12 @@ mod nonlossless_tests {
                         worst = delta;
                         worst_qindex = qindex;
                     }
-                    worst_reduction = worst_reduction.min(
-                        exhaustive[&qindex].1 as f64 / report.candidates_evaluated as f64,
-                    );
+                    worst_reduction = worst_reduction
+                        .min(exhaustive[&qindex].1 as f64 / report.candidates_evaluated as f64);
                 }
                 println!(
                     "{probes},{trust},{worst:+.3},{worst_qindex},{first:+.3},{worst_reduction:.2}"
                 );
-            }
-        }
-    }
-
-    /// How far a trial's *own* probe measurement should be believed.
-    ///
-    /// The correction extrapolates a ratio measured on [`tile::TYPE_GAIN_PROBES`] of a trial's
-    /// blocks over all of them, and a trial that probed was corrected by that ratio in full -
-    /// not because anything measured it should be, but because it is the trial's own
-    /// measurement. `measure_dct_only_ranking_error` is what says that assumption is where the
-    /// error at `qindex` 1 lives: an estimator probing *every* size search, so that every trial
-    /// is corrected in full and no ratio is ever remembered, reconstructs 0.344 dB *below* the
-    /// exhaustive search there, against the sampled estimator's +0.023 dB. This sweeps the
-    /// shrinkage on that measured correction against the one on a remembered correction.
-    #[test]
-    #[ignore = "measurement sweep, not an assertion"]
-    fn measure_type_gain_probe_trust() {
-        let sets = tuning_set();
-        let unsampled = unsampled_costs(&sets);
-        println!("probe_trust,trust,worst_penalty,worst_frame,mean_penalty,bound_delta");
-        for probe_trust in 0_i64..=16 {
-            for trust in [0_i64, 2, 4, 6, 8, 10, 12, 16] {
-                let arm = GainArm {
-                    probe_trust,
-                    trust,
-                    memory: tile::TYPE_GAIN_MEMORY,
-                };
-                let (worst, worst_name, mean) = tuning_set_penalty(&sets, &unsampled, arm);
-                let delta = bound_delta(arm);
-                println!(
-                    "{probe_trust},{trust},{worst:+.3},{worst_name},{mean:+.3},{delta:+.3}"
-                );
-            }
-        }
-    }
-
-    /// The shrinkage and the recency window swept together on the set that separates them.
-    ///
-    /// `measure_type_gain_memory_against_trust` sweeps the same grid against the two assertions
-    /// the pair has to satisfy together, which is a search for a cell that passes rather than a
-    /// measurement of the pair. This is the measurement: over the whole [`tuning_set`], including
-    /// the [`gain_frames`] that separate the type gain, it reports what each cell costs against
-    /// the same estimator probing every size search - the worst frame and the mean - beside the
-    /// 96x80 distortion delta. An optimum here is one the tuning set chose.
-    #[test]
-    #[ignore = "measurement sweep, not an assertion"]
-    fn measure_type_gain_calibration() {
-        let sets = tuning_set();
-        let unsampled = unsampled_costs(&sets);
-        println!("memory,trust,worst_penalty,worst_frame,mean_penalty,bound_delta");
-        for memory in [1_usize, 2, 3, 4, 6, 8, 16, usize::MAX] {
-            for trust in [0_i64, 1, 2, 3, 4, 6, 8, 10, 12, 14, 16] {
-                let arm = GainArm {
-                    probe_trust: tile::TYPE_GAIN_PROBE_TRUST,
-                    trust,
-                    memory,
-                };
-                let (worst, worst_name, mean) = tuning_set_penalty(&sets, &unsampled, arm);
-                let delta = bound_delta(arm);
-                let window = if memory == usize::MAX {
-                    "frame".to_string()
-                } else {
-                    memory.to_string()
-                };
-                println!("{window},{trust},{worst:+.3},{worst_name},{mean:+.3},{delta:+.3}");
             }
         }
     }
@@ -1790,9 +1854,10 @@ mod nonlossless_tests {
     /// The calibration constants cannot remove it and this is the measurement that says so: it
     /// prints, per quantizer on the 96x80 `test_pattern` the distortion bound is asserted on, the
     /// reconstruction of every arm the shortcut has - the shipped one, the same estimator probing
-    /// every size search, the un-shrunk and fully-shrunk corrections, and the correction removed
-    /// altogether - each against the exhaustive search, together with how many coding blocks
-    /// chose a different transform size from the exhaustive search's.
+    /// every size search, the un-shrunk and fully-shrunk corrections, and forcing a probe at
+    /// every search that can reach the smallest size - each against the exhaustive search,
+    /// together with how many coding blocks chose a different transform size from the exhaustive
+    /// search's.
     #[test]
     #[ignore = "measurement sweep, not an assertion"]
     fn measure_dct_only_ranking_error() {
@@ -1834,10 +1899,9 @@ mod nonlossless_tests {
                         .encode_with_report(),
                 ),
                 (
-                    "probe_every_search_trust_0",
+                    "probe_trust_16",
                     tile::FrameEncoder::new(&pixels, width, height, qindex)
-                        .with_type_gain_interval(1)
-                        .with_type_gain_trust(0)
+                        .with_type_gain_probe_trust(16)
                         .encode_with_report(),
                 ),
                 (
@@ -1876,7 +1940,6 @@ mod nonlossless_tests {
         for (width, height) in [(128_usize, 96_usize), (192, 160)] {
             let mut frames = content_frames(width as u32, height as u32);
             frames.push(("test_pattern", test_pattern(width as u32, height as u32)));
-            frames.extend(gain_frames(width as u32, height as u32));
             println!("size,{width}x{height}");
             println!("frame,qindex,trust_spread,memory_spread,best_trust,best_memory");
             for (name, pixels) in &frames {

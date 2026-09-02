@@ -283,7 +283,7 @@ pub(super) const TYPE_GAIN_TRUST: i64 = 8;
 ///
 /// Provisional: swept by `measure_type_gain_probe_trust`. `16` is the un-shrunk correction this
 /// replaced, which was an assumption rather than a measurement.
-pub(super) const TYPE_GAIN_PROBE_TRUST: i64 = 16;
+pub(super) const TYPE_GAIN_PROBE_TRUST: i64 = 14;
 
 /// [`TYPE_GAIN_TRUST`] denominator: the un-shrunk correction.
 const TYPE_GAIN_TRUST_ONE: i64 = 16;
@@ -430,6 +430,10 @@ pub(crate) struct FrameEncoder<'a> {
     /// [`TYPE_GAIN_PROBE_TRUST`] outside tests.
     #[cfg(test)]
     type_gain_probe_trust: i64,
+    /// Whether every trial reads its ratio back from the accumulator, including one that probed,
+    /// so a test can measure the probing asymmetry away. `false` outside tests.
+    #[cfg(test)]
+    unified_type_gain: bool,
     /// Transform-type candidates actually transformed, quantized and reconstructed, which is the
     /// work the shortcuts exist to remove.
     #[cfg(test)]
@@ -654,6 +658,8 @@ impl<'a> FrameEncoder<'a> {
             type_gain_trust: TYPE_GAIN_TRUST,
             #[cfg(test)]
             type_gain_probe_trust: TYPE_GAIN_PROBE_TRUST,
+            #[cfg(test)]
+            unified_type_gain: false,
             #[cfg(test)]
             type_gain_memory: TYPE_GAIN_MEMORY,
             #[cfg(test)]
@@ -883,6 +889,26 @@ impl<'a> FrameEncoder<'a> {
     #[cfg(not(test))]
     fn type_gain_probe_trust(&self) -> i64 {
         TYPE_GAIN_PROBE_TRUST
+    }
+
+    /// Corrects every trial from the accumulator, including one that probed, so the correction no
+    /// longer depends on which coding blocks the stride happened to sample.
+    #[cfg(test)]
+    pub(crate) fn with_unified_type_gain(mut self) -> Self {
+        self.unified_type_gain = true;
+        self
+    }
+
+    /// Whether a trial that probed still reads its own measurement back. `false` outside tests.
+    #[cfg(test)]
+    fn unified_type_gain(&self) -> bool {
+        self.unified_type_gain
+    }
+
+    /// Whether a trial that probed still reads its own measurement back. `false` outside tests.
+    #[cfg(not(test))]
+    fn unified_type_gain(&self) -> bool {
+        false
     }
 
     /// Encodes the tile and returns the symbol-coded bytes (`decode_tile`, §5.11.2).
@@ -1355,7 +1381,8 @@ impl<'a> FrameEncoder<'a> {
     /// frame instead, so it is still corrected - by the ratio a probe of its own would have been
     /// measuring.
     fn corrected_trial_cost(&self, cost: i64, tx_width: usize) -> i64 {
-        let (dct, best) = if self.probe_dct_cost > 0 {
+        let measured_here = self.probe_dct_cost > 0 && !self.unified_type_gain();
+        let (dct, best) = if measured_here {
             (self.probe_dct_cost, self.probe_best_cost)
         } else {
             let slot = type_gain_slot(tx_width);
@@ -1373,7 +1400,7 @@ impl<'a> FrameEncoder<'a> {
             return cost;
         }
         let mut measured = dct - best;
-        let trust = if self.probe_dct_cost > 0 {
+        let trust = if measured_here {
             self.type_gain_probe_trust()
         } else {
             self.type_gain_trust()
