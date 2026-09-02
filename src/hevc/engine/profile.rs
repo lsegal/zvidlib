@@ -641,7 +641,10 @@ mod tests {
         let total = report.total().as_secs_f64();
         let expected = report.stage(Stage::Sao).as_secs_f64() / total;
         let vector = report.vectorized_share();
-        assert!((vector - expected).abs() < 1e-9, "vectorized share {vector}");
+        assert!(
+            (vector - expected).abs() < 1e-9,
+            "vectorized share {vector}"
+        );
         assert!(
             (report.share(Stage::Residual) - report.stage(Stage::Residual).as_secs_f64() / total)
                 .abs()
