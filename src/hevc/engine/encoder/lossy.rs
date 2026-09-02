@@ -568,46 +568,8 @@ fn write_idr_residual_slice(
             sse: picture_sse(&deblocked, y, cb, cr),
             bits: slice_data.len() as u64 * 8,
         };
-        // What SAO is weighed against is one step of the quantizer, so that
-        // is the point the probe codes: this same writer one QP finer, or one
-        // QP coarser at QP 0, where there is no finer.
-        let (fine, coarse) = {
-            let point = |probe_qp| curve_point(planes, probe_qp, search, filter.deblocking());
-            if qp > 0 {
-                (point(qp - 1), base)
-            } else {
-                (base, point(qp + 1))
-            }
-        };
-        // What a grid of structures for this picture costs, before anything
-        // is traded away to buy the rate back — the rate the price below is
-        // read off the curve at. `grid_bins` is the model
-        // `the_coded_rate_model_agrees_with_what_the_writer_spends` holds to
-        // within 9.5% of what `code_sao` really writes, which is far inside
-        // what the calibration's own two-point extrapolation resolves, so the
-        // rate probe costs a search rather than a second coded slice.
-        let structures = sao_structure_grid(&deblocked, planes, lambda_q8(qp));
-        let (structure_mode, structure_band) = grid_bins(&structures, ctbs_x);
-        // The price the search prices its candidates at, read off this
-        // picture's own curve rather than off the closed form.
-        //
-        // The closed form is the right instrument for choosing between two
-        // codings of one CTB at one QP, where the picture cancels out of the
-        // comparison, and that is what choosing an edge class or a band
-        // position is. It is the wrong one for §7.3.8.3's merge, which is not
-        // a choice between two codings of a CTB at all: taking a neighbour's
-        // parameters gives up distortion to spend fewer bits on the slice,
-        // which is the same trade `keeps_sao` makes and the one #287 measured
-        // the closed form wrong for by 0.4x to 2.5x. Priced at the closed
-        // form the search takes merges that buy 0.29 of squared error a bit
-        // where these pictures' own curves buy 0.27, and #274's operating
-        // points go with them; priced at the curve it keeps them.
-        let search_lambda = calibrated_sao_lambda_q8(
-            fine,
-            coarse,
-            qp,
-            (structure_mode + structure_band).max(1),
-        );
+        let (fine, coarse) = sao_curve_probe(planes, qp, search, filter.deblocking(), base);
+        let search_lambda = sao_search_lambda_q8(&deblocked, planes, qp, ctbs_x, fine, coarse);
         let grid = sao_reconstruction(&mut recon, planes, search_lambda);
         let gain = base.sse.saturating_sub(picture_sse(&recon, y, cb, cr));
         // What the grid costs, read off the coded slice rather than counted
@@ -1005,6 +967,69 @@ fn keeps_sao(gain: u64, sao_bits: u64, qp: i32, fine: CurvePoint, coarse: CurveP
         return false;
     }
     gain as f64 > sao_threshold_sse(fine, coarse, qp, sao_bits)
+}
+
+/// The price the per-CTB SAO search prices this picture's candidates at.
+///
+/// The closed form is the right instrument for choosing between two codings
+/// of one CTB at one QP, where the picture cancels out of the comparison, and
+/// that is what choosing an edge class or a band position is. It is the wrong
+/// one for §7.3.8.3's merge, which is not a choice between two codings of a
+/// CTB at all: taking a neighbour's parameters gives up distortion to spend
+/// fewer bits on the *slice*, which is the same trade [`keeps_sao`] makes and
+/// the one #287 measured the closed form wrong for by 0.4x to 2.5x. Priced at
+/// the closed form the search takes merges that buy 0.29 of squared error a
+/// bit where these pictures' own curves buy 0.27, and #274's operating points
+/// go with them.
+///
+/// So the search is priced on the same instrument the slice-level rule is:
+/// [`calibrated_sao_lambda_q8`], read at the rate a grid of *structures* for
+/// this picture costs. Structures rather than the search's own answer,
+/// because the rate the price is read at has to be one nothing has been
+/// traded away to reach yet — a grid that already merged would be read at its
+/// own reduced rate, and a concave threshold prices a smaller grid higher per
+/// bit, so the price would chase the merges it is meant to judge.
+///
+/// The rate is [`grid_bins`] rather than a second coded slice.
+/// `the_coded_rate_model_agrees_with_what_the_writer_spends` holds that model
+/// to within 9.5% of what `code_sao` really writes, which is far inside what
+/// the calibration's own two-point extrapolation resolves.
+fn sao_search_lambda_q8(
+    deblocked: &ReconstructedPicture,
+    planes: SourcePlanes<'_>,
+    qp: i32,
+    ctbs_x: usize,
+    fine: CurvePoint,
+    coarse: CurvePoint,
+) -> u32 {
+    let structures = sao_structure_grid(deblocked, planes, lambda_q8(qp));
+    let (mode, band) = grid_bins(&structures, ctbs_x);
+    let lambda = calibrated_sao_lambda_q8(fine, coarse, qp, (mode + band).max(1));
+    if std::env::var_os("ZVIDLIB_SAO_TRACE").is_some() {
+        println!(
+            "TRACE qp {qp}: structures {} bins, fixed {}, calibrated {lambda}",
+            mode + band,
+            lambda_q8(qp)
+        );
+    }
+    lambda
+}
+
+/// The two points of this picture's own curve the SAO decisions are taken
+/// against: the writer's own coded point and [`curve_point`] one QP away.
+fn sao_curve_probe(
+    planes: SourcePlanes<'_>,
+    qp: i32,
+    search: ModeSearch,
+    deblocking: bool,
+    base: CurvePoint,
+) -> (CurvePoint, CurvePoint) {
+    let point = |probe_qp| curve_point(planes, probe_qp, search, deblocking);
+    if qp > 0 {
+        (point(qp - 1), base)
+    } else {
+        (base, point(qp + 1))
+    }
 }
 
 /// The multiplier the slice-level SAO decision trades distortion against rate
@@ -2107,7 +2132,7 @@ mod tests {
         height: usize,
         qp: i32,
     ) -> Vec<ResolvedSao> {
-        let (_, mut deblocked, _) = write_idr_residual_slice(
+        let (slice, mut deblocked, _) = write_idr_residual_slice(
             y,
             cb,
             cr,
@@ -2117,17 +2142,21 @@ mod tests {
             ModeSearch::Rdo,
             LoopFilter::Deblock,
         );
-        sao_reconstruction(
-            &mut deblocked,
-            SourcePlanes {
-                y,
-                cb,
-                cr,
-                width,
-                height,
-            },
-            lambda_q8(qp),
-        )
+        let planes = SourcePlanes {
+            y,
+            cb,
+            cr,
+            width,
+            height,
+        };
+        let base = CurvePoint {
+            sse: picture_sse(&deblocked, y, cb, cr),
+            bits: slice.len() as u64 * 8,
+        };
+        let (fine, coarse) = sao_curve_probe(planes, qp, ModeSearch::Rdo, true, base);
+        let ctbs_x = width / CTB;
+        let lambda = sao_search_lambda_q8(&deblocked, planes, qp, ctbs_x, fine, coarse);
+        sao_reconstruction(&mut deblocked, planes, lambda)
     }
 
     #[test]
