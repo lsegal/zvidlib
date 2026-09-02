@@ -1156,13 +1156,15 @@ site added without a check fails the assertion instead of going unnoticed;
 `the_documented_site_table_lists_every_dispatch_site` reads the site table back
 out of the `active_by_site` rustdoc and compares it; and
 `every_site_reports_the_pinned_instruction_set` pins each entry of
-`simd::available()` in turn and requires every site to follow. A stage that
-silently had one implementation for all arms would still read `1.00x`, but it
-could no longer do so while claiming a `Vectorized` column of "yes" — the site
-list, the table in [The HEVC per-stage groups](#the-hevc-per-stage-groups) and
-the kernels are checked against each other. What is *not* yet checked is that a
-committed baseline table records the commit it was drawn at against the
-`Vectorized` columns in force there, which is the residual gap this row exposed.
+`simd::available()` in turn and requires every site to follow. A stage whose
+arms are all the same code therefore cannot be one that is registered as a site
+and passing those tests, so "this group reads `1.00x`" and "this group has no
+kernel" can be told apart by asking `active_by_site` rather than by reading the
+prose. What is *not* checked by anything is the `Vectorized` column in [The HEVC
+per-stage groups](#the-hevc-per-stage-groups) or a committed baseline table's
+agreement with the kernels in force at the commit it was drawn at — both are
+prose, and both are what went stale here. Quoting an old table's ratio is only
+safe alongside the commit stamped on it, which is why the stamps are there.
 
 The whole-frame encoder groups are the practical consequence.
 `av1_encode_frame_q32` reads 1.49x and `av1_encode_frame_q160` 1.53x here,
