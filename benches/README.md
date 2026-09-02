@@ -2041,6 +2041,54 @@ on one host with the arms interleaved, with the `scalar` arm read as a control.
 A recorded absolute figure from another draw is not a comparison - the four
 models above differ by more than the effect.
 
+#### Why the isolated ratio did not reach this group (issue #382)
+
+The two measurements above disagree, and #340 recorded two candidate reasons
+without separating them: either the band search is too small a share of a
+reconstruction for any ratio on it to show, or the classification is worth
+vectorizing here and only the *call shape* is wrong, a `#[target_feature]`
+kernel being uninlinable into a caller that invokes it once per 16-to-64-sample
+CTB row. The two have opposite consequences - the first says no kernel at this
+site can ever pay, the second says the site needs a different call - so the
+question had to be settled by measurement rather than argument.
+
+**The share is a measured number.** `hevc_encode_*_reconstruct_no_band_search`
+is the same reconstruction with the band half of the §8.7.3 search skipped, so
+the per-CTB decision is the four edge-offset classes against SAO off. Both arms
+are built and timed in one criterion process on one host, five interleaved
+rounds, per-benchmark minimum; the difference is what the band search costs.
+Six `ubuntu-latest` draws plus one `macos-15-intel`, grouped by CPU model as
+every x86_64 table here has to be:
+
+| CPU model | draws | `hevc_encode_640x352_reconstruct` | `avx2` share | `scalar` share |
+|---|---|---|---|---|
+| Intel Xeon Platinum 8573C | 2 | 3.90-4.47 ms | 25.4%, 23.2% | 9.9%, 10.0% |
+| Intel Core i7-8700B | 1 | 7.49 ms | 28.8% | 8.5% |
+| AMD EPYC 7763 | 1 | 4.72 ms | 26.2% | 12.7% |
+| AMD EPYC 9V45 | 1 | 2.69 ms | 28.8% | 9.8% |
+| AMD EPYC 9V74 | 2 | 4.77-4.81 ms | 27.5%, 28.9% | 13.9%, 12.8% |
+
+**So the first explanation is refuted.** The band search is roughly a quarter
+of the vectorized arm of this group on every model timed, against a
+round-to-round spread of 1-6% on the `ubuntu-latest` hosts. A 1.10-1.53x on
+work that big is several percent end to end, which this harness resolves. It
+did not appear, so the missing win is not a missing denominator.
+
+Read the two share columns together rather than either alone. The band search
+is scalar in both, so the `scalar` column's 8-14% is its share of a
+reconstruction whose *other* stages are also scalar, and the `avx2` column's
+23-29% is its share once prediction, the transform round trip, deblocking and
+the SAO filter itself have been vectorized around it. The second number is the
+one that matters for a kernel decision, and it is the one that grew: pinning
+everything else made the unvectorized band search the largest single item in
+the group. The `_quantized` arms read 8.6-11.6% for the same reason in
+reverse - the transform round trip they add is a large scalar-and-vector cost
+the band search is then a smaller fraction of.
+
+The `macos-15-intel` draw agrees on the share and should be read only for it:
+that host's round-to-round spread is 24-51%, against 1-6% on `ubuntu-latest`,
+so its minimum is a floor rather than a measurement.
+
 **AVX-512 was timed and does not separate even in isolation.**
 `ubuntu-latest` draws AVX-512CD hosts, so the `vpconflictd` shape #305 pointed
 at was reachable. Resolving the scatter's duplicate indices inside the vector
