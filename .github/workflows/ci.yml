@@ -77,6 +77,18 @@ jobs:
         run: python3 -m unittest discover -s .github/scripts -v
       - name: Test AV1 SIMD kernels against the scalar path
         run: cargo test --features native --lib av1_simd -- --nocapture
+      # The kernels being bit-exact is not the same as their being fast, and
+      # `--lib av1_simd` above only proves the first. `#[target_feature]` widens
+      # the function it is written on and nothing it calls, so an `av1_simd`
+      # kernel the inliner declines to absorb into its wrapper is compiled at
+      # the baseline instruction set and runs several times slower than the
+      # scalar code it replaces, with every test still passing (#336). This
+      # greps that out of the emitted assembly. One x86_64 host is enough and
+      # this job is one: on the matrix's aarch64 macOS runner NEON is in the
+      # baseline, so a kernel that lost its attribute still compiles to NEON and
+      # leaves no trace, and `macos-15-intel` would only repeat what runs here.
+      - name: Check the SIMD kernels kept their target feature
+        run: python3 .github/scripts/check_simd_target_features.py build
       - name: Test library units
         run: cargo test --features native --lib
       - name: Test AV1 SIMD motion compensation
@@ -196,6 +208,12 @@ jobs:
             echo '## Benchmark host'
             echo
             echo '```'
+            # `ubuntu-latest` is a pool of several CPU models, and an
+            # elementwise minimum taken across two of them is attributable to
+            # no named host. `benches/README.md` names the model each committed
+            # table was measured on, so the model has to be in the run's own
+            # record rather than reconstructed afterwards.
+            echo "# host cpu model: $(grep -m1 '^model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//')"
             grep -hE '^# (host instruction sets|widest detected|dispatch site)' bench.log \
               | sort -u || echo 'no instruction-set log found in the benchmark output'
             echo '```'

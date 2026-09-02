@@ -205,6 +205,14 @@ pub fn set_active_isa(isa: Option<SimdIsa>) {
 // The 4- and 8-point transforms have no useful 256-bit shape (a whole 8x8
 // coefficient block is four AVX2 registers), so AVX2 hosts run them through the
 // SSE4.1 path and spend the wider registers on the pixel filters instead.
+//
+// Nothing in the type system enforces that, and a kernel that loses the
+// attribute stays bit-exact, so no test here notices - only the ratio against
+// scalar on an x86_64 host does.
+// `.github/scripts/check_simd_target_features.py` reads it off the emitted
+// assembly instead, failing on an out-of-line `core::core_arch` intrinsic or on
+// a generic kernel left standing as its own symbol, and CI runs it on the
+// x86_64 job.
 // ---------------------------------------------------------------------
 
 macro_rules! simd_entry_points {
@@ -409,6 +417,23 @@ pub(crate) fn coeff_contexts(
 /// Vectorized [`crate::av1_encoder`] inverse WHT, or `None` when the caller
 /// should use the scalar path.
 pub(crate) fn iwht4x4(isa: SimdIsa, quant: &[i32; 16]) -> Option<[i32; 16]> {
+    // x86_64 stays on the scalar reference, for the same reason the forward
+    // direction below does — but on this kernel's own measurement rather than
+    // on that one's. `av1_encode_stage_iwht` (#342) reads 331.600 µs scalar
+    // against 399.630 µs under `sse4.1` and 371.650 µs under `avx2` at
+    // 320x180, and 3.064 ms against 3.682 ms and 3.424 ms at 1080p: 0.83x and
+    // 0.89x, the same pair at both sizes. Elementwise minimum of three rounds
+    // on one AMD EPYC 7763 64-Core, the host the committed x86_64 table was
+    // measured on. The inverse runs two `transpose4`s where the forward runs
+    // three, so it is the cheaper of the two — and it still loses, because
+    // sixteen shuffle micro-operations contending for one or two shuffle ports
+    // are still sixteen more than the scalar loop LLVM auto-vectorizes out of
+    // `av1_encoder::wht`, which has none. `neon` keeps the kernel, where the
+    // shuffle issue width is what makes it win.
+    #[cfg(target_arch = "x86_64")]
+    if matches!(isa, SimdIsa::Sse41 | SimdIsa::Avx2) {
+        return None;
+    }
     if !transforms::within_limit(quant, transforms::WHT_INPUT_LIMIT) {
         return None;
     }

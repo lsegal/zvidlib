@@ -22,6 +22,7 @@
 //! | `av1_forward_adst_8x8`, `av1_forward_flipadst_16x16` | the forward ADST family, including a flipped type |
 //! | `av1_encode_frame_q{0,32,160}` | one whole frame through the public encoder, `src/av1_encoder/tile.rs` |
 //! | `av1_encode_stage_wht` | the forward 4x4 WHT, `src/av1_encoder/wht.rs` |
+//! | `av1_encode_stage_iwht` | the lossless inverse 4x4 WHT, `src/av1_encoder/wht.rs` |
 //! | `av1_encode_stage_symbol` | symbol coding over the static CDF tables, `src/av1_encoder/symbol.rs` and `cdf.rs` |
 //! | `av1_encode_stage_tile` | tile encoding, `src/av1_encoder/tile.rs` |
 //! | `av1_encode_stage_coeff_ctx` | §8.3.2 `coeff_base`/`coeff_br` context derivation, `src/av1_simd/coeff.rs` |
@@ -259,7 +260,7 @@ const STAGE_QINDEX: u8 = 0;
 fn report_stage_coverage(_: &mut Criterion) {
     println!(
         "# av1_encode: every stage of the native AV1 encoder is benchmarked: the forward 4x4\n\
-         # WHT, symbol (range) coding over the static CDF tables, the §8.3.2 coefficient-context\n\
+         # WHT and its inverse, symbol (range) coding over the static CDF tables, the §8.3.2 coefficient-context\n\
          # derivation, whole-tile encoding (superblock iteration, DC_PRED, coefficient coding),\n\
          # and sequence/frame header\n\
          # writing with OBU LEB128 framing — alongside the whole-frame groups and the forward\n\
@@ -289,6 +290,34 @@ fn stage_wht(criterion: &mut Criterion, (width, height): (u32, u32), suffix: &st
     let workload = stage_workload(&name, width, height);
     bench_across_isas(criterion, &workload, || {
         encoder_bench::fwht4x4_plane(&plane, width as usize, height as usize)
+    });
+}
+
+/// The lossless inverse 4x4 WHT over the same plane's coefficients: the other
+/// half of the `av1_simd` WHT dispatch family.
+///
+/// It is here rather than in `benches/av1_decode.rs` because the function it
+/// measures is `av1_encoder::wht::iwht4x4` — the encoder-side reconstruct and
+/// the oracle the forward transform is checked against. The AV1 decoders reach
+/// their lossless reconstruct through `av1_intra::inverse_wht_4x4`, which is a
+/// different function and not a dispatch site at all.
+///
+/// It gets its own group because the forward group cannot settle it: the
+/// forward pass runs three `transpose4`s to the inverse's two, so the shuffle
+/// pressure that put `av1_encode_stage_wht` under parity on x86_64 is not this
+/// kernel's shuffle pressure, and reading one dispatch off the other's number
+/// is the reasoning `benches/README.md` warns against.
+///
+/// The coefficients are built once outside the timed closure, so the group
+/// measures the inverse transform and not the forward one that produced its
+/// input.
+fn stage_iwht(criterion: &mut Criterion, (width, height): (u32, u32), suffix: &str) {
+    let plane = stage_plane(width, height);
+    let coefficients = encoder_bench::wht4x4_coefficients(&plane, width as usize, height as usize);
+    let name = format!("av1_encode_stage_iwht{suffix}");
+    let workload = stage_workload(&name, width, height);
+    bench_across_isas(criterion, &workload, || {
+        encoder_bench::iwht4x4_plane(&coefficients)
     });
 }
 
@@ -372,6 +401,7 @@ fn av1_encode_stages(criterion: &mut Criterion) {
         .chain(std::env::var_os(LARGE_GROUP_ENV).map(|_| (FRAME_LARGE, "_1080p")))
     {
         stage_wht(criterion, size, suffix);
+        stage_iwht(criterion, size, suffix);
         stage_symbol(criterion, size, suffix);
         stage_coeff_ctx(criterion, size, suffix);
         stage_tile(criterion, size, suffix);
