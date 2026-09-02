@@ -192,6 +192,7 @@ is not mistaken for bitstream-writing cost. Both default to 640x352 and add a
 | --- | --- |
 | `av1_encode_frame_q{0,32,160}` | one whole frame through the public encoder, `src/av1_encoder/tile.rs` |
 | `av1_encode_stage_wht` | the forward 4x4 WHT, `src/av1_encoder/wht.rs` |
+| `av1_encode_stage_iwht` | the lossless inverse 4x4 WHT, `src/av1_encoder/wht.rs` |
 | `av1_encode_stage_symbol` | symbol coding over the static CDF tables, `src/av1_encoder/symbol.rs` and `cdf.rs` |
 | `av1_encode_stage_coeff_ctx` | the §8.3.2 `coeff_base`/`coeff_br` context derivation on its own, `src/av1_simd/coeff.rs` |
 | `av1_encode_stage_tile` | tile encoding: superblock iteration, `DC_PRED`, coefficient coding and its vectorized §8.3.2 context derivation, `src/av1_encoder/tile.rs` and `src/av1_simd/coeff.rs` |
@@ -215,9 +216,9 @@ the §8.3.2 context derivation half of it is now vectorized, which
 reads close to flat anyway; [Why the tile group barely moves](#why-the-tile-group-barely-moves)
 is the measurement that says why, and what the remaining target is.
 
-This encoder's vectorized kernels are the forward transforms, the forward WHT,
-and the `coeff_base` / `coeff_br` context derivation the coefficient coding loop
-runs on (§8.3.2, `src/av1_simd/coeff.rs`, the `av1_coeff_ctx` dispatch site).
+This encoder's vectorized kernels are the forward transforms, the forward WHT
+and its inverse, and the `coeff_base` / `coeff_br` context derivation the
+coefficient coding loop runs on (§8.3.2, `src/av1_simd/coeff.rs`, the `av1_coeff_ctx` dispatch site).
 The last of those derives a whole block's contexts in one data-parallel pass
 ahead of the serial symbol loop, which is legal because the loop walks the
 up-right diagonal scan backwards, so every neighbour a position consults is
