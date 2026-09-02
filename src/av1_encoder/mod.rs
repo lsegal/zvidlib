@@ -2842,7 +2842,10 @@ mod nonlossless_tests {
         let (width, height) = (128_usize, 96_usize);
         let mut frames = content_frames(width as u32, height as u32);
         frames.push(("test_pattern", test_pattern(width as u32, height as u32)));
-        println!("frame,qindex,exhaustive,shipped,consistent,shipped_ratio,consistent_ratio");
+        println!(
+            "frame,qindex,exhaustive,shipped,consistent,bounded,shipped_ratio,consistent_ratio,\
+             bounded_ratio,trial_blocks,budget_per_block"
+        );
         for (name, pixels) in &frames {
             for qindex in DETERMINISM_QINDEXES {
                 let exhaustive = tile::FrameEncoder::new(pixels, width, height, qindex)
@@ -2856,10 +2859,27 @@ mod nonlossless_tests {
                     .with_context_consistent_trials()
                     .encode_with_report()
                     .candidates_evaluated;
+                let bounded = tile::FrameEncoder::new(pixels, width, height, qindex)
+                    .with_context_consistent_size_trials()
+                    .encode_with_report();
+                // The candidate budget the 4x bound leaves once the shipped ranking's own
+                // trials are paid for, spread over the blocks a consistent trial must search:
+                // what it buys is how many transform types the trial could afford to try per
+                // block, against the whole set an exact per-block minimum needs.
+                let budget = exhaustive as f64 / 4.0 - shipped as f64;
+                let per_block = if bounded.consistent_trial_blocks > 0 {
+                    budget / bounded.consistent_trial_blocks as f64
+                } else {
+                    0.0
+                };
                 println!(
-                    "{name},{qindex},{exhaustive},{shipped},{consistent},{:.2},{:.2}",
+                    "{name},{qindex},{exhaustive},{shipped},{consistent},{},{:.2},{:.2},{:.2},{},{:.2}",
+                    bounded.candidates_evaluated,
                     exhaustive as f64 / shipped as f64,
-                    exhaustive as f64 / consistent as f64
+                    exhaustive as f64 / consistent as f64,
+                    exhaustive as f64 / bounded.candidates_evaluated as f64,
+                    bounded.consistent_trial_blocks,
+                    per_block
                 );
             }
         }
@@ -2968,6 +2988,145 @@ mod nonlossless_tests {
                     shipped.size_choices.len()
                 );
             }
+        }
+    }
+
+    /// A context-consistent trial restricted to the size search, and bounded by the incumbent
+    /// size's cost, keeps the exhaustive search's size ranking - and still cannot be afforded.
+    ///
+    /// This is #388's answer, and it is the second of the two outcomes that issue asks for: the
+    /// bound cannot be reached, and this is the measurement of why.
+    ///
+    /// **Two exact reductions, neither available to the shipped estimator.**
+    ///
+    /// 1. *Consistency only where the ranking needs it.* The counterfactual #356 named belongs to
+    ///    the size trial; making every other speculative pass code the full type set as well is
+    ///    what made `with_context_consistent_trials` cost the exhaustive search. Under
+    ///    `with_context_consistent_size_trials` the partition search's whole-block and
+    ///    split-subtree measurements stay on the set's `DCT_DCT`, exactly as they do in the
+    ///    shipped search, and the size decisions are *still* the exhaustive search's on every
+    ///    coding block at every quantizer here. What is given up is the byte-for-byte identity
+    ///    the arm above asserts - that was being carried by the partition passes, not by the size
+    ///    trial - and what it costs is asserted below against the shortcut bound's own 0.05 dB
+    ///    and 1.5%, both of which it holds.
+    /// 2. *A cost bound on the trial.* A trial's cost is a sum of `sse + lambda * bits` over its
+    ///    blocks, so it only grows: once the partial sum passes the incumbent size's, the size
+    ///    has lost and the rest of its blocks need not be searched at all. That is exact, and it
+    ///    is available only to a context-consistent trial - the shipped trial ranks on
+    ///    `corrected_trial_cost`, which subtracts a credit the trial has not finished measuring,
+    ///    so no partial sum of its is a proof of anything. `abandoned_trials` is asserted
+    ///    non-zero so the saving is known to be reached rather than assumed.
+    ///
+    /// Together they take the candidate reduction from the 1.00x-1.93x
+    /// `a_context_consistent_size_trial_ranks_like_the_exhaustive_search_and_costs_like_it`
+    /// records to 1.13x-3.27x across the tuning set at 128x96 and 2.06x-2.34x on `test_pattern`
+    /// there. It is not enough, and the arithmetic of why is not close.
+    ///
+    /// **What the bound leaves to spend.** Under `reduced_tx_set = 1` an intra block's derived
+    /// set is `TX_SET_INTRA_2` - five types - at 4x4, 8x8 and 16x16, and DCT-only at 32x32. So an
+    /// exact per-block minimum costs five candidates where the DCT-only ranking costs one: four
+    /// extra on every block a size trial searches. The 4x bound's whole budget is
+    /// `exhaustive / 4`, and the shipped ranking already spends most of it on the passes both
+    /// arms share; what is left, divided over the blocks a consistent trial must search, is the
+    /// per-block allowance asserted below. It is under one candidate on `test_pattern` here and
+    /// negative on 30 of the 48 frame-and-quantizer pairs at 128x96, where the shipped search
+    /// itself does not reach 4x. There is no pruning of a five-type set into that allowance that
+    /// still returns the set's minimum, which is what "exact" means here; anything that fits is
+    /// an estimate of the minimum, and an estimate of the minimum is the DCT-and-credit ranking
+    /// this issue exists to replace. #349 already crossed every shape that estimate could take.
+    ///
+    /// The cost assertion is in the failing direction, like the one above: if a later change ever
+    /// does bring a bounded context-consistent trial inside 4x, this test fails and says so.
+    #[test]
+    fn a_bounded_context_consistent_size_trial_keeps_the_ranking_and_still_costs_too_much() {
+        let (width, height) = (96_usize, 80_usize);
+        let pixels = test_pattern(width as u32, height as u32);
+        let quality = |report: &tile::SearchReport| {
+            let reconstruction: Vec<u8> = (0..height)
+                .flat_map(|row| report.reconstruction[row * report.coded_width..][..width].to_vec())
+                .collect();
+            psnr(&pixels, &reconstruction)
+        };
+        // Candidates an exact per-block minimum costs over the DCT-only ranking, on the blocks a
+        // size trial searches: `TX_SET_INTRA_2` is five types and the ranking it replaces is one.
+        const EXTRA_PER_BLOCK: f64 = 4.0;
+        for qindex in DETERMINISM_QINDEXES {
+            let exhaustive = tile::FrameEncoder::new(&pixels, width, height, qindex)
+                .without_search_shortcuts()
+                .encode_with_report();
+            let decisions: std::collections::BTreeMap<_, _> = exhaustive
+                .size_choices
+                .iter()
+                .map(|&(r, c, bw, chosen)| ((r, c, bw), chosen))
+                .collect();
+            let bounded = tile::FrameEncoder::new(&pixels, width, height, qindex)
+                .with_context_consistent_size_trials()
+                .encode_with_report();
+            let agreeing = bounded
+                .size_choices
+                .iter()
+                .filter(|&&(r, c, bw, chosen)| decisions.get(&(r, c, bw)) == Some(&chosen))
+                .count();
+            assert_eq!(
+                agreeing,
+                bounded.size_choices.len(),
+                "qindex {qindex}: a bounded context-consistent size trial agreed with the \
+                 exhaustive search on {agreeing} of its {} size decisions, so restricting the \
+                 consistency to the size trial, or bounding it by the incumbent's cost, is no \
+                 longer exact",
+                bounded.size_choices.len()
+            );
+            assert!(
+                bounded.abandoned_trials > 0,
+                "qindex {qindex}: no size trial was ever abandoned by the incumbent's cost, so \
+                 the bound this arm is named for buys nothing on this frame"
+            );
+            // It holds the shortcut bound's quality and rate halves; only the candidate half
+            // fails, which is the whole of the finding.
+            let (bounded_psnr, exhaustive_psnr) = (quality(&bounded), quality(&exhaustive));
+            assert!(
+                bounded_psnr >= exhaustive_psnr - 0.05,
+                "qindex {qindex} reconstructed at {bounded_psnr:.3} dB against the exhaustive \
+                 search's {exhaustive_psnr:.3} dB"
+            );
+            let growth = bounded.tile.len() as f64 / exhaustive.tile.len() as f64 - 1.0;
+            assert!(
+                growth <= 0.015,
+                "qindex {qindex} spent {} bytes against the exhaustive search's {} ({:+.2}%)",
+                bounded.tile.len(),
+                exhaustive.tile.len(),
+                growth * 100.0
+            );
+            assert!(
+                bounded.candidates_evaluated * 4 >= exhaustive.candidates_evaluated,
+                "qindex {qindex}: a bounded context-consistent size trial evaluated {} \
+                 transform-type candidates against the exhaustive search's {}, which is inside \
+                 the 4x reduction `the_search_shortcuts_stay_within_their_rate_and_distortion_\
+                 bound` requires - if that is genuinely so, it can replace the DCT-only ranking \
+                 and the transform-gain correction with it",
+                bounded.candidates_evaluated,
+                exhaustive.candidates_evaluated
+            );
+            // And the reason it cannot be pruned into the bound: the budget the bound leaves,
+            // spread over the blocks a consistent trial has to search, is less than the four
+            // extra candidates an exact per-block minimum over `TX_SET_INTRA_2` costs.
+            let shipped =
+                tile::FrameEncoder::new(&pixels, width, height, qindex).encode_with_report();
+            let budget = exhaustive.candidates_evaluated as f64 / 4.0
+                - shipped.candidates_evaluated as f64;
+            let blocks = bounded.consistent_trial_blocks as f64;
+            assert!(
+                blocks > 0.0,
+                "qindex {qindex}: no block was searched by a context-consistent size trial"
+            );
+            assert!(
+                budget / blocks < EXTRA_PER_BLOCK,
+                "qindex {qindex}: the 4x bound leaves {:.2} candidates per trial block once the \
+                 shipped ranking is paid for, which is the {EXTRA_PER_BLOCK} an exact minimum \
+                 over the five-type intra set costs - a context-consistent trial fits inside the \
+                 bound with no pruning at all and should be shipped",
+                budget / blocks
+            );
         }
     }
 

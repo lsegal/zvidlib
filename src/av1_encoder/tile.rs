@@ -640,6 +640,13 @@ pub(crate) struct FrameEncoder<'a> {
     /// what it costs.
     #[cfg(test)]
     context_consistent_trials: bool,
+    /// Set by [`Self::with_context_consistent_size_trials`] to make context-consistency a
+    /// property of the *size trial* alone, leaving every other speculative pass on the set's
+    /// `DCT_DCT` exactly as the shipped search leaves it. This is the affordable half of the
+    /// arm above, and `a_bounded_context_consistent_size_trial_keeps_the_ranking_and_still_costs_too_much`
+    /// is what it is measured by.
+    #[cfg(test)]
+    consistent_size_trials: bool,
     /// Set by [`Self::without_type_gain_correction`] to rank sizes on the type set's `DCT_DCT`
     /// alone - no probe, no accumulator, no correction - which is the bare ranking every
     /// correction is applied on top of, and the baseline any of them has to beat.
@@ -718,6 +725,11 @@ pub(crate) struct FrameEncoder<'a> {
     /// reached on real content rather than assert a saving that never fires.
     #[cfg(test)]
     abandoned_trials: u64,
+    /// Transform blocks a context-consistent size trial searched with the whole type set, which
+    /// is the base the candidate budget in
+    /// `measure_context_consistent_trial_candidate_budget` is divided over.
+    #[cfg(test)]
+    consistent_trial_blocks: u64,
     /// Every [`ProbeKey`] a size trial probed, in the order they were measured, against the key
     /// the emitting pass actually reached at each transform block's position. How far the two
     /// sets overlap is what any reuse of a probe's result could ever have covered, which
@@ -759,6 +771,8 @@ pub(crate) struct SearchReport {
     pub(crate) cost_ties: u64,
     /// Size trials the context-consistent trial's cost bound abandoned part-way.
     pub(crate) abandoned_trials: u64,
+    /// Transform blocks a context-consistent size trial searched with the whole type set.
+    pub(crate) consistent_trial_blocks: u64,
     /// The probe and emit key sets and the counts that bound their overlap, for
     /// `measure_probe_reuse_coverage`.
     pub(crate) probe_keys: Vec<(usize, usize, usize, u8)>,
@@ -922,6 +936,8 @@ impl<'a> FrameEncoder<'a> {
             #[cfg(test)]
             context_consistent_trials: false,
             #[cfg(test)]
+            consistent_size_trials: false,
+            #[cfg(test)]
             no_type_gain_correction: false,
             #[cfg(test)]
             type_gain_interval: TYPE_GAIN_SAMPLE_INTERVAL,
@@ -958,6 +974,8 @@ impl<'a> FrameEncoder<'a> {
             cost_ties: 0,
             #[cfg(test)]
             abandoned_trials: 0,
+            #[cfg(test)]
+            consistent_trial_blocks: 0,
             #[cfg(test)]
             probe_keys: Vec::new(),
             #[cfg(test)]
@@ -1009,6 +1027,37 @@ impl<'a> FrameEncoder<'a> {
     pub(crate) fn with_context_consistent_trials(mut self) -> Self {
         self.context_consistent_trials = true;
         self
+    }
+
+    /// Makes only the transform-*size* trial context-consistent, and leaves every other
+    /// speculative pass - the partition search's whole-block and split-subtree measurements -
+    /// ranking on the set's `DCT_DCT` as the shipped search does.
+    ///
+    /// [`Self::with_context_consistent_trials`] makes every non-emitting pass code the full type
+    /// set, which is why it costs the exhaustive search. But the counterfactual #356 identified
+    /// is a property of the *size* ranking: it is the size trial whose cost and contexts the
+    /// emitting pass never reproduces. Restricting the consistency to that trial is the
+    /// reduction #388 asks for under "a consistency applied only to the blocks whose ranking it
+    /// changes", and it is exact where it matters - the size decisions this arm makes are still
+    /// the exhaustive search's, on every coding block at every quantizer measured. What it gives
+    /// up is the byte-for-byte identity with the exhaustive search, which was being carried by
+    /// the *partition* passes rather than by the size trial.
+    #[cfg(test)]
+    pub(crate) fn with_context_consistent_size_trials(mut self) -> Self {
+        self.consistent_size_trials = true;
+        self
+    }
+
+    /// Whether only the size trial is context-consistent. Never, outside tests.
+    #[cfg(test)]
+    fn consistent_size_trials(&self) -> bool {
+        self.consistent_size_trials
+    }
+
+    /// Whether only the size trial is context-consistent. Never, outside tests.
+    #[cfg(not(test))]
+    fn consistent_size_trials(&self) -> bool {
+        false
     }
 
     /// Whether a size trial codes its blocks with the type the emitting pass would pick. Never,
@@ -1341,6 +1390,7 @@ impl<'a> FrameEncoder<'a> {
             size_choices: std::mem::take(&mut self.size_choices),
             cost_ties: self.cost_ties,
             abandoned_trials: self.abandoned_trials,
+            consistent_trial_blocks: self.consistent_trial_blocks,
             probe_keys: std::mem::take(&mut self.probe_keys),
             emitted_blocks: std::mem::take(&mut self.emitted_blocks),
             emitted_coding_blocks: self.emitted_coding_blocks,
@@ -1640,7 +1690,8 @@ impl<'a> FrameEncoder<'a> {
         let large = largest.min(MAX_FORWARD_TX) >= 32;
         // A context-consistent trial has nothing to probe: it already codes every block with the
         // type the emitting pass would pick, so the gain a probe measures is inside its own cost.
-        let consistent = self.shortcuts() && self.context_consistent_trials();
+        let consistent =
+            self.shortcuts() && (self.context_consistent_trials() || self.consistent_size_trials());
         let probing = self.shortcuts()
             && !consistent
             && self.type_gain_correction()
@@ -2040,7 +2091,12 @@ impl<'a> FrameEncoder<'a> {
         }
         let trial = self.shortcuts() && !emit;
         let mut probing = false;
-        let consistent_here = self.context_consistent_trials() && self.in_size_trial;
+        let consistent_here = self.context_consistent_trials()
+            || (self.consistent_size_trials() && self.in_size_trial);
+        #[cfg(test)]
+        if consistent_here && trial && candidates.len() > 1 {
+            self.consistent_trial_blocks += 1;
+        }
         if trial && candidates.len() > 1 && !consistent_here {
             if self.probe_budget > 0 {
                 self.probe_budget -= 1;
