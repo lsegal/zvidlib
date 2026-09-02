@@ -493,8 +493,11 @@ pub(crate) fn fwht4x4(isa: SimdIsa, residual: &[i32; 16]) -> Option<[i32; 16]> {
     // auto-vectorizes out of `av1_encoder::wht`; what the hand kernel adds on
     // top is three `transpose4`s, twenty-four shuffle micro-operations that
     // contend for one or two shuffle ports, against a scalar loop that has no
-    // shuffles at all. `neon` keeps the kernel and its 2.72x, because a wider
-    // shuffle issue is exactly what that host has.
+    // shuffles at all. `neon` keeps the kernel, but not the 2.72x this comment
+    // used to cite for it: the aarch64 table re-drawn by #368 reads
+    // `av1_encode_stage_wht` at 1.03x, so on that host the kernel is at parity
+    // rather than above it. At parity is not below it, which is the whole of
+    // what this early return turns on.
     #[cfg(target_arch = "x86_64")]
     if matches!(isa, SimdIsa::Sse41 | SimdIsa::Avx2) {
         return None;
