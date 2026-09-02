@@ -1546,7 +1546,9 @@ places, so the ratio is a property of the kernels rather than of the frame size.
 
 `sse4.1` beats `avx2` on a minority of rows, and by enough on two of them to be
 more than noise: `av1_encode_stage_coeff_ctx` was 3.04x under `sse4.1` against
-2.50x under `avx2`, and the `rdo_inter` pair is 1.63x/1.64x against 1.55x. The
+2.50x under `avx2`, and the `rdo_inter` pair is 1.63x/1.64x against 1.55x. Both
+of those pairs of rows now pre-date their repair — #371 for the first and #387
+for the second — and the re-measurements below are what replaces them. The
 `Best` column already recorded `sse4.1` for these, but the dispatch site
 preferred `avx2` when the host had it, so a real encode took the slower arm.
 #362 answers why, and the answer is the same one for both rows: **the wide arm
@@ -1724,11 +1726,71 @@ apart, which is #362's redirect reproducing on the table's own hardware.
   #362 changes. #370 carried it, and took the second of those two: `sad` routes
   blocks narrower than 32 and `satd` blocks narrower than 16 to the SSE4.1
   kernel, each at its own AVX2 body's threshold rather than at one shared
-  number. Widening what the search hands the kernel is the other repair and is
-  still open as #387 — it is the one that would make AVX2 *win* here rather than
-  stop losing, but it moves the search's candidate ordering and early
-  termination with it, so it is an optimization rather than a defect fix.
-  Measured under [The #370 re-measurement](#the-370-re-measurement).
+  number. Widening what the search hands the kernel is the other repair and
+  #387 wrote it — it is the one that makes AVX2 *win* here rather than stop
+  losing, and it moves the search's candidate ordering with it, so it is an
+  optimization rather than a defect fix. Measured under [The #370
+  re-measurement](#the-370-re-measurement) and [The #387
+  re-measurement](#the-387-re-measurement).
+
+#### The #387 re-measurement
+
+#370 routed the narrow blocks around AVX2 and brought the two arms level; #387
+gives AVX2 something wide to do and the acceptance criterion was that it has to
+*win* on its own numbers. It does, by more than routing ever had to give.
+
+The width was never in the block — `rdo.rs` searches a `CTB` of 16 and its
+candidate partitions subdivide that — it is across the *candidates*: the
+whole-pel stage scores `(2 * radius + 1)^2` predictions of one source block, and
+`_mm256_sad_epu8` reduces per 8-byte lane, so one instruction carries two
+16-wide candidates (one per 128-bit lane) or four narrower ones (one per qword).
+`rdcost::sad_batch` is that entry point, `rdo::motion_search` gathers candidates
+into fixed batches to feed it, and the scan order and `mv_order` tie-break are
+untouched, so the winning vector is the one the per-candidate search picked.
+This is also the one place `SAD_AVX2_MIN_W` does not apply: a width the
+single-block path routes *away* from AVX2 is exactly a width the batched path
+routes *to* it, because its vector is full there.
+
+Measured at `c7205cf2a908` — the branch's merge with `main`, so #370's routing is
+in the tree — on an **AMD EPYC 7763 64-Core Processor (Linux/X64)**, the same
+host model as the committed table and as #370's round, with
+`ZVIDLIB_BENCH_LARGE=1`, `# host instruction sets: scalar, sse4.1, avx2` and
+`# dispatch site hevc_rdcost: avx2` ([run
+33625305783](https://github.com/lsegal/zvidlib/actions/runs/33625305783)). It is
+one round rather than the elementwise minimum of three, so it is recorded here
+rather than merged into the table; the `rdo_intra` control below is what carries
+the attribution.
+
+| Group | `scalar` | `sse4.1` | `avx2` | Best |
+| --- | ---: | ---: | ---: | ---: |
+| `hevc_encode_640x352_rdo_inter` | 92.881 ms | 58.789 ms (1.58x) | 39.723 ms (2.34x) | 2.34x `avx2` |
+| `hevc_encode_1920x1088_rdo_inter` | 878.39 ms | 558.10 ms (1.57x) | 373.63 ms (2.35x) | 2.35x `avx2` |
+| `hevc_encode_640x352` | 104.39 ms | 68.400 ms (1.53x) | 48.776 ms (2.14x) | 2.14x `avx2` |
+| `hevc_encode_1920x1088` | 1.0028 s | 656.45 ms (1.53x) | 472.23 ms (2.12x) | 2.12x `avx2` |
+| `hevc_encode_640x352_rdo_intra` | 5.598 ms | 3.762 ms (1.49x) | 3.753 ms (1.49x) | 1.49x `avx2` |
+| `hevc_encode_1920x1088_rdo_intra` | 51.991 ms | 34.943 ms (1.49x) | 34.256 ms (1.52x) | 1.52x `avx2` |
+
+The `Best` column of the `rdo_inter` pair reads `avx2` for the first time. The
+two vector arms are 32% and 33% apart with the wide one ahead — 39.723 ms
+against 58.789 ms and 373.63 ms against 558.10 ms — where #370's round on this
+same host model had them 1.0% and 1.3% apart, and every round before it had
+`sse4.1` ahead by 5%. Level was the whole of what routing could buy; the batched
+kernel is what buys more than level.
+
+`rdo_intra` is the control that should not move, and does not: it scores intra
+predictions through `satd` alone, forms no batch, and reads 1.49x/1.52x here
+against #370's round's 1.48x/1.50x on the same host model. The absolute times of
+this round run about 5% slower than that one across every column, `scalar`
+included — one draw of run-to-run variance on a shared runner — which is why the
+claim is the within-round sign rather than the absolute numbers.
+
+The whole-frame groups are the practical consequence, since the mode search is
+most of what they do: `hevc_encode_640x352` reads 48.776 ms under `avx2` against
+68.400 ms under `sse4.1` and `hevc_encode_1920x1088` 472.23 ms against
+656.45 ms, so an x86_64 user encoding HEVC on an AVX2 host gets about 28% of a
+whole encode back, where #370's routing recovered 2.8% of it. The committed
+x86_64 table's two `hevc_encode_*_rdo_inter` rows, and the whole-frame rows
+above them, pre-date both changes.
 
 ## Hardware HEVC decoders
 
