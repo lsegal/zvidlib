@@ -98,7 +98,7 @@
 //! #280 attributed that walk to the `w x ( h + 7 )` intermediate the
 //! two-dimensional path materializes between its two passes, and issue #309
 //! measured the two passes apart to check it. **It is not the intermediate.**
-//! The horizontal pass alone decays 2.13x → 1.01x over the same sweep, and so
+//! The horizontal pass alone decays 2.12x → 1.03x over the same sweep, and so
 //! do the one-dimensional `x_frac == 0` / `y_frac == 0` phases, which build no
 //! intermediate at all. `measure_filter_taps_by_row_length` below strips the
 //! block walk, the allocation and the intermediate out entirely — one

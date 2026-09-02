@@ -610,10 +610,10 @@ aarch64 host in one process per measurement:
 
 **The decay is there with no intermediate.** `measure_interp_pass_split` times
 the two passes apart. The horizontal pass alone — which writes a fresh buffer
-nothing has yet read — decays 2.13x at 8x8, 1.51x at 16x16, 1.12x at 32x32,
-1.01x at 64x64, and the one-dimensional `x_frac == 0` / `y_frac == 0` phases,
-which build no intermediate at all, decay with it (horizontal-only 1.86x → 1.04x,
-vertical-only 1.43x → 1.10x). Whatever erodes the ratio is fully present when
+nothing has yet read — decays 2.12x at 8x8, 1.53x at 16x16, 1.06x at 32x32,
+1.03x at 64x64, and the one-dimensional `x_frac == 0` / `y_frac == 0` phases,
+which build no intermediate at all, decay with it (horizontal-only 1.91x → 1.29x,
+vertical-only 1.38x → 1.21x). Whatever erodes the ratio is fully present when
 there is no intermediate to blame.
 
 **The variable is the per-call row length.** `measure_filter_taps_by_row_length`
@@ -657,12 +657,17 @@ redundant re-filtering, and a 2 KiB working set at 64 wide. A/B'd against the
 full-height intermediate in one process (`measure_2d_ring_vs_flat`, best of 15
 interleaved rounds), it lost at every size, on both arms:
 
-| Luma block | flat `neon` | ring `neon` | speedup |
-| --- | ---: | ---: | ---: |
-| 8x8 | 5.33 ms | 9.97 ms | 0.53x |
-| 16x16 | 3.07 ms | 5.91 ms | 0.52x |
-| 32x32 | 2.37 ms | 3.21 ms | 0.74x |
-| 64x64 | 2.05 ms | 2.59 ms | 0.79x |
+| Luma block | flat `neon` | ring `neon` | speedup | flat `scalar` | ring `scalar` | speedup |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8x8 | 8.87 ms | 15.79 ms | 0.56x | 17.89 ms | 19.96 ms | 0.90x |
+| 16x16 | 4.91 ms | 6.07 ms | 0.81x | 8.62 ms | 9.44 ms | 0.91x |
+| 32x32 | 3.40 ms | 3.69 ms | 0.92x | 4.69 ms | 4.87 ms | 0.96x |
+| 64x64 | 2.89 ms | 2.94 ms | 0.98x | 3.33 ms | 3.36 ms | 0.99x |
+
+Both arms are spelled out inside the test rather than one of them being the
+production path, and the test asserts they agree sample-for-sample with each
+other and with `interp_block` before it times anything, so the comparison stays
+runnable and honest after the revert.
 
 The modular slot index costs more than the intermediate does, and it replaces the
 flat buffer's constant row stride — which LLVM strength-reduces — with an address

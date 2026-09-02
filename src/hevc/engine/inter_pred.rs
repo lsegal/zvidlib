@@ -478,7 +478,7 @@ fn interp_block<const N: usize>(
             // Issue #309 measured a wrap-around ring that keeps only the
             // `N` horizontal rows the vertical pass has live, instead of
             // all `h + N − 1` of them, and it lost at every block size
-            // (0.46x at 8x8 to 0.79x at 64x64): the modular slot index
+            // (0.56x at 8x8 to 0.98x at 64x64): the modular slot index
             // costs more than the intermediate does. At the largest luma
             // block the intermediate is 64 x 71 x 4 = 18 KiB, which sits
             // inside a 128 KiB L1D, so there was never a spill to
@@ -2007,8 +2007,15 @@ mod tests {
     /// on the scalar reference and on every SIMD backend the host CPU
     /// offers.
     ///
-    /// A/Bs the ring-buffered two-dimensional 8-tap luma path against
-    /// the full-height `w x ( h + 7 )` intermediate it replaced.
+    /// A/Bs the full-height `w x ( h + 7 )` intermediate the
+    /// two-dimensional 8-tap luma path uses against the wrap-around ring
+    /// issue #309 proposed in its place, which keeps only the eight
+    /// horizontal rows the vertical pass has live.
+    ///
+    /// Both arms are spelled out here rather than one of them being the
+    /// production path, because the ring lost and was not kept: the
+    /// comparison has to stay runnable after the revert for the table in
+    /// `benches/README.md` to be reproducible.
     ///
     /// Both arms run in one process, interleaved, best of many rounds:
     /// separate benchmark processes on this host disagree with each
@@ -2023,9 +2030,9 @@ mod tests {
     fn measure_2d_ring_vs_flat() {
         use std::time::Instant;
 
-        /// The full-height intermediate this branch used before the ring.
+        /// The full-height intermediate `interp_block` uses today.
         // The arms have to be spelled the same way to be comparable, and
-        // this one mirrors `interp_block`'s own signature.
+        // both mirror `interp_block`'s own signature.
         #[allow(clippy::too_many_arguments)]
         fn flat_2d(
             isa: Isa,
@@ -2062,6 +2069,51 @@ mod tests {
             out
         }
 
+        /// The wrap-around ring issue #309 proposed: only the eight
+        /// horizontal rows the vertical pass has live are kept, so the
+        /// intermediate is `8 x w` instead of `( h + 7 ) x w`. Same total
+        /// horizontal work, no row filtered twice.
+        #[allow(clippy::too_many_arguments)]
+        fn ring_2d(
+            isa: Isa,
+            plane: &RefPlane<'_>,
+            x_int: i32,
+            y_int: i32,
+            hk: &[i32; 8],
+            vk: &[i32; 8],
+            w: usize,
+            h: usize,
+            shift1: i32,
+        ) -> Vec<i32> {
+            let (halo, span) = (3i32, w + 7);
+            let mut out = vec![0i32; w * h];
+            let mut ring = vec![0i32; w * 8];
+            let mut scratch = vec![0i32; span];
+            let horizontal_row = |ring: &mut [i32], scratch: &mut [i32], row: usize| {
+                let src = plane.row_window(x_int - halo, span, y_int - halo + row as i32, scratch);
+                let taps: [&[i32]; 8] = std::array::from_fn(|t| &src[t..t + w]);
+                let slot = row % 8;
+                simd::filter_taps(isa, &taps, hk, shift1, &mut ring[slot * w..(slot + 1) * w]);
+            };
+            for row in 0..8 {
+                horizontal_row(&mut ring, &mut scratch, row);
+            }
+            for y in 0..h {
+                {
+                    let ring = &ring;
+                    let taps: [&[i32]; 8] = std::array::from_fn(|t| {
+                        let slot = (y + t) % 8;
+                        &ring[slot * w..(slot + 1) * w]
+                    });
+                    simd::filter_taps(isa, &taps, vk, 6, &mut out[y * w..(y + 1) * w]);
+                }
+                if y + 8 < h + 7 {
+                    horizontal_row(&mut ring, &mut scratch, y + 8);
+                }
+            }
+            out
+        }
+
         let (pw, ph) = (1920usize, 1088usize);
         let plane_samples = pseudo_random(7, pw * ph, 255);
         let plane = RefPlane::new(&plane_samples, pw, ph).unwrap();
@@ -2073,6 +2125,22 @@ mod tests {
         println!("\n2D 8-tap luma: ring vs full-height intermediate");
         println!("  (one process, best of {rounds} interleaved rounds, ms)");
         println!("  size      isa       flat       ring   speedup");
+        // The A/B is only meaningful if the two arms compute the same
+        // block, and if the flat arm is still what `interp_block` runs.
+        for &size in &[8usize, 16, 32, 64] {
+            for &isa in &isas {
+                let flat = flat_2d(isa, &plane, 64, 64, hk, vk, size, size, shift1);
+                let ring = ring_2d(isa, &plane, 64, 64, hk, vk, size, size, shift1);
+                let prod =
+                    interp_luma_block_with(isa, &plane, 64, 64, 2, 3, size, size, 8).unwrap();
+                assert_eq!(flat, ring, "{isa:?} {size}x{size}: ring differs from flat");
+                assert_eq!(
+                    flat, prod,
+                    "{isa:?} {size}x{size}: flat differs from interp_block"
+                );
+            }
+        }
+
         for &size in &[8usize, 16, 32, 64] {
             let (cols, rows_of_blocks) = (pw / size, ph / size);
             let blocks: Vec<(i32, i32)> = (0..rows_of_blocks)
@@ -2091,8 +2159,7 @@ mod tests {
 
                     let start = Instant::now();
                     for &(x, y) in &blocks {
-                        let b =
-                            interp_luma_block_with(isa, &plane, x, y, 2, 3, size, size, 8).unwrap();
+                        let b = ring_2d(isa, &plane, x, y, hk, vk, size, size, shift1);
                         sink += b[0] as i64;
                     }
                     let ring = start.elapsed().as_secs_f64();
