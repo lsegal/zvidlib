@@ -110,11 +110,12 @@ fn assert_all_match<T: PartialEq + std::fmt::Debug>(results: &[(SimdIsa, T)], wh
 // Transforms
 // ---------------------------------------------------------------------
 
-/// Whether `fwht4x4` is expected to answer with a kernel result. The forward
-/// WHT is dispatched to the scalar reference on x86_64 (see `super::fwht4x4`),
-/// so there `None` is the documented answer for an in-range block rather than
-/// a fallback. The inverse still has a kernel everywhere.
-const FORWARD_WHT_HAS_KERNEL: bool = !cfg!(target_arch = "x86_64");
+/// Whether the WHT kernels are expected to answer with a kernel result. Both
+/// directions are dispatched to the scalar reference on x86_64 (see
+/// `super::fwht4x4` and `super::iwht4x4`), each on its own measurement, so
+/// there `None` is the documented answer for an in-range block rather than a
+/// fallback.
+const WHT_HAS_KERNEL: bool = !cfg!(target_arch = "x86_64");
 
 #[test]
 fn walsh_hadamard_kernels_match_the_scalar_reference() {
@@ -132,19 +133,22 @@ fn walsh_hadamard_kernels_match_the_scalar_reference() {
             let kernel = fwht4x4(isa, &residual);
             assert_eq!(
                 kernel.is_some(),
-                FORWARD_WHT_HAS_KERNEL,
+                WHT_HAS_KERNEL,
                 "{}: unexpected forward WHT dispatch",
                 isa.name()
             );
             let coefficients = kernel.unwrap_or(scalar_coefficients);
             assert_eq!(coefficients, scalar_coefficients, "{}", isa.name());
-            let reconstructed = iwht4x4(isa, &coefficients).expect("in-range block");
+            let scalar_reconstructed = iwht4x4_scalar(&coefficients);
+            let inverse_kernel = iwht4x4(isa, &coefficients);
             assert_eq!(
-                reconstructed,
-                iwht4x4_scalar(&coefficients),
-                "{}",
+                inverse_kernel.is_some(),
+                WHT_HAS_KERNEL,
+                "{}: unexpected inverse WHT dispatch",
                 isa.name()
             );
+            let reconstructed = inverse_kernel.unwrap_or(scalar_reconstructed);
+            assert_eq!(reconstructed, scalar_reconstructed, "{}", isa.name());
             assert_eq!(reconstructed, residual, "forward/inverse must round-trip");
         }
     }
@@ -1286,6 +1290,32 @@ fn vectorized_round_trip_reproduces_the_residual() {
                 }
             }
             assert_all_match(&results, &format!("{tx_type:?} {size}x{size} round trip"));
+        }
+    }
+}
+
+/// #362: the coefficient-context site must not hand a 4x4 block to the AVX2
+/// kernel. A row shorter than eight lanes is one iteration under either width,
+/// so the wide arm does the same work with half its lanes idle and pays a
+/// staged partial store on top - measured at 2.50x of scalar against SSE4.1's
+/// 3.04x. Blocks from 8 wide up keep AVX2, where it genuinely halves the
+/// iterations per row. Nothing on a non-x86_64 host is redirected at all.
+#[test]
+fn the_coefficient_context_site_keeps_narrow_blocks_off_avx2() {
+    let narrow = [1usize, 2, 3, 4, 5, 6, 7];
+    let wide = [8usize, 9, 16, 32, 64];
+    for isa in available_isas() {
+        for size in narrow.into_iter().chain(wide) {
+            let routed = coeff_ctx_isa(isa, size);
+            let redirected = cfg!(target_arch = "x86_64") && isa == SimdIsa::Avx2 && size < 8;
+            let want = if redirected { SimdIsa::Sse41 } else { isa };
+            assert_eq!(
+                routed,
+                want,
+                "{} at size {size} routed to {}",
+                isa.name(),
+                routed.name()
+            );
         }
     }
 }

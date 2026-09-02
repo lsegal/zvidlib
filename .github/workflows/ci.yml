@@ -208,6 +208,12 @@ jobs:
             echo '## Benchmark host'
             echo
             echo '```'
+            # `ubuntu-latest` is a pool of several CPU models, and an
+            # elementwise minimum taken across two of them is attributable to
+            # no named host. `benches/README.md` names the model each committed
+            # table was measured on, so the model has to be in the run's own
+            # record rather than reconstructed afterwards.
+            echo "# host cpu model: $(grep -m1 '^model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//')"
             grep -hE '^# (host instruction sets|widest detected|dispatch site)' bench.log \
               | sort -u || echo 'no instruction-set log found in the benchmark output'
             echo '```'
