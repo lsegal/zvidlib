@@ -43,11 +43,11 @@ use winit::window::{Window, WindowId};
 use zvidlib::io::MemorySource;
 use zvidlib::{
     AacSampleReader, Codec, CodecProfile, ColorRange, CpuFrameSource, DefaultAudioOutput, Error,
-    ErrorKind, ExactFrameReader, FrameDestination, FrameSource, GraphicsAdapter, GraphicsApi,
-    GraphicsResource, HardwarePreference, IndexedPresentationTimeline, Limits, Mp4Demuxer,
-    Mp4DemuxerOptions, NativeAacDecoder, NativeAudioOutput, Orientation, PixelFormat,
-    PlaybackController, PlaybackOptions, ResourceKind, ResourceOwnership, Result, TrackKind,
-    TransferPolicy, VideoDecoderConfig, VideoDecoderFactory, VideoDimensions, execute_transfer,
+    ErrorKind, FrameDestination, FrameSource, GraphicsAdapter, GraphicsApi, GraphicsResource,
+    HardwarePreference, IndexedPresentationTimeline, Limits, Mp4Demuxer, Mp4DemuxerOptions,
+    NativeAacDecoder, NativeAudioOutput, Orientation, PixelFormat, PlaybackController,
+    PlaybackOptions, ResourceKind, ResourceOwnership, Result, TrackKind, TransferPolicy,
+    VideoDecoderConfig, VideoDecoderFactory, VideoDimensions, execute_transfer,
     native_hevc_video_decoder_factory,
 };
 
@@ -55,7 +55,7 @@ mod gl_window;
 mod scrub;
 
 use gl_window::{CONTROL_LEGEND, FpsCounter, GlWindowAdapter, LegendVisibility};
-use scrub::{KeyframeIndex, ScrubPreviewer, target_frame};
+use scrub::{FrameService, target_frame};
 
 const TEXTURE_HANDLE: u64 = 1;
 
@@ -119,26 +119,10 @@ fn run() -> Result<()> {
         configuration: video.decoder_config.clone(),
     };
     let support = factory.capability(&configuration);
-    let keyframes = KeyframeIndex::from_samples(&video_samples);
-    // A second reader over the same samples, so a scrub preview never contends with the decoder
-    // playback is driving. A backend that will not open two sessions costs the preview, not the
-    // example.
-    let scrub = match ScrubPreviewer::new(
-        &factory,
-        configuration.clone(),
-        video_samples.clone(),
-        limits,
-    ) {
-        Ok(previewer) => Some(previewer),
-        Err(error) => {
-            eprintln!(
-                "warning: scrub previews are unavailable ({}); the timeline will still seek on release",
-                error.message()
-            );
-            None
-        }
-    };
-    let video_reader = ExactFrameReader::new(&factory, configuration, video_samples, limits)?;
+    // Every frame the window draws comes off this one worker thread, playback's included: a
+    // decode on the event-loop thread is what froze the window for seconds after a scrub.
+    let frames = FrameService::new(&factory, configuration, video_samples, limits)?;
+    let video_reader = frames.source();
     let audio_decoder = NativeAacDecoder::new(&audio_config, Limits::default())?;
     let audio_reader = AacSampleReader::new(
         audio_decoder,
@@ -185,8 +169,7 @@ fn run() -> Result<()> {
         playback,
         frame_count,
         frames_per_five_seconds,
-        keyframes,
-        scrub,
+        frames,
     );
     let event_loop = EventLoop::new()
         .map_err(|error| invalid(format!("could not create the event loop: {error}")))?;
@@ -203,10 +186,11 @@ struct App<P> {
     playback: P,
     frame_count: u64,
     frames_per_five_seconds: u64,
+    /// A frame is wanted that playback is not going to ask for on its own: the still the window
+    /// shows while paused, at the frame a seek or a committed scrub left it on.
     needs_static_frame: bool,
     timeline_hover: Option<f32>,
-    keyframes: KeyframeIndex,
-    scrub: Option<ScrubPreviewer>,
+    frames: FrameService,
     /// The pointer is down on the timeline bar, so previews replace normal presentation.
     dragging: bool,
     /// The exact frame the drag is pointing at, committed when the pointer is released.
@@ -235,8 +219,7 @@ where
         playback: PlaybackController<V, A, O>,
         frame_count: u64,
         frames_per_five_seconds: u64,
-        keyframes: KeyframeIndex,
-        scrub: Option<ScrubPreviewer>,
+        frames: FrameService,
     ) -> Self {
         Self {
             dimensions,
@@ -245,8 +228,7 @@ where
             frames_per_five_seconds,
             needs_static_frame: false,
             timeline_hover: None,
-            keyframes,
-            scrub,
+            frames,
             dragging: false,
             scrub_target: None,
             legend: LegendVisibility::new(Instant::now()),
@@ -329,46 +311,42 @@ where
         (x / f64::from(width.max(1))).clamp(0.0, 1.0) as f32
     }
 
-    /// Records where the drag is pointing and asks the worker thread for a preview of it.
+    /// Records where the drag is pointing and points the worker thread at it.
     ///
-    /// Nothing here decodes: the preview is snapped back to its random-access point so it is one
-    /// intra picture rather than a whole group of pictures, and it is decoded off this thread.
+    /// Nothing here decodes. The worker walks to the frame under the pointer from its
+    /// random-access point, drawing what it passes, so the picture follows the drag from the
+    /// first intra picture onwards instead of waiting for the whole group of pictures.
     fn scrub_preview(&mut self, fraction: f32) {
         let target = target_frame(fraction, self.frame_count);
         self.scrub_target = Some(target);
-        let preview = self.keyframes.at_or_before(target);
-        if let Some(scrub) = self.scrub.as_mut() {
-            scrub.request(preview);
-        }
+        self.frames.request(target);
         if let Some(state) = self.state.as_ref() {
             state.window.request_redraw();
         }
     }
 
-    /// Ends a drag by seeking playback to the exact frame the pointer was left on. This is the
-    /// only seek a whole scrub performs, where every pointer move used to run one.
+    /// Ends a drag by moving playback to the frame the pointer was left on. Only the clock moves
+    /// here: the picture arrives from the worker, which the drag has already walked to that
+    /// frame, so committing decodes nothing.
     fn commit_scrub(&mut self, event_loop: &ActiveEventLoop) {
         self.dragging = false;
-        if let Some(scrub) = self.scrub.as_mut() {
-            scrub.forget_request();
-        }
         let Some(target) = self.scrub_target.take() else {
             return;
         };
         // Unconditional, even when the position has not moved: a preview replaced whatever was
-        // on screen, so the committed frame still has to be decoded and drawn.
+        // on screen, so the committed frame still has to be drawn.
         self.seek_to_frame(event_loop, target);
     }
 
-    /// Draws the newest completed preview, if one has arrived, without waiting for the decoder.
-    fn present_scrub_preview(&mut self, event_loop: &ActiveEventLoop) -> bool {
+    /// Draws the newest frame the worker has decoded, if one has arrived, without waiting for it.
+    fn present_latest_frame(&mut self, event_loop: &ActiveEventLoop) -> bool {
         // `present` would decode the frame the audio clock calls for, which is exactly the work a
         // drag must not do on this thread; the audio queue still needs topping up.
         if let Err(error) = self.playback.pump_audio() {
             self.fail(event_loop, error);
             return false;
         }
-        match self.scrub.as_mut().and_then(ScrubPreviewer::take_latest) {
+        match self.frames.take_latest() {
             Some(frame) => {
                 self.upload_frame(event_loop, &frame);
                 true
@@ -384,7 +362,7 @@ where
 
         let now = Instant::now();
         let frame_presented = if self.dragging {
-            self.present_scrub_preview(event_loop)
+            self.present_latest_frame(event_loop)
         } else if self.playback.is_playing() {
             match self.playback.present() {
                 Ok((_, Some(frame))) => {
@@ -399,6 +377,10 @@ where
                     }
                     false
                 }
+                // The frame the clock calls for is still decoding. The window keeps the picture
+                // it has and asks again on the next redraw rather than waiting for it, which is
+                // what lets playback resume immediately after a seek.
+                Err(error) if error.kind() == ErrorKind::WouldBlock => false,
                 Err(error) => {
                     return self.fail(event_loop, error);
                 }
@@ -409,6 +391,11 @@ where
                     self.needs_static_frame = false;
                     self.upload_frame(event_loop, &frame);
                     true
+                }
+                // Same again while paused: the still is drawn when the worker has decoded it, and
+                // until then whatever the walk to it has passed keeps the window moving.
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    self.present_latest_frame(event_loop)
                 }
                 Err(error) => return self.fail(event_loop, error),
             }
@@ -445,9 +432,14 @@ where
             );
         }
 
-        // Keep redrawing while the legend is fading so the fade animates even when paused, and
-        // while a drag is open so a preview that finishes decoding is picked up.
-        if self.playback.is_playing() || legend_opacity > 0.0 || self.dragging {
+        // Keep redrawing while the legend is fading so the fade animates even when paused, while
+        // a drag is open so a preview that finishes decoding is picked up, and while a still is
+        // outstanding so the frame a seek asked for is drawn when the worker delivers it.
+        if self.playback.is_playing()
+            || legend_opacity > 0.0
+            || self.dragging
+            || self.needs_static_frame
+        {
             state.window.request_redraw();
         }
     }
