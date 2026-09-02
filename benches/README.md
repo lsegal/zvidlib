@@ -1144,7 +1144,10 @@ lane-crossing, not downclocking, not the context gather. The detail differs.
   from size 8 up where it halves the iterations per row and stores whole
   vectors. The `avx2` column of this group is consequently the SSE4.1 kernel's
   number from here on, in the same sense `av1_encode_stage_wht`'s three columns
-  are all the scalar transform.
+  are all the scalar transform. Giving AVX2 real work at size 4 needs a kernel
+  that steps two rows at a time rather than one — the outputs of adjacent rows
+  are already contiguous, so eight lanes are there to be filled — and #371
+  carries that.
 - `hevc_encode_*_rdo_inter`. The same family, a different mechanism, and *not*
   the same fix. `rdcost::sad_avx2`'s 256-bit loop needs `w >= 32` and
   `satd_avx2`'s vector pair needs `w >= 16`, but `rdo.rs` searches a `CTB` of 16
