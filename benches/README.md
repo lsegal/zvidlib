@@ -853,6 +853,96 @@ out roughly even on Apple Silicon, where LLVM auto-vectorizes the scalar code
 well under `lto = "fat"`, while AV1 deblocking and motion compensation on the
 same host are 2.4-4.9x. `active_by_site()` answers the question directly.
 
+## What a drag preview costs the frame under the pointer
+
+The other profiling example measures an interaction rather than a codec.
+Dragging `native_gl`'s timeline bar walks a background decoder towards the frame
+under the pointer and publishes pictures on the way, so the drag keeps moving
+(issue #363); `PREVIEW_INTERVAL` in `examples/native_gl/scrub.rs` is how often it
+publishes. That interval was arithmetic — a dozen pictures over the 613-frame
+walk issue #354 timed at 1.7 s, about 4% on top — and issue #379 is what
+happened when it was measured.
+
+`examples/scrub_preview_profile.rs` drives the same `FrameService` the window
+drives, over the same bundled sample through the same hardware decoder, with no
+window and no renderer in the way:
+
+```sh
+cargo run --release --features native --example scrub_preview_profile
+cargo run --release --features native --example scrub_preview_profile -- 5
+cargo run --release --features native --example scrub_preview_profile -- 3 80 150 400
+```
+
+The first argument is runs per arm and the rest are cadences in milliseconds.
+Each arm builds its own service, so every walk starts from a cold decoder, and
+each reports the fastest of its runs: the decoder is shared hardware and
+anything else on the host only ever adds time. Its baseline arm is playback's
+exact request, which publishes nothing on the way to its target — what the drag
+did between #355 and #363 — so the overhead each cadence reports is measured
+against the same decoder in the same process.
+
+### The sweep
+
+Walking to frame 767 of `examples/media/BigBuckBunny.mp4` from cold on an Apple
+Silicon host (M1, 8 cores) through VideoToolbox, `--release`, fastest of five
+runs per arm. No previews at all: **1.25 s**, one picture.
+
+| interval | arrival | published | spacing | converted | overhead | per convert |
+| --- | --- | --- | --- | --- | --- | --- |
+| 80 ms | 3.52 s | 34 | 104 ms | 306 | 182% | 7.4 ms |
+| 150 ms | 7.03 s | 50 | 141 ms | 765 | 463% | 7.6 ms |
+| 250 ms | 5.56 s | 24 | 232 ms | 578 | 345% | 7.5 ms |
+| 400 ms | 3.39 s | 12 | 282 ms | 299 | 171% | 7.2 ms |
+| 600 ms | 2.38 s | 8 | 297 ms | 173 | 91% | 6.5 ms |
+| 800 ms | 2.31 s | 7 | 330 ms | 156 | 85% | 6.8 ms |
+| 1200 ms | 2.18 s | 6 | 363 ms | 129 | 74% | 7.2 ms |
+| 1600 ms | 1.82 s | 5 | 364 ms | 100 | 43% | 5.5 ms |
+| 2400 ms | 1.89 s | 5 | 378 ms | 102 | 51% | 6.3 ms |
+
+`published` is what the service published, counted by the service rather than by
+what the harness collected — a picture the render thread never draws still cost
+its conversion. `converted` is what the walk converted to RGBA, which is the
+larger number and the one the time goes into, and `spacing` is arrival divided
+by publishes: how often the picture under the pointer actually moves, which is
+what #363 asked for.
+
+### What it says
+
+**The 4% estimate was wrong by two orders of magnitude, and the per-picture
+price was not what it got wrong.** Per converted picture the cost is 5.2 ms to
+7.6 ms across the whole sweep, which is the 6.6 ms #355 measured through the
+`hevc_hardware_readback` seam. What the estimate missed is the count: the
+150 ms cadence converts **765** of the sample's 768 pictures on one walk, not a
+dozen, and the frame under the pointer arrives in 7.03 s rather than 1.7 s —
+worse than the 6.4 s issue #354 was opened for.
+
+The count is the reader's cache tail. `ExactFrameReader::get` keeps the frames
+immediately behind its target as well as the target, as many as
+`Limits::max_cached_frames` holds (32 by default), which is what makes stepping
+backwards free after a seek. A preview walk calls `get` once per published
+picture and pays that tail every time, so a stride shorter than the tail
+converts everything it passes and the walk is back to #354's behaviour by a
+different route. Issue #402 tracks the tail; the cadence can only work around
+it.
+
+Working around it is what `PREVIEW_INTERVAL` now does. It is 1.6 s, the knee:
+past it the walk neither arrives sooner nor publishes more — the stride is
+capped by `MAXIMUM_STRIDE` and the tail is what remains — and at it the frame
+under the pointer arrives in 1.82 s, #354's 1.7 s and about 8%, while the walk
+still publishes five pictures at 364 ms apart. The motion #363 asked for is not
+lost with it: since issue #374 a background pass keeps a shrunk picture every
+half second of the track, and a drag draws one for wherever the pointer is
+within a frame of the window's, so what this cadence owes #363 is the
+full-resolution picture catching up rather than the movement itself.
+
+The sweep is not monotonic, and that is the same mechanism seen from the
+outside: the stride is computed from the walk's own measured per-frame rate,
+that rate includes the conversions the step paid for, and a shorter stride
+converts a larger fraction of what it passes. Shortening the interval lengthens
+the per-frame estimate the next stride is computed from, so 80 ms and 400 ms
+land on similar strides from opposite directions while 150 ms sits in the
+region where every frame is converted.
+
 ## The audio container path
 
 `cargo bench --bench audio_mux` measures the audio write and read paths in two
