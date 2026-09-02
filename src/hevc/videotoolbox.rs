@@ -9,6 +9,7 @@ use apple_cf::raw;
 use videotoolbox::{Codec as VtCodec, DecompressionSession};
 
 use super::engine::hvcc::HvccRecord;
+use super::readback;
 use crate::{
     CancellationToken, DecodedVideoFrame, EncodedVideoSample, Error, ErrorKind, FrameIndex, Limits,
     PixelFormat, Plane, Result, VideoDecoder, VideoDecoderConfig, VideoDimensions, VideoFrame,
@@ -318,9 +319,16 @@ fn decoded_frame(
             "VideoToolbox RGBA output exceeds the allocation limit",
         ));
     }
+    // The surface-copy phase for VideoToolbox is the base-address lock: the
+    // decoded `CVPixelBuffer` is already in memory the CPU can address on a
+    // unified-memory host, so this is a lock rather than a transfer, and the
+    // seam is what says so rather than assuming it.
+    let surface_copy = readback::Timer::start();
     let guard = buffer
         .lock_read_only()
         .map_err(|status| codec(format!("could not lock VideoToolbox output ({status})")))?;
+    surface_copy.record(readback::Phase::SurfaceCopy);
+    let color_convert = readback::Timer::start();
     let mut rgba = vec![0_u8; length];
     for y in 0..height {
         let luma = guard
@@ -348,6 +356,8 @@ fn decoded_frame(
             rgba[target + 3] = 255;
         }
     }
+    color_convert.record(readback::Phase::ColorConvert);
+    readback::count_frame();
     Ok(DecodedVideoFrame {
         presentation_index: FrameIndex(presentation as u64),
         frame: VideoFrame::new(

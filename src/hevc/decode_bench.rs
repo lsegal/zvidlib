@@ -20,7 +20,9 @@
 //! does for a whole-frame decode.
 
 use super::engine::deblock::{EdgePos, EdgeQp, EdgeType, SamplePlane, filter_luma_block_edge};
-use super::engine::inter_pred::{RefPlane, default_weighted_pred, interp_luma_block};
+use super::engine::inter_pred::{
+    RefPlane, default_weighted_pred, interp_chroma_block, interp_luma_block,
+};
 use super::engine::intra_pred::{
     Component as IntraComponent, IntraPredParams, ReferenceSamples, intra_predict,
 };
@@ -34,8 +36,47 @@ use crate::{
     Limits, PixelFormat, VideoDecoder, VideoDecoderConfig, VideoDimensions,
 };
 
-/// Luma side of one inter-prediction block.
-const INTER_BLOCK: usize = 16;
+/// The largest inter prediction unit, and the cell the §8.5.3.3 workload's
+/// prediction-unit schedule is laid out on: every cell is filled by prediction
+/// units of one class, so a cell is either one 64x64 unit or the 4, 16 or 64
+/// smaller ones that tile it.
+const INTER_CELL: usize = 64;
+
+/// The §8.5.3.3 prediction-unit mix a real decode runs, as issue #280 measured
+/// it: 48 frames of `examples/media/BigBuckBunny.mp4` at 1920x1080, every
+/// prediction unit the decoder reconstructed, weighted by luma sample.
+///
+/// Each entry is `(luma side, bi-predicted, share of luma samples)`. The
+/// workload this drives replaced a uniform grid of 16x16 bi-predicted
+/// *luma-only* blocks, which that measurement showed was not what the stage
+/// runs on real content in any of the three ways that matter to a vector
+/// kernel:
+///
+/// * **Size.** 62% of predicted luma samples are in 64x64 units and 31% in
+///   32x32; 16x16 is 5% and 8x8 is 1.4%. The old grid's block was the third
+///   most common size by sample and carried 5% of the real work.
+/// * **List utilisation.** 38% of predicted luma samples are uni-predicted,
+///   which runs one interpolation rather than two and takes the
+///   §8.5.3.3.4.2 single-list combine rather than the two-list one. The old
+///   grid was bi-predicted throughout.
+/// * **Component.** At 4:2:0 every luma sample brings half a chroma sample,
+///   through the §8.5.3.3.3.3 4-tap filter rather than the 8-tap one — a
+///   third of the stage's samples, on a kernel that measures materially lower
+///   than the luma one. The old grid predicted no chroma at all.
+///
+/// The clip codes 2Nx2N prediction units throughout, so every size here is
+/// square; a stream using the §7.3.8.5 asymmetric partitions would add
+/// rectangular units, and this table would be re-measured rather than guessed.
+const INTER_PU_MIX: [(usize, bool, f64); 8] = [
+    (64, true, 0.432),
+    (64, false, 0.189),
+    (32, true, 0.162),
+    (32, false, 0.149),
+    (16, false, 0.036),
+    (16, true, 0.017),
+    (8, false, 0.009),
+    (8, true, 0.005),
+];
 /// The CTB side the SAO stage is driven at, as `log2`.
 const SAO_CTB_LOG2: u32 = 6;
 /// Bit depth every stage runs at; the bundled sample is 8-bit Main.
@@ -44,6 +85,77 @@ const BIT_DEPTH: u8 = 8;
 const TX_SIZES: [usize; 4] = [4, 8, 16, 32];
 /// CABAC bins one iteration of the entropy stage decodes.
 const CABAC_BINS: usize = 1 << 18;
+
+/// One scheduled §8.5.3.3 prediction unit of the inter-prediction workload.
+#[derive(Debug, Clone, Copy)]
+struct InterPu {
+    /// Top-left luma position, in samples.
+    x: i32,
+    y: i32,
+    /// Luma side; the unit is square, as every unit the measured clip codes is.
+    n: usize,
+    /// `predFlagL1` — whether this unit runs two interpolations and the
+    /// two-list §8.5.3.3.4.2 combine, or one and the single-list one.
+    bi: bool,
+    /// Which fractional phase pair this unit filters at, so the schedule
+    /// sweeps the one- and two-dimensional filter paths and the copy path.
+    phase: i32,
+}
+
+/// Lay out one frame's worth of prediction units matching [`INTER_PU_MIX`].
+///
+/// The frame is walked in [`INTER_CELL`]-sized cells, and each cell is filled
+/// entirely by units of one class. The class is chosen greedily — whichever is
+/// furthest below its target share of luma samples so far — so the emitted mix
+/// converges on the measured one exactly rather than approximately, and does so
+/// deterministically, which is what the benchmark's bit-exactness guard needs.
+///
+/// A margin of one cell is left on the right and bottom edges because the
+/// workload offsets its second reference list by one sample; every unit and
+/// both of its lists therefore lie inside the plane.
+fn schedule_inter_pus(width: usize, height: usize) -> Vec<InterPu> {
+    let cells_x = (width / INTER_CELL).saturating_sub(1);
+    let cells_y = (height / INTER_CELL).saturating_sub(1);
+    let mut emitted = [0u64; INTER_PU_MIX.len()];
+    let mut total = 0u64;
+    let mut pus = Vec::new();
+    let mut phase = 0i32;
+    for cy in 0..cells_y {
+        for cx in 0..cells_x {
+            // Furthest below target, measured as a sample deficit so the very
+            // first cell (where every share is zero) still picks the largest.
+            let class = (0..INTER_PU_MIX.len())
+                .max_by(|&a, &b| {
+                    let deficit = |i: usize| {
+                        INTER_PU_MIX[i]
+                            .2
+                            .mul_add(total as f64, -(emitted[i] as f64))
+                    };
+                    deficit(a)
+                        .partial_cmp(&deficit(b))
+                        .expect("the shares are finite")
+                })
+                .expect("the mix is not empty");
+            let (n, bi, _) = INTER_PU_MIX[class];
+            for by in (0..INTER_CELL).step_by(n) {
+                for bx in (0..INTER_CELL).step_by(n) {
+                    pus.push(InterPu {
+                        x: (cx * INTER_CELL + bx) as i32,
+                        y: (cy * INTER_CELL + by) as i32,
+                        n,
+                        bi,
+                        phase,
+                    });
+                    phase = (phase + 1) % 16;
+                }
+            }
+            let cell_samples = (INTER_CELL * INTER_CELL) as u64;
+            emitted[class] += cell_samples;
+            total += cell_samples;
+        }
+    }
+    pus
+}
 
 /// An FNV-1a fold, so a stage's whole output identifies it in eight bytes.
 struct Digest(u64);
@@ -182,6 +294,11 @@ pub struct HevcStageInputs {
     /// exactly what the first already builds, a whole decoded picture.
     picture: Picture,
     sao_ctbs: Vec<ResolvedSao>,
+    /// The §8.5.3.3 prediction units one run of the stage reconstructs, in
+    /// raster order, built to [`INTER_PU_MIX`]. Scheduling them is setup, so
+    /// it happens here rather than inside the timed loop.
+    inter_pus: Vec<InterPu>,
+    inter_luma_samples: u64,
     convert_config: VideoDecoderConfig,
     cabac_bytes: Vec<u8>,
 }
@@ -204,6 +321,8 @@ impl HevcStageInputs {
         let tx_blocks = build_tx_blocks();
         let tx_samples = tx_blocks.iter().map(|(l, _)| l.len() as u64).sum();
         let (picture, sao_ctbs) = build_sao_inputs(width, height, &luma);
+        let inter_pus = schedule_inter_pus(width, height);
+        let inter_luma_samples = inter_pus.iter().map(|pu| (pu.n * pu.n) as u64).sum();
         Self {
             width,
             height,
@@ -214,16 +333,21 @@ impl HevcStageInputs {
             tx_samples,
             picture,
             sao_ctbs,
+            inter_pus,
+            inter_luma_samples,
             convert_config: convert_config(width, height),
             cabac_bytes: build_cabac_bitstream(),
         }
     }
 
     /// Luma samples the inter-prediction stage writes per run.
+    ///
+    /// Luma only, so the figure stays comparable with the one this group
+    /// reported before it predicted chroma; each of these samples brings half
+    /// a chroma sample of §8.5.3.3.3.3 work with it at 4:2:0.
     #[must_use]
     pub fn inter_pred_samples(&self) -> u64 {
-        let (bx, by) = self.inter_grid();
-        (bx * by * INTER_BLOCK * INTER_BLOCK) as u64
+        self.inter_luma_samples
     }
 
     /// Samples the intra-prediction stage writes per run.
@@ -262,59 +386,67 @@ impl HevcStageInputs {
         CABAC_BINS as u64
     }
 
-    /// §8.5.3.3 — fractional-sample interpolation and the weighted combine.
+    /// §8.5.3.3 — fractional-sample interpolation and the weighted combine,
+    /// over the prediction-unit mix a real decode runs.
     ///
-    /// Bi-predicts a grid of 16x16 luma blocks: two 8-tap interpolations at
-    /// different fractional phases, combined through the §8.5.3.3.4.2 default
-    /// weighted prediction. Both are the vectorized `filter_taps` /
-    /// `combine_weighted` primitives.
+    /// Each scheduled unit interpolates its luma through the §8.5.3.3.3.2
+    /// 8-tap filter and, at 4:2:0, its Cb and Cr through the §8.5.3.3.3.3
+    /// 4-tap filter, once per used reference list, and combines the result
+    /// through the §8.5.3.3.4.2 default weighted prediction. Every one of
+    /// those is a vectorized `filter_taps` / `combine_weighted` primitive.
+    ///
+    /// The unit sizes, the uni/bi split and the presence of chroma all come
+    /// from [`INTER_PU_MIX`], which is measured rather than chosen; see that
+    /// constant for what the uniform 16x16 bi-predicted luma-only grid this
+    /// replaced was getting wrong.
     ///
     /// # Panics
-    /// Panics if the prepared plane no longer matches its dimensions.
+    /// Panics if the prepared planes no longer match their dimensions.
     #[must_use]
     pub fn run_inter_pred(&self) -> Vec<u8> {
-        let plane = RefPlane::new(&self.luma, self.width, self.height)
+        let luma = RefPlane::new(&self.luma, self.width, self.height)
             .expect("the prepared plane matches its dimensions");
-        let (blocks_x, blocks_y) = self.inter_grid();
+        let (cw, ch) = (self.width / 2, self.height / 2);
+        let cb = RefPlane::new(self.picture.plane(Plane::Cb), cw, ch)
+            .expect("the prepared picture's Cb plane matches its dimensions");
+        let cr = RefPlane::new(self.picture.plane(Plane::Cr), cw, ch)
+            .expect("the prepared picture's Cr plane matches its dimensions");
         let mut digest = Digest::new();
-        for by in 0..blocks_y {
-            for bx in 0..blocks_x {
-                let x = (bx * INTER_BLOCK) as i32;
-                let y = (by * INTER_BLOCK) as i32;
-                // Sweep every fractional phase so both the one- and the
-                // two-dimensional filter paths run.
-                let l0 = interp_luma_block(
-                    &plane,
-                    x,
-                    y,
-                    (bx % 4) as i32,
-                    (by % 4) as i32,
-                    INTER_BLOCK,
-                    INTER_BLOCK,
-                    BIT_DEPTH,
-                )
-                .expect("the block lies inside the plane");
-                let l1 = interp_luma_block(
-                    &plane,
-                    x + 1,
-                    y + 1,
-                    ((bx + 1) % 4) as i32,
-                    ((by + 2) % 4) as i32,
-                    INTER_BLOCK,
-                    INTER_BLOCK,
-                    BIT_DEPTH,
-                )
-                .expect("the block lies inside the plane");
-                let combined = default_weighted_pred(
-                    &l0,
-                    &l1,
-                    true,
-                    true,
-                    INTER_BLOCK,
-                    INTER_BLOCK,
-                    BIT_DEPTH,
-                )
-                .expect("both lists are the block's size");
+        for pu in &self.inter_pus {
+            let n = pu.n;
+            // Sweep the fractional phases so both the one-dimensional and the
+            // two-dimensional filter paths run, and so a unit that lands on a
+            // full-sample position (the copy path) is reached too.
+            let (fx0, fy0) = (pu.phase % 4, (pu.phase / 4) % 4);
+            let (fx1, fy1) = ((pu.phase + 1) % 4, (pu.phase + 3) % 4);
+            let l0 = interp_luma_block(&luma, pu.x, pu.y, fx0, fy0, n, n, BIT_DEPTH)
+                .expect("the unit lies inside the plane");
+            let l1 = if pu.bi {
+                interp_luma_block(&luma, pu.x + 1, pu.y + 1, fx1, fy1, n, n, BIT_DEPTH)
+                    .expect("the unit lies inside the plane")
+            } else {
+                Vec::new()
+            };
+            let combined = default_weighted_pred(&l0, &l1, true, pu.bi, n, n, BIT_DEPTH)
+                .expect("both lists are the unit's size");
+            digest.push_all(&combined);
+
+            // §8.5.3.3.3.3: the chroma units are half the luma unit's side at
+            // 4:2:0, at eighth-sample phases rather than quarter-sample ones.
+            let (cn, cx, cy) = (n / 2, pu.x / 2, pu.y / 2);
+            let (cfx0, cfy0) = (pu.phase % 8, (pu.phase / 8) % 8);
+            let (cfx1, cfy1) = ((pu.phase + 3) % 8, (pu.phase + 5) % 8);
+            for plane in [&cb, &cr] {
+                let c0 = interp_chroma_block(plane, cx, cy, cfx0, cfy0, cn, cn, BIT_DEPTH)
+                    .expect("the unit lies inside the plane");
+                let c1 = if pu.bi {
+                    interp_chroma_block(plane, cx + 1, cy + 1, cfx1, cfy1, cn, cn, BIT_DEPTH)
+                        .expect("the unit lies inside the plane")
+                } else {
+                    Vec::new()
+                };
+                let combined = default_weighted_pred(&c0, &c1, true, pu.bi, cn, cn, BIT_DEPTH)
+                    .expect("both lists are the unit's size");
                 digest.push_all(&combined);
             }
         }
@@ -395,17 +527,17 @@ impl HevcStageInputs {
 
     /// The YUV420-to-RGBA output conversion every whole-frame decode ends in.
     ///
-    /// Issue #220: this stage is not decoding, but it is a third of what the
+    /// Issue #220: this stage is not decoding, but it was a third of what the
     /// whole-frame groups measure (see `benches/README.md`), so it is timed
     /// directly rather than inferred by subtracting one whole-frame group from
-    /// another. Like [`run_cabac`], it has no vector kernel today and its arms
-    /// are expected to come out equal; issue #219 is the ticket that changes
-    /// that, and this is the group that would show it.
+    /// another. Issue #219 gave it the [`color_convert`] kernel family, so its
+    /// arms now separate by instruction set like the decoding stages do, and
+    /// this group is what reports that.
     ///
     /// # Panics
     /// Panics if the prepared picture no longer converts.
     ///
-    /// [`run_cabac`]: Self::run_cabac
+    /// [`color_convert`]: super::color_convert
     #[must_use]
     pub fn run_color_convert(&self) -> Vec<u8> {
         let frame = picture_to_rgba(&self.picture, &self.convert_config, &Limits::default())
@@ -458,13 +590,6 @@ impl HevcStageInputs {
 
     /// Inter-prediction block grid, leaving a block of margin on each axis so
     /// the `+1` L1 offset stays addressable.
-    fn inter_grid(&self) -> (usize, usize) {
-        (
-            (self.width / INTER_BLOCK).saturating_sub(1),
-            (self.height / INTER_BLOCK).saturating_sub(1),
-        )
-    }
-
     /// Every vertical luma edge segment of the frame, on the §8.7.2.4 grid:
     /// 8 samples apart across the edge, 4 rows apart along it.
     fn luma_edges(&self) -> Vec<EdgePos> {
@@ -638,9 +763,10 @@ fn convert_config(width: usize, height: usize) -> VideoDecoderConfig {
 ///
 /// Issue #220: the public decoder's `submit` returns RGBA, so a whole-frame
 /// benchmark through it measures decoding *plus* the colour conversion of
-/// [`HevcStageInputs::run_color_convert`] — a third of the interval, with no
-/// vector kernel behind it, diluting every scalar-versus-SIMD ratio taken off
-/// those groups. This is the same decode without that tail: it drives the same
+/// [`HevcStageInputs::run_color_convert`] — a third of the interval, which
+/// until issue #219 gave it a kernel had no vector path at all and diluted
+/// every scalar-versus-SIMD ratio taken off those groups. This is the same
+/// decode without that tail: it drives the same
 /// `HevcDecoder` over the same access units and collects its pictures instead
 /// of converting them, so the difference between this and the end-to-end group
 /// is the conversion and nothing else about how the bitstream is handled.
@@ -753,6 +879,64 @@ mod tests {
         HevcStageInputs::new(256, 128)
     }
 
+    /// The §8.5.3.3 workload has to run the prediction-unit mix issue #280
+    /// measured, not a mix that happens to be close to it.
+    ///
+    /// The uniform 16x16 bi-predicted luma-only grid this replaced would fail
+    /// every assertion here: one size instead of four, no uni-predicted units,
+    /// and no chroma. A schedule that drifted back towards one of those — say
+    /// by rounding every cell to the largest class — would look like a faster
+    /// kernel rather than a narrower workload, which is the failure this
+    /// benchmark exists to avoid.
+    #[test]
+    fn the_inter_pred_schedule_runs_the_measured_prediction_unit_mix() {
+        // A frame large enough that each class gets whole cells to land in;
+        // the greedy schedule converges on the shares as cells accumulate.
+        let pus = schedule_inter_pus(1920, 1088);
+        let total: u64 = pus.iter().map(|pu| (pu.n * pu.n) as u64).sum();
+        assert!(total > 0, "the schedule emitted no prediction units");
+
+        for &(n, bi, share) in &INTER_PU_MIX {
+            let got: u64 = pus
+                .iter()
+                .filter(|pu| pu.n == n && pu.bi == bi)
+                .map(|pu| (pu.n * pu.n) as u64)
+                .sum();
+            let got = got as f64 / total as f64;
+            assert!(
+                (got - share).abs() < 0.01,
+                "{n}x{n} {} is {:.1}% of luma samples, measured {:.1}%",
+                if bi { "bi" } else { "uni" },
+                got * 100.0,
+                share * 100.0,
+            );
+        }
+
+        // Bi-prediction is the majority but not the whole of it, and every
+        // measured size is present — the three things the old grid collapsed.
+        let bi: u64 = pus
+            .iter()
+            .filter(|pu| pu.bi)
+            .map(|pu| (pu.n * pu.n) as u64)
+            .sum();
+        let bi = bi as f64 / total as f64;
+        assert!((0.55..0.70).contains(&bi), "bi-predicted share is {bi}");
+        for side in [8usize, 16, 32, 64] {
+            assert!(
+                pus.iter().any(|pu| pu.n == side),
+                "no {side}x{side} prediction unit was scheduled"
+            );
+        }
+
+        // And the workload predicts chroma: every unit is at least 8x8 luma,
+        // so every unit has a 4:2:0 chroma unit of at least 4x4 to filter.
+        assert!(
+            pus.iter()
+                .all(|pu| pu.n >= 8 && pu.x % 2 == 0 && pu.y % 2 == 0),
+            "a unit has no whole 4:2:0 chroma unit"
+        );
+    }
+
     /// Every stage must produce identical output on every instruction set the
     /// host can run.
     ///
@@ -862,7 +1046,10 @@ mod tests {
     #[test]
     fn reported_sample_counts_match_the_workloads() {
         let inputs = small_inputs();
-        assert_eq!(inputs.inter_pred_samples(), 15 * 7 * 256);
+        // Three 64x64 cells fit a 256x128 frame once the one-cell margin the
+        // second reference list needs is taken off each edge, and every cell
+        // is filled by prediction units of one class whatever that class is.
+        assert_eq!(inputs.inter_pred_samples(), 3 * 64 * 64);
         assert_eq!(inputs.sao_samples(), 256 * 128 * 3 / 2);
         assert_eq!(
             inputs.deblock_samples(),

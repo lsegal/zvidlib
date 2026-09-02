@@ -18,12 +18,12 @@
 //! | `hevc_decode_1080p` | whole-frame decode through `ExactFrameReader` | n/a |
 //! | `hevc_decode` | whole-frame `submit`-to-RGBA round trip, one arm per instruction set | n/a |
 //! | `hevc_decode_to_picture` | the same decode stopping at the decoded `Picture` | n/a |
-//! | `hevc_inter_pred` | §8.5.3.3 8-tap luma interpolation + weighted combine | yes |
+//! | `hevc_inter_pred` | §8.5.3.3 interpolation + weighted combine, over the measured prediction-unit mix | yes |
 //! | `hevc_intra_pred` | §8.4.4.2 reference smoothing, planar / DC / angular | yes |
 //! | `hevc_deblock` | §8.7.2 luma block-edge deblocking | yes |
 //! | `hevc_sao` | §8.7.3 sample adaptive offset, band and edge | yes |
 //! | `hevc_inverse_transform` | §8.6 dequantization + inverse DCT/DST | yes |
-//! | `hevc_color_convert` | YUV420-to-RGBA output conversion | no, today |
+//! | `hevc_color_convert` | decoder output YUV420-to-RGBA conversion | yes |
 //! | `hevc_cabac` | §9.3.4 arithmetic bin decoding | no, by design |
 //!
 //! The three whole-frame groups need the bundled sample and so sit behind
@@ -33,10 +33,11 @@
 //!
 //! `hevc_decode` measures `submit` to RGBA, which is what an application pays
 //! per frame and so is worth keeping. It is not, however, a decode: the
-//! `picture_to_rgba` pass at the end of it is a third of the interval (issue
-//! #189's stage attribution, recorded in `benches/README.md`) and no HEVC
-//! kernel touches it, so a scalar-versus-SIMD ratio taken off that group has a
-//! third of its denominator pinned no matter how fast the kernels get.
+//! `picture_to_rgba` pass at the end of it was a third of the interval (issue
+//! #189's stage attribution, recorded in `benches/README.md`) with no vector
+//! kernel behind it until issue #219 gave it one, so a ratio taken off that
+//! group used to have a third of its denominator pinned no matter how fast the
+//! decoding kernels got.
 //! `hevc_decode_to_picture` is the same decode over the same access units,
 //! collecting the decoded pictures instead of converting them, and is the group
 //! to read a decode ratio off. `hevc_color_convert` times the conversion
@@ -192,8 +193,8 @@ fn hevc_decode_by_isa(criterion: &mut Criterion) {
 ///
 /// Issue #220: this is the group a decode ratio is read off. [`hevc_decode`]
 /// includes `picture_to_rgba`, which issue #189's attribution put at a third of
-/// that interval with no vector kernel behind it, so its scalar-versus-SIMD
-/// ratio is structurally understated by a stage no HEVC kernel can move. Same
+/// that interval, so its ratio mixes decoding with an output stage — one that
+/// is vectorized as of issue #219 but is still not decoding. Same
 /// sample, same access units, same frame count as that group; the only
 /// difference is what happens to the decoded picture.
 ///
@@ -252,8 +253,13 @@ where
     bench_across_isas(criterion, &workload, || run(inputs));
 }
 
-/// §8.5.3.3 inter prediction: the 8-tap luma interpolation and the weighted
-/// combine, the two `engine::simd` primitives.
+/// §8.5.3.3 inter prediction: the 8-tap luma and 4-tap chroma interpolation and
+/// the weighted combine, the two `engine::simd` primitives.
+///
+/// The workload is the prediction-unit mix issue #280 measured off a real
+/// 1080p decode — sizes, the uni/bi split and chroma — rather than the uniform
+/// 16x16 bi-predicted luma-only grid it used to be. See
+/// `crate::hevc::decode_bench::INTER_PU_MIX` for what that grid was missing.
 fn hevc_inter_pred_by_isa(criterion: &mut Criterion) {
     let samples = hevc_stage_inputs().inter_pred_samples();
     hevc_stage_group(criterion, "hevc_inter_pred", samples, |inputs| {
@@ -297,13 +303,14 @@ fn hevc_inverse_transform_by_isa(criterion: &mut Criterion) {
     });
 }
 
-/// The YUV420-to-RGBA output conversion, the stage that separates
-/// `hevc_decode` from `hevc_decode_to_picture`.
+/// The decoder's 8-bit 4:2:0 YUV-to-RGBA output conversion over a full 1080p
+/// picture.
 ///
-/// It has no vector path today, so its arms are expected to come out equal —
-/// which is the finding: it is the single largest item in a whole-frame
-/// measurement and none of the HEVC kernels reach it. Issue #219 is the ticket
-/// that vectorizes it, and this is the group that would show the difference.
+/// Not a decoding stage, but the largest single item in a whole-frame decode —
+/// the issue #189 attribution in `benches/README.md` measured it at a third of
+/// everything the two whole-frame groups time — and it is on the path of both
+/// of them, so its arms are what say how much of the diluted whole-frame ratio
+/// the kernel recovers.
 fn hevc_color_convert_by_isa(criterion: &mut Criterion) {
     let samples = hevc_stage_inputs().color_convert_samples();
     hevc_stage_group(criterion, "hevc_color_convert", samples, |inputs| {

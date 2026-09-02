@@ -45,6 +45,7 @@
 use crate::hevc::engine::binarization::PartMode;
 use crate::hevc::engine::deblock::{DeblockCu, DeblockCuDesc, DeblockCuParams, NoFilterMap};
 use crate::hevc::engine::encoder::rdo::PictureDecision;
+use crate::hevc::engine::encoder::recon_simd::{self, BandStats, EdgeStats};
 use crate::hevc::engine::encoder::transform::{
     ForwardBlockParams, chroma_qp, luma_qp, transform_and_quantize,
 };
@@ -239,7 +240,9 @@ pub(crate) fn reconstruct_picture(
     }
 
     if cfg.sao_luma || cfg.sao_chroma {
-        let grid = estimate_sao(&pic, src, cfg);
+        // No §7.3.8.3 syntax is written for this reconstruction, so the
+        // decision is distortion-only.
+        let grid = estimate_sao(&pic, src, cfg.sao_luma, cfg.sao_chroma, 0);
         pic = crate::hevc::engine::sao::apply_sao_picture_full(
             pic,
             &grid,
@@ -355,47 +358,51 @@ fn reconstruct_component(
     quant: Option<u32>,
     component: TfComponent,
 ) {
-    let predict = |sx: usize, sy: usize| -> i32 {
-        match reference {
-            // §8.5.3.3.2 reference-sample clamping: a vector that leaves the
-            // picture reads the edge sample.
-            Some((reference, rw, rh)) => {
-                let rx = (sx as i32 + mv_x).clamp(0, rw as i32 - 1) as usize;
-                let ry = (sy as i32 + mv_y).clamp(0, rh as i32 - 1) as usize;
-                i32::from(reference[ry * rw + rx])
-            }
-            None => NEUTRAL_LUMA,
-        }
-    };
     let Some(q_p) = quant else {
-        // The residual is coded exactly, so the reconstruction is the source.
+        // The residual is coded exactly, so the reconstruction is the source,
+        // and the §8.6.6 add-and-clip of a whole row is a straight-line run
+        // the vector kernel can take whole once the prediction is gathered.
+        let mut prediction = vec![0u8; w];
+        let (dst, dst_stride) = pic.plane_mut(plane);
         for row in 0..h {
-            for col in 0..w {
-                let (sx, sy) = (x + col, y + row);
-                let predicted = predict(sx, sy);
-                let residual = i32::from(source[sy * src_stride + sx]) - predicted;
-                pic.set_sample(plane, sx, sy, clip1(predicted + residual, BIT_DEPTH));
-            }
+            let sy = y + row;
+            gather_prediction_row(&mut prediction, reference, x, sy, mv_x, mv_y);
+            let src_row = &source[sy * src_stride + x..sy * src_stride + x + w];
+            let dst_row = &mut dst[sy * dst_stride + x..sy * dst_stride + x + w];
+            recon_simd::reconstruct_row(dst_row, src_row, &prediction);
         }
         return;
     };
 
     // §7.3.8.8: the residual of a partition is coded as square transform
-    // blocks. This geometry's partitions are whole or halved CTBs, so tiling
-    // by the largest legal square that fits is the transform tree a writer
-    // would build for them.
+    // blocks, the smallest of which is 4x4. An asymmetric partition can be as
+    // narrow as four luma samples, and its 4:2:0 chroma half then measures two
+    // — less than one transform block, and not a whole number of them in the
+    // other direction either. Tiling by the largest legal square that fits and
+    // clipping each block to the partition is what a writer does there: the
+    // samples past the edge carry no residual, so they are coded as zero and
+    // never written back.
     let n_tbs = transform_block_size(w, h);
     let mut prediction = vec![0i32; n_tbs * n_tbs];
     let mut residual = vec![0i32; n_tbs * n_tbs];
+    let mut pred_row = vec![0u8; n_tbs];
     for by in (0..h).step_by(n_tbs) {
         for bx in (0..w).step_by(n_tbs) {
-            for row in 0..n_tbs {
-                for col in 0..n_tbs {
-                    let (sx, sy) = (x + bx + col, y + by + row);
-                    let predicted = predict(sx, sy);
+            let block_h = n_tbs.min(h - by);
+            let block_w = n_tbs.min(w - bx);
+            if block_h != n_tbs || block_w != n_tbs {
+                // Only the clipped blocks need the padding zeroed; a whole one
+                // overwrites every position below.
+                residual.fill(0);
+            }
+            for row in 0..block_h {
+                let sy = y + by + row;
+                gather_prediction_row(&mut pred_row[..block_w], reference, x + bx, sy, mv_x, mv_y);
+                for col in 0..block_w {
+                    let predicted = i32::from(pred_row[col]);
                     prediction[row * n_tbs + col] = predicted;
                     residual[row * n_tbs + col] =
-                        i32::from(source[sy * src_stride + sx]) - predicted;
+                        i32::from(source[sy * src_stride + x + bx + col]) - predicted;
                 }
             }
             // Forward transform → quantize → the decoder's own §8.6.2
@@ -440,24 +447,66 @@ fn reconstruct_component(
             } else {
                 vec![0i32; n_tbs * n_tbs]
             };
-            for row in 0..n_tbs {
-                for col in 0..n_tbs {
-                    let i = row * n_tbs + col;
-                    pic.set_sample(
-                        plane,
-                        x + bx + col,
-                        y + by + row,
-                        clip1(prediction[i] + coded[i], BIT_DEPTH),
-                    );
-                }
+            // The §8.6.6 add-and-clip of a transform block is `n_tbs`
+            // straight-line runs over two `i32` operands, so each row goes
+            // through the vector kernel whole rather than one `set_sample` at
+            // a time.
+            let (dst, dst_stride) = pic.plane_mut(plane);
+            for row in 0..block_h {
+                let start = (y + by + row) * dst_stride + x + bx;
+                recon_simd::add_clip_row(
+                    &mut dst[start..start + block_w],
+                    &prediction[row * n_tbs..row * n_tbs + block_w],
+                    &coded[row * n_tbs..row * n_tbs + block_w],
+                );
             }
         }
     }
 }
 
-/// The largest legal square transform block that tiles a `w` x `h` partition:
-/// the largest power of two no greater than either side, clamped to the
+/// Gathers the §8.5.3.3.2 prediction of one row of a partition contiguously,
+/// so the add-and-clip that consumes it is a straight-line run.
+///
+/// The gather is a plain copy whenever the motion vector keeps the row inside
+/// the reference, which is the common case; only a row that hangs off an edge
+/// falls back to the per-sample reference-sample clamp. `prediction.len()` is
+/// the run length.
+fn gather_prediction_row(
+    prediction: &mut [u8],
+    reference: Option<(&[u8], usize, usize)>,
+    x: usize,
+    sy: usize,
+    mv_x: i32,
+    mv_y: i32,
+) {
+    let w = prediction.len();
+    match reference {
+        Some((reference, rw, rh)) => {
+            let ry = (sy as i32 + mv_y).clamp(0, rh as i32 - 1) as usize;
+            let base = ry * rw;
+            let left = x as i32 + mv_x;
+            if left >= 0 && left + w as i32 <= rw as i32 {
+                let start = base + left as usize;
+                prediction.copy_from_slice(&reference[start..start + w]);
+            } else {
+                for (col, sample) in prediction.iter_mut().enumerate() {
+                    let rx = (left + col as i32).clamp(0, rw as i32 - 1) as usize;
+                    *sample = reference[base + rx];
+                }
+            }
+        }
+        None => prediction.fill(NEUTRAL_LUMA as u8),
+    }
+}
+
+/// The largest legal square transform block for a `w` x `h` partition: the
+/// largest power of two no greater than either side, clamped to the
 /// §7.4.3.2.1 4..=32 transform-block range.
+///
+/// The clamp at 4 means the result does not always divide the partition — an
+/// asymmetric partition's 4:2:0 chroma half can be as short as two samples —
+/// so the caller clips the last block of each row and column to the partition
+/// rather than assuming a whole tiling.
 fn transform_block_size(w: usize, h: usize) -> usize {
     let side = w.min(h);
     let log2 = (usize::BITS - 1 - side.leading_zeros()).clamp(2, 5);
@@ -502,102 +551,311 @@ fn deblock_descriptors(width: usize, height: usize, qp: i32) -> Vec<DeblockCuDes
     cus
 }
 
+/// §8.7.2 — run the in-loop deblocking filter over a finished
+/// reconstruction, in place.
+///
+/// The residual writer in [`crate::hevc::engine::encoder::lossy`] builds its
+/// reconstruction block by block as it codes, because §8.4.4.2.2 intra
+/// prediction reads the neighbouring samples *prior to* the in-loop filter
+/// process. Deblocking is therefore a whole-picture pass run once the last
+/// coding unit of the picture is coded — the §8.7.1 ordering the decoder
+/// itself uses — and not something interleaved into coding order.
+///
+/// Every coding unit the writer emits is one 16×16 intra `PART_2Nx2N` block
+/// with an unsplit transform tree, coded at `SliceQpY`, so the descriptors are
+/// exactly the ones [`deblock_descriptors`] builds. Because every unit is
+/// intra, the §8.7.2.4 boundary strength is 2 at every filtered edge and the
+/// `has_nonzero_coeff` / motion fields of the [`MotionField`] are never read —
+/// its all-intra default is the whole of what this picture's field says.
+pub(crate) fn deblock_reconstruction(recon: &mut ReconstructedPicture, qp: i32) {
+    let (width, height) = (recon.width, recon.height);
+    let mut pic = Picture::new(width, height, CHROMA_ARRAY_TYPE, BIT_DEPTH, BIT_DEPTH);
+    for (plane, samples) in [
+        (Plane::Luma, &recon.y),
+        (Plane::Cb, &recon.cb),
+        (Plane::Cr, &recon.cr),
+    ] {
+        let (buf, _) = pic.plane_mut(plane);
+        for (dst, &src) in buf.iter_mut().zip(samples) {
+            *dst = i32::from(src);
+        }
+    }
+    let field = MotionField::new(width, height);
+    let cus = deblock_descriptors(width, height, qp);
+    crate::hevc::engine::deblock::deblock_picture(&mut pic, &field, &cus);
+    recon.y = plane_to_u8(&pic, Plane::Luma);
+    recon.cb = plane_to_u8(&pic, Plane::Cb);
+    recon.cr = plane_to_u8(&pic, Plane::Cr);
+}
+
 /// The largest magnitude a `sao_offset_abs` can carry at 8-bit depth
-/// (§7.4.9.3: `(1 << (Min(bitDepth, 10) − 5)) − 1`).
-const SAO_OFFSET_MAX: i32 = 7;
+/// (§7.4.9.3: `(1 << (Min(bitDepth, 10) − 5)) − 1`), which is also the `cMax`
+/// of its Table 9-43 truncated-Rice binarization — `pub(crate)` so the writer
+/// codes against the same bound the search clamps to.
+pub(crate) const SAO_OFFSET_MAX: i32 = 7;
+
+/// §8.7.3 — estimate SAO parameters for a finished, already-deblocked
+/// reconstruction, apply them in place, and return the per-CTB grid the
+/// writer has to code as §7.3.8.3 syntax.
+///
+/// The counterpart of [`deblock_reconstruction`] for the second in-loop
+/// filter, and run after it: §8.7.1 orders SAO behind deblocking, and the
+/// parameter search is only meaningful against the samples SAO will actually
+/// see. Like deblocking it is a whole-picture pass, because §8.4.4.2.2 intra
+/// prediction reads the *unfiltered* neighbours — the grid returned here
+/// describes the picture's output, never this picture's own prediction input.
+///
+/// `lambda_q8` is passed through to [`estimate_sao`], which is what makes the
+/// per-CTB decision charge for the syntax the caller then writes.
+pub(crate) fn sao_reconstruction(
+    recon: &mut ReconstructedPicture,
+    src: SourcePlanes<'_>,
+    lambda_q8: u32,
+) -> Vec<ResolvedSao> {
+    let (width, height) = (recon.width, recon.height);
+    let mut pic = Picture::new(width, height, CHROMA_ARRAY_TYPE, BIT_DEPTH, BIT_DEPTH);
+    for (plane, samples) in [
+        (Plane::Luma, &recon.y),
+        (Plane::Cb, &recon.cb),
+        (Plane::Cr, &recon.cr),
+    ] {
+        let (buf, _) = pic.plane_mut(plane);
+        for (dst, &src) in buf.iter_mut().zip(samples) {
+            *dst = i32::from(src);
+        }
+    }
+    let grid = estimate_sao(&pic, src, true, true, lambda_q8);
+    let pic = crate::hevc::engine::sao::apply_sao_picture_full(
+        pic,
+        &grid,
+        CTB_LOG2,
+        CHROMA_ARRAY_TYPE,
+        true,
+        true,
+        None,
+        None,
+    );
+    recon.y = plane_to_u8(&pic, Plane::Luma);
+    recon.cb = plane_to_u8(&pic, Plane::Cb);
+    recon.cr = plane_to_u8(&pic, Plane::Cr);
+    grid
+}
 
 /// Encoder-side §7.3.8.3 SAO parameter estimation.
 ///
-/// For each CTB and each component this picks the edge-offset class whose
-/// per-category mean error between the source and the deblocked reconstruction
-/// reduces the sum of squared errors the most, and leaves SAO off for that CTB
-/// when no class does. The offsets are the per-category mean errors clamped to
-/// the signalable range with the §7.4.9.3 inferred edge-offset signs
-/// (categories 1 and 2 positive, 3 and 4 negative), which is the standard
-/// least-squares choice for edge offset and the reason this stage is worth
-/// measuring: it reads every reconstructed sample of the picture once per
-/// candidate class.
-fn estimate_sao(pic: &Picture, src: SourcePlanes<'_>, cfg: ReconConfig) -> Vec<ResolvedSao> {
+/// For each CTB this searches both §8.7.3.2 types against each other and
+/// against leaving SAO off, and takes whichever wins on `D + lambda * R`:
+///
+/// * the four **edge-offset** classes, whose offsets are the per-category mean
+///   errors between the source and the deblocked reconstruction, clamped to
+///   the signalable range with the §7.4.9.3 inferred signs (categories 1 and
+///   2 positive, 3 and 4 negative);
+/// * the 32 **band-offset** positions, whose four consecutive bands take their
+///   own per-band mean errors, clamped to the same magnitude but signalled
+///   with a `sao_offset_sign` each, so an offset may point either way.
+///
+/// Both are the least-squares choice for their type, which is the reason this
+/// stage is worth measuring: it reads every reconstructed sample of the
+/// picture once per candidate class, plus once more to bin the samples the 32
+/// band positions are all scored from.
+///
+/// The two types are compared under one score rather than a winner being
+/// picked per type first, because they do not cost the same: band offset pays
+/// four signs and five `sao_band_position` bins where edge offset pays two
+/// class bins, so a band candidate has to buy more error to be worth the same.
+///
+/// The two chroma components are decided *together*, on the summed gain of one
+/// shared type, because §7.4.9.3 infers `SaoTypeIdx[2]` and `SaoEoClass[2]`
+/// from cIdx 1: a Cb and a Cr that picked different types, or different edge
+/// classes, are not a bitstream. Each still carries its own four offsets and,
+/// under band offset, its own `sao_band_position` — no position is inferred —
+/// which is the whole of what the syntax gives cIdx 2 of its own.
+///
+/// `lambda_q8` is the §9 rate-distortion multiplier in 1/256 units, matching
+/// [`crate::hevc::engine::encoder::rdo::lambda_q8`]. SAO costs per-CTB syntax
+/// on every CTB it is enabled for, so a candidate is taken only when its SSE
+/// reduction clears `lambda * bins`, the bins being the §9.3.3 binarization's
+/// own count for the parameters that would be coded. At `lambda_q8 == 0` the
+/// test degrades to "any reduction at all", which is what a caller that codes
+/// no syntax for the decision wants.
+fn estimate_sao(
+    pic: &Picture,
+    src: SourcePlanes<'_>,
+    sao_luma: bool,
+    sao_chroma: bool,
+    lambda_q8: u32,
+) -> Vec<ResolvedSao> {
     let w_ctbs = src.width.div_ceil(CTB);
     let h_ctbs = src.height.div_ceil(CTB);
     let mut grid = vec![ResolvedSao::off(); w_ctbs * h_ctbs];
-    let components: [(Plane, &[u8], bool); 3] = [
-        (Plane::Luma, src.y, cfg.sao_luma),
-        (Plane::Cb, src.cb, cfg.sao_chroma),
-        (Plane::Cr, src.cr, cfg.sao_chroma),
-    ];
-    for (c_idx, (plane, source, enabled)) in components.into_iter().enumerate() {
-        if !enabled {
-            continue;
-        }
-        let (pw, ph) = pic.plane_dims(plane);
-        let step = if plane == Plane::Luma { CTB } else { CTB / 2 };
-        for ry in 0..h_ctbs {
-            for rx in 0..w_ctbs {
-                let (x0, y0) = (rx * step, ry * step);
-                let (x1, y1) = ((x0 + step).min(pw), (y0 + step).min(ph));
-                grid[ry * w_ctbs + rx].components[c_idx] =
-                    best_edge_offset(pic, plane, source, pw, x0, y0, x1, y1);
+    for ry in 0..h_ctbs {
+        for rx in 0..w_ctbs {
+            let cell = &mut grid[ry * w_ctbs + rx];
+            if sao_luma {
+                cell.components[0] = best_luma_sao(pic, src, rx, ry, lambda_q8);
+            }
+            if sao_chroma {
+                let [cb, cr] = best_chroma_sao(pic, src, rx, ry, lambda_q8);
+                cell.components[1] = cb;
+                cell.components[2] = cr;
             }
         }
     }
     grid
 }
 
-/// The best §8.7.3.2 edge-offset component for one CTB of one plane, or an
-/// off component when none of the four classes reduces the distortion.
-#[allow(clippy::too_many_arguments)]
-fn best_edge_offset(
+/// The CTB at `(rx, ry)` as a half-open rectangle in one plane's own sample
+/// grid, clipped to the plane.
+fn ctb_rect(pic: &Picture, plane: Plane, rx: usize, ry: usize) -> (usize, usize, usize, usize) {
+    let (pw, ph) = pic.plane_dims(plane);
+    let step = if plane == Plane::Luma { CTB } else { CTB / 2 };
+    let (x0, y0) = (rx * step, ry * step);
+    (x0, y0, (x0 + step).min(pw), (y0 + step).min(ph))
+}
+
+/// The §9.3.3 bin count of the four `sao_offset_abs` values of one component —
+/// Table 9-43 TR with `cMax == 7` and `cRiceParam == 0`, i.e. truncated unary.
+fn offset_abs_bins(offsets: &[i32; 5]) -> u64 {
+    offsets[1..5]
+        .iter()
+        .map(|&o| {
+            let v = u64::from(o.unsigned_abs()).min(SAO_OFFSET_MAX as u64);
+            if v < SAO_OFFSET_MAX as u64 { v + 1 } else { v }
+        })
+        .sum()
+}
+/// The `D + lambda * R` score of one SAO candidate: the SSE reduction it buys
+/// less the §7.3.8.3 syntax it has to be signalled with, in the same units
+/// and under the same lambda the mode decision uses.
+///
+/// Positive means the candidate is worth coding at all; the largest score
+/// wins, which is what lets edge offset and band offset be compared against
+/// each other and against "off" in one decision rather than two.
+fn rd_score(gain: i64, bins: u64, lambda_q8: u32) -> i64 {
+    gain - (bins * u64::from(lambda_q8) / 256) as i64
+}
+
+/// The widest the slice-level SAO decision's calibrated multiplier is allowed
+/// to depart from `lambda_q8`, as a factor either way. It bounds how far a
+/// two-point measurement of one picture is trusted over the closed form —
+/// and, because it is a bound known before the measurement is taken, it is
+/// also what lets `keeps_sao` skip the measurement whenever the decision is
+/// already outside the band, and what [`band_offset_bins`] charges band
+/// offset's own syntax at.
+pub(super) const SAO_LAMBDA_BAND: u64 = 4;
+
+/// What band offset's own syntax — the five `sao_band_position` bins and its
+/// `sao_offset_sign` bins — is charged per bin, as a multiple of `lambda_q8`,
+/// numerator over denominator. It is the coarse end of the departure the
+/// slice-level decision measured between the closed form and what a picture's
+/// own curve pays per bit: 0.4x to 2.5x, in neither direction consistently.
+const BAND_SYNTAX_CHARGE_NUM: u64 = 5;
+const BAND_SYNTAX_CHARGE_DEN: u64 = 2;
+
+/// The §7.3.8.3 bins one band-offset component costs beyond its shared
+/// `sao_type_idx` bin: a `sao_offset_sign` for every nonzero offset, the five
+/// fixed-length `sao_band_position` bins, and the offsets' own truncated-Rice
+/// bins.
+///
+/// This is what makes band offset a different bet from edge offset at the
+/// same gain: it pays five position bins and up to four sign bins where edge
+/// offset pays two class bins and infers its signs.
+///
+/// Those band-only bins — the position and the signs — are charged at
+/// [`BAND_SYNTAX_CHARGE_NUM`]/[`BAND_SYNTAX_CHARGE_DEN`] times `lambda_q8`
+/// rather than at `lambda_q8` itself. The closed form is derived for choosing
+/// between two codings of one block; edge offset's rate is the part of that
+/// trade the sweep has always been measured on, while these bins are rate the
+/// closed form has never been checked against, and the slice-level decision
+/// measured the closed form missing what a picture's own curve pays per bit
+/// by up to 2.5x. Charging them at that coarse end means band offset is taken
+/// where it wins by more than the uncertainty in its own price and left alone
+/// where it wins by less — which at coarse QPs is the difference between a
+/// slice that sits on the writer's own rate-distortion curve and one that
+/// sits a hair under it, and at [`SAO_LAMBDA_BAND`], the trust bound rather
+/// than the measured end, would be the difference between band offset paying
+/// at QP 12 and never being selected at all.
+fn band_offset_bins(offsets: &[i32; 5]) -> u64 {
+    let signs = offsets[1..5].iter().filter(|&&o| o != 0).count() as u64;
+    (BAND_SYNTAX_CHARGE_NUM * (5 + signs)).div_ceil(BAND_SYNTAX_CHARGE_DEN)
+        + offset_abs_bins(offsets)
+}
+
+/// The per-band summed and counted error of one CTB of one plane, indexed by
+/// the §8.7.3.2 band index `sample >> (bitDepth − 5)`.
+///
+/// Gathered once per CTB and reused by all 32 candidate band positions, since
+/// a position only selects which four of these 32 bands are offset.
+fn band_stats(
     pic: &Picture,
     plane: Plane,
     source: &[u8],
     src_stride: usize,
-    x0: usize,
-    y0: usize,
-    x1: usize,
-    y1: usize,
-) -> ResolvedSaoComponent {
-    let (pw, ph) = pic.plane_dims(plane);
+    rect: (usize, usize, usize, usize),
+) -> ([i64; 32], [i64; 32]) {
+    let (x0, y0, x1, y1) = rect;
+    let (pw, _) = pic.plane_dims(plane);
     let samples = pic.plane(plane);
+    // The kernel's band shift is fixed to this module's 8-bit geometry.
+    debug_assert_eq!(BIT_DEPTH, 8, "band classification assumes 8-bit samples");
+    let mut stats = BandStats::default();
+    for y in y0..y1 {
+        let recon = &samples[y * pw + x0..y * pw + x1];
+        let src = &source[y * src_stride + x0..y * src_stride + x1];
+        recon_simd::band_offset_row(recon, src, &mut stats);
+    }
+    (stats.sums, stats.counts)
+}
+
+/// The §7.4.9.3 offsets the four consecutive bands starting at
+/// `band_position` would take, and the SSE reduction they buy.
+///
+/// Unlike edge offset, whose signs §7.4.9.3 infers from the category, band
+/// offset codes a `sao_offset_sign` per nonzero offset — so the offset is the
+/// band's mean error in whichever direction it points, clamped only to the
+/// signalable magnitude.
+fn band_offsets(sums: &[i64; 32], counts: &[i64; 32], band_position: u8) -> (i64, [i32; 5]) {
+    let mut offsets = [0i32; 5];
+    let mut gain = 0i64;
+    for k in 0..4usize {
+        // §8.7.3.2 equation 8-414: the four bands wrap the 32-band range.
+        let band = (usize::from(band_position) + k) & 31;
+        if counts[band] == 0 {
+            continue;
+        }
+        let offset = div_round(sums[band], counts[band]).clamp(-SAO_OFFSET_MAX, SAO_OFFSET_MAX);
+        offsets[k + 1] = offset;
+        // The SSE reduction of adding a constant `o` to `n` samples whose
+        // summed error is `s`: 2*o*s − n*o^2.
+        gain += 2 * i64::from(offset) * sums[band]
+            - counts[band] * i64::from(offset) * i64::from(offset);
+    }
+    (gain, offsets)
+}
+
+/// The best SAO component for the luma of one CTB, or an off component when
+/// nothing earns the syntax it would be coded with.
+///
+/// The four §8.7.3.2 edge-offset classes and the 32 band positions are scored
+/// against each other under one [`rd_score`], so the type is chosen by what it
+/// buys net of what it costs rather than by picking a winner per type first.
+fn best_luma_sao(
+    pic: &Picture,
+    src: SourcePlanes<'_>,
+    rx: usize,
+    ry: usize,
+    lambda_q8: u32,
+) -> ResolvedSaoComponent {
+    let rect = ctb_rect(pic, Plane::Luma, rx, ry);
     let mut best = ResolvedSaoComponent::off();
-    let mut best_gain = 0i64;
+    let mut best_score = 0i64;
     for eo_class in 0..4u8 {
-        let (h0, v0, h1, v1) = crate::hevc::engine::sao::eo_pos(eo_class);
-        // Per §8.7.3.2 category (1..4), the summed and counted error.
-        let mut sums = [0i64; 5];
-        let mut counts = [0i64; 5];
-        for y in y0..y1 {
-            for x in x0..x1 {
-                let Some(category) = edge_category(samples, pw, ph, x, y, h0, v0, h1, v1) else {
-                    continue;
-                };
-                let error = i64::from(source[y * src_stride + x]) - i64::from(samples[y * pw + x]);
-                sums[category] += error;
-                counts[category] += 1;
-            }
-        }
-        let mut offsets = [0i32; 5];
-        let mut gain = 0i64;
-        for category in 1..5 {
-            if counts[category] == 0 {
-                continue;
-            }
-            let mean = div_round(sums[category], counts[category]);
-            // §7.4.9.3 infers the sign per category, so a mean that points the
-            // other way is not signalable and the offset stays 0.
-            let offset = if category <= 2 {
-                mean.clamp(0, SAO_OFFSET_MAX)
-            } else {
-                mean.clamp(-SAO_OFFSET_MAX, 0)
-            };
-            offsets[category] = offset;
-            // The SSE reduction of adding a constant `o` to `n` samples whose
-            // summed error is `s`: 2*o*s − n*o^2.
-            gain += 2 * i64::from(offset) * sums[category]
-                - counts[category] * i64::from(offset) * i64::from(offset);
-        }
-        if gain > best_gain {
-            best_gain = gain;
+        let (gain, offsets) = class_offsets(pic, Plane::Luma, src.y, src.width, rect, eo_class);
+        // One `sao_type_idx_luma` bin beyond the "off" bin, two
+        // `sao_eo_class_luma` bins, and the offsets' own.
+        let score = rd_score(gain, 1 + 2 + offset_abs_bins(&offsets), lambda_q8);
+        if score > best_score {
+            best_score = score;
             best = ResolvedSaoComponent {
                 sao_type_idx: 2,
                 offset_val: offsets,
@@ -606,42 +864,191 @@ fn best_edge_offset(
             };
         }
     }
+    let (sums, counts) = band_stats(pic, Plane::Luma, src.y, src.width, rect);
+    for band_position in 0..32u8 {
+        let (gain, offsets) = band_offsets(&sums, &counts, band_position);
+        // One `sao_type_idx_luma` bin beyond the "off" bin, then the band
+        // path's own signs, position and offsets.
+        let score = rd_score(gain, 1 + band_offset_bins(&offsets), lambda_q8);
+        if score > best_score {
+            best_score = score;
+            best = ResolvedSaoComponent {
+                sao_type_idx: 1,
+                offset_val: offsets,
+                band_position,
+                eo_class: 0,
+            };
+        }
+    }
     best
 }
 
-/// §8.7.3.2 `edgeIdx` remapped to the `SaoOffsetVal` category index
-/// (1..4), or `None` for category 0 (no offset) and for samples whose
-/// neighbours leave the plane.
-#[allow(clippy::too_many_arguments)]
-fn edge_category(
-    samples: &[i32],
-    pw: usize,
-    ph: usize,
-    x: usize,
-    y: usize,
-    h0: i32,
-    v0: i32,
-    h1: i32,
-    v1: i32,
-) -> Option<usize> {
-    let at = |dx: i32, dy: i32| -> Option<i32> {
-        let nx = x as i32 + dx;
-        let ny = y as i32 + dy;
-        (nx >= 0 && ny >= 0 && (nx as usize) < pw && (ny as usize) < ph)
-            .then(|| samples[ny as usize * pw + nx as usize])
-    };
-    let here = samples[y * pw + x];
-    let a = at(h0, v0)?;
-    let b = at(h1, v1)?;
-    let edge_idx = 2 + (here - a).signum() + (here - b).signum();
-    // §8.7.3.2: edgeIdx 0/1/2/3/4 maps to categories 1, 2, 0, 3, 4.
-    match edge_idx {
-        0 => Some(1),
-        1 => Some(2),
-        3 => Some(3),
-        4 => Some(4),
-        _ => None,
+/// The best SAO components for the Cb and Cr of one CTB, sharing the one type
+/// the §7.4.9.3 inference leaves them.
+///
+/// `SaoTypeIdx[2]` and `SaoEoClass[2]` are inferred from cIdx 1, so the two
+/// components are decided together on the summed gain of one shared type —
+/// and, for edge offset, one shared class. Band offset infers no position, so
+/// each component still picks the four bands that suit it, exactly as each
+/// picks its own four offsets.
+fn best_chroma_sao(
+    pic: &Picture,
+    src: SourcePlanes<'_>,
+    rx: usize,
+    ry: usize,
+    lambda_q8: u32,
+) -> [ResolvedSaoComponent; 2] {
+    let (cb_rect, cr_rect) = (
+        ctb_rect(pic, Plane::Cb, rx, ry),
+        ctb_rect(pic, Plane::Cr, rx, ry),
+    );
+    let chroma_stride = src.width / 2;
+    let mut best = [ResolvedSaoComponent::off(); 2];
+    let mut best_score = 0i64;
+    for eo_class in 0..4u8 {
+        let (cb_gain, cb_offsets) =
+            class_offsets(pic, Plane::Cb, src.cb, chroma_stride, cb_rect, eo_class);
+        let (cr_gain, cr_offsets) =
+            class_offsets(pic, Plane::Cr, src.cr, chroma_stride, cr_rect, eo_class);
+        // One `sao_type_idx_chroma` bin beyond the "off" bin, two
+        // `sao_eo_class_chroma` bins, and both components' offsets — cIdx 2
+        // codes neither a type nor a class of its own.
+        let bins = 1 + 2 + offset_abs_bins(&cb_offsets) + offset_abs_bins(&cr_offsets);
+        let score = rd_score(cb_gain + cr_gain, bins, lambda_q8);
+        if score > best_score {
+            best_score = score;
+            best = [
+                ResolvedSaoComponent {
+                    sao_type_idx: 2,
+                    offset_val: cb_offsets,
+                    band_position: 0,
+                    eo_class,
+                },
+                ResolvedSaoComponent {
+                    sao_type_idx: 2,
+                    offset_val: cr_offsets,
+                    band_position: 0,
+                    eo_class,
+                },
+            ];
+        }
     }
+    let cb = best_band_component(pic, Plane::Cb, src.cb, chroma_stride, cb_rect, lambda_q8);
+    let cr = best_band_component(pic, Plane::Cr, src.cr, chroma_stride, cr_rect, lambda_q8);
+    // The shared `sao_type_idx_chroma` bin is paid once for the pair.
+    let bins = 1 + band_offset_bins(&cb.1) + band_offset_bins(&cr.1);
+    let score = rd_score(cb.0 + cr.0, bins, lambda_q8);
+    if score > best_score {
+        best = [
+            ResolvedSaoComponent {
+                sao_type_idx: 1,
+                offset_val: cb.1,
+                band_position: cb.2,
+                eo_class: 0,
+            },
+            ResolvedSaoComponent {
+                sao_type_idx: 1,
+                offset_val: cr.1,
+                band_position: cr.2,
+                eo_class: 0,
+            },
+        ];
+    }
+    best
+}
+
+/// The band position of one chroma component that scores best on its own
+/// share of the band path's rate, with the gain and offsets it buys.
+///
+/// The pair's shared `sao_type_idx_chroma` bin is not charged here, because it
+/// is paid once for both components by the caller.
+fn best_band_component(
+    pic: &Picture,
+    plane: Plane,
+    source: &[u8],
+    src_stride: usize,
+    rect: (usize, usize, usize, usize),
+    lambda_q8: u32,
+) -> (i64, [i32; 5], u8) {
+    let (sums, counts) = band_stats(pic, plane, source, src_stride, rect);
+    let mut best = (0i64, [0i32; 5], 0u8);
+    let mut best_score = i64::MIN;
+    for band_position in 0..32u8 {
+        let (gain, offsets) = band_offsets(&sums, &counts, band_position);
+        let score = rd_score(gain, band_offset_bins(&offsets), lambda_q8);
+        if score > best_score {
+            best_score = score;
+            best = (gain, offsets, band_position);
+        }
+    }
+    best
+}
+
+/// The §7.4.9.3 offsets one edge-offset class would take on one CTB of one
+/// plane, and the SSE reduction they buy.
+fn class_offsets(
+    pic: &Picture,
+    plane: Plane,
+    source: &[u8],
+    src_stride: usize,
+    rect: (usize, usize, usize, usize),
+    eo_class: u8,
+) -> (i64, [i32; 5]) {
+    let (x0, y0, x1, y1) = rect;
+    let (pw, ph) = pic.plane_dims(plane);
+    let samples = pic.plane(plane);
+    let (h0, v0, h1, v1) = crate::hevc::engine::sao::eo_pos(eo_class);
+    // Per §8.7.3.2 category (1..4), the summed and counted error. The
+    // neighbour bounds test is hoisted out of the sample loop and turned into
+    // a row range: a sample is classifiable exactly when both of its
+    // neighbours are inside the plane, and for a fixed class that is a
+    // whole-row condition vertically and a contiguous run horizontally.
+    // Everything left in the run is a straight-line accumulation the vector
+    // kernel can take whole.
+    let mut stats = EdgeStats::default();
+    for y in y0..y1 {
+        let (ay, by) = (y as i32 + v0, y as i32 + v1);
+        if ay < 0 || by < 0 || ay >= ph as i32 || by >= ph as i32 {
+            continue;
+        }
+        let lo = (x0 as i32).max(-h0).max(-h1);
+        let hi = (x1 as i32).min(pw as i32 - h0).min(pw as i32 - h1);
+        if hi <= lo {
+            continue;
+        }
+        let (lo, run) = (lo as usize, (hi - lo) as usize);
+        let a_start = (ay as usize) * pw + (lo as i32 + h0) as usize;
+        let b_start = (by as usize) * pw + (lo as i32 + h1) as usize;
+        recon_simd::edge_offset_row(
+            &samples[y * pw + lo..y * pw + lo + run],
+            &samples[a_start..a_start + run],
+            &samples[b_start..b_start + run],
+            &source[y * src_stride + lo..y * src_stride + lo + run],
+            &mut stats,
+        );
+    }
+    let (sums, counts) = (stats.sums, stats.counts);
+    let mut offsets = [0i32; 5];
+    let mut gain = 0i64;
+    for category in 1..5 {
+        if counts[category] == 0 {
+            continue;
+        }
+        let mean = div_round(sums[category], counts[category]);
+        // §7.4.9.3 infers the sign per category, so a mean that points the
+        // other way is not signalable and the offset stays 0.
+        let offset = if category <= 2 {
+            mean.clamp(0, SAO_OFFSET_MAX)
+        } else {
+            mean.clamp(-SAO_OFFSET_MAX, 0)
+        };
+        offsets[category] = offset;
+        // The SSE reduction of adding a constant `o` to `n` samples whose
+        // summed error is `s`: 2*o*s − n*o^2.
+        gain += 2 * i64::from(offset) * sums[category]
+            - counts[category] * i64::from(offset) * i64::from(offset);
+    }
+    (gain, offsets)
 }
 
 /// Round-half-away-from-zero integer division.
@@ -667,7 +1074,9 @@ fn plane_to_u8(pic: &Picture, plane: Plane) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hevc::engine::encoder::rdo::{DecisionConfig, decide_picture};
+    use crate::hevc::engine::encoder::rdo::{
+        BlockDecision, DecisionConfig, PartitionDecision, decide_picture,
+    };
 
     const W: usize = 64;
     const H: usize = 32;
@@ -722,6 +1131,60 @@ mod tests {
                 (d * d) as u64
             })
             .sum()
+    }
+
+    #[test]
+    fn the_search_takes_band_offset_where_the_bias_is_a_value_range() {
+        // The case §8.7.3.2 edge offset cannot reach: two flat regions, one of
+        // which the "quantizer" biased 3 low. Every interior sample of a flat
+        // region is edge category 0, so no edge class has anything to offset —
+        // but every one of those samples sits in the same value band, which is
+        // precisely what band offset selects on.
+        let mut pic = Picture::new(W, H, CHROMA_ARRAY_TYPE, BIT_DEPTH, BIT_DEPTH);
+        let (buf, _) = pic.plane_mut(Plane::Luma);
+        for row in 0..H {
+            for col in 0..W {
+                buf[row * W + col] = if col < W / 2 { 100 } else { 200 };
+            }
+        }
+        for plane in [Plane::Cb, Plane::Cr] {
+            let (buf, _) = pic.plane_mut(plane);
+            buf.fill(128);
+        }
+        let y: Vec<u8> = (0..W * H)
+            .map(|i| if i % W < W / 2 { 103 } else { 200 })
+            .collect();
+        let chroma = vec![128u8; (W / 2) * (H / 2)];
+        let src = SourcePlanes {
+            y: &y,
+            cb: &chroma,
+            cr: &chroma,
+            width: W,
+            height: H,
+        };
+
+        let grid = estimate_sao(&pic, src, true, true, 32);
+        // The first CTB lies wholly inside the biased region.
+        let luma = grid[0].components[0];
+        assert_eq!(
+            luma.sao_type_idx, 1,
+            "the search picked type {} where only band offset can reach the error",
+            luma.sao_type_idx
+        );
+        // Band 12 is where sample 100 lives at 8-bit depth (100 >> 3), and the
+        // four signalled bands wrap the 32-band range from `band_position`.
+        let position = usize::from(luma.band_position);
+        let k = (12 + 32 - position) % 32;
+        assert!(
+            k < 4,
+            "band 12 is outside the four bands at position {position}"
+        );
+        assert_eq!(
+            luma.offset_val[k + 1],
+            3,
+            "the band carrying the bias was offset by {} rather than its mean error",
+            luma.offset_val[k + 1]
+        );
     }
 
     #[test]
@@ -795,6 +1258,154 @@ mod tests {
         );
         assert_eq!(filtered.y.len(), src.0.len());
         assert_eq!(filtered.cb.len(), src.1.len());
+    }
+
+    #[test]
+    fn the_whole_reconstruction_is_identical_on_every_instruction_set() {
+        // The §8.6.6 loop and the SAO parameter search both dispatch through
+        // `hevc_recon`, so pinning each available instruction set in turn has
+        // to leave the reconstructed picture — and the SAO decisions that
+        // shaped it — bit for bit the same.
+        let _guard = crate::simd::test_lock();
+        let cfg = ReconConfig {
+            deblocking: true,
+            sao_luma: true,
+            sao_chroma: true,
+            pcm_loop_filter_disabled: false,
+            ..ReconConfig::default()
+        };
+        let src = source(0);
+        let next = source(3);
+        crate::simd::set_override(Some(crate::simd::SimdIsa::Scalar));
+        let reference = reconstruct_picture(planes(&src), None, &plan(&src, None), cfg);
+        let expected_inter = reconstruct_picture(
+            planes(&next),
+            Some(&reference),
+            &plan(&next, Some(&reference.y)),
+            cfg,
+        );
+        for isa in crate::simd::available() {
+            crate::simd::set_override(Some(isa));
+            let intra = reconstruct_picture(planes(&src), None, &plan(&src, None), cfg);
+            assert_eq!(intra, reference, "{} intra reconstruction", isa.name());
+            let inter = reconstruct_picture(
+                planes(&next),
+                Some(&reference),
+                &plan(&next, Some(&reference.y)),
+                cfg,
+            );
+            assert_eq!(inter, expected_inter, "{} inter reconstruction", isa.name());
+        }
+        crate::simd::set_override(None);
+    }
+
+    #[test]
+    fn the_quantized_reconstruction_is_identical_on_every_instruction_set_at_every_qp() {
+        // The lossy writer's §8.6.6 add-and-clip dispatches through
+        // `hevc_recon` too, over `i32` operands rather than the byte runs the
+        // exact-residual path carries. Every QP the round-trip tests cover has
+        // to reconstruct byte for byte the same on every instruction set, both
+        // intra and predicting from a lossy reference.
+        let _guard = crate::simd::test_lock();
+        let src = source(0);
+        let next = source(3);
+        for qp in [12i32, 20, 26, 34, 37, 47, 51] {
+            let cfg = ReconConfig {
+                deblocking: true,
+                sao_luma: true,
+                sao_chroma: true,
+                pcm_loop_filter_disabled: false,
+                quantized_residual: true,
+                qp,
+            };
+            crate::simd::set_override(Some(crate::simd::SimdIsa::Scalar));
+            let reference = reconstruct_picture(planes(&src), None, &plan(&src, None), cfg);
+            let expected_inter = reconstruct_picture(
+                planes(&next),
+                Some(&reference),
+                &plan(&next, Some(&reference.y)),
+                cfg,
+            );
+            for isa in crate::simd::available() {
+                crate::simd::set_override(Some(isa));
+                let intra = reconstruct_picture(planes(&src), None, &plan(&src, None), cfg);
+                assert_eq!(intra, reference, "{} intra at qp {qp}", isa.name());
+                let inter = reconstruct_picture(
+                    planes(&next),
+                    Some(&reference),
+                    &plan(&next, Some(&reference.y)),
+                    cfg,
+                );
+                assert_eq!(inter, expected_inter, "{} inter at qp {qp}", isa.name());
+            }
+        }
+        crate::simd::set_override(None);
+    }
+
+    #[test]
+    fn an_asymmetric_partitions_chroma_half_reconstructs_inside_the_plane() {
+        // §7.3.8.8 transform blocks bottom out at 4x4, but the 4:2:0 chroma
+        // half of the 16x4 and 16x12 asymmetric partitions the mode search can
+        // pick measures 8x2 and 8x6 — neither a whole number of 4x4 blocks.
+        // The residual coding has to clip its last block to the partition
+        // instead of running off the end of the plane.
+        let src = source(0);
+        let (width, height) = (W, H);
+        let partition = |x, y, w, h| PartitionDecision {
+            x,
+            y,
+            w,
+            h,
+            mv_x: 0,
+            mv_y: 0,
+            sad: 0,
+            satd: 0,
+            bit_cost: 0,
+            rd_cost: 0,
+        };
+        let mut blocks = Vec::new();
+        for y0 in (0..height).step_by(CTB) {
+            for x0 in (0..width).step_by(CTB) {
+                blocks.push(BlockDecision {
+                    x: x0,
+                    y: y0,
+                    size: CTB,
+                    // 16x4 over 16x12, so both the two-sample-tall chroma half
+                    // and the six-sample-tall one are coded.
+                    partitions: vec![
+                        partition(x0, y0, CTB, 4),
+                        partition(x0, y0 + 4, CTB, CTB - 4),
+                    ],
+                    rd_cost: 0,
+                    pcm_cost: u64::MAX,
+                });
+            }
+        }
+        let decision = PictureDecision {
+            blocks,
+            rd_cost: 0,
+            pcm_blocks: 0,
+        };
+        let cfg = ReconConfig {
+            quantized_residual: true,
+            qp: 32,
+            ..ReconConfig::default()
+        };
+        let _guard = crate::simd::test_lock();
+        crate::simd::set_override(Some(crate::simd::SimdIsa::Scalar));
+        let expected = reconstruct_picture(planes(&src), None, &decision, cfg);
+        assert_eq!(expected.y.len(), src.0.len());
+        assert_eq!(expected.cb.len(), src.1.len());
+        assert_eq!(expected.cr.len(), src.2.len());
+        // The clipped blocks go through the same vector kernel as the whole
+        // ones, over a partial run, so they are pinned across instruction sets
+        // too.
+        for isa in crate::simd::available() {
+            crate::simd::set_override(Some(isa));
+            let lossy = reconstruct_picture(planes(&src), None, &decision, cfg);
+            assert_eq!(lossy, expected, "{}", isa.name());
+        }
+        crate::simd::set_override(None);
     }
 
     #[test]

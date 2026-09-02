@@ -40,8 +40,8 @@ const BENCH_PREDICTOR: i32 = 128;
 
 /// Runs the encoder's mode-search / RDO stage over one luma picture.
 ///
-/// This is the stage that reaches `hevc_rdcost`, the crate's only
-/// encoder-side SIMD dispatch family, through its SAD and SATD distortion
+/// This is the stage that reaches `hevc_rdcost`, one of the crate's three
+/// encoder-side SIMD dispatch families, through its SAD and SATD distortion
 /// metrics.
 ///
 /// `reference_y`, when present, enables the coarse whole-pel inter search;
@@ -145,6 +145,39 @@ pub fn cabac_encode_bins(bins: &[u8], contexts: usize) -> Vec<u8> {
         } else {
             cabac.encode_bypass(&mut writer, bin & 1);
         }
+    }
+    cabac.encode_terminate(&mut writer, 1);
+    writer.finish()
+}
+
+/// Drives the §9.3.5 CABAC arithmetic encoder over *runs* of bypass bins,
+/// the shape the lossy residual writer's bins actually have.
+///
+/// `cabac_encode_bins` above interleaves single bypass bins with
+/// context-coded ones, so it cannot see a run-at-a-time bypass step at all.
+/// This one is the complementary workload: each `(value, n)` pair is one
+/// contiguous `n`-bin bypass field of the kind `coeff_sign_flag`, the
+/// Golomb-Rice suffix of `coeff_abs_level_remaining` and the
+/// `last_sig_coeff_*` suffixes emit, coded through
+/// `CabacEncoder::encode_bypass_bits`. The returned bytes are the
+/// arithmetic codeword, so the bit writer the runs go through is measured
+/// with them.
+///
+/// See `benches/README.md`'s "Why the CABAC arithmetic encoder stays serial"
+/// for what this group was added to settle: the §9.3.5.5 step unrolled over a
+/// whole run is an exact identity, but it is not a speedup with the present
+/// `put_bit`-at-a-time sink.
+///
+/// # Panics
+///
+/// Panics if any run is wider than 32 bins.
+#[must_use]
+pub fn cabac_encode_bypass_runs(runs: &[(u32, u8)]) -> Vec<u8> {
+    let mut writer = BitWriter::new();
+    let mut cabac = CabacEncoder::new();
+    for &(value, n) in runs {
+        assert!(n <= 32, "a bypass run is at most one u32 wide");
+        cabac.encode_bypass_bits(&mut writer, value, n);
     }
     cabac.encode_terminate(&mut writer, 1);
     writer.finish()

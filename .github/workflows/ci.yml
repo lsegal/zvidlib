@@ -41,13 +41,15 @@ jobs:
       # every one of them is reachable from a [[bench]] target.
       - name: Check every bench source is compiled
         run: cargo test --features native --test bench_sources_compile
-      # `criterion_baseline.py` renders the committed table in
-      # `benches/README.md`, and its failure mode is a plausible table with a
-      # column silently missing rather than a crash - the arm name it matched
-      # drifted from the one `SimdIsa` prints and every SSE4.1 measurement was
-      # dropped. Nothing else in CI executes this script's `table` path.
+      # `criterion_baseline.py` is where a benchmark regression threshold is
+      # justified from, and it runs in a job that takes two hours to reach it.
+      # Standard library only, so this needs no install step. Its `table`
+      # subcommand is covered here too: that path's failure mode is a plausible
+      # table with a column silently missing rather than a crash - the arm name
+      # it matched drifted from the one `SimdIsa` prints and every SSE4.1
+      # measurement was dropped - and nothing else in CI executes it.
       - name: Test the benchmark baseline script
-        run: python3 -m unittest discover -s .github/scripts -p 'test_*.py' -v
+        run: python3 -m unittest discover -s .github/scripts -v
       - name: Test AV1 SIMD kernels against the scalar path
         run: cargo test --features native --lib av1_simd -- --nocapture
       - name: Test library units
@@ -222,6 +224,14 @@ jobs:
         run: rustup show
       - name: Check native target
         run: cargo check --all-targets --features native
+      # The `cfg(windows)` half of the tree - `src/hevc/windows_mf.rs`, the
+      # Windows arm of `src/hevc/nvdec.rs`, and the `windows` crate feature
+      # list - only ever compiles here, so linting it anywhere else is
+      # impossible. Same `-D warnings` gate the Linux job uses, so a
+      # platform-specific warning fails the build rather than waiting for
+      # someone to build on that platform by hand.
+      - name: Lint native target
+        run: cargo clippy --all-targets --features native -- -D warnings
       - name: Test library units
         run: cargo test --features native --lib
       - name: Test accelerated HEVC selection and correctness

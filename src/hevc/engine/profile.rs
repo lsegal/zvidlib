@@ -27,6 +27,16 @@
 //! per scope stay small against the work they bracket. [`Report::overhead`]
 //! quantifies what is left.
 //!
+//! # Sub-stages
+//!
+//! Three variants — [`Stage::InterPred`], [`Stage::InterPredFilter`] and
+//! [`Stage::InterPredWrite`] — decompose one stage rather than naming three,
+//! because issue #280 found that the single `inter_pred` row this used to
+//! report was a third work no vector kernel touches. Exclusive attribution
+//! makes that decomposition free to read: the two inner scopes take their own
+//! time and [`Stage::InterPred`] keeps the remainder, so the three sum to what
+//! the one row used to say and each is separately actionable.
+//!
 //! # Threads and wasm
 //!
 //! State is thread-local, so a profile covers the decode work that happens on
@@ -61,8 +71,17 @@ pub enum Stage {
     InverseTransform = 3,
     /// §8.4.4.2 intra prediction, plus the §8.6.7 residual add and store.
     IntraPred = 4,
-    /// §8.5.3.3 inter prediction: interpolation and the weighted combine.
+    /// §8.5.3.3 inter prediction, *excluding* the two sub-stages below: the
+    /// §8.5.3.2 reference-plane setup and the per-prediction-unit allocation
+    /// that the interpolation and the write-back happen between.
     InterPred = 5,
+    /// §8.5.3.3.3 fractional-sample interpolation and the §8.5.3.3.4 weighted
+    /// combine — the part of inter prediction the `engine::simd` kernels are.
+    InterPredFilter = 11,
+    /// §8.4.4.1 `recSamples = Clip1( predSamples + resSamples )`: writing each
+    /// prediction unit's luma and chroma prediction, plus its residual, back
+    /// into the picture. Inside inter prediction, reached by no vector kernel.
+    InterPredWrite = 12,
     /// §8.5.3.2 motion-vector derivation: merge and AMVP candidate lists.
     MotionDerive = 10,
     /// §8.7.2 in-loop deblocking.
@@ -76,7 +95,7 @@ pub enum Stage {
 }
 
 /// Number of [`Stage`] variants — the width of every accumulator array here.
-pub const STAGE_COUNT: usize = 11;
+pub const STAGE_COUNT: usize = 13;
 
 /// Every [`Stage`], in declaration order, for reporting.
 pub const STAGES: [Stage; STAGE_COUNT] = [
@@ -86,6 +105,8 @@ pub const STAGES: [Stage; STAGE_COUNT] = [
     Stage::InverseTransform,
     Stage::IntraPred,
     Stage::InterPred,
+    Stage::InterPredFilter,
+    Stage::InterPredWrite,
     Stage::MotionDerive,
     Stage::Deblock,
     Stage::Sao,
@@ -103,7 +124,9 @@ impl Stage {
             Stage::Residual => "residual_cabac",
             Stage::InverseTransform => "inverse_transform",
             Stage::IntraPred => "intra_pred",
-            Stage::InterPred => "inter_pred",
+            Stage::InterPred => "inter_pred_setup",
+            Stage::InterPredFilter => "inter_pred_filter",
+            Stage::InterPredWrite => "inter_pred_write",
             Stage::MotionDerive => "motion_derive",
             Stage::Deblock => "deblock",
             Stage::Sao => "sao",
@@ -117,15 +140,23 @@ impl Stage {
     /// This is the classification the Amdahl ceiling in [`Report`] is computed
     /// from: the sum of the vectorized stages' shares is the only part of a
     /// decode any amount of SIMD can move.
+    ///
+    /// [`Stage::ColorConvert`] counts here as of issue #219, which gave the
+    /// output conversion a kernel of its own — it is not decoding, but it is
+    /// on the path of every whole-frame measurement, so it is part of what
+    /// SIMD moves in the number those groups report. It still contributes
+    /// nothing to [`Report::vectorized_decode_share`], whose denominator
+    /// excludes it.
     #[must_use]
     pub fn is_vectorized(self) -> bool {
         matches!(
             self,
             Stage::InverseTransform
                 | Stage::IntraPred
-                | Stage::InterPred
+                | Stage::InterPredFilter
                 | Stage::Deblock
                 | Stage::Sao
+                | Stage::ColorConvert
         )
     }
 }
@@ -551,5 +582,6 @@ mod tests {
         assert!((report.speedup_at(1.0) - 1.0).abs() < 1e-9);
         assert!(!Stage::Residual.is_vectorized());
         assert!(Stage::Sao.is_vectorized());
+        assert!(Stage::ColorConvert.is_vectorized());
     }
 }

@@ -24,16 +24,17 @@
 //!
 //! ## The SIMD axis, and where it is expected to read flat
 //!
-//! `hevc_rdcost` — the SAD and SATD distortion metrics the mode search calls —
-//! and `hevc_fwd_transform_quant` — the forward transform's butterfly and the
-//! quantization loop — are the encoder's two SIMD dispatch families. Bitstream
-//! writing, CABAC, and the RGBA-to-YUV420 conversion have no vector path, so
-//! their arms are expected to read the same under every instruction set. That
-//! is the measured result the issue asks for, not a broken benchmark: it says
-//! the next encoder-side vectorization target is entropy coding or color
-//! conversion, and it is why every group asserts through
-//! `simd::active_by_site()` that the override landed rather than inferring it
-//! from the clock.
+//! The encoder has four SIMD dispatch families of its own: `hevc_rdcost`, the
+//! SAD and SATD distortion metrics the mode search calls;
+//! `hevc_fwd_transform_quant`, the forward transform's butterfly and the
+//! quantization loop; `hevc_recon`, the §8.6.6 reconstruction loop and the
+//! encode-side §8.7.3 SAO parameter search; and `hevc_colorconv`, the RGBA8 to
+//! YUV420 input conversion. Bitstream writing and CABAC have no vector path,
+//! so their arms are expected to read the same under every instruction set.
+//! That is the measured result the issue asks for, not a broken benchmark: it
+//! says the next encoder-side vectorization target is entropy coding, and it
+//! is why every group asserts through `simd::active_by_site()` that the
+//! override landed rather than inferring it from the clock.
 //!
 //! `hevc_encode_cabac`'s flat arm is a settled question rather than an open
 //! one. The §9.3.5 arithmetic encoder is serial by construction, and
@@ -42,10 +43,11 @@
 //! formulation of it — including the 3.7x ceiling such a formulation would be
 //! chasing, and the two exact serial changes that take most of it instead.
 //!
-//! The one exception is the reconstruction group. It runs the decoder's own
-//! §8.7.2 deblocking and §8.7.3 SAO kernels over the encoder's reconstructed
-//! picture, and those *are* vectorized, so it is the one encoder-side group
-//! outside mode search that is expected to move with the instruction set.
+//! The exception is the reconstruction group. It runs `hevc_recon` over every
+//! partition and every CTB, and then the decoder's own vectorized §8.7.2
+//! deblocking and §8.7.3 SAO filter kernels over the result, so it is the one
+//! encoder-side group outside mode search that is expected to move with the
+//! instruction set.
 //!
 //! ## Stage coverage
 //!
@@ -108,9 +110,9 @@ fn report_stage_coverage(_: &mut Criterion) {
          # (with both an exact and a quantized residual), CABAC + bitwriting, whole-picture\n\
          # access-unit writing for both the lossless PCM writer and the lossy residual writer,\n\
          # and the RGBA8->YUV420 input conversion. No stage of the pipeline is absent.\n\
-         # hevc_encode: hevc_rdcost, hevc_fwd_transform_quant and hevc_colorconv are the\n\
-         # encoder's three SIMD dispatch families, so apart from the mode-search,\n\
-         # forward-transform, reconstruction (the last running the decoder's vectorized\n\
+         # hevc_encode: hevc_rdcost, hevc_recon, hevc_fwd_transform_quant and hevc_colorconv\n\
+         # are the encoder's four SIMD dispatch families, so apart from the mode-search,\n\
+         # forward-transform, reconstruction (the last also running the decoder's vectorized\n\
          # in-loop filter kernels) and RGBA8->YUV420 groups the arms are expected to read\n\
          # flat across instruction sets, which is the measured result, not a broken bench."
     );
@@ -273,10 +275,18 @@ fn zvidlib_rdo_defaults() -> (i32, i32) {
 ///
 /// The stage that makes the encoder predict from what a decoder will hold
 /// rather than from the source it was handed: every coded block is
-/// reconstructed (predict + add residual), then the §8.7.2 deblocking filter
-/// and §8.7.3 SAO run over the whole picture through the decoder's own
-/// kernels, which is why this is the one non-mode-search encoder group that
-/// can show an instruction-set delta.
+/// reconstructed (predict + add residual), then the §8.7.3 SAO parameters are
+/// searched and the §8.7.2 deblocking filter and §8.7.3 SAO run over the whole
+/// picture through the decoder's own kernels. The reconstruction loop and the
+/// SAO search dispatch through `hevc_recon` and the filters through
+/// `hevc_prediction_filters`, which is why this is the one non-mode-search
+/// encoder group that can show an instruction-set delta.
+///
+/// Two arms are measured over the same plan: `_reconstruct` codes the residual
+/// exactly, the way the PCM writer does, and `_reconstruct_quantized` round-trips
+/// it through the §8.6.4 forward transform and §8.6.3 quantizer the way the
+/// residual writer does. Only the latter exercises the coded add-and-clip that
+/// a real encode pays for.
 ///
 /// The mode-search plan the reconstruction consumes is built in setup, not in
 /// the timed loop — mode search costs an order of magnitude more than
@@ -300,14 +310,24 @@ fn reconstruct(criterion: &mut Criterion, size: (u32, u32), group_prefix: &str) 
         config.1,
     );
 
-    let name = format!("{group_prefix}_reconstruct");
-    let isa_workload = IsaWorkload::new(
-        &name,
-        FrameWork::new(1, u64::from(size.0), u64::from(size.1)),
-    );
-    bench_across_isas(criterion, &isa_workload, || {
-        encoder_bench::reconstruct_encoded_picture(&workload, true, true)
-    });
+    // Both residual paths run over the same planned picture. The exact one is
+    // the PCM writer's; the quantized one is the residual writer's, and it is
+    // the path a real encode takes, so it needs its own arm or its §8.6.6
+    // add-and-clip is never measured.
+    for quantized in [false, true] {
+        let name = if quantized {
+            format!("{group_prefix}_reconstruct_quantized")
+        } else {
+            format!("{group_prefix}_reconstruct")
+        };
+        let isa_workload = IsaWorkload::new(
+            &name,
+            FrameWork::new(1, u64::from(size.0), u64::from(size.1)),
+        );
+        bench_across_isas(criterion, &isa_workload, || {
+            encoder_bench::reconstruct_encoded_picture_quantized(&workload, true, true, quantized)
+        });
+    }
 }
 
 /// Whole-picture bitstream writing: parameter sets, slice header, and the
@@ -393,6 +413,10 @@ const CABAC_BINS: usize = 1 << 18;
 /// Distinct context models the bin sequence cycles through.
 const CABAC_CONTEXTS: usize = 64;
 
+/// Bypass bins per `hevc_encode_cabac_bypass` iteration, matched to
+/// [`CABAC_BINS`] so the two CABAC groups' `elem/s` lines compare directly.
+const CABAC_BYPASS_BINS: usize = CABAC_BINS;
+
 /// Syntax elements per bitwriter iteration.
 const BITWRITER_VALUES: usize = 1 << 16;
 
@@ -408,6 +432,19 @@ fn entropy_coding(criterion: &mut Criterion) {
     let values: Vec<u32> = (0..BITWRITER_VALUES)
         .map(|i| (i as u32).wrapping_mul(2_654_435_761) >> 11)
         .collect();
+    // Run lengths spread over 1..=16 — the residual writer's range, from a
+    // one-bin Rice suffix to a full 16-coefficient `coeff_sign_flag` pass —
+    // so the workload is not one degenerate width.
+    let mut runs: Vec<(u32, u8)> = Vec::new();
+    let mut coded = 0usize;
+    let mut state = 0x2545_F491u32;
+    while coded < CABAC_BYPASS_BINS {
+        state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+        let remaining = CABAC_BYPASS_BINS - coded;
+        let n = ((1 + (state >> 20) % 16) as usize).min(remaining) as u8;
+        runs.push((state & ((1u32 << n) - 1), n));
+        coded += n as usize;
+    }
 
     // These two workloads are bin and syntax-element streams, not pictures.
     // Counting bins and values as the elements makes criterion's `elem/s` line
@@ -420,6 +457,22 @@ fn entropy_coding(criterion: &mut Criterion) {
     };
     bench_across_isas(criterion, &cabac, || {
         encoder_bench::cabac_encode_bins(&bins, CABAC_CONTEXTS)
+    });
+
+    // The complementary CABAC workload: contiguous bypass *runs* rather than
+    // single bypass bins interleaved with context-coded ones. This is the
+    // shape 62% of the lossy residual writer's bins have, and the only
+    // shape the run-at-a-time §9.3.5.5 step can be seen in — which is why
+    // `hevc_encode_cabac` above is expected not to move with it.
+    let bypass_runs = IsaWorkload {
+        sample_size: 20,
+        ..IsaWorkload::new(
+            "hevc_encode_cabac_bypass",
+            FrameWork::new(CABAC_BYPASS_BINS as u64, 1, 1),
+        )
+    };
+    bench_across_isas(criterion, &bypass_runs, || {
+        encoder_bench::cabac_encode_bypass_runs(&runs)
     });
 
     let bitwriter = IsaWorkload {

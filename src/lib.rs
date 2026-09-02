@@ -67,6 +67,17 @@ pub use hevc::decode_bench as hevc_decoder_bench;
 #[doc(hidden)]
 pub use hevc::decode_profile as hevc_decode_profile;
 
+/// Decode-versus-readback attribution for the hardware HEVC backends.
+///
+/// Internal and unstable. A hardware backend maps its own surface and converts
+/// it to RGBA inside `submit`, so a caller sees the fixed-function decode and
+/// the host readback as one number; this splits them without exposing the
+/// platform surface itself. See `benches/hevc_hardware.rs` and the reasoning
+/// recorded in `benches/README.md`.
+#[cfg(not(target_arch = "wasm32"))]
+#[doc(hidden)]
+pub use hevc::readback as hevc_hardware_readback;
+
 #[cfg(not(target_arch = "wasm32"))]
 mod native_audio;
 

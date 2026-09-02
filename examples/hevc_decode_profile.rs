@@ -7,6 +7,11 @@
 //! kernels measure 1.3x-2.4x, and neither number explains the other without a
 //! share-of-total breakdown.
 //!
+//! Issue #280 then split §8.5.3.3 inter prediction into `inter_pred_filter`,
+//! `inter_pred_write` and `inter_pred_setup`, because the single row it used to
+//! print was a third §8.4.4.1 write-back and reference-plane setup that no
+//! vector kernel reaches — see `benches/README.md` for what that answered.
+//!
 //! This example produces that breakdown. It decodes frames of
 //! `examples/media/BigBuckBunny.mp4` through the ordinary public decoder with
 //! `zvidlib::hevc_decode_profile` running, then prints each stage's exclusive
@@ -131,7 +136,8 @@ fn main() {
         report.speedup_at(4.0),
     );
     println!(
-        "`color_convert` alone is {:.1}% of the measured total and has no vector kernel.",
+        "`color_convert` alone is {:.1}% of the measured total; it is output conversion \
+         rather than decoding, and since issue #219 it has a vector kernel of its own.",
         report.share(profile::Stage::ColorConvert) * 100.0,
     );
     println!(

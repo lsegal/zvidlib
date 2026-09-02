@@ -32,9 +32,14 @@ behavior, and the decoded-frame playback rate is drawn in the window's top-left 
 
 Playback controls (also printed at startup): `SPACE` toggles play/pause, `LEFT`/`RIGHT` step to the
 previous/next frame, `J`/`L` rewind/fast-forward five seconds, and the timeline bar drawn along the
-bottom edge scrubs as the pointer moves across it (clicking works too). Seeking keeps the audio
-clock and the displayed video frame in sync, and audio keeps playing while scrubbing if playback
-was running.
+bottom edge scrubs when you click or drag it. Hovering only moves the bar's marker. Seeking keeps
+the audio clock and the displayed video frame in sync, and audio keeps playing while scrubbing if
+playback was running.
+
+A drag previews on a background thread rather than seeking: a second decoder answers the newest
+pointer position, snapped back to its random-access point so each preview is one intra picture, and
+supersedes any position the pointer has already moved past. The window keeps drawing throughout,
+and only the frame the pointer is released on is seeked to and decoded exactly.
 
 ```console
 cargo run --example native_gl --features native
@@ -51,7 +56,8 @@ sample timing and, when audio is available, the `AudioContext` clock rather than
 or hard-coded FPS pacing.
 
 The page's controls are play/pause, five-second rewind/fast-forward, previous/next frame stepping,
-and a timeline range input that scrubs as the pointer moves across it. The whole AAC track is
+and a timeline range input that scrubs when you click or drag it, keeping only the newest requested
+position when a drag outruns the decoder. The whole AAC track is
 decoded once into a single `AudioBuffer`, so seeking and scrubbing only reschedule playback from
 the new offset instead of re-running the decoder, and audio keeps playing while you scrub.
 
