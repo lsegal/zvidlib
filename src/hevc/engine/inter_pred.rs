@@ -515,15 +515,15 @@ fn interp_block<const N: usize>(
         w,
         h,
         bit_depth,
-        narrows(isa, bit_depth, w),
+        narrows(isa, bit_depth, w, hk.is_none() && vk.is_some()),
     )
 }
 
 /// Whether [`interp_block`] takes the 16-bit accumulation for this
-/// backend, `bit_depth` and block width.
+/// backend, `bit_depth`, block width and phase.
 ///
-/// Three conditions, and the narrow path is only faster when all of
-/// them hold:
+/// Four conditions, and the narrow path is only faster when all of them
+/// hold:
 ///
 /// * **Eight-bit content.** The 16-bit accumulator is only in range
 ///   there: `shift1` is zero, so the tap accumulation is bounded by
@@ -532,16 +532,32 @@ fn interp_block<const N: usize>(
 /// * **A vector backend.** The whole point is that a vector unit
 ///   multiplies twice as many `i16` lanes per instruction as `i32`
 ///   lanes. [`Isa::Scalar`] multiplies one either way, so for it the
-///   narrowing pass over the source is cost with nothing behind it —
-///   `measure_narrow_vs_wide_block` reads it below parity.
+///   narrowing pass over the source is cost with nothing behind it.
 /// * **A row of at least eight samples.** A shorter row never reaches
-///   the 16-bit vector loop at all: `measure_narrow_filter_taps` reads
-///   0.76x at a row of four, where the whole call is the widening
-///   remainder plus the cost of having narrowed the source for it. So
-///   the narrow-width chroma blocks keep the `i32` kernel too.
+///   the 16-bit vector loop at all: `simd::measure_narrow_filter_taps`
+///   reads 0.96x at a row of four, where the whole call is the widening
+///   remainder plus the cost of having narrowed the source for it.
+/// * **The vertical-only phase**, and this is the one that is about the
+///   caller rather than the kernel. `measure_narrow_vs_wide_block` reads
+///   the vertical-only phase at 1.08x to 1.77x and the horizontal-only
+///   and two-dimensional phases at 0.82x to 1.11x, and the difference is
+///   not the kernel — it is the same kernel — but who pays to narrow the
+///   source. The vertical-only case reaches its source through
+///   [`RefPlane::gather`], which materializes a `w x ( h + N − 1 )`
+///   buffer either way, so writing it as `i16` instead of `i32` is free
+///   and the kernel's 1.85x lands intact. The other two reach theirs
+///   through [`RefPlane::row_window`], which **borrows the plane with no
+///   copy at all** whenever the window lies inside it — the common case
+///   — so narrowing has to add a whole materialized pass the wide path
+///   never performs, and that pass costs about what the wider lanes
+///   save. The two-dimensional case is worse again, because only its
+///   horizontal pass can use the narrowing: its vertical pass multiplies
+///   a 16-bit intermediate by a coefficient of up to 58, needs a 32-bit
+///   accumulator, and on every vector unit here that is the same lane
+///   count the `i32` kernel already issues.
 #[inline]
-fn narrows(isa: Isa, bit_depth: u8, w: usize) -> bool {
-    bit_depth == 8 && isa != Isa::Scalar && w >= 8
+fn narrows(isa: Isa, bit_depth: u8, w: usize, vertical_only: bool) -> bool {
+    bit_depth == 8 && isa != Isa::Scalar && w >= 8 && vertical_only
 }
 
 /// [`interp_block`] with the 16-bit accumulation forced on or off.
@@ -562,7 +578,7 @@ fn interp_block_with_width<const N: usize>(
     bit_depth: u8,
     narrow: bool,
 ) -> Vec<i32> {
-    debug_assert!(!narrow || narrows(isa, bit_depth, w));
+    debug_assert!(!narrow || (bit_depth == 8 && w >= 8));
     let shift1 = interp_shift1(bit_depth);
     let halo = N as i32 / 2 - 1;
     let span = w + N - 1;
@@ -2302,65 +2318,51 @@ mod tests {
         let plane_samples = pseudo_random(8, pw * ph, 255);
         let plane = RefPlane::new(&plane_samples, pw, ph).unwrap();
         let isa = simd::detected_isa();
-        // The half-pel phase in both dimensions: the two-dimensional
-        // path, which is what a decode spends its interpolation on.
-        let hk = &LUMA_FILTER[2];
-        let vk = &LUMA_FILTER[2];
         let rounds = 15;
+        // Every phase case of Table 8-8 that filters at all, because
+        // they narrow very differently: the one-dimensional cases have a
+        // single pass and narrow all of it, while the two-dimensional
+        // case narrows only its horizontal pass and pays the conversion
+        // for a vertical pass that cannot use it.
+        type Phase<'k> = (&'static str, Option<&'k [i32; 8]>, Option<&'k [i32; 8]>);
+        let cases: [Phase<'_>; 3] = [
+            ("h-only", Some(&LUMA_FILTER[2]), None),
+            ("v-only", None, Some(&LUMA_FILTER[2])),
+            ("2-D", Some(&LUMA_FILTER[2]), Some(&LUMA_FILTER[2])),
+        ];
 
         println!("\n8-tap luma interp_block, i32 vs i16 accumulation, {isa:?}, best of {rounds}");
         println!("  (equal total sample count at every block size)");
-        println!("  block     i32 ms   i16 ms   narrow");
-        for &(w, h) in &[(8usize, 8usize), (16, 16), (32, 32), (64, 64)] {
-            let calls = (1 << 22) / (w * h);
-            let wide =
-                interp_block_with_width::<8>(isa, &plane, 4, 4, Some(hk), Some(vk), w, h, 8, false);
-            let narrow =
-                interp_block_with_width::<8>(isa, &plane, 4, 4, Some(hk), Some(vk), w, h, 8, true);
-            assert_eq!(wide, narrow, "the two arms disagree at {w}x{h}");
+        println!("  phase   block     i32 ms   i16 ms   narrow");
+        for (name, hk, vk) in cases {
+            for &(w, h) in &[(8usize, 8usize), (16, 16), (32, 32), (64, 64)] {
+                let calls = (1 << 22) / (w * h);
+                let run = |narrow: bool| {
+                    interp_block_with_width::<8>(isa, &plane, 4, 4, hk, vk, w, h, 8, narrow)
+                };
+                assert_eq!(run(false), run(true), "{name} arms disagree at {w}x{h}");
 
-            let (mut bw, mut bn) = (f64::INFINITY, f64::INFINITY);
-            for _ in 0..rounds {
-                let start = Instant::now();
-                for _ in 0..calls {
-                    std::hint::black_box(interp_block_with_width::<8>(
-                        isa,
-                        &plane,
-                        4,
-                        4,
-                        Some(hk),
-                        Some(vk),
-                        w,
-                        h,
-                        8,
-                        false,
-                    ));
+                let (mut bw, mut bn) = (f64::INFINITY, f64::INFINITY);
+                for _ in 0..rounds {
+                    let start = Instant::now();
+                    for _ in 0..calls {
+                        std::hint::black_box(run(false));
+                    }
+                    bw = bw.min(start.elapsed().as_secs_f64());
+                    let start = Instant::now();
+                    for _ in 0..calls {
+                        std::hint::black_box(run(true));
+                    }
+                    bn = bn.min(start.elapsed().as_secs_f64());
                 }
-                bw = bw.min(start.elapsed().as_secs_f64());
-                let start = Instant::now();
-                for _ in 0..calls {
-                    std::hint::black_box(interp_block_with_width::<8>(
-                        isa,
-                        &plane,
-                        4,
-                        4,
-                        Some(hk),
-                        Some(vk),
-                        w,
-                        h,
-                        8,
-                        true,
-                    ));
-                }
-                bn = bn.min(start.elapsed().as_secs_f64());
+                println!(
+                    "  {name:>6}  {:>5}  {:9.2} {:8.2}  {:5.2}x",
+                    format!("{w}x{h}"),
+                    bw * 1e3,
+                    bn * 1e3,
+                    bw / bn
+                );
             }
-            println!(
-                "  {:>5}  {:9.2} {:8.2}  {:5.2}x",
-                format!("{w}x{h}"),
-                bw * 1e3,
-                bn * 1e3,
-                bw / bn
-            );
         }
     }
 
