@@ -123,6 +123,12 @@ jobs:
           cargo test --release --features native --lib
       - name: Test native_gl example overlays
         run: cargo test --features native --example native_gl
+      # The web example makes the same scrubbing decisions `native_gl` does - the random-access
+      # restart, the measured stride, the walk's next step - and its copy of them had nothing
+      # asserting it (#380). Node's built-in runner, so this needs no install step and no
+      # dependency the example does not already have.
+      - name: Test the web example's scrub walk
+        run: node --test examples/web_canvas/scrub.test.js
       # The HEVC/AV1 engine unit tests are pure numerics, and the inter-prediction
       # ones compare every SIMD backend the runner's CPU offers against the scalar
       # reference — which is how the x86_64 SSE4.1/AVX2 kernels get covered at all,
