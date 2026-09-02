@@ -1647,14 +1647,15 @@ the kernel is worth landing. This group says it is not.**
 The whole-picture comparison is the one the decision was taken on, and it was
 run as a paired branch-against-base measurement rather than against a recorded
 figure: both trees built and timed on the same host, interleaved within a
-round, five rounds per draw, eleven draws across four models. The group's own
+round, five rounds per draw, twelve draws across five models. The group's own
 `scalar` arm is the control - it resolves to the same scalar reference in both
-trees, so it has to read 1.00x, and it does to within +/-0.012 everywhere.
+trees, so it has to read 1.00x, and it does to within +/-0.02 everywhere.
 
 | CPU model | draws | `avx2` | `sse4.1` | `scalar` (control) |
 |---|---|---|---|---|
 | Intel Xeon Platinum 8573C | 1 | 1.00x | 1.01x | 1.01x |
 | Intel Xeon Platinum 8370C | 2 | 1.01x | 1.00-1.02x | 1.00x |
+| Intel Core i7-8700B | 1 | 0.99-1.00x | 1.01-1.02x | 1.00-1.02x |
 | AMD EPYC 7763 | 5 | 0.97-0.99x | 0.95-0.98x | 0.99-1.00x |
 | AMD EPYC 9V74 | 3 | 0.94-0.95x | 0.95x | 1.00x |
 
