@@ -21,12 +21,13 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest]
-        draw: [1, 2, 3, 4, 5, 6, 7, 8, 9]
+        # The nine-draw sweep that produced the recorded per-model table has
+        # already run; these two re-confirm bit-exactness and the ratio after
+        # the merge from main rather than re-taking the table.
+        draw: [1]
         include:
           - os: macos-15-intel
             draw: 1
-          - os: macos-15-intel
-            draw: 2
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
@@ -77,22 +78,48 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        draw: [1, 2]
+        draw: [1, 2, 3]
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Install Rust toolchain
         run: rustup show
       - name: Install native audio dependencies
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - name: Report the host
         run: grep -m1 'model name' /proc/cpuinfo
-      - name: Run the reconstruction group
+      # The whole-picture effect is a branch-against-base comparison, so both
+      # trees are built and run on the same host and interleaved within a round:
+      # `ubuntu-latest` draws several CPU models, and they disagree by more than
+      # this effect. The group's own scalar arm is the control - it resolves to
+      # the same scalar reference in both trees, so it has to read 1.00x.
+      - name: Check out the merge base alongside
+        run: |
+          git worktree add ../base "$(git merge-base HEAD origin/main)"
+      - name: Build both benchmark binaries
+        run: |
+          cargo bench --features native --bench hevc_encode --no-run
+          cd ../base && cargo bench --features native --bench hevc_encode --no-run
+      - name: Run the reconstruction group, interleaved
         run: |
           set -o pipefail
-          cargo bench --features native --bench hevc_encode -- \
-            hevc_encode_640x352_reconstruct 2>&1 | tee reconstruct.log
+          echo "HOST-MODEL $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2-)" \
+            | tee reconstruct.log
+          for round in 1 2 3; do
+            for tree in head base; do
+              case "$tree" in
+                head) dir=. ;;
+                base) dir=../base ;;
+              esac
+              echo "=== ROUND $round TREE $tree ===" >> "$GITHUB_WORKSPACE/reconstruct.log"
+              ( cd "$dir" && cargo bench --features native --bench hevc_encode -- \
+                  hevc_encode_640x352_reconstruct ) 2>&1 \
+                | tee -a "$GITHUB_WORKSPACE/reconstruct.log"
+            done
+          done
       - name: Upload the log
         uses: actions/upload-artifact@v4
         with:
