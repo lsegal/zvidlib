@@ -15,10 +15,12 @@
 //!
 //! * The drag asks for the frame under the pointer and draws whatever has arrived. The worker
 //!   does not jump straight to it - it walks there from the target's random-access point in
-//!   strides, publishing each frame it passes, so the picture tracks the pointer from the first
+//!   strides, publishing the frames it stops on, so the picture tracks the pointer from the first
 //!   intra picture onwards instead of holding still for the whole decode. A newer target replaces
 //!   the older one and redirects the walk; a walk that has to start over cancels the decode it is
-//!   inside rather than finishing it.
+//!   inside rather than finishing it. Only the frames the walk stops on are converted to RGBA:
+//!   the reader tells the decoder that the pictures it is passing are wanted for reference only
+//!   (issue #354), which is what makes the far end of the bar cost what the near end does.
 //! * Playback reads through a [`FrameServiceSource`], which is the same worker behind
 //!   [`zvidlib::PlaybackVideoSource`]. A frame that has not been decoded yet is reported as
 //!   [`ErrorKind::WouldBlock`] and the render thread simply keeps the picture it has, so a seek
@@ -39,11 +41,15 @@ use zvidlib::{
 
 /// How far apart the frames a walk publishes are.
 ///
-/// The reader decodes every sample in between either way, so this only sets how often the picture
-/// under a drag moves - and asking for each frame in turn is what keeps that under the 30 ms the
-/// issue asks for, since a stride of four made the picture wait for four frames' decoding
-/// (measured at 20-97 ms on the bundled 1080p sample, against 13-27 ms at one).
-const WALK_STRIDE: u64 = 1;
+/// The reader decodes every sample in between either way, but only the ones a walk stops on cost
+/// a colour conversion now that [`ExactFrameReader`] tells the decoder which pictures are wanted
+/// (issue #354). That is what sets this: a published frame costs its own conversion plus the
+/// decoding of the frames since the last one, about 6.6 ms + 2.9 ms per frame on the bundled
+/// 1080p sample through VideoToolbox, so a stride of eight lands at roughly the 30 ms the issue
+/// #333 budget asks for while reaching the far end of the bar in a third of the time. A stride of
+/// one publishes more often and pays a conversion for every frame it passes: 7.7 s to walk to the
+/// last frame of the bundled sample, against 3.0 s at eight.
+const WALK_STRIDE: u64 = 8;
 
 /// How many decoded frames the render thread can still collect.
 ///

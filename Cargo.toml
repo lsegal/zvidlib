@@ -26,11 +26,6 @@ test = true
 # `native` exactly as `native_gl` is. The feature gates no code of its own; it is
 # only what keeps a wasm build from trying to compile a native-only target.
 [[example]]
-name = "scrub_probe"
-path = "examples/scrub_probe.rs"
-required-features = ["native"]
-
-[[example]]
 name = "hevc_decode_profile"
 path = "examples/hevc_decode_profile.rs"
 required-features = ["native"]

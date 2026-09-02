@@ -6,7 +6,8 @@ use std::task::{Context, Poll, Waker};
 use zvidlib::io::MemorySource;
 use zvidlib::{
     CancellationToken, Codec, CodecProfile, ColorRange, EncodedVideoSample, ErrorKind,
-    ExpectedVideoFrame, FrameDigest, FrameIndex, HardwarePreference, Limits, Mp4DemuxerOptions,
+    ExactFrameReader, ExpectedVideoFrame, FrameDigest, FrameIndex, HardwarePreference, Limits,
+    Mp4DemuxerOptions,
     PixelFormat, VideoDecoderConfig, VideoDecoderConformanceVector, VideoDecoderFactory,
     VideoDimensions, native_av1_video_decoder_factory, native_hevc_video_decoder_factory,
     verify_video_decoder_conformance,
@@ -85,6 +86,76 @@ fn native_hevc_decoder_conforms_for_sequential_reverse_and_alternating_seeks() {
         .err()
         .expect("the HEVC decoder must enforce its allocation limit");
     assert_eq!(error.kind(), ErrorKind::ResourceLimit);
+}
+
+/// A frame in the middle of the bundled sample's single group of pictures can only be reached by
+/// decoding everything before it, and issue #354 is what that used to cost: every one of those
+/// pictures was converted to RGBA for nobody. The reader now tells the decoder they are wanted
+/// for reference only, and this is what that must not change - the frame it walks to, and the
+/// ones it publishes after it, are still the fixture's frames.
+#[test]
+fn a_walk_that_skips_the_pictures_it_passes_still_decodes_the_frames_it_stops_on() {
+    let expected = include_str!("fixtures/codec/big_buck_bunny_hevc_rgba.sha256")
+        .lines()
+        .map(|line| {
+            let (_, digest) = line.split_once(' ').unwrap();
+            FrameDigest::from_hex(digest).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let limits = Limits::default();
+    let source = MemorySource::new(include_bytes!("../examples/media/BigBuckBunny.mp4").to_vec());
+    let vector = block_on(VideoDecoderConformanceVector::from_mp4(
+        "bundled HEVC Main sample",
+        &source,
+        Mp4DemuxerOptions::default(),
+        1,
+        VideoDecoderConfig {
+            codec: Codec::Hevc,
+            profile: CodecProfile::HevcMain,
+            coded_dimensions: VideoDimensions::new(1920, 1080, &limits).unwrap(),
+            output_format: PixelFormat::Rgba8,
+            color_range: ColorRange::Limited,
+            hardware: HardwarePreference::Avoid,
+            configuration: Vec::new(),
+        },
+        &expected,
+    ))
+    .unwrap();
+
+    let mut reader = ExactFrameReader::new(
+        &native_hevc_video_decoder_factory(),
+        vector.configuration.clone(),
+        vector.samples.clone(),
+        limits,
+    )
+    .unwrap();
+    let cancellation = CancellationToken::new();
+
+    // The walk a drag makes: stop every eight frames, as the native example does.
+    for index in (0..=24_u64).step_by(8) {
+        let frame = reader.get(FrameIndex(index), &cancellation).unwrap();
+        assert_eq!(
+            FrameDigest::from_frame(&frame).unwrap(),
+            vector.expected_frames[index as usize].digest,
+            "frame {index} does not match the fixture"
+        );
+    }
+    let statistics = reader.statistics();
+    assert_eq!(statistics.resets, 1, "one walk, not one per stop");
+    assert!(
+        statistics.samples_skipped >= 8,
+        "the frames between the stops are decoded without being converted: {statistics:?}"
+    );
+
+    // A frame the walk went past is not lost, only more expensive: it costs the reset and the
+    // decode from the random-access point that any unreachable frame does.
+    let frame = reader.get(FrameIndex(13), &cancellation).unwrap();
+    assert_eq!(
+        FrameDigest::from_frame(&frame).unwrap(),
+        vector.expected_frames[13].digest,
+        "a frame the walk passed comes back exactly when it is asked for"
+    );
+    assert_eq!(reader.statistics().resets, 2);
 }
 
 /// Splits a low-overhead AV1 byte stream into temporal units, delimited by
