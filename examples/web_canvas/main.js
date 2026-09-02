@@ -258,13 +258,18 @@ async function main() {
   // the pointer has already moved *behind* is aborted.
   //
   // Walking is the other half, and it always runs forwards, because decoding does. A target
-  // ahead of the frame on screen is reached one frame at a time, drawing each, since the decoder
-  // is already positioned there and each step costs one frame instead of the whole span. A
-  // target behind it cannot be reached that way, so the walk restarts at the random-access point
-  // at or before the target and draws every frame from there - asking for the target directly
-  // instead decodes that same span while drawing nothing, and the next pointer sample aborted it
-  // before it landed, which is what left a backwards drag frozen. Either way the picture tracks
-  // the pointer during a drag instead of holding still until the target arrives.
+  // behind the frame on screen therefore cannot be walked to: the walk restarts at the
+  // random-access point at or before it and comes forwards from there. Asking for such a target
+  // directly instead decodes that same span while drawing nothing, and the next pointer sample
+  // aborted it before it landed, which is what left a backwards drag frozen.
+  //
+  // How far each step of the walk goes is measured rather than fixed at one frame. Drawing every
+  // frame it passes makes the picture crawl behind a fast drag, because each one costs a decode,
+  // an RGBA readback and an upload; `native_gl` measured the same thing from the other side and
+  // stopped drawing them at all, which is what left *it* frozen (issues #354 and #355). So a
+  // step is whatever fits in `SCRUB_INTERVAL_MS` at the rate the walk is actually decoding at:
+  // the picture moves about seven times a second whatever the span, and the frames in between
+  // are never asked for, so they cost the browser's decoding and nothing of ours.
   let scrubTarget = null;
   let scrubbing = false;
   let scrubAbort = null;
@@ -274,9 +279,23 @@ async function main() {
   // frames and the next walk has to start over at a random-access point.
   let scrubPosition = null;
 
+  // How often the walk draws, and the ceiling on how far one step may jump so that an
+  // unmeasurably fast decoder still draws pictures rather than skipping the span in silence.
+  const SCRUB_INTERVAL_MS = 150;
+  const SCRUB_MAXIMUM_STEP = 512;
+  // What a frame is costing this walk, measured from the steps it has already taken.
+  let scrubMsPerFrame = null;
+
+  function scrubStrideFrames() {
+    if (scrubMsPerFrame === null) return 1;
+    if (scrubMsPerFrame <= 0) return SCRUB_MAXIMUM_STEP;
+    const frames = Math.floor(SCRUB_INTERVAL_MS / scrubMsPerFrame);
+    return Math.min(Math.max(frames, 1), SCRUB_MAXIMUM_STEP);
+  }
+
   function scrubWalkStart(target) {
     if (scrubPosition === null) return randomAccessPointAtOrBefore(target);
-    if (scrubPosition < target) return scrubPosition + 1;
+    if (scrubPosition < target) return Math.min(target, scrubPosition + scrubStrideFrames());
     if (scrubPosition === target) return target;
     return randomAccessPointAtOrBefore(target);
   }
@@ -301,9 +320,14 @@ async function main() {
         const next = scrubWalkStart(target);
         scrubAbort = new AbortController();
         scrubStep = next;
+        const startedAt = performance.now();
         try {
           const frame = await video.get(BigInt(next), scrubAbort.signal);
           uploadFrame(frame.pixels, frame.width, frame.height);
+          // Only a step whose span is known says anything about the rate: a restart at a
+          // random-access point decoded an unknown number of frames to get there.
+          const span = scrubPosition === null ? 0 : next - scrubPosition;
+          if (span > 0) scrubMsPerFrame = (performance.now() - startedAt) / span;
           frameIndex = next;
           scrubPosition = next;
           pausedMediaTimeMs = mediaTimeForFrame(frameIndex);

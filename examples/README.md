@@ -36,10 +36,12 @@ bottom edge scrubs when you click or drag it. Hovering only moves the bar's mark
 the audio clock and the displayed video frame in sync, and audio keeps playing while scrubbing if
 playback was running.
 
-A drag previews on a background thread rather than seeking: a second decoder answers the newest
-pointer position, snapped back to its random-access point so each preview is one intra picture, and
-supersedes any position the pointer has already moved past. The window keeps drawing throughout,
-and only the frame the pointer is released on is seeked to and decoded exactly.
+A drag previews on a background thread rather than seeking: the worker walks towards the newest
+pointer position and supersedes any position the pointer has already moved past. It publishes a
+picture roughly every 150 ms of decoding rather than every frame it passes, so the picture keeps
+moving during a long walk without paying a full-resolution conversion per frame, and a position
+behind the reader restarts at its random-access point. The window keeps drawing throughout, and
+only the frame the pointer is released on is seeked to and decoded exactly.
 
 ```console
 cargo run --example native_gl --features native
@@ -57,10 +59,12 @@ or hard-coded FPS pacing.
 
 The page's controls are play/pause, five-second rewind/fast-forward, previous/next frame stepping,
 and a timeline range input that scrubs when you click or drag it, keeping only the newest requested
-position when a drag outruns the decoder. A drag draws every frame it passes rather than only the
-one it lands on: forwards it steps a frame at a time, and backwards it restarts at the random-access
-point at or before the pointer (`VideoStream.randomAccessPoints()`) and walks forwards from there,
-so the picture follows the pointer in both directions. The whole AAC track is
+position when a drag outruns the decoder. A drag draws pictures on the way to the frame it lands on
+rather than only that frame: it walks forwards from where the decoder already is, or, when the
+pointer moves backwards, from the random-access point at or before it
+(`VideoStream.randomAccessPoints()`). Each step covers whatever fits in 150 ms at the rate the walk
+is decoding at, so the picture keeps moving throughout a drag without drawing - and paying for -
+every frame it passes. The whole AAC track is
 decoded once into a single `AudioBuffer`, so seeking and scrubbing only reschedule playback from
 the new offset instead of re-running the decoder, and audio keeps playing while you scrub.
 
