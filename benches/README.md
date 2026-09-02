@@ -1469,7 +1469,9 @@ places, so the ratio is a property of the kernels rather than of the frame size.
 
 `sse4.1` beats `avx2` on a minority of rows, and by enough on two of them to be
 more than noise: `av1_encode_stage_coeff_ctx` was 3.04x under `sse4.1` against
-2.50x under `avx2`, and the `rdo_inter` pair is 1.63x/1.64x against 1.55x. The
+2.50x under `avx2`, and the `rdo_inter` pair is 1.63x/1.64x against 1.55x. Both
+of those pairs of rows now pre-date their repair — #371 for the first and #387
+for the second — and the re-measurements below are what replaces them. The
 `Best` column already recorded `sse4.1` for these, but the dispatch site
 preferred `avx2` when the host had it, so a real encode took the slower arm.
 #362 answers why, and the answer is the same one for both rows: **the wide arm
@@ -1595,7 +1597,57 @@ carries that row.
   per-call setup the wider step does not pay for rather than idle lanes and a
   staged store, and the repair is to widen what the search hands the kernel (or
   to route these two the way `coeff_ctx` is now routed) rather than anything
-  #362 changes. #370 carries it.
+  #362 changes. #370 carries it, and #387 widened what the search hands the
+  kernel; the round below is the result.
+
+#### The #387 re-measurement
+
+#370 routed the narrow blocks around AVX2; #387 gives AVX2 something wide to do
+instead. The width was never in the block — `rdo.rs` searches a `CTB` of 16 and
+its candidate partitions subdivide that — it is in the *candidates*: the
+whole-pel stage scores `(2 * radius + 1)^2` predictions of one source block, and
+`_mm256_sad_epu8` reduces per 8-byte lane, so one instruction can carry two
+16-wide candidates (one per 128-bit lane) or four 8-wide ones (one per qword).
+`rdcost::sad_batch` is that entry point and `rdo::motion_search` gathers
+candidates into fixed batches to feed it, with the scan order and the `mv_order`
+tie-break unchanged, so the values and the winner are what the per-candidate
+search produced.
+
+Measured at `1fe8ef7f3e57` — the branch's implementation commit — on an
+**Intel(R) Xeon(R) Platinum 8573C (Linux/X64)**, one `workflow_dispatch` round
+with `ZVIDLIB_BENCH_LARGE=1`, `# host instruction sets: scalar, sse4.1, avx2`
+and `# dispatch site hevc_rdcost: avx2`. It is one round on one more model, so
+these absolute times are not comparable with the committed table's EPYC 7763
+draw, with #362's Xeon 6973P-C round or with #371's EPYC 9V74 one; what is
+comparable, and what the acceptance criterion turns on, is the
+`sse4.1`-against-`avx2` sign *within* the round.
+
+| Group | `scalar` | `sse4.1` | `avx2` | Best |
+| --- | ---: | ---: | ---: | ---: |
+| `hevc_encode_640x352_rdo_inter` | 85.713 ms | 51.326 ms (1.67x) | 38.365 ms (2.23x) | 2.23x `avx2` |
+| `hevc_encode_1920x1088_rdo_inter` | 809.43 ms | 482.78 ms (1.68x) | 359.62 ms (2.25x) | 2.25x `avx2` |
+| `hevc_encode_640x352` | 96.164 ms | 59.599 ms (1.61x) | 46.389 ms (2.07x) | 2.07x `avx2` |
+| `hevc_encode_1920x1088` | 910.07 ms | 565.17 ms (1.61x) | 441.67 ms (2.06x) | 2.06x `avx2` |
+| `hevc_encode_640x352_rdo_intra` | 4.462 ms | 2.925 ms (1.53x) | 2.987 ms (1.49x) | 1.53x `sse4.1` |
+| `hevc_encode_1920x1088_rdo_intra` | 41.305 ms | 27.011 ms (1.53x) | 27.338 ms (1.51x) | 1.53x `sse4.1` |
+
+The `rdo_inter` arms have swapped: `avx2` is 25% ahead of `sse4.1` at both sizes
+(38.365 ms against 51.326 ms, 359.62 ms against 482.78 ms), where every round
+since #351 had `sse4.1` ahead by 5% to 9% on exactly these two rows. The
+`sse4.1` column is the control that says the host is the usual one and the
+narrow path is untouched: 1.67x/1.68x here against the 1.62x to 1.69x the
+EPYC 7763, Xeon 6973P-C and EPYC 9V74 rounds each recorded. Nothing routes
+around AVX2 any more, so #370's redirect is no longer what carries these rows —
+the batched kernel is.
+
+The whole-frame `hevc_encode_*` groups carry it through, since the mode search
+is most of what they do: 2.07x/2.06x under `avx2` against 1.61x under `sse4.1`,
+where the committed table has them at 1.52x/1.51x against 1.58x/1.57x — the
+same reversal, diluted by the reconstruction and writing stages that batching
+does not touch. `rdo_intra` is the control that should *not* move, and does not:
+it scores intra predictions rather than motion candidates, has no batch to form,
+and stays 1.53x `sse4.1` against 1.49x/1.51x `avx2`, the shape the committed
+table records for it.
 
 ## Hardware HEVC decoders
 
