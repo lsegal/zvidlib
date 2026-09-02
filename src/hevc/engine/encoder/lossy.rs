@@ -950,14 +950,17 @@ fn curve_point(src: SourcePlanes<'_>, qp: i32, search: ModeSearch, deblocking: b
 /// its own curve can accept both a grid and a costlier one that buys less per
 /// bit than the curve does there.
 ///
-/// ## What is not being decided
+/// ## What the rule cannot decide
 ///
-/// The comparison is between one measured quantity and one extrapolated one,
-/// and [`SAO_ACCEPTANCE_PRECISION_NUM`] is how far the extrapolated one can
-/// be wrong. A gain inside that of the threshold does not resolve the
-/// comparison in either direction, so it is not taken as clearing it. This is
-/// what stops the writer accepting a slice on a margin of a few parts in a
-/// thousand of a quantity it can only place to a few parts in a hundred.
+/// Monotone is not the same as precise, and the rule is only the first. The
+/// comparison is between one measured quantity and one extrapolated one, and
+/// [`SAO_ACCEPTANCE_RESOLUTION_NUM`] is how far the extrapolated one is
+/// measured to be wrong: tens of percent of the distortion it predicts, which
+/// is wider than every margin this writer's operating points are decided on.
+/// So the rule is left to decide them - a tolerance wide enough to refuse the
+/// decisions #287 found sitting under the curve refuses the wins beside them
+/// too - and what covers the difference is [`SaoLambda::band_q8`], which is
+/// why that charge is a constant and not something the probe measures.
 ///
 /// ## When the probe runs
 ///
@@ -991,16 +994,7 @@ fn keeps_sao(
         return false;
     }
     let (fine, coarse) = probe();
-    clears_sao_threshold(gain, sao_threshold_sse(fine, coarse, qp, sao_bits))
-}
-
-/// Whether `gain` clears `threshold` by more than the acceptance model's own
-/// resolution — see [`SAO_ACCEPTANCE_PRECISION_NUM`] for why clearing it at
-/// all is not enough.
-fn clears_sao_threshold(gain: u64, threshold: f64) -> bool {
-    let margin = threshold * SAO_ACCEPTANCE_PRECISION_NUM as f64
-        / SAO_ACCEPTANCE_PRECISION_DEN as f64;
-    gain as f64 > threshold + margin
+    gain as f64 > sao_threshold_sse(fine, coarse, qp, sao_bits)
 }
 
 /// The multiplier the slice-level SAO decision trades distortion against rate
@@ -1084,36 +1078,45 @@ fn reachable_sse(fine: CurvePoint, coarse: CurvePoint, qp: i32, sao_bits: u64) -
     (reachable.is_finite() && reachable > 0.0).then_some(reachable)
 }
 
-/// How far a slice-level SAO decision has to clear the curve before the
-/// writer is entitled to call it a decision, as a fraction of the distortion
-/// [`reachable_sse`] predicts.
+/// What the slice-level acceptance model can resolve, as a fraction of the
+/// distortion [`reachable_sse`] predicts, and the reason the writer does not
+/// chase the margins it decides these operating points on.
 ///
-/// The acceptance test compares two estimates of the same quantity — the
+/// The acceptance test compares two estimates of the same quantity: the
 /// squared error SAO removed, measured exactly, against the squared error a
-/// finer quantizer would remove, *extrapolated* from a two-point probe to a
-/// rate a fraction of a quantizer step above the coded one. Only the first is
-/// measured. `measure_sao_acceptance_precision` quantifies the second against
-/// the ladder [`super::tests::sao_curve_offsets`] interpolates, which is this
-/// same writer coded at every QP from 0 to 51, and the extrapolation's error
-/// there reaches 3.7% of the distortion it predicts over the QP 12-51 sweep
-/// on both test pictures at both sizes.
+/// finer quantizer would remove, *extrapolated* from a two-point probe.
+/// Only the first is measured. `measure_sao_acceptance_precision` quantifies
+/// the second by holding a rung of the ladder
+/// [`super::tests::sao_curve_offsets`] interpolates out and predicting it from
+/// its neighbours, and the answer is that the extrapolation is wrong by tens
+/// of percent of the distortion it predicts: worst 50% on noise 128x96, 20%
+/// on both smooth pictures, and 196% on noise 64x48, where one quantizer step
+/// is only tens of bits wide and byte rounding is most of the step. In the
+/// currency the invariant is stated in that is 0.006 dB to 0.34 dB, and it is
+/// an *upper* bound on the shipped model's error twice over - the chord spans
+/// two quantizer steps where the shipped one spans one, and it is read a whole
+/// step from its anchor where SAO spends a fraction of one.
 ///
-/// So a gain that clears the threshold by less than that is not measured to
-/// be above the curve; it is inside the model's own resolution, and #287
-/// found the writer taking exactly such a decision — accepting a slice at
-/// noise 128x96 QP 32 by 0.25% of its own gain, which
+/// What that measurement settles is not a tolerance to apply but a question
+/// to stop asking. #287 found the writer accepting a slice at noise 128x96
+/// QP 32 by 0.25% of its own gain that
 /// `every_accepted_sao_point_sits_on_the_writers_own_curve` then measured
-/// 0.003 dB *below* the curve. Requiring the margin to exceed the model's
-/// resolution is what turns that from a decision taken into a decision
-/// recognised as unresolvable, and an unresolvable decision does not spend
-/// the bits.
-///
-/// The bound is the measured 3.7% rounded up to a figure the measurement
-/// supports rather than one fitted to a single point; see
-/// [`SaoLambda::band_q8`] for what it lets the band-syntax charge do.
-const SAO_ACCEPTANCE_PRECISION_NUM: u64 = 1;
-/// Denominator of [`SAO_ACCEPTANCE_PRECISION_NUM`] — 1/25 is 4%.
-const SAO_ACCEPTANCE_PRECISION_DEN: u64 = 25;
+/// 0.003 dB *below* the curve, and it reads as a decision that wants a
+/// tolerance around it. It cannot have one that helps. The model's resolution
+/// at that picture and QP is 0.13 dB, which is forty times the 0.003 dB
+/// failure - and also larger than the 0.100 dB win the same rule buys at
+/// noise 64x48 QP 12, which a margin wide enough to decline the failure
+/// declines as well. Measured rather than assumed, every operating point this
+/// writer has, win and failure alike, sits inside the acceptance model's own
+/// resolution, so no threshold on that model separates them and none is
+/// applied. `the_acceptance_model_cannot_resolve_the_margins_it_decides_on`
+/// holds this, and [`SaoLambda::band_q8`] is what stands in its place.
+const SAO_ACCEPTANCE_RESOLUTION_NUM: u64 = 3;
+/// Denominator of [`SAO_ACCEPTANCE_RESOLUTION_NUM`] — 3/5 is 60%, the round
+/// figure above the worst 50.5% the full-picture measurement reached. Held by
+/// `the_acceptance_model_cannot_resolve_the_margins_it_decides_on` rather
+/// than read by the decision, which is the whole point of it.
+const SAO_ACCEPTANCE_RESOLUTION_DEN: u64 = 5;
 
 /// The squared error the slice-level SAO decision has to beat, in the picture
 /// SSE units `gain` is measured in.
@@ -2321,9 +2324,231 @@ mod tests {
         }
     }
 
+    /// This writer's own SAO-off rate-distortion curve at every QP from 0 to
+    /// 51, in the coordinates [`reachable_sse`] extrapolates in — the ladder
+    /// [`sao_curve_offsets`] interpolates against, measured in slice-data
+    /// bits and whole-picture SSE rather than in slice bytes and dB.
+    fn curve_ladder(
+        y: &[u8],
+        cb: &[u8],
+        cr: &[u8],
+        width: usize,
+        height: usize,
+    ) -> Vec<CurvePoint> {
+        (0..=51)
+            .map(|qp| {
+                curve_point(
+                    SourcePlanes {
+                        y,
+                        cb,
+                        cr,
+                        width,
+                        height,
+                    },
+                    qp,
+                    ModeSearch::Rdo,
+                    true,
+                )
+            })
+            .collect()
+    }
+
+    /// What the slice-level acceptance model can and cannot resolve, which is
+    /// the measurement [`SAO_ACCEPTANCE_PRECISION_NUM`] is set from.
+    ///
+    /// The model's threshold is `D(coded) - D(coded_rate + sao_bits)` with the
+    /// second term read off a straight line in log-rate against log-distortion
+    /// through two measured points. Only the first term is measured; the
+    /// second is where the model can be wrong, and this holds one rung of the
+    /// ladder out to say by how much.
+    ///
+    /// For each QP the chord is taken through the ladder's `qp - 1` and
+    /// `qp + 1` rungs and used to predict the held-out `qp` rung, at the rate
+    /// that rung actually coded. The error is reported the way the decision
+    /// would feel it: against the distortion the coarser rung's own step
+    /// removes, which is the `reachable` the threshold is built out of, and
+    /// again in dB. Both choices make this an upper bound on the shipped
+    /// model's error - it spans two quantizer steps where the shipped chord
+    /// spans one, and it is evaluated a whole step away from its anchor where
+    /// SAO spends a fraction of one, and a log-log chord tracks a convex curve
+    /// better on both counts.
+    #[test]
+    #[ignore = "measurement: the SAO acceptance model's own precision against the ladder"]
+    fn measure_sao_acceptance_precision() {
+        for (name, width, height, smooth) in [
+            ("smooth 64x48", 64usize, 48usize, true),
+            ("smooth 128x96", 128, 96, true),
+            ("noise 64x48", 64, 48, false),
+            ("noise 128x96", 128, 96, false),
+        ] {
+            let (y, cb, cr) = if smooth {
+                smooth_picture(width, height)
+            } else {
+                picture(width, height)
+            };
+            let ladder = curve_ladder(&y, &cb, &cr, width, height);
+            let mut worst = 0.0f64;
+            let mut worst_at = 0;
+            for qp in 12..=50usize {
+                let (fine, held, coded) = (ladder[qp - 1], ladder[qp], ladder[qp + 1]);
+                // The held-out rung has to sit above the coarser one in rate
+                // and below it in distortion, or there is no step to predict.
+                if held.bits <= coded.bits || held.sse >= coded.sse {
+                    continue;
+                }
+                let sao_bits = held.bits - coded.bits;
+                let truth = (coded.sse - held.sse) as f64;
+                let Some(predicted) = reachable_sse(fine, coded, qp as i32 + 1, sao_bits) else {
+                    continue;
+                };
+                let relative = (predicted - truth).abs() / truth;
+                // The same error where the invariant measures it: how far the
+                // predicted reconstruction sits from the measured one.
+                let db = 10.0
+                    * ((coded.sse as f64 - predicted).max(1.0) / held.sse as f64).log10().abs();
+                println!(
+                    "PRECISION {name} qp {qp}: {sao_bits} bits, reachable {truth:.0} measured, \
+                     {predicted:.0} predicted ({:+.2}%, {db:.4} dB)",
+                    (predicted / truth - 1.0) * 100.0
+                );
+                if relative > worst {
+                    worst = relative;
+                    worst_at = qp;
+                }
+            }
+            println!(
+                "PRECISION {name}: worst {:.2}% at qp {worst_at}",
+                worst * 100.0
+            );
+        }
+    }
+
     /// A point on a picture's curve, for the calibration's own unit tests.
     fn curve(bits: u64, sse: u64) -> CurvePoint {
         CurvePoint { sse, bits }
+    }
+
+    #[test]
+    fn the_slice_level_threshold_is_monotone_in_the_grid_it_judges() {
+        // What #287 could not get out of the rule, stated where it is true.
+        // The threshold is the distortion the picture's own curve reaches at
+        // the rate being judged, and a grid can only be asked for more of it
+        // by asking for more bits - so over every probe shape the calibration
+        // accepts, and across the whole trust band including both clamps,
+        // `sao_threshold_sse` never falls as `sao_bits` rises.
+        let coded = curve(8_000, 100_000);
+        for (name, fine) in [
+            ("a step that buys a little", curve(10_000, 97_000)),
+            ("a step that buys a lot", curve(10_000, 40_000)),
+            ("a step that buys nearly everything", curve(10_000, 200)),
+            ("a wide step", curve(40_000, 30_000)),
+            ("a narrow step", curve(8_050, 99_000)),
+        ] {
+            for qp in [0i32, 12, 26, 37, 51] {
+                let mut previous = 0.0f64;
+                for sao_bits in 1..=8_000u64 {
+                    let threshold = sao_threshold_sse(fine, coded, qp, sao_bits);
+                    assert!(
+                        threshold >= previous,
+                        "{name} at qp {qp}: {sao_bits} bits are asked for {threshold:.3} of \
+                         squared error, less than the {previous:.3} one fewer bit was asked for"
+                    );
+                    previous = threshold;
+                }
+            }
+        }
+
+        // And the consequence for a superset grid, which is the form #287
+        // wanted: a grid whose extra components cover what the curve charges
+        // for their extra bits is accepted wherever its subset is. The
+        // multiplier form hides this because it divides an increasing concave
+        // threshold by the rate, so check the two against each other on the
+        // very numbers #287 read as a contradiction.
+        let (qp, fine) = (12, curve(10_000, 60_000));
+        let subset = sao_threshold_sse(fine, coded, qp, 72);
+        let superset = sao_threshold_sse(fine, coded, qp, 104);
+        assert!(
+            superset >= subset,
+            "the larger grid was asked for less squared error ({superset:.3}) than the smaller \
+             one ({subset:.3})"
+        );
+        // A subset accepted at 54, and a superset that buys the marginal
+        // distortion the extra bits are charged: both accepted.
+        let subset_gain = subset.ceil() as u64 + 1;
+        let superset_gain = subset_gain + (superset - subset).ceil() as u64 + 1;
+        let never = || panic!("the probe ran outside the band");
+        for (name, gain, bits) in [
+            ("the subset", subset_gain, 72u64),
+            ("the superset", superset_gain, 104),
+        ] {
+            assert!(
+                keeps_sao(gain, bits, qp, || (fine, coded)),
+                "{name} grid ({gain} for {bits} bits) was declined"
+            );
+        }
+        let _ = never;
+    }
+
+    #[test]
+    fn the_acceptance_model_cannot_resolve_the_margins_it_decides_on() {
+        // The measurement `measure_sao_acceptance_precision` prints, pinned on
+        // the picture and size #287 read its 0.003 dB failure off, and stated
+        // as what it means rather than as a number: the two-point model this
+        // rule extrapolates with is wrong by a larger fraction of the
+        // distortion it predicts than any margin the rule decides on, so
+        // nothing is gained by putting a tolerance around the comparison.
+        //
+        // Predicting a held-out rung from its neighbours is the model doing
+        // its own job with a known answer, and it is an easier job than the
+        // shipped one on both counts - a chord over two quantizer steps read
+        // one step from its anchor, where the writer's is over one step read a
+        // fraction of one from its anchor - so the error here is an upper
+        // bound the shipped model is not measured to beat.
+        let (width, height) = (128usize, 96usize);
+        let (y, cb, cr) = picture(width, height);
+        let ladder = curve_ladder(&y, &cb, &cr, width, height);
+        let mut worst = 0.0f64;
+        let mut worst_at = 0;
+        let mut measured = 0;
+        for qp in 12..=50usize {
+            let (fine, held, coded) = (ladder[qp - 1], ladder[qp], ladder[qp + 1]);
+            if held.bits <= coded.bits || held.sse >= coded.sse {
+                continue;
+            }
+            let truth = (coded.sse - held.sse) as f64;
+            let Some(predicted) = reachable_sse(fine, coded, qp as i32 + 1, held.bits - coded.bits)
+            else {
+                continue;
+            };
+            measured += 1;
+            let relative = (predicted - truth).abs() / truth;
+            if relative > worst {
+                worst = relative;
+                worst_at = qp;
+            }
+        }
+        assert!(
+            measured > 30,
+            "only {measured} rungs of the ladder described a curve, too few to say anything \
+             about the model's resolution"
+        );
+        let bound = SAO_ACCEPTANCE_RESOLUTION_NUM as f64 / SAO_ACCEPTANCE_RESOLUTION_DEN as f64;
+        assert!(
+            worst > 0.10,
+            "the acceptance model predicted every held-out rung to within {:.1}%, so it is far \
+             sharper than SAO_ACCEPTANCE_RESOLUTION_NUM records and the constant, the reasoning \
+             in SaoLambda::band_q8 that rests on it, and this test all need re-deriving rather \
+             than relaxing",
+            worst * 100.0
+        );
+        assert!(
+            worst <= bound,
+            "the acceptance model missed the held-out rung at qp {worst_at} by {:.1}%, beyond \
+             the {:.0}% SAO_ACCEPTANCE_RESOLUTION_NUM records; re-measure it from \
+             measure_sao_acceptance_precision rather than widening the constant to fit",
+            worst * 100.0,
+            bound * 100.0
+        );
     }
 
     #[test]
