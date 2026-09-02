@@ -1964,6 +1964,78 @@ mod tests {
     /// both exercised on every backend.
     const ORIGINS: [(i32, i32); 5] = [(9, 7), (-5, 3), (2, -6), (70, 40), (-3, -3)];
 
+    /// The eight-bit block path accumulates at 16-bit width, and this
+    /// is what holds that formulation against the normative per-sample
+    /// §8.5.3.3.3.2 / §8.5.3.3.3.3 equations rather than against
+    /// another 16-bit accumulation.
+    ///
+    /// `every_backend_matches_scalar_luma_block` compares the vector
+    /// kernels to the scalar one, but at eight bits both sides are the
+    /// narrow kernel, so it cannot see a range error the narrowing
+    /// itself introduces. This runs every block shape, origin and phase
+    /// through the block path and through `interp_luma_sample` /
+    /// `interp_chroma_sample`, which are `i32` throughout.
+    #[test]
+    fn the_eight_bit_block_path_matches_the_per_sample_equations() {
+        let (pw, ph) = (96usize, 72usize);
+        let plane_samples = pseudo_random(8, pw * ph, 255);
+        let plane = RefPlane::new(&plane_samples, pw, ph).unwrap();
+        for &(w, h) in &BLOCK_SHAPES {
+            for &(x_int, y_int) in &ORIGINS {
+                for x_frac in 0..4 {
+                    for y_frac in 0..4 {
+                        let got =
+                            interp_luma_block(&plane, x_int, y_int, x_frac, y_frac, w, h, 8)
+                                .unwrap();
+                        let want = (0..h as i32)
+                            .flat_map(|y| {
+                                (0..w as i32).map(move |x| {
+                                    interp_luma_sample(
+                                        &plane,
+                                        x_int + x,
+                                        y_int + y,
+                                        x_frac,
+                                        y_frac,
+                                        8,
+                                    )
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        assert_eq!(
+                            got, want,
+                            "luma {w}x{h} @({x_int},{y_int}) frac=({x_frac},{y_frac})"
+                        );
+                    }
+                }
+                for x_frac in 0..8 {
+                    for y_frac in 0..8 {
+                        let got =
+                            interp_chroma_block(&plane, x_int, y_int, x_frac, y_frac, w, h, 8)
+                                .unwrap();
+                        let want = (0..h as i32)
+                            .flat_map(|y| {
+                                (0..w as i32).map(move |x| {
+                                    interp_chroma_sample(
+                                        &plane,
+                                        x_int + x,
+                                        y_int + y,
+                                        x_frac,
+                                        y_frac,
+                                        8,
+                                    )
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        assert_eq!(
+                            got, want,
+                            "chroma {w}x{h} @({x_int},{y_int}) frac=({x_frac},{y_frac})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn every_backend_matches_scalar_luma_block() {
         let (pw, ph) = (96usize, 72usize);
