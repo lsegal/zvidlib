@@ -362,6 +362,30 @@ simd_entry_points! {
         plane: &[i32], size: usize, base_out: &mut [i32], br_out: &mut [i32]
     ) = coeff::block_contexts, avx2 = Avx2;
 }
+
+/// The row-pair AVX2 arm of [`coeff_contexts`], for the one block shape the
+/// row-at-a-time kernel cannot fill: a row exactly half the vector's width.
+///
+/// This is its own wrapper rather than a fourth arm of `simd_entry_points!`
+/// because the kernel it wraps is not the generic one - it needs
+/// [`vector::HalfPairs`], which only the 256-bit vector implements. The
+/// `#[inline(always)]` on the kernel is load-bearing here for the same codegen
+/// reason as everywhere else in this module.
+///
+/// # Safety
+///
+/// The caller must have established AVX2 support and `size * 2 == 8`, which
+/// [`coeff_ctx_row_pairs`] is what decides.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn coeff_ctx_pairs_avx2(
+    plane: &[i32],
+    size: usize,
+    base_out: &mut [i32],
+    br_out: &mut [i32],
+) {
+    unsafe { coeff::block_contexts_row_pairs::<vector::Avx2>(plane, size, base_out, br_out) }
+}
 simd_entry_points! {
     #[allow(clippy::too_many_arguments)]
     fn [box_stats_sse41, box_stats_avx2, box_stats_neon](
@@ -390,25 +414,46 @@ macro_rules! dispatch {
 // Safe dispatchers used by the AV1 transform and filter modules
 // ---------------------------------------------------------------------
 
+/// Whether a `size x size` block under `isa` runs the row-pair kernel
+/// [`coeff::block_contexts_row_pairs`] rather than the row-at-a-time
+/// [`coeff::block_contexts`].
+///
+/// That kernel packs rows `r` and `r + 1` into the two halves of one vector, so
+/// it applies exactly when a row is half the vector's width: AVX2's eight lanes
+/// against a 4-wide block, the shape #362 measured as AVX2's worst and the only
+/// narrow one `choose_tx_size` can actually pick. Everything else - every other
+/// size, every other instruction set - keeps the generic kernel.
+#[cfg(target_arch = "x86_64")]
+fn coeff_ctx_row_pairs(isa: SimdIsa, size: usize) -> bool {
+    use vector::I32x as _;
+    isa == SimdIsa::Avx2 && size * 2 == vector::Avx2::LANES
+}
+
 /// The instruction set [`coeff_contexts`] runs a `size x size` block under,
 /// which is `isa` itself everywhere except the one case below.
 ///
 /// x86_64 blocks narrower than AVX2's eight lanes run the SSE4.1 kernel even on
 /// an AVX2 host, the way [`fwht4x4`] keeps x86_64 on its scalar reference for
-/// #337 / #342. The kernel steps along a *row* of the block, so a row shorter
-/// than the vector cannot be split across more than one iteration however wide
-/// the vector is: a 4x4 block is one iteration per row under SSE4.1 *and* under
-/// AVX2, four of AVX2's eight lanes idle in every one of them. Identical work
-/// at twice the width is at best a tie, and it is not even that here, because
-/// the tail store is the one thing the widths do not share. `store_masked`
-/// forwards a full vector straight to the store instruction and stages a
-/// partial one through a stack buffer; `count` is `min(size, LANES)`, so at
-/// `size == 4` SSE4.1's four lanes are exactly full and take the native store
-/// while AVX2 is partial and pays a 32-byte spill plus a 16-byte copy on
-/// *every* store, twice a row, for `base_out` and `br_out` alike. That is the
-/// 3.04x-against-2.50x of #362, and `av1_encode_stage_coeff_ctx` reproduces it
-/// so cleanly because [`crate::av1_encoder::bench::coeff_context_plane`]
-/// derives contexts for 4x4 blocks and nothing else.
+/// #337 / #342 — **unless** [`coeff_ctx_row_pairs`] covers them, which at size
+/// 4 it now does.
+///
+/// The redirect exists because the row-at-a-time kernel steps along a *row* of
+/// the block, so a row shorter than the vector cannot be split across more than
+/// one iteration however wide the vector is: a 4x4 block is one iteration per
+/// row under SSE4.1 *and* under AVX2, four of AVX2's eight lanes idle in every
+/// one of them. Identical work at twice the width is at best a tie, and it is
+/// not even that, because the tail store is the one thing the widths do not
+/// share: `store_masked` forwards a full vector straight to the store
+/// instruction and stages a partial one through a stack buffer, so at
+/// `size == 4` SSE4.1's four lanes are exactly full while AVX2 pays a 32-byte
+/// spill plus a 16-byte copy on *every* store, twice a row. That is the
+/// 3.04x-against-2.50x of #362.
+///
+/// #371 removes both halves of that at size 4 rather than routing around them:
+/// the row-pair kernel does a whole block-row-pair per iteration and stores it
+/// with one native full-width store, so AVX2 keeps size 4 on its own kernel.
+/// The sizes below 8 that remain redirected — 1 to 3 and 5 to 7 — are shapes
+/// the encoder never codes and no vector width fits, so they stay on SSE4.1.
 ///
 /// From `size == 8` up the two arms stop being the same work: AVX2 halves the
 /// iterations per row and its stores are full vectors, so the wider kernel is
@@ -416,7 +461,11 @@ macro_rules! dispatch {
 #[cfg_attr(not(target_arch = "x86_64"), allow(unused_variables))]
 fn coeff_ctx_isa(isa: SimdIsa, size: usize) -> SimdIsa {
     #[cfg(target_arch = "x86_64")]
-    if isa == SimdIsa::Avx2 && size < 8 && std::is_x86_feature_detected!("sse4.1") {
+    if isa == SimdIsa::Avx2
+        && size < 8
+        && !coeff_ctx_row_pairs(isa, size)
+        && std::is_x86_feature_detected!("sse4.1")
+    {
         // AVX2 implies SSE4.1 on every CPU that has ever shipped, but the probe
         // is a cached load next to a whole block's context derivation, so the
         // redirect is checked rather than assumed.
@@ -441,8 +490,16 @@ pub(crate) fn coeff_contexts(
     debug_assert_eq!(plane.len(), coeff::padded_len(size));
     debug_assert_eq!(base_out.len(), size * size);
     debug_assert_eq!(br_out.len(), size * size);
+    let routed = coeff_ctx_isa(isa, size);
+    #[cfg(target_arch = "x86_64")]
+    if coeff_ctx_row_pairs(routed, size) {
+        // `routed` is AVX2, so the host has it; the size condition is the
+        // wrapper's other precondition and is what this just checked.
+        unsafe { coeff_ctx_pairs_avx2(plane, size, base_out, br_out) };
+        return true;
+    }
     dispatch!(
-        coeff_ctx_isa(isa, size),
+        routed,
         [coeff_ctx_sse41, coeff_ctx_avx2, coeff_ctx_neon](plane, size, base_out, br_out),
         return false
     );
