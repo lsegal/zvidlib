@@ -94,7 +94,9 @@ fn main() {
         .next()
         .map_or(DEFAULT_RUNS, |arg| arg.parse().expect("run count"));
     let intervals: Vec<u64> = {
-        let named: Vec<u64> = args.map(|arg| arg.parse().expect("interval in ms")).collect();
+        let named: Vec<u64> = args
+            .map(|arg| arg.parse().expect("interval in ms"))
+            .collect();
         if named.is_empty() {
             DEFAULT_INTERVALS_MS.to_vec()
         } else {
