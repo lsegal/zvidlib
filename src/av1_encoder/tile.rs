@@ -156,9 +156,24 @@ pub(super) const TYPE_GAIN_SAMPLE_INTERVAL: usize = 2;
 /// rank a size on - it costs `smooth` +12.97% against the unsampled estimator un-shrunk - which
 /// is why it is paired with [`TYPE_GAIN_TRUST`] at half, and why the two are documented as one
 /// choice there rather than as two independent ones. #308 removed this window entirely on the
-/// grounds that the shrinkage subsumed it; that no longer holds under #299's rate model, where
-/// frame-wide accumulation misses the distortion bound at `qindex` 1 by 0.109 dB at every
-/// shrinkage from 0 to 16.
+/// grounds that the shrinkage subsumed it; that has not held since #299's rate model.
+///
+/// #343 recorded that `measure_type_gain_memory_windows` had gone flat on the tuning set of the
+/// day - every window from one probe to frame-wide accumulation measuring the identical penalty -
+/// so the window was no longer chosen by a measurement either. It separates again on the three
+/// `gain_*` frames that issue added, which vary the *type gain* across a region boundary rather
+/// than the residual energy: `measure_type_gain_separation` reads a spread of up to 1.7% across
+/// the windows on `gain_bands` and up to 0.77% on `gain_edge`, against 0.000% on all but two of
+/// the twelve frame-and-quantizer pairs the old set offers.
+///
+/// What still fixes the value is the distortion bound, and sharply. On the extended set at the
+/// shipped [`TYPE_GAIN_PROBE_TRUST`], `measure_type_gain_calibration` puts every window from `3`
+/// upwards - and frame-wide accumulation with them - at 0.159 dB below the exhaustive search at
+/// `qindex` 1, three times the 0.05 dB
+/// `the_search_shortcuts_stay_within_their_rate_and_distortion_bound` allows, at every shrinkage.
+/// Only `1` holds it, at the shrinkages [`TYPE_GAIN_TRUST`] is chosen from. The longer windows
+/// are marginally cheaper on the tuning set - +1.22% worst against `1`'s +1.44% - and that is not
+/// a trade the bound permits.
 ///
 /// The decay is one multiply and one divide per accumulator, paid only on the sampled trials.
 pub(super) const TYPE_GAIN_MEMORY: usize = 1;
@@ -228,54 +243,61 @@ pub(crate) enum GainRatio {
 /// [`TYPE_GAIN_TRUST_ONE`] sixteenths. A trial that probed is corrected in full by what it
 /// measured on its own block; only an estimate carried from other blocks is shrunk.
 ///
-/// This and [`TYPE_GAIN_MEMORY`] were derived against each other, and the honest description of
-/// how is that they were grid-searched rather than reasoned to. #281 chose a shrinkage of `2`
-/// against a surface whose worst case was `scene_edge` at +9.32%, and #308 then removed the
-/// recency window on the grounds that the shrinkage subsumed it - both measured while
-/// [`estimate_rate`] charged a level `2 + 2 * bit_length(level)`. #299 replaced that with the
-/// symbol-counting model §5.11.39 actually codes, which removed most of the penalty both
-/// mechanisms existed to absorb: re-running `measure_type_gain_trust` and
-/// `measure_type_gain_memory_windows` against it puts every frame of the tuning set within 0.63%
-/// at every quantizer, flat across the whole `0..=16` shrinkage range and flat across every
-/// window from one probe to the whole frame. Neither knob separates on the set either was chosen
-/// on any more.
+/// #281 chose `2` against a surface whose worst case was `scene_edge` at +9.32%, and #308 then
+/// removed the recency window on the grounds that this shrinkage subsumed it - both measured
+/// while [`estimate_rate`] charged a level `2 + 2 * bit_length(level)`. #299 replaced that with
+/// the symbol-counting model §5.11.39 actually codes, which removed most of the penalty both
+/// mechanisms existed to absorb, and #343 recorded what was left: `measure_type_gain_trust` and
+/// `measure_type_gain_memory_windows` read *flat* on the whole tuning set, every frame within
+/// 0.63% at every quantizer and at every value of either knob. Neither constant was chosen by a
+/// measurement of its own any more, and what actually selected the pair was
+/// `measure_type_gain_memory_against_trust`: a 66-cell grid of which `(memory 1, trust 8)` was
+/// the only cell holding both the 0.05 dB distortion bound and the per-frame ceilings at once.
 ///
-/// What still separates them is the pair of assertions they have to satisfy together -
-/// `the_search_shortcuts_stay_within_their_rate_and_distortion_bound`'s 0.05 dB against the
-/// exhaustive search on `test_pattern` at 96x80, and
-/// `the_type_gain_sampling_interval_holds_on_content_it_was_not_tuned_on`'s per-frame ceilings on
-/// the tuning set - and `(1, 8)` is the *only* point of the 66-cell `memory` x `trust` grid that
-/// satisfies both. It is a defensible policy read on its own terms - correct a non-probing trial
-/// by the freshest measurement at that size, and believe half of it, a remembered ratio being
-/// worth less than a measured one - but it was not arrived at that way, and its neighbours fail:
-/// `(1, 6)` misses the distortion bound at `qindex` 1 by 0.109 dB and `(1, 10)` misses
-/// `smooth`'s ceiling at 128x96 by 0.63 points. Neither assertion was touched to reach it.
+/// Two things changed that, and both are measurements rather than a re-search of the grid.
 ///
-/// Everything above was measured under the rate model #299 replaced, and none of it survives
-/// that change. Re-running `measure_type_gain_trust` against the symbol-counting model puts every
-/// frame of the tuning set within 0.63% of the unsampled estimator at every quantizer and *flat*
-/// across the whole `0..=16` range - `bands` -1.74% at `qindex` 160, `mosaic` +0.63% at 160,
-/// `test_pattern` +0.29% at 200 and +0.00% everywhere else, each identical at every value. The
-/// `scene_edge` penalty this shrinkage was derived to absorb was the rate model mispricing the
-/// large levels a region boundary produces, not the estimator carrying a ratio across one.
-/// `measure_type_gain_memory_windows` reads flat the same way, so [`TYPE_GAIN_MEMORY`] - which
-/// #308 removed on the grounds that this shrinkage subsumed it - is not separable from it either.
+/// **The tuning set separates the type gain now.** Every frame `content_frames` had varied the
+/// residual *energy* across a boundary, which is the right axis for [`TYPE_GAIN_SAMPLE_INTERVAL`]
+/// (whose error is a stale cost) and the wrong one for this shrinkage, which carries the ratio
+/// `(dct - best) / dct` across a boundary. A boundary between two regions that both have a near
+/// zero type gain does not move that ratio however sharply the energy jumps, which is why the
+/// sweeps read flat once the rate model stopped mispricing the levels a boundary produces. The
+/// three `gain_*` frames put a region the non-DCT types win on - a sawtooth ramp, hard diagonal
+/// edges - next to full-range noise, where they cannot, so the ratio genuinely changes across the
+/// boundary at every quantizer. `measure_type_gain_separation` is the check: on `gain_edge` and
+/// `gain_bands` the shrinkage moves the frame's penalty by 0.03% to 2.2% at almost every
+/// quantizer and both sizes, against the 0.000% the old set reads at all but two of twelve.
 ///
-/// Neither constant is therefore chosen by its own sweep any more, and the honest description of
-/// how they *are* chosen is a grid search: `measure_type_gain_memory_against_trust` sweeps the
-/// pair against the two assertions they have to satisfy together, and at the shipped sampling
-/// interval `(memory 1, trust 8)` - correct a non-probing trial by the freshest measurement at
-/// that size and believe half of it - is the *only* cell of that 66-cell grid holding both the
-/// 0.05 dB distortion bound and the per-frame ceilings at once. Its neighbours fail on one side
-/// or the other: `(1, 6)` misses the distortion bound at `qindex` 1 by 0.109 dB, and `(1, 10)`,
-/// `(2, 14)` and `(2, 16)` clear the distortion bound but overshoot a per-frame ceiling.
+/// **The correction a trial measures on its own blocks is shrunk too.** That was the last
+/// unmeasured assumption in the mechanism, and [`TYPE_GAIN_PROBE_TRUST`] is where it is measured;
+/// with it in force this shrinkage is no longer carrying the whole calibration alone. On the
+/// extended set, `measure_type_gain_calibration` puts the worst frame of the grid at +1.2% to
+/// +1.8% for every cell but the un-shrunk corner, against +1.99% to +12.97% before, and the
+/// 0.05 dB bound holds over a `13..=16` by `8..=10` region of the `(probe_trust, trust)` plane
+/// rather than at one point of it. `8` sits inside that region on both axes.
 ///
-/// That fragility is a statement about the shortcuts rather than about these constants. With the
-/// rate model corrected, the DCT-only trial ranking's own error at `qindex` 1 is about 0.2 dB and
-/// no setting of either knob removes it, so what clears the bound is which way a handful of size
-/// decisions fall. Re-deriving the calibration on content that genuinely separates it is tracked
-/// separately rather than papered over here, and no bound, ceiling or test was relaxed to reach
-/// this pair.
+/// What the value says, read as a policy, is what it always said: correct a trial by a ratio it
+/// measured on its own blocks at seven eighths, and one carried from elsewhere in the frame at
+/// half of that, a remembered ratio being worth less than a measured one. The difference is that
+/// both halves of it are now measured. `measure_unified_type_gain` is the check on the policy
+/// itself - correcting *every* trial from the accumulator, so the two are not distinguished at
+/// all, costs the tuning set's worst frame between +6.4% and +37.9% at every window and
+/// shrinkage, and misses the distortion bound at 0.203 dB almost everywhere.
+///
+/// The residual 0.2 dB the DCT-only ranking carries at `qindex` 1 is not this constant's to fix,
+/// and `measure_type_gain_probes_against_trust` is what establishes that: measuring the ratio on
+/// *more* blocks makes it monotonically worse - -0.344 dB at two probes, -0.460 dB at six - while
+/// the candidate reduction falls under the 4x the bound requires. A sharper estimate of the ratio
+/// produces a worse size ranking, so what that error measures is the extrapolation model, not the
+/// sampling: the correction assumes the type search's gain scales with a trial's searched cost,
+/// which over-credits the smallest size at a quantizer where every block is coded. No number of
+/// probes and no setting of these constants removes a model error, which is why they are
+/// shrinkages rather than a sharper estimator. Replacing the model is #349.
+///
+/// No bound, ceiling or test was relaxed to reach this pair. The per-frame ceilings were
+/// re-measured at the new constants as that test's own rule requires: `scene_edge` *tightens*
+/// from 2.5% to 1%, the whole set fits under 1% except `mosaic` at +1.22% and `gain_bands` at
+/// +1.44%, and the worst frame of the tuning set falls from +1.99% to +1.44%.
 ///
 /// # This is a bias, not an estimator's shrinkage
 ///
@@ -304,6 +326,35 @@ pub(crate) enum GainRatio {
 /// the wrong thing", and re-derive it by re-running that grid whenever the rate model, the
 /// quantizer or the type set moves - not by reasoning about how noisy a probe is.
 pub(super) const TYPE_GAIN_TRUST: i64 = 8;
+
+/// How much of a gain a trial *measured on its own blocks* is corrected by, in
+/// [`TYPE_GAIN_TRUST_ONE`] sixteenths.
+///
+/// The correction extrapolates a ratio measured on [`TYPE_GAIN_PROBES`] of a trial's blocks over
+/// all of them, and until #343 a trial that probed was corrected by that ratio in *full*. Nothing
+/// measured that it should be. It was the trial's own measurement, so it was believed entirely,
+/// and only a ratio carried from other blocks was shrunk - by [`TYPE_GAIN_TRUST`], which was then
+/// left carrying the whole calibration and, on the tuning set of the day, could not be chosen by
+/// a sweep of its own.
+///
+/// A full-strength correction is not what the measurements support. `measure_dct_only_ranking_error`
+/// is the sharpest form of it: an estimator probing *every* size search, where every trial is
+/// corrected in full and no ratio is ever remembered, reconstructs 0.344 dB *below* the exhaustive
+/// search at `qindex` 1 on the 96x80 `test_pattern`, against the sampled estimator's +0.023 dB.
+/// The extrapolation over-credits, and it over-credits most where a trial has the most blocks to
+/// extrapolate over, which is the smallest size.
+///
+/// `measure_type_gain_probe_trust` sweeps this against [`TYPE_GAIN_TRUST`] over the whole tuning
+/// set - `content_frames` including the three `gain_*` frames added for #343, plus `test_pattern`,
+/// at 128x96 and 192x160 over six quantizers - and `14` is where it lands. At the shipped
+/// shrinkage the tuning set's worst frame falls from +1.99% at the un-shrunk `16` to +1.67% at
+/// `14` and `15`, back to +1.86% at `13` and to +3.62% at `12`; the mean improves from -0.085% to
+/// -0.145%; and the 0.05 dB distortion bound holds over the whole `13..=16` by `trust` `8..=10`
+/// region rather than at the single cell of a 66-cell grid #343 recorded. `14` is the interior of
+/// that region on both axes, and it is chosen by the tuning set rather than by the bound.
+///
+/// This costs nothing: the shrinkage is the multiply and divide that was already there.
+pub(super) const TYPE_GAIN_PROBE_TRUST: i64 = 14;
 
 /// [`TYPE_GAIN_TRUST`] denominator: the un-shrunk correction.
 const TYPE_GAIN_TRUST_ONE: i64 = 16;
@@ -459,6 +510,14 @@ pub(crate) struct FrameEncoder<'a> {
     /// The shrinkage in force, in the units of [`TYPE_GAIN_TRUST`], so a test can sweep it.
     #[cfg(test)]
     type_gain_trust: i64,
+    /// The shrinkage a trial's own probe measurement is corrected by, so a test can sweep it.
+    /// [`TYPE_GAIN_PROBE_TRUST`] outside tests.
+    #[cfg(test)]
+    type_gain_probe_trust: i64,
+    /// Whether every trial reads its ratio back from the accumulator, including one that probed,
+    /// so a test can measure the probing asymmetry away. `false` outside tests.
+    #[cfg(test)]
+    unified_type_gain: bool,
     /// Transform-type candidates actually transformed, quantized and reconstructed, which is the
     /// work the shortcuts exist to remove.
     #[cfg(test)]
@@ -685,6 +744,10 @@ impl<'a> FrameEncoder<'a> {
             type_gain_ratio: GainRatio::Weighted,
             #[cfg(test)]
             type_gain_trust: TYPE_GAIN_TRUST,
+            #[cfg(test)]
+            type_gain_probe_trust: TYPE_GAIN_PROBE_TRUST,
+            #[cfg(test)]
+            unified_type_gain: false,
             #[cfg(test)]
             type_gain_memory: TYPE_GAIN_MEMORY,
             #[cfg(test)]
@@ -944,6 +1007,49 @@ impl<'a> FrameEncoder<'a> {
     #[cfg(not(test))]
     fn type_gain_trust(&self) -> i64 {
         TYPE_GAIN_TRUST
+    }
+
+    /// Overrides how far a trial's *own* probe measurement is shrunk, so a test can sweep it.
+    #[cfg(test)]
+    pub(crate) fn with_type_gain_probe_trust(mut self, trust: i64) -> Self {
+        assert!(
+            (0..=TYPE_GAIN_TRUST_ONE).contains(&trust),
+            "shrinkage is a fraction"
+        );
+        self.type_gain_probe_trust = trust;
+        self
+    }
+
+    /// The measured-gain shrinkage in force. [`TYPE_GAIN_PROBE_TRUST`] outside tests.
+    #[cfg(test)]
+    fn type_gain_probe_trust(&self) -> i64 {
+        self.type_gain_probe_trust
+    }
+
+    /// The measured-gain shrinkage in force. [`TYPE_GAIN_PROBE_TRUST`] outside tests.
+    #[cfg(not(test))]
+    fn type_gain_probe_trust(&self) -> i64 {
+        TYPE_GAIN_PROBE_TRUST
+    }
+
+    /// Corrects every trial from the accumulator, including one that probed, so the correction no
+    /// longer depends on which coding blocks the stride happened to sample.
+    #[cfg(test)]
+    pub(crate) fn with_unified_type_gain(mut self) -> Self {
+        self.unified_type_gain = true;
+        self
+    }
+
+    /// Whether a trial that probed still reads its own measurement back. `false` outside tests.
+    #[cfg(test)]
+    fn unified_type_gain(&self) -> bool {
+        self.unified_type_gain
+    }
+
+    /// Whether a trial that probed still reads its own measurement back. `false` outside tests.
+    #[cfg(not(test))]
+    fn unified_type_gain(&self) -> bool {
+        false
     }
 
     /// Encodes the tile and returns the symbol-coded bytes (`decode_tile`, §5.11.2).
@@ -1427,7 +1533,8 @@ impl<'a> FrameEncoder<'a> {
     /// frame instead, so it is still corrected - by the ratio a probe of its own would have been
     /// measuring.
     fn corrected_trial_cost(&self, cost: i64, tx_width: usize) -> i64 {
-        let (dct, best) = if self.probe_dct_cost > 0 {
+        let measured_here = self.probe_dct_cost > 0 && !self.unified_type_gain();
+        let (dct, best) = if measured_here {
             (self.probe_dct_cost, self.probe_best_cost)
         } else {
             let slot = type_gain_slot(tx_width);
@@ -1445,9 +1552,12 @@ impl<'a> FrameEncoder<'a> {
             return cost;
         }
         let mut measured = dct - best;
-        if self.probe_dct_cost <= 0 {
-            measured = measured * self.type_gain_trust() / TYPE_GAIN_TRUST_ONE;
-        }
+        let trust = if measured_here {
+            self.type_gain_probe_trust()
+        } else {
+            self.type_gain_trust()
+        };
+        measured = measured * trust / TYPE_GAIN_TRUST_ONE;
         cost - measured.saturating_mul(self.trial_searched_cost) / dct
     }
 
