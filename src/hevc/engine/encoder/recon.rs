@@ -44,7 +44,7 @@
 
 use crate::hevc::engine::binarization::PartMode;
 use crate::hevc::engine::deblock::{DeblockCu, DeblockCuDesc, DeblockCuParams, NoFilterMap};
-use crate::hevc::engine::encoder::rdo::PictureDecision;
+use crate::hevc::engine::encoder::rdo::{BlockDecision, PictureDecision};
 use crate::hevc::engine::encoder::recon_simd::{self, BandStats, EdgeStats};
 use crate::hevc::engine::encoder::transform::{
     ForwardBlockParams, chroma_qp, luma_qp, transform_and_quantize,
@@ -178,25 +178,20 @@ pub(crate) fn reconstruct_picture(
         // block, which is what this writer emits today; anything else is
         // coded from its searched partitions.
         let coded_as_pcm = reference.is_none() || block.rd_cost >= block.pcm_cost;
+        let predict_from = if coded_as_pcm { None } else { reference };
+        reconstruct_block(
+            &mut pic,
+            src,
+            predict_from,
+            block,
+            cfg.quantized_residual.then_some(cfg.qp),
+        );
         for partition in &block.partitions {
             let (mv_x, mv_y) = if coded_as_pcm {
                 (0, 0)
             } else {
                 (partition.mv_x, partition.mv_y)
             };
-            let predict_from = if coded_as_pcm { None } else { reference };
-            reconstruct_partition(
-                &mut pic,
-                src,
-                predict_from,
-                partition.x,
-                partition.y,
-                partition.w,
-                partition.h,
-                mv_x,
-                mv_y,
-                cfg.quantized_residual.then_some(cfg.qp),
-            );
             field.fill_rect(
                 partition.x,
                 partition.y,
@@ -242,7 +237,13 @@ pub(crate) fn reconstruct_picture(
     if cfg.sao_luma || cfg.sao_chroma {
         // No §7.3.8.3 syntax is written for this reconstruction, so the
         // decision is distortion-only.
-        let grid = estimate_sao(&pic, src, cfg.sao_luma, cfg.sao_chroma, 0);
+        let grid = estimate_sao(
+            &pic,
+            src,
+            cfg.sao_luma,
+            cfg.sao_chroma,
+            SaoLambda::closed_form(0),
+        );
         pic = crate::hevc::engine::sao::apply_sao_picture_full(
             pic,
             &grid,
@@ -264,9 +265,17 @@ pub(crate) fn reconstruct_picture(
     }
 }
 
-/// Reconstruct one prediction partition: form the prediction, code the
-/// residual against it, and add the coded residual back (§8.6.6
+/// Reconstruct one coding unit: form each prediction partition's prediction,
+/// code the residual against it over the *coding unit's* transform tree, and
+/// add the coded residual back (§8.6.6
 /// `recSamples = Clip1( predSamples + resSamples )`).
+///
+/// §7.3.8.8 hangs the transform tree off the coding unit, not off the
+/// prediction unit, which is why a 16x16 coding unit keeps an 8x8 chroma
+/// transform block however its prediction is partitioned. The prediction
+/// geometry is still each partition's own — its motion vector predicts only
+/// its own samples — but it is gathered into one coding-unit-sized buffer that
+/// the residual coding then reads whole.
 ///
 /// With `quant` set to `None` the residual is `source − prediction` coded
 /// exactly, as a PCM block carries it, and the reconstruction is the source.
@@ -274,39 +283,48 @@ pub(crate) fn reconstruct_picture(
 /// forward transform and §8.6.3 quantization and back through the decoder's
 /// own §8.6.2 reconstruction — which is what makes the reference picture
 /// differ from the source, and the entire reason it is kept separately at all.
-#[allow(clippy::too_many_arguments)]
-fn reconstruct_partition(
+fn reconstruct_block(
     pic: &mut Picture,
     src: SourcePlanes<'_>,
     reference: Option<&ReconstructedPicture>,
-    x: usize,
-    y: usize,
-    w: usize,
-    h: usize,
-    mv_x: i32,
-    mv_y: i32,
+    block: &BlockDecision,
     quant: Option<i32>,
 ) {
+    let pred_mode = if reference.is_some() {
+        PredMode::Inter
+    } else {
+        PredMode::Intra
+    };
+    let size = block.size;
+    let mut prediction = vec![0u8; size * size];
+    gather_block_prediction(
+        &mut prediction,
+        size,
+        reference.map(|r| (r.y.as_slice(), r.width, r.height)),
+        block,
+        false,
+    );
     reconstruct_component(
         pic,
         Plane::Luma,
         src.y,
         src.width,
-        reference.map(|r| (r.y.as_slice(), r.width, r.height)),
-        x,
-        y,
-        w,
-        h,
-        mv_x,
-        mv_y,
+        &prediction,
+        block.x,
+        block.y,
+        size,
         // §8.6.1 eq. 8-284 — the luma `qP` from `SliceQpY`.
         quant.map(|qp| luma_qp(qp, BIT_DEPTH)),
         TfComponent::Luma,
+        pred_mode,
     );
-    // 4:2:0 — the chroma partition is the luma one halved, and the motion
-    // vector with it (§8.5.3.3.3.3 whole-sample part; this search is
-    // whole-pel, so the halved vector needs no fractional interpolation).
+    // 4:2:0 — the chroma coding block is the luma one halved, and each
+    // partition's motion vector with it (§8.5.3.3.3.3 whole-sample part; this
+    // search is whole-pel, so the halved vector needs no fractional
+    // interpolation).
     let (cw, chh) = (src.width / 2, src.height / 2);
+    let c_size = size / 2;
+    prediction.truncate(c_size * c_size);
     for (plane, source, reference_plane, component) in [
         (
             Plane::Cb,
@@ -321,97 +339,122 @@ fn reconstruct_partition(
             TfComponent::Cr,
         ),
     ] {
+        gather_block_prediction(
+            &mut prediction,
+            c_size,
+            reference_plane.map(|p| (p, cw, chh)),
+            block,
+            true,
+        );
         reconstruct_component(
             pic,
             plane,
             source,
             cw,
-            reference_plane.map(|p| (p, cw, chh)),
-            x / 2,
-            y / 2,
-            (w / 2).max(1),
-            (h / 2).max(1),
-            mv_x / 2,
-            mv_y / 2,
+            &prediction,
+            block.x / 2,
+            block.y / 2,
+            c_size,
             // §8.6.1 with the writer's zero chroma QP offsets: the chroma
             // blocks quantize at the Table 8-10 mapping of the luma QP.
             quant.map(|qp| chroma_qp(qp, 0, BIT_DEPTH, CHROMA_ARRAY_TYPE)),
             component,
+            pred_mode,
         );
     }
 }
 
-/// [`reconstruct_partition`] for one colour component.
+/// Gathers one coding unit's §8.5.3.3.2 prediction, one prediction partition
+/// at a time, into the `size` x `size` buffer [`reconstruct_component`] codes
+/// the residual against.
+///
+/// `chroma` halves the coding block, each partition inside it, and each
+/// partition's motion vector, which is the 4:2:0 geometry. The partitions of a
+/// coding unit tile it exactly, so every position of `prediction` is written.
+fn gather_block_prediction(
+    prediction: &mut [u8],
+    size: usize,
+    reference: Option<(&[u8], usize, usize)>,
+    block: &BlockDecision,
+    chroma: bool,
+) {
+    let scale = |v: usize| if chroma { v / 2 } else { v };
+    let (x0, y0) = (scale(block.x), scale(block.y));
+    for partition in &block.partitions {
+        let (px, py) = (scale(partition.x), scale(partition.y));
+        let (pw, ph) = (scale(partition.w).max(1), scale(partition.h).max(1));
+        let (mv_x, mv_y) = if chroma {
+            (partition.mv_x / 2, partition.mv_y / 2)
+        } else {
+            (partition.mv_x, partition.mv_y)
+        };
+        for row in 0..ph {
+            let start = (py - y0 + row) * size + (px - x0);
+            gather_prediction_row(
+                &mut prediction[start..start + pw],
+                reference,
+                px,
+                py + row,
+                mv_x,
+                mv_y,
+            );
+        }
+    }
+}
+
+/// [`reconstruct_block`] for one colour component, over the square `size` x
+/// `size` coding block whose prediction the caller has already gathered.
 #[allow(clippy::too_many_arguments)]
 fn reconstruct_component(
     pic: &mut Picture,
     plane: Plane,
     source: &[u8],
     src_stride: usize,
-    reference: Option<(&[u8], usize, usize)>,
+    prediction: &[u8],
     x: usize,
     y: usize,
-    w: usize,
-    h: usize,
-    mv_x: i32,
-    mv_y: i32,
+    size: usize,
     quant: Option<u32>,
     component: TfComponent,
+    pred_mode: PredMode,
 ) {
+    let (w, h) = (size, size);
+    debug_assert_eq!(prediction.len(), w * h);
     let Some(q_p) = quant else {
         // The residual is coded exactly, so the reconstruction is the source,
         // and the §8.6.6 add-and-clip of a whole row is a straight-line run
-        // the vector kernel can take whole once the prediction is gathered.
-        let mut prediction = vec![0u8; w];
+        // the vector kernel can take whole.
         let (dst, dst_stride) = pic.plane_mut(plane);
         for row in 0..h {
             let sy = y + row;
-            gather_prediction_row(&mut prediction, reference, x, sy, mv_x, mv_y);
             let src_row = &source[sy * src_stride + x..sy * src_stride + x + w];
             let dst_row = &mut dst[sy * dst_stride + x..sy * dst_stride + x + w];
-            recon_simd::reconstruct_row(dst_row, src_row, &prediction);
+            recon_simd::reconstruct_row(dst_row, src_row, &prediction[row * w..row * w + w]);
         }
         return;
     };
 
-    // §7.3.8.8: the residual of a partition is coded as square transform
-    // blocks, the smallest of which is 4x4. An asymmetric partition can be as
-    // narrow as four luma samples, and its 4:2:0 chroma half then measures two
-    // — less than one transform block, and not a whole number of them in the
-    // other direction either. Tiling by the largest legal square that fits and
-    // clipping each block to the partition is what a writer does there: the
-    // samples past the edge carry no residual, so they are coded as zero and
-    // never written back.
+    // §7.3.8.8: the residual of a *coding unit* is coded as square transform
+    // blocks. The coding block is square and no smaller than the 4x4 floor in
+    // either component, so the largest legal square tiles it exactly and no
+    // block is ever clipped or zero-padded.
     let n_tbs = transform_block_size(w, h);
-    let mut prediction = vec![0i32; n_tbs * n_tbs];
+    debug_assert_eq!(w % n_tbs, 0);
+    let mut pred_block = vec![0i32; n_tbs * n_tbs];
     let mut residual = vec![0i32; n_tbs * n_tbs];
-    let mut pred_row = vec![0u8; n_tbs];
     for by in (0..h).step_by(n_tbs) {
         for bx in (0..w).step_by(n_tbs) {
-            let block_h = n_tbs.min(h - by);
-            let block_w = n_tbs.min(w - bx);
-            if block_h != n_tbs || block_w != n_tbs {
-                // Only the clipped blocks need the padding zeroed; a whole one
-                // overwrites every position below.
-                residual.fill(0);
-            }
-            for row in 0..block_h {
+            for row in 0..n_tbs {
                 let sy = y + by + row;
-                gather_prediction_row(&mut pred_row[..block_w], reference, x + bx, sy, mv_x, mv_y);
-                for col in 0..block_w {
-                    let predicted = i32::from(pred_row[col]);
-                    prediction[row * n_tbs + col] = predicted;
+                for col in 0..n_tbs {
+                    let predicted = i32::from(prediction[(by + row) * w + bx + col]);
+                    pred_block[row * n_tbs + col] = predicted;
                     residual[row * n_tbs + col] =
                         i32::from(source[sy * src_stride + x + bx + col]) - predicted;
                 }
             }
             // Forward transform → quantize → the decoder's own §8.6.2
             // reconstruction of the levels that survived.
-            let pred_mode = if reference.is_some() {
-                PredMode::Inter
-            } else {
-                PredMode::Intra
-            };
             let levels = transform_and_quantize(
                 &residual,
                 None,
@@ -452,12 +495,12 @@ fn reconstruct_component(
             // through the vector kernel whole rather than one `set_sample` at
             // a time.
             let (dst, dst_stride) = pic.plane_mut(plane);
-            for row in 0..block_h {
+            for row in 0..n_tbs {
                 let start = (y + by + row) * dst_stride + x + bx;
                 recon_simd::add_clip_row(
-                    &mut dst[start..start + block_w],
-                    &prediction[row * n_tbs..row * n_tbs + block_w],
-                    &coded[row * n_tbs..row * n_tbs + block_w],
+                    &mut dst[start..start + n_tbs],
+                    &pred_block[row * n_tbs..(row + 1) * n_tbs],
+                    &coded[row * n_tbs..(row + 1) * n_tbs],
                 );
             }
         }
@@ -499,14 +542,12 @@ fn gather_prediction_row(
     }
 }
 
-/// The largest legal square transform block for a `w` x `h` partition: the
+/// The largest legal square transform block for a `w` x `h` coding block: the
 /// largest power of two no greater than either side, clamped to the
 /// §7.4.3.2.1 4..=32 transform-block range.
 ///
-/// The clamp at 4 means the result does not always divide the partition — an
-/// asymmetric partition's 4:2:0 chroma half can be as short as two samples —
-/// so the caller clips the last block of each row and column to the partition
-/// rather than assuming a whole tiling.
+/// A coding block is square and at least 8x8 in luma, so both it and its 4:2:0
+/// chroma halves are whole multiples of the result and the tiling is exact.
 fn transform_block_size(w: usize, h: usize) -> usize {
     let side = w.min(h);
     let log2 = (usize::BITS - 1 - side.leading_zeros()).clamp(2, 5);
@@ -605,12 +646,12 @@ pub(crate) const SAO_OFFSET_MAX: i32 = 7;
 /// prediction reads the *unfiltered* neighbours — the grid returned here
 /// describes the picture's output, never this picture's own prediction input.
 ///
-/// `lambda_q8` is passed through to [`estimate_sao`], which is what makes the
+/// `lambda` is passed through to [`estimate_sao`], which is what makes the
 /// per-CTB decision charge for the syntax the caller then writes.
 pub(crate) fn sao_reconstruction(
     recon: &mut ReconstructedPicture,
     src: SourcePlanes<'_>,
-    lambda_q8: u32,
+    lambda: SaoLambda,
 ) -> Vec<ResolvedSao> {
     let (width, height) = (recon.width, recon.height);
     let mut pic = Picture::new(width, height, CHROMA_ARRAY_TYPE, BIT_DEPTH, BIT_DEPTH);
@@ -624,7 +665,7 @@ pub(crate) fn sao_reconstruction(
             *dst = i32::from(src);
         }
     }
-    let grid = estimate_sao(&pic, src, true, true, lambda_q8);
+    let grid = estimate_sao(&pic, src, true, true, lambda);
     let pic = crate::hevc::engine::sao::apply_sao_picture_full(
         pic,
         &grid,
@@ -671,11 +712,11 @@ pub(crate) fn sao_reconstruction(
 /// under band offset, its own `sao_band_position` — no position is inferred —
 /// which is the whole of what the syntax gives cIdx 2 of its own.
 ///
-/// `lambda_q8` is the §9 rate-distortion multiplier in 1/256 units, matching
-/// [`crate::hevc::engine::encoder::rdo::lambda_q8`]. SAO costs per-CTB syntax
+/// `lambda` is the pair of §9 rate-distortion multipliers the candidates are
+/// priced with — see [`SaoLambda`]. SAO costs per-CTB syntax
 /// on every CTB it is enabled for, so a candidate is taken only when its SSE
 /// reduction clears `lambda * bins`, the bins being the §9.3.3 binarization's
-/// own count for the parameters that would be coded. At `lambda_q8 == 0` the
+/// own count for the parameters that would be coded. At a zero `lambda` the
 /// test degrades to "any reduction at all", which is what a caller that codes
 /// no syntax for the decision wants.
 fn estimate_sao(
@@ -683,7 +724,7 @@ fn estimate_sao(
     src: SourcePlanes<'_>,
     sao_luma: bool,
     sao_chroma: bool,
-    lambda_q8: u32,
+    lambda: SaoLambda,
 ) -> Vec<ResolvedSao> {
     let w_ctbs = src.width.div_ceil(CTB);
     let h_ctbs = src.height.div_ceil(CTB);
@@ -692,10 +733,10 @@ fn estimate_sao(
         for rx in 0..w_ctbs {
             let cell = &mut grid[ry * w_ctbs + rx];
             if sao_luma {
-                cell.components[0] = best_luma_sao(pic, src, rx, ry, lambda_q8);
+                cell.components[0] = best_luma_sao(pic, src, rx, ry, lambda);
             }
             if sao_chroma {
-                let [cb, cr] = best_chroma_sao(pic, src, rx, ry, lambda_q8);
+                let [cb, cr] = best_chroma_sao(pic, src, rx, ry, lambda);
                 cell.components[1] = cb;
                 cell.components[2] = cr;
             }
@@ -726,13 +767,18 @@ fn offset_abs_bins(offsets: &[i32; 5]) -> u64 {
 }
 /// The `D + lambda * R` score of one SAO candidate: the SSE reduction it buys
 /// less the §7.3.8.3 syntax it has to be signalled with, in the same units
-/// and under the same lambda the mode decision uses.
+/// the mode decision uses.
+///
+/// `bins` are priced at [`SaoLambda::mode_q8`] and `band_bins` — band
+/// offset's own syntax, the rate the closed form was never derived for — at
+/// [`SaoLambda::band_q8`]. A candidate that codes no band syntax passes 0.
 ///
 /// Positive means the candidate is worth coding at all; the largest score
 /// wins, which is what lets edge offset and band offset be compared against
 /// each other and against "off" in one decision rather than two.
-fn rd_score(gain: i64, bins: u64, lambda_q8: u32) -> i64 {
-    gain - (bins * u64::from(lambda_q8) / 256) as i64
+fn rd_score(gain: i64, bins: u64, band_bins: u64, lambda: SaoLambda) -> i64 {
+    let rate = bins * u64::from(lambda.mode_q8) + band_bins * u64::from(lambda.band_q8);
+    gain - (rate / 256) as i64
 }
 
 /// The widest the slice-level SAO decision's calibrated multiplier is allowed
@@ -740,45 +786,99 @@ fn rd_score(gain: i64, bins: u64, lambda_q8: u32) -> i64 {
 /// two-point measurement of one picture is trusted over the closed form —
 /// and, because it is a bound known before the measurement is taken, it is
 /// also what lets `keeps_sao` skip the measurement whenever the decision is
-/// already outside the band, and what [`band_offset_bins`] charges band
-/// offset's own syntax at.
+/// already outside the band, and what bounds the band-syntax charge
+/// [`SaoLambda::band_q8`] carries.
 pub(super) const SAO_LAMBDA_BAND: u64 = 4;
 
-/// What band offset's own syntax — the five `sao_band_position` bins and its
-/// `sao_offset_sign` bins — is charged per bin, as a multiple of `lambda_q8`,
-/// numerator over denominator. It is the coarse end of the departure the
-/// slice-level decision measured between the closed form and what a picture's
-/// own curve pays per bit: 0.4x to 2.5x, in neither direction consistently.
-const BAND_SYNTAX_CHARGE_NUM: u64 = 5;
-const BAND_SYNTAX_CHARGE_DEN: u64 = 2;
+/// What band offset's own syntax is charged per bin, as a multiple of
+/// `lambda_q8`, numerator over denominator — see [`SaoLambda::band_q8`] for
+/// what the multiple is and what the sweep says about it.
+const BAND_SYNTAX_CHARGE_NUM: u32 = 5;
+const BAND_SYNTAX_CHARGE_DEN: u32 = 2;
 
-/// The §7.3.8.3 bins one band-offset component costs beyond its shared
-/// `sao_type_idx` bin: a `sao_offset_sign` for every nonzero offset, the five
-/// fixed-length `sao_band_position` bins, and the offsets' own truncated-Rice
-/// bins.
+/// The two §9 rate-distortion multipliers the per-CTB SAO search prices
+/// syntax with, both in the 1/256 units
+/// [`crate::hevc::engine::encoder::rdo::lambda_q8`] returns.
+///
+/// Two, because the search prices two kinds of bit and only one of them is
+/// what the closed form was derived for. Inside a picture already committed
+/// to coding `sao( )` on every CTB, choosing an edge class — or choosing
+/// offsets at all — is a choice between two codings of one CTB at one QP,
+/// where the picture cancels out of the comparison and `lambda_q8` is the
+/// right instrument. Band offset's own syntax is not that: its five
+/// `sao_band_position` bins and its `sao_offset_sign` bins are rate that buys
+/// a value-range correction no edge class can reach, and what that rate is
+/// worth is a property of the content in the same way the slice-level
+/// decision's is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct SaoLambda {
+    /// What every bin the closed form is derived for costs: the type and
+    /// class bins, and the offsets' own truncated-Rice bins.
+    pub(crate) mode_q8: u32,
+    /// What band offset's own syntax costs — the five `sao_band_position`
+    /// bins and the `sao_offset_sign` bins.
+    ///
+    /// #287 set out to read this off the slice-level probe, the way
+    /// `calibrated_sao_lambda_q8` reads the slice-level multiplier, so that
+    /// the search and the acceptance test would price the same bits alike.
+    /// The QP 12-51 sweep on both test pictures at both sizes says it cannot
+    /// be, and brackets it instead. Three measurements, all recorded by
+    /// `sao_sweep`:
+    ///
+    /// - The probe's own price for a marginal bit — the tangent to this
+    ///   picture's curve at its coded point, which is the steepest thing the
+    ///   probe can be read for — lands at 1.1x to 1.4x `lambda_q8`.
+    /// - Below 1.5x, the writer accepts a band component at noise 128x96
+    ///   QP 32 that puts the slice 0.003 dB under its own SAO-off curve,
+    ///   breaking `every_accepted_sao_point_sits_on_the_writers_own_curve`.
+    /// - At [`SAO_LAMBDA_BAND`], the trust bound, band offset is never
+    ///   selected at all and #274's operating points go with it.
+    ///
+    /// So the probe's own answer sits below the floor the invariant needs,
+    /// and the charge stays a constant inside the measured window
+    /// [1.5x, 4x) — narrowed by measurement, not derived from one. What it
+    /// is standing in for is not a mispriced bit but the slice-level
+    /// acceptance rule's own precision: at these operating points the rule
+    /// decides on margins of a few parts in a thousand, and it is not
+    /// monotone in the grid — a superset grid measured to be worth its own
+    /// bits can fail the test its subset passes, because the multiplier is
+    /// itself a function of the rate being judged.
+    pub(crate) band_q8: u32,
+}
+
+impl SaoLambda {
+    /// Both prices at the closed form, for a caller that codes no `sao( )`
+    /// syntax for its decision and so charges nothing for any of it.
+    pub(crate) fn closed_form(lambda_q8: u32) -> Self {
+        Self {
+            mode_q8: lambda_q8,
+            band_q8: lambda_q8,
+        }
+    }
+
+    /// The prices the writer searches with: the closed form for every bin it
+    /// was derived for, and [`SaoLambda::band_q8`] for band offset's own.
+    pub(crate) fn for_search(lambda_q8: u32) -> Self {
+        Self {
+            mode_q8: lambda_q8,
+            band_q8: (lambda_q8 * BAND_SYNTAX_CHARGE_NUM).div_ceil(BAND_SYNTAX_CHARGE_DEN),
+        }
+    }
+}
+
+/// The §7.3.8.3 bins one band-offset component costs that edge offset does
+/// not: the five fixed-length `sao_band_position` bins and a
+/// `sao_offset_sign` for every nonzero offset.
 ///
 /// This is what makes band offset a different bet from edge offset at the
-/// same gain: it pays five position bins and up to four sign bins where edge
-/// offset pays two class bins and infers its signs.
-///
-/// Those band-only bins — the position and the signs — are charged at
-/// [`BAND_SYNTAX_CHARGE_NUM`]/[`BAND_SYNTAX_CHARGE_DEN`] times `lambda_q8`
-/// rather than at `lambda_q8` itself. The closed form is derived for choosing
-/// between two codings of one block; edge offset's rate is the part of that
-/// trade the sweep has always been measured on, while these bins are rate the
-/// closed form has never been checked against, and the slice-level decision
-/// measured the closed form missing what a picture's own curve pays per bit
-/// by up to 2.5x. Charging them at that coarse end means band offset is taken
-/// where it wins by more than the uncertainty in its own price and left alone
-/// where it wins by less — which at coarse QPs is the difference between a
-/// slice that sits on the writer's own rate-distortion curve and one that
-/// sits a hair under it, and at [`SAO_LAMBDA_BAND`], the trust bound rather
-/// than the measured end, would be the difference between band offset paying
-/// at QP 12 and never being selected at all.
-fn band_offset_bins(offsets: &[i32; 5]) -> u64 {
-    let signs = offsets[1..5].iter().filter(|&&o| o != 0).count() as u64;
-    (BAND_SYNTAX_CHARGE_NUM * (5 + signs)).div_ceil(BAND_SYNTAX_CHARGE_DEN)
-        + offset_abs_bins(offsets)
+/// same gain — it pays five position bins and up to four sign bins where edge
+/// offset pays two class bins and infers its signs — and it is the part of a
+/// band candidate's rate [`SaoLambda::band_q8`] prices. The offsets' own
+/// truncated-Rice bins are counted by [`offset_abs_bins`] exactly as edge
+/// offset's are, and priced the same way, because they are the same kind of
+/// bit.
+fn band_syntax_bins(offsets: &[i32; 5]) -> u64 {
+    5 + offsets[1..5].iter().filter(|&&o| o != 0).count() as u64
 }
 
 /// The per-band summed and counted error of one CTB of one plane, indexed by
@@ -844,7 +944,7 @@ fn best_luma_sao(
     src: SourcePlanes<'_>,
     rx: usize,
     ry: usize,
-    lambda_q8: u32,
+    lambda: SaoLambda,
 ) -> ResolvedSaoComponent {
     let rect = ctb_rect(pic, Plane::Luma, rx, ry);
     let mut best = ResolvedSaoComponent::off();
@@ -853,7 +953,7 @@ fn best_luma_sao(
         let (gain, offsets) = class_offsets(pic, Plane::Luma, src.y, src.width, rect, eo_class);
         // One `sao_type_idx_luma` bin beyond the "off" bin, two
         // `sao_eo_class_luma` bins, and the offsets' own.
-        let score = rd_score(gain, 1 + 2 + offset_abs_bins(&offsets), lambda_q8);
+        let score = rd_score(gain, 1 + 2 + offset_abs_bins(&offsets), 0, lambda);
         if score > best_score {
             best_score = score;
             best = ResolvedSaoComponent {
@@ -869,7 +969,12 @@ fn best_luma_sao(
         let (gain, offsets) = band_offsets(&sums, &counts, band_position);
         // One `sao_type_idx_luma` bin beyond the "off" bin, then the band
         // path's own signs, position and offsets.
-        let score = rd_score(gain, 1 + band_offset_bins(&offsets), lambda_q8);
+        let score = rd_score(
+            gain,
+            1 + offset_abs_bins(&offsets),
+            band_syntax_bins(&offsets),
+            lambda,
+        );
         if score > best_score {
             best_score = score;
             best = ResolvedSaoComponent {
@@ -896,7 +1001,7 @@ fn best_chroma_sao(
     src: SourcePlanes<'_>,
     rx: usize,
     ry: usize,
-    lambda_q8: u32,
+    lambda: SaoLambda,
 ) -> [ResolvedSaoComponent; 2] {
     let (cb_rect, cr_rect) = (
         ctb_rect(pic, Plane::Cb, rx, ry),
@@ -914,7 +1019,7 @@ fn best_chroma_sao(
         // `sao_eo_class_chroma` bins, and both components' offsets — cIdx 2
         // codes neither a type nor a class of its own.
         let bins = 1 + 2 + offset_abs_bins(&cb_offsets) + offset_abs_bins(&cr_offsets);
-        let score = rd_score(cb_gain + cr_gain, bins, lambda_q8);
+        let score = rd_score(cb_gain + cr_gain, bins, 0, lambda);
         if score > best_score {
             best_score = score;
             best = [
@@ -933,11 +1038,12 @@ fn best_chroma_sao(
             ];
         }
     }
-    let cb = best_band_component(pic, Plane::Cb, src.cb, chroma_stride, cb_rect, lambda_q8);
-    let cr = best_band_component(pic, Plane::Cr, src.cr, chroma_stride, cr_rect, lambda_q8);
+    let cb = best_band_component(pic, Plane::Cb, src.cb, chroma_stride, cb_rect, lambda);
+    let cr = best_band_component(pic, Plane::Cr, src.cr, chroma_stride, cr_rect, lambda);
     // The shared `sao_type_idx_chroma` bin is paid once for the pair.
-    let bins = 1 + band_offset_bins(&cb.1) + band_offset_bins(&cr.1);
-    let score = rd_score(cb.0 + cr.0, bins, lambda_q8);
+    let bins = 1 + offset_abs_bins(&cb.1) + offset_abs_bins(&cr.1);
+    let band_bins = band_syntax_bins(&cb.1) + band_syntax_bins(&cr.1);
+    let score = rd_score(cb.0 + cr.0, bins, band_bins, lambda);
     if score > best_score {
         best = [
             ResolvedSaoComponent {
@@ -968,14 +1074,19 @@ fn best_band_component(
     source: &[u8],
     src_stride: usize,
     rect: (usize, usize, usize, usize),
-    lambda_q8: u32,
+    lambda: SaoLambda,
 ) -> (i64, [i32; 5], u8) {
     let (sums, counts) = band_stats(pic, plane, source, src_stride, rect);
     let mut best = (0i64, [0i32; 5], 0u8);
     let mut best_score = i64::MIN;
     for band_position in 0..32u8 {
         let (gain, offsets) = band_offsets(&sums, &counts, band_position);
-        let score = rd_score(gain, band_offset_bins(&offsets), lambda_q8);
+        let score = rd_score(
+            gain,
+            offset_abs_bins(&offsets),
+            band_syntax_bins(&offsets),
+            lambda,
+        );
         if score > best_score {
             best_score = score;
             best = (gain, offsets, band_position);
@@ -1163,7 +1274,7 @@ mod tests {
             height: H,
         };
 
-        let grid = estimate_sao(&pic, src, true, true, 32);
+        let grid = estimate_sao(&pic, src, true, true, SaoLambda::closed_form(32));
         // The first CTB lies wholly inside the biased region.
         let luma = grid[0].components[0];
         assert_eq!(
@@ -1342,50 +1453,55 @@ mod tests {
         crate::simd::set_override(None);
     }
 
-    #[test]
-    fn an_asymmetric_partitions_chroma_half_reconstructs_inside_the_plane() {
-        // §7.3.8.8 transform blocks bottom out at 4x4, but the 4:2:0 chroma
-        // half of the 16x4 and 16x12 asymmetric partitions the mode search can
-        // pick measures 8x2 and 8x6 — neither a whole number of 4x4 blocks.
-        // The residual coding has to clip its last block to the partition
-        // instead of running off the end of the plane.
-        let src = source(0);
-        let (width, height) = (W, H);
-        let partition = |x, y, w, h| PartitionDecision {
-            x,
-            y,
-            w,
-            h,
-            mv_x: 0,
-            mv_y: 0,
-            sad: 0,
-            satd: 0,
-            bit_cost: 0,
-            rd_cost: 0,
-        };
+    /// A whole-picture decision whose every CTB is one coding unit split into
+    /// `shapes`, given as `(dx, dy, w, h)` offsets inside the CTB, all with a
+    /// zero motion vector.
+    fn decision_of(shapes: &[(usize, usize, usize, usize)]) -> PictureDecision {
         let mut blocks = Vec::new();
-        for y0 in (0..height).step_by(CTB) {
-            for x0 in (0..width).step_by(CTB) {
+        for y0 in (0..H).step_by(CTB) {
+            for x0 in (0..W).step_by(CTB) {
                 blocks.push(BlockDecision {
                     x: x0,
                     y: y0,
                     size: CTB,
-                    // 16x4 over 16x12, so both the two-sample-tall chroma half
-                    // and the six-sample-tall one are coded.
-                    partitions: vec![
-                        partition(x0, y0, CTB, 4),
-                        partition(x0, y0 + 4, CTB, CTB - 4),
-                    ],
+                    partitions: shapes
+                        .iter()
+                        .map(|&(dx, dy, w, h)| PartitionDecision {
+                            x: x0 + dx,
+                            y: y0 + dy,
+                            w,
+                            h,
+                            mv_x: 0,
+                            mv_y: 0,
+                            sad: 0,
+                            satd: 0,
+                            bit_cost: 0,
+                            rd_cost: 0,
+                        })
+                        .collect(),
                     rd_cost: 0,
                     pcm_cost: u64::MAX,
                 });
             }
         }
-        let decision = PictureDecision {
+        PictureDecision {
             blocks,
             rd_cost: 0,
             pcm_blocks: 0,
-        };
+        }
+    }
+
+    /// The 16x4-over-16x12 split, whose 4:2:0 chroma halves are 8x2 and 8x6 —
+    /// neither a whole number of the 4x4 blocks §7.3.8.8 bottoms out at.
+    const ASYMMETRIC: &[(usize, usize, usize, usize)] = &[(0, 0, CTB, 4), (0, 4, CTB, CTB - 4)];
+
+    #[test]
+    fn an_asymmetric_partitions_chroma_half_reconstructs_inside_the_plane() {
+        // The residual is coded over the coding unit's own transform tree, so
+        // an 8x2 chroma prediction partition never becomes a transform block
+        // and nothing indexes past the end of the chroma plane.
+        let src = source(0);
+        let decision = decision_of(ASYMMETRIC);
         let cfg = ReconConfig {
             quantized_residual: true,
             qp: 32,
@@ -1397,15 +1513,52 @@ mod tests {
         assert_eq!(expected.y.len(), src.0.len());
         assert_eq!(expected.cb.len(), src.1.len());
         assert_eq!(expected.cr.len(), src.2.len());
-        // The clipped blocks go through the same vector kernel as the whole
-        // ones, over a partial run, so they are pinned across instruction sets
-        // too.
+        // Every transform block is now a whole one, but the add-and-clip still
+        // goes through the vector kernel, so the result is pinned across
+        // instruction sets.
         for isa in crate::simd::available() {
             crate::simd::set_override(Some(isa));
             let lossy = reconstruct_picture(planes(&src), None, &decision, cfg);
             assert_eq!(lossy, expected, "{}", isa.name());
         }
         crate::simd::set_override(None);
+    }
+
+    #[test]
+    fn the_transform_tree_is_the_coding_units_however_the_prediction_is_partitioned() {
+        // §7.3.8.8 hangs the transform tree off the coding unit, so a 16x16 CU
+        // codes one 16x16 luma and two 8x8 chroma transform blocks no matter
+        // how its prediction is split. These partitionings all predict the
+        // same samples — every motion vector is zero and there is no reference
+        // — so if the residual is coded over the CU they must reconstruct
+        // identically. Tiling each *partition* instead did not: the asymmetric
+        // shapes fell to 8x8 and 4x4 luma blocks, and their chroma halves to
+        // zero-padded partial ones.
+        let src = source(0);
+        let cfg = ReconConfig {
+            quantized_residual: true,
+            qp: 32,
+            ..ReconConfig::default()
+        };
+        let whole = reconstruct_picture(planes(&src), None, &decision_of(&[(0, 0, CTB, CTB)]), cfg);
+        for shapes in [
+            ASYMMETRIC,
+            &[(0, 0, CTB, CTB - 4), (0, CTB - 4, CTB, 4)],
+            &[(0, 0, 4, CTB), (4, 0, CTB - 4, CTB)],
+            &[(0, 0, CTB / 2, CTB), (CTB / 2, 0, CTB / 2, CTB)],
+            &[
+                (0, 0, CTB / 2, CTB / 2),
+                (CTB / 2, 0, CTB / 2, CTB / 2),
+                (0, CTB / 2, CTB / 2, CTB / 2),
+                (CTB / 2, CTB / 2, CTB / 2, CTB / 2),
+            ],
+        ] {
+            let split = reconstruct_picture(planes(&src), None, &decision_of(shapes), cfg);
+            assert_eq!(
+                split, whole,
+                "{shapes:?} did not reconstruct through the coding unit's transform tree"
+            );
+        }
     }
 
     #[test]
@@ -1538,10 +1691,21 @@ mod tests {
     }
 
     #[test]
-    fn partitions_tile_into_the_largest_legal_square_transform_block() {
+    fn coding_blocks_tile_into_the_largest_legal_square_transform_block() {
+        // Every coding block this encoder codes, and every 4:2:0 chroma half
+        // of one, is a whole number of its own transform blocks.
+        for size in [8usize, 16, 32, 64] {
+            let n_tbs = transform_block_size(size, size);
+            assert_eq!(size % n_tbs, 0, "luma {size}");
+            let c_size = size / 2;
+            assert_eq!(
+                c_size % transform_block_size(c_size, c_size),
+                0,
+                "chroma {c_size}"
+            );
+        }
         assert_eq!(transform_block_size(16, 16), 16);
-        assert_eq!(transform_block_size(16, 8), 8);
-        assert_eq!(transform_block_size(8, 4), 4);
+        assert_eq!(transform_block_size(8, 8), 8);
         // Below the 4x4 minimum and above the 32x32 maximum both clamp.
         assert_eq!(transform_block_size(2, 2), 4);
         assert_eq!(transform_block_size(64, 64), 32);

@@ -255,18 +255,38 @@ def table(args: argparse.Namespace) -> int:
             if identifier not in merged or median < merged[identifier]:
                 merged[identifier] = float(median)
 
-    isa_names = ["scalar", "sse41", "avx2", "neon"]
+    # Which arms are instruction sets is read off the data rather than kept in a
+    # list here. The arm names come from `SimdIsa`'s `Display` on the Rust side
+    # ("sse4.1", not "sse41"), and a hardcoded allowlist that drifts from it
+    # drops the column silently: the group still has the arm, the table just
+    # stops having somewhere to put it, which reads as a host that could not run
+    # it. `bench_across_isas` always emits a `scalar` arm, so a group having one
+    # is what identifies it as a per-ISA group, and every other arm of such a
+    # group is an instruction set by construction - including one added after
+    # this script was last touched.
     groups: dict[str, dict[str, float]] = {}
     for identifier, median in merged.items():
         group, _, arm = identifier.rpartition("/")
-        if arm in isa_names and group:
+        if group:
             groups.setdefault(group, {})[arm] = median
+    groups = {group: arms for group, arms in groups.items() if "scalar" in arms}
 
     if not groups:
         print("error: no per-instruction-set groups in the given baselines", file=sys.stderr)
         return 1
 
-    present = [isa for isa in isa_names if any(isa in arms for arms in groups.values())]
+    # Scalar is the reference every other column is a ratio against, so it leads.
+    # The rest are ordered narrowest-first where the width is known, so the
+    # columns read as a progression, and alphabetically after that so an
+    # unrecognised instruction set still lands somewhere stable instead of
+    # moving between runs.
+    width_order = ["sse4.1", "avx2", "avx512", "neon"]
+
+    def isa_sort_key(isa: str) -> tuple[int, str]:
+        return (width_order.index(isa), "") if isa in width_order else (len(width_order), isa)
+
+    found = {isa for arms in groups.values() for isa in arms if isa != "scalar"}
+    present = ["scalar"] + sorted(found, key=isa_sort_key)
     host = args.host or (hosts[0] if hosts else "unknown host")
 
     # The commit is part of the measurement, not decoration: kernels land often
