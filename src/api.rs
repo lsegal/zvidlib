@@ -18,6 +18,12 @@ pub enum ErrorKind {
     Cancelled,
     InvalidState,
     Internal,
+    /// The operation could not be satisfied without waiting, and the caller asked not to wait.
+    ///
+    /// A non-blocking source returns this rather than blocking its caller - a render thread
+    /// polling for a frame a background decoder has not produced yet - and the caller retries.
+    /// It says nothing about whether the work will succeed, only that it has not finished.
+    WouldBlock,
 }
 
 /// An error with a stable category and human-readable context.
