@@ -168,6 +168,67 @@ pub(crate) fn sad(
     }
 }
 
+/// Sums of absolute differences between one source block and several candidate predictions
+/// of it, scored in a single call.
+///
+/// The motion search evaluates `(2 * radius + 1)^2` predictions of the *same* source block,
+/// and on `x86_64` no block it evaluates is 32 wide: `rdo` searches a CTB of 16 and
+/// `candidate_partitions` only subdivides it. A per-candidate [`sad`] therefore never fills a
+/// 256-bit vector — #370 measured the AVX2 arm doing the same 128-bit job as SSE4.1 and merely
+/// routed around it. The width AVX2 has is across *candidates*, not across a row: `_mm256_sad_epu8`
+/// sums each 8-byte lane independently, so one instruction can carry two 16-wide candidates
+/// (one per 128-bit lane) or four 8-wide ones (one per qword), which is real work at the full
+/// width rather than a wider register doing half of it.
+///
+/// `plane` is the reference picture and `offsets` the byte offset of each candidate's top-left
+/// sample within it, so a caller does not have to build a slice per candidate. `out[i]` receives
+/// the SAD of `offsets[i]`; the values and their order are exactly what calling [`sad`] per
+/// candidate would produce, on every instruction set, so batching cannot move a mode decision.
+///
+/// Panics if `out` is shorter than `offsets`, or if any block is too large for its plane.
+pub(crate) fn sad_batch(
+    src: &[u8],
+    src_stride: usize,
+    plane: &[u8],
+    offsets: &[usize],
+    pred_stride: usize,
+    w: usize,
+    h: usize,
+    out: &mut [u32],
+) {
+    assert!(
+        out.len() >= offsets.len(),
+        "output holds {} SADs, {} candidates were requested",
+        out.len(),
+        offsets.len()
+    );
+    check_block(src, src_stride, w, h);
+    for &offset in offsets {
+        assert!(
+            offset <= plane.len(),
+            "candidate offset {offset} is past the {}-byte plane",
+            plane.len()
+        );
+        check_block(&plane[offset..], pred_stride, w, h);
+    }
+    #[cfg(target_arch = "x86_64")]
+    // Only the widths whose candidates tile a 256-bit vector exactly are batched. 12- and
+    // 24-wide partitions exist in the candidate table but would need a masked tail per
+    // candidate, which is the cost that made the wide arm lose in the first place, so they
+    // keep the per-candidate path.
+    if isa_code() == ISA_AVX2 && matches!(w, 4 | 8 | 16) && (w != 4 || h % 2 == 0) {
+        // SAFETY: every block was bounds-checked above, and this arm was only reached after
+        // `detect_isa` confirmed `is_x86_feature_detected!("avx2")`.
+        unsafe {
+            x86::sad_batch_avx2(src, src_stride, plane, offsets, pred_stride, w, h, out);
+        }
+        return;
+    }
+    for (slot, &offset) in out.iter_mut().zip(offsets) {
+        *slot = sad(src, src_stride, &plane[offset..], pred_stride, w, h);
+    }
+}
+
 /// Sum of absolute Hadamard-transformed differences between a source and prediction block.
 ///
 /// The block is tiled into 8x8 Hadamard transforms when both dimensions are multiples of 8 and
@@ -485,6 +546,140 @@ mod x86 {
             let lo = _mm_cvtsi128_si32(folded) as u32;
             let hi = _mm_cvtsi128_si32(_mm_unpackhi_epi64(folded, folded)) as u32;
             lo + hi + tail
+        }
+    }
+
+    /// The two 64-bit halves of a `_mm_sad_epu8` accumulator, added.
+    #[target_feature(enable = "sse4.1")]
+    unsafe fn hsum_epu8_pair(v: __m128i) -> u32 {
+        unsafe {
+            let lo = _mm_cvtsi128_si32(v) as u32;
+            let hi = _mm_cvtsi128_si32(_mm_unpackhi_epi64(v, v)) as u32;
+            lo + hi
+        }
+    }
+
+    /// AVX2 SAD over several candidate predictions of one source block.
+    ///
+    /// `_mm256_sad_epu8` reduces per 8-byte lane, so the lane layout decides how many
+    /// candidates one instruction carries. Each supported width picks the layout that fills
+    /// the vector with *different* candidates rather than with more of one row:
+    ///
+    /// | Width | Layout | Candidates per instruction |
+    /// | --- | --- | --- |
+    /// | 16 | one candidate row per 128-bit lane | 2 |
+    /// | 8 | one candidate row per qword | 4 |
+    /// | 4 | one candidate's two rows per qword | 4 (over two rows) |
+    ///
+    /// The source block is the same for every candidate, so it is loaded once per row and
+    /// broadcast, and only the predictions are gathered. Candidates left over below a group
+    /// fall back to the single-block kernel, whose result is identical.
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn sad_batch_avx2(
+        src: &[u8],
+        src_stride: usize,
+        plane: &[u8],
+        offsets: &[usize],
+        pred_stride: usize,
+        w: usize,
+        h: usize,
+        out: &mut [u32],
+    ) {
+        unsafe {
+            let sp = src.as_ptr();
+            let pp = plane.as_ptr();
+            let group = if w == 16 { 2 } else { 4 };
+            let mut i = 0;
+            while i + group <= offsets.len() {
+                if w == 16 {
+                    let a = pp.add(offsets[i]);
+                    let b = pp.add(offsets[i + 1]);
+                    let mut acc = _mm256_setzero_si256();
+                    for y in 0..h {
+                        let s = _mm256_broadcastsi128_si256(_mm_loadu_si128(
+                            sp.add(y * src_stride) as *const __m128i,
+                        ));
+                        let p = _mm256_inserti128_si256(
+                            _mm256_castsi128_si256(_mm_loadu_si128(
+                                a.add(y * pred_stride) as *const __m128i
+                            )),
+                            _mm_loadu_si128(b.add(y * pred_stride) as *const __m128i),
+                            1,
+                        );
+                        acc = _mm256_add_epi64(acc, _mm256_sad_epu8(s, p));
+                    }
+                    out[i] = hsum_epu8_pair(_mm256_castsi256_si128(acc));
+                    out[i + 1] = hsum_epu8_pair(_mm256_extracti128_si256(acc, 1));
+                } else {
+                    let c = [
+                        pp.add(offsets[i]),
+                        pp.add(offsets[i + 1]),
+                        pp.add(offsets[i + 2]),
+                        pp.add(offsets[i + 3]),
+                    ];
+                    let mut acc = _mm256_setzero_si256();
+                    if w == 8 {
+                        for y in 0..h {
+                            let s = _mm256_set1_epi64x(read_row8(sp.add(y * src_stride)));
+                            let p = _mm256_set_epi64x(
+                                read_row8(c[3].add(y * pred_stride)),
+                                read_row8(c[2].add(y * pred_stride)),
+                                read_row8(c[1].add(y * pred_stride)),
+                                read_row8(c[0].add(y * pred_stride)),
+                            );
+                            acc = _mm256_add_epi64(acc, _mm256_sad_epu8(s, p));
+                        }
+                    } else {
+                        // Two 4-wide rows fill one qword, so a 4xN candidate needs h/2 steps
+                        // rather than h. `sad_batch` only takes this path for even `h`.
+                        for y in (0..h).step_by(2) {
+                            let s = _mm256_set1_epi64x(read_rows4(sp.add(y * src_stride), src_stride));
+                            let p = _mm256_set_epi64x(
+                                read_rows4(c[3].add(y * pred_stride), pred_stride),
+                                read_rows4(c[2].add(y * pred_stride), pred_stride),
+                                read_rows4(c[1].add(y * pred_stride), pred_stride),
+                                read_rows4(c[0].add(y * pred_stride), pred_stride),
+                            );
+                            acc = _mm256_add_epi64(acc, _mm256_sad_epu8(s, p));
+                        }
+                    }
+                    // Every qword of the accumulator is one candidate's whole SAD.
+                    let mut lanes = [0u64; 4];
+                    _mm256_storeu_si256(lanes.as_mut_ptr() as *mut __m256i, acc);
+                    for (slot, lane) in out[i..i + 4].iter_mut().zip(lanes) {
+                        *slot = lane as u32;
+                    }
+                }
+                i += group;
+            }
+            for (slot, &offset) in out[i..offsets.len()].iter_mut().zip(&offsets[i..]) {
+                *slot = sad_avx2(
+                    src,
+                    src_stride,
+                    &plane[offset..],
+                    pred_stride,
+                    w,
+                    h,
+                );
+            }
+        }
+    }
+
+    /// One 8-wide row, as the qword `_mm256_sad_epu8` will reduce it in.
+    #[target_feature(enable = "avx2")]
+    unsafe fn read_row8(p: *const u8) -> i64 {
+        unsafe { (p as *const i64).read_unaligned() }
+    }
+
+    /// Two 4-wide rows packed into one qword. Source and prediction are packed the same way,
+    /// so the byte-wise differences the SAD sums are the same pairs either packing would give.
+    #[target_feature(enable = "avx2")]
+    unsafe fn read_rows4(p: *const u8, stride: usize) -> i64 {
+        unsafe {
+            let lo = u64::from((p as *const u32).read_unaligned());
+            let hi = u64::from((p.add(stride) as *const u32).read_unaligned());
+            (lo | (hi << 32)) as i64
         }
     }
 
@@ -926,6 +1121,75 @@ mod tests {
                     isa()
                 );
             }
+        }
+    }
+
+    /// Batched SAD is only useful if it cannot move a decision, so it is held against the
+    /// per-candidate scalar reference at every shape, candidate count and instruction set:
+    /// the counts deliberately straddle the AVX2 group sizes so both the vectorized groups
+    /// and the leftover candidates below one are covered.
+    #[test]
+    fn sad_batch_matches_the_per_candidate_reference_on_every_instruction_set() {
+        let _guard = crate::simd::test_lock();
+        for &(w, h) in SHAPES {
+            let stride = MAX_BLOCK + w + 5;
+            let rows = h + 12;
+            let src = plane(0x5150_4142_4344_4546, stride, rows);
+            let reference = plane(0x9e37_79b9_7f4a_7c15, stride, rows);
+            let offsets: Vec<usize> = (0..17).map(|i| (i % 9) * stride + (i % 5)).collect();
+            let expected: Vec<u32> = offsets
+                .iter()
+                .map(|&o| sad_scalar(&src, stride, &reference[o..], stride, w, h))
+                .collect();
+            for isa in crate::simd::available() {
+                crate::simd::set_override(Some(isa));
+                for count in [1usize, 2, 3, 4, 5, 8, 16, 17] {
+                    let mut out = vec![0u32; count];
+                    sad_batch(
+                        &src,
+                        stride,
+                        &reference,
+                        &offsets[..count],
+                        stride,
+                        w,
+                        h,
+                        &mut out,
+                    );
+                    assert_eq!(
+                        out,
+                        expected[..count],
+                        "{w}x{h} batched SAD of {count} candidates on {isa:?}"
+                    );
+                }
+            }
+            crate::simd::set_override(None);
+        }
+    }
+
+    /// The batched AVX2 kernel is exercised through its own `#[target_feature]` wrapper as
+    /// well as through dispatch, so it stays covered even if `sad_batch`'s width conditions
+    /// ever move.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_batched_avx2_kernel_matches_the_scalar_reference() {
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        for &(w, h) in &[(4usize, 4usize), (4, 8), (4, 16), (8, 4), (8, 8), (16, 16), (16, 8)] {
+            let stride = MAX_BLOCK + 7;
+            let src = plane(0x0f1e_2d3c_4b5a_6978, stride, h + 10);
+            let reference = plane(0xfeed_face_dead_c0de, stride, h + 10);
+            let offsets: Vec<usize> = (0..9).map(|i| i * stride + (i % 3)).collect();
+            let expected: Vec<u32> = offsets
+                .iter()
+                .map(|&o| sad_scalar(&src, stride, &reference[o..], stride, w, h))
+                .collect();
+            let mut out = vec![0u32; offsets.len()];
+            // SAFETY: AVX2 was just detected, and every block fits its plane.
+            unsafe {
+                x86::sad_batch_avx2(&src, stride, &reference, &offsets, stride, w, h, &mut out);
+            }
+            assert_eq!(out, expected, "{w}x{h} batched AVX2 SAD");
         }
     }
 
