@@ -1022,7 +1022,7 @@ the table that is under 50 ms for a single-random-access-point track on either
 backend. It answers a different question — "what is at this point of the movie",
 not "which frame is the pointer on" — which is precisely why it can: the picture
 was decoded already. It costs one forward decode pass over the track, on a
-thread and a decoder of its own - **3.15 s** to cover all 768 frames of the
+thread and a decoder of its own - **2.74 s** to cover all 768 frames of the
 bundled 1080p sample through VideoToolbox, measured by
 `tests/preview_index.rs::a_preview_answers_any_position_without_decoding`, which
 moved out of the example with the tier - and a bounded amount of memory
