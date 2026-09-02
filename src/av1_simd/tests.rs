@@ -1294,20 +1294,23 @@ fn vectorized_round_trip_reproduces_the_residual() {
     }
 }
 
-/// #362: the coefficient-context site must not hand a 4x4 block to the AVX2
-/// kernel. A row shorter than eight lanes is one iteration under either width,
-/// so the wide arm does the same work with half its lanes idle and pays a
-/// staged partial store on top - measured at 2.50x of scalar against SSE4.1's
-/// 3.04x. Blocks from 8 wide up keep AVX2, where it genuinely halves the
-/// iterations per row. Nothing on a non-x86_64 host is redirected at all.
+/// #362 kept 4x4 blocks off the AVX2 kernel because a row shorter than eight
+/// lanes is one iteration under either width, half of them idle, with a staged
+/// partial store on top. #371 gives AVX2 a row-pair kernel that does fill the
+/// vector at size 4, so the site routes that size back to AVX2 and redirects
+/// only the narrow sizes no width fits — 1 to 3 and 5 to 7, none of which the
+/// encoder codes. Blocks from 8 wide up were never redirected, and nothing on a
+/// non-x86_64 host is redirected at all.
 #[test]
-fn the_coefficient_context_site_keeps_narrow_blocks_off_avx2() {
+fn the_coefficient_context_site_routes_narrow_blocks_by_what_fills_a_vector() {
     let narrow = [1usize, 2, 3, 4, 5, 6, 7];
     let wide = [8usize, 9, 16, 32, 64];
     for isa in available_isas() {
         for size in narrow.into_iter().chain(wide) {
             let routed = coeff_ctx_isa(isa, size);
-            let redirected = cfg!(target_arch = "x86_64") && isa == SimdIsa::Avx2 && size < 8;
+            let row_pairs = cfg!(target_arch = "x86_64") && isa == SimdIsa::Avx2 && size == 4;
+            let redirected =
+                cfg!(target_arch = "x86_64") && isa == SimdIsa::Avx2 && size < 8 && !row_pairs;
             let want = if redirected { SimdIsa::Sse41 } else { isa };
             assert_eq!(
                 routed,
@@ -1315,6 +1318,13 @@ fn the_coefficient_context_site_keeps_narrow_blocks_off_avx2() {
                 "{} at size {size} routed to {}",
                 isa.name(),
                 routed.name()
+            );
+            #[cfg(target_arch = "x86_64")]
+            assert_eq!(
+                coeff_ctx_row_pairs(routed, size),
+                row_pairs,
+                "{} at size {size} took the wrong kernel",
+                isa.name()
             );
         }
     }

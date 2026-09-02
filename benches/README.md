@@ -1071,6 +1071,58 @@ instruction set", not "this row was skipped". An aarch64 baseline and an x86_64
 one therefore describe disjoint halves of the dispatch matrix, and a ratio from
 one says nothing about the other.
 
+### Checking a table still describes the crate
+
+A committed table is a measurement of a commit, and the commit is stamped on
+it. What nothing checked until now is whether that commit's *kernels* are the
+ones the crate has: a row silently stops describing anything the moment a
+dispatch site lands under it, and the only signal was somebody noticing a ratio
+that moved for no attributable reason. Chasing one such row down to a stale
+table rather than a regression is the whole of what issue #361 turned out to
+be, and `src/simd.rs` already refuses to let the *code* side of that go quiet —
+`the_documented_site_table_lists_every_dispatch_site` makes a dispatch site
+impossible to add without a check.
+
+```sh
+python3 .github/scripts/criterion_baseline.py staleness --readme benches/README.md
+```
+
+It reads each stamp out of this file, reads the dispatch sites
+`zvidlib::simd::active_by_site` documents at that commit, diffs them against
+the sites registered now, and names the rows whose subject site did not exist
+when the table was drawn. Today that is three rows of the Apple M1 table —
+`hevc_color_convert`, `av1_encode_stage_tile` and
+`hevc_encode_640x352_reconstruct` — and nothing on the x86_64 one, which was
+drawn at a commit with the same eleven sites the crate has now.
+
+Three things about how it reads the site set are worth stating, because each is
+a place a more obvious implementation does not work:
+
+- The sites are read from `active_by_site`'s **rustdoc table**, not from a
+  build. A dispatch site is a Rust value, and resolving it at a stamped commit
+  would mean building that commit; the doc table is the same set by test, and
+  it can be read out of a blob.
+- A stamp is routinely a checkpoint commit on a branch whose ref is deleted at
+  merge — both tables here are — so `git show` fails on exactly the commits
+  this check exists to read. It falls back to the GitHub contents API, and a
+  stamp neither can resolve is reported as *unverified* rather than as clean.
+- A row is attributed to a site only when the row's group is that site's own
+  number. Whole-frame groups like `hevc_encode_640x352` cross every site at
+  once, so a landed kernel moves them by an amount no single row can be blamed
+  for, and naming them would bury the rows that can be.
+
+The check runs in the `Rust checks` job and writes its report to the step
+summary. It reports and never gates, for the same reason [the delta
+report](#the-threshold-and-why-it-is-only-a-report) does not: a stale table is
+a measurement to redraw, not a broken build. The redraw is the recipe above.
+
+It answers the site-set half of what can go stale. The `Vectorized` column in
+[The HEVC per-stage groups](#the-hevc-per-stage-groups) is the other half, and
+it is not checked here: a site can exist and still resolve to the scalar
+reference on every arm — `hevc_recon` does — so "is there a dispatch site" and
+"is there a vector kernel" are different questions, and only the first can be
+answered from a commit that is not built.
+
 ### Apple M1 (aarch64)
 
 Measured on **Apple M1 (macOS 15, aarch64)**, at `b6655bad215f`.
@@ -1211,11 +1263,15 @@ workflow that measured it, which touches no crate code.
 
 The two `av1_encode_stage_coeff_ctx` rows are the pre-#362 code and are kept as
 the record of the defect that issue reports; the repair is measured under [The
-#362 re-measurement](#the-362-re-measurement) below, on its own host and with
-its own provenance. The two `hevc_encode_*_rdo_inter` rows are pre-#370 in the
-same way, and their repair is measured under [The #370
-re-measurement](#the-370-re-measurement) — that one landed on *this* host, so
-its `avx2` column is directly comparable with the one here.
+#362 re-measurement](#the-362-re-measurement) below, and the kernel that
+replaces the routing under [The #371 re-measurement](#the-371-re-measurement),
+each on its own host and with its own provenance. Both rows' `avx2` column is
+therefore two repairs out of date, in the direction of being too slow.
+
+The two `hevc_encode_*_rdo_inter` rows are pre-#370 in the same way; their
+repair is measured under [The #370 re-measurement](#the-370-re-measurement),
+which landed on *this* host, so its `avx2` column is directly comparable with
+the one here.
 
 | Group | `scalar` | `sse4.1` | `avx2` | Best |
 | --- | ---: | ---: | ---: | ---: |
@@ -1441,12 +1497,17 @@ lane-crossing, not downclocking, not the context gather. The detail differs.
   routes blocks narrower than eight lanes to the SSE4.1 kernel at the
   `av1_coeff_ctx` dispatch site, the way #342 routed `fwht4x4`, and keeps AVX2
   from size 8 up where it halves the iterations per row and stores whole
-  vectors. The `avx2` column of this group is consequently the SSE4.1 kernel's
-  number from here on, in the same sense `av1_encode_stage_wht`'s three columns
-  are all the scalar transform. Giving AVX2 real work at size 4 needs a kernel
-  that steps two rows at a time rather than one — the outputs of adjacent rows
-  are already contiguous, so eight lanes are there to be filled — and #371
-  carries that.
+  vectors. The `avx2` column of this group was consequently the SSE4.1 kernel's
+  number for as long as that routing stood, in the same sense
+  `av1_encode_stage_wht`'s three columns are all the scalar transform. Giving
+  AVX2 real work at size 4 needs a kernel that steps two rows at a time rather
+  than one — the outputs of adjacent rows are already contiguous, so eight lanes
+  are there to be filled — and #371 wrote it: `coeff::block_contexts_row_pairs`
+  puts row `r` in the vector's low half and row `r + 1` in its high half, which
+  makes the iteration full-width and the store native, and the site routes size
+  4 back to `avx2` on the strength of the measurement below. The redirect
+  survives only for sizes 1 to 3 and 5 to 7, which no vector width fits and the
+  encoder never codes.
 
 #### The #362 re-measurement
 
@@ -1487,6 +1548,44 @@ The `rdo_inter` pair is in the table above as the control, and it is unmoved:
 1.69x under `sse4.1` against 1.54x/1.55x under `avx2`, the same shape #351
 recorded on a different host. Nothing in #362 touches `rdcost`, and the second
 bullet above is why it would not have helped if it did.
+#### The #371 re-measurement
+
+#362's repair routed around the idle lanes; #371 removes them, and the
+acceptance criterion was that the wide arm has to *win* on its own numbers
+before the dispatch site takes it back. It does, and by more than the margin
+#362 measured against it.
+
+Measured at `f7b709ee62d7` — the branch's implementation commit — on an **AMD
+EPYC 9V74 80-Core Processor (Linux/X64)**, one `workflow_dispatch` round with
+`ZVIDLIB_BENCH_LARGE=1`, `# host instruction sets: scalar, sse4.1, avx2` and
+`# dispatch site av1_coeff_ctx: avx2`. It is one round on one more model, so
+these absolute times are not comparable with the table's EPYC 7763 draw or with
+#362's Xeon 6973P-C round either; what is comparable, and what the criterion
+turns on, is the `sse4.1`-against-`avx2` sign *within* the round.
+
+| Group | `scalar` | `sse4.1` | `avx2` | Best |
+| --- | ---: | ---: | ---: | ---: |
+| `av1_encode_stage_coeff_ctx` | 3.505 ms | 1.165 ms (3.01x) | 937.520 µs (3.74x) | 3.74x `avx2` |
+| `av1_encode_stage_coeff_ctx_1080p` | 32.132 ms | 10.738 ms (2.99x) | 8.643 ms (3.72x) | 3.72x `avx2` |
+| `av1_encode_stage_tile` | 15.320 ms | 12.544 ms (1.22x) | 12.452 ms (1.23x) | 1.23x `avx2` |
+| `av1_encode_stage_tile_1080p` | 141.740 ms | 116.690 ms (1.21x) | 115.490 ms (1.23x) | 1.23x `avx2` |
+| `hevc_encode_640x352_rdo_inter` | 73.844 ms | 45.439 ms (1.63x) | 47.741 ms (1.55x) | 1.63x `sse4.1` |
+| `hevc_encode_1920x1088_rdo_inter` | 699.730 ms | 431.420 ms (1.62x) | 451.480 ms (1.55x) | 1.62x `sse4.1` |
+
+The two vector arms of `av1_encode_stage_coeff_ctx` are 24% apart and the wide
+one is ahead: 937.520 µs against 1.165 ms at 320x180, 8.643 ms against 10.738 ms
+at 1080p, the same ratio at both sizes because the group derives contexts for
+4x4 blocks and nothing else. Under #362's routing those two columns read the
+same number to within 0.13%, because they *were* the same kernel; the split
+reopening in AVX2's favour is what a kernel that actually fills its lanes looks
+like. `av1_encode_stage_tile`, which runs the derivation behind the serial range
+coder, carries a smaller share of it through — 1.23x against 1.22x — as it
+should, since the context pass is one stage of that group rather than all of it.
+
+The `rdo_inter` pair is the control, unchanged by anything here: 1.62x/1.63x
+under `sse4.1` against 1.55x under `avx2`, the same shape #351 and #362 both
+recorded on other hosts. Nothing in #371 touches `rdcost`, and this round
+predates #370's own repair — that row is measured below.
 
 #### The #370 re-measurement
 
@@ -1536,6 +1635,7 @@ encoding HEVC on an AVX2 host gets about 2.8% of a whole encode back — the two
 arms are now 0.3% and 0.6% apart where the table has them 4.3% and 4.0% apart.
 `av1_encode_stage_coeff_ctx` reads 1.4647 ms and 1.4745 ms on this host, 0.7%
 apart, which is #362's redirect reproducing on the table's own hardware.
+
 - `hevc_encode_*_rdo_inter`. The same family, a different mechanism, and *not*
   the same fix. `rdcost::sad_avx2`'s 256-bit loop needs `w >= 32` and
   `satd_avx2`'s vector pair needs `w >= 16`, but `rdo.rs` searches a `CTB` of 16
