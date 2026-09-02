@@ -122,19 +122,12 @@ impl PreviewIndex {
             stride,
             slots: vec![None; slots],
         }));
-        // The pass never asks for a frame twice, so a frame cache only costs it work: the
-        // reader converts the last `max_cached_frames` pictures before every target it walks to,
-        // and with previews a few frames apart that is every picture in the track converted at
-        // full resolution for nobody. One is the smallest the reader accepts.
-        let reader = ExactFrameReader::new(
-            factory,
-            configuration,
-            samples,
-            Limits {
-                max_cached_frames: 1,
-                ..limits
-            },
-        )?;
+        // The pass never asks for a frame twice, so it asks for every preview as a step rather
+        // than a destination (see `build`) and keeps the caller's cache limit. #374 had to
+        // shrink `max_cached_frames` to 1 here instead, because the tail was the reader's and
+        // not the request's; #402 moved it to the request, which is what let this go back to
+        // the limits it was handed.
+        let reader = ExactFrameReader::new(factory, configuration, samples, limits)?;
         let cancellation = CancellationToken::new();
         let worker_store = Arc::clone(&store);
         let worker_cancellation = cancellation.clone();
@@ -219,7 +212,9 @@ fn build(
         // A preview that cannot be decoded leaves its slot empty and the pass carries on: the
         // index is an optimisation, and a gap in it costs a fallback to the neighbour rather
         // than an error the window has to show.
-        let Ok(picture) = reader.get(FrameIndex(frame), cancellation) else {
+        // A step, not a destination: this pass walks forwards and never comes back, so the
+        // frames behind each preview would be converted at full resolution for nobody.
+        let Ok(picture) = reader.get_step(FrameIndex(frame), cancellation) else {
             continue;
         };
         let Ok(preview) = shrink(&picture, &limits) else {

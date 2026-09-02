@@ -367,6 +367,32 @@ pub struct ExactFrameReader {
     statistics: DecodeStatistics,
 }
 
+/// What a caller wants out of a request, which is what decides whether the reader keeps the
+/// frames behind the one it was asked for.
+///
+/// The frames a walk passes are decoded either way - a picture cannot be decoded without its
+/// references - so this only decides which of them are converted to RGBA, which is the part of
+/// a walk that costs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Request {
+    /// Somewhere to be: keep the frames behind it that the cache can hold, so coming back to
+    /// one of them is free.
+    Destination,
+    /// Somewhere to pass through: keep only the frame asked for, and the reordered frames at or
+    /// after it that the next step needs anyway.
+    Step,
+}
+
+impl Request {
+    /// How far behind the target this request keeps pictures, in presentation frames.
+    fn cache_tail(self, limits: &Limits) -> u64 {
+        match self {
+            Self::Destination => u64::from(limits.max_cached_frames),
+            Self::Step => 0,
+        }
+    }
+}
+
 impl ExactFrameReader {
     pub fn new(
         factory: &dyn VideoDecoderFactory,
@@ -426,10 +452,48 @@ impl ExactFrameReader {
         })
     }
 
-    /// Returns exactly the requested presentation frame.
+    /// Returns exactly the requested presentation frame, and the frames behind it that the
+    /// cache can hold, so a request that comes back for one of those is answered for nothing.
+    ///
+    /// This is the destination of a seek. A walk that is going to keep walking forwards should
+    /// ask for its intermediate frames with [`get_step`] instead, which converts the frame it
+    /// was asked for and nothing else.
+    ///
+    /// [`get_step`]: Self::get_step
     pub fn get(
         &mut self,
         presentation_index: FrameIndex,
+        cancellation: &CancellationToken,
+    ) -> Result<VideoFrame> {
+        self.get_request(presentation_index, Request::Destination, cancellation)
+    }
+
+    /// Returns exactly the requested presentation frame and converts nothing else.
+    ///
+    /// A step is a picture on the way to somewhere, not somewhere: the caller is going to ask
+    /// for a frame further forward next, so the frames behind this one that [`get`] would keep
+    /// are converted for a request that never comes. That tail is bounded per call and so is
+    /// affordable for one seek, but a walk that publishes as it goes pays it once per published
+    /// picture, and once the stride is shorter than the tail the tails overlap and the walk
+    /// converts every picture it passes rather than the few it publishes (issue #402).
+    ///
+    /// Frames at or after the target in presentation order are still kept, exactly as [`get`]
+    /// keeps them: on a stream with B-pictures those are the reordered frames the next request
+    /// asks for, and dropping them would reset the decoder and re-walk the group of pictures.
+    ///
+    /// [`get`]: Self::get
+    pub fn get_step(
+        &mut self,
+        presentation_index: FrameIndex,
+        cancellation: &CancellationToken,
+    ) -> Result<VideoFrame> {
+        self.get_request(presentation_index, Request::Step, cancellation)
+    }
+
+    fn get_request(
+        &mut self,
+        presentation_index: FrameIndex,
+        request: Request,
         cancellation: &CancellationToken,
     ) -> Result<VideoFrame> {
         cancellation.check()?;
@@ -497,13 +561,17 @@ impl ExactFrameReader {
             // reset the decoder and walk the whole group of pictures again.
             //
             // The second is the frames immediately behind the target, as many as the cache can
-            // hold. Walking here fills the cache with them as a side effect, and that is what
-            // makes stepping backwards a frame at a time cost nothing; skipping them would
-            // leave the cache empty behind the target and turn every backward step into
-            // another walk from the random-access point. They are a bounded charge - the last
-            // `max_cached_frames` conversions of a walk however long - against a saving that
-            // grows with the distance.
-            let cache_tail = u64::from(self.limits.max_cached_frames);
+            // hold, and that one belongs to the request rather than to the reader. Walking here
+            // fills the cache with them as a side effect, and that is what makes stepping
+            // backwards a frame at a time cost nothing after a seek; skipping them would leave
+            // the cache empty behind the target and turn every backward step into another walk
+            // from the random-access point. For a destination they are a bounded charge - the
+            // last `max_cached_frames` conversions of a walk however long - against a saving
+            // that grows with the distance. For a step they are a charge with no saving behind
+            // it at all: the caller is walking forwards and will never ask for them, and paying
+            // the tail once per step is what made a 150 ms preview cadence convert 765 of the
+            // bundled sample's 768 pictures (issue #402).
+            let cache_tail = request.cache_tail(&self.limits);
             let wanted = position >= target_position
                 || self.samples[position].presentation_index.0
                     >= presentation_index.0.saturating_sub(cache_tail);
@@ -1185,6 +1253,137 @@ mod tests {
             reader.statistics().resets,
             after_walk.resets,
             "the tail the walk kept is in the cache, so stepping back decodes nothing"
+        );
+        assert_eq!(
+            reader.statistics().samples_submitted,
+            after_walk.samples_submitted
+        );
+    }
+
+    #[test]
+    fn a_step_converts_its_own_picture_and_no_tail_behind_it() {
+        // The charge issue #402 is about. A destination keeps the frames behind it because the
+        // request after it is very likely to be for one of them; a step is passed through on
+        // the way somewhere else, so those frames are converted for a request that never comes,
+        // and a walk that steps more often than the tail is long converts everything it passes.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let factory = HintFactory {
+            wanted: Arc::clone(&log),
+        };
+        let samples: Vec<_> = (0..40)
+            .map(|index| sample(index, index as u8, index == 0))
+            .collect();
+        let mut reader = ExactFrameReader::new(
+            &factory,
+            config(),
+            samples,
+            Limits {
+                max_cached_frames: 4,
+                ..Limits::default()
+            },
+        )
+        .unwrap();
+        let cancellation = CancellationToken::new();
+
+        assert_eq!(
+            value(&reader.get_step(FrameIndex(32), &cancellation).unwrap()),
+            32
+        );
+        let after_step = reader.statistics();
+        assert_eq!(
+            after_step.samples_skipped, 32,
+            "frames 0 to 31 are all passed through, tail included"
+        );
+        assert_eq!(
+            reader.cached_frames(),
+            1,
+            "only the picture the step asked for was converted"
+        );
+    }
+
+    #[test]
+    fn a_walk_of_steps_converts_what_it_asks_for_rather_than_what_it_passes() {
+        // The shape of a drag's preview walk: repeated forward steps towards a far target. Each
+        // step used to pay its own cache tail, and with a stride shorter than the tail the tails
+        // overlapped and covered the whole span. As steps, the walk converts one picture per
+        // step however long the span is.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let factory = HintFactory {
+            wanted: Arc::clone(&log),
+        };
+        let samples: Vec<_> = (0..64)
+            .map(|index| sample(index, index as u8, index == 0))
+            .collect();
+        let mut reader = ExactFrameReader::new(
+            &factory,
+            config(),
+            samples,
+            Limits {
+                max_cached_frames: 8,
+                ..Limits::default()
+            },
+        )
+        .unwrap();
+        let cancellation = CancellationToken::new();
+
+        // A stride of 4 against a tail of 8: every frame in the span is within some step's tail.
+        let steps: Vec<u64> = (4..60).step_by(4).collect();
+        for step in &steps {
+            reader.get_step(FrameIndex(*step), &cancellation).unwrap();
+        }
+        let converted = reader.statistics().samples_submitted - reader.statistics().samples_skipped;
+        assert_eq!(
+            converted,
+            steps.len() as u64,
+            "one conversion per published step, not one per frame passed"
+        );
+        assert_eq!(
+            reader.statistics().resets,
+            1,
+            "only the cold start resets; a forward walk of steps never starts over again"
+        );
+    }
+
+    #[test]
+    fn a_step_walk_that_ends_in_a_destination_still_leaves_a_cache_tail_to_step_back_through() {
+        // What the request split must not cost: a committed scrub is a walk of steps that ends
+        // at the frame under the pointer, and stepping backwards from there is still expected
+        // to come out of the cache rather than walking from the random-access point again.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let factory = HintFactory {
+            wanted: Arc::clone(&log),
+        };
+        let samples: Vec<_> = (0..40)
+            .map(|index| sample(index, index as u8, index == 0))
+            .collect();
+        let mut reader = ExactFrameReader::new(
+            &factory,
+            config(),
+            samples,
+            Limits {
+                max_cached_frames: 4,
+                ..Limits::default()
+            },
+        )
+        .unwrap();
+        let cancellation = CancellationToken::new();
+
+        for step in [8_u64, 16, 24] {
+            reader.get_step(FrameIndex(step), &cancellation).unwrap();
+        }
+        reader.get(FrameIndex(32), &cancellation).unwrap();
+        let after_walk = reader.statistics();
+
+        for index in [31_u64, 30, 29] {
+            assert_eq!(
+                value(&reader.get(FrameIndex(index), &cancellation).unwrap()),
+                index as u8
+            );
+        }
+        assert_eq!(
+            reader.statistics().resets,
+            after_walk.resets,
+            "the destination kept its tail, so stepping back decodes nothing"
         );
         assert_eq!(
             reader.statistics().samples_submitted,
