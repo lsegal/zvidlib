@@ -74,12 +74,16 @@ jobs:
             -- --ignored --nocapture
 
   reconstruct-group:
-    name: hevc_encode_640x352_reconstruct (draw ${{ matrix.draw }})
+    name: hevc_encode_640x352_reconstruct (${{ matrix.os }} draw ${{ matrix.draw }})
     strategy:
       fail-fast: false
       matrix:
-        draw: [1, 2, 3]
-    runs-on: ubuntu-latest
+        os: [ubuntu-latest]
+        draw: [1, 2, 3, 4, 5, 6, 7, 8]
+        include:
+          - os: macos-15-intel
+            draw: 1
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
@@ -88,9 +92,8 @@ jobs:
       - name: Install Rust toolchain
         run: rustup show
       - name: Install native audio dependencies
+        if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
-      - name: Report the host
-        run: grep -m1 'model name' /proc/cpuinfo
       # The whole-picture effect is a branch-against-base comparison, so both
       # trees are built and run on the same host and interleaved within a round:
       # `ubuntu-latest` draws several CPU models, and they disagree by more than
@@ -100,15 +103,23 @@ jobs:
         run: |
           git worktree add ../base "$(git merge-base HEAD origin/main)"
       - name: Build both benchmark binaries
+        env:
+          DYLD_FALLBACK_LIBRARY_PATH: /usr/lib/swift
         run: |
           cargo bench --features native --bench hevc_encode --no-run
           cd ../base && cargo bench --features native --bench hevc_encode --no-run
       - name: Run the reconstruction group, interleaved
+        env:
+          DYLD_FALLBACK_LIBRARY_PATH: /usr/lib/swift
         run: |
           set -o pipefail
-          echo "HOST-MODEL $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2-)" \
-            | tee reconstruct.log
-          for round in 1 2 3; do
+          if [ -r /proc/cpuinfo ]; then
+            echo "HOST-MODEL $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2-)" \
+              | tee reconstruct.log
+          else
+            echo "HOST-MODEL $(sysctl -n machdep.cpu.brand_string)" | tee reconstruct.log
+          fi
+          for round in 1 2 3 4 5; do
             for tree in head base; do
               case "$tree" in
                 head) dir=. ;;
@@ -123,6 +134,6 @@ jobs:
       - name: Upload the log
         uses: actions/upload-artifact@v4
         with:
-          name: reconstruct-draw-${{ matrix.draw }}
+          name: reconstruct-${{ matrix.os }}-draw-${{ matrix.draw }}
           path: reconstruct.log
           retention-days: 7
