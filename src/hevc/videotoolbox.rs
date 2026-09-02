@@ -1,6 +1,7 @@
 //! macOS VideoToolbox HEVC backend.
 
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use apple_cf::cf::{AsCFType, CFDictionary, CFNumber, CFType};
@@ -16,6 +17,10 @@ use crate::{
 };
 
 type OutputQueue = Arc<Mutex<Vec<Result<DecodedVideoFrame>>>>;
+
+/// Whether the pictures being decoded are wanted, shared with the decompression callback that
+/// would otherwise convert each one to RGBA.
+type OutputWanted = Arc<AtomicBool>;
 
 pub(super) fn is_available(_dimensions: VideoDimensions) -> bool {
     DecompressionSession::is_hardware_decode_supported(VtCodec::HEVC)
@@ -40,6 +45,7 @@ struct VideoToolboxDecoder {
     limits: Limits,
     format: CMFormatDescription,
     output: OutputQueue,
+    output_wanted: OutputWanted,
     session: Option<DecompressionSession>,
 }
 
@@ -47,12 +53,20 @@ impl VideoToolboxDecoder {
     fn new(configuration: VideoDecoderConfig, limits: Limits, record: &HvccRecord) -> Result<Self> {
         let format = create_format_description(record)?;
         let output = Arc::new(Mutex::new(Vec::new()));
-        let session = create_session(&format, &configuration, limits, Arc::clone(&output))?;
+        let output_wanted = Arc::new(AtomicBool::new(true));
+        let session = create_session(
+            &format,
+            &configuration,
+            limits,
+            Arc::clone(&output),
+            Arc::clone(&output_wanted),
+        )?;
         Ok(Self {
             configuration,
             limits,
             format,
             output,
+            output_wanted,
             session: Some(session),
         })
     }
@@ -91,9 +105,17 @@ impl VideoDecoder for VideoToolboxDecoder {
             return Err(limit("HEVC access unit exceeds the allocation limit"));
         }
         let sample_buffer = create_sample_buffer(sample, &self.format)?;
+        // `kVTDecodeFrame_DoNotOutputFrame` is VideoToolbox's own name for this: the sample is
+        // decoded, and stays a reference for the frames after it, but no picture comes back and
+        // the callback has nothing to lock or convert.
+        let flags = if self.output_wanted.load(Ordering::Acquire) {
+            0
+        } else {
+            videotoolbox::ffi::kVTDecodeFrame_DoNotOutputFrame
+        };
         self.session().and_then(|session| {
             session
-                .decode(&sample_buffer)
+                .decode_with_options(&sample_buffer, flags, None)
                 .map_err(|error| codec(format!("VideoToolbox rejected HEVC input: {error}")))?;
             session
                 .wait_for_async_frames()
@@ -127,8 +149,13 @@ impl VideoDecoder for VideoToolboxDecoder {
             &self.configuration,
             self.limits,
             Arc::clone(&self.output),
+            Arc::clone(&self.output_wanted),
         )?);
         Ok(())
+    }
+
+    fn set_output_wanted(&mut self, wanted: bool) {
+        self.output_wanted.store(wanted, Ordering::Release);
     }
 }
 
@@ -137,6 +164,7 @@ fn create_session(
     configuration: &VideoDecoderConfig,
     limits: Limits,
     output: OutputQueue,
+    output_wanted: OutputWanted,
 ) -> Result<DecompressionSession> {
     let pixel_format = CFNumber::from_u64(u64::from(
         raw::kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
@@ -154,6 +182,11 @@ fn create_session(
         format,
         Some(&attributes),
         move |decoded| {
+            // A frame decoded with `kVTDecodeFrame_DoNotOutputFrame` still reaches the callback,
+            // with no image buffer to convert. Dropping it here is the whole saving.
+            if !output_wanted.load(Ordering::Acquire) {
+                return;
+            }
             let result = decoded_frame(decoded, &callback_configuration, &limits);
             if let Ok(mut queue) = output.lock() {
                 queue.push(result);

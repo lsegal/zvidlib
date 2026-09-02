@@ -285,6 +285,28 @@ pub trait VideoDecoder: Send {
     ) -> Result<Vec<DecodedVideoFrame>>;
     fn drain(&mut self, cancellation: &CancellationToken) -> Result<Vec<DecodedVideoFrame>>;
     fn reset(&mut self) -> Result<()>;
+
+    /// Whether the caller wants the pictures the next samples decode to, or is only decoding
+    /// them because a later frame references them.
+    ///
+    /// Reaching a frame in the middle of a long group of pictures means decoding every sample
+    /// before it, and on the way there nothing looks at those pictures. What they cost is not
+    /// the decoding: a hardware backend hands back NV12 and every one of these decoders then
+    /// converts a whole picture to RGBA on the CPU and allocates the frame that holds it. On
+    /// the bundled 1080p sample that conversion is 6.6 ms of the 9.6 ms a frame takes through
+    /// VideoToolbox, so a seek that skips it for the frames it passes costs a third of what it
+    /// did.
+    ///
+    /// A decoder must still *decode* a suppressed sample - the frames after it reference the
+    /// picture - and must still account for its presentation identity; what it may skip is
+    /// producing the [`DecodedVideoFrame`], which it reports by returning fewer frames than it
+    /// was given samples.
+    ///
+    /// The default implementation ignores the hint, which is always correct: a decoder that
+    /// keeps producing every frame is a decoder that is merely no faster. [`ExactFrameReader`]
+    /// tracks what it was actually handed rather than what it asked for, so a backend that
+    /// implements this and one that does not answer the same frames.
+    fn set_output_wanted(&mut self, _wanted: bool) {}
 }
 
 /// Discovers and creates video decoders without exposing backend-specific types.
@@ -311,6 +333,9 @@ pub trait VideoEncoderFactory {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DecodeStatistics {
     pub samples_submitted: u64,
+    /// Of those, the ones submitted only so a later frame could reference them, with the
+    /// decoder told not to produce their pictures.
+    pub samples_skipped: u64,
     pub cache_hits: u64,
     pub resets: u64,
     pub drains: u64,
@@ -325,6 +350,18 @@ pub struct ExactFrameReader {
     cache: BTreeMap<FrameIndex, VideoFrame>,
     lru: VecDeque<FrameIndex>,
     published_since_reset: HashSet<FrameIndex>,
+    /// Frames whose sample was submitted while the decoder was told nothing wanted its picture,
+    /// so the decoder passed through them without producing one. Reaching one again needs the
+    /// same reset an evicted published frame does.
+    suppressed_since_reset: HashSet<FrameIndex>,
+    /// Frames whose sample has been submitted and whose picture has not come back yet, because a
+    /// reordering decoder holds one until the samples after it arrive. They are the frames a
+    /// decoder may drop the moment output stops being wanted, so turning it off writes them off
+    /// with the rest.
+    in_flight_since_reset: HashSet<FrameIndex>,
+    /// What the decoder was last told, so a walk toggles it once at the target rather than
+    /// on every sample.
+    output_wanted: bool,
     next_decode_position: Option<usize>,
     limits: Limits,
     statistics: DecodeStatistics,
@@ -380,6 +417,9 @@ impl ExactFrameReader {
             cache: BTreeMap::new(),
             lru: VecDeque::new(),
             published_since_reset: HashSet::new(),
+            suppressed_since_reset: HashSet::new(),
+            in_flight_since_reset: HashSet::new(),
+            output_wanted: true,
             next_decode_position: None,
             limits,
             statistics: DecodeStatistics::default(),
@@ -413,14 +453,21 @@ impl ExactFrameReader {
         // requires a reset is when the frame was already published once and evicted from the
         // cache, since a decoder must never be asked to emit the same presentation frame twice
         // without an intervening reset (see `publish`).
+        //
+        // A frame the decoder walked past without producing is in the same position as one that
+        // was published and evicted: the decoder will not emit it again, so only a reset can
+        // reach it.
         let can_reuse = self
             .next_decode_position
             .is_some_and(|position| position >= random_access_position)
-            && !self.published_since_reset.contains(&presentation_index);
+            && !self.published_since_reset.contains(&presentation_index)
+            && !self.suppressed_since_reset.contains(&presentation_index);
         if !can_reuse {
             self.decoder.reset()?;
             self.statistics.resets = self.statistics.resets.saturating_add(1);
             self.published_since_reset.clear();
+            self.suppressed_since_reset.clear();
+            self.in_flight_since_reset.clear();
             self.next_decode_position = Some(random_access_position);
         }
 
@@ -434,11 +481,44 @@ impl ExactFrameReader {
                 ));
             }
             if position == self.samples.len() {
+                self.set_output_wanted(true);
                 self.drain_internal(cancellation)?;
                 break;
             }
+            // Nothing looks at a picture decoded on the way to the target, and skipping the
+            // colour conversion it would otherwise pay is most of what a long walk costs. Two
+            // kinds of frame are kept anyway, both because the request after this one is very
+            // likely to be for them.
+            //
+            // The first is anything at or after the target in *presentation* order. A walk
+            // arrives at its target from behind and carries on forwards, and deciding this by
+            // decode position instead discards exactly the reordered frames a stream with
+            // B-pictures asks for next: on the bundled sample every fourth request would then
+            // reset the decoder and walk the whole group of pictures again.
+            //
+            // The second is the frames immediately behind the target, as many as the cache can
+            // hold. Walking here fills the cache with them as a side effect, and that is what
+            // makes stepping backwards a frame at a time cost nothing; skipping them would
+            // leave the cache empty behind the target and turn every backward step into
+            // another walk from the random-access point. They are a bounded charge - the last
+            // `max_cached_frames` conversions of a walk however long - against a saving that
+            // grows with the distance.
+            let cache_tail = u64::from(self.limits.max_cached_frames);
+            let wanted = position >= target_position
+                || self.samples[position].presentation_index.0
+                    >= presentation_index.0.saturating_sub(cache_tail);
+            self.set_output_wanted(wanted);
+            let suppressed = !self.output_wanted;
             let outputs = self.decoder.submit(&self.samples[position], cancellation)?;
             self.statistics.samples_submitted = self.statistics.samples_submitted.saturating_add(1);
+            if suppressed {
+                self.statistics.samples_skipped = self.statistics.samples_skipped.saturating_add(1);
+                self.suppressed_since_reset
+                    .insert(self.samples[position].presentation_index);
+            } else {
+                self.in_flight_since_reset
+                    .insert(self.samples[position].presentation_index);
+            }
             self.next_decode_position = Some(position + 1);
             work += 1;
             self.publish(outputs)?;
@@ -461,17 +541,45 @@ impl ExactFrameReader {
     /// Drains delayed output into the bounded presentation cache.
     pub fn drain(&mut self, cancellation: &CancellationToken) -> Result<usize> {
         cancellation.check()?;
+        self.set_output_wanted(true);
         self.drain_internal(cancellation)
+    }
+
+    /// Tells the decoder whether the next samples' pictures are wanted, when that has changed.
+    ///
+    /// Turning output off writes off the frames the decoder is still holding as well as the ones
+    /// it is about to be handed. A reordering decoder releases a picture several samples after
+    /// the one that carried it, so a frame submitted while output was wanted can come out - and
+    /// be dropped - during the suppressed stretch that follows. Not writing those off is a
+    /// decoder that will never produce them and a reader that still believes it can ask, which
+    /// ends in `decoder did not produce the requested presentation frame`. A picture that does
+    /// arrive after all takes itself back off the list in [`publish`].
+    ///
+    /// [`publish`]: Self::publish
+    fn set_output_wanted(&mut self, wanted: bool) {
+        if self.output_wanted == wanted {
+            return;
+        }
+        if !wanted {
+            for frame in self.in_flight_since_reset.drain() {
+                self.suppressed_since_reset.insert(frame);
+            }
+        }
+        self.decoder.set_output_wanted(wanted);
+        self.output_wanted = wanted;
     }
 
     /// Clears decoder, reorder, and frame-cache state.
     pub fn reset(&mut self) -> Result<()> {
+        self.set_output_wanted(true);
         self.decoder.reset()?;
         self.statistics.resets = self.statistics.resets.saturating_add(1);
         self.next_decode_position = None;
         self.cache.clear();
         self.lru.clear();
         self.published_since_reset.clear();
+        self.suppressed_since_reset.clear();
+        self.in_flight_since_reset.clear();
         Ok(())
     }
 
@@ -501,6 +609,13 @@ impl ExactFrameReader {
 
     fn publish(&mut self, outputs: Vec<DecodedVideoFrame>) -> Result<()> {
         for output in outputs {
+            // A decoder that ignores the output hint, or one that only emits a suppressed
+            // sample's picture later, hands back a frame this reader had written off. What it
+            // was handed is what counts, so it is a cached frame again rather than a reset.
+            self.suppressed_since_reset
+                .remove(&output.presentation_index);
+            self.in_flight_since_reset
+                .remove(&output.presentation_index);
             if !self.published_since_reset.insert(output.presentation_index) {
                 return Err(Error::new(
                     ErrorKind::MalformedMedia,
@@ -690,6 +805,7 @@ impl VideoDecoder for UncompressedVideoDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     fn config() -> VideoDecoderConfig {
         VideoDecoderConfig {
@@ -817,6 +933,403 @@ mod tests {
         );
         assert!(reader.statistics().resets > first.resets);
         assert!(reader.cached_frames() <= 3);
+    }
+
+    /// Records what each sample was asked to produce, so a test can see the hint the reader
+    /// actually gave rather than only its effect.
+    struct HintFactory {
+        wanted: Arc<Mutex<Vec<(u64, bool)>>>,
+    }
+
+    struct HintDecoder {
+        configuration: VideoDecoderConfig,
+        limits: Limits,
+        wanted: Arc<Mutex<Vec<(u64, bool)>>>,
+        output_wanted: bool,
+    }
+
+    impl VideoDecoderFactory for HintFactory {
+        fn capability(&self, _: &VideoDecoderConfig) -> CodecSupport {
+            CodecSupport::Supported {
+                implementation: CodecImplementation::Software,
+            }
+        }
+
+        fn create(
+            &self,
+            configuration: &VideoDecoderConfig,
+            limits: &Limits,
+        ) -> Result<Box<dyn VideoDecoder>> {
+            Ok(Box::new(HintDecoder {
+                configuration: configuration.clone(),
+                limits: *limits,
+                wanted: Arc::clone(&self.wanted),
+                output_wanted: true,
+            }))
+        }
+    }
+
+    impl VideoDecoder for HintDecoder {
+        fn submit(
+            &mut self,
+            sample: &EncodedVideoSample,
+            cancellation: &CancellationToken,
+        ) -> Result<Vec<DecodedVideoFrame>> {
+            cancellation.check()?;
+            self.wanted
+                .lock()
+                .expect("hint log poisoned")
+                .push((sample.presentation_index.0, self.output_wanted));
+            if !self.output_wanted {
+                return Ok(Vec::new());
+            }
+            Ok(vec![DecodedVideoFrame {
+                presentation_index: sample.presentation_index,
+                frame: VideoFrame::new(
+                    self.configuration.coded_dimensions,
+                    PixelFormat::Gray8,
+                    ColorRange::Full,
+                    vec![Plane {
+                        data: sample.data.clone(),
+                        stride: 1,
+                    }],
+                    &self.limits,
+                )?,
+            }])
+        }
+
+        fn drain(&mut self, _: &CancellationToken) -> Result<Vec<DecodedVideoFrame>> {
+            Ok(Vec::new())
+        }
+
+        fn reset(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn set_output_wanted(&mut self, wanted: bool) {
+            self.output_wanted = wanted;
+        }
+    }
+
+    /// Ten frames behind one random-access point, as the bundled sample's single group of
+    /// pictures is, with `value == index * 10`.
+    fn single_group_of_pictures() -> Vec<EncodedVideoSample> {
+        (0..10)
+            .map(|index| sample(index, (index * 10) as u8, index == 0))
+            .collect()
+    }
+
+    /// A cache small enough that a walk over ten frames is longer than the tail the reader
+    /// keeps behind its target; the default cache would hold the whole group of pictures.
+    fn small_cache() -> Limits {
+        Limits {
+            max_cached_frames: 2,
+            ..Limits::default()
+        }
+    }
+
+    #[test]
+    fn walking_to_a_distant_frame_does_not_ask_for_the_pictures_it_passes() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let factory = HintFactory {
+            wanted: Arc::clone(&log),
+        };
+        let mut reader = ExactFrameReader::new(
+            &factory,
+            config(),
+            single_group_of_pictures(),
+            small_cache(),
+        )
+        .unwrap();
+        let cancellation = CancellationToken::new();
+
+        assert_eq!(
+            value(&reader.get(FrameIndex(8), &cancellation).unwrap()),
+            80
+        );
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec![
+                (0, false),
+                (1, false),
+                (2, false),
+                (3, false),
+                (4, false),
+                (5, false),
+                (6, true),
+                (7, true),
+                (8, true),
+            ],
+            "only the target and the tail the cache can hold are produced"
+        );
+        let statistics = reader.statistics();
+        assert_eq!(statistics.samples_submitted, 9);
+        assert_eq!(statistics.samples_skipped, 6);
+        assert_eq!(statistics.resets, 1, "the walk itself is one decode");
+    }
+
+    #[test]
+    fn a_frame_the_walk_went_past_is_decoded_again_rather_than_reported_missing() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let factory = HintFactory {
+            wanted: Arc::clone(&log),
+        };
+        let mut reader = ExactFrameReader::new(
+            &factory,
+            config(),
+            single_group_of_pictures(),
+            small_cache(),
+        )
+        .unwrap();
+        let cancellation = CancellationToken::new();
+        reader.get(FrameIndex(8), &cancellation).unwrap();
+        let resets = reader.statistics().resets;
+
+        // Frame 4 was submitted with nothing wanting its picture, so this decoder will never
+        // emit it again. The reader has to notice that and start over, exactly as it does for a
+        // frame it published and then evicted.
+        assert_eq!(
+            value(&reader.get(FrameIndex(4), &cancellation).unwrap()),
+            40
+        );
+        assert_eq!(reader.statistics().resets, resets + 1);
+        // And having decoded it, it is a cached frame again rather than a second reset.
+        assert_eq!(
+            value(&reader.get(FrameIndex(4), &cancellation).unwrap()),
+            40
+        );
+        assert_eq!(reader.statistics().resets, resets + 1);
+    }
+
+    #[test]
+    fn a_reordered_frame_at_or_past_the_target_is_kept_for_the_request_that_follows() {
+        // Decode order 0, 4, 2, 1, 3: reaching frame 4 means submitting samples whose own
+        // frames are 2, 1 and 3, which is a walk *backwards* in presentation order. Skipping by
+        // decode position would discard them and make every following request a fresh walk.
+        let samples = vec![
+            sample(0, 0, true),
+            sample(4, 40, false),
+            sample(2, 20, false),
+            sample(1, 10, false),
+            sample(3, 30, false),
+            sample(8, 80, false),
+            sample(6, 60, false),
+            sample(5, 50, false),
+            sample(7, 70, false),
+        ];
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let factory = HintFactory {
+            wanted: Arc::clone(&log),
+        };
+        let mut reader = ExactFrameReader::new(&factory, config(), samples, small_cache()).unwrap();
+        let cancellation = CancellationToken::new();
+
+        assert_eq!(
+            value(&reader.get(FrameIndex(4), &cancellation).unwrap()),
+            40
+        );
+        let resets = reader.statistics().resets;
+        for (index, expected) in [(1_u64, 10_u8), (2, 20), (3, 30)] {
+            assert_eq!(
+                value(&reader.get(FrameIndex(index), &cancellation).unwrap()),
+                expected,
+                "frame {index} is still available"
+            );
+        }
+        assert_eq!(
+            reader.statistics().resets,
+            resets,
+            "a frame after the target in decode order is not skipped"
+        );
+        assert_eq!(
+            reader.statistics().samples_skipped,
+            1,
+            "only frame 0, the random-access point the walk starts from, is behind frame 4"
+        );
+    }
+
+    #[test]
+    fn a_walk_leaves_the_frames_behind_its_target_cached_so_stepping_back_is_free() {
+        // Walking fills the cache with the frames just before the target as a side effect, and
+        // that is what makes the example's previous-frame key cheap. Skipping those too would
+        // send every backward step all the way back to the random-access point.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let factory = HintFactory {
+            wanted: Arc::clone(&log),
+        };
+        let samples: Vec<_> = (0..40)
+            .map(|index| sample(index, index as u8, index == 0))
+            .collect();
+        let mut reader = ExactFrameReader::new(
+            &factory,
+            config(),
+            samples,
+            Limits {
+                max_cached_frames: 4,
+                ..Limits::default()
+            },
+        )
+        .unwrap();
+        let cancellation = CancellationToken::new();
+        reader.get(FrameIndex(32), &cancellation).unwrap();
+        let after_walk = reader.statistics();
+        assert_eq!(after_walk.samples_skipped, 28, "frames 0 to 27 are skipped");
+
+        for index in [31_u64, 30, 29] {
+            assert_eq!(
+                value(&reader.get(FrameIndex(index), &cancellation).unwrap()),
+                index as u8
+            );
+        }
+        assert_eq!(
+            reader.statistics().resets,
+            after_walk.resets,
+            "the tail the walk kept is in the cache, so stepping back decodes nothing"
+        );
+        assert_eq!(
+            reader.statistics().samples_submitted,
+            after_walk.samples_submitted
+        );
+    }
+
+    /// A decoder that releases each picture one sample late, and drops whatever it is holding
+    /// when nothing wants its output - which is what a reordering decoder does.
+    struct LateFactory;
+
+    struct LateDecoder {
+        configuration: VideoDecoderConfig,
+        limits: Limits,
+        held: Option<EncodedVideoSample>,
+        output_wanted: bool,
+    }
+
+    impl VideoDecoderFactory for LateFactory {
+        fn capability(&self, _: &VideoDecoderConfig) -> CodecSupport {
+            CodecSupport::Supported {
+                implementation: CodecImplementation::Software,
+            }
+        }
+
+        fn create(
+            &self,
+            configuration: &VideoDecoderConfig,
+            limits: &Limits,
+        ) -> Result<Box<dyn VideoDecoder>> {
+            Ok(Box::new(LateDecoder {
+                configuration: configuration.clone(),
+                limits: *limits,
+                held: None,
+                output_wanted: true,
+            }))
+        }
+    }
+
+    impl LateDecoder {
+        fn release(&self, sample: EncodedVideoSample) -> Result<Vec<DecodedVideoFrame>> {
+            if !self.output_wanted {
+                return Ok(Vec::new());
+            }
+            Ok(vec![DecodedVideoFrame {
+                presentation_index: sample.presentation_index,
+                frame: VideoFrame::new(
+                    self.configuration.coded_dimensions,
+                    PixelFormat::Gray8,
+                    ColorRange::Full,
+                    vec![Plane {
+                        data: sample.data,
+                        stride: 1,
+                    }],
+                    &self.limits,
+                )?,
+            }])
+        }
+    }
+
+    impl VideoDecoder for LateDecoder {
+        fn submit(
+            &mut self,
+            sample: &EncodedVideoSample,
+            cancellation: &CancellationToken,
+        ) -> Result<Vec<DecodedVideoFrame>> {
+            cancellation.check()?;
+            match self.held.replace(sample.clone()) {
+                Some(previous) => self.release(previous),
+                None => Ok(Vec::new()),
+            }
+        }
+
+        fn drain(&mut self, _: &CancellationToken) -> Result<Vec<DecodedVideoFrame>> {
+            match self.held.take() {
+                Some(held) => self.release(held),
+                None => Ok(Vec::new()),
+            }
+        }
+
+        fn reset(&mut self) -> Result<()> {
+            self.held = None;
+            Ok(())
+        }
+
+        fn set_output_wanted(&mut self, wanted: bool) {
+            self.output_wanted = wanted;
+        }
+    }
+
+    #[test]
+    fn a_frame_still_inside_a_reordering_decoder_when_output_stops_is_written_off_too() {
+        // The frame a decoder is holding when output stops being wanted comes out during the
+        // suppressed stretch and is dropped, even though its own sample was submitted while
+        // output was still wanted. A reader that does not write it off believes it can still be
+        // asked for and reports the decoder as malformed when it never arrives.
+        let mut reader = ExactFrameReader::new(
+            &LateFactory,
+            config(),
+            single_group_of_pictures(),
+            small_cache(),
+        )
+        .unwrap();
+        let cancellation = CancellationToken::new();
+
+        // Reaching frame 4 means submitting frame 5's sample to release it, so the decoder is
+        // left holding frame 5 - which it releases, and drops, on the first suppressed submit of
+        // the request that follows.
+        assert_eq!(
+            value(&reader.get(FrameIndex(4), &cancellation).unwrap()),
+            40
+        );
+        assert_eq!(
+            value(&reader.get(FrameIndex(9), &cancellation).unwrap()),
+            90
+        );
+        assert_eq!(
+            value(&reader.get(FrameIndex(5), &cancellation).unwrap()),
+            50,
+            "the frame that was dropped in flight is decoded again, not reported missing"
+        );
+    }
+
+    #[test]
+    fn a_decoder_that_ignores_the_hint_still_answers_every_frame() {
+        // `set_output_wanted` is advisory: `uncompressed_video_decoder_factory` does not
+        // implement it, and the reader has to be no less correct for that.
+        let factory = uncompressed_video_decoder_factory();
+        let mut reader = ExactFrameReader::new(
+            &factory,
+            config(),
+            single_group_of_pictures(),
+            small_cache(),
+        )
+        .unwrap();
+        let cancellation = CancellationToken::new();
+        reader.get(FrameIndex(8), &cancellation).unwrap();
+        assert_eq!(reader.statistics().samples_skipped, 6);
+        for index in 0..9_u64 {
+            assert_eq!(
+                value(&reader.get(FrameIndex(index), &cancellation).unwrap()),
+                (index * 10) as u8,
+                "frame {index} came back from the decoder that ignored the hint"
+            );
+        }
     }
 
     #[test]
