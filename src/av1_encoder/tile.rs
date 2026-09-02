@@ -780,7 +780,8 @@ pub(crate) struct SearchReport {
     /// two searches to a place in the frame rather than to a position in the trace.
     pub(crate) size_choices: Vec<(usize, usize, usize, usize)>,
     pub(crate) cost_ties: u64,
-    /// Size trials the context-consistent trial's cost bound abandoned part-way.
+    /// Size trials the incumbent size's cost bound abandoned part-way, whether the trial was a
+    /// shipped one or a context-consistent one.
     pub(crate) abandoned_trials: u64,
     /// Transform blocks a context-consistent size trial searched with the whole type set.
     pub(crate) consistent_trial_blocks: u64,
