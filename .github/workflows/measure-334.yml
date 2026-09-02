@@ -1,0 +1,76 @@
+# Temporary: the x86_64 measurement for issue #334, removed before this branch
+# merges. Timed runs in `ci.yml` are `main`-only, and the band-offset harness is
+# an `#[ignore]`d test rather than a criterion group, so this is the way to draw
+# x86_64 hosts for it from a branch.
+name: Measure #334 (band offset on x86_64)
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/measure-334.yml'
+      - 'src/hevc/engine/encoder/recon_simd.rs'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  band-offset:
+    name: band offset (${{ matrix.os }} draw ${{ matrix.draw }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15-intel]
+        draw: [1, 2, 3]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: rustup show
+      - name: Report the host
+        run: |
+          uname -m
+          if [ -r /proc/cpuinfo ]; then
+            grep -m1 'model name' /proc/cpuinfo
+            grep -m1 '^flags' /proc/cpuinfo | tr ' ' '\n' | grep -E '^(sse4_1|avx2|avx512f|avx512cd)$' || true
+          else
+            sysctl -n machdep.cpu.brand_string
+            sysctl -n machdep.cpu.leaf7_features || true
+          fi
+      # The candidate kernels are asserted bit-exact before anything is timed,
+      # so a number can never come from an arm that computes the wrong answer.
+      - name: Assert the candidates against the scalar reference
+        run: cargo test --release --lib recon_simd -- --nocapture
+      - name: Time the band-offset search
+        run: |
+          cargo test --release --lib recon_simd::tests::bench_band_offset_row \
+            -- --ignored --nocapture
+
+  reconstruct-group:
+    name: hevc_encode_640x352_reconstruct (draw ${{ matrix.draw }})
+    strategy:
+      fail-fast: false
+      matrix:
+        draw: [1, 2]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: rustup show
+      - name: Install native audio dependencies
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - name: Report the host
+        run: grep -m1 'model name' /proc/cpuinfo
+      - name: Run the reconstruction group
+        run: |
+          set -o pipefail
+          cargo bench --features native --bench hevc_encode -- \
+            hevc_encode_640x352_reconstruct 2>&1 | tee reconstruct.log
+      - name: Upload the log
+        uses: actions/upload-artifact@v4
+        with:
+          name: reconstruct-draw-${{ matrix.draw }}
+          path: reconstruct.log
+          retention-days: 7
