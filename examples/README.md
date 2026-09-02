@@ -43,6 +43,15 @@ moving during a long walk without paying a full-resolution conversion per frame,
 behind the reader restarts at its random-access point. The window keeps drawing throughout, and
 only the frame the pointer is released on is seeked to and decoded exactly.
 
+What the drag draws *first* does not come from that walk at all. A background pass over the track
+keeps a quarter-scale picture every half second of playback, capped at 64 MiB, and a drag looks the
+nearest one up and uploads it before it asks the walk for anything - a lookup and a texture upload,
+under a millisecond, against the second and a half the same position costs to decode exactly on the
+bundled sample, whose 768 frames are a single group of pictures. The walk still runs underneath and
+replaces the preview with the exact frame when it lands. Until the pass reaches a point, a drag
+there falls back to the nearest earlier picture, so the bar is progressively right rather than
+blank.
+
 ```console
 cargo run --example native_gl --features native
 ```

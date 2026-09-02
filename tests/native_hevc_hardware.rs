@@ -298,3 +298,42 @@ fn hardware_readback_seam_attributes_each_decoded_frame() {
         report.frames, report.surface_copy, report.color_convert
     );
 }
+
+/// Issue #374: what a cold seek to an arbitrary frame of the bundled sample costs, on a hardware
+/// backend, as a number rather than an impression.
+///
+/// The sample's `stss` names one sync sample for 768 frames, so every one of these is a walk from
+/// frame zero. Ignored because it is a wall-clock reading on whatever host runs it.
+#[test]
+#[ignore = "host-specific seek-latency measurement"]
+fn a_cold_hardware_seek_costs_this_much() {
+    let mut vector = bundled_vector();
+    vector.configuration.hardware = HardwarePreference::Require;
+    let factory = native_hevc_video_decoder_factory();
+    if factory.capability(&vector.configuration) == CodecSupport::HardwareUnavailable {
+        eprintln!("skipping: hardware HEVC unavailable");
+        return;
+    }
+    let cancellation = CancellationToken::new();
+    for target in [76_u64, 384, 767] {
+        let mut reader = ExactFrameReader::new(
+            &factory,
+            vector.configuration.clone(),
+            vector.samples.clone(),
+            Limits::default(),
+        )
+        .unwrap();
+        let started = Instant::now();
+        let frame = reader.get(FrameIndex(target), &cancellation).unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(
+            FrameDigest::from_frame(&frame).unwrap(),
+            vector.expected_frames[target as usize].digest
+        );
+        let statistics = reader.statistics();
+        eprintln!(
+            "cold seek to frame {target}: {elapsed:?} ({} submitted, {} skipped)",
+            statistics.samples_submitted, statistics.samples_skipped
+        );
+    }
+}
