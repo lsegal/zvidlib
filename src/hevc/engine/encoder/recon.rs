@@ -805,8 +805,15 @@ fn rd_score(gain: i64, bins: u64, band_bins: u64, lambda: SaoLambda) -> i64 {
 pub(super) const SAO_LAMBDA_BAND: u64 = 4;
 
 /// What band offset's own syntax is charged per bin, as a multiple of
-/// `lambda_q8`, numerator over denominator — see [`SaoLambda::band_q8`] for
-/// what the multiple is and what the sweep says about it.
+/// `lambda_q8`, numerator over denominator.
+///
+/// 5/2 is 2.47x rounded to the precision one sweep supports: the merge a band
+/// component forfeits, measured over the QP 12-51 sweep on both test pictures
+/// at both sizes as 2517 coded bins spent against 1018 band-syntax bins
+/// charged. See [`SaoLambda::band_q8`] for the derivation and
+/// `the_band_syntax_charge_is_the_merge_a_band_component_forfeits` for the
+/// measurement. The sweep is byte-identical at 247/100 and at 5/2, so the
+/// rounding is not a decision.
 const BAND_SYNTAX_CHARGE_NUM: u32 = 5;
 const BAND_SYNTAX_CHARGE_DEN: u32 = 2;
 
@@ -858,25 +865,78 @@ pub(crate) struct SaoLambda {
     /// QP 32 slice lands the same 2079 bytes the same 0.003 dB under its own
     /// curve, byte for byte and millibel for millibel, on the repaired rule
     /// and on the one before it alike. The charge is therefore not standing
-    /// in for anything the slice-level rule was getting wrong, and it stays
-    /// at 2.5x rather than moving to the 1.5x that also holds — a constant
-    /// sitting on the exact boundary where the invariant is next measured to
-    /// break is fitted to that boundary, not derived, and doubling the QPs
-    /// that carry band components from 13 to 27 is not worth buying at that
-    /// price.
+    /// in for anything the slice-level rule was getting wrong, and #344
+    /// concluded that what closes the gap has to be a price on the search.
     ///
-    /// What it is standing in for is the acceptance rule's own resolution.
-    /// The rule is monotone in the grid — `keeps_sao` states why, and #287's
-    /// non-monotone reading is a property of restating a concave threshold as
-    /// a per-bit multiplier rather than of the decision — but monotone is not precise, and at
-    /// these operating points it decides on margins of a few parts in a
-    /// thousand. `SAO_ACCEPTANCE_RESOLUTION_NUM` is how far it can actually
-    /// see: the two-point extrapolation the rule rests on is measured wrong
-    /// by tens of percent of the distortion it predicts, 0.13 dB at this very
-    /// picture and QP, which is forty times the 0.003 dB the invariant fails
-    /// by here. The invariant is measuring something the acceptance rule
-    /// cannot resolve, so what closes that gap has to be a charge on the
-    /// search rather than a tolerance on the rule, and this constant is it.
+    /// # What the search misprices is §7.3.8.3's merge
+    ///
+    /// It is not a bit the band component codes; it is a structure its
+    /// neighbours stop being able to elide. `code_sao` writes one
+    /// `sao_merge_left_flag` or `sao_merge_up_flag` in place of a whole
+    /// `sao( )` structure whenever a CTB's three components are exactly its
+    /// left or above neighbour's. The per-CTB search never sees that: it
+    /// scores every candidate against the structure it would code standalone,
+    /// so a CTB that was about to cost one flag and a CTB that was about to
+    /// cost twenty bins look the same to it.
+    ///
+    /// The blindness is not symmetric between the two types, which is what
+    /// puts the whole of it on band offset. An edge component picks one of
+    /// four classes and lets §7.4.9.3 infer its four signs, so two
+    /// neighbouring CTBs of one kind of content resolve to identical
+    /// parameters routinely — 29 of the 48 CTBs of the noise picture at
+    /// 128x96 and QP 12 merge. A band component picks one of 32 positions and
+    /// four signed offsets per component, so two neighbours essentially never
+    /// do: pricing band offset at the closed form on that same picture takes
+    /// the band components from 2 to 10 and the merges from 29 to 22. Seven
+    /// whole structures were coded where seven flags had been, and not one
+    /// bin of that is a bin the band components code.
+    ///
+    /// # The charge is that merge, measured
+    ///
+    /// [`coding_bins`] is the search's own rate model made exact — the flags
+    /// `code_sao` codes for a cell, and the structure it codes only when
+    /// neither merge fires — and
+    /// `the_coded_rate_model_agrees_with_what_the_writer_spends` holds it
+    /// against the bits the writer actually spends, worst 9.5% over six
+    /// operating points, the residual being the merge and type-idx bins that
+    /// are context-coded and cost less than a bin each. Summed over a grid by
+    /// [`grid_bins`], it says what band offset costs a whole picture:
+    ///
+    /// ```text
+    /// charge = ( bins with band offset available
+    ///            - bins with band offset priced out at SAO_LAMBDA_BAND )
+    ///          / band-syntax bins the band components code
+    /// ```
+    ///
+    /// The numerator is every bin band offset costs, forfeited merges
+    /// included; the denominator is the part of it the search can see. Over
+    /// the QP 12-51 sweep on both test pictures at both sizes that is 2517
+    /// bins against 1018, or **2.47x** — which is the fitted 2.5x, derived.
+    /// The constant does not move: `sao_sweep` is byte-identical at 247/100
+    /// and at 5/2, so what changed is that the value is now a measurement of
+    /// the merge rather than a fit to the boundary where the invariant is
+    /// next measured to break.
+    ///
+    /// It is far above the 1.1x-1.4x the two-point probe measures a marginal
+    /// bit at, and that is the expected answer rather than a discrepancy: the
+    /// probe prices a bit of *this slice's own coded rate*, and the forfeited
+    /// merge is not one. Per-QP the ratio runs from 0.50x to 4.00x — a
+    /// constant is the right shape only in aggregate, because how much merge
+    /// a band component destroys is a property of how much its neighbours
+    /// agreed with each other, which is content and not rate.
+    ///
+    /// What is *not* landed is the obvious next step, giving the search
+    /// [`coding_bins`] directly instead of a constant standing in for it.
+    /// That was built and swept: it raises the merges on that picture from 29
+    /// to 32, keeps every #274 operating point, and prices SAO correctly
+    /// enough that the slice-level rule then accepts it at QPs it used to
+    /// decline — and two of those acceptances land 0.001 dB and 0.011 dB
+    /// under the writer's own curve, at CTBs carrying no band component at
+    /// all. That is `SAO_ACCEPTANCE_RESOLUTION_NUM` again, a rule deciding on
+    /// margins forty times finer than it can resolve, and it is the same
+    /// blocker #344 recorded rather than anything about band offset. It is
+    /// tracked separately.
+    ///
     pub(crate) band_q8: u32,
 }
 
@@ -911,8 +971,101 @@ impl SaoLambda {
 /// truncated-Rice bins are counted by [`offset_abs_bins`] exactly as edge
 /// offset's are, and priced the same way, because they are the same kind of
 /// bit.
-fn band_syntax_bins(offsets: &[i32; 5]) -> u64 {
+pub(crate) fn band_syntax_bins(offsets: &[i32; 5]) -> u64 {
     5 + offsets[1..5].iter().filter(|&&o| o != 0).count() as u64
+}
+
+/// The §7.3.8.3 bins one cell's own `sao( )` structure costs, split into the
+/// bins [`SaoLambda::mode_q8`] prices and the band-offset bins
+/// [`SaoLambda::band_q8`] does.
+///
+/// Absolute rather than marginal, which is what the per-CTB search's own
+/// scoring is not: it charges a candidate the bins it codes *beyond* leaving
+/// SAO off, because at that point in the decision the alternative is always
+/// this same CTB coding its own structure. [`coding_bins`] is where that
+/// stops being true.
+pub(crate) fn cell_bins(cell: &ResolvedSao) -> (u64, u64) {
+    let (mut mode, mut band) = (0u64, 0u64);
+    // `sao_type_idx_luma`, then `sao_type_idx_chroma` for the pair — §7.4.9.3
+    // infers cIdx 2's type from cIdx 1, so Cr codes none of its own.
+    for (component, partner) in [
+        (&cell.components[0], None),
+        (&cell.components[1], Some(&cell.components[2])),
+    ] {
+        // Table 9-43 TR (cMax 2): bin 0 always, bin 1 only when it is on.
+        mode += 1;
+        if component.sao_type_idx == 0 {
+            continue;
+        }
+        mode += 1;
+        for c in std::iter::once(component).chain(partner) {
+            mode += offset_abs_bins(&c.offset_val);
+            if component.sao_type_idx == 1 {
+                // Band offset: each component signals its own signs and its
+                // own five-bin `sao_band_position`.
+                band += band_syntax_bins(&c.offset_val);
+            }
+        }
+        if component.sao_type_idx == 2 {
+            // One `sao_eo_class` for the component or the pair.
+            mode += 2;
+        }
+    }
+    (mode, band)
+}
+
+/// What the writer will really spend on `cell` at this position, given what
+/// its left and above neighbours resolved to: the §7.3.8.3 merge flags
+/// `code_sao` codes for it, and the structure it codes only when neither
+/// merge fires.
+///
+/// This is the quantity the per-CTB search cannot see and the one the fitted
+/// band-syntax charge has been standing in for. `code_sao` merges on exact
+/// equality of all three components, so a cell equal to a decided neighbour
+/// costs one flag in place of its whole structure. Edge offset picks one of
+/// four classes and lets §7.4.9.3 infer its signs, so two neighbouring CTBs
+/// of one kind of content land on identical parameters routinely; band offset
+/// picks one of 32 positions and four signed offsets per component, so two
+/// neighbours essentially never do. A band component therefore costs its own
+/// syntax *and* the merge it forfeits — for itself, and for whichever
+/// neighbours would have merged with it — and none of that is a bin it codes.
+///
+/// `the_band_syntax_charge_is_the_merge_a_band_component_forfeits` measures
+/// the difference and is what [`BAND_SYNTAX_CHARGE_NUM`] is now set from.
+pub(crate) fn coding_bins(
+    cell: &ResolvedSao,
+    left: Option<ResolvedSao>,
+    above: Option<ResolvedSao>,
+) -> (u64, u64) {
+    let mut mode = 0u64;
+    let merge_left = left == Some(*cell);
+    if left.is_some() {
+        mode += 1;
+    }
+    let merge_up = !merge_left && above == Some(*cell);
+    if above.is_some() && !merge_left {
+        mode += 1;
+    }
+    if merge_left || merge_up {
+        return (mode, 0);
+    }
+    let (structure_mode, band) = cell_bins(cell);
+    (mode + structure_mode, band)
+}
+
+/// The bins `code_sao` will write for a whole grid, split the same way
+/// [`cell_bins`] splits them.
+pub(crate) fn grid_bins(grid: &[ResolvedSao], ctbs_x: usize) -> (u64, u64) {
+    let (mut mode, mut band) = (0u64, 0u64);
+    for (addr, cell) in grid.iter().enumerate() {
+        let (rx, ry) = (addr % ctbs_x, addr / ctbs_x);
+        let left = (rx > 0).then(|| grid[addr - 1]);
+        let above = (ry > 0).then(|| grid[addr - ctbs_x]);
+        let (m, b) = coding_bins(cell, left, above);
+        mode += m;
+        band += b;
+    }
+    (mode, band)
 }
 
 /// The per-band summed and counted error of one CTB of one plane, indexed by
@@ -1683,6 +1836,102 @@ mod tests {
                 "{shapes:?} did not reconstruct through the coding unit's transform tree"
             );
         }
+    }
+
+    /// A resolved cell carrying one luma band component with the given
+    /// position, for the coded-rate tests below.
+    fn band_cell(band_position: u8, offsets: [i32; 5]) -> ResolvedSao {
+        let mut cell = ResolvedSao::off();
+        cell.components[0] = ResolvedSaoComponent {
+            sao_type_idx: 1,
+            offset_val: offsets,
+            band_position,
+            eo_class: 0,
+        };
+        cell
+    }
+
+    /// The same, carrying one luma edge component of the given class.
+    fn edge_cell(eo_class: u8, offsets: [i32; 5]) -> ResolvedSao {
+        let mut cell = ResolvedSao::off();
+        cell.components[0] = ResolvedSaoComponent {
+            sao_type_idx: 2,
+            offset_val: offsets,
+            band_position: 0,
+            eo_class,
+        };
+        cell
+    }
+
+    #[test]
+    fn a_cell_equal_to_a_neighbour_costs_one_merge_flag_instead_of_its_structure() {
+        // §7.3.8.3's merge, which is the whole of what `coding_bins` exists
+        // to price: `code_sao` codes `sao_merge_left_flag` and returns,
+        // whatever the structure would have been.
+        let cell = band_cell(9, [0, 3, -2, 0, 1]);
+        let (structure_mode, structure_band) = cell_bins(&cell);
+        assert!(
+            structure_mode + structure_band > 10,
+            "a band cell's own structure is not the many bins the merge elides"
+        );
+
+        // First CTB of the picture: no neighbour exists, so no flag is coded
+        // and the structure is unavoidable.
+        assert_eq!(
+            coding_bins(&cell, None, None),
+            (structure_mode, structure_band)
+        );
+        // Equal to the left neighbour: one flag, and nothing else at all.
+        assert_eq!(coding_bins(&cell, Some(cell), None), (1, 0));
+        // Equal to the above neighbour but not the left one: the left flag is
+        // coded as 0 first, then the up flag as 1.
+        let other = edge_cell(1, [0, 1, 1, -1, -1]);
+        assert_eq!(coding_bins(&cell, Some(other), Some(cell)), (2, 0));
+    }
+
+    #[test]
+    fn a_cell_that_matches_neither_neighbour_pays_the_flags_it_declines() {
+        // The other side of the same decision, and the one the search was
+        // charging nothing for: a cell that cannot merge pays two declined
+        // flags on top of its whole structure.
+        let cell = band_cell(9, [0, 3, -2, 0, 1]);
+        let other = edge_cell(1, [0, 1, 1, -1, -1]);
+        let (mode, band) = cell_bins(&cell);
+        assert_eq!(
+            coding_bins(&cell, Some(other), Some(other)),
+            (mode + 2, band)
+        );
+        // At the left edge of the picture there is only the up flag, and in
+        // the top row only the left one.
+        assert_eq!(coding_bins(&cell, None, Some(other)), (mode + 1, band));
+        assert_eq!(coding_bins(&cell, Some(other), None), (mode + 1, band));
+    }
+
+    #[test]
+    fn a_band_cell_is_charged_the_syntax_an_edge_cell_does_not_code() {
+        // `cell_bins` splits the §7.3.8.3 bins the way `SaoLambda` prices
+        // them, so what lands in the band half has to be exactly the five
+        // `sao_band_position` bins and the sign of each nonzero offset.
+        let offsets = [0, 3, -2, 0, 1];
+        let (band_mode, band_band) = cell_bins(&band_cell(9, offsets));
+        let (edge_mode, edge_band) = cell_bins(&edge_cell(1, offsets));
+        assert_eq!(edge_band, 0, "an edge cell codes no band syntax");
+        assert_eq!(band_band, 5 + 3, "five position bins and three signs");
+        // Against edge offset's two `sao_eo_class_luma` bins, which are
+        // `mode_q8` bins like the offsets' own.
+        assert_eq!(band_mode + 2, edge_mode);
+    }
+
+    #[test]
+    fn an_off_cell_still_costs_the_type_bin_every_component_pays() {
+        // Why `cell_bins` is absolute where the search's own scoring is
+        // marginal: leaving SAO off is not free once a merge is on the table,
+        // because a merged CTB does not code these two bins either.
+        assert_eq!(cell_bins(&ResolvedSao::off()), (2, 0));
+        assert_eq!(
+            coding_bins(&ResolvedSao::off(), Some(ResolvedSao::off()), None),
+            (1, 0)
+        );
     }
 
     #[test]
