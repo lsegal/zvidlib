@@ -169,29 +169,39 @@ impl<'a> RefPlane<'a> {
     /// The [`RefPlane::row_window`] window of row `y`, narrowed into
     /// `dst` for the 16-bit interpolation path.
     ///
-    /// `scratch` is the same edge-extension staging buffer
-    /// [`RefPlane::row_window`] takes; `dst` must be at least `len` long.
+    /// Converts straight out of the plane rather than staging through
+    /// [`RefPlane::row_window`]'s `i32` scratch: the narrow path already
+    /// has to write a buffer, so routing it through the wide one would
+    /// add a whole `i32` pass over the source that the wide path does
+    /// not pay — `row_window` borrows the plane outright when the window
+    /// lies inside it. `dst` must be at least `len` long.
     #[inline]
-    fn row_window_narrow(
-        &self,
-        x_start: i32,
-        len: usize,
-        y: i32,
-        scratch: &mut [i32],
-        dst: &mut [i16],
-    ) {
-        let src = self.row_window(x_start, len, y, scratch);
-        narrow_samples(&src[..len], &mut dst[..len]);
+    fn row_window_narrow(&self, x_start: i32, len: usize, y: i32, dst: &mut [i16]) {
+        let yc = y.clamp(0, self.height as i32 - 1) as usize;
+        let base = yc * self.width;
+        if x_start >= 0 && (x_start as usize).saturating_add(len) <= self.width {
+            let start = base + x_start as usize;
+            narrow_samples(&self.samples[start..start + len], &mut dst[..len]);
+            return;
+        }
+        let row = &self.samples[base..base + self.width];
+        let last = self.width as i32 - 1;
+        for (i, d) in dst[..len].iter_mut().enumerate() {
+            let s = row[x_start.saturating_add(i as i32).clamp(0, last) as usize];
+            debug_assert!(
+                (0..=i32::from(NARROW_MAX_SAMPLE)).contains(&s),
+                "sample {s} is outside the eight-bit range the narrow interpolation path requires"
+            );
+            *d = s as i16;
+        }
     }
 
     /// [`RefPlane::gather`] narrowed to `i16` for the 16-bit
     /// interpolation path.
     fn gather_narrow(&self, x0: i32, y0: i32, w: usize, h: usize) -> Vec<i16> {
-        let mut scratch = vec![0i32; w];
         let mut buf = vec![0i16; w * h];
         for (r, row) in buf.chunks_exact_mut(w).enumerate() {
-            self.copy_row(x0, y0 + r as i32, &mut scratch);
-            narrow_samples(&scratch, row);
+            self.row_window_narrow(x0, w, y0 + r as i32, row);
         }
         buf
     }
@@ -524,18 +534,11 @@ fn interp_block<const N: usize>(
         }
         // Horizontal-only (a/b/c, aX): one source window per output row.
         (Some(hk), None) => {
-            let mut scratch = vec![0i32; span];
             if narrow {
                 let hk16: [i16; N] = std::array::from_fn(|t| hk[t] as i16);
                 let mut win = vec![0i16; span];
                 for y in 0..h {
-                    plane.row_window_narrow(
-                        x_int - halo,
-                        span,
-                        y_int + y as i32,
-                        &mut scratch,
-                        &mut win,
-                    );
+                    plane.row_window_narrow(x_int - halo, span, y_int + y as i32, &mut win);
                     let taps: [&[i16]; N] = std::array::from_fn(|t| &win[t..t + w]);
                     simd::filter_taps_narrow(
                         isa,
@@ -547,6 +550,7 @@ fn interp_block<const N: usize>(
                 }
                 return out;
             }
+            let mut scratch = vec![0i32; span];
             for y in 0..h {
                 let src = plane.row_window(x_int - halo, span, y_int + y as i32, &mut scratch);
                 let taps: [&[i32]; N] = std::array::from_fn(|t| &src[t..t + w]);
@@ -593,7 +597,6 @@ fn interp_block<const N: usize>(
             // recover. See `measure_2d_ring_vs_flat`.
             let rows = h + N - 1;
             let mut horizontal = vec![0i32; w * rows];
-            let mut scratch = vec![0i32; span];
             if narrow {
                 // Only the horizontal pass narrows. Its own output is
                 // `i16`-ranged, but the vertical pass multiplies it by a
@@ -612,7 +615,6 @@ fn interp_block<const N: usize>(
                         x_int - halo,
                         span,
                         y_int - halo + row as i32,
-                        &mut scratch,
                         &mut win,
                     );
                     let taps: [&[i16]; N] = std::array::from_fn(|t| &win[t..t + w]);
@@ -625,6 +627,7 @@ fn interp_block<const N: usize>(
                     );
                 }
             } else {
+                let mut scratch = vec![0i32; span];
                 for row in 0..rows {
                     let src = plane.row_window(
                         x_int - halo,
