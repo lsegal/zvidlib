@@ -1263,8 +1263,10 @@ workflow that measured it, which touches no crate code.
 
 The two `av1_encode_stage_coeff_ctx` rows are the pre-#362 code and are kept as
 the record of the defect that issue reports; the repair is measured under [The
-#362 re-measurement](#the-362-re-measurement) below, on its own host and with
-its own provenance.
+#362 re-measurement](#the-362-re-measurement) below, and the kernel that
+replaces the routing under [The #371 re-measurement](#the-371-re-measurement),
+each on its own host and with its own provenance. Both rows' `avx2` column is
+therefore two repairs out of date, in the direction of being too slow.
 
 | Group | `scalar` | `sse4.1` | `avx2` | Best |
 | --- | ---: | ---: | ---: | ---: |
@@ -1490,12 +1492,17 @@ lane-crossing, not downclocking, not the context gather. The detail differs.
   routes blocks narrower than eight lanes to the SSE4.1 kernel at the
   `av1_coeff_ctx` dispatch site, the way #342 routed `fwht4x4`, and keeps AVX2
   from size 8 up where it halves the iterations per row and stores whole
-  vectors. The `avx2` column of this group is consequently the SSE4.1 kernel's
-  number from here on, in the same sense `av1_encode_stage_wht`'s three columns
-  are all the scalar transform. Giving AVX2 real work at size 4 needs a kernel
-  that steps two rows at a time rather than one — the outputs of adjacent rows
-  are already contiguous, so eight lanes are there to be filled — and #371
-  carries that.
+  vectors. The `avx2` column of this group was consequently the SSE4.1 kernel's
+  number for as long as that routing stood, in the same sense
+  `av1_encode_stage_wht`'s three columns are all the scalar transform. Giving
+  AVX2 real work at size 4 needs a kernel that steps two rows at a time rather
+  than one — the outputs of adjacent rows are already contiguous, so eight lanes
+  are there to be filled — and #371 wrote it: `coeff::block_contexts_row_pairs`
+  puts row `r` in the vector's low half and row `r + 1` in its high half, which
+  makes the iteration full-width and the store native, and the site routes size
+  4 back to `avx2` on the strength of the measurement below. The redirect
+  survives only for sizes 1 to 3 and 5 to 7, which no vector width fits and the
+  encoder never codes.
 
 #### The #362 re-measurement
 
@@ -1536,6 +1543,45 @@ The `rdo_inter` pair is in the table above as the control, and it is unmoved:
 1.69x under `sse4.1` against 1.54x/1.55x under `avx2`, the same shape #351
 recorded on a different host. Nothing in #362 touches `rdcost`, and the second
 bullet above is why it would not have helped if it did.
+#### The #371 re-measurement
+
+#362's repair routed around the idle lanes; #371 removes them, and the
+acceptance criterion was that the wide arm has to *win* on its own numbers
+before the dispatch site takes it back. It does, and by more than the margin
+#362 measured against it.
+
+Measured at `f7b709ee62d7` — the branch's implementation commit — on an **AMD
+EPYC 9V74 80-Core Processor (Linux/X64)**, one `workflow_dispatch` round with
+`ZVIDLIB_BENCH_LARGE=1`, `# host instruction sets: scalar, sse4.1, avx2` and
+`# dispatch site av1_coeff_ctx: avx2`. It is one round on one more model, so
+these absolute times are not comparable with the table's EPYC 7763 draw or with
+#362's Xeon 6973P-C round either; what is comparable, and what the criterion
+turns on, is the `sse4.1`-against-`avx2` sign *within* the round.
+
+| Group | `scalar` | `sse4.1` | `avx2` | Best |
+| --- | ---: | ---: | ---: | ---: |
+| `av1_encode_stage_coeff_ctx` | 3.505 ms | 1.165 ms (3.01x) | 937.520 µs (3.74x) | 3.74x `avx2` |
+| `av1_encode_stage_coeff_ctx_1080p` | 32.132 ms | 10.738 ms (2.99x) | 8.643 ms (3.72x) | 3.72x `avx2` |
+| `av1_encode_stage_tile` | 15.320 ms | 12.544 ms (1.22x) | 12.452 ms (1.23x) | 1.23x `avx2` |
+| `av1_encode_stage_tile_1080p` | 141.740 ms | 116.690 ms (1.21x) | 115.490 ms (1.23x) | 1.23x `avx2` |
+| `hevc_encode_640x352_rdo_inter` | 73.844 ms | 45.439 ms (1.63x) | 47.741 ms (1.55x) | 1.63x `sse4.1` |
+| `hevc_encode_1920x1088_rdo_inter` | 699.730 ms | 431.420 ms (1.62x) | 451.480 ms (1.55x) | 1.62x `sse4.1` |
+
+The two vector arms of `av1_encode_stage_coeff_ctx` are 24% apart and the wide
+one is ahead: 937.520 µs against 1.165 ms at 320x180, 8.643 ms against 10.738 ms
+at 1080p, the same ratio at both sizes because the group derives contexts for
+4x4 blocks and nothing else. Under #362's routing those two columns read the
+same number to within 0.13%, because they *were* the same kernel; the split
+reopening in AVX2's favour is what a kernel that actually fills its lanes looks
+like. `av1_encode_stage_tile`, which runs the derivation behind the serial range
+coder, carries a smaller share of it through — 1.23x against 1.22x — as it
+should, since the context pass is one stage of that group rather than all of it.
+
+The `rdo_inter` pair is the control, unchanged by anything here: 1.62x/1.63x
+under `sse4.1` against 1.55x under `avx2`, the same shape #351 and #362 both
+recorded on other hosts. Nothing in #371 touches `rdcost`, and #370 still
+carries that row.
+
 - `hevc_encode_*_rdo_inter`. The same family, a different mechanism, and *not*
   the same fix. `rdcost::sad_avx2`'s 256-bit loop needs `w >= 32` and
   `satd_avx2`'s vector pair needs `w >= 16`, but `rdo.rs` searches a `CTB` of 16
