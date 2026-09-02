@@ -388,18 +388,21 @@ const BAND_SHIFT: i32 = 3;
 /// [`crate::hevc::engine::simd::combine_weighted`] does on the instruction sets
 /// where its kernel measured below parity.
 ///
-/// # x86_64 does separate, and that is why the site was kept
+/// # x86_64 separates in isolation and not in the encoder
 ///
 /// The site was kept rather than the call inlined into
 /// [`crate::hevc::engine::encoder::recon`] so the band search stayed a named
 /// `hevc_recon` dispatch point with a bit-exactness harness pointed at it, on
-/// the argument that the NEON result was measured rather than universal. It is
-/// not universal. The same two shapes were timed on x86_64 across five CPU
-/// models, nine `ubuntu-latest` draws plus two `macos-15-intel` ones, best of
-/// nine interleaved rounds per draw and grouped by CPU model — the pool draws
-/// several models and they disagree by more than the effect, so an average
-/// across the pool answers nothing. Ratio of the lane-scatter shape to this
-/// scalar reference, at the run lengths #305 used:
+/// the argument that the NEON result was measured rather than universal. The
+/// same two shapes were therefore timed on x86_64, and the answer depends on
+/// which benchmark is asked.
+///
+/// **In isolation the classification does pay.** Timed by
+/// `bench_band_offset_row` across five CPU models, nine `ubuntu-latest` draws
+/// plus two `macos-15-intel` ones, best of nine interleaved rounds per draw and
+/// grouped by CPU model - the pool draws several models and they disagree by
+/// more than the effect, so an average across it answers nothing. Ratio of the
+/// lane-scatter shape to this scalar reference, at the run lengths #305 used:
 ///
 /// | CPU model | 16 | 64 | 256 | 1024 |
 /// |---|---|---|---|---|
@@ -409,49 +412,67 @@ const BAND_SHIFT: i32 = 3;
 /// | AMD EPYC 7763 (AVX2) | 1.24x | 1.13x | 1.10x | 1.10x |
 /// | AMD EPYC 9V74 (AVX2) | 1.23x | 0.97-1.02x | 1.01x | 0.97x |
 ///
-/// Each row reproduces to about ±0.02 across that model's independent draws,
-/// which is the noise floor the decision is taken against; the per-round spread
-/// printed by the harness is dominated by interference on a shared runner and
-/// cancels in the ratio, since the arms are interleaved within a round.
+/// Each row reproduces to about ±0.02 across that model's independent draws.
+/// Four of the five models separate at every length, by 1.10x to 1.53x, and the
+/// SSE4.1 shape is ahead of scalar on every model at every length (1.02-1.45x).
+/// On that measurement alone the kernel is worth landing.
 ///
-/// So the classification *is* worth vectorizing on x86_64 even though the
-/// scatter behind it is not: four of the five models separate at every length,
-/// by 1.10x to 1.53x. Only Zen 5 does not, and there the kernel is a wash
-/// rather than a regression at the lengths this call actually sees — a run here
-/// is one CTB row, so 16 to 64 samples, never the 1024 where Zen 5 reads 0.97x.
-/// The SSE4.1 kernel is ahead of scalar on every model at every length
-/// (1.02-1.45x), so a host without AVX2 gets the narrower one.
+/// **In the encoder it does not.** The whole-picture
+/// `hevc_encode_640x352_reconstruct` group was then run as a paired
+/// branch-against-base comparison - both trees built and timed on the same
+/// host, interleaved within a round, five rounds per draw, eleven draws across
+/// four models - with the group's own scalar arm as the control, since that arm
+/// resolves to this reference in both trees and so has to read 1.00x. It does,
+/// to within ±0.012 everywhere. The kernel arms do not improve:
+///
+/// | CPU model | draws | `avx2` | `sse4.1` | `scalar` (control) |
+/// |---|---|---|---|---|
+/// | Intel Xeon Platinum 8573C | 1 | 1.00x | 1.01x | 1.01x |
+/// | Intel Xeon Platinum 8370C | 2 | 1.01x | 1.00-1.02x | 1.00x |
+/// | AMD EPYC 7763 | 5 | 0.97-0.99x | 0.95-0.98x | 0.99-1.00x |
+/// | AMD EPYC 9V74 | 3 | 0.94-0.95x | 0.95x | 1.00x |
+///
+/// On the Intel parts the kernel is invisible against its own control; on both
+/// AMD parts it is a 2% to 6% *regression*, reproducing across independent
+/// draws with every round signed the same way, and well outside what the
+/// control moves by. So the shape that reads 1.10-1.53x in a loop of its own
+/// buys nothing where the encoder calls it, and on Zen costs more than it
+/// saves.
+///
+/// The two benchmarks measure different things, and the encoder's is the one
+/// that decides. `bench_band_offset_row` calls the kernel back-to-back over one
+/// L1-resident run of up to 1024 samples with `stats` hot and the call fully
+/// predicted; the encoder calls it once per CTB row, so 16 to 64 samples, in
+/// between the rest of reconstruction. The leading explanation for the
+/// remaining gap - that a `#[target_feature]` kernel cannot be inlined into the
+/// caller the way this reference can, so the per-call overhead lands on a run
+/// too short to amortize it - is consistent with the isolated win being
+/// smallest at 16 samples, but it was not itself measured and is not the reason
+/// the kernel is unlanded. The measured whole-picture result is.
+///
+/// **No x86_64 kernel is dispatched to**, the same call
+/// [`crate::hevc::engine::simd::combine_weighted`] got at four lanes and the
+/// same one #305 made for NEON. Both x86 shapes stay behind `#[cfg(test)]` as
+/// the measurement apparatus, asserted bit-exact so the figures above are
+/// figures for kernels that would be correct to land.
 ///
 /// AVX-512 was timed too, since `ubuntu-latest` turned out to draw AVX-512CD
-/// hosts. Neither shape is landed. Resolving the scatter's duplicate indices
-/// with `vpconflictd` reads **0.42-0.56x** on every host that can run it: the
-/// conflict-resolving pointer chase costs more than the read-modify-writes it
-/// removes, at 32 bands over 16 lanes where duplicates are rare. Merely
-/// widening the classification to 512 bits reads 1.14-1.52x on the Intel parts
-/// but **0.21-0.30x** on Zen 5, whose double-pumped AVX-512 makes the wider
-/// classification a large loss, so the 256-bit kernel is the one that is safe
-/// everywhere.
+/// hosts, and it does not separate even in isolation. Resolving the scatter's
+/// duplicate indices with `vpconflictd` reads **0.42-0.56x** on every host that
+/// can run it: the conflict-resolving pointer chase costs more than the
+/// read-modify-writes it removes, at 32 bands over 16 lanes where duplicates
+/// are rare. Merely widening the classification to 512 bits reads 1.14-1.52x on
+/// the Intel parts but **0.21-0.30x** on Zen 5, whose double-pumped AVX-512
+/// makes the wider classification a large loss.
 ///
 /// # Panics
 /// Panics unless the run and the source are the same length.
 pub(crate) fn band_offset_row(here: &[i32], src: &[u8], stats: &mut BandStats) {
     assert_eq!(here.len(), src.len(), "run and source differ");
-    match isa_code() {
-        #[cfg(target_arch = "x86_64")]
-        ISA_AVX2 => {
-            // SAFETY: the lengths agree, and this arm is only reachable after
-            // `is_x86_feature_detected!("avx2")` or an override clamped to an
-            // available instruction set.
-            unsafe { x86::band_offset_row_avx2_lanes(here, src, stats) }
-        }
-        #[cfg(target_arch = "x86_64")]
-        ISA_SSE41 => {
-            // SAFETY: as above, with SSE4.1 detected.
-            unsafe { x86::band_offset_row_sse41_lanes(here, src, stats) }
-        }
-        // NEON measured below parity for both shapes; see above.
-        _ => band_offset_row_scalar(here, src, stats),
-    }
+    // Every arm resolves here: NEON measured below parity in isolation, and the
+    // x86 kernels that do separate in isolation do not separate in the encoder.
+    // See above for both measurements.
+    band_offset_row_scalar(here, src, stats);
 }
 
 /// The portable reference for [`band_offset_row`], and the implementation it
@@ -743,6 +764,7 @@ mod x86 {
     /// measurement separates the scatter from the classification rather than
     /// from two different classifications.
     #[inline]
+    #[cfg(test)]
     #[target_feature(enable = "avx2")]
     unsafe fn band_classify8_avx2(here: *const i32, src: *const u8) -> (__m256i, __m256i) {
         unsafe {
@@ -794,13 +816,16 @@ mod x86 {
         }
     }
 
-    /// The AVX2 band-offset kernel: classify eight samples in the vector unit,
-    /// then scatter them straight out of the lanes with `vpextrd` rather than
+    #[cfg(test)]
+    /// Candidate B on AVX2: classify eight samples in the vector unit, then
+    /// scatter them straight out of the lanes with `vpextrd` rather than
     /// through the staging buffers [`band_offset_row_avx2_staged`] uses.
     ///
-    /// This is the arm [`super::band_offset_row`] dispatches to on an AVX2
-    /// host. It measured at or ahead of the staged shape at every run length on
-    /// every CPU model timed, and it is the simpler of the two.
+    /// The better of the two x86 shapes - at or ahead of the staged one at
+    /// every run length on every CPU model timed - and still not dispatched to:
+    /// its isolated 1.10-1.53x does not reach the whole-picture group, which
+    /// reads 1.00x on Intel and 0.94-0.99x on AMD. See
+    /// [`super::band_offset_row`].
     #[target_feature(enable = "avx2")]
     pub(super) unsafe fn band_offset_row_avx2_lanes(
         here: &[i32],
@@ -982,6 +1007,7 @@ mod x86 {
     }
 
     /// The four-lane classification behind the two SSE4.1 candidates.
+    #[cfg(test)]
     #[inline]
     #[target_feature(enable = "sse4.1")]
     unsafe fn band_classify4_sse41(here: *const i32, src: *const u8) -> (__m128i, __m128i) {
@@ -1026,10 +1052,10 @@ mod x86 {
         }
     }
 
-    /// The SSE4.1 band-offset kernel: the four-lane classification scattered
-    /// straight out of the lanes, the narrower form of
-    /// [`band_offset_row_avx2_lanes`] and the arm
-    /// [`super::band_offset_row`] dispatches to on a host without AVX2.
+    #[cfg(test)]
+    /// Candidate B at four lanes: the SSE4.1 classification scattered straight
+    /// out of the lanes, the narrower form of [`band_offset_row_avx2_lanes`].
+    /// Not dispatched to, for the same measured reason.
     #[target_feature(enable = "sse4.1")]
     pub(super) unsafe fn band_offset_row_sse41_lanes(
         here: &[i32],
