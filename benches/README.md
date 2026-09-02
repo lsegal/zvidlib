@@ -1098,7 +1098,10 @@ workflow that measured it, which touches no crate code.
 The two `av1_encode_stage_coeff_ctx` rows are the pre-#362 code and are kept as
 the record of the defect that issue reports; the repair is measured under [The
 #362 re-measurement](#the-362-re-measurement) below, on its own host and with
-its own provenance.
+its own provenance. The two `hevc_encode_*_rdo_inter` rows are pre-#370 in the
+same way, and their repair is measured under [The #370
+re-measurement](#the-370-re-measurement) — that one landed on *this* host, so
+its `avx2` column is directly comparable with the one here.
 
 | Group | `scalar` | `sse4.1` | `avx2` | Best |
 | --- | ---: | ---: | ---: | ---: |
@@ -1370,6 +1373,55 @@ The `rdo_inter` pair is in the table above as the control, and it is unmoved:
 1.69x under `sse4.1` against 1.54x/1.55x under `avx2`, the same shape #351
 recorded on a different host. Nothing in #362 touches `rdcost`, and the second
 bullet above is why it would not have helped if it did.
+
+#### The #370 re-measurement
+
+Unlike the round above, this one landed on the **AMD EPYC 7763 64-Core
+Processor (Linux/X64)** — the same host the committed x86_64 table was measured
+on — so its columns can be read against that table directly. It is still one
+round rather than the elementwise minimum of three, which is why it is recorded
+here rather than merged into the table; the controls below are what carry the
+attribution. Measured at `6213a5580b78` with `ZVIDLIB_BENCH_LARGE=1`,
+`# host instruction sets: scalar, sse4.1, avx2`, `# dispatch site
+hevc_rdcost: avx2` ([run
+33615242194](https://github.com/lsegal/zvidlib/actions/runs/33615242194)):
+
+| Group | `scalar` | `sse4.1` | `avx2` | Best |
+| --- | ---: | ---: | ---: | ---: |
+| `hevc_encode_640x352_rdo_inter` | 88.922 ms | 55.341 ms (1.61x) | 55.886 ms (1.59x) | 1.61x `sse4.1` |
+| `hevc_encode_1920x1088_rdo_inter` | 843.440 ms | 523.280 ms (1.61x) | 530.010 ms (1.59x) | 1.61x `sse4.1` |
+| `hevc_encode_640x352` | 101.710 ms | 65.083 ms (1.56x) | 65.257 ms (1.56x) | 1.56x `sse4.1` |
+| `hevc_encode_1920x1088` | 974.890 ms | 624.680 ms (1.56x) | 628.680 ms (1.55x) | 1.56x `sse4.1` |
+| `hevc_encode_640x352_rdo_intra` | 5.591 ms | 3.765 ms (1.48x) | 3.721 ms (1.50x) | 1.50x `avx2` |
+| `hevc_encode_1920x1088_rdo_intra` | 52.104 ms | 34.900 ms (1.49x) | 34.693 ms (1.50x) | 1.50x `avx2` |
+
+The `avx2` column of the `rdo_inter` pair is what moved, and only it: 57.659 ms
+to 55.886 ms and 547.481 ms to 530.010 ms against the table above, both about
+3% faster, while the same rows' `scalar` and `sse4.1` columns land within 1% of
+their table values (88.922 against 89.626, 55.341 against 54.769, 843.440
+against 851.069, 523.280 against 520.861). `rdo_intra`, which runs the same
+`rdcost::satd` through a mode search that never calls `sad`, is unmoved at
+1.48x/1.50x against the table's 1.49x/1.49x — one round of run-to-run noise on
+a row the change does not reach. So the 3% is attributable to the routing
+rather than to the host or the round.
+
+The gap between the two vector arms goes from 5.3% and 5.1% to 1.0% and 1.3%,
+and `Best` still reads `sse4.1` — this repair stops the `avx2` arm paying for a
+width it never gets, which brings it level, and level is the whole of what
+routing can buy. The residual 1% is real and expected: a CTB of 16 keeps `satd`
+on the genuine AVX2 pair loop at `w == 16`, and these groups are whole-frame
+encodes with the other AVX2 dispatch sites (`hevc_fwd_transform_quant`,
+`hevc_recon`, `hevc_prediction_filters`) still live in both arms. Making the
+`avx2` arm actually faster than `sse4.1` here needs the batched search of #387,
+not a threshold.
+
+The whole-frame groups are the practical consequence. `hevc_encode_640x352`
+reads 65.257 ms under `avx2` against the table's 67.101 ms and
+`hevc_encode_1920x1088` 628.680 ms against 646.477 ms, so an x86_64 user
+encoding HEVC on an AVX2 host gets about 2.8% of a whole encode back — the two
+arms are now 0.3% and 0.6% apart where the table has them 4.3% and 4.0% apart.
+`av1_encode_stage_coeff_ctx` reads 1.4647 ms and 1.4745 ms on this host, 0.7%
+apart, which is #362's redirect reproducing on the table's own hardware.
 - `hevc_encode_*_rdo_inter`. The same family, a different mechanism, and *not*
   the same fix. `rdcost::sad_avx2`'s 256-bit loop needs `w >= 32` and
   `satd_avx2`'s vector pair needs `w >= 16`, but `rdo.rs` searches a `CTB` of 16
@@ -1383,7 +1435,14 @@ bullet above is why it would not have helped if it did.
   per-call setup the wider step does not pay for rather than idle lanes and a
   staged store, and the repair is to widen what the search hands the kernel (or
   to route these two the way `coeff_ctx` is now routed) rather than anything
-  #362 changes. #370 carries it.
+  #362 changes. #370 carried it, and took the second of those two: `sad` routes
+  blocks narrower than 32 and `satd` blocks narrower than 16 to the SSE4.1
+  kernel, each at its own AVX2 body's threshold rather than at one shared
+  number. Widening what the search hands the kernel is the other repair and is
+  still open as #387 — it is the one that would make AVX2 *win* here rather than
+  stop losing, but it moves the search's candidate ordering and early
+  termination with it, so it is an optimization rather than a defect fix.
+  Measured under [The #370 re-measurement](#the-370-re-measurement).
 
 ## Hardware HEVC decoders
 
