@@ -133,7 +133,16 @@ fn run() -> Result<()> {
     // pointer at the far end of the bar is a second of hardware decoding away however the walk to
     // it is arranged. A background pass keeps a shrunk picture every few frames, so the drag has
     // something to draw for any position immediately while that walk runs.
-    let previews = PreviewIndex::new(&factory, configuration, video_samples, limits)?;
+    let frames_per_second = ((video.presentation_order.len() as u128 * u128::from(video.timescale))
+        / u128::from(video.duration.max(1)))
+    .max(1) as u64;
+    let previews = PreviewIndex::new(
+        &factory,
+        configuration,
+        video_samples,
+        limits,
+        frames_per_second,
+    )?;
     let video_reader = frames.source();
     let audio_decoder = NativeAacDecoder::new(&audio_config, Limits::default())?;
     let audio_reader = AacSampleReader::new(

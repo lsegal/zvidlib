@@ -42,6 +42,15 @@ use zvidlib::{
 /// replaces it within a second anyway.
 const PREVIEW_SCALE: u32 = 4;
 
+/// How far apart the previews are, when memory allows it: half a second of playback.
+///
+/// Closer together is a finer scrub but a longer pass - every preview is a full-resolution
+/// picture the reader has to convert before it can be shrunk, and until the pass reaches the far
+/// end of the bar a drag there falls back to an earlier picture. Half a second is about as coarse
+/// as a scrub can be before the picture stops answering "which shot is this", and it keeps the
+/// pass over the bundled sample to a couple of seconds.
+const PREVIEW_SECONDS: u64 = 2;
+
 /// A ceiling on what the whole index may hold.
 ///
 /// The stride follows from this and the track length rather than being fixed, so a long track
@@ -100,15 +109,32 @@ impl PreviewIndex {
         configuration: VideoDecoderConfig,
         samples: Vec<EncodedVideoSample>,
         limits: Limits,
+        frames_per_second: u64,
     ) -> Result<Self> {
         let frame_count = samples.len().max(1) as u64;
-        let stride = preview_stride(&configuration.coded_dimensions, frame_count);
+        let stride = preview_stride(
+            &configuration.coded_dimensions,
+            frame_count,
+            frames_per_second,
+        );
         let slots = frame_count.div_ceil(stride) as usize;
         let store = Arc::new(Mutex::new(Store {
             stride,
             slots: vec![None; slots],
         }));
-        let reader = ExactFrameReader::new(factory, configuration, samples, limits)?;
+        // The pass never asks for a frame twice, so a frame cache only costs it work: the
+        // reader converts the last `max_cached_frames` pictures before every target it walks to,
+        // and with previews a few frames apart that is every picture in the track converted at
+        // full resolution for nobody. One is the smallest the reader accepts.
+        let reader = ExactFrameReader::new(
+            factory,
+            configuration,
+            samples,
+            Limits {
+                max_cached_frames: 1,
+                ..limits
+            },
+        )?;
         let cancellation = CancellationToken::new();
         let worker_store = Arc::clone(&store);
         let worker_cancellation = cancellation.clone();
@@ -130,6 +156,17 @@ impl PreviewIndex {
         })
     }
 
+    /// How many of the index's positions the background pass has filled, out of how many there
+    /// are, so a measurement can wait for the whole track rather than for the first picture.
+    #[cfg(test)]
+    fn coverage(&self) -> (usize, usize) {
+        let store = self.store.lock().expect("preview store poisoned");
+        (
+            store.slots.iter().filter(|slot| slot.is_some()).count(),
+            store.slots.len(),
+        )
+    }
+
     /// The kept picture closest to `frame`, or `None` while the pass has decoded nothing.
     ///
     /// This is a lock, a search and a clone of an already-decoded picture. Nothing here decodes,
@@ -148,11 +185,14 @@ impl Drop for PreviewIndex {
     }
 }
 
-/// How many frames apart the previews are, from the memory they would take.
-fn preview_stride(dimensions: &VideoDimensions, frame_count: u64) -> u64 {
+/// How many frames apart the previews are: half a second of playback, or further apart when
+/// that many would not fit in the budget.
+fn preview_stride(dimensions: &VideoDimensions, frame_count: u64, frames_per_second: u64) -> u64 {
     let bytes = preview_bytes(dimensions).max(1);
     let affordable = (PREVIEW_BUDGET_BYTES / bytes).max(1);
-    frame_count.div_ceil(affordable).max(1)
+    let budgeted = frame_count.div_ceil(affordable);
+    let wanted = frames_per_second.div_ceil(PREVIEW_SECONDS);
+    budgeted.max(wanted).max(1)
 }
 
 /// What one preview of a `dimensions` source costs in memory.
@@ -311,15 +351,17 @@ mod tests {
     fn the_stride_keeps_the_index_inside_its_budget() {
         let dimensions = VideoDimensions::new(1920, 1080, &Limits::default()).unwrap();
         for frame_count in [1_u64, 768, 100_000, 10_000_000] {
-            let stride = preview_stride(&dimensions, frame_count);
+            let stride = preview_stride(&dimensions, frame_count, 24);
             let slots = frame_count.div_ceil(stride);
             assert!(
                 slots * preview_bytes(&dimensions) <= PREVIEW_BUDGET_BYTES,
                 "{frame_count} frames at stride {stride} exceeds the budget"
             );
         }
-        // The bundled sample fits well inside it, so its previews stay close together.
-        assert!(preview_stride(&dimensions, 768) <= 8);
+        // A short track is spaced by the frame rate rather than by the budget, and a long one the
+        // other way around: the budget only takes over once half a second apart is too many.
+        assert_eq!(preview_stride(&dimensions, 768, 24), 12);
+        assert!(preview_stride(&dimensions, 10_000_000, 24) > 12);
     }
 
     /// A drag ahead of where the pass has reached draws the newest picture behind it, and one
@@ -361,5 +403,99 @@ mod tests {
         let mut frame = rgba(4, 4, |_, _| [0, 0, 0, 0]);
         frame.pixel_format = PixelFormat::Yuv420p8;
         assert!(shrink(&frame, &Limits::default()).is_err());
+    }
+}
+
+#[cfg(test)]
+mod measurement {
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+    use std::time::{Duration, Instant};
+
+    use zvidlib::io::MemorySource;
+    use zvidlib::{
+        Codec, CodecProfile, ColorRange, Limits, Mp4Demuxer, Mp4DemuxerOptions, PixelFormat,
+        TrackKind, VideoDecoderConfig, native_hevc_video_decoder_factory,
+    };
+
+    use super::*;
+
+    fn block_on<F: Future>(future: F) -> F::Output {
+        let mut boxed = Box::pin(future);
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+        match boxed.as_mut().poll(&mut context) {
+            Poll::Ready(value) => value,
+            Poll::Pending => panic!("unexpected pending future"),
+        }
+    }
+
+    /// Issue #374: what a scrub anywhere on the bar costs once the index is built.
+    ///
+    /// The point of the index is that this is not a decode, so the figure it prints should be
+    /// microseconds rather than the second the same position costs to decode exactly. Ignored
+    /// because it is a wall-clock reading on whatever host runs it, and because building the
+    /// index decodes the whole bundled track.
+    #[test]
+    #[ignore = "host-specific preview-latency measurement"]
+    fn a_preview_answers_any_position_without_decoding() {
+        let bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/examples/media/BigBuckBunny.mp4"
+        ));
+        let source = MemorySource::new(bytes.to_vec());
+        let demuxer = block_on(Mp4Demuxer::open(&source, Mp4DemuxerOptions::default())).unwrap();
+        let video = demuxer
+            .tracks
+            .iter()
+            .find(|track| track.kind == TrackKind::Video)
+            .unwrap();
+        let limits = Limits::default();
+        let samples = block_on(video.to_encoded_video_samples(&source, &limits)).unwrap();
+        let frame_count = samples.len() as u64;
+        let configuration = VideoDecoderConfig {
+            codec: video.codec,
+            profile: CodecProfile::HevcMain,
+            coded_dimensions: video.dimensions.unwrap(),
+            output_format: PixelFormat::Rgba8,
+            color_range: ColorRange::Limited,
+            hardware: zvidlib::HardwarePreference::Prefer,
+            configuration: video.decoder_config.clone(),
+        };
+        assert_eq!(configuration.codec, Codec::Hevc);
+        let factory = native_hevc_video_decoder_factory();
+        let started = Instant::now();
+        let index =
+            PreviewIndex::new(&factory, configuration, samples, limits, 24).expect("preview index");
+
+        // Wait for the pass to cover the whole track, which is the state a drag finds it in a
+        // second or two after the window opens.
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            let (filled, total) = index.coverage();
+            if filled == total || Instant::now() >= deadline {
+                assert_eq!(filled, total, "the preview pass did not finish in time");
+                break;
+            }
+            std::thread::yield_now();
+        }
+        let built = started.elapsed();
+
+        // Every position on the bar, sampled a hundred ways, answered from the index.
+        let mut worst = Duration::ZERO;
+        for step in 0..=100_u64 {
+            let frame = step * (frame_count - 1) / 100;
+            let started = Instant::now();
+            let preview = index.nearest(frame).expect("a preview for every position");
+            worst = worst.max(started.elapsed());
+            assert_eq!(preview.pixel_format, PixelFormat::Rgba8);
+        }
+        eprintln!(
+            "preview index over {frame_count} frames built in {built:?}; worst lookup {worst:?}"
+        );
+        assert!(
+            worst < Duration::from_millis(50),
+            "a preview lookup took {worst:?}"
+        );
     }
 }
