@@ -836,13 +836,33 @@ pub(crate) struct SaoLambda {
     ///
     /// So the probe's own answer sits below the floor the invariant needs,
     /// and the charge stays a constant inside the measured window
-    /// [1.5x, 4x) — narrowed by measurement, not derived from one. What it
-    /// is standing in for is not a mispriced bit but the slice-level
-    /// acceptance rule's own precision: at these operating points the rule
-    /// decides on margins of a few parts in a thousand, and it is not
-    /// monotone in the grid — a superset grid measured to be worth its own
-    /// bits can fail the test its subset passes, because the multiplier is
-    /// itself a function of the rate being judged.
+    /// [1.5x, 4x) — narrowed by measurement, not derived from one.
+    ///
+    /// #344 re-took that sweep against the repaired slice-level rule to see
+    /// whether the window's floor moves, and it does not: at 1.4x and at
+    /// 1.1x, the two ends of what the probe measures, the same noise 128x96
+    /// QP 32 slice lands the same 2079 bytes the same 0.003 dB under its own
+    /// curve, byte for byte and millibel for millibel, on the repaired rule
+    /// and on the one before it alike. The charge is therefore not standing
+    /// in for anything the slice-level rule was getting wrong, and it stays
+    /// at 2.5x rather than moving to the 1.5x that also holds — a constant
+    /// sitting on the exact boundary where the invariant is next measured to
+    /// break is fitted to that boundary, not derived, and doubling the QPs
+    /// that carry band components from 13 to 27 is not worth buying at that
+    /// price.
+    ///
+    /// What it is standing in for is the acceptance rule's own resolution.
+    /// The rule is monotone in the grid — `keeps_sao` states why, and #287's
+    /// non-monotone reading is a property of restating a concave threshold as
+    /// a per-bit multiplier rather than of the decision — but monotone is not precise, and at
+    /// these operating points it decides on margins of a few parts in a
+    /// thousand. `SAO_ACCEPTANCE_RESOLUTION_NUM` is how far it can actually
+    /// see: the two-point extrapolation the rule rests on is measured wrong
+    /// by tens of percent of the distortion it predicts, 0.13 dB at this very
+    /// picture and QP, which is forty times the 0.003 dB the invariant fails
+    /// by here. The invariant is measuring something the acceptance rule
+    /// cannot resolve, so what closes that gap has to be a charge on the
+    /// search rather than a tolerance on the rule, and this constant is it.
     pub(crate) band_q8: u32,
 }
 
