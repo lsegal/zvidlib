@@ -13,14 +13,19 @@
 //!
 //! A [`FrameService`] owns the one [`ExactFrameReader`] the example has and answers two callers:
 //!
-//! * The drag asks for the frame under the pointer and draws whatever has arrived. The worker
-//!   does not jump straight to it - it walks there from the target's random-access point in
-//!   strides, publishing the frames it stops on, so the picture tracks the pointer from the first
-//!   intra picture onwards instead of holding still for the whole decode. A newer target replaces
-//!   the older one and redirects the walk; a walk that has to start over cancels the decode it is
-//!   inside rather than finishing it. Only the frames the walk stops on are converted to RGBA:
-//!   the reader tells the decoder that the pictures it is passing are wanted for reference only
-//!   (issue #354), which is what makes the far end of the bar cost what the near end does.
+//! * The drag asks for the frame under the pointer and draws it when it arrives. A newer target
+//!   replaces the older one rather than queueing behind it, and one the current decode has
+//!   already passed cancels that decode instead of waiting for a frame nothing will draw.
+//!
+//!   The worker asks for that frame and nothing else. #319 and #339 had it stop every frame on
+//!   the way there and draw each one, so the picture would track the pointer - but on this
+//!   sample every stop is a frame of the *start* of the movie while the pointer is at the end,
+//!   and each one costs a full-resolution NV12-to-RGBA pass (6.6 ms against the 2.9 ms the
+//!   decoding itself takes) for a picture that is nowhere near where the pointer is. That is
+//!   what issue #354 is: the far end of the bar took 6.4 s to arrive at. `ExactFrameReader`
+//!   now tells the decoder that the pictures between where it is and the frame that was asked
+//!   for are wanted for reference only, so they cost their decoding and nothing else, and the
+//!   frame under the pointer arrives in 1.7 s instead.
 //! * Playback reads through a [`FrameServiceSource`], which is the same worker behind
 //!   [`zvidlib::PlaybackVideoSource`]. A frame that has not been decoded yet is reported as
 //!   [`ErrorKind::WouldBlock`] and the render thread simply keeps the picture it has, so a seek
@@ -28,7 +33,9 @@
 //!
 //! Sharing one reader between the two is also what makes committing a scrub free: the drag has
 //! already walked the decoder to the frame the commit asks for, so playback's request for it is a
-//! cache hit rather than a second decode through the same 613 frames.
+//! cache hit rather than a second decode through the same 613 frames. The frames just behind it
+//! are cached too - the reader keeps as many as its cache can hold rather than skipping them -
+//! so the previous-frame key is a cache hit after a scrub as much as it is during playback.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
@@ -39,52 +46,12 @@ use zvidlib::{
     PlaybackVideoSource, Result, VideoDecoderConfig, VideoDecoderFactory, VideoFrame,
 };
 
-/// How far apart the frames a walk publishes are.
-///
-/// The reader decodes every sample in between either way, but only the ones a walk stops on cost
-/// a colour conversion now that [`ExactFrameReader`] tells the decoder which pictures are wanted
-/// (issue #354). That is what sets this: a published frame costs its own conversion plus the
-/// decoding of the frames since the last one, about 6.6 ms + 2.9 ms per frame on the bundled
-/// 1080p sample through VideoToolbox, so a stride of eight lands at roughly the 30 ms the issue
-/// #333 budget asks for while reaching the far end of the bar in a third of the time. A stride of
-/// one publishes more often and pays a conversion for every frame it passes: 7.7 s to walk to the
-/// last frame of the bundled sample, against 3.0 s at eight.
-const WALK_STRIDE: u64 = 8;
-
 /// How many decoded frames the render thread can still collect.
 ///
 /// Playback asks for one frame per redraw and a drag draws the newest, so a couple of frames of
 /// slack is all a poll needs - and a 1080p RGBA frame is 8 MiB, so this is the memory the queue
 /// costs.
 const DELIVERY_DEPTH: usize = 3;
-
-/// The presentation indices a decode can start from, ascending.
-pub struct KeyframeIndex {
-    frames: Vec<u64>,
-}
-
-impl KeyframeIndex {
-    /// Collects the random-access samples' presentation indices from a track's decode-order
-    /// samples.
-    pub fn from_samples(samples: &[EncodedVideoSample]) -> Self {
-        let mut frames: Vec<u64> = samples
-            .iter()
-            .filter(|sample| sample.random_access)
-            .map(|sample| sample.presentation_index.0)
-            .collect();
-        frames.sort_unstable();
-        Self { frames }
-    }
-
-    /// The newest random-access frame at or before `frame`, or `frame` itself when the track
-    /// indexes none before it.
-    pub fn at_or_before(&self, frame: u64) -> u64 {
-        match self.frames.partition_point(|candidate| *candidate <= frame) {
-            0 => frame,
-            position => self.frames[position - 1],
-        }
-    }
-}
 
 /// The frame a timeline position `fraction` of the way along a `frame_count`-frame track selects.
 pub fn target_frame(fraction: f32, frame_count: u64) -> u64 {
@@ -156,13 +123,12 @@ impl FrameService {
         samples: Vec<EncodedVideoSample>,
         limits: Limits,
     ) -> Result<Self> {
-        let keyframes = KeyframeIndex::from_samples(&samples);
         let reader = ExactFrameReader::new(factory, configuration, samples, limits)?;
         let queue = Arc::new((Mutex::new(Queue::default()), Condvar::new()));
         let worker_queue = Arc::clone(&queue);
         let worker = thread::Builder::new()
             .name("zvidlib-frame-service".to_string())
-            .spawn(move || decode_frames(&worker_queue, reader, &keyframes))
+            .spawn(move || decode_frames(&worker_queue, reader))
             .map_err(|error| {
                 Error::new(
                     ErrorKind::InvalidInput,
@@ -253,16 +219,9 @@ impl PlaybackVideoSource for FrameServiceSource {
     }
 }
 
-/// Walks the reader to whatever frame the queue is pointing at, publishing what it passes.
-fn decode_frames(
-    queue: &Arc<(Mutex<Queue>, Condvar)>,
-    mut reader: ExactFrameReader,
-    keyframes: &KeyframeIndex,
-) {
+/// Decodes whatever frame the queue is pointing at, and then waits for the next one.
+fn decode_frames(queue: &Arc<(Mutex<Queue>, Condvar)>, mut reader: ExactFrameReader) {
     let (lock, condvar) = &**queue;
-    // Where the last published frame left the reader, so a forward request continues from it
-    // rather than starting over at a random-access point.
-    let mut position: Option<u64> = None;
     loop {
         let (mut target, mut cancellation) = {
             let mut state = lock.lock().expect("frame queue poisoned");
@@ -278,33 +237,26 @@ fn decode_frames(
                 state = condvar.wait(state).expect("frame queue poisoned");
             }
         };
-        let mut cursor = walk_start(position, target, keyframes);
         loop {
-            lock.lock().expect("frame queue poisoned").cursor = Some(cursor);
+            lock.lock().expect("frame queue poisoned").cursor = Some(target);
             // Decoded outside the lock so a newer target can both replace this one and cancel the
-            // decode part-way through.
-            let decoded = reader.get(FrameIndex(cursor), &cancellation);
-            let reached = decoded.is_ok();
+            // decode part-way through. Everything between the reader's position and this frame is
+            // decoded inside this one call, for reference only.
+            let decoded = reader.get(FrameIndex(target), &cancellation);
             let mut state = lock.lock().expect("frame queue poisoned");
             if state.shutdown {
                 return;
             }
             match decoded {
                 Ok(frame) => {
-                    position = Some(cursor);
                     while state.delivered.len() >= DELIVERY_DEPTH {
                         state.delivered.pop_front();
                     }
-                    state.delivered.push_back((cursor, frame));
+                    state.delivered.push_back((target, frame));
                 }
-                Err(error) if error.kind() == ErrorKind::Cancelled => {
-                    // Superseded part-way through, so the reader stopped between frames and the
-                    // next walk starts from a random-access point rather than from nowhere.
-                    position = None;
-                }
+                Err(error) if error.kind() == ErrorKind::Cancelled => {}
                 Err(error) => {
-                    // Handed to whichever caller asks next; this walk cannot make progress.
-                    position = None;
+                    // Handed to whichever caller asks next; this request cannot make progress.
                     state.failure = Some(error);
                     state.target = None;
                 }
@@ -314,40 +266,21 @@ fn decode_frames(
                 state.in_flight = None;
                 break;
             };
-            if current != target {
-                target = current;
-                cursor = walk_start(position, target, keyframes);
-            } else if reached && cursor == target {
-                // The walk arrived. Clearing the target rather than holding it parks the worker
-                // instead of decoding the same frame again, and lets a drag that comes back to
-                // this frame ask for it afresh - out of the reader's cache, for nothing.
+            if current == target {
+                // Arrived. Clearing the target rather than holding it parks the worker instead
+                // of decoding the same frame again, and lets a drag that comes back to this
+                // frame ask for it afresh - out of the reader's cache, for nothing.
                 state.target = None;
                 state.cursor = None;
                 state.in_flight = None;
                 break;
-            } else if reached {
-                cursor = target.min(cursor.saturating_add(WALK_STRIDE));
-            } else {
-                cursor = walk_start(position, target, keyframes);
             }
+            target = current;
             if cancellation.is_cancelled() {
                 cancellation = CancellationToken::new();
                 state.in_flight = Some(cancellation.clone());
             }
         }
-    }
-}
-
-/// The first frame of a walk from `position` to `target`.
-///
-/// A target ahead of where the reader already is continues from there, decoding only what lies
-/// between. Anything else restarts at the target's random-access point, which is the frame the
-/// reader would have to decode from anyway and the first one it can publish.
-fn walk_start(position: Option<u64>, target: u64, keyframes: &KeyframeIndex) -> u64 {
-    match position {
-        Some(position) if position < target => target.min(position.saturating_add(WALK_STRIDE)),
-        Some(position) if position == target => target,
-        _ => keyframes.at_or_before(target),
     }
 }
 
@@ -371,28 +304,6 @@ mod tests {
     }
 
     #[test]
-    fn a_target_snaps_back_to_the_random_access_point_that_decodes_it() {
-        let index = KeyframeIndex::from_samples(&samples(12, 4));
-        assert_eq!(index.at_or_before(0), 0);
-        assert_eq!(index.at_or_before(3), 0);
-        assert_eq!(index.at_or_before(4), 4);
-        assert_eq!(index.at_or_before(7), 4);
-        assert_eq!(index.at_or_before(11), 8);
-        // Past the last indexed frame the caller's own target is the best answer available.
-        assert_eq!(index.at_or_before(40), 8);
-    }
-
-    #[test]
-    fn a_track_without_a_leading_random_access_point_returns_the_target_itself() {
-        let mut without = samples(4, 1);
-        for sample in &mut without {
-            sample.random_access = false;
-        }
-        let index = KeyframeIndex::from_samples(&without);
-        assert_eq!(index.at_or_before(2), 2);
-    }
-
-    #[test]
     fn a_timeline_fraction_selects_the_frame_it_points_at() {
         assert_eq!(target_frame(0.0, 101), 0);
         assert_eq!(target_frame(0.5, 101), 50);
@@ -401,18 +312,6 @@ mod tests {
         assert_eq!(target_frame(-1.0, 101), 0);
         assert_eq!(target_frame(2.0, 101), 100);
         assert_eq!(target_frame(0.5, 0), 0);
-    }
-
-    #[test]
-    fn a_walk_continues_forwards_and_restarts_from_a_random_access_point_otherwise() {
-        let keyframes = KeyframeIndex::from_samples(&samples(64, 16));
-        // Nothing decoded yet, or a target behind the reader: start where the decode has to.
-        assert_eq!(walk_start(None, 40, &keyframes), 32);
-        assert_eq!(walk_start(Some(50), 40, &keyframes), 32);
-        // Ahead of the reader: continue from it, one stride at a time, without overshooting.
-        assert_eq!(walk_start(Some(32), 40, &keyframes), 32 + WALK_STRIDE);
-        assert_eq!(walk_start(Some(39), 40, &keyframes), 40);
-        assert_eq!(walk_start(Some(40), 40, &keyframes), 40);
     }
 
     /// How many samples a decoder may still decode before it blocks, so a test can hold a walk
@@ -511,6 +410,18 @@ mod tests {
         .unwrap()
     }
 
+    /// Polls `poll` for a tenth of a second, for asserting that nothing arrives.
+    fn wait_for_a_moment<T>(mut poll: impl FnMut() -> Option<T>) -> Option<T> {
+        let deadline = Instant::now() + Duration::from_millis(100);
+        while Instant::now() < deadline {
+            if let Some(value) = poll() {
+                return Some(value);
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        None
+    }
+
     /// Polls `poll` until it answers, or gives up after ten seconds.
     fn wait_for<T>(mut poll: impl FnMut() -> Option<T>) -> Option<T> {
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -577,9 +488,11 @@ mod tests {
     }
 
     #[test]
-    fn a_walk_through_a_single_group_of_pictures_draws_the_frames_it_passes() {
+    fn a_request_across_a_single_group_of_pictures_draws_the_frame_that_was_asked_for() {
         // One random-access point, as the bundled sample has: reaching frame 9 means decoding
-        // every frame from 0, and a scrub that showed nothing until it arrived is the freeze.
+        // every frame from 0. Those nine pictures are decoded for reference and never drawn -
+        // issue #354 - so the window keeps the picture it has until the frame under the pointer
+        // itself arrives, rather than crawling through the start of the movie to get there.
         let mut single_gop = samples(12, 1);
         for sample in single_gop.iter_mut().skip(1) {
             sample.random_access = false;
@@ -588,12 +501,12 @@ mod tests {
         let mut frames = open(Some(Arc::clone(&gate)), single_gop);
         frames.request(9);
 
-        // One sample's worth of decoding is enough to publish something: the walk starts at the
-        // random-access point rather than at the target, so the window has a picture long before
-        // the nine frames the target needs have been decoded.
-        grant(&gate, 1);
-        let first = wait_for(|| frames.take_latest()).map(|frame| frame.planes[0].data[0]);
-        assert_eq!(first, Some(0), "the walk draws where it starts");
+        // Enough decoding for the frames before the target, and still nothing to draw.
+        grant(&gate, 8);
+        assert!(
+            wait_for_a_moment(|| frames.take_latest()).is_none(),
+            "a frame the request passed is not drawn"
+        );
 
         grant(&gate, u32::MAX / 2);
         let arrived = wait_for(|| {
@@ -602,6 +515,10 @@ mod tests {
                 .map(|frame| frame.planes[0].data[0])
                 .filter(|index| *index == 9)
         });
-        assert_eq!(arrived, Some(9), "and then walks on to the target");
+        assert_eq!(
+            arrived,
+            Some(9),
+            "the frame that was asked for is the one drawn"
+        );
     }
 }

@@ -121,11 +121,17 @@ fn a_walk_that_skips_the_pictures_it_passes_still_decodes_the_frames_it_stops_on
     ))
     .unwrap();
 
+    // A cache smaller than the walk: the reader keeps the frames within `max_cached_frames` of
+    // its target, so the default 32 would cover this whole walk and skip nothing.
+    let walk_limits = Limits {
+        max_cached_frames: 4,
+        ..limits
+    };
     let mut reader = ExactFrameReader::new(
         &native_hevc_video_decoder_factory(),
         vector.configuration.clone(),
         vector.samples.clone(),
-        limits,
+        walk_limits,
     )
     .unwrap();
     let cancellation = CancellationToken::new();
@@ -144,6 +150,23 @@ fn a_walk_that_skips_the_pictures_it_passes_still_decodes_the_frames_it_stops_on
     assert!(
         statistics.samples_skipped >= 8,
         "the frames between the stops are decoded without being converted: {statistics:?}"
+    );
+
+    // The frames immediately before a stop are kept, which is what makes stepping backwards
+    // from it a cache hit rather than another walk from the random-access point.
+    let resets = statistics.resets;
+    for index in [23_u64, 22] {
+        let frame = reader.get(FrameIndex(index), &cancellation).unwrap();
+        assert_eq!(
+            FrameDigest::from_frame(&frame).unwrap(),
+            vector.expected_frames[index as usize].digest,
+            "frame {index}, just behind the last stop, does not match the fixture"
+        );
+    }
+    assert_eq!(
+        reader.statistics().resets,
+        resets,
+        "stepping back into the walk's own tail decodes nothing again"
     );
 
     // A frame the walk went past is not lost, only sometimes more expensive: whether it is still

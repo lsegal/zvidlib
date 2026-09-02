@@ -479,18 +479,27 @@ impl ExactFrameReader {
                 break;
             }
             // Nothing looks at a picture decoded on the way to the target, and skipping the
-            // colour conversion it would otherwise pay is most of what a long walk costs.
+            // colour conversion it would otherwise pay is most of what a long walk costs. Two
+            // kinds of frame are kept anyway, both because the request after this one is very
+            // likely to be for them.
             //
-            // What "on the way" means is a *presentation*-order question, not a decode-order
-            // one. A walk arrives at its target from behind and carries on forwards, so a
-            // sample whose own frame is at or after the target is one the next request is
-            // likely to ask for, and producing it is what makes that request a cache hit. Only
-            // the frames the walk has already gone past are skipped. Deciding this by decode
-            // position instead discards exactly the reordered frames a walk over a stream with
+            // The first is anything at or after the target in *presentation* order. A walk
+            // arrives at its target from behind and carries on forwards, and deciding this by
+            // decode position instead discards exactly the reordered frames a stream with
             // B-pictures asks for next: on the bundled sample every fourth request would then
             // reset the decoder and walk the whole group of pictures again.
+            //
+            // The second is the frames immediately behind the target, as many as the cache can
+            // hold. Walking here fills the cache with them as a side effect, and that is what
+            // makes stepping backwards a frame at a time cost nothing; skipping them would
+            // leave the cache empty behind the target and turn every backward step into
+            // another walk from the random-access point. They are a bounded charge - the last
+            // `max_cached_frames` conversions of a walk however long - against a saving that
+            // grows with the distance.
+            let cache_tail = u64::from(self.limits.max_cached_frames);
             let wanted = position >= target_position
-                || self.samples[position].presentation_index >= presentation_index;
+                || self.samples[position].presentation_index.0
+                    >= presentation_index.0.saturating_sub(cache_tail);
             self.set_output_wanted(wanted);
             let suppressed = !self.output_wanted;
             let outputs = self.decoder.submit(&self.samples[position], cancellation)?;
@@ -981,6 +990,15 @@ mod tests {
             .collect()
     }
 
+    /// A cache small enough that a walk over ten frames is longer than the tail the reader
+    /// keeps behind its target; the default cache would hold the whole group of pictures.
+    fn small_cache() -> Limits {
+        Limits {
+            max_cached_frames: 2,
+            ..Limits::default()
+        }
+    }
+
     #[test]
     fn walking_to_a_distant_frame_does_not_ask_for_the_pictures_it_passes() {
         let log = Arc::new(Mutex::new(Vec::new()));
@@ -991,7 +1009,7 @@ mod tests {
             &factory,
             config(),
             single_group_of_pictures(),
-            Limits::default(),
+            small_cache(),
         )
         .unwrap();
         let cancellation = CancellationToken::new();
@@ -1009,15 +1027,15 @@ mod tests {
                 (3, false),
                 (4, false),
                 (5, false),
-                (6, false),
-                (7, false),
+                (6, true),
+                (7, true),
                 (8, true),
             ],
-            "only the frame that was asked for is produced"
+            "only the target and the tail the cache can hold are produced"
         );
         let statistics = reader.statistics();
         assert_eq!(statistics.samples_submitted, 9);
-        assert_eq!(statistics.samples_skipped, 8);
+        assert_eq!(statistics.samples_skipped, 6);
         assert_eq!(statistics.resets, 1, "the walk itself is one decode");
     }
 
@@ -1031,7 +1049,7 @@ mod tests {
             &factory,
             config(),
             single_group_of_pictures(),
-            Limits::default(),
+            small_cache(),
         )
         .unwrap();
         let cancellation = CancellationToken::new();
@@ -1074,8 +1092,7 @@ mod tests {
         let factory = HintFactory {
             wanted: Arc::clone(&log),
         };
-        let mut reader =
-            ExactFrameReader::new(&factory, config(), samples, Limits::default()).unwrap();
+        let mut reader = ExactFrameReader::new(&factory, config(), samples, small_cache()).unwrap();
         let cancellation = CancellationToken::new();
 
         assert_eq!(
@@ -1103,6 +1120,50 @@ mod tests {
     }
 
     #[test]
+    fn a_walk_leaves_the_frames_behind_its_target_cached_so_stepping_back_is_free() {
+        // Walking fills the cache with the frames just before the target as a side effect, and
+        // that is what makes the example's previous-frame key cheap. Skipping those too would
+        // send every backward step all the way back to the random-access point.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let factory = HintFactory {
+            wanted: Arc::clone(&log),
+        };
+        let samples: Vec<_> = (0..40)
+            .map(|index| sample(index, index as u8, index == 0))
+            .collect();
+        let mut reader = ExactFrameReader::new(
+            &factory,
+            config(),
+            samples,
+            Limits {
+                max_cached_frames: 4,
+                ..Limits::default()
+            },
+        )
+        .unwrap();
+        let cancellation = CancellationToken::new();
+        reader.get(FrameIndex(32), &cancellation).unwrap();
+        let after_walk = reader.statistics();
+        assert_eq!(after_walk.samples_skipped, 28, "frames 0 to 27 are skipped");
+
+        for index in [31_u64, 30, 29] {
+            assert_eq!(
+                value(&reader.get(FrameIndex(index), &cancellation).unwrap()),
+                index as u8
+            );
+        }
+        assert_eq!(
+            reader.statistics().resets,
+            after_walk.resets,
+            "the tail the walk kept is in the cache, so stepping back decodes nothing"
+        );
+        assert_eq!(
+            reader.statistics().samples_submitted,
+            after_walk.samples_submitted
+        );
+    }
+
+    #[test]
     fn a_decoder_that_ignores_the_hint_still_answers_every_frame() {
         // `set_output_wanted` is advisory: `uncompressed_video_decoder_factory` does not
         // implement it, and the reader has to be no less correct for that.
@@ -1111,12 +1172,12 @@ mod tests {
             &factory,
             config(),
             single_group_of_pictures(),
-            Limits::default(),
+            small_cache(),
         )
         .unwrap();
         let cancellation = CancellationToken::new();
         reader.get(FrameIndex(8), &cancellation).unwrap();
-        assert_eq!(reader.statistics().samples_skipped, 8);
+        assert_eq!(reader.statistics().samples_skipped, 6);
         for index in 0..9_u64 {
             assert_eq!(
                 value(&reader.get(FrameIndex(index), &cancellation).unwrap()),
@@ -1124,11 +1185,6 @@ mod tests {
                 "frame {index} came back from the decoder that ignored the hint"
             );
         }
-        assert_eq!(
-            reader.statistics().resets,
-            1,
-            "frames the decoder produced anyway are cached, not walked to again"
-        );
     }
 
     #[test]
