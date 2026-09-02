@@ -674,7 +674,10 @@ mod tests {
         }
         assert!(!table.is_empty(), "`SITE_GROUP_PREFIXES` parsed as empty");
         for (site, prefixes) in &table {
-            assert!(!prefixes.is_empty(), "site `{site}` parsed with no prefixes");
+            assert!(
+                !prefixes.is_empty(),
+                "site `{site}` parsed with no prefixes"
+            );
         }
         table
     }
