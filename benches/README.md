@@ -192,6 +192,7 @@ is not mistaken for bitstream-writing cost. Both default to 640x352 and add a
 | --- | --- |
 | `av1_encode_frame_q{0,32,160}` | one whole frame through the public encoder, `src/av1_encoder/tile.rs` |
 | `av1_encode_stage_wht` | the forward 4x4 WHT, `src/av1_encoder/wht.rs` |
+| `av1_encode_stage_iwht` | the lossless inverse 4x4 WHT, `src/av1_encoder/wht.rs` |
 | `av1_encode_stage_symbol` | symbol coding over the static CDF tables, `src/av1_encoder/symbol.rs` and `cdf.rs` |
 | `av1_encode_stage_coeff_ctx` | the §8.3.2 `coeff_base`/`coeff_br` context derivation on its own, `src/av1_simd/coeff.rs` |
 | `av1_encode_stage_tile` | tile encoding: superblock iteration, `DC_PRED`, coefficient coding and its vectorized §8.3.2 context derivation, `src/av1_encoder/tile.rs` and `src/av1_simd/coeff.rs` |
@@ -215,9 +216,10 @@ the §8.3.2 context derivation half of it is now vectorized, which
 reads close to flat anyway; [Why the tile group barely moves](#why-the-tile-group-barely-moves)
 is the measurement that says why, and what the remaining target is.
 
-This encoder's vectorized kernels are the forward transforms, the forward WHT,
-and the `coeff_base` / `coeff_br` context derivation the coefficient coding loop
-runs on (§8.3.2, `src/av1_simd/coeff.rs`, the `av1_coeff_ctx` dispatch site).
+This encoder's vectorized kernels are the forward transforms, the forward WHT
+and its inverse — both WHT directions on `neon` only, since each was measured
+under parity on x86_64 and routed to the scalar reference there — and the
+`coeff_base` / `coeff_br` context derivation the coefficient coding loop runs on (§8.3.2, `src/av1_simd/coeff.rs`, the `av1_coeff_ctx` dispatch site).
 The last of those derives a whole block's contexts in one data-parallel pass
 ahead of the serial symbol loop, which is legal because the loop walks the
 up-right diagonal scan backwards, so every neighbour a position consults is
@@ -1000,6 +1002,11 @@ Measured on **AMD EPYC 7763 64-Core Processor (Linux, x86_64)**, at
 `b284c38a6391` — the #337 merge `b233f0a74f88` plus the temporary six-round
 workflow that measured it, which touches no crate code.
 
+The two `av1_encode_stage_coeff_ctx` rows are the pre-#362 code and are kept as
+the record of the defect that issue reports; the repair is measured under [The
+#362 re-measurement](#the-362-re-measurement) below, on its own host and with
+its own provenance.
+
 | Group | `scalar` | `sse4.1` | `avx2` | Best |
 | --- | ---: | ---: | ---: | ---: |
 | `av1_cdef` | 89.226 ms | 38.801 ms (2.30x) | 31.241 ms (2.86x) | 2.86x `avx2` |
@@ -1022,6 +1029,8 @@ workflow that measured it, which touches no crate code.
 | `av1_encode_stage_symbol_1080p` | 8.257 ms | 8.167 ms (1.01x) | 8.236 ms (1.00x) | 1.01x `sse4.1` |
 | `av1_encode_stage_tile` | 21.340 ms | 18.051 ms (1.18x) | 18.248 ms (1.17x) | 1.18x `sse4.1` |
 | `av1_encode_stage_tile_1080p` | 197.811 ms | 167.742 ms (1.18x) | 169.684 ms (1.17x) | 1.18x `sse4.1` |
+| `av1_encode_stage_iwht` † | 331.600 µs | 399.630 µs (0.83x) | 371.650 µs (0.89x) | 0.89x `avx2` |
+| `av1_encode_stage_iwht_1080p` † | 3.064 ms | 3.682 ms (0.83x) | 3.424 ms (0.89x) | 0.89x `avx2` |
 | `av1_encode_stage_wht` | 436.654 µs | 371.908 µs (1.17x) | 372.555 µs (1.17x) | 1.17x `sse4.1` |
 | `av1_encode_stage_wht_1080p` | 4.026 ms | 3.423 ms (1.18x) | 3.419 ms (1.18x) | 1.18x `avx2` |
 | `av1_entropy_symbol` | 3.767 ms | 3.767 ms (1.00x) | 3.766 ms (1.00x) | 1.00x `avx2` |
@@ -1078,9 +1087,22 @@ workflow that measured it, which touches no crate code.
 | `hevc_inverse_transform` | 9.291 ms | 7.079 ms (1.31x) | 6.396 ms (1.45x) | 1.45x `avx2` |
 | `hevc_sao` | 32.116 ms | 19.431 ms (1.65x) | 18.325 ms (1.75x) | 1.75x `avx2` |
 
+† The two `av1_encode_stage_iwht` rows come from a separate draw. The group did
+not exist when the rest of this table was measured — #342 added it — so it was
+measured on its own, by the same recipe: three rounds, elementwise minimum, on
+one AMD EPYC 7763 64-Core, the model this table names. Six draws were dispatched
+so that three sharing a model could be selected; two landed on an AMD EPYC 9V74
+80-Core and were discarded. That draw timed `av1_encode_stage_wht` alongside the
+inverse group and read it at 1.16x and 1.16x against the 1.17x and 1.18x above,
+which is the check that the two draws are comparable. Both rows are the state
+*before* the dispatch change they settled, and are the measurement rather than
+the current arms: `av1_simd::iwht4x4` now returns `None` on x86_64, so a re-take
+will read them the way `av1_encode_stage_wht` reads here.
+
 #### Reading the rows
 
-Not one row's `Best` arm is below parity. The lowest cells anywhere in the table
+Not one row's `Best` arm is below parity, except the two the footnote above
+marks as a pre-change measurement. The lowest cells anywhere in the table
 are 0.98x and 0.99x, and four of the five belong to groups whose arms are the
 same code: `av1_decode_frame`, `av1_encode_stage_bitstream`,
 `av1_encode_stage_symbol` and `hevc_encode_cabac` have no vector kernel, so
@@ -1113,6 +1135,17 @@ Two rows read at parity for a reason worth stating rather than as noise:
   that the x86_64 early return skips before the fallback — a few percent of a
   very small kernel, not a kernel difference. `neon` keeps the kernel and its
   2.72x, where the shuffle issue width is what makes it win.
+- `av1_encode_stage_iwht` at 0.83x and 0.89x is the other direction of that same
+  family, and #342 measured it rather than inferring it: the forward group could
+  not settle it, because the forward pass runs three `transpose4`s where the
+  inverse runs two, so the shuffle pressure that put `av1_encode_stage_wht`
+  under parity is not this kernel's shuffle pressure. It turns out to be enough
+  anyway. Two `transpose4`s are sixteen shuffle micro-operations contending for
+  one or two ports, against a scalar loop with none, and the row reads the same
+  0.83x / 0.89x pair at 320x180 and at 1080p — a property of the kernel, not of
+  the frame size or of a noisy round. `av1_simd::iwht4x4` therefore joins
+  `fwht4x4` on the scalar reference on x86_64 and keeps its kernel on `neon`,
+  and this is now a measured dispatch on both sides of the family.
 
 The rows with real vector work are now the ones with the largest ratios, which
 is what the old table could not show. `hevc_encode_*_rgba_to_yuv420` leads at
@@ -1174,11 +1207,90 @@ getting about 1.5x back for it. The `_1080p` variants agree to two decimal
 places, so the ratio is a property of the kernels rather than of the frame size.
 
 `sse4.1` beats `avx2` on a minority of rows, and by enough on two of them to be
-more than noise: `av1_encode_stage_coeff_ctx` is 3.04x under `sse4.1` against
+more than noise: `av1_encode_stage_coeff_ctx` was 3.04x under `sse4.1` against
 2.50x under `avx2`, and the `rdo_inter` pair is 1.63x/1.64x against 1.55x. The
-`Best` column already records `sse4.1` for these, but the dispatch site prefers
-`avx2` when the host has it, so a real encode takes the slower arm. Why the
-wider kernel is slower is not answered by this table; `#362` answers it.
+`Best` column already recorded `sse4.1` for these, but the dispatch site
+preferred `avx2` when the host had it, so a real encode took the slower arm.
+#362 answers why, and the answer is the same one for both rows: **the wide arm
+never reaches its width on the block shapes these workloads actually use.** Not
+lane-crossing, not downclocking, not the context gather. The detail differs.
+
+- `av1_encode_stage_coeff_ctx`. `src/av1_simd/coeff.rs` steps along a *row* of
+  the transform block, and a row shorter than the vector cannot be split across
+  more than one iteration however wide the vector is. A 4x4 block is one
+  iteration per row under `sse4.1` *and* under `avx2`, four of AVX2's eight
+  lanes idle in every one of them, so the wide arm does identical work at twice
+  the width — at best a tie. It is not even a tie, because the tail store is the
+  one thing the widths do not share: `I32x::store_masked` forwards a full vector
+  straight to the store instruction and stages a partial one through a stack
+  buffer, and `count` is `min(size, LANES)`. At size 4 SSE4.1's four lanes are
+  exactly full and take the native store, while AVX2 is partial and pays a
+  32-byte spill plus a 16-byte copy on *every* store, twice a row, for
+  `base_out` and `br_out` alike. The group reproduces it so cleanly because
+  `coeff_context_plane` derives contexts for 4x4 blocks and nothing else. #362
+  routes blocks narrower than eight lanes to the SSE4.1 kernel at the
+  `av1_coeff_ctx` dispatch site, the way #342 routed `fwht4x4`, and keeps AVX2
+  from size 8 up where it halves the iterations per row and stores whole
+  vectors. The `avx2` column of this group is consequently the SSE4.1 kernel's
+  number from here on, in the same sense `av1_encode_stage_wht`'s three columns
+  are all the scalar transform. Giving AVX2 real work at size 4 needs a kernel
+  that steps two rows at a time rather than one — the outputs of adjacent rows
+  are already contiguous, so eight lanes are there to be filled — and #371
+  carries that.
+
+#### The #362 re-measurement
+
+The repair is measured, not asserted, but it is deliberately recorded here
+rather than folded into the table above. The `workflow_dispatch` round that
+measured it landed on an **Intel(R) Xeon(R) 6973P-C (Linux/X64)** — one of the
+three CPU models the table's draw explicitly measured and discarded for not
+being the AMD EPYC 7763 the other rounds shared — and it is one round, not the
+elementwise minimum of three. Its absolute times are therefore not comparable
+with the table's, and merging two rows of it into a table attributed to a named
+host would make that table attributable to no host at all, which is the failure
+mode the six-round selection above exists to avoid.
+
+What *is* comparable is the `sse4.1`-against-`avx2` sign within the round, which
+is the whole claim. Measured at `539dad3d61cb` with `ZVIDLIB_BENCH_LARGE=1`,
+`# host instruction sets: scalar, sse4.1, avx2`, `# dispatch site
+av1_coeff_ctx: avx2`:
+
+| Group | `scalar` | `sse4.1` | `avx2` | Best |
+| --- | ---: | ---: | ---: | ---: |
+| `av1_encode_stage_coeff_ctx` | 3.483 ms | 930.916 µs (3.74x) | 929.755 µs (3.75x) | 3.75x `avx2` |
+| `av1_encode_stage_coeff_ctx_1080p` | 31.480 ms | 8.801 ms (3.58x) | 8.568 ms (3.67x) | 3.67x `avx2` |
+| `av1_encode_stage_tile` | 15.510 ms | 12.541 ms (1.24x) | 12.522 ms (1.24x) | 1.24x `avx2` |
+| `av1_encode_stage_tile_1080p` | 149.547 ms | 116.654 ms (1.28x) | 116.531 ms (1.28x) | 1.28x `avx2` |
+| `hevc_encode_640x352_rdo_inter` | 58.661 ms | 34.657 ms (1.69x) | 37.999 ms (1.54x) | 1.69x `sse4.1` |
+| `hevc_encode_1920x1088_rdo_inter` | 554.943 ms | 328.088 ms (1.69x) | 358.684 ms (1.55x) | 1.69x `sse4.1` |
+
+The 20% gap between the two vector arms of `av1_encode_stage_coeff_ctx` is
+gone: they now read 930.916 µs and 929.755 µs, 0.13% apart, which is what
+"both arms run the same kernel" looks like — the `avx2` column is the SSE4.1
+kernel reached through the redirect, exactly as `av1_encode_stage_wht`'s three
+columns are all the same scalar transform. `av1_encode_stage_tile`, which
+contains the derivation behind the serial range coder, loses its 1.18x-against-
+1.17x split the same way. The dispatch site no longer takes the slower arm, and
+the `Best` column stops disagreeing with what a real x86_64 encode does.
+
+The `rdo_inter` pair is in the table above as the control, and it is unmoved:
+1.69x under `sse4.1` against 1.54x/1.55x under `avx2`, the same shape #351
+recorded on a different host. Nothing in #362 touches `rdcost`, and the second
+bullet above is why it would not have helped if it did.
+- `hevc_encode_*_rdo_inter`. The same family, a different mechanism, and *not*
+  the same fix. `rdcost::sad_avx2`'s 256-bit loop needs `w >= 32` and
+  `satd_avx2`'s vector pair needs `w >= 16`, but `rdo.rs` searches a `CTB` of 16
+  and its candidate partitions subdivide that, so the 32-wide SAD branch is
+  never taken at all and every sub-partition of width 8 or 4 falls through to
+  `satd_8x8_sse41`. Both AVX2 metrics therefore execute the same 128-bit body as
+  their SSE4.1 counterparts, plus a 256-bit zero, a `vextracti128` fold and the
+  `vzeroupper` an AVX2 `#[target_feature]` function emits on return — a fixed
+  per-call cost, on a motion search that issues 81 SAD calls per candidate, which
+  is exactly the loop where a per-call cost cannot amortize. So it is a
+  per-call setup the wider step does not pay for rather than idle lanes and a
+  staged store, and the repair is to widen what the search hands the kernel (or
+  to route these two the way `coeff_ctx` is now routed) rather than anything
+  #362 changes. #370 carries it.
 
 ## Hardware HEVC decoders
 

@@ -24,7 +24,7 @@ use super::headers::{
 };
 use super::symbol::SymbolEncoder;
 use super::tile::{CoeffScratch, FrameEncoder};
-use super::wht::fwht4x4;
+use super::wht::{fwht4x4, fwht4x4_scalar, iwht4x4};
 use super::{cdf, stream_configuration};
 use crate::ColorRange;
 
@@ -66,6 +66,67 @@ pub fn fwht4x4_plane(plane: &[u8], width: usize, height: usize) -> Vec<u8> {
                 digest ^= coefficient as u32 as u64;
                 digest = digest.wrapping_mul(0x1000_0000_01b3);
             }
+        }
+    }
+    digest.to_le_bytes().to_vec()
+}
+
+/// The lossless coefficients of one 8-bit luma plane, block by block, as the
+/// flat input [`iwht4x4_plane`] runs over.
+///
+/// Built outside the timed loop so the inverse group measures the inverse WHT
+/// and not the forward one, and built through `wht::fwht4x4_scalar` rather than
+/// the dispatching `wht::fwht4x4` so the input is the same bytes on every host
+/// and under every instruction-set override — a setup step that varied with
+/// the arm would make the inverse group's bit-exactness guard compare
+/// different inputs rather than different kernels.
+#[must_use]
+pub fn wht4x4_coefficients(plane: &[u8], width: usize, height: usize) -> Vec<i32> {
+    assert!(
+        plane.len() >= width * height,
+        "plane is shorter than its dimensions"
+    );
+    let mut coefficients = Vec::new();
+    let mut residual = [0i32; 16];
+    for block_y in (0..height & !3).step_by(4) {
+        for block_x in (0..width & !3).step_by(4) {
+            for row in 0..4 {
+                let start = (block_y + row) * width + block_x;
+                for column in 0..4 {
+                    residual[row * 4 + column] = i32::from(plane[start + column]) - BENCH_PREDICTOR;
+                }
+            }
+            coefficients.extend_from_slice(&fwht4x4_scalar(&residual));
+        }
+    }
+    coefficients
+}
+
+/// Runs the lossless 4x4 inverse WHT over every block of
+/// [`wht4x4_coefficients`]'s output.
+///
+/// The counterpart to [`fwht4x4_plane`] and the other half of the same
+/// dispatch family: `crate::av1_simd::iwht4x4`. It has its own group because a
+/// dispatch decision taken on the forward direction's measurement is a
+/// decision taken on a different kernel — the forward transform runs three
+/// `transpose4`s where the inverse runs two, so the shuffle pressure that
+/// settled the forward arm is not the inverse arm's shuffle pressure.
+///
+/// Returns an order-sensitive fold of every reconstructed residual rather than
+/// the residuals themselves, for the same reason [`fwht4x4_plane`] does.
+#[must_use]
+pub fn iwht4x4_plane(coefficients: &[i32]) -> Vec<u8> {
+    assert!(
+        coefficients.len() % 16 == 0,
+        "coefficients are whole 4x4 blocks"
+    );
+    let mut digest = 0xcbf2_9ce4_8422_2325_u64;
+    let mut block = [0i32; 16];
+    for quantized in coefficients.chunks_exact(16) {
+        block.copy_from_slice(quantized);
+        for residual in iwht4x4(&block) {
+            digest ^= residual as u32 as u64;
+            digest = digest.wrapping_mul(0x1000_0000_01b3);
         }
     }
     digest.to_le_bytes().to_vec()
