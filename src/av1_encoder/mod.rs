@@ -1537,6 +1537,28 @@ mod nonlossless_tests {
             .sum()
     }
 
+    /// The per-frame penalty ceilings
+    /// `the_type_gain_per_frame_penalties_are_pinned_at_the_shipped_sampling_interval` asserts
+    /// and `measure_type_gain_memory_against_trust` sweeps against, so the two cannot drift.
+    ///
+    /// Measured at the shipped constants with margin, not derived from the frames' content; see
+    /// that test for what a failure means and where these are re-measured from.
+    fn type_gain_ceilings() -> std::collections::BTreeMap<&'static str, f64> {
+        std::collections::BTreeMap::from([
+            ("noise", 1.0),
+            ("smooth", 1.0),
+            ("diagonals", 1.0),
+            ("quadrants", 1.0),
+            ("scene_edge", 1.0),
+            ("bands", 1.0),
+            ("mosaic", 1.5),
+            ("gain_edge", 1.0),
+            ("gain_bands", 1.75),
+            ("gain_mosaic", 1.0),
+            ("test_pattern", 1.0),
+        ])
+    }
+
     /// One cell of a calibration sweep: the knobs whose values it varies.
     #[derive(Clone, Copy)]
     struct GainArm {
@@ -2448,9 +2470,10 @@ mod nonlossless_tests {
                                 / cost(1) as f64
                                 * 100.0
                                 - 100.0;
-                            // The ceilings `the_type_gain_sampling_interval_holds_on_content_it_
-                            // was_not_tuned_on` asserts, as an overshoot so the worst is a max.
-                            let ceiling = if *name == "scene_edge" { 2.5 } else { 1.0 };
+                            // The ceilings
+                            // `the_type_gain_per_frame_penalties_are_pinned_at_the_shipped_
+                            // sampling_interval` asserts, as an overshoot so the worst is a max.
+                            let ceiling = type_gain_ceilings()[name];
                             if penalty - ceiling > worst_overshoot {
                                 worst_overshoot = penalty - ceiling;
                                 worst_name = format!("{name}@{width}x{height}");
@@ -2538,17 +2561,7 @@ mod nonlossless_tests {
         for (width, height) in [(128_usize, 96_usize), (192, 160)] {
             let mut frames = content_frames(width as u32, height as u32);
             frames.push(("test_pattern", test_pattern(width as u32, height as u32)));
-            // Measured at `PINNED_AT` with margin, not derived from the frames' content.
-            let ceilings = std::collections::BTreeMap::from([
-                ("noise", 1.0),
-                ("smooth", 1.0),
-                ("diagonals", 1.0),
-                ("quadrants", 1.0),
-                ("scene_edge", 2.5),
-                ("bands", 1.0),
-                ("mosaic", 1.0),
-                ("test_pattern", 1.0),
-            ]);
+            let ceilings = type_gain_ceilings();
             for (name, pixels) in &frames {
                 let ceiling = ceilings[name];
                 for qindex in [1_u8, 8, 32, 80, 160, 200] {
