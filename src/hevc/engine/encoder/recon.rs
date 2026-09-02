@@ -715,7 +715,7 @@ fn ctb_rect(pic: &Picture, plane: Plane, rx: usize, ry: usize) -> (usize, usize,
 
 /// The §9.3.3 bin count of the four `sao_offset_abs` values of one component —
 /// Table 9-43 TR with `cMax == 7` and `cRiceParam == 0`, i.e. truncated unary.
-fn offset_abs_bins(offsets: &[i32; 5]) -> u64 {
+pub(crate) fn offset_abs_bins(offsets: &[i32; 5]) -> u64 {
     offsets[1..5]
         .iter()
         .map(|&o| {
@@ -796,7 +796,7 @@ impl SaoLambda {
 /// the band candidate's rate [`SaoLambda::band_q8`] prices. Its offsets'
 /// own truncated-Rice bins are counted by [`offset_abs_bins`] exactly as edge
 /// offset's are, and priced the same way.
-fn band_syntax_bins(offsets: &[i32; 5]) -> u64 {
+pub(crate) fn band_syntax_bins(offsets: &[i32; 5]) -> u64 {
     5 + offsets[1..5].iter().filter(|&&o| o != 0).count() as u64
 }
 
