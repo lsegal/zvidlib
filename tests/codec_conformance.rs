@@ -7,10 +7,9 @@ use zvidlib::io::MemorySource;
 use zvidlib::{
     CancellationToken, Codec, CodecProfile, ColorRange, EncodedVideoSample, ErrorKind,
     ExactFrameReader, ExpectedVideoFrame, FrameDigest, FrameIndex, HardwarePreference, Limits,
-    Mp4DemuxerOptions,
-    PixelFormat, VideoDecoderConfig, VideoDecoderConformanceVector, VideoDecoderFactory,
-    VideoDimensions, native_av1_video_decoder_factory, native_hevc_video_decoder_factory,
-    verify_video_decoder_conformance,
+    Mp4DemuxerOptions, PixelFormat, VideoDecoderConfig, VideoDecoderConformanceVector,
+    VideoDecoderFactory, VideoDimensions, native_av1_video_decoder_factory,
+    native_hevc_video_decoder_factory, verify_video_decoder_conformance,
 };
 
 fn block_on<T>(future: impl Future<Output = T>) -> T {
@@ -147,15 +146,17 @@ fn a_walk_that_skips_the_pictures_it_passes_still_decodes_the_frames_it_stops_on
         "the frames between the stops are decoded without being converted: {statistics:?}"
     );
 
-    // A frame the walk went past is not lost, only more expensive: it costs the reset and the
-    // decode from the random-access point that any unreachable frame does.
-    let frame = reader.get(FrameIndex(13), &cancellation).unwrap();
-    assert_eq!(
-        FrameDigest::from_frame(&frame).unwrap(),
-        vector.expected_frames[13].digest,
-        "a frame the walk passed comes back exactly when it is asked for"
-    );
-    assert_eq!(reader.statistics().resets, 2);
+    // A frame the walk went past is not lost, only sometimes more expensive: whether it is still
+    // cached, was kept because it follows a stop in presentation order, or has to be decoded
+    // again from the random-access point, what comes back is the fixture's frame.
+    for index in [13_u64, 5, 21, 24] {
+        let frame = reader.get(FrameIndex(index), &cancellation).unwrap();
+        assert_eq!(
+            FrameDigest::from_frame(&frame).unwrap(),
+            vector.expected_frames[index as usize].digest,
+            "frame {index}, which the walk passed, does not match the fixture"
+        );
+    }
 }
 
 /// Splits a low-overhead AV1 byte stream into temporal units, delimited by
