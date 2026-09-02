@@ -1057,7 +1057,9 @@ Three rounds and not one, because `table` takes the elementwise **minimum**
 across the baselines it is given. Contention only ever makes a measurement
 slower, so the fastest observation of an arm is the closest any round got to an
 uncontended one; averaging would fold every neighbour process into the number
-instead.
+instead. Three is a floor rather than a target: the aarch64 table below was
+drawn with six, because the host measuring it was running other work and more
+rounds is the only lever this recipe has against that.
 
 Only the groups `bench_across_isas` builds appear, because they are the only
 ones where "scalar vs each ISA" is a question — the rest of the suite is a single
@@ -1090,10 +1092,12 @@ python3 .github/scripts/criterion_baseline.py staleness --readme benches/README.
 It reads each stamp out of this file, reads the dispatch sites
 `zvidlib::simd::active_by_site` documents at that commit, diffs them against
 the sites registered now, and names the rows whose subject site did not exist
-when the table was drawn. Today that is three rows of the Apple M1 table —
-`hevc_color_convert`, `av1_encode_stage_tile` and
-`hevc_encode_640x352_reconstruct` — and nothing on the x86_64 one, which was
-drawn at a commit with the same eleven sites the crate has now.
+when the table was drawn. When #389 added it, that was three rows of the Apple
+M1 table — `hevc_color_convert`, `av1_encode_stage_tile` and
+`hevc_encode_640x352_reconstruct` — and nothing on the x86_64 one. #368 re-drew
+the Apple M1 table in answer, so both tables are clean today: each is stamped at
+a commit carrying the same eleven sites the crate has now, and the report flags
+nothing.
 
 Three things about how it reads the site set are worth stating, because each is
 a place a more obvious implementation does not work:
@@ -1125,111 +1129,174 @@ answered from a commit that is not built.
 
 ### Apple M1 (aarch64)
 
-Measured on **Apple M1 (macOS 15, aarch64)**, at `b6655bad215f`.
+Measured on **Apple M1 (macOS 26, aarch64)**, at `f3e7674fc5be`, with
+`ZVIDLIB_BENCH_LARGE=1` — so this table carries the `_1080p` rows too — and the
+elementwise minimum taken across **six** rounds rather than three. Six because
+the measuring host was not quiet: it ran other work throughout, at load averages
+between 3 and 15 on eight cores, and more rounds is the only lever the recipe
+gives against that. Every round logged `scalar` and `neon` and nothing else.
+
+This replaces the table drawn at `b6655bad215f`, whose stamp predates three of
+the dispatch sites it recorded. `criterion_baseline.py staleness` names them,
+and one re-draw clears all three at once:
+
+| Row | Site that landed after `b6655bad215f` | At the old stamp | Here |
+| --- | --- | ---: | ---: |
+| `av1_encode_stage_tile` | `av1_coeff_ctx` (#253) | 0.96x | 1.06x |
+| `hevc_color_convert` | `hevc_color_convert` (#222) | 1.27x | 3.62x |
+| `hevc_encode_640x352_reconstruct` | `hevc_recon` (#208) | 0.98x | 1.97x |
+
+All three were sub-parity or near-parity rows measured before the kernel they
+name existed, which is the only thing they had in common; none of them is a
+near-parity row now. The table has also grown by twenty-six rows that had no
+`neon` figure anywhere: every `_1080p` row, both `av1_encode_stage_coeff_ctx`
+rows, both `av1_encode_stage_iwht` rows, `hevc_decode`, `hevc_decode_to_picture`
+and the `hevc_encode_1920x1088` family.
 
 | Group | `scalar` | `neon` | Best |
 | --- | ---: | ---: | ---: |
-| `av1_cdef` | 46.615 ms | 32.865 ms (1.42x) | 1.42x `neon` |
-| `av1_deblock` | 25.088 ms | 4.497 ms (5.58x) | 5.58x `neon` |
-| `av1_deblock_boundary` | 362.401 µs | 62.127 µs (5.83x) | 5.83x `neon` |
-| `av1_deblock_chroma` | 12.448 ms | 4.838 ms (2.57x) | 2.57x `neon` |
-| `av1_deblock_wide` | 78.324 ms | 40.843 ms (1.92x) | 1.92x `neon` |
-| `av1_decode_frame` | 82.680 ms | 88.976 ms (0.93x) | 0.93x `neon` |
-| `av1_encode_frame_q0` | 22.174 ms | 24.314 ms (0.91x) | 0.91x `neon` |
-| `av1_encode_frame_q160` | 344.933 ms | 153.918 ms (2.24x) | 2.24x `neon` |
-| `av1_encode_frame_q32` | 275.371 ms | 170.418 ms (1.62x) | 1.62x `neon` |
-| `av1_encode_stage_bitstream` | 17.426 µs | 17.517 µs (0.99x) | 0.99x `neon` |
-| `av1_encode_stage_symbol` | 1.558 ms | 1.940 ms (0.80x) | 0.80x `neon` |
-| `av1_encode_stage_tile` | 30.144 ms | 31.441 ms (0.96x) | 0.96x `neon` |
-| `av1_encode_stage_wht` | 981.525 µs | 360.850 µs (2.72x) | 2.72x `neon` |
-| `av1_entropy_symbol` | 3.449 ms | 3.422 ms (1.01x) | 1.01x `neon` |
-| `av1_forward_adst_8x8` | 33.915 ms | 8.722 ms (3.89x) | 3.89x `neon` |
-| `av1_forward_dct_16x16` | 45.538 ms | 12.369 ms (3.68x) | 3.68x `neon` |
-| `av1_forward_dct_32x32` | 60.160 ms | 63.603 ms (0.95x) | 0.95x `neon` |
-| `av1_forward_dct_4x4` | 50.984 ms | 7.889 ms (6.46x) | 6.46x `neon` |
-| `av1_forward_dct_8x8` | 33.702 ms | 8.557 ms (3.94x) | 3.94x `neon` |
-| `av1_forward_flipadst_16x16` | 36.556 ms | 12.258 ms (2.98x) | 2.98x `neon` |
-| `av1_intra_directional` | 26.145 ms | 27.222 ms (0.96x) | 0.96x `neon` |
-| `av1_intra_paeth` | 3.376 ms | 3.442 ms (0.98x) | 0.98x `neon` |
-| `av1_intra_smooth` | 3.564 ms | 3.410 ms (1.05x) | 1.05x `neon` |
-| `av1_inverse_adst_8x8` | 50.591 ms | 17.851 ms (2.83x) | 2.83x `neon` |
-| `av1_inverse_dct_16x16` | 24.143 ms | 11.105 ms (2.17x) | 2.17x `neon` |
-| `av1_inverse_dct_32x32` | 17.398 ms | 11.327 ms (1.54x) | 1.54x `neon` |
-| `av1_inverse_dct_4x4` | 78.638 ms | 28.663 ms (2.74x) | 2.74x `neon` |
-| `av1_inverse_dct_64x64` | 27.862 ms | 13.821 ms (2.02x) | 2.02x `neon` |
-| `av1_inverse_dct_8x8` | 42.501 ms | 17.817 ms (2.39x) | 2.39x `neon` |
-| `av1_inverse_flipadst_16x16` | 28.316 ms | 12.777 ms (2.22x) | 2.22x `neon` |
-| `av1_mc_blend_mask` | 26.063 ms | 12.135 ms (2.15x) | 2.15x `neon` |
-| `av1_mc_compound_average` | 25.797 ms | 11.882 ms (2.17x) | 2.17x `neon` |
-| `av1_mc_single` | 16.269 ms | 5.961 ms (2.73x) | 2.73x `neon` |
-| `av1_motion_compensation` | 14.660 ms | 5.442 ms (2.69x) | 2.69x `neon` |
-| `av1_self_guided` | 8.473 ms | 3.310 ms (2.56x) | 2.56x `neon` |
-| `av1_wiener` | 9.564 ms | 7.196 ms (1.33x) | 1.33x `neon` |
-| `hevc_cabac` | 2.559 ms | 2.250 ms (1.14x) | 1.14x `neon` |
-| `hevc_color_convert` | 15.095 ms | 11.926 ms (1.27x) | 1.27x `neon` |
-| `hevc_deblock` | 15.124 ms | 14.748 ms (1.03x) | 1.03x `neon` |
-| `hevc_encode_640x352` | 104.222 ms | 57.448 ms (1.81x) | 1.81x `neon` |
-| `hevc_encode_640x352_fwd_transform_quant` | 13.874 ms | 7.306 ms (1.90x) | 1.90x `neon` |
-| `hevc_encode_640x352_pcm_write` | 10.279 ms | 10.003 ms (1.03x) | 1.03x `neon` |
-| `hevc_encode_640x352_rdo_inter` | 77.838 ms | 27.887 ms (2.79x) | 2.79x `neon` |
-| `hevc_encode_640x352_rdo_intra` | 3.631 ms | 1.554 ms (2.34x) | 2.34x `neon` |
-| `hevc_encode_640x352_reconstruct` | 13.469 ms | 13.733 ms (0.98x) | 0.98x `neon` |
-| `hevc_encode_640x352_residual_write` | 34.563 ms | 33.620 ms (1.03x) | 1.03x `neon` |
-| `hevc_encode_640x352_rgba_to_yuv420` | 628.049 µs | 151.822 µs (4.14x) | 4.14x `neon` |
-| `hevc_encode_bitwriter` | 4.208 ms | 4.060 ms (1.04x) | 1.04x `neon` |
-| `hevc_encode_cabac` | 2.256 ms | 2.195 ms (1.03x) | 1.03x `neon` |
-| `hevc_inter_pred` | 24.449 ms | 22.433 ms (1.09x) | 1.09x `neon` |
-| `hevc_intra_pred` | 8.569 ms | 8.396 ms (1.02x) | 1.02x `neon` |
-| `hevc_inverse_transform` | 8.278 ms | 7.636 ms (1.08x) | 1.08x `neon` |
-| `hevc_sao` | 2.659 ms | 2.149 ms (1.24x) | 1.24x `neon` |
+| `av1_cdef` | 35.043 ms | 25.967 ms (1.35x) | 1.35x `neon` |
+| `av1_deblock` | 23.124 ms | 3.364 ms (6.87x) | 6.87x `neon` |
+| `av1_deblock_boundary` | 276.117 µs | 57.595 µs (4.79x) | 4.79x `neon` |
+| `av1_deblock_chroma` | 11.729 ms | 5.131 ms (2.29x) | 2.29x `neon` |
+| `av1_deblock_wide` | 58.572 ms | 27.485 ms (2.13x) | 2.13x `neon` |
+| `av1_decode_frame` | 76.003 ms | 75.990 ms (1.00x) | 1.00x `neon` |
+| `av1_encode_frame_q0` | 17.031 ms | 16.317 ms (1.04x) | 1.04x `neon` |
+| `av1_encode_frame_q0_1080p` | 177.864 ms | 170.023 ms (1.05x) | 1.05x `neon` |
+| `av1_encode_frame_q160` | 266.334 ms | 172.617 ms (1.54x) | 1.54x `neon` |
+| `av1_encode_frame_q160_1080p` | 2.114 s | 1.359 s (1.56x) | 1.56x `neon` |
+| `av1_encode_frame_q32` | 243.043 ms | 150.656 ms (1.61x) | 1.61x `neon` |
+| `av1_encode_frame_q32_1080p` | 2.402 s | 1.358 s (1.77x) | 1.77x `neon` |
+| `av1_encode_stage_bitstream` | 13.678 µs | 14.249 µs (0.96x) | 0.96x `neon` |
+| `av1_encode_stage_bitstream_1080p` | 152.156 µs | 156.234 µs (0.97x) | 0.97x `neon` |
+| `av1_encode_stage_coeff_ctx` | 1.917 ms | 897.883 µs (2.14x) | 2.14x `neon` |
+| `av1_encode_stage_coeff_ctx_1080p` | 17.125 ms | 8.320 ms (2.06x) | 2.06x `neon` |
+| `av1_encode_stage_iwht` | 332.657 µs | 308.618 µs (1.08x) | 1.08x `neon` |
+| `av1_encode_stage_iwht_1080p` | 3.234 ms | 2.898 ms (1.12x) | 1.12x `neon` |
+| `av1_encode_stage_symbol` | 912.771 µs | 923.899 µs (0.99x) | 0.99x `neon` |
+| `av1_encode_stage_symbol_1080p` | 8.597 ms | 8.604 ms (1.00x) | 1.00x `neon` |
+| `av1_encode_stage_tile` | 16.784 ms | 15.824 ms (1.06x) | 1.06x `neon` |
+| `av1_encode_stage_tile_1080p` | 162.570 ms | 142.799 ms (1.14x) | 1.14x `neon` |
+| `av1_encode_stage_wht` | 312.714 µs | 304.506 µs (1.03x) | 1.03x `neon` |
+| `av1_encode_stage_wht_1080p` | 2.962 ms | 2.864 ms (1.03x) | 1.03x `neon` |
+| `av1_entropy_symbol` | 3.075 ms | 3.141 ms (0.98x) | 0.98x `neon` |
+| `av1_forward_adst_8x8` | 29.647 ms | 7.272 ms (4.08x) | 4.08x `neon` |
+| `av1_forward_dct_16x16` | 37.029 ms | 10.919 ms (3.39x) | 3.39x `neon` |
+| `av1_forward_dct_32x32` | 53.549 ms | 62.642 ms (0.85x) | 0.85x `neon` |
+| `av1_forward_dct_4x4` | 40.458 ms | 6.991 ms (5.79x) | 5.79x `neon` |
+| `av1_forward_dct_8x8` | 29.153 ms | 7.741 ms (3.77x) | 3.77x `neon` |
+| `av1_forward_flipadst_16x16` | 34.389 ms | 11.904 ms (2.89x) | 2.89x `neon` |
+| `av1_intra_directional` | 25.517 ms | 25.300 ms (1.01x) | 1.01x `neon` |
+| `av1_intra_paeth` | 2.937 ms | 2.944 ms (1.00x) | 1.00x `neon` |
+| `av1_intra_smooth` | 2.949 ms | 2.928 ms (1.01x) | 1.01x `neon` |
+| `av1_inverse_adst_8x8` | 35.012 ms | 16.710 ms (2.10x) | 2.10x `neon` |
+| `av1_inverse_dct_16x16` | 22.046 ms | 11.769 ms (1.87x) | 1.87x `neon` |
+| `av1_inverse_dct_32x32` | 17.420 ms | 10.280 ms (1.69x) | 1.69x `neon` |
+| `av1_inverse_dct_4x4` | 66.590 ms | 24.599 ms (2.71x) | 2.71x `neon` |
+| `av1_inverse_dct_64x64` | 18.831 ms | 11.049 ms (1.70x) | 1.70x `neon` |
+| `av1_inverse_dct_8x8` | 36.558 ms | 15.252 ms (2.40x) | 2.40x `neon` |
+| `av1_inverse_flipadst_16x16` | 22.783 ms | 13.007 ms (1.75x) | 1.75x `neon` |
+| `av1_mc_blend_mask` | 22.952 ms | 10.769 ms (2.13x) | 2.13x `neon` |
+| `av1_mc_compound_average` | 22.057 ms | 10.513 ms (2.10x) | 2.10x `neon` |
+| `av1_mc_single` | 13.572 ms | 5.392 ms (2.52x) | 2.52x `neon` |
+| `av1_motion_compensation` | 13.476 ms | 5.216 ms (2.58x) | 2.58x `neon` |
+| `av1_self_guided` | 7.165 ms | 2.823 ms (2.54x) | 2.54x `neon` |
+| `av1_wiener` | 7.818 ms | 6.253 ms (1.25x) | 1.25x `neon` |
+| `hevc_cabac` | 2.303 ms | 2.361 ms (0.98x) | 0.98x `neon` |
+| `hevc_color_convert` | 10.315 ms | 2.851 ms (3.62x) | 3.62x `neon` |
+| `hevc_deblock` | 15.417 ms | 13.604 ms (1.13x) | 1.13x `neon` |
+| `hevc_decode` | 393.298 ms | 351.123 ms (1.12x) | 1.12x `neon` |
+| `hevc_decode_to_picture` | 360.844 ms | 332.305 ms (1.09x) | 1.09x `neon` |
+| `hevc_encode_1920x1088` | 871.129 ms | 407.339 ms (2.14x) | 2.14x `neon` |
+| `hevc_encode_1920x1088_fwd_transform_quant` | 129.161 ms | 68.830 ms (1.88x) | 1.88x `neon` |
+| `hevc_encode_1920x1088_pcm_write` | 4.779 ms | 4.689 ms (1.02x) | 1.02x `neon` |
+| `hevc_encode_1920x1088_rdo_inter` | 695.594 ms | 287.745 ms (2.42x) | 2.42x `neon` |
+| `hevc_encode_1920x1088_rdo_intra` | 31.857 ms | 15.208 ms (2.09x) | 2.09x `neon` |
+| `hevc_encode_1920x1088_reconstruct` | 82.809 ms | 42.166 ms (1.96x) | 1.96x `neon` |
+| `hevc_encode_1920x1088_reconstruct_quantized` | 195.560 ms | 91.223 ms (2.14x) | 2.14x `neon` |
+| `hevc_encode_1920x1088_residual_write` | 2.135 s | 1.585 s (1.35x) | 1.35x `neon` |
+| `hevc_encode_1920x1088_rgba_to_yuv420` | 4.305 ms | 1.206 ms (3.57x) | 3.57x `neon` |
+| `hevc_encode_640x352` | 75.976 ms | 35.111 ms (2.16x) | 2.16x `neon` |
+| `hevc_encode_640x352_fwd_transform_quant` | 13.618 ms | 7.250 ms (1.88x) | 1.88x `neon` |
+| `hevc_encode_640x352_pcm_write` | 369.736 µs | 370.587 µs (1.00x) | 1.00x `neon` |
+| `hevc_encode_640x352_rdo_inter` | 77.495 ms | 30.734 ms (2.52x) | 2.52x `neon` |
+| `hevc_encode_640x352_rdo_intra` | 3.300 ms | 1.567 ms (2.11x) | 2.11x `neon` |
+| `hevc_encode_640x352_reconstruct` | 9.086 ms | 4.604 ms (1.97x) | 1.97x `neon` |
+| `hevc_encode_640x352_reconstruct_quantized` | 21.297 ms | 9.552 ms (2.23x) | 2.23x `neon` |
+| `hevc_encode_640x352_residual_write` | 214.550 ms | 160.240 ms (1.34x) | 1.34x `neon` |
+| `hevc_encode_640x352_rgba_to_yuv420` | 469.579 µs | 123.619 µs (3.80x) | 3.80x `neon` |
+| `hevc_encode_bitwriter` | 646.662 µs | 667.521 µs (0.97x) | 0.97x `neon` |
+| `hevc_encode_cabac` | 1.711 ms | 1.880 ms (0.91x) | 0.91x `neon` |
+| `hevc_encode_cabac_bypass` | 1.972 ms | 1.992 ms (0.99x) | 0.99x `neon` |
+| `hevc_inter_pred` | 22.855 ms | 20.458 ms (1.12x) | 1.12x `neon` |
+| `hevc_intra_pred` | 8.160 ms | 8.428 ms (0.97x) | 0.97x `neon` |
+| `hevc_inverse_transform` | 7.750 ms | 6.096 ms (1.27x) | 1.27x `neon` |
+| `hevc_sao` | 2.335 ms | 1.583 ms (1.47x) | 1.47x `neon` |
 
 #### Reading the sub-parity rows
 
-An arm below `1.00x` is slower under its vector kernel than under scalar. Before
-treating one as a defect, note what three independent measurement sets of this
-same table did to the candidates:
+An arm below `1.00x` is slower under its vector kernel than under scalar. Ten
+rows are, and eight of them are groups whose two arms are the same code:
+`av1_encode_stage_bitstream` and its `_1080p` row, `av1_encode_stage_symbol`,
+`av1_entropy_symbol`, `hevc_cabac`, `hevc_encode_bitwriter`, `hevc_encode_cabac`
+and `hevc_encode_cabac_bypass` have no vector path at all, so their columns
+differ only by measurement noise. The widest that noise got is
+`hevc_encode_cabac` at **0.91x**, across a six-round minimum on a host running
+other work, and that is the scale to read the rest of the near-parity band at: a
+9% gap on this table is not a finding.
 
-| Group | set 1 | set 2 | set 3 |
-| --- | ---: | ---: | ---: |
-| `hevc_intra_pred` | 0.62x | 1.04x | 1.09x |
-| `av1_intra_paeth` | 0.78x | 0.88x | 0.98x |
-| `av1_forward_dct_32x32` | 0.78x | 0.91x | 0.95x |
+The two rows that are not same-code are `av1_forward_dct_32x32` at **0.85x** and
+`hevc_intra_pred` at **0.97x**. Both have kernels, and both are rows the
+previous draw's discussion had already flagged as unsettled: it recorded three
+independent measurement sets reading `hevc_intra_pred` at 0.62x, 1.04x and 1.09x
+and `av1_forward_dct_32x32` at 0.78x, 0.91x and 0.95x with no code change
+between them, and read the walk as the host getting quieter. This draw is a
+minimum over six rounds rather than a single set, which is a tighter estimator
+than any of those three — and it does not lift either row to parity. A minimum
+removes a round that was contended; it cannot remove contention that was present
+in every round, and this host had some in all six.
 
-No kernel changed between set 2 and set 3. What changed was the load average on
-the measuring host, and every candidate walked towards parity as the machine got
-quieter. **On this host, at this noise level, no arm is reliably below parity
-except the ones with no vector kernel at all** — `av1_encode_stage_symbol`,
-`av1_encode_stage_bitstream`, `hevc_cabac`, `hevc_encode_cabac` and
-`av1_entropy_symbol`, where the two arms are the same code and differ only by
-measurement noise.
+So the walk-to-parity reading survives for `hevc_intra_pred`, which lands inside
+the same 9% band the same-code rows define. It does not obviously survive for
+`av1_forward_dct_32x32`, whose 15% gap is the largest sub-parity figure on the
+table and sits against 1.48x for the same group under `avx2` on x86_64. That is
+now the one aarch64 row worth acting on rather than re-reading, and it is
+tracked separately; nothing else here is below parity for a reason other than
+having no kernel.
 
-`hevc_color_convert` used to be listed there too, and this table's `1.27x` row
-is what a same-code group reads at this noise level rather than a NEON win.
-That is no longer what the group measures. `b6655bad215f` predates `f695a1a`,
-the #222 merge that closed #219 by adding `src/hevc/color_convert.rs` with
-scalar, SSE4.1, AVX2 and NEON backends, so this draw timed the old per-sample
-scalar loop in `picture_to_rgba` on both arms. **The `hevc_color_convert` row
-above is stale, and re-drawing this table is the only thing that will fix it**;
-every other row in it is a group whose kernels are unchanged since the draw.
+**`av1_encode_stage_wht` is no longer 2.72x.** The old table put the forward
+4x4 WHT at 2.72x `neon`, and `src/av1_simd/mod.rs` cited exactly that figure as
+why `fwht4x4` keeps its kernel on aarch64 while returning `None` on x86_64. This
+draw reads it at **1.03x** at 320x180 and 1.03x at 1080p, and reads the inverse
+direction — `av1_encode_stage_iwht`, which the old table had no row for at all —
+at 1.08x and 1.12x against 0.83x/0.89x under `sse4.1`/`avx2`. The kernel is
+still being dispatched: `fwht4x4` falls back to scalar only when an input
+exceeds `WHT_INPUT_LIMIT` (2^18) and this group's residuals are a `u8` plane
+less a predictor of 128, bounded by 127. So the forward direction is in the
+parity band on this host too, and only the inverse still clears it. The
+dispatch decision the comment defends is unchanged — `neon` keeps both kernels,
+because neither is *below* parity the way the x86_64 arms are — but the number
+it defends the decision with is this table's, not the old one's.
 
 The rest of the near-parity rows are the story this file tells above: under
 `lto = "fat"` with `codegen-units = 1`, LLVM does to the scalar reference roughly
 what the hand kernel does, and the two land within noise of each other.
 
 This is the single most useful thing the committed table records. A one-off
-measurement of any of the three rows above would have looked like a broken
-kernel and sent someone rewriting code that was fine. It is also why the CI job
-compares medians rather than means, sets its threshold at a deliberately loose
-15%, and reports instead of failing: a shared runner is a noisier host than this
-one, not a quieter one.
+measurement of any of these rows would have looked like a broken kernel and sent
+someone rewriting code that was fine. It is also why the CI job compares medians
+rather than means, sets its threshold at a deliberately loose 15%, and reports
+instead of failing: a shared runner is a noisier host than this one, not a
+quieter one.
 
 ### x86_64 with SSE4.1 and AVX2 (Linux)
 
 Measured on a GitHub `ubuntu-latest` runner rather than on this project's
 development machine, because no aarch64 host can produce these columns at all.
 The rounds ran with `ZVIDLIB_BENCH_LARGE=1` and the elementwise minimum was
-taken across three of them, exactly as the recipe above describes. That is also
-why this table carries the `_1080p` rows the Apple M1 one does not.
+taken across three of them, exactly as the recipe above describes — the same
+recipe the Apple M1 table above is drawn with, so the `_1080p` rows are now on
+both.
 
 GitHub's `ubuntu-latest` pool is not uniform, so the CPU model is checked before
 a round is used: an elementwise minimum taken across different CPU models is
@@ -1399,8 +1466,11 @@ Two rows read at parity for a reason worth stating rather than as noise:
   shuffle micro-operations the hand kernel adds on top. So all three arms
   execute the same scalar transform, and the ratio is only the input-limit scan
   that the x86_64 early return skips before the fallback — a few percent of a
-  very small kernel, not a kernel difference. `neon` keeps the kernel and its
-  2.72x, where the shuffle issue width is what makes it win.
+  very small kernel, not a kernel difference. `neon` keeps the kernel, but not
+  the 2.72x this bullet used to cite for it: the re-drawn aarch64 table reads
+  the group at 1.03x, in the parity band rather than above it. What still
+  separates the two hosts is the *direction* of the gap — aarch64 is at parity
+  where x86_64 was under it — and that is what the dispatch turns on.
 - `av1_encode_stage_iwht` at 0.83x and 0.89x is the other direction of that same
   family, and #342 measured it rather than inferring it: the forward group could
   not settle it, because the forward pass runs three `transpose4`s where the
@@ -1438,11 +1508,13 @@ checkpoint the draw was taken on does not contain — see the paragraph on
 first table drawn after it, and nothing between the two draws changed what the
 group *measures*: what changed is that there is now something to measure.
 
-This also settles the aarch64 side. That table's [sub-parity
-discussion](#reading-the-sub-parity-rows) named `hevc_color_convert` as a group
-whose arms are the same code; that was true of the draw it describes and is no
-longer true of the crate. Its `1.27x` row is stale for the same reason and the
-note there now says so.
+This also settled the aarch64 side, and #368 has since re-drawn it. That
+table's [sub-parity discussion](#reading-the-sub-parity-rows) named
+`hevc_color_convert` as a group whose arms are the same code; that was true of
+the draw it described and not of the crate. The row now reads 3.62x `neon` at
+`f3e7674fc5be`, measured against a `hevc_color_convert` kernel that exists, and
+it was not the only row in that position — `av1_encode_stage_tile` and
+`hevc_encode_640x352_reconstruct` predated their sites too.
 
 **What keeps the hole from reopening.** A per-ISA group is only measuring its
 arms if the code under it reaches a dispatch site that `zvidlib::simd` drives,
@@ -1474,7 +1546,9 @@ places, so the ratio is a property of the kernels rather than of the frame size.
 
 `sse4.1` beats `avx2` on a minority of rows, and by enough on two of them to be
 more than noise: `av1_encode_stage_coeff_ctx` was 3.04x under `sse4.1` against
-2.50x under `avx2`, and the `rdo_inter` pair is 1.63x/1.64x against 1.55x. The
+2.50x under `avx2`, and the `rdo_inter` pair is 1.63x/1.64x against 1.55x. Both
+of those pairs of rows now pre-date their repair — #371 for the first and #387
+for the second — and the re-measurements below are what replaces them. The
 `Best` column already recorded `sse4.1` for these, but the dispatch site
 preferred `avx2` when the host had it, so a real encode took the slower arm.
 #362 answers why, and the answer is the same one for both rows: **the wide arm
@@ -1652,11 +1726,71 @@ apart, which is #362's redirect reproducing on the table's own hardware.
   #362 changes. #370 carried it, and took the second of those two: `sad` routes
   blocks narrower than 32 and `satd` blocks narrower than 16 to the SSE4.1
   kernel, each at its own AVX2 body's threshold rather than at one shared
-  number. Widening what the search hands the kernel is the other repair and is
-  still open as #387 — it is the one that would make AVX2 *win* here rather than
-  stop losing, but it moves the search's candidate ordering and early
-  termination with it, so it is an optimization rather than a defect fix.
-  Measured under [The #370 re-measurement](#the-370-re-measurement).
+  number. Widening what the search hands the kernel is the other repair and
+  #387 wrote it — it is the one that makes AVX2 *win* here rather than stop
+  losing, and it moves the search's candidate ordering with it, so it is an
+  optimization rather than a defect fix. Measured under [The #370
+  re-measurement](#the-370-re-measurement) and [The #387
+  re-measurement](#the-387-re-measurement).
+
+#### The #387 re-measurement
+
+#370 routed the narrow blocks around AVX2 and brought the two arms level; #387
+gives AVX2 something wide to do and the acceptance criterion was that it has to
+*win* on its own numbers. It does, by more than routing ever had to give.
+
+The width was never in the block — `rdo.rs` searches a `CTB` of 16 and its
+candidate partitions subdivide that — it is across the *candidates*: the
+whole-pel stage scores `(2 * radius + 1)^2` predictions of one source block, and
+`_mm256_sad_epu8` reduces per 8-byte lane, so one instruction carries two
+16-wide candidates (one per 128-bit lane) or four narrower ones (one per qword).
+`rdcost::sad_batch` is that entry point, `rdo::motion_search` gathers candidates
+into fixed batches to feed it, and the scan order and `mv_order` tie-break are
+untouched, so the winning vector is the one the per-candidate search picked.
+This is also the one place `SAD_AVX2_MIN_W` does not apply: a width the
+single-block path routes *away* from AVX2 is exactly a width the batched path
+routes *to* it, because its vector is full there.
+
+Measured at `c7205cf2a908` — the branch's merge with `main`, so #370's routing is
+in the tree — on an **AMD EPYC 7763 64-Core Processor (Linux/X64)**, the same
+host model as the committed table and as #370's round, with
+`ZVIDLIB_BENCH_LARGE=1`, `# host instruction sets: scalar, sse4.1, avx2` and
+`# dispatch site hevc_rdcost: avx2` ([run
+33625305783](https://github.com/lsegal/zvidlib/actions/runs/33625305783)). It is
+one round rather than the elementwise minimum of three, so it is recorded here
+rather than merged into the table; the `rdo_intra` control below is what carries
+the attribution.
+
+| Group | `scalar` | `sse4.1` | `avx2` | Best |
+| --- | ---: | ---: | ---: | ---: |
+| `hevc_encode_640x352_rdo_inter` | 92.881 ms | 58.789 ms (1.58x) | 39.723 ms (2.34x) | 2.34x `avx2` |
+| `hevc_encode_1920x1088_rdo_inter` | 878.39 ms | 558.10 ms (1.57x) | 373.63 ms (2.35x) | 2.35x `avx2` |
+| `hevc_encode_640x352` | 104.39 ms | 68.400 ms (1.53x) | 48.776 ms (2.14x) | 2.14x `avx2` |
+| `hevc_encode_1920x1088` | 1.0028 s | 656.45 ms (1.53x) | 472.23 ms (2.12x) | 2.12x `avx2` |
+| `hevc_encode_640x352_rdo_intra` | 5.598 ms | 3.762 ms (1.49x) | 3.753 ms (1.49x) | 1.49x `avx2` |
+| `hevc_encode_1920x1088_rdo_intra` | 51.991 ms | 34.943 ms (1.49x) | 34.256 ms (1.52x) | 1.52x `avx2` |
+
+The `Best` column of the `rdo_inter` pair reads `avx2` for the first time. The
+two vector arms are 32% and 33% apart with the wide one ahead — 39.723 ms
+against 58.789 ms and 373.63 ms against 558.10 ms — where #370's round on this
+same host model had them 1.0% and 1.3% apart, and every round before it had
+`sse4.1` ahead by 5%. Level was the whole of what routing could buy; the batched
+kernel is what buys more than level.
+
+`rdo_intra` is the control that should not move, and does not: it scores intra
+predictions through `satd` alone, forms no batch, and reads 1.49x/1.52x here
+against #370's round's 1.48x/1.50x on the same host model. The absolute times of
+this round run about 5% slower than that one across every column, `scalar`
+included — one draw of run-to-run variance on a shared runner — which is why the
+claim is the within-round sign rather than the absolute numbers.
+
+The whole-frame groups are the practical consequence, since the mode search is
+most of what they do: `hevc_encode_640x352` reads 48.776 ms under `avx2` against
+68.400 ms under `sse4.1` and `hevc_encode_1920x1088` 472.23 ms against
+656.45 ms, so an x86_64 user encoding HEVC on an AVX2 host gets about 28% of a
+whole encode back, where #370's routing recovered 2.8% of it. The committed
+x86_64 table's two `hevc_encode_*_rdo_inter` rows, and the whole-frame rows
+above them, pre-date both changes.
 
 ## Hardware HEVC decoders
 
