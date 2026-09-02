@@ -122,8 +122,30 @@ fn walsh_hadamard_kernels_match_the_scalar_reference() {
             for value in &mut residual {
                 *value = rng.in_range(255);
             }
-            let coefficients = fwht4x4(isa, &residual).expect("in-range block is vectorizable");
-            assert_eq!(coefficients, fwht4x4_scalar(&residual), "{}", isa.name());
+            // The forward WHT is dispatched to the scalar reference on
+            // x86_64 (see `super::fwht4x4`), so there `None` is the
+            // documented answer for an in-range block rather than a
+            // fallback. The inverse still has a kernel everywhere.
+            let scalar_coefficients = fwht4x4_scalar(&residual);
+            let coefficients = match fwht4x4(isa, &residual) {
+                Some(coefficients) => {
+                    assert!(
+                        !cfg!(target_arch = "x86_64"),
+                        "{}: the forward WHT is dispatched to scalar on x86_64",
+                        isa.name()
+                    );
+                    coefficients
+                }
+                None => {
+                    assert!(
+                        cfg!(target_arch = "x86_64"),
+                        "{}: an in-range block is vectorizable",
+                        isa.name()
+                    );
+                    scalar_coefficients
+                }
+            };
+            assert_eq!(coefficients, scalar_coefficients, "{}", isa.name());
             let reconstructed = iwht4x4(isa, &coefficients).expect("in-range block");
             assert_eq!(
                 reconstructed,
