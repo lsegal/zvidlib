@@ -610,9 +610,15 @@ pub(crate) struct FrameEncoder<'a> {
     /// is being trialled. A trial's cost is a sum of squared errors and `lambda * bits`, so it
     /// only grows: once the partial sum passes what the incumbent size already costs, no
     /// remaining block can bring it back and the rest of the trial cannot change the answer.
-    /// [`FrameEncoder::choose_tx_size`] sets it from the incumbent, and only for a
-    /// context-consistent trial, whose ranking cost *is* the sum this bounds.
+    /// [`FrameEncoder::choose_tx_size`] sets it from the incumbent, for any trial whose ranking
+    /// cost [`Self::trial_rank_bound`] can bound from below by the sum this accumulates.
     trial_ceiling: i64,
+    /// The credit the running trial's ranking will subtract from that sum, as the
+    /// `(measured, dct)` pair [`GainModel::Linear`] scales by [`Self::trial_searched_cost`], or
+    /// `(0, 0)` when the trial is ranked on the raw sum. Fixed for the whole trial:
+    /// [`FrameEncoder::shipped_trial_credit`] only accepts a trial that does not probe, so the
+    /// accumulator it is read from cannot move while the trial runs.
+    trial_credit: (i64, i64),
     /// Whether the pass now running is a [`FrameEncoder::choose_tx_size`] size trial, as opposed
     /// to one of the partition search's own measurement passes. Context-consistency is a
     /// property of the size trial alone: it is the size ranking the counterfactual distorts, and
@@ -647,6 +653,11 @@ pub(crate) struct FrameEncoder<'a> {
     /// is what it is measured by.
     #[cfg(test)]
     consistent_size_trials: bool,
+    /// Set by [`Self::with_unbounded_size_trials`] to stop bounding the shipped size trial by
+    /// the incumbent size's cost, so a test can measure what that bound buys and show that
+    /// turning it off changes nothing but the candidate count.
+    #[cfg(test)]
+    unbounded_size_trials: bool,
     /// Set by [`Self::without_type_gain_correction`] to rank sizes on the type set's `DCT_DCT`
     /// alone - no probe, no accumulator, no correction - which is the bare ranking every
     /// correction is applied on top of, and the baseline any of them has to beat.
@@ -927,6 +938,7 @@ impl<'a> FrameEncoder<'a> {
             trial_searched_cost: 0,
             trial_searched_blocks: 0,
             trial_ceiling: i64::MAX,
+            trial_credit: (0, 0),
             in_size_trial: false,
             trial_abandoned: false,
             #[cfg(test)]
@@ -937,6 +949,8 @@ impl<'a> FrameEncoder<'a> {
             context_consistent_trials: false,
             #[cfg(test)]
             consistent_size_trials: false,
+            #[cfg(test)]
+            unbounded_size_trials: false,
             #[cfg(test)]
             no_type_gain_correction: false,
             #[cfg(test)]
@@ -1072,6 +1086,31 @@ impl<'a> FrameEncoder<'a> {
     #[cfg(not(test))]
     fn context_consistent_trials(&self) -> bool {
         false
+    }
+
+    /// Stops bounding a shipped size trial by the incumbent size's cost, leaving every trial to
+    /// run to its last block as it did before #398.
+    ///
+    /// The bound is exact, so this arm is the same encode: it exists so a test can measure the
+    /// candidates the bound removes, and assert that removing them changed nothing else.
+    #[cfg(test)]
+    pub(crate) fn with_unbounded_size_trials(mut self) -> Self {
+        self.unbounded_size_trials = true;
+        self
+    }
+
+    /// Whether a shipped size trial may be abandoned at the incumbent's cost. Always, outside
+    /// tests.
+    #[cfg(test)]
+    fn bounded_size_trials(&self) -> bool {
+        !self.unbounded_size_trials
+    }
+
+    /// Whether a shipped size trial may be abandoned at the incumbent's cost. Always, outside
+    /// tests.
+    #[cfg(not(test))]
+    fn bounded_size_trials(&self) -> bool {
+        true
     }
 
     /// Ranks transform sizes on the set's `DCT_DCT` alone, with no probe and no correction, which
@@ -1719,14 +1758,33 @@ impl<'a> FrameEncoder<'a> {
             self.probe_blocks = 0;
             self.trial_searched_cost = 0;
             self.trial_searched_blocks = 0;
-            // Only a context-consistent trial may be abandoned part-way. Its ranking cost is the
-            // sum `code_block_transforms` accumulates, so a partial sum above the incumbent is
-            // already a proof that the size loses. The shipped trial's is not: it ranks on
-            // `corrected_trial_cost(cost, ...)`, which subtracts a credit the trial has not
-            // finished measuring, so a partial sum above the incumbent proves nothing there.
-            self.trial_ceiling = if consistent {
+            // A trial may be abandoned part-way whenever `trial_rank_bound` can turn the sum
+            // `code_block_transforms` accumulates into a lower bound on the cost the trial will
+            // finally be *ranked* on. A context-consistent trial is ranked on that sum directly,
+            // so the sum is its own bound. A shipped trial is ranked on
+            // `corrected_trial_cost(cost, ...)`, and #398 is where that case is settled: a trial
+            // that does not probe reads its credit from an accumulator fixed before it starts,
+            // and under `GainModel::Linear` the credit is `measured * trial_searched_cost / dct`
+            // - a fixed fraction of a quantity that grows only as fast as the sum itself. When
+            // that fraction is at most one the corrected cost is monotone in the sum too, and
+            // `shipped_trial_credit` hands back the `(measured, dct)` that makes it so.
+            self.trial_credit = (0, 0);
+            let bounded = if consistent {
+                true
+            } else {
+                match self.shipped_trial_credit(tx_width, probing) {
+                    Some(credit) => {
+                        self.trial_credit = credit;
+                        true
+                    }
+                    None => false,
+                }
+            };
+            self.trial_ceiling = if bounded {
                 // The incumbent's cost is reachable only by a size that also wins the tie, which
-                // is the larger transform; a smaller one has to come in strictly under it.
+                // is the larger transform; a smaller one has to come in strictly under it. The
+                // tie-break is over the ranking cost, so it reads the same either side of the
+                // correction: `trial_rank_bound` bounds that same ranking cost from below.
                 if tx_width > best.0 {
                     best.1
                 } else {
@@ -1741,6 +1799,7 @@ impl<'a> FrameEncoder<'a> {
             self.in_size_trial = false;
             let abandoned = self.trial_abandoned;
             self.trial_ceiling = i64::MAX;
+            self.trial_credit = (0, 0);
             self.trial_abandoned = false;
             self.restore(snapshot);
             if abandoned {
@@ -1881,6 +1940,88 @@ impl<'a> FrameEncoder<'a> {
         }
     }
 
+    /// The credit the shipped ranking will subtract from a size trial of `tx_width`, as the
+    /// `(measured, dct)` pair [`GainModel::Linear`] scales by [`Self::trial_searched_cost`], or
+    /// `None` when the trial's ranking cost is not monotone in the sum it accumulates.
+    ///
+    /// This is #398's answer to the reason #388 recorded for gating the trial cost bound to the
+    /// context-consistent arm. The shipped trial ranks on [`Self::corrected_trial_cost`], which
+    /// subtracts a credit, so a partial sum is a proof of nothing *in general*. It is a proof
+    /// under the shipped estimator, on the majority of trials, and this is the exact statement
+    /// of when:
+    ///
+    /// - **The trial must not probe.** A probing trial measures its own `(dct_p, best_p)` as it
+    ///   goes, so the credit is not a function of the trial's progress that anything is known
+    ///   about. Only every [`TYPE_GAIN_SAMPLE_INTERVAL`]-th size search probes, so this is the
+    ///   majority of trials rather than a corner of them. A non-probing trial leaves
+    ///   `probe_dct_cost` at zero and touches no accumulator, so the `(dct, best, probes)` read
+    ///   here is what [`Self::corrected_trial_cost`] will read back at the end.
+    /// - **The model must be [`GainModel::Linear`].** It alone scales the measurement by the
+    ///   trial's searched *cost*, which grows exactly as fast as the sum. Every other model
+    ///   scales by the searched *block count*, and a block that costs nothing still adds a whole
+    ///   block's credit, so the corrected cost can fall as the trial runs. Only `Linear` ships.
+    /// - **The credit fraction must be at most one.** With `measured = (dct - best) * trust /
+    ///   TYPE_GAIN_TRUST_ONE` fixed, the credit is `measured * s / dct` for a searched cost `s`.
+    ///   A block adds `c >= 0` to the sum and at most `c` to `s`, so the corrected cost moves by
+    ///   at least `c - ceil(measured * c / dct)`, which is non-negative exactly when `measured <=
+    ///   dct`. At the fraction's ceiling of one - reachable only when the whole of a probe's DCT
+    ///   cost was beaten away and `trust` is not shrinking it - that step is zero rather than
+    ///   negative: the corrected cost stops rising but never falls, so the bound stays exact and
+    ///   only stops abandoning anything. The shrinkage is asserted into `0..=TYPE_GAIN_TRUST_ONE`
+    ///   and `best` is `cheapest.min(dct)`, so the fraction cannot exceed one under any arm this
+    ///   crate can construct; it is still checked, because the bound is exact only if it holds.
+    ///
+    /// A trial that will not be corrected at all - the [`Self::type_gain_correction`] arm off, or
+    /// an accumulator with nothing in it - ranks on the raw sum, which is the same statement with
+    /// a zero credit.
+    fn shipped_trial_credit(&self, tx_width: usize, probing: bool) -> Option<(i64, i64)> {
+        if !self.shortcuts() || probing || !self.bounded_size_trials() {
+            return None;
+        }
+        if !self.type_gain_correction() {
+            return Some((0, 0));
+        }
+        if self.type_gain_model() != GainModel::Linear {
+            return None;
+        }
+        let slot = type_gain_slot(tx_width);
+        let running = self.type_gain[slot];
+        #[cfg(not(test))]
+        let (dct, best, probes) = (running.dct_cost, running.best_cost, running.probes);
+        #[cfg(test)]
+        let (dct, best, probes) = self.remembered_gain(running, slot);
+        // The same two guards `corrected_trial_cost` returns the uncorrected cost under, and
+        // fixed for the trial for the same reason: nothing a non-probing trial does moves them.
+        if dct <= 0 || probes <= 0 {
+            return Some((0, 0));
+        }
+        let measured = (dct - best) * self.type_gain_trust() / TYPE_GAIN_TRUST_ONE;
+        (0..=dct).contains(&measured).then_some((measured, dct))
+    }
+
+    /// The smallest cost the running trial can still be *ranked* at, given the sum it has
+    /// accumulated so far.
+    ///
+    /// [`Self::shipped_trial_credit`] establishes that the ranking cost only rises from here, so
+    /// this value is a lower bound on it: the trial's own final ranking is this same expression
+    /// evaluated on the sums it finishes with.
+    ///
+    /// The credit is taken in `i128` where [`Self::corrected_trial_cost`] takes it in `i64` with
+    /// a `saturating_mul`. That does not make the two disagree in the direction that matters: a
+    /// saturated product is smaller than the real one, so the shipped credit is never larger than
+    /// this one and the shipped ranking cost is never smaller than this bound. The bound stays
+    /// valid - a little loose - in the range where the shipped correction saturates.
+    fn trial_rank_bound(&self, cost: i64) -> i64 {
+        let (measured, dct) = self.trial_credit;
+        if measured <= 0 || dct <= 0 {
+            return cost;
+        }
+        // `measured <= dct` and `trial_searched_cost <= cost`, so the credit is at most `cost`
+        // and the narrowing cannot overflow.
+        let credit = i128::from(measured) * i128::from(self.trial_searched_cost) / i128::from(dct);
+        cost - credit as i64
+    }
+
     /// Discounts a size trial's DCT-only cost by what the type search has been measured to be
     /// worth at this transform size.
     ///
@@ -1975,10 +2116,13 @@ impl<'a> FrameEncoder<'a> {
                     cost += self.transform_block(x, y, bw, tx_width, emit);
                 }
                 // A transform block's cost is `sse + lambda * bits`, both non-negative, so this
-                // sum is monotone and a trial that has already passed its ceiling can only end
-                // above it. Abandoning it here skips the type search on every block it has not
-                // reached yet; the caller discards the partial sum rather than ranking on it.
-                if cost > self.trial_ceiling {
+                // sum is monotone, and `trial_rank_bound` turns it into a lower bound on the
+                // cost the trial will be ranked on. A trial already above its ceiling on that
+                // bound can only end above it. Abandoning it here skips the type search on every
+                // block it has not reached yet; the caller discards the partial sum rather than
+                // ranking on it. The raw comparison comes first because the bound never exceeds
+                // the sum, so a sum inside the ceiling needs no arithmetic at all.
+                if cost > self.trial_ceiling && self.trial_rank_bound(cost) > self.trial_ceiling {
                     self.trial_abandoned = true;
                     return cost;
                 }
