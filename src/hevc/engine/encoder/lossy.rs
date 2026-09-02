@@ -569,18 +569,43 @@ fn write_idr_residual_slice(
             bits: slice_data.len() as u64 * 8,
         };
         let (fine, coarse) = sao_curve_probe(planes, qp, search, filter.deblocking(), base);
-        let search_lambda = sao_search_lambda_q8(fine, coarse, qp);
-        let grid = sao_reconstruction(&mut recon, planes, search_lambda);
-        let gain = base.sse.saturating_sub(picture_sse(&recon, y, cb, cr));
-        // What the grid costs, read off the coded slice rather than counted
-        // beside it: the same slice data with the `sao( )` structures in
-        // front of each CTB, against the same slice data without them.
-        let coded = code_slice_data(&records, Some(&grid), qp, ctbs_x);
-        let sao_bits = (coded.len() as u64 * 8).saturating_sub(base.bits);
-        // Further rungs of this picture's own curve, walked only where the
-        // grid costs more than the one step the probe measured — which the
-        // sweep reaches at one operating point out of 160.
+        // Further rungs of this picture's own curve, walked only where a
+        // grid costs more than the one step the probe measured.
         let finer = |probe_qp| Some(curve_point(planes, probe_qp, search, filter.deblocking()));
+        // The price the search prices its candidates at, and then the same
+        // price re-read at the rate the grid it produced actually spends.
+        //
+        // [`sao_search_lambda_q8`] is the curve's slope at the coded point,
+        // which is the right price for a candidate and is read before there
+        // is a grid to read anything else at. It is a *local* slope, though,
+        // and a grid that spends more than the step the probe measured has
+        // been bought outside the stretch of curve the slope describes: at
+        // smooth 128x96 QP 21 the tangent is 0.27x the closed form, the
+        // search spends 1.57 quantizer steps at it, and the curve is steeper
+        // out there than at the anchor. So the price is re-read as what the
+        // rate actually spent is worth per bit, and the search runs again
+        // whenever that is dearer than what it charged. Only dearer: a
+        // re-read that would let the search buy *more* is the same
+        // extrapolation being trusted further out, which is what put the
+        // point under the curve to begin with.
+        let mut search_lambda = sao_search_lambda_q8(fine, coarse, qp);
+        let (mut grid, mut gain, mut coded, mut sao_bits);
+        loop {
+            recon = deblocked.clone();
+            grid = sao_reconstruction(&mut recon, planes, search_lambda);
+            gain = base.sse.saturating_sub(picture_sse(&recon, y, cb, cr));
+            // What the grid costs, read off the coded slice rather than
+            // counted beside it: the same slice data with the `sao( )`
+            // structures in front of each CTB, against the same slice data
+            // without them.
+            coded = code_slice_data(&records, Some(&grid), qp, ctbs_x);
+            sao_bits = (coded.len() as u64 * 8).saturating_sub(base.bits);
+            let spent = sao_spent_lambda_q8(fine, coarse, qp, sao_bits, finer);
+            if spent <= search_lambda {
+                break;
+            }
+            search_lambda = spent;
+        }
         if keeps_sao(gain, sao_bits, qp, fine, coarse, finer) {
             slice_data = coded;
             sao_kept = true;
@@ -1025,7 +1050,11 @@ fn sao_search_lambda_q8(fine: CurvePoint, coarse: CurvePoint, qp: i32) -> u32 {
     let fixed = lambda_q8(qp);
     // The coded point is `coarse` at every QP but 0, where there is no finer
     // point to probe and the writer's own point is `fine` instead.
-    let (coded, other) = if qp > 0 { (coarse, fine) } else { (fine, coarse) };
+    let (coded, other) = if qp > 0 {
+        (coarse, fine)
+    } else {
+        (fine, coarse)
+    };
     if coded.sse == 0 || coded.bits == 0 || other.sse == 0 {
         return fixed;
     }
@@ -1043,6 +1072,29 @@ fn sao_search_lambda_q8(fine: CurvePoint, coarse: CurvePoint, qp: i32) -> u32 {
     }
     let fixed = u64::from(fixed);
     let measured = (slope * 256.0).round() as u64;
+    measured.clamp((fixed / SAO_LAMBDA_BAND).max(1), fixed * SAO_LAMBDA_BAND) as u32
+}
+
+/// What the rate a grid actually spends is worth per bit on this picture's
+/// own curve, in the Q8 units [`lambda_q8`] returns.
+///
+/// The same quantity [`sao_threshold_sse`] decides on, divided by the rate it
+/// was read at, and clamped to the same [`SAO_LAMBDA_BAND`] every other price
+/// here is. This is what [`sao_search_lambda_q8`]'s tangent is checked
+/// against once there is a grid to check it at.
+fn sao_spent_lambda_q8(
+    fine: CurvePoint,
+    coarse: CurvePoint,
+    qp: i32,
+    sao_bits: u64,
+    finer: impl FnMut(i32) -> Option<CurvePoint>,
+) -> u32 {
+    let fixed = u64::from(lambda_q8(qp));
+    if sao_bits == 0 {
+        return fixed as u32;
+    }
+    let threshold = sao_threshold_sse(fine, coarse, qp, sao_bits, finer);
+    let measured = (threshold * 256.0 / sao_bits as f64).round().max(0.0) as u64;
     measured.clamp((fixed / SAO_LAMBDA_BAND).max(1), fixed * SAO_LAMBDA_BAND) as u32
 }
 
@@ -1215,8 +1267,8 @@ fn sao_threshold_sse(
         line((fixed / SAO_LAMBDA_BAND).max(1)),
         line(fixed.saturating_mul(SAO_LAMBDA_BAND)),
     );
-    bracketed_reachable_sse(fine, coarse, qp, sao_bits, finer)
-        .or_else(|| reachable_sse(fine, coarse, qp, sao_bits))
+    let b = bracketed_reachable_sse(fine, coarse, qp, sao_bits, finer);
+    b.or_else(|| reachable_sse(fine, coarse, qp, sao_bits))
         .unwrap_or_else(|| line(fixed))
         .clamp(lo, hi)
 }

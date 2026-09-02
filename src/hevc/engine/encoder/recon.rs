@@ -824,7 +824,10 @@ fn estimate_sao(
             // because it only sees this CTB.
             let mut best = ResolvedSao::off();
             let mut best_score = score(&best);
-            for candidate in [merges[0], merges[1], Some(standalone)].into_iter().flatten() {
+            for candidate in [merges[0], merges[1], Some(standalone)]
+                .into_iter()
+                .flatten()
+            {
                 let candidate_score = score(&candidate);
                 if candidate_score > best_score {
                     best_score = candidate_score;
