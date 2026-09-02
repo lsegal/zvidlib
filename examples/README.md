@@ -57,7 +57,10 @@ or hard-coded FPS pacing.
 
 The page's controls are play/pause, five-second rewind/fast-forward, previous/next frame stepping,
 and a timeline range input that scrubs when you click or drag it, keeping only the newest requested
-position when a drag outruns the decoder. The whole AAC track is
+position when a drag outruns the decoder. A drag draws every frame it passes rather than only the
+one it lands on: forwards it steps a frame at a time, and backwards it restarts at the random-access
+point at or before the pointer (`VideoStream.randomAccessPoints()`) and walks forwards from there,
+so the picture follows the pointer in both directions. The whole AAC track is
 decoded once into a single `AudioBuffer`, so seeking and scrubbing only reschedule playback from
 the new offset instead of re-running the decoder, and audio keeps playing while you scrub.
 
