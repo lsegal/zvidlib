@@ -97,6 +97,10 @@ enum Command {
     Reset {
         response: SyncSender<Result<Vec<DecodedVideoFrame>>>,
     },
+    SetOutputWanted {
+        wanted: bool,
+        response: SyncSender<Result<Vec<DecodedVideoFrame>>>,
+    },
     Stop,
 }
 
@@ -183,6 +187,14 @@ impl VideoDecoder for NvDecoder {
         self.request(|response| Command::Reset { response })
             .map(|_| ())
     }
+
+    /// Forwards the hint to the worker and waits for it, so that a sample submitted after this
+    /// returns is decoded under the setting the caller asked for. The command channel is FIFO,
+    /// so the wait is not what orders it; it is what keeps a dropped worker visible here rather
+    /// than silently leaving the decoder converting frames nobody wants.
+    fn set_output_wanted(&mut self, wanted: bool) {
+        let _ = self.request(|response| Command::SetOutputWanted { wanted, response });
+    }
 }
 
 impl Drop for NvDecoder {
@@ -212,6 +224,10 @@ fn run_worker(mut core: NvDecoderCore, commands: Receiver<Command>) {
             }
             Command::Reset { response } => {
                 let _ = response.send(core.reset().map(|()| Vec::new()));
+            }
+            Command::SetOutputWanted { wanted, response } => {
+                core.set_output_wanted(wanted);
+                let _ = response.send(Ok(Vec::new()));
             }
             Command::Stop => return,
         }
@@ -245,6 +261,7 @@ impl NvDecoderCore {
             decoder: ptr::null_mut(),
             dimensions: configuration.coded_dimensions,
             max_allocation_bytes: limits.max_allocation_bytes,
+            output_wanted: true,
             frames: Vec::new(),
             error: None,
         });
@@ -305,6 +322,10 @@ impl NvDecoderCore {
         self.take_frames()
     }
 
+    fn set_output_wanted(&mut self, wanted: bool) {
+        self.callback_state.output_wanted = wanted;
+    }
+
     fn reset(&mut self) -> Result<()> {
         self.destroy_parser_and_decoder();
         self.callback_state.frames.clear();
@@ -329,16 +350,26 @@ impl NvDecoderCore {
         let raw_frames = std::mem::take(&mut self.callback_state.frames);
         raw_frames
             .into_iter()
-            .map(|raw| {
-                let presentation_index = self
-                    .presentation_indexes
-                    .pop()
-                    .ok_or_else(|| codec("NVDEC produced a frame without a submitted identity"))?
-                    .0;
-                Ok(DecodedVideoFrame {
-                    presentation_index,
-                    frame: nv12_to_rgba(raw, &self.configuration, &self.limits)?,
-                })
+            .filter_map(|raw| {
+                // Popped for a suppressed picture too: it was displayed, so it owns the identity
+                // at the front of the heap whether or not a frame is built from it.
+                let presentation_index = match self.presentation_indexes.pop() {
+                    Some(Reverse(index)) => index,
+                    None => {
+                        return Some(Err(codec(
+                            "NVDEC produced a frame without a submitted identity",
+                        )));
+                    }
+                };
+                let raw = raw?;
+                Some(
+                    nv12_to_rgba(raw, &self.configuration, &self.limits).map(|frame| {
+                        DecodedVideoFrame {
+                            presentation_index,
+                            frame,
+                        }
+                    }),
+                )
             })
             .collect()
     }
@@ -518,7 +549,14 @@ struct CallbackState {
     decoder: *mut c_void,
     dimensions: VideoDimensions,
     max_allocation_bytes: u64,
-    frames: Vec<RawNv12Frame>,
+    /// Whether the pictures arriving at the display callback are wanted as frames. A suppressed
+    /// picture is still decoded, and still reaches the callback; what it skips is the readback.
+    output_wanted: bool,
+    /// One entry per displayed picture, in display order. A suppressed picture leaves `None`,
+    /// which `take_frames` needs in order to consume that picture's presentation identity: the
+    /// identities are popped one per displayed picture, so dropping an entry outright would
+    /// hand every later frame the index of the one before it.
+    frames: Vec<Option<RawNv12Frame>>,
     error: Option<String>,
 }
 
@@ -652,6 +690,13 @@ unsafe extern "system" fn display_callback(
         if state.decoder.is_null() {
             return Err("NVDEC display callback has no decoder".to_owned());
         }
+        // The picture was decoded and remains a reference for the frames after it; skipping the
+        // map/copy-back/convert below is the whole saving. The placeholder still records that a
+        // picture was displayed, which is what keeps the presentation identities aligned.
+        if !state.output_wanted {
+            state.frames.push(None);
+            return Ok(());
+        }
         let mut processing = CuvidProcParams {
             progressive_frame: display.progressive_frame,
             second_field: 0,
@@ -701,10 +746,10 @@ unsafe extern "system" fn display_callback(
             return Err(format!("NVDEC frame unmap failed: CUDA error {unmapped}"));
         }
         surface_copy.record(readback::Phase::SurfaceCopy);
-        state.frames.push(RawNv12Frame {
+        state.frames.push(Some(RawNv12Frame {
             pitch: pitch as usize,
             data,
-        });
+        }));
         Ok(())
     })();
     match result {
