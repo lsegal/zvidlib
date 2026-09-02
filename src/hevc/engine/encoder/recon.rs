@@ -97,6 +97,17 @@ pub(crate) struct ReconConfig {
     /// reconstruction at [`Self::qp`]. Cleared, the residual is exact and the
     /// reconstruction is the source picture.
     pub quantized_residual: bool,
+    /// Run the band-offset half of the §8.7.3 parameter search.
+    ///
+    /// Always set outside the benchmark harness: clearing it leaves the
+    /// per-CTB decision to the four edge-offset classes alone, which is a
+    /// conformant but worse encode. It exists because the *share* of a
+    /// reconstruction the band search costs is otherwise unmeasurable from
+    /// outside — #382 needed the difference between the whole-picture group
+    /// with the search running and with it skipped, and an estimate was
+    /// exactly what would not settle the question. See
+    /// [`crate::hevc::engine::encoder::recon_simd::band_offset_row`].
+    pub sao_band_search: bool,
 }
 
 impl Default for ReconConfig {
@@ -110,6 +121,7 @@ impl Default for ReconConfig {
             pcm_loop_filter_disabled: true,
             qp: 26,
             quantized_residual: false,
+            sao_band_search: true,
         }
     }
 }
@@ -243,6 +255,7 @@ pub(crate) fn reconstruct_picture(
             cfg.sao_luma,
             cfg.sao_chroma,
             SaoLambda::closed_form(0),
+            cfg.sao_band_search,
         );
         pic = crate::hevc::engine::sao::apply_sao_picture_full(
             pic,
@@ -665,7 +678,7 @@ pub(crate) fn sao_reconstruction(
             *dst = i32::from(src);
         }
     }
-    let grid = estimate_sao(&pic, src, true, true, lambda);
+    let grid = estimate_sao(&pic, src, true, true, lambda, true);
     let pic = crate::hevc::engine::sao::apply_sao_picture_full(
         pic,
         &grid,
@@ -725,6 +738,7 @@ fn estimate_sao(
     sao_luma: bool,
     sao_chroma: bool,
     lambda: SaoLambda,
+    band_search: bool,
 ) -> Vec<ResolvedSao> {
     let w_ctbs = src.width.div_ceil(CTB);
     let h_ctbs = src.height.div_ceil(CTB);
@@ -733,10 +747,10 @@ fn estimate_sao(
         for rx in 0..w_ctbs {
             let cell = &mut grid[ry * w_ctbs + rx];
             if sao_luma {
-                cell.components[0] = best_luma_sao(pic, src, rx, ry, lambda);
+                cell.components[0] = best_luma_sao(pic, src, rx, ry, lambda, band_search);
             }
             if sao_chroma {
-                let [cb, cr] = best_chroma_sao(pic, src, rx, ry, lambda);
+                let [cb, cr] = best_chroma_sao(pic, src, rx, ry, lambda, band_search);
                 cell.components[1] = cb;
                 cell.components[2] = cr;
             }
@@ -1072,11 +1086,19 @@ fn band_stats(
     // The kernel's band shift is fixed to this module's 8-bit geometry.
     debug_assert_eq!(BIT_DEPTH, 8, "band classification assumes 8-bit samples");
     let mut stats = BandStats::default();
-    for y in y0..y1 {
-        let recon = &samples[y * pw + x0..y * pw + x1];
-        let src = &source[y * src_stride + x0..y * src_stride + x1];
-        recon_simd::band_offset_row(recon, src, &mut stats);
-    }
+    // One dispatched call for the whole CTB rather than one per row: #382
+    // measured the per-row shape's `#[target_feature]` call overhead as the
+    // reason the isolated kernel win did not reach this group. See
+    // [`recon_simd::band_offset_rect`].
+    recon_simd::band_offset_rect(
+        &samples[y0 * pw + x0..],
+        pw,
+        &source[y0 * src_stride + x0..],
+        src_stride,
+        x1 - x0,
+        y1 - y0,
+        &mut stats,
+    );
     (stats.sums, stats.counts)
 }
 
@@ -1118,6 +1140,7 @@ fn best_luma_sao(
     rx: usize,
     ry: usize,
     lambda: SaoLambda,
+    band_search: bool,
 ) -> ResolvedSaoComponent {
     let rect = ctb_rect(pic, Plane::Luma, rx, ry);
     let mut best = ResolvedSaoComponent::off();
@@ -1136,6 +1159,9 @@ fn best_luma_sao(
                 eo_class,
             };
         }
+    }
+    if !band_search {
+        return best;
     }
     let (sums, counts) = band_stats(pic, Plane::Luma, src.y, src.width, rect);
     for band_position in 0..32u8 {
@@ -1175,6 +1201,7 @@ fn best_chroma_sao(
     rx: usize,
     ry: usize,
     lambda: SaoLambda,
+    band_search: bool,
 ) -> [ResolvedSaoComponent; 2] {
     let (cb_rect, cr_rect) = (
         ctb_rect(pic, Plane::Cb, rx, ry),
@@ -1210,6 +1237,9 @@ fn best_chroma_sao(
                 },
             ];
         }
+    }
+    if !band_search {
+        return best;
     }
     let cb = best_band_component(pic, Plane::Cb, src.cb, chroma_stride, cb_rect, lambda);
     let cr = best_band_component(pic, Plane::Cr, src.cr, chroma_stride, cr_rect, lambda);
@@ -1447,7 +1477,7 @@ mod tests {
             height: H,
         };
 
-        let grid = estimate_sao(&pic, src, true, true, SaoLambda::closed_form(32));
+        let grid = estimate_sao(&pic, src, true, true, SaoLambda::closed_form(32), true);
         // The first CTB lies wholly inside the biased region.
         let luma = grid[0].components[0];
         assert_eq!(
@@ -1468,6 +1498,79 @@ mod tests {
             3,
             "the band carrying the bias was offset by {} rather than its mean error",
             luma.offset_val[k + 1]
+        );
+    }
+
+    /// The band-search stub is only a measurement instrument if it really
+    /// removes the band half and nothing else. Both halves of that are
+    /// asserted here: with the flag set the same picture takes band offset
+    /// somewhere, and with it cleared no component in the whole grid does —
+    /// so the difference the #382 benchmark subtracts is the band search's
+    /// own cost and not a compiler-elided arm or a search that never reached
+    /// the band candidates in the first place.
+    #[test]
+    fn clearing_the_band_search_leaves_no_band_offset_component() {
+        let _guard = crate::simd::test_lock();
+        let src = source(0);
+        let decision = plan(&src, None);
+        let cfg = ReconConfig {
+            deblocking: true,
+            sao_luma: true,
+            sao_chroma: true,
+            pcm_loop_filter_disabled: false,
+            quantized_residual: true,
+            qp: 37,
+            ..ReconConfig::default()
+        };
+
+        let searched = reconstruct_picture(planes(&src), None, &decision, cfg);
+        let stubbed = reconstruct_picture(
+            planes(&src),
+            None,
+            &decision,
+            ReconConfig {
+                sao_band_search: false,
+                ..cfg
+            },
+        );
+        assert_ne!(
+            searched.y, stubbed.y,
+            "clearing the band search changed no reconstructed sample, so the              arm the benchmark subtracts costs nothing to remove"
+        );
+
+        // Read the grids directly, since the reconstructed planes only show
+        // that *something* moved.
+        let mut pic = Picture::new(
+            searched.width,
+            searched.height,
+            CHROMA_ARRAY_TYPE,
+            BIT_DEPTH,
+            BIT_DEPTH,
+        );
+        for (plane, samples) in [
+            (Plane::Luma, &searched.y),
+            (Plane::Cb, &searched.cb),
+            (Plane::Cr, &searched.cr),
+        ] {
+            let (buf, _) = pic.plane_mut(plane);
+            for (dst, &s) in buf.iter_mut().zip(samples) {
+                *dst = i32::from(s);
+            }
+        }
+        let source_planes = planes(&src);
+        let lambda = SaoLambda::closed_form(0);
+        let with = estimate_sao(&pic, source_planes, true, true, lambda, true);
+        let without = estimate_sao(&pic, source_planes, true, true, lambda, false);
+        assert!(
+            with.iter()
+                .any(|cell| cell.components.iter().any(|c| c.sao_type_idx == 1)),
+            "no CTB of this picture takes band offset even with the search on"
+        );
+        assert!(
+            without
+                .iter()
+                .all(|cell| cell.components.iter().all(|c| c.sao_type_idx != 1)),
+            "a band-offset component survived with the band search cleared"
         );
     }
 
@@ -1600,6 +1703,7 @@ mod tests {
                 sao_chroma: true,
                 pcm_loop_filter_disabled: false,
                 quantized_residual: true,
+                sao_band_search: true,
                 qp,
             };
             crate::simd::set_override(Some(crate::simd::SimdIsa::Scalar));

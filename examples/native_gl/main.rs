@@ -389,7 +389,9 @@ where
             return false;
         }
         match self.frames.take_latest() {
-            Some(frame) => {
+            // The index says whether this is the frame under the pointer or one the walk passed;
+            // either is drawn, so the window ignores it.
+            Some((_, frame)) => {
                 self.upload_frame(event_loop, &frame);
                 true
             }

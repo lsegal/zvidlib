@@ -43,8 +43,9 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use zvidlib::{
-    CancellationToken, EncodedVideoSample, Error, ErrorKind, ExactFrameReader, FrameIndex, Limits,
-    PlaybackVideoSource, Result, VideoDecoderConfig, VideoDecoderFactory, VideoFrame,
+    CancellationToken, DecodeStatistics, EncodedVideoSample, Error, ErrorKind, ExactFrameReader,
+    FrameIndex, Limits, PlaybackVideoSource, Result, VideoDecoderConfig, VideoDecoderFactory,
+    VideoFrame,
 };
 
 /// How many decoded frames the render thread can still collect.
@@ -61,19 +62,55 @@ const DELIVERY_DEPTH: usize = 3;
 /// each one, and on this sample most of them are frames of the start of the movie while the
 /// pointer is at the far end, so the frame that was actually asked for arrived 6.4 s late. Not
 /// publishing any of them is what #355 traded for a 1.7 s arrival - and it left the picture
-/// frozen for those 1.7 s, which is issue #363. A cadence buys back the motion at a bounded
-/// price: about seven pictures a second however long the span is, so the same 613-frame walk
-/// converts a dozen frames rather than 613 and still lands its target within a few percent of
-/// the time it takes to decode nothing else at all.
-const PREVIEW_INTERVAL: Duration = Duration::from_millis(150);
+/// frozen for those 1.7 s, which is issue #363. A cadence buys the motion back, and this is what
+/// it costs.
+///
+/// The value is measured rather than derived. #363 set it to 150 ms by arithmetic - a dozen
+/// published pictures over the 613-frame walk, 4% on top of #354's arrival - and
+/// `examples/scrub_preview_profile.rs`, which walks this service to frame 767 from cold through
+/// VideoToolbox, says the arithmetic was wrong by two orders of magnitude: at 150 ms the walk
+/// converts **765** of the sample's 768 pictures, not a dozen, and the frame under the pointer
+/// arrives in **7.03 s** against **1.25 s** with no previews at all. That is worse than the
+/// 6.4 s #354 was opened for.
+///
+/// The count is what the estimate missed, not the price. Every published picture converts the
+/// frames behind it that fit in the reader's cache as well as itself (`ExactFrameReader`'s
+/// bounded tail, `Limits::max_cached_frames`, 32 by default), so a stride shorter than that tail
+/// converts every frame it passes; measured per converted picture the cost is 5.2 ms to 7.6 ms
+/// across the whole sweep, which is #355's 6.6 ms. Issue #402 tracks the tail itself.
+///
+/// So the interval is set where the sweep stops paying. Arrival against publish spacing, the
+/// fastest of five runs each:
+///
+/// | interval | arrival | published | spacing | converted |
+/// | --- | --- | --- | --- | --- |
+/// | 80 ms | 3.52 s | 34 | 104 ms | 306 |
+/// | 150 ms | 7.03 s | 50 | 141 ms | 765 |
+/// | 400 ms | 3.39 s | 12 | 282 ms | 299 |
+/// | 800 ms | 2.31 s | 7 | 330 ms | 156 |
+/// | 1600 ms | 1.82 s | 5 | 364 ms | 100 |
+/// | 2400 ms | 1.89 s | 5 | 378 ms | 102 |
+///
+/// Past 1.6 s the walk neither arrives sooner nor publishes more - the stride is capped by
+/// [`MAXIMUM_STRIDE`] and the tail is what is left - so 1.6 s is the knee, and it lands the frame
+/// under the pointer in 1.82 s: #354's 1.7 s and about 8%, rather than five times it. It still
+/// publishes five pictures on the way, one every 364 ms, and #374's background preview index
+/// draws a shrunk picture for wherever the pointer is within a frame of the window's regardless,
+/// so what this cadence owes #363 is the full-resolution picture catching up, not the motion
+/// itself.
+const PREVIEW_INTERVAL: Duration = Duration::from_millis(1600);
 
-/// How many frames a walk decodes between published pictures.
+/// How many frames a walk decodes between published pictures at `interval`.
 ///
 /// The first step of a walk has nothing measured to go on and so publishes immediately; after
-/// that the stride is whatever fits in [`PREVIEW_INTERVAL`] at the rate the walk is actually
-/// decoding at, which on this sample climbs from one frame to roughly fifty as the estimate
-/// settles. A decode slower than the interval still moves a frame at a time rather than stalling.
-fn stride_frames(per_frame: Option<Duration>) -> u64 {
+/// that the stride is whatever fits in `interval` at the rate the walk is actually decoding at,
+/// which on this sample climbs from one frame to roughly fifty as the estimate settles. A decode
+/// slower than the interval still moves a frame at a time rather than stalling.
+///
+/// The interval is a parameter rather than [`PREVIEW_INTERVAL`] read directly so that
+/// `examples/scrub_preview_profile.rs` can sweep it over the same walk this module runs; the
+/// window always uses the constant.
+fn stride_frames(interval: Duration, per_frame: Option<Duration>) -> u64 {
     let Some(per_frame) = per_frame else {
         return 1;
     };
@@ -81,7 +118,7 @@ fn stride_frames(per_frame: Option<Duration>) -> u64 {
     if per_frame <= 0.0 {
         return MAXIMUM_STRIDE;
     }
-    let frames = (PREVIEW_INTERVAL.as_secs_f64() / per_frame).floor();
+    let frames = (interval.as_secs_f64() / per_frame).floor();
     (frames as u64).clamp(1, MAXIMUM_STRIDE)
 }
 
@@ -126,12 +163,13 @@ impl KeyframeIndex {
 fn walk_step(
     position: Option<u64>,
     target: u64,
+    interval: Duration,
     per_frame: Option<Duration>,
     keyframes: &KeyframeIndex,
 ) -> u64 {
     match position {
         Some(position) if position < target => {
-            target.min(position.saturating_add(stride_frames(per_frame)))
+            target.min(position.saturating_add(stride_frames(interval, per_frame)))
         }
         Some(position) if position == target => target,
         _ => keyframes.at_or_before(target),
@@ -159,6 +197,15 @@ struct Queue {
     in_flight: Option<CancellationToken>,
     /// What the worker has decoded and the render thread has not collected, oldest first.
     delivered: VecDeque<(u64, VideoFrame)>,
+    /// How many pictures the worker has published, whether or not the render thread collected
+    /// them - a picture dropped from `delivered` still cost its conversion. Counted here rather
+    /// than by the caller because `examples/scrub_preview_profile.rs` charges the cadence by it
+    /// and a poll can miss one.
+    published: u64,
+    /// The reader's counters as of the last decode, so that same profile can tell how many
+    /// pictures a walk converted rather than how many it published: a published picture also
+    /// converts the frames behind it that fit in the reader's cache.
+    statistics: DecodeStatistics,
     /// A decode failure to hand to whichever caller asks next.
     failure: Option<Error>,
     shutdown: bool,
@@ -205,12 +252,25 @@ pub struct FrameService {
 }
 
 impl FrameService {
-    /// Builds a service over its own decoder for the track's samples.
+    /// Builds a service over its own decoder for the track's samples, publishing a drag's
+    /// pictures at [`PREVIEW_INTERVAL`].
     pub fn new(
         factory: &dyn VideoDecoderFactory,
         configuration: VideoDecoderConfig,
         samples: Vec<EncodedVideoSample>,
         limits: Limits,
+    ) -> Result<Self> {
+        Self::with_preview_interval(factory, configuration, samples, limits, PREVIEW_INTERVAL)
+    }
+
+    /// The same service with the publishing cadence named, which is how
+    /// `examples/scrub_preview_profile.rs` sweeps it.
+    pub fn with_preview_interval(
+        factory: &dyn VideoDecoderFactory,
+        configuration: VideoDecoderConfig,
+        samples: Vec<EncodedVideoSample>,
+        limits: Limits,
+        preview_interval: Duration,
     ) -> Result<Self> {
         let keyframes = KeyframeIndex::from_samples(&samples);
         let reader = ExactFrameReader::new(factory, configuration, samples, limits)?;
@@ -218,7 +278,7 @@ impl FrameService {
         let worker_queue = Arc::clone(&queue);
         let worker = thread::Builder::new()
             .name("zvidlib-frame-service".to_string())
-            .spawn(move || decode_frames(&worker_queue, reader, &keyframes))
+            .spawn(move || decode_frames(&worker_queue, reader, &keyframes, preview_interval))
             .map_err(|error| {
                 Error::new(
                     ErrorKind::InvalidInput,
@@ -255,13 +315,31 @@ impl FrameService {
         retargeted
     }
 
-    /// The newest frame the worker has decoded, or `None` rather than waiting for one.
-    pub fn take_latest(&mut self) -> Option<VideoFrame> {
+    /// The newest frame the worker has decoded and its presentation index, or `None` rather
+    /// than waiting for one.
+    ///
+    /// The index is what tells a caller whether the picture it just collected is the frame under
+    /// the pointer or one the walk passed on the way there; the window ignores it and draws
+    /// either, and `examples/scrub_preview_profile.rs` times the walk by it.
+    pub fn take_latest(&mut self) -> Option<(u64, VideoFrame)> {
         let (lock, _) = &*self.queue;
         let mut state = lock.lock().expect("frame queue poisoned");
-        let newest = state.delivered.pop_back().map(|(_, frame)| frame);
+        let newest = state.delivered.pop_back();
         state.delivered.clear();
         newest
+    }
+
+    /// How many pictures the worker has published, and the reader's counters as of its last
+    /// decode. `samples_submitted` less `samples_skipped` is what the walk converted.
+    ///
+    /// The window draws pictures rather than counting them, so this is
+    /// `examples/scrub_preview_profile.rs`'s alone - `allow` rather than `expect` because the
+    /// same module compiles into both targets and it is only dead in this one.
+    #[allow(dead_code)]
+    pub fn published(&self) -> (u64, DecodeStatistics) {
+        let (lock, _) = &*self.queue;
+        let state = lock.lock().expect("frame queue poisoned");
+        (state.published, state.statistics)
     }
 }
 
@@ -320,18 +398,24 @@ impl PlaybackVideoSource for FrameServiceSource {
 /// An exact request - playback's - asks for its frame and nothing else. A preview strides towards
 /// its target instead, publishing a picture roughly every [`PREVIEW_INTERVAL`], so a drag over a
 /// long span keeps moving rather than holding one picture until the span finishes decoding.
+/// `examples/scrub_preview_profile.rs` times this loop; [`PREVIEW_INTERVAL`] records what it
+/// found.
 fn decode_frames(
     queue: &Arc<(Mutex<Queue>, Condvar)>,
     mut reader: ExactFrameReader,
     keyframes: &KeyframeIndex,
+    preview_interval: Duration,
 ) {
     let (lock, condvar) = &**queue;
     // Where the last decoded frame left the reader, so a forward step continues from it rather
     // than starting over at a random-access point.
     let mut position: Option<u64> = None;
-    // What a frame of this track is costing this walk, measured rather than assumed: it is the
-    // difference between the 2.9 ms a decode takes and the 6.6 ms a published picture adds, and
-    // it is what decides how many frames fit in one interval.
+    // What a frame of this track is costing this walk, measured rather than assumed: the 2.9 ms
+    // a decode takes plus whatever share of a published picture's conversion the step carries,
+    // and it is what decides how many frames fit in one interval. It is a feedback loop, which
+    // is why the sweep in [`PREVIEW_INTERVAL`] is not monotonic: a shorter interval shortens the
+    // stride, a shorter stride converts a larger fraction of what it passes, and that lengthens
+    // the per-frame estimate the next stride is computed from.
     let mut per_frame: Option<Duration> = None;
     loop {
         let (mut target, mut preview, mut cancellation) = {
@@ -350,7 +434,7 @@ fn decode_frames(
         };
         loop {
             let step = if preview {
-                walk_step(position, target, per_frame, keyframes)
+                walk_step(position, target, preview_interval, per_frame, keyframes)
             } else {
                 target
             };
@@ -384,6 +468,8 @@ fn decode_frames(
                         state.delivered.pop_front();
                     }
                     state.delivered.push_back((step, frame));
+                    state.published = state.published.saturating_add(1);
+                    state.statistics = reader.statistics();
                 }
                 Err(error) if error.kind() == ErrorKind::Cancelled => {
                     // Superseded part-way through, so the reader stopped between frames and the
@@ -589,7 +675,7 @@ mod tests {
         let drawn = wait_for(|| {
             frames
                 .take_latest()
-                .map(|frame| frame.planes[0].data[0])
+                .map(|(_, frame)| frame.planes[0].data[0])
                 .filter(|index| *index == 8)
         });
         assert_eq!(
@@ -643,7 +729,11 @@ mod tests {
 
         // Enough decoding for the frames before the target, and the picture has already moved.
         grant(&gate, 8);
-        let early = wait_for(|| frames.take_latest().map(|frame| frame.planes[0].data[0]));
+        let early = wait_for(|| {
+            frames
+                .take_latest()
+                .map(|(_, frame)| frame.planes[0].data[0])
+        });
         assert!(
             early.is_some_and(|index| index < 9),
             "a preview draws something on the way to its target, not only the target"
@@ -653,7 +743,7 @@ mod tests {
         let arrived = wait_for(|| {
             frames
                 .take_latest()
-                .map(|frame| frame.planes[0].data[0])
+                .map(|(_, frame)| frame.planes[0].data[0])
                 .filter(|index| *index == 9)
         });
         assert_eq!(
@@ -700,31 +790,48 @@ mod tests {
 
     #[test]
     fn a_stride_is_what_fits_in_one_publishing_interval() {
+        // Pinned rather than [`PREVIEW_INTERVAL`]: what is under test is that a stride follows
+        // whatever interval it is handed, and the shipped one is a measurement that moves.
+        const INTERVAL: Duration = Duration::from_millis(150);
         // Nothing measured yet: publish the first picture immediately and measure from it.
-        assert_eq!(stride_frames(None), 1);
-        // 30 ms a frame fits five of them in the 150 ms interval.
-        assert_eq!(stride_frames(Some(Duration::from_millis(30))), 5);
+        assert_eq!(stride_frames(INTERVAL, None), 1);
+        // 30 ms a frame fits five of them in a 150 ms interval.
+        assert_eq!(stride_frames(INTERVAL, Some(Duration::from_millis(30))), 5);
+        // The interval is the knob issue #379's profile sweeps, so the stride follows it: the
+        // same decoding rate covers twice the frames in twice the time.
+        assert_eq!(
+            stride_frames(Duration::from_millis(300), Some(Duration::from_millis(30))),
+            10
+        );
         // A frame slower than the whole interval still moves, one frame at a time.
-        assert_eq!(stride_frames(Some(Duration::from_millis(400))), 1);
+        assert_eq!(stride_frames(INTERVAL, Some(Duration::from_millis(400))), 1);
         // And an unmeasurably fast one still publishes rather than jumping a whole track blind.
-        assert_eq!(stride_frames(Some(Duration::from_nanos(1))), MAXIMUM_STRIDE);
-        assert_eq!(stride_frames(Some(Duration::ZERO)), MAXIMUM_STRIDE);
+        assert_eq!(
+            stride_frames(INTERVAL, Some(Duration::from_nanos(1))),
+            MAXIMUM_STRIDE
+        );
+        assert_eq!(
+            stride_frames(INTERVAL, Some(Duration::ZERO)),
+            MAXIMUM_STRIDE
+        );
     }
 
     #[test]
     fn a_walk_continues_forwards_and_restarts_backwards() {
         let keyframes = KeyframeIndex::from_samples(&samples(12, 4));
+        // Five frames a step, as `a_stride_is_what_fits_in_one_publishing_interval` pins.
+        const INTERVAL: Duration = Duration::from_millis(150);
         let rate = Some(Duration::from_millis(30));
         // Ahead of the reader: continue from where it is, one stride at a time.
-        assert_eq!(walk_step(Some(2), 11, rate, &keyframes), 7);
+        assert_eq!(walk_step(Some(2), 11, INTERVAL, rate, &keyframes), 7);
         // Never past the target itself.
-        assert_eq!(walk_step(Some(2), 5, rate, &keyframes), 5);
+        assert_eq!(walk_step(Some(2), 5, INTERVAL, rate, &keyframes), 5);
         // Already there.
-        assert_eq!(walk_step(Some(5), 5, rate, &keyframes), 5);
+        assert_eq!(walk_step(Some(5), 5, INTERVAL, rate, &keyframes), 5);
         // Behind the reader, or a position a cancelled decode left unknown: restart at the
         // random-access point the target decodes from, which is the first frame it can publish.
-        assert_eq!(walk_step(Some(11), 6, rate, &keyframes), 4);
-        assert_eq!(walk_step(None, 6, rate, &keyframes), 4);
+        assert_eq!(walk_step(Some(11), 6, INTERVAL, rate, &keyframes), 4);
+        assert_eq!(walk_step(None, 6, INTERVAL, rate, &keyframes), 4);
     }
 
     #[test]

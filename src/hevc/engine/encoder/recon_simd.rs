@@ -451,6 +451,13 @@ const BAND_SHIFT: i32 = 3;
 /// smallest at 16 samples, but it was not itself measured and is not the reason
 /// the kernel is unlanded. The measured whole-picture result is.
 ///
+/// **#382 has since measured both of those candidate causes, and neither is the
+/// reason.** The band search is 23-29% of this group's `avx2` arm rather than a
+/// negligible share, and calling the kernel once per CTB instead of once per
+/// row is a *larger* regression than calling it per row. See
+/// [`band_offset_rect`] for both figures and for where a future attempt should
+/// start instead.
+///
 /// **No x86_64 kernel is dispatched to**, the same call
 /// [`crate::hevc::engine::simd::combine_weighted`] got at four lanes and the
 /// same one #305 made for NEON. Both x86 shapes stay behind `#[cfg(test)]` as
@@ -474,6 +481,103 @@ pub(crate) fn band_offset_row(here: &[i32], src: &[u8], stats: &mut BandStats) {
     // x86 kernels that do separate in isolation do not separate in the encoder.
     // See above for both measurements.
     band_offset_row_scalar(here, src, stats);
+}
+
+/// One CTB of the §8.7.3.2 band classification, dispatched once for the whole
+/// rectangle rather than once per row.
+///
+/// # The call shape #382 measured
+///
+/// [`band_offset_row`] records that the lane-scatter kernel reads 1.10-1.53x
+/// against the scalar reference in `bench_band_offset_row` and 1.00x (Intel) to
+/// 0.94-0.99x (AMD) in `hevc_encode_640x352_reconstruct`, and names two
+/// candidate causes it could not separate: a `#[target_feature]` call the
+/// compiler cannot inline, landing on a 16-to-64-sample run too short to
+/// amortize it, or a band search too small a share of a reconstruction for any
+/// ratio on it to show.
+///
+/// #382 measured both, and **neither survives.**
+///
+/// The share was taken by timing the reconstruction group with the band half of
+/// the search skipped - that is what `hevc_encode_*_reconstruct_no_band_search`
+/// exists for - on six `ubuntu-latest` draws and one `macos-15-intel`, five
+/// interleaved rounds each. The band search is **23-29% of this group's `avx2`
+/// arm** on every CPU model timed, against a 1-6% round-to-round spread. A
+/// 1.10-1.53x on work that large is several percent end to end, which the
+/// harness resolves; it did not appear, so the denominator is not the problem.
+///
+/// The call shape was then tested by *being* this entry: the rows of a CTB are
+/// walked inside one `#[target_feature]` entry, so a 16x16 luma CTB pays one
+/// non-inlinable call rather than sixteen and an 8x8 chroma CTB one rather than
+/// eight, over the same lane-scatter body. Paired branch-against-base, both
+/// trees built and timed on one host, interleaved within a round:
+///
+/// | CPU model | draws | `avx2` | `sse4.1` | `scalar` (control) |
+/// |---|---|---|---|---|
+/// | Intel Xeon Platinum 8573C | 1 | 1.023x | 1.015x | 1.010x |
+/// | AMD EPYC 7763 | 6 | 0.966-1.003x | 0.993-1.007x | 1.001-1.015x |
+/// | AMD EPYC 9V74 | 5 | 0.872-0.891x | 0.974-0.992x | 1.006-1.008x |
+///
+/// **It is worse, not better.** On Zen 5 the once-per-CTB shape reads
+/// 0.872-0.891x across five draws where the once-per-row shape read
+/// 0.94-0.95x: removing fifteen of every sixteen calls made the kernel *more*
+/// expensive, which is the opposite of what a call-overhead account predicts.
+/// On Intel it does not separate from its own control, the same answer the
+/// per-row shape gave.
+///
+/// So the site is not what is costing the kernel its isolated win. What the two
+/// measurements together say is that `bench_band_offset_row` does not measure
+/// the encoder's work - it runs one L1-resident run of up to 1024 samples back
+/// to back with `stats` hot and the branch fully predicted, where this loop
+/// classifies CTB windows of a picture-sized plane interleaved with prediction,
+/// the transform round trip and two in-loop filters, reloading `stats` per CTB.
+/// **A third call shape is not what would make that transfer**; the untested
+/// idea is a different decomposition, one keeping the 32-band accumulators in
+/// registers across a whole CTB rather than in 32 memory slots re-read per row,
+/// and that is a different kernel rather than this one re-shaped.
+///
+/// This entry is therefore kept, resolving to the scalar reference on every
+/// instruction set, so a future attempt starts from the once-per-CTB shape
+/// without re-deriving that the once-per-row one is not the cost. Both x86 rect
+/// kernels stay `#[cfg(test)]` beside the six once-per-row candidates, asserted
+/// bit-exact, as the apparatus the figures above were taken with.
+///
+/// `here_stride` and `src_stride` are the two planes' own row pitches; `here`
+/// and `src` start at the rectangle's first sample.
+///
+/// # Panics
+/// Panics unless both planes hold `height` rows of at least `width` samples
+/// from the given origins.
+pub(crate) fn band_offset_rect(
+    here: &[i32],
+    here_stride: usize,
+    src: &[u8],
+    src_stride: usize,
+    width: usize,
+    height: usize,
+    stats: &mut BandStats,
+) {
+    if width == 0 || height == 0 {
+        return;
+    }
+    assert!(
+        here.len() >= (height - 1) * here_stride + width,
+        "reconstruction rectangle runs past the plane"
+    );
+    assert!(
+        src.len() >= (height - 1) * src_stride + width,
+        "source rectangle runs past the plane"
+    );
+    // Every instruction set resolves to the scalar reference: the once-per-CTB
+    // shape was measured against it and is a regression, worse on Zen 5 than
+    // the once-per-row shape it was meant to repair. See above.
+    for y in 0..height {
+        band_offset_row_scalar(
+            &here[y * here_stride..y * here_stride + width],
+            &src[y * src_stride..y * src_stride + width],
+            stats,
+        );
+    }
 }
 
 /// The portable reference for [`band_offset_row`], and the implementation it
@@ -765,7 +869,6 @@ mod x86 {
     /// measurement separates the scatter from the classification rather than
     /// from two different classifications.
     #[inline]
-    #[cfg(test)]
     #[target_feature(enable = "avx2")]
     unsafe fn band_classify8_avx2(here: *const i32, src: *const u8) -> (__m256i, __m256i) {
         unsafe {
@@ -817,7 +920,6 @@ mod x86 {
         }
     }
 
-    #[cfg(test)]
     /// Candidate B on AVX2: classify eight samples in the vector unit, then
     /// scatter them straight out of the lanes with `vpextrd` rather than
     /// through the staging buffers [`band_offset_row_avx2_staged`] uses.
@@ -827,6 +929,7 @@ mod x86 {
     /// its isolated 1.10-1.53x does not reach the whole-picture group, which
     /// reads 1.00x on Intel and 0.94-0.99x on AMD. See
     /// [`super::band_offset_row`].
+    #[inline]
     #[target_feature(enable = "avx2")]
     pub(super) unsafe fn band_offset_row_avx2_lanes(
         here: &[i32],
@@ -860,6 +963,54 @@ mod x86 {
                 i += 8;
             }
             super::band_offset_row_scalar(&here[i..], &src[i..], stats);
+        }
+    }
+
+    #[cfg(test)]
+    /// One CTB of [`band_offset_row_avx2_lanes`] under a single
+    /// `#[target_feature]` entry.
+    ///
+    /// This is the once-per-CTB call shape #382 tested the call-overhead
+    /// explanation with: the rows are walked inside the vector entry, so a
+    /// 16x16 luma CTB pays one non-inlinable call instead of sixteen. See
+    /// [`super::band_offset_rect`] for what that bought.
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn band_offset_rect_avx2(
+        here: &[i32],
+        here_stride: usize,
+        src: &[u8],
+        src_stride: usize,
+        width: usize,
+        height: usize,
+        stats: &mut BandStats,
+    ) {
+        unsafe {
+            for y in 0..height {
+                let recon = &here[y * here_stride..y * here_stride + width];
+                let source = &src[y * src_stride..y * src_stride + width];
+                band_offset_row_avx2_lanes(recon, source, stats);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    /// [`band_offset_rect_avx2`] at four lanes.
+    #[target_feature(enable = "sse4.1")]
+    pub(super) unsafe fn band_offset_rect_sse41(
+        here: &[i32],
+        here_stride: usize,
+        src: &[u8],
+        src_stride: usize,
+        width: usize,
+        height: usize,
+        stats: &mut BandStats,
+    ) {
+        unsafe {
+            for y in 0..height {
+                let recon = &here[y * here_stride..y * here_stride + width];
+                let source = &src[y * src_stride..y * src_stride + width];
+                band_offset_row_sse41_lanes(recon, source, stats);
+            }
         }
     }
 
@@ -1008,7 +1159,6 @@ mod x86 {
     }
 
     /// The four-lane classification behind the two SSE4.1 candidates.
-    #[cfg(test)]
     #[inline]
     #[target_feature(enable = "sse4.1")]
     unsafe fn band_classify4_sse41(here: *const i32, src: *const u8) -> (__m128i, __m128i) {
@@ -1053,10 +1203,10 @@ mod x86 {
         }
     }
 
-    #[cfg(test)]
     /// Candidate B at four lanes: the SSE4.1 classification scattered straight
     /// out of the lanes, the narrower form of [`band_offset_row_avx2_lanes`].
     /// Not dispatched to, for the same measured reason.
+    #[inline]
     #[target_feature(enable = "sse4.1")]
     pub(super) unsafe fn band_offset_row_sse41_lanes(
         here: &[i32],
@@ -1301,6 +1451,107 @@ mod tests {
             }
         }
         simd::set_override(None);
+    }
+
+    /// The strided rectangles the #382 call-shape measurement was taken over,
+    /// and the row-by-row scalar answer every arm has to reproduce.
+    ///
+    /// Strides wider than the rectangle are the case that matters: a CTB is a
+    /// window into a plane, so the rows a rect call walks are not contiguous,
+    /// and a kernel that ignored the pitch would still pass on a full-width
+    /// rectangle. The widths straddle both vector steps and the heights cover
+    /// luma and chroma CTBs.
+    fn band_rect_fixture(width: usize, height: usize) -> (Vec<i32>, Vec<u8>, BandStats) {
+        const STRIDE: usize = BAND_RECT_STRIDE;
+        let mut here = samples(0x7777_8888_9999_aaaa, STRIDE * height);
+        for (i, value) in here.iter_mut().enumerate() {
+            *value = (i as i32 * 7) % 300 - 12;
+        }
+        let src = bytes(0x0123_4567_89ab_cdef, STRIDE * height);
+        let mut expected = BandStats::default();
+        for y in 0..height {
+            band_offset_row_scalar(
+                &here[y * STRIDE..y * STRIDE + width],
+                &src[y * STRIDE..y * STRIDE + width],
+                &mut expected,
+            );
+        }
+        (here, src, expected)
+    }
+
+    /// The pitch [`band_rect_fixture`] lays its rows out at, wider than every
+    /// rectangle measured against it.
+    const BAND_RECT_STRIDE: usize = 71;
+
+    /// The rectangles both the dispatch test and the x86 kernel test cover.
+    const BAND_RECTS: &[(usize, usize)] = &[
+        (1, 1),
+        (3, 2),
+        (4, 4),
+        (7, 3),
+        (8, 8),
+        (16, 16),
+        (17, 5),
+        (64, 4),
+    ];
+
+    /// The once-per-CTB entry has to give the row-by-row answer under every
+    /// pin, the same way the once-per-row entry does.
+    #[test]
+    fn the_band_offset_rect_matches_the_row_reference_on_every_instruction_set() {
+        let _guard = simd::test_lock();
+        const STRIDE: usize = BAND_RECT_STRIDE;
+        for &(width, height) in BAND_RECTS {
+            let (here, src, expected) = band_rect_fixture(width, height);
+            for isa in simd::available() {
+                simd::set_override(Some(isa));
+                let mut got = BandStats::default();
+                band_offset_rect(&here, STRIDE, &src, STRIDE, width, height, &mut got);
+                assert_eq!(
+                    got,
+                    expected,
+                    "{} band rect {width}x{height} at stride {STRIDE}",
+                    isa.name()
+                );
+            }
+        }
+        simd::set_override(None);
+    }
+
+    /// The once-per-CTB x86 kernels are not dispatched to - #382 measured them
+    /// as a regression - so nothing else reaches them. They are still asserted
+    /// bit-exact here, for the same reason the once-per-row candidates are:
+    /// the figures recorded for them have to be figures for kernels that would
+    /// have been correct to land.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_x86_band_offset_rect_kernels_match_the_row_reference() {
+        const STRIDE: usize = BAND_RECT_STRIDE;
+        for &(width, height) in BAND_RECTS {
+            let (here, src, expected) = band_rect_fixture(width, height);
+            if is_x86_feature_detected!("sse4.1") {
+                let mut got = BandStats::default();
+                // SAFETY: SSE4.1 is detected, and the rectangle lies inside
+                // both planes.
+                unsafe {
+                    x86::band_offset_rect_sse41(
+                        &here, STRIDE, &src, STRIDE, width, height, &mut got,
+                    );
+                }
+                assert_eq!(got, expected, "sse4.1 rect {width}x{height}");
+            }
+            if is_x86_feature_detected!("avx2") {
+                let mut got = BandStats::default();
+                // SAFETY: AVX2 is detected, and the rectangle lies inside both
+                // planes.
+                unsafe {
+                    x86::band_offset_rect_avx2(
+                        &here, STRIDE, &src, STRIDE, width, height, &mut got,
+                    );
+                }
+                assert_eq!(got, expected, "avx2 rect {width}x{height}");
+            }
+        }
     }
 
     #[test]

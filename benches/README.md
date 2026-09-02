@@ -853,6 +853,96 @@ out roughly even on Apple Silicon, where LLVM auto-vectorizes the scalar code
 well under `lto = "fat"`, while AV1 deblocking and motion compensation on the
 same host are 2.4-4.9x. `active_by_site()` answers the question directly.
 
+## What a drag preview costs the frame under the pointer
+
+The other profiling example measures an interaction rather than a codec.
+Dragging `native_gl`'s timeline bar walks a background decoder towards the frame
+under the pointer and publishes pictures on the way, so the drag keeps moving
+(issue #363); `PREVIEW_INTERVAL` in `examples/native_gl/scrub.rs` is how often it
+publishes. That interval was arithmetic — a dozen pictures over the 613-frame
+walk issue #354 timed at 1.7 s, about 4% on top — and issue #379 is what
+happened when it was measured.
+
+`examples/scrub_preview_profile.rs` drives the same `FrameService` the window
+drives, over the same bundled sample through the same hardware decoder, with no
+window and no renderer in the way:
+
+```sh
+cargo run --release --features native --example scrub_preview_profile
+cargo run --release --features native --example scrub_preview_profile -- 5
+cargo run --release --features native --example scrub_preview_profile -- 3 80 150 400
+```
+
+The first argument is runs per arm and the rest are cadences in milliseconds.
+Each arm builds its own service, so every walk starts from a cold decoder, and
+each reports the fastest of its runs: the decoder is shared hardware and
+anything else on the host only ever adds time. Its baseline arm is playback's
+exact request, which publishes nothing on the way to its target — what the drag
+did between #355 and #363 — so the overhead each cadence reports is measured
+against the same decoder in the same process.
+
+### The sweep
+
+Walking to frame 767 of `examples/media/BigBuckBunny.mp4` from cold on an Apple
+Silicon host (M1, 8 cores) through VideoToolbox, `--release`, fastest of five
+runs per arm. No previews at all: **1.25 s**, one picture.
+
+| interval | arrival | published | spacing | converted | overhead | per convert |
+| --- | --- | --- | --- | --- | --- | --- |
+| 80 ms | 3.52 s | 34 | 104 ms | 306 | 182% | 7.4 ms |
+| 150 ms | 7.03 s | 50 | 141 ms | 765 | 463% | 7.6 ms |
+| 250 ms | 5.56 s | 24 | 232 ms | 578 | 345% | 7.5 ms |
+| 400 ms | 3.39 s | 12 | 282 ms | 299 | 171% | 7.2 ms |
+| 600 ms | 2.38 s | 8 | 297 ms | 173 | 91% | 6.5 ms |
+| 800 ms | 2.31 s | 7 | 330 ms | 156 | 85% | 6.8 ms |
+| 1200 ms | 2.18 s | 6 | 363 ms | 129 | 74% | 7.2 ms |
+| 1600 ms | 1.82 s | 5 | 364 ms | 100 | 43% | 5.5 ms |
+| 2400 ms | 1.89 s | 5 | 378 ms | 102 | 51% | 6.3 ms |
+
+`published` is what the service published, counted by the service rather than by
+what the harness collected — a picture the render thread never draws still cost
+its conversion. `converted` is what the walk converted to RGBA, which is the
+larger number and the one the time goes into, and `spacing` is arrival divided
+by publishes: how often the picture under the pointer actually moves, which is
+what #363 asked for.
+
+### What it says
+
+**The 4% estimate was wrong by two orders of magnitude, and the per-picture
+price was not what it got wrong.** Per converted picture the cost is 5.2 ms to
+7.6 ms across the whole sweep, which is the 6.6 ms #355 measured through the
+`hevc_hardware_readback` seam. What the estimate missed is the count: the
+150 ms cadence converts **765** of the sample's 768 pictures on one walk, not a
+dozen, and the frame under the pointer arrives in 7.03 s rather than 1.7 s —
+worse than the 6.4 s issue #354 was opened for.
+
+The count is the reader's cache tail. `ExactFrameReader::get` keeps the frames
+immediately behind its target as well as the target, as many as
+`Limits::max_cached_frames` holds (32 by default), which is what makes stepping
+backwards free after a seek. A preview walk calls `get` once per published
+picture and pays that tail every time, so a stride shorter than the tail
+converts everything it passes and the walk is back to #354's behaviour by a
+different route. Issue #402 tracks the tail; the cadence can only work around
+it.
+
+Working around it is what `PREVIEW_INTERVAL` now does. It is 1.6 s, the knee:
+past it the walk neither arrives sooner nor publishes more — the stride is
+capped by `MAXIMUM_STRIDE` and the tail is what remains — and at it the frame
+under the pointer arrives in 1.82 s, #354's 1.7 s and about 8%, while the walk
+still publishes five pictures at 364 ms apart. The motion #363 asked for is not
+lost with it: since issue #374 a background pass keeps a shrunk picture every
+half second of the track, and a drag draws one for wherever the pointer is
+within a frame of the window's, so what this cadence owes #363 is the
+full-resolution picture catching up rather than the movement itself.
+
+The sweep is not monotonic, and that is the same mechanism seen from the
+outside: the stride is computed from the walk's own measured per-frame rate,
+that rate includes the conversions the step paid for, and a shorter stride
+converts a larger fraction of what it passes. Shortening the interval lengthens
+the per-frame estimate the next stride is computed from, so 80 ms and 400 ms
+land on similar strides from opposite directions while 150 ms sits in the
+region where every frame is converted.
+
 ## The audio container path
 
 `cargo bench --bench audio_mux` measures the audio write and read paths in two
@@ -2211,6 +2301,106 @@ If you re-time this, re-time it the same way: a branch-against-base ratio taken
 on one host with the arms interleaved, with the `scalar` arm read as a control.
 A recorded absolute figure from another draw is not a comparison - the four
 models above differ by more than the effect.
+
+#### Why the isolated ratio did not reach this group (issue #382)
+
+The two measurements above disagree, and #340 recorded two candidate reasons
+without separating them: either the band search is too small a share of a
+reconstruction for any ratio on it to show, or the classification is worth
+vectorizing here and only the *call shape* is wrong, a `#[target_feature]`
+kernel being uninlinable into a caller that invokes it once per 16-to-64-sample
+CTB row. The two have opposite consequences - the first says no kernel at this
+site can ever pay, the second says the site needs a different call - so the
+question had to be settled by measurement rather than argument.
+
+**The share is a measured number.** `hevc_encode_*_reconstruct_no_band_search`
+is the same reconstruction with the band half of the §8.7.3 search skipped, so
+the per-CTB decision is the four edge-offset classes against SAO off. Both arms
+are built and timed in one criterion process on one host, five interleaved
+rounds, per-benchmark minimum; the difference is what the band search costs.
+Six `ubuntu-latest` draws plus one `macos-15-intel`, grouped by CPU model as
+every x86_64 table here has to be:
+
+| CPU model | draws | `hevc_encode_640x352_reconstruct` | `avx2` share | `scalar` share |
+|---|---|---|---|---|
+| Intel Xeon Platinum 8573C | 2 | 3.90-4.47 ms | 25.4%, 23.2% | 9.9%, 10.0% |
+| Intel Core i7-8700B | 1 | 7.49 ms | 28.8% | 8.5% |
+| AMD EPYC 7763 | 1 | 4.72 ms | 26.2% | 12.7% |
+| AMD EPYC 9V45 | 1 | 2.69 ms | 28.8% | 9.8% |
+| AMD EPYC 9V74 | 2 | 4.77-4.81 ms | 27.5%, 28.9% | 13.9%, 12.8% |
+
+**So the first explanation is refuted.** The band search is roughly a quarter
+of the vectorized arm of this group on every model timed, against a
+round-to-round spread of 1-6% on the `ubuntu-latest` hosts. A 1.10-1.53x on
+work that big is several percent end to end, which this harness resolves. It
+did not appear, so the missing win is not a missing denominator.
+
+Read the two share columns together rather than either alone. The band search
+is scalar in both, so the `scalar` column's 8-14% is its share of a
+reconstruction whose *other* stages are also scalar, and the `avx2` column's
+23-29% is its share once prediction, the transform round trip, deblocking and
+the SAO filter itself have been vectorized around it. The second number is the
+one that matters for a kernel decision, and it is the one that grew: pinning
+everything else made the unvectorized band search the largest single item in
+the group. The `_quantized` arms read 8.6-11.6% for the same reason in
+reverse - the transform round trip they add is a large scalar-and-vector cost
+the band search is then a smaller fraction of.
+
+The `macos-15-intel` draw agrees on the share and should be read only for it:
+that host's round-to-round spread is 24-51%, against 1-6% on `ubuntu-latest`,
+so its minimum is a floor rather than a measurement.
+
+**The call shape is not the reason either.** That left the second explanation,
+which is testable directly: give the kernel a call shape whose per-call cost is
+amortized over a whole CTB instead of one row. `band_offset_rect` is that
+shape - the rows of a CTB are walked *inside* one `#[target_feature]` entry, so
+a 16x16 luma CTB pays one non-inlinable call rather than sixteen and an 8x8
+chroma CTB one rather than eight, over the same lane-scatter body #340 timed.
+Measured the same way the per-row shape was, as a paired branch-against-base
+comparison with both trees built and timed on one host and interleaved within a
+round, five rounds per draw:
+
+| CPU model | draws | `avx2` | `sse4.1` | `scalar` (control) |
+|---|---|---|---|---|
+| Intel Xeon Platinum 8573C | 1 | 1.023x | 1.015x | 1.010x |
+| AMD EPYC 7763 | 6 | 0.966-1.003x | 0.993-1.007x | 1.001-1.015x |
+| AMD EPYC 9V74 | 5 | 0.872-0.891x | 0.974-0.992x | 1.006-1.008x |
+
+**It is worse, not better.** On Zen 5 the once-per-CTB shape reads 0.872-0.891x
+across five independent draws where the once-per-row shape read 0.94-0.95x:
+removing fifteen of every sixteen calls made the kernel *more* expensive, which
+is the opposite of what a call-overhead account predicts and enough on its own
+to refute it. On EPYC 7763 it reproduces the per-row figure, sitting 1-4% under
+that draw's own control. On the one readable Intel draw it is 1.023x against a
+1.010x control - no separation, the same answer the per-row shape's 1.00x gave.
+
+A twelfth draw, on `macos-15-intel` (Intel Core i7-8700B), is **discarded rather
+than reported**: its `scalar` control read 1.172x, and a control that moves 17%
+where it must read 1.00x says the host was not quiet enough for a several-percent
+effect. That is the control doing its job. The same host's spread disqualified it
+from the share table above for the same reason.
+
+**So neither candidate cause survives, and the site is not the problem.** What
+the two measurements together say is that the isolated harness is not measuring
+the encoder's work: `bench_band_offset_row` runs one L1-resident run of up to
+1024 samples back to back with `stats` hot and the branch fully predicted, and
+the reconstruction loop runs the same classification over CTB windows of a
+picture-sized plane, interleaved with prediction, the transform round trip and
+two in-loop filters, with `stats` reloaded per CTB and the band histogram
+competing for cache with everything else in the stage. The 1.10-1.53x is a real
+figure for the loop it was taken in and does not transfer, and a third call
+shape is not what would make it transfer.
+
+**Do not spend another attempt on this dispatch site.** The remaining
+untested idea is not a call shape but a different decomposition - deriving the
+32-band histogram for a whole CTB in one pass that keeps its accumulators in
+registers across rows, rather than 32 memory accumulators re-read per row - and
+that is a different kernel, not this one re-shaped. `band_offset_rect` is kept
+as the site's entry point precisely so a future attempt starts from the
+once-per-CTB shape without re-deriving that the once-per-row one is not what is
+costing it; both x86 rect kernels stay `#[cfg(test)]` alongside the six
+once-per-row candidates, asserted bit-exact, as the apparatus these figures
+were taken with.
 
 **AVX-512 was timed and does not separate even in isolation.**
 `ubuntu-latest` draws AVX-512CD hosts, so the `vpconflictd` shape #305 pointed
