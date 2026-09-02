@@ -58,9 +58,10 @@ jobs:
       # kernel the inliner declines to absorb into its wrapper is compiled at
       # the baseline instruction set and runs several times slower than the
       # scalar code it replaces, with every test still passing (#336). This
-      # greps that out of the emitted assembly. It runs here rather than in the
-      # matrix job because this is the x86_64 runner: on aarch64 NEON is in the
-      # baseline and the defect leaves no trace.
+      # greps that out of the emitted assembly. One x86_64 host is enough and
+      # this job is one: on the matrix's aarch64 macOS runner NEON is in the
+      # baseline, so a kernel that lost its attribute still compiles to NEON and
+      # leaves no trace, and `macos-15-intel` would only repeat what runs here.
       - name: Check the SIMD kernels kept their target feature
         run: python3 .github/scripts/check_simd_target_features.py build
       - name: Test library units
