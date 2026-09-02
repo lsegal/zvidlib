@@ -5,13 +5,15 @@
 //! memory, and browser-owned objects are retained only as JavaScript handles.
 
 use crate::io::MemorySource;
-use crate::web_decoder::{WebVideoDecodeSession, video_frame_durations_ms};
+use crate::web_decoder::{
+    WebVideoDecodeSession, video_frame_durations_ms, video_random_access_points,
+};
 use crate::{
     AudioBuffer as CoreAudioBuffer, CancellationToken, ColorRange, ErrorKind,
     FrameIndex as CoreFrameIndex, FrameRate, Limits, PixelFormat, Plane, Rational as CoreRational,
     SampleRange as CoreSampleRange, Timeline, VideoDimensions, VideoFrame as CoreVideoFrame,
 };
-use js_sys::{BigInt, Float32Array, Promise, Reflect, Uint8Array};
+use js_sys::{Array, BigInt, Float32Array, Promise, Reflect, Uint8Array};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use wasm_bindgen::JsCast;
@@ -670,6 +672,8 @@ pub struct WasmVideoStream {
     decode_session: Rc<RefCell<Option<WebVideoDecodeSession>>>,
     /// Lazily-parsed per-presentation-frame durations in milliseconds.
     frame_durations_ms: Rc<RefCell<Option<Vec<f64>>>>,
+    /// Lazily-parsed presentation indices of the track's random-access samples, ascending.
+    random_access_points: Rc<RefCell<Option<Vec<u64>>>>,
 }
 
 #[wasm_bindgen(js_class = VideoStream)]
@@ -729,6 +733,51 @@ impl WasmVideoStream {
                 .ok_or_else(|| {
                     js_error(ErrorKind::InvalidInput, "presentation frame is not indexed")
                 })
+        })
+    }
+
+    /// Returns the presentation indices this track's decoding can start from, ascending, as an
+    /// array of `BigInt`s.
+    ///
+    /// A caller that has to move the picture backwards - scrubbing a timeline is the one that
+    /// motivated this - cannot walk there frame by frame, because decoding only runs forwards. It
+    /// restarts at the random-access point at or before its target and walks forwards from there
+    /// instead, drawing what it passes, which is what keeps a backwards drag moving rather than
+    /// frozen for the length of a whole group of pictures.
+    #[wasm_bindgen(js_name = randomAccessPoints)]
+    pub fn random_access_points(&self, signal: Option<AbortSignal>) -> Promise {
+        let state = Rc::clone(&self.state);
+        let direction = self.direction;
+        let index = self.index;
+        let bytes = self.bytes.clone();
+        let points = Rc::clone(&self.random_access_points);
+        future_to_promise(async move {
+            ensure_open(&state)?;
+            check_signal(signal.as_ref())?;
+            if direction != StreamDirection::Input {
+                return Err(js_error(
+                    ErrorKind::InvalidState,
+                    "randomAccessPoints is only valid on an input video stream",
+                ));
+            }
+            let bytes = bytes.ok_or_else(|| {
+                js_error(
+                    ErrorKind::Unsupported,
+                    "input video timing metadata is unavailable",
+                )
+            })?;
+            if points.borrow().is_none() {
+                let parsed = video_random_access_points(&bytes, index, &Limits::default())
+                    .await
+                    .map_err(|error| js_error(error.kind(), error.message()))?;
+                *points.borrow_mut() = Some(parsed);
+            }
+            check_signal(signal.as_ref())?;
+            let array = Array::new();
+            for point in points.borrow().as_ref().into_iter().flatten() {
+                array.push(&BigInt::from(*point).into());
+            }
+            Ok(array.into())
         })
     }
 
@@ -1063,6 +1112,7 @@ impl WasmMediaInput {
             bytes: Some(Rc::clone(&self.bytes)),
             decode_session: Rc::new(RefCell::new(None)),
             frame_durations_ms: Rc::new(RefCell::new(None)),
+            random_access_points: Rc::new(RefCell::new(None)),
         })
     }
 
@@ -1146,6 +1196,7 @@ impl WasmMediaOutput {
             bytes: None,
             decode_session: Rc::new(RefCell::new(None)),
             frame_durations_ms: Rc::new(RefCell::new(None)),
+            random_access_points: Rc::new(RefCell::new(None)),
         })
     }
 
@@ -1260,7 +1311,7 @@ impl WasmPlayback {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use js_sys::{Array, Object};
+    use js_sys::Object;
     use wasm_bindgen_test::*;
     use web_sys::AbortController;
 
@@ -1370,6 +1421,54 @@ mod tests {
                 Err(error) => assert_error_code(&error, "UNSUPPORTED"),
             }
         }
+    }
+
+    /// Issue #363: scrubbing a timeline backwards has to restart its decode
+    /// somewhere, and the only frames it can restart at are the track's
+    /// random-access samples. The bundled sample codes its 768 frames as a
+    /// single group of pictures, so frame zero is the one point it offers -
+    /// which is what the `web_canvas` example walks forwards from when a drag
+    /// moves back down the bar.
+    #[wasm_bindgen_test(async)]
+    async fn random_access_points_are_the_frames_a_decode_can_restart_at() {
+        const SAMPLE: &[u8] = include_bytes!("../examples/media/BigBuckBunny.mp4");
+        let bytes = Uint8Array::from(SAMPLE);
+        let input =
+            WasmMediaInput::open_inner(bytes.into(), Limits::default().max_allocation_bytes, None)
+                .await
+                .unwrap();
+        let video = input.video(0).unwrap();
+
+        let points: js_sys::Array = JsFuture::from(video.random_access_points(None))
+            .await
+            .unwrap()
+            .unchecked_into();
+        let indices: Vec<u64> = points
+            .iter()
+            .map(|point| parse_u64(&point, "random access point").unwrap())
+            .collect();
+        assert_eq!(indices, vec![0]);
+
+        // Parsed once and cached, so a second call answers from the same list.
+        let again: js_sys::Array = JsFuture::from(video.random_access_points(None))
+            .await
+            .unwrap()
+            .unchecked_into();
+        assert_eq!(again.length(), points.length());
+
+        // An output stream indexes no samples to restart at.
+        let options = WasmCreateOptions::new(None).unwrap();
+        let output = WasmMediaOutput {
+            bytes: Vec::new(),
+            mime_type: options.mime_type,
+            max_output_bytes: options.max_output_bytes,
+            state: Rc::new(Cell::new(false)),
+            timeline: None,
+        };
+        let error = JsFuture::from(output.video(0).unwrap().random_access_points(None))
+            .await
+            .expect_err("an output stream has no random-access index");
+        assert_error_code(&error, "INVALID_STATE");
     }
 
     /// Regression test for issue #38: the very last frame of a GOP has no
