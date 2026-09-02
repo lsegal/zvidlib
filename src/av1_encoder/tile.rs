@@ -325,6 +325,12 @@ pub(crate) enum GainRatio {
 /// and take the cell that holds them. Read `8` as "believe half of a measurement known to be of
 /// the wrong thing", and re-derive it by re-running that grid whenever the rate model, the
 /// quantizer or the type set moves - not by reasoning about how noisy a probe is.
+///
+/// None of this is particular to a *remembered* ratio. A probe measures the same wrong quantity
+/// whichever trial reads it back, so [`TYPE_GAIN_PROBE_TRUST`] is a bias on the same grounds and
+/// is documented there in the same terms; the two differ only in whose blocks the measurement
+/// came from, which is a matter of how much of it to damp rather than of what it is a
+/// measurement of.
 pub(super) const TYPE_GAIN_TRUST: i64 = 8;
 
 /// How much of a gain a trial *measured on its own blocks* is corrected by, in
@@ -354,6 +360,34 @@ pub(super) const TYPE_GAIN_TRUST: i64 = 8;
 /// that region on both axes, and it is chosen by the tuning set rather than by the bound.
 ///
 /// This costs nothing: the shrinkage is the multiply and divide that was already there.
+///
+/// # This is a bias, not an estimator's shrinkage
+///
+/// Read as a shrinkage, `14` would say a trial's own probe is a noisy estimate of the gain its
+/// blocks would see and should be pulled towards the mean by an eighth. It is not, and #356
+/// measured why - the same measurement that made [`TYPE_GAIN_TRUST`] a bias, and it applies here
+/// in full. A probe measures the type set's gain against a *DCT-only* trial's reconstruction and
+/// coefficient contexts, and the emitting pass has neither: it writes the type its own search
+/// picks and reconstructs from it. That a probe was taken on the trial's own blocks changes whose
+/// blocks the wrong quantity was measured on, not that it is the wrong quantity. Probing more of
+/// them does not help either, which is `measure_type_gain_probes_against_trust`'s result: the
+/// reconstruction goes monotonically further below the exhaustive search, -0.344 dB at two probes
+/// and -0.460 dB at six, while the candidate reduction falls under the 4x
+/// `the_search_shortcuts_stay_within_their_rate_and_distortion_bound` requires.
+///
+/// `a_context_consistent_size_trial_ranks_like_the_exhaustive_search_and_costs_like_it` is where
+/// that counterfactual is shown to be the whole of the residual rather than part of it, and it is
+/// also why no setting of this constant can be the fix: a trial that codes each of its blocks
+/// with the type the emitting pass would pick, and keeps it, reproduces the exhaustive search's
+/// size decisions exactly, byte for byte and to 0.000 dB, at a candidate reduction of 1.69x-1.93x
+/// that cannot ship. So `14` damps a measurement of the wrong quantity because damping it costs
+/// less than believing it - a bias term, permanently and by construction rather than until a
+/// better estimator arrives.
+///
+/// Re-derive it the way a bias is derived, by re-running `measure_type_gain_probe_trust`'s sweep
+/// against [`TYPE_GAIN_TRUST`] and taking the interior of the region that holds the assertions,
+/// whenever the rate model, the quantizer or the type set moves. Do not reason about it as a
+/// confidence in a probe against noise.
 pub(super) const TYPE_GAIN_PROBE_TRUST: i64 = 14;
 
 /// [`TYPE_GAIN_TRUST`] denominator: the un-shrunk correction.

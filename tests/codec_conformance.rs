@@ -6,10 +6,10 @@ use std::task::{Context, Poll, Waker};
 use zvidlib::io::MemorySource;
 use zvidlib::{
     CancellationToken, Codec, CodecProfile, ColorRange, EncodedVideoSample, ErrorKind,
-    ExpectedVideoFrame, FrameDigest, FrameIndex, HardwarePreference, Limits, Mp4DemuxerOptions,
-    PixelFormat, VideoDecoderConfig, VideoDecoderConformanceVector, VideoDecoderFactory,
-    VideoDimensions, native_av1_video_decoder_factory, native_hevc_video_decoder_factory,
-    verify_video_decoder_conformance,
+    ExactFrameReader, ExpectedVideoFrame, FrameDigest, FrameIndex, HardwarePreference, Limits,
+    Mp4DemuxerOptions, PixelFormat, VideoDecoderConfig, VideoDecoderConformanceVector,
+    VideoDecoderFactory, VideoDimensions, native_av1_video_decoder_factory,
+    native_hevc_video_decoder_factory, verify_video_decoder_conformance,
 };
 
 fn block_on<T>(future: impl Future<Output = T>) -> T {
@@ -85,6 +85,101 @@ fn native_hevc_decoder_conforms_for_sequential_reverse_and_alternating_seeks() {
         .err()
         .expect("the HEVC decoder must enforce its allocation limit");
     assert_eq!(error.kind(), ErrorKind::ResourceLimit);
+}
+
+/// A frame in the middle of the bundled sample's single group of pictures can only be reached by
+/// decoding everything before it, and issue #354 is what that used to cost: every one of those
+/// pictures was converted to RGBA for nobody. The reader now tells the decoder they are wanted
+/// for reference only, and this is what that must not change - the frame the seek asks for, the
+/// tail it keeps behind it, and a frame it passed are all still the fixture's frames.
+#[test]
+fn a_seek_that_skips_the_pictures_it_passes_still_decodes_the_frames_it_returns() {
+    let expected = include_str!("fixtures/codec/big_buck_bunny_hevc_rgba.sha256")
+        .lines()
+        .map(|line| {
+            let (_, digest) = line.split_once(' ').unwrap();
+            FrameDigest::from_hex(digest).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let limits = Limits::default();
+    let source = MemorySource::new(include_bytes!("../examples/media/BigBuckBunny.mp4").to_vec());
+    let vector = block_on(VideoDecoderConformanceVector::from_mp4(
+        "bundled HEVC Main sample",
+        &source,
+        Mp4DemuxerOptions::default(),
+        1,
+        VideoDecoderConfig {
+            codec: Codec::Hevc,
+            profile: CodecProfile::HevcMain,
+            coded_dimensions: VideoDimensions::new(1920, 1080, &limits).unwrap(),
+            output_format: PixelFormat::Rgba8,
+            color_range: ColorRange::Limited,
+            hardware: HardwarePreference::Avoid,
+            configuration: Vec::new(),
+        },
+        &expected,
+    ))
+    .unwrap();
+
+    // A cache smaller than the seek: the reader keeps the frames within `max_cached_frames` of
+    // its target, so the default 32 would cover most of this one and skip almost nothing.
+    let seek_limits = Limits {
+        max_cached_frames: 4,
+        ..limits
+    };
+    let mut reader = ExactFrameReader::new(
+        &native_hevc_video_decoder_factory(),
+        vector.configuration.clone(),
+        vector.samples.clone(),
+        seek_limits,
+    )
+    .unwrap();
+    let cancellation = CancellationToken::new();
+
+    // A click part-way along a timeline: one request, every frame before it decoded to reach it.
+    let target = 48_u64;
+    let frame = reader.get(FrameIndex(target), &cancellation).unwrap();
+    assert_eq!(
+        FrameDigest::from_frame(&frame).unwrap(),
+        vector.expected_frames[target as usize].digest,
+        "the frame the seek asked for is not the fixture's frame"
+    );
+    let statistics = reader.statistics();
+    assert_eq!(
+        statistics.resets, 1,
+        "one decode, from the random-access point"
+    );
+    assert!(
+        statistics.samples_skipped >= target / 2,
+        "the frames on the way are decoded without being converted: {statistics:?}"
+    );
+
+    // The frames immediately behind it are kept, which is what makes stepping backwards from
+    // where a seek lands a cache hit rather than another decode from the random-access point.
+    for index in [target - 1, target - 2] {
+        let frame = reader.get(FrameIndex(index), &cancellation).unwrap();
+        assert_eq!(
+            FrameDigest::from_frame(&frame).unwrap(),
+            vector.expected_frames[index as usize].digest,
+            "frame {index}, just behind the seek, does not match the fixture"
+        );
+    }
+    assert_eq!(
+        reader.statistics().resets,
+        statistics.resets,
+        "stepping back into the tail the seek kept decodes nothing again"
+    );
+
+    // A frame further back was skipped, so it costs a reset and a decode from the random-access
+    // point - and comes back exactly, which is the part that matters.
+    let passed = 12_u64;
+    let frame = reader.get(FrameIndex(passed), &cancellation).unwrap();
+    assert_eq!(
+        FrameDigest::from_frame(&frame).unwrap(),
+        vector.expected_frames[passed as usize].digest,
+        "a frame the seek passed does not match the fixture when it is asked for"
+    );
+    assert_eq!(reader.statistics().resets, statistics.resets + 1);
 }
 
 /// Splits a low-overhead AV1 byte stream into temporal units, delimited by

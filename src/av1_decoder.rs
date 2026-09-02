@@ -82,6 +82,7 @@ impl VideoDecoderFactory for Av1DecoderFactory {
             configuration: configuration.clone(),
             limits: *limits,
             inner: Av1InterDecoder::new(*limits)?,
+            output_wanted: true,
         }))
     }
 }
@@ -144,6 +145,8 @@ struct Av1Decoder {
     configuration: VideoDecoderConfig,
     limits: Limits,
     inner: Av1InterDecoder,
+    /// Whether a caller wants the pictures being decoded, or is only walking past them.
+    output_wanted: bool,
 }
 
 impl VideoDecoder for Av1Decoder {
@@ -157,6 +160,12 @@ impl VideoDecoder for Av1Decoder {
             return Err(limit("AV1 temporal unit exceeds the allocation limit"));
         }
         let decoded = self.inner.decode_temporal_unit(&sample.data)?;
+        if !self.output_wanted {
+            // The frame is decoded and stays a reference for the ones after it; only the
+            // YUV-to-RGBA pass over it is skipped, which is what a caller walking to a later
+            // frame is paying for and never looks at.
+            return Ok(Vec::new());
+        }
         let frame = temporal_unit_to_rgba(&decoded, &self.configuration, &self.limits)?;
         Ok(vec![DecodedVideoFrame {
             presentation_index: sample.presentation_index,
@@ -175,6 +184,10 @@ impl VideoDecoder for Av1Decoder {
     fn reset(&mut self) -> Result<()> {
         self.inner.reset();
         Ok(())
+    }
+
+    fn set_output_wanted(&mut self, wanted: bool) {
+        self.output_wanted = wanted;
     }
 }
 
