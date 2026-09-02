@@ -1501,6 +1501,18 @@ pub(crate) fn inverse_transform_1d(kind: Tx1d, values: &[i64]) -> Vec<i64> {
     }
 }
 
+/// `Dq_Denom[txSz]` (spec §7.12.3): the divisor the reconstruction applies to every dequantized
+/// coefficient, which keeps the larger transforms' intermediate magnitudes in range. It is `1`
+/// for `TX_4X4` through `TX_16X16`, `2` for `TX_32X32`, and `4` for `TX_64X64`.
+#[must_use]
+pub fn dq_denom(size: usize) -> i32 {
+    match size {
+        0..=16 => 1,
+        32 => 2,
+        _ => 4,
+    }
+}
+
 /// Downshift applied to the column pass output for a `size x size` block.
 ///
 /// The 64-point size keeps the 32-point shift: both 1-D passes have unit
@@ -1534,10 +1546,13 @@ pub fn inverse_transform(
 ) -> Vec<i16> {
     debug_assert_eq!(coefficients.len(), size * size);
     debug_assert!(matches!(size, 4 | 8 | 16 | 32 | 64));
+    let denominator = i64::from(dq_denom(size));
     let mut dequantized = vec![0i64; size * size];
     for (index, value) in dequantized.iter_mut().enumerate() {
         let quant = if index == 0 { dc_quant } else { ac_quant };
-        *value = i64::from(coefficients[index]) * i64::from(quant);
+        // §7.12.3: the dequantized coefficient is divided by `Dq_Denom[txSz]`, truncating
+        // towards zero (the specification scales the magnitude and reapplies the sign).
+        *value = i64::from(coefficients[index]) * i64::from(quant) / denominator;
     }
     let (mut column, mut row, lr_flip, ud_flip) = tx_type.kernels();
     if size >= 32 {
@@ -1784,7 +1799,8 @@ mod tests {
             let residuals = inverse_transform(&coefficients, size, Av1TxType::Idtx, 4, 4);
             let scale = identity_scale(size);
             let expect = |coefficient: i64| -> i64 {
-                let dequantized = coefficient * 4;
+                // §7.12.3 divides the dequantized coefficient by `Dq_Denom[txSz]`.
+                let dequantized = coefficient * 4 / i64::from(dq_denom(size));
                 let row = dct_round_shift(dequantized * scale);
                 let column = dct_round_shift(row * scale);
                 let shift = transform_shift(size);

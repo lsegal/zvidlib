@@ -44,7 +44,7 @@
 
 use crate::hevc::engine::binarization::PartMode;
 use crate::hevc::engine::deblock::{DeblockCu, DeblockCuDesc, DeblockCuParams, NoFilterMap};
-use crate::hevc::engine::encoder::rdo::PictureDecision;
+use crate::hevc::engine::encoder::rdo::{BlockDecision, PictureDecision};
 use crate::hevc::engine::encoder::recon_simd::{self, BandStats, EdgeStats};
 use crate::hevc::engine::encoder::transform::{
     ForwardBlockParams, chroma_qp, luma_qp, transform_and_quantize,
@@ -178,25 +178,20 @@ pub(crate) fn reconstruct_picture(
         // block, which is what this writer emits today; anything else is
         // coded from its searched partitions.
         let coded_as_pcm = reference.is_none() || block.rd_cost >= block.pcm_cost;
+        let predict_from = if coded_as_pcm { None } else { reference };
+        reconstruct_block(
+            &mut pic,
+            src,
+            predict_from,
+            block,
+            cfg.quantized_residual.then_some(cfg.qp),
+        );
         for partition in &block.partitions {
             let (mv_x, mv_y) = if coded_as_pcm {
                 (0, 0)
             } else {
                 (partition.mv_x, partition.mv_y)
             };
-            let predict_from = if coded_as_pcm { None } else { reference };
-            reconstruct_partition(
-                &mut pic,
-                src,
-                predict_from,
-                partition.x,
-                partition.y,
-                partition.w,
-                partition.h,
-                mv_x,
-                mv_y,
-                cfg.quantized_residual.then_some(cfg.qp),
-            );
             field.fill_rect(
                 partition.x,
                 partition.y,
@@ -270,9 +265,17 @@ pub(crate) fn reconstruct_picture(
     }
 }
 
-/// Reconstruct one prediction partition: form the prediction, code the
-/// residual against it, and add the coded residual back (§8.6.6
+/// Reconstruct one coding unit: form each prediction partition's prediction,
+/// code the residual against it over the *coding unit's* transform tree, and
+/// add the coded residual back (§8.6.6
 /// `recSamples = Clip1( predSamples + resSamples )`).
+///
+/// §7.3.8.8 hangs the transform tree off the coding unit, not off the
+/// prediction unit, which is why a 16x16 coding unit keeps an 8x8 chroma
+/// transform block however its prediction is partitioned. The prediction
+/// geometry is still each partition's own — its motion vector predicts only
+/// its own samples — but it is gathered into one coding-unit-sized buffer that
+/// the residual coding then reads whole.
 ///
 /// With `quant` set to `None` the residual is `source − prediction` coded
 /// exactly, as a PCM block carries it, and the reconstruction is the source.
@@ -280,39 +283,48 @@ pub(crate) fn reconstruct_picture(
 /// forward transform and §8.6.3 quantization and back through the decoder's
 /// own §8.6.2 reconstruction — which is what makes the reference picture
 /// differ from the source, and the entire reason it is kept separately at all.
-#[allow(clippy::too_many_arguments)]
-fn reconstruct_partition(
+fn reconstruct_block(
     pic: &mut Picture,
     src: SourcePlanes<'_>,
     reference: Option<&ReconstructedPicture>,
-    x: usize,
-    y: usize,
-    w: usize,
-    h: usize,
-    mv_x: i32,
-    mv_y: i32,
+    block: &BlockDecision,
     quant: Option<i32>,
 ) {
+    let pred_mode = if reference.is_some() {
+        PredMode::Inter
+    } else {
+        PredMode::Intra
+    };
+    let size = block.size;
+    let mut prediction = vec![0u8; size * size];
+    gather_block_prediction(
+        &mut prediction,
+        size,
+        reference.map(|r| (r.y.as_slice(), r.width, r.height)),
+        block,
+        false,
+    );
     reconstruct_component(
         pic,
         Plane::Luma,
         src.y,
         src.width,
-        reference.map(|r| (r.y.as_slice(), r.width, r.height)),
-        x,
-        y,
-        w,
-        h,
-        mv_x,
-        mv_y,
+        &prediction,
+        block.x,
+        block.y,
+        size,
         // §8.6.1 eq. 8-284 — the luma `qP` from `SliceQpY`.
         quant.map(|qp| luma_qp(qp, BIT_DEPTH)),
         TfComponent::Luma,
+        pred_mode,
     );
-    // 4:2:0 — the chroma partition is the luma one halved, and the motion
-    // vector with it (§8.5.3.3.3.3 whole-sample part; this search is
-    // whole-pel, so the halved vector needs no fractional interpolation).
+    // 4:2:0 — the chroma coding block is the luma one halved, and each
+    // partition's motion vector with it (§8.5.3.3.3.3 whole-sample part; this
+    // search is whole-pel, so the halved vector needs no fractional
+    // interpolation).
     let (cw, chh) = (src.width / 2, src.height / 2);
+    let c_size = size / 2;
+    prediction.truncate(c_size * c_size);
     for (plane, source, reference_plane, component) in [
         (
             Plane::Cb,
@@ -327,97 +339,122 @@ fn reconstruct_partition(
             TfComponent::Cr,
         ),
     ] {
+        gather_block_prediction(
+            &mut prediction,
+            c_size,
+            reference_plane.map(|p| (p, cw, chh)),
+            block,
+            true,
+        );
         reconstruct_component(
             pic,
             plane,
             source,
             cw,
-            reference_plane.map(|p| (p, cw, chh)),
-            x / 2,
-            y / 2,
-            (w / 2).max(1),
-            (h / 2).max(1),
-            mv_x / 2,
-            mv_y / 2,
+            &prediction,
+            block.x / 2,
+            block.y / 2,
+            c_size,
             // §8.6.1 with the writer's zero chroma QP offsets: the chroma
             // blocks quantize at the Table 8-10 mapping of the luma QP.
             quant.map(|qp| chroma_qp(qp, 0, BIT_DEPTH, CHROMA_ARRAY_TYPE)),
             component,
+            pred_mode,
         );
     }
 }
 
-/// [`reconstruct_partition`] for one colour component.
+/// Gathers one coding unit's §8.5.3.3.2 prediction, one prediction partition
+/// at a time, into the `size` x `size` buffer [`reconstruct_component`] codes
+/// the residual against.
+///
+/// `chroma` halves the coding block, each partition inside it, and each
+/// partition's motion vector, which is the 4:2:0 geometry. The partitions of a
+/// coding unit tile it exactly, so every position of `prediction` is written.
+fn gather_block_prediction(
+    prediction: &mut [u8],
+    size: usize,
+    reference: Option<(&[u8], usize, usize)>,
+    block: &BlockDecision,
+    chroma: bool,
+) {
+    let scale = |v: usize| if chroma { v / 2 } else { v };
+    let (x0, y0) = (scale(block.x), scale(block.y));
+    for partition in &block.partitions {
+        let (px, py) = (scale(partition.x), scale(partition.y));
+        let (pw, ph) = (scale(partition.w).max(1), scale(partition.h).max(1));
+        let (mv_x, mv_y) = if chroma {
+            (partition.mv_x / 2, partition.mv_y / 2)
+        } else {
+            (partition.mv_x, partition.mv_y)
+        };
+        for row in 0..ph {
+            let start = (py - y0 + row) * size + (px - x0);
+            gather_prediction_row(
+                &mut prediction[start..start + pw],
+                reference,
+                px,
+                py + row,
+                mv_x,
+                mv_y,
+            );
+        }
+    }
+}
+
+/// [`reconstruct_block`] for one colour component, over the square `size` x
+/// `size` coding block whose prediction the caller has already gathered.
 #[allow(clippy::too_many_arguments)]
 fn reconstruct_component(
     pic: &mut Picture,
     plane: Plane,
     source: &[u8],
     src_stride: usize,
-    reference: Option<(&[u8], usize, usize)>,
+    prediction: &[u8],
     x: usize,
     y: usize,
-    w: usize,
-    h: usize,
-    mv_x: i32,
-    mv_y: i32,
+    size: usize,
     quant: Option<u32>,
     component: TfComponent,
+    pred_mode: PredMode,
 ) {
+    let (w, h) = (size, size);
+    debug_assert_eq!(prediction.len(), w * h);
     let Some(q_p) = quant else {
         // The residual is coded exactly, so the reconstruction is the source,
         // and the §8.6.6 add-and-clip of a whole row is a straight-line run
-        // the vector kernel can take whole once the prediction is gathered.
-        let mut prediction = vec![0u8; w];
+        // the vector kernel can take whole.
         let (dst, dst_stride) = pic.plane_mut(plane);
         for row in 0..h {
             let sy = y + row;
-            gather_prediction_row(&mut prediction, reference, x, sy, mv_x, mv_y);
             let src_row = &source[sy * src_stride + x..sy * src_stride + x + w];
             let dst_row = &mut dst[sy * dst_stride + x..sy * dst_stride + x + w];
-            recon_simd::reconstruct_row(dst_row, src_row, &prediction);
+            recon_simd::reconstruct_row(dst_row, src_row, &prediction[row * w..row * w + w]);
         }
         return;
     };
 
-    // §7.3.8.8: the residual of a partition is coded as square transform
-    // blocks, the smallest of which is 4x4. An asymmetric partition can be as
-    // narrow as four luma samples, and its 4:2:0 chroma half then measures two
-    // — less than one transform block, and not a whole number of them in the
-    // other direction either. Tiling by the largest legal square that fits and
-    // clipping each block to the partition is what a writer does there: the
-    // samples past the edge carry no residual, so they are coded as zero and
-    // never written back.
+    // §7.3.8.8: the residual of a *coding unit* is coded as square transform
+    // blocks. The coding block is square and no smaller than the 4x4 floor in
+    // either component, so the largest legal square tiles it exactly and no
+    // block is ever clipped or zero-padded.
     let n_tbs = transform_block_size(w, h);
-    let mut prediction = vec![0i32; n_tbs * n_tbs];
+    debug_assert_eq!(w % n_tbs, 0);
+    let mut pred_block = vec![0i32; n_tbs * n_tbs];
     let mut residual = vec![0i32; n_tbs * n_tbs];
-    let mut pred_row = vec![0u8; n_tbs];
     for by in (0..h).step_by(n_tbs) {
         for bx in (0..w).step_by(n_tbs) {
-            let block_h = n_tbs.min(h - by);
-            let block_w = n_tbs.min(w - bx);
-            if block_h != n_tbs || block_w != n_tbs {
-                // Only the clipped blocks need the padding zeroed; a whole one
-                // overwrites every position below.
-                residual.fill(0);
-            }
-            for row in 0..block_h {
+            for row in 0..n_tbs {
                 let sy = y + by + row;
-                gather_prediction_row(&mut pred_row[..block_w], reference, x + bx, sy, mv_x, mv_y);
-                for col in 0..block_w {
-                    let predicted = i32::from(pred_row[col]);
-                    prediction[row * n_tbs + col] = predicted;
+                for col in 0..n_tbs {
+                    let predicted = i32::from(prediction[(by + row) * w + bx + col]);
+                    pred_block[row * n_tbs + col] = predicted;
                     residual[row * n_tbs + col] =
                         i32::from(source[sy * src_stride + x + bx + col]) - predicted;
                 }
             }
             // Forward transform → quantize → the decoder's own §8.6.2
             // reconstruction of the levels that survived.
-            let pred_mode = if reference.is_some() {
-                PredMode::Inter
-            } else {
-                PredMode::Intra
-            };
             let levels = transform_and_quantize(
                 &residual,
                 None,
@@ -458,12 +495,12 @@ fn reconstruct_component(
             // through the vector kernel whole rather than one `set_sample` at
             // a time.
             let (dst, dst_stride) = pic.plane_mut(plane);
-            for row in 0..block_h {
+            for row in 0..n_tbs {
                 let start = (y + by + row) * dst_stride + x + bx;
                 recon_simd::add_clip_row(
-                    &mut dst[start..start + block_w],
-                    &prediction[row * n_tbs..row * n_tbs + block_w],
-                    &coded[row * n_tbs..row * n_tbs + block_w],
+                    &mut dst[start..start + n_tbs],
+                    &pred_block[row * n_tbs..(row + 1) * n_tbs],
+                    &coded[row * n_tbs..(row + 1) * n_tbs],
                 );
             }
         }
@@ -505,14 +542,12 @@ fn gather_prediction_row(
     }
 }
 
-/// The largest legal square transform block for a `w` x `h` partition: the
+/// The largest legal square transform block for a `w` x `h` coding block: the
 /// largest power of two no greater than either side, clamped to the
 /// §7.4.3.2.1 4..=32 transform-block range.
 ///
-/// The clamp at 4 means the result does not always divide the partition — an
-/// asymmetric partition's 4:2:0 chroma half can be as short as two samples —
-/// so the caller clips the last block of each row and column to the partition
-/// rather than assuming a whole tiling.
+/// A coding block is square and at least 8x8 in luma, so both it and its 4:2:0
+/// chroma halves are whole multiples of the result and the tiling is exact.
 fn transform_block_size(w: usize, h: usize) -> usize {
     let side = w.min(h);
     let log2 = (usize::BITS - 1 - side.leading_zeros()).clamp(2, 5);
@@ -1418,50 +1453,55 @@ mod tests {
         crate::simd::set_override(None);
     }
 
-    #[test]
-    fn an_asymmetric_partitions_chroma_half_reconstructs_inside_the_plane() {
-        // §7.3.8.8 transform blocks bottom out at 4x4, but the 4:2:0 chroma
-        // half of the 16x4 and 16x12 asymmetric partitions the mode search can
-        // pick measures 8x2 and 8x6 — neither a whole number of 4x4 blocks.
-        // The residual coding has to clip its last block to the partition
-        // instead of running off the end of the plane.
-        let src = source(0);
-        let (width, height) = (W, H);
-        let partition = |x, y, w, h| PartitionDecision {
-            x,
-            y,
-            w,
-            h,
-            mv_x: 0,
-            mv_y: 0,
-            sad: 0,
-            satd: 0,
-            bit_cost: 0,
-            rd_cost: 0,
-        };
+    /// A whole-picture decision whose every CTB is one coding unit split into
+    /// `shapes`, given as `(dx, dy, w, h)` offsets inside the CTB, all with a
+    /// zero motion vector.
+    fn decision_of(shapes: &[(usize, usize, usize, usize)]) -> PictureDecision {
         let mut blocks = Vec::new();
-        for y0 in (0..height).step_by(CTB) {
-            for x0 in (0..width).step_by(CTB) {
+        for y0 in (0..H).step_by(CTB) {
+            for x0 in (0..W).step_by(CTB) {
                 blocks.push(BlockDecision {
                     x: x0,
                     y: y0,
                     size: CTB,
-                    // 16x4 over 16x12, so both the two-sample-tall chroma half
-                    // and the six-sample-tall one are coded.
-                    partitions: vec![
-                        partition(x0, y0, CTB, 4),
-                        partition(x0, y0 + 4, CTB, CTB - 4),
-                    ],
+                    partitions: shapes
+                        .iter()
+                        .map(|&(dx, dy, w, h)| PartitionDecision {
+                            x: x0 + dx,
+                            y: y0 + dy,
+                            w,
+                            h,
+                            mv_x: 0,
+                            mv_y: 0,
+                            sad: 0,
+                            satd: 0,
+                            bit_cost: 0,
+                            rd_cost: 0,
+                        })
+                        .collect(),
                     rd_cost: 0,
                     pcm_cost: u64::MAX,
                 });
             }
         }
-        let decision = PictureDecision {
+        PictureDecision {
             blocks,
             rd_cost: 0,
             pcm_blocks: 0,
-        };
+        }
+    }
+
+    /// The 16x4-over-16x12 split, whose 4:2:0 chroma halves are 8x2 and 8x6 —
+    /// neither a whole number of the 4x4 blocks §7.3.8.8 bottoms out at.
+    const ASYMMETRIC: &[(usize, usize, usize, usize)] = &[(0, 0, CTB, 4), (0, 4, CTB, CTB - 4)];
+
+    #[test]
+    fn an_asymmetric_partitions_chroma_half_reconstructs_inside_the_plane() {
+        // The residual is coded over the coding unit's own transform tree, so
+        // an 8x2 chroma prediction partition never becomes a transform block
+        // and nothing indexes past the end of the chroma plane.
+        let src = source(0);
+        let decision = decision_of(ASYMMETRIC);
         let cfg = ReconConfig {
             quantized_residual: true,
             qp: 32,
@@ -1473,15 +1513,52 @@ mod tests {
         assert_eq!(expected.y.len(), src.0.len());
         assert_eq!(expected.cb.len(), src.1.len());
         assert_eq!(expected.cr.len(), src.2.len());
-        // The clipped blocks go through the same vector kernel as the whole
-        // ones, over a partial run, so they are pinned across instruction sets
-        // too.
+        // Every transform block is now a whole one, but the add-and-clip still
+        // goes through the vector kernel, so the result is pinned across
+        // instruction sets.
         for isa in crate::simd::available() {
             crate::simd::set_override(Some(isa));
             let lossy = reconstruct_picture(planes(&src), None, &decision, cfg);
             assert_eq!(lossy, expected, "{}", isa.name());
         }
         crate::simd::set_override(None);
+    }
+
+    #[test]
+    fn the_transform_tree_is_the_coding_units_however_the_prediction_is_partitioned() {
+        // §7.3.8.8 hangs the transform tree off the coding unit, so a 16x16 CU
+        // codes one 16x16 luma and two 8x8 chroma transform blocks no matter
+        // how its prediction is split. These partitionings all predict the
+        // same samples — every motion vector is zero and there is no reference
+        // — so if the residual is coded over the CU they must reconstruct
+        // identically. Tiling each *partition* instead did not: the asymmetric
+        // shapes fell to 8x8 and 4x4 luma blocks, and their chroma halves to
+        // zero-padded partial ones.
+        let src = source(0);
+        let cfg = ReconConfig {
+            quantized_residual: true,
+            qp: 32,
+            ..ReconConfig::default()
+        };
+        let whole = reconstruct_picture(planes(&src), None, &decision_of(&[(0, 0, CTB, CTB)]), cfg);
+        for shapes in [
+            ASYMMETRIC,
+            &[(0, 0, CTB, CTB - 4), (0, CTB - 4, CTB, 4)],
+            &[(0, 0, 4, CTB), (4, 0, CTB - 4, CTB)],
+            &[(0, 0, CTB / 2, CTB), (CTB / 2, 0, CTB / 2, CTB)],
+            &[
+                (0, 0, CTB / 2, CTB / 2),
+                (CTB / 2, 0, CTB / 2, CTB / 2),
+                (0, CTB / 2, CTB / 2, CTB / 2),
+                (CTB / 2, CTB / 2, CTB / 2, CTB / 2),
+            ],
+        ] {
+            let split = reconstruct_picture(planes(&src), None, &decision_of(shapes), cfg);
+            assert_eq!(
+                split, whole,
+                "{shapes:?} did not reconstruct through the coding unit's transform tree"
+            );
+        }
     }
 
     #[test]
@@ -1614,10 +1691,21 @@ mod tests {
     }
 
     #[test]
-    fn partitions_tile_into_the_largest_legal_square_transform_block() {
+    fn coding_blocks_tile_into_the_largest_legal_square_transform_block() {
+        // Every coding block this encoder codes, and every 4:2:0 chroma half
+        // of one, is a whole number of its own transform blocks.
+        for size in [8usize, 16, 32, 64] {
+            let n_tbs = transform_block_size(size, size);
+            assert_eq!(size % n_tbs, 0, "luma {size}");
+            let c_size = size / 2;
+            assert_eq!(
+                c_size % transform_block_size(c_size, c_size),
+                0,
+                "chroma {c_size}"
+            );
+        }
         assert_eq!(transform_block_size(16, 16), 16);
-        assert_eq!(transform_block_size(16, 8), 8);
-        assert_eq!(transform_block_size(8, 4), 4);
+        assert_eq!(transform_block_size(8, 8), 8);
         // Below the 4x4 minimum and above the 32x32 maximum both clamp.
         assert_eq!(transform_block_size(2, 2), 4);
         assert_eq!(transform_block_size(64, 64), 32);
