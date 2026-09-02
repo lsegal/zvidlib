@@ -505,10 +505,38 @@ mod tests {
 
     /// Busy-wait rather than sleep: the profiler charges elapsed wall time, and
     /// a spin keeps the test's timing independent of scheduler granularity.
+    ///
+    /// A spin burns *at least* what it was asked for and, on a contended
+    /// runner, arbitrarily more — so a test may assert that a stage recorded
+    /// no less than the time it spun, and never that two spins kept the ratio
+    /// they were asked for. Anything that needs an exact split builds a
+    /// [`Report`] with [`report_of`] instead.
     fn spin(duration: Duration) {
         let until = Instant::now() + duration;
         while Instant::now() < until {
             std::hint::spin_loop();
+        }
+    }
+
+    /// A [`Report`] with the attribution stated outright.
+    ///
+    /// The arithmetic over a finished report — the shares, the Amdahl
+    /// ceilings, the table — is a pure function of the nanos charged to each
+    /// stage, so it is tested against durations that are given rather than
+    /// measured. `total` is the profiled wall clock; anything it exceeds the
+    /// stage times by is unattributed, exactly as a real profile's is.
+    fn report_of(stages: &[(Stage, Duration)], total: Duration) -> Report {
+        let mut nanos = [0; STAGE_COUNT];
+        let mut entries = [0; STAGE_COUNT];
+        for (stage, duration) in stages {
+            nanos[*stage as usize] += duration.as_nanos() as u64;
+            entries[*stage as usize] += 1;
+        }
+        Report {
+            nanos,
+            entries,
+            total,
+            scopes: stages.len() as u64,
         }
     }
 
@@ -536,14 +564,17 @@ mod tests {
         let report = finish().expect("profile was started");
         let outer = report.stage(Stage::SliceData);
         let inner = report.stage(Stage::Residual);
-        // The inner stage's 20 ms belongs to it alone; the outer keeps only
-        // the 10 ms it spent outside the nested scope.
-        assert!(inner >= Duration::from_millis(19), "inner was {inner:?}");
-        assert!(
-            outer >= Duration::from_millis(9) && outer < inner,
-            "outer was {outer:?}"
-        );
+        // The inner stage's 20 ms belongs to it alone, and the outer keeps
+        // only the two 5 ms spins it ran outside the nested scope — so each
+        // is charged no less than what it spun, and the inner scope's time is
+        // charged to it *instead of* the outer rather than to both. Which of
+        // the two ends up larger is the runner's business, not the
+        // attribution's: a stall inside either spin lands on that stage.
+        assert!(inner >= Duration::from_millis(20), "inner was {inner:?}");
+        assert!(outer >= Duration::from_millis(10), "outer was {outer:?}");
         assert_eq!(report.entries(Stage::Residual), 1);
+        assert_eq!(report.entries(Stage::SliceData), 1);
+        assert_eq!(report.attributed(), outer + inner);
         assert!(report.attributed() <= report.total());
     }
 
@@ -554,34 +585,97 @@ mod tests {
         spin(Duration::from_millis(5));
         let report = finish().expect("profile was started");
         drop(open);
-        assert!(report.stage(Stage::Deblock) >= Duration::from_millis(4));
+        // The spin burns at least its 5 ms before `finish` reads the clock,
+        // so the only way this comes up short is the open scope being dropped
+        // rather than closed.
+        assert!(report.stage(Stage::Deblock) >= Duration::from_millis(5));
+        assert_eq!(report.attributed(), report.stage(Stage::Deblock));
     }
 
     #[test]
     fn shares_and_ceilings_follow_the_attribution() {
-        assert!(start());
-        {
-            let _serial = scope(Stage::Residual);
-            spin(Duration::from_millis(30));
-        }
-        {
-            let _vector = scope(Stage::Sao);
-            spin(Duration::from_millis(10));
-        }
-        let report = finish().expect("profile was started");
+        // 30 ms of serial residual decode against 10 ms of vectorizable SAO:
+        // a quarter of the profile is in a vectorized stage, so the ceiling on
+        // any whole-frame speedup from SIMD is 1/(1 - 0.25). The durations are
+        // stated rather than spun, because what is under test is the
+        // arithmetic over an attribution, not how much wall clock two spins
+        // happen to take relative to each other on a contended runner.
+        let report = report_of(
+            &[
+                (Stage::Residual, Duration::from_millis(30)),
+                (Stage::Sao, Duration::from_millis(10)),
+            ],
+            Duration::from_millis(40),
+        );
         let vector = report.vectorized_share();
-        // ~25% of the profile is in a vectorized stage, so the ceiling on any
-        // whole-frame speedup from SIMD is ~1/(1 - 0.25).
-        assert!((0.15..0.35).contains(&vector), "vectorized share {vector}");
+        assert!((vector - 0.25).abs() < 1e-9, "vectorized share {vector}");
         // No colour conversion was profiled, so both denominators agree.
         assert!((report.vectorized_decode_share() - vector).abs() < 1e-9);
         assert_eq!(report.decode_total(), report.total());
         assert!(report.markdown_table(1).contains("`residual_cabac`"));
+        assert!((report.max_whole_frame_speedup() - 1.0 / 0.75).abs() < 1e-9);
         assert!(report.max_whole_frame_speedup() > 1.0);
         assert!(report.speedup_at(2.0) < report.max_whole_frame_speedup());
         assert!((report.speedup_at(1.0) - 1.0).abs() < 1e-9);
         assert!(!Stage::Residual.is_vectorized());
         assert!(Stage::Sao.is_vectorized());
         assert!(Stage::ColorConvert.is_vectorized());
+    }
+
+    #[test]
+    fn a_share_is_the_time_the_profile_charged_the_stage() {
+        // The shares a real profile reports are the ones its own recorded
+        // attribution implies — the link `shares_and_ceilings_follow_the_attribution`
+        // used to cover by spinning, asserted against what the profile
+        // charged rather than against what the spins were asked for.
+        assert!(start());
+        {
+            let _serial = scope(Stage::Residual);
+            spin(Duration::from_millis(3));
+        }
+        {
+            let _vector = scope(Stage::Sao);
+            spin(Duration::from_millis(1));
+        }
+        let report = finish().expect("profile was started");
+        let total = report.total().as_secs_f64();
+        let expected = report.stage(Stage::Sao).as_secs_f64() / total;
+        let vector = report.vectorized_share();
+        assert!((vector - expected).abs() < 1e-9, "vectorized share {vector}");
+        assert!(
+            (report.share(Stage::Residual) - report.stage(Stage::Residual).as_secs_f64() / total)
+                .abs()
+                < 1e-9
+        );
+        assert!(vector > 0.0 && vector < 1.0, "vectorized share {vector}");
+        assert!((report.vectorized_decode_share() - vector).abs() < 1e-9);
+        assert_eq!(report.decode_total(), report.total());
+    }
+
+    #[test]
+    fn colour_conversion_is_out_of_the_decode_denominator() {
+        // The one case where the two denominators are meant to disagree, which
+        // an injected report can state exactly: 20 ms of colour conversion in
+        // a 100 ms profile is 20% of the total and none of the decode, and
+        // every other stage's decode share is against the remaining 80 ms.
+        let report = report_of(
+            &[
+                (Stage::ColorConvert, Duration::from_millis(20)),
+                (Stage::Sao, Duration::from_millis(40)),
+                (Stage::Residual, Duration::from_millis(40)),
+            ],
+            Duration::from_millis(100),
+        );
+        assert_eq!(report.decode_total(), Duration::from_millis(80));
+        assert_eq!(report.unattributed(), Duration::ZERO);
+        assert!((report.share(Stage::ColorConvert) - 0.2).abs() < 1e-9);
+        assert!((report.decode_share(Stage::ColorConvert) - 0.0).abs() < 1e-9);
+        assert!((report.share(Stage::Sao) - 0.4).abs() < 1e-9);
+        assert!((report.decode_share(Stage::Sao) - 0.5).abs() < 1e-9);
+        // `ColorConvert` is vectorized, so it counts towards the share of the
+        // total and drops out of the share of the decode.
+        assert!((report.vectorized_share() - 0.6).abs() < 1e-9);
+        assert!((report.vectorized_decode_share() - 0.5).abs() < 1e-9);
+        assert!(report.markdown_table(1).contains("| n/a |"));
     }
 }
