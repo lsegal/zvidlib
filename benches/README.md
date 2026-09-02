@@ -985,6 +985,11 @@ Measured on **AMD EPYC 7763 64-Core Processor (Linux, x86_64)**, at
 `b284c38a6391` — the #337 merge `b233f0a74f88` plus the temporary six-round
 workflow that measured it, which touches no crate code.
 
+The two `av1_encode_stage_coeff_ctx` rows are the pre-#362 code and are kept as
+the record of the defect that issue reports; the repair is measured under [The
+#362 re-measurement](#the-362-re-measurement) below, on its own host and with
+its own provenance.
+
 | Group | `scalar` | `sse4.1` | `avx2` | Best |
 | --- | ---: | ---: | ---: | ---: |
 | `av1_cdef` | 89.226 ms | 38.801 ms (2.30x) | 31.241 ms (2.86x) | 2.86x `avx2` |
@@ -1148,6 +1153,46 @@ lane-crossing, not downclocking, not the context gather. The detail differs.
   that steps two rows at a time rather than one — the outputs of adjacent rows
   are already contiguous, so eight lanes are there to be filled — and #371
   carries that.
+
+#### The #362 re-measurement
+
+The repair is measured, not asserted, but it is deliberately recorded here
+rather than folded into the table above. The `workflow_dispatch` round that
+measured it landed on an **Intel(R) Xeon(R) 6973P-C (Linux/X64)** — one of the
+three CPU models the table's draw explicitly measured and discarded for not
+being the AMD EPYC 7763 the other rounds shared — and it is one round, not the
+elementwise minimum of three. Its absolute times are therefore not comparable
+with the table's, and merging two rows of it into a table attributed to a named
+host would make that table attributable to no host at all, which is the failure
+mode the six-round selection above exists to avoid.
+
+What *is* comparable is the `sse4.1`-against-`avx2` sign within the round, which
+is the whole claim. Measured at `539dad3d61cb` with `ZVIDLIB_BENCH_LARGE=1`,
+`# host instruction sets: scalar, sse4.1, avx2`, `# dispatch site
+av1_coeff_ctx: avx2`:
+
+| Group | `scalar` | `sse4.1` | `avx2` | Best |
+| --- | ---: | ---: | ---: | ---: |
+| `av1_encode_stage_coeff_ctx` | 3.483 ms | 930.916 µs (3.74x) | 929.755 µs (3.75x) | 3.75x `avx2` |
+| `av1_encode_stage_coeff_ctx_1080p` | 31.480 ms | 8.801 ms (3.58x) | 8.568 ms (3.67x) | 3.67x `avx2` |
+| `av1_encode_stage_tile` | 15.510 ms | 12.541 ms (1.24x) | 12.522 ms (1.24x) | 1.24x `avx2` |
+| `av1_encode_stage_tile_1080p` | 149.547 ms | 116.654 ms (1.28x) | 116.531 ms (1.28x) | 1.28x `avx2` |
+| `hevc_encode_640x352_rdo_inter` | 58.661 ms | 34.657 ms (1.69x) | 37.999 ms (1.54x) | 1.69x `sse4.1` |
+| `hevc_encode_1920x1088_rdo_inter` | 554.943 ms | 328.088 ms (1.69x) | 358.684 ms (1.55x) | 1.69x `sse4.1` |
+
+The 20% gap between the two vector arms of `av1_encode_stage_coeff_ctx` is
+gone: they now read 930.916 µs and 929.755 µs, 0.13% apart, which is what
+"both arms run the same kernel" looks like — the `avx2` column is the SSE4.1
+kernel reached through the redirect, exactly as `av1_encode_stage_wht`'s three
+columns are all the same scalar transform. `av1_encode_stage_tile`, which
+contains the derivation behind the serial range coder, loses its 1.18x-against-
+1.17x split the same way. The dispatch site no longer takes the slower arm, and
+the `Best` column stops disagreeing with what a real x86_64 encode does.
+
+The `rdo_inter` pair is in the table above as the control, and it is unmoved:
+1.69x under `sse4.1` against 1.54x/1.55x under `avx2`, the same shape #351
+recorded on a different host. Nothing in #362 touches `rdcost`, and the second
+bullet above is why it would not have helped if it did.
 - `hevc_encode_*_rdo_inter`. The same family, a different mechanism, and *not*
   the same fix. `rdcost::sad_avx2`'s 256-bit loop needs `w >= 32` and
   `satd_avx2`'s vector pair needs `w >= 16`, but `rdo.rs` searches a `CTB` of 16
