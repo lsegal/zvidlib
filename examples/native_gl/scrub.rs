@@ -81,9 +81,9 @@ impl Queue {
     ///
     /// Returns whether this changed the target: repeating one must not disturb the decode that is
     /// already serving it. Neither must moving the target further ahead - the frame being decoded
-    /// still lies between the reader and the new target, so cancelling it would throw away work
-    /// the new target needs and send the walk back to a random-access point. Only a target the
-    /// current decode has already passed cancels it.
+    /// lies between the reader and the new target, so cancelling it would throw away reference
+    /// decoding the new target needs and send the reader back to a random-access point. Only a
+    /// target the current decode has already passed cancels it.
     fn retarget(&mut self, frame: u64) -> bool {
         if self.target == Some(frame) {
             return false;
@@ -116,7 +116,7 @@ pub struct FrameService {
 }
 
 impl FrameService {
-    /// Builds a service over its own decoder and the track's random-access points.
+    /// Builds a service over its own decoder for the track's samples.
     pub fn new(
         factory: &dyn VideoDecoderFactory,
         configuration: VideoDecoderConfig,
