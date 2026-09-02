@@ -197,9 +197,10 @@ struct TypeGain {
     /// Summed best-of-set cost of the same blocks, so `dct_cost - best_cost` is what the type
     /// search has been measured to be worth at this size.
     best_cost: i64,
-    /// Probes accumulated, which [`Self::ratio`]'s mean divides by. Only the sweep that
-    /// measured the unweighted mean against the shipped ratio of sums reads that.
-    #[cfg(test)]
+    /// Probes accumulated, which is how many transform blocks [`Self::dct_cost`] and
+    /// [`Self::best_cost`] are summed over. It is the divisor of a *per-block* measured gain,
+    /// which is what every [`GainModel`] but [`GainModel::Linear`] extrapolates from, and it is
+    /// also what [`Self::ratio`]'s mean divides by.
     probes: i64,
     /// The same measurement as the mean of the probes' *own* ratios, in [`GAIN_RATIO_ONE`]
     /// units, so an expensive probe does not outweigh a cheap one. Measured and rejected; kept
@@ -288,11 +289,15 @@ pub(crate) enum GainRatio {
 /// and `measure_type_gain_probes_against_trust` is what establishes that: measuring the ratio on
 /// *more* blocks makes it monotonically worse - -0.344 dB at two probes, -0.460 dB at six - while
 /// the candidate reduction falls under the 4x the bound requires. A sharper estimate of the ratio
-/// produces a worse size ranking, so what that error measures is the extrapolation model, not the
-/// sampling: the correction assumes the type search's gain scales with a trial's searched cost,
-/// which over-credits the smallest size at a quantizer where every block is coded. No number of
-/// probes and no setting of these constants removes a model error, which is why they are
-/// shrinkages rather than a sharper estimator. Replacing the model is #349.
+/// produces a worse size ranking. #349 read that as the extrapolation model - the correction
+/// assumes the type search's gain scales with a trial's searched cost, which over-credits the
+/// smallest size at a quantizer where every block is coded - and built every replacement that
+/// reading asks for. The over-credit is not the error: it is what the correction is *worth*. A
+/// credit that does not depend on how much of the trial was probed is flat in the probe count,
+/// which is the monotonicity a model error would have to lose, and it reconstructs exactly where
+/// crediting nothing does. See [`GainModel`], where the sweep and its four corners are recorded.
+/// So no number of probes and no setting of these constants reaches the residual, and they are
+/// biases rather than a sharper estimator.
 ///
 /// No bound, ceiling or test was relaxed to reach this pair. The per-frame ceilings were
 /// re-measured at the new constants as that test's own rule requires: `scene_edge` *tightens*
@@ -348,7 +353,9 @@ pub(super) const TYPE_GAIN_TRUST: i64 = 8;
 /// corrected in full and no ratio is ever remembered, reconstructs 0.344 dB *below* the exhaustive
 /// search at `qindex` 1 on the 96x80 `test_pattern`, against the sampled estimator's +0.023 dB.
 /// The extrapolation over-credits, and it over-credits most where a trial has the most blocks to
-/// extrapolate over, which is the smallest size.
+/// extrapolate over, which is the smallest size - and #349 measured that the over-credit is the
+/// correction's whole value rather than its error, which is why this constant damps it rather
+/// than the model being replaced. [`GainModel`] records that sweep.
 ///
 /// `measure_type_gain_probe_trust` sweeps this against [`TYPE_GAIN_TRUST`] over the whole tuning
 /// set - `content_frames` including the three `gain_*` frames added for #343, plus `test_pattern`,
@@ -392,6 +399,111 @@ pub(super) const TYPE_GAIN_PROBE_TRUST: i64 = 14;
 
 /// [`TYPE_GAIN_TRUST`] denominator: the un-shrunk correction.
 const TYPE_GAIN_TRUST_ONE: i64 = 16;
+
+/// The shape the transform-gain correction extrapolates a probe's measurement in.
+///
+/// A probe measures what the whole transform-type set is worth against the set's `DCT_DCT` on
+/// `p` of a trial's blocks, and the correction has to turn that into what the set is worth on
+/// the trial's other `b - p`. How it does that is the *model*, and it is separable from how much
+/// of the result is believed ([`TYPE_GAIN_TRUST`], [`TYPE_GAIN_PROBE_TRUST`]) and from which
+/// blocks the measurement came off ([`TYPE_GAIN_SAMPLE_INTERVAL`], [`TYPE_GAIN_MEMORY`]).
+///
+/// Only the shipped [`TYPE_GAIN_MODEL`] is constructed outside tests; the others are reachable
+/// from [`FrameEncoder::with_type_gain_model`], which a non-test build does not have.
+///
+/// # Shipped encodes use [`GainModel::Linear`], and #349 is why
+///
+/// #349 read the residual at `base_q_idx` 1 as this extrapolation: the credit grows linearly in
+/// the trial's searched cost, so it over-credits the size with the most blocks to extrapolate
+/// over, and a sharper probe ranks monotonically worse, which is what a model error looks like.
+/// The three replacements that reading asks for are the other variants here, and
+/// `measure_type_gain_models` crosses them with the probe count on the 96x80 `test_pattern`.
+/// What it measures is that the credit has no useful freedom in its shape, only in its
+/// magnitude, and that the two bounds fix that magnitude from opposite sides:
+///
+/// | credit | `qindex` 1 at 1 probe | at 64 probes | worst reduction |
+/// |:-------|----------------------:|-------------:|----------------:|
+/// | none (the DCT-only ranking) | -0.203 dB | -0.203 dB | 4.77x |
+/// | [`Linear`](GainModel::Linear), shipped | +0.023 dB | -0.125 dB | 4.26x |
+/// | [`PerBlock`](GainModel::PerBlock) | +0.023 dB | -0.125 dB | 4.26x |
+/// | [`Saturating`](GainModel::Saturating) at one block | -0.203 dB | -0.203 dB | 4.77x |
+/// | [`Amplified`](GainModel::Amplified) at 48 sixteenths | +0.324 dB | +0.105 dB | 2.46x |
+///
+/// Read across, that is one number in four disguises. Counting the gain per block rather than
+/// per unit of searched cost moves nothing at any probe count, so the cost weighting is not the
+/// axis the residual lives on. Making the credit independent of how much of the trial was
+/// probed, which is what a saturation does and what the monotonicity #349 asks for requires,
+/// satisfies that monotonicity exactly - and satisfies it by crediting nothing: it lands on the
+/// bare DCT-only ranking at every probe count. And the value the shipped credit does buy comes
+/// from *over*-crediting: a trial's first block measures a larger gain than the trial's mean,
+/// and the linear extrapolation multiplies that one-block sample over every block of the trial.
+/// Probing more blocks removes the over-credit, which is why a sharper estimate ranks worse.
+///
+/// [`Amplified`](GainModel::Amplified) is that over-credit stated rather than sampled into
+/// existence: about three times the trial's own measured per-block gain, credited whatever the
+/// probe count, so the probe count only sharpens the measurement. It restores `base_q_idx` 1
+/// with every block of every trial probed - and takes the candidate reduction to 2.46x, against
+/// the 4x `the_search_shortcuts_stay_within_their_rate_and_distortion_bound` requires, because
+/// the credit that keeps the smallest size reachable is also what makes it expensive.
+///
+/// So the ranking wants more credit at `base_q_idx` 1, the candidate bound wants less, and the
+/// shipped configuration is the cell where the two meet.
+/// `the_type_gain_credit_is_a_magnitude_rather_than_a_shape` asserts all four corners of that,
+/// so a future change to the shape has to move those numbers rather than restate the reading.
+/// It is also what #356 predicts: the correction is a scalar credit against a cost measured in
+/// contexts the emitting pass will not have, and the only degree of freedom such a credit has is
+/// how much of it to believe. [`TYPE_GAIN_TRUST`] and [`TYPE_GAIN_PROBE_TRUST`] therefore stay,
+/// and stay biases.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum GainModel {
+    /// The gain scales with the trial's searched cost: `(dct_p - best_p) * dct_b / dct_p`, where
+    /// `dct_b` is [`FrameEncoder::trial_searched_cost`]. This is what #272 shipped and what #349
+    /// replaced, and it is kept so a sweep can measure the others against it.
+    Linear,
+    /// The gain scales with the trial's searched *block count*: `(dct_p - best_p) * b / p`. An
+    /// expensive block is credited the same as a cheap one at the same size, which is the axis
+    /// the type set's win is actually counted on - each block is one more chance for a non-DCT
+    /// type to beat `DCT_DCT`.
+    PerBlock,
+    /// The same per-block gain, damped by a credit that saturates in the trial's block count:
+    /// `(dct_p - best_p) * e(b) / p` with `e(b) = b * s / (b + s - 1)` and `s`
+    /// [`TYPE_GAIN_SATURATION`]. `e(1)` is `1` and `e` approaches `s` from below, so a trial of
+    /// one block is credited what it measured and a trial of sixty-four is credited far less than
+    /// sixty-four times it.
+    Saturating,
+    /// The per-block gain over the trial's blocks, scaled by [`TYPE_GAIN_AMPLIFICATION`]
+    /// sixteenths: `(dct_p - best_p) * b * a / (p * 16)`.
+    ///
+    /// This is the only shape that can put the credit *above* what the type set was measured to
+    /// win, which is where the shipped estimator's one-block sample already puts it: a trial's
+    /// first block measures a larger gain than its mean, so the shipped correction over-credits
+    /// by an amount nothing states and every sharper measurement removes. `a` states it, so the
+    /// probe count only sharpens the per-block gain instead of also changing how much of it is
+    /// credited. `16` is [`PerBlock`](GainModel::PerBlock) exactly.
+    Amplified,
+}
+
+/// Blocks the [`GainModel::Saturating`] credit saturates at: the `s` of `e(b) = b * s / (b+s-1)`.
+///
+/// This is the one number in the model that says how far a probe's measurement carries, and it
+/// is what makes the credit stop depending on how much of a trial was probed - the monotonicity
+/// #349 asks for, which [`GainModel`] records is bought by crediting nothing. Nothing ships it,
+/// so `4` is only the value `measure_type_gain_models` sweeps around.
+pub(super) const TYPE_GAIN_SATURATION: usize = 4;
+
+/// Sixteenths [`GainModel::Amplified`] credits the trial's measured per-block gain at.
+///
+/// `16` is the trial's own measurement, un-amplified. `48` is where the shipped estimator's
+/// one-block sample already puts the credit, and is the value [`GainModel`]'s table and
+/// `the_type_gain_credit_is_a_magnitude_rather_than_a_shape` read the model at; nothing ships
+/// either, so this is only the value `measure_type_gain_models` sweeps around.
+pub(super) const TYPE_GAIN_AMPLIFICATION: i64 = 16;
+
+/// The extrapolation shipped encodes use, which is the one #349 measured the alternatives
+/// against and did not displace. Every other [`GainModel`] is reachable only from
+/// [`FrameEncoder::with_type_gain_model`], which a non-test build does not have.
+pub(super) const TYPE_GAIN_MODEL: GainModel = GainModel::Linear;
 
 /// Fixed-point scale of [`TypeGain::ratio`], which is a fraction in `0..=1` and needs the
 /// resolution an integer ratio of costs would otherwise lose.
@@ -481,12 +593,19 @@ pub(crate) struct FrameEncoder<'a> {
     /// [`Self::type_gain`].
     probe_dct_cost: i64,
     probe_best_cost: i64,
+    /// Transform blocks the current trial probed, which is the divisor of the per-block gain
+    /// [`GainModel::PerBlock`] and [`GainModel::Saturating`] extrapolate from. It is not always
+    /// [`Self::type_gain_probes`]: a trial with fewer blocks than that probes all of them.
+    probe_blocks: i64,
     /// Size searches run so far this frame, which is what [`TYPE_GAIN_SAMPLE_INTERVAL`] samples.
     size_searches: usize,
     /// Summed DCT-only cost of every block the current trial actually searched, which is the base
     /// the measured gain is extrapolated over. Zero-skipped blocks are excluded: no transform type
     /// can improve a block that codes no coefficients.
     trial_searched_cost: i64,
+    /// How many blocks that cost is summed over, which is the base a per-block gain is
+    /// extrapolated over. Zero-skipped blocks are excluded from it for the same reason.
+    trial_searched_blocks: i64,
     /// Set by [`Self::without_search_shortcuts`] to restore the original exhaustive search, so a
     /// test can compare the shortcuts against the search they stand in for.
     #[cfg(test)]
@@ -552,6 +671,18 @@ pub(crate) struct FrameEncoder<'a> {
     /// so a test can measure the probing asymmetry away. `false` outside tests.
     #[cfg(test)]
     unified_type_gain: bool,
+    /// The extrapolation in force, so a test can sweep the credit's shape against the probe
+    /// count. [`TYPE_GAIN_MODEL`] outside tests.
+    #[cfg(test)]
+    type_gain_model: GainModel,
+    /// The block count [`GainModel::Saturating`]'s credit saturates at, so a test can sweep it.
+    /// [`TYPE_GAIN_SATURATION`] outside tests.
+    #[cfg(test)]
+    type_gain_saturation: usize,
+    /// The sixteenths [`GainModel::Amplified`] credits at, so a test can sweep it.
+    /// [`TYPE_GAIN_AMPLIFICATION`] outside tests.
+    #[cfg(test)]
+    type_gain_amplification: i64,
     /// Transform-type candidates actually transformed, quantized and reconstructed, which is the
     /// work the shortcuts exist to remove.
     #[cfg(test)]
@@ -754,8 +885,10 @@ impl<'a> FrameEncoder<'a> {
             gain_column: 0,
             probe_dct_cost: 0,
             probe_best_cost: 0,
+            probe_blocks: 0,
             size_searches: 0,
             trial_searched_cost: 0,
+            trial_searched_blocks: 0,
             #[cfg(test)]
             exhaustive: false,
             #[cfg(test)]
@@ -782,6 +915,12 @@ impl<'a> FrameEncoder<'a> {
             type_gain_probe_trust: TYPE_GAIN_PROBE_TRUST,
             #[cfg(test)]
             unified_type_gain: false,
+            #[cfg(test)]
+            type_gain_model: TYPE_GAIN_MODEL,
+            #[cfg(test)]
+            type_gain_saturation: TYPE_GAIN_SATURATION,
+            #[cfg(test)]
+            type_gain_amplification: TYPE_GAIN_AMPLIFICATION,
             #[cfg(test)]
             type_gain_memory: TYPE_GAIN_MEMORY,
             #[cfg(test)]
@@ -1084,6 +1223,73 @@ impl<'a> FrameEncoder<'a> {
     #[cfg(not(test))]
     fn unified_type_gain(&self) -> bool {
         false
+    }
+
+    /// Overrides the extrapolation the correction uses, so a sweep can cross the credit's shape
+    /// with the probe count instead of asserting the shipped shape is right.
+    #[cfg(test)]
+    pub(crate) fn with_type_gain_model(mut self, model: GainModel) -> Self {
+        self.type_gain_model = model;
+        self
+    }
+
+    /// The extrapolation in force. [`TYPE_GAIN_MODEL`] outside tests.
+    #[cfg(test)]
+    fn type_gain_model(&self) -> GainModel {
+        self.type_gain_model
+    }
+
+    /// The extrapolation in force. [`TYPE_GAIN_MODEL`] outside tests.
+    #[cfg(not(test))]
+    fn type_gain_model(&self) -> GainModel {
+        TYPE_GAIN_MODEL
+    }
+
+    /// Overrides where [`GainModel::Saturating`]'s credit saturates, so a sweep can choose it.
+    #[cfg(test)]
+    pub(crate) fn with_type_gain_saturation(mut self, blocks: usize) -> Self {
+        assert!(
+            blocks >= 1,
+            "a credit saturating at no blocks credits nothing"
+        );
+        self.type_gain_saturation = blocks;
+        self
+    }
+
+    /// Where [`GainModel::Saturating`]'s credit saturates. [`TYPE_GAIN_SATURATION`] outside
+    /// tests.
+    #[cfg(test)]
+    fn type_gain_saturation(&self) -> i64 {
+        self.type_gain_saturation as i64
+    }
+
+    /// Where [`GainModel::Saturating`]'s credit saturates. [`TYPE_GAIN_SATURATION`] outside
+    /// tests.
+    #[cfg(not(test))]
+    fn type_gain_saturation(&self) -> i64 {
+        TYPE_GAIN_SATURATION as i64
+    }
+
+    /// Overrides how far [`GainModel::Amplified`] credits a measured per-block gain, so a sweep
+    /// can choose it.
+    #[cfg(test)]
+    pub(crate) fn with_type_gain_amplification(mut self, sixteenths: i64) -> Self {
+        self.type_gain_amplification = sixteenths;
+        self
+    }
+
+    /// The sixteenths [`GainModel::Amplified`] credits at. [`TYPE_GAIN_AMPLIFICATION`] outside
+    /// tests.
+    #[cfg(test)]
+    fn type_gain_amplification(&self) -> i64 {
+        self.type_gain_amplification
+    }
+
+    /// The sixteenths [`GainModel::Amplified`] credits at. [`TYPE_GAIN_AMPLIFICATION`] outside
+    /// tests.
+    #[cfg(not(test))]
+    fn type_gain_amplification(&self) -> i64 {
+        TYPE_GAIN_AMPLIFICATION
     }
 
     /// Encodes the tile and returns the symbol-coded bytes (`decode_tile`, §5.11.2).
@@ -1430,7 +1636,9 @@ impl<'a> FrameEncoder<'a> {
             };
             self.probe_dct_cost = 0;
             self.probe_best_cost = 0;
+            self.probe_blocks = 0;
             self.trial_searched_cost = 0;
+            self.trial_searched_blocks = 0;
             let cost = self.code_block_transforms(r, c, bw, tx_width, false);
             self.restore(snapshot);
             // Correcting a context-consistent trial would double-count: the type search's gain is
@@ -1501,10 +1709,10 @@ impl<'a> FrameEncoder<'a> {
         let (num, den) = (memory as i64 - 1, memory as i64);
         gain.dct_cost = gain.dct_cost * num / den;
         gain.best_cost = gain.best_cost * num / den;
+        gain.probes = gain.probes * num / den;
         #[cfg(test)]
         {
             gain.ratio = gain.ratio * num / den;
-            gain.probes = gain.probes * num / den;
         }
     }
 
@@ -1517,8 +1725,8 @@ impl<'a> FrameEncoder<'a> {
                 0
             };
             gain.ratio = (gain.ratio * gain.probes + probe_ratio) / (gain.probes + 1);
-            gain.probes += 1;
         }
+        gain.probes += 1;
         gain.dct_cost += dct;
         gain.best_cost += best_of_set;
     }
@@ -1527,30 +1735,38 @@ impl<'a> FrameEncoder<'a> {
     /// and [`Self::type_gain_ratio`] select. Outside tests there is only the running
     /// accumulator's ratio of sums, which is what the sweeps measured every arm against.
     #[cfg(test)]
-    fn remembered_gain(&self, running: TypeGain, slot: usize) -> (i64, i64) {
+    fn remembered_gain(&self, running: TypeGain, slot: usize) -> (i64, i64, i64) {
         let column = self.column_gain[self.gain_column * TYPE_GAIN_SIZES + slot];
-        let (dct, best) = match self.type_gain_locality() {
-            GainLocality::Running => (running.dct_cost, running.best_cost),
-            GainLocality::Column => (column.dct_cost, column.best_cost),
+        let (dct, best, probes) = match self.type_gain_locality() {
+            GainLocality::Running => (running.dct_cost, running.best_cost, running.probes),
+            GainLocality::Column => (column.dct_cost, column.best_cost, column.probes),
             GainLocality::Blended => (
                 running.dct_cost + column.dct_cost,
                 running.best_cost + column.best_cost,
+                running.probes + column.probes,
             ),
         };
         match self.type_gain_ratio() {
-            GainRatio::Weighted => (dct, best),
+            GainRatio::Weighted => (dct, best, probes),
             // The mean is already a ratio, so it is handed back over `GAIN_RATIO_ONE` and the
             // subtraction in `corrected_trial_cost` is the same either way.
             GainRatio::Mean => {
+                // The mean is a ratio of costs and carries no block count with it, so it can
+                // only be read by the model that consumes a ratio of costs.
+                debug_assert_eq!(
+                    self.type_gain_model(),
+                    GainModel::Linear,
+                    "a per-block model cannot read a gain expressed as a ratio of costs"
+                );
                 let ratio = match self.type_gain_locality() {
                     GainLocality::Running => running.ratio,
                     GainLocality::Column => column.ratio,
                     GainLocality::Blended => (running.ratio + column.ratio) / 2,
                 };
                 if dct <= 0 {
-                    (0, 0)
+                    (0, 0, 0)
                 } else {
-                    (GAIN_RATIO_ONE, GAIN_RATIO_ONE - ratio)
+                    (GAIN_RATIO_ONE, GAIN_RATIO_ONE - ratio, probes)
                 }
             }
         }
@@ -1559,30 +1775,38 @@ impl<'a> FrameEncoder<'a> {
     /// Discounts a size trial's DCT-only cost by what the type search has been measured to be
     /// worth at this transform size.
     ///
-    /// With `p` this size's probed blocks and `s` every block this trial searched, the estimate
-    /// is `sum(best_p)/sum(dct_p)` applied to `sum(dct_s)`, which reduces to subtracting
-    /// `(dct_p - best_p) * dct_s / dct_p`. Blocks the zero-block shortcut decided are not in `s`:
-    /// no transform type improves a block that codes no coefficients. A trial that probed uses
-    /// its own `p`; one that skipped the probe uses every block sampled at that size so far this
-    /// frame instead, so it is still corrected - by the ratio a probe of its own would have been
-    /// measuring.
+    /// A probe measures `dct_p - best_p` over `p` blocks and the trial has `b` searched blocks
+    /// costing `dct_b`; the model is what turns the first into a credit against the second.
+    /// Blocks the zero-block shortcut decided are in neither: no transform type improves a block
+    /// that codes no coefficients. A trial that probed uses its own `p`; one that skipped the
+    /// probe uses every block sampled at that size so far this frame instead, so it is still
+    /// corrected - by the measurement a probe of its own would have been taking.
+    ///
+    /// [`GainModel::Linear`] scales the measurement by `dct_b / dct_p`, [`GainModel::PerBlock`]
+    /// by `b / p`, and [`GainModel::Saturating`] by `e(b) / p`. Only the last of the three is
+    /// still a model when `p` reaches `b`: the other two collapse to the measurement itself, so
+    /// how much a trial is credited depends on whether the probe count happened to cover it, and
+    /// raising the probe count moves the *sizes* against each other rather than only sharpening
+    /// the estimate. That is the dependence [`TYPE_GAIN_SATURATION`] removes.
     fn corrected_trial_cost(&self, cost: i64, tx_width: usize) -> i64 {
         let measured_here = self.probe_dct_cost > 0 && !self.unified_type_gain();
-        let (dct, best) = if measured_here {
-            (self.probe_dct_cost, self.probe_best_cost)
+        let (dct, best, probes) = if measured_here {
+            (self.probe_dct_cost, self.probe_best_cost, self.probe_blocks)
         } else {
             let slot = type_gain_slot(tx_width);
             let running = self.type_gain[slot];
             #[cfg(not(test))]
             {
-                (running.dct_cost, running.best_cost)
+                (running.dct_cost, running.best_cost, running.probes)
             }
             #[cfg(test)]
             {
                 self.remembered_gain(running, slot)
             }
         };
-        if dct <= 0 {
+        // A trial every block of which the zero-block shortcut decided has nothing to credit,
+        // and no probe or accumulator to credit it from.
+        if dct <= 0 || probes <= 0 || self.trial_searched_blocks <= 0 {
             return cost;
         }
         let mut measured = dct - best;
@@ -1592,7 +1816,27 @@ impl<'a> FrameEncoder<'a> {
             self.type_gain_trust()
         };
         measured = measured * trust / TYPE_GAIN_TRUST_ONE;
-        cost - measured.saturating_mul(self.trial_searched_cost) / dct
+        let blocks = self.trial_searched_blocks;
+        let credit = match self.type_gain_model() {
+            GainModel::Linear => measured.saturating_mul(self.trial_searched_cost) / dct,
+            GainModel::PerBlock => measured.saturating_mul(blocks) / probes,
+            GainModel::Amplified => {
+                let numerator = i128::from(measured)
+                    * i128::from(blocks)
+                    * i128::from(self.type_gain_amplification());
+                let denominator = i128::from(probes) * i128::from(TYPE_GAIN_TRUST_ONE);
+                (numerator / denominator) as i64
+            }
+            GainModel::Saturating => {
+                // `e(b) = b * s / (b + s - 1)`, evaluated together with the `/ p` so the
+                // saturation is not rounded away on a trial of one or two blocks.
+                let saturation = self.type_gain_saturation();
+                let numerator = i128::from(measured) * i128::from(blocks) * i128::from(saturation);
+                let denominator = i128::from(probes) * i128::from(blocks + saturation - 1);
+                (numerator / denominator) as i64
+            }
+        };
+        cost - credit
     }
 
     /// Walks a coding block's transform blocks in the decoder's raster order, reconstructing
@@ -1806,6 +2050,7 @@ impl<'a> FrameEncoder<'a> {
             let best_of_set = cheapest.min(dct);
             self.probe_dct_cost += dct;
             self.probe_best_cost += best_of_set;
+            self.probe_blocks += 1;
             let slot = type_gain_slot(size);
             let memory = self.type_gain_memory();
             Self::decay(&mut self.type_gain[slot], memory);
@@ -1823,6 +2068,7 @@ impl<'a> FrameEncoder<'a> {
         let cost = self.write_candidate(x, y, block_width, size, prediction, &winner, &scan, emit);
         if trial {
             self.trial_searched_cost += cost;
+            self.trial_searched_blocks += 1;
         }
         cost
     }
