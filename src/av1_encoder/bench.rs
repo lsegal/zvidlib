@@ -75,8 +75,8 @@ pub fn fwht4x4_plane(plane: &[u8], width: usize, height: usize) -> Vec<u8> {
 /// flat input [`iwht4x4_plane`] runs over.
 ///
 /// Built outside the timed loop so the inverse group measures the inverse WHT
-/// and not the forward one, and built through [`fwht4x4_scalar`] rather than
-/// the dispatching [`fwht4x4`] so the input is the same bytes on every host
+/// and not the forward one, and built through `wht::fwht4x4_scalar` rather than
+/// the dispatching `wht::fwht4x4` so the input is the same bytes on every host
 /// and under every instruction-set override — a setup step that varied with
 /// the arm would make the inverse group's bit-exactness guard compare
 /// different inputs rather than different kernels.
