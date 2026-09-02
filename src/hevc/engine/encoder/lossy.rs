@@ -2125,6 +2125,53 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "scratch"]
+    fn scratch_points() {
+        for (name, width, height, smooth, qp) in [
+            ("smooth 64x48", 64usize, 48usize, true, 12i32),
+            ("smooth 128x96", 128, 96, true, 12),
+            ("noise 64x48", 64, 48, false, 37),
+            ("noise 128x96", 128, 96, false, 37),
+            ("noise 128x96", 128, 96, false, 30),
+            ("noise 128x96", 128, 96, false, 32),
+        ] {
+            let (y, cb, cr) = if smooth { smooth_picture(width, height) } else { picture(width, height) };
+            let ((ob, op), (nb, np)) = sao_on_off(&y, &cb, &cr, width, height, qp);
+            println!("POINT {name} qp {qp}: {ob} -> {nb} bytes, {op:.3} -> {np:.3} dB ({:+.3})", np - op);
+        }
+    }
+
+    #[test]
+    #[ignore = "scratch"]
+    fn scratch_merge_census() {
+        for (name, width, height, smooth, qps) in [
+            ("noise 64x48", 64usize, 48usize, false, vec![12i32, 32, 37]),
+            ("noise 128x96", 128, 96, false, vec![12, 32, 37]),
+            ("smooth 128x96", 128, 96, true, vec![12, 32]),
+        ] {
+            let (y, cb, cr) = if smooth { smooth_picture(width, height) } else { picture(width, height) };
+            for qp in qps {
+                let grid = sao_grid(&y, &cb, &cr, width, height, qp);
+                let ctbs_x = width.div_ceil(64);
+                let n = grid.len();
+                let mut merged = 0;
+                let mut band = 0;
+                let mut off = 0;
+                for addr in 0..n {
+                    let (rx, ry) = (addr % ctbs_x, addr / ctbs_x);
+                    let here = grid[addr];
+                    let left = (rx > 0).then(|| grid[addr - 1]);
+                    let above = (ry > 0).then(|| grid[addr - ctbs_x]);
+                    if left == Some(here) || above == Some(here) { merged += 1; }
+                    if here.components.iter().any(|c| c.sao_type_idx == 1) { band += 1; }
+                    if here.components.iter().all(|c| c.sao_type_idx == 0) { off += 1; }
+                }
+                println!("CENSUS {name} qp {qp}: {n} ctbs, merged {merged}, any-band {band}, all-off {off}");
+            }
+        }
+    }
+
+    #[test]
     fn the_search_picks_band_offset_where_it_beats_every_edge_class() {
         // The band path of §7.3.8.3 — four `sao_offset_sign` bins and a
         // five-bin `sao_band_position` — is only ever written when the search
