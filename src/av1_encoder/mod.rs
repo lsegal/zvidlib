@@ -2906,11 +2906,19 @@ mod nonlossless_tests {
     ///
     /// **It cannot ship.** A context-consistent trial is the exhaustive type search, run once per
     /// size candidate instead of once per emitted block, so it buys a candidate reduction of only
-    /// 1.69x-1.93x where `the_search_shortcuts_stay_within_their_rate_and_distortion_bound`
+    /// 1.69x-2.00x where `the_search_shortcuts_stay_within_their_rate_and_distortion_bound`
     /// requires 4x - between 2.2x and 2.9x more transform-type candidates than the shipped
     /// estimator. The bound is asserted here in the failing direction on purpose: if some later
     /// change ever makes a context-consistent trial fit inside `4x`, this test fails and says so,
     /// which is the outcome worth being told about.
+    ///
+    /// Those numbers are already net of the exact cost bound #388 added - a trial whose partial
+    /// `sse + lambda * bits` sum passes the incumbent size's has lost and is abandoned where it
+    /// stands. It is worth 0.00x-0.07x here and up to 0.30x across the tuning set, which is the
+    /// measure of how little of this arm's cost is spent on trials that were going to lose.
+    /// `a_bounded_context_consistent_size_trial_keeps_the_ranking_and_still_costs_too_much` is
+    /// where the rest of #388's answer is: restricting the consistency to the size trial makes it
+    /// twice as cheap and still not cheap enough, and costs 0.31 dB at `base_q_idx` 1 for it.
     ///
     /// The shipped estimator's disagreement at `base_q_idx` 1 is asserted too, so the comparison
     /// is not vacuous - a frame where every arm already agreed would pass the first half of this
@@ -2992,51 +3000,66 @@ mod nonlossless_tests {
     }
 
     /// A context-consistent trial restricted to the size search, and bounded by the incumbent
-    /// size's cost, keeps the exhaustive search's size ranking - and still cannot be afforded.
+    /// size's cost, keeps the exhaustive search's size ranking exactly - and is *worse* than the
+    /// estimator it would replace.
     ///
     /// This is #388's answer, and it is the second of the two outcomes that issue asks for: the
-    /// bound cannot be reached, and this is the measurement of why.
+    /// 4x bound cannot be reached, and this is the measurement of why, on the frame the shortcut
+    /// bound itself is asserted on.
     ///
-    /// **Two exact reductions, neither available to the shipped estimator.**
+    /// **Two exact reductions, neither of them available to the shipped estimator.**
     ///
-    /// 1. *Consistency only where the ranking needs it.* The counterfactual #356 named belongs to
-    ///    the size trial; making every other speculative pass code the full type set as well is
-    ///    what made `with_context_consistent_trials` cost the exhaustive search. Under
-    ///    `with_context_consistent_size_trials` the partition search's whole-block and
-    ///    split-subtree measurements stay on the set's `DCT_DCT`, exactly as they do in the
-    ///    shipped search, and the size decisions are *still* the exhaustive search's on every
-    ///    coding block at every quantizer here. What is given up is the byte-for-byte identity
-    ///    the arm above asserts - that was being carried by the partition passes, not by the size
-    ///    trial - and what it costs is asserted below against the shortcut bound's own 0.05 dB
-    ///    and 1.5%, both of which it holds.
+    /// 1. *Consistency only where the size ranking needs it.* The counterfactual #356 named
+    ///    belongs to the size trial; making every other speculative pass code the full type set
+    ///    as well is what makes `with_context_consistent_trials` cost the exhaustive search.
+    ///    Under `with_context_consistent_size_trials` the partition search's whole-block and
+    ///    split-subtree measurements stay on the set's `DCT_DCT`, exactly as the shipped search
+    ///    leaves them, and the size decisions are still the exhaustive search's - every coding
+    ///    block, every quantizer here, asserted below.
     /// 2. *A cost bound on the trial.* A trial's cost is a sum of `sse + lambda * bits` over its
-    ///    blocks, so it only grows: once the partial sum passes the incumbent size's, the size
-    ///    has lost and the rest of its blocks need not be searched at all. That is exact, and it
-    ///    is available only to a context-consistent trial - the shipped trial ranks on
+    ///    blocks, so it only grows: once the partial sum passes the incumbent size's the size has
+    ///    lost, and the rest of its blocks need not be searched at all. That is exact, and it is
+    ///    available only to a context-consistent trial - the shipped trial ranks on
     ///    `corrected_trial_cost`, which subtracts a credit the trial has not finished measuring,
-    ///    so no partial sum of its is a proof of anything. `abandoned_trials` is asserted
-    ///    non-zero so the saving is known to be reached rather than assumed.
+    ///    so no partial sum of its own is a proof of anything. `abandoned_trials` is asserted
+    ///    non-zero (42-67 per frame here) so the saving is known to be reached rather than
+    ///    assumed.
     ///
-    /// Together they take the candidate reduction from the 1.00x-1.93x
-    /// `a_context_consistent_size_trial_ranks_like_the_exhaustive_search_and_costs_like_it`
-    /// records to 1.13x-3.27x across the tuning set at 128x96 and 2.06x-2.34x on `test_pattern`
-    /// there. It is not enough, and the arithmetic of why is not close.
+    /// Together they take the candidate reduction from the 1.69x-2.00x the arm above measures to
+    /// 2.05x-2.23x here, and from 1.00x-1.93x to 1.13x-3.27x across the tuning set at 128x96.
+    /// The 4x bound is still not close, and the arithmetic of the gap is not close either.
     ///
     /// **What the bound leaves to spend.** Under `reduced_tx_set = 1` an intra block's derived
-    /// set is `TX_SET_INTRA_2` - five types - at 4x4, 8x8 and 16x16, and DCT-only at 32x32. So an
+    /// set is `TX_SET_INTRA_2` - five types - at 4x4, 8x8 and 16x16, and DCT-only at 32x32, so an
     /// exact per-block minimum costs five candidates where the DCT-only ranking costs one: four
-    /// extra on every block a size trial searches. The 4x bound's whole budget is
-    /// `exhaustive / 4`, and the shipped ranking already spends most of it on the passes both
-    /// arms share; what is left, divided over the blocks a consistent trial must search, is the
-    /// per-block allowance asserted below. It is under one candidate on `test_pattern` here and
-    /// negative on 30 of the 48 frame-and-quantizer pairs at 128x96, where the shipped search
-    /// itself does not reach 4x. There is no pruning of a five-type set into that allowance that
-    /// still returns the set's minimum, which is what "exact" means here; anything that fits is
-    /// an estimate of the minimum, and an estimate of the minimum is the DCT-and-credit ranking
-    /// this issue exists to replace. #349 already crossed every shape that estimate could take.
+    /// extra on every block a size trial searches. The whole budget the 4x bound allows is
+    /// `exhaustive / 4`, the shipped ranking already spends most of it on the passes both arms
+    /// share, and what is left divided over the blocks a consistent trial must search is
+    /// 0.21-0.72 candidates per block on this frame - negative on 30 of the 48 frame-and-quantizer
+    /// pairs at 128x96, where the shipped search does not itself reach 4x. No pruning of a
+    /// five-type set fits four extra candidates into that allowance and still returns the set's
+    /// minimum, and returning something other than the minimum is an *estimate* of it, which is
+    /// the DCT-and-credit ranking this issue exists to replace. #349 crossed every shape that
+    /// estimate can take.
     ///
-    /// The cost assertion is in the failing direction, like the one above: if a later change ever
-    /// does bring a bounded context-consistent trial inside 4x, this test fails and says so.
+    /// **The part that was not expected, and is the real answer.** The affordable form of
+    /// consistency is not merely short of the candidate bound - it is worse than what ships. At
+    /// `base_q_idx` 1 it reconstructs 0.312 dB *below* the exhaustive search, six times the
+    /// shortcut bound's 0.05 dB, where the shipped estimator reconstructs 0.023 dB *above* it.
+    /// The size decisions it makes are the exhaustive search's by construction, so the loss is
+    /// not in the size ranking at all: it is that the partition search then ranks DCT-only costs
+    /// over sizes chosen by a search whose costs it cannot see, and the two rankings disagree
+    /// where they used to be consistently wrong together. The byte-for-byte identity the arm
+    /// above records was being carried by the *partition* passes, not by the size trial.
+    ///
+    /// So the ~0.2 dB the size ranking carries at `base_q_idx` 1 is not reachable by making the
+    /// size trial affordable. The half of consistency that is affordable does not carry the gain,
+    /// and the half that carries it is inseparable from the partition passes, which together are
+    /// the exhaustive search. That closes the route this issue opened.
+    ///
+    /// Both halves are asserted in the failing direction, like the arm above: a change that
+    /// brings the bounded trial inside 4x, or that makes it hold the 0.05 dB bound, fails this
+    /// test and says so.
     #[test]
     fn a_bounded_context_consistent_size_trial_keeps_the_ranking_and_still_costs_too_much() {
         let (width, height) = (96_usize, 80_usize);
@@ -3081,52 +3104,66 @@ mod nonlossless_tests {
                 "qindex {qindex}: no size trial was ever abandoned by the incumbent's cost, so \
                  the bound this arm is named for buys nothing on this frame"
             );
-            // It holds the shortcut bound's quality and rate halves; only the candidate half
-            // fails, which is the whole of the finding.
-            let (bounded_psnr, exhaustive_psnr) = (quality(&bounded), quality(&exhaustive));
-            assert!(
-                bounded_psnr >= exhaustive_psnr - 0.05,
-                "qindex {qindex} reconstructed at {bounded_psnr:.3} dB against the exhaustive \
-                 search's {exhaustive_psnr:.3} dB"
-            );
-            let growth = bounded.tile.len() as f64 / exhaustive.tile.len() as f64 - 1.0;
-            assert!(
-                growth <= 0.015,
-                "qindex {qindex} spent {} bytes against the exhaustive search's {} ({:+.2}%)",
-                bounded.tile.len(),
-                exhaustive.tile.len(),
-                growth * 100.0
-            );
+            // The cost half, in the failing direction like the arm above: this is the 4x
+            // reduction the shortcut bound requires, and the bounded trial is still well under
+            // it at 2.05x-2.23x here.
             assert!(
                 bounded.candidates_evaluated * 4 >= exhaustive.candidates_evaluated,
                 "qindex {qindex}: a bounded context-consistent size trial evaluated {} \
                  transform-type candidates against the exhaustive search's {}, which is inside \
-                 the 4x reduction `the_search_shortcuts_stay_within_their_rate_and_distortion_\
-                 bound` requires - if that is genuinely so, it can replace the DCT-only ranking \
-                 and the transform-gain correction with it",
+                 the 4x reduction the shortcut bound requires - if that is genuinely so, it can \
+                 replace the DCT-only ranking and the transform-gain correction with it",
                 bounded.candidates_evaluated,
                 exhaustive.candidates_evaluated
             );
-            // And the reason it cannot be pruned into the bound: the budget the bound leaves,
-            // spread over the blocks a consistent trial has to search, is less than the four
-            // extra candidates an exact per-block minimum over `TX_SET_INTRA_2` costs.
+            // And why no pruning closes the gap: the budget the 4x bound leaves once the passes
+            // both arms share are paid for, spread over the blocks a consistent trial has to
+            // search, is 0.21-0.72 candidates per block against the four an exact minimum over
+            // the five-type intra set costs.
             let shipped =
                 tile::FrameEncoder::new(&pixels, width, height, qindex).encode_with_report();
-            let budget = exhaustive.candidates_evaluated as f64 / 4.0
-                - shipped.candidates_evaluated as f64;
+            let budget =
+                exhaustive.candidates_evaluated as f64 / 4.0 - shipped.candidates_evaluated as f64;
             let blocks = bounded.consistent_trial_blocks as f64;
             assert!(
                 blocks > 0.0,
-                "qindex {qindex}: no block was searched by a context-consistent size trial"
+                "qindex {qindex}: no block was searched by a context-consistent size trial, so \
+                 the allowance below is divided by nothing"
             );
             assert!(
                 budget / blocks < EXTRA_PER_BLOCK,
                 "qindex {qindex}: the 4x bound leaves {:.2} candidates per trial block once the \
-                 shipped ranking is paid for, which is the {EXTRA_PER_BLOCK} an exact minimum \
+                 shipped ranking is paid for, which is the {EXTRA_PER_BLOCK:.0} an exact minimum \
                  over the five-type intra set costs - a context-consistent trial fits inside the \
                  bound with no pruning at all and should be shipped",
                 budget / blocks
             );
+            // The quality half, and the finding this test exists for. The affordable form of
+            // consistency is not merely short of the bound: at `base_q_idx` 1 it reconstructs
+            // 0.312 dB below the exhaustive search where the shipped estimator reconstructs
+            // 0.023 dB *above* it. An exactly correct size ranking read by a DCT-only partition
+            // search is worse than the approximate one, because the partition ranking cannot
+            // cost the sizes the exact trial hands it. Asserted in the failing direction: a
+            // change that makes the affordable arm hold the shortcut bound is the news.
+            let (bounded_psnr, exhaustive_psnr) = (quality(&bounded), quality(&exhaustive));
+            if qindex == 1 {
+                assert!(
+                    bounded_psnr < exhaustive_psnr - 0.05,
+                    "qindex 1: a bounded context-consistent size trial reconstructed at \
+                     {bounded_psnr:.3} dB against the exhaustive search's {exhaustive_psnr:.3} \
+                     dB, which holds the shortcut bound's 0.05 dB - the affordable half of \
+                     consistency now carries the size ranking's residual and only its candidate \
+                     cost is left to solve",
+                );
+                let shipped_psnr = quality(&shipped);
+                assert!(
+                    shipped_psnr > bounded_psnr,
+                    "qindex 1: the shipped estimator reconstructed at {shipped_psnr:.3} dB \
+                     against a bounded context-consistent trial's {bounded_psnr:.3} dB, so the \
+                     exact size ranking is no longer the worse of the two and this test's \
+                     conclusion no longer holds"
+                );
+            }
         }
     }
 
