@@ -28,6 +28,11 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
         run: rustup show
+      # `alsa-sys` is reached through the dev-dependency graph even without
+      # `--features native`, so the lib tests do not build on Linux without it.
+      - name: Install native audio dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - name: Report the host
         run: |
           uname -m
