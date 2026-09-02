@@ -298,6 +298,33 @@ pub(crate) enum GainRatio {
 /// re-measured at the new constants as that test's own rule requires: `scene_edge` *tightens*
 /// from 2.5% to 1%, the whole set fits under 1% except `mosaic` at +1.22% and `gain_bands` at
 /// +1.44%, and the worst frame of the tuning set falls from +1.99% to +1.44%.
+///
+/// # This is a bias, not an estimator's shrinkage
+///
+/// A shrinkage presumes there is a quantity being estimated and that the estimate is noisy. That
+/// is not the situation here, and #356 measured why. What a probe measures is the type set's gain
+/// against a DCT-only trial's reconstruction and coefficient contexts, and the emitting pass
+/// produces neither: it writes the type its own search picks and reconstructs from it. A size
+/// trial's cost is therefore a counterfactual the encoder never emits, and every ranking built on
+/// it - corrected or not - inherits that, which is why #349 found no shape of credit that moved a
+/// single size decision.
+///
+/// `a_context_consistent_size_trial_ranks_like_the_exhaustive_search_and_costs_like_it` shows the
+/// counterfactual is the whole of the residual: a trial that codes each of its blocks with the
+/// type the emitting pass would pick, and keeps it, reproduces the exhaustive search's size
+/// decisions *exactly* at every quantizer measured, byte for byte and to 0.000 dB - not three
+/// decisions better, but all of them. It also costs a candidate reduction of only 1.69x-1.93x
+/// against the exhaustive search, where `the_search_shortcuts_stay_within_their_rate_and_
+/// distortion_bound` requires 4x, so it cannot ship at any setting of anything here.
+///
+/// So this constant is not shrinking a noisy measurement of the right quantity towards its mean.
+/// It is damping a measurement of the *wrong* quantity - one taken in contexts the frame will not
+/// have - because damping it happens to cost less than believing it. That makes it a bias term,
+/// permanently and by construction rather than until a better estimator arrives, and the grid
+/// search above is the honest way to pick a bias: sweep it against the assertions it has to hold
+/// and take the cell that holds them. Read `8` as "believe half of a measurement known to be of
+/// the wrong thing", and re-derive it by re-running that grid whenever the rate model, the
+/// quantizer or the type set moves - not by reasoning about how noisy a probe is.
 pub(super) const TYPE_GAIN_TRUST: i64 = 8;
 
 /// How much of a gain a trial *measured on its own blocks* is corrected by, in
@@ -435,6 +462,19 @@ pub(crate) struct FrameEncoder<'a> {
     /// they are evaluated in.
     #[cfg(test)]
     reversed_candidates: bool,
+    /// Set by [`Self::with_context_consistent_trials`] to make a size trial code each of its
+    /// blocks with the type the emitting pass would pick, keeping that type's reconstruction and
+    /// contexts, instead of ranking on the set's DCT and correcting the ranking afterwards. This
+    /// is the trial whose ranking is the emitting pass's own; nothing ships it, because
+    /// `a_context_consistent_size_trial_costs_more_candidates_than_the_shortcuts_allow` measures
+    /// what it costs.
+    #[cfg(test)]
+    context_consistent_trials: bool,
+    /// Set by [`Self::without_type_gain_correction`] to rank sizes on the type set's `DCT_DCT`
+    /// alone - no probe, no accumulator, no correction - which is the bare ranking every
+    /// correction is applied on top of, and the baseline any of them has to beat.
+    #[cfg(test)]
+    no_type_gain_correction: bool,
     /// The sampling interval in force, so a test can sweep it and measure what
     /// [`TYPE_GAIN_SAMPLE_INTERVAL`] costs at each value instead of asserting the shipped one is
     /// right. Outside tests the constant is read directly.
@@ -687,6 +727,10 @@ impl<'a> FrameEncoder<'a> {
             #[cfg(test)]
             reversed_candidates: false,
             #[cfg(test)]
+            context_consistent_trials: false,
+            #[cfg(test)]
+            no_type_gain_correction: false,
+            #[cfg(test)]
             type_gain_interval: TYPE_GAIN_SAMPLE_INTERVAL,
             #[cfg(test)]
             force_smallest_size_probes: false,
@@ -745,6 +789,59 @@ impl<'a> FrameEncoder<'a> {
     pub(crate) fn with_reversed_candidate_order(mut self) -> Self {
         self.reversed_candidates = true;
         self
+    }
+
+    /// Makes every transform-size trial code its blocks with the type the emitting pass would
+    /// pick, and keep it.
+    ///
+    /// The shipped trial ranks a size on the type set's `DCT_DCT` alone and probes a sample of
+    /// its blocks with the rest of the set purely to *measure* - the block keeps DCT's result, so
+    /// the trial's reconstruction and coefficient contexts are a DCT-only trial's and the
+    /// measurement is credited back to the trial's total in [`Self::corrected_trial_cost`]. That
+    /// is a counterfactual: the emitting pass writes the type its own search picks and
+    /// reconstructs from it, so neither the cost the trial ranked on nor the contexts it built
+    /// are the ones the frame goes on to produce. Under this arm the trial *is* the emitting
+    /// pass, block for block, and no correction is applied on top of it, which is the only trial
+    /// whose ranking is by construction the emitting pass's own. It exists to price that, not to
+    /// ship: it costs the full type set on every searched block of every size candidate.
+    #[cfg(test)]
+    pub(crate) fn with_context_consistent_trials(mut self) -> Self {
+        self.context_consistent_trials = true;
+        self
+    }
+
+    /// Whether a size trial codes its blocks with the type the emitting pass would pick. Never,
+    /// outside tests.
+    #[cfg(test)]
+    fn context_consistent_trials(&self) -> bool {
+        self.context_consistent_trials
+    }
+
+    /// Whether a size trial codes its blocks with the type the emitting pass would pick. Never,
+    /// outside tests.
+    #[cfg(not(test))]
+    fn context_consistent_trials(&self) -> bool {
+        false
+    }
+
+    /// Ranks transform sizes on the set's `DCT_DCT` alone, with no probe and no correction, which
+    /// is the ranking [`TYPE_GAIN_TRUST`] exists to correct.
+    #[cfg(test)]
+    pub(crate) fn without_type_gain_correction(mut self) -> Self {
+        self.no_type_gain_correction = true;
+        self
+    }
+
+    /// Whether the transform-gain correction runs at all. Always, outside tests.
+    #[cfg(test)]
+    fn type_gain_correction(&self) -> bool {
+        !self.no_type_gain_correction
+    }
+
+    /// Whether the transform-gain correction runs at all. Always, outside tests.
+    #[cfg(not(test))]
+    fn type_gain_correction(&self) -> bool {
+        true
     }
 
     /// Whether the search shortcuts are on. Always, outside tests.
@@ -1272,7 +1369,12 @@ impl<'a> FrameEncoder<'a> {
         // cost 28-70% more transform-type candidates and up to +12.4% rate-distortion, for an
         // outcome the sampled estimator is not worse than.
         let large = largest.min(MAX_FORWARD_TX) >= 32;
+        // A context-consistent trial has nothing to probe: it already codes every block with the
+        // type the emitting pass would pick, so the gain a probe measures is inside its own cost.
+        let consistent = self.shortcuts() && self.context_consistent_trials();
         let probing = self.shortcuts()
+            && !consistent
+            && self.type_gain_correction()
             && (self.sample_type_gain()
                 || large
                 || (self.force_smallest_size_probes() && widths.last() == Some(&4)));
@@ -1297,7 +1399,13 @@ impl<'a> FrameEncoder<'a> {
             self.trial_searched_cost = 0;
             let cost = self.code_block_transforms(r, c, bw, tx_width, false);
             self.restore(snapshot);
-            let cost = self.corrected_trial_cost(cost, tx_width);
+            // Correcting a context-consistent trial would double-count: the type search's gain is
+            // already in the cost it just measured, on every block rather than on a sample.
+            let cost = if consistent || !self.type_gain_correction() {
+                cost
+            } else {
+                self.corrected_trial_cost(cost, tx_width)
+            };
             // Sizes are ranked by the same total order the type search uses: cost first, and an
             // exact tie broken towards the cheaper size to signal, which is the largest one -
             // its depth, and so its `read_tx_size` symbol, is the smallest. Deciding a tie by the
@@ -1588,7 +1696,7 @@ impl<'a> FrameEncoder<'a> {
         }
         let trial = self.shortcuts() && !emit;
         let mut probing = false;
-        if trial && candidates.len() > 1 {
+        if trial && candidates.len() > 1 && !self.context_consistent_trials() {
             if self.probe_budget > 0 {
                 self.probe_budget -= 1;
                 probing = true;
