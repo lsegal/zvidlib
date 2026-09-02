@@ -1103,12 +1103,12 @@ The rows with real vector work are now the ones with the largest ratios, which
 is what the old table could not show. `hevc_encode_*_rgba_to_yuv420` leads at
 6.27x and 6.06x, followed by `av1_deblock` at 6.28x, `av1_forward_dct_4x4` at
 5.55x, `av1_deblock_boundary` at 4.90x and `hevc_color_convert` at 4.76x — that
-last one read `1.00x` in the previous table, which is the one move here this
+last one read `1.00x` in the previous table, and is the one move here this
 re-take does not attribute: the #337 repair did not touch
 `hevc::color_convert`, so something between #261's draw and this one changed
-what that group measures, and finding out what is left to the follow-up. The AV1 forward transforms sit between 3.1x and 3.5x, `av1_self_guided` at
-3.49x and `av1_cdef` at 2.86x, and the motion-compensation family between 2.3x
-and 2.7x.
+what that group measures, and `#361` finds out what. The AV1 forward transforms
+sit between 3.1x and 3.5x, `av1_self_guided` at 3.49x and `av1_cdef` at 2.86x,
+and the motion-compensation family between 2.3x and 2.7x.
 
 The whole-frame encoder groups are the practical consequence.
 `av1_encode_frame_q32` reads 1.49x and `av1_encode_frame_q160` 1.53x here,
@@ -1120,8 +1120,9 @@ places, so the ratio is a property of the kernels rather than of the frame size.
 `sse4.1` beats `avx2` on a minority of rows, and by enough on two of them to be
 more than noise: `av1_encode_stage_coeff_ctx` is 3.04x under `sse4.1` against
 2.50x under `avx2`, and the `rdo_inter` pair is 1.63x/1.64x against 1.55x. The
-`Best` column already records `sse4.1` for these, so dispatch is not choosing
-wrongly; why the wider kernel is slower is not answered by this table.
+`Best` column already records `sse4.1` for these, but the dispatch site prefers
+`avx2` when the host has it, so a real encode takes the slower arm. Why the
+wider kernel is slower is not answered by this table; `#362` answers it.
 
 ## Hardware HEVC decoders
 
