@@ -278,6 +278,13 @@ pub(crate) enum GainRatio {
 /// this pair.
 pub(super) const TYPE_GAIN_TRUST: i64 = 8;
 
+/// How much of a gain a trial *measured on its own blocks* is corrected by, in
+/// [`TYPE_GAIN_TRUST_ONE`] sixteenths.
+///
+/// Provisional: swept by `measure_type_gain_probe_trust`. `16` is the un-shrunk correction this
+/// replaced, which was an assumption rather than a measurement.
+pub(super) const TYPE_GAIN_PROBE_TRUST: i64 = 16;
+
 /// [`TYPE_GAIN_TRUST`] denominator: the un-shrunk correction.
 const TYPE_GAIN_TRUST_ONE: i64 = 16;
 
@@ -419,6 +426,10 @@ pub(crate) struct FrameEncoder<'a> {
     /// The shrinkage in force, in the units of [`TYPE_GAIN_TRUST`], so a test can sweep it.
     #[cfg(test)]
     type_gain_trust: i64,
+    /// The shrinkage a trial's own probe measurement is corrected by, so a test can sweep it.
+    /// [`TYPE_GAIN_PROBE_TRUST`] outside tests.
+    #[cfg(test)]
+    type_gain_probe_trust: i64,
     /// Transform-type candidates actually transformed, quantized and reconstructed, which is the
     /// work the shortcuts exist to remove.
     #[cfg(test)]
@@ -642,6 +653,8 @@ impl<'a> FrameEncoder<'a> {
             #[cfg(test)]
             type_gain_trust: TYPE_GAIN_TRUST,
             #[cfg(test)]
+            type_gain_probe_trust: TYPE_GAIN_PROBE_TRUST,
+            #[cfg(test)]
             type_gain_memory: TYPE_GAIN_MEMORY,
             #[cfg(test)]
             candidates_evaluated: 0,
@@ -847,6 +860,29 @@ impl<'a> FrameEncoder<'a> {
     #[cfg(not(test))]
     fn type_gain_trust(&self) -> i64 {
         TYPE_GAIN_TRUST
+    }
+
+    /// Overrides how far a trial's *own* probe measurement is shrunk, so a test can sweep it.
+    #[cfg(test)]
+    pub(crate) fn with_type_gain_probe_trust(mut self, trust: i64) -> Self {
+        assert!(
+            (0..=TYPE_GAIN_TRUST_ONE).contains(&trust),
+            "shrinkage is a fraction"
+        );
+        self.type_gain_probe_trust = trust;
+        self
+    }
+
+    /// The measured-gain shrinkage in force. [`TYPE_GAIN_PROBE_TRUST`] outside tests.
+    #[cfg(test)]
+    fn type_gain_probe_trust(&self) -> i64 {
+        self.type_gain_probe_trust
+    }
+
+    /// The measured-gain shrinkage in force. [`TYPE_GAIN_PROBE_TRUST`] outside tests.
+    #[cfg(not(test))]
+    fn type_gain_probe_trust(&self) -> i64 {
+        TYPE_GAIN_PROBE_TRUST
     }
 
     /// Encodes the tile and returns the symbol-coded bytes (`decode_tile`, §5.11.2).
@@ -1337,9 +1373,12 @@ impl<'a> FrameEncoder<'a> {
             return cost;
         }
         let mut measured = dct - best;
-        if self.probe_dct_cost <= 0 {
-            measured = measured * self.type_gain_trust() / TYPE_GAIN_TRUST_ONE;
-        }
+        let trust = if self.probe_dct_cost > 0 {
+            self.type_gain_probe_trust()
+        } else {
+            self.type_gain_trust()
+        };
+        measured = measured * trust / TYPE_GAIN_TRUST_ONE;
         cost - measured.saturating_mul(self.trial_searched_cost) / dct
     }
 

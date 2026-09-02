@@ -1514,7 +1514,7 @@ mod nonlossless_tests {
         let ramp = |x: u32, y: u32| (((x + y) % 32) * 8) as u8;
         // A region it cannot: full-range noise, uncorrelated in both axes.
         let mut state = 0xC0FF_EE01_u32;
-        let mut noisy = {
+        let noisy = {
             let values: Vec<u8> = (0..width * height)
                 .map(|_| (lcg(&mut state) >> 24) as u8)
                 .collect();
@@ -1548,6 +1548,331 @@ mod nonlossless_tests {
             ("gain_bands", gain_bands),
             ("gain_mosaic", gain_mosaic),
         ]
+    }
+
+    /// One cell of a calibration sweep: the three knobs whose values it varies.
+    #[derive(Clone, Copy)]
+    struct GainArm {
+        probe_trust: i64,
+        trust: i64,
+        memory: usize,
+    }
+
+    impl GainArm {
+        fn apply<'a>(self, encoder: tile::FrameEncoder<'a>) -> tile::FrameEncoder<'a> {
+            encoder
+                .with_type_gain_probe_trust(self.probe_trust)
+                .with_type_gain_trust(self.trust)
+                .with_type_gain_memory(self.memory)
+        }
+    }
+
+    /// The frames a calibration sweep runs on, at both sizes: [`content_frames`], the encoder's
+    /// own `test_pattern`, and the [`gain_frames`] that separate the type gain.
+    fn tuning_set() -> Vec<(usize, usize, Vec<(&'static str, Vec<u8>)>)> {
+        [(128_usize, 96_usize), (192, 160)]
+            .into_iter()
+            .map(|(width, height)| {
+                let mut frames = content_frames(width as u32, height as u32);
+                frames.push(("test_pattern", test_pattern(width as u32, height as u32)));
+                frames.extend(gain_frames(width as u32, height as u32));
+                (width, height, frames)
+            })
+            .collect()
+    }
+
+    /// The cost of the same estimator probing *every* size search, which is what a sampled
+    /// arm's penalty is measured against and does not itself depend on any of the constants.
+    fn unsampled_costs(
+        sets: &[(usize, usize, Vec<(&'static str, Vec<u8>)>)],
+    ) -> std::collections::BTreeMap<(usize, &'static str, u8), i64> {
+        let mut costs = std::collections::BTreeMap::new();
+        for (width, height, frames) in sets {
+            for (name, pixels) in frames {
+                for qindex in DETERMINISM_QINDEXES {
+                    let ac = i64::from(crate::av1_intra::get_ac_quant(qindex));
+                    let lambda = (ac * ac / 256).max(1);
+                    let report = tile::FrameEncoder::new(pixels, *width, *height, qindex)
+                        .with_type_gain_interval(1)
+                        .encode_with_report();
+                    let cost = sse_against(&report, pixels, *width, *height)
+                        + lambda * report.tile.len() as i64 * 8;
+                    costs.insert((*width, *name, qindex), cost);
+                }
+            }
+        }
+        costs
+    }
+
+    /// The worst frame's and the mean penalty an arm costs over [`tuning_set`], against the
+    /// unsampled estimator.
+    fn tuning_set_penalty(
+        sets: &[(usize, usize, Vec<(&'static str, Vec<u8>)>)],
+        unsampled: &std::collections::BTreeMap<(usize, &'static str, u8), i64>,
+        arm: GainArm,
+    ) -> (f64, String, f64) {
+        let mut worst = f64::NEG_INFINITY;
+        let mut worst_name = String::new();
+        let (mut total, mut count) = (0.0, 0.0);
+        for (width, height, frames) in sets {
+            for (name, pixels) in frames {
+                for qindex in DETERMINISM_QINDEXES {
+                    let ac = i64::from(crate::av1_intra::get_ac_quant(qindex));
+                    let lambda = (ac * ac / 256).max(1);
+                    let report = arm
+                        .apply(tile::FrameEncoder::new(pixels, *width, *height, qindex))
+                        .with_type_gain_interval(tile::TYPE_GAIN_SAMPLE_INTERVAL)
+                        .encode_with_report();
+                    let cost = sse_against(&report, pixels, *width, *height)
+                        + lambda * report.tile.len() as i64 * 8;
+                    let penalty =
+                        cost as f64 / unsampled[&(*width, *name, qindex)] as f64 * 100.0 - 100.0;
+                    if penalty > worst {
+                        worst = penalty;
+                        worst_name = format!("{name}@{width}x{height}q{qindex}");
+                    }
+                    total += penalty;
+                    count += 1.0;
+                }
+            }
+        }
+        (worst, worst_name, total / count)
+    }
+
+    /// The worst reconstruction an arm gives against the exhaustive search on the 96x80
+    /// `test_pattern`, which is what
+    /// `the_search_shortcuts_stay_within_their_rate_and_distortion_bound` holds at 0.05 dB.
+    fn bound_delta(arm: GainArm) -> f64 {
+        let (width, height) = (96_usize, 80_usize);
+        let pixels = test_pattern(width as u32, height as u32);
+        let quality = |report: &tile::SearchReport| {
+            let reconstruction: Vec<u8> = (0..height)
+                .flat_map(|row| report.reconstruction[row * report.coded_width..][..width].to_vec())
+                .collect();
+            psnr(&pixels, &reconstruction)
+        };
+        let mut worst = f64::INFINITY;
+        for qindex in DETERMINISM_QINDEXES {
+            let exhaustive = tile::FrameEncoder::new(&pixels, width, height, qindex)
+                .without_search_shortcuts()
+                .encode_with_report();
+            let fast = arm.apply(tile::FrameEncoder::new(&pixels, width, height, qindex));
+            worst = worst.min(quality(&fast.encode_with_report()) - quality(&exhaustive));
+        }
+        worst
+    }
+
+    /// How far a trial's *own* probe measurement should be believed.
+    ///
+    /// The correction extrapolates a ratio measured on [`tile::TYPE_GAIN_PROBES`] of a trial's
+    /// blocks over all of them, and a trial that probed was corrected by that ratio in full -
+    /// not because anything measured it should be, but because it is the trial's own
+    /// measurement. `measure_dct_only_ranking_error` is what says that assumption is where the
+    /// error at `qindex` 1 lives: an estimator probing *every* size search, so that every trial
+    /// is corrected in full and no ratio is ever remembered, reconstructs 0.344 dB *below* the
+    /// exhaustive search there, against the sampled estimator's +0.023 dB. This sweeps the
+    /// shrinkage on that measured correction against the one on a remembered correction.
+    #[test]
+    #[ignore = "measurement sweep, not an assertion"]
+    fn measure_type_gain_probe_trust() {
+        let sets = tuning_set();
+        let unsampled = unsampled_costs(&sets);
+        println!("probe_trust,trust,worst_penalty,worst_frame,mean_penalty,bound_delta");
+        for probe_trust in 0_i64..=16 {
+            for trust in [0_i64, 2, 4, 6, 8, 10, 12, 16] {
+                let arm = GainArm {
+                    probe_trust,
+                    trust,
+                    memory: tile::TYPE_GAIN_MEMORY,
+                };
+                let (worst, worst_name, mean) = tuning_set_penalty(&sets, &unsampled, arm);
+                let delta = bound_delta(arm);
+                println!(
+                    "{probe_trust},{trust},{worst:+.3},{worst_name},{mean:+.3},{delta:+.3}"
+                );
+            }
+        }
+    }
+
+    /// The shrinkage and the recency window swept together on the set that separates them.
+    ///
+    /// `measure_type_gain_memory_against_trust` sweeps the same grid against the two assertions
+    /// the pair has to satisfy together, which is a search for a cell that passes rather than a
+    /// measurement of the pair. This is the measurement: over `content_frames` *and*
+    /// [`gain_frames`] at both sizes and every quantizer, it reports what each cell costs against
+    /// the same estimator probing every size search - the worst frame and the mean - beside the
+    /// 96x80 distortion delta. An optimum here is one the tuning set chose.
+    #[test]
+    #[ignore = "measurement sweep, not an assertion"]
+    fn measure_type_gain_calibration() {
+        let (bw, bh) = (96_usize, 80_usize);
+        let bpix = test_pattern(bw as u32, bh as u32);
+        let quality = |report: &tile::SearchReport| {
+            let reconstruction: Vec<u8> = (0..bh)
+                .flat_map(|row| report.reconstruction[row * report.coded_width..][..bw].to_vec())
+                .collect();
+            psnr(&bpix, &reconstruction)
+        };
+        let mut exhaustive = std::collections::BTreeMap::new();
+        for qindex in DETERMINISM_QINDEXES {
+            let report = tile::FrameEncoder::new(&bpix, bw, bh, qindex)
+                .without_search_shortcuts()
+                .encode_with_report();
+            exhaustive.insert(qindex, quality(&report));
+        }
+        // The unsampled estimator each cell is measured against, which does not depend on the
+        // cell: a trial that probes is corrected by its own measurement whatever the shrinkage is.
+        let mut sets = Vec::new();
+        for (width, height) in [(128_usize, 96_usize), (192, 160)] {
+            let mut frames = content_frames(width as u32, height as u32);
+            frames.push(("test_pattern", test_pattern(width as u32, height as u32)));
+            frames.extend(gain_frames(width as u32, height as u32));
+            sets.push((width, height, frames));
+        }
+        let mut unsampled = std::collections::BTreeMap::new();
+        for (width, height, frames) in &sets {
+            for (name, pixels) in frames {
+                for qindex in [1_u8, 8, 32, 80, 160, 200] {
+                    let ac = i64::from(crate::av1_intra::get_ac_quant(qindex));
+                    let lambda = (ac * ac / 256).max(1);
+                    let report = tile::FrameEncoder::new(pixels, *width, *height, qindex)
+                        .with_type_gain_interval(1)
+                        .encode_with_report();
+                    let cost = sse_against(&report, pixels, *width, *height)
+                        + lambda * report.tile.len() as i64 * 8;
+                    unsampled.insert((*width, *name, qindex), cost);
+                }
+            }
+        }
+        println!("memory,trust,worst_penalty,worst_frame,mean_penalty,bound_delta");
+        for memory in [1_usize, 2, 3, 4, 8, usize::MAX] {
+            for trust in [0_i64, 1, 2, 3, 4, 6, 8, 10, 12, 14, 16] {
+                let mut worst_delta = f64::INFINITY;
+                for qindex in DETERMINISM_QINDEXES {
+                    let fast = tile::FrameEncoder::new(&bpix, bw, bh, qindex)
+                        .with_type_gain_memory(memory)
+                        .with_type_gain_trust(trust)
+                        .encode_with_report();
+                    worst_delta = worst_delta.min(quality(&fast) - exhaustive[&qindex]);
+                }
+                let mut worst = f64::NEG_INFINITY;
+                let mut worst_name = String::new();
+                let mut total = 0.0;
+                let mut count = 0.0;
+                for (width, height, frames) in &sets {
+                    for (name, pixels) in frames {
+                        for qindex in [1_u8, 8, 32, 80, 160, 200] {
+                            let ac = i64::from(crate::av1_intra::get_ac_quant(qindex));
+                            let lambda = (ac * ac / 256).max(1);
+                            let report = tile::FrameEncoder::new(pixels, *width, *height, qindex)
+                                .with_type_gain_interval(tile::TYPE_GAIN_SAMPLE_INTERVAL)
+                                .with_type_gain_memory(memory)
+                                .with_type_gain_trust(trust)
+                                .encode_with_report();
+                            let cost = sse_against(&report, pixels, *width, *height)
+                                + lambda * report.tile.len() as i64 * 8;
+                            let penalty = cost as f64
+                                / unsampled[&(*width, *name, qindex)] as f64
+                                * 100.0
+                                - 100.0;
+                            if penalty > worst {
+                                worst = penalty;
+                                worst_name = format!("{name}@{width}x{height}q{qindex}");
+                            }
+                            total += penalty;
+                            count += 1.0;
+                        }
+                    }
+                }
+                let window = if memory == usize::MAX {
+                    "frame".to_string()
+                } else {
+                    memory.to_string()
+                };
+                println!(
+                    "{window},{trust},{worst:+.3},{worst_name},{:+.3},{worst_delta:+.3}",
+                    total / count
+                );
+            }
+        }
+    }
+
+    /// Where the DCT-only ranking's own error at `qindex` 1 comes from.
+    ///
+    /// The calibration constants cannot remove it and this is the measurement that says so: it
+    /// prints, per quantizer on the 96x80 `test_pattern` the distortion bound is asserted on, the
+    /// reconstruction of every arm the shortcut has - the shipped one, the same estimator probing
+    /// every size search, the un-shrunk and fully-shrunk corrections, and the correction removed
+    /// altogether - each against the exhaustive search, together with how many coding blocks
+    /// chose a different transform size from the exhaustive search's.
+    #[test]
+    #[ignore = "measurement sweep, not an assertion"]
+    fn measure_dct_only_ranking_error() {
+        let (width, height) = (96_usize, 80_usize);
+        let pixels = test_pattern(width as u32, height as u32);
+        let quality = |report: &tile::SearchReport| {
+            let reconstruction: Vec<u8> = (0..height)
+                .flat_map(|row| report.reconstruction[row * report.coded_width..][..width].to_vec())
+                .collect();
+            psnr(&pixels, &reconstruction)
+        };
+        println!("qindex,arm,d_psnr,size_choices_differing,size_choices");
+        for qindex in DETERMINISM_QINDEXES {
+            let exhaustive = tile::FrameEncoder::new(&pixels, width, height, qindex)
+                .without_search_shortcuts()
+                .encode_with_report();
+            let reference = quality(&exhaustive);
+            let arms: Vec<(&str, tile::SearchReport)> = vec![
+                (
+                    "shipped",
+                    tile::FrameEncoder::new(&pixels, width, height, qindex).encode_with_report(),
+                ),
+                (
+                    "probe_every_search",
+                    tile::FrameEncoder::new(&pixels, width, height, qindex)
+                        .with_type_gain_interval(1)
+                        .encode_with_report(),
+                ),
+                (
+                    "trust_16",
+                    tile::FrameEncoder::new(&pixels, width, height, qindex)
+                        .with_type_gain_trust(16)
+                        .encode_with_report(),
+                ),
+                (
+                    "trust_0",
+                    tile::FrameEncoder::new(&pixels, width, height, qindex)
+                        .with_type_gain_trust(0)
+                        .encode_with_report(),
+                ),
+                (
+                    "probe_every_search_trust_0",
+                    tile::FrameEncoder::new(&pixels, width, height, qindex)
+                        .with_type_gain_interval(1)
+                        .with_type_gain_trust(0)
+                        .encode_with_report(),
+                ),
+                (
+                    "forced_smallest_probes",
+                    tile::FrameEncoder::new(&pixels, width, height, qindex)
+                        .with_forced_smallest_size_probes()
+                        .encode_with_report(),
+                ),
+            ];
+            for (name, report) in &arms {
+                let differing = report
+                    .size_choices
+                    .iter()
+                    .zip(exhaustive.size_choices.iter())
+                    .filter(|(fast, exh)| fast.3 != exh.3)
+                    .count();
+                println!(
+                    "{qindex},{name},{:+.4},{differing},{}",
+                    quality(report) - reference,
+                    report.size_choices.len()
+                );
+            }
+        }
     }
 
     /// Whether a frame separates the shrinkage and the recency window at all.
