@@ -547,135 +547,63 @@ fn write_idr_residual_slice(
     let mut slice_data = code_slice_data(&records, None, qp, ctbs_x);
     let mut sao_kept = false;
     if filter.sao() {
-        let src = SourcePlanes {
-            y,
-            cb,
-            cr,
-            width,
-            height,
-        };
+        let deblocked = recon.clone();
+        // The per-CTB search keeps the closed-form multiplier: inside a
+        // picture already committed to coding `sao( )` on every CTB, that
+        // decision is between two codings of one CTB at one QP, which is the
+        // trade `lambda_q8` is derived for and where the picture cancels out
+        // of it. The slice-level test below is the one where it does not
+        // cancel, and that one is taken against the measured curve.
+        let grid = sao_reconstruction(
+            &mut recon,
+            SourcePlanes {
+                y,
+                cb,
+                cr,
+                width,
+                height,
+            },
+            SaoLambda::for_search(lambda_q8(qp)),
+        );
         let base = CurvePoint {
-            sse: picture_sse(&recon, y, cb, cr),
+            sse: picture_sse(&deblocked, y, cb, cr),
             bits: slice_data.len() as u64 * 8,
         };
-        // One §8.7.3 pass at one price: search the grid, apply it to a copy of
-        // the deblocked reconstruction, and read what it costs off the coded
-        // slice rather than counting it beside — the same slice data with the
-        // `sao( )` structures in front of each CTB, against the same slice
-        // data without them.
-        let pass = |lambda: SaoLambda| {
-            let mut filtered = recon.clone();
-            let grid = sao_reconstruction(&mut filtered, src, lambda);
-            let gain = base.sse.saturating_sub(picture_sse(&filtered, y, cb, cr));
-            let coded = code_slice_data(&records, Some(&grid), qp, ctbs_x);
-            let sao_bits = (coded.len() as u64 * 8).saturating_sub(base.bits);
-            (filtered, gain, coded, sao_bits)
-        };
+        let gain = base.sse.saturating_sub(picture_sse(&recon, y, cb, cr));
+        // What the grid costs, read off the coded slice rather than counted
+        // beside it: the same slice data with the `sao( )` structures in
+        // front of each CTB, against the same slice data without them.
+        let coded = code_slice_data(&records, Some(&grid), qp, ctbs_x);
+        let sao_bits = (coded.len() as u64 * 8).saturating_sub(base.bits);
         // What SAO is weighed against is one step of the quantizer, so that
         // is the point the probe codes: this same writer one QP finer, or one
         // QP coarser at QP 0, where there is no finer.
         let probe = || {
-            let point = |probe_qp| curve_point(src, probe_qp, search, filter.deblocking());
+            let point = |probe_qp| {
+                curve_point(
+                    SourcePlanes {
+                        y,
+                        cb,
+                        cr,
+                        width,
+                        height,
+                    },
+                    probe_qp,
+                    search,
+                    filter.deblocking(),
+                )
+            };
             if qp > 0 {
                 (point(qp - 1), base)
             } else {
                 (base, point(qp + 1))
             }
         };
-        // The first pass prices every bin at the closed form. That is the
-        // right instrument for all of them but band offset's own syntax, and
-        // it is the only price available before a grid exists: the probe runs
-        // only where the closed form leaves the slice-level decision open,
-        // and whether it does is read off a coded grid, which needs a
-        // multiplier. So the measured price can only ever reprice a second
-        // pass, never the first.
-        let fixed = lambda_q8(qp);
-        let variant = std::env::var("SAO_EXP").unwrap_or_else(|_| "band-marginal".into());
-        let k: f64 = std::env::var("SAO_BAND_K").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0);
-        let first = SaoLambda { mode_q8: fixed, band_q8: (f64::from(fixed) * k) as u32 };
-        let (mut filtered, mut gain, mut coded, mut sao_bits) = pass(first);
-        let keeps = match sao_band_verdict(gain, sao_bits, qp) {
-            Some(settled) => settled,
-            None => {
-                if std::env::var("SAO_MEASURE").is_ok() {
-                    use crate::hevc::engine::encoder::recon::{band_syntax_bins, offset_abs_bins};
-                    let grid_full = {
-                        let mut f = recon.clone();
-                        sao_reconstruction(&mut f, src, SaoLambda::closed_form(fixed))
-                    };
-                    let mut est_band = 0u64;
-                    let mut edge_only = grid_full.clone();
-                    for cell in edge_only.iter_mut() {
-                        if cell.components[0].sao_type_idx == 1 {
-                            est_band += 1 + 
-                                band_syntax_bins(&cell.components[0].offset_val)
-                                + offset_abs_bins(&cell.components[0].offset_val);
-                            cell.components[0] = crate::hevc::engine::sao::ResolvedSaoComponent::off();
-                        }
-                        if cell.components[1].sao_type_idx == 1 {
-                            est_band += 1
-                                + band_syntax_bins(&cell.components[1].offset_val)
-                                + offset_abs_bins(&cell.components[1].offset_val)
-                                + band_syntax_bins(&cell.components[2].offset_val)
-                                + offset_abs_bins(&cell.components[2].offset_val);
-                            cell.components[1] = crate::hevc::engine::sao::ResolvedSaoComponent::off();
-                            cell.components[2] = crate::hevc::engine::sao::ResolvedSaoComponent::off();
-                        }
-                    }
-                    let edge_coded = code_slice_data(&records, Some(&edge_only), qp, ctbs_x);
-                    let real_band = (coded.len() as i64 - edge_coded.len() as i64) * 8;
-                    if est_band > 0 {
-                        println!(
-                            "MEASURE w {width} qp {qp}: band est {est_band} bins, real {real_band} bits, ratio {:.3}",
-                            real_band as f64 / est_band as f64
-                        );
-                    }
-                }
-                let (fine, coarse) = probe();
-                let marginal = marginal_sao_lambda_q8(fine, coarse, qp);
-                let secant = calibrated_sao_lambda_q8(fine, coarse, qp, sao_bits);
-                let next = match variant.as_str() {
-                    "none" => SaoLambda::closed_form(fixed),
-                    "band-marginal" => SaoLambda { mode_q8: fixed, band_q8: marginal },
-                    "all-marginal" => SaoLambda::closed_form(marginal),
-                    "band-secant" => SaoLambda { mode_q8: fixed, band_q8: secant },
-                    "accept-marginal" => SaoLambda { mode_q8: fixed, band_q8: marginal },
-                    "accept-marginal-closed" => SaoLambda::closed_form(fixed),
-                    "all-secant" => SaoLambda::closed_form(secant),
-                    _ => first,
-                };
-                if next != first {
-                    let redone = pass(next);
-                    (filtered, gain, coded, sao_bits) = redone;
-                }
-                if variant == "best-of" {
-                    let margin = |g: u64, b: u64| {
-                        let l = u64::from(calibrated_sao_lambda_q8(fine, coarse, qp, b));
-                        g as i64 - (b.saturating_mul(l) / 256) as i64
-                    };
-                    let mut best = (margin(gain, sao_bits), filtered.clone(), gain, coded.clone(), sao_bits);
-                    for cand in [
-                        SaoLambda { mode_q8: fixed, band_q8: marginal },
-                        SaoLambda::closed_form(marginal),
-                        SaoLambda::closed_form(secant),
-                    ] {
-                        let (f2, g2, c2, b2) = pass(cand);
-                        let m2 = margin(g2, b2);
-                        if m2 > best.0 {
-                            best = (m2, f2, g2, c2, b2);
-                        }
-                    }
-                    (filtered, gain, coded, sao_bits) = (best.1, best.2, best.3, best.4);
-                    best.0 > 0
-                } else {
-                    clears_calibrated(gain, sao_bits, qp, fine, coarse)
-                }
-            }
-        };
-        if keeps {
-            recon = filtered;
+        if keeps_sao(gain, sao_bits, qp, probe) {
             slice_data = coded;
             sao_kept = true;
+        } else {
+            recon = deblocked;
         }
     }
 
@@ -983,106 +911,40 @@ fn curve_point(src: SourcePlanes<'_>, qp: i32, search: ModeSearch, deblocking: b
     }
 }
 
-/// How much of the slice-level SAO decision the closed form settles on its
-/// own: `Some(keeps)` where it is already decided, `None` where the caller
-/// has to run the probe.
+/// The slice-level half of the SAO decision: whether a grid that removed
+/// `gain` of squared error is worth the `sao_bits` it would be coded with.
 ///
 /// The trade is `D + lambda * R` against the multiplier
-/// [`calibrated_sao_lambda_q8`] reads off this picture's own curve — so the
-/// probe is run only when its answer can change the outcome. The calibrated
-/// multiplier is never outside a factor of [`SAO_LAMBDA_BAND`] either side of
-/// the closed-form one, so a gain that clears the band's coarse end already
-/// clears whatever the probe would have returned, and one that misses its
-/// fine end already misses it. Over the QP 12-51 sweep on the two test
-/// pictures that settles half the pictures without a probe, where SAO either
-/// found nothing the quantizer had left behind or found far more than a step
-/// of it recovers.
-///
-/// It is also what decides whether the band-offset syntax is priced by
-/// measurement or by the closed form: the price comes from the probe, so it
-/// exists exactly where this returns `None`.
-fn sao_band_verdict(gain: u64, sao_bits: u64, qp: i32) -> Option<bool> {
+/// [`calibrated_sao_lambda_q8`] reads off this picture's own curve, which is
+/// what `probe` measures — so `probe` is called only when its answer can
+/// change the outcome. The calibrated multiplier is never outside a factor of
+/// [`SAO_LAMBDA_BAND`] either side of the closed-form one, so a gain that
+/// clears the band's coarse end already clears whatever the probe would have
+/// returned, and one that misses its fine end already misses it. Over the
+/// QP 12-51 sweep on the two test pictures that settles half the pictures
+/// without a probe, where SAO either found nothing the quantizer had left
+/// behind or found far more than a step of it recovers.
+fn keeps_sao(
+    gain: u64,
+    sao_bits: u64,
+    qp: i32,
+    probe: impl FnOnce() -> (CurvePoint, CurvePoint),
+) -> bool {
     if sao_bits == 0 {
-        return Some(gain > 0);
+        return gain > 0;
     }
     let clears = |lambda: u64| gain > sao_bits.saturating_mul(lambda) / 256;
     let fixed = u64::from(lambda_q8(qp));
     if clears(fixed.saturating_mul(SAO_LAMBDA_BAND)) {
-        return Some(true);
+        return true;
     }
     if !clears((fixed / SAO_LAMBDA_BAND).max(1)) {
-        return Some(false);
+        return false;
     }
-    None
-}
-
-/// The other half of that decision: whether `gain` clears `sao_bits` at the
-/// multiplier [`calibrated_sao_lambda_q8`] reads off the two points `probe`
-/// returned.
-///
-/// Split from [`sao_band_verdict`] because the caller does more with the
-/// probe than decide: the same two points also price the band-offset syntax
-/// the per-CTB search is re-run with, and that re-run moves `sao_bits`, so
-/// the multiplier is read off them once more at the rate finally coded.
-fn clears_calibrated(
-    gain: u64,
-    sao_bits: u64,
-    qp: i32,
-    fine: CurvePoint,
-    coarse: CurvePoint,
-) -> bool {
-    let lambda = u64::from(calibrated_sao_lambda_q8(fine, coarse, qp, sao_bits));
-    gain > sao_bits.saturating_mul(lambda) / 256
-}
-
-/// What one *marginal* bit is worth on this picture's own curve, in the same
-/// 1/256 units [`calibrated_sao_lambda_q8`] returns and read off the same two
-/// probe points.
-///
-/// This is that function's own limit as `sao_bits` goes to zero: the slope of
-/// the log-rate against log-distortion line at the coded point rather than
-/// the average slope out to some rate. The two answer different questions and
-/// the per-CTB search asks this one. A slice-level accept spends `sao_bits`
-/// at once and is rightly charged what those bits average; one CTB choosing
-/// band offset over edge offset spends a handful more than it otherwise
-/// would, at the near end of a curve that is convex, where the average is
-/// already too cheap. Charging the marginal price is what replaces the fixed
-/// 2.5x factor [`crate::hevc::engine::encoder::recon::band_offset_bins`] used
-/// to carry: over the QP 12-51 sweep on both test pictures at both sizes it
-/// lands between 1.1x and 3.4x the closed form, so it reproduces the coarse
-/// end the constant was picked at where that end was right, and does not
-/// impose it on the pictures where it was not.
-///
-/// It is bounded by [`SAO_LAMBDA_BAND`] on both sides for the same reason the
-/// calibrated multiplier is: a two-point probe of one picture is trusted over
-/// the closed form only so far.
-fn marginal_sao_lambda_q8(fine: CurvePoint, coarse: CurvePoint, qp: i32) -> u32 {
-    let fixed = lambda_q8(qp);
-    let (coded, other) = if qp > 0 {
-        (coarse, fine)
-    } else {
-        (fine, coarse)
-    };
-    if coded.sse == 0 || coded.bits == 0 || other.sse == 0 {
-        return fixed;
-    }
-    let rate_ratio = other.bits as f64 / coded.bits as f64;
-    let sse_ratio = other.sse as f64 / coded.sse as f64;
-    if (rate_ratio - 1.0).abs() < 1e-9 || (sse_ratio - 1.0).abs() < 1e-9 {
-        return fixed;
-    }
-    if (rate_ratio > 1.0) != (sse_ratio < 1.0) {
-        return fixed;
-    }
-    // d(reachable)/d(sao_bits) at sao_bits = 0, the derivative of
-    // `coded.sse * (1 - sse_ratio ^ (ln(1 + b / coded.bits) / ln(rate_ratio)))`.
-    let slope = coded.sse as f64 * -sse_ratio.ln() / (coded.bits as f64 * rate_ratio.ln());
-    if !slope.is_finite() || slope <= 0.0 {
-        return fixed;
-    }
-    let fixed = u64::from(fixed);
-    let marginal = (slope * 256.0).round().max(0.0) as u64;
-    marginal.clamp((fixed / SAO_LAMBDA_BAND).max(1), fixed * SAO_LAMBDA_BAND) as u32
+    let (fine, coarse) = probe();
+    clears(u64::from(calibrated_sao_lambda_q8(
+        fine, coarse, qp, sao_bits,
+    )))
 }
 
 /// The multiplier the slice-level SAO decision trades distortion against rate
@@ -2116,7 +1978,7 @@ mod tests {
                 width,
                 height,
             },
-            SaoLambda::closed_form(lambda_q8(qp)),
+            SaoLambda::for_search(lambda_q8(qp)),
         )
     }
 
@@ -2280,41 +2142,6 @@ mod tests {
         }
     }
 
-    #[test]
-    #[ignore = "measurement: the QP 12-51 SAO sweep on both pictures at both sizes"]
-    fn sao_sweep() {
-        for (name, width, height, smooth) in [
-            ("smooth 64x48", 64usize, 48usize, true),
-            ("smooth 128x96", 128, 96, true),
-            ("noise 64x48", 64, 48, false),
-            ("noise 128x96", 128, 96, false),
-        ] {
-            let (y, cb, cr) = if smooth {
-                smooth_picture(width, height)
-            } else {
-                picture(width, height)
-            };
-            for qp in 12..=51 {
-                let ((off_bytes, off_psnr), (on_bytes, on_psnr)) =
-                    sao_on_off(&y, &cb, &cr, width, height, qp);
-                let band = sao_grid(&y, &cb, &cr, width, height, qp)
-                    .iter()
-                    .flat_map(|cell| cell.components.iter())
-                    .filter(|c| c.sao_type_idx == 1)
-                    .count();
-                println!(
-                    "SWEEP {name} qp {qp}: {off_bytes} -> {on_bytes} bytes, \
-                     {off_psnr:.3} -> {on_psnr:.3} dB ({:+.3}), band components {band}",
-                    on_psnr - off_psnr
-                );
-            }
-            let sweep: Vec<i32> = (12..=51).collect();
-            for (qp, bytes, delta) in sao_curve_offsets(&y, &cb, &cr, width, height, &sweep) {
-                println!("CURVE {name} qp {qp}: {bytes} bytes, {delta:+.3} dB off the curve");
-            }
-        }
-    }
-
     /// A point on a picture's curve, for the calibration's own unit tests.
     fn curve(bits: u64, sse: u64) -> CurvePoint {
         CurvePoint { sse, bits }
@@ -2390,32 +2217,36 @@ mod tests {
         let qp = 26;
         let fixed = u64::from(lambda_q8(qp));
         let sao_bits = 256;
-        assert_eq!(
-            sao_band_verdict(sao_bits * fixed * SAO_LAMBDA_BAND / 256 + 1, sao_bits, qp),
-            Some(true),
-            "a gain clearing the band's coarse end was not settled as kept"
-        );
-        assert_eq!(
-            sao_band_verdict(sao_bits * (fixed / SAO_LAMBDA_BAND) / 256, sao_bits, qp),
-            Some(false),
-            "a gain missing the band's fine end was not settled as declined"
-        );
-        // Between them the closed form settles nothing and the probe decides.
-        let inside = sao_bits * fixed / 256;
-        assert_eq!(
-            sao_band_verdict(inside, sao_bits, qp),
-            None,
-            "the band settled a decision only the probe can take"
-        );
+        let never = || panic!("the probe ran where the band had already settled the decision");
         assert!(
-            clears_calibrated(
-                inside,
+            keeps_sao(
+                sao_bits * fixed * SAO_LAMBDA_BAND / 256 + 1,
                 sao_bits,
                 qp,
-                curve(10_000, 80_000),
-                curve(8_000, 100_000)
+                never
             ),
-            "the probe's own multiplier was not what the decision was taken at"
+            "a gain clearing the band's coarse end was not kept"
+        );
+        assert!(
+            !keeps_sao(
+                sao_bits * (fixed / SAO_LAMBDA_BAND) / 256,
+                sao_bits,
+                qp,
+                never
+            ),
+            "a gain missing the band's fine end was not declined"
+        );
+        // Between them the probe decides, and its answer is used.
+        let inside = sao_bits * fixed / 256;
+        let probed = std::cell::Cell::new(false);
+        let probe = || {
+            probed.set(true);
+            (curve(10_000, 80_000), curve(8_000, 100_000))
+        };
+        keeps_sao(inside, sao_bits, qp, probe);
+        assert!(
+            probed.get(),
+            "the probe was skipped where the band left it open"
         );
     }
 

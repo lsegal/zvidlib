@@ -671,8 +671,8 @@ pub(crate) fn sao_reconstruction(
 /// under band offset, its own `sao_band_position` — no position is inferred —
 /// which is the whole of what the syntax gives cIdx 2 of its own.
 ///
-/// `lambda` is the pair of §9 rate-distortion multipliers in 1/256 units the
-/// candidates are priced with — see [`SaoLambda`]. SAO costs per-CTB syntax
+/// `lambda` is the pair of §9 rate-distortion multipliers the candidates are
+/// priced with — see [`SaoLambda`]. SAO costs per-CTB syntax
 /// on every CTB it is enabled for, so a candidate is taken only when its SSE
 /// reduction clears `lambda * bins`, the bins being the §9.3.3 binarization's
 /// own count for the parameters that would be coded. At a zero `lambda` the
@@ -715,7 +715,7 @@ fn ctb_rect(pic: &Picture, plane: Plane, rx: usize, ry: usize) -> (usize, usize,
 
 /// The §9.3.3 bin count of the four `sao_offset_abs` values of one component —
 /// Table 9-43 TR with `cMax == 7` and `cRiceParam == 0`, i.e. truncated unary.
-pub(crate) fn offset_abs_bins(offsets: &[i32; 5]) -> u64 {
+fn offset_abs_bins(offsets: &[i32; 5]) -> u64 {
     offsets[1..5]
         .iter()
         .map(|&o| {
@@ -728,8 +728,8 @@ pub(crate) fn offset_abs_bins(offsets: &[i32; 5]) -> u64 {
 /// less the §7.3.8.3 syntax it has to be signalled with, in the same units
 /// the mode decision uses.
 ///
-/// `bins` are priced at [`SaoLambda::mode_q8`] and `band_bins` — the band-only
-/// syntax, which is the rate the closed form was never derived for — at
+/// `bins` are priced at [`SaoLambda::mode_q8`] and `band_bins` — band
+/// offset's own syntax, the rate the closed form was never derived for — at
 /// [`SaoLambda::band_q8`]. A candidate that codes no band syntax passes 0.
 ///
 /// Positive means the candidate is worth coding at all; the largest score
@@ -746,8 +746,14 @@ fn rd_score(gain: i64, bins: u64, band_bins: u64, lambda: SaoLambda) -> i64 {
 /// and, because it is a bound known before the measurement is taken, it is
 /// also what lets `keeps_sao` skip the measurement whenever the decision is
 /// already outside the band, and what bounds the band-syntax charge
-/// [`SaoLambda`] carries.
+/// [`SaoLambda::band_q8`] carries.
 pub(super) const SAO_LAMBDA_BAND: u64 = 4;
+
+/// What band offset's own syntax is charged per bin, as a multiple of
+/// `lambda_q8`, numerator over denominator — see [`SaoLambda::band_q8`] for
+/// what the multiple is and what the sweep says about it.
+const BAND_SYNTAX_CHARGE_NUM: u32 = 5;
+const BAND_SYNTAX_CHARGE_DEN: u32 = 2;
 
 /// The two §9 rate-distortion multipliers the per-CTB SAO search prices
 /// syntax with, both in the 1/256 units
@@ -762,9 +768,7 @@ pub(super) const SAO_LAMBDA_BAND: u64 = 4;
 /// `sao_band_position` bins and its `sao_offset_sign` bins are rate that buys
 /// a value-range correction no edge class can reach, and what that rate is
 /// worth is a property of the content in the same way the slice-level
-/// decision's is. So it is priced separately, at whatever the caller has
-/// measured — the slice-level probe's own multiplier where that probe ran,
-/// and the closed form where it did not.
+/// decision's is.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct SaoLambda {
     /// What every bin the closed form is derived for costs: the type and
@@ -772,16 +776,51 @@ pub(crate) struct SaoLambda {
     pub(crate) mode_q8: u32,
     /// What band offset's own syntax costs — the five `sao_band_position`
     /// bins and the `sao_offset_sign` bins.
+    ///
+    /// #287 set out to read this off the slice-level probe, the way
+    /// `calibrated_sao_lambda_q8` reads the slice-level multiplier, so that
+    /// the search and the acceptance test would price the same bits alike.
+    /// The QP 12-51 sweep on both test pictures at both sizes says it cannot
+    /// be, and brackets it instead. Three measurements, all recorded by
+    /// `sao_sweep`:
+    ///
+    /// - The probe's own price for a marginal bit — the tangent to this
+    ///   picture's curve at its coded point, which is the steepest thing the
+    ///   probe can be read for — lands at 1.1x to 1.4x `lambda_q8`.
+    /// - Below 1.5x, the writer accepts a band component at noise 128x96
+    ///   QP 32 that puts the slice 0.003 dB under its own SAO-off curve,
+    ///   breaking `every_accepted_sao_point_sits_on_the_writers_own_curve`.
+    /// - At [`SAO_LAMBDA_BAND`], the trust bound, band offset is never
+    ///   selected at all and #274's operating points go with it.
+    ///
+    /// So the probe's own answer sits below the floor the invariant needs,
+    /// and the charge stays a constant inside the measured window
+    /// [1.5x, 4x) — narrowed by measurement, not derived from one. What it
+    /// is standing in for is not a mispriced bit but the slice-level
+    /// acceptance rule's own precision: at these operating points the rule
+    /// decides on margins of a few parts in a thousand, and it is not
+    /// monotone in the grid — a superset grid measured to be worth its own
+    /// bits can fail the test its subset passes, because the multiplier is
+    /// itself a function of the rate being judged.
     pub(crate) band_q8: u32,
 }
 
 impl SaoLambda {
-    /// Both prices at the closed form, for a caller that has taken no
-    /// measurement of this picture's own curve to charge band syntax with.
+    /// Both prices at the closed form, for a caller that codes no `sao( )`
+    /// syntax for its decision and so charges nothing for any of it.
     pub(crate) fn closed_form(lambda_q8: u32) -> Self {
         Self {
             mode_q8: lambda_q8,
             band_q8: lambda_q8,
+        }
+    }
+
+    /// The prices the writer searches with: the closed form for every bin it
+    /// was derived for, and [`SaoLambda::band_q8`] for band offset's own.
+    pub(crate) fn for_search(lambda_q8: u32) -> Self {
+        Self {
+            mode_q8: lambda_q8,
+            band_q8: (lambda_q8 * BAND_SYNTAX_CHARGE_NUM).div_ceil(BAND_SYNTAX_CHARGE_DEN),
         }
     }
 }
@@ -792,11 +831,12 @@ impl SaoLambda {
 ///
 /// This is what makes band offset a different bet from edge offset at the
 /// same gain — it pays five position bins and up to four sign bins where edge
-/// offset pays two class bins and infers its signs — and it is the part of
-/// the band candidate's rate [`SaoLambda::band_q8`] prices. Its offsets'
-/// own truncated-Rice bins are counted by [`offset_abs_bins`] exactly as edge
-/// offset's are, and priced the same way.
-pub(crate) fn band_syntax_bins(offsets: &[i32; 5]) -> u64 {
+/// offset pays two class bins and infers its signs — and it is the part of a
+/// band candidate's rate [`SaoLambda::band_q8`] prices. The offsets' own
+/// truncated-Rice bins are counted by [`offset_abs_bins`] exactly as edge
+/// offset's are, and priced the same way, because they are the same kind of
+/// bit.
+fn band_syntax_bins(offsets: &[i32; 5]) -> u64 {
     5 + offsets[1..5].iter().filter(|&&o| o != 0).count() as u64
 }
 
