@@ -323,6 +323,8 @@ struct HevcDecoder {
     sequence: SequenceDecoder,
     reorder: Vec<DecodedFrame>,
     presentation_indexes: BinaryHeap<Reverse<FrameIndex>>,
+    /// Whether a caller wants the pictures being decoded, or is only walking past them.
+    output_wanted: bool,
 }
 
 impl HevcDecoder {
@@ -341,6 +343,7 @@ impl HevcDecoder {
             sequence: SequenceDecoder::new(),
             reorder: Vec::new(),
             presentation_indexes: BinaryHeap::new(),
+            output_wanted: true,
         };
         decoder.reinitialize()?;
         Ok(decoder)
@@ -358,6 +361,11 @@ impl HevcDecoder {
 
     fn collect(&mut self, flush: bool) -> Result<Vec<DecodedVideoFrame>> {
         let pictures = self.collect_pictures(flush)?;
+        if !self.output_wanted {
+            // The pictures are still taken from the reorder queue above, which is what keeps the
+            // decoder's own bookkeeping straight; only their conversion is skipped.
+            return Ok(Vec::new());
+        }
         let mut output = Vec::with_capacity(pictures.len());
         for (presentation_index, picture) in pictures {
             output.push(DecodedVideoFrame {
@@ -482,6 +490,10 @@ impl VideoDecoder for HevcDecoder {
 
     fn reset(&mut self) -> Result<()> {
         self.reinitialize()
+    }
+
+    fn set_output_wanted(&mut self, wanted: bool) {
+        self.output_wanted = wanted;
     }
 }
 

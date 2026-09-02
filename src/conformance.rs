@@ -566,6 +566,7 @@ fn add_statistics(left: DecodeStatistics, right: DecodeStatistics) -> DecodeStat
         samples_submitted: left
             .samples_submitted
             .saturating_add(right.samples_submitted),
+        samples_skipped: left.samples_skipped.saturating_add(right.samples_skipped),
         cache_hits: left.cache_hits.saturating_add(right.cache_hits),
         resets: left.resets.saturating_add(right.resets),
         drains: left.drains.saturating_add(right.drains),
