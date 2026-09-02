@@ -1821,11 +1821,15 @@ mod nonlossless_tests {
     /// reduction falls from 4.26x through 4.11x to 3.57x, under the 4x
     /// `the_search_shortcuts_stay_within_their_rate_and_distortion_bound` requires. A better
     /// estimate of the ratio produces a worse size ranking, so what the error at `qindex` 1
-    /// measures is not the sampling: it is the extrapolation model itself. The correction assumes
-    /// the type search's gain scales with a trial's searched cost, which over-credits the
-    /// smallest size where every block is coded, and no number of probes and no setting of the
-    /// three constants removes a model error. That is why the shrinkages are what hold the bound,
-    /// and why they are shrinkages rather than a sharper estimator.
+    /// measures is not the sampling.
+    ///
+    /// It is not the extrapolation either, which is how #349 read it.
+    /// `measure_type_gain_models` sweeps this same probe count against every shape the credit
+    /// could have and finds the shape moves nothing: what a sharper probe removes is an
+    /// *over*-credit, and the over-credit is the whole of what the correction is worth. See
+    /// [`tile::GainModel`] and `the_type_gain_credit_is_a_magnitude_rather_than_a_shape`. That is
+    /// why the shrinkages are what hold the bound, and why they are biases rather than a sharper
+    /// estimator.
     #[test]
     #[ignore = "measurement sweep, not an assertion"]
     fn measure_type_gain_probes_against_trust() {
@@ -1872,6 +1876,238 @@ mod nonlossless_tests {
                 );
             }
         }
+    }
+
+    /// Whether the credit's *shape* is what makes a sharper probe rank worse.
+    ///
+    /// `measure_type_gain_probes_against_trust` reads a reconstruction that falls monotonically
+    /// below the exhaustive search as the probe count rises. This crosses that probe count with
+    /// every extrapolation the correction could use - the shipped
+    /// [`tile::GainModel::Linear`], the per-block ratio, and the per-block ratio damped by a
+    /// credit saturating in the trial's block count at every saturation from one block to
+    /// sixty-four - and prints, per cell, the `qindex` 1 delta the sweep turns on, the worst
+    /// delta over [`DETERMINISM_QINDEXES`], and the candidate reduction the shortcuts have to
+    /// keep.
+    ///
+    /// A model is only a model while `p < b`. `Linear` and `PerBlock` both collapse to the
+    /// measurement itself once a trial's probe count covers all of its blocks, so raising the
+    /// probe count makes a four-block trial exact while a sixty-four-block trial is still
+    /// extrapolated - it moves the sizes against each other rather than sharpening one estimate,
+    /// which is the monotonicity failure. `Saturating` credits `e(b) = b * s / (b + s - 1)`
+    /// blocks whether or not the probe covered them, so the probe count changes only how well
+    /// the per-block gain is measured.
+    #[test]
+    #[ignore = "measurement sweep, not an assertion"]
+    fn measure_type_gain_models() {
+        let (width, height) = (96_usize, 80_usize);
+        let pixels = test_pattern(width as u32, height as u32);
+        let quality = |report: &tile::SearchReport| {
+            let reconstruction: Vec<u8> = (0..height)
+                .flat_map(|row| report.reconstruction[row * report.coded_width..][..width].to_vec())
+                .collect();
+            psnr(&pixels, &reconstruction)
+        };
+        let mut exhaustive = std::collections::BTreeMap::new();
+        for qindex in DETERMINISM_QINDEXES {
+            let report = tile::FrameEncoder::new(&pixels, width, height, qindex)
+                .without_search_shortcuts()
+                .encode_with_report();
+            exhaustive.insert(qindex, (quality(&report), report.candidates_evaluated));
+        }
+        let mut arms: Vec<(String, tile::GainModel, usize, i64)> = vec![
+            ("linear".to_string(), tile::GainModel::Linear, 1, 16),
+            ("per_block".to_string(), tile::GainModel::PerBlock, 1, 16),
+        ];
+        for saturation in [1_usize, 2, 4, 8, 16, 32, 64] {
+            arms.push((
+                format!("saturating_{saturation}"),
+                tile::GainModel::Saturating,
+                saturation,
+                16,
+            ));
+        }
+        for amplification in [16_i64, 20, 24, 32, 48, 64, 96, 128, 192, 256] {
+            arms.push((
+                format!("amplified_{amplification}"),
+                tile::GainModel::Amplified,
+                1,
+                amplification,
+            ));
+        }
+        println!("model,probes,qindex_1_delta,worst_delta,worst_qindex,worst_reduction");
+        for (name, model, saturation, amplification) in &arms {
+            for probes in [1_usize, 2, 3, 4, 6, 8, 16, 64] {
+                let mut worst = f64::INFINITY;
+                let mut worst_qindex = 0_u8;
+                let mut first = 0.0;
+                let mut worst_reduction = f64::INFINITY;
+                for qindex in DETERMINISM_QINDEXES {
+                    let report = tile::FrameEncoder::new(&pixels, width, height, qindex)
+                        .with_type_gain_model(*model)
+                        .with_type_gain_saturation(*saturation)
+                        .with_type_gain_amplification(*amplification)
+                        .with_type_gain_probes(probes)
+                        .encode_with_report();
+                    let delta = quality(&report) - exhaustive[&qindex].0;
+                    if qindex == 1 {
+                        first = delta;
+                    }
+                    if delta < worst {
+                        worst = delta;
+                        worst_qindex = qindex;
+                    }
+                    worst_reduction = worst_reduction
+                        .min(exhaustive[&qindex].1 as f64 / report.candidates_evaluated as f64);
+                }
+                println!(
+                    "{name},{probes},{first:+.3},{worst:+.3},{worst_qindex},{worst_reduction:.2}"
+                );
+            }
+        }
+    }
+
+    /// The transform-gain credit is a magnitude, fixed from opposite sides by the distortion
+    /// bound and the candidate bound, and its *shape* is not what the residual at `base_q_idx` 1
+    /// measures.
+    ///
+    /// #349 read the residual as the extrapolation: the credit grows linearly in a trial's
+    /// searched cost, so it over-credits the size with the most blocks to extrapolate over, and
+    /// `measure_type_gain_probes_against_trust` shows a sharper probe ranking monotonically
+    /// worse - which is what a model error looks like. `measure_type_gain_models` builds all
+    /// three replacements that reading asks for and this asserts what they measure, so the next
+    /// change to the shape has to move these numbers rather than restate the reading.
+    ///
+    /// The four assertions are the four corners of the result:
+    ///
+    /// - A credit that does not depend on how much of the trial was probed
+    ///   ([`tile::GainModel::Saturating`] at one block) is *flat* in the probe count - the
+    ///   monotonicity #349 asks for, satisfied exactly - and it sits at the bare DCT-only
+    ///   ranking's reconstruction, so it satisfies it by crediting nothing.
+    /// - Counting the gain per block rather than per unit of searched cost
+    ///   ([`tile::GainModel::PerBlock`]) does not move `base_q_idx` 1 at any probe count. The
+    ///   cost weighting is not the axis the error lives on.
+    /// - The shipped credit is worth about a fifth of a decibel at `base_q_idx` 1 over crediting
+    ///   nothing, and it is worth it because a one-block sample of a trial's gain is larger than
+    ///   the trial's own mean. That is the over-credit, and it is what a sharper probe removes.
+    /// - Stating that over-credit explicitly instead of sampling it into existence
+    ///   ([`tile::GainModel::Amplified`], where the probe count only sharpens the per-block gain)
+    ///   does restore `base_q_idx` 1 with every block of every trial probed - and takes the
+    ///   candidate reduction to under half of the 4x
+    ///   `the_search_shortcuts_stay_within_their_rate_and_distortion_bound` requires.
+    ///
+    /// So the ranking wants more credit at `base_q_idx` 1 and the candidate bound wants less, the
+    /// shipped configuration is where the two meet, and the shape of the extrapolation has no
+    /// freedom left in it. That is consistent with what #356 measured the correction to be: a
+    /// scalar credit against a cost taken in contexts the emitting pass will not have, whose only
+    /// useful degree of freedom is how much of it to believe.
+    #[test]
+    fn the_type_gain_credit_is_a_magnitude_rather_than_a_shape() {
+        let (width, height) = (96_usize, 80_usize);
+        let pixels = test_pattern(width as u32, height as u32);
+        let quality = |report: &tile::SearchReport| {
+            let reconstruction: Vec<u8> = (0..height)
+                .flat_map(|row| report.reconstruction[row * report.coded_width..][..width].to_vec())
+                .collect();
+            psnr(&pixels, &reconstruction)
+        };
+        let mut exhaustive = std::collections::BTreeMap::new();
+        for qindex in DETERMINISM_QINDEXES {
+            let report = tile::FrameEncoder::new(&pixels, width, height, qindex)
+                .without_search_shortcuts()
+                .encode_with_report();
+            exhaustive.insert(qindex, (quality(&report), report.candidates_evaluated));
+        }
+        // The `base_q_idx` 1 delta against the exhaustive search, and the worst candidate
+        // reduction over every quantizer, for one arm of the model sweep.
+        let arm = |model: tile::GainModel, saturation: usize, amplification: i64, probes: usize| {
+            let mut first = 0.0;
+            let mut worst_reduction = f64::INFINITY;
+            for qindex in DETERMINISM_QINDEXES {
+                let report = tile::FrameEncoder::new(&pixels, width, height, qindex)
+                    .with_type_gain_model(model)
+                    .with_type_gain_saturation(saturation)
+                    .with_type_gain_amplification(amplification)
+                    .with_type_gain_probes(probes)
+                    .encode_with_report();
+                if qindex == 1 {
+                    first = quality(&report) - exhaustive[&qindex].0;
+                }
+                worst_reduction = worst_reduction
+                    .min(exhaustive[&qindex].1 as f64 / report.candidates_evaluated as f64);
+            }
+            (first, worst_reduction)
+        };
+        let probe_counts = [1_usize, 2, 3, 4, 6, 8, 16, 64];
+
+        // The DCT-only ranking, which is what every credit is measured against.
+        let uncorrected = quality(
+            &tile::FrameEncoder::new(&pixels, width, height, 1)
+                .without_type_gain_correction()
+                .encode_with_report(),
+        ) - exhaustive[&1].0;
+
+        // A credit that saturates at one block does not depend on how much of the trial was
+        // probed, so a larger probe count only sharpens the per-block gain it credits - and it
+        // reconstructs where crediting nothing does.
+        let flat = probe_counts.map(|probes| arm(tile::GainModel::Saturating, 1, 16, probes).0);
+        for (probes, delta) in probe_counts.iter().zip(flat.iter()) {
+            assert!(
+                *delta >= flat[0] - 0.001,
+                "a probe-count-independent credit is flat in the probe count, \
+                 but {probes} probes reads {delta:+.3} dB against {:+.3} dB at one",
+                flat[0],
+            );
+            assert!(
+                (*delta - uncorrected).abs() < 0.01,
+                "and it credits nothing: {probes} probes reads {delta:+.3} dB against the \
+                 DCT-only ranking's {uncorrected:+.3} dB",
+            );
+        }
+
+        // Counting the gain per block rather than per unit of searched cost changes nothing at
+        // any probe count, so the cost weighting is not what the residual measures.
+        for probes in probe_counts {
+            let linear = arm(tile::GainModel::Linear, 1, 16, probes).0;
+            let per_block = arm(tile::GainModel::PerBlock, 1, 16, probes).0;
+            assert!(
+                (linear - per_block).abs() < 0.01,
+                "a per-block credit reads {per_block:+.3} dB at {probes} probes against the \
+                 per-cost credit's {linear:+.3} dB",
+            );
+        }
+
+        // What the shipped credit is worth, and that a sharper probe removes it: the one-block
+        // sample over-credits, and the over-credit is the whole of the correction's value.
+        let (shipped, shipped_reduction) = arm(tile::GainModel::Linear, 1, 16, 1);
+        assert!(
+            shipped - uncorrected > 0.2,
+            "the shipped credit reads {shipped:+.3} dB against the DCT-only ranking's \
+             {uncorrected:+.3} dB",
+        );
+        assert!(
+            shipped_reduction >= 4.0,
+            "and keeps the candidate reduction at {shipped_reduction:.2}x",
+        );
+        let sharper = arm(tile::GainModel::Linear, 1, 16, 2).0;
+        assert!(
+            sharper < shipped - 0.2,
+            "a two-block sample of the same ratio reads {sharper:+.3} dB against the one-block \
+             sample's {shipped:+.3} dB",
+        );
+
+        // Stating the over-credit instead of sampling it into existence restores `base_q_idx` 1
+        // with every block probed, and cannot be afforded.
+        let (amplified, amplified_reduction) = arm(tile::GainModel::Amplified, 1, 48, 64);
+        assert!(
+            amplified >= shipped - 0.001,
+            "an explicit over-credit with every block probed reads {amplified:+.3} dB against \
+             the shipped {shipped:+.3} dB",
+        );
+        assert!(
+            amplified_reduction < 4.0,
+            "but keeps only {amplified_reduction:.2}x of the exhaustive search's candidates, \
+             against the 4x the bound requires",
+        );
     }
 
     /// Where the DCT-only ranking's own error at `qindex` 1 comes from.
