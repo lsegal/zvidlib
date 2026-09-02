@@ -67,13 +67,17 @@ const DELIVERY_DEPTH: usize = 3;
 /// the time it takes to decode nothing else at all.
 const PREVIEW_INTERVAL: Duration = Duration::from_millis(150);
 
-/// How many frames a walk decodes between published pictures.
+/// How many frames a walk decodes between published pictures at `interval`.
 ///
 /// The first step of a walk has nothing measured to go on and so publishes immediately; after
-/// that the stride is whatever fits in [`PREVIEW_INTERVAL`] at the rate the walk is actually
-/// decoding at, which on this sample climbs from one frame to roughly fifty as the estimate
-/// settles. A decode slower than the interval still moves a frame at a time rather than stalling.
-fn stride_frames(per_frame: Option<Duration>) -> u64 {
+/// that the stride is whatever fits in `interval` at the rate the walk is actually decoding at,
+/// which on this sample climbs from one frame to roughly fifty as the estimate settles. A decode
+/// slower than the interval still moves a frame at a time rather than stalling.
+///
+/// The interval is a parameter rather than [`PREVIEW_INTERVAL`] read directly so that
+/// `examples/scrub_preview_profile.rs` can sweep it over the same walk this module runs; the
+/// window always uses the constant.
+fn stride_frames(interval: Duration, per_frame: Option<Duration>) -> u64 {
     let Some(per_frame) = per_frame else {
         return 1;
     };
@@ -81,7 +85,7 @@ fn stride_frames(per_frame: Option<Duration>) -> u64 {
     if per_frame <= 0.0 {
         return MAXIMUM_STRIDE;
     }
-    let frames = (PREVIEW_INTERVAL.as_secs_f64() / per_frame).floor();
+    let frames = (interval.as_secs_f64() / per_frame).floor();
     (frames as u64).clamp(1, MAXIMUM_STRIDE)
 }
 
@@ -126,12 +130,13 @@ impl KeyframeIndex {
 fn walk_step(
     position: Option<u64>,
     target: u64,
+    interval: Duration,
     per_frame: Option<Duration>,
     keyframes: &KeyframeIndex,
 ) -> u64 {
     match position {
         Some(position) if position < target => {
-            target.min(position.saturating_add(stride_frames(per_frame)))
+            target.min(position.saturating_add(stride_frames(interval, per_frame)))
         }
         Some(position) if position == target => target,
         _ => keyframes.at_or_before(target),
@@ -205,12 +210,25 @@ pub struct FrameService {
 }
 
 impl FrameService {
-    /// Builds a service over its own decoder for the track's samples.
+    /// Builds a service over its own decoder for the track's samples, publishing a drag's
+    /// pictures at [`PREVIEW_INTERVAL`].
     pub fn new(
         factory: &dyn VideoDecoderFactory,
         configuration: VideoDecoderConfig,
         samples: Vec<EncodedVideoSample>,
         limits: Limits,
+    ) -> Result<Self> {
+        Self::with_preview_interval(factory, configuration, samples, limits, PREVIEW_INTERVAL)
+    }
+
+    /// The same service with the publishing cadence named, which is how
+    /// `examples/scrub_preview_profile.rs` sweeps it.
+    pub fn with_preview_interval(
+        factory: &dyn VideoDecoderFactory,
+        configuration: VideoDecoderConfig,
+        samples: Vec<EncodedVideoSample>,
+        limits: Limits,
+        preview_interval: Duration,
     ) -> Result<Self> {
         let keyframes = KeyframeIndex::from_samples(&samples);
         let reader = ExactFrameReader::new(factory, configuration, samples, limits)?;
@@ -218,7 +236,7 @@ impl FrameService {
         let worker_queue = Arc::clone(&queue);
         let worker = thread::Builder::new()
             .name("zvidlib-frame-service".to_string())
-            .spawn(move || decode_frames(&worker_queue, reader, &keyframes))
+            .spawn(move || decode_frames(&worker_queue, reader, &keyframes, preview_interval))
             .map_err(|error| {
                 Error::new(
                     ErrorKind::InvalidInput,
@@ -255,11 +273,16 @@ impl FrameService {
         retargeted
     }
 
-    /// The newest frame the worker has decoded, or `None` rather than waiting for one.
-    pub fn take_latest(&mut self) -> Option<VideoFrame> {
+    /// The newest frame the worker has decoded and its presentation index, or `None` rather
+    /// than waiting for one.
+    ///
+    /// The index is what tells a caller whether the picture it just collected is the frame under
+    /// the pointer or one the walk passed on the way there; the window ignores it and draws
+    /// either, and `examples/scrub_preview_profile.rs` times the walk by it.
+    pub fn take_latest(&mut self) -> Option<(u64, VideoFrame)> {
         let (lock, _) = &*self.queue;
         let mut state = lock.lock().expect("frame queue poisoned");
-        let newest = state.delivered.pop_back().map(|(_, frame)| frame);
+        let newest = state.delivered.pop_back();
         state.delivered.clear();
         newest
     }
@@ -324,6 +347,7 @@ fn decode_frames(
     queue: &Arc<(Mutex<Queue>, Condvar)>,
     mut reader: ExactFrameReader,
     keyframes: &KeyframeIndex,
+    preview_interval: Duration,
 ) {
     let (lock, condvar) = &**queue;
     // Where the last decoded frame left the reader, so a forward step continues from it rather
@@ -350,7 +374,7 @@ fn decode_frames(
         };
         loop {
             let step = if preview {
-                walk_step(position, target, per_frame, keyframes)
+                walk_step(position, target, preview_interval, per_frame, keyframes)
             } else {
                 target
             };
@@ -589,7 +613,7 @@ mod tests {
         let drawn = wait_for(|| {
             frames
                 .take_latest()
-                .map(|frame| frame.planes[0].data[0])
+                .map(|(_, frame)| frame.planes[0].data[0])
                 .filter(|index| *index == 8)
         });
         assert_eq!(
@@ -619,7 +643,7 @@ mod tests {
 
         let frame = wait_for(|| source.get_exact(FrameIndex(4), &token).ok());
         assert_eq!(
-            frame.map(|frame| frame.planes[0].data[0]),
+            frame.map(|(_, frame)| frame.planes[0].data[0]),
             Some(4),
             "the frame is delivered once it has decoded"
         );
@@ -643,7 +667,7 @@ mod tests {
 
         // Enough decoding for the frames before the target, and the picture has already moved.
         grant(&gate, 8);
-        let early = wait_for(|| frames.take_latest().map(|frame| frame.planes[0].data[0]));
+        let early = wait_for(|| frames.take_latest().map(|(_, frame)| frame.planes[0].data[0]));
         assert!(
             early.is_some_and(|index| index < 9),
             "a preview draws something on the way to its target, not only the target"
@@ -653,7 +677,7 @@ mod tests {
         let arrived = wait_for(|| {
             frames
                 .take_latest()
-                .map(|frame| frame.planes[0].data[0])
+                .map(|(_, frame)| frame.planes[0].data[0])
                 .filter(|index| *index == 9)
         });
         assert_eq!(
@@ -692,7 +716,7 @@ mod tests {
         grant(&gate, u32::MAX / 2);
         let arrived = wait_for(|| source.get_exact(FrameIndex(9), &cancellation).ok());
         assert_eq!(
-            arrived.map(|frame| frame.planes[0].data[0]),
+            arrived.map(|(_, frame)| frame.planes[0].data[0]),
             Some(9),
             "the frame that was asked for is the one drawn"
         );
@@ -701,14 +725,14 @@ mod tests {
     #[test]
     fn a_stride_is_what_fits_in_one_publishing_interval() {
         // Nothing measured yet: publish the first picture immediately and measure from it.
-        assert_eq!(stride_frames(None), 1);
+        assert_eq!(stride_frames(PREVIEW_INTERVAL, None), 1);
         // 30 ms a frame fits five of them in the 150 ms interval.
-        assert_eq!(stride_frames(Some(Duration::from_millis(30))), 5);
+        assert_eq!(stride_frames(PREVIEW_INTERVAL, Some(Duration::from_millis(30))), 5);
         // A frame slower than the whole interval still moves, one frame at a time.
-        assert_eq!(stride_frames(Some(Duration::from_millis(400))), 1);
+        assert_eq!(stride_frames(PREVIEW_INTERVAL, Some(Duration::from_millis(400))), 1);
         // And an unmeasurably fast one still publishes rather than jumping a whole track blind.
-        assert_eq!(stride_frames(Some(Duration::from_nanos(1))), MAXIMUM_STRIDE);
-        assert_eq!(stride_frames(Some(Duration::ZERO)), MAXIMUM_STRIDE);
+        assert_eq!(stride_frames(PREVIEW_INTERVAL, Some(Duration::from_nanos(1))), MAXIMUM_STRIDE);
+        assert_eq!(stride_frames(PREVIEW_INTERVAL, Some(Duration::ZERO)), MAXIMUM_STRIDE);
     }
 
     #[test]
@@ -716,15 +740,15 @@ mod tests {
         let keyframes = KeyframeIndex::from_samples(&samples(12, 4));
         let rate = Some(Duration::from_millis(30));
         // Ahead of the reader: continue from where it is, one stride at a time.
-        assert_eq!(walk_step(Some(2), 11, rate, &keyframes), 7);
+        assert_eq!(walk_step(Some(2), 11, PREVIEW_INTERVAL, rate, &keyframes), 7);
         // Never past the target itself.
-        assert_eq!(walk_step(Some(2), 5, rate, &keyframes), 5);
+        assert_eq!(walk_step(Some(2), 5, PREVIEW_INTERVAL, rate, &keyframes), 5);
         // Already there.
-        assert_eq!(walk_step(Some(5), 5, rate, &keyframes), 5);
+        assert_eq!(walk_step(Some(5), 5, PREVIEW_INTERVAL, rate, &keyframes), 5);
         // Behind the reader, or a position a cancelled decode left unknown: restart at the
         // random-access point the target decodes from, which is the first frame it can publish.
-        assert_eq!(walk_step(Some(11), 6, rate, &keyframes), 4);
-        assert_eq!(walk_step(None, 6, rate, &keyframes), 4);
+        assert_eq!(walk_step(Some(11), 6, PREVIEW_INTERVAL, rate, &keyframes), 4);
+        assert_eq!(walk_step(None, 6, PREVIEW_INTERVAL, rate, &keyframes), 4);
     }
 
     #[test]
