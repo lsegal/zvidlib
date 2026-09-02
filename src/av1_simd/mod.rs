@@ -205,6 +205,14 @@ pub fn set_active_isa(isa: Option<SimdIsa>) {
 // The 4- and 8-point transforms have no useful 256-bit shape (a whole 8x8
 // coefficient block is four AVX2 registers), so AVX2 hosts run them through the
 // SSE4.1 path and spend the wider registers on the pixel filters instead.
+//
+// Nothing in the type system enforces that, and a kernel that loses the
+// attribute stays bit-exact, so no test here notices - only the ratio against
+// scalar on an x86_64 host does.
+// `.github/scripts/check_simd_target_features.py` reads it off the emitted
+// assembly instead, failing on an out-of-line `core::core_arch` intrinsic or on
+// a generic kernel left standing as its own symbol, and CI runs it on the
+// x86_64 job.
 // ---------------------------------------------------------------------
 
 macro_rules! simd_entry_points {

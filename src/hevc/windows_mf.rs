@@ -87,6 +87,10 @@ enum Command {
     Reset {
         response: SyncSender<Result<Vec<DecodedVideoFrame>>>,
     },
+    SetOutputWanted {
+        wanted: bool,
+        response: SyncSender<Result<Vec<DecodedVideoFrame>>>,
+    },
     Stop,
 }
 
@@ -176,6 +180,14 @@ impl VideoDecoder for HardwareDecoder {
         self.request(|response| Command::Reset { response })
             .map(|_| ())
     }
+
+    /// Forwards the hint to the worker and waits for it, so that a sample submitted after this
+    /// returns is drained under the setting the caller asked for. The command channel is FIFO,
+    /// so the wait is not what orders it; it is what keeps a dropped worker visible here rather
+    /// than silently leaving the decoder converting frames nobody wants.
+    fn set_output_wanted(&mut self, wanted: bool) {
+        let _ = self.request(|response| Command::SetOutputWanted { wanted, response });
+    }
 }
 
 impl Drop for HardwareDecoder {
@@ -206,6 +218,10 @@ fn run_worker(mut core: DecoderCore, commands: Receiver<Command>) {
             Command::Reset { response } => {
                 let _ = response.send(core.reset().map(|()| Vec::new()));
             }
+            Command::SetOutputWanted { wanted, response } => {
+                core.set_output_wanted(wanted);
+                let _ = response.send(Ok(Vec::new()));
+            }
             Command::Stop => return,
         }
     }
@@ -223,6 +239,10 @@ struct DecoderCore {
     parameter_sets: Vec<u8>,
     identities: HashMap<i64, FrameIndex>,
     next_identity: i64,
+    /// Whether the samples `ProcessOutput` hands back are wanted as frames. A suppressed sample
+    /// is still decoded and still collected - the transform will not proceed until its output is
+    /// taken - but it never reaches the staging copy or the colour conversion.
+    output_wanted: bool,
 }
 
 impl DecoderCore {
@@ -286,6 +306,7 @@ impl DecoderCore {
             parameter_sets,
             identities: HashMap::new(),
             next_identity: 1,
+            output_wanted: true,
         })
     }
 
@@ -383,7 +404,11 @@ impl DecoderCore {
                     let sample = sample.ok_or_else(|| {
                         codec("Media Foundation reported output without a video sample")
                     })?;
-                    frames.push(self.convert_output(sample)?);
+                    if self.output_wanted {
+                        frames.push(self.convert_output(sample)?);
+                    } else {
+                        self.discard_output(&sample)?;
+                    }
                 }
                 Err(error) if error.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => return Ok(frames),
                 Err(error) if error.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
@@ -397,6 +422,25 @@ impl DecoderCore {
                 }
             }
         }
+    }
+
+    fn set_output_wanted(&mut self, wanted: bool) {
+        self.output_wanted = wanted;
+    }
+
+    /// Retires a decoded sample without reading its picture.
+    ///
+    /// Only the identity bookkeeping of [`DecoderCore::convert_output`] is kept: the sample's
+    /// timestamp is still matched and consumed, so the frames that follow keep their own, and
+    /// dropping the sample releases the decoder's surface. What is skipped is the D3D11 staging
+    /// copy and the NV12-to-RGBA pass over a picture nothing will draw.
+    fn discard_output(&mut self, sample: &IMFSample) -> Result<()> {
+        let token = unsafe { sample.GetSampleTime() }
+            .map_err(|error| windows_error("decoded HEVC frame has no timestamp", error))?;
+        self.identities.remove(&token).ok_or_else(|| {
+            codec("decoded HEVC frame timestamp does not match a submitted sample")
+        })?;
+        Ok(())
     }
 
     fn convert_output(&mut self, sample: IMFSample) -> Result<DecodedVideoFrame> {

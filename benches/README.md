@@ -938,10 +938,18 @@ No kernel changed between set 2 and set 3. What changed was the load average on
 the measuring host, and every candidate walked towards parity as the machine got
 quieter. **On this host, at this noise level, no arm is reliably below parity
 except the ones with no vector kernel at all** — `av1_encode_stage_symbol`,
-`av1_encode_stage_bitstream`, `hevc_cabac`, `hevc_encode_cabac`,
-`av1_entropy_symbol` and `hevc_color_convert`, where the two arms are the same
-code and differ only by measurement noise. Of those, `hevc_color_convert` is the
-one worth acting on, and `#219` already tracks vectorizing it.
+`av1_encode_stage_bitstream`, `hevc_cabac`, `hevc_encode_cabac` and
+`av1_entropy_symbol`, where the two arms are the same code and differ only by
+measurement noise.
+
+`hevc_color_convert` used to be listed there too, and this table's `1.27x` row
+is what a same-code group reads at this noise level rather than a NEON win.
+That is no longer what the group measures. `b6655bad215f` predates `f695a1a`,
+the #222 merge that closed #219 by adding `src/hevc/color_convert.rs` with
+scalar, SSE4.1, AVX2 and NEON backends, so this draw timed the old per-sample
+scalar loop in `picture_to_rgba` on both arms. **The `hevc_color_convert` row
+above is stale, and re-drawing this table is the only thing that will fix it**;
+every other row in it is a group whose kernels are unchanged since the draw.
 
 The rest of the near-parity rows are the story this file tells above: under
 `lto = "fat"` with `codegen-units = 1`, LLVM does to the scalar reference roughly
@@ -980,6 +988,13 @@ out-of-line `core_arch` call with its operand spilled to the stack. It recorded
 `av1_deblock_wide` at 0.13x under `avx2` and `av1_forward_flipadst_16x16` at
 0.20x. Those figures described the compiler's output, not the kernels, and the
 kernels they described no longer exist.
+
+That draw is older than its date suggests in one further way. `e115506f8bf6` is
+a checkpoint commit on the #257 branch, and its merge base with `main` is
+`b9995b1` (#254) — so it does not contain `f695a1a`, the #222 merge, even though
+#222 landed on `main` fifty minutes before the checkpoint was written. That is
+the whole of why `hevc_color_convert` moved; see [Reading the
+rows](#reading-the-rows) below.
 
 Measured on **AMD EPYC 7763 64-Core Processor (Linux, x86_64)**, at
 `b284c38a6391` — the #337 merge `b233f0a74f88` plus the temporary six-round
@@ -1107,13 +1122,54 @@ Two rows read at parity for a reason worth stating rather than as noise:
 The rows with real vector work are now the ones with the largest ratios, which
 is what the old table could not show. `hevc_encode_*_rgba_to_yuv420` leads at
 6.27x and 6.06x, followed by `av1_deblock` at 6.28x, `av1_forward_dct_4x4` at
-5.55x, `av1_deblock_boundary` at 4.90x and `hevc_color_convert` at 4.76x — that
-last one read `1.00x` in the previous table, and is the one move here this
-re-take does not attribute: the #337 repair did not touch
-`hevc::color_convert`, so something between #261's draw and this one changed
-what that group measures, and `#361` finds out what. The AV1 forward transforms
-sit between 3.1x and 3.5x, `av1_self_guided` at 3.49x and `av1_cdef` at 2.86x,
-and the motion-compensation family between 2.3x and 2.7x.
+5.55x, `av1_deblock_boundary` at 4.90x and `hevc_color_convert` at 4.76x. The
+AV1 forward transforms sit between 3.1x and 3.5x, `av1_self_guided` at 3.49x and
+`av1_cdef` at 2.86x, and the motion-compensation family between 2.3x and 2.7x.
+
+**`hevc_color_convert` moved from `1.00x` to `4.76x` because #222 landed in
+between.** Every other row is attributable to #337, and this one is the move
+#351 recorded without a cause, because #337 touched only `src/av1_simd` and
+never `src/hevc/color_convert.rs`. The cause is neither #337 nor the harness:
+the `1.00x` was a correct reading of a group that had no vector arms yet.
+
+At `e115506f8bf6` there is no `src/hevc/color_convert.rs` in the tree at all.
+The conversion is a per-pixel scalar double loop inside `picture_to_rgba` in
+`src/hevc/mod.rs`, with no `simd` dispatch of any kind, so `scalar`, `sse4.1`
+and `avx2` ran byte-identical code and `1.00x / 1.00x` is exactly what they
+should have read. `benches/hevc_decode.rs` said as much at that commit: its
+per-stage table listed the group's `Vectorized` column as "no, today". The
+`convert_row_{sse41,avx2}` kernels arrived with #222 (`f695a1a`), which the
+checkpoint the draw was taken on does not contain — see the paragraph on
+`e115506f8bf6`'s merge base above. So the 4.76x is #222's win, showing up in the
+first table drawn after it, and nothing between the two draws changed what the
+group *measures*: what changed is that there is now something to measure.
+
+This also settles the aarch64 side. That table's [sub-parity
+discussion](#reading-the-sub-parity-rows) named `hevc_color_convert` as a group
+whose arms are the same code; that was true of the draw it describes and is no
+longer true of the crate. Its `1.27x` row is stale for the same reason and the
+note there now says so.
+
+**What keeps the hole from reopening.** A per-ISA group is only measuring its
+arms if the code under it reaches a dispatch site that `zvidlib::simd` drives,
+and that is now checked rather than assumed. `src/hevc/color_convert.rs` is
+registered as the `hevc_color_convert` site in `simd::active_by_site`, and four
+tests in `src/simd.rs` hold it there: `pinning_scalar_reaches_every_dispatch_site`
+and `clearing_the_override_restores_per_site_detection` assert one selector per
+site against a hand-written list that must equal `active_by_site` exactly, so a
+site added without a check fails the assertion instead of going unnoticed;
+`the_documented_site_table_lists_every_dispatch_site` reads the site table back
+out of the `active_by_site` rustdoc and compares it; and
+`every_site_reports_the_pinned_instruction_set` pins each entry of
+`simd::available()` in turn and requires every site to follow. A stage whose
+arms are all the same code therefore cannot be one that is registered as a site
+and passing those tests, so "this group reads `1.00x`" and "this group has no
+kernel" can be told apart by asking `active_by_site` rather than by reading the
+prose. What is *not* checked by anything is the `Vectorized` column in [The HEVC
+per-stage groups](#the-hevc-per-stage-groups) or a committed baseline table's
+agreement with the kernels in force at the commit it was drawn at — both are
+prose, and both are what went stale here. Quoting an old table's ratio is only
+safe alongside the commit stamped on it, which is why the stamps are there.
 
 The whole-frame encoder groups are the practical consequence.
 `av1_encode_frame_q32` reads 1.49x and `av1_encode_frame_q160` 1.53x here,
