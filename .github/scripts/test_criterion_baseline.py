@@ -31,6 +31,8 @@ from contextlib import redirect_stdout
 
 import criterion_baseline as cb
 
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
+
 
 def _baseline(commit: str, medians: dict[str, float]) -> dict:
     return {
@@ -297,6 +299,185 @@ class RenderTable(unittest.TestCase):
         path = _isa_baseline(self.root / "stamp.json", {"g/scalar": 10.0, "g/avx2": 5.0}, commit="abcdef0123456789" + "0" * 24)
         rendered = self.render(path, host="Some CPU (Linux, x86_64)")
         self.assertIn("Measured on **Some CPU (Linux, x86_64)**, at `abcdef012345`.", rendered)
+
+
+# A stand-in for `active_by_site`'s rustdoc table, with the surrounding prose
+# the parser has to walk past.
+def _simd_source(sites: list[str]) -> str:
+    rows = "\n".join(f"/// | `{site}` | some kernels |" for site in sites)
+    return (
+        "//! module docs\n"
+        "/// The instruction set every dispatch site resolves to.\n"
+        "///\n"
+        "/// | Site | Kernels |\n"
+        "/// | --- | --- |\n"
+        f"{rows}\n"
+        "///\n"
+        "/// The `hevc_*` sites are absent on `wasm32`.\n"
+        "pub fn active_by_site() -> Vec<(&'static str, SimdIsa)> {\n"
+        "    vec![(\"av1_simd\", SimdIsa::Scalar)]\n"
+        "}\n"
+    )
+
+
+def _readme(host: str, commit: str, groups: list[str]) -> str:
+    rows = "\n".join(f"| `{group}` | 1.000 ms | 1.000 ms (1.00x) | 1.00x `neon` |" for group in groups)
+    return (
+        "## Committed baselines\n\n"
+        "This table replaces the one #261 recorded at `e115506f8bf6`.\n\n"
+        f"Measured on **{host}**, at `{commit}`.\n\n"
+        "| Group | `scalar` | `neon` | Best |\n"
+        "| --- | ---: | ---: | ---: |\n"
+        f"{rows}\n\n"
+        "#### Reading the sub-parity rows\n\nProse that is not a table.\n"
+    )
+
+
+class DispatchSiteParsing(unittest.TestCase):
+    """The site table is read out of a blob, so its parser is the whole check."""
+
+    def test_sites_are_read_off_the_rustdoc_table(self) -> None:
+        sites = cb._documented_dispatch_sites(_simd_source(["av1_simd", "hevc_recon"]))
+        self.assertEqual(sites, ["av1_simd", "hevc_recon"])
+
+    def test_prose_outside_the_table_is_not_a_site(self) -> None:
+        # `hevc_*` appears in the sentence below the table and must not be read
+        # as a twelfth site.
+        sites = cb._documented_dispatch_sites(_simd_source(["av1_simd"]))
+        self.assertEqual(sites, ["av1_simd"])
+
+    def test_the_real_site_table_parses(self) -> None:
+        source = (_REPO_ROOT / cb.SIMD_SOURCE).read_text()
+        sites = cb._documented_dispatch_sites(source)
+        self.assertIn("av1_simd", sites)
+        self.assertIn("hevc_color_convert", sites)
+
+    def test_every_documented_site_names_the_rows_it_invalidates(self) -> None:
+        # The guard that keeps `SITE_GROUP_PREFIXES` from being the next thing
+        # that goes quiet: a dispatch site added to `active_by_site` without
+        # deciding which committed rows it makes stale fails here.
+        source = (_REPO_ROOT / cb.SIMD_SOURCE).read_text()
+        for site in cb._documented_dispatch_sites(source):
+            self.assertIn(site, cb.SITE_GROUP_PREFIXES, f"{site} has no mapped groups")
+
+
+class ReadmeStampParsing(unittest.TestCase):
+    def test_the_stamp_is_the_bolded_host_line(self) -> None:
+        # Not `e115506f8bf6`, which the prose mentions as a *superseded* draw.
+        tables = cb._committed_tables(_readme("Apple M1", "b6655bad215f", ["hevc_sao"]))
+        self.assertEqual([t["commit"] for t in tables], ["b6655bad215f"])
+
+    def test_the_rows_under_a_stamp_are_its_groups(self) -> None:
+        tables = cb._committed_tables(
+            _readme("Apple M1", "b6655bad215f", ["hevc_sao", "hevc_color_convert"])
+        )
+        self.assertEqual(tables[0]["groups"], ["hevc_sao", "hevc_color_convert"])
+
+    def test_prose_after_the_table_ends_it(self) -> None:
+        readme = _readme("Apple M1", "b6655bad215f", ["hevc_sao"])
+        self.assertEqual(cb._committed_tables(readme)[0]["groups"], ["hevc_sao"])
+
+    def test_the_committed_readme_has_both_stamped_tables(self) -> None:
+        tables = cb._committed_tables((_REPO_ROOT / "benches/README.md").read_text())
+        self.assertEqual(len(tables), 2)
+        self.assertTrue(all(table["groups"] for table in tables))
+
+
+class GroupToSiteAttribution(unittest.TestCase):
+    def test_a_size_family_is_matched_by_prefix(self) -> None:
+        self.assertTrue(cb._group_matches_site("av1_forward_dct_16x16", "av1_simd"))
+
+    def test_the_1080p_variant_is_the_same_group(self) -> None:
+        self.assertTrue(cb._group_matches_site("av1_encode_stage_tile_1080p", "av1_coeff_ctx"))
+
+    def test_a_whole_frame_group_is_attributed_to_no_site(self) -> None:
+        # `hevc_encode_640x352` crosses every HEVC site, so no row of it can be
+        # blamed on one; the `_rdo_` and `_reconstruct` rows under it can.
+        self.assertFalse(
+            any(cb._group_matches_site("hevc_encode_640x352", site) for site in cb.SITE_GROUP_PREFIXES)
+        )
+        self.assertTrue(cb._group_matches_site("hevc_encode_640x352_reconstruct", "hevc_recon"))
+
+    def test_a_serial_group_is_attributed_to_no_site(self) -> None:
+        for group in ("hevc_cabac", "av1_encode_stage_symbol", "av1_entropy_symbol"):
+            self.assertFalse(
+                any(cb._group_matches_site(group, site) for site in cb.SITE_GROUP_PREFIXES),
+                group,
+            )
+
+
+class StalenessReport(unittest.TestCase):
+    """`staleness` end to end, with the stamp resolution stubbed.
+
+    Reading `src/simd.rs` at an arbitrary commit needs either that commit in the
+    clone or the network, and neither belongs in a unit test - so the resolver
+    is replaced and everything around it is exercised for real.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = pathlib.Path(self.tmp.name)
+        (self.root / "src").mkdir()
+        (self.root / "benches").mkdir()
+        self.real_resolver = cb._sites_at_commit
+        self.addCleanup(setattr, cb, "_sites_at_commit", self.real_resolver)
+
+    def run_report(self, head: list[str], then: list[str] | None, groups: list[str]) -> str:
+        (self.root / cb.SIMD_SOURCE).write_text(_simd_source(head))
+        readme = self.root / "benches/README.md"
+        readme.write_text(_readme("Apple M1", "b6655bad215f", groups))
+        cb._sites_at_commit = lambda commit, repo_root, slug: then
+        args = argparse.Namespace(readme=str(readme), repo_root=str(self.root), out=None)
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            self.assertEqual(cb.staleness(args), 0)
+        return buffer.getvalue()
+
+    def test_a_site_that_landed_after_the_stamp_names_its_row(self) -> None:
+        report = self.run_report(
+            head=["av1_simd", "hevc_color_convert"],
+            then=["av1_simd"],
+            groups=["hevc_sao", "hevc_color_convert"],
+        )
+        self.assertIn("| `hevc_color_convert` | `hevc_color_convert` |", report)
+        self.assertNotIn("| `hevc_sao` |", report)
+        self.assertIn("1 row(s) flagged", report)
+
+    def test_an_unchanged_site_set_is_clean(self) -> None:
+        report = self.run_report(
+            head=["av1_simd", "hevc_recon"],
+            then=["av1_simd", "hevc_recon"],
+            groups=["hevc_sao"],
+        )
+        self.assertIn("Clean", report)
+        self.assertIn("0 row(s) flagged", report)
+
+    def test_a_landed_site_no_row_measures_is_said_so(self) -> None:
+        report = self.run_report(
+            head=["av1_simd", "hevc_recon"], then=["av1_simd"], groups=["hevc_sao"]
+        )
+        self.assertIn("`hevc_recon`", report)
+        self.assertIn("No row of this table is attributed", report)
+        self.assertIn("0 row(s) flagged", report)
+
+    def test_an_unreadable_stamp_is_unverified_rather_than_clean(self) -> None:
+        report = self.run_report(head=["av1_simd"], then=None, groups=["hevc_sao"])
+        self.assertIn("unverified rather than clean", report)
+        self.assertNotIn("Clean", report)
+
+    def test_a_retired_site_is_reported_too(self) -> None:
+        report = self.run_report(
+            head=["av1_simd"], then=["av1_simd", "hevc_gone"], groups=["hevc_sao"]
+        )
+        self.assertIn("present at the stamp and gone now", report)
+
+    def test_a_readme_with_no_stamped_table_is_an_error(self) -> None:
+        (self.root / cb.SIMD_SOURCE).write_text(_simd_source(["av1_simd"]))
+        readme = self.root / "benches/README.md"
+        readme.write_text("## Committed baselines\n\nNothing measured yet.\n")
+        args = argparse.Namespace(readme=str(readme), repo_root=str(self.root), out=None)
+        self.assertEqual(cb.staleness(args), 1)
 
 
 if __name__ == "__main__":

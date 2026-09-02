@@ -1071,6 +1071,58 @@ instruction set", not "this row was skipped". An aarch64 baseline and an x86_64
 one therefore describe disjoint halves of the dispatch matrix, and a ratio from
 one says nothing about the other.
 
+### Checking a table still describes the crate
+
+A committed table is a measurement of a commit, and the commit is stamped on
+it. What nothing checked until now is whether that commit's *kernels* are the
+ones the crate has: a row silently stops describing anything the moment a
+dispatch site lands under it, and the only signal was somebody noticing a ratio
+that moved for no attributable reason. Chasing one such row down to a stale
+table rather than a regression is the whole of what issue #361 turned out to
+be, and `src/simd.rs` already refuses to let the *code* side of that go quiet —
+`the_documented_site_table_lists_every_dispatch_site` makes a dispatch site
+impossible to add without a check.
+
+```sh
+python3 .github/scripts/criterion_baseline.py staleness --readme benches/README.md
+```
+
+It reads each stamp out of this file, reads the dispatch sites
+`zvidlib::simd::active_by_site` documents at that commit, diffs them against
+the sites registered now, and names the rows whose subject site did not exist
+when the table was drawn. Today that is three rows of the Apple M1 table —
+`hevc_color_convert`, `av1_encode_stage_tile` and
+`hevc_encode_640x352_reconstruct` — and nothing on the x86_64 one, which was
+drawn at a commit with the same eleven sites the crate has now.
+
+Three things about how it reads the site set are worth stating, because each is
+a place a more obvious implementation does not work:
+
+- The sites are read from `active_by_site`'s **rustdoc table**, not from a
+  build. A dispatch site is a Rust value, and resolving it at a stamped commit
+  would mean building that commit; the doc table is the same set by test, and
+  it can be read out of a blob.
+- A stamp is routinely a checkpoint commit on a branch whose ref is deleted at
+  merge — both tables here are — so `git show` fails on exactly the commits
+  this check exists to read. It falls back to the GitHub contents API, and a
+  stamp neither can resolve is reported as *unverified* rather than as clean.
+- A row is attributed to a site only when the row's group is that site's own
+  number. Whole-frame groups like `hevc_encode_640x352` cross every site at
+  once, so a landed kernel moves them by an amount no single row can be blamed
+  for, and naming them would bury the rows that can be.
+
+The check runs in the `Rust checks` job and writes its report to the step
+summary. It reports and never gates, for the same reason [the delta
+report](#the-threshold-and-why-it-is-only-a-report) does not: a stale table is
+a measurement to redraw, not a broken build. The redraw is the recipe above.
+
+It answers the site-set half of what can go stale. The `Vectorized` column in
+[The HEVC per-stage groups](#the-hevc-per-stage-groups) is the other half, and
+it is not checked here: a site can exist and still resolve to the scalar
+reference on every arm — `hevc_recon` does — so "is there a dispatch site" and
+"is there a vector kernel" are different questions, and only the first can be
+answered from a commit that is not built.
+
 ### Apple M1 (aarch64)
 
 Measured on **Apple M1 (macOS 15, aarch64)**, at `b6655bad215f`.
