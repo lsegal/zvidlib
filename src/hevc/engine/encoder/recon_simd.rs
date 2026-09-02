@@ -523,39 +523,15 @@ pub(crate) fn band_offset_rect(
         src.len() >= (height - 1) * src_stride + width,
         "source rectangle runs past the plane"
     );
-    match isa_code() {
-        #[cfg(target_arch = "x86_64")]
-        ISA_AVX2 => {
-            // SAFETY: the rectangle was bounds-checked above, and this arm is
-            // only reachable with AVX2 available.
-            unsafe {
-                x86::band_offset_rect_avx2(here, here_stride, src, src_stride, width, height, stats)
-            }
-        }
-        #[cfg(target_arch = "x86_64")]
-        ISA_SSE41 => {
-            // SAFETY: as above, with SSE4.1 detected.
-            unsafe {
-                x86::band_offset_rect_sse41(
-                    here,
-                    here_stride,
-                    src,
-                    src_stride,
-                    width,
-                    height,
-                    stats,
-                )
-            }
-        }
-        _ => {
-            for y in 0..height {
-                band_offset_row_scalar(
-                    &here[y * here_stride..y * here_stride + width],
-                    &src[y * src_stride..y * src_stride + width],
-                    stats,
-                );
-            }
-        }
+    // Every instruction set resolves to the scalar reference: the once-per-CTB
+    // shape was measured against it and is a regression, worse on Zen 5 than
+    // the once-per-row shape it was meant to repair. See above.
+    for y in 0..height {
+        band_offset_row_scalar(
+            &here[y * here_stride..y * here_stride + width],
+            &src[y * src_stride..y * src_stride + width],
+            stats,
+        );
     }
 }
 
@@ -945,6 +921,7 @@ mod x86 {
         }
     }
 
+    #[cfg(test)]
     /// One CTB of [`band_offset_row_avx2_lanes`] under a single
     /// `#[target_feature]` entry.
     ///
@@ -971,6 +948,7 @@ mod x86 {
         }
     }
 
+    #[cfg(test)]
     /// [`band_offset_rect_avx2`] at four lanes.
     #[target_feature(enable = "sse4.1")]
     pub(super) unsafe fn band_offset_rect_sse41(
@@ -1430,42 +1408,56 @@ mod tests {
         simd::set_override(None);
     }
 
-    /// The once-per-CTB call shape has to be the same function as the
-    /// once-per-row one, or the #382 comparison is between two different
-    /// answers rather than two call shapes. Strides wider than the rectangle
-    /// are the case that matters: a CTB is a window into a plane, so the rows
-    /// a rect call walks are not contiguous, and a kernel that ignored the
-    /// pitch would still pass on a full-width rectangle.
+    /// The strided rectangles the #382 call-shape measurement was taken over,
+    /// and the row-by-row scalar answer every arm has to reproduce.
+    ///
+    /// Strides wider than the rectangle are the case that matters: a CTB is a
+    /// window into a plane, so the rows a rect call walks are not contiguous,
+    /// and a kernel that ignored the pitch would still pass on a full-width
+    /// rectangle. The widths straddle both vector steps and the heights cover
+    /// luma and chroma CTBs.
+    fn band_rect_fixture(width: usize, height: usize) -> (Vec<i32>, Vec<u8>, BandStats) {
+        const STRIDE: usize = BAND_RECT_STRIDE;
+        let mut here = samples(0x7777_8888_9999_aaaa, STRIDE * height);
+        for (i, value) in here.iter_mut().enumerate() {
+            *value = (i as i32 * 7) % 300 - 12;
+        }
+        let src = bytes(0x0123_4567_89ab_cdef, STRIDE * height);
+        let mut expected = BandStats::default();
+        for y in 0..height {
+            band_offset_row_scalar(
+                &here[y * STRIDE..y * STRIDE + width],
+                &src[y * STRIDE..y * STRIDE + width],
+                &mut expected,
+            );
+        }
+        (here, src, expected)
+    }
+
+    /// The pitch [`band_rect_fixture`] lays its rows out at, wider than every
+    /// rectangle measured against it.
+    const BAND_RECT_STRIDE: usize = 71;
+
+    /// The rectangles both the dispatch test and the x86 kernel test cover.
+    const BAND_RECTS: &[(usize, usize)] = &[
+        (1, 1),
+        (3, 2),
+        (4, 4),
+        (7, 3),
+        (8, 8),
+        (16, 16),
+        (17, 5),
+        (64, 4),
+    ];
+
+    /// The once-per-CTB entry has to give the row-by-row answer under every
+    /// pin, the same way the once-per-row entry does.
     #[test]
     fn the_band_offset_rect_matches_the_row_reference_on_every_instruction_set() {
         let _guard = simd::test_lock();
-        // Widths straddling both vector steps, heights covering luma and
-        // chroma CTBs, and a pitch wider than every width.
-        const STRIDE: usize = 71;
-        for &(width, height) in &[
-            (1usize, 1usize),
-            (3, 2),
-            (4, 4),
-            (7, 3),
-            (8, 8),
-            (16, 16),
-            (17, 5),
-            (64, 4),
-        ] {
-            let mut here = samples(0x7777_8888_9999_aaaa, STRIDE * height);
-            for (i, value) in here.iter_mut().enumerate() {
-                *value = (i as i32 * 7) % 300 - 12;
-            }
-            let src = bytes(0x0123_4567_89ab_cdef, STRIDE * height);
-
-            let mut expected = BandStats::default();
-            for y in 0..height {
-                band_offset_row_scalar(
-                    &here[y * STRIDE..y * STRIDE + width],
-                    &src[y * STRIDE..y * STRIDE + width],
-                    &mut expected,
-                );
-            }
+        const STRIDE: usize = BAND_RECT_STRIDE;
+        for &(width, height) in BAND_RECTS {
+            let (here, src, expected) = band_rect_fixture(width, height);
             for isa in simd::available() {
                 simd::set_override(Some(isa));
                 let mut got = BandStats::default();
@@ -1479,6 +1471,42 @@ mod tests {
             }
         }
         simd::set_override(None);
+    }
+
+    /// The once-per-CTB x86 kernels are not dispatched to - #382 measured them
+    /// as a regression - so nothing else reaches them. They are still asserted
+    /// bit-exact here, for the same reason the once-per-row candidates are:
+    /// the figures recorded for them have to be figures for kernels that would
+    /// have been correct to land.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_x86_band_offset_rect_kernels_match_the_row_reference() {
+        const STRIDE: usize = BAND_RECT_STRIDE;
+        for &(width, height) in BAND_RECTS {
+            let (here, src, expected) = band_rect_fixture(width, height);
+            if is_x86_feature_detected!("sse4.1") {
+                let mut got = BandStats::default();
+                // SAFETY: SSE4.1 is detected, and the rectangle lies inside
+                // both planes.
+                unsafe {
+                    x86::band_offset_rect_sse41(
+                        &here, STRIDE, &src, STRIDE, width, height, &mut got,
+                    );
+                }
+                assert_eq!(got, expected, "sse4.1 rect {width}x{height}");
+            }
+            if is_x86_feature_detected!("avx2") {
+                let mut got = BandStats::default();
+                // SAFETY: AVX2 is detected, and the rectangle lies inside both
+                // planes.
+                unsafe {
+                    x86::band_offset_rect_avx2(
+                        &here, STRIDE, &src, STRIDE, width, height, &mut got,
+                    );
+                }
+                assert_eq!(got, expected, "avx2 rect {width}x{height}");
+            }
+        }
     }
 
     #[test]
