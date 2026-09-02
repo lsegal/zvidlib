@@ -451,6 +451,13 @@ const BAND_SHIFT: i32 = 3;
 /// smallest at 16 samples, but it was not itself measured and is not the reason
 /// the kernel is unlanded. The measured whole-picture result is.
 ///
+/// **#382 has since measured both of those candidate causes, and neither is the
+/// reason.** The band search is 23-29% of this group's `avx2` arm rather than a
+/// negligible share, and calling the kernel once per CTB instead of once per
+/// row is a *larger* regression than calling it per row. See
+/// [`band_offset_rect`] for both figures and for where a future attempt should
+/// start instead.
+///
 /// **No x86_64 kernel is dispatched to**, the same call
 /// [`crate::hevc::engine::simd::combine_weighted`] got at four lanes and the
 /// same one #305 made for NEON. Both x86 shapes stay behind `#[cfg(test)]` as
@@ -489,13 +496,48 @@ pub(crate) fn band_offset_row(here: &[i32], src: &[u8], stats: &mut BandStats) {
 /// amortize it, or a band search too small a share of a reconstruction for any
 /// ratio on it to show.
 ///
-/// #382 separated them by timing the reconstruction group with the band half of
-/// the search skipped, which is what `hevc_encode_*_reconstruct_no_band_search`
-/// exists for. The share is *not* small: see `benches/README.md`. That left the
-/// call shape, and this entry is the direct test of it — the rows of a CTB are
+/// #382 measured both, and **neither survives.**
+///
+/// The share was taken by timing the reconstruction group with the band half of
+/// the search skipped - that is what `hevc_encode_*_reconstruct_no_band_search`
+/// exists for - on six `ubuntu-latest` draws and one `macos-15-intel`, five
+/// interleaved rounds each. The band search is **23-29% of this group's `avx2`
+/// arm** on every CPU model timed, against a 1-6% round-to-round spread. A
+/// 1.10-1.53x on work that large is several percent end to end, which the
+/// harness resolves; it did not appear, so the denominator is not the problem.
+///
+/// The call shape was then tested by *being* this entry: the rows of a CTB are
 /// walked inside one `#[target_feature]` entry, so a 16x16 luma CTB pays one
-/// non-inlinable call instead of sixteen and a 8x8 chroma CTB one instead of
-/// eight.
+/// non-inlinable call rather than sixteen and an 8x8 chroma CTB one rather than
+/// eight, over the same lane-scatter body. Paired branch-against-base, both
+/// trees built and timed on one host, interleaved within a round:
+///
+/// | CPU model | draws | `avx2` | `sse4.1` | `scalar` (control) |
+/// |---|---|---|---|---|
+/// | AMD EPYC 7763 | 3 | 0.976-0.982x | 0.992-1.004x | 1.001-1.009x |
+/// | AMD EPYC 9V74 | 3 | 0.872-0.891x | 0.976-0.988x | 1.006-1.008x |
+///
+/// **It is worse, not better.** On Zen 5 the once-per-CTB shape reads
+/// 0.872-0.891x where the once-per-row shape read 0.94-0.95x: removing fifteen
+/// of every sixteen calls made the kernel *more* expensive, which is the
+/// opposite of what a call-overhead account predicts.
+///
+/// So the site is not what is costing the kernel its isolated win. What the two
+/// measurements together say is that `bench_band_offset_row` does not measure
+/// the encoder's work - it runs one L1-resident run of up to 1024 samples back
+/// to back with `stats` hot and the branch fully predicted, where this loop
+/// classifies CTB windows of a picture-sized plane interleaved with prediction,
+/// the transform round trip and two in-loop filters, reloading `stats` per CTB.
+/// **A third call shape is not what would make that transfer**; the untested
+/// idea is a different decomposition, one keeping the 32-band accumulators in
+/// registers across a whole CTB rather than in 32 memory slots re-read per row,
+/// and that is a different kernel rather than this one re-shaped.
+///
+/// This entry is therefore kept, resolving to the scalar reference on every
+/// instruction set, so a future attempt starts from the once-per-CTB shape
+/// without re-deriving that the once-per-row one is not the cost. Both x86 rect
+/// kernels stay `#[cfg(test)]` beside the six once-per-row candidates, asserted
+/// bit-exact, as the apparatus the figures above were taken with.
 ///
 /// `here_stride` and `src_stride` are the two planes' own row pitches; `here`
 /// and `src` start at the rectangle's first sample.
