@@ -793,8 +793,8 @@ pub(super) const SAO_LAMBDA_BAND: u64 = 4;
 /// What band offset's own syntax is charged per bin, as a multiple of
 /// `lambda_q8`, numerator over denominator — see [`SaoLambda::band_q8`] for
 /// what the multiple is and what the sweep says about it.
-const BAND_SYNTAX_CHARGE_NUM: u32 = 5;
-const BAND_SYNTAX_CHARGE_DEN: u32 = 2;
+const BAND_SYNTAX_CHARGE_NUM: u32 = 1;
+const BAND_SYNTAX_CHARGE_DEN: u32 = 1;
 
 /// The two §9 rate-distortion multipliers the per-CTB SAO search prices
 /// syntax with, both in the 1/256 units
@@ -953,6 +953,57 @@ fn band_offsets(sums: &[i64; 32], counts: &[i64; 32], band_position: u8) -> (i64
     (gain, offsets)
 }
 
+/// How many of a candidate's four offsets are actually signalled, which is
+/// how many means it fitted and so how many times [`band_fit_optimism`] is
+/// charged.
+fn fitted_offsets(offsets: &[i32; 5]) -> i64 {
+    offsets[1..5].iter().filter(|&&o| o != 0).count() as i64
+}
+
+/// The amount by which a band candidate's measured gain overstates the
+/// squared error it will actually remove, per offset it fits — read off the
+/// same 32-band histogram the candidates are scored from.
+///
+/// [`band_offsets`] measures a band's gain on exactly the samples its offset
+/// was fitted to. For a band of `n` samples whose summed error is `s` that
+/// gain is `s^2 / n` at the unrounded offset, and its expectation is
+/// `n * mu^2 + sigma^2`: one residual variance of the gain describes the
+/// noise in the band rather than its mean. So the overstatement is `sigma^2`
+/// per fitted offset, and — this is what makes it worth charging rather than
+/// absorbing — it does not shrink with `n`, while the gain it inflates does.
+///
+/// `sigma^2` is a property of the reconstruction error, not of the
+/// classification, so it can be read off the bands a candidate does not use.
+/// A candidate offsets four of the 32 bands and the other 28 carry the same
+/// fit against the same samples, which makes them a held-out sample of
+/// exactly this quantity — gathered already, by [`band_stats`], for nothing.
+/// The median over the nonempty bands is what is taken rather than the mean:
+/// a few bands genuinely do carry a mean, they are precisely the ones a
+/// candidate is about to select, and a mean would let them inflate the
+/// estimate of what the rest say.
+///
+/// The estimate is of the unrounded fit. The search rounds and clamps, and an
+/// offset that rounds to zero is neither signalled nor credited with any
+/// gain, so the charge is applied per *nonzero* offset by
+/// [`fitted_offsets`].
+fn band_fit_optimism(sums: &[i64; 32], counts: &[i64; 32]) -> i64 {
+    let mut fits = [0i64; 32];
+    let mut used = 0usize;
+    for band in 0..32 {
+        if counts[band] == 0 {
+            continue;
+        }
+        fits[used] = sums[band] * sums[band] / counts[band];
+        used += 1;
+    }
+    if used == 0 {
+        return 0;
+    }
+    let fits = &mut fits[..used];
+    fits.sort_unstable();
+    fits[used / 2]
+}
+
 /// The best SAO component for the luma of one CTB, or an off component when
 /// nothing earns the syntax it would be coded with.
 ///
@@ -985,8 +1036,12 @@ fn best_luma_sao(
         }
     }
     let (sums, counts) = band_stats(pic, Plane::Luma, src.y, src.width, rect);
+    let optimism = band_fit_optimism(&sums, &counts);
     for band_position in 0..32u8 {
         let (gain, offsets) = band_offsets(&sums, &counts, band_position);
+        // What the fit measured, less what fitting it on its own samples
+        // overstates — see `band_fit_optimism`.
+        let gain = gain - optimism * fitted_offsets(&offsets);
         // One `sao_type_idx_luma` bin beyond the "off" bin, then the band
         // path's own signs, position and offsets.
         let score = rd_score(
@@ -1097,10 +1152,15 @@ fn best_band_component(
     lambda: SaoLambda,
 ) -> (i64, [i32; 5], u8) {
     let (sums, counts) = band_stats(pic, plane, source, src_stride, rect);
+    let optimism = band_fit_optimism(&sums, &counts);
     let mut best = (0i64, [0i32; 5], 0u8);
     let mut best_score = i64::MIN;
     for band_position in 0..32u8 {
         let (gain, offsets) = band_offsets(&sums, &counts, band_position);
+        // The corrected gain is what is returned as well as what is scored,
+        // so the pair's shared decision in `best_chroma_sao` compares the
+        // same quantity for both components.
+        let gain = gain - optimism * fitted_offsets(&offsets);
         let score = rd_score(
             gain,
             offset_abs_bins(&offsets),
