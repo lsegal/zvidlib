@@ -182,6 +182,27 @@ pub(crate) trait I32x: Copy {
     }
 }
 
+/// A vector whose two 128-bit halves can be filled from two separate places.
+///
+/// The coefficient-context kernel steps along a *row* of a transform block, so
+/// a 4-wide block leaves half of an eight-lane vector idle however the kernel
+/// is written. The way out is to stop treating the vector as one row: rows `r`
+/// and `r + 1` of a 4x4 block are eight consecutive outputs, so one vector
+/// holding row `r` in its low half and row `r + 1` in its high half does a
+/// whole block-row-pair per iteration and stores it with a single full-width
+/// store. Only the 256-bit implementation provides this - a 128-bit vector is
+/// exactly one 4-wide row already, and NEON's is the same shape, so the trait
+/// is x86_64-only.
+#[cfg(target_arch = "x86_64")]
+pub(crate) trait HalfPairs: I32x {
+    /// Loads the first four lanes of `low` into lanes 0..4 and the first four
+    /// of `high` into lanes 4..8 (both slices at least four long).
+    unsafe fn load_halves(low: &[i32], high: &[i32]) -> Self;
+    /// `[low; 4] ++ [high; 4]`: a value that differs between the two rows an
+    /// iteration covers but is uniform within each of them.
+    unsafe fn splat_halves(low: i32, high: i32) -> Self;
+}
+
 /// A 4-lane vector that can transpose a 4x4 block of lanes.
 ///
 /// The separable 4- and 8-point transforms need to swap rows and columns
@@ -200,7 +221,7 @@ pub(crate) trait Transpose4: I32x {
 
 #[cfg(target_arch = "x86_64")]
 mod x86 {
-    use super::{I32x, Transpose4};
+    use super::{HalfPairs, I32x, Transpose4};
     use core::arch::x86_64::*;
 
     #[derive(Clone, Copy)]
@@ -494,6 +515,29 @@ mod x86 {
                 let sum = _mm_add_epi32(lo, hi);
                 let pairs = _mm_hadd_epi32(sum, sum);
                 _mm_cvtsi128_si32(_mm_hadd_epi32(pairs, pairs))
+            }
+        }
+    }
+
+    impl HalfPairs for Avx2 {
+        #[inline(always)]
+        unsafe fn load_halves(low: &[i32], high: &[i32]) -> Self {
+            unsafe {
+                // Two 128-bit loads and a `vinserti128`: three micro-operations
+                // against the eight lanes of work they feed, amortized over the
+                // eight neighbours an iteration reads.
+                let lo = _mm_loadu_si128(low.as_ptr().cast());
+                let hi = _mm_loadu_si128(high.as_ptr().cast());
+                Self(_mm256_inserti128_si256::<1>(_mm256_castsi128_si256(lo), hi))
+            }
+        }
+        #[inline(always)]
+        unsafe fn splat_halves(low: i32, high: i32) -> Self {
+            unsafe {
+                Self(_mm256_inserti128_si256::<1>(
+                    _mm256_castsi128_si256(_mm_set1_epi32(low)),
+                    _mm_set1_epi32(high),
+                ))
             }
         }
     }
