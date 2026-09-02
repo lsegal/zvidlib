@@ -444,7 +444,18 @@ fn decode_frames(
             // decode part-way through. Everything between the reader's position and this frame is
             // decoded inside this one call, for reference only - which is what keeps a stride's
             // skipped frames costing their decoding and no conversion (#355).
-            let decoded = reader.get(FrameIndex(step), &cancellation);
+            //
+            // A step short of the target asks for its own picture and no cache tail: this walk is
+            // going forwards and will never come back for the frames behind an intermediate
+            // publish, and paying that tail once per published picture is what turned a 150 ms
+            // cadence into a conversion of every frame in the track (#402). The target itself is
+            // a destination and keeps its tail, so a committed scrub is still followed by free
+            // backward steps.
+            let decoded = if step == target {
+                reader.get(FrameIndex(step), &cancellation)
+            } else {
+                reader.get_step(FrameIndex(step), &cancellation)
+            };
             let elapsed = started.elapsed();
             let mut state = lock.lock().expect("frame queue poisoned");
             if state.shutdown {
