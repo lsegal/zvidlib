@@ -1785,15 +1785,21 @@ re-measurement sections below are the record of how each was established.
   redirect and the kernel were established rather than the current numbers.
 #### The #362 re-measurement
 
-The repair is measured, not asserted, but it is deliberately recorded here
-rather than folded into the table above. The `workflow_dispatch` round that
-measured it landed on an **Intel(R) Xeon(R) 6973P-C (Linux/X64)** — one of the
-three CPU models the table's draw explicitly measured and discarded for not
-being the AMD EPYC 7763 the other rounds shared — and it is one round, not the
-elementwise minimum of three. Its absolute times are therefore not comparable
-with the table's, and merging two rows of it into a table attributed to a named
-host would make that table attributable to no host at all, which is the failure
-mode the six-round selection above exists to avoid.
+This section is the record of how #362's redirect was established, not the
+crate's current numbers: the table above supersedes it, and reads this group at
+3.66x `avx2` against 3.07x `sse4.1` because #371 replaced the redirect with a
+kernel. What survives here is the evidence that the redirect did what it
+claimed, on the round that measured it.
+
+The repair was measured, not asserted, and it was deliberately recorded here
+rather than folded into the table. The `workflow_dispatch` round that measured
+it landed on an **Intel(R) Xeon(R) 6973P-C (Linux/X64)** — one of the CPU models
+the table's draw explicitly measured and discarded for not being the AMD EPYC
+7763 the merged rounds shared — and it is one round, not the elementwise minimum
+of three. Its absolute times are therefore not comparable with the table's, and
+merging two rows of it into a table attributed to a named host would make that
+table attributable to no host at all, which is the failure mode the six-round
+selection above exists to avoid.
 
 What *is* comparable is the `sse4.1`-against-`avx2` sign within the round, which
 is the whole claim. Measured at `539dad3d61cb` with `ZVIDLIB_BENCH_LARGE=1`,
@@ -1818,16 +1824,24 @@ contains the derivation behind the serial range coder, loses its 1.18x-against-
 1.17x split the same way. The dispatch site no longer takes the slower arm, and
 the `Best` column stops disagreeing with what a real x86_64 encode does.
 
-The `rdo_inter` pair is in the table above as the control, and it is unmoved:
-1.69x under `sse4.1` against 1.54x/1.55x under `avx2`, the same shape #351
-recorded on a different host. Nothing in #362 touches `rdcost`, and the second
-bullet above is why it would not have helped if it did.
+The `rdo_inter` pair is the control, and it is unmoved: 1.69x under `sse4.1`
+against 1.54x/1.55x under `avx2`, the same shape #351 recorded on a different
+host. Nothing in #362 touches `rdcost`, and the second bullet above is why it
+would not have helped if it did. That pair has since been repaired twice on its
+own account, by #370 and #387, and the table above now reads it at 2.31x and
+2.34x under `avx2`; this round predates both.
 #### The #371 re-measurement
 
 #362's repair routed around the idle lanes; #371 removes them, and the
 acceptance criterion was that the wide arm has to *win* on its own numbers
 before the dispatch site takes it back. It does, and by more than the margin
 #362 measured against it.
+
+The table above now carries this result directly, on the AMD EPYC 7763 it names
+rather than on the EPYC 9V74 measured here: `av1_encode_stage_coeff_ctx` reads
+1.181 ms `avx2` against 1.409 ms `sse4.1` there, a 19% gap against the 24% below,
+and `Best` reads `avx2` on both rows. This section stays as the record of the
+acceptance criterion and the round that met it.
 
 Measured at `f7b709ee62d7` — the branch's implementation commit — on an **AMD
 EPYC 9V74 80-Core Processor (Linux/X64)**, one `workflow_dispatch` round with
@@ -1864,11 +1878,13 @@ predates #370's own repair — that row is measured below.
 #### The #370 re-measurement
 
 Unlike the round above, this one landed on the **AMD EPYC 7763 64-Core
-Processor (Linux/X64)** — the same host the committed x86_64 table was measured
-on — so its columns can be read against that table directly. It is still one
-round rather than the elementwise minimum of three, which is why it is recorded
-here rather than merged into the table; the controls below are what carry the
-attribution. Measured at `6213a5580b78` with `ZVIDLIB_BENCH_LARGE=1`,
+Processor (Linux/X64)** — the same host model both the superseded x86_64 table
+and the one above were measured on — so its columns can be read against either
+directly. It is still one round rather than the elementwise minimum of three,
+which is why it is recorded here rather than merged into a table; the controls
+below are what carry the attribution. Every figure it compares against is the
+`b284c38a6391` draw, which the table above replaces; #387 has since moved these
+rows again, and the table's numbers are that later state rather than this one. Measured at `6213a5580b78` with `ZVIDLIB_BENCH_LARGE=1`,
 `# host instruction sets: scalar, sse4.1, avx2`, `# dispatch site
 hevc_rdcost: avx2` ([run
 33615242194](https://github.com/lsegal/zvidlib/actions/runs/33615242194)):
@@ -1883,12 +1899,12 @@ hevc_rdcost: avx2` ([run
 | `hevc_encode_1920x1088_rdo_intra` | 52.104 ms | 34.900 ms (1.49x) | 34.693 ms (1.50x) | 1.50x `avx2` |
 
 The `avx2` column of the `rdo_inter` pair is what moved, and only it: 57.659 ms
-to 55.886 ms and 547.481 ms to 530.010 ms against the table above, both about
+to 55.886 ms and 547.481 ms to 530.010 ms against the superseded table, both about
 3% faster, while the same rows' `scalar` and `sse4.1` columns land within 1% of
 their table values (88.922 against 89.626, 55.341 against 54.769, 843.440
-against 851.069, 523.280 against 520.861). `rdo_intra`, which runs the same
+against 851.069, 523.280 against 520.861, all from that draw). `rdo_intra`, which runs the same
 `rdcost::satd` through a mode search that never calls `sad`, is unmoved at
-1.48x/1.50x against the table's 1.49x/1.49x — one round of run-to-run noise on
+1.48x/1.50x against that draw's 1.49x/1.49x — one round of run-to-run noise on
 a row the change does not reach. So the 3% is attributable to the routing
 rather than to the host or the round.
 
@@ -1903,12 +1919,15 @@ encodes with the other AVX2 dispatch sites (`hevc_fwd_transform_quant`,
 not a threshold.
 
 The whole-frame groups are the practical consequence. `hevc_encode_640x352`
-reads 65.257 ms under `avx2` against the table's 67.101 ms and
+reads 65.257 ms under `avx2` against that draw's 67.101 ms and
 `hevc_encode_1920x1088` 628.680 ms against 646.477 ms, so an x86_64 user
 encoding HEVC on an AVX2 host gets about 2.8% of a whole encode back — the two
-arms are now 0.3% and 0.6% apart where the table has them 4.3% and 4.0% apart.
+arms are now 0.3% and 0.6% apart where that draw had them 4.3% and 4.0% apart.
+#387 turned that 2.8% into about 28%, and the table above is where that reads.
 `av1_encode_stage_coeff_ctx` reads 1.4647 ms and 1.4745 ms on this host, 0.7%
-apart, which is #362's redirect reproducing on the table's own hardware.
+apart, which is #362's redirect reproducing on the committed table's own
+hardware — a state #371 has since separated again, at 1.181 ms against 1.409 ms
+in the table above.
 
 - `hevc_encode_*_rdo_inter`. The same family, a different mechanism, and *not*
   the same fix. `rdcost::sad_avx2`'s 256-bit loop needs `w >= 32` and
@@ -1931,7 +1950,10 @@ apart, which is #362's redirect reproducing on the table's own hardware.
   losing, and it moves the search's candidate ordering with it, so it is an
   optimization rather than a defect fix. Measured under [The #370
   re-measurement](#the-370-re-measurement) and [The #387
-  re-measurement](#the-387-re-measurement).
+  re-measurement](#the-387-re-measurement); the table above now carries the end
+  state of both, at 2.31x and 2.34x `avx2` against `sse4.1`'s 1.55x and 1.56x,
+  so those two sections are the record of how each step was established rather
+  than the current numbers.
 
 #### The #387 re-measurement
 
@@ -1988,9 +2010,16 @@ The whole-frame groups are the practical consequence, since the mode search is
 most of what they do: `hevc_encode_640x352` reads 48.776 ms under `avx2` against
 68.400 ms under `sse4.1` and `hevc_encode_1920x1088` 472.23 ms against
 656.45 ms, so an x86_64 user encoding HEVC on an AVX2 host gets about 28% of a
-whole encode back, where #370's routing recovered 2.8% of it. The committed
-x86_64 table's two `hevc_encode_*_rdo_inter` rows, and the whole-frame rows
-above them, pre-date both changes.
+whole encode back, where #370's routing recovered 2.8% of it.
+
+The committed table above no longer pre-dates any of this — it is the reason
+this issue's re-draw happened — and it is the check on this round as well as its
+successor. Its three merged rounds read `hevc_encode_640x352_rdo_inter` at
+39.616 ms and `hevc_encode_1920x1088_rdo_inter` at 373.683 ms against the
+39.723 ms and 373.63 ms below, within 1% on both, and the whole-frame pair at
+48.870 ms and 467.708 ms against 48.776 ms and 472.23 ms. So the single round
+recorded here reproduces as an elementwise minimum of three on the same host
+model, which is the strongest form the attribution below can take.
 
 ## Hardware HEVC decoders
 
