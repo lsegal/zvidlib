@@ -1,0 +1,81 @@
+# Temporary: re-takes the x86_64 SSE4.1/AVX2 column of `benches/README.md` for
+# issue #350, whose recorded figures predate the codegen repair in #337.
+#
+# `ci.yml`'s `Benchmarks` job can do this one round at a time, but the recipe in
+# `benches/README.md` needs three rounds *on the same CPU model*, and GitHub's
+# `ubuntu-latest` pool is not uniform. Six independent rounds run here at once,
+# each logging its own `/proc/cpuinfo` model name, so three that share a model
+# can be selected afterwards and the rest discarded - the same selection #261
+# made by hand across separate dispatches.
+#
+# Delete this file once the table is refreshed.
+name: Bench x86 baseline (issue 350)
+
+on:
+  workflow_dispatch:
+  # Registration only. `workflow_dispatch` is unavailable for a workflow GitHub
+  # has never seen, and this file exists on a branch rather than on `main`, so
+  # the pull request that adds it is what makes it dispatchable. The job below
+  # is `workflow_dispatch`-gated, so the pull request run itself measures
+  # nothing.
+  pull_request:
+    paths:
+      - '.github/workflows/bench-350.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    name: Round ${{ matrix.round }}
+    if: github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        round: [1, 2, 3, 4, 5, 6]
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: rustup show
+      - name: Install native audio dependencies
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - name: Record the host CPU model
+        run: |
+          grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | xargs \
+            | tee cpu-model.txt >> "$GITHUB_STEP_SUMMARY"
+      - name: Run the benchmarks
+        env:
+          ZVIDLIB_BENCH_LARGE: '1'
+        run: |
+          set -o pipefail
+          cargo bench --features native --benches 2>&1 | tee bench.log
+      - name: Report the host's instruction sets
+        run: |
+          {
+            echo '## Round ${{ matrix.round }} host'
+            echo
+            echo '```'
+            cat cpu-model.txt
+            grep -hE '^# (host instruction sets|widest detected|dispatch site)' bench.log \
+              | sort -u || echo 'no instruction-set log found in the benchmark output'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Collect this round's baseline
+        run: |
+          python3 .github/scripts/criterion_baseline.py collect \
+            --criterion-dir target/criterion \
+            --out "baseline/criterion-baseline-${{ matrix.round }}.json" \
+            --commit "$GITHUB_SHA" \
+            --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --host "$(cat cpu-model.txt) ($RUNNER_OS/$RUNNER_ARCH)"
+      - name: Upload this round
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-350-round-${{ matrix.round }}
+          path: |
+            bench.log
+            cpu-model.txt
+            baseline/criterion-baseline-${{ matrix.round }}.json
+          retention-days: 30
