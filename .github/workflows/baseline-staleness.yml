@@ -15,8 +15,9 @@ name: Baseline staleness
 # toolchain, no cargo and no cache here; the job is seconds.
 #
 # The two `paths:` lists are written out twice rather than shared, because
-# GitHub Actions does not resolve YAML anchors; `ci_staleness_report_runs_on_
-# markdown` asserts they stay in step.
+# GitHub Actions does not resolve YAML anchors;
+# `tests/ci_staleness_report_sees_markdown_changes.rs` asserts they stay in
+# step, and that this workflow keeps no `paths-ignore` of its own.
 on:
   push:
     branches: [main]

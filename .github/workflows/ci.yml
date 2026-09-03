@@ -82,6 +82,11 @@ jobs:
       # measurement was dropped - and nothing else in CI executes it.
       - name: Test the benchmark baseline script
         run: python3 -m unittest discover -s .github/scripts -v
+      # The staleness report used to run here and is now `baseline-staleness.yml`:
+      # its whole input is `benches/README.md`, and the `paths-ignore` above
+      # meant the changes that edit that file were exactly the changes that
+      # skipped it (#449). The unit tests of the script it runs stay here,
+      # since those depend on the script rather than on the tables.
       - name: Test AV1 SIMD kernels against the scalar path
         run: cargo test --features native --lib av1_simd -- --nocapture
       # The kernels being bit-exact is not the same as their being fast, and
