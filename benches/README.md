@@ -1,7 +1,7 @@
 # Benchmarks
 
 zvidlib's benchmarks run under [criterion](https://docs.rs/criterion) with
-`harness = false`, across six bench targets that share `benches/support/`:
+`harness = false`, across nine bench targets that share `benches/support/`:
 
 | Target | Measures |
 | --- | --- |
@@ -11,6 +11,9 @@ zvidlib's benchmarks run under [criterion](https://docs.rs/criterion) with
 | `benches/audio_decode.rs` | the audio decode path: AAC access units and `AacSampleReader` range/seek reads |
 | `benches/audio_mux.rs` | the audio container path: MP4 muxing, sample-table growth, demux, and gapless timing |
 | `benches/hevc_encode.rs` | the pure-Rust HEVC encoder, whole-frame and per-stage |
+| `benches/hevc_decode.rs` | the HEVC software decoder: whole-frame decode and every hot stage, scalar versus SIMD |
+| `benches/hevc_hardware.rs` | the platform fixed-function HEVC decoders against the software one |
+| `benches/exact_seek.rs` | what an exact frame at an arbitrary point costs, by backend and by random-access cadence |
 
 Each target loads and decodes its fixtures once per process, so every iteration
 measures the work under test and nothing else. `codec` is one target rather than
@@ -33,6 +36,9 @@ cargo bench --bench av1_encode    # the AV1 encoder, whole-frame and per-stage
 cargo bench --bench audio_decode  # the audio decode path only
 cargo bench --bench audio_mux     # the audio container path only
 cargo bench --bench hevc_encode   # the HEVC encoder groups only
+cargo bench --bench hevc_decode   # the HEVC software decoder only
+cargo bench --bench hevc_hardware # the platform hardware HEVC decoders
+cargo bench --bench exact_seek    # exact-seek cost by backend and cadence
 cargo bench --features simd       # the same groups, recorded under `simd=on`
 cargo bench --no-run              # compile only
 ```
@@ -170,7 +176,7 @@ axis here, and both arms always appear in the same run.
 Filter to one of them the same way as any other group:
 
 ```sh
-cargo bench --bench codec -- av1_deblock
+cargo bench --bench codec -- av1_deblock_luma
 cargo bench --bench av1_decode -- 'av1_deblock/scalar'
 cargo bench --bench av1_decode -- av1_inverse   # every inverse-transform group
 ```
@@ -964,6 +970,190 @@ out roughly even on Apple Silicon, where LLVM auto-vectorizes the scalar code
 well under `lto = "fat"`, while AV1 deblocking and motion compensation on the
 same host are 2.4-4.9x. `active_by_site()` answers the question directly.
 
+## What a drag preview costs the frame under the pointer
+
+The other profiling example measures an interaction rather than a codec.
+Dragging `native_gl`'s timeline bar walks a background decoder towards the frame
+under the pointer and publishes pictures on the way, so the drag keeps moving
+(issue #363); `PREVIEW_INTERVAL` in `examples/native_gl/scrub.rs` is how often it
+publishes. That interval was arithmetic — a dozen pictures over the 613-frame
+walk issue #354 timed at 1.7 s, about 4% on top — and issue #379 is what
+happened when it was measured.
+
+`examples/scrub_preview_profile.rs` drives the same `FrameService` the window
+drives, over the same bundled sample through the same hardware decoder, with no
+window and no renderer in the way:
+
+```sh
+cargo run --release --features native --example scrub_preview_profile
+cargo run --release --features native --example scrub_preview_profile -- 5
+cargo run --release --features native --example scrub_preview_profile -- 3 80 150 400
+```
+
+The first argument is runs per arm and the rest are cadences in milliseconds.
+Each arm builds its own service, so every walk starts from a cold decoder, and
+each reports the fastest of its runs: the decoder is shared hardware and
+anything else on the host only ever adds time. Its baseline arm is playback's
+exact request, which publishes nothing on the way to its target — what the drag
+did between #355 and #363 — so the overhead each cadence reports is measured
+against the same decoder in the same process.
+
+### The sweep
+
+Walking to frame 767 of `examples/media/BigBuckBunny.mp4` from cold on an Apple
+Silicon host (M1, 8 cores) through VideoToolbox, `--release`, fastest of five
+runs per arm. No previews at all: **1.25 s**, one picture.
+
+| interval | arrival | published | spacing | converted | overhead | per convert |
+| --- | --- | --- | --- | --- | --- | --- |
+| 80 ms | 3.52 s | 34 | 104 ms | 306 | 182% | 7.4 ms |
+| 150 ms | 7.03 s | 50 | 141 ms | 765 | 463% | 7.6 ms |
+| 250 ms | 5.56 s | 24 | 232 ms | 578 | 345% | 7.5 ms |
+| 400 ms | 3.39 s | 12 | 282 ms | 299 | 171% | 7.2 ms |
+| 600 ms | 2.38 s | 8 | 297 ms | 173 | 91% | 6.5 ms |
+| 800 ms | 2.31 s | 7 | 330 ms | 156 | 85% | 6.8 ms |
+| 1200 ms | 2.18 s | 6 | 363 ms | 129 | 74% | 7.2 ms |
+| 1600 ms | 1.82 s | 5 | 364 ms | 100 | 43% | 5.5 ms |
+| 2400 ms | 1.89 s | 5 | 378 ms | 102 | 51% | 6.3 ms |
+
+`published` is what the service published, counted by the service rather than by
+what the harness collected — a picture the render thread never draws still cost
+its conversion. `converted` is what the walk converted to RGBA, which is the
+larger number and the one the time goes into, and `spacing` is arrival divided
+by publishes: how often the picture under the pointer actually moves, which is
+what #363 asked for.
+
+### What it says
+
+**The 4% estimate was wrong by two orders of magnitude, and the per-picture
+price was not what it got wrong.** Per converted picture the cost is 5.2 ms to
+7.6 ms across the whole sweep, which is the 6.6 ms #355 measured through the
+`hevc_hardware_readback` seam. What the estimate missed is the count: the
+150 ms cadence converts **765** of the sample's 768 pictures on one walk, not a
+dozen, and the frame under the pointer arrives in 7.03 s rather than 1.7 s —
+worse than the 6.4 s issue #354 was opened for.
+
+The count is the reader's cache tail. `ExactFrameReader::get` keeps the frames
+immediately behind its target as well as the target, as many as
+`Limits::max_cached_frames` holds (32 by default), which is what makes stepping
+backwards free after a seek. A preview walk calls `get` once per published
+picture and pays that tail every time, so a stride shorter than the tail
+converts everything it passes and the walk is back to #354's behaviour by a
+different route. Issue #402 tracks the tail; the cadence can only work around
+it.
+
+Working around it is what `PREVIEW_INTERVAL` now does. It is 1.6 s, the knee:
+past it the walk neither arrives sooner nor publishes more — the stride is
+capped by `MAXIMUM_STRIDE` and the tail is what remains — and at it the frame
+under the pointer arrives in 1.82 s, #354's 1.7 s and about 8%, while the walk
+still publishes five pictures at 364 ms apart. The motion #363 asked for is not
+lost with it: since issue #374 a background pass keeps a shrunk picture every
+half second of the track, and a drag draws one for wherever the pointer is
+within a frame of the window's, so what this cadence owes #363 is the
+full-resolution picture catching up rather than the movement itself.
+
+The sweep is not monotonic, and that is the same mechanism seen from the
+outside: the stride is computed from the walk's own measured per-frame rate,
+that rate includes the conversions the step paid for, and a shorter stride
+converts a larger fraction of what it passes. Shortening the interval lengthens
+the per-frame estimate the next stride is computed from, so 80 ms and 400 ms
+land on similar strides from opposite directions while 150 ms sits in the
+region where every frame is converted.
+
+## What an exact frame at an arbitrary point costs (`--bench exact_seek`)
+
+Issue #374 asked for "<50 ms to any part of a video". #383 answered the *scrub*
+half of it and left the exact half open, on the reasoning that reaching
+presentation frame *n* means decoding every sample from the nearest preceding
+random-access point, and the bundled sample has exactly one. Issue #395 is that
+reasoning measured, because it had never been separated from the thing it was
+being blamed on: every figure in #354, #363, #374 and #383 came from a track
+that codes its 768 frames as a single group of pictures, so "an exact seek is
+slow" and "an exact seek on a single-group-of-pictures track is slow" had the
+same evidence behind them.
+
+`benches/exact_seek.rs` separates them. It measures a cold
+`ExactFrameReader::get` — a fresh reader per iteration, nothing cached, nothing
+warm, construction off the clock — to the frame four fifths of the way along the
+track, across two axes: the backend (`HardwarePreference::Avoid` for the crate's
+own software decoder, `Prefer` for the host's fixed-function one) and the
+track's random-access cadence. The cadence axis is the pair of fixtures in
+`tests/fixtures/codec/`: the same 768 frames of the bundled sample re-encoded at
+512x288 with the same encoder, preset and quality, differing only in `keyint`,
+so one carries one random-access point and the other twenty-four and nothing
+else about them differs.
+
+```sh
+cargo bench --bench exact_seek                       # the hardware arms
+ZVIDLIB_BENCH_LARGE=1 cargo bench --bench exact_seek # and the software ones
+```
+
+The software arms are opt-in for the usual reason: one cold `raps=1` software
+seek decodes 613 pictures.
+
+### The measurement
+
+Apple Silicon (M1, 8 cores), `--release`, VideoToolbox as the hardware backend,
+seeking to frame 614 of 768. Criterion's median of ten samples.
+
+| track | hardware | software |
+| --- | --- | --- |
+| `raps=1` (one random-access point) | **119.29 ms** | **1.6556 s** |
+| `raps=24` (one every 32 frames) | **18.77 ms** | **31.17 ms** |
+| a `PreviewIndex::nearest` lookup over the same track | **1.109 µs** | — |
+
+### What it says
+
+**The cadence is the whole cost, and the two cases do not behave alike.** On the
+same content at the same size and quality, one random-access point costs
+**6.4x** what twenty-four cost on the hardware backend and **53x** on the
+software one. Nothing else about the two tracks differs, so nothing else can be
+charged for it.
+
+**A track with several random-access points is already inside the budget, on
+both backends.** 18.77 ms and 31.17 ms are both under #374's 50 ms, from cold,
+with no preview tier, no proxy and no change to the reader. That is the figure
+that **rejects decoding the group of pictures in parallel across several
+sessions**: it only ever helps a track with more than one random-access point,
+and on such a track the exact seek already answers in 19-31 ms. On the track
+that actually has the problem there is nothing to parallelise — one entry point
+admits one walk — so the direction is fastest exactly where it is not needed and
+inapplicable where it is.
+
+**A track with one random-access point is not reachable by any arrangement of
+one decoder.** 119.29 ms is at 512x288; the same seek on the bundled 1080p
+sample is the 1.09 s of hardware decode #383 instrumented. Both are the hardware
+running at its own throughput with a full queue, so the gap to 50 ms is not a
+decoder-configuration problem and no amount of pipelining closes it.
+
+**What is chosen is the preview tier**, now `zvidlib::PreviewIndex` rather than a
+copy inside `examples/native_gl`. A lookup is **1.109 µs**, five orders of
+magnitude under the 119.29 ms exact seek it stands in for and the only arm in
+the table that is under 50 ms for a single-random-access-point track on either
+backend. It answers a different question — "what is at this point of the movie",
+not "which frame is the pointer on" — which is precisely why it can: the picture
+was decoded already. It costs one forward decode pass over the track, on a
+thread and a decoder of its own - **2.74 s** to cover all 768 frames of the
+bundled 1080p sample through VideoToolbox, measured by
+`tests/preview_index.rs::a_preview_answers_any_position_without_decoding`, which
+moved out of the example with the tier - and a bounded amount of memory
+(`PreviewOptions::budget_bytes`, 64 MB by default, which the stride follows from
+so a long track keeps previews further apart rather than more of them).
+
+**A proxy or re-indexed representation is rejected**, and the figure that rejects
+it is the 18.77 ms above. A proxy is a track with more random-access points; the
+best it can buy is the `raps=24` row, and that row is four orders of magnitude
+slower than the preview tier a scrub actually needs. So it pays a full transcode
+of the source and a second copy of the media on disk to land in the same range
+the exact walk already reaches, on the cases where that range is reachable at
+all. It stays rejected until a caller appears that needs *exact* frames at
+arbitrary positions repeatedly, which is an editor's requirement rather than a
+scrub's, and the preview tier is what a scrub was asking for.
+
+**Nothing about the decoded frames changes.** The preview tier is additive and
+opt-in, the reader is untouched, and the 768-frame fixture digests in
+`tests/codec_conformance.rs` and `tests/native_hevc_hardware.rs` still hold.
+
 ## The audio container path
 
 `cargo bench --bench audio_mux` measures the audio write and read paths in two
@@ -1238,6 +1428,72 @@ reference on every arm — `hevc_recon` does — so "is there a dispatch site" a
 "is there a vector kernel" are different questions, and only the first can be
 answered from a commit that is not built.
 
+### One group name, two targets, and the row that moved for nothing
+
+A third way a committed row stops describing what it names, and the one that is
+hardest to see from the table: two bench targets registering the same criterion
+group name. Criterion keys a group by its name alone. The name carries no
+namespace for the target that registered it and every target in this crate
+writes the same `target/criterion/` tree, so two targets both calling a group
+`av1_deblock` write the same `target/criterion/av1_deblock/<isa>` directory.
+Both groups still run, both print their timings and both pass their
+bit-exactness guard; the target that runs second simply overwrites the first,
+and `criterion_baseline.py collect` can only ever see one of them.
+
+`benches/codec.rs` and `benches/av1_decode.rs` both claimed `av1_deblock` until
+issue #414, and they do not measure the same thing: `codec.rs` filters a
+synthetic 1080p luma plane at level 24, `av1_decode.rs` a structured plane at
+level 32. **Their vector arms agree to 0.1% and their `scalar` arms are 27%
+apart** — the vector kernels do fixed masked work per lane, while the scalar
+reference branches per position on the §7.14.6.1 filter mask, so it is the only
+arm the content reaches. Which target ran second therefore moved the `scalar`
+column of that row by a quarter and left the two vector columns where they were.
+
+That is what #414 reports. The two x86_64 draws ran the targets in opposite
+orders: the #350 workflow ran a plain `cargo bench`, which walks targets
+alphabetically and so runs `codec` after `av1_decode`, while the #393 workflow
+followed the recipe above, which names `codec` first. Read out of #350's own six
+rounds, on the three that landed on the AMD EPYC 7763, the two groups are:
+
+| Target's group | `scalar` | `sse4.1` | `avx2` |
+| --- | ---: | ---: | ---: |
+| `codec.rs`, collected | 21.506 ms | 3.974 ms | 3.424 ms |
+| `av1_decode.rs`, overwritten | 27.290 ms | 3.974 ms | 3.403 ms |
+
+so the 21.506 ms in the table below and the 26.956 ms #393 measured are two
+different benchmarks, not one benchmark two months apart.
+
+Nothing in the range between the stamps moves the arm. Bisecting it needs a step
+comparable to every other step, which the recipe above cannot give — a round is
+attributable only to the CPU model it landed on, `ubuntu-latest` is a pool of
+models, and this arm reads anywhere between 21.4 ms and 29.9 ms across the pool
+at one commit. So each of nine steps over the 32 commits between `b233f0a74f88`
+and `605f9a43a24c` measured *both* ends on its own runner, in two worktrees with
+their own target directories and three interleaved passes each, and reported the
+ratio: **0.977x to 1.000x, every step**, the later commit never slower. A
+paired ratio is immune to which model the step landed on, which is what makes
+nine of them comparable without dispatching a lottery per step.
+
+**Neither committed table has a row for both groups, and which one is missing
+differs between them.** `codec.rs`'s group is now `av1_deblock_luma`, pairing
+with the `av1_deblock_chroma` it is the luma half of, and `av1_decode.rs` keeps
+`av1_deblock` as the narrow-filter member of its deblocking trio — the name the
+recipe's own target order already resolves to. The x86_64 table below collected
+`codec.rs`'s side, so its row is renamed with its numbers untouched and it has
+no `av1_deblock` row; the aarch64 table collected `av1_decode.rs`'s side (#390
+drew it over `codec`, `av1_decode`, ... in the recipe's order), so its
+`av1_deblock` row stands as measured and it has no `av1_deblock_luma` row. Each
+gains its missing row at its next draw. No ratio in either table changes, and no
+row is wrong now that it names the group it was measured from.
+
+`no_two_bench_targets_register_the_same_group_name` in
+`tests/bench_group_names_are_unique.rs` keeps it fixed, in the `Rust checks`
+job. It reads the group names out of each `[[bench]]` target's crate root and
+fails on one that two targets claim, which is a check that costs a file read
+rather than a draw — and unlike the staleness report it fails rather than
+reports, because a collision is a naming mistake in the tree in front of it, not
+a measurement to redraw.
+
 ### Apple M1 (aarch64)
 
 Measured on **Apple M1 (macOS 26, aarch64)**, at `f3e7674fc5be`, with
@@ -1263,6 +1519,12 @@ near-parity row now. The table has also grown by twenty-six rows that had no
 `neon` figure anywhere: every `_1080p` row, both `av1_encode_stage_coeff_ctx`
 rows, both `av1_encode_stage_iwht` rows, `hevc_decode`, `hevc_decode_to_picture`
 and the `hevc_encode_1920x1088` family.
+
+The `av1_deblock` row here is `benches/av1_decode.rs`'s group, which this draw
+ran second and so collected; there is no `av1_deblock_luma` row, because
+`benches/codec.rs`'s group was overwritten in every round. That is the opposite
+side of the collision the x86_64 table below collected. See [One group name, two
+targets](#one-group-name-two-targets-and-the-row-that-moved-for-nothing) above.
 
 | Group | `scalar` | `neon` | Best |
 | --- | ---: | ---: | ---: |
@@ -1293,7 +1555,7 @@ and the `hevc_encode_1920x1088` family.
 | `av1_entropy_symbol` | 3.075 ms | 3.141 ms (0.98x) | 0.98x `neon` |
 | `av1_forward_adst_8x8` | 29.647 ms | 7.272 ms (4.08x) | 4.08x `neon` |
 | `av1_forward_dct_16x16` | 37.029 ms | 10.919 ms (3.39x) | 3.39x `neon` |
-| `av1_forward_dct_32x32` | 53.549 ms | 62.642 ms (0.85x) | 0.85x `neon` |
+| `av1_forward_dct_32x32` | 53.549 ms | 62.642 ms (0.85x) | 0.85x `neon` (superseded; see [below](#reading-the-sub-parity-rows)) |
 | `av1_forward_dct_4x4` | 40.458 ms | 6.991 ms (5.79x) | 5.79x `neon` |
 | `av1_forward_dct_8x8` | 29.153 ms | 7.741 ms (3.77x) | 3.77x `neon` |
 | `av1_forward_flipadst_16x16` | 34.389 ms | 11.904 ms (2.89x) | 2.89x `neon` |
@@ -1368,12 +1630,49 @@ removes a round that was contended; it cannot remove contention that was present
 in every round, and this host had some in all six.
 
 So the walk-to-parity reading survives for `hevc_intra_pred`, which lands inside
-the same 9% band the same-code rows define. It does not obviously survive for
-`av1_forward_dct_32x32`, whose 15% gap is the largest sub-parity figure on the
-table and sits against 1.48x for the same group under `avx2` on x86_64. That is
-now the one aarch64 row worth acting on rather than re-reading, and it is
-tracked separately; nothing else here is below parity for a reason other than
-having no kernel.
+the same 9% band the same-code rows define. It did not survive for
+`av1_forward_dct_32x32`, whose 15% gap was the largest sub-parity figure on the
+table and sat against 1.48x for the same group under `avx2` on x86_64. That was
+the one aarch64 row worth acting on rather than re-reading, and #403 acted on
+it; nothing else here is below parity for a reason other than having no kernel.
+
+**`av1_forward_dct_32x32` was the kernel, and the kernel is fixed (#403).** The
+row was not the host, and the way to tell was to stop comparing the two arms and
+compare the `neon` arm against itself. Cost per vector operation is a ratio
+internal to one arm, so contention inflates every size of it equally and cancels
+out of the comparison. The 4-, 8- and 16-point forward kernels all ran at
+roughly the same cost per operation; the 32-point kernel ran about 2.9x slower
+per operation, on the same instruction mix. A cliff at one size is not something
+a noisy host can produce.
+
+What it was: `av1_simd::transforms::basis_row_rs14` folded its split
+accumulator every fourth term as `if index % 4 == 3`, inside the innermost loop
+of an `O(N^2)` basis multiply. At 4, 8 and 16 points LLVM fully unrolls that
+loop and the condition costs nothing. At 32 points it stops unrolling and the
+condition becomes a real branch per term. Writing the fold as the tail of a
+`chunks_exact(4)` group is the same arithmetic in the same order — `N` is always
+a multiple of four — and removes the branch.
+
+Measured on the same Apple M1, arms interleaved slab-by-slab with an elementwise
+minimum over twelve rounds rather than run group-at-a-time, which is what lets a
+contended host still give a usable floor:
+
+| Group | `scalar` | `neon` before | `neon` after |
+| --- | ---: | ---: | ---: |
+| `av1_forward_dct_4x4` | 42.442 ms | 6.604 ms (5.84x) | 6.746 ms (6.29x) |
+| `av1_forward_dct_8x8` | 31.830 ms | 7.312 ms (4.26x) | 7.571 ms (4.20x) |
+| `av1_forward_dct_16x16` | 39.675 ms | 10.971 ms (3.37x) | 12.026 ms (3.30x) |
+| `av1_forward_dct_32x32` | 62.405 ms | 61.982 ms (0.91x) | 28.563 ms (2.18x) |
+
+The three smaller sizes are unchanged, because they were already unrolled; only
+32 points moves, and it moves 2.2x. The scalar column is this round's, not the
+table's above: the host was busier here, which is why its `scalar` figures read
+high and the before-ratio reads 0.91x where the six-round table read 0.85x. That
+difference is the whole reason the row survived three earlier readings — the
+scalar arm is the one that moves with the host, the `neon` arm read 62 ms under
+both a quiet host and a load average of 17, and a minimum can only be pushed up
+by contention, never down. Two arms whose floors are 14% apart under the *same*
+contention were never going to be explained by that contention.
 
 **`av1_encode_stage_wht` is no longer 2.72x.** The old table put the forward
 4x4 WHT at 2.72x `neon`, and `src/av1_simd/mod.rs` cited exactly that figure as
@@ -1451,12 +1750,19 @@ repair is measured under [The #370 re-measurement](#the-370-re-measurement),
 which landed on *this* host, so its `avx2` column is directly comparable with
 the one here.
 
+The `av1_deblock_luma` row is the row this draw recorded as `av1_deblock`, with
+its numbers untouched: they are `benches/codec.rs`'s group, which the workflow
+that drew this table ran second and so collected. See [One group name, two
+targets](#one-group-name-two-targets-and-the-row-that-moved-for-nothing) above.
+There is no `av1_deblock` row here, because the group of that name was
+overwritten in every round of this draw.
+
 | Group | `scalar` | `sse4.1` | `avx2` | Best |
 | --- | ---: | ---: | ---: | ---: |
 | `av1_cdef` | 89.226 ms | 38.801 ms (2.30x) | 31.241 ms (2.86x) | 2.86x `avx2` |
-| `av1_deblock` | 21.506 ms | 3.974 ms (5.41x) | 3.424 ms (6.28x) | 6.28x `avx2` |
 | `av1_deblock_boundary` | 370.488 µs | 75.674 µs (4.90x) | 78.676 µs (4.71x) | 4.90x `sse4.1` |
 | `av1_deblock_chroma` | 16.036 ms | 6.091 ms (2.63x) | 6.336 ms (2.53x) | 2.63x `sse4.1` |
+| `av1_deblock_luma` | 21.506 ms | 3.974 ms (5.41x) | 3.424 ms (6.28x) | 6.28x `avx2` |
 | `av1_deblock_wide` | 104.338 ms | 36.634 ms (2.85x) | 31.647 ms (3.30x) | 3.30x `avx2` |
 | `av1_decode_frame` | 98.518 ms | 98.855 ms (1.00x) | 99.331 ms (0.99x) | 1.00x `sse4.1` |
 | `av1_encode_frame_q0` | 22.029 ms | 18.612 ms (1.18x) | 18.816 ms (1.17x) | 1.18x `sse4.1` |
@@ -1596,7 +1902,7 @@ Two rows read at parity for a reason worth stating rather than as noise:
 
 The rows with real vector work are now the ones with the largest ratios, which
 is what the old table could not show. `hevc_encode_*_rgba_to_yuv420` leads at
-6.27x and 6.06x, followed by `av1_deblock` at 6.28x, `av1_forward_dct_4x4` at
+6.27x and 6.06x, followed by `av1_deblock_luma` at 6.28x, `av1_forward_dct_4x4` at
 5.55x, `av1_deblock_boundary` at 4.90x and `hevc_color_convert` at 4.76x. The
 AV1 forward transforms sit between 3.1x and 3.5x, `av1_self_guided` at 3.49x and
 `av1_cdef` at 2.86x, and the motion-compensation family between 2.3x and 2.7x.
@@ -1657,7 +1963,9 @@ places, so the ratio is a property of the kernels rather than of the frame size.
 
 `sse4.1` beats `avx2` on a minority of rows, and by enough on two of them to be
 more than noise: `av1_encode_stage_coeff_ctx` was 3.04x under `sse4.1` against
-2.50x under `avx2`, and the `rdo_inter` pair is 1.63x/1.64x against 1.55x. The
+2.50x under `avx2`, and the `rdo_inter` pair is 1.63x/1.64x against 1.55x. Both
+of those pairs of rows now pre-date their repair — #371 for the first and #387
+for the second — and the re-measurements below are what replaces them. The
 `Best` column already recorded `sse4.1` for these, but the dispatch site
 preferred `avx2` when the host had it, so a real encode took the slower arm.
 #362 answers why, and the answer is the same one for both rows: **the wide arm
@@ -1835,11 +2143,71 @@ apart, which is #362's redirect reproducing on the table's own hardware.
   #362 changes. #370 carried it, and took the second of those two: `sad` routes
   blocks narrower than 32 and `satd` blocks narrower than 16 to the SSE4.1
   kernel, each at its own AVX2 body's threshold rather than at one shared
-  number. Widening what the search hands the kernel is the other repair and is
-  still open as #387 — it is the one that would make AVX2 *win* here rather than
-  stop losing, but it moves the search's candidate ordering and early
-  termination with it, so it is an optimization rather than a defect fix.
-  Measured under [The #370 re-measurement](#the-370-re-measurement).
+  number. Widening what the search hands the kernel is the other repair and
+  #387 wrote it — it is the one that makes AVX2 *win* here rather than stop
+  losing, and it moves the search's candidate ordering with it, so it is an
+  optimization rather than a defect fix. Measured under [The #370
+  re-measurement](#the-370-re-measurement) and [The #387
+  re-measurement](#the-387-re-measurement).
+
+#### The #387 re-measurement
+
+#370 routed the narrow blocks around AVX2 and brought the two arms level; #387
+gives AVX2 something wide to do and the acceptance criterion was that it has to
+*win* on its own numbers. It does, by more than routing ever had to give.
+
+The width was never in the block — `rdo.rs` searches a `CTB` of 16 and its
+candidate partitions subdivide that — it is across the *candidates*: the
+whole-pel stage scores `(2 * radius + 1)^2` predictions of one source block, and
+`_mm256_sad_epu8` reduces per 8-byte lane, so one instruction carries two
+16-wide candidates (one per 128-bit lane) or four narrower ones (one per qword).
+`rdcost::sad_batch` is that entry point, `rdo::motion_search` gathers candidates
+into fixed batches to feed it, and the scan order and `mv_order` tie-break are
+untouched, so the winning vector is the one the per-candidate search picked.
+This is also the one place `SAD_AVX2_MIN_W` does not apply: a width the
+single-block path routes *away* from AVX2 is exactly a width the batched path
+routes *to* it, because its vector is full there.
+
+Measured at `c7205cf2a908` — the branch's merge with `main`, so #370's routing is
+in the tree — on an **AMD EPYC 7763 64-Core Processor (Linux/X64)**, the same
+host model as the committed table and as #370's round, with
+`ZVIDLIB_BENCH_LARGE=1`, `# host instruction sets: scalar, sse4.1, avx2` and
+`# dispatch site hevc_rdcost: avx2` ([run
+33625305783](https://github.com/lsegal/zvidlib/actions/runs/33625305783)). It is
+one round rather than the elementwise minimum of three, so it is recorded here
+rather than merged into the table; the `rdo_intra` control below is what carries
+the attribution.
+
+| Group | `scalar` | `sse4.1` | `avx2` | Best |
+| --- | ---: | ---: | ---: | ---: |
+| `hevc_encode_640x352_rdo_inter` | 92.881 ms | 58.789 ms (1.58x) | 39.723 ms (2.34x) | 2.34x `avx2` |
+| `hevc_encode_1920x1088_rdo_inter` | 878.39 ms | 558.10 ms (1.57x) | 373.63 ms (2.35x) | 2.35x `avx2` |
+| `hevc_encode_640x352` | 104.39 ms | 68.400 ms (1.53x) | 48.776 ms (2.14x) | 2.14x `avx2` |
+| `hevc_encode_1920x1088` | 1.0028 s | 656.45 ms (1.53x) | 472.23 ms (2.12x) | 2.12x `avx2` |
+| `hevc_encode_640x352_rdo_intra` | 5.598 ms | 3.762 ms (1.49x) | 3.753 ms (1.49x) | 1.49x `avx2` |
+| `hevc_encode_1920x1088_rdo_intra` | 51.991 ms | 34.943 ms (1.49x) | 34.256 ms (1.52x) | 1.52x `avx2` |
+
+The `Best` column of the `rdo_inter` pair reads `avx2` for the first time. The
+two vector arms are 32% and 33% apart with the wide one ahead — 39.723 ms
+against 58.789 ms and 373.63 ms against 558.10 ms — where #370's round on this
+same host model had them 1.0% and 1.3% apart, and every round before it had
+`sse4.1` ahead by 5%. Level was the whole of what routing could buy; the batched
+kernel is what buys more than level.
+
+`rdo_intra` is the control that should not move, and does not: it scores intra
+predictions through `satd` alone, forms no batch, and reads 1.49x/1.52x here
+against #370's round's 1.48x/1.50x on the same host model. The absolute times of
+this round run about 5% slower than that one across every column, `scalar`
+included — one draw of run-to-run variance on a shared runner — which is why the
+claim is the within-round sign rather than the absolute numbers.
+
+The whole-frame groups are the practical consequence, since the mode search is
+most of what they do: `hevc_encode_640x352` reads 48.776 ms under `avx2` against
+68.400 ms under `sse4.1` and `hevc_encode_1920x1088` 472.23 ms against
+656.45 ms, so an x86_64 user encoding HEVC on an AVX2 host gets about 28% of a
+whole encode back, where #370's routing recovered 2.8% of it. The committed
+x86_64 table's two `hevc_encode_*_rdo_inter` rows, and the whole-frame rows
+above them, pre-date both changes.
 
 ## Hardware HEVC decoders
 
@@ -2223,6 +2591,106 @@ If you re-time this, re-time it the same way: a branch-against-base ratio taken
 on one host with the arms interleaved, with the `scalar` arm read as a control.
 A recorded absolute figure from another draw is not a comparison - the four
 models above differ by more than the effect.
+
+#### Why the isolated ratio did not reach this group (issue #382)
+
+The two measurements above disagree, and #340 recorded two candidate reasons
+without separating them: either the band search is too small a share of a
+reconstruction for any ratio on it to show, or the classification is worth
+vectorizing here and only the *call shape* is wrong, a `#[target_feature]`
+kernel being uninlinable into a caller that invokes it once per 16-to-64-sample
+CTB row. The two have opposite consequences - the first says no kernel at this
+site can ever pay, the second says the site needs a different call - so the
+question had to be settled by measurement rather than argument.
+
+**The share is a measured number.** `hevc_encode_*_reconstruct_no_band_search`
+is the same reconstruction with the band half of the §8.7.3 search skipped, so
+the per-CTB decision is the four edge-offset classes against SAO off. Both arms
+are built and timed in one criterion process on one host, five interleaved
+rounds, per-benchmark minimum; the difference is what the band search costs.
+Six `ubuntu-latest` draws plus one `macos-15-intel`, grouped by CPU model as
+every x86_64 table here has to be:
+
+| CPU model | draws | `hevc_encode_640x352_reconstruct` | `avx2` share | `scalar` share |
+|---|---|---|---|---|
+| Intel Xeon Platinum 8573C | 2 | 3.90-4.47 ms | 25.4%, 23.2% | 9.9%, 10.0% |
+| Intel Core i7-8700B | 1 | 7.49 ms | 28.8% | 8.5% |
+| AMD EPYC 7763 | 1 | 4.72 ms | 26.2% | 12.7% |
+| AMD EPYC 9V45 | 1 | 2.69 ms | 28.8% | 9.8% |
+| AMD EPYC 9V74 | 2 | 4.77-4.81 ms | 27.5%, 28.9% | 13.9%, 12.8% |
+
+**So the first explanation is refuted.** The band search is roughly a quarter
+of the vectorized arm of this group on every model timed, against a
+round-to-round spread of 1-6% on the `ubuntu-latest` hosts. A 1.10-1.53x on
+work that big is several percent end to end, which this harness resolves. It
+did not appear, so the missing win is not a missing denominator.
+
+Read the two share columns together rather than either alone. The band search
+is scalar in both, so the `scalar` column's 8-14% is its share of a
+reconstruction whose *other* stages are also scalar, and the `avx2` column's
+23-29% is its share once prediction, the transform round trip, deblocking and
+the SAO filter itself have been vectorized around it. The second number is the
+one that matters for a kernel decision, and it is the one that grew: pinning
+everything else made the unvectorized band search the largest single item in
+the group. The `_quantized` arms read 8.6-11.6% for the same reason in
+reverse - the transform round trip they add is a large scalar-and-vector cost
+the band search is then a smaller fraction of.
+
+The `macos-15-intel` draw agrees on the share and should be read only for it:
+that host's round-to-round spread is 24-51%, against 1-6% on `ubuntu-latest`,
+so its minimum is a floor rather than a measurement.
+
+**The call shape is not the reason either.** That left the second explanation,
+which is testable directly: give the kernel a call shape whose per-call cost is
+amortized over a whole CTB instead of one row. `band_offset_rect` is that
+shape - the rows of a CTB are walked *inside* one `#[target_feature]` entry, so
+a 16x16 luma CTB pays one non-inlinable call rather than sixteen and an 8x8
+chroma CTB one rather than eight, over the same lane-scatter body #340 timed.
+Measured the same way the per-row shape was, as a paired branch-against-base
+comparison with both trees built and timed on one host and interleaved within a
+round, five rounds per draw:
+
+| CPU model | draws | `avx2` | `sse4.1` | `scalar` (control) |
+|---|---|---|---|---|
+| Intel Xeon Platinum 8573C | 1 | 1.023x | 1.015x | 1.010x |
+| AMD EPYC 7763 | 6 | 0.966-1.003x | 0.993-1.007x | 1.001-1.015x |
+| AMD EPYC 9V74 | 5 | 0.872-0.891x | 0.974-0.992x | 1.006-1.008x |
+
+**It is worse, not better.** On Zen 5 the once-per-CTB shape reads 0.872-0.891x
+across five independent draws where the once-per-row shape read 0.94-0.95x:
+removing fifteen of every sixteen calls made the kernel *more* expensive, which
+is the opposite of what a call-overhead account predicts and enough on its own
+to refute it. On EPYC 7763 it reproduces the per-row figure, sitting 1-4% under
+that draw's own control. On the one readable Intel draw it is 1.023x against a
+1.010x control - no separation, the same answer the per-row shape's 1.00x gave.
+
+A twelfth draw, on `macos-15-intel` (Intel Core i7-8700B), is **discarded rather
+than reported**: its `scalar` control read 1.172x, and a control that moves 17%
+where it must read 1.00x says the host was not quiet enough for a several-percent
+effect. That is the control doing its job. The same host's spread disqualified it
+from the share table above for the same reason.
+
+**So neither candidate cause survives, and the site is not the problem.** What
+the two measurements together say is that the isolated harness is not measuring
+the encoder's work: `bench_band_offset_row` runs one L1-resident run of up to
+1024 samples back to back with `stats` hot and the branch fully predicted, and
+the reconstruction loop runs the same classification over CTB windows of a
+picture-sized plane, interleaved with prediction, the transform round trip and
+two in-loop filters, with `stats` reloaded per CTB and the band histogram
+competing for cache with everything else in the stage. The 1.10-1.53x is a real
+figure for the loop it was taken in and does not transfer, and a third call
+shape is not what would make it transfer.
+
+**Do not spend another attempt on this dispatch site.** The remaining
+untested idea is not a call shape but a different decomposition - deriving the
+32-band histogram for a whole CTB in one pass that keeps its accumulators in
+registers across rows, rather than 32 memory accumulators re-read per row - and
+that is a different kernel, not this one re-shaped. `band_offset_rect` is kept
+as the site's entry point precisely so a future attempt starts from the
+once-per-CTB shape without re-deriving that the once-per-row one is not what is
+costing it; both x86 rect kernels stay `#[cfg(test)]` alongside the six
+once-per-row candidates, asserted bit-exact, as the apparatus these figures
+were taken with.
 
 **AVX-512 was timed and does not separate even in isolation.**
 `ubuntu-latest` draws AVX-512CD hosts, so the `vpconflictd` shape #305 pointed

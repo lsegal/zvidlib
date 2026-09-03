@@ -56,3 +56,32 @@ The duration is 2.048 s rather than a round two seconds so that the media
 duration is an exact multiple of the 1024-sample AAC-LC access unit and no
 packet's indexed interval is truncated. As above, FFmpeg is only the offline
 fixture generator and is not a build, test, or runtime dependency.
+
+`bbb_hevc_512x288_gop768.mp4` and `bbb_hevc_512x288_gop32.mp4` are the paired
+random-access-cadence tracks the `exact_seek` benchmark target measures over.
+Both are the same 768 frames of the bundled `examples/media/BigBuckBunny.mp4`
+sample re-encoded at 512x288 with the same encoder, preset and quality; the
+*only* difference between them is `keyint`, so the first carries one
+random-access point and the second twenty-four. That is what makes the gap
+between them attributable to the cadence rather than to resolution, bitrate or
+content, which the bundled sample alone cannot do: it codes its 768 frames as a
+single group of pictures and can therefore only ever describe the worst case.
+They were generated offline with
+
+```sh
+for g in 768 32; do
+  ffmpeg -i ../../../examples/media/BigBuckBunny.mp4 -an -vf scale=512:288 \
+    -c:v libx265 -preset medium -crf 32 \
+    -x265-params "keyint=$g:min-keyint=$g:scenecut=0" \
+    -tag:v hvc1 -movflags +faststart "bbb_hevc_512x288_gop${g}.mp4"
+done
+```
+
+`scenecut=0` is what makes the cadence exact rather than approximate: without
+it x265 inserts extra key frames wherever the content changes, and the
+`keyint=768` track would not have had one random-access point. As above, FFmpeg
+is only the offline fixture generator and is not a build, test, or runtime
+dependency. 512x288 keeps the pair under a megabyte together; the absolute
+per-frame decode cost at that size is smaller than the bundled 1080p sample's,
+but the ratio between the two arms - which is what the cadence question is
+about - is not affected by it.

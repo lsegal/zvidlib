@@ -1,6 +1,9 @@
 // See examples/README.md for setup: build the wasm package into ./pkg before serving this
 // directory over HTTP(S). BigBuckBunny.mp4 is already symlinked in from examples/media/.
 import init, { MediaInput, errorCode } from "./pkg/zvidlib.js";
+// The walk's pure decisions live apart from the browser wiring so `scrub.test.js` can assert
+// them, the way `examples/native_gl/scrub.rs` asserts its own copy of the same rules.
+import { scrubWalkStart } from "./scrub.js";
 
 const canvas = document.querySelector("#video");
 const playButton = document.querySelector("#play");
@@ -185,19 +188,6 @@ async function main() {
     return Math.min(low, frameStarts.length - 1);
   }
 
-  // The newest random-access frame at or before `index`, or `index` itself when the track
-  // indexes none before it - the same rule `native_gl`'s `KeyframeIndex` follows.
-  function randomAccessPointAtOrBefore(index) {
-    let low = 0;
-    let high = randomAccessPoints.length;
-    while (low < high) {
-      const mid = Math.floor((low + high) / 2);
-      if (randomAccessPoints[mid] <= index) low = mid + 1;
-      else high = mid;
-    }
-    return low === 0 ? index : randomAccessPoints[low - 1];
-  }
-
   function mediaTimeForFrame(index) {
     return frameStarts[Math.min(Math.max(index, 0), lastFrameIndex)] ?? 0;
   }
@@ -279,26 +269,9 @@ async function main() {
   // frames and the next walk has to start over at a random-access point.
   let scrubPosition = null;
 
-  // How often the walk draws, and the ceiling on how far one step may jump so that an
-  // unmeasurably fast decoder still draws pictures rather than skipping the span in silence.
-  const SCRUB_INTERVAL_MS = 150;
-  const SCRUB_MAXIMUM_STEP = 512;
-  // What a frame is costing this walk, measured from the steps it has already taken.
+  // What a frame is costing this walk, measured from the steps it has already taken. The step
+  // it buys is `scrubStrideFrames`, and where the walk goes next is `scrubWalkStart`.
   let scrubMsPerFrame = null;
-
-  function scrubStrideFrames() {
-    if (scrubMsPerFrame === null) return 1;
-    if (scrubMsPerFrame <= 0) return SCRUB_MAXIMUM_STEP;
-    const frames = Math.floor(SCRUB_INTERVAL_MS / scrubMsPerFrame);
-    return Math.min(Math.max(frames, 1), SCRUB_MAXIMUM_STEP);
-  }
-
-  function scrubWalkStart(target) {
-    if (scrubPosition === null) return randomAccessPointAtOrBefore(target);
-    if (scrubPosition < target) return Math.min(target, scrubPosition + scrubStrideFrames());
-    if (scrubPosition === target) return target;
-    return randomAccessPointAtOrBefore(target);
-  }
 
   async function scrubTo(index) {
     // Without a browser HEVC decoder there is nothing to walk through: the synthetic frames are
@@ -317,7 +290,7 @@ async function main() {
     try {
       while (scrubTarget !== null) {
         const target = scrubTarget;
-        const next = scrubWalkStart(target);
+        const next = scrubWalkStart(scrubPosition, target, scrubMsPerFrame, randomAccessPoints);
         scrubAbort = new AbortController();
         scrubStep = next;
         const startedAt = performance.now();

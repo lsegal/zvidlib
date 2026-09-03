@@ -425,6 +425,29 @@ pub fn reconstruct_encoded_picture_quantized(
     sao: bool,
     quantized: bool,
 ) -> Vec<u8> {
+    reconstruct_encoded_picture_band_search(workload, deblocking, sao, quantized, true)
+}
+
+/// [`reconstruct_encoded_picture_quantized`] with the band-offset half of the
+/// §8.7.3 parameter search skippable.
+///
+/// This is the measurement apparatus #382 needed and nothing else. The band
+/// search's cost inside a whole reconstruction cannot be read off any group
+/// that always runs it, so the question "is the band search a large enough
+/// share of `hevc_encode_*_reconstruct` for a 1.1-1.5x kernel on it to have
+/// been visible" is answered by timing this function both ways on one host and
+/// taking the difference. With `band_search` cleared the per-CTB decision is
+/// the four edge-offset classes against SAO off, which changes the SAO
+/// decisions and so the returned planes — that is the point, and it is why
+/// this arm is never compared bit-for-bit against the other one.
+#[must_use]
+pub fn reconstruct_encoded_picture_band_search(
+    workload: &ReconstructWorkload,
+    deblocking: bool,
+    sao: bool,
+    quantized: bool,
+    band_search: bool,
+) -> Vec<u8> {
     let reconstructed = reconstruct_picture(
         SourcePlanes {
             y: &workload.y,
@@ -445,6 +468,7 @@ pub fn reconstruct_encoded_picture_quantized(
             // `PcmAuOptions::pcm_loop_filter_disabled == false` writes).
             pcm_loop_filter_disabled: !(deblocking || sao),
             quantized_residual: quantized,
+            sao_band_search: band_search,
             ..ReconConfig::default()
         },
     );

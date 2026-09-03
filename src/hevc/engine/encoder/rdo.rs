@@ -222,8 +222,20 @@ fn motion_search<'a>(
         return (0, 0, neutral, CTB, sad);
     };
 
+    // The whole-pel stage scores `(2 * radius + 1)^2` predictions of one source block, which
+    // is where this search spends its time and the only place it has vector width to give:
+    // the blocks are at most 16 wide, so a per-candidate SAD leaves a 256-bit register doing
+    // a 128-bit job (#370). Candidates are gathered into fixed batches and scored together by
+    // `rdcost::sad_batch`, which packs several of them into one `_mm256_sad_epu8`. The scan
+    // order and the tie-break below are unchanged, and the batched SADs are the same values
+    // the per-candidate call returns, so the winning motion vector - and the mode decision
+    // built on it - is bit-identical to what the unbatched search picked.
     let radius = cfg.search_radius.max(0);
     let mut best = (0, 0, u32::MAX);
+    let mut offsets = [0usize; SAD_BATCH];
+    let mut mvs = [(0i32, 0i32); SAD_BATCH];
+    let mut sads = [0u32; SAD_BATCH];
+    let mut pending = 0usize;
     for dy in -radius..=radius {
         for dx in -radius..=radius {
             let rx = x as i32 + dx;
@@ -231,12 +243,39 @@ fn motion_search<'a>(
             if rx < 0 || ry < 0 || rx as usize + w > width || ry as usize + h > height {
                 continue;
             }
-            let pred = &reference[ry as usize * stride + rx as usize..];
-            let sad = metric_sad(src, stride, pred, stride, w, h, cfg.backend);
-            if sad < best.2 || (sad == best.2 && mv_order(dx, dy) < mv_order(best.0, best.1)) {
-                best = (dx, dy, sad);
+            offsets[pending] = ry as usize * stride + rx as usize;
+            mvs[pending] = (dx, dy);
+            pending += 1;
+            if pending == SAD_BATCH {
+                metric_sad_batch(
+                    src,
+                    stride,
+                    reference,
+                    &offsets,
+                    stride,
+                    w,
+                    h,
+                    &mut sads,
+                    cfg.backend,
+                );
+                take_best(&mut best, &mvs, &sads);
+                pending = 0;
             }
         }
+    }
+    if pending > 0 {
+        metric_sad_batch(
+            src,
+            stride,
+            reference,
+            &offsets[..pending],
+            stride,
+            w,
+            h,
+            &mut sads[..pending],
+            cfg.backend,
+        );
+        take_best(&mut best, &mvs[..pending], &sads[..pending]);
     }
 
     let mut refined = best;
@@ -265,6 +304,47 @@ fn motion_search<'a>(
         &reference[(y as i32 + refined.1) as usize * stride + (x as i32 + refined.0) as usize..];
     let sad = metric_sad(src, stride, pred, stride, w, h, cfg.backend);
     (refined.0, refined.1, pred, stride, sad)
+}
+
+/// Candidates gathered before one batched SAD call.
+///
+/// A multiple of both AVX2 candidate-group sizes (two 16-wide candidates per vector, four
+/// narrower ones), so a full batch never leaves a group-sized remainder on the slower
+/// per-candidate path, and small enough to stay on the stack next to the search.
+const SAD_BATCH: usize = 16;
+
+/// Folds one batch of scored candidates into the running best, keeping the unbatched
+/// search's tie-break: a lower SAD wins, and an equal SAD goes to the smaller `mv_order`.
+fn take_best(best: &mut (i32, i32, u32), mvs: &[(i32, i32)], sads: &[u32]) {
+    for (&(dx, dy), &sad) in mvs.iter().zip(sads) {
+        if sad < best.2 || (sad == best.2 && mv_order(dx, dy) < mv_order(best.0, best.1)) {
+            *best = (dx, dy, sad);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn metric_sad_batch(
+    src: &[u8],
+    src_stride: usize,
+    plane: &[u8],
+    offsets: &[usize],
+    pred_stride: usize,
+    w: usize,
+    h: usize,
+    out: &mut [u32],
+    backend: DistortionBackend,
+) {
+    match backend {
+        DistortionBackend::Dispatched => {
+            rdcost::sad_batch(src, src_stride, plane, offsets, pred_stride, w, h, out)
+        }
+        DistortionBackend::Scalar => {
+            for (slot, &offset) in out.iter_mut().zip(offsets) {
+                *slot = rdcost::sad_scalar(src, src_stride, &plane[offset..], pred_stride, w, h);
+            }
+        }
+    }
 }
 
 fn metric_sad(
@@ -580,6 +660,127 @@ mod tests {
                 .iter()
                 .any(|partition| partition.sad > 0 && partition.satd > 0)
         }));
+    }
+
+    /// The batched whole-pel search has to pick the same motion vectors the per-candidate
+    /// search picked, including where several candidates tie and the `mv_order` tie-break
+    /// decides. The reference here is an unbatched scalar search written out in full - the
+    /// whole-pel stage and the SATD refinement that consumes its winner - and `motion_search`
+    /// is held against it on every instruction set the host offers.
+    #[test]
+    fn the_batched_motion_search_picks_what_the_per_candidate_search_picks() {
+        const N: usize = 48;
+        const SHAPES: &[(usize, usize, usize, usize)] = &[
+            (0, 0, 16, 16),
+            (0, 0, 8, 8),
+            (0, 0, 4, 4),
+            (0, 0, 16, 8),
+            (0, 0, 4, 16),
+            (4, 4, 12, 12),
+        ];
+        let _guard = crate::simd::test_lock();
+        let src = plane(N, N, 0, 0);
+        let reference = plane(N, N, 2, 1);
+        let cfg = DecisionConfig::default();
+
+        let inside = |rx: i32, ry: i32, w: usize, h: usize| {
+            rx >= 0 && ry >= 0 && rx as usize + w <= N && ry as usize + h <= N
+        };
+        let mut expected = Vec::new();
+        for by in (0..N).step_by(CTB) {
+            for bx in (0..N).step_by(CTB) {
+                for &(ox, oy, w, h) in SHAPES {
+                    let (x, y) = (bx + ox, by + oy);
+                    let block = &src[y * N + x..];
+                    let mut best = (0i32, 0i32, u32::MAX);
+                    for dy in -cfg.search_radius..=cfg.search_radius {
+                        for dx in -cfg.search_radius..=cfg.search_radius {
+                            let (rx, ry) = (x as i32 + dx, y as i32 + dy);
+                            if !inside(rx, ry, w, h) {
+                                continue;
+                            }
+                            let sad = rdcost::sad_scalar(
+                                block,
+                                N,
+                                &reference[ry as usize * N + rx as usize..],
+                                N,
+                                w,
+                                h,
+                            );
+                            if sad < best.2
+                                || (sad == best.2 && mv_order(dx, dy) < mv_order(best.0, best.1))
+                            {
+                                best = (dx, dy, sad);
+                            }
+                        }
+                    }
+                    let mut refined = best;
+                    for (dx, dy) in [
+                        (best.0, best.1),
+                        (best.0 - 1, best.1),
+                        (best.0 + 1, best.1),
+                        (best.0, best.1 - 1),
+                        (best.0, best.1 + 1),
+                    ] {
+                        let (rx, ry) = (x as i32 + dx, y as i32 + dy);
+                        if !inside(rx, ry, w, h) {
+                            continue;
+                        }
+                        let satd = rdcost::satd_scalar(
+                            block,
+                            N,
+                            &reference[ry as usize * N + rx as usize..],
+                            N,
+                            w,
+                            h,
+                        );
+                        if satd < refined.2
+                            || (satd == refined.2
+                                && mv_order(dx, dy) < mv_order(refined.0, refined.1))
+                        {
+                            refined = (dx, dy, satd);
+                        }
+                    }
+                    let sad = rdcost::sad_scalar(
+                        block,
+                        N,
+                        &reference[(y as i32 + refined.1) as usize * N
+                            + (x as i32 + refined.0) as usize..],
+                        N,
+                        w,
+                        h,
+                    );
+                    expected.push((refined.0, refined.1, sad));
+                }
+            }
+        }
+
+        for isa in crate::simd::available() {
+            crate::simd::set_override(Some(isa));
+            let mut got = Vec::new();
+            for by in (0..N).step_by(CTB) {
+                for bx in (0..N).step_by(CTB) {
+                    for &(ox, oy, w, h) in SHAPES {
+                        let (x, y) = (bx + ox, by + oy);
+                        let (mv_x, mv_y, _, _, sad) = motion_search(
+                            &src[y * N + x..],
+                            N,
+                            N,
+                            N,
+                            Some(&reference),
+                            x,
+                            y,
+                            w,
+                            h,
+                            cfg,
+                        );
+                        got.push((mv_x, mv_y, sad));
+                    }
+                }
+            }
+            assert_eq!(got, expected, "batched whole-pel search on {isa:?}");
+        }
+        crate::simd::set_override(None);
     }
 
     /// The residual rate estimate has to order two candidate residuals the

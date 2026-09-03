@@ -327,6 +327,29 @@ fn reconstruct(criterion: &mut Criterion, size: (u32, u32), group_prefix: &str) 
         bench_across_isas(criterion, &isa_workload, || {
             encoder_bench::reconstruct_encoded_picture_quantized(&workload, true, true, quantized)
         });
+
+        // The same reconstruction with the band-offset half of the §8.7.3
+        // search skipped. Its only purpose is to be subtracted from the arm
+        // above: the difference is what the band search costs inside a whole
+        // reconstruction, which is the number #382 needed and which no group
+        // that always runs the search can report. Both arms are built and
+        // timed in the same process on the same host, so the pairing is
+        // structural rather than something a later comparison has to arrange.
+        //
+        // This arm's output is deliberately *not* the other's — an edge-only
+        // search picks different SAO parameters — so it is never compared
+        // against it. `bench_across_isas`'s guard still holds within this arm,
+        // across instruction sets, which is all it ever claimed.
+        let stub_name = format!("{name}_no_band_search");
+        let stub_workload = IsaWorkload::new(
+            &stub_name,
+            FrameWork::new(1, u64::from(size.0), u64::from(size.1)),
+        );
+        bench_across_isas(criterion, &stub_workload, || {
+            encoder_bench::reconstruct_encoded_picture_band_search(
+                &workload, true, true, quantized, false,
+            )
+        });
     }
 }
 
