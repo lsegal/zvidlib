@@ -7,15 +7,29 @@ film by the Blender Foundation. The clip is checked into the repo at
 download is needed before running either example. `examples/web_canvas/BigBuckBunny.mp4` is a
 symlink to that same file so both examples share one copy.
 
+The same clip is checked in a second time at `examples/media/BigBuckBunny.av1.mp4`, at 960x540 with
+an AV1 Main video track instead of an HEVC one and the same AAC audio track. It exists because
+whether the first sample decodes at all depends on the browser: a stock Chrome has no HEVC decoder,
+which used to leave `web_canvas` drawing a synthetic gradient and its seek preview tier unreachable
+(issue #441). Both files carry 768 frames of the same 32 seconds coded as a single group of
+pictures, so the timeline means the same thing whichever one the page opens. The native example
+uses the HEVC one, whose decoder zvidlib ships itself.
+
 ## Compressed decoding
 
 As documented in the main [README](../README.md#implemented-browser-boundary), the browser
-(`web`) build now decodes the sample's real HEVC video track through the browser's native
-`WebCodecs` `VideoDecoder`, so `web_canvas/` renders real decoded pixels instead of a synthetic
-gradient. Whether that decode actually succeeds depends on the browser and platform: zvidlib
-queries `VideoDecoder.isConfigSupported()` first, and `video.get()` still rejects with
-`UNSUPPORTED` (falling back to the synthetic gradient) if the browser has no HEVC decoder
-available. The native build prefers NVIDIA NVDEC on supported 64-bit Windows/Linux systems, then
+(`web`) build decodes the sample's real video track through the browser's native `WebCodecs`
+`VideoDecoder`, so `web_canvas/` renders real decoded pixels instead of a synthetic gradient.
+Which sample it decodes depends on the browser and platform rather than being assumed:
+`web_canvas/samples.js` declares each bundled sample's codec string and coded size, the page asks
+`VideoDecoder.isConfigSupported()` about each one *before* fetching anything, and it opens the
+first one the browser answers for — the 1080p HEVC clip where that is available, the 540p AV1 one
+otherwise. Only a browser that reports neither falls back to the synthetic gradient. A sample the
+probe accepts can still reject at `video.get()`, in which case the next candidate is tried.
+Nothing in the browser checks that a declared codec string still describes the file beside it, so
+`tests/web_canvas_samples_match_their_files.rs` demuxes each sample and asserts the declaration
+against the string zvidlib derives from the track's own `hvcC`/`av1C` box. The native build
+prefers NVIDIA NVDEC on supported 64-bit Windows/Linux systems, then
 the D3D11-aware Media Foundation HEVC decoder on Windows, or VideoToolbox on macOS. It falls back
 to zvidlib's dependency-free pure-Rust HEVC Main decoder when acceleration is unavailable, so the
 native OpenGL example still renders the same decoded pixels without requiring a system codec.
@@ -58,13 +72,14 @@ cargo run --example native_gl --features native
 
 ## Web canvas: `web_canvas/`
 
-A browser page that opens the sample as a `Blob`, creates a WebGL2 canvas context, extracts the
-indexed AAC-LC access units from zvidlib's MP4 demuxer, and schedules decoded PCM through Web
-Audio with WebCodecs `AudioDecoder` after the play button's user gesture. It calls `video.get()`
-for each displayed frame and uploads the real decoded RGBA pixels; if the browser cannot decode
-HEVC it falls back to a synthetic gradient sized to the real track instead. Both paths use MP4
-sample timing and, when audio is available, the `AudioContext` clock rather than display-refresh
-or hard-coded FPS pacing.
+A browser page that picks the bundled sample this browser reports a decoder for (see above), opens
+it as a `Blob`, creates a WebGL2 canvas context, extracts the indexed AAC-LC access units from
+zvidlib's MP4 demuxer, and schedules decoded PCM through Web Audio with WebCodecs `AudioDecoder`
+after the play button's user gesture. It calls `video.get()` for each displayed frame and uploads
+the real decoded RGBA pixels; only a browser that can decode neither bundled track falls back to a
+synthetic gradient sized to the real track instead. The status block under the page reports which
+sample was chosen and why. Both paths use MP4 sample timing and, when audio is available, the
+`AudioContext` clock rather than display-refresh or hard-coded FPS pacing.
 
 The page's controls are play/pause, five-second rewind/fast-forward, previous/next frame stepping,
 and a timeline range input that scrubs when you click or drag it, keeping only the newest requested
