@@ -123,9 +123,11 @@ impl<'a> RefPlane<'a> {
     /// columns. It is not carried by a decoded picture because
     /// `measure_narrow_mirror_amortization` prices the mirror against
     /// what a frame of interpolation does with it and the mirror is
-    /// dearer: **0.527 ms to write, 0.319 ms saved**, so the decoder
-    /// keeps the `i32` planes and [`narrows`] keeps issue #404's
-    /// routing. See `benches/README.md`.
+    /// dearer: paired within rounds against a null control, a picture
+    /// that writes one reads **0.91x to 0.95x** where the control reads
+    /// 1.0000x to 1.0599x, and even a mirror charged to nobody is worth
+    /// only 1.04x to 1.11x. So the decoder keeps the `i32` planes and
+    /// [`narrows`] keeps issue #404's routing. See `benches/README.md`.
     ///
     /// `narrow[ i ]` must equal `samples[ i ]` for every `i`, and every
     /// sample must lie in `0..=`[`NARROW_MAX_SAMPLE`]; only the lengths
@@ -675,9 +677,11 @@ fn interp_block<const N: usize>(
 ///   1.09x / 1.12x at 32x32 and 64x64 with a mirrored plane against
 ///   0.90x / 0.93x and 0.93x / 0.96x without one. **The mirror costs
 ///   more than that is worth**: `measure_narrow_mirror_amortization`
-///   writes one per 1080p luma plane in 0.527 ms at its floor, against
-///   0.319 ms saved over a whole frame's units at the measured size mix,
-///   and no decoded picture carries one. So [`RefPlane::with_narrow`] is
+///   prices a whole picture on each arm, paired within rounds against a
+///   null control, and one that writes a mirror reads 0.91x to 0.95x
+///   where the control reads 1.0000x to 1.0599x — while a mirror charged
+///   to nobody is worth only 1.04x to 1.11x, which is the ceiling the
+///   write is buying. So [`RefPlane::with_narrow`] is
 ///   test-only apparatus, [`RefPlane::borrows_narrow`] is false for
 ///   every plane the decoder builds, and these two phases behave as #404
 ///   left them — with both arms still spelled out below, and the
@@ -2790,12 +2794,24 @@ mod tests {
     /// turn, so the full-pel, one-dimensional and two-dimensional cases
     /// appear in the proportion the table gives them.
     ///
-    /// The two arms are the two plane representations as the decoder
-    /// really routes them: the `i32` arm is the plane without a mirror,
-    /// where [`narrows`] takes the 16-bit path on the vertical-only
-    /// phase alone (what issue #404 left), and the `i16` arm is the
-    /// mirrored plane, where it takes it on every filtering phase — with
-    /// the mirror's own build charged to it once per frame.
+    /// The arms are the plane representations as the decoder really
+    /// routes them. `i32` is the plane without a mirror, where
+    /// [`narrows`] takes the 16-bit path on the vertical-only phase
+    /// alone (what issue #404 left); the two mirrored arms take it on
+    /// every filtering phase and pay for the mirror, once into a fresh
+    /// `Vec` and once into a buffer that already exists; and a fourth
+    /// arm reads a mirror charged to nobody, which is the ceiling the
+    /// other two are buying.
+    ///
+    /// **Read as a best-of-many this flipped sign between invocations**,
+    /// which is issue #426's finding about this host arriving again, so
+    /// the instrument is #426's: the arms are paired *within* a round,
+    /// the arm order rotates so none of them always takes the slower
+    /// later slot, the statistic is the median of the per-round ratios
+    /// with an interquartile band rather than a ratio of two minima
+    /// chosen out of different rounds, and a second `i32` arm is a null
+    /// control whose true ratio is exactly 1.0000x. Nothing here is
+    /// trustworthy that the control does not underwrite.
     ///
     /// Ignored by default because it is a timing measurement, not an
     /// assertion. Run it with
@@ -2881,39 +2897,90 @@ mod tests {
             frame(&mirrored),
             "the mirrored arm changed the samples"
         );
-        let (mut wide, mut narrow) = (f64::INFINITY, f64::INFINITY);
-        for _ in 0..rounds {
+
+        // What a *picture* costs on each arm, which is the quantity that
+        // decides this: the `i32` arm is one frame of interpolation, and
+        // each `i16` arm is one mirror written plus one frame of
+        // interpolation reading it.
+        let time = |f: &mut dyn FnMut()| {
             let start = Instant::now();
+            f();
+            start.elapsed().as_secs_f64()
+        };
+        let mut wide_arm = || {
             std::hint::black_box(frame(&plane));
-            wide = wide.min(start.elapsed().as_secs_f64());
-            let start = Instant::now();
+        };
+        let mut alloc_arm = || {
+            let m = build_mirror();
+            let p = RefPlane::with_narrow(&plane_samples, &m, pw, ph).unwrap();
+            std::hint::black_box(frame(&p));
+        };
+        let mut reuse_arm = || {
+            for (d, &s) in reused.iter_mut().zip(plane_samples.iter()) {
+                *d = s as i16;
+            }
+            let p = RefPlane::with_narrow(&plane_samples, &reused, pw, ph).unwrap();
+            std::hint::black_box(frame(&p));
+        };
+        // The ceiling: the frame alone, off a mirror that is already
+        // there and charged to nobody. Nothing can reach it, but it is
+        // what the two arms above are spending the write to buy.
+        let mut free_arm = || {
             std::hint::black_box(frame(&mirrored));
-            narrow = narrow.min(start.elapsed().as_secs_f64());
+        };
+
+        // #426's lesson, applied: pair the arms **within** a round and
+        // take the median of the per-round ratios, because two minima
+        // chosen out of different rounds do not share the drift between
+        // those rounds; and rotate which arm runs first, because the
+        // later position of a round is systematically slower on this
+        // host. The null control is a second `i32` arm, whose true ratio
+        // is exactly 1.0000x, so a reader can see what the instrument
+        // misses by before reading what it says.
+        let paired = rounds * 2;
+        let (mut null, mut alloc, mut reuse, mut free) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for r in 0..paired {
+            // Five arms per round, in a rotating order.
+            let mut order = [0usize, 1, 2, 3, 4];
+            order.rotate_left(r % 5);
+            let mut t = [0.0f64; 5];
+            for &slot in &order {
+                t[slot] = match slot {
+                    0 => time(&mut wide_arm),
+                    1 => time(&mut wide_arm),
+                    2 => time(&mut alloc_arm),
+                    3 => time(&mut reuse_arm),
+                    _ => time(&mut free_arm),
+                };
+            }
+            null.push(t[0] / t[1]);
+            alloc.push(t[0] / t[2]);
+            reuse.push(t[0] / t[3]);
+            free.push(t[0] / t[4]);
         }
+        let quantiles = |v: &mut Vec<f64>| {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            (v[v.len() / 4], v[v.len() / 2], v[v.len() * 3 / 4])
+        };
+
         println!(
-            "\ni16 mirror amortization, {pw}x{ph}, {} units at the measured mix, {isa:?}, \
-             best of {rounds}",
+            "\ni16 mirror amortization, {pw}x{ph}, {} units at the measured mix, {isa:?}",
             units.len()
         );
-        println!("  build the mirror once            {:8.3} ms", build * 1e3);
-        println!("  ... into a buffer that exists    {:8.3} ms", refill * 1e3);
-        println!("  one frame of interpolation, i32  {:8.3} ms", wide * 1e3);
-        println!("  one frame of interpolation, i16  {:8.3} ms", narrow * 1e3);
-        println!(
-            "  saved per frame                  {:8.3} ms  ({:.2}x the build)",
-            (wide - narrow) * 1e3,
-            (wide - narrow) / build
-        );
-        println!(
-            "  with the build charged           {:8.3} ms  ({:5.2}x)",
-            (narrow + build) * 1e3,
-            wide / (narrow + build)
-        );
-        println!(
-            "  with the refill charged          {:8.3} ms  ({:5.2}x)",
-            (narrow + refill) * 1e3,
-            wide / (narrow + refill)
-        );
+        println!("  best of {rounds}, in isolation:");
+        println!("    write the mirror (fresh Vec)   {:8.3} ms", build * 1e3);
+        println!("    ... into a buffer that exists  {:8.3} ms", refill * 1e3);
+        println!("  {paired} within-round paired rounds, rotating arm order, i32 / arm:");
+        for (name, v) in [
+            ("i32 (null control, true 1.0000x)", &mut null),
+            ("mirror written into a fresh Vec ", &mut alloc),
+            ("mirror written into a reused buf", &mut reuse),
+            ("mirror already there, unpriced   ", &mut free),
+        ] {
+            let (q1, med, q3) = quantiles(v);
+            println!("    {name}  {med:6.4}x  [{q1:6.4}, {q3:6.4}]");
+        }
     }
 
     /// A/Bs the full-height `w x ( h + 7 )` intermediate the

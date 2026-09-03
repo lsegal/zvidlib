@@ -940,45 +940,54 @@ a converting one.
 **And the mirror costs more than that is worth.** It has to be written, once per
 picture, and every decoded picture is stored as a short-term reference, so the
 accounting is one write against one frame of interpolation.
-`measure_narrow_mirror_amortization` takes both halves over a 1080p luma plane
-on the same host: a frame's worth of prediction units at the measured
-`INTER_PU_MIX` size mix (62.1% of samples at 64x64, 31.1% at 32x32) walking all
-sixteen Table 8-8 phase combinations in turn.
+`measure_narrow_mirror_amortization` prices a *picture* on each arm over a 1080p
+luma plane: a frame's worth of prediction units at the measured `INTER_PU_MIX`
+size mix (62.1% of samples at 64x64, 31.1% at 32x32) walking all sixteen Table
+8-8 phase combinations in turn, with the mirror's own write charged to the arms
+that need one.
 
-| | ms |
+Read as a best-of-many it flipped sign between invocations — 0.95x in one and
+1.04x in the next — which is #426's finding about this host arriving again, so
+the instrument is #426's: **five arms paired within each round, rotating which
+runs first, median of the per-round ratios with an interquartile band, and a
+null control whose true answer is exactly 1.0000x**. Thirty paired rounds per
+invocation, four invocations, Intel Core i9-10850K:
+
+| Arm (`i32` / arm, per picture) | median over four invocations |
 | --- | ---: |
-| write the mirror (fresh `Vec`) | 1.291 |
-| write it into a buffer that already exists | 0.527 |
-| one frame of interpolation, `i32` planes | 4.229 |
-| one frame of interpolation, mirrored planes | 3.910 |
-| **saved per frame** | **0.319** |
+| second `i32` arm — **null control, true 1.0000x** | 1.0000x to 1.0599x |
+| mirror written into a fresh `Vec` | **0.79x to 0.87x** |
+| mirror written into a buffer that already exists | **0.91x to 0.95x** |
+| mirror already there, its write charged to nobody | 1.04x to 1.11x |
 
-**0.527 ms spent to save 0.319 ms**, and 0.527 ms is the floor — a fresh
-four-megabyte `Vec` faulted in a page at a time reads 1.291 ms, and only a
-recycled picture buffer would reach the lower figure. Charged once per frame the
-representation reads **0.95x at its floor and 0.81x as it would actually be
-allocated**, against a plane set that is already 50% larger in memory for
-carrying two representations of every eight-bit sample. The luma figures are the
-favourable half, too: mirroring the chroma planes adds another half a luma
-plane's worth of writing for a 4-tap filter on quarter-sized blocks.
+Both arms that pay for the mirror sit **below the control in every invocation**,
+and the fresh-`Vec` arm by far more than the control's own 0.0% to 5.9% miss.
+Writing the mirror in isolation reads 1.17-1.54 ms into a fresh four-megabyte
+`Vec` — faulted in a page at a time — and 0.51-0.73 ms into one that already
+exists, which only a recycled picture buffer would reach. The bottom row is the
+ceiling the other two are buying and cannot reach: even charged to nobody the
+mirror is worth **4% to 11% of a frame's interpolation**, and writing it costs
+more than that.
 
-The saving is small for a reason the table above predicts rather than
+The ceiling is low for a reason the per-phase table predicts rather than
 contradicts. Uniformly over Table 8-8, three of sixteen phase combinations are
 horizontal-only, three vertical-only (which already narrowed), nine
 two-dimensional (which gains about a tenth) and one full-pel (which does not
-filter). Weighting the per-phase ratios by that gives about 8% of the
-interpolation, which is the 0.319 ms measured — the mirror's best case is
-one plane-sized pass short of paying for itself.
+filter), so the per-phase ratios weight out to under a tenth of the stage. And
+that is the favourable half of the accounting: mirroring the chroma planes adds
+another half a luma plane's worth of writing for a 4-tap filter on quarter-sized
+blocks, against a plane set already 50% larger in memory for carrying two
+representations of every eight-bit sample.
 
 **The section above bounds what that would have been worth even if the mirror
-were free.** #426's paired instrument, on this same i9-10850K, puts the whole-
-decode effect of the narrow path at smaller than about 4% and not distinguishable
-from zero, with a null control missing its known 1.0000x by 3.7% to 2.5%. A
-0.319 ms saving on a stage that is about 27% of decode proper is roughly 2% of a
-decode — inside that floor, on the arm where the mirror costs nothing. So the
-mirror is not a change this host could resolve end to end even in the accounting
-that ignores what it costs to write, which is the other reason the decision rests
-on the in-process A/Bs above rather than on a whole-decode draw.
+were free.** #426's paired instrument puts the whole-decode effect of the narrow
+path at smaller than about 4% on this host and not distinguishable from zero. The
+unpriced ceiling here is 4% to 11% of a stage that is about 27% of decode proper,
+so it is 1% to 3% of a decode — inside that floor, on the arm where the mirror
+costs nothing. The mirror is therefore not a change this host could resolve end
+to end even in the accounting that ignores what it costs to write, which is the
+other reason the decision rests on the in-process A/Bs above rather than on a
+whole-decode draw.
 
 **So the decoder keeps its `i32` planes and `narrows` keeps #404's routing.**
 `RefPlane::with_narrow` is `#[cfg(test)]` apparatus, as `measure_2d_ring_vs_flat`
@@ -994,14 +1003,15 @@ shape, origin, phase and backend.
 
 The remaining way to get the borrow is to make `i16` the plane's **sole**
 representation for eight-bit content rather than a second one, which removes the
-pass and the memory together. That is not this issue's question — #427 asked for
+write and the memory together. That is not this issue's question — #427 asked for
 it "without duplicating the plane type or disturbing the higher-bit-depth
 paths", and `Picture` would have to become an enum over sample width that every
 §8 consumer of `Picture::plane() -> &[i32]` resolves, with the deblocking, SAO,
-residual-add and output-conversion paths all reading through it. The measurement
-above is what would justify opening that: **0.319 ms per 1080p frame of
-interpolation, out of a stage that is about 27% of decode proper**, and no
-conversion cost against it.
+residual-add and output-conversion paths all reading through it. What would
+justify opening that is the unpriced row above — **4% to 11% of a 1080p frame's
+interpolation, out of a stage that is about 27% of decode proper** — with no
+write against it, which is also small enough that it should be measured on a
+host whose null control does better than ±5% before anyone starts.
 
 Sample-weighting the sweep predicts 1.07x for the measured mix, and the rebuilt
 group measures **1.09x against the old grid's 1.25x** on this host on the same
