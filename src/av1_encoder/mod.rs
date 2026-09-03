@@ -3018,12 +3018,21 @@ mod nonlossless_tests {
     ///    block, every quantizer here, asserted below.
     /// 2. *A cost bound on the trial.* A trial's cost is a sum of `sse + lambda * bits` over its
     ///    blocks, so it only grows: once the partial sum passes the incumbent size's the size has
-    ///    lost, and the rest of its blocks need not be searched at all. That is exact, and it is
-    ///    available only to a context-consistent trial - the shipped trial ranks on
-    ///    `corrected_trial_cost`, which subtracts a credit the trial has not finished measuring,
-    ///    so no partial sum of its own is a proof of anything. `abandoned_trials` is asserted
-    ///    non-zero (42-67 per frame here) so the saving is known to be reached rather than
-    ///    assumed.
+    ///    lost, and the rest of its blocks need not be searched at all. That is exact.
+    ///    `abandoned_trials` is asserted non-zero (42-67 per frame here) so the saving is known
+    ///    to be reached rather than assumed.
+    ///
+    ///    This was recorded here as a reduction *available only to a context-consistent trial*,
+    ///    on the grounds that the shipped trial ranks on `corrected_trial_cost`, which subtracts
+    ///    a credit the trial has not finished measuring. #398 settled that: the credit a
+    ///    non-probing trial reads under the shipped `GainModel::Linear` is a fixed fraction of
+    ///    the trial's own searched cost, so the corrected cost is monotone in the sum too and the
+    ///    shipped trial now takes the same bound - see
+    ///    `the_shipped_size_trial_is_bounded_by_the_incumbents_cost_and_the_bound_is_exact`. It
+    ///    is worth an order of magnitude less there, because the shipped trial spends one
+    ///    candidate on a block where a consistent trial spends five, so it does not move this
+    ///    test's conclusion: the gap below is measured against the shipped search *with* the
+    ///    bound in force.
     ///
     /// Together they take the candidate reduction from the 1.69x-2.00x the arm above measures to
     /// 2.05x-2.23x here, and from 1.00x-1.93x to 1.13x-3.27x across the tuning set at 128x96.
@@ -3454,6 +3463,111 @@ mod nonlossless_tests {
                 }
             }
         }
+    }
+
+    /// The shipped size trial is bounded by the incumbent size's cost, and the bound is exact.
+    ///
+    /// #388 gave the trial cost bound to the context-consistent size trial only, and recorded
+    /// why: the shipped trial does not rank on the sum `code_block_transforms` accumulates, it
+    /// ranks on `corrected_trial_cost`, which subtracts a transform-gain credit the trial has not
+    /// finished measuring, so a partial sum above the incumbent proves nothing. #398 asked
+    /// whether that reason holds for the shipped estimator. It does not, and this is the
+    /// measurement of what the difference is worth.
+    ///
+    /// **Why the shipped trial's corrected cost is monotone in the sum after all.** Under the
+    /// shipped `GainModel::Linear`, a trial that does *not* probe reads `(dct, best, probes)`
+    /// back from the per-size accumulator, which is fixed before the trial starts and which
+    /// nothing the trial does can move - a non-probing trial measures nothing and accumulates
+    /// nothing. Its credit is then `measured * trial_searched_cost / dct` with `measured` a
+    /// constant, so a block that adds `c >= 0` to the sum adds at most `c` to
+    /// `trial_searched_cost` - the searched cost is the same per-block cost, summed over a subset
+    /// of the same blocks - and so moves the corrected cost by at least
+    /// `c - ceil(measured * c / dct)`. That is non-negative exactly when the credit fraction
+    /// `measured / dct` is at most one. It always is: `best` is `cheapest.min(dct)` so
+    /// `dct - best` is at most `dct`, and `TYPE_GAIN_TRUST` only shrinks it further. At the
+    /// fraction's ceiling of one the step is zero rather than negative, so the corrected cost
+    /// stops rising but never falls and the bound stays exact - it merely stops abandoning
+    /// anything. `FrameEncoder::shipped_trial_credit` states the conditions and checks the
+    /// fraction rather than assuming it, and refuses the bound on the two cases where the
+    /// argument genuinely fails: a *probing* trial, whose credit is measured as it goes, and the
+    /// per-block `GainModel`s, which credit a zero-cost block a whole block's worth of gain and
+    /// so can make the corrected cost fall. Only every `TYPE_GAIN_SAMPLE_INTERVAL`-th size search
+    /// probes and only `Linear` ships, so this is the majority of shipped trials rather than a
+    /// corner of them.
+    ///
+    /// The tie-break survives unchanged. The incumbent's cost is reachable only by a size that
+    /// also wins the `(cost, larger transform)` tie, so the ceiling is the incumbent's own cost
+    /// for a larger transform and one below it for a smaller one - the same ceiling the
+    /// context-consistent arm takes, because it is a property of the ranking's total order and
+    /// not of which cost is being ranked.
+    ///
+    /// **What it buys, and that it is exact.** Both are asserted here on the frame
+    /// `the_search_shortcuts_stay_within_their_rate_and_distortion_bound` states its candidate
+    /// reduction on, at the same six quantizers. What it buys there is **0.14-1.00% of the
+    /// transform-type candidates**, on 18-26 abandoned trials per frame, and 0.03-6.60% across
+    /// the tuning set at 128x96 (0.01-6.45% at 192x160, on up to 120 abandoned trials). That is
+    /// an order of magnitude less than the 42-67 abandonments the context-consistent arm reports
+    /// on the same frame, and the arithmetic of the difference is the point: a context-consistent
+    /// trial searches five types on every block it reaches, so a block it never reaches is five
+    /// candidates saved, where the shipped trial ranks on `DCT_DCT` alone and a block it never
+    /// reaches is one. The bound is the same bound; there is simply an order of magnitude less
+    /// behind it to skip. Exactness is asserted as identity against
+    /// `with_unbounded_size_trials`, which is the same encode with the bound switched off:
+    /// identical bytes, identical transform trace, identical reconstruction and identical size
+    /// decisions, at every quantizer. An exact bound skips work, it does not change an answer.
+    /// `abandoned_trials` is asserted non-zero so the saving is measured rather than assumed.
+    #[test]
+    fn the_shipped_size_trial_is_bounded_by_the_incumbents_cost_and_the_bound_is_exact() {
+        let (width, height) = (96_usize, 80_usize);
+        let pixels = test_pattern(width as u32, height as u32);
+        let mut worst = f64::MAX;
+        for qindex in DETERMINISM_QINDEXES {
+            let bounded =
+                tile::FrameEncoder::new(&pixels, width, height, qindex).encode_with_report();
+            let unbounded = tile::FrameEncoder::new(&pixels, width, height, qindex)
+                .with_unbounded_size_trials()
+                .encode_with_report();
+            assert_eq!(
+                bounded.tile, unbounded.tile,
+                "qindex {qindex}: bounding the shipped size trial by the incumbent's cost                  changed the emitted bytes, so the bound is not exact"
+            );
+            assert_eq!(
+                bounded.trace, unbounded.trace,
+                "qindex {qindex}: bounding the shipped size trial changed which transform types                  the emitting pass chose"
+            );
+            assert_eq!(
+                bounded.reconstruction, unbounded.reconstruction,
+                "qindex {qindex}: bounding the shipped size trial changed the reconstruction"
+            );
+            assert_eq!(
+                bounded.size_choices, unbounded.size_choices,
+                "qindex {qindex}: bounding the shipped size trial changed a transform-size                  decision, so a trial was abandoned that would have won"
+            );
+            assert!(
+                bounded.abandoned_trials > 0,
+                "qindex {qindex}: no shipped size trial was ever abandoned by the incumbent's                  cost, so the bound buys nothing on this frame"
+            );
+            assert!(
+                bounded.candidates_evaluated <= unbounded.candidates_evaluated,
+                "qindex {qindex}: the bounded search evaluated {} transform-type candidates                  against the unbounded search's {}, so abandoning a trial early cost work                  instead of saving it",
+                bounded.candidates_evaluated,
+                unbounded.candidates_evaluated
+            );
+            let saving =
+                1.0 - bounded.candidates_evaluated as f64 / unbounded.candidates_evaluated as f64;
+            println!(
+                "qindex {qindex}: {} candidates against {} unbounded ({:.2}% saved),                  {} trials abandoned",
+                bounded.candidates_evaluated,
+                unbounded.candidates_evaluated,
+                saving * 100.0,
+                bounded.abandoned_trials
+            );
+            worst = worst.min(saving);
+        }
+        assert!(
+            worst > 0.0,
+            "the bound saved nothing at its worst quantizer, so it is not worth the arithmetic"
+        );
     }
 
     /// The stated bound on what the search shortcuts cost.

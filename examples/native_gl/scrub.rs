@@ -65,40 +65,46 @@ const DELIVERY_DEPTH: usize = 3;
 /// frozen for those 1.7 s, which is issue #363. A cadence buys the motion back, and this is what
 /// it costs.
 ///
-/// The value is measured rather than derived. #363 set it to 150 ms by arithmetic - a dozen
-/// published pictures over the 613-frame walk, 4% on top of #354's arrival - and
-/// `examples/scrub_preview_profile.rs`, which walks this service to frame 767 from cold through
-/// VideoToolbox, says the arithmetic was wrong by two orders of magnitude: at 150 ms the walk
-/// converts **765** of the sample's 768 pictures, not a dozen, and the frame under the pointer
-/// arrives in **7.03 s** against **1.25 s** with no previews at all. That is worse than the
-/// 6.4 s #354 was opened for.
+/// The value is measured rather than derived, and it has been measured twice. #379 swept it and
+/// found the cadence unaffordable at any spacing a drag wants: at 150 ms the walk to frame 767
+/// converted **765** of the sample's 768 pictures and the frame under the pointer arrived in
+/// 7.03 s against 1.25 s with no previews, so the interval was moved out to 1.6 s, which was
+/// simply where the sweep stopped paying. That knee was the reader's cache tail and not the
+/// cadence: every published picture also converted the frames behind it that fit in the cache,
+/// and once the stride was shorter than the tail the tails overlapped the whole span. #402 made
+/// that tail the request's rather than the reader's - a walk's intermediate steps ask through
+/// [`ExactFrameReader::get_step`], which converts the picture it was asked for and nothing else,
+/// while the target itself is still a destination and still keeps its tail - and with it gone
+/// there is no knee left to sit behind.
 ///
-/// The count is what the estimate missed, not the price. Every published picture converts the
-/// frames behind it that fit in the reader's cache as well as itself (`ExactFrameReader`'s
-/// bounded tail, `Limits::max_cached_frames`, 32 by default), so a stride shorter than that tail
-/// converts every frame it passes; measured per converted picture the cost is 5.2 ms to 7.6 ms
-/// across the whole sweep, which is #355's 6.6 ms. Issue #402 tracks the tail itself.
-///
-/// So the interval is set where the sweep stops paying. Arrival against publish spacing, the
-/// fastest of five runs each:
+/// Re-swept by `examples/scrub_preview_profile.rs` on this project's Apple M1 through
+/// VideoToolbox, three sweeps of five, five and seven runs, each cell the fastest of its runs.
+/// The baseline that publishes nothing arrives in 1.30-1.32 s across the three:
 ///
 /// | interval | arrival | published | spacing | converted |
 /// | --- | --- | --- | --- | --- |
-/// | 80 ms | 3.52 s | 34 | 104 ms | 306 |
-/// | 150 ms | 7.03 s | 50 | 141 ms | 765 |
-/// | 400 ms | 3.39 s | 12 | 282 ms | 299 |
-/// | 800 ms | 2.31 s | 7 | 330 ms | 156 |
-/// | 1600 ms | 1.82 s | 5 | 364 ms | 100 |
-/// | 2400 ms | 1.89 s | 5 | 378 ms | 102 |
+/// | 80 ms | 1.32-1.38 s | 12-16 | 82-115 ms | 24-36 |
+/// | 100 ms | 1.31-1.40 s | 10-14 | 97-130 ms | 24-36 |
+/// | 150 ms | 1.32-1.48 s | 12-14 | 101-122 ms | 27-51 |
+/// | 200 ms | 1.33-1.48 s | 10 | 132-148 ms | 30-46 |
+/// | 400 ms | 1.39-1.45 s | 7 | 199-206 ms | 38-43 |
+/// | 1600 ms | 1.38-1.40 s | 5 | 277-281 ms | 38-39 |
 ///
-/// Past 1.6 s the walk neither arrives sooner nor publishes more - the stride is capped by
-/// [`MAXIMUM_STRIDE`] and the tail is what is left - so 1.6 s is the knee, and it lands the frame
-/// under the pointer in 1.82 s: #354's 1.7 s and about 8%, rather than five times it. It still
-/// publishes five pictures on the way, one every 364 ms, and #374's background preview index
-/// draws a shrunk picture for wherever the pointer is within a frame of the window's regardless,
-/// so what this cadence owes #363 is the full-resolution picture catching up, not the motion
-/// itself.
-const PREVIEW_INTERVAL: Duration = Duration::from_millis(1600);
+/// The whole band is flat. Every interval from 80 ms to 1.6 s now lands the frame under the
+/// pointer within a few percent of a walk that publishes nothing, and the run-to-run spread on
+/// one interval is as wide as the spread across all of them - the two sweeps that put 150 ms
+/// highest and 120 ms highest are the same host, minutes apart. What used to be a choice between
+/// motion and arrival is not a trade any more, because the count the cadence controls is now the
+/// count it publishes: a dozen conversions over a 767-frame walk rather than 765.
+///
+/// So this goes back to the 150 ms #363 chose by arithmetic, which the arithmetic was right
+/// about all along and only the tail made unaffordable. It publishes about thirteen pictures on
+/// the way, one every 101-122 ms, and arrives in 1.32-1.48 s. #374's background preview index
+/// still draws a shrunk picture for wherever the pointer is, so this cadence owes #363 the
+/// full-resolution picture catching up several times a second, which is what it now does.
+///
+/// [`ExactFrameReader::get_step`]: zvidlib::ExactFrameReader::get_step
+const PREVIEW_INTERVAL: Duration = Duration::from_millis(150);
 
 /// How many frames a walk decodes between published pictures at `interval`.
 ///
@@ -444,7 +450,18 @@ fn decode_frames(
             // decode part-way through. Everything between the reader's position and this frame is
             // decoded inside this one call, for reference only - which is what keeps a stride's
             // skipped frames costing their decoding and no conversion (#355).
-            let decoded = reader.get(FrameIndex(step), &cancellation);
+            //
+            // A step short of the target asks for its own picture and no cache tail: this walk is
+            // going forwards and will never come back for the frames behind an intermediate
+            // publish, and paying that tail once per published picture is what turned a 150 ms
+            // cadence into a conversion of every frame in the track (#402). The target itself is
+            // a destination and keeps its tail, so a committed scrub is still followed by free
+            // backward steps.
+            let decoded = if step == target {
+                reader.get(FrameIndex(step), &cancellation)
+            } else {
+                reader.get_step(FrameIndex(step), &cancellation)
+            };
             let elapsed = started.elapsed();
             let mut state = lock.lock().expect("frame queue poisoned");
             if state.shutdown {

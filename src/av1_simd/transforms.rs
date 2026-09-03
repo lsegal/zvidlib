@@ -1411,20 +1411,50 @@ inverse_transform_driver!(inverse_transform64, 64, 6, dct64, dct64);
 /// overflow the low half. Folding the low accumulator's completed high bits
 /// into `high` every four terms is exact - `x == (x >> 14) * 2^14 + (x &
 /// 0x3fff)` holds for negative `x` too - and keeps the low half under `2^30`.
+///
+/// # Why the fold is a chunk boundary rather than a condition (#403)
+///
+/// The fold used to sit inside the term loop as `if index % 4 == 3`. That is
+/// the same arithmetic, and at 4, 8 and 16 points it costs nothing: LLVM fully
+/// unrolls a loop that short, so the condition folds away at compile time and
+/// every fourth unrolled term simply carries the two extra operations. At 32
+/// points it stops unrolling, and the condition survives into a real branch
+/// taken once per term - inside the innermost loop of an `O(N^2)` basis
+/// multiply, run `N / 4` groups times `N` outputs times two passes per block.
+///
+/// The cost of that was not subtle and it was not the host. Measured per
+/// vector operation, the 4-, 8- and 16-point kernels all ran at roughly the
+/// same rate and the 32-point kernel ran about 2.9x slower - a cliff in cost
+/// per instruction at exactly the size that stopped unrolling, with no change
+/// in the instruction mix. `av1_forward_dct_32x32` was the only forward
+/// transform below parity anywhere as a result, at 0.85x-0.91x `neon` against
+/// 3.4x-5.9x for its 4-, 8- and 16-point siblings.
+///
+/// Writing the fold as the tail of a `chunks_exact(4)` group removes the
+/// branch without changing the arithmetic or its order - `N` is 4, 8, 16 or
+/// 32, always a multiple of four, so the last group is never partial. On an
+/// Apple M1, `av1_forward_dct_32x32` moves from 0.91x to 2.18x `neon`
+/// (61.982 ms to 28.563 ms against a 56.681 ms scalar arm), and the other
+/// sizes are unchanged because they were already unrolled. `benches/README.md`
+/// carries the round.
 #[inline(always)]
 unsafe fn basis_row_rs14<V: I32x, const N: usize>(input: &[V; N], basis: &[i32]) -> V {
     unsafe {
         let mask = V::splat(0x3fff);
         let mut high = V::zero();
         let mut low = V::zero();
-        for (index, (&value, &coefficient)) in input.iter().zip(basis.iter()).enumerate() {
-            let scale = V::splat(coefficient);
-            high = high.add(value.sra::<14>().mul(scale));
-            low = low.add(value.and(mask).mul(scale));
-            if index % 4 == 3 {
-                high = high.add(low.sra::<14>());
-                low = low.and(mask);
+        // `N` is always a multiple of four, so the every-fourth-term fold is
+        // the tail of a four-term chunk rather than a condition inside the
+        // term loop. Same arithmetic in the same order; see the codegen note
+        // below for why the shape rather than the arithmetic is what matters.
+        for (values, coefficients) in input.chunks_exact(4).zip(basis.chunks_exact(4)) {
+            for (&value, &coefficient) in values.iter().zip(coefficients.iter()) {
+                let scale = V::splat(coefficient);
+                high = high.add(value.sra::<14>().mul(scale));
+                low = low.add(value.and(mask).mul(scale));
             }
+            high = high.add(low.sra::<14>());
+            low = low.and(mask);
         }
         high.add(round_shift14(low))
     }

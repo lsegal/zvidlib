@@ -1272,7 +1272,7 @@ and the `hevc_encode_1920x1088` family.
 | `av1_entropy_symbol` | 3.075 ms | 3.141 ms (0.98x) | 0.98x `neon` |
 | `av1_forward_adst_8x8` | 29.647 ms | 7.272 ms (4.08x) | 4.08x `neon` |
 | `av1_forward_dct_16x16` | 37.029 ms | 10.919 ms (3.39x) | 3.39x `neon` |
-| `av1_forward_dct_32x32` | 53.549 ms | 62.642 ms (0.85x) | 0.85x `neon` |
+| `av1_forward_dct_32x32` | 53.549 ms | 62.642 ms (0.85x) | 0.85x `neon` (superseded; see [below](#reading-the-sub-parity-rows)) |
 | `av1_forward_dct_4x4` | 40.458 ms | 6.991 ms (5.79x) | 5.79x `neon` |
 | `av1_forward_dct_8x8` | 29.153 ms | 7.741 ms (3.77x) | 3.77x `neon` |
 | `av1_forward_flipadst_16x16` | 34.389 ms | 11.904 ms (2.89x) | 2.89x `neon` |
@@ -1347,12 +1347,49 @@ removes a round that was contended; it cannot remove contention that was present
 in every round, and this host had some in all six.
 
 So the walk-to-parity reading survives for `hevc_intra_pred`, which lands inside
-the same 9% band the same-code rows define. It does not obviously survive for
-`av1_forward_dct_32x32`, whose 15% gap is the largest sub-parity figure on the
-table and sits against 1.48x for the same group under `avx2` on x86_64. That is
-now the one aarch64 row worth acting on rather than re-reading, and it is
-tracked separately; nothing else here is below parity for a reason other than
-having no kernel.
+the same 9% band the same-code rows define. It did not survive for
+`av1_forward_dct_32x32`, whose 15% gap was the largest sub-parity figure on the
+table and sat against 1.48x for the same group under `avx2` on x86_64. That was
+the one aarch64 row worth acting on rather than re-reading, and #403 acted on
+it; nothing else here is below parity for a reason other than having no kernel.
+
+**`av1_forward_dct_32x32` was the kernel, and the kernel is fixed (#403).** The
+row was not the host, and the way to tell was to stop comparing the two arms and
+compare the `neon` arm against itself. Cost per vector operation is a ratio
+internal to one arm, so contention inflates every size of it equally and cancels
+out of the comparison. The 4-, 8- and 16-point forward kernels all ran at
+roughly the same cost per operation; the 32-point kernel ran about 2.9x slower
+per operation, on the same instruction mix. A cliff at one size is not something
+a noisy host can produce.
+
+What it was: `av1_simd::transforms::basis_row_rs14` folded its split
+accumulator every fourth term as `if index % 4 == 3`, inside the innermost loop
+of an `O(N^2)` basis multiply. At 4, 8 and 16 points LLVM fully unrolls that
+loop and the condition costs nothing. At 32 points it stops unrolling and the
+condition becomes a real branch per term. Writing the fold as the tail of a
+`chunks_exact(4)` group is the same arithmetic in the same order — `N` is always
+a multiple of four — and removes the branch.
+
+Measured on the same Apple M1, arms interleaved slab-by-slab with an elementwise
+minimum over twelve rounds rather than run group-at-a-time, which is what lets a
+contended host still give a usable floor:
+
+| Group | `scalar` | `neon` before | `neon` after |
+| --- | ---: | ---: | ---: |
+| `av1_forward_dct_4x4` | 42.442 ms | 6.604 ms (5.84x) | 6.746 ms (6.29x) |
+| `av1_forward_dct_8x8` | 31.830 ms | 7.312 ms (4.26x) | 7.571 ms (4.20x) |
+| `av1_forward_dct_16x16` | 39.675 ms | 10.971 ms (3.37x) | 12.026 ms (3.30x) |
+| `av1_forward_dct_32x32` | 62.405 ms | 61.982 ms (0.91x) | 28.563 ms (2.18x) |
+
+The three smaller sizes are unchanged, because they were already unrolled; only
+32 points moves, and it moves 2.2x. The scalar column is this round's, not the
+table's above: the host was busier here, which is why its `scalar` figures read
+high and the before-ratio reads 0.91x where the six-round table read 0.85x. That
+difference is the whole reason the row survived three earlier readings — the
+scalar arm is the one that moves with the host, the `neon` arm read 62 ms under
+both a quiet host and a load average of 17, and a minimum can only be pushed up
+by contention, never down. Two arms whose floors are 14% apart under the *same*
+contention were never going to be explained by that contention.
 
 **`av1_encode_stage_wht` is no longer 2.72x.** The old table put the forward
 4x4 WHT at 2.72x `neon`, and `src/av1_simd/mod.rs` cited exactly that figure as
