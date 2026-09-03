@@ -402,4 +402,62 @@ mod tests {
         assert_eq!(packed[4], 0x5a);
         assert_eq!(packed[5], 0xf0);
     }
+
+    #[test]
+    fn the_narrow_mirror_reproduces_every_plane() {
+        let mut p = Picture::new(4, 4, 1, 8, 8);
+        for y in 0..4 {
+            for x in 0..4 {
+                p.set_sample(Plane::Luma, x, y, (y * 4 + x) as i32 * 17);
+            }
+        }
+        p.set_sample(Plane::Cb, 1, 1, 250);
+        p.set_sample(Plane::Cr, 0, 1, 3);
+        assert_eq!(p.narrow_plane(Plane::Luma), None);
+        p.build_narrow_mirror();
+        for plane in [Plane::Luma, Plane::Cb, Plane::Cr] {
+            let wide = p.plane(plane);
+            let narrow = p.narrow_plane(plane).expect("an eight-bit picture mirrors");
+            assert_eq!(narrow.len(), wide.len());
+            assert!(narrow.iter().zip(wide).all(|(&n, &w)| i32::from(n) == w));
+        }
+    }
+
+    /// The mirror describes samples the picture holds, so anything that
+    /// writes one drops it. A stale mirror would be read as reference
+    /// samples by the §8.5.3.3.3 interpolation path.
+    #[test]
+    fn writing_a_sample_drops_the_narrow_mirror() {
+        let mut p = Picture::new(4, 4, 1, 8, 8);
+        p.build_narrow_mirror();
+        assert!(p.narrow_plane(Plane::Luma).is_some());
+        p.set_sample(Plane::Luma, 0, 0, 7);
+        assert!(p.narrow_plane(Plane::Luma).is_none());
+
+        p.build_narrow_mirror();
+        assert!(p.narrow_plane(Plane::Luma).is_some());
+        let _ = p.plane_mut(Plane::Cb);
+        assert!(p.narrow_plane(Plane::Luma).is_none());
+    }
+
+    /// Above eight bits the `i16` tap accumulator the mirror exists for
+    /// is out of range, so there is no mirror to build.
+    #[test]
+    fn a_higher_bit_depth_picture_has_no_narrow_mirror() {
+        let mut p = Picture::new(4, 4, 1, 10, 10);
+        p.build_narrow_mirror();
+        assert!(p.narrow_plane(Plane::Luma).is_none());
+    }
+
+    /// Equality is about the samples, not about whether one of the two
+    /// pictures happens to have been made a reference.
+    #[test]
+    fn the_narrow_mirror_does_not_affect_equality() {
+        let mut a = Picture::new(4, 4, 1, 8, 8);
+        a.set_sample(Plane::Luma, 2, 2, 99);
+        let b = a.clone();
+        a.build_narrow_mirror();
+        assert_eq!(a, b);
+        assert_eq!(b, a);
+    }
 }

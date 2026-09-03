@@ -2196,64 +2196,186 @@ mod tests {
     /// itself introduces. This runs every block shape, origin and phase
     /// through the block path and through `interp_luma_sample` /
     /// `interp_chroma_sample`, which are `i32` throughout.
+    ///
+    /// It runs **both plane representations**, because which of them a
+    /// reference picture carries is what decides how many of the four
+    /// phase cases narrow at all (see [`narrows`]): a plane with the
+    /// `i16` mirror narrows the horizontal-only and two-dimensional
+    /// phases as well, and those arms would otherwise be unreached here.
     #[test]
     fn the_eight_bit_block_path_matches_the_per_sample_equations() {
         let (pw, ph) = (96usize, 72usize);
         let plane_samples = pseudo_random(8, pw * ph, 255);
-        let plane = RefPlane::new(&plane_samples, pw, ph).unwrap();
-        for &(w, h) in &BLOCK_SHAPES {
-            for &(x_int, y_int) in &ORIGINS {
-                for x_frac in 0..4 {
-                    for y_frac in 0..4 {
-                        let got = interp_luma_block(&plane, x_int, y_int, x_frac, y_frac, w, h, 8)
-                            .unwrap();
-                        let want = (0..h as i32)
-                            .flat_map(|y| {
-                                (0..w as i32).map(move |x| {
-                                    interp_luma_sample(
-                                        &plane,
-                                        x_int + x,
-                                        y_int + y,
-                                        x_frac,
-                                        y_frac,
-                                        8,
-                                    )
+        let mirror: Vec<i16> = plane_samples.iter().map(|&s| s as i16).collect();
+        let wide = RefPlane::new(&plane_samples, pw, ph).unwrap();
+        let mirrored = RefPlane::with_narrow(&plane_samples, &mirror, pw, ph).unwrap();
+        for (rep, plane) in [("wide", &wide), ("mirrored", &mirrored)] {
+            for &(w, h) in &BLOCK_SHAPES {
+                for &(x_int, y_int) in &ORIGINS {
+                    for x_frac in 0..4 {
+                        for y_frac in 0..4 {
+                            let got =
+                                interp_luma_block(plane, x_int, y_int, x_frac, y_frac, w, h, 8)
+                                    .unwrap();
+                            let want = (0..h as i32)
+                                .flat_map(|y| {
+                                    (0..w as i32).map(move |x| {
+                                        interp_luma_sample(
+                                            plane,
+                                            x_int + x,
+                                            y_int + y,
+                                            x_frac,
+                                            y_frac,
+                                            8,
+                                        )
+                                    })
                                 })
-                            })
-                            .collect::<Vec<_>>();
-                        assert_eq!(
-                            got, want,
-                            "luma {w}x{h} @({x_int},{y_int}) frac=({x_frac},{y_frac})"
-                        );
+                                .collect::<Vec<_>>();
+                            assert_eq!(
+                                got, want,
+                                "{rep} luma {w}x{h} @({x_int},{y_int}) frac=({x_frac},{y_frac})"
+                            );
+                        }
                     }
-                }
-                for x_frac in 0..8 {
-                    for y_frac in 0..8 {
-                        let got =
-                            interp_chroma_block(&plane, x_int, y_int, x_frac, y_frac, w, h, 8)
-                                .unwrap();
-                        let want = (0..h as i32)
-                            .flat_map(|y| {
-                                (0..w as i32).map(move |x| {
-                                    interp_chroma_sample(
-                                        &plane,
-                                        x_int + x,
-                                        y_int + y,
-                                        x_frac,
-                                        y_frac,
-                                        8,
-                                    )
+                    for x_frac in 0..8 {
+                        for y_frac in 0..8 {
+                            let got =
+                                interp_chroma_block(plane, x_int, y_int, x_frac, y_frac, w, h, 8)
+                                    .unwrap();
+                            let want = (0..h as i32)
+                                .flat_map(|y| {
+                                    (0..w as i32).map(move |x| {
+                                        interp_chroma_sample(
+                                            plane,
+                                            x_int + x,
+                                            y_int + y,
+                                            x_frac,
+                                            y_frac,
+                                            8,
+                                        )
+                                    })
                                 })
-                            })
-                            .collect::<Vec<_>>();
-                        assert_eq!(
-                            got, want,
-                            "chroma {w}x{h} @({x_int},{y_int}) frac=({x_frac},{y_frac})"
-                        );
+                                .collect::<Vec<_>>();
+                            assert_eq!(
+                                got, want,
+                                "{rep} chroma {w}x{h} @({x_int},{y_int}) frac=({x_frac},{y_frac})"
+                            );
+                        }
                     }
                 }
             }
         }
+    }
+
+    /// The `i16` mirror is a representation of the plane, not a second
+    /// plane: every block shape, origin and phase has to decode to the
+    /// same samples with it as without it, on every backend the host
+    /// offers.
+    ///
+    /// This is the direct guard on issue #427's change. The mirror moves
+    /// the horizontal-only and two-dimensional phases onto
+    /// `simd::filter_taps_narrow`, and it does so through a *borrowed*
+    /// window — so it exercises both `row_window_narrow`'s borrow and,
+    /// through the origins that straddle an edge, its `Clip3`
+    /// extension out of the mirror.
+    #[test]
+    fn a_mirrored_reference_plane_decodes_the_same_samples() {
+        let (pw, ph) = (96usize, 72usize);
+        let plane_samples = pseudo_random(11, pw * ph, 255);
+        let mirror: Vec<i16> = plane_samples.iter().map(|&s| s as i16).collect();
+        let wide = RefPlane::new(&plane_samples, pw, ph).unwrap();
+        let mirrored = RefPlane::with_narrow(&plane_samples, &mirror, pw, ph).unwrap();
+        for isa in simd::available_isas() {
+            for &(w, h) in &BLOCK_SHAPES {
+                for &(x_int, y_int) in &ORIGINS {
+                    for x_frac in 0..4 {
+                        for y_frac in 0..4 {
+                            let want = interp_luma_block_with(
+                                isa, &wide, x_int, y_int, x_frac, y_frac, w, h, 8,
+                            )
+                            .unwrap();
+                            let got = interp_luma_block_with(
+                                isa, &mirrored, x_int, y_int, x_frac, y_frac, w, h, 8,
+                            )
+                            .unwrap();
+                            assert_eq!(
+                                got, want,
+                                "{isa:?} luma {w}x{h} @({x_int},{y_int}) \
+                                 frac=({x_frac},{y_frac})"
+                            );
+                        }
+                    }
+                    for x_frac in 0..8 {
+                        for y_frac in 0..8 {
+                            let want = interp_chroma_block_with(
+                                isa, &wide, x_int, y_int, x_frac, y_frac, w, h, 8,
+                            )
+                            .unwrap();
+                            let got = interp_chroma_block_with(
+                                isa, &mirrored, x_int, y_int, x_frac, y_frac, w, h, 8,
+                            )
+                            .unwrap();
+                            assert_eq!(
+                                got, want,
+                                "{isa:?} chroma {w}x{h} @({x_int},{y_int}) \
+                                 frac=({x_frac},{y_frac})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// [`narrows`] routes on the plane representation, not only on the
+    /// phase: the horizontal-only and two-dimensional phases take the
+    /// 16-bit path exactly when the plane can hand them a borrowed
+    /// narrow window, and the conditions #404 established still hold.
+    #[test]
+    fn the_narrow_path_follows_the_plane_representation() {
+        let samples = pseudo_random(3, 32 * 32, 255);
+        let mirror: Vec<i16> = samples.iter().map(|&s| s as i16).collect();
+        let wide = RefPlane::new(&samples, 32, 32).unwrap();
+        let mirrored = RefPlane::with_narrow(&samples, &mirror, 32, 32).unwrap();
+        // Any vector backend the host offers; a scalar-only host has no
+        // narrow path to route at all and the last assertion below is
+        // then the whole answer.
+        let Some(isa) = simd::available_isas().into_iter().find(|&i| i != Isa::Scalar) else {
+            assert!(!narrows(Isa::Scalar, &mirrored, 8, 16, true, false));
+            return;
+        };
+
+        // Vertical-only gathers either way, so it narrows on both.
+        assert!(narrows(isa, &wide, 8, 16, false, true));
+        assert!(narrows(isa, &mirrored, 8, 16, false, true));
+        // Horizontal-only and two-dimensional only when the window is
+        // borrowed narrow.
+        assert!(!narrows(isa, &wide, 8, 16, true, false));
+        assert!(narrows(isa, &mirrored, 8, 16, true, false));
+        assert!(!narrows(isa, &wide, 8, 16, true, true));
+        assert!(narrows(isa, &mirrored, 8, 16, true, true));
+        // Full-pel has no tap accumulation to narrow.
+        assert!(!narrows(isa, &mirrored, 8, 16, false, false));
+        // The three conditions #404 established, unchanged: eight-bit
+        // content, a vector backend, and a row of at least eight.
+        assert!(!narrows(isa, &mirrored, 10, 16, true, false));
+        assert!(!narrows(Isa::Scalar, &mirrored, 8, 16, true, false));
+        assert!(!narrows(isa, &mirrored, 8, 4, true, false));
+    }
+
+    /// A mirror that does not describe the plane it is handed with is
+    /// rejected rather than silently interpolated from.
+    #[test]
+    fn a_mirror_of_the_wrong_length_is_rejected() {
+        let samples = vec![0i32; 16];
+        let short = vec![0i16; 15];
+        assert_eq!(
+            RefPlane::with_narrow(&samples, &short, 4, 4),
+            Err(InterPredError::PlaneLengthMismatch {
+                expected: 16,
+                got: 15,
+            })
+        );
     }
 
     #[test]
@@ -2454,6 +2576,13 @@ mod tests {
 
         let (pw, ph) = (256usize, 256usize);
         let plane_samples = pseudo_random(8, pw * ph, 255);
+        let mirror: Vec<i16> = plane_samples.iter().map(|&s| s as i16).collect();
+        // The two plane representations the phases are decided by: a
+        // reference picture out of the DPB carries the `i16` mirror and
+        // hands the narrow path borrowed windows, while one that does
+        // not (the §8.3.4 currPic snapshot, or the plane as issue #404
+        // left it) has to materialize them per block.
+        let mirrored = RefPlane::with_narrow(&plane_samples, &mirror, pw, ph).unwrap();
         let plane = RefPlane::new(&plane_samples, pw, ph).unwrap();
         let isa = simd::detected_isa();
         let rounds = 15;
@@ -2471,37 +2600,145 @@ mod tests {
 
         println!("\n8-tap luma interp_block, i32 vs i16 accumulation, {isa:?}, best of {rounds}");
         println!("  (equal total sample count at every block size)");
-        println!("  phase   block     i32 ms   i16 ms   narrow");
+        println!("  phase   block     i32 ms   i16 ms   narrow   i16 ms   narrow");
+        println!("                                     mirrored          copied");
         for (name, hk, vk) in cases {
             for &(w, h) in &[(8usize, 8usize), (16, 16), (32, 32), (64, 64)] {
                 let calls = (1 << 22) / (w * h);
-                let run = |narrow: bool| {
-                    interp_block_with_width::<8>(isa, &plane, 4, 4, hk, vk, w, h, 8, narrow)
+                let run = |p: &RefPlane<'_>, narrow: bool| {
+                    interp_block_with_width::<8>(isa, p, 4, 4, hk, vk, w, h, 8, narrow)
                 };
-                assert_eq!(run(false), run(true), "{name} arms disagree at {w}x{h}");
+                // Three arms, one answer: the plane representation must
+                // not move a decoded sample, only what it costs.
+                assert_eq!(
+                    run(&plane, false),
+                    run(&plane, true),
+                    "{name} arms disagree at {w}x{h}"
+                );
+                assert_eq!(
+                    run(&plane, false),
+                    run(&mirrored, true),
+                    "{name} mirrored arm disagrees at {w}x{h}"
+                );
 
-                let (mut bw, mut bn) = (f64::INFINITY, f64::INFINITY);
+                let (mut bw, mut bm, mut bc) = (f64::INFINITY, f64::INFINITY, f64::INFINITY);
                 for _ in 0..rounds {
                     let start = Instant::now();
                     for _ in 0..calls {
-                        std::hint::black_box(run(false));
+                        std::hint::black_box(run(&plane, false));
                     }
                     bw = bw.min(start.elapsed().as_secs_f64());
                     let start = Instant::now();
                     for _ in 0..calls {
-                        std::hint::black_box(run(true));
+                        std::hint::black_box(run(&mirrored, true));
                     }
-                    bn = bn.min(start.elapsed().as_secs_f64());
+                    bm = bm.min(start.elapsed().as_secs_f64());
+                    let start = Instant::now();
+                    for _ in 0..calls {
+                        std::hint::black_box(run(&plane, true));
+                    }
+                    bc = bc.min(start.elapsed().as_secs_f64());
                 }
                 println!(
-                    "  {name:>6}  {:>5}  {:9.2} {:8.2}  {:5.2}x",
+                    "  {name:>6}  {:>5}  {:9.2} {:8.2}  {:5.2}x {:8.2}  {:5.2}x",
                     format!("{w}x{h}"),
                     bw * 1e3,
-                    bn * 1e3,
-                    bw / bn
+                    bm * 1e3,
+                    bw / bm,
+                    bc * 1e3,
+                    bw / bc
                 );
             }
         }
+    }
+
+    /// What the `i16` mirror costs to build, against what a frame's
+    /// worth of §8.5.3.3.3 interpolation costs to run — the amortization
+    /// that decides whether issue #427's plane representation is worth
+    /// carrying at all.
+    ///
+    /// `measure_narrow_vs_wide_block` prices a *block* with the mirror
+    /// already there, which is what a block really gets: the mirror is
+    /// built once per picture on the way into the DPB
+    /// (`Picture::build_narrow_mirror`) and every prediction unit of
+    /// every picture that references it reads the same one. This prices
+    /// the build itself over one 1080p luma plane, and the horizontal
+    /// filtering of one frame's worth of prediction units beside it, so
+    /// the ratio between them is on the record rather than asserted.
+    ///
+    /// Ignored by default because it is a timing measurement, not an
+    /// assertion. Run it with
+    /// `cargo test --release --features native --lib
+    /// measure_narrow_mirror_amortization -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "benchmark; run with --ignored --nocapture"]
+    fn measure_narrow_mirror_amortization() {
+        use std::time::Instant;
+
+        let (pw, ph) = (1920usize, 1080usize);
+        let plane_samples = pseudo_random(8, pw * ph, 255);
+        let isa = simd::detected_isa();
+        let rounds = 15;
+
+        let mut build = f64::INFINITY;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            let mirror: Vec<i16> = plane_samples.iter().map(|&s| s as i16).collect();
+            std::hint::black_box(&mirror);
+            build = build.min(start.elapsed().as_secs_f64());
+        }
+
+        // One frame's worth of horizontal-only 16x16 luma units — the
+        // phase the mirror is carried for, at a size the measured mix
+        // puts a real share of its samples at.
+        let mirror: Vec<i16> = plane_samples.iter().map(|&s| s as i16).collect();
+        let mirrored = RefPlane::with_narrow(&plane_samples, &mirror, pw, ph).unwrap();
+        let plane = RefPlane::new(&plane_samples, pw, ph).unwrap();
+        let (bw, bh) = (16usize, 16usize);
+        let units = (pw / bw - 1) * (ph / bh - 1);
+        let frame = |p: &RefPlane<'_>, narrow: bool| {
+            let mut acc = 0i64;
+            for u in 0..units {
+                let (x, y) = ((u % (pw / bw - 1)) * bw, (u / (pw / bw - 1)) * bh);
+                let out = interp_block_with_width::<8>(
+                    isa,
+                    p,
+                    x as i32,
+                    y as i32,
+                    Some(&LUMA_FILTER[2]),
+                    None,
+                    bw,
+                    bh,
+                    8,
+                    narrow,
+                );
+                acc += i64::from(out[0]);
+            }
+            acc
+        };
+        assert_eq!(
+            frame(&plane, false),
+            frame(&mirrored, true),
+            "the mirrored arm changed the samples"
+        );
+        let (mut wide, mut narrow) = (f64::INFINITY, f64::INFINITY);
+        for _ in 0..rounds {
+            let start = Instant::now();
+            std::hint::black_box(frame(&plane, false));
+            wide = wide.min(start.elapsed().as_secs_f64());
+            let start = Instant::now();
+            std::hint::black_box(frame(&mirrored, true));
+            narrow = narrow.min(start.elapsed().as_secs_f64());
+        }
+        println!("\ni16 mirror amortization, {pw}x{ph}, {isa:?}, best of {rounds}");
+        println!("  build the mirror once            {:8.3} ms", build * 1e3);
+        println!("  one frame, h-only 16x16, i32     {:8.3} ms", wide * 1e3);
+        println!("  one frame, h-only 16x16, i16     {:8.3} ms", narrow * 1e3);
+        println!(
+            "  saved per frame                  {:8.3} ms  ({:.2}x the build)",
+            (wide - narrow) * 1e3,
+            (wide - narrow) / build
+        );
     }
 
     /// A/Bs the full-height `w x ( h + 7 )` intermediate the
