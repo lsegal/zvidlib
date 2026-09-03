@@ -832,6 +832,99 @@ Neither the decoded output nor any kernel changed in the course of this, so the
 sweep, the `hevc_inter_pred` ratio and the `inter_pred_filter` ms/frame rows
 above stand as re-measured.
 
+#### The plane representation behind that table, and what it costs
+
+The section above ends on a caller, so issue #427 asked the question the caller
+raises: `row_window` borrows the plane because the plane is `i32` and so are the
+taps. **If an eight-bit plane carried its samples as `i16`, `row_window` would
+borrow narrow, the materializing pass would not exist, and the two phases that
+lose to it should pick up what the vertical-only phase already shows.** That is
+issue #378's own first bullet — "decide whether the plane representation can be
+narrowed to `i16` for eight-bit content" — which #404 answered only at the
+kernel boundary.
+
+**The premise is right.** `RefPlane` now takes an optional `i16` mirror of the
+plane it wraps (`RefPlane::with_narrow`), and `row_window_narrow` borrows out of
+it exactly as `row_window` borrows out of the `i32` samples.
+`measure_narrow_vs_wide_block` grew a third arm so the two representations are
+timed against the same `i32` baseline in one interleaved process, all three
+asserted equal sample-for-sample first. On an **Intel Core i9-10850K
+(Windows, AVX2, `rustc 1.98.0`)**, best of fifteen rounds:
+
+| Phase | 8x8 | 16x16 | 32x32 | 64x64 |
+| --- | ---: | ---: | ---: | ---: |
+| horizontal-only, mirrored plane | 0.88x | 0.95x | **1.18x** | **1.27x** |
+| horizontal-only, copied per block (#404) | 0.76x | 0.80x | 0.90x | 0.93x |
+| vertical-only, mirrored plane | 1.01x | 1.14x | 1.19x | 1.36x |
+| vertical-only, `gather` narrowed (#404) | 0.99x | 1.09x | 1.13x | 1.12x |
+| two-dimensional, mirrored plane | 0.92x | 0.97x | 1.09x | 1.12x |
+| two-dimensional, copied per block (#404) | 0.81x | 0.85x | 0.93x | 0.96x |
+
+The horizontal-only row moves from 0.90x / 0.93x to **1.18x / 1.27x** at the two
+sizes carrying 93% of a decode's interpolated luma samples, with no kernel
+touched and no decoded sample moved: same block walk, same
+`simd::filter_taps_narrow`, one representation of the source instead of the
+other. The two-dimensional row moves too but less, for the reason #404 already
+gave — only its horizontal pass can narrow. Even the vertical-only row picks up
+a little, because `gather_narrow` becomes an `i16`-to-`i16` row copy rather than
+a converting one.
+
+**And the mirror costs more than that is worth.** It has to be written, once per
+picture, and every decoded picture is stored as a short-term reference, so the
+accounting is one write against one frame of interpolation.
+`measure_narrow_mirror_amortization` takes both halves over a 1080p luma plane
+on the same host: a frame's worth of prediction units at the measured
+`INTER_PU_MIX` size mix (62.1% of samples at 64x64, 31.1% at 32x32) walking all
+sixteen Table 8-8 phase combinations in turn.
+
+| | ms |
+| --- | ---: |
+| write the mirror (fresh `Vec`) | 1.291 |
+| write it into a buffer that already exists | 0.527 |
+| one frame of interpolation, `i32` planes | 4.229 |
+| one frame of interpolation, mirrored planes | 3.910 |
+| **saved per frame** | **0.319** |
+
+**0.527 ms spent to save 0.319 ms**, and 0.527 ms is the floor — a fresh
+four-megabyte `Vec` faulted in a page at a time reads 1.291 ms, and only a
+recycled picture buffer would reach the lower figure. Charged once per frame the
+representation reads **0.95x at its floor and 0.81x as it would actually be
+allocated**, against a plane set that is already 50% larger in memory for
+carrying two representations of every eight-bit sample. The luma figures are the
+favourable half, too: mirroring the chroma planes adds another half a luma
+plane's worth of writing for a 4-tap filter on quarter-sized blocks.
+
+The saving is small for a reason the table above predicts rather than
+contradicts. Uniformly over Table 8-8, three of sixteen phase combinations are
+horizontal-only, three vertical-only (which already narrowed), nine
+two-dimensional (which gains about a tenth) and one full-pel (which does not
+filter). Weighting the per-phase ratios by that gives about 8% of the
+interpolation, which is the 0.319 ms measured — the mirror's best case is
+one plane-sized pass short of paying for itself.
+
+**So the decoder keeps its `i32` planes and `narrows` keeps #404's routing.**
+`RefPlane::with_narrow` is `#[cfg(test)]` apparatus, as `measure_2d_ring_vs_flat`
+keeps the ring arm and #420 keeps its five rect kernels, so the table above stays
+reproducible after the decision it justifies; `narrows` names the condition that
+separates the phases — whether the window arrives narrow without a pass — rather
+than naming the phases, so what was measured is what the code says. Nothing in
+`benches/` changes: no dispatch site moved and no decoded sample moved, which
+`the_eight_bit_block_path_matches_the_per_sample_equations` now checks over
+*both* plane representations against the normative per-sample equations, and
+`a_mirrored_reference_plane_decodes_the_same_samples` checks over every block
+shape, origin, phase and backend.
+
+The remaining way to get the borrow is to make `i16` the plane's **sole**
+representation for eight-bit content rather than a second one, which removes the
+pass and the memory together. That is not this issue's question — #427 asked for
+it "without duplicating the plane type or disturbing the higher-bit-depth
+paths", and `Picture` would have to become an enum over sample width that every
+§8 consumer of `Picture::plane() -> &[i32]` resolves, with the deblocking, SAO,
+residual-add and output-conversion paths all reading through it. The measurement
+above is what would justify opening that: **0.319 ms per 1080p frame of
+interpolation, out of a stage that is about 27% of decode proper**, and no
+conversion cost against it.
+
 Sample-weighting the sweep predicts 1.07x for the measured mix, and the rebuilt
 group measures **1.09x against the old grid's 1.25x** on this host on the same
 day (24.449 / 22.433 ms against 25.713 / 20.494 ms, minimum of four interleaved
