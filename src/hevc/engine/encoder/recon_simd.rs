@@ -568,15 +568,55 @@ pub(crate) fn band_offset_rect(
         src.len() >= (height - 1) * src_stride + width,
         "source rectangle runs past the plane"
     );
-    // Every instruction set resolves to the scalar reference: the once-per-CTB
-    // shape was measured against it and is a regression, worse on Zen 5 than
-    // the once-per-row shape it was meant to repair. See above.
-    for y in 0..height {
-        band_offset_row_scalar(
-            &here[y * here_stride..y * here_stride + width],
-            &src[y * src_stride..y * src_stride + width],
-            stats,
-        );
+    match isa_code() {
+        #[cfg(target_arch = "x86_64")]
+        ISA_AVX2 => {
+            let mut narrow = NarrowBandStats::default();
+            // SAFETY: the rectangle lies inside both planes, asserted above, and
+            // this arm is only reachable with AVX2 available.
+            unsafe {
+                x86::band_offset_rect_avx2_narrow(
+                    here,
+                    here_stride,
+                    src,
+                    src_stride,
+                    width,
+                    height,
+                    &mut narrow,
+                );
+            }
+            narrow.fold_into(stats);
+        }
+        #[cfg(target_arch = "x86_64")]
+        ISA_SSE41 => {
+            let mut narrow = NarrowBandStats::default();
+            // SAFETY: as above, with SSE4.1 detected.
+            unsafe {
+                x86::band_offset_rect_sse41_narrow(
+                    here,
+                    here_stride,
+                    src,
+                    src_stride,
+                    width,
+                    height,
+                    &mut narrow,
+                );
+            }
+            narrow.fold_into(stats);
+        }
+        // The scalar arm keeps the once-per-row reference exactly as it was, so
+        // it stays the control the paired branch-against-base method reads
+        // 1.00x from: a control that changed with the branch would answer
+        // nothing.
+        _ => {
+            for y in 0..height {
+                band_offset_row_scalar(
+                    &here[y * here_stride..y * here_stride + width],
+                    &src[y * src_stride..y * src_stride + width],
+                    stats,
+                );
+            }
+        }
     }
 }
 
@@ -591,12 +631,124 @@ pub(crate) fn band_offset_row_scalar(here: &[i32], src: &[u8], stats: &mut BandS
     }
 }
 
+/// The 32-band histogram of one CTB at the width a CTB actually needs, split
+/// across [`NARROW_SETS`] partial accumulator sets.
+///
+/// # Why this is narrower than [`BandStats`]
+///
+/// [`BandStats`] is two `[i64; 32]` arrays — 512 bytes, zeroed once per CTB per
+/// component, written by every classified sample and re-read by all 32 candidate
+/// band positions. None of that width is reachable. A CTB here is 16x16 luma or
+/// 8x8 chroma, so at most 256 samples; §8.7.3.2 takes the error against the
+/// unclamped reconstruction, and the reconstruction the encoder hands this
+/// module is a clipped sample, so a band's sum is bounded by `256 · 255` and its
+/// count by 256. `i32` sums and `u16` counts hold that with four orders of
+/// magnitude to spare, at 192 bytes per set rather than 512.
+///
+/// # Why it is split
+///
+/// The scatter's cost is not the arithmetic, it is that consecutive samples
+/// landing in the same band form a dependent read-modify-write chain through one
+/// accumulator, and a CTB's samples are spatially coherent so they *do* land in
+/// the same band — the occupancy measurement in `tests/sao_band_occupancy.rs`
+/// reads a mean of 6.4 distinct bands per 256-sample CTB on real video. Two
+/// interleaved sets let two such chains run at once and are folded together at
+/// the end of the CTB, which costs 32 pairs of adds once rather than per row.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NarrowBandStats {
+    /// Summed `source − reconstruction` error per band, per partial set.
+    pub sums: [[i32; 32]; NARROW_SETS],
+    /// Number of samples per band, per partial set.
+    pub counts: [[u16; 32]; NARROW_SETS],
+}
+
+/// How many partial accumulator sets [`NarrowBandStats`] splits its histogram
+/// across.
+///
+/// Two, not four: the fold is 32 pairs of adds per set per CTB, which a 64-sample
+/// chroma CTB pays over a quarter of the samples a luma one does, so a third and
+/// fourth set cost more fold than they buy chain. Two sets at 384 bytes are still
+/// below the 512 [`BandStats`] zeroes for the same CTB.
+pub(crate) const NARROW_SETS: usize = 2;
+
+impl Default for NarrowBandStats {
+    fn default() -> Self {
+        Self {
+            sums: [[0; 32]; NARROW_SETS],
+            counts: [[0; 32]; NARROW_SETS],
+        }
+    }
+}
+
+impl NarrowBandStats {
+    /// Folds the partial sets together and widens them into `stats`, adding to
+    /// whatever it already holds the way the row kernels do.
+    ///
+    /// Called once per CTB per component, so the 32 widening adds are amortized
+    /// over the rectangle rather than paid per row.
+    pub(crate) fn fold_into(&self, stats: &mut BandStats) {
+        for band in 0..32 {
+            let mut sum = 0i64;
+            let mut count = 0i64;
+            for set in 0..NARROW_SETS {
+                sum += i64::from(self.sums[set][band]);
+                count += i64::from(self.counts[set][band]);
+            }
+            stats.sums[band] += sum;
+            stats.counts[band] += count;
+        }
+    }
+}
+
+/// The portable narrow control: [`band_offset_rect`]'s classification and
+/// scatter with nothing vectorized, accumulating into [`NarrowBandStats`].
+///
+/// This exists so the measurement can separate *narrowing and splitting the
+/// accumulators* from *classifying in the vector unit*. The x86 narrow kernels
+/// below do both at once, and #340 and #382 between them have already shown that
+/// attributing a band-search result to the wrong half of a kernel costs an issue
+/// to undo.
+pub(crate) fn band_offset_rect_narrow_scalar(
+    here: &[i32],
+    here_stride: usize,
+    src: &[u8],
+    src_stride: usize,
+    width: usize,
+    height: usize,
+    narrow: &mut NarrowBandStats,
+) {
+    for y in 0..height {
+        let recon_row = &here[y * here_stride..y * here_stride + width];
+        let src_row = &src[y * src_stride..y * src_stride + width];
+        let mut i = 0;
+        // Two samples at a time into two accumulator sets, so neighbours that
+        // share a band do not serialize on one slot.
+        while i + 2 <= width {
+            for set in 0..2 {
+                let recon = recon_row[i + set];
+                let band = (recon.clamp(0, BIT_DEPTH_MAX) >> BAND_SHIFT) as usize;
+                narrow.sums[set][band] += i32::from(src_row[i + set]) - recon;
+                narrow.counts[set][band] += 1;
+            }
+            i += 2;
+        }
+        for j in i..width {
+            let recon = recon_row[j];
+            let band = (recon.clamp(0, BIT_DEPTH_MAX) >> BAND_SHIFT) as usize;
+            narrow.sums[0][band] += i32::from(src_row[j]) - recon;
+            narrow.counts[0][band] += 1;
+        }
+    }
+}
+
 /// The `edgeIdx` values that map to categories 1, 2, 3 and 4, in that order.
 const EDGE_IDX_BY_CATEGORY: [i32; 4] = [0, 1, 3, 4];
 
 #[cfg(target_arch = "x86_64")]
 mod x86 {
-    use super::{BAND_SHIFT, BIT_DEPTH_MAX, BandStats, EDGE_IDX_BY_CATEGORY, EdgeStats};
+    use super::{
+        BAND_SHIFT, BIT_DEPTH_MAX, BandStats, EDGE_IDX_BY_CATEGORY, EdgeStats, NarrowBandStats,
+    };
     use std::arch::x86_64::*;
 
     /// Sum of the four `i32` lanes.
@@ -1011,6 +1163,295 @@ mod x86 {
                 let source = &src[y * src_stride..y * src_stride + width];
                 band_offset_row_sse41_lanes(recon, source, stats);
             }
+        }
+    }
+
+    /// Candidate C on AVX2: one CTB classified in the vector unit and scattered
+    /// into [`NarrowBandStats`] rather than into two `[i64; 32]` arrays.
+    ///
+    /// This is the decomposition #382 named as untested and #406 asked for. The
+    /// body is [`band_offset_row_avx2_lanes`]'s classification and lane scatter
+    /// unchanged — that is deliberate, so the measurement separates the
+    /// accumulator from the kernel rather than from a second kernel. What
+    /// changes is everything the scatter touches: `i32` sums and `u16` counts
+    /// instead of `i64` pairs, two interleaved partial sets instead of one, and
+    /// a fold paid once for the rectangle instead of a reload per row.
+    ///
+    /// The eight lanes alternate between the two sets in pairs, which is what
+    /// splits the dependency chain: lanes 0,1,4,5 into set 0 and 2,3,6,7 into
+    /// set 1, so two runs of same-band neighbours accumulate independently.
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn band_offset_rect_avx2_narrow(
+        here: &[i32],
+        here_stride: usize,
+        src: &[u8],
+        src_stride: usize,
+        width: usize,
+        height: usize,
+        narrow: &mut NarrowBandStats,
+    ) {
+        unsafe {
+            for y in 0..height {
+                let recon = &here[y * here_stride..y * here_stride + width];
+                let source = &src[y * src_stride..y * src_stride + width];
+                let mut i = 0;
+                while i + 8 <= width {
+                    let (band, err) = band_classify8_avx2(recon.as_ptr().add(i), source.as_ptr().add(i));
+                    let lo_b = _mm256_castsi256_si128(band);
+                    let hi_b = _mm256_extracti128_si256(band, 1);
+                    let lo_e = _mm256_castsi256_si128(err);
+                    let hi_e = _mm256_extracti128_si256(err, 1);
+                    macro_rules! scatter {
+                        ($b:expr, $e:expr, $k:literal, $set:literal) => {{
+                            let idx = _mm_extract_epi32::<$k>($b) as usize;
+                            narrow.sums[$set][idx] += _mm_extract_epi32::<$k>($e);
+                            narrow.counts[$set][idx] += 1;
+                        }};
+                    }
+                    scatter!(lo_b, lo_e, 0, 0);
+                    scatter!(lo_b, lo_e, 1, 0);
+                    scatter!(lo_b, lo_e, 2, 1);
+                    scatter!(lo_b, lo_e, 3, 1);
+                    scatter!(hi_b, hi_e, 0, 0);
+                    scatter!(hi_b, hi_e, 1, 0);
+                    scatter!(hi_b, hi_e, 2, 1);
+                    scatter!(hi_b, hi_e, 3, 1);
+                    i += 8;
+                }
+                for j in i..width {
+                    let r = recon[j];
+                    let b = (r.clamp(0, BIT_DEPTH_MAX) >> BAND_SHIFT) as usize;
+                    narrow.sums[0][b] += i32::from(source[j]) - r;
+                    narrow.counts[0][b] += 1;
+                }
+            }
+        }
+    }
+
+    /// [`band_offset_rect_avx2_narrow`] at four lanes.
+    ///
+    /// Four lanes split two-and-two across the same two accumulator sets, so a
+    /// CTB row narrower than eight samples — every chroma row of an 8x8 chroma
+    /// CTB is exactly eight, but a picture edge can be narrower — still reaches
+    /// a vector arm rather than dropping to the tail loop.
+    #[target_feature(enable = "sse4.1")]
+    pub(super) unsafe fn band_offset_rect_sse41_narrow(
+        here: &[i32],
+        here_stride: usize,
+        src: &[u8],
+        src_stride: usize,
+        width: usize,
+        height: usize,
+        narrow: &mut NarrowBandStats,
+    ) {
+        unsafe {
+            for y in 0..height {
+                let recon = &here[y * here_stride..y * here_stride + width];
+                let source = &src[y * src_stride..y * src_stride + width];
+                let mut i = 0;
+                while i + 4 <= width {
+                    let (band, err) =
+                        band_classify4_sse41(recon.as_ptr().add(i), source.as_ptr().add(i));
+                    macro_rules! scatter {
+                        ($k:literal, $set:literal) => {{
+                            let idx = _mm_extract_epi32::<$k>(band) as usize;
+                            narrow.sums[$set][idx] += _mm_extract_epi32::<$k>(err);
+                            narrow.counts[$set][idx] += 1;
+                        }};
+                    }
+                    scatter!(0, 0);
+                    scatter!(1, 0);
+                    scatter!(2, 1);
+                    scatter!(3, 1);
+                    i += 4;
+                }
+                for j in i..width {
+                    let r = recon[j];
+                    let b = (r.clamp(0, BIT_DEPTH_MAX) >> BAND_SHIFT) as usize;
+                    narrow.sums[0][b] += i32::from(source[j]) - r;
+                    narrow.counts[0][b] += 1;
+                }
+            }
+        }
+    }
+
+    /// Repeats a block once per transposed accumulator slot with `$j` bound to
+    /// each index in turn.
+    ///
+    /// The unroll is what keeps the eight accumulators eight separate values
+    /// rather than an addressable array: a loop over `0..TRANSPOSED_BANDS` would
+    /// force `acc` and `cnt` to the stack, which is the memory histogram this
+    /// whole shape exists to avoid.
+    macro_rules! seq_bands {
+        ($j:ident => $body:block) => {{
+            {
+                let $j = 0usize;
+                $body
+            }
+            {
+                let $j = 1usize;
+                $body
+            }
+            {
+                let $j = 2usize;
+                $body
+            }
+            {
+                let $j = 3usize;
+                $body
+            }
+            {
+                let $j = 4usize;
+                $body
+            }
+            {
+                let $j = 5usize;
+                $body
+            }
+            {
+                let $j = 6usize;
+                $body
+            }
+            {
+                let $j = 7usize;
+                $body
+            }
+        }};
+    }
+
+    /// How many consecutive bands [`band_offset_rect_avx2_transposed`] will
+    /// handle without touching a memory histogram at all.
+    ///
+    /// Eight, because eight `i32` sum accumulators and eight `i32` count
+    /// accumulators are sixteen `ymm` registers — the whole AVX2 register file —
+    /// and the classification needs three more, so eight is already the width at
+    /// which the "register-resident" claim starts costing spills. A CTB whose
+    /// band range is wider falls back to [`band_offset_rect_avx2_narrow`].
+    const TRANSPOSED_BANDS: usize = 8;
+
+    /// Candidate D on AVX2: the transposed formulation, with the histogram in
+    /// registers and no scatter at all.
+    ///
+    /// Instead of one pass that scatters each sample into its band, this makes
+    /// one masked pass *per band*: for band `b`, `acc_b += err & (band == b)` and
+    /// `cnt_b -= (band == b)`, with `acc_b` and `cnt_b` living in `ymm`
+    /// registers across the whole CTB and reduced horizontally once at the end.
+    /// There is no read-modify-write chain and no memory histogram — which is
+    /// exactly the thing every previous candidate kept.
+    ///
+    /// # It is only affordable over the bands a CTB actually occupies
+    ///
+    /// A pass per band over all 32 bands costs four vector operations per band
+    /// per eight samples — 16 operations per sample against the scalar
+    /// reference's four — so it can only win by visiting far fewer than 32. What
+    /// bounds that cheaply is the *range* `max − min + 1` of the CTB's band
+    /// indices, since a vector min/max over the clamped reconstruction is two
+    /// operations per sample, where the set of distinct occupied bands is not
+    /// derivable at any price the pass can pay.
+    ///
+    /// `tests/sao_band_occupancy.rs` measured that range before this kernel was
+    /// written. It is small on video — 38.4% of 168,840 CTBs of the bundled
+    /// 1080p sample occupy 4 bands or fewer and 68.6% occupy 8 or fewer — and it
+    /// is *not* small on the synthetic content the encoder groups search, whose
+    /// luma wraps a gradient at `& 0xff` and so spans a mean range of 15.5 with
+    /// nothing at all below 8. Its chroma is the opposite, at a range of 3.4
+    /// everywhere. See [`super::band_offset_rect`] for what that asymmetry did
+    /// to the result.
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn band_offset_rect_avx2_transposed(
+        here: &[i32],
+        here_stride: usize,
+        src: &[u8],
+        src_stride: usize,
+        width: usize,
+        height: usize,
+        narrow: &mut NarrowBandStats,
+    ) {
+        unsafe {
+            // The min/max pre-pass. Two operations per sample, and the only
+            // thing that can make the per-band passes below affordable.
+            let (mut lo, mut hi) = (BIT_DEPTH_MAX, 0i32);
+            for y in 0..height {
+                let recon = &here[y * here_stride..y * here_stride + width];
+                let mut i = 0;
+                let mut vlo = _mm256_set1_epi32(BIT_DEPTH_MAX);
+                let mut vhi = _mm256_setzero_si256();
+                while i + 8 <= width {
+                    let r = _mm256_loadu_si256(recon.as_ptr().add(i).cast());
+                    let c = _mm256_min_epi32(
+                        _mm256_max_epi32(r, _mm256_setzero_si256()),
+                        _mm256_set1_epi32(BIT_DEPTH_MAX),
+                    );
+                    vlo = _mm256_min_epi32(vlo, c);
+                    vhi = _mm256_max_epi32(vhi, c);
+                    i += 8;
+                }
+                let mut lanes = [0i32; 8];
+                _mm256_storeu_si256(lanes.as_mut_ptr().cast(), vlo);
+                lo = lo.min(lanes.iter().copied().min().unwrap_or(BIT_DEPTH_MAX));
+                _mm256_storeu_si256(lanes.as_mut_ptr().cast(), vhi);
+                hi = hi.max(lanes.iter().copied().max().unwrap_or(0));
+                for &r in &recon[i..] {
+                    let c = r.clamp(0, BIT_DEPTH_MAX);
+                    lo = lo.min(c);
+                    hi = hi.max(c);
+                }
+            }
+            let (first, last) = ((lo >> BAND_SHIFT) as usize, (hi >> BAND_SHIFT) as usize);
+            if last + 1 - first > TRANSPOSED_BANDS || width < 8 {
+                // Wider than the register file, or too narrow for a full vector:
+                // the scatter is the cheaper shape and this pre-pass is what it
+                // cost to find that out.
+                band_offset_rect_avx2_narrow(
+                    here, here_stride, src, src_stride, width, height, narrow,
+                );
+                return;
+            }
+
+            // Eight sum and eight count accumulators, held across the whole
+            // rectangle. Band `first + j` accumulates into slot `j`.
+            let mut acc = [_mm256_setzero_si256(); TRANSPOSED_BANDS];
+            let mut cnt = [_mm256_setzero_si256(); TRANSPOSED_BANDS];
+            for y in 0..height {
+                let recon = &here[y * here_stride..y * here_stride + width];
+                let source = &src[y * src_stride..y * src_stride + width];
+                let mut i = 0;
+                while i + 8 <= width {
+                    let (band, err) =
+                        band_classify8_avx2(recon.as_ptr().add(i), source.as_ptr().add(i));
+                    // Unrolled over the fixed accumulator count so the indices
+                    // stay compile-time constants and the arrays stay in
+                    // registers rather than becoming an addressable histogram.
+                    seq_bands!(j => {
+                        let mask =
+                            _mm256_cmpeq_epi32(band, _mm256_set1_epi32((first + j) as i32));
+                        acc[j] = _mm256_add_epi32(acc[j], _mm256_and_si256(err, mask));
+                        cnt[j] = _mm256_sub_epi32(cnt[j], mask);
+                    });
+                    i += 8;
+                }
+                // The row remainder is the one thing this shape still scatters,
+                // and it is at most seven samples of a CTB row.
+                for j in i..width {
+                    let r = recon[j];
+                    let b = (r.clamp(0, BIT_DEPTH_MAX) >> BAND_SHIFT) as usize;
+                    narrow.sums[0][b] += i32::from(source[j]) - r;
+                    narrow.counts[0][b] += 1;
+                }
+            }
+            // One horizontal reduction per occupied band, once for the CTB.
+            seq_bands!(j => {
+                if first + j <= last {
+                    narrow.sums[1][first + j] += hsum_epi32(_mm_add_epi32(
+                        _mm256_castsi256_si128(acc[j]),
+                        _mm256_extracti128_si256(acc[j], 1),
+                    ));
+                    narrow.counts[1][first + j] += hsum_epi32(_mm_add_epi32(
+                        _mm256_castsi256_si128(cnt[j]),
+                        _mm256_extracti128_si256(cnt[j], 1),
+                    )) as u16;
+                }
+            });
         }
     }
 
@@ -1553,6 +1994,127 @@ mod tests {
             }
         }
     }
+
+    /// The same fixture as [`band_rect_fixture`] over a deliberately narrow band
+    /// range, so [`x86::band_offset_rect_avx2_transposed`]'s register-resident
+    /// path is actually taken rather than falling straight back to the scatter.
+    ///
+    /// `span` is how many consecutive bands the reconstruction occupies. The
+    /// fixture above spans all 32, which is a fallback every time and would
+    /// leave the transposed body untested.
+    fn narrow_band_rect_fixture(
+        width: usize,
+        height: usize,
+        span: i32,
+    ) -> (Vec<i32>, Vec<u8>, BandStats) {
+        const STRIDE: usize = BAND_RECT_STRIDE;
+        let mut here = samples(0x4242_9999_1111_7777, STRIDE * height);
+        for (i, value) in here.iter_mut().enumerate() {
+            // Bands `10..10 + span`, which is neither at the bottom of the range
+            // nor wrapping it.
+            *value = 80 + (i as i32 * 5) % (span * 8);
+        }
+        let src = bytes(0xfeed_face_dead_beef, STRIDE * height);
+        let mut expected = BandStats::default();
+        for y in 0..height {
+            band_offset_row_scalar(
+                &here[y * STRIDE..y * STRIDE + width],
+                &src[y * STRIDE..y * STRIDE + width],
+                &mut expected,
+            );
+        }
+        (here, src, expected)
+    }
+
+    /// The narrow-accumulator candidates #406 asked for have to give the
+    /// row-by-row answer over every rectangle, on every instruction set the host
+    /// offers, at both ends of the band-range switch the transposed one makes.
+    ///
+    /// This is the guard the acceptance criterion names. It covers three things
+    /// the dispatch test alone would not: the transposed kernel, which is not
+    /// dispatched to; the register-resident path of it, which only a narrow band
+    /// range reaches; and the fold out of [`NarrowBandStats`], which is where a
+    /// too-narrow accumulator would show up as a wrong total rather than as a
+    /// crash.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_x86_narrow_band_rect_kernels_match_the_row_reference() {
+        const STRIDE: usize = BAND_RECT_STRIDE;
+        // `None` is the full-range fixture; `Some(span)` occupies `span`
+        // consecutive bands, which is what selects the transposed kernel's
+        // register-resident path over its fallback.
+        let fixtures: &[Option<i32>] = &[None, Some(1), Some(2), Some(4), Some(8), Some(9)];
+        for &(width, height) in BAND_RECTS {
+            for &span in fixtures {
+                let (here, src, expected) = match span {
+                    None => band_rect_fixture(width, height),
+                    Some(span) => narrow_band_rect_fixture(width, height, span),
+                };
+                let label = match span {
+                    None => "full range".to_string(),
+                    Some(span) => format!("{span}-band range"),
+                };
+
+                // The portable narrow control, which every host runs.
+                let mut narrow = NarrowBandStats::default();
+                band_offset_rect_narrow_scalar(
+                    &here, STRIDE, &src, STRIDE, width, height, &mut narrow,
+                );
+                let mut got = BandStats::default();
+                narrow.fold_into(&mut got);
+                assert_eq!(got, expected, "narrow scalar {width}x{height}, {label}");
+
+                if is_x86_feature_detected!("sse4.1") {
+                    let mut narrow = NarrowBandStats::default();
+                    // SAFETY: SSE4.1 is detected, and the rectangle lies inside
+                    // both planes.
+                    unsafe {
+                        x86::band_offset_rect_sse41_narrow(
+                            &here, STRIDE, &src, STRIDE, width, height, &mut narrow,
+                        );
+                    }
+                    let mut got = BandStats::default();
+                    narrow.fold_into(&mut got);
+                    assert_eq!(got, expected, "sse4.1 narrow {width}x{height}, {label}");
+                }
+                if is_x86_feature_detected!("avx2") {
+                    for (name, kernel) in [
+                        (
+                            "avx2 narrow",
+                            x86::band_offset_rect_avx2_narrow as NarrowRectKernel,
+                        ),
+                        (
+                            "avx2 transposed",
+                            x86::band_offset_rect_avx2_transposed as NarrowRectKernel,
+                        ),
+                    ] {
+                        let mut narrow = NarrowBandStats::default();
+                        // SAFETY: AVX2 is detected, and the rectangle lies
+                        // inside both planes.
+                        unsafe {
+                            kernel(&here, STRIDE, &src, STRIDE, width, height, &mut narrow);
+                        }
+                        let mut got = BandStats::default();
+                        narrow.fold_into(&mut got);
+                        assert_eq!(got, expected, "{name} {width}x{height}, {label}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The narrow once-per-CTB kernels, as a function pointer so the candidates
+    /// can be held in one list.
+    #[cfg(target_arch = "x86_64")]
+    type NarrowRectKernel = unsafe fn(
+        &[i32],
+        usize,
+        &[u8],
+        usize,
+        usize,
+        usize,
+        &mut NarrowBandStats,
+    );
 
     #[test]
     fn the_band_offset_search_matches_the_scalar_reference_on_every_instruction_set() {
