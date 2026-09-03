@@ -1289,6 +1289,14 @@ the Apple M1 table in answer, so both tables are clean today: each is stamped at
 a commit carrying the same eleven sites the crate has now, and the report flags
 nothing.
 
+Reporting nothing is not the same as being current, and the x86_64 table is
+where that showed. It was clean by this check for its whole life — no site
+landed under it — while four repairs to kernels behind sites that already
+existed moved six of its rows anyway, which is what #393 re-drew it for. This
+check answers "does a row name a site that did not exist yet"; it cannot answer
+"did the kernel behind an existing site change", because that needs the commit
+built rather than read.
+
 Three things about how it reads the site set are worth stating, because each is
 a place a more obvious implementation does not work:
 
@@ -1315,7 +1323,8 @@ It answers the site-set half of what can go stale. The `Vectorized` column in
 it is not checked here: a site can exist and still resolve to the scalar
 reference on every arm — `hevc_recon` does — so "is there a dispatch site" and
 "is there a vector kernel" are different questions, and only the first can be
-answered from a commit that is not built.
+answered from a commit that is not built. "Is it the *same* vector kernel" is a
+third, and the one the x86_64 re-draw above turned on.
 
 ### One group name, two targets, and the row that moved for nothing
 
@@ -1349,8 +1358,8 @@ rounds, on the three that landed on the AMD EPYC 7763, the two groups are:
 | `codec.rs`, collected | 21.506 ms | 3.974 ms | 3.424 ms |
 | `av1_decode.rs`, overwritten | 27.290 ms | 3.974 ms | 3.403 ms |
 
-so the 21.506 ms in the table below and the 26.956 ms #393 measured are two
-different benchmarks, not one benchmark two months apart.
+so the 21.506 ms the superseded table carried and the 26.956 ms in the x86_64
+table below are two different benchmarks, not one benchmark two months apart.
 
 Nothing in the range between the stamps moves the arm. Bisecting it needs a step
 comparable to every other step, which the recipe above cannot give — a round is
@@ -1363,17 +1372,14 @@ ratio: **0.977x to 1.000x, every step**, the later commit never slower. A
 paired ratio is immune to which model the step landed on, which is what makes
 nine of them comparable without dispatching a lottery per step.
 
-**Neither committed table has a row for both groups, and which one is missing
-differs between them.** `codec.rs`'s group is now `av1_deblock_luma`, pairing
-with the `av1_deblock_chroma` it is the luma half of, and `av1_decode.rs` keeps
-`av1_deblock` as the narrow-filter member of its deblocking trio — the name the
-recipe's own target order already resolves to. The x86_64 table below collected
-`codec.rs`'s side, so its row is renamed with its numbers untouched and it has
-no `av1_deblock` row; the aarch64 table collected `av1_decode.rs`'s side (#390
-drew it over `codec`, `av1_decode`, ... in the recipe's order), so its
-`av1_deblock` row stands as measured and it has no `av1_deblock_luma` row. Each
-gains its missing row at its next draw. No ratio in either table changes, and no
-row is wrong now that it names the group it was measured from.
+**Neither committed table has a row for both groups.** `codec.rs`'s group is now
+`av1_deblock_luma`, pairing with the `av1_deblock_chroma` it is the luma half
+of, and `av1_decode.rs` keeps `av1_deblock` as the narrow-filter member of its
+deblocking trio, the name the recipe's own target order already resolves to.
+Both tables below were drawn in that order and so collected `av1_decode.rs`'s
+side: each carries an `av1_deblock` row as measured and neither has an
+`av1_deblock_luma` row. Each gains it at its next draw. No ratio in either table
+is wrong now that it names the group it was measured from.
 
 `no_two_bench_targets_register_the_same_group_name` in
 `tests/bench_group_names_are_unique.rs` keeps it fixed, in the `Rust checks`
@@ -1594,168 +1600,170 @@ Measured on a GitHub `ubuntu-latest` runner rather than on this project's
 development machine, because no aarch64 host can produce these columns at all.
 The rounds ran with `ZVIDLIB_BENCH_LARGE=1` and the elementwise minimum was
 taken across three of them, exactly as the recipe above describes — the same
-recipe the Apple M1 table above is drawn with, so the `_1080p` rows are now on
-both.
+recipe the Apple M1 table above is drawn with, so the `_1080p` rows are on both.
 
 GitHub's `ubuntu-latest` pool is not uniform, so the CPU model is checked before
 a round is used: an elementwise minimum taken across different CPU models is
 attributable to no named host, and the whole point of naming one is that the
 numbers are not interchangeable. Six rounds were dispatched at once so that
-three sharing a model could be selected afterwards; the rounds that landed on an
-Intel Xeon 6973P-C, an Intel Xeon Platinum 8573C and an AMD EPYC 9V74 80-Core
-were measured and discarded. Every merged round logged `scalar`, `sse4.1` and
-`avx2` in its `# host instruction sets:` line, and `# dispatch site av1_simd:
-avx2` in its per-site log.
-
-This table replaces the one #261 recorded at `e115506f8bf6` on an AMD EPYC 9V74.
-That draw predates the codegen repair in #337 (issue #336), so every `av1_*` row
-in it timed `av1_simd` kernels whose `#[target_feature]` wrappers had degenerated
-into tail calls to baseline-instruction-set copies — each intrinsic an
-out-of-line `core_arch` call with its operand spilled to the stack. It recorded
-`av1_deblock_wide` at 0.13x under `avx2` and `av1_forward_flipadst_16x16` at
-0.20x. Those figures described the compiler's output, not the kernels, and the
-kernels they described no longer exist.
-
-That draw is older than its date suggests in one further way. `e115506f8bf6` is
-a checkpoint commit on the #257 branch, and its merge base with `main` is
-`b9995b1` (#254) — so it does not contain `f695a1a`, the #222 merge, even though
-#222 landed on `main` fifty minutes before the checkpoint was written. That is
-the whole of why `hevc_color_convert` moved; see [Reading the
-rows](#reading-the-rows) below.
+three sharing a model could be selected afterwards. Three landed on the AMD EPYC
+7763 64-Core Processor this table names and are the draw; two landed on an Intel
+Xeon 6973P-C and one on an AMD EPYC 9V74 80-Core, and were measured and
+discarded. Every merged round logged `scalar`, `sse4.1` and `avx2` in its
+`# host instruction sets:` line, and all eleven dispatch sites on `avx2` in its
+per-site log.
 
 Measured on **AMD EPYC 7763 64-Core Processor (Linux, x86_64)**, at
-`b284c38a6391` — the #337 merge `b233f0a74f88` plus the temporary six-round
-workflow that measured it, which touches no crate code.
+`d39c8df519d5` — `605f9a43a24c` (the tip of `main` when the draw was dispatched)
+plus the temporary six-round workflow that measured it, which touches no crate
+code ([run
+33638052798](https://github.com/lsegal/zvidlib/actions/runs/33638052798)).
 
-The two `av1_encode_stage_coeff_ctx` rows are the pre-#362 code and are kept as
-the record of the defect that issue reports; the repair is measured under [The
-#362 re-measurement](#the-362-re-measurement) below, and the kernel that
-replaces the routing under [The #371 re-measurement](#the-371-re-measurement),
-each on its own host and with its own provenance. Both rows' `avx2` column is
-therefore two repairs out of date, in the direction of being too slow.
+This table replaces the one drawn at `b284c38a6391`, on the same CPU model, and
+why it needed replacing is the half of staleness that [Checking a table still
+describes the crate](#checking-a-table-still-describes-the-crate) cannot see. No
+dispatch site landed under that draw, so `criterion_baseline.py staleness`
+reported it clean for its whole life; four repairs nevertheless moved six of its
+rows out from under it. #362 and #371 (PR #385) rebuilt the `av1_coeff_ctx`
+routing and then its kernel under the two `av1_encode_stage_coeff_ctx` rows, and
+#370 and #387 (PR #394) rebuilt `rdcost`'s block routing and then its batched
+motion search under the two `hevc_encode_*_rdo_inter` rows and the two
+whole-frame `hevc_encode_*` rows above them. Each repair was recorded in a
+re-measurement section of its own rather than folded into that table, which is
+the right call per repair — a table attributable to no single host is the
+failure mode the six-round selection exists to avoid — and the cost of taking it
+four times was a reader chasing four sections to know what the crate does. This
+draw folds them back in: every row is re-measured on one named host at one
+commit, and the four sections below stay as the record of their own repair
+rather than as the numbers to quote.
 
-The two `hevc_encode_*_rdo_inter` rows are pre-#370 in the same way; their
-repair is measured under [The #370 re-measurement](#the-370-re-measurement),
-which landed on *this* host, so its `avx2` column is directly comparable with
-the one here.
+The draw before that one is #261's, at `e115506f8bf6` on an AMD EPYC 9V74. It
+predates the codegen repair in #337 (issue #336), so every `av1_*` row in it
+timed `av1_simd` kernels whose `#[target_feature]` wrappers had degenerated into
+tail calls to baseline-instruction-set copies — each intrinsic an out-of-line
+`core_arch` call with its operand spilled to the stack. It recorded
+`av1_deblock_wide` at 0.13x under `avx2` and `av1_forward_flipadst_16x16` at
+0.20x. Those figures described the compiler's output, not the kernels, and the
+kernels they described no longer exist. `e115506f8bf6` is also a checkpoint
+commit on the #257 branch whose merge base with `main` is `b9995b1` (#254), so it
+does not contain `f695a1a`, the #222 merge, even though #222 landed on `main`
+fifty minutes before the checkpoint was written. That is the whole of why
+`hevc_color_convert` moved; see [Reading the rows](#reading-the-rows) below.
 
-The `av1_deblock_luma` row is the row this draw recorded as `av1_deblock`, with
-its numbers untouched: they are `benches/codec.rs`'s group, which the workflow
-that drew this table ran second and so collected. See [One group name, two
+The `av1_deblock` row here is `benches/av1_decode.rs`'s group, which this draw
+ran second and so collected; there is no `av1_deblock_luma` row, because
+`benches/codec.rs`'s group of that name was overwritten in every round. That is
+the opposite side of the collision from the table this one supersedes, which is
+why the row moved by a quarter in its `scalar` column and not at all in its
+vector ones. See [One group name, two
 targets](#one-group-name-two-targets-and-the-row-that-moved-for-nothing) above.
-There is no `av1_deblock` row here, because the group of that name was
-overwritten in every round of this draw.
 
 | Group | `scalar` | `sse4.1` | `avx2` | Best |
 | --- | ---: | ---: | ---: | ---: |
-| `av1_cdef` | 89.226 ms | 38.801 ms (2.30x) | 31.241 ms (2.86x) | 2.86x `avx2` |
-| `av1_deblock_boundary` | 370.488 µs | 75.674 µs (4.90x) | 78.676 µs (4.71x) | 4.90x `sse4.1` |
-| `av1_deblock_chroma` | 16.036 ms | 6.091 ms (2.63x) | 6.336 ms (2.53x) | 2.63x `sse4.1` |
-| `av1_deblock_luma` | 21.506 ms | 3.974 ms (5.41x) | 3.424 ms (6.28x) | 6.28x `avx2` |
-| `av1_deblock_wide` | 104.338 ms | 36.634 ms (2.85x) | 31.647 ms (3.30x) | 3.30x `avx2` |
-| `av1_decode_frame` | 98.518 ms | 98.855 ms (1.00x) | 99.331 ms (0.99x) | 1.00x `sse4.1` |
-| `av1_encode_frame_q0` | 22.029 ms | 18.612 ms (1.18x) | 18.816 ms (1.17x) | 1.18x `sse4.1` |
-| `av1_encode_frame_q0_1080p` | 206.988 ms | 176.980 ms (1.17x) | 178.784 ms (1.16x) | 1.17x `sse4.1` |
-| `av1_encode_frame_q160` | 284.968 ms | 193.387 ms (1.47x) | 185.702 ms (1.53x) | 1.53x `avx2` |
-| `av1_encode_frame_q160_1080p` | 2.617 s | 1.780 s (1.47x) | 1.715 s (1.53x) | 1.53x `avx2` |
-| `av1_encode_frame_q32` | 316.545 ms | 217.592 ms (1.45x) | 212.056 ms (1.49x) | 1.49x `avx2` |
-| `av1_encode_frame_q32_1080p` | 2.902 s | 2.008 s (1.44x) | 1.942 s (1.49x) | 1.49x `avx2` |
-| `av1_encode_stage_bitstream` | 14.023 µs | 13.480 µs (1.04x) | 14.136 µs (0.99x) | 1.04x `sse4.1` |
-| `av1_encode_stage_bitstream_1080p` | 126.152 µs | 126.368 µs (1.00x) | 126.356 µs (1.00x) | 1.00x `avx2` |
-| `av1_encode_stage_coeff_ctx` | 4.305 ms | 1.415 ms (3.04x) | 1.725 ms (2.50x) | 3.04x `sse4.1` |
-| `av1_encode_stage_coeff_ctx_1080p` | 39.301 ms | 13.042 ms (3.01x) | 15.838 ms (2.48x) | 3.01x `sse4.1` |
-| `av1_encode_stage_symbol` | 874.188 µs | 878.248 µs (1.00x) | 880.264 µs (0.99x) | 1.00x `sse4.1` |
-| `av1_encode_stage_symbol_1080p` | 8.257 ms | 8.167 ms (1.01x) | 8.236 ms (1.00x) | 1.01x `sse4.1` |
-| `av1_encode_stage_tile` | 21.340 ms | 18.051 ms (1.18x) | 18.248 ms (1.17x) | 1.18x `sse4.1` |
-| `av1_encode_stage_tile_1080p` | 197.811 ms | 167.742 ms (1.18x) | 169.684 ms (1.17x) | 1.18x `sse4.1` |
-| `av1_encode_stage_iwht` † | 331.600 µs | 399.630 µs (0.83x) | 371.650 µs (0.89x) | 0.89x `avx2` |
-| `av1_encode_stage_iwht_1080p` † | 3.064 ms | 3.682 ms (0.83x) | 3.424 ms (0.89x) | 0.89x `avx2` |
-| `av1_encode_stage_wht` | 436.654 µs | 371.908 µs (1.17x) | 372.555 µs (1.17x) | 1.17x `sse4.1` |
-| `av1_encode_stage_wht_1080p` | 4.026 ms | 3.423 ms (1.18x) | 3.419 ms (1.18x) | 1.18x `avx2` |
-| `av1_entropy_symbol` | 3.767 ms | 3.767 ms (1.00x) | 3.766 ms (1.00x) | 1.00x `avx2` |
-| `av1_forward_adst_8x8` | 32.313 ms | 9.663 ms (3.34x) | 9.213 ms (3.51x) | 3.51x `avx2` |
-| `av1_forward_dct_16x16` | 41.498 ms | 13.372 ms (3.10x) | 12.227 ms (3.39x) | 3.39x `avx2` |
-| `av1_forward_dct_32x32` | 56.890 ms | 43.147 ms (1.32x) | 38.382 ms (1.48x) | 1.48x `avx2` |
-| `av1_forward_dct_4x4` | 42.591 ms | 7.670 ms (5.55x) | 7.774 ms (5.48x) | 5.55x `sse4.1` |
-| `av1_forward_dct_8x8` | 32.806 ms | 10.046 ms (3.27x) | 9.275 ms (3.54x) | 3.54x `avx2` |
-| `av1_forward_flipadst_16x16` | 38.322 ms | 13.948 ms (2.75x) | 12.354 ms (3.10x) | 3.10x `avx2` |
-| `av1_intra_directional` | 35.603 ms | 35.580 ms (1.00x) | 35.582 ms (1.00x) | 1.00x `sse4.1` |
-| `av1_intra_paeth` | 3.106 ms | 3.163 ms (0.98x) | 2.953 ms (1.05x) | 1.05x `avx2` |
-| `av1_intra_smooth` | 3.078 ms | 3.079 ms (1.00x) | 3.078 ms (1.00x) | 1.00x `avx2` |
-| `av1_inverse_adst_8x8` | 34.830 ms | 22.214 ms (1.57x) | 21.862 ms (1.59x) | 1.59x `avx2` |
-| `av1_inverse_dct_16x16` | 25.175 ms | 15.434 ms (1.63x) | 14.931 ms (1.69x) | 1.69x `avx2` |
-| `av1_inverse_dct_32x32` | 21.299 ms | 13.771 ms (1.55x) | 13.410 ms (1.59x) | 1.59x `avx2` |
-| `av1_inverse_dct_4x4` | 53.750 ms | 25.005 ms (2.15x) | 25.732 ms (2.09x) | 2.15x `sse4.1` |
-| `av1_inverse_dct_64x64` | 27.276 ms | 18.297 ms (1.49x) | 17.765 ms (1.54x) | 1.54x `avx2` |
-| `av1_inverse_dct_8x8` | 33.400 ms | 18.343 ms (1.82x) | 17.920 ms (1.86x) | 1.86x `avx2` |
-| `av1_inverse_flipadst_16x16` | 28.593 ms | 19.693 ms (1.45x) | 18.760 ms (1.52x) | 1.52x `avx2` |
-| `av1_mc_blend_mask` | 26.056 ms | 14.137 ms (1.84x) | 11.179 ms (2.33x) | 2.33x `avx2` |
-| `av1_mc_compound_average` | 26.135 ms | 15.448 ms (1.69x) | 11.533 ms (2.27x) | 2.27x `avx2` |
-| `av1_mc_single` | 13.372 ms | 6.742 ms (1.98x) | 5.044 ms (2.65x) | 2.65x `avx2` |
-| `av1_motion_compensation` | 13.154 ms | 6.845 ms (1.92x) | 5.324 ms (2.47x) | 2.47x `avx2` |
-| `av1_self_guided` | 10.743 ms | 3.859 ms (2.78x) | 3.077 ms (3.49x) | 3.49x `avx2` |
-| `av1_wiener` | 11.655 ms | 8.438 ms (1.38x) | 6.213 ms (1.88x) | 1.88x `avx2` |
-| `hevc_cabac` | 2.201 ms | 2.201 ms (1.00x) | 2.201 ms (1.00x) | 1.00x `avx2` |
-| `hevc_color_convert` | 11.827 ms | 3.124 ms (3.79x) | 2.483 ms (4.76x) | 4.76x `avx2` |
-| `hevc_deblock` | 14.063 ms | 13.462 ms (1.04x) | 13.451 ms (1.05x) | 1.05x `avx2` |
-| `hevc_decode` | 700.695 ms | 599.583 ms (1.17x) | 578.868 ms (1.21x) | 1.21x `avx2` |
-| `hevc_decode_to_picture` | 626.111 ms | 586.569 ms (1.07x) | 562.726 ms (1.11x) | 1.11x `avx2` |
-| `hevc_encode_1920x1088` | 978.101 ms | 621.336 ms (1.57x) | 646.477 ms (1.51x) | 1.57x `sse4.1` |
-| `hevc_encode_1920x1088_fwd_transform_quant` | 148.217 ms | 96.906 ms (1.53x) | 93.307 ms (1.59x) | 1.59x `avx2` |
-| `hevc_encode_1920x1088_pcm_write` | 6.511 ms | 6.510 ms (1.00x) | 6.518 ms (1.00x) | 1.00x `sse4.1` |
-| `hevc_encode_1920x1088_rdo_inter` | 851.069 ms | 520.861 ms (1.63x) | 547.481 ms (1.55x) | 1.63x `sse4.1` |
-| `hevc_encode_1920x1088_rdo_intra` | 51.430 ms | 34.466 ms (1.49x) | 34.307 ms (1.50x) | 1.50x `avx2` |
-| `hevc_encode_1920x1088_reconstruct` | 97.670 ms | 50.193 ms (1.95x) | 45.805 ms (2.13x) | 2.13x `avx2` |
-| `hevc_encode_1920x1088_reconstruct_quantized` | 223.384 ms | 119.493 ms (1.87x) | 111.925 ms (2.00x) | 2.00x `avx2` |
-| `hevc_encode_1920x1088_residual_write` | 2.332 s | 1.805 s (1.29x) | 1.687 s (1.38x) | 1.38x `avx2` |
-| `hevc_encode_1920x1088_rgba_to_yuv420` | 5.822 ms | 1.172 ms (4.97x) | 928.249 µs (6.27x) | 6.27x `avx2` |
-| `hevc_encode_640x352` | 101.668 ms | 64.354 ms (1.58x) | 67.101 ms (1.52x) | 1.58x `sse4.1` |
-| `hevc_encode_640x352_fwd_transform_quant` | 15.923 ms | 10.409 ms (1.53x) | 9.841 ms (1.62x) | 1.62x `avx2` |
-| `hevc_encode_640x352_pcm_write` | 726.265 µs | 727.603 µs (1.00x) | 726.733 µs (1.00x) | 1.00x `avx2` |
-| `hevc_encode_640x352_rdo_inter` | 89.626 ms | 54.769 ms (1.64x) | 57.659 ms (1.55x) | 1.64x `sse4.1` |
-| `hevc_encode_640x352_rdo_intra` | 5.518 ms | 3.707 ms (1.49x) | 3.700 ms (1.49x) | 1.49x `avx2` |
-| `hevc_encode_640x352_reconstruct` | 10.120 ms | 5.109 ms (1.98x) | 4.748 ms (2.13x) | 2.13x `avx2` |
-| `hevc_encode_640x352_reconstruct_quantized` | 23.300 ms | 12.547 ms (1.86x) | 11.732 ms (1.99x) | 1.99x `avx2` |
-| `hevc_encode_640x352_residual_write` | 248.489 ms | 193.174 ms (1.29x) | 181.059 ms (1.37x) | 1.37x `avx2` |
-| `hevc_encode_640x352_rgba_to_yuv420` | 645.519 µs | 135.292 µs (4.77x) | 106.489 µs (6.06x) | 6.06x `avx2` |
-| `hevc_encode_bitwriter` | 703.320 µs | 703.788 µs (1.00x) | 703.451 µs (1.00x) | 1.00x `avx2` |
-| `hevc_encode_cabac` | 1.683 ms | 1.694 ms (0.99x) | 1.686 ms (1.00x) | 1.00x `avx2` |
-| `hevc_encode_cabac_bypass` | 2.053 ms | 2.052 ms (1.00x) | 2.054 ms (1.00x) | 1.00x `sse4.1` |
-| `hevc_inter_pred` | 29.145 ms | 21.996 ms (1.32x) | 19.735 ms (1.48x) | 1.48x `avx2` |
-| `hevc_intra_pred` | 8.304 ms | 8.296 ms (1.00x) | 7.887 ms (1.05x) | 1.05x `avx2` |
-| `hevc_inverse_transform` | 9.291 ms | 7.079 ms (1.31x) | 6.396 ms (1.45x) | 1.45x `avx2` |
-| `hevc_sao` | 32.116 ms | 19.431 ms (1.65x) | 18.325 ms (1.75x) | 1.75x `avx2` |
-
-† The two `av1_encode_stage_iwht` rows come from a separate draw. The group did
-not exist when the rest of this table was measured — #342 added it — so it was
-measured on its own, by the same recipe: three rounds, elementwise minimum, on
-one AMD EPYC 7763 64-Core, the model this table names. Six draws were dispatched
-so that three sharing a model could be selected; two landed on an AMD EPYC 9V74
-80-Core and were discarded. That draw timed `av1_encode_stage_wht` alongside the
-inverse group and read it at 1.16x and 1.16x against the 1.17x and 1.18x above,
-which is the check that the two draws are comparable. Both rows are the state
-*before* the dispatch change they settled, and are the measurement rather than
-the current arms: `av1_simd::iwht4x4` now returns `None` on x86_64, so a re-take
-will read them the way `av1_encode_stage_wht` reads here.
+| `av1_cdef` | 89.305 ms | 40.075 ms (2.23x) | 32.341 ms (2.76x) | 2.76x `avx2` |
+| `av1_deblock` | 26.956 ms | 3.934 ms (6.85x) | 3.392 ms (7.95x) | 7.95x `avx2` |
+| `av1_deblock_boundary` | 373.108 µs | 74.155 µs (5.03x) | 78.531 µs (4.75x) | 5.03x `sse4.1` |
+| `av1_deblock_chroma` | 15.974 ms | 6.083 ms (2.63x) | 6.304 ms (2.53x) | 2.63x `sse4.1` |
+| `av1_deblock_wide` | 104.984 ms | 37.076 ms (2.83x) | 33.176 ms (3.16x) | 3.16x `avx2` |
+| `av1_decode_frame` | 97.296 ms | 97.660 ms (1.00x) | 98.031 ms (0.99x) | 1.00x `sse4.1` |
+| `av1_encode_frame_q0` | 21.887 ms | 18.474 ms (1.18x) | 18.307 ms (1.20x) | 1.20x `avx2` |
+| `av1_encode_frame_q0_1080p` | 205.108 ms | 174.690 ms (1.17x) | 173.326 ms (1.18x) | 1.18x `avx2` |
+| `av1_encode_frame_q160` | 281.977 ms | 185.540 ms (1.52x) | 181.625 ms (1.55x) | 1.55x `avx2` |
+| `av1_encode_frame_q160_1080p` | 2.592 s | 1.713 s (1.51x) | 1.677 s (1.55x) | 1.55x `avx2` |
+| `av1_encode_frame_q32` | 318.283 ms | 213.720 ms (1.49x) | 210.589 ms (1.51x) | 1.51x `avx2` |
+| `av1_encode_frame_q32_1080p` | 2.906 s | 1.962 s (1.48x) | 1.915 s (1.52x) | 1.52x `avx2` |
+| `av1_encode_stage_bitstream` | 13.498 µs | 13.502 µs (1.00x) | 13.534 µs (1.00x) | 1.00x `sse4.1` |
+| `av1_encode_stage_bitstream_1080p` | 128.467 µs | 128.489 µs (1.00x) | 128.449 µs (1.00x) | 1.00x `avx2` |
+| `av1_encode_stage_coeff_ctx` | 4.328 ms | 1.409 ms (3.07x) | 1.181 ms (3.66x) | 3.66x `avx2` |
+| `av1_encode_stage_coeff_ctx_1080p` | 39.611 ms | 12.976 ms (3.05x) | 10.835 ms (3.66x) | 3.66x `avx2` |
+| `av1_encode_stage_iwht` | 405.408 µs | 382.267 µs (1.06x) | 382.240 µs (1.06x) | 1.06x `avx2` |
+| `av1_encode_stage_iwht_1080p` | 3.730 ms | 3.521 ms (1.06x) | 3.522 ms (1.06x) | 1.06x `sse4.1` |
+| `av1_encode_stage_symbol` | 877.902 µs | 875.397 µs (1.00x) | 872.179 µs (1.01x) | 1.01x `avx2` |
+| `av1_encode_stage_symbol_1080p` | 8.088 ms | 8.057 ms (1.00x) | 8.078 ms (1.00x) | 1.00x `sse4.1` |
+| `av1_encode_stage_tile` | 21.168 ms | 17.844 ms (1.19x) | 17.684 ms (1.20x) | 1.20x `avx2` |
+| `av1_encode_stage_tile_1080p` | 196.224 ms | 165.875 ms (1.18x) | 164.113 ms (1.20x) | 1.20x `avx2` |
+| `av1_encode_stage_wht` | 421.947 µs | 364.166 µs (1.16x) | 364.188 µs (1.16x) | 1.16x `sse4.1` |
+| `av1_encode_stage_wht_1080p` | 3.889 ms | 3.358 ms (1.16x) | 3.358 ms (1.16x) | 1.16x `sse4.1` |
+| `av1_entropy_symbol` | 3.718 ms | 3.718 ms (1.00x) | 3.718 ms (1.00x) | 1.00x `sse4.1` |
+| `av1_forward_adst_8x8` | 34.034 ms | 10.029 ms (3.39x) | 9.264 ms (3.67x) | 3.67x `avx2` |
+| `av1_forward_dct_16x16` | 38.632 ms | 13.485 ms (2.86x) | 12.156 ms (3.18x) | 3.18x `avx2` |
+| `av1_forward_dct_32x32` | 56.210 ms | 22.569 ms (2.49x) | 26.037 ms (2.16x) | 2.49x `sse4.1` |
+| `av1_forward_dct_4x4` | 45.110 ms | 7.863 ms (5.74x) | 7.786 ms (5.79x) | 5.79x `avx2` |
+| `av1_forward_dct_8x8` | 34.279 ms | 9.956 ms (3.44x) | 9.215 ms (3.72x) | 3.72x `avx2` |
+| `av1_forward_flipadst_16x16` | 38.602 ms | 13.814 ms (2.79x) | 12.778 ms (3.02x) | 3.02x `avx2` |
+| `av1_intra_directional` | 35.547 ms | 35.537 ms (1.00x) | 35.535 ms (1.00x) | 1.00x `avx2` |
+| `av1_intra_paeth` | 3.106 ms | 3.124 ms (0.99x) | 2.996 ms (1.04x) | 1.04x `avx2` |
+| `av1_intra_smooth` | 3.083 ms | 3.081 ms (1.00x) | 3.083 ms (1.00x) | 1.00x `sse4.1` |
+| `av1_inverse_adst_8x8` | 34.730 ms | 20.214 ms (1.72x) | 22.194 ms (1.56x) | 1.72x `sse4.1` |
+| `av1_inverse_dct_16x16` | 26.210 ms | 15.829 ms (1.66x) | 15.087 ms (1.74x) | 1.74x `avx2` |
+| `av1_inverse_dct_32x32` | 22.309 ms | 14.023 ms (1.59x) | 13.504 ms (1.65x) | 1.65x `avx2` |
+| `av1_inverse_dct_4x4` | 55.009 ms | 26.005 ms (2.12x) | 24.906 ms (2.21x) | 2.21x `avx2` |
+| `av1_inverse_dct_64x64` | 27.131 ms | 18.567 ms (1.46x) | 17.945 ms (1.51x) | 1.51x `avx2` |
+| `av1_inverse_dct_8x8` | 33.498 ms | 18.578 ms (1.80x) | 18.077 ms (1.85x) | 1.85x `avx2` |
+| `av1_inverse_flipadst_16x16` | 28.575 ms | 20.646 ms (1.38x) | 19.424 ms (1.47x) | 1.47x `avx2` |
+| `av1_mc_blend_mask` | 25.128 ms | 14.172 ms (1.77x) | 10.826 ms (2.32x) | 2.32x `avx2` |
+| `av1_mc_compound_average` | 25.060 ms | 15.655 ms (1.60x) | 11.345 ms (2.21x) | 2.21x `avx2` |
+| `av1_mc_single` | 13.108 ms | 6.866 ms (1.91x) | 5.219 ms (2.51x) | 2.51x `avx2` |
+| `av1_motion_compensation` | 13.233 ms | 6.849 ms (1.93x) | 5.051 ms (2.62x) | 2.62x `avx2` |
+| `av1_self_guided` | 10.775 ms | 3.755 ms (2.87x) | 3.105 ms (3.47x) | 3.47x `avx2` |
+| `av1_wiener` | 11.651 ms | 8.438 ms (1.38x) | 6.212 ms (1.88x) | 1.88x `avx2` |
+| `hevc_cabac` | 2.188 ms | 2.187 ms (1.00x) | 2.187 ms (1.00x) | 1.00x `avx2` |
+| `hevc_color_convert` | 11.911 ms | 3.124 ms (3.81x) | 2.479 ms (4.80x) | 4.80x `avx2` |
+| `hevc_deblock` | 14.038 ms | 13.437 ms (1.04x) | 13.428 ms (1.05x) | 1.05x `avx2` |
+| `hevc_decode` | 613.511 ms | 472.270 ms (1.30x) | 444.598 ms (1.38x) | 1.38x `avx2` |
+| `hevc_decode_to_picture` | 538.099 ms | 452.442 ms (1.19x) | 432.184 ms (1.25x) | 1.25x `avx2` |
+| `hevc_encode_1920x1088` | 988.549 ms | 653.553 ms (1.51x) | 467.708 ms (2.11x) | 2.11x `avx2` |
+| `hevc_encode_1920x1088_fwd_transform_quant` | 147.884 ms | 98.725 ms (1.50x) | 93.934 ms (1.57x) | 1.57x `avx2` |
+| `hevc_encode_1920x1088_pcm_write` | 6.256 ms | 6.212 ms (1.01x) | 6.232 ms (1.00x) | 1.01x `sse4.1` |
+| `hevc_encode_1920x1088_rdo_inter` | 874.285 ms | 559.596 ms (1.56x) | 373.683 ms (2.34x) | 2.34x `avx2` |
+| `hevc_encode_1920x1088_rdo_intra` | 51.282 ms | 34.314 ms (1.49x) | 34.119 ms (1.50x) | 1.50x `avx2` |
+| `hevc_encode_1920x1088_reconstruct` | 95.854 ms | 49.062 ms (1.95x) | 45.449 ms (2.11x) | 2.11x `avx2` |
+| `hevc_encode_1920x1088_reconstruct_no_band_search` | 83.923 ms | 38.495 ms (2.18x) | 35.973 ms (2.33x) | 2.33x `avx2` |
+| `hevc_encode_1920x1088_reconstruct_quantized` | 221.360 ms | 122.562 ms (1.81x) | 115.279 ms (1.92x) | 1.92x `avx2` |
+| `hevc_encode_1920x1088_reconstruct_quantized_no_band_search` | 213.497 ms | 113.656 ms (1.88x) | 106.231 ms (2.01x) | 2.01x `avx2` |
+| `hevc_encode_1920x1088_residual_write` | 2.301 s | 1.794 s (1.28x) | 1.686 s (1.37x) | 1.37x `avx2` |
+| `hevc_encode_1920x1088_rgba_to_yuv420` | 5.946 ms | 1.197 ms (4.97x) | 963.751 µs (6.17x) | 6.17x `avx2` |
+| `hevc_encode_640x352` | 103.204 ms | 68.389 ms (1.51x) | 48.870 ms (2.11x) | 2.11x `avx2` |
+| `hevc_encode_640x352_fwd_transform_quant` | 16.085 ms | 10.598 ms (1.52x) | 10.206 ms (1.58x) | 1.58x `avx2` |
+| `hevc_encode_640x352_pcm_write` | 724.845 µs | 726.480 µs (1.00x) | 728.722 µs (0.99x) | 1.00x `sse4.1` |
+| `hevc_encode_640x352_rdo_inter` | 91.391 ms | 58.827 ms (1.55x) | 39.616 ms (2.31x) | 2.31x `avx2` |
+| `hevc_encode_640x352_rdo_intra` | 5.517 ms | 3.694 ms (1.49x) | 3.655 ms (1.51x) | 1.51x `avx2` |
+| `hevc_encode_640x352_reconstruct` | 10.064 ms | 5.028 ms (2.00x) | 4.760 ms (2.11x) | 2.11x `avx2` |
+| `hevc_encode_640x352_reconstruct_no_band_search` | 8.781 ms | 3.813 ms (2.30x) | 3.504 ms (2.51x) | 2.51x `avx2` |
+| `hevc_encode_640x352_reconstruct_quantized` | 23.108 ms | 12.602 ms (1.83x) | 11.837 ms (1.95x) | 1.95x `avx2` |
+| `hevc_encode_640x352_reconstruct_quantized_no_band_search` | 22.425 ms | 11.479 ms (1.95x) | 10.496 ms (2.14x) | 2.14x `avx2` |
+| `hevc_encode_640x352_residual_write` | 246.162 ms | 191.760 ms (1.28x) | 180.551 ms (1.36x) | 1.36x `avx2` |
+| `hevc_encode_640x352_rgba_to_yuv420` | 646.307 µs | 134.182 µs (4.82x) | 105.164 µs (6.15x) | 6.15x `avx2` |
+| `hevc_encode_bitwriter` | 703.669 µs | 703.365 µs (1.00x) | 703.663 µs (1.00x) | 1.00x `sse4.1` |
+| `hevc_encode_cabac` | 1.691 ms | 1.693 ms (1.00x) | 1.699 ms (1.00x) | 1.00x `sse4.1` |
+| `hevc_encode_cabac_bypass` | 2.043 ms | 2.035 ms (1.00x) | 2.045 ms (1.00x) | 1.00x `sse4.1` |
+| `hevc_inter_pred` | 28.926 ms | 21.796 ms (1.33x) | 19.668 ms (1.47x) | 1.47x `avx2` |
+| `hevc_intra_pred` | 8.402 ms | 8.448 ms (0.99x) | 8.098 ms (1.04x) | 1.04x `avx2` |
+| `hevc_inverse_transform` | 9.147 ms | 7.007 ms (1.31x) | 6.600 ms (1.39x) | 1.39x `avx2` |
+| `hevc_sao` | 3.129 ms | 1.662 ms (1.88x) | 1.610 ms (1.94x) | 1.94x `avx2` |
 
 #### Reading the rows
 
-Not one row's `Best` arm is below parity, except the two the footnote above
-marks as a pre-change measurement. The lowest cells anywhere in the table
-are 0.98x and 0.99x, and four of the five belong to groups whose arms are the
-same code: `av1_decode_frame`, `av1_encode_stage_bitstream`,
-`av1_encode_stage_symbol` and `hevc_encode_cabac` have no vector kernel, so
-their columns differ only by measurement noise, exactly as the aarch64
-discussion above describes. The same holds for `av1_entropy_symbol`,
-`av1_intra_directional`, `hevc_cabac`, `hevc_encode_bitwriter`,
-`hevc_encode_cabac_bypass` and both `pcm_write` rows, which land on `1.00x` from
-the same cause. The fifth is `av1_intra_paeth`'s `sse4.1` arm at 0.98x, which
-does have a kernel; its `avx2` arm reads 1.05x on the same row, and the aarch64
-table records the same group walking from 0.78x to 0.98x across three draws with
-no code change, so this is the near-parity band that discussion is about rather
-than a kernel to act on.
+Not one row's `Best` arm is below parity, and this is the first x86_64 draw of
+which that is true without a footnote: the two `av1_encode_stage_iwht` rows the
+previous table marked † at 0.83x and 0.89x read 1.06x and 1.06x here, for
+exactly the reason that footnote gave. The lowest cells anywhere in the table
+are four readings of 0.99x, and two of them belong to groups whose arms are the
+same code: `av1_decode_frame` and `hevc_encode_640x352_pcm_write` have no vector
+kernel, so their columns differ only by measurement noise, exactly as the
+aarch64 discussion above describes. The same holds for
+`av1_encode_stage_bitstream`, `av1_encode_stage_symbol`, `av1_entropy_symbol`,
+`av1_intra_directional`, `av1_intra_smooth`, `hevc_cabac`,
+`hevc_encode_bitwriter`, `hevc_encode_cabac`, `hevc_encode_cabac_bypass` and the
+other `pcm_write` row, which land on `1.00x` from the same cause. The other two
+0.99x cells are `av1_intra_paeth`'s and `hevc_intra_pred`'s `sse4.1` arms, which
+do have kernels; both groups read 1.04x under `avx2` on the same row, and the
+aarch64 table records `av1_intra_paeth` walking from 0.78x to 0.98x across three
+draws with no code change, so this is the near-parity band that discussion is
+about rather than a kernel to act on.
 
-Two rows read at parity for a reason worth stating rather than as noise:
+Three rows read at parity for a reason worth stating rather than as noise, and
+the table now shows the reason directly:
 
 - `av1_intra_smooth` is `1.00x` under both vector arms because #337 removed the
   placeholder `smooth_row_{sse41,avx2}` arms. The §7.11.2.6 smooth predictor has
@@ -1765,7 +1773,7 @@ Two rows read at parity for a reason worth stating rather than as noise:
   never paid. That is what the old table's 0.48x was. All three arms now call
   the reference directly, and the row is flat until a real kernel earns the arms
   back.
-- `av1_encode_stage_wht` at 1.17x is not a vector win either. #337 routes
+- `av1_encode_stage_wht` at 1.16x is not a vector win either. #337 routes
   `av1_simd::fwht4x4` to `None` on x86_64 (see #342), because the 4x4 WHT is
   fourteen SSE2-baseline adds, subtracts and shifts that LLVM already
   auto-vectorizes out of `av1_encoder::wht`, against three `transpose4`s of
@@ -1777,42 +1785,114 @@ Two rows read at parity for a reason worth stating rather than as noise:
   the group at 1.03x, in the parity band rather than above it. What still
   separates the two hosts is the *direction* of the gap — aarch64 is at parity
   where x86_64 was under it — and that is what the dispatch turns on.
-- `av1_encode_stage_iwht` at 0.83x and 0.89x is the other direction of that same
-  family, and #342 measured it rather than inferring it: the forward group could
-  not settle it, because the forward pass runs three `transpose4`s where the
-  inverse runs two, so the shuffle pressure that put `av1_encode_stage_wht`
-  under parity is not this kernel's shuffle pressure. It turns out to be enough
-  anyway. Two `transpose4`s are sixteen shuffle micro-operations contending for
-  one or two ports, against a scalar loop with none, and the row reads the same
-  0.83x / 0.89x pair at 320x180 and at 1080p — a property of the kernel, not of
-  the frame size or of a noisy round. `av1_simd::iwht4x4` therefore joins
-  `fwht4x4` on the scalar reference on x86_64 and keeps its kernel on `neon`,
-  and this is now a measured dispatch on both sides of the family.
+- `av1_encode_stage_iwht` at 1.06x is now the same story, and this draw is what
+  settles it. #342 measured the inverse 4x4 WHT at 0.83x and 0.89x under a hand
+  kernel whose two `transpose4`s were sixteen shuffle micro-operations
+  contending for one or two ports, against a scalar loop with none, and routed
+  `av1_simd::iwht4x4` to `None` on x86_64 in answer. That routing was never
+  measured on this table: the two rows carried the pre-change kernel behind a †,
+  and the footnote predicted a re-take would read them the way
+  `av1_encode_stage_wht` reads. It does. Both rows are above parity rather than
+  under it, and the prediction is checkable in the table rather than only in
+  prose — the `sse4.1` and `avx2` columns of `av1_encode_stage_wht` (364.166 µs
+  against 364.188 µs) and of `av1_encode_stage_iwht` (382.267 µs against
+  382.240 µs) agree to four significant figures, across all three rounds, which
+  is what "all three arms run the same scalar transform" looks like when the
+  arms are genuinely the same code.
 
-The rows with real vector work are now the ones with the largest ratios, which
-is what the old table could not show. `hevc_encode_*_rgba_to_yuv420` leads at
-6.27x and 6.06x, followed by `av1_deblock_luma` at 6.28x, `av1_forward_dct_4x4` at
-5.55x, `av1_deblock_boundary` at 4.90x and `hevc_color_convert` at 4.76x. The
-AV1 forward transforms sit between 3.1x and 3.5x, `av1_self_guided` at 3.49x and
-`av1_cdef` at 2.86x, and the motion-compensation family between 2.3x and 2.7x.
+**Six rows changed their `Best` arm because four repairs landed under them.**
+This is what the draw was for, and each is now the table's own number rather
+than a cross-reference:
 
-**`hevc_color_convert` moved from `1.00x` to `4.76x` because #222 landed in
-between.** Every other row is attributable to #337, and this one is the move
-#351 recorded without a cause, because #337 touched only `src/av1_simd` and
-never `src/hevc/color_convert.rs`. The cause is neither #337 nor the harness:
-the `1.00x` was a correct reading of a group that had no vector arms yet.
+- `av1_encode_stage_coeff_ctx` reads `avx2` for the first time — 1.181 ms
+  against 1.409 ms, 3.66x against 3.07x, and the `_1080p` row 10.835 ms against
+  12.976 ms at the same 3.66x, since the group derives contexts for 4x4 blocks
+  and nothing else. The previous table had this pair at 1.415 ms `sse4.1`
+  against 1.725 ms `avx2`, with `Best` reading 3.04x `sse4.1`. #371's
+  `coeff::block_contexts_row_pairs` is what moved it, and the 24% gap that
+  change measured on an AMD EPYC 9V74 reproduces at 19% here on the model this
+  table names.
+- The `hevc_encode_*_rdo_inter` pair reads `avx2` too, and by the largest margin
+  in this family anywhere: 39.616 ms against 58.827 ms and 373.683 ms against
+  559.596 ms, so 2.31x and 2.34x where the previous table read 1.64x and 1.63x
+  under `sse4.1`. That is #387's batched `rdcost::sad_batch`, reproducing to
+  within 1% of the single round that measured it (39.723 ms and 373.63 ms
+  there).
+- The two whole-frame `hevc_encode_*` rows move with them, because the mode
+  search is most of what they do. `hevc_encode_640x352` reads 48.870 ms under
+  `avx2` against 68.389 ms under `sse4.1` and `hevc_encode_1920x1088`
+  467.708 ms against 653.553 ms — both 2.11x, where the previous table had them
+  at 1.58x and 1.57x with `Best` reading `sse4.1`. An x86_64 user encoding HEVC
+  on an AVX2 host gets about 28% of a whole encode back relative to the arm that
+  table would have sent them to.
 
-At `e115506f8bf6` there is no `src/hevc/color_convert.rs` in the tree at all.
-The conversion is a per-pixel scalar double loop inside `picture_to_rgba` in
-`src/hevc/mod.rs`, with no `simd` dispatch of any kind, so `scalar`, `sse4.1`
-and `avx2` ran byte-identical code and `1.00x / 1.00x` is exactly what they
-should have read. `benches/hevc_decode.rs` said as much at that commit: its
-per-stage table listed the group's `Vectorized` column as "no, today". The
-`convert_row_{sse41,avx2}` kernels arrived with #222 (`f695a1a`), which the
-checkpoint the draw was taken on does not contain — see the paragraph on
-`e115506f8bf6`'s merge base above. So the 4.76x is #222's win, showing up in the
-first table drawn after it, and nothing between the two draws changed what the
-group *measures*: what changed is that there is now something to measure.
+**Three more rows moved because the thing they measure was rebuilt.** `hevc_sao`
+reads 3.129 ms `scalar` against the previous table's 32.116 ms. That tenfold
+drop is not a kernel win: #313 rebuilt the group on the real CTB mix rather than
+a synthetic one, so it is a different measurement of the same stage, and its
+ratio is 1.94x against 1.75x. The two whole-decode groups carry the same change
+— `hevc_decode` at 1.38x against 1.21x and `hevc_decode_to_picture` at 1.25x
+against 1.11x, with absolute times down from 700.695 ms to 613.511 ms and from
+626.111 ms to 538.099 ms — because #313 is what made §8.7.3 reach its vector
+kernels in decode at all.
+
+**Four rows are new.** `hevc_encode_640x352_reconstruct_no_band_search`,
+`hevc_encode_1920x1088_reconstruct_no_band_search` and the two
+`_reconstruct_quantized_no_band_search` rows are the arms #382 added to measure
+what share of a reconstruction the SAO band search is; they appear here because
+`bench_across_isas` builds them like any other group. They read 2.51x and 2.33x
+against their band-searching counterparts' 2.11x and 2.11x, and 2.14x and 2.01x
+against 1.95x and 1.92x — the gap being the band search, which
+[#382](#why-the-isolated-ratio-did-not-reach-this-group-issue-382) measured at
+23-29% of the group's `avx2` arm.
+
+**One row's `Best` moved the other way, and one moved for a reason this draw
+cannot name.**
+
+- `av1_forward_dct_32x32` reads 2.49x `sse4.1` against 2.16x `avx2`, where the
+  previous table read 1.32x and 1.48x with `avx2` ahead. Both arms got
+  substantially faster — 43.147 ms to 22.569 ms and 38.382 ms to 26.037 ms — so
+  this is #405's repair of the accumulator fold, which replaced a branch at 32
+  points, landing on both widths and on the 128-bit one harder. The three
+  merged rounds read 22.57, 22.60 and 22.66 ms against 26.04, 26.06 and
+  26.04 ms, so the 13% gap between the arms is a property of the kernels rather
+  than of a round. `av1_inverse_adst_8x8` is the only other row where `sse4.1`
+  leads by more than the near-parity band, at 1.72x against 1.56x.
+- `av1_deblock` reads 7.95x where the superseded table read 6.28x, and the two
+  are not the same benchmark. Its `scalar` arm reads 26.956 ms against
+  21.506 ms while `sse4.1` and `avx2` land within 1% of their old values
+  (3.934 ms against 3.974 ms, 3.392 ms against 3.424 ms), which is the signature
+  of the group-name collision #417 settled rather than of a regression: the two
+  targets that both registered `av1_deblock` filter different content, so only
+  the scalar arm, which branches per position on the filter mask, separates
+  them. This draw ran `av1_decode.rs` second and so collected its side; the
+  superseded table collected `benches/codec.rs`'s, now `av1_deblock_luma`. A
+  nine-step paired bisect over the range read 0.977x to 1.000x at every step,
+  so nothing between the stamps moved the arm. See [One group name, two
+  targets](#one-group-name-two-targets-and-the-row-that-moved-for-nothing).
+
+The rows with real vector work are the ones with the largest ratios.
+`av1_deblock` leads at 7.95x, followed by `hevc_encode_*_rgba_to_yuv420` at
+6.17x and 6.15x, `av1_forward_dct_4x4` at 5.79x, `av1_deblock_boundary` at
+5.03x and `hevc_color_convert` at 4.80x. The
+AV1 forward transforms sit between 3.0x and 3.7x, `av1_self_guided` at 3.47x and
+`av1_cdef` at 2.76x, and the motion-compensation family between 2.2x and 2.6x.
+
+**`hevc_color_convert` reads 4.80x, and the 1.00x it replaced was #222's
+absence rather than a measurement fault.** Every other row of the
+`e115506f8bf6` draw is attributable to #337, and this one is the move #351
+recorded without a cause, because #337 touched only `src/av1_simd` and never
+`src/hevc/color_convert.rs`. At `e115506f8bf6` there is no
+`src/hevc/color_convert.rs` in the tree at all. The conversion is a per-pixel
+scalar double loop inside `picture_to_rgba` in `src/hevc/mod.rs`, with no `simd`
+dispatch of any kind, so `scalar`, `sse4.1` and `avx2` ran byte-identical code
+and `1.00x / 1.00x` is exactly what they should have read. `benches/hevc_decode.rs`
+said as much at that commit: its per-stage table listed the group's `Vectorized`
+column as "no, today". The `convert_row_{sse41,avx2}` kernels arrived with #222
+(`f695a1a`), which the checkpoint the draw was taken on does not contain — see
+the paragraph on `e115506f8bf6`'s merge base above. So the 4.80x is #222's win,
+and nothing between the draws changed what the group *measures*: what changed is
+that there is now something to measure.
 
 This also settled the aarch64 side, and #368 has since re-drawn it. That
 table's [sub-parity discussion](#reading-the-sub-parity-rows) named
@@ -1838,28 +1918,26 @@ arms are all the same code therefore cannot be one that is registered as a site
 and passing those tests, so "this group reads `1.00x`" and "this group has no
 kernel" can be told apart by asking `active_by_site` rather than by reading the
 prose. What is *not* checked by anything is the `Vectorized` column in [The HEVC
-per-stage groups](#the-hevc-per-stage-groups) or a committed baseline table's
-agreement with the kernels in force at the commit it was drawn at — both are
-prose, and both are what went stale here. Quoting an old table's ratio is only
-safe alongside the commit stamped on it, which is why the stamps are there.
+per-stage groups](#the-hevc-per-stage-groups), or a committed table's agreement
+with kernels that changed *without* adding a site — the six rows above are
+exactly that case, and re-drawing on a schedule is the only answer to it.
+Quoting an old table's ratio is only safe alongside the commit stamped on it,
+which is why the stamps are there.
 
 The whole-frame encoder groups are the practical consequence.
-`av1_encode_frame_q32` reads 1.49x and `av1_encode_frame_q160` 1.53x here,
-against 0.52x and 0.48x in the table this one replaces: an x86_64 user of the
-AV1 encoder stops paying roughly twice over for having a vector path and starts
+`av1_encode_frame_q32` reads 1.51x and `av1_encode_frame_q160` 1.55x here,
+against 0.52x and 0.48x in the `e115506f8bf6` table: an x86_64 user of the AV1
+encoder stops paying roughly twice over for having a vector path and starts
 getting about 1.5x back for it. The `_1080p` variants agree to two decimal
 places, so the ratio is a property of the kernels rather than of the frame size.
 
-`sse4.1` beats `avx2` on a minority of rows, and by enough on two of them to be
-more than noise: `av1_encode_stage_coeff_ctx` was 3.04x under `sse4.1` against
-2.50x under `avx2`, and the `rdo_inter` pair is 1.63x/1.64x against 1.55x. Both
-of those pairs of rows now pre-date their repair — #371 for the first and #387
-for the second — and the re-measurements below are what replaces them. The
-`Best` column already recorded `sse4.1` for these, but the dispatch site
-preferred `avx2` when the host had it, so a real encode took the slower arm.
-#362 answers why, and the answer is the same one for both rows: **the wide arm
-never reaches its width on the block shapes these workloads actually use.** Not
-lane-crossing, not downclocking, not the context gather. The detail differs.
+Where `sse4.1` still beats `avx2` it is now by the near-parity band or by
+`av1_forward_dct_32x32`'s 13%, and no longer on the two families that made the
+`Best` column disagree with what a real encode does. Both of those are settled,
+and settled the same way: **the wide arm was not reaching its width on the block
+shapes these workloads actually use**, and the answer in each case was to give
+it width rather than to route around it. The mechanism differs, and the
+re-measurement sections below are the record of how each was established.
 
 - `av1_encode_stage_coeff_ctx`. `src/av1_simd/coeff.rs` steps along a *row* of
   the transform block, and a row shorter than the vector cannot be split across
@@ -1888,18 +1966,27 @@ lane-crossing, not downclocking, not the context gather. The detail differs.
   4 back to `avx2` on the strength of the measurement below. The redirect
   survives only for sizes 1 to 3 and 5 to 7, which no vector width fits and the
   encoder never codes.
-
+  The table above now carries the result: this group's `avx2` column is
+  `block_contexts_row_pairs` measured on the host the table names, at 3.66x
+  against `sse4.1`'s 3.07x, so the two sections below are the record of how the
+  redirect and the kernel were established rather than the current numbers.
 #### The #362 re-measurement
 
-The repair is measured, not asserted, but it is deliberately recorded here
-rather than folded into the table above. The `workflow_dispatch` round that
-measured it landed on an **Intel(R) Xeon(R) 6973P-C (Linux/X64)** — one of the
-three CPU models the table's draw explicitly measured and discarded for not
-being the AMD EPYC 7763 the other rounds shared — and it is one round, not the
-elementwise minimum of three. Its absolute times are therefore not comparable
-with the table's, and merging two rows of it into a table attributed to a named
-host would make that table attributable to no host at all, which is the failure
-mode the six-round selection above exists to avoid.
+This section is the record of how #362's redirect was established, not the
+crate's current numbers: the table above supersedes it, and reads this group at
+3.66x `avx2` against 3.07x `sse4.1` because #371 replaced the redirect with a
+kernel. What survives here is the evidence that the redirect did what it
+claimed, on the round that measured it.
+
+The repair was measured, not asserted, and it was deliberately recorded here
+rather than folded into the table. The `workflow_dispatch` round that measured
+it landed on an **Intel(R) Xeon(R) 6973P-C (Linux/X64)** — one of the CPU models
+the table's draw explicitly measured and discarded for not being the AMD EPYC
+7763 the merged rounds shared — and it is one round, not the elementwise minimum
+of three. Its absolute times are therefore not comparable with the table's, and
+merging two rows of it into a table attributed to a named host would make that
+table attributable to no host at all, which is the failure mode the six-round
+selection above exists to avoid.
 
 What *is* comparable is the `sse4.1`-against-`avx2` sign within the round, which
 is the whole claim. Measured at `539dad3d61cb` with `ZVIDLIB_BENCH_LARGE=1`,
@@ -1924,16 +2011,24 @@ contains the derivation behind the serial range coder, loses its 1.18x-against-
 1.17x split the same way. The dispatch site no longer takes the slower arm, and
 the `Best` column stops disagreeing with what a real x86_64 encode does.
 
-The `rdo_inter` pair is in the table above as the control, and it is unmoved:
-1.69x under `sse4.1` against 1.54x/1.55x under `avx2`, the same shape #351
-recorded on a different host. Nothing in #362 touches `rdcost`, and the second
-bullet above is why it would not have helped if it did.
+The `rdo_inter` pair is the control, and it is unmoved: 1.69x under `sse4.1`
+against 1.54x/1.55x under `avx2`, the same shape #351 recorded on a different
+host. Nothing in #362 touches `rdcost`, and the second bullet above is why it
+would not have helped if it did. That pair has since been repaired twice on its
+own account, by #370 and #387, and the table above now reads it at 2.31x and
+2.34x under `avx2`; this round predates both.
 #### The #371 re-measurement
 
 #362's repair routed around the idle lanes; #371 removes them, and the
 acceptance criterion was that the wide arm has to *win* on its own numbers
 before the dispatch site takes it back. It does, and by more than the margin
 #362 measured against it.
+
+The table above now carries this result directly, on the AMD EPYC 7763 it names
+rather than on the EPYC 9V74 measured here: `av1_encode_stage_coeff_ctx` reads
+1.181 ms `avx2` against 1.409 ms `sse4.1` there, a 19% gap against the 24% below,
+and `Best` reads `avx2` on both rows. This section stays as the record of the
+acceptance criterion and the round that met it.
 
 Measured at `f7b709ee62d7` — the branch's implementation commit — on an **AMD
 EPYC 9V74 80-Core Processor (Linux/X64)**, one `workflow_dispatch` round with
@@ -1970,11 +2065,13 @@ predates #370's own repair — that row is measured below.
 #### The #370 re-measurement
 
 Unlike the round above, this one landed on the **AMD EPYC 7763 64-Core
-Processor (Linux/X64)** — the same host the committed x86_64 table was measured
-on — so its columns can be read against that table directly. It is still one
-round rather than the elementwise minimum of three, which is why it is recorded
-here rather than merged into the table; the controls below are what carry the
-attribution. Measured at `6213a5580b78` with `ZVIDLIB_BENCH_LARGE=1`,
+Processor (Linux/X64)** — the same host model both the superseded x86_64 table
+and the one above were measured on — so its columns can be read against either
+directly. It is still one round rather than the elementwise minimum of three,
+which is why it is recorded here rather than merged into a table; the controls
+below are what carry the attribution. Every figure it compares against is the
+`b284c38a6391` draw, which the table above replaces; #387 has since moved these
+rows again, and the table's numbers are that later state rather than this one. Measured at `6213a5580b78` with `ZVIDLIB_BENCH_LARGE=1`,
 `# host instruction sets: scalar, sse4.1, avx2`, `# dispatch site
 hevc_rdcost: avx2` ([run
 33615242194](https://github.com/lsegal/zvidlib/actions/runs/33615242194)):
@@ -1989,12 +2086,12 @@ hevc_rdcost: avx2` ([run
 | `hevc_encode_1920x1088_rdo_intra` | 52.104 ms | 34.900 ms (1.49x) | 34.693 ms (1.50x) | 1.50x `avx2` |
 
 The `avx2` column of the `rdo_inter` pair is what moved, and only it: 57.659 ms
-to 55.886 ms and 547.481 ms to 530.010 ms against the table above, both about
+to 55.886 ms and 547.481 ms to 530.010 ms against the superseded table, both about
 3% faster, while the same rows' `scalar` and `sse4.1` columns land within 1% of
 their table values (88.922 against 89.626, 55.341 against 54.769, 843.440
-against 851.069, 523.280 against 520.861). `rdo_intra`, which runs the same
+against 851.069, 523.280 against 520.861, all from that draw). `rdo_intra`, which runs the same
 `rdcost::satd` through a mode search that never calls `sad`, is unmoved at
-1.48x/1.50x against the table's 1.49x/1.49x — one round of run-to-run noise on
+1.48x/1.50x against that draw's 1.49x/1.49x — one round of run-to-run noise on
 a row the change does not reach. So the 3% is attributable to the routing
 rather than to the host or the round.
 
@@ -2009,12 +2106,15 @@ encodes with the other AVX2 dispatch sites (`hevc_fwd_transform_quant`,
 not a threshold.
 
 The whole-frame groups are the practical consequence. `hevc_encode_640x352`
-reads 65.257 ms under `avx2` against the table's 67.101 ms and
+reads 65.257 ms under `avx2` against that draw's 67.101 ms and
 `hevc_encode_1920x1088` 628.680 ms against 646.477 ms, so an x86_64 user
 encoding HEVC on an AVX2 host gets about 2.8% of a whole encode back — the two
-arms are now 0.3% and 0.6% apart where the table has them 4.3% and 4.0% apart.
+arms are now 0.3% and 0.6% apart where that draw had them 4.3% and 4.0% apart.
+#387 turned that 2.8% into about 28%, and the table above is where that reads.
 `av1_encode_stage_coeff_ctx` reads 1.4647 ms and 1.4745 ms on this host, 0.7%
-apart, which is #362's redirect reproducing on the table's own hardware.
+apart, which is #362's redirect reproducing on the committed table's own
+hardware — a state #371 has since separated again, at 1.181 ms against 1.409 ms
+in the table above.
 
 - `hevc_encode_*_rdo_inter`. The same family, a different mechanism, and *not*
   the same fix. `rdcost::sad_avx2`'s 256-bit loop needs `w >= 32` and
@@ -2037,7 +2137,10 @@ apart, which is #362's redirect reproducing on the table's own hardware.
   losing, and it moves the search's candidate ordering with it, so it is an
   optimization rather than a defect fix. Measured under [The #370
   re-measurement](#the-370-re-measurement) and [The #387
-  re-measurement](#the-387-re-measurement).
+  re-measurement](#the-387-re-measurement); the table above now carries the end
+  state of both, at 2.31x and 2.34x `avx2` against `sse4.1`'s 1.55x and 1.56x,
+  so those two sections are the record of how each step was established rather
+  than the current numbers.
 
 #### The #387 re-measurement
 
@@ -2094,9 +2197,16 @@ The whole-frame groups are the practical consequence, since the mode search is
 most of what they do: `hevc_encode_640x352` reads 48.776 ms under `avx2` against
 68.400 ms under `sse4.1` and `hevc_encode_1920x1088` 472.23 ms against
 656.45 ms, so an x86_64 user encoding HEVC on an AVX2 host gets about 28% of a
-whole encode back, where #370's routing recovered 2.8% of it. The committed
-x86_64 table's two `hevc_encode_*_rdo_inter` rows, and the whole-frame rows
-above them, pre-date both changes.
+whole encode back, where #370's routing recovered 2.8% of it.
+
+The committed table above no longer pre-dates any of this — it is the reason
+this issue's re-draw happened — and it is the check on this round as well as its
+successor. Its three merged rounds read `hevc_encode_640x352_rdo_inter` at
+39.616 ms and `hevc_encode_1920x1088_rdo_inter` at 373.683 ms against the
+39.723 ms and 373.63 ms below, within 1% on both, and the whole-frame pair at
+48.870 ms and 467.708 ms against 48.776 ms and 472.23 ms. So the single round
+recorded here reproduces as an elementwise minimum of three on the same host
+model, which is the strongest form the attribution below can take.
 
 ## Hardware HEVC decoders
 
