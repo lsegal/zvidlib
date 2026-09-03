@@ -244,7 +244,9 @@ impl Av1CodecConfigurationRecord {
         if p[0] != 0x81 {
             return malformed("av1C marker or version is invalid");
         }
-        if p[2] & 0b11 != 0 || p[3] & 0b1110_0000 != 0 {
+        // Only `p[3]`'s top three bits are reserved. `p[2]`'s low two bits are
+        // `chroma_sample_position`, cross-checked and stored below.
+        if p[3] & 0b1110_0000 != 0 {
             return malformed("av1C reserved bits are nonzero");
         }
         let seq_profile = p[1] >> 5;
@@ -1171,6 +1173,35 @@ mod tests {
         b.bytes
     }
 
+    /// A reduced still-picture sequence header for 8-bit 4:2:0 Main profile
+    /// carrying `pos` as its `chroma_sample_position`.
+    fn reduced_sequence_payload_420(pos: u8) -> Vec<u8> {
+        let mut b = BitWriter::default();
+        b.bits(0, 3); // Main profile
+        b.bits(1, 1); // still_picture
+        b.bits(1, 1); // reduced_still_picture_header
+        b.bits(4, 5); // level 2.0
+        b.bits(0, 4); // one width bit
+        b.bits(0, 4); // one height bit
+        b.bits(0, 1); // max width minus one = 0
+        b.bits(0, 1); // max height minus one = 0
+        b.bits(0, 1); // use_128x128_superblock
+        b.bits(0, 1); // enable_filter_intra
+        b.bits(0, 1); // enable_intra_edge_filter
+        b.bits(0, 1); // enable_superres
+        b.bits(0, 1); // enable_cdef
+        b.bits(0, 1); // enable_restoration
+        b.bits(0, 1); // high_bitdepth
+        b.bits(0, 1); // monochrome
+        b.bits(0, 1); // color description absent
+        b.bits(0, 1); // studio range
+        b.bits(u32::from(pos), 2); // chroma_sample_position
+        b.bits(0, 1); // separate_uv_delta_q
+        b.bits(0, 1); // film grain absent
+        b.trailing_bits();
+        b.bytes
+    }
+
     fn obu(obu_type: u8, payload: &[u8]) -> Vec<u8> {
         assert!(payload.len() < 128);
         let mut bytes = vec![(obu_type << 3) | 0x02, payload.len() as u8];
@@ -1239,6 +1270,52 @@ mod tests {
             Av1CodecConfigurationRecord::parse(&extended_av1c(&record), &Limits::default())
                 .unwrap();
         assert_eq!(extended, parsed);
+    }
+
+    #[test]
+    fn av1c_accepts_every_chroma_sample_position() {
+        for pos in 0..4u8 {
+            // seq_tier_0 = 0, 8-bit, colour, 4:2:0 subsampling, and `pos` in the
+            // low two bits that used to be refused as reserved.
+            let byte2 = 0x0c | pos;
+
+            let bare = Av1CodecConfigurationRecord::parse(
+                &av1c(&[0x81, 0x04, byte2, 0]),
+                &Limits::default(),
+            )
+            .unwrap();
+            assert_eq!(bare.chroma_sample_position, pos);
+            assert!(bare.chroma_subsampling_x);
+            assert!(bare.chroma_subsampling_y);
+
+            // The same value also has to survive the sequence-header agreement
+            // check against an OBU that declares it.
+            let mut record = vec![0x81, 0x04, byte2, 0];
+            record.extend_from_slice(&obu(1, &reduced_sequence_payload_420(pos)));
+            let cross_checked =
+                Av1CodecConfigurationRecord::parse(&av1c(&record), &Limits::default()).unwrap();
+            assert_eq!(cross_checked.chroma_sample_position, pos);
+        }
+    }
+
+    #[test]
+    fn av1c_still_rejects_p3_reserved_bits_and_sequence_header_disagreement() {
+        for reserved in [0b0010_0000u8, 0b0100_0000, 0b1000_0000] {
+            let error = Av1CodecConfigurationRecord::parse(
+                &av1c(&[0x81, 0x04, 0x0c, reserved]),
+                &Limits::default(),
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::MalformedMedia);
+        }
+
+        // A record whose `chroma_sample_position` contradicts its sequence
+        // header is still malformed; the field is checked, not ignored.
+        let mut record = vec![0x81, 0x04, 0x0d, 0];
+        record.extend_from_slice(&obu(1, &reduced_sequence_payload_420(2)));
+        let error =
+            Av1CodecConfigurationRecord::parse(&av1c(&record), &Limits::default()).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::MalformedMedia);
     }
 
     #[test]
