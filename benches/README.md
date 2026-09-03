@@ -717,6 +717,117 @@ four samples where an `i16` formulation would cover eight. That is a change to
 how sample planes are represented across `engine`, not a change to `filter_taps`,
 and it is tracked separately rather than folded in here.
 
+That became issue #378, and the section below is its answer: the kernel does go
+about twice as fast at 16-bit width, and it turns out that only buys anything on
+one of the four phase cases, for a reason that is about the *caller* rather than
+the kernel.
+
+#### `filter_taps` at 16-bit width: where the doubled lane count survives the trip
+
+Issue #378 asked whether narrowing the interpolation sample path from `i32` to
+`i16` recovers what #309 and #312 could not. Three findings, in the order they
+constrain each other.
+
+**The 16-bit accumulator is in range at eight bits, and only at eight bits.**
+`shift1` is `Min( 4, BitDepth − 8 )`, so it is zero for eight-bit content and the
+tap accumulation is not scaled down before it lands. A partial sum of
+`Σ coeffs[t] · taps[t][i]` taken in tap order is a subset sum, so it is bounded by
+the all-negative and all-positive subsets. The widest §8.5.3.3.3.2 kernel is
+`[ −1, 4, −11, 40, 40, −11, 4, −1 ]`, whose positive coefficients sum to 88 and
+negative to −24, so with samples in `0..=255` the reachable interval is
+`−6120..=22440` — inside `i16`, with room to spare. At nine bits it is not
+(`88 · 511 = 44968`), and the arrangement collapses. So this is an eight-bit fast
+path, not a change to how planes are represented, and the higher bit depths keep
+the `i32` kernel untouched.
+
+**Only an `i16` *accumulator* wins; `i16` operands alone win nothing.** This is
+the finding that decides the shape of everything else. A widening multiply-
+accumulate — `vmlal_s16` on NEON, `vmlal_high_s16` for the top half — reads
+`i16` lanes but still produces four `i32` lanes per instruction, exactly what
+`vmlaq_s32` produces. Timed against the `i32` kernel over the row-length sweep it
+reads 1.18x at a row of 8, 1.04x at 64 and **1.00x at 256**: the whole of its
+small-row advantage is halved load bandwidth, and at long rows there is nothing
+left. The doubling only exists with `vmlaq_n_s16`, which keeps eight lanes all
+the way through the accumulator. `simd::filter_taps_narrow` is that kernel, and
+`simd::measure_narrow_filter_taps` A/Bs it against `filter_taps` on the same
+sweep, in one process, interleaved, best of nine rounds:
+
+| Samples per call | `i32` `neon` | `i16` `neon` | narrow | `i32` `scalar` | `i16` `scalar` | narrow |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 4 | 3.88 ms | 4.05 ms | 0.96x | 13.56 ms | 8.87 ms | 1.53x |
+| 8 | 2.22 ms | 2.20 ms | 1.01x | 7.60 ms | 6.94 ms | 1.09x |
+| 16 | 1.76 ms | 1.31 ms | 1.34x | 3.85 ms | 5.34 ms | 0.72x |
+| 32 | 1.56 ms | 0.94 ms | 1.66x | 2.35 ms | 2.47 ms | 0.95x |
+| 64 | 1.60 ms | 0.87 ms | 1.84x | 2.03 ms | 1.86 ms | 1.09x |
+| 128 | 1.52 ms | 0.82 ms | 1.85x | 1.73 ms | 1.55 ms | 1.12x |
+| 256 | 1.50 ms | 0.80 ms | 1.89x | 1.63 ms | 1.45 ms | 1.12x |
+
+The kernel reaches **1.89x** where #309 established the `i32` kernel was already
+at the M1's integer SIMD multiply throughput, which is the expected answer: the
+limit was multiplies per cycle, and this issues half as many for the same work.
+Below a row of eight there is no 16-bit vector loop to reach — the call is the
+4-wide widening remainder plus the cost of having narrowed its source — so the
+narrow-width chroma blocks keep the `i32` kernel.
+
+**But a block is not a kernel, and only one phase case keeps the win.**
+`measure_narrow_vs_wide_block` A/Bs the two arms through the whole of
+`interp_block` — the block walk, the source narrowing and the allocations
+included — at the half-pel phase, in one process, best of fifteen rounds, with
+the two arms asserted equal sample-for-sample before anything is timed:
+
+| Phase | 8x8 | 16x16 | 32x32 | 64x64 |
+| --- | ---: | ---: | ---: | ---: |
+| horizontal-only (a/b/c) | 0.82x | 0.99x | 0.94x | 1.04x |
+| vertical-only (d/h/n) | 1.37x | 1.22x | 1.25x | 1.43x |
+| two-dimensional (e/i/p, f/j/q, g/k/r) | 0.92x | 0.95x | 0.99x | 1.02x |
+
+Same kernel in all three rows, at 1.89x in isolation, and only the middle row
+keeps any of it. **What separates them is who pays to narrow the source.** The
+vertical-only case reaches its taps through `RefPlane::gather`, which
+materializes a `w x ( h + N − 1 )` buffer either way, so writing that buffer as
+`i16` instead of `i32` costs nothing at all — same store count, half the bytes —
+and the kernel's advantage arrives intact. The other two reach theirs through
+`RefPlane::row_window`, which **borrows the plane outright with no copy** when
+the window lies inside it, which is the common case. Narrowing there has to
+introduce a materialized pass that the `i32` path never performs, and that pass
+costs about what the wider lanes save. The two-dimensional case is worse again
+for a second, independent reason: only its horizontal pass can narrow at all. Its
+vertical pass multiplies a 16-bit intermediate by a coefficient of up to 58, so
+it needs a 32-bit accumulator, and by the finding above that is the same lane
+count the `i32` kernel already issues.
+
+So `interp_block` takes the narrow path for the vertical-only phase, at eight
+bits, on a vector backend, at rows of eight samples or more — the four conditions
+`inter_pred::narrows` spells out — and nowhere else. Both arms stay spelled out
+inside `interp_block_with_width` rather than one of them being deleted, the same
+arrangement `measure_2d_ring_vs_flat` uses, so the table above stays reproducible
+after the decision it justifies.
+
+**The whole-decode effect is below this host's noise floor, and the null control
+is what says so.** `inter_pred_filter` is about 27% of decode proper, the
+vertical-only phase is 3 of the 16 Table 8-8 combinations, and a 1.2-1.4x on that
+share is a low single-digit percentage of a decode. Paired against `main` through
+`hevc_decode_profile`, 48 frames, twelve interleaved rounds, elementwise minimum,
+the `neon` arm read 1.10x in one round set and 0.83x in another. The `scalar` arm
+is the control that settles it: `narrows` is false for `Isa::Scalar`, so both
+binaries execute identical code on that arm, and it still read 1.06x and 1.07x in
+those same two round sets. **A ±7% disagreement on an arm where the answer is
+known to be 1.00x is larger than the effect being measured**, and the host was
+running other work throughout. The in-process A/Bs above are the instrument for
+this question, for exactly the reason `measure_2d_ring_vs_flat` already gives:
+separate benchmark processes on this host disagree with each other by more than
+the effect. The committed `hevc_inter_pred` and `inter_pred_filter` rows are
+therefore left as they stand rather than redrawn from measurements that cannot
+resolve the change.
+
+No decoded sample moves on any backend or at any bit depth.
+`the_eight_bit_block_path_matches_the_per_sample_equations` runs every block
+shape, origin and phase of the eight-bit block path against the normative
+per-sample §8.5.3.3.3.2 / §8.5.3.3.3.3 equations, which are `i32` throughout —
+the guard that matters here, because `every_backend_matches_scalar_luma_block`
+compares vector kernels against the scalar one and at eight bits both of its
+sides would be the narrow formulation.
+
 Neither the decoded output nor any kernel changed in the course of this, so the
 sweep, the `hevc_inter_pred` ratio and the `inter_pred_filter` ms/frame rows
 above stand as re-measured.
