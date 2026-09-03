@@ -40,7 +40,7 @@ mod av1_decoder;
 /// arbitrary position faster than a decode from the nearest random-access point
 /// can give one. Portable: the store, the stride and the pass cursor compile
 /// everywhere, and only the driver differs - a thread in [`previews::PreviewIndex`]
-/// here, an idle callback in [`web_previews`] for the browser (issue #432).
+/// here, an idle callback in `web_previews` for the browser (issue #432).
 pub mod previews;
 
 #[cfg(not(target_arch = "wasm32"))]

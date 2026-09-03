@@ -37,7 +37,7 @@
 //! [`PreviewPass`] cursor that says which frame the next preview is of and what
 //! becomes of the picture once something has decoded it. Only the driver is
 //! native-only - [`PreviewIndex`]'s thread here, against an idle-callback slice
-//! in [`crate::web_previews`] for the browser. Both fill the same store, and a
+//! in `crate::web_previews` for the browser. Both fill the same store, and a
 //! [`PreviewStore`] is what [`ExactFrameReader::seek`] answers from on either
 //! target.
 //!
@@ -243,7 +243,7 @@ impl SeekPreviewSource for PreviewStore {
 ///
 /// What is *not* here is the loop. The pass walks forwards one preview at a
 /// time and something has to advance it: a thread on native ([`PreviewIndex`]),
-/// an idle callback in a browser ([`crate::web_previews`]). Both drive this, so
+/// an idle callback in a browser (`crate::web_previews`). Both drive this, so
 /// the stride derivation, the slot bookkeeping and the shrink are written once
 /// and a browser preview is the same picture a native one is.
 pub struct PreviewPass {
