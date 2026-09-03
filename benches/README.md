@@ -768,7 +768,7 @@ small-row advantage is halved load bandwidth, and at long rows there is nothing
 left. The doubling only exists with `vmlaq_n_s16`, which keeps eight lanes all
 the way through the accumulator. `simd::filter_taps_narrow` is that kernel, and
 `simd::measure_narrow_filter_taps` A/Bs it against `filter_taps` on the same
-sweep, in one process, interleaved, best of nine rounds:
+sweep, in one process, interleaved, best of nine rounds. On an **Apple M1**:
 
 | Samples per call | `i32` `neon` | `i16` `neon` | narrow | `i32` `scalar` | `i16` `scalar` | narrow |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -787,11 +787,48 @@ Below a row of eight there is no 16-bit vector loop to reach — the call is the
 4-wide widening remainder plus the cost of having narrowed its source — so the
 narrow-width chroma blocks keep the `i32` kernel.
 
+**The same sweep on x86_64 (issue #435).** Every figure above is a NEON figure,
+and `narrows` admits `Avx2` and `Sse41` too, where the `i32` kernel issues eight
+and four lanes rather than NEON's four — so the lane-count half of the argument
+is not the same argument on all three. Taken on an **Intel Core i9-10850K (10
+cores, Windows)**, best of nine rounds, as a range over three consecutive
+invocations of the same binary:
+
+| Samples per call | `sse4.1` | `avx2` | `scalar` |
+| --- | ---: | ---: | ---: |
+| 4 | 0.73-0.88x | 0.81-0.90x | 0.70-0.85x |
+| 8 | 1.10-1.16x | 0.95-1.13x | 0.78-0.81x |
+| 16 | 1.25-1.39x | 1.04-1.13x | 0.63-0.74x |
+| 32 | 1.41-1.52x | 1.30-1.52x | 0.64-0.65x |
+| 64 | 1.67-1.81x | 1.38-1.76x | 0.56-0.57x |
+| 128 | 1.94-2.03x | 1.70-1.73x | 0.57-0.61x |
+| 256 | 2.08-2.09x | 2.06-2.11x | 0.56-0.62x |
+
+**The kernel finding transfers, and then some**: both x86 backends reach about
+**2.1x** at a long row, above NEON's 1.89x, and for the same reason — the `i32`
+kernel is at the host's integer SIMD multiply throughput and this issues half as
+many multiplies. AVX2 reaching it as well as SSE4.1 is worth stating explicitly,
+because the eight-lane `i32` kernel is the case where doubling the lanes might
+have run out of execution ports first, and it does not. This sweep is shorter
+than the block one below and correspondingly noisier: a fourth invocation read
+3.00x at a row of 256 on `sse4.1`, entirely from a slow draw on its `i32` arm
+(4.59 ms against the 3.13 ms the other two read), and it is excluded above as
+host interference rather than a reading.
+
+**The `scalar` column is the control, and on this host it is unambiguous.**
+`narrows` is false for `Isa::Scalar`, and the scalar arm reads **0.56x to 0.85x
+at every length**, worse the longer the row: with one multiply per instruction
+either way, narrowing the source is pure cost, exactly as the second condition
+claims. The M1's scalar column reads 0.72x to 1.53x with no such trend, so this
+is the sharper of the two demonstrations that the condition is about vector
+lanes rather than about `i16` being smaller.
+
 **But a block is not a kernel, and only one phase case keeps the win.**
 `measure_narrow_vs_wide_block` A/Bs the two arms through the whole of
 `interp_block` — the block walk, the source narrowing and the allocations
 included — at the half-pel phase, in one process, best of fifteen rounds, with
-the two arms asserted equal sample-for-sample before anything is timed:
+the two arms asserted equal sample-for-sample before anything is timed. On an
+**Apple M1**:
 
 | Phase | 8x8 | 16x16 | 32x32 | 64x64 |
 | --- | ---: | ---: | ---: | ---: |
@@ -799,8 +836,51 @@ the two arms asserted equal sample-for-sample before anything is timed:
 | vertical-only (d/h/n) | 1.37x | 1.22x | 1.25x | 1.43x |
 | two-dimensional (e/i/p, f/j/q, g/k/r) | 0.92x | 0.95x | 0.99x | 1.02x |
 
-Same kernel in all three rows, at 1.89x in isolation, and only the middle row
-keeps any of it. **What separates them is who pays to narrow the source.** The
+And on the same **Intel Core i9-10850K**, as a range over three consecutive
+invocations — the sweep now walks every vector backend the host offers rather
+than only `detected_isa()`, interleaving the backends with each other as well as
+the two arms:
+
+| Phase | backend | 8x8 | 16x16 | 32x32 | 64x64 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| horizontal-only (a/b/c) | `sse4.1` | 0.83x | 0.94-0.95x | 1.09-1.11x | 1.13-1.14x |
+| horizontal-only (a/b/c) | `avx2` | 0.79-0.81x | 0.84-0.85x | 0.95-0.97x | 0.97-0.99x |
+| vertical-only (d/h/n) | `sse4.1` | 1.00-1.02x | 1.12-1.13x | 1.23-1.24x | 1.29-1.31x |
+| vertical-only (d/h/n) | `avx2` | 0.95-0.97x | 1.05-1.06x | 1.12x | 1.10-1.12x |
+| two-dimensional | `sse4.1` | 0.88-0.90x | 0.96-0.97x | 1.03-1.05x | 1.07-1.08x |
+| two-dimensional | `avx2` | 0.85-0.87x | 0.88-0.89x | 0.97-0.98x | 0.98-1.03x |
+
+Unlike the whole-decode instrument #431 and #434 wrestled with on this same
+host, this one resolves the question it is asked: the three invocations agree to
+within **±0.02x** on every cell, against effects of 10% to 30%. That is what an
+in-process A/B over a fixed working set buys, and it is why the isolated
+measurement rather than the whole-decode one is what the routing decision rests
+on.
+
+**The phase finding transfers to both x86 backends; its size does not.** The
+vertical-only row is the only one above parity at every width on both backends,
+and the ordering of the three phases is the same on all three instruction sets,
+so the "who pays to narrow the source" argument below is not a NEON artefact.
+But the win is **smaller on x86 than on NEON, and smallest on the widest
+backend**: at 64x64 the vertical-only phase reads 1.43x on NEON, 1.29-1.31x on
+`sse4.1` and 1.10-1.12x on `avx2`. That ordering is the lane-count prediction
+issue #435 made, confirmed: AVX2's `i32` kernel already issues eight lanes per
+multiply, so doubling to sixteen `i16` lanes has proportionally less of the
+block's remaining cost to remove, while SSE4.1 goes four to eight exactly as
+NEON does and lands nearer NEON's figure.
+
+**At a block width of eight the x86 win is gone.** The vertical-only phase reads
+1.00-1.02x on `sse4.1` and **0.95-0.97x on `avx2`** at 8x8, where NEON reads
+1.37x — reproducibly, and the corresponding row-8 kernel reading is marginal on
+AVX2 too (0.95-1.13x above). `narrows` admits those blocks on its `w >= 8`
+condition, which is a NEON reading. This is a real gap in the evidence for a
+*different* condition than the one #435 set out to settle, it costs at most a
+few percent of one phase of one stage on the width where it is wrong, and
+tightening it means making the threshold instruction-set-dependent — so it is
+filed as follow-up work rather than changed here on one host's draw.
+
+Same kernel in all three rows, at 1.89x to 2.1x in isolation, and only the
+middle row keeps any of it. **What separates them is who pays to narrow the source.** The
 vertical-only case reaches its taps through `RefPlane::gather`, which
 materializes a `w x ( h + N − 1 )` buffer either way, so writing that buffer as
 `i16` instead of `i32` costs nothing at all — same store count, half the bytes —
@@ -816,10 +896,15 @@ count the `i32` kernel already issues.
 
 So `interp_block` takes the narrow path for the vertical-only phase, at eight
 bits, on a vector backend, at rows of eight samples or more — the four conditions
-`inter_pred::narrows` spells out — and nowhere else. Both arms stay spelled out
-inside `interp_block_with_width` rather than one of them being deleted, the same
-arrangement `measure_2d_ring_vs_flat` uses, so the table above stays reproducible
-after the decision it justifies.
+`inter_pred::narrows` spells out — and nowhere else. The **"a vector backend"**
+condition now stands on a measurement from each of the three backends it admits
+rather than from NEON alone: `neon` 1.22-1.43x, `sse4.1` 1.12-1.31x and `avx2`
+1.05-1.12x on the phase it routes, against a `scalar` control that is a loss at
+every row length on both hosts. It is therefore kept as `isa != Isa::Scalar`
+rather than narrowed to the backends #378 happened to measure. Both arms stay
+spelled out inside `interp_block_with_width` rather than one of them being
+deleted, the same arrangement `measure_2d_ring_vs_flat` uses, so the tables above
+stay reproducible after the decision they justify.
 
 **The whole-decode effect is below this host's noise floor, and the null control
 is what says so.** `inter_pred_filter` is about 27% of decode proper, the
