@@ -86,6 +86,15 @@ const DEFAULT_FRAMES: usize = 48;
 /// Twelve because that is what issue #426 records the unusable cross-process
 /// pairing as having used, so the in-process instrument is asked for its
 /// answer at the same round count rather than at a more generous one.
+///
+/// Raising this does not lower the floor the run reports, and issue #434
+/// measured that: 51 rounds read a *worse* floor than 21 on the same host
+/// (6.37% against 4.43%). The floor comes from an interquartile width of the
+/// host's round-to-round scatter, which estimates a spread rather than
+/// averaging one away, so it does not shrink as `1/sqrt(n)` — a longer run only
+/// catches more of the interference it is measuring. More rounds buy a
+/// better-estimated noise floor, never a lower one; only a quieter host does
+/// that. See `benches/README.md`.
 const PAIR_ROUNDS: usize = 12;
 
 fn main() {

@@ -254,7 +254,7 @@ pub(crate) fn reconstruct_picture(
             src,
             cfg.sao_luma,
             cfg.sao_chroma,
-            SaoLambda::closed_form(0),
+            0,
             cfg.sao_band_search,
         );
         pic = crate::hevc::engine::sao::apply_sao_picture_full(
@@ -659,26 +659,15 @@ pub(crate) const SAO_OFFSET_MAX: i32 = 7;
 /// prediction reads the *unfiltered* neighbours — the grid returned here
 /// describes the picture's output, never this picture's own prediction input.
 ///
-/// `lambda` is passed through to [`estimate_sao`], which is what makes the
+/// `lambda_q8` is passed through to [`estimate_sao`], which is what makes the
 /// per-CTB decision charge for the syntax the caller then writes.
 pub(crate) fn sao_reconstruction(
     recon: &mut ReconstructedPicture,
     src: SourcePlanes<'_>,
-    lambda: SaoLambda,
+    lambda_q8: u32,
 ) -> Vec<ResolvedSao> {
-    let (width, height) = (recon.width, recon.height);
-    let mut pic = Picture::new(width, height, CHROMA_ARRAY_TYPE, BIT_DEPTH, BIT_DEPTH);
-    for (plane, samples) in [
-        (Plane::Luma, &recon.y),
-        (Plane::Cb, &recon.cb),
-        (Plane::Cr, &recon.cr),
-    ] {
-        let (buf, _) = pic.plane_mut(plane);
-        for (dst, &src) in buf.iter_mut().zip(samples) {
-            *dst = i32::from(src);
-        }
-    }
-    let grid = estimate_sao(&pic, src, true, true, lambda, true);
+    let pic = as_picture(recon);
+    let grid = estimate_sao(&pic, src, true, true, lambda_q8, true);
     let pic = crate::hevc::engine::sao::apply_sao_picture_full(
         pic,
         &grid,
@@ -693,6 +682,28 @@ pub(crate) fn sao_reconstruction(
     recon.cb = plane_to_u8(&pic, Plane::Cb);
     recon.cr = plane_to_u8(&pic, Plane::Cr);
     grid
+}
+
+/// A reconstruction's three planes as the [`Picture`] the SAO stage reads.
+fn as_picture(recon: &ReconstructedPicture) -> Picture {
+    let mut pic = Picture::new(
+        recon.width,
+        recon.height,
+        CHROMA_ARRAY_TYPE,
+        BIT_DEPTH,
+        BIT_DEPTH,
+    );
+    for (plane, samples) in [
+        (Plane::Luma, &recon.y),
+        (Plane::Cb, &recon.cb),
+        (Plane::Cr, &recon.cr),
+    ] {
+        let (buf, _) = pic.plane_mut(plane);
+        for (dst, &src) in buf.iter_mut().zip(samples) {
+            *dst = i32::from(src);
+        }
+    }
+    pic
 }
 
 /// Encoder-side §7.3.8.3 SAO parameter estimation.
@@ -725,10 +736,10 @@ pub(crate) fn sao_reconstruction(
 /// under band offset, its own `sao_band_position` — no position is inferred —
 /// which is the whole of what the syntax gives cIdx 2 of its own.
 ///
-/// `lambda` is the pair of §9 rate-distortion multipliers the candidates are
-/// priced with — see [`SaoLambda`]. SAO costs per-CTB syntax
-/// on every CTB it is enabled for, so a candidate is taken only when its SSE
-/// reduction clears `lambda * bins`, the bins being the §9.3.3 binarization's
+/// `lambda_q8` is the §9 rate-distortion multiplier the candidates are priced
+/// with, in the 1/256 units [`crate::hevc::engine::encoder::rdo::lambda_q8`]
+/// returns. SAO costs per-CTB syntax on every CTB it is enabled for, so a
+/// candidate is taken only when its SSE reduction clears `lambda_q8 * bins`, the bins being the §9.3.3 binarization's
 /// own count for the parameters that would be coded. At a zero `lambda` the
 /// test degrades to "any reduction at all", which is what a caller that codes
 /// no syntax for the decision wants.
@@ -737,23 +748,61 @@ fn estimate_sao(
     src: SourcePlanes<'_>,
     sao_luma: bool,
     sao_chroma: bool,
-    lambda: SaoLambda,
+    lambda_q8: u32,
     band_search: bool,
 ) -> Vec<ResolvedSao> {
     let w_ctbs = src.width.div_ceil(CTB);
     let h_ctbs = src.height.div_ceil(CTB);
+    let chroma_stride = src.width / 2;
     let mut grid = vec![ResolvedSao::off(); w_ctbs * h_ctbs];
     for ry in 0..h_ctbs {
         for rx in 0..w_ctbs {
-            let cell = &mut grid[ry * w_ctbs + rx];
-            if sao_luma {
-                cell.components[0] = best_luma_sao(pic, src, rx, ry, lambda, band_search);
+            let addr = ry * w_ctbs + rx;
+            let luma = sao_luma.then(|| {
+                PlaneStats::gather(pic, Plane::Luma, src.y, src.width, rx, ry, band_search)
+            });
+            let chroma = sao_chroma.then(|| {
+                [
+                    PlaneStats::gather(pic, Plane::Cb, src.cb, chroma_stride, rx, ry, band_search),
+                    PlaneStats::gather(pic, Plane::Cr, src.cr, chroma_stride, rx, ry, band_search),
+                ]
+            });
+            // The structure this CTB would code for itself. Its luma and its
+            // chroma pair are chosen independently because the bins
+            // [`cell_bins`] counts for the two are separable, so the best
+            // pair is the pair of bests.
+            let mut standalone = ResolvedSao::off();
+            if let Some(stats) = &luma {
+                standalone.components[0] = best_luma_component(stats, lambda_q8, band_search);
             }
-            if sao_chroma {
-                let [cb, cr] = best_chroma_sao(pic, src, rx, ry, lambda, band_search);
-                cell.components[1] = cb;
-                cell.components[2] = cr;
+            if let Some([cb, cr]) = &chroma {
+                let [best_cb, best_cr] = best_chroma_components(cb, cr, lambda_q8, band_search);
+                standalone.components[1] = best_cb;
+                standalone.components[2] = best_cr;
             }
+            let left = (rx > 0).then(|| grid[addr - 1]);
+            let above = (ry > 0).then(|| grid[addr - w_ctbs]);
+            let score = |cell: &ResolvedSao| {
+                let (mode, band) = coding_bins(cell, left, above);
+                let gain = cell_gain(cell, luma.as_ref(), chroma.as_ref());
+                rd_score(gain, mode + band, lambda_q8)
+            };
+            // "Off" first and the two merges before the structure, so that a
+            // tie is broken towards the cell that codes the least. A merge
+            // scoring exactly what the standalone structure scores is the
+            // same trade for this CTB and a cheaper neighbour for the next
+            // one, which is a preference the score itself cannot express
+            // because it only sees this CTB.
+            let mut best = ResolvedSao::off();
+            let mut best_score = score(&best);
+            for candidate in [left, above, Some(standalone)].into_iter().flatten() {
+                let candidate_score = score(&candidate);
+                if candidate_score > best_score {
+                    best_score = candidate_score;
+                    best = candidate;
+                }
+            }
+            grid[addr] = best;
         }
     }
     grid
@@ -783,16 +832,18 @@ fn offset_abs_bins(offsets: &[i32; 5]) -> u64 {
 /// less the §7.3.8.3 syntax it has to be signalled with, in the same units
 /// the mode decision uses.
 ///
-/// `bins` are priced at [`SaoLambda::mode_q8`] and `band_bins` — band
-/// offset's own syntax, the rate the closed form was never derived for — at
-/// [`SaoLambda::band_q8`]. A candidate that codes no band syntax passes 0.
+/// Every bin is priced at the one closed-form multiplier, because `bins` is
+/// what [`coding_bins`] says `code_sao` will really write for the candidate
+/// rather than what its structure would cost standalone. There is no second
+/// multiplier: what a band component used to be charged beyond its own
+/// syntax was the merge it forfeits, and the search now counts that merge
+/// instead of pricing a constant in its place.
 ///
 /// Positive means the candidate is worth coding at all; the largest score
-/// wins, which is what lets edge offset and band offset be compared against
-/// each other and against "off" in one decision rather than two.
-fn rd_score(gain: i64, bins: u64, band_bins: u64, lambda: SaoLambda) -> i64 {
-    let rate = bins * u64::from(lambda.mode_q8) + band_bins * u64::from(lambda.band_q8);
-    gain - (rate / 256) as i64
+/// wins, which is what lets edge offset, band offset, the two merges and
+/// leaving SAO off be compared in one decision rather than several.
+fn rd_score(gain: i64, bins: u64, lambda_q8: u32) -> i64 {
+    gain - (bins * u64::from(lambda_q8) / 256) as i64
 }
 
 /// The widest the slice-level SAO decision's calibrated multiplier is allowed
@@ -800,165 +851,8 @@ fn rd_score(gain: i64, bins: u64, band_bins: u64, lambda: SaoLambda) -> i64 {
 /// two-point measurement of one picture is trusted over the closed form —
 /// and, because it is a bound known before the measurement is taken, it is
 /// also what lets `keeps_sao` skip the measurement whenever the decision is
-/// already outside the band, and what bounds the band-syntax charge
-/// [`SaoLambda::band_q8`] carries.
+/// already outside the band.
 pub(super) const SAO_LAMBDA_BAND: u64 = 4;
-
-/// What band offset's own syntax is charged per bin, as a multiple of
-/// `lambda_q8`, numerator over denominator.
-///
-/// 5/2 is 2.47x rounded to the precision one sweep supports: the merge a band
-/// component forfeits, measured over the QP 12-51 sweep on both test pictures
-/// at both sizes as 2517 coded bins spent against 1018 band-syntax bins
-/// charged. See [`SaoLambda::band_q8`] for the derivation and
-/// `the_band_syntax_charge_is_the_merge_a_band_component_forfeits` for the
-/// measurement. The sweep is byte-identical at 247/100 and at 5/2, so the
-/// rounding is not a decision.
-const BAND_SYNTAX_CHARGE_NUM: u32 = 5;
-const BAND_SYNTAX_CHARGE_DEN: u32 = 2;
-
-/// The two §9 rate-distortion multipliers the per-CTB SAO search prices
-/// syntax with, both in the 1/256 units
-/// [`crate::hevc::engine::encoder::rdo::lambda_q8`] returns.
-///
-/// Two, because the search prices two kinds of bit and only one of them is
-/// what the closed form was derived for. Inside a picture already committed
-/// to coding `sao( )` on every CTB, choosing an edge class — or choosing
-/// offsets at all — is a choice between two codings of one CTB at one QP,
-/// where the picture cancels out of the comparison and `lambda_q8` is the
-/// right instrument. Band offset's own syntax is not that: its five
-/// `sao_band_position` bins and its `sao_offset_sign` bins are rate that buys
-/// a value-range correction no edge class can reach, and what that rate is
-/// worth is a property of the content in the same way the slice-level
-/// decision's is.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) struct SaoLambda {
-    /// What every bin the closed form is derived for costs: the type and
-    /// class bins, and the offsets' own truncated-Rice bins.
-    pub(crate) mode_q8: u32,
-    /// What band offset's own syntax costs — the five `sao_band_position`
-    /// bins and the `sao_offset_sign` bins.
-    ///
-    /// #287 set out to read this off the slice-level probe, the way
-    /// `calibrated_sao_lambda_q8` reads the slice-level multiplier, so that
-    /// the search and the acceptance test would price the same bits alike.
-    /// The QP 12-51 sweep on both test pictures at both sizes says it cannot
-    /// be, and brackets it instead. Three measurements, all recorded by
-    /// `sao_sweep`:
-    ///
-    /// - The probe's own price for a marginal bit — the tangent to this
-    ///   picture's curve at its coded point, which is the steepest thing the
-    ///   probe can be read for — lands at 1.1x to 1.4x `lambda_q8`.
-    /// - Below 1.5x, the writer accepts a band component at noise 128x96
-    ///   QP 32 that puts the slice 0.003 dB under its own SAO-off curve,
-    ///   breaking `every_accepted_sao_point_sits_on_the_writers_own_curve`.
-    /// - At [`SAO_LAMBDA_BAND`], the trust bound, band offset is never
-    ///   selected at all and #274's operating points go with it.
-    ///
-    /// So the probe's own answer sits below the floor the invariant needs,
-    /// and the charge stays a constant inside the measured window
-    /// [1.5x, 4x) — narrowed by measurement, not derived from one.
-    ///
-    /// #344 re-took that sweep against the repaired slice-level rule to see
-    /// whether the window's floor moves, and it does not: at 1.4x and at
-    /// 1.1x, the two ends of what the probe measures, the same noise 128x96
-    /// QP 32 slice lands the same 2079 bytes the same 0.003 dB under its own
-    /// curve, byte for byte and millibel for millibel, on the repaired rule
-    /// and on the one before it alike. The charge is therefore not standing
-    /// in for anything the slice-level rule was getting wrong, and #344
-    /// concluded that what closes the gap has to be a price on the search.
-    ///
-    /// # What the search misprices is §7.3.8.3's merge
-    ///
-    /// It is not a bit the band component codes; it is a structure its
-    /// neighbours stop being able to elide. `code_sao` writes one
-    /// `sao_merge_left_flag` or `sao_merge_up_flag` in place of a whole
-    /// `sao( )` structure whenever a CTB's three components are exactly its
-    /// left or above neighbour's. The per-CTB search never sees that: it
-    /// scores every candidate against the structure it would code standalone,
-    /// so a CTB that was about to cost one flag and a CTB that was about to
-    /// cost twenty bins look the same to it.
-    ///
-    /// The blindness is not symmetric between the two types, which is what
-    /// puts the whole of it on band offset. An edge component picks one of
-    /// four classes and lets §7.4.9.3 infer its four signs, so two
-    /// neighbouring CTBs of one kind of content resolve to identical
-    /// parameters routinely — 29 of the 48 CTBs of the noise picture at
-    /// 128x96 and QP 12 merge. A band component picks one of 32 positions and
-    /// four signed offsets per component, so two neighbours essentially never
-    /// do: pricing band offset at the closed form on that same picture takes
-    /// the band components from 2 to 10 and the merges from 29 to 22. Seven
-    /// whole structures were coded where seven flags had been, and not one
-    /// bin of that is a bin the band components code.
-    ///
-    /// # The charge is that merge, measured
-    ///
-    /// [`coding_bins`] is the search's own rate model made exact — the flags
-    /// `code_sao` codes for a cell, and the structure it codes only when
-    /// neither merge fires — and
-    /// `the_coded_rate_model_agrees_with_what_the_writer_spends` holds it
-    /// against the bits the writer actually spends, worst 9.5% over six
-    /// operating points, the residual being the merge and type-idx bins that
-    /// are context-coded and cost less than a bin each. Summed over a grid by
-    /// [`grid_bins`], it says what band offset costs a whole picture:
-    ///
-    /// ```text
-    /// charge = ( bins with band offset available
-    ///            - bins with band offset priced out at SAO_LAMBDA_BAND )
-    ///          / band-syntax bins the band components code
-    /// ```
-    ///
-    /// The numerator is every bin band offset costs, forfeited merges
-    /// included; the denominator is the part of it the search can see. Over
-    /// the QP 12-51 sweep on both test pictures at both sizes that is 2517
-    /// bins against 1018, or **2.47x** — which is the fitted 2.5x, derived.
-    /// The constant does not move: `sao_sweep` is byte-identical at 247/100
-    /// and at 5/2, so what changed is that the value is now a measurement of
-    /// the merge rather than a fit to the boundary where the invariant is
-    /// next measured to break.
-    ///
-    /// It is far above the 1.1x-1.4x the two-point probe measures a marginal
-    /// bit at, and that is the expected answer rather than a discrepancy: the
-    /// probe prices a bit of *this slice's own coded rate*, and the forfeited
-    /// merge is not one. Per-QP the ratio runs from 0.50x to 4.00x — a
-    /// constant is the right shape only in aggregate, because how much merge
-    /// a band component destroys is a property of how much its neighbours
-    /// agreed with each other, which is content and not rate.
-    ///
-    /// What is *not* landed is the obvious next step, giving the search
-    /// [`coding_bins`] directly instead of a constant standing in for it.
-    /// That was built and swept: it raises the merges on that picture from 29
-    /// to 32, keeps every #274 operating point, and prices SAO correctly
-    /// enough that the slice-level rule then accepts it at QPs it used to
-    /// decline — and two of those acceptances land 0.001 dB and 0.011 dB
-    /// under the writer's own curve, at CTBs carrying no band component at
-    /// all. That is `SAO_ACCEPTANCE_RESOLUTION_NUM` again, a rule deciding on
-    /// margins forty times finer than it can resolve, and it is the same
-    /// blocker #344 recorded rather than anything about band offset. It is
-    /// tracked separately.
-    ///
-    pub(crate) band_q8: u32,
-}
-
-impl SaoLambda {
-    /// Both prices at the closed form, for a caller that codes no `sao( )`
-    /// syntax for its decision and so charges nothing for any of it.
-    pub(crate) fn closed_form(lambda_q8: u32) -> Self {
-        Self {
-            mode_q8: lambda_q8,
-            band_q8: lambda_q8,
-        }
-    }
-
-    /// The prices the writer searches with: the closed form for every bin it
-    /// was derived for, and [`SaoLambda::band_q8`] for band offset's own.
-    pub(crate) fn for_search(lambda_q8: u32) -> Self {
-        Self {
-            mode_q8: lambda_q8,
-            band_q8: (lambda_q8 * BAND_SYNTAX_CHARGE_NUM).div_ceil(BAND_SYNTAX_CHARGE_DEN),
-        }
-    }
-}
 
 /// The §7.3.8.3 bins one band-offset component costs that edge offset does
 /// not: the five fixed-length `sao_band_position` bins and a
@@ -967,7 +861,10 @@ impl SaoLambda {
 /// This is what makes band offset a different bet from edge offset at the
 /// same gain — it pays five position bins and up to four sign bins where edge
 /// offset pays two class bins and infers its signs — and it is the part of a
-/// band candidate's rate [`SaoLambda::band_q8`] prices. The offsets' own
+/// band candidate's rate a fitted band-syntax charge used to be applied to.
+/// It is priced at the one closed-form multiplier now, like every other bin,
+/// because what that charge stood in for is the merge [`coding_bins`] counts.
+/// The offsets' own
 /// truncated-Rice bins are counted by [`offset_abs_bins`] exactly as edge
 /// offset's are, and priced the same way, because they are the same kind of
 /// bit.
@@ -976,14 +873,14 @@ pub(crate) fn band_syntax_bins(offsets: &[i32; 5]) -> u64 {
 }
 
 /// The §7.3.8.3 bins one cell's own `sao( )` structure costs, split into the
-/// bins [`SaoLambda::mode_q8`] prices and the band-offset bins
-/// [`SaoLambda::band_q8`] does.
+/// structure's own bins and the band-offset bins [`band_syntax_bins`] counts.
 ///
-/// Absolute rather than marginal, which is what the per-CTB search's own
-/// scoring is not: it charges a candidate the bins it codes *beyond* leaving
-/// SAO off, because at that point in the decision the alternative is always
-/// this same CTB coding its own structure. [`coding_bins`] is where that
-/// stops being true.
+/// Absolute rather than marginal. The per-component searches
+/// [`best_luma_component`] and [`best_chroma_components`] still score
+/// marginally over leaving that component off, because there the alternative
+/// really is this same CTB coding its own structure and the "off" bin is
+/// common to both sides; [`coding_bins`] is where that stops being true and
+/// the cell-level decision is taken on absolute bins.
 pub(crate) fn cell_bins(cell: &ResolvedSao) -> (u64, u64) {
     let (mut mode, mut band) = (0u64, 0u64);
     // `sao_type_idx_luma`, then `sao_type_idx_chroma` for the pair — §7.4.9.3
@@ -1018,9 +915,8 @@ pub(crate) fn cell_bins(cell: &ResolvedSao) -> (u64, u64) {
 /// its left and above neighbours resolved to: the §7.3.8.3 merge flags
 /// `code_sao` codes for it, and the structure it codes only when neither
 /// merge fires.
-///
-/// This is the quantity the per-CTB search cannot see and the one the fitted
-/// band-syntax charge has been standing in for. `code_sao` merges on exact
+/// This is the quantity the per-CTB search is scored on, and what a fitted
+/// band-syntax charge used to stand in for. `code_sao` merges on exact
 /// equality of all three components, so a cell equal to a decided neighbour
 /// costs one flag in place of its whole structure. Edge offset picks one of
 /// four classes and lets §7.4.9.3 infer its signs, so two neighbouring CTBs
@@ -1030,8 +926,11 @@ pub(crate) fn cell_bins(cell: &ResolvedSao) -> (u64, u64) {
 /// syntax *and* the merge it forfeits — for itself, and for whichever
 /// neighbours would have merged with it — and none of that is a bin it codes.
 ///
-/// `the_band_syntax_charge_is_the_merge_a_band_component_forfeits` measures
-/// the difference and is what [`BAND_SYNTAX_CHARGE_NUM`] is now set from.
+/// This is the quantity the per-CTB search is scored on:
+/// [`estimate_sao`] walks the grid in the raster order `code_sao` writes it
+/// in, so the left and above cells are decided by the time this one is, and
+/// every candidate — including the two merges themselves — is priced at what
+/// the writer will really spend on it.
 pub(crate) fn coding_bins(
     cell: &ResolvedSao,
     left: Option<ResolvedSao>,
@@ -1120,12 +1019,106 @@ fn band_offsets(sums: &[i64; 32], counts: &[i64; 32], band_position: u8) -> (i64
         }
         let offset = div_round(sums[band], counts[band]).clamp(-SAO_OFFSET_MAX, SAO_OFFSET_MAX);
         offsets[k + 1] = offset;
-        // The SSE reduction of adding a constant `o` to `n` samples whose
-        // summed error is `s`: 2*o*s − n*o^2.
-        gain += 2 * i64::from(offset) * sums[band]
-            - counts[band] * i64::from(offset) * i64::from(offset);
+        gain += offset_gain(sums[band], counts[band], offset);
     }
     (gain, offsets)
+}
+
+/// Every statistic one CTB of one plane can be scored on: the summed and
+/// counted `source − reconstruction` error of each §8.7.3.2 edge category
+/// under each of the four classes, and of each of the 32 bands.
+///
+/// Gathered whole, rather than alongside the winner as the search finds it,
+/// because the search now scores candidates it did not generate. The two
+/// §7.3.8.3 merges take whatever the left or above neighbour resolved to —
+/// any class, any band position, and offsets chosen for a different CTB's
+/// error — so a search that kept only its own candidates' statistics could
+/// not say what a merge buys here.
+struct PlaneStats {
+    /// Per edge-offset class, the §8.7.3.2 per-category sums and counts
+    /// [`edge_offsets`] chooses from.
+    edge: [([i64; 5], [i64; 5]); 4],
+    /// Per §8.7.3.2 band index, the same sums and counts. All zero when the
+    /// caller cleared the band search, which is also when no cell in the grid
+    /// can carry a band component for a merge to copy.
+    band: ([i64; 32], [i64; 32]),
+}
+
+impl PlaneStats {
+    /// Gather one CTB of one plane.
+    fn gather(
+        pic: &Picture,
+        plane: Plane,
+        source: &[u8],
+        src_stride: usize,
+        rx: usize,
+        ry: usize,
+        band_search: bool,
+    ) -> Self {
+        let rect = ctb_rect(pic, plane, rx, ry);
+        Self {
+            edge: std::array::from_fn(|eo_class| {
+                edge_stats(pic, plane, source, src_stride, rect, eo_class as u8)
+            }),
+            band: if band_search {
+                band_stats(pic, plane, source, src_stride, rect)
+            } else {
+                ([0; 32], [0; 32])
+            },
+        }
+    }
+
+    /// The SSE reduction `component` buys on this CTB, whether or not this
+    /// CTB's own search would have proposed it — which is exactly what
+    /// pricing a merge against a structure needs.
+    fn gain(&self, component: &ResolvedSaoComponent) -> i64 {
+        match component.sao_type_idx {
+            // Band offset: the four consecutive bands §8.7.3.2 equation 8-414
+            // wraps around the 32-band range, each with its own signed offset.
+            1 => (0..4)
+                .map(|k| {
+                    let (sums, counts) = &self.band;
+                    let band = (usize::from(component.band_position) + k) & 31;
+                    offset_gain(sums[band], counts[band], component.offset_val[k + 1])
+                })
+                .sum(),
+            // Edge offset: one §8.7.3.2 category per signalled offset, under
+            // the class the component carries.
+            2 => {
+                let (sums, counts) = &self.edge[usize::from(component.eo_class)];
+                (1..5)
+                    .map(|category| {
+                        offset_gain(
+                            sums[category],
+                            counts[category],
+                            component.offset_val[category],
+                        )
+                    })
+                    .sum()
+            }
+            _ => 0,
+        }
+    }
+}
+
+/// The SSE reduction of adding a constant `offset` to `count` samples whose
+/// summed `source − reconstruction` error is `sum`: `2*o*s − n*o^2`.
+fn offset_gain(sum: i64, count: i64, offset: i32) -> i64 {
+    2 * i64::from(offset) * sum - count * i64::from(offset) * i64::from(offset)
+}
+
+/// What a whole candidate cell buys on this CTB, summed over the components
+/// the caller is deciding.
+fn cell_gain(
+    cell: &ResolvedSao,
+    luma: Option<&PlaneStats>,
+    chroma: Option<&[PlaneStats; 2]>,
+) -> i64 {
+    let mut gain = luma.map_or(0, |stats| stats.gain(&cell.components[0]));
+    if let Some([cb, cr]) = chroma {
+        gain += cb.gain(&cell.components[1]) + cr.gain(&cell.components[2]);
+    }
+    gain
 }
 
 /// The best SAO component for the luma of one CTB, or an off component when
@@ -1134,22 +1127,22 @@ fn band_offsets(sums: &[i64; 32], counts: &[i64; 32], band_position: u8) -> (i64
 /// The four §8.7.3.2 edge-offset classes and the 32 band positions are scored
 /// against each other under one [`rd_score`], so the type is chosen by what it
 /// buys net of what it costs rather than by picking a winner per type first.
-fn best_luma_sao(
-    pic: &Picture,
-    src: SourcePlanes<'_>,
-    rx: usize,
-    ry: usize,
-    lambda: SaoLambda,
+/// This is the structure the CTB would code for itself; whether it is worth
+/// coding at all against a merge is [`estimate_sao`]'s decision, not this
+/// one's.
+fn best_luma_component(
+    stats: &PlaneStats,
+    lambda_q8: u32,
     band_search: bool,
 ) -> ResolvedSaoComponent {
-    let rect = ctb_rect(pic, Plane::Luma, rx, ry);
     let mut best = ResolvedSaoComponent::off();
     let mut best_score = 0i64;
     for eo_class in 0..4u8 {
-        let (gain, offsets) = class_offsets(pic, Plane::Luma, src.y, src.width, rect, eo_class);
+        let (sums, counts) = &stats.edge[usize::from(eo_class)];
+        let (gain, offsets) = edge_offsets(sums, counts);
         // One `sao_type_idx_luma` bin beyond the "off" bin, two
         // `sao_eo_class_luma` bins, and the offsets' own.
-        let score = rd_score(gain, 1 + 2 + offset_abs_bins(&offsets), 0, lambda);
+        let score = rd_score(gain, 1 + 2 + offset_abs_bins(&offsets), lambda_q8);
         if score > best_score {
             best_score = score;
             best = ResolvedSaoComponent {
@@ -1163,16 +1156,15 @@ fn best_luma_sao(
     if !band_search {
         return best;
     }
-    let (sums, counts) = band_stats(pic, Plane::Luma, src.y, src.width, rect);
+    let (sums, counts) = &stats.band;
     for band_position in 0..32u8 {
-        let (gain, offsets) = band_offsets(&sums, &counts, band_position);
+        let (gain, offsets) = band_offsets(sums, counts, band_position);
         // One `sao_type_idx_luma` bin beyond the "off" bin, then the band
         // path's own signs, position and offsets.
         let score = rd_score(
             gain,
-            1 + offset_abs_bins(&offsets),
-            band_syntax_bins(&offsets),
-            lambda,
+            1 + offset_abs_bins(&offsets) + band_syntax_bins(&offsets),
+            lambda_q8,
         );
         if score > best_score {
             best_score = score;
@@ -1195,31 +1187,23 @@ fn best_luma_sao(
 /// and, for edge offset, one shared class. Band offset infers no position, so
 /// each component still picks the four bands that suit it, exactly as each
 /// picks its own four offsets.
-fn best_chroma_sao(
-    pic: &Picture,
-    src: SourcePlanes<'_>,
-    rx: usize,
-    ry: usize,
-    lambda: SaoLambda,
+fn best_chroma_components(
+    cb_stats: &PlaneStats,
+    cr_stats: &PlaneStats,
+    lambda_q8: u32,
     band_search: bool,
 ) -> [ResolvedSaoComponent; 2] {
-    let (cb_rect, cr_rect) = (
-        ctb_rect(pic, Plane::Cb, rx, ry),
-        ctb_rect(pic, Plane::Cr, rx, ry),
-    );
-    let chroma_stride = src.width / 2;
     let mut best = [ResolvedSaoComponent::off(); 2];
     let mut best_score = 0i64;
     for eo_class in 0..4u8 {
-        let (cb_gain, cb_offsets) =
-            class_offsets(pic, Plane::Cb, src.cb, chroma_stride, cb_rect, eo_class);
-        let (cr_gain, cr_offsets) =
-            class_offsets(pic, Plane::Cr, src.cr, chroma_stride, cr_rect, eo_class);
+        let class = usize::from(eo_class);
+        let (cb_gain, cb_offsets) = edge_offsets(&cb_stats.edge[class].0, &cb_stats.edge[class].1);
+        let (cr_gain, cr_offsets) = edge_offsets(&cr_stats.edge[class].0, &cr_stats.edge[class].1);
         // One `sao_type_idx_chroma` bin beyond the "off" bin, two
         // `sao_eo_class_chroma` bins, and both components' offsets — cIdx 2
         // codes neither a type nor a class of its own.
         let bins = 1 + 2 + offset_abs_bins(&cb_offsets) + offset_abs_bins(&cr_offsets);
-        let score = rd_score(cb_gain + cr_gain, bins, 0, lambda);
+        let score = rd_score(cb_gain + cr_gain, bins, lambda_q8);
         if score > best_score {
             best_score = score;
             best = [
@@ -1241,12 +1225,15 @@ fn best_chroma_sao(
     if !band_search {
         return best;
     }
-    let cb = best_band_component(pic, Plane::Cb, src.cb, chroma_stride, cb_rect, lambda);
-    let cr = best_band_component(pic, Plane::Cr, src.cr, chroma_stride, cr_rect, lambda);
+    let cb = best_band_component(cb_stats, lambda_q8);
+    let cr = best_band_component(cr_stats, lambda_q8);
     // The shared `sao_type_idx_chroma` bin is paid once for the pair.
-    let bins = 1 + offset_abs_bins(&cb.1) + offset_abs_bins(&cr.1);
-    let band_bins = band_syntax_bins(&cb.1) + band_syntax_bins(&cr.1);
-    let score = rd_score(cb.0 + cr.0, bins, band_bins, lambda);
+    let bins = 1
+        + offset_abs_bins(&cb.1)
+        + offset_abs_bins(&cr.1)
+        + band_syntax_bins(&cb.1)
+        + band_syntax_bins(&cr.1);
+    let score = rd_score(cb.0 + cr.0, bins, lambda_q8);
     if score > best_score {
         best = [
             ResolvedSaoComponent {
@@ -1271,24 +1258,16 @@ fn best_chroma_sao(
 ///
 /// The pair's shared `sao_type_idx_chroma` bin is not charged here, because it
 /// is paid once for both components by the caller.
-fn best_band_component(
-    pic: &Picture,
-    plane: Plane,
-    source: &[u8],
-    src_stride: usize,
-    rect: (usize, usize, usize, usize),
-    lambda: SaoLambda,
-) -> (i64, [i32; 5], u8) {
-    let (sums, counts) = band_stats(pic, plane, source, src_stride, rect);
+fn best_band_component(stats: &PlaneStats, lambda_q8: u32) -> (i64, [i32; 5], u8) {
+    let (sums, counts) = &stats.band;
     let mut best = (0i64, [0i32; 5], 0u8);
     let mut best_score = i64::MIN;
     for band_position in 0..32u8 {
-        let (gain, offsets) = band_offsets(&sums, &counts, band_position);
+        let (gain, offsets) = band_offsets(sums, counts, band_position);
         let score = rd_score(
             gain,
-            offset_abs_bins(&offsets),
-            band_syntax_bins(&offsets),
-            lambda,
+            offset_abs_bins(&offsets) + band_syntax_bins(&offsets),
+            lambda_q8,
         );
         if score > best_score {
             best_score = score;
@@ -1298,16 +1277,16 @@ fn best_band_component(
     best
 }
 
-/// The §7.4.9.3 offsets one edge-offset class would take on one CTB of one
-/// plane, and the SSE reduction they buy.
-fn class_offsets(
+/// The §8.7.3.2 per-category summed and counted `source − reconstruction`
+/// error of one CTB of one plane, under one edge-offset class.
+fn edge_stats(
     pic: &Picture,
     plane: Plane,
     source: &[u8],
     src_stride: usize,
     rect: (usize, usize, usize, usize),
     eo_class: u8,
-) -> (i64, [i32; 5]) {
+) -> ([i64; 5], [i64; 5]) {
     let (x0, y0, x1, y1) = rect;
     let (pw, ph) = pic.plane_dims(plane);
     let samples = pic.plane(plane);
@@ -1341,7 +1320,12 @@ fn class_offsets(
             &mut stats,
         );
     }
-    let (sums, counts) = (stats.sums, stats.counts);
+    (stats.sums, stats.counts)
+}
+
+/// The §7.4.9.3 offsets one edge-offset class would take from those
+/// statistics, and the SSE reduction they buy.
+fn edge_offsets(sums: &[i64; 5], counts: &[i64; 5]) -> (i64, [i32; 5]) {
     let mut offsets = [0i32; 5];
     let mut gain = 0i64;
     for category in 1..5 {
@@ -1357,10 +1341,7 @@ fn class_offsets(
             mean.clamp(-SAO_OFFSET_MAX, 0)
         };
         offsets[category] = offset;
-        // The SSE reduction of adding a constant `o` to `n` samples whose
-        // summed error is `s`: 2*o*s − n*o^2.
-        gain += 2 * i64::from(offset) * sums[category]
-            - counts[category] * i64::from(offset) * i64::from(offset);
+        gain += offset_gain(sums[category], counts[category], offset);
     }
     (gain, offsets)
 }
@@ -1477,7 +1458,7 @@ mod tests {
             height: H,
         };
 
-        let grid = estimate_sao(&pic, src, true, true, SaoLambda::closed_form(32), true);
+        let grid = estimate_sao(&pic, src, true, true, 32, true);
         // The first CTB lies wholly inside the biased region.
         let luma = grid[0].components[0];
         assert_eq!(
@@ -1558,7 +1539,7 @@ mod tests {
             }
         }
         let source_planes = planes(&src);
-        let lambda = SaoLambda::closed_form(0);
+        let lambda = 0;
         let with = estimate_sao(&pic, source_planes, true, true, lambda, true);
         let without = estimate_sao(&pic, source_planes, true, true, lambda, false);
         assert!(
@@ -1909,8 +1890,8 @@ mod tests {
 
     #[test]
     fn a_band_cell_is_charged_the_syntax_an_edge_cell_does_not_code() {
-        // `cell_bins` splits the §7.3.8.3 bins the way `SaoLambda` prices
-        // them, so what lands in the band half has to be exactly the five
+        // `cell_bins` splits the §7.3.8.3 bins into the structure's own and
+        // band offset's own, so what lands in the band half has to be exactly the five
         // `sao_band_position` bins and the sign of each nonzero offset.
         let offsets = [0, 3, -2, 0, 1];
         let (band_mode, band_band) = cell_bins(&band_cell(9, offsets));

@@ -13,6 +13,7 @@ import {
   randomAccessPointAtOrBefore,
   scrubStrideFrames,
   scrubWalkStart,
+  shouldDrawPreview,
 } from "./scrub.js";
 
 // Every fourth frame, as `samples(12, 4)` builds for the native tests.
@@ -69,6 +70,18 @@ test("an unmeasured walk steps one frame and a fast one is still bounded", () =>
   assert.equal(scrubWalkStart(2, 11, null, KEYFRAMES), 3);
   // The step ceiling applies to the walk, not only to the stride.
   assert.equal(scrubWalkStart(0, 10_000, 0, KEYFRAMES), SCRUB_MAXIMUM_STEP);
+});
+
+test("a preview is drawn while the walk is elsewhere and never over the exact frame", () => {
+  // The pointer has moved somewhere the walk has not reached: the preview is the only picture
+  // of that position there is, and drawing it is what answers the seek inside the budget.
+  assert.equal(shouldDrawPreview(0, 500), true);
+  assert.equal(shouldDrawPreview(700, 500), true);
+  // Nothing drawn yet is still somewhere else.
+  assert.equal(shouldDrawPreview(null, 0), true);
+  // The walk has landed on the frame the pointer is on, and a downscaled stand-in for it would
+  // only blur the exact picture already on the canvas.
+  assert.equal(shouldDrawPreview(500, 500), false);
 });
 
 test("a single-group-of-pictures track restarts a backwards walk at frame zero", () => {

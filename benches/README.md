@@ -532,7 +532,10 @@ Intel Core i9-10850K the control itself lands between 0.9623x and 1.0252x, with
 the arm under test always inside that miss. The effect on these rows is therefore
 **under about 4%, and not distinguishable from zero at this host's noise floor** —
 see `#426: the same question, on an instrument with a null control in it` below
-for the readings and for what the control caught.
+for the readings and for what the control caught. Issue #434 asked for the draw
+again on a quiet host and could not reach one; its five further draws corroborate
+the bound without tightening it, and establish that raising `--rounds` cannot
+tighten it either — see the `#434` re-run section below.
 
 The two `sao` tables above are the arms measured *after* issue #310; the rest of
 each table is the issue #280 measurement set, so the SAO rows are the only ones
@@ -765,7 +768,7 @@ small-row advantage is halved load bandwidth, and at long rows there is nothing
 left. The doubling only exists with `vmlaq_n_s16`, which keeps eight lanes all
 the way through the accumulator. `simd::filter_taps_narrow` is that kernel, and
 `simd::measure_narrow_filter_taps` A/Bs it against `filter_taps` on the same
-sweep, in one process, interleaved, best of nine rounds:
+sweep, in one process, interleaved, best of nine rounds. On an **Apple M1**:
 
 | Samples per call | `i32` `neon` | `i16` `neon` | narrow | `i32` `scalar` | `i16` `scalar` | narrow |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -784,11 +787,48 @@ Below a row of eight there is no 16-bit vector loop to reach — the call is the
 4-wide widening remainder plus the cost of having narrowed its source — so the
 narrow-width chroma blocks keep the `i32` kernel.
 
+**The same sweep on x86_64 (issue #435).** Every figure above is a NEON figure,
+and `narrows` admits `Avx2` and `Sse41` too, where the `i32` kernel issues eight
+and four lanes rather than NEON's four — so the lane-count half of the argument
+is not the same argument on all three. Taken on an **Intel Core i9-10850K (10
+cores, Windows)**, best of nine rounds, as a range over three consecutive
+invocations of the same binary:
+
+| Samples per call | `sse4.1` | `avx2` | `scalar` |
+| --- | ---: | ---: | ---: |
+| 4 | 0.73-0.88x | 0.81-0.90x | 0.70-0.85x |
+| 8 | 1.10-1.16x | 0.95-1.13x | 0.78-0.81x |
+| 16 | 1.25-1.39x | 1.04-1.13x | 0.63-0.74x |
+| 32 | 1.41-1.52x | 1.30-1.52x | 0.64-0.65x |
+| 64 | 1.67-1.81x | 1.38-1.76x | 0.56-0.57x |
+| 128 | 1.94-2.03x | 1.70-1.73x | 0.57-0.61x |
+| 256 | 2.08-2.09x | 2.06-2.11x | 0.56-0.62x |
+
+**The kernel finding transfers, and then some**: both x86 backends reach about
+**2.1x** at a long row, above NEON's 1.89x, and for the same reason — the `i32`
+kernel is at the host's integer SIMD multiply throughput and this issues half as
+many multiplies. AVX2 reaching it as well as SSE4.1 is worth stating explicitly,
+because the eight-lane `i32` kernel is the case where doubling the lanes might
+have run out of execution ports first, and it does not. This sweep is shorter
+than the block one below and correspondingly noisier: a fourth invocation read
+3.00x at a row of 256 on `sse4.1`, entirely from a slow draw on its `i32` arm
+(4.59 ms against the 3.13 ms the other two read), and it is excluded above as
+host interference rather than a reading.
+
+**The `scalar` column is the control, and on this host it is unambiguous.**
+`narrows` is false for `Isa::Scalar`, and the scalar arm reads **0.56x to 0.85x
+at every length**, worse the longer the row: with one multiply per instruction
+either way, narrowing the source is pure cost, exactly as the second condition
+claims. The M1's scalar column reads 0.72x to 1.53x with no such trend, so this
+is the sharper of the two demonstrations that the condition is about vector
+lanes rather than about `i16` being smaller.
+
 **But a block is not a kernel, and only one phase case keeps the win.**
 `measure_narrow_vs_wide_block` A/Bs the two arms through the whole of
 `interp_block` — the block walk, the source narrowing and the allocations
 included — at the half-pel phase, in one process, best of fifteen rounds, with
-the two arms asserted equal sample-for-sample before anything is timed:
+the two arms asserted equal sample-for-sample before anything is timed. On an
+**Apple M1**:
 
 | Phase | 8x8 | 16x16 | 32x32 | 64x64 |
 | --- | ---: | ---: | ---: | ---: |
@@ -796,8 +836,51 @@ the two arms asserted equal sample-for-sample before anything is timed:
 | vertical-only (d/h/n) | 1.37x | 1.22x | 1.25x | 1.43x |
 | two-dimensional (e/i/p, f/j/q, g/k/r) | 0.92x | 0.95x | 0.99x | 1.02x |
 
-Same kernel in all three rows, at 1.89x in isolation, and only the middle row
-keeps any of it. **What separates them is who pays to narrow the source.** The
+And on the same **Intel Core i9-10850K**, as a range over three consecutive
+invocations — the sweep now walks every vector backend the host offers rather
+than only `detected_isa()`, interleaving the backends with each other as well as
+the two arms:
+
+| Phase | backend | 8x8 | 16x16 | 32x32 | 64x64 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| horizontal-only (a/b/c) | `sse4.1` | 0.83x | 0.94-0.95x | 1.09-1.11x | 1.13-1.14x |
+| horizontal-only (a/b/c) | `avx2` | 0.79-0.81x | 0.84-0.85x | 0.95-0.97x | 0.97-0.99x |
+| vertical-only (d/h/n) | `sse4.1` | 1.00-1.02x | 1.12-1.13x | 1.23-1.24x | 1.29-1.31x |
+| vertical-only (d/h/n) | `avx2` | 0.95-0.97x | 1.05-1.06x | 1.12x | 1.10-1.12x |
+| two-dimensional | `sse4.1` | 0.88-0.90x | 0.96-0.97x | 1.03-1.05x | 1.07-1.08x |
+| two-dimensional | `avx2` | 0.85-0.87x | 0.88-0.89x | 0.97-0.98x | 0.98-1.03x |
+
+Unlike the whole-decode instrument #431 and #434 wrestled with on this same
+host, this one resolves the question it is asked: the three invocations agree to
+within **±0.02x** on every cell, against effects of 10% to 30%. That is what an
+in-process A/B over a fixed working set buys, and it is why the isolated
+measurement rather than the whole-decode one is what the routing decision rests
+on.
+
+**The phase finding transfers to both x86 backends; its size does not.** The
+vertical-only row is the only one above parity at every width on both backends,
+and the ordering of the three phases is the same on all three instruction sets,
+so the "who pays to narrow the source" argument below is not a NEON artefact.
+But the win is **smaller on x86 than on NEON, and smallest on the widest
+backend**: at 64x64 the vertical-only phase reads 1.43x on NEON, 1.29-1.31x on
+`sse4.1` and 1.10-1.12x on `avx2`. That ordering is the lane-count prediction
+issue #435 made, confirmed: AVX2's `i32` kernel already issues eight lanes per
+multiply, so doubling to sixteen `i16` lanes has proportionally less of the
+block's remaining cost to remove, while SSE4.1 goes four to eight exactly as
+NEON does and lands nearer NEON's figure.
+
+**At a block width of eight the x86 win is gone.** The vertical-only phase reads
+1.00-1.02x on `sse4.1` and **0.95-0.97x on `avx2`** at 8x8, where NEON reads
+1.37x — reproducibly, and the corresponding row-8 kernel reading is marginal on
+AVX2 too (0.95-1.13x above). `narrows` admits those blocks on its `w >= 8`
+condition, which is a NEON reading. This is a real gap in the evidence for a
+*different* condition than the one #435 set out to settle, it costs at most a
+few percent of one phase of one stage on the width where it is wrong, and
+tightening it means making the threshold instruction-set-dependent — so it is
+filed as **#440** rather than changed here on one host's draw.
+
+Same kernel in all three rows, at 1.89x to 2.1x in isolation, and only the
+middle row keeps any of it. **What separates them is who pays to narrow the source.** The
 vertical-only case reaches its taps through `RefPlane::gather`, which
 materializes a `w x ( h + N − 1 )` buffer either way, so writing that buffer as
 `i16` instead of `i32` costs nothing at all — same store count, half the bytes —
@@ -813,10 +896,15 @@ count the `i32` kernel already issues.
 
 So `interp_block` takes the narrow path for the vertical-only phase, at eight
 bits, on a vector backend, at rows of eight samples or more — the four conditions
-`inter_pred::narrows` spells out — and nowhere else. Both arms stay spelled out
-inside `interp_block_with_width` rather than one of them being deleted, the same
-arrangement `measure_2d_ring_vs_flat` uses, so the table above stays reproducible
-after the decision it justifies.
+`inter_pred::narrows` spells out — and nowhere else. The **"a vector backend"**
+condition now stands on a measurement from each of the three backends it admits
+rather than from NEON alone: `neon` 1.22-1.43x, `sse4.1` 1.12-1.31x and `avx2`
+1.05-1.12x on the phase it routes, against a `scalar` control that is a loss at
+every row length on both hosts. It is therefore kept as `isa != Isa::Scalar`
+rather than narrowed to the backends #378 happened to measure. Both arms stay
+spelled out inside `interp_block_with_width` rather than one of them being
+deleted, the same arrangement `measure_2d_ring_vs_flat` uses, so the tables above
+stay reproducible after the decision they justify.
 
 **The whole-decode effect is below this host's noise floor, and the null control
 is what says so.** `inter_pred_filter` is about 27% of decode proper, the
@@ -887,6 +975,64 @@ reading the control it prints alongside the effect. Nothing in that output is
 trustworthy that its own control does not underwrite — which is the whole lesson
 of #404's ±7% `scalar` arm, now built into the instrument instead of discovered
 after the fact.
+
+##### #434: the re-run, and why `--rounds` is not the lever
+
+Issue #434 asked for the draw above to be taken again on a host quiet enough
+that the control settles — preferably the Apple Silicon machine the committed
+`hevc_inter_pred` and `inter_pred_filter` rows were drawn on. **That host was not
+reachable, and the only host that was is the same i9-10850K, busier than when the
+bound above was drawn.** Five draws were taken on it (48 frames, `Avx2`, the
+arms and statistic unchanged):
+
+| Draw | Rounds | Scheduling | Control median [interquartile] | Shipped-arm median | Floor |
+| --- | ---: | --- | ---: | ---: | ---: |
+| 1 | 21 | as-launched | 1.0268x [0.9909, 1.0874] | 1.0094x | 8.74% |
+| 2 | 21 | `High` priority | 0.9969x [0.9615, 1.0443] | 1.0155x | 4.43% |
+| 3 | 21 | `High` + one-core affinity | 1.0063x [0.9454, 1.0403] | 1.0227x | 5.46% |
+| 4 | 51 | `High` priority | 0.9864x [0.9363, 1.0487] | 1.0066x | 6.37% |
+| 5 | 21 | `High` priority | 1.0315x [0.9772, 1.0566] | 1.0311x | 5.66% |
+
+The wide arm's *minimum* — the most stable statistic in the output — ranged
+41.99 to 46.49 ms/frame across these five draws, an 11% spread on a quantity
+that should barely move. That is the direct evidence the host was not quiet:
+other work was resident on it throughout, and no draw reached a floor better
+than the ±4% already recorded.
+
+**Raising `--rounds` does not tighten this floor, and draw 4 is why.** The issue
+offered two levers — more rounds, or a quieter host — and only the second one is
+real. The band the floor is taken from is an *interquartile width of the host's
+own round-to-round scatter*, not a standard error of a mean: it estimates a
+spread rather than averaging one away, so it does not shrink as `1/√n`. Going
+from 21 rounds to 51 made the floor **worse** (6.37% against 4.43%), because a
+run two and a half times longer simply catches more of the interference it is
+measuring. More rounds buy a better-estimated noise floor, never a lower one.
+
+The converse is the trap this creates, and it is worth naming because the number
+moves in the flattering direction: a 5-round draw on this same host reports a
+**3.36%** floor, tighter than any of the five above. It has not measured less
+noise. An interquartile band over five readings is three of them, so it
+understates a spread it has barely sampled. The floor is only as trustworthy as
+the round count behind it, and a lower one obtained by shortening the run is an
+artefact rather than a tightening.
+
+**Raising the process priority is the one lever that helped, and only to the
+median.** Draw 2 put the control median within **0.31%** of 1.0000x — the ~1%
+the issue asked for — while its interquartile band stayed at [0.9615, 1.0443].
+Reading that median alone as "the control settled" is exactly the error this
+instrument exists to prevent, which is why the floor is taken as the widest the
+control misses 1.0000x *anywhere in its band*: a control that scatters ±4% around
+a perfect median has not resolved a 1% effect. Draws 3 and 5 confirm the median
+itself is not reproducible either, wandering 0.9864x to 1.0315x. Pinning to one
+physical core (draw 3) did not help; the contending work is not pinned.
+
+So the bound is **unchanged at ±4%**, and no tighter floor is substituted for it,
+because none was earned. What these draws add is corroboration rather than
+resolution: every shipped-arm median above (0.9968x to 1.0376x) again lands
+inside its own control's miss, on a host noisier than the one that first bounded
+the effect, which is what a genuinely-near-zero effect looks like. The re-run
+that would tighten this still needs a quiet host — the Apple Silicon machine of
+the committed rows, idle — and not a longer run on a busy one.
 
 No decoded sample moves on any backend or at any bit depth.
 `the_eight_bit_block_path_matches_the_per_sample_equations` runs every block
@@ -1334,6 +1480,61 @@ scrub's, and the preview tier is what a scrub was asking for.
 **Nothing about the decoded frames changes.** The preview tier is additive and
 opt-in, the reader is untouched, and the 768-frame fixture digests in
 `tests/codec_conformance.rs` and `tests/native_hevc_hardware.rs` still hold.
+
+### The same seek in a browser
+
+Issue #432. The table above is the native tier; on `wasm32` there was no tier at
+all. `previews` was gated `#[cfg(not(target_arch = "wasm32"))]` because its pass
+owns a thread, so nothing implemented `SeekPreviewSource` in a browser and
+`ExactFrameReader::seek` there could only ever answer `Seek::Exact` from the
+presentation cache or `Seek::Pending`. `examples/web_canvas` therefore walked
+forwards from a random-access point on every drag — on the bundled sample, whose
+768 frames name one sync sample, that walk is the whole group of pictures.
+
+What was native-only was only the driver. The store, the stride and the pass
+cursor are portable now, and the browser advances the same pass one preview per
+`requestIdleCallback` instead of on a thread. The lookup a seek is bounded on is
+therefore the *same code* on both targets — `Store::nearest_at` — and what is
+measured here is that it stays that cheap when a browser is the thing calling
+it:
+
+```sh
+wasm-pack test --headless --chrome --no-default-features --features web \
+  --lib -- --nocapture web_previews
+```
+
+`web_previews::tests::a_browser_preview_answers_any_position_inside_the_seek_budget`
+is the counterpart of
+`tests/preview_index.rs::a_preview_answers_any_position_without_decoding`: the
+bundled sample's shape — 768 frames, spaced twelve apart by
+`PreviewOptions::for_frame_rate(24)` into 64 positions — with every position of
+the bar sampled a hundred and one ways.
+
+| lookup | headless Chrome (Windows, Chrome 152) |
+| --- | --- |
+| worst `PreviewStore::nearest_at` over 101 positions | **0.035 ms** |
+
+**Read this as a bound, not as a cost.** It is timed with `performance.now()`,
+whose resolution Chrome clamps — the whole reading is a handful of its ticks, so
+the useful statement is *under 0.04 ms*, not 35 µs to three figures. The native
+row's 1.109 µs is criterion's median over ten samples of the same lookup and is
+the figure to quote for what the code costs.
+
+**The bound is what the requirement needs.** Under 0.04 ms is three orders of
+magnitude inside the 50 ms of section 3.2, and four orders under the 119.29 ms a
+cold hardware `raps=1` exact seek costs at 512x288 — which on the bundled 1080p
+sample is the 1.09 s of hardware decode #383 instrumented, and is what a browser
+drag used to wait for. The seek no longer decodes on either target, so it no
+longer depends on the seek distance or the track length on either.
+
+**What it costs to fill is one forward decode pass over the track**, the same as
+native, minus the thread: `WebPreviewIndex::step` decodes one preview and
+returns to the event loop, so the page keeps its interaction while the pass runs
+and a lookup is answered from whatever the pass has reached so far.
+`one_step_of_the_browser_pass_fills_one_position_and_moves_on` holds that one
+step fills one position and advances exactly one, through the real `WebCodecs`
+backend where the browser has an HEVC decoder and reporting `UNSUPPORTED` where
+it does not.
 
 ## The audio container path
 
