@@ -532,7 +532,10 @@ Intel Core i9-10850K the control itself lands between 0.9623x and 1.0252x, with
 the arm under test always inside that miss. The effect on these rows is therefore
 **under about 4%, and not distinguishable from zero at this host's noise floor** —
 see `#426: the same question, on an instrument with a null control in it` below
-for the readings and for what the control caught.
+for the readings and for what the control caught. Issue #434 asked for the draw
+again on a quiet host and could not reach one; its five further draws corroborate
+the bound without tightening it, and establish that raising `--rounds` cannot
+tighten it either — see the `#434` re-run section below.
 
 The two `sao` tables above are the arms measured *after* issue #310; the rest of
 each table is the issue #280 measurement set, so the SAO rows are the only ones
@@ -887,6 +890,64 @@ reading the control it prints alongside the effect. Nothing in that output is
 trustworthy that its own control does not underwrite — which is the whole lesson
 of #404's ±7% `scalar` arm, now built into the instrument instead of discovered
 after the fact.
+
+##### #434: the re-run, and why `--rounds` is not the lever
+
+Issue #434 asked for the draw above to be taken again on a host quiet enough
+that the control settles — preferably the Apple Silicon machine the committed
+`hevc_inter_pred` and `inter_pred_filter` rows were drawn on. **That host was not
+reachable, and the only host that was is the same i9-10850K, busier than when the
+bound above was drawn.** Five draws were taken on it (48 frames, `Avx2`, the
+arms and statistic unchanged):
+
+| Draw | Rounds | Scheduling | Control median [interquartile] | Shipped-arm median | Floor |
+| --- | ---: | --- | ---: | ---: | ---: |
+| 1 | 21 | as-launched | 1.0268x [0.9909, 1.0874] | 1.0094x | 8.74% |
+| 2 | 21 | `High` priority | 0.9969x [0.9615, 1.0443] | 1.0155x | 4.43% |
+| 3 | 21 | `High` + one-core affinity | 1.0063x [0.9454, 1.0403] | 1.0227x | 5.46% |
+| 4 | 51 | `High` priority | 0.9864x [0.9363, 1.0487] | 1.0066x | 6.37% |
+| 5 | 21 | `High` priority | 1.0315x [0.9772, 1.0566] | 1.0311x | 5.66% |
+
+The wide arm's *minimum* — the most stable statistic in the output — ranged
+41.99 to 46.49 ms/frame across these five draws, an 11% spread on a quantity
+that should barely move. That is the direct evidence the host was not quiet:
+other work was resident on it throughout, and no draw reached a floor better
+than the ±4% already recorded.
+
+**Raising `--rounds` does not tighten this floor, and draw 4 is why.** The issue
+offered two levers — more rounds, or a quieter host — and only the second one is
+real. The band the floor is taken from is an *interquartile width of the host's
+own round-to-round scatter*, not a standard error of a mean: it estimates a
+spread rather than averaging one away, so it does not shrink as `1/√n`. Going
+from 21 rounds to 51 made the floor **worse** (6.37% against 4.43%), because a
+run two and a half times longer simply catches more of the interference it is
+measuring. More rounds buy a better-estimated noise floor, never a lower one.
+
+The converse is the trap this creates, and it is worth naming because the number
+moves in the flattering direction: a 5-round draw on this same host reports a
+**3.36%** floor, tighter than any of the five above. It has not measured less
+noise. An interquartile band over five readings is three of them, so it
+understates a spread it has barely sampled. The floor is only as trustworthy as
+the round count behind it, and a lower one obtained by shortening the run is an
+artefact rather than a tightening.
+
+**Raising the process priority is the one lever that helped, and only to the
+median.** Draw 2 put the control median within **0.31%** of 1.0000x — the ~1%
+the issue asked for — while its interquartile band stayed at [0.9615, 1.0443].
+Reading that median alone as "the control settled" is exactly the error this
+instrument exists to prevent, which is why the floor is taken as the widest the
+control misses 1.0000x *anywhere in its band*: a control that scatters ±4% around
+a perfect median has not resolved a 1% effect. Draws 3 and 5 confirm the median
+itself is not reproducible either, wandering 0.9864x to 1.0315x. Pinning to one
+physical core (draw 3) did not help; the contending work is not pinned.
+
+So the bound is **unchanged at ±4%**, and no tighter floor is substituted for it,
+because none was earned. What these draws add is corroboration rather than
+resolution: every shipped-arm median above (0.9968x to 1.0376x) again lands
+inside its own control's miss, on a host noisier than the one that first bounded
+the effect, which is what a genuinely-near-zero effect looks like. The re-run
+that would tighten this still needs a quiet host — the Apple Silicon machine of
+the committed rows, idle — and not a longer run on a busy one.
 
 No decoded sample moves on any backend or at any bit depth.
 `the_eight_bit_block_path_matches_the_per_sample_equations` runs every block
