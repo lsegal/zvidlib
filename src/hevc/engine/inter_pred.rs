@@ -529,18 +529,41 @@ fn interp_block<const N: usize>(
 ///   there: `shift1` is zero, so the tap accumulation is bounded by
 ///   [`NARROW_MAX_SAMPLE`] times the coefficient sums. At nine bits and
 ///   above the pre-shift accumulator overflows `i16`.
-/// * **A vector backend.** The whole point is that a vector unit
+/// * **A vector backend**, and every one of them, which #435 checked
+///   rather than assumed. The whole point is that a vector unit
 ///   multiplies twice as many `i16` lanes per instruction as `i32`
 ///   lanes. [`Isa::Scalar`] multiplies one either way, so for it the
-///   narrowing pass over the source is cost with nothing behind it.
+///   narrowing pass over the source is cost with nothing behind it —
+///   on x86_64 its `measure_narrow_filter_taps` column is a loss at
+///   *every* row length, 0.56x to 0.85x, and worse the longer the row.
+///   The condition admits `Neon`, `Avx2` and `Sse41`, and until #435
+///   only `Neon` had been measured; the lane-count argument does not
+///   transfer between them for free, because AVX2's `i32` kernel issues
+///   eight lanes per multiply where NEON's and SSE4.1's issue four.
+///   `measure_narrow_vs_wide_block` now sweeps every available backend
+///   and reads the phase this routes at **1.22-1.43x (`neon`),
+///   1.12-1.31x (`sse4.1`) and 1.05-1.12x (`avx2`)** over 16x16 to
+///   64x64 — smallest on the widest backend, exactly as the lane count
+///   predicts, but above parity on all three, so the condition stays
+///   `isa != Isa::Scalar` rather than being cut back to the backend it
+///   was first measured on.
 /// * **A row of at least eight samples.** A shorter row never reaches
 ///   the 16-bit vector loop at all: `simd::measure_narrow_filter_taps`
 ///   reads 0.96x at a row of four, where the whole call is the widening
 ///   remainder plus the cost of having narrowed the source for it.
+///   This bound is the one condition still resting on a single
+///   instruction set. At a width of exactly eight the x86 sweep reads
+///   the vertical-only block at 1.00-1.02x (`sse4.1`) and 0.95-0.97x
+///   (`avx2`) against NEON's 1.37x, so the threshold is right for NEON
+///   and about a wash to marginally wrong for x86_64. Raising it there
+///   means making it instruction-set-dependent, which #435 left as
+///   follow-up work in #440 rather than doing on one host's draw.
 /// * **The vertical-only phase**, and this is the one that is about the
 ///   caller rather than the kernel. `measure_narrow_vs_wide_block` reads
 ///   the vertical-only phase at 1.08x to 1.77x and the horizontal-only
-///   and two-dimensional phases at 0.82x to 1.11x, and the difference is
+///   and two-dimensional phases at 0.82x to 1.11x on `neon`, and puts
+///   the vertical-only phase above both of the others at every width on
+///   `sse4.1` and `avx2` as well, and the difference is
 ///   not the kernel — it is the same kernel — but who pays to narrow the
 ///   source. The vertical-only case reaches its source through
 ///   [`RefPlane::gather`], which materializes a `w x ( h + N − 1 )`
@@ -2394,7 +2417,16 @@ mod tests {
         let (pw, ph) = (256usize, 256usize);
         let plane_samples = pseudo_random(8, pw * ph, 255);
         let plane = RefPlane::new(&plane_samples, pw, ph).unwrap();
-        let isa = simd::detected_isa();
+        // Every vector backend the host offers rather than only the widest
+        // one: `narrows` admits all of them, and the lane-count half of its
+        // argument does not read the same on a four-lane and an eight-lane
+        // `i32` kernel, so one backend's reading does not stand in for
+        // another's. `Isa::Scalar` is left out because `narrows` is false
+        // for it and neither arm is ever selected there.
+        let isas: Vec<Isa> = simd::available_isas()
+            .into_iter()
+            .filter(|&isa| isa != Isa::Scalar)
+            .collect();
         let rounds = 15;
         // Every phase case of Table 8-8 that filters at all, because
         // they narrow very differently: the one-dimensional cases have a
@@ -2408,37 +2440,51 @@ mod tests {
             ("2-D", Some(&LUMA_FILTER[2]), Some(&LUMA_FILTER[2])),
         ];
 
-        println!("\n8-tap luma interp_block, i32 vs i16 accumulation, {isa:?}, best of {rounds}");
+        println!("\n8-tap luma interp_block, i32 vs i16 accumulation, best of {rounds}");
         println!("  (equal total sample count at every block size)");
-        println!("  phase   block     i32 ms   i16 ms   narrow");
+        println!("  phase   block      isa     i32 ms   i16 ms   narrow");
         for (name, hk, vk) in cases {
             for &(w, h) in &[(8usize, 8usize), (16, 16), (32, 32), (64, 64)] {
                 let calls = (1 << 22) / (w * h);
-                let run = |narrow: bool| {
+                let run = |isa: Isa, narrow: bool| {
                     interp_block_with_width::<8>(isa, &plane, 4, 4, hk, vk, w, h, 8, narrow)
                 };
-                assert_eq!(run(false), run(true), "{name} arms disagree at {w}x{h}");
-
-                let (mut bw, mut bn) = (f64::INFINITY, f64::INFINITY);
-                for _ in 0..rounds {
-                    let start = Instant::now();
-                    for _ in 0..calls {
-                        std::hint::black_box(run(false));
-                    }
-                    bw = bw.min(start.elapsed().as_secs_f64());
-                    let start = Instant::now();
-                    for _ in 0..calls {
-                        std::hint::black_box(run(true));
-                    }
-                    bn = bn.min(start.elapsed().as_secs_f64());
+                for &isa in &isas {
+                    assert_eq!(
+                        run(isa, false),
+                        run(isa, true),
+                        "{isa:?} {name} arms disagree at {w}x{h}"
+                    );
                 }
-                println!(
-                    "  {name:>6}  {:>5}  {:9.2} {:8.2}  {:5.2}x",
-                    format!("{w}x{h}"),
-                    bw * 1e3,
-                    bn * 1e3,
-                    bw / bn
-                );
+
+                // The backends are interleaved with each other as well as
+                // with the two arms, so a drift that lands mid-sweep is
+                // spread across the columns rather than charged to one.
+                let mut best = vec![(f64::INFINITY, f64::INFINITY); isas.len()];
+                for _ in 0..rounds {
+                    for (i, &isa) in isas.iter().enumerate() {
+                        let start = Instant::now();
+                        for _ in 0..calls {
+                            std::hint::black_box(run(isa, false));
+                        }
+                        best[i].0 = best[i].0.min(start.elapsed().as_secs_f64());
+                        let start = Instant::now();
+                        for _ in 0..calls {
+                            std::hint::black_box(run(isa, true));
+                        }
+                        best[i].1 = best[i].1.min(start.elapsed().as_secs_f64());
+                    }
+                }
+                for (&isa, (bw, bn)) in isas.iter().zip(best.iter().copied()) {
+                    println!(
+                        "  {name:>6}  {:>5}  {:>7}  {:9.2} {:8.2}  {:5.2}x",
+                        format!("{w}x{h}"),
+                        format!("{isa:?}"),
+                        bw * 1e3,
+                        bn * 1e3,
+                        bw / bn
+                    );
+                }
             }
         }
     }
