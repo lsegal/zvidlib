@@ -2631,7 +2631,9 @@ cargo test --features native --release --test sao_band_occupancy -- \
 It reports how many of the 32 §8.7.3.2 SAO bands a block occupies — each band is
 eight of the 256 sample values, so this is a within-block value distribution
 rather than an SAO-specific quantity — both as distinct bands and as the band
-range `max - min + 1`:
+range `max - min + 1`. The figures are properties of the content rather than of a
+host — the generators are deterministic and the decode is bit-exact — so the run
+above reproduces this table exactly:
 
 | content | distinct bands | band range `max - min + 1` |
 | --- | --- | --- |
