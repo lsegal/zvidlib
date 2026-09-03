@@ -551,13 +551,22 @@ fn interp_block<const N: usize>(
 ///   the 16-bit vector loop at all: `simd::measure_narrow_filter_taps`
 ///   reads 0.96x at a row of four, where the whole call is the widening
 ///   remainder plus the cost of having narrowed the source for it.
-///   This bound is the one condition still resting on a single
-///   instruction set. At a width of exactly eight the x86 sweep reads
-///   the vertical-only block at 1.00-1.02x (`sse4.1`) and 0.95-0.97x
-///   (`avx2`) against NEON's 1.37x, so the threshold is right for NEON
-///   and about a wash to marginally wrong for x86_64. Raising it there
-///   means making it instruction-set-dependent, which #435 left as
-///   follow-up work in #440 rather than doing on one host's draw.
+///   Eight itself is the width the bound is actually decided at, and
+///   #435 left it resting on a single NEON reading of 1.37x while its
+///   own x86 host — an i9-10850K — read the same cell at 1.00-1.02x
+///   (`sse4.1`) and 0.95-0.97x (`avx2`), which looked like a case for
+///   making the threshold per-backend. #440 re-took it on two more
+///   x86_64 hosts and the AVX2 loss did not reproduce: the same
+///   `avx2` cell reads **1.01x on an EPYC 7763** and **1.44-1.57x on an
+///   i7-8700B**, the largest win in any of the block tables. What
+///   varies at this width is the host, not the instruction set — 8x8
+///   makes 64 times as many calls as 64x64 for the same sample work, so
+///   the per-call `RefPlane::gather` and its allocation dominate, and
+///   what the narrow arm saves there is half the buffer's bytes rather
+///   than any vector lanes. A per-backend minimum would have been drawn
+///   from the worst of the three hosts and cost the best of them a 1.5x,
+///   so the bound stays a single `w >= 8`, now with a figure from
+///   `neon`, `sse4.1` and `avx2` across four hosts behind it.
 /// * **The vertical-only phase**, and this is the one that is about the
 ///   caller rather than the kernel. `measure_narrow_vs_wide_block` reads
 ///   the vertical-only phase at 1.08x to 1.77x and the horizontal-only
