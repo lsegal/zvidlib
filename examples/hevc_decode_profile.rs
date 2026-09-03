@@ -230,7 +230,8 @@ fn decode_profiled(
 /// A/Bs the §8.5.3.3 16-bit interpolation accumulation over a whole decode,
 /// with a null control that reports the instrument's own noise floor.
 ///
-/// Three arms run per round, interleaved in the same order every round:
+/// Three arms run per round, in an order that rotates from round to round so
+/// that no arm keeps a favourable position:
 ///
 /// * **wide** — the accumulation forced off, which is the `i32` path
 ///   everywhere and so exactly what `main` executed before #404 landed.
@@ -297,17 +298,29 @@ fn pair_narrow_accumulation(
     );
     let decoded = counts[0];
 
-    // `INFINITY` so the first round's reading always wins the minimum.
-    let mut best_total = [f64::INFINITY; ARMS.len()];
-    let mut best_filter = [f64::INFINITY; ARMS.len()];
-    for _ in 0..rounds {
-        for (slot, (_, narrow)) in ARMS.iter().enumerate() {
-            narrow_interp::set_override(*narrow);
+    // Every round's reading is kept, not just the best: the statistic that
+    // resolves this is a *paired* one, taken within a round, and a running
+    // minimum throws the pairing away. See below.
+    let mut totals = vec![vec![0f64; rounds]; ARMS.len()];
+    let mut filters = vec![vec![0f64; rounds]; ARMS.len()];
+    for round in 0..rounds {
+        // The arm order rotates every round. Under a *fixed* order any
+        // per-position systematic — the allocator's state by the third decode
+        // of a round, a turbo clock that has had two decodes to sag — lands on
+        // the same arm every time and survives the elementwise minimum, which
+        // is exactly how it would masquerade as an effect: measured with a
+        // fixed order this control read 0.9469x, and the arm it accuses runs
+        // the same code as the arm it is measured against. Rotating gives
+        // every arm every position, so a bias that belongs to the position
+        // cancels instead of being attributed to the branch under test.
+        for offset in 0..ARMS.len() {
+            let slot = (round + offset) % ARMS.len();
+            narrow_interp::set_override(ARMS[slot].1);
             let (count, report) = decode_profiled(configuration, samples, frames, |_| {});
             let per_frame = count.max(1) as f64;
-            best_total[slot] = best_total[slot].min(report.total().as_secs_f64() * 1e3 / per_frame);
-            best_filter[slot] = best_filter[slot]
-                .min(report.stage(profile::Stage::InterPredFilter).as_secs_f64() * 1e3 / per_frame);
+            totals[slot][round] = report.total().as_secs_f64() * 1e3 / per_frame;
+            filters[slot][round] =
+                report.stage(profile::Stage::InterPredFilter).as_secs_f64() * 1e3 / per_frame;
         }
     }
     narrow_interp::set_override(None);
@@ -319,62 +332,104 @@ fn pair_narrow_accumulation(
          {rounds} interleaved rounds in one process, elementwise minimum."
     );
     println!();
-    println!("| Arm | ms/frame | `inter_pred_filter` ms/frame |");
+    println!("| Arm | ms/frame (min) | `inter_pred_filter` ms/frame (min) |");
     println!("| --- | ---: | ---: |");
     for (slot, (name, _)) in ARMS.iter().enumerate() {
         println!(
             "| {name} | {:.3} | {:.3} |",
-            best_total[slot], best_filter[slot]
+            minimum(&totals[slot]),
+            minimum(&filters[slot])
         );
     }
     println!();
 
     // Every ratio is taken against the wide arm, including the control's, so
-    // the control answers the same question the effect does.
-    let effect_total = best_total[0] / best_total[1];
-    let effect_filter = best_filter[0] / best_filter[1];
-    let control_total = best_total[0] / best_total[2];
-    let control_filter = best_filter[0] / best_filter[2];
-    println!(
-        "Shipped against wide: **{effect_total:.4}x** whole decode, \
-         **{effect_filter:.4}x** `inter_pred_filter`."
-    );
-    println!(
-        "Control against wide (identical code; the true answer is 1.0000x): \
-         **{control_total:.4}x** whole decode, **{control_filter:.4}x** `inter_pred_filter`."
-    );
-    println!();
+    // the control answers exactly the question the effect does — with the
+    // known answer 1.0000x, because it runs the wide arm's code.
+    //
+    // The ratio of the two arms' *minima* is not the statistic to read it
+    // with. Each minimum is one round's decode chosen out of twelve, and the
+    // two chosen rounds need not be the same round, so whatever the host was
+    // doing between them lands undivided in the ratio: measured that way this
+    // A/B read 0.9623x and then 1.0127x on consecutive invocations, with the
+    // control moving 0.9995x to 0.9843x underneath it. The pairing is what
+    // rescues it. Both arms of a round run within seconds of each other, so a
+    // *within-round* ratio divides out the drift they share, and the median
+    // over rounds is then robust to the odd round that caught an interrupt.
+    for (label, arms) in [("whole decode", &totals), ("`inter_pred_filter`", &filters)] {
+        let effect = paired_ratios(&arms[0], &arms[1]);
+        let control = paired_ratios(&arms[0], &arms[2]);
+        let (effect_median, effect_low, effect_high) = band(&effect);
+        let (control_median, control_low, control_high) = band(&control);
+        println!(
+            "{label}: shipped against wide **{effect_median:.4}x** \
+             [{effect_low:.4}, {effect_high:.4}] interquartile"
+        );
+        println!(
+            "  control against wide (identical code, true answer 1.0000x) \
+             **{control_median:.4}x** [{control_low:.4}, {control_high:.4}]"
+        );
 
-    // The control's own miss is the smallest difference this instrument can
-    // tell from nothing, so an effect inside it is not resolved by this run.
-    let floor_total = (control_total - 1.0).abs();
-    let floor_filter = (control_filter - 1.0).abs();
-    println!(
-        "Noise floor (the control's miss of its known answer): {:.2}% whole decode, \
-         {:.2}% `inter_pred_filter`.",
-        floor_total * 100.0,
-        floor_filter * 100.0,
-    );
-    for (label, effect, floor) in [
-        ("whole decode", effect_total, floor_total),
-        ("`inter_pred_filter`", effect_filter, floor_filter),
-    ] {
-        let effect_size = (effect - 1.0).abs();
-        if effect_size > floor {
+        // The floor is the widest the control misses 1.0000x anywhere in its
+        // own band, not just at its median: an instrument that scatters ±2%
+        // around a perfect median has not resolved a 1% effect.
+        let floor = (control_median - 1.0)
+            .abs()
+            .max((control_low - 1.0).abs())
+            .max((control_high - 1.0).abs());
+        let effect_size = (effect_median - 1.0).abs();
+        if effect_size > floor && (effect_low - 1.0) * (effect_high - 1.0) > 0.0 {
             println!(
-                "  {label}: resolved — the {:.2}% effect is larger than the {:.2}% floor.",
+                "  resolved — the {:.2}% effect clears the {:.2}% floor and its band \
+                 does not straddle 1.0000x.",
                 effect_size * 100.0,
                 floor * 100.0,
             );
         } else {
             println!(
-                "  {label}: not resolved — the {:.2}% effect is inside the {:.2}% floor, \
-                 which bounds it.",
-                effect_size * 100.0,
+                "  not resolved — the effect is bounded by the {:.2}% floor this \
+                 instrument reaches on this host.",
                 floor * 100.0,
             );
         }
     }
+}
+
+/// The smallest reading in `values`.
+fn minimum(values: &[f64]) -> f64 {
+    values.iter().copied().fold(f64::INFINITY, f64::min)
+}
+
+/// The within-round ratios of `numerator` to `denominator`.
+///
+/// Pairing within a round is the point: the two decodes run seconds apart, so
+/// a clock or a scheduler that drifts over the whole run drifts across both of
+/// them and divides out, which the ratio of two separately chosen minima does
+/// not do.
+fn paired_ratios(numerator: &[f64], denominator: &[f64]) -> Vec<f64> {
+    numerator
+        .iter()
+        .zip(denominator)
+        .map(|(&a, &b)| a / b)
+        .collect()
+}
+
+/// The median of `values` and its interquartile band.
+///
+/// A band rather than a standard deviation because these are ratios of timings
+/// with a hard floor and a long tail — a round that caught an interrupt is far
+/// from symmetric — and percentiles do not assume otherwise. The *inter-
+/// quartile* band specifically, rather than a wider one, because at the round
+/// counts this runs at a 10th percentile is the second-smallest reading and so
+/// reports the worst round rather than the spread.
+fn band(values: &[f64]) -> (f64, f64, f64) {
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let at = |fraction: f64| {
+        let index = (fraction * (sorted.len() - 1) as f64).round() as usize;
+        sorted[index]
+    };
+    (at(0.5), at(0.25), at(0.75))
 }
 
 /// FNV-1a over `bytes`, continuing from `hash`.
