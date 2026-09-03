@@ -447,24 +447,12 @@ impl HevcStageInputs {
     /// Panics if the prepared planes no longer match their dimensions.
     #[must_use]
     pub fn run_inter_pred(&self) -> Vec<u8> {
-        // A real decode's reference planes carry the `i16` mirror the
-        // §8.5.3.3.3 16-bit interpolation path borrows its tap windows
-        // out of (issue #427), built once per picture on the way into
-        // the DPB. `schedule_inter_pus` lays out exactly one frame's
-        // worth of units, so building it here once per call charges the
-        // stage the same one pass per frame the decoder pays — and
-        // charges it in full, since a reference picture that serves
-        // several pictures pays it once for all of them.
-        let narrow_of = |src: &[i32]| src.iter().map(|&s| s as i16).collect::<Vec<i16>>();
-        let luma_narrow = narrow_of(&self.luma);
-        let cb_narrow = narrow_of(self.picture.plane(Plane::Cb));
-        let cr_narrow = narrow_of(self.picture.plane(Plane::Cr));
-        let luma = RefPlane::with_narrow(&self.luma, &luma_narrow, self.width, self.height)
+        let luma = RefPlane::new(&self.luma, self.width, self.height)
             .expect("the prepared plane matches its dimensions");
         let (cw, ch) = (self.width / 2, self.height / 2);
-        let cb = RefPlane::with_narrow(self.picture.plane(Plane::Cb), &cb_narrow, cw, ch)
+        let cb = RefPlane::new(self.picture.plane(Plane::Cb), cw, ch)
             .expect("the prepared picture's Cb plane matches its dimensions");
-        let cr = RefPlane::with_narrow(self.picture.plane(Plane::Cr), &cr_narrow, cw, ch)
+        let cr = RefPlane::new(self.picture.plane(Plane::Cr), cw, ch)
             .expect("the prepared picture's Cr plane matches its dimensions");
         let mut digest = Digest::new();
         for pu in &self.inter_pus {

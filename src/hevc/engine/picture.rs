@@ -15,7 +15,7 @@
 
 /// One reconstructed picture: the luma plane and (unless monochrome) the
 /// two chroma planes, each row-major.
-#[derive(Debug, Clone, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Picture {
     /// `pic_width_in_luma_samples`.
     width_luma: usize,
@@ -38,39 +38,6 @@ pub struct Picture {
     cb: Vec<i32>,
     /// `SCr[ x ][ y ]`, row-major; empty when monochrome.
     cr: Vec<i32>,
-    /// The eight-bit `i16` mirror of the three planes, in
-    /// [`Plane`] order, built by [`Picture::build_narrow_mirror`] once
-    /// the picture is finished and about to be used as a reference.
-    ///
-    /// This is a *representation* of the planes above, not a second set
-    /// of samples: element `i` of each entry always equals element `i`
-    /// of the plane it mirrors. It exists so the §8.5.3.3.3 16-bit
-    /// interpolation path can borrow narrow tap windows out of a
-    /// reference plane instead of materializing them per block (issue
-    /// #427); every mutator drops it, so a picture that is still being
-    /// reconstructed simply has none and the interpolation falls back to
-    /// what it did before.
-    narrow: Option<[Vec<i16>; 3]>,
-}
-
-/// Two pictures are equal when their geometry and their samples are,
-/// which is what every caller means by it. The `i16` mirror is a
-/// representation of the same samples — built or dropped by when a
-/// picture last became a reference, not by what it contains — so it is
-/// deliberately not part of the comparison.
-impl PartialEq for Picture {
-    fn eq(&self, other: &Self) -> bool {
-        self.width_luma == other.width_luma
-            && self.height_luma == other.height_luma
-            && self.width_chroma == other.width_chroma
-            && self.height_chroma == other.height_chroma
-            && self.chroma_array_type == other.chroma_array_type
-            && self.bit_depth_luma == other.bit_depth_luma
-            && self.bit_depth_chroma == other.bit_depth_chroma
-            && self.luma == other.luma
-            && self.cb == other.cb
-            && self.cr == other.cr
-    }
 }
 
 /// The three colour components addressable in a [`Picture`].
@@ -135,7 +102,6 @@ impl Picture {
             luma,
             cb,
             cr,
-            narrow: None,
         }
     }
 
@@ -225,57 +191,8 @@ impl Picture {
     /// # Panics
     /// Panics if `(x, y)` lies outside the plane.
     pub fn set_sample(&mut self, plane: Plane, x: usize, y: usize, v: i32) {
-        self.narrow = None;
         let (buf, stride) = self.plane_slice_mut(plane);
         buf[y * stride + x] = v;
-    }
-
-    /// Build the eight-bit `i16` mirror of the three planes, so a
-    /// §8.5.3.3.3 reference plane can hand the 16-bit interpolation path
-    /// its tap windows without materializing them
-    /// ([`crate::hevc::engine::inter_pred::RefPlane::with_narrow`]).
-    ///
-    /// Call it once, on a finished picture, at the point it becomes a
-    /// reference — the decoder does so on the way into the DPB. Every
-    /// mutator drops the mirror again, so it can never describe samples
-    /// the picture no longer holds; rebuilding it costs one pass over
-    /// the planes.
-    ///
-    /// A no-op unless every plane the picture carries is eight-bit,
-    /// which is the only range the `i16` tap accumulator of
-    /// `simd::filter_taps_narrow` stays inside: at nine bits `88 · 511`
-    /// leaves `i16` and the higher-bit-depth paths keep the `i32`
-    /// kernel.
-    pub fn build_narrow_mirror(&mut self) {
-        if self.bit_depth_luma != 8 || (self.chroma_array_type != 0 && self.bit_depth_chroma != 8) {
-            self.narrow = None;
-            return;
-        }
-        let narrow_of = |src: &[i32]| {
-            debug_assert!(
-                src.iter().all(|&s| (0..=255).contains(&s)),
-                "an eight-bit picture holds a sample outside [0, 255]"
-            );
-            src.iter().map(|&s| s as i16).collect::<Vec<i16>>()
-        };
-        self.narrow = Some([
-            narrow_of(&self.luma),
-            narrow_of(&self.cb),
-            narrow_of(&self.cr),
-        ]);
-    }
-
-    /// The [`Picture::build_narrow_mirror`] mirror of `plane`, or `None`
-    /// when this picture carries none.
-    #[inline]
-    #[must_use]
-    pub fn narrow_plane(&self, plane: Plane) -> Option<&[i16]> {
-        let narrow = self.narrow.as_ref()?;
-        Some(match plane {
-            Plane::Luma => &narrow[0],
-            Plane::Cb => &narrow[1],
-            Plane::Cr => &narrow[2],
-        })
     }
 
     /// Borrow the raw row-major plane buffer (read-only).
@@ -289,7 +206,6 @@ impl Picture {
     /// Used by the §8.7.2 deblocking driver to wrap a component plane in a
     /// [`crate::hevc::engine::deblock::SamplePlane`] for in-place edge filtering.
     pub fn plane_mut(&mut self, plane: Plane) -> (&mut [i32], usize) {
-        self.narrow = None;
         self.plane_slice_mut(plane)
     }
 
@@ -407,63 +323,5 @@ mod tests {
         assert_eq!(&packed[0..4], &[0x51, 0x51, 0x51, 0x51]);
         assert_eq!(packed[4], 0x5a);
         assert_eq!(packed[5], 0xf0);
-    }
-
-    #[test]
-    fn the_narrow_mirror_reproduces_every_plane() {
-        let mut p = Picture::new(4, 4, 1, 8, 8);
-        for y in 0..4 {
-            for x in 0..4 {
-                p.set_sample(Plane::Luma, x, y, (y * 4 + x) as i32 * 17);
-            }
-        }
-        p.set_sample(Plane::Cb, 1, 1, 250);
-        p.set_sample(Plane::Cr, 0, 1, 3);
-        assert_eq!(p.narrow_plane(Plane::Luma), None);
-        p.build_narrow_mirror();
-        for plane in [Plane::Luma, Plane::Cb, Plane::Cr] {
-            let wide = p.plane(plane);
-            let narrow = p.narrow_plane(plane).expect("an eight-bit picture mirrors");
-            assert_eq!(narrow.len(), wide.len());
-            assert!(narrow.iter().zip(wide).all(|(&n, &w)| i32::from(n) == w));
-        }
-    }
-
-    /// The mirror describes samples the picture holds, so anything that
-    /// writes one drops it. A stale mirror would be read as reference
-    /// samples by the §8.5.3.3.3 interpolation path.
-    #[test]
-    fn writing_a_sample_drops_the_narrow_mirror() {
-        let mut p = Picture::new(4, 4, 1, 8, 8);
-        p.build_narrow_mirror();
-        assert!(p.narrow_plane(Plane::Luma).is_some());
-        p.set_sample(Plane::Luma, 0, 0, 7);
-        assert!(p.narrow_plane(Plane::Luma).is_none());
-
-        p.build_narrow_mirror();
-        assert!(p.narrow_plane(Plane::Luma).is_some());
-        let _ = p.plane_mut(Plane::Cb);
-        assert!(p.narrow_plane(Plane::Luma).is_none());
-    }
-
-    /// Above eight bits the `i16` tap accumulator the mirror exists for
-    /// is out of range, so there is no mirror to build.
-    #[test]
-    fn a_higher_bit_depth_picture_has_no_narrow_mirror() {
-        let mut p = Picture::new(4, 4, 1, 10, 10);
-        p.build_narrow_mirror();
-        assert!(p.narrow_plane(Plane::Luma).is_none());
-    }
-
-    /// Equality is about the samples, not about whether one of the two
-    /// pictures happens to have been made a reference.
-    #[test]
-    fn the_narrow_mirror_does_not_affect_equality() {
-        let mut a = Picture::new(4, 4, 1, 8, 8);
-        a.set_sample(Plane::Luma, 2, 2, 99);
-        let b = a.clone();
-        a.build_narrow_mirror();
-        assert_eq!(a, b);
-        assert_eq!(b, a);
     }
 }

@@ -66,10 +66,11 @@ pub struct RefPlane<'a> {
     /// narrow window instead of materializing one, which is the whole
     /// difference between the phase cases that keep
     /// [`simd::filter_taps_narrow`]'s advantage and the ones that spend
-    /// it on the conversion — see [`narrows`]. `None` is always safe:
-    /// the narrow path then converts per window exactly as it did
-    /// before, and [`narrows`] declines the phases where that costs more
-    /// than it saves.
+    /// it on the conversion — see [`narrows`]. It is `None` for every
+    /// plane the decoder builds, because issue #427 measured the mirror
+    /// as costing more to write than a frame of interpolation saves with
+    /// it; [`RefPlane::with_narrow`], which is the only way to set it, is
+    /// the test-only apparatus that measurement was taken with.
     narrow: Option<&'a [i16]>,
     /// Plane width in samples (`pic_width_in_luma_samples` for luma, or
     /// `pic_width_in_luma_samples / SubWidthC` for chroma).
@@ -111,21 +112,32 @@ impl<'a> RefPlane<'a> {
     /// own samples, so the 16-bit interpolation path can borrow narrow
     /// windows out of it with no conversion at all.
     ///
+    /// **Test-only apparatus, and issue #427 is why.** This is the plane
+    /// representation that question asked for: with it,
+    /// [`RefPlane::row_window_narrow`] borrows exactly as
+    /// [`RefPlane::row_window`] does, and the horizontal-only and
+    /// two-dimensional phases keep [`simd::filter_taps_narrow`]'s
+    /// advantage instead of spending it on a materializing pass — 1.18x
+    /// and 1.27x at 32x32 and 64x64 against 0.90x and 0.93x without it,
+    /// which `measure_narrow_vs_wide_block` prints as its two right-hand
+    /// columns. It is not carried by a decoded picture because
+    /// `measure_narrow_mirror_amortization` prices the mirror against
+    /// what a frame of interpolation does with it and the mirror is
+    /// dearer: **0.527 ms to write, 0.319 ms saved**, so the decoder
+    /// keeps the `i32` planes and [`narrows`] keeps issue #404's
+    /// routing. See `benches/README.md`.
+    ///
     /// `narrow[ i ]` must equal `samples[ i ]` for every `i`, and every
     /// sample must lie in `0..=`[`NARROW_MAX_SAMPLE`]; only the lengths
-    /// are checked, because the plane is walked once per prediction unit
-    /// and its contents are not. The mirror is a
-    /// representation of the same plane, not a second plane, and
-    /// [`crate::hevc::engine::picture::Picture::build_narrow_mirror`]
-    /// builds it only for eight-bit pictures. A picture without one
-    /// (higher bit depth, or still being reconstructed) uses
-    /// [`RefPlane::new`] and loses nothing but the borrow.
+    /// are checked, because a plane is walked once per prediction unit
+    /// and its contents are not.
     ///
     /// # Errors
     ///
     /// The [`RefPlane::new`] errors, plus
     /// [`InterPredError::PlaneLengthMismatch`] if the mirror's length
     /// does not match the plane's.
+    #[cfg(test)]
     pub fn with_narrow(
         samples: &'a [i32],
         narrow: &'a [i16],
@@ -654,15 +666,23 @@ fn interp_block<const N: usize>(
 ///   so narrowing per block had to add a pass the wide path never
 ///   performs and that pass cost about what the wider lanes saved.
 ///
-///   Issue #427 removed that pass rather than paying it: a picture that
-///   carries the `i16` mirror of its own planes
-///   ([`crate::hevc::engine::picture::Picture::build_narrow_mirror`],
-///   built once when the picture becomes a reference) lets
-///   [`RefPlane::row_window_narrow`] borrow narrow exactly as
-///   `row_window` borrows wide. So these two phases narrow when — and
-///   only when — the plane carries that mirror, which
-///   [`RefPlane::borrows_narrow`] answers. Without one they behave as
-///   #404 left them.
+///   Issue #427 asked whether that pass could be removed rather than
+///   paid, by having an eight-bit plane carry the `i16` mirror of its
+///   own samples so [`RefPlane::row_window_narrow`] borrows narrow
+///   exactly as `row_window` borrows wide. It can, and the two phases
+///   do keep the kernel's advantage that way —
+///   `measure_narrow_vs_wide_block` reads them at 1.18x / 1.27x and
+///   1.09x / 1.12x at 32x32 and 64x64 with a mirrored plane against
+///   0.90x / 0.93x and 0.93x / 0.96x without one. **The mirror costs
+///   more than that is worth**: `measure_narrow_mirror_amortization`
+///   writes one per 1080p luma plane in 0.527 ms at its floor, against
+///   0.319 ms saved over a whole frame's units at the measured size mix,
+///   and no decoded picture carries one. So [`RefPlane::with_narrow`] is
+///   test-only apparatus, [`RefPlane::borrows_narrow`] is false for
+///   every plane the decoder builds, and these two phases behave as #404
+///   left them — with both arms still spelled out below, and the
+///   condition that separates them named rather than implied, so the
+///   measurement stays reproducible.
 ///
 /// The two-dimensional phase gains less than the horizontal-only one for
 /// a reason no plane representation reaches: only its horizontal pass
@@ -2554,12 +2574,24 @@ mod tests {
     ///
     /// `simd::measure_narrow_filter_taps` times the kernel alone and is
     /// the ceiling; this is what a block actually gets, because the
-    /// narrow arm has to convert its source window to `i16` first, and
-    /// only the horizontal pass of the two-dimensional case narrows —
-    /// the vertical pass multiplies a 16-bit intermediate by a
-    /// coefficient of up to 58 and needs a 32-bit accumulator either way.
+    /// narrow arm has to reach its source as `i16` first, and only the
+    /// horizontal pass of the two-dimensional case narrows — the
+    /// vertical pass multiplies a 16-bit intermediate by a coefficient
+    /// of up to 58 and needs a 32-bit accumulator either way.
     ///
-    /// Both arms run in one process, interleaved, best of many rounds:
+    /// **Three arms, not two**, because issue #427's question is which
+    /// plane representation the narrow arm reads: `i32` is the wide
+    /// kernel, `mirrored` narrows out of a plane carrying the `i16`
+    /// mirror of its own samples ([`RefPlane::with_narrow`]) so every
+    /// window is borrowed, and `copied` narrows out of a plane that does
+    /// not so every window is materialized. `copied` is what the decoder
+    /// really has and what issue #404's table was drawn from; `mirrored`
+    /// is what it would have if a picture carried the mirror, and the
+    /// gap between the two right-hand columns is the whole of what that
+    /// representation buys. `measure_narrow_mirror_amortization` prices
+    /// what it costs.
+    ///
+    /// All three arms run in one process, interleaved, best of many rounds:
     /// separate benchmark processes on this host disagree with each
     /// other by more than the effect being measured. The two arms are
     /// asserted to agree sample-for-sample before anything is timed.
@@ -2576,11 +2608,10 @@ mod tests {
         let (pw, ph) = (256usize, 256usize);
         let plane_samples = pseudo_random(8, pw * ph, 255);
         let mirror: Vec<i16> = plane_samples.iter().map(|&s| s as i16).collect();
-        // The two plane representations the phases are decided by: a
-        // reference picture out of the DPB carries the `i16` mirror and
-        // hands the narrow path borrowed windows, while one that does
-        // not (the §8.3.4 currPic snapshot, or the plane as issue #404
-        // left it) has to materialize them per block.
+        // The two plane representations the phases are decided by: one
+        // carrying the `i16` mirror hands the narrow path borrowed
+        // windows, and one without it — which is every plane the decoder
+        // builds — has to materialize them per block.
         let mirrored = RefPlane::with_narrow(&plane_samples, &mirror, pw, ph).unwrap();
         let plane = RefPlane::new(&plane_samples, pw, ph).unwrap();
         let isa = simd::detected_isa();
@@ -2657,13 +2688,27 @@ mod tests {
     /// carrying at all.
     ///
     /// `measure_narrow_vs_wide_block` prices a *block* with the mirror
-    /// already there, which is what a block really gets: the mirror is
-    /// built once per picture on the way into the DPB
-    /// (`Picture::build_narrow_mirror`) and every prediction unit of
-    /// every picture that references it reads the same one. This prices
-    /// the build itself over one 1080p luma plane, and the horizontal
-    /// filtering of one frame's worth of prediction units beside it, so
-    /// the ratio between them is on the record rather than asserted.
+    /// already there, and a block would really get it that way: one
+    /// mirror would be written per picture, when the picture is finished
+    /// and becomes a reference, and every prediction unit that reads
+    /// that picture would read the same one. It would also be written
+    /// once per *decoded* picture, because every decoded picture is
+    /// stored as a short-term reference, so the accounting is one build
+    /// against one frame of interpolation — which is what this weighs.
+    ///
+    /// The frame is one 1080p luma plane's worth of prediction units at
+    /// the **measured** size mix `decode_bench::INTER_PU_MIX` records
+    /// (62.1% of luma samples at 64x64, 31.1% at 32x32, 5.3% at 16x16,
+    /// 1.4% at 8x8) walking all sixteen Table 8-8 phase combinations in
+    /// turn, so the full-pel, one-dimensional and two-dimensional cases
+    /// appear in the proportion the table gives them.
+    ///
+    /// The two arms are the two plane representations as the decoder
+    /// really routes them: the `i32` arm is the plane without a mirror,
+    /// where [`narrows`] takes the 16-bit path on the vertical-only
+    /// phase alone (what issue #404 left), and the `i16` arm is the
+    /// mirrored plane, where it takes it on every filtering phase — with
+    /// the mirror's own build charged to it once per frame.
     ///
     /// Ignored by default because it is a timing measurement, not an
     /// assertion. Run it with
@@ -2679,64 +2724,108 @@ mod tests {
         let isa = simd::detected_isa();
         let rounds = 15;
 
+        let build_mirror = || {
+            plane_samples
+                .iter()
+                .map(|&s| s as i16)
+                .collect::<Vec<i16>>()
+        };
         let mut build = f64::INFINITY;
         for _ in 0..rounds {
             let start = Instant::now();
-            let mirror: Vec<i16> = plane_samples.iter().map(|&s| s as i16).collect();
-            std::hint::black_box(&mirror);
+            std::hint::black_box(build_mirror());
             build = build.min(start.elapsed().as_secs_f64());
         }
+        // The same pass into a buffer that already exists — the floor a
+        // recycled picture could reach, since a fresh four-megabyte
+        // `Vec` is faulted in a page at a time and that is a cost of the
+        // allocation rather than of the narrowing.
+        let mut reused = vec![0i16; pw * ph];
+        let mut refill = f64::INFINITY;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for (d, &s) in reused.iter_mut().zip(plane_samples.iter()) {
+                *d = s as i16;
+            }
+            std::hint::black_box(&reused);
+            refill = refill.min(start.elapsed().as_secs_f64());
+        }
 
-        // One frame's worth of horizontal-only 16x16 luma units — the
-        // phase the mirror is carried for, at a size the measured mix
-        // puts a real share of its samples at.
-        let mirror: Vec<i16> = plane_samples.iter().map(|&s| s as i16).collect();
+        // One frame's worth of units at the measured size mix, laid out
+        // once so both arms walk exactly the same schedule.
+        let shares: [(usize, f64); 4] = [(64, 0.621), (32, 0.311), (16, 0.053), (8, 0.014)];
+        let mut units: Vec<(usize, i32, i32, i32)> = Vec::new();
+        let mut phase = 0usize;
+        for (size, share) in shares {
+            let samples = (pw * ph) as f64 * share;
+            let count = (samples / (size * size) as f64).round() as usize;
+            let across = pw / size - 1;
+            for u in 0..count {
+                let (x, y) = ((u % across) * size, (u / across % (ph / size - 1)) * size);
+                units.push((size, x as i32, y as i32, phase as i32));
+                phase = (phase + 1) % 16;
+            }
+        }
+
+        let mirror = build_mirror();
         let mirrored = RefPlane::with_narrow(&plane_samples, &mirror, pw, ph).unwrap();
         let plane = RefPlane::new(&plane_samples, pw, ph).unwrap();
-        let (bw, bh) = (16usize, 16usize);
-        let units = (pw / bw - 1) * (ph / bh - 1);
-        let frame = |p: &RefPlane<'_>, narrow: bool| {
+        let frame = |p: &RefPlane<'_>| {
             let mut acc = 0i64;
-            for u in 0..units {
-                let (x, y) = ((u % (pw / bw - 1)) * bw, (u / (pw / bw - 1)) * bh);
-                let out = interp_block_with_width::<8>(
+            for &(size, x, y, phase) in &units {
+                let (xf, yf) = (phase % 4, phase / 4);
+                let out = interp_block::<8>(
                     isa,
                     p,
-                    x as i32,
-                    y as i32,
-                    Some(&LUMA_FILTER[2]),
-                    None,
-                    bw,
-                    bh,
+                    x,
+                    y,
+                    (xf != 0).then(|| &LUMA_FILTER[xf as usize]),
+                    (yf != 0).then(|| &LUMA_FILTER[yf as usize]),
+                    size,
+                    size,
                     8,
-                    narrow,
                 );
-                acc += i64::from(out[0]);
+                acc += i64::from(out[0]) + i64::from(out[out.len() - 1]);
             }
             acc
         };
         assert_eq!(
-            frame(&plane, false),
-            frame(&mirrored, true),
+            frame(&plane),
+            frame(&mirrored),
             "the mirrored arm changed the samples"
         );
         let (mut wide, mut narrow) = (f64::INFINITY, f64::INFINITY);
         for _ in 0..rounds {
             let start = Instant::now();
-            std::hint::black_box(frame(&plane, false));
+            std::hint::black_box(frame(&plane));
             wide = wide.min(start.elapsed().as_secs_f64());
             let start = Instant::now();
-            std::hint::black_box(frame(&mirrored, true));
+            std::hint::black_box(frame(&mirrored));
             narrow = narrow.min(start.elapsed().as_secs_f64());
         }
-        println!("\ni16 mirror amortization, {pw}x{ph}, {isa:?}, best of {rounds}");
+        println!(
+            "\ni16 mirror amortization, {pw}x{ph}, {} units at the measured mix, {isa:?}, \
+             best of {rounds}",
+            units.len()
+        );
         println!("  build the mirror once            {:8.3} ms", build * 1e3);
-        println!("  one frame, h-only 16x16, i32     {:8.3} ms", wide * 1e3);
-        println!("  one frame, h-only 16x16, i16     {:8.3} ms", narrow * 1e3);
+        println!("  ... into a buffer that exists    {:8.3} ms", refill * 1e3);
+        println!("  one frame of interpolation, i32  {:8.3} ms", wide * 1e3);
+        println!("  one frame of interpolation, i16  {:8.3} ms", narrow * 1e3);
         println!(
             "  saved per frame                  {:8.3} ms  ({:.2}x the build)",
             (wide - narrow) * 1e3,
             (wide - narrow) / build
+        );
+        println!(
+            "  with the build charged           {:8.3} ms  ({:5.2}x)",
+            (narrow + build) * 1e3,
+            wide / (narrow + build)
+        );
+        println!(
+            "  with the refill charged          {:8.3} ms  ({:5.2}x)",
+            (narrow + refill) * 1e3,
+            wide / (narrow + refill)
         );
     }
 

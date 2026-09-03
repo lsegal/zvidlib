@@ -198,15 +198,9 @@ impl PictureSequenceState {
         &mut self,
         poc: PicOrderCnt,
         layer_id: u8,
-        mut picture: Picture,
+        picture: Picture,
         motion: MotionField,
     ) {
-        // The picture is finished here and will only ever be read from
-        // now on, which is the one point its `i16` mirror can be built
-        // and stay valid. §8.5.3.3.3's 16-bit interpolation path borrows
-        // its tap windows out of it rather than materializing them per
-        // block (issue #427); at bit depths above eight this is a no-op.
-        picture.build_narrow_mirror();
         self.dpb.insert(DpbEntry {
             poc: poc.val,
             layer_id,
