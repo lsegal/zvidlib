@@ -91,6 +91,20 @@ Budgets are expressed in bytes and frame counts, not an unbounded time window. T
 
 Prefetch is advisory and cancellable. It must not change which frame an indexed request returns, exceed configured resource limits, or conceal a decoder error needed by the caller.
 
+### 3.2 Seek latency
+
+A seek to any position of any track must be constant time and must complete in under 50 ms in the worst case. Constant time here means independent of the seek distance and of the track length: seeking to the last frame of a two-hour track costs what seeking to the second frame costs, and neither is allowed to be proportional to the number of frames between the current position and the target.
+
+This is a requirement on `seek`, which answers *what is at this position of the timeline*, and not on `get(n)`, which answers *exactly which frame this is*. The two cannot have the same bound. A frame in the middle of a long group of pictures depends on every frame back to its random-access point, and decoding them is the track's cost, not the decoder's: on a 1080p HEVC track coded as a single group of pictures, the last frame is roughly 700 reference decodes away from the only place a decode can start, which is over a second on hardware that manages 700 pictures a second. No arrangement of one decoder reaches 50 ms from there, so `seek` may not be defined as a synchronous exact decode.
+
+A seek is therefore answered from pictures that are already decoded, and never by decoding:
+
+- the presentation cache, when the requested frame is still in it;
+- otherwise a bounded seek preview index — one downscaled picture every N frames, populated by a background pass over the track on a decoder of its own, sized by a memory budget rather than by a fixed count, and answering the nearest position it has reached while it is still being built;
+- otherwise nothing, reported as such, so the caller falls through to its own exact request rather than blocking on the fast tier.
+
+The preview index is part of the library rather than of each application: every caller that scrubs a timeline needs it, and a caller that has to build its own has a seek that does not meet this requirement until it does. Exactness is unaffected. A preview is explicitly not the frame that was asked for, is labelled with the frame it is of, and never substitutes for `get(n)`, which continues to return exactly frame `n` or an error (section 8).
+
 ## 4. Writing and synchronization
 
 An output session accepts presentation-order frames and audio with explicit timing. The default indexed writer expects the next frame number; out-of-order or sparse writes require an option and a bounded staging policy.

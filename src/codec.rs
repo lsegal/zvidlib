@@ -966,6 +966,115 @@ mod tests {
         frame.planes[0].data[0]
     }
 
+    /// A reader over a single-group track: one random-access point at frame zero, so reaching
+    /// any frame exactly means decoding every frame before it.
+    fn single_group_reader(frames: u64) -> ExactFrameReader {
+        let samples = (0..frames)
+            .map(|index| sample(index, (index % 251) as u8, index == 0))
+            .collect();
+        ExactFrameReader::new(
+            &uncompressed_video_decoder_factory(),
+            config(),
+            samples,
+            Limits::default(),
+        )
+        .unwrap()
+    }
+
+    /// A seek with nothing decoded anywhere near it says so rather than deciding to decode: the
+    /// caller falls through to its own exact request instead of the seek path silently becoming
+    /// the walk it is bounded against.
+    #[test]
+    fn a_seek_with_nothing_decoded_is_pending_and_submits_no_samples() {
+        let mut reader = single_group_reader(512);
+        assert_eq!(reader.seek(FrameIndex(511)), Seek::Pending);
+        assert_eq!(reader.statistics().samples_submitted, 0);
+        assert_eq!(reader.statistics().resets, 0);
+    }
+
+    /// A seek back to somewhere the reader has just been is the frame itself, from the cache.
+    #[test]
+    fn a_seek_into_the_cache_answers_exactly() {
+        let mut reader = single_group_reader(64);
+        let cancellation = CancellationToken::new();
+        reader.get(FrameIndex(40), &cancellation).unwrap();
+        let submitted = reader.statistics().samples_submitted;
+        let Seek::Exact(frame) = reader.seek(FrameIndex(40)) else {
+            panic!("a cached frame seeks exactly");
+        };
+        assert_eq!(value(&frame), 40);
+        assert_eq!(
+            reader.statistics().samples_submitted,
+            submitted,
+            "an exact seek decodes nothing"
+        );
+    }
+
+    /// The requirement in `ARCHITECTURE.md` section 3.2: a seek to any position of a track that
+    /// is one group of pictures answers from an already-decoded picture and decodes nothing, so
+    /// what it costs does not grow with how far along the track the position is.
+    #[test]
+    fn a_seek_anywhere_on_a_single_group_track_decodes_nothing() {
+        let frames = 512;
+        let mut pass = crate::seek::SeekPreviewPass::new(
+            &uncompressed_video_decoder_factory(),
+            config(),
+            (0..frames)
+                .map(|index| sample(index, (index % 251) as u8, index == 0))
+                .collect(),
+            Limits::default(),
+            24,
+            crate::seek::SeekPreviewOptions::default(),
+        )
+        .unwrap();
+        let previews = pass.previews();
+        pass.run(&CancellationToken::new());
+
+        let mut reader = single_group_reader(frames);
+        reader.set_seek_previews(Some(previews));
+        for target in [0_u64, 1, 255, 400, 511] {
+            match reader.seek(FrameIndex(target)) {
+                Seek::Preview { frame, .. } => assert!(
+                    frame.0.abs_diff(target) < 12,
+                    "frame {target} answered by {frame:?}, further than one stride away"
+                ),
+                Seek::Exact(_) => {}
+                Seek::Pending => panic!("frame {target} had no answer"),
+            }
+        }
+        assert_eq!(
+            reader.statistics().samples_submitted,
+            0,
+            "seeking is not decoding"
+        );
+        assert_eq!(reader.statistics().resets, 0);
+    }
+
+    /// Detaching the index puts the reader back to answering out of its own cache alone, so a
+    /// caller that drops a preview pass does not keep serving its pictures.
+    #[test]
+    fn detaching_the_preview_index_leaves_only_the_cache() {
+        let mut pass = crate::seek::SeekPreviewPass::new(
+            &uncompressed_video_decoder_factory(),
+            config(),
+            (0..64_u64)
+                .map(|index| sample(index, (index % 251) as u8, index == 0))
+                .collect(),
+            Limits::default(),
+            24,
+            crate::seek::SeekPreviewOptions::default(),
+        )
+        .unwrap();
+        let previews = pass.previews();
+        pass.run(&CancellationToken::new());
+
+        let mut reader = single_group_reader(64);
+        reader.set_seek_previews(Some(previews));
+        assert!(matches!(reader.seek(FrameIndex(63)), Seek::Preview { .. }));
+        reader.set_seek_previews(None);
+        assert_eq!(reader.seek(FrameIndex(63)), Seek::Pending);
+    }
+
     #[test]
     fn capability_distinguishes_codec_profile_configuration_and_hardware() {
         let factory = uncompressed_video_decoder_factory();
