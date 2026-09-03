@@ -1016,6 +1016,27 @@ understates a spread it has barely sampled. The floor is only as trustworthy as
 the round count behind it, and a lower one obtained by shortening the run is an
 artefact rather than a tightening.
 
+**Issue #438 moved that from prose into the instrument, because a trap only
+this document knows about is one the output still sets.** `--pair` now prints
+the round count beside every ratio and every floor — `the 4.43% floor this
+instrument reaches on this host over 21 rounds` — and below
+`hevc_decode_profile::paired::MIN_FLOOR_ROUNDS` it prints **no floor at all**,
+the way the arms already refuse to report a ratio with no control behind it.
+The minimum is the fewest rounds at which two readings fall beyond *each* end of
+the interquartile band, which is 8. Below it the band's end is the run's own
+second-most-extreme reading, so the band is the whole range with one reading
+shaved off each side and it moves by a whole reading whenever a single round
+lands differently: the 5-round draw's 3.36% is one round's placement, not a
+spread. `paired::floor` returns `None` there and the run reports the effect as
+*unbounded* rather than as small — which is the honest reading, since an
+unmeasured floor bounds nothing. Nothing about the statistic above the minimum
+changed: the floor is still the widest the control misses 1.0000x anywhere in
+its band, the five draws above stand as taken, and the default `--rounds 12`
+clears the minimum, so an ordinary run reports exactly what it always did.
+`hevc::engine::profile::paired`'s unit tests pin the derivation of the minimum,
+the unchanged band and floor definitions, and the refusal itself, so the trap
+is now a test rather than a paragraph.
+
 **Raising the process priority is the one lever that helped, and only to the
 median.** Draw 2 put the control median within **0.31%** of 1.0000x — the ~1%
 the issue asked for — while its interquartile band stayed at [0.9615, 1.0443].
