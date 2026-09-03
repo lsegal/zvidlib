@@ -36,6 +36,12 @@ pub mod transfer;
 #[cfg(not(target_arch = "wasm32"))]
 mod av1_decoder;
 
+/// The bounded preview tier over a track, for callers that need an answer at an
+/// arbitrary position faster than a decode from the nearest random-access point
+/// can give one. Native-only: its pass runs on a thread of its own.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod previews;
+
 #[cfg(not(target_arch = "wasm32"))]
 mod hevc;
 
@@ -167,3 +173,5 @@ pub use hevc::native_hevc_video_decoder_factory;
 pub use hevc::native_hevc_video_encoder_factory;
 #[cfg(not(target_arch = "wasm32"))]
 pub use native_audio::{DefaultAudioOutput, NativeAacDecoder};
+#[cfg(not(target_arch = "wasm32"))]
+pub use previews::{PreviewIndex, PreviewOptions};
