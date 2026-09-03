@@ -146,6 +146,9 @@ web-sys = { version = "0.3.104", optional = true, features = [
     "EncodedVideoChunk",
     "EncodedVideoChunkInit",
     "EncodedVideoChunkType",
+    # `performance.now()` is what times the browser preview lookup against the
+    # section 3.2 budget; see `web_previews`.
+    "Performance",
     "PlaneLayout",
     "ReadableStream",
     "VideoDecoder",
@@ -155,6 +158,7 @@ web-sys = { version = "0.3.104", optional = true, features = [
     "VideoFrame",
     "VideoFrameCopyToOptions",
     "VideoPixelFormat",
+    "Window",
 ] }
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]

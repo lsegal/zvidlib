@@ -1283,6 +1283,61 @@ scrub's, and the preview tier is what a scrub was asking for.
 opt-in, the reader is untouched, and the 768-frame fixture digests in
 `tests/codec_conformance.rs` and `tests/native_hevc_hardware.rs` still hold.
 
+### The same seek in a browser
+
+Issue #432. The table above is the native tier; on `wasm32` there was no tier at
+all. `previews` was gated `#[cfg(not(target_arch = "wasm32"))]` because its pass
+owns a thread, so nothing implemented `SeekPreviewSource` in a browser and
+`ExactFrameReader::seek` there could only ever answer `Seek::Exact` from the
+presentation cache or `Seek::Pending`. `examples/web_canvas` therefore walked
+forwards from a random-access point on every drag — on the bundled sample, whose
+768 frames name one sync sample, that walk is the whole group of pictures.
+
+What was native-only was only the driver. The store, the stride and the pass
+cursor are portable now, and the browser advances the same pass one preview per
+`requestIdleCallback` instead of on a thread. The lookup a seek is bounded on is
+therefore the *same code* on both targets — `Store::nearest_at` — and what is
+measured here is that it stays that cheap when a browser is the thing calling
+it:
+
+```sh
+wasm-pack test --headless --chrome --no-default-features --features web \
+  --lib -- --nocapture web_previews
+```
+
+`web_previews::tests::a_browser_preview_answers_any_position_inside_the_seek_budget`
+is the counterpart of
+`tests/preview_index.rs::a_preview_answers_any_position_without_decoding`: the
+bundled sample's shape — 768 frames, spaced twelve apart by
+`PreviewOptions::for_frame_rate(24)` into 64 positions — with every position of
+the bar sampled a hundred and one ways.
+
+| lookup | headless Chrome (Windows, Chrome 152) |
+| --- | --- |
+| worst `PreviewStore::nearest_at` over 101 positions | **0.035 ms** |
+
+**Read this as a bound, not as a cost.** It is timed with `performance.now()`,
+whose resolution Chrome clamps — the whole reading is a handful of its ticks, so
+the useful statement is *under 0.04 ms*, not 35 µs to three figures. The native
+row's 1.109 µs is criterion's median over ten samples of the same lookup and is
+the figure to quote for what the code costs.
+
+**The bound is what the requirement needs.** Under 0.04 ms is three orders of
+magnitude inside the 50 ms of section 3.2, and four orders under the 119.29 ms a
+cold hardware `raps=1` exact seek costs at 512x288 — which on the bundled 1080p
+sample is the 1.09 s of hardware decode #383 instrumented, and is what a browser
+drag used to wait for. The seek no longer decodes on either target, so it no
+longer depends on the seek distance or the track length on either.
+
+**What it costs to fill is one forward decode pass over the track**, the same as
+native, minus the thread: `WebPreviewIndex::step` decodes one preview and
+returns to the event loop, so the page keeps its interaction while the pass runs
+and a lookup is answered from whatever the pass has reached so far.
+`one_step_of_the_browser_pass_fills_one_position_and_moves_on` holds that one
+step fills one position and advances exactly one, through the real `WebCodecs`
+backend where the browser has an HEVC decoder and reporting `UNSUPPORTED` where
+it does not.
+
 ## The audio container path
 
 `cargo bench --bench audio_mux` measures the audio write and read paths in two

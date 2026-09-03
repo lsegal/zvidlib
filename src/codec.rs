@@ -391,7 +391,12 @@ pub const SEEK_LATENCY_BUDGET: Duration = Duration::from_millis(50);
 /// target that needs the tier most. An implementation must not decode and must not wait on a
 /// decoder: what it returns is a picture it already had, or nothing.
 ///
+/// Issue #432 gave the browser its own implementation. What answers a seek on either target is
+/// now the same [`previews::PreviewStore`]; what differs is only what fills it, a thread in
+/// [`previews::PreviewIndex`] against an idle callback in `crate::web_previews`.
+///
 /// [`previews::PreviewIndex`]: crate::previews::PreviewIndex
+/// [`previews::PreviewStore`]: crate::previews::PreviewStore
 pub trait SeekPreviewSource: Send + Sync {
     /// The kept picture closest to `frame` and the frame it is actually of, or `None` while
     /// nothing near that position has been decoded.

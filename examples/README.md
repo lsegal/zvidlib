@@ -73,7 +73,18 @@ rather than only that frame: it walks forwards from where the decoder already is
 pointer moves backwards, from the random-access point at or before it
 (`VideoStream.randomAccessPoints()`). Each step covers whatever fits in 150 ms at the rate the walk
 is decoding at, so the picture keeps moving throughout a drag without drawing - and paying for -
-every frame it passes. The whole AAC track is
+every frame it passes.
+
+The picture the drag *follows*, though, is not the walk's. `ARCHITECTURE.md` section 3.2 requires a
+seek to any position of any track to answer in under 50 ms, and no walk can: the bundled sample
+codes its 768 frames as one group of pictures, so the far end of the bar is 767 reference decodes
+from the only place a decode can start. So the page builds `VideoStream.previews()` - the browser's
+seek preview tier, one shrunk picture every stride frames - and every pointer sample draws the
+nearest of them immediately while the walk goes after the exact frame underneath it. The pass has no
+thread to fill itself on in a browser, so the page advances it one preview per `requestIdleCallback`
+and it yields to the event loop in between; a lookup is answered from whatever the pass has reached
+so far, so a drag over the far end works before the pass gets there. The overlay under the frame
+rate reports what each seek cost against `seekLatencyBudgetMs()`. The whole AAC track is
 decoded once into a single `AudioBuffer`, so seeking and scrubbing only reschedule playback from
 the new offset instead of re-running the decoder, and audio keeps playing while you scrub.
 
