@@ -661,9 +661,13 @@ pub mod paired {
 
         #[test]
         fn the_floor_is_the_widest_miss_of_one_anywhere_in_the_band() {
-            // A control whose median is perfect but whose band is not: the
+            // A control whose median is perfect but whose band is not, and
+            // lopsided so that one end of the band is the widest miss: the
             // reading the floor exists to refuse to call resolved.
-            let values: Vec<f64> = (0..21).map(|i| 0.94 + i as f64 / 100.0).collect();
+            let values = [
+                0.90, 0.90, 0.90, 0.90, 0.90, 0.98, 0.99, 0.99, 0.99, 0.99, 1.00, 1.01, 1.01, 1.01,
+                1.01, 1.06, 1.10, 1.10, 1.10, 1.10, 1.10,
+            ];
             let reported = floor(&values).expect("21 rounds underwrite a floor");
             let (median, low, high) = band(&values);
             assert!((median - 1.0).abs() < 1e-9, "median {median}");
@@ -698,7 +702,9 @@ pub mod paired {
                 .filter(|&rounds| floor(&long[..rounds]).is_some_and(|short| short < full))
                 .collect::<Vec<_>>();
             assert!(
-                understating.iter().all(|&rounds| rounds >= MIN_FLOOR_ROUNDS),
+                understating
+                    .iter()
+                    .all(|&rounds| rounds >= MIN_FLOOR_ROUNDS),
                 "a run under the minimum reported a tighter floor than the whole draw: \
                  {understating:?}"
             );
