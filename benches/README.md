@@ -1888,17 +1888,19 @@ ratio: **0.977x to 1.000x, every step**, the later commit never slower. A
 paired ratio is immune to which model the step landed on, which is what makes
 nine of them comparable without dispatching a lottery per step.
 
-**Only the aarch64 table has a row for both groups.** `codec.rs`'s group is now
+**Both tables now have a row for both groups.** `codec.rs`'s group is now
 `av1_deblock_luma`, pairing with the `av1_deblock_chroma` it is the luma half
 of, and `av1_decode.rs` keeps `av1_deblock` as the narrow-filter member of its
 deblocking trio, the name the recipe's own target order already resolves to.
 Both tables below were drawn in that order and so collected `av1_decode.rs`'s
-side, and each carries an `av1_deblock` row as measured. The Apple M1 table has
-since gained an `av1_deblock_luma` row of its own, measured separately for issue
-#423 — which is where the two sides of the collision can be read against each
-other on one host, and where the paragraph above's claim about the two arms is
-checked on aarch64 rather than inferred from the x86_64 rounds. The x86_64 table
-gains its row at its next draw. No ratio in either table is wrong now that it
+side, and each carries an `av1_deblock` row as measured; each has since gained
+an `av1_deblock_luma` row of its own, measured separately from `codec.rs` alone
+— the Apple M1's for issue #423, the AMD EPYC 7763's for issue #445. Each of
+those draws re-measured `av1_deblock` beside it as a control, so the claim this
+section makes about the two arms is now checked directly on both hosts rather
+than inferred from #350's rounds: the vector arms agree to **1.6%** on `neon`,
+**0.9%** on `sse4.1` and **1.4%** on `avx2`, while the `scalar` arms are
+**21%** and **25.5%** apart. No ratio in either table is wrong now that it
 names the group it was measured from.
 
 `no_two_bench_targets_register_the_same_group_name` in
@@ -2196,12 +2198,55 @@ fifty minutes before the checkpoint was written. That is the whole of why
 `hevc_color_convert` moved; see [Reading the rows](#reading-the-rows) below.
 
 The `av1_deblock` row here is `benches/av1_decode.rs`'s group, which this draw
-ran second and so collected; there is no `av1_deblock_luma` row, because
-`benches/codec.rs`'s group of that name was overwritten in every round. That is
-the opposite side of the collision from the table this one supersedes, which is
-why the row moved by a quarter in its `scalar` column and not at all in its
-vector ones. See [One group name, two
+ran second and so collected, and `benches/codec.rs`'s group was overwritten in
+every one of its rounds. That is the opposite side of the collision from the
+table this one supersedes, which is why the row moved by a quarter in its
+`scalar` column and not at all in its vector ones. See [One group name, two
 targets](#one-group-name-two-targets-and-the-row-that-moved-for-nothing) above.
+
+The `av1_deblock_luma` row is the one figure here not from that draw. #417 made
+it nameable and issue #445 measured it, on the same CPU model, at
+`358259443817`, from `benches/codec.rs` alone and into a `CRITERION_HOME` of its
+own so nothing could overwrite it. Six rounds were dispatched by the same
+round-selection this table's own draw used; three landed on the AMD EPYC 7763
+and are the row, as the elementwise minimum of the **nine** rounds they carry
+between them — three rounds each, three machines of the named model — with the
+other three (two on an AMD EPYC 9V74 80-Core, one on an Intel Xeon Platinum
+8573C) measured and discarded ([run
+33812824745](https://github.com/lsegal/zvidlib/actions/runs/33812824745), [run
+33812836030](https://github.com/lsegal/zvidlib/actions/runs/33812836030), [run
+33812841697](https://github.com/lsegal/zvidlib/actions/runs/33812841697)). The
+nine agree to 0.30% on `scalar` and 0.82% on either vector arm.
+`src/av1_simd/filters.rs` and `src/av1_filters.rs` — the vector and scalar
+deblocking code the arms run — are unchanged between `d39c8df519d5` and that
+commit, so the row measures the same kernels as the rows around it and the
+table's stamp does not move; for this group the rename is the only thing
+separating the two commits.
+
+Unlike the aarch64 table's `av1_deblock_luma` row, this one needs no allowance
+for a quieter host, because the same session re-measured
+`benches/av1_decode.rs`'s `av1_deblock` into a second `CRITERION_HOME` as a
+control and it lands on the committed row above: **26.975 ms / 3.927 ms
+(6.87x) / 3.381 ms (7.98x)** against the row's 26.956 ms / 3.934 ms (6.85x) /
+3.392 ms (7.95x), every arm within **0.32%**. The new row is therefore directly
+comparable to its neighbours as drawn. It also reproduces the figure the
+superseded `b284c38a6391` table carried under the name `av1_deblock` — #350's
+rounds collected `codec.rs`'s side, and #417 renamed it — to within **0.25%**
+on every arm (21.506 ms / 3.974 ms / 3.424 ms there), which is the paired
+bisect's "nothing between the stamps moves the arm" arriving a second way.
+
+The control is also what puts the two sides of the collision next to each other
+on `sse4.1` and `avx2`, as the aarch64 table's does on `neon`. Measured side by
+side in one session the two groups' vector arms agree to **0.9%** (`sse4.1`,
+3.964 ms against 3.927 ms) and **1.4%** (`avx2`, 3.428 ms against 3.381 ms)
+while their `scalar` arms are **25.5%** apart (21.492 ms against 26.975 ms).
+That is [One group name, two
+targets](#one-group-name-two-targets-and-the-row-that-moved-for-nothing)'s
+claim measured directly on x86_64 rather than read out of #350's rounds, and it
+agrees with the 1.6% / 21% the M1 control reports on `neon`: the vector kernels
+do fixed masked work per lane, while the scalar reference branches per position
+on the §7.14.6.1 filter mask and so is the only arm the two targets' different
+content reaches.
 
 | Group | `scalar` | `sse4.1` | `avx2` | Best |
 | --- | ---: | ---: | ---: | ---: |
@@ -2209,6 +2254,7 @@ targets](#one-group-name-two-targets-and-the-row-that-moved-for-nothing) above.
 | `av1_deblock` | 26.956 ms | 3.934 ms (6.85x) | 3.392 ms (7.95x) | 7.95x `avx2` |
 | `av1_deblock_boundary` | 373.108 µs | 74.155 µs (5.03x) | 78.531 µs (4.75x) | 5.03x `sse4.1` |
 | `av1_deblock_chroma` | 15.974 ms | 6.083 ms (2.63x) | 6.304 ms (2.53x) | 2.63x `sse4.1` |
+| `av1_deblock_luma` | 21.492 ms | 3.964 ms (5.42x) | 3.428 ms (6.27x) | 6.27x `avx2` |
 | `av1_deblock_wide` | 104.984 ms | 37.076 ms (2.83x) | 33.176 ms (3.16x) | 3.16x `avx2` |
 | `av1_decode_frame` | 97.296 ms | 97.660 ms (1.00x) | 98.031 ms (0.99x) | 1.00x `sse4.1` |
 | `av1_encode_frame_q0` | 21.887 ms | 18.474 ms (1.18x) | 18.307 ms (1.20x) | 1.20x `avx2` |
