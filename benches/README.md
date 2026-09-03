@@ -1062,8 +1062,10 @@ plane it wraps (`RefPlane::with_narrow`), and `row_window_narrow` borrows out of
 it exactly as `row_window` borrows out of the `i32` samples.
 `measure_narrow_vs_wide_block` grew a third arm so the two representations are
 timed against the same `i32` baseline in one interleaved process, all three
-asserted equal sample-for-sample first. On an **Intel Core i9-10850K
-(Windows, AVX2, `rustc 1.98.0`)**, best of fifteen rounds:
+asserted equal sample-for-sample first. Since #435 that sweep also walks every
+vector backend the host offers, so the table below is the `avx2` column of it.
+On an **Intel Core i9-10850K (Windows, AVX2, `rustc 1.98.0`)**, best of fifteen
+rounds:
 
 | Phase | 8x8 | 16x16 | 32x32 | 64x64 |
 | --- | ---: | ---: | ---: | ---: |
