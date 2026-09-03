@@ -923,6 +923,14 @@ from 21 rounds to 51 made the floor **worse** (6.37% against 4.43%), because a
 run two and a half times longer simply catches more of the interference it is
 measuring. More rounds buy a better-estimated noise floor, never a lower one.
 
+The converse is the trap this creates, and it is worth naming because the number
+moves in the flattering direction: a 5-round draw on this same host reports a
+**3.36%** floor, tighter than any of the five above. It has not measured less
+noise. An interquartile band over five readings is three of them, so it
+understates a spread it has barely sampled. The floor is only as trustworthy as
+the round count behind it, and a lower one obtained by shortening the run is an
+artefact rather than a tightening.
+
 **Raising the process priority is the one lever that helped, and only to the
 median.** Draw 2 put the control median within **0.31%** of 1.0000x — the ~1%
 the issue asked for — while its interquartile band stayed at [0.9615, 1.0443].
