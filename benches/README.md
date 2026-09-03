@@ -1244,7 +1244,7 @@ alphabetically and so runs `codec` after `av1_decode`, while the #393 workflow
 followed the recipe above, which names `codec` first. Read out of #350's own six
 rounds, on the three that landed on the AMD EPYC 7763, the two groups are:
 
-| Group | `scalar` | `sse4.1` | `avx2` |
+| Target's group | `scalar` | `sse4.1` | `avx2` |
 | --- | ---: | ---: | ---: |
 | `codec.rs`, collected | 21.506 ms | 3.974 ms | 3.424 ms |
 | `av1_decode.rs`, overwritten | 27.290 ms | 3.974 ms | 3.403 ms |
