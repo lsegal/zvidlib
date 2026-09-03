@@ -717,6 +717,117 @@ four samples where an `i16` formulation would cover eight. That is a change to
 how sample planes are represented across `engine`, not a change to `filter_taps`,
 and it is tracked separately rather than folded in here.
 
+That became issue #378, and the section below is its answer: the kernel does go
+about twice as fast at 16-bit width, and it turns out that only buys anything on
+one of the four phase cases, for a reason that is about the *caller* rather than
+the kernel.
+
+#### `filter_taps` at 16-bit width: where the doubled lane count survives the trip
+
+Issue #378 asked whether narrowing the interpolation sample path from `i32` to
+`i16` recovers what #309 and #312 could not. Three findings, in the order they
+constrain each other.
+
+**The 16-bit accumulator is in range at eight bits, and only at eight bits.**
+`shift1` is `Min( 4, BitDepth − 8 )`, so it is zero for eight-bit content and the
+tap accumulation is not scaled down before it lands. A partial sum of
+`Σ coeffs[t] · taps[t][i]` taken in tap order is a subset sum, so it is bounded by
+the all-negative and all-positive subsets. The widest §8.5.3.3.3.2 kernel is
+`[ −1, 4, −11, 40, 40, −11, 4, −1 ]`, whose positive coefficients sum to 88 and
+negative to −24, so with samples in `0..=255` the reachable interval is
+`−6120..=22440` — inside `i16`, with room to spare. At nine bits it is not
+(`88 · 511 = 44968`), and the arrangement collapses. So this is an eight-bit fast
+path, not a change to how planes are represented, and the higher bit depths keep
+the `i32` kernel untouched.
+
+**Only an `i16` *accumulator* wins; `i16` operands alone win nothing.** This is
+the finding that decides the shape of everything else. A widening multiply-
+accumulate — `vmlal_s16` on NEON, `vmlal_high_s16` for the top half — reads
+`i16` lanes but still produces four `i32` lanes per instruction, exactly what
+`vmlaq_s32` produces. Timed against the `i32` kernel over the row-length sweep it
+reads 1.18x at a row of 8, 1.04x at 64 and **1.00x at 256**: the whole of its
+small-row advantage is halved load bandwidth, and at long rows there is nothing
+left. The doubling only exists with `vmlaq_n_s16`, which keeps eight lanes all
+the way through the accumulator. `simd::filter_taps_narrow` is that kernel, and
+`simd::measure_narrow_filter_taps` A/Bs it against `filter_taps` on the same
+sweep, in one process, interleaved, best of nine rounds:
+
+| Samples per call | `i32` `neon` | `i16` `neon` | narrow | `i32` `scalar` | `i16` `scalar` | narrow |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 4 | 3.88 ms | 4.05 ms | 0.96x | 13.56 ms | 8.87 ms | 1.53x |
+| 8 | 2.22 ms | 2.20 ms | 1.01x | 7.60 ms | 6.94 ms | 1.09x |
+| 16 | 1.76 ms | 1.31 ms | 1.34x | 3.85 ms | 5.34 ms | 0.72x |
+| 32 | 1.56 ms | 0.94 ms | 1.66x | 2.35 ms | 2.47 ms | 0.95x |
+| 64 | 1.60 ms | 0.87 ms | 1.84x | 2.03 ms | 1.86 ms | 1.09x |
+| 128 | 1.52 ms | 0.82 ms | 1.85x | 1.73 ms | 1.55 ms | 1.12x |
+| 256 | 1.50 ms | 0.80 ms | 1.89x | 1.63 ms | 1.45 ms | 1.12x |
+
+The kernel reaches **1.89x** where #309 established the `i32` kernel was already
+at the M1's integer SIMD multiply throughput, which is the expected answer: the
+limit was multiplies per cycle, and this issues half as many for the same work.
+Below a row of eight there is no 16-bit vector loop to reach — the call is the
+4-wide widening remainder plus the cost of having narrowed its source — so the
+narrow-width chroma blocks keep the `i32` kernel.
+
+**But a block is not a kernel, and only one phase case keeps the win.**
+`measure_narrow_vs_wide_block` A/Bs the two arms through the whole of
+`interp_block` — the block walk, the source narrowing and the allocations
+included — at the half-pel phase, in one process, best of fifteen rounds, with
+the two arms asserted equal sample-for-sample before anything is timed:
+
+| Phase | 8x8 | 16x16 | 32x32 | 64x64 |
+| --- | ---: | ---: | ---: | ---: |
+| horizontal-only (a/b/c) | 0.82x | 0.99x | 0.94x | 1.04x |
+| vertical-only (d/h/n) | 1.37x | 1.22x | 1.25x | 1.43x |
+| two-dimensional (e/i/p, f/j/q, g/k/r) | 0.92x | 0.95x | 0.99x | 1.02x |
+
+Same kernel in all three rows, at 1.89x in isolation, and only the middle row
+keeps any of it. **What separates them is who pays to narrow the source.** The
+vertical-only case reaches its taps through `RefPlane::gather`, which
+materializes a `w x ( h + N − 1 )` buffer either way, so writing that buffer as
+`i16` instead of `i32` costs nothing at all — same store count, half the bytes —
+and the kernel's advantage arrives intact. The other two reach theirs through
+`RefPlane::row_window`, which **borrows the plane outright with no copy** when
+the window lies inside it, which is the common case. Narrowing there has to
+introduce a materialized pass that the `i32` path never performs, and that pass
+costs about what the wider lanes save. The two-dimensional case is worse again
+for a second, independent reason: only its horizontal pass can narrow at all. Its
+vertical pass multiplies a 16-bit intermediate by a coefficient of up to 58, so
+it needs a 32-bit accumulator, and by the finding above that is the same lane
+count the `i32` kernel already issues.
+
+So `interp_block` takes the narrow path for the vertical-only phase, at eight
+bits, on a vector backend, at rows of eight samples or more — the four conditions
+`inter_pred::narrows` spells out — and nowhere else. Both arms stay spelled out
+inside `interp_block_with_width` rather than one of them being deleted, the same
+arrangement `measure_2d_ring_vs_flat` uses, so the table above stays reproducible
+after the decision it justifies.
+
+**The whole-decode effect is below this host's noise floor, and the null control
+is what says so.** `inter_pred_filter` is about 27% of decode proper, the
+vertical-only phase is 3 of the 16 Table 8-8 combinations, and a 1.2-1.4x on that
+share is a low single-digit percentage of a decode. Paired against `main` through
+`hevc_decode_profile`, 48 frames, twelve interleaved rounds, elementwise minimum,
+the `neon` arm read 1.10x in one round set and 0.83x in another. The `scalar` arm
+is the control that settles it: `narrows` is false for `Isa::Scalar`, so both
+binaries execute identical code on that arm, and it still read 1.06x and 1.07x in
+those same two round sets. **A ±7% disagreement on an arm where the answer is
+known to be 1.00x is larger than the effect being measured**, and the host was
+running other work throughout. The in-process A/Bs above are the instrument for
+this question, for exactly the reason `measure_2d_ring_vs_flat` already gives:
+separate benchmark processes on this host disagree with each other by more than
+the effect. The committed `hevc_inter_pred` and `inter_pred_filter` rows are
+therefore left as they stand rather than redrawn from measurements that cannot
+resolve the change.
+
+No decoded sample moves on any backend or at any bit depth.
+`the_eight_bit_block_path_matches_the_per_sample_equations` runs every block
+shape, origin and phase of the eight-bit block path against the normative
+per-sample §8.5.3.3.3.2 / §8.5.3.3.3.3 equations, which are `i32` throughout —
+the guard that matters here, because `every_backend_matches_scalar_luma_block`
+compares vector kernels against the scalar one and at eight bits both of its
+sides would be the narrow formulation.
+
 Neither the decoded output nor any kernel changed in the course of this, so the
 sweep, the `hevc_inter_pred` ratio and the `inter_pred_filter` ms/frame rows
 above stand as re-measured.
@@ -2680,16 +2791,123 @@ competing for cache with everything else in the stage. The 1.10-1.53x is a real
 figure for the loop it was taken in and does not transfer, and a third call
 shape is not what would make it transfer.
 
-**Do not spend another attempt on this dispatch site.** The remaining
-untested idea is not a call shape but a different decomposition - deriving the
-32-band histogram for a whole CTB in one pass that keeps its accumulators in
-registers across rows, rather than 32 memory accumulators re-read per row - and
-that is a different kernel, not this one re-shaped. `band_offset_rect` is kept
-as the site's entry point precisely so a future attempt starts from the
-once-per-CTB shape without re-deriving that the once-per-row one is not what is
-costing it; both x86 rect kernels stay `#[cfg(test)]` alongside the six
-once-per-row candidates, asserted bit-exact, as the apparatus these figures
-were taken with.
+That left one untested idea, and it was not a call shape but a different
+decomposition - deriving the 32-band histogram for a whole CTB in one pass that
+keeps its accumulators in registers across rows, rather than 32 memory
+accumulators re-read per row. #406 built it. It is a null result, and this
+dispatch site is now closed.
+
+#### The register-resident accumulator, and why it is a null result
+
+Three shapes, all asserted bit-exact against `band_offset_row_scalar` under
+every `simd::set_override` pin over strided rectangles by
+`the_x86_narrow_band_rect_kernels_match_the_row_reference`: a **portable narrow
+control** that narrows and splits the accumulators and vectorizes nothing, so a
+result can be attributed to the accumulator rather than to the classification;
+**`band_offset_rect_avx2_narrow`** and its SSE4.1 twin, which are the same lane
+scatter #340 timed but into `i32` sums and `u32` counts split across two partial
+sets instead of two `[i64; 32]` arrays; and
+**`band_offset_rect_avx2_transposed`**, the register-resident shape proper - a
+masked pass per band with the histogram held in `ymm` registers, no memory
+histogram and no scatter at all.
+
+**The occupancy the transposed shape depends on was measured first**, because
+its cost is proportional to the bands it visits and only the band *range* is
+derivable at a price it can pay: a vector min/max is two operations per sample,
+while the set of distinct occupied bands is not available at any price the pass
+can afford. `tests/sao_band_occupancy.rs` is that measurement.
+
+| content | distinct bands | band range `max - min + 1` |
+| --- | --- | --- |
+| bundled 1080p sample, luma 16x16 (n=168,840) | mean 6.4, 38.4% <=4 | mean 6.4, 38.4% <=4, 68.6% <=8 |
+| synthetic 640x352 luma 16x16 (n=1,760) | mean 10.0 | **mean 15.5, 0% <=8** |
+| synthetic 640x352 chroma 8x8 (n=3,520) | mean 3.2 | mean 3.4, 100% <=4 |
+
+Real video is sparse. The synthetic content this group searches is not, because
+its luma wraps a gradient at `& 0xff`. **So the one shape with a sparse-CTB
+advantage has no sparse luma CTB to take it on in the group that decides** -
+worth knowing before writing it, which is why it was measured before writing it.
+
+**Narrowing the accumulators is a loss on its own, which is the opposite of the
+premise.** `bench_band_offset_rect` times the two rectangles the site is
+actually called with - a 16x16 luma CTB and an 8x8 chroma CTB - including the
+per-CTB zeroing and fold a whole-CTB accumulator has to pay and a per-row one
+does not. Intel Core i9-10850K, minimum of 15 interleaved rounds, reproducing to
++/-0.03 across independent runs:
+
+| arm | luma 16x16 | chroma 8x8 |
+| --- | ---: | ---: |
+| rows (reference) | 1.00x | 1.00x |
+| lane scatter into `BandStats` (#340's kernel) | 1.07-1.09x | 0.98-1.02x |
+| narrow scalar control | **0.80-0.81x** | **0.66-0.70x** |
+| avx2 narrow | 0.99-1.03x | 0.77-0.80x |
+| avx2 narrow, fold deleted | 1.06-1.11x | 0.94-0.99x |
+| avx2 transposed | 0.84-0.86x | 0.61-0.65x |
+| avx2 transposed, 4-band range | 1.05-1.13x | 0.62-0.65x |
+
+Read the control row first: narrowing and splitting the accumulators, with no
+vector unit involved at all, reads **0.66-0.81x**. The narrow histogram costs
+more than the width it saves, and `u16` counts were worse again than the `u32`
+this table was taken at. Two `u32`-counted sets are also 512 bytes - exactly
+what `BandStats` costs - so the "halves the traffic" half of the idea and the
+"splits the dependency chain" half are in direct tension, and only one of them
+can hold at a time.
+
+The `fold deleted` row is the ceiling. It prices away the one cost this shape
+adds that a per-row `BandStats` does not, so **no rewiring of the caller to
+consume the narrow accumulator directly could beat it**. Even there it reads
+1.06-1.11x on luma and 0.94-0.99x on chroma against a wide-scatter kernel
+already at 1.07-1.09x and 0.98-1.02x in the same rounds: not distinguishable
+from the kernel #340 measured and #382 showed does not transfer.
+
+**And it does not separate in the encoder either**, which is the criterion the
+last two attempts failed. Paired branch-against-base, both trees built and timed
+on one host and interleaved within a round, five rounds per draw, with
+`band_offset_rect` dispatching to the narrow kernels in the branch and to the
+row reference in the base. The `scalar` arm is the control: it resolves to the
+same row reference in both trees, so it has to read 1.00x.
+
+Eight `ubuntu-latest` legs were dispatched at once so that legs sharing a CPU
+model could be grouped afterwards, plus one local Intel desktop host:
+
+| CPU model | draws | `avx2` | `sse4.1` | `scalar` (control) |
+| --- | ---: | ---: | ---: | ---: |
+| Intel Xeon Platinum 8573C | 2 | 1.006-1.012x | 1.000-1.006x | 1.000-1.001x |
+| AMD EPYC 7763 64-Core | 2 | 0.991-1.005x | 0.977-0.998x | 0.999-1.001x |
+| AMD EPYC 9V74 80-Core (Zen 5) | 3 | **0.959-0.965x** | 0.967-0.980x | 1.002-1.005x |
+| Intel Core i9-10850K (local) | 1 | 0.978x | 1.003x | 1.000x |
+
+**Nothing separates, and on Zen 5 it is a reproducible regression.** On both
+Intel parts and on EPYC 7763 every arm sits inside a band its own control is
+already inside - 1.006-1.012x against a 1.000-1.001x control is not a result.
+On EPYC 9V74 the `avx2` arm reads 0.959-0.965x across three independent draws,
+every round signed the same way, against controls of 1.002-1.005x: a 3.5-4%
+regression, well outside what the control moves by. That is the same signature
+#340's per-row shape (0.94-0.95x on Zen 5) and #382's per-CTB shape
+(0.872-0.891x on Zen 5) both produced, and the third time this dispatch site has
+answered a differently-shaped kernel the same way.
+
+A ninth leg, on an Intel Xeon 6973P-C, is **discarded rather than reported**:
+its `scalar` control read 0.975x, and a control that moves 2.5% where it must
+read 1.00x cannot resolve a several-percent effect. That is the control doing
+its job. An earlier six-leg draw agreed in range - `avx2` 0.975-1.012x,
+`sse4.1` 0.971-1.006x, controls 0.999-1.010x - but is not reported by model,
+because that draw wrote the host's model only to the run's step summary and not
+to the artifacts the ratios are recomputed from. It is the reason the workflow
+now records the model in an uploaded file.
+
+**Do not spend a fourth attempt on this dispatch site.** Three shapes across
+three issues now agree, and none of the three guessed causes survived: not the
+denominator (#382 measured the band search at 23-29% of this group's `avx2`
+arm), not the call shape (#382 measured once-per-CTB as worse than
+once-per-row), and not the accumulator width (#406 measured narrowing as a loss
+before any vector unit is involved). What is left is that a 32-way scatter over
+a CTB is already close to what this classification costs, and the isolated
+harness's 1.10-1.53x is a figure for a loop the encoder does not run.
+`band_offset_rect` is kept as the site's entry point so the site keeps a named
+dispatch point with a bit-exactness harness pointed at it; all five x86 rect
+kernels stay `#[cfg(test)]` alongside the six once-per-row candidates, asserted
+bit-exact, as the apparatus these figures were taken with.
 
 **AVX-512 was timed and does not separate even in isolation.**
 `ubuntu-latest` draws AVX-512CD hosts, so the `vpconflictd` shape #305 pointed
