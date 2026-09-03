@@ -137,6 +137,9 @@ pub async fn video_random_access_points(
 /// A lazily-configured `WebCodecs` decode session for one input video track.
 pub struct WebVideoDecodeSession {
     samples: Vec<EncodedVideoSample>,
+    /// The track's coded size, which a caller sizing a preview budget against it
+    /// needs before it has decoded anything (see [`crate::web_previews`]).
+    dimensions: VideoDimensions,
     decode_position_by_presentation: HashMap<FrameIndex, usize>,
     decoder: JsVideoDecoder,
     config: JsVideoDecoderConfig,
@@ -250,6 +253,7 @@ impl WebVideoDecodeSession {
 
         Ok(Self {
             samples,
+            dimensions,
             decode_position_by_presentation,
             decoder,
             config,
@@ -264,6 +268,16 @@ impl WebVideoDecodeSession {
             _output_closure: output_closure,
             _error_closure: error_closure,
         })
+    }
+
+    /// The track's coded size.
+    pub fn dimensions(&self) -> VideoDimensions {
+        self.dimensions
+    }
+
+    /// How many presentation frames the track has.
+    pub fn frame_count(&self) -> u64 {
+        self.samples.len() as u64
     }
 
     fn nearest_random_access(&self, position: usize) -> usize {

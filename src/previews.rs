@@ -199,6 +199,15 @@ impl PreviewStore {
         self.store.lock().ok()?.nearest(frame)
     }
 
+    /// [`Self::nearest`], with the frame the picture it returned is actually of.
+    ///
+    /// This is [`SeekPreviewSource::nearest_at`] as an inherent method, so a
+    /// caller holding a concrete store - the browser's wasm bindings do - reads
+    /// it without importing the trait.
+    pub fn nearest_at(&self, frame: FrameIndex) -> Option<(FrameIndex, VideoFrame)> {
+        self.store.lock().ok()?.nearest_at(frame.0)
+    }
+
     /// How many of the pass's positions are filled, out of how many there are.
     pub fn coverage(&self) -> (usize, usize) {
         match self.store.lock() {
@@ -225,7 +234,7 @@ impl PreviewStore {
 /// [`ExactFrameReader::seek`]: crate::codec::ExactFrameReader::seek
 impl SeekPreviewSource for PreviewStore {
     fn nearest_at(&self, frame: FrameIndex) -> Option<(FrameIndex, VideoFrame)> {
-        self.store.lock().ok()?.nearest_at(frame.0)
+        PreviewStore::nearest_at(self, frame)
     }
 }
 
