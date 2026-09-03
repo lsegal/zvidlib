@@ -37,7 +37,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        leg: [1, 2, 3, 4, 5, 6]
+        leg: [1, 2, 3, 4, 5, 6, 7, 8]
     steps:
       - name: Check out the branch
         uses: actions/checkout@v4
@@ -59,11 +59,17 @@ jobs:
             base
       - name: Install native audio dependencies
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      # The model goes into an uploaded file, not only into the step summary:
+      # a draw the pool spread across several CPU models has to be groupable by
+      # model afterwards, and `GITHUB_STEP_SUMMARY` is not readable from the
+      # artifacts the ratios are recomputed from.
       - name: Name the host
         run: |
+          grep -m1 '^model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//' > host-cpu.log
+          cat host-cpu.log
           {
             echo '```'
-            echo "# host cpu model: $(grep -m1 '^model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//')"
+            echo "# host cpu model: $(cat host-cpu.log)"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Build both trees
@@ -118,4 +124,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: issue-406-draw-${{ matrix.leg }}
-          path: '*.log'
+          path: |
+            *.log
+            host-cpu.log
