@@ -1,0 +1,111 @@
+# Temporary: the paired branch-against-base draw issue #406's acceptance
+# criterion asks for, across whatever CPU models the `ubuntu-latest` pool
+# happens to hand out.
+#
+# This workflow is removed again before the branch merges. It exists because the
+# question — does the register-resident band accumulator separate in
+# `hevc_encode_640x352_reconstruct` — has already been answered wrongly twice
+# from a single host, and the two prior answers disagreed by CPU vendor.
+#
+# Each matrix leg builds both trees on one runner, times the group from each
+# alternately within a round, and reports the elementwise minimum. The group's
+# own `scalar` arm is the control: `band_offset_rect`'s scalar path is byte
+# identical in both trees, so that arm has to read 1.00x, and a leg whose
+# control does not is discarded rather than reported.
+name: Issue 406 paired draw
+
+on:
+  workflow_dispatch:
+    inputs:
+      base:
+        description: The commit to time the branch against.
+        required: true
+      rounds:
+        description: Interleaved rounds per leg.
+        required: false
+        default: '5'
+
+jobs:
+  draw:
+    name: Draw ${{ matrix.leg }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        leg: [1, 2, 3, 4, 5, 6]
+    steps:
+      - name: Check out the branch
+        uses: actions/checkout@v4
+        with:
+          path: branch
+          fetch-depth: 0
+      - name: Check out the base
+        uses: actions/checkout@v4
+        with:
+          path: base
+          ref: ${{ inputs.base }}
+      - name: Install Rust toolchain
+        run: rustup show
+      - name: Install native audio dependencies
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - name: Name the host
+        run: |
+          {
+            echo '```'
+            echo "# host cpu model: $(grep -m1 '^model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//')"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Build both trees
+        run: |
+          set -o pipefail
+          (cd branch && cargo bench --features native --bench hevc_encode --no-run)
+          (cd base && cargo bench --features native --bench hevc_encode --no-run)
+      - name: Take the draw
+        run: |
+          set -o pipefail
+          for r in $(seq 1 "${{ inputs.rounds }}"); do
+            if [ $((r % 2)) -eq 1 ]; then order="branch base"; else order="base branch"; fi
+            for tree in $order; do
+              (cd "$tree" && cargo bench --features native --bench hevc_encode -- \
+                'hevc_encode_640x352_reconstruct/') > "$tree-$r.log" 2>&1
+            done
+          done
+          {
+            echo '## Elementwise minimum of ${{ inputs.rounds }} interleaved rounds'
+            echo
+            echo '```'
+            echo "# host cpu model: $(grep -m1 '^model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//')"
+            awk '
+              function tons(v, u) {
+                if (u == "s") return v * 1e9
+                if (u == "ms") return v * 1e6
+                if (u == "\xc2\xb5s" || u == "us") return v * 1e3
+                return v
+              }
+              FNR == 1 { split(FILENAME, p, "-"); tag = p[1] }
+              /^[a-z0-9_]+\/(scalar|sse4\.1|avx2)$/ { arm = $0; next }
+              /time:/ && arm != "" {
+                gsub(/[\[\]]/, "")
+                ns = tons($4, $5)
+                key = tag "|" arm
+                if (!(key in best) || ns < best[key]) best[key] = ns
+                arms[arm] = 1
+                arm = ""
+              }
+              END {
+                printf "%-46s %12s %12s %8s\n", "arm", "base (ms)", "branch (ms)", "ratio"
+                for (a in arms) {
+                  b = best["base|" a]; n = best["branch|" a]
+                  if (b == "" || n == "") continue
+                  printf "%-46s %12.4f %12.4f %7.3fx\n", a, b/1e6, n/1e6, b/n
+                }
+              }
+            ' branch-*.log base-*.log | sort
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload the raw logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: issue-406-draw-${{ matrix.leg }}
+          path: '*.log'

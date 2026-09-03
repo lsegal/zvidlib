@@ -659,7 +659,7 @@ pub(crate) struct NarrowBandStats {
     /// Summed `source − reconstruction` error per band, per partial set.
     pub sums: [[i32; 32]; NARROW_SETS],
     /// Number of samples per band, per partial set.
-    pub counts: [[u16; 32]; NARROW_SETS],
+    pub counts: [[u32; 32]; NARROW_SETS],
 }
 
 /// How many partial accumulator sets [`NarrowBandStats`] splits its histogram
@@ -1449,7 +1449,7 @@ mod x86 {
                     narrow.counts[1][first + j] += hsum_epi32(_mm_add_epi32(
                         _mm256_castsi256_si128(cnt[j]),
                         _mm256_extracti128_si256(cnt[j], 1),
-                    )) as u16;
+                    )) as u32;
                 }
             });
         }
@@ -2116,6 +2116,211 @@ mod tests {
         &mut NarrowBandStats,
     );
 
+    /// What the §8.7.3 band search costs *per CTB*, over the two CTB shapes the
+    /// encoder actually asks for and over the band ranges
+    /// `tests/sao_band_occupancy.rs` measured real content to have.
+    ///
+    /// Ignored by default because it measures rather than asserts; run it with
+    /// `cargo test --features native --release --lib
+    /// recon_simd::tests::bench_band_offset_rect -- --ignored --nocapture`.
+    ///
+    /// This is deliberately not `bench_band_offset_row`. That benchmark times
+    /// one L1-resident run of up to 1024 samples back to back with `stats` hot,
+    /// and #340 and #382 between them established that its answer does not
+    /// transfer to the encoder. This one times a 16x16 luma CTB and an 8x8
+    /// chroma CTB — the only two rectangles [`super::band_offset_rect`] is ever
+    /// called with — including the per-CTB zeroing and fold that a whole-CTB
+    /// accumulator has to pay for and a per-row one does not. It is still an
+    /// isolated benchmark and still does not decide anything on its own; it
+    /// exists so a shape that cannot even win here is not carried as far as a
+    /// paired whole-encoder draw.
+    ///
+    /// The arms are interleaved within each round and the reported time is the
+    /// minimum across rounds; the spread column is how far an arm's worst round
+    /// sat above its own best, and a ratio nearer 1.00x than that spread has not
+    /// separated.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    #[ignore = "benchmark; run explicitly with --ignored --nocapture"]
+    fn bench_band_offset_rect() {
+        use std::hint::black_box;
+
+        const ROUNDS: usize = 15;
+        /// CTBs classified per timed call, held constant across the shapes so a
+        /// chroma CTB is not measured over a sixteenth of a luma one's work.
+        const SAMPLES_PER_CALL: usize = 1 << 20;
+        /// The two rectangles `recon::band_stats` asks for, at the pitch a
+        /// picture-sized plane has rather than a packed one.
+        const SHAPES: &[(&str, usize, usize)] = &[("luma 16x16", 16, 16), ("chroma 8x8", 8, 8)];
+        /// Band ranges to time each shape over.
+        ///
+        /// `None` spans all 32 bands, which is the synthetic encoder content's
+        /// luma; the numbered spans are what the occupancy measurement found in
+        /// video, where 38.4% of CTBs occupy 4 bands or fewer.
+        const SPANS: &[Option<i32>] = &[None, Some(12), Some(4)];
+
+        if !is_x86_feature_detected!("avx2") {
+            println!("# host has no AVX2; nothing to measure");
+            return;
+        }
+        println!("# per-CTB band search, host dispatch site hevc_recon: {:?}", isa());
+
+        for &(shape, width, height) in SHAPES {
+            for &span in SPANS {
+                const STRIDE: usize = BAND_RECT_STRIDE;
+                let (here, src, expected) = match span {
+                    None => band_rect_fixture(width, height),
+                    Some(span) => narrow_band_rect_fixture(width, height, span),
+                };
+                let calls = SAMPLES_PER_CALL / (width * height);
+
+                // Every arm produces a `BandStats`, including the narrow ones,
+                // so each pays the fold and the widening its shape implies and
+                // none is credited with work it skipped.
+                let mut arms: Vec<(&'static str, Box<dyn Fn(&mut BandStats)>)> = Vec::new();
+                let (h, s) = (here.clone(), src.clone());
+                arms.push((
+                    "rows (reference)",
+                    Box::new(move |stats: &mut BandStats| {
+                        for y in 0..height {
+                            band_offset_row_scalar(
+                                &h[y * STRIDE..y * STRIDE + width],
+                                &s[y * STRIDE..y * STRIDE + width],
+                                stats,
+                            );
+                        }
+                    }),
+                ));
+                let (h, s) = (here.clone(), src.clone());
+                arms.push((
+                    "narrow scalar",
+                    Box::new(move |stats: &mut BandStats| {
+                        let mut narrow = NarrowBandStats::default();
+                        band_offset_rect_narrow_scalar(
+                            &h, STRIDE, &s, STRIDE, width, height, &mut narrow,
+                        );
+                        narrow.fold_into(stats);
+                    }),
+                ));
+                let (h, s) = (here.clone(), src.clone());
+                arms.push((
+                    "avx2 wide scatter",
+                    Box::new(move |stats: &mut BandStats| {
+                        // SAFETY: AVX2 was detected above.
+                        unsafe {
+                            x86::band_offset_rect_avx2(
+                                &h, STRIDE, &s, STRIDE, width, height, stats,
+                            );
+                        }
+                    }),
+                ));
+                for (name, kernel) in [
+                    (
+                        "avx2 narrow",
+                        x86::band_offset_rect_avx2_narrow as NarrowRectKernel,
+                    ),
+                    (
+                        "avx2 transposed",
+                        x86::band_offset_rect_avx2_transposed as NarrowRectKernel,
+                    ),
+                ] {
+                    let (h, s) = (here.clone(), src.clone());
+                    arms.push((
+                        name,
+                        Box::new(move |stats: &mut BandStats| {
+                            let mut narrow = NarrowBandStats::default();
+                            // SAFETY: AVX2 was detected above.
+                            unsafe {
+                                kernel(&h, STRIDE, &s, STRIDE, width, height, &mut narrow);
+                            }
+                            narrow.fold_into(stats);
+                        }),
+                    ));
+                }
+
+                // The same two narrow kernels with the fold dropped. Their
+                // answer is wrong on purpose — they are not asserted against
+                // `expected` below — and they exist only to price the fold,
+                // which is the one cost a narrow whole-CTB accumulator adds and
+                // a per-row `BandStats` does not. If a narrow arm is still not
+                // ahead of the reference with its fold removed, no rewiring of
+                // the caller to consume `NarrowBandStats` directly could rescue
+                // it, and the decomposition is answered rather than deferred.
+                let (h, s) = (here.clone(), src.clone());
+                arms.push((
+                    "narrow scalar, no fold",
+                    Box::new(move |_stats: &mut BandStats| {
+                        let mut narrow = NarrowBandStats::default();
+                        band_offset_rect_narrow_scalar(
+                            &h, STRIDE, &s, STRIDE, width, height, &mut narrow,
+                        );
+                        black_box(&narrow);
+                    }),
+                ));
+                let (h, s) = (here.clone(), src.clone());
+                arms.push((
+                    "avx2 narrow, no fold",
+                    Box::new(move |_stats: &mut BandStats| {
+                        let mut narrow = NarrowBandStats::default();
+                        // SAFETY: AVX2 was detected above.
+                        unsafe {
+                            x86::band_offset_rect_avx2_narrow(
+                                &h, STRIDE, &s, STRIDE, width, height, &mut narrow,
+                            );
+                        }
+                        black_box(&narrow);
+                    }),
+                ));
+                /// How many leading arms produce the reference answer and are
+                /// asserted against it. The trailing fold-priced arms do not.
+                const ASSERTED_ARMS: usize = 5;
+
+                let mut best = vec![f64::INFINITY; arms.len()];
+                let mut worst = vec![0f64; arms.len()];
+                for _ in 0..ROUNDS {
+                    for (arm, (name, run)) in arms.iter().enumerate() {
+                        let mut stats = BandStats::default();
+                        let start = std::time::Instant::now();
+                        for _ in 0..calls {
+                            // A fresh `BandStats` per call, because the encoder
+                            // takes one per CTB and zeroing it is part of what
+                            // narrowing the accumulator is supposed to save.
+                            let mut per_ctb = BandStats::default();
+                            run(black_box(&mut per_ctb));
+                            stats.sums[0] += black_box(per_ctb.sums[0]);
+                        }
+                        let secs = start.elapsed().as_secs_f64();
+                        if arm < ASSERTED_ARMS {
+                            let mut once = BandStats::default();
+                            run(&mut once);
+                            assert_eq!(once, expected, "{name} diverged");
+                        }
+                        black_box(&stats);
+                        best[arm] = best[arm].min(secs);
+                        worst[arm] = worst[arm].max(secs);
+                    }
+                }
+
+                let label = match span {
+                    None => "all 32 bands".to_string(),
+                    Some(span) => format!("{span}-band range"),
+                };
+                println!();
+                println!("{shape}, {label}, {calls} CTBs per round, best of {ROUNDS} rounds");
+                println!("{:<24}{:>12}{:>12}{:>12}", "arm", "MCTB/s", "ratio", "spread");
+                for (arm, (name, _)) in arms.iter().enumerate() {
+                    println!(
+                        "{:<24}{:>12.2}{:>11.2}x{:>11.1}%",
+                        name,
+                        calls as f64 / best[arm] / 1e6,
+                        best[0] / best[arm],
+                        100.0 * (worst[arm] / best[arm] - 1.0),
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn the_band_offset_search_matches_the_scalar_reference_on_every_instruction_set() {
         let _guard = simd::test_lock();
@@ -2456,7 +2661,7 @@ mod tests {
 
         /// The run lengths #305 timed on NEON.
         const LENGTHS: &[usize] = &[16, 64, 256, 1024];
-        const ROUNDS: usize = 9;
+        const ROUNDS: usize = 15;
         /// Samples classified per timed call, held constant across the run
         /// lengths so a short run is not measured over less work than a long
         /// one.
