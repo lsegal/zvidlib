@@ -2394,7 +2394,16 @@ mod tests {
         let (pw, ph) = (256usize, 256usize);
         let plane_samples = pseudo_random(8, pw * ph, 255);
         let plane = RefPlane::new(&plane_samples, pw, ph).unwrap();
-        let isa = simd::detected_isa();
+        // Every vector backend the host offers rather than only the widest
+        // one: `narrows` admits all of them, and the lane-count half of its
+        // argument does not read the same on a four-lane and an eight-lane
+        // `i32` kernel, so one backend's reading does not stand in for
+        // another's. `Isa::Scalar` is left out because `narrows` is false
+        // for it and neither arm is ever selected there.
+        let isas: Vec<Isa> = simd::available_isas()
+            .into_iter()
+            .filter(|&isa| isa != Isa::Scalar)
+            .collect();
         let rounds = 15;
         // Every phase case of Table 8-8 that filters at all, because
         // they narrow very differently: the one-dimensional cases have a
@@ -2408,37 +2417,51 @@ mod tests {
             ("2-D", Some(&LUMA_FILTER[2]), Some(&LUMA_FILTER[2])),
         ];
 
-        println!("\n8-tap luma interp_block, i32 vs i16 accumulation, {isa:?}, best of {rounds}");
+        println!("\n8-tap luma interp_block, i32 vs i16 accumulation, best of {rounds}");
         println!("  (equal total sample count at every block size)");
-        println!("  phase   block     i32 ms   i16 ms   narrow");
+        println!("  phase   block      isa     i32 ms   i16 ms   narrow");
         for (name, hk, vk) in cases {
             for &(w, h) in &[(8usize, 8usize), (16, 16), (32, 32), (64, 64)] {
                 let calls = (1 << 22) / (w * h);
-                let run = |narrow: bool| {
+                let run = |isa: Isa, narrow: bool| {
                     interp_block_with_width::<8>(isa, &plane, 4, 4, hk, vk, w, h, 8, narrow)
                 };
-                assert_eq!(run(false), run(true), "{name} arms disagree at {w}x{h}");
-
-                let (mut bw, mut bn) = (f64::INFINITY, f64::INFINITY);
-                for _ in 0..rounds {
-                    let start = Instant::now();
-                    for _ in 0..calls {
-                        std::hint::black_box(run(false));
-                    }
-                    bw = bw.min(start.elapsed().as_secs_f64());
-                    let start = Instant::now();
-                    for _ in 0..calls {
-                        std::hint::black_box(run(true));
-                    }
-                    bn = bn.min(start.elapsed().as_secs_f64());
+                for &isa in &isas {
+                    assert_eq!(
+                        run(isa, false),
+                        run(isa, true),
+                        "{isa:?} {name} arms disagree at {w}x{h}"
+                    );
                 }
-                println!(
-                    "  {name:>6}  {:>5}  {:9.2} {:8.2}  {:5.2}x",
-                    format!("{w}x{h}"),
-                    bw * 1e3,
-                    bn * 1e3,
-                    bw / bn
-                );
+
+                // The backends are interleaved with each other as well as
+                // with the two arms, so a drift that lands mid-sweep is
+                // spread across the columns rather than charged to one.
+                let mut best = vec![(f64::INFINITY, f64::INFINITY); isas.len()];
+                for _ in 0..rounds {
+                    for (i, &isa) in isas.iter().enumerate() {
+                        let start = Instant::now();
+                        for _ in 0..calls {
+                            std::hint::black_box(run(isa, false));
+                        }
+                        best[i].0 = best[i].0.min(start.elapsed().as_secs_f64());
+                        let start = Instant::now();
+                        for _ in 0..calls {
+                            std::hint::black_box(run(isa, true));
+                        }
+                        best[i].1 = best[i].1.min(start.elapsed().as_secs_f64());
+                    }
+                }
+                for (&isa, (bw, bn)) in isas.iter().zip(best.iter().copied()) {
+                    println!(
+                        "  {name:>6}  {:>5}  {:>7}  {:9.2} {:8.2}  {:5.2}x",
+                        format!("{w}x{h}"),
+                        format!("{isa:?}"),
+                        bw * 1e3,
+                        bn * 1e3,
+                        bw / bn
+                    );
+                }
             }
         }
     }
