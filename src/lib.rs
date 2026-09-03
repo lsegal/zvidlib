@@ -29,13 +29,18 @@ pub mod mp4;
 pub mod mp4_demux;
 pub mod output;
 pub mod playback;
-pub mod seek;
 pub mod simd;
 pub mod timeline;
 pub mod transfer;
 
 #[cfg(not(target_arch = "wasm32"))]
 mod av1_decoder;
+
+/// The bounded preview tier over a track, for callers that need an answer at an
+/// arbitrary position faster than a decode from the nearest random-access point
+/// can give one. Native-only: its pass runs on a thread of its own.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod previews;
 
 #[cfg(not(target_arch = "wasm32"))]
 mod hevc;
@@ -130,9 +135,9 @@ pub use codec::{
     AudioDrain, AudioEncoder, AudioEncoderFormat, AudioGapless, CancellationToken,
     CodecImplementation, CodecProfile, CodecSupport, DecodeStatistics, DecodedVideoFrame,
     EncodedSample, EncodedVideoSample, EncoderConfig, EncoderFuture, ExactFrameReader,
-    HardwarePreference, SampleDependency, Seek, TrackKind, VideoDecoder, VideoDecoderConfig,
-    VideoDecoderFactory, VideoEncoder, VideoEncoderConfig, VideoEncoderFactory, VideoEncoderFormat,
-    uncompressed_video_decoder_factory,
+    HardwarePreference, SEEK_LATENCY_BUDGET, SampleDependency, Seek, SeekPreviewSource, TrackKind,
+    VideoDecoder, VideoDecoderConfig, VideoDecoderFactory, VideoEncoder, VideoEncoderConfig,
+    VideoEncoderFactory, VideoEncoderFormat, uncompressed_video_decoder_factory,
 };
 pub use codec_config::{DerivedCodecString, derive_codec_string};
 pub use conformance::{
@@ -152,9 +157,6 @@ pub use playback::{
     PlaybackAudioOutput, PlaybackAudioSource, PlaybackController, PlaybackOptions,
     PlaybackVideoSource, Presentation, WebAudioOutput,
 };
-pub use seek::{
-    SEEK_LATENCY_BUDGET, SeekPreviewOptions, SeekPreviewPass, SeekPreviews, shrink_frame,
-};
 pub use timeline::{FrameIndex, FrameRate, Rational, SampleRange, Timeline};
 pub use transfer::{
     ColorConversion, ContextIdentity, CpuFrameDestination, CpuFrameSource, CpuPlaneDestination,
@@ -171,3 +173,5 @@ pub use hevc::native_hevc_video_decoder_factory;
 pub use hevc::native_hevc_video_encoder_factory;
 #[cfg(not(target_arch = "wasm32"))]
 pub use native_audio::{DefaultAudioOutput, NativeAacDecoder};
+#[cfg(not(target_arch = "wasm32"))]
+pub use previews::{PreviewIndex, PreviewOptions};

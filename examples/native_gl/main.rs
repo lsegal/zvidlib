@@ -12,8 +12,8 @@
 //!
 //! Dragging the timeline bar decodes its previews on a background thread (see [`scrub`]), so the
 //! window keeps drawing and keeps its audio scheduled while the pointer moves. What it draws
-//! while that decode runs comes from [`previews`], a background pass that keeps a shrunk picture
-//! every half second of the track: the bundled sample is one group of pictures, so the frame at
+//! while that decode runs comes from [`zvidlib::PreviewIndex`], a background pass that keeps a
+//! shrunk picture every half second of the track: the bundled sample is one group of pictures, so the frame at
 //! the far end of the bar is a second of hardware decoding away however the walk to it is
 //! arranged, and only a picture that was decoded already can answer a drag immediately.
 //!
@@ -50,17 +50,15 @@ use zvidlib::{
     ErrorKind, FrameDestination, FrameSource, GraphicsAdapter, GraphicsApi, GraphicsResource,
     HardwarePreference, IndexedPresentationTimeline, Limits, Mp4Demuxer, Mp4DemuxerOptions,
     NativeAacDecoder, NativeAudioOutput, Orientation, PixelFormat, PlaybackController,
-    PlaybackOptions, ResourceKind, ResourceOwnership, Result, TrackKind, TransferPolicy,
-    VideoDecoderConfig, VideoDecoderFactory, VideoDimensions, execute_transfer,
-    native_hevc_video_decoder_factory,
+    PlaybackOptions, PreviewIndex, PreviewOptions, ResourceKind, ResourceOwnership, Result,
+    TrackKind, TransferPolicy, VideoDecoderConfig, VideoDecoderFactory, VideoDimensions,
+    execute_transfer, native_hevc_video_decoder_factory,
 };
 
 mod gl_window;
-mod previews;
 mod scrub;
 
 use gl_window::{CONTROL_LEGEND, FpsCounter, GlWindowAdapter, LegendVisibility};
-use previews::PreviewIndex;
 use scrub::{FrameService, target_frame};
 
 const TEXTURE_HANDLE: u64 = 1;
@@ -145,7 +143,7 @@ fn run() -> Result<()> {
         configuration,
         video_samples,
         limits,
-        frames_per_second,
+        PreviewOptions::for_frame_rate(frames_per_second),
     )?;
     let video_reader = frames.source();
     let audio_decoder = NativeAacDecoder::new(&audio_config, Limits::default())?;

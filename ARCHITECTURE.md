@@ -103,7 +103,9 @@ A seek is therefore answered from pictures that are already decoded, and never b
 - otherwise a bounded seek preview index — one downscaled picture every N frames, populated by a background pass over the track on a decoder of its own, sized by a memory budget rather than by a fixed count, and answering the nearest position it has reached while it is still being built;
 - otherwise nothing, reported as such, so the caller falls through to its own exact request rather than blocking on the fast tier.
 
-The preview index is part of the library rather than of each application: every caller that scrubs a timeline needs it, and a caller that has to build its own has a seek that does not meet this requirement until it does. Exactness is unaffected. A preview is explicitly not the frame that was asked for, is labelled with the frame it is of, and never substitutes for `get(n)`, which continues to return exactly frame `n` or an error (section 8).
+The preview index is part of the library rather than of each application: every caller that scrubs a timeline needs it, and a caller that has to build its own has a seek that does not meet this requirement until it does. The reader reaches it through a trait rather than by naming it, because the reader is portable and an index whose pass owns a thread is not; a browser-side source implements the same lookup against whatever it can decode ahead.
+
+Exactness is unaffected. A preview is explicitly not the frame that was asked for, is labelled with the frame it is of, and never substitutes for `get(n)`, which continues to return exactly frame `n` or an error (section 8).
 
 ## 4. Writing and synchronization
 

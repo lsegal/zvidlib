@@ -763,3 +763,73 @@ pub fn synthetic_rgba8_sequence(width: u32, height: u32, frames: usize) -> Vec<V
         })
         .collect()
 }
+
+/// One of the paired 512x288 HEVC tracks that differ only in keyframe cadence.
+pub struct GopCadenceTrack {
+    /// `raps=1` or `raps=24`, the arm name a benchmark reports under.
+    pub label: &'static str,
+    pub configuration: VideoDecoderConfig,
+    pub samples: Vec<EncodedVideoSample>,
+    pub width: u64,
+    pub height: u64,
+    /// How many of `samples` are random-access points.
+    pub random_access_points: usize,
+}
+
+/// The two tracks whose *only* difference is how often a decode may restart.
+///
+/// The bundled 1080p sample answers what an exact seek costs on real content,
+/// but it codes its 768 frames as one group of pictures, so it cannot say
+/// anything about a track with several random-access points. Two tracks encoded
+/// from the same source at the same size, quality and preset, differing only in
+/// `keyint`, can: any gap between them is the cadence and nothing else. See
+/// `tests/fixtures/codec/README.md` for how they were produced.
+pub fn gop_cadence_tracks() -> &'static [GopCadenceTrack; 2] {
+    static TRACKS: OnceLock<[GopCadenceTrack; 2]> = OnceLock::new();
+    TRACKS.get_or_init(|| {
+        [
+            gop_cadence_track(
+                "raps=1",
+                include_bytes!("../../tests/fixtures/codec/bbb_hevc_512x288_gop768.mp4").to_vec(),
+            ),
+            gop_cadence_track(
+                "raps=24",
+                include_bytes!("../../tests/fixtures/codec/bbb_hevc_512x288_gop32.mp4").to_vec(),
+            ),
+        ]
+    })
+}
+
+fn gop_cadence_track(label: &'static str, bytes: Vec<u8>) -> GopCadenceTrack {
+    let limits = Limits::default();
+    let source = MemorySource::new(bytes);
+    let movie = block_on(Mp4Demuxer::open(&source, Mp4DemuxerOptions::default()))
+        .expect("the gop-cadence fixture is a readable MP4");
+    let track = movie
+        .tracks
+        .iter()
+        .find(|track| track.kind == TrackKind::Video)
+        .expect("the gop-cadence fixture has a video track");
+    let dimensions = track
+        .dimensions
+        .expect("the gop-cadence fixture's video track is dimensioned");
+    let samples = block_on(track.to_encoded_video_samples(&source, &limits))
+        .expect("the gop-cadence fixture's video samples are readable");
+    let random_access_points = samples.iter().filter(|sample| sample.random_access).count();
+    GopCadenceTrack {
+        label,
+        configuration: VideoDecoderConfig {
+            codec: Codec::Hevc,
+            profile: CodecProfile::HevcMain,
+            coded_dimensions: dimensions,
+            output_format: PixelFormat::Rgba8,
+            color_range: ColorRange::Limited,
+            hardware: zvidlib::HardwarePreference::Avoid,
+            configuration: track.decoder_config.clone(),
+        },
+        samples,
+        width: u64::from(dimensions.width),
+        height: u64::from(dimensions.height),
+        random_access_points,
+    }
+}
