@@ -2371,26 +2371,39 @@ mod tests {
     /// both exercised on every backend.
     const ORIGINS: [(i32, i32); 5] = [(9, 7), (-5, 3), (2, -6), (70, 40), (-3, -3)];
 
-    /// The width threshold in `narrows` is one number for every backend,
-    /// and #440 is why it is not one number per backend.
+    /// The width threshold in `narrows` is one number per *phase* and
+    /// the same number on every *backend*: #440 is why it is not
+    /// per-backend, and #452 is why it is per-phase.
     ///
-    /// The 8x8 vertical-only cell reads 0.95-0.97x on `avx2` on the
-    /// i9-10850K, which is what asked the question, and 1.01x on an EPYC
-    /// 7763, 0.99-1.00x on a Xeon 6973P-C and 1.61-1.67x on a Core
-    /// i7-8700B on that same backend, which is what answered it: the
-    /// spread at that width is between hosts, not between instruction
-    /// sets, so a per-backend minimum of 16 for `Avx2` would have been
-    /// drawn from the one host of four where AVX2 is weakest there.
-    /// `benches/README.md` carries every host's readings.
+    /// #440 asked whether the threshold should be instruction-set
+    /// dependent. The 8x8 vertical-only cell reads 0.95-0.97x on `avx2`
+    /// on the i9-10850K, which is what asked the question, and 1.01x on
+    /// an EPYC 7763, 0.99-1.00x on a Xeon 6973P-C and 1.61-1.67x on a
+    /// Core i7-8700B on that same backend, which is what answered it:
+    /// the spread at that width is between hosts, not between
+    /// instruction sets, so a per-backend minimum of 16 for `Avx2` would
+    /// have been drawn from the one host of four where AVX2 is weakest
+    /// there.
+    ///
+    /// #452 asked the other half, because that reading is the
+    /// vertical-only phase's and the bound gated all three. In the
+    /// mirrored arrangement the horizontal-only and two-dimensional
+    /// phases read 0.88x-1.04x at 8x8 on **every** host and backend
+    /// measured — four hosts, three backends, nothing above 1.04x — and
+    /// straddle parity at 16x16 by backend rather than by host. 32x32 is
+    /// the first width every reading is a win at, so those two phases
+    /// take [`NARROW_MIN_WIDTH_MIRRORED`] and the vertical-only one
+    /// keeps [`NARROW_MIN_WIDTH`]. `benches/README.md` carries every
+    /// host's readings for both decisions.
     ///
     /// This asserts the shape of that decision rather than its numbers:
-    /// every vector backend admits exactly the same widths, the
-    /// threshold is eight, and the other three conditions still gate it
-    /// independently of the width. A later per-backend threshold has to
-    /// delete this test, which is the point — the evidence for one is in
-    /// the README and says no.
+    /// each phase admits exactly the same widths on every vector
+    /// backend, the two thresholds are the two constants, and the other
+    /// conditions still gate it independently of the width. A later
+    /// per-backend threshold has to delete this test, which is the point
+    /// — the evidence for one is in the README and says no.
     #[test]
-    fn the_width_threshold_is_one_number_on_every_backend() {
+    fn the_width_threshold_is_one_number_per_phase_on_every_backend() {
         let (pw, ph) = (96usize, 72usize);
         let plane_samples = pseudo_random(8, pw * ph, 255);
         let mirror: Vec<i16> = plane_samples.iter().map(|&s| s as i16).collect();
@@ -2413,27 +2426,44 @@ mod tests {
             "an override is in force, so this would pin it rather than the shipped decision"
         );
 
-        // (horizontal, vertical), and the plane representation that
-        // makes each one narrow at all.
+        // (horizontal, vertical), the plane representation that makes
+        // each one narrow at all, and the width bound that phase is
+        // measured to deserve.
         let narrowing_phases = [
-            ((false, true), &wide),
-            ((false, true), &mirrored),
-            ((true, false), &mirrored),
-            ((true, true), &mirrored),
+            ((false, true), &wide, NARROW_MIN_WIDTH),
+            ((false, true), &mirrored, NARROW_MIN_WIDTH),
+            ((true, false), &mirrored, NARROW_MIN_WIDTH_MIRRORED),
+            ((true, true), &mirrored, NARROW_MIN_WIDTH_MIRRORED),
         ];
         for isa in vector_isas {
-            for ((horizontal, vertical), plane) in narrowing_phases {
+            for ((horizontal, vertical), plane, min_width) in narrowing_phases {
                 for w in [2usize, 4, 6, 7] {
                     assert!(
                         !narrows(isa, plane, 8, w, horizontal, vertical),
                         "{isa:?} narrows a {w}-wide row, which never reaches the 16-bit vector loop"
                     );
                 }
+                // Below the phase's own bound and at or above it. The
+                // widths are the sweep's, so every assertion here names a
+                // cell `benches/README.md` carries a reading for.
+                for w in [8usize, 12, 16, 24] {
+                    if w >= min_width {
+                        continue;
+                    }
+                    assert!(
+                        !narrows(isa, plane, 8, w, horizontal, vertical),
+                        "{isa:?} narrows a {w}-wide block at ({horizontal}, {vertical}), below \
+                         that phase's measured minimum of {min_width} (#452)"
+                    );
+                }
                 for w in [8usize, 12, 16, 24, 32, 64] {
+                    if w < min_width {
+                        continue;
+                    }
                     assert!(
                         narrows(isa, plane, 8, w, horizontal, vertical),
                         "{isa:?} declines a {w}-wide block at ({horizontal}, {vertical}); the \
-                         threshold is eight on every backend (#440)"
+                         threshold is {min_width} on every backend (#440, #452)"
                     );
                     // The width condition is necessary, not sufficient:
                     // the others still decide, and #440 moved none of them.
@@ -2604,7 +2634,9 @@ mod tests {
     /// [`narrows`] routes on the plane representation, not only on the
     /// phase: the horizontal-only and two-dimensional phases take the
     /// 16-bit path exactly when the plane can hand them a borrowed
-    /// narrow window, and the conditions #404 established still hold.
+    /// narrow window *and* the block is at least
+    /// [`NARROW_MIN_WIDTH_MIRRORED`] wide, and the conditions #404
+    /// established still hold.
     #[test]
     fn the_narrow_path_follows_the_plane_representation() {
         // What is asserted here is the *shipped* decision, so #426's
@@ -2631,21 +2663,28 @@ mod tests {
             return;
         };
 
-        // Vertical-only gathers either way, so it narrows on both.
+        // Vertical-only gathers either way, so it narrows on both, from
+        // `NARROW_MIN_WIDTH` up.
         assert!(narrows(isa, &wide, 8, 16, false, true));
         assert!(narrows(isa, &mirrored, 8, 16, false, true));
         // Horizontal-only and two-dimensional only when the window is
-        // borrowed narrow.
-        assert!(!narrows(isa, &wide, 8, 16, true, false));
-        assert!(narrows(isa, &mirrored, 8, 16, true, false));
-        assert!(!narrows(isa, &wide, 8, 16, true, true));
-        assert!(narrows(isa, &mirrored, 8, 16, true, true));
+        // borrowed narrow — and only from `NARROW_MIN_WIDTH_MIRRORED`,
+        // which #452 measured higher than the vertical-only phase's.
+        let mirrored_min = NARROW_MIN_WIDTH_MIRRORED;
+        assert!(!narrows(isa, &wide, 8, mirrored_min, true, false));
+        assert!(narrows(isa, &mirrored, 8, mirrored_min, true, false));
+        assert!(!narrows(isa, &wide, 8, mirrored_min, true, true));
+        assert!(narrows(isa, &mirrored, 8, mirrored_min, true, true));
+        // A borrowed narrow window is not enough on its own below that
+        // width, where the mirrored cells read 0.88x-1.14x (#452).
+        assert!(!narrows(isa, &mirrored, 8, 16, true, false));
+        assert!(!narrows(isa, &mirrored, 8, 16, true, true));
         // Full-pel has no tap accumulation to narrow.
-        assert!(!narrows(isa, &mirrored, 8, 16, false, false));
+        assert!(!narrows(isa, &mirrored, 8, mirrored_min, false, false));
         // The three conditions #404 established, unchanged: eight-bit
         // content, a vector backend, and a row of at least eight.
-        assert!(!narrows(isa, &mirrored, 10, 16, true, false));
-        assert!(!narrows(Isa::Scalar, &mirrored, 8, 16, true, false));
+        assert!(!narrows(isa, &mirrored, 10, mirrored_min, true, false));
+        assert!(!narrows(Isa::Scalar, &mirrored, 8, mirrored_min, true, false));
         assert!(!narrows(isa, &mirrored, 8, 4, true, false));
     }
 
