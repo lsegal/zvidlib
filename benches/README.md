@@ -523,6 +523,17 @@ conversion is not decoding: it is the YUV420-to-RGBA pass every whole-frame
 measurement takes on the way out of the decoder. Both denominators are reported
 because the two answer different questions and are easy to confuse.
 
+The `inter_pred_filter` rows carry a bound as well as a figure. Issue #404 gave
+§8.5.3.3 interpolation a 16-bit accumulation path and routed the vertical-only
+phase to it, and issue #426 asked what that is worth to these rows. It is worth
+less than they can resolve: `hevc_decode_profile --pair` A/Bs the two arms in one
+process against a null control whose answer is known to be 1.0000x, and on an
+Intel Core i9-10850K the control itself lands between 0.9623x and 1.0252x, with
+the arm under test always inside that miss. The effect on these rows is therefore
+**under about 4%, and not distinguishable from zero at this host's noise floor** —
+see `#426: the same question, on an instrument with a null control in it` below
+for the readings and for what the control caught.
+
 The two `sao` tables above are the arms measured *after* issue #310; the rest of
 each table is the issue #280 measurement set, so the SAO rows are the only ones
 in them taken on a different day. What they replaced was a single `sao` row at
@@ -823,6 +834,59 @@ separate benchmark processes on this host disagree with each other by more than
 the effect. The committed `hevc_inter_pred` and `inter_pred_filter` rows are
 therefore left as they stand rather than redrawn from measurements that cannot
 resolve the change.
+
+##### #426: the same question, on an instrument with a null control in it
+
+Issue #426 asked for this pairing again on a host quiet enough that the control
+settles at 1.00x. What it produced instead is a better instrument and a
+*bounded* null result, which is the outcome that issue's own third bullet asks
+for when a quiet host cannot be reached.
+
+**The confound was the instrument, not only the host.** The pairing above ran
+two *builds* in two *processes*, and nothing in it held anything else still.
+`hevc_decode_profile --pair` now runs both arms inside one binary, over the same
+decoder and the same frames, through a process-level override of the `narrows`
+decision (`zvidlib::hevc_narrow_interp`) — and a third arm that simply runs the
+wide arm's code again. That third arm is a null control with a known answer of
+1.0000x, measured in the same rounds by the same instrument, so every reading is
+reported next to what the instrument could actually resolve when it was taken.
+The three arms are asserted to decode bit-identically, an FNV digest over every
+plane of every frame, before anything is timed: the whole-decode form of the
+guard `measure_narrow_vs_wide_block` already applies per block.
+
+**The control immediately caught two things the effect would otherwise have been
+credited with.** With the arms run in a *fixed* order every round, it read
+**0.9469x** — the third decode of a round is systematically slower than the first
+on this host, and under a fixed order that penalty lands on the same arm every
+round and survives the elementwise minimum intact. The arm order now rotates, so
+each arm takes each position an equal number of times. Then the *statistic*
+turned out to carry as much noise as the host did: read as a ratio of the two
+arms' minima — the form the pairing above used — consecutive invocations of the
+same binary read **0.9623x and then 1.0127x**, with the control moving 0.9995x to
+0.9843x underneath them, because two minima chosen out of different rounds do not
+share the drift between those rounds. `--pair` therefore reports a *within-round
+paired* ratio, median over rounds with an interquartile band, which divides out
+the drift the two arms of a round do share.
+
+**On an Intel Core i9-10850K (10 cores, Windows, `Avx2`), 48 frames, 12 to 21
+interleaved rounds, the answer is bounded rather than resolved.** Across repeated
+invocations the null control's median reads **0.9623x to 1.0252x** against its
+known 1.0000x, with an interquartile scatter of ±5% to ±10%; the `narrows`-decides
+arm reads **0.9627x to 1.0117x** over the same runs, inside the control's own miss
+every time. The whole-decode effect of the narrow path is therefore **smaller than
+about 4% on this host and not distinguishable from zero**, and `inter_pred_filter`
+ms/frame is bounded the same way. That is a bound where #404 had none. It is not
+the ±1% control the issue hoped for, and this host — a ten-core desktop with other
+work on it — is not the quiet host that would produce one.
+
+So the committed `hevc_inter_pred` and `inter_pred_filter` rows still stand rather
+than moving, but they no longer stand on an unbounded null: the floor that bounds
+them is **±4% at the median of a within-round paired ratio**, on the host named
+above. A future draw on a genuinely quiet host tightens it by running `--pair` and
+reading the control it prints alongside the effect. Nothing in that output is
+trustworthy that its own control does not underwrite — which is the whole lesson
+of #404's ±7% `scalar` arm, now built into the instrument instead of discovered
+after the fact.
 
 No decoded sample moves on any backend or at any bit depth.
 `the_eight_bit_block_path_matches_the_per_sample_equations` runs every block
