@@ -73,6 +73,18 @@ pub use hevc::decode_bench as hevc_decoder_bench;
 #[doc(hidden)]
 pub use hevc::decode_profile as hevc_decode_profile;
 
+/// The 16-bit interpolation accumulation, forced on or off for a measurement.
+///
+/// Internal and unstable. §8.5.3.3 interpolation decides per block whether the
+/// tap accumulation is worth taking in `i16`; this forces that decision, so one
+/// process can decode the same frames both ways and a whole-decode A/B does not
+/// have to pair two builds against each other. See
+/// `examples/hevc_decode_profile.rs` and the noise floor recorded in
+/// `benches/README.md`.
+#[cfg(not(target_arch = "wasm32"))]
+#[doc(hidden)]
+pub use hevc::narrow_interp as hevc_narrow_interp;
+
 /// Decode-versus-readback attribution for the hardware HEVC backends.
 ///
 /// Internal and unstable. A hardware backend maps its own surface and converts

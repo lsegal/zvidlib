@@ -557,7 +557,84 @@ fn interp_block<const N: usize>(
 ///   count the `i32` kernel already issues.
 #[inline]
 fn narrows(isa: Isa, bit_depth: u8, w: usize, vertical_only: bool) -> bool {
-    bit_depth == 8 && isa != Isa::Scalar && w >= 8 && vertical_only
+    // The 16-bit accumulator is only in range at eight bits, and a row
+    // shorter than eight samples never reaches the vector loop at all —
+    // `interp_block_with_width` asserts both. An override chooses between
+    // the two arms inside that range and cannot take the narrow one
+    // outside it.
+    let in_range = bit_depth == 8 && w >= 8;
+    match narrow_interp::override_value() {
+        Some(narrow) => narrow && in_range,
+        None => in_range && isa != Isa::Scalar && vertical_only,
+    }
+}
+
+/// A process-level override for the `narrows` decision, so one process
+/// can decode the same frames with the 16-bit accumulation on and off.
+///
+/// #404 landed the narrow path and left one of its own acceptance criteria
+/// unmet: what the path is worth to a *whole decode*, as opposed to to
+/// `interp_block`, could not be resolved. The pairing it tried was two
+/// builds in two processes — this crate against `main`, through
+/// `examples/hevc_decode_profile.rs` — and issue #426 records why the
+/// answer was unusable. The `scalar` arm of that pairing is a control with
+/// a known answer, because `narrows` is false for `Isa::Scalar` and the
+/// two binaries therefore execute identical code on it, so it must read
+/// 1.00x; it read 1.06x and 1.07x, while the arm under test read 1.10x and
+/// 0.83x. A control that misses its own known answer by ±7% cannot
+/// underwrite a low-single-digit measurement.
+///
+/// The fault was the instrument rather than the host. `measure_narrow_vs_wide_block`
+/// and `measure_2d_ring_vs_flat` both run their arms **in one process,
+/// interleaved, best of many rounds**, and both say in as many words that
+/// separate benchmark processes on this host disagree with each other by
+/// more than the effect being measured. This override extends that
+/// arrangement from a block to a decode: with it, both arms are the same
+/// binary, the same decoder and the same frames, and the only difference
+/// between them is the branch under test.
+///
+/// Internal and unstable. The decoder's own behaviour is `None`, and
+/// nothing outside a measurement should set this.
+pub mod narrow_interp {
+    use core::sync::atomic::{AtomicU8, Ordering};
+
+    /// `0` follows `narrows`; `1` forces the wide `i32` arm; `2` forces the
+    /// narrow one wherever it is in range.
+    static OVERRIDE: AtomicU8 = AtomicU8::new(0);
+
+    /// Forces the 16-bit accumulation off (`Some(false)`), or on wherever
+    /// it is in range (`Some(true)`), or restores the shipped decision
+    /// (`None`).
+    ///
+    /// `Some(false)` is the pre-#404 baseline reached without a second
+    /// build: the wide `i32` arm everywhere, which is exactly what `main`
+    /// executed before the narrow path landed. `Some(true)` narrows every
+    /// phase case that is in *range* rather than only the one that is
+    /// *faster*, which is the other half of what #404 measured — the sweep
+    /// read the horizontal-only and two-dimensional phases at 0.82x-1.11x
+    /// in isolation, and this is how a decode is asked the same question.
+    ///
+    /// Safe to call from any thread at any time: the two arms agree
+    /// sample-for-sample, so a switch that lands between two blocks of the
+    /// same frame still produces the same output.
+    pub fn set_override(narrow: Option<bool>) {
+        let code = match narrow {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        };
+        OVERRIDE.store(code, Ordering::Relaxed);
+    }
+
+    /// The override in force, or `None` when `narrows` is deciding.
+    #[must_use]
+    pub fn override_value() -> Option<bool> {
+        match OVERRIDE.load(Ordering::Relaxed) {
+            1 => Some(false),
+            2 => Some(true),
+            _ => None,
+        }
+    }
 }
 
 /// [`interp_block`] with the 16-bit accumulation forced on or off.

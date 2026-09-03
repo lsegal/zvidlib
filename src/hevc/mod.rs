@@ -7,6 +7,9 @@ pub(crate) mod color_convert;
 pub mod decode_bench;
 // internal — exposed for the stage-attribution example; not part of the stable API
 #[doc(hidden)]
+pub use engine::inter_pred::narrow_interp;
+// internal — exposed for the stage-attribution example; not part of the stable API
+#[doc(hidden)]
 pub use engine::profile as decode_profile;
 mod encoder;
 pub(crate) mod engine;
