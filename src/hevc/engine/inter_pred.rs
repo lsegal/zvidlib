@@ -674,18 +674,20 @@ fn interp_block<const N: usize>(
 ///   #435 left it resting on a single NEON reading of 1.37x while its
 ///   own x86 host — an i9-10850K — read the same cell at 1.00-1.02x
 ///   (`sse4.1`) and 0.95-0.97x (`avx2`), which looked like a case for
-///   making the threshold per-backend. #440 re-took it on two more
-///   x86_64 hosts and the AVX2 loss did not reproduce: the same
-///   `avx2` cell reads **1.01x on an EPYC 7763** and **1.44-1.57x on an
-///   i7-8700B**, the largest win in any of the block tables. What
-///   varies at this width is the host, not the instruction set — 8x8
-///   makes 64 times as many calls as 64x64 for the same sample work, so
-///   the per-call `RefPlane::gather` and its allocation dominate, and
-///   what the narrow arm saves there is half the buffer's bytes rather
-///   than any vector lanes. A per-backend minimum would have been drawn
-///   from the worst of the three hosts and cost the best of them a 1.5x,
-///   so the bound stays a single `w >= 8`, now with a figure from
-///   `neon`, `sse4.1` and `avx2` across four hosts behind it.
+///   making the threshold per-backend. #440 re-took it on three more
+///   x86_64 hosts and the AVX2 loss did not reproduce on any of them:
+///   the same `avx2` cell reads **1.01x on an EPYC 7763**, **0.99-1.00x
+///   on a Xeon 6973P-C** and **1.61-1.67x on an i7-8700B**, the last
+///   being the largest reading in any of the block tables. What varies
+///   at this width is the host, not the instruction set — 8x8 makes 64
+///   times as many calls as 64x64 for the same sample work, so the
+///   per-call `RefPlane::gather` and its allocation dominate, and what
+///   the narrow arm saves there is half that buffer's bytes rather than
+///   any vector lanes. A per-backend minimum of 16 for `Avx2` would
+///   have been drawn from the one host of four where AVX2 is weakest at
+///   this width and would have cost the others what they read there, so
+///   the bound stays a single `w >= 8`, now with a figure from `neon`,
+///   `sse4.1` and `avx2` across four hosts behind it.
 /// * **The source is reached narrow without a materializing pass**, and
 ///   this is the one that is about the caller rather than the kernel.
 ///   Issue #404 measured the same kernel at 1.89x in isolation keeping
