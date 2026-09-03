@@ -8,6 +8,14 @@
 export const SCRUB_INTERVAL_MS = 150;
 export const SCRUB_MAXIMUM_STEP = 512;
 
+// Whether a pointer move at `target` should draw the seek preview, given the frame already on
+// the canvas. A preview stands in for a picture that is not there yet: it is the right thing to
+// draw while the walk is still somewhere else, and the wrong thing to draw over the exact frame
+// the walk has already landed on, which it would only blur (issue #432).
+export function shouldDrawPreview(drawnFrame, target) {
+  return drawnFrame !== target;
+}
+
 // The newest random-access frame at or before `index`, or `index` itself when the track
 // indexes none before it - the same rule `native_gl`'s `KeyframeIndex` follows.
 export function randomAccessPointAtOrBefore(randomAccessPoints, index) {

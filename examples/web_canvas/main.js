@@ -1,9 +1,14 @@
 // See examples/README.md for setup: build the wasm package into ./pkg before serving this
 // directory over HTTP(S). BigBuckBunny.mp4 is already symlinked in from examples/media/.
-import init, { MediaInput, errorCode } from "./pkg/zvidlib.js";
+import init, {
+  MediaInput,
+  PreviewOptions,
+  errorCode,
+  seekLatencyBudgetMs,
+} from "./pkg/zvidlib.js";
 // The walk's pure decisions live apart from the browser wiring so `scrub.test.js` can assert
 // them, the way `examples/native_gl/scrub.rs` asserts its own copy of the same rules.
-import { scrubWalkStart } from "./scrub.js";
+import { scrubWalkStart, shouldDrawPreview } from "./scrub.js";
 
 const canvas = document.querySelector("#video");
 const playButton = document.querySelector("#play");
@@ -14,6 +19,7 @@ const nextFrameButton = document.querySelector("#next-frame");
 const timeline = document.querySelector("#timeline");
 const status = document.querySelector("#status");
 const fps = document.querySelector("#fps");
+const seekLatency = document.querySelector("#seek-latency");
 
 const VERTEX_SHADER = `
   attribute vec2 position;
@@ -156,6 +162,77 @@ async function main() {
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
   }
 
+  // The seek preview tier (issue #432). `ARCHITECTURE.md` section 3.2 requires a seek to any
+  // position of any track to answer inside `seekLatencyBudgetMs()`, and the bundled sample codes
+  // its 768 frames as one group of pictures, so walking to an arbitrary position is seconds of
+  // decode - which is what this example used to do on every drag. The index keeps one shrunk
+  // picture every stride frames, and a drag draws the nearest of them at once while the walk
+  // goes after the exact frame underneath it.
+  const budgetMs = seekLatencyBudgetMs();
+  let previews = null;
+  let worstPreviewMs = 0;
+  if (useRealDecode) {
+    try {
+      // The pass spaces previews by the source's frame rate, which the first frame's duration
+      // gives; a track whose durations are unreadable never got this far.
+      const framesPerSecond = 1000 / (frameStarts[1] - frameStarts[0] || 1000 / 24);
+      previews = await video.previews(new PreviewOptions(framesPerSecond));
+      lines.push(
+        `Seek previews: ${previews.total} positions, ${previews.stride} frames apart, filling in the background.`,
+      );
+      pumpPreviews();
+    } catch (error) {
+      lines.push(`video.previews() rejected with ${errorCode(error)}: a drag walks the group of pictures instead.`);
+    }
+    status.textContent = lines.join("\n");
+  }
+
+  // The pass has no thread to run on here - that is exactly why the native `PreviewIndex` is
+  // native-only - so the page lends it the gaps between its own work: one preview per idle
+  // callback, yielding to the event loop in between, and stopping as soon as the pass has
+  // visited every position. `requestIdleCallback` is missing from some browsers, where a
+  // zero-delay timeout stands in for it.
+  function scheduleIdle(callback) {
+    if (typeof requestIdleCallback === "function") requestIdleCallback(callback);
+    else setTimeout(callback, 0);
+  }
+
+  function pumpPreviews() {
+    if (!previews || previews.complete || stopped) return;
+    scheduleIdle(async () => {
+      try {
+        await previews.step();
+      } catch (error) {
+        // A preview that will not decode leaves its position empty and the pass carries on, so
+        // the only thing that ends the loop here is the index itself failing.
+        previews = null;
+        lines.push(`Preview pass stopped with ${errorCode(error) ?? "ERROR"}.`);
+        status.textContent = lines.join("\n");
+        return;
+      }
+      pumpPreviews();
+    });
+  }
+
+  // The seek: what is at this position of the timeline, answered from a picture the pass already
+  // decoded. A lookup and an upload, never a decode, whatever the drag jumped over - which is
+  // what makes it constant time and what keeps it inside the budget. The walk behind it replaces
+  // this with the exact frame shortly.
+  function drawPreview(target) {
+    if (!previews || !shouldDrawPreview(frameIndex, target)) return;
+    const started = performance.now();
+    const preview = previews.nearest(BigInt(target));
+    if (!preview) return;
+    const picture = preview.picture;
+    uploadFrame(picture.pixels, picture.width, picture.height);
+    const elapsed = performance.now() - started;
+    worstPreviewMs = Math.max(worstPreviewMs, elapsed);
+    if (seekLatency) {
+      seekLatency.textContent =
+        `seek ${elapsed.toFixed(2)} ms (worst ${worstPreviewMs.toFixed(2)} of ${budgetMs} ms)`;
+    }
+  }
+
   async function frameDuration(index) {
     try {
       return await video.frameDuration(BigInt(index));
@@ -278,6 +355,10 @@ async function main() {
     // generated from the index, so the ordinary seek draws them at once.
     if (!useRealDecode) return requestSeek(index, false);
     scrubTarget = Math.min(Math.max(index, 0), lastFrameIndex);
+    // Answer the seek before starting the walk, on every pointer sample rather than only on the
+    // first: this is the picture the drag is actually following, and it is drawn now instead of
+    // after however many frames the exact one is away.
+    drawPreview(scrubTarget);
     if (scrubbing) {
       if (scrubStep !== null && scrubStep > scrubTarget) scrubAbort?.abort();
       return;
