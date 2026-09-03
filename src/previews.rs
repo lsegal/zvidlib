@@ -26,20 +26,41 @@
 //! Until it reaches a point, a lookup there falls back to the nearest earlier
 //! preview, so the picture is progressively right rather than absent.
 //!
-//! The pass runs on a thread of its own, so this module is native-only. The
-//! browser backend has no equivalent yet; see the crate's issue tracker.
+//! # What is portable, and what the driver is
+//!
+//! The pass is a loop, and a loop needs somewhere to run. On native that is a
+//! thread of its own, which [`PreviewIndex`] owns and which is why it is gated
+//! to non-`wasm32` targets. A browser has no thread to give it, so issue #432
+//! split this module in two. Everything the loop *operates on* is portable and
+//! lives here: [`PreviewOptions`] and the stride it derives, the
+//! [`PreviewStore`] of pictures with its nearest-with-fallback lookup, and the
+//! [`PreviewPass`] cursor that says which frame the next preview is of and what
+//! becomes of the picture once something has decoded it. Only the driver is
+//! native-only - [`PreviewIndex`]'s thread here, against an idle-callback slice
+//! in [`crate::web_previews`] for the browser. Both fill the same store, and a
+//! [`PreviewStore`] is what [`ExactFrameReader::seek`] answers from on either
+//! target.
+//!
+//! [`ExactFrameReader::seek`]: crate::codec::ExactFrameReader::seek
 
 use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
-use std::time::Duration;
 
-use crate::api::{Error, ErrorKind, Limits, Result};
-use crate::codec::{
-    CancellationToken, EncodedVideoSample, ExactFrameReader, SeekPreviewSource, VideoDecoderConfig,
-    VideoDecoderFactory,
-};
+use crate::api::{Limits, Result};
+use crate::codec::SeekPreviewSource;
 use crate::media::{PixelFormat, Plane, VideoDimensions, VideoFrame};
 use crate::timeline::FrameIndex;
+
+#[cfg(not(target_arch = "wasm32"))]
+use std::thread::{self, JoinHandle};
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Duration;
+
+use crate::api::{Error, ErrorKind};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::codec::{
+    CancellationToken, EncodedVideoSample, ExactFrameReader, VideoDecoderConfig,
+    VideoDecoderFactory,
+};
 
 /// How the index trades memory and pass length against how fine the scrub is.
 ///
@@ -154,16 +175,153 @@ impl Store {
     }
 }
 
+/// The pictures a preview pass has decoded so far, shared between whatever is
+/// filling them in and whatever is answering seeks from them.
+///
+/// This is the half of the tier a seek touches, and it is portable because a
+/// seek is: it locks, searches an array and clones a picture, and it neither
+/// decodes nor waits on a decoder. Cloning a handle shares the pictures rather
+/// than copying them, which is what lets a reader start answering seeks while
+/// the pass is still walking the track.
+#[derive(Clone)]
+pub struct PreviewStore {
+    store: Arc<Mutex<Store>>,
+}
+
+impl PreviewStore {
+    /// The kept picture closest to `frame`, or `None` while the pass has decoded
+    /// nothing.
+    ///
+    /// This is a lock, a search and a clone of an already-decoded picture.
+    /// Nothing here decodes, and nothing here waits on the decoder, so it is safe
+    /// to call from an event loop.
+    pub fn nearest(&self, frame: u64) -> Option<VideoFrame> {
+        self.store.lock().ok()?.nearest(frame)
+    }
+
+    /// How many of the pass's positions are filled, out of how many there are.
+    pub fn coverage(&self) -> (usize, usize) {
+        match self.store.lock() {
+            Ok(store) => (
+                store.slots.iter().filter(|slot| slot.is_some()).count(),
+                store.slots.len(),
+            ),
+            Err(_) => (0, 0),
+        }
+    }
+
+    /// How many frames apart the previews in this store are.
+    pub fn stride(&self) -> u64 {
+        self.store.lock().map(|store| store.stride).unwrap_or(1)
+    }
+}
+
+/// A [`PreviewStore`] is what [`ExactFrameReader::seek`] answers a position
+/// from, and the reader reaches it through this trait rather than by name: the
+/// reader is portable, and until issue #432 the only implementation was not.
+/// The store is portable now, and both drivers - [`PreviewIndex`]'s thread and
+/// the browser's idle callback - fill one of these.
+///
+/// [`ExactFrameReader::seek`]: crate::codec::ExactFrameReader::seek
+impl SeekPreviewSource for PreviewStore {
+    fn nearest_at(&self, frame: FrameIndex) -> Option<(FrameIndex, VideoFrame)> {
+        self.store.lock().ok()?.nearest_at(frame.0)
+    }
+}
+
+/// The portable half of a preview pass: which frame the next preview is of, and
+/// what becomes of the picture once something has decoded it.
+///
+/// What is *not* here is the loop. The pass walks forwards one preview at a
+/// time and something has to advance it: a thread on native ([`PreviewIndex`]),
+/// an idle callback in a browser ([`crate::web_previews`]). Both drive this, so
+/// the stride derivation, the slot bookkeeping and the shrink are written once
+/// and a browser preview is the same picture a native one is.
+pub struct PreviewPass {
+    store: PreviewStore,
+    options: PreviewOptions,
+    stride: u64,
+    slots: usize,
+    next_slot: usize,
+}
+
+impl PreviewPass {
+    /// A pass over `frame_count` frames of a `dimensions` source, with the
+    /// stride [`PreviewOptions::stride`] derives from the two.
+    pub fn new(options: PreviewOptions, dimensions: &VideoDimensions, frame_count: u64) -> Self {
+        let frame_count = frame_count.max(1);
+        let stride = options.stride(dimensions, frame_count);
+        let slots = frame_count.div_ceil(stride) as usize;
+        Self {
+            store: PreviewStore {
+                store: Arc::new(Mutex::new(Store {
+                    stride,
+                    slots: vec![None; slots],
+                })),
+            },
+            options,
+            stride,
+            slots,
+            next_slot: 0,
+        }
+    }
+
+    /// A handle on the pictures, for whatever answers seeks from them.
+    pub fn store(&self) -> PreviewStore {
+        self.store.clone()
+    }
+
+    /// How many frames apart this pass's previews are.
+    pub fn stride(&self) -> u64 {
+        self.stride
+    }
+
+    /// The frame the next preview is of, or `None` once the pass has visited
+    /// every position.
+    pub fn next_frame(&self) -> Option<FrameIndex> {
+        (self.next_slot < self.slots).then(|| FrameIndex(self.next_slot as u64 * self.stride))
+    }
+
+    /// Shrinks `picture` into the position [`next_frame`](Self::next_frame)
+    /// named, and advances past it.
+    ///
+    /// A picture that cannot be shrunk leaves its slot empty, exactly as a frame
+    /// that would not decode does: the index is an optimisation, and a gap in it
+    /// costs a fallback to the neighbour rather than an error the caller has to
+    /// show.
+    pub fn accept(&mut self, picture: &VideoFrame, limits: &Limits) {
+        let slot = self.next_slot;
+        self.skip();
+        if slot >= self.slots {
+            return;
+        }
+        let Ok(preview) = shrink(picture, self.options.scale, limits) else {
+            return;
+        };
+        if let Ok(mut store) = self.store.store.lock() {
+            store.slots[slot] = Some(preview);
+        }
+    }
+
+    /// Advances past a position whose frame would not decode, leaving its slot
+    /// empty.
+    pub fn skip(&mut self) {
+        self.next_slot = self.next_slot.saturating_add(1);
+    }
+}
+
 /// A background pass over a track that keeps a shrunk picture every `stride`
 /// frames.
 ///
 /// Dropping the index cancels the pass and joins its thread.
+#[cfg(not(target_arch = "wasm32"))]
 pub struct PreviewIndex {
-    store: Arc<Mutex<Store>>,
+    store: PreviewStore,
     cancellation: CancellationToken,
     worker: Option<JoinHandle<()>>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl PreviewIndex {
     /// Starts the pass over `samples`, on a decoder of its own.
     ///
@@ -179,12 +337,8 @@ impl PreviewIndex {
         options: PreviewOptions,
     ) -> Result<Self> {
         let frame_count = samples.len().max(1) as u64;
-        let stride = options.stride(&configuration.coded_dimensions, frame_count);
-        let slots = frame_count.div_ceil(stride) as usize;
-        let store = Arc::new(Mutex::new(Store {
-            stride,
-            slots: vec![None; slots],
-        }));
+        let pass = PreviewPass::new(options, &configuration.coded_dimensions, frame_count);
+        let store = pass.store();
         // The pass never asks for a frame twice, so it asks for every preview as
         // a step rather than a destination (see `build`) and keeps the caller's
         // cache limit. #374 had to shrink `max_cached_frames` to 1 here instead,
@@ -193,19 +347,11 @@ impl PreviewIndex {
         // handed.
         let reader = ExactFrameReader::new(factory, configuration, samples, limits)?;
         let cancellation = CancellationToken::new();
-        let worker_store = Arc::clone(&store);
         let worker_cancellation = cancellation.clone();
         let worker = thread::Builder::new()
             .name("zvidlib-preview-index".to_string())
             .spawn(move || {
-                build(
-                    reader,
-                    &worker_store,
-                    &worker_cancellation,
-                    stride,
-                    slots,
-                    options,
-                );
+                build(reader, pass, &worker_cancellation);
             })
             .map_err(|error| {
                 Error::new(
@@ -227,13 +373,7 @@ impl PreviewIndex {
     /// polls this, or calls [`wait_for_coverage`](Self::wait_for_coverage); one
     /// that is happy to draw a progressively better picture ignores it.
     pub fn coverage(&self) -> (usize, usize) {
-        match self.store.lock() {
-            Ok(store) => (
-                store.slots.iter().filter(|slot| slot.is_some()).count(),
-                store.slots.len(),
-            ),
-            Err(_) => (0, 0),
-        }
+        self.store.coverage()
     }
 
     /// Blocks until the background pass has visited every position.
@@ -260,22 +400,24 @@ impl PreviewIndex {
     /// Nothing here decodes, and nothing here waits on the decoder, so it is safe
     /// to call from an event loop.
     pub fn nearest(&self, frame: u64) -> Option<VideoFrame> {
-        self.store.lock().ok()?.nearest(frame)
+        self.store.nearest(frame)
+    }
+
+    /// A handle on the pictures, for a reader that answers seeks from them
+    /// without owning the index.
+    pub fn store(&self) -> PreviewStore {
+        self.store.clone()
     }
 }
 
-/// The index is what [`ExactFrameReader::seek`] answers a position from, and the
-/// reader reaches it through this trait rather than by name: the reader is
-/// portable and this module is not, so a browser-side source implements the same
-/// method against whatever it can decode ahead.
-///
-/// [`ExactFrameReader::seek`]: crate::codec::ExactFrameReader::seek
+#[cfg(not(target_arch = "wasm32"))]
 impl SeekPreviewSource for PreviewIndex {
     fn nearest_at(&self, frame: FrameIndex) -> Option<(FrameIndex, VideoFrame)> {
-        self.store.lock().ok()?.nearest_at(frame.0)
+        self.store.nearest_at(frame)
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Drop for PreviewIndex {
     fn drop(&mut self) {
         self.cancellation.cancel();
@@ -287,20 +429,13 @@ impl Drop for PreviewIndex {
 
 /// Walks the track once, forwards, keeping a shrunk copy of every `stride`-th
 /// frame.
-fn build(
-    mut reader: ExactFrameReader,
-    store: &Arc<Mutex<Store>>,
-    cancellation: &CancellationToken,
-    stride: u64,
-    slots: usize,
-    options: PreviewOptions,
-) {
+#[cfg(not(target_arch = "wasm32"))]
+fn build(mut reader: ExactFrameReader, mut pass: PreviewPass, cancellation: &CancellationToken) {
     let limits = Limits::default();
-    for slot in 0..slots {
+    while let Some(frame) = pass.next_frame() {
         if cancellation.is_cancelled() {
             return;
         }
-        let frame = slot as u64 * stride;
         // A preview that cannot be decoded leaves its slot empty and the pass
         // carries on: the index is an optimisation, and a gap in it costs a
         // fallback to the neighbour rather than an error the caller has to show.
@@ -308,15 +443,11 @@ fn build(
         // A step, not a destination: this pass walks forwards and never comes
         // back, so the frames behind each preview would be converted at full
         // resolution for nobody.
-        let Ok(picture) = reader.get_step(FrameIndex(frame), cancellation) else {
+        let Ok(picture) = reader.get_step(frame, cancellation) else {
+            pass.skip();
             continue;
         };
-        let Ok(preview) = shrink(&picture, options.scale, &limits) else {
-            continue;
-        };
-        if let Ok(mut store) = store.lock() {
-            store.slots[slot] = Some(preview);
-        }
+        pass.accept(&picture, &limits);
     }
 }
 
