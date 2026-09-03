@@ -513,6 +513,202 @@ impl Report {
     }
 }
 
+/// The statistic `examples/hevc_decode_profile.rs --pair` reports its A/B with.
+///
+/// The `--pair` instrument runs three arms interleaved — two under test and a
+/// null control that runs one of them again — and reports each arm's ratio
+/// against the same baseline as a median with an interquartile band over the
+/// rounds. The control's known answer is 1.0000x, so whatever it misses by is
+/// this host's noise floor, and no reading of the arm under test means anything
+/// the control cannot underwrite.
+///
+/// The band and the floor live here rather than in the example because they are
+/// the rule the instrument *reports* by, and issue #438 is about a way that
+/// rule could mislead: a floor drawn from very few rounds reads tighter than
+/// one drawn from many on the same host, which is the flattering direction.
+/// Here they are unit-tested; in the example they were only ever exercised by
+/// running the profile.
+pub mod paired {
+    /// Rounds that must lie beyond each end of the band before it describes a
+    /// spread rather than a pair of extremes.
+    ///
+    /// With one round beyond an end, that end *is* the run's second-most-
+    /// extreme reading: the band is the run's whole range with a single
+    /// reading shaved off each side, and it moves by a whole reading whenever
+    /// one round lands differently. Two is the fewest that puts a reading
+    /// between the band's end and the extreme, so no single round decides the
+    /// width the floor is taken from.
+    const ROUNDS_BEYOND_EACH_END: usize = 2;
+
+    /// The fewest rounds that can underwrite a noise floor.
+    ///
+    /// The least `n` for which [`rounds_beyond_band_ends`] reaches
+    /// [`ROUNDS_BEYOND_EACH_END`]; the test below derives it rather than
+    /// trusting this constant.
+    ///
+    /// Below it [`floor`] reports nothing at all, the way the arms already
+    /// refuse a ratio with no control behind it. Issue #438 is why: on one
+    /// i9-10850K a 5-round draw reported a **3.36%** floor where 21 rounds read
+    /// 4.43% and 51 rounds read 6.37%. The 5-round draw had not measured a
+    /// quieter host — an interquartile band over five readings is three of
+    /// them — but it is the number a reader would take for the tightest of the
+    /// three. A floor too few rounds can support is worse than no floor.
+    pub const MIN_FLOOR_ROUNDS: usize = 8;
+
+    /// The index [`band`] reads `fraction` of the way through `len` sorted
+    /// readings.
+    fn quantile_index(len: usize, fraction: f64) -> usize {
+        (fraction * (len - 1) as f64).round() as usize
+    }
+
+    /// How many of `rounds` readings fall outside the band's nearer end.
+    ///
+    /// The smaller of the two counts, since a floor is only as well sampled as
+    /// the tail that samples it worst.
+    #[must_use]
+    pub fn rounds_beyond_band_ends(rounds: usize) -> usize {
+        match rounds {
+            0 => 0,
+            rounds => {
+                let low = quantile_index(rounds, 0.25);
+                let high = quantile_index(rounds, 0.75);
+                low.min(rounds - 1 - high)
+            }
+        }
+    }
+
+    /// The median of `values` and its interquartile band.
+    ///
+    /// A band rather than a standard deviation because these are ratios of
+    /// timings with a hard floor and a long tail — a round that caught an
+    /// interrupt is far from symmetric — and percentiles do not assume
+    /// otherwise. The *interquartile* band specifically, rather than a wider
+    /// one, because at the round counts this runs at a 10th percentile is the
+    /// second-smallest reading and so reports the worst round rather than the
+    /// spread.
+    ///
+    /// # Panics
+    ///
+    /// If `values` is empty.
+    #[must_use]
+    pub fn band(values: &[f64]) -> (f64, f64, f64) {
+        assert!(!values.is_empty(), "a band needs at least one reading");
+        let mut sorted = values.to_vec();
+        sorted.sort_by(f64::total_cmp);
+        let at = |fraction: f64| sorted[quantile_index(sorted.len(), fraction)];
+        (at(0.5), at(0.25), at(0.75))
+    }
+
+    /// The noise floor `control`'s readings underwrite, or `None` when there
+    /// are too few of them to underwrite one.
+    ///
+    /// The floor itself is unchanged: the widest the control misses 1.0000x
+    /// anywhere in its own band, not just at its median, because an instrument
+    /// that scatters ±2% around a perfect median has not resolved a 1% effect.
+    /// What is new is that it is only reported when
+    /// [`rounds_beyond_band_ends`] reaches [`ROUNDS_BEYOND_EACH_END`], so a
+    /// short run reports no floor rather than a falsely narrow one.
+    #[must_use]
+    pub fn floor(control: &[f64]) -> Option<f64> {
+        if rounds_beyond_band_ends(control.len()) < ROUNDS_BEYOND_EACH_END {
+            return None;
+        }
+        let (median, low, high) = band(control);
+        Some(
+            (median - 1.0)
+                .abs()
+                .max((low - 1.0).abs())
+                .max((high - 1.0).abs()),
+        )
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Readings whose sorted order is `0.90, 0.91, ...`, so every order
+        /// statistic is identifiable from the value alone.
+        fn readings(count: usize) -> Vec<f64> {
+            (0..count).map(|i| 0.90 + i as f64 / 100.0).collect()
+        }
+
+        #[test]
+        fn the_minimum_round_count_is_the_least_that_samples_both_tails() {
+            let least = (1..64)
+                .find(|&rounds| rounds_beyond_band_ends(rounds) >= ROUNDS_BEYOND_EACH_END)
+                .expect("some round count samples both tails");
+            assert_eq!(least, MIN_FLOOR_ROUNDS);
+            // The band over five readings is three of them, with a single
+            // reading beyond each end: the case issue #438 measured.
+            assert_eq!(rounds_beyond_band_ends(5), 1);
+            // The default `PAIR_ROUNDS` clears it, so an ordinary `--pair` run
+            // still reports a floor.
+            assert!(rounds_beyond_band_ends(12) >= ROUNDS_BEYOND_EACH_END);
+        }
+
+        #[test]
+        fn the_band_is_the_interquartile_band_it_always_was() {
+            // Unsorted in, quartiles out: the statistic above the minimum is
+            // the one the recorded draws in `benches/README.md` were taken
+            // with, and nothing here widens it.
+            let mut values = readings(21);
+            values.reverse();
+            let (median, low, high) = band(&values);
+            assert!((median - 1.00).abs() < 1e-9, "median {median}");
+            assert!((low - 0.95).abs() < 1e-9, "low {low}");
+            assert!((high - 1.05).abs() < 1e-9, "high {high}");
+        }
+
+        #[test]
+        fn the_floor_is_the_widest_miss_of_one_anywhere_in_the_band() {
+            // A control whose median is perfect but whose band is not: the
+            // reading the floor exists to refuse to call resolved.
+            let values: Vec<f64> = (0..21).map(|i| 0.94 + i as f64 / 100.0).collect();
+            let reported = floor(&values).expect("21 rounds underwrite a floor");
+            let (median, low, high) = band(&values);
+            assert!((median - 1.0).abs() < 1e-9, "median {median}");
+            assert!((reported - (high - 1.0)).abs() < 1e-9, "floor {reported}");
+            assert!(reported > (low - 1.0).abs());
+        }
+
+        #[test]
+        fn too_few_rounds_report_no_floor_at_all() {
+            for rounds in 0..MIN_FLOOR_ROUNDS {
+                assert_eq!(
+                    floor(&readings(rounds)),
+                    None,
+                    "{rounds} rounds reported a floor"
+                );
+            }
+            assert!(floor(&readings(MIN_FLOOR_ROUNDS)).is_some());
+        }
+
+        #[test]
+        fn a_short_run_reports_no_floor_where_it_would_have_understated_the_spread() {
+            // The trap issue #438 names, in the shape it was measured in: on
+            // one host, readings drawn from the same scatter reported their
+            // *tightest* floor at the lowest round count. The prefixes short
+            // enough to do that now report nothing at all, so there is no
+            // number for a reader to mistake for a quieter host.
+            let long: Vec<f64> = (0..51)
+                .map(|i| 0.95 + ((i * 37) % 51) as f64 / 500.0)
+                .collect();
+            let full = floor(&long).expect("51 rounds underwrite a floor");
+            let understating = (1..long.len())
+                .filter(|&rounds| floor(&long[..rounds]).is_some_and(|short| short < full))
+                .collect::<Vec<_>>();
+            assert!(
+                understating.iter().all(|&rounds| rounds >= MIN_FLOOR_ROUNDS),
+                "a run under the minimum reported a tighter floor than the whole draw: \
+                 {understating:?}"
+            );
+            for rounds in 1..MIN_FLOOR_ROUNDS {
+                assert_eq!(floor(&long[..rounds]), None, "{rounds} rounds");
+            }
+        }
+    }
+}
+
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
