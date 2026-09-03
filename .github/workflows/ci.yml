@@ -133,12 +133,12 @@ jobs:
       # The web example makes the same scrubbing decisions `native_gl` does - the random-access
       # restart, the measured stride, the walk's next step - and its copy of them had nothing
       # asserting it (#380). Node's built-in runner, so this needs no install step and no
-      # dependency the example does not already have. The directory rather than
-      # `scrub.test.js`: which bundled sample the page opens is a decision of the same kind and
-      # has its own `samples.test.js` beside it (#441), and naming one file is how the second
-      # one would go unrun.
+      # dependency the example does not already have. A glob rather than `scrub.test.js`: which
+      # bundled sample the page opens is a decision of the same kind and has its own
+      # `samples.test.js` beside it (#441), and naming one file is how the second one would go
+      # unrun. Not the bare directory - `node --test <dir>` resolves it as a module and fails.
       - name: Test the web example's pure decisions
-        run: node --test examples/web_canvas/
+        run: node --test 'examples/web_canvas/*.test.js'
       # `samples.test.js` can only check the choice, not the claim it is made from: the codec
       # string the page probes with is written down in JavaScript, so this demuxes each declared
       # sample and asserts the declaration against what zvidlib derives from the track itself.
