@@ -523,6 +523,20 @@ conversion is not decoding: it is the YUV420-to-RGBA pass every whole-frame
 measurement takes on the way out of the decoder. Both denominators are reported
 because the two answer different questions and are easy to confuse.
 
+The `inter_pred_filter` rows carry a bound as well as a figure. Issue #404 gave
+§8.5.3.3 interpolation a 16-bit accumulation path and routed the vertical-only
+phase to it, and issue #426 asked what that is worth to these rows. It is worth
+less than they can resolve: `hevc_decode_profile --pair` A/Bs the two arms in one
+process against a null control whose answer is known to be 1.0000x, and on an
+Intel Core i9-10850K the control itself lands between 0.9623x and 1.0252x, with
+the arm under test always inside that miss. The effect on these rows is therefore
+**under about 4%, and not distinguishable from zero at this host's noise floor** —
+see `#426: the same question, on an instrument with a null control in it` below
+for the readings and for what the control caught. Issue #434 asked for the draw
+again on a quiet host and could not reach one; its five further draws corroborate
+the bound without tightening it, and establish that raising `--rounds` cannot
+tighten it either — see the `#434` re-run section below.
+
 The two `sao` tables above are the arms measured *after* issue #310; the rest of
 each table is the issue #280 measurement set, so the SAO rows are the only ones
 in them taken on a different day. What they replaced was a single `sao` row at
@@ -823,6 +837,117 @@ separate benchmark processes on this host disagree with each other by more than
 the effect. The committed `hevc_inter_pred` and `inter_pred_filter` rows are
 therefore left as they stand rather than redrawn from measurements that cannot
 resolve the change.
+
+##### #426: the same question, on an instrument with a null control in it
+
+Issue #426 asked for this pairing again on a host quiet enough that the control
+settles at 1.00x. What it produced instead is a better instrument and a
+*bounded* null result, which is the outcome that issue's own third bullet asks
+for when a quiet host cannot be reached.
+
+**The confound was the instrument, not only the host.** The pairing above ran
+two *builds* in two *processes*, and nothing in it held anything else still.
+`hevc_decode_profile --pair` now runs both arms inside one binary, over the same
+decoder and the same frames, through a process-level override of the `narrows`
+decision (`zvidlib::hevc_narrow_interp`) — and a third arm that simply runs the
+wide arm's code again. That third arm is a null control with a known answer of
+1.0000x, measured in the same rounds by the same instrument, so every reading is
+reported next to what the instrument could actually resolve when it was taken.
+The three arms are asserted to decode bit-identically, an FNV digest over every
+plane of every frame, before anything is timed: the whole-decode form of the
+guard `measure_narrow_vs_wide_block` already applies per block.
+
+**The control immediately caught two things the effect would otherwise have been
+credited with.** With the arms run in a *fixed* order every round, it read
+**0.9469x** — the third decode of a round is systematically slower than the first
+on this host, and under a fixed order that penalty lands on the same arm every
+round and survives the elementwise minimum intact. The arm order now rotates, so
+each arm takes each position an equal number of times. Then the *statistic*
+turned out to carry as much noise as the host did: read as a ratio of the two
+arms' minima — the form the pairing above used — consecutive invocations of the
+same binary read **0.9623x and then 1.0127x**, with the control moving 0.9995x to
+0.9843x underneath them, because two minima chosen out of different rounds do not
+share the drift between those rounds. `--pair` therefore reports a *within-round
+paired* ratio, median over rounds with an interquartile band, which divides out
+the drift the two arms of a round do share.
+
+**On an Intel Core i9-10850K (10 cores, Windows, `Avx2`), 48 frames, 12 to 21
+interleaved rounds, the answer is bounded rather than resolved.** Across repeated
+invocations the null control's median reads **0.9623x to 1.0252x** against its
+known 1.0000x, with an interquartile scatter of ±5% to ±10%; the `narrows`-decides
+arm reads **0.9627x to 1.0117x** over the same runs, inside the control's own miss
+every time. The whole-decode effect of the narrow path is therefore **smaller than
+about 4% on this host and not distinguishable from zero**, and `inter_pred_filter`
+ms/frame is bounded the same way. That is a bound where #404 had none. It is not
+the ±1% control the issue hoped for, and this host — a ten-core desktop with other
+work on it — is not the quiet host that would produce one.
+
+So the committed `hevc_inter_pred` and `inter_pred_filter` rows still stand rather
+than moving, but they no longer stand on an unbounded null: the floor that bounds
+them is **±4% at the median of a within-round paired ratio**, on the host named
+above. A future draw on a genuinely quiet host tightens it by running `--pair` and
+reading the control it prints alongside the effect. Nothing in that output is
+trustworthy that its own control does not underwrite — which is the whole lesson
+of #404's ±7% `scalar` arm, now built into the instrument instead of discovered
+after the fact.
+
+##### #434: the re-run, and why `--rounds` is not the lever
+
+Issue #434 asked for the draw above to be taken again on a host quiet enough
+that the control settles — preferably the Apple Silicon machine the committed
+`hevc_inter_pred` and `inter_pred_filter` rows were drawn on. **That host was not
+reachable, and the only host that was is the same i9-10850K, busier than when the
+bound above was drawn.** Five draws were taken on it (48 frames, `Avx2`, the
+arms and statistic unchanged):
+
+| Draw | Rounds | Scheduling | Control median [interquartile] | Shipped-arm median | Floor |
+| --- | ---: | --- | ---: | ---: | ---: |
+| 1 | 21 | as-launched | 1.0268x [0.9909, 1.0874] | 1.0094x | 8.74% |
+| 2 | 21 | `High` priority | 0.9969x [0.9615, 1.0443] | 1.0155x | 4.43% |
+| 3 | 21 | `High` + one-core affinity | 1.0063x [0.9454, 1.0403] | 1.0227x | 5.46% |
+| 4 | 51 | `High` priority | 0.9864x [0.9363, 1.0487] | 1.0066x | 6.37% |
+| 5 | 21 | `High` priority | 1.0315x [0.9772, 1.0566] | 1.0311x | 5.66% |
+
+The wide arm's *minimum* — the most stable statistic in the output — ranged
+41.99 to 46.49 ms/frame across these five draws, an 11% spread on a quantity
+that should barely move. That is the direct evidence the host was not quiet:
+other work was resident on it throughout, and no draw reached a floor better
+than the ±4% already recorded.
+
+**Raising `--rounds` does not tighten this floor, and draw 4 is why.** The issue
+offered two levers — more rounds, or a quieter host — and only the second one is
+real. The band the floor is taken from is an *interquartile width of the host's
+own round-to-round scatter*, not a standard error of a mean: it estimates a
+spread rather than averaging one away, so it does not shrink as `1/√n`. Going
+from 21 rounds to 51 made the floor **worse** (6.37% against 4.43%), because a
+run two and a half times longer simply catches more of the interference it is
+measuring. More rounds buy a better-estimated noise floor, never a lower one.
+
+The converse is the trap this creates, and it is worth naming because the number
+moves in the flattering direction: a 5-round draw on this same host reports a
+**3.36%** floor, tighter than any of the five above. It has not measured less
+noise. An interquartile band over five readings is three of them, so it
+understates a spread it has barely sampled. The floor is only as trustworthy as
+the round count behind it, and a lower one obtained by shortening the run is an
+artefact rather than a tightening.
+
+**Raising the process priority is the one lever that helped, and only to the
+median.** Draw 2 put the control median within **0.31%** of 1.0000x — the ~1%
+the issue asked for — while its interquartile band stayed at [0.9615, 1.0443].
+Reading that median alone as "the control settled" is exactly the error this
+instrument exists to prevent, which is why the floor is taken as the widest the
+control misses 1.0000x *anywhere in its band*: a control that scatters ±4% around
+a perfect median has not resolved a 1% effect. Draws 3 and 5 confirm the median
+itself is not reproducible either, wandering 0.9864x to 1.0315x. Pinning to one
+physical core (draw 3) did not help; the contending work is not pinned.
+
+So the bound is **unchanged at ±4%**, and no tighter floor is substituted for it,
+because none was earned. What these draws add is corroboration rather than
+resolution: every shipped-arm median above (0.9968x to 1.0376x) again lands
+inside its own control's miss, on a host noisier than the one that first bounded
+the effect, which is what a genuinely-near-zero effect looks like. The re-run
+that would tighten this still needs a quiet host — the Apple Silicon machine of
+the committed rows, idle — and not a longer run on a busy one.
 
 No decoded sample moves on any backend or at any bit depth.
 `the_eight_bit_block_path_matches_the_per_sample_equations` runs every block
