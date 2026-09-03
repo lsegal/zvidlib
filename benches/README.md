@@ -211,6 +211,10 @@ decompose the same work `av1_encode_frame_q0` measures end to end. The
 non-lossless search the `q32` and `q160` groups show is a whole-frame property
 rather than a stage of its own, which is why it has no per-stage counterpart.
 
+Its whole-frame content is `support::av1_gray8_planes`, which borrows the HEVC
+encoder fixture's luma, so `What the synthetic content's value distribution is,
+and what it cannot answer` below applies to these groups unchanged.
+
 The stage breakdown is the point of the per-stage groups, and it is lopsided:
 tile encoding is within a small factor of the whole-frame number, the forward
 WHT and the symbol coder are each an order of magnitude cheaper than that, and
@@ -519,6 +523,17 @@ conversion is not decoding: it is the YUV420-to-RGBA pass every whole-frame
 measurement takes on the way out of the decoder. Both denominators are reported
 because the two answer different questions and are easy to confuse.
 
+The `inter_pred_filter` rows carry a bound as well as a figure. Issue #404 gave
+§8.5.3.3 interpolation a 16-bit accumulation path and routed the vertical-only
+phase to it, and issue #426 asked what that is worth to these rows. It is worth
+less than they can resolve: `hevc_decode_profile --pair` A/Bs the two arms in one
+process against a null control whose answer is known to be 1.0000x, and on an
+Intel Core i9-10850K the control itself lands between 0.9623x and 1.0252x, with
+the arm under test always inside that miss. The effect on these rows is therefore
+**under about 4%, and not distinguishable from zero at this host's noise floor** —
+see `#426: the same question, on an instrument with a null control in it` below
+for the readings and for what the control caught.
+
 The two `sao` tables above are the arms measured *after* issue #310; the rest of
 each table is the issue #280 measurement set, so the SAO rows are the only ones
 in them taken on a different day. What they replaced was a single `sao` row at
@@ -820,6 +835,59 @@ the effect. The committed `hevc_inter_pred` and `inter_pred_filter` rows are
 therefore left as they stand rather than redrawn from measurements that cannot
 resolve the change.
 
+##### #426: the same question, on an instrument with a null control in it
+
+Issue #426 asked for this pairing again on a host quiet enough that the control
+settles at 1.00x. What it produced instead is a better instrument and a
+*bounded* null result, which is the outcome that issue's own third bullet asks
+for when a quiet host cannot be reached.
+
+**The confound was the instrument, not only the host.** The pairing above ran
+two *builds* in two *processes*, and nothing in it held anything else still.
+`hevc_decode_profile --pair` now runs both arms inside one binary, over the same
+decoder and the same frames, through a process-level override of the `narrows`
+decision (`zvidlib::hevc_narrow_interp`) — and a third arm that simply runs the
+wide arm's code again. That third arm is a null control with a known answer of
+1.0000x, measured in the same rounds by the same instrument, so every reading is
+reported next to what the instrument could actually resolve when it was taken.
+The three arms are asserted to decode bit-identically, an FNV digest over every
+plane of every frame, before anything is timed: the whole-decode form of the
+guard `measure_narrow_vs_wide_block` already applies per block.
+
+**The control immediately caught two things the effect would otherwise have been
+credited with.** With the arms run in a *fixed* order every round, it read
+**0.9469x** — the third decode of a round is systematically slower than the first
+on this host, and under a fixed order that penalty lands on the same arm every
+round and survives the elementwise minimum intact. The arm order now rotates, so
+each arm takes each position an equal number of times. Then the *statistic*
+turned out to carry as much noise as the host did: read as a ratio of the two
+arms' minima — the form the pairing above used — consecutive invocations of the
+same binary read **0.9623x and then 1.0127x**, with the control moving 0.9995x to
+0.9843x underneath them, because two minima chosen out of different rounds do not
+share the drift between those rounds. `--pair` therefore reports a *within-round
+paired* ratio, median over rounds with an interquartile band, which divides out
+the drift the two arms of a round do share.
+
+**On an Intel Core i9-10850K (10 cores, Windows, `Avx2`), 48 frames, 12 to 21
+interleaved rounds, the answer is bounded rather than resolved.** Across repeated
+invocations the null control's median reads **0.9623x to 1.0252x** against its
+known 1.0000x, with an interquartile scatter of ±5% to ±10%; the `narrows`-decides
+arm reads **0.9627x to 1.0117x** over the same runs, inside the control's own miss
+every time. The whole-decode effect of the narrow path is therefore **smaller than
+about 4% on this host and not distinguishable from zero**, and `inter_pred_filter`
+ms/frame is bounded the same way. That is a bound where #404 had none. It is not
+the ±1% control the issue hoped for, and this host — a ten-core desktop with other
+work on it — is not the quiet host that would produce one.
+
+So the committed `hevc_inter_pred` and `inter_pred_filter` rows still stand rather
+than moving, but they no longer stand on an unbounded null: the floor that bounds
+them is **±4% at the median of a within-round paired ratio**, on the host named
+above. A future draw on a genuinely quiet host tightens it by running `--pair` and
+reading the control it prints alongside the effect. Nothing in that output is
+trustworthy that its own control does not underwrite — which is the whole lesson
+of #404's ±7% `scalar` arm, now built into the instrument instead of discovered
+after the fact.
+
 No decoded sample moves on any backend or at any bit depth.
 `the_eight_bit_block_path_matches_the_per_sample_equations` runs every block
 shape, origin and phase of the eight-bit block path against the normative
@@ -901,6 +969,16 @@ two-dimensional (which gains about a tenth) and one full-pel (which does not
 filter). Weighting the per-phase ratios by that gives about 8% of the
 interpolation, which is the 0.319 ms measured — the mirror's best case is
 one plane-sized pass short of paying for itself.
+
+**The section above bounds what that would have been worth even if the mirror
+were free.** #426's paired instrument, on this same i9-10850K, puts the whole-
+decode effect of the narrow path at smaller than about 4% and not distinguishable
+from zero, with a null control missing its known 1.0000x by 3.7% to 2.5%. A
+0.319 ms saving on a stage that is about 27% of decode proper is roughly 2% of a
+decode — inside that floor, on the arm where the mirror costs nothing. So the
+mirror is not a change this host could resolve end to end even in the accounting
+that ignores what it costs to write, which is the other reason the decision rests
+on the in-process A/Bs above rather than on a whole-decode draw.
 
 **So the decoder keeps its `i32` planes and `narrows` keeps #404's routing.**
 `RefPlane::with_narrow` is `#[cfg(test)]` apparatus, as `measure_2d_ring_vs_flat`
@@ -2636,6 +2714,13 @@ that need not run on the submitting thread.
 Every one of them is cached in a `OnceLock`, so the demux and decode cost is paid
 once per process rather than once per iteration.
 
+The three generated `synthetic_*` fixtures share one moving diagonal ramp, and
+its luma wraps at `& 0xff`. That gives a block an atypical spread of sample
+values, which matters to any measurement whose cost depends on the distribution
+of samples rather than their count; `What the synthetic content's value
+distribution is, and what it cannot answer` states what it costs and how to
+re-take the figure.
+
 ## Throughput
 
 `support::FrameWork` describes the pixel work one iteration performs.
@@ -2682,6 +2767,75 @@ mistaken for bitstream-writing cost:
 Every group runs once per available instruction set through
 `support::isa::bench_across_isas`, with the same bit-exactness and
 `active_by_site()` guards as the decode-side groups.
+
+### What the synthetic content's value distribution is, and what it cannot answer
+
+The encoder groups decode nothing first, so their content is generated rather
+than filmed, and it is generated the same way for all of them:
+`support::synthetic_yuv420_sequence` builds a moving diagonal ramp plus
+low-amplitude noise for the per-stage groups, `support::synthetic_rgba8_sequence`
+the same ramp in RGBA8 for the whole-frame groups, and `support::av1_gray8_planes`
+borrows the first's luma outright for the AV1 encoder groups above. That keeps
+neither prediction nor entropy coding in an unrepresentative best case, which is
+what it was chosen for, and it is a fair input for any kernel whose cost scales
+with the *number* of samples it touches.
+
+It is not a fair input for a kernel whose cost depends on the *distribution* of
+those samples within a block. Both luma generators close with `& 0xff`, so a ramp
+that would otherwise leave 8-bit range wraps back to zero, and a block straddling
+the wrap spans nearly the whole 8-bit range instead of the narrow one video's
+spatial coherence would give it. The chroma — a `% 24` sawtooth around 128 — has
+the opposite skew, being *more* concentrated than video everywhere.
+
+`tests/sao_band_occupancy.rs` is the measurement of this and the way to re-take
+it:
+
+```sh
+cargo test --features native --release --test sao_band_occupancy -- \
+  --ignored --nocapture
+```
+
+It reports how many of the 32 §8.7.3.2 SAO bands a block occupies — each band is
+eight of the 256 sample values, so this is a within-block value distribution
+rather than an SAO-specific quantity — both as distinct bands and as the band
+range `max - min + 1`. The figures are properties of the content rather than of a
+host — the generators are deterministic and the decode is bit-exact — so the run
+above reproduces this table exactly:
+
+| content | distinct bands | band range `max - min + 1` |
+| --- | --- | --- |
+| bundled 1080p sample, luma 16x16 (n=168,840) | mean 6.4, 38.4% <=4 | mean 6.4, 38.4% <=4, 68.6% <=8 |
+| synthetic 640x352 luma 16x16 (n=1,760) | mean 10.0 | **mean 15.5, 0% <=8** |
+| synthetic 640x352 chroma 8x8 (n=3,520) | mean 3.2 | mean 3.4, 100% <=4 |
+
+Read the two luma rows against each other. Real video occupies four bands or
+fewer in 38.4% of its CTBs; the synthetic luma occupies eight or fewer in **none**
+of its 1,760. A kernel with a narrow-block fast path would therefore have run
+that path on over a third of real CTBs and on no synthetic luma CTB at all, so
+`hevc_encode_640x352_reconstruct` reports it as pure overhead whatever it is
+worth on video.
+
+#406 is the worked example. The transposed SAO band kernel it wrote costs work
+proportional to the band range it visits, and the group its acceptance criterion
+named could not have exercised the fast path even had the kernel deserved one.
+That kernel was a null result for a separate and more decisive reason — narrowing
+the accumulators loses before any vector unit is involved, which the portable
+control measured at 0.66-0.81x — so nothing about its conclusion turns on this,
+and the full account is under `The register-resident accumulator` below. The
+criterion was still stated against content that could not answer it.
+
+Prediction-mode selection, transform-size selection and anything driven by local
+variance carry the same exposure. Before writing a kernel whose cost varies with
+value distribution, re-take the measurement above and check that the group meant
+to judge it carries the distribution the kernel needs; when it does not, judge it
+on the bundled sample's decoded luma, which `tests/sao_band_occupancy.rs` reads
+alongside the synthetic planes for exactly that comparison.
+
+The generators are deliberately left as they are. Clamping or reflecting the ramp
+instead of wrapping it would make the content locally coherent the way video is,
+but it would move every committed encoder row in `Committed baselines` below and
+require re-drawing both tables by the recipe there — a larger change than the
+exposure warrants now that it is written down.
 
 ### Resolutions
 

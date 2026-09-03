@@ -7,6 +7,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 /// A non-`Send` encoder future that works on native and single-threaded WASM.
 pub type EncoderFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + 'a>>;
@@ -370,8 +371,55 @@ pub struct ExactFrameReader {
     /// on every sample.
     output_wanted: bool,
     next_decode_position: Option<usize>,
+    /// The fast tier [`ExactFrameReader::seek`] answers from, when the caller has attached one.
+    seek_previews: Option<Arc<dyn SeekPreviewSource>>,
     limits: Limits,
     statistics: DecodeStatistics,
+}
+
+/// The longest a seek to any position of any track may take.
+///
+/// This is the requirement `ARCHITECTURE.md` section 3.2 states, kept here as a value so the
+/// tests that hold the library to it and the callers that budget against it quote one number.
+pub const SEEK_LATENCY_BUDGET: Duration = Duration::from_millis(50);
+
+/// Already-decoded pictures spread over a track, which a seek may answer from.
+///
+/// This is a trait rather than the concrete index because [`ExactFrameReader`] is portable and
+/// [`previews::PreviewIndex`] is not - its pass owns a thread, so it is native-only - and a
+/// reader that named the concrete type could not be built for the browser at all, which is the
+/// target that needs the tier most. An implementation must not decode and must not wait on a
+/// decoder: what it returns is a picture it already had, or nothing.
+///
+/// [`previews::PreviewIndex`]: crate::previews::PreviewIndex
+pub trait SeekPreviewSource: Send + Sync {
+    /// The kept picture closest to `frame` and the frame it is actually of, or `None` while
+    /// nothing near that position has been decoded.
+    fn nearest_at(&self, frame: FrameIndex) -> Option<(FrameIndex, VideoFrame)>;
+}
+
+/// What a constant-time [`ExactFrameReader::seek`] could answer with.
+///
+/// A seek is a question about a position on the timeline, and it has to be answered now: the
+/// exact frame at an arbitrary point of a long group of pictures is a decode of every frame
+/// before it, which on a 1080p track is seconds rather than the [`SEEK_LATENCY_BUDGET`]
+/// `ARCHITECTURE.md` section 3.2 allows. So a seek returns the best picture already decoded and
+/// the caller walks to the exact one behind it with [`ExactFrameReader::get`] if it still wants
+/// it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Seek {
+    /// The frame asked for, already decoded and cached. Nothing further is needed.
+    Exact(VideoFrame),
+    /// A picture of a different frame, the closest one the seek preview index holds.
+    Preview {
+        picture: VideoFrame,
+        /// The frame `picture` is actually of, which is within one preview stride of the frame
+        /// asked for once the pass has covered that part of the track.
+        frame: FrameIndex,
+    },
+    /// Nothing is decoded yet for anywhere near this position: no cached frame, and either no
+    /// preview index attached or an index whose pass has not produced a picture.
+    Pending,
 }
 
 /// What a caller wants out of a request, which is what decides whether the reader keeps the
@@ -454,9 +502,49 @@ impl ExactFrameReader {
             in_flight_since_reset: HashSet::new(),
             output_wanted: true,
             next_decode_position: None,
+            seek_previews: None,
             limits,
             statistics: DecodeStatistics::default(),
         })
+    }
+
+    /// Attaches (or, with `None`, detaches) the preview source [`Self::seek`] answers from.
+    ///
+    /// The source is normally a [`previews::PreviewIndex`] filling itself on a decoder of its
+    /// own, and it is shared rather than owned so a reader can start answering seeks from it
+    /// while its pass is still walking the track.
+    ///
+    /// [`previews::PreviewIndex`]: crate::previews::PreviewIndex
+    pub fn set_seek_previews(&mut self, previews: Option<Arc<dyn SeekPreviewSource>>) {
+        self.seek_previews = previews;
+    }
+
+    /// Answers "what is at this position of the timeline" without decoding anything.
+    ///
+    /// This is the seek path, and it is bounded by `ARCHITECTURE.md` section 3.2: it takes the
+    /// same time whichever position of whatever track it is asked about, because it only ever
+    /// looks at pictures that are already decoded. It reads the presentation cache first - a
+    /// seek back to somewhere the reader has just been is exact for nothing - and then the
+    /// attached seek preview index, and it returns [`Seek::Pending`] rather than blocking when
+    /// neither holds anything.
+    ///
+    /// Reaching the exact frame is [`Self::get`], which is unbounded by construction: the frame
+    /// depends on every frame back to its random-access point and they all have to be decoded.
+    /// A caller that wants both draws what this returns and walks to the exact frame behind it.
+    pub fn seek(&mut self, presentation_index: FrameIndex) -> Seek {
+        if let Some(frame) = self.cache.get(&presentation_index).cloned() {
+            self.statistics.cache_hits = self.statistics.cache_hits.saturating_add(1);
+            self.touch(presentation_index);
+            return Seek::Exact(frame);
+        }
+        match self
+            .seek_previews
+            .as_ref()
+            .and_then(|previews| previews.nearest_at(presentation_index))
+        {
+            Some((frame, picture)) => Seek::Preview { picture, frame },
+            None => Seek::Pending,
+        }
     }
 
     /// Returns exactly the requested presentation frame, and the frames behind it that the
@@ -910,6 +998,144 @@ mod tests {
 
     fn value(frame: &VideoFrame) -> u8 {
         frame.planes[0].data[0]
+    }
+
+    /// A reader over a single-group track: one random-access point at frame zero, so reaching
+    /// any frame exactly means decoding every frame before it. This is the shape the bundled
+    /// sample has and the shape the seek budget is hard for.
+    fn single_group_reader(frames: u64) -> ExactFrameReader {
+        let samples = (0..frames)
+            .map(|index| sample(index, (index % 251) as u8, index == 0))
+            .collect();
+        ExactFrameReader::new(
+            &uncompressed_video_decoder_factory(),
+            config(),
+            samples,
+            Limits::default(),
+        )
+        .unwrap()
+    }
+
+    /// A preview source holding one picture every `stride` frames, standing in for the pass a
+    /// `previews::PreviewIndex` runs. The reader's contract is that a seek reads pictures and
+    /// never decodes, and asserting that does not need a decoder behind the source.
+    struct StridedPreviews {
+        stride: u64,
+        frames: u64,
+    }
+
+    impl SeekPreviewSource for StridedPreviews {
+        fn nearest_at(&self, frame: FrameIndex) -> Option<(FrameIndex, VideoFrame)> {
+            if self.frames == 0 {
+                return None;
+            }
+            let at = (frame.0 / self.stride * self.stride).min(self.frames - 1);
+            let picture = VideoFrame::new(
+                config().coded_dimensions,
+                PixelFormat::Gray8,
+                ColorRange::Full,
+                vec![Plane {
+                    data: vec![(at % 251) as u8],
+                    stride: 1,
+                }],
+                &Limits::default(),
+            )
+            .ok()?;
+            Some((FrameIndex(at), picture))
+        }
+    }
+
+    /// A seek with nothing decoded anywhere near it says so rather than deciding to decode: the
+    /// caller falls through to its own exact request instead of the seek path silently becoming
+    /// the walk it is bounded against.
+    #[test]
+    fn a_seek_with_nothing_decoded_is_pending_and_submits_no_samples() {
+        let mut reader = single_group_reader(512);
+        assert_eq!(reader.seek(FrameIndex(511)), Seek::Pending);
+        assert_eq!(reader.statistics().samples_submitted, 0);
+        assert_eq!(reader.statistics().resets, 0);
+    }
+
+    /// A seek back to somewhere the reader has just been is the frame itself, from the cache.
+    #[test]
+    fn a_seek_into_the_cache_answers_exactly() {
+        let mut reader = single_group_reader(64);
+        let cancellation = CancellationToken::new();
+        reader.get(FrameIndex(40), &cancellation).unwrap();
+        let submitted = reader.statistics().samples_submitted;
+        let Seek::Exact(frame) = reader.seek(FrameIndex(40)) else {
+            panic!("a cached frame seeks exactly");
+        };
+        assert_eq!(value(&frame), 40);
+        assert_eq!(
+            reader.statistics().samples_submitted,
+            submitted,
+            "an exact seek decodes nothing"
+        );
+    }
+
+    /// The requirement in `ARCHITECTURE.md` section 3.2: a seek to any position of a track that
+    /// is one group of pictures answers from an already-decoded picture and decodes nothing, so
+    /// what it costs does not grow with how far along the track the position is.
+    #[test]
+    fn a_seek_anywhere_on_a_single_group_track_decodes_nothing() {
+        let mut reader = single_group_reader(512);
+        reader.set_seek_previews(Some(Arc::new(StridedPreviews {
+            stride: 12,
+            frames: 512,
+        })));
+        for target in [0_u64, 1, 255, 400, 511] {
+            match reader.seek(FrameIndex(target)) {
+                Seek::Preview { frame, .. } => assert!(
+                    frame.0.abs_diff(target) < 12,
+                    "frame {target} answered by {frame:?}, further than one stride away"
+                ),
+                Seek::Exact(_) => {}
+                Seek::Pending => panic!("frame {target} had no answer"),
+            }
+        }
+        assert_eq!(
+            reader.statistics().samples_submitted,
+            0,
+            "seeking is not decoding"
+        );
+        assert_eq!(reader.statistics().resets, 0);
+    }
+
+    /// The 50 ms half of the same requirement, held on every run rather than only in the
+    /// host-specific measurement over the bundled sample: a hundred positions of a single-group
+    /// track, the far end no slower than the near one.
+    #[test]
+    fn a_seek_to_any_position_answers_inside_the_latency_budget() {
+        let frames = 768;
+        let mut reader = single_group_reader(frames);
+        reader.set_seek_previews(Some(Arc::new(StridedPreviews { stride: 12, frames })));
+        let mut worst = Duration::ZERO;
+        for step in 0..=100_u64 {
+            let target = FrameIndex(step * (frames - 1) / 100);
+            let started = std::time::Instant::now();
+            let answer = reader.seek(target);
+            worst = worst.max(started.elapsed());
+            assert_ne!(answer, Seek::Pending, "frame {} had no answer", target.0);
+        }
+        assert!(
+            worst < SEEK_LATENCY_BUDGET,
+            "the worst seek took {worst:?}, over the {SEEK_LATENCY_BUDGET:?} budget"
+        );
+    }
+
+    /// Detaching the source puts the reader back to answering out of its own cache alone, so a
+    /// caller that drops a preview index does not keep serving its pictures.
+    #[test]
+    fn detaching_the_preview_source_leaves_only_the_cache() {
+        let mut reader = single_group_reader(64);
+        reader.set_seek_previews(Some(Arc::new(StridedPreviews {
+            stride: 12,
+            frames: 64,
+        })));
+        assert!(matches!(reader.seek(FrameIndex(63)), Seek::Preview { .. }));
+        reader.set_seek_previews(None);
+        assert_eq!(reader.seek(FrameIndex(63)), Seek::Pending);
     }
 
     #[test]
