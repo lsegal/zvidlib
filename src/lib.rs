@@ -147,9 +147,9 @@ pub use codec::{
     AudioDrain, AudioEncoder, AudioEncoderFormat, AudioGapless, CancellationToken,
     CodecImplementation, CodecProfile, CodecSupport, DecodeStatistics, DecodedVideoFrame,
     EncodedSample, EncodedVideoSample, EncoderConfig, EncoderFuture, ExactFrameReader,
-    HardwarePreference, SampleDependency, TrackKind, VideoDecoder, VideoDecoderConfig,
-    VideoDecoderFactory, VideoEncoder, VideoEncoderConfig, VideoEncoderFactory, VideoEncoderFormat,
-    uncompressed_video_decoder_factory,
+    HardwarePreference, SEEK_LATENCY_BUDGET, SampleDependency, Seek, SeekPreviewSource, TrackKind,
+    VideoDecoder, VideoDecoderConfig, VideoDecoderFactory, VideoEncoder, VideoEncoderConfig,
+    VideoEncoderFactory, VideoEncoderFormat, uncompressed_video_decoder_factory,
 };
 pub use codec_config::{DerivedCodecString, derive_codec_string};
 pub use conformance::{

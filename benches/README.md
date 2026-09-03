@@ -211,6 +211,10 @@ decompose the same work `av1_encode_frame_q0` measures end to end. The
 non-lossless search the `q32` and `q160` groups show is a whole-frame property
 rather than a stage of its own, which is why it has no per-stage counterpart.
 
+Its whole-frame content is `support::av1_gray8_planes`, which borrows the HEVC
+encoder fixture's luma, so `What the synthetic content's value distribution is,
+and what it cannot answer` below applies to these groups unchanged.
+
 The stage breakdown is the point of the per-stage groups, and it is lopsided:
 tile encoding is within a small factor of the whole-frame number, the forward
 WHT and the symbol coder are each an order of magnitude cheaper than that, and
@@ -2607,6 +2611,13 @@ that need not run on the submitting thread.
 Every one of them is cached in a `OnceLock`, so the demux and decode cost is paid
 once per process rather than once per iteration.
 
+The three generated `synthetic_*` fixtures share one moving diagonal ramp, and
+its luma wraps at `& 0xff`. That gives a block an atypical spread of sample
+values, which matters to any measurement whose cost depends on the distribution
+of samples rather than their count; `What the synthetic content's value
+distribution is, and what it cannot answer` states what it costs and how to
+re-take the figure.
+
 ## Throughput
 
 `support::FrameWork` describes the pixel work one iteration performs.
@@ -2653,6 +2664,75 @@ mistaken for bitstream-writing cost:
 Every group runs once per available instruction set through
 `support::isa::bench_across_isas`, with the same bit-exactness and
 `active_by_site()` guards as the decode-side groups.
+
+### What the synthetic content's value distribution is, and what it cannot answer
+
+The encoder groups decode nothing first, so their content is generated rather
+than filmed, and it is generated the same way for all of them:
+`support::synthetic_yuv420_sequence` builds a moving diagonal ramp plus
+low-amplitude noise for the per-stage groups, `support::synthetic_rgba8_sequence`
+the same ramp in RGBA8 for the whole-frame groups, and `support::av1_gray8_planes`
+borrows the first's luma outright for the AV1 encoder groups above. That keeps
+neither prediction nor entropy coding in an unrepresentative best case, which is
+what it was chosen for, and it is a fair input for any kernel whose cost scales
+with the *number* of samples it touches.
+
+It is not a fair input for a kernel whose cost depends on the *distribution* of
+those samples within a block. Both luma generators close with `& 0xff`, so a ramp
+that would otherwise leave 8-bit range wraps back to zero, and a block straddling
+the wrap spans nearly the whole 8-bit range instead of the narrow one video's
+spatial coherence would give it. The chroma — a `% 24` sawtooth around 128 — has
+the opposite skew, being *more* concentrated than video everywhere.
+
+`tests/sao_band_occupancy.rs` is the measurement of this and the way to re-take
+it:
+
+```sh
+cargo test --features native --release --test sao_band_occupancy -- \
+  --ignored --nocapture
+```
+
+It reports how many of the 32 §8.7.3.2 SAO bands a block occupies — each band is
+eight of the 256 sample values, so this is a within-block value distribution
+rather than an SAO-specific quantity — both as distinct bands and as the band
+range `max - min + 1`. The figures are properties of the content rather than of a
+host — the generators are deterministic and the decode is bit-exact — so the run
+above reproduces this table exactly:
+
+| content | distinct bands | band range `max - min + 1` |
+| --- | --- | --- |
+| bundled 1080p sample, luma 16x16 (n=168,840) | mean 6.4, 38.4% <=4 | mean 6.4, 38.4% <=4, 68.6% <=8 |
+| synthetic 640x352 luma 16x16 (n=1,760) | mean 10.0 | **mean 15.5, 0% <=8** |
+| synthetic 640x352 chroma 8x8 (n=3,520) | mean 3.2 | mean 3.4, 100% <=4 |
+
+Read the two luma rows against each other. Real video occupies four bands or
+fewer in 38.4% of its CTBs; the synthetic luma occupies eight or fewer in **none**
+of its 1,760. A kernel with a narrow-block fast path would therefore have run
+that path on over a third of real CTBs and on no synthetic luma CTB at all, so
+`hevc_encode_640x352_reconstruct` reports it as pure overhead whatever it is
+worth on video.
+
+#406 is the worked example. The transposed SAO band kernel it wrote costs work
+proportional to the band range it visits, and the group its acceptance criterion
+named could not have exercised the fast path even had the kernel deserved one.
+That kernel was a null result for a separate and more decisive reason — narrowing
+the accumulators loses before any vector unit is involved, which the portable
+control measured at 0.66-0.81x — so nothing about its conclusion turns on this,
+and the full account is under `The register-resident accumulator` below. The
+criterion was still stated against content that could not answer it.
+
+Prediction-mode selection, transform-size selection and anything driven by local
+variance carry the same exposure. Before writing a kernel whose cost varies with
+value distribution, re-take the measurement above and check that the group meant
+to judge it carries the distribution the kernel needs; when it does not, judge it
+on the bundled sample's decoded luma, which `tests/sao_band_occupancy.rs` reads
+alongside the synthetic planes for exactly that comparison.
+
+The generators are deliberately left as they are. Clamping or reflecting the ramp
+instead of wrapping it would make the content locally coherent the way video is,
+but it would move every committed encoder row in `Committed baselines` below and
+require re-drawing both tables by the recipe there — a larger change than the
+exposure warrants now that it is written down.
 
 ### Resolutions
 
