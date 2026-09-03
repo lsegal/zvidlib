@@ -100,7 +100,10 @@ fn report(label: &str, histogram: &[u64]) {
     print!("{label:<34} mean {mean:>5.1}  ");
     for k in [4usize, 8, 12, 16, 24] {
         let cumulative: u64 = histogram[..=k].iter().sum();
-        print!("<={k:<2}: {:>5.1}%  ", 100.0 * cumulative as f64 / total as f64);
+        print!(
+            "<={k:<2}: {:>5.1}%  ",
+            100.0 * cumulative as f64 / total as f64
+        );
     }
     println!("n={total}");
 }
@@ -186,8 +189,7 @@ fn decoded_luma(frames: usize) -> Vec<Plane8> {
     let mut out = Vec::new();
     for sample in vector.samples.iter().take(frames) {
         for frame in decoder.submit(sample, &cancellation).unwrap() {
-            let (y, _, _) =
-                zvidlib::hevc_encoder_bench::rgba_to_yuv420_planes(&frame.frame);
+            let (y, _, _) = zvidlib::hevc_encoder_bench::rgba_to_yuv420_planes(&frame.frame);
             out.push(Plane8 {
                 data: y,
                 width: frame.frame.dimensions.width as usize,

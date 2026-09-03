@@ -642,8 +642,15 @@ pub(crate) fn band_offset_row_scalar(here: &[i32], src: &[u8], stats: &mut BandS
 /// 8x8 chroma, so at most 256 samples; §8.7.3.2 takes the error against the
 /// unclamped reconstruction, and the reconstruction the encoder hands this
 /// module is a clipped sample, so a band's sum is bounded by `256 · 255` and its
-/// count by 256. `i32` sums and `u16` counts hold that with four orders of
-/// magnitude to spare, at 192 bytes per set rather than 512.
+/// count by 256. `i32` sums and `u32` counts hold that with four orders of
+/// magnitude to spare, at 256 bytes per set rather than 512.
+///
+/// The counts are `u32` and not the `u16` a 256-sample CTB would allow, because
+/// `u16` was measured and is *worse*: a 16-bit read-modify-write into the
+/// histogram costs more on this dispatch's hosts than the halved traffic saves,
+/// and it read 0.67x against 0.77-0.80x for the same kernel at `u32` on the
+/// chroma shape. That is the first of several places this decomposition turned
+/// out to be paying for its own narrowness.
 ///
 /// # Why it is split
 ///
@@ -665,10 +672,18 @@ pub(crate) struct NarrowBandStats {
 /// How many partial accumulator sets [`NarrowBandStats`] splits its histogram
 /// across.
 ///
-/// Two, not four: the fold is 32 pairs of adds per set per CTB, which a 64-sample
-/// chroma CTB pays over a quarter of the samples a luma one does, so a third and
-/// fourth set cost more fold than they buy chain. Two sets at 384 bytes are still
-/// below the 512 [`BandStats`] zeroes for the same CTB.
+/// Two, not four: the fold is 32 pairs of adds per set per CTB, which a
+/// 64-sample chroma CTB pays over a quarter of the samples a luma one does, so a
+/// third and fourth set cost more fold than they buy chain.
+///
+/// Note what two `u32`-counted sets actually cost. 256 bytes each is 512 bytes
+/// for the pair — *exactly* what [`BandStats`] costs, and paid on top of it
+/// rather than instead of it, since the caller still wants a `BandStats` back.
+/// The premise that a narrow histogram halves the traffic holds only for a
+/// single set, and a single set is the one that keeps the dependency chain the
+/// split exists to break. The two halves of the idea are in direct tension, and
+/// the measurement recorded at [`band_offset_rect`] is what that tension is
+/// worth.
 pub(crate) const NARROW_SETS: usize = 2;
 
 impl Default for NarrowBandStats {
@@ -1196,7 +1211,8 @@ mod x86 {
                 let source = &src[y * src_stride..y * src_stride + width];
                 let mut i = 0;
                 while i + 8 <= width {
-                    let (band, err) = band_classify8_avx2(recon.as_ptr().add(i), source.as_ptr().add(i));
+                    let (band, err) =
+                        band_classify8_avx2(recon.as_ptr().add(i), source.as_ptr().add(i));
                     let lo_b = _mm256_castsi256_si128(band);
                     let hi_b = _mm256_extracti128_si256(band, 1);
                     let lo_e = _mm256_castsi256_si128(err);
@@ -1403,7 +1419,13 @@ mod x86 {
                 // the scatter is the cheaper shape and this pre-pass is what it
                 // cost to find that out.
                 band_offset_rect_avx2_narrow(
-                    here, here_stride, src, src_stride, width, height, narrow,
+                    here,
+                    here_stride,
+                    src,
+                    src_stride,
+                    width,
+                    height,
+                    narrow,
                 );
                 return;
             }
@@ -2058,7 +2080,13 @@ mod tests {
                 // The portable narrow control, which every host runs.
                 let mut narrow = NarrowBandStats::default();
                 band_offset_rect_narrow_scalar(
-                    &here, STRIDE, &src, STRIDE, width, height, &mut narrow,
+                    &here,
+                    STRIDE,
+                    &src,
+                    STRIDE,
+                    width,
+                    height,
+                    &mut narrow,
                 );
                 let mut got = BandStats::default();
                 narrow.fold_into(&mut got);
@@ -2070,7 +2098,13 @@ mod tests {
                     // both planes.
                     unsafe {
                         x86::band_offset_rect_sse41_narrow(
-                            &here, STRIDE, &src, STRIDE, width, height, &mut narrow,
+                            &here,
+                            STRIDE,
+                            &src,
+                            STRIDE,
+                            width,
+                            height,
+                            &mut narrow,
                         );
                     }
                     let mut got = BandStats::default();
@@ -2106,15 +2140,13 @@ mod tests {
     /// The narrow once-per-CTB kernels, as a function pointer so the candidates
     /// can be held in one list.
     #[cfg(target_arch = "x86_64")]
-    type NarrowRectKernel = unsafe fn(
-        &[i32],
-        usize,
-        &[u8],
-        usize,
-        usize,
-        usize,
-        &mut NarrowBandStats,
-    );
+    type NarrowRectKernel =
+        unsafe fn(&[i32], usize, &[u8], usize, usize, usize, &mut NarrowBandStats);
+
+    /// One named arm of [`bench_band_offset_rect`], boxed so shapes with
+    /// different accumulator types can be held in one interleaved list.
+    #[cfg(target_arch = "x86_64")]
+    type BenchArm = (&'static str, Box<dyn Fn(&mut BandStats)>);
 
     /// What the §8.7.3 band search costs *per CTB*, over the two CTB shapes the
     /// encoder actually asks for and over the band ranges
@@ -2163,7 +2195,10 @@ mod tests {
             println!("# host has no AVX2; nothing to measure");
             return;
         }
-        println!("# per-CTB band search, host dispatch site hevc_recon: {:?}", isa());
+        println!(
+            "# per-CTB band search, host dispatch site hevc_recon: {:?}",
+            isa()
+        );
 
         for &(shape, width, height) in SHAPES {
             for &span in SPANS {
@@ -2177,7 +2212,7 @@ mod tests {
                 // Every arm produces a `BandStats`, including the narrow ones,
                 // so each pays the fold and the widening its shape implies and
                 // none is credited with work it skipped.
-                let mut arms: Vec<(&'static str, Box<dyn Fn(&mut BandStats)>)> = Vec::new();
+                let mut arms: Vec<BenchArm> = Vec::new();
                 let (h, s) = (here.clone(), src.clone());
                 arms.push((
                     "rows (reference)",
@@ -2197,7 +2232,13 @@ mod tests {
                     Box::new(move |stats: &mut BandStats| {
                         let mut narrow = NarrowBandStats::default();
                         band_offset_rect_narrow_scalar(
-                            &h, STRIDE, &s, STRIDE, width, height, &mut narrow,
+                            &h,
+                            STRIDE,
+                            &s,
+                            STRIDE,
+                            width,
+                            height,
+                            &mut narrow,
                         );
                         narrow.fold_into(stats);
                     }),
@@ -2252,7 +2293,13 @@ mod tests {
                     Box::new(move |_stats: &mut BandStats| {
                         let mut narrow = NarrowBandStats::default();
                         band_offset_rect_narrow_scalar(
-                            &h, STRIDE, &s, STRIDE, width, height, &mut narrow,
+                            &h,
+                            STRIDE,
+                            &s,
+                            STRIDE,
+                            width,
+                            height,
+                            &mut narrow,
                         );
                         black_box(&narrow);
                     }),
@@ -2265,7 +2312,13 @@ mod tests {
                         // SAFETY: AVX2 was detected above.
                         unsafe {
                             x86::band_offset_rect_avx2_narrow(
-                                &h, STRIDE, &s, STRIDE, width, height, &mut narrow,
+                                &h,
+                                STRIDE,
+                                &s,
+                                STRIDE,
+                                width,
+                                height,
+                                &mut narrow,
                             );
                         }
                         black_box(&narrow);
@@ -2307,7 +2360,10 @@ mod tests {
                 };
                 println!();
                 println!("{shape}, {label}, {calls} CTBs per round, best of {ROUNDS} rounds");
-                println!("{:<24}{:>12}{:>12}{:>12}", "arm", "MCTB/s", "ratio", "spread");
+                println!(
+                    "{:<24}{:>12}{:>12}{:>12}",
+                    "arm", "MCTB/s", "ratio", "spread"
+                );
                 for (arm, (name, _)) in arms.iter().enumerate() {
                     println!(
                         "{:<24}{:>12.2}{:>11.2}x{:>11.1}%",
