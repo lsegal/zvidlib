@@ -2628,10 +2628,10 @@ cargo test --features native --release --test sao_band_occupancy -- \
   --ignored --nocapture
 ```
 
-It reports how many of the 32 §8.7.3.2 SAO bands a block occupies — those bands
-are 8-bit value bins three places wide, so this is a within-block value
-distribution rather than an SAO-specific quantity — both as distinct bands and as
-the band range `max - min + 1`:
+It reports how many of the 32 §8.7.3.2 SAO bands a block occupies — each band is
+eight of the 256 sample values, so this is a within-block value distribution
+rather than an SAO-specific quantity — both as distinct bands and as the band
+range `max - min + 1`:
 
 | content | distinct bands | band range `max - min + 1` |
 | --- | --- | --- |
