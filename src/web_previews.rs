@@ -256,6 +256,59 @@ mod tests {
         assert_eq!(picture.planes[0].data[0], 7);
     }
 
+    /// The driver itself, over the bundled sample through the real `WebCodecs`
+    /// backend: one step decodes one preview and leaves the pass on the next
+    /// position, without the caller having anywhere to run a loop.
+    ///
+    /// Not every headless Chrome build can decode HEVC - it depends on platform
+    /// codec licensing - so this accepts a browser-reported `UNSUPPORTED` the
+    /// way `wasm_api`'s decode test does, and only fails on other error kinds or
+    /// on a pass that did not move.
+    #[wasm_bindgen_test(async)]
+    async fn one_step_of_the_browser_pass_fills_one_position_and_moves_on() {
+        const SAMPLE: &[u8] = include_bytes!("../examples/media/BigBuckBunny.mp4");
+        let limits = Limits::default();
+        let mut index = match WebPreviewIndex::open(
+            SAMPLE,
+            0,
+            &limits,
+            PreviewOptions::for_frame_rate(24),
+        )
+        .await
+        {
+            Ok(index) => index,
+            Err(error) => {
+                assert_eq!(error.kind(), ErrorKind::Unsupported);
+                return;
+            }
+        };
+        assert_eq!(index.coverage().0, 0, "nothing is decoded before a step");
+        assert_eq!(index.next_frame(), Some(FrameIndex(0)));
+
+        let more = index
+            .step(&CancellationToken::new())
+            .await
+            .expect("a step over a decodable track");
+        assert!(more, "768 frames do not fit in one preview position");
+        assert_eq!(
+            index.next_frame(),
+            Some(FrameIndex(index.stride())),
+            "the pass advanced exactly one position"
+        );
+
+        // A frame that would not decode leaves its position empty and the pass
+        // still moves, so the picture is asserted only where there is one - and
+        // where there is, it is the shrunk RGBA a lookup anywhere answers with.
+        if let Some((frame, picture)) = index.store().nearest_at(FrameIndex(index.stride() * 4)) {
+            assert_eq!(frame, FrameIndex(0));
+            assert_eq!(picture.pixel_format, PixelFormat::Rgba8);
+            assert!(
+                picture.dimensions.width < 1920,
+                "a preview is the frame shrunk, not the frame"
+            );
+        }
+    }
+
     /// Issue #432's measurement, the browser counterpart of
     /// `tests/preview_index.rs::a_preview_answers_any_position_without_decoding`:
     /// every position of the bar, answered from the index, against the budget
