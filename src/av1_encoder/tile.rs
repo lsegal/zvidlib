@@ -2080,6 +2080,20 @@ impl<'a> FrameEncoder<'a> {
         } else {
             self.type_gain_trust()
         };
+        // A plain `i64` multiply, and the one product here that is genuinely unreachable rather
+        // than merely unreached. Both credits below widened because their second factor is a
+        // quantity the enforced bounds leave large - a whole coding block's summed cost, or a
+        // block count against a frame-wide accumulator - but this one's second factor is
+        // `TYPE_GAIN_TRUST_ONE` = 16 at most, asserted by `with_type_gain_trust` and
+        // `with_type_gain_probe_trust`, so it multiplies `dct - best` by at most 2^4. `dct - best`
+        // is at most `dct`, which is a sum of transform-block costs; even at the frame-wide
+        // accumulator `with_type_gain_memory` reaches, `dct` leaving 2^59 would need a frame whose
+        // every probe block sat at the 2^41 ceiling in numbers no `Limits::default` frame admits,
+        // and at the shipped window of one probe it is a single block under 2^41 with 22 bits to
+        // spare. #412 left this alone deliberately and noted the distinction in
+        // `the_widened_linear_credit_never_leaves_i64_and_matches_the_bound`;
+        // `the_trust_shrinkage_has_headroom_the_two_widened_credits_do_not` asserts it, so the
+        // three products are now distinguished by measurement rather than by prose.
         measured = measured * trust / TYPE_GAIN_TRUST_ONE;
         let blocks = self.trial_searched_blocks;
         let credit = match self.type_gain_model() {
@@ -2116,7 +2130,33 @@ impl<'a> FrameEncoder<'a> {
                     .set(self.linear_credit_product.get().max(product));
                 (product / i128::from(dct)) as i64
             }
-            GainModel::PerBlock => measured.saturating_mul(blocks) / probes,
+            GainModel::PerBlock => {
+                // Taken in `i128` for the same reason as `Linear` above (#424): a
+                // `saturating_mul` here collapses the credit to `i64::MAX / probes`, which is
+                // *smaller* than the real credit, so the arm is silently under-credited and the
+                // size ranking moves rather than failing. Nothing ships this model, but a
+                // calibration sweep is the one consumer for which a wrong number is worse than a
+                // panic: `measure_type_gain_models` ranks this arm against the others, and an arm
+                // that saturated would report a penalty that is an artefact of the accumulator's
+                // magnitude rather than of the model.
+                //
+                // Reachability. `blocks` is `trial_searched_blocks`, at most 256 - a 64x64 coding
+                // block of 4x4 transforms - where `Linear`'s second factor was a whole coding
+                // block's summed cost near `2^43`, so the headroom is far larger here. Under the
+                // shipped `TYPE_GAIN_MEMORY` of 1, `decay` zeroes the accumulator before every
+                // `accumulate`, so `measured <= dct` is one probe block under `2^41` and the
+                // product is under `2^49`. It is `with_type_gain_memory` that reaches the
+                // frame-wide accumulator, and there a `dct` past about `2^55` times 256 blocks
+                // leaves `i64` - a test-only window and a test-only model on a large frame, which
+                // is exactly the combination a sweep is.
+                //
+                // The result always fits, and for a different reason than `Linear`'s. `dct` is
+                // summed over `probes` blocks each under the `2^41` transform-block ceiling, so
+                // `measured / probes` is at most a block's cost however large the accumulator
+                // grows; times at most 256 blocks that is under `2^49`, so the narrowed result
+                // cannot overflow and only the intermediate needed the width.
+                (i128::from(measured) * i128::from(blocks) / i128::from(probes)) as i64
+            }
             GainModel::Amplified => {
                 let numerator = i128::from(measured)
                     * i128::from(blocks)
@@ -3253,6 +3293,201 @@ mod tests {
             reached_the_cliff,
             "the sweep must cross the range the saturating product could not represent"
         );
+    }
+
+    /// A `FrameEncoder` whose transform-gain state is set directly for the per-block arms, where
+    /// the credit's factors are the trial's *block count* and the accumulator's probe count
+    /// rather than the two costs [`credit_encoder`] sets.
+    ///
+    /// The probe fields are again what is set, for the same reason: `measured_here` selects them,
+    /// and they are the arm that can carry a `dct` and a `probes` summed over a whole frame.
+    fn per_block_credit_encoder<'a>(
+        plane: &'a [u8],
+        measured: i64,
+        dct: i64,
+        blocks: i64,
+        probes: i64,
+    ) -> FrameEncoder<'a> {
+        let mut encoder = FrameEncoder::new(plane, 16, 16, 80)
+            .with_type_gain_probe_trust(TYPE_GAIN_TRUST_ONE)
+            .with_type_gain_model(GainModel::PerBlock);
+        encoder.probe_dct_cost = dct;
+        encoder.probe_best_cost = dct - measured;
+        encoder.probe_blocks = probes;
+        encoder.trial_searched_cost = dct;
+        encoder.trial_searched_blocks = blocks;
+        encoder
+    }
+
+    /// #424: the `GainModel::PerBlock` credit was `measured.saturating_mul(blocks) / probes`, and
+    /// the saturating branch is reachable for the same reason `Linear`'s was - not from the
+    /// shipped window of one probe, but from the frame-wide accumulator `with_type_gain_memory`
+    /// reaches on a large frame, which is exactly the configuration a calibration sweep runs.
+    ///
+    /// Saturating does not fail loudly. It collapses the credit to `i64::MAX / probes`, which is
+    /// *smaller* than the real credit, so the arm is silently under-credited and would report a
+    /// penalty that is an artefact of the accumulator's magnitude rather than of the model. This
+    /// reaches that cliff and asserts the ranking no longer moves across it.
+    #[test]
+    fn the_per_block_credit_is_exact_where_the_saturating_product_had_a_cliff() {
+        let plane = vec![128u8; 16 * 16];
+        // A frame-wide accumulator holding 2^16 probe blocks each near the 2^41 transform-block
+        // ceiling, against a 64x64 coding block of 4x4 transforms. Every factor is inside what
+        // the enforced bounds admit and inside `i64`; only their product is not, at `2^65`.
+        let (blocks, probes) = (256i64, 1i64 << 16);
+        let (measured, dct) = (1i64 << 57, 1i64 << 57);
+        assert!(
+            dct / probes < (1 << 41),
+            "the accumulator's mean probe block stays under the transform-block ceiling"
+        );
+        let encoder = per_block_credit_encoder(&plane, measured, dct, blocks, probes);
+
+        let exact = (i128::from(measured) * i128::from(blocks) / i128::from(probes)) as i64;
+        let saturated = measured.saturating_mul(blocks) / probes;
+        assert_ne!(
+            exact, saturated,
+            "the test must reach the cliff, or it asserts nothing"
+        );
+        assert!(
+            saturated < exact,
+            "a saturated product under-credits: {saturated} vs {exact}"
+        );
+
+        // The trial's own cost, and a rival size that gets no credit at all. Under the exact
+        // credit the trialled size wins; under the saturated one it loses, which is the silent
+        // ranking change this issue is about.
+        let trial_cost = 1i64 << 42;
+        let rival_cost = -(1i64 << 48);
+        let corrected = encoder.corrected_trial_cost(trial_cost, 32);
+        assert_eq!(corrected, trial_cost - exact);
+        assert!(
+            corrected < rival_cost,
+            "the exactly credited trial ranks under the rival: {corrected} vs {rival_cost}"
+        );
+        assert!(
+            trial_cost - saturated > rival_cost,
+            "the saturated credit ranked it the other way, which is the cliff"
+        );
+    }
+
+    /// The per-block credit's result is bounded, and for a different reason than `Linear`'s.
+    /// `Linear`'s rests on `measured <= dct`, which makes its credit at most the trial's searched
+    /// cost. This one rests on `dct` being summed over `probes` blocks each under the `2^41`
+    /// transform-block ceiling: `measured / probes` is then at most one block's cost however far
+    /// the accumulator has grown, and over at most 256 searched blocks that is under `2^49`. So
+    /// widening the intermediate to `i128` cannot make the narrowed result overflow.
+    ///
+    /// Swept across the saturating regime and well under it, holding both the general bound and
+    /// the tighter one the enforced ceilings buy wherever the sweep's point respects them.
+    #[test]
+    fn the_widened_per_block_credit_never_leaves_i64_and_matches_the_bound() {
+        let plane = vec![128u8; 16 * 16];
+        let mut reached_the_cliff = false;
+        // `dct` runs to `2^60`: the shrinkage above the credit is a separate expression with its
+        // own headroom, asserted by `the_trust_shrinkage_has_headroom_the_two_widened_credits_do_not`
+        // rather than bounded by this sweep. This one is about the product.
+        for dct_shift in [10u32, 20, 31, 42, 55, 60] {
+            let dct = 1i64 << dct_shift;
+            for numerator in [1i64, 3, 4] {
+                // `measured <= dct` holds on every arm: `best` is `cheapest.min(dct)` and the
+                // trust shrinkage only shrinks the difference further.
+                let measured = dct / 4 * numerator;
+                // The trial's block count, up to a 64x64 coding block of 4x4 transforms.
+                for blocks in [1i64, 16, 64, 256] {
+                    for probe_shift in [0u32, 4, 10, 16] {
+                        let probes = 1i64 << probe_shift;
+                        let encoder =
+                            per_block_credit_encoder(&plane, measured, dct, blocks, probes);
+                        let credit = i128::from(measured) * i128::from(blocks) / i128::from(probes);
+                        assert!(
+                            i64::try_from(credit).is_ok(),
+                            "the widened credit narrows back into an i64: {credit}"
+                        );
+                        if dct / probes < (1 << 41) && blocks <= 256 {
+                            assert!(
+                                credit < (1i128 << 49),
+                                "inside the enforced ceilings the credit is under 2^49: {credit}"
+                            );
+                        }
+                        reached_the_cliff |= measured.checked_mul(blocks).is_none();
+
+                        let cost = dct;
+                        assert_eq!(encoder.corrected_trial_cost(cost, 32), cost - credit as i64);
+                    }
+                }
+            }
+        }
+        assert!(
+            reached_the_cliff,
+            "the sweep must cross the range the saturating product could not represent"
+        );
+    }
+
+    /// The third product in `corrected_trial_cost` is the trust shrinkage `measured * trust /
+    /// TYPE_GAIN_TRUST_ONE` above both widened credits, and it is the one that is genuinely
+    /// unreachable rather than merely unreached: its second factor is at most `16`, where the two
+    /// credits multiply by a whole coding block's cost or by a block count against a frame-wide
+    /// accumulator. #412 left it alone deliberately and #424 records why; this asserts the
+    /// distinction those comments rest on rather than leaving all three products argued in prose.
+    #[test]
+    fn the_trust_shrinkage_has_headroom_the_two_widened_credits_do_not() {
+        // A 64x64 coding block's own ceiling, which is what a probe's `dct - best` is bounded by
+        // at the shipped window of one probe.
+        let coding_block_ceiling = 1i64 << 43;
+        for trust in 0..=TYPE_GAIN_TRUST_ONE {
+            assert!(
+                coding_block_ceiling.checked_mul(trust).is_some(),
+                "the shrinkage fits at the coding-block ceiling for trust {trust}"
+            );
+        }
+        // Sixteen bits of headroom: the ceiling could grow by 2^16 and the shrinkage would still
+        // fit, which is what makes it a different question from the two products below.
+        assert!(
+            (coding_block_ceiling << 16)
+                .checked_mul(TYPE_GAIN_TRUST_ONE)
+                .is_some(),
+            "the shrinkage keeps about 16 bits over the enforced ceiling"
+        );
+        // The two credits have no such margin at their own second factors, which is why they are
+        // widened and this is not.
+        assert!(
+            coding_block_ceiling
+                .checked_mul(coding_block_ceiling)
+                .is_none(),
+            "the Linear product leaves i64 at the same ceiling (#412)"
+        );
+        assert!(
+            (1i64 << 57).checked_mul(256).is_none(),
+            "the PerBlock product leaves i64 at a frame-wide accumulator (#424)"
+        );
+    }
+
+    /// Only `GainModel::Linear` ships, so no widening of a per-block arm can move an encoded
+    /// byte. Asserted rather than argued: the shipped model is pinned, and an encode that selects
+    /// it explicitly is byte-identical to one that takes the default, so the arms a sweep
+    /// overrides are off the shipped path entirely.
+    #[test]
+    fn no_encoded_byte_depends_on_the_per_block_arm() {
+        assert_eq!(
+            TYPE_GAIN_MODEL,
+            GainModel::Linear,
+            "the shipped extrapolation is the one #412 widened"
+        );
+        let (width, height) = (61usize, 37usize);
+        let mut rng = Lcg(0x5eed);
+        let plane: Vec<u8> = (0..width * height)
+            .map(|_| (rng.next() & 0xff) as u8)
+            .collect();
+        for qindex in [0u8, 40, 160] {
+            let shipped = FrameEncoder::new(&plane, width, height, qindex).encode();
+            let pinned = FrameEncoder::new(&plane, width, height, qindex)
+                .with_type_gain_model(GainModel::Linear)
+                .encode();
+            assert_eq!(
+                shipped, pinned,
+                "the shipped encode ranks on the Linear credit at qindex {qindex}"
+            );
+        }
     }
 
     /// The encoded bitstream is the contract: a vector context pass that changed a single symbol
