@@ -606,6 +606,13 @@ pub(crate) struct FrameEncoder<'a> {
     /// How many blocks that cost is summed over, which is the base a per-block gain is
     /// extrapolated over. Zero-skipped blocks are excluded from it for the same reason.
     trial_searched_blocks: i64,
+    /// Largest `measured * trial_searched_cost` the [`GainModel::Linear`] credit has formed this
+    /// frame, in the `i128` #412 widened it to. A frame whose maximum is inside `i64` is a frame
+    /// the `saturating_mul` that widening replaced would have computed identically, which is how
+    /// `the_linear_credit_never_saturated_on_the_tuning_set` demonstrates the bitstream did not
+    /// move. Kept in a `Cell` so `corrected_trial_cost` stays a `&self` method.
+    #[cfg(test)]
+    linear_credit_product: std::cell::Cell<i128>,
     /// Cost a running size trial may reach before it is abandoned, or [`i64::MAX`] when nothing
     /// is being trialled. A trial's cost is a sum of squared errors and `lambda * bits`, so it
     /// only grows: once the partial sum passes what the incumbent size already costs, no
@@ -796,6 +803,9 @@ pub(crate) struct SearchReport {
     pub(crate) size_search_probes: Vec<(usize, bool)>,
     pub(crate) zero_skipped_emitted: u64,
     pub(crate) reusable_emitted: u64,
+    /// Largest `measured * trial_searched_cost` the [`GainModel::Linear`] credit formed over the
+    /// frame; see [`FrameEncoder::linear_credit_product`].
+    pub(crate) linear_credit_product: i128,
 }
 
 /// One transform type considered for a block, with everything the winner needs to be written:
@@ -937,6 +947,8 @@ impl<'a> FrameEncoder<'a> {
             probe_blocks: 0,
             size_searches: 0,
             trial_searched_cost: 0,
+            #[cfg(test)]
+            linear_credit_product: std::cell::Cell::new(0),
             trial_searched_blocks: 0,
             trial_ceiling: i64::MAX,
             trial_credit: (0, 0),
@@ -1438,6 +1450,7 @@ impl<'a> FrameEncoder<'a> {
             size_search_probes: std::mem::take(&mut self.size_search_probes),
             zero_skipped_emitted: self.zero_skipped_emitted,
             reusable_emitted: self.reusable_emitted,
+            linear_credit_product: self.linear_credit_product.get(),
             tile: self.sym.finish(),
         }
     }
@@ -2007,11 +2020,12 @@ impl<'a> FrameEncoder<'a> {
     /// this value is a lower bound on it: the trial's own final ranking is this same expression
     /// evaluated on the sums it finishes with.
     ///
-    /// The credit is taken in `i128` where [`Self::corrected_trial_cost`] takes it in `i64` with
-    /// a `saturating_mul`. That does not make the two disagree in the direction that matters: a
-    /// saturated product is smaller than the real one, so the shipped credit is never larger than
-    /// this one and the shipped ranking cost is never smaller than this bound. The bound stays
-    /// valid - a little loose - in the range where the shipped correction saturates.
+    /// The credit is taken in `i128` and so is [`Self::corrected_trial_cost`]'s, which is what
+    /// makes the two the *same* expression rather than one bounding the other: this is the
+    /// trial's own final ranking evaluated on the sums it has so far, with no widening difference
+    /// left between them. #412 is where the second half of that stopped being a `saturating_mul`
+    /// in `i64`; before it, a saturated product was smaller than the real one, so the bound was
+    /// still valid and merely loose wherever the shipped correction saturated.
     fn trial_rank_bound(&self, cost: i64) -> i64 {
         let (measured, dct) = self.trial_credit;
         if measured <= 0 || dct <= 0 {
@@ -2069,7 +2083,39 @@ impl<'a> FrameEncoder<'a> {
         measured = measured * trust / TYPE_GAIN_TRUST_ONE;
         let blocks = self.trial_searched_blocks;
         let credit = match self.type_gain_model() {
-            GainModel::Linear => measured.saturating_mul(self.trial_searched_cost) / dct,
+            GainModel::Linear => {
+                // Taken in `i128` because the product genuinely can leave `i64`, and the
+                // `saturating_mul` this replaces (#412) turned that into a silently wrong
+                // *ranking* rather than a panic: a saturated product collapses the credit to
+                // `i64::MAX / dct`, which is smaller than the real credit, so the trial is
+                // under-credited and the size it loses to is an artefact of the accumulator's
+                // magnitude rather than of the block.
+                //
+                // Reachability, at the bounds this crate actually enforces. A transform block's
+                // cost is `sse + lambda * bits` over at most 32x32 = 1024 samples; `sse` is
+                // bounded by the reconstruction's `i16` clamp in `av1_intra::inverse_transform`
+                // against a residual of at most 255, so a block is under `2^41` and a 64x64
+                // coding block - the largest, since M0 never uses 128x128 superblocks - is under
+                // `2^43`. `trial_searched_cost` is one coding block's sum and so is bounded by
+                // that. `measured <= dct` (`shipped_trial_credit`), and `dct` is at most
+                // `LARGE_TYPE_GAIN_PROBES` probe blocks on the probing arm and, because
+                // `type_gain_memory()` is `TYPE_GAIN_MEMORY` = 1 outside tests and `decay` zeroes
+                // the accumulator ahead of every `accumulate`, exactly *one* probe block on the
+                // arm that reads the accumulator back - not the frame-wide sum it would be at a
+                // longer window. Even so `2^43 * 2^43` is `2^86`, so nothing in the enforced
+                // bounds rules the saturating branch out, and `with_type_gain_memory` reaches
+                // the frame-wide accumulator directly.
+                //
+                // The result always fits. `measured <= dct` makes the credit at most
+                // `trial_searched_cost`, which is an `i64`, so only the intermediate needed
+                // widening. This is the same expression `trial_rank_bound` evaluates, in the
+                // same width, which is what lets the bound be exact rather than merely valid.
+                let product = i128::from(measured) * i128::from(self.trial_searched_cost);
+                #[cfg(test)]
+                self.linear_credit_product
+                    .set(self.linear_credit_product.get().max(product));
+                (product / i128::from(dct)) as i64
+            }
             GainModel::PerBlock => measured.saturating_mul(blocks) / probes,
             GainModel::Amplified => {
                 let numerator = i128::from(measured)
