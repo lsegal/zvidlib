@@ -5,6 +5,7 @@
 .glorp.json
 /examples/media/*.mp4
 !/examples/media/BigBuckBunny.mp4
+!/examples/media/BigBuckBunny.av1.mp4
 /examples/output/
 node_modules/
 __pycache__/
