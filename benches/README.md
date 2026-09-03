@@ -1,7 +1,7 @@
 # Benchmarks
 
 zvidlib's benchmarks run under [criterion](https://docs.rs/criterion) with
-`harness = false`, across six bench targets that share `benches/support/`:
+`harness = false`, across nine bench targets that share `benches/support/`:
 
 | Target | Measures |
 | --- | --- |
@@ -11,6 +11,9 @@ zvidlib's benchmarks run under [criterion](https://docs.rs/criterion) with
 | `benches/audio_decode.rs` | the audio decode path: AAC access units and `AacSampleReader` range/seek reads |
 | `benches/audio_mux.rs` | the audio container path: MP4 muxing, sample-table growth, demux, and gapless timing |
 | `benches/hevc_encode.rs` | the pure-Rust HEVC encoder, whole-frame and per-stage |
+| `benches/hevc_decode.rs` | the HEVC software decoder: whole-frame decode and every hot stage, scalar versus SIMD |
+| `benches/hevc_hardware.rs` | the platform fixed-function HEVC decoders against the software one |
+| `benches/exact_seek.rs` | what an exact frame at an arbitrary point costs, by backend and by random-access cadence |
 
 Each target loads and decodes its fixtures once per process, so every iteration
 measures the work under test and nothing else. `codec` is one target rather than
@@ -33,6 +36,9 @@ cargo bench --bench av1_encode    # the AV1 encoder, whole-frame and per-stage
 cargo bench --bench audio_decode  # the audio decode path only
 cargo bench --bench audio_mux     # the audio container path only
 cargo bench --bench hevc_encode   # the HEVC encoder groups only
+cargo bench --bench hevc_decode   # the HEVC software decoder only
+cargo bench --bench hevc_hardware # the platform hardware HEVC decoders
+cargo bench --bench exact_seek    # exact-seek cost by backend and cadence
 cargo bench --features simd       # the same groups, recorded under `simd=on`
 cargo bench --no-run              # compile only
 ```
@@ -942,6 +948,100 @@ converts a larger fraction of what it passes. Shortening the interval lengthens
 the per-frame estimate the next stride is computed from, so 80 ms and 400 ms
 land on similar strides from opposite directions while 150 ms sits in the
 region where every frame is converted.
+
+## What an exact frame at an arbitrary point costs (`--bench exact_seek`)
+
+Issue #374 asked for "<50 ms to any part of a video". #383 answered the *scrub*
+half of it and left the exact half open, on the reasoning that reaching
+presentation frame *n* means decoding every sample from the nearest preceding
+random-access point, and the bundled sample has exactly one. Issue #395 is that
+reasoning measured, because it had never been separated from the thing it was
+being blamed on: every figure in #354, #363, #374 and #383 came from a track
+that codes its 768 frames as a single group of pictures, so "an exact seek is
+slow" and "an exact seek on a single-group-of-pictures track is slow" had the
+same evidence behind them.
+
+`benches/exact_seek.rs` separates them. It measures a cold
+`ExactFrameReader::get` — a fresh reader per iteration, nothing cached, nothing
+warm, construction off the clock — to the frame four fifths of the way along the
+track, across two axes: the backend (`HardwarePreference::Avoid` for the crate's
+own software decoder, `Prefer` for the host's fixed-function one) and the
+track's random-access cadence. The cadence axis is the pair of fixtures in
+`tests/fixtures/codec/`: the same 768 frames of the bundled sample re-encoded at
+512x288 with the same encoder, preset and quality, differing only in `keyint`,
+so one carries one random-access point and the other twenty-four and nothing
+else about them differs.
+
+```sh
+cargo bench --bench exact_seek                       # the hardware arms
+ZVIDLIB_BENCH_LARGE=1 cargo bench --bench exact_seek # and the software ones
+```
+
+The software arms are opt-in for the usual reason: one cold `raps=1` software
+seek decodes 613 pictures.
+
+### The measurement
+
+Apple Silicon (M1, 8 cores), `--release`, VideoToolbox as the hardware backend,
+seeking to frame 614 of 768. Criterion's median of ten samples.
+
+| track | hardware | software |
+| --- | --- | --- |
+| `raps=1` (one random-access point) | **119.29 ms** | **1.6556 s** |
+| `raps=24` (one every 32 frames) | **18.77 ms** | **31.17 ms** |
+| a `PreviewIndex::nearest` lookup over the same track | **1.109 µs** | — |
+
+### What it says
+
+**The cadence is the whole cost, and the two cases do not behave alike.** On the
+same content at the same size and quality, one random-access point costs
+**6.4x** what twenty-four cost on the hardware backend and **53x** on the
+software one. Nothing else about the two tracks differs, so nothing else can be
+charged for it.
+
+**A track with several random-access points is already inside the budget, on
+both backends.** 18.77 ms and 31.17 ms are both under #374's 50 ms, from cold,
+with no preview tier, no proxy and no change to the reader. That is the figure
+that **rejects decoding the group of pictures in parallel across several
+sessions**: it only ever helps a track with more than one random-access point,
+and on such a track the exact seek already answers in 19-31 ms. On the track
+that actually has the problem there is nothing to parallelise — one entry point
+admits one walk — so the direction is fastest exactly where it is not needed and
+inapplicable where it is.
+
+**A track with one random-access point is not reachable by any arrangement of
+one decoder.** 119.29 ms is at 512x288; the same seek on the bundled 1080p
+sample is the 1.09 s of hardware decode #383 instrumented. Both are the hardware
+running at its own throughput with a full queue, so the gap to 50 ms is not a
+decoder-configuration problem and no amount of pipelining closes it.
+
+**What is chosen is the preview tier**, now `zvidlib::PreviewIndex` rather than a
+copy inside `examples/native_gl`. A lookup is **1.109 µs**, five orders of
+magnitude under the 119.29 ms exact seek it stands in for and the only arm in
+the table that is under 50 ms for a single-random-access-point track on either
+backend. It answers a different question — "what is at this point of the movie",
+not "which frame is the pointer on" — which is precisely why it can: the picture
+was decoded already. It costs one forward decode pass over the track, on a
+thread and a decoder of its own - **2.74 s** to cover all 768 frames of the
+bundled 1080p sample through VideoToolbox, measured by
+`tests/preview_index.rs::a_preview_answers_any_position_without_decoding`, which
+moved out of the example with the tier - and a bounded amount of memory
+(`PreviewOptions::budget_bytes`, 64 MB by default, which the stride follows from
+so a long track keeps previews further apart rather than more of them).
+
+**A proxy or re-indexed representation is rejected**, and the figure that rejects
+it is the 18.77 ms above. A proxy is a track with more random-access points; the
+best it can buy is the `raps=24` row, and that row is four orders of magnitude
+slower than the preview tier a scrub actually needs. So it pays a full transcode
+of the source and a second copy of the media on disk to land in the same range
+the exact walk already reaches, on the cases where that range is reachable at
+all. It stays rejected until a caller appears that needs *exact* frames at
+arbitrary positions repeatedly, which is an editor's requirement rather than a
+scrub's, and the preview tier is what a scrub was asking for.
+
+**Nothing about the decoded frames changes.** The preview tier is additive and
+opt-in, the reader is untouched, and the 768-frame fixture digests in
+`tests/codec_conformance.rs` and `tests/native_hevc_hardware.rs` still hold.
 
 ## The audio container path
 

@@ -106,6 +106,16 @@ name = "hevc_hardware"
 path = "benches/hevc_hardware.rs"
 harness = false
 
+# Issue #395's measurement: what an exact frame at an arbitrary point of a track
+# costs, by backend and by how often the track lets a decode restart. A separate
+# target because it is the only one whose fixtures are the paired gop-cadence
+# tracks rather than the bundled sample, and because one cold `raps=1` software
+# seek decodes a whole group of pictures, which no default run should carry.
+[[bench]]
+name = "exact_seek"
+path = "benches/exact_seek.rs"
+harness = false
+
 [features]
 default = []
 # Additive, off by default. The crate's SIMD kernels dispatch at run time rather
