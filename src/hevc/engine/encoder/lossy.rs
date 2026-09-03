@@ -118,22 +118,32 @@
 //! for — nor at any QP coarse enough that the four signs and five position
 //! bins outweigh what a value-range bias is worth.
 //!
-//! Those band-only bins are charged at 2.5x `lambda_q8`, and what that
-//! multiple is is the §7.3.8.3 **merge** a band component forfeits. `code_sao`
-//! codes one merge flag in place of a whole `sao( )` structure whenever a
-//! CTB's three components are exactly its left or above neighbour's, and the
-//! per-CTB search prices every candidate as though it were coding its
-//! structure standalone. Edge offset picks one of four classes with §7.4.9.3
-//! inferring its signs, so neighbours agree often; band offset picks one of 32
-//! positions and four signed offsets per component, so they essentially never
-//! do, and taking one costs whole structures at CTBs that were about to cost a
-//! flag. Measured on the QP 12-51 sweep over both test pictures at both sizes
-//! that is 2517 coded bins spent against 1018 band-syntax bins charged, or
-//! 2.47x — see [`SaoLambda::band_q8`] for the derivation, the reason it sits
-//! far above the 1.1x-1.4x the probe prices a marginal bit at, and why giving
-//! the search the exact rate model instead of the constant is blocked on
-//! [`SAO_ACCEPTANCE_RESOLUTION_NUM`] rather than on anything about band
-//! offset.
+//! Those band-only bins carry no charge of their own any more. The per-CTB
+//! search is given [`coding_bins`] itself, so every candidate is scored at
+//! what `code_sao` will really write for it — one §7.3.8.3 merge flag when
+//! the cell equals a decided neighbour, and the declined flags plus the whole
+//! structure when it does not — and the two merges are candidates of the
+//! search in their own right rather than something it discovers by accident.
+//! What the fitted 2.5x used to stand in for was exactly that merge: edge
+//! offset picks one of four classes with §7.4.9.3 inferring its signs, so
+//! neighbours agree often, while band offset picks one of 32 positions and
+//! four signed offsets per component, so they essentially never do and taking
+//! one costs whole structures at CTBs that were about to cost a flag.
+//! Counting the merge is strictly better than a constant priced in its place,
+//! because how much merge a band component destroys is a property of how much
+//! its neighbours agreed with each other, which is content and not rate — the
+//! per-QP ratio the constant averaged ran 0.50x to 4.00x.
+//!
+//! Pricing SAO correctly makes it cheaper, and #400 is where the slice-level
+//! rule then had to answer for grids it used to decline. What it was getting
+//! wrong is not [`SAO_ACCEPTANCE_RESOLUTION_NUM`]: it is that the two-point
+//! model was being *extrapolated* past the one quantizer step the probe
+//! measures, on a curve that is steeper further out. See
+//! [`bracketed_reachable_sse`], which walks further rungs of the picture's own
+//! ladder until the rate being judged is bracketed, and
+//! [`sao_search_lambda_q8`] and [`sao_spent_lambda_q8`], which are the
+//! search's own price and the re-read of it at the rate the grid it produced
+//! actually spends.
 //!
 //! ## Why the writer runs two passes
 //!
@@ -966,19 +976,26 @@ fn curve_point(src: SourcePlanes<'_>, qp: i32, search: ModeSearch, deblocking: b
 /// is wider than every margin this writer's operating points are decided on.
 /// So the rule is left to decide them - a tolerance wide enough to refuse the
 /// decisions #287 found sitting under the curve refuses the wins beside them
-/// too - and what covers the difference is [`SaoLambda::band_q8`], which is
-/// why that charge is a constant and not something the probe measures.
+/// too - and none is applied.
 ///
-/// ## When the probe runs
+/// What #400 established is that the failures it was blamed for were not
+/// resolution at all. A rule reading its two points *inside* the interval
+/// they measure is a measurement; one reading them outside it is a
+/// prediction, and that is where the grids landing under the curve were being
+/// decided. [`bracketed_reachable_sse`] keeps the read inside the interval by
+/// walking `finer` rungs of the same ladder until the rate being judged is
+/// bracketed, which is why this takes a `finer` callback rather than two
+/// points alone.
 ///
-/// `probe` is a second decision pass, so it is called only when its answer
-/// can change the outcome. The threshold is never outside the band
-/// [`SAO_LAMBDA_BAND`] draws either side of the closed-form line, so a gain
-/// clearing the band's coarse end already clears whatever the probe would
-/// have returned, and one that misses its fine end already misses it. Over
-/// the QP 12-51 sweep on the two test pictures that settles half the pictures
-/// without a probe, where SAO either found nothing the quantizer had left
-/// behind or found far more than a step of it recovers.
+/// ## What the band settles without reading the curve
+///
+/// The threshold is never outside the band [`SAO_LAMBDA_BAND`] draws either
+/// side of the closed-form line, so a gain clearing the band's coarse end
+/// already clears whatever the curve would have returned, and one that misses
+/// its fine end already misses it. Over the QP 12-51 sweep on the two test
+/// pictures that settles half the pictures on the band alone, where SAO
+/// either found nothing the quantizer had left behind or found far more than
+/// a step of it recovers.
 fn keeps_sao(
     gain: u64,
     sao_bits: u64,
@@ -1228,7 +1245,10 @@ fn reachable_sse(fine: CurvePoint, coarse: CurvePoint, qp: i32, sao_bits: u64) -
 /// writer has, win and failure alike, sits inside the acceptance model's own
 /// resolution, so no threshold on that model separates them and none is
 /// applied. `the_acceptance_model_cannot_resolve_the_margins_it_decides_on`
-/// holds this, and [`SaoLambda::band_q8`] is what stands in its place.
+/// holds this, and no threshold on the model stands in its place: what
+/// #400 found under the curve was the model being read outside the interval
+/// its two points measure, which [`bracketed_reachable_sse`] repairs without
+/// asking the model for precision it does not have.
 const SAO_ACCEPTANCE_RESOLUTION_NUM: u64 = 3;
 /// Denominator of [`SAO_ACCEPTANCE_RESOLUTION_NUM`] — 3/5 is 60%, the round
 /// figure above the worst 50.5% the full-picture measurement reached. Held by
@@ -2525,10 +2545,13 @@ mod tests {
     /// against the SAO-off writer's own curve, how many components the search
     /// gave band offset, and what the pass bought.
     ///
-    /// Re-run it against a candidate band-syntax charge to see the bracket
-    /// [`SaoLambda::band_q8`] records. Below 1.5x `lambda_q8` the `CURVE` line
-    /// for noise 128x96 QP 32 goes to -0.003 dB; at 4x the `SWEEP` lines lose
-    /// their band components entirely.
+    /// Before #400 this was re-run against a candidate band-syntax charge to
+    /// see the bracket that constant sat in: below 1.5x `lambda_q8` the
+    /// `CURVE` line for noise 128x96 QP 32 went to -0.003 dB, and at 4x the
+    /// `SWEEP` lines lost their band components entirely. There is no such
+    /// constant now — the search prices [`coding_bins`]'s own model — so what
+    /// the sweep records is the shipped decision rather than one point of a
+    /// bracket.
     ///
     /// #344 re-took it at 1.4x and 1.1x — the two ends of what the probe
     /// measures a marginal bit at — against the repaired slice-level rule and
@@ -2807,8 +2830,8 @@ mod tests {
             worst > 0.10,
             "the acceptance model predicted every held-out rung to within {:.1}%, so it is far \
              sharper than SAO_ACCEPTANCE_RESOLUTION_NUM records and the constant, the reasoning \
-             in SaoLambda::band_q8 that rests on it, and this test all need re-deriving rather \
-             than relaxing",
+             about the acceptance rule that rests on it, and this test all need re-deriving \
+             rather than relaxing",
             worst * 100.0
         );
         assert!(

@@ -736,10 +736,10 @@ fn as_picture(recon: &ReconstructedPicture) -> Picture {
 /// under band offset, its own `sao_band_position` — no position is inferred —
 /// which is the whole of what the syntax gives cIdx 2 of its own.
 ///
-/// `lambda` is the pair of §9 rate-distortion multipliers the candidates are
-/// priced with — see [`SaoLambda`]. SAO costs per-CTB syntax
-/// on every CTB it is enabled for, so a candidate is taken only when its SSE
-/// reduction clears `lambda * bins`, the bins being the §9.3.3 binarization's
+/// `lambda_q8` is the §9 rate-distortion multiplier the candidates are priced
+/// with, in the 1/256 units [`crate::hevc::engine::encoder::rdo::lambda_q8`]
+/// returns. SAO costs per-CTB syntax on every CTB it is enabled for, so a
+/// candidate is taken only when its SSE reduction clears `lambda_q8 * bins`, the bins being the §9.3.3 binarization's
 /// own count for the parameters that would be coded. At a zero `lambda` the
 /// test degrades to "any reduction at all", which is what a caller that codes
 /// no syntax for the decision wants.
@@ -861,7 +861,10 @@ pub(super) const SAO_LAMBDA_BAND: u64 = 4;
 /// This is what makes band offset a different bet from edge offset at the
 /// same gain — it pays five position bins and up to four sign bins where edge
 /// offset pays two class bins and infers its signs — and it is the part of a
-/// band candidate's rate [`SaoLambda::band_q8`] prices. The offsets' own
+/// band candidate's rate a fitted band-syntax charge used to be applied to.
+/// It is priced at the one closed-form multiplier now, like every other bin,
+/// because what that charge stood in for is the merge [`coding_bins`] counts.
+/// The offsets' own
 /// truncated-Rice bins are counted by [`offset_abs_bins`] exactly as edge
 /// offset's are, and priced the same way, because they are the same kind of
 /// bit.
@@ -1887,8 +1890,8 @@ mod tests {
 
     #[test]
     fn a_band_cell_is_charged_the_syntax_an_edge_cell_does_not_code() {
-        // `cell_bins` splits the §7.3.8.3 bins the way `SaoLambda` prices
-        // them, so what lands in the band half has to be exactly the five
+        // `cell_bins` splits the §7.3.8.3 bins into the structure's own and
+        // band offset's own, so what lands in the band half has to be exactly the five
         // `sao_band_position` bins and the sign of each nonzero offset.
         let offsets = [0, 3, -2, 0, 1];
         let (band_mode, band_band) = cell_bins(&band_cell(9, offsets));
