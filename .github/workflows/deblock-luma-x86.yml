@@ -13,6 +13,17 @@ name: Deblock luma x86_64 draw
 
 on:
   workflow_dispatch:
+    inputs:
+      runs:
+        description: >-
+          Space-separated run IDs of earlier `draw` runs to merge. Leave empty
+          to draw a new round instead of merging.
+        required: false
+        default: ""
+      model:
+        description: The CPU model every merged run must have landed on.
+        required: false
+        default: AMD EPYC 7763 64-Core Processor
   # Temporary, and only so GitHub registers `workflow_dispatch` for a workflow
   # that exists on this branch alone. The job itself never runs on a pull
   # request; see the `if:` below.
@@ -24,7 +35,7 @@ permissions:
 jobs:
   draw:
     name: Draw av1_deblock_luma
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && inputs.runs == ''
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
@@ -105,3 +116,63 @@ jobs:
             bench-*.log
             host.txt
           retention-days: 7
+
+  # Renders the committed row with `criterion_baseline.py table` itself, over
+  # every round from the runs that landed on the CPU model the x86_64 table
+  # names. Separate from `draw` because which runs those are is only knowable
+  # after the dispatched rounds report their host, and because merging measures
+  # nothing and so must not compete with a benchmark for a runner.
+  merge:
+    name: Merge the selected rounds
+    if: github.event_name == 'workflow_dispatch' && inputs.runs != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+
+      # The model check is the selection, restated where it is acted on: a
+      # merge across two models is the elementwise minimum this recipe exists
+      # to avoid, so a run that did not land on the named model fails the job
+      # rather than being quietly folded in.
+      - name: Download the selected runs and check each one's host
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUNS: ${{ inputs.runs }}
+          MODEL: ${{ inputs.model }}
+        run: |
+          set -euo pipefail
+          for run in $RUNS; do
+            gh run download "$run" --repo "$GITHUB_REPOSITORY" --dir "selected/$run"
+            model=$(sed -n 's/^# host cpu model: //p' "selected/$run/deblock-luma-draw/host.txt")
+            echo "run $run landed on: $model"
+            if [ "$model" != "$MODEL" ]; then
+              echo "::error::run $run landed on '$model', not '$MODEL'"
+              exit 1
+            fi
+          done
+
+      - name: Render the merged tables
+        env:
+          MODEL: ${{ inputs.model }}
+          RUNS: ${{ inputs.runs }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Merged draw on $MODEL"
+            echo
+            echo "Runs merged: \`$RUNS\` — $(ls selected/*/deblock-luma-draw/luma-*.json | wc -l) rounds."
+            echo
+            echo '### `av1_deblock_luma` (benches/codec.rs, drawn alone)'
+            echo
+            python3 .github/scripts/criterion_baseline.py table \
+              --baseline selected/*/deblock-luma-draw/luma-*.json \
+              --host "$MODEL (Linux, x86_64)"
+            echo
+            echo '### `av1_deblock` control (benches/av1_decode.rs, same sessions)'
+            echo
+            python3 .github/scripts/criterion_baseline.py table \
+              --baseline selected/*/deblock-luma-draw/ctrl-*.json \
+              --host "$MODEL (Linux, x86_64)"
+          } >> "$GITHUB_STEP_SUMMARY"
