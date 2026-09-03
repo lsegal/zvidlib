@@ -167,7 +167,7 @@ use crate::hevc::engine::encoder::rdo::{
 };
 use crate::hevc::engine::encoder::recon::{
     ReconstructedPicture, SAO_LAMBDA_BAND, SAO_OFFSET_MAX, SourcePlanes, deblock_reconstruction,
-    grid_bins, sao_reconstruction, sao_structure_grid,
+    grid_bins, sao_reconstruction,
 };
 use crate::hevc::engine::encoder::residual::{
     EngineResidualBinSink, ResidualWriteParams, has_coded_levels, write_residual_coding,

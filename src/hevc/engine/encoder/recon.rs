@@ -256,7 +256,6 @@ pub(crate) fn reconstruct_picture(
             cfg.sao_chroma,
             0,
             cfg.sao_band_search,
-            true,
         );
         pic = crate::hevc::engine::sao::apply_sao_picture_full(
             pic,
@@ -667,8 +666,8 @@ pub(crate) fn sao_reconstruction(
     src: SourcePlanes<'_>,
     lambda_q8: u32,
 ) -> Vec<ResolvedSao> {
-    let mut pic = as_picture(recon);
-    let grid = estimate_sao(&pic, src, true, true, lambda_q8, true, true);
+    let pic = as_picture(recon);
+    let grid = estimate_sao(&pic, src, true, true, lambda_q8, true);
     let pic = crate::hevc::engine::sao::apply_sao_picture_full(
         pic,
         &grid,
@@ -683,23 +682,6 @@ pub(crate) fn sao_reconstruction(
     recon.cb = plane_to_u8(&pic, Plane::Cb);
     recon.cr = plane_to_u8(&pic, Plane::Cr);
     grid
-}
-
-/// The grid the per-CTB search returns for `recon`, without applying it and
-/// without offering the two §7.3.8.3 merges as candidates.
-///
-/// This is the writer's rate probe for its own SAO stage: what the structures
-/// this picture wants would cost, before anything is traded away to buy the
-/// rate back. [`super::lossy`] reads the price of a bin off the picture's own
-/// curve at that rate and searches again, because a merge is not a choice
-/// between two codings of one CTB — it is a choice about how many bits the
-/// slice spends, which is the trade the closed form is measured wrong for.
-pub(crate) fn sao_structure_grid(
-    recon: &ReconstructedPicture,
-    src: SourcePlanes<'_>,
-    lambda_q8: u32,
-) -> Vec<ResolvedSao> {
-    estimate_sao(&as_picture(recon), src, true, true, lambda_q8, true, false)
 }
 
 /// A reconstruction's three planes as the [`Picture`] the SAO stage reads.
@@ -768,7 +750,6 @@ fn estimate_sao(
     sao_chroma: bool,
     lambda_q8: u32,
     band_search: bool,
-    merge_candidates: bool,
 ) -> Vec<ResolvedSao> {
     let w_ctbs = src.width.div_ceil(CTB);
     let h_ctbs = src.height.div_ceil(CTB);
@@ -801,16 +782,6 @@ fn estimate_sao(
             }
             let left = (rx > 0).then(|| grid[addr - 1]);
             let above = (ry > 0).then(|| grid[addr - w_ctbs]);
-            // The merge flags are counted whether or not the merges are
-            // offered as candidates: a cell whose own best happens to equal a
-            // decided neighbour is coded as one flag either way, and that is
-            // rate the search should see. What `merge_candidates` controls is
-            // only whether the search may *take* a neighbour's parameters it
-            // would not have chosen — a rate trade, and one the caller has to
-            // have priced the picture's own curve for.
-            let merges = merge_candidates
-                .then(|| [left, above])
-                .unwrap_or([None, None]);
             let score = |cell: &ResolvedSao| {
                 let (mode, band) = coding_bins(cell, left, above);
                 let gain = cell_gain(cell, luma.as_ref(), chroma.as_ref());
@@ -824,10 +795,7 @@ fn estimate_sao(
             // because it only sees this CTB.
             let mut best = ResolvedSao::off();
             let mut best_score = score(&best);
-            for candidate in [merges[0], merges[1], Some(standalone)]
-                .into_iter()
-                .flatten()
-            {
+            for candidate in [left, above, Some(standalone)].into_iter().flatten() {
                 let candidate_score = score(&candidate);
                 if candidate_score > best_score {
                     best_score = candidate_score;
@@ -1487,7 +1455,7 @@ mod tests {
             height: H,
         };
 
-        let grid = estimate_sao(&pic, src, true, true, 32, true, true);
+        let grid = estimate_sao(&pic, src, true, true, 32, true);
         // The first CTB lies wholly inside the biased region.
         let luma = grid[0].components[0];
         assert_eq!(
@@ -1569,8 +1537,8 @@ mod tests {
         }
         let source_planes = planes(&src);
         let lambda = 0;
-        let with = estimate_sao(&pic, source_planes, true, true, lambda, true, true);
-        let without = estimate_sao(&pic, source_planes, true, true, lambda, false, true);
+        let with = estimate_sao(&pic, source_planes, true, true, lambda, true);
+        let without = estimate_sao(&pic, source_planes, true, true, lambda, false);
         assert!(
             with.iter()
                 .any(|cell| cell.components.iter().any(|c| c.sao_type_idx == 1)),
