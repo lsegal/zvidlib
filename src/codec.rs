@@ -1,3 +1,4 @@
+use crate::seek::SeekPreviews;
 use crate::{
     AudioBuffer, Codec, ColorRange, Error, ErrorKind, FrameIndex, FrameSource, Limits, PixelFormat,
     Plane, Result, VideoDimensions, VideoFrame,
@@ -363,8 +364,34 @@ pub struct ExactFrameReader {
     /// on every sample.
     output_wanted: bool,
     next_decode_position: Option<usize>,
+    /// The fast tier a [`ExactFrameReader::seek`] answers from, when the caller has attached
+    /// one. It is shared with the pass that fills it, which runs on its own decoder.
+    seek_previews: Option<SeekPreviews>,
     limits: Limits,
     statistics: DecodeStatistics,
+}
+
+/// What a constant-time [`ExactFrameReader::seek`] could answer with.
+///
+/// A seek is a question about a position on the timeline, and it has to be answered now: the
+/// exact frame at an arbitrary point of a long group of pictures is a decode of every frame
+/// before it, which on a 1080p track is seconds rather than the 50 ms `ARCHITECTURE.md`
+/// section 3.2 allows. So a seek returns the best picture already decoded and the caller walks
+/// to the exact one behind it with [`ExactFrameReader::get`] if it still wants it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Seek {
+    /// The frame asked for, already decoded and cached. Nothing further is needed.
+    Exact(VideoFrame),
+    /// A picture of a different frame, the closest one the seek preview index holds.
+    Preview {
+        picture: VideoFrame,
+        /// The frame `picture` is actually of, which is within one preview stride of the frame
+        /// asked for once the pass has covered that part of the track.
+        frame: FrameIndex,
+    },
+    /// Nothing is decoded yet for anywhere near this position: no cached frame, and either no
+    /// preview index attached or an index whose pass has not produced a picture.
+    Pending,
 }
 
 /// What a caller wants out of a request, which is what decides whether the reader keeps the
@@ -447,9 +474,49 @@ impl ExactFrameReader {
             in_flight_since_reset: HashSet::new(),
             output_wanted: true,
             next_decode_position: None,
+            seek_previews: None,
             limits,
             statistics: DecodeStatistics::default(),
         })
+    }
+
+    /// Attaches (or, with `None`, detaches) the seek preview index [`Self::seek`] answers from.
+    ///
+    /// The index is normally filled by a [`SeekPreviewPass`] on a decoder of its own, and is
+    /// shared rather than owned so a reader can start answering seeks from it while the pass is
+    /// still walking the track.
+    ///
+    /// [`SeekPreviewPass`]: crate::seek::SeekPreviewPass
+    pub fn set_seek_previews(&mut self, previews: Option<SeekPreviews>) {
+        self.seek_previews = previews;
+    }
+
+    /// Answers "what is at this position of the timeline" without decoding anything.
+    ///
+    /// This is the seek path, and it is bounded by `ARCHITECTURE.md` section 3.2: it takes the
+    /// same time whichever position of whatever track it is asked about, because it only ever
+    /// looks at pictures that are already decoded. It reads the presentation cache first - a
+    /// seek back to somewhere the reader has just been is exact for nothing - and then the
+    /// attached seek preview index, and it returns [`Seek::Pending`] rather than blocking when
+    /// neither holds anything.
+    ///
+    /// Reaching the exact frame is [`Self::get`], which is unbounded by construction: the frame
+    /// depends on every frame back to its random-access point and they all have to be decoded.
+    /// A caller that wants both draws what this returns and walks to the exact frame behind it.
+    pub fn seek(&mut self, presentation_index: FrameIndex) -> Seek {
+        if let Some(frame) = self.cache.get(&presentation_index).cloned() {
+            self.statistics.cache_hits = self.statistics.cache_hits.saturating_add(1);
+            self.touch(presentation_index);
+            return Seek::Exact(frame);
+        }
+        match self
+            .seek_previews
+            .as_ref()
+            .and_then(|previews| previews.nearest_at(presentation_index))
+        {
+            Some((frame, picture)) => Seek::Preview { picture, frame },
+            None => Seek::Pending,
+        }
     }
 
     /// Returns exactly the requested presentation frame, and the frames behind it that the

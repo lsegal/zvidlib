@@ -29,6 +29,7 @@ pub mod mp4;
 pub mod mp4_demux;
 pub mod output;
 pub mod playback;
+pub mod seek;
 pub mod simd;
 pub mod timeline;
 pub mod transfer;
@@ -129,7 +130,7 @@ pub use codec::{
     AudioDrain, AudioEncoder, AudioEncoderFormat, AudioGapless, CancellationToken,
     CodecImplementation, CodecProfile, CodecSupport, DecodeStatistics, DecodedVideoFrame,
     EncodedSample, EncodedVideoSample, EncoderConfig, EncoderFuture, ExactFrameReader,
-    HardwarePreference, SampleDependency, TrackKind, VideoDecoder, VideoDecoderConfig,
+    HardwarePreference, SampleDependency, Seek, TrackKind, VideoDecoder, VideoDecoderConfig,
     VideoDecoderFactory, VideoEncoder, VideoEncoderConfig, VideoEncoderFactory, VideoEncoderFormat,
     uncompressed_video_decoder_factory,
 };
@@ -150,6 +151,9 @@ pub use playback::{
     AudioOutputBackend, AudioOutputKind, IndexedPresentationTimeline, NativeAudioOutput,
     PlaybackAudioOutput, PlaybackAudioSource, PlaybackController, PlaybackOptions,
     PlaybackVideoSource, Presentation, WebAudioOutput,
+};
+pub use seek::{
+    SEEK_LATENCY_BUDGET, SeekPreviewOptions, SeekPreviewPass, SeekPreviews, shrink_frame,
 };
 pub use timeline::{FrameIndex, FrameRate, Rational, SampleRange, Timeline};
 pub use transfer::{
