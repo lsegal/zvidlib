@@ -58,6 +58,19 @@ pub struct RefPlane<'a> {
     /// Row-major samples, `width * height` of them. `sample[ y * width + x ]`
     /// is the plane sample at full-sample location `( x, y )`.
     samples: &'a [i32],
+    /// The same samples again as `i16`, when the picture carries the
+    /// eight-bit mirror of this plane
+    /// ([`crate::hevc::engine::picture::Picture::narrow_plane`]).
+    ///
+    /// This is what lets [`RefPlane::row_window_narrow`] *borrow* a
+    /// narrow window instead of materializing one, which is the whole
+    /// difference between the phase cases that keep
+    /// [`simd::filter_taps_narrow`]'s advantage and the ones that spend
+    /// it on the conversion — see [`narrows`]. `None` is always safe:
+    /// the narrow path then converts per window exactly as it did
+    /// before, and [`narrows`] declines the phases where that costs more
+    /// than it saves.
+    narrow: Option<&'a [i16]>,
     /// Plane width in samples (`pic_width_in_luma_samples` for luma, or
     /// `pic_width_in_luma_samples / SubWidthC` for chroma).
     width: usize,
@@ -88,9 +101,61 @@ impl<'a> RefPlane<'a> {
         }
         Ok(Self {
             samples,
+            narrow: None,
             width,
             height,
         })
+    }
+
+    /// Wraps a plane that also carries the eight-bit `i16` mirror of its
+    /// own samples, so the 16-bit interpolation path can borrow narrow
+    /// windows out of it with no conversion at all.
+    ///
+    /// `narrow[ i ]` must equal `samples[ i ]` for every `i`, and every
+    /// sample must lie in `0..=`[`NARROW_MAX_SAMPLE`] — the mirror is a
+    /// representation of the same plane, not a second plane, and
+    /// [`crate::hevc::engine::picture::Picture::build_narrow_mirror`]
+    /// builds it only for eight-bit pictures. A picture without one
+    /// (higher bit depth, or still being reconstructed) uses
+    /// [`RefPlane::new`] and loses nothing but the borrow.
+    ///
+    /// # Errors
+    ///
+    /// The [`RefPlane::new`] errors, plus
+    /// [`InterPredError::PlaneLengthMismatch`] if the mirror's length
+    /// does not match the plane's.
+    pub fn with_narrow(
+        samples: &'a [i32],
+        narrow: &'a [i16],
+        width: usize,
+        height: usize,
+    ) -> Result<Self, InterPredError> {
+        let plane = Self::new(samples, width, height)?;
+        if narrow.len() != samples.len() {
+            return Err(InterPredError::PlaneLengthMismatch {
+                expected: samples.len(),
+                got: narrow.len(),
+            });
+        }
+        debug_assert!(
+            samples
+                .iter()
+                .all(|&s| (0..=i32::from(NARROW_MAX_SAMPLE)).contains(&s)),
+            "a narrow mirror was supplied for a plane that is not eight-bit"
+        );
+        Ok(Self {
+            narrow: Some(narrow),
+            ..plane
+        })
+    }
+
+    /// Whether this plane can hand [`simd::filter_taps_narrow`] its taps
+    /// without a materializing pass — i.e. whether it carries the `i16`
+    /// mirror [`RefPlane::with_narrow`] takes.
+    #[inline]
+    #[must_use]
+    fn borrows_narrow(&self) -> bool {
+        self.narrow.is_some()
     }
 
     /// The plane width in samples.
@@ -166,27 +231,37 @@ impl<'a> RefPlane<'a> {
         &scratch[..len]
     }
 
-    /// The [`RefPlane::row_window`] window of row `y`, narrowed into
-    /// `dst` for the 16-bit interpolation path.
+    /// [`RefPlane::copy_row`] narrowed to `i16` for the 16-bit
+    /// interpolation path.
     ///
     /// Converts straight out of the plane rather than staging through
-    /// [`RefPlane::row_window`]'s `i32` scratch: the narrow path already
+    /// [`RefPlane::copy_row`]'s `i32` scratch: the narrow path already
     /// has to write a buffer, so routing it through the wide one would
-    /// add a whole `i32` pass over the source that the wide path does
-    /// not pay — `row_window` borrows the plane outright when the window
-    /// lies inside it. `dst` must be at least `len` long.
+    /// add a whole `i32` pass over the source. When the plane carries
+    /// the `i16` mirror the inside case is a straight row copy out of
+    /// it, with no conversion at all.
     #[inline]
-    fn row_window_narrow(&self, x_start: i32, len: usize, y: i32, dst: &mut [i16]) {
+    fn copy_row_narrow(&self, x_start: i32, y: i32, dst: &mut [i16]) {
         let yc = y.clamp(0, self.height as i32 - 1) as usize;
         let base = yc * self.width;
-        if x_start >= 0 && (x_start as usize).saturating_add(len) <= self.width {
+        if x_start >= 0 && (x_start as usize).saturating_add(dst.len()) <= self.width {
             let start = base + x_start as usize;
-            narrow_samples(&self.samples[start..start + len], &mut dst[..len]);
+            match self.narrow {
+                Some(n) => dst.copy_from_slice(&n[start..start + dst.len()]),
+                None => narrow_samples(&self.samples[start..start + dst.len()], dst),
+            }
+            return;
+        }
+        let last = self.width as i32 - 1;
+        if let Some(n) = self.narrow {
+            let row = &n[base..base + self.width];
+            for (i, d) in dst.iter_mut().enumerate() {
+                *d = row[x_start.saturating_add(i as i32).clamp(0, last) as usize];
+            }
             return;
         }
         let row = &self.samples[base..base + self.width];
-        let last = self.width as i32 - 1;
-        for (i, d) in dst[..len].iter_mut().enumerate() {
+        for (i, d) in dst.iter_mut().enumerate() {
             let s = row[x_start.saturating_add(i as i32).clamp(0, last) as usize];
             debug_assert!(
                 (0..=i32::from(NARROW_MAX_SAMPLE)).contains(&s),
@@ -196,12 +271,46 @@ impl<'a> RefPlane<'a> {
         }
     }
 
+    /// [`RefPlane::row_window`] for the 16-bit interpolation path: a
+    /// `len`-sample window of row `y` starting at column `x_start`, as
+    /// `i16`.
+    ///
+    /// **Borrowed straight out of the plane's `i16` mirror** when the
+    /// plane carries one ([`RefPlane::with_narrow`]) and the window lies
+    /// wholly inside it — the case that makes the narrow path worth
+    /// taking for the phases that reach their taps a row at a time,
+    /// because it is then exactly as free as the wide `row_window`
+    /// borrow it replaces. Without a mirror, or across an edge, it is
+    /// materialized into `scratch`, which is what the wide path never
+    /// has to do and what [`narrows`] prices. `scratch` must be at least
+    /// `len` long.
+    #[inline]
+    fn row_window_narrow<'s>(
+        &'s self,
+        x_start: i32,
+        len: usize,
+        y: i32,
+        scratch: &'s mut [i16],
+    ) -> &'s [i16] {
+        match self.narrow {
+            Some(n) if x_start >= 0 && (x_start as usize).saturating_add(len) <= self.width => {
+                let yc = y.clamp(0, self.height as i32 - 1) as usize;
+                let start = yc * self.width + x_start as usize;
+                &n[start..start + len]
+            }
+            _ => {
+                self.copy_row_narrow(x_start, y, &mut scratch[..len]);
+                &scratch[..len]
+            }
+        }
+    }
+
     /// [`RefPlane::gather`] narrowed to `i16` for the 16-bit
     /// interpolation path.
     fn gather_narrow(&self, x0: i32, y0: i32, w: usize, h: usize) -> Vec<i16> {
         let mut buf = vec![0i16; w * h];
         for (r, row) in buf.chunks_exact_mut(w).enumerate() {
-            self.row_window_narrow(x0, w, y0 + r as i32, row);
+            self.copy_row_narrow(x0, y0 + r as i32, row);
         }
         buf
     }
@@ -515,15 +624,15 @@ fn interp_block<const N: usize>(
         w,
         h,
         bit_depth,
-        narrows(isa, bit_depth, w, hk.is_none() && vk.is_some()),
+        narrows(isa, plane, bit_depth, w, hk.is_some(), vk.is_some()),
     )
 }
 
 /// Whether [`interp_block`] takes the 16-bit accumulation for this
-/// backend, `bit_depth`, block width and phase.
+/// backend, plane, `bit_depth`, block width and phase.
 ///
-/// Four conditions, and the narrow path is only faster when all of them
-/// hold:
+/// Three conditions hold for every phase, and a fourth separates the
+/// phases from each other:
 ///
 /// * **Eight-bit content.** The 16-bit accumulator is only in range
 ///   there: `shift1` is zero, so the tap accumulation is bounded by
@@ -537,27 +646,55 @@ fn interp_block<const N: usize>(
 ///   the 16-bit vector loop at all: `simd::measure_narrow_filter_taps`
 ///   reads 0.96x at a row of four, where the whole call is the widening
 ///   remainder plus the cost of having narrowed the source for it.
-/// * **The vertical-only phase**, and this is the one that is about the
-///   caller rather than the kernel. `measure_narrow_vs_wide_block` reads
-///   the vertical-only phase at 1.08x to 1.77x and the horizontal-only
-///   and two-dimensional phases at 0.82x to 1.11x, and the difference is
-///   not the kernel — it is the same kernel — but who pays to narrow the
-///   source. The vertical-only case reaches its source through
-///   [`RefPlane::gather`], which materializes a `w x ( h + N − 1 )`
-///   buffer either way, so writing it as `i16` instead of `i32` is free
-///   and the kernel's 1.85x lands intact. The other two reach theirs
-///   through [`RefPlane::row_window`], which **borrows the plane with no
-///   copy at all** whenever the window lies inside it — the common case
-///   — so narrowing has to add a whole materialized pass the wide path
-///   never performs, and that pass costs about what the wider lanes
-///   save. The two-dimensional case is worse again, because only its
-///   horizontal pass can use the narrowing: its vertical pass multiplies
-///   a 16-bit intermediate by a coefficient of up to 58, needs a 32-bit
-///   accumulator, and on every vector unit here that is the same lane
-///   count the `i32` kernel already issues.
+/// * **The source is reached narrow without a materializing pass**, and
+///   this is the one that is about the caller rather than the kernel.
+///   Issue #404 measured the same kernel at 1.89x in isolation keeping
+///   its advantage only on the vertical-only phase, because that phase
+///   reaches its source through [`RefPlane::gather`], which materializes
+///   a `w x ( h + N − 1 )` buffer either way — so writing it as `i16`
+///   instead of `i32` is free. The horizontal-only and two-dimensional
+///   phases reach theirs through [`RefPlane::row_window`], which borrows
+///   the plane with no copy at all whenever the window lies inside it,
+///   so narrowing per block had to add a pass the wide path never
+///   performs and that pass cost about what the wider lanes saved.
+///
+///   Issue #427 removed that pass rather than paying it: a picture that
+///   carries the `i16` mirror of its own planes
+///   ([`crate::hevc::engine::picture::Picture::build_narrow_mirror`],
+///   built once when the picture becomes a reference) lets
+///   [`RefPlane::row_window_narrow`] borrow narrow exactly as
+///   `row_window` borrows wide. So these two phases narrow when — and
+///   only when — the plane carries that mirror, which
+///   [`RefPlane::borrows_narrow`] answers. Without one they behave as
+///   #404 left them.
+///
+/// The two-dimensional phase gains less than the horizontal-only one for
+/// a reason no plane representation reaches: only its horizontal pass
+/// can use the narrowing at all. Its vertical pass multiplies a 16-bit
+/// intermediate by a coefficient of up to 58, needs a 32-bit
+/// accumulator, and on every vector unit here that is the same lane
+/// count the `i32` kernel already issues.
 #[inline]
-fn narrows(isa: Isa, bit_depth: u8, w: usize, vertical_only: bool) -> bool {
-    bit_depth == 8 && isa != Isa::Scalar && w >= 8 && vertical_only
+fn narrows(
+    isa: Isa,
+    plane: &RefPlane<'_>,
+    bit_depth: u8,
+    w: usize,
+    horizontal: bool,
+    vertical: bool,
+) -> bool {
+    if bit_depth != 8 || isa == Isa::Scalar || w < 8 {
+        return false;
+    }
+    match (horizontal, vertical) {
+        // Full-pel: no tap accumulation to narrow.
+        (false, false) => false,
+        // Vertical-only: `gather` materializes either way.
+        (false, true) => true,
+        // Horizontal-only and two-dimensional: only worth it when the
+        // window arrives narrow for free.
+        _ => plane.borrows_narrow(),
+    }
 }
 
 /// [`interp_block`] with the 16-bit accumulation forced on or off.
@@ -601,8 +738,9 @@ fn interp_block_with_width<const N: usize>(
                 let hk16: [i16; N] = std::array::from_fn(|t| hk[t] as i16);
                 let mut win = vec![0i16; span];
                 for y in 0..h {
-                    plane.row_window_narrow(x_int - halo, span, y_int + y as i32, &mut win);
-                    let taps: [&[i16]; N] = std::array::from_fn(|t| &win[t..t + w]);
+                    let src =
+                        plane.row_window_narrow(x_int - halo, span, y_int + y as i32, &mut win);
+                    let taps: [&[i16]; N] = std::array::from_fn(|t| &src[t..t + w]);
                     simd::filter_taps_narrow(
                         isa,
                         &taps,
@@ -674,13 +812,13 @@ fn interp_block_with_width<const N: usize>(
                 let hk16: [i16; N] = std::array::from_fn(|t| hk[t] as i16);
                 let mut win = vec![0i16; span];
                 for row in 0..rows {
-                    plane.row_window_narrow(
+                    let src = plane.row_window_narrow(
                         x_int - halo,
                         span,
                         y_int - halo + row as i32,
                         &mut win,
                     );
-                    let taps: [&[i16]; N] = std::array::from_fn(|t| &win[t..t + w]);
+                    let taps: [&[i16]; N] = std::array::from_fn(|t| &src[t..t + w]);
                     simd::filter_taps_narrow(
                         isa,
                         &taps,

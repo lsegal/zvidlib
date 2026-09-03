@@ -627,20 +627,22 @@ fn build_list_prediction<'a>(
     list: &ResolvedList<'a>,
     chroma_array_type: u8,
 ) -> Result<ListPrediction<'a>, ReconError> {
+    // A finished reference picture carries the `i16` mirror of its own
+    // planes (§8.5.3.3.3's 16-bit interpolation path borrows its tap
+    // windows straight out of it — issue #427); one still being
+    // reconstructed, which is the §8.3.4 currPic snapshot, does not, and
+    // `RefPlane::new` is then exactly what it always was.
+    let plane_of = |plane, w, h| match list.ref_pic.narrow_plane(plane) {
+        Some(narrow) => RefPlane::with_narrow(list.ref_pic.plane(plane), narrow, w, h),
+        None => RefPlane::new(list.ref_pic.plane(plane), w, h),
+    };
     let (lw, lh) = list.ref_pic.plane_dims(Plane::Luma);
-    let lp =
-        RefPlane::new(list.ref_pic.plane(Plane::Luma), lw, lh).map_err(ReconError::InterPred)?;
+    let lp = plane_of(Plane::Luma, lw, lh).map_err(ReconError::InterPred)?;
     let (cb, cr) = if chroma_array_type != 0 {
         let (cw, ch) = list.ref_pic.plane_dims(Plane::Cb);
         (
-            Some(
-                RefPlane::new(list.ref_pic.plane(Plane::Cb), cw, ch)
-                    .map_err(ReconError::InterPred)?,
-            ),
-            Some(
-                RefPlane::new(list.ref_pic.plane(Plane::Cr), cw, ch)
-                    .map_err(ReconError::InterPred)?,
-            ),
+            Some(plane_of(Plane::Cb, cw, ch).map_err(ReconError::InterPred)?),
+            Some(plane_of(Plane::Cr, cw, ch).map_err(ReconError::InterPred)?),
         )
     } else {
         (None, None)
