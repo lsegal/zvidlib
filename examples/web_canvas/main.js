@@ -176,7 +176,9 @@ async function main() {
       // The pass spaces previews by the source's frame rate, which the first frame's duration
       // gives; a track whose durations are unreadable never got this far.
       const framesPerSecond = 1000 / (frameStarts[1] - frameStarts[0] || 1000 / 24);
-      previews = await video.previews(new PreviewOptions(framesPerSecond));
+      const previewOptions = new PreviewOptions(framesPerSecond);
+      previews = await video.previews(previewOptions);
+      previewOptions.free();
       lines.push(
         `Seek previews: ${previews.total} positions, ${previews.stride} frames apart, filling in the background.`,
       );
@@ -225,6 +227,10 @@ async function main() {
     if (!preview) return;
     const picture = preview.picture;
     uploadFrame(picture.pixels, picture.width, picture.height);
+    // A drag asks for one of these per pointer sample, so the wasm-side copies are released
+    // rather than left for the finalizer to find.
+    picture.free();
+    preview.free();
     const elapsed = performance.now() - started;
     worstPreviewMs = Math.max(worstPreviewMs, elapsed);
     if (seekLatency) {
