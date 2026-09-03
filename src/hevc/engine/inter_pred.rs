@@ -347,6 +347,29 @@ impl<'a> RefPlane<'a> {
 /// (`88 · 511 = 44968`).
 const NARROW_MAX_SAMPLE: u8 = 255;
 
+/// The block width below which [`narrows`] is false for every phase,
+/// because a shorter row never reaches [`simd::filter_taps_narrow`]'s
+/// 16-bit vector loop at all.
+///
+/// Structural rather than measured: below this the whole call is the
+/// widening remainder plus the cost of having narrowed the source for
+/// it, which `simd::measure_narrow_filter_taps` reads at 0.96x at a row
+/// of four. It is also the minimum the vertical-only phase uses, on the
+/// four-host measurement issue #440 settled — see [`narrows`].
+const NARROW_MIN_WIDTH: usize = 8;
+
+/// The block width below which [`narrows`] is false for the
+/// horizontal-only and two-dimensional phases, which only narrow at all
+/// out of a plane that [borrows narrow][RefPlane::borrows_narrow].
+///
+/// Higher than [`NARROW_MIN_WIDTH`] on the measurement issue #452 took:
+/// at 8x8 those two phases read 0.88x-1.04x mirrored on every host and
+/// backend measured, at 16x16 they straddle parity (0.91x-1.14x, with
+/// `avx2` below it on all three x86_64 hosts and `neon` and `sse4.1`
+/// above), and 32x32 is the first width where every reading is a win
+/// (1.06x-1.34x). See [`narrows`] and `benches/README.md`.
+const NARROW_MIN_WIDTH_MIRRORED: usize = 32;
+
 /// Copies eight-bit plane samples into a 16-bit buffer for
 /// [`simd::filter_taps_narrow`].
 ///
@@ -641,8 +664,9 @@ fn interp_block<const N: usize>(
 /// Whether [`interp_block`] takes the 16-bit accumulation for this
 /// backend, plane, `bit_depth`, block width and phase.
 ///
-/// Three conditions hold for every phase, and a fourth separates the
-/// phases from each other:
+/// Two conditions hold for every phase, a third separates the phases
+/// from each other, and the width bound is read off that third one
+/// rather than being a single number:
 ///
 /// * **Eight-bit content.** The 16-bit accumulator is only in range
 ///   there: `shift1` is zero, so the tap accumulation is bounded by
@@ -666,11 +690,15 @@ fn interp_block<const N: usize>(
 ///   predicts, but above parity on all three, so the condition stays
 ///   `isa != Isa::Scalar` rather than being cut back to the backend it
 ///   was first measured on.
-/// * **A row of at least eight samples.** A shorter row never reaches
-///   the 16-bit vector loop at all: `simd::measure_narrow_filter_taps`
+/// * **A row wide enough for the phase**, which is
+///   [`NARROW_MIN_WIDTH`] for the vertical-only phase and
+///   [`NARROW_MIN_WIDTH_MIRRORED`] for the two that need a plane
+///   borrowing narrow. A row shorter than eight never reaches
+///   the 16-bit vector loop at all on any phase:
+///   `simd::measure_narrow_filter_taps`
 ///   reads 0.96x at a row of four, where the whole call is the widening
 ///   remainder plus the cost of having narrowed the source for it.
-///   Eight itself is the width the bound is actually decided at, and
+///   Eight itself is the width the vertical-only bound is decided at, and
 ///   #435 left it resting on a single NEON reading of 1.37x while its
 ///   own x86 host — an i9-10850K — read the same cell at 1.00-1.02x
 ///   (`sse4.1`) and 0.95-0.97x (`avx2`), which looked like a case for
@@ -686,8 +714,29 @@ fn interp_block<const N: usize>(
 ///   any vector lanes. A per-backend minimum of 16 for `Avx2` would
 ///   have been drawn from the one host of four where AVX2 is weakest at
 ///   this width and would have cost the others what they read there, so
-///   the bound stays a single `w >= 8`, now with a figure from `neon`,
+///   the vertical-only bound stays `w >= 8`, with a figure from `neon`,
 ///   `sse4.1` and `avx2` across four hosts behind it.
+///
+///   **The other two phases are not decided at eight, and #452 is why
+///   they no longer share that number.** #440's sweep read them too, in
+///   the mirrored arrangement that is the only one they narrow in at
+///   all, and there the 8x8 cell is not a host disagreement but an
+///   agreement: 0.88x / 0.92x on the i9-10850K, 1.04x / 0.99x
+///   (`sse4.1`) and 0.95x / 0.95x (`avx2`) on the Xeon 6973P-C,
+///   0.95-0.96x / 0.97-0.98x and 0.89-0.91x / 0.91-0.92x on the
+///   i7-8700B, and 0.97-1.01x / 0.91-0.97x on an Apple M1 (`neon`,
+///   added by #452, since every earlier mirrored reading was x86_64).
+///   Four hosts, three backends, **not one reading above 1.04x** —
+///   where the vertical-only phase at the same width spans 0.95x to
+///   1.67x and is above parity on most of them. At 16x16 the two phases
+///   straddle parity, 0.91x-1.14x, and the split there is by backend
+///   (`avx2` at or below it on all three x86_64 hosts, `neon` and
+///   `sse4.1` above), which is the shape #440 refused to encode as a
+///   per-backend threshold. 32x32 is the first width where every host
+///   and every backend reads a win, 1.06x-1.34x, so
+///   [`NARROW_MIN_WIDTH_MIRRORED`] is 32 and the width bound became
+///   phase-dependent rather than staying one number justified from one
+///   phase's readings.
 /// * **The source is reached narrow without a materializing pass**, and
 ///   this is the one that is about the caller rather than the kernel.
 ///   Issue #404 measured the same kernel at 1.89x in isolation keeping
@@ -718,7 +767,11 @@ fn interp_block<const N: usize>(
 ///   every plane the decoder builds, and these two phases behave as #404
 ///   left them — with both arms still spelled out below, and the
 ///   condition that separates them named rather than implied, so the
-///   measurement stays reproducible.
+///   measurement stays reproducible. What #452 changed is the width at
+///   which they *would* narrow once a mirror existed: the bullet above
+///   settles that at [`NARROW_MIN_WIDTH_MIRRORED`] rather than at the
+///   vertical-only phase's eight, so a future mirror does not inherit a
+///   bound that was never measured for these two phases.
 ///
 /// The two-dimensional phase gains less than the horizontal-only one for
 /// a reason no plane representation reaches: only its horizontal pass
@@ -736,11 +789,12 @@ fn narrows(
     vertical: bool,
 ) -> bool {
     // The 16-bit accumulator is only in range at eight bits, and a row
-    // shorter than eight samples never reaches the vector loop at all —
-    // `interp_block_with_width` asserts both. An override chooses between
-    // the two arms inside that range and cannot take the narrow one
-    // outside it.
-    let in_range = bit_depth == 8 && w >= 8;
+    // shorter than `NARROW_MIN_WIDTH` never reaches the vector loop at
+    // all — `interp_block_with_width` asserts both. An override chooses
+    // between the two arms inside that range and cannot take the narrow
+    // one outside it, so the per-phase minimum below is not part of it:
+    // that one is about what a width is worth, not about what it means.
+    let in_range = bit_depth == 8 && w >= NARROW_MIN_WIDTH;
     match narrow_interp::override_value() {
         Some(narrow) => narrow && in_range,
         None => {
@@ -749,11 +803,13 @@ fn narrows(
                 && match (horizontal, vertical) {
                     // Full-pel: no tap accumulation to narrow.
                     (false, false) => false,
-                    // Vertical-only: `gather` materializes either way.
+                    // Vertical-only: `gather` materializes either way, so
+                    // the structural minimum is also the useful one.
                     (false, true) => true,
                     // Horizontal-only and two-dimensional: only worth it
-                    // when the window arrives narrow for free.
-                    _ => plane.borrows_narrow(),
+                    // when the window arrives narrow for free, and then
+                    // only from `NARROW_MIN_WIDTH_MIRRORED` up.
+                    _ => plane.borrows_narrow() && w >= NARROW_MIN_WIDTH_MIRRORED,
                 }
         }
     }
@@ -845,7 +901,7 @@ fn interp_block_with_width<const N: usize>(
     bit_depth: u8,
     narrow: bool,
 ) -> Vec<i32> {
-    debug_assert!(!narrow || (bit_depth == 8 && w >= 8));
+    debug_assert!(!narrow || (bit_depth == 8 && w >= NARROW_MIN_WIDTH));
     let shift1 = interp_shift1(bit_depth);
     let halo = N as i32 / 2 - 1;
     let span = w + N - 1;
