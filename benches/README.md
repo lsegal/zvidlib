@@ -869,15 +869,16 @@ multiply, so doubling to sixteen `i16` lanes has proportionally less of the
 block's remaining cost to remove, while SSE4.1 goes four to eight exactly as
 NEON does and lands nearer NEON's figure.
 
-**At a block width of eight the x86 win is gone.** The vertical-only phase reads
-1.00-1.02x on `sse4.1` and **0.95-0.97x on `avx2`** at 8x8, where NEON reads
-1.37x — reproducibly, and the corresponding row-8 kernel reading is marginal on
-AVX2 too (0.95-1.13x above). `narrows` admits those blocks on its `w >= 8`
-condition, which is a NEON reading. This is a real gap in the evidence for a
-*different* condition than the one #435 set out to settle, it costs at most a
-few percent of one phase of one stage on the width where it is wrong, and
-tightening it means making the threshold instruction-set-dependent — so it is
-filed as **#440** rather than changed here on one host's draw.
+**At a block width of eight this host's win is gone, and that turned out to be
+about the host.** The vertical-only phase reads 1.00-1.02x on `sse4.1` and
+**0.95-0.97x on `avx2`** at 8x8, where NEON reads 1.37x — reproducibly, to
+±0.02x across the three invocations, and the corresponding row-8 kernel reading
+is marginal on AVX2 too (0.95-1.13x above). `narrows` admits those blocks on its
+`w >= 8` condition, which was a NEON reading, so #440 was filed to re-take the
+8x8 cell elsewhere before making the threshold instruction-set-dependent on one
+host's draw. Two more x86_64 hosts disagree with this one, in opposite
+directions, and **#440: the width threshold on two more x86_64 hosts** below is
+that measurement and what it settles.
 
 Same kernel in all three rows, at 1.89x to 2.1x in isolation, and only the
 middle row keeps any of it. **What separates them is who pays to narrow the source.** The
@@ -901,7 +902,11 @@ condition now stands on a measurement from each of the three backends it admits
 rather than from NEON alone: `neon` 1.22-1.43x, `sse4.1` 1.12-1.31x and `avx2`
 1.05-1.12x on the phase it routes, against a `scalar` control that is a loss at
 every row length on both hosts. It is therefore kept as `isa != Isa::Scalar`
-rather than narrowed to the backends #378 happened to measure. Both arms stay
+rather than narrowed to the backends #378 happened to measure. The **"a row of
+at least eight samples"** condition stands on the four hosts of #440 below
+rather than on NEON alone, and stays a single `w >= 8` rather than becoming
+per-backend, because what varies at that width is the host and not the
+instruction set. Both arms stay
 spelled out inside `interp_block_with_width` rather than one of them being
 deleted, the same arrangement `measure_2d_ring_vs_flat` uses, so the tables above
 stay reproducible after the decision they justify.
@@ -922,6 +927,84 @@ separate benchmark processes on this host disagree with each other by more than
 the effect. The committed `hevc_inter_pred` and `inter_pred_filter` rows are
 therefore left as they stand rather than redrawn from measurements that cannot
 resolve the change.
+
+##### #440: the width threshold on two more x86_64 hosts
+
+The block table above leaves `narrows`'s `w >= 8` condition resting on one
+instruction set in one direction and one host in the other: NEON reads 8x8
+vertical-only at 1.37x, and the i9-10850K reads it at 1.00-1.02x (`sse4.1`) and
+0.95-0.97x (`avx2`). Issue #440 asked for that cell on at least one more x86_64
+host with a different microarchitecture before the threshold was made
+instruction-set-dependent. It was taken on two, through the CI runner pool,
+which is where `benches/README.md`'s other multi-model x86_64 readings come
+from — three consecutive invocations of the same binary per host, the same
+in-process interleaved best-of-fifteen instrument, the arms asserted equal
+sample-for-sample before anything is timed.
+
+On an **AMD EPYC 7763 (Zen 3, `ubuntu-latest`)**:
+
+| Phase | backend | 8x8 | 16x16 | 32x32 | 64x64 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| horizontal-only (a/b/c) | `sse4.1` | 0.87x | 0.87-0.88x | 1.05x | 1.09-1.10x |
+| horizontal-only (a/b/c) | `avx2` | 0.83-0.84x | 0.77-0.79x | 0.81-0.82x | 0.95-0.96x |
+| vertical-only (d/h/n) | `sse4.1` | 1.06x | 1.09-1.11x | 1.21-1.22x | 1.23-1.24x |
+| vertical-only (d/h/n) | `avx2` | 1.01x | 1.05x | 1.07x | 1.03-1.07x |
+| two-dimensional | `sse4.1` | 0.87x | 0.92x | 1.02-1.03x | 1.04-1.05x |
+| two-dimensional | `avx2` | 0.83x | 0.86-0.87x | 0.87x | 0.96x |
+
+And on an **Intel Core i7-8700B (Coffee Lake, `macos-15-intel`)**:
+
+| Phase | backend | 8x8 | 16x16 | 32x32 | 64x64 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| horizontal-only (a/b/c) | `sse4.1` | 0.81-1.03x | 0.78-0.90x | 1.04-1.06x | 1.24-1.26x |
+| horizontal-only (a/b/c) | `avx2` | 0.79-0.80x | 0.84-0.93x | 0.96-0.99x | 1.10-1.11x |
+| vertical-only (d/h/n) | `sse4.1` | 1.52-1.63x | 1.32-1.40x | 1.44-1.48x | 1.59-1.62x |
+| vertical-only (d/h/n) | `avx2` | 1.44-1.57x | 1.30-1.31x | 1.38-1.39x | 1.47x |
+| two-dimensional | `sse4.1` | 0.86-0.87x | 0.93-0.94x | 1.03x | 1.11-1.14x |
+| two-dimensional | `avx2` | 0.86-0.89x | 0.90x | 0.98-0.99x | 1.05-1.07x |
+
+**The AVX2 loss at 8x8 does not reproduce, and the disagreement is between hosts
+rather than between instruction sets.** On the same `avx2` backend the 8x8
+vertical-only cell reads 0.95-0.97x on the i9-10850K, **1.01x** on the EPYC 7763
+and **1.44-1.57x** on the i7-8700B — the last being the largest win anywhere in
+any of these tables, larger than NEON's 1.37x. `sse4.1` spans the same width the
+same way: 1.00-1.02x, 1.06x, 1.52-1.63x. A per-backend minimum width of 16 for
+`Avx2` would have been drawn from the one host of the three where AVX2 is worst
+at that width, and would have cost the i7-8700B a 1.5x. So the answer is issue
+#440's second branch: **the numbers are recorded and `w >= 8` stands.**
+
+**What the 8x8 row is actually sensitive to is the fixed per-call cost, which is
+a host property.** Every cell of this sweep does the same total sample work —
+`calls` is `(1 << 22) / (w * h)` — so the 8x8 column makes 64 times as many
+`interp_block` calls as the 64x64 one, and per-call overhead that is invisible
+at 64x64 dominates there. The vertical-only arm's per-call work is a
+`RefPlane::gather` into a `w x ( h + 7 )` buffer plus an allocation, and both
+arms pay it; what the narrow arm changes is that the buffer is half the bytes.
+How much that is worth depends on the host's allocator and store bandwidth
+rather than on its vector width, which is why the three x86_64 hosts spread
+across 0.95x to 1.57x on one backend at one width while agreeing to within
+±0.02x with themselves. The 16x16-and-up cells, where the kernel rather than the
+per-call cost dominates, are the ones that agree across hosts, and they are
+above parity on every backend on all four hosts.
+
+**The instrument is the same one, and its within-host resolution holds on the
+runners.** The EPYC's three invocations agree to **±0.01x** on every cell of all
+24 rows. The i7-8700B is the noisier of the two — it is the only host whose
+spread exceeds ±0.05x anywhere, and its widest cells are the horizontal-only
+8x8 and 16x16 `sse4.1` readings, where a slow first invocation (22.14 ms against
+the 17.4 ms the other two read on the `i32` arm) inflates the range; its
+vertical-only rows still span at most 0.13x and never approach parity. A shared
+CI runner is a worse host than a quiet desktop, and the tables above are
+reported as ranges for that reason, but the effect being read at 8x8 is 50%
+against a spread of 13% and does not need a better one.
+
+**No routing changed and no decoded sample moved.** `narrows` keeps
+`bit_depth == 8 && w >= 8`, its four conditions and its override;
+`every_backend_matches_scalar_filter_taps_narrow`,
+`every_backend_matches_scalar_luma_block` and
+`the_eight_bit_block_path_matches_the_per_sample_equations` are untouched and
+passing. What changed is that the width condition now cites a measurement from
+`neon`, `sse4.1` and `avx2` across four hosts instead of one NEON reading.
 
 ##### #426: the same question, on an instrument with a null control in it
 
