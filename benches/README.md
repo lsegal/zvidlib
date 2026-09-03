@@ -1099,6 +1099,27 @@ understates a spread it has barely sampled. The floor is only as trustworthy as
 the round count behind it, and a lower one obtained by shortening the run is an
 artefact rather than a tightening.
 
+**Issue #438 moved that from prose into the instrument, because a trap only
+this document knows about is one the output still sets.** `--pair` now prints
+the round count beside every ratio and every floor — `the 4.43% floor this
+instrument reaches on this host over 21 rounds` — and below
+`hevc_decode_profile::paired::MIN_FLOOR_ROUNDS` it prints **no floor at all**,
+the way the arms already refuse to report a ratio with no control behind it.
+The minimum is the fewest rounds at which two readings fall beyond *each* end of
+the interquartile band, which is 8. Below it the band's end is the run's own
+second-most-extreme reading, so the band is the whole range with one reading
+shaved off each side and it moves by a whole reading whenever a single round
+lands differently: the 5-round draw's 3.36% is one round's placement, not a
+spread. `paired::floor` returns `None` there and the run reports the effect as
+*unbounded* rather than as small — which is the honest reading, since an
+unmeasured floor bounds nothing. Nothing about the statistic above the minimum
+changed: the floor is still the widest the control misses 1.0000x anywhere in
+its band, the five draws above stand as taken, and the default `--rounds 12`
+clears the minimum, so an ordinary run reports exactly what it always did.
+`hevc::engine::profile::paired`'s unit tests pin the derivation of the minimum,
+the unchanged band and floor definitions, and the refusal itself, so the trap
+is now a test rather than a paragraph.
+
 **Raising the process priority is the one lever that helped, and only to the
 median.** Draw 2 put the control median within **0.31%** of 1.0000x — the ~1%
 the issue asked for — while its interquartile band stayed at [0.9615, 1.0443].
@@ -1128,6 +1149,121 @@ sides would be the narrow formulation.
 Neither the decoded output nor any kernel changed in the course of this, so the
 sweep, the `hevc_inter_pred` ratio and the `inter_pred_filter` ms/frame rows
 above stand as re-measured.
+
+#### The plane representation behind that table, and what it costs
+
+The section above ends on a caller, so issue #427 asked the question the caller
+raises: `row_window` borrows the plane because the plane is `i32` and so are the
+taps. **If an eight-bit plane carried its samples as `i16`, `row_window` would
+borrow narrow, the materializing pass would not exist, and the two phases that
+lose to it should pick up what the vertical-only phase already shows.** That is
+issue #378's own first bullet — "decide whether the plane representation can be
+narrowed to `i16` for eight-bit content" — which #404 answered only at the
+kernel boundary.
+
+**The premise is right.** `RefPlane` now takes an optional `i16` mirror of the
+plane it wraps (`RefPlane::with_narrow`), and `row_window_narrow` borrows out of
+it exactly as `row_window` borrows out of the `i32` samples.
+`measure_narrow_vs_wide_block` grew a third arm so the two representations are
+timed against the same `i32` baseline in one interleaved process, all three
+asserted equal sample-for-sample first. Since #435 that sweep also walks every
+vector backend the host offers, so the table below is the `avx2` column of it.
+On an **Intel Core i9-10850K (Windows, AVX2, `rustc 1.98.0`)**, best of fifteen
+rounds:
+
+| Phase | 8x8 | 16x16 | 32x32 | 64x64 |
+| --- | ---: | ---: | ---: | ---: |
+| horizontal-only, mirrored plane | 0.88x | 0.95x | **1.18x** | **1.27x** |
+| horizontal-only, copied per block (#404) | 0.76x | 0.80x | 0.90x | 0.93x |
+| vertical-only, mirrored plane | 1.01x | 1.14x | 1.19x | 1.36x |
+| vertical-only, `gather` narrowed (#404) | 0.99x | 1.09x | 1.13x | 1.12x |
+| two-dimensional, mirrored plane | 0.92x | 0.97x | 1.09x | 1.12x |
+| two-dimensional, copied per block (#404) | 0.81x | 0.85x | 0.93x | 0.96x |
+
+The horizontal-only row moves from 0.90x / 0.93x to **1.18x / 1.27x** at the two
+sizes carrying 93% of a decode's interpolated luma samples, with no kernel
+touched and no decoded sample moved: same block walk, same
+`simd::filter_taps_narrow`, one representation of the source instead of the
+other. The two-dimensional row moves too but less, for the reason #404 already
+gave — only its horizontal pass can narrow. Even the vertical-only row picks up
+a little, because `gather_narrow` becomes an `i16`-to-`i16` row copy rather than
+a converting one.
+
+**And the mirror costs more than that is worth.** It has to be written, once per
+picture, and every decoded picture is stored as a short-term reference, so the
+accounting is one write against one frame of interpolation.
+`measure_narrow_mirror_amortization` prices a *picture* on each arm over a 1080p
+luma plane: a frame's worth of prediction units at the measured `INTER_PU_MIX`
+size mix (62.1% of samples at 64x64, 31.1% at 32x32) walking all sixteen Table
+8-8 phase combinations in turn, with the mirror's own write charged to the arms
+that need one.
+
+Read as a best-of-many it flipped sign between invocations — 0.95x in one and
+1.04x in the next — which is #426's finding about this host arriving again, so
+the instrument is #426's: **five arms paired within each round, rotating which
+runs first, median of the per-round ratios with an interquartile band, and a
+null control whose true answer is exactly 1.0000x**. Thirty paired rounds per
+invocation, four invocations, Intel Core i9-10850K:
+
+| Arm (`i32` / arm, per picture) | median over four invocations |
+| --- | ---: |
+| second `i32` arm — **null control, true 1.0000x** | 1.0000x to 1.0599x |
+| mirror written into a fresh `Vec` | **0.79x to 0.87x** |
+| mirror written into a buffer that already exists | **0.91x to 0.95x** |
+| mirror already there, its write charged to nobody | 1.04x to 1.11x |
+
+Both arms that pay for the mirror sit **below the control in every invocation**,
+and the fresh-`Vec` arm by far more than the control's own 0.0% to 5.9% miss.
+Writing the mirror in isolation reads 1.17-1.54 ms into a fresh four-megabyte
+`Vec` — faulted in a page at a time — and 0.51-0.73 ms into one that already
+exists, which only a recycled picture buffer would reach. The bottom row is the
+ceiling the other two are buying and cannot reach: even charged to nobody the
+mirror is worth **4% to 11% of a frame's interpolation**, and writing it costs
+more than that.
+
+The ceiling is low for a reason the per-phase table predicts rather than
+contradicts. Uniformly over Table 8-8, three of sixteen phase combinations are
+horizontal-only, three vertical-only (which already narrowed), nine
+two-dimensional (which gains about a tenth) and one full-pel (which does not
+filter), so the per-phase ratios weight out to under a tenth of the stage. And
+that is the favourable half of the accounting: mirroring the chroma planes adds
+another half a luma plane's worth of writing for a 4-tap filter on quarter-sized
+blocks, against a plane set already 50% larger in memory for carrying two
+representations of every eight-bit sample.
+
+**The section above bounds what that would have been worth even if the mirror
+were free.** #426's paired instrument puts the whole-decode effect of the narrow
+path at smaller than about 4% on this host and not distinguishable from zero. The
+unpriced ceiling here is 4% to 11% of a stage that is about 27% of decode proper,
+so it is 1% to 3% of a decode — inside that floor, on the arm where the mirror
+costs nothing. The mirror is therefore not a change this host could resolve end
+to end even in the accounting that ignores what it costs to write, which is the
+other reason the decision rests on the in-process A/Bs above rather than on a
+whole-decode draw.
+
+**So the decoder keeps its `i32` planes and `narrows` keeps #404's routing.**
+`RefPlane::with_narrow` is `#[cfg(test)]` apparatus, as `measure_2d_ring_vs_flat`
+keeps the ring arm and #420 keeps its five rect kernels, so the table above stays
+reproducible after the decision it justifies; `narrows` names the condition that
+separates the phases — whether the window arrives narrow without a pass — rather
+than naming the phases, so what was measured is what the code says. Nothing in
+`benches/` changes: no dispatch site moved and no decoded sample moved, which
+`the_eight_bit_block_path_matches_the_per_sample_equations` now checks over
+*both* plane representations against the normative per-sample equations, and
+`a_mirrored_reference_plane_decodes_the_same_samples` checks over every block
+shape, origin, phase and backend.
+
+The remaining way to get the borrow is to make `i16` the plane's **sole**
+representation for eight-bit content rather than a second one, which removes the
+write and the memory together. That is not this issue's question — #427 asked for
+it "without duplicating the plane type or disturbing the higher-bit-depth
+paths", and `Picture` would have to become an enum over sample width that every
+§8 consumer of `Picture::plane() -> &[i32]` resolves, with the deblocking, SAO,
+residual-add and output-conversion paths all reading through it. What would
+justify opening that is the unpriced row above — **4% to 11% of a 1080p frame's
+interpolation, out of a stage that is about 27% of decode proper** — with no
+write against it, which is also small enough that it should be measured on a
+host whose null control does better than ±5% before anyone starts.
 
 Sample-weighting the sweep predicts 1.07x for the measured mix, and the rebuilt
 group measures **1.09x against the old grid's 1.25x** on this host on the same
@@ -1835,14 +1971,18 @@ ratio: **0.977x to 1.000x, every step**, the later commit never slower. A
 paired ratio is immune to which model the step landed on, which is what makes
 nine of them comparable without dispatching a lottery per step.
 
-**Neither committed table has a row for both groups.** `codec.rs`'s group is now
+**Only the aarch64 table has a row for both groups.** `codec.rs`'s group is now
 `av1_deblock_luma`, pairing with the `av1_deblock_chroma` it is the luma half
 of, and `av1_decode.rs` keeps `av1_deblock` as the narrow-filter member of its
 deblocking trio, the name the recipe's own target order already resolves to.
 Both tables below were drawn in that order and so collected `av1_decode.rs`'s
-side: each carries an `av1_deblock` row as measured and neither has an
-`av1_deblock_luma` row. Each gains it at its next draw. No ratio in either table
-is wrong now that it names the group it was measured from.
+side, and each carries an `av1_deblock` row as measured. The Apple M1 table has
+since gained an `av1_deblock_luma` row of its own, measured separately for issue
+#423 — which is where the two sides of the collision can be read against each
+other on one host, and where the paragraph above's claim about the two arms is
+checked on aarch64 rather than inferred from the x86_64 rounds. The x86_64 table
+gains its row at its next draw. No ratio in either table is wrong now that it
+names the group it was measured from.
 
 `no_two_bench_targets_register_the_same_group_name` in
 `tests/bench_group_names_are_unique.rs` keeps it fixed, in the `Rust checks`
@@ -1879,10 +2019,34 @@ rows, both `av1_encode_stage_iwht` rows, `hevc_decode`, `hevc_decode_to_picture`
 and the `hevc_encode_1920x1088` family.
 
 The `av1_deblock` row here is `benches/av1_decode.rs`'s group, which this draw
-ran second and so collected; there is no `av1_deblock_luma` row, because
-`benches/codec.rs`'s group was overwritten in every round. That is the opposite
-side of the collision the x86_64 table below collected. See [One group name, two
+ran second and so collected, and `benches/codec.rs`'s group was overwritten in
+every one of its six rounds. That is the opposite side of the collision the
+x86_64 table below collected. See [One group name, two
 targets](#one-group-name-two-targets-and-the-row-that-moved-for-nothing) above.
+
+The `av1_deblock_luma` row is the one figure here not from that draw. #417 made
+it nameable and issue #423 measured it, on the same Apple M1, at
+`6dfd4b53479f`, from `benches/codec.rs` alone so nothing could overwrite it, as
+the elementwise minimum of six rounds of its own under the same recipe.
+`src/av1_simd/filters.rs` and `src/av1_filters.rs` — the vector and scalar
+deblocking code the two arms run — are unchanged between that commit and this
+table's stamp, so the row measures the same kernels as the rows around it; for
+this group the rename is the only thing separating the two commits.
+
+The host was quieter for that draw than for the six rounds above, so the row is
+reported with a control rather than on its own. `benches/av1_decode.rs`'s
+`av1_deblock` was re-measured in the same session, same recipe, and read
+**20.288 ms / 2.845 ms (7.13x)** against the **23.124 ms / 3.364 ms (6.87x)**
+the row above carries: both arms 12-15% faster, the ratio within 4%. Read the
+`av1_deblock_luma` ratio against its neighbours and its two absolute times as a
+slightly quieter host's. The control also confirms on aarch64 what [One group
+name, two
+targets](#one-group-name-two-targets-and-the-row-that-moved-for-nothing) reports
+from x86_64: measured side by side the two groups' `neon` arms agree to **1.6%**
+(2.799 ms against 2.845 ms) while their `scalar` arms are **21%** apart
+(16.769 ms against 20.288 ms), because the vector kernels do fixed masked work
+per lane while the scalar reference branches per position on the filter mask and
+so is the only arm the two targets' different content reaches.
 
 | Group | `scalar` | `neon` | Best |
 | --- | ---: | ---: | ---: |
@@ -1890,6 +2054,7 @@ targets](#one-group-name-two-targets-and-the-row-that-moved-for-nothing) above.
 | `av1_deblock` | 23.124 ms | 3.364 ms (6.87x) | 6.87x `neon` |
 | `av1_deblock_boundary` | 276.117 µs | 57.595 µs (4.79x) | 4.79x `neon` |
 | `av1_deblock_chroma` | 11.729 ms | 5.131 ms (2.29x) | 2.29x `neon` |
+| `av1_deblock_luma` | 16.769 ms | 2.799 ms (5.99x) | 5.99x `neon` |
 | `av1_deblock_wide` | 58.572 ms | 27.485 ms (2.13x) | 2.13x `neon` |
 | `av1_decode_frame` | 76.003 ms | 75.990 ms (1.00x) | 1.00x `neon` |
 | `av1_encode_frame_q0` | 17.031 ms | 16.317 ms (1.04x) | 1.04x `neon` |
