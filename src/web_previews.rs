@@ -1,5 +1,5 @@
-//! The browser's [`SeekPreviewSource`]: the preview tier, driven from the event
-//! loop instead of from a thread.
+//! The browser's [`SeekPreviewSource`](crate::codec::SeekPreviewSource): the
+//! preview tier, driven from the event loop instead of from a thread.
 //!
 //! `ARCHITECTURE.md` section 3.2 binds a seek to
 //! [`SEEK_LATENCY_BUDGET`](crate::codec::SEEK_LATENCY_BUDGET) on *any* position
@@ -268,20 +268,16 @@ mod tests {
     async fn one_step_of_the_browser_pass_fills_one_position_and_moves_on() {
         const SAMPLE: &[u8] = include_bytes!("../examples/media/BigBuckBunny.mp4");
         let limits = Limits::default();
-        let mut index = match WebPreviewIndex::open(
-            SAMPLE,
-            0,
-            &limits,
-            PreviewOptions::for_frame_rate(24),
-        )
-        .await
-        {
-            Ok(index) => index,
-            Err(error) => {
-                assert_eq!(error.kind(), ErrorKind::Unsupported);
-                return;
-            }
-        };
+        let mut index =
+            match WebPreviewIndex::open(SAMPLE, 0, &limits, PreviewOptions::for_frame_rate(24))
+                .await
+            {
+                Ok(index) => index,
+                Err(error) => {
+                    assert_eq!(error.kind(), ErrorKind::Unsupported);
+                    return;
+                }
+            };
         assert_eq!(index.coverage().0, 0, "nothing is decoded before a step");
         assert_eq!(index.next_frame(), Some(FrameIndex(0)));
 
@@ -299,13 +295,22 @@ mod tests {
         // A frame that would not decode leaves its position empty and the pass
         // still moves, so the picture is asserted only where there is one - and
         // where there is, it is the shrunk RGBA a lookup anywhere answers with.
-        if let Some((frame, picture)) = index.store().nearest_at(FrameIndex(index.stride() * 4)) {
-            assert_eq!(frame, FrameIndex(0));
-            assert_eq!(picture.pixel_format, PixelFormat::Rgba8);
-            assert!(
-                picture.dimensions.width < 1920,
-                "a preview is the frame shrunk, not the frame"
-            );
+        match index.store().nearest_at(FrameIndex(index.stride() * 4)) {
+            Some((frame, picture)) => {
+                assert_eq!(frame, FrameIndex(0));
+                assert_eq!(picture.pixel_format, PixelFormat::Rgba8);
+                assert!(
+                    picture.dimensions.width < 1920,
+                    "a preview is the frame shrunk, not the frame"
+                );
+                console_log!(
+                    "one browser preview step stored a {}x{} picture of frame {}",
+                    picture.dimensions.width,
+                    picture.dimensions.height,
+                    frame.0
+                );
+            }
+            None => console_log!("this browser decoded no picture for the first preview position"),
         }
     }
 
