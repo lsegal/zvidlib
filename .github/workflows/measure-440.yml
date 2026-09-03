@@ -21,6 +21,14 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
         run: rustup show
+      # `ci_workflows_cache_cargo` requires this of every cargo job, and a
+      # repeated draw wants it anyway: `[profile.release]` is fat LTO with one
+      # codegen unit, so an uncached job spends eight minutes building before
+      # it measures anything.
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       - name: Identify the host
         run: |
           uname -a
