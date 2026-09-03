@@ -1752,14 +1752,18 @@ ratio: **0.977x to 1.000x, every step**, the later commit never slower. A
 paired ratio is immune to which model the step landed on, which is what makes
 nine of them comparable without dispatching a lottery per step.
 
-**Neither committed table has a row for both groups.** `codec.rs`'s group is now
+**Only the aarch64 table has a row for both groups.** `codec.rs`'s group is now
 `av1_deblock_luma`, pairing with the `av1_deblock_chroma` it is the luma half
 of, and `av1_decode.rs` keeps `av1_deblock` as the narrow-filter member of its
 deblocking trio, the name the recipe's own target order already resolves to.
 Both tables below were drawn in that order and so collected `av1_decode.rs`'s
-side: each carries an `av1_deblock` row as measured and neither has an
-`av1_deblock_luma` row. Each gains it at its next draw. No ratio in either table
-is wrong now that it names the group it was measured from.
+side, and each carries an `av1_deblock` row as measured. The Apple M1 table has
+since gained an `av1_deblock_luma` row of its own, measured separately for issue
+#423 — which is where the two sides of the collision can be read against each
+other on one host, and where the paragraph above's claim about the two arms is
+checked on aarch64 rather than inferred from the x86_64 rounds. The x86_64 table
+gains its row at its next draw. No ratio in either table is wrong now that it
+names the group it was measured from.
 
 `no_two_bench_targets_register_the_same_group_name` in
 `tests/bench_group_names_are_unique.rs` keeps it fixed, in the `Rust checks`
@@ -1796,10 +1800,34 @@ rows, both `av1_encode_stage_iwht` rows, `hevc_decode`, `hevc_decode_to_picture`
 and the `hevc_encode_1920x1088` family.
 
 The `av1_deblock` row here is `benches/av1_decode.rs`'s group, which this draw
-ran second and so collected; there is no `av1_deblock_luma` row, because
-`benches/codec.rs`'s group was overwritten in every round. That is the opposite
-side of the collision the x86_64 table below collected. See [One group name, two
+ran second and so collected, and `benches/codec.rs`'s group was overwritten in
+every one of its six rounds. That is the opposite side of the collision the
+x86_64 table below collected. See [One group name, two
 targets](#one-group-name-two-targets-and-the-row-that-moved-for-nothing) above.
+
+The `av1_deblock_luma` row is the one figure here not from that draw. #417 made
+it nameable and issue #423 measured it, on the same Apple M1, at
+`6dfd4b53479f`, from `benches/codec.rs` alone so nothing could overwrite it, as
+the elementwise minimum of six rounds of its own under the same recipe.
+`src/av1_simd/filters.rs` and `src/av1_filters.rs` — the vector and scalar
+deblocking code the two arms run — are unchanged between that commit and this
+table's stamp, so the row measures the same kernels as the rows around it; for
+this group the rename is the only thing separating the two commits.
+
+The host was quieter for that draw than for the six rounds above, so the row is
+reported with a control rather than on its own. `benches/av1_decode.rs`'s
+`av1_deblock` was re-measured in the same session, same recipe, and read
+**20.288 ms / 2.845 ms (7.13x)** against the **23.124 ms / 3.364 ms (6.87x)**
+the row above carries: both arms 12-15% faster, the ratio within 4%. Read the
+`av1_deblock_luma` ratio against its neighbours and its two absolute times as a
+slightly quieter host's. The control also confirms on aarch64 what [One group
+name, two
+targets](#one-group-name-two-targets-and-the-row-that-moved-for-nothing) reports
+from x86_64: measured side by side the two groups' `neon` arms agree to **1.6%**
+(2.799 ms against 2.845 ms) while their `scalar` arms are **21%** apart
+(16.769 ms against 20.288 ms), because the vector kernels do fixed masked work
+per lane while the scalar reference branches per position on the filter mask and
+so is the only arm the two targets' different content reaches.
 
 | Group | `scalar` | `neon` | Best |
 | --- | ---: | ---: | ---: |
@@ -1807,6 +1835,7 @@ targets](#one-group-name-two-targets-and-the-row-that-moved-for-nothing) above.
 | `av1_deblock` | 23.124 ms | 3.364 ms (6.87x) | 6.87x `neon` |
 | `av1_deblock_boundary` | 276.117 µs | 57.595 µs (4.79x) | 4.79x `neon` |
 | `av1_deblock_chroma` | 11.729 ms | 5.131 ms (2.29x) | 2.29x `neon` |
+| `av1_deblock_luma` | 16.769 ms | 2.799 ms (5.99x) | 5.99x `neon` |
 | `av1_deblock_wide` | 58.572 ms | 27.485 ms (2.13x) | 2.13x `neon` |
 | `av1_decode_frame` | 76.003 ms | 75.990 ms (1.00x) | 1.00x `neon` |
 | `av1_encode_frame_q0` | 17.031 ms | 16.317 ms (1.04x) | 1.04x `neon` |
