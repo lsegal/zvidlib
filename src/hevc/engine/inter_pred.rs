@@ -569,16 +569,16 @@ fn narrows(isa: Isa, bit_depth: u8, w: usize, vertical_only: bool) -> bool {
     }
 }
 
-/// A process-level override for the [`narrows`] decision, so one process
+/// A process-level override for the `narrows` decision, so one process
 /// can decode the same frames with the 16-bit accumulation on and off.
 ///
 /// #404 landed the narrow path and left one of its own acceptance criteria
 /// unmet: what the path is worth to a *whole decode*, as opposed to to
-/// [`interp_block`], could not be resolved. The pairing it tried was two
+/// `interp_block`, could not be resolved. The pairing it tried was two
 /// builds in two processes — this crate against `main`, through
 /// `examples/hevc_decode_profile.rs` — and issue #426 records why the
 /// answer was unusable. The `scalar` arm of that pairing is a control with
-/// a known answer, because [`narrows`] is false for [`Isa::Scalar`] and the
+/// a known answer, because `narrows` is false for `Isa::Scalar` and the
 /// two binaries therefore execute identical code on it, so it must read
 /// 1.00x; it read 1.06x and 1.07x, while the arm under test read 1.10x and
 /// 0.83x. A control that misses its own known answer by ±7% cannot
@@ -626,7 +626,7 @@ pub mod narrow_interp {
         OVERRIDE.store(code, Ordering::Relaxed);
     }
 
-    /// The override in force, or `None` when [`super::narrows`] is deciding.
+    /// The override in force, or `None` when `narrows` is deciding.
     #[must_use]
     pub fn override_value() -> Option<bool> {
         match OVERRIDE.load(Ordering::Relaxed) {

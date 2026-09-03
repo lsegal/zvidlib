@@ -36,6 +36,30 @@
 //! same breakdown can be read with and without the vector kernels. Run under
 //! `--release`: the decoder is a pure-Rust software codec and a debug build's
 //! stage mix is not the shipped build's.
+//!
+//! # `--pair`: what one decision is worth to a whole decode
+//!
+//! `--pair` answers a different question from the breakdown: not how a decode
+//! divides, but how much a single kernel decision moves it. It A/Bs the
+//! §8.5.3.3 16-bit interpolation accumulation #404 landed, running both arms
+//! **in one process, interleaved**, and — the part that makes it usable — a
+//! third *null control* arm that runs the same code as the first, so the
+//! instrument reports its own noise floor next to the effect.
+//!
+//! ```sh
+//! cargo run --release --features native --example hevc_decode_profile -- --pair
+//! cargo run --release --features native --example hevc_decode_profile -- 48 avx2 --pair
+//! cargo run --release --features native --example hevc_decode_profile -- --pair --rounds 20
+//! ```
+//!
+//! Issue #426 is why the control is there. #404 paired two *builds* in two
+//! *processes* and its control arm — `scalar`, where both binaries provably
+//! execute identical code — read 1.06x and 1.07x against a true answer of
+//! 1.00x, which is a wider miss than the effect being asked about. Reading the
+//! two arms out of one process is the same arrangement
+//! `measure_narrow_vs_wide_block` and `measure_2d_ring_vs_flat` already use,
+//! and for the reason both of them state: separate benchmark processes
+//! disagree with each other by more than the effect being measured.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -281,11 +305,9 @@ fn pair_narrow_accumulation(
             narrow_interp::set_override(*narrow);
             let (count, report) = decode_profiled(configuration, samples, frames, |_| {});
             let per_frame = count.max(1) as f64;
-            best_total[slot] =
-                best_total[slot].min(report.total().as_secs_f64() * 1e3 / per_frame);
-            best_filter[slot] = best_filter[slot].min(
-                report.stage(profile::Stage::InterPredFilter).as_secs_f64() * 1e3 / per_frame,
-            );
+            best_total[slot] = best_total[slot].min(report.total().as_secs_f64() * 1e3 / per_frame);
+            best_filter[slot] = best_filter[slot]
+                .min(report.stage(profile::Stage::InterPredFilter).as_secs_f64() * 1e3 / per_frame);
         }
     }
     narrow_interp::set_override(None);
