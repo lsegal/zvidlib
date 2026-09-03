@@ -52,6 +52,15 @@
 //! cargo run --release --features native --example hevc_decode_profile -- --pair --rounds 20
 //! ```
 //!
+//! Every ratio and every floor is printed with the round count behind it, and
+//! below `hevc_decode_profile::paired::MIN_FLOOR_ROUNDS` **no floor is printed
+//! at all** — issue #438 is why. The floor is an interquartile width of the
+//! host's round-to-round scatter, so a very short run understates a spread it
+//! has barely sampled and reports a *tighter* floor than a longer run on the
+//! same host: 3.36% at 5 rounds against 4.43% at 21 and 6.37% at 51, with no
+//! host any quieter. A floor too few rounds can support is worse than no
+//! floor, so a short run now gets none.
+//!
 //! Issue #426 is why the control is there. #404 paired two *builds* in two
 //! *processes* and its control arm — `scalar`, where both binaries provably
 //! execute identical code — read 1.06x and 1.07x against a true answer of
@@ -66,6 +75,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 
 use zvidlib::hevc_decode_profile as profile;
+use zvidlib::hevc_decode_profile::paired;
 use zvidlib::hevc_narrow_interp as narrow_interp;
 use zvidlib::io::MemorySource;
 use zvidlib::simd::{self, SimdIsa};
@@ -95,6 +105,10 @@ const DEFAULT_FRAMES: usize = 48;
 /// catches more of the interference it is measuring. More rounds buy a
 /// better-estimated noise floor, never a lower one; only a quieter host does
 /// that. See `benches/README.md`.
+///
+/// *Lowering* it is the direction that misleads, which is why
+/// [`paired::MIN_FLOOR_ROUNDS`] exists: below that count no floor is reported
+/// at all. Twelve clears it.
 const PAIR_ROUNDS: usize = 12;
 
 fn main() {
@@ -365,14 +379,38 @@ fn pair_narrow_accumulation(
     // rescues it. Both arms of a round run within seconds of each other, so a
     // *within-round* ratio divides out the drift they share, and the median
     // over rounds is then robust to the odd round that caught an interrupt.
+    // A floor is only as good as the round count behind it, and issue #438
+    // measured the trap: a 5-round draw on the host of the #434 re-run
+    // reported a 3.36% floor where 21 rounds read 4.43% and 51 read 6.37%. It
+    // had not measured a quieter host — an interquartile band over five
+    // readings is three of them, so it understates a spread it has barely
+    // sampled — but 3.36% is the number a reader would take for the tightest
+    // of the three. So below `paired::MIN_FLOOR_ROUNDS` no floor is printed at
+    // all, the way the arms already refuse a ratio with no control behind it,
+    // and above it every floor is printed with the round count it rests on.
+    if rounds < paired::MIN_FLOOR_ROUNDS {
+        println!(
+            "**No noise floor is reported below {} rounds, and this run took {rounds}.** \
+             The floor is an interquartile width of the host's own round-to-round \
+             scatter, and at {rounds} rounds fewer than two readings fall beyond each \
+             end of that band, so its width is set by a single round rather than by a \
+             sampled spread — a floor drawn from it reads *tighter* than a longer run \
+             on the same host without the host having been any quieter. Re-run with \
+             `--rounds {}` or more.",
+            paired::MIN_FLOOR_ROUNDS,
+            paired::MIN_FLOOR_ROUNDS,
+        );
+        println!();
+    }
+
     for (label, arms) in [("whole decode", &totals), ("`inter_pred_filter`", &filters)] {
         let effect = paired_ratios(&arms[0], &arms[1]);
         let control = paired_ratios(&arms[0], &arms[2]);
-        let (effect_median, effect_low, effect_high) = band(&effect);
-        let (control_median, control_low, control_high) = band(&control);
+        let (effect_median, effect_low, effect_high) = paired::band(&effect);
+        let (control_median, control_low, control_high) = paired::band(&control);
         println!(
             "{label}: shipped against wide **{effect_median:.4}x** \
-             [{effect_low:.4}, {effect_high:.4}] interquartile"
+             [{effect_low:.4}, {effect_high:.4}] interquartile over {rounds} rounds"
         );
         println!(
             "  control against wide (identical code, true answer 1.0000x) \
@@ -382,22 +420,27 @@ fn pair_narrow_accumulation(
         // The floor is the widest the control misses 1.0000x anywhere in its
         // own band, not just at its median: an instrument that scatters ±2%
         // around a perfect median has not resolved a 1% effect.
-        let floor = (control_median - 1.0)
-            .abs()
-            .max((control_low - 1.0).abs())
-            .max((control_high - 1.0).abs());
         let effect_size = (effect_median - 1.0).abs();
+        let Some(floor) = paired::floor(&control) else {
+            println!(
+                "  not resolved — {rounds} rounds underwrite no floor (see above), so \
+                 the {:.2}% effect this run reads is unbounded rather than small.",
+                effect_size * 100.0,
+            );
+            continue;
+        };
         if effect_size > floor && (effect_low - 1.0) * (effect_high - 1.0) > 0.0 {
             println!(
-                "  resolved — the {:.2}% effect clears the {:.2}% floor and its band \
-                 does not straddle 1.0000x.",
+                "  resolved — the {:.2}% effect clears the {:.2}% floor this instrument \
+                 reaches on this host over {rounds} rounds, and its band does not \
+                 straddle 1.0000x.",
                 effect_size * 100.0,
                 floor * 100.0,
             );
         } else {
             println!(
                 "  not resolved — the effect is bounded by the {:.2}% floor this \
-                 instrument reaches on this host.",
+                 instrument reaches on this host over {rounds} rounds.",
                 floor * 100.0,
             );
         }
@@ -421,24 +464,6 @@ fn paired_ratios(numerator: &[f64], denominator: &[f64]) -> Vec<f64> {
         .zip(denominator)
         .map(|(&a, &b)| a / b)
         .collect()
-}
-
-/// The median of `values` and its interquartile band.
-///
-/// A band rather than a standard deviation because these are ratios of timings
-/// with a hard floor and a long tail — a round that caught an interrupt is far
-/// from symmetric — and percentiles do not assume otherwise. The *inter-
-/// quartile* band specifically, rather than a wider one, because at the round
-/// counts this runs at a 10th percentile is the second-smallest reading and so
-/// reports the worst round rather than the spread.
-fn band(values: &[f64]) -> (f64, f64, f64) {
-    let mut sorted = values.to_vec();
-    sorted.sort_by(f64::total_cmp);
-    let at = |fraction: f64| {
-        let index = (fraction * (sorted.len() - 1) as f64).round() as usize;
-        sorted[index]
-    };
-    (at(0.5), at(0.25), at(0.75))
 }
 
 /// FNV-1a over `bytes`, continuing from `hash`.
