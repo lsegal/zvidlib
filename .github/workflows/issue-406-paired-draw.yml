@@ -3,33 +3,37 @@
 # happens to hand out.
 #
 # This workflow is removed again before the branch merges. It exists because the
-# question — does the register-resident band accumulator separate in
-# `hevc_encode_640x352_reconstruct` — has already been answered wrongly twice
-# from a single host, and the two prior answers disagreed by CPU vendor.
+# question — does a register-resident band accumulator separate in
+# `hevc_encode_640x352_reconstruct` — is the one this dispatch site has now got
+# wrong twice from one host at a time, and the two prior answers disagreed by
+# CPU vendor.
 #
 # Each matrix leg builds both trees on one runner, times the group from each
 # alternately within a round, and reports the elementwise minimum. The group's
 # own `scalar` arm is the control: `band_offset_rect`'s scalar path is byte
 # identical in both trees, so that arm has to read 1.00x, and a leg whose
 # control does not is discarded rather than reported.
+#
+# It runs on a push that touches this file, because a `workflow_dispatch`
+# workflow can only be dispatched once it is on the default branch and this one
+# never will be.
 name: Issue 406 paired draw
 
 on:
-  workflow_dispatch:
-    inputs:
-      base:
-        description: The commit to time the branch against.
-        required: true
-      rounds:
-        description: Interleaved rounds per leg.
-        required: false
-        default: '5'
+  push:
+    paths:
+      - .github/workflows/issue-406-paired-draw.yml
 
 jobs:
   draw:
     name: Draw ${{ matrix.leg }}
     runs-on: ubuntu-latest
     timeout-minutes: 180
+    env:
+      # The commit this branch forked from, which is the branch minus its own
+      # change and nothing else.
+      BASE: 5b90e13593f02c0010fa61cfcf075680ee3b2373
+      ROUNDS: '5'
     strategy:
       fail-fast: false
       matrix:
@@ -39,14 +43,20 @@ jobs:
         uses: actions/checkout@v4
         with:
           path: branch
-          fetch-depth: 0
       - name: Check out the base
         uses: actions/checkout@v4
         with:
           path: base
-          ref: ${{ inputs.base }}
+          ref: 5b90e13593f02c0010fa61cfcf075680ee3b2373
       - name: Install Rust toolchain
         run: rustup show
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          workspaces: |
+            branch
+            base
       - name: Install native audio dependencies
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - name: Name the host
@@ -64,7 +74,7 @@ jobs:
       - name: Take the draw
         run: |
           set -o pipefail
-          for r in $(seq 1 "${{ inputs.rounds }}"); do
+          for r in $(seq 1 "$ROUNDS"); do
             if [ $((r % 2)) -eq 1 ]; then order="branch base"; else order="base branch"; fi
             for tree in $order; do
               (cd "$tree" && cargo bench --features native --bench hevc_encode -- \
@@ -72,7 +82,7 @@ jobs:
             done
           done
           {
-            echo '## Elementwise minimum of ${{ inputs.rounds }} interleaved rounds'
+            echo "## Elementwise minimum of $ROUNDS interleaved rounds"
             echo
             echo '```'
             echo "# host cpu model: $(grep -m1 '^model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//')"
@@ -80,8 +90,8 @@ jobs:
               function tons(v, u) {
                 if (u == "s") return v * 1e9
                 if (u == "ms") return v * 1e6
-                if (u == "\xc2\xb5s" || u == "us") return v * 1e3
-                return v
+                if (u == "us") return v * 1e3
+                return v * 1e3
               }
               FNR == 1 { split(FILENAME, p, "-"); tag = p[1] }
               /^[a-z0-9_]+\/(scalar|sse4\.1|avx2)$/ { arm = $0; next }
