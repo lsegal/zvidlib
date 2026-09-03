@@ -939,7 +939,12 @@ instruction-set-dependent. It was taken on two, through the CI runner pool,
 which is where `benches/README.md`'s other multi-model x86_64 readings come
 from — three consecutive invocations of the same binary per host, the same
 in-process interleaved best-of-fifteen instrument, the arms asserted equal
-sample-for-sample before anything is timed.
+sample-for-sample before anything is timed. To re-take it, run
+`cargo test --release --features native --lib measure_narrow_vs_wide_block --
+--ignored --nocapture` from a workflow job on `ubuntu-latest` and
+`macos-15-intel` and name the model each draw landed on, the way the
+`bench_band_offset_row` tables below do: `ubuntu-latest` is a pool of several
+CPU models, and a ratio that is not attributed to one is attributed to nothing.
 
 On an **AMD EPYC 7763 (Zen 3, `ubuntu-latest`)**:
 
