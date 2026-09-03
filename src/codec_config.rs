@@ -218,6 +218,18 @@ mod tests {
     }
 
     #[test]
+    fn av1_codec_string_carries_every_chroma_sample_position() {
+        // 4:2:0 colour with each `chroma_sample_position`; the value is the last
+        // digit of the `av01.` string.
+        for pos in 0..4u8 {
+            let av1c = boxed(b"av1C", &[0x81, 0x04, 0x0c | pos, 0]);
+            let derived = derive_codec_string(Codec::Av1, &av1c).unwrap();
+            assert_eq!(derived.profile, CodecProfile::Av1Main);
+            assert_eq!(derived.codec_string, format!("av01.0.04M.08.0.11{pos}"));
+        }
+    }
+
+    #[test]
     fn distinguishes_av1_high_and_professional_profiles() {
         let high = boxed(b"av1C", &[0x81, 0x24, 0, 0]);
         assert_eq!(
