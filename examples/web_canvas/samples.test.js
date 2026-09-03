@@ -1,7 +1,8 @@
 // Node's built-in runner, like `scrub.test.js`, so this needs no dependency the example does not
-// already have: `node --test examples/web_canvas/`. What it covers is the choice issue #441 added
-// - which bundled sample the page opens, given what the browser said it can decode - kept pure in
-// `samples.js` so it can be asserted without a browser, a wasm build or a decoder.
+// already have: `node --test 'examples/web_canvas/*.test.js'`. What it covers is the choice
+// issue #441 added - which bundled sample the page opens, given what the browser said it can
+// decode - kept pure in `samples.js` so it can be asserted without a browser, a wasm build or a
+// decoder.
 //
 // The declarations themselves are checked elsewhere and deliberately not here: asserting a codec
 // string against a copy of itself proves nothing, so the file each entry describes is demuxed and
