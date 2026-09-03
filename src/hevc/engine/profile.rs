@@ -543,7 +543,7 @@ pub mod paired {
     /// The fewest rounds that can underwrite a noise floor.
     ///
     /// The least `n` for which [`rounds_beyond_band_ends`] reaches
-    /// [`ROUNDS_BEYOND_EACH_END`]; the test below derives it rather than
+    /// `ROUNDS_BEYOND_EACH_END`; the test below derives it rather than
     /// trusting this constant.
     ///
     /// Below it [`floor`] reports nothing at all, the way the arms already
@@ -606,7 +606,7 @@ pub mod paired {
     /// anywhere in its own band, not just at its median, because an instrument
     /// that scatters ±2% around a perfect median has not resolved a 1% effect.
     /// What is new is that it is only reported when
-    /// [`rounds_beyond_band_ends`] reaches [`ROUNDS_BEYOND_EACH_END`], so a
+    /// [`rounds_beyond_band_ends`] reaches `ROUNDS_BEYOND_EACH_END`, so a
     /// short run reports no floor rather than a falsely narrow one.
     #[must_use]
     pub fn floor(control: &[f64]) -> Option<f64> {
