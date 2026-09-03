@@ -3516,6 +3516,77 @@ mod nonlossless_tests {
     /// identical bytes, identical transform trace, identical reconstruction and identical size
     /// decisions, at every quantizer. An exact bound skips work, it does not change an answer.
     /// `abandoned_trials` is asserted non-zero so the saving is measured rather than assumed.
+    /// #412 widened the `GainModel::Linear` credit's `measured * trial_searched_cost` from a
+    /// `saturating_mul` in `i64` to a product in `i128`, and the fourth thing that issue asks for
+    /// is that no frame's bitstream moves. This is that demonstration, and it is an identity
+    /// rather than a comparison: the two expressions differ *only* where the product leaves
+    /// `i64`, so a frame whose largest product is inside `i64` is a frame the old code computed
+    /// exactly the same credit for, on every trial, and therefore emitted the same bytes for.
+    ///
+    /// Asserted over the whole tuning set at both sizes and every quantizer, with the observed
+    /// maximum recorded as a ratio of `i64::MAX` so the headroom is a number rather than a claim.
+    /// The largest product any of these frames forms is **1_619_126_546_051**, or `5_696_510x`
+    /// under `i64::MAX` - about `2^22` of headroom. The maximum is asserted non-zero as well, so
+    /// a set that stopped forming the credit at all could not pass by never entering the arm.
+    ///
+    /// The second assertion is the one that says why the frame size is not the thing to bound.
+    /// Neither factor is frame-wide: `trial_searched_cost` is one coding block's sum, and `dct`
+    /// is one probe block, because `type_gain_memory()` is `TYPE_GAIN_MEMORY` = 1 outside tests
+    /// and `decay` zeroes the accumulator ahead of every `accumulate`. So 2.5x the area buys no
+    /// more than 2x the product here, and 8192x8192 - the largest `Limits::default` admits - is
+    /// the same answer as 192x160. That is what makes the shipped encoder safe; it is not what
+    /// makes the expression safe, since `with_type_gain_memory` reaches the frame-wide
+    /// accumulator and the `i16` reconstruction clamp leaves a coding block's own ceiling near
+    /// `2^43`, whose square does not fit. Hence the widening rather than a `debug_assert!`.
+    #[test]
+    fn the_linear_credit_never_saturated_on_the_tuning_set() {
+        let mut by_size = Vec::new();
+        for (width, height, frames) in tuning_set() {
+            let mut worst = 0i128;
+            for (name, pixels) in &frames {
+                for qindex in DETERMINISM_QINDEXES {
+                    let report =
+                        tile::FrameEncoder::new(pixels, width, height, qindex).encode_with_report();
+                    let product = report.linear_credit_product;
+                    assert!(
+                        i64::try_from(product).is_ok(),
+                        "the Linear credit's product left i64 on {name} at {width}x{height} \
+                         qindex {qindex}: {product}, so the saturating_mul #412 replaced would \
+                         have under-credited a trial and the bitstream is not unchanged"
+                    );
+                    worst = worst.max(product);
+                }
+            }
+            by_size.push((width * height, worst));
+        }
+        let worst = by_size.iter().map(|&(_, w)| w).max().unwrap_or(0);
+        assert!(
+            worst > 0,
+            "no frame in the tuning set formed a Linear credit at all, so this asserts nothing"
+        );
+        let headroom = i128::from(i64::MAX) / worst;
+        assert!(
+            headroom >= 1 << 20,
+            "the tuning set's largest Linear credit product is {worst}, only {headroom}x under \
+             i64::MAX; the recorded headroom was 5_696_510x, over 2^22"
+        );
+
+        // Neither factor is a frame-wide quantity, and this is what says so. `dct` is one probe
+        // block and `trial_searched_cost` is one coding block's sum, so the product is bounded by
+        // the coding block rather than by the picture: 2.5x the area must not buy anything like
+        // 2.5x the product, or the frame size would be the thing to bound and 8192x8192 - the
+        // largest `Limits::default` allows - would be a different answer from 192x160.
+        let (small_area, small) = by_size[0];
+        let (large_area, large) = by_size[by_size.len() - 1];
+        assert!(large_area > small_area, "the tuning set has two sizes");
+        assert!(
+            large <= small * 2,
+            "the largest Linear credit product grew from {small} at {small_area} pixels to \
+             {large} at {large_area}; it is supposed to be bounded by a coding block, not by the \
+             frame"
+        );
+    }
+
     #[test]
     fn the_shipped_size_trial_is_bounded_by_the_incumbents_cost_and_the_bound_is_exact() {
         let (width, height) = (96_usize, 80_usize);
