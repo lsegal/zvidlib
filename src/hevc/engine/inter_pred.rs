@@ -112,7 +112,9 @@ impl<'a> RefPlane<'a> {
     /// windows out of it with no conversion at all.
     ///
     /// `narrow[ i ]` must equal `samples[ i ]` for every `i`, and every
-    /// sample must lie in `0..=`[`NARROW_MAX_SAMPLE`] — the mirror is a
+    /// sample must lie in `0..=`[`NARROW_MAX_SAMPLE`]; only the lengths
+    /// are checked, because the plane is walked once per prediction unit
+    /// and its contents are not. The mirror is a
     /// representation of the same plane, not a second plane, and
     /// [`crate::hevc::engine::picture::Picture::build_narrow_mirror`]
     /// builds it only for eight-bit pictures. A picture without one
@@ -137,12 +139,6 @@ impl<'a> RefPlane<'a> {
                 got: narrow.len(),
             });
         }
-        debug_assert!(
-            samples
-                .iter()
-                .all(|&s| (0..=i32::from(NARROW_MAX_SAMPLE)).contains(&s)),
-            "a narrow mirror was supplied for a plane that is not eight-bit"
-        );
         Ok(Self {
             narrow: Some(narrow),
             ..plane
@@ -2340,7 +2336,10 @@ mod tests {
         // Any vector backend the host offers; a scalar-only host has no
         // narrow path to route at all and the last assertion below is
         // then the whole answer.
-        let Some(isa) = simd::available_isas().into_iter().find(|&i| i != Isa::Scalar) else {
+        let Some(isa) = simd::available_isas()
+            .into_iter()
+            .find(|&i| i != Isa::Scalar)
+        else {
             assert!(!narrows(Isa::Scalar, &mirrored, 8, 16, true, false));
             return;
         };

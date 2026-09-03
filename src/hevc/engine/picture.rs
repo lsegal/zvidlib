@@ -251,7 +251,13 @@ impl Picture {
             self.narrow = None;
             return;
         }
-        let narrow_of = |src: &[i32]| src.iter().map(|&s| s as i16).collect::<Vec<i16>>();
+        let narrow_of = |src: &[i32]| {
+            debug_assert!(
+                src.iter().all(|&s| (0..=255).contains(&s)),
+                "an eight-bit picture holds a sample outside [0, 255]"
+            );
+            src.iter().map(|&s| s as i16).collect::<Vec<i16>>()
+        };
         self.narrow = Some([
             narrow_of(&self.luma),
             narrow_of(&self.cb),
