@@ -22,7 +22,7 @@ The project is a library, not a media CLI or an FFmpeg binding. FFmpeg is a feat
 
 ## Implemented browser boundary
 
-The `web` feature exposes `MediaInput`, `MediaOutput`, `Playback`, `VideoStream`, `AudioStream`, `OpenOptions`, `CreateOptions`, `PlaybackOptions`, `FrameIndex`, `Timestamp`, `Rational`, `SampleRange`, `VideoFrame`, and `AudioBuffer` through `wasm-bindgen`.
+The `web` feature exposes `MediaInput`, `MediaOutput`, `Playback`, `VideoStream`, `AudioStream`, `OpenOptions`, `CreateOptions`, `PlaybackOptions`, `PreviewIndex`, `PreviewOptions`, `Preview`, `FrameIndex`, `Timestamp`, `Rational`, `SampleRange`, `VideoFrame`, and `AudioBuffer` through `wasm-bindgen`.
 
 `MediaInput.open` accepts a `Blob`, `ReadableStream<Uint8Array>`, `ArrayBuffer`, or typed-array view. It consumes streams, always releases its reader lock, and supports cancellation through `OpenOptions.signal`. Input bytes are copied into owned WebAssembly storage; `bytes()` returns a fresh JavaScript snapshot rather than a view into growable WebAssembly memory.
 
@@ -74,6 +74,14 @@ All exported 64-bit frame, sample, and timestamp values return JavaScript `BigIn
 Input `VideoStream` handles also expose `frameDuration(index)`, which resolves to that presentation
 frame's MP4 duration in milliseconds. This timing query is independent of codec availability, so
 browser applications can pace fallback rendering even when `get(index)` reports `UNSUPPORTED`.
+
+`video.previews(options)` builds the seek preview tier `ARCHITECTURE.md` section 3.2 requires a
+seek to be answered from: one downscaled picture every stride frames, on a decode session of its
+own. The pass has no thread to run on in a browser, so the caller advances it a preview at a time
+with `await index.step(signal)` from `requestIdleCallback` or a `requestAnimationFrame` slice, and
+`index.nearest(frame)` answers from whatever it has reached so far. That lookup is *synchronous*
+and never decodes - it returns a `Preview` carrying the picture and the frame it is actually of, or
+`null` - which is what lets it stay inside `seekLatencyBudgetMs()` however far a drag jumped.
 
 ## Planned API examples
 

@@ -38,8 +38,9 @@ mod av1_decoder;
 
 /// The bounded preview tier over a track, for callers that need an answer at an
 /// arbitrary position faster than a decode from the nearest random-access point
-/// can give one. Native-only: its pass runs on a thread of its own.
-#[cfg(not(target_arch = "wasm32"))]
+/// can give one. Portable: the store, the stride and the pass cursor compile
+/// everywhere, and only the driver differs - a thread in [`previews::PreviewIndex`]
+/// here, an idle callback in `web_previews` for the browser (issue #432).
 pub mod previews;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -105,6 +106,11 @@ mod wasm_api;
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
 mod web_decoder;
 
+/// The browser's preview driver: the same [`previews::PreviewPass`] the native
+/// index runs, advanced one preview per idle callback instead of on a thread.
+#[cfg(all(feature = "web", target_arch = "wasm32"))]
+pub mod web_previews;
+
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
 pub use wasm_api::*;
 
@@ -169,6 +175,7 @@ pub use playback::{
     PlaybackAudioOutput, PlaybackAudioSource, PlaybackController, PlaybackOptions,
     PlaybackVideoSource, Presentation, WebAudioOutput,
 };
+pub use previews::{PreviewOptions, PreviewPass, PreviewStore};
 pub use timeline::{FrameIndex, FrameRate, Rational, SampleRange, Timeline};
 pub use transfer::{
     ColorConversion, ContextIdentity, CpuFrameDestination, CpuFrameSource, CpuPlaneDestination,
@@ -186,4 +193,4 @@ pub use hevc::native_hevc_video_encoder_factory;
 #[cfg(not(target_arch = "wasm32"))]
 pub use native_audio::{DefaultAudioOutput, NativeAacDecoder};
 #[cfg(not(target_arch = "wasm32"))]
-pub use previews::{PreviewIndex, PreviewOptions};
+pub use previews::PreviewIndex;
