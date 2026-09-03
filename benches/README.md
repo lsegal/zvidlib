@@ -2391,16 +2391,96 @@ competing for cache with everything else in the stage. The 1.10-1.53x is a real
 figure for the loop it was taken in and does not transfer, and a third call
 shape is not what would make it transfer.
 
-**Do not spend another attempt on this dispatch site.** The remaining
-untested idea is not a call shape but a different decomposition - deriving the
-32-band histogram for a whole CTB in one pass that keeps its accumulators in
-registers across rows, rather than 32 memory accumulators re-read per row - and
-that is a different kernel, not this one re-shaped. `band_offset_rect` is kept
-as the site's entry point precisely so a future attempt starts from the
-once-per-CTB shape without re-deriving that the once-per-row one is not what is
-costing it; both x86 rect kernels stay `#[cfg(test)]` alongside the six
-once-per-row candidates, asserted bit-exact, as the apparatus these figures
-were taken with.
+That left one untested idea, and it was not a call shape but a different
+decomposition - deriving the 32-band histogram for a whole CTB in one pass that
+keeps its accumulators in registers across rows, rather than 32 memory
+accumulators re-read per row. #406 built it. It is a null result, and this
+dispatch site is now closed.
+
+#### The register-resident accumulator, and why it is a null result
+
+Three shapes, all asserted bit-exact against `band_offset_row_scalar` under
+every `simd::set_override` pin over strided rectangles by
+`the_x86_narrow_band_rect_kernels_match_the_row_reference`: a **portable narrow
+control** that narrows and splits the accumulators and vectorizes nothing, so a
+result can be attributed to the accumulator rather than to the classification;
+**`band_offset_rect_avx2_narrow`** and its SSE4.1 twin, which are the same lane
+scatter #340 timed but into `i32` sums and `u32` counts split across two partial
+sets instead of two `[i64; 32]` arrays; and
+**`band_offset_rect_avx2_transposed`**, the register-resident shape proper - a
+masked pass per band with the histogram held in `ymm` registers, no memory
+histogram and no scatter at all.
+
+**The occupancy the transposed shape depends on was measured first**, because
+its cost is proportional to the bands it visits and only the band *range* is
+derivable at a price it can pay: a vector min/max is two operations per sample,
+while the set of distinct occupied bands is not available at any price the pass
+can afford. `tests/sao_band_occupancy.rs` is that measurement.
+
+| content | distinct bands | band range `max - min + 1` |
+| --- | --- | --- |
+| bundled 1080p sample, luma 16x16 (n=168,840) | mean 6.4, 38.4% <=4 | mean 6.4, 38.4% <=4, 68.6% <=8 |
+| synthetic 640x352 luma 16x16 (n=1,760) | mean 10.0 | **mean 15.5, 0% <=8** |
+| synthetic 640x352 chroma 8x8 (n=3,520) | mean 3.2 | mean 3.4, 100% <=4 |
+
+Real video is sparse. The synthetic content this group searches is not, because
+its luma wraps a gradient at `& 0xff`. **So the one shape with a sparse-CTB
+advantage has no sparse luma CTB to take it on in the group that decides** -
+worth knowing before writing it, which is why it was measured before writing it.
+
+**Narrowing the accumulators is a loss on its own, which is the opposite of the
+premise.** `bench_band_offset_rect` times the two rectangles the site is
+actually called with - a 16x16 luma CTB and an 8x8 chroma CTB - including the
+per-CTB zeroing and fold a whole-CTB accumulator has to pay and a per-row one
+does not. Intel Core i9-10850K, minimum of 15 interleaved rounds, reproducing to
++/-0.03 across independent runs:
+
+| arm | luma 16x16 | chroma 8x8 |
+| --- | ---: | ---: |
+| rows (reference) | 1.00x | 1.00x |
+| lane scatter into `BandStats` (#340's kernel) | 1.07-1.09x | 0.98-1.02x |
+| narrow scalar control | **0.80-0.81x** | **0.66-0.70x** |
+| avx2 narrow | 0.99-1.03x | 0.77-0.80x |
+| avx2 narrow, fold deleted | 1.06-1.11x | 0.94-0.99x |
+| avx2 transposed | 0.84-0.86x | 0.61-0.65x |
+| avx2 transposed, 4-band range | 1.05-1.13x | 0.62-0.65x |
+
+Read the control row first: narrowing and splitting the accumulators, with no
+vector unit involved at all, reads **0.66-0.81x**. The narrow histogram costs
+more than the width it saves, and `u16` counts were worse again than the `u32`
+this table was taken at. Two `u32`-counted sets are also 512 bytes - exactly
+what `BandStats` costs - so the "halves the traffic" half of the idea and the
+"splits the dependency chain" half are in direct tension, and only one of them
+can hold at a time.
+
+The `fold deleted` row is the ceiling. It prices away the one cost this shape
+adds that a per-row `BandStats` does not, so **no rewiring of the caller to
+consume the narrow accumulator directly could beat it**. Even there it reads
+1.06-1.11x on luma and 0.94-0.99x on chroma against a wide-scatter kernel
+already at 1.07-1.09x and 0.98-1.02x in the same rounds: not distinguishable
+from the kernel #340 measured and #382 showed does not transfer.
+
+**And it does not separate in the encoder either**, which is the criterion the
+last two attempts failed. Paired branch-against-base, both trees built and timed
+on one host and interleaved within a round, five rounds per draw, with
+`band_offset_rect` dispatching to the narrow kernels in the branch and to the
+row reference in the base. The `scalar` arm is the control: it resolves to the
+same row reference in both trees, so it has to read 1.00x.
+
+<!-- ISSUE-406-ENCODER-TABLE -->
+
+**Do not spend a fourth attempt on this dispatch site.** Three shapes across
+three issues now agree, and none of the three guessed causes survived: not the
+denominator (#382 measured the band search at 23-29% of this group's `avx2`
+arm), not the call shape (#382 measured once-per-CTB as worse than
+once-per-row), and not the accumulator width (#406 measured narrowing as a loss
+before any vector unit is involved). What is left is that a 32-way scatter over
+a CTB is already close to what this classification costs, and the isolated
+harness's 1.10-1.53x is a figure for a loop the encoder does not run.
+`band_offset_rect` is kept as the site's entry point so the site keeps a named
+dispatch point with a bit-exactness harness pointed at it; all five x86 rect
+kernels stay `#[cfg(test)]` alongside the six once-per-row candidates, asserted
+bit-exact, as the apparatus these figures were taken with.
 
 **AVX-512 was timed and does not separate even in isolation.**
 `ubuntu-latest` draws AVX-512CD hosts, so the `vpconflictd` shape #305 pointed

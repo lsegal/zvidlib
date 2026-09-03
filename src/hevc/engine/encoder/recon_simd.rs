@@ -536,11 +536,90 @@ pub(crate) fn band_offset_row(here: &[i32], src: &[u8], stats: &mut BandStats) {
 /// registers across a whole CTB rather than in 32 memory slots re-read per row,
 /// and that is a different kernel rather than this one re-shaped.
 ///
+/// # That decomposition has now been written and measured, and it is a null
+/// result. This site is closed.
+///
+/// #406 built it. Three shapes, all asserted bit-exact against
+/// [`band_offset_row_scalar`] under every `simd::set_override` pin over strided
+/// rectangles by `the_x86_narrow_band_rect_kernels_match_the_row_reference`:
+///
+/// - [`band_offset_rect_narrow_scalar`], the portable control, which narrows and
+///   splits the accumulators and vectorizes nothing, so the measurement can
+///   attribute a result to the accumulator rather than to the classification;
+/// - [`x86::band_offset_rect_avx2_narrow`] and its SSE4.1 twin, which are
+///   [`x86::band_offset_row_avx2_lanes`]'s classification and lane scatter over
+///   [`NarrowBandStats`] instead of two `[i64; 32]` arrays;
+/// - [`x86::band_offset_rect_avx2_transposed`], which is the register-resident
+///   shape proper — a masked pass per band with the histogram in `ymm`
+///   registers, no memory histogram and no scatter at all.
+///
+/// **The occupancy the transposed shape needs was measured first**, in
+/// `tests/sao_band_occupancy.rs`, because that shape's cost is proportional to
+/// the bands it visits and only the band *range* is derivable at a price it can
+/// pay. Real video is sparse: over 168,840 CTBs of the bundled 1080p sample the
+/// mean range is 6.4 and 38.4% of CTBs occupy 4 bands or fewer. The synthetic
+/// content `hevc_encode_640x352_reconstruct` searches is not, because its luma
+/// wraps a gradient at `& 0xff` — mean range 15.5, nothing at all at 8 or below,
+/// while its chroma is 3.4 everywhere. So the one shape with a sparse-CTB
+/// advantage has no sparse luma CTB to take it on in the group that decides.
+///
+/// **Narrowing the accumulators is a loss on its own, which is the opposite of
+/// the premise.** `bench_band_offset_rect` times the two rectangles this entry
+/// is actually called with, a 16x16 luma CTB and an 8x8 chroma CTB, including
+/// the per-CTB zeroing and fold a whole-CTB accumulator has to pay and a
+/// per-row one does not. Intel Core i9-10850K, minimum of 15 interleaved
+/// rounds, reproducing to ±0.03 across independent runs:
+///
+/// | arm | luma 16x16 | chroma 8x8 |
+/// |---|---|---|
+/// | rows (reference) | 1.00x | 1.00x |
+/// | lane scatter into `BandStats` (#340's kernel) | 1.07-1.09x | 0.98-1.02x |
+/// | narrow scalar control | 0.80-0.81x | 0.66-0.70x |
+/// | avx2 narrow | 0.99-1.03x | 0.77-0.80x |
+/// | avx2 narrow, fold deleted | 1.06-1.11x | 0.94-0.99x |
+/// | avx2 transposed | 0.84-0.86x | 0.61-0.65x |
+/// | avx2 transposed, 4-band range | 1.05-1.13x | 0.62-0.65x |
+///
+/// Read the control row first. Narrowing and splitting the accumulators, with
+/// no vector unit involved at all, reads **0.66-0.81x** — the narrow histogram
+/// costs more than the width it saves, and `u16` counts were worse again than
+/// the `u32` the table was taken at. The `fold deleted` row is the ceiling: it
+/// prices away the one cost this shape adds that a per-row `BandStats` does not,
+/// so no rewiring of [`crate::hevc::engine::encoder::recon::band_stats`] to
+/// consume [`NarrowBandStats`] directly could beat it. Even there the narrow
+/// kernel reads 1.06-1.11x on luma and 0.94-0.99x on chroma, against a
+/// wide-scatter kernel already at 1.07-1.09x and 0.98-1.02x in the same rounds.
+/// **It is not distinguishable from the kernel #340 measured and #382 showed
+/// does not transfer**, and the transposed shape is behind both except on a
+/// 4-band luma CTB the deciding content does not contain.
+///
+/// **And it does not separate in the encoder either**, which is the criterion
+/// the last two attempts failed. Paired branch-against-base, both trees built
+/// and timed on one host and interleaved within a round, five rounds per draw,
+/// with this entry dispatching to the narrow kernels in the branch and to the
+/// row reference in the base. The `scalar` arm is the control: it resolves to
+/// the same row reference in both trees, so it has to read 1.00x.
+///
+/// See `benches/README.md` for the draws grouped by CPU model. Nothing
+/// separates: every `avx2` and `sse4.1` figure sits inside a band its own
+/// control is already inside, and the `avx2` arm's central tendency is slightly
+/// *below* parity rather than above it.
+///
+/// **Do not spend a fourth attempt on this dispatch site.** Three shapes across
+/// three issues now agree, and the reason is not any of the three causes that
+/// were guessed: it is not the denominator (#382 measured the band search at
+/// 23-29% of this group's `avx2` arm), not the call shape (#382 measured
+/// once-per-CTB as worse than once-per-row), and not the accumulator width
+/// (#406 measured narrowing as a loss before any vector unit is involved). What
+/// is left is that a 32-way scatter over a CTB is already near what this
+/// classification costs, and the isolated harness's 1.10-1.53x is a figure for a
+/// loop the encoder does not run.
+///
 /// This entry is therefore kept, resolving to the scalar reference on every
-/// instruction set, so a future attempt starts from the once-per-CTB shape
-/// without re-deriving that the once-per-row one is not the cost. Both x86 rect
-/// kernels stay `#[cfg(test)]` beside the six once-per-row candidates, asserted
-/// bit-exact, as the apparatus the figures above were taken with.
+/// instruction set, so the site keeps a named dispatch point with a
+/// bit-exactness harness pointed at it. All five x86 rect kernels stay
+/// `#[cfg(test)]` beside the six once-per-row candidates, asserted bit-exact, as
+/// the apparatus these figures were taken with.
 ///
 /// `here_stride` and `src_stride` are the two planes' own row pitches; `here`
 /// and `src` start at the rectangle's first sample.
@@ -568,55 +647,17 @@ pub(crate) fn band_offset_rect(
         src.len() >= (height - 1) * src_stride + width,
         "source rectangle runs past the plane"
     );
-    match isa_code() {
-        #[cfg(target_arch = "x86_64")]
-        ISA_AVX2 => {
-            let mut narrow = NarrowBandStats::default();
-            // SAFETY: the rectangle lies inside both planes, asserted above, and
-            // this arm is only reachable with AVX2 available.
-            unsafe {
-                x86::band_offset_rect_avx2_narrow(
-                    here,
-                    here_stride,
-                    src,
-                    src_stride,
-                    width,
-                    height,
-                    &mut narrow,
-                );
-            }
-            narrow.fold_into(stats);
-        }
-        #[cfg(target_arch = "x86_64")]
-        ISA_SSE41 => {
-            let mut narrow = NarrowBandStats::default();
-            // SAFETY: as above, with SSE4.1 detected.
-            unsafe {
-                x86::band_offset_rect_sse41_narrow(
-                    here,
-                    here_stride,
-                    src,
-                    src_stride,
-                    width,
-                    height,
-                    &mut narrow,
-                );
-            }
-            narrow.fold_into(stats);
-        }
-        // The scalar arm keeps the once-per-row reference exactly as it was, so
-        // it stays the control the paired branch-against-base method reads
-        // 1.00x from: a control that changed with the branch would answer
-        // nothing.
-        _ => {
-            for y in 0..height {
-                band_offset_row_scalar(
-                    &here[y * here_stride..y * here_stride + width],
-                    &src[y * src_stride..y * src_stride + width],
-                    stats,
-                );
-            }
-        }
+    // Every instruction set resolves to the scalar reference. #382 measured the
+    // once-per-CTB lane-scatter shape against it as a regression, and #406
+    // measured all three narrow and register-resident shapes as a null result -
+    // in isolation and, the criterion that decides, in
+    // `hevc_encode_640x352_reconstruct`. See above.
+    for y in 0..height {
+        band_offset_row_scalar(
+            &here[y * here_stride..y * here_stride + width],
+            &src[y * src_stride..y * src_stride + width],
+            stats,
+        );
     }
 }
 
@@ -661,6 +702,7 @@ pub(crate) fn band_offset_row_scalar(here: &[i32], src: &[u8], stats: &mut BandS
 /// reads a mean of 6.4 distinct bands per 256-sample CTB on real video. Two
 /// interleaved sets let two such chains run at once and are folded together at
 /// the end of the CTB, which costs 32 pairs of adds once rather than per row.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct NarrowBandStats {
     /// Summed `source − reconstruction` error per band, per partial set.
@@ -684,8 +726,10 @@ pub(crate) struct NarrowBandStats {
 /// split exists to break. The two halves of the idea are in direct tension, and
 /// the measurement recorded at [`band_offset_rect`] is what that tension is
 /// worth.
+#[cfg(test)]
 pub(crate) const NARROW_SETS: usize = 2;
 
+#[cfg(test)]
 impl Default for NarrowBandStats {
     fn default() -> Self {
         Self {
@@ -695,6 +739,7 @@ impl Default for NarrowBandStats {
     }
 }
 
+#[cfg(test)]
 impl NarrowBandStats {
     /// Folds the partial sets together and widens them into `stats`, adding to
     /// whatever it already holds the way the row kernels do.
@@ -723,6 +768,7 @@ impl NarrowBandStats {
 /// below do both at once, and #340 and #382 between them have already shown that
 /// attributing a band-search result to the wrong half of a kernel costs an issue
 /// to undo.
+#[cfg(test)]
 pub(crate) fn band_offset_rect_narrow_scalar(
     here: &[i32],
     here_stride: usize,
@@ -761,9 +807,9 @@ const EDGE_IDX_BY_CATEGORY: [i32; 4] = [0, 1, 3, 4];
 
 #[cfg(target_arch = "x86_64")]
 mod x86 {
-    use super::{
-        BAND_SHIFT, BIT_DEPTH_MAX, BandStats, EDGE_IDX_BY_CATEGORY, EdgeStats, NarrowBandStats,
-    };
+    use super::{BAND_SHIFT, BIT_DEPTH_MAX, BandStats, EDGE_IDX_BY_CATEGORY, EdgeStats};
+    #[cfg(test)]
+    use super::NarrowBandStats;
     use std::arch::x86_64::*;
 
     /// Sum of the four `i32` lanes.
@@ -1195,6 +1241,7 @@ mod x86 {
     /// The eight lanes alternate between the two sets in pairs, which is what
     /// splits the dependency chain: lanes 0,1,4,5 into set 0 and 2,3,6,7 into
     /// set 1, so two runs of same-band neighbours accumulate independently.
+    #[cfg(test)]
     #[target_feature(enable = "avx2")]
     pub(super) unsafe fn band_offset_rect_avx2_narrow(
         here: &[i32],
@@ -1250,6 +1297,7 @@ mod x86 {
     /// CTB row narrower than eight samples — every chroma row of an 8x8 chroma
     /// CTB is exactly eight, but a picture edge can be narrower — still reaches
     /// a vector arm rather than dropping to the tail loop.
+    #[cfg(test)]
     #[target_feature(enable = "sse4.1")]
     pub(super) unsafe fn band_offset_rect_sse41_narrow(
         here: &[i32],
@@ -1298,6 +1346,7 @@ mod x86 {
     /// rather than an addressable array: a loop over `0..TRANSPOSED_BANDS` would
     /// force `acc` and `cnt` to the stack, which is the memory histogram this
     /// whole shape exists to avoid.
+    #[cfg(test)]
     macro_rules! seq_bands {
         ($j:ident => $body:block) => {{
             {
@@ -1373,6 +1422,7 @@ mod x86 {
     /// nothing at all below 8. Its chroma is the opposite, at a range of 3.4
     /// everywhere. See [`super::band_offset_rect`] for what that asymmetry did
     /// to the result.
+    #[cfg(test)]
     #[target_feature(enable = "avx2")]
     pub(super) unsafe fn band_offset_rect_avx2_transposed(
         here: &[i32],
