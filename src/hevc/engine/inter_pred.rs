@@ -2315,6 +2315,94 @@ mod tests {
     /// both exercised on every backend.
     const ORIGINS: [(i32, i32); 5] = [(9, 7), (-5, 3), (2, -6), (70, 40), (-3, -3)];
 
+    /// The width threshold in `narrows` is one number for every backend,
+    /// and #440 is why it is not one number per backend.
+    ///
+    /// The 8x8 vertical-only cell reads 0.95-0.97x on `avx2` on the
+    /// i9-10850K, which is what asked the question, and 1.01x on an EPYC
+    /// 7763, 0.99-1.00x on a Xeon 6973P-C and 1.61-1.67x on a Core
+    /// i7-8700B on that same backend, which is what answered it: the
+    /// spread at that width is between hosts, not between instruction
+    /// sets, so a per-backend minimum of 16 for `Avx2` would have been
+    /// drawn from the one host of four where AVX2 is weakest there.
+    /// `benches/README.md` carries every host's readings.
+    ///
+    /// This asserts the shape of that decision rather than its numbers:
+    /// every vector backend admits exactly the same widths, the
+    /// threshold is eight, and the other three conditions still gate it
+    /// independently of the width. A later per-backend threshold has to
+    /// delete this test, which is the point — the evidence for one is in
+    /// the README and says no.
+    #[test]
+    fn the_width_threshold_is_one_number_on_every_backend() {
+        let (pw, ph) = (96usize, 72usize);
+        let plane_samples = pseudo_random(8, pw * ph, 255);
+        let mirror: Vec<i16> = plane_samples.iter().map(|&s| s as i16).collect();
+        let wide = RefPlane::new(&plane_samples, pw, ph).unwrap();
+        // Both plane representations, because they admit different
+        // phases: the width threshold has to be the same number for the
+        // phases a mirrored plane adds as for the one it does not.
+        let mirrored = RefPlane::with_narrow(&plane_samples, &mirror, pw, ph).unwrap();
+
+        let vector_isas: Vec<Isa> = simd::available_isas()
+            .into_iter()
+            .filter(|&isa| isa != Isa::Scalar)
+            .collect();
+        assert!(
+            !vector_isas.is_empty(),
+            "the host offers no vector backend, so `narrows` is false everywhere"
+        );
+        assert!(
+            narrow_interp::override_value().is_none(),
+            "an override is in force, so this would pin it rather than the shipped decision"
+        );
+
+        // (horizontal, vertical), and the plane representation that
+        // makes each one narrow at all.
+        let narrowing_phases = [
+            ((false, true), &wide),
+            ((false, true), &mirrored),
+            ((true, false), &mirrored),
+            ((true, true), &mirrored),
+        ];
+        for isa in vector_isas {
+            for ((horizontal, vertical), plane) in narrowing_phases {
+                for w in [2usize, 4, 6, 7] {
+                    assert!(
+                        !narrows(isa, plane, 8, w, horizontal, vertical),
+                        "{isa:?} narrows a {w}-wide row, which never reaches the 16-bit vector loop"
+                    );
+                }
+                for w in [8usize, 12, 16, 24, 32, 64] {
+                    assert!(
+                        narrows(isa, plane, 8, w, horizontal, vertical),
+                        "{isa:?} declines a {w}-wide block at ({horizontal}, {vertical}); the \
+                         threshold is eight on every backend (#440)"
+                    );
+                    // The width condition is necessary, not sufficient:
+                    // the others still decide, and #440 moved none of them.
+                    assert!(
+                        !narrows(isa, plane, 10, w, horizontal, vertical),
+                        "{isa:?} narrows ten-bit content at {w}, where the accumulator overflows"
+                    );
+                    assert!(
+                        !narrows(Isa::Scalar, plane, 8, w, horizontal, vertical),
+                        "the scalar backend narrows at {w}, where it is a loss at every row length"
+                    );
+                    assert!(
+                        !narrows(isa, plane, 8, w, false, false),
+                        "{isa:?} narrows the full-pel phase at {w}, which accumulates no taps"
+                    );
+                    assert!(
+                        !narrows(isa, &wide, 8, w, true, false),
+                        "{isa:?} narrows a horizontal-only block at {w} out of a plane that does \
+                         not borrow narrow, where the pass costs what the lanes save"
+                    );
+                }
+            }
+        }
+    }
+
     /// The eight-bit block path accumulates at 16-bit width, and this
     /// is what holds that formulation against the normative per-sample
     /// §8.5.3.3.3.2 / §8.5.3.3.3.3 equations rather than against

@@ -940,7 +940,12 @@ pool — which is where this file's other multi-model x86_64 readings come from,
 `ubuntu-latest` being a pool of several CPU models — three consecutive
 invocations of the same binary per host, the same in-process interleaved
 best-of-fifteen instrument, the arms asserted equal sample-for-sample before
-anything is timed.
+anything is timed. To re-take it, run `cargo test --release --features native
+--lib measure_narrow_vs_wide_block -- --ignored --nocapture` from a workflow job
+on `ubuntu-latest` and `macos-15-intel`, and name the model each draw landed on:
+a ratio that is not attributed to a CPU model is attributed to nothing, and the
+two `ubuntu-latest` draws below are two different models for exactly that
+reason.
 
 **The vertical-only cell at 8x8, which is the one the routing turns on**, in the
 shipped arrangement — the sweep's `copied` column, since #427 established that a
