@@ -5,7 +5,7 @@
   "scripts": {
     "build:wasm": "wasm-pack build ../.. --target web --out-dir examples/web_canvas/pkg --no-default-features --features web",
     "dev": "pnpm run build:wasm && vite",
-    "test": "node --test scrub.test.js"
+    "test": "node --test ."
   },
   "devDependencies": {
     "vite": "^5.4.11"

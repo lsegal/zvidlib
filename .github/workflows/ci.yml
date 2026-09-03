@@ -133,9 +133,17 @@ jobs:
       # The web example makes the same scrubbing decisions `native_gl` does - the random-access
       # restart, the measured stride, the walk's next step - and its copy of them had nothing
       # asserting it (#380). Node's built-in runner, so this needs no install step and no
-      # dependency the example does not already have.
-      - name: Test the web example's scrub walk
-        run: node --test examples/web_canvas/scrub.test.js
+      # dependency the example does not already have. The directory rather than
+      # `scrub.test.js`: which bundled sample the page opens is a decision of the same kind and
+      # has its own `samples.test.js` beside it (#441), and naming one file is how the second
+      # one would go unrun.
+      - name: Test the web example's pure decisions
+        run: node --test examples/web_canvas/
+      # `samples.test.js` can only check the choice, not the claim it is made from: the codec
+      # string the page probes with is written down in JavaScript, so this demuxes each declared
+      # sample and asserts the declaration against what zvidlib derives from the track itself.
+      - name: Check the web example's samples match their declarations
+        run: cargo test --features native --test web_canvas_samples_match_their_files
       # The HEVC/AV1 engine unit tests are pure numerics, and the inter-prediction
       # ones compare every SIMD backend the runner's CPU offers against the scalar
       # reference — which is how the x86_64 SSE4.1/AVX2 kernels get covered at all,
