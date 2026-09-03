@@ -35,7 +35,7 @@ use std::time::Duration;
 
 use crate::api::{Error, ErrorKind, Limits, Result};
 use crate::codec::{
-    CancellationToken, EncodedVideoSample, ExactFrameReader, VideoDecoderConfig,
+    CancellationToken, EncodedVideoSample, ExactFrameReader, SeekPreviewSource, VideoDecoderConfig,
     VideoDecoderFactory,
 };
 use crate::media::{PixelFormat, Plane, VideoDimensions, VideoFrame};
@@ -125,6 +125,11 @@ impl Store {
     /// behind it rather than nothing, which is what makes the index useful while
     /// it is still being built.
     fn nearest(&self, frame: u64) -> Option<VideoFrame> {
+        self.nearest_at(frame).map(|(_, preview)| preview)
+    }
+
+    /// [`Self::nearest`], with the frame the picture it returned is actually of.
+    fn nearest_at(&self, frame: u64) -> Option<(FrameIndex, VideoFrame)> {
         if self.slots.is_empty() {
             return None;
         }
@@ -132,16 +137,20 @@ impl Store {
         for distance in 0..self.slots.len() {
             if distance <= slot {
                 if let Some(preview) = self.slots[slot - distance].as_ref() {
-                    return Some(preview.clone());
+                    return Some((self.frame_of(slot - distance), preview.clone()));
                 }
             }
             if distance > 0 {
                 if let Some(preview) = self.slots.get(slot + distance).and_then(Option::as_ref) {
-                    return Some(preview.clone());
+                    return Some((self.frame_of(slot + distance), preview.clone()));
                 }
             }
         }
         None
+    }
+
+    fn frame_of(&self, slot: usize) -> FrameIndex {
+        FrameIndex(slot as u64 * self.stride)
     }
 }
 
@@ -252,6 +261,18 @@ impl PreviewIndex {
     /// to call from an event loop.
     pub fn nearest(&self, frame: u64) -> Option<VideoFrame> {
         self.store.lock().ok()?.nearest(frame)
+    }
+}
+
+/// The index is what [`ExactFrameReader::seek`] answers a position from, and the
+/// reader reaches it through this trait rather than by name: the reader is
+/// portable and this module is not, so a browser-side source implements the same
+/// method against whatever it can decode ahead.
+///
+/// [`ExactFrameReader::seek`]: crate::codec::ExactFrameReader::seek
+impl SeekPreviewSource for PreviewIndex {
+    fn nearest_at(&self, frame: FrameIndex) -> Option<(FrameIndex, VideoFrame)> {
+        self.store.lock().ok()?.nearest_at(frame.0)
     }
 }
 
