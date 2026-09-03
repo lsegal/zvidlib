@@ -877,7 +877,7 @@ condition, which is a NEON reading. This is a real gap in the evidence for a
 *different* condition than the one #435 set out to settle, it costs at most a
 few percent of one phase of one stage on the width where it is wrong, and
 tightening it means making the threshold instruction-set-dependent — so it is
-filed as follow-up work rather than changed here on one host's draw.
+filed as **#440** rather than changed here on one host's draw.
 
 Same kernel in all three rows, at 1.89x to 2.1x in isolation, and only the
 middle row keeps any of it. **What separates them is who pays to narrow the source.** The

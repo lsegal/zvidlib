@@ -557,7 +557,7 @@ fn interp_block<const N: usize>(
 ///   (`avx2`) against NEON's 1.37x, so the threshold is right for NEON
 ///   and about a wash to marginally wrong for x86_64. Raising it there
 ///   means making it instruction-set-dependent, which #435 left as
-///   follow-up work rather than doing on one host's draw.
+///   follow-up work in #440 rather than doing on one host's draw.
 /// * **The vertical-only phase**, and this is the one that is about the
 ///   caller rather than the kernel. `measure_narrow_vs_wide_block` reads
 ///   the vertical-only phase at 1.08x to 1.77x and the horizontal-only
