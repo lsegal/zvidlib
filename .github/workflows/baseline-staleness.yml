@@ -1,0 +1,70 @@
+name: Baseline staleness
+
+# The one check in this repository whose entire input is a Markdown file, so it
+# is the one check `ci.yml`'s `paths-ignore: ['**/*.md']` must not cover. A
+# committed-baseline draw edits `benches/README.md` and nothing else - that is
+# what a draw *is* (#423/#444, #445/#447) - and under `paths-ignore` the report
+# was skipped by exactly the change it exists to check, on the branch and after
+# the merge, leaving it to be dispatched by hand afterwards (#449).
+#
+# It lives in its own workflow rather than in `ci.yml` because its trigger is
+# the opposite of that workflow's: this runs *because* prose changed. Splitting
+# it keeps both halves - a Markdown-only change still does not pay for the
+# `Rust checks` matrix, the benchmark suite or the delta report, and it still
+# gets the report. Standard library Python over two text files, so there is no
+# toolchain, no cargo and no cache here; the job is seconds.
+#
+# The two `paths:` lists are written out twice rather than shared, because
+# GitHub Actions does not resolve YAML anchors;
+# `tests/ci_staleness_report_sees_markdown_changes.rs` asserts they stay in
+# step, and that this workflow keeps no `paths-ignore` of its own.
+on:
+  push:
+    branches: [main]
+    # The report's real inputs: the committed tables, the dispatch-site
+    # registry it compares them against (`criterion_baseline.SIMD_SOURCE`), the
+    # script itself, and this file.
+    paths:
+      - 'benches/README.md'
+      - 'src/simd.rs'
+      - '.github/scripts/criterion_baseline.py'
+      - '.github/workflows/baseline-staleness.yml'
+  pull_request:
+    paths:
+      - 'benches/README.md'
+      - 'src/simd.rs'
+      - '.github/scripts/criterion_baseline.py'
+      - '.github/workflows/baseline-staleness.yml'
+  # A table can go stale without any of the paths above changing - the stamp
+  # resolver reads a commit that may since have been garbage-collected - so the
+  # report is also runnable on demand.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: staleness-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  staleness:
+    name: Report stale committed baseline tables
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Reports, never fails: a committed baseline row that predates the
+      # dispatch site it measures is a table to redraw, not a broken build -
+      # the same call the delta report's 15% threshold makes. `continue-on-
+      # error` covers the resolver rather than the finding: a stamp is usually
+      # a checkpoint commit on a deleted branch, so reading `src/simd.rs` at it
+      # goes through the contents API and a rate limit or an outage must not
+      # take the job down with it.
+      - name: Report stale committed baseline tables
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 .github/scripts/criterion_baseline.py staleness \
+            --readme benches/README.md --out staleness.md
+          cat staleness.md >> "$GITHUB_STEP_SUMMARY"
