@@ -68,7 +68,8 @@ jobs:
       - name: Install native audio dependencies
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - name: Report the host
-        run: echo "# host cpu model: $(grep -m1 '^model name' /proc/cpuinfo | cut -d: -f2- | xargs)"
+        run: |
+          echo "# host cpu model: $(grep -m1 '^model name' /proc/cpuinfo | cut -d: -f2- | xargs)"
       - name: Lay out the two worktrees
         run: |
           git worktree add --detach "$RUNNER_TEMP/base" "$BASE_SHA"
