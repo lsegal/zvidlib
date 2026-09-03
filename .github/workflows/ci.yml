@@ -82,21 +82,11 @@ jobs:
       # measurement was dropped - and nothing else in CI executes it.
       - name: Test the benchmark baseline script
         run: python3 -m unittest discover -s .github/scripts -v
-      # Reports, never fails: a committed baseline row that predates the
-      # dispatch site it measures is a table to redraw, not a broken build -
-      # the same call the delta report's 15% threshold makes. `continue-on-
-      # error` covers the resolver rather than the finding: a stamp is usually
-      # a checkpoint commit on a deleted branch, so reading `src/simd.rs` at it
-      # goes through the contents API and a rate limit or an outage must not
-      # take the job down with it.
-      - name: Report stale committed baseline tables
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          python3 .github/scripts/criterion_baseline.py staleness \
-            --readme benches/README.md --out staleness.md
-          cat staleness.md >> "$GITHUB_STEP_SUMMARY"
+      # The staleness report used to run here and is now `baseline-staleness.yml`:
+      # its whole input is `benches/README.md`, and the `paths-ignore` above
+      # meant the changes that edit that file were exactly the changes that
+      # skipped it (#449). The unit tests of the script it runs stay here,
+      # since those depend on the script rather than on the tables.
       - name: Test AV1 SIMD kernels against the scalar path
         run: cargo test --features native --lib av1_simd -- --nocapture
       # The kernels being bit-exact is not the same as their being fast, and
@@ -133,9 +123,17 @@ jobs:
       # The web example makes the same scrubbing decisions `native_gl` does - the random-access
       # restart, the measured stride, the walk's next step - and its copy of them had nothing
       # asserting it (#380). Node's built-in runner, so this needs no install step and no
-      # dependency the example does not already have.
-      - name: Test the web example's scrub walk
-        run: node --test examples/web_canvas/scrub.test.js
+      # dependency the example does not already have. A glob rather than `scrub.test.js`: which
+      # bundled sample the page opens is a decision of the same kind and has its own
+      # `samples.test.js` beside it (#441), and naming one file is how the second one would go
+      # unrun. Not the bare directory - `node --test <dir>` resolves it as a module and fails.
+      - name: Test the web example's pure decisions
+        run: node --test 'examples/web_canvas/*.test.js'
+      # `samples.test.js` can only check the choice, not the claim it is made from: the codec
+      # string the page probes with is written down in JavaScript, so this demuxes each declared
+      # sample and asserts the declaration against what zvidlib derives from the track itself.
+      - name: Check the web example's samples match their declarations
+        run: cargo test --features native --test web_canvas_samples_match_their_files
       # The HEVC/AV1 engine unit tests are pure numerics, and the inter-prediction
       # ones compare every SIMD backend the runner's CPU offers against the scalar
       # reference — which is how the x86_64 SSE4.1/AVX2 kernels get covered at all,

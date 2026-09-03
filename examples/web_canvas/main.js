@@ -1,5 +1,5 @@
 // See examples/README.md for setup: build the wasm package into ./pkg before serving this
-// directory over HTTP(S). BigBuckBunny.mp4 is already symlinked in from examples/media/.
+// directory over HTTP(S). Both samples are already symlinked in from examples/media/.
 import init, {
   MediaInput,
   PreviewOptions,
@@ -9,6 +9,9 @@ import init, {
 // The walk's pure decisions live apart from the browser wiring so `scrub.test.js` can assert
 // them, the way `examples/native_gl/scrub.rs` asserts its own copy of the same rules.
 import { scrubWalkStart, shouldDrawPreview } from "./scrub.js";
+// Which sample this browser can decode is a decision of the same kind, kept in `samples.js` and
+// asserted by `samples.test.js`; see that file for why there is more than one to choose from.
+import { SAMPLES, decoderConfig, supportedSamples } from "./samples.js";
 
 const canvas = document.querySelector("#video");
 const playButton = document.querySelector("#play");
@@ -59,8 +62,9 @@ function compileProgram(gl) {
   return program;
 }
 
-// Builds a synthetic RGBA gradient frame, used only as a fallback when the browser cannot
-// decode the sample's HEVC track via WebCodecs (see examples/README.md).
+// Builds a synthetic RGBA gradient frame, used only as a fallback when the browser cannot decode
+// any bundled sample's track via WebCodecs - which since issue #441 means a browser with neither
+// an HEVC nor an AV1 decoder, rather than merely no HEVC one (see examples/README.md).
 function syntheticFrame(width, height, phase) {
   const pixels = new Uint8Array(width * height * 4);
   for (let y = 0; y < height; y++) {
@@ -73,6 +77,75 @@ function syntheticFrame(width, height, phase) {
     }
   }
   return pixels;
+}
+
+// What this browser says it can decode, asked before anything is fetched. `isConfigSupported`
+// answers from a codec string and a coded size alone, which is exactly what `samples.js`
+// declares, so a browser with no HEVC decoder never downloads the HEVC copy of the clip.
+async function probeSupport(samples) {
+  if (!globalThis.VideoDecoder) return [];
+  const answers = new Map(
+    await Promise.all(
+      samples.map(async (sample) => {
+        try {
+          const support = await VideoDecoder.isConfigSupported(decoderConfig(sample));
+          return [sample, support?.supported === true];
+        } catch {
+          // A codec string this browser cannot even parse rejects rather than answering, which
+          // is a no like any other.
+          return [sample, false];
+        }
+      }),
+    ),
+  );
+  return supportedSamples(samples, (sample) => answers.get(sample));
+}
+
+async function openSample(sample, lines) {
+  const response = await fetch(sample.file);
+  if (!response.ok) {
+    lines.push(
+      `${sample.file}: HTTP ${response.status}. See examples/README.md for how to fetch the sample.`,
+    );
+    return null;
+  }
+  const input = await MediaInput.open(await response.blob());
+  return { input, video: input.video(0), audio: input.audio(0) };
+}
+
+// Opens the first bundled sample this browser can actually decode a frame out of (issue #441).
+//
+// The probe narrows the list without fetching, and the decode of frame zero is what settles it:
+// `isConfigSupported` answers about the codec, not about this particular file, so a sample it
+// says yes to can still reject, and the next candidate is tried rather than the page giving up.
+// When nothing decodes, the first sample is opened anyway - the page still reads its frame
+// timing, its dimensions and its audio off it and draws the synthetic gradient over them,
+// exactly as it did before there was a choice to make.
+async function openDecodableSample(lines) {
+  const supported = await probeSupport(SAMPLES);
+  lines.push(
+    supported.length > 0
+      ? `This browser reports a decoder for: ${supported.map((sample) => sample.description).join(", ")}.`
+      : "This browser reports no decoder for any bundled sample.",
+  );
+  for (const sample of supported) {
+    const opened = await openSample(sample, lines);
+    if (!opened) continue;
+    try {
+      const decodedFrame = await opened.video.get(0n);
+      lines.push(
+        `${sample.description}: video.get(0n) decoded a real ${decodedFrame.width}x${decodedFrame.height} frame.`,
+      );
+      return { ...opened, sample, decodedFrame };
+    } catch (error) {
+      lines.push(`${sample.description}: video.get(0n) rejected with ${errorCode(error)}.`);
+      opened.input.close();
+    }
+  }
+  const fallback = await openSample(SAMPLES[0], lines);
+  if (!fallback) return null;
+  lines.push("No bundled sample decodes here: falling back to a synthetic frame.");
+  return { ...fallback, sample: SAMPLES[0], decodedFrame: null };
 }
 
 async function main() {
@@ -99,31 +172,19 @@ async function main() {
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
 
-  status.textContent = "Fetching BigBuckBunny.mp4…";
-  const response = await fetch("./BigBuckBunny.mp4");
-  if (!response.ok) {
-    status.textContent = `BigBuckBunny.mp4: HTTP ${response.status}. See examples/README.md for how to fetch the sample.`;
+  status.textContent = "Choosing a sample this browser can decode…";
+  const lines = [];
+  const opened = await openDecodableSample(lines);
+  if (!opened) {
+    status.textContent = lines.join("\n");
     return;
   }
-
-  const input = await MediaInput.open(await response.blob());
-  const video = input.video(0);
-  const audio = input.audio(0);
-  const lines = [
-    `Opened ${input.byteLength} bytes.`,
+  const { input, video, audio, sample, decodedFrame } = opened;
+  lines.push(
+    `Opened ${sample.file} (${sample.description}), ${input.byteLength} bytes.`,
     `Video stream 0 direction: ${video.direction}`,
     `Audio stream 0 direction: ${audio.direction}`,
-  ];
-
-  // Real decoding depends on the browser having an HEVC WebCodecs decoder; fall back to a
-  // synthetic gradient sized to the track when it doesn't (see examples/README.md).
-  let decodedFrame = null;
-  try {
-    decodedFrame = await video.get(0n);
-    lines.push(`video.get(0n) decoded a real ${decodedFrame.width}x${decodedFrame.height} frame.`);
-  } catch (error) {
-    lines.push(`video.get(0n) rejected with ${errorCode(error)}: falling back to a synthetic frame.`);
-  }
+  );
   const useRealDecode = decodedFrame !== null;
   let audioState = null;
   try {
@@ -357,8 +418,8 @@ async function main() {
   let scrubMsPerFrame = null;
 
   async function scrubTo(index) {
-    // Without a browser HEVC decoder there is nothing to walk through: the synthetic frames are
-    // generated from the index, so the ordinary seek draws them at once.
+    // With no decoder for any bundled sample there is nothing to walk through: the synthetic
+    // frames are generated from the index, so the ordinary seek draws them at once.
     if (!useRealDecode) return requestSeek(index, false);
     scrubTarget = Math.min(Math.max(index, 0), lastFrameIndex);
     // Answer the seek before starting the walk, on every pointer sample rather than only on the

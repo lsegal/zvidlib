@@ -1813,6 +1813,19 @@ check answers "does a row name a site that did not exist yet"; it cannot answer
 "did the kernel behind an existing site change", because that needs the commit
 built rather than read.
 
+It runs in CI as `.github/workflows/baseline-staleness.yml`, on pull requests
+and on pushes to `main`, filtered to the paths it actually reads: this file,
+`src/simd.rs`, the script, and the workflow. It is a workflow of its own rather
+than a step of `ci.yml` because that workflow is `paths-ignore: '**/*.md'`, and
+a draw against a committed table *is* a change to this file and nothing else —
+so the report was skipped by exactly the change it exists to check, and the
+#445 and #423 draws both had to dispatch it by hand afterwards (#449). The
+split keeps both halves: a prose change gets the report and still does not pay
+for the `Rust checks` matrix, the benchmark suite or the delta report. It
+reports and does not gate, there as here — a stale row is a table to redraw,
+not a broken build — and the arrangement is pinned by
+`tests/ci_staleness_report_sees_markdown_changes.rs`.
+
 Three things about how it reads the site set are worth stating, because each is
 a place a more obvious implementation does not work:
 

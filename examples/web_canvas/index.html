@@ -20,9 +20,11 @@
   <h1>zvidlib WebGL canvas example</h1>
   <p>
     Opens the Big Buck Bunny sample, decodes it with zvidlib's browser WebCodecs backend, and
-    renders the real frames onto a WebGL2 canvas. If this browser can't decode the sample's HEVC
-    track, it falls back to a synthetic gradient instead; see
-    <a href="../README.md">examples/README.md</a> for details.
+    renders the real frames onto a WebGL2 canvas. The clip is bundled twice, with an HEVC track
+    and with an AV1 one, and this page asks the browser which it can decode before fetching
+    either; only a browser with neither falls back to a synthetic gradient. The status below
+    reports which sample was chosen — see <a href="../README.md">examples/README.md</a> for
+    details.
   </p>
   <div id="canvas-wrap">
     <canvas id="video" width="1280" height="720"></canvas>
