@@ -2684,7 +2684,14 @@ mod tests {
         // The three conditions #404 established, unchanged: eight-bit
         // content, a vector backend, and a row of at least eight.
         assert!(!narrows(isa, &mirrored, 10, mirrored_min, true, false));
-        assert!(!narrows(Isa::Scalar, &mirrored, 8, mirrored_min, true, false));
+        assert!(!narrows(
+            Isa::Scalar,
+            &mirrored,
+            8,
+            mirrored_min,
+            true,
+            false
+        ));
         assert!(!narrows(isa, &mirrored, 8, 4, true, false));
     }
 
