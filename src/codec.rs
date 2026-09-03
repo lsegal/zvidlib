@@ -349,6 +349,13 @@ pub struct ExactFrameReader {
     decode_position_by_presentation: HashMap<FrameIndex, usize>,
     cache: BTreeMap<FrameIndex, VideoFrame>,
     lru: VecDeque<FrameIndex>,
+    /// Presentation frames the decoder has emitted since the last reset, which is how far
+    /// continuing the open session is assumed to reach: one of these that has since been
+    /// evicted from the cache is assumed unreachable without a reset. It is only that
+    /// assumption. A decoder that emits one of them again is published again and cached, not
+    /// refused (see [`publish`]).
+    ///
+    /// [`publish`]: Self::publish
     published_since_reset: HashSet<FrameIndex>,
     /// Frames whose sample was submitted while the decoder was told nothing wanted its picture,
     /// so the decoder passed through them without producing one. Reaching one again needs the
@@ -515,8 +522,10 @@ impl ExactFrameReader {
         // the frame is unreachable without a reset: it may simply still be buffered inside the
         // decoder, pending release as more samples are submitted. The only case that truly
         // requires a reset is when the frame was already published once and evicted from the
-        // cache, since a decoder must never be asked to emit the same presentation frame twice
-        // without an intervening reset (see `publish`).
+        // cache, since a decoder is not expected to emit the same presentation frame twice
+        // without an intervening reset. That is an assumption about what continuing the session
+        // can reach, not a rule the decoder is held to: one that does emit the frame again is
+        // published a second time and cached rather than refused (see `publish`).
         //
         // A frame the decoder walked past without producing is in the same position as one that
         // was published and evicted: the decoder will not emit it again, so only a reset can
@@ -684,12 +693,16 @@ impl ExactFrameReader {
                 .remove(&output.presentation_index);
             self.in_flight_since_reset
                 .remove(&output.presentation_index);
-            if !self.published_since_reset.insert(output.presentation_index) {
-                return Err(Error::new(
-                    ErrorKind::MalformedMedia,
-                    "decoder produced the same presentation frame more than once without a reset",
-                ));
-            }
+            // A repeat of a frame already published since the last reset is not an error, and
+            // was one until issue #415. Nothing here depends on a decoder emitting each
+            // presentation frame at most once per session: `published_since_reset` only decides
+            // whether a re-request can continue the open session or has to reset, and a decoder
+            // that hands the frame back anyway makes that answer conservative rather than wrong.
+            // Refusing it rejected the whole stream as `MalformedMedia` over a backend's
+            // behaviour, and rejected it for a picture the reader was about to cache and could
+            // have answered the very request from. The `WebCodecs` backend already re-caches
+            // such a frame, so this is also what makes the two backends agree.
+            self.published_since_reset.insert(output.presentation_index);
             if !self
                 .decode_position_by_presentation
                 .contains_key(&output.presentation_index)
@@ -1077,6 +1090,120 @@ mod tests {
         fn set_output_wanted(&mut self, wanted: bool) {
             self.output_wanted = wanted;
         }
+    }
+
+    /// A decoder that hands back the previous sample's picture again alongside the current
+    /// one, as a backend that does not deduplicate its output across a session does. Both
+    /// pictures are genuine and correctly identified; the repeat is only a frame the reader has
+    /// already seen since its last reset.
+    struct ReplayFactory;
+
+    struct ReplayDecoder {
+        configuration: VideoDecoderConfig,
+        limits: Limits,
+        previous: Option<(FrameIndex, u8)>,
+    }
+
+    impl ReplayDecoder {
+        fn produce(&self, presentation_index: FrameIndex, value: u8) -> Result<DecodedVideoFrame> {
+            Ok(DecodedVideoFrame {
+                presentation_index,
+                frame: VideoFrame::new(
+                    self.configuration.coded_dimensions,
+                    PixelFormat::Gray8,
+                    ColorRange::Full,
+                    vec![Plane {
+                        data: vec![value],
+                        stride: 1,
+                    }],
+                    &self.limits,
+                )?,
+            })
+        }
+    }
+
+    impl VideoDecoderFactory for ReplayFactory {
+        fn capability(&self, _: &VideoDecoderConfig) -> CodecSupport {
+            CodecSupport::Supported {
+                implementation: CodecImplementation::Software,
+            }
+        }
+
+        fn create(
+            &self,
+            configuration: &VideoDecoderConfig,
+            limits: &Limits,
+        ) -> Result<Box<dyn VideoDecoder>> {
+            Ok(Box::new(ReplayDecoder {
+                configuration: configuration.clone(),
+                limits: *limits,
+                previous: None,
+            }))
+        }
+    }
+
+    impl VideoDecoder for ReplayDecoder {
+        fn submit(
+            &mut self,
+            sample: &EncodedVideoSample,
+            cancellation: &CancellationToken,
+        ) -> Result<Vec<DecodedVideoFrame>> {
+            cancellation.check()?;
+            let value = sample.data[0];
+            let mut outputs = Vec::new();
+            if let Some((index, previous)) = self.previous {
+                outputs.push(self.produce(index, previous)?);
+            }
+            outputs.push(self.produce(sample.presentation_index, value)?);
+            self.previous = Some((sample.presentation_index, value));
+            Ok(outputs)
+        }
+
+        fn drain(&mut self, _: &CancellationToken) -> Result<Vec<DecodedVideoFrame>> {
+            Ok(Vec::new())
+        }
+
+        fn reset(&mut self) -> Result<()> {
+            self.previous = None;
+            Ok(())
+        }
+    }
+
+    /// Issue #415: publishing a presentation frame twice within one decode session used to fail
+    /// the whole request with `MalformedMedia`, which held the backend to a rule the reader does
+    /// not depend on and threw away a picture it was about to cache.
+    #[test]
+    fn a_frame_the_decoder_emits_twice_is_cached_again_rather_than_refused() {
+        let mut reader = ExactFrameReader::new(
+            &ReplayFactory,
+            config(),
+            single_group_of_pictures(),
+            Limits::default(),
+        )
+        .unwrap();
+        let cancellation = CancellationToken::new();
+
+        // Reaching frame 3 submits samples 0 through 3, and every sample after the first
+        // republishes its predecessor, so frames 0, 1, and 2 are each published twice.
+        assert_eq!(
+            value(&reader.get(FrameIndex(3), &cancellation).unwrap()),
+            30
+        );
+        assert_eq!(
+            value(&reader.get(FrameIndex(6), &cancellation).unwrap()),
+            60
+        );
+
+        // The repeats were cached rather than refused, so the frames behind the target are
+        // still answered from the cache instead of costing another reset.
+        let resets = reader.statistics().resets;
+        let hits = reader.statistics().cache_hits;
+        assert_eq!(
+            value(&reader.get(FrameIndex(5), &cancellation).unwrap()),
+            50
+        );
+        assert_eq!(reader.statistics().resets, resets);
+        assert!(reader.statistics().cache_hits > hits);
     }
 
     /// Ten frames behind one random-access point, as the bundled sample's single group of
