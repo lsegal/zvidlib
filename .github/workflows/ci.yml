@@ -62,6 +62,13 @@ jobs:
       # every one of them is reachable from a [[bench]] target.
       - name: Check every bench source is compiled
         run: cargo test --features native --test bench_sources_compile
+      # Criterion keys a group by its name alone, so two targets claiming one
+      # name overwrite each other under target/criterion/ and a collected
+      # baseline sees whichever ran second. That is silent in a bench log and
+      # only surfaces as a committed table row that moved for no reason a commit
+      # explains, which is what issue #414 turned out to be.
+      - name: Check no two bench targets claim one criterion group
+        run: cargo test --features native --test bench_group_names_are_unique
       # The caching this workflow depends on is opt-in per job, so a job added
       # without it is slow in a way nothing else here would report.
       - name: Check every cargo CI job is cached
