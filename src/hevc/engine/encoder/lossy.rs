@@ -119,11 +119,12 @@
 //! bins outweigh what a value-range bias is worth.
 //!
 //! Those band-only bins carry no charge of their own any more. The per-CTB
-//! search is given [`coding_bins`] itself, so every candidate is scored at
-//! what `code_sao` will really write for it — one §7.3.8.3 merge flag when
-//! the cell equals a decided neighbour, and the declined flags plus the whole
-//! structure when it does not — and the two merges are candidates of the
-//! search in their own right rather than something it discovers by accident.
+//! search is given [`coding_bins`](super::recon::coding_bins) itself, so
+//! every candidate is scored at what `code_sao` will really write for it —
+//! one §7.3.8.3 merge flag when the cell equals a decided neighbour, and the
+//! declined flags plus the whole structure when it does not — and the two
+//! merges are candidates of the search in their own right rather than
+//! something it discovers by accident.
 //! What the fitted 2.5x used to stand in for was exactly that merge: edge
 //! offset picks one of four classes with §7.4.9.3 inferring its signs, so
 //! neighbours agree often, while band offset picks one of 32 positions and
@@ -2549,7 +2550,8 @@ mod tests {
     /// see the bracket that constant sat in: below 1.5x `lambda_q8` the
     /// `CURVE` line for noise 128x96 QP 32 went to -0.003 dB, and at 4x the
     /// `SWEEP` lines lost their band components entirely. There is no such
-    /// constant now — the search prices [`coding_bins`]'s own model — so what
+    /// constant now — the search prices the exact model
+    /// [`coding_bins`](super::super::recon::coding_bins) counts — so what
     /// the sweep records is the shipped decision rather than one point of a
     /// bracket.
     ///
