@@ -27,9 +27,21 @@ permissions:
 # reviewed. `main` pushes and `workflow_dispatch` runs are never cancelled -
 # the benchmark job's stored baseline is a chain, and a cancelled link is a
 # missing comparison for the run after it.
+#
+# The exemption is carried by the *group* rather than by `cancel-in-progress`,
+# which is a literal here on purpose. `cancel-in-progress: ${{ ... }}` is
+# substituted before it is read, so a `push` rendered the string `false` and
+# every non-empty string is truthy: the flag meant to protect `main` was the
+# thing cancelling it, and only when two pushes landed close enough together to
+# overlap, which is why it survived so long (#451). Instead, only a
+# `pull_request` shares a group with anything - `github.ref` is
+# `refs/pull/N/merge`, so a PR's runs supersede each other and no other PR's -
+# while a `push` or a `workflow_dispatch` keys on `github.run_id` and is
+# therefore alone in its group, where `cancel-in-progress` has nothing to act
+# on. `tests/ci_concurrency_spares_main.rs` asserts both halves.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: true
 
 jobs:
   rust:
