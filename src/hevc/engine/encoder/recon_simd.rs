@@ -600,10 +600,21 @@ pub(crate) fn band_offset_row(here: &[i32], src: &[u8], stats: &mut BandStats) {
 /// row reference in the base. The `scalar` arm is the control: it resolves to
 /// the same row reference in both trees, so it has to read 1.00x.
 ///
-/// See `benches/README.md` for the draws grouped by CPU model. Nothing
-/// separates: every `avx2` and `sse4.1` figure sits inside a band its own
-/// control is already inside, and the `avx2` arm's central tendency is slightly
-/// *below* parity rather than above it.
+/// | CPU model | draws | `avx2` | `sse4.1` | `scalar` (control) |
+/// |---|---|---|---|---|
+/// | Intel Xeon Platinum 8573C | 2 | 1.006-1.012x | 1.000-1.006x | 1.000-1.001x |
+/// | AMD EPYC 7763 64-Core | 2 | 0.991-1.005x | 0.977-0.998x | 0.999-1.001x |
+/// | AMD EPYC 9V74 80-Core (Zen 5) | 3 | **0.959-0.965x** | 0.967-0.980x | 1.002-1.005x |
+/// | Intel Core i9-10850K (local) | 1 | 0.978x | 1.003x | 1.000x |
+///
+/// **Nothing separates, and on Zen 5 it is a reproducible regression.** On both
+/// Intel parts and on EPYC 7763 every arm sits inside a band its own control is
+/// already inside. On EPYC 9V74 the `avx2` arm reads 0.959-0.965x across three
+/// independent draws, every round signed the same way, against controls of
+/// 1.002-1.005x — the same signature #340's per-row shape (0.94-0.95x on Zen 5)
+/// and #382's per-CTB shape (0.872-0.891x) both produced. A ninth leg on an
+/// Intel Xeon 6973P-C is discarded rather than reported: its control read
+/// 0.975x. See `benches/README.md` for the full record.
 ///
 /// **Do not spend a fourth attempt on this dispatch site.** Three shapes across
 /// three issues now agree, and the reason is not any of the three causes that
@@ -807,9 +818,9 @@ const EDGE_IDX_BY_CATEGORY: [i32; 4] = [0, 1, 3, 4];
 
 #[cfg(target_arch = "x86_64")]
 mod x86 {
-    use super::{BAND_SHIFT, BIT_DEPTH_MAX, BandStats, EDGE_IDX_BY_CATEGORY, EdgeStats};
     #[cfg(test)]
     use super::NarrowBandStats;
+    use super::{BAND_SHIFT, BIT_DEPTH_MAX, BandStats, EDGE_IDX_BY_CATEGORY, EdgeStats};
     use std::arch::x86_64::*;
 
     /// Sum of the four `i32` lanes.

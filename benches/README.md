@@ -2646,7 +2646,34 @@ on one host and interleaved within a round, five rounds per draw, with
 row reference in the base. The `scalar` arm is the control: it resolves to the
 same row reference in both trees, so it has to read 1.00x.
 
-<!-- ISSUE-406-ENCODER-TABLE -->
+Eight `ubuntu-latest` legs were dispatched at once so that legs sharing a CPU
+model could be grouped afterwards, plus one local Intel desktop host:
+
+| CPU model | draws | `avx2` | `sse4.1` | `scalar` (control) |
+| --- | ---: | ---: | ---: | ---: |
+| Intel Xeon Platinum 8573C | 2 | 1.006-1.012x | 1.000-1.006x | 1.000-1.001x |
+| AMD EPYC 7763 64-Core | 2 | 0.991-1.005x | 0.977-0.998x | 0.999-1.001x |
+| AMD EPYC 9V74 80-Core (Zen 5) | 3 | **0.959-0.965x** | 0.967-0.980x | 1.002-1.005x |
+| Intel Core i9-10850K (local) | 1 | 0.978x | 1.003x | 1.000x |
+
+**Nothing separates, and on Zen 5 it is a reproducible regression.** On both
+Intel parts and on EPYC 7763 every arm sits inside a band its own control is
+already inside - 1.006-1.012x against a 1.000-1.001x control is not a result.
+On EPYC 9V74 the `avx2` arm reads 0.959-0.965x across three independent draws,
+every round signed the same way, against controls of 1.002-1.005x: a 3.5-4%
+regression, well outside what the control moves by. That is the same signature
+#340's per-row shape (0.94-0.95x on Zen 5) and #382's per-CTB shape
+(0.872-0.891x on Zen 5) both produced, and the third time this dispatch site has
+answered a differently-shaped kernel the same way.
+
+A ninth leg, on an Intel Xeon 6973P-C, is **discarded rather than reported**:
+its `scalar` control read 0.975x, and a control that moves 2.5% where it must
+read 1.00x cannot resolve a several-percent effect. That is the control doing
+its job. An earlier six-leg draw agreed in range - `avx2` 0.975-1.012x,
+`sse4.1` 0.971-1.006x, controls 0.999-1.010x - but is not reported by model,
+because that draw wrote the host's model only to the run's step summary and not
+to the artifacts the ratios are recomputed from. It is the reason the workflow
+now records the model in an uploaded file.
 
 **Do not spend a fourth attempt on this dispatch site.** Three shapes across
 three issues now agree, and none of the three guessed causes survived: not the
