@@ -176,7 +176,7 @@ axis here, and both arms always appear in the same run.
 Filter to one of them the same way as any other group:
 
 ```sh
-cargo bench --bench codec -- av1_deblock
+cargo bench --bench codec -- av1_deblock_luma
 cargo bench --bench av1_decode -- 'av1_deblock/scalar'
 cargo bench --bench av1_decode -- av1_inverse   # every inverse-transform group
 ```
@@ -1326,6 +1326,69 @@ reference on every arm — `hevc_recon` does — so "is there a dispatch site" a
 answered from a commit that is not built. "Is it the *same* vector kernel" is a
 third, and the one the x86_64 re-draw above turned on.
 
+### One group name, two targets, and the row that moved for nothing
+
+A third way a committed row stops describing what it names, and the one that is
+hardest to see from the table: two bench targets registering the same criterion
+group name. Criterion keys a group by its name alone. The name carries no
+namespace for the target that registered it and every target in this crate
+writes the same `target/criterion/` tree, so two targets both calling a group
+`av1_deblock` write the same `target/criterion/av1_deblock/<isa>` directory.
+Both groups still run, both print their timings and both pass their
+bit-exactness guard; the target that runs second simply overwrites the first,
+and `criterion_baseline.py collect` can only ever see one of them.
+
+`benches/codec.rs` and `benches/av1_decode.rs` both claimed `av1_deblock` until
+issue #414, and they do not measure the same thing: `codec.rs` filters a
+synthetic 1080p luma plane at level 24, `av1_decode.rs` a structured plane at
+level 32. **Their vector arms agree to 0.1% and their `scalar` arms are 27%
+apart** — the vector kernels do fixed masked work per lane, while the scalar
+reference branches per position on the §7.14.6.1 filter mask, so it is the only
+arm the content reaches. Which target ran second therefore moved the `scalar`
+column of that row by a quarter and left the two vector columns where they were.
+
+That is what #414 reports. The two x86_64 draws ran the targets in opposite
+orders: the #350 workflow ran a plain `cargo bench`, which walks targets
+alphabetically and so runs `codec` after `av1_decode`, while the #393 workflow
+followed the recipe above, which names `codec` first. Read out of #350's own six
+rounds, on the three that landed on the AMD EPYC 7763, the two groups are:
+
+| Target's group | `scalar` | `sse4.1` | `avx2` |
+| --- | ---: | ---: | ---: |
+| `codec.rs`, collected | 21.506 ms | 3.974 ms | 3.424 ms |
+| `av1_decode.rs`, overwritten | 27.290 ms | 3.974 ms | 3.403 ms |
+
+so the 21.506 ms the superseded table carried and the 26.956 ms in the x86_64
+table below are two different benchmarks, not one benchmark two months apart.
+
+Nothing in the range between the stamps moves the arm. Bisecting it needs a step
+comparable to every other step, which the recipe above cannot give — a round is
+attributable only to the CPU model it landed on, `ubuntu-latest` is a pool of
+models, and this arm reads anywhere between 21.4 ms and 29.9 ms across the pool
+at one commit. So each of nine steps over the 32 commits between `b233f0a74f88`
+and `605f9a43a24c` measured *both* ends on its own runner, in two worktrees with
+their own target directories and three interleaved passes each, and reported the
+ratio: **0.977x to 1.000x, every step**, the later commit never slower. A
+paired ratio is immune to which model the step landed on, which is what makes
+nine of them comparable without dispatching a lottery per step.
+
+**Neither committed table has a row for both groups.** `codec.rs`'s group is now
+`av1_deblock_luma`, pairing with the `av1_deblock_chroma` it is the luma half
+of, and `av1_decode.rs` keeps `av1_deblock` as the narrow-filter member of its
+deblocking trio, the name the recipe's own target order already resolves to.
+Both tables below were drawn in that order and so collected `av1_decode.rs`'s
+side: each carries an `av1_deblock` row as measured and neither has an
+`av1_deblock_luma` row. Each gains it at its next draw. No ratio in either table
+is wrong now that it names the group it was measured from.
+
+`no_two_bench_targets_register_the_same_group_name` in
+`tests/bench_group_names_are_unique.rs` keeps it fixed, in the `Rust checks`
+job. It reads the group names out of each `[[bench]]` target's crate root and
+fails on one that two targets claim, which is a check that costs a file read
+rather than a draw — and unlike the staleness report it fails rather than
+reports, because a collision is a naming mistake in the tree in front of it, not
+a measurement to redraw.
+
 ### Apple M1 (aarch64)
 
 Measured on **Apple M1 (macOS 26, aarch64)**, at `f3e7674fc5be`, with
@@ -1351,6 +1414,12 @@ near-parity row now. The table has also grown by twenty-six rows that had no
 `neon` figure anywhere: every `_1080p` row, both `av1_encode_stage_coeff_ctx`
 rows, both `av1_encode_stage_iwht` rows, `hevc_decode`, `hevc_decode_to_picture`
 and the `hevc_encode_1920x1088` family.
+
+The `av1_deblock` row here is `benches/av1_decode.rs`'s group, which this draw
+ran second and so collected; there is no `av1_deblock_luma` row, because
+`benches/codec.rs`'s group was overwritten in every round. That is the opposite
+side of the collision the x86_64 table below collected. See [One group name, two
+targets](#one-group-name-two-targets-and-the-row-that-moved-for-nothing) above.
 
 | Group | `scalar` | `neon` | Best |
 | --- | ---: | ---: | ---: |
@@ -1581,6 +1650,14 @@ does not contain `f695a1a`, the #222 merge, even though #222 landed on `main`
 fifty minutes before the checkpoint was written. That is the whole of why
 `hevc_color_convert` moved; see [Reading the rows](#reading-the-rows) below.
 
+The `av1_deblock` row here is `benches/av1_decode.rs`'s group, which this draw
+ran second and so collected; there is no `av1_deblock_luma` row, because
+`benches/codec.rs`'s group of that name was overwritten in every round. That is
+the opposite side of the collision from the table this one supersedes, which is
+why the row moved by a quarter in its `scalar` column and not at all in its
+vector ones. See [One group name, two
+targets](#one-group-name-two-targets-and-the-row-that-moved-for-nothing) above.
+
 | Group | `scalar` | `sse4.1` | `avx2` | Best |
 | --- | ---: | ---: | ---: | ---: |
 | `av1_cdef` | 89.305 ms | 40.075 ms (2.23x) | 32.341 ms (2.76x) | 2.76x `avx2` |
@@ -1781,22 +1858,23 @@ cannot name.**
   26.04 ms, so the 13% gap between the arms is a property of the kernels rather
   than of a round. `av1_inverse_adst_8x8` is the only other row where `sse4.1`
   leads by more than the near-parity band, at 1.72x against 1.56x.
-- `av1_deblock`'s ratio rose to 7.95x from 6.28x without any vector kernel
-  moving. Its `scalar` arm reads 26.956 ms against 21.506 ms, 25% slower, while
-  `sse4.1` and `avx2` land within 1% of their old values (3.934 ms against
-  3.974 ms, 3.392 ms against 3.424 ms). All three rounds agree on the scalar
-  figure to within 1%, and the neighbouring scalar arms did not move —
-  `av1_deblock_wide` at 104.984 ms against 104.338 ms, `av1_cdef` at 89.305 ms
-  against 89.226 ms — so it is stable and specific to this group rather than a draw-wide shift.
-  `src/av1_filters.rs` and `benches/av1_decode.rs` are identical at both stamps,
-  so the cause is not the scalar path's own code, and this table does not
-  identify it. #414 tracks it. Until it is settled, read this row's 7.95x as
-  partly a scalar regression rather than wholly a vector win.
+- `av1_deblock` reads 7.95x where the superseded table read 6.28x, and the two
+  are not the same benchmark. Its `scalar` arm reads 26.956 ms against
+  21.506 ms while `sse4.1` and `avx2` land within 1% of their old values
+  (3.934 ms against 3.974 ms, 3.392 ms against 3.424 ms), which is the signature
+  of the group-name collision #417 settled rather than of a regression: the two
+  targets that both registered `av1_deblock` filter different content, so only
+  the scalar arm, which branches per position on the filter mask, separates
+  them. This draw ran `av1_decode.rs` second and so collected its side; the
+  superseded table collected `benches/codec.rs`'s, now `av1_deblock_luma`. A
+  nine-step paired bisect over the range read 0.977x to 1.000x at every step,
+  so nothing between the stamps moved the arm. See [One group name, two
+  targets](#one-group-name-two-targets-and-the-row-that-moved-for-nothing).
 
 The rows with real vector work are the ones with the largest ratios.
-`av1_deblock` leads at 7.95x with the caveat above, followed by
-`hevc_encode_*_rgba_to_yuv420` at 6.17x and 6.15x, `av1_forward_dct_4x4` at
-5.79x, `av1_deblock_boundary` at 5.03x and `hevc_color_convert` at 4.80x. The
+`av1_deblock` leads at 7.95x, followed by `hevc_encode_*_rgba_to_yuv420` at
+6.17x and 6.15x, `av1_forward_dct_4x4` at 5.79x, `av1_deblock_boundary` at
+5.03x and `hevc_color_convert` at 4.80x. The
 AV1 forward transforms sit between 3.0x and 3.7x, `av1_self_guided` at 3.47x and
 `av1_cdef` at 2.76x, and the motion-compensation family between 2.2x and 2.6x.
 
