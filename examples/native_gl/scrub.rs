@@ -55,9 +55,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use zvidlib::{
-    CancellationToken, EncodedVideoSample, Error, ErrorKind, ExactFrameReader,
-    FrameIndex, Limits, PlaybackVideoSource, Result, VideoDecoderConfig, VideoDecoderFactory,
-    VideoFrame,
+    CancellationToken, EncodedVideoSample, Error, ErrorKind, ExactFrameReader, FrameIndex, Limits,
+    PlaybackVideoSource, Result, VideoDecoderConfig, VideoDecoderFactory, VideoFrame,
 };
 
 /// How many decoded frames the render thread can still collect.

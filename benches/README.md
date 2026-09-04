@@ -1679,33 +1679,23 @@ out roughly even on Apple Silicon, where LLVM auto-vectorizes the scalar code
 well under `lto = "fat"`, while AV1 deblocking and motion compensation on the
 same host are 2.4-4.9x. `active_by_site()` answers the question directly.
 
-## What a drag preview costs the frame under the pointer
+## What a drag preview cadence cost the frame under the pointer (removed)
 
-The other profiling example measures an interaction rather than a codec.
-Dragging `native_gl`'s timeline bar walks a background decoder towards the frame
-under the pointer and publishes pictures on the way, so the drag keeps moving
-(issue #363); `PREVIEW_INTERVAL` in `examples/native_gl/scrub.rs` is how often it
-publishes. That interval was arithmetic — a dozen pictures over the 613-frame
-walk issue #354 timed at 1.7 s, about 4% on top — and issue #379 is what
-happened when it was measured.
+**The harness this section describes no longer exists.** Dragging `native_gl`'s
+timeline bar walked a background decoder towards the frame under the pointer and
+published pictures on the way so the drag kept moving (issue #363);
+`PREVIEW_INTERVAL` in `examples/native_gl/scrub.rs` was how often it published,
+and `examples/scrub_preview_profile.rs` drove the same `FrameService` the window
+drove, over the same bundled sample through the same hardware decoder, to price
+it. Issue #458 then made the window draw nothing that is not at the playhead, so
+the published pictures were converted and dropped, and issue #462 removed the
+cadence, the flag that selected it and the profile that swept it. What is kept
+here is the reading, because it is the reason the cadence is gone.
 
-`examples/scrub_preview_profile.rs` drives the same `FrameService` the window
-drives, over the same bundled sample through the same hardware decoder, with no
-window and no renderer in the way:
-
-```sh
-cargo run --release --features native --example scrub_preview_profile
-cargo run --release --features native --example scrub_preview_profile -- 5
-cargo run --release --features native --example scrub_preview_profile -- 3 80 150 400
-```
-
-The first argument is runs per arm and the rest are cadences in milliseconds.
-Each arm builds its own service, so every walk starts from a cold decoder, and
-each reports the fastest of its runs: the decoder is shared hardware and
-anything else on the host only ever adds time. Its baseline arm is playback's
-exact request, which publishes nothing on the way to its target — what the drag
-did between #355 and #363 — so the overhead each cadence reports is measured
-against the same decoder in the same process.
+The interval started as arithmetic — a dozen pictures over the 613-frame walk
+issue #354 timed at 1.7 s, about 4% on top — and issue #379 is what happened when
+it was measured. The sweep below is that first measurement, before issue #402
+removed the reader's cache tail from an intermediate publish.
 
 ### The sweep
 
@@ -1732,6 +1722,13 @@ larger number and the one the time goes into, and `spacing` is arrival divided
 by publishes: how often the picture under the pointer actually moves, which is
 what #363 asked for.
 
+After #402 made an intermediate publish carry its own picture and no cache tail,
+the same harness re-swept the band flat: against a 1.30-1.32 s no-preview
+baseline, 80 ms arrived in 1.32-1.38 s converting 24-36 pictures, 150 ms in
+1.32-1.48 s converting 27-51, and 1.6 s in 1.38-1.40 s — the run-to-run spread on
+one interval as wide as the spread across all of them. That is what returned
+`PREVIEW_INTERVAL` to 150 ms, and it is the last reading the cadence has.
+
 ### What it says
 
 **The 4% estimate was wrong by two orders of magnitude, and the per-picture
@@ -1745,29 +1742,32 @@ worse than the 6.4 s issue #354 was opened for.
 The count is the reader's cache tail. `ExactFrameReader::get` keeps the frames
 immediately behind its target as well as the target, as many as
 `Limits::max_cached_frames` holds (32 by default), which is what makes stepping
-backwards free after a seek. A preview walk calls `get` once per published
-picture and pays that tail every time, so a stride shorter than the tail
-converts everything it passes and the walk is back to #354's behaviour by a
-different route. Issue #402 tracks the tail; the cadence can only work around
-it.
+backwards free after a seek. A preview walk called `get` once per published
+picture and paid that tail every time, so a stride shorter than the tail
+converted everything it passed and the walk was back to #354's behaviour by a
+different route. Issue #402 moved intermediate steps onto
+`ExactFrameReader::get_step`, which converts the picture it was asked for and
+nothing else, and the knee went with it.
 
-Working around it is what `PREVIEW_INTERVAL` now does. It is 1.6 s, the knee:
-past it the walk neither arrives sooner nor publishes more — the stride is
-capped by `MAXIMUM_STRIDE` and the tail is what remains — and at it the frame
-under the pointer arrives in 1.82 s, #354's 1.7 s and about 8%, while the walk
-still publishes five pictures at 364 ms apart. The motion #363 asked for is not
-lost with it: since issue #374 a background pass keeps a shrunk picture every
-half second of the track, and a drag draws one for wherever the pointer is
-within a frame of the window's, so what this cadence owes #363 is the
-full-resolution picture catching up rather than the movement itself.
+The first sweep is not monotonic, and that is the same mechanism seen from the
+outside: the stride was computed from the walk's own measured per-frame rate,
+that rate included the conversions the step paid for, and a shorter stride
+converted a larger fraction of what it passed. Shortening the interval
+lengthened the per-frame estimate the next stride was computed from, so 80 ms
+and 400 ms landed on similar strides from opposite directions while 150 ms sat
+in the region where every frame was converted.
 
-The sweep is not monotonic, and that is the same mechanism seen from the
-outside: the stride is computed from the walk's own measured per-frame rate,
-that rate includes the conversions the step paid for, and a shorter stride
-converts a larger fraction of what it passes. Shortening the interval lengthens
-the per-frame estimate the next stride is computed from, so 80 ms and 400 ms
-land on similar strides from opposite directions while 150 ms sits in the
-region where every frame is converted.
+**What ended the cadence is the exact-seek table below rather than either
+sweep.** A cadence is only worth publishing on a walk long enough to fire it,
+and the walk is long only on a track that codes its frames as one group of
+pictures — precisely the track whose passed frames are of the *start* of the
+movie while the pointer is at the far end, which is what #458 stopped the window
+drawing. On a track with several random-access points the frames a walk passes
+*are* near the pointer, but there the cold exact seek is **18.77 ms** on the
+hardware backend and **31.17 ms** on the software one, so the walk is over
+before any cadence a drag would want could publish anything. The motion #363
+asked for is `zvidlib::PreviewIndex`'s, which since issue #374 answers wherever
+the pointer is in **1.109 µs**.
 
 ## What an exact frame at an arbitrary point costs (`--bench exact_seek`)
 
