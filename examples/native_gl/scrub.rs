@@ -188,6 +188,68 @@ pub fn target_frame(fraction: f32, frame_count: u64) -> u64 {
     (f64::from(fraction.clamp(0.0, 1.0)) * maximum as f64).round() as u64
 }
 
+/// Whether a picture the worker delivered is of the frame the window is trying to show.
+///
+/// A walk towards a far target publishes the frames it passes, and on a track coded as one group
+/// of pictures those are frames of the *start* of the movie while the pointer is at the far end.
+/// Drawing them is what made a drag flash frame 0, then 15, then 30, on the way to the frame
+/// under the pointer (issue #458), so the window draws a delivered picture only when this says it
+/// belongs at the playhead and leaves [`zvidlib::PreviewIndex`]'s shrunk picture - which is of
+/// wherever the pointer is - on screen when it does not.
+///
+/// `tolerance` is how stale a picture may be and still count. A drag retargets on every pointer
+/// move, so the frame a decode was started for is a frame or two behind the one the pointer is on
+/// by the time it lands; insisting on an exact match would keep the full-resolution picture out of
+/// a slow drag entirely, and the frames within the tolerance are of the same moment of the movie.
+///
+/// The window's alone - `allow` rather than `expect` because the same module compiles into
+/// `examples/scrub_preview_profile.rs` too, which draws nothing and so needs none of this.
+#[allow(dead_code)]
+pub fn frame_is_at_playhead(index: u64, playhead: u64, tolerance: u64) -> bool {
+    index.abs_diff(playhead) <= tolerance
+}
+
+/// How often a drag moves the audio clock to the frame under the pointer.
+///
+/// It is the audio queue rather than the drag that this paces. Each
+/// [`zvidlib::PlaybackController::seek`] cancels the PCM already scheduled and prerolls afresh, so
+/// seeking on every pointer move of a 60 Hz drag would replace each grain about 16 ms after
+/// scheduling it and the device would play a stutter of onsets rather than the sound at the
+/// playhead. A grain of this length is long enough to be heard before the next seek supersedes it
+/// and short enough that the sound still tracks a moving pointer.
+#[allow(dead_code)]
+const AUDIO_SCRUB_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Paces the seeks a drag makes to keep the audio at the playhead.
+#[derive(Default)]
+#[allow(dead_code)]
+pub struct AudioScrubCadence {
+    last: Option<Instant>,
+}
+
+#[allow(dead_code)]
+impl AudioScrubCadence {
+    /// Whether the audio clock should move now, recording that it did.
+    ///
+    /// The first call after [`Self::rearm`] is always due: a drag that presses the bar and holds
+    /// the pointer still has still moved the playhead, and the sound has to go with it.
+    pub fn due(&mut self, now: Instant) -> bool {
+        if self
+            .last
+            .is_some_and(|last| now.duration_since(last) < AUDIO_SCRUB_INTERVAL)
+        {
+            return false;
+        }
+        self.last = Some(now);
+        true
+    }
+
+    /// Forgets the last seek, so the next drag scrubs from its first pointer move.
+    pub fn rearm(&mut self) {
+        self.last = None;
+    }
+}
+
 #[derive(Default)]
 struct Queue {
     /// The frame the worker is walking towards, replacing rather than queueing behind an older
@@ -304,17 +366,21 @@ impl FrameService {
         }
     }
 
-    /// Asks for `frame` as a drag's preview, redirecting any older request. Returns whether this
-    /// changed the target, and never waits for the decode itself.
+    /// Asks for `frame`, redirecting any older request. Returns whether this changed the target,
+    /// and never waits for the decode itself.
     ///
-    /// A preview publishes the pictures the walk passes on a time cadence as well as the frame
-    /// itself, so a drag keeps moving while a long span decodes (issue #363).
-    pub fn request(&mut self, frame: u64) -> bool {
+    /// `preview` decides what the walk towards it publishes. A preview publishes the pictures it
+    /// passes on a time cadence as well as the frame itself, which is what #363 added so a drag
+    /// over a long span kept moving; anything else asks for its frame and nothing else, which is
+    /// what the window's drag asks for now that it draws no picture that is not at the playhead
+    /// (issue #458) and is the baseline `examples/scrub_preview_profile.rs` measures the cadence
+    /// against.
+    pub fn request(&mut self, frame: u64, preview: bool) -> bool {
         let (lock, condvar) = &*self.queue;
         let retargeted = lock
             .lock()
             .expect("frame queue poisoned")
-            .retarget(frame, true);
+            .retarget(frame, preview);
         if retargeted {
             condvar.notify_one();
         }
@@ -325,8 +391,9 @@ impl FrameService {
     /// than waiting for one.
     ///
     /// The index is what tells a caller whether the picture it just collected is the frame under
-    /// the pointer or one the walk passed on the way there; the window ignores it and draws
-    /// either, and `examples/scrub_preview_profile.rs` times the walk by it.
+    /// the pointer or one the walk passed on the way there. The window draws only the former -
+    /// see [`frame_is_at_playhead`] - and `examples/scrub_preview_profile.rs` times the walk by
+    /// it.
     pub fn take_latest(&mut self) -> Option<(u64, VideoFrame)> {
         let (lock, _) = &*self.queue;
         let mut state = lock.lock().expect("frame queue poisoned");
@@ -681,11 +748,11 @@ mod tests {
         let mut frames = open(Some(Arc::clone(&gate)), samples(12, 4));
 
         // Every request returns while the decoder is still blocked, and nothing has been drawn.
-        assert!(frames.request(0));
+        assert!(frames.request(0, true));
         assert!(frames.take_latest().is_none());
         // An unchanged target is not re-requested, and a changed one redirects the walk.
-        assert!(!frames.request(0));
-        assert!(frames.request(8));
+        assert!(!frames.request(0, true));
+        assert!(frames.request(8, true));
 
         grant(&gate, u32::MAX / 2);
 
@@ -742,7 +809,7 @@ mod tests {
         }
         let gate = gate(0);
         let mut frames = open(Some(Arc::clone(&gate)), single_gop);
-        frames.request(9);
+        frames.request(9, true);
 
         // Enough decoding for the frames before the target, and the picture has already moved.
         grant(&gate, 8);
@@ -803,6 +870,75 @@ mod tests {
             Some(9),
             "the frame that was asked for is the one drawn"
         );
+    }
+
+    #[test]
+    fn a_drag_asks_for_the_frame_under_the_pointer_and_publishes_nothing_it_passed() {
+        // Issue #458: the window draws no picture that is not at the playhead, so the drag asks
+        // for the walk that publishes none of them. One random-access point, as the bundled
+        // sample has, so everything before frame 9 is decoded to reach it.
+        let mut single_gop = samples(12, 1);
+        for sample in single_gop.iter_mut().skip(1) {
+            sample.random_access = false;
+        }
+        let gate = gate(0);
+        let mut frames = open(Some(Arc::clone(&gate)), single_gop);
+        frames.request(9, false);
+
+        // Enough decoding for the frames before the target, and still nothing published.
+        grant(&gate, 8);
+        assert!(
+            wait_for_a_moment(|| frames.take_latest()).is_none(),
+            "a frame the drag's walk passed is published to nobody"
+        );
+
+        grant(&gate, u32::MAX / 2);
+        let arrived = wait_for(|| {
+            frames
+                .take_latest()
+                .map(|(index, frame)| (index, frame.planes[0].data[0]))
+        });
+        assert_eq!(
+            arrived,
+            Some((9, 9)),
+            "the frame under the pointer is the one that is published"
+        );
+    }
+
+    #[test]
+    fn only_a_picture_at_the_playhead_is_drawn() {
+        // The frames a walk passes on this sample are the start of the movie while the pointer is
+        // at the far end, which is what a drag used to flash (issue #458).
+        assert!(!frame_is_at_playhead(0, 600, 7));
+        assert!(!frame_is_at_playhead(15, 600, 7));
+        assert!(!frame_is_at_playhead(30, 600, 7));
+        assert!(frame_is_at_playhead(600, 600, 7));
+        // A picture the pointer has moved on from since the decode started is of the same moment
+        // of the movie and is still drawn, in either direction, up to the tolerance.
+        assert!(frame_is_at_playhead(593, 600, 7));
+        assert!(frame_is_at_playhead(607, 600, 7));
+        assert!(!frame_is_at_playhead(592, 600, 7));
+        assert!(!frame_is_at_playhead(608, 600, 7));
+    }
+
+    #[test]
+    fn a_drag_moves_the_audio_on_a_cadence_rather_than_on_every_pointer_move() {
+        let start = Instant::now();
+        let mut cadence = AudioScrubCadence::default();
+
+        // The press moves the sound to where the bar was clicked without waiting for a cadence.
+        assert!(cadence.due(start));
+        // The pointer moves of the next tenth of a second do not, or each seek would discard the
+        // PCM the one before it queued and nothing would be heard.
+        assert!(!cadence.due(start + Duration::from_millis(16)));
+        assert!(!cadence.due(start + Duration::from_millis(99)));
+        // Once a grain has played, the clock follows the pointer again.
+        assert!(cadence.due(start + AUDIO_SCRUB_INTERVAL));
+        assert!(!cadence.due(start + AUDIO_SCRUB_INTERVAL + Duration::from_millis(16)));
+        // A committed scrub rearms it, so the next drag scrubs from its first pointer move
+        // instead of inheriting this one's pacing.
+        cadence.rearm();
+        assert!(cadence.due(start + AUDIO_SCRUB_INTERVAL + Duration::from_millis(17)));
     }
 
     #[test]
