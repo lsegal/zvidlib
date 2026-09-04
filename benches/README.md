@@ -1141,10 +1141,11 @@ its own re-measurement on this host and arrives a second way: eight is a real wi
 there on `neon` while it is a wash on the same width for the other two phases, on
 the same host, in the same invocation. And the **vertical-only 16x16 cell reads
 1.01-1.05x**, below both the 8x8 and the 32x32 cells around it, reproducibly
-across all three invocations — a dip this file's x86_64 tables do not show and
-which nothing here explains; it does not move the bound, since 16 is admitted for
-that phase by the width below it either way, and it is recorded rather than
-tidied away.
+across all three invocations. It does not move the bound, since 16 is admitted
+for that phase by the width below it either way, and it was recorded here rather
+than tidied away; **#455 below decomposes it and is where it is explained**, and
+also corrects the claim in this sentence's first draft that no x86_64 table shows
+it — the i7-8700B table above shows it in all four of its vertical-only rows.
 
 **This is a latent path, and the entry says so.** `RefPlane::with_narrow` is
 test-only apparatus and `borrows_narrow()` is false for every plane the decoder
@@ -1156,6 +1157,129 @@ proposes building a mirror starts from a number measured for the phases it would
 turn on. `every_backend_matches_scalar_filter_taps_narrow`,
 `every_backend_matches_scalar_luma_block` and
 `the_eight_bit_block_path_matches_the_per_sample_equations` are untouched and
+passing.
+
+##### #455: the 16x16 dip, decomposed into the half it is in
+
+The `neon` sweep above is not monotonic in block width on its vertical-only row:
+16x16 sits below both 8x8 and 32x32, on both narrow arrangements, on every
+invocation. Issue #455 asked whether that is the kernel or the instrument. It is
+neither a property of `filter_taps_narrow` nor an error in the column — **it is
+in the source gather, and 16 is the one width where the narrow gather is slower
+than the wide one.**
+
+**The dip reproduces.** Same host — **Apple M1 (Firestorm, MacBookAir10,1,
+Darwin 25.5.0)** — same binary, three consecutive invocations, the same
+in-process interleaved best-of-fifteen:
+
+| Phase | 8x8 | 16x16 | 32x32 | 64x64 |
+| --- | ---: | ---: | ---: | ---: |
+| vertical-only, mirrored | 1.34-1.35x | **1.01-1.02x** | 1.24-1.25x | 1.46-1.47x |
+| vertical-only, copied | 1.45-1.47x | **1.04x** | 1.21-1.25x | 1.42-1.43x |
+
+The 16x16, 32x32 and 64x64 cells land inside the ranges #452 recorded. The 8x8
+cell reads lower than its 1.45-1.52x / 1.57-1.64x, which is itself the finding
+#440 predicts: 8x8 is the cell whose `calls` count is 64 times the 64x64 one and
+whose reading is therefore dominated by fixed per-call cost, and this host was
+carrying a load average around 5 throughout. Nothing about the dip depends on
+that cell, which is why it is the one width where the two draws disagree.
+
+**`measure_narrow_gather_vs_kernel` splits the cell in two.** The vertical-only
+arm of `interp_block_with_width` is exactly an output allocation, one
+`RefPlane::gather` of `w x ( h + 7 )`, and `h` calls of `filter_taps`; the narrow
+arm swaps the gather for a `RefPlane::gather_narrow` of the same shape in `i16`
+and the filter for `filter_taps_narrow`. Timing those two halves separately, at
+the same `calls` count, in nanoseconds per `interp_block` call — three
+invocations, agreeing to ±0.3% on every cell:
+
+| block | source `i32` | source mir | source cop | kernel `i32` | kernel `i16` |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 8x8 | 102.9-103.1 | 83.3-84.0 | 70.4-71.0 | 64.4-66.8 | 57.0-57.1 |
+| 16x16 | 120.8-121.1 | **143.2-143.4** | **135.7** | 166.0-166.1 | 132.0-132.2 |
+| 32x32 | 225.0-227.8 | 183.0-183.2 | 180.4-182.1 | 498.3-503.2 | 358.9-362.3 |
+| 64x64 | 645.5-655.8 | 402.3-409.1 | 427.7-430.1 | 1684.6-1690.3 | 1112.6-1118.3 |
+
+**The kernel half is monotonic and a win at every width** — 1.13x, 1.26x,
+1.39-1.40x, 1.51x — which is the row-length curve `simd::measure_narrow_filter_taps`
+reads on `neon` (1.28x / 1.45x / 1.59x / 1.72x at rows of 8, 16, 32 and 64),
+slightly diluted by the output allocation both arms share. There is no dip in it.
+**The source half carries the whole of the dip, and inverts:** the narrow gather
+is faster than the wide one at 8x8 (1.24x / 1.46x), at 32x32 (1.24x / 1.26x) and
+at 64x64 (1.60x / 1.51x), and is *slower* at 16x16 (**0.84x / 0.89x**). Composed
+back together the two halves reproduce the sweep's shape, dip included:
+1.19-1.20x / 1.04x / 1.33-1.35x / 1.53-1.54x mirrored.
+
+**Why 16 and not another width: the gather's per-row cost is not proportional to
+the bytes it copies.** Both arms copy one row at a time into a `w`-strided
+buffer, `4 * w` bytes for the wide arm and `2 * w` for the narrow one, so the two
+reach the same byte counts at different widths. `measure_narrow_gather_by_row_bytes`
+sweeps the width at a fixed 32 rows and reports nanoseconds per row, three
+invocations:
+
+| `w` | `i32` bytes/row | `i32` ns/row | `i16` bytes/row | mir ns/row | cop ns/row |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 4 | 16 | 4.16-4.23 | 8 | 3.90-4.01 | 3.58-3.74 |
+| 8 | 32 | 4.90-5.17 | 16 | 5.12-5.44 | 4.23-4.41 |
+| 12 | 48 | 5.91-6.14 | 24 | 5.50-5.72 | 5.18-5.44 |
+| **16** | **64** | **3.75-4.04** | **32** | **5.88-6.17** | **5.56-5.80** |
+| 20 | 80 | 3.92-3.93 | 40 | 6.51-6.52 | 6.18-6.19 |
+| 24 | 96 | 4.07 | 48 | 6.93-6.95 | 6.57-6.60 |
+| **32** | **128** | 4.69-4.83 | **64** | **4.92-4.93** | **4.85-5.16** |
+| 40 | 160 | 5.66-5.70 | 80 | 5.09 | 5.69-5.71 |
+| 48 | 192 | 6.98-7.02 | 96 | 5.25-5.30 | 7.06-7.09 |
+| 64 | 256 | 8.50-8.59 | 128 | 5.81-5.90 | 6.38-6.46 |
+
+**Both arms have the same discontinuity, at the same destination byte count.**
+Read down either arm's own columns: the cost climbs across 16, 24, 32, 40 and 48
+destination bytes per row, drops sharply at **64**, and then climbs again with the
+byte count as one would expect. The wide arm reaches 64 destination bytes per row
+at `w = 16` and the narrow arm reaches it at `w = 32`, so the two arms' cheapest
+widths are a factor of two apart — and **block width 16 is the single width in
+this sweep where the wide arm sits on the step down (3.75-4.04 ns/row) while the
+narrow arm sits on the peak just below it (5.56-6.17 ns/row).** That is the
+inversion in the source column above, and it is the whole of the dip.
+
+The step itself is a property of this host's row copy rather than of anything
+zvidlib chooses: `RefPlane::copy_row` and the mirrored branch of
+`copy_row_narrow` are both a `copy_from_slice` of the row, so the boundary is
+where the platform's `memcpy` changes strategy and/or where a 64-byte
+destination stride stops sharing a cache line between consecutive rows. Which of
+those two it is, this measurement does not separate — the arms are within 20% of
+each other at equal bytes per row rather than equal, so byte count alone does not
+account for all of it — and it does not need to, because either way the answer to
+#455 is the same: the dip is in the gather's row geometry, not in the `neon`
+kernel, and not in the column being wrong.
+
+**So `narrows` does not change, and this time the reason is measured rather than
+inherited.** The composed 16x16 cell is 1.01-1.07x — a wash, never a loss — and
+16 is admitted for the vertical-only phase by `NARROW_MIN_WIDTH` = 8 either way,
+so no threshold expressible in widths would act on it. More to the point, a width
+threshold gates the *kernel* choice, and the kernel half of this cell is a 1.26x
+win at that width; what is costing the narrow arm its margin is the gather it
+has to do first, which a minimum width neither describes nor fixes. #440 refused
+a per-backend threshold on the evidence it had and #452 refused a per-phase one
+below 32 for the mirrored phases; this refuses a width bound aimed at the wrong
+half of the cell.
+
+**The claim that no x86_64 host shows this is wrong, and the tables above already
+said so.** The **Intel Core i7-8700B (Coffee Lake)** sweep in the #440 section
+dips at 16x16 in *all four* of its vertical-only rows — 1.22-1.28x → **1.12-1.14x**
+→ 1.29-1.30x (`sse4.1`, mirrored), 1.19-1.24x → **1.07-1.10x** → 1.16-1.19x
+(`avx2`, mirrored), 1.68-1.75x → **1.47x** → 1.62-1.63x (`sse4.1`, copied) and
+1.61-1.67x → **1.38-1.45x** → 1.47-1.51x (`avx2`, copied). Across every host in
+this file the dip appears exactly where the 8x8 cell is inflated — M1 `neon`
+1.57-1.64x and i7-8700B 1.61-1.75x copied, both dipping; Xeon 6973P-C
+0.99-1.07x, i9-10850K 0.95-0.97x and EPYC 7763 1.01-1.06x, none dipping — which
+is the same fixed-per-call-cost sensitivity #440 named for that column. The
+mechanism above is measured on the M1 only; that the shape travels to one x86_64
+host and not the other three is recorded here and not explained.
+
+**Nothing routes differently and no decoded sample moves.** The two new
+measurements are `#[ignore]`d timing tests next to the sweep they decompose;
+`narrows`, `NARROW_MIN_WIDTH` and `NARROW_MIN_WIDTH_MIRRORED` are untouched, and
+`every_backend_matches_scalar_filter_taps_narrow`,
+`every_backend_matches_scalar_luma_block` and
+`the_eight_bit_block_path_matches_the_per_sample_equations` are unchanged and
 passing.
 
 ##### #426: the same question, on an instrument with a null control in it

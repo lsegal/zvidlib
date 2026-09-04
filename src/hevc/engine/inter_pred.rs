@@ -773,6 +773,22 @@ fn interp_block<const N: usize>(
 ///   vertical-only phase's eight, so a future mirror does not inherit a
 ///   bound that was never measured for these two phases.
 ///
+/// The vertical-only phase's own gather is not the free ride the first
+/// bullet above makes it sound, and issue #455 is where that was
+/// measured. Writing the `w x ( h + N − 1 )` buffer as `i16` rather
+/// than `i32` is free in the sense that both arms write one; it is not
+/// free in the sense of costing the same, because the per-row cost of
+/// [`RefPlane::gather`] does not scale with the bytes a row copies. It
+/// steps down at 64 destination bytes per row, which the wide arm
+/// reaches at `w = 16` and the narrow arm only at `w = 32`, so at a
+/// block width of exactly 16 the narrow gather is **slower** than the
+/// wide one and the phase's whole sweep dips to parity there.
+/// `measure_narrow_gather_vs_kernel` and
+/// `measure_narrow_gather_by_row_bytes` are that decomposition, and
+/// `benches/README.md` carries it. It moves no bound: the kernel half of
+/// that cell is still a 1.26x win, so a minimum *width* is aimed at the
+/// half of the call that is not what costs it.
+///
 /// The two-dimensional phase gains less than the horizontal-only one for
 /// a reason no plane representation reaches: only its horizontal pass
 /// can use the narrowing at all. Its vertical pass multiplies a 16-bit
@@ -3157,7 +3173,6 @@ mod tests {
             }
         }
     }
-
 
     /// The per-row cost of [`RefPlane::gather`] and
     /// [`RefPlane::gather_narrow`] as a function of the bytes one row
