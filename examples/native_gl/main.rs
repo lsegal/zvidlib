@@ -369,7 +369,7 @@ where
         if let Some(preview) = self.previews.nearest(target) {
             let _ = self.upload_frame_at(preview.dimensions, &preview);
         }
-        self.frames.request(target, false);
+        self.frames.request(target);
         self.scrub_audio(event_loop, target);
         if let Some(state) = self.state.as_ref() {
             state.window.request_redraw();
