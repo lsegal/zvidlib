@@ -3226,6 +3226,8 @@ across hosts.
 | --- | --- | --- | --- | --- | --- | --- |
 | VideoToolbox | idle Apple Silicon (#170) | 167 Mpx/s | not recorded | not recorded | 15 Mpx/s | ~11x |
 | VideoToolbox | Apple M1, macOS 26.5 (#282) | 163 Mpx/s, 78.6 fps | 16.7 ms | 114 ms | 38.5 Mpx/s, 18.6 fps | ~4x |
+| NVDEC | RTX 4080 + i9-10850K, Windows (#376) | 191 Mpx/s, 92.3 fps | 131 ms | 128 ms | not measured | — |
+| Media Foundation | RTX 4080 + i9-10850K, Windows (#376) | 216 Mpx/s, 104.1 fps | 331 ms | 343 ms | not measured | — |
 | NVDEC | `ubuntu-latest`, Azure VM, x86_64 (#282) | not measured | — | — | — | — |
 | Media Foundation | `windows-latest`, Hyper-V Video adapter (#282) | not measured | — | — | — | — |
 
@@ -3244,13 +3246,11 @@ than either run's own reading. The second run came out 40% slower on the
 contention rather than anything the decoder did, so the slower run is discarded
 on that evidence instead of averaged in.
 
-### Backends that could not be measured
+### Hosted runners that could not measure a backend
 
-NVDEC and Media Foundation both have code in the tree
-(`src/hevc/nvdec.rs`, `src/hevc/windows_mf.rs`) and both compile and run the
-benchmark, but no host with the fixed-function hardware behind either one was
-available. The bench needed no changes to reach that conclusion on either
-platform: it built and skipped cleanly, exactly as designed.
+The physical Windows host in #376 measured both backends, but the standard
+hosted runners still cannot. The bench needs no changes on those platforms: it
+builds and skips cleanly, exactly as designed.
 
 - **NVDEC**, on `ubuntu-latest`: no NVIDIA GPU and no driver. The probe reports
   `NVDEC: NVIDIA CUDA driver is unavailable: libcuda.so.1: cannot open shared
@@ -3272,9 +3272,8 @@ platform: it built and skipped cleanly, exactly as designed.
   `nvcuvid.dll` are both absent from the image), so neither of that platform's
   two candidate backends is reachable on a hosted runner.
 
-Both numbers stay open until a host with the hardware runs the benchmark. The
-Windows run is worth one note of its own beyond the missing row: it is the first
-time the crate has been built and run on Windows in CI at all — `.github/workflows/ci.yml`
+The hosted Windows run is worth one note of its own beyond the missing row: it
+is the first time the crate has been built and run on Windows in CI at all — `.github/workflows/ci.yml`
 has only ever had Linux jobs — and the `windows` and `libloading` target
 dependencies, the Media Foundation backend, and the benchmark suite all compiled
 without a warning.
@@ -3311,13 +3310,13 @@ run to produce it. The seam counts frames as well as nanoseconds, and the group
 asserts the count matches the window, so a backend that stopped reporting reads
 as a failed run rather than as free readback.
 
-One host has run it so far, and each row names its own:
+Two hosts have run it so far, and each row names its own:
 
 | Host | Backend | `surface_copy` | `color_convert` | Share of `steady_state` |
 | --- | --- | --- | --- | --- |
 | Apple Silicon (unified memory) | VideoToolbox | ~3 us/frame | ~10 ms/frame | roughly two thirds to three quarters of 13-15 ms/frame |
-| discrete NVIDIA GPU | NVDEC | not yet measured (`#318`) | not yet measured | — |
-| Windows + D3D11 | Media Foundation | not yet measured (`#318`) | not yet measured | — |
+| RTX 4080 + i9-10850K, Windows (#376) | NVDEC | 1.33 ms/frame | 8.87 ms/frame | 91.2% of 11.17 ms/frame |
+| RTX 4080 + i9-10850K, Windows (#376) | Media Foundation | 0.98 ms/frame | 7.96 ms/frame | 93.0% of 9.62 ms/frame |
 
 The Apple Silicon numbers are over the same 32-frame window `steady_state` uses,
 and its `steady_state` figure moves with the host's other work. The split is the
@@ -3327,14 +3326,12 @@ all — and the host round trip is almost entirely the crate's own NV12-to-RGBA
 pass, the same conversion that is the largest single item in a *software*
 decode.
 
-That is one host's answer and not the general one. A discrete-GPU host is
-expected to read differently, with a real PCIe transfer in `surface_copy`
-(`cuvidMapVideoFrame` plus `cuMemcpyDtoH`, or the staging-texture
-`CopySubresourceRegion` plus `Map`) rather than a lock — which is the case the
-split was built to expose. `#300` corrected the stale pointer that used to stand
-here, and `#318` carries the measurement itself; it needs a host with the
-hardware, for the same reason the [hardware decoder
-table](#hardware-hevc-decoders) above still has empty rows.
+Those are host-specific answers rather than general ones. The Windows run is
+the discrete-GPU case the split was built to expose: a real PCIe transfer in
+`surface_copy` (`cuvidMapVideoFrame` plus `cuMemcpyDtoH`, or the staging-texture
+`CopySubresourceRegion` plus `Map`) rather than a unified-memory lock. The
+transfer is measurable but the colour conversion still dominates both
+backends, and together they account for more than 90% of steady-state decode.
 
 There is no readback arm on the software baseline. The seam covers the
 fixed-function backends; the software decoder's own conversion is already the
@@ -3358,13 +3355,11 @@ That was decided against, for now:
   of the copy that runs, not a way to avoid it, and the seam above measures
   exactly that code rather than a reimplemented stand-in.
 
-The third point is the one that is only known for unified memory. It rests on
-the recorded ratio, where the transfer is ~3 us against ~10 ms of conversion, so
-there is no round trip worth removing. A discrete-GPU host that reverses that
-ratio — a PCIe transfer dominating the conversion — would not settle the first
-two objections, but it would remove the third, and this decision should be
-re-read against that number rather than against the Apple Silicon one when
-`#318` produces it.
+The third point now holds on both memory architectures measured. On unified
+memory, the transfer is ~3 us against ~10 ms of conversion; on the RTX 4080,
+the real PCIe copy is 0.98-1.33 ms against 7.96-8.87 ms of conversion. A future
+host where the transfer dominates would not settle the first two objections,
+but it would make this decision worth re-reading against that host's number.
 
 The zero-copy path stays unbuilt until a caller needs it; the case for it would
 be a real GPU-side consumer, not a measurement. Until then
