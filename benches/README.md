@@ -896,17 +896,20 @@ it needs a 32-bit accumulator, and by the finding above that is the same lane
 count the `i32` kernel already issues.
 
 So `interp_block` takes the narrow path for the vertical-only phase, at eight
-bits, on a vector backend, at rows of eight samples or more — the four conditions
-`inter_pred::narrows` spells out — and nowhere else. The **"a vector backend"**
+bits, on a vector backend, at rows of eight samples or more — the conditions
+`inter_pred::narrows` spells out — and nowhere else. (The width in that sentence
+is the vertical-only phase's; #452 below reads the same bound off the other two
+phases `narrows` gates and lands on 32 for them.) The **"a vector backend"**
 condition now stands on a measurement from each of the three backends it admits
 rather than from NEON alone: `neon` 1.22-1.43x, `sse4.1` 1.12-1.31x and `avx2`
 1.05-1.12x on the phase it routes, against a `scalar` control that is a loss at
 every row length on both hosts. It is therefore kept as `isa != Isa::Scalar`
 rather than narrowed to the backends #378 happened to measure. The **"a row of
 at least eight samples"** condition stands on the four hosts of #440 below
-rather than on NEON alone, and stays a single `w >= 8` rather than becoming
+rather than on NEON alone, and stays `w >= 8` for this phase rather than becoming
 per-backend, because what varies at that width is the host and not the
-instruction set. Both arms stay spelled out inside
+instruction set; **#452** below reads the same cell for the two phases a mirrored
+plane admits, where the hosts agree and the number is not eight. Both arms stay spelled out inside
 `interp_block_with_width` rather than one of them being
 deleted, the same arrangement `measure_2d_ring_vs_flat` uses, so the tables above
 stay reproducible after the decision they justify.
@@ -1045,6 +1048,115 @@ reason, but the question being asked at 8x8 — is the AVX2 reading a loss or no
 `every_backend_matches_scalar_luma_block` and
 `the_eight_bit_block_path_matches_the_per_sample_equations` are untouched and
 passing. What changed is the evidence behind the width bound.
+
+That settles the bound **for the vertical-only phase**, which is the one every
+reading above is drawn from and the only one a production plane routes down the
+narrow path. `narrows` gated all three narrowing phases on the same number, and
+the mirrored columns of the two tables above say the other two do not read the
+same way at that width; **#452 below is that question and what it changes.**
+
+##### #452: the same bound, read off the phases it was never measured for
+
+The section above decides `w >= 8` from the **vertical-only** phase's 8x8 cell on
+four hosts. `narrows` gates two more phases on that same number — the
+horizontal-only and two-dimensional cases, which since #427 are admitted whenever
+`plane.borrows_narrow()`, i.e. whenever the plane carries the `i16` mirror
+`RefPlane::with_narrow` builds. The sweeps above measured those phases too, in
+exactly that mirrored arrangement, and **nothing had read their 8x8 cell as
+evidence for the bound that gates them.**
+
+Reading it changes the answer. Collecting the `mirrored` columns already in this
+file and adding the `neon` row this sweep had never had — every earlier mirrored
+reading is x86_64, and #440's own finding is that eight is the width hosts
+disagree at most — the **8x8** cell for the two mirrored-only phases is:
+
+| Host | microarchitecture | backend | horizontal-only | two-dimensional |
+| --- | --- | --- | ---: | ---: |
+| Apple M1 | Firestorm | `neon` | 0.97-1.01x | 0.91-0.97x |
+| Intel Core i9-10850K | Comet Lake | `avx2` | 0.88x | 0.92x |
+| Intel Xeon 6973P-C | Granite Rapids | `sse4.1` | 1.04x | 0.99x |
+| Intel Xeon 6973P-C | Granite Rapids | `avx2` | 0.95x | 0.95x |
+| Intel Core i7-8700B | Coffee Lake | `sse4.1` | 0.95-0.96x | 0.97-0.98x |
+| Intel Core i7-8700B | Coffee Lake | `avx2` | 0.89-0.91x | 0.91-0.92x |
+
+And the **16x16** cell, the next width up:
+
+| Host | backend | horizontal-only | two-dimensional |
+| --- | --- | ---: | ---: |
+| Apple M1 | `neon` | 1.05-1.09x | 1.04-1.07x |
+| Intel Core i9-10850K | `avx2` | 0.95x | 0.97x |
+| Intel Xeon 6973P-C | `sse4.1` | 1.14x | 1.08-1.09x |
+| Intel Xeon 6973P-C | `avx2` | 1.00x | 0.99-1.01x |
+| Intel Core i7-8700B | `sse4.1` | 1.03-1.05x | 1.04-1.05x |
+| Intel Core i7-8700B | `avx2` | 0.91-0.98x | 0.98-0.99x |
+
+**This is the opposite shape to #440's, and that is what decides it.** #440 found
+the 8x8 vertical-only cell spanning 0.95x to 1.67x on one backend across four
+hosts — a host disagreement, which no threshold expressed in widths and
+instruction sets can encode, so the single bound stood. Here the same four hosts
+and the same three backends agree: **twelve readings between 0.88x and 1.04x, not
+one of them a win**, where the vertical-only phase at the same width is above
+parity on most of them and reaches 1.67x on one. What varies at 8x8 is still the
+host, but for these two phases every host lands on the same side of parity.
+
+Nor is it noise. The instrument resolves to ±0.02x on the M1 rows above (three
+consecutive invocations, the same in-process interleaved best-of-fifteen, the
+arms asserted equal sample-for-sample first) and to ±0.01x-0.07x on the two CI
+hosts, against a deficit of up to 12%.
+
+**Sixteen is the width where the disagreement becomes a backend one, and 32 is
+where it stops.** At 16x16 the readings straddle parity — `avx2` at or below it
+on all three x86_64 hosts (0.91x-1.01x), `neon` and `sse4.1` above it
+(1.03x-1.14x). Encoding *that* split would mean a per-backend threshold, which is
+exactly what #440 refused, and refused on the stronger evidence. At 32x32 the
+same twelve cells read **1.06x-1.34x** — every host, every backend, both phases,
+a win — and at 64x64 1.14x-1.93x.
+
+So the answer is #452's first branch: **the width bound becomes phase-dependent**,
+`NARROW_MIN_WIDTH` = 8 for the vertical-only phase on #440's four-host reading
+and `NARROW_MIN_WIDTH_MIRRORED` = 32 for the two that need a plane borrowing
+narrow, each arm now standing on a measurement of the phase it gates rather than
+of a different one. `the_width_threshold_is_one_number_on_every_backend` is
+renamed `..._per_phase_on_every_backend` and asserts both numbers; that the test
+had to change is the point, since it pinned a shape one phase's readings had
+been generalized into.
+
+The **full aarch64 sweep** the `neon` rows above come from, on an **Apple M1
+(Firestorm, macOS 26.5.2, `rustc 1.98.0`)**, as a range over three consecutive
+invocations — the first mirrored-arm figures this file has had from an aarch64
+host, since the M1 block table above predates #427:
+
+| Phase | 8x8 | 16x16 | 32x32 | 64x64 |
+| --- | ---: | ---: | ---: | ---: |
+| horizontal-only, mirrored | 0.97-1.01x | 1.05-1.09x | 1.12-1.15x | 1.27-1.28x |
+| horizontal-only, copied | 0.73-0.74x | 0.85-0.90x | 0.91-0.93x | 1.02x |
+| vertical-only, mirrored | 1.45-1.52x | 1.01-1.03x | 1.21-1.39x | 1.46-1.47x |
+| vertical-only, copied | 1.57-1.64x | 1.04-1.05x | 1.21-1.34x | 1.42-1.43x |
+| two-dimensional, mirrored | 0.91-0.97x | 1.04-1.07x | 1.06-1.09x | 1.18-1.21x |
+| two-dimensional, copied | 0.78-0.83x | 0.89-0.93x | 0.95-1.00x | 0.99-1.12x |
+
+Two things in it are worth naming. The **vertical-only 8x8 cell reads 1.45-1.52x
+mirrored and 1.57-1.64x copied**, so #440's conclusion for that phase survives
+its own re-measurement on this host and arrives a second way: eight is a real win
+there on `neon` while it is a wash on the same width for the other two phases, on
+the same host, in the same invocation. And the **vertical-only 16x16 cell reads
+1.01-1.05x**, below both the 8x8 and the 32x32 cells around it, reproducibly
+across all three invocations — a dip this file's x86_64 tables do not show and
+which nothing here explains; it does not move the bound, since 16 is admitted for
+that phase by the width below it either way, and it is recorded rather than
+tidied away.
+
+**This is a latent path, and the entry says so.** `RefPlane::with_narrow` is
+test-only apparatus and `borrows_narrow()` is false for every plane the decoder
+builds (#427 priced the mirror's write at more than it buys), so no decoded
+sample and no production routing changes: the arms these two phases would take
+are unreachable in a shipped decode. What changes is that they no longer carry a
+bound inherited from a phase that reads nothing like them, so whatever next
+proposes building a mirror starts from a number measured for the phases it would
+turn on. `every_backend_matches_scalar_filter_taps_narrow`,
+`every_backend_matches_scalar_luma_block` and
+`the_eight_bit_block_path_matches_the_per_sample_equations` are untouched and
+passing.
 
 ##### #426: the same question, on an instrument with a null control in it
 
