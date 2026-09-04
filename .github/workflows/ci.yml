@@ -406,7 +406,10 @@ jobs:
       # a machine that measured a ninth of it.
       - name: Collect this run's baseline
         run: |
-          hosts="$(cat partials/host-*.txt | sort -u | paste -sd '; ' -)"
+          # `awk` rather than `paste -sd '; '`, which cycles its delimiter
+          # *characters* and joins three hosts as `a;b c`.
+          hosts="$(cat partials/host-*.txt | sort -u \
+            | awk 'NR > 1 { printf "; " } { printf "%s", $0 } END { print "" }')"
           python3 .github/scripts/criterion_baseline.py collect \
             --criterion-dir target/criterion \
             --out baseline/criterion-baseline.json \
