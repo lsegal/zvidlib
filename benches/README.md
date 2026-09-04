@@ -1968,27 +1968,32 @@ because that tag records which *build* produced a number, not which kernel ran.
 
 ## Continuous integration
 
-The `Benchmarks` job in `.github/workflows/ci.yml` treats the suite as two
-different things depending on the event.
+`.github/workflows/ci.yml` treats the suite as two different things depending on
+the event, and splits it across jobs differently for each.
 
-**On every pull request** it runs `cargo bench --no-run` and stops. That is one
-build and no measurement. It exists because the usual way a benchmark suite dies
-is not a bad number, it is rotting: the bench code stops compiling against the
-crate, nobody runs it locally, and the decay is only discovered when someone
-needs a measurement months later. Compiling on every PR makes that failure
-immediate and cheap.
+**On every pull request** the `Benchmarks (compile only)` job runs
+`cargo bench --no-run` over every target and stops. That is one build and no
+measurement. It exists because the usual way a benchmark suite dies is not a bad
+number, it is rotting: the bench code stops compiling against the crate, nobody
+runs it locally, and the decay is only discovered when someone needs a
+measurement months later. Compiling on every PR makes that failure immediate and
+cheap.
 
 It deliberately does **not** time anything on a pull request. GitHub's shared
 runners differ in CPU model, neighbour load, and thermal state between two runs
 of the same commit by far more than the regressions worth catching. A PR gate on
 those timings would fail on noise, and a check that fails on noise gets disabled.
 
-**On `main` pushes and `workflow_dispatch`** it runs the full suite with
-`ZVIDLIB_BENCH_LARGE=1`, so the per-ISA HEVC group — the one that proves the
-crate-wide override reaches the HEVC kernels — is included. Then it:
+**On `main` pushes and `workflow_dispatch`** there is one `Benchmarks (<target>)`
+job per `[[bench]]` target, each running only its own target with
+`ZVIDLIB_BENCH_LARGE=1` — so the per-ISA HEVC group, the one that proves the
+crate-wide override reaches the HEVC kernels, is included. Each of those jobs
+uploads its own criterion output, and a single `Benchmark report` job then:
 
-1. writes `bench.log` and puts the host's instruction sets into the job summary;
-2. reduces `target/criterion/` to one small JSON baseline through
+1. reassembles one `target/criterion/` tree and one `bench.log` out of the nine
+   partial artifacts, and puts every host and its instruction sets into the job
+   summary;
+2. reduces that tree to one small JSON baseline through
    `.github/scripts/criterion_baseline.py collect`;
 3. downloads the newest baseline artifact from a previous `main` run and diffs
    the two with `criterion_baseline.py compare`, writing a per-group delta table
@@ -1998,6 +2003,45 @@ crate-wide override reaches the HEVC kernels — is included. Then it:
 
 `workflow_dispatch` is how to measure a branch on demand without merging it, and
 it takes a `threshold` input.
+
+### One target per runner
+
+The timed run is fanned out because the targets share nothing at measurement
+time. On one runner the job's wall clock was their sum: on `main` push
+`33834381334` the timed step spanned 03:48:55Z to 04:26Z, of which `hevc_encode`
+was 11m24s and `av1_encode` 10m29s — two targets, more than half the time, with
+the other seven waiting on them. Fanned out, the wall clock is the slowest
+single target plus its build. The compile check is *not* fanned out, for the
+mirror-image reason: its cost is almost entirely the shared crate build, so nine
+copies would pay that nine times for one answer.
+
+The matrix lists its targets by name, which is a second copy of what `Cargo.toml`
+declares, so `tests/ci_benchmarks_run_every_target.rs` asserts the two agree. A
+target added to the manifest and not to the matrix still compiles on every PR
+and is simply never measured again, and the only symptom is a baseline that
+stops carrying its groups — which reads as benchmarks that were deleted.
+
+**What this costs is host attribution.** One stored baseline is now a merge
+across nine runners rather than one machine's suite, so its `host` field is every
+distinct model observed, joined, and the job summary carries a target-to-model
+table. Nothing in the delta report depended on a single host — `compare` already
+diffs point estimates across two machines from a shared pool, which is why its
+threshold is loose and why it does not use criterion's own change detection —
+and per benchmark the run-to-run spread is unchanged, since a given target was
+already landing on an arbitrary pool member every run. What is no longer true is
+that two benchmarks in the same baseline were measured on the same machine, so
+do not read across groups within one baseline. The committed tables in this file
+are drawn from `workflow_dispatch` runs and name their host explicitly
+(`criterion_baseline.py table --host`), which is unaffected.
+
+**The timed step clears `target/criterion` before running.** `Swatinem/rust-cache`
+walks every directory under `target/` that is not a profile directory and deletes
+the files it finds, leaving the directories, so a restored cache handed criterion
+an empty `<id>/base/`. Criterion checks that the directory exists, tries to load
+`<id>/base/sample.json` out of it for its previous-run comparison, and logs
+`Criterion.rs ERROR: ... No such file or directory` — 267 of them in run
+`33834381334`, one per benchmark, none of which failed anything. Deleting the
+skeleton makes every measurement a first one, which is what it always was.
 
 ### The threshold, and why it is only a report
 
