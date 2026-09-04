@@ -173,8 +173,8 @@ jobs:
       - name: Test in headless Chrome
         run: wasm-pack test --headless --chrome --no-default-features --features web
 
-  # Benchmarks are measured, not gated. On a pull request this job only compiles
-  # the suite: `cargo bench --no-run` costs one build and catches bench-code
+  # Benchmarks are measured, not gated. On a pull request the suite is only
+  # compiled: `cargo bench --no-run` costs one build and catches bench-code
   # rot, which is how benchmark suites usually die - the code stops compiling
   # against the crate and nobody notices for months. It deliberately does not
   # time anything on a pull request. GitHub's shared runners vary by an order of
@@ -184,19 +184,25 @@ jobs:
   # Timed runs happen on `main` pushes and `workflow_dispatch`, where successive
   # runs are comparable enough to be worth storing: each one saves a baseline
   # artifact and reports its deltas against the previous one in the job summary.
-  benchmarks:
-    name: Benchmarks
+  #
+  # The compile check is one job and the timed run is one job *per bench
+  # target*, because the two have opposite shapes. Compiling is a single cargo
+  # invocation whose cost is almost entirely the shared crate build, so nine
+  # copies of it would pay that nine times for one result. Measuring is nine
+  # independent programs that share nothing but the binary they were built
+  # from, and running them on one runner made the job's wall clock their sum:
+  # on `main` push 33834381334 the timed step spanned 03:48:55Z to 04:26Z, and
+  # `hevc_encode` (11m24s) plus `av1_encode` (10m29s) were more than half of it
+  # (#459). Fanned out, the wall clock is the slowest single target instead.
+  benchmark-compile:
+    name: Benchmarks (compile only)
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    # `actions: read` is for listing and downloading the previous run's baseline
-    # artifact through the API; `actions/download-artifact` only reaches within
-    # a single run.
     permissions:
       contents: read
-      actions: read
     # `[profile.bench]` is `lto = "fat"` with `codegen-units = 1`, so the build
-    # alone is slow, and the timed run adds one arm per available instruction
-    # set on top of it.
-    timeout-minutes: 120
+    # alone is slow even without timing anything.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
@@ -213,16 +219,55 @@ jobs:
           cache-on-failure: true
       - name: Install native audio dependencies
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
-      # Every `[[bench]]` target, not one of them: the suite is nine targets
-      # (`codec`, `av1_decode`, `av1_encode`, `hevc_decode`, `hevc_encode`,
-      # `audio_decode`, `audio_mux`, `hevc_hardware`, `exact_seek`) and naming
-      # one would let the other eight rot unnoticed, which is the exact failure
-      # this step exists to catch.
+      # Every `[[bench]]` target, not one of them: naming one would let the
+      # other eight rot unnoticed, which is the exact failure this job exists
+      # to catch.
       - name: Compile the benchmark suite
         run: cargo bench --features native --benches --no-run
 
-      - name: Run the benchmarks
-        if: github.event_name != 'pull_request'
+  benchmarks:
+    name: Benchmarks (${{ matrix.bench }})
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      # One target failing still leaves the other eight measured, and the
+      # report job below refuses to build a baseline out of a partial suite
+      # anyway - so cancelling the survivors would only cost the log that says
+      # which ones were fine.
+      fail-fast: false
+      matrix:
+        # Slowest first, because a pool that cannot start all nine at once
+        # starts them in this order and the wall clock is whatever finishes
+        # last. `tests/ci_benchmarks_run_every_target.rs` asserts this list is
+        # exactly the `[[bench]]` targets `Cargo.toml` declares, so a target
+        # added there cannot silently stop being measured.
+        bench:
+          - hevc_encode
+          - av1_encode
+          - av1_decode
+          - hevc_decode
+          - codec
+          - audio_decode
+          - audio_mux
+          - exact_seek
+          - hevc_hardware
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: rustup show
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Install native audio dependencies
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - name: Compile ${{ matrix.bench }}
+        run: cargo bench --features native --bench ${{ matrix.bench }} --no-run
+
+      - name: Run ${{ matrix.bench }}
         env:
           # The whole-frame 1080p groups are the ones that prove the
           # crate-wide SIMD override reaches the HEVC kernels on real decode
@@ -231,49 +276,140 @@ jobs:
           ZVIDLIB_BENCH_LARGE: '1'
         # `tee` would otherwise swallow a panicking benchmark's exit status;
         # Actions runs `run:` under `bash -e` without pipefail.
+        #
+        # `target/criterion` is cleared first because the restored build cache
+        # brings back a *skeleton* of it and nothing else: `rust-cache` walks
+        # any directory under `target/` that is not a profile directory and
+        # deletes every file it finds, leaving the directories. Criterion then
+        # sees `<id>/base/` exists, tries to load `<id>/base/sample.json` for
+        # the previous-run comparison, and logs
+        # `Criterion.rs ERROR: ... No such file or directory` - 268 of them in
+        # run 33834381334, one per benchmark plus one unrelated CUDA line
+        # (#459). Deleting the skeleton makes every measurement a first one,
+        # which is what it always was.
         run: |
           set -o pipefail
-          cargo bench --features native --benches 2>&1 | tee bench.log
+          rm -rf target/criterion
+          cargo bench --features native --bench ${{ matrix.bench }} 2>&1 \
+            | tee "bench-${{ matrix.bench }}.log"
 
       # `bench_across_isas` runs one arm per entry in `zvidlib::simd::available()`,
       # so a runner without AVX2 has no `avx2` arm rather than reporting scalar
-      # numbers under a vector label. Surfacing the list makes a baseline
-      # attributable to a host: an arm that vanished because the runner pool
-      # changed looks exactly like an arm that never existed.
-      - name: Report the host's instruction sets
-        if: github.event_name != 'pull_request'
+      # numbers under a vector label. Recording the model per target is what
+      # keeps a merged baseline attributable: the nine targets are nine
+      # runners now, and an arm that vanished because the pool changed looks
+      # exactly like an arm that never existed.
+      - name: Record this target's host
+        run: |
+          model="$(grep -m1 '^model name' /proc/cpuinfo | cut -d: -f2- | xargs)"
+          echo "$model ($RUNNER_OS/$RUNNER_ARCH)" > "host-${{ matrix.bench }}.txt"
+
+      # Only the two files `criterion_baseline.py collect` reads, not the
+      # rendered HTML next to them: the report job reassembles a
+      # `target/criterion` tree out of these, and the reports would be tens of
+      # megabytes of artifact for a script that never opens them.
+      # `hevc_hardware` measures nothing on a runner with no hardware decoder,
+      # so the tree can legitimately be empty here.
+      - name: Stage this target's criterion output
+        run: |
+          mkdir -p upload target/criterion
+          cp "bench-${{ matrix.bench }}.log" "host-${{ matrix.bench }}.txt" upload/
+          find target/criterion -path '*/new/*' \
+            \( -name estimates.json -o -name benchmark.json \) \
+            -exec cp --parents {} upload/ \;
+
+      - name: Upload this target's criterion output
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-partial-${{ github.run_id }}-${{ matrix.bench }}
+          path: upload/
+          retention-days: 1
+
+  # The half of the old single job that was never per-target: one baseline, one
+  # delta report and one stored artifact for the whole suite, so the chain a
+  # `main` run compares against keeps the shape it had before the fan-out.
+  #
+  # `needs: benchmarks` is deliberately strict. A baseline assembled from
+  # whichever targets happened to succeed would drop the rest silently, and the
+  # next run's delta report would read that absence as benchmarks that
+  # disappeared rather than as a job that failed.
+  benchmark-report:
+    name: Benchmark report
+    if: github.event_name != 'pull_request'
+    needs: benchmarks
+    runs-on: ubuntu-latest
+    # `actions: read` is for listing and downloading the previous run's baseline
+    # artifact through the API; `actions/download-artifact` only reaches within
+    # a single run.
+    permissions:
+      contents: read
+      actions: read
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      # `merge-multiple` unpacks all nine artifacts into one tree. The criterion
+      # paths cannot collide across targets - two bench targets sharing a group
+      # name is what `tests/bench_group_names_are_unique.rs` forbids (#414) -
+      # and the per-target log and host files carry the target in their names.
+      - name: Download this run's per-target output
+        uses: actions/download-artifact@v4
+        with:
+          pattern: criterion-partial-${{ github.run_id }}-*
+          merge-multiple: true
+          path: partials
+
+      - name: Reassemble the suite's criterion tree and log
+        run: |
+          rm -rf target/criterion
+          mkdir -p target
+          mv partials/target/criterion target/criterion
+          # Alphabetical by target, which is the order `cargo bench` walked
+          # them in when this was one job, so the concatenated log reads the
+          # same way the old `bench.log` did.
+          cat partials/bench-*.log > bench.log
+
+      - name: Report the hosts and their instruction sets
         run: |
           {
-            echo '## Benchmark host'
+            echo '## Benchmark hosts'
+            echo
+            echo 'Each bench target runs on its own runner, so one baseline now'
+            echo 'spans several hosts. `benches/README.md` names the model each'
+            echo 'committed table was measured on, so the models have to be in'
+            echo "the run's own record rather than reconstructed afterwards."
+            echo
+            echo '| bench target | host CPU model |'
+            echo '| --- | --- |'
+            for host_file in partials/host-*.txt; do
+              target="${host_file#partials/host-}"
+              printf '| `%s` | %s |\n' "${target%.txt}" "$(cat "$host_file")"
+            done
             echo
             echo '```'
-            # `ubuntu-latest` is a pool of several CPU models, and an
-            # elementwise minimum taken across two of them is attributable to
-            # no named host. `benches/README.md` names the model each committed
-            # table was measured on, so the model has to be in the run's own
-            # record rather than reconstructed afterwards.
-            echo "# host cpu model: $(grep -m1 '^model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//')"
             grep -hE '^# (host instruction sets|widest detected|dispatch site)' bench.log \
               | sort -u || echo 'no instruction-set log found in the benchmark output'
             echo '```'
             echo
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # Every distinct host, not the first one: the baseline is a merge across
+      # nine runners, and naming one of them would attribute the whole suite to
+      # a machine that measured a ninth of it.
       - name: Collect this run's baseline
-        if: github.event_name != 'pull_request'
         run: |
+          hosts="$(cat partials/host-*.txt | sort -u | paste -sd '; ' -)"
           python3 .github/scripts/criterion_baseline.py collect \
             --criterion-dir target/criterion \
             --out baseline/criterion-baseline.json \
             --commit "$GITHUB_SHA" \
             --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
-            --host "$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | xargs) ($RUNNER_OS/$RUNNER_ARCH)"
+            --host "$hosts"
 
       # The newest non-expired baseline uploaded by a `main` run. Absent on the
       # very first run, and after the 90-day retention window lapses; the
       # comparison step reports "no previous baseline" rather than failing.
       - name: Download the previous main baseline
-        if: github.event_name != 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -291,7 +427,6 @@ jobs:
           unzip -o -j previous.zip -d previous
 
       - name: Compare against the previous baseline
-        if: github.event_name != 'pull_request'
         run: |
           python3 .github/scripts/criterion_baseline.py compare \
             --previous previous/criterion-baseline.json \
@@ -318,7 +453,6 @@ jobs:
       # be unrecoverable off the runner - which is exactly what refreshing the
       # committed table in `benches/README.md` needs from a dispatched run.
       - name: Upload the full benchmark log
-        if: github.event_name != 'pull_request'
         uses: actions/upload-artifact@v4
         with:
           name: criterion-report-${{ github.run_id }}
