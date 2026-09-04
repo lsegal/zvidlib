@@ -10,12 +10,16 @@
 //! one is shown, the decoded-frame playback rate is drawn in the top-left corner, and a control
 //! legend is drawn above the timeline bar until it fades out (press `H` to show or hide it).
 //!
-//! Dragging the timeline bar decodes its previews on a background thread (see [`scrub`]), so the
-//! window keeps drawing and keeps its audio scheduled while the pointer moves. What it draws
-//! while that decode runs comes from [`zvidlib::PreviewIndex`], a background pass that keeps a
-//! shrunk picture every half second of the track: the bundled sample is one group of pictures, so the frame at
-//! the far end of the bar is a second of hardware decoding away however the walk to it is
-//! arranged, and only a picture that was decoded already can answer a drag immediately.
+//! Dragging the timeline bar decodes the frame under the pointer on a background thread (see
+//! [`scrub`]), so the window keeps drawing while the pointer moves. What it draws until that frame
+//! lands comes from [`zvidlib::PreviewIndex`], a background pass that keeps a shrunk picture every
+//! half second of the track: the bundled sample is one group of pictures, so the frame at the far
+//! end of the bar is a second of hardware decoding away however the walk to it is arranged, and
+//! only a picture that was decoded already can answer a drag immediately. Nothing else is drawn
+//! while a drag is open - a picture the walk passed is of the start of the movie rather than of
+//! the pointer's position, and showing those was issue #458 - and the audio follows the pointer
+//! too, by seeking the clock to it a few times a second rather than playing on from where the
+//! drag began.
 //!
 //! Run with:
 //!
@@ -59,7 +63,7 @@ mod gl_window;
 mod scrub;
 
 use gl_window::{CONTROL_LEGEND, FpsCounter, GlWindowAdapter, LegendVisibility};
-use scrub::{FrameService, target_frame};
+use scrub::{AudioScrubCadence, FrameService, frame_is_at_playhead, target_frame};
 
 const TEXTURE_HANDLE: u64 = 1;
 
@@ -223,6 +227,8 @@ struct App<P> {
     dragging: bool,
     /// The exact frame the drag is pointing at, committed when the pointer is released.
     scrub_target: Option<u64>,
+    /// Paces how often a drag moves the audio clock to the frame under the pointer.
+    audio_scrub: AudioScrubCadence,
     /// Pictures decoded ahead of time, one every few frames, so a drag draws the right part of
     /// the movie before the walk to the exact frame under it finishes.
     previews: PreviewIndex,
@@ -264,6 +270,7 @@ where
             frames,
             dragging: false,
             scrub_target: None,
+            audio_scrub: AudioScrubCadence::default(),
             previews,
             legend: LegendVisibility::new(Instant::now()),
             fps: FpsCounter::new(),
@@ -345,12 +352,15 @@ where
         (x / f64::from(width.max(1))).clamp(0.0, 1.0) as f32
     }
 
-    /// Records where the drag is pointing and points the worker thread at it.
+    /// Records where the drag is pointing, points the worker thread at it, and takes the audio
+    /// there.
     ///
-    /// Nothing here decodes. The worker walks to the frame under the pointer from its
-    /// random-access point, drawing what it passes, so the picture follows the drag from the
-    /// first intra picture onwards instead of waiting for the whole group of pictures.
-    fn scrub_preview(&mut self, fraction: f32) {
+    /// Nothing here decodes video. The worker is asked for the frame under the pointer and for no
+    /// other: the pictures a walk passes are of the start of the movie on this sample and the
+    /// window will not draw them (issue #458), so paying their conversion would only delay the one
+    /// it is waiting for. What the window shows until that frame lands is the preview index's
+    /// shrunk picture, which is already of wherever the pointer is.
+    fn scrub_preview(&mut self, event_loop: &ActiveEventLoop, fraction: f32) {
         let target = target_frame(fraction, self.frame_count);
         self.scrub_target = Some(target);
         // Drawn here rather than left to the worker: this is a lookup and a texture upload over
@@ -359,10 +369,54 @@ where
         if let Some(preview) = self.previews.nearest(target) {
             let _ = self.upload_frame_at(preview.dimensions, &preview);
         }
-        self.frames.request(target);
+        self.frames.request(target, false);
+        self.scrub_audio(event_loop, target);
         if let Some(state) = self.state.as_ref() {
             state.window.request_redraw();
         }
+    }
+
+    /// Moves the audio clock to the frame the pointer is on, so a drag hears the part of the
+    /// movie it is pointing at.
+    ///
+    /// Before this, a drag left the clock wherever the press found it and `pump_audio` kept
+    /// scheduling from there, so the picture scrubbed while the sound played straight on (issue
+    /// #458). The seek is what moves it: it is cheap on this example's video source, whose `reset`
+    /// deliberately leaves the worker's decoder alone, so the walk the drag has going is not
+    /// disturbed by it. It is paced by [`AudioScrubCadence`] rather than run on every pointer
+    /// move, because each seek discards the PCM already queued and a drag delivers a move per
+    /// displayed frame.
+    fn scrub_audio(&mut self, event_loop: &ActiveEventLoop, target: u64) {
+        // Nothing is being scheduled while paused, so there is nothing to keep at the playhead;
+        // the commit's seek is what moves a paused clock.
+        if !self.playback.is_playing() || !self.audio_scrub.due(Instant::now()) {
+            return;
+        }
+        if let Err(error) = self.playback.seek(zvidlib::FrameIndex(target)) {
+            self.fail(event_loop, error);
+        }
+    }
+
+    /// The frame the window is trying to show: the one under the pointer while a drag is open,
+    /// and the one the audio clock is on otherwise.
+    fn playhead_frame(&self) -> Option<u64> {
+        match self.scrub_target {
+            Some(target) if self.dragging => Some(target),
+            _ => self
+                .playback
+                .current_frame_index()
+                .ok()
+                .map(|frame| frame.0),
+        }
+    }
+
+    /// How far from the playhead a delivered picture may be and still be drawn, in frames.
+    ///
+    /// A quarter of a second of this track. A drag retargets faster than a decode finishes, so
+    /// the picture that lands is of the frame the pointer was on when it started; that is the
+    /// same moment of the movie, while the frames a walk passes are a different one entirely.
+    fn playhead_tolerance(&self) -> u64 {
+        (self.frames_per_five_seconds / 20).max(1)
     }
 
     /// Ends a drag by moving playback to the frame the pointer was left on. Only the clock moves
@@ -370,6 +424,9 @@ where
     /// frame, so committing decodes nothing.
     fn commit_scrub(&mut self, event_loop: &ActiveEventLoop) {
         self.dragging = false;
+        // The next drag moves the audio on its first pointer move rather than inheriting this
+        // one's pacing.
+        self.audio_scrub.rearm();
         let Some(target) = self.scrub_target.take() else {
             return;
         };
@@ -386,14 +443,21 @@ where
             self.fail(event_loop, error);
             return false;
         }
+        // The index says whether this is the frame the window is waiting for or one a walk
+        // passed on the way to it. Only the first is drawn: the pictures between a random-access
+        // point and a far target are of the start of the movie, and drawing them was what made a
+        // drag show frame 0, then 15, then 30, before the frame under the pointer (issue #458).
+        let playhead = self.playhead_frame();
+        let tolerance = self.playhead_tolerance();
         match self.frames.take_latest() {
-            // The index says whether this is the frame under the pointer or one the walk passed;
-            // either is drawn, so the window ignores it.
-            Some((_, frame)) => {
+            Some((index, frame))
+                if playhead
+                    .is_some_and(|playhead| frame_is_at_playhead(index, playhead, tolerance)) =>
+            {
                 self.upload_frame(event_loop, &frame);
                 true
             }
-            None => false,
+            _ => false,
         }
     }
 
@@ -685,7 +749,7 @@ where
                     // A drag keeps the marker under the pointer even once it has slid off the
                     // bar vertically, since it is still scrubbing.
                     self.timeline_hover = Some(fraction);
-                    self.scrub_preview(fraction);
+                    self.scrub_preview(event_loop, fraction);
                 } else if let Some(state) = self.state.as_ref() {
                     state.window.request_redraw();
                 }
@@ -697,7 +761,7 @@ where
             } => {
                 if let Some(fraction) = self.timeline_hover {
                     self.dragging = true;
-                    self.scrub_preview(fraction);
+                    self.scrub_preview(event_loop, fraction);
                 }
             }
             WindowEvent::MouseInput {

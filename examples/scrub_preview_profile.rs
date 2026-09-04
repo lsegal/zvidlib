@@ -181,7 +181,9 @@ fn preview_walk(
     )
     .expect("the frame service opens over the bundled sample");
     let started = Instant::now();
-    frames.request(target);
+    // The cadence is this example's subject, so this asks for the walk that publishes what it
+    // passes even though the window no longer does (issue #458).
+    frames.request(target, true);
     loop {
         // Collecting is what the render thread does with a picture, and it is what frees the
         // delivery queue, so a harness that never collected would not be timing a drag.
