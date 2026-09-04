@@ -47,11 +47,11 @@ the audio clock and the displayed video frame in sync, and audio keeps playing w
 playback was running.
 
 A drag previews on a background thread rather than seeking: the worker walks towards the newest
-pointer position and supersedes any position the pointer has already moved past. It publishes a
-picture roughly every 150 ms of decoding rather than every frame it passes, so the picture keeps
-moving during a long walk without paying a full-resolution conversion per frame, and a position
-behind the reader restarts at its random-access point. The window keeps drawing throughout, and
-only the frame the pointer is released on is seeked to and decoded exactly.
+pointer position and supersedes any position the pointer has already moved past. It publishes the
+frame under the pointer and nothing it passes on the way - the frames in between are decoded for
+reference only and never converted - so a drag draws no picture that is not at the playhead. The
+window keeps drawing throughout, and only the frame the pointer is released on is seeked to and
+decoded exactly.
 
 What the drag draws *first* does not come from that walk at all. A background pass over the track
 keeps a quarter-scale picture every half second of playback, capped at 64 MiB, and a drag looks the

@@ -30,14 +30,6 @@ name = "hevc_decode_profile"
 path = "examples/hevc_decode_profile.rs"
 required-features = ["native"]
 
-# Issue #379's measurement of the drag preview cadence. It reuses `native_gl`'s
-# `scrub` module through `#[path]` rather than a copy, so what it times is the
-# code the window runs.
-[[example]]
-name = "scrub_preview_profile"
-path = "examples/scrub_preview_profile.rs"
-required-features = ["native"]
-
 # Criterion drives its own harness (`harness = false`), so the bench targets must
 # not link libtest. Every codec group lives in this one target so the shared
 # `benches/support/` fixture cache is loaded and decoded once per process.
