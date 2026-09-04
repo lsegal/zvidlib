@@ -3158,6 +3158,81 @@ mod tests {
         }
     }
 
+
+    /// The per-row cost of [`RefPlane::gather`] and
+    /// [`RefPlane::gather_narrow`] as a function of the bytes one row
+    /// copies, which is what `measure_narrow_gather_vs_kernel` leaves
+    /// to be explained.
+    ///
+    /// That measurement puts the whole of issue #455's 16x16 dip in the
+    /// source half: the narrow gather is faster than the wide one at
+    /// every block width except 16, where it inverts. The two arms copy
+    /// `4 * w` and `2 * w` bytes per row respectively, so they reach the
+    /// same byte counts at different widths — the wide arm's `w = 8` row
+    /// and the narrow arm's `w = 16` row are both 32 bytes. Sweeping
+    /// width and reporting **nanoseconds per row against bytes per row**
+    /// therefore lays the two arms on one axis: if the cost depends only
+    /// on the byte count, the two curves coincide and the dip is a
+    /// property of `memcpy` at one size rather than of narrowing.
+    ///
+    /// The row count is fixed so that width is the only thing varying,
+    /// and the region is wholly inside the plane so both arms take the
+    /// straight-copy branch of [`RefPlane::copy_row_narrow`] rather than
+    /// the edge-extension one.
+    ///
+    /// Ignored by default because it is a timing measurement, not an
+    /// assertion. Run it with
+    /// `cargo test --release --features native --lib
+    /// measure_narrow_gather_by_row_bytes -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "benchmark; run with --ignored --nocapture"]
+    fn measure_narrow_gather_by_row_bytes() {
+        use std::time::Instant;
+
+        let (pw, ph) = (256usize, 256usize);
+        let plane_samples = pseudo_random(8, pw * ph, 255);
+        let mirror: Vec<i16> = plane_samples.iter().map(|&s| s as i16).collect();
+        let mirrored = RefPlane::with_narrow(&plane_samples, &mirror, pw, ph).unwrap();
+        let plane = RefPlane::new(&plane_samples, pw, ph).unwrap();
+        let rounds = 15;
+        let rows = 32usize;
+        let calls = 1usize << 15;
+        let (x0, y0) = (4i32, 1i32);
+
+        println!("\nRefPlane::gather row cost by bytes per row, best of {rounds} rounds");
+        println!("  {rows} rows per call, {calls} calls per round, region wholly inside the plane");
+        println!("    w    i32 B/row  ns/row     i16 B/row  ns/row (mir)  ns/row (cop)");
+        for &w in &[4usize, 8, 12, 16, 20, 24, 32, 40, 48, 64] {
+            let mut best = [f64::INFINITY; 3];
+            for _ in 0..rounds {
+                let start = Instant::now();
+                for _ in 0..calls {
+                    std::hint::black_box(plane.gather(x0, y0, w, rows));
+                }
+                best[0] = best[0].min(start.elapsed().as_secs_f64());
+                let start = Instant::now();
+                for _ in 0..calls {
+                    std::hint::black_box(mirrored.gather_narrow(x0, y0, w, rows));
+                }
+                best[1] = best[1].min(start.elapsed().as_secs_f64());
+                let start = Instant::now();
+                for _ in 0..calls {
+                    std::hint::black_box(plane.gather_narrow(x0, y0, w, rows));
+                }
+                best[2] = best[2].min(start.elapsed().as_secs_f64());
+            }
+            let ns = |t: f64| t * 1e9 / (calls * rows) as f64;
+            println!(
+                "  {w:>3}    {:>6}   {:7.2}      {:>6}   {:9.2}     {:9.2}",
+                w * 4,
+                ns(best[0]),
+                w * 2,
+                ns(best[1]),
+                ns(best[2]),
+            );
+        }
+    }
+
     /// What the `i16` mirror costs to build, against what a frame's
     /// worth of §8.5.3.3.3 interpolation costs to run — the amortization
     /// that decides whether issue #427's plane representation is worth
