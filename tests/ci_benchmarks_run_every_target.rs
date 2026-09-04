@@ -119,7 +119,9 @@ fn the_timed_step_clears_the_criterion_directory_first() {
     // reads.
     let measured = lines
         .iter()
-        .position(|line| line.starts_with("cargo bench --features native --bench") && !line.contains("--no-run"))
+        .position(|line| {
+            line.starts_with("cargo bench --features native --bench") && !line.contains("--no-run")
+        })
         .expect(
             "ci.yml no longer runs a single bench target with \
              `cargo bench --features native --bench <target>`",

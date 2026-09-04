@@ -85,6 +85,14 @@ jobs:
       # without it is slow in a way nothing else here would report.
       - name: Check every cargo CI job is cached
         run: cargo test --features native --test ci_workflows_cache_cargo
+      # The timed benchmark run names its `[[bench]]` targets in a matrix, which
+      # is a second copy of what `Cargo.toml` declares. A target added to the
+      # manifest and not the matrix still compiles on every PR and is simply
+      # never measured again (#459), and the same test pins the
+      # `rm -rf target/criterion` that keeps a restored build cache from making
+      # criterion log an error per benchmark.
+      - name: Check the benchmark matrix measures every target
+        run: cargo test --features native --test ci_benchmarks_run_every_target
       # `criterion_baseline.py` is where a benchmark regression threshold is
       # justified from, and it runs in a job that takes two hours to reach it.
       # Standard library only, so this needs no install step. Its `table`
