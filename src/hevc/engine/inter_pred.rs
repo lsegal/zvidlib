@@ -773,6 +773,22 @@ fn interp_block<const N: usize>(
 ///   vertical-only phase's eight, so a future mirror does not inherit a
 ///   bound that was never measured for these two phases.
 ///
+/// The vertical-only phase's own gather is not the free ride the first
+/// bullet above makes it sound, and issue #455 is where that was
+/// measured. Writing the `w x ( h + N − 1 )` buffer as `i16` rather
+/// than `i32` is free in the sense that both arms write one; it is not
+/// free in the sense of costing the same, because the per-row cost of
+/// [`RefPlane::gather`] does not scale with the bytes a row copies. It
+/// steps down at 64 destination bytes per row, which the wide arm
+/// reaches at `w = 16` and the narrow arm only at `w = 32`, so at a
+/// block width of exactly 16 the narrow gather is **slower** than the
+/// wide one and the phase's whole sweep dips to parity there.
+/// `measure_narrow_gather_vs_kernel` and
+/// `measure_narrow_gather_by_row_bytes` are that decomposition, and
+/// `benches/README.md` carries it. It moves no bound: the kernel half of
+/// that cell is still a 1.26x win, so a minimum *width* is aimed at the
+/// half of the call that is not what costs it.
+///
 /// The two-dimensional phase gains less than the horizontal-only one for
 /// a reason no plane representation reaches: only its horizontal pass
 /// can use the narrowing at all. Its vertical pass multiplies a 16-bit
@@ -3012,6 +3028,223 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// Decomposes the **vertical-only** phase of
+    /// `measure_narrow_vs_wide_block` into the two costs it is the sum
+    /// of, because that sweep's `neon` row is not monotonic in block
+    /// width and one summed number cannot say which half moved.
+    ///
+    /// Issue #455's question is whether the 16x16 cell dipping to parity
+    /// is the kernel or the instrument. `interp_block_with_width`'s
+    /// vertical-only arm is exactly `vec![0i32; w * h]` plus one
+    /// `RefPlane::gather` of `w x ( h + 7 )` plus `h` calls of
+    /// [`simd::filter_taps`], and the narrow arm swaps the first for a
+    /// [`RefPlane::gather_narrow`] of the same shape in `i16` and the
+    /// last for [`simd::filter_taps_narrow`]. So the two halves are:
+    ///
+    /// - **source**: the allocation and the gather, which is per *call*
+    ///   and identical work at every width, and which is where the
+    ///   narrow arm's buffer being half the bytes is worth something;
+    /// - **kernel**: the output allocation and the `h` filter calls,
+    ///   which is per *sample* and is where the 8-lane `i16` kernel is
+    ///   worth something over the 4-lane `i32` one.
+    ///
+    /// `calls` is `( 1 << 22 ) / ( w * h )` here as it is there, so the
+    /// two halves add back to that sweep's cell and the composed ratio
+    /// in the right-hand columns is directly comparable to it. Both
+    /// gather arms are asserted equal to the wide one sample-for-sample
+    /// before anything is timed.
+    ///
+    /// Ignored by default because it is a timing measurement, not an
+    /// assertion. Run it with
+    /// `cargo test --release --features native --lib
+    /// measure_narrow_gather_vs_kernel -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "benchmark; run with --ignored --nocapture"]
+    fn measure_narrow_gather_vs_kernel() {
+        use std::time::Instant;
+
+        let (pw, ph) = (256usize, 256usize);
+        let plane_samples = pseudo_random(8, pw * ph, 255);
+        let mirror: Vec<i16> = plane_samples.iter().map(|&s| s as i16).collect();
+        let mirrored = RefPlane::with_narrow(&plane_samples, &mirror, pw, ph).unwrap();
+        let plane = RefPlane::new(&plane_samples, pw, ph).unwrap();
+        let isas: Vec<Isa> = simd::available_isas()
+            .into_iter()
+            .filter(|&isa| isa != Isa::Scalar)
+            .collect();
+        let rounds = 15;
+        let vk = &LUMA_FILTER[2];
+        let vk16: [i16; 8] = std::array::from_fn(|t| vk[t] as i16);
+        let shift1 = interp_shift1(8);
+        // The same block position the block sweep filters at, so both
+        // gather arms take their inside-the-plane branch as they do
+        // there.
+        let (x_int, y_int, halo) = (4i32, 4i32, 3i32);
+
+        println!("\nvertical-only interp_block decomposed, best of {rounds} interleaved rounds");
+        println!("  ns per interp_block call; source = gather + its allocation,");
+        println!("  kernel = the `w * h` output allocation plus `h` filter_taps calls");
+        println!("  block      isa      source ns/call        kernel ns/call    composed narrow");
+        println!("                     i32    mir    cop        i32     i16    mirrored  copied");
+        for &(w, h) in &[(8usize, 8usize), (16, 16), (32, 32), (64, 64)] {
+            let calls = (1 << 22) / (w * h);
+            let rows = h + 7;
+            // Neither the plane representation nor the narrowing may
+            // move a source sample, only what it costs to reach it.
+            let sw = plane.gather(x_int, y_int - halo, w, rows);
+            let sm = mirrored.gather_narrow(x_int, y_int - halo, w, rows);
+            let sc = plane.gather_narrow(x_int, y_int - halo, w, rows);
+            assert_eq!(sm, sc, "gather arms disagree at {w}x{h}");
+            assert!(
+                sw.iter().zip(sm.iter()).all(|(&a, &b)| a == i32::from(b)),
+                "narrow gather disagrees with the wide one at {w}x{h}"
+            );
+
+            // The three source arms and both kernel arms are all
+            // interleaved with each other, so a drift that lands
+            // mid-sweep is spread across the columns rather than
+            // charged to one.
+            let mut src_best = [f64::INFINITY; 3];
+            let mut ker_best = vec![(f64::INFINITY, f64::INFINITY); isas.len()];
+            for _ in 0..rounds {
+                let start = Instant::now();
+                for _ in 0..calls {
+                    std::hint::black_box(plane.gather(x_int, y_int - halo, w, rows));
+                }
+                src_best[0] = src_best[0].min(start.elapsed().as_secs_f64());
+                let start = Instant::now();
+                for _ in 0..calls {
+                    std::hint::black_box(mirrored.gather_narrow(x_int, y_int - halo, w, rows));
+                }
+                src_best[1] = src_best[1].min(start.elapsed().as_secs_f64());
+                let start = Instant::now();
+                for _ in 0..calls {
+                    std::hint::black_box(plane.gather_narrow(x_int, y_int - halo, w, rows));
+                }
+                src_best[2] = src_best[2].min(start.elapsed().as_secs_f64());
+                for (i, &isa) in isas.iter().enumerate() {
+                    let start = Instant::now();
+                    for _ in 0..calls {
+                        let mut out = vec![0i32; w * h];
+                        for y in 0..h {
+                            let taps: [&[i32]; 8] =
+                                std::array::from_fn(|t| &sw[(y + t) * w..(y + t + 1) * w]);
+                            simd::filter_taps(isa, &taps, vk, shift1, &mut out[y * w..(y + 1) * w]);
+                        }
+                        std::hint::black_box(out);
+                    }
+                    ker_best[i].0 = ker_best[i].0.min(start.elapsed().as_secs_f64());
+                    let start = Instant::now();
+                    for _ in 0..calls {
+                        let mut out = vec![0i32; w * h];
+                        for y in 0..h {
+                            let taps: [&[i16]; 8] =
+                                std::array::from_fn(|t| &sm[(y + t) * w..(y + t + 1) * w]);
+                            simd::filter_taps_narrow(
+                                isa,
+                                &taps,
+                                &vk16,
+                                shift1,
+                                &mut out[y * w..(y + 1) * w],
+                            );
+                        }
+                        std::hint::black_box(out);
+                    }
+                    ker_best[i].1 = ker_best[i].1.min(start.elapsed().as_secs_f64());
+                }
+            }
+            let ns = |t: f64| t * 1e9 / calls as f64;
+            for (&isa, (kw, kn)) in isas.iter().zip(ker_best.iter().copied()) {
+                println!(
+                    "  {:>5}  {:>7}  {:6.1} {:6.1} {:6.1}   {:7.1} {:7.1}    {:6.2}x {:6.2}x",
+                    format!("{w}x{h}"),
+                    format!("{isa:?}"),
+                    ns(src_best[0]),
+                    ns(src_best[1]),
+                    ns(src_best[2]),
+                    ns(kw),
+                    ns(kn),
+                    (src_best[0] + kw) / (src_best[1] + kn),
+                    (src_best[0] + kw) / (src_best[2] + kn),
+                );
+            }
+        }
+    }
+
+    /// The per-row cost of [`RefPlane::gather`] and
+    /// [`RefPlane::gather_narrow`] as a function of the bytes one row
+    /// copies, which is what `measure_narrow_gather_vs_kernel` leaves
+    /// to be explained.
+    ///
+    /// That measurement puts the whole of issue #455's 16x16 dip in the
+    /// source half: the narrow gather is faster than the wide one at
+    /// every block width except 16, where it inverts. The two arms copy
+    /// `4 * w` and `2 * w` bytes per row respectively, so they reach the
+    /// same byte counts at different widths — the wide arm's `w = 8` row
+    /// and the narrow arm's `w = 16` row are both 32 bytes. Sweeping
+    /// width and reporting **nanoseconds per row against bytes per row**
+    /// therefore lays the two arms on one axis: if the cost depends only
+    /// on the byte count, the two curves coincide and the dip is a
+    /// property of `memcpy` at one size rather than of narrowing.
+    ///
+    /// The row count is fixed so that width is the only thing varying,
+    /// and the region is wholly inside the plane so both arms take the
+    /// straight-copy branch of [`RefPlane::copy_row_narrow`] rather than
+    /// the edge-extension one.
+    ///
+    /// Ignored by default because it is a timing measurement, not an
+    /// assertion. Run it with
+    /// `cargo test --release --features native --lib
+    /// measure_narrow_gather_by_row_bytes -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "benchmark; run with --ignored --nocapture"]
+    fn measure_narrow_gather_by_row_bytes() {
+        use std::time::Instant;
+
+        let (pw, ph) = (256usize, 256usize);
+        let plane_samples = pseudo_random(8, pw * ph, 255);
+        let mirror: Vec<i16> = plane_samples.iter().map(|&s| s as i16).collect();
+        let mirrored = RefPlane::with_narrow(&plane_samples, &mirror, pw, ph).unwrap();
+        let plane = RefPlane::new(&plane_samples, pw, ph).unwrap();
+        let rounds = 15;
+        let rows = 32usize;
+        let calls = 1usize << 15;
+        let (x0, y0) = (4i32, 1i32);
+
+        println!("\nRefPlane::gather row cost by bytes per row, best of {rounds} rounds");
+        println!("  {rows} rows per call, {calls} calls per round, region wholly inside the plane");
+        println!("    w    i32 B/row  ns/row     i16 B/row  ns/row (mir)  ns/row (cop)");
+        for &w in &[4usize, 8, 12, 16, 20, 24, 32, 40, 48, 64] {
+            let mut best = [f64::INFINITY; 3];
+            for _ in 0..rounds {
+                let start = Instant::now();
+                for _ in 0..calls {
+                    std::hint::black_box(plane.gather(x0, y0, w, rows));
+                }
+                best[0] = best[0].min(start.elapsed().as_secs_f64());
+                let start = Instant::now();
+                for _ in 0..calls {
+                    std::hint::black_box(mirrored.gather_narrow(x0, y0, w, rows));
+                }
+                best[1] = best[1].min(start.elapsed().as_secs_f64());
+                let start = Instant::now();
+                for _ in 0..calls {
+                    std::hint::black_box(plane.gather_narrow(x0, y0, w, rows));
+                }
+                best[2] = best[2].min(start.elapsed().as_secs_f64());
+            }
+            let ns = |t: f64| t * 1e9 / (calls * rows) as f64;
+            println!(
+                "  {w:>3}    {:>6}   {:7.2}      {:>6}   {:9.2}     {:9.2}",
+                w * 4,
+                ns(best[0]),
+                w * 2,
+                ns(best[1]),
+                ns(best[2]),
+            );
         }
     }
 
