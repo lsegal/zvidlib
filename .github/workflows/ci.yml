@@ -85,6 +85,29 @@ jobs:
       # without it is slow in a way nothing else here would report.
       - name: Check every cargo CI job is cached
         run: cargo test --features native --test ci_workflows_cache_cargo
+      # `ci.yml` and `baseline-staleness.yml` spare a `main` push from
+      # cancellation in their group key rather than with `cancel-in-progress`,
+      # because Actions reads that key's value as a string and every non-empty
+      # string is truthy - so an expression there cancelled the `main` runs the
+      # comment beside it documented as never cancelled (#451). A cancelled
+      # `main` run is a hole in the benchmark baseline chain and reports itself
+      # as nothing at all, so the arrangement needs a test rather than a reader.
+      - name: Check the concurrency groups still spare a main push
+        run: cargo test --features native --test ci_concurrency_spares_main
+      # `baseline-staleness.yml` names `benches/README.md` twice - once in the
+      # `push` trigger's `paths:` and once in the `pull_request` trigger's - and
+      # a report that skips itself on exactly the change it exists to check is
+      # silent by construction (#449). This asserts the two lists stay in step
+      # and that the workflow keeps no `paths-ignore` of its own.
+      - name: Check the staleness report still sees markdown changes
+        run: cargo test --features native --test ci_staleness_report_sees_markdown_changes
+      # The steps above are one per test by design - each carries the reason its
+      # guard exists - and that is exactly how #464 happened: two of them had no
+      # step and were compiled but never run. This closes that by asserting the
+      # steps and the `tests/ci_*.rs` files are the same set, so a guard added
+      # without a step fails here instead of passing silently forever.
+      - name: Check every CI guard test is given a step
+        run: cargo test --features native --test ci_guard_tests_are_run
       # The timed benchmark run names its `[[bench]]` targets in a matrix, which
       # is a second copy of what `Cargo.toml` declares. A target added to the
       # manifest and not the matrix still compiles on every PR and is simply
