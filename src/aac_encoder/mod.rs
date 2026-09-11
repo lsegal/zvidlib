@@ -30,8 +30,7 @@ impl AudioEncoderFactory for AacEncoderFactory {
     fn capability(&self, configuration: &AudioEncoderConfig) -> CodecSupport {
         if let unsupported @ (CodecSupport::UnsupportedCodec
         | CodecSupport::UnsupportedProfile
-        | CodecSupport::InvalidConfiguration { .. }) =
-            capability_without_backend(configuration)
+        | CodecSupport::InvalidConfiguration { .. }) = capability_without_backend(configuration)
         {
             return unsupported;
         }
@@ -146,6 +145,7 @@ fn sampling_frequency_index(sample_rate: u32) -> Option<u8> {
 /// `sample_rate`/`channels`: `audioObjectType(5)=2`, `samplingFrequencyIndex(4)`,
 /// `channelConfiguration(4)`, then `frameLengthFlag`, `dependsOnCoreCoder`, and
 /// `extensionFlag` all zero (1024-sample frames, no dependency, no extension).
+#[cfg(any(target_os = "macos", test))]
 fn audio_specific_config(sample_rate: u32, channels: u16) -> [u8; 2] {
     const AAC_LC: u8 = 2;
     let frequency_index =
@@ -163,6 +163,7 @@ fn audio_specific_config(sample_rate: u32, channels: u16) -> [u8; 2] {
 /// Writes an MPEG-4 descriptor length, big-endian base-128 with the
 /// continuation bit set on every byte but the last, as `esds` and its nested
 /// descriptors require.
+#[cfg(any(target_os = "macos", test))]
 fn write_descriptor_length(out: &mut Vec<u8>, length: u32) {
     let mut chunks = [0_u8; 4];
     let mut remaining = length;
@@ -184,6 +185,7 @@ fn write_descriptor_length(out: &mut Vec<u8>, length: u32) {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn write_descriptor(out: &mut Vec<u8>, tag: u8, content: &[u8]) {
     out.push(tag);
     write_descriptor_length(out, u32::try_from(content.len()).unwrap_or(u32::MAX));
@@ -194,6 +196,7 @@ fn write_descriptor(out: &mut Vec<u8>, tag: u8, content: &[u8]) {
 /// `ES_Descriptor` wrapping a `DecoderConfigDescriptor` (object type `0x40`,
 /// MPEG-4 audio stream type) whose `DecoderSpecificInfo` is the
 /// `AudioSpecificConfig`, followed by the file-format `SLConfigDescriptor`.
+#[cfg(any(target_os = "macos", test))]
 fn esds_box(sample_rate: u32, channels: u16) -> Vec<u8> {
     let audio_specific_config = audio_specific_config(sample_rate, channels);
 
@@ -250,8 +253,8 @@ mod tests {
         assert_eq!(&esds[4..8], b"esds");
         let declared_len = u32::from_be_bytes(esds[0..4].try_into().unwrap()) as usize;
         assert_eq!(declared_len, esds.len());
-        // ES_Descriptor tag directly follows the FullBox version/flags.
-        assert_eq!(esds[8], 0x03);
+        // ES_Descriptor tag directly follows the 4-byte FullBox version/flags.
+        assert_eq!(esds[12], 0x03);
     }
 
     #[test]

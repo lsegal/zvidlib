@@ -108,7 +108,10 @@ unsafe extern "C" {
 }
 
 const fn fourcc(bytes: &[u8; 4]) -> u32 {
-    ((bytes[0] as u32) << 24) | ((bytes[1] as u32) << 16) | ((bytes[2] as u32) << 8) | bytes[3] as u32
+    ((bytes[0] as u32) << 24)
+        | ((bytes[1] as u32) << 16)
+        | ((bytes[2] as u32) << 8)
+        | bytes[3] as u32
 }
 
 const K_AUDIO_FORMAT_LINEAR_PCM: u32 = fourcc(b"lpcm");
@@ -147,6 +150,11 @@ pub(super) fn create(
     })?;
     let max_packet_size =
         query_max_output_packet_size(converter).unwrap_or(FALLBACK_MAX_PACKET_SIZE);
+    // Read once, before any real audio flows through it: this is the encoder's
+    // fixed algorithmic look-ahead for this configuration, not a measurement
+    // that changes run to run, and `finish` needs it to know how much trailing
+    // silence pushes the last buffered real frame out of the pipeline.
+    let priming_frames = query_priming_frames(converter);
     Ok(Box::new(AacEncoder {
         converter,
         config: EncoderConfig {
@@ -160,13 +168,17 @@ pub(super) fn create(
         },
         channels: u32::from(configuration.channels),
         max_packet_size,
+        priming_frames,
         pending: Vec::new(),
+        total_input_frames: 0,
         encoded_position: 0,
         finished: false,
     }))
 }
 
-fn new_converter(configuration: &AudioEncoderConfig) -> std::result::Result<AudioConverterRef, OSStatus> {
+fn new_converter(
+    configuration: &AudioEncoderConfig,
+) -> std::result::Result<AudioConverterRef, OSStatus> {
     let source_format = AudioStreamBasicDescription {
         sample_rate: f64::from(configuration.sample_rate),
         format_id: K_AUDIO_FORMAT_LINEAR_PCM,
@@ -190,8 +202,7 @@ fn new_converter(configuration: &AudioEncoderConfig) -> std::result::Result<Audi
         reserved: 0,
     };
     let mut converter: AudioConverterRef = ptr::null_mut();
-    let status =
-        unsafe { AudioConverterNew(&source_format, &destination_format, &mut converter) };
+    let status = unsafe { AudioConverterNew(&source_format, &destination_format, &mut converter) };
     if status != 0 || converter.is_null() {
         return Err(status);
     }
@@ -230,18 +241,23 @@ fn query_priming_frames(converter: AudioConverterRef) -> u32 {
 }
 
 fn status_error(status: OSStatus, context: &str) -> Error {
-    Error::new(
-        ErrorKind::Codec,
-        format!("{context} (OSStatus {status})"),
-    )
+    Error::new(ErrorKind::Codec, format!("{context} (OSStatus {status})"))
 }
 
-/// PCM frames handed to [`input_proc`] for exactly one `AudioConverterFillComplexBuffer`
+/// The PCM backlog offered to [`input_proc`] for one `AudioConverterFillComplexBuffer`
 /// call. Interleaved `f32`, matching [`AudioBuffer::samples`].
+///
+/// AAC-LC's encoder look-ahead means one output packet does not correspond to
+/// one fixed-size chunk of input: `AudioConverterFillComplexBuffer` may invoke
+/// this callback more than once per call, asking for more source frames than
+/// [`FRAME_LENGTH`] before it has enough to produce a packet. So the whole
+/// backlog is handed over up front, and `consumed_frames` tracks how much of
+/// it the converter has actually taken; a second invocation within the same
+/// call reports whatever backlog remains, which is normally none.
 struct PendingInput {
     samples: Vec<f32>,
     channels: u32,
-    delivered: bool,
+    consumed_frames: usize,
 }
 
 extern "C" fn input_proc(
@@ -251,9 +267,9 @@ extern "C" fn input_proc(
     out_data_packet_description: *mut *mut AudioStreamPacketDescription,
     in_user_data: *mut c_void,
 ) -> OSStatus {
-    // Safety: `in_user_data` is the `&mut PendingInput` `fill_one_frame` passed to
-    // `AudioConverterFillComplexBuffer` for the duration of that call, and this
-    // callback only runs synchronously within it.
+    // Safety: `in_user_data` is the `&mut PendingInput` `try_encode_one_packet`
+    // passed to `AudioConverterFillComplexBuffer` for the duration of that
+    // call, and this callback only runs synchronously within it.
     let state = unsafe { &mut *in_user_data.cast::<PendingInput>() };
     unsafe {
         if !out_data_packet_description.is_null() {
@@ -262,7 +278,10 @@ extern "C" fn input_proc(
         (*io_data).number_buffers = 1;
         (*io_data).buffers[0].number_channels = state.channels;
     }
-    if state.delivered || state.samples.is_empty() {
+    let channels = state.channels as usize;
+    let total_frames = state.samples.len() / channels;
+    let available_frames = total_frames - state.consumed_frames;
+    if available_frames == 0 {
         unsafe {
             *io_number_data_packets = 0;
             (*io_data).buffers[0].data_byte_size = 0;
@@ -270,14 +289,19 @@ extern "C" fn input_proc(
         }
         return NO_MORE_INPUT;
     }
-    let frames = state.samples.len() as u32 / state.channels;
+    let start_sample = state.consumed_frames * channels;
+    let slice = &mut state.samples[start_sample..];
     unsafe {
-        *io_number_data_packets = frames;
+        *io_number_data_packets = u32::try_from(available_frames).unwrap_or(u32::MAX);
         (*io_data).buffers[0].data_byte_size =
-            u32::try_from(state.samples.len() * std::mem::size_of::<f32>()).unwrap_or(u32::MAX);
-        (*io_data).buffers[0].data = state.samples.as_mut_ptr().cast();
+            u32::try_from(slice.len() * std::mem::size_of::<f32>()).unwrap_or(u32::MAX);
+        (*io_data).buffers[0].data = slice.as_mut_ptr().cast();
     }
-    state.delivered = true;
+    // The converter is handed the entire remaining backlog and is expected to
+    // consume all of what it is offered before asking again, exactly as a PCM
+    // source with no more to give would; there is no partial-consumption signal
+    // to read back afterward.
+    state.consumed_frames = total_frames;
     0
 }
 
@@ -287,10 +311,20 @@ pub(super) struct AacEncoder {
     format: AudioEncoderFormat,
     channels: u32,
     max_packet_size: u32,
-    /// Interleaved PCM buffered across `encode` calls until a full 1024-sample
-    /// frame is available; `AudioBuffer`s from callers are not required to
-    /// arrive in frame-sized batches.
+    /// The encoder's fixed algorithmic look-ahead, in frames, read once at
+    /// creation via `kAudioConverterPropertyPrimeInfo`; reported back as
+    /// [`AudioGapless::priming`] and used to size the trailing flush in
+    /// `finish`.
+    priming_frames: u32,
+    /// PCM handed to `AudioConverter` but not yet reported as an AAC-LC
+    /// packet; every `try_encode_one_packet` call offers the whole backlog and
+    /// the converter buffers whatever it does not immediately need
+    /// internally, so this rarely holds more than one `encode` call's worth.
     pending: Vec<f32>,
+    /// Total PCM frames handed to the encoder so far, real audio and trailing
+    /// silence alike; `finish` uses this to compute how much silence completes
+    /// the final partial frame and flushes the look-ahead pipeline.
+    total_input_frames: u64,
     /// Total PCM frames encoded so far, in `timescale` (= sample rate) ticks;
     /// every emitted [`EncodedSample`] is timestamped from this running clock
     /// rather than from the `AudioBuffer::range` that happened to trigger it,
@@ -314,18 +348,16 @@ impl Drop for AacEncoder {
 }
 
 impl AacEncoder {
-    fn frame_samples(&self) -> usize {
-        (FRAME_LENGTH * self.channels) as usize
-    }
-
-    /// Encodes exactly one AAC-LC frame from `frame_pcm`, which must hold
-    /// exactly [`FRAME_LENGTH`] interleaved PCM frames.
-    fn encode_frame(&mut self, frame_pcm: Vec<f32>) -> Result<Vec<u8>> {
-        debug_assert_eq!(frame_pcm.len(), self.frame_samples());
+    /// Offers the entire buffered backlog to the converter and asks for one
+    /// AAC-LC packet. Returns `Ok(None)` when the backlog (however large) is
+    /// not yet enough to complete one - the ordinary case mid-stream, and also
+    /// how end-of-stream flushing after `finish` learns the converter has
+    /// nothing left buffered internally, once called with an empty backlog.
+    fn try_encode_one_packet(&mut self) -> Result<Option<Vec<u8>>> {
         let mut input = PendingInput {
-            samples: frame_pcm,
+            samples: std::mem::take(&mut self.pending),
             channels: self.channels,
-            delivered: false,
+            consumed_frames: 0,
         };
         let mut output_packets: u32 = 1;
         let mut output_buffer = vec![0_u8; self.max_packet_size as usize];
@@ -352,28 +384,34 @@ impl AacEncoder {
                 &mut packet_description,
             )
         };
-        if status != 0 {
-            return Err(status_error(
-                status,
-                "AudioConverterFillComplexBuffer failed to encode an AAC-LC frame",
-            ));
-        }
+        // Whatever the converter did not report as consumed goes back to the
+        // front of the backlog; ordinarily that is everything or nothing, since
+        // `input_proc` always offers the full remainder.
+        let channels = usize::try_from(self.channels).unwrap_or(1);
+        let consumed_samples = (input.consumed_frames * channels).min(input.samples.len());
+        self.pending = input.samples.split_off(consumed_samples);
+
         if output_packets == 0 {
-            return Err(Error::new(
-                ErrorKind::Codec,
-                "AudioConverterFillComplexBuffer produced no AAC-LC packet for a full frame",
-            ));
+            return if status == 0 || status == NO_MORE_INPUT {
+                Ok(None)
+            } else {
+                Err(status_error(
+                    status,
+                    "AudioConverterFillComplexBuffer failed to encode an AAC-LC frame",
+                ))
+            };
         }
         output_buffer.truncate(packet_description.data_byte_size as usize);
-        Ok(output_buffer)
+        Ok(Some(output_buffer))
     }
 
-    fn drain_full_frames(&mut self, running_position: &mut u64) -> Result<Vec<EncodedSample>> {
-        let frame_samples = self.frame_samples();
+    /// Repeatedly asks the converter for a packet until it reports it has
+    /// nothing ready, which is how both an ordinary `encode` call (bounded by
+    /// what backlog is actually buffered) and the end-of-stream flush in
+    /// `finish` (called with the backlog already padded, or empty) drain.
+    fn drain_ready_packets(&mut self, running_position: &mut u64) -> Result<Vec<EncodedSample>> {
         let mut samples = Vec::new();
-        while self.pending.len() >= frame_samples {
-            let frame_pcm = self.pending.drain(..frame_samples).collect::<Vec<_>>();
-            let data = self.encode_frame(frame_pcm)?;
+        while let Some(data) = self.try_encode_one_packet()? {
             let dts = i64::try_from(*running_position).map_err(|_| {
                 Error::new(ErrorKind::ResourceLimit, "AAC sample position overflowed")
             })?;
@@ -406,16 +444,19 @@ impl AudioEncoder for AacEncoder {
         buffer: AudioBuffer,
     ) -> EncoderFuture<'a, Vec<EncodedSample>> {
         Box::pin(async move {
-            if buffer.sample_rate != self.format.sample_rate || buffer.channels != self.format.channels
+            if buffer.sample_rate != self.format.sample_rate
+                || buffer.channels != self.format.channels
             {
                 return Err(Error::new(
                     ErrorKind::InvalidInput,
                     "audio buffer format does not match the AAC encoder",
                 ));
             }
+            let channels = usize::try_from(self.channels).unwrap_or(1);
+            self.total_input_frames += (buffer.samples.len() / channels) as u64;
             self.pending.extend_from_slice(&buffer.samples);
             let mut position = self.encoded_position;
-            let samples = self.drain_full_frames(&mut position)?;
+            let samples = self.drain_ready_packets(&mut position)?;
             self.encoded_position = position;
             Ok(samples)
         })
@@ -430,23 +471,33 @@ impl AudioEncoder for AacEncoder {
                 });
             }
             self.finished = true;
-            let mut position = self.encoded_position;
-            let mut samples = self.drain_full_frames(&mut position)?;
-            let mut padding = 0_u32;
-            if !self.pending.is_empty() {
-                let frame_samples = self.frame_samples();
-                let present_frames = u32::try_from(self.pending.len() / usize::from(self.format.channels))
-                    .unwrap_or(FRAME_LENGTH);
-                padding = FRAME_LENGTH - present_frames;
-                self.pending.resize(frame_samples, 0.0);
-                let mut tail = self.drain_full_frames(&mut position)?;
-                samples.append(&mut tail);
+
+            // Silence to complete the final partial frame, plus the encoder's
+            // own algorithmic look-ahead again in trailing silence: the same
+            // amount of pipeline delay a sample experiences going in is what
+            // pushes the last real sample out the other end.
+            let remainder = self.total_input_frames % u64::from(FRAME_LENGTH);
+            let boundary_padding = if remainder == 0 {
+                0
+            } else {
+                FRAME_LENGTH - u32::try_from(remainder).unwrap_or(0)
+            };
+            let padding = boundary_padding + self.priming_frames;
+            if padding > 0 {
+                let channels = usize::try_from(self.channels).unwrap_or(1);
+                let silence = usize::try_from(padding).unwrap_or(0) * channels;
+                self.pending.resize(self.pending.len() + silence, 0.0);
             }
+
+            let mut position = self.encoded_position;
+            let samples = self.drain_ready_packets(&mut position)?;
             self.encoded_position = position;
-            let priming = query_priming_frames(self.converter);
             Ok(AudioDrain {
                 samples,
-                gapless: AudioGapless { priming, padding },
+                gapless: AudioGapless {
+                    priming: self.priming_frames,
+                    padding,
+                },
             })
         })
     }
