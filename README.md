@@ -2,7 +2,7 @@
 
 zvidlib is a Rust library for frame-accurate video and synchronized audio I/O on native and WebAssembly targets. Its primary jobs are reading an MP4 into a GL/WebGL canvas and writing canvas frames plus an audio stream into an MP4, behind a small API centered on indexed `get` and `put` operations.
 
-> **Project status:** zvidlib is pre-1.0 and its API may still change before the first release. The portable foundation now includes checked timeline arithmetic, validated media buffers, asynchronous byte I/O, CPU/GL/WebGL transfer contracts, bounded ordinary/fragmented MP4 sample indexing, normalized codec factories, bounded exact-frame video decoding, exact AAC sample reads, audio-clock playback control and adapter contracts, encoder contracts, strict indexed output, seekable MP4 muxing, and the browser WebAssembly boundary. The generated JavaScript package includes BigInt-safe values, stable errors, Blob/stream input, Blob output, session/stream/playback handles, real HEVC/AV1 video decode through the browser's native `WebCodecs` `VideoDecoder`, and AAC packet/config exports for browser `AudioDecoder` playback. Native builds include HEVC Main and AV1 Main decoders and encoders (`native_hevc_video_decoder_factory`, `native_hevc_video_encoder_factory`, `native_av1_video_decoder_factory`, `native_av1_video_encoder_factory`), plus AAC-LC decode and default-device PCM output for synchronized playback; HEVC decode uses NVIDIA NVDEC on supported 64-bit Windows/Linux systems, a D3D11-aware Media Foundation decoder on Windows, or VideoToolbox on macOS, and otherwise retains the dependency-free pure-Rust fallback. Color AV1 encoding beyond the monochrome profile and fully portable audio-device abstractions remain planned; audio *encoding* is not -- see the writer-core notes under [Planned API examples](#planned-api-examples) for why the crate ships no `AudioEncoder` implementation. The complete workflow interfaces below remain intentionally aspirational and may change before the first release.
+> **Project status:** zvidlib is pre-1.0 and its API may still change before the first release. The portable foundation now includes checked timeline arithmetic, validated media buffers, asynchronous byte I/O, CPU/GL/WebGL transfer contracts, bounded ordinary/fragmented MP4 sample indexing, normalized codec factories, bounded exact-frame video decoding, exact AAC sample reads, audio-clock playback control and adapter contracts, encoder contracts, strict indexed output, seekable MP4 muxing, and the browser WebAssembly boundary. The generated JavaScript package includes BigInt-safe values, stable errors, Blob/stream input, Blob output, session/stream/playback handles, real HEVC/AV1 video decode through the browser's native `WebCodecs` `VideoDecoder`, real AV1 video encode through the browser's native `WebCodecs` `VideoEncoder` muxed into a seekable MP4, and AAC packet/config exports for browser `AudioDecoder` playback. Native builds include HEVC Main and AV1 Main decoders and encoders (`native_hevc_video_decoder_factory`, `native_hevc_video_encoder_factory`, `native_av1_video_decoder_factory`, `native_av1_video_encoder_factory`), plus AAC-LC decode and default-device PCM output for synchronized playback; HEVC decode uses NVIDIA NVDEC on supported 64-bit Windows/Linux systems, a D3D11-aware Media Foundation decoder on Windows, or VideoToolbox on macOS, and otherwise retains the dependency-free pure-Rust fallback. Color AV1 encoding beyond the monochrome profile and fully portable audio-device abstractions remain planned; audio *encoding* is not -- see the writer-core notes under [Planned API examples](#planned-api-examples) for why the crate ships no `AudioEncoder` implementation. The complete workflow interfaces below remain intentionally aspirational and may change before the first release.
 
 ## Documentation
 
@@ -54,17 +54,28 @@ try {
 input.close();
 ```
 
-`MediaOutput.finish()` returns a browser-owned `Blob` with the configured MIME type. `writeEncodedChunk()` is the byte-sink boundary used by a muxer backend; indexed video/audio `put` calls remain explicitly unsupported until those backends land.
+`MediaOutput.finish()` returns a browser-owned `Blob` with the configured MIME type. `writeEncodedChunk()` remains the byte-sink boundary for a caller supplying its own already-encoded container chunks. An output `VideoStream.put(index, frame)` instead drives a real AV1 encoder through the browser's native `WebCodecs` `VideoEncoder` and muxes the result into a seekable MP4 through `Mp4Muxer`; `writeEncodedChunk` and `put` are mutually exclusive on the same output. Indexed audio `put` calls remain explicitly unsupported until a browser `AudioEncoder` bridge lands.
 
 ```js
-import { CreateOptions, MediaOutput } from "./pkg/zvidlib.js";
+import { CreateOptions, MediaOutput, VideoFrame } from "./pkg/zvidlib.js";
 
 const createOptions = new CreateOptions("mp4");
 createOptions.maxOutputBytes = 512n * 1024n * 1024n;
+createOptions.setTimeline(30, 1, 48_000); // 30 fps video, required before encoding video
 const output = await MediaOutput.create(createOptions);
 
-// A future MP4 muxer supplies already-encoded container chunks here.
-output.writeEncodedChunk(new Uint8Array([0, 0, 0, 8, 0x66, 0x72, 0x65, 0x65]));
+const video = output.video(0);
+try {
+  const frame = VideoFrame.rgba(16, 12, new Uint8Array(16 * 12 * 4).fill(128));
+  // Encodes the real frame via the browser's native WebCodecs `VideoEncoder`
+  // and muxes it into the output MP4.
+  await video.put(0n, frame);
+} catch (error) {
+  // "UNSUPPORTED"/"CODEC" if this browser has no AV1 encoder, rather than a
+  // silently corrupt or empty output.
+  console.log(errorCode(error));
+}
+
 const blob = await output.finish();
 console.log(blob.type); // "video/mp4"
 ```
@@ -281,6 +292,8 @@ The implemented portable writer core exposes `VideoEncoder` and `AudioEncoder` c
 
 `native_hevc_video_encoder_factory()` supplies the matching dependency-free software backend for 8-bit 4:2:0 HEVC Main profile. It accepts limited-range `Rgba8` CPU frames whose dimensions are multiples of 16, emits one IDR access unit per input frame, and generates the matching standardized `hvcC` box. `VideoEncoderConfig::configuration` selects the operating point the same way AV1's does: empty codes every coding unit as a `pcm_flag == 1` PCM block, so the coded picture is exactly the source, a single byte carrying `SliceQpY` in `0..=51` codes ITU-T H.265 §7.3.8.11 quantized residual at that QP, and four big-endian bytes give a nonzero target bitrate in bits a second. Lossless PCM stays the default, so callers that configure nothing get byte-identical output to earlier releases; unlike AV1's `base_q_idx`, a `0` byte is not a lossless request, because HEVC QP 0 is simply the finest quantizer step. The two lossy forms differ in what they optimize as well as in who picks the quantizer: a fixed QP takes the closest picture at that QP, because a caller naming a QP is asking for a picture, while a bitrate target picks `SliceQpY` per picture against what the previous picture actually cost and charges every intra candidate for the residual bits it would code, because with a rate to hit the bits a decision saves buy quality elsewhere. Lossy streams decode through `native_hevc_video_decoder_factory()` with distortion that tracks the requested QP, and a bitrate-targeted stream settles within 25 percent of its per-picture budget — about as tight as an integer QP chosen once a picture allows. The writer searches the intra prediction mode per coding unit and runs both in-loop filters -- §8.7.2 deblocking, and §8.7.3 SAO wherever the pass earns the `sao( )` syntax it costs against the picture's own rate-distortion curve. `VideoEncoderConfig::timescale` and `frame_duration` define the exact constant-rate clock used for emitted DTS, PTS, and duration values.
 
+`web_video_encoder_factory()` (browser build only) bridges the browser's native `WebCodecs` `VideoEncoder` behind the same `VideoEncoderFactory`/`VideoEncoder` contract, for 8-bit AV1. It accepts `Rgba8` CPU frames, submits them to the browser's encoder with `latencyMode: "realtime"`, and emits one `EncodedSample` per frame in submission order once the browser reports it. Because `EncoderConfig::decoder_config` is read before any frame is encoded, its `av1C` box is synthesized locally from the requested profile with empty `configOBUs`, which the AV1-in-ISOBMFF binding permits when the sequence header travels in-band, as every `WebCodecs`-emitted key frame's does; the standardized box the native AV1 encoder emits instead comes from a decoder that already has real bitstream headers to draw from. `WasmVideoStream.put` on an output stream drives this factory directly: the first `put()` opens the encoder and an `Mp4Muxer` sized from that frame's dimensions and the output's `CreateOptions.setTimeline`, and `MediaOutput.finish()` drains and finalizes it. Browser `AudioEncoder` support is not yet implemented; see the writer-core notes above for why the crate does not implement its own AAC encoder for the native encoders either.
+
 Frame indices are zero-based. A video `get(n)` returns exactly frame `n` in presentation order, not merely the nearest keyframe. The matching audio `get(n)` returns the half-open sample interval covered by video frame `n`; sample-accurate APIs will also be available for audio-only use.
 
 Runnable versions of the native GL and browser WebGL workflows above, driven against a real Big Buck Bunny MP4 sample, live in [`examples/`](examples/README.md).
@@ -323,7 +336,7 @@ cargo fmt --all -- --check
 cargo clippy --all-targets --features native -- -D warnings
 ```
 
-These commands validate the portable core on both targets. Native builds include accelerated HEVC Main decode through NVDEC on supported 64-bit Windows/Linux systems, Media Foundation on Windows, and VideoToolbox on macOS, with a dependency-free pure-Rust fallback. They also include the pure-Rust AV1 Main decoder (including non-lossless intra/inter AV1 decoding), dependency-free HEVC Main and monochrome AV1 Main-profile encoders (lossless, plus a non-lossless path verified against both the crate's own decoder and an independent ffmpeg decode), AAC-LC decode, and default-device PCM output described above. There is no audio encoder in either build, by design. The browser build exposes AAC packet/config data for WebCodecs `AudioDecoder` playback. Color AV1 encoding beyond the monochrome profile and fully portable audio-device abstractions remain planned.
+These commands validate the portable core on both targets. Native builds include accelerated HEVC Main decode through NVDEC on supported 64-bit Windows/Linux systems, Media Foundation on Windows, and VideoToolbox on macOS, with a dependency-free pure-Rust fallback. They also include the pure-Rust AV1 Main decoder (including non-lossless intra/inter AV1 decoding), dependency-free HEVC Main and monochrome AV1 Main-profile encoders (lossless, plus a non-lossless path verified against both the crate's own decoder and an independent ffmpeg decode), AAC-LC decode, and default-device PCM output described above. There is no audio encoder in either build, by design. The browser build exposes AAC packet/config data for WebCodecs `AudioDecoder` playback and a real AV1 `VideoEncoder` backed by the browser's `WebCodecs` `VideoEncoder`. Color AV1 encoding beyond the monochrome profile in the native encoder and fully portable audio-device abstractions remain planned.
 
 Native compressed-codec backends use the public `VideoDecoderConformanceVector`
 and `VideoEncoderConformanceVector` runners before registration. Decoder vectors
@@ -361,7 +374,7 @@ Run the browser integration suite in an installed Chrome browser with:
 wasm-pack test --headless --chrome --no-default-features --features web
 ```
 
-The suite verifies Blob and stream input, cancellation, reader-lock cleanup, BigInt range handling, typed-array copy lifetimes, browser-object ownership, stable errors, Blob output, and decoding the bundled HEVC sample through WebCodecs. The base build does not require WASM threads or cross-origin isolation. Future optional threaded builds will document their additional headers and browser requirements separately.
+The suite verifies Blob and stream input, cancellation, reader-lock cleanup, BigInt range handling, typed-array copy lifetimes, browser-object ownership, stable errors, Blob output, decoding the bundled HEVC sample through WebCodecs, and encoding through an output `VideoStream.put` into a demuxable MP4 through the browser's `WebCodecs` `VideoEncoder`. The base build does not require WASM threads or cross-origin isolation. Future optional threaded builds will document their additional headers and browser requirements separately.
 
 The `web` feature's video decoder uses `web-sys`'s `WebCodecs` bindings, which that crate gates behind `--cfg=web_sys_unstable_apis` because the spec is still evolving. `.cargo/config.toml` sets that flag for the `wasm32-unknown-unknown` target automatically, so the `cargo`/`wasm-pack` commands above need no extra flags.
 
