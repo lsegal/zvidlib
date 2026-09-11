@@ -294,7 +294,7 @@ extern "C" fn input_proc(
     unsafe {
         *io_number_data_packets = u32::try_from(available_frames).unwrap_or(u32::MAX);
         (*io_data).buffers[0].data_byte_size =
-            u32::try_from(slice.len() * std::mem::size_of::<f32>()).unwrap_or(u32::MAX);
+            u32::try_from(std::mem::size_of_val(slice)).unwrap_or(u32::MAX);
         (*io_data).buffers[0].data = slice.as_mut_ptr().cast();
     }
     // The converter is handed the entire remaining backlog and is expected to

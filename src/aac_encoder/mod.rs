@@ -36,7 +36,7 @@ impl AudioEncoderFactory for AacEncoderFactory {
         }
         #[cfg(target_os = "macos")]
         {
-            return audiotoolbox::capability(configuration);
+            audiotoolbox::capability(configuration)
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -70,7 +70,7 @@ impl AudioEncoderFactory for AacEncoderFactory {
         }
         #[cfg(target_os = "macos")]
         {
-            return audiotoolbox::create(configuration, limits);
+            audiotoolbox::create(configuration, limits)
         }
         #[cfg(not(target_os = "macos"))]
         {
