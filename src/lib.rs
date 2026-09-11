@@ -44,6 +44,9 @@ mod av1_decoder;
 pub mod previews;
 
 #[cfg(not(target_arch = "wasm32"))]
+mod aac_encoder;
+
+#[cfg(not(target_arch = "wasm32"))]
 mod hevc;
 
 /// Per-stage access to the HEVC encoder for the criterion benchmark suite.
@@ -150,12 +153,13 @@ pub use av1_intra_pred::{
 };
 pub use av1_simd::SimdIsa;
 pub use codec::{
-    AudioDrain, AudioEncoder, AudioEncoderFormat, AudioGapless, CancellationToken,
-    CodecImplementation, CodecProfile, CodecSupport, DecodeStatistics, DecodedVideoFrame,
-    EncodedSample, EncodedVideoSample, EncoderConfig, EncoderFuture, ExactFrameReader,
-    HardwarePreference, SEEK_LATENCY_BUDGET, SampleDependency, Seek, SeekPreviewSource, TrackKind,
-    VideoDecoder, VideoDecoderConfig, VideoDecoderFactory, VideoEncoder, VideoEncoderConfig,
-    VideoEncoderFactory, VideoEncoderFormat, uncompressed_video_decoder_factory,
+    AudioDrain, AudioEncoder, AudioEncoderConfig, AudioEncoderFactory, AudioEncoderFormat,
+    AudioGapless, CancellationToken, CodecImplementation, CodecProfile, CodecSupport,
+    DecodeStatistics, DecodedVideoFrame, EncodedSample, EncodedVideoSample, EncoderConfig,
+    EncoderFuture, ExactFrameReader, HardwarePreference, SEEK_LATENCY_BUDGET, SampleDependency,
+    Seek, SeekPreviewSource, TrackKind, VideoDecoder, VideoDecoderConfig, VideoDecoderFactory,
+    VideoEncoder, VideoEncoderConfig, VideoEncoderFactory, VideoEncoderFormat,
+    uncompressed_video_decoder_factory,
 };
 pub use codec_config::{DerivedCodecString, derive_codec_string};
 pub use conformance::{
@@ -184,6 +188,8 @@ pub use transfer::{
     TransferStage, execute_transfer, inspect_transfer,
 };
 
+#[cfg(not(target_arch = "wasm32"))]
+pub use aac_encoder::native_aac_audio_encoder_factory;
 #[cfg(not(target_arch = "wasm32"))]
 pub use av1_decoder::native_av1_video_decoder_factory;
 #[cfg(not(target_arch = "wasm32"))]
