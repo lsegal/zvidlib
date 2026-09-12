@@ -54,7 +54,7 @@ try {
 input.close();
 ```
 
-`MediaOutput.finish()` returns a browser-owned `Blob` with the configured MIME type. `writeEncodedChunk()` remains the raw byte-sink boundary for a caller supplying its own already-muxed container bytes. Indexed `put` on track 0 of a video stream instead encodes through a built-in `WebCodecs` bridge (AV1 Main profile, RGBA8 input) and mixes those samples into a real MP4 at `finish()`; call `videoEncodeSupport()` first to check whether the current browser can encode. Other track indices, other codecs, and audio `put` remain unsupported until their backends land.
+`MediaOutput.finish()` returns a browser-owned `Blob` with the configured MIME type. `writeEncodedChunk()` remains the raw byte-sink boundary for a caller supplying its own already-muxed container bytes. Indexed `put` on track 0 of a video stream instead encodes through a built-in `WebCodecs` bridge (AV1 Main or HEVC Main profile, RGBA8 input; `CreateOptions.videoCodec` selects which, defaulting to `"av1"`) and mixes those samples into a real MP4 at `finish()`; call `videoEncodeSupport()` first to check whether the current browser can encode the selected codec. Other track indices, other codecs/profiles, and audio `put` remain unsupported until their backends land.
 
 ```js
 import { CreateOptions, MediaOutput } from "./pkg/zvidlib.js";
