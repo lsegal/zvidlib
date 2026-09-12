@@ -330,6 +330,34 @@ pub trait VideoEncoderFactory {
     ) -> Result<Box<dyn VideoEncoder>>;
 }
 
+/// Backend-neutral audio encoder configuration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AudioEncoderConfig {
+    pub codec: Codec,
+    pub profile: CodecProfile,
+    pub sample_rate: u32,
+    pub channels: u16,
+    /// Exact media-clock timescale used for emitted DTS and PTS values.
+    pub timescale: u32,
+    pub configuration: Vec<u8>,
+}
+
+/// Discovers and creates audio encoders using the normalized capability model,
+/// the audio counterpart to [`VideoEncoderFactory`].
+///
+/// zvidlib still ships no audio codec of its own (see [`AudioEncoder`]); this
+/// trait is the seam a platform adapter implements, so a caller that wants
+/// discoverable capability reporting is not left writing the `Result<Box<dyn
+/// AudioEncoder>>` construction by hand.
+pub trait AudioEncoderFactory {
+    fn capability(&self, configuration: &AudioEncoderConfig) -> CodecSupport;
+    fn create(
+        &self,
+        configuration: &AudioEncoderConfig,
+        limits: &Limits,
+    ) -> Result<Box<dyn AudioEncoder>>;
+}
+
 /// Observable counters for validating cache and decoder reuse behavior.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DecodeStatistics {
