@@ -35,7 +35,7 @@ const MAX_IN_FLIGHT_CHUNKS: u32 = 16;
 ///
 /// Reached through `globalThis` so it works in both window and worker scopes
 /// without pulling in another `web-sys` feature.
-fn schedule_event_loop_tick(resolve: &js_sys::Function) {
+pub(crate) fn schedule_event_loop_tick(resolve: &js_sys::Function) {
     let global = js_sys::global();
     if let Ok(set_timeout) = js_sys::Reflect::get(&global, &JsValue::from_str("setTimeout"))
         && let Ok(set_timeout) = set_timeout.dyn_into::<js_sys::Function>()
@@ -55,7 +55,7 @@ fn codec_description(codec: Codec, decoder_config: &[u8]) -> Result<&[u8]> {
     }
 }
 
-fn js_to_promise(value: impl JsCast) -> js_sys::Promise {
+pub(crate) fn js_to_promise(value: impl JsCast) -> js_sys::Promise {
     value.unchecked_into()
 }
 
@@ -570,7 +570,7 @@ fn can_continue_session(
         && !published_since_reset.contains(&presentation_index)
 }
 
-fn normalize_js_error(error: JsValue, context: &str) -> Error {
+pub(crate) fn normalize_js_error(error: JsValue, context: &str) -> Error {
     let detail = js_sys::Reflect::get(&error, &JsValue::from_str("message"))
         .ok()
         .and_then(|value| value.as_string())
