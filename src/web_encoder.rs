@@ -10,8 +10,9 @@
 //! ([`crate::WasmMediaOutput`]) instead buffer chunks from this session and
 //! build the MP4 track configuration once that first chunk arrives.
 //!
-//! Scope for this initial bridge: AV1 Main profile output from RGBA8 input.
-//! Broader codec and pixel-format coverage is tracked as follow-up work.
+//! Scope for this initial bridge: AV1 Main profile video output from RGBA8
+//! input, and AAC-LC audio output from interleaved f32 PCM. Broader video
+//! codec and pixel-format coverage is tracked as follow-up work.
 
 use crate::av1::{Av1Obu, Av1Parser};
 use crate::codec::{CodecImplementation, CodecSupport, SampleDependency};
@@ -24,7 +25,10 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
-    EncodedVideoChunk, VideoEncoder as JsVideoEncoder, VideoEncoderConfig as JsVideoEncoderConfig,
+    AudioData as JsAudioData, AudioDataInit, AudioEncoder as JsAudioEncoder,
+    AudioEncoderConfig as JsAudioEncoderConfig, AudioEncoderInit, AudioSampleFormat,
+    EncodedAudioChunk, EncodedAudioChunkMetadata, EncodedAudioChunkType, EncodedVideoChunk,
+    VideoEncoder as JsVideoEncoder, VideoEncoderConfig as JsVideoEncoderConfig,
     VideoEncoderEncodeOptions, VideoEncoderInit, VideoFrame as JsVideoFrame, VideoFrameBufferInit,
     VideoPixelFormat,
 };
@@ -287,6 +291,320 @@ pub fn sample_dependency(is_sync: bool) -> SampleDependency {
     } else {
         SampleDependency::DEPENDENT
     }
+}
+
+/// One encoded output from a [`WebAudioEncodeSession`].
+pub struct WebEncodedAudioChunk {
+    pub data: Vec<u8>,
+    pub is_sync: bool,
+    pub timestamp_micros: f64,
+    pub duration_micros: Option<f64>,
+    /// Complete `esds` configuration box (size + fourcc + payload), present
+    /// only on the first chunk a session ever emits.
+    pub decoder_config: Option<Vec<u8>>,
+}
+
+/// Best-effort, synchronous support check for the `WebCodecs` audio encoder
+/// bridge. See [`video_encode_capability`] for why this cannot be more than a
+/// best effort: `isConfigSupported()` is asynchronous.
+pub fn audio_encode_capability(
+    codec: Codec,
+    profile: CodecProfile,
+    hardware: HardwarePreference,
+) -> CodecSupport {
+    if codec != Codec::Aac || profile != CodecProfile::AacLowComplexity {
+        return CodecSupport::UnsupportedProfile;
+    }
+    if hardware == HardwarePreference::Require {
+        return CodecSupport::HardwareUnavailable;
+    }
+    let global = js_sys::global();
+    let has_constructor =
+        js_sys::Reflect::has(&global, &JsValue::from_str("AudioEncoder")).unwrap_or(false);
+    if !has_constructor {
+        return CodecSupport::UnsupportedCodec;
+    }
+    CodecSupport::Supported {
+        implementation: CodecImplementation::Software,
+    }
+}
+
+/// A lazily-driven `WebCodecs` encode session producing AAC-LC chunks from
+/// interleaved `f32` PCM.
+///
+/// Unlike [`WebVideoEncodeSession`], `encode()` here does not wait for an
+/// output chunk before returning: an `AudioEncoder` buffers encoder
+/// look-ahead/priming across several input buffers before it emits its first
+/// fixed-size AAC frame (mirroring the priming the native AudioToolbox AAC-LC
+/// backend has to handle explicitly), so waiting inside `encode()` for a
+/// chunk that only a *later* `encode()` call would elicit would deadlock the
+/// session against itself. `encode()` instead submits input and returns
+/// whatever chunks already happen to be ready (often none); `finish()`
+/// awaits `flush()`, which the spec guarantees does not resolve until every
+/// submitted input's output has been delivered, and only then drains the
+/// rest.
+pub struct WebAudioEncodeSession {
+    encoder: JsAudioEncoder,
+    sample_rate: u32,
+    channels: u16,
+    pending_chunks: Rc<RefCell<VecDeque<(EncodedAudioChunk, EncodedAudioChunkMetadata)>>>,
+    encode_error: Rc<RefCell<Option<String>>>,
+    emitted_config: bool,
+    finished: bool,
+    // Kept alive for the lifetime of `encoder`.
+    _output_closure: Closure<dyn FnMut(EncodedAudioChunk, EncodedAudioChunkMetadata)>,
+    _error_closure: Closure<dyn FnMut(JsValue)>,
+}
+
+impl WebAudioEncodeSession {
+    /// Opens a session targeting AAC-LC at `sample_rate`/`channels`,
+    /// timestamps and durations given in microseconds.
+    pub fn open(
+        sample_rate: u32,
+        channels: u16,
+        bitrate_bits_per_second: Option<u32>,
+    ) -> Result<Self> {
+        let pending_chunks: Rc<RefCell<VecDeque<(EncodedAudioChunk, EncodedAudioChunkMetadata)>>> =
+            Rc::new(RefCell::new(VecDeque::new()));
+        let encode_error: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+
+        let output_chunks = Rc::clone(&pending_chunks);
+        let output_closure = Closure::new(
+            move |chunk: EncodedAudioChunk, metadata: EncodedAudioChunkMetadata| {
+                output_chunks.borrow_mut().push_back((chunk, metadata));
+            },
+        );
+        let error_state = Rc::clone(&encode_error);
+        let error_closure = Closure::new(move |error: JsValue| {
+            let message = js_sys::Reflect::get(&error, &JsValue::from_str("message"))
+                .ok()
+                .and_then(|value| value.as_string())
+                .unwrap_or_else(|| "WebCodecs encoder reported an error".to_owned());
+            *error_state.borrow_mut() = Some(message);
+        });
+
+        let init = AudioEncoderInit::new(
+            error_closure.as_ref().unchecked_ref(),
+            output_closure.as_ref().unchecked_ref(),
+        );
+        let encoder = JsAudioEncoder::new(&init)
+            .map_err(|error| normalize_js_error(error, "constructing a WebCodecs AudioEncoder"))?;
+
+        let config = JsAudioEncoderConfig::new("mp4a.40.2", u32::from(channels), sample_rate);
+        if let Some(bitrate) = bitrate_bits_per_second {
+            config.set_bitrate(bitrate);
+        }
+        encoder
+            .configure(&config)
+            .map_err(|error| normalize_js_error(error, "configuring the WebCodecs AudioEncoder"))?;
+
+        Ok(Self {
+            encoder,
+            sample_rate,
+            channels,
+            pending_chunks,
+            encode_error,
+            emitted_config: false,
+            finished: false,
+            _output_closure: output_closure,
+            _error_closure: error_closure,
+        })
+    }
+
+    /// Encodes one buffer of interleaved `f32` PCM and returns every chunk
+    /// already ready, which is often empty: an `AudioEncoder` typically
+    /// buffers several buffers' worth of input before emitting its first
+    /// fixed-size AAC frame.
+    pub async fn encode(
+        &mut self,
+        samples: &[f32],
+        timestamp_micros: f64,
+    ) -> Result<Vec<WebEncodedAudioChunk>> {
+        if self.finished {
+            return Err(Error::new(
+                ErrorKind::InvalidState,
+                "the WebCodecs audio encoder session has already finished",
+            ));
+        }
+        let channels = usize::from(self.channels);
+        if channels == 0 || samples.len() % channels != 0 {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "interleaved audio sample count is not a multiple of the channel count",
+            ));
+        }
+        let number_of_frames = u32::try_from(samples.len() / channels).map_err(|_| {
+            Error::new(
+                ErrorKind::ResourceLimit,
+                "audio buffer frame count overflow",
+            )
+        })?;
+
+        let bytes: &[u8] = bytemuck_cast_f32_slice(samples);
+        let data_array = js_sys::Uint8Array::from(bytes);
+        let init = AudioDataInit::new_with_u8_array(
+            &data_array,
+            AudioSampleFormat::F32,
+            u32::from(self.channels),
+            number_of_frames,
+            self.sample_rate as f32,
+            0,
+        );
+        init.set_timestamp_f64(timestamp_micros);
+        let audio_data = JsAudioData::new(&init)
+            .map_err(|error| normalize_js_error(error, "constructing an AudioData"))?;
+
+        let result = self.encoder.encode(&audio_data);
+        audio_data.close();
+        result.map_err(|error| normalize_js_error(error, "encoding an audio buffer"))?;
+
+        if let Some(message) = self.encode_error.borrow_mut().take() {
+            return Err(Error::new(ErrorKind::Codec, message));
+        }
+        self.take_ready_chunks()
+    }
+
+    /// Flushes the encoder - which the spec guarantees does not resolve until
+    /// every chunk from every prior `encode()` call has been delivered to the
+    /// output callback - and returns every chunk still pending.
+    pub async fn finish(&mut self) -> Result<Vec<WebEncodedAudioChunk>> {
+        if self.finished {
+            return Ok(Vec::new());
+        }
+        self.finished = true;
+        JsFuture::from(js_to_promise(self.encoder.flush()))
+            .await
+            .map_err(|error| normalize_js_error(error, "flushing the WebCodecs AudioEncoder"))?;
+        if let Some(message) = self.encode_error.borrow_mut().take() {
+            return Err(Error::new(ErrorKind::Codec, message));
+        }
+        let chunks = self.take_ready_chunks()?;
+        let _ = self.encoder.close();
+        Ok(chunks)
+    }
+
+    fn take_ready_chunks(&mut self) -> Result<Vec<WebEncodedAudioChunk>> {
+        let mut chunks = Vec::new();
+        while let Some((chunk, metadata)) = self.pending_chunks.borrow_mut().pop_front() {
+            let destination = js_sys::Uint8Array::new_with_length(chunk.byte_length());
+            chunk
+                .copy_to_with_buffer_source(&destination)
+                .map_err(|error| normalize_js_error(error, "copying an encoded audio chunk"))?;
+            let data = destination.to_vec();
+            let is_sync = chunk.type_() == EncodedAudioChunkType::Key;
+
+            let decoder_config = if !self.emitted_config {
+                metadata
+                    .get_decoder_config()
+                    .and_then(|config| config.get_description())
+                    .map(|description| {
+                        let bytes = js_sys::Uint8Array::new(&description).to_vec();
+                        esds_box(&bytes)
+                    })
+                    .inspect(|_| {
+                        self.emitted_config = true;
+                    })
+            } else {
+                None
+            };
+
+            chunks.push(WebEncodedAudioChunk {
+                data,
+                is_sync,
+                timestamp_micros: chunk.timestamp(),
+                duration_micros: chunk.duration(),
+                decoder_config,
+            });
+        }
+        Ok(chunks)
+    }
+}
+
+impl Drop for WebAudioEncodeSession {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = self.encoder.close();
+        }
+    }
+}
+
+/// Reinterprets an `f32` PCM slice as its little-endian byte representation,
+/// which is what `AudioSampleFormat::F32` expects `AudioDataInit`'s buffer to
+/// contain.
+fn bytemuck_cast_f32_slice(samples: &[f32]) -> &[u8] {
+    // SAFETY: `f32` has no padding and every bit pattern is valid, so viewing
+    // it as `u8` is always sound; the returned slice borrows `samples` and
+    // cannot outlive it.
+    unsafe {
+        std::slice::from_raw_parts(
+            samples.as_ptr().cast::<u8>(),
+            std::mem::size_of_val(samples),
+        )
+    }
+}
+
+/// Writes an MPEG-4 descriptor length, big-endian base-128 with the
+/// continuation bit set on every byte but the last, as `esds` and its nested
+/// descriptors require.
+fn write_descriptor_length(out: &mut Vec<u8>, length: u32) {
+    let mut chunks = [0_u8; 4];
+    let mut remaining = length;
+    let mut count = 0;
+    loop {
+        chunks[count] = (remaining & 0x7f) as u8;
+        remaining >>= 7;
+        count += 1;
+        if remaining == 0 || count == chunks.len() {
+            break;
+        }
+    }
+    for (position, index) in (0..count).rev().enumerate() {
+        let mut byte = chunks[index];
+        if position != count - 1 {
+            byte |= 0x80;
+        }
+        out.push(byte);
+    }
+}
+
+fn write_descriptor(out: &mut Vec<u8>, tag: u8, content: &[u8]) {
+    out.push(tag);
+    write_descriptor_length(out, u32::try_from(content.len()).unwrap_or(u32::MAX));
+    out.extend_from_slice(content);
+}
+
+/// Builds the complete `esds` MP4 box declaring an AAC track from the raw
+/// `AudioSpecificConfig` bytes `WebCodecs` reports on its first emitted
+/// chunk's `metadata.decoderConfig.description`: an `ES_Descriptor` wrapping a
+/// `DecoderConfigDescriptor` (object type `0x40`, MPEG-4 audio stream type)
+/// whose `DecoderSpecificInfo` is that `AudioSpecificConfig` verbatim,
+/// followed by the file-format `SLConfigDescriptor`.
+///
+/// Unlike AV1 (see `av1c_from_bitstream`), AAC's decoder configuration is
+/// genuinely out-of-band, so this trusts `WebCodecs`' own report of it rather
+/// than deriving it from the bitstream.
+fn esds_box(audio_specific_config: &[u8]) -> Vec<u8> {
+    let mut decoder_specific_info = Vec::new();
+    write_descriptor(&mut decoder_specific_info, 0x05, audio_specific_config);
+
+    let mut decoder_config_descriptor = vec![
+        0x40, // objectTypeIndication: MPEG-4 Audio
+        0x15, // streamType (5, audio) << 2 | upStream (0) << 1 | reserved (1)
+        0, 0, 0, // bufferSizeDB
+        0, 0, 0, 0, // maxBitrate
+        0, 0, 0, 0, // avgBitrate
+    ];
+    decoder_config_descriptor.extend_from_slice(&decoder_specific_info);
+
+    let mut es_descriptor = vec![0, 0]; // ES_ID
+    es_descriptor.push(0); // no stream dependence, no URL, no OCR stream
+    write_descriptor(&mut es_descriptor, 0x04, &decoder_config_descriptor);
+    write_descriptor(&mut es_descriptor, 0x06, &[0x02]); // SLConfigDescriptor, MP4 predefined
+
+    let mut payload = vec![0, 0, 0, 0]; // FullBox version/flags
+    write_descriptor(&mut payload, 0x03, &es_descriptor);
+
+    wrap_box(b"esds", &payload)
 }
 
 /// Wraps a raw box payload with its 32-bit size and fourcc header.
