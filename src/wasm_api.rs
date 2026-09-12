@@ -353,7 +353,7 @@ impl WasmSampleRange {
     }
 }
 
-/// An owned RGBA CPU frame. Pixel arrays are copied in both directions.
+/// An owned CPU video frame. Pixel arrays are copied in both directions.
 #[wasm_bindgen(js_name = VideoFrame)]
 pub struct WasmVideoFrame(CoreVideoFrame);
 
@@ -361,16 +361,95 @@ pub struct WasmVideoFrame(CoreVideoFrame);
 impl WasmVideoFrame {
     #[wasm_bindgen(js_name = rgba)]
     pub fn rgba(width: u32, height: u32, pixels: Uint8Array) -> Result<WasmVideoFrame, JsValue> {
-        let limits = Limits::default();
-        let dimensions = VideoDimensions::new(width, height, &limits)
-            .map_err(|error| js_error(error.kind(), error.message()))?;
         let stride = usize::try_from(width)
             .ok()
             .and_then(|width| width.checked_mul(4))
             .ok_or_else(|| js_error(ErrorKind::ResourceLimit, "video stride overflow"))?;
+        Self::packed(width, height, PixelFormat::Rgba8, stride, pixels)
+    }
+
+    /// A BGRA8, tightly-packed (`stride == width * 4`) frame.
+    #[wasm_bindgen(js_name = bgra8)]
+    pub fn bgra8(width: u32, height: u32, pixels: Uint8Array) -> Result<WasmVideoFrame, JsValue> {
+        let stride = usize::try_from(width)
+            .ok()
+            .and_then(|width| width.checked_mul(4))
+            .ok_or_else(|| js_error(ErrorKind::ResourceLimit, "video stride overflow"))?;
+        Self::packed(width, height, PixelFormat::Bgra8, stride, pixels)
+    }
+
+    /// A YUV 4:2:0 planar 8-bit frame: one tightly-packed full-resolution Y
+    /// plane followed by tightly-packed, half-resolution (rounded up) U and V
+    /// planes, all three concatenated into `pixels`.
+    #[wasm_bindgen(js_name = yuv420p8)]
+    pub fn yuv420p8(
+        width: u32,
+        height: u32,
+        pixels: Uint8Array,
+    ) -> Result<WasmVideoFrame, JsValue> {
+        let limits = Limits::default();
+        let dimensions = VideoDimensions::new(width, height, &limits)
+            .map_err(|error| js_error(error.kind(), error.message()))?;
+        let w = width as usize;
+        let h = height as usize;
+        let chroma_w = w.div_ceil(2);
+        let chroma_h = h.div_ceil(2);
+        let luma_len = w
+            .checked_mul(h)
+            .ok_or_else(|| js_error(ErrorKind::ResourceLimit, "video plane size overflow"))?;
+        let chroma_len = chroma_w
+            .checked_mul(chroma_h)
+            .ok_or_else(|| js_error(ErrorKind::ResourceLimit, "video plane size overflow"))?;
+        let pixels = pixels.to_vec();
+        let expected = luma_len
+            .checked_add(chroma_len)
+            .and_then(|value| value.checked_add(chroma_len))
+            .ok_or_else(|| js_error(ErrorKind::ResourceLimit, "video plane size overflow"))?;
+        if pixels.len() != expected {
+            return Err(js_error(
+                ErrorKind::InvalidInput,
+                "YUV 4:2:0 frame data does not match the given width/height",
+            ));
+        }
+        let (y, uv) = pixels.split_at(luma_len);
+        let (u, v) = uv.split_at(chroma_len);
         let frame = CoreVideoFrame::new(
             dimensions,
-            PixelFormat::Rgba8,
+            PixelFormat::Yuv420p8,
+            ColorRange::Full,
+            vec![
+                Plane {
+                    data: y.to_vec(),
+                    stride: w,
+                },
+                Plane {
+                    data: u.to_vec(),
+                    stride: chroma_w,
+                },
+                Plane {
+                    data: v.to_vec(),
+                    stride: chroma_w,
+                },
+            ],
+            &limits,
+        )
+        .map_err(|error| js_error(error.kind(), error.message()))?;
+        Ok(Self(frame))
+    }
+
+    fn packed(
+        width: u32,
+        height: u32,
+        pixel_format: PixelFormat,
+        stride: usize,
+        pixels: Uint8Array,
+    ) -> Result<WasmVideoFrame, JsValue> {
+        let limits = Limits::default();
+        let dimensions = VideoDimensions::new(width, height, &limits)
+            .map_err(|error| js_error(error.kind(), error.message()))?;
+        let frame = CoreVideoFrame::new(
+            dimensions,
+            pixel_format,
             ColorRange::Full,
             vec![Plane {
                 data: pixels.to_vec(),
@@ -891,9 +970,7 @@ impl WasmVideoStream {
         let state = Rc::clone(&self.state);
         let direction = self.direction;
         let browser_video = self.browser_video.clone();
-        let width = frame.0.dimensions.width;
-        let height = frame.0.dimensions.height;
-        let rgba = frame.0.planes[0].data.clone();
+        let core_frame = frame.0.clone();
         future_to_promise(async move {
             ensure_open(&state)?;
             check_signal(signal.as_ref())?;
@@ -910,7 +987,7 @@ impl WasmVideoStream {
                     "no browser video encoder backend is registered for this track",
                 )
             })?;
-            encode_browser_video_frame(&browser_video, index, width, height, rgba)
+            encode_browser_video_frame(&browser_video, index, core_frame)
                 .await
                 .map_err(|error| js_error(error.kind(), error.message()))?;
             Ok(JsValue::UNDEFINED)
@@ -1490,10 +1567,10 @@ impl BrowserVideoTrack {
 async fn encode_browser_video_frame(
     track: &Rc<RefCell<BrowserVideoTrack>>,
     index: u64,
-    width: u32,
-    height: u32,
-    rgba: Vec<u8>,
+    frame: CoreVideoFrame,
 ) -> crate::Result<()> {
+    let width = frame.dimensions.width;
+    let height = frame.dimensions.height;
     let (timescale, frame_duration) = {
         let state = track.borrow();
         if state.timescale == 0 || state.frame_duration == 0 {
@@ -1550,7 +1627,7 @@ async fn encode_browser_video_frame(
     .map_err(|_| crate::Error::new(ErrorKind::ResourceLimit, "frame duration does not fit"))?;
 
     let result = session
-        .encode(&rgba, timestamp_micros, duration_micros, key_frame)
+        .encode(&frame, timestamp_micros, duration_micros, key_frame)
         .await;
 
     let mut state = track.borrow_mut();
@@ -2215,6 +2292,48 @@ mod tests {
             JsFuture::from(video.put(BigInt::from(frame_index).into(), &frame, None))
                 .await
                 .expect("encoding a frame through WebCodecs must succeed");
+        }
+        let mut output = output;
+        let blob: Blob = JsFuture::from(output.finish())
+            .await
+            .unwrap()
+            .unchecked_into();
+        let array_buffer = JsFuture::from(blob.array_buffer()).await.unwrap();
+        let bytes = Uint8Array::new(&array_buffer).to_vec();
+        assert!(!bytes.is_empty());
+
+        let source = MemorySource::new(bytes);
+        let demuxer = crate::Mp4Demuxer::open(&source, crate::Mp4DemuxerOptions::default())
+            .await
+            .expect("the browser-encoded output must be a parseable MP4");
+        assert_eq!(demuxer.tracks.len(), 1);
+        assert_eq!(demuxer.tracks[0].kind, crate::TrackKind::Video);
+        assert_eq!(demuxer.tracks[0].samples.len(), 3);
+    }
+
+    #[wasm_bindgen_test]
+    async fn put_encodes_yuv420p8_through_webcodecs_into_a_playable_mp4() {
+        if !video_encode_support(None).unwrap() {
+            // No WebCodecs AV1 encoder in this browser; nothing to verify here.
+            return;
+        }
+        let options = WasmCreateOptions::new(None).unwrap();
+        let output = WasmMediaOutput {
+            bytes: Vec::new(),
+            mime_type: options.mime_type,
+            max_output_bytes: options.max_output_bytes,
+            state: Rc::new(Cell::new(false)),
+            timeline: None,
+            browser_video: Rc::new(RefCell::new(BrowserVideoTrack::new(30, 1))),
+        };
+        let video = output.video(0).unwrap();
+        // 4x4 luma plus two 2x2 chroma planes, concatenated: Y, then U, then V.
+        let pixels = owned_u8_array(&[128_u8; 4 * 4 + 2 * 2 + 2 * 2]);
+        let frame = WasmVideoFrame::yuv420p8(4, 4, pixels).unwrap();
+        for frame_index in 0..3_u64 {
+            JsFuture::from(video.put(BigInt::from(frame_index).into(), &frame, None))
+                .await
+                .expect("encoding a YUV 4:2:0 frame through WebCodecs must succeed");
         }
         let mut output = output;
         let blob: Blob = JsFuture::from(output.finish())
