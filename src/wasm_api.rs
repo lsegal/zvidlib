@@ -4,17 +4,19 @@
 //! typed arrays are snapshots rather than views into growable WebAssembly
 //! memory, and browser-owned objects are retained only as JavaScript handles.
 
-use crate::io::MemorySource;
+use crate::io::{MemorySink, MemorySource};
+use crate::mp4::{Mp4Muxer, Mp4TrackConfig, Mp4TrackFormat};
 use crate::web_decoder::{
     WebVideoDecodeSession, video_frame_durations_ms, video_random_access_points,
 };
+use crate::web_encoder::{WebVideoEncodeSession, sample_dependency, video_encode_capability};
 use crate::web_previews::WebPreviewIndex;
 use crate::{
-    AudioBuffer as CoreAudioBuffer, CancellationToken, ColorRange, ErrorKind,
-    FrameIndex as CoreFrameIndex, FrameRate, Limits, PixelFormat, Plane,
-    PreviewOptions as CorePreviewOptions, PreviewStore, Rational as CoreRational,
-    SEEK_LATENCY_BUDGET, SampleRange as CoreSampleRange, Timeline, VideoDimensions,
-    VideoFrame as CoreVideoFrame,
+    AudioBuffer as CoreAudioBuffer, CancellationToken, Codec, CodecProfile, ColorRange,
+    EncodedSample, EncoderConfig, ErrorKind, FrameIndex as CoreFrameIndex, FrameRate,
+    HardwarePreference, Limits, PixelFormat, Plane, PreviewOptions as CorePreviewOptions,
+    PreviewStore, Rational as CoreRational, SEEK_LATENCY_BUDGET, SampleRange as CoreSampleRange,
+    Timeline, VideoDimensions, VideoFrame as CoreVideoFrame,
 };
 use js_sys::{Array, BigInt, Float32Array, Promise, Reflect, Uint8Array};
 use std::cell::{Cell, RefCell};
@@ -677,6 +679,9 @@ pub struct WasmVideoStream {
     frame_durations_ms: Rc<RefCell<Option<Vec<f64>>>>,
     /// Lazily-parsed presentation indices of the track's random-access samples, ascending.
     random_access_points: Rc<RefCell<Option<Vec<u64>>>>,
+    /// Shared `WebCodecs` encode state for an output video track, set only for
+    /// the track index this bridge currently supports encoding (track 0).
+    browser_video: Option<Rc<RefCell<BrowserVideoTrack>>>,
 }
 
 #[wasm_bindgen(js_class = VideoStream)]
@@ -880,25 +885,35 @@ impl WasmVideoStream {
     pub fn put(
         &self,
         frame_index: JsValue,
-        _frame: &WasmVideoFrame,
+        frame: &WasmVideoFrame,
         signal: Option<AbortSignal>,
     ) -> Promise {
         let state = Rc::clone(&self.state);
         let direction = self.direction;
+        let browser_video = self.browser_video.clone();
+        let width = frame.0.dimensions.width;
+        let height = frame.0.dimensions.height;
+        let rgba = frame.0.planes[0].data.clone();
         future_to_promise(async move {
             ensure_open(&state)?;
             check_signal(signal.as_ref())?;
-            parse_u64(&frame_index, "frame index")?;
+            let index = parse_u64(&frame_index, "frame index")?;
             if direction != StreamDirection::Output {
                 return Err(js_error(
                     ErrorKind::InvalidState,
                     "put is only valid on an output video stream",
                 ));
             }
-            Err(js_error(
-                ErrorKind::Unsupported,
-                "no browser video encoder backend is registered",
-            ))
+            let browser_video = browser_video.ok_or_else(|| {
+                js_error(
+                    ErrorKind::Unsupported,
+                    "no browser video encoder backend is registered for this track",
+                )
+            })?;
+            encode_browser_video_frame(&browser_video, index, width, height, rgba)
+                .await
+                .map_err(|error| js_error(error.kind(), error.message()))?;
+            Ok(JsValue::UNDEFINED)
         })
     }
 }
@@ -933,6 +948,32 @@ async fn parse_audio_track(
 #[wasm_bindgen(js_name = seekLatencyBudgetMs)]
 pub fn seek_latency_budget_ms() -> f64 {
     SEEK_LATENCY_BUDGET.as_secs_f64() * 1_000.0
+}
+
+/// Reports whether this browser's `WebCodecs` bridge can encode AV1 Main
+/// profile video, the only codec/profile this bridge currently implements.
+///
+/// `hardware` accepts `"require"`, `"prefer"` (the default), or `"avoid"`,
+/// mirroring [`crate::HardwarePreference`]. This is a synchronous,
+/// best-effort feature check: `WebCodecs`' own `isConfigSupported()` is
+/// asynchronous and configuration-specific, so a caller that needs a
+/// definitive answer still has to attempt a real encode via
+/// [`WasmVideoStream::put`].
+#[wasm_bindgen(js_name = videoEncodeSupport)]
+pub fn video_encode_support(hardware: Option<String>) -> Result<bool, JsValue> {
+    let hardware = match hardware.as_deref() {
+        None | Some("prefer") => HardwarePreference::Prefer,
+        Some("require") => HardwarePreference::Require,
+        Some("avoid") => HardwarePreference::Avoid,
+        Some(other) => {
+            return Err(js_error(
+                ErrorKind::InvalidInput,
+                format!("unknown hardware preference: {other}"),
+            ));
+        }
+    };
+    let support = video_encode_capability(Codec::Av1, CodecProfile::Av1Main, hardware);
+    Ok(support.is_supported())
 }
 
 /// How a preview index trades memory and pass length against how fine the scrub
@@ -1383,6 +1424,7 @@ impl WasmMediaInput {
             decode_session: Rc::new(RefCell::new(None)),
             frame_durations_ms: Rc::new(RefCell::new(None)),
             random_access_points: Rc::new(RefCell::new(None)),
+            browser_video: None,
         })
     }
 
@@ -1409,6 +1451,224 @@ impl WasmMediaInput {
     }
 }
 
+/// Buffered `WebCodecs` video encode state for one output track's browser
+/// encoder bridge, shared between [`WasmMediaOutput`] and the
+/// [`WasmVideoStream`] it hands out for that track.
+///
+/// Building the real MP4 sample entry requires a complete `av1C` decoder
+/// configuration, which `WebCodecs` only reveals once its encoder emits its
+/// first chunk. So unlike the portable [`crate::codec::VideoEncoder`] trait,
+/// samples are buffered here and the [`Mp4Muxer`] is not built until
+/// [`WasmMediaOutput::finish`], once every real per-sample decoder detail is
+/// known.
+struct BrowserVideoTrack {
+    session: Option<WebVideoEncodeSession>,
+    dimensions: Option<(u32, u32)>,
+    decoder_config: Option<Vec<u8>>,
+    samples: Vec<EncodedSample>,
+    next_index: u64,
+    timescale: u32,
+    frame_duration: u32,
+}
+
+impl BrowserVideoTrack {
+    fn new(timescale: u32, frame_duration: u32) -> Self {
+        Self {
+            session: None,
+            dimensions: None,
+            decoder_config: None,
+            samples: Vec::new(),
+            next_index: 0,
+            timescale,
+            frame_duration,
+        }
+    }
+}
+
+/// Encodes one presentation-order frame through `track`'s `WebCodecs` session,
+/// opening the session on the first call.
+async fn encode_browser_video_frame(
+    track: &Rc<RefCell<BrowserVideoTrack>>,
+    index: u64,
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+) -> crate::Result<()> {
+    let (timescale, frame_duration) = {
+        let state = track.borrow();
+        if state.timescale == 0 || state.frame_duration == 0 {
+            return Err(crate::Error::new(
+                ErrorKind::InvalidState,
+                "frameRate must be set via CreateOptions to encode browser video",
+            ));
+        }
+        if index != state.next_index {
+            return Err(crate::Error::new(
+                ErrorKind::InvalidInput,
+                "frame index must equal the next expected output index",
+            ));
+        }
+        if let Some(dimensions) = state.dimensions
+            && dimensions != (width, height)
+        {
+            return Err(crate::Error::new(
+                ErrorKind::InvalidInput,
+                "frame dimensions changed mid-stream",
+            ));
+        }
+        (state.timescale, state.frame_duration)
+    };
+
+    let mut session = {
+        let mut state = track.borrow_mut();
+        match state.session.take() {
+            Some(session) => session,
+            None => {
+                let session = WebVideoEncodeSession::open(width, height, None)?;
+                state.dimensions = Some((width, height));
+                session
+            }
+        }
+    };
+
+    let key_frame = index == 0;
+    let ticks = index
+        .checked_mul(u64::from(frame_duration))
+        .ok_or_else(|| crate::Error::new(ErrorKind::ResourceLimit, "frame timestamp overflow"))?;
+    let timestamp_micros = ticks
+        .checked_mul(1_000_000)
+        .and_then(|value| value.checked_div(u64::from(timescale)))
+        .ok_or_else(|| crate::Error::new(ErrorKind::ResourceLimit, "frame timestamp overflow"))?;
+    let duration_micros = u32::try_from(
+        u64::from(frame_duration)
+            .checked_mul(1_000_000)
+            .and_then(|value| value.checked_div(u64::from(timescale)))
+            .ok_or_else(|| {
+                crate::Error::new(ErrorKind::ResourceLimit, "frame duration overflow")
+            })?,
+    )
+    .map_err(|_| crate::Error::new(ErrorKind::ResourceLimit, "frame duration does not fit"))?;
+
+    let result = session
+        .encode(&rgba, timestamp_micros, duration_micros, key_frame)
+        .await;
+
+    let mut state = track.borrow_mut();
+    state.session = Some(session);
+    let chunk = result?;
+
+    if state.decoder_config.is_none()
+        && let Some(config) = chunk.decoder_config
+    {
+        state.decoder_config = Some(config);
+    }
+    let pts = i64::try_from(ticks).map_err(|_| {
+        crate::Error::new(ErrorKind::ResourceLimit, "presentation time does not fit")
+    })?;
+    state.samples.push(EncodedSample {
+        data: chunk.data,
+        dts: pts,
+        pts,
+        duration: frame_duration,
+        is_sync: chunk.is_sync,
+        dependency: sample_dependency(chunk.is_sync),
+    });
+    state.next_index += 1;
+    Ok(())
+}
+
+/// Flushes any open browser video encode session and, if the track produced
+/// any samples, muxes them into a complete MP4. Falls back to `raw_bytes`
+/// (accumulated via [`WasmMediaOutput::write_encoded_chunk`]) when the
+/// browser video encode path was never used.
+async fn finalize_browser_output(
+    track: &Rc<RefCell<BrowserVideoTrack>>,
+    raw_bytes: Vec<u8>,
+) -> crate::Result<Vec<u8>> {
+    let pending_session = {
+        let mut state = track.borrow_mut();
+        state.session.take()
+    };
+    if pending_session.is_none() && track.borrow().samples.is_empty() {
+        return Ok(raw_bytes);
+    }
+    if let Some(mut session) = pending_session {
+        let remaining = session.finish().await?;
+        let mut state = track.borrow_mut();
+        for chunk in remaining {
+            if state.decoder_config.is_none()
+                && let Some(config) = chunk.decoder_config
+            {
+                state.decoder_config = Some(config);
+            }
+            let ticks = state
+                .next_index
+                .checked_mul(u64::from(state.frame_duration))
+                .ok_or_else(|| {
+                    crate::Error::new(ErrorKind::ResourceLimit, "presentation time overflow")
+                })?;
+            let pts = i64::try_from(ticks).map_err(|_| {
+                crate::Error::new(ErrorKind::ResourceLimit, "presentation time does not fit")
+            })?;
+            let frame_duration = state.frame_duration;
+            state.samples.push(EncodedSample {
+                data: chunk.data,
+                dts: pts,
+                pts,
+                duration: frame_duration,
+                is_sync: chunk.is_sync,
+                dependency: sample_dependency(chunk.is_sync),
+            });
+            state.next_index += 1;
+        }
+    }
+
+    let (coded_dimensions, decoder_config, timescale, samples) = {
+        let mut state = track.borrow_mut();
+        let dimensions = state.dimensions.ok_or_else(|| {
+            crate::Error::new(
+                ErrorKind::Internal,
+                "browser video track was opened but never encoded a frame",
+            )
+        })?;
+        let decoder_config = state.decoder_config.clone().ok_or_else(|| {
+            crate::Error::new(
+                ErrorKind::Internal,
+                "browser video track produced no decoder configuration",
+            )
+        })?;
+        (
+            dimensions,
+            decoder_config,
+            state.timescale,
+            std::mem::take(&mut state.samples),
+        )
+    };
+
+    let video_dimensions =
+        VideoDimensions::new(coded_dimensions.0, coded_dimensions.1, &Limits::default())?;
+    let track_config = Mp4TrackConfig {
+        encoder: EncoderConfig {
+            codec: Codec::Av1,
+            timescale,
+            decoder_config,
+        },
+        format: Mp4TrackFormat::Video(video_dimensions),
+    };
+    let sink = MemorySink::new();
+    let mut muxer = Mp4Muxer::new(
+        sink,
+        vec![track_config],
+        crate::OutputOptions::default().max_samples_per_track,
+    )
+    .await?;
+    for sample in samples {
+        muxer.write_sample(0, sample).await?;
+    }
+    let sink = muxer.finish().await?;
+    Ok(sink.into_inner())
+}
+
 /// A browser output adapter that returns finalized bytes as an owned `Blob`.
 #[wasm_bindgen(js_name = MediaOutput)]
 pub struct WasmMediaOutput {
@@ -1417,6 +1677,7 @@ pub struct WasmMediaOutput {
     max_output_bytes: u64,
     state: Rc<Cell<bool>>,
     timeline: Option<Timeline>,
+    browser_video: Rc<RefCell<BrowserVideoTrack>>,
 }
 
 #[wasm_bindgen(js_class = MediaOutput)]
@@ -1428,6 +1689,20 @@ impl WasmMediaOutput {
             (Some(frame_rate), Some(sample_rate)) => Timeline::new(frame_rate, sample_rate).ok(),
             _ => None,
         };
+        // Browser video encoding needs an exact MP4 timescale/frame duration
+        // up front, derived the same way `Timeline` derives one: numerator as
+        // timescale, denominator as the per-frame tick count. `put()` on the
+        // resulting video stream reports a clear error when `frameRate` was
+        // never set instead of failing here.
+        let (video_timescale, video_frame_duration) = options
+            .frame_rate
+            .and_then(|frame_rate| {
+                let rational = frame_rate.as_rational();
+                let timescale = u32::try_from(rational.numerator()).ok()?;
+                let frame_duration = u32::try_from(rational.denominator()).ok()?;
+                Some((timescale, frame_duration))
+            })
+            .unwrap_or((0, 0));
         future_to_promise(async move {
             Ok(JsValue::from(Self {
                 bytes: Vec::new(),
@@ -1435,6 +1710,10 @@ impl WasmMediaOutput {
                 max_output_bytes,
                 state: Rc::new(Cell::new(false)),
                 timeline,
+                browser_video: Rc::new(RefCell::new(BrowserVideoTrack::new(
+                    video_timescale,
+                    video_frame_duration,
+                ))),
             }))
         })
     }
@@ -1459,6 +1738,9 @@ impl WasmMediaOutput {
 
     pub fn video(&self, index: u32) -> Result<WasmVideoStream, JsValue> {
         ensure_open(&self.state)?;
+        // The WebCodecs bridge currently supports encoding a single video
+        // track (track 0); `put()` on any other index reports Unsupported.
+        let browser_video = (index == 0).then(|| Rc::clone(&self.browser_video));
         Ok(WasmVideoStream {
             index,
             state: Rc::clone(&self.state),
@@ -1467,6 +1749,7 @@ impl WasmMediaOutput {
             decode_session: Rc::new(RefCell::new(None)),
             frame_durations_ms: Rc::new(RefCell::new(None)),
             random_access_points: Rc::new(RefCell::new(None)),
+            browser_video,
         })
     }
 
@@ -1482,15 +1765,20 @@ impl WasmMediaOutput {
     }
 
     pub fn finish(&mut self) -> Promise {
-        let result = (|| {
-            ensure_open(&self.state)?;
-            let blob = make_blob(&self.bytes, &self.mime_type)
+        let state = Rc::clone(&self.state);
+        let mime_type = self.mime_type.clone();
+        let browser_video = Rc::clone(&self.browser_video);
+        let raw_bytes = std::mem::take(&mut self.bytes);
+        future_to_promise(async move {
+            ensure_open(&state)?;
+            let bytes = finalize_browser_output(&browser_video, raw_bytes)
+                .await
+                .map_err(|error| js_error(error.kind(), error.message()))?;
+            let blob = make_blob(&bytes, &mime_type)
                 .map_err(|error| normalize_browser_error(error, "creating output Blob"))?;
-            self.state.set(true);
-            self.bytes.clear();
+            state.set(true);
             Ok(JsValue::from(blob))
-        })();
-        future_to_promise(async move { result })
+        })
     }
 
     #[wasm_bindgen(getter, js_name = isClosed)]
@@ -1734,6 +2022,7 @@ mod tests {
             max_output_bytes: options.max_output_bytes,
             state: Rc::new(Cell::new(false)),
             timeline: None,
+            browser_video: Rc::new(RefCell::new(BrowserVideoTrack::new(0, 0))),
         };
         let error = JsFuture::from(output.video(0).unwrap().random_access_points(None))
             .await
@@ -1894,6 +2183,7 @@ mod tests {
             max_output_bytes: options.max_output_bytes,
             state: Rc::new(Cell::new(false)),
             timeline: None,
+            browser_video: Rc::new(RefCell::new(BrowserVideoTrack::new(0, 0))),
         };
         let chunk = Uint8Array::from(&[9_u8, 8, 7][..]);
         output.write_encoded_chunk(chunk.clone()).unwrap();
@@ -1901,6 +2191,47 @@ mod tests {
         let blob = make_blob(&output.bytes, &output.mime_type).unwrap();
         let bytes = JsFuture::from(blob.array_buffer()).await.unwrap();
         assert_eq!(Uint8Array::new(&bytes).to_vec(), vec![9, 8, 7]);
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn put_encodes_through_webcodecs_into_a_playable_mp4() {
+        if !video_encode_support(None).unwrap() {
+            // No WebCodecs AV1 encoder in this browser; nothing to verify here.
+            return;
+        }
+        let options = WasmCreateOptions::new(None).unwrap();
+        let output = WasmMediaOutput {
+            bytes: Vec::new(),
+            mime_type: options.mime_type,
+            max_output_bytes: options.max_output_bytes,
+            state: Rc::new(Cell::new(false)),
+            timeline: None,
+            browser_video: Rc::new(RefCell::new(BrowserVideoTrack::new(30, 1))),
+        };
+        let video = output.video(0).unwrap();
+        let pixels = owned_u8_array(&[128_u8; 4 * 4 * 4]);
+        let frame = WasmVideoFrame::rgba(4, 4, pixels).unwrap();
+        for frame_index in 0..3_u64 {
+            JsFuture::from(video.put(BigInt::from(frame_index).into(), &frame, None))
+                .await
+                .expect("encoding a frame through WebCodecs must succeed");
+        }
+        let mut output = output;
+        let blob: Blob = JsFuture::from(output.finish())
+            .await
+            .unwrap()
+            .unchecked_into();
+        let array_buffer = JsFuture::from(blob.array_buffer()).await.unwrap();
+        let bytes = Uint8Array::new(&array_buffer).to_vec();
+        assert!(!bytes.is_empty());
+
+        let source = MemorySource::new(bytes);
+        let demuxer = crate::Mp4Demuxer::open(&source, crate::Mp4DemuxerOptions::default())
+            .await
+            .expect("the browser-encoded output must be a parseable MP4");
+        assert_eq!(demuxer.tracks.len(), 1);
+        assert_eq!(demuxer.tracks[0].kind, crate::TrackKind::Video);
+        assert_eq!(demuxer.tracks[0].samples.len(), 3);
     }
 
     #[wasm_bindgen_test]

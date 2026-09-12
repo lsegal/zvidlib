@@ -137,6 +137,7 @@ web-sys = { version = "0.3.104", optional = true, features = [
     "Blob",
     "EncodedVideoChunk",
     "EncodedVideoChunkInit",
+    "EncodedVideoChunkMetadata",
     "EncodedVideoChunkType",
     # `performance.now()` is what times the browser preview lookup against the
     # section 3.2 budget; see `web_previews`.
@@ -147,7 +148,12 @@ web-sys = { version = "0.3.104", optional = true, features = [
     "VideoDecoderConfig",
     "VideoDecoderInit",
     "VideoDecoderSupport",
+    "VideoEncoder",
+    "VideoEncoderConfig",
+    "VideoEncoderEncodeOptions",
+    "VideoEncoderInit",
     "VideoFrame",
+    "VideoFrameBufferInit",
     "VideoFrameCopyToOptions",
     "VideoPixelFormat",
     "Window",
