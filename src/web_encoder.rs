@@ -27,7 +27,7 @@ use wasm_bindgen_futures::JsFuture;
 use web_sys::{
     EncodedVideoChunk, EncodedVideoChunkMetadata, VideoEncoder as JsVideoEncoder,
     VideoEncoderConfig as JsVideoEncoderConfig, VideoEncoderEncodeOptions, VideoEncoderInit,
-    VideoFrame as JsVideoFrame, VideoFrameBufferInit, VideoPixelFormat,
+    VideoEncoderSupport, VideoFrame as JsVideoFrame, VideoFrameBufferInit, VideoPixelFormat,
 };
 
 /// One encoded output from a [`WebVideoEncodeSession`].
@@ -97,7 +97,7 @@ pub struct WebVideoEncodeSession {
 impl WebVideoEncodeSession {
     /// Opens a session targeting `codec` (AV1 Main or HEVC Main) at
     /// `width`x`height`, timestamps and durations given in microseconds.
-    pub fn open(
+    pub async fn open(
         codec: Codec,
         width: u32,
         height: u32,
@@ -116,6 +116,30 @@ impl WebVideoEncodeSession {
                 ));
             }
         };
+
+        let config = JsVideoEncoderConfig::new(initial_codec_string, height, width);
+        if let Some(bitrate) = bitrate_bits_per_second {
+            config.set_bitrate(bitrate);
+        }
+
+        // `configure()` only ever synchronously validates the shape of the
+        // config; a codec/profile the browser cannot actually encode is
+        // reported asynchronously by closing the encoder and invoking the
+        // error callback. Checking `isConfigSupported()` first means an
+        // unsupported codec (e.g. no HEVC software encoder) surfaces here as
+        // a normal error rather than as a "closed codec" failure on the
+        // first `encode()` call.
+        let support: VideoEncoderSupport =
+            JsFuture::from(js_to_promise(JsVideoEncoder::is_config_supported(&config)))
+                .await
+                .map_err(|error| normalize_js_error(error, "querying WebCodecs encoder support"))?
+                .unchecked_into();
+        if !support.get_supported().unwrap_or(false) {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                format!("this browser cannot encode {initial_codec_string} via WebCodecs"),
+            ));
+        }
 
         let pending_chunks: Rc<RefCell<VecDeque<(EncodedVideoChunk, JsValue)>>> =
             Rc::new(RefCell::new(VecDeque::new()));
@@ -154,10 +178,6 @@ impl WebVideoEncodeSession {
         let encoder = JsVideoEncoder::new(&init)
             .map_err(|error| normalize_js_error(error, "constructing a WebCodecs VideoEncoder"))?;
 
-        let config = JsVideoEncoderConfig::new(initial_codec_string, height, width);
-        if let Some(bitrate) = bitrate_bits_per_second {
-            config.set_bitrate(bitrate);
-        }
         encoder
             .configure(&config)
             .map_err(|error| normalize_js_error(error, "configuring the WebCodecs VideoEncoder"))?;

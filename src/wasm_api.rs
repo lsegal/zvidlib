@@ -1562,15 +1562,17 @@ async fn encode_browser_video_frame(
         (state.timescale, state.frame_duration)
     };
 
-    let mut session = {
+    let existing_session = {
         let mut state = track.borrow_mut();
-        match state.session.take() {
-            Some(session) => session,
-            None => {
-                let session = WebVideoEncodeSession::open(state.codec, width, height, None)?;
-                state.dimensions = Some((width, height));
-                session
-            }
+        state.session.take()
+    };
+    let mut session = match existing_session {
+        Some(session) => session,
+        None => {
+            let codec = track.borrow().codec;
+            let session = WebVideoEncodeSession::open(codec, width, height, None).await?;
+            track.borrow_mut().dimensions = Some((width, height));
+            session
         }
     };
 
