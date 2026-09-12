@@ -13,9 +13,10 @@
 //! Scope for this initial bridge: AV1 Main profile output from RGBA8 input.
 //! Broader codec and pixel-format coverage is tracked as follow-up work.
 
+use crate::av1::{Av1Obu, Av1Parser};
 use crate::codec::{CodecImplementation, CodecSupport, SampleDependency};
 use crate::web_decoder::{js_to_promise, normalize_js_error, schedule_event_loop_tick};
-use crate::{Codec, CodecProfile, Error, ErrorKind, HardwarePreference, Result};
+use crate::{Codec, CodecProfile, Error, ErrorKind, HardwarePreference, Limits, Result};
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
@@ -23,9 +24,9 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
-    EncodedVideoChunk, EncodedVideoChunkMetadata, VideoEncoder as JsVideoEncoder,
-    VideoEncoderConfig as JsVideoEncoderConfig, VideoEncoderEncodeOptions, VideoEncoderInit,
-    VideoFrame as JsVideoFrame, VideoFrameBufferInit, VideoPixelFormat,
+    EncodedVideoChunk, VideoEncoder as JsVideoEncoder, VideoEncoderConfig as JsVideoEncoderConfig,
+    VideoEncoderEncodeOptions, VideoEncoderInit, VideoFrame as JsVideoFrame, VideoFrameBufferInit,
+    VideoPixelFormat,
 };
 
 /// One encoded output from a [`WebVideoEncodeSession`].
@@ -71,16 +72,13 @@ pub fn video_encode_capability(
     }
 }
 
-/// One `WebCodecs` output chunk paired with the metadata it arrived with.
-type PendingChunk = (EncodedVideoChunk, Option<EncodedVideoChunkMetadata>);
-
 /// A lazily-driven `WebCodecs` encode session producing AV1 Main chunks from
 /// RGBA8 frames.
 pub struct WebVideoEncodeSession {
     encoder: JsVideoEncoder,
     width: u32,
     height: u32,
-    pending_chunks: Rc<RefCell<VecDeque<PendingChunk>>>,
+    pending_chunks: Rc<RefCell<VecDeque<EncodedVideoChunk>>>,
     encode_error: Rc<RefCell<Option<String>>>,
     waker: Rc<RefCell<Option<js_sys::Function>>>,
     emitted_config: bool,
@@ -94,16 +92,19 @@ impl WebVideoEncodeSession {
     /// Opens a session targeting AV1 Main at `width`x`height`, timestamps and
     /// durations given in microseconds.
     pub fn open(width: u32, height: u32, bitrate_bits_per_second: Option<u32>) -> Result<Self> {
-        let pending_chunks: Rc<RefCell<VecDeque<PendingChunk>>> =
+        let pending_chunks: Rc<RefCell<VecDeque<EncodedVideoChunk>>> =
             Rc::new(RefCell::new(VecDeque::new()));
         let encode_error: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
         let waker: Rc<RefCell<Option<js_sys::Function>>> = Rc::new(RefCell::new(None));
 
         let output_chunks = Rc::clone(&pending_chunks);
         let output_waker = Rc::clone(&waker);
-        let output_closure = Closure::new(move |chunk: EncodedVideoChunk, metadata: JsValue| {
-            let metadata: Option<EncodedVideoChunkMetadata> = metadata.dyn_into().ok();
-            output_chunks.borrow_mut().push_back((chunk, metadata));
+        // The second callback argument (`EncodedVideoChunkMetadata`) is not
+        // used: AV1's sequence header travels in-band in the chunk's own
+        // bytes rather than in `metadata.decoderConfig.description` (see
+        // `av1c_from_bitstream`), so only the chunk itself is kept.
+        let output_closure = Closure::new(move |chunk: EncodedVideoChunk, _metadata: JsValue| {
+            output_chunks.borrow_mut().push_back(chunk);
             if let Some(resolve) = output_waker.borrow_mut().take() {
                 let _ = resolve.call0(&JsValue::NULL);
             }
@@ -230,7 +231,7 @@ impl WebVideoEncodeSession {
     }
 
     fn take_ready_chunk(&mut self) -> Result<Option<WebEncodedVideoChunk>> {
-        let Some((chunk, metadata)) = self.pending_chunks.borrow_mut().pop_front() else {
+        let Some(chunk) = self.pending_chunks.borrow_mut().pop_front() else {
             return Ok(None);
         };
         let destination = js_sys::Uint8Array::new_with_length(chunk.byte_length());
@@ -240,18 +241,15 @@ impl WebVideoEncodeSession {
         let data = destination.to_vec();
         let is_sync = chunk.type_() == web_sys::EncodedVideoChunkType::Key;
 
-        let decoder_config = if !self.emitted_config {
-            let description = metadata
-                .and_then(|metadata| metadata.get_decoder_config())
-                .and_then(|config| config.get_description());
-            description
-                .map(|description| {
-                    let bytes = js_sys::Uint8Array::new(&description).to_vec();
-                    wrap_box(b"av1C", &bytes)
-                })
-                .inspect(|_| {
-                    self.emitted_config = true;
-                })
+        // AV1's sequence header travels in-band in the bitstream rather than
+        // through `EncodedVideoChunkMetadata.decoderConfig.description`
+        // (that field is for codecs like AVC/HEVC whose parameter sets are
+        // genuinely out-of-band), so the real `av1C` is derived from the key
+        // chunk's own bytes instead of from chunk metadata.
+        let decoder_config = if !self.emitted_config && is_sync {
+            av1c_from_bitstream(&data).inspect(|_| {
+                self.emitted_config = true;
+            })
         } else {
             None
         };
@@ -299,4 +297,80 @@ fn wrap_box(fourcc: &[u8; 4], payload: &[u8]) -> Vec<u8> {
     boxed.extend_from_slice(fourcc);
     boxed.extend_from_slice(payload);
     boxed
+}
+
+/// Builds a complete `av1C` box from a key chunk's raw AV1 OBU bitstream.
+///
+/// `WebCodecs` does not hand back a separate decoder configuration for AV1:
+/// its sequence header is one of the OBUs already in the chunk's own bytes
+/// (the "low overhead bitstream format" AV1's ISO Media binding also uses for
+/// `configOBUs`), so this scans for it directly rather than trusting
+/// out-of-band metadata AV1 doesn't populate.
+fn av1c_from_bitstream(data: &[u8]) -> Option<Vec<u8>> {
+    let sequence_header_obu = extract_sequence_header_obu(data)?;
+    let mut parser = Av1Parser::new(Limits::default()).ok()?;
+    let parsed = parser.parse_low_overhead(sequence_header_obu).ok()?;
+    let sequence = parsed.iter().find_map(|obu| match obu {
+        Av1Obu::SequenceHeader { sequence, .. } => Some(sequence),
+        _ => None,
+    })?;
+    let operating_point = sequence.operating_points.first()?;
+    let color = &sequence.color_config;
+
+    let mut payload = Vec::with_capacity(4 + sequence_header_obu.len());
+    payload.push(0x81);
+    payload.push((sequence.seq_profile << 5) | (operating_point.level & 0x1f));
+    payload.push(
+        (u8::from(operating_point.tier) << 7)
+            | (u8::from(color.bit_depth > 8) << 6)
+            | (u8::from(color.bit_depth == 12) << 5)
+            | (u8::from(color.monochrome) << 4)
+            | (u8::from(color.subsampling_x) << 3)
+            | (u8::from(color.subsampling_y) << 2)
+            | (color.chroma_sample_position & 3),
+    );
+    payload.push(0); // no initial presentation delay
+    payload.extend_from_slice(sequence_header_obu);
+    Some(wrap_box(b"av1C", &payload))
+}
+
+/// Scans a raw "low overhead bitstream format" OBU stream (AV1 §5.2) for its
+/// first Sequence Header OBU and returns that OBU's exact bytes (header, size
+/// field, and payload), which is what `av1C`'s `configOBUs` embeds verbatim.
+fn extract_sequence_header_obu(bytes: &[u8]) -> Option<&[u8]> {
+    const SEQUENCE_HEADER_OBU_TYPE: u8 = 1;
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let header_byte = *bytes.get(offset)?;
+        let obu_type = (header_byte >> 3) & 0b1111;
+        let has_extension = header_byte & 0b0000_0100 != 0;
+        let has_size_field = header_byte & 0b0000_0010 != 0;
+        if !has_size_field {
+            // Every OBU emitted by a `WebCodecs` encoder carries a size
+            // field; one that doesn't cannot be bounded without decoding it.
+            return None;
+        }
+        let size_offset = offset + 1 + usize::from(has_extension);
+        let (payload_len, leb_len) = read_leb128(bytes.get(size_offset..)?)?;
+        let payload_start = size_offset + leb_len;
+        let obu_len = (payload_start - offset).checked_add(usize::try_from(payload_len).ok()?)?;
+        let obu = bytes.get(offset..offset.checked_add(obu_len)?)?;
+        if obu_type == SEQUENCE_HEADER_OBU_TYPE {
+            return Some(obu);
+        }
+        offset = offset.checked_add(obu_len)?;
+    }
+    None
+}
+
+/// Reads an AV1 `leb128()` value, returning it with the number of bytes read.
+fn read_leb128(bytes: &[u8]) -> Option<(u64, usize)> {
+    let mut value: u64 = 0;
+    for (index, &byte) in bytes.iter().enumerate().take(8) {
+        value |= u64::from(byte & 0x7f) << (index * 7);
+        if byte & 0x80 == 0 {
+            return Some((value, index + 1));
+        }
+    }
+    None
 }
