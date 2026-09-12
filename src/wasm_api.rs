@@ -2563,11 +2563,25 @@ mod tests {
                 .expect("encoding an audio buffer through WebCodecs must succeed");
         }
 
+        // Whether this browser's `AudioEncoder` can actually produce AAC-LC
+        // (rather than merely exposing the constructor `audio_encode_support`
+        // checked above) is only knowable once its asynchronous error
+        // callback has had a chance to fire, which `put()` never yields long
+        // enough to observe (see `WebAudioEncodeSession::encode`'s doc
+        // comment): a browser with no platform AAC encoder to back
+        // `WebCodecs` (unlike macOS/Windows, Linux has none, mirroring the
+        // native AudioToolbox/Media Foundation story) only reports that at
+        // `finish()`'s `flush()`. Tolerate that specific, checked failure
+        // mode; anything else is a real bug.
         let mut output = output;
-        let blob: Blob = JsFuture::from(output.finish())
-            .await
-            .unwrap()
-            .unchecked_into();
+        let finish_result = JsFuture::from(output.finish()).await;
+        let blob: Blob = match finish_result {
+            Ok(value) => value.unchecked_into(),
+            Err(error) => {
+                assert_error_code(&error, "CODEC");
+                return;
+            }
+        };
         let array_buffer = JsFuture::from(blob.array_buffer()).await.unwrap();
         let bytes = Uint8Array::new(&array_buffer).to_vec();
         assert!(!bytes.is_empty());

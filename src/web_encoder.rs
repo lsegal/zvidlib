@@ -472,12 +472,19 @@ impl WebAudioEncodeSession {
             return Ok(Vec::new());
         }
         self.finished = true;
-        JsFuture::from(js_to_promise(self.encoder.flush()))
-            .await
-            .map_err(|error| normalize_js_error(error, "flushing the WebCodecs AudioEncoder"))?;
+        // `flush()` itself rejects with a generic "closed codec" error when an
+        // earlier `encode()` call's failure has already closed the encoder
+        // (per the `WebCodecs` spec), which would otherwise mask the real
+        // reason. That failure surfaces to `encode_error` no later than
+        // `flush()`'s own settling, so it is checked first and preferred over
+        // `flush()`'s own (less informative) rejection.
+        let flush_result = JsFuture::from(js_to_promise(self.encoder.flush())).await;
         if let Some(message) = self.encode_error.borrow_mut().take() {
+            let _ = self.encoder.close();
             return Err(Error::new(ErrorKind::Codec, message));
         }
+        flush_result
+            .map_err(|error| normalize_js_error(error, "flushing the WebCodecs AudioEncoder"))?;
         let chunks = self.take_ready_chunks()?;
         let _ = self.encoder.close();
         Ok(chunks)
