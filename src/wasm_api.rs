@@ -2864,7 +2864,7 @@ mod tests {
 
     #[wasm_bindgen_test(async)]
     async fn put_encodes_yuv420p8_through_webcodecs_into_a_playable_mp4() {
-        if !video_encode_support(None).unwrap() {
+        if !video_encode_support(None, None).unwrap() {
             // No WebCodecs AV1 encoder in this browser; nothing to verify here.
             return;
         }
@@ -2877,6 +2877,7 @@ mod tests {
             timeline: None,
             video_timescale: 30,
             video_frame_duration: 1,
+            video_codec: Codec::Av1,
             browser_video_tracks: Rc::new(RefCell::new(BTreeMap::new())),
             browser_audio: Rc::new(RefCell::new(BrowserAudioTrack::new())),
         };
