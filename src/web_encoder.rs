@@ -33,10 +33,9 @@ use web_sys::{
     AudioData as JsAudioData, AudioDataInit, AudioEncoder as JsAudioEncoder,
     AudioEncoderConfig as JsAudioEncoderConfig, AudioEncoderInit, AudioSampleFormat,
     EncodedAudioChunk, EncodedAudioChunkMetadata, EncodedAudioChunkType, EncodedVideoChunk,
-    EncodedVideoChunkMetadata, VideoEncoder as JsVideoEncoder,
+    EncodedVideoChunkMetadata, PlaneLayout, VideoEncoder as JsVideoEncoder,
     VideoEncoderConfig as JsVideoEncoderConfig, VideoEncoderEncodeOptions, VideoEncoderInit,
     VideoEncoderSupport, VideoFrame as JsVideoFrame, VideoFrameBufferInit, VideoPixelFormat,
-    PlaneLayout,
 };
 
 /// One encoded output from a [`WebVideoEncodeSession`].
