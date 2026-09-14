@@ -2617,9 +2617,15 @@ mod tests {
         let video = output.video(0).unwrap();
         let frame = WasmVideoFrame::rgba(4, 4, owned_u8_array(&[128_u8; 4 * 4 * 4])).unwrap();
         for frame_index in 0..3_u64 {
-            JsFuture::from(video.put(BigInt::from(frame_index).into(), &frame, None))
-                .await
-                .expect("encoding an HEVC frame through WebCodecs must succeed");
+            if let Err(error) =
+                JsFuture::from(video.put(BigInt::from(frame_index).into(), &frame, None)).await
+            {
+                // The synchronous probe only establishes that this bridge
+                // supports HEVC. The browser can still reject this concrete
+                // configuration asynchronously when no encoder is available.
+                assert_error_code(&error, "UNSUPPORTED");
+                return;
+            }
         }
         let mut output = output;
         let blob: Blob = JsFuture::from(output.finish())
