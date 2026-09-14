@@ -30,6 +30,41 @@ the D3D11-aware Media Foundation HEVC decoder on Windows, or VideoToolbox on mac
 to zvidlib's dependency-free pure-Rust HEVC Main decoder when acceleration is unavailable, so the
 native OpenGL example still renders the same decoded pixels without requiring a system codec.
 
+## Encoding
+
+### Native: `native_encode`
+
+Produces a short, one-second AV1 Main-profile MP4 from synthetic grayscale frames using the
+dependency-free native encoder and zvidlib's MP4 muxer. It needs no external encoder, device, or
+media input. Pass an output path (or omit it for `zvidlib-native-encode.mp4` in the current
+directory), then open the resulting file in a player or inspect it with `ffprobe`:
+
+```console
+cargo run --example native_encode --features native -- output.mp4
+ffprobe output.mp4
+```
+
+Native AAC remains platform-specific: the AudioToolbox adapter is available on macOS, while the
+portable native example intentionally remains video-only so it runs on every supported native
+target. `tests/native_aac_encoder.rs` demonstrates its synchronized audio+video `MediaOutput`
+path on macOS.
+
+### Browser: `web_encode/`
+
+Encodes a one-second animated RGBA gradient through the browser's WebCodecs AV1 encoder and
+downloads a real MP4. Where the browser exposes its AAC-LC `AudioEncoder`, it also creates one
+interleaved stereo PCM buffer per video frame and muxes the resulting audio on the same 30 fps /
+48 kHz timeline. The on-page player is the verification surface for the produced file.
+
+```console
+cd examples/web_encode
+pnpm install
+pnpm dev
+```
+
+Open the printed local URL and choose **Encode MP4**. The button is disabled when the browser does
+not provide an AV1 WebCodecs encoder; the status text says whether audio was included.
+
 ## Native GL: `native_gl/`
 
 Opens the sample, selects accelerated HEVC Main decoding when available (printing the selected
