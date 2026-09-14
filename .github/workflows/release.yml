@@ -1,0 +1,51 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    name: Package release assets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+      - name: Install Rust toolchain
+        run: rustup show
+      - name: Install wasm32 target
+        run: rustup target add wasm32-unknown-unknown
+      - name: Install wasm-pack
+        env:
+          WASM_PACK_VERSION: '0.15.0'
+        run: |
+          target="wasm-pack-v${WASM_PACK_VERSION}-x86_64-unknown-linux-musl"
+          mkdir -p "$RUNNER_TEMP/wasm-pack"
+          curl -sSfL "https://github.com/rustwasm/wasm-pack/releases/download/v${WASM_PACK_VERSION}/${target}.tar.gz" \
+            | tar -xz --strip-components=1 -C "$RUNNER_TEMP/wasm-pack" "${target}/wasm-pack"
+          echo "$RUNNER_TEMP/wasm-pack" >> "$GITHUB_PATH"
+      - name: Verify package version matches the release tag
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          test "${TAG#v}" = "$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+      - name: Build release assets
+        run: |
+          mkdir release
+          cargo package --locked --no-verify
+          cp target/package/zvidlib-*.crate release/
+          wasm-pack build --release --target web --out-dir pkg --no-default-features --features web
+          (cd pkg && npm pack --pack-destination ../release)
+          mv release/zvidlib-*.tgz "release/zvidlib-web-v${{ github.event.release.tag_name }}.tgz"
+      - name: Publish the Rust crate
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked
+      - name: Attach release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" release/* --clobber
