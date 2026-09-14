@@ -28,10 +28,9 @@ use web_sys::{
     AudioData as JsAudioData, AudioDataInit, AudioEncoder as JsAudioEncoder,
     AudioEncoderConfig as JsAudioEncoderConfig, AudioEncoderInit, AudioSampleFormat,
     EncodedAudioChunk, EncodedAudioChunkMetadata, EncodedAudioChunkType, EncodedVideoChunk,
-    VideoEncoder as JsVideoEncoder, VideoEncoderConfig as JsVideoEncoderConfig,
-    VideoEncoderEncodeOptions, VideoEncoderInit, VideoFrame as JsVideoFrame, VideoFrameBufferInit,
-    VideoPixelFormat,
-    VideoEncoderSupport,
+    EncodedVideoChunkMetadata, VideoEncoder as JsVideoEncoder,
+    VideoEncoderConfig as JsVideoEncoderConfig, VideoEncoderEncodeOptions, VideoEncoderInit,
+    VideoEncoderSupport, VideoFrame as JsVideoFrame, VideoFrameBufferInit, VideoPixelFormat,
 };
 
 /// One encoded output from a [`WebVideoEncodeSession`].

@@ -634,7 +634,12 @@ impl WasmCreateOptions {
         self.video_codec = match value.as_str() {
             "av1" => Codec::Av1,
             "hevc" => Codec::Hevc,
-            other => return Err(js_error(ErrorKind::Unsupported, format!("unsupported video codec: {other}"))),
+            other => {
+                return Err(js_error(
+                    ErrorKind::Unsupported,
+                    format!("unsupported video codec: {other}"),
+                ));
+            }
         };
         Ok(())
     }
@@ -986,7 +991,10 @@ pub fn seek_latency_budget_ms() -> f64 {
 /// definitive answer still has to attempt a real encode via
 /// [`WasmVideoStream::put`].
 #[wasm_bindgen(js_name = videoEncodeSupport)]
-pub fn video_encode_support(hardware: Option<String>, codec: Option<String>) -> Result<bool, JsValue> {
+pub fn video_encode_support(
+    hardware: Option<String>,
+    codec: Option<String>,
+) -> Result<bool, JsValue> {
     let hardware = match hardware.as_deref() {
         None | Some("prefer") => HardwarePreference::Prefer,
         Some("require") => HardwarePreference::Require,
@@ -1001,7 +1009,12 @@ pub fn video_encode_support(hardware: Option<String>, codec: Option<String>) -> 
     let (codec, profile) = match codec.as_deref() {
         None | Some("av1") => (Codec::Av1, CodecProfile::Av1Main),
         Some("hevc") => (Codec::Hevc, CodecProfile::HevcMain),
-        Some(other) => return Err(js_error(ErrorKind::Unsupported, format!("unsupported video codec: {other}"))),
+        Some(other) => {
+            return Err(js_error(
+                ErrorKind::Unsupported,
+                format!("unsupported video codec: {other}"),
+            ));
+        }
     };
     let support = video_encode_capability(codec, profile, hardware);
     Ok(support.is_supported())
@@ -2609,11 +2622,17 @@ mod tests {
                 .expect("encoding an HEVC frame through WebCodecs must succeed");
         }
         let mut output = output;
-        let blob: Blob = JsFuture::from(output.finish()).await.unwrap().unchecked_into();
-        let bytes = Uint8Array::new(&JsFuture::from(blob.array_buffer()).await.unwrap()).to_vec();
-        let demuxer = crate::Mp4Demuxer::open(&MemorySource::new(bytes), crate::Mp4DemuxerOptions::default())
+        let blob: Blob = JsFuture::from(output.finish())
             .await
-            .expect("the browser-encoded output must be a parseable MP4");
+            .unwrap()
+            .unchecked_into();
+        let bytes = Uint8Array::new(&JsFuture::from(blob.array_buffer()).await.unwrap()).to_vec();
+        let demuxer = crate::Mp4Demuxer::open(
+            &MemorySource::new(bytes),
+            crate::Mp4DemuxerOptions::default(),
+        )
+        .await
+        .expect("the browser-encoded output must be a parseable MP4");
         assert_eq!(demuxer.tracks.len(), 1);
         assert_eq!(demuxer.tracks[0].codec, Codec::Hevc);
         assert_eq!(demuxer.tracks[0].samples.len(), 3);
