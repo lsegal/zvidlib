@@ -10,7 +10,7 @@
 //! ([`crate::WasmMediaOutput`]) instead buffer chunks from this session and
 //! build the MP4 track configuration once that first chunk arrives.
 //!
-//! Scope for this initial bridge: AV1 Main profile video output, accepting
+//! Scope for this initial bridge: AV1 Main and HEVC Main profile output from
 //! RGBA8, BGRA8, and YUV 4:2:0 planar 8-bit input frames, and AAC-LC audio
 //! output from interleaved f32 PCM. Broader video codec and pixel-format
 //! coverage is tracked as follow-up work.
@@ -33,17 +33,17 @@ use web_sys::{
     AudioData as JsAudioData, AudioDataInit, AudioEncoder as JsAudioEncoder,
     AudioEncoderConfig as JsAudioEncoderConfig, AudioEncoderInit, AudioSampleFormat,
     EncodedAudioChunk, EncodedAudioChunkMetadata, EncodedAudioChunkType, EncodedVideoChunk,
-    PlaneLayout, VideoEncoder as JsVideoEncoder, VideoEncoderConfig as JsVideoEncoderConfig,
-    VideoEncoderEncodeOptions, VideoEncoderInit, VideoFrame as JsVideoFrame, VideoFrameBufferInit,
-    VideoPixelFormat,
+    EncodedVideoChunkMetadata, PlaneLayout, VideoEncoder as JsVideoEncoder,
+    VideoEncoderConfig as JsVideoEncoderConfig, VideoEncoderEncodeOptions, VideoEncoderInit,
+    VideoEncoderSupport, VideoFrame as JsVideoFrame, VideoFrameBufferInit, VideoPixelFormat,
 };
 
 /// One encoded output from a [`WebVideoEncodeSession`].
 pub struct WebEncodedVideoChunk {
     pub data: Vec<u8>,
     pub is_sync: bool,
-    /// Complete `av1C` configuration box (size + fourcc + payload), present
-    /// only on the first chunk a session ever emits.
+    /// Complete `av1C`/`hvcC` configuration box (size + fourcc + payload),
+    /// present only on the first chunk a session ever emits.
     pub decoder_config: Option<Vec<u8>>,
 }
 
@@ -61,7 +61,11 @@ pub fn video_encode_capability(
     profile: CodecProfile,
     hardware: HardwarePreference,
 ) -> CodecSupport {
-    if codec != Codec::Av1 || profile != CodecProfile::Av1Main {
+    let supported = matches!(
+        (codec, profile),
+        (Codec::Av1, CodecProfile::Av1Main) | (Codec::Hevc, CodecProfile::HevcMain)
+    );
+    if !supported {
         return CodecSupport::UnsupportedProfile;
     }
     if hardware == HardwarePreference::Require {
@@ -81,13 +85,14 @@ pub fn video_encode_capability(
     }
 }
 
-/// A lazily-driven `WebCodecs` encode session producing AV1 Main chunks from
-/// RGBA8 frames.
+/// A lazily-driven `WebCodecs` encode session producing AV1 Main or HEVC Main
+/// chunks from RGBA8 frames.
 pub struct WebVideoEncodeSession {
     encoder: JsVideoEncoder,
+    codec: Codec,
     width: u32,
     height: u32,
-    pending_chunks: Rc<RefCell<VecDeque<EncodedVideoChunk>>>,
+    pending_chunks: Rc<RefCell<VecDeque<(EncodedVideoChunk, JsValue)>>>,
     encode_error: Rc<RefCell<Option<String>>>,
     waker: Rc<RefCell<Option<js_sys::Function>>>,
     emitted_config: bool,
@@ -98,22 +103,65 @@ pub struct WebVideoEncodeSession {
 }
 
 impl WebVideoEncodeSession {
-    /// Opens a session targeting AV1 Main at `width`x`height`, timestamps and
-    /// durations given in microseconds.
-    pub fn open(width: u32, height: u32, bitrate_bits_per_second: Option<u32>) -> Result<Self> {
-        let pending_chunks: Rc<RefCell<VecDeque<EncodedVideoChunk>>> =
+    /// Opens a session targeting `codec` (AV1 Main or HEVC Main) at
+    /// `width`x`height`, timestamps and durations given in microseconds.
+    pub async fn open(
+        codec: Codec,
+        width: u32,
+        height: u32,
+        bitrate_bits_per_second: Option<u32>,
+    ) -> Result<Self> {
+        let initial_codec_string = match codec {
+            Codec::Av1 => "av01.0.00M.08",
+            // Main profile, tier L, level 3.1, no constraint flags. Only a
+            // starting point for `configure()`: like AV1, the real profile
+            // and level are read back from what the encoder actually emits.
+            Codec::Hevc => "hev1.1.6.L93.B0",
+            Codec::UncompressedVideo | Codec::Aac => {
+                return Err(Error::new(
+                    ErrorKind::Unsupported,
+                    "the WebCodecs video encoder bridge only supports AV1 and HEVC",
+                ));
+            }
+        };
+
+        let config = JsVideoEncoderConfig::new(initial_codec_string, height, width);
+        if let Some(bitrate) = bitrate_bits_per_second {
+            config.set_bitrate(bitrate);
+        }
+
+        // `configure()` only ever synchronously validates the shape of the
+        // config; a codec/profile the browser cannot actually encode is
+        // reported asynchronously by closing the encoder and invoking the
+        // error callback. Checking `isConfigSupported()` first means an
+        // unsupported codec (e.g. no HEVC software encoder) surfaces here as
+        // a normal error rather than as a "closed codec" failure on the
+        // first `encode()` call.
+        let support: VideoEncoderSupport =
+            JsFuture::from(js_to_promise(JsVideoEncoder::is_config_supported(&config)))
+                .await
+                .map_err(|error| normalize_js_error(error, "querying WebCodecs encoder support"))?
+                .unchecked_into();
+        if !support.get_supported().unwrap_or(false) {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                format!("this browser cannot encode {initial_codec_string} via WebCodecs"),
+            ));
+        }
+
+        let pending_chunks: Rc<RefCell<VecDeque<(EncodedVideoChunk, JsValue)>>> =
             Rc::new(RefCell::new(VecDeque::new()));
         let encode_error: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
         let waker: Rc<RefCell<Option<js_sys::Function>>> = Rc::new(RefCell::new(None));
 
         let output_chunks = Rc::clone(&pending_chunks);
         let output_waker = Rc::clone(&waker);
-        // The second callback argument (`EncodedVideoChunkMetadata`) is not
-        // used: AV1's sequence header travels in-band in the chunk's own
-        // bytes rather than in `metadata.decoderConfig.description` (see
-        // `av1c_from_bitstream`), so only the chunk itself is kept.
-        let output_closure = Closure::new(move |chunk: EncodedVideoChunk, _metadata: JsValue| {
-            output_chunks.borrow_mut().push_back(chunk);
+        // AV1's sequence header travels in-band in the chunk's own bytes
+        // (see `av1c_from_bitstream`), but HEVC's parameter sets are
+        // genuinely out-of-band, so `metadata` is kept alongside the chunk
+        // for `take_ready_chunk` to read `decoderConfig.description` from.
+        let output_closure = Closure::new(move |chunk: EncodedVideoChunk, metadata: JsValue| {
+            output_chunks.borrow_mut().push_back((chunk, metadata));
             if let Some(resolve) = output_waker.borrow_mut().take() {
                 let _ = resolve.call0(&JsValue::NULL);
             }
@@ -138,16 +186,13 @@ impl WebVideoEncodeSession {
         let encoder = JsVideoEncoder::new(&init)
             .map_err(|error| normalize_js_error(error, "constructing a WebCodecs VideoEncoder"))?;
 
-        let config = JsVideoEncoderConfig::new("av01.0.00M.08", height, width);
-        if let Some(bitrate) = bitrate_bits_per_second {
-            config.set_bitrate(bitrate);
-        }
         encoder
             .configure(&config)
             .map_err(|error| normalize_js_error(error, "configuring the WebCodecs VideoEncoder"))?;
 
         Ok(Self {
             encoder,
+            codec,
             width,
             height,
             pending_chunks,
@@ -245,7 +290,7 @@ impl WebVideoEncodeSession {
     }
 
     fn take_ready_chunk(&mut self) -> Result<Option<WebEncodedVideoChunk>> {
-        let Some(chunk) = self.pending_chunks.borrow_mut().pop_front() else {
+        let Some((chunk, metadata)) = self.pending_chunks.borrow_mut().pop_front() else {
             return Ok(None);
         };
         let destination = js_sys::Uint8Array::new_with_length(chunk.byte_length());
@@ -255,13 +300,17 @@ impl WebVideoEncodeSession {
         let data = destination.to_vec();
         let is_sync = chunk.type_() == web_sys::EncodedVideoChunkType::Key;
 
-        // AV1's sequence header travels in-band in the bitstream rather than
-        // through `EncodedVideoChunkMetadata.decoderConfig.description`
-        // (that field is for codecs like AVC/HEVC whose parameter sets are
-        // genuinely out-of-band), so the real `av1C` is derived from the key
-        // chunk's own bytes instead of from chunk metadata.
+        // AV1's sequence header travels in-band in the bitstream, so the
+        // real `av1C` is derived from the key chunk's own bytes. HEVC's
+        // parameter sets are genuinely out-of-band, so its `hvcC` is instead
+        // read from `EncodedVideoChunkMetadata.decoderConfig.description`.
         let decoder_config = if !self.emitted_config && is_sync {
-            av1c_from_bitstream(&data).inspect(|_| {
+            let config = match self.codec {
+                Codec::Av1 => av1c_from_bitstream(&data),
+                Codec::Hevc => hvcc_from_metadata(&metadata),
+                Codec::UncompressedVideo | Codec::Aac => None,
+            };
+            config.inspect(|_| {
                 self.emitted_config = true;
             })
         } else {
@@ -724,6 +773,22 @@ fn av1c_from_bitstream(data: &[u8]) -> Option<Vec<u8>> {
     payload.push(0); // no initial presentation delay
     payload.extend_from_slice(sequence_header_obu);
     Some(wrap_box(b"av1C", &payload))
+}
+
+/// Builds a complete `hvcC` box from a key chunk's `EncodedVideoChunkMetadata`.
+///
+/// Unlike AV1, `WebCodecs` gives HEVC's parameter sets to the caller
+/// out-of-band: the first key chunk's metadata carries a `decoderConfig`
+/// whose `description` is exactly the `HEVCDecoderConfigurationRecord`
+/// payload (see `codec_config::derive_codec_string`'s `hvcC` parse), so this
+/// wraps that payload with its box header rather than scanning the
+/// bitstream.
+fn hvcc_from_metadata(metadata: &JsValue) -> Option<Vec<u8>> {
+    let metadata: &EncodedVideoChunkMetadata = metadata.dyn_ref()?;
+    let decoder_config = metadata.get_decoder_config()?;
+    let description = decoder_config.get_description()?;
+    let bytes = js_sys::Uint8Array::new(&description).to_vec();
+    Some(wrap_box(b"hvcC", &bytes))
 }
 
 /// Scans a raw "low overhead bitstream format" OBU stream (AV1 §5.2) for its
