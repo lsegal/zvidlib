@@ -11,7 +11,7 @@ use zvidlib::io::MemorySink;
 use zvidlib::mp4::{Mp4Muxer, Mp4TrackConfig, Mp4TrackFormat};
 use zvidlib::{
     Codec, CodecProfile, ColorRange, CpuFrameSource, FrameIndex, FrameSource, HardwarePreference,
-    Limits, Orientation, PixelFormat, Plane, VideoDimensions, VideoEncoder, VideoEncoderConfig,
+    Limits, Orientation, PixelFormat, Plane, VideoDimensions, VideoEncoderConfig,
     VideoEncoderFactory, VideoFrame, native_av1_video_encoder_factory,
 };
 
@@ -28,9 +28,7 @@ fn block_on<T>(future: impl Future<Output = T>) -> T {
 
 fn frame(dimensions: VideoDimensions, index: u64, limits: &Limits) -> VideoFrame {
     let pixels = (0..dimensions.height)
-        .flat_map(|y| {
-            (0..dimensions.width).map(move |x| ((x + y + index as u32 * 5) % 256) as u8)
-        })
+        .flat_map(|y| (0..dimensions.width).map(move |x| ((x + y + index as u32 * 5) % 256) as u8))
         .collect();
     VideoFrame::new(
         dimensions,
@@ -50,7 +48,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .nth(1)
         .unwrap_or_else(|| "zvidlib-native-encode.mp4".to_owned());
     let limits = Limits::default();
-    let dimensions = VideoDimensions::new(320, 180, &limits)?;
+    // Keep the default quick enough to run interactively through the portable
+    // software encoder; callers can adapt the frame generator for production sizes.
+    let dimensions = VideoDimensions::new(96, 54, &limits)?;
     let configuration = VideoEncoderConfig {
         codec: Codec::Av1,
         profile: CodecProfile::Av1Main,
