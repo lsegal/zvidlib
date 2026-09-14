@@ -11,13 +11,18 @@
 //! build the MP4 track configuration once that first chunk arrives.
 //!
 //! Scope for this initial bridge: AV1 Main and HEVC Main profile output from
-//! RGBA8 input, and AAC-LC audio output from interleaved f32 PCM. Broader
-//! codec and pixel-format coverage is tracked as follow-up work.
+//! RGBA8, BGRA8, and YUV 4:2:0 planar 8-bit input frames, and AAC-LC audio
+//! output from interleaved f32 PCM. Broader video codec and pixel-format
+//! coverage is tracked as follow-up work.
 
 use crate::av1::{Av1Obu, Av1Parser};
 use crate::codec::{CodecImplementation, CodecSupport, SampleDependency};
+use crate::media::required_plane_layouts;
 use crate::web_decoder::{js_to_promise, normalize_js_error, schedule_event_loop_tick};
-use crate::{Codec, CodecProfile, Error, ErrorKind, HardwarePreference, Limits, Result};
+use crate::{
+    Codec, CodecProfile, Error, ErrorKind, HardwarePreference, Limits, PixelFormat, Result,
+    VideoFrame,
+};
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
@@ -31,6 +36,7 @@ use web_sys::{
     EncodedVideoChunkMetadata, VideoEncoder as JsVideoEncoder,
     VideoEncoderConfig as JsVideoEncoderConfig, VideoEncoderEncodeOptions, VideoEncoderInit,
     VideoEncoderSupport, VideoFrame as JsVideoFrame, VideoFrameBufferInit, VideoPixelFormat,
+    PlaneLayout,
 };
 
 /// One encoded output from a [`WebVideoEncodeSession`].
@@ -200,15 +206,18 @@ impl WebVideoEncodeSession {
         })
     }
 
-    /// Encodes one RGBA8, tightly-packed (`stride == width * 4`) frame and
-    /// returns the chunk it produces.
+    /// Encodes one input frame and returns the chunk it produces.
+    ///
+    /// `frame` must match the session's configured width/height and carry a
+    /// pixel format this bridge supports (RGBA8, BGRA8, or YUV 4:2:0 planar
+    /// 8-bit); see [`web_pixel_format`].
     ///
     /// Blocks until exactly one output chunk is available, which keeps
     /// ordering trivial: `WebCodecs` never reorders a video encoder's output
     /// relative to submission.
     pub async fn encode(
         &mut self,
-        rgba: &[u8],
+        frame: &VideoFrame,
         timestamp_micros: u64,
         duration_micros: u32,
         key_frame: bool,
@@ -219,32 +228,34 @@ impl WebVideoEncodeSession {
                 "the WebCodecs video encoder session has already finished",
             ));
         }
-        let required_len = (self.width as usize)
-            .checked_mul(self.height as usize)
-            .and_then(|pixels| pixels.checked_mul(4))
-            .ok_or_else(|| Error::new(ErrorKind::ResourceLimit, "video frame size overflow"))?;
-        if rgba.len() != required_len {
+        if frame.dimensions.width != self.width || frame.dimensions.height != self.height {
             return Err(Error::new(
                 ErrorKind::InvalidInput,
-                "RGBA frame data does not match the configured width/height",
+                "video frame dimensions do not match the configured width/height",
             ));
         }
+        let format = web_pixel_format(frame.pixel_format)?;
+        let (bytes, layout) = pack_planes_tightly(frame)?;
 
-        let data = js_sys::Uint8Array::from(rgba);
+        let data = js_sys::Uint8Array::from(bytes.as_slice());
         let init = VideoFrameBufferInit::new_with_f64(
             self.height,
             self.width,
-            VideoPixelFormat::Rgba,
+            format,
             timestamp_micros as f64,
         );
         init.set_duration_f64(f64::from(duration_micros));
-        let frame = JsVideoFrame::new_with_buffer_source_and_video_frame_buffer_init(&data, &init)
-            .map_err(|error| normalize_js_error(error, "constructing a VideoFrame"))?;
+        if let Some(layout) = layout.as_deref() {
+            init.set_layout(layout);
+        }
+        let js_frame =
+            JsVideoFrame::new_with_buffer_source_and_video_frame_buffer_init(&data, &init)
+                .map_err(|error| normalize_js_error(error, "constructing a VideoFrame"))?;
 
         let options = VideoEncoderEncodeOptions::new();
         options.set_key_frame(key_frame);
-        let result = self.encoder.encode_with_options(&frame, &options);
-        frame.close();
+        let result = self.encoder.encode_with_options(&js_frame, &options);
+        js_frame.close();
         result.map_err(|error| normalize_js_error(error, "encoding a video frame"))?;
 
         self.wait_for_chunk().await
@@ -330,6 +341,63 @@ impl Drop for WebVideoEncodeSession {
             let _ = self.encoder.close();
         }
     }
+}
+
+/// Maps a portable [`PixelFormat`] to the `WebCodecs` pixel format this
+/// bridge feeds it as.
+///
+/// Only formats `WebCodecs` accepts as a `VideoFrameBufferInit.format` and
+/// this bridge has been wired up for are supported; other formats are
+/// rejected rather than silently reinterpreted.
+fn web_pixel_format(pixel_format: PixelFormat) -> Result<VideoPixelFormat> {
+    match pixel_format {
+        PixelFormat::Rgba8 => Ok(VideoPixelFormat::Rgba),
+        PixelFormat::Bgra8 => Ok(VideoPixelFormat::Bgra),
+        PixelFormat::Yuv420p8 => Ok(VideoPixelFormat::I420),
+        PixelFormat::Rgb8 | PixelFormat::Gray8 => Err(Error::new(
+            ErrorKind::Unsupported,
+            "this pixel format is not supported by the WebCodecs export bridge",
+        )),
+    }
+}
+
+/// Packs `frame`'s planes into one contiguous, tightly-packed buffer for
+/// `VideoFrame`'s `BufferSource` constructor, plus an explicit `PlaneLayout`
+/// describing each plane's offset and stride when there is more than one
+/// plane (a single-plane buffer uses the format's own default layout).
+///
+/// A plane's own `stride` may be wider than its pixel data (e.g. row
+/// padding); this copies out just the pixel bytes of each row so the
+/// resulting buffer has no gaps `WebCodecs` would otherwise need a
+/// `PlaneLayout` to skip over.
+fn pack_planes_tightly(frame: &VideoFrame) -> Result<(Vec<u8>, Option<Vec<PlaneLayout>>)> {
+    let layouts = required_plane_layouts(frame.dimensions, frame.pixel_format)?;
+    let mut bytes = Vec::new();
+    let mut plane_layout = Vec::with_capacity(layouts.len());
+    for (plane, (row_bytes, rows)) in frame.planes.iter().zip(&layouts) {
+        let offset = u32::try_from(bytes.len())
+            .map_err(|_| Error::new(ErrorKind::ResourceLimit, "video plane offset overflow"))?;
+        for row in 0..*rows {
+            let start = row
+                .checked_mul(plane.stride)
+                .ok_or_else(|| Error::new(ErrorKind::ResourceLimit, "video plane row overflow"))?;
+            let end = start
+                .checked_add(*row_bytes)
+                .ok_or_else(|| Error::new(ErrorKind::ResourceLimit, "video plane row overflow"))?;
+            let row_data = plane.data.get(start..end).ok_or_else(|| {
+                Error::new(
+                    ErrorKind::InvalidInput,
+                    "a video plane is shorter than its stride and height",
+                )
+            })?;
+            bytes.extend_from_slice(row_data);
+        }
+        let stride = u32::try_from(*row_bytes)
+            .map_err(|_| Error::new(ErrorKind::ResourceLimit, "video row size overflow"))?;
+        plane_layout.push(PlaneLayout::new(offset, stride));
+    }
+    let layout = (layouts.len() > 1).then_some(plane_layout);
+    Ok((bytes, layout))
 }
 
 /// The dependency an encoded sample declares in the MP4 sample dependency

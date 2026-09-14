@@ -169,7 +169,7 @@ impl AudioBuffer {
     }
 }
 
-fn required_plane_layouts(
+pub(crate) fn required_plane_layouts(
     dimensions: VideoDimensions,
     pixel_format: PixelFormat,
 ) -> Result<Vec<(usize, usize)>> {
