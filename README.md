@@ -2,7 +2,7 @@
 
 zvidlib is a Rust library for frame-accurate video and synchronized audio I/O on native and WebAssembly targets. Its primary jobs are reading an MP4 into a GL/WebGL canvas and writing canvas frames plus an audio stream into an MP4, behind a small API centered on indexed `get` and `put` operations.
 
-> **Project status:** zvidlib is pre-1.0 and its API may still change before the first release. The portable foundation now includes checked timeline arithmetic, validated media buffers, asynchronous byte I/O, CPU/GL/WebGL transfer contracts, bounded ordinary/fragmented MP4 sample indexing, normalized codec factories, bounded exact-frame video decoding, exact AAC sample reads, audio-clock playback control and adapter contracts, encoder contracts, strict indexed output, seekable MP4 muxing, and the browser WebAssembly boundary. The generated JavaScript package includes BigInt-safe values, stable errors, Blob/stream input, Blob output, session/stream/playback handles, real HEVC/AV1 video decode through the browser's native `WebCodecs` `VideoDecoder`, and AAC packet/config exports for browser `AudioDecoder` playback. Native builds include HEVC Main and AV1 Main decoders and encoders (`native_hevc_video_decoder_factory`, `native_hevc_video_encoder_factory`, `native_av1_video_decoder_factory`, `native_av1_video_encoder_factory`), plus AAC-LC decode and default-device PCM output for synchronized playback; HEVC decode uses NVIDIA NVDEC on supported 64-bit Windows/Linux systems, a D3D11-aware Media Foundation decoder on Windows, or VideoToolbox on macOS, and otherwise retains the dependency-free pure-Rust fallback. Color AV1 encoding beyond the monochrome profile and fully portable audio-device abstractions remain planned; a portable, trait-implementing audio *encoder* is not -- see the writer-core notes under [Planned API examples](#planned-api-examples) for why the crate ships no `AudioEncoder` implementation, and [Implemented browser boundary](#implemented-browser-boundary) for the browser's own `WebCodecs`-backed AAC-LC encode bridge, which does not implement that trait. The complete workflow interfaces below remain intentionally aspirational and may change before the first release.
+> **Project status:** zvidlib is pre-1.0 and its API may still change in a future minor release. The portable foundation now includes checked timeline arithmetic, validated media buffers, asynchronous byte I/O, CPU/GL/WebGL transfer contracts, bounded ordinary/fragmented MP4 sample indexing, normalized codec factories, bounded exact-frame video decoding, exact AAC sample reads, audio-clock playback control and adapter contracts, encoder contracts, strict indexed output, seekable MP4 muxing, and the browser WebAssembly boundary. The generated JavaScript package includes BigInt-safe values, stable errors, Blob/stream input, Blob output, session/stream/playback handles, real HEVC/AV1 video decode through the browser's native `WebCodecs` `VideoDecoder`, and AAC packet/config exports for browser `AudioDecoder` playback. Native builds include HEVC Main and AV1 Main decoders and encoders (`native_hevc_video_decoder_factory`, `native_hevc_video_encoder_factory`, `native_av1_video_decoder_factory`, `native_av1_video_encoder_factory`), plus AAC-LC decode and default-device PCM output for synchronized playback; HEVC decode uses NVIDIA NVDEC on supported 64-bit Windows/Linux systems, a D3D11-aware Media Foundation decoder on Windows, or VideoToolbox on macOS, and otherwise retains the dependency-free pure-Rust fallback. Color AV1 encoding beyond the monochrome profile and fully portable audio-device abstractions remain planned; a portable, trait-implementing audio *encoder* is not -- see the writer-core notes under [Planned API examples](#planned-api-examples) for why the crate ships no `AudioEncoder` implementation, and [Implemented browser boundary](#implemented-browser-boundary) for the browser's own `WebCodecs`-backed AAC-LC encode bridge, which does not implement that trait. The complete workflow interfaces below remain intentionally aspirational.
 
 ## Documentation
 
@@ -311,6 +311,35 @@ Codec and hardware availability varies by browser and operating system. Opening 
 ## Repository layout
 
 The repository contains a dependency-free portable core that validates native and WASM build configuration and implements the foundational timeline, media, I/O, frame-transfer, bounded MP4 reading, codec factory, exact-frame decoding, encoder, indexed-output, and seekable MP4 writing layers. Planned modules and dependency boundaries are described in [ARCHITECTURE.md](ARCHITECTURE.md). Runtime dependencies will be added only with a documented portability, maintenance, size, and licensing rationale.
+
+## Using a release
+
+Each GitHub release is a paired crates.io and browser package release. For zvidlib 0.1.0, use the
+published crate version:
+
+```toml
+[dependencies]
+zvidlib = "0.1.0"
+```
+
+Cargo resolves the published source itself; applications do not need to clone or vendor zvidlib.
+The native API is supported on the Rust version recorded in `rust-toolchain.toml`; platform codec
+adapters retain their documented platform capability checks.
+
+For a browser build, install the matching release asset directly:
+
+```sh
+npm install https://github.com/lsegal/zvidlib/releases/download/v0.1.0/zvidlib-web-v0.1.0.tgz
+```
+
+The package contains `zvidlib.js`, `zvidlib.d.ts`, and `zvidlib_bg.wasm` generated by
+`wasm-pack --target web`; import it as an ES module and initialize it once as shown below. Browser
+and Cargo consumers must use the same release version when they exchange media or API contracts.
+
+zvidlib follows pre-1.0 semantic versioning: patch releases preserve documented public API and
+behavior, while a minor release may make breaking API changes. Every release tag has matching
+crates.io metadata and browser artifact coordinates; release notes call out any platform
+capability change.
 
 ## Building the library
 

@@ -1,6 +1,6 @@
 [package]
 name = "zvidlib"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Frame-accurate video and audio I/O for native and WebAssembly applications"
@@ -8,7 +8,6 @@ repository = "https://github.com/lsegal/zvidlib"
 readme = "README.md"
 keywords = ["video", "audio", "webassembly", "webgl", "mp4"]
 categories = ["multimedia", "wasm"]
-publish = false
 
 [lib]
 crate-type = ["rlib", "cdylib"]
