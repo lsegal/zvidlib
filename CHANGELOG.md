@@ -4,6 +4,11 @@ All notable changes to zvidlib will be documented in this file.
 
 ## Unreleased
 
+- Add runnable native and browser MP4 encoding examples (issue #467). `cargo run --example
+  native_encode --features native -- output.mp4` produces a one-second AV1 MP4 without an external
+  encoder; `examples/web_encode/` builds a WebCodecs page that encodes the same length animated
+  video and includes synchronized AAC-LC audio whenever the browser supplies that encoder.
+
 - Accept `Bgra8` and `Yuv420p8` input frames in the browser `WebCodecs` export bridge, in addition to `Rgba8` (issue #476, a sub-issue of #473). `WasmVideoStream.put()` previously copied out only the input `VideoFrame`'s first plane and always encoded it as RGBA, so a caller with BGRA or planar YUV source data had to convert it to RGBA itself before every `put()` call. `WebVideoEncodeSession::encode` now takes the whole `VideoFrame` and maps its pixel format to the matching `WebCodecs` `VideoPixelFormat`; a `Yuv420p8` frame's three planes are packed into one buffer with an explicit `PlaneLayout` describing each plane's offset and stride, since `VideoFrameBufferInit` otherwise assumes a single tightly-packed plane. `VideoFrame.bgra8()` and `VideoFrame.yuv420p8()` join `VideoFrame.rgba()` as browser-facing constructors. `Rgb8` and `Gray8` remain unsupported by this bridge, since `WebCodecs` has no matching pixel format for them.
 
   `wasm-pack test --headless --chrome` gained `put_encodes_yuv420p8_through_webcodecs_into_a_playable_mp4`, following `put_encodes_through_webcodecs_into_a_playable_mp4`'s pattern of encoding a few frames and parsing the result back with `Mp4Demuxer`.

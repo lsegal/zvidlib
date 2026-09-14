@@ -30,6 +30,11 @@ name = "hevc_decode_profile"
 path = "examples/hevc_decode_profile.rs"
 required-features = ["native"]
 
+[[example]]
+name = "native_encode"
+path = "examples/native_encode.rs"
+required-features = ["native"]
+
 # Criterion drives its own harness (`harness = false`), so the bench targets must
 # not link libtest. Every codec group lives in this one target so the shared
 # `benches/support/` fixture cache is loaded and decoded once per process.

@@ -1,0 +1,16 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>zvidlib WebCodecs encoder example</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 2rem; max-width: 48rem; }
+  button { font: inherit; padding: .5rem .8rem; }
+  video { display: block; margin-top: 1rem; max-width: 100%; background: #111; }
+  #status { white-space: pre-wrap; }
+</style>
+<h1>zvidlib WebCodecs encoder example</h1>
+<p>Encodes a one-second animated gradient to MP4. When this browser exposes AAC-LC encoding, it also muxes a synchronized 440 Hz audio track.</p>
+<button id="encode" type="button">Encode MP4</button>
+<a id="download" hidden download="zvidlib-web-encode.mp4">Download MP4</a>
+<video id="preview" controls></video>
+<pre id="status">Loading WebAssembly…</pre>
+<script type="module" src="./main.js"></script>
