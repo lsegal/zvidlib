@@ -35,6 +35,7 @@ jobs:
       - name: Verify package version matches the release tag
         run: |
           test "${TAG#v}" = "$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          cargo metadata --no-deps --format-version 1 | jq -e '.packages[0] | (.license != null and .license != "") or (.license_file != null and .license_file != "")'
           test -n "$CARGO_REGISTRY_TOKEN"
         env:
           TAG: ${{ github.ref_name }}
@@ -47,6 +48,8 @@ jobs:
           wasm-pack build --release --target web --out-dir pkg --no-default-features --features web
           (cd pkg && npm pack --pack-destination ../release)
           mv release/zvidlib-*.tgz "release/zvidlib-web-${{ github.ref_name }}.tgz"
+          mv release "$RUNNER_TEMP/release"
+          rm -rf pkg
       - name: Publish the Rust crate
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
@@ -54,4 +57,4 @@ jobs:
       - name: Create the GitHub release with its assets
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${{ github.ref_name }}" release/* --verify-tag --title "zvidlib ${{ github.ref_name }}" --generate-notes
+        run: gh release create "${{ github.ref_name }}" "$RUNNER_TEMP"/release/* --verify-tag --title "zvidlib ${{ github.ref_name }}" --generate-notes
