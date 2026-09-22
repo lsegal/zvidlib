@@ -4,6 +4,8 @@ All notable changes to zvidlib will be documented in this file.
 
 ## Unreleased
 
+## 0.1.0 - 2026-09-22
+
 - Prepare the first consumable zvidlib release, versioned as 0.1.0 (issue #483). Native Cargo
   consumers can depend on `zvidlib = "0.1.0"` from crates.io and browser consumers can install the
   paired `zvidlib-web-v0.1.0.tgz` GitHub Release asset; the README documents both coordinates and
