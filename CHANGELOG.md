@@ -4,6 +4,13 @@ All notable changes to zvidlib will be documented in this file.
 
 ## Unreleased
 
+## 0.1.0 - 2026-09-22
+
+- Prepare the first consumable zvidlib release, versioned as 0.1.0 (issue #483). Native Cargo
+  consumers can depend on `zvidlib = "0.1.0"` from crates.io and browser consumers can install the
+  paired `zvidlib-web-v0.1.0.tgz` GitHub Release asset; the README documents both coordinates and
+  the pre-1.0 compatibility policy.
+
 - Add runnable native and browser MP4 encoding examples (issue #467). `cargo run --example
   native_encode --features native -- output.mp4` produces a one-second AV1 MP4 without an external
   encoder; `examples/web_encode/` builds a WebCodecs page that encodes the same length animated
