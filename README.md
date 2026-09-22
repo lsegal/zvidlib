@@ -323,7 +323,7 @@ zvidlib = "0.1.0"
 ```
 
 Cargo resolves the published source itself; applications do not need to clone or vendor zvidlib.
-The native API is supported on the Rust version recorded in `rust-toolchain.toml`; platform codec
+The native API requires Rust 1.85 or later, as recorded by `rust-version` in `Cargo.toml`; platform codec
 adapters retain their documented platform capability checks.
 
 For a browser build, install the matching release asset directly:

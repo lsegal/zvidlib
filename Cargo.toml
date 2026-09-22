@@ -8,6 +8,9 @@ repository = "https://github.com/lsegal/zvidlib"
 readme = "README.md"
 keywords = ["video", "audio", "webassembly", "webgl", "mp4"]
 categories = ["multimedia", "wasm"]
+# Integration fixtures and browser demo videos are not needed to build the
+# published crate. Keep the MP4 sample used by the library's inline tests.
+exclude = ["/tests", "/examples/media/BigBuckBunny.av1.mp4", "/examples/web_canvas/*.mp4"]
 
 [lib]
 crate-type = ["rlib", "cdylib"]
