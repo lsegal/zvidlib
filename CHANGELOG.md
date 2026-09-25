@@ -4,6 +4,8 @@ All notable changes to zvidlib will be documented in this file.
 
 ## Unreleased
 
+- Add hardware HEVC Main encoding on Windows through Media Foundation (issue #487). `native_hevc_video_encoder_factory()` now routes `HardwarePreference::Prefer` and `Require` target-bitrate configurations to the GPU vendor's hardware encoder (NVENC, Quick Sync, or AMF). `Prefer` falls back to Microsoft's software HEVC encoder and then to the native one, while `Require` reports `HardwareUnavailable`; `Avoid` is unchanged. The encoder runs at a constant frame rate with the requested bitrate and keyframe interval, no B-frames and low latency, takes limited-range `Rgba8`, `Bgra8` or `Yuv420p8` frames (RGB is converted on the GPU where the encoder accepts it), and emits length-prefixed samples with an `hvcC` that `Mp4Muxer`, zvidlib's decoder and ffmpeg all read. A target-bitrate configuration may now append four big-endian bytes giving the keyframe interval in frames. `finish()` drains the encoder, dropping a pending `encode()` or `finish()` cancels the stream, and a lost GPU device is reported as `ErrorKind::Graphics`. The new `VideoEncoder::implementation()` and `VideoEncoder::backend_name()` report which encoder was created. On an RTX 4080, 1080p RGBA encodes at about 140 fps, 4.7x real time.
+
 ## 0.1.1 - 2026-09-22
 
 - Use 0.1.1 for the first published release. The earlier 0.1.0 tag did not produce a GitHub

@@ -537,6 +537,14 @@ jobs:
         run: cargo test --features native --lib
       - name: Test accelerated HEVC selection and correctness
         run: cargo test --features native --test native_hevc_hardware -- --nocapture
+      # The encode direction (#487): which encoder `Prefer` and `Require`
+      # select, and on a host with a hardware encoder an MP4 that zvidlib and
+      # ffmpeg both decode. Hosted runners have no GPU encoder, so the hardware
+      # cases skip there and the preference answers are what is checked; the
+      # Media Foundation backend's unit tests in `--lib` above still cover
+      # Microsoft's software encoder on any runner that has it installed.
+      - name: Test platform HEVC encoder selection and output
+        run: cargo test --features native --test native_hevc_encoder -- --nocapture
       - name: Test AV1 SIMD motion compensation
         run: cargo test --features native --lib av1_mc -- --nocapture
       # `--release` is the profile #327 was reported against: nothing about the
