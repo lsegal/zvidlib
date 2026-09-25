@@ -1256,7 +1256,7 @@ impl MfHevcEncoder {
     }
 
     /// Converts a source frame to the layout the MFT was given.
-    fn payload(&self, source: FrameSource<'_>) -> Result<Vec<u8>> {
+    fn payload(feed: Feed, settings: &Settings, source: FrameSource<'_>) -> Result<Vec<u8>> {
         let FrameSource::Cpu(source) = source else {
             return Err(Error::new(
                 ErrorKind::Unsupported,
@@ -1264,10 +1264,10 @@ impl MfHevcEncoder {
             ));
         };
         let frame = source.frame;
-        let (width, height) = (self.settings.width, self.settings.height);
+        let (width, height) = (settings.width, settings.height);
         if frame.dimensions.width != width
             || frame.dimensions.height != height
-            || frame.pixel_format != self.settings.input_format
+            || frame.pixel_format != settings.input_format
             || frame.color_range != ColorRange::Limited
         {
             return Err(Error::new(
@@ -1287,12 +1287,8 @@ impl MfHevcEncoder {
             let plane = &frame.planes[plane];
             &plane.data[y * plane.stride..][..bytes]
         };
-        let mut out = vec![
-            0;
-            self.feed
-                .frame_len(self.settings.width, self.settings.height)
-        ];
-        match (self.feed, frame.pixel_format) {
+        let mut out = vec![0; feed.frame_len(settings.width, settings.height)];
+        match (feed, frame.pixel_format) {
             (Feed::Argb32, PixelFormat::Bgra8) => {
                 for (y, dst) in out.chunks_exact_mut(width * 4).enumerate() {
                     dst.copy_from_slice(row(0, y, width * 4));
@@ -1396,7 +1392,7 @@ impl VideoEncoder for MfHevcEncoder {
                     "HEVC encoder frame indexes must be consecutive and start at zero",
                 ));
             }
-            self.payload(source)
+            Self::payload(self.feed, &self.settings, source)
         });
         match prepared {
             Ok(payload) => {
@@ -1838,6 +1834,110 @@ mod tests {
         })
         .unwrap();
         eprintln!("compared {checked} encoder(s)");
+    }
+
+    /// `frame` with each plane's rows reversed, or padded to a wider stride.
+    fn relaid(frame: &VideoFrame, flip: bool, padding: usize) -> VideoFrame {
+        let planes = frame
+            .planes
+            .iter()
+            .enumerate()
+            .map(|(index, plane)| {
+                let bytes = if frame.pixel_format == PixelFormat::Yuv420p8 {
+                    frame.dimensions.width as usize / if index == 0 { 1 } else { 2 }
+                } else {
+                    frame.dimensions.width as usize * 4
+                };
+                let mut rows: Vec<&[u8]> = plane.data.chunks_exact(plane.stride).collect();
+                if flip {
+                    rows.reverse();
+                }
+                let stride = bytes + padding;
+                let mut data = Vec::with_capacity(rows.len() * stride);
+                for row in rows {
+                    data.extend_from_slice(&row[..bytes]);
+                    data.resize(data.len() + padding, 0xa5);
+                }
+                Plane { data, stride }
+            })
+            .collect();
+        VideoFrame::new(
+            frame.dimensions,
+            frame.pixel_format,
+            frame.color_range,
+            planes,
+            &Limits::default(),
+        )
+        .unwrap()
+    }
+
+    /// The per-frame conversion on the caller's thread, which runs on every
+    /// Windows host whether or not it has an encoder: orientation and stride
+    /// never change the bytes handed over, and every input format of one
+    /// picture arrives as the same NV12 - which also pins the BGRA swizzle
+    /// and the chroma interleave against the native encoder's own kernels.
+    #[test]
+    fn every_input_layout_converts_to_the_same_encoder_input() {
+        let convert = |feed, format, frame: &VideoFrame, orientation| {
+            let settings = round_trip_settings(format);
+            MfHevcEncoder::payload(
+                feed,
+                &settings,
+                FrameSource::Cpu(CpuFrameSource { frame, orientation }),
+            )
+            .unwrap()
+        };
+        let mut by_feed: Vec<(Feed, Vec<u8>)> = Vec::new();
+        for (feed, format) in [
+            (Feed::Argb32, PixelFormat::Rgba8),
+            (Feed::Argb32, PixelFormat::Bgra8),
+            (Feed::Nv12, PixelFormat::Rgba8),
+            (Feed::Nv12, PixelFormat::Bgra8),
+            (Feed::Nv12, PixelFormat::Yuv420p8),
+        ] {
+            let source = frame(320, 240, 3, format);
+            let expected = convert(feed, format, &source, Orientation::TopLeft);
+            assert_eq!(expected.len(), feed.frame_len(320, 240));
+            let padded = relaid(&source, false, 12);
+            assert_eq!(
+                convert(feed, format, &padded, Orientation::TopLeft),
+                expected,
+                "{feed:?} from padded {format:?}"
+            );
+            let flipped = relaid(&source, true, 12);
+            assert_eq!(
+                convert(feed, format, &flipped, Orientation::BottomLeft),
+                expected,
+                "{feed:?} from bottom-up {format:?}"
+            );
+            match by_feed.iter().find(|(known, _)| *known == feed) {
+                Some((_, first)) => assert!(*first == expected, "{feed:?} from {format:?}"),
+                None => by_feed.push((feed, expected)),
+            }
+        }
+        // ARGB32 is BGRA in memory.
+        let rgba = frame(320, 240, 3, PixelFormat::Rgba8);
+        let bgra = frame(320, 240, 3, PixelFormat::Bgra8);
+        assert_eq!(
+            convert(
+                Feed::Argb32,
+                PixelFormat::Rgba8,
+                &rgba,
+                Orientation::TopLeft
+            ),
+            bgra.planes[0].data
+        );
+        // A frame that is not the configured format is refused, not converted.
+        let error = MfHevcEncoder::payload(
+            Feed::Nv12,
+            &round_trip_settings(PixelFormat::Rgba8),
+            FrameSource::Cpu(CpuFrameSource {
+                frame: &bgra,
+                orientation: Orientation::TopLeft,
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
     }
 
     fn settings(timescale: u32, frame_duration: u32) -> Settings {
