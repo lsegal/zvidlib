@@ -25,6 +25,8 @@ mod parameter_sets;
 pub mod readback;
 #[cfg(target_os = "macos")]
 mod videotoolbox;
+#[cfg(target_os = "macos")]
+mod videotoolbox_encoder;
 #[cfg(windows)]
 mod windows_mf;
 

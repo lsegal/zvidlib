@@ -75,8 +75,7 @@ impl ParameterSets {
                 "the HEVC encoder produced no video or picture parameter set",
             ));
         }
-        let unit =
-            nal_unit_from_coded(sps).map_err(|e| codec(format!("invalid HEVC SPS: {e}")))?;
+        let unit = nal_unit_from_coded(sps).map_err(|e| codec(format!("invalid HEVC SPS: {e}")))?;
         let parsed = SeqParameterSet::parse(&unit.rbsp)
             .map_err(|e| codec(format!("invalid HEVC SPS: {e:?}")))?;
         let rbsp = &unit.rbsp;
@@ -305,7 +304,10 @@ mod tests {
             encode_idr_pcm_au(&luma, &chroma, &chroma, width, height).unwrap()
         };
         let reference = parse_hvcc(&hvcc_box(&annexb).unwrap()[8..]).unwrap();
-        assert_eq!(record.general_profile_space, reference.general_profile_space);
+        assert_eq!(
+            record.general_profile_space,
+            reference.general_profile_space
+        );
         assert_eq!(record.general_tier_flag, reference.general_tier_flag);
         assert_eq!(
             record.general_profile_compatibility_flags,
