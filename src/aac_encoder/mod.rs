@@ -23,7 +23,7 @@ use crate::{
 };
 
 /// AAC-LC always encodes 1024 samples per frame.
-#[cfg(any(target_os = "macos", windows, test))]
+#[cfg(any(target_os = "macos", windows))]
 const FRAME_LENGTH: u32 = 1024;
 
 /// Returns the native AAC-LC encoder backend.
