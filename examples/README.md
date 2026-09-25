@@ -44,10 +44,10 @@ cargo run --example native_encode --features native -- output.mp4
 ffprobe output.mp4
 ```
 
-Native AAC remains platform-specific: the AudioToolbox adapter is available on macOS, while the
-portable native example intentionally remains video-only so it runs on every supported native
-target. `tests/native_aac_encoder.rs` demonstrates its synchronized audio+video `MediaOutput`
-path on macOS.
+Native AAC remains platform-specific: the AudioToolbox adapter is available on macOS and the Media
+Foundation adapter on Windows, while the portable native example intentionally remains video-only so
+it runs on every supported native target. `tests/native_aac_encoder.rs` demonstrates its
+synchronized audio+video `MediaOutput` path on macOS and Windows.
 
 ### Browser: `web_encode/`
 

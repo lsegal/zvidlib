@@ -552,9 +552,10 @@ jobs:
           cargo build --release --features native
           cargo test --release --features native --test macos_swift_runtime_rpath -- --nocapture
           cargo test --release --features native --lib
-      # `native_aac_encoder.rs` is macOS-only in its own right - AudioToolbox is the
-      # backend, not merely the fastest one for it - so this runs beside the rpath
-      # test above rather than in the cross-platform `rust` job.
-      - name: Test the native macOS AudioToolbox AAC encoder
-        if: runner.os == 'macOS'
+      # `native_aac_encoder.rs` needs a platform AAC encoder - AudioToolbox on
+      # macOS, Media Foundation on Windows, and none on Linux - so it runs here on
+      # every matrix host rather than in the Linux-only `rust` job. Its impulse
+      # tests are what hold each backend's reported priming and padding to the
+      # access units it actually emits (#488).
+      - name: Test the native AAC encoder
         run: cargo test --features native --test native_aac_encoder -- --nocapture

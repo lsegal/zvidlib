@@ -4,6 +4,9 @@ All notable changes to zvidlib will be documented in this file.
 
 ## Unreleased
 
+- Add a Windows Media Foundation backend for AAC-LC to `native_aac_audio_encoder_factory()` (issue #488). On Windows the factory now reports `Supported` instead of `HardwareUnavailable` and encodes 44.1 or 48 kHz mono or stereo audio through Microsoft's AAC encoder MFT, emitting raw AAC access units and a matching `esds`/`AudioSpecificConfig` for `Mp4Muxer`. Both backends now accept a target bit rate as four big-endian bytes of bits a second in `AudioEncoderConfig::configuration`, rounded to the nearest rate the platform encoder offers.
+- Fix the macOS AudioToolbox AAC encoder's gapless metadata (issue #488). `finish()` padded the input with silence instead of ending the stream, so the padding it reported did not match the packets it emitted and muxed tracks were trimmed at the wrong place. It now signals end of stream and measures padding from the emitted packets, so an impulse at one second decodes within 16 samples of where it was encoded after an MP4 round trip on both macOS and Windows, and callers never compute padding themselves.
+
 ## 0.1.1 - 2026-09-22
 
 - Use 0.1.1 for the first published release. The earlier 0.1.0 tag did not produce a GitHub

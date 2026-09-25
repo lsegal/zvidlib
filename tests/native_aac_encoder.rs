@@ -1,4 +1,4 @@
-#![cfg(target_os = "macos")]
+#![cfg(any(target_os = "macos", windows))]
 
 use std::f32::consts::PI;
 use std::future::Future;
@@ -6,7 +6,11 @@ use std::pin::Pin;
 use std::process::{Command, Stdio};
 use std::task::{Context, Poll, Waker};
 
-use zvidlib::io::MemorySink;
+use zvidlib::io::{MemorySink, MemorySource};
+use zvidlib::mp4::{Mp4Muxer, Mp4TrackConfig, Mp4TrackFormat};
+use zvidlib::{
+    AacSampleReader, CancellationToken, Mp4Demuxer, Mp4DemuxerOptions, NativeAacDecoder, TrackKind,
+};
 use zvidlib::{
     AudioBuffer, AudioEncoder, AudioEncoderConfig, AudioEncoderFactory, AudioEncoderFormat, Codec,
     CodecProfile, ColorRange, CpuFrameSource, EncodedSample, EncoderConfig, EncoderFuture,
@@ -103,7 +107,7 @@ fn sine_wave(range: SampleRange, sample_rate: u32, channels: u16, frequency: f32
 }
 
 /// Mux a few frames of synthesized video and a 440 Hz sine tone through
-/// [`MediaOutput`] with the native AudioToolbox AAC-LC encoder, and hand the
+/// [`MediaOutput`] with the native AAC-LC encoder, and hand the
 /// resulting MP4 to an independent ffmpeg to decode both tracks end to end -
 /// the audio counterpart to `native_av1_output_decodes_with_independent_ffmpeg`.
 #[test]
@@ -244,4 +248,148 @@ fn native_aac_output_decodes_with_independent_ffmpeg() {
         "independent ffmpeg decode failed: {}",
         String::from_utf8_lossy(&decode.stderr)
     );
+}
+
+/// Encodes `total_frames` of silence with a single full-scale-ish impulse at
+/// `impulse_frame` through the native AAC-LC encoder, muxes the access units
+/// and the encoder's own gapless metadata into an MP4, then demuxes and decodes
+/// it back through the MP4 edit list. Returns the decoded presentation length
+/// and the frame holding the loudest decoded sample.
+fn encode_impulse_and_find_it(
+    sample_rate: u32,
+    channels: u16,
+    total_frames: u64,
+    impulse_frame: u64,
+    configuration: Vec<u8>,
+) -> (u64, u64) {
+    let limits = Limits::default();
+    let audio_configuration = AudioEncoderConfig {
+        codec: Codec::Aac,
+        profile: CodecProfile::AacLowComplexity,
+        sample_rate,
+        channels,
+        timescale: sample_rate,
+        configuration,
+    };
+    let mut encoder = native_aac_audio_encoder_factory()
+        .create(&audio_configuration, &limits)
+        .unwrap();
+
+    // Deliberately not a multiple of the 1024-frame AAC frame, so buffers
+    // straddle access units and the stream ends on a partial frame.
+    let chunk = 1_000_u64;
+    let mut packets = Vec::new();
+    let mut start = 0;
+    while start < total_frames {
+        let end = (start + chunk).min(total_frames);
+        let range = SampleRange::new(start, end).unwrap();
+        let mut samples =
+            vec![0.0_f32; usize::try_from((end - start) * u64::from(channels)).unwrap()];
+        if (start..end).contains(&impulse_frame) {
+            let offset = usize::try_from(impulse_frame - start).unwrap() * usize::from(channels);
+            samples[offset..offset + usize::from(channels)].fill(0.9);
+        }
+        let buffer = AudioBuffer::new(range, sample_rate, channels, samples, &limits).unwrap();
+        packets.extend(block_on(encoder.encode(FrameIndex(start / chunk), buffer)).unwrap());
+        start = end;
+    }
+    let drain = block_on(encoder.finish()).unwrap();
+    packets.extend(drain.samples);
+    let encoded_frames = packets
+        .iter()
+        .map(|packet| u64::from(packet.duration))
+        .sum::<u64>();
+    assert_eq!(
+        encoded_frames,
+        u64::from(drain.gapless.priming) + total_frames + u64::from(drain.gapless.padding),
+        "the reported priming and padding must account for exactly the emitted access units"
+    );
+
+    let mut muxer = block_on(Mp4Muxer::new(
+        MemorySink::new(),
+        vec![Mp4TrackConfig {
+            encoder: encoder.config().clone(),
+            format: Mp4TrackFormat::Audio { channels },
+        }],
+        packets.len(),
+    ))
+    .unwrap();
+    for packet in packets {
+        block_on(muxer.write_sample(0, packet)).unwrap();
+    }
+    muxer.set_audio_gapless(0, drain.gapless).unwrap();
+    let bytes = block_on(muxer.finish()).unwrap().into_inner();
+
+    let source = MemorySource::new(bytes);
+    let movie = block_on(Mp4Demuxer::open(&source, Mp4DemuxerOptions::default())).unwrap();
+    let track = movie
+        .tracks
+        .iter()
+        .find(|track| track.kind == TrackKind::Audio)
+        .unwrap();
+    let config = track.aac_config().unwrap();
+    assert_eq!(config.sample_rate, sample_rate);
+    assert_eq!(config.channels, channels);
+    let timing = track.audio_timing(movie.movie_timescale).unwrap();
+    let encoded = block_on(track.to_encoded_audio_samples(&source, &limits)).unwrap();
+    let decoder = NativeAacDecoder::new(&config, limits).unwrap();
+    let mut reader =
+        AacSampleReader::new(decoder, encoded, sample_rate, channels, timing, 1, limits).unwrap();
+    let length = reader.presentation_length();
+    let decoded = reader
+        .get_range(
+            SampleRange::new(0, length).unwrap(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+    let loudest = decoded
+        .samples
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.abs().total_cmp(&b.abs()))
+        .map(|(index, _)| (index / usize::from(channels)) as u64)
+        .unwrap();
+    (length, loudest)
+}
+
+fn assert_impulse_round_trips(sample_rate: u32, channels: u16, configuration: Vec<u8>) {
+    // Two seconds with the impulse at one: well clear of both ends, so neither
+    // the encoder's priming nor its end padding can hide or clip it.
+    let total_frames = u64::from(sample_rate) * 2;
+    let impulse_frame = u64::from(sample_rate);
+    let (length, loudest) = encode_impulse_and_find_it(
+        sample_rate,
+        channels,
+        total_frames,
+        impulse_frame,
+        configuration,
+    );
+    assert_eq!(
+        length, total_frames,
+        "gapless trimming must present exactly the encoded input"
+    );
+    assert!(
+        loudest.abs_diff(impulse_frame) <= 16,
+        "an impulse at frame {impulse_frame} decoded at frame {loudest} \
+         ({sample_rate} Hz, {channels} channels)"
+    );
+}
+
+/// Issue #488's acceptance test: an impulse at one second decodes within 16
+/// samples of frame 48,000 after a round trip through the MP4 muxer and
+/// demuxer, which only holds if the encoder's reported priming is its real
+/// delay and its padding matches the access units it emitted.
+#[test]
+fn native_aac_impulse_survives_mux_and_demux_at_48k_stereo() {
+    assert_impulse_round_trips(48_000, 2, Vec::new());
+}
+
+#[test]
+fn native_aac_impulse_survives_mux_and_demux_at_44_1k_mono() {
+    assert_impulse_round_trips(44_100, 1, Vec::new());
+}
+
+#[test]
+fn native_aac_impulse_survives_mux_and_demux_at_a_requested_bit_rate() {
+    assert_impulse_round_trips(48_000, 2, 128_000_u32.to_be_bytes().to_vec());
 }

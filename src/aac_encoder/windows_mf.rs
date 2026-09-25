@@ -17,9 +17,9 @@ use windows::Win32::Media::MediaFoundation::{
     MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_VERSION, MFAudioFormat_AAC, MFAudioFormat_PCM,
     MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Audio, MFStartup,
     MFT_CATEGORY_AUDIO_ENCODER, MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_SYNCMFT,
-    MFT_MESSAGE_COMMAND_DRAIN, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
-    MFT_MESSAGE_NOTIFY_END_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
-    MFT_REGISTER_TYPE_INFO, MFTEnumEx,
+    MFT_MESSAGE_COMMAND_DRAIN, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
+    MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_END_STREAMING,
+    MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER, MFT_REGISTER_TYPE_INFO, MFTEnumEx,
 };
 use windows::Win32::System::Com::{CoIncrementMTAUsage, CoTaskMemFree};
 
@@ -45,14 +45,17 @@ const AAC_PROFILE_L2: u32 = 0x29;
 
 /// The MFT's encoder delay, in PCM frames, as a standard AAC decoder sees it.
 ///
-/// Unlike AudioToolbox, the MFT exposes no property for this and does not
-/// trim it from its output: the first access unit it emits starts at input
-/// frame zero, so a decoder's own one-frame MDCT overlap is the whole delay
-/// the track needs to cut. `tests/native_aac_encoder.rs` pins this with an
-/// impulse through a full mux and demux.
-const PRIMING_FRAMES: u32 = FRAME_LENGTH;
+/// The MFT exposes no property for this because it trims its own priming: it
+/// emits exactly one access unit per 1024 input frames, rounded up, and a
+/// decoder's output starts at input frame zero, so there is nothing ahead of
+/// the caller's audio for the track to cut. `tests/native_aac_encoder.rs` pins
+/// this with an impulse through a full mux and demux.
+const PRIMING_FRAMES: u32 = 0;
 
-pub(super) fn capability(configuration: &AudioEncoderConfig, bit_rate: Option<u32>) -> CodecSupport {
+pub(super) fn capability(
+    configuration: &AudioEncoderConfig,
+    bit_rate: Option<u32>,
+) -> CodecSupport {
     match open_transform(configuration, bit_rate) {
         Ok(_) => CodecSupport::Supported {
             implementation: CodecImplementation::Hardware,
@@ -104,8 +107,7 @@ fn ensure_media_foundation() -> Result<()> {
     static STARTED: OnceLock<std::result::Result<(), String>> = OnceLock::new();
     STARTED
         .get_or_init(|| unsafe {
-            CoIncrementMTAUsage()
-                .map_err(|error| format!("could not initialize COM: {error}"))?;
+            CoIncrementMTAUsage().map_err(|error| format!("could not initialize COM: {error}"))?;
             MFStartup(MF_VERSION, 0)
                 .map_err(|error| format!("could not initialize Media Foundation: {error}"))
         })
@@ -130,9 +132,9 @@ fn open_transform(
     let input = pcm_type(configuration)?;
     let output = aac_type(configuration, nearest_bytes_per_second(bit_rate))?;
     unsafe {
-        transform
-            .SetOutputType(0, &output, 0)
-            .map_err(|error| windows_error("the AAC encoder MFT rejected its output type", error))?;
+        transform.SetOutputType(0, &output, 0).map_err(|error| {
+            windows_error("the AAC encoder MFT rejected its output type", error)
+        })?;
         transform
             .SetInputType(0, &input, 0)
             .map_err(|error| windows_error("the AAC encoder MFT rejected its input type", error))?;
@@ -192,10 +194,7 @@ fn pcm_type(configuration: &AudioEncoderConfig) -> Result<IMFMediaType> {
                 media_type.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, configuration.sample_rate)
             })
             .and_then(|()| {
-                media_type.SetUINT32(
-                    &MF_MT_AUDIO_NUM_CHANNELS,
-                    u32::from(configuration.channels),
-                )
+                media_type.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, u32::from(configuration.channels))
             })
             .and_then(|()| media_type.SetUINT32(&MF_MT_AUDIO_BLOCK_ALIGNMENT, block_alignment))
             .and_then(|()| {
@@ -221,12 +220,11 @@ fn aac_type(configuration: &AudioEncoderConfig, bytes_per_second: u32) -> Result
                 media_type.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, configuration.sample_rate)
             })
             .and_then(|()| {
-                media_type.SetUINT32(
-                    &MF_MT_AUDIO_NUM_CHANNELS,
-                    u32::from(configuration.channels),
-                )
+                media_type.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, u32::from(configuration.channels))
             })
-            .and_then(|()| media_type.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, bytes_per_second))
+            .and_then(|()| {
+                media_type.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, bytes_per_second)
+            })
             // Payload type 0 is raw access units, which is what an MP4 sample
             // carries; the `AudioSpecificConfig` travels in the `esds` instead.
             .and_then(|()| media_type.SetUINT32(&MF_MT_AAC_PAYLOAD_TYPE, 0))
@@ -308,7 +306,8 @@ impl AacEncoder {
         let bytes = u32::try_from(samples.len() * 2)
             .map_err(|_| Error::new(ErrorKind::ResourceLimit, "audio buffer is too large"))?;
         let rate = i64::from(self.format.sample_rate);
-        let hundred_nanoseconds = |frames: u64| i64::try_from(frames).unwrap_or(i64::MAX) * 10_000_000 / rate;
+        let hundred_nanoseconds =
+            |frames: u64| i64::try_from(frames).unwrap_or(i64::MAX) * 10_000_000 / rate;
         unsafe {
             let buffer = MFCreateMemoryBuffer(bytes)
                 .map_err(|error| windows_error("could not allocate a PCM buffer", error))?;
@@ -384,8 +383,9 @@ impl AacEncoder {
             if packet.is_empty() {
                 continue;
             }
-            let dts = i64::try_from(self.encoded_position)
-                .map_err(|_| Error::new(ErrorKind::ResourceLimit, "AAC sample position overflowed"))?;
+            let dts = i64::try_from(self.encoded_position).map_err(|_| {
+                Error::new(ErrorKind::ResourceLimit, "AAC sample position overflowed")
+            })?;
             out.push(EncodedSample {
                 data: packet,
                 dts,
