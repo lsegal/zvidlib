@@ -15,6 +15,10 @@ mod encoder;
 pub(crate) mod engine;
 #[cfg(all(any(windows, target_os = "linux"), target_pointer_width = "64"))]
 mod nvdec;
+// Only the platform encoders frame their output through this; it is compiled everywhere so its
+// tests run everywhere.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod parameter_sets;
 // internal — exposed for the hardware benchmark suite; not part of the stable API
 #[cfg(not(target_arch = "wasm32"))]
 #[doc(hidden)]
