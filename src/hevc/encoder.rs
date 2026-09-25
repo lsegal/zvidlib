@@ -19,10 +19,16 @@ use crate::{
 
 /// Returns the HEVC Main encoder factory.
 ///
-/// `Avoid` always selects the dependency-free software encoder, whose
-/// operating points are described at [`parse_operating_point`]. `Prefer` and
-/// `Require` ask for a platform encoder, which serves the target-bitrate
-/// configurations: on Windows that is the GPU vendor's hardware Media
+/// [`VideoEncoderConfig::configuration`] selects the operating point: empty
+/// for lossless PCM, one `SliceQpY` byte in `0..=51` for a fixed quantizer, or
+/// four big-endian bytes of target bitrate in bits a second, optionally
+/// followed by four big-endian bytes of keyframe interval in frames (zero
+/// meaning one second).
+///
+/// `Avoid` always selects the dependency-free software encoder, which takes
+/// every operating point. `Prefer` and `Require` ask for a platform encoder,
+/// which serves the target-bitrate configurations: on Windows that is the GPU
+/// vendor's hardware Media
 /// Foundation encoder (NVENC, Quick Sync or AMF). `Prefer` falls back to
 /// Microsoft's software Media Foundation encoder and then to the native one;
 /// `Require` reports [`CodecSupport::HardwareUnavailable`] instead. Every

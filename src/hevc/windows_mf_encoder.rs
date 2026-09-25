@@ -231,13 +231,17 @@ pub(super) fn create(
     limits: &Limits,
 ) -> Result<Box<dyn VideoEncoder>> {
     let payload = u64::from(settings.width) * u64::from(settings.height) * 4;
-    if payload > limits.max_allocation_bytes {
+    if settings.width > limits.max_width
+        || settings.height > limits.max_height
+        || payload > limits.max_allocation_bytes
+    {
         return Err(Error::new(
             ErrorKind::ResourceLimit,
             "HEVC frame exceeds configured allocation limit",
         ));
     }
-    MfHevcEncoder::spawn(settings, class).map(|encoder| Box::new(encoder) as Box<dyn VideoEncoder>)
+    MfHevcEncoder::spawn(settings, class, *limits)
+        .map(|encoder| Box::new(encoder) as Box<dyn VideoEncoder>)
 }
 
 /// Runs `work` on a fresh thread with COM and Media Foundation started.
@@ -820,6 +824,7 @@ fn set(result: windows::core::Result<()>, what: &str) -> Result<()> {
 struct Core {
     mft: Mft,
     settings: Settings,
+    limits: Limits,
     /// The parameter sets the `hvcC` declares.
     declared: ParameterSets,
     /// Frames submitted, in order, not yet matched to an output.
@@ -834,7 +839,7 @@ struct Core {
 }
 
 impl Core {
-    fn open(settings: Settings, class: MftClass) -> Result<Self> {
+    fn open(settings: Settings, class: MftClass, limits: Limits) -> Result<Self> {
         let runtime = MfRuntime::start()?;
         let mut reasons = Vec::new();
         for activate in candidates(class)? {
@@ -844,6 +849,7 @@ impl Core {
                     return Ok(Self {
                         mft,
                         settings,
+                        limits,
                         declared,
                         pending: Default::default(),
                         last_emitted: None,
@@ -945,6 +951,12 @@ impl Core {
             if !self.declared.contains_all(&seen) {
                 return Err(codec(
                     "encoder changed its parameter sets mid-stream, which an hvc1 track cannot carry",
+                ));
+            }
+            if unit.data.len() as u64 > self.limits.max_allocation_bytes {
+                return Err(Error::new(
+                    ErrorKind::ResourceLimit,
+                    "HEVC access unit exceeds configured allocation limit",
                 ));
             }
             let index = self.output_index(output.time)?;
@@ -1165,14 +1177,14 @@ struct MfHevcEncoder {
 }
 
 impl MfHevcEncoder {
-    fn spawn(settings: Settings, class: MftClass) -> Result<Self> {
+    fn spawn(settings: Settings, class: MftClass, limits: Limits) -> Result<Self> {
         let (command_tx, command_rx) = channel();
         let (ready_tx, ready_rx) = sync_channel(1);
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);
         let worker = thread::Builder::new()
             .name("zvidlib-mf-hevc-encode".into())
-            .spawn(move || match Core::open(settings, class) {
+            .spawn(move || match Core::open(settings, class, limits) {
                 Ok(core) => {
                     let ready = (core.declared.hvcc(), core.mft.feed, core.mft.name.clone());
                     if ready_tx.send(Ok(ready)).is_ok() {
