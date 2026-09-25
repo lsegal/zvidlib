@@ -1,24 +1,44 @@
 //! Native AAC-LC encoding, delegating to a platform codec.
 //!
 //! zvidlib deliberately ships no AAC bitstream implementation of its own (see
-//! the reasoning on [`crate::AudioEncoder`]); this module is the first
-//! platform adapter that fills the seam, backed by macOS AudioToolbox. Other
-//! platforms report [`CodecSupport::HardwareUnavailable`] rather than falling
-//! back to a software encoder this crate does not carry.
+//! the reasoning on [`crate::AudioEncoder`]); this module fills the seam with
+//! platform adapters instead: macOS AudioToolbox and, on Windows, Microsoft's
+//! Media Foundation AAC encoder MFT. Other platforms report
+//! [`CodecSupport::HardwareUnavailable`] rather than falling back to a
+//! software encoder this crate does not carry.
+//!
+//! Both backends report their own encoder delay as
+//! [`crate::AudioGapless::priming`] and measure
+//! [`crate::AudioGapless::padding`] from the access units they actually
+//! emitted, so a muxed track trims to exactly the samples the caller encoded.
 
 #[cfg(target_os = "macos")]
 mod audiotoolbox;
+#[cfg(windows)]
+mod windows_mf;
 
 use crate::{
     AudioEncoder, AudioEncoderConfig, AudioEncoderFactory, Codec, CodecImplementation,
     CodecProfile, CodecSupport, Error, ErrorKind, Limits, Result,
 };
 
+/// AAC-LC always encodes 1024 samples per frame.
+#[cfg(any(target_os = "macos", windows, test))]
+const FRAME_LENGTH: u32 = 1024;
+
 /// Returns the native AAC-LC encoder backend.
 ///
-/// The only implementation in the tree is macOS AudioToolbox; every other
-/// target reports [`CodecSupport::HardwareUnavailable`] from `capability`,
-/// consistent with the crate carrying no software AAC encoder.
+/// macOS encodes through AudioToolbox and Windows through Media Foundation's
+/// AAC encoder MFT; every other target reports
+/// [`CodecSupport::HardwareUnavailable`] from `capability`, consistent with
+/// the crate carrying no software AAC encoder. The Media Foundation encoder
+/// accepts only 44.1 and 48 kHz input and reports other rates the same way.
+///
+/// [`AudioEncoderConfig::configuration`] is either empty, leaving the bit rate
+/// to the backend, or four big-endian bytes naming a nonzero target bit rate in
+/// bits a second, the same form the native HEVC encoder takes. Each backend
+/// rounds the request to the nearest rate it offers for the configured sample
+/// rate and channel count; Media Foundation's are 96, 128, 160 and 192 kb/s.
 pub fn native_aac_audio_encoder_factory() -> impl AudioEncoderFactory {
     AacEncoderFactory
 }
@@ -34,12 +54,18 @@ impl AudioEncoderFactory for AacEncoderFactory {
         {
             return unsupported;
         }
+        let bit_rate = parse_bit_rate(&configuration.configuration).flatten();
         #[cfg(target_os = "macos")]
         {
-            audiotoolbox::capability(configuration)
+            audiotoolbox::capability(configuration, bit_rate)
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(windows)]
         {
+            windows_mf::capability(configuration, bit_rate)
+        }
+        #[cfg(not(any(target_os = "macos", windows)))]
+        {
+            let _ = bit_rate;
             CodecSupport::HardwareUnavailable
         }
     }
@@ -68,16 +94,21 @@ impl AudioEncoderFactory for AacEncoderFactory {
             }
             CodecSupport::HardwareUnavailable => unreachable!("hardware is not checked here"),
         }
+        let bit_rate = parse_bit_rate(&configuration.configuration).flatten();
         #[cfg(target_os = "macos")]
         {
-            audiotoolbox::create(configuration, limits)
+            audiotoolbox::create(configuration, bit_rate, limits)
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(windows)]
         {
-            let _ = limits;
+            windows_mf::create(configuration, bit_rate, limits)
+        }
+        #[cfg(not(any(target_os = "macos", windows)))]
+        {
+            let _ = (bit_rate, limits);
             Err(Error::new(
                 ErrorKind::Unsupported,
-                "native AAC encoding is only available on macOS",
+                "native AAC encoding is only available on macOS and Windows",
             ))
         }
     }
@@ -90,9 +121,11 @@ fn capability_without_backend(configuration: &AudioEncoderConfig) -> CodecSuppor
     if configuration.profile != CodecProfile::AacLowComplexity {
         return CodecSupport::UnsupportedProfile;
     }
-    if !configuration.configuration.is_empty() {
+    if parse_bit_rate(&configuration.configuration).is_none() {
         return CodecSupport::InvalidConfiguration {
-            reason: "native AAC encoder configuration takes no extra configuration bytes".into(),
+            reason: "native AAC encoder configuration is either empty or four big-endian bytes \
+                     giving a nonzero target bit rate in bits a second"
+                .into(),
         };
     }
     if sampling_frequency_index(configuration.sample_rate).is_none() {
@@ -116,6 +149,42 @@ fn capability_without_backend(configuration: &AudioEncoderConfig) -> CodecSuppor
     CodecSupport::Supported {
         implementation: CodecImplementation::Hardware,
     }
+}
+
+/// Reads the backend-private configuration: `Some(None)` for an empty one
+/// (the backend's default bit rate), `Some(Some(bits_per_second))` for four
+/// big-endian bytes naming a nonzero rate, and `None` for anything else. Zero
+/// is rejected rather than read as "no target", as the HEVC encoder does.
+fn parse_bit_rate(configuration: &[u8]) -> Option<Option<u32>> {
+    match configuration {
+        [] => Some(None),
+        [a, b, c, d] => match u32::from_be_bytes([*a, *b, *c, *d]) {
+            0 => None,
+            bits_per_second => Some(Some(bits_per_second)),
+        },
+        _ => None,
+    }
+}
+
+/// The end padding of a stream whose emitted access units cover
+/// `encoded_frames` PCM frames, `priming` of them encoder delay ahead of the
+/// `input_frames` the caller supplied. An encoder that emitted too few frames
+/// to hold every input frame has lost audio, which is an error rather than a
+/// padding a caller could correct.
+#[cfg(any(target_os = "macos", windows, test))]
+fn gapless_padding(encoded_frames: u64, priming: u32, input_frames: u64) -> Result<u32> {
+    let presented = input_frames + u64::from(priming);
+    let padding = encoded_frames.checked_sub(presented).ok_or_else(|| {
+        Error::new(
+            ErrorKind::Codec,
+            format!(
+                "the AAC encoder emitted {encoded_frames} frames, fewer than the {presented} its \
+                 priming and input need"
+            ),
+        )
+    })?;
+    u32::try_from(padding)
+        .map_err(|_| Error::new(ErrorKind::ResourceLimit, "AAC padding exceeds u32"))
 }
 
 /// The MPEG-4 Audio `samplingFrequencyIndex` for one of the fixed rates the
@@ -145,7 +214,7 @@ fn sampling_frequency_index(sample_rate: u32) -> Option<u8> {
 /// `sample_rate`/`channels`: `audioObjectType(5)=2`, `samplingFrequencyIndex(4)`,
 /// `channelConfiguration(4)`, then `frameLengthFlag`, `dependsOnCoreCoder`, and
 /// `extensionFlag` all zero (1024-sample frames, no dependency, no extension).
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", windows, test))]
 fn audio_specific_config(sample_rate: u32, channels: u16) -> [u8; 2] {
     const AAC_LC: u8 = 2;
     let frequency_index =
@@ -163,7 +232,7 @@ fn audio_specific_config(sample_rate: u32, channels: u16) -> [u8; 2] {
 /// Writes an MPEG-4 descriptor length, big-endian base-128 with the
 /// continuation bit set on every byte but the last, as `esds` and its nested
 /// descriptors require.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", windows, test))]
 fn write_descriptor_length(out: &mut Vec<u8>, length: u32) {
     let mut chunks = [0_u8; 4];
     let mut remaining = length;
@@ -185,7 +254,7 @@ fn write_descriptor_length(out: &mut Vec<u8>, length: u32) {
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", windows, test))]
 fn write_descriptor(out: &mut Vec<u8>, tag: u8, content: &[u8]) {
     out.push(tag);
     write_descriptor_length(out, u32::try_from(content.len()).unwrap_or(u32::MAX));
@@ -196,7 +265,7 @@ fn write_descriptor(out: &mut Vec<u8>, tag: u8, content: &[u8]) {
 /// `ES_Descriptor` wrapping a `DecoderConfigDescriptor` (object type `0x40`,
 /// MPEG-4 audio stream type) whose `DecoderSpecificInfo` is the
 /// `AudioSpecificConfig`, followed by the file-format `SLConfigDescriptor`.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", windows, test))]
 fn esds_box(sample_rate: u32, channels: u16) -> Vec<u8> {
     let audio_specific_config = audio_specific_config(sample_rate, channels);
 
@@ -274,6 +343,25 @@ mod tests {
     }
 
     #[test]
+    fn configuration_is_empty_or_a_nonzero_big_endian_bit_rate() {
+        assert_eq!(parse_bit_rate(&[]), Some(None));
+        assert_eq!(
+            parse_bit_rate(&128_000_u32.to_be_bytes()),
+            Some(Some(128_000))
+        );
+        assert_eq!(parse_bit_rate(&0_u32.to_be_bytes()), None);
+        assert_eq!(parse_bit_rate(&[1, 2]), None);
+    }
+
+    #[test]
+    fn gapless_padding_is_what_the_emitted_frames_hold_past_priming_and_input() {
+        // 1024 priming + 48_000 input = 49_024 frames; 48 access units hold 49_152.
+        assert_eq!(gapless_padding(48 * 1024, 1024, 48_000).unwrap(), 128);
+        assert_eq!(gapless_padding(2 * 1024, 1024, 1024).unwrap(), 0);
+        assert!(gapless_padding(47 * 1024, 1024, 48_000).is_err());
+    }
+
+    #[test]
     fn capability_rejects_wrong_codec_profile_and_configuration() {
         let factory = native_aac_audio_encoder_factory();
         let base = AudioEncoderConfig {
@@ -300,6 +388,13 @@ mod tests {
 
         candidate = base.clone();
         candidate.configuration = vec![0];
+        assert!(matches!(
+            factory.capability(&candidate),
+            CodecSupport::InvalidConfiguration { .. }
+        ));
+
+        candidate = base.clone();
+        candidate.configuration = 0_u32.to_be_bytes().to_vec();
         assert!(matches!(
             factory.capability(&candidate),
             CodecSupport::InvalidConfiguration { .. }
