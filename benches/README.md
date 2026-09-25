@@ -12,7 +12,7 @@ zvidlib's benchmarks run under [criterion](https://docs.rs/criterion) with
 | `benches/audio_mux.rs` | the audio container path: MP4 muxing, sample-table growth, demux, and gapless timing |
 | `benches/hevc_encode.rs` | the pure-Rust HEVC encoder, whole-frame and per-stage |
 | `benches/hevc_decode.rs` | the HEVC software decoder: whole-frame decode and every hot stage, scalar versus SIMD |
-| `benches/hevc_hardware.rs` | the platform fixed-function HEVC decoders against the software one |
+| `benches/hevc_hardware.rs` | the platform fixed-function HEVC decoders against the software one, and the VideoToolbox HEVC encoder |
 | `benches/exact_seek.rs` | what an exact frame at an arbitrary point costs, by backend and by random-access cadence |
 
 Each target loads and decodes its fixtures once per process, so every iteration
@@ -37,7 +37,7 @@ cargo bench --bench audio_decode  # the audio decode path only
 cargo bench --bench audio_mux     # the audio container path only
 cargo bench --bench hevc_encode   # the HEVC encoder groups only
 cargo bench --bench hevc_decode   # the HEVC software decoder only
-cargo bench --bench hevc_hardware # the platform hardware HEVC decoders
+cargo bench --bench hevc_hardware # the platform hardware HEVC decoders and encoder
 cargo bench --bench exact_seek    # exact-seek cost by backend and cadence
 cargo bench --features simd       # the same groups, recorded under `simd=on`
 cargo bench --no-run              # compile only
@@ -3256,6 +3256,20 @@ session per iteration after the framework has already initialized. The single
 untimed pass printed above the criterion output reports the cold one, which
 includes one-time driver/framework initialization; a caller pays that once and
 the warm cost on every seek-driven reset.
+
+### Hardware encode
+
+`hevc_hardware_encode` is the encoder counterpart, and runs only where
+`native_hevc_video_encoder_factory` selects hardware for a `Require`
+configuration — today, VideoToolbox on a Mac with a hardware HEVC encoder;
+elsewhere it prints why it skipped. It encodes 30 frames of the synthetic 1080p
+RGBA8 sequence at 8 Mbit/s and 30 fps, split the same way as the decoder arms:
+`hardware/session_setup` times creation, including the black priming frame the
+encoder encodes to learn its parameter sets before the caller's first, and
+`hardware/steady_state` times every frame's copy and submission plus the final
+drain. The untimed pass above the criterion output prints the steady-state rate
+as a multiple of real time. There is no software arm: `hevc_encode` measures the
+software encoder, and a matching 1080p window there takes over a minute.
 
 ### Measured backends
 

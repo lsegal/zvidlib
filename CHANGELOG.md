@@ -4,6 +4,12 @@ All notable changes to zvidlib will be documented in this file.
 
 ## Unreleased
 
+- Add a hardware HEVC Main encoder on macOS through VideoToolbox, so zvidlib can encode 1080p30 in real time (issue #486). `native_hevc_video_encoder_factory()` was software-only: it answered `HardwarePreference::Require` with `HardwareUnavailable` and took seconds a frame at 1080p. It now honours `HardwarePreference`: `Require` uses a hardware-backed `VTCompressionSession` or reports why it cannot, `Prefer` uses one when the host has it and falls back to the software encoder otherwise, and `Avoid` stays on software; `capability()` reports `CodecImplementation::Hardware` when the hardware path is selected. The hardware encoder takes a target bitrate - the existing four-byte configuration, or a new eight-byte form that adds a big-endian maximum keyframe interval in frames (the software encoder accepts that form too, so a `Prefer` fallback needs no second configuration) - and limited-range `Rgba8` or `Bgra8` frames at any even size, which VideoToolbox converts to YCbCr itself with no CPU colour conversion. It encodes HEVC Main in real-time mode with no B-frames and emits length-prefixed samples with the encoder's sync flags and a standard `hvcC` that `Mp4Muxer` accepts. `finish()` drains it, and dropping it unfinished cancels.
+
+  The empty (lossless PCM) and one-byte (fixed QP) configurations stay software-only, because a fixed-function encoder cannot honour them: `Prefer` keeps them on the software encoder and `Require` rejects them as an invalid configuration. Windows and Linux still have no hardware HEVC encoder and report `HardwareUnavailable` for `Require`.
+
+  `tests/native_hevc_hardware.rs` gained a capability test that runs on every native host, and, on a Mac with the hardware, a round trip through the encoder conformance runner, `Mp4Muxer`, `Mp4Demuxer` and the software decoder with an `hvcC` check, a BGRA and bottom-up input test, a cancellation test, and a 1080p30 faster-than-real-time check. `cargo bench --bench hevc_hardware` has a new `hevc_hardware_encode` group.
+
 ## 0.1.1 - 2026-09-22
 
 - Use 0.1.1 for the first published release. The earlier 0.1.0 tag did not produce a GitHub

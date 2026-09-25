@@ -20,10 +20,15 @@ use crate::{
 /// Returns the native HEVC Main encoder.
 ///
 /// `Prefer` and `Require` select the VideoToolbox hardware encoder on macOS when the host has one
-/// and the configuration asks for something it can honour: a target bitrate (see
-/// [`parse_hardware_settings`]) and `Rgba8` or `Bgra8` input. `Prefer` otherwise falls back to the
-/// dependency-free software encoder, `Require` reports [`CodecSupport::HardwareUnavailable`] or the
-/// reason the configuration cannot be encoded in hardware, and `Avoid` always selects software.
+/// and the configuration asks for something it can honour: a target bitrate, as four big-endian
+/// bytes of bits a second optionally followed by four giving the maximum keyframe interval in
+/// frames (one second of frames when omitted), with limited-range `Rgba8` or `Bgra8` input at even
+/// dimensions. The hardware encoder emits HEVC Main with no B-frames in real-time mode, so every
+/// sample's DTS equals its PTS. `Prefer` otherwise falls back to the dependency-free software
+/// encoder, which also accepts the empty (lossless PCM) and one-byte (fixed QP) configurations a
+/// fixed-function encoder cannot honour; `Require` reports [`CodecSupport::HardwareUnavailable`],
+/// or the reason the configuration cannot be encoded in hardware; and `Avoid` always selects
+/// software.
 pub fn native_hevc_video_encoder_factory() -> impl VideoEncoderFactory {
     HevcEncoderFactory
 }

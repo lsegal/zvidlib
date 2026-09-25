@@ -69,6 +69,20 @@
 //! already attributed by `zvidlib::hevc_decode_profile`'s `color_convert`
 //! stage and measured directly by `hevc_color_convert` in
 //! `benches/hevc_decode.rs`.
+//!
+//! # Hardware encode
+//!
+//! [`hevc_hardware_encode`] is the encoder counterpart: the VideoToolbox HEVC
+//! encoder behind `native_hevc_video_encoder_factory`
+//! (`src/hevc/videotoolbox_encoder.rs`) encoding 1080p30 at a target bitrate,
+//! split the same way into session setup and steady state. Setup includes the priming
+//! frame the encoder encodes to learn its parameter sets before the first real
+//! one. It sits here rather than in `benches/hevc_encode.rs` because it shares
+//! this module's shape - an opaque fixed-function block, no SIMD axis, and a
+//! group that skips itself where the host has no such block - and none of that
+//! target's. There is no software arm: `hevc_encode` already measures the
+//! software encoder, and at seconds a 1080p frame a like-for-like window would
+//! dominate the run to say what one line of its output already does.
 
 use std::hint::black_box;
 use std::time::{Duration, Instant};
@@ -77,8 +91,11 @@ use criterion::measurement::WallTime;
 use criterion::{BenchmarkGroup, Criterion, criterion_group, criterion_main};
 use zvidlib::hevc_hardware_readback as readback;
 use zvidlib::{
-    CancellationToken, CodecSupport, EncodedVideoSample, HardwarePreference, Limits,
-    VideoDecoderConfig, VideoDecoderFactory, native_hevc_video_decoder_factory,
+    CancellationToken, Codec, CodecImplementation, CodecProfile, CodecSupport, ColorRange,
+    CpuFrameSource, EncodedVideoSample, FrameIndex, FrameSource, HardwarePreference, Limits,
+    Orientation, PixelFormat, VideoDecoderConfig, VideoDecoderFactory, VideoDimensions,
+    VideoEncoderConfig, VideoEncoderFactory, VideoFrame, native_hevc_video_decoder_factory,
+    native_hevc_video_encoder_factory,
 };
 
 mod support;
@@ -385,5 +402,109 @@ fn hevc_hardware(criterion: &mut Criterion) {
     }
 }
 
-criterion_group!(benches, hevc_hardware);
+/// Frames one steady-state encode iteration submits: one second at 30 fps.
+const ENCODE_FRAMES: usize = 30;
+
+/// The encode arms' clock: 30 fps.
+const ENCODE_TIMESCALE: u32 = 90_000;
+const ENCODE_FRAME_DURATION: u32 = 3_000;
+
+/// 1080p30 HEVC Main at 8 Mbit/s with a keyframe every second, in hardware.
+fn encoder_configuration() -> VideoEncoderConfig {
+    VideoEncoderConfig {
+        codec: Codec::Hevc,
+        profile: CodecProfile::HevcMain,
+        coded_dimensions: VideoDimensions::new(1920, 1080, &Limits::default())
+            .expect("1080p is within the default limits"),
+        input_format: PixelFormat::Rgba8,
+        color_range: ColorRange::Limited,
+        hardware: HardwarePreference::Require,
+        timescale: ENCODE_TIMESCALE,
+        frame_duration: ENCODE_FRAME_DURATION,
+        configuration: 8_000_000_u32.to_be_bytes().to_vec(),
+    }
+}
+
+/// Creates an encoder and encodes `frames`, returning the time spent creating it and the time
+/// spent on every frame after that, drain included.
+fn timed_encode(configuration: &VideoEncoderConfig, frames: &[VideoFrame]) -> (Duration, Duration) {
+    let started = Instant::now();
+    let mut encoder = native_hevc_video_encoder_factory()
+        .create(configuration, &Limits::default())
+        .expect("the encoder is constructible after its capability was checked");
+    let setup = started.elapsed();
+    let steady = Instant::now();
+    for (index, frame) in frames.iter().enumerate() {
+        let source = FrameSource::Cpu(CpuFrameSource {
+            frame,
+            orientation: Orientation::TopLeft,
+        });
+        black_box(
+            support::block_on(encoder.encode(FrameIndex(index as u64), source))
+                .expect("the synthetic sequence encodes"),
+        );
+    }
+    black_box(support::block_on(encoder.finish()).expect("the encoder drains"));
+    (setup, steady.elapsed())
+}
+
+/// Hardware HEVC encode of 1080p30 synthetic content, split into session setup and steady state.
+///
+/// Skips with a message rather than failing when the host has no hardware encoder, like
+/// [`hevc_hardware`].
+fn hevc_hardware_encode(criterion: &mut Criterion) {
+    let configuration = encoder_configuration();
+    let support = native_hevc_video_encoder_factory().capability(&configuration);
+    if support
+        != (CodecSupport::Supported {
+            implementation: CodecImplementation::Hardware,
+        })
+    {
+        println!("# skipping the hardware HEVC encode group: {support:?}");
+        return;
+    }
+    let dimensions = configuration.coded_dimensions;
+    let frames =
+        support::synthetic_rgba8_sequence(dimensions.width, dimensions.height, ENCODE_FRAMES);
+    let work = FrameWork::new(
+        ENCODE_FRAMES as u64,
+        u64::from(dimensions.width),
+        u64::from(dimensions.height),
+    );
+
+    let (setup, steady) = timed_encode(&configuration, &frames);
+    let fps = ENCODE_FRAMES as f64 / steady.as_secs_f64();
+    let real_time = f64::from(ENCODE_TIMESCALE) / f64::from(ENCODE_FRAME_DURATION);
+    println!(
+        "# hardware HEVC encode: cold session setup {:.1} ms; {ENCODE_FRAMES} 1080p frame(s) in \
+         {:.4}s => {fps:.1} fps, {:.1}x real time at {real_time} fps",
+        setup.as_secs_f64() * 1e3,
+        steady.as_secs_f64(),
+        fps / real_time,
+    );
+
+    let mut group = criterion.benchmark_group("hevc_hardware_encode");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(500));
+    group.measurement_time(Duration::from_secs(5));
+    group.throughput(FrameWork::new(1, work.width, work.height).elements());
+    group.bench_function("hardware/session_setup", |bencher| {
+        bencher.iter_custom(|iterations| {
+            (0..iterations)
+                .map(|_| timed_encode(&configuration, &[]).0)
+                .sum()
+        });
+    });
+    group.throughput(work.elements());
+    group.bench_function("hardware/steady_state", |bencher| {
+        bencher.iter_custom(|iterations| {
+            (0..iterations)
+                .map(|_| timed_encode(&configuration, &frames).1)
+                .sum()
+        });
+    });
+    group.finish();
+}
+
+criterion_group!(benches, hevc_hardware, hevc_hardware_encode);
 criterion_main!(benches);
