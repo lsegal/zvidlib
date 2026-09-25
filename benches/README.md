@@ -12,7 +12,7 @@ zvidlib's benchmarks run under [criterion](https://docs.rs/criterion) with
 | `benches/audio_mux.rs` | the audio container path: MP4 muxing, sample-table growth, demux, and gapless timing |
 | `benches/hevc_encode.rs` | the pure-Rust HEVC encoder, whole-frame and per-stage |
 | `benches/hevc_decode.rs` | the HEVC software decoder: whole-frame decode and every hot stage, scalar versus SIMD |
-| `benches/hevc_hardware.rs` | the platform fixed-function HEVC decoders against the software one |
+| `benches/hevc_hardware.rs` | the platform fixed-function HEVC decoders against the software one, and the hardware HEVC encoder |
 | `benches/exact_seek.rs` | what an exact frame at an arbitrary point costs, by backend and by random-access cadence |
 
 Each target loads and decodes its fixtures once per process, so every iteration
@@ -37,7 +37,7 @@ cargo bench --bench audio_decode  # the audio decode path only
 cargo bench --bench audio_mux     # the audio container path only
 cargo bench --bench hevc_encode   # the HEVC encoder groups only
 cargo bench --bench hevc_decode   # the HEVC software decoder only
-cargo bench --bench hevc_hardware # the platform hardware HEVC decoders
+cargo bench --bench hevc_hardware # the platform hardware HEVC decoders and encoder
 cargo bench --bench exact_seek    # exact-seek cost by backend and cadence
 cargo bench --features simd       # the same groups, recorded under `simd=on`
 cargo bench --no-run              # compile only
@@ -3414,6 +3414,28 @@ a build nobody ships. It costs two `Instant::now()` reads and a relaxed
 `fetch_add` per phase per frame. Its accumulators are process-wide atomics rather
 than thread-locals because NVDEC and VideoToolbox deliver frames from a callback
 that need not run on the submitting thread.
+
+### Hardware encode
+
+`hevc_hardware_encode` is the encode direction (#487): whichever hardware
+encoder `native_hevc_video_encoder_factory` selects for `Require` - a Media
+Foundation MFT on Windows - fed 60 frames of synthetic 1080p RGBA at 30 fps and
+an 8 Mbit/s target, through `finish`. `hardware/session_setup` is encoder
+creation alone; `hardware/rgba8_1080p30` starts its clock once the encoder
+exists and stops it when `finish` has drained it, so it is the throughput a
+recording pipeline sees. There is no software comparison arm: the native
+encoder spends seconds on a 1080p frame, and `hevc_encode` already measures it.
+The group skips with the factory's reason on a host without a hardware encoder,
+which is every hosted runner.
+
+| Backend | Host | Encode, 1080p RGBA | Real time at 30 fps | Warm setup | Cold setup |
+| --- | --- | --- | --- | --- | --- |
+| NVIDIA HEVC Encoder MFT (NVENC) | RTX 4080 + i9-10850K, Windows 11 (#487) | 294 Mpx/s, 141.7 fps | 4.7x | 425 ms | 417 ms |
+
+The RGBA input reaches NVENC as ARGB32, so the colour conversion in that figure
+is the GPU's; the only CPU work per frame is the red/blue swap into BGRA and the
+copy into a Media Foundation buffer. Setup is dominated by NVENC's own session
+initialization, and is paid once per recording rather than per frame.
 
 ## Fixtures
 
