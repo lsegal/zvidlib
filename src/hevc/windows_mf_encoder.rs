@@ -1714,6 +1714,120 @@ mod tests {
         }
     }
 
+    /// The first class of MFT this host has, as an encoder, or `None` to skip.
+    fn any_encoder(settings: Settings) -> Option<Box<dyn VideoEncoder>> {
+        [MftClass::Hardware, MftClass::Software]
+            .into_iter()
+            .find_map(|class| create(settings, class, &Limits::default()).ok())
+            .or_else(|| {
+                eprintln!("skipping: this host has no Media Foundation HEVC encoder");
+                None
+            })
+    }
+
+    fn encode_frame(
+        encoder: &mut dyn VideoEncoder,
+        source: &VideoFrame,
+        index: u64,
+    ) -> Result<Vec<EncodedSample>> {
+        block_on(encoder.encode(
+            FrameIndex(index),
+            FrameSource::Cpu(CpuFrameSource {
+                frame: source,
+                orientation: Orientation::TopLeft,
+            }),
+        ))
+    }
+
+    /// Dropping a request before it resolves is how a caller cancels: the
+    /// stream stops, every later call says so, and the encoder still shuts
+    /// down promptly rather than draining a stream nobody wants.
+    #[test]
+    fn dropping_a_pending_request_cancels_the_stream() {
+        let settings = round_trip_settings(PixelFormat::Rgba8);
+        let source = frame(320, 240, 0, PixelFormat::Rgba8);
+        for pending in ["encode", "finish"] {
+            let Some(mut encoder) = any_encoder(settings) else {
+                return;
+            };
+            encode_frame(encoder.as_mut(), &source, 0).unwrap();
+            // Built and dropped without being awaited to completion.
+            if pending == "encode" {
+                drop(encoder.encode(
+                    FrameIndex(1),
+                    FrameSource::Cpu(CpuFrameSource {
+                        frame: &source,
+                        orientation: Orientation::TopLeft,
+                    }),
+                ));
+            } else {
+                drop(encoder.finish());
+            }
+            let error = encode_frame(encoder.as_mut(), &source, 2).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::Cancelled, "{pending}: {error}");
+            let error = block_on(encoder.finish()).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::Cancelled, "{pending}: {error}");
+            let started = Instant::now();
+            drop(encoder);
+            assert!(
+                started.elapsed() < STALL_TIMEOUT,
+                "{pending}: shutdown waited"
+            );
+        }
+    }
+
+    #[test]
+    fn a_finished_encoder_rejects_further_work_and_frames_must_be_consecutive() {
+        let settings = round_trip_settings(PixelFormat::Rgba8);
+        let Some(mut encoder) = any_encoder(settings) else {
+            return;
+        };
+        let source = frame(320, 240, 0, PixelFormat::Rgba8);
+        let error = encode_frame(encoder.as_mut(), &source, 1).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+        let wrong = frame(320, 240, 0, PixelFormat::Bgra8);
+        let error = encode_frame(encoder.as_mut(), &wrong, 0).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+
+        encode_frame(encoder.as_mut(), &source, 0).unwrap();
+        let drained = block_on(encoder.finish()).unwrap();
+        assert!(drained.len() <= 1);
+        let error = encode_frame(encoder.as_mut(), &source, 1).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidState);
+        let error = block_on(encoder.finish()).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidState);
+    }
+
+    /// An MFT that does not publish its parameter sets on its output type is
+    /// probed with a throwaway frame instead. Where an MFT does publish them,
+    /// the probe has to agree, which is what keeps the probe path honest on a
+    /// host whose encoder never needs it.
+    #[test]
+    fn the_probe_encode_finds_the_parameter_sets_the_sequence_header_declares() {
+        let settings = round_trip_settings(PixelFormat::Rgba8);
+        let checked = run_on_mf_thread("zvidlib-mf-hevc-test", move || {
+            let mut checked = 0;
+            for class in [MftClass::Hardware, MftClass::Software] {
+                for activate in candidates(class)? {
+                    let Ok(mft) = Mft::open(activate.clone(), class, &settings) else {
+                        continue;
+                    };
+                    let header = mft.sequence_header();
+                    drop(mft);
+                    let probed = probe_parameter_sets(activate, class, &settings)?;
+                    assert!(probed.hvcc().is_some());
+                    if header.is_complete() {
+                        assert_eq!(probed, header);
+                        checked += 1;
+                    }
+                }
+            }
+            Ok(checked)
+        })
+        .unwrap();
+        eprintln!("compared {checked} encoder(s)");
+    }
+
     fn settings(timescale: u32, frame_duration: u32) -> Settings {
         Settings {
             width: 64,
