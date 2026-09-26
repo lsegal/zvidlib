@@ -1,5 +1,8 @@
 //! Native HEVC/H.265 decoding with platform acceleration and a dependency-free software fallback.
 
+// Annex B reframing for platform encoders, which only the Windows backend has.
+#[cfg(any(windows, test))]
+mod annexb;
 // internal — exposed for the criterion benchmark suite; not part of the stable API
 #[doc(hidden)]
 pub mod bench;
@@ -23,6 +26,8 @@ pub mod readback;
 mod videotoolbox;
 #[cfg(windows)]
 mod windows_mf;
+#[cfg(windows)]
+mod windows_mf_encoder;
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;

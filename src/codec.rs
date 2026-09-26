@@ -103,6 +103,23 @@ pub struct AudioDrain {
 pub trait VideoEncoder {
     fn config(&self) -> &EncoderConfig;
     fn format(&self) -> VideoEncoderFormat;
+    /// Whether this encoder runs on dedicated hardware or in software.
+    ///
+    /// A factory's [`VideoEncoderFactory::capability`] answers the same
+    /// question before an encoder exists; this is the answer for the encoder
+    /// actually created, which can differ when a backend that probed as
+    /// available fails to start and a `Prefer` factory falls back. The
+    /// default is `Software`, which is what every encoder that does not
+    /// override it is.
+    fn implementation(&self) -> CodecImplementation {
+        CodecImplementation::Software
+    }
+    /// A human-readable name for the backend doing the encoding, such as a
+    /// Media Foundation encoder's friendly name. For logs and diagnostics
+    /// only; it is not stable across platforms, drivers or releases.
+    fn backend_name(&self) -> &str {
+        "zvidlib"
+    }
     fn encode<'a>(
         &'a mut self,
         index: FrameIndex,
