@@ -173,6 +173,8 @@ unsafe extern "C" {
     static kVTCompressionPropertyKey_ExpectedFrameRate: CFStringRef;
     static kVTCompressionPropertyKey_MaxKeyFrameInterval: CFStringRef;
     static kVTCompressionPropertyKey_YCbCrMatrix: CFStringRef;
+    static kVTCompressionPropertyKey_PixelTransferProperties: CFStringRef;
+    static kVTPixelTransferPropertyKey_DestinationYCbCrMatrix: CFStringRef;
     static kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder: CFStringRef;
     static kVTEncodeFrameOptionKey_ForceKeyFrame: CFStringRef;
     fn VTCopySupportedPropertyDictionaryForEncoder(
@@ -389,6 +391,13 @@ impl VideoToolboxEncoder {
             let average = number_i32(bits_per_second);
             let interval = number_i32(keyframe_interval);
             let rate = number_f64(frame_rate);
+            // The BGRA-to-YCbCr conversion VideoToolbox runs on the way in takes its matrix from
+            // here, not from `YCbCrMatrix`, and defaults to BT.709. The crate's decoders convert
+            // back with BT.601, so anything else shifts colour on a round trip.
+            let transfer = dictionary(&[(
+                kVTPixelTransferPropertyKey_DestinationYCbCrMatrix,
+                kCVImageBufferYCbCrMatrix_ITU_R_601_4,
+            )]);
             let required = [
                 (
                     kVTCompressionPropertyKey_ProfileLevel,
@@ -415,6 +424,11 @@ impl VideoToolboxEncoder {
                     interval.0,
                     "keyframe interval",
                 ),
+                (
+                    kVTCompressionPropertyKey_PixelTransferProperties,
+                    transfer.0,
+                    "BT.601 colour conversion",
+                ),
             ];
             for (key, value, name) in required {
                 let status = VTSessionSetProperty(self.session, key, value);
@@ -424,8 +438,8 @@ impl VideoToolboxEncoder {
                     )));
                 }
             }
-            // Hints the encoder may decline. The matrix is the one this crate's decoders convert
-            // back with, so a round trip does not shift colour.
+            // Hints the encoder may decline. The matrix signalled in the stream matches the one
+            // the conversion above used.
             for (key, value) in [
                 (kVTCompressionPropertyKey_ExpectedFrameRate, rate.0),
                 (
