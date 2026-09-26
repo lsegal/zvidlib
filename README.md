@@ -273,7 +273,7 @@ document.body.append(link);
 
 JavaScript frame indices are `BigInt` so the wrapper can preserve the Rust `u64` range. Both writers reject skipped or repeated indices by default, and `finish()` is required to drain codecs and finalize the MP4.
 
-zvidlib deliberately ships **no audio encoder**. `AudioEncoder` is the contract that platform and browser backends fill -- browsers expose `WebCodecs` `AudioEncoder`, macOS has AudioToolbox, Windows has Media Foundation -- and the crate itself compresses no audio. Writing a pure-Rust AAC-LC encoder means owning a filter bank, a psychoacoustic model, and rate control, where the thing to defend is output quality rather than throughput, and a mediocre encoder under this crate's name is harder for callers to route around than no encoder at all. Delegating to one platform encoder is per-platform work that leaves the other platforms uncovered, so it answers no portability question the trait does not already answer. `MediaOutput` muxes an audio track given any `AudioEncoder`, so the audio write path is complete up to the codec, and the codec is the piece callers are best positioned to choose. Adding an implementation later is additive and breaks no caller.
+zvidlib deliberately ships **no audio encoder of its own**. `AudioEncoder` is the contract that platform and browser backends fill -- browsers expose `WebCodecs` `AudioEncoder`, macOS has AudioToolbox, Windows has Media Foundation -- and the crate itself compresses no audio. `native_aac_audio_encoder_factory()` delegates to AudioToolbox on macOS and to Media Foundation on Windows, and reports `HardwareUnavailable` elsewhere rather than falling back to an encoder of its own. Writing a pure-Rust AAC-LC encoder means owning a filter bank, a psychoacoustic model, and rate control, where the thing to defend is output quality rather than throughput, and a mediocre encoder under this crate's name is harder for callers to route around than no encoder at all. `MediaOutput` muxes an audio track given any `AudioEncoder`, so the audio write path is complete up to the codec, and the codec is the piece callers are best positioned to choose. Adding an implementation later is additive and breaks no caller.
 
 The implemented portable writer core exposes `VideoEncoder` and `AudioEncoder` contracts plus `MediaOutput`. An encoder backend declares its MP4 codec configuration and exact output timescale, then returns `EncodedSample` values with DTS, PTS, duration, sync, and dependency metadata. `MediaOutput::put_video` accepts the shared CPU/GL/WebGL `FrameSource`; it and `put_audio` enforce zero-based consecutive indices and exact frame-aligned audio ranges. `finish` drains both encoders, records audio priming and padding in an edit list, finalizes sample indexes, and flushes the seekable `ByteSink`.
 
@@ -319,22 +319,32 @@ The native HEVC Main backends each factory can select, in the order it tries the
 | Decode (`native_hevc_video_decoder_factory`) | NVDEC (64-bit), Media Foundation (D3D11), then pure Rust | VideoToolbox, then pure Rust | NVDEC (64-bit), then pure Rust |
 | Encode (`native_hevc_video_encoder_factory`) | Media Foundation hardware (NVENC, Quick Sync, AMF), then Media Foundation software, then pure Rust | VideoToolbox hardware, then pure Rust | pure Rust |
 
+Every native encoder, by operating system, and what does the encoding. A *hardware* encoder runs on the GPU or media engine. A *platform* encoder is the operating system's own codec; it reports `CodecImplementation::Hardware` because zvidlib runs none of the codec itself. A *software* encoder is zvidlib's own pure-Rust code and reports `CodecImplementation::Software`. `VideoEncoder::implementation()` and `backend_name()` report which one a created video encoder is.
+
+| Encoder | Windows | macOS | Linux |
+| --- | --- | --- | --- |
+| HEVC Main (`native_hevc_video_encoder_factory`) | **Hardware**: Media Foundation (NVENC, Quick Sync, AMF) for `Prefer`/`Require` target-bitrate configurations, with `Prefer` falling back to Media Foundation's **software** HEVC encoder. **Software**: pure Rust for `Avoid`, lossless, fixed QP, and the last `Prefer` fallback | **Hardware**: VideoToolbox for `Prefer`/`Require` target-bitrate configurations (`Rgba8`/`Bgra8`, even dimensions). **Software**: pure Rust for `Avoid`, lossless, fixed QP, and the `Prefer` fallback | **Software**: pure Rust; `Require` reports `HardwareUnavailable` |
+| AV1 Main, 8-bit monochrome (`native_av1_video_encoder_factory`) | **Software**: pure Rust | **Software**: pure Rust | **Software**: pure Rust |
+| AAC-LC (`native_aac_audio_encoder_factory`) | **Platform**: Media Foundation AAC encoder MFT (44.1 or 48 kHz, mono or stereo) | **Platform**: AudioToolbox | None: reports `HardwareUnavailable` |
+
+The browser build encodes through `WebCodecs` instead: AV1 or HEVC Main video and AAC-LC audio, wherever the browser provides those encoders (see [Implemented browser boundary](#implemented-browser-boundary)).
+
 ## Repository layout
 
 The repository contains a dependency-free portable core that validates native and WASM build configuration and implements the foundational timeline, media, I/O, frame-transfer, bounded MP4 reading, codec factory, exact-frame decoding, encoder, indexed-output, and seekable MP4 writing layers. Planned modules and dependency boundaries are described in [ARCHITECTURE.md](ARCHITECTURE.md). Runtime dependencies will be added only with a documented portability, maintenance, size, and licensing rationale.
 
 ## Using a release
 
-Each GitHub release contains a Rust crate archive and a browser package. For zvidlib 0.1.1, use
+Each GitHub release contains a Rust crate archive and a browser package. For zvidlib 0.2.0, use
 the release tag as the native Cargo dependency coordinate:
 
 ```toml
 [dependencies]
-zvidlib = { git = "https://github.com/lsegal/zvidlib.git", tag = "v0.1.1", features = ["native"] }
+zvidlib = { git = "https://github.com/lsegal/zvidlib.git", tag = "v0.2.0", features = ["native"] }
 ```
 
 Cargo fetches the versioned release tag itself; applications do not need to clone or vendor zvidlib.
-The matching `zvidlib-0.1.1.crate` GitHub Release asset provides an archive for inspection or
+The matching `zvidlib-0.2.0.crate` GitHub Release asset provides an archive for inspection or
 offline packaging. The project is not currently published to crates.io.
 The native API requires Rust 1.85 or later, as recorded by `rust-version` in `Cargo.toml`; platform codec
 adapters retain their documented platform capability checks.
@@ -342,7 +352,7 @@ adapters retain their documented platform capability checks.
 For a browser build, install the matching release asset directly:
 
 ```sh
-npm install https://github.com/lsegal/zvidlib/releases/download/v0.1.1/zvidlib-web-v0.1.1.tgz
+npm install https://github.com/lsegal/zvidlib/releases/download/v0.2.0/zvidlib-web-v0.2.0.tgz
 ```
 
 The package contains `zvidlib.js`, `zvidlib.d.ts`, and `zvidlib_bg.wasm` generated by
@@ -365,7 +375,7 @@ cargo fmt --all -- --check
 cargo clippy --all-targets --features native -- -D warnings
 ```
 
-These commands validate the portable core on both targets. Native builds include accelerated HEVC Main decode through NVDEC on supported 64-bit Windows/Linux systems, Media Foundation on Windows, and VideoToolbox on macOS, with a dependency-free pure-Rust fallback. They also include the pure-Rust AV1 Main decoder (including non-lossless intra/inter AV1 decoding), dependency-free HEVC Main and monochrome AV1 Main-profile encoders (lossless, plus a non-lossless path verified against both the crate's own decoder and an independent ffmpeg decode), AAC-LC decode, and default-device PCM output described above. There is no portable, trait-implementing audio encoder in either build, by design. The browser build exposes AAC packet/config data for WebCodecs `AudioDecoder` playback, and encodes AAC-LC through its own `WebCodecs` `AudioEncoder` bridge (see [Implemented browser boundary](#implemented-browser-boundary)). Color AV1 encoding beyond the monochrome profile and fully portable audio-device abstractions remain planned.
+These commands validate the portable core on both targets. Native builds include accelerated HEVC Main decode through NVDEC on supported 64-bit Windows/Linux systems, Media Foundation on Windows, and VideoToolbox on macOS, with a dependency-free pure-Rust fallback. They also include the pure-Rust AV1 Main decoder (including non-lossless intra/inter AV1 decoding), dependency-free HEVC Main and monochrome AV1 Main-profile encoders (lossless, plus a non-lossless path verified against both the crate's own decoder and an independent ffmpeg decode), AAC-LC decode, and default-device PCM output described above. Native builds also encode HEVC Main in hardware through VideoToolbox on macOS and Media Foundation on Windows, and AAC-LC through AudioToolbox on macOS and Media Foundation on Windows; zvidlib carries no audio encoder of its own, by design. The encoder table under [Platform expectations](#platform-expectations) lists every encoder by operating system. The browser build exposes AAC packet/config data for WebCodecs `AudioDecoder` playback, and encodes AAC-LC through its own `WebCodecs` `AudioEncoder` bridge (see [Implemented browser boundary](#implemented-browser-boundary)). Color AV1 encoding beyond the monochrome profile and fully portable audio-device abstractions remain planned.
 
 Native compressed-codec backends use the public `VideoDecoderConformanceVector`
 and `VideoEncoderConformanceVector` runners before registration. Decoder vectors
