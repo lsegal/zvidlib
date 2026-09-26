@@ -334,7 +334,6 @@ mod platform {
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
-
 mod platform {
     use crate::{
         CodecImplementation, CodecSupport, Error, ErrorKind, Limits, Result, VideoEncoder,
