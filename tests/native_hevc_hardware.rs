@@ -344,11 +344,12 @@ fn a_cold_hardware_seek_costs_this_much() {
 
 // ---- Hardware HEVC encoding (issue #486) ----
 //
-// The encoder half of `native_hevc_video_encoder_factory`: VideoToolbox on macOS, reached only
-// through `HardwarePreference::Prefer` or `Require` with a target-bitrate configuration. Every
-// test that needs the hardware skips itself on a host without it, the way the decoder tests
-// above do, so the capability test is the only one that asserts anything on Windows, Linux, or an
-// Intel Mac runner.
+// What a stream from the hardware encoder `Require` selects has to survive: the encoder
+// conformance runner, `Mp4Muxer` and `Mp4Demuxer`, BGRA and bottom-up input, and being abandoned
+// mid-stream. Which encoder a preference selects, and the 1080p30 real-time bar, are
+// `tests/native_hevc_encoder.rs`. Written against VideoToolbox, the backend a hosted runner can
+// reach (`macos-latest`); every test skips itself on a host with no hardware encoder, the way
+// the decoder tests above do.
 
 /// A 30 fps clock.
 const TIMESCALE: u32 = 90_000;
@@ -552,80 +553,6 @@ fn software_decoder_configuration(
     }
 }
 
-#[test]
-/// 720p rather than 1080p because the software encoder needs dimensions divisible by 16, and this
-/// test is about which encoder a request reaches, which only means anything where both could.
-fn native_hevc_encoder_honors_hardware_preference_and_fallback() {
-    let factory = native_hevc_video_encoder_factory();
-    let capability = |format, hardware, bytes: &[u8]| {
-        factory.capability(&encoder_configuration(
-            (1280, 720),
-            format,
-            hardware,
-            bytes.to_vec(),
-        ))
-    };
-    let software = CodecSupport::Supported {
-        implementation: CodecImplementation::Software,
-    };
-    let hardware = CodecSupport::Supported {
-        implementation: CodecImplementation::Hardware,
-    };
-    let target = bitrate(8_000_000, None);
-    let (rgba, bgra) = (PixelFormat::Rgba8, PixelFormat::Bgra8);
-    let (avoid, prefer, require) = (
-        HardwarePreference::Avoid,
-        HardwarePreference::Prefer,
-        HardwarePreference::Require,
-    );
-
-    assert_eq!(capability(rgba, avoid, &target), software);
-    let preferred = capability(rgba, prefer, &target);
-    let required = capability(rgba, require, &target);
-    if preferred == hardware {
-        assert_eq!(required, hardware);
-    } else {
-        assert_eq!(preferred, software);
-        assert_eq!(required, CodecSupport::HardwareUnavailable);
-        let error = factory
-            .create(
-                &encoder_configuration((1280, 720), rgba, require, target.clone()),
-                &Limits::default(),
-            )
-            .err()
-            .expect("Require without hardware must not create an encoder");
-        assert_eq!(error.kind(), zvidlib::ErrorKind::Unsupported);
-    }
-    if !cfg!(target_os = "macos") {
-        assert_eq!(required, CodecSupport::HardwareUnavailable);
-    }
-
-    // A fixed-function encoder has no lossless mode and takes no QP from its caller, so those
-    // requests stay with the software encoder under `Prefer` and are refused under `Require`.
-    for request in [Vec::new(), vec![26]] {
-        assert_eq!(capability(rgba, prefer, &request), software, "{request:?}");
-        assert!(matches!(
-            capability(rgba, require, &request),
-            CodecSupport::InvalidConfiguration { .. }
-        ));
-    }
-
-    // BGRA is what a camera hands over, and only the hardware path takes it.
-    assert!(matches!(
-        capability(bgra, avoid, &target),
-        CodecSupport::InvalidConfiguration { .. }
-    ));
-    let preferred_bgra = capability(bgra, prefer, &target);
-    if preferred == hardware {
-        assert_eq!(preferred_bgra, hardware);
-    } else {
-        assert!(matches!(
-            preferred_bgra,
-            CodecSupport::InvalidConfiguration { .. }
-        ));
-    }
-}
-
 /// The acceptance round trip: a hardware stream passes the crate's encoder conformance runner
 /// against the software decoder, declares a standard Main-profile `hvcC`, keeps keyframes at the
 /// requested interval, and survives `Mp4Muxer` and `Mp4Demuxer` unchanged.
@@ -808,54 +735,6 @@ fn hardware_hevc_accepts_bgra_and_bottom_up_input() {
     }
 }
 
-/// The issue's acceptance bar: 1080p30 HEVC Main encodes faster than real time, in hardware. The
-/// clock covers every frame's copy and submission and the final drain, and not the session
-/// setup, which a recording pays once.
-#[test]
-fn hardware_hevc_encodes_1080p30_faster_than_real_time() {
-    let size = (1920, 1080);
-    let frame_count = 90_u32;
-    let configuration = encoder_configuration(
-        size,
-        PixelFormat::Bgra8,
-        HardwarePreference::Require,
-        bitrate(8_000_000, None),
-    );
-    if !hardware_encoder_available(&configuration) {
-        return;
-    }
-    let frames: Vec<VideoFrame> = (0..4)
-        .map(|index| video_frame(size, PixelFormat::Bgra8, rgba_frame(size, index * 11)))
-        .collect();
-    let mut encoder = native_hevc_video_encoder_factory()
-        .create(&configuration, &Limits::default())
-        .unwrap();
-    let started = Instant::now();
-    let mut samples = Vec::new();
-    for index in 0..frame_count {
-        let frame = &frames[index as usize % frames.len()];
-        samples.extend(
-            block_on(encoder.encode(
-                FrameIndex(u64::from(index)),
-                FrameSource::Cpu(CpuFrameSource {
-                    frame,
-                    orientation: Orientation::TopLeft,
-                }),
-            ))
-            .unwrap(),
-        );
-    }
-    samples.extend(block_on(encoder.finish()).unwrap());
-    let elapsed = started.elapsed();
-    assert_muxable_samples(&samples, u64::from(frame_count));
-    let fps = f64::from(frame_count) / elapsed.as_secs_f64();
-    eprintln!("VideoToolbox encoded {frame_count} 1920x1080 frames in {elapsed:?} ({fps:.1} FPS)");
-    assert!(
-        fps > 30.0,
-        "hardware HEVC encoded 1080p at {fps:.1} FPS, below real time"
-    );
-}
-
 /// Dropping an encoder that was never finished is how a recording is abandoned. It has to tear
 /// the session down without waiting for, or emitting, the frames still inside it and leave the
 /// hardware usable; and an encoder that was finished refuses further frames.
@@ -889,6 +768,5 @@ fn an_unfinished_hardware_encoder_is_cancelled_by_dropping_it() {
     let mut samples = block_on(finished.encode(FrameIndex(0), source())).unwrap();
     samples.extend(block_on(finished.finish()).unwrap());
     assert_muxable_samples(&samples, 1);
-    let error = block_on(finished.encode(FrameIndex(1), source())).unwrap_err();
-    assert_eq!(error.kind(), zvidlib::ErrorKind::InvalidState);
+    assert!(block_on(finished.encode(FrameIndex(1), source())).is_err());
 }

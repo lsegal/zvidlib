@@ -17,18 +17,26 @@ use crate::{
     VideoEncoderFactory, VideoEncoderFormat,
 };
 
-/// Returns the native HEVC Main encoder.
+/// Returns the HEVC Main encoder factory.
 ///
-/// `Prefer` and `Require` select the VideoToolbox hardware encoder on macOS when the host has one
-/// and the configuration asks for something it can honour: a target bitrate, as four big-endian
-/// bytes of bits a second optionally followed by four giving the maximum keyframe interval in
-/// frames (one second of frames when omitted), with limited-range `Rgba8` or `Bgra8` input at even
-/// dimensions. The hardware encoder emits HEVC Main with no B-frames in real-time mode, so every
-/// sample's DTS equals its PTS. `Prefer` otherwise falls back to the dependency-free software
-/// encoder, which also accepts the empty (lossless PCM) and one-byte (fixed QP) configurations a
-/// fixed-function encoder cannot honour; `Require` reports [`CodecSupport::HardwareUnavailable`],
-/// or the reason the configuration cannot be encoded in hardware; and `Avoid` always selects
-/// software.
+/// [`VideoEncoderConfig::configuration`] selects the operating point: empty
+/// for lossless PCM, one `SliceQpY` byte in `0..=51` for a fixed quantizer, or
+/// four big-endian bytes of target bitrate in bits a second, optionally
+/// followed by four big-endian bytes of keyframe interval in frames (zero
+/// meaning one second).
+///
+/// `Avoid` always selects the dependency-free software encoder, which takes
+/// every operating point. `Prefer` and `Require` ask for a platform encoder,
+/// which serves the target-bitrate configurations: on Windows that is the GPU
+/// vendor's hardware Media Foundation encoder (NVENC, Quick Sync or AMF), and on macOS VideoToolbox's
+/// hardware encoder, which takes limited-range `Rgba8` or `Bgra8` input at
+/// even dimensions and converts it to YCbCr on the media engine. `Prefer`
+/// falls back - on Windows to Microsoft's software Media Foundation encoder
+/// first - to the native one; `Require` reports
+/// [`CodecSupport::HardwareUnavailable`] instead. Linux has no platform
+/// encoder yet, so there `Prefer` is the native encoder and `Require` is
+/// unavailable. [`VideoEncoder::implementation`] and
+/// [`VideoEncoder::backend_name`] report which one a created encoder is.
 pub fn native_hevc_video_encoder_factory() -> impl VideoEncoderFactory {
     HevcEncoderFactory
 }
@@ -43,163 +51,32 @@ impl VideoEncoderFactory for HevcEncoderFactory {
             return CodecSupport::UnsupportedProfile;
         }
         if c.hardware != HardwarePreference::Avoid {
-            match hardware_capability(c) {
-                Ok(_) => {
-                    return CodecSupport::Supported {
-                        implementation: CodecImplementation::Hardware,
-                    };
-                }
-                Err(unsupported) if c.hardware == HardwarePreference::Require => {
-                    return unsupported;
-                }
+            if let Some(implementation) = platform::capability(c) {
+                return CodecSupport::Supported { implementation };
+            }
+            if c.hardware == HardwarePreference::Require {
+                return platform::unavailable(c);
+            }
+        }
+        native_capability(c)
+    }
+    fn create(&self, c: &VideoEncoderConfig, limits: &Limits) -> Result<Box<dyn VideoEncoder>> {
+        if c.codec != Codec::Hevc || c.profile != CodecProfile::HevcMain {
+            return Err(support_error(self.capability(c)));
+        }
+        if c.hardware != HardwarePreference::Avoid {
+            match platform::create(c, limits) {
+                Ok(encoder) => return Ok(encoder),
+                Err(error) if c.hardware == HardwarePreference::Require => return Err(error),
                 Err(_) => {}
             }
         }
-        software_capability(c)
-    }
-    fn create(&self, c: &VideoEncoderConfig, limits: &Limits) -> Result<Box<dyn VideoEncoder>> {
-        let support = self.capability(c);
-        if !support.is_supported() {
-            return Err(support_error(support));
-        }
-        check_limits(c, limits)?;
-        if support
-            == (CodecSupport::Supported {
-                implementation: CodecImplementation::Hardware,
-            })
-        {
-            match create_hardware(c, limits) {
-                Ok(encoder) => return Ok(encoder),
-                Err(error) if c.hardware == HardwarePreference::Require => return Err(error),
-                // `Prefer` asked for hardware only if it works; a session the host refused is
-                // what the software encoder is the fallback for.
-                Err(_) => {
-                    let software = software_capability(c);
-                    if !software.is_supported() {
-                        return Err(support_error(software));
-                    }
-                }
-            }
-        }
-        create_software(c, limits)
+        create_native(c, limits)
     }
 }
 
-/// The hardware encoder's settings for `c`, or why it cannot encode it.
-fn hardware_capability(
-    c: &VideoEncoderConfig,
-) -> std::result::Result<HardwareSettings, CodecSupport> {
-    let settings = parse_hardware_settings(c).map_err(invalid)?;
-    #[cfg(target_os = "macos")]
-    {
-        if super::videotoolbox_encoder::is_available(c.coded_dimensions) {
-            return Ok(settings);
-        }
-    }
-    let _ = settings;
-    Err(CodecSupport::HardwareUnavailable)
-}
-
-#[cfg(target_os = "macos")]
-fn create_hardware(c: &VideoEncoderConfig, limits: &Limits) -> Result<Box<dyn VideoEncoder>> {
-    let settings = parse_hardware_settings(c).map_err(invalid_input)?;
-    super::videotoolbox_encoder::create(
-        c,
-        limits,
-        super::videotoolbox_encoder::Settings {
-            bits_per_second: settings.bits_per_second,
-            keyframe_interval: settings.keyframe_interval,
-        },
-    )
-}
-
-#[cfg(not(target_os = "macos"))]
-fn create_hardware(_: &VideoEncoderConfig, _: &Limits) -> Result<Box<dyn VideoEncoder>> {
-    Err(Error::new(
-        ErrorKind::Unsupported,
-        "hardware HEVC encoding is only available on macOS",
-    ))
-}
-
-/// What a hardware encoder is asked to do, resolved from a [`VideoEncoderConfig`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct HardwareSettings {
-    bits_per_second: u32,
-    /// The most frames from one keyframe to the next, counting the first.
-    keyframe_interval: u32,
-}
-
-const HARDWARE_HELP: &str = "hardware HEVC encoding needs a target bitrate: four big-endian bytes \
-     giving a nonzero bitrate in bits a second, optionally followed by four giving a nonzero \
-     maximum keyframe interval in frames";
-
-/// The configuration a hardware encoder can honour, which is narrower than the software one.
-///
-/// A fixed-function encoder has no lossless mode and does not take a picture's QP from its
-/// caller, so the empty (lossless PCM) and one-byte (fixed `SliceQpY`) forms of
-/// [`parse_operating_point`] are not requests it can meet, and a `Prefer` caller who made one gets
-/// the software encoder that can. The bitrate forms are: four bytes, a target bitrate with a
-/// keyframe every second, or eight, a target bitrate and a maximum keyframe interval in frames.
-///
-/// Input must be `Rgba8` or `Bgra8` - the formats a camera or a renderer produces, which the
-/// hardware converts to YCbCr itself - at limited range, with even dimensions for 4:2:0, and a
-/// clock VideoToolbox's 32-bit `CMTime` timescale can carry.
-fn parse_hardware_settings(
-    c: &VideoEncoderConfig,
-) -> std::result::Result<HardwareSettings, String> {
-    if !matches!(c.input_format, PixelFormat::Rgba8 | PixelFormat::Bgra8) {
-        return Err("hardware HEVC encoding requires Rgba8 or Bgra8 input".into());
-    }
-    if c.color_range != ColorRange::Limited {
-        return Err("hardware HEVC encoding requires limited-range input".into());
-    }
-    if c.timescale == 0 || c.frame_duration == 0 {
-        return Err("hardware HEVC encoding requires nonzero timescale and frame duration".into());
-    }
-    if i32::try_from(c.timescale).is_err() {
-        return Err("hardware HEVC encoding requires a timescale below 2^31".into());
-    }
-    if c.coded_dimensions.width % 2 != 0 || c.coded_dimensions.height % 2 != 0 {
-        return Err("hardware HEVC encoding requires even dimensions".into());
-    }
-    let (bits_per_second, keyframe_interval) = match parse_operating_point(&c.configuration) {
-        Some(OperatingPoint::TargetBitrate {
-            bits_per_second,
-            keyframe_interval,
-        }) => (
-            bits_per_second,
-            // One second of frames, when the caller does not say.
-            keyframe_interval.unwrap_or_else(|| c.timescale.div_ceil(c.frame_duration).max(1)),
-        ),
-        _ => return Err(HARDWARE_HELP.into()),
-    };
-    if i32::try_from(bits_per_second).is_err() || i32::try_from(keyframe_interval).is_err() {
-        return Err("hardware HEVC bitrate and keyframe interval must be below 2^31".into());
-    }
-    Ok(HardwareSettings {
-        bits_per_second,
-        keyframe_interval,
-    })
-}
-
-fn check_limits(c: &VideoEncoderConfig, limits: &Limits) -> Result<()> {
-    let d = c.coded_dimensions;
-    let pixels = u64::from(d.width)
-        .checked_mul(u64::from(d.height))
-        .ok_or_else(|| limit("HEVC frame dimensions overflow"))?;
-    if d.width > limits.max_width
-        || d.height > limits.max_height
-        || pixels
-            .checked_mul(6)
-            .ok_or_else(|| limit("HEVC frame allocation overflows"))?
-            > limits.max_allocation_bytes
-    {
-        return Err(limit("HEVC frame exceeds configured allocation limit"));
-    }
-    Ok(())
-}
-
-fn software_capability(c: &VideoEncoderConfig) -> CodecSupport {
+/// What the dependency-free software encoder can do with `c`.
+fn native_capability(c: &VideoEncoderConfig) -> CodecSupport {
     if c.input_format != PixelFormat::Rgba8 {
         return invalid("native HEVC Main encoding requires RGBA8 input");
     }
@@ -220,10 +97,24 @@ fn software_capability(c: &VideoEncoderConfig) -> CodecSupport {
     }
 }
 
-/// The software encoder, once [`software_capability`] and [`check_limits`] have accepted `c`.
-fn create_software(c: &VideoEncoderConfig, limits: &Limits) -> Result<Box<dyn VideoEncoder>> {
+fn create_native(c: &VideoEncoderConfig, limits: &Limits) -> Result<Box<dyn VideoEncoder>> {
+    let support = native_capability(c);
+    if !support.is_supported() {
+        return Err(support_error(support));
+    }
     let d = c.coded_dimensions;
-    let pixels = u64::from(d.width) * u64::from(d.height);
+    let pixels = u64::from(d.width)
+        .checked_mul(u64::from(d.height))
+        .ok_or_else(|| limit("HEVC frame dimensions overflow"))?;
+    if d.width > limits.max_width
+        || d.height > limits.max_height
+        || pixels
+            .checked_mul(6)
+            .ok_or_else(|| limit("HEVC frame allocation overflows"))?
+            > limits.max_allocation_bytes
+    {
+        return Err(limit("HEVC frame exceeds configured allocation limit"));
+    }
     let operating_point = parse_operating_point(&c.configuration)
         .ok_or_else(|| invalid_input(OPERATING_POINT_HELP))?;
     // A target bitrate leaves the QP to rate control, which needs the
@@ -257,6 +148,213 @@ fn create_software(c: &VideoEncoderConfig, limits: &Limits) -> Result<Box<dyn Vi
         limits: *limits,
         reference: None,
     }))
+}
+
+/// The platform encoders, behind one interface so the factory reads the same
+/// on every target.
+#[cfg(windows)]
+mod platform {
+    use super::super::windows_mf_encoder::{self, MftClass, Settings};
+    use super::{OperatingPoint, parse_operating_point};
+    use crate::{
+        CodecImplementation, CodecSupport, ColorRange, Error, ErrorKind, HardwarePreference,
+        Limits, Result, VideoEncoder, VideoEncoderConfig,
+    };
+
+    /// The Media Foundation request `c` resolves to, or why it cannot be one.
+    fn settings(c: &VideoEncoderConfig) -> std::result::Result<Settings, &'static str> {
+        let Some(OperatingPoint::TargetBitrate {
+            bits_per_second,
+            keyframe_interval,
+        }) = parse_operating_point(&c.configuration)
+        else {
+            return Err(
+                "hardware HEVC encoding requires a target-bitrate configuration: four \
+                 big-endian bytes of bits a second, optionally followed by four big-endian \
+                 bytes of keyframe interval in frames",
+            );
+        };
+        if c.color_range != ColorRange::Limited {
+            return Err("Media Foundation HEVC encoding requires limited-range input");
+        }
+        let settings = Settings {
+            width: c.coded_dimensions.width,
+            height: c.coded_dimensions.height,
+            input_format: c.input_format,
+            timescale: c.timescale,
+            frame_duration: c.frame_duration,
+            bits_per_second,
+            keyframe_interval: match keyframe_interval {
+                // One second, rounded up to a whole frame.
+                0 => c.timescale.div_ceil(c.frame_duration.max(1)).max(1),
+                frames => frames,
+            },
+        };
+        match settings.unsupported_reason() {
+            Some(reason) => Err(reason),
+            None => Ok(settings),
+        }
+    }
+
+    /// The Media Foundation encoders a preference allows, in order.
+    fn classes(c: &VideoEncoderConfig) -> &'static [MftClass] {
+        if c.hardware == HardwarePreference::Prefer {
+            &[MftClass::Hardware, MftClass::Software]
+        } else {
+            &[MftClass::Hardware]
+        }
+    }
+
+    pub(super) fn capability(c: &VideoEncoderConfig) -> Option<CodecImplementation> {
+        let settings = settings(c).ok()?;
+        classes(c)
+            .iter()
+            .find(|&&class| windows_mf_encoder::probe(settings, class).is_ok())
+            .map(|class| match class {
+                MftClass::Hardware => CodecImplementation::Hardware,
+                MftClass::Software => CodecImplementation::Software,
+            })
+    }
+
+    /// Why `Require` cannot be met: a configuration no hardware encoder takes
+    /// is invalid, and one it would take on a host without one is unavailable.
+    pub(super) fn unavailable(c: &VideoEncoderConfig) -> CodecSupport {
+        match settings(c) {
+            Err(reason) => CodecSupport::InvalidConfiguration {
+                reason: reason.into(),
+            },
+            Ok(_) => CodecSupport::HardwareUnavailable,
+        }
+    }
+
+    pub(super) fn create(c: &VideoEncoderConfig, limits: &Limits) -> Result<Box<dyn VideoEncoder>> {
+        let settings = settings(c).map_err(|reason| Error::new(ErrorKind::InvalidInput, reason))?;
+        let mut reasons = Vec::new();
+        for &class in classes(c) {
+            match windows_mf_encoder::create(settings, class, limits) {
+                Ok(encoder) => return Ok(encoder),
+                Err(error) => reasons.push(error.message().to_owned()),
+            }
+        }
+        Err(Error::new(
+            ErrorKind::Unsupported,
+            format!(
+                "hardware HEVC encoding is unavailable ({})",
+                reasons.join("; ")
+            ),
+        ))
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod platform {
+    use super::super::videotoolbox_encoder::{self, Settings};
+    use super::{OperatingPoint, parse_operating_point};
+    use crate::{
+        CodecImplementation, CodecSupport, ColorRange, Error, ErrorKind, Limits, PixelFormat,
+        Result, VideoEncoder, VideoEncoderConfig,
+    };
+
+    /// The VideoToolbox request `c` resolves to, or why it cannot be one.
+    ///
+    /// Input must be limited-range `Rgba8` or `Bgra8` - what a camera or a
+    /// renderer produces, which the media engine converts to YCbCr itself -
+    /// at even dimensions for 4:2:0, on a clock and at a rate VideoToolbox's
+    /// 32-bit `CMTime` timescale and `SInt32` properties can carry.
+    fn settings(c: &VideoEncoderConfig) -> std::result::Result<Settings, &'static str> {
+        let Some(OperatingPoint::TargetBitrate {
+            bits_per_second,
+            keyframe_interval,
+        }) = parse_operating_point(&c.configuration)
+        else {
+            return Err(
+                "hardware HEVC encoding requires a target-bitrate configuration: four \
+                 big-endian bytes of bits a second, optionally followed by four big-endian \
+                 bytes of keyframe interval in frames",
+            );
+        };
+        if !matches!(c.input_format, PixelFormat::Rgba8 | PixelFormat::Bgra8) {
+            return Err("VideoToolbox HEVC encoding requires Rgba8 or Bgra8 input");
+        }
+        if c.color_range != ColorRange::Limited {
+            return Err("VideoToolbox HEVC encoding requires limited-range input");
+        }
+        if c.timescale == 0 || c.frame_duration == 0 || i32::try_from(c.timescale).is_err() {
+            return Err(
+                "VideoToolbox HEVC encoding requires a nonzero frame duration and a nonzero \
+                 timescale below 2^31",
+            );
+        }
+        if c.coded_dimensions.width % 2 != 0 || c.coded_dimensions.height % 2 != 0 {
+            return Err("VideoToolbox HEVC encoding requires even dimensions");
+        }
+        let keyframe_interval = match keyframe_interval {
+            // One second, rounded up to a whole frame.
+            0 => c.timescale.div_ceil(c.frame_duration).max(1),
+            frames => frames,
+        };
+        if i32::try_from(bits_per_second).is_err() || i32::try_from(keyframe_interval).is_err() {
+            return Err("VideoToolbox HEVC bitrate and keyframe interval must be below 2^31");
+        }
+        Ok(Settings {
+            bits_per_second,
+            keyframe_interval,
+        })
+    }
+
+    pub(super) fn capability(c: &VideoEncoderConfig) -> Option<CodecImplementation> {
+        settings(c).ok()?;
+        videotoolbox_encoder::is_available(c.coded_dimensions)
+            .then_some(CodecImplementation::Hardware)
+    }
+
+    /// Why `Require` cannot be met: a configuration VideoToolbox cannot take
+    /// is invalid, and one it would take on a host without the hardware is
+    /// unavailable.
+    pub(super) fn unavailable(c: &VideoEncoderConfig) -> CodecSupport {
+        match settings(c) {
+            Err(reason) => CodecSupport::InvalidConfiguration {
+                reason: reason.into(),
+            },
+            Ok(_) => CodecSupport::HardwareUnavailable,
+        }
+    }
+
+    pub(super) fn create(c: &VideoEncoderConfig, limits: &Limits) -> Result<Box<dyn VideoEncoder>> {
+        let settings = settings(c).map_err(|reason| Error::new(ErrorKind::InvalidInput, reason))?;
+        if !videotoolbox_encoder::is_available(c.coded_dimensions) {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                "hardware HEVC encoding is unavailable (VideoToolbox has no hardware HEVC \
+                 encoder for this size)",
+            ));
+        }
+        videotoolbox_encoder::create(c, limits, settings)
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+
+mod platform {
+    use crate::{
+        CodecImplementation, CodecSupport, Error, ErrorKind, Limits, Result, VideoEncoder,
+        VideoEncoderConfig,
+    };
+
+    pub(super) fn capability(_: &VideoEncoderConfig) -> Option<CodecImplementation> {
+        None
+    }
+
+    pub(super) fn unavailable(_: &VideoEncoderConfig) -> CodecSupport {
+        CodecSupport::HardwareUnavailable
+    }
+
+    pub(super) fn create(_: &VideoEncoderConfig, _: &Limits) -> Result<Box<dyn VideoEncoder>> {
+        Err(Error::new(
+            ErrorKind::Unsupported,
+            "hardware HEVC encoding is unavailable (no platform encoder exists for this target)",
+        ))
+    }
 }
 struct HevcEncoder {
     configuration: VideoEncoderConfig,
@@ -439,10 +537,10 @@ enum OperatingPoint {
     TargetBitrate {
         /// The target, in bits a second. Nonzero.
         bits_per_second: u32,
-        /// The most frames from one keyframe to the next, when the caller
-        /// named one. Every picture this encoder writes is an IDR, so it meets
-        /// any interval; a hardware encoder is what the value is for.
-        keyframe_interval: Option<u32>,
+        /// Frames from one keyframe to the next, or zero for the encoder's
+        /// default. Only platform encoders read it: the native writer makes
+        /// every picture an IDR, which already meets any interval.
+        keyframe_interval: u32,
     },
 }
 
@@ -512,7 +610,8 @@ const QP_RANGE: core::ops::RangeInclusive<u8> = 0..=51;
 
 const OPERATING_POINT_HELP: &str = "the native HEVC encoder's configuration is either empty \
      (lossless PCM), a single SliceQpY byte in 0..=51 selecting lossy residual coding at that \
-     fixed quantizer, or four big-endian bytes giving a nonzero target bitrate in bits a second, \n     optionally followed by four giving a nonzero maximum keyframe interval in frames";
+     fixed quantizer, or four big-endian bytes giving a nonzero target bitrate in bits a second, \
+     optionally followed by four big-endian bytes giving a keyframe interval in frames";
 
 /// The backend-private configuration this encoder accepts, following the
 /// precedent [`crate::native_av1_video_encoder_factory`] set with `base_q_idx`.
@@ -533,17 +632,18 @@ const OPERATING_POINT_HELP: &str = "the native HEVC encoder's configuration is e
 /// encoder picks `SliceQpY` per picture to hit it. Zero is rejected rather
 /// than treated as "no target", because a caller that reaches for the bitrate
 /// form is asking for a rate and there is no rate that means "whatever you
-/// like". Eight bytes are the same bitrate followed by a big-endian maximum
-/// keyframe interval in frames, also nonzero. This encoder writes every
-/// picture as an IDR, which meets any interval, so the second half only
-/// matters to the hardware encoder [`parse_hardware_settings`] hands it to;
-/// accepting it here is what lets a `Prefer` caller fall back to software
-/// without rewriting its configuration. The two lossy forms differ in more than who picks the QP: the
+/// like". The two lossy forms differ in more than who picks the QP: the
 /// fixed-QP form optimizes each intra decision for the closest picture,
 /// because a caller naming a QP is asking for a picture, while the bitrate
 /// form charges every candidate for the residual bits it would code, because
 /// with a rate to hit the bits a decision saves are bits the next picture's QP
 /// can spend where they buy more.
+///
+/// Eight bytes are the same bitrate followed by a big-endian keyframe
+/// interval in frames, zero meaning one second. The interval is for the
+/// platform encoders the factory selects under `Prefer` and `Require`, which
+/// predict between pictures; the native writer accepts and ignores it, because
+/// every picture it writes is already an IDR.
 ///
 /// The lengths discriminate, so the whole surface is the configuration's
 /// length and anything else is rejected.
@@ -558,24 +658,21 @@ fn parse_operating_point(configuration: &[u8]) -> Option<OperatingPoint> {
     match configuration {
         [] => Some(OperatingPoint::LosslessPcm),
         [qp] if QP_RANGE.contains(qp) => Some(OperatingPoint::Lossy { qp: i32::from(*qp) }),
-        [a, b, c, d] => match u32::from_be_bytes([*a, *b, *c, *d]) {
-            0 => None,
-            bits_per_second => Some(OperatingPoint::TargetBitrate {
-                bits_per_second,
-                keyframe_interval: None,
-            }),
-        },
-        [a, b, c, d, e, f, g, h] => match (
-            u32::from_be_bytes([*a, *b, *c, *d]),
-            u32::from_be_bytes([*e, *f, *g, *h]),
-        ) {
-            (0, _) | (_, 0) => None,
-            (bits_per_second, keyframe_interval) => Some(OperatingPoint::TargetBitrate {
-                bits_per_second,
-                keyframe_interval: Some(keyframe_interval),
-            }),
-        },
+        [a, b, c, d] => target_bitrate([*a, *b, *c, *d], 0),
+        [a, b, c, d, e, f, g, h] => {
+            target_bitrate([*a, *b, *c, *d], u32::from_be_bytes([*e, *f, *g, *h]))
+        }
         _ => None,
+    }
+}
+
+fn target_bitrate(bits_per_second: [u8; 4], keyframe_interval: u32) -> Option<OperatingPoint> {
+    match u32::from_be_bytes(bits_per_second) {
+        0 => None,
+        bits_per_second => Some(OperatingPoint::TargetBitrate {
+            bits_per_second,
+            keyframe_interval,
+        }),
     }
 }
 
@@ -969,23 +1066,22 @@ mod tests {
             parse_operating_point(&1_000_000_u32.to_be_bytes()),
             Some(OperatingPoint::TargetBitrate {
                 bits_per_second: 1_000_000,
-                keyframe_interval: None,
+                keyframe_interval: 0,
             }),
             "four bytes are a big-endian target bitrate"
         );
+        let mut with_interval = 1_000_000_u32.to_be_bytes().to_vec();
+        with_interval.extend_from_slice(&60_u32.to_be_bytes());
         assert_eq!(
-            parse_operating_point(&[0, 0x0f, 0x42, 0x40, 0, 0, 0, 30]),
+            parse_operating_point(&with_interval),
             Some(OperatingPoint::TargetBitrate {
                 bits_per_second: 1_000_000,
-                keyframe_interval: Some(30),
+                keyframe_interval: 60,
             }),
-            "eight bytes add a big-endian maximum keyframe interval"
+            "eight bytes add a big-endian keyframe interval"
         );
-        assert_eq!(
-            parse_operating_point(&[0, 0x0f, 0x42, 0x40, 0, 0, 0, 0]),
-            None
-        );
-        assert_eq!(parse_operating_point(&[0, 0, 0, 0, 0, 0, 0, 30]), None);
+        with_interval[..4].fill(0);
+        assert_eq!(parse_operating_point(&with_interval), None);
         assert_eq!(
             parse_operating_point(&0_u32.to_be_bytes()),
             None,
@@ -1006,6 +1102,7 @@ mod tests {
             vec![26],
             vec![51],
             1_000_000_u32.to_be_bytes().to_vec(),
+            [1_000_000_u32.to_be_bytes(), 30_u32.to_be_bytes()].concat(),
         ] {
             assert!(
                 factory

@@ -35,11 +35,11 @@ use std::ffi::c_void;
 use std::ptr;
 use std::sync::{Arc, Mutex};
 
-use super::parameter_sets::{ParameterSets, split_access_unit};
+use super::annexb::{ParameterSets, reframe_length_prefixed};
 use crate::{
-    Codec, ColorRange, EncodedSample, EncoderConfig, EncoderFuture, Error, ErrorKind, FrameIndex,
-    FrameSource, Limits, Orientation, PixelFormat, Result, SampleDependency, VideoDimensions,
-    VideoEncoder, VideoEncoderConfig, VideoEncoderFormat, VideoFrame,
+    Codec, CodecImplementation, ColorRange, EncodedSample, EncoderConfig, EncoderFuture, Error,
+    ErrorKind, FrameIndex, FrameSource, Limits, Orientation, PixelFormat, Result, SampleDependency,
+    VideoDimensions, VideoEncoder, VideoEncoderConfig, VideoEncoderFormat, VideoFrame,
 };
 
 type OSStatus = i32;
@@ -478,7 +478,8 @@ impl VideoToolboxEncoder {
         for output in self.take_outputs() {
             match output {
                 Output::Picture(picture) => {
-                    split_access_unit(&picture.data, &mut declared)?;
+                    reframe_length_prefixed(&picture.data, &mut declared)
+                        .ok_or_else(|| codec("VideoToolbox primed with no HEVC picture"))?;
                     for set in [
                         &picture.parameter_sets.vps,
                         &picture.parameter_sets.sps,
@@ -497,7 +498,9 @@ impl VideoToolboxEncoder {
         self.config = EncoderConfig {
             codec: Codec::Hevc,
             timescale: self.configuration.timescale,
-            decoder_config: declared.hvcc()?,
+            decoder_config: declared.hvcc().ok_or_else(|| {
+                codec("VideoToolbox did not produce a complete set of HEVC parameter sets")
+            })?,
         };
         self.declared = declared;
         Ok(())
@@ -640,8 +643,10 @@ impl VideoToolboxEncoder {
                 Output::Failed(error) => return Err(codec(error)),
             };
             let mut sets = picture.parameter_sets;
-            let data = split_access_unit(&picture.data, &mut sets)?;
-            if !self.declared.covers(&sets) {
+            let data = reframe_length_prefixed(&picture.data, &mut sets)
+                .ok_or_else(|| codec("VideoToolbox returned a malformed HEVC access unit"))?
+                .data;
+            if !self.declared.contains_all(&sets) {
                 return Err(codec(
                     "VideoToolbox changed its HEVC parameter sets after the stream was declared",
                 ));
@@ -717,6 +722,15 @@ impl VideoToolboxEncoder {
 impl VideoEncoder for VideoToolboxEncoder {
     fn config(&self) -> &EncoderConfig {
         &self.config
+    }
+
+    fn implementation(&self) -> CodecImplementation {
+        // Session creation required a hardware encoder and checked it got one.
+        CodecImplementation::Hardware
+    }
+
+    fn backend_name(&self) -> &str {
+        "VideoToolbox HEVC"
     }
 
     fn format(&self) -> VideoEncoderFormat {

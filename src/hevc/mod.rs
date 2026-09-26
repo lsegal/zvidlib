@@ -1,5 +1,9 @@
 //! Native HEVC/H.265 decoding with platform acceleration and a dependency-free software fallback.
 
+// Annex B and length-prefixed reframing for the platform encoders: Media Foundation on Windows
+// and VideoToolbox on macOS.
+#[cfg(any(windows, target_os = "macos", test))]
+mod annexb;
 // internal — exposed for the criterion benchmark suite; not part of the stable API
 #[doc(hidden)]
 pub mod bench;
@@ -15,10 +19,6 @@ mod encoder;
 pub(crate) mod engine;
 #[cfg(all(any(windows, target_os = "linux"), target_pointer_width = "64"))]
 mod nvdec;
-// Only the platform encoders frame their output through this; it is compiled everywhere so its
-// tests run everywhere.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-mod parameter_sets;
 // internal — exposed for the hardware benchmark suite; not part of the stable API
 #[cfg(not(target_arch = "wasm32"))]
 #[doc(hidden)]
@@ -29,6 +29,8 @@ mod videotoolbox;
 mod videotoolbox_encoder;
 #[cfg(windows)]
 mod windows_mf;
+#[cfg(windows)]
+mod windows_mf_encoder;
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
