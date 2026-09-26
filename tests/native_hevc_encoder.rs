@@ -125,6 +125,30 @@ fn encode_all(encoder: &mut dyn VideoEncoder, frames: &[VideoFrame]) -> Vec<Enco
     samples
 }
 
+/// `samples` from `encoder` muxed by `Mp4Muxer` into a single-track MP4.
+fn mux(
+    encoder: &dyn VideoEncoder,
+    dimensions: VideoDimensions,
+    samples: Vec<EncodedSample>,
+) -> Vec<u8> {
+    block_on(async {
+        let mut muxer = Mp4Muxer::new(
+            MemorySink::new(),
+            vec![Mp4TrackConfig {
+                encoder: encoder.config().clone(),
+                format: Mp4TrackFormat::Video(dimensions),
+            }],
+            1_000,
+        )
+        .await
+        .unwrap();
+        for sample in samples {
+            muxer.write_sample(0, sample).await.unwrap();
+        }
+        muxer.finish().await.unwrap().into_inner()
+    })
+}
+
 fn tool_available(name: &str) -> bool {
     Command::new(name)
         .arg("-version")
@@ -224,22 +248,7 @@ fn hardware_output_muxes_to_an_mp4_that_zvidlib_and_ffmpeg_both_decode() {
     assert_eq!(hvcc[8 + 22], 3, "VPS, SPS and PPS arrays");
 
     let dimensions = configuration.coded_dimensions;
-    let bytes = block_on(async {
-        let mut muxer = Mp4Muxer::new(
-            MemorySink::new(),
-            vec![Mp4TrackConfig {
-                encoder: encoder.config().clone(),
-                format: Mp4TrackFormat::Video(dimensions),
-            }],
-            1_000,
-        )
-        .await
-        .unwrap();
-        for sample in samples {
-            muxer.write_sample(0, sample).await.unwrap();
-        }
-        muxer.finish().await.unwrap().into_inner()
-    });
+    let bytes = mux(encoder.as_ref(), dimensions, samples);
 
     // zvidlib reads its own file back: the demuxed track is the stream that
     // was written, and the decoder reproduces the source at either end of
@@ -337,6 +346,73 @@ fn hardware_output_muxes_to_an_mp4_that_zvidlib_and_ffmpeg_both_decode() {
         decode.status.success() && errors.trim().is_empty(),
         "ffmpeg: {errors}"
     );
+}
+
+/// Issue #495: the same 1080p `Mp4Muxer` file opened by AVFoundation, which
+/// QuickTime plays with and which is stricter about `hvc1` sample entries,
+/// `hvcC` contents and edit lists than ffmpeg is. The asset and its video
+/// track have to report playable, and `AVAssetReader` has to decode every
+/// frame through VideoToolbox's decoder over the one and a half seconds the
+/// track was written to cover. `tests/support/avfoundation_decode.swift` does
+/// the reading; this test decides whether what it read is right.
+#[cfg(target_os = "macos")]
+#[test]
+fn hardware_output_muxes_to_an_mp4_that_avfoundation_plays_and_decodes() {
+    const FRAMES: u64 = 45;
+    let configuration = configuration(1920, 1080, PixelFormat::Rgba8, HardwarePreference::Require);
+    let Some(mut encoder) = hardware_encoder(&configuration) else {
+        return;
+    };
+    let frames: Vec<_> = (0..FRAMES)
+        .map(|index| rgba_frame(1920, 1080, index))
+        .collect();
+    let samples = encode_all(encoder.as_mut(), &frames);
+    assert_eq!(samples.len() as u64, FRAMES);
+    let bytes = mux(encoder.as_ref(), configuration.coded_dimensions, samples);
+
+    let path = std::env::temp_dir().join(format!(
+        "zvidlib-hevc-avfoundation-{}-{:?}.mp4",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::write(&path, &bytes).unwrap();
+    let _cleanup = RemoveOnDrop(path.clone());
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/support/avfoundation_decode.swift");
+    // The Swift toolchain comes with the Xcode command line tools this crate
+    // already needs to build its Swift bridge on macOS, so a missing `swift`
+    // is a broken host rather than a reason to skip.
+    let check = Command::new("xcrun")
+        .arg("swift")
+        .arg(&script)
+        .arg(&path)
+        .output()
+        .expect("xcrun swift runs the AVFoundation check");
+    let report = String::from_utf8_lossy(&check.stdout);
+    let errors = String::from_utf8_lossy(&check.stderr);
+    eprintln!("AVFoundation read:\n{report}");
+    assert!(
+        check.status.success(),
+        "AVFoundation could not read the file:\n{report}{errors}"
+    );
+    for expected in [
+        "asset_playable=true",
+        "video_tracks=1",
+        "track_playable=true",
+        "track_decodable=true",
+        "codec=hvc1",
+        "width=1920",
+        "height=1080",
+        "track_start=0.000",
+        "track_duration=1.500",
+        "asset_duration=1.500",
+        "decoded_frames=45",
+    ] {
+        assert!(
+            report.lines().any(|line| line == expected),
+            "{expected} not in:\n{report}"
+        );
+    }
 }
 
 struct RemoveOnDrop(PathBuf);

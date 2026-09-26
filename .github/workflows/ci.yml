@@ -540,7 +540,9 @@ jobs:
       # The encode direction (#487, #486): which encoder `Prefer` and `Require`
       # select, and on a host with a hardware encoder an MP4 that zvidlib and
       # ffmpeg both decode. `macos-latest` reaches VideoToolbox's hardware
-      # encoder, so it runs the hardware cases; the other hosted runners have no
+      # encoder, so it runs the hardware cases, including the check that
+      # AVFoundation plays that MP4 and decodes every frame of it (#495) through
+      # `tests/support/avfoundation_decode.swift`; the other hosted runners have no
       # hardware encoder, so they skip them and the preference answers are what
       # is checked. The Media Foundation backend's unit tests in `--lib` above
       # still cover Microsoft's software encoder on any runner that has it
