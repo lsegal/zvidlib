@@ -28,12 +28,14 @@ use crate::{
 /// `Avoid` always selects the dependency-free software encoder, which takes
 /// every operating point. `Prefer` and `Require` ask for a platform encoder,
 /// which serves the target-bitrate configurations: on Windows that is the GPU
-/// vendor's hardware Media
-/// Foundation encoder (NVENC, Quick Sync or AMF). `Prefer` falls back to
-/// Microsoft's software Media Foundation encoder and then to the native one;
-/// `Require` reports [`CodecSupport::HardwareUnavailable`] instead. Every
-/// other target has no platform encoder yet, so there `Prefer` is the native
-/// encoder and `Require` is unavailable. [`VideoEncoder::implementation`] and
+/// vendor's hardware Media Foundation encoder (NVENC, Quick Sync or AMF), and on macOS VideoToolbox's
+/// hardware encoder, which takes limited-range `Rgba8` or `Bgra8` input at
+/// even dimensions and converts it to YCbCr on the media engine. `Prefer`
+/// falls back - on Windows to Microsoft's software Media Foundation encoder
+/// first - to the native one; `Require` reports
+/// [`CodecSupport::HardwareUnavailable`] instead. Linux has no platform
+/// encoder yet, so there `Prefer` is the native encoder and `Require` is
+/// unavailable. [`VideoEncoder::implementation`] and
 /// [`VideoEncoder::backend_name`] report which one a created encoder is.
 pub fn native_hevc_video_encoder_factory() -> impl VideoEncoderFactory {
     HevcEncoderFactory
@@ -244,7 +246,94 @@ mod platform {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+mod platform {
+    use super::super::videotoolbox_encoder::{self, Settings};
+    use super::{OperatingPoint, parse_operating_point};
+    use crate::{
+        CodecImplementation, CodecSupport, ColorRange, Error, ErrorKind, Limits, PixelFormat,
+        Result, VideoEncoder, VideoEncoderConfig,
+    };
+
+    /// The VideoToolbox request `c` resolves to, or why it cannot be one.
+    ///
+    /// Input must be limited-range `Rgba8` or `Bgra8` - what a camera or a
+    /// renderer produces, which the media engine converts to YCbCr itself -
+    /// at even dimensions for 4:2:0, on a clock and at a rate VideoToolbox's
+    /// 32-bit `CMTime` timescale and `SInt32` properties can carry.
+    fn settings(c: &VideoEncoderConfig) -> std::result::Result<Settings, &'static str> {
+        let Some(OperatingPoint::TargetBitrate {
+            bits_per_second,
+            keyframe_interval,
+        }) = parse_operating_point(&c.configuration)
+        else {
+            return Err(
+                "hardware HEVC encoding requires a target-bitrate configuration: four \
+                 big-endian bytes of bits a second, optionally followed by four big-endian \
+                 bytes of keyframe interval in frames",
+            );
+        };
+        if !matches!(c.input_format, PixelFormat::Rgba8 | PixelFormat::Bgra8) {
+            return Err("VideoToolbox HEVC encoding requires Rgba8 or Bgra8 input");
+        }
+        if c.color_range != ColorRange::Limited {
+            return Err("VideoToolbox HEVC encoding requires limited-range input");
+        }
+        if c.timescale == 0 || c.frame_duration == 0 || i32::try_from(c.timescale).is_err() {
+            return Err(
+                "VideoToolbox HEVC encoding requires a nonzero frame duration and a nonzero \
+                 timescale below 2^31",
+            );
+        }
+        if c.coded_dimensions.width % 2 != 0 || c.coded_dimensions.height % 2 != 0 {
+            return Err("VideoToolbox HEVC encoding requires even dimensions");
+        }
+        let keyframe_interval = match keyframe_interval {
+            // One second, rounded up to a whole frame.
+            0 => c.timescale.div_ceil(c.frame_duration).max(1),
+            frames => frames,
+        };
+        if i32::try_from(bits_per_second).is_err() || i32::try_from(keyframe_interval).is_err() {
+            return Err("VideoToolbox HEVC bitrate and keyframe interval must be below 2^31");
+        }
+        Ok(Settings {
+            bits_per_second,
+            keyframe_interval,
+        })
+    }
+
+    pub(super) fn capability(c: &VideoEncoderConfig) -> Option<CodecImplementation> {
+        settings(c).ok()?;
+        videotoolbox_encoder::is_available(c.coded_dimensions)
+            .then_some(CodecImplementation::Hardware)
+    }
+
+    /// Why `Require` cannot be met: a configuration VideoToolbox cannot take
+    /// is invalid, and one it would take on a host without the hardware is
+    /// unavailable.
+    pub(super) fn unavailable(c: &VideoEncoderConfig) -> CodecSupport {
+        match settings(c) {
+            Err(reason) => CodecSupport::InvalidConfiguration {
+                reason: reason.into(),
+            },
+            Ok(_) => CodecSupport::HardwareUnavailable,
+        }
+    }
+
+    pub(super) fn create(c: &VideoEncoderConfig, limits: &Limits) -> Result<Box<dyn VideoEncoder>> {
+        let settings = settings(c).map_err(|reason| Error::new(ErrorKind::InvalidInput, reason))?;
+        if !videotoolbox_encoder::is_available(c.coded_dimensions) {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                "hardware HEVC encoding is unavailable (VideoToolbox has no hardware HEVC \
+                 encoder for this size)",
+            ));
+        }
+        videotoolbox_encoder::create(c, limits, settings)
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 mod platform {
     use crate::{
         CodecImplementation, CodecSupport, Error, ErrorKind, Limits, Result, VideoEncoder,

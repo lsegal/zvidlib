@@ -263,6 +263,7 @@ impl ParameterSets {
     }
 
     /// Whether every kind of parameter set has been seen.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub fn is_complete(&self) -> bool {
         !self.vps.is_empty() && !self.sps.is_empty() && !self.pps.is_empty()
     }
@@ -298,11 +299,38 @@ pub(super) struct AccessUnit {
 /// added to `sets`, and the length-prefixed rest. `None` when the unit carries
 /// no picture - an encoder that emits its parameter sets on their own, ahead
 /// of the first picture, produces one of these.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(super) fn reframe_access_unit(stream: &[u8], sets: &mut ParameterSets) -> Option<AccessUnit> {
+    reframe_units(split_annex_b(stream), sets)
+}
+
+/// Splits four-byte length-prefixed NAL units, the framing VideoToolbox
+/// already emits. `None` when the data ends inside a length or a unit.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(super) fn split_length_prefixed(data: &[u8]) -> Option<Vec<&[u8]>> {
+    let mut units = Vec::new();
+    let mut rest = data;
+    while !rest.is_empty() {
+        let length = u32::from_be_bytes(rest.get(..4)?.try_into().ok()?) as usize;
+        units.push(rest.get(4..)?.get(..length)?);
+        rest = &rest[4 + length..];
+    }
+    Some(units)
+}
+
+/// [`reframe_access_unit`] for an access unit that is already four-byte
+/// length-prefixed: the parameter sets and delimiters are taken out and the
+/// rest re-emitted. `None` when the data is truncated or carries no picture.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(super) fn reframe_length_prefixed(data: &[u8], sets: &mut ParameterSets) -> Option<AccessUnit> {
+    reframe_units(split_length_prefixed(data)?, sets)
+}
+
+fn reframe_units(units: Vec<&[u8]>, sets: &mut ParameterSets) -> Option<AccessUnit> {
     let mut is_irap = false;
     let mut has_picture = false;
     let mut picture = Vec::new();
-    for unit in split_annex_b(stream) {
+    for unit in units {
         if is_out_of_band(unit) {
             sets.collect(unit);
         } else {
@@ -455,6 +483,56 @@ mod tests {
         let unit = reframe_access_unit(&trailing, &mut sets).unwrap();
         assert!(!unit.is_irap);
         assert_eq!(unit.data, [0, 0, 0, 3, 0x02, 1, 0xaa]);
+    }
+
+    #[test]
+    fn reframes_a_length_prefixed_access_unit_without_its_parameter_sets() {
+        // VPS, AUD, prefix SEI and an IDR slice, as VideoToolbox would frame them.
+        let sample = [
+            0,
+            0,
+            0,
+            3,
+            0x40,
+            1,
+            7,
+            0,
+            0,
+            0,
+            3,
+            NAL_AUD << 1,
+            1,
+            0x50,
+            0,
+            0,
+            0,
+            3,
+            0x4e,
+            1,
+            5,
+            0,
+            0,
+            0,
+            4,
+            0x26,
+            1,
+            9,
+            9,
+        ];
+        assert_eq!(split_length_prefixed(&sample).unwrap().len(), 4);
+        let mut sets = ParameterSets::default();
+        let unit = reframe_length_prefixed(&sample, &mut sets).unwrap();
+        assert_eq!(sets.vps, [vec![0x40, 1, 7]]);
+        assert_eq!(
+            unit.data,
+            [0, 0, 0, 3, 0x4e, 1, 5, 0, 0, 0, 4, 0x26, 1, 9, 9]
+        );
+        assert!(unit.is_irap);
+
+        // Truncated in a length, truncated in a unit, and no picture at all.
+        assert!(split_length_prefixed(&sample[..2]).is_none());
+        assert!(reframe_length_prefixed(&sample[..sample.len() - 1], &mut sets).is_none());
+        assert!(reframe_length_prefixed(&sample[..7], &mut sets).is_none());
     }
 
     #[test]

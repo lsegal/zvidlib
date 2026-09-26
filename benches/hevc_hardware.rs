@@ -72,12 +72,14 @@
 //!
 //! # Hardware encode
 //!
-//! [`hevc_hardware_encode`] is the encode direction (issue #487): whichever
-//! hardware encoder `native_hevc_video_encoder_factory` selects for `Require`
-//! (a Media Foundation MFT on Windows - NVENC, Quick Sync or AMF), fed
-//! synthetic 1080p RGBA at 30 fps. Session setup and encode throughput are
-//! again separate benchmarks, and the untimed pass prints the real-time factor
-//! the issue's acceptance criterion is stated in.
+//! [`hevc_hardware_encode`] is the encode direction (issues #487 and #486):
+//! whichever hardware encoder `native_hevc_video_encoder_factory` selects for
+//! `Require` (a Media Foundation MFT on Windows - NVENC, Quick Sync or AMF -
+//! or VideoToolbox on macOS, whose setup includes the priming frame it encodes
+//! to learn its parameter sets), fed synthetic 1080p RGBA at 30 fps. Session
+//! setup and encode throughput are again separate benchmarks, and the untimed
+//! pass prints the real-time factor the issues' acceptance criterion is
+//! stated in.
 
 use std::hint::black_box;
 use std::time::{Duration, Instant};
