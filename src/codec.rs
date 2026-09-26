@@ -130,14 +130,14 @@ pub trait VideoEncoder {
 
 /// Backend-neutral audio encoder contract.
 ///
-/// # zvidlib does not implement this trait
+/// # zvidlib carries no audio encoder of its own
 ///
-/// This crate ships **no audio encoder**, and that is a deliberate, recorded
-/// decision (issue #174), not an oversight or an unfinished corner. `AudioEncoder`
-/// exists as the seam that platform and browser backends fill; the only
-/// implementations in the tree are the pass-through PCM doubles used by
-/// `tests/indexed_mp4_output.rs` and `benches/audio_mux.rs`, which package sample
-/// ranges into [`EncodedSample`]s without compressing anything.
+/// This crate ships **no audio encoder of its own**, and that is a deliberate,
+/// recorded decision (issue #174), not an oversight or an unfinished corner.
+/// `AudioEncoder` exists as the seam that platform and browser backends fill.
+/// `native_aac_audio_encoder_factory` fills it with the operating system's AAC-LC
+/// encoder, AudioToolbox on macOS and Media Foundation on Windows, and reports
+/// `HardwareUnavailable` elsewhere; the browser build fills it through `WebCodecs`.
 ///
 /// The reasoning:
 ///
@@ -148,9 +148,8 @@ pub trait VideoEncoder {
 ///   callers than no encoder at all, because it is harder to route around.
 /// * Every target zvidlib runs on already has a good AAC encoder. Browsers expose
 ///   `WebCodecs` `AudioEncoder`; macOS has AudioToolbox and Windows has Media
-///   Foundation. Delegating to any one of them is per-platform work that still
-///   leaves other platforms uncovered, so it answers no portability question that
-///   this trait does not already answer better.
+///   Foundation. Delegating to them is per-platform work, so a platform without
+///   one reports that it has no encoder rather than getting a weaker one.
 /// * The crate's subject is frame-accurate video and synchronized audio *I/O*.
 ///   [`crate::MediaOutput`] can already mux an audio track given any
 ///   `AudioEncoder`, so the write path is complete up to the codec, and the codec
