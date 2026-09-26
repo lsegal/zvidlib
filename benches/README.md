@@ -3434,16 +3434,23 @@ encoder encodes to learn its parameter sets before the caller's first frame.
 | Backend | Host | Encode, 1080p RGBA | Real time at 30 fps | Warm setup | Cold setup |
 | --- | --- | --- | --- | --- | --- |
 | NVIDIA HEVC Encoder MFT (NVENC) | RTX 4080 + i9-10850K, Windows 11 (#487) | 294 Mpx/s, 141.7 fps | 4.7x | 425 ms | 417 ms |
+| VideoToolbox HEVC | Apple M1 (MacBookAir10,1), macOS 26.6.2 (#494) | 223 Mpx/s, 107.4 fps | 3.6x | 44.3 ms | 46 ms |
 
 The RGBA input reaches NVENC as ARGB32, so the colour conversion in that figure
 is the GPU's; the only CPU work per frame is the red/blue swap into BGRA and the
 copy into a Media Foundation buffer. Setup is dominated by NVENC's own session
 initialization, and is paid once per recording rather than per frame.
 
-VideoToolbox has no row yet, because this group has not been run on a Mac. The
-nearest figure is not a criterion measurement: during #486, on a `macos-latest`
-runner, a VideoToolbox encode of 90 1080p BGRA frames, drain included, ran at
-182.9 fps, about 6x real time.
+The VideoToolbox row is `cargo bench --features native --bench hevc_hardware`
+in release on an Apple M1 on battery, with no builds running (load average 2-3).
+Encode is the criterion estimate from a 40-second measurement; three default
+runs before it gave 107-129 fps, and the untimed pass at the top of each run
+103-149 fps, so read it as "about 3.5x to 4x real time" rather than to the
+frame. Warm setup is the median of three criterion `session_setup` estimates
+(43.0-44.8 ms), and cold setup the median of four untimed passes (44-50 ms).
+As with NVENC, cold and warm setup are within noise of each other. The
+`macos-latest` runner figure from #486 (182.9 fps for 90 BGRA frames) was not a
+criterion measurement and is not comparable.
 
 ## Fixtures
 
