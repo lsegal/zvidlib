@@ -642,4 +642,100 @@ mod tests {
         assert_eq!(multiply_high(-8, -3_209), 0);
         assert_eq!(clip_u8(multiply_high(0, 9_539)), 0);
     }
+
+    fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
+        use std::task::{Context, Poll, Waker};
+        let mut context = Context::from_waker(Waker::noop());
+        let mut future = std::pin::pin!(future);
+        loop {
+            if let Poll::Ready(value) = future.as_mut().poll(&mut context) {
+                return value;
+            }
+        }
+    }
+
+    /// Issue #506: the 32-frame-cadence fixture is an open-GOP stream. Each CRA picture after
+    /// the first is followed in decode order by RASL pictures presented before it, and those
+    /// reference pictures from before the CRA. Every frame from 29 onwards used to fail from a
+    /// fresh reader: 29 to 31 because the reader started at the CRA that leads them, and later
+    /// frames because a decode started at a CRA tried to reconstruct its RASL pictures. Every
+    /// frame must now match FFmpeg's decode walked in order, in reverse and alternating, and
+    /// the frames around CRA boundaries must match it from a fresh reader.
+    #[test]
+    fn open_gop_leading_pictures_decode_from_every_starting_point() {
+        use crate::io::MemorySource;
+        use crate::{
+            ExactFrameReader, FrameDigest, FrameIndex, Mp4DemuxerOptions,
+            VideoDecoderConformanceVector, VideoDimensions, verify_video_decoder_conformance,
+        };
+
+        let expected = include_str!("../../tests/fixtures/codec/bbb_hevc_512x288_gop32_rgba.sha256")
+            .lines()
+            .map(|line| FrameDigest::from_hex(line.split_once(' ').unwrap().1).unwrap())
+            .collect::<Vec<_>>();
+        let limits = Limits::default();
+        let source = MemorySource::new(
+            include_bytes!("../../tests/fixtures/codec/bbb_hevc_512x288_gop32.mp4").to_vec(),
+        );
+        let vector = block_on(VideoDecoderConformanceVector::from_mp4(
+            "open-GOP HEVC Main fixture",
+            &source,
+            Mp4DemuxerOptions::default(),
+            1,
+            VideoDecoderConfig {
+                codec: Codec::Hevc,
+                profile: CodecProfile::HevcMain,
+                coded_dimensions: VideoDimensions::new(512, 288, &limits).unwrap(),
+                output_format: PixelFormat::Rgba8,
+                color_range: ColorRange::Limited,
+                hardware: HardwarePreference::Avoid,
+                configuration: Vec::new(),
+            },
+            &expected,
+        ))
+        .unwrap();
+        assert_eq!(vector.samples.len(), 768);
+        // The fixture's shape, which is what makes it a regression test: the CRA at frame 32
+        // is followed in decode order by the RASL pictures 30, 29 and 31.
+        let order = vector.samples[29..33]
+            .iter()
+            .map(|sample| (sample.presentation_index.0, sample.random_access))
+            .collect::<Vec<_>>();
+        assert_eq!(order, [(32, true), (30, false), (29, false), (31, false)]);
+
+        let factory = native_hevc_video_decoder_factory();
+        let report = verify_video_decoder_conformance(&factory, &vector, limits).unwrap();
+        assert_eq!(report.frames_verified, 3 * 768);
+
+        // A fresh reader for every frame of the first two CRA boundaries, and for the leading
+        // and trailing pictures of later ones.
+        let cancellation = CancellationToken::new();
+        for index in (20..=72).chain([413, 415, 416, 767]) {
+            let expected = &expected[index];
+            let mut reader = ExactFrameReader::new(
+                &factory,
+                vector.configuration.clone(),
+                vector.samples.clone(),
+                limits,
+            )
+            .unwrap();
+            let frame = reader
+                .get(FrameIndex(index as u64), &cancellation)
+                .unwrap_or_else(|error| panic!("frame {index} from a fresh reader: {error}"));
+            assert_eq!(
+                FrameDigest::from_frame(&frame).unwrap(),
+                *expected,
+                "frame {index} from a fresh reader"
+            );
+            // A frame at or after a CRA is reached from that CRA, skipping its RASL pictures,
+            // not by walking the whole track from frame 0.
+            if index == 40 {
+                assert!(
+                    reader.statistics().samples_submitted <= 16,
+                    "frame 40 is decoded from the CRA at frame 32: {:?}",
+                    reader.statistics()
+                );
+            }
+        }
+    }
 }

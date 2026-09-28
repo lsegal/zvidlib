@@ -85,3 +85,20 @@ dependency. 512x288 keeps the pair under a megabyte together; the absolute
 per-frame decode cost at that size is smaller than the bundled 1080p sample's,
 but the ratio between the two arms - which is what the cadence question is
 about - is not affected by it.
+
+`bbb_hevc_512x288_gop32_rgba.sha256` carries the canonical `FrameDigest` of
+each of the 768 presentation frames of `bbb_hevc_512x288_gop32.mp4`, in the
+same format as `big_buck_bunny_hevc_rgba.sha256`. x265 codes that track as
+open groups of pictures: each CRA picture after the first is followed in decode
+order by RASL pictures that are presented before it and reference pictures from
+the group before it, which is what the issue #506 regression test in
+`src/hevc/mod.rs` needs. The reference frames were decoded with FFmpeg 6.0 and
+converted with the same BT.601 matrix:
+
+```sh
+ffmpeg -i bbb_hevc_512x288_gop32.mp4   -vf "scale=in_color_matrix=bt601:in_range=tv" -pix_fmt rgba -f rawvideo   bbb_hevc_512x288_gop32.rgba
+```
+
+then fingerprinted 512x288x4 bytes at a time with `FrameDigest::from_frame`
+over a limited-range `Rgba8` frame. The same command reproduces the first
+frames of `big_buck_bunny_hevc_rgba.sha256` from the bundled sample.

@@ -1212,6 +1212,42 @@ mod tests {
         assert_eq!(reader.seek(FrameIndex(63)), Seek::Pending);
     }
 
+    /// Issue #506: frame 3 follows the random-access point at frame 4 in decode order but is
+    /// presented before it, the shape of an open-GOP stream's leading pictures. A decoder that
+    /// starts at frame 4 cannot reconstruct it, so the reader starts from frame 0 instead. Frame
+    /// 5 is not leading, so it is still decoded from frame 4.
+    #[test]
+    fn a_leading_picture_is_decoded_from_the_random_access_point_before_it() {
+        let samples = vec![
+            sample(0, 10, true),
+            sample(1, 11, false),
+            sample(2, 12, false),
+            sample(4, 14, true),
+            sample(3, 13, false),
+            sample(5, 15, false),
+        ];
+        let mut reader = ExactFrameReader::new(
+            &uncompressed_video_decoder_factory(),
+            config(),
+            samples.clone(),
+            Limits::default(),
+        )
+        .unwrap();
+        let cancellation = CancellationToken::new();
+        assert_eq!(value(&reader.get(FrameIndex(3), &cancellation).unwrap()), 13);
+        assert_eq!(reader.statistics().samples_submitted, 5);
+
+        let mut reader = ExactFrameReader::new(
+            &uncompressed_video_decoder_factory(),
+            config(),
+            samples,
+            Limits::default(),
+        )
+        .unwrap();
+        assert_eq!(value(&reader.get(FrameIndex(5), &cancellation).unwrap()), 15);
+        assert_eq!(reader.statistics().samples_submitted, 3);
+    }
+
     #[test]
     fn capability_distinguishes_codec_profile_configuration_and_hardware() {
         let factory = uncompressed_video_decoder_factory();

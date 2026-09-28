@@ -504,10 +504,17 @@ impl WebCodecsDecoder {
         })
     }
 
+    /// A random-access point presented after the target is skipped even when it comes first in
+    /// decode order: the target is one of its leading pictures, which a decode starting there
+    /// cannot reconstruct (issue #506).
     fn nearest_random_access(&self, position: usize) -> usize {
+        let target = self.samples[position].presentation_index;
         (0..=position)
             .rev()
-            .find(|&candidate| self.samples[candidate].random_access)
+            .find(|&candidate| {
+                let sample = &self.samples[candidate];
+                sample.random_access && sample.presentation_index <= target
+            })
             .unwrap_or(0)
     }
 
@@ -878,6 +885,9 @@ mod tests {
     /// same pixels the native software decoder does. The digests are that
     /// decoder's output for this fixture on a native build, and frame 20 is
     /// reached by walking forwards from the random-access point at frame 0.
+    /// Issue #506: frame 40 is decoded from the CRA at frame 32 past its
+    /// leading pictures, and frame 29, one of those leading pictures, from
+    /// frame 0.
     #[wasm_bindgen_test(async)]
     async fn software_fallback_decodes_hevc_like_the_native_decoder() {
         let mut session = WebVideoDecodeSession::open_with(
@@ -910,6 +920,18 @@ mod tests {
             (
                 2,
                 "c9213b4b6961cef722c723ed0ac1e302b99f0f72162e447191ae4c0e3b03211f",
+            ),
+            (
+                40,
+                "dedcc605951fd99f5546e98c7d5243c6e31535e37726f45b2aa7faea025d2e3c",
+            ),
+            (
+                29,
+                "50a1d7185ea2a54d245d7e3d4e8c4e182dd2e61e9bfb72b025cf688353bdc55e",
+            ),
+            (
+                32,
+                "c8aa7d647b3c001d1c0bb473ff7c9d195481a2490273c37404db5430165312f9",
             ),
         ];
         for (frame, expected) in expected {
