@@ -605,6 +605,48 @@ mod tests {
     }
 
     #[test]
+    fn a_10_bit_sample_converts_like_the_8_bit_sample_it_widens() {
+        // `4·v` at 10 bits is exactly `v` at 8 bits, so both kernels have to agree on it; the
+        // same content with its two low bits set is then allowed to differ, which is the
+        // precision the 10-bit kernel keeps.
+        let (width, height) = (9, 3);
+        let (luma, cb, cr, chroma_width) = planes(width, height);
+        let reference = convert(Isa::Scalar, width, height);
+        let widen = |plane: &[i32], low: i32| plane.iter().map(|v| v * 4 + low).collect::<Vec<_>>();
+        let mut rgba = vec![0_u8; width * height * 4];
+        convert_high_bit_depth_yuv420_to_rgba(
+            &widen(&luma, 0),
+            width,
+            10,
+            &widen(&cb, 0),
+            &widen(&cr, 0),
+            chroma_width,
+            10,
+            width,
+            height,
+            &mut rgba,
+            width * 4,
+        );
+        assert_eq!(rgba, reference);
+
+        convert_high_bit_depth_yuv420_to_rgba(
+            &widen(&luma, 3),
+            width,
+            10,
+            &widen(&cb, 3),
+            &widen(&cr, 3),
+            chroma_width,
+            10,
+            width,
+            height,
+            &mut rgba,
+            width * 4,
+        );
+        assert_ne!(rgba, reference);
+        assert!(rgba.chunks_exact(4).all(|pixel| pixel[3] == 255));
+    }
+
+    #[test]
     fn the_override_reaches_this_kernel() {
         let _guard = simd::test_lock();
         for isa in simd::available() {
