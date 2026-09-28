@@ -1,20 +1,29 @@
 //! Native HEVC/H.265 decoding with platform acceleration and a dependency-free software fallback.
+//!
+//! The software decoder is portable and also builds for `wasm32`, where it is the browser's
+//! fallback when WebCodecs cannot decode a track (issue #504); the platform backends and the
+//! encoder's public factory stay native-only.
 
 // Annex B and length-prefixed reframing for the platform encoders: Media Foundation on Windows
 // and VideoToolbox on macOS.
 #[cfg(any(windows, target_os = "macos", test))]
 mod annexb;
 // internal — exposed for the criterion benchmark suite; not part of the stable API
+#[cfg(not(target_arch = "wasm32"))]
 #[doc(hidden)]
 pub mod bench;
 pub(crate) mod color_convert;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod decode_bench;
 // internal — exposed for the stage-attribution example; not part of the stable API
+#[cfg(not(target_arch = "wasm32"))]
 #[doc(hidden)]
 pub use engine::inter_pred::narrow_interp;
 // internal — exposed for the stage-attribution example; not part of the stable API
+#[cfg(not(target_arch = "wasm32"))]
 #[doc(hidden)]
 pub use engine::profile as decode_profile;
+#[cfg(not(target_arch = "wasm32"))]
 mod encoder;
 pub(crate) mod engine;
 #[cfg(all(any(windows, target_os = "linux"), target_pointer_width = "64"))]
@@ -42,6 +51,7 @@ use crate::{
     Limits, PixelFormat, Plane, Result, VideoDecoder, VideoDecoderConfig, VideoDecoderFactory,
     VideoFrame,
 };
+#[cfg(not(target_arch = "wasm32"))]
 pub use encoder::native_hevc_video_encoder_factory;
 use engine::hvcc::{HvccRecord, parse_hvcc, split_length_prefixed};
 use engine::picture::{Picture, Plane as HevcPlane, sub_wh_c};
@@ -114,7 +124,8 @@ impl VideoDecoderFactory for HevcDecoderFactory {
         }
         let parsed = ParsedConfiguration::parse(configuration, limits)?;
         if configuration.hardware != HardwarePreference::Avoid {
-            let mut hardware_errors = Vec::new();
+            #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
+            let mut hardware_errors = Vec::<String>::new();
             #[cfg(all(any(windows, target_os = "linux"), target_pointer_width = "64"))]
             match nvdec::create(configuration, limits, &parsed.record) {
                 Ok(decoder) => return Ok(decoder),
@@ -464,6 +475,7 @@ impl HevcDecoder {
     ///
     /// The picture-only half of the issue #220 split, used by
     /// [`crate::hevc_decoder_bench`].
+    #[cfg(not(target_arch = "wasm32"))]
     fn submit_pictures(
         &mut self,
         sample: &EncodedVideoSample,
