@@ -177,6 +177,12 @@ pub struct SequenceDecoder {
     pending: Vec<SegmentData>,
     cvs_index: u32,
     seen_picture: bool,
+    /// `NoRaslOutputFlag` of the most recent IRAP picture: while it is set,
+    /// the RASL pictures associated with that IRAP are discarded (§8.1.3).
+    skip_rasl: bool,
+    /// Pictures discarded without decoding, counted as their first slice
+    /// segment arrives.
+    skipped_pictures: u64,
     /// Debug: tolerate an end_of_slice_segment_flag mismatch (decode
     /// as much as possible instead of erroring).
     tolerant: bool,
@@ -230,6 +236,17 @@ impl SequenceDecoder {
             let first_in_pic = rbsp.first().is_some_and(|b| b & 0x80 != 0);
             if first_in_pic {
                 self.finish_picture()?;
+            }
+            // §8.1.3: a RASL picture associated with an IRAP picture whose
+            // NoRaslOutputFlag is 1 references pictures from before that IRAP,
+            // which this decode never saw. It is not output, and it is not
+            // decoded: its slices are dropped. The IRAP it follows has already
+            // been decoded by the `finish_picture` above, which set `skip_rasl`.
+            if self.skip_rasl && NalKind::new(header.nal_unit_type).is_rasl() {
+                if first_in_pic {
+                    self.skipped_pictures += 1;
+                }
+                return Ok(());
             }
             // Issue #189 stage attribution: §7.3.6 slice segment header.
             let _profile = prof_scope(ProfStage::HeaderParse);
@@ -313,6 +330,14 @@ impl SequenceDecoder {
         std::mem::take(&mut self.frames)
     }
 
+    /// How many pictures have been discarded without decoding: the RASL
+    /// pictures of an IRAP picture that started decoding (§8.1.3). They
+    /// produce no [`DecodedFrame`].
+    #[must_use]
+    pub const fn skipped_pictures(&self) -> u64 {
+        self.skipped_pictures
+    }
+
     /// `sps_max_num_reorder_pics` of the highest sub-layer of the most
     /// recently activated SPS (`None` before any SPS).
     #[must_use]
@@ -378,6 +403,9 @@ impl SequenceDecoder {
             nal_kind.is_idr() || nal_kind.is_bla() || (nal_kind.is_irap() && !self.seen_picture);
         if nal_kind.is_irap() && no_rasl_output && self.seen_picture {
             self.cvs_index += 1;
+        }
+        if nal_kind.is_irap() {
+            self.skip_rasl = no_rasl_output;
         }
         self.seen_picture = true;
 

@@ -819,10 +819,21 @@ impl ExactFrameReader {
         self.cache.len()
     }
 
+    /// The random-access point a decode reaching `target_position` starts from.
+    ///
+    /// A random-access point presented *after* the target cannot be it, even when it comes
+    /// first in decode order: the target is then one of its leading pictures, and an open-GOP
+    /// stream's leading pictures (HEVC RASL pictures) reference pictures from before the
+    /// random-access point, so a decode that starts there cannot reconstruct them (issue #506).
+    /// The walk goes back to a random-access point the target is not leading.
     fn nearest_random_access(&self, target_position: usize) -> usize {
+        let target = self.samples[target_position].presentation_index;
         (0..=target_position)
             .rev()
-            .find(|position| self.samples[*position].random_access)
+            .find(|position| {
+                let sample = &self.samples[*position];
+                sample.random_access && sample.presentation_index <= target
+            })
             .unwrap_or(0)
     }
 
@@ -1199,6 +1210,48 @@ mod tests {
         assert!(matches!(reader.seek(FrameIndex(63)), Seek::Preview { .. }));
         reader.set_seek_previews(None);
         assert_eq!(reader.seek(FrameIndex(63)), Seek::Pending);
+    }
+
+    /// Issue #506: frame 3 follows the random-access point at frame 4 in decode order but is
+    /// presented before it, the shape of an open-GOP stream's leading pictures. A decoder that
+    /// starts at frame 4 cannot reconstruct it, so the reader starts from frame 0 instead. Frame
+    /// 5 is not leading, so it is still decoded from frame 4.
+    #[test]
+    fn a_leading_picture_is_decoded_from_the_random_access_point_before_it() {
+        let samples = vec![
+            sample(0, 10, true),
+            sample(1, 11, false),
+            sample(2, 12, false),
+            sample(4, 14, true),
+            sample(3, 13, false),
+            sample(5, 15, false),
+        ];
+        let mut reader = ExactFrameReader::new(
+            &uncompressed_video_decoder_factory(),
+            config(),
+            samples.clone(),
+            Limits::default(),
+        )
+        .unwrap();
+        let cancellation = CancellationToken::new();
+        assert_eq!(
+            value(&reader.get(FrameIndex(3), &cancellation).unwrap()),
+            13
+        );
+        assert_eq!(reader.statistics().samples_submitted, 5);
+
+        let mut reader = ExactFrameReader::new(
+            &uncompressed_video_decoder_factory(),
+            config(),
+            samples,
+            Limits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            value(&reader.get(FrameIndex(5), &cancellation).unwrap()),
+            15
+        );
+        assert_eq!(reader.statistics().samples_submitted, 3);
     }
 
     #[test]
