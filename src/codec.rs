@@ -1234,7 +1234,10 @@ mod tests {
         )
         .unwrap();
         let cancellation = CancellationToken::new();
-        assert_eq!(value(&reader.get(FrameIndex(3), &cancellation).unwrap()), 13);
+        assert_eq!(
+            value(&reader.get(FrameIndex(3), &cancellation).unwrap()),
+            13
+        );
         assert_eq!(reader.statistics().samples_submitted, 5);
 
         let mut reader = ExactFrameReader::new(
@@ -1244,7 +1247,10 @@ mod tests {
             Limits::default(),
         )
         .unwrap();
-        assert_eq!(value(&reader.get(FrameIndex(5), &cancellation).unwrap()), 15);
+        assert_eq!(
+            value(&reader.get(FrameIndex(5), &cancellation).unwrap()),
+            15
+        );
         assert_eq!(reader.statistics().samples_submitted, 3);
     }
 

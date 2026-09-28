@@ -669,10 +669,11 @@ mod tests {
             VideoDecoderConformanceVector, VideoDimensions, verify_video_decoder_conformance,
         };
 
-        let expected = include_str!("../../tests/fixtures/codec/bbb_hevc_512x288_gop32_rgba.sha256")
-            .lines()
-            .map(|line| FrameDigest::from_hex(line.split_once(' ').unwrap().1).unwrap())
-            .collect::<Vec<_>>();
+        let expected =
+            include_str!("../../tests/fixtures/codec/bbb_hevc_512x288_gop32_rgba.sha256")
+                .lines()
+                .map(|line| FrameDigest::from_hex(line.split_once(' ').unwrap().1).unwrap())
+                .collect::<Vec<_>>();
         let limits = Limits::default();
         let source = MemorySource::new(
             include_bytes!("../../tests/fixtures/codec/bbb_hevc_512x288_gop32.mp4").to_vec(),
