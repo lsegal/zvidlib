@@ -1,11 +1,13 @@
 //! Bounded AV1 low-overhead bitstream and configuration parsing.
 //!
 //! This module intentionally provides syntax/state only; it does not
-//! implement pixel reconstruction. Pixel reconstruction lives in
-//! [`crate::av1_intra_decoder`] and [`crate::av1_inter_decoder`], and the
-//! registered [`VideoDecoderFactory`](crate::VideoDecoderFactory) that wires
-//! them together lives in `crate::av1_decoder`
-//! ([`native_av1_video_decoder_factory`](crate::native_av1_video_decoder_factory)).
+//! implement pixel reconstruction. The bounded lossless monochrome
+//! reconstruction in [`crate::av1_intra_decoder`] and
+//! [`crate::av1_inter_decoder`] is kept for its own callers; the registered
+//! [`VideoDecoderFactory`](crate::VideoDecoderFactory) in `crate::av1_decoder`
+//! ([`native_av1_video_decoder_factory`](crate::native_av1_video_decoder_factory))
+//! decodes with the complete Main-profile decoder in `crate::av1_dec`, which
+//! carries its own header parsing.
 
 use crate::{Error, ErrorKind, Limits, Result};
 

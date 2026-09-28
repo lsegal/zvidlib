@@ -102,3 +102,63 @@ ffmpeg -i bbb_hevc_512x288_gop32.mp4   -vf "scale=in_color_matrix=bt601:in_range
 then fingerprinted 512x288x4 bytes at a time with `FrameDigest::from_frame`
 over a limited-range `Rgba8` frame. The same command reproduces the first
 frames of `big_buck_bunny_hevc_rgba.sha256` from the bundled sample.
+
+`bbb_hevc_main10_128x72.mp4` is a 12-frame HEVC Main 10 (`yuv420p10le`) track
+cut from the bundled `examples/media/BigBuckBunny.mp4` sample, with one
+random-access point and B-frames, for the Main 10 software decode (issue #508).
+It was generated offline with
+
+```sh
+ffmpeg -ss 10 -i ../../../examples/media/BigBuckBunny.mp4 -an -frames:v 12   -vf scale=128:72 -pix_fmt yuv420p10le -c:v libx265 -profile:v main10   -preset medium -crf 30   -x265-params "keyint=12:min-keyint=12:scenecut=0:bframes=3"   -tag:v hvc1 -movflags +faststart bbb_hevc_main10_128x72.mp4
+```
+
+`bbb_hevc_main10_128x72_yuv420p10le.sha256` is the SHA-256 of each
+presentation frame of FFmpeg 6.0's own decode of that track
+(`ffmpeg -i bbb_hevc_main10_128x72.mp4 -f rawvideo -pix_fmt yuv420p10le`),
+the planar little-endian 16-bit layout `Picture::to_planar_le16` produces. It
+is the independent reference: the decoder's 10-bit samples must equal
+FFmpeg's before any colour conversion.
+
+`bbb_hevc_main10_128x72_rgba.sha256` carries one canonical `FrameDigest` per
+presentation frame of the same track's `Rgba8` output. FFmpeg's scaler has no
+10-bit path that reproduces the fixed-point BT.601 matrix `picture_to_rgba`
+uses (its 8-bit fast path is the one the Main fixture above matches), so these
+digests were computed by applying that matrix, as documented in
+`src/hevc/color_convert.rs`, to FFmpeg's `yuv420p10le` decode in a separate
+Python script, with each 10-bit sample shifted up by one bit to the matrix's
+11-bit scale. As above, FFmpeg is only the offline fixture generator and is not
+a build, test, or runtime dependency.
+
+`big_buck_bunny_av1_yuv420.sha256` holds one canonical `FrameDigest` per
+presentation frame (0-767) of the bundled `examples/media/BigBuckBunny.av1.mp4`
+sample (SVT-AV1, 8-bit 4:2:0 Main, 960x540, limited range) as decoded by
+FFmpeg's libdav1d wrapper, fingerprinted as `Yuv420p8` frames with limited
+color range. They were generated offline with
+
+```sh
+ffmpeg -c:v libdav1d -i ../../../examples/media/BigBuckBunny.av1.mp4 \
+  -fps_mode passthrough -f rawvideo -pix_fmt yuv420p ref.yuv
+```
+
+and hashed as `FrameDigest::from_frame` does: the big-endian width and height,
+the `Yuv420p8` tag (4), the limited-range tag (1), the plane count (3), then
+each frame's Y, U and V samples. `src/av1_dec/tests.rs` checks the crate's AV1
+decoder against every one of them. `big_buck_bunny_av1_rgba.sha256` carries the
+`Rgba8` digests of the same libdav1d frames after this crate's BT.601
+`convert_to_rgba8` (`src/av1_filters.rs`), the conversion
+`native_av1_video_decoder_factory` applies to BT.601 (`matrix_coefficients` 6)
+streams; `tests/codec_conformance.rs` and the browser fallback test in
+`src/web_decoder.rs` compare the factory's output with them.
+
+`av1_main10_64x64.mp4` is a single 64x64 10-bit 4:2:0 AV1 Main frame, which
+the software AV1 decoder refuses because it decodes 8-bit streams only. It is
+the browser fallback's example of a track neither decoder can take, generated
+offline with
+
+```sh
+ffmpeg -f lavfi -i testsrc=size=64x64:rate=30 -frames:v 1 -c:v libaom-av1 \
+  -cpu-used 8 -crf 40 -pix_fmt yuv420p10le -movflags +faststart av1_main10_64x64.mp4
+```
+
+As above, FFmpeg is only the offline fixture generator and is not a build,
+test, or runtime dependency.
