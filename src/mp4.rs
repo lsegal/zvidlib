@@ -14,6 +14,40 @@ pub enum Mp4TrackFormat {
     Audio { channels: u16 },
 }
 
+/// Image encoding of an MP4 cover-art picture.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CoverArtFormat {
+    Jpeg,
+    Png,
+}
+
+impl CoverArtFormat {
+    /// The iTunes metadata `data` box type indicator for this format.
+    pub(crate) fn data_type(self) -> u32 {
+        match self {
+            Self::Jpeg => 13,
+            Self::Png => 14,
+        }
+    }
+
+    pub(crate) fn from_data_type(data_type: u32) -> Option<Self> {
+        match data_type {
+            13 => Some(Self::Jpeg),
+            14 => Some(Self::Png),
+            _ => None,
+        }
+    }
+}
+
+/// An already-encoded cover-art image, written as iTunes-style
+/// `moov/udta/meta/ilst/covr` metadata that file browsers and players show as
+/// the file's thumbnail without decoding any video.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CoverArt {
+    pub format: CoverArtFormat,
+    pub data: Vec<u8>,
+}
+
 /// A track declaration passed to [`Mp4Muxer`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Mp4TrackConfig {
@@ -58,6 +92,7 @@ pub struct Mp4Muxer<S> {
     tracks: Vec<TrackState>,
     mdat_start: u64,
     max_samples_per_track: usize,
+    cover_art: Option<CoverArt>,
     finished: bool,
 }
 
@@ -108,6 +143,7 @@ impl<S: ByteSink> Mp4Muxer<S> {
             tracks,
             mdat_start,
             max_samples_per_track,
+            cover_art: None,
             finished: false,
         })
     }
@@ -163,6 +199,17 @@ impl<S: ByteSink> Mp4Muxer<S> {
         Ok(())
     }
 
+    /// Sets or clears the cover art that [`Mp4Muxer::finish`] writes into the
+    /// movie box. It may be set any time before `finish`, so a recorder can
+    /// pick a frame after capture. Without cover art, output is unchanged.
+    pub fn set_cover_art(&mut self, cover_art: Option<CoverArt>) -> Result<()> {
+        if let Some(cover_art) = &cover_art {
+            validate_cover_art(cover_art)?;
+        }
+        self.cover_art = cover_art;
+        Ok(())
+    }
+
     pub async fn finish(mut self) -> Result<S> {
         if self.finished {
             return Err(invalid_state("MP4 muxer was already finished"));
@@ -175,7 +222,7 @@ impl<S: ByteSink> Mp4Muxer<S> {
         self.sink.seek(self.mdat_start + 8).await?;
         self.sink.write(&mdat_size.to_be_bytes()).await?;
         self.sink.seek(payload_end).await?;
-        let moov = moov_box(&self.tracks)?;
+        let moov = moov_box(&self.tracks, self.cover_art.as_ref())?;
         self.sink.write(&moov).await?;
         self.sink.flush().await?;
         self.finished = true;
@@ -218,6 +265,13 @@ fn validate_track_config(config: &Mp4TrackConfig) -> Result<()> {
         | (Codec::Aac, Mp4TrackFormat::Audio { .. }) => Ok(()),
         _ => Err(invalid("codec and MP4 track kind are incompatible")),
     }
+}
+
+fn validate_cover_art(cover_art: &CoverArt) -> Result<()> {
+    if cover_art.data.is_empty() {
+        return Err(invalid("cover art data must be nonempty"));
+    }
+    Ok(())
 }
 
 fn validate_sample(track: &TrackState, sample: &EncodedSample) -> Result<()> {
@@ -280,12 +334,33 @@ fn ftyp_box() -> Result<Vec<u8>> {
     make_box(*b"ftyp", payload)
 }
 
-fn moov_box(tracks: &[TrackState]) -> Result<Vec<u8>> {
+fn moov_box(tracks: &[TrackState], cover_art: Option<&CoverArt>) -> Result<Vec<u8>> {
     let mut payload = mvhd_box(tracks)?;
     for track in tracks {
         payload.extend_from_slice(&trak_box(track)?);
     }
+    if let Some(cover_art) = cover_art {
+        payload.extend_from_slice(&udta_box(cover_art)?);
+    }
     make_box(*b"moov", payload)
+}
+
+/// `udta` > `meta` > `ilst` > `covr` > `data`, the iTunes metadata layout that
+/// Explorer, Finder, and most players read cover art from.
+fn udta_box(cover_art: &CoverArt) -> Result<Vec<u8>> {
+    let mut data = cover_art.format.data_type().to_be_bytes().to_vec();
+    data.extend_from_slice(&0_u32.to_be_bytes());
+    data.extend_from_slice(&cover_art.data);
+    let ilst = make_box(*b"ilst", make_box(*b"covr", make_box(*b"data", data)?)?)?;
+
+    let mut hdlr = vec![0; 4];
+    hdlr.extend_from_slice(b"mdir");
+    hdlr.extend_from_slice(b"appl");
+    hdlr.extend_from_slice(&[0; 8]);
+    hdlr.push(0);
+    let mut meta = full_box(*b"hdlr", 0, 0, hdlr)?;
+    meta.extend_from_slice(&ilst);
+    make_box(*b"udta", full_box(*b"meta", 0, 0, meta)?)
 }
 
 fn mvhd_box(tracks: &[TrackState]) -> Result<Vec<u8>> {

@@ -2,7 +2,7 @@
 
 use crate::codec::{AudioEncoder, VideoEncoder};
 use crate::io::ByteSink;
-use crate::mp4::{Mp4Muxer, Mp4TrackConfig, Mp4TrackFormat};
+use crate::mp4::{CoverArt, Mp4Muxer, Mp4TrackConfig, Mp4TrackFormat};
 use crate::transfer::FrameSource;
 use crate::{AudioBuffer, Error, ErrorKind, FrameIndex, Result, Timeline};
 
@@ -156,6 +156,13 @@ where
         }
         self.next_audio = advance(index)?;
         Ok(())
+    }
+
+    /// Sets or clears the cover art written into the finished MP4. It may be
+    /// set any time before [`MediaOutput::finish`]; see
+    /// [`Mp4Muxer::set_cover_art`].
+    pub fn set_cover_art(&mut self, cover_art: Option<CoverArt>) -> Result<()> {
+        self.muxer.set_cover_art(cover_art)
     }
 
     /// Drains both encoders, records gapless audio trim, finalizes indexes, and

@@ -4,6 +4,7 @@ use crate::audio::{AudioEdit, AudioTrackTiming, EncodedAudioSample};
 use crate::codec::{EncodedVideoSample, SampleDependency, TrackKind};
 use crate::io::ByteSource;
 use crate::media::{Codec, VideoDimensions};
+use crate::mp4::{CoverArt, CoverArtFormat};
 use crate::timeline::FrameIndex;
 use crate::{Error, ErrorKind, Limits, Result};
 use std::collections::{BTreeMap, BTreeSet};
@@ -273,6 +274,9 @@ pub struct AacTrackConfig {
 pub struct Mp4Demuxer {
     pub movie_timescale: u32,
     pub tracks: Vec<Mp4Track>,
+    /// The first JPEG or PNG picture in iTunes-style
+    /// `moov/udta/meta/ilst/covr` metadata, if the file has one.
+    pub cover_art: Option<CoverArt>,
 }
 
 /// Bounded format detection. At most 32 bytes are requested.
@@ -543,6 +547,7 @@ fn parse_moov(
     options: &Mp4DemuxerOptions,
 ) -> Result<ParsedMovie> {
     let mut builder = MovieBuilder::default();
+    let mut cover_art = None;
     for child in children(bytes, 1, budget, options)? {
         match &child.kind {
             b"mvhd" => builder.timescale = Some(parse_mvhd(child.payload)?),
@@ -550,6 +555,16 @@ fn parse_moov(
                 .tracks
                 .push(parse_trak(child.payload, budget, options)?),
             b"mvex" => parse_mvex(child.payload, &mut builder.trex, budget, options)?,
+            b"udta" if cover_art.is_none() => {
+                // User data is optional metadata that files in the wild often
+                // lay out loosely, so a malformed `udta` never fails the open;
+                // only exceeding a resource limit does.
+                cover_art = match parse_udta_cover_art(child.payload, budget, options) {
+                    Ok(cover_art) => cover_art,
+                    Err(error) if error.kind() == ErrorKind::ResourceLimit => return Err(error),
+                    Err(_) => None,
+                };
+            }
             _ => {}
         }
     }
@@ -580,9 +595,59 @@ fn parse_moov(
         demuxer: Mp4Demuxer {
             movie_timescale,
             tracks,
+            cover_art,
         },
         fragment_defaults: builder.trex,
     })
+}
+
+/// Finds the first JPEG or PNG `data` box under `udta/meta/ilst/covr`.
+fn parse_udta_cover_art(
+    bytes: &[u8],
+    budget: &mut Budget,
+    options: &Mp4DemuxerOptions,
+) -> Result<Option<CoverArt>> {
+    for meta in children(bytes, 2, budget, options)? {
+        if &meta.kind != b"meta" {
+            continue;
+        }
+        // ISO BMFF makes `meta` a full box; QuickTime writes it as a plain
+        // container, recognizable by `hdlr` starting right after the header.
+        let items = if meta.payload.get(4..8) == Some(b"hdlr") {
+            meta.payload
+        } else {
+            full(meta.payload)?.1
+        };
+        for ilst in children(items, 3, budget, options)? {
+            if &ilst.kind != b"ilst" {
+                continue;
+            }
+            for covr in children(ilst.payload, 4, budget, options)? {
+                if &covr.kind != b"covr" {
+                    continue;
+                }
+                for data in children(covr.payload, 5, budget, options)? {
+                    if &data.kind != b"data" {
+                        continue;
+                    }
+                    let Some(format) = CoverArtFormat::from_data_type(be_u32(data.payload, 0)?)
+                    else {
+                        continue;
+                    };
+                    let image = slice(data.payload, 8, data.payload.len().saturating_sub(8))?;
+                    if image.is_empty() {
+                        continue;
+                    }
+                    ensure_allocation(image.len(), 1, options, "cover art")?;
+                    return Ok(Some(CoverArt {
+                        format,
+                        data: image.to_vec(),
+                    }));
+                }
+            }
+        }
+    }
+    Ok(None)
 }
 
 fn parse_mvhd(payload: &[u8]) -> Result<u32> {

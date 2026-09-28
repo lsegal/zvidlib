@@ -176,6 +176,7 @@ pub use media::{
 pub use mp4_demux::{
     AacTrackConfig, EditMapping, Mp4Demuxer, Mp4DemuxerOptions, Mp4Sample, Mp4Track, probe_mp4,
 };
+pub use mp4::{CoverArt, CoverArtFormat};
 pub use output::{MediaOutput, OutputOptions};
 pub use playback::{
     AudioOutputBackend, AudioOutputKind, IndexedPresentationTimeline, NativeAudioOutput,

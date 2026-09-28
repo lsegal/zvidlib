@@ -5,7 +5,7 @@
 //! memory, and browser-owned objects are retained only as JavaScript handles.
 
 use crate::io::{MemorySink, MemorySource};
-use crate::mp4::{Mp4Muxer, Mp4TrackConfig, Mp4TrackFormat};
+use crate::mp4::{CoverArt, CoverArtFormat, Mp4Muxer, Mp4TrackConfig, Mp4TrackFormat};
 use crate::web_decoder::{
     WebVideoDecodeSession, video_frame_durations_ms, video_random_access_points,
 };
@@ -1963,6 +1963,7 @@ async fn finalize_browser_output(
     tracks: &Rc<RefCell<BTreeMap<u32, Rc<RefCell<BrowserVideoTrack>>>>>,
     audio: &Rc<RefCell<BrowserAudioTrack>>,
     raw_bytes: Vec<u8>,
+    cover_art: Option<CoverArt>,
 ) -> crate::Result<Vec<u8>> {
     let ordered: Vec<Rc<RefCell<BrowserVideoTrack>>> =
         tracks.borrow().values().map(Rc::clone).collect();
@@ -2067,6 +2068,7 @@ async fn finalize_browser_output(
             muxer.write_sample(index, sample).await?;
         }
     }
+    muxer.set_cover_art(cover_art)?;
     let sink = muxer.finish().await?;
     Ok(sink.into_inner())
 }
@@ -2090,6 +2092,7 @@ pub struct WasmMediaOutput {
     /// track index.
     browser_video_tracks: Rc<RefCell<BTreeMap<u32, Rc<RefCell<BrowserVideoTrack>>>>>,
     browser_audio: Rc<RefCell<BrowserAudioTrack>>,
+    cover_art: Option<CoverArt>,
 }
 
 #[wasm_bindgen(js_class = MediaOutput)]
@@ -2128,6 +2131,7 @@ impl WasmMediaOutput {
                 video_codec,
                 browser_video_tracks: Rc::new(RefCell::new(BTreeMap::new())),
                 browser_audio: Rc::new(RefCell::new(BrowserAudioTrack::new())),
+                cover_art: None,
             }))
         })
     }
@@ -2190,17 +2194,60 @@ impl WasmMediaOutput {
         })
     }
 
+    /// Sets the cover art embedded in the finished MP4 as its file-browser
+    /// thumbnail. `mimeType` is `image/jpeg` or `image/png`; `null` clears it.
+    /// May be called any time before `finish()`.
+    #[wasm_bindgen(js_name = setCoverArt)]
+    pub fn set_cover_art(
+        &mut self,
+        data: Option<Uint8Array>,
+        mime_type: Option<String>,
+    ) -> Result<(), JsValue> {
+        ensure_open(&self.state)?;
+        let Some(data) = data else {
+            self.cover_art = None;
+            return Ok(());
+        };
+        let format = match mime_type.as_deref() {
+            Some("image/jpeg") => CoverArtFormat::Jpeg,
+            Some("image/png") => CoverArtFormat::Png,
+            _ => {
+                return Err(js_error(
+                    ErrorKind::InvalidInput,
+                    "cover art mimeType must be image/jpeg or image/png",
+                ));
+            }
+        };
+        if data.length() == 0 {
+            return Err(js_error(
+                ErrorKind::InvalidInput,
+                "cover art data must be nonempty",
+            ));
+        }
+        self.cover_art = Some(CoverArt {
+            format,
+            data: data.to_vec(),
+        });
+        Ok(())
+    }
+
     pub fn finish(&mut self) -> Promise {
         let state = Rc::clone(&self.state);
         let mime_type = self.mime_type.clone();
         let browser_video_tracks = Rc::clone(&self.browser_video_tracks);
         let browser_audio = Rc::clone(&self.browser_audio);
         let raw_bytes = std::mem::take(&mut self.bytes);
+        let cover_art = self.cover_art.clone();
         future_to_promise(async move {
             ensure_open(&state)?;
-            let bytes = finalize_browser_output(&browser_video_tracks, &browser_audio, raw_bytes)
-                .await
-                .map_err(|error| js_error(error.kind(), error.message()))?;
+            let bytes = finalize_browser_output(
+                &browser_video_tracks,
+                &browser_audio,
+                raw_bytes,
+                cover_art,
+            )
+            .await
+            .map_err(|error| js_error(error.kind(), error.message()))?;
             let blob = make_blob(&bytes, &mime_type)
                 .map_err(|error| normalize_browser_error(error, "creating output Blob"))?;
             state.set(true);
@@ -2216,6 +2263,7 @@ impl WasmMediaOutput {
     pub fn close(&mut self) {
         if !self.state.replace(true) {
             self.bytes.clear();
+            self.cover_art = None;
         }
     }
 }
