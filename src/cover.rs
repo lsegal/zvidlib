@@ -592,7 +592,8 @@ mod tests {
         while at < png.len() {
             let length = u32::from_be_bytes(png[at..at + 4].try_into().unwrap()) as usize;
             let body = &png[at + 4..at + 8 + length];
-            let crc = u32::from_be_bytes(png[at + 8 + length..at + 12 + length].try_into().unwrap());
+            let crc =
+                u32::from_be_bytes(png[at + 8 + length..at + 12 + length].try_into().unwrap());
             assert_eq!(crc, crc32(body));
             let data = &body[4..];
             match &body[..4] {
@@ -613,8 +614,16 @@ mod tests {
         for y in 0..height {
             let line = &filtered[y * (row_bytes + 1)..(y + 1) * (row_bytes + 1)];
             for x in 0..row_bytes {
-                let left = if x >= 3 { rgb[y * row_bytes + x - 3] } else { 0 };
-                let up = if y > 0 { rgb[(y - 1) * row_bytes + x] } else { 0 };
+                let left = if x >= 3 {
+                    rgb[y * row_bytes + x - 3]
+                } else {
+                    0
+                };
+                let up = if y > 0 {
+                    rgb[(y - 1) * row_bytes + x]
+                } else {
+                    0
+                };
                 let up_left = if x >= 3 && y > 0 {
                     rgb[(y - 1) * row_bytes + x - 3]
                 } else {
@@ -742,14 +751,8 @@ mod tests {
             frame(1, 2, format, vec![Plane { data, stride }])
         };
         for source in [
-            one_by_two(
-                PixelFormat::Rgba8,
-                packed(&|[r, g, b]| vec![r, g, b, 255]),
-            ),
-            one_by_two(
-                PixelFormat::Bgra8,
-                packed(&|[r, g, b]| vec![b, g, r, 255]),
-            ),
+            one_by_two(PixelFormat::Rgba8, packed(&|[r, g, b]| vec![r, g, b, 255])),
+            one_by_two(PixelFormat::Bgra8, packed(&|[r, g, b]| vec![b, g, r, 255])),
             one_by_two(PixelFormat::Rgb8, packed(&|pixel| pixel.to_vec())),
         ] {
             let thumbnail = Thumbnail::new(&source, Orientation::TopLeft).unwrap();

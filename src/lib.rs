@@ -169,10 +169,10 @@ pub use conformance::{
     VideoEncoderConformanceReport, VideoEncoderConformanceVector, verify_video_decoder_conformance,
     verify_video_encoder_conformance,
 };
+pub use cover::{COVER_THUMBNAIL_MAX_EDGE, CoverSource, DEFAULT_COVER_FRAME};
 pub use media::{
     AudioBuffer, Codec, ColorRange, Container, PixelFormat, Plane, VideoDimensions, VideoFrame,
 };
-pub use cover::{COVER_THUMBNAIL_MAX_EDGE, CoverSource, DEFAULT_COVER_FRAME};
 pub use mp4::{CoverArt, CoverArtFormat};
 pub use mp4_demux::{
     AacTrackConfig, EditMapping, Mp4Demuxer, Mp4DemuxerOptions, Mp4Sample, Mp4Track, probe_mp4,
