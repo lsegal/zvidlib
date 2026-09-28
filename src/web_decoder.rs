@@ -15,6 +15,7 @@
 //! calling thread and is meant for the handful of frames a thumbnail or a
 //! preview pass needs rather than real-time playback.
 
+use crate::av1::{Av1CodecConfigurationRecord, Av1Obu, Av1Parser};
 use crate::codec::{
     CancellationToken, CodecProfile, EncodedVideoSample, ExactFrameReader, HardwarePreference,
     VideoDecoderConfig, VideoDecoderFactory,
@@ -255,6 +256,16 @@ impl WebVideoDecodeSession {
         matches!(self.backend, DecodeBackend::Software(_))
     }
 
+    /// Whether this browser decodes `track_index` of `bytes` through
+    /// `WebCodecs`, for the tests that exercise that session's own behaviour
+    /// and have nothing to check where the software fallback takes over.
+    #[cfg(test)]
+    pub(crate) async fn decodes_through_webcodecs(bytes: &[u8], track_index: u32) -> bool {
+        Self::open(bytes, track_index, &Limits::default())
+            .await
+            .is_ok_and(|session| !session.is_software())
+    }
+
     /// Decodes and returns exactly the requested presentation frame as RGBA bytes.
     ///
     /// A single group of pictures can be hundreds of frames long, so a caller that has moved on -
@@ -300,9 +311,15 @@ impl SoftwareDecoder {
         limits: &Limits,
     ) -> Result<Self> {
         let factory = software_decoder_factory(track.codec)?;
-        let profile = match track.codec {
-            Codec::Av1 => CodecProfile::Av1Main,
-            _ => CodecProfile::HevcMain,
+        // The HEVC decoder only accepts limited-range input, while the AV1
+        // decoder reports whatever range the sequence header signals and the
+        // reader holds every frame to the configured one.
+        let (profile, color_range) = match track.codec {
+            Codec::Av1 => (
+                CodecProfile::Av1Main,
+                av1_color_range(track, &samples, limits),
+            ),
+            _ => (CodecProfile::HevcMain, ColorRange::Limited),
         };
         // The decoders validate the configuration record itself, so a stream
         // they cannot decode (HEVC Main 10, say) is refused here, at open,
@@ -312,7 +329,7 @@ impl SoftwareDecoder {
             profile,
             coded_dimensions: dimensions,
             output_format: PixelFormat::Rgba8,
-            color_range: ColorRange::Limited,
+            color_range,
             hardware: HardwarePreference::Avoid,
             configuration: track.decoder_config.clone(),
         };
@@ -331,6 +348,34 @@ impl SoftwareDecoder {
         yield_to_event_loop().await;
         let frame = self.reader.get(presentation_index, cancellation)?;
         Ok((frame.dimensions, packed_rgba(&frame)))
+    }
+}
+
+/// The colour range an AV1 track's sequence header signals: from `av1C`'s
+/// `configOBUs` when it carries one, which it need not, and otherwise from the
+/// first sample, a key frame that must. Limited when neither parses, which
+/// leaves the reader to reject the first frame that disagrees.
+fn av1_color_range(
+    track: &Mp4Track,
+    samples: &[EncodedVideoSample],
+    limits: &Limits,
+) -> ColorRange {
+    let from_config = Av1CodecConfigurationRecord::parse(&track.decoder_config, limits)
+        .ok()
+        .and_then(|record| {
+            record.config_obus.into_iter().find_map(|obu| match obu {
+                Av1Obu::SequenceHeader { sequence, .. } => Some(sequence),
+                _ => None,
+            })
+        });
+    let sequence = from_config.or_else(|| {
+        let mut parser = Av1Parser::new(*limits).ok()?;
+        parser.parse_low_overhead(&samples.first()?.data).ok()?;
+        parser.sequence
+    });
+    match sequence {
+        Some(sequence) if sequence.color_config.color_range => ColorRange::Full,
+        _ => ColorRange::Limited,
     }
 }
 
@@ -809,5 +854,220 @@ mod tests {
     fn an_invalidated_session_requires_a_reset() {
         let published = HashSet::new();
         assert!(!can_continue_session(None, 0, &published, FrameIndex(0)));
+    }
+
+    const SMALL_HEVC: &[u8] = include_bytes!("../tests/fixtures/codec/bbb_hevc_512x288_gop32.mp4");
+
+    fn digest(dimensions: VideoDimensions, rgba: Vec<u8>) -> String {
+        let limits = Limits::default();
+        let stride = dimensions.width as usize * 4;
+        let frame = VideoFrame::new(
+            dimensions,
+            PixelFormat::Rgba8,
+            ColorRange::Limited,
+            vec![crate::media::Plane { data: rgba, stride }],
+            &limits,
+        )
+        .unwrap();
+        crate::conformance::FrameDigest::from_frame(&frame)
+            .unwrap()
+            .to_hex()
+    }
+
+    /// Issue #504: the software fallback decodes an HEVC Main track to the
+    /// same pixels the native software decoder does. The digests are that
+    /// decoder's output for this fixture on a native build, and frame 20 is
+    /// reached by walking forwards from the random-access point at frame 0.
+    #[wasm_bindgen_test(async)]
+    async fn software_fallback_decodes_hevc_like_the_native_decoder() {
+        let mut session = WebVideoDecodeSession::open_with(
+            SMALL_HEVC,
+            0,
+            &Limits::default(),
+            BackendChoice::SoftwareOnly,
+        )
+        .await
+        .unwrap();
+        assert!(session.is_software());
+        assert_eq!(
+            (session.dimensions().width, session.dimensions().height),
+            (512, 288)
+        );
+        assert_eq!(session.frame_count(), 768);
+        let expected = [
+            (
+                0,
+                "d405441057a0528fe3a0cda232a667177168004b7153c079080f25aafab078ce",
+            ),
+            (
+                1,
+                "2d7594d6df9dcacb1949b9f56b82e28f4c46309ae41a269619dc364d19ea7c75",
+            ),
+            (
+                20,
+                "79ac5da3a64bf292dbd490f9c92fe9321610c022dd9be117692b23ba19a281a0",
+            ),
+            (
+                2,
+                "c9213b4b6961cef722c723ed0ac1e302b99f0f72162e447191ae4c0e3b03211f",
+            ),
+        ];
+        for (frame, expected) in expected {
+            let (dimensions, rgba) = session
+                .get(FrameIndex(frame), &CancellationToken::new())
+                .await
+                .unwrap();
+            assert_eq!(rgba.len(), 512 * 288 * 4);
+            assert_eq!(digest(dimensions, rgba), expected, "frame {frame}");
+        }
+    }
+
+    /// The fallback is only for what `WebCodecs` cannot do: a browser that
+    /// reports the config supported keeps decoding through `WebCodecs`.
+    #[wasm_bindgen_test(async)]
+    async fn webcodecs_stays_preferred_when_the_browser_supports_the_config() {
+        let limits = Limits::default();
+        let session = WebVideoDecodeSession::open(SMALL_HEVC, 0, &limits)
+            .await
+            .unwrap();
+        let source = MemorySource::new(SMALL_HEVC.to_vec());
+        let track = parse_video_track(&source, 0, &limits).await.unwrap();
+        let derived = derive_codec_string(track.codec, &track.decoder_config).unwrap();
+        let config = JsVideoDecoderConfig::new(&derived.codec_string);
+        config.set_coded_width(512);
+        config.set_coded_height(288);
+        config.set_description_u8_array(&js_sys::Uint8Array::from(
+            codec_description(track.codec, &track.decoder_config).unwrap(),
+        ));
+        config.set_optimize_for_latency(true);
+        let support: VideoDecoderSupport =
+            JsFuture::from(js_to_promise(JsVideoDecoder::is_config_supported(&config)))
+                .await
+                .unwrap()
+                .unchecked_into();
+        assert_eq!(
+            session.is_software(),
+            !support.get_supported().unwrap_or(false)
+        );
+    }
+
+    /// A lossless monochrome AV1 track, the subset the crate's AV1 decoder
+    /// covers, decodes through the fallback back to the exact gray levels it
+    /// was encoded from.
+    #[wasm_bindgen_test(async)]
+    async fn software_fallback_decodes_av1_back_to_its_source() {
+        use crate::codec::{VideoEncoderConfig, VideoEncoderFactory};
+        use crate::io::MemorySink;
+        use crate::mp4::{Mp4Muxer, Mp4TrackConfig, Mp4TrackFormat};
+        use crate::transfer::{CpuFrameSource, FrameSource, Orientation};
+
+        let limits = Limits::default();
+        let dimensions = VideoDimensions::new(32, 18, &limits).unwrap();
+        let gray = |index: u64| -> Vec<u8> {
+            (0..dimensions.height)
+                .flat_map(|y| {
+                    (0..dimensions.width)
+                        .map(move |x| ((x * 7 + y * 3 + index as u32 * 5) % 256) as u8)
+                })
+                .collect()
+        };
+        let mut encoder = crate::native_av1_video_encoder_factory()
+            .create(
+                &VideoEncoderConfig {
+                    codec: Codec::Av1,
+                    profile: CodecProfile::Av1Main,
+                    coded_dimensions: dimensions,
+                    input_format: PixelFormat::Gray8,
+                    color_range: ColorRange::Full,
+                    hardware: HardwarePreference::Avoid,
+                    timescale: 30,
+                    frame_duration: 1,
+                    configuration: Vec::new(),
+                },
+                &limits,
+            )
+            .unwrap();
+        let mut muxer = Mp4Muxer::new(
+            MemorySink::new(),
+            vec![Mp4TrackConfig {
+                encoder: encoder.config().clone(),
+                format: Mp4TrackFormat::Video(dimensions),
+            }],
+            60,
+        )
+        .await
+        .unwrap();
+        for index in 0..3_u64 {
+            let frame = VideoFrame::new(
+                dimensions,
+                PixelFormat::Gray8,
+                ColorRange::Full,
+                vec![crate::media::Plane {
+                    data: gray(index),
+                    stride: dimensions.width as usize,
+                }],
+                &limits,
+            )
+            .unwrap();
+            let samples = encoder
+                .encode(
+                    FrameIndex(index),
+                    FrameSource::Cpu(CpuFrameSource {
+                        frame: &frame,
+                        orientation: Orientation::TopLeft,
+                    }),
+                )
+                .await
+                .unwrap();
+            for sample in samples {
+                muxer.write_sample(0, sample).await.unwrap();
+            }
+        }
+        for sample in encoder.finish().await.unwrap() {
+            muxer.write_sample(0, sample).await.unwrap();
+        }
+        let bytes = muxer.finish().await.unwrap().into_inner();
+
+        let mut session =
+            WebVideoDecodeSession::open_with(&bytes, 0, &limits, BackendChoice::SoftwareOnly)
+                .await
+                .unwrap();
+        assert!(session.is_software());
+        for index in [2_u64, 0] {
+            let (decoded, rgba) = session
+                .get(FrameIndex(index), &CancellationToken::new())
+                .await
+                .unwrap();
+            assert_eq!(decoded, dimensions);
+            let expected: Vec<u8> = gray(index)
+                .into_iter()
+                .flat_map(|level| [level, level, level, 255])
+                .collect();
+            assert_eq!(rgba, expected, "frame {index}");
+        }
+    }
+
+    /// A track neither `WebCodecs` nor the software decoder can take is still
+    /// reported `Unsupported`, naming why the fallback refused it.
+    #[wasm_bindgen_test(async)]
+    async fn a_track_the_software_decoder_refuses_stays_unsupported() {
+        const COLOR_AV1: &[u8] = include_bytes!("../examples/media/BigBuckBunny.av1.mp4");
+        let error = match WebVideoDecodeSession::open_with(
+            COLOR_AV1,
+            0,
+            &Limits::default(),
+            BackendChoice::SoftwareOnly,
+        )
+        .await
+        {
+            Ok(_) => panic!("the AV1 software decoder covers monochrome streams only"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        assert!(
+            error.message().contains("software decoder cannot either"),
+            "{}",
+            error.message()
+        );
     }
 }

@@ -502,6 +502,7 @@ mod tests {
     }
 
     fn backends() -> Vec<Isa> {
+        #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
         let mut isas = vec![Isa::Scalar];
         #[cfg(target_arch = "x86_64")]
         {

@@ -415,6 +415,9 @@ pub struct ExactFrameReader {
     /// on every sample.
     output_wanted: bool,
     next_decode_position: Option<usize>,
+    /// The random-access position the open decode session started from. Only frames at or
+    /// after it have been, or can still be, submitted without a reset.
+    session_start: Option<usize>,
     /// The fast tier [`ExactFrameReader::seek`] answers from, when the caller has attached one.
     seek_previews: Option<Arc<dyn SeekPreviewSource>>,
     limits: Limits,
@@ -551,6 +554,7 @@ impl ExactFrameReader {
             in_flight_since_reset: HashSet::new(),
             output_wanted: true,
             next_decode_position: None,
+            session_start: None,
             seek_previews: None,
             limits,
             statistics: DecodeStatistics::default(),
@@ -667,9 +671,17 @@ impl ExactFrameReader {
         // A frame the decoder walked past without producing is in the same position as one that
         // was published and evicted: the decoder will not emit it again, so only a reset can
         // reach it.
+        //
+        // And a session that started at a later random-access point than the target's never
+        // submitted the target at all, however far it has since walked. On a track whose frames
+        // are all random-access points, a request for frame 2 opens the session at 2, and a
+        // request for frame 0 after it would otherwise walk on from 3 to the end of the track.
         let can_reuse = self
             .next_decode_position
             .is_some_and(|position| position >= random_access_position)
+            && self
+                .session_start
+                .is_some_and(|start| start <= random_access_position)
             && !self.published_since_reset.contains(&presentation_index)
             && !self.suppressed_since_reset.contains(&presentation_index);
         if !can_reuse {
@@ -679,6 +691,7 @@ impl ExactFrameReader {
             self.suppressed_since_reset.clear();
             self.in_flight_since_reset.clear();
             self.next_decode_position = Some(random_access_position);
+            self.session_start = Some(random_access_position);
         }
 
         let mut work = 0_u32;
@@ -789,6 +802,7 @@ impl ExactFrameReader {
         self.decoder.reset()?;
         self.statistics.resets = self.statistics.resets.saturating_add(1);
         self.next_decode_position = None;
+        self.session_start = None;
         self.cache.clear();
         self.lru.clear();
         self.published_since_reset.clear();
@@ -1239,6 +1253,36 @@ mod tests {
                 .kind(),
             ErrorKind::ResourceLimit
         );
+    }
+
+    /// Issue #504: every frame of an all-intra track is a random-access point, so a request for
+    /// frame 2 opens its decode session at frame 2. Frame 0 was never submitted in that session,
+    /// so reaching it needs a reset rather than a walk onwards from frame 3.
+    #[test]
+    fn a_request_before_the_open_session_start_resets_the_decoder() {
+        let samples = (0..4)
+            .map(|index| sample(index, index as u8 + 10, true))
+            .collect();
+        let mut reader = ExactFrameReader::new(
+            &uncompressed_video_decoder_factory(),
+            config(),
+            samples,
+            Limits {
+                max_cached_frames: 1,
+                ..Limits::default()
+            },
+        )
+        .unwrap();
+        let cancellation = CancellationToken::new();
+        assert_eq!(
+            value(&reader.get(FrameIndex(2), &cancellation).unwrap()),
+            12
+        );
+        assert_eq!(
+            value(&reader.get(FrameIndex(0), &cancellation).unwrap()),
+            10
+        );
+        assert_eq!(reader.statistics().resets, 2);
     }
 
     #[test]

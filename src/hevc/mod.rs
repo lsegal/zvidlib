@@ -6,7 +6,7 @@
 
 // Annex B and length-prefixed reframing for the platform encoders: Media Foundation on Windows
 // and VideoToolbox on macOS.
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", all(test, not(target_arch = "wasm32"))))]
 mod annexb;
 // internal — exposed for the criterion benchmark suite; not part of the stable API
 #[cfg(not(target_arch = "wasm32"))]
