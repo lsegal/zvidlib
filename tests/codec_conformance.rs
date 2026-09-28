@@ -329,12 +329,15 @@ fn native_av1_decoder_conforms_for_sequential_reverse_and_alternating_seeks() {
 }
 
 #[test]
-fn native_av1_decoder_conforms_on_the_colour_sample_for_sequential_reverse_and_alternating_seeks() {
+fn native_av1_decoder_matches_an_independent_decode_of_the_colour_sample() {
     // Issue #509: the bundled SVT-AV1 8-bit 4:2:0 Main sample, decoded through
     // the registered factory. The digests are FFmpeg/libdav1d's decode of the
     // same track converted to RGBA by this crate's BT.601 `convert_to_rgba8`,
     // the conversion the factory itself applies; see
-    // `tests/fixtures/codec/README.md`.
+    // `tests/fixtures/codec/README.md`. The track has a single random-access
+    // point, so `verify_video_decoder_conformance`'s reverse pattern would
+    // re-decode it from the start for nearly every frame; every frame is
+    // checked in order instead, followed by backward and forward seeks.
     let expected = include_str!("fixtures/codec/big_buck_bunny_av1_rgba.sha256")
         .lines()
         .map(|line| {
@@ -363,15 +366,24 @@ fn native_av1_decoder_conforms_on_the_colour_sample_for_sequential_reverse_and_a
     ))
     .unwrap();
     assert_eq!(vector.samples.len(), 768);
-    assert!(
-        native_av1_video_decoder_factory()
-            .capability(&vector.configuration)
-            .is_supported()
-    );
+    let factory = native_av1_video_decoder_factory();
+    assert!(factory.capability(&vector.configuration).is_supported());
 
-    let report =
-        verify_video_decoder_conformance(&native_av1_video_decoder_factory(), &vector, limits)
-            .unwrap();
-    assert_eq!(report.frames_verified, 2304);
-    assert_eq!(report.access_patterns_verified, 3);
+    let mut reader = ExactFrameReader::new(
+        &factory,
+        vector.configuration.clone(),
+        vector.samples.clone(),
+        limits,
+    )
+    .unwrap();
+    let cancellation = CancellationToken::new();
+    let order = (0..768).chain([5, 400, 401, 3]);
+    for index in order {
+        let frame = reader.get(FrameIndex(index), &cancellation).unwrap();
+        assert_eq!(
+            FrameDigest::from_frame(&frame).unwrap(),
+            expected[index as usize],
+            "frame {index}"
+        );
+    }
 }

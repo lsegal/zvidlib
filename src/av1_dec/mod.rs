@@ -130,6 +130,7 @@ pub(crate) struct Decoder {
     ref_order_hint: [u32; NUM_REF_FRAMES],
     frame: Option<FrameInProgress>,
     output_wanted: bool,
+    frames_shown: u64,
 }
 
 impl Decoder {
@@ -142,6 +143,7 @@ impl Decoder {
             ref_order_hint: [0; NUM_REF_FRAMES],
             frame: None,
             output_wanted: true,
+            frames_shown: 0,
         }
     }
 
@@ -157,6 +159,12 @@ impl Decoder {
     /// kept as references) either way.
     pub(crate) fn set_output_wanted(&mut self, wanted: bool) {
         self.output_wanted = wanted;
+    }
+
+    /// How many frames the decoder has shown, whether or not they were
+    /// converted for output.
+    pub(crate) fn frames_shown(&self) -> u64 {
+        self.frames_shown
     }
 
     /// Decodes one temporal unit (a low-overhead OBU sequence), returning the
@@ -548,6 +556,9 @@ impl Decoder {
                 self.refs[i] = Some(Arc::clone(&slot));
             }
         }
+        if fh.show_frame {
+            self.frames_shown += 1;
+        }
         if fh.show_frame && self.output_wanted {
             Ok(Some(self.output_picture(seq, &slot, &fh.film_grain)))
         } else {
@@ -572,6 +583,7 @@ impl Decoder {
                 self.refs[i] = Some(Arc::clone(&slot));
             }
         }
+        self.frames_shown += 1;
         if !self.output_wanted {
             return Ok(None);
         }

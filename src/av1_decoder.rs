@@ -160,7 +160,13 @@ impl VideoDecoder for Av1Decoder {
         }
         // A temporal unit shows exactly one frame; with spatial layers the
         // last picture shown is the highest layer, the one to present.
-        let Some(picture) = self.inner.decode_temporal_unit(&sample.data)?.pop() else {
+        let shown_before = self.inner.frames_shown();
+        let pictures = self.inner.decode_temporal_unit(&sample.data)?;
+        if self.inner.frames_shown() == shown_before {
+            return Err(malformed("AV1 temporal unit does not show a frame"));
+        }
+        let Some(picture) = pictures.into_iter().next_back() else {
+            // The caller asked not to see this frame.
             return Ok(Vec::new());
         };
         let frame = picture_to_rgba(&picture, &self.configuration, &self.limits)?;
