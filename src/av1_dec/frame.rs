@@ -80,8 +80,6 @@ impl FrameBuf {
 
 /// The per-4x4 block mode info the decode process stores for each frame.
 pub(crate) struct ModeInfo {
-    pub(crate) mi_rows: usize,
-    pub(crate) mi_cols: usize,
     pub(crate) y_modes: Vec<u8>,
     pub(crate) uv_modes: Vec<u8>,
     pub(crate) ref_frames: Vec<[i8; 2]>,
@@ -107,8 +105,6 @@ impl ModeInfo {
     pub(crate) fn new(mi_rows: usize, mi_cols: usize) -> Self {
         let n = mi_rows * mi_cols;
         Self {
-            mi_rows,
-            mi_cols,
             y_modes: vec![0; n],
             uv_modes: vec![0; n],
             ref_frames: vec![[INTRA_FRAME, NONE]; n],
@@ -129,11 +125,6 @@ impl ModeInfo {
             delta_lfs: vec![[0; FRAME_LF_COUNT]; n],
             tx_types: vec![0; n],
         }
-    }
-
-    #[inline(always)]
-    pub(crate) fn idx(&self, row: usize, col: usize) -> usize {
-        row * self.mi_cols + col
     }
 }
 

@@ -17,13 +17,11 @@
 //! reconstructed data, independent of the entropy/prediction pipeline in
 //! [`crate::av1_intra_decoder`] and [`crate::av1_inter_decoder`]. The
 //! registered [`crate::VideoDecoderFactory`] (`crate::av1_decoder`,
-//! [`crate::native_av1_video_decoder_factory`]) currently only calls
-//! [`convert_to_rgba8`], the final output-conversion stage: the bounded
-//! `CodedLossless` streams [`crate::Av1InterDecoder`] accepts never signal
-//! deblocking, CDEF, loop restoration, super-resolution, or film grain (AV1
-//! spec §5.9.11), so the other stages in this module remain unreachable from
-//! that decoder today and are exercised only by this module's own unit
-//! tests.
+//! [`crate::native_av1_video_decoder_factory`]) only calls
+//! [`convert_to_rgba8`], the final output-conversion stage: it decodes with
+//! `crate::av1_dec`, which carries its own bit-exact implementation of every
+//! in-loop filter, so the other stages in this module are exercised only by
+//! [`crate::Av1InterDecoder`] and this module's own unit tests.
 //!
 //! Per-frame/per-sequence filter signaling is optional in AV1: every stage
 //! below accepts a disabled/`None` configuration and behaves as an

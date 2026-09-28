@@ -85,3 +85,37 @@ dependency. 512x288 keeps the pair under a megabyte together; the absolute
 per-frame decode cost at that size is smaller than the bundled 1080p sample's,
 but the ratio between the two arms - which is what the cadence question is
 about - is not affected by it.
+
+`big_buck_bunny_av1_yuv420.sha256` holds one canonical `FrameDigest` per
+presentation frame (0-767) of the bundled `examples/media/BigBuckBunny.av1.mp4`
+sample (SVT-AV1, 8-bit 4:2:0 Main, 960x540, limited range) as decoded by
+FFmpeg's libdav1d wrapper, fingerprinted as `Yuv420p8` frames with limited
+color range. They were generated offline with
+
+```sh
+ffmpeg -c:v libdav1d -i ../../../examples/media/BigBuckBunny.av1.mp4 \
+  -fps_mode passthrough -f rawvideo -pix_fmt yuv420p ref.yuv
+```
+
+and hashed as `FrameDigest::from_frame` does: the big-endian width and height,
+the `Yuv420p8` tag (4), the limited-range tag (1), the plane count (3), then
+each frame's Y, U and V samples. `src/av1_dec/tests.rs` checks the crate's AV1
+decoder against every one of them. `big_buck_bunny_av1_rgba.sha256` carries the
+`Rgba8` digests of the same libdav1d frames after this crate's BT.601
+`convert_to_rgba8` (`src/av1_filters.rs`), the conversion
+`native_av1_video_decoder_factory` applies to BT.601 (`matrix_coefficients` 6)
+streams; `tests/codec_conformance.rs` and the browser fallback test in
+`src/web_decoder.rs` compare the factory's output with them.
+
+`av1_main10_64x64.mp4` is a single 64x64 10-bit 4:2:0 AV1 Main frame, which
+the software AV1 decoder refuses because it decodes 8-bit streams only. It is
+the browser fallback's example of a track neither decoder can take, generated
+offline with
+
+```sh
+ffmpeg -f lavfi -i testsrc=size=64x64:rate=30 -frames:v 1 -c:v libaom-av1 \
+  -cpu-used 8 -crf 40 -pix_fmt yuv420p10le -movflags +faststart av1_main10_64x64.mp4
+```
+
+As above, FFmpeg is only the offline fixture generator and is not a build,
+test, or runtime dependency.

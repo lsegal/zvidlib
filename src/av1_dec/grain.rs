@@ -198,7 +198,7 @@ pub(crate) fn apply_film_grain(p: &FilmGrainParams, out: &mut OutPlanes<'_>) {
     // Add noise: build noise stripes, then the noise image, then blend.
     let w = out.width;
     let h = out.height;
-    let stripe_count = (h + 1) / 2 / 16 + 2;
+    let stripe_count = h.div_ceil(2) / 16 + 2;
     let stripe_w = w + 64;
     let mut noise_stripe: Vec<[Vec<i32>; 3]> = (0..stripe_count)
         .map(|_| {
@@ -213,7 +213,7 @@ pub(crate) fn apply_film_grain(p: &FilmGrainParams, out: &mut OutPlanes<'_>) {
     let mut y = 0usize;
     while y < h.div_ceil(2) {
         let mut rng = Rng(p.grain_seed);
-        rng.0 ^= ((((luma_num * 37 + 178) & 255) << 8) as u16) as u16;
+        rng.0 ^= (((luma_num * 37 + 178) & 255) << 8) as u16;
         rng.0 ^= ((luma_num * 173 + 105) & 255) as u16;
         let mut x = 0usize;
         while x < w.div_ceil(2) {

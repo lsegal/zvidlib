@@ -1560,10 +1560,6 @@ fn intra_edge_filter_strength(w: usize, h: usize, filter_type: bool, delta: i32)
             if d >= 56 {
                 strength = 1;
             }
-        } else if blk_wh <= 12 {
-            if d >= 40 {
-                strength = 1;
-            }
         } else if blk_wh <= 16 {
             if d >= 40 {
                 strength = 1;

@@ -587,13 +587,12 @@ impl<'a> TileDecoder<'a> {
         let bh4 = bh4(sub_size);
         let ss_x = self.seq.subsampling_x;
         let ss_y = self.seq.subsampling_y;
-        self.has_chroma = if bh4 == 1 && ss_y && (r & 1) == 0 {
-            false
-        } else if bw4 == 1 && ss_x && (c & 1) == 0 {
-            false
-        } else {
-            self.seq.num_planes > 1
-        };
+        self.has_chroma =
+            if (bh4 == 1 && ss_y && (r & 1) == 0) || (bw4 == 1 && ss_x && (c & 1) == 0) {
+                false
+            } else {
+                self.seq.num_planes > 1
+            };
         self.avail_u = self.is_inside(r as isize - 1, c as isize);
         self.avail_l = self.is_inside(r as isize, c as isize - 1);
         self.avail_u_chroma = self.avail_u;
@@ -812,9 +811,7 @@ impl<'a> TileDecoder<'a> {
         };
         let pred = if prev_u == -1 {
             if prev_l == -1 { 0 } else { prev_l }
-        } else if prev_l == -1 {
-            prev_u
-        } else if prev_ul == prev_u {
+        } else if prev_l == -1 || prev_ul == prev_u {
             prev_u
         } else {
             prev_l
@@ -1154,18 +1151,16 @@ impl<'a> TileDecoder<'a> {
                     self.segment_id = 0;
                     return;
                 }
-                if !pre_skip {
-                    if self.skip {
-                        let seg_id_predicted = 0;
-                        for i in 0..bw4(self.mi_size) {
-                            self.above_seg_pred_context[self.mi_col + i] = seg_id_predicted;
-                        }
-                        for i in 0..bh4(self.mi_size) {
-                            self.left_seg_pred_context[self.mi_row + i] = seg_id_predicted;
-                        }
-                        self.read_segment_id();
-                        return;
+                if !pre_skip && self.skip {
+                    let seg_id_predicted = 0;
+                    for i in 0..bw4(self.mi_size) {
+                        self.above_seg_pred_context[self.mi_col + i] = seg_id_predicted;
                     }
+                    for i in 0..bh4(self.mi_size) {
+                        self.left_seg_pred_context[self.mi_row + i] = seg_id_predicted;
+                    }
+                    self.read_segment_id();
+                    return;
                 }
                 if self.fh.segmentation.temporal_update {
                     let ctx = usize::from(self.left_seg_pred_context[self.mi_row])
@@ -1974,8 +1969,7 @@ impl<'a> TileDecoder<'a> {
     fn read_mv_component(&mut self, ctx: usize, comp: usize) -> i32 {
         let mv_sign = self.sd.symbol(&mut self.cdf.mv_sign[ctx][comp]);
         let mv_class = self.sd.symbol(&mut self.cdf.mv_class[ctx][comp]);
-        let mag;
-        if mv_class == 0 {
+        let mag = if mv_class == 0 {
             let mv_class0_bit = self.sd.symbol(&mut self.cdf.mv_class0_bit[ctx][comp]) as i32;
             let fr = if self.fh.force_integer_mv {
                 3
@@ -1989,14 +1983,13 @@ impl<'a> TileDecoder<'a> {
             } else {
                 1
             };
-            mag = ((mv_class0_bit << 3) | (fr << 1) | hp) + 1;
+            ((mv_class0_bit << 3) | (fr << 1) | hp) + 1
         } else {
             let mut d = 0i32;
             for i in 0..mv_class {
                 let bit = self.sd.symbol(&mut self.cdf.mv_bit[ctx][comp][i]) as i32;
                 d |= bit << i;
             }
-            let mut m = CLASS0_SIZE << (mv_class + 2);
             let fr = if self.fh.force_integer_mv {
                 3
             } else {
@@ -2007,9 +2000,9 @@ impl<'a> TileDecoder<'a> {
             } else {
                 1
             };
-            m += ((d << 3) | (fr << 1) | hp) + 1;
-            mag = m;
-        }
+            let m = CLASS0_SIZE << (mv_class + 2);
+            m + ((d << 3) | (fr << 1) | hp) + 1
+        };
         if mv_sign != 0 { -mag } else { mag }
     }
 
@@ -2088,9 +2081,9 @@ impl<'a> TileDecoder<'a> {
                 let unit_size = self.fh.loop_restoration_size[plane];
                 let unit_rows = self.f.lr[plane].unit_rows;
                 let unit_cols = self.f.lr[plane].unit_cols;
-                let unit_row_start = (r * (MI_SIZE >> sub_y) + unit_size - 1) / unit_size;
+                let unit_row_start = (r * (MI_SIZE >> sub_y)).div_ceil(unit_size);
                 let unit_row_end =
-                    unit_rows.min(((r + h) * (MI_SIZE >> sub_y) + unit_size - 1) / unit_size);
+                    unit_rows.min(((r + h) * (MI_SIZE >> sub_y)).div_ceil(unit_size));
                 let (numerator, denominator) = if self.fh.use_superres {
                     (
                         (MI_SIZE >> sub_x) * self.fh.superres_denom,
@@ -2099,9 +2092,8 @@ impl<'a> TileDecoder<'a> {
                 } else {
                     (MI_SIZE >> sub_x, unit_size)
                 };
-                let unit_col_start = (c * numerator + denominator - 1) / denominator;
-                let unit_col_end =
-                    unit_cols.min(((c + w) * numerator + denominator - 1) / denominator);
+                let unit_col_start = (c * numerator).div_ceil(denominator);
+                let unit_col_end = unit_cols.min(((c + w) * numerator).div_ceil(denominator));
                 for unit_row in unit_row_start..unit_row_end {
                     for unit_col in unit_col_start..unit_col_end {
                         self.read_lr_unit(plane, unit_row, unit_col);

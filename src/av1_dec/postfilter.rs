@@ -101,7 +101,7 @@ impl Ctx<'_> {
 
 /// The loop filter process (section 7.14), in place on `curr`.
 pub(crate) fn loop_filter(seq: &SequenceHeader, fh: &FrameHeader, f: &mut FrameState) {
-    let mut planes = std::mem::replace(&mut f.curr.planes, Vec::new());
+    let mut planes = std::mem::take(&mut f.curr.planes);
     {
         let ctx = Ctx { seq, fh, f };
         for plane in 0..seq.num_planes {

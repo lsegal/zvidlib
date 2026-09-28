@@ -266,22 +266,4 @@ impl CdfContext {
         self.coeff_base = DEFAULT_COEFF_BASE_CDF[idx];
         self.coeff_br = DEFAULT_COEFF_BR_CDF[idx];
     }
-
-    /// Replaces the coefficient CDFs with another context's, as
-    /// `load_cdfs` would for them alone.
-    pub(crate) fn copy_coeff_cdfs_from(&mut self, other: &Self) {
-        self.txb_skip = other.txb_skip;
-        self.eob_pt_16 = other.eob_pt_16;
-        self.eob_pt_32 = other.eob_pt_32;
-        self.eob_pt_64 = other.eob_pt_64;
-        self.eob_pt_128 = other.eob_pt_128;
-        self.eob_pt_256 = other.eob_pt_256;
-        self.eob_pt_512 = other.eob_pt_512;
-        self.eob_pt_1024 = other.eob_pt_1024;
-        self.eob_extra = other.eob_extra;
-        self.dc_sign = other.dc_sign;
-        self.coeff_base_eob = other.coeff_base_eob;
-        self.coeff_base = other.coeff_base;
-        self.coeff_br = other.coeff_br;
-    }
 }

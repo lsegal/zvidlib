@@ -20,6 +20,11 @@
 //! CDF adaptation; and every in-loop filter. Malformed input returns
 //! [`ErrorKind::MalformedMedia`] rather than panicking.
 
+// The processes below follow the specification's pseudocode, which indexes
+// several parallel arrays with one loop variable; keeping that shape makes
+// each function checkable line by line against the section it implements.
+#![allow(clippy::needless_range_loop)]
+
 mod bits;
 mod cdf;
 mod consts;
@@ -72,7 +77,6 @@ const OBU_TILE_LIST: u8 = 8;
 /// process (section 7.20).
 pub(crate) struct RefSlot {
     pub(crate) upscaled_width: usize,
-    pub(crate) frame_width: usize,
     pub(crate) frame_height: usize,
     pub(crate) render_width: usize,
     pub(crate) render_height: usize,
@@ -153,11 +157,6 @@ impl Decoder {
     /// kept as references) either way.
     pub(crate) fn set_output_wanted(&mut self, wanted: bool) {
         self.output_wanted = wanted;
-    }
-
-    /// The most recent sequence header's properties relevant to callers.
-    pub(crate) fn sequence(&self) -> Option<&SequenceHeader> {
-        self.sequence.as_ref()
     }
 
     /// Decodes one temporal unit (a low-overhead OBU sequence), returning the
@@ -521,7 +520,6 @@ impl Decoder {
         let lr_frame = Arc::new(lr_frame);
         let slot = Arc::new(RefSlot {
             upscaled_width: fh.upscaled_width,
-            frame_width: fh.frame_width,
             frame_height: fh.frame_height,
             render_width: fh.render_width,
             render_height: fh.render_height,
@@ -777,3 +775,6 @@ fn project(v8: i32, delta: i32, dst_sign: i32, max8: i32, max_off8: i32) -> Opti
         Some(v8)
     }
 }
+
+#[cfg(test)]
+mod tests;

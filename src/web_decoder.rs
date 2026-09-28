@@ -951,9 +951,8 @@ mod tests {
         );
     }
 
-    /// A lossless monochrome AV1 track, the subset the crate's AV1 decoder
-    /// covers, decodes through the fallback back to the exact gray levels it
-    /// was encoded from.
+    /// A lossless monochrome AV1 track decodes through the fallback back to
+    /// the exact gray levels it was encoded from.
     #[wasm_bindgen_test(async)]
     async fn software_fallback_decodes_av1_back_to_its_source() {
         use crate::codec::{VideoEncoderConfig, VideoEncoderFactory};
@@ -1047,20 +1046,68 @@ mod tests {
         }
     }
 
-    /// A track neither `WebCodecs` nor the software decoder can take is still
-    /// reported `Unsupported`, naming why the fallback refused it.
+    /// Issue #509: a colour AV1 track (the bundled SVT-AV1 8-bit 4:2:0 Main
+    /// sample) decodes through the fallback. The digests are FFmpeg/libdav1d's
+    /// decode of the same frames converted by the crate's own BT.601 RGBA
+    /// conversion, the lines of `tests/fixtures/codec/big_buck_bunny_av1_rgba.sha256`
+    /// the native conformance test checks every frame against; frame 20 is
+    /// reached by walking forwards from the random-access point at frame 0.
     #[wasm_bindgen_test(async)]
-    async fn a_track_the_software_decoder_refuses_stays_unsupported() {
+    async fn software_fallback_decodes_colour_av1_like_an_independent_decoder() {
         const COLOR_AV1: &[u8] = include_bytes!("../examples/media/BigBuckBunny.av1.mp4");
-        let error = match WebVideoDecodeSession::open_with(
+        let mut session = WebVideoDecodeSession::open_with(
             COLOR_AV1,
             0,
             &Limits::default(),
             BackendChoice::SoftwareOnly,
         )
         .await
+        .unwrap();
+        assert!(session.is_software());
+        assert_eq!(
+            (session.dimensions().width, session.dimensions().height),
+            (960, 540)
+        );
+        assert_eq!(session.frame_count(), 768);
+        let expected = [
+            (
+                0,
+                "3c7fbf07cee4f4e3b72c9667061e162362019f6aea2c035fad2032180dd8742f",
+            ),
+            (
+                1,
+                "2c189d695e847d075bb765611f51287594eca1e8bbabc5a403c6d623c21dc5c7",
+            ),
+            (
+                20,
+                "387c5e72026d94a8c123c3e27977e44a84bc6ec902629e7f44b040c957979886",
+            ),
+        ];
+        for (frame, expected) in expected {
+            let (dimensions, rgba) = session
+                .get(FrameIndex(frame), &CancellationToken::new())
+                .await
+                .unwrap();
+            assert_eq!(rgba.len(), 960 * 540 * 4);
+            assert_eq!(digest(dimensions, rgba), expected, "frame {frame}");
+        }
+    }
+
+    /// A track neither `WebCodecs` nor the software decoder can take is still
+    /// reported `Unsupported`, naming why the fallback refused it. The software
+    /// AV1 decoder covers 8-bit streams, so a 10-bit Main track is refused.
+    #[wasm_bindgen_test(async)]
+    async fn a_track_the_software_decoder_refuses_stays_unsupported() {
+        const MAIN_10_AV1: &[u8] = include_bytes!("../tests/fixtures/codec/av1_main10_64x64.mp4");
+        let error = match WebVideoDecodeSession::open_with(
+            MAIN_10_AV1,
+            0,
+            &Limits::default(),
+            BackendChoice::SoftwareOnly,
+        )
+        .await
         {
-            Ok(_) => panic!("the AV1 software decoder covers monochrome streams only"),
+            Ok(_) => panic!("the AV1 software decoder covers 8-bit streams only"),
             Err(error) => error,
         };
         assert_eq!(error.kind(), ErrorKind::Unsupported);

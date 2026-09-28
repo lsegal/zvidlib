@@ -22,7 +22,8 @@ fn brev(num_bits: u32, x: usize) -> usize {
 #[inline(always)]
 fn cos128(angle: i32) -> i64 {
     let angle2 = angle & 255;
-    let v = if angle2 <= 64 {
+
+    if angle2 <= 64 {
         COS128_LOOKUP[angle2 as usize] as i64
     } else if angle2 <= 128 {
         -(COS128_LOOKUP[(128 - angle2) as usize] as i64)
@@ -30,8 +31,7 @@ fn cos128(angle: i32) -> i64 {
         -(COS128_LOOKUP[(angle2 - 128) as usize] as i64)
     } else {
         COS128_LOOKUP[(256 - angle2) as usize] as i64
-    };
-    v
+    }
 }
 
 #[inline(always)]
