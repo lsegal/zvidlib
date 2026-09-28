@@ -19,6 +19,8 @@ pub(crate) const SUPERBLOCK_128: u32 = 1 << 13;
 pub(crate) const SEGMENTATION: u32 = 1 << 14;
 pub(crate) const DELTA_Q: u32 = 1 << 15;
 pub(crate) const DELTA_LF: u32 = 1 << 16;
+#[cfg(test)]
+pub(crate) const ALL: u32 = (1 << 17) - 1;
 
 #[cfg(test)]
 thread_local! {
