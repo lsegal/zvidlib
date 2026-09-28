@@ -6,6 +6,7 @@ use std::sync::Arc;
 use super::RefSlot;
 use super::cdf::CdfContext;
 use super::consts::*;
+use super::coverage;
 use super::frame::FrameState;
 use super::header::{FrameHeader, SequenceHeader};
 use super::symbol::SymbolDecoder;
@@ -626,6 +627,7 @@ impl<'a> TileDecoder<'a> {
         self.uv_mode = DC_PRED;
 
         self.mode_info();
+        self.note_tools();
         self.palette_tokens();
         self.read_block_tx_size();
         if self.skip {
@@ -691,6 +693,32 @@ impl<'a> TileDecoder<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Records the block-level tools this block uses (see `coverage`).
+    fn note_tools(&self) {
+        let mut tools = 0;
+        if self.palette_size_y > 0 || self.palette_size_uv > 0 {
+            tools |= coverage::PALETTE;
+        }
+        if self.use_intrabc {
+            tools |= coverage::INTRA_BLOCK_COPY;
+        }
+        if self.use_filter_intra {
+            tools |= coverage::FILTER_INTRA;
+        }
+        if self.ref_frame[1] > INTRA_FRAME {
+            tools |= match self.compound_type {
+                COMPOUND_WEDGE => coverage::WEDGE_COMPOUND,
+                COMPOUND_DIFFWTD => coverage::DIFF_WEIGHTED_COMPOUND,
+                COMPOUND_DISTANCE => coverage::DISTANCE_WEIGHTED_COMPOUND,
+                _ => 0,
+            };
+        }
+        if self.is_inter && self.interp_filter[0] != self.interp_filter[1] {
+            tools |= coverage::DUAL_FILTER;
+        }
+        coverage::note(tools);
     }
 
     fn reset_block_context(&mut self, bw4: usize, bh4: usize) {

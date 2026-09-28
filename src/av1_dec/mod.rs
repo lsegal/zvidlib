@@ -28,6 +28,7 @@
 mod bits;
 mod cdf;
 mod consts;
+mod coverage;
 mod frame;
 mod grain;
 mod header;
@@ -119,6 +120,31 @@ struct FrameInProgress {
     cdf: Box<CdfContext>,
     saved_cdf: Option<Box<CdfContext>>,
     next_tile: usize,
+}
+
+/// Records the frame-level tools `fh` uses (see `coverage`).
+fn note_frame_tools(seq: &SequenceHeader, fh: &FrameHeader) {
+    let flags = [
+        (fh.use_superres, coverage::SUPERRES),
+        (fh.using_qmatrix, coverage::QUANTIZER_MATRIX),
+        (
+            fh.tile_info.tile_cols * fh.tile_info.tile_rows > 1,
+            coverage::MULTIPLE_TILES,
+        ),
+        (
+            fh.tile_info.context_update_tile_id != 0,
+            coverage::CONTEXT_UPDATE_TILE_ID,
+        ),
+        (seq.use_128x128_superblock, coverage::SUPERBLOCK_128),
+        (fh.segmentation.enabled, coverage::SEGMENTATION),
+        (fh.delta_q_present, coverage::DELTA_Q),
+        (fh.delta_lf_present, coverage::DELTA_LF),
+    ];
+    for (used, tool) in flags {
+        if used {
+            coverage::note(tool);
+        }
+    }
 }
 
 /// The stateful decoder.
@@ -305,6 +331,7 @@ impl Decoder {
             seq.subsampling_y,
             &self.limits,
         )?;
+        note_frame_tools(seq, &fh);
         let mi = ModeInfo::new(fh.mi_rows, fh.mi_cols);
         let mut prev_segment_ids = vec![0u8; fh.mi_rows * fh.mi_cols];
         let cdf = if fh.primary_ref_frame == PRIMARY_REF_NONE {
@@ -453,6 +480,7 @@ impl Decoder {
         }
         frame.next_tile = tg_end + 1;
         if tg_end != num_tiles - 1 {
+            coverage::note(coverage::MULTIPLE_TILE_GROUPS);
             self.frame = Some(frame);
             return Ok(None);
         }
@@ -616,6 +644,7 @@ impl Decoder {
             planes.push(out);
         }
         if seq.film_grain_params_present && grain.apply_grain {
+            coverage::note(coverage::FILM_GRAIN);
             let mut out = grain::OutPlanes {
                 planes: &mut planes,
                 width: w,

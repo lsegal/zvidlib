@@ -21,7 +21,11 @@ fn block_on<T>(future: impl Future<Output = T>) -> T {
 }
 
 fn samples() -> Vec<EncodedVideoSample> {
-    let source = MemorySource::new(COLOR_AV1.to_vec());
+    samples_of(COLOR_AV1)
+}
+
+fn samples_of(mp4: &[u8]) -> Vec<EncodedVideoSample> {
+    let source = MemorySource::new(mp4.to_vec());
     let movie = block_on(Mp4Demuxer::open(&source, Mp4DemuxerOptions::default())).unwrap();
     let track = movie.track(1).unwrap();
     block_on(track.to_encoded_video_samples(&source, &Limits::default())).unwrap()
@@ -159,4 +163,28 @@ fn limits_bound_frame_size_and_obu_count() {
         .decode_temporal_unit(&samples[0].data)
         .unwrap_err();
     assert_eq!(error.kind(), ErrorKind::ResourceLimit);
+}
+
+#[test]
+#[ignore]
+fn probe() {
+    let data = std::fs::read(std::env::var("AV1_PROBE").unwrap()).unwrap();
+    let mut decoder = Decoder::new(Limits::default());
+    let _ = coverage::take();
+    let mut shown = 0;
+    let mut out = String::new();
+    for sample in samples_of(&data) {
+        match decoder.decode_temporal_unit(&sample.data) {
+            Ok(pictures) => for picture in pictures {
+                out += &format!("{shown} {}
+", yuv_digest(&picture).to_hex());
+                shown += 1;
+            },
+            Err(e) => { out += &format!("ERR {e}
+"); break; }
+        }
+    }
+    out += &format!("TOOLS {:#x}
+", coverage::take());
+    std::fs::write(std::env::var("AV1_PROBE_OUT").unwrap(), out).unwrap();
 }
