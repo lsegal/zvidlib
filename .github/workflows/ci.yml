@@ -147,8 +147,9 @@ jobs:
       - name: Test library units
         run: cargo test --features native --lib
       # Pins no-cover output byte for byte and round-trips JPEG and PNG cover
-      # art through `Mp4Muxer` and `Mp4Demuxer` (#502); the ffprobe check in it
-      # skips itself where ffprobe is not installed.
+      # art through `Mp4Muxer` and `Mp4Demuxer` (#502), and checks the cover
+      # `MediaOutput` generates from a frame (#510); the ffprobe and ffmpeg
+      # checks in it skip themselves where those tools are not installed.
       - name: Test MP4 cover art
         run: cargo test --features native --test mp4_cover_art
       - name: Test AV1 SIMD motion compensation
