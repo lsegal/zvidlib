@@ -5,11 +5,23 @@
 //! Because decode is inherently asynchronous here, this does not implement
 //! the portable, synchronous [`crate::codec::VideoDecoder`] trait; it is a
 //! browser-only bridge kept out of the portable core.
+//!
+//! When the browser reports a track's configuration unsupported - HEVC in
+//! Chrome, Edge and WebView2 is the common case - the session falls back to
+//! the crate's own portable software decoder for that codec instead, driven
+//! through the same [`ExactFrameReader`] native callers use (issue #504).
+//! `WebCodecs` stays preferred whenever the browser supports the config: it is
+//! usually hardware and always faster, while the fallback decodes on the
+//! calling thread and is meant for the handful of frames a thumbnail or a
+//! preview pass needs rather than real-time playback.
 
-use crate::codec::{CancellationToken, EncodedVideoSample};
+use crate::codec::{
+    CancellationToken, CodecProfile, EncodedVideoSample, ExactFrameReader, HardwarePreference,
+    VideoDecoderConfig, VideoDecoderFactory,
+};
 use crate::codec_config::{box_payload, derive_codec_string};
 use crate::io::MemorySource;
-use crate::media::{Codec, VideoDimensions};
+use crate::media::{Codec, ColorRange, PixelFormat, VideoDimensions, VideoFrame};
 use crate::mp4_demux::{Mp4Demuxer, Mp4DemuxerOptions, Mp4Track};
 use crate::timeline::FrameIndex;
 use crate::{Error, ErrorKind, Limits, Result};
@@ -134,12 +146,216 @@ pub async fn video_random_access_points(
     Ok(points)
 }
 
-/// A lazily-configured `WebCodecs` decode session for one input video track.
+/// An exact-frame decode session for one input video track, on the browser's
+/// `WebCodecs` decoder when it supports the track and on the crate's software
+/// decoder otherwise.
 pub struct WebVideoDecodeSession {
-    samples: Vec<EncodedVideoSample>,
     /// The track's coded size, which a caller sizing a preview budget against it
     /// needs before it has decoded anything (see [`crate::web_previews`]).
     dimensions: VideoDimensions,
+    frame_count: u64,
+    backend: DecodeBackend,
+}
+
+enum DecodeBackend {
+    WebCodecs(WebCodecsDecoder),
+    Software(SoftwareDecoder),
+}
+
+/// Which decoders [`WebVideoDecodeSession::open_with`] may choose between.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BackendChoice {
+    /// `WebCodecs` when the browser supports the config, software otherwise.
+    Automatic,
+    /// Software whatever the browser supports, so a test covers the fallback
+    /// even in a browser that happens to decode the codec itself.
+    #[cfg(test)]
+    SoftwareOnly,
+}
+
+impl WebVideoDecodeSession {
+    pub async fn open(bytes: &[u8], track_index: u32, limits: &Limits) -> Result<Self> {
+        Self::open_with(bytes, track_index, limits, BackendChoice::Automatic).await
+    }
+
+    async fn open_with(
+        bytes: &[u8],
+        track_index: u32,
+        limits: &Limits,
+        choice: BackendChoice,
+    ) -> Result<Self> {
+        let source = MemorySource::new(bytes.to_vec());
+        let track = parse_video_track(&source, track_index, limits).await?;
+        let dimensions = track.dimensions.ok_or_else(|| {
+            Error::new(ErrorKind::MalformedMedia, "video track has no dimensions")
+        })?;
+        let derived = derive_codec_string(track.codec, &track.decoder_config)?;
+        let description = codec_description(track.codec, &track.decoder_config)?;
+
+        let config = JsVideoDecoderConfig::new(&derived.codec_string);
+        config.set_coded_width(dimensions.width);
+        config.set_coded_height(dimensions.height);
+        config.set_description_u8_array(&js_sys::Uint8Array::from(description));
+        config.set_optimize_for_latency(true);
+
+        let webcodecs_supported = match choice {
+            BackendChoice::Automatic => {
+                let support: VideoDecoderSupport =
+                    JsFuture::from(js_to_promise(JsVideoDecoder::is_config_supported(&config)))
+                        .await
+                        .map_err(|error| {
+                            normalize_js_error(error, "querying WebCodecs decoder support")
+                        })?
+                        .unchecked_into();
+                support.get_supported().unwrap_or(false)
+            }
+            #[cfg(test)]
+            BackendChoice::SoftwareOnly => false,
+        };
+
+        let samples = track.to_encoded_video_samples(&source, limits).await?;
+        let frame_count = samples.len() as u64;
+        let backend = if webcodecs_supported {
+            DecodeBackend::WebCodecs(WebCodecsDecoder::open(config, samples, limits)?)
+        } else {
+            let decoder =
+                SoftwareDecoder::open(&track, dimensions, samples, limits).map_err(|error| {
+                    Error::new(
+                        ErrorKind::Unsupported,
+                        format!(
+                            "this browser cannot decode {} via WebCodecs, and the software \
+                             decoder cannot either: {}",
+                            derived.codec_string,
+                            error.message()
+                        ),
+                    )
+                })?;
+            DecodeBackend::Software(decoder)
+        };
+        Ok(Self {
+            dimensions,
+            frame_count,
+            backend,
+        })
+    }
+
+    /// The track's coded size.
+    pub fn dimensions(&self) -> VideoDimensions {
+        self.dimensions
+    }
+
+    /// How many presentation frames the track has.
+    pub fn frame_count(&self) -> u64 {
+        self.frame_count
+    }
+
+    /// Whether this session decodes in software because `WebCodecs` could not.
+    #[cfg(test)]
+    fn is_software(&self) -> bool {
+        matches!(self.backend, DecodeBackend::Software(_))
+    }
+
+    /// Decodes and returns exactly the requested presentation frame as RGBA bytes.
+    ///
+    /// A single group of pictures can be hundreds of frames long, so a caller that has moved on -
+    /// a timeline scrub whose pointer is already somewhere else - cancels the request rather than
+    /// waiting for a frame it will not draw.
+    pub async fn get(
+        &mut self,
+        presentation_index: FrameIndex,
+        cancellation: &CancellationToken,
+    ) -> Result<(VideoDimensions, Vec<u8>)> {
+        match &mut self.backend {
+            DecodeBackend::WebCodecs(decoder) => {
+                decoder.get(presentation_index, cancellation).await
+            }
+            DecodeBackend::Software(decoder) => decoder.get(presentation_index, cancellation).await,
+        }
+    }
+}
+
+/// The crate's own software decoder for `codec`.
+fn software_decoder_factory(codec: Codec) -> Result<Box<dyn VideoDecoderFactory>> {
+    match codec {
+        Codec::Hevc => Ok(Box::new(crate::native_hevc_video_decoder_factory())),
+        Codec::Av1 => Ok(Box::new(crate::native_av1_video_decoder_factory())),
+        Codec::UncompressedVideo | Codec::Aac => Err(Error::new(
+            ErrorKind::Unsupported,
+            "only HEVC and AV1 have a software decoder backend",
+        )),
+    }
+}
+
+/// The portable software decoder, behind the same exact-frame reader native
+/// callers use.
+struct SoftwareDecoder {
+    reader: ExactFrameReader,
+}
+
+impl SoftwareDecoder {
+    fn open(
+        track: &Mp4Track,
+        dimensions: VideoDimensions,
+        samples: Vec<EncodedVideoSample>,
+        limits: &Limits,
+    ) -> Result<Self> {
+        let factory = software_decoder_factory(track.codec)?;
+        let profile = match track.codec {
+            Codec::Av1 => CodecProfile::Av1Main,
+            _ => CodecProfile::HevcMain,
+        };
+        // The decoders validate the configuration record itself, so a stream
+        // they cannot decode (HEVC Main 10, say) is refused here, at open,
+        // rather than on its first frame.
+        let configuration = VideoDecoderConfig {
+            codec: track.codec,
+            profile,
+            coded_dimensions: dimensions,
+            output_format: PixelFormat::Rgba8,
+            color_range: ColorRange::Limited,
+            hardware: HardwarePreference::Avoid,
+            configuration: track.decoder_config.clone(),
+        };
+        let reader = ExactFrameReader::new(factory.as_ref(), configuration, samples, *limits)?;
+        Ok(Self { reader })
+    }
+
+    async fn get(
+        &mut self,
+        presentation_index: FrameIndex,
+        cancellation: &CancellationToken,
+    ) -> Result<(VideoDimensions, Vec<u8>)> {
+        // The decode itself runs to completion on this thread, so an abort can
+        // only land between requests. Yielding once first is what lets a scrub
+        // that has already moved on cancel a stale request before it starts.
+        yield_to_event_loop().await;
+        let frame = self.reader.get(presentation_index, cancellation)?;
+        Ok((frame.dimensions, packed_rgba(&frame)))
+    }
+}
+
+/// The frame's RGBA rows without stride padding, the layout a `WebCodecs`
+/// copy produces and every caller of [`WebVideoDecodeSession::get`] expects.
+fn packed_rgba(frame: &VideoFrame) -> Vec<u8> {
+    let plane = &frame.planes[0];
+    let row = frame.dimensions.width as usize * 4;
+    plane
+        .data
+        .chunks(plane.stride)
+        .take(frame.dimensions.height as usize)
+        .flat_map(|line| &line[..row])
+        .copied()
+        .collect()
+}
+
+async fn yield_to_event_loop() {
+    let promise = js_sys::Promise::new(&mut |resolve, _reject| schedule_event_loop_tick(&resolve));
+    let _ = JsFuture::from(promise).await;
+}
+
+/// A lazily-configured `WebCodecs` decode session for one input video track.
+struct WebCodecsDecoder {
+    samples: Vec<EncodedVideoSample>,
     decode_position_by_presentation: HashMap<FrameIndex, usize>,
     decoder: JsVideoDecoder,
     config: JsVideoDecoderConfig,
@@ -179,37 +395,12 @@ pub struct WebVideoDecodeSession {
     _error_closure: Closure<dyn FnMut(JsValue)>,
 }
 
-impl WebVideoDecodeSession {
-    pub async fn open(bytes: &[u8], track_index: u32, limits: &Limits) -> Result<Self> {
-        let source = MemorySource::new(bytes.to_vec());
-        let track = parse_video_track(&source, track_index, limits).await?;
-        let dimensions = track.dimensions.ok_or_else(|| {
-            Error::new(ErrorKind::MalformedMedia, "video track has no dimensions")
-        })?;
-        let derived = derive_codec_string(track.codec, &track.decoder_config)?;
-        let description = codec_description(track.codec, &track.decoder_config)?;
-
-        let config = JsVideoDecoderConfig::new(&derived.codec_string);
-        config.set_coded_width(dimensions.width);
-        config.set_coded_height(dimensions.height);
-        config.set_description_u8_array(&js_sys::Uint8Array::from(description));
-        config.set_optimize_for_latency(true);
-
-        let support: VideoDecoderSupport =
-            JsFuture::from(js_to_promise(JsVideoDecoder::is_config_supported(&config)))
-                .await
-                .map_err(|error| normalize_js_error(error, "querying WebCodecs decoder support"))?
-                .unchecked_into();
-        if !support.get_supported().unwrap_or(false) {
-            return Err(Error::new(
-                ErrorKind::Unsupported,
-                format!(
-                    "this browser cannot decode {} via WebCodecs",
-                    derived.codec_string
-                ),
-            ));
-        }
-
+impl WebCodecsDecoder {
+    fn open(
+        config: JsVideoDecoderConfig,
+        samples: Vec<EncodedVideoSample>,
+        limits: &Limits,
+    ) -> Result<Self> {
         let pending_frames: Rc<RefCell<Vec<JsVideoFrame>>> = Rc::new(RefCell::new(Vec::new()));
         let decode_error: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
         let waker: Rc<RefCell<Option<js_sys::Function>>> = Rc::new(RefCell::new(None));
@@ -245,15 +436,13 @@ impl WebVideoDecodeSession {
             .configure(&config)
             .map_err(|error| normalize_js_error(error, "configuring the WebCodecs VideoDecoder"))?;
 
-        let mut decode_position_by_presentation = HashMap::with_capacity(track.samples.len());
-        let samples = track.to_encoded_video_samples(&source, limits).await?;
+        let mut decode_position_by_presentation = HashMap::with_capacity(samples.len());
         for (position, sample) in samples.iter().enumerate() {
             decode_position_by_presentation.insert(sample.presentation_index, position);
         }
 
         Ok(Self {
             samples,
-            dimensions,
             decode_position_by_presentation,
             decoder,
             config,
@@ -270,16 +459,6 @@ impl WebVideoDecodeSession {
         })
     }
 
-    /// The track's coded size.
-    pub fn dimensions(&self) -> VideoDimensions {
-        self.dimensions
-    }
-
-    /// How many presentation frames the track has.
-    pub fn frame_count(&self) -> u64 {
-        self.samples.len() as u64
-    }
-
     fn nearest_random_access(&self, position: usize) -> usize {
         (0..=position)
             .rev()
@@ -289,11 +468,9 @@ impl WebVideoDecodeSession {
 
     /// Decodes and returns exactly the requested presentation frame as RGBA bytes.
     ///
-    /// A single group of pictures can be hundreds of frames long, so a caller that has moved on -
-    /// a timeline scrub whose pointer is already somewhere else - cancels the request rather than
-    /// waiting for a frame it will not draw. The token is checked on every turn of the decode
-    /// loop, so cancelling stops the decode part-way through instead of after it.
-    pub async fn get(
+    /// The token is checked on every turn of the decode loop, so cancelling stops the decode
+    /// part-way through instead of after it.
+    async fn get(
         &mut self,
         presentation_index: FrameIndex,
         cancellation: &CancellationToken,
@@ -539,7 +716,7 @@ impl WebVideoDecodeSession {
     }
 }
 
-impl Drop for WebVideoDecodeSession {
+impl Drop for WebCodecsDecoder {
     fn drop(&mut self) {
         self.close_pending_frames();
         self.close_cached_frames();
