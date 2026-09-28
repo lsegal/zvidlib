@@ -1289,16 +1289,15 @@ fn segmentation_params(b: &mut BitReader<'_>, fh: &mut FrameHeader) -> Result<()
     let seg = &mut fh.segmentation;
     seg.enabled = b.flag()?;
     if seg.enabled {
-        let update_data;
-        if fh.primary_ref_frame == PRIMARY_REF_NONE {
+        let update_data = if fh.primary_ref_frame == PRIMARY_REF_NONE {
             seg.update_map = true;
             seg.temporal_update = false;
-            update_data = true;
+            true
         } else {
             seg.update_map = b.flag()?;
             seg.temporal_update = if seg.update_map { b.flag()? } else { false };
-            update_data = b.flag()?;
-        }
+            b.flag()?
+        };
         if update_data {
             for i in 0..MAX_SEGMENTS {
                 for j in 0..SEG_LVL_MAX {
