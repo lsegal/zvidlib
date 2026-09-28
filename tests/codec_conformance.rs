@@ -99,9 +99,8 @@ fn native_hevc_decoder_conforms_for_main10() {
         })
         .collect::<Vec<_>>();
     let limits = Limits::default();
-    let source = MemorySource::new(
-        include_bytes!("fixtures/codec/bbb_hevc_main10_128x72.mp4").to_vec(),
-    );
+    let source =
+        MemorySource::new(include_bytes!("fixtures/codec/bbb_hevc_main10_128x72.mp4").to_vec());
     let vector = block_on(VideoDecoderConformanceVector::from_mp4(
         "HEVC Main 10 sample",
         &source,

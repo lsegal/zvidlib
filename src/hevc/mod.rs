@@ -737,12 +737,11 @@ mod tests {
     /// `yuv420p10le` decode of the same fixture exactly.
     #[test]
     fn main10_pictures_match_an_independent_reference_decode() {
-        let expected = include_str!(
-            "../../tests/fixtures/codec/bbb_hevc_main10_128x72_yuv420p10le.sha256"
-        )
-        .lines()
-        .map(|line| line.split_once(' ').unwrap().1.to_owned())
-        .collect::<Vec<_>>();
+        let expected =
+            include_str!("../../tests/fixtures/codec/bbb_hevc_main10_128x72_yuv420p10le.sha256")
+                .lines()
+                .map(|line| line.split_once(' ').unwrap().1.to_owned())
+                .collect::<Vec<_>>();
         let limits = Limits::default();
         let (configuration, samples) =
             main10_fixture(CodecProfile::HevcMain10, HardwarePreference::Avoid);
