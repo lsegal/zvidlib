@@ -819,10 +819,21 @@ impl ExactFrameReader {
         self.cache.len()
     }
 
+    /// The random-access point a decode reaching `target_position` starts from.
+    ///
+    /// A random-access point presented *after* the target cannot be it, even when it comes
+    /// first in decode order: the target is then one of its leading pictures, and an open-GOP
+    /// stream's leading pictures (HEVC RASL pictures) reference pictures from before the
+    /// random-access point, so a decode that starts there cannot reconstruct them (issue #506).
+    /// The walk goes back to a random-access point the target is not leading.
     fn nearest_random_access(&self, target_position: usize) -> usize {
+        let target = self.samples[target_position].presentation_index;
         (0..=target_position)
             .rev()
-            .find(|position| self.samples[*position].random_access)
+            .find(|position| {
+                let sample = &self.samples[*position];
+                sample.random_access && sample.presentation_index <= target
+            })
             .unwrap_or(0)
     }
 

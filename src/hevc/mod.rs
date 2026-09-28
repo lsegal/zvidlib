@@ -456,6 +456,7 @@ impl HevcDecoder {
             .map_err(|error| malformed(format!("invalid HEVC access unit: {error}")))?;
         self.presentation_indexes
             .push(Reverse(sample.presentation_index));
+        let skipped_before = self.sequence.skipped_pictures();
         let result = catch_unwind(AssertUnwindSafe(|| {
             for unit in units {
                 self.sequence.push_nal_unit(unit)?;
@@ -463,7 +464,16 @@ impl HevcDecoder {
             Ok::<(), SequenceError>(())
         }));
         match result {
-            Ok(Ok(())) => Ok(()),
+            Ok(Ok(())) => {
+                // A leading picture the decoder discarded because decoding
+                // started at its IRAP will never be output, so its identity
+                // must not be handed to the next picture that is.
+                if self.sequence.skipped_pictures() != skipped_before {
+                    self.presentation_indexes
+                        .retain(|Reverse(index)| *index != sample.presentation_index);
+                }
+                Ok(())
+            }
             Ok(Err(error)) => Err(sequence_error(error)),
             Err(_) => Err(malformed(
                 "HEVC bitstream triggered an invalid decoder state",
