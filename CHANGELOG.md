@@ -4,6 +4,8 @@ All notable changes to zvidlib will be documented in this file.
 
 ## Unreleased
 
+- Add cover art to MP4 output (issue #502). `Mp4Muxer::set_cover_art` and `MediaOutput::set_cover_art` take a caller-encoded JPEG or PNG `CoverArt` and write it as iTunes-style `moov/udta/meta/ilst/covr` metadata, which Windows Explorer, Finder and most players show as the file's thumbnail without an HEVC or AV1 decoder. The cover can be set any time before `finish`, so a recorder can pick a frame after capture. In the browser, `MediaOutput.setCoverArt(bytes, mimeType)` does the same for `image/jpeg` and `image/png`. `Mp4Demuxer::cover_art` reads the picture back. Output without cover art is byte-identical to earlier releases.
+
 ## 0.2.0 - 2026-09-25
 
 zvidlib now encodes HEVC Main in hardware on macOS and Windows and AAC-LC on Windows as well as macOS, so a native application can record 1080p30 HEVC with AAC audio in real time through zvidlib alone. Use the `v0.2.0` Git tag for Cargo and `zvidlib-web-v0.2.0.tgz` for the browser package.

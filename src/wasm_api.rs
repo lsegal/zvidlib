@@ -2502,6 +2502,7 @@ mod tests {
             video_codec: Codec::Av1,
             browser_video_tracks: Rc::new(RefCell::new(BTreeMap::new())),
             browser_audio: Rc::new(RefCell::new(BrowserAudioTrack::new())),
+            cover_art: None,
         };
         let error = JsFuture::from(output.video(0).unwrap().random_access_points(None))
             .await
@@ -2667,6 +2668,7 @@ mod tests {
             video_codec: Codec::Av1,
             browser_video_tracks: Rc::new(RefCell::new(BTreeMap::new())),
             browser_audio: Rc::new(RefCell::new(BrowserAudioTrack::new())),
+            cover_art: None,
         };
         let chunk = Uint8Array::from(&[9_u8, 8, 7][..]);
         output.write_encoded_chunk(chunk.clone()).unwrap();
@@ -2694,6 +2696,7 @@ mod tests {
             video_codec: Codec::Av1,
             browser_video_tracks: Rc::new(RefCell::new(BTreeMap::new())),
             browser_audio: Rc::new(RefCell::new(BrowserAudioTrack::new())),
+            cover_art: None,
         };
         let video = output.video(0).unwrap();
         let pixels = owned_u8_array(&[128_u8; 4 * 4 * 4]);
@@ -2722,6 +2725,65 @@ mod tests {
     }
 
     #[wasm_bindgen_test(async)]
+    async fn set_cover_art_embeds_the_picture_in_the_finished_mp4() {
+        if !video_encode_support(None, None).unwrap() {
+            return;
+        }
+        let options = WasmCreateOptions::new(None).unwrap();
+        let mut output = WasmMediaOutput {
+            bytes: Vec::new(),
+            mime_type: options.mime_type,
+            max_output_bytes: options.max_output_bytes,
+            state: Rc::new(Cell::new(false)),
+            timeline: None,
+            video_timescale: 30,
+            video_frame_duration: 1,
+            video_codec: Codec::Av1,
+            browser_video_tracks: Rc::new(RefCell::new(BTreeMap::new())),
+            browser_audio: Rc::new(RefCell::new(BrowserAudioTrack::new())),
+            cover_art: None,
+        };
+        assert!(
+            output
+                .set_cover_art(
+                    Some(owned_u8_array(b"GIF89a")),
+                    Some("image/gif".to_owned())
+                )
+                .is_err()
+        );
+        let video = output.video(0).unwrap();
+        let pixels = owned_u8_array(&[128_u8; 4 * 4 * 4]);
+        let frame = WasmVideoFrame::rgba(4, 4, pixels).unwrap();
+        for frame_index in 0..3_u64 {
+            JsFuture::from(video.put(BigInt::from(frame_index).into(), &frame, None))
+                .await
+                .expect("encoding a frame through WebCodecs must succeed");
+        }
+        // Chosen after capture, as a recorder picking a middle frame would.
+        let jpeg = [0xff_u8, 0xd8, 0xff, 0xe0, 0, 0x10, b'J', b'F', b'I', b'F'];
+        output
+            .set_cover_art(Some(owned_u8_array(&jpeg)), Some("image/jpeg".to_owned()))
+            .unwrap();
+        let blob: Blob = JsFuture::from(output.finish())
+            .await
+            .unwrap()
+            .unchecked_into();
+        let array_buffer = JsFuture::from(blob.array_buffer()).await.unwrap();
+        let source = MemorySource::new(Uint8Array::new(&array_buffer).to_vec());
+        let demuxer = crate::Mp4Demuxer::open(&source, crate::Mp4DemuxerOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(demuxer.tracks[0].samples.len(), 3);
+        assert_eq!(
+            demuxer.cover_art,
+            Some(CoverArt {
+                format: CoverArtFormat::Jpeg,
+                data: jpeg.to_vec(),
+            })
+        );
+    }
+
+    #[wasm_bindgen_test(async)]
     async fn put_encodes_hevc_through_webcodecs_into_a_playable_mp4() {
         if !video_encode_support(None, Some("hevc".to_owned())).unwrap() {
             return;
@@ -2738,6 +2800,7 @@ mod tests {
             video_codec: Codec::Hevc,
             browser_video_tracks: Rc::new(RefCell::new(BTreeMap::new())),
             browser_audio: Rc::new(RefCell::new(BrowserAudioTrack::new())),
+            cover_art: None,
         };
         let video = output.video(0).unwrap();
         let frame = WasmVideoFrame::rgba(4, 4, owned_u8_array(&[128_u8; 4 * 4 * 4])).unwrap();
@@ -2791,6 +2854,7 @@ mod tests {
             video_codec: Codec::Av1,
             browser_video_tracks: Rc::new(RefCell::new(BTreeMap::new())),
             browser_audio: Rc::new(RefCell::new(BrowserAudioTrack::new())),
+            cover_art: None,
         };
 
         let video = output.video(0).unwrap();
@@ -2875,6 +2939,7 @@ mod tests {
             video_codec: Codec::Av1,
             browser_video_tracks: Rc::new(RefCell::new(BTreeMap::new())),
             browser_audio: Rc::new(RefCell::new(BrowserAudioTrack::new())),
+            cover_art: None,
         };
         let track0 = output.video(0).unwrap();
         let track1 = output.video(1).unwrap();
@@ -2928,6 +2993,7 @@ mod tests {
             video_codec: Codec::Av1,
             browser_video_tracks: Rc::new(RefCell::new(BTreeMap::new())),
             browser_audio: Rc::new(RefCell::new(BrowserAudioTrack::new())),
+            cover_art: None,
         };
         let video = output.video(0).unwrap();
         // 4x4 luma plus two 2x2 chroma planes, concatenated: Y, then U, then V.

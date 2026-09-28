@@ -283,7 +283,10 @@ fn malformed_user_data_does_not_prevent_opening() {
             b"meta",
             &[
                 vec![0; 4],
-                make_box(b"ilst", &make_box(b"covr", &make_box(b"data", &[0, 0, 0, 13]))),
+                make_box(
+                    b"ilst",
+                    &make_box(b"covr", &make_box(b"data", &[0, 0, 0, 13])),
+                ),
             ]
             .concat(),
         ),
