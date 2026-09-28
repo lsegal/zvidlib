@@ -2405,17 +2405,17 @@ mod tests {
         assert_eq!(input.bytes().unwrap().to_vec(), vec![4, 5, 6]);
     }
 
-    /// The bundled HEVC sample decoded through the real `WebCodecs` backend.
+    /// The bundled HEVC sample decoded through `get()`.
     ///
-    /// Not every headless Chrome build can decode HEVC (it depends on
-    /// platform codec licensing), so this accepts either a real decoded RGBA
-    /// frame or a browser-reported `UNSUPPORTED`, and only fails on other
-    /// error kinds or on structurally wrong output. Fetches two sequential
-    /// presentation frames, matching how the `web_canvas` example plays back
-    /// frame by frame, and checks that each frame's reported dimensions
-    /// match its own pixel buffer rather than a stale, session-wide value.
+    /// Not every headless Chrome build can decode HEVC through `WebCodecs`
+    /// (it depends on platform codec licensing); where it cannot, the software
+    /// fallback decodes it instead (issue #504), so either way this must be a
+    /// real decoded RGBA frame. Fetches two sequential presentation frames,
+    /// matching how the `web_canvas` example plays back frame by frame, and
+    /// checks that each frame's reported dimensions match its own pixel buffer
+    /// rather than a stale, session-wide value.
     #[wasm_bindgen_test(async)]
-    async fn video_get_decodes_the_bundled_sample_or_reports_unsupported() {
+    async fn video_get_decodes_the_bundled_sample() {
         const SAMPLE: &[u8] = include_bytes!("../examples/media/BigBuckBunny.mp4");
         let bytes = Uint8Array::from(SAMPLE);
         let input =
@@ -2433,26 +2433,23 @@ mod tests {
         assert!((duration - (1_000.0 / 24.0)).abs() < 0.001);
 
         for frame_index in [0_u64, 1_u64] {
-            match JsFuture::from(video.get(BigInt::from(frame_index).into(), None)).await {
-                Ok(frame) => {
-                    // `WasmVideoFrame` doesn't implement `JsCast`, so read its
-                    // wasm-bindgen getters back through `Reflect` instead.
-                    let get_u32 = |name: &str| -> u32 {
-                        Reflect::get(&frame, &JsValue::from_str(name))
-                            .unwrap()
-                            .as_f64()
-                            .unwrap() as u32
-                    };
-                    let width = get_u32("width");
-                    let height = get_u32("height");
-                    assert!(width > 0);
-                    assert!(height > 0);
-                    let pixels = Reflect::get(&frame, &JsValue::from_str("pixels")).unwrap();
-                    let pixels: Uint8Array = pixels.unchecked_into();
-                    assert_eq!(pixels.length(), width * height * 4);
-                }
-                Err(error) => assert_error_code(&error, "UNSUPPORTED"),
-            }
+            let frame = JsFuture::from(video.get(BigInt::from(frame_index).into(), None))
+                .await
+                .expect("the software fallback decodes HEVC Main wherever WebCodecs cannot");
+            // `WasmVideoFrame` doesn't implement `JsCast`, so read its
+            // wasm-bindgen getters back through `Reflect` instead.
+            let get_u32 = |name: &str| -> u32 {
+                Reflect::get(&frame, &JsValue::from_str(name))
+                    .unwrap()
+                    .as_f64()
+                    .unwrap() as u32
+            };
+            let width = get_u32("width");
+            let height = get_u32("height");
+            assert_eq!((width, height), (1920, 1080));
+            let pixels = Reflect::get(&frame, &JsValue::from_str("pixels")).unwrap();
+            let pixels: Uint8Array = pixels.unchecked_into();
+            assert_eq!(pixels.length(), width * height * 4);
         }
     }
 
@@ -2518,6 +2515,11 @@ mod tests {
     async fn video_get_decodes_the_last_frame_of_a_sparse_keyframe_gop() {
         const SAMPLE: &[u8] = include_bytes!("../examples/media/BigBuckBunny.mp4");
         const LAST_FRAME_INDEX: u64 = 767;
+        // This exercises the `WebCodecs` session; the software fallback would
+        // decode the same 1080p walk far too slowly for a browser test.
+        if !WebVideoDecodeSession::decodes_through_webcodecs(SAMPLE, 0).await {
+            return;
+        }
         let bytes = Uint8Array::from(SAMPLE);
         let input =
             WasmMediaInput::open_inner(bytes.into(), Limits::default().max_allocation_bytes, None)
@@ -2549,6 +2551,11 @@ mod tests {
     async fn video_get_decodes_consecutive_frames_without_restarting_the_gop() {
         const SAMPLE: &[u8] = include_bytes!("../examples/media/BigBuckBunny.mp4");
         const FRAME_COUNT: u64 = 48;
+        // This exercises the `WebCodecs` session; the software fallback would
+        // decode the same 1080p walk far too slowly for a browser test.
+        if !WebVideoDecodeSession::decodes_through_webcodecs(SAMPLE, 0).await {
+            return;
+        }
         let bytes = Uint8Array::from(SAMPLE);
         let input =
             WasmMediaInput::open_inner(bytes.into(), Limits::default().max_allocation_bytes, None)
@@ -2592,6 +2599,11 @@ mod tests {
     async fn video_get_decodes_deep_into_a_sparse_keyframe_gop() {
         const SAMPLE: &[u8] = include_bytes!("../examples/media/BigBuckBunny.mp4");
         const DEEP_FRAME_INDEX: u64 = 400;
+        // This exercises the `WebCodecs` session; the software fallback would
+        // decode the same 1080p walk far too slowly for a browser test.
+        if !WebVideoDecodeSession::decodes_through_webcodecs(SAMPLE, 0).await {
+            return;
+        }
         let bytes = Uint8Array::from(SAMPLE);
         let input =
             WasmMediaInput::open_inner(bytes.into(), Limits::default().max_allocation_bytes, None)

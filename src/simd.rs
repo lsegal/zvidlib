@@ -120,8 +120,8 @@ pub fn available() -> Vec<SimdIsa> {
 /// | `hevc_colorconv` | HEVC encoder-side RGBA8 to YUV420 input conversion |
 /// | `hevc_color_convert` | HEVC decoder output YUV420-to-RGBA conversion |
 ///
-/// The `hevc_*` sites are absent on `wasm32`, which does not build the HEVC
-/// engine.
+/// The `hevc_*` sites are absent on `wasm32`, where the HEVC kernels have no
+/// vector backend and always run the scalar path.
 #[must_use]
 pub fn active_by_site() -> Vec<(&'static str, SimdIsa)> {
     #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
