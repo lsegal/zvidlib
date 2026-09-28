@@ -998,7 +998,8 @@ mod tests {
     /// Issue #507: a request for frame 40 opens the decode session at the
     /// random-access point at frame 32, and a following request for frame 5
     /// must restart from frame 0 rather than walk on from frame 41. Frame 5
-    /// has to match what a fresh session decodes for it.
+    /// has to match what a fresh session decodes for it. Only a browser that
+    /// decodes the track through `WebCodecs` runs that session.
     #[wasm_bindgen_test(async)]
     async fn a_request_before_the_open_session_start_returns_the_requested_frame() {
         let limits = Limits::default();
@@ -1006,6 +1007,9 @@ mod tests {
         let mut fresh = WebVideoDecodeSession::open(SMALL_HEVC, 0, &limits)
             .await
             .unwrap();
+        if fresh.is_software() {
+            return;
+        }
         let expected = fresh.get(FrameIndex(5), &cancellation).await.unwrap();
 
         let mut session = WebVideoDecodeSession::open(SMALL_HEVC, 0, &limits)
