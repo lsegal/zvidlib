@@ -1,6 +1,7 @@
 //! Strict synchronized indexed writing built on encoder and muxer contracts.
 
 use crate::codec::{AudioEncoder, VideoEncoder};
+use crate::cover::{CoverCapture, CoverSource};
 use crate::io::ByteSink;
 use crate::mp4::{CoverArt, Mp4Muxer, Mp4TrackConfig, Mp4TrackFormat};
 use crate::transfer::FrameSource;
@@ -13,6 +14,11 @@ pub struct OutputOptions {
     pub max_samples_per_track: usize,
     /// Maximum packet batch an encoder may return from one call or drain.
     pub max_samples_per_encode: usize,
+    /// Which video frame becomes the file's cover art when no explicit
+    /// [`CoverArt`] is set. Defaults to [`CoverSource::Frame`] of
+    /// [`DEFAULT_COVER_FRAME`](crate::DEFAULT_COVER_FRAME); use
+    /// [`CoverSource::None`] for output without cover art.
+    pub cover_source: CoverSource,
 }
 
 impl Default for OutputOptions {
@@ -20,6 +26,7 @@ impl Default for OutputOptions {
         Self {
             max_samples_per_track: 1_000_000,
             max_samples_per_encode: 64,
+            cover_source: CoverSource::default(),
         }
     }
 }
@@ -33,6 +40,8 @@ pub struct MediaOutput<S, V, A> {
     next_video: u64,
     next_audio: u64,
     max_samples_per_encode: usize,
+    cover: CoverCapture,
+    explicit_cover_art: bool,
     failure: Option<Error>,
 }
 
@@ -88,6 +97,8 @@ where
             next_video: 0,
             next_audio: 0,
             max_samples_per_encode: options.max_samples_per_encode,
+            cover: CoverCapture::new(options.cover_source),
+            explicit_cover_art: false,
             failure: None,
         })
     }
@@ -108,6 +119,7 @@ where
     ) -> Result<()> {
         self.ensure_healthy()?;
         check_index("video", self.next_video, index)?;
+        self.cover.offer(index.0, frame);
         let samples = match self.video.encode(index, frame).await {
             Ok(samples) => samples,
             Err(error) => return Err(self.fail(error)),
@@ -160,9 +172,14 @@ where
 
     /// Sets or clears the cover art written into the finished MP4. It may be
     /// set any time before [`MediaOutput::finish`]; see
-    /// [`Mp4Muxer::set_cover_art`].
+    /// [`Mp4Muxer::set_cover_art`]. A cover set here replaces the one
+    /// [`OutputOptions::cover_source`] would generate; clearing it restores
+    /// the generated cover.
     pub fn set_cover_art(&mut self, cover_art: Option<CoverArt>) -> Result<()> {
-        self.muxer.set_cover_art(cover_art)
+        let explicit = cover_art.is_some();
+        self.muxer.set_cover_art(cover_art)?;
+        self.explicit_cover_art = explicit;
+        Ok(())
     }
 
     /// Drains both encoders, records gapless audio trim, finalizes indexes, and
@@ -187,6 +204,9 @@ where
             self.muxer.write_sample(1, sample).await?;
         }
         self.muxer.set_audio_gapless(1, delayed_audio.gapless)?;
+        if !self.explicit_cover_art {
+            self.muxer.set_cover_art(self.cover.cover_art())?;
+        }
         self.muxer.finish().await
     }
 

@@ -4,8 +4,10 @@
 //! typed arrays are snapshots rather than views into growable WebAssembly
 //! memory, and browser-owned objects are retained only as JavaScript handles.
 
+use crate::cover::{CoverCapture, CoverSource};
 use crate::io::{MemorySink, MemorySource};
 use crate::mp4::{CoverArt, CoverArtFormat, Mp4Muxer, Mp4TrackConfig, Mp4TrackFormat};
+use crate::transfer::{CpuFrameSource, FrameSource, Orientation};
 use crate::web_decoder::{
     WebVideoDecodeSession, video_frame_durations_ms, video_random_access_points,
 };
@@ -621,6 +623,7 @@ pub struct WasmCreateOptions {
     frame_rate: Option<FrameRate>,
     audio_sample_rate: Option<u32>,
     video_codec: Codec,
+    cover_source: CoverSource,
 }
 
 #[wasm_bindgen(js_class = CreateOptions)]
@@ -641,6 +644,7 @@ impl WasmCreateOptions {
             frame_rate: None,
             audio_sample_rate: None,
             video_codec: Codec::Av1,
+            cover_source: CoverSource::default(),
         })
     }
 
@@ -719,6 +723,28 @@ impl WasmCreateOptions {
                     format!("unsupported video codec: {other}"),
                 ));
             }
+        };
+        Ok(())
+    }
+
+    /// The zero-based video frame [`WasmMediaOutput::finish`] shrinks into a
+    /// PNG cover-art thumbnail when `setCoverArt()` supplied none: `4n` by
+    /// default, or `null` for no generated cover. A stream with fewer frames
+    /// uses its last one.
+    #[wasm_bindgen(getter, js_name = coverFrame)]
+    pub fn cover_frame(&self) -> JsValue {
+        match self.cover_source {
+            CoverSource::Frame(index) => bigint_u64(index),
+            CoverSource::None => JsValue::NULL,
+        }
+    }
+
+    #[wasm_bindgen(setter, js_name = coverFrame)]
+    pub fn set_cover_frame(&mut self, value: JsValue) -> Result<(), JsValue> {
+        self.cover_source = if value.is_null() || value.is_undefined() {
+            CoverSource::None
+        } else {
+            CoverSource::Frame(parse_u64(&value, "coverFrame")?)
         };
         Ok(())
     }
@@ -1637,10 +1663,12 @@ struct BrowserVideoTrack {
     timescale: u32,
     frame_duration: u32,
     codec: Codec,
+    /// The frame this track offers as the output's generated cover art.
+    cover: CoverCapture,
 }
 
 impl BrowserVideoTrack {
-    fn new(timescale: u32, frame_duration: u32, codec: Codec) -> Self {
+    fn new(timescale: u32, frame_duration: u32, codec: Codec, cover_source: CoverSource) -> Self {
         Self {
             session: None,
             dimensions: None,
@@ -1650,6 +1678,7 @@ impl BrowserVideoTrack {
             timescale,
             frame_duration,
             codec,
+            cover: CoverCapture::new(cover_source),
         }
     }
 }
@@ -1687,6 +1716,13 @@ async fn encode_browser_video_frame(
         }
         (state.timescale, state.frame_duration)
     };
+    track.borrow_mut().cover.offer(
+        index,
+        FrameSource::Cpu(CpuFrameSource {
+            frame: &frame,
+            orientation: Orientation::TopLeft,
+        }),
+    );
 
     let existing_session = {
         let mut state = track.borrow_mut();
@@ -1970,6 +2006,7 @@ async fn finalize_browser_output(
 
     let mut track_configs = Vec::new();
     let mut track_samples = Vec::new();
+    let mut generated_cover = None;
     for track in &ordered {
         let pending_session = {
             let mut state = track.borrow_mut();
@@ -2009,6 +2046,10 @@ async fn finalize_browser_output(
         let has_activity = track.borrow().dimensions.is_some();
         if !has_activity {
             continue;
+        }
+        // The first muxed video track supplies the generated cover.
+        if track_configs.is_empty() {
+            generated_cover = track.borrow().cover.cover_art();
         }
 
         let (coded_dimensions, decoder_config, timescale, samples, codec) = {
@@ -2068,7 +2109,7 @@ async fn finalize_browser_output(
             muxer.write_sample(index, sample).await?;
         }
     }
-    muxer.set_cover_art(cover_art)?;
+    muxer.set_cover_art(cover_art.or(generated_cover))?;
     let sink = muxer.finish().await?;
     Ok(sink.into_inner())
 }
@@ -2093,6 +2134,7 @@ pub struct WasmMediaOutput {
     browser_video_tracks: Rc<RefCell<BTreeMap<u32, Rc<RefCell<BrowserVideoTrack>>>>>,
     browser_audio: Rc<RefCell<BrowserAudioTrack>>,
     cover_art: Option<CoverArt>,
+    cover_source: CoverSource,
 }
 
 #[wasm_bindgen(js_class = MediaOutput)]
@@ -2101,6 +2143,7 @@ impl WasmMediaOutput {
         let mime_type = options.mime_type.clone();
         let max_output_bytes = options.max_output_bytes;
         let video_codec = options.video_codec;
+        let cover_source = options.cover_source;
         let timeline = match (options.frame_rate, options.audio_sample_rate) {
             (Some(frame_rate), Some(sample_rate)) => Timeline::new(frame_rate, sample_rate).ok(),
             _ => None,
@@ -2132,6 +2175,7 @@ impl WasmMediaOutput {
                 browser_video_tracks: Rc::new(RefCell::new(BTreeMap::new())),
                 browser_audio: Rc::new(RefCell::new(BrowserAudioTrack::new())),
                 cover_art: None,
+                cover_source,
             }))
         })
     }
@@ -2163,6 +2207,7 @@ impl WasmMediaOutput {
                     self.video_timescale,
                     self.video_frame_duration,
                     self.video_codec,
+                    self.cover_source,
                 )))
             }))
         };
@@ -2500,6 +2545,7 @@ mod tests {
             browser_video_tracks: Rc::new(RefCell::new(BTreeMap::new())),
             browser_audio: Rc::new(RefCell::new(BrowserAudioTrack::new())),
             cover_art: None,
+            cover_source: CoverSource::default(),
         };
         let error = JsFuture::from(output.video(0).unwrap().random_access_points(None))
             .await
@@ -2681,6 +2727,7 @@ mod tests {
             browser_video_tracks: Rc::new(RefCell::new(BTreeMap::new())),
             browser_audio: Rc::new(RefCell::new(BrowserAudioTrack::new())),
             cover_art: None,
+            cover_source: CoverSource::default(),
         };
         let chunk = Uint8Array::from(&[9_u8, 8, 7][..]);
         output.write_encoded_chunk(chunk.clone()).unwrap();
@@ -2709,6 +2756,7 @@ mod tests {
             browser_video_tracks: Rc::new(RefCell::new(BTreeMap::new())),
             browser_audio: Rc::new(RefCell::new(BrowserAudioTrack::new())),
             cover_art: None,
+            cover_source: CoverSource::default(),
         };
         let video = output.video(0).unwrap();
         let pixels = owned_u8_array(&[128_u8; 4 * 4 * 4]);
@@ -2754,6 +2802,7 @@ mod tests {
             browser_video_tracks: Rc::new(RefCell::new(BTreeMap::new())),
             browser_audio: Rc::new(RefCell::new(BrowserAudioTrack::new())),
             cover_art: None,
+            cover_source: CoverSource::default(),
         };
         assert!(
             output
@@ -2796,6 +2845,59 @@ mod tests {
     }
 
     #[wasm_bindgen_test(async)]
+    async fn finish_generates_cover_art_from_the_cover_frame() {
+        if !video_encode_support(None, None).unwrap() {
+            return;
+        }
+        let mut options = WasmCreateOptions::new(None).unwrap();
+        assert_eq!(options.cover_frame().as_f64(), None);
+        assert_eq!(
+            u64::try_from(BigInt::from(options.cover_frame())).unwrap(),
+            4
+        );
+        let frames: Vec<WasmVideoFrame> = (0..3_u8)
+            .map(|value| {
+                WasmVideoFrame::rgba(4, 4, owned_u8_array(&[value * 60; 4 * 4 * 4])).unwrap()
+            })
+            .collect();
+        for cover_frame in [JsValue::from(1), JsValue::NULL] {
+            options.set_cover_frame(cover_frame.clone()).unwrap();
+            let mut output = WasmMediaOutput {
+                bytes: Vec::new(),
+                mime_type: options.mime_type.clone(),
+                max_output_bytes: options.max_output_bytes,
+                state: Rc::new(Cell::new(false)),
+                timeline: None,
+                video_timescale: 30,
+                video_frame_duration: 1,
+                video_codec: Codec::Av1,
+                browser_video_tracks: Rc::new(RefCell::new(BTreeMap::new())),
+                browser_audio: Rc::new(RefCell::new(BrowserAudioTrack::new())),
+                cover_art: None,
+                cover_source: options.cover_source,
+            };
+            let video = output.video(0).unwrap();
+            for (index, frame) in frames.iter().enumerate() {
+                JsFuture::from(video.put(BigInt::from(index as u64).into(), frame, None))
+                    .await
+                    .expect("encoding a frame through WebCodecs must succeed");
+            }
+            let blob: Blob = JsFuture::from(output.finish())
+                .await
+                .unwrap()
+                .unchecked_into();
+            let array_buffer = JsFuture::from(blob.array_buffer()).await.unwrap();
+            let source = MemorySource::new(Uint8Array::new(&array_buffer).to_vec());
+            let demuxer = crate::Mp4Demuxer::open(&source, crate::Mp4DemuxerOptions::default())
+                .await
+                .unwrap();
+            let expected =
+                (!cover_frame.is_null()).then(|| CoverArt::from_video_frame(&frames[1].0).unwrap());
+            assert_eq!(demuxer.cover_art, expected);
+        }
+    }
+
+    #[wasm_bindgen_test(async)]
     async fn put_encodes_hevc_through_webcodecs_into_a_playable_mp4() {
         if !video_encode_support(None, Some("hevc".to_owned())).unwrap() {
             return;
@@ -2813,6 +2915,7 @@ mod tests {
             browser_video_tracks: Rc::new(RefCell::new(BTreeMap::new())),
             browser_audio: Rc::new(RefCell::new(BrowserAudioTrack::new())),
             cover_art: None,
+            cover_source: CoverSource::default(),
         };
         let video = output.video(0).unwrap();
         let frame = WasmVideoFrame::rgba(4, 4, owned_u8_array(&[128_u8; 4 * 4 * 4])).unwrap();
@@ -2867,6 +2970,7 @@ mod tests {
             browser_video_tracks: Rc::new(RefCell::new(BTreeMap::new())),
             browser_audio: Rc::new(RefCell::new(BrowserAudioTrack::new())),
             cover_art: None,
+            cover_source: CoverSource::default(),
         };
 
         let video = output.video(0).unwrap();
@@ -2952,6 +3056,7 @@ mod tests {
             browser_video_tracks: Rc::new(RefCell::new(BTreeMap::new())),
             browser_audio: Rc::new(RefCell::new(BrowserAudioTrack::new())),
             cover_art: None,
+            cover_source: CoverSource::default(),
         };
         let track0 = output.video(0).unwrap();
         let track1 = output.video(1).unwrap();
@@ -3006,6 +3111,7 @@ mod tests {
             browser_video_tracks: Rc::new(RefCell::new(BTreeMap::new())),
             browser_audio: Rc::new(RefCell::new(BrowserAudioTrack::new())),
             cover_art: None,
+            cover_source: CoverSource::default(),
         };
         let video = output.video(0).unwrap();
         // 4x4 luma plus two 2x2 chroma planes, concatenated: Y, then U, then V.
