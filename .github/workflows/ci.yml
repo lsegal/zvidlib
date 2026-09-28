@@ -146,6 +146,11 @@ jobs:
         run: python3 .github/scripts/check_simd_target_features.py build
       - name: Test library units
         run: cargo test --features native --lib
+      # Pins no-cover output byte for byte and round-trips JPEG and PNG cover
+      # art through `Mp4Muxer` and `Mp4Demuxer` (#502); the ffprobe check in it
+      # skips itself where ffprobe is not installed.
+      - name: Test MP4 cover art
+        run: cargo test --features native --test mp4_cover_art
       - name: Test AV1 SIMD motion compensation
         run: cargo test --features native --lib av1_mc -- --nocapture
       # `--release` is the profile #327 was reported against: nothing about the

@@ -171,6 +171,7 @@ pub use conformance::{
 pub use media::{
     AudioBuffer, Codec, ColorRange, Container, PixelFormat, Plane, VideoDimensions, VideoFrame,
 };
+pub use mp4::{CoverArt, CoverArtFormat};
 pub use mp4_demux::{
     AacTrackConfig, EditMapping, Mp4Demuxer, Mp4DemuxerOptions, Mp4Sample, Mp4Track, probe_mp4,
 };
