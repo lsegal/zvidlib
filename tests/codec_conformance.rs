@@ -367,3 +367,63 @@ fn native_av1_decoder_conforms_for_sequential_reverse_and_alternating_seeks() {
         .expect("the AV1 decoder must enforce its allocation limit");
     assert_eq!(error.kind(), ErrorKind::ResourceLimit);
 }
+
+#[test]
+fn native_av1_decoder_matches_an_independent_decode_of_the_colour_sample() {
+    // Issue #509: the bundled SVT-AV1 8-bit 4:2:0 Main sample, decoded through
+    // the registered factory. The digests are FFmpeg/libdav1d's decode of the
+    // same track converted to RGBA by this crate's BT.601 `convert_to_rgba8`,
+    // the conversion the factory itself applies; see
+    // `tests/fixtures/codec/README.md`. The track has a single random-access
+    // point, so `verify_video_decoder_conformance`'s reverse pattern would
+    // re-decode it from the start for nearly every frame; every frame is
+    // checked in order instead, followed by backward and forward seeks.
+    let expected = include_str!("fixtures/codec/big_buck_bunny_av1_rgba.sha256")
+        .lines()
+        .map(|line| {
+            let (_, digest) = line.split_once(' ').unwrap();
+            FrameDigest::from_hex(digest).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let limits = Limits::default();
+    let source =
+        MemorySource::new(include_bytes!("../examples/media/BigBuckBunny.av1.mp4").to_vec());
+    let vector = block_on(VideoDecoderConformanceVector::from_mp4(
+        "bundled AV1 Main 4:2:0 sample",
+        &source,
+        Mp4DemuxerOptions::default(),
+        1,
+        VideoDecoderConfig {
+            codec: Codec::Av1,
+            profile: CodecProfile::Av1Main,
+            coded_dimensions: VideoDimensions::new(960, 540, &limits).unwrap(),
+            output_format: PixelFormat::Rgba8,
+            color_range: ColorRange::Limited,
+            hardware: HardwarePreference::Avoid,
+            configuration: Vec::new(),
+        },
+        &expected,
+    ))
+    .unwrap();
+    assert_eq!(vector.samples.len(), 768);
+    let factory = native_av1_video_decoder_factory();
+    assert!(factory.capability(&vector.configuration).is_supported());
+
+    let mut reader = ExactFrameReader::new(
+        &factory,
+        vector.configuration.clone(),
+        vector.samples.clone(),
+        limits,
+    )
+    .unwrap();
+    let cancellation = CancellationToken::new();
+    let order = (0..768).chain([5, 400, 401, 3]);
+    for index in order {
+        let frame = reader.get(FrameIndex(index), &cancellation).unwrap();
+        assert_eq!(
+            FrameDigest::from_frame(&frame).unwrap(),
+            expected[index as usize],
+            "frame {index}"
+        );
+    }
+}

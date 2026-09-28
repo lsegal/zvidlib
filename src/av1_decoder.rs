@@ -1,32 +1,30 @@
 //! Native, dependency-free AV1 software decoding, registered as a
 //! [`VideoDecoderFactory`].
 //!
-//! This wraps [`Av1InterDecoder`], which itself only decodes the bounded
-//! Main-profile 8-bit lossless monochrome subset documented on that type: a
-//! single tile, static (non-adapted) CDFs, order-hint-based reference
-//! selection, whole-pel `NEARESTMV`/`GLOBALMV`/bounded `NEWMV` inter
-//! prediction plus average LAST/LAST2 compound prediction, and validated
-//! `show_existing_frame` output. `CodedLossless` streams never signal
-//! deblocking, CDEF, loop restoration, super-resolution, or film grain (AV1
-//! spec §5.9.11), so this decoder never needs to invoke the in-loop filter
-//! stages in [`crate::av1_filters`] beyond the final, always-applicable
-//! output color conversion.
+//! This wraps the crate's AV1 Main-profile decoder (`crate::av1_dec`), which
+//! implements the complete decoding process of the AV1 specification for
+//! 8-bit 4:2:0 colour and monochrome streams: every intra and inter
+//! prediction tool, CDF adaptation, tiles, and the deblocking, CDEF,
+//! super-resolution, loop restoration and film grain stages.
 //!
-//! Every reconstructed frame is monochrome (neutral, mid-gray chroma), so
-//! [`convert_to_rgba8`] is called with an arbitrary non-identity matrix
-//! (`Bt601`): with neutral chroma the matrix choice is a no-op on the
-//! resulting R=G=B luma value for every supported matrix except `Identity`.
+//! Decoded pictures are converted to `Rgba8` with [`convert_to_rgba8`]. Colour
+//! pictures use the matrix their sequence header signals (BT.601 when it is
+//! unspecified or one the conversion does not implement); monochrome pictures
+//! carry neutral chroma, for which the matrix choice is a no-op on the
+//! resulting R=G=B luma value for every supported matrix except `Identity`, so
+//! they are converted with `Bt601` whatever they signal.
 
+use crate::av1_dec::{DecodedPicture, Decoder};
 use crate::{
-    Av1CodecConfigurationRecord, Av1InterDecoder, Av1SyntaxSupport, CancellationToken, Codec,
-    CodecImplementation, CodecProfile, CodecSupport, DecodedVideoFrame, EncodedVideoSample, Error,
+    Av1CodecConfigurationRecord, Av1SyntaxSupport, CancellationToken, Codec, CodecImplementation,
+    CodecProfile, CodecSupport, ColorRange, DecodedVideoFrame, EncodedVideoSample, Error,
     ErrorKind, FilterFrame, FilterPlane, HardwarePreference, Limits, MatrixCoefficients,
     PixelFormat, Result, VideoDecoder, VideoDecoderConfig, VideoDecoderFactory, VideoFrame,
     convert_to_rgba8,
 };
 
-/// Returns the dependency-free native AV1 Main lossless monochrome software
-/// decoder backend.
+/// Returns the dependency-free native AV1 Main-profile (8-bit 4:2:0 and
+/// monochrome) software decoder backend.
 pub fn native_av1_video_decoder_factory() -> impl VideoDecoderFactory {
     Av1DecoderFactory
 }
@@ -78,11 +76,13 @@ impl VideoDecoderFactory for Av1DecoderFactory {
             }
         }
         ParsedConfiguration::parse(configuration, limits)?;
+        if limits.max_av1_blocks_per_frame == 0 {
+            return Err(limit("AV1 reconstruction block limit must be nonzero"));
+        }
         Ok(Box::new(Av1Decoder {
             configuration: configuration.clone(),
             limits: *limits,
-            inner: Av1InterDecoder::new(*limits)?,
-            output_wanted: true,
+            inner: Decoder::new(*limits),
         }))
     }
 }
@@ -127,14 +127,15 @@ impl ParsedConfiguration {
         }
         let record = Av1CodecConfigurationRecord::parse(&configuration.configuration, limits)
             .map_err(|error| malformed(format!("invalid av1C configuration: {error}")))?;
+        let four_two_zero = record.chroma_subsampling_x && record.chroma_subsampling_y;
         if record.support != Av1SyntaxSupport::MainProfile
             || record.high_bitdepth
             || record.twelve_bit
-            || !record.monochrome
+            || !(record.monochrome || four_two_zero)
         {
             return Err(Error::new(
                 ErrorKind::Unsupported,
-                "native AV1 decoder requires an 8-bit monochrome Main-profile av1C configuration",
+                "native AV1 decoder requires an 8-bit 4:2:0 or monochrome Main-profile av1C configuration",
             ));
         }
         Ok(Self)
@@ -144,9 +145,7 @@ impl ParsedConfiguration {
 struct Av1Decoder {
     configuration: VideoDecoderConfig,
     limits: Limits,
-    inner: Av1InterDecoder,
-    /// Whether a caller wants the pictures being decoded, or is only walking past them.
-    output_wanted: bool,
+    inner: Decoder,
 }
 
 impl VideoDecoder for Av1Decoder {
@@ -159,14 +158,18 @@ impl VideoDecoder for Av1Decoder {
         if sample.data.len() as u64 > self.limits.max_allocation_bytes {
             return Err(limit("AV1 temporal unit exceeds the allocation limit"));
         }
-        let decoded = self.inner.decode_temporal_unit(&sample.data)?;
-        if !self.output_wanted {
-            // The frame is decoded and stays a reference for the ones after it; only the
-            // YUV-to-RGBA pass over it is skipped, which is what a caller walking to a later
-            // frame is paying for and never looks at.
-            return Ok(Vec::new());
+        // A temporal unit shows exactly one frame; with spatial layers the
+        // last picture shown is the highest layer, the one to present.
+        let shown_before = self.inner.frames_shown();
+        let pictures = self.inner.decode_temporal_unit(&sample.data)?;
+        if self.inner.frames_shown() == shown_before {
+            return Err(malformed("AV1 temporal unit does not show a frame"));
         }
-        let frame = temporal_unit_to_rgba(&decoded, &self.configuration, &self.limits)?;
+        let Some(picture) = pictures.into_iter().next_back() else {
+            // The caller asked not to see this frame.
+            return Ok(Vec::new());
+        };
+        let frame = picture_to_rgba(&picture, &self.configuration, &self.limits)?;
         Ok(vec![DecodedVideoFrame {
             presentation_index: sample.presentation_index,
             frame,
@@ -175,9 +178,9 @@ impl VideoDecoder for Av1Decoder {
 
     fn drain(&mut self, cancellation: &CancellationToken) -> Result<Vec<DecodedVideoFrame>> {
         check_cancelled(cancellation)?;
-        // Every temporal unit this decoder accepts makes exactly one frame
-        // visible immediately (`show_frame` or `show_existing_frame`); there
-        // is no delayed/reordered output to release on drain.
+        // Every temporal unit this decoder accepts makes its frame visible
+        // immediately (`show_frame` or `show_existing_frame`); there is no
+        // delayed/reordered output to release on drain.
         Ok(Vec::new())
     }
 
@@ -187,79 +190,73 @@ impl VideoDecoder for Av1Decoder {
     }
 
     fn set_output_wanted(&mut self, wanted: bool) {
-        self.output_wanted = wanted;
+        // The frame is decoded and stays a reference for the ones after it;
+        // only the output (film grain and the YUV-to-RGBA pass) is skipped,
+        // which is what a caller walking to a later frame is paying for and
+        // never looks at.
+        self.inner.set_output_wanted(wanted);
     }
 }
 
-fn temporal_unit_to_rgba(
-    decoded: &VideoFrame,
+fn picture_to_rgba(
+    picture: &DecodedPicture,
     configuration: &VideoDecoderConfig,
     limits: &Limits,
 ) -> Result<VideoFrame> {
-    if decoded.pixel_format != PixelFormat::Yuv420p8 || decoded.planes.len() != 3 {
-        return Err(malformed(
-            "AV1 decoder produced an unexpected internal pixel format",
-        ));
-    }
-    if decoded.dimensions != configuration.coded_dimensions {
+    let width = picture.width;
+    let height = picture.height;
+    if width as u64 != u64::from(configuration.coded_dimensions.width)
+        || height as u64 != u64::from(configuration.coded_dimensions.height)
+    {
         return Err(malformed(
             "decoded AV1 frame does not match its display dimensions",
         ));
     }
-    let width = usize::try_from(decoded.dimensions.width)
-        .map_err(|_| limit("AV1 decoded width is not representable"))?;
-    let height = usize::try_from(decoded.dimensions.height)
-        .map_err(|_| limit("AV1 decoded height is not representable"))?;
-    let chroma_width = width.div_ceil(2);
-    let chroma_height = height.div_ceil(2);
-    let y = plane_to_filter_plane(&decoded.planes[0], width, height, limits)?;
-    let u = plane_to_filter_plane(&decoded.planes[1], chroma_width, chroma_height, limits)?;
-    let v = plane_to_filter_plane(&decoded.planes[2], chroma_width, chroma_height, limits)?;
-    let filter_frame = FilterFrame::new_yuv(y, u, v, true, true)
-        .map_err(|error| malformed(format!("invalid AV1 decoded plane layout: {error}")))?;
-    let rgba = convert_to_rgba8(
-        &filter_frame,
-        decoded.color_range,
-        MatrixCoefficients::Bt601,
-        limits,
-    )?;
+    let y = FilterPlane::from_samples(width, height, picture.planes[0].clone(), limits)
+        .map_err(|error| malformed(format!("invalid AV1 decoded plane: {error}")))?;
+    let (filter_frame, matrix) = if picture.monochrome {
+        (FilterFrame::new_monochrome(y), MatrixCoefficients::Bt601)
+    } else {
+        let chroma_width = width.div_ceil(2);
+        let chroma_height = height.div_ceil(2);
+        let u = FilterPlane::from_samples(
+            chroma_width,
+            chroma_height,
+            picture.planes[1].clone(),
+            limits,
+        )
+        .map_err(|error| malformed(format!("invalid AV1 decoded plane: {error}")))?;
+        let v = FilterPlane::from_samples(
+            chroma_width,
+            chroma_height,
+            picture.planes[2].clone(),
+            limits,
+        )
+        .map_err(|error| malformed(format!("invalid AV1 decoded plane: {error}")))?;
+        let frame = FilterFrame::new_yuv(y, u, v, picture.subsampling_x, picture.subsampling_y)
+            .map_err(|error| malformed(format!("invalid AV1 decoded plane layout: {error}")))?;
+        let matrix = match MatrixCoefficients::from_raw(picture.matrix_coefficients) {
+            Ok(MatrixCoefficients::Identity) | Err(_) => MatrixCoefficients::Bt601,
+            Ok(matrix) => matrix,
+        };
+        (frame, matrix)
+    };
+    let color_range = if picture.full_range {
+        ColorRange::Full
+    } else {
+        ColorRange::Limited
+    };
+    let rgba = convert_to_rgba8(&filter_frame, color_range, matrix, limits)?;
     let stride = width
         .checked_mul(4)
         .ok_or_else(|| limit("AV1 RGBA stride overflows"))?;
     VideoFrame::new(
         configuration.coded_dimensions,
         PixelFormat::Rgba8,
-        decoded.color_range,
+        color_range,
         vec![crate::Plane { data: rgba, stride }],
         limits,
     )
-}
-
-fn plane_to_filter_plane(
-    plane: &crate::Plane,
-    width: usize,
-    height: usize,
-    limits: &Limits,
-) -> Result<FilterPlane> {
-    let mut packed = Vec::new();
-    packed
-        .try_reserve(width.checked_mul(height).unwrap_or(0))
-        .map_err(|_| limit("AV1 plane extraction allocation failed"))?;
-    for row in 0..height {
-        let start = row
-            .checked_mul(plane.stride)
-            .ok_or_else(|| limit("AV1 plane row offset overflows"))?;
-        let end = start
-            .checked_add(width)
-            .ok_or_else(|| limit("AV1 plane row length overflows"))?;
-        let bytes = plane
-            .data
-            .get(start..end)
-            .ok_or_else(|| malformed("AV1 decoded plane is shorter than its active rows"))?;
-        packed.extend_from_slice(bytes);
-    }
-    FilterPlane::from_samples(width, height, packed, limits)
-        .map_err(|error| malformed(format!("invalid AV1 decoded plane: {error}")))
 }
 
 fn check_cancelled(cancellation: &CancellationToken) -> Result<()> {
@@ -284,7 +281,7 @@ fn limit(message: impl Into<String>) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ColorRange, VideoDimensions};
+    use crate::VideoDimensions;
 
     fn av1c(payload: &[u8]) -> Vec<u8> {
         let mut bytes = (8u32 + payload.len() as u32).to_be_bytes().to_vec();
@@ -349,9 +346,14 @@ mod tests {
             CodecSupport::InvalidConfiguration { .. }
         ));
 
-        // Non-monochrome av1C: monochrome bit cleared.
+        // Colour 4:2:0 av1C: monochrome bit cleared, both subsampling bits set.
         candidate = config();
         candidate.configuration = av1c(&[0x81, 0x00, 0x0C, 0x00]);
+        assert!(factory.capability(&candidate).is_supported());
+
+        // 10-bit (high_bitdepth) Main-profile av1C.
+        candidate = config();
+        candidate.configuration = av1c(&[0x81, 0x00, 0x4C, 0x00]);
         assert!(matches!(
             factory.capability(&candidate),
             CodecSupport::InvalidConfiguration { .. }

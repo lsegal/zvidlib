@@ -34,6 +34,7 @@ pub mod simd;
 pub mod timeline;
 pub mod transfer;
 
+mod av1_dec;
 mod av1_decoder;
 
 /// The bounded preview tier over a track, for callers that need an answer at an

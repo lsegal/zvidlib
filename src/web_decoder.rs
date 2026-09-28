@@ -428,6 +428,10 @@ struct WebCodecsDecoder {
     /// decoder, which is what lets a session walk arbitrarily deep into a
     /// single GOP (see `get()` for why resets are otherwise required).
     next_decode_position: Option<usize>,
+    /// The random-access position the open decode session started from. Only
+    /// frames at or after it have been, or can still be, submitted without a
+    /// reset. Mirrors `VideoDecoder::session_start` in the portable backend.
+    session_start: Option<usize>,
     /// Presentation frames the decoder has already emitted since the last
     /// reset. A `WebCodecs` decoder never emits the same presentation frame
     /// twice without an intervening reset, so this is the only condition
@@ -500,6 +504,7 @@ impl WebCodecsDecoder {
             cache: HashMap::new(),
             cache_order: VecDeque::new(),
             next_decode_position: None,
+            session_start: None,
             published_since_reset: HashSet::new(),
             waker,
             limits: *limits,
@@ -548,6 +553,7 @@ impl WebCodecsDecoder {
         // without ever triggering the key-frame-after-flush requirement.
         let can_reuse = can_continue_session(
             self.next_decode_position,
+            self.session_start,
             random_access_position,
             &self.published_since_reset,
             presentation_index,
@@ -573,6 +579,7 @@ impl WebCodecsDecoder {
                 normalize_js_error(error, "reconfiguring the WebCodecs VideoDecoder")
             })?;
             self.next_decode_position = Some(random_access_position);
+            self.session_start = Some(random_access_position);
         }
 
         let mut submitted = 0_u32;
@@ -786,13 +793,21 @@ impl Drop for WebCodecsDecoder {
 /// a reset is the frame having already been emitted once since the last reset
 /// (and since evicted from the cache), because a `WebCodecs` decoder will not
 /// emit the same presentation frame twice without one.
+///
+/// A session that started at a later random-access point than the target's
+/// never submitted the target at all, however far it has since walked, so it
+/// must reset too: after a request for frame 40 of a 32-frame GOP opens the
+/// session at 32, a request for frame 5 would otherwise walk on from 41 and
+/// never reach it (issue #507).
 fn can_continue_session(
     next_decode_position: Option<usize>,
+    session_start: Option<usize>,
     random_access_position: usize,
     published_since_reset: &HashSet<FrameIndex>,
     presentation_index: FrameIndex,
 ) -> bool {
     next_decode_position.is_some_and(|position| position >= random_access_position)
+        && session_start.is_some_and(|start| start <= random_access_position)
         && !published_since_reset.contains(&presentation_index)
 }
 
@@ -819,9 +834,16 @@ mod tests {
         // decode position. That must not force a reset, or every displayed
         // frame re-decodes the whole GOP from its key frame.
         let published = HashSet::new();
-        assert!(can_continue_session(Some(9), 0, &published, FrameIndex(2)));
+        assert!(can_continue_session(
+            Some(9),
+            Some(0),
+            0,
+            &published,
+            FrameIndex(2)
+        ));
         assert!(can_continue_session(
             Some(120),
+            Some(0),
             0,
             &published,
             FrameIndex(3)
@@ -833,8 +855,20 @@ mod tests {
         // A `WebCodecs` decoder will not emit the same presentation frame
         // twice, so a re-request after cache eviction genuinely needs one.
         let published = HashSet::from([FrameIndex(2)]);
-        assert!(!can_continue_session(Some(9), 0, &published, FrameIndex(2)));
-        assert!(can_continue_session(Some(9), 0, &published, FrameIndex(3)));
+        assert!(!can_continue_session(
+            Some(9),
+            Some(0),
+            0,
+            &published,
+            FrameIndex(2)
+        ));
+        assert!(can_continue_session(
+            Some(9),
+            Some(0),
+            0,
+            &published,
+            FrameIndex(3)
+        ));
     }
 
     #[wasm_bindgen_test]
@@ -842,11 +876,13 @@ mod tests {
         let published = HashSet::new();
         assert!(!can_continue_session(
             Some(4),
+            Some(0),
             30,
             &published,
             FrameIndex(31)
         ));
         assert!(can_continue_session(
+            Some(30),
             Some(30),
             30,
             &published,
@@ -855,9 +891,46 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
+    fn a_request_before_the_open_session_start_requires_a_reset() {
+        // Issue #507: frame 40 of a 32-frame GOP opens the session at 32 and
+        // walks it on past 40. Frame 5's random-access point is 0, before the
+        // session started, so the session never submitted frame 5 however far
+        // it has since walked.
+        let published = HashSet::new();
+        assert!(!can_continue_session(
+            Some(41),
+            Some(32),
+            0,
+            &published,
+            FrameIndex(5)
+        ));
+        // A later request in the same GOP the session started from continues.
+        assert!(can_continue_session(
+            Some(41),
+            Some(32),
+            32,
+            &published,
+            FrameIndex(45)
+        ));
+    }
+
+    #[wasm_bindgen_test]
     fn an_invalidated_session_requires_a_reset() {
         let published = HashSet::new();
-        assert!(!can_continue_session(None, 0, &published, FrameIndex(0)));
+        assert!(!can_continue_session(
+            None,
+            Some(0),
+            0,
+            &published,
+            FrameIndex(0)
+        ));
+        assert!(!can_continue_session(
+            Some(0),
+            None,
+            0,
+            &published,
+            FrameIndex(0)
+        ));
     }
 
     const SMALL_HEVC: &[u8] = include_bytes!("../tests/fixtures/codec/bbb_hevc_512x288_gop32.mp4");
@@ -926,6 +999,38 @@ mod tests {
         }
     }
 
+    /// Issue #507: a request for frame 40 opens the decode session at the
+    /// random-access point at frame 32, and a following request for frame 5
+    /// must restart from frame 0 rather than walk on from frame 41. Frame 5
+    /// has to match what a fresh session decodes for it. Only a browser that
+    /// decodes the track through `WebCodecs` runs that session.
+    #[wasm_bindgen_test(async)]
+    async fn a_request_before_the_open_session_start_returns_the_requested_frame() {
+        let limits = Limits::default();
+        let cancellation = CancellationToken::new();
+        let mut fresh = WebVideoDecodeSession::open(SMALL_HEVC, 0, &limits)
+            .await
+            .unwrap();
+        if fresh.is_software() {
+            return;
+        }
+        let expected = fresh.get(FrameIndex(5), &cancellation).await.unwrap();
+
+        let mut session = WebVideoDecodeSession::open(SMALL_HEVC, 0, &limits)
+            .await
+            .unwrap();
+        session.get(FrameIndex(40), &cancellation).await.unwrap();
+        let (dimensions, rgba) = session.get(FrameIndex(5), &cancellation).await.unwrap();
+        assert_eq!(
+            (dimensions.width, dimensions.height),
+            (expected.0.width, expected.0.height)
+        );
+        assert!(
+            rgba == expected.1,
+            "frame 5 after frame 40 differs from a fresh decode"
+        );
+    }
+
     /// Issue #508: an HEVC Main 10 track is opened with the profile its `hvcC`
     /// names, so the fallback decodes it instead of refusing it. The digests
     /// are the native conformance fixture's, which were computed from an
@@ -991,9 +1096,8 @@ mod tests {
         );
     }
 
-    /// A lossless monochrome AV1 track, the subset the crate's AV1 decoder
-    /// covers, decodes through the fallback back to the exact gray levels it
-    /// was encoded from.
+    /// A lossless monochrome AV1 track decodes through the fallback back to
+    /// the exact gray levels it was encoded from.
     #[wasm_bindgen_test(async)]
     async fn software_fallback_decodes_av1_back_to_its_source() {
         use crate::codec::{VideoEncoderConfig, VideoEncoderFactory};
@@ -1087,20 +1191,68 @@ mod tests {
         }
     }
 
-    /// A track neither `WebCodecs` nor the software decoder can take is still
-    /// reported `Unsupported`, naming why the fallback refused it.
+    /// Issue #509: a colour AV1 track (the bundled SVT-AV1 8-bit 4:2:0 Main
+    /// sample) decodes through the fallback. The digests are FFmpeg/libdav1d's
+    /// decode of the same frames converted by the crate's own BT.601 RGBA
+    /// conversion, the lines of `tests/fixtures/codec/big_buck_bunny_av1_rgba.sha256`
+    /// the native conformance test checks every frame against; frame 20 is
+    /// reached by walking forwards from the random-access point at frame 0.
     #[wasm_bindgen_test(async)]
-    async fn a_track_the_software_decoder_refuses_stays_unsupported() {
+    async fn software_fallback_decodes_colour_av1_like_an_independent_decoder() {
         const COLOR_AV1: &[u8] = include_bytes!("../examples/media/BigBuckBunny.av1.mp4");
-        let error = match WebVideoDecodeSession::open_with(
+        let mut session = WebVideoDecodeSession::open_with(
             COLOR_AV1,
             0,
             &Limits::default(),
             BackendChoice::SoftwareOnly,
         )
         .await
+        .unwrap();
+        assert!(session.is_software());
+        assert_eq!(
+            (session.dimensions().width, session.dimensions().height),
+            (960, 540)
+        );
+        assert_eq!(session.frame_count(), 768);
+        let expected = [
+            (
+                0,
+                "3c7fbf07cee4f4e3b72c9667061e162362019f6aea2c035fad2032180dd8742f",
+            ),
+            (
+                1,
+                "2c189d695e847d075bb765611f51287594eca1e8bbabc5a403c6d623c21dc5c7",
+            ),
+            (
+                20,
+                "387c5e72026d94a8c123c3e27977e44a84bc6ec902629e7f44b040c957979886",
+            ),
+        ];
+        for (frame, expected) in expected {
+            let (dimensions, rgba) = session
+                .get(FrameIndex(frame), &CancellationToken::new())
+                .await
+                .unwrap();
+            assert_eq!(rgba.len(), 960 * 540 * 4);
+            assert_eq!(digest(dimensions, rgba), expected, "frame {frame}");
+        }
+    }
+
+    /// A track neither `WebCodecs` nor the software decoder can take is still
+    /// reported `Unsupported`, naming why the fallback refused it. The software
+    /// AV1 decoder covers 8-bit streams, so a 10-bit Main track is refused.
+    #[wasm_bindgen_test(async)]
+    async fn a_track_the_software_decoder_refuses_stays_unsupported() {
+        const MAIN_10_AV1: &[u8] = include_bytes!("../tests/fixtures/codec/av1_main10_64x64.mp4");
+        let error = match WebVideoDecodeSession::open_with(
+            MAIN_10_AV1,
+            0,
+            &Limits::default(),
+            BackendChoice::SoftwareOnly,
+        )
+        .await
         {
-            Ok(_) => panic!("the AV1 software decoder covers monochrome streams only"),
+            Ok(_) => panic!("the AV1 software decoder covers 8-bit streams only"),
             Err(error) => error,
         };
         assert_eq!(error.kind(), ErrorKind::Unsupported);
