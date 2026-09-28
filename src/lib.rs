@@ -23,6 +23,7 @@ pub mod av1_simd;
 pub mod codec;
 pub mod codec_config;
 pub mod conformance;
+pub mod cover;
 pub mod io;
 pub mod media;
 pub mod mp4;
@@ -171,6 +172,7 @@ pub use conformance::{
 pub use media::{
     AudioBuffer, Codec, ColorRange, Container, PixelFormat, Plane, VideoDimensions, VideoFrame,
 };
+pub use cover::{COVER_THUMBNAIL_MAX_EDGE, CoverSource, DEFAULT_COVER_FRAME};
 pub use mp4::{CoverArt, CoverArtFormat};
 pub use mp4_demux::{
     AacTrackConfig, EditMapping, Mp4Demuxer, Mp4DemuxerOptions, Mp4Sample, Mp4Track, probe_mp4,
