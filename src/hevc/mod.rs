@@ -733,21 +733,29 @@ mod tests {
         (configuration, samples)
     }
 
-    /// Issue #508: the 10-bit samples themselves, before any RGBA conversion, are FFmpeg's
-    /// `yuv420p10le` decode of the same fixture exactly.
+    /// Issue #508: the 10-bit samples themselves are FFmpeg's `yuv420p10le` decode of the same
+    /// fixture exactly, and their RGBA conversion is the fixture's, which applies the documented
+    /// matrix to that FFmpeg decode.
     #[test]
     fn main10_pictures_match_an_independent_reference_decode() {
-        let expected =
-            include_str!("../../tests/fixtures/codec/bbb_hevc_main10_128x72_yuv420p10le.sha256")
+        let digests = |fixture: &str| {
+            fixture
                 .lines()
                 .map(|line| line.split_once(' ').unwrap().1.to_owned())
-                .collect::<Vec<_>>();
+                .collect::<Vec<_>>()
+        };
+        let expected = digests(include_str!(
+            "../../tests/fixtures/codec/bbb_hevc_main10_128x72_yuv420p10le.sha256"
+        ));
+        let expected_rgba = digests(include_str!(
+            "../../tests/fixtures/codec/bbb_hevc_main10_128x72_rgba.sha256"
+        ));
         let limits = Limits::default();
         let (configuration, samples) =
             main10_fixture(CodecProfile::HevcMain10, HardwarePreference::Avoid);
         let parsed = ParsedConfiguration::parse(&configuration, &limits).unwrap();
         assert!(parsed.high_bit_depth);
-        let mut decoder = HevcDecoder::new(configuration, limits, parsed).unwrap();
+        let mut decoder = HevcDecoder::new(configuration.clone(), limits, parsed).unwrap();
         let cancellation = CancellationToken::new();
         let mut pictures = Vec::new();
         for sample in &samples {
@@ -759,13 +767,18 @@ mod tests {
         pictures.sort_by_key(|(index, _)| *index);
 
         assert_eq!(pictures.len(), expected.len());
-        for ((index, picture), expected) in pictures.iter().zip(&expected) {
+        for (((index, picture), expected), expected_rgba) in
+            pictures.iter().zip(&expected).zip(&expected_rgba)
+        {
             assert_eq!(picture.bit_depth_luma(), 10);
             assert_eq!(picture.bit_depth_chroma(), 10);
             let digest = crate::conformance::FrameDigest(crate::conformance::sha256(
                 &picture.to_planar_le16(),
             ));
             assert_eq!(&digest.to_hex(), expected, "frame {}", index.0);
+            let rgba = picture_to_rgba(picture, &configuration, &limits).unwrap();
+            let digest = crate::conformance::FrameDigest::from_frame(&rgba).unwrap();
+            assert_eq!(&digest.to_hex(), expected_rgba, "frame {} RGBA", index.0);
         }
     }
 
