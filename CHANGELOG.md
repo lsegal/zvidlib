@@ -4,6 +4,9 @@ All notable changes to zvidlib will be documented in this file.
 
 ## Unreleased
 
+- Fall back to zvidlib's software decoder in the browser build when WebCodecs cannot decode a video track (issue #504). `VideoStream.get()` and `VideoStream.previews()` previously rejected with `UNSUPPORTED` whenever `VideoDecoder.isConfigSupported()` said no, which is the common case for HEVC in Chrome, Edge and WebView2, so those browsers could not show a single frame of an HEVC recording. They now decode HEVC Main tracks, and the lossless monochrome AV1 Main tracks the native AV1 decoder covers, with the same pure-Rust decoders native builds use, and the pixels match a native software decode exactly. WebCodecs is still used whenever the browser supports the track. The fallback decodes on the calling thread and is sized for thumbnails, previews and single-frame seeks rather than real-time playback. A track neither can decode, such as HEVC Main 10 or colour AV1, still rejects with `UNSUPPORTED`, and the message now says why the software decoder refused it.
+- Fix `ExactFrameReader::get()` failing with `decoder did not produce the requested presentation frame` when asked for a frame before the random-access point its open decode session started from (issue #504). On a track with several random-access points, requesting a later frame and then an earlier one walked onwards from the later one instead of restarting the decode, so a thumbnail or scrub that moved backwards across a key frame could fail. It now resets the decoder and decodes from the earlier random-access point.
+
 ## 0.2.0 - 2026-09-25
 
 zvidlib now encodes HEVC Main in hardware on macOS and Windows and AAC-LC on Windows as well as macOS, so a native application can record 1080p30 HEVC with AAC audio in real time through zvidlib alone. Use the `v0.2.0` Git tag for Cargo and `zvidlib-web-v0.2.0.tgz` for the browser package.

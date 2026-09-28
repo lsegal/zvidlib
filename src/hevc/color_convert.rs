@@ -140,6 +140,7 @@ const V_TO_G: i32 = -6_660;
 const U_TO_B: i32 = 16_525;
 
 /// The `A = 255` byte, pre-placed in the high lane of the packed pixel.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 const OPAQUE: i32 = 0xFF00_0000_u32 as i32;
 
 /// Converts a whole 8-bit 4:2:0 picture to RGBA on the detected backend.
@@ -501,6 +502,7 @@ mod tests {
     }
 
     fn backends() -> Vec<Isa> {
+        #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
         let mut isas = vec![Isa::Scalar];
         #[cfg(target_arch = "x86_64")]
         {

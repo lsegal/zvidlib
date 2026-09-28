@@ -33,7 +33,6 @@ pub mod simd;
 pub mod timeline;
 pub mod transfer;
 
-#[cfg(not(target_arch = "wasm32"))]
 mod av1_decoder;
 
 /// The bounded preview tier over a track, for callers that need an answer at an
@@ -46,7 +45,6 @@ pub mod previews;
 #[cfg(not(target_arch = "wasm32"))]
 mod aac_encoder;
 
-#[cfg(not(target_arch = "wasm32"))]
 mod hevc;
 
 /// Per-stage access to the HEVC encoder for the criterion benchmark suite.
@@ -193,9 +191,7 @@ pub use transfer::{
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use aac_encoder::native_aac_audio_encoder_factory;
-#[cfg(not(target_arch = "wasm32"))]
 pub use av1_decoder::native_av1_video_decoder_factory;
-#[cfg(not(target_arch = "wasm32"))]
 pub use hevc::native_hevc_video_decoder_factory;
 #[cfg(not(target_arch = "wasm32"))]
 pub use hevc::native_hevc_video_encoder_factory;

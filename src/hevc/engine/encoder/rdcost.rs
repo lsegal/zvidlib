@@ -1372,6 +1372,7 @@ mod tests {
     /// threshold moves the other's blocks or anything on a non-x86_64 host.
     #[test]
     fn each_metric_keeps_blocks_narrower_than_its_avx2_body_off_avx2() {
+        #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
         let mut codes = vec![ISA_UNDETECTED, ISA_SCALAR];
         #[cfg(target_arch = "x86_64")]
         codes.extend([ISA_SSE41, ISA_AVX2]);
