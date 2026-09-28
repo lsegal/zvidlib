@@ -220,17 +220,18 @@ impl WebVideoDecodeSession {
             DecodeBackend::WebCodecs(WebCodecsDecoder::open(config, samples, limits)?)
         } else {
             let decoder =
-                SoftwareDecoder::open(&track, dimensions, samples, limits).map_err(|error| {
-                    Error::new(
-                        ErrorKind::Unsupported,
-                        format!(
-                            "this browser cannot decode {} via WebCodecs, and the software \
-                             decoder cannot either: {}",
-                            derived.codec_string,
-                            error.message()
-                        ),
-                    )
-                })?;
+                SoftwareDecoder::open(&track, derived.profile, dimensions, samples, limits)
+                    .map_err(|error| {
+                        Error::new(
+                            ErrorKind::Unsupported,
+                            format!(
+                                "this browser cannot decode {} via WebCodecs, and the software \
+                                 decoder cannot either: {}",
+                                derived.codec_string,
+                                error.message()
+                            ),
+                        )
+                    })?;
             DecodeBackend::Software(decoder)
         };
         Ok(Self {
@@ -304,8 +305,11 @@ struct SoftwareDecoder {
 }
 
 impl SoftwareDecoder {
+    /// `hevc_profile` is the profile the track's `hvcC` names, so a Main 10
+    /// track is opened as Main 10 (issue #508).
     fn open(
         track: &Mp4Track,
+        hevc_profile: CodecProfile,
         dimensions: VideoDimensions,
         samples: Vec<EncodedVideoSample>,
         limits: &Limits,
@@ -319,10 +323,10 @@ impl SoftwareDecoder {
                 CodecProfile::Av1Main,
                 av1_color_range(track, &samples, limits),
             ),
-            _ => (CodecProfile::HevcMain, ColorRange::Limited),
+            _ => (hevc_profile, ColorRange::Limited),
         };
         // The decoders validate the configuration record itself, so a stream
-        // they cannot decode (HEVC Main 10, say) is refused here, at open,
+        // they cannot decode (colour AV1, say) is refused here, at open,
         // rather than on its first frame.
         let configuration = VideoDecoderConfig {
             codec: track.codec,
@@ -1025,6 +1029,42 @@ mod tests {
             rgba == expected.1,
             "frame 5 after frame 40 differs from a fresh decode"
         );
+    }
+
+    /// Issue #508: an HEVC Main 10 track is opened with the profile its `hvcC`
+    /// names, so the fallback decodes it instead of refusing it. The digests
+    /// are the native conformance fixture's, which were computed from an
+    /// independent FFmpeg decode of the same track.
+    #[wasm_bindgen_test(async)]
+    async fn software_fallback_decodes_hevc_main10() {
+        const MAIN10: &[u8] = include_bytes!("../tests/fixtures/codec/bbb_hevc_main10_128x72.mp4");
+        let expected: Vec<&str> =
+            include_str!("../tests/fixtures/codec/bbb_hevc_main10_128x72_rgba.sha256")
+                .lines()
+                .map(|line| line.split_once(' ').unwrap().1)
+                .collect();
+        let mut session = WebVideoDecodeSession::open_with(
+            MAIN10,
+            0,
+            &Limits::default(),
+            BackendChoice::SoftwareOnly,
+        )
+        .await
+        .unwrap();
+        assert!(session.is_software());
+        assert_eq!(session.frame_count(), 12);
+        for frame in [0_u64, 5, 11, 3] {
+            let (dimensions, rgba) = session
+                .get(FrameIndex(frame), &CancellationToken::new())
+                .await
+                .unwrap();
+            assert_eq!((dimensions.width, dimensions.height), (128, 72));
+            assert_eq!(
+                digest(dimensions, rgba),
+                expected[frame as usize],
+                "frame {frame}"
+            );
+        }
     }
 
     /// The fallback is only for what `WebCodecs` cannot do: a browser that

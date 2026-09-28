@@ -250,6 +250,65 @@ fn convert_row_scalar(luma: &[i32], cb: &[i32], cr: &[i32], out: &mut [u8], star
     }
 }
 
+/// Converts a whole 4:2:0 picture with 9- to 11-bit samples to RGBA (issue
+/// #508), for HEVC Main 10.
+///
+/// The matrix is the 8-bit kernel's. Only the scaling in front of it changes:
+/// the 8-bit kernel's `8·Y` is `Y` at 11 bits, so a `BitDepth`-bit sample is
+/// shifted up by `11 - BitDepth` instead and keeps every bit it was decoded
+/// with rather than being rounded to 8 bits first. The offsets stay `128` and
+/// `1024`, which are 16 and 128 at 11 bits. Each component is scaled by its own
+/// bit depth, since Main 10 lets luma and chroma differ.
+///
+/// This runs on the scalar path only. Main 10 reaches the software decoder as
+/// a fallback, and a vector kernel for it can follow if that ever becomes a
+/// throughput path.
+///
+/// # Panics
+/// Panics if either bit depth is outside `8..=11`, or if any plane or the
+/// destination is too small for the dimensions.
+#[allow(clippy::too_many_arguments)]
+pub fn convert_high_bit_depth_yuv420_to_rgba(
+    luma: &[i32],
+    luma_stride: usize,
+    luma_bit_depth: u8,
+    cb: &[i32],
+    cr: &[i32],
+    chroma_stride: usize,
+    chroma_bit_depth: u8,
+    width: usize,
+    height: usize,
+    rgba: &mut [u8],
+    rgba_stride: usize,
+) {
+    assert!((8..=11).contains(&luma_bit_depth) && (8..=11).contains(&chroma_bit_depth));
+    let luma_shift = 11 - luma_bit_depth;
+    let chroma_shift = 11 - chroma_bit_depth;
+    let chroma_width = width.div_ceil(2);
+    for y in 0..height {
+        let luma_row = &luma[y * luma_stride..y * luma_stride + width];
+        let chroma_base = (y / 2) * chroma_stride;
+        let cb_row = &cb[chroma_base..chroma_base + chroma_width];
+        let cr_row = &cr[chroma_base..chroma_base + chroma_width];
+        let out_row = &mut rgba[y * rgba_stride..y * rgba_stride + width * 4];
+        for x in 0..width {
+            let y_scaled = (luma_row[x] << luma_shift) - 128;
+            let u_scaled = (cb_row[x / 2] << chroma_shift) - 1024;
+            let v_scaled = (cr_row[x / 2] << chroma_shift) - 1024;
+            let y_term = multiply_high(y_scaled, Y_COEFF);
+            let at = x * 4;
+            out_row[at] = clip_u8(y_term.saturating_add(multiply_high(v_scaled, V_TO_R)));
+            out_row[at + 1] = clip_u8(
+                y_term
+                    .saturating_add(multiply_high(u_scaled, U_TO_G))
+                    .saturating_add(multiply_high(v_scaled, V_TO_G)),
+            );
+            out_row[at + 2] = clip_u8(y_term.saturating_add(multiply_high(u_scaled, U_TO_B)));
+            out_row[at + 3] = 255;
+        }
+    }
+}
+
 /// The decoder's Q16 fixed-point multiply: a full-width product, then an
 /// arithmetic shift back down.
 pub fn multiply_high(left: i32, right: i32) -> i32 {
@@ -543,6 +602,48 @@ mod tests {
                 assert_eq!(pixel[3], 255, "alpha is always opaque");
             }
         }
+    }
+
+    #[test]
+    fn a_10_bit_sample_converts_like_the_8_bit_sample_it_widens() {
+        // `4·v` at 10 bits is exactly `v` at 8 bits, so both kernels have to agree on it; the
+        // same content with its two low bits set is then allowed to differ, which is the
+        // precision the 10-bit kernel keeps.
+        let (width, height) = (9, 3);
+        let (luma, cb, cr, chroma_width) = planes(width, height);
+        let reference = convert(Isa::Scalar, width, height);
+        let widen = |plane: &[i32], low: i32| plane.iter().map(|v| v * 4 + low).collect::<Vec<_>>();
+        let mut rgba = vec![0_u8; width * height * 4];
+        convert_high_bit_depth_yuv420_to_rgba(
+            &widen(&luma, 0),
+            width,
+            10,
+            &widen(&cb, 0),
+            &widen(&cr, 0),
+            chroma_width,
+            10,
+            width,
+            height,
+            &mut rgba,
+            width * 4,
+        );
+        assert_eq!(rgba, reference);
+
+        convert_high_bit_depth_yuv420_to_rgba(
+            &widen(&luma, 3),
+            width,
+            10,
+            &widen(&cb, 3),
+            &widen(&cr, 3),
+            chroma_width,
+            10,
+            width,
+            height,
+            &mut rgba,
+            width * 4,
+        );
+        assert_ne!(rgba, reference);
+        assert!(rgba.chunks_exact(4).all(|pixel| pixel[3] == 255));
     }
 
     #[test]

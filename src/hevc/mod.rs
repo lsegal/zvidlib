@@ -60,11 +60,13 @@ use engine::sps::SeqParameterSet;
 
 const DEFAULT_REORDER_DEPTH: usize = 8;
 
-/// Returns the native HEVC Main decoder backend.
+/// Returns the native HEVC Main and Main 10 decoder backend.
 ///
-/// `Prefer` and `Require` select NVIDIA NVDEC on supported 64-bit Windows/Linux hosts, D3D11-aware
-/// Media Foundation on Windows, or VideoToolbox on macOS. `Prefer` falls back to the dependency-free
-/// software decoder when acceleration is unavailable; `Avoid` always selects software.
+/// For 8-bit Main, `Prefer` and `Require` select NVIDIA NVDEC on supported 64-bit Windows/Linux
+/// hosts, D3D11-aware Media Foundation on Windows, or VideoToolbox on macOS. `Prefer` falls back to
+/// the dependency-free software decoder when acceleration is unavailable; `Avoid` always selects
+/// software. Main 10 tracks with more than 8 bits per sample are always decoded in software, since
+/// none of the accelerated backends is wired for them, so `Require` reports them unavailable.
 pub fn native_hevc_video_decoder_factory() -> impl VideoDecoderFactory {
     HevcDecoderFactory
 }
@@ -81,10 +83,13 @@ impl VideoDecoderFactory for HevcDecoderFactory {
         {
             return unsupported;
         }
-        if let Err(error) = ParsedConfiguration::parse(configuration, &Limits::default()) {
-            return invalid_configuration(error.message());
-        }
-        if configuration.hardware != HardwarePreference::Avoid && hardware_available(configuration)
+        let parsed = match ParsedConfiguration::parse(configuration, &Limits::default()) {
+            Ok(parsed) => parsed,
+            Err(error) => return invalid_configuration(error.message()),
+        };
+        if configuration.hardware != HardwarePreference::Avoid
+            && !parsed.high_bit_depth
+            && hardware_available(configuration)
         {
             return CodecSupport::Supported {
                 implementation: CodecImplementation::Hardware,
@@ -114,7 +119,7 @@ impl VideoDecoderFactory for HevcDecoderFactory {
             CodecSupport::UnsupportedProfile => {
                 return Err(Error::new(
                     ErrorKind::Unsupported,
-                    "native HEVC decoder supports the Main profile",
+                    "native HEVC decoder supports the Main and Main 10 profiles",
                 ));
             }
             CodecSupport::HardwareUnavailable => unreachable!("hardware is not checked here"),
@@ -123,7 +128,15 @@ impl VideoDecoderFactory for HevcDecoderFactory {
             }
         }
         let parsed = ParsedConfiguration::parse(configuration, limits)?;
-        if configuration.hardware != HardwarePreference::Avoid {
+        if configuration.hardware == HardwarePreference::Require && parsed.high_bit_depth {
+            // Every accelerated backend below is 8-bit Main only, and would only notice a 10-bit
+            // sequence once decoding had started.
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                "hardware HEVC decoding is unavailable (no accelerated backend decodes more than 8 bits per sample)",
+            ));
+        }
+        if configuration.hardware != HardwarePreference::Avoid && !parsed.high_bit_depth {
             #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
             let mut hardware_errors = Vec::<String>::new();
             #[cfg(all(any(windows, target_os = "linux"), target_pointer_width = "64"))]
@@ -170,16 +183,17 @@ impl HevcDecoderFactory {
         if configuration.codec != Codec::Hevc {
             return CodecSupport::UnsupportedCodec;
         }
-        if configuration.profile != CodecProfile::HevcMain {
+        if !matches!(
+            configuration.profile,
+            CodecProfile::HevcMain | CodecProfile::HevcMain10
+        ) {
             return CodecSupport::UnsupportedProfile;
         }
         if configuration.output_format != PixelFormat::Rgba8 {
-            return invalid_configuration("native HEVC Main decoding currently outputs RGBA8");
+            return invalid_configuration("native HEVC decoding currently outputs RGBA8");
         }
         if configuration.color_range != ColorRange::Limited {
-            return invalid_configuration(
-                "native HEVC Main RGBA output requires limited-range input",
-            );
+            return invalid_configuration("native HEVC RGBA output requires limited-range input");
         }
         CodecSupport::Supported {
             implementation: CodecImplementation::Software,
@@ -212,6 +226,9 @@ fn invalid_configuration(reason: impl Into<String>) -> CodecSupport {
 #[derive(Debug)]
 struct ParsedConfiguration {
     record: HvccRecord,
+    /// Whether either component carries more than 8 bits per sample, which only the software
+    /// decoder handles.
+    high_bit_depth: bool,
 }
 
 impl ParsedConfiguration {
@@ -222,14 +239,27 @@ impl ParsedConfiguration {
         let payload = hvcc_payload(&configuration.configuration)?;
         let record = parse_hvcc(payload)
             .map_err(|error| malformed(format!("invalid hvcC configuration: {error}")))?;
-        if record.general_profile_idc != 1
-            || record.bit_depth_luma_minus8 != 0
-            || record.bit_depth_chroma_minus8 != 0
+        let max_bit_depth_minus8 = max_bit_depth_minus8(configuration.profile);
+        let profile_idc_allowed = match configuration.profile {
+            // A Main 10 decoder also decodes Main.
+            CodecProfile::HevcMain10 => matches!(record.general_profile_idc, 1 | 2),
+            _ => record.general_profile_idc == 1,
+        };
+        if !profile_idc_allowed
+            || record.bit_depth_luma_minus8 > max_bit_depth_minus8
+            || record.bit_depth_chroma_minus8 > max_bit_depth_minus8
             || record.chroma_format_idc != 1
         {
             return Err(Error::new(
                 ErrorKind::Unsupported,
-                "native HEVC decoder requires an 8-bit 4:2:0 Main-profile hvcC configuration",
+                match configuration.profile {
+                    CodecProfile::HevcMain10 => {
+                        "native HEVC decoder requires an 8- to 10-bit 4:2:0 Main or Main 10 hvcC configuration"
+                    }
+                    _ => {
+                        "native HEVC decoder requires an 8-bit 4:2:0 Main-profile hvcC configuration"
+                    }
+                },
             ));
         }
         let sps_unit = record
@@ -240,7 +270,23 @@ impl ParsedConfiguration {
         let sps = SeqParameterSet::parse(&sps_unit.rbsp)
             .map_err(|error| malformed(format!("invalid HEVC SPS: {error}")))?;
         validate_sps(&sps, configuration, limits)?;
-        Ok(Self { record })
+        let high_bit_depth = record.bit_depth_luma_minus8 != 0
+            || record.bit_depth_chroma_minus8 != 0
+            || sps.bit_depth_luma_minus8 != 0
+            || sps.bit_depth_chroma_minus8 != 0;
+        Ok(Self {
+            record,
+            high_bit_depth,
+        })
+    }
+}
+
+/// The deepest samples `profile` allows, as `bit_depth_*_minus8`: 8 bits for Main, 10 for
+/// Main 10.
+fn max_bit_depth_minus8(profile: CodecProfile) -> u8 {
+    match profile {
+        CodecProfile::HevcMain10 => 2,
+        _ => 0,
     }
 }
 
@@ -265,14 +311,20 @@ fn validate_sps(
     configuration: &VideoDecoderConfig,
     limits: &Limits,
 ) -> Result<()> {
+    let max_bit_depth_minus8 = max_bit_depth_minus8(configuration.profile);
     if sps.chroma_format_idc != 1
         || sps.separate_colour_plane_flag
-        || sps.bit_depth_luma_minus8 != 0
-        || sps.bit_depth_chroma_minus8 != 0
+        || sps.bit_depth_luma_minus8 > max_bit_depth_minus8
+        || sps.bit_depth_chroma_minus8 > max_bit_depth_minus8
     {
         return Err(Error::new(
             ErrorKind::Unsupported,
-            "native HEVC decoder requires SPS Main-profile 8-bit 4:2:0 syntax",
+            match configuration.profile {
+                CodecProfile::HevcMain10 => {
+                    "native HEVC decoder requires SPS 8- to 10-bit 4:2:0 syntax"
+                }
+                _ => "native HEVC decoder requires SPS Main-profile 8-bit 4:2:0 syntax",
+            },
         ));
     }
     if sps.pic_width_in_luma_samples > limits.max_width
@@ -529,13 +581,14 @@ fn picture_to_rgba(
     limits: &Limits,
 ) -> Result<VideoFrame> {
     let _profile = engine::profile::scope(engine::profile::Stage::ColorConvert);
+    let max_bit_depth = 8 + max_bit_depth_minus8(configuration.profile);
     if picture.chroma_array_type() != 1
-        || picture.bit_depth_luma() != 8
-        || picture.bit_depth_chroma() != 8
+        || !(8..=max_bit_depth).contains(&picture.bit_depth_luma())
+        || !(8..=max_bit_depth).contains(&picture.bit_depth_chroma())
     {
         return Err(Error::new(
             ErrorKind::Unsupported,
-            "decoded HEVC picture is not Main-profile 8-bit 4:2:0",
+            "decoded HEVC picture is not 4:2:0 at a bit depth its profile allows",
         ));
     }
     let width = configuration.coded_dimensions.width as usize;
@@ -559,17 +612,33 @@ fn picture_to_rgba(
     let cr = picture.plane(HevcPlane::Cr);
     let chroma_width = picture.plane_dims(HevcPlane::Cb).0;
     let mut rgba = vec![0_u8; length];
-    color_convert::convert_yuv420_to_rgba(
-        luma,
-        picture.width_luma(),
-        cb,
-        cr,
-        chroma_width,
-        width,
-        height,
-        &mut rgba,
-        stride,
-    );
+    if picture.bit_depth_luma() == 8 && picture.bit_depth_chroma() == 8 {
+        color_convert::convert_yuv420_to_rgba(
+            luma,
+            picture.width_luma(),
+            cb,
+            cr,
+            chroma_width,
+            width,
+            height,
+            &mut rgba,
+            stride,
+        );
+    } else {
+        color_convert::convert_high_bit_depth_yuv420_to_rgba(
+            luma,
+            picture.width_luma(),
+            picture.bit_depth_luma(),
+            cb,
+            cr,
+            chroma_width,
+            picture.bit_depth_chroma(),
+            width,
+            height,
+            &mut rgba,
+            stride,
+        );
+    }
     VideoFrame::new(
         configuration.coded_dimensions,
         PixelFormat::Rgba8,
@@ -623,6 +692,135 @@ mod tests {
         };
         let support = native_hevc_video_decoder_factory().capability(&configuration);
         assert!(matches!(support, CodecSupport::InvalidConfiguration { .. }));
+    }
+
+    fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
+        use std::task::{Context, Poll, Waker};
+        let mut future = Box::pin(future);
+        let mut context = Context::from_waker(Waker::noop());
+        loop {
+            if let Poll::Ready(value) = future.as_mut().poll(&mut context) {
+                return value;
+            }
+        }
+    }
+
+    /// The 12-frame HEVC Main 10 fixture's decoder configuration and decode-order samples.
+    fn main10_fixture(
+        profile: CodecProfile,
+        hardware: HardwarePreference,
+    ) -> (VideoDecoderConfig, Vec<EncodedVideoSample>) {
+        use crate::Mp4DemuxerOptions;
+        use crate::io::MemorySource;
+        use crate::mp4_demux::Mp4Demuxer;
+
+        let limits = Limits::default();
+        let source = MemorySource::new(
+            include_bytes!("../../tests/fixtures/codec/bbb_hevc_main10_128x72.mp4").to_vec(),
+        );
+        let movie = block_on(Mp4Demuxer::open(&source, Mp4DemuxerOptions::default())).unwrap();
+        let track = &movie.tracks[0];
+        let samples = block_on(track.to_encoded_video_samples(&source, &limits)).unwrap();
+        let configuration = VideoDecoderConfig {
+            codec: Codec::Hevc,
+            profile,
+            coded_dimensions: track.dimensions.unwrap(),
+            output_format: PixelFormat::Rgba8,
+            color_range: ColorRange::Limited,
+            hardware,
+            configuration: track.decoder_config.clone(),
+        };
+        (configuration, samples)
+    }
+
+    /// Issue #508: the 10-bit samples themselves are FFmpeg's `yuv420p10le` decode of the same
+    /// fixture exactly, and their RGBA conversion is the fixture's, which applies the documented
+    /// matrix to that FFmpeg decode.
+    #[test]
+    fn main10_pictures_match_an_independent_reference_decode() {
+        let digests = |fixture: &str| {
+            fixture
+                .lines()
+                .map(|line| line.split_once(' ').unwrap().1.to_owned())
+                .collect::<Vec<_>>()
+        };
+        let expected = digests(include_str!(
+            "../../tests/fixtures/codec/bbb_hevc_main10_128x72_yuv420p10le.sha256"
+        ));
+        let expected_rgba = digests(include_str!(
+            "../../tests/fixtures/codec/bbb_hevc_main10_128x72_rgba.sha256"
+        ));
+        let limits = Limits::default();
+        let (configuration, samples) =
+            main10_fixture(CodecProfile::HevcMain10, HardwarePreference::Avoid);
+        let parsed = ParsedConfiguration::parse(&configuration, &limits).unwrap();
+        assert!(parsed.high_bit_depth);
+        let mut decoder = HevcDecoder::new(configuration.clone(), limits, parsed).unwrap();
+        let cancellation = CancellationToken::new();
+        let mut pictures = Vec::new();
+        for sample in &samples {
+            decoder.push_sample(sample, &cancellation).unwrap();
+            pictures.extend(decoder.collect_pictures(false).unwrap());
+        }
+        decoder.sequence.flush().unwrap();
+        pictures.extend(decoder.collect_pictures(true).unwrap());
+        pictures.sort_by_key(|(index, _)| *index);
+
+        assert_eq!(pictures.len(), expected.len());
+        for (((index, picture), expected), expected_rgba) in
+            pictures.iter().zip(&expected).zip(&expected_rgba)
+        {
+            assert_eq!(picture.bit_depth_luma(), 10);
+            assert_eq!(picture.bit_depth_chroma(), 10);
+            let digest = crate::conformance::FrameDigest(crate::conformance::sha256(
+                &picture.to_planar_le16(),
+            ));
+            assert_eq!(&digest.to_hex(), expected, "frame {}", index.0);
+            let rgba = picture_to_rgba(picture, &configuration, &limits).unwrap();
+            let digest = crate::conformance::FrameDigest::from_frame(&rgba).unwrap();
+            assert_eq!(&digest.to_hex(), expected_rgba, "frame {} RGBA", index.0);
+        }
+    }
+
+    #[test]
+    fn main10_is_decoded_in_software_whatever_the_hardware_preference() {
+        let factory = native_hevc_video_decoder_factory();
+        for hardware in [HardwarePreference::Avoid, HardwarePreference::Prefer] {
+            let (configuration, _) = main10_fixture(CodecProfile::HevcMain10, hardware);
+            assert_eq!(
+                factory.capability(&configuration),
+                CodecSupport::Supported {
+                    implementation: CodecImplementation::Software
+                },
+                "{hardware:?}"
+            );
+        }
+        let (configuration, _) =
+            main10_fixture(CodecProfile::HevcMain10, HardwarePreference::Require);
+        assert_eq!(
+            factory.capability(&configuration),
+            CodecSupport::HardwareUnavailable
+        );
+        let error = factory
+            .create(&configuration, &Limits::default())
+            .err()
+            .expect("no accelerated backend decodes Main 10");
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn a_main_profile_configuration_still_refuses_a_10_bit_track() {
+        let (configuration, _) = main10_fixture(CodecProfile::HevcMain, HardwarePreference::Avoid);
+        let factory = native_hevc_video_decoder_factory();
+        assert!(matches!(
+            factory.capability(&configuration),
+            CodecSupport::InvalidConfiguration { .. }
+        ));
+        let error = factory
+            .create(&configuration, &Limits::default())
+            .err()
+            .expect("HEVC Main is 8-bit");
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
     }
 
     #[test]
