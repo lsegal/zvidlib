@@ -86,6 +86,32 @@ per-frame decode cost at that size is smaller than the bundled 1080p sample's,
 but the ratio between the two arms - which is what the cadence question is
 about - is not affected by it.
 
+`bbb_hevc_main10_128x72.mp4` is a 12-frame HEVC Main 10 (`yuv420p10le`) track
+cut from the bundled `examples/media/BigBuckBunny.mp4` sample, with one
+random-access point and B-frames, for the Main 10 software decode (issue #508).
+It was generated offline with
+
+```sh
+ffmpeg -ss 10 -i ../../../examples/media/BigBuckBunny.mp4 -an -frames:v 12   -vf scale=128:72 -pix_fmt yuv420p10le -c:v libx265 -profile:v main10   -preset medium -crf 30   -x265-params "keyint=12:min-keyint=12:scenecut=0:bframes=3"   -tag:v hvc1 -movflags +faststart bbb_hevc_main10_128x72.mp4
+```
+
+`bbb_hevc_main10_128x72_yuv420p10le.sha256` is the SHA-256 of each
+presentation frame of FFmpeg 6.0's own decode of that track
+(`ffmpeg -i bbb_hevc_main10_128x72.mp4 -f rawvideo -pix_fmt yuv420p10le`),
+the planar little-endian 16-bit layout `Picture::to_planar_le16` produces. It
+is the independent reference: the decoder's 10-bit samples must equal
+FFmpeg's before any colour conversion.
+
+`bbb_hevc_main10_128x72_rgba.sha256` carries one canonical `FrameDigest` per
+presentation frame of the same track's `Rgba8` output. FFmpeg's scaler has no
+10-bit path that reproduces the fixed-point BT.601 matrix `picture_to_rgba`
+uses (its 8-bit fast path is the one the Main fixture above matches), so these
+digests were computed by applying that matrix, as documented in
+`src/hevc/color_convert.rs`, to FFmpeg's `yuv420p10le` decode in a separate
+Python script, with each 10-bit sample shifted up by one bit to the matrix's
+11-bit scale. As above, FFmpeg is only the offline fixture generator and is not
+a build, test, or runtime dependency.
+
 `big_buck_bunny_av1_yuv420.sha256` holds one canonical `FrameDigest` per
 presentation frame (0-767) of the bundled `examples/media/BigBuckBunny.av1.mp4`
 sample (SVT-AV1, 8-bit 4:2:0 Main, 960x540, limited range) as decoded by

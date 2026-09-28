@@ -87,6 +87,46 @@ fn native_hevc_decoder_conforms_for_sequential_reverse_and_alternating_seeks() {
     assert_eq!(error.kind(), ErrorKind::ResourceLimit);
 }
 
+/// Issue #508: an HEVC Main 10 track decodes in software, and asking for hardware does not route it
+/// to an 8-bit-only accelerated backend first.
+#[test]
+fn native_hevc_decoder_conforms_for_main10() {
+    let expected = include_str!("fixtures/codec/bbb_hevc_main10_128x72_rgba.sha256")
+        .lines()
+        .map(|line| {
+            let (_, digest) = line.split_once(' ').unwrap();
+            FrameDigest::from_hex(digest).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let limits = Limits::default();
+    let source =
+        MemorySource::new(include_bytes!("fixtures/codec/bbb_hevc_main10_128x72.mp4").to_vec());
+    let vector = block_on(VideoDecoderConformanceVector::from_mp4(
+        "HEVC Main 10 sample",
+        &source,
+        Mp4DemuxerOptions::default(),
+        1,
+        VideoDecoderConfig {
+            codec: Codec::Hevc,
+            profile: CodecProfile::HevcMain10,
+            coded_dimensions: VideoDimensions::new(128, 72, &limits).unwrap(),
+            output_format: PixelFormat::Rgba8,
+            color_range: ColorRange::Limited,
+            hardware: HardwarePreference::Prefer,
+            configuration: Vec::new(),
+        },
+        &expected,
+    ))
+    .unwrap();
+    assert_eq!(vector.samples.len(), 12);
+
+    let report =
+        verify_video_decoder_conformance(&native_hevc_video_decoder_factory(), &vector, limits)
+            .unwrap();
+    assert_eq!(report.frames_verified, 36);
+    assert_eq!(report.access_patterns_verified, 3);
+}
+
 /// A frame in the middle of the bundled sample's single group of pictures can only be reached by
 /// decoding everything before it, and issue #354 is what that used to cost: every one of those
 /// pictures was converted to RGBA for nobody. The reader now tells the decoder they are wanted
