@@ -6,7 +6,7 @@ All notable changes to zvidlib will be documented in this file.
 
 ## 0.3.0 - 2026-09-28
 
-zvidlib now writes cover art into MP4 files, so Windows Explorer, Finder and most players show a thumbnail for an HEVC or AV1 recording without a decoder for it. Use the `v0.3.0` Git tag for Cargo and `zvidlib-web-v0.3.0.tgz` for the browser package.
+zvidlib now writes cover art into MP4 files, so Windows Explorer, Finder and most players show a thumbnail for an HEVC or AV1 recording without a decoder for it. It also decodes HEVC Main 10 in software, natively and in the browser's software fallback, and the browser build falls back to software decoding when WebCodecs cannot decode a track. Use the `v0.3.0` Git tag for Cargo and `zvidlib-web-v0.3.0.tgz` for the browser package.
 
 - **Cover art API:** `Mp4Muxer::set_cover_art` and `MediaOutput::set_cover_art` write a caller-encoded JPEG or PNG `CoverArt` as `moov/udta/meta/ilst/covr`, and `Mp4Demuxer::cover_art` reads it back. In the browser, `MediaOutput.setCoverArt(bytes, mimeType)` does the same.
 - **Behaviour change:** `MediaOutput` now generates a cover by default from video frame 4, shrunk to at most 512 pixels on its longest edge and stored as a PNG. Choose another frame with `OutputOptions::cover_source = CoverSource::Frame(n)` (`CreateOptions.coverFrame` in the browser), or turn generation off with `CoverSource::None` (`coverFrame: null`). A cover passed to `set_cover_art` always takes precedence.
