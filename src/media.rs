@@ -12,6 +12,11 @@ pub enum Container {
 #[non_exhaustive]
 pub enum Codec {
     UncompressedVideo,
+    /// H.264/AVC video. MP4 passthrough only: [`crate::Mp4Demuxer`] reads
+    /// `avc1`/`avc3` sample entries and [`crate::mp4::Mp4Muxer`] writes `avc1`,
+    /// with an `avcC` box as the decoder configuration. No encoder or decoder
+    /// factory accepts it.
+    H264,
     Hevc,
     Av1,
     Aac,

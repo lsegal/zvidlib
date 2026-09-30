@@ -23,7 +23,7 @@ pub fn derive_codec_string(codec: Codec, decoder_config: &[u8]) -> Result<Derive
     match codec {
         Codec::Hevc => derive_hevc(decoder_config),
         Codec::Av1 => derive_av1(decoder_config),
-        Codec::UncompressedVideo | Codec::Aac => Err(Error::new(
+        Codec::UncompressedVideo | Codec::H264 | Codec::Aac => Err(Error::new(
             ErrorKind::Unsupported,
             "codec string derivation only supports HEVC and AV1 video",
         )),

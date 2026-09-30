@@ -253,6 +253,7 @@ fn validate_track_config(config: &Mp4TrackConfig) -> Result<()> {
                 "the uncompressed conformance codec is not an MP4 output codec",
             ));
         }
+        Codec::H264 => b"avcC",
         Codec::Hevc => b"hvcC",
         Codec::Av1 => b"av1C",
         Codec::Aac => b"esds",
@@ -261,7 +262,7 @@ fn validate_track_config(config: &Mp4TrackConfig) -> Result<()> {
         return Err(invalid("codec configuration box type is incompatible"));
     }
     match (config.encoder.codec, config.format) {
-        (Codec::Hevc | Codec::Av1, Mp4TrackFormat::Video(_))
+        (Codec::H264 | Codec::Hevc | Codec::Av1, Mp4TrackFormat::Video(_))
         | (Codec::Aac, Mp4TrackFormat::Audio { .. }) => Ok(()),
         _ => Err(invalid("codec and MP4 track kind are incompatible")),
     }
@@ -562,6 +563,7 @@ fn video_sample_entry(track: &TrackState, dimensions: VideoDimensions) -> Result
                     "uncompressed conformance codec used for an MP4 video sample entry",
                 ));
             }
+            Codec::H264 => *b"avc1",
             Codec::Hevc => *b"hvc1",
             Codec::Av1 => *b"av01",
             Codec::Aac => return Err(internal("AAC used for a video sample entry")),
