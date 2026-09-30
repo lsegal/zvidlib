@@ -61,7 +61,7 @@ fn codec_description(codec: Codec, decoder_config: &[u8]) -> Result<&[u8]> {
     match codec {
         Codec::Hevc => box_payload(decoder_config, b"hvcC"),
         Codec::Av1 => box_payload(decoder_config, b"av1C"),
-        Codec::UncompressedVideo | Codec::Aac => Err(Error::new(
+        Codec::UncompressedVideo | Codec::H264 | Codec::Aac => Err(Error::new(
             ErrorKind::Unsupported,
             "only HEVC and AV1 have a WebCodecs decoder backend",
         )),
@@ -291,7 +291,7 @@ fn software_decoder_factory(codec: Codec) -> Result<Box<dyn VideoDecoderFactory>
     match codec {
         Codec::Hevc => Ok(Box::new(crate::native_hevc_video_decoder_factory())),
         Codec::Av1 => Ok(Box::new(crate::native_av1_video_decoder_factory())),
-        Codec::UncompressedVideo | Codec::Aac => Err(Error::new(
+        Codec::UncompressedVideo | Codec::H264 | Codec::Aac => Err(Error::new(
             ErrorKind::Unsupported,
             "only HEVC and AV1 have a software decoder backend",
         )),

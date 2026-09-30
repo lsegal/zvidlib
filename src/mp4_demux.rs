@@ -856,6 +856,7 @@ fn parse_stsd(
     }
     let entry = one_child(&body[4..], 6, budget, options)?;
     let (codec, prefix, kind) = match &entry.kind {
+        b"avc1" | b"avc3" => (Codec::H264, 78, TrackKind::Video),
         b"hvc1" | b"hev1" => (Codec::Hevc, 78, TrackKind::Video),
         b"av01" => (Codec::Av1, 78, TrackKind::Video),
         b"mp4a" => (Codec::Aac, 28, TrackKind::Audio),
@@ -879,6 +880,7 @@ fn parse_stsd(
         track.sample_rate = Some(fixed_rate >> 16);
     }
     let config_kind = match codec {
+        Codec::H264 => b"avcC",
         Codec::Hevc => b"hvcC",
         Codec::Av1 => b"av1C",
         Codec::Aac => b"esds",
@@ -2108,6 +2110,145 @@ mod tests {
         let derived =
             crate::codec_config::derive_codec_string(track.codec, &track.decoder_config).unwrap();
         assert!(derived.codec_string.starts_with("hev1."));
+    }
+
+    /// An `avcC` record as WebCodecs/mediabunny writes it: High profile,
+    /// level 3.1, 4-byte NAL lengths, one SPS and one PPS.
+    fn avcc_box() -> Vec<u8> {
+        let sps = [
+            0x67, 0x64, 0x00, 0x1f, 0xac, 0xd9, 0x40, 0x50, 0x05, 0xbb, 0x01, 0x10,
+        ];
+        let pps = [0x68, 0xeb, 0xe3, 0xcb, 0x22, 0xc0];
+        let mut record = vec![1, 0x64, 0x00, 0x1f, 0xff, 0xe1];
+        record.extend_from_slice(&u16::try_from(sps.len()).unwrap().to_be_bytes());
+        record.extend_from_slice(&sps);
+        record.push(1);
+        record.extend_from_slice(&u16::try_from(pps.len()).unwrap().to_be_bytes());
+        record.extend_from_slice(&pps);
+        boxed(b"avcC", record)
+    }
+
+    fn mux_h264(samples: &[crate::EncodedSample]) -> Vec<u8> {
+        use crate::io::MemorySink;
+        use crate::mp4::{Mp4Muxer, Mp4TrackConfig, Mp4TrackFormat};
+        block_on(async {
+            let mut muxer = Mp4Muxer::new(
+                MemorySink::new(),
+                vec![Mp4TrackConfig {
+                    encoder: crate::EncoderConfig {
+                        codec: Codec::H264,
+                        timescale: 30_000,
+                        decoder_config: avcc_box(),
+                    },
+                    format: Mp4TrackFormat::Video(VideoDimensions {
+                        width: 640,
+                        height: 360,
+                    }),
+                }],
+                16,
+            )
+            .await
+            .unwrap();
+            for sample in samples {
+                muxer.write_sample(0, sample.clone()).await.unwrap();
+            }
+            muxer.finish().await.unwrap().into_inner()
+        })
+    }
+
+    #[test]
+    fn h264_avc1_track_round_trips_through_the_muxer_and_demuxer() {
+        let samples: Vec<crate::EncodedSample> = (0..4_u8)
+            .map(|index| crate::EncodedSample {
+                data: vec![index + 1; 20 + usize::from(index)],
+                dts: i64::from(index) * 1_001,
+                pts: i64::from(index) * 1_001,
+                duration: 1_001,
+                is_sync: index == 0,
+                dependency: if index == 0 {
+                    SampleDependency::INDEPENDENT
+                } else {
+                    SampleDependency::DEPENDENT
+                },
+            })
+            .collect();
+        let bytes = mux_h264(&samples);
+        assert!(
+            bytes.windows(4).any(|window| window == b"avc1"),
+            "the muxer must write an avc1 sample entry"
+        );
+
+        let source = MemorySource::new(bytes.clone());
+        let demuxer = block_on(Mp4Demuxer::open(&source, Mp4DemuxerOptions::default())).unwrap();
+        assert_eq!(demuxer.tracks.len(), 1);
+        let track = &demuxer.tracks[0];
+        assert_eq!(track.kind, TrackKind::Video);
+        assert_eq!(track.codec, Codec::H264);
+        assert_eq!(track.decoder_config, avcc_box());
+        assert_eq!(track.timescale, 30_000);
+        assert_eq!(
+            track.dimensions,
+            Some(VideoDimensions {
+                width: 640,
+                height: 360
+            })
+        );
+        assert_eq!(track.samples.len(), samples.len());
+        for (read, written) in track.samples.iter().zip(&samples) {
+            assert_eq!(read.dts, u64::try_from(written.dts).unwrap());
+            assert_eq!(read.pts, written.pts);
+            assert_eq!(read.duration, written.duration);
+            assert_eq!(read.is_sync, written.is_sync);
+        }
+        let read = block_on(track.to_encoded_video_samples(&source, &Limits::default())).unwrap();
+        let data: Vec<_> = read.iter().map(|sample| sample.data.clone()).collect();
+        let expected: Vec<_> = samples.iter().map(|sample| sample.data.clone()).collect();
+        assert_eq!(data, expected);
+
+        // H.264 is passthrough only: there is no WebCodecs codec string for it.
+        let error = crate::codec_config::derive_codec_string(track.codec, &track.decoder_config)
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+
+        // `avc3` carries the same `avcC` and demuxes the same way.
+        let at = bytes
+            .windows(4)
+            .position(|window| window == b"avc1")
+            .unwrap();
+        let mut avc3 = bytes;
+        avc3[at..at + 4].copy_from_slice(b"avc3");
+        let demuxer = block_on(Mp4Demuxer::open(
+            &MemorySource::new(avc3),
+            Mp4DemuxerOptions::default(),
+        ))
+        .unwrap();
+        assert_eq!(demuxer.tracks[0].codec, Codec::H264);
+        assert_eq!(demuxer.tracks[0].decoder_config, avcc_box());
+    }
+
+    #[test]
+    fn h264_track_needs_an_avcc_decoder_config() {
+        use crate::io::MemorySink;
+        use crate::mp4::{Mp4Muxer, Mp4TrackConfig, Mp4TrackFormat};
+        let error = match block_on(Mp4Muxer::new(
+            MemorySink::new(),
+            vec![Mp4TrackConfig {
+                encoder: crate::EncoderConfig {
+                    codec: Codec::H264,
+                    timescale: 30_000,
+                    decoder_config: boxed(b"hvcC", [1, 2, 3, 4]),
+                },
+                format: Mp4TrackFormat::Video(VideoDimensions {
+                    width: 640,
+                    height: 360,
+                }),
+            }],
+            16,
+        )) {
+            Ok(_) => panic!("an H.264 track with an hvcC box must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
     }
 
     #[test]

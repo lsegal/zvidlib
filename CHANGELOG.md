@@ -4,6 +4,8 @@ All notable changes to zvidlib will be documented in this file.
 
 ## Unreleased
 
+- Pass H.264 (AVC) video through MP4 files (issue #521). `Mp4Demuxer::open` previously rejected any file whose video sample entry was `avc1` or `avc3` with `unsupported MP4 sample entry`, and `Mp4Muxer` had no way to write one, so an H.264 MP4 from a browser encoder could not be remuxed through zvidlib. The new `Codec::H264` variant is reported for `avc1` and `avc3` tracks, whose `decoder_config` is the complete `avcC` box, and `Mp4Muxer` writes a `Codec::H264` video track with an `avcC` `decoder_config` as an `avc1` sample entry. This is passthrough only: no encoder or decoder factory accepts H.264, and they report `UnsupportedCodec` for it, while `derive_codec_string` and the browser decoder return an `Unsupported` error. `Codec` is `#[non_exhaustive]`, so the new variant is not a breaking change for code that matches on it.
+
 ## 0.3.0 - 2026-09-28
 
 zvidlib now writes cover art into MP4 files, so Windows Explorer, Finder and most players show a thumbnail for an HEVC or AV1 recording without a decoder for it. It also decodes HEVC Main 10 in software, natively and in the browser's software fallback, and the browser build falls back to software decoding when WebCodecs cannot decode a track. Use the `v0.3.0` Git tag for Cargo and `zvidlib-web-v0.3.0.tgz` for the browser package.
