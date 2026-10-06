@@ -401,15 +401,14 @@ impl NativeVp9Encoder {
 
         let key = index.0 % self.keyframe_interval == 0;
         let reference = if key { None } else { self.reference.as_ref() };
-        let (data, reconstruction) =
-            FrameEncoder::new(
-                self.geometry,
-                &picture,
-                reference,
-                self.base_q_idx,
-                self.tools,
-            )
-                .encode(self.color_range == ColorRange::Full);
+        let (data, reconstruction) = FrameEncoder::new(
+            self.geometry,
+            &picture,
+            reference,
+            self.base_q_idx,
+            self.tools,
+        )
+        .encode(self.color_range == ColorRange::Full);
         if u64::try_from(data.len()).unwrap_or(u64::MAX) > self.limits.max_allocation_bytes {
             return Err(Error::new(
                 ErrorKind::ResourceLimit,

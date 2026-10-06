@@ -282,6 +282,10 @@ struct PlaneCoding {
     bits: f64,
 }
 
+/// The best chroma mode found so far: its cost, mode, both planes' coding and
+/// their reconstruction.
+type ChromaCandidate = (f64, IntraMode, [PlaneCoding; 2], [Vec<u8>; 2]);
+
 /// The above and left coding contexts a block reads and writes.
 struct ContextSnapshot {
     above_nonzero: [Vec<bool>; 3],
@@ -339,8 +343,11 @@ impl<'a> FrameEncoder<'a> {
             ac_q: ac,
             // Distortion is a pixel-domain squared error and rate is in bits.
             // The transform's coefficients are eight times orthonormal, so the
-            // effective step is `ac / 8`.
-            lambda: f64::from(ac * ac) / 96.0,
+            // effective step is `ac / 8`, and lambda is about a nineteenth of
+            // its square: enough to drop coefficients, skip blocks and merge
+            // partitions where they cost more than they restore, without
+            // trading away the quality the quantizer would otherwise keep.
+            lambda: f64::from(ac * ac) / 1200.0,
             mode_info: vec![ModeInfo::default(); geometry.mi_cols * geometry.mi_rows],
             above_nonzero: [
                 vec![false; geometry.mi_cols * 2],
@@ -508,7 +515,14 @@ impl<'a> FrameEncoder<'a> {
         pixels
     }
 
-    fn load_pixels(&mut self, plane: usize, mi_row: usize, mi_col: usize, bsl: usize, pixels: &[u8]) {
+    fn load_pixels(
+        &mut self,
+        plane: usize,
+        mi_row: usize,
+        mi_col: usize,
+        bsl: usize,
+        pixels: &[u8],
+    ) {
         let (x, y, width, height) = self.plane_region(plane, mi_row, mi_col, bsl);
         let stride = self.recon.strides[plane];
         for row in 0..height {
@@ -565,7 +579,13 @@ impl<'a> FrameEncoder<'a> {
         }
     }
 
-    fn restore_block(&mut self, mi_row: usize, mi_col: usize, bsl: usize, snapshot: &BlockSnapshot) {
+    fn restore_block(
+        &mut self,
+        mi_row: usize,
+        mi_col: usize,
+        bsl: usize,
+        snapshot: &BlockSnapshot,
+    ) {
         for plane in 0..3 {
             self.load_pixels(plane, mi_row, mi_col, bsl, &snapshot.pixels[plane]);
         }
@@ -841,8 +861,10 @@ impl<'a> FrameEncoder<'a> {
         for tx_size in 0..=self.max_tx_size(bsl) {
             let mut best_luma: Option<(f64, IntraMode, PlaneCoding, Vec<u8>)> = None;
             for mode in IntraMode::ALL {
-                let coding = self.code_plane(0, mi_row, mi_col, bsl, usize::from(tx_size), Some(mode));
-                let bits = coding.bits + cost(|sink| self.y_mode_symbol(sink, neighbors, bsl, mode));
+                let coding =
+                    self.code_plane(0, mi_row, mi_col, bsl, usize::from(tx_size), Some(mode));
+                let bits =
+                    coding.bits + cost(|sink| self.y_mode_symbol(sink, neighbors, bsl, mode));
                 let total = coding.error as f64 + self.lambda * bits;
                 if best_luma.as_ref().is_none_or(|best| total < best.0) {
                     let pixels = self.block_pixels(0, mi_row, mi_col, bsl);
@@ -853,7 +875,7 @@ impl<'a> FrameEncoder<'a> {
                 best_luma.expect("at least one intra mode is evaluated");
 
             let uv_tx_size = plane_tx_size(tx_size, bsl, 1);
-            let mut best_uv: Option<(f64, IntraMode, [PlaneCoding; 2], [Vec<u8>; 2])> = None;
+            let mut best_uv: Option<ChromaCandidate> = None;
             for mode in IntraMode::ALL {
                 let codings = [1, 2].map(|plane| {
                     self.code_plane(plane, mi_row, mi_col, bsl, uv_tx_size, Some(mode))
@@ -880,7 +902,11 @@ impl<'a> FrameEncoder<'a> {
                 skip,
                 tx_size,
             };
-            let token_bits = if skip { 0.0 } else { luma.bits + u.bits + v.bits };
+            let token_bits = if skip {
+                0.0
+            } else {
+                luma.bits + u.bits + v.bits
+            };
             let header_bits = cost(|sink| {
                 self.skip_symbol(sink, neighbors, skip);
                 if !self.is_key() {
@@ -1105,7 +1131,12 @@ impl<'a> FrameEncoder<'a> {
                 let (size, width, height, scale) = if plane == 0 {
                     (8 << bsl, geometry.width, geometry.height, 2)
                 } else {
-                    (4 << bsl, geometry.chroma_width(), geometry.chroma_height(), 1)
+                    (
+                        4 << bsl,
+                        geometry.chroma_width(),
+                        geometry.chroma_height(),
+                        1,
+                    )
                 };
                 let reference_plane = ReferencePlane {
                     pixels: &reference.planes[plane],
@@ -1168,7 +1199,11 @@ impl<'a> FrameEncoder<'a> {
                 }
                 let uv_tx_size = plane_tx_size(tx_size, bsl, 1);
                 let codings = [0, 1, 2].map(|plane| {
-                    let plane_tx = if plane == 0 { usize::from(tx_size) } else { uv_tx_size };
+                    let plane_tx = if plane == 0 {
+                        usize::from(tx_size)
+                    } else {
+                        uv_tx_size
+                    };
                     self.code_plane(plane, mi_row, mi_col, bsl, plane_tx, None)
                 });
                 if codings
@@ -1242,7 +1277,10 @@ impl<'a> FrameEncoder<'a> {
             (true, false) => sink.write(true, probs[2]),
             (false, false) => {}
         }
-        debug_assert!(split || (has_rows && has_cols), "a partial square must split");
+        debug_assert!(
+            split || (has_rows && has_cols),
+            "a partial square must split"
+        );
     }
 
     fn skip_symbol<S: BoolSink>(&self, sink: &mut S, neighbors: Neighbors, skip: bool) {
@@ -1376,14 +1414,24 @@ impl<'a> FrameEncoder<'a> {
             return;
         }
         let (candidates, mode_context) = self.mv_references(mi_row, mi_col, bsl);
-        debug_assert_eq!(candidates[0], choice.best_mv, "NEARESTMV changed since the search");
+        debug_assert_eq!(
+            candidates[0], choice.best_mv,
+            "NEARESTMV changed since the search"
+        );
         debug_assert!(match info.mode {
             NEARESTMV => info.mv == candidates[0],
             NEARMV => info.mv == candidates[1],
             ZEROMV => info.mv == Mv::default(),
             _ => true,
         });
-        self.inter_symbols(writer, neighbors, mode_context, info.mode, info.mv, choice.best_mv);
+        self.inter_symbols(
+            writer,
+            neighbors,
+            mode_context,
+            info.mode,
+            info.mv,
+            choice.best_mv,
+        );
     }
 
     fn write_tokens(
@@ -1488,10 +1536,16 @@ fn scan_order(tx_size: usize, tx_type: TxType) -> (&'static [i16], &'static [i16
     match (tx_size, tx_type) {
         (0, TxType::AdstDct) => (&shared::ROW_SCAN_4X4, &shared::ROW_SCAN_4X4_NEIGHBORS),
         (0, TxType::DctAdst) => (&shared::COL_SCAN_4X4, &shared::COL_SCAN_4X4_NEIGHBORS),
-        (0, _) => (&shared::DEFAULT_SCAN_4X4, &shared::DEFAULT_SCAN_4X4_NEIGHBORS),
+        (0, _) => (
+            &shared::DEFAULT_SCAN_4X4,
+            &shared::DEFAULT_SCAN_4X4_NEIGHBORS,
+        ),
         (1, TxType::AdstDct) => (&shared::ROW_SCAN_8X8, &shared::ROW_SCAN_8X8_NEIGHBORS),
         (1, TxType::DctAdst) => (&shared::COL_SCAN_8X8, &shared::COL_SCAN_8X8_NEIGHBORS),
-        (1, _) => (&shared::DEFAULT_SCAN_8X8, &shared::DEFAULT_SCAN_8X8_NEIGHBORS),
+        (1, _) => (
+            &shared::DEFAULT_SCAN_8X8,
+            &shared::DEFAULT_SCAN_8X8_NEIGHBORS,
+        ),
         (2, TxType::AdstDct) => (&shared::ROW_SCAN_16X16, &shared::ROW_SCAN_16X16_NEIGHBORS),
         (2, TxType::DctAdst) => (&shared::COL_SCAN_16X16, &shared::COL_SCAN_16X16_NEIGHBORS),
         (2, _) => (
@@ -1556,7 +1610,13 @@ fn write_coefficients<S: BoolSink>(
     let mut cache = [0_u8; 1024];
     let mut previous_zero = false;
     for c in 0..eob {
-        let probs = coefficient_probs(tx_size, plane_type, reference, usize::from(bands[c]), context);
+        let probs = coefficient_probs(
+            tx_size,
+            plane_type,
+            reference,
+            usize::from(bands[c]),
+            context,
+        );
         if !previous_zero {
             sink.write(true, probs[0]);
         }
@@ -1580,8 +1640,13 @@ fn write_coefficients<S: BoolSink>(
             >> 1;
     }
     if eob < scan.len() {
-        let probs =
-            coefficient_probs(tx_size, plane_type, reference, usize::from(bands[eob]), context);
+        let probs = coefficient_probs(
+            tx_size,
+            plane_type,
+            reference,
+            usize::from(bands[eob]),
+            context,
+        );
         sink.write(false, probs[0]);
     }
 }
@@ -1819,7 +1884,11 @@ mod tests {
                     .map(|index| {
                         state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
                         let magnitude = ((state >> 16) % 7) as i32 >> (index / n).min(3);
-                        if state & 1 == 0 { magnitude } else { -magnitude }
+                        if state & 1 == 0 {
+                            magnitude
+                        } else {
+                            -magnitude
+                        }
                     })
                     .collect();
                 let (scan, _) = scan_order(tx_size, TxType::DctDct);
@@ -1834,8 +1903,26 @@ mod tests {
         let mut counter = BitCost::default();
         for (tx_size, levels, eob) in &blocks {
             for context in 0..3 {
-                write_coefficients(&mut writer, levels, *eob, *tx_size, TxType::DctDct, 0, 1, context);
-                write_coefficients(&mut counter, levels, *eob, *tx_size, TxType::DctDct, 0, 1, context);
+                write_coefficients(
+                    &mut writer,
+                    levels,
+                    *eob,
+                    *tx_size,
+                    TxType::DctDct,
+                    0,
+                    1,
+                    context,
+                );
+                write_coefficients(
+                    &mut counter,
+                    levels,
+                    *eob,
+                    *tx_size,
+                    TxType::DctDct,
+                    0,
+                    1,
+                    context,
+                );
             }
         }
         let written = writer.finish().len() as f64 * 8.0;

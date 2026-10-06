@@ -156,9 +156,7 @@ impl BoolSink for BitCost {
 /// The cost in bits of coding `bit` when a zero has `probability` / 256.
 pub(super) fn bit_cost(bit: bool, probability: u8) -> f64 {
     static COSTS: OnceLock<[f64; 256]> = OnceLock::new();
-    let costs = COSTS.get_or_init(|| {
-        core::array::from_fn(|p| -(p.max(1) as f64 / 256.0).log2())
-    });
+    let costs = COSTS.get_or_init(|| core::array::from_fn(|p| -(p.max(1) as f64 / 256.0).log2()));
     let p = usize::from(probability);
     costs[if bit { 256 - p } else { p }]
 }

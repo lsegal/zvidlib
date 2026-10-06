@@ -410,7 +410,10 @@ mod tests {
                 for i in 0..n {
                     let expected = basis[i * n + k] * SCALE;
                     let error = (f64::from(output[i]) - expected).abs();
-                    assert!(error <= 3.0, "{n}-point basis {k} sample {i} off by {error}");
+                    assert!(
+                        error <= 3.0,
+                        "{n}-point basis {k} sample {i} off by {error}"
+                    );
                 }
             }
         }
@@ -424,7 +427,11 @@ mod tests {
                 .map(|index| (index as i32 * 37 % 61) - 30)
                 .collect();
             for tx_type in TX_TYPES {
-                let tx_type = if tx_size == 3 { TxType::DctDct } else { tx_type };
+                let tx_type = if tx_size == 3 {
+                    TxType::DctDct
+                } else {
+                    tx_type
+                };
                 let mut coefficients = vec![0.0; n * n];
                 forward_transform(&residual, tx_size, tx_type, &mut coefficients);
                 let rounded: Vec<i32> = coefficients
@@ -474,7 +481,9 @@ mod tests {
     #[test]
     fn intra_predictors_scale_to_every_transform_size() {
         let stride = 40;
-        let mut plane: Vec<u8> = (0..stride * 40).map(|index| (index * 7 % 251) as u8).collect();
+        let mut plane: Vec<u8> = (0..stride * 40)
+            .map(|index| (index * 7 % 251) as u8)
+            .collect();
         for size in [4, 8, 16, 32] {
             let (x, y) = (4, 4);
             predict_intra(&mut plane, stride, x, y, size, IntraMode::V, true, true);
@@ -485,7 +494,11 @@ mod tests {
                 );
             }
             predict_intra(&mut plane, stride, x, y, size, IntraMode::Dc, false, false);
-            assert!(plane[y * stride + x..][..size].iter().all(|&value| value == 128));
+            assert!(
+                plane[y * stride + x..][..size]
+                    .iter()
+                    .all(|&value| value == 128)
+            );
             let mut copy = plane.clone();
             predict_intra(&mut copy, stride, x, y, size, IntraMode::Dc, true, false);
             let sum: u32 = plane[(y - 1) * stride + x..][..size]
