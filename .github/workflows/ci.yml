@@ -146,6 +146,34 @@ jobs:
         run: python3 .github/scripts/check_simd_target_features.py build
       - name: Test library units
         run: cargo test --features native --lib
+      # The VP9 decoder is held bit-exact to libvpx on every profile 0 test
+      # vector libvpx's own test suite decodes (#527): hidden frames,
+      # superframes, show_existing_frame, intra-only frames, scaled reference
+      # frames, tiles, frame sizes from 2x2 to 1920x1080 and so on. The vectors
+      # and their per-frame MD5s come from the WebM project's test-data bucket,
+      # about 27 MB in all, so they are cached between runs, keyed on the list
+      # of names the test reads. One host is enough: the decoder is portable
+      # scalar code with nothing platform-specific to cover.
+      - name: Cache the libvpx VP9 test vectors
+        uses: actions/cache@v4
+        with:
+          path: vp9-test-vectors
+          key: libvpx-vp9-test-vectors-${{ hashFiles('tests/fixtures/codec/libvpx_vp9_test_vectors.txt') }}
+      - name: Download the libvpx VP9 test vectors
+        run: |
+          mkdir -p vp9-test-vectors
+          while read -r name; do
+            for file in "$name" "$name.md5"; do
+              if [ ! -f "vp9-test-vectors/$file" ]; then
+                curl -sSfL --retry 3 -o "vp9-test-vectors/$file" \
+                  "https://storage.googleapis.com/downloads.webmproject.org/test_data/libvpx/$file"
+              fi
+            done
+          done < tests/fixtures/codec/libvpx_vp9_test_vectors.txt
+      - name: Test VP9 decoding against the libvpx test vectors
+        env:
+          ZVIDLIB_VP9_VECTORS: ${{ github.workspace }}/vp9-test-vectors
+        run: cargo test --features native --lib vp9_dec::tests::libvpx_test_vectors -- --ignored --nocapture
       # Pins no-cover output byte for byte and round-trips JPEG and PNG cover
       # art through `Mp4Muxer` and `Mp4Demuxer` (#502), and checks the cover
       # `MediaOutput` generates from a frame (#510); the ffprobe and ffmpeg

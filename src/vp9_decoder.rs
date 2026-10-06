@@ -1,0 +1,371 @@
+//! Native, dependency-free VP9 software decoding, registered as a
+//! [`VideoDecoderFactory`].
+//!
+//! This wraps the crate's VP9 profile 0 decoder (`crate::vp9_dec`), which
+//! decodes 8-bit 4:2:0 streams bit for bit as libvpx does: hidden frames,
+//! superframes, `show_existing_frame`, intra-only frames, reference frames
+//! of another size, tiles, segmentation, lossless coding and every
+//! interpolation filter.
+//!
+//! A sample is one VP9 chunk as the VP9 ISO-BMFF binding defines it: a frame,
+//! or a superframe whose hidden frames precede the one it shows. Each sample
+//! must show a frame. Decoded pictures are converted to `Rgba8` with
+//! [`convert_to_rgba8`], using the matrix the frame's `color_space` names
+//! (BT.601 when it is unknown or one the conversion does not implement), at
+//! the size the frame was coded at: a stream that changes resolution emits
+//! frames of each size.
+
+use crate::vp9_dec::{DecodedPicture, Decoder};
+use crate::{
+    CancellationToken, Codec, CodecImplementation, CodecProfile, CodecSupport, ColorRange,
+    DecodedVideoFrame, EncodedVideoSample, Error, ErrorKind, FilterFrame, FilterPlane,
+    HardwarePreference, Limits, MatrixCoefficients, PixelFormat, Result, VideoDecoder,
+    VideoDecoderConfig, VideoDecoderFactory, VideoDimensions, VideoFrame, Vp9CodecConfig,
+    convert_to_rgba8,
+};
+
+/// Returns the dependency-free native VP9 profile 0 (8-bit 4:2:0) software
+/// decoder backend.
+pub fn native_vp9_video_decoder_factory() -> impl VideoDecoderFactory {
+    Vp9DecoderFactory
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Vp9DecoderFactory;
+
+impl VideoDecoderFactory for Vp9DecoderFactory {
+    fn capability(&self, configuration: &VideoDecoderConfig) -> CodecSupport {
+        match self.capability_without_parsing(configuration) {
+            CodecSupport::Supported { .. } => {}
+            other => return other,
+        }
+        if let Err(error) = parse_configuration(configuration, &Limits::default()) {
+            return invalid_configuration(error.message());
+        }
+        CodecSupport::Supported {
+            implementation: CodecImplementation::Software,
+        }
+    }
+
+    fn create(
+        &self,
+        configuration: &VideoDecoderConfig,
+        limits: &Limits,
+    ) -> Result<Box<dyn VideoDecoder>> {
+        match self.capability_without_parsing(configuration) {
+            CodecSupport::Supported { .. } => {}
+            CodecSupport::UnsupportedCodec => {
+                return Err(Error::new(
+                    ErrorKind::Unsupported,
+                    "native VP9 decoder requires VP9",
+                ));
+            }
+            CodecSupport::UnsupportedProfile => {
+                return Err(Error::new(
+                    ErrorKind::Unsupported,
+                    "native VP9 decoder supports profile 0",
+                ));
+            }
+            CodecSupport::HardwareUnavailable => {
+                return Err(Error::new(
+                    ErrorKind::Unsupported,
+                    "native VP9 decoder is software-only",
+                ));
+            }
+            CodecSupport::InvalidConfiguration { reason } => {
+                return Err(Error::new(ErrorKind::InvalidInput, reason));
+            }
+        }
+        parse_configuration(configuration, limits)?;
+        Ok(Box::new(Vp9Decoder {
+            limits: *limits,
+            inner: Decoder::new(*limits),
+        }))
+    }
+}
+
+impl Vp9DecoderFactory {
+    fn capability_without_parsing(&self, configuration: &VideoDecoderConfig) -> CodecSupport {
+        if configuration.codec != Codec::Vp9 {
+            return CodecSupport::UnsupportedCodec;
+        }
+        if configuration.profile != CodecProfile::Vp9Profile0 {
+            return CodecSupport::UnsupportedProfile;
+        }
+        if configuration.hardware == HardwarePreference::Require {
+            return CodecSupport::HardwareUnavailable;
+        }
+        if configuration.output_format != PixelFormat::Rgba8 {
+            return invalid_configuration("native VP9 decoding currently outputs RGBA8");
+        }
+        CodecSupport::Supported {
+            implementation: CodecImplementation::Software,
+        }
+    }
+}
+
+fn invalid_configuration(reason: impl Into<String>) -> CodecSupport {
+    CodecSupport::InvalidConfiguration {
+        reason: reason.into(),
+    }
+}
+
+/// Validates the track's `vpcC` box (or WebM `CodecPrivate`). Either may be
+/// empty or absent from a stream, since the VP9 bitstream describes itself;
+/// when present it must describe a profile 0 8-bit 4:2:0 stream.
+fn parse_configuration(configuration: &VideoDecoderConfig, limits: &Limits) -> Result<()> {
+    if configuration.configuration.len() as u64 > limits.max_allocation_bytes {
+        return Err(limit("VP9 configuration exceeds the allocation limit"));
+    }
+    let record = Vp9CodecConfig::parse(&configuration.configuration)
+        .map_err(|error| malformed(format!("invalid VP9 configuration: {error}")))?;
+    if record.profile != 0 || record.bit_depth != 8 || !record.is_420() {
+        return Err(Error::new(
+            ErrorKind::Unsupported,
+            "native VP9 decoder requires a profile 0, 8-bit 4:2:0 configuration",
+        ));
+    }
+    Ok(())
+}
+
+struct Vp9Decoder {
+    limits: Limits,
+    inner: Decoder,
+}
+
+impl VideoDecoder for Vp9Decoder {
+    fn submit(
+        &mut self,
+        sample: &EncodedVideoSample,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<DecodedVideoFrame>> {
+        cancellation.check()?;
+        if sample.data.len() as u64 > self.limits.max_allocation_bytes {
+            return Err(limit("VP9 sample exceeds the allocation limit"));
+        }
+        let shown_before = self.inner.frames_shown();
+        let picture = self.inner.decode_chunk(&sample.data)?;
+        if self.inner.frames_shown() == shown_before {
+            return Err(malformed("VP9 sample does not show a frame"));
+        }
+        let Some(picture) = picture else {
+            // The caller asked not to see this frame.
+            return Ok(Vec::new());
+        };
+        Ok(vec![DecodedVideoFrame {
+            presentation_index: sample.presentation_index,
+            frame: picture_to_rgba(&picture, &self.limits)?,
+        }])
+    }
+
+    fn drain(&mut self, cancellation: &CancellationToken) -> Result<Vec<DecodedVideoFrame>> {
+        cancellation.check()?;
+        // Every sample shows its frame as it is decoded; nothing is held
+        // back for reordering.
+        Ok(Vec::new())
+    }
+
+    fn reset(&mut self) -> Result<()> {
+        self.inner.reset();
+        Ok(())
+    }
+
+    fn set_output_wanted(&mut self, wanted: bool) {
+        // The frame is still decoded and kept as a reference; only the
+        // copy out of the reference buffer and the YUV-to-RGBA pass are
+        // skipped.
+        self.inner.set_output_wanted(wanted);
+    }
+}
+
+/// The conversion matrix for a VP9 `color_space`: `CS_BT_709` (2) and
+/// `CS_BT_2020` (5) have their own, and everything else, including
+/// `CS_UNKNOWN`, `CS_BT_601` and `CS_SMPTE_170`, uses BT.601.
+fn matrix_for(color_space: u8) -> MatrixCoefficients {
+    match color_space {
+        2 => MatrixCoefficients::Bt709,
+        5 => MatrixCoefficients::Bt2020Ncl,
+        _ => MatrixCoefficients::Bt601,
+    }
+}
+
+pub(crate) fn picture_to_rgba(picture: &DecodedPicture, limits: &Limits) -> Result<VideoFrame> {
+    let width = picture.width;
+    let height = picture.height;
+    let dimensions = VideoDimensions::new(width as u32, height as u32, limits)?;
+    let plane = |index: usize, plane_width: usize, plane_height: usize| {
+        FilterPlane::from_samples(
+            plane_width,
+            plane_height,
+            picture.planes[index].clone(),
+            limits,
+        )
+        .map_err(|error| malformed(format!("invalid VP9 decoded plane: {error}")))
+    };
+    let chroma_width = width.div_ceil(2);
+    let chroma_height = height.div_ceil(2);
+    let frame = FilterFrame::new_yuv(
+        plane(0, width, height)?,
+        plane(1, chroma_width, chroma_height)?,
+        plane(2, chroma_width, chroma_height)?,
+        true,
+        true,
+    )
+    .map_err(|error| malformed(format!("invalid VP9 decoded plane layout: {error}")))?;
+    let color_range = if picture.full_range {
+        ColorRange::Full
+    } else {
+        ColorRange::Limited
+    };
+    let rgba = convert_to_rgba8(&frame, color_range, matrix_for(picture.color_space), limits)?;
+    let stride = width
+        .checked_mul(4)
+        .ok_or_else(|| limit("VP9 RGBA stride overflows"))?;
+    VideoFrame::new(
+        dimensions,
+        PixelFormat::Rgba8,
+        color_range,
+        vec![crate::Plane { data: rgba, stride }],
+        limits,
+    )
+}
+
+fn malformed(message: impl Into<String>) -> Error {
+    Error::new(ErrorKind::MalformedMedia, message)
+}
+
+fn limit(message: impl Into<String>) -> Error {
+    Error::new(ErrorKind::ResourceLimit, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn vpcc(record: &[u8]) -> Vec<u8> {
+        let mut bytes = (12u32 + record.len() as u32).to_be_bytes().to_vec();
+        bytes.extend_from_slice(b"vpcC");
+        bytes.extend_from_slice(&[1, 0, 0, 0]);
+        bytes.extend_from_slice(record);
+        bytes
+    }
+
+    fn config() -> VideoDecoderConfig {
+        VideoDecoderConfig {
+            codec: Codec::Vp9,
+            profile: CodecProfile::Vp9Profile0,
+            coded_dimensions: VideoDimensions::new(16, 16, &Limits::default()).unwrap(),
+            output_format: PixelFormat::Rgba8,
+            color_range: ColorRange::Limited,
+            hardware: HardwarePreference::Avoid,
+            configuration: vpcc(&[0, 10, 0x80, 2, 2, 2, 0, 0]),
+        }
+    }
+
+    #[test]
+    fn capability_distinguishes_codec_profile_configuration_and_hardware() {
+        let factory = native_vp9_video_decoder_factory();
+        assert!(factory.capability(&config()).is_supported());
+
+        let mut candidate = config();
+        candidate.configuration = Vec::new();
+        assert!(factory.capability(&candidate).is_supported());
+
+        candidate = config();
+        candidate.codec = Codec::Av1;
+        assert_eq!(
+            factory.capability(&candidate),
+            CodecSupport::UnsupportedCodec
+        );
+
+        candidate = config();
+        candidate.profile = CodecProfile::Vp9Profile2;
+        assert_eq!(
+            factory.capability(&candidate),
+            CodecSupport::UnsupportedProfile
+        );
+
+        candidate = config();
+        candidate.hardware = HardwarePreference::Require;
+        assert_eq!(
+            factory.capability(&candidate),
+            CodecSupport::HardwareUnavailable
+        );
+        candidate.hardware = HardwarePreference::Prefer;
+        assert_eq!(
+            factory.capability(&candidate),
+            CodecSupport::Supported {
+                implementation: CodecImplementation::Software
+            }
+        );
+
+        candidate = config();
+        candidate.output_format = PixelFormat::Yuv420p8;
+        assert!(matches!(
+            factory.capability(&candidate),
+            CodecSupport::InvalidConfiguration { .. }
+        ));
+
+        // A 10-bit, a 4:4:4 and a truncated configuration.
+        for configuration in [
+            vpcc(&[0, 10, 0xa0, 2, 2, 2, 0, 0]),
+            vpcc(&[1, 10, 0x86, 2, 2, 2, 0, 0]),
+            vec![1, 2, 3],
+        ] {
+            candidate = config();
+            candidate.configuration = configuration;
+            assert!(matches!(
+                factory.capability(&candidate),
+                CodecSupport::InvalidConfiguration { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn create_rejects_malformed_configuration_and_samples() {
+        let mut candidate = config();
+        candidate.configuration = vec![1, 2, 3];
+        let error = native_vp9_video_decoder_factory()
+            .create(&candidate, &Limits::default())
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), ErrorKind::MalformedMedia);
+
+        let mut decoder = native_vp9_video_decoder_factory()
+            .create(&config(), &Limits::default())
+            .unwrap();
+        for data in [vec![], vec![0xff, 0xff], vec![0x82, 0x49, 0x83]] {
+            let sample = EncodedVideoSample {
+                presentation_index: crate::FrameIndex(0),
+                random_access: true,
+                data,
+            };
+            let error = decoder
+                .submit(&sample, &CancellationToken::new())
+                .unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::MalformedMedia);
+        }
+    }
+
+    #[test]
+    fn create_enforces_allocation_limit() {
+        let restrictive = Limits {
+            max_allocation_bytes: 0,
+            ..Limits::default()
+        };
+        let error = native_vp9_video_decoder_factory()
+            .create(&config(), &restrictive)
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), ErrorKind::ResourceLimit);
+    }
+
+    #[test]
+    fn color_spaces_pick_their_matrix() {
+        assert_eq!(matrix_for(0), MatrixCoefficients::Bt601);
+        assert_eq!(matrix_for(1), MatrixCoefficients::Bt601);
+        assert_eq!(matrix_for(2), MatrixCoefficients::Bt709);
+        assert_eq!(matrix_for(3), MatrixCoefficients::Bt601);
+        assert_eq!(matrix_for(5), MatrixCoefficients::Bt2020Ncl);
+    }
+}

@@ -100,8 +100,10 @@ pub struct WebmDemuxer {
     /// [`Mp4Track::timescale`] is derived from the segment's
     /// `TimestampScale`. A V_AV1 track's `decoder_config` is its
     /// `CodecPrivate` wrapped in an `av1C` box, and an A_OPUS track's is its
-    /// `OpusHead` rewritten as a `dOps` box, as an MP4 track's are; an
-    /// A_VORBIS track's is its Xiph-laced `CodecPrivate`.
+    /// `OpusHead` rewritten as a `dOps` box, as an MP4 track's are. A V_VP9
+    /// track's is the `vpcC` box its `CodecPrivate` describes (see
+    /// [`crate::Vp9CodecConfig`]), a V_VP8 track has none, and an A_VORBIS
+    /// track's is its Xiph-laced `CodecPrivate`.
     pub tracks: Vec<Mp4Track>,
     /// Cue points, in file order, for the indexed tracks. Empty when the file
     /// has no `Cues`, as a live `MediaRecorder` capture usually does.
@@ -639,8 +641,16 @@ impl ParsedBlock {
             // decoded for its references but never presented (RFC 6386
             // section 9.1), and Matroska's invisible flag says the same of
             // the whole block.
-            let shown = track.codec != Codec::Vp8
-                || (!self.invisible && first_byte.is_none_or(|tag| tag & 0x10 != 0));
+            //
+            // A VP9 block is a chunk that shows one frame, carrying hidden
+            // frames ahead of it in a superframe; whether a chunk shows a
+            // frame is only known from its last frame, so a block that does
+            // not is identified by the invisible flag alone.
+            let shown = match track.codec {
+                Codec::Vp8 => !self.invisible && first_byte.is_none_or(|tag| tag & 0x10 != 0),
+                Codec::Vp9 => !self.invisible,
+                _ => true,
+            };
             track.frames.push(Frame {
                 offset,
                 size,
@@ -967,13 +977,12 @@ fn parse_track_entry(payload: &[u8], options: &WebmDemuxerOptions) -> Result<Tra
 }
 
 /// The codec indexed for a Matroska video `CodecID`, or `None` when zvidlib
-/// has no decoder for it. `V_VP9` belongs here once [`Codec`] has it,
-/// together with an arm in [`decoder_config`] for its `CodecPrivate` (a
-/// sibling sub-issue of #523).
+/// has no decoder for it.
 fn video_codec(codec_id: &str) -> Option<Codec> {
     match codec_id {
         "V_AV1" => Some(Codec::Av1),
         "V_VP8" => Some(Codec::Vp8),
+        "V_VP9" => Some(Codec::Vp9),
         _ => None,
     }
 }
@@ -1009,6 +1018,15 @@ fn decoder_config(codec: Codec, codec_private: Option<&[u8]>) -> Result<Vec<u8>>
         // VP8 defines no configuration record, so any `CodecPrivate` is
         // ignored and decoders configure from each key frame's header.
         Codec::Vp8 => Ok(Vec::new()),
+        // VP9's `CodecPrivate` is an optional list of features (profile,
+        // level, bit depth, chroma subsampling); it becomes the `vpcC` box an
+        // MP4 track would carry, with the profile 0 defaults for any it
+        // leaves out.
+        Codec::Vp9 => {
+            let config =
+                crate::Vp9CodecConfig::parse_webm_codec_private(codec_private.unwrap_or_default())?;
+            Ok(config.to_vpcc())
+        }
         _ => Err(unsupported(
             "codec has no WebM decoder configuration mapping",
         )),
@@ -1826,7 +1844,7 @@ mod tests {
                     "webm",
                     &[
                         info(None, None),
-                        tracks(&[video_entry(1, "V_VP9", None)]),
+                        tracks(&[video_entry(1, "V_THEORA", None)]),
                         blocks(),
                     ],
                     true,

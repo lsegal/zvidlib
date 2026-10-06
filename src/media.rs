@@ -54,6 +54,10 @@ pub enum Codec {
     /// configuration record. [`crate::native_vp8_video_decoder_factory`]
     /// decodes it; no encoder factory accepts it.
     Vp8,
+    /// VP9 video, carried in MP4 as a `vp09` sample entry whose decoder
+    /// configuration is the complete `vpcC` box (see
+    /// [`crate::Vp9CodecConfig`]).
+    Vp9,
     Aac,
     /// Opus audio (RFC 6716). MP4 carries it in an `Opus` sample entry whose
     /// decoder configuration is a `dOps` box; Matroska and WebM carry the

@@ -120,6 +120,7 @@ impl WebVideoEncodeSession {
             Codec::UncompressedVideo
             | Codec::H264
             | Codec::Vp8
+            | Codec::Vp9
             | Codec::Aac
             | Codec::Opus
             | Codec::Vorbis => {
@@ -316,6 +317,7 @@ impl WebVideoEncodeSession {
                 Codec::UncompressedVideo
                 | Codec::H264
                 | Codec::Vp8
+                | Codec::Vp9
                 | Codec::Aac
                 | Codec::Opus
                 | Codec::Vorbis => None,
