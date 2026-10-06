@@ -8,10 +8,9 @@
 //! transforms, encoder-side distortion metrics, and encoder-side color
 //! conversion, and the AV1, VP8 and VP9 decoders' shared output color
 //! conversion ([`crate::av1_filters::convert_to_rgba8`]). Each of those sites
-//! caches
-//! its own CPU feature probe, which is what you want in production but makes
-//! "run this workload with SIMD off" impossible to express from outside the
-//! crate.
+//! caches its own CPU feature probe, which is what you want in production but
+//! makes "run this workload with SIMD off" impossible to express from outside
+//! the crate.
 //!
 //! This module is that single switch. [`set_override`] pins **every** kernel in
 //! the crate to one [`SimdIsa`] (or restores per-site automatic detection with
@@ -51,8 +50,9 @@ static OVERRIDE: AtomicU8 = AtomicU8::new(0);
 /// The override reaches every dispatch family: the AV1 transform and in-loop
 /// filter kernels, AV1 motion compensation (through the default level
 /// [`crate::av1_mc::McContext::new`] picks up), AV1 intra prediction, every
-/// HEVC engine kernel, and the AV1, VP8 and VP9 output color conversion. [`SimdIsa::Scalar`] therefore genuinely reaches the
-/// scalar code path rather than merely the widest scalar-ish one.
+/// HEVC engine kernel, and the AV1, VP8 and VP9 output color conversion.
+/// [`SimdIsa::Scalar`] therefore genuinely reaches the scalar code path rather
+/// than merely the widest scalar-ish one.
 ///
 /// An instruction set this host cannot execute is clamped to
 /// [`SimdIsa::Scalar`] rather than silently ignored, so a caller that asks for

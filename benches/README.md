@@ -183,6 +183,39 @@ cargo bench --bench av1_decode -- 'av1_deblock/scalar'
 cargo bench --bench av1_decode -- av1_inverse   # every inverse-transform group
 ```
 
+## The VP8 and VP9 decoder suite (`--bench vpx_decode`)
+
+`benches/vpx_decode.rs` measures the pure-Rust VP8 and VP9 software decoders
+end to end, and the YUV-to-RGBA conversion every AV1, VP8 and VP9 software
+picture leaves through (`convert_to_rgba8`, the `yuv_to_rgba` dispatch site,
+issue #574). Every group is a per-ISA group.
+
+| Group | Stage |
+| --- | --- |
+| `yuv_to_rgba_1080p`, `yuv_to_rgba_4k` | `convert_to_rgba8` over one limited-range BT.709 4:2:0 picture, `src/yuv_to_rgba.rs` |
+| `vp8_decode_frame` | whole-frame decode through `native_vp8_video_decoder_factory` |
+| `vp9_decode_frame` | whole-frame decode through `native_vp9_video_decoder_factory` |
+
+The decode groups decode six 640x360 frames the crate's own VP8 and VP9
+encoders produce once per process. Neither decoder has another vector kernel,
+so the conversion is the only thing their arms differ in, and their ratio is
+the share of a decode the conversion kernel recovers. `av1_decode_frame` in
+[the AV1 decoder suite](#the-av1-decoder-suite---bench-av1_decode) converts
+through the same site.
+
+The conversion's `scalar` arm is the fixed-point scalar code, not the `f64`
+loop it replaced. The vector arms are bit-exact with it, and it is bit-exact
+with that `f64` definition for every input: pixels whose fixed-point value
+lands next to a rounding boundary, about 0.1-0.9% of random content, are
+recomputed in `f64`. Indicative timings from the #574 pull request, on a
+20-thread x86_64 host that other builds were loading at the time (so read the
+ratios, not the absolute times):
+
+| Group | `f64` before #574 | `scalar` | `sse4.1` | `avx2` |
+| --- | ---: | ---: | ---: | ---: |
+| `yuv_to_rgba_1080p` | ~90 ms | 35.3 ms | 11.8 ms (3.0x) | 7.8 ms (4.5x) |
+| `yuv_to_rgba_4k` | ~324 ms | 113.2 ms | 39.0 ms (2.9x) | 21.3 ms (5.3x) |
+
 ## The AV1 encoder suite (`--bench av1_encode`)
 
 `benches/av1_encode.rs` measures the native AV1 encoder on two axes: whole-frame
