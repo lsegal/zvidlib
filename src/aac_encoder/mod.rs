@@ -1,9 +1,10 @@
 //! Native AAC-LC encoding, delegating to a platform codec.
 //!
 //! zvidlib deliberately ships no AAC bitstream implementation of its own (see
-//! the reasoning on [`crate::AudioEncoder`]); this module fills the seam with
-//! platform adapters instead: macOS AudioToolbox and, on Windows, Microsoft's
-//! Media Foundation AAC encoder MFT. Other platforms report
+//! [`crate::AudioEncoder`] for why, and for the Opus and Vorbis encoders it
+//! does carry); this module fills the seam with platform adapters instead:
+//! macOS AudioToolbox and, on Windows, Microsoft's Media Foundation AAC
+//! encoder MFT. Other platforms report
 //! [`CodecSupport::HardwareUnavailable`] rather than falling back to a
 //! software encoder this crate does not carry.
 //!

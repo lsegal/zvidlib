@@ -2,9 +2,9 @@
 
 ## 1. Purpose and constraints
 
-zvidlib is a Rust media library that provides frame-accurate, indexed video access and synchronized audio access for native and WebAssembly applications. The first complete vertical slice will read and write MP4-family containers carrying HEVC/H.265 or AV1 video and AAC audio, and transfer images through CPU memory, OpenGL, or WebGL.
+zvidlib is a Rust media library that provides frame-accurate, indexed video access and synchronized audio access for native and WebAssembly applications. The first complete vertical slice will read and write MP4-family containers carrying HEVC/H.265 or AV1 video and AAC or Opus audio, and transfer images through CPU memory, OpenGL, or WebGL.
 
-This document is primarily a design contract. The repository implements the portable foundation—errors, limits, capability values, rational timeline arithmetic, synchronized audio intervals, validated CPU media buffers, byte I/O, bounded ordinary/fragmented MP4 sample indexing, normalized codec factories, bounded exact-frame video decoding with portable conformance, accelerated Windows/Linux/macOS HEVC Main decode with a dependency-free software fallback, accelerated HEVC Main encode through Media Foundation on Windows and VideoToolbox on macOS, dependency-free native AV1 Main decode and HEVC/AV1 encode backends (`native_hevc_video_decoder_factory`, `native_hevc_video_encoder_factory`, `native_av1_video_decoder_factory`, `native_av1_video_encoder_factory`), exact AAC packet/sample reads, audio-clock playback control and native/Web Audio adapter contracts, encoder contracts, CPU/GL/WebGL transfer contracts, strict synchronized indexed output, and deterministic seekable MP4 muxing—while a concrete AAC encoder and audio-device bindings remain planned.
+This document is primarily a design contract. The repository implements the portable foundation—errors, limits, capability values, rational timeline arithmetic, synchronized audio intervals, validated CPU media buffers, byte I/O, bounded ordinary/fragmented MP4 sample indexing, normalized codec factories, bounded exact-frame video decoding with portable conformance, accelerated Windows/Linux/macOS HEVC Main decode with a dependency-free software fallback, accelerated HEVC Main encode through Media Foundation on Windows and VideoToolbox on macOS, dependency-free native AV1 Main decode and HEVC/AV1 encode backends (`native_hevc_video_decoder_factory`, `native_hevc_video_encoder_factory`, `native_av1_video_decoder_factory`, `native_av1_video_encoder_factory`), exact AAC, Opus and Vorbis packet/sample reads with pure-Rust Opus and Vorbis decoders and encoders, audio-clock playback control and native/Web Audio adapter contracts, encoder contracts, CPU/GL/WebGL transfer contracts, strict synchronized indexed output, and deterministic seekable MP4 muxing—while a concrete AAC encoder and audio-device bindings remain planned.
 
 The design is governed by these constraints:
 
@@ -61,7 +61,7 @@ Core concepts are:
 - sample range: a half-open `[start, end)` range in an audio track's sample clock;
 - edit mapping: movie timeline to track timeline, including empty edits and offsets.
 
-Variable-frame-rate media is indexed from the ordered sample table. For video frame `n`, synchronized audio is the sample interval intersecting that frame's presentation interval. Rounding uses a documented boundary rule so adjacent requests neither duplicate nor lose samples. Encoder delay, AAC priming, end padding, and MP4 edit lists are retained and applied.
+Variable-frame-rate media is indexed from the ordered sample table. For video frame `n`, synchronized audio is the sample interval intersecting that frame's presentation interval. Rounding uses a documented boundary rule so adjacent requests neither duplicate nor lose samples. Encoder delay, AAC priming, Opus pre-skip, end padding, and MP4 edit lists are retained and applied.
 
 ## 3. Frame-accurate reading
 
@@ -143,7 +143,11 @@ Codec interfaces operate on owned or lifetime-safe encoded packets and media val
 
 Container codec configuration is normalized before reaching a backend and serialized by the muxer without depending on backend-private types. This permits multiple implementations: browser WebCodecs, operating-system APIs, pure Rust/WASM codecs, or optional external adapters.
 
-The initial codec priorities are HEVC/H.265 and AV1 video plus AAC audio. They are goals, not a promise that every browser exposes all three encoders/decoders. Capability discovery must distinguish unsupported codec, unsupported profile, invalid configuration, and unavailable hardware.
+The initial codec priorities are HEVC/H.265 and AV1 video plus AAC audio, with Opus and Vorbis audio alongside AAC. They are goals, not a promise that every browser exposes every encoder/decoder.
+
+Audio codecs map onto containers as follows. AAC is carried in MP4 `mp4a`/`esds`. Opus is carried in MP4 as an `Opus` sample entry with a `dOps` box, always on a 48 kHz sample clock because Opus always decodes at 48 kHz; its pre-skip is informative there and the edit list does the trimming, and each packet's decoded length is read from its own table of contents, since muxers shorten the last sample's table duration to trim the end. Matroska and WebM carry Opus's RFC 7845 `OpusHead` and Vorbis's three Xiph-laced setup headers as `CodecPrivate`. Vorbis has no widely supported MP4 mapping, so the MP4 muxer refuses it. A Vorbis packet's decoded length depends on its own block size and the previous packet's, which the setup header's modes determine, so the configuration parser reads them; a stream's first packet decodes no samples.
+
+Every audio codec reads through one exact sample reader, which maps presentation ranges through priming, padding and edits onto packets and decodes a codec-specific preroll ahead of a seek: one packet for Vorbis, whose packets depend only on the overlap with the previous one, and 320 ms for Opus, by when its prediction state matches a continuous decode. Preroll output is never cached for a later request. The browser build drives the same reader with `WebCodecs` `AudioDecoder` where the browser supports the track, from a freshly configured decoder for each read, and checks the browser's output fills the packets' intervals exactly, falling back to the pure-Rust decoder where it does not. Audio encoders are either the platform's (AAC) or faithful ports of the reference encoders (`opus-pure` for libopus, and zvidlib's own port of libvorbis, bit-identical to it), never a codec design of zvidlib's own. Capability discovery must distinguish unsupported codec, unsupported profile, invalid configuration, and unavailable hardware.
 
 No codec implementation is automatically trusted with arbitrary allocation sizes. Backends receive limits and must validate decoded dimensions and formats before publishing a frame.
 
@@ -164,7 +168,7 @@ Zero-copy is an optimization, not part of correctness. The capability model repo
 
 ## 8. Audio and playback adapters
 
-Core audio APIs exchange timestamped sample buffers; they do not own an audio device. Native output and Web Audio integration are adapters above the core stream API.
+Core audio APIs exchange timestamped sample buffers; they do not own an audio device. Native output and Web Audio integration are adapters above the core stream API, and the playback controller reads AAC, Opus and Vorbis tracks through the same exact sample reader.
 
 A playback controller selects a monotonic master clock (normally the audio device clock), maps it to media time, requests the corresponding exact video frame, and schedules audio ahead within a bounded window. It may drop a late presentation frame but never silently substitute a different frame for `get(n)`. Seeking cancels queued work, resets decoder and audio scheduling state, applies the new edit mapping, and prerolls before resuming.
 

@@ -130,33 +130,33 @@ pub trait VideoEncoder {
 
 /// Backend-neutral audio encoder contract.
 ///
-/// # zvidlib carries no audio encoder of its own
+/// # Where the audio encoders come from
 ///
-/// This crate ships **no audio encoder of its own**, and that is a deliberate,
-/// recorded decision (issue #174), not an oversight or an unfinished corner.
-/// `AudioEncoder` exists as the seam that platform and browser backends fill.
-/// `native_aac_audio_encoder_factory` fills it with the operating system's AAC-LC
-/// encoder, AudioToolbox on macOS and Media Foundation on Windows, and reports
-/// `HardwareUnavailable` elsewhere; the browser build fills it through `WebCodecs`.
+/// zvidlib writes no audio codec of its own design. Each encoder behind this
+/// trait is either the platform's or a faithful port of the codec's reference
+/// encoder, so the quality a caller gets is the reference's rather than a
+/// reimplementation's:
 ///
-/// The reasoning:
+/// * AAC-LC: `native_aac_audio_encoder_factory` delegates to the operating
+///   system's encoder, AudioToolbox on macOS and Media Foundation on Windows,
+///   and reports `HardwareUnavailable` elsewhere; the browser build encodes
+///   through `WebCodecs`. A pure-Rust AAC-LC encoder is a large subsystem in
+///   its own right -- filter bank, psychoacoustic model, quantization and rate
+///   control -- with no open reference implementation to port, and the
+///   platforms already have good ones (issue #174).
+/// * Opus: `native_opus_audio_encoder_factory` runs `opus-pure`, a pure-Rust
+///   port of libopus, on every target; the browser build can also encode
+///   through `WebCodecs`.
+/// * Vorbis: `native_vorbis_audio_encoder_factory` runs zvidlib's own port of
+///   the libvorbis 1.3.7 encoder, whose packets are bit-identical to
+///   libvorbis's for the same input and quality.
 ///
-/// * A pure-Rust AAC-LC encoder is a large subsystem in its own right -- filter
-///   bank, psychoacoustic model, quantization and rate control, bitstream writer
-///   -- and its output quality, not its throughput, is what would have to be
-///   defended. A mediocre encoder shipped under this crate's name is worse for
-///   callers than no encoder at all, because it is harder to route around.
-/// * Every target zvidlib runs on already has a good AAC encoder. Browsers expose
-///   `WebCodecs` `AudioEncoder`; macOS has AudioToolbox and Windows has Media
-///   Foundation. Delegating to them is per-platform work, so a platform without
-///   one reports that it has no encoder rather than getting a weaker one.
-/// * The crate's subject is frame-accurate video and synchronized audio *I/O*.
-///   [`crate::MediaOutput`] can already mux an audio track given any
-///   `AudioEncoder`, so the write path is complete up to the codec, and the codec
-///   is the part callers are best positioned to choose.
-///
-/// If that calculus changes, adding an implementation is additive and breaks no
-/// caller: everything downstream of this trait is already written against it.
+/// The concern behind issue #174 was that a mediocre encoder shipped under
+/// this crate's name is worse for callers than none, because it is harder to
+/// route around. A port of the reference encoder answers that concern where an
+/// original design could not. [`crate::MediaOutput`] muxes an audio track
+/// given any `AudioEncoder`, so a caller with an encoder of its own still
+/// plugs it in here.
 pub trait AudioEncoder {
     fn config(&self) -> &EncoderConfig;
     fn format(&self) -> AudioEncoderFormat;
@@ -365,10 +365,11 @@ pub struct AudioEncoderConfig {
 /// Discovers and creates audio encoders using the normalized capability model,
 /// the audio counterpart to [`VideoEncoderFactory`].
 ///
-/// zvidlib still ships no audio codec of its own (see [`AudioEncoder`]); this
-/// trait is the seam a platform adapter implements, so a caller that wants
-/// discoverable capability reporting is not left writing the `Result<Box<dyn
-/// AudioEncoder>>` construction by hand.
+/// The native AAC, Opus and Vorbis factories implement it (see
+/// [`AudioEncoder`] for where each encoder comes from), and a caller's own
+/// adapter can too, so a caller that wants discoverable capability reporting
+/// is not left writing the `Result<Box<dyn AudioEncoder>>` construction by
+/// hand.
 pub trait AudioEncoderFactory {
     fn capability(&self, configuration: &AudioEncoderConfig) -> CodecSupport;
     fn create(
