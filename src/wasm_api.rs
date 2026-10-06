@@ -636,8 +636,8 @@ pub struct WasmCreateOptions {
 #[wasm_bindgen(js_class = CreateOptions)]
 impl WasmCreateOptions {
     /// `container` is `"mp4"` (the default) or `"webm"`, whose `finish()`
-    /// returns a `video/webm` Blob. WebM output carries AV1 video and Opus or
-    /// Vorbis audio.
+    /// returns a `video/webm` Blob. WebM output carries AV1 or VP8 video and
+    /// Opus or Vorbis audio.
     #[wasm_bindgen(constructor)]
     pub fn new(container: Option<String>) -> Result<WasmCreateOptions, JsValue> {
         let name = container.unwrap_or_else(|| "mp4".to_owned());
@@ -718,12 +718,15 @@ impl WasmCreateOptions {
     }
 
     /// The browser video codec for [`WasmVideoStream::put`]: `"av1"`
-    /// (default), `"hevc"` or `"vp9"`. WebM permits no HEVC, so a `"webm"`
-    /// output accepts `"av1"` or `"vp9"`.
+    /// (default), `"hevc"`, `"vp8"` or `"vp9"`, each encoded through
+    /// `WebCodecs` `VideoEncoder`. WebM permits no HEVC and MP4 has no widely
+    /// supported mapping for VP8, so an `"mp4"` output takes `"av1"`, `"hevc"`
+    /// or `"vp9"` and a `"webm"` output `"av1"`, `"vp8"` or `"vp9"`.
     #[wasm_bindgen(getter, js_name = videoCodec)]
     pub fn video_codec(&self) -> String {
         match self.video_codec {
             Codec::Hevc => "hevc".to_owned(),
+            Codec::Vp8 => "vp8".to_owned(),
             Codec::Vp9 => "vp9".to_owned(),
             _ => "av1".to_owned(),
         }
@@ -740,6 +743,13 @@ impl WasmCreateOptions {
                 ));
             }
             "hevc" => Codec::Hevc,
+            "vp8" if self.container != Container::WebM => {
+                return Err(js_error(
+                    ErrorKind::Unsupported,
+                    "MP4 has no widely supported VP8 mapping; write VP8 to a webm output",
+                ));
+            }
+            "vp8" => Codec::Vp8,
             "vp9" => Codec::Vp9,
             other => {
                 return Err(js_error(
@@ -1164,8 +1174,8 @@ pub fn seek_latency_budget_ms() -> f64 {
 }
 
 /// Reports whether this browser's `WebCodecs` bridge can encode AV1 Main,
-/// HEVC Main or VP9 profile 0 video: `codec` is `"av1"` (the default),
-/// `"hevc"` or `"vp9"`.
+/// HEVC Main, VP8 or VP9 profile 0 video: `codec` is `"av1"` (the default),
+/// `"hevc"`, `"vp8"` or `"vp9"`.
 ///
 /// `hardware` accepts `"require"`, `"prefer"` (the default), or `"avoid"`,
 /// mirroring [`crate::HardwarePreference`]. This is a synchronous,
@@ -1192,6 +1202,7 @@ pub fn video_encode_support(
     let (codec, profile) = match codec.as_deref() {
         None | Some("av1") => (Codec::Av1, CodecProfile::Av1Main),
         Some("hevc") => (Codec::Hevc, CodecProfile::HevcMain),
+        Some("vp8") => (Codec::Vp8, CodecProfile::Vp8),
         Some("vp9") => (Codec::Vp9, CodecProfile::Vp9Profile0),
         Some(other) => {
             return Err(js_error(
@@ -3736,6 +3747,13 @@ mod tests {
             &options.set_video_codec("hevc".to_owned()).unwrap_err(),
             "UNSUPPORTED",
         );
+        options.set_video_codec("vp8".to_owned()).unwrap();
+        assert_eq!(options.video_codec(), "vp8");
+        let mut mp4 = WasmCreateOptions::new(None).unwrap();
+        assert_error_code(
+            &mp4.set_video_codec("vp8".to_owned()).unwrap_err(),
+            "UNSUPPORTED",
+        );
         assert_error_code(
             &WasmCreateOptions::new(Some("mkv".to_owned()))
                 .err()
@@ -3944,6 +3962,82 @@ mod tests {
         assert_eq!(demuxer.tracks[0].codec, Codec::Av1);
         assert_eq!(demuxer.tracks[0].samples.len(), 3);
         assert!(!demuxer.cues.is_empty());
+    }
+
+    /// Issue #530: `videoCodec = "vp8"` encodes through `WebCodecs` into a
+    /// WebM that zvidlib's own VP8 decoder reads and the browser plays and
+    /// seeks.
+    #[wasm_bindgen_test(async)]
+    async fn put_encodes_vp8_through_webcodecs_into_a_seekable_webm() {
+        assert!(!video_encode_support(Some("require".into()), Some("vp8".into())).unwrap());
+        if !video_encode_support(None, Some("vp8".into())).unwrap() {
+            return;
+        }
+        let mut options = WasmCreateOptions::new(Some("webm".to_owned())).unwrap();
+        options.set_video_codec("vp8".to_owned()).unwrap();
+        let mut output = browser_output(&options);
+        let video = output.video(0).unwrap();
+        // Two and a half seconds of a grey frame at 30 frames a second.
+        const FRAMES: u64 = 75;
+        let pixels = owned_u8_array(&[128_u8; 32 * 32 * 4]);
+        let frame = WasmVideoFrame::rgba(32, 32, pixels).unwrap();
+        for frame_index in 0..FRAMES {
+            JsFuture::from(video.put(BigInt::from(frame_index).into(), &frame, None))
+                .await
+                .expect("encoding a VP8 frame through WebCodecs must succeed");
+        }
+        let blob: Blob = JsFuture::from(output.finish())
+            .await
+            .unwrap()
+            .unchecked_into();
+        assert_eq!(blob.type_(), "video/webm");
+        let array_buffer = JsFuture::from(blob.array_buffer()).await.unwrap();
+        let bytes = Uint8Array::new(&array_buffer).to_vec();
+        let source = MemorySource::new(bytes.clone());
+        let demuxer = crate::WebmDemuxer::open(&source, crate::WebmDemuxerOptions::default())
+            .await
+            .expect("the browser-encoded output must be a parseable WebM");
+        let track = &demuxer.tracks[0];
+        assert_eq!(track.codec, Codec::Vp8);
+        assert_eq!(track.samples.len(), FRAMES as usize);
+        assert!(!demuxer.cues.is_empty());
+
+        let limits = Limits::default();
+        let samples = track
+            .to_encoded_video_samples(&source, &limits)
+            .await
+            .unwrap();
+        use crate::VideoDecoderFactory;
+        let factory = crate::native_vp8_video_decoder_factory();
+        let mut decoder = factory
+            .create(
+                &crate::VideoDecoderConfig {
+                    codec: Codec::Vp8,
+                    profile: CodecProfile::Vp8,
+                    coded_dimensions: track.dimensions.unwrap(),
+                    output_format: crate::PixelFormat::Rgba8,
+                    color_range: crate::ColorRange::Limited,
+                    hardware: HardwarePreference::Avoid,
+                    configuration: Vec::new(),
+                },
+                &limits,
+            )
+            .unwrap();
+        let cancellation = crate::CancellationToken::new();
+        for sample in &samples {
+            let frames = decoder.submit(sample, &cancellation).unwrap();
+            assert_eq!(frames.len(), 1);
+            let pixels = &frames[0].frame.planes[0].data;
+            assert!(pixels.iter().step_by(4).all(|&red| red.abs_diff(128) <= 6));
+        }
+
+        let blob = make_blob(&bytes, "video/webm").unwrap();
+        let probe = JsFuture::from(probe_test_video(&blob, 2.0))
+            .await
+            .expect("the browser must load and seek the VP8 WebM");
+        let probe = Array::from(&probe);
+        assert!((probe.get(2).as_f64().unwrap() - 2.0).abs() < 0.1);
+        assert_eq!(probe.get(3).as_f64().unwrap(), 32.0);
     }
 
     #[wasm_bindgen_test]

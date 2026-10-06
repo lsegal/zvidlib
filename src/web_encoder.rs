@@ -65,6 +65,7 @@ pub fn video_encode_capability(
         (codec, profile),
         (Codec::Av1, CodecProfile::Av1Main)
             | (Codec::Hevc, CodecProfile::HevcMain)
+            | (Codec::Vp8, CodecProfile::Vp8)
             | (Codec::Vp9, CodecProfile::Vp9Profile0)
     );
     if !supported {
@@ -108,9 +109,9 @@ pub struct WebVideoEncodeSession {
 }
 
 impl WebVideoEncodeSession {
-    /// Opens a session targeting `codec` (AV1 Main, HEVC Main or VP9 profile 0)
-    /// at `width`x`height` and `timescale / frame_duration` frames a second,
-    /// timestamps and durations given in microseconds.
+    /// Opens a session targeting `codec` (AV1 Main, HEVC Main, VP8 or VP9
+    /// profile 0) at `width`x`height` and `timescale / frame_duration` frames
+    /// a second, timestamps and durations given in microseconds.
     pub async fn open(
         codec: Codec,
         width: u32,
@@ -134,16 +135,12 @@ impl WebVideoEncodeSession {
             // starting point for `configure()`: like AV1, the real profile
             // and level are read back from what the encoder actually emits.
             Codec::Hevc => "hev1.1.6.L93.B0",
+            Codec::Vp8 => "vp8",
             Codec::Vp9 => vp9_codec_string.as_str(),
-            Codec::UncompressedVideo
-            | Codec::H264
-            | Codec::Vp8
-            | Codec::Aac
-            | Codec::Opus
-            | Codec::Vorbis => {
+            Codec::UncompressedVideo | Codec::H264 | Codec::Aac | Codec::Opus | Codec::Vorbis => {
                 return Err(Error::new(
                     ErrorKind::Unsupported,
-                    "the WebCodecs video encoder bridge only supports AV1, HEVC and VP9",
+                    "the WebCodecs video encoder bridge only supports AV1, HEVC, VP8 and VP9",
                 ));
             }
         };
@@ -329,14 +326,16 @@ impl WebVideoEncodeSession {
         // VP9's colour description for its `vpcC`. HEVC's
         // parameter sets are genuinely out-of-band, so its `hvcC` is instead
         // read from `EncodedVideoChunkMetadata.decoderConfig.description`.
+        // VP8 has no configuration record at all: its key frames carry
+        // everything a decoder needs.
         let decoder_config = if !self.emitted_config && is_sync {
             let config = match self.codec {
                 Codec::Av1 => av1c_from_bitstream(&data),
                 Codec::Hevc => hvcc_from_metadata(&metadata),
+                Codec::Vp8 => Some(Vec::new()),
                 Codec::Vp9 => crate::vp9_encoder::vpcc_from_key_frame(&data, self.vp9_level),
                 Codec::UncompressedVideo
                 | Codec::H264
-                | Codec::Vp8
                 | Codec::Aac
                 | Codec::Opus
                 | Codec::Vorbis => None,

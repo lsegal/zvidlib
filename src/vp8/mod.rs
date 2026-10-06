@@ -34,12 +34,17 @@
 //! exposes no VP8 decoder, so macOS decodes in software.
 
 mod bool_decoder;
+mod bool_encoder;
 mod decoder;
+mod encoder;
+mod frame_encoder;
 mod loop_filter;
 mod predict;
 mod tables;
 #[cfg(test)]
 mod tests;
+
+pub use encoder::native_vp8_video_encoder_factory;
 
 use decoder::{Decoder, Picture};
 
