@@ -223,9 +223,7 @@ mod platform {
     /// is invalid, and one it would take on a host without one is unavailable.
     pub(super) fn unavailable(c: &VideoEncoderConfig) -> CodecSupport {
         match settings(c) {
-            Err(reason) => CodecSupport::InvalidConfiguration {
-                reason: reason.into(),
-            },
+            Err(reason) => CodecSupport::InvalidConfiguration { reason },
             Ok(_) => CodecSupport::HardwareUnavailable,
         }
     }
@@ -254,8 +252,8 @@ mod platform {
     use super::super::videotoolbox_encoder::{self, Settings};
     use super::{OperatingPoint, parse_operating_point};
     use crate::{
-        CodecImplementation, CodecSupport, ColorRange, Error, ErrorKind, Limits, PixelFormat,
-        Result, VideoEncoder, VideoEncoderConfig,
+        Codec, CodecImplementation, CodecSupport, ColorRange, Error, ErrorKind, Limits,
+        PixelFormat, Result, VideoEncoder, VideoEncoderConfig,
     };
 
     /// The VideoToolbox request `c` resolves to, or why it cannot be one.
@@ -301,13 +299,14 @@ mod platform {
         }
         Ok(Settings {
             bits_per_second,
+            quality: None,
             keyframe_interval,
         })
     }
 
     pub(super) fn capability(c: &VideoEncoderConfig) -> Option<CodecImplementation> {
         settings(c).ok()?;
-        videotoolbox_encoder::is_available(c.coded_dimensions)
+        videotoolbox_encoder::is_available(Codec::Hevc, c.coded_dimensions)
             .then_some(CodecImplementation::Hardware)
     }
 
@@ -325,7 +324,7 @@ mod platform {
 
     pub(super) fn create(c: &VideoEncoderConfig, limits: &Limits) -> Result<Box<dyn VideoEncoder>> {
         let settings = settings(c).map_err(|reason| Error::new(ErrorKind::InvalidInput, reason))?;
-        if !videotoolbox_encoder::is_available(c.coded_dimensions) {
+        if !videotoolbox_encoder::is_available(Codec::Hevc, c.coded_dimensions) {
             return Err(Error::new(
                 ErrorKind::Unsupported,
                 "hardware HEVC encoding is unavailable (VideoToolbox has no hardware HEVC \

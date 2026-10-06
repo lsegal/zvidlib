@@ -1,4 +1,4 @@
-//! macOS VideoToolbox hardware HEVC Main encoder.
+//! macOS VideoToolbox hardware HEVC Main and VP9 profile 0 encoder.
 //!
 //! A `VTCompressionSession` that is required to be hardware-backed, in real-time mode, with frame
 //! reordering off so decode order is presentation order and every sample's DTS equals its PTS.
@@ -16,6 +16,10 @@
 //! frame zero, and frame zero is forced to be a keyframe so the stream still opens on one. Any
 //! later sample that references a parameter set the `hvcC` does not declare is an error rather
 //! than a stream that would not decode.
+//!
+//! A VP9 stream's `vpcC` is built the same way, from the colour space and range the priming key
+//! frame signals, and every later key frame has to signal the same. VP9 is rate controlled by
+//! quality rather than to a bitrate, and its samples are already one chunk each.
 //!
 //! # Dropped frames
 //!
@@ -74,6 +78,8 @@ const CM_TIME_INVALID: CMTime = CMTime {
 };
 /// `kCMVideoCodecType_HEVC`.
 const HEVC: u32 = u32::from_be_bytes(*b"hvc1");
+/// `kCMVideoCodecType_VP9`.
+const VP9: u32 = u32::from_be_bytes(*b"vp09");
 /// `kCVPixelFormatType_32BGRA`.
 const BGRA: u32 = u32::from_be_bytes(*b"BGRA");
 /// `kCFNumberSInt32Type`.
@@ -170,6 +176,7 @@ unsafe extern "C" {
     static kVTCompressionPropertyKey_ProfileLevel: CFStringRef;
     static kVTProfileLevel_HEVC_Main_AutoLevel: CFStringRef;
     static kVTCompressionPropertyKey_AverageBitRate: CFStringRef;
+    static kVTCompressionPropertyKey_Quality: CFStringRef;
     static kVTCompressionPropertyKey_ExpectedFrameRate: CFStringRef;
     static kVTCompressionPropertyKey_MaxKeyFrameInterval: CFStringRef;
     static kVTCompressionPropertyKey_YCbCrMatrix: CFStringRef;
@@ -228,18 +235,41 @@ unsafe extern "C" {
     fn VTCompressionSessionInvalidate(session: VTCompressionSessionRef);
 }
 
-/// What [`super::encoder`] resolved from a configuration for the hardware path.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct Settings {
-    pub(super) bits_per_second: u32,
-    pub(super) keyframe_interval: u32,
+/// What the HEVC or VP9 factory resolved from a configuration for the hardware path.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Settings {
+    /// The target bitrate, or for a stream rate controlled by quality a nominal one.
+    pub(crate) bits_per_second: u32,
+    /// `kVTCompressionPropertyKey_Quality` in `0.0..=1.0`, for a stream rate controlled by
+    /// quality rather than to [`Self::bits_per_second`].
+    pub(crate) quality: Option<f64>,
+    pub(crate) keyframe_interval: u32,
 }
 
-/// Whether VideoToolbox has a hardware HEVC encoder for pictures of this size.
+/// The `CMVideoCodecType` VideoToolbox encodes `codec` as.
+fn codec_type(codec: Codec) -> Option<u32> {
+    match codec {
+        Codec::Hevc => Some(HEVC),
+        Codec::Vp9 => Some(VP9),
+        _ => None,
+    }
+}
+
+fn codec_name(codec: Codec) -> &'static str {
+    match codec {
+        Codec::Vp9 => "VP9",
+        _ => "HEVC",
+    }
+}
+
+/// Whether VideoToolbox has a hardware `codec` encoder for pictures of this size.
 ///
 /// Asks for the encoder's supported properties under the same "hardware required" specification
 /// the session is created with, which answers without creating a session.
-pub(super) fn is_available(dimensions: VideoDimensions) -> bool {
+pub(crate) fn is_available(codec: Codec, dimensions: VideoDimensions) -> bool {
+    let Some(codec) = codec_type(codec) else {
+        return false;
+    };
     let (Ok(width), Ok(height)) = (
         i32::try_from(dimensions.width),
         i32::try_from(dimensions.height),
@@ -254,7 +284,7 @@ pub(super) fn is_available(dimensions: VideoDimensions) -> bool {
         let status = VTCopySupportedPropertyDictionaryForEncoder(
             width,
             height,
-            HEVC,
+            codec,
             specification.0,
             &mut encoder_id,
             &mut properties,
@@ -265,7 +295,7 @@ pub(super) fn is_available(dimensions: VideoDimensions) -> bool {
     }
 }
 
-pub(super) fn create(
+pub(crate) fn create(
     configuration: &VideoEncoderConfig,
     limits: &Limits,
     settings: Settings,
@@ -276,11 +306,12 @@ pub(super) fn create(
 
 /// One encoded picture as the output callback saw it.
 struct Picture {
-    /// The access unit as VideoToolbox emitted it, four-byte length-prefixed.
+    /// The sample as VideoToolbox emitted it: an HEVC access unit, four-byte length-prefixed, or
+    /// a VP9 chunk.
     data: Vec<u8>,
     pts: CMTime,
     is_sync: bool,
-    /// The parameter sets the sample's format description declares.
+    /// The parameter sets the sample's format description declares. Empty for VP9.
     parameter_sets: ParameterSets,
 }
 
@@ -291,7 +322,20 @@ enum Output {
     Failed(String),
 }
 
-type Shared = Mutex<Vec<Output>>;
+/// What the output callback shares with the encoder.
+struct Shared {
+    /// Whether the session encodes HEVC, whose format descriptions carry parameter sets.
+    hevc: bool,
+    outputs: Mutex<Vec<Output>>,
+}
+
+/// What the track's decoder configuration declares, which every sample is held to.
+enum Declared {
+    /// The parameter sets the `hvcC` carries.
+    Hevc(ParameterSets),
+    /// The `vpcC`, and the level it names, as the priming key frame signalled them.
+    Vp9 { vpcc: Vec<u8>, level: u8 },
+}
 
 struct VideoToolboxEncoder {
     configuration: VideoEncoderConfig,
@@ -301,8 +345,8 @@ struct VideoToolboxEncoder {
     /// in `Drop` once the session can no longer call back.
     shared: Arc<Shared>,
     config: EncoderConfig,
-    /// The parameter sets the `hvcC` in [`Self::config`] declares.
-    declared: ParameterSets,
+    /// What the decoder configuration in [`Self::config`] declares.
+    declared: Declared,
     next_index: u64,
     /// The last sample out of the session, held until the next one says how long it lasts.
     pending: Option<EncodedSample>,
@@ -315,10 +359,16 @@ impl VideoToolboxEncoder {
     fn new(configuration: VideoEncoderConfig, limits: Limits, settings: Settings) -> Result<Self> {
         let dimensions = configuration.coded_dimensions;
         let width = i32::try_from(dimensions.width)
-            .map_err(|_| limit("HEVC frame width exceeds VideoToolbox's range"))?;
+            .map_err(|_| limit("frame width exceeds VideoToolbox's range"))?;
         let height = i32::try_from(dimensions.height)
-            .map_err(|_| limit("HEVC frame height exceeds VideoToolbox's range"))?;
-        let shared: Arc<Shared> = Arc::default();
+            .map_err(|_| limit("frame height exceeds VideoToolbox's range"))?;
+        let codec_type = codec_type(configuration.codec)
+            .ok_or_else(|| unsupported("VideoToolbox encodes HEVC or VP9 only"))?;
+        let name = codec_name(configuration.codec);
+        let shared = Arc::new(Shared {
+            hevc: configuration.codec == Codec::Hevc,
+            outputs: Mutex::default(),
+        });
         let refcon = Arc::into_raw(Arc::clone(&shared))
             .cast_mut()
             .cast::<c_void>();
@@ -341,7 +391,7 @@ impl VideoToolboxEncoder {
                 ptr::null(),
                 width,
                 height,
-                HEVC,
+                codec_type,
                 specification.0,
                 attributes.0,
                 ptr::null(),
@@ -354,21 +404,21 @@ impl VideoToolboxEncoder {
             // SAFETY: the session was never created, so nothing else holds this reference.
             drop(unsafe { Arc::from_raw(refcon.cast_const().cast::<Shared>()) });
             return Err(unsupported(format!(
-                "could not create a hardware VideoToolbox HEVC encoder (OSStatus {status})"
+                "could not create a hardware VideoToolbox {name} encoder (OSStatus {status})"
             )));
         }
         // From here on `Drop` owns the session and the refcon.
         let mut encoder = Self {
+            config: EncoderConfig {
+                codec: configuration.codec,
+                timescale: 0,
+                decoder_config: Vec::new(),
+            },
             configuration,
             limits,
             session,
             shared,
-            config: EncoderConfig {
-                codec: Codec::Hevc,
-                timescale: 0,
-                decoder_config: Vec::new(),
-            },
-            declared: ParameterSets::default(),
+            declared: Declared::Hevc(ParameterSets::default()),
             next_index: 0,
             pending: None,
             emitted: false,
@@ -379,11 +429,16 @@ impl VideoToolboxEncoder {
         Ok(encoder)
     }
 
+    fn name(&self) -> &'static str {
+        codec_name(self.configuration.codec)
+    }
+
     fn configure(&mut self, settings: Settings) -> Result<()> {
+        let label = self.name();
         let bits_per_second = i32::try_from(settings.bits_per_second)
-            .map_err(|_| invalid_input("HEVC target bitrate exceeds VideoToolbox's range"))?;
+            .map_err(|_| invalid_input("target bitrate exceeds VideoToolbox's range"))?;
         let keyframe_interval = i32::try_from(settings.keyframe_interval)
-            .map_err(|_| invalid_input("HEVC keyframe interval exceeds VideoToolbox's range"))?;
+            .map_err(|_| invalid_input("keyframe interval exceeds VideoToolbox's range"))?;
         let frame_rate =
             f64::from(self.configuration.timescale) / f64::from(self.configuration.frame_duration);
         // SAFETY: the session is valid and every value is a live CF object for the call.
@@ -391,6 +446,7 @@ impl VideoToolboxEncoder {
             let average = number_i32(bits_per_second);
             let interval = number_i32(keyframe_interval);
             let rate = number_f64(frame_rate);
+            let quality = settings.quality.map(number_f64);
             // The BGRA-to-YCbCr conversion VideoToolbox runs on the way in takes its matrix from
             // here, not from `YCbCrMatrix`, and defaults to BT.709. The crate's decoders convert
             // back with BT.601, so anything else shifts colour on a round trip.
@@ -398,12 +454,7 @@ impl VideoToolboxEncoder {
                 kVTPixelTransferPropertyKey_DestinationYCbCrMatrix,
                 kCVImageBufferYCbCrMatrix_ITU_R_601_4,
             )]);
-            let required = [
-                (
-                    kVTCompressionPropertyKey_ProfileLevel,
-                    kVTProfileLevel_HEVC_Main_AutoLevel,
-                    "profile",
-                ),
+            let mut required = vec![
                 (
                     kVTCompressionPropertyKey_AllowFrameReordering,
                     kCFBooleanFalse,
@@ -413,11 +464,6 @@ impl VideoToolboxEncoder {
                     kVTCompressionPropertyKey_RealTime,
                     kCFBooleanTrue,
                     "real-time mode",
-                ),
-                (
-                    kVTCompressionPropertyKey_AverageBitRate,
-                    average.0,
-                    "target bitrate",
                 ),
                 (
                     kVTCompressionPropertyKey_MaxKeyFrameInterval,
@@ -430,29 +476,50 @@ impl VideoToolboxEncoder {
                     "BT.601 colour conversion",
                 ),
             ];
-            for (key, value, name) in required {
-                let status = VTSessionSetProperty(self.session, key, value);
-                if status != 0 {
-                    return Err(unsupported(format!(
-                        "VideoToolbox rejected the HEVC {name} (OSStatus {status})"
-                    )));
-                }
-            }
             // Hints the encoder may decline. The matrix signalled in the stream matches the one
             // the conversion above used.
-            for (key, value) in [
+            let mut hints = vec![
                 (kVTCompressionPropertyKey_ExpectedFrameRate, rate.0),
                 (
                     kVTCompressionPropertyKey_YCbCrMatrix,
                     kCVImageBufferYCbCrMatrix_ITU_R_601_4,
                 ),
-            ] {
+            ];
+            if self.configuration.codec == Codec::Hevc {
+                required.push((
+                    kVTCompressionPropertyKey_ProfileLevel,
+                    kVTProfileLevel_HEVC_Main_AutoLevel,
+                    "profile",
+                ));
+            }
+            match &quality {
+                // A stream rate controlled by quality still declares its nominal bitrate, but
+                // only as a hint.
+                Some(quality) => hints.extend([
+                    (kVTCompressionPropertyKey_Quality, quality.0),
+                    (kVTCompressionPropertyKey_AverageBitRate, average.0),
+                ]),
+                None => required.push((
+                    kVTCompressionPropertyKey_AverageBitRate,
+                    average.0,
+                    "target bitrate",
+                )),
+            }
+            for (key, value, name) in required {
+                let status = VTSessionSetProperty(self.session, key, value);
+                if status != 0 {
+                    return Err(unsupported(format!(
+                        "VideoToolbox rejected the {label} {name} (OSStatus {status})"
+                    )));
+                }
+            }
+            for (key, value) in hints {
                 VTSessionSetProperty(self.session, key, value);
             }
             let status = VTCompressionSessionPrepareToEncodeFrames(self.session);
             if status != 0 {
                 return Err(unsupported(format!(
-                    "VideoToolbox could not prepare the HEVC encoder (OSStatus {status})"
+                    "VideoToolbox could not prepare the {label} encoder (OSStatus {status})"
                 )));
             }
             let mut using: CFTypeRef = ptr::null();
@@ -464,15 +531,16 @@ impl VideoToolboxEncoder {
             );
             let using = Owned(using);
             if status != 0 || using.0.is_null() || CFBooleanGetValue(using.0) == 0 {
-                return Err(unsupported(
-                    "VideoToolbox created a software HEVC encoder instead of a hardware one",
-                ));
+                return Err(unsupported(format!(
+                    "VideoToolbox created a software {label} encoder instead of a hardware one"
+                )));
             }
         }
         Ok(())
     }
 
-    /// Encodes the black priming frame and declares the parameter sets it came out with.
+    /// Encodes the black priming frame and declares the parameter sets, or for VP9 the colour
+    /// signalling, it came out with.
     fn prime(&mut self) -> Result<()> {
         let dimensions = self.configuration.coded_dimensions;
         let black = VideoFrame::new(
@@ -488,6 +556,9 @@ impl VideoToolboxEncoder {
         let buffer = self.pixel_buffer(&black, Orientation::TopLeft)?;
         self.submit(&buffer, 0, true)?;
         self.complete()?;
+        if self.configuration.codec == Codec::Vp9 {
+            return self.prime_vp9();
+        }
         let mut declared = ParameterSets::default();
         for output in self.take_outputs() {
             match output {
@@ -516,7 +587,39 @@ impl VideoToolboxEncoder {
                 codec("VideoToolbox did not produce a complete set of HEVC parameter sets")
             })?,
         };
-        self.declared = declared;
+        self.declared = Declared::Hevc(declared);
+        Ok(())
+    }
+
+    /// Declares the `vpcC` the priming key frame signals.
+    fn prime_vp9(&mut self) -> Result<()> {
+        let level = crate::vp9_encoder::pick_level(
+            self.configuration.coded_dimensions,
+            self.configuration.timescale,
+            self.configuration.frame_duration,
+        )
+        .ok_or_else(|| invalid_input("VP9 dimensions and frame rate exceed level 6.2 limits"))?;
+        let mut vpcc = None;
+        for output in self.take_outputs() {
+            match output {
+                Output::Picture(picture) if vpcc.is_none() => {
+                    vpcc = Some(
+                        crate::vp9_encoder::key_frame_vpcc(&picture.data, level).ok_or_else(
+                            || codec("VideoToolbox primed with no VP9 profile 0 key frame"),
+                        )?,
+                    );
+                }
+                Output::Picture(_) | Output::Dropped => {}
+                Output::Failed(error) => return Err(codec(error)),
+            }
+        }
+        let vpcc = vpcc.ok_or_else(|| codec("VideoToolbox dropped its VP9 priming frame"))?;
+        self.config = EncoderConfig {
+            codec: Codec::Vp9,
+            timescale: self.configuration.timescale,
+            decoder_config: vpcc.clone(),
+        };
+        self.declared = Declared::Vp9 { vpcc, level };
         Ok(())
     }
 
@@ -527,19 +630,17 @@ impl VideoToolboxEncoder {
         let plane = frame
             .planes
             .first()
-            .ok_or_else(|| invalid_input("HEVC input frame has no pixel plane"))?;
+            .ok_or_else(|| invalid_input("input frame has no pixel plane"))?;
         let row_bytes = width * 4;
         if plane.stride < row_bytes || plane.data.len() < plane.stride * (height - 1) + row_bytes {
-            return Err(invalid_input(
-                "HEVC input frame plane is shorter than its size",
-            ));
+            return Err(invalid_input("input frame plane is shorter than its size"));
         }
         let swizzle = match frame.pixel_format {
             PixelFormat::Bgra8 => false,
             PixelFormat::Rgba8 => true,
             _ => {
                 return Err(invalid_input(
-                    "hardware HEVC encoding accepts Rgba8 or Bgra8",
+                    "VideoToolbox encoding accepts Rgba8 or Bgra8",
                 ));
             }
         };
@@ -548,9 +649,7 @@ impl VideoToolboxEncoder {
         unsafe {
             let pool = VTCompressionSessionGetPixelBufferPool(self.session);
             if pool.is_null() {
-                return Err(codec(
-                    "the VideoToolbox HEVC encoder has no pixel buffer pool",
-                ));
+                return Err(codec("the VideoToolbox encoder has no pixel buffer pool"));
             }
             let mut buffer: CVPixelBufferRef = ptr::null_mut();
             let status = CVPixelBufferPoolCreatePixelBuffer(ptr::null(), pool, &mut buffer);
@@ -595,7 +694,7 @@ impl VideoToolboxEncoder {
     /// Hands one pixel buffer to the session at `tick`, in the configured timescale.
     fn submit(&self, buffer: &Owned, tick: i64, key_frame: bool) -> Result<()> {
         let timescale = i32::try_from(self.configuration.timescale)
-            .map_err(|_| limit("HEVC timescale exceeds VideoToolbox's range"))?;
+            .map_err(|_| limit("timescale exceeds VideoToolbox's range"))?;
         let pts = CMTime {
             value: tick,
             timescale,
@@ -623,7 +722,7 @@ impl VideoToolboxEncoder {
         };
         if status != 0 {
             return Err(codec(format!(
-                "VideoToolbox rejected an HEVC frame (OSStatus {status})"
+                "VideoToolbox rejected a frame (OSStatus {status})"
             )));
         }
         Ok(())
@@ -635,14 +734,20 @@ impl VideoToolboxEncoder {
         let status = unsafe { VTCompressionSessionCompleteFrames(self.session, CM_TIME_INVALID) };
         if status != 0 {
             return Err(codec(format!(
-                "VideoToolbox could not finish HEVC frames (OSStatus {status})"
+                "VideoToolbox could not finish frames (OSStatus {status})"
             )));
         }
         Ok(())
     }
 
     fn take_outputs(&self) -> Vec<Output> {
-        std::mem::take(&mut *self.shared.lock().unwrap_or_else(|e| e.into_inner()))
+        std::mem::take(
+            &mut *self
+                .shared
+                .outputs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        )
     }
 
     /// Turns whatever the callback has queued into samples, returning every one whose duration
@@ -656,19 +761,35 @@ impl VideoToolboxEncoder {
                 Output::Dropped => continue,
                 Output::Failed(error) => return Err(codec(error)),
             };
-            let mut sets = picture.parameter_sets;
-            let data = reframe_length_prefixed(&picture.data, &mut sets)
-                .ok_or_else(|| codec("VideoToolbox returned a malformed HEVC access unit"))?
-                .data;
-            if !self.declared.contains_all(&sets) {
-                return Err(codec(
-                    "VideoToolbox changed its HEVC parameter sets after the stream was declared",
-                ));
-            }
+            let (data, is_sync) = match &self.declared {
+                Declared::Hevc(declared) => {
+                    let mut sets = picture.parameter_sets;
+                    let data = reframe_length_prefixed(&picture.data, &mut sets)
+                        .ok_or_else(|| codec("VideoToolbox returned a malformed HEVC access unit"))?
+                        .data;
+                    if !declared.contains_all(&sets) {
+                        return Err(codec(
+                            "VideoToolbox changed its HEVC parameter sets after the stream was declared",
+                        ));
+                    }
+                    (data, picture.is_sync)
+                }
+                Declared::Vp9 { vpcc, level } => {
+                    // Only a key frame makes a VP9 sample a sync sample.
+                    let key = crate::vp9_encoder::key_frame_vpcc(&picture.data, *level);
+                    if key.as_ref().is_some_and(|key| key != vpcc) {
+                        return Err(codec(
+                            "VideoToolbox changed its VP9 colour signalling after the stream was declared",
+                        ));
+                    }
+                    (picture.data, key.is_some())
+                }
+            };
             if data.len() as u64 > self.limits.max_allocation_bytes {
-                return Err(limit(
-                    "HEVC access unit exceeds configured allocation limit",
-                ));
+                return Err(limit(format!(
+                    "{} sample exceeds configured allocation limit",
+                    self.name()
+                )));
             }
             // The stream timestamp, undoing the one-frame offset every frame was submitted at.
             let mut tick = self.ticks(picture.pts)? - i64::from(self.configuration.frame_duration);
@@ -685,7 +806,7 @@ impl VideoToolboxEncoder {
                 previous.duration = u32::try_from(tick - previous.dts)
                     .ok()
                     .filter(|duration| *duration > 0)
-                    .ok_or_else(|| codec("VideoToolbox returned HEVC frames out of order"))?;
+                    .ok_or_else(|| codec("VideoToolbox returned frames out of order"))?;
                 samples.push(previous);
             }
             self.pending = Some(EncodedSample {
@@ -693,8 +814,8 @@ impl VideoToolboxEncoder {
                 dts: tick,
                 pts: tick,
                 duration: self.configuration.frame_duration,
-                is_sync: picture.is_sync,
-                dependency: if picture.is_sync {
+                is_sync,
+                dependency: if is_sync {
                     SampleDependency::INDEPENDENT
                 } else {
                     SampleDependency::DEPENDENT
@@ -709,15 +830,13 @@ impl VideoToolboxEncoder {
     fn ticks(&self, time: CMTime) -> Result<i64> {
         let timescale = i64::from(self.configuration.timescale);
         if time.flags & CM_TIME_VALID == 0 || time.timescale <= 0 {
-            return Err(codec(
-                "VideoToolbox returned an HEVC frame without a timestamp",
-            ));
+            return Err(codec("VideoToolbox returned a frame without a timestamp"));
         }
         if i64::from(time.timescale) == timescale {
             return Ok(time.value);
         }
         let scaled = i128::from(time.value) * i128::from(timescale) / i128::from(time.timescale);
-        i64::try_from(scaled).map_err(|_| limit("HEVC timeline overflows"))
+        i64::try_from(scaled).map_err(|_| limit("timeline overflows"))
     }
 
     fn check_frame(&self, frame: &VideoFrame) -> Result<()> {
@@ -726,7 +845,7 @@ impl VideoToolboxEncoder {
             || frame.color_range != self.configuration.color_range
         {
             return Err(invalid_input(
-                "HEVC input frame does not match the configured size and format",
+                "input frame does not match the configured size and format",
             ));
         }
         Ok(())
@@ -744,7 +863,10 @@ impl VideoEncoder for VideoToolboxEncoder {
     }
 
     fn backend_name(&self) -> &str {
-        "VideoToolbox HEVC"
+        match self.configuration.codec {
+            Codec::Vp9 => "VideoToolbox VP9",
+            _ => "VideoToolbox HEVC",
+        }
     }
 
     fn format(&self) -> VideoEncoderFormat {
@@ -763,20 +885,22 @@ impl VideoEncoder for VideoToolboxEncoder {
             if self.finished {
                 return Err(Error::new(
                     ErrorKind::InvalidState,
-                    "HEVC encoder has already been finished",
+                    format!("{} encoder has already been finished", self.name()),
                 ));
             }
             if index.0 != self.next_index {
-                return Err(invalid_input(
-                    "HEVC encoder frame indexes must be consecutive and start at zero",
-                ));
+                return Err(invalid_input(format!(
+                    "{} encoder frame indexes must be consecutive and start at zero",
+                    self.name()
+                )));
             }
             let source = match source {
                 FrameSource::Cpu(source) => source,
                 FrameSource::Graphics(_) => {
-                    return Err(unsupported(
-                        "the VideoToolbox HEVC encoder requires a CPU frame source",
-                    ));
+                    return Err(unsupported(format!(
+                        "the VideoToolbox {} encoder requires a CPU frame source",
+                        self.name()
+                    )));
                 }
             };
             self.check_frame(source.frame)?;
@@ -787,7 +911,7 @@ impl VideoEncoder for VideoToolboxEncoder {
                 .checked_add(1)
                 .and_then(|frames| frames.checked_mul(u64::from(self.configuration.frame_duration)))
                 .and_then(|tick| i64::try_from(tick).ok())
-                .ok_or_else(|| limit("HEVC timeline overflows"))?;
+                .ok_or_else(|| limit("timeline overflows"))?;
             self.submit(&buffer, tick, index.0 == 0)?;
             self.next_index += 1;
             self.collect()
@@ -808,15 +932,15 @@ impl VideoEncoder for VideoToolboxEncoder {
                     .next_index
                     .checked_mul(u64::from(self.configuration.frame_duration))
                     .and_then(|end| i64::try_from(end).ok())
-                    .ok_or_else(|| limit("HEVC timeline overflows"))?;
+                    .ok_or_else(|| limit("timeline overflows"))?;
                 last.duration = u32::try_from(end - last.dts)
                     .ok()
                     .filter(|duration| *duration > 0)
-                    .ok_or_else(|| codec("VideoToolbox returned an HEVC frame past the end"))?;
+                    .ok_or_else(|| codec("VideoToolbox returned a frame past the end"))?;
                 samples.push(last);
             }
             if self.next_index > 0 && !self.emitted && samples.is_empty() {
-                return Err(codec("VideoToolbox dropped every HEVC frame"));
+                return Err(codec("VideoToolbox dropped every frame"));
             }
             self.emitted |= !samples.is_empty();
             Ok(samples)
@@ -847,30 +971,71 @@ unsafe extern "C" fn on_output(
     // SAFETY: `refcon` is the encoder's strong reference to its queue, alive while the session is.
     let shared = unsafe { &*refcon.cast_const().cast::<Shared>() };
     let output = if status != 0 {
-        Output::Failed(format!(
-            "VideoToolbox HEVC encode failed (OSStatus {status})"
-        ))
+        Output::Failed(format!("VideoToolbox encode failed (OSStatus {status})"))
     } else if sample.is_null() || flags & FRAME_DROPPED != 0 {
         Output::Dropped
     } else {
         // SAFETY: the sample buffer is valid for the duration of the callback.
-        unsafe { read_sample(sample) }
+        unsafe { read_sample(sample, shared.hevc) }
     };
     shared
+        .outputs
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .push(output);
 }
 
-/// Copies an encoded sample, and the parameter sets it declares, out of its buffer.
-unsafe fn read_sample(sample: CMSampleBufferRef) -> Output {
+/// Copies an encoded sample, and for HEVC the parameter sets it declares, out of its buffer.
+unsafe fn read_sample(sample: CMSampleBufferRef, hevc: bool) -> Output {
     // SAFETY: the caller passes a valid sample buffer, and everything read from it is copied
     // before the callback returns.
+    unsafe {
+        let parameter_sets = if hevc {
+            match read_parameter_sets(sample) {
+                Ok(sets) => sets,
+                Err(error) => return Output::Failed(error),
+            }
+        } else {
+            ParameterSets::default()
+        };
+        let block = CMSampleBufferGetDataBuffer(sample);
+        if block.is_null() {
+            return Output::Failed("VideoToolbox returned a sample without data".into());
+        }
+        let length = CMBlockBufferGetDataLength(block);
+        let mut data = vec![0_u8; length];
+        let status = CMBlockBufferCopyDataBytes(block, 0, length, data.as_mut_ptr().cast());
+        if status != 0 {
+            return Output::Failed(format!(
+                "could not copy VideoToolbox output (OSStatus {status})"
+            ));
+        }
+        let mut is_sync = true;
+        let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, 0);
+        if !attachments.is_null() && CFArrayGetCount(attachments) > 0 {
+            let first = CFArrayGetValueAtIndex(attachments, 0);
+            let not_sync = CFDictionaryGetValue(first, kCMSampleAttachmentKey_NotSync);
+            is_sync = not_sync.is_null() || CFBooleanGetValue(not_sync) == 0;
+        }
+        Output::Picture(Picture {
+            data,
+            pts: CMSampleBufferGetPresentationTimeStamp(sample),
+            is_sync,
+            parameter_sets,
+        })
+    }
+}
+
+/// The HEVC parameter sets an encoded sample's format description declares.
+unsafe fn read_parameter_sets(
+    sample: CMSampleBufferRef,
+) -> std::result::Result<ParameterSets, String> {
+    // SAFETY: the caller passes a valid sample buffer, and every set is copied out of it.
     unsafe {
         let mut parameter_sets = ParameterSets::default();
         let description = CMSampleBufferGetFormatDescription(sample);
         if description.is_null() {
-            return Output::Failed("VideoToolbox returned HEVC without a format".into());
+            return Err("VideoToolbox returned HEVC without a format".into());
         }
         let mut count = 0_usize;
         let mut header_length = 0_i32;
@@ -883,12 +1048,12 @@ unsafe fn read_sample(sample: CMSampleBufferRef) -> Output {
             &mut header_length,
         );
         if status != 0 {
-            return Output::Failed(format!(
+            return Err(format!(
                 "VideoToolbox HEVC format has no parameter sets (OSStatus {status})"
             ));
         }
         if header_length != 4 {
-            return Output::Failed(format!(
+            return Err(format!(
                 "VideoToolbox HEVC uses {header_length}-byte NAL lengths instead of 4"
             ));
         }
@@ -908,32 +1073,7 @@ unsafe fn read_sample(sample: CMSampleBufferRef) -> Output {
                 parameter_sets.collect(std::slice::from_raw_parts(set, size));
             }
         }
-
-        let block = CMSampleBufferGetDataBuffer(sample);
-        if block.is_null() {
-            return Output::Failed("VideoToolbox returned an HEVC sample without data".into());
-        }
-        let length = CMBlockBufferGetDataLength(block);
-        let mut data = vec![0_u8; length];
-        let status = CMBlockBufferCopyDataBytes(block, 0, length, data.as_mut_ptr().cast());
-        if status != 0 {
-            return Output::Failed(format!(
-                "could not copy VideoToolbox HEVC output (OSStatus {status})"
-            ));
-        }
-        let mut is_sync = true;
-        let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, 0);
-        if !attachments.is_null() && CFArrayGetCount(attachments) > 0 {
-            let first = CFArrayGetValueAtIndex(attachments, 0);
-            let not_sync = CFDictionaryGetValue(first, kCMSampleAttachmentKey_NotSync);
-            is_sync = not_sync.is_null() || CFBooleanGetValue(not_sync) == 0;
-        }
-        Output::Picture(Picture {
-            data,
-            pts: CMSampleBufferGetPresentationTimeStamp(sample),
-            is_sync,
-            parameter_sets,
-        })
+        Ok(parameter_sets)
     }
 }
 

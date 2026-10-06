@@ -69,8 +69,8 @@ use windows::core::{GUID, HRESULT, Interface, PWSTR};
 use super::annexb::{self, ParameterSets};
 use super::engine::encoder::colorconv;
 use crate::{
-    Codec, CodecImplementation, ColorRange, EncodedSample, EncoderConfig, EncoderFuture, Error, ErrorKind,
-    FrameIndex, FrameSource, Limits, Orientation, PixelFormat, Result, SampleDependency,
+    Codec, CodecImplementation, ColorRange, EncodedSample, EncoderConfig, EncoderFuture, Error,
+    ErrorKind, FrameIndex, FrameSource, Limits, Orientation, PixelFormat, Result, SampleDependency,
     VideoEncoder, VideoEncoderFormat,
 };
 
@@ -1096,7 +1096,10 @@ impl Core {
                 .checked_mul(u64::from(self.settings.frame_duration))
                 .and_then(|tick| i64::try_from(tick).ok())
                 .ok_or_else(|| {
-                    Error::new(ErrorKind::ResourceLimit, format!("{name} timeline overflows"))
+                    Error::new(
+                        ErrorKind::ResourceLimit,
+                        format!("{name} timeline overflows"),
+                    )
                 })?;
             samples.push(EncodedSample {
                 data,
@@ -1356,7 +1359,11 @@ impl MfVideoEncoder {
             .name("zvidlib-mf-encode".into())
             .spawn(move || match Core::open(settings, class, limits) {
                 Ok(core) => {
-                    let ready = (core.declared.decoder_config(), core.mft.feed, core.mft.name.clone());
+                    let ready = (
+                        core.declared.decoder_config(),
+                        core.mft.feed,
+                        core.mft.name.clone(),
+                    );
                     if ready_tx.send(Ok(ready)).is_ok() {
                         run_worker(core, &command_rx, &worker_cancelled);
                     }

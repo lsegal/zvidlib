@@ -84,8 +84,7 @@ impl VideoEncoderFactory for NativeVp9EncoderFactory {
         configuration: &VideoEncoderConfig,
         limits: &Limits,
     ) -> Result<Box<dyn VideoEncoder>> {
-        if configuration.codec != Codec::Vp9 || configuration.profile != CodecProfile::Vp9Profile0
-        {
+        if configuration.codec != Codec::Vp9 || configuration.profile != CodecProfile::Vp9Profile0 {
             return Err(capability_error(self.capability(configuration)));
         }
         if configuration.hardware != HardwarePreference::Avoid {
@@ -147,7 +146,8 @@ fn hardware_request(
     // About 0.17 bits a pixel at the default quantizer, rising steeply toward
     // the finest one: 1080p30 at the default declares roughly 10 Mbit/s.
     let bits_per_pixel = 0.05 + 0.25 * quality * quality;
-    let pixels_per_second = f64::from(dimensions.width) * f64::from(dimensions.height)
+    let pixels_per_second = f64::from(dimensions.width)
+        * f64::from(dimensions.height)
         * f64::from(configuration.timescale)
         / f64::from(configuration.frame_duration);
     Ok(HardwareRequest {
