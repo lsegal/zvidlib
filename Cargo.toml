@@ -215,6 +215,11 @@ winit = "0.30.13"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 cpal = "0.15.3"
+
+# Native AAC decoding where the operating system has no AAC decoder of its own:
+# macOS decodes through AudioToolbox and Windows through Media Foundation, so
+# only Linux and the other native targets carry Symphonia's (issue #561).
+[target.'cfg(not(any(target_arch = "wasm32", target_os = "macos", windows)))'.dependencies]
 symphonia-codec-aac = "0.5.5"
 
 [target.'cfg(any(windows, target_os = "linux"))'.dependencies]
