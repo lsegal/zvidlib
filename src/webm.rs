@@ -28,7 +28,7 @@ use crate::media::Codec;
 use crate::mp4::{Mp4TrackConfig, Mp4TrackFormat};
 use crate::opus::OpusHead;
 use crate::vorbis::VorbisConfig;
-use crate::{Error, ErrorKind, Result};
+use crate::{Error, ErrorKind, Result, Vp9CodecConfig};
 
 /// One tick of every block timestamp written: a millisecond, Matroska's
 /// default and the scale every WebM player expects.
@@ -503,7 +503,7 @@ fn validate_track_config(config: &Mp4TrackConfig) -> Result<()> {
         return Err(invalid("a WebM track timescale must be nonzero"));
     }
     match (config.encoder.codec, config.format) {
-        (Codec::Av1, Mp4TrackFormat::Video(_)) => {}
+        (Codec::Av1 | Codec::Vp9, Mp4TrackFormat::Video(_)) => {}
         (Codec::Opus | Codec::Vorbis, Mp4TrackFormat::Audio { channels }) => {
             let declared = match config.encoder.codec {
                 Codec::Opus => {
@@ -552,8 +552,8 @@ fn codec_delay(config: &Mp4TrackConfig) -> Result<u32> {
     }
 }
 
-/// The track's `CodecID` and `CodecPrivate`. A V_VP8 or V_VP9 arm joins V_AV1
-/// here once zvidlib encodes them (the sibling sub-issues of #523).
+/// The track's `CodecID` and `CodecPrivate`. A V_VP8 arm joins V_AV1 and V_VP9
+/// here once zvidlib encodes VP8 (a sibling sub-issue of #523).
 fn codec_private(config: &Mp4TrackConfig) -> Result<(&'static str, Vec<u8>)> {
     match config.encoder.codec {
         Codec::Av1 => {
@@ -571,6 +571,23 @@ fn codec_private(config: &Mp4TrackConfig) -> Result<(&'static str, Vec<u8>)> {
             }
             // WebM's CodecPrivate is the AV1CodecConfigurationRecord itself.
             Ok(("V_AV1", whole[8..].to_vec()))
+        }
+        Codec::Vp9 => {
+            // The WebM VP9 codec mapping's CodecPrivate is a list of
+            // (ID, length, value) features: profile (1), level (2), bit
+            // depth (3) and chroma subsampling (4), all from the `vpcC`.
+            let vpcc = Vp9CodecConfig::parse_vpcc(&config.encoder.decoder_config)
+                .map_err(|_| invalid("VP9 codec configuration must be a complete vpcC box"))?;
+            let mut features = Vec::with_capacity(12);
+            for (id, value) in [
+                (1, vpcc.profile),
+                (2, vpcc.level),
+                (3, vpcc.bit_depth),
+                (4, vpcc.chroma_subsampling),
+            ] {
+                features.extend_from_slice(&[id, 1, value]);
+            }
+            Ok(("V_VP9", features))
         }
         // The Matroska Opus mapping's CodecPrivate is the RFC 7845 OpusHead.
         Codec::Opus => Ok((
