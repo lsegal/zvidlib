@@ -7,21 +7,27 @@
 //! - every frame is error resilient, so it is coded with the default
 //!   probabilities, sends no probability updates, and needs no state from
 //!   earlier frames other than the reconstructed reference picture;
-//! - every superblock is split down to 8x8 blocks, every transform is 4x4
-//!   (`tx_mode = ONLY_4X4`), and the loop filter is off (`filter_level = 0`);
+//! - every superblock is split down to 8x8 blocks and every transform is 4x4
+//!   (`tx_mode = ONLY_4X4`);
+//! - the loop filter runs at the per-frame level that brings the
+//!   reconstruction closest to the source, with sharpness 0 and no mode or
+//!   reference deltas;
 //! - key frames choose among the DC, V, H and TM intra modes per block;
 //! - inter frames predict from the previous frame (`LAST_FRAME`) with
 //!   whole-sample motion vectors found by a diamond search, coded as
 //!   `ZEROMV`, `NEARESTMV`, `NEARMV` or `NEWMV`, or fall back to intra.
 //!
 //! The encoder keeps a reconstruction that matches the decoding process
-//! exactly, and predicts every later block and frame from it.
+//! exactly: blocks predict from it unfiltered within the frame, and later
+//! frames predict from it after the loop filter.
 
 use super::bitwriter::{BitWriter, BoolEncoder};
 use super::dsp::{
     IntraMode, ReferencePlane, TxType, forward_transform, inverse_transform_add, predict_inter,
     predict_intra_4x4,
 };
+use crate::vp9_dec::loopfilter::{self, FilterPlane, LoopFilterMask, MaskBlock};
+
 use super::tables::{
     AC_QLOOKUP, CAT6_PROBS, COEF_PROBS_4X4, COL_SCAN_4X4, COL_SCAN_4X4_NEIGHBORS, DC_QLOOKUP,
     DEFAULT_SCAN_4X4, DEFAULT_SCAN_4X4_NEIGHBORS, IF_UV_MODE_PROBS, IF_Y_MODE_PROBS,
@@ -98,6 +104,10 @@ const MV_REF_SEARCH: [(isize, isize); 8] = [
     (-1, -2),
     (-2, -2),
 ];
+
+/// `BLOCK_8X8` and `TX_4X4`, the only block and transform sizes coded.
+const BLOCK_8X8: u8 = 3;
+const TX_4X4: u8 = 0;
 
 const NEARESTMV: u8 = 10;
 const NEARMV: u8 = 11;
@@ -206,6 +216,11 @@ pub(super) struct FrameEncoder<'a> {
     reference: Option<&'a Picture>,
     recon: Picture,
     base_q_idx: u8,
+    /// The loop filter level the frame header signals; zero turns it off.
+    filter_level: u8,
+    /// Whether [`Self::encode`] chooses a loop filter level at all; tests
+    /// clear it to compare against an unfiltered encode.
+    loop_filter: bool,
     /// The quantizer steps every plane uses: the header codes no deltas.
     dc_q: i32,
     ac_q: i32,
@@ -235,6 +250,8 @@ impl<'a> FrameEncoder<'a> {
             reference,
             recon: Picture::new(&geometry),
             base_q_idx,
+            filter_level: 0,
+            loop_filter: true,
             dc_q: DC_QLOOKUP[q],
             ac_q: ac,
             // Distortion is a pixel-domain squared error and rate is in bits.
@@ -258,6 +275,13 @@ impl<'a> FrameEncoder<'a> {
         self.reference.is_none()
     }
 
+    /// Leaves the loop filter off, as the encoder did before it chose a level.
+    #[cfg(test)]
+    pub(super) fn without_loop_filter(mut self) -> Self {
+        self.loop_filter = false;
+        self
+    }
+
     /// Encodes the frame and returns its bytes with the reconstruction;
     /// `full_range` is the colour range the key frame header signals.
     pub(super) fn encode(mut self, full_range: bool) -> (Vec<u8>, Picture) {
@@ -270,6 +294,9 @@ impl<'a> FrameEncoder<'a> {
                 self.encode_partition(sb_row * 8, sb_col * 8, 3);
             }
         }
+        if self.loop_filter {
+            self.apply_loop_filter();
+        }
         let key = self.is_key();
         let geometry = self.geometry;
         let tile = std::mem::replace(&mut self.writer, BoolEncoder::new()).finish();
@@ -278,12 +305,144 @@ impl<'a> FrameEncoder<'a> {
             &geometry,
             key,
             self.base_q_idx,
+            self.filter_level,
             full_range,
             compressed.len(),
         );
         frame.extend_from_slice(&compressed);
         frame.extend_from_slice(&tile);
         (frame, self.recon)
+    }
+
+    /// Chooses the loop filter level whose output is closest to the source
+    /// and filters the reconstruction with it, as the decoder will.
+    ///
+    /// The level costs no bits, so this is libvpx's `search_filter_level`
+    /// without its rate bias: start from the level libvpx's `LPF_PICK_FROM_Q`
+    /// guesses for the quantizer, then step towards lower error, halving the
+    /// step each time neither neighbour improves.
+    fn apply_loop_filter(&mut self) {
+        let mut guess = (i64::from(self.ac_q) * 20_723 + 1_015_158 + (1 << 17)) >> 18;
+        if self.is_key() {
+            guess -= 4;
+        }
+        let mut tried = [false; 64];
+        // The best level so far, its error and its filtered picture.
+        let mut best: Option<(u8, u64, Picture)> = None;
+        let mut try_level = |level: u8, best: &mut Option<(u8, u64, Picture)>| {
+            if std::mem::replace(&mut tried[usize::from(level)], true) {
+                return;
+            }
+            let picture = self.filtered(level);
+            let error = self.source_error(&picture);
+            if best
+                .as_ref()
+                .is_none_or(|&(_, best_error, _)| error < best_error)
+            {
+                *best = Some((level, error, picture));
+            }
+        };
+
+        let mut middle = guess.clamp(0, 63) as u8;
+        try_level(0, &mut best);
+        try_level(middle, &mut best);
+        let mut step = if middle < 16 { 4 } else { middle / 4 };
+        let mut direction = 0_i8;
+        while step > 0 {
+            if direction <= 0 {
+                try_level(middle.saturating_sub(step), &mut best);
+            }
+            if direction >= 0 {
+                try_level((middle + step).min(63), &mut best);
+            }
+            let level = best.as_ref().map_or(0, |&(level, _, _)| level);
+            if level == middle {
+                step /= 2;
+                direction = 0;
+            } else {
+                direction = if level < middle { -1 } else { 1 };
+                middle = level;
+            }
+        }
+        if let Some((level, _, picture)) = best {
+            self.filter_level = level;
+            self.recon = picture;
+        }
+    }
+
+    /// The reconstruction after the loop filter at `level`.
+    fn filtered(&self, level: u8) -> Picture {
+        let mut picture = self.recon.clone();
+        if level == 0 {
+            return picture;
+        }
+        let Geometry {
+            mi_rows, mi_cols, ..
+        } = self.geometry;
+        let sb_cols = mi_cols.div_ceil(8);
+        let mut masks = vec![LoopFilterMask::default(); sb_cols * mi_rows.div_ceil(8)];
+        for mi_row in 0..mi_rows {
+            for mi_col in 0..mi_cols {
+                let info = self.mode_info[mi_row * mi_cols + mi_col];
+                loopfilter::build_mask(
+                    &mut masks[(mi_row >> 3) * sb_cols + (mi_col >> 3)],
+                    &MaskBlock {
+                        sb_type: BLOCK_8X8,
+                        tx_size: TX_4X4,
+                        skip_inter: info.skip && info.is_inter,
+                        filter_level: level,
+                    },
+                    mi_row,
+                    mi_col,
+                    1,
+                    1,
+                );
+            }
+        }
+        let strides = picture.strides;
+        let [y, u, v] = &mut picture.planes;
+        let mut planes = [
+            FilterPlane {
+                data: y,
+                stride: strides[0],
+                origin: 0,
+            },
+            FilterPlane {
+                data: u,
+                stride: strides[1],
+                origin: 0,
+            },
+            FilterPlane {
+                data: v,
+                stride: strides[2],
+                origin: 0,
+            },
+        ];
+        loopfilter::filter_frame(&mut planes, &mut masks, mi_rows, mi_cols, 0);
+        picture
+    }
+
+    /// The squared error between `picture` and the source over the visible
+    /// area of every plane.
+    fn source_error(&self, picture: &Picture) -> u64 {
+        let geometry = &self.geometry;
+        let mut error = 0;
+        for (plane, width, height) in [
+            (0, geometry.width, geometry.height),
+            (1, geometry.chroma_width(), geometry.chroma_height()),
+            (2, geometry.chroma_width(), geometry.chroma_height()),
+        ] {
+            let stride = picture.strides[plane];
+            for row in 0..height {
+                let range = row * stride..row * stride + width;
+                error += picture.planes[plane][range.clone()]
+                    .iter()
+                    .zip(&self.source.planes[plane][range])
+                    .map(|(&a, &b)| u64::from(a.abs_diff(b)).pow(2))
+                    .sum::<u64>();
+            }
+        }
+        error
     }
 
     fn encode_partition(&mut self, mi_row: usize, mi_col: usize, bsl: usize) {
@@ -1168,6 +1327,7 @@ fn uncompressed_header(
     geometry: &Geometry,
     key: bool,
     base_q_idx: u8,
+    filter_level: u8,
     full_range: bool,
     compressed_size: usize,
 ) -> Vec<u8> {
@@ -1198,7 +1358,7 @@ fn uncompressed_header(
         writer.literal(1, 2); // raw_interpolation_filter = EIGHTTAP (regular)
     }
     writer.literal(0, 2); // frame_context_idx
-    writer.literal(0, 6); // loop_filter_level
+    writer.literal(u32::from(filter_level), 6); // loop_filter_level
     writer.literal(0, 3); // loop_filter_sharpness
     writer.bit(false); // loop_filter_delta_enabled
     writer.literal(u32::from(base_q_idx), 8);
