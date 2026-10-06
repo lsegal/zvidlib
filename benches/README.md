@@ -8,6 +8,7 @@ zvidlib's benchmarks run under [criterion](https://docs.rs/criterion) with
 | `benches/codec.rs` | codec work: decode, encoder inputs, and the per-ISA SIMD groups |
 | `benches/av1_decode.rs` | the AV1 software decoder: whole-frame decode and every hot stage, scalar versus SIMD |
 | `benches/av1_encode.rs` | the native AV1 encoder: whole-frame encode, every stage, and the forward-transform kernels, scalar versus SIMD |
+| `benches/vp8_decode.rs` | the VP8 software decoder: whole-frame decode and every hot stage, scalar versus SIMD |
 | `benches/audio_decode.rs` | the audio decode path: AAC access units and `AacSampleReader` range/seek reads |
 | `benches/audio_mux.rs` | the audio container path: MP4 muxing, sample-table growth, demux, and gapless timing |
 | `benches/hevc_encode.rs` | the pure-Rust HEVC encoder, whole-frame and per-stage |

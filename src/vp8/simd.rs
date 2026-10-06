@@ -309,9 +309,10 @@ mod kernels {
     }
 
     /// Where a subblock mode takes each of its 16 samples from (raster
-    /// order). `A3 + j` is `avg3` centred on edge sample `j + 1`, `A2 + j` is
-    /// `avg2` of edge samples `j` and `j + 1`, and `E + j` is edge sample `j`
-    /// itself, the edge running `l3, l3, l2, l1, l0, p, a0, .., a7, a7, ..`.
+    /// order). `A3 + j` is `avg3` of edge samples `j`, `j + 1` and `j + 2`,
+    /// `A2 + j` is `avg2` of edge samples `j` and `j + 1`, and `E + j` is edge
+    /// sample `j` itself, the edge running `l3, l3, l2, l1, l0, p, a0, .., a7`
+    /// and then repeating `a7`.
     const A3: u8 = 0;
     const A2: u8 = 16;
     const E: u8 = 32;
@@ -343,12 +344,26 @@ mod kernels {
          A2 + 1, A3, E, E, E, E, E, E],
     ];
 
-    /// [`crate::vp8::predict::predict_subblock_scalar`]. TM is computed for
-    /// all 16 samples at once; every directional mode reads its samples out
-    /// of the edge's `avg2` and `avg3` rows, which are computed a vector at a
-    /// time.
+    /// The 16 bytes of a whole 4x4 subblock in one vector. A subblock is too
+    /// small for 32-bit lanes to pay, so its kernel works on bytes instead.
+    pub(super) trait Bytes16: Copy {
+        unsafe fn load(src: &[u8; 16]) -> Self;
+        unsafe fn store(self, dst: &mut [u8; 16]);
+        /// `(x + y + 1) >> 1` per byte.
+        unsafe fn avg2(x: Self, y: Self) -> Self;
+        /// `(x + 2 * y + z + 2) >> 2` per byte, which is exactly the rounded
+        /// average of `y` and the truncated average of `x` and `z`.
+        unsafe fn avg3(x: Self, y: Self, z: Self) -> Self;
+        /// Byte `i` of the result is byte `SUBBLOCK_SOURCES[mode][i]` of
+        /// `rows` laid end to end.
+        unsafe fn lookup(rows: [Self; 3], mode: usize) -> Self;
+        /// TM prediction: `clamp255(left[r] + above[1 + c] - above[0])`.
+        unsafe fn tm(above: &[u8; 9], left: &[u8; 4]) -> Self;
+    }
+
+    /// [`crate::vp8::predict::predict_subblock_scalar`].
     #[inline(always)]
-    pub(super) unsafe fn subblock<V: I32x>(
+    pub(super) unsafe fn subblock<B: Bytes16>(
         mode: u8,
         above: &[u8; 9],
         left: &[u8; 4],
@@ -367,58 +382,171 @@ mod kernels {
                         .sum();
                     block = [((sum + 4) >> 3) as u8; 16];
                 }
-                B_TM_PRED => {
-                    let mut lefts = [0i32; 16];
-                    let mut tops = [0i32; 16];
-                    for index in 0..16 {
-                        lefts[index] = i32::from(left[index >> 2]);
-                        tops[index] = i32::from(above[1 + (index & 3)]);
-                    }
-                    let corner = V::splat(i32::from(above[0]));
-                    let mut index = 0;
-                    while index < 16 {
-                        V::load(&lefts[index..])
-                            .add(V::load(&tops[index..]))
-                            .sub(corner)
-                            .store_u8_clamped(&mut block[index..]);
-                        index += V::LANES;
-                    }
-                }
+                B_TM_PRED => B::tm(above, left).store(&mut block),
                 B_VE_PRED | B_HE_PRED | B_LD_PRED | B_RD_PRED | B_VR_PRED | B_VL_PRED
                 | B_HD_PRED | B_HU_PRED => {
-                    let mut edge = [i32::from(above[8]); 24];
-                    edge[0] = i32::from(left[3]);
-                    for (index, &value) in left.iter().rev().enumerate() {
-                        edge[1 + index] = i32::from(value);
-                    }
-                    for (index, &value) in above.iter().enumerate() {
-                        edge[5 + index] = i32::from(value);
-                    }
-                    // `A3`, `A2` and then the edge itself, as `SUBBLOCK_SOURCES`
-                    // indexes them.
-                    let mut table = [0i32; 48];
-                    let mut index = 0;
-                    while index < 16 {
-                        let x = V::load(&edge[index..]);
-                        let y = V::load(&edge[index + 1..]);
-                        let z = V::load(&edge[index + 2..]);
-                        let avg3 = x.add(y).add(y).add(z).add(V::splat(2)).sra::<2>();
-                        let avg2 = x.add(y).add(V::splat(1)).sra::<1>();
-                        avg3.store(&mut table[index..]);
-                        avg2.store(&mut table[16 + index..]);
-                        index += V::LANES;
-                    }
-                    table[32..48].copy_from_slice(&edge[..16]);
-                    let sources = &SUBBLOCK_SOURCES[usize::from(mode - B_VE_PRED)];
-                    for (sample, &source) in block.iter_mut().zip(sources) {
-                        *sample = table[usize::from(source)] as u8;
-                    }
+                    let mut edge = [above[8]; 18];
+                    edge[0] = left[3];
+                    edge[1] = left[3];
+                    edge[2] = left[2];
+                    edge[3] = left[1];
+                    edge[4] = left[0];
+                    edge[5..14].copy_from_slice(above);
+                    let x = B::load(edge[0..16].try_into().unwrap());
+                    let y = B::load(edge[1..17].try_into().unwrap());
+                    let z = B::load(edge[2..18].try_into().unwrap());
+                    let rows = [B::avg3(x, y, z), B::avg2(x, y), x];
+                    B::lookup(rows, usize::from(mode - B_VE_PRED)).store(&mut block);
                 }
                 _ => unreachable!("subblock intra modes are 0..=9"),
             }
         }
         for (row, line) in block.chunks_exact(4).enumerate() {
             plane[offset + row * stride..offset + row * stride + 4].copy_from_slice(line);
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub(super) use x86_bytes::X86Bytes;
+
+    #[cfg(target_arch = "x86_64")]
+    mod x86_bytes {
+        use super::{Bytes16, SUBBLOCK_SOURCES};
+        use core::arch::x86_64::*;
+
+        /// `pshufb` masks taking each mode's samples out of each of the three
+        /// rows, `0x80` (zero) where a sample comes from another row.
+        const SHUFFLES: [[[u8; 16]; 3]; 8] = {
+            let mut masks = [[[0x80u8; 16]; 3]; 8];
+            let mut mode = 0;
+            while mode < 8 {
+                let mut index = 0;
+                while index < 16 {
+                    let source = SUBBLOCK_SOURCES[mode][index];
+                    masks[mode][(source / 16) as usize][index] = source % 16;
+                    index += 1;
+                }
+                mode += 1;
+            }
+            masks
+        };
+
+        #[derive(Clone, Copy)]
+        pub(crate) struct X86Bytes(__m128i);
+
+        impl Bytes16 for X86Bytes {
+            #[inline(always)]
+            unsafe fn load(src: &[u8; 16]) -> Self {
+                unsafe { Self(_mm_loadu_si128(src.as_ptr().cast())) }
+            }
+            #[inline(always)]
+            unsafe fn store(self, dst: &mut [u8; 16]) {
+                unsafe { _mm_storeu_si128(dst.as_mut_ptr().cast(), self.0) }
+            }
+            #[inline(always)]
+            unsafe fn avg2(x: Self, y: Self) -> Self {
+                unsafe { Self(_mm_avg_epu8(x.0, y.0)) }
+            }
+            #[inline(always)]
+            unsafe fn avg3(x: Self, y: Self, z: Self) -> Self {
+                unsafe {
+                    // `pavgb` rounds up; taking the odd bit back off makes it
+                    // the truncated average.
+                    let odd = _mm_and_si128(_mm_xor_si128(x.0, z.0), _mm_set1_epi8(1));
+                    let floor = _mm_sub_epi8(_mm_avg_epu8(x.0, z.0), odd);
+                    Self(_mm_avg_epu8(floor, y.0))
+                }
+            }
+            #[inline(always)]
+            unsafe fn lookup(rows: [Self; 3], mode: usize) -> Self {
+                unsafe {
+                    let mut picked = _mm_setzero_si128();
+                    for (row, mask) in rows.iter().zip(&SHUFFLES[mode]) {
+                        let mask = _mm_loadu_si128(mask.as_ptr().cast());
+                        picked = _mm_or_si128(picked, _mm_shuffle_epi8(row.0, mask));
+                    }
+                    Self(picked)
+                }
+            }
+            #[inline(always)]
+            unsafe fn tm(above: &[u8; 9], left: &[u8; 4]) -> Self {
+                let top = |column: usize| i16::from(above[1 + column]);
+                let side = |row: usize| i16::from(left[row]);
+                unsafe {
+                    let tops = _mm_setr_epi16(
+                        top(0),
+                        top(1),
+                        top(2),
+                        top(3),
+                        top(0),
+                        top(1),
+                        top(2),
+                        top(3),
+                    );
+                    let base = _mm_sub_epi16(tops, _mm_set1_epi16(i16::from(above[0])));
+                    let (l0, l1, l2, l3) = (side(0), side(1), side(2), side(3));
+                    let rows01 =
+                        _mm_add_epi16(base, _mm_setr_epi16(l0, l0, l0, l0, l1, l1, l1, l1));
+                    let rows23 =
+                        _mm_add_epi16(base, _mm_setr_epi16(l2, l2, l2, l2, l3, l3, l3, l3));
+                    Self(_mm_packus_epi16(rows01, rows23))
+                }
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub(super) use arm_bytes::NeonBytes;
+
+    #[cfg(target_arch = "aarch64")]
+    mod arm_bytes {
+        use super::{Bytes16, SUBBLOCK_SOURCES};
+        use core::arch::aarch64::*;
+
+        #[derive(Clone, Copy)]
+        pub(crate) struct NeonBytes(uint8x16_t);
+
+        impl Bytes16 for NeonBytes {
+            #[inline(always)]
+            unsafe fn load(src: &[u8; 16]) -> Self {
+                unsafe { Self(vld1q_u8(src.as_ptr())) }
+            }
+            #[inline(always)]
+            unsafe fn store(self, dst: &mut [u8; 16]) {
+                unsafe { vst1q_u8(dst.as_mut_ptr(), self.0) }
+            }
+            #[inline(always)]
+            unsafe fn avg2(x: Self, y: Self) -> Self {
+                unsafe { Self(vrhaddq_u8(x.0, y.0)) }
+            }
+            #[inline(always)]
+            unsafe fn avg3(x: Self, y: Self, z: Self) -> Self {
+                unsafe { Self(vrhaddq_u8(vhaddq_u8(x.0, z.0), y.0)) }
+            }
+            #[inline(always)]
+            unsafe fn lookup(rows: [Self; 3], mode: usize) -> Self {
+                unsafe {
+                    let table = uint8x16x3_t(rows[0].0, rows[1].0, rows[2].0);
+                    Self(vqtbl3q_u8(table, vld1q_u8(SUBBLOCK_SOURCES[mode].as_ptr())))
+                }
+            }
+            #[inline(always)]
+            unsafe fn tm(above: &[u8; 9], left: &[u8; 4]) -> Self {
+                let tops = [
+                    above[1], above[2], above[3], above[4], above[1], above[2], above[3], above[4],
+                ];
+                let sides: [[i16; 8]; 2] = [0, 2].map(|first| {
+                    let (a, b) = (i16::from(left[first]), i16::from(left[first + 1]));
+                    [a, a, a, a, b, b, b, b]
+                });
+                unsafe {
+                    let tops = vreinterpretq_s16_u16(vmovl_u8(vld1_u8(tops.as_ptr())));
+                    let base = vsubq_s16(tops, vdupq_n_s16(i16::from(above[0])));
+                    let low = vqmovun_s16(vaddq_s16(base, vld1q_s16(sides[0].as_ptr())));
+                    let high = vqmovun_s16(vaddq_s16(base, vld1q_s16(sides[1].as_ptr())));
+                    Self(vcombine_u8(low, high))
+                }
+            }
         }
     }
 
@@ -628,12 +756,28 @@ macro_rules! entry_points {
             $($arg:ident : $ty:ty),* $(,)?
         ) $(-> $ret:ty)? = $kernel:ident, avx2 = $avx_vector:ident;
     ) => {
+        entry_points! {
+            $(#[$meta])*
+            fn [$sse_name, $avx_name, $neon_name]($($arg: $ty),*) $(-> $ret)?
+                = $kernel::<
+                    crate::av1_simd::vector::Sse4,
+                    crate::av1_simd::vector::$avx_vector,
+                    crate::av1_simd::vector::Neon,
+                >;
+        }
+    };
+    (
+        $(#[$meta:meta])*
+        fn [$sse_name:ident, $avx_name:ident, $neon_name:ident](
+            $($arg:ident : $ty:ty),* $(,)?
+        ) $(-> $ret:ty)? = $kernel:ident::<$sse:ty, $avx:ty, $neon:ty $(,)?>;
+    ) => {
         #[cfg(target_arch = "x86_64")]
         #[target_feature(enable = "sse4.1")]
         #[inline(never)]
         $(#[$meta])*
         unsafe fn $sse_name($($arg: $ty),*) $(-> $ret)? {
-            unsafe { kernels::$kernel::<crate::av1_simd::vector::Sse4>($($arg),*) }
+            unsafe { kernels::$kernel::<$sse>($($arg),*) }
         }
 
         #[cfg(target_arch = "x86_64")]
@@ -641,7 +785,7 @@ macro_rules! entry_points {
         #[inline(never)]
         $(#[$meta])*
         unsafe fn $avx_name($($arg: $ty),*) $(-> $ret)? {
-            unsafe { kernels::$kernel::<crate::av1_simd::vector::$avx_vector>($($arg),*) }
+            unsafe { kernels::$kernel::<$avx>($($arg),*) }
         }
 
         #[cfg(target_arch = "aarch64")]
@@ -649,7 +793,7 @@ macro_rules! entry_points {
         #[inline(never)]
         $(#[$meta])*
         unsafe fn $neon_name($($arg: $ty),*) $(-> $ret)? {
-            unsafe { kernels::$kernel::<crate::av1_simd::vector::Neon>($($arg),*) }
+            unsafe { kernels::$kernel::<$neon>($($arg),*) }
         }
     };
 }
@@ -693,7 +837,7 @@ entry_points! {
 entry_points! {
     fn [subblock_sse41, subblock_avx2, subblock_neon](
         mode: u8, above: &[u8; 9], left: &[u8; 4], plane: &mut [u8], offset: usize, stride: usize,
-    ) = subblock, avx2 = Avx2;
+    ) = subblock::<kernels::X86Bytes, kernels::X86Bytes, kernels::NeonBytes>;
 }
 entry_points! {
     fn [horizontal_edge_sse41, horizontal_edge_avx2, horizontal_edge_neon](
