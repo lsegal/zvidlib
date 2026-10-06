@@ -913,38 +913,52 @@ impl<'a> FrameEncoder<'a> {
         // the best of an exhaustive search of the four samples around zero and
         // the sample around each candidate.
         let range = 64 * 8;
-        let mut best_mv = Mv::default();
-        let mut best_sad = self.luma_sad(reference, mi_row, mi_col, best_mv, u32::MAX);
-        let mut whole = |center: Mv, radius: i32| {
+        // The best vector so far and its luma SAD.
+        let mut best = (Mv::default(), u32::MAX);
+        let consider = |best: &mut (Mv, u32), candidate: Mv| -> bool {
+            if candidate.row.abs() > range || candidate.col.abs() > range {
+                return false;
+            }
+            let sad = self.luma_sad(reference, mi_row, mi_col, candidate, best.1);
+            if sad < best.1 {
+                *best = (candidate, sad);
+                true
+            } else {
+                false
+            }
+        };
+        // Zero and the candidates themselves come first, so that in flat
+        // areas, where many vectors tie, the block keeps one that is cheap to
+        // code.
+        for (center, radius) in [
+            (Mv::default(), 0),
+            (nearest, 0),
+            (near, 0),
+            (nearest, 1),
+            (near, 1),
+            (Mv::default(), 4),
+        ] {
             let center = Mv {
                 row: center.row / 8 * 8,
                 col: center.col / 8 * 8,
             };
             for row in -radius..=radius {
                 for col in -radius..=radius {
-                    let candidate = Mv {
-                        row: center.row + row * 8,
-                        col: center.col + col * 8,
-                    };
-                    if candidate.row.abs() > range || candidate.col.abs() > range {
-                        continue;
-                    }
-                    let sad = self.luma_sad(reference, mi_row, mi_col, candidate, best_sad);
-                    if sad < best_sad {
-                        best_sad = sad;
-                        best_mv = candidate;
-                    }
+                    consider(
+                        &mut best,
+                        Mv {
+                            row: center.row + row * 8,
+                            col: center.col + col * 8,
+                        },
+                    );
                 }
             }
-        };
-        whole(nearest, 1);
-        whole(near, 1);
-        whole(Mv::default(), 4);
+        }
         for step in [8, 4, 2, 1] {
             let delta = step * 8;
             for _ in 0..16 {
+                let center = best.0;
                 let mut improved = false;
-                let center = best_mv;
                 for (row, col) in [
                     (-1, 0),
                     (1, 0),
@@ -955,19 +969,13 @@ impl<'a> FrameEncoder<'a> {
                     (1, -1),
                     (1, 1),
                 ] {
-                    let candidate = Mv {
-                        row: center.row + row * delta,
-                        col: center.col + col * delta,
-                    };
-                    if candidate.row.abs() > range || candidate.col.abs() > range {
-                        continue;
-                    }
-                    let sad = self.luma_sad(reference, mi_row, mi_col, candidate, best_sad);
-                    if sad < best_sad {
-                        best_sad = sad;
-                        best_mv = candidate;
-                        improved = true;
-                    }
+                    improved |= consider(
+                        &mut best,
+                        Mv {
+                            row: center.row + row * delta,
+                            col: center.col + col * delta,
+                        },
+                    );
                 }
                 if !improved {
                     break;
@@ -975,12 +983,13 @@ impl<'a> FrameEncoder<'a> {
             }
         }
 
-        // Sub-sample refinement around the whole-sample vector and the
-        // candidates, measured on the 8-tap prediction itself and including
-        // the rate of coding it: half, then quarter, then eighth samples.
+        // Sub-sample refinement around the whole-sample vector, measured on
+        // the 8-tap prediction itself and including the rate of coding it:
+        // half, then quarter, then eighth samples.
         let usehp = self.allow_high_precision_mv && use_mv_hp(nearest);
         let bits_for = |mv: Mv| motion_bits(mv, candidates, mode_context, usehp);
-        let whole_mv = best_mv;
+        let whole_mv = best.0;
+        let mut best_mv = whole_mv;
         if self.subpel_step < 8 {
             let finest = if usehp {
                 self.subpel_step
@@ -997,14 +1006,6 @@ impl<'a> FrameEncoder<'a> {
                 })
             };
             let mut best_cost = cost(best_mv).unwrap_or(f64::INFINITY);
-            for candidate in [nearest, near, Mv::default()] {
-                if let Some(candidate_cost) = cost(candidate)
-                    && candidate_cost < best_cost
-                {
-                    best_cost = candidate_cost;
-                    best_mv = candidate;
-                }
-            }
             let mut step = 4;
             while step >= finest {
                 let center = best_mv;
@@ -1038,8 +1039,11 @@ impl<'a> FrameEncoder<'a> {
 
         // Prediction error is only a proxy for what the residual costs to
         // code, so the refined vector has to beat the whole-sample one on the
-        // coded rate and distortion.
-        let mut choice = self.code_inter(
+        // coded rate and distortion. It must not code worse, either: where
+        // the motion is whole samples, a fractional vector only fits the
+        // reference's quantization noise, and trading distortion for its rate
+        // loses quality.
+        let (mut choice, whole_error) = self.code_inter(
             reference,
             mi_row,
             mi_col,
@@ -1049,7 +1053,7 @@ impl<'a> FrameEncoder<'a> {
             usehp,
         );
         if best_mv != whole_mv {
-            let refined = self.code_inter(
+            let (refined, refined_error) = self.code_inter(
                 reference,
                 mi_row,
                 mi_col,
@@ -1058,14 +1062,15 @@ impl<'a> FrameEncoder<'a> {
                 mode_context,
                 usehp,
             );
-            if refined.cost < choice.cost {
+            if refined.cost < choice.cost && refined_error <= whole_error {
                 choice = refined;
             }
         }
         Some(choice)
     }
 
-    /// Predicts the block with `mv` and codes its residual.
+    /// Predicts the block with `mv` and codes its residual; returns the
+    /// choice and its squared error.
     #[allow(clippy::too_many_arguments)]
     fn code_inter(
         &mut self,
@@ -1076,7 +1081,7 @@ impl<'a> FrameEncoder<'a> {
         candidates: [Mv; 2],
         mode_context: usize,
         usehp: bool,
-    ) -> BlockChoice {
+    ) -> (BlockChoice, u64) {
         let [nearest, near] = candidates;
         let mode = inter_mode(mv, nearest, near);
         let mut bits = motion_bits(mv, candidates, mode_context, usehp)
@@ -1142,7 +1147,7 @@ impl<'a> FrameEncoder<'a> {
                     .copy_from_slice(&self.recon.planes[plane][start..start + 4]);
             }
         }
-        BlockChoice {
+        let choice = BlockChoice {
             info: ModeInfo {
                 is_inter: true,
                 mode,
@@ -1156,7 +1161,8 @@ impl<'a> FrameEncoder<'a> {
             luma,
             chroma,
             cost: error as f64 + self.lambda * bits,
-        }
+        };
+        (choice, error)
     }
 
     fn write_mode_info(&mut self, mi_row: usize, mi_col: usize, choice: &BlockChoice) {

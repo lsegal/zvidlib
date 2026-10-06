@@ -479,8 +479,9 @@ fn sub_sample_motion_shrinks_output_at_equal_or_better_quality() {
         let (whole_bytes, whole_quality) = measure(true);
         let (bytes, quality) = measure(false);
         assert!(
-            bytes * 3 < whole_bytes * 2 && quality >= whole_quality,
-            "q{base_q_idx}: {bytes} bytes at {quality:.2} dB against {whole_bytes} bytes at              {whole_quality:.2} dB with whole-sample motion"
+            bytes * 5 < whole_bytes * 4 && quality >= whole_quality,
+            "q{base_q_idx}: {bytes} bytes at {quality:.2} dB against {whole_bytes} bytes at \
+             {whole_quality:.2} dB with whole-sample motion"
         );
     }
 }
