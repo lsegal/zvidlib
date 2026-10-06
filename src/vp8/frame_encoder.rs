@@ -394,14 +394,13 @@ impl FrameEncoder {
                 );
             }
         }
-        for plane in 1..3 {
-            let stride = frame.planes[plane].width;
+        for (plane, (source, prediction)) in source.iter().zip(&frame.planes).enumerate().skip(1) {
+            let stride = prediction.width;
             let origin = mb_y * 8 * stride + mb_x * 8;
             for block in 0..4 {
                 let offset = origin + (block >> 1) * 4 * stride + (block & 1) * 4;
                 let index = 16 + (plane - 1) * 4 + block;
-                let coefficients =
-                    forward_dct(&residual(&source[plane], &frame.planes[plane], offset));
+                let coefficients = forward_dct(&residual(source, prediction, offset));
                 (macroblock.levels[index], dequantized[index]) =
                     quantize(&coefficients, quantizer.uv, 0);
             }

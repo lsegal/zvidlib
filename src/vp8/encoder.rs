@@ -611,7 +611,7 @@ pub(super) mod tests {
             let average = bits as f64 / 2.0;
             let ratio = average / f64::from(bits_per_second);
             assert!(
-                (0.6..1.4).contains(&ratio),
+                (0.85..1.15).contains(&ratio),
                 "{bits_per_second} b/s target gave {average} b/s"
             );
         }

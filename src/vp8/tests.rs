@@ -431,7 +431,8 @@ fn skips_a_webm_vp8_tracks_hidden_alternate_references_as_libvpx_does() {
 
 /// Issue #530: libvpx decodes the native encoder's output, written as WebM,
 /// to exactly the pictures zvidlib's decoder does, and ffmpeg reads the WebM
-/// as seekable VP8. Skips where ffmpeg, or its libvpx decoder, is missing.
+/// as seekable VP8. Skips where ffmpeg, or its libvpx decoder, is missing,
+/// unless `ZVIDLIB_REQUIRE_LIBVPX` is set.
 #[test]
 fn libvpx_decodes_the_encoders_webm_exactly() {
     use super::encoder::tests::{configuration, encode, test_frame};
@@ -450,6 +451,12 @@ fn libvpx_decodes_the_encoders_webm_exactly() {
                 .any(|line| line.split_whitespace().nth(1) == Some("libvpx"))
         });
     if !libvpx {
+        // CI installs ffmpeg for this test and sets the variable, so there
+        // a missing decoder fails rather than passing unchecked.
+        assert!(
+            std::env::var_os("ZVIDLIB_REQUIRE_LIBVPX").is_none(),
+            "ffmpeg with the libvpx VP8 decoder is required"
+        );
         eprintln!("skipping: ffmpeg with the libvpx VP8 decoder is unavailable");
         return;
     }
