@@ -67,7 +67,7 @@ fn encode_samples() -> (Mp4TrackConfig, Vec<EncodedSample>) {
         coded_dimensions: dimensions,
         input_format: PixelFormat::Rgba8,
         color_range: ColorRange::Limited,
-        hardware: HardwarePreference::Prefer,
+        hardware: HardwarePreference::Avoid,
         timescale: 30,
         frame_duration: 1,
         configuration: vec![60, 0, 5],
