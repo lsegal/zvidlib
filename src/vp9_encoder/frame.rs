@@ -317,57 +317,56 @@ impl<'a> FrameEncoder<'a> {
     /// Chooses the loop filter level whose output is closest to the source
     /// and filters the reconstruction with it, as the decoder will.
     ///
-    /// The level costs no bits, so this is libvpx's `search_filter_level`
-    /// without its rate bias: start from the level libvpx's `LPF_PICK_FROM_Q`
-    /// guesses for the quantizer, then step towards lower error, halving the
-    /// step each time neither neighbour improves.
+    /// This is libvpx's `search_filter_level`: start from the level libvpx's
+    /// `LPF_PICK_FROM_Q` guesses for the quantizer, then step towards lower
+    /// error, halving the step each time neither neighbour improves. Like
+    /// libvpx it biases the search towards lower levels, because a level
+    /// that only just lowers this frame's error over-smooths the reference
+    /// later frames predict from and makes them cost more.
     fn apply_loop_filter(&mut self) {
         let mut guess = (i64::from(self.ac_q) * 20_723 + 1_015_158 + (1 << 17)) >> 18;
         if self.is_key() {
             guess -= 4;
         }
-        let mut tried = [false; 64];
-        // The best level so far, its error and its filtered picture.
-        let mut best: Option<(u8, u64, Picture)> = None;
-        let mut try_level = |level: u8, best: &mut Option<(u8, u64, Picture)>| {
-            if std::mem::replace(&mut tried[usize::from(level)], true) {
-                return;
-            }
-            let picture = self.filtered(level);
-            let error = self.source_error(&picture);
-            if best
-                .as_ref()
-                .is_none_or(|&(_, best_error, _)| error < best_error)
-            {
-                *best = Some((level, error, picture));
-            }
+        let mut errors = [None; 64];
+        let mut error = |level: u8| {
+            *errors[usize::from(level)]
+                .get_or_insert_with(|| self.source_error(&self.filtered(level)))
         };
 
         let mut middle = guess.clamp(0, 63) as u8;
-        try_level(0, &mut best);
-        try_level(middle, &mut best);
+        let mut best = middle;
+        let mut best_error = error(middle);
         let mut step = if middle < 16 { 4 } else { middle / 4 };
         let mut direction = 0_i8;
         while step > 0 {
-            if direction <= 0 {
-                try_level(middle.saturating_sub(step), &mut best);
+            let low = middle.saturating_sub(step);
+            let high = (middle + step).min(63);
+            let bias = (best_error >> (15 - middle / 8)) * u64::from(step);
+            if direction <= 0 && low != middle {
+                let low_error = error(low);
+                if low_error.saturating_sub(bias) < best_error {
+                    best_error = best_error.min(low_error);
+                    best = low;
+                }
             }
-            if direction >= 0 {
-                try_level((middle + step).min(63), &mut best);
+            if direction >= 0 && high != middle {
+                let high_error = error(high);
+                if high_error < best_error.saturating_sub(bias) {
+                    best_error = high_error;
+                    best = high;
+                }
             }
-            let level = best.as_ref().map_or(0, |&(level, _, _)| level);
-            if level == middle {
+            if best == middle {
                 step /= 2;
                 direction = 0;
             } else {
-                direction = if level < middle { -1 } else { 1 };
-                middle = level;
+                direction = if best < middle { -1 } else { 1 };
+                middle = best;
             }
         }
-        if let Some((level, _, picture)) = best {
-            self.filter_level = level;
-            self.recon = picture;
-        }
+        self.filter_level = best;
+        self.recon = self.filtered(best);
     }
 
     /// The reconstruction after the loop filter at `level`.
@@ -399,26 +398,37 @@ impl<'a> FrameEncoder<'a> {
                 );
             }
         }
-        let strides = picture.strides;
-        let [y, u, v] = &mut picture.planes;
-        let mut planes = [
-            FilterPlane {
-                data: y,
-                stride: strides[0],
-                origin: 0,
-            },
-            FilterPlane {
-                data: u,
-                stride: strides[1],
-                origin: 0,
-            },
-            FilterPlane {
-                data: v,
-                stride: strides[2],
-                origin: 0,
-            },
-        ];
+        // The filter works a superblock at a time and may touch samples past
+        // the decoded area, so it runs on copies laid out as the decoder's
+        // planes are: whole superblocks with an 8-sample border.
+        const BORDER: usize = 8;
+        let mut padded = [0, 1, 2].map(|plane| {
+            let superblock = if plane == 0 { 64 } else { 32 };
+            let stride = picture.strides[plane];
+            let rows = picture.planes[plane].len() / stride;
+            let padded_stride = stride.div_ceil(superblock) * superblock + 2 * BORDER;
+            let padded_rows = rows.div_ceil(superblock) * superblock + 2 * BORDER;
+            let mut data = vec![0; padded_stride * padded_rows];
+            for row in 0..rows {
+                let start = (row + BORDER) * padded_stride + BORDER;
+                data[start..start + stride]
+                    .copy_from_slice(&picture.planes[plane][row * stride..(row + 1) * stride]);
+            }
+            (data, padded_stride)
+        });
+        let mut planes = padded.each_mut().map(|(data, stride)| FilterPlane {
+            data,
+            stride: *stride,
+            origin: BORDER * *stride + BORDER,
+        });
         loopfilter::filter_frame(&mut planes, &mut masks, mi_rows, mi_cols, 0);
+        for (plane, (data, padded_stride)) in padded.iter().enumerate() {
+            let stride = picture.strides[plane];
+            for (row, output) in picture.planes[plane].chunks_exact_mut(stride).enumerate() {
+                let start = (row + BORDER) * padded_stride + BORDER;
+                output.copy_from_slice(&data[start..start + stride]);
+            }
+        }
         picture
     }
 
