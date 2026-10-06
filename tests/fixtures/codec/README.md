@@ -237,3 +237,20 @@ libvpx's digest; `tests/vp8_conformance.rs` checks that every frame comes
 back identically through `ExactFrameReader` in sequential, reverse and
 alternating order. They are distributed under the libvpx license; see
 `THIRD_PARTY_NOTICES.md`.
+
+`vp8/vp8_testsrc2_98x66.webm` is a 30-frame VP8 WebM track with a key frame
+every 12 frames and a size that is not a whole number of macroblocks, and
+`vp8_testsrc2_98x66.webm.md5` is libvpx's decode of it, one MD5 of each
+frame's I420 output per line. They were generated offline with
+
+```sh
+ffmpeg -f lavfi -i "testsrc2=size=98x66:rate=25" -t 1.2 -c:v libvpx -g 12 \
+  -auto-alt-ref 0 -b:v 300k -deadline good vp8_testsrc2_98x66.webm
+ffmpeg -c:v libvpx -i vp8_testsrc2_98x66.webm -f framemd5 - | grep -v '^#' \
+  | awk -F', *' '{print $6}' > vp8_testsrc2_98x66.webm.md5
+```
+
+`src/vp8/tests.rs` demuxes it with `WebmDemuxer` and compares every frame with
+libvpx's digest, and `tests/vp8_conformance.rs` reads it back through
+`ExactFrameReader` in sequential, reverse and alternating order. As above,
+FFmpeg is only the offline fixture generator.

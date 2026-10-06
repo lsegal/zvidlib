@@ -177,3 +177,40 @@ fn truncated_and_oversized_frames_are_errors_not_panics() {
     let error = Decoder::new(limits).decode(key_frame).unwrap_err();
     assert_eq!(error.kind(), crate::ErrorKind::ResourceLimit);
 }
+
+fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
+    use std::task::{Context, Poll, Waker};
+    let mut context = Context::from_waker(Waker::noop());
+    let mut future = Box::pin(future);
+    loop {
+        if let Poll::Ready(value) = future.as_mut().poll(&mut context) {
+            return value;
+        }
+    }
+}
+
+#[test]
+fn decodes_a_webm_vp8_track_exactly_as_libvpx_does() {
+    // FFmpeg's libvpx encode of `testsrc2`, with libvpx's decode of each
+    // frame as an MD5; see `tests/fixtures/codec/README.md`.
+    let source = crate::io::MemorySource::new(
+        include_bytes!("../../tests/fixtures/codec/vp8/vp8_testsrc2_98x66.webm").to_vec(),
+    );
+    let expected: Vec<&str> =
+        include_str!("../../tests/fixtures/codec/vp8/vp8_testsrc2_98x66.webm.md5")
+            .lines()
+            .collect();
+    let demuxer = block_on(crate::WebmDemuxer::open(&source, Default::default())).unwrap();
+    let track = &demuxer.tracks[0];
+    assert_eq!(track.codec, crate::Codec::Vp8);
+    assert!(track.decoder_config.is_empty());
+    let samples = block_on(track.to_encoded_video_samples(&source, &Limits::default())).unwrap();
+    assert_eq!(samples.len(), expected.len());
+    let mut decoder = Decoder::new(Limits::default());
+    for (index, sample) in samples.iter().enumerate() {
+        assert_eq!(sample.presentation_index.0, index as u64);
+        let picture = decoder.decode(&sample.data).unwrap().unwrap();
+        assert_eq!((picture.width, picture.height), (98, 66));
+        assert_eq!(i420_md5(&picture), expected[index], "frame {index}");
+    }
+}

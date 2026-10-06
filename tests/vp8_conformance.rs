@@ -12,7 +12,7 @@ use zvidlib::{
     CancellationToken, Codec, CodecImplementation, CodecProfile, CodecSupport, ColorRange,
     EncodedVideoSample, ErrorKind, ExactFrameReader, ExpectedVideoFrame, FrameDigest, FrameIndex,
     HardwarePreference, Limits, PixelFormat, VideoDecoderConfig, VideoDecoderConformanceVector,
-    VideoDecoderFactory, VideoDimensions, native_vp8_video_decoder_factory,
+    VideoDecoderFactory, VideoDimensions, WebmDemuxer, native_vp8_video_decoder_factory,
     verify_video_decoder_conformance,
 };
 
@@ -146,6 +146,56 @@ fn native_vp8_decoder_conforms_for_sequential_reverse_and_alternating_seeks() {
         assert_eq!(report.access_patterns_verified, 3, "{name}");
         assert_eq!(report.frames_verified, 3 * frames.len() as u64, "{name}");
     }
+}
+
+fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
+    use std::task::{Context, Poll, Waker};
+    let mut context = Context::from_waker(Waker::noop());
+    let mut future = Box::pin(future);
+    loop {
+        if let Poll::Ready(value) = future.as_mut().poll(&mut context) {
+            return value;
+        }
+    }
+}
+
+#[test]
+fn a_webm_vp8_track_returns_every_frame_exactly() {
+    let source = zvidlib::io::MemorySource::new(
+        include_bytes!("fixtures/codec/vp8/vp8_testsrc2_98x66.webm").to_vec(),
+    );
+    let limits = Limits::default();
+    let demuxer = block_on(WebmDemuxer::open(&source, Default::default())).unwrap();
+    let track = &demuxer.tracks[0];
+    assert_eq!(track.codec, Codec::Vp8);
+    let dimensions = track.dimensions.unwrap();
+    assert_eq!((dimensions.width, dimensions.height), (98, 66));
+    let samples = block_on(track.to_encoded_video_samples(&source, &limits)).unwrap();
+    assert_eq!(
+        samples.iter().filter(|sample| sample.random_access).count(),
+        3
+    );
+    let factory = native_vp8_video_decoder_factory();
+    let configuration = VideoDecoderConfig {
+        configuration: track.decoder_config.clone(),
+        ..configuration(dimensions)
+    };
+    let expected = sequential_digests(&factory, &configuration, &samples);
+    let vector = VideoDecoderConformanceVector {
+        name: "VP8 in WebM".into(),
+        configuration,
+        expected_frames: expected
+            .iter()
+            .enumerate()
+            .map(|(index, &digest)| ExpectedVideoFrame {
+                presentation_index: FrameIndex(index as u64),
+                digest,
+            })
+            .collect(),
+        samples,
+    };
+    let report = verify_video_decoder_conformance(&factory, &vector, limits).unwrap();
+    assert_eq!(report.frames_verified, 3 * 30);
 }
 
 #[test]
