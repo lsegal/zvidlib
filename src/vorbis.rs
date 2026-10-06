@@ -12,6 +12,7 @@
 //! zvidlib builds for, `wasm32` included.
 
 use crate::codec::parse_audio_bit_rate;
+use crate::vorbis_decoder::VorbisDecoder;
 use crate::vorbis_encoder::{VorbisEncoder, quality_for_nominal_bitrate};
 use crate::{
     AudioBuffer, AudioDecoder, AudioDrain, AudioEncoder, AudioEncoderConfig, AudioEncoderFactory,
@@ -440,14 +441,15 @@ impl<'a> BitReader<'a> {
     }
 }
 
-/// A native, pure-Rust Vorbis decoder for mono and stereo streams, producing
-/// interleaved `f32` PCM.
+/// A native, pure-Rust Vorbis decoder for streams of one to eight channels,
+/// producing interleaved `f32` PCM in the Vorbis channel order (Vorbis I
+/// section 4.3.9).
 ///
 /// A packet decoded straight after [`AudioDecoder::reset`] has no previous
 /// block to overlap and decodes to silence; [`VORBIS_PREROLL_PACKETS`] is the
 /// preroll that keeps an [`crate::AudioSampleReader`] from returning it.
 pub struct NativeVorbisDecoder {
-    decoder: symphonia_codec_vorbis::VorbisDecoder,
+    decoder: VorbisDecoder,
     channels: u16,
     sample_rate: u32,
     /// Whether nothing has been decoded since the decoder was created or reset.
@@ -464,14 +466,6 @@ impl NativeVorbisDecoder {
                 "Vorbis channel count or sample rate is outside configured limits",
             ));
         }
-        // Symphonia's Vorbis decoder, which this wraps, decodes some streams of
-        // more than two channels wrongly where FFmpeg's and libvorbis's agree,
-        // so those are refused rather than decoded to the wrong audio.
-        if channels > 2 {
-            return Err(unsupported(
-                "the native Vorbis decoder supports mono and stereo streams",
-            ));
-        }
         let mut extra_data = config.identification_header.clone();
         extra_data.extend_from_slice(&config.setup_header);
         let mut parameters = CodecParameters::new();
@@ -479,10 +473,9 @@ impl NativeVorbisDecoder {
             .for_codec(CODEC_TYPE_VORBIS)
             .with_extra_data(extra_data.into_boxed_slice());
         let decoder =
-            symphonia_codec_vorbis::VorbisDecoder::try_new(&parameters, &DecoderOptions::default())
-                .map_err(|error| {
-                    unsupported(format!("Vorbis configuration is unsupported: {error}"))
-                })?;
+            VorbisDecoder::try_new(&parameters, &DecoderOptions::default()).map_err(|error| {
+                unsupported(format!("Vorbis configuration is unsupported: {error}"))
+            })?;
         Ok(Self {
             decoder,
             channels,

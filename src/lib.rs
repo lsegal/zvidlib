@@ -37,6 +37,7 @@ pub mod simd;
 pub mod timeline;
 pub mod transfer;
 pub mod vorbis;
+mod vorbis_decoder;
 mod vorbis_encoder;
 pub mod webm;
 pub mod webm_demux;
