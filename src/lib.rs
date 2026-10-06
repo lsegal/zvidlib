@@ -39,6 +39,7 @@ pub mod transfer;
 pub mod vorbis;
 mod vorbis_decoder;
 mod vorbis_encoder;
+mod vp9_encoder;
 pub mod webm;
 pub mod webm_demux;
 
@@ -217,6 +218,7 @@ pub use transfer::{
 pub use vorbis::{
     NativeVorbisDecoder, VORBIS_PREROLL_PACKETS, VorbisConfig, native_vorbis_audio_encoder_factory,
 };
+pub use vp9_encoder::native_vp9_video_encoder_factory;
 pub use webm::WebmMuxer;
 pub use webm_demux::{
     WebmAudioTrim, WebmCuePoint, WebmDemuxer, WebmDemuxerOptions, WebmSeekPoint, WebmSkippedTrack,

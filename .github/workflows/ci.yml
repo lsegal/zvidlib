@@ -63,6 +63,11 @@ jobs:
           cache-on-failure: true
       - name: Install native audio dependencies
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      # The VP9 encoder's tests require libvpx and FFmpeg's own VP9 decoder to
+      # reproduce its reconstruction exactly (#528). They skip themselves where
+      # ffmpeg is missing, so install it before the library units run.
+      - name: Install ffmpeg for independent VP9 decoding
+        run: sudo apt-get install -y ffmpeg
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Check native target
@@ -211,6 +216,11 @@ jobs:
       # for bit by the library unit tests above.
       - name: Test Vorbis decode and encode
         run: cargo test --features native --test vorbis_codec
+      # Muxes the native VP9 encoder's output as `vp09`/`vpcC`, reads it back
+      # through `Mp4Demuxer`, plays the MP4 through libvpx and FFmpeg's VP9
+      # decoder, and runs the encoder conformance vector against libvpx (#528).
+      - name: Test VP9 encoder output
+        run: cargo test --features native --test native_vp9_encoder
       # Remuxes the bundled AV1 sample into WebM and back, asserting the WebM
       # index hands a decoder exactly the MP4's samples and frames, and that
       # the written Cues are seekable (#526). Its ffprobe and ffmpeg check

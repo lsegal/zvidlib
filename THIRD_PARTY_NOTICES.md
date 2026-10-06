@@ -98,6 +98,13 @@ from libvpx's `vp9/common` and `vpx_dsp` sources, and the rest of
 `src/vp9_dec/` follows the structure of libvpx's VP9 decoder, so that it
 decodes bit for bit as libvpx does.
 
+The VP9 default probability, quantizer, scan and interpolation filter tables in
+`src/vp9_encoder/tables.rs` are generated from [libvpx](https://chromium.googlesource.com/webm/libvpx)
+(`vp9/common/vp9_entropy.c`, `vp9_entropymode.c`, `vp9_quant_common.c`,
+`vp9_scan.c` and `vp9_filter.c`), and the 4x4 transforms in
+`src/vp9_encoder/dsp.rs` follow its `vpx_dsp/inv_txfm.c` and
+`vp9/encoder/vp9_dct.c`.
+
 Copyright (c) 2010, The WebM Project authors. All rights reserved.
 
 Redistribution and use in source and binary forms, with or without

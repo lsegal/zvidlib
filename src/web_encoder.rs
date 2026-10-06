@@ -6,11 +6,11 @@
 //! the portable, synchronous [`crate::codec::VideoEncoder`] trait: that
 //! trait's `config()` must return a complete MP4 sample-entry `decoder_config`
 //! before any frame is encoded, but `WebCodecs` only reveals the real
-//! `av1C`/`hvcC` description once the encoder emits its first chunk. Callers
+//! `av1C`/`hvcC`/`vpcC` description once the encoder emits its first chunk. Callers
 //! ([`crate::WasmMediaOutput`]) instead buffer chunks from this session and
 //! build the MP4 track configuration once that first chunk arrives.
 //!
-//! Scope for this initial bridge: AV1 Main and HEVC Main profile output from
+//! Scope for this bridge: AV1 Main, HEVC Main and VP9 profile 0 output from
 //! RGBA8, BGRA8, and YUV 4:2:0 planar 8-bit input frames, and AAC-LC audio
 //! output from interleaved f32 PCM. Broader video codec and pixel-format
 //! coverage is tracked as follow-up work.
@@ -42,7 +42,7 @@ use web_sys::{
 pub struct WebEncodedVideoChunk {
     pub data: Vec<u8>,
     pub is_sync: bool,
-    /// Complete `av1C`/`hvcC` configuration box (size + fourcc + payload),
+    /// Complete `av1C`/`hvcC`/`vpcC` configuration box (size + fourcc + payload),
     /// present only on the first chunk a session ever emits.
     pub decoder_config: Option<Vec<u8>>,
 }
@@ -66,6 +66,7 @@ pub fn video_encode_capability(
         (Codec::Av1, CodecProfile::Av1Main)
             | (Codec::Hevc, CodecProfile::HevcMain)
             | (Codec::Vp8, CodecProfile::Vp8)
+            | (Codec::Vp9, CodecProfile::Vp9Profile0)
     );
     if !supported {
         return CodecSupport::UnsupportedProfile;
@@ -87,11 +88,14 @@ pub fn video_encode_capability(
     }
 }
 
-/// A lazily-driven `WebCodecs` encode session producing AV1 Main or HEVC Main
+/// A lazily-driven `WebCodecs` encode session producing AV1 Main, HEVC Main or
+/// VP9 profile 0
 /// chunks from RGBA8 frames.
 pub struct WebVideoEncodeSession {
     encoder: JsVideoEncoder,
     codec: Codec,
+    /// The VP9 level the session's codec string names, for its `vpcC`.
+    vp9_level: u8,
     width: u32,
     height: u32,
     pending_chunks: Rc<RefCell<VecDeque<(EncodedVideoChunk, JsValue)>>>,
@@ -105,14 +109,26 @@ pub struct WebVideoEncodeSession {
 }
 
 impl WebVideoEncodeSession {
-    /// Opens a session targeting `codec` (AV1 Main, HEVC Main or VP8) at
-    /// `width`x`height`, timestamps and durations given in microseconds.
+    /// Opens a session targeting `codec` (AV1 Main, HEVC Main, VP8 or VP9
+    /// profile 0) at `width`x`height` and `timescale / frame_duration` frames
+    /// a second, timestamps and durations given in microseconds.
     pub async fn open(
         codec: Codec,
         width: u32,
         height: u32,
+        timescale: u32,
+        frame_duration: u32,
         bitrate_bits_per_second: Option<u32>,
     ) -> Result<Self> {
+        // VP9's level is not read back from the encoder's output, so the codec
+        // string names the real one up front.
+        let vp9_level = crate::vp9_encoder::pick_level(
+            crate::VideoDimensions { width, height },
+            timescale,
+            frame_duration,
+        )
+        .unwrap_or(62);
+        let vp9_codec_string = format!("vp09.00.{vp9_level:02}.08");
         let initial_codec_string = match codec {
             Codec::Av1 => "av01.0.00M.08",
             // Main profile, tier L, level 3.1, no constraint flags. Only a
@@ -120,15 +136,11 @@ impl WebVideoEncodeSession {
             // and level are read back from what the encoder actually emits.
             Codec::Hevc => "hev1.1.6.L93.B0",
             Codec::Vp8 => "vp8",
-            Codec::UncompressedVideo
-            | Codec::H264
-            | Codec::Vp9
-            | Codec::Aac
-            | Codec::Opus
-            | Codec::Vorbis => {
+            Codec::Vp9 => vp9_codec_string.as_str(),
+            Codec::UncompressedVideo | Codec::H264 | Codec::Aac | Codec::Opus | Codec::Vorbis => {
                 return Err(Error::new(
                     ErrorKind::Unsupported,
-                    "the WebCodecs video encoder bridge only supports AV1, HEVC and VP8",
+                    "the WebCodecs video encoder bridge only supports AV1, HEVC, VP8 and VP9",
                 ));
             }
         };
@@ -201,6 +213,7 @@ impl WebVideoEncodeSession {
         Ok(Self {
             encoder,
             codec,
+            vp9_level,
             width,
             height,
             pending_chunks,
@@ -309,7 +322,8 @@ impl WebVideoEncodeSession {
         let is_sync = chunk.type_() == web_sys::EncodedVideoChunkType::Key;
 
         // AV1's sequence header travels in-band in the bitstream, so the
-        // real `av1C` is derived from the key chunk's own bytes. HEVC's
+        // real `av1C` is derived from the key chunk's own bytes, and so is
+        // VP9's colour description for its `vpcC`. HEVC's
         // parameter sets are genuinely out-of-band, so its `hvcC` is instead
         // read from `EncodedVideoChunkMetadata.decoderConfig.description`.
         // VP8 has no configuration record at all: its key frames carry
@@ -319,9 +333,9 @@ impl WebVideoEncodeSession {
                 Codec::Av1 => av1c_from_bitstream(&data),
                 Codec::Hevc => hvcc_from_metadata(&metadata),
                 Codec::Vp8 => Some(Vec::new()),
+                Codec::Vp9 => crate::vp9_encoder::vpcc_from_key_frame(&data, self.vp9_level),
                 Codec::UncompressedVideo
                 | Codec::H264
-                | Codec::Vp9
                 | Codec::Aac
                 | Codec::Opus
                 | Codec::Vorbis => None,
