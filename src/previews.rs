@@ -338,6 +338,11 @@ impl PreviewIndex {
     /// [`ExactFrameReader`] would make every preview the index decodes a seek
     /// that reader has to undo, and the two want opposite things from it - the
     /// index walks forwards once and never goes back, a scrub jumps.
+    ///
+    /// Every sample is counted as a presentation frame, which holds for an MP4
+    /// track. A track with decode-only samples, such as a VP8 WebM track's
+    /// hidden alternate references, wants
+    /// [`with_frame_count`](Self::with_frame_count) instead.
     pub fn new(
         factory: &dyn VideoDecoderFactory,
         configuration: VideoDecoderConfig,
@@ -345,7 +350,34 @@ impl PreviewIndex {
         limits: Limits,
         options: PreviewOptions,
     ) -> Result<Self> {
-        let frame_count = samples.len().max(1) as u64;
+        let frame_count = samples.len() as u64;
+        Self::with_frame_count(
+            factory,
+            configuration,
+            samples,
+            frame_count,
+            limits,
+            options,
+        )
+    }
+
+    /// [`Self::new`], over the track's first `frame_count` presentation frames.
+    ///
+    /// Issue #543: a decode-only sample takes an identity past the last
+    /// presentation frame (see [`Mp4Track::to_encoded_video_samples`]), and
+    /// asking for it never produces a picture. Counting it would plan slots no
+    /// decode fills and space the rest further apart, so a caller with such a
+    /// track passes `presentation_order.len()` here.
+    ///
+    /// [`Mp4Track::to_encoded_video_samples`]: crate::Mp4Track::to_encoded_video_samples
+    pub fn with_frame_count(
+        factory: &dyn VideoDecoderFactory,
+        configuration: VideoDecoderConfig,
+        samples: Vec<EncodedVideoSample>,
+        frame_count: u64,
+        limits: Limits,
+        options: PreviewOptions,
+    ) -> Result<Self> {
         let pass = PreviewPass::new(options, &configuration.coded_dimensions, frame_count);
         let store = pass.store();
         // The pass never asks for a frame twice, so it asks for every preview as
