@@ -709,10 +709,20 @@ unsafe extern "system" fn sequence_callback(
                 state.codec_name
             ));
         }
-        if format.display_area.right - format.display_area.left != state.dimensions.width as i32
-            || format.display_area.bottom - format.display_area.top
-                != state.dimensions.height as i32
-        {
+        let display_width = format.display_area.right - format.display_area.left;
+        let display_height = format.display_area.bottom - format.display_area.top;
+        let (width, height) = (state.dimensions.width, state.dimensions.height);
+        let matches = if state.crop_on_readback {
+            // The VP8 parser rounds an odd display size down to even, but the coded surface it
+            // decodes still holds every row and column of the frame, which is what is cropped.
+            display_width == (width & !1) as i32
+                && display_height == (height & !1) as i32
+                && format.coded_width >= width
+                && format.coded_height >= height
+        } else {
+            display_width == width as i32 && display_height == height as i32
+        };
+        if !matches {
             return Err(
                 "NVDEC sequence dimensions differ from the decoder configuration".to_owned(),
             );
