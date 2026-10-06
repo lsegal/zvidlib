@@ -11,6 +11,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::pin;
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
@@ -33,6 +34,16 @@ fn block_on<T>(future: impl Future<Output = T>) -> T {
         }
         std::thread::yield_now();
     }
+}
+
+/// Holds the other tests in this file off while one runs. They encode 1080p
+/// through the same hardware encoder, which on the `macos-latest` runner, a
+/// virtual Mac, is shared: the 1080p30 timing below measured about 180 fps
+/// alone and as little as 15 fps beside the other tests' encodes, which timed
+/// them rather than the encoder (#565).
+fn serial() -> MutexGuard<'static, ()> {
+    static HARDWARE: Mutex<()> = Mutex::new(());
+    HARDWARE.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// A 30 fps target-bitrate configuration, with a one-second keyframe interval
@@ -160,6 +171,7 @@ fn tool_available(name: &str) -> bool {
 
 #[test]
 fn the_factory_honours_hardware_preference_and_reports_the_implementation() {
+    let _serial = serial();
     let factory = native_hevc_video_encoder_factory();
     let limits = Limits::default();
 
@@ -216,6 +228,7 @@ fn the_factory_honours_hardware_preference_and_reports_the_implementation() {
 /// ffprobe and ffmpeg read as HEVC Main with every frame intact.
 #[test]
 fn hardware_output_muxes_to_an_mp4_that_zvidlib_and_ffmpeg_both_decode() {
+    let _serial = serial();
     const FRAMES: u64 = 45;
     let configuration = configuration(1920, 1080, PixelFormat::Rgba8, HardwarePreference::Require);
     let Some(mut encoder) = hardware_encoder(&configuration) else {
@@ -358,6 +371,7 @@ fn hardware_output_muxes_to_an_mp4_that_zvidlib_and_ffmpeg_both_decode() {
 #[cfg(target_os = "macos")]
 #[test]
 fn hardware_output_muxes_to_an_mp4_that_avfoundation_plays_and_decodes() {
+    let _serial = serial();
     const FRAMES: u64 = 45;
     let configuration = configuration(1920, 1080, PixelFormat::Rgba8, HardwarePreference::Require);
     let Some(mut encoder) = hardware_encoder(&configuration) else {
@@ -428,6 +442,7 @@ impl Drop for RemoveOnDrop {
 /// video, frames prepared ahead so only the encode is timed.
 #[test]
 fn hardware_encodes_1080p30_faster_than_real_time() {
+    let _serial = serial();
     const FRAMES: u64 = 90;
     let configuration = configuration(1920, 1080, PixelFormat::Rgba8, HardwarePreference::Require);
     let Some(mut encoder) = hardware_encoder(&configuration) else {
