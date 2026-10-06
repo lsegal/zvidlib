@@ -33,6 +33,7 @@ pub mod playback;
 pub mod simd;
 pub mod timeline;
 pub mod transfer;
+mod vp9_encoder;
 
 mod av1_dec;
 mod av1_decoder;
@@ -194,6 +195,7 @@ pub use transfer::{
     Orientation, ResourceKind, ResourceOwnership, ScaleFilter, TransferCapability, TransferPolicy,
     TransferStage, execute_transfer, inspect_transfer,
 };
+pub use vp9_encoder::native_vp9_video_encoder_factory;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use aac_encoder::native_aac_audio_encoder_factory;
