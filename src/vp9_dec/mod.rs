@@ -27,6 +27,7 @@
 
 mod bits;
 mod block;
+mod chunk;
 mod idct1d;
 mod loopfilter;
 mod probs;
@@ -41,6 +42,8 @@ use std::sync::Arc;
 use bits::{BitReader, BoolDecoder};
 use block::{FrameDecoder, MvRef};
 use probs::{FrameContext, FrameCounts};
+
+pub(crate) use chunk::{ChunkInspector, FrameShape};
 
 use crate::{Error, ErrorKind, Limits, Result};
 
