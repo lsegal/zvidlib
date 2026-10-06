@@ -1143,9 +1143,43 @@ fn read_compressed_header(
     Ok(())
 }
 
+/// The colour range a chunk's first frame signals: `Some(full_range)` when
+/// that frame is a profile 0 key frame, or an intra-only frame (which profile
+/// 0 makes studio range), and `None` for any other frame or for data that
+/// does not parse. A track's first sample is a key frame, so this is the
+/// range of its first picture, read without decoding it.
+pub(crate) fn chunk_full_range(data: &[u8]) -> Option<bool> {
+    let first = match superframe_index(data).ok()? {
+        Some(sizes) => data.get(..*sizes.first()?)?,
+        None => data,
+    };
+    let mut reader = BitReader::new(first);
+    if reader.literal(2).ok()? != 2 || reader.literal(2).ok()? != 0 || reader.bit().ok()? {
+        // Not a frame marker, not profile 0, or show_existing_frame.
+        return None;
+    }
+    let key_frame = !reader.bit().ok()?;
+    let show_frame = reader.bit().ok()?;
+    let error_resilient = reader.bit().ok()?;
+    if key_frame {
+        if reader.literal(24).ok()? != 0x49_83_42 || reader.literal(3).ok()? == 7 {
+            return None;
+        }
+        return reader.bit().ok();
+    }
+    let intra_only = !show_frame && reader.bit().ok()?;
+    if !error_resilient {
+        reader.literal(2).ok()?;
+    }
+    intra_only.then_some(false)
+}
+
 /// Parses a superframe index (Annex B.3), returning the frame sizes it
 /// lists, or `None` when the chunk holds a single frame.
 fn superframe_index(data: &[u8]) -> Result<Option<Vec<usize>>> {
+    if data.is_empty() {
+        return Ok(None);
+    }
     let marker = data[data.len() - 1];
     if marker & 0xe0 != 0xc0 {
         return Ok(None);
