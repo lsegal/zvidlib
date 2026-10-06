@@ -516,9 +516,10 @@ fn validate_limits(dimensions: VideoDimensions, limits: &Limits) -> Result<()> {
     let aligned =
         u64::from(dimensions.width.div_ceil(8) * 8) * u64::from(dimensions.height.div_ceil(8) * 8);
     // The source, reconstruction and reference pictures at 1.5 bytes a pixel,
-    // plus per-block mode information.
+    // the filtered copy and superblock-padded copy the loop filter search
+    // holds alongside them, plus per-block mode information.
     let working = aligned
-        .checked_mul(5)
+        .checked_mul(8)
         .and_then(|bytes| bytes.checked_add(64 * 1024))
         .ok_or_else(|| Error::new(ErrorKind::ResourceLimit, "VP9 allocation size overflow"))?;
     if working > limits.max_allocation_bytes {
