@@ -330,6 +330,10 @@ pub fn convert_row_with(
     let out = &mut out[..luma.len() * 4];
     // The vector loops only run where every lane's chroma sample exists, so
     // they never need the clamp; the scalar tail applies it.
+    #[cfg_attr(
+        not(any(target_arch = "x86_64", target_arch = "aarch64")),
+        allow(unused_variables)
+    )]
     let vector_end = if subsampled_x {
         luma.len().min(cb.len() * 2)
     } else {
@@ -365,6 +369,7 @@ pub fn convert_row_with(
 /// The vector backends call it for their tail and for any vector that holds a
 /// pixel near a rounding boundary, so both run the arithmetic that defines the
 /// result.
+#[allow(clippy::too_many_arguments)]
 fn convert_range_scalar(
     conversion: &Conversion,
     luma: &[u8],
