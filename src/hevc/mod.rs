@@ -38,6 +38,8 @@ pub mod readback;
 mod videotoolbox;
 #[cfg(target_os = "macos")]
 mod videotoolbox_encoder;
+#[cfg(target_os = "macos")]
+pub(crate) mod videotoolbox_vp9;
 #[cfg(windows)]
 pub(crate) mod windows_mf;
 #[cfg(windows)]

@@ -213,17 +213,25 @@ fn libvpx_test_vectors() {
             max_allocation_bytes: 1 << 32,
             ..Limits::default()
         });
+        let mut inspector = ChunkInspector::default();
         let mut shown = 0usize;
         let mut failure = None;
         for (index, chunk) in chunks.into_iter().enumerate() {
+            let shape = inspector.inspect(chunk);
             match decoder.decode_chunk(chunk) {
                 Ok(Some(picture)) => {
                     if expected.get(shown) != Some(&picture_md5(&picture)) {
                         failure = Some(format!("frame {shown} (chunk {index}) differs"));
+                    } else if shape.as_ref().ok().copied().flatten() != Some(shape_of(&picture)) {
+                        failure = Some(format!("chunk {index} is inspected as {shape:?}"));
                     }
                     shown += 1;
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    if !matches!(shape, Ok(None)) {
+                        failure = Some(format!("chunk {index} is inspected as {shape:?}"));
+                    }
+                }
                 Err(error) => failure = Some(format!("chunk {index}: {error}")),
             }
             if failure.is_some() {
@@ -311,6 +319,15 @@ fn yuv_digest(picture: &DecodedPicture) -> crate::FrameDigest {
     crate::FrameDigest::from_frame(&frame).unwrap()
 }
 
+fn shape_of(picture: &DecodedPicture) -> FrameShape {
+    FrameShape {
+        width: picture.width,
+        height: picture.height,
+        color_space: picture.color_space,
+        full_range: picture.full_range,
+    }
+}
+
 /// Both MP4 fixtures, encoded by libvpx from the bundled sample, decode to
 /// exactly the frames libvpx decodes them to. The 256x144 one is a two-pass
 /// encode whose superframes carry hidden alternate reference frames, which
@@ -337,6 +354,7 @@ fn mp4_fixtures_decode_bit_exactly_against_libvpx() {
         let samples = mp4_samples(mp4);
         assert_eq!((samples.len(), expected.len()), (frames, frames));
         let mut decoder = Decoder::new(Limits::default());
+        let mut inspector = ChunkInspector::default();
         let mut superframes_with_hidden_frames = 0;
         for (index, sample) in samples.iter().enumerate() {
             if superframe_index(&sample.data)
@@ -345,7 +363,9 @@ fn mp4_fixtures_decode_bit_exactly_against_libvpx() {
             {
                 superframes_with_hidden_frames += 1;
             }
+            let shape = inspector.inspect(&sample.data).unwrap();
             let picture = decoder.decode_chunk(&sample.data).unwrap().unwrap();
+            assert_eq!(shape, Some(shape_of(&picture)), "frame {index}");
             assert_eq!((picture.width, picture.height), size);
             assert!(!picture.full_range);
             assert_eq!(yuv_digest(&picture), expected[index], "frame {index}");
@@ -391,6 +411,27 @@ fn show_existing_frame_shows_a_reference_again() {
     decoder.set_output_wanted(false);
     assert!(decoder.decode_chunk(&[0x88]).unwrap().is_none());
     assert_eq!(decoder.frames_shown(), shown_before + 9);
+}
+
+#[test]
+fn the_inspector_follows_show_existing_frame_and_refuses_what_the_decoder_refuses() {
+    let samples = mp4_samples(BBB_256X144);
+    let mut inspector = ChunkInspector::default();
+    // An inter frame before any key frame.
+    let error = inspector.inspect(&samples[2].data).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::MalformedMedia);
+    let key = inspector.inspect(&samples[0].data).unwrap().unwrap();
+    assert_eq!((key.width, key.height), (256, 144));
+    // A key frame refreshes every slot, so every slot shows its shape.
+    for slot in 0..8u8 {
+        assert_eq!(inspector.inspect(&[0x88 | slot]).unwrap(), Some(key));
+    }
+    for data in [&[][..], &[0x00, 0x00], &[0x90, 0x00]] {
+        assert!(inspector.inspect(data).is_err(), "{data:?}");
+    }
+    inspector.reset();
+    let error = inspector.inspect(&[0x88]).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::MalformedMedia);
 }
 
 #[test]

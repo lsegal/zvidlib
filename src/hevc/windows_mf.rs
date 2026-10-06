@@ -1,8 +1,8 @@
 //! Windows Media Foundation decoding backed by the active D3D11 video device.
 //!
-//! It decodes HEVC Main for the HEVC factory and VP8 for the VP8 factory. Both share the worker
-//! thread, the D3D11 device manager and the transform's input and output loop; a [`Bitstream`]
-//! holds what differs between them.
+//! It decodes HEVC Main for the HEVC factory, VP8 for the VP8 factory and VP9 profile 0 for the
+//! VP9 factory. They share the worker thread, the D3D11 device manager and the transform's input
+//! and output loop; a [`Bitstream`] holds what differs between them.
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -16,9 +16,10 @@ use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
-    D3D11_DECODER_PROFILE_HEVC_VLD_MAIN, D3D11_DECODER_PROFILE_VP8_VLD, D3D11_MAP_READ,
-    D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
-    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, ID3D11VideoDevice,
+    D3D11_DECODER_PROFILE_HEVC_VLD_MAIN, D3D11_DECODER_PROFILE_VP8_VLD,
+    D3D11_DECODER_PROFILE_VP9_VLD_PROFILE0, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE,
+    D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING, D3D11CreateDevice, ID3D11Device,
+    ID3D11DeviceContext, ID3D11Texture2D, ID3D11VideoDevice,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC};
 use windows::Win32::Media::MediaFoundation::{
@@ -33,7 +34,7 @@ use windows::Win32::Media::MediaFoundation::{
     MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_START_OF_STREAM,
     MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES,
     MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MFTEnumEx, MFVideoFormat_HEVC,
-    MFVideoFormat_NV12, MFVideoFormat_VP80, MFVideoInterlace_Progressive,
+    MFVideoFormat_NV12, MFVideoFormat_VP80, MFVideoFormat_VP90, MFVideoInterlace_Progressive,
 };
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
@@ -42,8 +43,11 @@ use windows::Win32::System::Com::{
 use windows::core::{GUID, Interface};
 
 use super::engine::hvcc::{HvccRecord, split_length_prefixed};
-use super::planar::{PlanarConverter, nv12_to_planar, vp8_frame_is_shown, vp8_sample};
+use super::planar::{
+    PlanarConverter, nv12_to_planar, vp8_frame_is_shown, vp8_sample, vp9_dimensions, vp9_frame,
+};
 use super::readback;
+use crate::vp9_dec::{ChunkInspector, FrameShape, chunk_frames};
 use crate::{
     CancellationToken, DecodedVideoFrame, EncodedVideoSample, Error, ErrorKind, FrameIndex, Limits,
     PixelFormat, Plane, Result, VideoDecoder, VideoDecoderConfig, VideoDimensions, VideoFrame,
@@ -58,6 +62,13 @@ pub(super) fn is_available(dimensions: VideoDimensions) -> bool {
 /// transform is installed.
 pub(crate) fn is_vp8_available(dimensions: VideoDimensions) -> bool {
     probe(Format::Vp8, dimensions)
+}
+
+/// Whether Media Foundation can decode VP9 profile 0 in hardware at `dimensions` on this host:
+/// the adapter exposes the D3D11 VP9 profile 0 decoder profile with NV12 output, and a
+/// D3D11-aware VP9 decoder transform is installed.
+pub(crate) fn is_vp9_available(dimensions: VideoDimensions) -> bool {
+    probe(Format::Vp9, dimensions)
 }
 
 fn probe(format: Format, dimensions: VideoDimensions) -> bool {
@@ -106,10 +117,28 @@ pub(crate) fn create_vp8(
         .map(|decoder| Box::new(decoder) as Box<dyn VideoDecoder>)
 }
 
+/// Creates a Media Foundation VP9 profile 0 decoder. Its pictures are converted by the software
+/// decoder's own conversion, with the colour each frame's header names.
+pub(crate) fn create_vp9(
+    configuration: &VideoDecoderConfig,
+    limits: &Limits,
+) -> Result<Box<dyn VideoDecoder>> {
+    HardwareDecoder::spawn(
+        configuration.clone(),
+        *limits,
+        Bitstream::Vp9 {
+            inspector: Box::default(),
+            shapes: HashMap::new(),
+        },
+    )
+    .map(|decoder| Box::new(decoder) as Box<dyn VideoDecoder>)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Format {
     Hevc,
     Vp8,
+    Vp9,
 }
 
 impl Format {
@@ -117,6 +146,7 @@ impl Format {
         match self {
             Self::Hevc => "HEVC",
             Self::Vp8 => "VP8",
+            Self::Vp9 => "VP9",
         }
     }
 
@@ -124,6 +154,7 @@ impl Format {
         match self {
             Self::Hevc => MFVideoFormat_HEVC,
             Self::Vp8 => MFVideoFormat_VP80,
+            Self::Vp9 => MFVideoFormat_VP90,
         }
     }
 
@@ -132,6 +163,7 @@ impl Format {
         match self {
             Self::Hevc => (D3D11_DECODER_PROFILE_HEVC_VLD_MAIN, "HEVC Main"),
             Self::Vp8 => (D3D11_DECODER_PROFILE_VP8_VLD, "VP8"),
+            Self::Vp9 => (D3D11_DECODER_PROFILE_VP9_VLD_PROFILE0, "VP9 profile 0"),
         }
     }
 }
@@ -147,6 +179,14 @@ enum Bitstream {
     /// One VP8 frame per sample, passed through unchanged. Pictures are cropped from the whole
     /// decoded surface, which keeps odd dimensions exact, and converted by `convert`.
     Vp8 { convert: PlanarConverter },
+    /// One VP9 chunk per sample, passed through unchanged: the transform decodes a superframe's
+    /// hidden frames on the way to the frame it shows. `inspector` reads each chunk's headers
+    /// first, for the size and colour of the frame it shows, which `shapes` holds under the
+    /// sample's timestamp until that frame is output.
+    Vp9 {
+        inspector: Box<ChunkInspector>,
+        shapes: HashMap<i64, FrameShape>,
+    },
 }
 
 impl Bitstream {
@@ -154,6 +194,7 @@ impl Bitstream {
         match self {
             Self::Hevc { .. } => Format::Hevc,
             Self::Vp8 { .. } => Format::Vp8,
+            Self::Vp9 { .. } => Format::Vp9,
         }
     }
 }
@@ -347,8 +388,8 @@ impl DecoderCore {
         let (device, context) = create_d3d_device()?;
         require_hardware(&device, format, configuration.coded_dimensions)?;
         let transform = create_transform(format)?;
-        if format == Format::Vp8 {
-            // VP8 never reorders, so a decoder that held frames back would return a shown frame
+        if format != Format::Hevc {
+            // VP8 and VP9 never reorder, so a decoder that held frames back would return a shown frame
             // from a later sample than the one that coded it. A decoder that does not know the
             // attribute ignores it.
             if let Ok(attributes) = unsafe { transform.GetAttributes() } {
@@ -424,7 +465,7 @@ impl DecoderCore {
     ) -> Result<Vec<DecodedVideoFrame>> {
         check_cancelled(cancellation)?;
         let name = self.name();
-        let (data, shown) = match &self.bitstream {
+        let (data, shown) = match &mut self.bitstream {
             Bitstream::Hevc {
                 nal_length_size,
                 parameter_sets,
@@ -447,6 +488,32 @@ impl DecoderCore {
                 Cow::Borrowed(vp8_sample(sample, self.limits.max_allocation_bytes)?),
                 vp8_frame_is_shown(&sample.data),
             ),
+            Bitstream::Vp9 { inspector, shapes } => {
+                if sample.data.len() as u64 > self.limits.max_allocation_bytes {
+                    return Err(Error::new(
+                        ErrorKind::ResourceLimit,
+                        "VP9 sample exceeds the allocation limit",
+                    ));
+                }
+                if sample.data.is_empty() {
+                    return Err(Error::new(ErrorKind::MalformedMedia, "VP9 sample is empty"));
+                }
+                // Every header is read before anything reaches the transform, so a sample the
+                // software decoder would refuse is refused here too, with the same error.
+                let mut last = None;
+                for frame in chunk_frames(&sample.data)? {
+                    last = Some(inspector.inspect_frame(frame)?);
+                }
+                let last = last.expect("a chunk has a frame");
+                if !last.shown {
+                    return Err(Error::new(
+                        ErrorKind::MalformedMedia,
+                        "VP9 sample does not show a frame",
+                    ));
+                }
+                shapes.insert(self.next_identity, last.shape);
+                (Cow::Borrowed(sample.data.as_slice()), true)
+            }
         };
         let token = self.next_identity;
         self.next_identity = self
@@ -514,6 +581,10 @@ impl DecoderCore {
         self.identities.clear();
         self.hidden.clear();
         self.next_identity = 1;
+        if let Bitstream::Vp9 { inspector, shapes } = &mut self.bitstream {
+            inspector.reset();
+            shapes.clear();
+        }
         Ok(())
     }
 
@@ -578,6 +649,10 @@ impl DecoderCore {
             windows_error(&format!("decoded {name} frame has no timestamp"), error)
         })?;
         let presentation_index = self.identities.remove(&token);
+        let shape = match &mut self.bitstream {
+            Bitstream::Vp9 { shapes, .. } => shapes.remove(&token),
+            _ => None,
+        };
         if presentation_index.is_none() && !self.hidden.remove(&token) {
             return Err(codec(format!(
                 "decoded {name} frame timestamp does not match a submitted sample"
@@ -589,14 +664,18 @@ impl DecoderCore {
         let Some(presentation_index) = presentation_index.filter(|_| self.output_wanted) else {
             return Ok(None);
         };
-        let frame = self.convert_output(sample)?;
+        let frame = self.convert_output(sample, shape)?;
         Ok(Some(DecodedVideoFrame {
             presentation_index,
             frame,
         }))
     }
 
-    fn convert_output(&mut self, sample: &IMFSample) -> Result<VideoFrame> {
+    fn convert_output(
+        &mut self,
+        sample: &IMFSample,
+        shape: Option<FrameShape>,
+    ) -> Result<VideoFrame> {
         let name = self.name();
         let buffer = unsafe { sample.GetBufferByIndex(0) }.map_err(|error| {
             windows_error(&format!("decoded {name} frame has no buffer"), error)
@@ -635,6 +714,17 @@ impl DecoderCore {
                 &self.configuration,
                 &self.limits,
             ),
+            Bitstream::Vp9 { .. } => {
+                let shape = shape.ok_or_else(|| codec("decoded VP9 frame has no frame header"))?;
+                let planes = copy_nv12_to_planar(
+                    &self._device,
+                    &self.context,
+                    &source,
+                    source_subresource,
+                    vp9_dimensions(shape, &self.limits)?,
+                )?;
+                vp9_frame(planes, shape, &self.limits)
+            }
         }
     }
 }
@@ -747,18 +837,19 @@ fn create_transform(format: Format) -> Result<IMFTransform> {
             require_d3d_aware(&transform, format)?;
             Ok(transform)
         }
-        Format::Vp8 => find_vp8_transform(),
+        Format::Vp8 | Format::Vp9 => find_transform(format),
     }
 }
 
-/// Windows has no VP8 decoder with a fixed CLSID: VP8 is decoded by whichever decoder transform
-/// is installed for it, such as the one the VP9 Video Extensions package registers. The first
-/// synchronous, D3D11-aware one in Media Foundation's preferred order is used. Asynchronous
-/// vendor transforms are skipped, as they are for HEVC.
-fn find_vp8_transform() -> Result<IMFTransform> {
+/// Windows has no VP8 or VP9 decoder with a fixed CLSID: each is decoded by whichever decoder
+/// transform is installed for it, such as the one the VP9 Video Extensions package registers.
+/// The first synchronous, D3D11-aware one in Media Foundation's preferred order is used.
+/// Asynchronous vendor transforms are skipped, as they are for HEVC.
+fn find_transform(format: Format) -> Result<IMFTransform> {
+    let name = format.name();
     let input = MFT_REGISTER_TYPE_INFO {
         guidMajorType: MFMediaType_Video,
-        guidSubtype: MFVideoFormat_VP80,
+        guidSubtype: format.subtype(),
     };
     let flags = MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_LOCALMFT | MFT_ENUM_FLAG_SORTANDFILTER;
     let mut list = ptr::null_mut::<Option<IMFActivate>>();
@@ -773,7 +864,7 @@ fn find_vp8_transform() -> Result<IMFTransform> {
             &mut count,
         )
     }
-    .map_err(|error| windows_error("could not enumerate VP8 decoders", error))?;
+    .map_err(|error| windows_error(&format!("could not enumerate {name} decoders"), error))?;
     let activates: Vec<IMFActivate> = if list.is_null() {
         Vec::new()
     } else {
@@ -787,9 +878,9 @@ fn find_vp8_transform() -> Result<IMFTransform> {
     let mut rejected = None;
     for activate in activates {
         let candidate = unsafe { activate.ActivateObject::<IMFTransform>() }
-            .map_err(|error| windows_error("could not create VP8 decoder", error))
+            .map_err(|error| windows_error(&format!("could not create {name} decoder"), error))
             .and_then(|transform| {
-                require_d3d_aware(&transform, Format::Vp8)?;
+                require_d3d_aware(&transform, format)?;
                 Ok(transform)
             });
         match candidate {
@@ -800,7 +891,8 @@ fn find_vp8_transform() -> Result<IMFTransform> {
             }
         }
     }
-    Err(rejected.unwrap_or_else(|| unsupported("no Media Foundation VP8 decoder is installed")))
+    Err(rejected
+        .unwrap_or_else(|| unsupported(format!("no Media Foundation {name} decoder is installed"))))
 }
 
 fn require_d3d_aware(transform: &IMFTransform, format: Format) -> Result<()> {
@@ -902,10 +994,11 @@ fn make_input_sample(data: &[u8], timestamp: i64, name: &str) -> Result<IMFSampl
     Ok(sample)
 }
 
-/// Reads a decoded VP8 picture back as the three 4:2:0 planes the software decoder produces.
+/// Reads a decoded VP8 or VP9 picture back as the three 4:2:0 planes the software decoder
+/// produces.
 ///
 /// The whole decoded surface is copied, since an NV12 texture cannot have the odd dimensions a
-/// VP8 frame can, and then cropped to `dimensions`: the surface is at least the frame's size
+/// VP8 or VP9 frame can, and then cropped to `dimensions`: the surface is at least the frame's size
 /// rounded up to even, so it holds every row and column of the frame.
 fn copy_nv12_to_planar(
     device: &ID3D11Device,
@@ -936,9 +1029,9 @@ fn copy_nv12_to_planar(
     unsafe {
         device
             .CreateTexture2D(&description, None, Some(&mut staging))
-            .map_err(|error| windows_error("could not allocate VP8 readback texture", error))?;
+            .map_err(|error| windows_error("could not allocate readback texture", error))?;
     }
-    let staging = staging.ok_or_else(|| codec("VP8 readback texture was not returned"))?;
+    let staging = staging.ok_or_else(|| codec("readback texture was not returned"))?;
     unsafe {
         context.CopySubresourceRegion(&staging, 0, 0, 0, 0, source, source_subresource, None);
     }
@@ -946,11 +1039,11 @@ fn copy_nv12_to_planar(
     unsafe {
         context
             .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
-            .map_err(|error| windows_error("could not map VP8 readback texture", error))?;
+            .map_err(|error| windows_error("could not map readback texture", error))?;
     }
     if mapped.pData.is_null() {
         unsafe { context.Unmap(&staging, 0) };
-        return Err(codec("mapped VP8 readback texture was null"));
+        return Err(codec("mapped readback texture was null"));
     }
     surface_copy.record(readback::Phase::SurfaceCopy);
     let pitch = mapped.RowPitch as usize;

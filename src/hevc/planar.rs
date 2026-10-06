@@ -1,7 +1,8 @@
-//! What the hardware VP8 backends (NVDEC and Media Foundation) share: recognising a VP8 frame's
-//! shape from its tag, and turning the NV12 surface a decoder writes into the three 4:2:0 planes
-//! the software decoder produces, so both go through the same RGBA conversion.
+//! What the hardware VP8 and VP9 backends (NVDEC and Media Foundation) share: recognising a VP8
+//! frame's shape from its tag, and turning the NV12 surface a decoder writes into the three 4:2:0
+//! planes the software decoder produces, so both go through the same RGBA conversion.
 
+use crate::vp9_dec::{DecodedPicture, FrameShape};
 use crate::{
     EncodedVideoSample, Error, ErrorKind, Limits, Result, VideoDecoderConfig, VideoDimensions,
     VideoFrame,
@@ -84,6 +85,28 @@ pub(super) fn nv12_to_planar(
         }
     }
     Ok([luma, u, v])
+}
+
+/// The size a VP9 frame's header gives it, which its picture is cropped to.
+pub(super) fn vp9_dimensions(shape: FrameShape, limits: &Limits) -> Result<VideoDimensions> {
+    VideoDimensions::new(shape.width as u32, shape.height as u32, limits)
+}
+
+/// Converts a VP9 picture, cropped to [`vp9_dimensions`], with the colour its header named, as
+/// the software decoder converts its own pictures.
+pub(super) fn vp9_frame(
+    planes: [Vec<u8>; 3],
+    shape: FrameShape,
+    limits: &Limits,
+) -> Result<VideoFrame> {
+    let picture = DecodedPicture {
+        width: shape.width,
+        height: shape.height,
+        planes,
+        color_space: shape.color_space,
+        full_range: shape.full_range,
+    };
+    crate::vp9_decoder::picture_to_rgba(&picture, limits)
 }
 
 #[cfg(test)]
