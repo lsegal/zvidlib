@@ -1,5 +1,5 @@
-//! Native, dependency-free VP8 software decoding, registered as a
-//! [`VideoDecoderFactory`].
+//! Native VP8 decoding, registered as a [`VideoDecoderFactory`]: a
+//! dependency-free software decoder, and NVIDIA NVDEC where the host has it.
 //!
 //! This is a complete implementation of the VP8 decoding process of RFC 6386
 //! for every bitstream version (0 to 3): the boolean entropy decoder, key-frame
@@ -20,6 +20,13 @@
 //! colour space VP8 defines, and are converted to `Rgba8` with
 //! [`convert_to_rgba8`]. Like the other software decoders, decoding runs on
 //! the calling thread.
+//!
+//! NVDEC decodes VP8 on 64-bit Windows and Linux hosts with an NVIDIA adapter
+//! whose driver reports VP8 support. Its pictures are cropped and converted to
+//! RGBA by the same code as the software decoder's, and VP8 decoding is exact,
+//! so both produce the same pixels. Media Foundation and VideoToolbox are not
+//! used: Windows ships no VP8 decoder of its own, and VideoToolbox exposes no
+//! VP8 decoder at all.
 
 mod bool_decoder;
 mod decoder;
@@ -38,12 +45,17 @@ use crate::{
     VideoDecoderConfig, VideoDecoderFactory, VideoFrame, convert_to_rgba8,
 };
 
-/// Returns the dependency-free native VP8 software decoder backend.
+/// Returns the native VP8 decoder backend.
 ///
 /// The decoder accepts [`Codec::Vp8`] with [`CodecProfile::Vp8`] and outputs
 /// [`PixelFormat::Rgba8`]. VP8 carries no codec configuration record, so
-/// `configuration` is ignored. It is software-only, so a configuration that
-/// requires hardware reports [`CodecSupport::HardwareUnavailable`].
+/// `configuration` is ignored.
+///
+/// `Prefer` and `Require` select NVIDIA NVDEC on supported 64-bit Windows and
+/// Linux hosts. `Prefer` falls back to the dependency-free software decoder
+/// when NVDEC is unavailable, and `Require` reports
+/// [`CodecSupport::HardwareUnavailable`]. `Avoid` always selects software.
+/// Both produce the same pixels.
 pub fn native_vp8_video_decoder_factory() -> impl VideoDecoderFactory {
     Vp8DecoderFactory
 }
@@ -53,23 +65,20 @@ struct Vp8DecoderFactory;
 
 impl VideoDecoderFactory for Vp8DecoderFactory {
     fn capability(&self, configuration: &VideoDecoderConfig) -> CodecSupport {
-        if configuration.codec != Codec::Vp8 {
-            return CodecSupport::UnsupportedCodec;
+        let support = self.capability_without_hardware(configuration);
+        if !support.is_supported() {
+            return support;
         }
-        if configuration.profile != CodecProfile::Vp8 {
-            return CodecSupport::UnsupportedProfile;
+        if configuration.hardware != HardwarePreference::Avoid && hardware_available(configuration)
+        {
+            return CodecSupport::Supported {
+                implementation: CodecImplementation::Hardware,
+            };
         }
         if configuration.hardware == HardwarePreference::Require {
             return CodecSupport::HardwareUnavailable;
         }
-        if configuration.output_format != PixelFormat::Rgba8 {
-            return CodecSupport::InvalidConfiguration {
-                reason: "native VP8 decoding currently outputs RGBA8".into(),
-            };
-        }
-        CodecSupport::Supported {
-            implementation: CodecImplementation::Software,
-        }
+        support
     }
 
     fn create(
@@ -77,7 +86,7 @@ impl VideoDecoderFactory for Vp8DecoderFactory {
         configuration: &VideoDecoderConfig,
         limits: &Limits,
     ) -> Result<Box<dyn VideoDecoder>> {
-        match self.capability(configuration) {
+        match self.capability_without_hardware(configuration) {
             CodecSupport::Supported { .. } => {}
             CodecSupport::UnsupportedCodec => {
                 return Err(Error::new(
@@ -91,14 +100,44 @@ impl VideoDecoderFactory for Vp8DecoderFactory {
                     "native VP8 decoder requires the VP8 profile",
                 ));
             }
-            CodecSupport::HardwareUnavailable => {
-                return Err(Error::new(
-                    ErrorKind::Unsupported,
-                    "native VP8 decoder is software-only",
-                ));
-            }
+            CodecSupport::HardwareUnavailable => unreachable!("hardware is not checked here"),
             CodecSupport::InvalidConfiguration { reason } => {
                 return Err(Error::new(ErrorKind::InvalidInput, reason));
+            }
+        }
+        if configuration.hardware != HardwarePreference::Avoid {
+            #[cfg_attr(
+                not(all(any(windows, target_os = "linux"), target_pointer_width = "64")),
+                allow(unused_mut)
+            )]
+            let mut hardware_errors = Vec::<String>::new();
+            #[cfg(all(any(windows, target_os = "linux"), target_pointer_width = "64"))]
+            match crate::hevc::nvdec::create_vp8(
+                configuration,
+                limits,
+                |planes, configuration, limits| {
+                    let dimensions = configuration.coded_dimensions;
+                    let picture = Picture {
+                        width: dimensions.width as usize,
+                        height: dimensions.height as usize,
+                        planes,
+                    };
+                    picture_to_rgba(&picture, configuration, limits)
+                },
+            ) {
+                Ok(decoder) => return Ok(decoder),
+                Err(error) => hardware_errors.push(format!("NVDEC: {}", error.message())),
+            }
+            if configuration.hardware == HardwarePreference::Require {
+                let detail = if hardware_errors.is_empty() {
+                    "no accelerated backend exists for this target".to_owned()
+                } else {
+                    hardware_errors.join("; ")
+                };
+                return Err(Error::new(
+                    ErrorKind::Unsupported,
+                    format!("hardware VP8 decoding is unavailable ({detail})"),
+                ));
             }
         }
         Ok(Box::new(Vp8Decoder {
@@ -107,6 +146,33 @@ impl VideoDecoderFactory for Vp8DecoderFactory {
             inner: Decoder::new(*limits),
         }))
     }
+}
+
+impl Vp8DecoderFactory {
+    fn capability_without_hardware(&self, configuration: &VideoDecoderConfig) -> CodecSupport {
+        if configuration.codec != Codec::Vp8 {
+            return CodecSupport::UnsupportedCodec;
+        }
+        if configuration.profile != CodecProfile::Vp8 {
+            return CodecSupport::UnsupportedProfile;
+        }
+        if configuration.output_format != PixelFormat::Rgba8 {
+            return CodecSupport::InvalidConfiguration {
+                reason: "native VP8 decoding currently outputs RGBA8".into(),
+            };
+        }
+        CodecSupport::Supported {
+            implementation: CodecImplementation::Software,
+        }
+    }
+}
+
+fn hardware_available(_configuration: &VideoDecoderConfig) -> bool {
+    #[cfg(all(any(windows, target_os = "linux"), target_pointer_width = "64"))]
+    if crate::hevc::nvdec::is_vp8_available(_configuration.coded_dimensions) {
+        return true;
+    }
+    false
 }
 
 struct Vp8Decoder {
