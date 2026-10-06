@@ -645,7 +645,10 @@ pub(super) unsafe fn noise_compand<V: F32x4>(
         while i + 4 <= n {
             let mp = logmask.as_mut_ptr().add(i);
             let db = V::load(mp).add_f64_trunc_clamp(0.5, top).to_array();
-            let curve = gather::<V>(compand, db.map(|d| d as usize));
+            // Indexed with bounds checks: the clamp above is the only thing
+            // keeping these in range, and a 40-entry table makes the checks
+            // cheap.
+            let curve = V::from_array(db.map(|d| compand[d as usize]));
             V::load(logmdct.as_ptr().add(i))
                 .sub(V::load(work.as_ptr().add(i)))
                 .add(curve)

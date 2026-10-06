@@ -57,7 +57,7 @@ mod psy;
 mod res0;
 mod setup;
 #[allow(unsafe_code)]
-mod simd;
+pub(crate) mod simd;
 mod smallft;
 mod tables;
 #[cfg(test)]

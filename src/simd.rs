@@ -1,12 +1,13 @@
 //! The process-wide SIMD instruction-set override shared by every codec kernel.
 //!
-//! zvidlib's pure-Rust HEVC and AV1 codecs dispatch their hot loops to
-//! runtime-detected vector kernels in several independent places: the AV1
-//! transforms and in-loop filters ([`crate::av1_simd`]), AV1 inter prediction
-//! ([`crate::av1_mc`]), AV1 intra prediction ([`crate::av1_intra_pred`]), and
-//! the HEVC engine's inter/intra prediction, in-loop filters, inverse
-//! transforms, encoder-side distortion metrics, and encoder-side color
-//! conversion. Each of those sites caches
+//! zvidlib's pure-Rust HEVC and AV1 codecs and its Vorbis encoder dispatch
+//! their hot loops to runtime-detected vector kernels in several independent
+//! places: the AV1 transforms and in-loop filters ([`crate::av1_simd`]), AV1
+//! inter prediction ([`crate::av1_mc`]), AV1 intra prediction
+//! ([`crate::av1_intra_pred`]), the Vorbis encoder's analysis stages, and the
+//! HEVC engine's inter/intra prediction, in-loop filters, inverse transforms,
+//! encoder-side distortion metrics, and encoder-side color conversion. Each of
+//! those sites caches
 //! its own CPU feature probe, which is what you want in production but makes
 //! "run this workload with SIMD off" impossible to express from outside the
 //! crate.
@@ -46,10 +47,10 @@ static OVERRIDE: AtomicU8 = AtomicU8::new(0);
 /// Forces every SIMD-dispatched kernel in the crate onto `isa`, or restores
 /// per-site automatic detection with `None`.
 ///
-/// The override reaches all four dispatch families: the AV1 transform and
-/// in-loop filter kernels, AV1 motion compensation (through the default level
-/// [`crate::av1_mc::McContext::new`] picks up), AV1 intra prediction, and every
-/// HEVC engine kernel. [`SimdIsa::Scalar`] therefore genuinely reaches the
+/// The override reaches every dispatch family: the AV1 transform and in-loop
+/// filter kernels, AV1 motion compensation (through the default level
+/// [`crate::av1_mc::McContext::new`] picks up), AV1 intra prediction, the
+/// Vorbis encoder's analysis kernels, and every HEVC engine kernel. [`SimdIsa::Scalar`] therefore genuinely reaches the
 /// scalar code path rather than merely the widest scalar-ish one.
 ///
 /// An instruction set this host cannot execute is clamped to
@@ -112,6 +113,7 @@ pub fn available() -> Vec<SimdIsa> {
 /// | `av1_mc` | AV1 motion compensation (the level [`crate::av1_mc::McContext::new`] picks) |
 /// | `av1_intra_pred` | AV1 intra prediction and residual reconstruction |
 /// | `av1_coeff_ctx` | AV1 encoder-side coefficient context derivation (§8.3.2) |
+/// | `vorbis_encode` | Vorbis encoder forward MDCT, real FFT, noise-mask fits, floor fitting and log spectra |
 /// | `hevc_prediction_filters` | HEVC inter/intra prediction and in-loop filters |
 /// | `hevc_transforms` | HEVC inverse transforms and dequantization |
 /// | `hevc_rdcost` | HEVC encoder-side distortion metrics |
@@ -133,6 +135,7 @@ pub fn active_by_site() -> Vec<(&'static str, SimdIsa)> {
             from_intra_simd(crate::av1_intra_pred::av1_intra_simd()),
         ),
         ("av1_coeff_ctx", crate::av1_simd::coeff::active_isa()),
+        ("vorbis_encode", crate::vorbis_encoder::simd::active_isa()),
     ];
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -362,6 +365,9 @@ mod tests {
         // AV1 encoder-side coefficient context derivation, whose `OnceLock`
         // detection may likewise have already resolved to a vector backend.
         assert_eq!(crate::av1_simd::coeff::active_isa(), SimdIsa::Scalar);
+        // The Vorbis encoder's analysis kernels, whose `OnceLock` detection
+        // may likewise have already resolved to a vector backend.
+        assert_eq!(crate::vorbis_encoder::simd::active_isa(), SimdIsa::Scalar);
         // AV1 motion compensation, through the level `McContext::new` picks.
         assert_eq!(default_level(), SimdLevel::Scalar);
         assert_eq!(McContext::new().level(), SimdLevel::Scalar);
@@ -388,6 +394,7 @@ mod tests {
             "av1_mc",
             "av1_intra_pred",
             "av1_coeff_ctx",
+            "vorbis_encode",
             "hevc_prediction_filters",
             "hevc_transforms",
             "hevc_rdcost",
@@ -451,6 +458,8 @@ mod tests {
             crate::av1_simd::coeff::active_isa() != SimdIsa::Scalar,
             vectorized
         );
+        // The Vorbis encoder's analysis kernels.
+        assert_eq!(crate::vorbis_encoder::simd::active_isa(), detected());
         // AV1 motion compensation.
         assert_eq!(
             default_level() != crate::av1_mc::SimdLevel::Scalar,
@@ -492,6 +501,7 @@ mod tests {
             "av1_mc",
             "av1_intra_pred",
             "av1_coeff_ctx",
+            "vorbis_encode",
             "hevc_prediction_filters",
             "hevc_transforms",
             "hevc_rdcost",

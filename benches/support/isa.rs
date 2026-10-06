@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 use criterion::Criterion;
 use zvidlib::simd::{self, SimdIsa};
 
-use super::FrameWork;
+use super::{AudioWork, FrameWork, report_audio_throughput};
 
 /// Logs what this host can actually execute, before anything is timed.
 ///
@@ -118,6 +118,44 @@ where
         simd::set_override(Some(isa));
         assert_reached_every_site(workload.codec, isa);
         report_megapixels_per_second(workload, isa, &run);
+        group.bench_function(isa.name(), |bencher| bencher.iter(|| black_box(run())));
+    }
+    simd::set_override(None);
+    group.finish();
+}
+
+/// Benchmarks an audio `run` once per available instruction set.
+///
+/// The audio counterpart of [`bench_across_isas`], with the same two guards
+/// (bit-exact output across every arm, and the override reaching every
+/// dispatch site) but measured in samples rather than pixels: criterion
+/// reports samples per second, and each arm prints the realtime factor that
+/// decides whether an encoder keeps up with its input.
+pub fn bench_audio_across_isas<F>(criterion: &mut Criterion, codec: &str, work: AudioWork, run: F)
+where
+    F: Fn() -> Vec<u8>,
+{
+    assert_bit_exact_across_isas(codec, &run);
+
+    let mut group = criterion.benchmark_group(codec);
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(500));
+    group.measurement_time(Duration::from_secs(5));
+    report_audio_throughput(&mut group, codec, work);
+    for isa in simd::available() {
+        simd::set_override(Some(isa));
+        assert_reached_every_site(codec, isa);
+        let started = Instant::now();
+        let output = black_box(run());
+        let elapsed = started.elapsed();
+        println!(
+            "# {codec}/{}: {:.4}s of audio in {:.4}s => {:.1}x realtime ({} output bytes)",
+            isa.name(),
+            work.seconds(),
+            elapsed.as_secs_f64(),
+            work.realtime_factor(elapsed),
+            output.len(),
+        );
         group.bench_function(isa.name(), |bencher| bencher.iter(|| black_box(run())));
     }
     simd::set_override(None);
