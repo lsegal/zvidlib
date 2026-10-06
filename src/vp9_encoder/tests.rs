@@ -578,3 +578,118 @@ mod ffmpeg {
         }
     }
 }
+
+/// The `loop_filter_level` an encoded frame's uncompressed header signals.
+fn signalled_filter_level(sample: &EncodedSample) -> u8 {
+    // Key frames: marker, profile, flags, sync code, colour, size, render
+    // size and frame_context_idx. Inter frames: marker, profile, flags,
+    // refresh flags, references, sizes, motion vector precision,
+    // interpolation filter and frame_context_idx.
+    let start = if sample.is_sync { 71 } else { 36 };
+    (start..start + 6).fold(0, |level, index| {
+        (level << 1) | ((sample.data[index / 8] >> (7 - index % 8)) & 1)
+    })
+}
+
+/// The visible `yuv420p` bytes of a picture.
+fn visible(picture: &Picture, geometry: &Geometry) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for (plane, width, height) in [
+        (0, geometry.width, geometry.height),
+        (1, geometry.chroma_width(), geometry.chroma_height()),
+        (2, geometry.chroma_width(), geometry.chroma_height()),
+    ] {
+        let stride = picture.strides[plane];
+        for row in 0..height {
+            bytes.extend_from_slice(&picture.planes[plane][row * stride..row * stride + width]);
+        }
+    }
+    bytes
+}
+
+/// The RGBA test card `tests/native_vp9_encoder.rs` encodes: gradients
+/// under a checkerboard, panning right two pixels a frame.
+fn test_card_frame(index: u32) -> VideoFrame {
+    const WIDTH: u32 = 160;
+    const HEIGHT: u32 = 90;
+    const FRAMES: u32 = 12;
+    let mut pixels = Vec::with_capacity((WIDTH * HEIGHT * 4) as usize);
+    for y in 0..HEIGHT {
+        for x in 0..WIDTH {
+            let u = x + index * 2;
+            let checker = if ((u / 10) + (y / 10)) % 2 == 0 {
+                60
+            } else {
+                0
+            };
+            pixels.extend_from_slice(&[
+                (u * 255 / (WIDTH + 2 * FRAMES)) as u8,
+                (y * 255 / HEIGHT) as u8 / 2 + checker,
+                (255 - u * 200 / (WIDTH + 2 * FRAMES)) as u8,
+                255,
+            ]);
+        }
+    }
+    VideoFrame::new(
+        VideoDimensions {
+            width: WIDTH,
+            height: HEIGHT,
+        },
+        PixelFormat::Rgba8,
+        ColorRange::Limited,
+        vec![Plane {
+            data: pixels,
+            stride: WIDTH as usize * 4,
+        }],
+        &Limits::default(),
+    )
+    .unwrap()
+}
+
+/// Encodes `frames` as one group of pictures, with or without the loop
+/// filter, and returns the total size in bytes and the PSNR of the
+/// reconstruction against the source.
+fn encode_group(frames: &[VideoFrame], base_q_idx: u8, loop_filter: bool) -> (usize, f64) {
+    let dimensions = frames[0].dimensions;
+    let geometry = Geometry::new(dimensions.width as usize, dimensions.height as usize);
+    let mut reference: Option<Picture> = None;
+    let (mut bytes, mut reconstructed, mut sources) = (0, Vec::new(), Vec::new());
+    for frame in frames {
+        let source = source_picture(&geometry, frame, Orientation::TopLeft).unwrap();
+        let mut encoder = FrameEncoder::new(geometry, &source, reference.as_ref(), base_q_idx);
+        if !loop_filter {
+            encoder = encoder.without_loop_filter();
+        }
+        let (data, reconstruction) = encoder.encode(false);
+        bytes += data.len();
+        reconstructed.extend(visible(&reconstruction, &geometry));
+        sources.extend(visible(&source, &geometry));
+        reference = Some(reconstruction);
+    }
+    (bytes, psnr(&reconstructed, &sources))
+}
+
+#[test]
+fn every_frame_signals_a_loop_filter_level() {
+    let mut config = configuration(96, 64, PixelFormat::Yuv420p8);
+    config.configuration = vec![DEFAULT_BASE_Q_IDX, 0, 5];
+    let (samples, _, _) = encode_sequence(&config, 8);
+    for (index, sample) in samples.iter().enumerate() {
+        let level = signalled_filter_level(sample);
+        assert!((1..=63).contains(&level), "frame {index} level {level}");
+    }
+}
+
+#[test]
+fn loop_filter_shrinks_output_at_better_psnr() {
+    let frames: Vec<VideoFrame> = (0..12).map(test_card_frame).collect();
+    for base_q_idx in [100, 150] {
+        let (unfiltered_bytes, unfiltered_psnr) = encode_group(&frames, base_q_idx, false);
+        let (filtered_bytes, filtered_psnr) = encode_group(&frames, base_q_idx, true);
+        assert!(
+            filtered_bytes < unfiltered_bytes && filtered_psnr >= unfiltered_psnr,
+            "q {base_q_idx}: {filtered_bytes} bytes at {filtered_psnr:.2} dB filtered, \
+             {unfiltered_bytes} bytes at {unfiltered_psnr:.2} dB unfiltered"
+        );
+    }
+}
