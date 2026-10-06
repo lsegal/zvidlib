@@ -133,11 +133,11 @@ web = [
 ]
 
 [dependencies]
-# Pure-Rust Opus (a port of libopus 1.6) and Vorbis decoding. Both build for
+# Pure-Rust Opus decoding (a port of libopus 1.6), and the DSP and bit readers
+# the Vorbis decoder vendored in `src/vorbis_decoder/` builds on. Both build for
 # `wasm32` as well as native targets, so the browser build's software audio
 # fallback runs the same decoders native callers do.
 opus-pure = "0.2.2"
-symphonia-codec-vorbis = "0.5.5"
 symphonia-core = "0.5.5"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]

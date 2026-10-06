@@ -145,22 +145,29 @@ fn transients_in_short_blocks_decode_as_libvorbis_does() {
 }
 
 #[test]
-fn surround_configuration_parses_but_is_not_decoded() {
+fn surround_decodes_as_libvorbis_does_in_the_vorbis_channel_order() {
     // A 5.1 stream's setup header has several coupling steps and submaps, all
     // of which the configuration walk must get through to reach its modes.
-    let (mut packets, _) = ogg_packets(&std::fs::read(fixture("vorbis_6ch_16k.ogg")).unwrap());
-    let audio = packets.split_off(3);
-    let [identification, comment, setup]: [Vec<u8>; 3] = packets.try_into().unwrap();
-    let config = VorbisConfig::from_headers(identification, comment, setup).unwrap();
-    assert_eq!(config.channels, 6);
-    let samples = config.encoded_samples(audio).unwrap();
-    assert!(samples.last().unwrap().decoded_range.end >= 4_000);
-    // The decoder underneath decodes some surround streams wrongly, so it
-    // refuses them rather than return the wrong audio.
-    let error = NativeVorbisDecoder::new(&config, Limits::default())
-        .err()
-        .unwrap();
-    assert_eq!(error.kind(), zvidlib::ErrorKind::Unsupported);
+    // Each channel is a tone of its own, so a channel out of the Vorbis order
+    // (Vorbis I section 4.3.9) differs from libvorbis's as much as a wrong
+    // decode would.
+    assert_matches_libvorbis("vorbis_6ch_16k", 6, 16_000, 4_000);
+}
+
+#[test]
+fn a_channel_coupled_in_several_steps_decodes_as_libvorbis_does() {
+    // libvorbis's 5.1 mapping at this rate and quality couples the left
+    // channel in three of its four steps, which only decode right when they
+    // are undone in reverse order.
+    assert_matches_libvorbis("vorbis_6ch_48k", 6, 48_000, 12_000);
+}
+
+#[test]
+fn several_channels_sharing_one_residue_decode_as_libvorbis_does() {
+    // Four uncoupled channels share one format 1 residue whose partitions do
+    // not fill its last classword, so a class decoded past one channel's
+    // partitions must not land on the next channel's.
+    assert_matches_libvorbis("vorbis_4ch_44k", 4, 44_100, 11_025);
 }
 
 #[test]
