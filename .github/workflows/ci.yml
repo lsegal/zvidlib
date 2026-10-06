@@ -648,7 +648,11 @@ jobs:
       # it to the software decoder's pixels, through `show_existing_frame` and
       # every seek order; where it has none, they skip with the reason, and
       # `Prefer` is seen to fall back to software and `Require` to report
-      # hardware unavailable. `--lib` above runs each backend on its own.
+      # hardware unavailable. `--lib` above runs each backend on its own. The
+      # same file covers the encode direction (#550): a hardware VP9 encoder's
+      # stream must mux into MP4 and WebM and decode through the native VP9
+      # decoder, and a runner without one skips after checking the preference
+      # answers.
       - name: Test accelerated VP9 selection and correctness
         run: cargo test --features native --test vp9_hardware -- --nocapture
       # The encode direction (#487, #486): which encoder `Prefer` and `Require`
