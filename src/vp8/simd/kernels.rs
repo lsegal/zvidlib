@@ -493,7 +493,11 @@ unsafe fn filter_segments<V: I32x>(p: &mut [V; 4], q: &mut [V; 4], limits: EdgeL
         let p0 = p[0].sub(bias);
         let q0 = q[0].sub(bias);
         let q1 = q[1].sub(bias);
-        let base = q0.sub(p0).mul(V::splat(3));
+        // The multiplies by small constants here are shifts and adds: a
+        // 32-bit vector multiply is two micro-ops with a ten-cycle latency on
+        // x86_64, and these lanes are small enough that both are exact.
+        let step = q0.sub(p0);
+        let base = step.sll::<1>().add(step);
         let outer = clamp(base.add(clamp(p1.sub(q1))));
         // The common adjustment of `p0`/`q0` for the filter value `a`.
         let common = |a: V| {
@@ -520,8 +524,11 @@ unsafe fn filter_segments<V: I32x>(p: &mut [V; 4], q: &mut [V; 4], limits: EdgeL
             // taps; anything else the macroblock filter, whose `w` is that
             // same clamped value.
             let (hev_p0, hev_q0, _) = common(outer);
-            let tap = |weight: i32| clamp(outer.mul(V::splat(weight)).add(V::splat(63)).sra::<7>());
-            let (a0, a1, a2) = (tap(27), tap(18), tap(9));
+            let round = |weighted: V| clamp(weighted.add(V::splat(63)).sra::<7>());
+            let nine = outer.sll::<3>().add(outer);
+            let a0 = round(nine.sll::<1>().add(nine));
+            let a1 = round(nine.sll::<1>());
+            let a2 = round(nine);
             let p2 = p[2].sub(bias);
             let q2 = q[2].sub(bias);
             p[0] = V::select(mask, V::select(hev, hev_p0, to_unsigned(p0.add(a0))), p[0]);

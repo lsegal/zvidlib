@@ -185,12 +185,12 @@ entry_points! {
 entry_points! {
     fn [filter_h_sse41, filter_h_avx2, filter_h_neon](
         data: &mut [u8], at: usize, stride: usize, count: usize, limits: EdgeLimits
-    ) = filter_horizontal_edge, avx2 = Avx2;
+    ) = filter_horizontal_edge, avx2 = Sse4;
 }
 entry_points! {
     fn [filter_v_sse41, filter_v_avx2, filter_v_neon](
         data: &mut [u8], at: usize, stride: usize, count: usize, limits: EdgeLimits
-    ) = filter_vertical_edge, avx2 = Avx2;
+    ) = filter_vertical_edge, avx2 = Sse4;
 }
 
 #[cfg(target_arch = "aarch64")]
