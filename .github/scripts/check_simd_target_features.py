@@ -24,11 +24,12 @@ checks (issue #341):
 
 The first rule is crate-wide and so covers every `#[target_feature]` site the
 crate has, `hevc::engine::simd`, `hevc::engine::transform_simd`,
-`hevc::color_convert` and `av1_mc` included: an out-of-line intrinsic call is
-the same defect wherever it appears. The second covers the two modules that
-dispatch through generic kernels, `av1_simd` and `vorbis_simd` (issue #572);
-the other sites write their intrinsics directly inside the `#[target_feature]`
-function, where there is no separate body for the inliner to leave behind.
+`hevc::color_convert`, `yuv_to_rgba` and `av1_mc` included: an out-of-line
+intrinsic call is the same defect wherever it appears. The second covers the
+two modules that dispatch through generic kernels, `av1_simd` and
+`vorbis_simd` (issue #572); the other sites write their intrinsics directly
+inside the `#[target_feature]` function, where there is no separate body for
+the inliner to leave behind.
 
     build --target-dir target/simd-feature-check
     check --asm path/to/crate.s

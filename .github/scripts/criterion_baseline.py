@@ -544,6 +544,7 @@ SITE_GROUP_PREFIXES: dict[str, tuple[str, ...]] = {
     "hevc_fwd_transform_quant": ("hevc_encode_640x352_fwd_transform_quant",),
     "hevc_colorconv": ("hevc_encode_640x352_rgba_to_yuv420",),
     "hevc_color_convert": ("hevc_color_convert",),
+    "yuv_to_rgba": ("yuv_to_rgba",),
     "vorbis_decode": (
         "vorbis_imdct",
         "vorbis_overlap_add",
