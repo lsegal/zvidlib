@@ -1026,11 +1026,14 @@ fn loop_filter_is_a_rate_distortion_gain() {
     // Larger blocks and transforms leave less blocking for the filter to
     // remove, so it mostly buys quality rather than bits: the filtered stream
     // must be sharper, and no larger than the unfiltered one would have to
-    // grow to match it at the high-rate 6 dB per doubling of the rate.
+    // grow to match it at the high-rate 6 dB per doubling of the rate. The
+    // coarse quantizers are where the greedy per-frame level search used to
+    // smooth the panning references until the whole sequence came out larger
+    // and blurrier than with no filter (issue #563).
     let frames: Vec<VideoFrame> = (0..12)
         .map(|index| test_card_frame(160, 90, index))
         .collect();
-    for base_q_idx in [100, 150] {
+    for base_q_idx in [100, 150, 210, 220, 230] {
         let (unfiltered_bytes, unfiltered_psnr) = encode_group(&frames, base_q_idx, false);
         let (filtered_bytes, filtered_psnr) = encode_group(&frames, base_q_idx, true);
         let equivalent_bytes =
