@@ -161,12 +161,6 @@ fn factory_advertises_only_the_implemented_surface() {
         CodecSupport::InvalidConfiguration { .. }
     ));
     invalid = configuration(64, 48, PixelFormat::Yuv420p8);
-    invalid.hardware = HardwarePreference::Require;
-    assert_eq!(
-        factory.capability(&invalid),
-        CodecSupport::HardwareUnavailable
-    );
-    invalid = configuration(64, 48, PixelFormat::Yuv420p8);
     invalid.profile = CodecProfile::Av1Main;
     assert_eq!(
         factory.capability(&invalid),
@@ -185,6 +179,129 @@ fn factory_advertises_only_the_implemented_surface() {
             CodecSupport::InvalidConfiguration { .. }
         ));
     }
+}
+
+/// `Avoid` is always the software encoder. `Prefer` and `Require` are the
+/// hardware encoder where the host has one, and otherwise `Prefer` falls back
+/// to software and `Require` is unavailable; either way the two agree, and a
+/// created encoder reports what the capability promised.
+#[test]
+fn the_hardware_preference_selects_hardware_only_where_the_host_has_it() {
+    let factory = native_vp9_video_encoder_factory();
+    // RGBA is an input every platform's hardware encoder takes.
+    let mut config = configuration(64, 48, PixelFormat::Rgba8);
+    let software = CodecSupport::Supported {
+        implementation: CodecImplementation::Software,
+    };
+    let hardware = CodecSupport::Supported {
+        implementation: CodecImplementation::Hardware,
+    };
+    assert_eq!(factory.capability(&config), software);
+    config.hardware = HardwarePreference::Require;
+    let required = factory.capability(&config);
+    config.hardware = HardwarePreference::Prefer;
+    let preferred = factory.capability(&config);
+    if required == hardware {
+        assert_eq!(preferred, hardware);
+    } else {
+        assert_eq!(required, CodecSupport::HardwareUnavailable);
+        assert_eq!(preferred, software);
+        config.hardware = HardwarePreference::Require;
+        let error = factory.create(&config, &Limits::default()).err().unwrap();
+        assert_eq!(error.kind(), ErrorKind::Unsupported, "{error}");
+    }
+    for preference in [HardwarePreference::Avoid, HardwarePreference::Prefer] {
+        config.hardware = preference;
+        let encoder = factory.create(&config, &Limits::default()).unwrap();
+        let CodecSupport::Supported { implementation } = factory.capability(&config) else {
+            unreachable!("checked above");
+        };
+        assert_eq!(encoder.implementation(), implementation, "{preference:?}");
+    }
+
+    // What no hardware encoder can take is an invalid configuration for
+    // `Require` where the platform has hardware encoders, and `Prefer` still
+    // falls back to software for it. Linux has none at all.
+    for (width, height, range) in [(63, 48, ColorRange::Limited), (64, 48, ColorRange::Full)] {
+        let mut config = configuration(width, height, PixelFormat::Rgba8);
+        config.color_range = range;
+        config.hardware = HardwarePreference::Require;
+        let support = factory.capability(&config);
+        if cfg!(any(windows, target_os = "macos")) {
+            assert!(
+                matches!(support, CodecSupport::InvalidConfiguration { .. }),
+                "{width}x{height} {range:?}: {support:?}"
+            );
+        } else {
+            assert_eq!(support, CodecSupport::HardwareUnavailable);
+        }
+        config.hardware = HardwarePreference::Prefer;
+        assert_eq!(factory.capability(&config), software);
+    }
+}
+
+#[test]
+fn hardware_requests_map_the_quantizer_onto_quality() {
+    let request = |blob: Vec<u8>| {
+        let mut config = configuration(1920, 1080, PixelFormat::Rgba8);
+        config.configuration = blob;
+        hardware_request(&config).unwrap()
+    };
+    assert_eq!(request(vec![1]).quality, 1.0);
+    assert_eq!(request(vec![255]).quality, 0.0);
+    let default = request(Vec::new());
+    assert_eq!(default.quality, f64::from(255 - DEFAULT_BASE_Q_IDX) / 254.0);
+    assert_eq!(
+        default.keyframe_interval,
+        u32::from(DEFAULT_KEYFRAME_INTERVAL)
+    );
+    assert_eq!(request(vec![60, 0, 5]).keyframe_interval, 5);
+    // Finer quantizers declare more bits, and 1080p at about 30 frames a
+    // second declares about 10 Mbit/s at the default.
+    assert!(request(vec![10]).nominal_bits_per_second > default.nominal_bits_per_second);
+    assert!(request(vec![250]).nominal_bits_per_second < default.nominal_bits_per_second);
+    assert!((8_000_000..12_000_000).contains(&default.nominal_bits_per_second));
+
+    let rejected = |config: VideoEncoderConfig| hardware_request(&config).unwrap_err();
+    assert!(rejected(configuration(17, 10, PixelFormat::Rgba8)).contains("even"));
+    let mut full = configuration(64, 48, PixelFormat::Rgba8);
+    full.color_range = ColorRange::Full;
+    assert!(rejected(full).contains("limited-range"));
+    let mut blob = configuration(64, 48, PixelFormat::Rgba8);
+    blob.configuration = vec![0];
+    assert_eq!(rejected(blob.clone()), CONFIGURATION_SHAPE);
+    // Error resilience is the software encoder's alone.
+    blob.configuration = vec![60, 0, 5, FLAG_ERROR_RESILIENT];
+    assert!(rejected(blob).contains("error resilient"));
+}
+
+/// A hardware encoder's samples are sync samples exactly when they open on a
+/// key frame, and that key frame's colour fields are what the `vpcC` declares:
+/// checked here against the software encoder's own key and inter frames.
+#[cfg(any(windows, target_os = "macos"))]
+#[test]
+fn key_frame_vpcc_finds_key_frames_and_their_colour() {
+    let mut config = configuration(64, 48, PixelFormat::Yuv420p8);
+    config.configuration = vec![60, 0, 3];
+    let level = pick_level(
+        config.coded_dimensions,
+        config.timescale,
+        config.frame_duration,
+    )
+    .unwrap();
+    let declared = NativeVp9Encoder::new(&config, &Limits::default())
+        .unwrap()
+        .declared
+        .decoder_config;
+    let (samples, _, _) = encode_sequence(&config, 6);
+    for (index, sample) in samples.iter().enumerate() {
+        let found = key_frame_vpcc(&sample.data, level);
+        assert_eq!(found.is_some(), sample.is_sync, "frame {index}");
+        if let Some(vpcc) = found {
+            assert_eq!(vpcc, declared, "frame {index}");
+        }
+    }
+    assert_eq!(key_frame_vpcc(&[], level), None);
 }
 
 #[test]

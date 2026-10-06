@@ -1,6 +1,7 @@
-//! Dependency-free native VP9 encoding.
+//! Native VP9 encoding: a dependency-free software encoder, and the
+//! platform's hardware encoder where the host has one.
 //!
-//! The backend encodes VP9 profile 0 (8-bit 4:2:0) with key frames and
+//! The software backend encodes VP9 profile 0 (8-bit 4:2:0) with key frames and
 //! inter frames. A key frame starts every group of pictures, and each inter
 //! frame predicts from the frame before it, so every sample after a key frame
 //! up to the next one depends on the samples before it. See [`frame`] for the
@@ -11,7 +12,9 @@
 //! frames, a single nonzero `base_q_idx` byte, that byte followed by the key
 //! frame interval in frames as a big-endian `u16`, or those three bytes
 //! followed by a flags byte whose bit 0 ([`FLAG_ERROR_RESILIENT`]) makes every
-//! frame error resilient. See [`parse_configuration`].
+//! frame error resilient. See [`parse_configuration`]. A hardware encoder
+//! takes the same configuration without that flag: it is rate controlled by
+//! quality, which `base_q_idx` maps onto, instead of to a bitrate.
 
 mod bitwriter;
 mod context;
@@ -41,12 +44,23 @@ pub const FLAG_ERROR_RESILIENT: u8 = 1;
 /// than one tile column above this width.
 const MAX_WIDTH: u32 = 4096;
 
-/// Returns the native software VP9 encoder backend.
+/// Returns the native VP9 profile 0 encoder backend.
 ///
-/// It encodes VP9 profile 0 from `Yuv420p8`, `Rgba8`, `Bgra8` or `Gray8`
-/// frames up to 4096 pixels wide, entirely in Rust. RGB input is converted
-/// to 4:2:0 with the BT.601 matrix in the configured range. Hardware is never
-/// used: `HardwarePreference::Require` reports `HardwareUnavailable`.
+/// `Avoid` always selects the software encoder, which encodes VP9 profile 0
+/// from `Yuv420p8`, `Rgba8`, `Bgra8` or `Gray8` frames up to 4096 pixels wide,
+/// entirely in Rust. RGB input is converted to 4:2:0 with the BT.601 matrix in
+/// the configured range.
+///
+/// `Prefer` and `Require` ask for a hardware encoder: on Windows the GPU
+/// vendor's Media Foundation VP9 encoder (for example Intel Quick Sync), which
+/// takes `Rgba8`, `Bgra8` or `Yuv420p8`, and on macOS VideoToolbox's, which
+/// takes `Rgba8` or `Bgra8`, in both cases limited-range input at even
+/// dimensions. Its output is a VP9 profile 0 stream like the software
+/// encoder's, with a `vpcC` built from its first key frame. `Prefer` falls
+/// back to the software encoder when no hardware encoder is usable, and
+/// `Require` reports [`CodecSupport::HardwareUnavailable`] instead. Linux has
+/// no hardware encoder yet. [`VideoEncoder::implementation`] and
+/// [`VideoEncoder::backend_name`] report which one a created encoder is.
 pub fn native_vp9_video_encoder_factory() -> impl VideoEncoderFactory {
     NativeVp9EncoderFactory
 }
@@ -55,6 +69,22 @@ struct NativeVp9EncoderFactory;
 
 impl VideoEncoderFactory for NativeVp9EncoderFactory {
     fn capability(&self, configuration: &VideoEncoderConfig) -> CodecSupport {
+        if configuration.codec != Codec::Vp9 {
+            return CodecSupport::UnsupportedCodec;
+        }
+        if configuration.profile != CodecProfile::Vp9Profile0 {
+            return CodecSupport::UnsupportedProfile;
+        }
+        if configuration.hardware != HardwarePreference::Avoid {
+            if platform::capability(configuration) {
+                return CodecSupport::Supported {
+                    implementation: CodecImplementation::Hardware,
+                };
+            }
+            if configuration.hardware == HardwarePreference::Require {
+                return platform::unavailable(configuration);
+            }
+        }
         validate_configuration(configuration)
     }
 
@@ -63,7 +93,214 @@ impl VideoEncoderFactory for NativeVp9EncoderFactory {
         configuration: &VideoEncoderConfig,
         limits: &Limits,
     ) -> Result<Box<dyn VideoEncoder>> {
+        if configuration.codec != Codec::Vp9 || configuration.profile != CodecProfile::Vp9Profile0 {
+            return Err(capability_error(self.capability(configuration)));
+        }
+        if configuration.hardware != HardwarePreference::Avoid {
+            match platform::create(configuration, limits) {
+                Ok(encoder) => return Ok(encoder),
+                Err(error) if configuration.hardware == HardwarePreference::Require => {
+                    return Err(error);
+                }
+                Err(_) => {}
+            }
+        }
         Ok(Box::new(NativeVp9Encoder::new(configuration, limits)?))
+    }
+}
+
+/// What a hardware encoder is asked for, resolved from a configuration on
+/// every platform alike.
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct HardwareRequest {
+    /// `base_q_idx` mapped onto `0.0..=1.0`, best quality highest.
+    quality: f64,
+    /// A nominal bitrate for that quality, for encoders that want one declared
+    /// even when they are rate controlled by quality.
+    nominal_bits_per_second: u32,
+    keyframe_interval: u32,
+}
+
+/// The hardware request `configuration` resolves to, or why no hardware
+/// encoder can take it. Platform restrictions, such as the input formats a
+/// backend converts, are the backend's to add.
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+fn hardware_request(
+    configuration: &VideoEncoderConfig,
+) -> std::result::Result<HardwareRequest, String> {
+    let dimensions = configuration.coded_dimensions;
+    if dimensions.width == 0 || dimensions.height == 0 {
+        return Err("VP9 coded dimensions must be nonzero".into());
+    }
+    if dimensions.width % 2 != 0 || dimensions.height % 2 != 0 {
+        return Err("hardware VP9 encoding requires even dimensions".into());
+    }
+    if configuration.color_range != ColorRange::Limited {
+        return Err("hardware VP9 encoding requires limited-range input".into());
+    }
+    if configuration.timescale == 0 || configuration.frame_duration == 0 {
+        return Err("VP9 timescale and frame duration must be nonzero".into());
+    }
+    let settings = parse_configuration(&configuration.configuration).ok_or(CONFIGURATION_SHAPE)?;
+    if settings.error_resilient {
+        return Err("hardware VP9 encoders cannot code every frame error resilient".into());
+    }
+    pick_level(
+        dimensions,
+        configuration.timescale,
+        configuration.frame_duration,
+    )
+    .ok_or("VP9 dimensions and frame rate exceed level 6.2 limits")?;
+    // `base_q_idx` 1 is the finest quantizer and 255 the coarsest.
+    let quality = f64::from(255 - settings.base_q_idx) / 254.0;
+    // About 0.17 bits a pixel at the default quantizer, rising steeply toward
+    // the finest one: 1080p30 at the default declares roughly 10 Mbit/s.
+    let bits_per_pixel = 0.05 + 0.25 * quality * quality;
+    let pixels_per_second = f64::from(dimensions.width)
+        * f64::from(dimensions.height)
+        * f64::from(configuration.timescale)
+        / f64::from(configuration.frame_duration);
+    Ok(HardwareRequest {
+        quality,
+        nominal_bits_per_second: (pixels_per_second * bits_per_pixel)
+            .clamp(100_000.0, f64::from(i32::MAX)) as u32,
+        keyframe_interval: u32::from(settings.keyframe_interval),
+    })
+}
+
+/// The `vpcC` a chunk's first frame signals, or `None` when that frame is not
+/// a profile 0 key frame. A hardware encoder's sample is a sync sample exactly
+/// when this is `Some`, and every key frame has to signal what the track
+/// declares.
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) fn key_frame_vpcc(chunk: &[u8], level: u8) -> Option<Vec<u8>> {
+    let frames = crate::vp9_dec::chunk_frames(chunk).ok()?;
+    vpcc_from_key_frame(frames.first()?, level)
+}
+
+/// The hardware encoders, behind one interface so the factory reads the same
+/// on every target.
+#[cfg(windows)]
+mod platform {
+    use crate::hevc::windows_mf_encoder::{self, MftClass, OutputFormat, Settings};
+    use crate::{CodecSupport, Error, ErrorKind, Limits, Result, VideoEncoder, VideoEncoderConfig};
+
+    /// The Media Foundation request `c` resolves to, or why it cannot be one.
+    fn settings(c: &VideoEncoderConfig) -> std::result::Result<Settings, String> {
+        let request = super::hardware_request(c)?;
+        let settings = Settings {
+            format: OutputFormat::Vp9,
+            width: c.coded_dimensions.width,
+            height: c.coded_dimensions.height,
+            input_format: c.input_format,
+            timescale: c.timescale,
+            frame_duration: c.frame_duration,
+            bits_per_second: request.nominal_bits_per_second,
+            quality: Some((request.quality * 100.0).round() as u32),
+            keyframe_interval: request.keyframe_interval,
+        };
+        match settings.unsupported_reason() {
+            Some(reason) => Err(reason),
+            None => Ok(settings),
+        }
+    }
+
+    /// Whether a hardware VP9 MFT accepts `c`. Microsoft ships no software
+    /// VP9 encoder, and the native one is the fallback in any case.
+    pub(super) fn capability(c: &VideoEncoderConfig) -> bool {
+        settings(c)
+            .is_ok_and(|settings| windows_mf_encoder::probe(settings, MftClass::Hardware).is_ok())
+    }
+
+    /// Why `Require` cannot be met: a configuration no hardware encoder takes
+    /// is invalid, and one it would take on a host without one is unavailable.
+    pub(super) fn unavailable(c: &VideoEncoderConfig) -> CodecSupport {
+        match settings(c) {
+            Err(reason) => CodecSupport::InvalidConfiguration { reason },
+            Ok(_) => CodecSupport::HardwareUnavailable,
+        }
+    }
+
+    pub(super) fn create(c: &VideoEncoderConfig, limits: &Limits) -> Result<Box<dyn VideoEncoder>> {
+        let settings = settings(c).map_err(|reason| Error::new(ErrorKind::InvalidInput, reason))?;
+        windows_mf_encoder::create(settings, MftClass::Hardware, limits).map_err(|error| {
+            Error::new(
+                ErrorKind::Unsupported,
+                format!("hardware VP9 encoding is unavailable ({})", error.message()),
+            )
+        })
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod platform {
+    use crate::hevc::videotoolbox_encoder::{self, Settings};
+    use crate::{
+        Codec, CodecSupport, Error, ErrorKind, Limits, PixelFormat, Result, VideoEncoder,
+        VideoEncoderConfig,
+    };
+
+    /// The VideoToolbox request `c` resolves to, or why it cannot be one.
+    fn settings(c: &VideoEncoderConfig) -> std::result::Result<Settings, String> {
+        let request = super::hardware_request(c)?;
+        if !matches!(c.input_format, PixelFormat::Rgba8 | PixelFormat::Bgra8) {
+            return Err("VideoToolbox VP9 encoding requires Rgba8 or Bgra8 input".into());
+        }
+        if i32::try_from(c.timescale).is_err() {
+            return Err("VideoToolbox VP9 encoding requires a timescale below 2^31".into());
+        }
+        Ok(Settings {
+            bits_per_second: request.nominal_bits_per_second,
+            quality: Some(request.quality),
+            keyframe_interval: request.keyframe_interval,
+        })
+    }
+
+    pub(super) fn capability(c: &VideoEncoderConfig) -> bool {
+        settings(c).is_ok() && videotoolbox_encoder::is_available(Codec::Vp9, c.coded_dimensions)
+    }
+
+    /// Why `Require` cannot be met: a configuration VideoToolbox cannot take
+    /// is invalid, and one it would take on a host without the hardware is
+    /// unavailable.
+    pub(super) fn unavailable(c: &VideoEncoderConfig) -> CodecSupport {
+        match settings(c) {
+            Err(reason) => CodecSupport::InvalidConfiguration { reason },
+            Ok(_) => CodecSupport::HardwareUnavailable,
+        }
+    }
+
+    pub(super) fn create(c: &VideoEncoderConfig, limits: &Limits) -> Result<Box<dyn VideoEncoder>> {
+        let settings = settings(c).map_err(|reason| Error::new(ErrorKind::InvalidInput, reason))?;
+        if !videotoolbox_encoder::is_available(Codec::Vp9, c.coded_dimensions) {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                "hardware VP9 encoding is unavailable (VideoToolbox has no hardware VP9 \
+                 encoder for this size)",
+            ));
+        }
+        videotoolbox_encoder::create(c, limits, settings)
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+mod platform {
+    use crate::{CodecSupport, Error, ErrorKind, Limits, Result, VideoEncoder, VideoEncoderConfig};
+
+    pub(super) fn capability(_: &VideoEncoderConfig) -> bool {
+        false
+    }
+
+    pub(super) fn unavailable(_: &VideoEncoderConfig) -> CodecSupport {
+        CodecSupport::HardwareUnavailable
+    }
+
+    pub(super) fn create(_: &VideoEncoderConfig, _: &Limits) -> Result<Box<dyn VideoEncoder>> {
+        Err(Error::new(
+            ErrorKind::Unsupported,
+            "hardware VP9 encoding is unavailable (no platform encoder exists for this target)",
+        ))
     }
 }
 
@@ -78,9 +315,6 @@ fn validate_configuration(configuration: &VideoEncoderConfig) -> CodecSupport {
     }
     if configuration.profile != CodecProfile::Vp9Profile0 {
         return CodecSupport::UnsupportedProfile;
-    }
-    if configuration.hardware == HardwarePreference::Require {
-        return CodecSupport::HardwareUnavailable;
     }
     let dimensions = configuration.coded_dimensions;
     if dimensions.width == 0 || dimensions.height == 0 {
@@ -262,7 +496,7 @@ fn capability_error(support: CodecSupport) -> Error {
         }
         CodecSupport::HardwareUnavailable => (
             ErrorKind::Unsupported,
-            "the native VP9 encoder is software-only",
+            "no hardware VP9 encoder is available",
         ),
         CodecSupport::Supported { .. } => (
             ErrorKind::Internal,
