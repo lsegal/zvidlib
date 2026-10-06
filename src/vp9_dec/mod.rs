@@ -30,7 +30,8 @@ mod block;
 // What the hardware backends read from a chunk before handing it to the platform decoder.
 #[cfg(any(
     test,
-    all(any(windows, target_os = "linux"), target_pointer_width = "64"),
+    windows,
+    all(target_os = "linux", target_pointer_width = "64"),
     target_os = "macos"
 ))]
 mod chunk;
@@ -51,7 +52,8 @@ use probs::{FrameContext, FrameCounts};
 
 #[cfg(any(
     test,
-    all(any(windows, target_os = "linux"), target_pointer_width = "64"),
+    windows,
+    all(target_os = "linux", target_pointer_width = "64"),
     target_os = "macos"
 ))]
 pub(crate) use chunk::{ChunkInspector, FrameShape, chunk_frames};
