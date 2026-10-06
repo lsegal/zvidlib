@@ -207,14 +207,19 @@ The conversion's `scalar` arm is the fixed-point scalar code, not the `f64`
 loop it replaced. The vector arms are bit-exact with it, and it is bit-exact
 with that `f64` definition for every input: pixels whose fixed-point value
 lands next to a rounding boundary, about 0.1-0.9% of random content, are
-recomputed in `f64`. Indicative timings from the #574 pull request, on a
-20-thread x86_64 host that other builds were loading at the time (so read the
-ratios, not the absolute times):
+recomputed in `f64`. Indicative medians from two runs for the #574 pull
+request, on a 20-thread x86_64 host that other builds were loading at the time,
+so read the ratios rather than the absolute times; the first column is the
+fastest the replaced `f64` loop measured over three runs on the same host:
 
 | Group | `f64` before #574 | `scalar` | `sse4.1` | `avx2` |
 | --- | ---: | ---: | ---: | ---: |
-| `yuv_to_rgba_1080p` | ~90 ms | 35.3 ms | 11.8 ms (3.0x) | 7.8 ms (4.5x) |
-| `yuv_to_rgba_4k` | ~324 ms | 113.2 ms | 39.0 ms (2.9x) | 21.3 ms (5.3x) |
+| `yuv_to_rgba_1080p` | 54 ms or more | 25.8-35.3 ms | 10.1-11.8 ms (2.6-3.0x) | 7.8-9.7 ms (2.7-4.5x) |
+| `yuv_to_rgba_4k` | 217 ms or more | 97.0-113.2 ms | 32.5-39.0 ms (2.9-3.0x) | 21.3-31.1 ms (3.1-5.3x) |
+
+The decode groups' arms could not be told apart on that host: two arms running
+identical code differed by up to 2x between runs. The CI timed-benchmark job
+measures this target on every `main` push, on uncontended runners.
 
 ## The AV1 encoder suite (`--bench av1_encode`)
 
