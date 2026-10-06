@@ -53,6 +53,37 @@ fn moving_yuv_frame(width: u32, height: u32, index: u32) -> VideoFrame {
     let cr = (0..chroma_width * chroma_height)
         .map(|i| (150 - (i / chroma_width) % 40) as u8)
         .collect();
+    yuv_frame(width, height, luma, cb, cr)
+}
+
+/// Smooth detail that pans 1.375 samples right and 0.625 down a frame, so
+/// only sub-sample motion vectors predict it well.
+fn sub_sample_yuv_frame(width: u32, height: u32, index: u32) -> VideoFrame {
+    let (width, height) = (width as usize, height as usize);
+    let (chroma_width, chroma_height) = (width.div_ceil(2), height.div_ceil(2));
+    let (dx, dy) = (f64::from(index) * 1.375, f64::from(index) * 0.625);
+    let scene = |x: f64, y: f64| {
+        128.0
+            + 45.0 * (0.41 * (x - dx)).sin() * (0.23 * (y - dy)).cos()
+            + 30.0 * (0.17 * (x - dx) + 0.29 * (y - dy)).sin()
+    };
+    let sample = |value: f64| value.round().clamp(0.0, 255.0) as u8;
+    let luma = (0..width * height)
+        .map(|i| sample(scene((i % width) as f64, (i / width) as f64)))
+        .collect();
+    let chroma = |offset: f64| -> Vec<u8> {
+        (0..chroma_width * chroma_height)
+            .map(|i| {
+                let (x, y) = ((i % chroma_width) as f64, (i / chroma_width) as f64);
+                sample(128.0 + 0.4 * (scene(x * 2.0 + 0.5, y * 2.0 + 0.5) - 128.0) + offset)
+            })
+            .collect()
+    };
+    yuv_frame(width, height, luma, chroma(-10.0), chroma(10.0))
+}
+
+fn yuv_frame(width: usize, height: usize, luma: Vec<u8>, cb: Vec<u8>, cr: Vec<u8>) -> VideoFrame {
+    let chroma_width = width.div_ceil(2);
     VideoFrame::new(
         VideoDimensions {
             width: width as u32,
@@ -97,11 +128,26 @@ fn reconstruction(encoder: &NativeVp9Encoder) -> Vec<u8> {
     bytes
 }
 
+type Content = fn(u32, u32, u32) -> VideoFrame;
+
 fn encode_sequence(
     config: &VideoEncoderConfig,
     frames: u32,
 ) -> (Vec<EncodedSample>, Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    encode_content(config, frames, moving_yuv_frame, false)
+}
+
+/// Encodes `frames` frames of `content`, searching whole-sample motion only
+/// when `whole_sample_motion` is set; returns the samples, reconstructions
+/// and sources.
+fn encode_content(
+    config: &VideoEncoderConfig,
+    frames: u32,
+    content: Content,
+    whole_sample_motion: bool,
+) -> (Vec<EncodedSample>, Vec<Vec<u8>>, Vec<Vec<u8>>) {
     let mut encoder = NativeVp9Encoder::new(config, &Limits::default()).unwrap();
+    encoder.whole_sample_motion = whole_sample_motion;
     let mut samples = Vec::new();
     let mut reconstructions = Vec::new();
     let mut sources = Vec::new();
@@ -110,7 +156,7 @@ fn encode_sequence(
         config.coded_dimensions.height,
     );
     for index in 0..frames {
-        let frame = moving_yuv_frame(width, height, index);
+        let frame = content(width, height, index);
         sources.push(
             frame
                 .planes
@@ -300,6 +346,32 @@ fn inter_frames_are_smaller_than_key_frames_for_moving_content() {
 }
 
 #[test]
+fn sub_sample_motion_shrinks_output_at_equal_or_better_quality() {
+    for base_q_idx in [40, DEFAULT_BASE_Q_IDX, 150] {
+        let mut config = configuration(96, 64, PixelFormat::Yuv420p8);
+        config.configuration = vec![base_q_idx];
+        let measure = |whole_sample_motion| {
+            let (samples, reconstructions, sources) =
+                encode_content(&config, 8, sub_sample_yuv_frame, whole_sample_motion);
+            let bytes: usize = samples[1..].iter().map(|sample| sample.data.len()).sum();
+            let quality = reconstructions[1..]
+                .iter()
+                .zip(&sources[1..])
+                .map(|(reconstruction, source)| psnr(reconstruction, source))
+                .sum::<f64>()
+                / 7.0;
+            (bytes, quality)
+        };
+        let (whole_bytes, whole_quality) = measure(true);
+        let (bytes, quality) = measure(false);
+        assert!(
+            bytes * 3 < whole_bytes * 2 && quality >= whole_quality,
+            "q{base_q_idx}: {bytes} bytes at {quality:.2} dB against {whole_bytes} bytes at              {whole_quality:.2} dB with whole-sample motion"
+        );
+    }
+}
+
+#[test]
 fn rgba_input_converts_with_bt601() {
     let config = configuration(16, 16, PixelFormat::Rgba8);
     let mut encoder = NativeVp9Encoder::new(&config, &Limits::default()).unwrap();
@@ -410,7 +482,16 @@ mod ffmpeg {
         output.stdout
     }
 
+    /// Checks both the whole-sample test content and the sub-sample content,
+    /// whose eighth-sample vectors exercise the 8-tap filters and the
+    /// high-precision motion vector bits.
     fn assert_decoders_match_reconstruction(config: &VideoEncoderConfig, frames: u32) {
+        for content in [moving_yuv_frame as Content, sub_sample_yuv_frame] {
+            assert_decoders_match_content(config, frames, content);
+        }
+    }
+
+    fn assert_decoders_match_content(config: &VideoEncoderConfig, frames: u32, content: Content) {
         let decoders: Vec<&str> = ["vp9", "libvpx-vp9"]
             .into_iter()
             .filter(|name| decoder_available(name))
@@ -419,7 +500,7 @@ mod ffmpeg {
             eprintln!("skipping independent VP9 decode because ffmpeg has no VP9 decoder");
             return;
         }
-        let (samples, reconstructions, _) = encode_sequence(config, frames);
+        let (samples, reconstructions, _) = encode_content(config, frames, content, false);
         let (width, height) = (
             config.coded_dimensions.width,
             config.coded_dimensions.height,

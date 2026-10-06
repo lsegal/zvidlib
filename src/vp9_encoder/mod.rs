@@ -286,6 +286,9 @@ struct NativeVp9Encoder {
     reference: Option<Picture>,
     next_index: u64,
     finished: bool,
+    /// Searches whole-sample motion only, to compare against in tests.
+    #[cfg(test)]
+    whole_sample_motion: bool,
 }
 
 impl VideoEncoder for NativeVp9Encoder {
@@ -358,6 +361,8 @@ impl NativeVp9Encoder {
             reference: None,
             next_index: 0,
             finished: false,
+            #[cfg(test)]
+            whole_sample_motion: false,
         })
     }
 
@@ -398,9 +403,14 @@ impl NativeVp9Encoder {
 
         let key = index.0 % self.keyframe_interval == 0;
         let reference = if key { None } else { self.reference.as_ref() };
-        let (data, reconstruction) =
-            FrameEncoder::new(self.geometry, &picture, reference, self.base_q_idx)
-                .encode(self.color_range == ColorRange::Full);
+        let frame_encoder = FrameEncoder::new(self.geometry, &picture, reference, self.base_q_idx);
+        #[cfg(test)]
+        let frame_encoder = if self.whole_sample_motion {
+            frame_encoder.whole_sample_motion()
+        } else {
+            frame_encoder
+        };
+        let (data, reconstruction) = frame_encoder.encode(self.color_range == ColorRange::Full);
         if u64::try_from(data.len()).unwrap_or(u64::MAX) > self.limits.max_allocation_bytes {
             return Err(Error::new(
                 ErrorKind::ResourceLimit,

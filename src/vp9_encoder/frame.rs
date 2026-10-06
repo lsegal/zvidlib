@@ -268,8 +268,7 @@ impl<'a> FrameEncoder<'a> {
             // The transform's coefficients are eight times orthonormal, so the
             // effective step is `ac / 8`.
             lambda: f64::from(ac * ac) / 96.0,
-            allow_high_precision_mv: reference.is_some()
-                && base_q_idx < HIGH_PRECISION_MV_QTHRESH,
+            allow_high_precision_mv: reference.is_some() && base_q_idx < HIGH_PRECISION_MV_QTHRESH,
             subpel_step: 1,
             mode_info: vec![ModeInfo::default(); geometry.mi_cols * geometry.mi_rows],
             above_nonzero: [
@@ -739,23 +738,38 @@ impl<'a> FrameEncoder<'a> {
         let [nearest, near] = candidates;
 
         // Whole-sample search, kept within 64 samples of the block so every
-        // vector stays in the cheap motion vector classes.
+        // vector stays in the cheap motion vector classes. A diamond search
+        // alone settles on false minima in detailed texture, so it starts from
+        // the best of an exhaustive search of the four samples around zero and
+        // the sample around each candidate.
         let range = 64 * 8;
         let mut best_mv = Mv::default();
         let mut best_sad = self.luma_sad(reference, mi_row, mi_col, best_mv, u32::MAX);
-        for start in [nearest, near] {
-            let start = Mv {
-                row: start.row / 8 * 8,
-                col: start.col / 8 * 8,
+        let mut whole = |center: Mv, radius: i32| {
+            let center = Mv {
+                row: center.row / 8 * 8,
+                col: center.col / 8 * 8,
             };
-            if start.row.abs() <= range && start.col.abs() <= range {
-                let sad = self.luma_sad(reference, mi_row, mi_col, start, best_sad);
-                if sad < best_sad {
-                    best_sad = sad;
-                    best_mv = start;
+            for row in -radius..=radius {
+                for col in -radius..=radius {
+                    let candidate = Mv {
+                        row: center.row + row * 8,
+                        col: center.col + col * 8,
+                    };
+                    if candidate.row.abs() > range || candidate.col.abs() > range {
+                        continue;
+                    }
+                    let sad = self.luma_sad(reference, mi_row, mi_col, candidate, best_sad);
+                    if sad < best_sad {
+                        best_sad = sad;
+                        best_mv = candidate;
+                    }
                 }
             }
-        }
+        };
+        whole(nearest, 1);
+        whole(near, 1);
+        whole(Mv::default(), 4);
         for step in [8, 4, 2, 1] {
             let delta = step * 8;
             for _ in 0..16 {
@@ -791,39 +805,25 @@ impl<'a> FrameEncoder<'a> {
             }
         }
 
-        // Sub-sample refinement around the whole-sample vector, measured on
-        // the 8-tap prediction itself and including the rate of coding it.
+        // Sub-sample refinement around the whole-sample vector and the
+        // candidates, measured on the 8-tap prediction itself and including
+        // the rate of coding it: half, then quarter, then eighth samples.
         let usehp = self.allow_high_precision_mv && use_mv_hp(nearest);
-        let motion_bits = |mv: Mv| -> Option<f64> {
-            let mode = inter_mode(mv, nearest, near);
-            let mut bits = tree_bits(
-                &INTER_MODE_TREE,
-                &INTER_MODE_PROBS[mode_context * 3..mode_context * 3 + 3],
-                mode - NEARESTMV,
-            );
-            if mode == NEWMV {
-                let difference = Mv {
-                    row: mv.row - nearest.row,
-                    col: mv.col - nearest.col,
-                };
-                // Without eighth samples only even differences are codable.
-                if !usehp && (difference.row | difference.col) & 1 != 0 {
-                    return None;
-                }
-                bits += mv_bits(difference, usehp);
-            }
-            Some(bits)
-        };
+        let motion_bits = |mv: Mv| motion_bits(mv, candidates, mode_context, usehp);
+        let whole_mv = best_mv;
         if self.subpel_step < 8 {
             let finest = if usehp {
                 self.subpel_step
             } else {
                 self.subpel_step.max(2)
             };
+            // The prediction error overstates the distortion left once the
+            // residual is coded, so rate weighs a quarter of what it does in
+            // the mode decision.
             let cost = |mv: Mv| {
                 motion_bits(mv).map(|bits| {
                     self.luma_prediction_error(reference, mi_row, mi_col, mv) as f64
-                        + self.lambda * bits
+                        + 0.25 * self.lambda * bits
                 })
             };
             let mut best_cost = cost(best_mv).unwrap_or(f64::INFINITY);
@@ -866,8 +866,51 @@ impl<'a> FrameEncoder<'a> {
             }
         }
 
-        let mode = inter_mode(best_mv, nearest, near);
-        let mut bits = motion_bits(best_mv).expect("the chosen motion vector is codable");
+        // Prediction error is only a proxy for what the residual costs to
+        // code, so the refined vector has to beat the whole-sample one on the
+        // coded rate and distortion.
+        let mut choice = self.code_inter(
+            reference,
+            mi_row,
+            mi_col,
+            whole_mv,
+            candidates,
+            mode_context,
+            usehp,
+        );
+        if best_mv != whole_mv {
+            let refined = self.code_inter(
+                reference,
+                mi_row,
+                mi_col,
+                best_mv,
+                candidates,
+                mode_context,
+                usehp,
+            );
+            if refined.cost < choice.cost {
+                choice = refined;
+            }
+        }
+        Some(choice)
+    }
+
+    /// Predicts the block with `mv` and codes its residual.
+    #[allow(clippy::too_many_arguments)]
+    fn code_inter(
+        &mut self,
+        reference: &Picture,
+        mi_row: usize,
+        mi_col: usize,
+        mv: Mv,
+        candidates: [Mv; 2],
+        mode_context: usize,
+        usehp: bool,
+    ) -> BlockChoice {
+        let [nearest, near] = candidates;
+        let mode = inter_mode(mv, nearest, near);
+        let mut bits = motion_bits(mv, candidates, mode_context, usehp)
+            .expect("the chosen motion vector is codable");
         let above = self.above_info(mi_row, mi_col);
         let left = self.left_info(mi_row, mi_col);
         bits += bool_bits(true, INTRA_INTER_PROBS[intra_inter_context(above, left)]);
@@ -896,8 +939,8 @@ impl<'a> FrameEncoder<'a> {
                 x,
                 y,
                 size,
-                best_mv.row * scale,
-                best_mv.col * scale,
+                mv.row * scale,
+                mv.col * scale,
                 &mut prediction,
             );
             let stride = self.recon.strides[plane];
@@ -929,11 +972,11 @@ impl<'a> FrameEncoder<'a> {
                     .copy_from_slice(&self.recon.planes[plane][start..start + 4]);
             }
         }
-        Some(BlockChoice {
+        BlockChoice {
             info: ModeInfo {
                 is_inter: true,
                 mode,
-                mv: best_mv,
+                mv,
                 skip: false,
             },
             uv_mode: IntraMode::Dc,
@@ -943,7 +986,7 @@ impl<'a> FrameEncoder<'a> {
             luma,
             chroma,
             cost: error as f64 + self.lambda * bits,
-        })
+        }
     }
 
     fn write_mode_info(&mut self, mi_row: usize, mi_col: usize, choice: &BlockChoice) {
@@ -1198,6 +1241,29 @@ fn mv_class(z: u32) -> (usize, u32) {
     (class, z - base)
 }
 
+/// The cost in bits of coding `mv` as an inter mode and, for `NEWMV`, a
+/// difference from the nearest candidate, or `None` when the difference has an
+/// eighth-sample component the block cannot code.
+fn motion_bits(mv: Mv, [nearest, near]: [Mv; 2], mode_context: usize, usehp: bool) -> Option<f64> {
+    let mode = inter_mode(mv, nearest, near);
+    let mut bits = tree_bits(
+        &INTER_MODE_TREE,
+        &INTER_MODE_PROBS[mode_context * 3..mode_context * 3 + 3],
+        mode - NEARESTMV,
+    );
+    if mode == NEWMV {
+        let difference = Mv {
+            row: mv.row - nearest.row,
+            col: mv.col - nearest.col,
+        };
+        if !usehp && (difference.row | difference.col) & 1 != 0 {
+            return None;
+        }
+        bits += mv_bits(difference, usehp);
+    }
+    Some(bits)
+}
+
 /// The inter mode that codes `mv` given the block's reference candidates.
 fn inter_mode(mv: Mv, nearest: Mv, near: Mv) -> u8 {
     if mv == Mv::default() {
@@ -1241,7 +1307,11 @@ fn write_mv(writer: &mut BoolEncoder, difference: Mv, usehp: bool) {
         writer.tree(&MV_FP_TREE, fp, fraction);
         // Without high-precision vectors the eighth-sample bit is implied.
         if usehp {
-            let hp = if class == 0 { probs.class0_hp } else { probs.hp };
+            let hp = if class == 0 {
+                probs.class0_hp
+            } else {
+                probs.hp
+            };
             writer.write(offset & 1 != 0, hp);
         }
     }
@@ -1297,7 +1367,11 @@ fn mv_bits(difference: Mv, usehp: bool) -> f64 {
         };
         bits += tree_bits(&MV_FP_TREE, fp, ((offset >> 1) & 3) as u8);
         if usehp {
-            let hp = if class == 0 { probs.class0_hp } else { probs.hp };
+            let hp = if class == 0 {
+                probs.class0_hp
+            } else {
+                probs.hp
+            };
             bits += bool_bits(offset & 1 != 0, hp);
         }
     }
