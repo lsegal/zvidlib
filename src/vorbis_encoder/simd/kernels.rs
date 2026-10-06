@@ -74,6 +74,7 @@ enum Presum {
 /// Four iterations of one pre-rotation loop: reads `input` stepping `x0` down
 /// and `x1` up by 16 and `trig` down from `t`, writes `w2[i..i+8)`.
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 unsafe fn presum_group<V: F32x4>(
     kind: Presum,
     input: *const f32,

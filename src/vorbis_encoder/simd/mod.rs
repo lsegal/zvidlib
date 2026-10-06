@@ -39,9 +39,13 @@
 //! are therefore identical with SIMD on and off, which `tests` asserts both
 //! kernel by kernel and on whole encodes.
 
+// Only x86_64 and aarch64 have entry points; elsewhere (`wasm32` included)
+// every dispatcher runs its scalar reference.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 mod kernels;
 #[cfg(test)]
 mod tests;
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 mod vector;
 
 use crate::simd::SimdIsa;

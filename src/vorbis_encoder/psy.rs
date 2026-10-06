@@ -758,6 +758,10 @@ pub(crate) struct NoiseSums {
 }
 
 impl NoiseSums {
+    #[cfg_attr(
+        not(any(target_arch = "x86_64", target_arch = "aarch64")),
+        allow(dead_code)
+    )]
     pub(super) fn len(&self) -> usize {
         self.n.len()
     }
@@ -860,11 +864,11 @@ pub(super) fn noise_fixed_scalar(
     offset: f32,
     noise: &mut [f32],
 ) {
-    for i in start..end {
+    for (i, v) in noise.iter_mut().enumerate().take(end).skip(start) {
         let (a, bb, d) = fixed_fit(sums, fixed, i, reflect);
         let r = (a + i as f32 * bb) / d;
-        if r - offset < noise[i] {
-            noise[i] = r - offset;
+        if r - offset < *v {
+            *v = r - offset;
         }
     }
 }
@@ -880,17 +884,17 @@ pub(super) fn noise_extrapolate_scalar(
     noise: &mut [f32],
 ) {
     let (a, bb, d) = fit;
-    for i in start..end {
+    for (i, v) in noise.iter_mut().enumerate().take(end).skip(start) {
         let mut r = (a + i as f32 * bb) / d;
         if lower_only {
-            if r - offset < noise[i] {
-                noise[i] = r - offset;
+            if r - offset < *v {
+                *v = r - offset;
             }
         } else {
             if r < 0. {
                 r = 0.;
             }
-            noise[i] = r - offset;
+            *v = r - offset;
         }
     }
 }
