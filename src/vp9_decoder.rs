@@ -510,13 +510,14 @@ mod tests {
             }
         }
 
-        let mut backends: Vec<(&str, Create)> = Vec::new();
-        #[cfg(all(any(windows, target_os = "linux"), target_pointer_width = "64"))]
-        backends.push(("NVDEC", crate::hevc::nvdec::create_vp9));
-        #[cfg(windows)]
-        backends.push(("Media Foundation", crate::hevc::windows_mf::create_vp9));
-        #[cfg(target_os = "macos")]
-        backends.push(("VideoToolbox", crate::hevc::videotoolbox_vp9::create_vp9));
+        let backends: [(&str, Create); _] = [
+            #[cfg(all(any(windows, target_os = "linux"), target_pointer_width = "64"))]
+            ("NVDEC", crate::hevc::nvdec::create_vp9),
+            #[cfg(windows)]
+            ("Media Foundation", crate::hevc::windows_mf::create_vp9),
+            #[cfg(target_os = "macos")]
+            ("VideoToolbox", crate::hevc::videotoolbox_vp9::create_vp9),
+        ];
 
         let limits = Limits::default();
         let mut streams = Vec::new();
