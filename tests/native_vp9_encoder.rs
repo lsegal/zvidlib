@@ -479,3 +479,101 @@ fn native_vp9_encoder_passes_conformance_against_an_independent_decoder() {
     assert_eq!(report.frames_encoded, 9);
     assert_eq!(report.packets_emitted, 9);
 }
+
+/// Issue #528's acceptance criterion: the encoder's output decodes
+/// frame-accurately through zvidlib's own VP9 decoder, through the shared
+/// conformance runner and under backwards and forwards seeks across key
+/// frames.
+#[test]
+fn native_vp9_encoder_round_trips_through_the_native_decoder() {
+    let limits = Limits::default();
+    let dimensions = VideoDimensions::new(WIDTH, HEIGHT, &limits).unwrap();
+    let frames: Vec<VideoFrame> = (0..FRAMES)
+        .map(|index| {
+            VideoFrame::new(
+                dimensions,
+                PixelFormat::Rgba8,
+                ColorRange::Limited,
+                vec![Plane {
+                    data: rgba_frame(index),
+                    stride: (WIDTH * 4) as usize,
+                }],
+                &limits,
+            )
+            .unwrap()
+        })
+        .collect();
+    let encoder_configuration = VideoEncoderConfig {
+        codec: Codec::Vp9,
+        profile: CodecProfile::Vp9Profile0,
+        coded_dimensions: dimensions,
+        input_format: PixelFormat::Rgba8,
+        color_range: ColorRange::Limited,
+        hardware: HardwarePreference::Avoid,
+        timescale: 30,
+        frame_duration: 1,
+        configuration: vec![60, 0, 5],
+    };
+    let decoder_configuration = VideoDecoderConfig {
+        codec: Codec::Vp9,
+        profile: CodecProfile::Vp9Profile0,
+        coded_dimensions: dimensions,
+        output_format: PixelFormat::Rgba8,
+        color_range: ColorRange::Limited,
+        hardware: HardwarePreference::Avoid,
+        configuration: Vec::new(),
+    };
+    let vector = VideoEncoderConformanceVector {
+        name: "vp9-rgba-pan-key-every-5".into(),
+        configuration: encoder_configuration.clone(),
+        decoder_configuration: decoder_configuration.clone(),
+        frames: frames.clone(),
+        minimum_psnr_db: 30.0,
+    };
+    let report = block_on(verify_video_encoder_conformance(
+        &native_vp9_video_encoder_factory(),
+        &zvidlib::native_vp9_video_decoder_factory(),
+        &vector,
+        limits,
+    ))
+    .unwrap();
+    assert_eq!(report.frames_encoded, u64::from(FRAMES));
+
+    // Every frame is the same whichever order it is asked for in.
+    let mut encoder = native_vp9_video_encoder_factory()
+        .create(&encoder_configuration, &limits)
+        .unwrap();
+    let mut samples = Vec::new();
+    for (index, frame) in frames.iter().enumerate() {
+        let source = FrameSource::Cpu(CpuFrameSource {
+            frame,
+            orientation: Orientation::TopLeft,
+        });
+        for sample in block_on(encoder.encode(FrameIndex(index as u64), source)).unwrap() {
+            samples.push(EncodedVideoSample {
+                presentation_index: FrameIndex(index as u64),
+                random_access: sample.is_sync,
+                data: sample.data,
+            });
+        }
+    }
+    let mut configuration = decoder_configuration;
+    configuration.configuration = encoder.config().decoder_config.clone();
+    let decoder = zvidlib::native_vp9_video_decoder_factory();
+    let cancellation = CancellationToken::new();
+    let mut sequential =
+        zvidlib::ExactFrameReader::new(&decoder, configuration.clone(), samples.clone(), limits)
+            .unwrap();
+    let in_order: Vec<VideoFrame> = (0..u64::from(FRAMES))
+        .map(|index| sequential.get(FrameIndex(index), &cancellation).unwrap())
+        .collect();
+    let mut seeking =
+        zvidlib::ExactFrameReader::new(&decoder, configuration, samples, limits).unwrap();
+    for index in [11_u64, 3, 9, 0, 6, 4, 10] {
+        let frame = seeking.get(FrameIndex(index), &cancellation).unwrap();
+        assert!(
+            frame == in_order[index as usize],
+            "frame {index} differs after a seek"
+        );
+    }
+}
