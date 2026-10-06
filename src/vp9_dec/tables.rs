@@ -1770,7 +1770,7 @@ pub(super) static AC_QLOOKUP: [i16; 256] = [
 ];
 
 /// `vp9_filter_kernels`, indexed by interpolation filter: regular, smooth, sharp, bilinear.
-pub(super) static FILTER_KERNELS: [[[i16; 8]; 16]; 4] = [
+pub(crate) static FILTER_KERNELS: [[[i16; 8]; 16]; 4] = [
     [
         [0, 0, 0, 128, 0, 0, 0, 0],
         [0, 1, -5, 126, 8, -3, 1, 0],
