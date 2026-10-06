@@ -11,10 +11,11 @@
 //!   (`tx_mode = ONLY_4X4`), and the loop filter is off (`filter_level = 0`);
 //! - key frames choose among the DC, V, H and TM intra modes per block;
 //! - inter frames predict from the previous frame (`LAST_FRAME`) with motion
-//!   vectors found by a whole-sample diamond search and refined to quarter
-//!   samples, or to eighth samples where `allow_high_precision_mv` lets the
-//!   block code them, through the regular 8-tap filters. They are coded as
-//!   `ZEROMV`, `NEARESTMV`, `NEARMV` or `NEWMV`, or fall back to intra.
+//!   vectors found by a whole-sample search and refined to quarter samples,
+//!   or to eighth samples where `allow_high_precision_mv` lets the block code
+//!   them, through the regular 8-tap filters the header selects. They are
+//!   coded as `ZEROMV`, `NEARESTMV`, `NEARMV` or `NEWMV`, or fall back to
+//!   intra.
 //!
 //! The encoder keeps a reconstruction that matches the decoding process
 //! exactly, and predicts every later block and frame from it.
@@ -283,8 +284,8 @@ impl<'a> FrameEncoder<'a> {
         }
     }
 
-    /// Restricts the motion search to whole samples, as the encoder searched
-    /// before sub-sample refinement, so tests can measure what it gains.
+    /// Restricts the motion search to whole samples, so tests can measure
+    /// what sub-sample refinement gains.
     #[cfg(test)]
     pub(super) fn whole_sample_motion(mut self) -> Self {
         self.allow_high_precision_mv = false;
@@ -809,7 +810,7 @@ impl<'a> FrameEncoder<'a> {
         // candidates, measured on the 8-tap prediction itself and including
         // the rate of coding it: half, then quarter, then eighth samples.
         let usehp = self.allow_high_precision_mv && use_mv_hp(nearest);
-        let motion_bits = |mv: Mv| motion_bits(mv, candidates, mode_context, usehp);
+        let bits_for = |mv: Mv| motion_bits(mv, candidates, mode_context, usehp);
         let whole_mv = best_mv;
         if self.subpel_step < 8 {
             let finest = if usehp {
@@ -821,7 +822,7 @@ impl<'a> FrameEncoder<'a> {
             // residual is coded, so rate weighs a quarter of what it does in
             // the mode decision.
             let cost = |mv: Mv| {
-                motion_bits(mv).map(|bits| {
+                bits_for(mv).map(|bits| {
                     self.luma_prediction_error(reference, mi_row, mi_col, mv) as f64
                         + 0.25 * self.lambda * bits
                 })
