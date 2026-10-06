@@ -26,14 +26,27 @@ fn generate_win_curve(bs: usize) -> Vec<f32> {
 pub struct Windows {
     /// Short block window left-half curve.
     pub short: Vec<f32>,
+    /// `short` reversed: the right-half curve.
+    pub short_rev: Vec<f32>,
     /// Long block window left-half curve.
     pub long: Vec<f32>,
+    /// `long` reversed: the right-half curve.
+    pub long_rev: Vec<f32>,
 }
 
 impl Windows {
     pub fn new(blocksize0: usize, blocksize1: usize) -> Self {
         let short = generate_win_curve(blocksize0);
         let long = generate_win_curve(blocksize1);
-        Windows { short, long }
+        // The overlap-add kernels read the falling slope forwards, so it is
+        // stored rather than reversed per sample.
+        let short_rev = short.iter().rev().copied().collect();
+        let long_rev = long.iter().rev().copied().collect();
+        Windows {
+            short,
+            short_rev,
+            long,
+            long_rev,
+        }
     }
 }
