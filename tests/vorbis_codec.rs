@@ -6,12 +6,20 @@
 //! them through `vorbisfile`, trimmed to the stream's granule positions (see
 //! that directory's README). zvidlib has no Ogg container, so the test reads
 //! the pages itself.
+//!
+//! The native encoder's packets are pinned bit for bit to libvorbis's by the
+//! unit tests in `src/vorbis_encoder/`; here they are read back through the
+//! decoder the way a demuxed track would be.
 
 use std::path::{Path, PathBuf};
 
+use zvidlib::io::MemorySink;
+use zvidlib::mp4::{Mp4Muxer, Mp4TrackConfig, Mp4TrackFormat};
 use zvidlib::{
-    AudioSampleReader, AudioTrackTiming, CancellationToken, Limits, NativeVorbisDecoder,
-    SampleRange, VORBIS_PREROLL_PACKETS, VorbisConfig,
+    AudioBuffer, AudioEncoderConfig, AudioEncoderFactory, AudioSampleReader, AudioTrackTiming,
+    CancellationToken, Codec, CodecProfile, CodecSupport, EncodedSample, FrameIndex, Limits,
+    NativeVorbisDecoder, SampleRange, VORBIS_PREROLL_PACKETS, VorbisConfig,
+    native_vorbis_audio_encoder_factory,
 };
 
 fn fixture(name: &str) -> PathBuf {
@@ -222,4 +230,250 @@ fn malformed_configuration_is_rejected() {
     );
     // An audio packet must start with a zero bit.
     assert!(config.packet_block_size(&[0x01]).is_err());
+}
+
+// --- the native encoder -------------------------------------------------------
+
+fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
+    let mut future = std::pin::pin!(future);
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    loop {
+        if let std::task::Poll::Ready(value) = future.as_mut().poll(&mut context) {
+            return value;
+        }
+    }
+}
+
+fn encoder_config(sample_rate: u32, channels: u16, configuration: Vec<u8>) -> AudioEncoderConfig {
+    AudioEncoderConfig {
+        codec: Codec::Vorbis,
+        profile: CodecProfile::Vorbis,
+        sample_rate,
+        channels,
+        timescale: sample_rate,
+        configuration,
+    }
+}
+
+/// Encodes interleaved `input` in buffers of `chunk` frames, then reads the
+/// stream back through `NativeVorbisDecoder` exactly as a demuxed Matroska or
+/// WebM track would be read: the `CodecPrivate`, each packet's interval, and
+/// the drained end padding.
+fn round_trip(
+    input: &[f32],
+    sample_rate: u32,
+    channels: u16,
+    chunk: usize,
+    configuration: Vec<u8>,
+) -> (Vec<f32>, u64, Vec<EncodedSample>) {
+    let factory = native_vorbis_audio_encoder_factory();
+    let config = encoder_config(sample_rate, channels, configuration);
+    assert!(factory.capability(&config).is_supported());
+    let mut encoder = factory.create(&config, &Limits::default()).unwrap();
+    assert_eq!(encoder.config().codec, Codec::Vorbis);
+    let frames = input.len() / usize::from(channels);
+    let mut encoded = Vec::new();
+    let mut start = 0;
+    while start < frames {
+        let end = (start + chunk).min(frames);
+        let buffer = AudioBuffer::new(
+            SampleRange::new(start as u64, end as u64).unwrap(),
+            sample_rate,
+            channels,
+            input[start * usize::from(channels)..end * usize::from(channels)].to_vec(),
+            &Limits::default(),
+        )
+        .unwrap();
+        encoded.extend(block_on(encoder.encode(FrameIndex(0), buffer)).unwrap());
+        start = end;
+    }
+    let drain = block_on(encoder.finish()).unwrap();
+    encoded.extend(drain.samples);
+    assert_eq!(drain.gapless.priming, 0);
+
+    let stream = VorbisConfig::from_codec_private(&encoder.config().decoder_config).unwrap();
+    assert_eq!(stream.sample_rate, sample_rate);
+    assert_eq!(u16::from(stream.channels), channels);
+    // The encoder's intervals are the ones the headers say the packets have.
+    let packets = stream
+        .encoded_samples(encoded.iter().map(|sample| sample.data.clone()).collect())
+        .unwrap();
+    for (packet, sample) in packets.iter().zip(&encoded) {
+        assert_eq!(packet.decoded_range.start, sample.pts as u64);
+        assert_eq!(packet.decoded_range.len(), u64::from(sample.duration));
+    }
+    let decoder = NativeVorbisDecoder::new(&stream, Limits::default()).unwrap();
+    let mut reader = AudioSampleReader::new(
+        decoder,
+        packets,
+        sample_rate,
+        channels,
+        AudioTrackTiming {
+            padding: drain.gapless.padding,
+            ..AudioTrackTiming::default()
+        },
+        VORBIS_PREROLL_PACKETS,
+        Limits::default(),
+    )
+    .unwrap();
+    let length = reader.presentation_length();
+    let decoded = reader
+        .get_range(
+            SampleRange::new(0, length).unwrap(),
+            &CancellationToken::new(),
+        )
+        .unwrap()
+        .samples;
+    (decoded, length, encoded)
+}
+
+fn snr_db(reference: &[f32], decoded: &[f32]) -> f64 {
+    let signal: f64 = reference.iter().map(|&v| f64::from(v).powi(2)).sum();
+    let noise: f64 = reference
+        .iter()
+        .zip(decoded)
+        .map(|(&r, &d)| (f64::from(r) - f64::from(d)).powi(2))
+        .sum();
+    10.0 * (signal / noise.max(f64::MIN_POSITIVE)).log10()
+}
+
+fn music_like(frames: usize, sample_rate: u32) -> Vec<f32> {
+    let mut seed = 0x2468_ace0_u32;
+    (0..frames)
+        .flat_map(|i| {
+            let t = i as f32 / sample_rate as f32;
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let noise = (seed >> 9) as f32 / (1 << 23) as f32 - 0.5;
+            let tone = |f: f32| (2.0 * std::f32::consts::PI * f * t).sin();
+            // A click every quarter second, so the encoder switches block
+            // sizes as well.
+            let click = if i % (sample_rate as usize / 4) < 40 {
+                0.5 * noise
+            } else {
+                0.0
+            };
+            [
+                0.25 * tone(220.0) + 0.15 * tone(1_100.0) + 0.02 * noise + click,
+                0.25 * tone(330.0) + 0.1 * tone(2_500.0) + 0.02 * noise + click,
+            ]
+        })
+        .collect()
+}
+
+#[test]
+fn encoded_vorbis_round_trips_with_its_exact_length() {
+    for (sample_rate, chunk) in [(44_100, 1_000), (48_000, 4_096), (22_050, 333)] {
+        let frames = sample_rate as usize;
+        let input = music_like(frames, sample_rate);
+        let (decoded, length, encoded) = round_trip(&input, sample_rate, 2, chunk, Vec::new());
+        assert_eq!(length, frames as u64, "{sample_rate} Hz");
+        assert_eq!(decoded.len(), input.len());
+        let snr = snr_db(&input, &decoded);
+        assert!(
+            snr > 20.0,
+            "{sample_rate} Hz round trip is only {snr:.1} dB"
+        );
+        // The first packet primes the overlap and spans no samples.
+        assert_eq!(encoded[0].duration, 0);
+    }
+}
+
+#[test]
+fn an_impulse_decodes_at_the_sample_it_was_encoded_at() {
+    let frames = 20_000;
+    for at in [0, 1, 1_023, 1_024, 7_777, frames - 1] {
+        let mut input = vec![0_f32; frames];
+        input[at] = 0.9;
+        let (decoded, length, _) = round_trip(&input, 48_000, 1, 1_024, Vec::new());
+        assert_eq!(length, frames as u64);
+        let peak = decoded
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
+            .unwrap()
+            .0;
+        assert!(
+            peak.abs_diff(at) <= 1,
+            "an impulse encoded at {at} decoded with its peak at {peak}"
+        );
+    }
+}
+
+#[test]
+fn a_target_bit_rate_selects_the_quality_libvorbis_would() {
+    let input = music_like(44_100, 44_100);
+    let bits = |configuration: Vec<u8>| {
+        let (_, _, encoded) = round_trip(&input, 44_100, 2, 4_096, configuration);
+        encoded
+            .iter()
+            .map(|sample| sample.data.len() * 8)
+            .sum::<usize>()
+    };
+    let low = bits(64_000_u32.to_be_bytes().to_vec());
+    let high = bits(192_000_u32.to_be_bytes().to_vec());
+    assert!(low < high, "64 kb/s used {low} bits, 192 kb/s {high}");
+}
+
+#[test]
+fn encoder_capability_rejects_what_it_cannot_encode() {
+    let factory = native_vorbis_audio_encoder_factory();
+    let base = encoder_config(44_100, 2, Vec::new());
+    assert_eq!(
+        factory.capability(&base),
+        CodecSupport::Supported {
+            implementation: zvidlib::CodecImplementation::Software
+        }
+    );
+    let cases = [
+        AudioEncoderConfig {
+            codec: Codec::Opus,
+            ..base.clone()
+        },
+        AudioEncoderConfig {
+            profile: CodecProfile::Opus,
+            ..base.clone()
+        },
+        AudioEncoderConfig {
+            channels: 6,
+            ..base.clone()
+        },
+        AudioEncoderConfig {
+            timescale: 48_000,
+            ..base.clone()
+        },
+        AudioEncoderConfig {
+            configuration: vec![1, 2, 3],
+            ..base.clone()
+        },
+        AudioEncoderConfig {
+            configuration: 1_u32.to_be_bytes().to_vec(),
+            ..base.clone()
+        },
+        encoder_config(0, 2, Vec::new()),
+    ];
+    for case in cases {
+        assert!(
+            !factory.capability(&case).is_supported(),
+            "{case:?} should be refused"
+        );
+        assert!(factory.create(&case, &Limits::default()).is_err());
+    }
+}
+
+#[test]
+fn mp4_refuses_a_vorbis_track() {
+    let factory = native_vorbis_audio_encoder_factory();
+    let encoder = factory
+        .create(&encoder_config(44_100, 2, Vec::new()), &Limits::default())
+        .unwrap();
+    let result = block_on(Mp4Muxer::new(
+        MemorySink::new(),
+        vec![Mp4TrackConfig {
+            encoder: encoder.config().clone(),
+            format: Mp4TrackFormat::Audio { channels: 2 },
+        }],
+        1_000,
+    ));
+    let error = result.err().expect("Vorbis has no MP4 sample entry");
+    assert_eq!(error.kind(), zvidlib::ErrorKind::Unsupported);
 }

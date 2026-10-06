@@ -419,8 +419,8 @@ pub struct WebEncodedAudioChunk {
     pub is_sync: bool,
     pub timestamp_micros: f64,
     pub duration_micros: Option<f64>,
-    /// Complete `esds` configuration box (size + fourcc + payload), present
-    /// only on the first chunk a session ever emits.
+    /// Complete MP4 codec configuration box - `esds` for AAC, `dOps` for
+    /// Opus - present only on the first chunk a session ever emits.
     pub decoder_config: Option<Vec<u8>>,
 }
 
@@ -432,8 +432,11 @@ pub fn audio_encode_capability(
     profile: CodecProfile,
     hardware: HardwarePreference,
 ) -> CodecSupport {
-    if codec != Codec::Aac || profile != CodecProfile::AacLowComplexity {
-        return CodecSupport::UnsupportedProfile;
+    match (codec, profile) {
+        (Codec::Aac, CodecProfile::AacLowComplexity) | (Codec::Opus, CodecProfile::Opus) => {}
+        // Browsers offer no Vorbis encoder, and MP4 no mapping to write one to.
+        (Codec::Vorbis, _) => return CodecSupport::UnsupportedCodec,
+        _ => return CodecSupport::UnsupportedProfile,
     }
     if hardware == HardwarePreference::Require {
         return CodecSupport::HardwareUnavailable;
@@ -449,8 +452,8 @@ pub fn audio_encode_capability(
     }
 }
 
-/// A lazily-driven `WebCodecs` encode session producing AAC-LC chunks from
-/// interleaved `f32` PCM.
+/// A lazily-driven `WebCodecs` encode session producing AAC-LC or Opus chunks
+/// from interleaved `f32` PCM.
 ///
 /// Unlike [`WebVideoEncodeSession`], `encode()` here does not wait for an
 /// output chunk before returning: an `AudioEncoder` buffers encoder
@@ -464,6 +467,7 @@ pub fn audio_encode_capability(
 /// submitted input's output has been delivered, and only then drains the
 /// rest.
 pub struct WebAudioEncodeSession {
+    codec: Codec,
     encoder: JsAudioEncoder,
     sample_rate: u32,
     channels: u16,
@@ -477,9 +481,10 @@ pub struct WebAudioEncodeSession {
 }
 
 impl WebAudioEncodeSession {
-    /// Opens a session targeting AAC-LC at `sample_rate`/`channels`,
+    /// Opens a session targeting AAC-LC or Opus at `sample_rate`/`channels`,
     /// timestamps and durations given in microseconds.
     pub fn open(
+        codec: Codec,
         sample_rate: u32,
         channels: u16,
         bitrate_bits_per_second: Option<u32>,
@@ -510,7 +515,17 @@ impl WebAudioEncodeSession {
         let encoder = JsAudioEncoder::new(&init)
             .map_err(|error| normalize_js_error(error, "constructing a WebCodecs AudioEncoder"))?;
 
-        let config = JsAudioEncoderConfig::new("mp4a.40.2", u32::from(channels), sample_rate);
+        let codec_string = match codec {
+            Codec::Aac => "mp4a.40.2",
+            Codec::Opus => "opus",
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::Unsupported,
+                    "the WebCodecs audio encoder bridge supports AAC-LC and Opus",
+                ));
+            }
+        };
+        let config = JsAudioEncoderConfig::new(codec_string, u32::from(channels), sample_rate);
         if let Some(bitrate) = bitrate_bits_per_second {
             config.set_bitrate(bitrate);
         }
@@ -519,6 +534,7 @@ impl WebAudioEncodeSession {
             .map_err(|error| normalize_js_error(error, "configuring the WebCodecs AudioEncoder"))?;
 
         Ok(Self {
+            codec,
             encoder,
             sample_rate,
             channels,
@@ -621,16 +637,17 @@ impl WebAudioEncodeSession {
             let is_sync = chunk.type_() == EncodedAudioChunkType::Key;
 
             let decoder_config = if !self.emitted_config {
-                metadata
+                let description = metadata
                     .get_decoder_config()
                     .and_then(|config| config.get_description())
-                    .map(|description| {
-                        let bytes = js_sys::Uint8Array::new(&description).to_vec();
-                        esds_box(&bytes)
-                    })
-                    .inspect(|_| {
-                        self.emitted_config = true;
-                    })
+                    .map(|description| js_sys::Uint8Array::new(&description).to_vec());
+                match self.codec {
+                    Codec::Opus => Some(opus_dops(description.as_deref(), self.channels)?),
+                    _ => description.map(|bytes| esds_box(&bytes)),
+                }
+                .inspect(|_| {
+                    self.emitted_config = true;
+                })
             } else {
                 None
             };
@@ -653,6 +670,27 @@ impl Drop for WebAudioEncodeSession {
             let _ = self.encoder.close();
         }
     }
+}
+
+/// The `dOps` box for a `WebCodecs` Opus encoder's stream, from the `OpusHead`
+/// its first chunk's `decoderConfig.description` carries.
+///
+/// The header is what holds the encoder's delay, the stream's pre-skip. A
+/// browser that reports no description is assumed to delay as libopus does
+/// in its general-audio mode, 312 samples at 48 kHz, which is what browsers
+/// encode Opus with.
+fn opus_dops(description: Option<&[u8]>, channels: u16) -> Result<Vec<u8>> {
+    const LIBOPUS_AUDIO_PRE_SKIP: u16 = 312;
+    let head = match description {
+        Some(description) => crate::OpusHead::from_identification_header(description)?,
+        None => crate::OpusHead::new(
+            u8::try_from(channels)
+                .map_err(|_| Error::new(ErrorKind::Unsupported, "too many Opus channels"))?,
+            LIBOPUS_AUDIO_PRE_SKIP,
+            crate::OPUS_SAMPLE_RATE,
+        )?,
+    };
+    Ok(head.to_dops())
 }
 
 /// Reinterprets an `f32` PCM slice as its little-endian byte representation,

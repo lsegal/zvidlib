@@ -35,6 +35,7 @@ pub mod simd;
 pub mod timeline;
 pub mod transfer;
 pub mod vorbis;
+mod vorbis_encoder;
 
 mod av1_dec;
 mod av1_decoder;
@@ -107,6 +108,9 @@ mod native_audio;
 
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
 mod wasm_api;
+
+#[cfg(all(feature = "web", target_arch = "wasm32"))]
+mod web_audio_decoder;
 
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
 mod web_decoder;
@@ -201,7 +205,9 @@ pub use transfer::{
     Orientation, ResourceKind, ResourceOwnership, ScaleFilter, TransferCapability, TransferPolicy,
     TransferStage, execute_transfer, inspect_transfer,
 };
-pub use vorbis::{NativeVorbisDecoder, VORBIS_PREROLL_PACKETS, VorbisConfig};
+pub use vorbis::{
+    NativeVorbisDecoder, VORBIS_PREROLL_PACKETS, VorbisConfig, native_vorbis_audio_encoder_factory,
+};
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use aac_encoder::native_aac_audio_encoder_factory;

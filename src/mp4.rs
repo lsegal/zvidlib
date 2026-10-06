@@ -231,6 +231,24 @@ impl<S: ByteSink> Mp4Muxer<S> {
 }
 
 fn validate_track_config(config: &Mp4TrackConfig) -> Result<()> {
+    let expected_config = match config.encoder.codec {
+        Codec::UncompressedVideo => {
+            return Err(invalid(
+                "the uncompressed conformance codec is not an MP4 output codec",
+            ));
+        }
+        Codec::H264 => b"avcC",
+        Codec::Hevc => b"hvcC",
+        Codec::Av1 => b"av1C",
+        Codec::Aac => b"esds",
+        Codec::Opus => b"dOps",
+        Codec::Vorbis => {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                "Vorbis has no widely supported MP4 mapping; write it to a Matroska or WebM                  container instead",
+            ));
+        }
+    };
     if config.encoder.timescale == 0 {
         return Err(invalid("an MP4 track timescale must be nonzero"));
     }
@@ -247,25 +265,6 @@ fn validate_track_config(config: &Mp4TrackConfig) -> Result<()> {
     if usize::try_from(declared).ok() != Some(config.encoder.decoder_config.len()) {
         return Err(invalid("codec configuration box size is inconsistent"));
     }
-    let expected_config = match config.encoder.codec {
-        Codec::UncompressedVideo => {
-            return Err(invalid(
-                "the uncompressed conformance codec is not an MP4 output codec",
-            ));
-        }
-        Codec::H264 => b"avcC",
-        Codec::Hevc => b"hvcC",
-        Codec::Av1 => b"av1C",
-        Codec::Aac => b"esds",
-        Codec::Opus => b"dOps",
-        Codec::Vorbis => {
-            return Err(Error::new(
-                ErrorKind::Unsupported,
-                "Vorbis has no widely supported MP4 mapping; write it to a Matroska or WebM \
-                 container instead",
-            ));
-        }
-    };
     if &config.encoder.decoder_config[4..8] != expected_config {
         return Err(invalid("codec configuration box type is incompatible"));
     }

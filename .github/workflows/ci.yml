@@ -177,9 +177,11 @@ jobs:
           ZVIDLIB_OPUS_TEST_VECTORS: ${{ runner.temp }}/opus_newvectors
         run: cargo test --features native --test opus_codec
       # Holds the Vorbis decoder to libvorbis's own output, short blocks
-      # included, and pins packet durations read from the setup header and
-      # bit-identical reads after a seek (#524).
-      - name: Test Vorbis decode
+      # included, and pins packet durations read from the setup header,
+      # bit-identical reads after a seek, and the native encoder's exact-length
+      # round trip (#524). The encoder's packets are pinned to libvorbis's bit
+      # for bit by the library unit tests above.
+      - name: Test Vorbis decode and encode
         run: cargo test --features native --test vorbis_codec
       - name: Test AV1 SIMD motion compensation
         run: cargo test --features native --lib av1_mc -- --nocapture
