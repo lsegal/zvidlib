@@ -256,6 +256,47 @@ fn hardware_show_existing_frame_shows_the_same_reference_as_software() {
     assert_eq!(sequential_digests(&hardware, &samples), expected);
 }
 
+/// Hardware sessions on several threads at once, each required to decode
+/// every fixture exactly as the software decoder does. On a virtual Mac,
+/// VideoToolbox fails a VP9 decode while another session decodes, so the
+/// backend must keep its sessions from overlapping there (#580).
+#[test]
+fn concurrent_hardware_vp9_sessions_match_the_software_decoder() {
+    const THREADS: usize = 4;
+    const ROUNDS: usize = 3;
+    let _serial = serial();
+    let mut streams = Vec::new();
+    for (name, track) in fixtures() {
+        let Some(hardware) = hardware_configuration(&track.configuration) else {
+            return;
+        };
+        let expected = sequential_digests(&track.configuration, &track.samples);
+        streams.push((name, hardware, track.samples, expected));
+    }
+    let start = std::sync::Barrier::new(THREADS);
+    std::thread::scope(|scope| {
+        for thread in 0..THREADS {
+            let (streams, start) = (&streams, &start);
+            scope.spawn(move || {
+                start.wait();
+                for round in 0..ROUNDS {
+                    // Each thread starts on a different fixture, so sessions
+                    // of every size decode side by side.
+                    for offset in 0..streams.len() {
+                        let (name, hardware, samples, expected) =
+                            &streams[(thread + round + offset) % streams.len()];
+                        assert_eq!(
+                            &sequential_digests(hardware, samples),
+                            expected,
+                            "{name}, thread {thread}, round {round}"
+                        );
+                    }
+                }
+            });
+        }
+    });
+}
+
 #[test]
 fn hardware_refuses_what_the_software_decoder_refuses() {
     let _serial = serial();
