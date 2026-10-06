@@ -116,67 +116,8 @@ impl<'a> BoolDecoder<'a> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::bool_encoder::BoolEncoder;
     use super::*;
-
-    /// A boolean encoder (RFC 6386 section 7.3) to round-trip the decoder.
-    struct BoolEncoder {
-        output: Vec<u8>,
-        range: u32,
-        bottom: u32,
-        bit_count: i32,
-    }
-
-    impl BoolEncoder {
-        fn new() -> Self {
-            Self {
-                output: Vec::new(),
-                range: 255,
-                bottom: 0,
-                bit_count: 24,
-            }
-        }
-
-        fn add_one_to_output(&mut self) {
-            for byte in self.output.iter_mut().rev() {
-                if *byte == 255 {
-                    *byte = 0;
-                } else {
-                    *byte += 1;
-                    break;
-                }
-            }
-        }
-
-        fn write(&mut self, probability: u8, bit: bool) {
-            let split = 1 + (((self.range - 1) * u32::from(probability)) >> 8);
-            if bit {
-                self.bottom = self.bottom.wrapping_add(split);
-                self.range -= split;
-            } else {
-                self.range = split;
-            }
-            while self.range < 128 {
-                self.range <<= 1;
-                if self.bottom & (1 << 31) != 0 {
-                    self.add_one_to_output();
-                }
-                self.bottom <<= 1;
-                self.bit_count -= 1;
-                if self.bit_count == 0 {
-                    self.output.push((self.bottom >> 24) as u8);
-                    self.bottom &= (1 << 24) - 1;
-                    self.bit_count = 8;
-                }
-            }
-        }
-
-        fn finish(mut self) -> Vec<u8> {
-            for _ in 0..32 {
-                self.write(128, false);
-            }
-            self.output
-        }
-    }
 
     #[test]
     fn decodes_what_the_reference_encoder_writes() {

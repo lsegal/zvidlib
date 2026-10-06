@@ -11,7 +11,7 @@
 use super::bool_decoder::BoolDecoder;
 use super::loop_filter::{FrameFilter, MacroblockFilter, filter_frame};
 use super::predict::{
-    Plane, idct_add, inverse_walsh, macroblock_edges, predict_block, predict_inter,
+    Edges, Plane, idct_add, inverse_walsh, macroblock_edges, predict_block, predict_inter,
     predict_subblock,
 };
 use super::tables::*;
@@ -29,42 +29,42 @@ pub(crate) struct Picture {
 
 /// A reconstructed frame at macroblock-aligned dimensions.
 #[derive(Debug)]
-struct Frame {
-    planes: [Plane; 3],
+pub(super) struct Frame {
+    pub(super) planes: [Plane; 3],
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct MotionVector {
-    x: i16,
-    y: i16,
+pub(super) struct MotionVector {
+    pub(super) x: i16,
+    pub(super) y: i16,
 }
 
 impl MotionVector {
-    const ZERO: Self = Self { x: 0, y: 0 };
+    pub(super) const ZERO: Self = Self { x: 0, y: 0 };
 
-    fn is_zero(self) -> bool {
+    pub(super) fn is_zero(self) -> bool {
         self == Self::ZERO
     }
 }
 
-const INTRA_FRAME: usize = 0;
-const LAST_FRAME: usize = 1;
-const GOLDEN_FRAME: usize = 2;
-const ALTREF_FRAME: usize = 3;
+pub(super) const INTRA_FRAME: usize = 0;
+pub(super) const LAST_FRAME: usize = 1;
+pub(super) const GOLDEN_FRAME: usize = 2;
+pub(super) const ALTREF_FRAME: usize = 3;
 
 #[derive(Clone, Copy, Debug)]
-struct MacroblockInfo {
-    y_mode: u8,
-    uv_mode: u8,
-    reference: usize,
-    mv: MotionVector,
+pub(super) struct MacroblockInfo {
+    pub(super) y_mode: u8,
+    pub(super) uv_mode: u8,
+    pub(super) reference: usize,
+    pub(super) mv: MotionVector,
     /// Subblock intra modes; for a whole-macroblock intra mode, the subblock
     /// mode it implies for its neighbours' contexts.
-    b_modes: [u8; 16],
+    pub(super) b_modes: [u8; 16],
     /// Subblock motion vectors; every one equals `mv` unless split.
-    mvs: [MotionVector; 16],
-    segment: usize,
-    skip: bool,
+    pub(super) mvs: [MotionVector; 16],
+    pub(super) segment: usize,
+    pub(super) skip: bool,
 }
 
 impl Default for MacroblockInfo {
@@ -128,7 +128,7 @@ struct Dequantizer {
 
 /// Coefficients of one macroblock: 16 Y, 4 U, 4 V and the Y2 block, each in
 /// raster order and already dequantized.
-type Coefficients = [[i16; 16]; 25];
+pub(super) type Coefficients = [[i16; 16]; 25];
 
 pub(crate) struct Decoder {
     limits: Limits,
@@ -547,7 +547,15 @@ impl Decoder {
                         &mut coefficients,
                     )
                 };
-                self.reconstruct(context, &macroblock, &mut coefficients, frame, mb_x, mb_y);
+                reconstruct(
+                    &self.references,
+                    context,
+                    &macroblock,
+                    &mut coefficients,
+                    frame,
+                    mb_x,
+                    mb_y,
+                );
 
                 filters[segment_index] = MacroblockFilter {
                     level: self.filter_level(filter_level, &macroblock),
@@ -659,12 +667,7 @@ impl Decoder {
 
         // Motion vectors are bounded to at most one macroblock outside the
         // frame, in eighth samples.
-        let bounds = MvBounds {
-            left: -(((mb_x + 1) as i32) << 7),
-            right: ((self.mb_cols - mb_x) as i32) << 7,
-            top: -(((mb_y + 1) as i32) << 7),
-            bottom: ((self.mb_rows - mb_y) as i32) << 7,
-        };
+        let bounds = MvBounds::new(mb_x, mb_y, self.mb_cols, self.mb_rows);
         let mv_probabilities = self.probabilities.mv;
         match macroblock.y_mode {
             NEARESTMV => macroblock.mv = bounds.clamp(near.mvs[1]),
@@ -722,123 +725,6 @@ impl Decoder {
         level as u8
     }
 
-    fn reconstruct(
-        &self,
-        context: &FrameContext,
-        macroblock: &MacroblockInfo,
-        coefficients: &mut Coefficients,
-        frame: &mut Frame,
-        mb_x: usize,
-        mb_y: usize,
-    ) {
-        if macroblock.y_mode != B_PRED && macroblock.y_mode != SPLITMV {
-            let dc = inverse_walsh(&coefficients[24]);
-            for (block, value) in dc.into_iter().enumerate() {
-                coefficients[block][0] = value;
-            }
-        }
-        let [y_plane, u_plane, v_plane] = &mut frame.planes;
-        if macroblock.reference == INTRA_FRAME {
-            reconstruct_intra_luma(macroblock, coefficients, y_plane, mb_x, mb_y);
-            for (plane, first_block) in [(u_plane, 16), (v_plane, 20)] {
-                let edges = macroblock_edges::<8, 9>(plane, mb_x, mb_y);
-                let stride = plane.width;
-                let origin = mb_y * 8 * stride + mb_x * 8;
-                predict_block(
-                    macroblock.uv_mode,
-                    &edges,
-                    mb_y > 0,
-                    mb_x > 0,
-                    &mut plane.data,
-                    origin,
-                    stride,
-                );
-                add_residual(
-                    &coefficients[first_block..first_block + 4],
-                    plane,
-                    origin,
-                    2,
-                );
-            }
-            return;
-        }
-
-        let reference = self.references[macroblock.reference]
-            .as_ref()
-            .expect("every reference is set by the first key frame");
-        let x0 = mb_x * 16;
-        let y0 = mb_y * 16;
-        if macroblock.y_mode == SPLITMV {
-            for block in 0..16 {
-                let mv = macroblock.mvs[block];
-                predict_inter(
-                    &reference.planes[0],
-                    y_plane,
-                    x0 + (block & 3) * 4,
-                    y0 + (block >> 2) * 4,
-                    4,
-                    4,
-                    i32::from(mv.x),
-                    i32::from(mv.y),
-                    context.filters,
-                );
-            }
-        } else {
-            predict_inter(
-                &reference.planes[0],
-                y_plane,
-                x0,
-                y0,
-                16,
-                16,
-                i32::from(macroblock.mv.x),
-                i32::from(macroblock.mv.y),
-                context.filters,
-            );
-        }
-        add_residual(&coefficients[0..16], y_plane, y0 * y_plane.width + x0, 4);
-
-        let chroma_mvs = chroma_mvs(macroblock, context.full_pixel_chroma);
-        for (plane_index, plane, first_block) in [(1, u_plane, 16), (2, v_plane, 20)] {
-            let reference = &reference.planes[plane_index];
-            if macroblock.y_mode == SPLITMV {
-                for (block, (mv_x, mv_y)) in chroma_mvs.iter().copied().enumerate() {
-                    predict_inter(
-                        reference,
-                        plane,
-                        mb_x * 8 + (block & 1) * 4,
-                        mb_y * 8 + (block >> 1) * 4,
-                        4,
-                        4,
-                        mv_x,
-                        mv_y,
-                        context.filters,
-                    );
-                }
-            } else {
-                let (mv_x, mv_y) = chroma_mvs[0];
-                predict_inter(
-                    reference,
-                    plane,
-                    mb_x * 8,
-                    mb_y * 8,
-                    8,
-                    8,
-                    mv_x,
-                    mv_y,
-                    context.filters,
-                );
-            }
-            let origin = mb_y * 8 * plane.width + mb_x * 8;
-            add_residual(
-                &coefficients[first_block..first_block + 4],
-                plane,
-                origin,
-                2,
-            );
-        }
-    }
-
     fn crop(&self, frame: &Frame) -> Picture {
         let chroma_width = self.width.div_ceil(2);
         let chroma_height = self.height.div_ceil(2);
@@ -862,14 +748,134 @@ impl Decoder {
     }
 }
 
-struct FrameContext {
-    key_frame: bool,
-    skip_probability: Option<u8>,
+/// Predicts a macroblock and adds its dequantized residual to `frame`, the
+/// frame being reconstructed. The encoder reconstructs its frames through
+/// this too, so its references are exactly the decoder's.
+pub(super) fn reconstruct(
+    references: &[Option<Arc<Frame>>; 4],
+    context: &FrameContext,
+    macroblock: &MacroblockInfo,
+    coefficients: &mut Coefficients,
+    frame: &mut Frame,
+    mb_x: usize,
+    mb_y: usize,
+) {
+    if macroblock.y_mode != B_PRED && macroblock.y_mode != SPLITMV {
+        let dc = inverse_walsh(&coefficients[24]);
+        for (block, value) in dc.into_iter().enumerate() {
+            coefficients[block][0] = value;
+        }
+    }
+    let [y_plane, u_plane, v_plane] = &mut frame.planes;
+    if macroblock.reference == INTRA_FRAME {
+        reconstruct_intra_luma(macroblock, coefficients, y_plane, mb_x, mb_y);
+        for (plane, first_block) in [(u_plane, 16), (v_plane, 20)] {
+            let edges = macroblock_edges::<8, 9>(plane, mb_x, mb_y);
+            let stride = plane.width;
+            let origin = mb_y * 8 * stride + mb_x * 8;
+            predict_block(
+                macroblock.uv_mode,
+                &edges,
+                mb_y > 0,
+                mb_x > 0,
+                &mut plane.data,
+                origin,
+                stride,
+            );
+            add_residual(
+                &coefficients[first_block..first_block + 4],
+                plane,
+                origin,
+                2,
+            );
+        }
+        return;
+    }
+
+    let reference = references[macroblock.reference]
+        .as_ref()
+        .expect("every reference is set by the first key frame");
+    let x0 = mb_x * 16;
+    let y0 = mb_y * 16;
+    if macroblock.y_mode == SPLITMV {
+        for block in 0..16 {
+            let mv = macroblock.mvs[block];
+            predict_inter(
+                &reference.planes[0],
+                y_plane,
+                x0 + (block & 3) * 4,
+                y0 + (block >> 2) * 4,
+                4,
+                4,
+                i32::from(mv.x),
+                i32::from(mv.y),
+                context.filters,
+            );
+        }
+    } else {
+        predict_inter(
+            &reference.planes[0],
+            y_plane,
+            x0,
+            y0,
+            16,
+            16,
+            i32::from(macroblock.mv.x),
+            i32::from(macroblock.mv.y),
+            context.filters,
+        );
+    }
+    add_residual(&coefficients[0..16], y_plane, y0 * y_plane.width + x0, 4);
+
+    let chroma_mvs = chroma_mvs(macroblock, context.full_pixel_chroma);
+    for (plane_index, plane, first_block) in [(1, u_plane, 16), (2, v_plane, 20)] {
+        let reference = &reference.planes[plane_index];
+        if macroblock.y_mode == SPLITMV {
+            for (block, (mv_x, mv_y)) in chroma_mvs.iter().copied().enumerate() {
+                predict_inter(
+                    reference,
+                    plane,
+                    mb_x * 8 + (block & 1) * 4,
+                    mb_y * 8 + (block >> 1) * 4,
+                    4,
+                    4,
+                    mv_x,
+                    mv_y,
+                    context.filters,
+                );
+            }
+        } else {
+            let (mv_x, mv_y) = chroma_mvs[0];
+            predict_inter(
+                reference,
+                plane,
+                mb_x * 8,
+                mb_y * 8,
+                8,
+                8,
+                mv_x,
+                mv_y,
+                context.filters,
+            );
+        }
+        let origin = mb_y * 8 * plane.width + mb_x * 8;
+        add_residual(
+            &coefficients[first_block..first_block + 4],
+            plane,
+            origin,
+            2,
+        );
+    }
+}
+
+pub(super) struct FrameContext {
+    pub(super) key_frame: bool,
+    pub(super) skip_probability: Option<u8>,
     /// Probabilities of intra, last-versus-other and golden-versus-altref.
-    inter_probabilities: Option<(u8, u8, u8)>,
-    sign_bias: [bool; 4],
-    filters: &'static [[i32; 6]; 8],
-    full_pixel_chroma: bool,
+    pub(super) inter_probabilities: Option<(u8, u8, u8)>,
+    pub(super) sign_bias: [bool; 4],
+    pub(super) filters: &'static [[i32; 6]; 8],
+    pub(super) full_pixel_chroma: bool,
 }
 
 /// Splits the token data into its DCT partitions, whose sizes (all but the
@@ -898,7 +904,7 @@ fn split_partitions(data: &[u8], count: usize) -> Result<Vec<BoolDecoder<'_>>> {
     Ok(partitions)
 }
 
-fn implied_b_mode(y_mode: u8) -> u8 {
+pub(super) fn implied_b_mode(y_mode: u8) -> u8 {
     match y_mode {
         V_PRED => B_VE_PRED,
         H_PRED => B_HE_PRED,
@@ -907,15 +913,15 @@ fn implied_b_mode(y_mode: u8) -> u8 {
     }
 }
 
-struct NearMvs {
+pub(super) struct NearMvs {
     /// Best, nearest and near.
-    mvs: [MotionVector; 3],
-    counts: [usize; 4],
+    pub(super) mvs: [MotionVector; 3],
+    pub(super) counts: [usize; 4],
 }
 
 /// Ranks the motion vectors of the above, left and above-left macroblocks
 /// (RFC 6386 section 18.3).
-fn find_near_mvs(
+pub(super) fn find_near_mvs(
     neighbours: [&MacroblockInfo; 3],
     reference: usize,
     sign_bias: &[bool; 4],
@@ -966,15 +972,26 @@ fn find_near_mvs(
     }
 }
 
-struct MvBounds {
-    left: i32,
-    right: i32,
-    top: i32,
-    bottom: i32,
+pub(super) struct MvBounds {
+    pub(super) left: i32,
+    pub(super) right: i32,
+    pub(super) top: i32,
+    pub(super) bottom: i32,
 }
 
 impl MvBounds {
-    fn clamp(&self, mv: MotionVector) -> MotionVector {
+    /// Motion vectors are bounded to at most one macroblock outside the
+    /// frame, in eighth samples.
+    pub(super) fn new(mb_x: usize, mb_y: usize, mb_cols: usize, mb_rows: usize) -> Self {
+        Self {
+            left: -(((mb_x + 1) as i32) << 7),
+            right: ((mb_cols - mb_x) as i32) << 7,
+            top: -(((mb_y + 1) as i32) << 7),
+            bottom: ((mb_rows - mb_y) as i32) << 7,
+        }
+    }
+
+    pub(super) fn clamp(&self, mv: MotionVector) -> MotionVector {
         MotionVector {
             x: i32::from(mv.x).clamp(self.left, self.right) as i16,
             y: i32::from(mv.y).clamp(self.top, self.bottom) as i16,
@@ -1250,35 +1267,8 @@ fn reconstruct_intra_luma(
         return;
     }
     for (block, residual) in coefficients[..16].iter().enumerate() {
-        let row = block >> 2;
-        let column = block & 3;
-        let offset = origin + row * 4 * stride + column * 4;
-        let mut above = [0u8; 9];
-        let mut left = [0u8; 4];
-        if row == 0 {
-            above.copy_from_slice(&edges.above[column * 4..column * 4 + 9]);
-        } else {
-            above[0] = if column == 0 {
-                edges.left[row * 4 - 1]
-            } else {
-                plane.data[offset - stride - 1]
-            };
-            above[1..5].copy_from_slice(&plane.data[offset - stride..offset - stride + 4]);
-            if column < 3 {
-                above[5..9].copy_from_slice(&plane.data[offset - stride + 4..offset - stride + 8]);
-            } else {
-                // Right-column subblocks use the macroblock's above-right
-                // pixels, the ones below them not being decoded yet.
-                above[5..9].copy_from_slice(&edges.above[17..21]);
-            }
-        }
-        for (r, sample) in left.iter_mut().enumerate() {
-            *sample = if column == 0 {
-                edges.left[row * 4 + r]
-            } else {
-                plane.data[offset + r * stride - 1]
-            };
-        }
+        let offset = origin + (block >> 2) * 4 * stride + (block & 3) * 4;
+        let (above, left) = subblock_edges(plane, &edges, origin, block);
         predict_subblock(
             macroblock.b_modes[block],
             &above,
@@ -1293,10 +1283,52 @@ fn reconstruct_intra_luma(
     }
 }
 
+/// The edges luma subblock `block` of the macroblock at `origin` predicts
+/// from: the pixel above-left, the four above and the four above-right, and
+/// the four to the left.
+pub(super) fn subblock_edges(
+    plane: &Plane,
+    edges: &Edges<16, 21>,
+    origin: usize,
+    block: usize,
+) -> ([u8; 9], [u8; 4]) {
+    let stride = plane.width;
+    let row = block >> 2;
+    let column = block & 3;
+    let offset = origin + row * 4 * stride + column * 4;
+    let mut above = [0u8; 9];
+    let mut left = [0u8; 4];
+    if row == 0 {
+        above.copy_from_slice(&edges.above[column * 4..column * 4 + 9]);
+    } else {
+        above[0] = if column == 0 {
+            edges.left[row * 4 - 1]
+        } else {
+            plane.data[offset - stride - 1]
+        };
+        above[1..5].copy_from_slice(&plane.data[offset - stride..offset - stride + 4]);
+        if column < 3 {
+            above[5..9].copy_from_slice(&plane.data[offset - stride + 4..offset - stride + 8]);
+        } else {
+            // Right-column subblocks use the macroblock's above-right
+            // pixels, the ones below them not being decoded yet.
+            above[5..9].copy_from_slice(&edges.above[17..21]);
+        }
+    }
+    for (r, sample) in left.iter_mut().enumerate() {
+        *sample = if column == 0 {
+            edges.left[row * 4 + r]
+        } else {
+            plane.data[offset + r * stride - 1]
+        };
+    }
+    (above, left)
+}
+
 /// The chroma motion vectors, in eighth chroma samples: one for the whole
 /// macroblock, or one per 4x4 chroma block of a split macroblock, each the
 /// rounded average of the four luma vectors it covers.
-fn chroma_mvs(macroblock: &MacroblockInfo, full_pixel: bool) -> [(i32, i32); 4] {
+pub(super) fn chroma_mvs(macroblock: &MacroblockInfo, full_pixel: bool) -> [(i32, i32); 4] {
     let mask = if full_pixel { !7 } else { !0 };
     if macroblock.y_mode != SPLITMV {
         // Halve, rounding away from zero.
