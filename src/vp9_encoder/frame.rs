@@ -192,13 +192,23 @@ struct BlockChoice {
     cost: f64,
 }
 
+/// The best chroma mode for a block and what coding it costs and produces.
+struct ChromaChoice {
+    cost: f64,
+    mode: IntraMode,
+    levels: [[i32; 16]; 2],
+    pixels: [[u8; 16]; 2],
+}
+
 pub(super) struct FrameEncoder<'a> {
     geometry: Geometry,
     source: &'a Picture,
     reference: Option<&'a Picture>,
     recon: Picture,
-    dc_q: [i32; 2],
-    ac_q: [i32; 2],
+    base_q_idx: u8,
+    /// The quantizer steps every plane uses: the header codes no deltas.
+    dc_q: i32,
+    ac_q: i32,
     lambda: f64,
     mode_info: Vec<ModeInfo>,
     above_nonzero: [Vec<bool>; 3],
@@ -224,8 +234,9 @@ impl<'a> FrameEncoder<'a> {
             source,
             reference,
             recon: Picture::new(&geometry),
-            dc_q: [DC_QLOOKUP[q]; 2],
-            ac_q: [ac; 2],
+            base_q_idx,
+            dc_q: DC_QLOOKUP[q],
+            ac_q: ac,
             // Distortion is a pixel-domain squared error and rate is in bits.
             // The transform's coefficients are eight times orthonormal, so the
             // effective step is `ac / 8`.
@@ -247,8 +258,9 @@ impl<'a> FrameEncoder<'a> {
         self.reference.is_none()
     }
 
-    /// Encodes the frame and returns its bytes with the reconstruction.
-    pub(super) fn encode(mut self, base_q_idx: u8, full_range: bool) -> (Vec<u8>, Picture) {
+    /// Encodes the frame and returns its bytes with the reconstruction;
+    /// `full_range` is the colour range the key frame header signals.
+    pub(super) fn encode(mut self, full_range: bool) -> (Vec<u8>, Picture) {
         let sb_rows = self.geometry.mi_rows.div_ceil(8);
         let sb_cols = self.geometry.mi_cols.div_ceil(8);
         for sb_row in 0..sb_rows {
@@ -262,8 +274,13 @@ impl<'a> FrameEncoder<'a> {
         let geometry = self.geometry;
         let tile = std::mem::replace(&mut self.writer, BoolEncoder::new()).finish();
         let compressed = compressed_header(key);
-        let mut frame =
-            uncompressed_header(&geometry, key, base_q_idx, full_range, compressed.len());
+        let mut frame = uncompressed_header(
+            &geometry,
+            key,
+            self.base_q_idx,
+            full_range,
+            compressed.len(),
+        );
         frame.extend_from_slice(&compressed);
         frame.extend_from_slice(&tile);
         (frame, self.recon)
@@ -369,17 +386,12 @@ impl<'a> FrameEncoder<'a> {
             }
         }
         let coefficients = forward_transform(&residual, tx_type);
-        let plane_type = usize::from(plane > 0);
         // A smaller rounding offset for inter residuals, as libvpx uses.
         let rounding = if intra { 0.375 } else { 0.25 };
         let mut levels = [0_i32; 16];
         let mut dequantized = [0_i32; 16];
         for (index, &coefficient) in coefficients.iter().enumerate() {
-            let step = if index == 0 {
-                self.dc_q[plane_type]
-            } else {
-                self.ac_q[plane_type]
-            };
+            let step = if index == 0 { self.dc_q } else { self.ac_q };
             let magnitude = f64::from(coefficient.unsigned_abs()) / f64::from(step) + rounding;
             // Keep every dequantized value inside the 16-bit range the decoder
             // stores coefficients in.
@@ -420,7 +432,7 @@ impl<'a> FrameEncoder<'a> {
             let mut error = 0_u64;
             let mut bits = 0.0;
             let tx_type = mode.tx_type();
-            for sub in 0..4 {
+            for (sub, sub_levels) in levels.iter_mut().take(4).enumerate() {
                 let (sub_row, sub_col) = (sub / 2, sub % 2);
                 let x = mi_col * 8 + sub_col * 4;
                 let y = mi_row * 8 + sub_row * 4;
@@ -436,7 +448,7 @@ impl<'a> FrameEncoder<'a> {
                 );
                 let (block, block_error) = self.code_residual(0, x, y, tx_type, true);
                 bits += estimate_token_bits(&block, tx_type);
-                levels[sub] = block;
+                *sub_levels = block;
                 error += block_error;
             }
             let probs = if key {
@@ -488,7 +500,7 @@ impl<'a> FrameEncoder<'a> {
                 .copy_from_slice(&best.luma[row * 8..row * 8 + 8]);
         }
 
-        let mut best_uv: Option<(f64, IntraMode, [[i32; 16]; 2], [[u8; 16]; 2])> = None;
+        let mut best_uv: Option<ChromaChoice> = None;
         for mode in IntraMode::ALL {
             let mut error = 0_u64;
             let mut bits = 0.0;
@@ -524,12 +536,21 @@ impl<'a> FrameEncoder<'a> {
             };
             bits += tree_bits(&INTRA_MODE_TREE, probs, mode as u8);
             let cost = error as f64 + self.lambda * bits;
-            if best_uv.as_ref().is_none_or(|best| cost < best.0) {
-                best_uv = Some((cost, mode, levels, pixels));
+            if best_uv.as_ref().is_none_or(|best| cost < best.cost) {
+                best_uv = Some(ChromaChoice {
+                    cost,
+                    mode,
+                    levels,
+                    pixels,
+                });
             }
         }
-        let (uv_cost, uv_mode, uv_levels, uv_pixels) =
-            best_uv.expect("at least one chroma mode is evaluated");
+        let ChromaChoice {
+            cost: uv_cost,
+            mode: uv_mode,
+            levels: uv_levels,
+            pixels: uv_pixels,
+        } = best_uv.expect("at least one chroma mode is evaluated");
         best.uv_mode = uv_mode;
         best.levels[4] = uv_levels[0];
         best.levels[5] = uv_levels[1];
@@ -611,13 +632,13 @@ impl<'a> FrameEncoder<'a> {
             let source_row =
                 &self.source.planes[0][(mi_row * 8 + row) * stride + mi_col * 8..][..8];
             let y = (y0 + row as isize).clamp(0, max_y) as usize;
-            for column in 0..8 {
+            for (column, &source) in source_row.iter().enumerate() {
                 let x = if inside {
                     (x0 + column as isize) as usize
                 } else {
                     (x0 + column as isize).clamp(0, max_x) as usize
                 };
-                sad += u32::from(source_row[column].abs_diff(reference.planes[0][y * stride + x]));
+                sad += u32::from(source.abs_diff(reference.planes[0][y * stride + x]));
             }
             if sad >= limit {
                 return sad;
@@ -731,7 +752,6 @@ impl<'a> FrameEncoder<'a> {
                 &reference_plane,
                 x,
                 y,
-                size,
                 size,
                 best_mv.row * scale,
                 best_mv.col * scale,

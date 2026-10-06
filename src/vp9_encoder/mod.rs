@@ -194,6 +194,7 @@ pub(crate) fn vpcc_box(level: u8, color_space: u8, full_range: bool) -> Vec<u8> 
 ///
 /// The browser encoder needs this because `WebCodecs` reports no decoder
 /// configuration for VP9: like AV1, everything travels in band.
+#[cfg_attr(not(all(feature = "web", target_arch = "wasm32")), allow(dead_code))]
 pub(crate) fn vpcc_from_key_frame(frame: &[u8], level: u8) -> Option<Vec<u8>> {
     let bit = |index: usize| -> Option<u8> {
         frame
@@ -399,7 +400,7 @@ impl NativeVp9Encoder {
         let reference = if key { None } else { self.reference.as_ref() };
         let (data, reconstruction) =
             FrameEncoder::new(self.geometry, &picture, reference, self.base_q_idx)
-                .encode(self.base_q_idx, self.color_range == ColorRange::Full);
+                .encode(self.color_range == ColorRange::Full);
         if u64::try_from(data.len()).unwrap_or(u64::MAX) > self.limits.max_allocation_bytes {
             return Err(Error::new(
                 ErrorKind::ResourceLimit,

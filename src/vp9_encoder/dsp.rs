@@ -280,7 +280,7 @@ impl ReferencePlane<'_> {
     }
 }
 
-/// Motion-compensates a `w` x `h` block whose top-left sample is at `(x, y)`
+/// Motion-compensates a `size` x `size` block whose top-left sample is at `(x, y)`
 /// with a motion vector in sixteenth-sample units of this plane, using the
 /// regular 8-tap filter the frame header selects.
 ///
@@ -291,8 +291,7 @@ pub(super) fn predict_inter(
     reference: &ReferencePlane<'_>,
     x: usize,
     y: usize,
-    w: usize,
-    h: usize,
+    size: usize,
     mv_row_q4: i32,
     mv_col_q4: i32,
     output: &mut [u8],
@@ -301,6 +300,7 @@ pub(super) fn predict_inter(
     let y0 = y as isize + (mv_row_q4 >> 4) as isize;
     let filter_x = &SUBPEL_FILTERS_REGULAR[(mv_col_q4 & 15) as usize * 8..][..8];
     let filter_y = &SUBPEL_FILTERS_REGULAR[(mv_row_q4 & 15) as usize * 8..][..8];
+    let (w, h) = (size, size);
     let mut intermediate = vec![0_u8; (h + 7) * w];
     for row in 0..h + 7 {
         let source_y = y0 + row as isize - 3;
@@ -373,7 +373,7 @@ mod tests {
             height: 8,
         };
         let mut output = [0_u8; 16];
-        predict_inter(&reference, 4, 4, 4, 4, -16 * 6, 16 * 2, &mut output);
+        predict_inter(&reference, 4, 4, 4, -16 * 6, 16 * 2, &mut output);
         // Rows -2..=1 read rows 0, 0, 0, 1 and columns 6..=9 read 6, 7, 7, 7.
         assert_eq!(&output[..4], &[18, 21, 21, 21]);
         assert_eq!(&output[8..12], &[18, 21, 21, 21]);
