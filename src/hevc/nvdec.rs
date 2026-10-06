@@ -1,11 +1,11 @@
 //! NVIDIA NVDEC backend for Windows and Linux, loaded from the display driver at runtime.
 //!
-//! It decodes HEVC Main for the HEVC factory and VP8 for the VP8 factory. Both share the driver
-//! loading, the worker thread that owns the CUDA context, and the parser callbacks; a
-//! [`Bitstream`] holds what differs between them.
+//! It decodes HEVC Main for the HEVC factory, VP8 for the VP8 factory and VP9 profile 0 for the
+//! VP9 factory. They share the driver loading, the worker thread that owns the CUDA context, and
+//! the parser callbacks; a [`Bitstream`] holds what differs between them.
 
 use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, VecDeque};
 use std::ffi::{c_char, c_int, c_void};
 use std::ptr;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
@@ -15,6 +15,7 @@ use libloading::Library;
 
 use super::engine::hvcc::{HvccRecord, split_length_prefixed};
 use super::readback;
+use crate::vp9_dec::{ChunkInspector, DecodedPicture, FrameShape, chunk_frames};
 use crate::{
     CancellationToken, DecodedVideoFrame, EncodedVideoSample, Error, ErrorKind, FrameIndex, Limits,
     PixelFormat, Plane, Result, VideoDecoder, VideoDecoderConfig, VideoDimensions, VideoFrame,
@@ -23,6 +24,7 @@ use crate::{
 const CUDA_SUCCESS: i32 = 0;
 const CUDA_VIDEO_CODEC_HEVC: u32 = 8;
 const CUDA_VIDEO_CODEC_VP8: u32 = 9;
+const CUDA_VIDEO_CODEC_VP9: u32 = 10;
 const CUDA_VIDEO_CHROMA_420: u32 = 1;
 const CUDA_VIDEO_SURFACE_NV12: u32 = 0;
 const CUDA_VIDEO_DEINTERLACE_WEAVE: u32 = 0;
@@ -67,6 +69,11 @@ pub(super) fn is_available(dimensions: VideoDimensions) -> bool {
 /// Whether NVDEC can decode VP8 at `dimensions` on this host.
 pub(crate) fn is_vp8_available(dimensions: VideoDimensions) -> bool {
     probe(CUDA_VIDEO_CODEC_VP8, dimensions)
+}
+
+/// Whether NVDEC can decode VP9 profile 0 at `dimensions` on this host.
+pub(crate) fn is_vp9_available(dimensions: VideoDimensions) -> bool {
+    probe(CUDA_VIDEO_CODEC_VP9, dimensions)
 }
 
 fn probe(codec_type: u32, dimensions: VideoDimensions) -> bool {
@@ -117,6 +124,24 @@ pub(crate) fn create_vp8(
         .map(|decoder| Box::new(decoder) as Box<dyn VideoDecoder>)
 }
 
+/// Creates an NVDEC VP9 profile 0 decoder. Its pictures are converted by the software decoder's
+/// own conversion, with the colour each frame's header names, so both return the same frames.
+pub(crate) fn create_vp9(
+    configuration: &VideoDecoderConfig,
+    limits: &Limits,
+) -> Result<Box<dyn VideoDecoder>> {
+    NvDecoder::spawn(
+        configuration.clone(),
+        *limits,
+        Bitstream::Vp9 {
+            inspector: ChunkInspector::default(),
+            shown: VecDeque::new(),
+            slots: [None; 8],
+        },
+    )
+    .map(|decoder| Box::new(decoder) as Box<dyn VideoDecoder>)
+}
+
 /// What differs between the codecs this backend decodes.
 enum Bitstream {
     /// Length-prefixed HEVC access units, rewritten to Annex B with the parameter sets ahead of
@@ -130,6 +155,21 @@ enum Bitstream {
     /// displayed as soon as they are decoded. They are decoded at the coded (macroblock-aligned)
     /// size and cropped on readback, which keeps odd dimensions exact.
     Vp8 { convert: PlanarConverter },
+    /// One VP9 chunk per sample, its frames passed to the parser one packet each. Every sample
+    /// shows exactly one frame, possibly after hidden ones or by `show_existing_frame`, and VP9
+    /// never reorders, so pictures are displayed as soon as they are decoded; they are cropped
+    /// on readback like VP8's. `inspector` reads each chunk's headers for the size and colour
+    /// of the frame it shows, which `shown` holds until that frame is displayed.
+    ///
+    /// The cuvid parser decodes a `show_existing_frame` header but never displays it, so the
+    /// backend shows it itself: `slots` follows which decode surface each of VP9's eight
+    /// reference slots holds, and the surface a shown slot names is read back directly. The
+    /// parser keeps a surface while any slot still references it.
+    Vp9 {
+        inspector: ChunkInspector,
+        shown: VecDeque<FrameShape>,
+        slots: [Option<c_int>; 8],
+    },
 }
 
 impl Bitstream {
@@ -137,6 +177,7 @@ impl Bitstream {
         match self {
             Self::Hevc { .. } => CUDA_VIDEO_CODEC_HEVC,
             Self::Vp8 { .. } => CUDA_VIDEO_CODEC_VP8,
+            Self::Vp9 { .. } => CUDA_VIDEO_CODEC_VP9,
         }
     }
 
@@ -144,6 +185,7 @@ impl Bitstream {
         match self {
             Self::Hevc { .. } => "HEVC",
             Self::Vp8 { .. } => "VP8",
+            Self::Vp9 { .. } => "VP9",
         }
     }
 }
@@ -325,11 +367,13 @@ impl NvDecoderCore {
             decoder: ptr::null_mut(),
             codec_type: bitstream.codec_type(),
             codec_name: bitstream.name(),
-            crop_on_readback: matches!(bitstream, Bitstream::Vp8 { .. }),
+            crop_on_readback: !matches!(bitstream, Bitstream::Hevc { .. }),
             surface_height: 0,
             dimensions: configuration.coded_dimensions,
             max_allocation_bytes: limits.max_allocation_bytes,
             output_wanted: true,
+            discard_displays: false,
+            decoded_picture: None,
             frames: Vec::new(),
             error: None,
         });
@@ -352,6 +396,11 @@ impl NvDecoderCore {
         cancellation: &CancellationToken,
     ) -> Result<Vec<DecodedVideoFrame>> {
         check_cancelled(cancellation)?;
+        if matches!(self.bitstream, Bitstream::Vp9 { .. }) {
+            self.submit_vp9(sample)?;
+            check_cancelled(cancellation)?;
+            return self.take_frames();
+        }
         let (data, displayed) = match &self.bitstream {
             Bitstream::Hevc {
                 nal_length_size,
@@ -369,6 +418,7 @@ impl NvDecoderCore {
                 vp8_sample(sample, self.limits.max_allocation_bytes)?,
                 vp8_frame_is_shown(&sample.data),
             ),
+            Bitstream::Vp9 { .. } => unreachable!("VP9 samples are submitted above"),
         };
         let timestamp = self.next_timestamp;
         self.next_timestamp = self
@@ -397,6 +447,91 @@ impl NvDecoderCore {
         self.take_frames()
     }
 
+    fn submit_vp9(&mut self, sample: &EncodedVideoSample) -> Result<()> {
+        if sample.data.len() as u64 > self.limits.max_allocation_bytes {
+            return Err(Error::new(
+                ErrorKind::ResourceLimit,
+                "VP9 sample exceeds the allocation limit",
+            ));
+        }
+        let Bitstream::Vp9 {
+            inspector,
+            shown,
+            slots,
+        } = &mut self.bitstream
+        else {
+            unreachable!("only VP9 samples are submitted here");
+        };
+        if sample.data.is_empty() {
+            return Err(Error::new(ErrorKind::MalformedMedia, "VP9 sample is empty"));
+        }
+        // Every header is read before anything reaches the driver, so a sample the software
+        // decoder would refuse is refused here too, with the same error.
+        let frames = chunk_frames(&sample.data)?;
+        let mut infos = Vec::with_capacity(frames.len());
+        for frame in &frames {
+            infos.push(inspector.inspect_frame(frame)?);
+        }
+        let last = *infos.last().expect("a chunk has a frame");
+        if !last.shown {
+            return Err(Error::new(
+                ErrorKind::MalformedMedia,
+                "VP9 sample does not show a frame",
+            ));
+        }
+        shown.push_back(last.shape);
+        self.presentation_indexes
+            .push(Reverse(sample.presentation_index));
+        let count = frames.len();
+        for (position, (frame, info)) in frames.into_iter().zip(infos).enumerate() {
+            // Like the software decoder, a chunk shows only its last frame.
+            let is_last = position + 1 == count;
+            if let Some(slot) = info.existing {
+                if is_last {
+                    let picture_index = slots[slot].ok_or_else(|| {
+                        codec("NVDEC holds no surface for the VP9 frame shown again")
+                    })?;
+                    let processing = CuvidProcParams {
+                        progressive_frame: 1,
+                        ..CuvidProcParams::zeroed()
+                    };
+                    read_back(&mut self.callback_state, picture_index, processing)
+                        .map_err(codec)?;
+                }
+                continue;
+            }
+            self.callback_state.discard_displays = !is_last;
+            self.callback_state.decoded_picture = None;
+            let mut packet = CuvidSourceDataPacket {
+                flags: CUVID_PKT_ENDOFPICTURE,
+                payload_size: u32::try_from(frame.len())
+                    .map_err(|_| Error::new(ErrorKind::ResourceLimit, "VP9 frame is too large"))?,
+                payload: frame.as_ptr(),
+                timestamp: 0,
+            };
+            let result =
+                unsafe { (self.runtime.api.cuvid_parse_video_data)(self.parser, &mut packet) };
+            self.callback_state.discard_displays = false;
+            if let Some(message) = self.callback_state.error.take() {
+                return Err(codec(message));
+            }
+            self.runtime
+                .api
+                .check(result, "NVDEC could not parse VP9 data")?;
+            let picture_index = self
+                .callback_state
+                .decoded_picture
+                .take()
+                .ok_or_else(|| codec("NVDEC decoded no picture for a VP9 frame"))?;
+            for (index, slot) in slots.iter_mut().enumerate() {
+                if info.refresh_frame_flags & (1 << index) != 0 {
+                    *slot = Some(picture_index);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn drain(&mut self, cancellation: &CancellationToken) -> Result<Vec<DecodedVideoFrame>> {
         check_cancelled(cancellation)?;
         let mut packet = CuvidSourceDataPacket {
@@ -419,6 +554,16 @@ impl NvDecoderCore {
         self.parser = create_parser(&self.runtime.api, &mut self.callback_state)?;
         self.presentation_indexes.clear();
         self.next_timestamp = 1;
+        if let Bitstream::Vp9 {
+            inspector,
+            shown,
+            slots,
+        } = &mut self.bitstream
+        {
+            inspector.reset();
+            shown.clear();
+            *slots = [None; 8];
+        }
         Ok(())
     }
 
@@ -435,6 +580,20 @@ impl NvDecoderCore {
 
     fn take_frames(&mut self) -> Result<Vec<DecodedVideoFrame>> {
         let raw_frames = std::mem::take(&mut self.callback_state.frames);
+        // Each displayed VP9 picture, read back or not, is the frame of the oldest sample still
+        // waiting for one, so it takes that sample's shape as it takes its identity.
+        let mut shapes = Vec::new();
+        if let Bitstream::Vp9 { shown, .. } = &mut self.bitstream {
+            for raw in &raw_frames {
+                let shape = shown
+                    .pop_front()
+                    .ok_or_else(|| codec("NVDEC displayed a VP9 frame no sample showed"))?;
+                if raw.is_some() {
+                    shapes.push(shape);
+                }
+            }
+        }
+        let mut shapes = shapes.into_iter();
         let wanted = claim_identities(raw_frames, &mut self.presentation_indexes)?;
         wanted
             .into_iter()
@@ -446,6 +605,10 @@ impl NvDecoderCore {
                         &self.configuration,
                         &self.limits,
                     )?,
+                    Bitstream::Vp9 { .. } => {
+                        let shape = shapes.next().expect("one shape per read-back frame");
+                        vp9_frame(&raw, shape, &self.limits)?
+                    }
                 };
                 Ok(DecodedVideoFrame {
                     presentation_index,
@@ -496,10 +659,10 @@ impl NvRuntime {
     }
 
     fn require_codec(&self, codec_type: u32, dimensions: VideoDimensions) -> Result<()> {
-        let name = if codec_type == CUDA_VIDEO_CODEC_VP8 {
-            "VP8"
-        } else {
-            "HEVC Main"
+        let name = match codec_type {
+            CUDA_VIDEO_CODEC_VP8 => "VP8",
+            CUDA_VIDEO_CODEC_VP9 => "VP9 profile 0",
+            _ => "HEVC Main",
         };
         let mut caps = CuvidDecodeCaps {
             codec_type,
@@ -645,6 +808,11 @@ struct CallbackState {
     /// Whether the pictures arriving at the display callback are wanted as frames. A suppressed
     /// picture is still decoded, and still reaches the callback; what it skips is the readback.
     output_wanted: bool,
+    /// Whether pictures arriving at the display callback are dropped without a trace, as a
+    /// shown VP9 frame that is not the last of its chunk is.
+    discard_displays: bool,
+    /// The decode surface of the last picture the decode callback decoded.
+    decoded_picture: Option<c_int>,
     /// One entry per displayed picture, in display order. A suppressed picture leaves `None`,
     /// which `take_frames` needs in order to consume that picture's presentation identity: the
     /// identities are popped one per displayed picture, so dropping an entry outright would
@@ -662,11 +830,11 @@ struct RawNv12Frame {
 
 fn create_parser(api: &NvApi, state: &mut Box<CallbackState>) -> Result<*mut c_void> {
     let mut parser = ptr::null_mut();
-    // VP8 never reorders, so a frame is displayed by the packet that codes it.
-    let max_display_delay = if state.codec_type == CUDA_VIDEO_CODEC_VP8 {
-        0
-    } else {
+    // VP8 and VP9 never reorder, so a frame is displayed by the packet that codes it.
+    let max_display_delay = if state.codec_type == CUDA_VIDEO_CODEC_HEVC {
         4
+    } else {
+        0
     };
     let mut params = CuvidParserParams {
         codec_type: state.codec_type,
@@ -715,8 +883,8 @@ unsafe extern "system" fn sequence_callback(
         let matches = if state.crop_on_readback {
             // The VP8 parser rounds an odd display size down to even, but the coded surface it
             // decodes still holds every row and column of the frame, which is what is cropped.
-            display_width == (width & !1) as i32
-                && display_height == (height & !1) as i32
+            (display_width == width as i32 || display_width == (width & !1) as i32)
+                && (display_height == height as i32 || display_height == (height & !1) as i32)
                 && format.coded_width >= width
                 && format.coded_height >= height
         } else {
@@ -801,6 +969,8 @@ unsafe extern "system" fn decode_callback(user: *mut c_void, picture: *mut c_voi
         state.error = Some("NVDEC decode callback received invalid state".into());
         return 0;
     }
+    // `CUVIDPICPARAMS` opens with `PicWidthInMbs`, `FrameHeightInMbs` and `CurrPicIdx`.
+    state.decoded_picture = Some(unsafe { *picture.cast::<c_int>().add(2) });
     let result = unsafe { (state.api.cuvid_decode_picture)(state.decoder, picture) };
     if result == CUDA_SUCCESS {
         1
@@ -823,69 +993,17 @@ unsafe extern "system" fn display_callback(
         if state.decoder.is_null() {
             return Err("NVDEC display callback has no decoder".to_owned());
         }
-        // The picture was decoded and remains a reference for the frames after it; skipping the
-        // map/copy-back/convert below is the whole saving. The placeholder still records that a
-        // picture was displayed, which is what keeps the presentation identities aligned.
-        if !state.output_wanted {
-            state.frames.push(None);
+        if state.discard_displays {
             return Ok(());
         }
-        let mut processing = CuvidProcParams {
+        let processing = CuvidProcParams {
             progressive_frame: display.progressive_frame,
             second_field: 0,
             top_field_first: display.top_field_first,
             unpaired_field: i32::from(display.repeat_first_field < 0),
             ..CuvidProcParams::zeroed()
         };
-        let mut device_pointer = 0_u64;
-        let mut pitch = 0_u32;
-        // NVDEC's surface-copy phase is the whole map/`cuMemcpyDtoH`/unmap
-        // sequence: on a discrete GPU this is the PCIe transfer, and it is the
-        // half of readback the colour conversion below cannot account for.
-        let surface_copy = readback::Timer::start();
-        let mapped = unsafe {
-            (state.api.cuvid_map_video_frame)(
-                state.decoder,
-                display.picture_index,
-                &mut device_pointer,
-                &mut pitch,
-                &mut processing,
-            )
-        };
-        if mapped != CUDA_SUCCESS {
-            return Err(format!(
-                "NVDEC could not map {} frame: CUDA error {mapped}",
-                state.codec_name
-            ));
-        }
-        let byte_count = usize::try_from(pitch)
-            .ok()
-            .and_then(|pitch| pitch.checked_mul(state.surface_height as usize))
-            .and_then(|luma| luma.checked_add(luma / 2))
-            .ok_or_else(|| "NVDEC frame size overflows".to_owned())?;
-        if byte_count as u64 > state.max_allocation_bytes {
-            unsafe { (state.api.cuvid_unmap_video_frame)(state.decoder, device_pointer) };
-            return Err("NVDEC frame exceeds the allocation limit".to_owned());
-        }
-        let mut data = vec![0_u8; byte_count];
-        let copied = unsafe {
-            (state.api.cu_memcpy_dtoh)(data.as_mut_ptr().cast(), device_pointer, byte_count)
-        };
-        let unmapped =
-            unsafe { (state.api.cuvid_unmap_video_frame)(state.decoder, device_pointer) };
-        if copied != CUDA_SUCCESS {
-            return Err(format!("NVDEC frame readback failed: CUDA error {copied}"));
-        }
-        if unmapped != CUDA_SUCCESS {
-            return Err(format!("NVDEC frame unmap failed: CUDA error {unmapped}"));
-        }
-        surface_copy.record(readback::Phase::SurfaceCopy);
-        state.frames.push(Some(RawNv12Frame {
-            pitch: pitch as usize,
-            surface_height: state.surface_height as usize,
-            data,
-        }));
-        Ok(())
+        read_back(state, display.picture_index, processing)
     })();
     match result {
         Ok(()) => 1,
@@ -894,6 +1012,68 @@ unsafe extern "system" fn display_callback(
             0
         }
     }
+}
+
+/// Reads the decoded picture on surface `picture_index` back as a displayed frame.
+fn read_back(
+    state: &mut CallbackState,
+    picture_index: c_int,
+    mut processing: CuvidProcParams,
+) -> std::result::Result<(), String> {
+    // The picture was decoded and remains a reference for the frames after it; skipping the
+    // map/copy-back/convert below is the whole saving. The placeholder still records that a
+    // picture was displayed, which is what keeps the presentation identities aligned.
+    if !state.output_wanted {
+        state.frames.push(None);
+        return Ok(());
+    }
+    let mut device_pointer = 0_u64;
+    let mut pitch = 0_u32;
+    // NVDEC's surface-copy phase is the whole map/`cuMemcpyDtoH`/unmap
+    // sequence: on a discrete GPU this is the PCIe transfer, and it is the
+    // half of readback the colour conversion below cannot account for.
+    let surface_copy = readback::Timer::start();
+    let mapped = unsafe {
+        (state.api.cuvid_map_video_frame)(
+            state.decoder,
+            picture_index,
+            &mut device_pointer,
+            &mut pitch,
+            &mut processing,
+        )
+    };
+    if mapped != CUDA_SUCCESS {
+        return Err(format!(
+            "NVDEC could not map {} frame: CUDA error {mapped}",
+            state.codec_name
+        ));
+    }
+    let byte_count = usize::try_from(pitch)
+        .ok()
+        .and_then(|pitch| pitch.checked_mul(state.surface_height as usize))
+        .and_then(|luma| luma.checked_add(luma / 2))
+        .ok_or_else(|| "NVDEC frame size overflows".to_owned())?;
+    if byte_count as u64 > state.max_allocation_bytes {
+        unsafe { (state.api.cuvid_unmap_video_frame)(state.decoder, device_pointer) };
+        return Err("NVDEC frame exceeds the allocation limit".to_owned());
+    }
+    let mut data = vec![0_u8; byte_count];
+    let copied =
+        unsafe { (state.api.cu_memcpy_dtoh)(data.as_mut_ptr().cast(), device_pointer, byte_count) };
+    let unmapped = unsafe { (state.api.cuvid_unmap_video_frame)(state.decoder, device_pointer) };
+    if copied != CUDA_SUCCESS {
+        return Err(format!("NVDEC frame readback failed: CUDA error {copied}"));
+    }
+    if unmapped != CUDA_SUCCESS {
+        return Err(format!("NVDEC frame unmap failed: CUDA error {unmapped}"));
+    }
+    surface_copy.record(readback::Phase::SurfaceCopy);
+    state.frames.push(Some(RawNv12Frame {
+        pitch: pitch as usize,
+        surface_height: state.surface_height as usize,
+        data,
+    }));
+    Ok(())
 }
 
 /// Pairs each displayed picture with the presentation identity it owns, dropping the suppressed
@@ -1051,6 +1231,20 @@ fn vp8_sample(sample: &EncodedVideoSample, max_allocation_bytes: u64) -> Result<
         ));
     }
     Ok(sample.data.clone())
+}
+
+/// Crops a VP9 picture to the size its header gave it and converts it as the software decoder
+/// converts its own pictures.
+fn vp9_frame(raw: &RawNv12Frame, shape: FrameShape, limits: &Limits) -> Result<VideoFrame> {
+    let dimensions = VideoDimensions::new(shape.width as u32, shape.height as u32, limits)?;
+    let picture = DecodedPicture {
+        width: shape.width,
+        height: shape.height,
+        planes: nv12_to_planar(raw, dimensions)?,
+        color_space: shape.color_space,
+        full_range: shape.full_range,
+    };
+    crate::vp9_decoder::picture_to_rgba(&picture, limits)
 }
 
 /// The `show_frame` bit of a VP8 frame tag (RFC 6386 section 9.1).

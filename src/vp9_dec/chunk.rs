@@ -24,6 +24,19 @@ pub(crate) struct FrameShape {
     pub(crate) full_range: bool,
 }
 
+/// What the start of one frame's header says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FrameInfo {
+    /// The frame's size and colour, or for `show_existing_frame` those of the frame it shows.
+    pub(crate) shape: FrameShape,
+    pub(crate) shown: bool,
+    /// The reference slot a `show_existing_frame` header shows again. Such a header decodes
+    /// nothing and refreshes no slot.
+    pub(crate) existing: Option<usize>,
+    /// The reference slots the decoded frame replaces.
+    pub(crate) refresh_frame_flags: u8,
+}
+
 /// Follows a VP9 stream chunk by chunk, as a [`Decoder`](super::Decoder) would, without
 /// decoding it.
 #[derive(Debug, Default)]
@@ -45,25 +58,16 @@ impl ChunkInspector {
         if data.is_empty() {
             return Err(malformed("VP9 sample is empty"));
         }
-        let Some(sizes) = superframe_index(data)? else {
-            return self.inspect_frame(data);
-        };
         let mut shown = None;
-        let mut offset = 0;
-        for size in sizes {
-            let end = offset + size;
-            if size == 0 || end > data.len() {
-                return Err(malformed(
-                    "VP9 superframe index names an invalid frame size",
-                ));
-            }
-            shown = self.inspect_frame(&data[offset..end])?;
-            offset = end;
+        for frame in chunk_frames(data)? {
+            let info = self.inspect_frame(frame)?;
+            shown = info.shown.then_some(info.shape);
         }
         Ok(shown)
     }
 
-    fn inspect_frame(&mut self, data: &[u8]) -> Result<Option<FrameShape>> {
+    /// Reads one frame of a chunk and records the reference slots it refreshes.
+    pub(crate) fn inspect_frame(&mut self, data: &[u8]) -> Result<FrameInfo> {
         let mut reader = BitReader::new(data);
         if reader.literal(2)? != 2 {
             return Err(malformed("VP9 frame marker is invalid"));
@@ -83,7 +87,12 @@ impl ChunkInspector {
             let shape = self.refs[index].ok_or_else(|| {
                 malformed("VP9 show_existing_frame names an empty reference slot")
             })?;
-            return Ok(Some(shape));
+            return Ok(FrameInfo {
+                shape,
+                shown: true,
+                existing: Some(index),
+                refresh_frame_flags: 0,
+            });
         }
         let key_frame = !reader.bit()?;
         let show_frame = reader.bit()?;
@@ -129,9 +138,8 @@ impl ChunkInspector {
                 }; 3];
                 for reference in &mut references {
                     let index = reader.literal(3)? as usize;
-                    *reference = self.refs[index].ok_or_else(|| {
-                        malformed("VP9 frame references an empty reference slot")
-                    })?;
+                    *reference = self.refs[index]
+                        .ok_or_else(|| malformed("VP9 frame references an empty reference slot"))?;
                     reader.bit()?; // ref_frame_sign_bias
                 }
                 let mut size = None;
@@ -162,8 +170,33 @@ impl ChunkInspector {
                 *reference = Some(shape);
             }
         }
-        Ok(show_frame.then_some(shape))
+        Ok(FrameInfo {
+            shape,
+            shown: show_frame,
+            existing: None,
+            refresh_frame_flags,
+        })
     }
+}
+
+/// The frames of a chunk: those its superframe index lists, or the whole chunk when it has none.
+pub(crate) fn chunk_frames(data: &[u8]) -> Result<Vec<&[u8]>> {
+    let Some(sizes) = superframe_index(data)? else {
+        return Ok(vec![data]);
+    };
+    let mut frames = Vec::with_capacity(sizes.len());
+    let mut offset = 0;
+    for size in sizes {
+        let end = offset + size;
+        if size == 0 || end > data.len() {
+            return Err(malformed(
+                "VP9 superframe index names an invalid frame size",
+            ));
+        }
+        frames.push(&data[offset..end]);
+        offset = end;
+    }
+    Ok(frames)
 }
 
 fn read_frame_size(reader: &mut BitReader) -> Result<(usize, usize)> {

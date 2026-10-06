@@ -43,7 +43,7 @@ use bits::{BitReader, BoolDecoder};
 use block::{FrameDecoder, MvRef};
 use probs::{FrameContext, FrameCounts};
 
-pub(crate) use chunk::{ChunkInspector, FrameShape};
+pub(crate) use chunk::{ChunkInspector, FrameInfo, FrameShape, chunk_frames};
 
 use crate::{Error, ErrorKind, Limits, Result};
 

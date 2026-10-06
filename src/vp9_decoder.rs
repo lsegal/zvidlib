@@ -1,5 +1,6 @@
-//! Native, dependency-free VP9 software decoding, registered as a
-//! [`VideoDecoderFactory`].
+//! Native VP9 decoding, registered as a [`VideoDecoderFactory`]: a
+//! dependency-free software decoder, and the platform's hardware decoder
+//! where the host has one.
 //!
 //! This wraps the crate's VP9 profile 0 decoder (`crate::vp9_dec`), which
 //! decodes 8-bit 4:2:0 streams bit for bit as libvpx does: hidden frames,
@@ -14,6 +15,12 @@
 //! (BT.601 when it is unknown or one the conversion does not implement), at
 //! the size the frame was coded at: a stream that changes resolution emits
 //! frames of each size.
+//!
+//! The hardware backends decode the same chunks. A chunk's headers are read
+//! before it reaches the platform decoder, so each sample still shows exactly
+//! one frame, and the decoded picture is cropped to the size its header names
+//! and converted by [`picture_to_rgba`] with the colour space and range the
+//! header names, exactly as a software picture is.
 
 use crate::vp9_dec::{DecodedPicture, Decoder};
 use crate::{
@@ -24,8 +31,13 @@ use crate::{
     convert_to_rgba8,
 };
 
-/// Returns the dependency-free native VP9 profile 0 (8-bit 4:2:0) software
-/// decoder backend.
+/// Returns the native VP9 profile 0 (8-bit 4:2:0) decoder backend.
+///
+/// `Prefer` and `Require` select a hardware decoder where the host has one
+/// that decodes VP9 profile 0 at the configured size: NVIDIA NVDEC on 64-bit
+/// Windows and Linux. `Prefer` falls back to the dependency-free software
+/// decoder when none is available, and `Require` reports
+/// [`CodecSupport::HardwareUnavailable`]. `Avoid` always selects software.
 pub fn native_vp9_video_decoder_factory() -> impl VideoDecoderFactory {
     Vp9DecoderFactory
 }
@@ -41,6 +53,15 @@ impl VideoDecoderFactory for Vp9DecoderFactory {
         }
         if let Err(error) = parse_configuration(configuration, &Limits::default()) {
             return invalid_configuration(error.message());
+        }
+        if configuration.hardware != HardwarePreference::Avoid && hardware_available(configuration)
+        {
+            return CodecSupport::Supported {
+                implementation: CodecImplementation::Hardware,
+            };
+        }
+        if configuration.hardware == HardwarePreference::Require {
+            return CodecSupport::HardwareUnavailable;
         }
         CodecSupport::Supported {
             implementation: CodecImplementation::Software,
@@ -66,17 +87,29 @@ impl VideoDecoderFactory for Vp9DecoderFactory {
                     "native VP9 decoder supports profile 0",
                 ));
             }
-            CodecSupport::HardwareUnavailable => {
-                return Err(Error::new(
-                    ErrorKind::Unsupported,
-                    "native VP9 decoder is software-only",
-                ));
-            }
+            CodecSupport::HardwareUnavailable => unreachable!("hardware is not checked here"),
             CodecSupport::InvalidConfiguration { reason } => {
                 return Err(Error::new(ErrorKind::InvalidInput, reason));
             }
         }
         parse_configuration(configuration, limits)?;
+        if configuration.hardware != HardwarePreference::Avoid {
+            let hardware_errors = match create_hardware(configuration, limits) {
+                Ok(decoder) => return Ok(decoder),
+                Err(errors) => errors,
+            };
+            if configuration.hardware == HardwarePreference::Require {
+                let detail = if hardware_errors.is_empty() {
+                    "no accelerated backend exists for this target".to_owned()
+                } else {
+                    hardware_errors.join("; ")
+                };
+                return Err(Error::new(
+                    ErrorKind::Unsupported,
+                    format!("hardware VP9 decoding is unavailable ({detail})"),
+                ));
+            }
+        }
         Ok(Box::new(Vp9Decoder {
             limits: *limits,
             inner: Decoder::new(*limits),
@@ -92,9 +125,6 @@ impl Vp9DecoderFactory {
         if configuration.profile != CodecProfile::Vp9Profile0 {
             return CodecSupport::UnsupportedProfile;
         }
-        if configuration.hardware == HardwarePreference::Require {
-            return CodecSupport::HardwareUnavailable;
-        }
         if configuration.output_format != PixelFormat::Rgba8 {
             return invalid_configuration("native VP9 decoding currently outputs RGBA8");
         }
@@ -102,6 +132,33 @@ impl Vp9DecoderFactory {
             implementation: CodecImplementation::Software,
         }
     }
+}
+
+fn hardware_available(_configuration: &VideoDecoderConfig) -> bool {
+    #[cfg(all(any(windows, target_os = "linux"), target_pointer_width = "64"))]
+    if crate::hevc::nvdec::is_vp9_available(_configuration.coded_dimensions) {
+        return true;
+    }
+    false
+}
+
+/// Creates the first hardware decoder that accepts the configuration, in the
+/// order [`hardware_available`] checks them, or says why each refused it.
+fn create_hardware(
+    _configuration: &VideoDecoderConfig,
+    _limits: &Limits,
+) -> std::result::Result<Box<dyn VideoDecoder>, Vec<String>> {
+    #[cfg_attr(
+        not(all(any(windows, target_os = "linux"), target_pointer_width = "64")),
+        allow(unused_mut)
+    )]
+    let mut errors = Vec::new();
+    #[cfg(all(any(windows, target_os = "linux"), target_pointer_width = "64"))]
+    match crate::hevc::nvdec::create_vp9(_configuration, _limits) {
+        Ok(decoder) => return Ok(decoder),
+        Err(error) => errors.push(format!("NVDEC: {}", error.message())),
+    }
+    Err(errors)
 }
 
 fn invalid_configuration(reason: impl Into<String>) -> CodecSupport {
@@ -285,19 +342,26 @@ mod tests {
             CodecSupport::UnsupportedProfile
         );
 
+        // Require and Prefer agree on whether this host has hardware.
         candidate = config();
         candidate.hardware = HardwarePreference::Require;
-        assert_eq!(
-            factory.capability(&candidate),
-            CodecSupport::HardwareUnavailable
-        );
+        let required = factory.capability(&candidate);
         candidate.hardware = HardwarePreference::Prefer;
-        assert_eq!(
-            factory.capability(&candidate),
-            CodecSupport::Supported {
-                implementation: CodecImplementation::Software
-            }
-        );
+        let preferred = factory.capability(&candidate);
+        if hardware_available(&candidate) {
+            let hardware = CodecSupport::Supported {
+                implementation: CodecImplementation::Hardware,
+            };
+            assert_eq!((required, preferred), (hardware.clone(), hardware));
+        } else {
+            assert_eq!(required, CodecSupport::HardwareUnavailable);
+            assert_eq!(
+                preferred,
+                CodecSupport::Supported {
+                    implementation: CodecImplementation::Software
+                }
+            );
+        }
 
         candidate = config();
         candidate.output_format = PixelFormat::Yuv420p8;
