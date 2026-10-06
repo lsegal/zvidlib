@@ -117,7 +117,7 @@ impl WebVideoEncodeSession {
             // starting point for `configure()`: like AV1, the real profile
             // and level are read back from what the encoder actually emits.
             Codec::Hevc => "hev1.1.6.L93.B0",
-            Codec::UncompressedVideo | Codec::H264 | Codec::Vp8 | Codec::Aac => {
+            Codec::UncompressedVideo | Codec::H264 | Codec::Vp8 | Codec::Vp9 | Codec::Aac => {
                 return Err(Error::new(
                     ErrorKind::Unsupported,
                     "the WebCodecs video encoder bridge only supports AV1 and HEVC",
@@ -308,7 +308,9 @@ impl WebVideoEncodeSession {
             let config = match self.codec {
                 Codec::Av1 => av1c_from_bitstream(&data),
                 Codec::Hevc => hvcc_from_metadata(&metadata),
-                Codec::UncompressedVideo | Codec::H264 | Codec::Vp8 | Codec::Aac => None,
+                Codec::UncompressedVideo | Codec::H264 | Codec::Vp8 | Codec::Vp9 | Codec::Aac => {
+                    None
+                }
             };
             config.inspect(|_| {
                 self.emitted_config = true;

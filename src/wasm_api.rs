@@ -2612,6 +2612,36 @@ mod tests {
         }
     }
 
+    /// Issue #527: a VP9-in-MP4 track opens and decodes through `get()`,
+    /// through `WebCodecs` where the browser decodes VP9 and the software
+    /// decoder otherwise, for frames on either side of its second key frame.
+    #[wasm_bindgen_test(async)]
+    async fn video_get_decodes_a_vp9_track() {
+        const SAMPLE: &[u8] = include_bytes!("../tests/fixtures/codec/vp9_bbb_256x144.mp4");
+        let bytes = Uint8Array::from(SAMPLE);
+        let input =
+            WasmMediaInput::open_inner(bytes.into(), Limits::default().max_allocation_bytes, None)
+                .await
+                .unwrap();
+        let video = input.video(0).unwrap();
+        for frame_index in [40_u64, 0, 23] {
+            let frame = JsFuture::from(video.get(BigInt::from(frame_index).into(), None))
+                .await
+                .expect("VP9 decodes through WebCodecs or the software fallback");
+            let get_u32 = |name: &str| -> u32 {
+                Reflect::get(&frame, &JsValue::from_str(name))
+                    .unwrap()
+                    .as_f64()
+                    .unwrap() as u32
+            };
+            assert_eq!((get_u32("width"), get_u32("height")), (256, 144));
+            let pixels: Uint8Array = Reflect::get(&frame, &JsValue::from_str("pixels"))
+                .unwrap()
+                .unchecked_into();
+            assert_eq!(pixels.length(), 256 * 144 * 4);
+        }
+    }
+
     /// Issue #363: scrubbing a timeline backwards has to restart its decode
     /// somewhere, and the only frames it can restart at are the track's
     /// random-access samples. The bundled sample codes its 768 frames as a
