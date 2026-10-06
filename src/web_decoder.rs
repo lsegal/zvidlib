@@ -65,10 +65,12 @@ fn codec_description(codec: Codec, decoder_config: &[u8]) -> Result<&[u8]> {
         Codec::Vp8 => Ok(&[]),
         // Nor does VP9's: its bitstream describes itself.
         Codec::Vp9 => Ok(&[]),
-        Codec::UncompressedVideo | Codec::H264 | Codec::Aac => Err(Error::new(
-            ErrorKind::Unsupported,
-            "only HEVC, AV1, VP8 and VP9 have a WebCodecs decoder backend",
-        )),
+        Codec::UncompressedVideo | Codec::H264 | Codec::Aac | Codec::Opus | Codec::Vorbis => {
+            Err(Error::new(
+                ErrorKind::Unsupported,
+                "only HEVC, AV1, VP8 and VP9 have a WebCodecs decoder backend",
+            ))
+        }
     }
 }
 
@@ -293,10 +295,12 @@ fn software_decoder_factory(codec: Codec) -> Result<Box<dyn VideoDecoderFactory>
         Codec::Av1 => Ok(Box::new(crate::native_av1_video_decoder_factory())),
         Codec::Vp8 => Ok(Box::new(crate::native_vp8_video_decoder_factory())),
         Codec::Vp9 => Ok(Box::new(crate::native_vp9_video_decoder_factory())),
-        Codec::UncompressedVideo | Codec::H264 | Codec::Aac => Err(Error::new(
-            ErrorKind::Unsupported,
-            "only HEVC, AV1, VP8 and VP9 have a software decoder backend",
-        )),
+        Codec::UncompressedVideo | Codec::H264 | Codec::Aac | Codec::Opus | Codec::Vorbis => {
+            Err(Error::new(
+                ErrorKind::Unsupported,
+                "only HEVC, AV1, VP8 and VP9 have a software decoder backend",
+            ))
+        }
     }
 }
 

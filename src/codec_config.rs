@@ -20,7 +20,10 @@ pub struct DerivedCodecString {
 }
 
 /// Derives a WebCodecs `codec` string and [`CodecProfile`] from a track's
-/// complete raw codec configuration box (including its size/fourcc header).
+/// complete raw codec configuration box (including its size/fourcc header):
+/// `hvcC`, `av1C` or Opus's `dOps`. Vorbis has no MP4 box, so its
+/// configuration is the Xiph-laced `CodecPrivate` [`crate::VorbisConfig`]
+/// reads.
 pub fn derive_codec_string(codec: Codec, decoder_config: &[u8]) -> Result<DerivedCodecString> {
     match codec {
         Codec::Hevc => derive_hevc(decoder_config),
@@ -31,6 +34,23 @@ pub fn derive_codec_string(codec: Codec, decoder_config: &[u8]) -> Result<Derive
             codec_string: "vp8".to_owned(),
             profile: CodecProfile::Vp8,
         }),
+        // Opus and Vorbis each have a single codec string; the configuration
+        // is still checked so a track the browser is handed is one zvidlib
+        // could also decode itself.
+        Codec::Opus => {
+            crate::OpusHead::from_dops(decoder_config)?;
+            Ok(DerivedCodecString {
+                codec_string: "opus".into(),
+                profile: CodecProfile::Opus,
+            })
+        }
+        Codec::Vorbis => {
+            crate::VorbisConfig::from_codec_private(decoder_config)?;
+            Ok(DerivedCodecString {
+                codec_string: "vorbis".into(),
+                profile: CodecProfile::Vorbis,
+            })
+        }
         Codec::Vp9 => {
             let config = Vp9CodecConfig::parse(decoder_config)?;
             Ok(DerivedCodecString {
@@ -40,7 +60,7 @@ pub fn derive_codec_string(codec: Codec, decoder_config: &[u8]) -> Result<Derive
         }
         Codec::UncompressedVideo | Codec::H264 | Codec::Aac => Err(Error::new(
             ErrorKind::Unsupported,
-            "codec string derivation only supports HEVC, AV1, VP8 and VP9 video",
+            "codec string derivation only supports HEVC, AV1, VP8, VP9, Opus and Vorbis",
         )),
     }
 }

@@ -59,6 +59,15 @@ pub enum Codec {
     /// [`crate::Vp9CodecConfig`]).
     Vp9,
     Aac,
+    /// Opus audio (RFC 6716). MP4 carries it in an `Opus` sample entry whose
+    /// decoder configuration is a `dOps` box; Matroska and WebM carry the
+    /// RFC 7845 `OpusHead` identification header as `CodecPrivate`. See
+    /// [`crate::OpusHead`].
+    Opus,
+    /// Vorbis I audio. There is no widely supported MP4 mapping for Vorbis, so
+    /// it has no MP4 sample entry; Matroska and WebM carry its three setup
+    /// headers Xiph-laced as `CodecPrivate`. See [`crate::VorbisConfig`].
+    Vorbis,
 }
 
 /// CPU video pixel formats supported by the portable media layer.

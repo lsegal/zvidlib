@@ -1,7 +1,7 @@
 //! Native AAC-LC decoding and default-device PCM output.
 
 use crate::{
-    AacDecoder, AacTrackConfig, AudioBuffer, AudioOutputBackend, CancellationToken, Error,
+    AacTrackConfig, AudioBuffer, AudioDecoder, AudioOutputBackend, CancellationToken, Error,
     ErrorKind, Limits, Result,
 };
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -55,7 +55,7 @@ impl NativeAacDecoder {
     }
 }
 
-impl AacDecoder for NativeAacDecoder {
+impl AudioDecoder for NativeAacDecoder {
     fn decode(
         &mut self,
         sample: &crate::EncodedAudioSample,

@@ -41,6 +41,11 @@ pub(crate) const CONTENT_ENCODINGS: u32 = 0x6D80;
 pub(crate) const VIDEO: u32 = 0xE0;
 pub(crate) const PIXEL_WIDTH: u32 = 0xB0;
 pub(crate) const PIXEL_HEIGHT: u32 = 0xBA;
+pub(crate) const AUDIO: u32 = 0xE1;
+pub(crate) const SAMPLING_FREQUENCY: u32 = 0xB5;
+pub(crate) const CHANNELS: u32 = 0x9F;
+pub(crate) const CODEC_DELAY: u32 = 0x56AA;
+pub(crate) const SEEK_PRE_ROLL: u32 = 0x56BB;
 pub(crate) const CLUSTER: u32 = 0x1F43_B675;
 pub(crate) const TIMESTAMP: u32 = 0xE7;
 pub(crate) const SIMPLE_BLOCK: u32 = 0xA3;
@@ -48,6 +53,7 @@ pub(crate) const BLOCK_GROUP: u32 = 0xA0;
 pub(crate) const BLOCK: u32 = 0xA1;
 pub(crate) const BLOCK_DURATION: u32 = 0x9B;
 pub(crate) const REFERENCE_BLOCK: u32 = 0xFB;
+pub(crate) const DISCARD_PADDING: u32 = 0x75A2;
 pub(crate) const CUES: u32 = 0x1C53_BB6B;
 pub(crate) const CUE_POINT: u32 = 0xBB;
 pub(crate) const CUE_TIME: u32 = 0xB3;
@@ -61,6 +67,8 @@ pub(crate) const ATTACHMENTS: u32 = 0x1941_A469;
 
 /// Matroska `TrackType` of a video track.
 pub(crate) const TRACK_TYPE_VIDEO: u64 = 1;
+/// Matroska `TrackType` of an audio track.
+pub(crate) const TRACK_TYPE_AUDIO: u64 = 2;
 
 /// Whether `id` is a child of a Segment. Meeting one inside an unknown-size
 /// Cluster ends that Cluster, which is how a live recording such as a
@@ -146,6 +154,18 @@ pub(crate) fn read_uint(payload: &[u8]) -> Result<u64> {
     Ok(payload
         .iter()
         .fold(0_u64, |value, &byte| (value << 8) | u64::from(byte)))
+}
+
+/// Reads an EBML signed integer payload of zero to eight bytes.
+pub(crate) fn read_int(payload: &[u8]) -> Result<i64> {
+    let value = read_uint(payload)?;
+    let bits = payload.len() * 8;
+    if bits == 0 || bits == 64 {
+        return Ok(value as i64);
+    }
+    // Sign-extend from the payload's own width.
+    let shift = 64 - bits;
+    Ok(((value << shift) as i64) >> shift)
 }
 
 /// Reads an EBML float payload of zero, four or eight bytes.
@@ -260,6 +280,23 @@ pub(crate) fn write_uint_fixed(output: &mut Vec<u8>, id: u32, value: u64) {
     write_element(output, id, &value.to_be_bytes());
 }
 
+/// Appends a signed integer element in its minimal byte length.
+pub(crate) fn write_int(output: &mut Vec<u8>, id: u32, value: i64) {
+    let bytes = value.to_be_bytes();
+    let mut length = 8;
+    // Drop leading bytes that only repeat the sign of the byte after them.
+    while length > 1 {
+        let lead = bytes[8 - length];
+        let next = bytes[9 - length];
+        if (lead == 0 && next & 0x80 == 0) || (lead == 0xff && next & 0x80 != 0) {
+            length -= 1;
+        } else {
+            break;
+        }
+    }
+    write_element(output, id, &bytes[8 - length..]);
+}
+
 /// Appends an eight-byte float element.
 pub(crate) fn write_float(output: &mut Vec<u8>, id: u32, value: f64) {
     write_element(output, id, &value.to_be_bytes());
@@ -318,6 +355,35 @@ mod tests {
         assert_eq!(read_signed_vint(&[0xBF]).unwrap(), (0, 1));
         assert_eq!(read_signed_vint(&[0x80]).unwrap(), (-63, 1));
         assert_eq!(read_signed_vint(&[0x5F, 0xFF]).unwrap(), (0, 2));
+    }
+
+    #[test]
+    fn signed_integers_round_trip_at_their_minimal_width() {
+        for value in [
+            0,
+            1,
+            -1,
+            127,
+            128,
+            -128,
+            -129,
+            6_500_000,
+            -6_500_000,
+            i64::MIN,
+            i64::MAX,
+        ] {
+            let mut output = Vec::new();
+            write_int(&mut output, DISCARD_PADDING, value);
+            let (id, id_length) = read_id(&output).unwrap();
+            assert_eq!(id, DISCARD_PADDING);
+            let (size, size_length) = read_known_vint(&output[id_length..]).unwrap();
+            let payload = &output[id_length + size_length..];
+            assert_eq!(payload.len() as u64, size);
+            assert_eq!(read_int(payload).unwrap(), value, "{value}");
+        }
+        let mut output = Vec::new();
+        write_int(&mut output, DISCARD_PADDING, -1);
+        assert_eq!(output.len(), 4);
     }
 
     #[test]

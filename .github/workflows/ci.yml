@@ -180,6 +180,37 @@ jobs:
       # checks in it skip themselves where those tools are not installed.
       - name: Test MP4 cover art
         run: cargo test --features native --test mp4_cover_art
+      # The twelve official Opus decoder test vectors (RFC 8251) are 75 MB, so
+      # they are downloaded rather than committed, and cached so most runs do
+      # not download them at all. The key names the file; it never changes.
+      - name: Cache the Opus RFC 8251 test vectors
+        id: opus-test-vectors
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/opus_newvectors
+          key: opus-testvectors-rfc8251
+      - name: Download the Opus RFC 8251 test vectors
+        if: steps.opus-test-vectors.outputs.cache-hit != 'true'
+        run: |
+          curl -sSfL https://opus-codec.org/static/testvectors/opus_testvectors-rfc8251.tar.gz \
+            | tar -xz -C "$RUNNER_TEMP"
+      # Holds the Opus decoder to libopus: every RFC 8251 vector, decoded in
+      # stereo and in mono, must pass `opus_compare` as the RFC requires, and
+      # one libopus-encoded MP4 per coding mode must decode to libopus's own
+      # output. It also pins exact-length reads through pre-skip and end
+      # trimming, reads after a seek, and the native encoder's round trip
+      # (#524).
+      - name: Test Opus decode and encode
+        env:
+          ZVIDLIB_OPUS_TEST_VECTORS: ${{ runner.temp }}/opus_newvectors
+        run: cargo test --features native --test opus_codec
+      # Holds the Vorbis decoder to libvorbis's own output, short blocks
+      # included, and pins packet durations read from the setup header,
+      # bit-identical reads after a seek, and the native encoder's exact-length
+      # round trip (#524). The encoder's packets are pinned to libvorbis's bit
+      # for bit by the library unit tests above.
+      - name: Test Vorbis decode and encode
+        run: cargo test --features native --test vorbis_codec
       # Remuxes the bundled AV1 sample into WebM and back, asserting the WebM
       # index hands a decoder exactly the MP4's samples and frames, and that
       # the written Cues are seekable (#526). Its ffprobe and ffmpeg check
