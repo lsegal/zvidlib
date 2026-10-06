@@ -36,6 +36,7 @@ pub mod transfer;
 
 mod av1_dec;
 mod av1_decoder;
+mod vp9_dec;
 
 /// The bounded preview tier over a track, for callers that need an answer at an
 /// arbitrary position faster than a decode from the nearest random-access point
