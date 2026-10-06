@@ -61,15 +61,14 @@ fixture generator and is not a build, test, or runtime dependency.
 issue #561 replaced Symphonia's AAC decoder with the platform ones on macOS
 and Windows, and what `tests/native_aac_decoder.rs` holds AudioToolbox and
 Media Foundation to; on Linux, which still decodes through Symphonia, the same
-test holds Symphonia to reproducing it exactly. For
-the bundled stereo sample and then the mono fixture, it holds three 1024-frame
-windows of each one's presentation timeline, as `AacSampleReader` returned
-them over `symphonia-codec-aac` 0.5.5 with a preroll of two access units: the
-first window, one starting at half the presentation length plus 333 frames,
-and the last full window. The samples are interleaved little-endian `f32`,
-36,864 bytes in all. It must only ever be regenerated with Symphonia, on
-Linux; a platform decoder is compared against it by signal-to-noise ratio,
-since AAC decoders are not bit-exact with each other.
+test holds Symphonia to it. For the bundled stereo sample and then the mono
+fixture, it holds three 1024-frame windows of each one's presentation
+timeline, as `AacSampleReader` returned them over `symphonia-codec-aac` 0.5.5
+with a preroll of two access units: the first window, one starting at half the
+presentation length plus 333 frames, and the last full window. The samples are
+interleaved little-endian `f32`, 36,864 bytes in all. It must only ever be
+regenerated with Symphonia, on Linux; a platform decoder is compared against it
+by signal-to-noise ratio, since AAC decoders are not bit-exact with each other.
 
 `bbb_hevc_512x288_gop768.mp4` and `bbb_hevc_512x288_gop32.mp4` are the paired
 random-access-cadence tracks the `exact_seek` benchmark target measures over.

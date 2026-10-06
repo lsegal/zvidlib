@@ -217,8 +217,9 @@ jobs:
       - name: Test Vorbis decode and encode
         run: cargo test --features native --test vorbis_codec
       # Linux has no platform AAC decoder, so `NativeAacDecoder` still runs
-      # Symphonia's here (#561), and must reproduce exactly the reference PCM
-      # the macOS and Windows runners hold their platform decoders to.
+      # Symphonia's here (#561), held to the same reference PCM, recorded from
+      # Symphonia, that the macOS and Windows runners hold their platform
+      # decoders to.
       - name: Test native AAC decoding through Symphonia
         run: cargo test --features native --test native_aac_decoder
       # Muxes the native VP9 encoder's output as `vp09`/`vpcC`, reads it back

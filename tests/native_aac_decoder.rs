@@ -9,7 +9,11 @@
 //! each other, so the PCM is compared by signal-to-noise ratio, and each window
 //! must match the reference clearly better than it does one sample early or
 //! late. Linux and the other native targets still decode through Symphonia,
-//! where the same tests hold the reference to reproducing exactly.
+//! where the same tests hold that decoder to its own recorded output: read in
+//! the order it was recorded, Symphonia reproduces it bit for bit, but its
+//! `reset` does not restart the noise it substitutes for perceptual noise
+//! substitution bands, so a read after a later seek differs within the same
+//! bounds the platform decoders meet.
 
 #![cfg(not(target_arch = "wasm32"))]
 
