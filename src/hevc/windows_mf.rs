@@ -1,6 +1,11 @@
-//! Windows Media Foundation HEVC decode backed by the active D3D11 video device.
+//! Windows Media Foundation decoding backed by the active D3D11 video device.
+//!
+//! It decodes HEVC Main for the HEVC factory and VP8 for the VP8 factory. Both share the worker
+//! thread, the D3D11 device manager and the transform's input and output loop; a [`Bitstream`]
+//! holds what differs between them.
 
-use std::collections::HashMap;
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
 use std::ptr;
@@ -11,29 +16,33 @@ use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
-    D3D11_DECODER_PROFILE_HEVC_VLD_MAIN, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE,
-    D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING, D3D11CreateDevice, ID3D11Device,
-    ID3D11DeviceContext, ID3D11Texture2D, ID3D11VideoDevice,
+    D3D11_DECODER_PROFILE_HEVC_VLD_MAIN, D3D11_DECODER_PROFILE_VP8_VLD, D3D11_MAP_READ,
+    D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
+    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, ID3D11VideoDevice,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC};
 use windows::Win32::Media::MediaFoundation::{
-    CLSID_MSH265DecoderMFT, IMFAttributes, IMFDXGIBuffer, IMFDXGIDeviceManager, IMFSample,
-    IMFTransform, MF_E_NOTACCEPTING, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE,
-    MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_SA_D3D11_AWARE,
-    MF_TRANSFORM_ASYNC, MF_VERSION, MFCreateDXGIDeviceManager, MFCreateMediaType,
-    MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video, MFShutdown, MFStartup,
-    MFT_MESSAGE_COMMAND_DRAIN, MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
+    CLSID_MSH265DecoderMFT, IMFActivate, IMFAttributes, IMFDXGIBuffer, IMFDXGIDeviceManager,
+    IMFSample, IMFTransform, MF_E_NOTACCEPTING, MF_E_TRANSFORM_NEED_MORE_INPUT,
+    MF_E_TRANSFORM_STREAM_CHANGE, MF_LOW_LATENCY, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE,
+    MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_SA_D3D11_AWARE, MF_TRANSFORM_ASYNC, MF_VERSION,
+    MFCreateDXGIDeviceManager, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample,
+    MFMediaType_Video, MFShutdown, MFStartup, MFT_CATEGORY_VIDEO_DECODER, MFT_ENUM_FLAG_LOCALMFT,
+    MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_SYNCMFT, MFT_MESSAGE_COMMAND_DRAIN,
+    MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
     MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_START_OF_STREAM,
     MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES,
-    MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFVideoFormat_HEVC, MFVideoFormat_NV12,
-    MFVideoInterlace_Progressive,
+    MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MFTEnumEx, MFVideoFormat_HEVC,
+    MFVideoFormat_NV12, MFVideoFormat_VP80, MFVideoInterlace_Progressive,
 };
 use windows::Win32::System::Com::{
-    CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
+    CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
+    CoUninitialize,
 };
-use windows::core::Interface;
+use windows::core::{GUID, Interface};
 
 use super::engine::hvcc::{HvccRecord, split_length_prefixed};
+use super::planar::{PlanarConverter, nv12_to_planar, vp8_frame_is_shown, vp8_sample};
 use super::readback;
 use crate::{
     CancellationToken, DecodedVideoFrame, EncodedVideoSample, Error, ErrorKind, FrameIndex, Limits,
@@ -41,15 +50,25 @@ use crate::{
 };
 
 pub(super) fn is_available(dimensions: VideoDimensions) -> bool {
+    probe(Format::Hevc, dimensions)
+}
+
+/// Whether Media Foundation can decode VP8 in hardware at `dimensions` on this host: the
+/// adapter exposes the D3D11 VP8 decoder profile with NV12 output, and a D3D11-aware VP8 decoder
+/// transform is installed.
+pub(crate) fn is_vp8_available(dimensions: VideoDimensions) -> bool {
+    probe(Format::Vp8, dimensions)
+}
+
+fn probe(format: Format, dimensions: VideoDimensions) -> bool {
     let (ready_tx, ready_rx) = sync_channel(1);
     if thread::Builder::new()
         .name("zvidlib-mf-probe".into())
         .spawn(move || {
             let result = MfRuntime::start().and_then(|_runtime| {
                 let (device, _) = create_d3d_device()?;
-                require_hevc_hardware(&device, dimensions)?;
-                let transform = create_transform()?;
-                require_d3d_aware(&transform)
+                require_hardware(&device, format, dimensions)?;
+                create_transform(format).map(|_| ())
             });
             let _ = ready_tx.send(result);
         })
@@ -68,10 +87,102 @@ pub(super) fn create(
     HardwareDecoder::spawn(
         configuration.clone(),
         *limits,
-        record.length_size,
-        annex_b_parameter_sets(record),
+        Bitstream::Hevc {
+            nal_length_size: record.length_size,
+            parameter_sets: annex_b_parameter_sets(record),
+        },
+        true,
     )
     .map(|decoder| Box::new(decoder) as Box<dyn VideoDecoder>)
+}
+
+/// Creates a Media Foundation VP8 decoder whose pictures are converted by `convert`, so the
+/// hardware decoder's output goes through exactly the conversion the software decoder's does.
+pub(crate) fn create_vp8(
+    configuration: &VideoDecoderConfig,
+    limits: &Limits,
+    convert: PlanarConverter,
+) -> Result<Box<dyn VideoDecoder>> {
+    HardwareDecoder::spawn(
+        configuration.clone(),
+        *limits,
+        Bitstream::Vp8 { convert },
+        true,
+    )
+    .map(|decoder| Box::new(decoder) as Box<dyn VideoDecoder>)
+}
+
+/// [`create_vp8`] without the D3D11 VP8 decoder profile, for hosts whose adapter lacks it.
+///
+/// The decoder transform then decodes on the CPU into D3D11 surfaces, which is not hardware
+/// decoding, so the factory never selects it. It runs everything else this backend does - the
+/// transform search, the identities of hidden frames, the surface readback and crop - which is
+/// what lets a host without the profile test that code.
+#[cfg(test)]
+pub(crate) fn create_vp8_without_hardware_profile(
+    configuration: &VideoDecoderConfig,
+    limits: &Limits,
+    convert: PlanarConverter,
+) -> Result<Box<dyn VideoDecoder>> {
+    HardwareDecoder::spawn(
+        configuration.clone(),
+        *limits,
+        Bitstream::Vp8 { convert },
+        false,
+    )
+    .map(|decoder| Box::new(decoder) as Box<dyn VideoDecoder>)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Format {
+    Hevc,
+    Vp8,
+}
+
+impl Format {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Hevc => "HEVC",
+            Self::Vp8 => "VP8",
+        }
+    }
+
+    fn subtype(self) -> GUID {
+        match self {
+            Self::Hevc => MFVideoFormat_HEVC,
+            Self::Vp8 => MFVideoFormat_VP80,
+        }
+    }
+
+    /// The D3D11 decoder profile the adapter must expose, and its name.
+    fn decoder_profile(self) -> (GUID, &'static str) {
+        match self {
+            Self::Hevc => (D3D11_DECODER_PROFILE_HEVC_VLD_MAIN, "HEVC Main"),
+            Self::Vp8 => (D3D11_DECODER_PROFILE_VP8_VLD, "VP8"),
+        }
+    }
+}
+
+/// What differs between the codecs this backend decodes.
+enum Bitstream {
+    /// Length-prefixed HEVC access units, rewritten to Annex B with the parameter sets ahead of
+    /// every random-access sample. Pictures are converted with [`copy_nv12_to_rgba`].
+    Hevc {
+        nal_length_size: usize,
+        parameter_sets: Vec<u8>,
+    },
+    /// One VP8 frame per sample, passed through unchanged. Pictures are cropped from the whole
+    /// decoded surface, which keeps odd dimensions exact, and converted by `convert`.
+    Vp8 { convert: PlanarConverter },
+}
+
+impl Bitstream {
+    fn format(&self) -> Format {
+        match self {
+            Self::Hevc { .. } => Format::Hevc,
+            Self::Vp8 { .. } => Format::Vp8,
+        }
+    }
 }
 
 enum Command {
@@ -103,15 +214,19 @@ impl HardwareDecoder {
     fn spawn(
         configuration: VideoDecoderConfig,
         limits: Limits,
-        nal_length_size: usize,
-        parameter_sets: Vec<u8>,
+        bitstream: Bitstream,
+        require_profile: bool,
     ) -> Result<Self> {
         let (command_tx, command_rx) = sync_channel(1);
         let (ready_tx, ready_rx) = sync_channel(1);
+        let thread_name = format!(
+            "zvidlib-mf-{}",
+            bitstream.format().name().to_ascii_lowercase()
+        );
         let worker = thread::Builder::new()
-            .name("zvidlib-mf-hevc".into())
+            .name(thread_name)
             .spawn(move || {
-                let core = DecoderCore::new(configuration, limits, nal_length_size, parameter_sets);
+                let core = DecoderCore::new(configuration, limits, bitstream, require_profile);
                 match core {
                     Ok(core) => {
                         if ready_tx.send(Ok(())).is_ok() {
@@ -235,9 +350,12 @@ struct DecoderCore {
     _device_manager: IMFDXGIDeviceManager,
     configuration: VideoDecoderConfig,
     limits: Limits,
-    nal_length_size: usize,
-    parameter_sets: Vec<u8>,
+    bitstream: Bitstream,
     identities: HashMap<i64, FrameIndex>,
+    /// The timestamps of submitted hidden VP8 frames. A hidden frame is decoded but never
+    /// displayed, so it owns no presentation identity; should the transform still output it, its
+    /// sample is recognised here and dropped rather than taken for a frame nobody submitted.
+    hidden: HashSet<i64>,
     next_identity: i64,
     /// Whether the samples `ProcessOutput` hands back are wanted as frames. A suppressed sample
     /// is still decoded and still collected - the transform will not proceed until its output is
@@ -249,14 +367,25 @@ impl DecoderCore {
     fn new(
         configuration: VideoDecoderConfig,
         limits: Limits,
-        nal_length_size: usize,
-        parameter_sets: Vec<u8>,
+        bitstream: Bitstream,
+        require_profile: bool,
     ) -> Result<Self> {
+        let format = bitstream.format();
+        let name = format.name();
         let runtime = MfRuntime::start()?;
         let (device, context) = create_d3d_device()?;
-        require_hevc_hardware(&device, configuration.coded_dimensions)?;
-        let transform = create_transform()?;
-        require_d3d_aware(&transform)?;
+        if require_profile {
+            require_hardware(&device, format, configuration.coded_dimensions)?;
+        }
+        let transform = create_transform(format)?;
+        if format == Format::Vp8 {
+            // VP8 never reorders, so a decoder that held frames back would return a shown frame
+            // from a later sample than the one that coded it. A decoder that does not know the
+            // attribute ignores it.
+            if let Ok(attributes) = unsafe { transform.GetAttributes() } {
+                let _ = unsafe { attributes.SetUINT32(&MF_LOW_LATENCY, 1) };
+            }
+        }
         let mut reset_token = 0;
         let mut manager = None;
         unsafe {
@@ -273,26 +402,31 @@ impl DecoderCore {
                     MFT_MESSAGE_SET_D3D_MANAGER,
                     Interface::as_raw(&manager) as usize,
                 )
-                .map_err(|error| windows_error("HEVC decoder rejected D3D manager", error))?;
+                .map_err(|error| {
+                    windows_error(&format!("{name} decoder rejected D3D manager"), error)
+                })?;
         }
-        set_input_type(&transform, configuration.coded_dimensions)?;
-        set_nv12_output_type(&transform)?;
-        let stream_info = unsafe { transform.GetOutputStreamInfo(0) }
-            .map_err(|error| windows_error("could not query HEVC output stream", error))?;
+        set_input_type(&transform, format, configuration.coded_dimensions)?;
+        set_nv12_output_type(&transform, format)?;
+        let stream_info = unsafe { transform.GetOutputStreamInfo(0) }.map_err(|error| {
+            windows_error(&format!("could not query {name} output stream"), error)
+        })?;
         let provides = MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32;
         let can_provide = MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES.0 as u32;
         if stream_info.dwFlags & (provides | can_provide) == 0 {
-            return Err(codec(
-                "D3D HEVC decoder requires caller-allocated output samples",
-            ));
+            return Err(codec(format!(
+                "D3D {name} decoder requires caller-allocated output samples"
+            )));
         }
         unsafe {
             transform
                 .ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)
-                .map_err(|error| windows_error("could not begin HEVC streaming", error))?;
+                .map_err(|error| {
+                    windows_error(&format!("could not begin {name} streaming"), error)
+                })?;
             transform
                 .ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)
-                .map_err(|error| windows_error("could not start HEVC stream", error))?;
+                .map_err(|error| windows_error(&format!("could not start {name} stream"), error))?;
         }
         Ok(Self {
             _runtime: runtime,
@@ -302,12 +436,16 @@ impl DecoderCore {
             _device_manager: manager,
             configuration,
             limits,
-            nal_length_size,
-            parameter_sets,
+            bitstream,
             identities: HashMap::new(),
+            hidden: HashSet::new(),
             next_identity: 1,
             output_wanted: true,
         })
+    }
+
+    fn name(&self) -> &'static str {
+        self.bitstream.format().name()
     }
 
     fn submit(
@@ -316,36 +454,58 @@ impl DecoderCore {
         cancellation: &CancellationToken,
     ) -> Result<Vec<DecodedVideoFrame>> {
         check_cancelled(cancellation)?;
-        if sample.data.len() as u64 > self.limits.max_allocation_bytes {
-            return Err(Error::new(
-                ErrorKind::ResourceLimit,
-                "HEVC access unit exceeds the allocation limit",
-            ));
-        }
-        let annex_b = annex_b_sample(
-            sample,
-            self.nal_length_size,
-            &self.parameter_sets,
-            self.limits.max_allocation_bytes,
-        )?;
+        let name = self.name();
+        let (data, shown) = match &self.bitstream {
+            Bitstream::Hevc {
+                nal_length_size,
+                parameter_sets,
+            } => {
+                if sample.data.len() as u64 > self.limits.max_allocation_bytes {
+                    return Err(Error::new(
+                        ErrorKind::ResourceLimit,
+                        "HEVC access unit exceeds the allocation limit",
+                    ));
+                }
+                let annex_b = annex_b_sample(
+                    sample,
+                    *nal_length_size,
+                    parameter_sets,
+                    self.limits.max_allocation_bytes,
+                )?;
+                (Cow::Owned(annex_b), true)
+            }
+            Bitstream::Vp8 { .. } => (
+                Cow::Borrowed(vp8_sample(sample, self.limits.max_allocation_bytes)?),
+                vp8_frame_is_shown(&sample.data),
+            ),
+        };
         let token = self.next_identity;
         self.next_identity = self
             .next_identity
             .checked_add(1)
             .ok_or_else(|| codec("Media Foundation timestamp identity overflow"))?;
-        self.identities.insert(token, sample.presentation_index);
-        let input = make_input_sample(&annex_b, token)?;
+        // A hidden VP8 frame is decoded but never displayed, so it must not leave an identity
+        // behind for the next displayed picture to claim.
+        if shown {
+            self.identities.insert(token, sample.presentation_index);
+        } else {
+            self.hidden.insert(token);
+        }
+        let input = make_input_sample(&data, token, name)?;
         let mut output = self.collect_output(cancellation)?;
         match unsafe { self.transform.ProcessInput(0, &input, 0) } {
             Ok(()) => {}
             Err(error) if error.code() == MF_E_NOTACCEPTING => {
                 output.extend(self.collect_output(cancellation)?);
                 unsafe { self.transform.ProcessInput(0, &input, 0) }.map_err(|error| {
-                    windows_error("Media Foundation rejected HEVC input", error)
+                    windows_error(&format!("Media Foundation rejected {name} input"), error)
                 })?;
             }
             Err(error) => {
-                return Err(windows_error("Media Foundation rejected HEVC input", error));
+                return Err(windows_error(
+                    &format!("Media Foundation rejected {name} input"),
+                    error,
+                ));
             }
         }
         output.extend(self.collect_output(cancellation)?);
@@ -354,27 +514,36 @@ impl DecoderCore {
 
     fn drain(&mut self, cancellation: &CancellationToken) -> Result<Vec<DecodedVideoFrame>> {
         check_cancelled(cancellation)?;
+        let name = self.name();
         unsafe {
             self.transform
                 .ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0)
-                .map_err(|error| windows_error("could not end HEVC stream", error))?;
+                .map_err(|error| windows_error(&format!("could not end {name} stream"), error))?;
             self.transform
                 .ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0)
-                .map_err(|error| windows_error("could not drain HEVC decoder", error))?;
+                .map_err(|error| {
+                    windows_error(&format!("could not drain {name} decoder"), error)
+                })?;
         }
         self.collect_output(cancellation)
     }
 
     fn reset(&mut self) -> Result<()> {
+        let name = self.name();
         unsafe {
             self.transform
                 .ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0)
-                .map_err(|error| windows_error("could not reset HEVC decoder", error))?;
+                .map_err(|error| {
+                    windows_error(&format!("could not reset {name} decoder"), error)
+                })?;
             self.transform
                 .ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)
-                .map_err(|error| windows_error("could not restart HEVC decoder", error))?;
+                .map_err(|error| {
+                    windows_error(&format!("could not restart {name} decoder"), error)
+                })?;
         }
         self.identities.clear();
+        self.hidden.clear();
         self.next_identity = 1;
         Ok(())
     }
@@ -383,6 +552,7 @@ impl DecoderCore {
         &mut self,
         cancellation: &CancellationToken,
     ) -> Result<Vec<DecodedVideoFrame>> {
+        let name = self.name();
         let mut frames = Vec::new();
         loop {
             check_cancelled(cancellation)?;
@@ -404,19 +574,17 @@ impl DecoderCore {
                     let sample = sample.ok_or_else(|| {
                         codec("Media Foundation reported output without a video sample")
                     })?;
-                    if self.output_wanted {
-                        frames.push(self.convert_output(sample)?);
-                    } else {
-                        self.discard_output(&sample)?;
+                    if let Some(frame) = self.take_output(&sample)? {
+                        frames.push(frame);
                     }
                 }
                 Err(error) if error.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => return Ok(frames),
                 Err(error) if error.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
-                    set_nv12_output_type(&self.transform)?;
+                    set_nv12_output_type(&self.transform, self.bitstream.format())?;
                 }
                 Err(error) => {
                     return Err(windows_error(
-                        "Media Foundation could not produce HEVC output",
+                        &format!("Media Foundation could not produce {name} output"),
                         error,
                     ));
                 }
@@ -428,32 +596,45 @@ impl DecoderCore {
         self.output_wanted = wanted;
     }
 
-    /// Retires a decoded sample without reading its picture.
+    /// Pairs a decoded sample with the presentation identity its timestamp names, and reads its
+    /// picture back when output is wanted.
     ///
-    /// Only the identity bookkeeping of [`DecoderCore::convert_output`] is kept: the sample's
-    /// timestamp is still matched and consumed, so the frames that follow keep their own, and
-    /// dropping the sample releases the decoder's surface. What is skipped is the D3D11 staging
-    /// copy and the NV12-to-RGBA pass over a picture nothing will draw.
-    fn discard_output(&mut self, sample: &IMFSample) -> Result<()> {
-        let token = unsafe { sample.GetSampleTime() }
-            .map_err(|error| windows_error("decoded HEVC frame has no timestamp", error))?;
-        self.identities.remove(&token).ok_or_else(|| {
-            codec("decoded HEVC frame timestamp does not match a submitted sample")
+    /// A sample nobody wants still consumes its identity, so the frames that follow keep their
+    /// own, and dropping it releases the decoder's surface; only the D3D11 staging copy and the
+    /// conversion of a picture nothing will draw are skipped. A hidden VP8 frame's sample has no
+    /// identity and is dropped the same way.
+    fn take_output(&mut self, sample: &IMFSample) -> Result<Option<DecodedVideoFrame>> {
+        let name = self.name();
+        let token = unsafe { sample.GetSampleTime() }.map_err(|error| {
+            windows_error(&format!("decoded {name} frame has no timestamp"), error)
         })?;
-        Ok(())
+        let presentation_index = self.identities.remove(&token);
+        if presentation_index.is_none() && !self.hidden.remove(&token) {
+            return Err(codec(format!(
+                "decoded {name} frame timestamp does not match a submitted sample"
+            )));
+        }
+        // VP8 never reorders, so a hidden frame submitted before this sample's frame can no
+        // longer be output.
+        self.hidden.retain(|&hidden| hidden > token);
+        let Some(presentation_index) = presentation_index.filter(|_| self.output_wanted) else {
+            return Ok(None);
+        };
+        let frame = self.convert_output(sample)?;
+        Ok(Some(DecodedVideoFrame {
+            presentation_index,
+            frame,
+        }))
     }
 
-    fn convert_output(&mut self, sample: IMFSample) -> Result<DecodedVideoFrame> {
-        let token = unsafe { sample.GetSampleTime() }
-            .map_err(|error| windows_error("decoded HEVC frame has no timestamp", error))?;
-        let presentation_index = self.identities.remove(&token).ok_or_else(|| {
-            codec("decoded HEVC frame timestamp does not match a submitted sample")
+    fn convert_output(&mut self, sample: &IMFSample) -> Result<VideoFrame> {
+        let name = self.name();
+        let buffer = unsafe { sample.GetBufferByIndex(0) }.map_err(|error| {
+            windows_error(&format!("decoded {name} frame has no buffer"), error)
         })?;
-        let buffer = unsafe { sample.GetBufferByIndex(0) }
-            .map_err(|error| windows_error("decoded HEVC frame has no buffer", error))?;
-        let dxgi: IMFDXGIBuffer = buffer
-            .cast()
-            .map_err(|error| windows_error("decoded HEVC frame is not D3D11-backed", error))?;
+        let dxgi: IMFDXGIBuffer = buffer.cast().map_err(|error| {
+            windows_error(&format!("decoded {name} frame is not D3D11-backed"), error)
+        })?;
         let mut raw_texture = ptr::null_mut::<c_void>();
         unsafe {
             dxgi.GetResource(&ID3D11Texture2D::IID, &mut raw_texture)
@@ -465,18 +646,27 @@ impl DecoderCore {
         let source = unsafe { ID3D11Texture2D::from_raw(raw_texture) };
         let source_subresource = unsafe { dxgi.GetSubresourceIndex() }
             .map_err(|error| windows_error("could not query decoded texture index", error))?;
-        let frame = copy_nv12_to_rgba(
-            &self._device,
-            &self.context,
-            &source,
-            source_subresource,
-            &self.configuration,
-            &self.limits,
-        )?;
-        Ok(DecodedVideoFrame {
-            presentation_index,
-            frame,
-        })
+        match &self.bitstream {
+            Bitstream::Hevc { .. } => copy_nv12_to_rgba(
+                &self._device,
+                &self.context,
+                &source,
+                source_subresource,
+                &self.configuration,
+                &self.limits,
+            ),
+            Bitstream::Vp8 { convert } => convert(
+                copy_nv12_to_planar(
+                    &self._device,
+                    &self.context,
+                    &source,
+                    source_subresource,
+                    self.configuration.coded_dimensions,
+                )?,
+                &self.configuration,
+                &self.limits,
+            ),
+        }
     }
 }
 
@@ -532,7 +722,12 @@ fn create_d3d_device() -> Result<(ID3D11Device, ID3D11DeviceContext)> {
     ))
 }
 
-fn require_hevc_hardware(device: &ID3D11Device, dimensions: VideoDimensions) -> Result<()> {
+fn require_hardware(
+    device: &ID3D11Device,
+    format: Format,
+    dimensions: VideoDimensions,
+) -> Result<()> {
+    let (decoder_profile, profile_name) = format.decoder_profile();
     let video: ID3D11VideoDevice = device
         .cast()
         .map_err(|error| windows_error("D3D11 video decode is unavailable", error))?;
@@ -540,69 +735,147 @@ fn require_hevc_hardware(device: &ID3D11Device, dimensions: VideoDimensions) -> 
     let mut found = false;
     for index in 0..profile_count {
         if unsafe { video.GetVideoDecoderProfile(index) }
-            .is_ok_and(|profile| profile == D3D11_DECODER_PROFILE_HEVC_VLD_MAIN)
+            .is_ok_and(|profile| profile == decoder_profile)
         {
             found = true;
             break;
         }
     }
     if !found {
-        return Err(unsupported(
-            "D3D11 adapter does not support HEVC Main decode",
-        ));
+        return Err(unsupported(format!(
+            "D3D11 adapter does not support {profile_name} decode"
+        )));
     }
-    let supported = unsafe {
-        video.CheckVideoDecoderFormat(&D3D11_DECODER_PROFILE_HEVC_VLD_MAIN, DXGI_FORMAT_NV12)
-    }
-    .map_err(|error| windows_error("could not query D3D11 HEVC output support", error))?;
+    let supported = unsafe { video.CheckVideoDecoderFormat(&decoder_profile, DXGI_FORMAT_NV12) }
+        .map_err(|error| {
+            windows_error(
+                &format!("could not query D3D11 {} output support", format.name()),
+                error,
+            )
+        })?;
     if !supported.as_bool() {
-        return Err(unsupported("D3D11 adapter cannot decode HEVC Main to NV12"));
+        return Err(unsupported(format!(
+            "D3D11 adapter cannot decode {profile_name} to NV12"
+        )));
     }
     let pixels = u64::from(dimensions.width) * u64::from(dimensions.height);
     if pixels == 0 {
-        return Err(unsupported("D3D11 HEVC dimensions must be nonzero"));
+        return Err(unsupported(format!(
+            "D3D11 {} dimensions must be nonzero",
+            format.name()
+        )));
     }
     Ok(())
 }
 
-fn create_transform() -> Result<IMFTransform> {
-    unsafe { CoCreateInstance(&CLSID_MSH265DecoderMFT, None, CLSCTX_INPROC_SERVER) }
-        .map_err(|error| windows_error("Windows HEVC decoder is unavailable", error))
+/// Creates the decoder transform for `format`, which must be synchronous and D3D11-aware.
+fn create_transform(format: Format) -> Result<IMFTransform> {
+    match format {
+        Format::Hevc => {
+            let transform =
+                unsafe { CoCreateInstance(&CLSID_MSH265DecoderMFT, None, CLSCTX_INPROC_SERVER) }
+                    .map_err(|error| windows_error("Windows HEVC decoder is unavailable", error))?;
+            require_d3d_aware(&transform, format)?;
+            Ok(transform)
+        }
+        Format::Vp8 => find_vp8_transform(),
+    }
 }
 
-fn require_d3d_aware(transform: &IMFTransform) -> Result<()> {
-    let attributes: IMFAttributes = unsafe { transform.GetAttributes() }
-        .map_err(|error| windows_error("could not query HEVC decoder attributes", error))?;
+/// Windows has no VP8 decoder with a fixed CLSID: VP8 is decoded by whichever decoder transform
+/// is installed for it, such as the one the VP9 Video Extensions package registers. The first
+/// synchronous, D3D11-aware one in Media Foundation's preferred order is used. Asynchronous
+/// vendor transforms are skipped, as they are for HEVC.
+fn find_vp8_transform() -> Result<IMFTransform> {
+    let input = MFT_REGISTER_TYPE_INFO {
+        guidMajorType: MFMediaType_Video,
+        guidSubtype: MFVideoFormat_VP80,
+    };
+    let flags = MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_LOCALMFT | MFT_ENUM_FLAG_SORTANDFILTER;
+    let mut list = ptr::null_mut::<Option<IMFActivate>>();
+    let mut count = 0_u32;
+    unsafe {
+        MFTEnumEx(
+            MFT_CATEGORY_VIDEO_DECODER,
+            flags,
+            Some(&input),
+            None,
+            &mut list,
+            &mut count,
+        )
+    }
+    .map_err(|error| windows_error("could not enumerate VP8 decoders", error))?;
+    let activates: Vec<IMFActivate> = if list.is_null() {
+        Vec::new()
+    } else {
+        let activates = unsafe { std::slice::from_raw_parts_mut(list, count as usize) }
+            .iter_mut()
+            .filter_map(Option::take)
+            .collect();
+        unsafe { CoTaskMemFree(Some(list.cast_const().cast())) };
+        activates
+    };
+    let mut rejected = None;
+    for activate in activates {
+        let candidate = unsafe { activate.ActivateObject::<IMFTransform>() }
+            .map_err(|error| windows_error("could not create VP8 decoder", error))
+            .and_then(|transform| {
+                require_d3d_aware(&transform, Format::Vp8)?;
+                Ok(transform)
+            });
+        match candidate {
+            Ok(transform) => return Ok(transform),
+            Err(error) => {
+                let _ = unsafe { activate.ShutdownObject() };
+                rejected = Some(error);
+            }
+        }
+    }
+    Err(rejected.unwrap_or_else(|| unsupported("no Media Foundation VP8 decoder is installed")))
+}
+
+fn require_d3d_aware(transform: &IMFTransform, format: Format) -> Result<()> {
+    let name = format.name();
+    let attributes: IMFAttributes = unsafe { transform.GetAttributes() }.map_err(|error| {
+        windows_error(&format!("could not query {name} decoder attributes"), error)
+    })?;
     if unsafe { attributes.GetUINT32(&MF_TRANSFORM_ASYNC) }.unwrap_or(0) != 0 {
-        return Err(unsupported(
-            "the installed HEVC decoder requires unsupported asynchronous MFT processing",
-        ));
+        return Err(unsupported(format!(
+            "the installed {name} decoder requires unsupported asynchronous MFT processing"
+        )));
     }
     if unsafe { attributes.GetUINT32(&MF_SA_D3D11_AWARE) }.unwrap_or(0) == 0 {
-        return Err(unsupported(
-            "the installed HEVC decoder is not D3D11 accelerated",
-        ));
+        return Err(unsupported(format!(
+            "the installed {name} decoder is not D3D11 accelerated"
+        )));
     }
     Ok(())
 }
 
-fn set_input_type(transform: &IMFTransform, dimensions: VideoDimensions) -> Result<()> {
+fn set_input_type(
+    transform: &IMFTransform,
+    format: Format,
+    dimensions: VideoDimensions,
+) -> Result<()> {
+    let name = format.name();
     let media_type = unsafe { MFCreateMediaType() }
-        .map_err(|error| windows_error("could not create HEVC input type", error))?;
+        .map_err(|error| windows_error(&format!("could not create {name} input type"), error))?;
     unsafe {
         media_type
             .SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)
-            .and_then(|()| media_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_HEVC))
+            .and_then(|()| media_type.SetGUID(&MF_MT_SUBTYPE, &format.subtype()))
             .and_then(|()| media_type.SetUINT64(&MF_MT_FRAME_SIZE, frame_size(dimensions)))
             .and_then(|()| {
                 media_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)
             })
             .and_then(|()| transform.SetInputType(0, &media_type, 0))
-            .map_err(|error| windows_error("could not configure HEVC input type", error))
+            .map_err(|error| {
+                windows_error(&format!("could not configure {name} input type"), error)
+            })
     }
 }
 
-fn set_nv12_output_type(transform: &IMFTransform) -> Result<()> {
+fn set_nv12_output_type(transform: &IMFTransform, format: Format) -> Result<()> {
     for index in 0..64 {
         let media_type = match unsafe { transform.GetOutputAvailableType(0, index) } {
             Ok(media_type) => media_type,
@@ -615,38 +888,110 @@ fn set_nv12_output_type(transform: &IMFTransform) -> Result<()> {
             return Ok(());
         }
     }
-    Err(unsupported(
-        "Windows HEVC decoder does not expose D3D11 NV12 output",
-    ))
+    Err(unsupported(format!(
+        "Windows {} decoder does not expose D3D11 NV12 output",
+        format.name()
+    )))
 }
 
-fn make_input_sample(data: &[u8], timestamp: i64) -> Result<IMFSample> {
-    let size = u32::try_from(data.len())
-        .map_err(|_| Error::new(ErrorKind::ResourceLimit, "HEVC access unit is too large"))?;
-    let buffer = unsafe { MFCreateMemoryBuffer(size) }
-        .map_err(|error| windows_error("could not allocate HEVC input buffer", error))?;
+fn make_input_sample(data: &[u8], timestamp: i64, name: &str) -> Result<IMFSample> {
+    let size = u32::try_from(data.len()).map_err(|_| {
+        Error::new(
+            ErrorKind::ResourceLimit,
+            format!("{name} access unit is too large"),
+        )
+    })?;
+    let buffer = unsafe { MFCreateMemoryBuffer(size) }.map_err(|error| {
+        windows_error(&format!("could not allocate {name} input buffer"), error)
+    })?;
     let mut destination = ptr::null_mut();
     unsafe {
-        buffer
-            .Lock(&mut destination, None, None)
-            .map_err(|error| windows_error("could not lock HEVC input buffer", error))?;
+        buffer.Lock(&mut destination, None, None).map_err(|error| {
+            windows_error(&format!("could not lock {name} input buffer"), error)
+        })?;
         ptr::copy_nonoverlapping(data.as_ptr(), destination, data.len());
         let unlock = buffer.Unlock();
-        unlock.map_err(|error| windows_error("could not unlock HEVC input buffer", error))?;
-        buffer
-            .SetCurrentLength(size)
-            .map_err(|error| windows_error("could not size HEVC input buffer", error))?;
+        unlock.map_err(|error| {
+            windows_error(&format!("could not unlock {name} input buffer"), error)
+        })?;
+        buffer.SetCurrentLength(size).map_err(|error| {
+            windows_error(&format!("could not size {name} input buffer"), error)
+        })?;
     }
-    let sample = unsafe { MFCreateSample() }
-        .map_err(|error| windows_error("could not allocate HEVC input sample", error))?;
+    let sample = unsafe { MFCreateSample() }.map_err(|error| {
+        windows_error(&format!("could not allocate {name} input sample"), error)
+    })?;
     unsafe {
         sample
             .AddBuffer(&buffer)
             .and_then(|()| sample.SetSampleTime(timestamp))
             .and_then(|()| sample.SetSampleDuration(1))
-            .map_err(|error| windows_error("could not populate HEVC input sample", error))?;
+            .map_err(|error| {
+                windows_error(&format!("could not populate {name} input sample"), error)
+            })?;
     }
     Ok(sample)
+}
+
+/// Reads a decoded VP8 picture back as the three 4:2:0 planes the software decoder produces.
+///
+/// The whole decoded surface is copied, since an NV12 texture cannot have the odd dimensions a
+/// VP8 frame can, and then cropped to `dimensions`: the surface is at least the frame's size
+/// rounded up to even, so it holds every row and column of the frame.
+fn copy_nv12_to_planar(
+    device: &ID3D11Device,
+    context: &ID3D11DeviceContext,
+    source: &ID3D11Texture2D,
+    source_subresource: u32,
+    dimensions: VideoDimensions,
+) -> Result<[Vec<u8>; 3]> {
+    let mut source_description = D3D11_TEXTURE2D_DESC::default();
+    unsafe { source.GetDesc(&mut source_description) };
+    let description = D3D11_TEXTURE2D_DESC {
+        Width: source_description.Width,
+        Height: source_description.Height,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: DXGI_FORMAT_NV12,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Usage: D3D11_USAGE_STAGING,
+        BindFlags: 0,
+        CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+        MiscFlags: 0,
+    };
+    let surface_copy = readback::Timer::start();
+    let mut staging = None;
+    unsafe {
+        device
+            .CreateTexture2D(&description, None, Some(&mut staging))
+            .map_err(|error| windows_error("could not allocate VP8 readback texture", error))?;
+    }
+    let staging = staging.ok_or_else(|| codec("VP8 readback texture was not returned"))?;
+    unsafe {
+        context.CopySubresourceRegion(&staging, 0, 0, 0, 0, source, source_subresource, None);
+    }
+    let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+    unsafe {
+        context
+            .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+            .map_err(|error| windows_error("could not map VP8 readback texture", error))?;
+    }
+    if mapped.pData.is_null() {
+        unsafe { context.Unmap(&staging, 0) };
+        return Err(codec("mapped VP8 readback texture was null"));
+    }
+    surface_copy.record(readback::Phase::SurfaceCopy);
+    let pitch = mapped.RowPitch as usize;
+    let surface_height = description.Height as usize;
+    // The interleaved chroma plane follows the luma plane's `surface_height` rows.
+    let length = pitch * (surface_height + surface_height.div_ceil(2));
+    let data = unsafe { std::slice::from_raw_parts(mapped.pData.cast::<u8>(), length) };
+    let planes = nv12_to_planar(data, pitch, surface_height, dimensions);
+    unsafe { context.Unmap(&staging, 0) };
+    planes
 }
 
 fn copy_nv12_to_rgba(
