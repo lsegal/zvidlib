@@ -1,12 +1,14 @@
 //! Native AAC-LC decoding and default-device PCM output.
 //!
-//! zvidlib carries no AAC bitstream implementation of its own, for decoding
-//! any more than for encoding (see [`crate::AudioEncoder`]): macOS decodes
-//! through AudioToolbox and Windows through Media Foundation's AAC decoder
-//! MFT, and every other native target reports [`ErrorKind::Unsupported`].
+//! Where the operating system has an AAC decoder, zvidlib decodes through it,
+//! as it encodes (see [`crate::AudioEncoder`]): macOS through AudioToolbox and
+//! Windows through Media Foundation's AAC decoder MFT. Linux and the other
+//! native targets have none, and decode through Symphonia's.
 
 #[cfg(target_os = "macos")]
 mod audiotoolbox;
+#[cfg(not(any(target_os = "macos", windows)))]
+mod symphonia;
 #[cfg(windows)]
 mod windows_mf;
 
@@ -24,37 +26,16 @@ use std::sync::{Arc, Mutex};
 
 #[cfg(target_os = "macos")]
 use audiotoolbox::Decoder as Backend;
+#[cfg(not(any(target_os = "macos", windows)))]
+use symphonia::Decoder as Backend;
 #[cfg(windows)]
 use windows_mf::Decoder as Backend;
 
-/// No platform AAC decoder exists here, so no backend can be constructed.
-#[cfg(not(any(target_os = "macos", windows)))]
-enum Backend {}
-
-#[cfg(not(any(target_os = "macos", windows)))]
-impl Backend {
-    fn new(_config: &AacTrackConfig) -> Result<Self> {
-        Err(unsupported(
-            "native AAC decoding uses the platform decoder, which only macOS \
-             (AudioToolbox) and Windows (Media Foundation) provide",
-        ))
-    }
-
-    fn decode(&mut self, _data: &[u8], _position: u64, _out: &mut Vec<f32>) -> Result<()> {
-        match *self {}
-    }
-
-    fn reset(&mut self) -> Result<()> {
-        match *self {}
-    }
-}
-
-/// AAC-LC access-unit decoder backed by the platform codec: AudioToolbox on
-/// macOS and Media Foundation on Windows.
+/// AAC-LC access-unit decoder: AudioToolbox on macOS, Media Foundation on
+/// Windows, and Symphonia's decoder on the native targets with no platform AAC
+/// decoder, such as Linux.
 ///
-/// Mono and stereo AAC-LC are accepted. Other native targets have no platform
-/// AAC decoder, and [`NativeAacDecoder::new`] reports
-/// [`ErrorKind::Unsupported`] there.
+/// Mono and stereo AAC-LC are accepted.
 pub struct NativeAacDecoder {
     backend: Backend,
     sample_rate: u32,
@@ -416,18 +397,11 @@ fn io(message: impl Into<String>) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(any(target_os = "macos", windows))]
     use crate::io::MemorySource;
-    #[cfg(any(target_os = "macos", windows))]
     use crate::{Mp4Demuxer, Mp4DemuxerOptions, TrackKind};
-    #[cfg(any(target_os = "macos", windows))]
     use std::future::Future;
-    #[cfg(any(target_os = "macos", windows))]
     use std::task::{Context, Poll, Waker};
 
-    // The platform decoders, and the Linux report that there is none, are
-    // also exercised end to end by `tests/native_aac_decoder.rs`.
-    #[cfg(any(target_os = "macos", windows))]
     #[test]
     fn native_decoder_consumes_demuxed_aac_access_units_as_exact_f32_intervals() {
         let source =
@@ -514,7 +488,6 @@ mod tests {
         assert_eq!(select_output_format(supported, 48_000, 2), Err(Vec::new()));
     }
 
-    #[cfg(any(target_os = "macos", windows))]
     fn block_on<F: Future>(future: F) -> F::Output {
         let mut future = Box::pin(future);
         let waker = Waker::noop();

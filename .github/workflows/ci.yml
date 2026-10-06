@@ -216,11 +216,10 @@ jobs:
       # for bit by the library unit tests above.
       - name: Test Vorbis decode and encode
         run: cargo test --features native --test vorbis_codec
-      # Linux has no platform AAC decoder, and zvidlib carries none of its own
-      # (#561), so `NativeAacDecoder` must report `Unsupported` here rather than
-      # decode. The macOS and Windows runners run the same file against their
-      # platform decoders.
-      - name: Test that native AAC decoding is unsupported on Linux
+      # Linux has no platform AAC decoder, so `NativeAacDecoder` still runs
+      # Symphonia's here (#561), and must reproduce exactly the reference PCM
+      # the macOS and Windows runners hold their platform decoders to.
+      - name: Test native AAC decoding through Symphonia
         run: cargo test --features native --test native_aac_decoder
       # Muxes the native VP9 encoder's output as `vp09`/`vpcC`, reads it back
       # through `Mp4Demuxer`, plays the MP4 through libvpx and FFmpeg's VP9
@@ -692,8 +691,7 @@ jobs:
       # `NativeAacDecoder` is the platform's AAC decoder - AudioToolbox on macOS
       # and Media Foundation on Windows (#561) - so this is where it is held to
       # the window boundaries and, within a signal-to-noise bound, the PCM that
-      # Symphonia's decoder produced before it was dropped. The Linux `rust` job
-      # runs the same file for the other half: no platform decoder, reported as
-      # `Unsupported`.
+      # Symphonia's decoder produced before it was dropped on these platforms.
+      # The Linux `rust` job runs the same file against Symphonia itself.
       - name: Test the native AAC decoder
         run: cargo test --features native --test native_aac_decoder -- --nocapture

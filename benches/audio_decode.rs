@@ -6,8 +6,8 @@
 //! 1. [`NativeAacDecoder::decode`] over a fixed run of AAC-LC access units, in
 //!    both channel layouts the backend accepts. Demuxing happens once in the
 //!    shared fixture cache, never inside a timed loop, so an iteration is
-//!    the platform decoder's work and the interleave into `AudioBuffer` and
-//!    nothing else. Reported as decoded samples per second and, in the printed
+//!    the decoder's work and the interleave into `AudioBuffer` and nothing
+//!    else. Reported as decoded samples per second and, in the printed
 //!    scale lines, as a realtime factor - the number that decides whether
 //!    playback can keep up.
 //! 2. [`AacSampleReader::get_range`], where the non-trivial work lives. Its
@@ -19,20 +19,21 @@
 //!    groups. Averaging them together would hide the seek
 //!    cost entirely, which is the one that shows up as an audible stall.
 //!
-//! `NativeAacDecoder` runs on the platform's AAC decoder - AudioToolbox on
-//! macOS, Media Foundation on Windows - so a host without one, such as Linux,
-//! skips every group with the reason.
+//! `NativeAacDecoder` runs on a different decoder per platform, so the same
+//! groups measure AudioToolbox on macOS, Media Foundation's AAC decoder MFT on
+//! Windows, and Symphonia's pure-Rust decoder on Linux (issue #561). Numbers
+//! are comparable across commits on one platform, not across platforms.
 //!
 //! # No scalar-versus-SIMD axis
 //!
 //! Unlike the groups in `benches/codec.rs`, nothing here runs once per
 //! instruction set and the group names carry no `simd=` tag. AAC decoding is
-//! delegated to the operating system's decoder, the process-wide override in
-//! `zvidlib::simd` does not reach it, and this crate has no audio SIMD kernels
-//! of its own - so a scalar arm and a vector arm would be the same code
-//! producing two identical numbers. If the platform decoder's performance
-//! turns out to bound playback, that is a finding for its own ticket rather
-//! than an axis to add here.
+//! delegated to the operating system's decoder or to the third-party
+//! `symphonia-codec-aac` crate, the process-wide override in `zvidlib::simd`
+//! reaches neither, and this crate has no audio SIMD kernels of its own - so a
+//! scalar arm and a vector arm would be the same code producing two identical
+//! numbers. If a decoder's performance turns out to bound playback, that is a
+//! finding for its own ticket rather than an axis to add here.
 
 mod support;
 
@@ -81,24 +82,8 @@ fn main_criterion() -> Criterion {
     Criterion::default()
 }
 
-/// Whether this host has the platform AAC decoder `NativeAacDecoder` runs on.
-/// Linux and the other targets without one skip every group here, saying why,
-/// as `hevc_hardware` does on a host without a hardware decoder.
-fn platform_decoder_available(group: &str) -> bool {
-    match NativeAacDecoder::new(&support::bundled_aac_track().config, Limits::default()) {
-        Ok(_) => true,
-        Err(error) => {
-            println!("# skipping the {group} group: {error}");
-            false
-        }
-    }
-}
-
 /// Raw access-unit decode, mono and stereo.
 fn aac_decode(criterion: &mut Criterion) {
-    if !platform_decoder_available("aac_decode") {
-        return;
-    }
     let mut group = criterion.benchmark_group("aac_decode");
     group.sample_size(20);
     decode_arm(
@@ -142,9 +127,6 @@ fn decode_arm(group: &mut BenchmarkGroup<'_, WallTime>, id: &str, track: &Bundle
 /// Reader requests that stay inside already-decoded packets, and the forward
 /// walk that crosses into new ones.
 fn aac_reader_sequential(criterion: &mut Criterion) {
-    if !platform_decoder_available("aac_reader_sequential") {
-        return;
-    }
     let track = support::bundled_aac_track();
     let cancellation = CancellationToken::new();
     let mut group = criterion.benchmark_group("aac_reader_sequential");
@@ -216,9 +198,6 @@ fn aac_reader_sequential(criterion: &mut Criterion) {
 
 /// Random-access reads, each of which forces a seek and a preroll re-decode.
 fn aac_reader_seek(criterion: &mut Criterion) {
-    if !platform_decoder_available("aac_reader_seek") {
-        return;
-    }
     let track = support::bundled_aac_track();
     let cancellation = CancellationToken::new();
     let mut reader = reader_for(track, track.timing.clone());
@@ -264,9 +243,6 @@ fn aac_reader_seek(criterion: &mut Criterion) {
 /// the timeline mapping in `AudioTrackTiming` is visible rather than amortized
 /// away inside a decode.
 fn aac_reader_edits(criterion: &mut Criterion) {
-    if !platform_decoder_available("aac_reader_edits") {
-        return;
-    }
     let cancellation = CancellationToken::new();
     let mut group = criterion.benchmark_group("aac_reader_edits");
     group.sample_size(20);
