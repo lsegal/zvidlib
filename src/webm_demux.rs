@@ -1090,3 +1090,519 @@ fn malformed(message: impl Into<String>) -> Error {
 fn limit(message: impl Into<String>) -> Error {
     Error::new(ErrorKind::ResourceLimit, message)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ebml::{write_element, write_id, write_string, write_uint, write_vint};
+    use crate::io::MemorySource;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll, Waker};
+
+    fn block_on<T>(future: impl Future<Output = T>) -> T {
+        let mut context = Context::from_waker(Waker::noop());
+        let mut future = Box::pin(future);
+        loop {
+            if let Poll::Ready(value) = Pin::new(&mut future).poll(&mut context) {
+                return value;
+            }
+        }
+    }
+
+    const AV1C: [u8; 4] = [0x81, 0, 0, 0];
+
+    fn ebml_header(doc_type: &str) -> Vec<u8> {
+        let mut payload = Vec::new();
+        write_uint(&mut payload, ebml::EBML_VERSION, 1);
+        write_string(&mut payload, ebml::DOC_TYPE, doc_type);
+        write_uint(&mut payload, ebml::DOC_TYPE_READ_VERSION, 2);
+        let mut output = Vec::new();
+        write_element(&mut output, ebml::EBML, &payload);
+        output
+    }
+
+    fn info(scale: Option<u64>, duration: Option<f64>) -> Vec<u8> {
+        let mut payload = Vec::new();
+        if let Some(scale) = scale {
+            write_uint(&mut payload, ebml::TIMESTAMP_SCALE, scale);
+        }
+        if let Some(duration) = duration {
+            ebml::write_float(&mut payload, ebml::DURATION, duration);
+        }
+        let mut output = Vec::new();
+        write_element(&mut output, ebml::INFO, &payload);
+        output
+    }
+
+    fn video_entry(number: u64, codec_id: &str, default_duration: Option<u64>) -> Vec<u8> {
+        let mut entry = Vec::new();
+        write_uint(&mut entry, ebml::TRACK_NUMBER, number);
+        write_uint(&mut entry, ebml::TRACK_TYPE, 1);
+        write_string(&mut entry, ebml::CODEC_ID, codec_id);
+        write_element(&mut entry, ebml::CODEC_PRIVATE, &AV1C);
+        if let Some(duration) = default_duration {
+            write_uint(&mut entry, ebml::DEFAULT_DURATION, duration);
+        }
+        let mut video = Vec::new();
+        write_uint(&mut video, ebml::PIXEL_WIDTH, 64);
+        write_uint(&mut video, ebml::PIXEL_HEIGHT, 48);
+        write_element(&mut entry, ebml::VIDEO, &video);
+        let mut output = Vec::new();
+        write_element(&mut output, ebml::TRACK_ENTRY, &entry);
+        output
+    }
+
+    fn opus_entry(number: u64) -> Vec<u8> {
+        let mut entry = Vec::new();
+        write_uint(&mut entry, ebml::TRACK_NUMBER, number);
+        write_uint(&mut entry, ebml::TRACK_TYPE, 2);
+        write_string(&mut entry, ebml::CODEC_ID, "A_OPUS");
+        let mut output = Vec::new();
+        write_element(&mut output, ebml::TRACK_ENTRY, &entry);
+        output
+    }
+
+    fn tracks(entries: &[Vec<u8>]) -> Vec<u8> {
+        let mut output = Vec::new();
+        write_element(&mut output, ebml::TRACKS, &entries.concat());
+        output
+    }
+
+    /// A block body: track number, relative timestamp, flags, then `body`.
+    fn block_body(track: u64, relative: i16, flags: u8, body: &[u8]) -> Vec<u8> {
+        let mut output = Vec::new();
+        write_vint(&mut output, track);
+        output.extend_from_slice(&relative.to_be_bytes());
+        output.push(flags);
+        output.extend_from_slice(body);
+        output
+    }
+
+    fn simple_block(track: u64, relative: i16, keyframe: bool, data: &[u8]) -> Vec<u8> {
+        let mut output = Vec::new();
+        let flags = if keyframe { 0x80 } else { 0 };
+        write_element(
+            &mut output,
+            ebml::SIMPLE_BLOCK,
+            &block_body(track, relative, flags, data),
+        );
+        output
+    }
+
+    /// A Cluster of known size, or of unknown size as a live recorder writes.
+    fn cluster(timestamp: u64, blocks: &[Vec<u8>], known_size: bool) -> Vec<u8> {
+        let mut payload = Vec::new();
+        write_uint(&mut payload, ebml::TIMESTAMP, timestamp);
+        payload.extend_from_slice(&blocks.concat());
+        let mut output = Vec::new();
+        if known_size {
+            write_element(&mut output, ebml::CLUSTER, &payload);
+        } else {
+            write_id(&mut output, ebml::CLUSTER);
+            output.push(0xFF);
+            output.extend_from_slice(&payload);
+        }
+        output
+    }
+
+    fn file(doc_type: &str, children: &[Vec<u8>], known_size: bool) -> Vec<u8> {
+        let mut output = ebml_header(doc_type);
+        let payload = children.concat();
+        if known_size {
+            write_element(&mut output, ebml::SEGMENT, &payload);
+        } else {
+            write_id(&mut output, ebml::SEGMENT);
+            output.extend_from_slice(&[0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+            output.extend_from_slice(&payload);
+        }
+        output
+    }
+
+    fn open(bytes: Vec<u8>) -> Result<WebmDemuxer> {
+        let source = MemorySource::new(bytes);
+        block_on(WebmDemuxer::open(&source, WebmDemuxerOptions::default()))
+    }
+
+    fn summary(track: &Mp4Track) -> Vec<(i64, u32, bool)> {
+        track
+            .samples
+            .iter()
+            .map(|sample| (sample.pts, sample.duration, sample.is_sync))
+            .collect()
+    }
+
+    #[test]
+    fn unknown_size_segment_and_clusters_without_cues_index_by_scan() {
+        // A MediaRecorder-style capture: no Cues, no Duration, every size unknown.
+        let bytes = file(
+            "webm",
+            &[
+                info(None, None),
+                tracks(&[video_entry(1, "V_AV1", Some(33_000_000)), opus_entry(2)]),
+                cluster(
+                    0,
+                    &[
+                        simple_block(1, 0, true, &[1, 1]),
+                        simple_block(2, 0, true, &[9]),
+                        simple_block(1, 33, false, &[2, 2, 2]),
+                    ],
+                    false,
+                ),
+                cluster(
+                    66,
+                    &[
+                        simple_block(1, 0, true, &[3]),
+                        simple_block(1, 33, false, &[4]),
+                    ],
+                    false,
+                ),
+            ],
+            false,
+        );
+        let demuxer = open(bytes.clone()).unwrap();
+        assert_eq!(demuxer.doc_type, "webm");
+        assert!(demuxer.cues.is_empty());
+        assert_eq!(demuxer.duration_seconds, None);
+        assert_eq!(
+            demuxer.skipped_tracks,
+            vec![WebmSkippedTrack {
+                number: 2,
+                codec_id: "A_OPUS".to_owned(),
+            }]
+        );
+        assert_eq!(demuxer.tracks.len(), 1);
+        let track = &demuxer.tracks[0];
+        assert_eq!(track.timescale, 1_000);
+        assert_eq!(
+            track.dimensions,
+            Some(VideoDimensions {
+                width: 64,
+                height: 48
+            })
+        );
+        assert_eq!(
+            track.decoder_config,
+            [0, 0, 0, 12, b'a', b'v', b'1', b'C', 0x81, 0, 0, 0]
+        );
+        // The last frame takes its length from DefaultDuration.
+        assert_eq!(
+            summary(track),
+            [
+                (0, 33, true),
+                (33, 33, false),
+                (66, 33, true),
+                (99, 33, false)
+            ]
+        );
+        let payloads: Vec<_> = track
+            .samples
+            .iter()
+            .map(|sample| {
+                let offset = sample.offset as usize;
+                bytes[offset..offset + sample.size as usize].to_vec()
+            })
+            .collect();
+        assert_eq!(payloads, [vec![1, 1], vec![2, 2, 2], vec![3], vec![4]]);
+        // Without Cues, seeking falls back to the scanned sync samples.
+        let seek = demuxer.seek_point(1, 98).unwrap();
+        assert!(!seek.from_cues);
+        assert_eq!(seek.time, 66);
+        assert_eq!(seek.offset, track.samples[2].offset);
+        assert!(demuxer.seek_point(3, 0).is_none());
+    }
+
+    #[test]
+    fn lacing_splits_blocks_into_evenly_timed_frames() {
+        // Xiph sizes 300 (255 + 45) and 2, then the 4-byte remainder.
+        let mut xiph = vec![2, 255, 45, 2];
+        xiph.extend(std::iter::repeat_n(7, 306));
+        // EBML sizes 5, then 5 + (-2) = 3, then the 1-byte remainder.
+        let mut ebml_laced = vec![2, 0x85, 0xBF - 2];
+        ebml_laced.extend(std::iter::repeat_n(8, 9));
+        // Fixed: three frames of two bytes.
+        let mut fixed = vec![2];
+        fixed.extend(std::iter::repeat_n(6, 6));
+        let laced = |flags: u8, body: &[u8], relative: i16| {
+            let mut output = Vec::new();
+            write_element(
+                &mut output,
+                ebml::SIMPLE_BLOCK,
+                &block_body(1, relative, 0x80 | flags, body),
+            );
+            output
+        };
+        let bytes = file(
+            "matroska",
+            &[
+                info(None, Some(90.0)),
+                tracks(&[video_entry(1, "V_AV1", None)]),
+                cluster(
+                    0,
+                    &[
+                        laced(0b010, &xiph, 0),
+                        laced(0b110, &ebml_laced, 30),
+                        laced(0b100, &fixed, 60),
+                    ],
+                    true,
+                ),
+            ],
+            true,
+        );
+        let demuxer = open(bytes).unwrap();
+        assert_eq!(demuxer.doc_type, "matroska");
+        assert_eq!(demuxer.duration_seconds, Some(0.09));
+        let track = &demuxer.tracks[0];
+        let sizes: Vec<_> = track.samples.iter().map(|sample| sample.size).collect();
+        assert_eq!(sizes, [300, 2, 4, 5, 3, 1, 2, 2, 2]);
+        // Each block's 30 ms is shared by its three frames; the last block's
+        // length comes from the segment Duration.
+        let times: Vec<_> = track.samples.iter().map(|sample| sample.pts).collect();
+        assert_eq!(times, [0, 10, 20, 30, 40, 50, 60, 70, 80]);
+        assert!(track.samples.iter().all(|sample| sample.duration == 10));
+        let mut offset = track.samples[0].offset;
+        for sample in &track.samples[..3] {
+            assert_eq!(sample.offset, offset);
+            offset += u64::from(sample.size);
+        }
+    }
+
+    #[test]
+    fn malformed_lacing_is_rejected() {
+        for (flags, body) in [
+            // Xiph sizes larger than the block.
+            (0b010_u8, vec![1, 200, 1]),
+            // Fixed lacing that does not divide the data.
+            (0b100, vec![1, 1, 2, 3]),
+            // EBML lacing whose difference makes a size negative.
+            (0b110, vec![2, 0x81, 0x80, 1, 1, 1]),
+        ] {
+            let mut block = Vec::new();
+            write_element(
+                &mut block,
+                ebml::SIMPLE_BLOCK,
+                &block_body(1, 0, 0x80 | flags, &body),
+            );
+            let bytes = file(
+                "webm",
+                &[
+                    info(None, None),
+                    tracks(&[video_entry(1, "V_AV1", None)]),
+                    cluster(0, &[block], true),
+                ],
+                true,
+            );
+            assert_eq!(open(bytes).unwrap_err().kind(), ErrorKind::MalformedMedia);
+        }
+    }
+
+    #[test]
+    fn block_groups_are_keyframes_unless_they_reference_a_block() {
+        let group = |relative: i16, reference: bool, duration: Option<u64>| {
+            let mut payload = Vec::new();
+            write_element(
+                &mut payload,
+                ebml::BLOCK,
+                &block_body(1, relative, 0, &[5, 5]),
+            );
+            if let Some(duration) = duration {
+                write_uint(&mut payload, ebml::BLOCK_DURATION, duration);
+            }
+            if reference {
+                write_element(&mut payload, ebml::REFERENCE_BLOCK, &[0xE0]);
+            }
+            let mut output = Vec::new();
+            write_element(&mut output, ebml::BLOCK_GROUP, &payload);
+            output
+        };
+        // A TimestampScale that does not divide a second counts in nanoseconds.
+        let bytes = file(
+            "webm",
+            &[
+                info(Some(3_000_000), None),
+                tracks(&[video_entry(1, "V_AV1", None)]),
+                cluster(10, &[group(0, false, None), group(2, true, Some(4))], true),
+            ],
+            true,
+        );
+        let demuxer = open(bytes).unwrap();
+        let track = &demuxer.tracks[0];
+        assert_eq!(track.timescale, 1_000_000_000);
+        assert_eq!(
+            summary(track),
+            [
+                (30_000_000, 6_000_000, true),
+                (36_000_000, 12_000_000, false)
+            ]
+        );
+        assert_eq!(track.samples[1].dependency, SampleDependency::DEPENDENT);
+    }
+
+    #[test]
+    fn cues_mark_random_access_and_answer_seeks() {
+        let first = cluster(
+            0,
+            &[
+                simple_block(1, 0, true, &[1]),
+                simple_block(1, 40, false, &[2]),
+            ],
+            true,
+        );
+        let second_start = info(None, Some(120.0)).len()
+            + tracks(&[video_entry(1, "V_AV1", None)]).len()
+            + first.len();
+        // The second Cluster's keyframe flag is missing; its cue restores it.
+        let second = cluster(80, &[simple_block(1, 0, false, &[3])], true);
+        let mut cue_positions = Vec::new();
+        write_uint(&mut cue_positions, ebml::CUE_TRACK, 1);
+        write_uint(
+            &mut cue_positions,
+            ebml::CUE_CLUSTER_POSITION,
+            second_start as u64,
+        );
+        let mut point = Vec::new();
+        write_uint(&mut point, ebml::CUE_TIME, 80);
+        write_element(&mut point, ebml::CUE_TRACK_POSITIONS, &cue_positions);
+        let mut points = Vec::new();
+        write_element(&mut points, ebml::CUE_POINT, &point);
+        let mut cues = Vec::new();
+        write_element(&mut cues, ebml::CUES, &points);
+        let bytes = file(
+            "webm",
+            &[
+                info(None, Some(120.0)),
+                tracks(&[video_entry(1, "V_AV1", None)]),
+                first,
+                second,
+                cues,
+            ],
+            true,
+        );
+        let demuxer = open(bytes.clone()).unwrap();
+        let track = &demuxer.tracks[0];
+        assert_eq!(
+            summary(track),
+            [(0, 40, true), (40, 40, false), (80, 40, true)]
+        );
+        assert_eq!(demuxer.cues.len(), 1);
+        let cue = demuxer.cues[0];
+        assert_eq!(
+            &bytes[cue.cluster_offset as usize..][..4],
+            &[0x1F, 0x43, 0xB6, 0x75]
+        );
+        let seek = demuxer.seek_point(1, 100).unwrap();
+        assert!(seek.from_cues);
+        assert_eq!((seek.time, seek.offset), (80, cue.cluster_offset));
+        // Before the only cue there is nowhere cued to start.
+        assert!(demuxer.seek_point(1, 50).is_none());
+    }
+
+    #[test]
+    fn structure_errors_are_reported_with_stable_kinds() {
+        let blocks = || cluster(0, &[simple_block(1, 0, true, &[1])], true);
+        let av1 = || tracks(&[video_entry(1, "V_AV1", None)]);
+        let cases = [
+            // No Tracks before the Cluster.
+            (
+                file("webm", &[info(None, None), blocks()], true),
+                ErrorKind::MalformedMedia,
+            ),
+            // No Info at all.
+            (
+                file("webm", &[av1(), blocks()], true),
+                ErrorKind::MalformedMedia,
+            ),
+            (
+                file(
+                    "webm",
+                    &[
+                        info(None, None),
+                        tracks(&[video_entry(1, "V_VP9", None)]),
+                        blocks(),
+                    ],
+                    true,
+                ),
+                ErrorKind::Unsupported,
+            ),
+            // A block for a track the file never declared.
+            (
+                file(
+                    "webm",
+                    &[
+                        info(None, None),
+                        av1(),
+                        cluster(0, &[simple_block(3, 0, true, &[1])], true),
+                    ],
+                    true,
+                ),
+                ErrorKind::MalformedMedia,
+            ),
+            (file("mkv3d", &[], true), ErrorKind::Unsupported),
+        ];
+        for (bytes, kind) in cases {
+            assert_eq!(open(bytes).unwrap_err().kind(), kind);
+        }
+        // A Segment that claims more bytes than the file holds.
+        let mut truncated = file("webm", &[info(None, None), av1(), blocks()], true);
+        truncated.truncate(truncated.len() - 1);
+        assert_eq!(
+            open(truncated).unwrap_err().kind(),
+            ErrorKind::MalformedMedia
+        );
+    }
+
+    #[test]
+    fn element_and_sample_limits_apply() {
+        let bytes = file(
+            "webm",
+            &[
+                info(None, None),
+                tracks(&[video_entry(1, "V_AV1", None)]),
+                cluster(
+                    0,
+                    &[
+                        simple_block(1, 0, true, &[1]),
+                        simple_block(1, 1, false, &[2]),
+                    ],
+                    true,
+                ),
+            ],
+            true,
+        );
+        let source = MemorySource::new(bytes);
+        let limited = |options: WebmDemuxerOptions| {
+            block_on(WebmDemuxer::open(&source, options))
+                .unwrap_err()
+                .kind()
+        };
+        for options in [
+            WebmDemuxerOptions {
+                max_samples_per_track: 1,
+                ..WebmDemuxerOptions::default()
+            },
+            WebmDemuxerOptions {
+                max_elements: 4,
+                ..WebmDemuxerOptions::default()
+            },
+            WebmDemuxerOptions {
+                max_element_bytes: 8,
+                ..WebmDemuxerOptions::default()
+            },
+        ] {
+            assert_eq!(limited(options), ErrorKind::ResourceLimit);
+        }
+    }
+
+    #[test]
+    fn probing_reads_the_doc_type_and_nothing_else() {
+        let webm = MemorySource::new(file("webm", &[], true));
+        let matroska = MemorySource::new(file("matroska", &[], true));
+        let other = MemorySource::new(file("other", &[], true));
+        let mp4 = MemorySource::new(b"\0\0\0\x18ftypisom".to_vec());
+        assert!(block_on(probe_webm(&webm)).unwrap());
+        assert!(block_on(probe_webm(&matroska)).unwrap());
+        assert!(!block_on(probe_webm(&other)).unwrap());
+        assert!(!block_on(probe_webm(&mp4)).unwrap());
+        assert!(!block_on(probe_webm(&MemorySource::new(vec![0x1A]))).unwrap());
+    }
+}
