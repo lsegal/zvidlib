@@ -6,7 +6,9 @@
 //! ([`crate::av1_mc`]), AV1 intra prediction ([`crate::av1_intra_pred`]), and
 //! the HEVC engine's inter/intra prediction, in-loop filters, inverse
 //! transforms, encoder-side distortion metrics, and encoder-side color
-//! conversion. Each of those sites caches
+//! conversion, and the AV1, VP8 and VP9 decoders' shared output color
+//! conversion ([`crate::av1_filters::convert_to_rgba8`]). Each of those sites
+//! caches
 //! its own CPU feature probe, which is what you want in production but makes
 //! "run this workload with SIMD off" impossible to express from outside the
 //! crate.
@@ -46,10 +48,10 @@ static OVERRIDE: AtomicU8 = AtomicU8::new(0);
 /// Forces every SIMD-dispatched kernel in the crate onto `isa`, or restores
 /// per-site automatic detection with `None`.
 ///
-/// The override reaches all four dispatch families: the AV1 transform and
-/// in-loop filter kernels, AV1 motion compensation (through the default level
-/// [`crate::av1_mc::McContext::new`] picks up), AV1 intra prediction, and every
-/// HEVC engine kernel. [`SimdIsa::Scalar`] therefore genuinely reaches the
+/// The override reaches every dispatch family: the AV1 transform and in-loop
+/// filter kernels, AV1 motion compensation (through the default level
+/// [`crate::av1_mc::McContext::new`] picks up), AV1 intra prediction, every
+/// HEVC engine kernel, and the AV1, VP8 and VP9 output color conversion. [`SimdIsa::Scalar`] therefore genuinely reaches the
 /// scalar code path rather than merely the widest scalar-ish one.
 ///
 /// An instruction set this host cannot execute is clamped to
@@ -119,6 +121,7 @@ pub fn available() -> Vec<SimdIsa> {
 /// | `hevc_fwd_transform_quant` | HEVC encoder-side forward transform and quantization |
 /// | `hevc_colorconv` | HEVC encoder-side RGBA8 to YUV420 input conversion |
 /// | `hevc_color_convert` | HEVC decoder output YUV420-to-RGBA conversion |
+/// | `yuv_to_rgba` | AV1, VP8 and VP9 decoder output YUV-to-RGBA conversion |
 ///
 /// The `hevc_*` sites are absent on `wasm32`, where the HEVC kernels have no
 /// vector backend and always run the scalar path.
@@ -159,7 +162,24 @@ pub fn active_by_site() -> Vec<(&'static str, SimdIsa)> {
             from_color_convert_isa(color_convert::detected_isa()),
         ));
     }
+    sites.push((
+        "yuv_to_rgba",
+        from_yuv_to_rgba_isa(crate::yuv_to_rgba::detected_isa()),
+    ));
     sites
+}
+
+fn from_yuv_to_rgba_isa(isa: crate::yuv_to_rgba::Isa) -> SimdIsa {
+    use crate::yuv_to_rgba::Isa;
+    match isa {
+        Isa::Scalar => SimdIsa::Scalar,
+        #[cfg(target_arch = "x86_64")]
+        Isa::Sse41 => SimdIsa::Sse41,
+        #[cfg(target_arch = "x86_64")]
+        Isa::Avx2 => SimdIsa::Avx2,
+        #[cfg(target_arch = "aarch64")]
+        Isa::Neon => SimdIsa::Neon,
+    }
 }
 
 fn from_mc_level(level: crate::av1_mc::SimdLevel) -> SimdIsa {
@@ -379,6 +399,11 @@ mod tests {
         assert_eq!(colorconv::isa(), colorconv::Isa::Scalar);
         // The HEVC decoder's YUV420-to-RGBA output conversion.
         assert_eq!(color_convert::detected_isa(), color_convert::Isa::Scalar);
+        // The AV1, VP8 and VP9 decoders' YUV-to-RGBA output conversion.
+        assert_eq!(
+            crate::yuv_to_rgba::detected_isa(),
+            crate::yuv_to_rgba::Isa::Scalar
+        );
 
         // The list above is written out by hand, one selector per site, so it
         // only stays exhaustive as long as it matches `active_by_site`. A new
@@ -395,6 +420,7 @@ mod tests {
             "hevc_fwd_transform_quant",
             "hevc_colorconv",
             "hevc_color_convert",
+            "yuv_to_rgba",
         ];
         let sites: Vec<&str> = active_by_site().into_iter().map(|(site, _)| site).collect();
         assert_eq!(sites, checked);
@@ -482,6 +508,11 @@ mod tests {
             color_convert::detected_isa() != color_convert::Isa::Scalar,
             vectorized
         );
+        // The AV1, VP8 and VP9 decoders' YUV-to-RGBA output conversion.
+        assert_eq!(
+            crate::yuv_to_rgba::detected_isa() != crate::yuv_to_rgba::Isa::Scalar,
+            vectorized
+        );
 
         // As in `pinning_scalar_reaches_every_dispatch_site`, the list above is
         // written out by hand, one selector per site, so it only stays
@@ -499,6 +530,7 @@ mod tests {
             "hevc_fwd_transform_quant",
             "hevc_colorconv",
             "hevc_color_convert",
+            "yuv_to_rgba",
         ];
         let sites: Vec<&str> = active_by_site().into_iter().map(|(site, _)| site).collect();
         assert_eq!(sites, checked);
