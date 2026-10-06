@@ -184,7 +184,12 @@ pub(crate) struct FrameDecoder<'a> {
     y_dequant: [[i32; 2]; 8],
     uv_dequant: [[i32; 2]; 8],
     coefficients: Vec<i32>,
+    /// `token_cache` of `decode_coefs`. Coefficient contexts only read the
+    /// entries of positions earlier in the scan, so it is never cleared.
+    token_cache: Vec<u8>,
     mc_buffer: Vec<u8>,
+    /// The horizontal pass of the two-dimensional convolution.
+    convolve_temp: Box<[u8; 64 * 135]>,
 }
 
 impl<'a> FrameDecoder<'a> {
@@ -263,7 +268,9 @@ impl<'a> FrameDecoder<'a> {
             y_dequant,
             uv_dequant,
             coefficients: vec![0; 32 * 32],
+            token_cache: vec![0; 32 * 32],
             mc_buffer: Vec::new(),
+            convolve_temp: Box::new([0; 64 * 135]),
         })
     }
 
@@ -1589,7 +1596,7 @@ impl<'a> FrameDecoder<'a> {
         let dq_shift = u32::from(tx_size == 3);
         let probs = &self.fc.coef[tx][plane_type][reference];
         let mut counts = self.counts.as_deref_mut();
-        let mut token_cache = [0u8; 1024];
+        let token_cache = &mut self.token_cache[..];
         let bd = &mut tile.bd;
         let mut dqv = dequant[0];
         let mut c = 0usize;
@@ -1615,7 +1622,7 @@ impl<'a> FrameDecoder<'a> {
                 if c >= max_eob {
                     return c;
                 }
-                context = coef_context(scan.neighbors, &token_cache, c);
+                context = coef_context(scan.neighbors, token_cache, c);
                 band = usize::from(band_translate[c]);
                 prob = &probs[band][context];
             }
@@ -1664,7 +1671,7 @@ impl<'a> FrameDecoder<'a> {
             let position = scan.scan[c] as usize;
             self.coefficients[position] = if bd.read(128) { -value } else { value };
             c += 1;
-            context = coef_context(scan.neighbors, &token_cache, c);
+            context = coef_context(scan.neighbors, token_cache, c);
             dqv = dequant[1];
         }
         c
@@ -1990,6 +1997,7 @@ impl<'a> FrameDecoder<'a> {
                     subpel_y,
                     ys,
                     average,
+                    &mut self.convolve_temp,
                 );
                 return;
             }
@@ -2012,6 +2020,7 @@ impl<'a> FrameDecoder<'a> {
             subpel_y,
             ys,
             average,
+            &mut self.convolve_temp,
         );
     }
 }
@@ -2069,7 +2078,7 @@ fn scan_order(tx_size: u8, tx_type: u8) -> Scan {
 
 /// `get_coef_context`.
 #[inline]
-fn coef_context(neighbors: &[i16], token_cache: &[u8; 1024], c: usize) -> usize {
+fn coef_context(neighbors: &[i16], token_cache: &[u8], c: usize) -> usize {
     (1 + usize::from(token_cache[neighbors[2 * c] as usize])
         + usize::from(token_cache[neighbors[2 * c + 1] as usize]))
         >> 1
