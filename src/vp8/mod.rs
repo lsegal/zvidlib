@@ -24,9 +24,10 @@
 //! NVDEC decodes VP8 on 64-bit Windows and Linux hosts with an NVIDIA adapter
 //! whose driver reports VP8 support. Its pictures are cropped and converted to
 //! RGBA by the same code as the software decoder's, and VP8 decoding is exact,
-//! so both produce the same pixels. Media Foundation and VideoToolbox are not
-//! used: Windows ships no VP8 decoder of its own, and VideoToolbox exposes no
-//! VP8 decoder at all.
+//! so both produce the same pixels. VideoToolbox exposes no VP8 decoder, so
+//! macOS decodes in software. Media Foundation is not used: it decodes VP8 in
+//! hardware only through a D3D11 VP8 decoder profile, which NVIDIA adapters do
+//! not expose (they decode VP8 through NVDEC alone).
 
 mod bool_decoder;
 mod decoder;
