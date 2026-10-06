@@ -24,7 +24,7 @@ checks (issue #341):
 
 The first rule is crate-wide and so covers every `#[target_feature]` site the
 crate has, `hevc::engine::simd`, `hevc::engine::transform_simd`,
-`hevc::color_convert` and `av1_mc` included: an out-of-line intrinsic call is
+`hevc::color_convert`, `yuv_to_rgba` and `av1_mc` included: an out-of-line intrinsic call is
 the same defect wherever it appears. The second is `av1_simd`-specific because
 only that module dispatches through generic kernels; the other sites write
 their intrinsics directly inside the `#[target_feature]` function, where there
