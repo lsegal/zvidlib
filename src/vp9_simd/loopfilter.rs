@@ -70,6 +70,38 @@ unsafe fn clamp8<V: I32x>(value: V) -> V {
     unsafe { value.clamp(V::splat(-128), V::splat(127)) }
 }
 
+/// Reads taps `range` (a whole number of 4-tap words) of the positions from
+/// `base` into `px`, where tap `i` is `i - reach` steps across the edge.
+#[inline(always)]
+unsafe fn load_taps<V: I32x>(
+    data: &[u8],
+    base: isize,
+    step: isize,
+    along: isize,
+    reach: usize,
+    range: core::ops::Range<usize>,
+    px: &mut [V; 16],
+) {
+    unsafe {
+        if along == 1 {
+            for i in range {
+                let at = base + (i as isize - reach as isize) * step;
+                px[i] = V::load_u8(&data[at as usize..]);
+            }
+        } else {
+            let mask = V::splat(0xff);
+            for word in range.start / 4..range.end / 4 {
+                let at = (base - reach as isize) as usize + 4 * word;
+                let bytes = V::load_u32_rows(data, at, along as usize);
+                px[4 * word] = bytes.and(mask);
+                px[4 * word + 1] = bytes.srl::<8>().and(mask);
+                px[4 * word + 2] = bytes.srl::<16>().and(mask);
+                px[4 * word + 3] = bytes.srl::<24>();
+            }
+        }
+    }
+}
+
 /// `ROUND_POWER_OF_TWO(sum, 3)` of the `filter8` taps.
 #[inline(always)]
 unsafe fn round3<V: I32x>(sum: V) -> V {
@@ -108,25 +140,12 @@ pub(super) unsafe fn filter_edge<V: I32x>(
         for chunk in (0..count).step_by(lanes) {
             let base = start + chunk as isize * along;
             // `px[i]` is the pixel `i - reach` steps across the edge, so
-            // `px[reach - 1]` is p0 and `px[reach]` is q0.
-            let mut px = [V::zero(); 16];
-            if horizontal {
-                for i in 0..2 * reach {
-                    let at = base + (i as isize - reach as isize) * step;
-                    px[i] = V::load_u8(&data[at as usize..]);
-                }
-            } else {
-                for word in 0..2 * reach / 4 {
-                    let at = (base - reach as isize) as usize + 4 * word;
-                    let bytes = V::load_u32_rows(data, at, along as usize);
-                    let mask = V::splat(0xff);
-                    px[4 * word] = bytes.and(mask);
-                    px[4 * word + 1] = bytes.srl::<8>().and(mask);
-                    px[4 * word + 2] = bytes.srl::<16>().and(mask);
-                    px[4 * word + 3] = bytes.srl::<24>();
-                }
-            }
+            // `px[reach - 1]` is p0 and `px[reach]` is q0. The eight taps
+            // nearest the edge are read now; the 16-wide filter's outer
+            // eight only once some position turns out to need them.
             let o = reach - 4;
+            let mut px = [V::zero(); 16];
+            load_taps(data, base, step, along, reach, o..o + 8, &mut px);
             let [p3, p2, p1, p0, q0, q1, q2, q3] = [
                 px[o],
                 px[o + 1],
@@ -169,20 +188,21 @@ pub(super) unsafe fn filter_edge<V: I32x>(
             out[o + 3] = clamp8(ps0.add(filter2)).add(bias);
             out[o + 5] = clamp8(qs1.sub(outer)).add(bias);
             out[o + 2] = clamp8(ps1.add(outer)).add(bias);
+            // The taps the filters applied so far changed.
+            let mut changed = o + 2..o + 6;
 
-            let (first, last) = if taps == Taps::Four {
-                (o + 2, o + 6)
-            } else {
-                // flat_mask4, then filter8 where both it and the filter
-                // mask hold.
-                let not_flat = d(p1, p0)
-                    .gt(one)
-                    .or(d(q1, q0).gt(one))
-                    .or(d(p2, p0).gt(one))
-                    .or(d(q2, q0).gt(one))
-                    .or(d(p3, p0).gt(one))
-                    .or(d(q3, q0).gt(one));
-                let flat = not_flat.andnot(mask);
+            // flat_mask4, then filter8 where both it and the filter mask
+            // hold. A position that is not flat keeps its filter4 result,
+            // so with none flat there is nothing more to compute.
+            let flat = d(p1, p0)
+                .gt(one)
+                .or(d(q1, q0).gt(one))
+                .or(d(p2, p0).gt(one))
+                .or(d(q2, q0).gt(one))
+                .or(d(p3, p0).gt(one))
+                .or(d(q3, q0).gt(one))
+                .andnot(mask);
+            if taps != Taps::Four && flat.any() {
                 let seven = [
                     p3.add(p3).add(p3).add(p2).add(p2).add(p1).add(p0).add(q0),
                     p3.add(p3).add(p2).add(p1).add(p1).add(p0).add(q0).add(q1),
@@ -194,11 +214,13 @@ pub(super) unsafe fn filter_edge<V: I32x>(
                 for k in 0..6 {
                     out[o + 1 + k] = V::select(flat, round3(seven[k]), out[o + 1 + k]);
                 }
-                if taps == Taps::Eight {
-                    (o + 1, o + 7)
-                } else {
+                changed = o + 1..o + 7;
+
+                if taps == Taps::Sixteen {
                     // flat_mask5 on the outer taps, then the 15-tap filter
                     // where it, flat_mask4 and the filter mask all hold.
+                    load_taps(data, base, step, along, reach, 0..4, &mut px);
+                    load_taps(data, base, step, along, reach, 12..16, &mut px);
                     let mut not_flat2 = V::zero();
                     for k in 0..4 {
                         not_flat2 = not_flat2
@@ -206,32 +228,39 @@ pub(super) unsafe fn filter_edge<V: I32x>(
                             .or(d(px[12 + k], q0).gt(one));
                     }
                     let flat2 = not_flat2.andnot(flat);
-                    // The taps past either end repeat p7 or q7, so the
-                    // window sum slides by one tap in and one out.
-                    let mut window = V::zero();
-                    for k in -7..=7isize {
-                        window = window.add(px[(1 + k).clamp(0, 15) as usize]);
-                    }
-                    for position in 1..15usize {
-                        if position > 1 {
-                            window = window
-                                .add(px[(position + 7).min(15)])
-                                .sub(px[position.saturating_sub(8)]);
+                    if flat2.any() {
+                        for k in (0..4).chain(12..16) {
+                            out[k] = px[k];
                         }
-                        let value = window.add(px[position]).add(V::splat(8)).sra::<4>();
-                        out[position] = V::select(flat2, value, out[position]);
+                        // The taps past either end repeat p7 or q7, so the
+                        // window sum slides by one tap in and one out.
+                        let mut window = V::zero();
+                        for k in -7..=7isize {
+                            window = window.add(px[(1 + k).clamp(0, 15) as usize]);
+                        }
+                        for position in 1..15usize {
+                            if position > 1 {
+                                window = window
+                                    .add(px[(position + 7).min(15)])
+                                    .sub(px[position.saturating_sub(8)]);
+                            }
+                            let value = window.add(px[position]).add(V::splat(8)).sra::<4>();
+                            out[position] = V::select(flat2, value, out[position]);
+                        }
+                        changed = 1..15;
                     }
-                    (1, 15)
                 }
-            };
+            }
 
             if horizontal {
-                for i in first..last {
+                for i in changed {
                     let at = base + (i as isize - reach as isize) * step;
                     out[i].store_u8_clamped(&mut data[at as usize..]);
                 }
             } else {
-                for word in 0..2 * reach / 4 {
+                // Whole words, so the unchanged taps in them are written
+                // back as they were read.
+                for word in changed.start / 4..changed.end.div_ceil(4) {
                     let at = (base - reach as isize) as usize + 4 * word;
                     out[4 * word]
                         .or(out[4 * word + 1].sll::<8>())

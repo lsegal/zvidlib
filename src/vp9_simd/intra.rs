@@ -9,6 +9,12 @@
 //! code (and libvpx's `d*_predictor`) uses. DC sums its edge with vectors and
 //! TM computes `left + above - above_left` a vector at a time.
 
+// Loops over vectors index rather than iterate: an iterator adapter or an
+// `array::from_fn` closure over vector values is a separate function the
+// inliner can leave outside the `#[target_feature]` wrapper, compiled at the
+// baseline instruction set (#341).
+#![allow(clippy::needless_range_loop)]
+
 use crate::av1_simd::vector::I32x;
 use crate::vp9_dec::recon::{
     D45_PRED, D63_PRED, D117_PRED, D135_PRED, D207_PRED, DC_PRED, H_PRED, TM_PRED, V_PRED,
@@ -76,9 +82,25 @@ fn avg3(a: u8, b: u8, c: u8) -> u8 {
 }
 
 /// Writes row `y` of the block from `row[..bs]`.
+///
+/// Each block size is its own constant-length copy, which compiles to a few
+/// vector moves rather than a call into `memcpy` per row.
 #[inline(always)]
 fn put(dest: &mut [u8], stride: usize, bs: usize, y: usize, row: &[u8]) {
-    dest[y * stride..y * stride + bs].copy_from_slice(&row[..bs]);
+    let at = y * stride;
+    match bs {
+        4 => dest[at..at + 4].copy_from_slice(&row[..4]),
+        8 => dest[at..at + 8].copy_from_slice(&row[..8]),
+        16 => dest[at..at + 16].copy_from_slice(&row[..16]),
+        _ => dest[at..at + 32].copy_from_slice(&row[..32]),
+    }
+}
+
+/// Fills row `y` of the block with `value`, with [`put`]'s constant-length
+/// stores.
+#[inline(always)]
+fn fill(dest: &mut [u8], stride: usize, bs: usize, y: usize, value: u8) {
+    put(dest, stride, bs, y, &[value; 32]);
 }
 
 /// The vector form of `vp9_dec::recon::predict_intra`: `above[0]` is the
@@ -104,50 +126,60 @@ pub(super) unsafe fn predict_intra<V: I32x>(
         if bs < V::LANES {
             return false;
         }
-        // Copies padded so that a vector load at any run position stays in
-        // bounds. `a[i + 1]` is the scalar code's `above(i)`.
-        let mut a = [0u8; RUN];
-        a[..65].copy_from_slice(above);
-        let mut l = [0u8; RUN];
-        l[..32].copy_from_slice(left);
-        let top_left = a[0];
-
+        // DC, V, H and TM read no further than the edges themselves.
+        let top_left = above[0];
         match mode {
             DC_PRED => {
                 let value = match (have_left, have_above) {
                     (false, false) => 128,
-                    (true, false) => (sum::<V>(&l, bs) + (bs as u32 >> 1)) / bs as u32,
-                    (false, true) => (sum::<V>(&a[1..], bs) + (bs as u32 >> 1)) / bs as u32,
+                    (true, false) => (sum::<V>(left, bs) + (bs as u32 >> 1)) / bs as u32,
+                    (false, true) => (sum::<V>(&above[1..], bs) + (bs as u32 >> 1)) / bs as u32,
                     (true, true) => {
                         let count = 2 * bs as u32;
-                        (sum::<V>(&l, bs) + sum::<V>(&a[1..], bs) + (count >> 1)) / count
+                        (sum::<V>(left, bs) + sum::<V>(&above[1..], bs) + (count >> 1)) / count
                     }
                 } as u8;
                 for y in 0..bs {
-                    dest[y * stride..y * stride + bs].fill(value);
+                    fill(dest, stride, bs, y, value);
                 }
+                return true;
             }
             V_PRED => {
                 for y in 0..bs {
-                    put(dest, stride, bs, y, &a[1..]);
+                    put(dest, stride, bs, y, &above[1..]);
                 }
+                return true;
             }
             H_PRED => {
                 for y in 0..bs {
-                    dest[y * stride..y * stride + bs].fill(l[y]);
+                    fill(dest, stride, bs, y, left[y]);
                 }
+                return true;
             }
             TM_PRED => {
                 let top_left = V::splat(i32::from(top_left));
                 for y in 0..bs {
-                    let side = V::splat(i32::from(l[y])).sub(top_left);
+                    let side = V::splat(i32::from(left[y])).sub(top_left);
                     for x in (0..bs).step_by(V::LANES) {
-                        V::load_u8(&a[1 + x..])
+                        V::load_u8(&above[1 + x..])
                             .add(side)
                             .store_u8_clamped(&mut dest[y * stride + x..]);
                     }
                 }
+                return true;
             }
+            _ => {}
+        }
+
+        // The directional predictors read runs of averages, so they work on
+        // copies padded far enough that a vector load at any run position
+        // stays in bounds. `a[i + 1]` is the scalar code's `above(i)`.
+        let mut a = [0u8; RUN];
+        a[..65].copy_from_slice(above);
+        let mut l = [0u8; RUN];
+        l[..32].copy_from_slice(left);
+
+        match mode {
             D45_PRED => {
                 // Position `i` of the run is `avg3(above(i), above(i + 1),
                 // above(i + 2))`, and the replicated last above pixel from
@@ -190,24 +222,32 @@ pub(super) unsafe fn predict_intra<V: I32x>(
             D117_PRED => {
                 // libvpx's `d117_predictor`: rows 0 and 1 from the above
                 // edge, column 0 from the left, and every later row the one
-                // two above it shifted a column right.
+                // two above it shifted a column right. So row `y` is a
+                // window into the row of its parity, extended to the left
+                // by the column-0 values that shift into it: `runs[p][bs +
+                // i]` is row `p` and `runs[p][bs - m]` is column 0 of row
+                // `p + 2 * m`, and row `y` starts at `bs - y / 2`.
                 let above_three = avg3_run::<V>(&a, 2 * bs);
                 let left_three = avg3_run::<V>(&l, bs);
                 let row0 = avg2_run::<V>(&a, 2 * bs);
-                put(dest, stride, bs, 0, &row0);
-                let mut row1 = [0u8; 32];
-                row1[0] = avg3(l[0], top_left, a[1]);
-                row1[1..bs].copy_from_slice(&above_three[..bs - 1]);
-                put(dest, stride, bs, 1, &row1);
-                for y in 2..bs {
-                    let first = if y == 2 {
+                let column = |row: usize| {
+                    if row == 2 {
                         avg3(top_left, l[0], l[1])
                     } else {
-                        left_three[y - 3]
-                    };
-                    dest[y * stride] = first;
-                    let from = (y - 2) * stride;
-                    dest.copy_within(from..from + bs - 1, y * stride + 1);
+                        left_three[row - 3]
+                    }
+                };
+                let mut runs = [[0u8; 64]; 2];
+                runs[0][bs..2 * bs].copy_from_slice(&row0[..bs]);
+                runs[1][bs] = avg3(l[0], top_left, a[1]);
+                runs[1][bs + 1..2 * bs].copy_from_slice(&above_three[..bs - 1]);
+                for parity in 0..2 {
+                    for m in 1..=(bs - 1 - parity) / 2 {
+                        runs[parity][bs - m] = column(parity + 2 * m);
+                    }
+                }
+                for y in 0..bs {
+                    put(dest, stride, bs, y, &runs[y & 1][bs - y / 2..]);
                 }
             }
             D135_PRED => {
@@ -231,24 +271,27 @@ pub(super) unsafe fn predict_intra<V: I32x>(
             _ => {
                 // D153: libvpx's `d153_predictor`. Columns 0 and 1 from the
                 // left edge, row 0 from the above one, and every later row
-                // the one above it shifted two columns right.
+                // the one above it shifted two columns right. So row `y` is
+                // the window from `2 * (bs - y)` of one run: row 0 from
+                // `2 * bs`, and before it the column 0 and column 1 values
+                // of each row in turn, interleaved.
                 let left_two = avg2_run::<V>(&l, bs);
                 let left_three = avg3_run::<V>(&l, bs);
                 let above_three = avg3_run::<V>(&a, 2 * bs);
-                let mut row0 = [0u8; 32];
-                row0[0] = avg2(top_left, l[0]);
-                row0[1] = avg3(l[0], top_left, a[1]);
-                row0[2..bs].copy_from_slice(&above_three[..bs - 2]);
-                put(dest, stride, bs, 0, &row0);
-                for y in 1..bs {
-                    dest[y * stride] = left_two[y - 1];
-                    dest[y * stride + 1] = if y == 1 {
+                let mut run = [0u8; 96];
+                run[2 * bs] = avg2(top_left, l[0]);
+                run[2 * bs + 1] = avg3(l[0], top_left, a[1]);
+                run[2 * bs + 2..3 * bs].copy_from_slice(&above_three[..bs - 2]);
+                for row in 1..bs {
+                    run[2 * (bs - row)] = left_two[row - 1];
+                    run[2 * (bs - row) + 1] = if row == 1 {
                         avg3(top_left, l[0], l[1])
                     } else {
-                        left_three[y - 2]
+                        left_three[row - 2]
                     };
-                    let from = (y - 1) * stride;
-                    dest.copy_within(from..from + bs - 2, y * stride + 2);
+                }
+                for y in 0..bs {
+                    put(dest, stride, bs, y, &run[2 * (bs - y)..]);
                 }
             }
         }

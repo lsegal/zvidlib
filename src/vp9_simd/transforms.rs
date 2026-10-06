@@ -1,11 +1,13 @@
 //! The two-dimensional inverse transforms and add-to-prediction of
 //! `vp9_dec::recon::inverse_transform_add`, with one row or column per lane.
 //!
-//! The row pass runs a group of rows at once, one per lane, so it reads its
-//! input down the columns; the column pass runs a group of columns at once
-//! and reads the row pass's output along the rows. Both passes call one
-//! [`transform`] site, so each 1-D transform is inlined once per instruction
-//! set rather than once per pass.
+//! The data flow is the AV1 transforms' (`av1_simd::transforms`): each pass
+//! gathers four rows into one lane apiece with 4x4 register transposes, runs
+//! the 1-D transform, and writes its output transposed, so the row pass
+//! leaves the intermediate's columns in rows for the column pass, which adds
+//! its output straight to the prediction. The transposes are four lanes wide,
+//! so AVX2 hosts run these through the SSE4.1 instantiation, as they do the
+//! AV1 transforms.
 
 // Loops over vectors index rather than iterate: an iterator adapter or an
 // `array::from_fn` closure over vector values is a separate function the
@@ -15,7 +17,7 @@
 
 use super::idct1d::{iadst4, iadst8, iadst16, idct4, idct8, idct16, idct32};
 use super::wide::W;
-use crate::av1_simd::vector::{I32x, MAX_LANES};
+use crate::av1_simd::vector::{I32x, Transpose4};
 use crate::vp9_dec::recon::{ADST_DCT, DCT_ADST, DCT_DCT};
 
 /// The largest input magnitude for which no intermediate value of
@@ -52,7 +54,7 @@ fn within(values: &[i32], limit: u32) -> bool {
 /// `false`, with `dest` untouched, when an ADST input exceeds its limit.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-pub(super) unsafe fn inverse_transform_add<V: I32x>(
+pub(super) unsafe fn inverse_transform_add<V: I32x + Transpose4>(
     coefficients: &[i32],
     dest: &mut [u8],
     stride: usize,
@@ -62,23 +64,17 @@ pub(super) unsafe fn inverse_transform_add<V: I32x>(
     lossless: bool,
 ) -> bool {
     unsafe {
+        if lossless {
+            iwht4x4_add::<V>(coefficients, dest, stride, eob);
+            return true;
+        }
         let (n, shift): (usize, i32) = match tx_size {
-            _ if lossless => (4, 0),
             0 => (4, 4),
             1 => (8, 5),
             2 => (16, 6),
             _ => (32, 6),
         };
-        // Every row and column group is a whole vector; the dispatcher
-        // narrows AVX2 to SSE4.1 for the 4x4 sizes so this never fails there.
-        if n < V::LANES {
-            return false;
-        }
-        if lossless {
-            iwht4x4_add::<V>(coefficients, dest, stride, eob);
-            return true;
-        }
-        if tx_type == DCT_DCT || tx_size == 3 {
+        let (rows, row_adst, column_adst) = if tx_type == DCT_DCT || tx_size == 3 {
             if eob == 1 {
                 dc_only::<V>(coefficients[0], dest, stride, n, shift);
                 return true;
@@ -94,120 +90,146 @@ pub(super) unsafe fn inverse_transform_add<V: I32x>(
                 _ if eob <= 135 => 16,
                 _ => 32,
             };
-            return inverse_2d::<V>(coefficients, dest, stride, n, rows, false, false, shift);
-        }
-        // `tx_type` names the vertical (column) transform first.
-        let (column_adst, row_adst) = match tx_type {
-            ADST_DCT => (true, false),
-            DCT_ADST => (false, true),
-            _ => (true, true),
+            (rows, false, false)
+        } else {
+            // `tx_type` names the vertical (column) transform first.
+            match tx_type {
+                ADST_DCT => (n, false, true),
+                DCT_ADST => (n, true, false),
+                _ => (n, true, true),
+            }
         };
-        inverse_2d::<V>(
-            coefficients,
+        let block = Block {
+            input: coefficients,
             dest,
             stride,
-            n,
-            n,
+            rows,
             row_adst,
             column_adst,
             shift,
-        )
-    }
-}
-
-/// The 1-D transform of size `n`, on `n` vectors of independent lanes.
-#[inline(always)]
-unsafe fn transform<V: I32x>(n: usize, adst: bool, input: &[W<V>], output: &mut [W<V>]) {
-    unsafe {
-        match (n, adst) {
-            (4, false) => idct4(input, output),
-            (4, true) => iadst4(input, output),
-            (8, false) => idct8(input, output),
-            (8, true) => iadst8(input, output),
-            (16, false) => idct16(input, output),
-            (16, true) => iadst16(input, output),
-            _ => idct32(input, output),
+        };
+        match n {
+            4 => inverse_2d_4::<V>(block),
+            8 => inverse_2d_8::<V>(block),
+            16 => inverse_2d_16::<V>(block),
+            _ => inverse_2d_32::<V>(block),
         }
     }
 }
 
-/// `inverse_2d` of the scalar reconstruction: transforms the first `rows`
-/// rows of the `n`x`n` `input` (the rest are zero), then every column, and
-/// adds `ROUND_POWER_OF_TWO(result, shift)` to `dest`.
-#[inline(always)]
-#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
-unsafe fn inverse_2d<V: I32x>(
-    input: &[i32],
-    dest: &mut [u8],
+/// One block for an `inverse_2d_*` driver.
+struct Block<'a> {
+    input: &'a [i32],
+    dest: &'a mut [u8],
     stride: usize,
-    n: usize,
+    /// How many leading rows of `input` the end-of-block position leaves
+    /// nonzero; the rest are treated as zero, as the scalar code does.
     rows: usize,
     row_adst: bool,
     column_adst: bool,
+    /// The final `ROUND_POWER_OF_TWO` shift.
     shift: i32,
-) -> bool {
-    unsafe {
-        if row_adst && !within(&input[..rows * n], adst_limit(n)) {
-            return false;
-        }
-        let lanes = V::LANES;
-        let mut middle = [0i32; 32 * 32];
-        let mut vectors_in = [W::<V>::zero(); 32];
-        let mut vectors_out = [W::<V>::zero(); 32];
-        let mut scratch = [0i32; MAX_LANES];
+}
 
-        // Two passes through one `transform` call: the rows of `input` into
-        // `middle`, then the columns of `middle` into `dest`.
-        for pass in 0..2 {
-            let (adst, groups) = if pass == 0 {
-                (row_adst, rows.div_ceil(lanes))
-            } else {
-                if column_adst && !within(&middle[..n * n], adst_limit(n)) {
+/// Gathers rows `4 * group..4 * group + 4` of the `n`-wide row-major `src`
+/// into `lanes`, one row per lane: lane `j` of `lanes[k]` is element `k` of
+/// row `4 * group + j`.
+#[inline(always)]
+unsafe fn gather_rows<V: I32x + Transpose4>(
+    src: &[i32],
+    n: usize,
+    group: usize,
+    lanes: &mut [W<V>],
+) {
+    unsafe {
+        let base = 4 * group * n;
+        for quad in 0..n / 4 {
+            let at = base + 4 * quad;
+            let tile = V::transpose4([
+                V::load(&src[at..]),
+                V::load(&src[at + n..]),
+                V::load(&src[at + 2 * n..]),
+                V::load(&src[at + 3 * n..]),
+            ]);
+            for j in 0..4 {
+                lanes[4 * quad + j] = W(tile[j]);
+            }
+        }
+    }
+}
+
+/// Defines the separable `N`x`N` inverse transform driver for one size:
+/// the first `rows` rows of the input through the row transform, then every
+/// column through the column transform, and `ROUND_POWER_OF_TWO(result,
+/// shift)` added to `dest`, as the scalar `inverse_2d` does.
+macro_rules! inverse_2d {
+    ($name:ident, $n:literal, $dct:ident, $adst:ident) => {
+        #[inline(always)]
+        unsafe fn $name<V: I32x + Transpose4>(block: Block<'_>) -> bool {
+            unsafe {
+                let Block {
+                    input,
+                    dest,
+                    stride,
+                    rows,
+                    row_adst,
+                    column_adst,
+                    shift,
+                } = block;
+                if row_adst && !within(&input[..rows * $n], adst_limit($n)) {
                     return false;
                 }
-                (column_adst, n / lanes)
-            };
-            for group in 0..groups {
-                let first = group * lanes;
-                for k in 0..n {
-                    vectors_in[k] = if pass == 0 {
-                        // Lane `j` is row `first + j`, read down column `k`.
-                        for (lane, slot) in scratch.iter_mut().enumerate().take(lanes) {
-                            let row = first + lane;
-                            *slot = if row < rows { input[row * n + k] } else { 0 };
-                        }
-                        W(V::load(&scratch))
+                let mut lanes = [W::<V>::zero(); $n];
+                let mut out = [W::<V>::zero(); $n];
+
+                // Row pass, four rows per iteration. `middle` holds the
+                // output transposed: its row `k` is column `k` of the
+                // intermediate block, whose rows past `rows` stay zero.
+                let mut middle = [0i32; $n * $n];
+                for group in 0..rows / 4 {
+                    gather_rows(input, $n, group, &mut lanes);
+                    if row_adst {
+                        $adst(&lanes, &mut out);
                     } else {
-                        // Lane `j` is column `first + j`, read along row `k`.
-                        W(V::load(&middle[k * n + first..]))
-                    };
-                }
-                transform(n, adst, &vectors_in[..n], &mut vectors_out[..n]);
-                if pass == 0 {
-                    for k in 0..n {
-                        vectors_out[k].0.store(&mut scratch);
-                        for (lane, &value) in scratch.iter().enumerate().take(lanes) {
-                            let row = first + lane;
-                            if row < n {
-                                middle[row * n + k] = value;
-                            }
-                        }
+                        $dct(&lanes, &mut out);
                     }
-                } else {
-                    let round = V::splat(1 << (shift - 1));
-                    for y in 0..n {
-                        let at = y * stride + first;
-                        let residual = vectors_out[y].0.add(round).sra_var(shift);
+                    for k in 0..$n {
+                        out[k].0.store(&mut middle[k * $n + 4 * group..]);
+                    }
+                }
+                if column_adst && !within(&middle, adst_limit($n)) {
+                    return false;
+                }
+
+                // Column pass, four columns per iteration, each output row
+                // added straight to the prediction.
+                let round = V::splat(1 << (shift - 1));
+                for group in 0..$n / 4 {
+                    gather_rows(&middle, $n, group, &mut lanes);
+                    if column_adst {
+                        $adst(&lanes, &mut out);
+                    } else {
+                        $dct(&lanes, &mut out);
+                    }
+                    for y in 0..$n {
+                        let at = y * stride + 4 * group;
+                        let residual = out[y].0.add(round).sra_var(shift);
                         V::load_u8(&dest[at..])
                             .add(residual)
                             .store_u8_clamped(&mut dest[at..]);
                     }
                 }
+                true
             }
         }
-        true
-    }
+    };
 }
+
+inverse_2d!(inverse_2d_4, 4, idct4, iadst4);
+inverse_2d!(inverse_2d_8, 8, idct8, iadst8);
+inverse_2d!(inverse_2d_16, 16, idct16, iadst16);
+// VP9 has no 32-point ADST, and the entry point never asks for one.
+inverse_2d!(inverse_2d_32, 32, idct32, idct32);
 
 /// The DC-only shortcut every DCT size takes when `eob == 1`.
 #[inline(always)]
@@ -228,8 +250,7 @@ unsafe fn dc_only<V: I32x>(dc: i32, dest: &mut [u8], stride: usize, n: usize, sh
     }
 }
 
-/// One `vpx_iwht4x4_16_add` butterfly on four vectors, after the given
-/// input shift.
+/// One `vpx_iwht4x4_16_add` butterfly on four vectors.
 #[inline(always)]
 unsafe fn wht_butterfly<V: I32x>(input: [V; 4]) -> [V; 4] {
     unsafe {
@@ -246,58 +267,46 @@ unsafe fn wht_butterfly<V: I32x>(input: [V; 4]) -> [V; 4] {
 }
 
 /// The 4x4 inverse Walsh-Hadamard transform of lossless frames, and its
-/// DC-only form. `V` has four lanes: callers narrow AVX2 to SSE4.1.
+/// DC-only form.
 #[inline(always)]
-unsafe fn iwht4x4_add<V: I32x>(input: &[i32], dest: &mut [u8], stride: usize, eob: usize) {
+unsafe fn iwht4x4_add<V: I32x + Transpose4>(
+    input: &[i32],
+    dest: &mut [u8],
+    stride: usize,
+    eob: usize,
+) {
     unsafe {
-        let mut rows = [0i32; 16];
-        if eob <= 1 {
+        let rows = if eob <= 1 {
             let mut a1 = input[0] >> 2;
             let e1 = a1 >> 1;
             a1 -= e1;
             let tmp = [a1, e1, e1, e1];
-            let mut first = [0i32; MAX_LANES];
-            let mut rest = [0i32; MAX_LANES];
+            let mut first = [0i32; 4];
+            let mut rest = [0i32; 4];
             for x in 0..4 {
                 rest[x] = tmp[x] >> 1;
                 first[x] = tmp[x] - rest[x];
             }
-            rows[..4].copy_from_slice(&first[..4]);
-            for y in 1..4 {
-                rows[y * 4..y * 4 + 4].copy_from_slice(&rest[..4]);
-            }
+            let rest = V::load(&rest);
+            [V::load(&first), rest, rest, rest]
         } else {
             // Row pass, one row per lane: tap `k` is column `k` of every row.
-            let mut scratch = [0i32; MAX_LANES];
-            let mut taps = [V::zero(); 4];
+            let mut taps = V::transpose4([
+                V::load(&input[0..]),
+                V::load(&input[4..]),
+                V::load(&input[8..]),
+                V::load(&input[12..]),
+            ]);
             for k in 0..4 {
-                for row in 0..4 {
-                    scratch[row] = input[row * 4 + k];
-                }
-                taps[k] = V::load(&scratch).sra::<2>();
-            }
-            let columns = wht_butterfly(taps);
-            for k in 0..4 {
-                columns[k].store(&mut scratch);
-                for row in 0..4 {
-                    rows[row * 4 + k] = scratch[row];
-                }
+                taps[k] = taps[k].sra::<2>();
             }
             // Column pass, one column per lane: tap `y` is row `y`.
-            let mut taps = [V::zero(); 4];
-            for y in 0..4 {
-                taps[y] = V::load(&rows[y * 4..]);
-            }
-            let columns = wht_butterfly(taps);
-            for y in 0..4 {
-                columns[y].store(&mut scratch);
-                rows[y * 4..y * 4 + 4].copy_from_slice(&scratch[..4]);
-            }
-        }
+            wht_butterfly(V::transpose4(wht_butterfly(taps)))
+        };
         for y in 0..4 {
             let at = y * stride;
             V::load_u8(&dest[at..])
-                .add(V::load(&rows[y * 4..]))
+                .add(rows[y])
                 .store_u8_clamped(&mut dest[at..]);
         }
     }

@@ -157,8 +157,11 @@ jobs:
       # frames, tiles, frame sizes from 2x2 to 1920x1080 and so on. The vectors
       # and their per-frame MD5s come from the WebM project's test-data bucket,
       # about 27 MB in all, so they are cached between runs, keyed on the list
-      # of names the test reads. One host is enough: the decoder is portable
-      # scalar code with nothing platform-specific to cover.
+      # of names the test reads. One host is enough: this one runs the widest
+      # vector kernels it detects, and every other instruction set is held to
+      # the scalar reference by the `vp9_simd` unit tests and the per-ISA
+      # fixture decode in the library units, which every native host runs
+      # (#570).
       - name: Cache the libvpx VP9 test vectors
         uses: actions/cache@v4
         with:

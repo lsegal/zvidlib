@@ -13,8 +13,9 @@
 //! The kernels are written once, generic over the 32-bit lane abstraction
 //! [`crate::av1_simd::vector::I32x`] the AV1 kernels already use, and
 //! instantiated per instruction set behind `#[target_feature]` wrappers. The
-//! 4-wide shapes (4x4 transforms, 4-pixel-wide predictions) have no useful
-//! 256-bit form, so AVX2 runs them through the SSE4.1 instantiation.
+//! transforms move data through four-lane register transposes and 4-pixel-
+//! wide predictions have no useful 256-bit form, so AVX2 runs those through
+//! the SSE4.1 instantiation.
 //!
 //! # Bit-exactness
 //!
@@ -90,6 +91,17 @@ macro_rules! simd_entry_points {
         fn [$sse:ident, $avx:ident, $neon:ident]($($arg:ident : $ty:ty),* $(,)?) $(-> $ret:ty)?
             = $module:ident::$kernel:ident;
     ) => {
+        simd_entry_points! {
+            $(#[$meta])*
+            fn [$sse, $avx, $neon]($($arg: $ty),*) $(-> $ret)?
+                = $module::$kernel, avx2 = Avx2;
+        }
+    };
+    (
+        $(#[$meta:meta])*
+        fn [$sse:ident, $avx:ident, $neon:ident]($($arg:ident : $ty:ty),* $(,)?) $(-> $ret:ty)?
+            = $module:ident::$kernel:ident, avx2 = $avx_vector:ident;
+    ) => {
         #[cfg(target_arch = "x86_64")]
         #[target_feature(enable = "sse4.1")]
         $(#[$meta])*
@@ -101,7 +113,7 @@ macro_rules! simd_entry_points {
         #[target_feature(enable = "avx2")]
         $(#[$meta])*
         unsafe fn $avx($($arg: $ty),*) $(-> $ret)? {
-            unsafe { $module::$kernel::<vector::Avx2>($($arg),*) }
+            unsafe { $module::$kernel::<vector::$avx_vector>($($arg),*) }
         }
 
         #[cfg(target_arch = "aarch64")]
@@ -136,7 +148,7 @@ simd_entry_points! {
     fn [itx_sse41, itx_avx2, itx_neon](
         coefficients: &[i32], dest: &mut [u8], stride: usize,
         tx_size: u8, tx_type: u8, eob: usize, lossless: bool
-    ) -> bool = transforms::inverse_transform_add;
+    ) -> bool = transforms::inverse_transform_add, avx2 = Sse4;
 }
 simd_entry_points! {
     #[allow(clippy::too_many_arguments)]
@@ -191,7 +203,7 @@ pub(crate) fn inverse_transform_add(
         return false;
     }
     dispatch!(
-        narrow(isa, n),
+        isa,
         [itx_sse41, itx_avx2, itx_neon](
             coefficients,
             dest,
