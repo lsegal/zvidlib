@@ -457,3 +457,35 @@ fn the_colour_range_of_a_key_frame_is_read_without_decoding_it() {
     full[4] |= 0x10;
     assert_eq!(chunk_full_range(&full), Some(true));
 }
+
+/// The 256x144 fixture remuxed to WebM (`V_VP9`, no `CodecPrivate`): the
+/// WebM demuxer indexes the same 48 chunks, describes the track with the
+/// `vpcC` box an MP4 one would carry, and they decode to libvpx's frames.
+#[test]
+fn webm_vp9_track_decodes_like_its_mp4_original() {
+    let source = crate::io::MemorySource::new(
+        include_bytes!("../../tests/fixtures/codec/vp9_bbb_256x144.webm").to_vec(),
+    );
+    let tracks = block_on(crate::container::open_tracks(&source, &Limits::default())).unwrap();
+    let track = &tracks[0];
+    assert_eq!(track.codec, crate::Codec::Vp9);
+    assert_eq!(&track.decoder_config[4..8], b"vpcC");
+    let config = crate::Vp9CodecConfig::parse(&track.decoder_config).unwrap();
+    assert_eq!((config.profile, config.bit_depth), (0, 8));
+    let samples = block_on(track.to_encoded_video_samples(&source, &Limits::default())).unwrap();
+    let mp4 = mp4_samples(BBB_256X144);
+    assert_eq!(samples.len(), mp4.len());
+    let expected = digests(include_str!(
+        "../../tests/fixtures/codec/vp9_bbb_256x144_yuv420.sha256"
+    ));
+    let mut decoder = Decoder::new(Limits::default());
+    for (index, (sample, original)) in samples.iter().zip(&mp4).enumerate() {
+        assert_eq!(sample.data, original.data, "chunk {index}");
+        assert_eq!(
+            sample.random_access, original.random_access,
+            "chunk {index}"
+        );
+        let picture = decoder.decode_chunk(&sample.data).unwrap().unwrap();
+        assert_eq!(yuv_digest(&picture), expected[index], "frame {index}");
+    }
+}
