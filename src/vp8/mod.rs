@@ -1,5 +1,6 @@
 //! Native VP8 decoding, registered as a [`VideoDecoderFactory`]: a
-//! dependency-free software decoder, and NVIDIA NVDEC where the host has it.
+//! dependency-free software decoder, and NVIDIA NVDEC or Media Foundation
+//! where the host has them.
 //!
 //! This is a complete implementation of the VP8 decoding process of RFC 6386
 //! for every bitstream version (0 to 3): the boolean entropy decoder, key-frame
@@ -22,12 +23,15 @@
 //! the calling thread.
 //!
 //! NVDEC decodes VP8 on 64-bit Windows and Linux hosts with an NVIDIA adapter
-//! whose driver reports VP8 support. Its pictures are cropped and converted to
-//! RGBA by the same code as the software decoder's, and VP8 decoding is exact,
-//! so both produce the same pixels. VideoToolbox exposes no VP8 decoder, so
-//! macOS decodes in software. Media Foundation is not used: it decodes VP8 in
-//! hardware only through a D3D11 VP8 decoder profile, which NVIDIA adapters do
-//! not expose (they decode VP8 through NVDEC alone).
+//! whose driver reports VP8 support. Where NVDEC is unavailable, Windows
+//! decodes VP8 through Media Foundation on adapters that expose the D3D11 VP8
+//! decoder profile (`D3D11_DECODER_PROFILE_VP8_VLD`), as Intel and some AMD
+//! drivers do, with an installed D3D11-aware VP8 decoder transform such as the
+//! VP9 Video Extensions'. NVIDIA drivers do not expose that profile; they
+//! decode VP8 through NVDEC alone. Either backend's pictures are cropped and
+//! converted to RGBA by the same code as the software decoder's, and VP8
+//! decoding is exact, so all three produce the same pixels. VideoToolbox
+//! exposes no VP8 decoder, so macOS decodes in software.
 
 mod bool_decoder;
 mod decoder;
@@ -53,10 +57,11 @@ use crate::{
 /// `configuration` is ignored.
 ///
 /// `Prefer` and `Require` select NVIDIA NVDEC on supported 64-bit Windows and
-/// Linux hosts. `Prefer` falls back to the dependency-free software decoder
-/// when NVDEC is unavailable, and `Require` reports
-/// [`CodecSupport::HardwareUnavailable`]. `Avoid` always selects software.
-/// Both produce the same pixels.
+/// Linux hosts, and otherwise Media Foundation on Windows hosts whose adapter
+/// exposes the D3D11 VP8 decoder profile. `Prefer` falls back to the
+/// dependency-free software decoder when neither is available, and `Require`
+/// reports [`CodecSupport::HardwareUnavailable`]. `Avoid` always selects
+/// software. All produce the same pixels.
 pub fn native_vp8_video_decoder_factory() -> impl VideoDecoderFactory {
     Vp8DecoderFactory
 }
@@ -108,26 +113,21 @@ impl VideoDecoderFactory for Vp8DecoderFactory {
         }
         if configuration.hardware != HardwarePreference::Avoid {
             #[cfg_attr(
-                not(all(any(windows, target_os = "linux"), target_pointer_width = "64")),
+                not(any(windows, all(target_os = "linux", target_pointer_width = "64"))),
                 allow(unused_mut)
             )]
             let mut hardware_errors = Vec::<String>::new();
             #[cfg(all(any(windows, target_os = "linux"), target_pointer_width = "64"))]
-            match crate::hevc::nvdec::create_vp8(
-                configuration,
-                limits,
-                |planes, configuration, limits| {
-                    let dimensions = configuration.coded_dimensions;
-                    let picture = Picture {
-                        width: dimensions.width as usize,
-                        height: dimensions.height as usize,
-                        planes,
-                    };
-                    picture_to_rgba(&picture, configuration, limits)
-                },
-            ) {
+            match crate::hevc::nvdec::create_vp8(configuration, limits, planes_to_rgba) {
                 Ok(decoder) => return Ok(decoder),
                 Err(error) => hardware_errors.push(format!("NVDEC: {}", error.message())),
+            }
+            #[cfg(windows)]
+            match crate::hevc::windows_mf::create_vp8(configuration, limits, planes_to_rgba) {
+                Ok(decoder) => return Ok(decoder),
+                Err(error) => {
+                    hardware_errors.push(format!("Media Foundation: {}", error.message()));
+                }
             }
             if configuration.hardware == HardwarePreference::Require {
                 let detail = if hardware_errors.is_empty() {
@@ -171,6 +171,10 @@ impl Vp8DecoderFactory {
 fn hardware_available(_configuration: &VideoDecoderConfig) -> bool {
     #[cfg(all(any(windows, target_os = "linux"), target_pointer_width = "64"))]
     if crate::hevc::nvdec::is_vp8_available(_configuration.coded_dimensions) {
+        return true;
+    }
+    #[cfg(windows)]
+    if crate::hevc::windows_mf::is_vp8_available(_configuration.coded_dimensions) {
         return true;
     }
     false
@@ -223,6 +227,23 @@ impl VideoDecoder for Vp8Decoder {
         // and the YUV-to-RGBA conversion are skipped.
         self.inner.set_output_wanted(wanted);
     }
+}
+
+/// Converts the cropped 4:2:0 planes a hardware decoder read back, so its pictures take exactly
+/// the software decoder's conversion.
+#[cfg(any(windows, all(target_os = "linux", target_pointer_width = "64")))]
+pub(crate) fn planes_to_rgba(
+    planes: [Vec<u8>; 3],
+    configuration: &VideoDecoderConfig,
+    limits: &Limits,
+) -> Result<VideoFrame> {
+    let dimensions = configuration.coded_dimensions;
+    let picture = Picture {
+        width: dimensions.width as usize,
+        height: dimensions.height as usize,
+        planes,
+    };
+    picture_to_rgba(&picture, configuration, limits)
 }
 
 fn picture_to_rgba(
