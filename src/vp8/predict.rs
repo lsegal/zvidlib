@@ -51,7 +51,7 @@ pub(crate) fn idct_add(coefficients: &[i16; 16], plane: &mut [u8], offset: usize
     }
 }
 
-pub(crate) fn idct_add_scalar(
+fn idct_add_scalar(
     coefficients: &[i16; 16],
     plane: &mut [u8],
     offset: usize,
@@ -100,7 +100,7 @@ pub(crate) fn inverse_walsh(input: &[i16; 16]) -> [i16; 16] {
     super::simd::inverse_walsh(input).unwrap_or_else(|| inverse_walsh_scalar(input))
 }
 
-pub(crate) fn inverse_walsh_scalar(input: &[i16; 16]) -> [i16; 16] {
+fn inverse_walsh_scalar(input: &[i16; 16]) -> [i16; 16] {
     let mut temp = [0i32; 16];
     for column in 0..4 {
         let i0 = i32::from(input[column]);
@@ -493,7 +493,7 @@ pub(crate) fn predict_inter(
 /// `(width + 5)`-wide `window`, then `vertical` into the block at
 /// `destination` of `output`.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn filter_window(
+fn filter_window(
     window: &[u8],
     width: usize,
     height: usize,

@@ -47,7 +47,14 @@
 //! AVX2 hosts run the 4x4 kernels - the transforms and SATD - through the
 //! 128-bit body, as `av1_simd` does its 4-point transforms (#342): a 4x4 block
 //! is four 4-lane rows with no 256-bit shape, and the transposes between their
-//! passes are 128-bit operations. The pixel kernels use all eight AVX2 lanes.
+//! passes are 128-bit operations. The loop filter does the same, because its
+//! eight-lane body measured slower than the four-lane one on an AVX2 host in
+//! every run (`benches/README.md`). Six-tap prediction, `TM_PRED` and
+//! quantization use all eight AVX2 lanes.
+//!
+//! The SAD measures at parity with its scalar reference on x86_64, which LLVM
+//! already compiles to the same `psadbw`; the kernel keeps that instruction
+//! from depending on the auto-vectorizer.
 
 // Targets with no vector implementation never reach the vector arms, so the
 // resulting unused-code warnings are silenced there and only there.
