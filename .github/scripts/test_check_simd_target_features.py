@@ -24,6 +24,14 @@ OUTLINED_KERNEL = (
     "NtNtNtB4_6vector3x864Avx2EB6_"
 )
 
+# `vorbis_simd::kernels::overlap_add::<vector::x86::Avx2>`, the same defect in
+# the Vorbis kernels' generic module (issue #572), mangled the way the AV1 one
+# above is.
+OUTLINED_VORBIS_KERNEL = (
+    "__RINvNtNtCs7lEMBtiCmc_7zvidlib11vorbis_simd7kernels11overlap_add"
+    "NtNtNtB4_6vector3x864Avx2EB6_"
+)
+
 # `vp8::simd::kernels::sixtap::<av1_simd::vector::x86::Avx2>`: a `vp8::simd`
 # kernel is generic over the same vector types, so the `av1_simd` component
 # its symbol carries is its vector argument's path (issue #569).
@@ -75,6 +83,13 @@ class ClassificationTest(unittest.TestCase):
 
     def test_a_generic_kernel_instantiation_is_outlined(self):
         self.assertTrue(checker.is_outlined_kernel(OUTLINED_KERNEL))
+
+    def test_a_vorbis_kernel_instantiation_is_outlined(self):
+        self.assertTrue(checker.is_outlined_kernel(OUTLINED_VORBIS_KERNEL))
+        self.assertEqual(
+            checker.readable(OUTLINED_VORBIS_KERNEL),
+            "zvidlib::vorbis_simd::kernels::overlap_add::vector::x86::Avx2",
+        )
 
     def test_a_vp8_kernel_instantiation_is_outlined(self):
         self.assertTrue(checker.is_outlined_kernel(OUTLINED_VP8_KERNEL))

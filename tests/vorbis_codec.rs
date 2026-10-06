@@ -170,6 +170,36 @@ fn several_channels_sharing_one_residue_decode_as_libvorbis_does() {
     assert_matches_libvorbis("vorbis_4ch_44k", 4, 44_100, 11_025);
 }
 
+/// The synthesis kernels have a vector arm per instruction set (issue #572),
+/// each held bit-exact with the scalar reference, so every arm this host can
+/// run decodes every fixture to the very same samples.
+#[test]
+fn every_instruction_set_decodes_to_the_same_samples() {
+    use zvidlib::simd::{self, SimdIsa};
+    for name in [
+        "vorbis_stereo_44k",
+        "vorbis_transient_mono",
+        "vorbis_6ch_48k",
+        "vorbis_4ch_44k",
+    ] {
+        let decode = |isa| {
+            simd::set_override(Some(isa));
+            let (_, mut reader) = open(&format!("{name}.ogg"));
+            let samples = read_all(&mut reader);
+            simd::set_override(None);
+            samples.iter().map(|s| s.to_bits()).collect::<Vec<_>>()
+        };
+        let scalar = decode(SimdIsa::Scalar);
+        for isa in simd::available() {
+            assert!(
+                decode(isa) == scalar,
+                "{name}: the {} arm decodes differently from scalar",
+                isa.name()
+            );
+        }
+    }
+}
+
 #[test]
 fn reads_after_seeking_return_exactly_the_continuous_decode() {
     for name in ["vorbis_stereo_44k.ogg", "vorbis_transient_mono.ogg"] {

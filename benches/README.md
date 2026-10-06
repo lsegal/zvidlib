@@ -8,7 +8,7 @@ zvidlib's benchmarks run under [criterion](https://docs.rs/criterion) with
 | `benches/codec.rs` | codec work: decode, encoder inputs, and the per-ISA SIMD groups |
 | `benches/av1_decode.rs` | the AV1 software decoder: whole-frame decode and every hot stage, scalar versus SIMD |
 | `benches/av1_encode.rs` | the native AV1 encoder: whole-frame encode, every stage, and the forward-transform kernels, scalar versus SIMD |
-| `benches/audio_decode.rs` | the audio decode path: AAC access units and `AacSampleReader` range/seek reads |
+| `benches/audio_decode.rs` | the audio decode paths: AAC access units, `AacSampleReader` range/seek reads, and the Vorbis decoder and its synthesis kernels, scalar versus SIMD |
 | `benches/audio_mux.rs` | the audio container path: MP4 muxing, sample-table growth, demux, and gapless timing |
 | `benches/hevc_encode.rs` | the pure-Rust HEVC encoder, whole-frame and per-stage |
 | `benches/hevc_decode.rs` | the HEVC software decoder: whole-frame decode and every hot stage, scalar versus SIMD |
@@ -110,12 +110,13 @@ simd::set_override(None);                  // back to per-host detection
 ```
 
 `set_override` reaches every dispatch family at once: the AV1 transforms and
-in-loop filters, AV1 motion compensation, AV1 intra prediction, and every HEVC
+in-loop filters, AV1 motion compensation, AV1 intra prediction, every HEVC
 engine kernel (inter/intra prediction, in-loop filters, inverse transforms, and
-encoder-side distortion metrics). An instruction set this host cannot execute is
-clamped to `SimdIsa::Scalar` rather than silently ignored, so the arm you asked
-for is always a defined one. `simd::active()` reports what is in force and
-`simd::available()` lists what this host can run.
+encoder-side distortion metrics), and the Vorbis decoder's synthesis kernels.
+An instruction set this host cannot execute is clamped to `SimdIsa::Scalar`
+rather than silently ignored, so the arm you asked for is always a defined one.
+`simd::active()` reports what is in force and `simd::available()` lists what
+this host can run.
 
 Groups built through `support::isa::bench_across_isas` run once per entry in
 `simd::available()` and are named `<codec>/<isa>`, so criterion compares the
@@ -2316,8 +2317,9 @@ when the table was drawn. When #389 added it, that was three rows of the Apple
 M1 table — `hevc_color_convert`, `av1_encode_stage_tile` and
 `hevc_encode_640x352_reconstruct` — and nothing on the x86_64 one. #368 re-drew
 the Apple M1 table in answer, so both tables are clean today: each is stamped at
-a commit carrying the same eleven sites the crate has now, and the report flags
-nothing.
+a commit carrying the eleven sites the crate had before `yuv_to_rgba` (#578)
+and `vorbis_decode` (#572) landed, neither has a row for either of those, and
+the report flags nothing.
 
 Reporting nothing is not the same as being current, and the x86_64 table is
 where that showed. It was clean by this check for its whole life — no site
@@ -4217,8 +4219,8 @@ assertion).
 
 ## Audio groups
 
-`benches/audio_decode.rs` measures two layers, and keeps them in separate groups
-on purpose:
+`benches/audio_decode.rs` measures three layers, and keeps them in separate
+groups on purpose:
 
 | Group | What it measures |
 | --- | --- |
@@ -4226,6 +4228,8 @@ on purpose:
 | `aac_reader_sequential` | `AacSampleReader::get_range` re-reading a resident range, and walking forward |
 | `aac_reader_seek` | random-access ranges, each forcing a decoder reset and a preroll re-decode |
 | `aac_reader_edits` | reads crossing edit-list boundaries and gapless priming/padding trims |
+| `vorbis_decode_stereo_44k`, `vorbis_decode_6ch_48k` | `NativeVorbisDecoder::decode` over every packet of a libvorbis-encoded fixture, per ISA |
+| `vorbis_imdct`, `vorbis_overlap_add`, `vorbis_coupling`, `vorbis_floor_product` | one Vorbis synthesis kernel over eight long blocks, per ISA |
 
 `AacSampleReader` keeps decoded packets in a `BTreeMap`, so the same call costs
 two very different things depending on whether the requested media range is
@@ -4234,13 +4238,12 @@ all — and everything in `aac_reader_seek` is the cold path. Reporting them
 together would average the seek cost away, and the seek cost is the one that
 shows up as an audible stall.
 
-These groups carry **no `simd=` tag and no per-ISA arms**. AAC decoding is
+The AAC groups carry **no `simd=` tag and no per-ISA arms**. AAC decoding is
 delegated to AudioToolbox on macOS, to Media Foundation on Windows, and to the
 third-party `symphonia-codec-aac` crate on Linux; `zvidlib::simd`'s override
-reaches none of them, and the crate has no audio SIMD kernels of its own, so a
-scalar arm and a vector arm would be the same code reported twice. Because the
-decoder differs by platform, so do these groups' numbers: the Linux benchmark
-runners measure Symphonia.
+reaches none of them, so a scalar arm and a vector arm would be the same code
+reported twice. Because the decoder differs by platform, so do these groups'
+numbers: the Linux benchmark runners measure Symphonia.
 
 The mono fixture exists because the bundled sample is stereo and carries no edit
 list, while `NativeAacDecoder` accepts AAC-LC mono as well (and rejects
@@ -4250,3 +4253,59 @@ sample does not have.
 
 Every bench target shares `benches/support/`, so each one leaves some of its
 helpers unused; the module allows `dead_code` for that reason.
+
+### The Vorbis groups
+
+The Vorbis decoder is this crate's own (vendored from Symphonia in
+`src/vorbis_decoder/`), and its inverse MDCT, windowed overlap-add and output
+clamp, inverse coupling and floor-times-residue product dispatch through the
+`vorbis_decode` site in `src/vorbis_simd/` (issue #572). Its groups are built
+through `support::isa::bench_audio_across_isas`, the sample-clock counterpart
+of `bench_across_isas`: one `<group>/<isa>` arm per available instruction set,
+the same bit-exactness guard before anything is timed, and the same per-site
+override assertion, reported in samples/sec and x-realtime rather than
+megapixels.
+
+The whole-stream groups decode the fixtures `tests/vorbis_codec.rs` checks
+against libvorbis's own decode: half a second of 44.1 kHz stereo music, and a
+quarter second of 48 kHz 5.1 whose mapping couples one channel in several
+steps. The per-stage groups come from `zvidlib::vorbis_decoder_bench`, a narrow
+public surface over the otherwise crate-private kernels. They run over eight
+2048-sample long blocks, so each stage's working set stays in L2 the way the
+decoder's does, and fold their output into eight bytes for the guard.
+
+The IMDCT is the crate's own rather than `symphonia_core`'s. Symphonia's only
+vector FFT is `rustfft`'s, behind its `opt-simd` feature, which picks its own
+instruction set where `zvidlib::simd::set_override` cannot reach it and does
+not round like its scalar FFT, so it would break both the scalar arm and the
+bit-exactness every per-ISA group asserts.
+
+Measured on an **Intel Core i9-10850K (Windows 11, x86_64)** while the host was
+about half busy with other work, so criterion's means wandered by tens of
+percent between runs. The table is therefore the minimum of 2,000 interleaved
+rounds per arm rather than a criterion draw: a contended round can only be
+slower, and interleaving the arms gives each the same contention.
+
+| Group | `scalar` | `sse4.1` | `avx2` |
+| --- | ---: | ---: | ---: |
+| `vorbis_imdct` | 34.1 µs | 26.1 µs (1.31x) | 20.2 µs (1.69x) |
+| `vorbis_overlap_add` | 4.8 µs | 4.9 µs (0.98x) | 3.7 µs (1.30x) |
+| `vorbis_coupling` | 12.0 µs | 9.0 µs (1.33x) | 6.9 µs (1.74x) |
+| `vorbis_floor_product` | 3.5 µs | 3.5 µs (1.00x) | 3.3 µs (1.06x) |
+| `vorbis_decode_stereo_44k` | 561.6 µs | 510.0 µs (1.10x) | 455.9 µs (1.23x) |
+| `vorbis_decode_6ch_48k` | 1022.4 µs | 917.1 µs (1.11x) | 872.5 µs (1.17x) |
+
+The IMDCT and coupling gain the most: their scalar loops either branch per
+sample (coupling) or interleave and reverse their data (the IMDCT's twiddles),
+which the compiler does not vectorize. The overlap-add and the floor product are
+already vectorized at the SSE2 baseline by the compiler, so their `sse4.1` arms
+can only match them and `avx2` gains only its width; the FFT stages in the
+middle of the IMDCT are the same case, which is why it is not faster still. A
+whole-stream decode moves by less than the stages do because most of a Vorbis
+packet is bit unpacking, floor curve synthesis and residue decode, which are
+serial and are not part of these kernels.
+
+Interleaving the decoded planes into the `f32` PCM a `NativeVorbisDecoder`
+returns was the third candidate #572 named, conditional on a profile. It is not
+vectorized: replacing Symphonia's interleaving copy with a direct one moved the
+whole-stream groups by about 1%, inside the noise of this host.
