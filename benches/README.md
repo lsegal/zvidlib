@@ -182,6 +182,55 @@ cargo bench --bench av1_decode -- 'av1_deblock/scalar'
 cargo bench --bench av1_decode -- av1_inverse   # every inverse-transform group
 ```
 
+## The VP8 decoder suite (`--bench vp8_decode`)
+
+`benches/vp8_decode.rs` measures the pure-Rust VP8 software decoder end to end
+and per hot stage (issue #568). Every group is a per-ISA group reaching the
+`vp8_decode` dispatch site, whose kernels live in `src/vp8/simd.rs`.
+
+| Group | Stage |
+| --- | --- |
+| `vp8_decode_720p` | whole-frame decode of a synthetic 1280x720 stream (one key frame, seven inter frames with quarter-sample motion) from the native VP8 encoder |
+| `vp8_decode_conformance` | whole-frame decode of all 18 `vp80-00-comprehensive` vectors |
+| `vp8_inverse_transform` | inverse WHT, inverse DCT and its DC-only shortcut, added to the prediction |
+| `vp8_inter_pred_sixtap`, `vp8_inter_pred_bilinear` | sub-pixel prediction of 16x16, 8x8 and 4x4 blocks |
+| `vp8_intra_pred` | 16x16 and 8x8 TM prediction and the ten 4x4 subblock modes |
+| `vp8_loop_filter_normal`, `vp8_loop_filter_simple` | the two loop filters over a whole 1280x720 frame |
+
+The whole-frame groups include the boolean entropy decoder, which is serial
+and has no vector path, and neither converts to RGBA (the shared
+`convert_to_rgba8` is tracked separately), so their ratios sit below the
+per-stage ones. The per-stage inputs come from `zvidlib::vp8_decoder_bench`.
+
+Two runs on one AMD64 Windows desktop with AVX2 at the commit that added the
+suite; the host was not idle, so the whole-frame arms in particular moved
+between runs. Times are criterion's point estimates, ratios against `scalar`
+of the same run.
+
+| Group | `scalar` | `sse4.1` | `avx2` |
+| --- | ---: | ---: | ---: |
+| `vp8_decode_720p` (run 1) | 226.7 ms | 131.8 ms (1.72x) | 92.6 ms (2.45x) |
+| `vp8_decode_720p` (run 2) | 152.6 ms | 160.9 ms (0.95x, ±20%) | 71.6 ms (2.13x) |
+| `vp8_decode_conformance` (run 2) | 680.6 ms | 459.6 ms (1.48x) | 631.7 ms (1.08x) |
+| `vp8_inverse_transform` | 3.66 ms | 2.99 ms (1.22x) | 2.97 ms (1.23x) |
+| `vp8_inter_pred_sixtap` | 11.10 ms | 4.69 ms (2.37x) | 3.84 ms (2.89x) |
+| `vp8_inter_pred_bilinear` | 11.02 ms | 4.16 ms (2.65x) | 3.79 ms (2.91x) |
+| `vp8_intra_pred` | 6.72 ms | 3.84 ms (1.75x) | 3.67 ms (1.83x) |
+| `vp8_loop_filter_normal` | 11.41 ms | 7.19 ms (1.59x) | 5.99 ms (1.91x) |
+| `vp8_loop_filter_simple` | 5.03 ms | 3.60 ms (1.40x) | 3.43 ms (1.47x) |
+
+The per-stage rows are run 2. The 4x4 kernels (the inverse transforms and the
+subblock predictors) have no 8-lane shape, so their AVX2 arm runs the 4-lane
+kernel compiled with AVX2 enabled and reads the same as SSE4.1. A first cut of
+the subblock predictor in 32-bit lanes measured 0.65x of scalar in isolation;
+it now works on the block's 16 bytes at once (`pavgb`/`pshufb`, NEON
+`vrhadd`/`vtbl`), which is what turned `vp8_intra_pred` from 0.91x into a gain.
+
+```sh
+cargo bench --features native --bench vp8_decode -- 'vp8_loop_filter_normal/scalar'
+cargo bench --features native --bench vp8_decode -- vp8_inter_pred
+```
+
 ## The AV1 encoder suite (`--bench av1_encode`)
 
 `benches/av1_encode.rs` measures the native AV1 encoder on two axes: whole-frame
