@@ -278,3 +278,26 @@ ffmpeg -c:v libvpx -i vp8_altref_98x66.ivf -f framemd5 - | grep -v '^#' \
 `src/vp8/tests.rs` compares every shown frame with libvpx's digest, and
 `tests/vp8_conformance.rs` holds a hardware VP8 decoder, where the host has
 one, to the software decoder's output and exact-frame seeks on it.
+
+`vp8/vp8_altref_98x66.webm` is a two-pass VP8 WebM encode of `testsrc2` with
+alternate references: 43 WebM blocks, three of which are hidden alternate
+reference frames (`show_frame` = 0) stored as blocks of their own, at the
+timestamp of the shown frame after them. `vp8_altref_98x66.webm.md5` is
+libvpx's decode of its 40 shown frames, one MD5 of each frame's I420 output per
+line. They were generated offline with
+
+```sh
+for pass in 1 2; do
+  ffmpeg -f lavfi -i "testsrc2=size=98x66:rate=25" -t 1.6 -c:v libvpx -g 16 \
+    -auto-alt-ref 1 -lag-in-frames 16 -b:v 300k -deadline good -pass $pass \
+    vp8_altref_98x66.webm
+done
+ffmpeg -c:v libvpx -i vp8_altref_98x66.webm -f framemd5 - | grep -v '^#' \
+  | awk -F', *' '{print $6}' > vp8_altref_98x66.webm.md5
+```
+
+(the first pass may write to the null muxer instead). `src/vp8/tests.rs`
+checks that `WebmDemuxer` presents only the shown frames and that each matches
+libvpx's digest, and `tests/vp8_conformance.rs` and the browser tests in
+`src/web_decoder.rs` read every shown frame back in sequential, reverse and
+alternating order, decoding through the hidden ones.
