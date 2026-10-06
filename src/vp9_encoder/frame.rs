@@ -292,6 +292,48 @@ struct PlaneCoding {
     bits: f64,
 }
 
+/// The cost a candidate has to stay under to be chosen, and what the planes
+/// coded before this one and its symbols already add to it.
+///
+/// A candidate's cost is `error + lambda * bits` over its planes and symbols,
+/// and coding more transform blocks only adds to both, so a plane whose cost
+/// so far reaches `best` cannot be chosen and is not coded further. The sum
+/// is formed as the candidate's full cost is, so the comparison is exact.
+///
+/// `ceiling` bounds the whole block's cost instead, for an intra candidate
+/// competing with an inter one: whatever else it codes, an intra block costs
+/// at least its luma error and luma symbols, so it cannot be chosen once
+/// those exceed the inter block's cost.
+#[derive(Clone, Copy)]
+struct Bound {
+    best: f64,
+    error: u64,
+    bits: f64,
+    symbol_bits: f64,
+    ceiling: f64,
+}
+
+impl Bound {
+    /// A bound on `best` alone.
+    fn under(best: f64, symbol_bits: f64) -> Self {
+        Self {
+            best,
+            error: 0,
+            bits: 0.0,
+            symbol_bits,
+            ceiling: f64::INFINITY,
+        }
+    }
+
+    /// Whether a plane coded so far as `coding` takes the candidate out of
+    /// contention.
+    fn reached(&self, lambda: f64, coding: &PlaneCoding) -> bool {
+        let error = (self.error + coding.error) as f64;
+        error + lambda * ((self.bits + coding.bits) + self.symbol_bits) >= self.best
+            || error + lambda * self.symbol_bits > self.ceiling
+    }
+}
+
 /// The best luma mode and transform size found so far.
 struct LumaCandidate {
     cost: f64,
@@ -443,7 +485,7 @@ impl<'a> FrameEncoder<'a> {
                 // of the chosen partition in place, and the contexts are
                 // replayed as the superblock is written.
                 let contexts = self.save_contexts(mi_col, 3);
-                let (node, _) = self.search_partition(mi_row, mi_col, 3);
+                let (node, _) = self.search_partition(mi_row, mi_col, 3, f64::INFINITY);
                 self.restore_contexts(mi_col, 3, &contexts);
                 self.write_partition(&mut writer, &node, mi_row, mi_col, 3);
             }
@@ -620,7 +662,20 @@ impl<'a> FrameEncoder<'a> {
     /// Chooses how to code the square of `bsl` at `(mi_row, mi_col)`, leaving
     /// its reconstruction, mode information and contexts in place; returns
     /// the decision with its cost.
-    fn search_partition(&mut self, mi_row: usize, mi_col: usize, bsl: usize) -> (Node, f64) {
+    ///
+    /// Only a cost under `budget` can change the caller's decision, so once
+    /// the cost is known to reach it the search stops and returns an infinite
+    /// cost; the caller then discards the decision. Costs are never negative,
+    /// so the quadrants of a split stop being searched as soon as those coded
+    /// so far reach the cost of the whole block or the budget: the decisions
+    /// are those of the full search.
+    fn search_partition(
+        &mut self,
+        mi_row: usize,
+        mi_col: usize,
+        bsl: usize,
+        budget: f64,
+    ) -> (Node, f64) {
         if mi_row >= self.geometry.mi_rows || mi_col >= self.geometry.mi_cols {
             return (Node::Outside, 0.0);
         }
@@ -646,27 +701,35 @@ impl<'a> FrameEncoder<'a> {
         if let Some(before) = &before {
             self.restore_block(mi_row, mi_col, bsl, before);
         }
+        let bound = best
+            .as_ref()
+            .map_or(budget, |&(_, whole_cost)| whole_cost.min(budget));
         let mut total =
             self.lambda * cost(|sink| self.partition_symbol(sink, mi_row, mi_col, bsl, true));
         let half = 1 << (bsl - 1);
-        let quadrants = [
+        let origins = [
             (mi_row, mi_col),
             (mi_row, mi_col + half),
             (mi_row + half, mi_col),
             (mi_row + half, mi_col + half),
-        ]
-        .map(|(row, col)| {
-            let (node, cost) = self.search_partition(row, col, bsl - 1);
+        ];
+        let mut quadrants = [const { Node::Outside }; 4];
+        for (quadrant, (row, col)) in quadrants.iter_mut().zip(origins) {
+            if total >= bound {
+                break;
+            }
+            let (node, cost) = self.search_partition(row, col, bsl - 1, bound - total);
             total += cost;
-            node
-        });
+            *quadrant = node;
+        }
+        let over_budget = |cost: f64| if cost < budget { cost } else { f64::INFINITY };
         match best {
             Some((node, whole_cost)) if whole_cost <= total => {
                 let after = after_whole.expect("saved after coding the block whole");
                 self.restore_block(mi_row, mi_col, bsl, &after);
-                (node, whole_cost)
+                (node, over_budget(whole_cost))
             }
-            _ => (Node::Split(Box::new(quadrants)), total),
+            _ => (Node::Split(Box::new(quadrants)), over_budget(total)),
         }
     }
 
@@ -882,16 +945,18 @@ impl<'a> FrameEncoder<'a> {
         {
             return inter.clone();
         }
-        let intra = self.choose_intra(mi_row, mi_col, bsl, neighbors);
-        match inter {
-            Some(inter) if inter.cost < intra.cost => inter,
-            _ => intra,
+        let ceiling = inter.as_ref().map_or(f64::INFINITY, |inter| inter.cost);
+        match self.choose_intra(mi_row, mi_col, bsl, neighbors, ceiling) {
+            Some(intra) if inter.as_ref().is_none_or(|inter| intra.cost <= inter.cost) => intra,
+            _ => inter.expect("intra is only ruled out by an inter candidate"),
         }
     }
 
     /// Codes one plane of a block with `tx_size` transforms (the plane's own
     /// size), predicting each transform block first with `intra` when given;
-    /// an inter prediction is already in place.
+    /// an inter prediction is already in place. Returns `None`, leaving the
+    /// plane part coded, once the candidate's cost reaches `bound`.
+    #[allow(clippy::too_many_arguments)]
     fn code_plane(
         &mut self,
         plane: usize,
@@ -900,7 +965,8 @@ impl<'a> FrameEncoder<'a> {
         bsl: usize,
         tx_size: usize,
         intra: Option<IntraMode>,
-    ) -> PlaneCoding {
+        bound: Option<Bound>,
+    ) -> Option<PlaneCoding> {
         let ss = usize::from(plane > 0);
         let n4 = (2 << bsl) >> ss;
         let step = 1 << tx_size;
@@ -944,9 +1010,12 @@ impl<'a> FrameEncoder<'a> {
                 coding.blocks.push(block);
                 coding.error += error;
                 coding.bits += bits;
+                if bound.is_some_and(|bound| bound.reached(self.lambda, &coding)) {
+                    return None;
+                }
             }
         }
-        coding
+        Some(coding)
     }
 
     /// Quantizes, dequantizes and reconstructs one transform block in place;
@@ -1099,13 +1168,16 @@ impl<'a> FrameEncoder<'a> {
         (block, error, counter.0)
     }
 
+    /// The best intra coding of the block, or `None` if it cannot cost
+    /// `ceiling` or less.
     fn choose_intra(
         &mut self,
         mi_row: usize,
         mi_col: usize,
         bsl: usize,
         neighbors: Neighbors,
-    ) -> BlockChoice {
+        ceiling: f64,
+    ) -> Option<BlockChoice> {
         // The luma mode is chosen with the largest transform, whose prediction
         // reads only the block's own edges, and the smaller transforms are
         // then tried with that mode, from the largest down, for as long as
@@ -1116,14 +1188,29 @@ impl<'a> FrameEncoder<'a> {
                         best_luma: &mut Option<LumaCandidate>,
                         tx_size: u8,
                         mode: IntraMode| {
-            let coding =
-                encoder.code_plane(0, mi_row, mi_col, bsl, usize::from(tx_size), Some(mode));
-            let bits = coding.bits
-                + cost(|sink| {
-                    encoder.tx_size_symbol(sink, neighbors, bsl, tx_size);
-                    encoder.y_mode_symbol(sink, neighbors, bsl, mode);
-                });
-            let total = coding.error as f64 + encoder.lambda * bits;
+            let symbol_bits = cost(|sink| {
+                encoder.tx_size_symbol(sink, neighbors, bsl, tx_size);
+                encoder.y_mode_symbol(sink, neighbors, bsl, mode);
+            });
+            let bound = Bound {
+                ceiling,
+                ..Bound::under(
+                    best_luma.as_ref().map_or(f64::INFINITY, |best| best.cost),
+                    symbol_bits,
+                )
+            };
+            let Some(coding) = encoder.code_plane(
+                0,
+                mi_row,
+                mi_col,
+                bsl,
+                usize::from(tx_size),
+                Some(mode),
+                Some(bound),
+            ) else {
+                return false;
+            };
+            let total = coding.error as f64 + encoder.lambda * (coding.bits + symbol_bits);
             let improves = best_luma.as_ref().is_none_or(|best| total < best.cost);
             if improves {
                 *best_luma = Some(LumaCandidate {
@@ -1139,7 +1226,7 @@ impl<'a> FrameEncoder<'a> {
         for mode in IntraMode::ALL {
             try_luma(self, &mut best_luma, max_tx_size, mode);
         }
-        let y_mode = best_luma.as_ref().expect("an intra mode is evaluated").mode;
+        let y_mode = best_luma.as_ref()?.mode;
         for tx_size in (0..max_tx_size).rev() {
             if !try_luma(self, &mut best_luma, tx_size, y_mode) {
                 break;
@@ -1150,15 +1237,36 @@ impl<'a> FrameEncoder<'a> {
             pixels: luma_pixels,
             coding: luma,
             ..
-        } = best_luma.expect("an intra mode is evaluated");
+        } = best_luma?;
+        let luma_symbol_bits = cost(|sink| {
+            self.tx_size_symbol(sink, neighbors, bsl, tx_size);
+            self.y_mode_symbol(sink, neighbors, bsl, y_mode);
+        });
+        if luma.error as f64 + self.lambda * luma_symbol_bits > ceiling {
+            return None;
+        }
 
         let uv_tx_size = plane_tx_size(tx_size, bsl, 1);
         let mut best_uv: Option<ChromaCandidate> = None;
         for mode in IntraMode::ALL {
-            let codings = [1, 2]
-                .map(|plane| self.code_plane(plane, mi_row, mi_col, bsl, uv_tx_size, Some(mode)));
-            let bits = codings.iter().map(|coding| coding.bits).sum::<f64>()
-                + cost(|sink| self.uv_mode_symbol(sink, y_mode, mode));
+            let symbol_bits = cost(|sink| self.uv_mode_symbol(sink, y_mode, mode));
+            let mut bound = best_uv
+                .as_ref()
+                .map(|best| Bound::under(best.0, symbol_bits));
+            let Some(u) = self.code_plane(1, mi_row, mi_col, bsl, uv_tx_size, Some(mode), bound)
+            else {
+                continue;
+            };
+            if let Some(bound) = &mut bound {
+                bound.error += u.error;
+                bound.bits += u.bits;
+            }
+            let Some(v) = self.code_plane(2, mi_row, mi_col, bsl, uv_tx_size, Some(mode), bound)
+            else {
+                continue;
+            };
+            let codings = [u, v];
+            let bits = codings.iter().map(|coding| coding.bits).sum::<f64>() + symbol_bits;
             let error: u64 = codings.iter().map(|coding| coding.error).sum();
             let total = error as f64 + self.lambda * bits;
             if best_uv.as_ref().is_none_or(|best| total < best.0) {
@@ -1187,7 +1295,7 @@ impl<'a> FrameEncoder<'a> {
             self.uv_mode_symbol(sink, y_mode, uv_mode);
         });
         let error = luma.error + u.error + v.error;
-        BlockChoice {
+        Some(BlockChoice {
             info: ModeInfo {
                 is_inter: false,
                 mode: y_mode as u8,
@@ -1200,7 +1308,7 @@ impl<'a> FrameEncoder<'a> {
             blocks: [luma.blocks, u.blocks, v.blocks],
             pixels: [luma_pixels, u_pixels, v_pixels],
             cost: error as f64 + self.lambda * (header_bits + token_bits),
-        }
+        })
     }
 
     /// The `NEARESTMV` and `NEARMV` candidates and the inter mode context, as
@@ -1479,7 +1587,17 @@ impl<'a> FrameEncoder<'a> {
                     self.load_pixels(0, mi_row, mi_col, bsl, &predicted[0]);
                 }
                 let uv_tx_size = plane_tx_size(tx_size, bsl, 1);
-                let luma = self.code_plane(0, mi_row, mi_col, bsl, usize::from(tx_size), None);
+                let header_bits = cost(|sink| {
+                    self.skip_symbol(sink, neighbors, false);
+                    self.tx_size_symbol(sink, neighbors, bsl, tx_size);
+                }) + mode_bits;
+                let bound = best
+                    .as_ref()
+                    .map(|best| Bound::under(best.cost, header_bits));
+                let tx = usize::from(tx_size);
+                let Some(luma) = self.code_plane(0, mi_row, mi_col, bsl, tx, None, bound) else {
+                    continue;
+                };
                 let [u, v] = match &chroma {
                     Some((size, codings, pixels)) if *size == uv_tx_size => {
                         for (plane, pixels) in [1, 2].into_iter().zip(pixels) {
@@ -1493,8 +1611,10 @@ impl<'a> FrameEncoder<'a> {
                                 self.load_pixels(plane, mi_row, mi_col, bsl, &predicted[plane]);
                             }
                         }
+                        // Not bounded: the coding is kept for other sizes.
                         let codings = [1, 2].map(|plane| {
-                            self.code_plane(plane, mi_row, mi_col, bsl, uv_tx_size, None)
+                            self.code_plane(plane, mi_row, mi_col, bsl, uv_tx_size, None, None)
+                                .expect("an unbounded plane is coded whole")
                         });
                         let pixels =
                             [1, 2].map(|plane| self.block_pixels(plane, mi_row, mi_col, bsl));
@@ -1510,10 +1630,6 @@ impl<'a> FrameEncoder<'a> {
                     // Coded empty, this is the skipped block already tried.
                     continue;
                 }
-                let header_bits = cost(|sink| {
-                    self.skip_symbol(sink, neighbors, false);
-                    self.tx_size_symbol(sink, neighbors, bsl, tx_size);
-                }) + mode_bits;
                 let token_bits: f64 = codings.iter().map(|coding| coding.bits).sum();
                 let error: u64 = codings.iter().map(|coding| coding.error).sum();
                 let total = error as f64 + self.lambda * (header_bits + token_bits);
