@@ -216,7 +216,10 @@ impl VorbisDecoder {
                 (&mut b[0], &mut a[coupling.angle_ch as usize])
             };
 
-            vorbis_simd::inverse_coupling(&mut magnitude_ch.residue[..n2], &mut angle_ch.residue[..n2]);
+            vorbis_simd::inverse_coupling(
+                &mut magnitude_ch.residue[..n2],
+                &mut angle_ch.residue[..n2],
+            );
         }
 
         // Section 4.3.6 - Dot Product

@@ -1,6 +1,7 @@
-//! Criterion benchmarks for the AAC decode path and the exact-range reader.
+//! Criterion benchmarks for the audio decode paths: AAC through Symphonia and
+//! the exact-range reader, and the crate's own Vorbis decoder.
 //!
-//! Two things are measured here, and keeping them apart is the point of the
+//! Three things are measured here, and keeping them apart is the point of the
 //! group layout:
 //!
 //! 1. [`NativeAacDecoder::decode`] over a fixed run of AAC-LC access units, in
@@ -18,33 +19,42 @@
 //!    that forces a decoder reset plus a preroll re-decode are three separate
 //!    groups. Averaging them together would hide the seek
 //!    cost entirely, which is the one that shows up as an audible stall.
+//! 3. [`NativeVorbisDecoder::decode`] over whole libvorbis-encoded streams, and
+//!    each of the Vorbis synthesis kernels on its own, scalar against every
+//!    vector instruction set the host has (issue #572).
 //!
-//! # No scalar-versus-SIMD axis
+//! # Which groups have a scalar-versus-SIMD axis
 //!
-//! Unlike the groups in `benches/codec.rs`, nothing here runs once per
-//! instruction set and the group names carry no `simd=` tag. AAC decoding is
-//! delegated to the third-party `symphonia-codec-aac` crate, the process-wide
-//! override in `zvidlib::simd` does not reach it, and this crate has no audio
-//! SIMD kernels of its own - so a scalar arm and a vector arm would be the same
-//! code producing two identical numbers. If Symphonia's own performance turns
-//! out to bound playback, that is a dependency-level finding for its own
-//! ticket rather than an axis to add here.
+//! The Vorbis groups do, and are named `<group>/<isa>` like the per-ISA
+//! groups in `benches/codec.rs`: the decoder and its kernels are this crate's
+//! own, dispatched through the `vorbis_decode` site of `zvidlib::simd`, so
+//! each arm runs different code and the bit-exactness guard checks they agree
+//! before any arm is timed.
+//!
+//! The AAC groups do not, and their names carry no `simd=` tag. AAC decoding
+//! is delegated to the third-party `symphonia-codec-aac` crate, the
+//! process-wide override in `zvidlib::simd` does not reach it, and so a scalar
+//! arm and a vector arm would be the same code producing two identical
+//! numbers. If Symphonia's own performance turns out to bound playback, that
+//! is a dependency-level finding for its own ticket rather than an axis to add
+//! here.
 
 mod support;
 
-use support::isa::log_host_isas;
+use support::isa::{AudioIsaWorkload, bench_audio_across_isas, log_host_isas};
 
 use std::hint::black_box;
 use std::time::Instant;
 
 use criterion::measurement::WallTime;
 use criterion::{BenchmarkGroup, Criterion, criterion_group, criterion_main};
+use zvidlib::vorbis_decoder_bench::{self, VorbisStageInputs};
 use zvidlib::{
     AacDecoder, AacSampleReader, AudioEdit, AudioTrackTiming, CancellationToken,
-    EncodedAudioSample, Limits, NativeAacDecoder, SampleRange,
+    EncodedAudioSample, Limits, NativeAacDecoder, NativeVorbisDecoder, SampleRange,
 };
 
-use support::{AudioWork, BundledAacTrack, report_audio_throughput};
+use support::{AudioWork, BundledAacTrack, VorbisFixture, report_audio_throughput};
 
 /// Access units decoded per iteration of the raw-decode group.
 ///
@@ -307,6 +317,66 @@ fn aac_reader_edits(criterion: &mut Criterion) {
     group.finish();
 }
 
+/// Whole-stream Vorbis decode, stereo and 5.1, scalar against each ISA.
+///
+/// An iteration decodes every packet of the fixture from a reset decoder, so
+/// it is the decoder's whole per-packet work - bit unpacking,
+/// floor and residue decode, and the synthesis kernels - plus the interleave
+/// into the returned buffer.
+fn vorbis_decode(criterion: &mut Criterion) {
+    vorbis_decode_arm(
+        criterion,
+        "vorbis_decode_stereo_44k",
+        support::vorbis_stereo_fixture(),
+    );
+    vorbis_decode_arm(
+        criterion,
+        "vorbis_decode_6ch_48k",
+        support::vorbis_surround_fixture(),
+    );
+}
+
+fn vorbis_decode_arm(criterion: &mut Criterion, group: &str, fixture: &VorbisFixture) {
+    let cancellation = CancellationToken::new();
+    let mut decoder = NativeVorbisDecoder::new(&fixture.config, Limits::default())
+        .expect("the fixture's configuration is one the native decoder accepts");
+    let workload = AudioIsaWorkload::new(group, fixture.work());
+    bench_audio_across_isas(criterion, &workload, || {
+        decoder
+            .reset()
+            .expect("resetting a Vorbis decoder succeeds");
+        let mut fold = 0_u64;
+        for packet in &fixture.packets {
+            let buffer = decoder
+                .decode(black_box(packet), &cancellation)
+                .expect("the fixture's packets decode");
+            fold = fold.rotate_left(7) ^ vorbis_decoder_bench::fold(&buffer.samples);
+        }
+        fold.to_le_bytes().to_vec()
+    });
+}
+
+/// Each Vorbis synthesis kernel alone, over eight long blocks of synthetic
+/// content, so a change in `vorbis_decode` can be attributed to a stage.
+fn vorbis_stages(criterion: &mut Criterion) {
+    let mut inputs = VorbisStageInputs::new();
+    // One channel's worth of output samples per run, at 44.1 kHz.
+    let work = AudioWork::new(inputs.samples_per_run(), 44_100, 1);
+    type Stage = fn(&mut VorbisStageInputs) -> u64;
+    let stages: [(&str, Stage); 4] = [
+        ("vorbis_imdct", VorbisStageInputs::run_imdct),
+        ("vorbis_overlap_add", VorbisStageInputs::run_overlap_add),
+        ("vorbis_coupling", VorbisStageInputs::run_coupling),
+        ("vorbis_floor_product", VorbisStageInputs::run_floor_product),
+    ];
+    for (group, stage) in stages {
+        let workload = AudioIsaWorkload::new(group, work);
+        bench_audio_across_isas(criterion, &workload, || {
+            stage(&mut inputs).to_le_bytes().to_vec()
+        });
+    }
+}
+
 /// Builds an [`AacSampleReader`] over a demuxed fixture.
 ///
 /// The packets are cloned because the reader owns them; that happens once per
@@ -430,6 +500,7 @@ fn report_realtime<T>(id: &str, work: AudioWork, run: &mut impl FnMut() -> T) {
 criterion_group! {
     name = audio;
     config = main_criterion();
-    targets = log_host_isas, aac_decode, aac_reader_sequential, aac_reader_seek, aac_reader_edits
+    targets = log_host_isas, aac_decode, aac_reader_sequential, aac_reader_seek, aac_reader_edits,
+        vorbis_decode, vorbis_stages
 }
 criterion_main!(audio);

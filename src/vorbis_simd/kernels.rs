@@ -9,6 +9,16 @@
 //! Every generic kernel is `#[inline(always)]`. That is a codegen requirement,
 //! not a speed hint: see the note on the entry points in [`super`].
 
+// Symphonia
+// Copyright (c) 2019-2022 The Project Symphonia Developers.
+//
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+// The scalar references are Symphonia's (`symphonia-codec-vorbis` 0.5.5 and
+// `symphonia-core` 0.5.5's IMDCT), restructured for this crate's vector kernels.
+
 use super::imdct::Plan;
 use super::vector::F32x;
 
@@ -40,18 +50,19 @@ pub(crate) unsafe fn overlap_add<V: F32x>(
     win: &[f32],
     win_rev: &[f32],
 ) {
-    let len = out.len();
-    let whole = len - len % V::LANES;
-    let mut i = 0;
-    while i < whole {
+    let whole = out.len() - out.len() % V::LANES;
+    let lanes = V::LANES;
+    for ((((out, s0), s1), w0), w1) in out[..whole]
+        .chunks_exact_mut(lanes)
+        .zip(left.chunks_exact(lanes))
+        .zip(right.chunks_exact(lanes))
+        .zip(win_rev.chunks_exact(lanes))
+        .zip(win.chunks_exact(lanes))
+    {
         unsafe {
-            let s0 = V::load(&left[i..]);
-            let s1 = V::load(&right[i..]);
-            let w0 = V::load(&win_rev[i..]);
-            let w1 = V::load(&win[i..]);
-            s0.mul(w0).add(s1.mul(w1)).store(&mut out[i..]);
+            let (s0, s1, w0, w1) = (V::load(s0), V::load(s1), V::load(w0), V::load(w1));
+            s0.mul(w0).add(s1.mul(w1)).store(out);
         }
-        i += V::LANES;
     }
     overlap_add_scalar(
         &mut out[whole..],
@@ -72,19 +83,12 @@ pub(crate) fn clamp_unit_scalar(buf: &mut [f32]) {
 
 #[inline(always)]
 pub(crate) unsafe fn clamp_unit<V: F32x>(buf: &mut [f32]) {
-    let len = buf.len();
-    let whole = len - len % V::LANES;
-    let mut i = 0;
+    let whole = buf.len() - buf.len() % V::LANES;
     unsafe {
         let low = V::splat(-1.0);
         let high = V::splat(1.0);
-        while i < whole {
-            let s = V::load(&buf[i..]);
-            // `f32::clamp` is `if s < min { min }` then `if s > max { max }`;
-            // both compares are false for NaN, which therefore passes through.
-            let s = V::select(s.lt(low), low, s);
-            V::select(s.gt(high), high, s).store(&mut buf[i..]);
-            i += V::LANES;
+        for chunk in buf[..whole].chunks_exact_mut(V::LANES) {
+            V::load(chunk).raise_to(low).lower_to(high).store(chunk);
         }
     }
     clamp_unit_scalar(&mut buf[whole..]);
@@ -98,7 +102,11 @@ pub(crate) unsafe fn clamp_unit<V: F32x>(buf: &mut [f32]) {
 pub(crate) fn inverse_coupling_scalar(magnitude: &mut [f32], angle: &mut [f32]) {
     for (m, a) in magnitude.iter_mut().zip(angle.iter_mut()) {
         let (new_m, new_a) = if *m > 0.0 {
-            if *a > 0.0 { (*m, *m - *a) } else { (*m + *a, *m) }
+            if *a > 0.0 {
+                (*m, *m - *a)
+            } else {
+                (*m + *a, *m)
+            }
         } else if *a > 0.0 {
             (*m, *m + *a)
         } else {
@@ -111,14 +119,15 @@ pub(crate) fn inverse_coupling_scalar(magnitude: &mut [f32], angle: &mut [f32]) 
 
 #[inline(always)]
 pub(crate) unsafe fn inverse_coupling<V: F32x>(magnitude: &mut [f32], angle: &mut [f32]) {
-    let len = magnitude.len();
-    let whole = len - len % V::LANES;
-    let mut i = 0;
+    let whole = magnitude.len() - magnitude.len() % V::LANES;
     unsafe {
         let zero = V::splat(0.0);
-        while i < whole {
-            let m = V::load(&magnitude[i..]);
-            let a = V::load(&angle[i..]);
+        for (m_out, a_out) in magnitude[..whole]
+            .chunks_exact_mut(V::LANES)
+            .zip(angle.chunks_exact_mut(V::LANES))
+        {
+            let m = V::load(m_out);
+            let a = V::load(a_out);
             let m_pos = m.gt(zero);
             let a_pos = a.gt(zero);
             let sum = m.add(a);
@@ -128,9 +137,8 @@ pub(crate) unsafe fn inverse_coupling<V: F32x>(magnitude: &mut [f32], angle: &mu
             // the magnitude becomes `m + a` or `m - a`. `m > 0` picks which.
             let when_a_pos = V::select(m_pos, diff, sum);
             let when_a_not_pos = V::select(m_pos, sum, diff);
-            V::select(a_pos, m, when_a_not_pos).store(&mut magnitude[i..]);
-            V::select(a_pos, when_a_pos, m).store(&mut angle[i..]);
-            i += V::LANES;
+            V::select(a_pos, m, when_a_not_pos).store(m_out);
+            V::select(a_pos, when_a_pos, m).store(a_out);
         }
     }
     inverse_coupling_scalar(&mut magnitude[whole..], &mut angle[whole..]);
@@ -149,16 +157,12 @@ pub(crate) fn apply_floor_scalar(floor: &mut [f32], residue: &[f32]) {
 
 #[inline(always)]
 pub(crate) unsafe fn apply_floor<V: F32x>(floor: &mut [f32], residue: &[f32]) {
-    let len = floor.len();
-    let whole = len - len % V::LANES;
-    let mut i = 0;
-    while i < whole {
-        unsafe {
-            V::load(&floor[i..])
-                .mul(V::load(&residue[i..]))
-                .store(&mut floor[i..]);
-        }
-        i += V::LANES;
+    let whole = floor.len() - floor.len() % V::LANES;
+    for (f, r) in floor[..whole]
+        .chunks_exact_mut(V::LANES)
+        .zip(residue.chunks_exact(V::LANES))
+    {
+        unsafe { V::load(f).mul(V::load(r)).store(f) };
     }
     apply_floor_scalar(&mut floor[whole..], &residue[whole..]);
 }
@@ -288,23 +292,29 @@ unsafe fn fft_stage<V: F32x>(plan: &Plan, re: &mut [f32], im: &mut [f32], half: 
     for base in (0..re.len()).step_by(2 * half) {
         let (e_re, o_re) = re[base..base + 2 * half].split_at_mut(half);
         let (e_im, o_im) = im[base..base + 2 * half].split_at_mut(half);
-        let mut j = 0;
-        while j < half {
+        let lanes = V::LANES;
+        for (((((e_re, e_im), o_re), o_im), wr), wi) in e_re
+            .chunks_exact_mut(lanes)
+            .zip(e_im.chunks_exact_mut(lanes))
+            .zip(o_re.chunks_exact_mut(lanes))
+            .zip(o_im.chunks_exact_mut(lanes))
+            .zip(wr.chunks_exact(lanes))
+            .zip(wi.chunks_exact(lanes))
+        {
             unsafe {
-                let w_re = V::load(&wr[j..]);
-                let w_im = V::load(&wi[j..]);
-                let or = V::load(&o_re[j..]);
-                let oi = V::load(&o_im[j..]);
+                let w_re = V::load(wr);
+                let w_im = V::load(wi);
+                let or = V::load(o_re);
+                let oi = V::load(o_im);
                 let tr = w_re.mul(or).sub(w_im.mul(oi));
                 let ti = w_re.mul(oi).add(w_im.mul(or));
-                let er = V::load(&e_re[j..]);
-                let ei = V::load(&e_im[j..]);
-                er.add(tr).store(&mut e_re[j..]);
-                ei.add(ti).store(&mut e_im[j..]);
-                er.sub(tr).store(&mut o_re[j..]);
-                ei.sub(ti).store(&mut o_im[j..]);
+                let er = V::load(e_re);
+                let ei = V::load(e_im);
+                er.add(tr).store(e_re);
+                ei.add(ti).store(e_im);
+                er.sub(tr).store(o_re);
+                ei.sub(ti).store(o_im);
             }
-            j += V::LANES;
         }
     }
 }
@@ -326,19 +336,20 @@ fn post_twiddle_range(plan: &Plan, re: &mut [f32], im: &mut [f32], from: usize) 
 
 #[inline(always)]
 unsafe fn post_twiddle<V: F32x>(plan: &Plan, re: &mut [f32], im: &mut [f32]) {
-    let len = re.len();
-    let whole = len - len % V::LANES;
-    let mut i = 0;
-    while i < whole {
+    let whole = re.len() - re.len() % V::LANES;
+    let lanes = V::LANES;
+    for (((xr_out, xi_out), c), d) in re[..whole]
+        .chunks_exact_mut(lanes)
+        .zip(im.chunks_exact_mut(lanes))
+        .zip(plan.tw_re.chunks_exact(lanes))
+        .zip(plan.tw_im.chunks_exact(lanes))
+    {
         unsafe {
-            let c = V::load(&plan.tw_re[i..]);
-            let d = V::load(&plan.tw_im[i..]);
-            let xr = V::load(&re[i..]);
-            let xi = V::load(&im[i..]);
-            c.mul(xr).add(d.mul(xi)).store(&mut re[i..]);
-            d.mul(xr).sub(c.mul(xi)).store(&mut im[i..]);
+            let (c, d) = (V::load(c), V::load(d));
+            let (xr, xi) = (V::load(xr_out), V::load(xi_out));
+            c.mul(xr).add(d.mul(xi)).store(xr_out);
+            d.mul(xr).sub(c.mul(xi)).store(xi_out);
         }
-        i += V::LANES;
     }
     post_twiddle_range(plan, re, im, whole);
 }
@@ -403,9 +414,21 @@ unsafe fn unfold<V: F32x>(re: &[f32], im: &[f32], out: &mut [f32]) {
                 V::load(&a_im[r..]).reverse().neg(),
                 &mut q0[q..],
             );
-            store_interleaved(V::load(&a_im[j..]), V::load(&b_re[r..]).reverse(), &mut q1[q..]);
-            store_interleaved(V::load(&b_im[j..]), V::load(&a_re[r..]).reverse(), &mut q2[q..]);
-            store_interleaved(V::load(&a_re[j..]), V::load(&b_im[r..]).reverse(), &mut q3[q..]);
+            store_interleaved(
+                V::load(&a_im[j..]),
+                V::load(&b_re[r..]).reverse(),
+                &mut q1[q..],
+            );
+            store_interleaved(
+                V::load(&b_im[j..]),
+                V::load(&a_re[r..]).reverse(),
+                &mut q2[q..],
+            );
+            store_interleaved(
+                V::load(&a_re[j..]),
+                V::load(&b_im[r..]).reverse(),
+                &mut q3[q..],
+            );
         }
         j += lanes;
     }

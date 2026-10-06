@@ -13,8 +13,10 @@ use super::Imdct;
 /// the one nearly every packet of a 44.1 or 48 kHz stream uses.
 pub const LONG_SPECTRUM: usize = 1024;
 
-/// Blocks one `run_*` call covers.
-pub const BLOCKS: usize = 64;
+/// Blocks one `run_*` call covers. Eight keeps every stage's working set
+/// inside L2, as the decoder's is - it synthesizes one block per channel at a
+/// time - so a group times the kernel rather than memory bandwidth.
+pub const BLOCKS: usize = 8;
 
 /// Precomputed inputs and output buffers for every stage group.
 pub struct VorbisStageInputs {
@@ -146,14 +148,17 @@ impl VorbisStageInputs {
     }
 }
 
-/// An order-sensitive fold of every sample's bits. Each sample is weighted by
-/// an odd multiplier, which is invertible modulo 2^64, so changing any one
-/// sample always changes the result.
+/// An order-sensitive fold of every sample's bits: the wrapping sum of each
+/// sample's bits XORed with a per-position key. XOR with a fixed key is a
+/// bijection, so changing any one sample always changes the result. It is
+/// 32-bit adds and XORs only, which vectorize at the baseline instruction set,
+/// so the fold costs little next to the kernels it guards.
 #[must_use]
 pub fn fold(samples: &[f32]) -> u64 {
-    samples.iter().enumerate().fold(0_u64, |acc, (i, &s)| {
-        acc.wrapping_add(u64::from(s.to_bits()).wrapping_mul(2 * i as u64 + 1))
-    })
+    let sum = samples.iter().enumerate().fold(0_u32, |acc, (i, &s)| {
+        acc.wrapping_add(s.to_bits() ^ (i as u32).wrapping_mul(0x9e37_79b9))
+    });
+    u64::from(sum) | (samples.len() as u64) << 32
 }
 
 /// The rising half of the Vorbis window for a `size`-sample block (Vorbis I

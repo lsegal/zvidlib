@@ -31,7 +31,7 @@ use zvidlib::io::MemorySource;
 use zvidlib::{
     AacTrackConfig, AudioTrackTiming, Codec, CodecProfile, ColorRange, EncodedAudioSample,
     EncodedVideoSample, FilterPlane, Limits, Mp4Demuxer, Mp4DemuxerOptions, Mp4Track, PixelFormat,
-    Plane, TrackKind, TxSizeGrid, VideoDecoderConfig, VideoDimensions, VideoFrame,
+    Plane, TrackKind, TxSizeGrid, VideoDecoderConfig, VideoDimensions, VideoFrame, VorbisConfig,
     decode_av1_lossless_intra,
 };
 
@@ -711,6 +711,95 @@ pub fn aac_mono_track() -> &'static BundledAacTrack {
         demux_aac_track(
             include_bytes!("../../tests/fixtures/codec/aac_lc_mono_48k.m4a").to_vec(),
             "the mono AAC-LC fixture",
+        )
+    })
+}
+
+/// A libvorbis-encoded Vorbis fixture, split into packets once per process.
+///
+/// The fixtures are the ones `tests/vorbis_codec.rs` checks the decoder against
+/// libvorbis's own decode with, so a Vorbis benchmark times the same streams
+/// the decoder is held correct on.
+pub struct VorbisFixture {
+    pub config: VorbisConfig,
+    pub packets: Vec<EncodedAudioSample>,
+    pub sample_rate: u32,
+    pub channels: u16,
+    /// Decoded samples per channel the whole stream covers.
+    pub decoded_samples: u64,
+}
+
+impl VorbisFixture {
+    /// The work the whole stream represents, for throughput reporting.
+    pub fn work(&self) -> AudioWork {
+        AudioWork::new(self.decoded_samples, self.sample_rate, self.channels)
+    }
+
+    fn parse(bytes: &[u8], label: &str) -> VorbisFixture {
+        let mut packets = ogg_packets(bytes);
+        assert!(packets.len() > 3, "{label} has audio packets");
+        let audio = packets.split_off(3);
+        let [identification, comment, setup]: [Vec<u8>; 3] = packets
+            .try_into()
+            .unwrap_or_else(|_| panic!("{label} starts with three header packets"));
+        let config = VorbisConfig::from_headers(identification, comment, setup)
+            .unwrap_or_else(|error| panic!("{label}'s headers parse: {error}"));
+        let packets = config
+            .encoded_samples(audio)
+            .unwrap_or_else(|error| panic!("{label}'s packets index: {error}"));
+        let decoded_samples = packets.last().map_or(0, |packet| packet.decoded_range.end);
+        VorbisFixture {
+            sample_rate: config.sample_rate,
+            channels: u16::from(config.channels),
+            config,
+            packets,
+            decoded_samples,
+        }
+    }
+}
+
+/// The packets of a single-stream Ogg file (RFC 3533), headers included.
+fn ogg_packets(bytes: &[u8]) -> Vec<Vec<u8>> {
+    let mut packets = Vec::new();
+    let mut partial = Vec::new();
+    let mut at = 0;
+    while at < bytes.len() {
+        assert_eq!(&bytes[at..at + 4], b"OggS", "an Ogg page at {at}");
+        let segments = usize::from(bytes[at + 26]);
+        let lacing = &bytes[at + 27..at + 27 + segments];
+        let mut body = at + 27 + segments;
+        for &length in lacing {
+            partial.extend_from_slice(&bytes[body..body + usize::from(length)]);
+            body += usize::from(length);
+            if length < 255 {
+                packets.push(std::mem::take(&mut partial));
+            }
+        }
+        at = body;
+    }
+    packets
+}
+
+/// Half a second of 44.1 kHz stereo music, which libvorbis codes in long
+/// blocks with square-polar coupling: the common case.
+pub fn vorbis_stereo_fixture() -> &'static VorbisFixture {
+    static FIXTURE: OnceLock<VorbisFixture> = OnceLock::new();
+    FIXTURE.get_or_init(|| {
+        VorbisFixture::parse(
+            include_bytes!("../../tests/fixtures/codec/vorbis_stereo_44k.ogg"),
+            "the stereo Vorbis fixture",
+        )
+    })
+}
+
+/// A quarter second of 48 kHz 5.1, whose mapping couples one channel in
+/// several steps, so coupling and synthesis run over six channels a packet.
+pub fn vorbis_surround_fixture() -> &'static VorbisFixture {
+    static FIXTURE: OnceLock<VorbisFixture> = OnceLock::new();
+    FIXTURE.get_or_init(|| {
+        VorbisFixture::parse(
+            include_bytes!("../../tests/fixtures/codec/vorbis_6ch_48k.ogg"),
+            "the 5.1 Vorbis fixture",
         )
     })
 }

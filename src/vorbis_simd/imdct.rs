@@ -10,6 +10,15 @@
 //! The transform here keeps Symphonia's pre- and post-twiddle arithmetic and
 //! its FFT's twiddle factors, so it is the same IMDCT up to rounding.
 
+// Symphonia
+// Copyright (c) 2019-2022 The Project Symphonia Developers.
+//
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+// The twiddle tables follow `symphonia-core` 0.5.5's IMDCT and FFT.
+
 use crate::simd::SimdIsa;
 
 use super::kernels::{self, Scratch};
@@ -93,7 +102,10 @@ impl Imdct {
     /// A transform of `n` spectral coefficients. `n` must be a power of two
     /// and at least 8; Vorbis's smallest block, 64 samples, has `n = 32`.
     pub(crate) fn new(n: usize) -> Self {
-        assert!(n.is_power_of_two() && n >= 8, "IMDCT size {n} is unsupported");
+        assert!(
+            n.is_power_of_two() && n >= 8,
+            "IMDCT size {n} is unsupported"
+        );
         let buffer = || vec![0.0; n / 2].into_boxed_slice();
         Imdct {
             plan: Plan::new(n),

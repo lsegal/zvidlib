@@ -81,8 +81,12 @@ fn imdct_vector_arms_match_scalar_bit_for_bit() {
             (0..n).map(|_| random.signed()).collect::<Vec<_>>(),
             random.mixed(n),
             vec![0.0; n],
-            (0..n).map(|i| if i == n / 3 { 1.0 } else { -0.0 }).collect(),
-            (0..n).map(|i| if i % 2 == 0 { 1.0e20 } else { -1.0e-20 }).collect(),
+            (0..n)
+                .map(|i| if i == n / 3 { 1.0 } else { -0.0 })
+                .collect(),
+            (0..n)
+                .map(|i| if i % 2 == 0 { 1.0e20 } else { -1.0e-20 })
+                .collect(),
         ];
         for spec in &inputs {
             let mut expected = vec![0.0; 2 * n];
@@ -110,7 +114,9 @@ fn scalar_imdct_matches_the_definition() {
             let expected: f64 = spec
                 .iter()
                 .enumerate()
-                .map(|(j, &x)| f64::from(x) * (pi_2n * ((2 * i + 1 + n) * (2 * j + 1)) as f64).cos())
+                .map(|(j, &x)| {
+                    f64::from(x) * (pi_2n * ((2 * i + 1 + n) * (2 * j + 1)) as f64).cos()
+                })
                 .sum();
             // Rounding grows with the transform's length and its sums.
             let tolerance = 2.0e-6 * n as f64;
@@ -151,7 +157,14 @@ fn overlap_add_vector_arms_match_scalar_bit_for_bit() {
         let win: Vec<f32> = (0..len).map(|_| random.signed().abs()).collect();
         let win_rev: Vec<f32> = win.iter().rev().copied().collect();
         let mut expected = vec![0.0; len];
-        overlap_add_with(SimdIsa::Scalar, &mut expected, &left, &right, &win, &win_rev);
+        overlap_add_with(
+            SimdIsa::Scalar,
+            &mut expected,
+            &left,
+            &right,
+            &win,
+            &win_rev,
+        );
         for isa in vector_isas() {
             let mut actual = vec![f32::NAN; len];
             overlap_add_with(isa, &mut actual, &left, &right, &win, &win_rev);
@@ -248,7 +261,12 @@ fn coupling_follows_the_specification() {
         angle.resize(8, 0.0);
         inverse_coupling_with(isa, &mut magnitude, &mut angle);
         for (i, (_, (m, a))) in cases.iter().enumerate() {
-            assert_eq!((magnitude[i], angle[i]), (*m, *a), "{} case {i}", isa.name());
+            assert_eq!(
+                (magnitude[i], angle[i]),
+                (*m, *a),
+                "{} case {i}",
+                isa.name()
+            );
         }
     }
 }

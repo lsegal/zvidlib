@@ -47,6 +47,19 @@ pub(crate) trait F32x: Copy {
     /// `mask ? a : b` per lane, where `mask` lanes are all-ones or all-zero.
     unsafe fn select(mask: Self, a: Self, b: Self) -> Self;
 
+    /// `if self < low { low } else { self }` per lane, the first half of
+    /// [`f32::clamp`]; NaN passes through.
+    #[inline(always)]
+    unsafe fn raise_to(self, low: Self) -> Self {
+        unsafe { Self::select(self.lt(low), low, self) }
+    }
+    /// `if self > high { high } else { self }` per lane, the second half of
+    /// [`f32::clamp`]; NaN passes through.
+    #[inline(always)]
+    unsafe fn lower_to(self, high: Self) -> Self {
+        unsafe { Self::select(self.gt(high), high, self) }
+    }
+
     /// The lanes in reverse order.
     unsafe fn reverse(self) -> Self;
     /// Splits the `2 * LANES` consecutive values `[self, next]` into their
@@ -110,6 +123,17 @@ mod x86 {
         #[inline(always)]
         unsafe fn select(mask: Self, a: Self, b: Self) -> Self {
             unsafe { Self(_mm_blendv_ps(b.0, a.0, mask.0)) }
+        }
+        // `maxps(a, b)` is exactly `a > b ? a : b` and `minps(a, b)` is
+        // `a < b ? a : b`, returning `b` when either is NaN, so with the bound
+        // first they are the two halves of `f32::clamp` in one instruction.
+        #[inline(always)]
+        unsafe fn raise_to(self, low: Self) -> Self {
+            unsafe { Self(_mm_max_ps(low.0, self.0)) }
+        }
+        #[inline(always)]
+        unsafe fn lower_to(self, high: Self) -> Self {
+            unsafe { Self(_mm_min_ps(high.0, self.0)) }
         }
         #[inline(always)]
         unsafe fn reverse(self) -> Self {
@@ -184,6 +208,15 @@ mod x86 {
         #[inline(always)]
         unsafe fn select(mask: Self, a: Self, b: Self) -> Self {
             unsafe { Self(_mm256_blendv_ps(b.0, a.0, mask.0)) }
+        }
+        // As for `Sse4`: exactly the two halves of `f32::clamp`.
+        #[inline(always)]
+        unsafe fn raise_to(self, low: Self) -> Self {
+            unsafe { Self(_mm256_max_ps(low.0, self.0)) }
+        }
+        #[inline(always)]
+        unsafe fn lower_to(self, high: Self) -> Self {
+            unsafe { Self(_mm256_min_ps(high.0, self.0)) }
         }
         #[inline(always)]
         unsafe fn reverse(self) -> Self {
@@ -284,6 +317,9 @@ mod arm {
         unsafe fn select(mask: Self, a: Self, b: Self) -> Self {
             unsafe { Self(vbslq_f32(vreinterpretq_u32_f32(mask.0), a.0, b.0)) }
         }
+        // `raise_to`/`lower_to` keep the compare-and-select defaults: NEON's
+        // `fmax`/`fmin` return a NaN when either operand is one, not the
+        // second operand, so they are not `f32::clamp`.
         #[inline(always)]
         unsafe fn reverse(self) -> Self {
             unsafe {
