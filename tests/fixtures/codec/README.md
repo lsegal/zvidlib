@@ -221,3 +221,19 @@ reaches the tools it is listed against (recorded by `src/av1_dec/coverage.rs`
 in test builds), so a regenerated fixture that stops using a tool fails rather
 than silently losing its check. As above, FFmpeg is only the offline fixture
 generator and is not a build, test, or runtime dependency.
+
+`vp8/vp80-00-comprehensive-001.ivf` to `-018.ivf` are libvpx's VP8 decoder
+test vectors, downloaded unmodified from
+`https://storage.googleapis.com/downloads.webmproject.org/test_data/libvpx/`
+together with the `.ivf.md5` file libvpx publishes beside each. Every line of
+an `.md5` file is the MD5 of one shown frame's I420 output from libvpx,
+cropped to the display size. They are the set libvpx checks its own VP8
+decoder against, and include every bitstream version (003 and 007 are version
+1, 004 version 2 and 005 version 3, so bilinear and full-pixel chroma
+prediction), odd frame sizes (006 and 014 are 175x143), a 1432x888 stream
+(008), streams with up to four key frames, and a hidden key frame (018).
+`src/vp8/tests.rs` decodes each vector and compares every shown frame with
+libvpx's digest; `tests/vp8_conformance.rs` checks that every frame comes
+back identically through `ExactFrameReader` in sequential, reverse and
+alternating order. They are distributed under the libvpx license; see
+`THIRD_PARTY_NOTICES.md`.

@@ -156,14 +156,18 @@ pub(crate) fn macroblock_edges<const N: usize, const A: usize>(
     let mut left = [129u8; N];
     if mb_y > 0 {
         let row = (y0 - 1) * plane.width;
-        above[0] = if mb_x > 0 { plane.data[row + x0 - 1] } else { 129 };
+        above[0] = if mb_x > 0 {
+            plane.data[row + x0 - 1]
+        } else {
+            129
+        };
         above[1..=N].copy_from_slice(&plane.data[row + x0..row + x0 + N]);
         if A > N + 1 {
             // The above-right pixels come from the next macroblock of the
             // row above; the last macroblock repeats the row's last pixel.
-            for index in N + 1..A {
+            for (index, sample) in above.iter_mut().enumerate().skip(N + 1) {
                 let x = x0 + index - 1;
-                above[index] = if x < plane.width {
+                *sample = if x < plane.width {
                     plane.data[row + x]
                 } else {
                     plane.data[row + plane.width - 1]

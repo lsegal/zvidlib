@@ -222,7 +222,7 @@ impl Decoder {
             // space, and libvpx clamps reconstructed pixels either way.
             header.read_literal(2);
         }
-        self.read_segmentation(&mut header, key_frame);
+        self.read_segmentation(&mut header);
         let simple_filter = header.read_flag();
         let filter_level = header.read_literal(6) as i32;
         let sharpness = header.read_literal(3) as u8;
@@ -388,7 +388,7 @@ impl Decoder {
         Ok(())
     }
 
-    fn read_segmentation(&mut self, header: &mut BoolDecoder<'_>, key_frame: bool) {
+    fn read_segmentation(&mut self, header: &mut BoolDecoder<'_>) {
         let segmentation = &mut self.segmentation;
         segmentation.enabled = header.read_flag();
         segmentation.update_map = false;
@@ -415,7 +415,6 @@ impl Decoder {
                 };
             }
         }
-        let _ = key_frame;
     }
 
     fn read_filter_deltas(&mut self, header: &mut BoolDecoder<'_>) {
@@ -509,9 +508,9 @@ impl Decoder {
         for mb_y in 0..self.mb_rows {
             let partition = &mut partitions[mb_y % partition_count];
             let mut left_context = [0u8; 9];
-            for mb_x in 0..mb_cols {
+            for (mb_x, above_context) in above_contexts.iter_mut().enumerate() {
                 let index = (mb_y + 1) * info_stride + mb_x + 1;
-                let mut macroblock = self.read_macroblock_header(
+                let macroblock = self.read_macroblock_header(
                     context,
                     header,
                     &info,
@@ -529,7 +528,7 @@ impl Decoder {
                 let has_y2 = macroblock.y_mode != B_PRED && macroblock.y_mode != SPLITMV;
                 let mut coefficients: Coefficients = [[0; 16]; 25];
                 let has_coefficients = if macroblock.skip {
-                    let above = &mut above_contexts[mb_x];
+                    let above = above_context;
                     above[..8].fill(0);
                     left_context[..8].fill(0);
                     if has_y2 {
@@ -542,7 +541,7 @@ impl Decoder {
                         partition,
                         &self.probabilities.coefficients,
                         &mut left_context,
-                        &mut above_contexts[mb_x],
+                        above_context,
                         has_y2,
                         dequantizer,
                         &mut coefficients,
@@ -554,7 +553,6 @@ impl Decoder {
                     level: self.filter_level(filter_level, &macroblock),
                     inner_edges: !has_y2 || has_coefficients,
                 };
-                macroblock.segment = self.segment_map[segment_index] as usize;
                 info[index] = macroblock;
             }
         }
@@ -755,7 +753,12 @@ impl Decoder {
                     origin,
                     stride,
                 );
-                add_residual(&coefficients[first_block..first_block + 4], plane, origin, 2);
+                add_residual(
+                    &coefficients[first_block..first_block + 4],
+                    plane,
+                    origin,
+                    2,
+                );
             }
             return;
         }
@@ -827,7 +830,12 @@ impl Decoder {
                 );
             }
             let origin = mb_y * 8 * plane.width + mb_x * 8;
-            add_residual(&coefficients[first_block..first_block + 4], plane, origin, 2);
+            add_residual(
+                &coefficients[first_block..first_block + 4],
+                plane,
+                origin,
+                2,
+            );
         }
     }
 
@@ -1178,7 +1186,7 @@ fn read_tokens(
     } else {
         (3, 0)
     };
-    for index in 0..16 {
+    for (index, output) in coefficients[..16].iter_mut().enumerate() {
         block(
             partition,
             y_type,
@@ -1186,7 +1194,7 @@ fn read_tokens(
             index & 3,
             y_first,
             dequantizer.y1,
-            &mut coefficients[index],
+            output,
         );
     }
     for index in 0..8 {
@@ -1241,7 +1249,7 @@ fn reconstruct_intra_luma(
         add_residual(&coefficients[0..16], plane, origin, 4);
         return;
     }
-    for block in 0..16 {
+    for (block, residual) in coefficients[..16].iter().enumerate() {
         let row = block >> 2;
         let column = block & 3;
         let offset = origin + row * 4 * stride + column * 4;
@@ -1279,8 +1287,8 @@ fn reconstruct_intra_luma(
             offset,
             stride,
         );
-        if coefficients[block].iter().any(|&value| value != 0) {
-            idct_add(&coefficients[block], &mut plane.data, offset, stride);
+        if residual.iter().any(|&value| value != 0) {
+            idct_add(residual, &mut plane.data, offset, stride);
         }
     }
 }

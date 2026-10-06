@@ -207,10 +207,10 @@ pub use webm_demux::{
 pub use aac_encoder::native_aac_audio_encoder_factory;
 pub use av1_decoder::native_av1_video_decoder_factory;
 pub use hevc::native_hevc_video_decoder_factory;
-pub use vp8::native_vp8_video_decoder_factory;
 #[cfg(not(target_arch = "wasm32"))]
 pub use hevc::native_hevc_video_encoder_factory;
 #[cfg(not(target_arch = "wasm32"))]
 pub use native_audio::{DefaultAudioOutput, NativeAacDecoder};
 #[cfg(not(target_arch = "wasm32"))]
 pub use previews::PreviewIndex;
+pub use vp8::native_vp8_video_decoder_factory;

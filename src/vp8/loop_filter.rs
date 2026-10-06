@@ -229,7 +229,16 @@ fn filter_macroblock(
     }
     if inner_edges {
         for y in (4..size).step_by(4) {
-            filter_edge(data, origin + y * stride, stride, 1, size, false, limits, simple);
+            filter_edge(
+                data,
+                origin + y * stride,
+                stride,
+                1,
+                size,
+                false,
+                limits,
+                simple,
+            );
         }
     }
 }
