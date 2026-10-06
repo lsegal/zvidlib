@@ -15,7 +15,7 @@
 use super::vector::{F32x4, I32x4};
 use crate::vorbis_encoder::floor1::{self, FitSums};
 use crate::vorbis_encoder::mdct::{self, MdctLookup};
-use crate::vorbis_encoder::psy::NoiseSums;
+use crate::vorbis_encoder::psy::NoiseAcc;
 use crate::vorbis_encoder::smallft;
 
 // ---------------------------------------------------------------------
@@ -463,40 +463,25 @@ unsafe fn bin_x<V: F32x4>(i: usize) -> V {
     unsafe { V::from_array([i as f32, (i + 1) as f32, (i + 2) as f32, (i + 3) as f32]) }
 }
 
+/// The (N, X, XX, Y, XY) sums of four bins, one bin per lane. The first four
+/// sums of a `repr(C)` entry are one 16-byte load, so four loads and a 4x4
+/// transpose replace sixteen scalar gathers; XY is gathered.
+///
+/// The indices come from the bark tables and the window arithmetic, so each
+/// is bounds-checked here rather than trusted.
 #[inline(always)]
-unsafe fn gather<V: F32x4>(v: &[f32], idx: [usize; 4]) -> V {
+unsafe fn gather_acc<V: F32x4>(acc: &[NoiseAcc], idx: [usize; 4]) -> [V; 5] {
+    let e = idx.map(|i| &acc[i]);
     unsafe {
-        V::from_array([
-            *v.get_unchecked(idx[0]),
-            *v.get_unchecked(idx[1]),
-            *v.get_unchecked(idx[2]),
-            *v.get_unchecked(idx[3]),
-        ])
-    }
-}
-
-#[inline(always)]
-unsafe fn gather_sums<V: F32x4>(s: &NoiseSums, idx: [usize; 4]) -> [V; 5] {
-    unsafe {
+        let [v0, v1, v2, v3] = e.map(|e| V::load((e as *const NoiseAcc).cast::<f32>()));
+        let (a, b) = v0.zip(v1);
+        let (c, d) = v2.zip(v3);
         [
-            gather(&s.n, idx),
-            gather(&s.x, idx),
-            gather(&s.xx, idx),
-            gather(&s.y, idx),
-            gather(&s.xy, idx),
-        ]
-    }
-}
-
-#[inline(always)]
-unsafe fn load_sums<V: F32x4>(s: &NoiseSums, at: usize) -> [V; 5] {
-    unsafe {
-        [
-            V::load(s.n.as_ptr().add(at)),
-            V::load(s.x.as_ptr().add(at)),
-            V::load(s.xx.as_ptr().add(at)),
-            V::load(s.y.as_ptr().add(at)),
-            V::load(s.xy.as_ptr().add(at)),
+            a.low_halves(c),
+            a.high_halves(c),
+            b.low_halves(d),
+            b.high_halves(d),
+            V::from_array(e.map(|e| e.xy)),
         ]
     }
 }
@@ -505,7 +490,7 @@ unsafe fn load_sums<V: F32x4>(s: &NoiseSums, at: usize) -> [V; 5] {
 /// fits of `bark_noise_hybridmp`'s first pass over `start..end`.
 #[inline(always)]
 pub(super) unsafe fn noise_bark<V: F32x4>(
-    sums: &NoiseSums,
+    acc: &[NoiseAcc],
     b: &[i32],
     start: usize,
     end: usize,
@@ -513,15 +498,7 @@ pub(super) unsafe fn noise_bark<V: F32x4>(
     offset: f32,
     noise: &mut [f32],
 ) {
-    let len = sums.len();
     assert!(end <= b.len() && end <= noise.len());
-    // The caller's segment scan guarantees every window lies inside the sums;
-    // re-check it here because the gathers below are unchecked.
-    for &w in &b[start..end] {
-        let (lo, hi) = (w >> 16, w & 0xffff);
-        let lo = if reflect { -lo } else { lo };
-        assert!(lo >= 0 && (lo as usize) < len && (hi as usize) < len);
-    }
     let mut i = start;
     unsafe {
         let zero = V::splat(0.);
@@ -530,14 +507,14 @@ pub(super) unsafe fn noise_bark<V: F32x4>(
             let w = [b[i], b[i + 1], b[i + 2], b[i + 3]];
             let hi = w.map(|w| (w & 0xffff) as usize);
             let lo = w.map(|w| (if reflect { -(w >> 16) } else { w >> 16 }) as usize);
-            let (a, bb, d) = noise_fit(gather_sums::<V>(sums, hi), gather_sums(sums, lo), reflect);
+            let (a, bb, d) = noise_fit(gather_acc::<V>(acc, hi), gather_acc(acc, lo), reflect);
             let r = a.add(bin_x::<V>(i).mul(bb)).div(d);
             let r = r.select_lt(zero, zero, r);
             r.sub(off).store(noise.as_mut_ptr().add(i));
             i += 4;
         }
     }
-    crate::vorbis_encoder::psy::noise_bark_scalar(sums, b, i, end, reflect, offset, noise);
+    crate::vorbis_encoder::psy::noise_bark_scalar(acc, b, i, end, reflect, offset, noise);
 }
 
 /// [`psy::noise_fixed_scalar`](crate::vorbis_encoder::psy): the fixed-width
@@ -546,7 +523,7 @@ pub(super) unsafe fn noise_bark<V: F32x4>(
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 pub(super) unsafe fn noise_fixed<V: F32x4>(
-    sums: &NoiseSums,
+    acc: &[NoiseAcc],
     fixed: i32,
     start: usize,
     end: usize,
@@ -554,34 +531,21 @@ pub(super) unsafe fn noise_fixed<V: F32x4>(
     offset: f32,
     noise: &mut [f32],
 ) {
-    let len = sums.len();
     assert!(end <= noise.len());
     let half = (fixed / 2) as isize;
-    // hi = i + fixed/2 and lo = hi - fixed move in lockstep with i, so the
-    // window edges of four consecutive bins are four consecutive sums (the
-    // reflected low edge runs backwards).
+    // A negative edge wraps to a huge index, which `gather_acc` rejects.
     let edges = |i: usize| {
         let hi = i as isize + half;
         let lo = hi - fixed as isize;
-        (hi, if reflect { -lo } else { lo })
+        (hi as usize, (if reflect { -lo } else { lo }) as usize)
     };
-    if start < end {
-        for i in [start, end - 1] {
-            let (hi, lo) = edges(i);
-            assert!(lo >= 0 && (lo as usize) < len && hi >= 0 && (hi as usize) < len);
-        }
-    }
     let mut i = start;
     unsafe {
         let off = V::splat(offset);
         while i + 4 <= end {
-            let (hi, lo) = edges(i);
-            let his = load_sums::<V>(sums, hi as usize);
-            let los = if reflect {
-                load_sums::<V>(sums, lo as usize - 3).map(|v| v.reverse())
-            } else {
-                load_sums::<V>(sums, lo as usize)
-            };
+            let [e0, e1, e2, e3] = [i, i + 1, i + 2, i + 3].map(edges);
+            let his = gather_acc::<V>(acc, [e0.0, e1.0, e2.0, e3.0]);
+            let los = gather_acc::<V>(acc, [e0.1, e1.1, e2.1, e3.1]);
             let (a, bb, d) = noise_fit(his, los, reflect);
             let r = a.add(bin_x::<V>(i).mul(bb)).div(d).sub(off);
             let np = noise.as_mut_ptr().add(i);
@@ -590,7 +554,7 @@ pub(super) unsafe fn noise_fixed<V: F32x4>(
             i += 4;
         }
     }
-    crate::vorbis_encoder::psy::noise_fixed_scalar(sums, fixed, i, end, reflect, offset, noise);
+    crate::vorbis_encoder::psy::noise_fixed_scalar(acc, fixed, i, end, reflect, offset, noise);
 }
 
 /// [`psy::noise_extrapolate_scalar`](crate::vorbis_encoder::psy): the tail of

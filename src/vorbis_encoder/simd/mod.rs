@@ -4,31 +4,45 @@
 //!
 //! # What is vectorized, and why only that
 //!
-//! A profile of the encoder (30 s of 44.1 kHz stereo at quality 3, 48 kHz
-//! stereo at quality 6 and 44.1 kHz mono at quality 0) spends its time in
-//! tone masking (~21%), coupling/quantization (11-18%), noise masking (~15%),
-//! floor fitting (~12%), the real FFT (~10%), envelope detection (~8%) and the
-//! forward MDCT (~6%). The kernels here cover the parts of those stages whose
-//! iterations are independent, which is the only shape a kernel can take
-//! while staying bit-exact:
+//! A profile of the scalar encoder (30 s of 44.1 kHz stereo at quality 3,
+//! 48 kHz stereo at quality 6 and 44.1 kHz mono at quality 0) spends its time
+//! in tone masking (20-22%), coupling/quantization (11-18%), noise masking
+//! (15-16%), floor fitting (12-14%), the real FFT (~10%), envelope detection
+//! (~8%), the forward MDCT (~6%) and residue coding (4-8%). The kernels here
+//! cover the parts of those stages whose iterations are independent, which is
+//! the only shape a kernel can take while staying bit-exact:
 //!
 //! | Kernel | Scalar reference |
 //! | --- | --- |
 //! | forward MDCT: pre-rotation, butterflies, bit-reversal, post-rotation | `mdct::MdctLookup::forward_scalar` (also the envelope's 128-point MDCT) |
-//! | real FFT: the `ido == 1` radix-4 pass and the radix-2/4 twiddle loops | `smallft::dradf4_first_rows`, `dradf4_twiddle_step`, `dradf2_twiddle_step` |
+//! | real FFT: the `ido == 1` radix-4 pass and the radix-2/4 twiddle loops | `smallft::dradf4_first_rows`, `dradf4_twiddle_scalar`, `dradf2_twiddle_scalar` |
 //! | noise-mask least-squares fits and companding | `psy::noise_bark_scalar`, `noise_fixed_scalar`, `noise_extrapolate_scalar`, `noise_compand_scalar` |
 //! | floor-fit accumulation | `floor1::accumulate_fit_scalar` |
 //! | log power spectra | `mapping0::log_mdct_scalar`, `log_fft_scalar` |
+//!
+//! The noise-mask fits are the one place the vector arm is arranged
+//! differently from C: it finds each pass's segment boundaries first and
+//! evaluates whole segments, where C runs three loops that stop at the first
+//! bin of the next shape. [`SimdIsa::Scalar`] keeps C's arrangement
+//! (`psy::bark_noise_hybridmp_scalar`, chosen through [`has_kernels`]), so
+//! the scalar arm, and with it `wasm32`, runs exactly the code it ran before.
 //!
 //! The rest stays scalar on purpose. Tone masking is a scatter-max of masking
 //! curves into a seed array followed by a monotonic-stack sweep
 //! (`seed_chase`) and a running minimum (`max_seeds`); every step depends on
 //! the one before it. Coupling and quantization work in 16-bin partitions
 //! whose noise normalization sorts each partition and walks it with a running
-//! energy budget. The noise mask's running sums (`bark_noise_hybridmp`'s
-//! prefix pass), the envelope's band accumulation and the 32-point MDCT tail
-//! are each a single floating-point recurrence that a vector could only
-//! compute by reassociating it, which would change the bits.
+//! energy budget. The noise mask's running sums (`running_sums`), the
+//! envelope's band accumulation and the 32-point MDCT tail are each a single
+//! floating-point recurrence that a vector could only compute by
+//! reassociating it, which would change the bits.
+//!
+//! Measured on one x86_64 desktop, interleaved and best of nine, the vector
+//! arms run the MDCT 2.5-2.9x, the FFT 2.2-2.3x, the log spectra 2-3x, the
+//! envelope search 1.6-1.7x, floor fitting 1.3-1.45x and the noise mask
+//! 1.1-1.3x faster than scalar, which makes a whole encode 1.2-1.3x faster:
+//! the stages left scalar are most of what remains. `benches/vorbis_encode.rs`
+//! times whole encodes per instruction set.
 //!
 //! # Bit-exactness
 //!
@@ -53,7 +67,7 @@ use std::sync::OnceLock;
 
 use super::floor1::FitSums;
 use super::mdct::MdctLookup;
-use super::psy::NoiseSums;
+use super::psy::NoiseAcc;
 
 /// The instruction set the Vorbis encoder kernels will actually run.
 ///
@@ -65,6 +79,19 @@ use super::psy::NoiseSums;
 pub(crate) fn active_isa() -> SimdIsa {
     static DETECTED: OnceLock<SimdIsa> = OnceLock::new();
     crate::simd::override_isa().unwrap_or_else(|| *DETECTED.get_or_init(crate::simd::detected))
+}
+
+/// Whether `isa` has vector kernels on this target. Where a stage is
+/// arranged differently for the kernels than C arranges it (the noise-mask
+/// fits), the scalar arm keeps C's arrangement and this picks between them.
+pub(super) fn has_kernels(isa: SimdIsa) -> bool {
+    match isa {
+        #[cfg(target_arch = "x86_64")]
+        SimdIsa::Sse41 | SimdIsa::Avx2 => true,
+        #[cfg(target_arch = "aarch64")]
+        SimdIsa::Neon => true,
+        _ => false,
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -164,14 +191,14 @@ entry_points! {
 entry_points! {
     #[allow(clippy::too_many_arguments)]
     fn [noise_bark_sse41, noise_bark_avx2, noise_bark_neon](
-        sums: &NoiseSums, b: &[i32], start: usize, end: usize,
+        acc: &[NoiseAcc], b: &[i32], start: usize, end: usize,
         reflect: bool, offset: f32, noise: &mut [f32]
     ) = noise_bark;
 }
 entry_points! {
     #[allow(clippy::too_many_arguments)]
     fn [noise_fixed_sse41, noise_fixed_avx2, noise_fixed_neon](
-        sums: &NoiseSums, fixed: i32, start: usize, end: usize,
+        acc: &[NoiseAcc], fixed: i32, start: usize, end: usize,
         reflect: bool, offset: f32, noise: &mut [f32]
     ) = noise_fixed;
 }
@@ -281,7 +308,7 @@ pub(super) fn dradf2_twiddle(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn noise_bark(
     isa: SimdIsa,
-    sums: &NoiseSums,
+    acc: &[NoiseAcc],
     b: &[i32],
     start: usize,
     end: usize,
@@ -292,9 +319,9 @@ pub(super) fn noise_bark(
     dispatch!(
         isa,
         [noise_bark_sse41, noise_bark_avx2, noise_bark_neon](
-            sums, b, start, end, reflect, offset, noise
+            acc, b, start, end, reflect, offset, noise
         ),
-        super::psy::noise_bark_scalar(sums, b, start, end, reflect, offset, noise)
+        super::psy::noise_bark_scalar(acc, b, start, end, reflect, offset, noise)
     );
 }
 
@@ -302,7 +329,7 @@ pub(super) fn noise_bark(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn noise_fixed(
     isa: SimdIsa,
-    sums: &NoiseSums,
+    acc: &[NoiseAcc],
     fixed: i32,
     start: usize,
     end: usize,
@@ -313,9 +340,9 @@ pub(super) fn noise_fixed(
     dispatch!(
         isa,
         [noise_fixed_sse41, noise_fixed_avx2, noise_fixed_neon](
-            sums, fixed, start, end, reflect, offset, noise
+            acc, fixed, start, end, reflect, offset, noise
         ),
-        super::psy::noise_fixed_scalar(sums, fixed, start, end, reflect, offset, noise)
+        super::psy::noise_fixed_scalar(acc, fixed, start, end, reflect, offset, noise)
     );
 }
 

@@ -7,6 +7,7 @@
 use super::*;
 use crate::simd::{self, SimdIsa};
 use crate::vorbis_encoder::VorbisEncoder;
+use crate::vorbis_encoder::psy::NoiseAcc;
 use crate::vorbis_encoder::smallft::DrftLookup;
 
 /// The vector instruction sets this host runs; empty on a host without one
@@ -169,7 +170,7 @@ fn fft_passes_match_scalar_on_ragged_shapes() {
 
 /// Monotonic running sums of positive weights, like the ones
 /// `bark_noise_hybridmp` builds, with an optional sprinkling of specials.
-fn noise_sums(rng: &mut Rng, n: usize, specials: bool) -> NoiseSums {
+fn noise_sums(rng: &mut Rng, n: usize, specials: bool) -> Vec<NoiseAcc> {
     let mut column = |scale: f32| {
         let mut acc = 0f32;
         (0..n)
@@ -183,13 +184,22 @@ fn noise_sums(rng: &mut Rng, n: usize, specials: bool) -> NoiseSums {
             })
             .collect::<Vec<f32>>()
     };
-    NoiseSums {
-        n: column(4e4),
-        x: column(4e6),
-        xx: column(4e9),
-        y: column(4e6),
-        xy: column(4e8),
-    }
+    let (sn, sx, sxx, sy, sxy) = (
+        column(4e4),
+        column(4e6),
+        column(4e9),
+        column(4e6),
+        column(4e8),
+    );
+    (0..n)
+        .map(|i| NoiseAcc {
+            n: sn[i],
+            x: sx[i],
+            xx: sxx[i],
+            y: sy[i],
+            xy: sxy[i],
+        })
+        .collect()
 }
 
 #[test]
@@ -296,6 +306,49 @@ fn noise_fits_match_scalar() {
                     let mut got = noise_in.clone();
                     noise_extrapolate(isa, fit, start, n, offset, lower_only, &mut got);
                     let label = format!("noise_extrapolate n={n} lower_only={lower_only}");
+                    assert_same(&label, isa, &got, &want);
+                }
+            }
+        }
+    }
+}
+
+/// The whole noise mask under every libvorbis psy setup of a few encoder
+/// configurations: the vector arm's segmented `bark_noise_hybridmp` against
+/// the scalar arm's C-shaped one, on the real bark windows and fixed-window
+/// widths, so the segment boundaries and the fit carried into each tail are
+/// exercised as the encoder exercises them.
+#[test]
+fn noise_mask_matches_scalar_under_real_psy_setups() {
+    use crate::vorbis_encoder::psy::{PsyLook, PsyScratch};
+    use crate::vorbis_encoder::setup::encode_init_vbr;
+
+    let mut rng = Rng::new(8);
+    for (channels, rate, quality) in [(2, 44_100, 0.4), (1, 8_000, 0.0), (2, 96_000, 1.0)] {
+        let ci = encode_init_vbr(channels, rate, quality).expect("a libvorbis setup");
+        for vi in &ci.psy_param {
+            let n = (ci.blocksizes[vi.blockflag as usize] / 2) as usize;
+            let look = PsyLook::new(vi, &ci.psy_g_param, n, ci.rate);
+            for specials in [false, true] {
+                // dB-scale spectra like `mapping0` hands the mask: mostly
+                // -160..0, with the edge cases mixed in.
+                let logmdct: Vec<f32> = (0..n)
+                    .map(|_| {
+                        if specials && rng.below(32) == 0 {
+                            rng.sample(true)
+                        } else {
+                            rng.range(-160.0, 0.0)
+                        }
+                    })
+                    .collect();
+                let mut want = vec![0f32; n];
+                let mut scratch = PsyScratch::default();
+                look.noisemask(SimdIsa::Scalar, &mut scratch, &logmdct, &mut want);
+                for isa in vector_isas() {
+                    let mut got = vec![0f32; n];
+                    let mut scratch = PsyScratch::default();
+                    look.noisemask(isa, &mut scratch, &logmdct, &mut got);
+                    let label = format!("noisemask {rate} Hz x{channels} q{quality} n={n}");
                     assert_same(&label, isa, &got, &want);
                 }
             }

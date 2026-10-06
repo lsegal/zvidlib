@@ -176,7 +176,7 @@ pub(super) fn dradf2_twiddle_scalar(
 }
 
 /// Butterfly `i` of row `t1 / ido` of `dradf2`'s twiddle loop.
-#[inline]
+#[inline(always)]
 pub(super) fn dradf2_twiddle_step(
     ido: usize,
     t0: usize,
@@ -305,7 +305,7 @@ pub(super) fn dradf4_twiddle_scalar(
 }
 
 /// Butterfly `i` of row `t1 / ido` of `dradf4`'s twiddle loop.
-#[inline]
+#[inline(always)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn dradf4_twiddle_step(
     ido: usize,

@@ -8,6 +8,7 @@ zvidlib's benchmarks run under [criterion](https://docs.rs/criterion) with
 | `benches/codec.rs` | codec work: decode, encoder inputs, and the per-ISA SIMD groups |
 | `benches/av1_decode.rs` | the AV1 software decoder: whole-frame decode and every hot stage, scalar versus SIMD |
 | `benches/av1_encode.rs` | the native AV1 encoder: whole-frame encode, every stage, and the forward-transform kernels, scalar versus SIMD |
+| `benches/vorbis_encode.rs` | the native Vorbis encoder: whole encodes, scalar versus SIMD |
 | `benches/audio_decode.rs` | the audio decode path: AAC access units and `AacSampleReader` range/seek reads |
 | `benches/audio_mux.rs` | the audio container path: MP4 muxing, sample-table growth, demux, and gapless timing |
 | `benches/hevc_encode.rs` | the pure-Rust HEVC encoder, whole-frame and per-stage |
@@ -33,6 +34,7 @@ cargo bench                       # the default, fast groups in every target
 cargo bench --bench codec         # codec work only
 cargo bench --bench av1_decode    # the AV1 software decoder only
 cargo bench --bench av1_encode    # the AV1 encoder, whole-frame and per-stage
+cargo bench --bench vorbis_encode # the Vorbis encoder, scalar versus SIMD
 cargo bench --bench audio_decode  # the audio decode path only
 cargo bench --bench audio_mux     # the audio container path only
 cargo bench --bench hevc_encode   # the HEVC encoder groups only
@@ -1918,6 +1920,34 @@ step fills one position and advances exactly one, through the real `WebCodecs`
 backend where the browser has an HEVC decoder and reporting `UNSUPPORTED` where
 it does not.
 
+## The Vorbis encoder suite (`--bench vorbis_encode`)
+
+`cargo bench --bench vorbis_encode` encodes ten seconds of synthetic audio
+(two partials per channel with vibrato, percussive bursts that force short
+blocks, and a noise floor) through `native_vorbis_audio_encoder_factory()`,
+once per instruction set `zvidlib::simd::available()` reports:
+
+| Group | Configuration |
+| --- | --- |
+| `vorbis_encode_44100_stereo_q4` | 44.1 kHz stereo at the factory's default quality 4 |
+| `vorbis_encode_48000_stereo_192k` | 48 kHz stereo at a 192 kb/s nominal rate |
+| `vorbis_encode_44100_mono_64k` | 44.1 kHz mono at a 64 kb/s nominal rate |
+
+Every arm's packets, timestamps and durations are checked byte for byte
+against the scalar arm's before anything is timed, and each arm checks that
+the override reached the `vorbis_encode` dispatch site. Criterion reports
+samples per second; each arm also prints its realtime factor.
+
+The whole encode is the unit on purpose. The vector kernels (issue #573) cover
+the forward MDCT, the real FFT, the noise-mask fits, floor fitting and the log
+spectra. Tone masking, coupling/quantization and residue coding are serial
+and stay scalar; `src/vorbis_encoder/simd/mod.rs` says why for each. They are
+about half of an encode, so the whole-encode ratio is far below the kernels'
+own: interleaved and best of nine on one x86_64 desktop, the vector arms ran
+the MDCT 2.5-2.9x, the FFT 2.2-2.3x and the noise mask 1.1-1.3x faster, and
+whole encodes 1.2-1.3x faster. The SSE4.1 and AVX2 arms read alike because
+the AVX2 entry points run the same four-lane kernels, VEX-encoded.
+
 ## The audio container path
 
 `cargo bench --bench audio_mux` measures the audio write and read paths in two
@@ -1941,22 +1971,14 @@ groups.
 `to_encoded_audio_samples` (packet extraction over the decoded sample clock), and
 `audio_timing` (priming, padding, and edit-list mapping).
 
-### There is no audio encoder to benchmark
+### No audio encoder in these groups
 
-`AudioEncoder` (`src/codec.rs`) is a trait with no implementation in the crate.
-Its only implementor anywhere in the tree is `PcmFixtureEncoder` in
-`tests/indexed_mp4_output.rs`, a test double that packages PCM without
-compressing anything. "Benchmark the audio encoder" therefore has no subject.
-
-That question is now closed rather than open. zvidlib ships no audio encoder by
-decision: the trait is the seam that platform and browser backends fill, and the
-rationale is recorded on `AudioEncoder` in `src/codec.rs` and in the README. So
-there is no audio-encode target pending for this suite, and none of the audio
-groups below are placeholders waiting on one.
-
-The bench-local `PcmBenchEncoder` is the same kind of pass-through double, and it
-is bench-local on purpose: holding codec work at effectively zero is what makes
-the measurement isolate container work.
+These groups encode through the bench-local `PcmBenchEncoder`, a pass-through
+double that packages PCM without compressing anything, and that is on purpose:
+holding codec work at effectively zero is what makes the measurement isolate
+container work. The crate's native audio encoders are measured on their own;
+the Vorbis encoder's codec work is the subject of
+[`--bench vorbis_encode`](#the-vorbis-encoder-suite---bench-vorbis_encode).
 
 ### No SIMD axis
 

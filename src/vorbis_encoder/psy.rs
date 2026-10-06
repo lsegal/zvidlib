@@ -73,7 +73,7 @@ pub(crate) struct PsyLook {
 /// Scratch buffers for the per-block psy functions (the C code uses alloca).
 #[derive(Debug, Default)]
 pub(crate) struct PsyScratch {
-    sums: NoiseSums,
+    acc: Vec<NoiseAcc>,
     work: Vec<f32>,
     seed: Vec<f32>,
     posstack: Vec<i32>,
@@ -736,65 +736,17 @@ pub(super) fn noise_compand_scalar(
 }
 
 /// Running sums of `bark_noise_hybridmp`: N, X, XX, Y, XY at one index.
+///
+/// `repr(C)` because the vector kernels load the first four sums of an entry
+/// as one 16-byte vector.
 #[derive(Debug, Clone, Copy, Default)]
-struct NoiseAcc {
-    n: f32,
-    x: f32,
-    xx: f32,
-    y: f32,
-    xy: f32,
-}
-
-/// The running sums of `bark_noise_hybridmp` for every bin, as the C code's
-/// five parallel arrays, so the fits over consecutive bins read consecutive
-/// floats.
-#[derive(Debug, Default)]
-pub(crate) struct NoiseSums {
-    pub(super) n: Vec<f32>,
-    pub(super) x: Vec<f32>,
-    pub(super) xx: Vec<f32>,
-    pub(super) y: Vec<f32>,
-    pub(super) xy: Vec<f32>,
-}
-
-impl NoiseSums {
-    #[cfg_attr(
-        not(any(target_arch = "x86_64", target_arch = "aarch64")),
-        allow(dead_code)
-    )]
-    pub(super) fn len(&self) -> usize {
-        self.n.len()
-    }
-
-    fn resize(&mut self, n: usize) {
-        for v in [
-            &mut self.n,
-            &mut self.x,
-            &mut self.xx,
-            &mut self.y,
-            &mut self.xy,
-        ] {
-            v.resize(n, 0.);
-        }
-    }
-
-    fn set(&mut self, i: usize, t: NoiseAcc) {
-        self.n[i] = t.n;
-        self.x[i] = t.x;
-        self.xx[i] = t.xx;
-        self.y[i] = t.y;
-        self.xy[i] = t.xy;
-    }
-
-    fn at(&self, i: usize) -> NoiseAcc {
-        NoiseAcc {
-            n: self.n[i],
-            x: self.x[i],
-            xx: self.xx[i],
-            y: self.y[i],
-            xy: self.xy[i],
-        }
-    }
+#[repr(C)]
+pub(crate) struct NoiseAcc {
+    pub(super) n: f32,
+    pub(super) x: f32,
+    pub(super) xx: f32,
+    pub(super) y: f32,
+    pub(super) xy: f32,
 }
 
 /// One least-squares evaluation of `bark_noise_hybridmp`. `reflect` selects
@@ -817,25 +769,27 @@ fn noise_fit(hi: &NoiseAcc, lo: &NoiseAcc, reflect: bool) -> (f32, f32, f32) {
 }
 
 /// The fit over bark window `w` (`lo << 16 | hi`); `reflect` mirrors `lo`.
-fn bark_fit(sums: &NoiseSums, w: i32, reflect: bool) -> (f32, f32, f32) {
+#[inline(always)]
+fn bark_fit(acc: &[NoiseAcc], w: i32, reflect: bool) -> (f32, f32, f32) {
     let (lo, hi) = (w >> 16, w & 0xffff);
     let lo = if reflect { -lo } else { lo };
-    noise_fit(&sums.at(hi as usize), &sums.at(lo as usize), reflect)
+    noise_fit(&acc[hi as usize], &acc[lo as usize], reflect)
 }
 
 /// The fit over the `fixed`-bin window centred on bin `i`.
-fn fixed_fit(sums: &NoiseSums, fixed: i32, i: usize, reflect: bool) -> (f32, f32, f32) {
+#[inline(always)]
+fn fixed_fit(acc: &[NoiseAcc], fixed: i32, i: usize, reflect: bool) -> (f32, f32, f32) {
     let hi = i as i32 + fixed / 2;
     let lo = hi - fixed;
     let lo = if reflect { -lo } else { lo };
-    noise_fit(&sums.at(hi as usize), &sums.at(lo as usize), reflect)
+    noise_fit(&acc[hi as usize], &acc[lo as usize], reflect)
 }
 
 /// `bark_noise_hybridmp`'s first pass over bins `start..end`, whose bark
 /// windows all straddle bin 0 (`reflect`) or all lie inside the spectrum.
 /// C's running `x` counter is exactly `i` for every block size.
 pub(super) fn noise_bark_scalar(
-    sums: &NoiseSums,
+    acc: &[NoiseAcc],
     b: &[i32],
     start: usize,
     end: usize,
@@ -844,7 +798,7 @@ pub(super) fn noise_bark_scalar(
     noise: &mut [f32],
 ) {
     for i in start..end {
-        let (a, bb, d) = bark_fit(sums, b[i], reflect);
+        let (a, bb, d) = bark_fit(acc, b[i], reflect);
         let mut r = (a + i as f32 * bb) / d;
         if r < 0. {
             r = 0.;
@@ -856,7 +810,7 @@ pub(super) fn noise_bark_scalar(
 /// `bark_noise_hybridmp`'s second (fixed-window) pass over bins
 /// `start..end`, lowering `noise` where the fit comes out below it.
 pub(super) fn noise_fixed_scalar(
-    sums: &NoiseSums,
+    acc: &[NoiseAcc],
     fixed: i32,
     start: usize,
     end: usize,
@@ -865,7 +819,7 @@ pub(super) fn noise_fixed_scalar(
     noise: &mut [f32],
 ) {
     for (i, v) in noise.iter_mut().enumerate().take(end).skip(start) {
-        let (a, bb, d) = fixed_fit(sums, fixed, i, reflect);
+        let (a, bb, d) = fixed_fit(acc, fixed, i, reflect);
         let r = (a + i as f32 * bb) / d;
         if r - offset < *v {
             *v = r - offset;
@@ -899,30 +853,9 @@ pub(super) fn noise_extrapolate_scalar(
     }
 }
 
-/// Port of psy.c `bark_noise_hybridmp`.
-///
-/// C runs each pass as three loops, each stopping at the first bin whose
-/// window leaves its shape (straddling bin 0, inside the spectrum, past it).
-/// Here the segment boundaries are found first and each segment is then
-/// evaluated through [`super::simd`]; the (A, B, D) the C loops carry into
-/// the extrapolated tail is the fit of the last bin evaluated, recomputed.
-#[allow(clippy::too_many_arguments)]
-fn bark_noise_hybridmp(
-    isa: SimdIsa,
-    s: &mut PsyScratch,
-    n: usize,
-    b: &[i32],
-    f: &[f32],
-    noise: &mut [f32],
-    offset: f32,
-    fixed: i32,
-) {
-    // every element is written by the accumulation loop below
-    let sums = &mut s.sums;
-    sums.resize(n);
-    let noise = &mut noise[..n];
-    let b = &b[..n];
-
+/// The running sums `bark_noise_hybridmp` fits against, one entry per bin of
+/// `acc`. Each sum depends on the one before it, so both arms share this.
+fn running_sums(acc: &mut [NoiseAcc], f: &[f32], offset: f32) {
     let mut t = NoiseAcc::default();
 
     let mut y = f[0] + offset;
@@ -935,10 +868,10 @@ fn bark_noise_hybridmp(
     t.n += w;
     t.x += w;
     t.y += w * y;
-    sums.set(0, t);
+    acc[0] = t;
 
     let mut x = 1f32;
-    for (i, &fi) in f.iter().enumerate().take(n).skip(1) {
+    for (ai, &fi) in acc.iter_mut().zip(f).skip(1) {
         let mut y = fi + offset;
         if y < 1. {
             y = 1.;
@@ -951,10 +884,56 @@ fn bark_noise_hybridmp(
         t.y += w * y;
         t.xy += w * x * y;
 
-        sums.set(i, t);
+        *ai = t;
         x += 1.;
     }
-    let sums = &s.sums;
+}
+
+/// Port of psy.c `bark_noise_hybridmp`: [`bark_noise_hybridmp_scalar`] on
+/// [`SimdIsa::Scalar`], [`bark_noise_hybridmp_segmented`] where `isa` has
+/// vector kernels. The two agree bit for bit.
+#[allow(clippy::too_many_arguments)]
+fn bark_noise_hybridmp(
+    isa: SimdIsa,
+    s: &mut PsyScratch,
+    n: usize,
+    b: &[i32],
+    f: &[f32],
+    noise: &mut [f32],
+    offset: f32,
+    fixed: i32,
+) {
+    if super::simd::has_kernels(isa) {
+        bark_noise_hybridmp_segmented(isa, s, n, b, f, noise, offset, fixed);
+    } else {
+        bark_noise_hybridmp_scalar(s, n, b, f, noise, offset, fixed);
+    }
+}
+
+/// `bark_noise_hybridmp` arranged for the vector kernels.
+///
+/// C runs each pass as three loops, each stopping at the first bin whose
+/// window leaves its shape (straddling bin 0, inside the spectrum, past it).
+/// Here the segment boundaries are found first and each segment is then
+/// evaluated through [`super::simd`]; the (A, B, D) the C loops carry into
+/// the extrapolated tail is the fit of the last bin evaluated, recomputed.
+#[allow(clippy::too_many_arguments)]
+fn bark_noise_hybridmp_segmented(
+    isa: SimdIsa,
+    s: &mut PsyScratch,
+    n: usize,
+    b: &[i32],
+    f: &[f32],
+    noise: &mut [f32],
+    offset: f32,
+    fixed: i32,
+) {
+    // every element is written by `running_sums`
+    s.acc.resize(n, NoiseAcc::default());
+    running_sums(&mut s.acc[..n], f, offset);
+    let acc = &s.acc[..n];
+    let noise = &mut noise[..n];
+    let b = &b[..n];
 
     let ni = n as i32;
     let mut i = 0usize;
@@ -977,13 +956,13 @@ fn bark_noise_hybridmp(
     }
     let fitted = i;
 
-    super::simd::noise_bark(isa, sums, b, 0, reflected, true, offset, noise);
-    super::simd::noise_bark(isa, sums, b, reflected, fitted, false, offset, noise);
+    super::simd::noise_bark(isa, acc, b, 0, reflected, true, offset, noise);
+    super::simd::noise_bark(isa, acc, b, reflected, fitted, false, offset, noise);
     let mut fit = (0f32, 0f32, 1f32);
     if fitted > reflected {
-        fit = bark_fit(sums, b[fitted - 1], false);
+        fit = bark_fit(acc, b[fitted - 1], false);
     } else if reflected > 0 {
-        fit = bark_fit(sums, b[reflected - 1], true);
+        fit = bark_fit(acc, b[reflected - 1], true);
     }
     super::simd::noise_extrapolate(isa, fit, fitted, n, offset, false, noise);
 
@@ -1011,14 +990,137 @@ fn bark_noise_hybridmp(
     }
     let fitted = i;
 
-    super::simd::noise_fixed(isa, sums, fixed, 0, reflected, true, offset, noise);
-    super::simd::noise_fixed(isa, sums, fixed, reflected, fitted, false, offset, noise);
+    super::simd::noise_fixed(isa, acc, fixed, 0, reflected, true, offset, noise);
+    super::simd::noise_fixed(isa, acc, fixed, reflected, fitted, false, offset, noise);
     if fitted > reflected {
-        fit = fixed_fit(sums, fixed, fitted - 1, false);
+        fit = fixed_fit(acc, fixed, fitted - 1, false);
     } else if reflected > 0 {
-        fit = fixed_fit(sums, fixed, reflected - 1, true);
+        fit = fixed_fit(acc, fixed, reflected - 1, true);
     }
     super::simd::noise_extrapolate(isa, fit, fitted, n, offset, true, noise);
+}
+
+/// Port of psy.c `bark_noise_hybridmp`, as written in C: the scalar arm, and
+/// the reference the vector arm is held to.
+fn bark_noise_hybridmp_scalar(
+    s: &mut PsyScratch,
+    n: usize,
+    b: &[i32],
+    f: &[f32],
+    noise: &mut [f32],
+    offset: f32,
+    fixed: i32,
+) {
+    // every element is written by `running_sums`
+    s.acc.resize(n, NoiseAcc::default());
+    let acc = &mut s.acc[..n];
+    running_sums(acc, f, offset);
+    let noise = &mut noise[..n];
+    let b = &b[..n];
+
+    let mut a = 0f32;
+    let mut bb = 0f32;
+    let mut d = 1f32;
+
+    let ni = n as i32;
+    let mut i = 0usize;
+    let mut x = 0f32;
+    while i < n {
+        let lo = b[i] >> 16;
+        let hi = b[i] & 0xffff;
+        if lo >= 0 || -lo >= ni {
+            break;
+        }
+        if hi >= ni {
+            break;
+        }
+        (a, bb, d) = noise_fit(&acc[hi as usize], &acc[(-lo) as usize], true);
+        let mut r = (a + x * bb) / d;
+        if r < 0. {
+            r = 0.;
+        }
+        noise[i] = r - offset;
+        i += 1;
+        x += 1.;
+    }
+
+    while i < n {
+        let lo = b[i] >> 16;
+        let hi = b[i] & 0xffff;
+        if lo < 0 || lo >= ni {
+            break;
+        }
+        if hi >= ni {
+            break;
+        }
+        (a, bb, d) = noise_fit(&acc[hi as usize], &acc[lo as usize], false);
+        let mut r = (a + x * bb) / d;
+        if r < 0. {
+            r = 0.;
+        }
+        noise[i] = r - offset;
+        i += 1;
+        x += 1.;
+    }
+
+    while i < n {
+        let mut r = (a + x * bb) / d;
+        if r < 0. {
+            r = 0.;
+        }
+        noise[i] = r - offset;
+        i += 1;
+        x += 1.;
+    }
+
+    if fixed <= 0 {
+        return;
+    }
+
+    let mut i = 0usize;
+    let mut x = 0f32;
+    while i < n {
+        let hi = i as i32 + fixed / 2;
+        let lo = hi - fixed;
+        if hi >= ni {
+            break;
+        }
+        if lo >= 0 {
+            break;
+        }
+        (a, bb, d) = noise_fit(&acc[hi as usize], &acc[(-lo) as usize], true);
+        let r = (a + x * bb) / d;
+        if r - offset < noise[i] {
+            noise[i] = r - offset;
+        }
+        i += 1;
+        x += 1.;
+    }
+    while i < n {
+        let hi = i as i32 + fixed / 2;
+        let lo = hi - fixed;
+        if hi >= ni {
+            break;
+        }
+        if lo < 0 {
+            break;
+        }
+        (a, bb, d) = noise_fit(&acc[hi as usize], &acc[lo as usize], false);
+        let r = (a + x * bb) / d;
+        if r - offset < noise[i] {
+            noise[i] = r - offset;
+        }
+        i += 1;
+        x += 1.;
+    }
+    while i < n {
+        let r = (a + x * bb) / d;
+        if r - offset < noise[i] {
+            noise[i] = r - offset;
+        }
+        i += 1;
+        x += 1.;
+    }
 }
 
 /// psy.c `_vp_ampmax_decay`
