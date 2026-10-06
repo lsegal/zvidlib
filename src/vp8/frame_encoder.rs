@@ -24,6 +24,7 @@ use super::loop_filter::{FrameFilter, MacroblockFilter, filter_frame};
 use super::predict::{
     Plane, idct_add, macroblock_edges, predict_block, predict_inter, predict_subblock,
 };
+use super::simd;
 use super::tables::*;
 use crate::{Error, ErrorKind, Result};
 use std::sync::Arc;
@@ -392,7 +393,7 @@ impl FrameEncoder {
             for block in 0..4 {
                 let offset = origin + (block >> 1) * 4 * stride + (block & 1) * 4;
                 let index = 16 + (plane - 1) * 4 + block;
-                let coefficients = forward_dct(&residual(source, prediction, offset));
+                let coefficients = residual_dct(source, prediction, offset);
                 (macroblock.levels[index], dequantized[index]) =
                     quantize(&coefficients, quantizer.uv, 0);
             }
@@ -1136,13 +1137,24 @@ fn motion_search(
 /// The sum of absolute differences between the source macroblock at
 /// `(x0, y0)` and the reference displaced by whole samples, with the
 /// reference extended beyond its edges.
-fn sad16_full(source: &Plane, reference: &Plane, x0: usize, y0: usize, dx: i32, dy: i32) -> u32 {
+pub(super) fn sad16_full(source: &Plane, reference: &Plane, x0: usize, y0: usize, dx: i32, dy: i32) -> u32 {
     let rx = x0 as i32 + dx;
     let ry = y0 as i32 + dy;
     let inside = rx >= 0
         && ry >= 0
         && rx as usize + 16 <= reference.width
         && ry as usize + 16 <= reference.height;
+    if inside {
+        let start = ry as usize * reference.width + rx as usize;
+        if let Some(sum) = simd::sad16(
+            &source.data[y0 * source.width + x0..],
+            source.width,
+            &reference.data[start..],
+            reference.width,
+        ) {
+            return sum;
+        }
+    }
     let mut sum = 0;
     for row in 0..16 {
         let source_row = &source.data[(y0 + row) * source.width + x0..][..16];
@@ -1163,8 +1175,16 @@ fn sad16_full(source: &Plane, reference: &Plane, x0: usize, y0: usize, dx: i32, 
     sum
 }
 
-fn sad16(source: &Plane, prediction: &Plane, origin: usize) -> u32 {
+pub(super) fn sad16(source: &Plane, prediction: &Plane, origin: usize) -> u32 {
     let stride = source.width;
+    if let Some(sum) = simd::sad16(
+        &source.data[origin..],
+        stride,
+        &prediction.data[origin..],
+        stride,
+    ) {
+        return sum;
+    }
     let mut sum = 0;
     for row in 0..16 {
         let start = origin + row * stride;
@@ -1193,7 +1213,11 @@ fn residual(source: &Plane, prediction: &Plane, offset: usize) -> [i16; 16] {
 
 /// The sum of absolute 4x4 Hadamard-transformed differences, halved: a
 /// cheap estimate of a residual's coding cost.
-fn satd4(block: &[i16; 16]) -> u32 {
+pub(super) fn satd4(block: &[i16; 16]) -> u32 {
+    simd::satd4(block).unwrap_or_else(|| satd4_scalar(block))
+}
+
+fn satd4_scalar(block: &[i16; 16]) -> u32 {
     let mut temp = [0i32; 16];
     for row in 0..4 {
         let r = &block[row * 4..row * 4 + 4];
@@ -1227,13 +1251,16 @@ fn satd4(block: &[i16; 16]) -> u32 {
 }
 
 /// The SATD of the `N`x`N` block at `origin` of two planes of one size.
-fn satd<const N: usize>(source: &Plane, prediction: &Plane, origin: usize) -> u32 {
+pub(super) fn satd<const N: usize>(source: &Plane, prediction: &Plane, origin: usize) -> u32 {
     let stride = source.width;
+    if let Some(sum) = simd::satd(&source.data, &prediction.data, origin, stride, N) {
+        return sum;
+    }
     let mut sum = 0;
     for block_y in 0..N / 4 {
         for block_x in 0..N / 4 {
             let offset = origin + block_y * 4 * stride + block_x * 4;
-            sum += satd4(&residual(source, prediction, offset));
+            sum += satd4_scalar(&residual(source, prediction, offset));
         }
     }
     sum
@@ -1353,7 +1380,7 @@ fn code_subblocks(
         for mode in 0..10 {
             predict_subblock(mode, &above, &left, &mut plane.data, offset, stride);
             let cost = quantizer.cost(
-                satd4(&residual(&source[0], plane, offset)),
+                satd::<4>(&source[0], plane, offset),
                 tree_cost(&B_MODE_TREE, probabilities, mode),
             );
             if cost < chosen.1 {
@@ -1362,7 +1389,7 @@ fn code_subblocks(
         }
         modes[block] = chosen.0;
         predict_subblock(chosen.0, &above, &left, &mut plane.data, offset, stride);
-        let coefficients = forward_dct(&residual(&source[0], plane, offset));
+        let coefficients = residual_dct(&source[0], plane, offset);
         (levels[block], dequantized[block]) = quantize(&coefficients, quantizer.y1, 0);
         if dequantized[block].iter().any(|&value| value != 0) {
             idct_add(&dequantized[block], &mut plane.data, offset, stride);
@@ -1434,7 +1461,7 @@ fn quantize_luma_with_y2(
     let mut dc = [0i16; 16];
     for block in 0..16 {
         let offset = origin + (block >> 2) * 4 * stride + (block & 3) * 4;
-        let coefficients = forward_dct(&residual(source, prediction, offset));
+        let coefficients = residual_dct(source, prediction, offset);
         dc[block] = coefficients[0];
         (levels[block], dequantized[block]) = quantize(&coefficients, quantizer.y1, 1);
     }
@@ -1443,7 +1470,16 @@ fn quantize_luma_with_y2(
 
 /// Quantizes a block's coefficients (raster order) from zigzag position
 /// `first`, returning the levels and their dequantized values.
-fn quantize(coefficients: &[i16; 16], factors: [i32; 2], first: usize) -> ([i16; 16], [i16; 16]) {
+pub(super) fn quantize(coefficients: &[i16; 16], factors: [i32; 2], first: usize) -> ([i16; 16], [i16; 16]) {
+    simd::quantize(coefficients, factors, first)
+        .unwrap_or_else(|| quantize_scalar(coefficients, factors, first))
+}
+
+fn quantize_scalar(
+    coefficients: &[i16; 16],
+    factors: [i32; 2],
+    first: usize,
+) -> ([i16; 16], [i16; 16]) {
     let mut levels = [0i16; 16];
     let mut dequantized = [0i16; 16];
     for (index, &position) in ZIGZAG.iter().enumerate().skip(first) {
@@ -1458,6 +1494,13 @@ fn quantize(coefficients: &[i16; 16], factors: [i32; 2], first: usize) -> ([i16;
         dequantized[position] = (level * step) as i16;
     }
     (levels, dequantized)
+}
+
+/// The forward DCT of the residual of the 4x4 block at `offset` of two
+/// planes of one size.
+pub(super) fn residual_dct(source: &Plane, prediction: &Plane, offset: usize) -> [i16; 16] {
+    simd::residual_dct(&source.data, &prediction.data, offset, source.width)
+        .unwrap_or_else(|| forward_dct(&residual(source, prediction, offset)))
 }
 
 /// libvpx's forward 4x4 DCT (`vp8_short_fdct4x4_c`), raster order.
@@ -1490,7 +1533,11 @@ fn forward_dct(input: &[i16; 16]) -> [i16; 16] {
 
 /// libvpx's forward Walsh-Hadamard transform (`vp8_short_walsh4x4_c`) of
 /// the 16 luma DC coefficients in raster order.
-fn forward_walsh(input: &[i16; 16]) -> [i16; 16] {
+pub(super) fn forward_walsh(input: &[i16; 16]) -> [i16; 16] {
+    simd::forward_walsh(input).unwrap_or_else(|| forward_walsh_scalar(input))
+}
+
+fn forward_walsh_scalar(input: &[i16; 16]) -> [i16; 16] {
     let mut temp = [0i32; 16];
     for row in 0..4 {
         let ip = &input[row * 4..row * 4 + 4];
@@ -1620,6 +1667,56 @@ mod tests {
             };
             assert!(average > floor, "q {q}: {average:.1} dB");
         }
+    }
+
+    /// The vector kernels may only change how fast a frame is coded, never
+    /// which modes, vectors and levels are chosen or what a decoder rebuilds,
+    /// so every instruction set has to write the same bytes and reconstruct
+    /// the same pictures as scalar. Frame sizes that are not whole macroblocks
+    /// put motion search and the loop filter at the frame's edges too.
+    #[test]
+    fn bitstreams_are_byte_identical_under_every_instruction_set() {
+        use crate::simd::{self, SimdIsa};
+
+        let encode = |width: usize, height: usize, q: u8| {
+            let mut encoder = FrameEncoder::new(width, height);
+            let mut decoder = super::super::decoder::Decoder::new(crate::Limits::default());
+            let mut output = Vec::new();
+            for index in 0..8 {
+                let data = encoder
+                    .encode(&source(width, height, index), index % 4 == 0, q)
+                    .unwrap();
+                let picture = decoder.decode(&data).unwrap().expect("a shown frame");
+                output.push((data, encoder.reconstruction(), picture.planes));
+            }
+            output
+        };
+        let _guard = simd::test_lock();
+        for (width, height) in [(70, 50), (128, 96)] {
+            for q in [0u8, 24, 90] {
+                simd::set_override(Some(SimdIsa::Scalar));
+                let reference = encode(width, height, q);
+                for isa in simd::available() {
+                    if isa == SimdIsa::Scalar {
+                        continue;
+                    }
+                    simd::set_override(Some(isa));
+                    let actual = encode(width, height, q);
+                    for (index, (actual, reference)) in actual.iter().zip(&reference).enumerate() {
+                        let same = actual == reference;
+                        if !same {
+                            simd::set_override(None);
+                        }
+                        assert!(
+                            same,
+                            "{width}x{height} q {q} frame {index}: {} diverged from scalar",
+                            isa.name()
+                        );
+                    }
+                }
+            }
+        }
+        simd::set_override(None);
     }
 
     #[test]

@@ -72,6 +72,22 @@ pub(crate) trait I32x: Copy {
     unsafe fn gt(self, other: Self) -> Self;
     /// Sum of all lanes.
     unsafe fn hsum(self) -> i32;
+    /// Sign-extends `LANES` 16-bit values from the front of `src`
+    /// (`src.len() >= LANES`).
+    unsafe fn load_i16(src: &[i16]) -> Self;
+    /// Stores the low 16 bits of every lane to the front of `dst`
+    /// (`dst.len() >= LANES`): the `as i16` truncation, not a saturation.
+    unsafe fn store_i16(self, dst: &mut [i16]);
+    /// Lane-wise `self / divisor` for `self >= 0` and `divisor >= 1`.
+    ///
+    /// None of the three instruction sets has an integer divide, so this goes
+    /// through `f64`, which is exact rather than approximate here: both
+    /// operands are integers below `2^31`, so the correctly rounded quotient
+    /// `q` of `n / d` errs by at most `q * 2^-53 < 2^-22 / d`, while a quotient
+    /// that is not an integer lies at least `1 / d` from the next one. The
+    /// truncating conversion back to `i32` therefore always lands on `n / d`
+    /// as integer division computes it.
+    unsafe fn div_nonneg(self, divisor: Self) -> Self;
     #[inline(always)]
     unsafe fn zero() -> Self {
         unsafe { Self::splat(0) }
@@ -243,6 +259,34 @@ mod x86 {
             unsafe { _mm_storeu_si128(dst.as_mut_ptr().cast(), self.0) }
         }
         #[inline(always)]
+        unsafe fn load_i16(src: &[i16]) -> Self {
+            unsafe { Self(_mm_cvtepi16_epi32(_mm_loadl_epi64(src[..4].as_ptr().cast()))) }
+        }
+        #[inline(always)]
+        unsafe fn store_i16(self, dst: &mut [i16]) {
+            unsafe {
+                // `packus_epi32` saturates, so the low halves are masked off
+                // first and the pack becomes an exact truncation.
+                let low = _mm_and_si128(self.0, _mm_set1_epi32(0xffff));
+                let packed = _mm_packus_epi32(low, low);
+                _mm_storel_epi64(dst[..4].as_mut_ptr().cast(), packed);
+            }
+        }
+        #[inline(always)]
+        unsafe fn div_nonneg(self, divisor: Self) -> Self {
+            unsafe {
+                let low = _mm_div_pd(_mm_cvtepi32_pd(self.0), _mm_cvtepi32_pd(divisor.0));
+                let high = _mm_div_pd(
+                    _mm_cvtepi32_pd(_mm_unpackhi_epi64(self.0, self.0)),
+                    _mm_cvtepi32_pd(_mm_unpackhi_epi64(divisor.0, divisor.0)),
+                );
+                Self(_mm_unpacklo_epi64(
+                    _mm_cvttpd_epi32(low),
+                    _mm_cvttpd_epi32(high),
+                ))
+            }
+        }
+        #[inline(always)]
         unsafe fn load_u8(src: &[u8]) -> Self {
             unsafe {
                 let bytes = u32::from_le_bytes([src[0], src[1], src[2], src[3]]);
@@ -390,6 +434,41 @@ mod x86 {
         #[inline(always)]
         unsafe fn store(self, dst: &mut [i32]) {
             unsafe { _mm256_storeu_si256(dst.as_mut_ptr().cast(), self.0) }
+        }
+        #[inline(always)]
+        unsafe fn load_i16(src: &[i16]) -> Self {
+            unsafe { Self(_mm256_cvtepi16_epi32(_mm_loadu_si128(src[..8].as_ptr().cast()))) }
+        }
+        #[inline(always)]
+        unsafe fn store_i16(self, dst: &mut [i16]) {
+            unsafe {
+                // Masked first so the saturating pack truncates exactly, and
+                // packed as two 128-bit halves so the result stays in lane
+                // order rather than `_mm256_packus_epi32`'s per-half interleave.
+                let low = _mm256_and_si256(self.0, _mm256_set1_epi32(0xffff));
+                let packed = _mm_packus_epi32(
+                    _mm256_castsi256_si128(low),
+                    _mm256_extracti128_si256::<1>(low),
+                );
+                _mm_storeu_si128(dst[..8].as_mut_ptr().cast(), packed);
+            }
+        }
+        #[inline(always)]
+        unsafe fn div_nonneg(self, divisor: Self) -> Self {
+            unsafe {
+                let low = _mm256_div_pd(
+                    _mm256_cvtepi32_pd(_mm256_castsi256_si128(self.0)),
+                    _mm256_cvtepi32_pd(_mm256_castsi256_si128(divisor.0)),
+                );
+                let high = _mm256_div_pd(
+                    _mm256_cvtepi32_pd(_mm256_extracti128_si256::<1>(self.0)),
+                    _mm256_cvtepi32_pd(_mm256_extracti128_si256::<1>(divisor.0)),
+                );
+                Self(_mm256_set_m128i(
+                    _mm256_cvttpd_epi32(high),
+                    _mm256_cvttpd_epi32(low),
+                ))
+            }
         }
         #[inline(always)]
         unsafe fn load_u8(src: &[u8]) -> Self {
@@ -572,6 +651,33 @@ mod arm {
         #[inline(always)]
         unsafe fn store(self, dst: &mut [i32]) {
             unsafe { vst1q_s32(dst.as_mut_ptr(), self.0) }
+        }
+        #[inline(always)]
+        unsafe fn load_i16(src: &[i16]) -> Self {
+            unsafe { Self(vmovl_s16(vld1_s16(src[..4].as_ptr()))) }
+        }
+        #[inline(always)]
+        unsafe fn store_i16(self, dst: &mut [i16]) {
+            // `vmovn` keeps the low half of each lane: a truncation.
+            unsafe { vst1_s16(dst[..4].as_mut_ptr(), vmovn_s32(self.0)) }
+        }
+        #[inline(always)]
+        unsafe fn div_nonneg(self, divisor: Self) -> Self {
+            unsafe {
+                let low = vdivq_f64(
+                    vcvtq_f64_s64(vmovl_s32(vget_low_s32(self.0))),
+                    vcvtq_f64_s64(vmovl_s32(vget_low_s32(divisor.0))),
+                );
+                let high = vdivq_f64(
+                    vcvtq_f64_s64(vmovl_high_s32(self.0)),
+                    vcvtq_f64_s64(vmovl_high_s32(divisor.0)),
+                );
+                // `vcvtq_s64_f64` rounds toward zero, as `cvttpd` does.
+                Self(vcombine_s32(
+                    vmovn_s64(vcvtq_s64_f64(low)),
+                    vmovn_s64(vcvtq_s64_f64(high)),
+                ))
+            }
         }
         #[inline(always)]
         unsafe fn load_u8(src: &[u8]) -> Self {

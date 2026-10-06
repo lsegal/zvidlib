@@ -40,6 +40,7 @@ mod encoder;
 mod frame_encoder;
 mod loop_filter;
 mod predict;
+pub(crate) mod simd;
 mod tables;
 #[cfg(test)]
 mod tests;
