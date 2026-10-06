@@ -40,22 +40,79 @@ fn inverse_2d(
     shift: u32,
     skip_zero_rows: bool,
 ) {
-    let mut out = [0i32; 32 * 32];
-    for row in 0..rows {
-        let input_row = &input[row * n..row * n + n];
+    match n {
+        4 => inverse_2d_n::<4>(
+            input,
+            dest,
+            stride,
+            rows,
+            row_transform,
+            column_transform,
+            shift,
+            skip_zero_rows,
+        ),
+        8 => inverse_2d_n::<8>(
+            input,
+            dest,
+            stride,
+            rows,
+            row_transform,
+            column_transform,
+            shift,
+            skip_zero_rows,
+        ),
+        16 => inverse_2d_n::<16>(
+            input,
+            dest,
+            stride,
+            rows,
+            row_transform,
+            column_transform,
+            shift,
+            skip_zero_rows,
+        ),
+        _ => inverse_2d_n::<32>(
+            input,
+            dest,
+            stride,
+            rows,
+            row_transform,
+            column_transform,
+            shift,
+            skip_zero_rows,
+        ),
+    }
+}
+
+/// [`inverse_2d`] for one size, so the intermediate is only as large as the
+/// block.
+#[allow(clippy::too_many_arguments)]
+fn inverse_2d_n<const N: usize>(
+    input: &[i32],
+    dest: &mut [u8],
+    stride: usize,
+    rows: usize,
+    row_transform: Transform1d,
+    column_transform: Transform1d,
+    shift: u32,
+    skip_zero_rows: bool,
+) {
+    let mut out = [[0i32; N]; N];
+    for (row, output) in out.iter_mut().enumerate().take(rows) {
+        let input_row = &input[row * N..row * N + N];
         if skip_zero_rows && input_row.iter().fold(0i16, |acc, &v| acc | v as i16) == 0 {
             continue;
         }
-        row_transform(input_row, &mut out[row * n..row * n + n]);
+        row_transform(input_row, output);
     }
-    let mut column = [0i32; 32];
-    let mut result = [0i32; 32];
-    for x in 0..n {
-        for y in 0..n {
-            column[y] = out[y * n + x];
+    let mut column = [0i32; N];
+    let mut result = [0i32; N];
+    for x in 0..N {
+        for y in 0..N {
+            column[y] = out[y][x];
         }
-        column_transform(&column[..n], &mut result[..n]);
-        for y in 0..n {
+        column_transform(&column, &mut result);
+        for y in 0..N {
             let pixel = &mut dest[y * stride + x];
             *pixel = clip_pixel_add(*pixel, round_power_of_two(result[y], shift));
         }
@@ -447,9 +504,9 @@ pub(super) type Kernel = [[i16; 8]; 16];
 /// rows starting three rows above the origin, the intermediate libvpx clips
 /// to 8 bits before the vertical pass. Positions are in 1/16 pixel.
 ///
-/// A phase-zero tap set is the identity, so filtering a whole-pixel
-/// position this way gives what libvpx's copy and one-dimensional
-/// convolutions give.
+/// A phase-zero tap set is the identity, which is why libvpx's copy and
+/// one-dimensional convolutions give what this would; whole-pixel
+/// directions take those shortcuts here too.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn convolve(
     src: &[u8],
@@ -465,43 +522,101 @@ pub(super) fn convolve(
     y_frac: i32,
     y_step: i32,
     average: bool,
+    temp: &mut [u8; 64 * 135],
 ) {
+    #[inline]
+    fn store(pixel: &mut u8, value: u8, average: bool) {
+        *pixel = if average {
+            ((u32::from(*pixel) + u32::from(value) + 1) >> 1) as u8
+        } else {
+            value
+        };
+    }
+    #[inline]
+    fn filter(pixels: &[u8], taps: &[i16; 8]) -> u8 {
+        let mut sum = 0i32;
+        for k in 0..8 {
+            sum += i32::from(pixels[k]) * i32::from(taps[k]);
+        }
+        ((sum + 64) >> 7).clamp(0, 255) as u8
+    }
+    let whole_x = x_frac == 0 && x_step == 16;
+    let whole_y = y_frac == 0 && y_step == 16;
+
+    if whole_x && whole_y {
+        for y in 0..h {
+            let line = &src[origin + y * src_stride..][..w];
+            let out = &mut dest[y * stride..][..w];
+            if average {
+                for (pixel, &value) in out.iter_mut().zip(line) {
+                    store(pixel, value, true);
+                }
+            } else {
+                out.copy_from_slice(line);
+            }
+        }
+        return;
+    }
+    if whole_y {
+        for y in 0..h {
+            let line = &src[origin + y * src_stride - 3..];
+            let out = &mut dest[y * stride..][..w];
+            let mut x_q4 = x_frac;
+            for pixel in out {
+                let base = (x_q4 >> 4) as usize;
+                store(
+                    pixel,
+                    filter(&line[base..base + 8], &kernel[(x_q4 & 15) as usize]),
+                    average,
+                );
+                x_q4 += x_step;
+            }
+        }
+        return;
+    }
+    if whole_x {
+        let top = origin - 3 * src_stride;
+        let mut y_q4 = y_frac;
+        for y in 0..h {
+            let base = top + (y_q4 >> 4) as usize * src_stride;
+            let taps = &kernel[(y_q4 & 15) as usize];
+            let out = &mut dest[y * stride..y * stride + w];
+            for (x, pixel) in out.iter_mut().enumerate() {
+                let mut sum = 0i32;
+                for (k, &tap) in taps.iter().enumerate() {
+                    sum += i32::from(src[base + k * src_stride + x]) * i32::from(tap);
+                }
+                store(pixel, ((sum + 64) >> 7).clamp(0, 255) as u8, average);
+            }
+            y_q4 += y_step;
+        }
+        return;
+    }
+
     let intermediate_height = ((((h as i32 - 1) * y_step + y_frac) >> 4) + 8) as usize;
-    let mut temp = [0u8; 64 * 135];
     let top = origin - 3 * src_stride - 3;
     for row in 0..intermediate_height {
         let line = &src[top + row * src_stride..];
         let mut x_q4 = x_frac;
         for x in 0..w {
             let base = (x_q4 >> 4) as usize;
-            let taps = &kernel[(x_q4 & 15) as usize];
-            let pixels = &line[base..base + 8];
-            let mut sum = 0i32;
-            for k in 0..8 {
-                sum += i32::from(pixels[k]) * i32::from(taps[k]);
-            }
-            temp[row * 64 + x] = ((sum + 64) >> 7).clamp(0, 255) as u8;
+            temp[row * 64 + x] = filter(&line[base..base + 8], &kernel[(x_q4 & 15) as usize]);
             x_q4 += x_step;
         }
     }
-    for x in 0..w {
-        let mut y_q4 = y_frac;
-        for y in 0..h {
-            let base = (y_q4 >> 4) as usize;
-            let taps = &kernel[(y_q4 & 15) as usize];
+    let mut y_q4 = y_frac;
+    for y in 0..h {
+        let base = (y_q4 >> 4) as usize;
+        let taps = &kernel[(y_q4 & 15) as usize];
+        let out = &mut dest[y * stride..y * stride + w];
+        for (x, pixel) in out.iter_mut().enumerate() {
             let mut sum = 0i32;
-            for k in 0..8 {
-                sum += i32::from(temp[(base + k) * 64 + x]) * i32::from(taps[k]);
+            for (k, &tap) in taps.iter().enumerate() {
+                sum += i32::from(temp[(base + k) * 64 + x]) * i32::from(tap);
             }
-            let value = ((sum + 64) >> 7).clamp(0, 255) as u8;
-            let pixel = &mut dest[y * stride + x];
-            *pixel = if average {
-                ((u32::from(*pixel) + u32::from(value) + 1) >> 1) as u8
-            } else {
-                value
-            };
-            y_q4 += y_step;
+            store(pixel, ((sum + 64) >> 7).clamp(0, 255) as u8, average);
         }
+        y_q4 += y_step;
     }
 }
 
@@ -541,7 +656,20 @@ mod tests {
         let origin = 3 * 16 + 3;
         let mut dest = [0u8; 16];
         convolve(
-            &src, origin, 16, &mut dest, 4, 4, 4, &kernel, 0, 16, 0, 16, false,
+            &src,
+            origin,
+            16,
+            &mut dest,
+            4,
+            4,
+            4,
+            &kernel,
+            0,
+            16,
+            0,
+            16,
+            false,
+            &mut [0; 64 * 135],
         );
         for y in 0..4 {
             for x in 0..4 {

@@ -1148,6 +1148,7 @@ fn read_compressed_header(
 /// 0 makes studio range), and `None` for any other frame or for data that
 /// does not parse. A track's first sample is a key frame, so this is the
 /// range of its first picture, read without decoding it.
+#[cfg_attr(not(all(feature = "web", target_arch = "wasm32")), allow(dead_code))]
 pub(crate) fn chunk_full_range(data: &[u8]) -> Option<bool> {
     let first = match superframe_index(data).ok()? {
         Some(sizes) => data.get(..*sizes.first()?)?,

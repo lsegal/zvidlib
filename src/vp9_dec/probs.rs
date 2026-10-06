@@ -42,6 +42,15 @@ pub(super) const D207_PRED: i8 = 7;
 pub(super) const D63_PRED: i8 = 8;
 pub(super) const TM_PRED: i8 = 9;
 
+/// The coefficient probabilities of one transform size:
+/// `[plane type][ref][band][context][node]` (`vp9_coeff_probs_model`).
+pub(super) type CoefProbs = [[[[[u8; 3]; 6]; 6]; 2]; 2];
+
+/// The coefficient counts of one transform size, over the four model tokens
+/// (zero, one, more than one, end of block): `[plane type][ref][band]
+/// [context][token]` (`vp9_coeff_count_model`).
+pub(super) type CoefCounts = [[[[[u32; 4]; 6]; 6]; 2]; 2];
+
 /// The motion vector probabilities of one component (`nmv_component`).
 #[derive(Clone, Copy, Debug)]
 pub(super) struct MvComponentProbs {
@@ -61,8 +70,8 @@ pub(super) struct FrameContext {
     pub(super) y_mode: [[u8; 9]; 4],
     pub(super) uv_mode: [[u8; 9]; 10],
     pub(super) partition: [[u8; 3]; 16],
-    /// `[tx size][plane type][ref][band][context][node]`.
-    pub(super) coef: [[[[[[u8; 3]; 6]; 6]; 2]; 2]; 4],
+    /// Indexed by transform size.
+    pub(super) coef: [CoefProbs; 4],
     pub(super) switchable_interp: [[u8; 2]; 4],
     pub(super) inter_mode: [[u8; 3]; 7],
     pub(super) intra_inter: [u8; 4],
@@ -138,9 +147,8 @@ pub(super) struct FrameCounts {
     pub(super) y_mode: [[u32; 10]; 4],
     pub(super) uv_mode: [[u32; 10]; 10],
     pub(super) partition: [[u32; 4]; 16],
-    /// `[tx size][plane type][ref][band][context][token]` over the four
-    /// model tokens: zero, one, more than one, and end of block.
-    pub(super) coef: [[[[[[u32; 4]; 6]; 6]; 2]; 2]; 4],
+    /// Indexed by transform size.
+    pub(super) coef: [CoefCounts; 4],
     pub(super) eob_branch: [[[[[u32; 6]; 6]; 2]; 2]; 4],
     pub(super) switchable_interp: [[u32; 3]; 4],
     pub(super) inter_mode: [[u32; 4]; 7],
