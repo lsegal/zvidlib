@@ -298,7 +298,7 @@ fn media_foundation_vp8_matches_the_software_decoder_and_seeks_exactly() {
         "001", "002", "003", "004", "005", "006", "007", "008", "009", "010", "011", "012", "013",
         "014", "015", "016", "017", "018",
     )
-    .map(|(name, ivf, _)| (name, &ivf[..]))
+    .map(|(name, ivf, _)| (name, ivf))
     .to_vec();
     ivfs.push((
         "vp8_altref_98x66",
