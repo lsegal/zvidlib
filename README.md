@@ -70,6 +70,27 @@ const blob = await output.finish();
 console.log(blob.type); // "video/mp4"
 ```
 
+### WebM
+
+WebM is read and written alongside MP4 through the same indexed `get(n)`/`put(n)` API. `MediaInput.open` tells the two apart by the bytes themselves, never by a file name or MIME type: an EBML header whose `DocType` is `webm` or `matroska` is WebM, and `input.container` reports `"webm"`, `"mp4"`, or `null`. A WebM input's AV1 video tracks then answer `get(n)`, `frameDuration(n)`, `randomAccessPoints()` and `previews()` exactly as an MP4's do. `new CreateOptions("webm")` makes `MediaOutput.finish()` mux the encoded video into a seekable WebM and return a `video/webm` Blob; `supportedContainers()` lists both names.
+
+WebM permits only VP8, VP9 or AV1 video and Vorbis or Opus audio, so WebM output is AV1 video only: `output.audio(n)` and `setCoverArt()` reject with `UNSUPPORTED` on a WebM output, and so does `videoCodec = "hevc"`. On input, Opus and Vorbis tracks are skipped rather than refused, so a browser `MediaRecorder` capture still opens for its video; VP8 and VP9 video tracks report `UNSUPPORTED` until their decoders land.
+
+```js
+const options = new CreateOptions("webm");
+options.setTimeline(30, 1, 48_000);
+const output = await MediaOutput.create(options);
+for (let frameIndex = 0n; frameIndex < 90n; frameIndex++) {
+  await output.video(0).put(frameIndex, VideoFrame.rgba(width, height, pixels));
+}
+const webm = await output.finish(); // Blob { type: "video/webm" }
+const input = await MediaInput.open(webm);
+console.log(input.container); // "webm"
+const frame = await input.video(0).get(45n);
+```
+
+Natively, `WebmDemuxer::open` builds the same `Mp4Track` sample index `Mp4Demuxer::open` does, so `to_encoded_video_samples` and `ExactFrameReader` read a WebM track unchanged. It handles unknown-size Segments and Clusters (as live recorders write them), SimpleBlocks and BlockGroups, Xiph, EBML and fixed-size lacing, and any `TimestampScale`; `WebmDemuxer::seek_point` starts a decode from the file's `Cues` when it has them and from the scanned keyframes when it does not. `WebmMuxer` takes the same `Mp4TrackConfig` declarations `Mp4Muxer` does, writes payload bytes as samples arrive, and at `finish` fills in the Segment and Cluster sizes, the `Duration`, a `SeekHead`, and `Cues` with one cue per keyframe, which is what lets Chrome and Firefox seek the file. Samples are written in one presentation-time order across tracks, because a WebM Cluster interleaves them. `probe_container` detects either container from a `ByteSource`, and `container_capabilities` reports both.
+
 All exported 64-bit frame, sample, and timestamp values return JavaScript `BigInt`. Inputs accept `BigInt` across the full Rust range or validated `Number` values only within JavaScript's safe-integer range. Rust and boundary failures reject with native `Error` instances named `ZvidError`; their stable `code` values can be read directly or with `errorCode(error)`.
 
 Input `VideoStream` handles also expose `frameDuration(index)`, which resolves to that presentation
