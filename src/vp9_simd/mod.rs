@@ -41,6 +41,7 @@
     allow(dead_code, unused_variables, unreachable_code, unused_imports)
 )]
 
+pub mod bench;
 pub(crate) mod convolve;
 pub(crate) mod idct1d;
 pub(crate) mod intra;

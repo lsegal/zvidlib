@@ -89,8 +89,7 @@ fn transform_with(
     eob: usize,
     lossless: bool,
 ) -> bool {
-    let vector =
-        inverse_transform_add(isa, input, dest, stride, tx_size, tx_type, eob, lossless);
+    let vector = inverse_transform_add(isa, input, dest, stride, tx_size, tx_type, eob, lossless);
     if !vector {
         inverse_transform_add_scalar(input, dest, stride, tx_size, tx_type, eob, lossless);
     }
@@ -113,8 +112,16 @@ fn check_transform(rng: &mut Lcg, tx_size: u8, tx_type: u8, eob: usize, span: i3
     let mut vectorized_everywhere = true;
     for isa in vector_isas() {
         let mut actual = base.clone();
-        vectorized_everywhere &=
-            transform_with(isa, &input, &mut actual, stride, tx_size, tx_type, eob, false);
+        vectorized_everywhere &= transform_with(
+            isa,
+            &input,
+            &mut actual,
+            stride,
+            tx_size,
+            tx_type,
+            eob,
+            false,
+        );
         assert_eq!(
             actual,
             expected,
@@ -174,7 +181,12 @@ fn large_coefficients_match_or_fall_back() {
     // keeps in range.
     for tx_size in 0..4u8 {
         let n = 4usize << tx_size;
-        for value in [i32::from(i16::MAX), i32::from(i16::MIN), 1 << 20, -(1 << 24)] {
+        for value in [
+            i32::from(i16::MAX),
+            i32::from(i16::MIN),
+            1 << 20,
+            -(1 << 24),
+        ] {
             let input = vec![value; n * n];
             let mut expected = vec![128u8; n * n];
             inverse_transform_add_scalar(&input, &mut expected, n, tx_size, DCT_DCT, n * n, false);
@@ -470,8 +482,7 @@ fn loop_filters_match_the_scalar_reference() {
     let mut vectorized = 0usize;
     for sharpness in [0u8, 3, 7] {
         let table = thresholds(sharpness);
-        for level in 0..64usize {
-            let t = table[level];
+        for (level, &t) in table.iter().enumerate() {
             let base = filter_plane(&mut rng, width, height);
             for taps in [
                 loopfilter::Taps::Four,
@@ -550,7 +561,14 @@ fn loop_filter_edges_near_the_plane_border_stay_scalar() {
         8,
         loopfilter::Taps::Sixteen
     ));
-    assert!(loopfilter::covers(len, 4, 1, 64, 8, loopfilter::Taps::Eight));
+    assert!(loopfilter::covers(
+        len,
+        4,
+        1,
+        64,
+        8,
+        loopfilter::Taps::Eight
+    ));
     assert!(!loopfilter::covers(
         len,
         (60 * 64) as isize,

@@ -79,6 +79,13 @@ pub use hevc::bench as hevc_encoder_bench;
 #[doc(hidden)]
 pub use hevc::decode_bench as hevc_decoder_bench;
 
+/// Per-stage access to the VP9 decoder for the criterion benchmark suite.
+///
+/// Internal and unstable: the decoder's stages are not otherwise reachable
+/// from a benchmark, which is a separate crate. See `benches/vp9_decode.rs`.
+#[doc(hidden)]
+pub use vp9_simd::bench as vp9_decoder_bench;
+
 /// Stage attribution for a whole-frame HEVC decode.
 ///
 /// Internal and unstable. [`hevc_decoder_bench`] measures each kernel in

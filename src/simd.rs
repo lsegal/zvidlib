@@ -1,10 +1,10 @@
 //! The process-wide SIMD instruction-set override shared by every codec kernel.
 //!
-//! zvidlib's pure-Rust HEVC and AV1 codecs dispatch their hot loops to
+//! zvidlib's pure-Rust HEVC, AV1 and VP9 codecs dispatch their hot loops to
 //! runtime-detected vector kernels in several independent places: the AV1
 //! transforms and in-loop filters ([`crate::av1_simd`]), AV1 inter prediction
-//! ([`crate::av1_mc`]), AV1 intra prediction ([`crate::av1_intra_pred`]), and
-//! the HEVC engine's inter/intra prediction, in-loop filters, inverse
+//! ([`crate::av1_mc`]), AV1 intra prediction ([`crate::av1_intra_pred`]), the
+//! VP9 decoder's transforms, prediction and loop filter, and the HEVC engine's inter/intra prediction, in-loop filters, inverse
 //! transforms, encoder-side distortion metrics, and encoder-side color
 //! conversion. Each of those sites caches
 //! its own CPU feature probe, which is what you want in production but makes
@@ -46,10 +46,10 @@ static OVERRIDE: AtomicU8 = AtomicU8::new(0);
 /// Forces every SIMD-dispatched kernel in the crate onto `isa`, or restores
 /// per-site automatic detection with `None`.
 ///
-/// The override reaches all four dispatch families: the AV1 transform and
+/// The override reaches all five dispatch families: the AV1 transform and
 /// in-loop filter kernels, AV1 motion compensation (through the default level
-/// [`crate::av1_mc::McContext::new`] picks up), AV1 intra prediction, and every
-/// HEVC engine kernel. [`SimdIsa::Scalar`] therefore genuinely reaches the
+/// [`crate::av1_mc::McContext::new`] picks up), AV1 intra prediction, every VP9
+/// decoder kernel, and every HEVC engine kernel. [`SimdIsa::Scalar`] therefore genuinely reaches the
 /// scalar code path rather than merely the widest scalar-ish one.
 ///
 /// An instruction set this host cannot execute is clamped to
@@ -112,6 +112,7 @@ pub fn available() -> Vec<SimdIsa> {
 /// | `av1_mc` | AV1 motion compensation (the level [`crate::av1_mc::McContext::new`] picks) |
 /// | `av1_intra_pred` | AV1 intra prediction and residual reconstruction |
 /// | `av1_coeff_ctx` | AV1 encoder-side coefficient context derivation (§8.3.2) |
+/// | `vp9_decode` | VP9 decoder inverse transforms, inter and intra prediction, and loop filter |
 /// | `hevc_prediction_filters` | HEVC inter/intra prediction and in-loop filters |
 /// | `hevc_transforms` | HEVC inverse transforms and dequantization |
 /// | `hevc_rdcost` | HEVC encoder-side distortion metrics |
@@ -133,6 +134,7 @@ pub fn active_by_site() -> Vec<(&'static str, SimdIsa)> {
             from_intra_simd(crate::av1_intra_pred::av1_intra_simd()),
         ),
         ("av1_coeff_ctx", crate::av1_simd::coeff::active_isa()),
+        ("vp9_decode", crate::vp9_simd::active_isa()),
     ];
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -365,6 +367,8 @@ mod tests {
         // AV1 motion compensation, through the level `McContext::new` picks.
         assert_eq!(default_level(), SimdLevel::Scalar);
         assert_eq!(McContext::new().level(), SimdLevel::Scalar);
+        // VP9 decoder transforms, prediction and loop filter.
+        assert_eq!(crate::vp9_simd::active_isa(), SimdIsa::Scalar);
         // HEVC inter/intra prediction and in-loop filters.
         assert_eq!(hevc_simd::detected_isa(), hevc_simd::Isa::Scalar);
         // HEVC inverse transforms and dequantization.
@@ -388,6 +392,7 @@ mod tests {
             "av1_mc",
             "av1_intra_pred",
             "av1_coeff_ctx",
+            "vp9_decode",
             "hevc_prediction_filters",
             "hevc_transforms",
             "hevc_rdcost",
@@ -456,6 +461,8 @@ mod tests {
             default_level() != crate::av1_mc::SimdLevel::Scalar,
             vectorized
         );
+        // VP9 decoder transforms, prediction and loop filter.
+        assert_eq!(crate::vp9_simd::active_isa(), detected());
         // HEVC inter/intra prediction and in-loop filters.
         assert_eq!(
             hevc_simd::detected_isa() != hevc_simd::Isa::Scalar,
@@ -492,6 +499,7 @@ mod tests {
             "av1_mc",
             "av1_intra_pred",
             "av1_coeff_ctx",
+            "vp9_decode",
             "hevc_prediction_filters",
             "hevc_transforms",
             "hevc_rdcost",

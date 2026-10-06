@@ -24,6 +24,13 @@ OUTLINED_KERNEL = (
     "NtNtNtB4_6vector3x864Avx2EB6_"
 )
 
+# `vp9_simd::transforms::inverse_transform_add::<av1_simd::vector::x86::Avx2>`,
+# a VP9 kernel written over the AV1 vector types, outlined the same way.
+OUTLINED_VP9_KERNEL = (
+    "__RINvNtNtCs7lEMBtiCmc_7zvidlib8vp9_simd10transforms21inverse_transform_add"
+    "NtNtNtB6_8av1_simd6vector3x864Avx2EB8_"
+)
+
 # `core::core_arch::x86::avx2::_mm256_and_si256`, an intrinsic emitted as a
 # function because the caller was not compiled with AVX2 enabled.
 INTRINSIC = "__RNvNtNtNtCsl7QZrza34zr_4core9core_arch3x864avx216__mm256_and_si256"
@@ -64,6 +71,9 @@ class ClassificationTest(unittest.TestCase):
 
     def test_a_generic_kernel_instantiation_is_outlined(self):
         self.assertTrue(checker.is_outlined_kernel(OUTLINED_KERNEL))
+
+    def test_a_generic_vp9_kernel_instantiation_is_outlined(self):
+        self.assertTrue(checker.is_outlined_kernel(OUTLINED_VP9_KERNEL))
 
     def test_an_intrinsic_is_recognized(self):
         self.assertTrue(checker.is_core_arch(INTRINSIC))
