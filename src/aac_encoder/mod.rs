@@ -14,9 +14,9 @@
 //! emitted, so a muxed track trims to exactly the samples the caller encoded.
 
 #[cfg(target_os = "macos")]
-mod audiotoolbox;
+pub(crate) mod audiotoolbox;
 #[cfg(windows)]
-mod windows_mf;
+pub(crate) mod windows_mf;
 
 use crate::codec::parse_audio_bit_rate;
 use crate::{

@@ -237,7 +237,7 @@ fn factory_advertises_only_the_implemented_surface() {
         factory.capability(&invalid),
         CodecSupport::InvalidConfiguration { .. }
     ));
-    for blob in [vec![0], vec![40, 0, 0], vec![1, 2]] {
+    for blob in [vec![0], vec![40, 0, 0], vec![1, 2], vec![40, 0, 1, 0x80]] {
         invalid = configuration(64, 48, PixelFormat::Yuv420p8);
         invalid.configuration = blob;
         assert!(matches!(
@@ -335,7 +335,10 @@ fn hardware_requests_map_the_quantizer_onto_quality() {
     assert!(rejected(full).contains("limited-range"));
     let mut blob = configuration(64, 48, PixelFormat::Rgba8);
     blob.configuration = vec![0];
-    assert_eq!(rejected(blob), CONFIGURATION_SHAPE);
+    assert_eq!(rejected(blob.clone()), CONFIGURATION_SHAPE);
+    // Error resilience is the software encoder's alone.
+    blob.configuration = vec![60, 0, 5, FLAG_ERROR_RESILIENT];
+    assert!(rejected(blob).contains("error resilient"));
 }
 
 /// A hardware encoder's samples are sync samples exactly when they open on a
@@ -368,17 +371,98 @@ fn key_frame_vpcc_finds_key_frames_and_their_colour() {
 }
 
 #[test]
-fn configuration_selects_quantizer_and_keyframe_interval() {
+fn configuration_selects_quantizer_keyframe_interval_and_error_resilience() {
+    let settings = |base_q_idx, keyframe_interval, error_resilient| {
+        Some(Settings {
+            base_q_idx,
+            keyframe_interval,
+            error_resilient,
+        })
+    };
     assert_eq!(
         parse_configuration(&[]),
-        Some((DEFAULT_BASE_Q_IDX, DEFAULT_KEYFRAME_INTERVAL))
+        settings(DEFAULT_BASE_Q_IDX, DEFAULT_KEYFRAME_INTERVAL, false)
     );
     assert_eq!(
         parse_configuration(&[200]),
-        Some((200, DEFAULT_KEYFRAME_INTERVAL))
+        settings(200, DEFAULT_KEYFRAME_INTERVAL, false)
     );
-    assert_eq!(parse_configuration(&[30, 1, 2]), Some((30, 258)));
+    assert_eq!(parse_configuration(&[30, 1, 2]), settings(30, 258, false));
+    assert_eq!(
+        parse_configuration(&[30, 1, 2, 0]),
+        settings(30, 258, false)
+    );
+    assert_eq!(
+        parse_configuration(&[30, 0, 1, FLAG_ERROR_RESILIENT]),
+        settings(30, 1, true)
+    );
     assert_eq!(parse_configuration(&[0]), None);
+    assert_eq!(parse_configuration(&[30, 0, 1, 2]), None);
+    assert_eq!(parse_configuration(&[0, 0, 1, 1]), None);
+    assert_eq!(parse_configuration(&[30, 0, 0, 1]), None);
+}
+
+/// The error-resilient bit of a frame's uncompressed header.
+fn error_resilient_mode(sample: &EncodedSample) -> bool {
+    // frame_marker, profile_low_bit, profile_high_bit, show_existing_frame,
+    // frame_type, show_frame, then error_resilient_mode.
+    sample.data[0] & 1 == 1
+}
+
+#[test]
+fn frames_adapt_probabilities_unless_error_resilience_is_requested() {
+    let mut config = configuration(40, 24, PixelFormat::Yuv420p8);
+    let (samples, _, _) = encode_sequence(&config, 3);
+    assert!(samples.iter().all(|sample| !error_resilient_mode(sample)));
+    config.configuration = vec![DEFAULT_BASE_Q_IDX, 0, 60, FLAG_ERROR_RESILIENT];
+    let (samples, _, _) = encode_sequence(&config, 3);
+    assert!(samples.iter().all(error_resilient_mode));
+}
+
+/// The total size and mean PSNR of a sequence of moving content.
+fn size_and_quality(config: &VideoEncoderConfig, frames: u32) -> (usize, f64) {
+    let (samples, reconstructions, sources) = encode_sequence(config, frames);
+    let size = samples.iter().map(|sample| sample.data.len()).sum();
+    let quality = reconstructions
+        .iter()
+        .zip(&sources)
+        .map(|(reconstruction, source)| psnr(reconstruction, source))
+        .sum::<f64>()
+        / f64::from(frames);
+    (size, quality)
+}
+
+/// Issue #555: adapting the probabilities from frame to frame gives a smaller
+/// stream than coding every frame error resilient, as the encoder did before,
+/// at equal or better quality. Adapted rates steer mode decisions toward
+/// slightly different trade-offs, so the adaptive stream's quantizer is lowered
+/// until its quality at least matches the error-resilient stream's.
+#[test]
+fn adaptive_probabilities_shrink_the_output_at_equal_quality() {
+    let measure = |base_q_idx: u8, flags: u8| {
+        let mut config = configuration(96, 64, PixelFormat::Yuv420p8);
+        config.configuration = vec![base_q_idx, 0, 30, flags];
+        size_and_quality(&config, 30)
+    };
+    for base_q_idx in [80, 160] {
+        let (resilient_size, resilient_quality) = measure(base_q_idx, FLAG_ERROR_RESILIENT);
+        let mut adaptive_q_idx = base_q_idx;
+        let (adaptive_size, adaptive_quality) = loop {
+            let (size, quality) = measure(adaptive_q_idx, 0);
+            if quality >= resilient_quality {
+                break (size, quality);
+            }
+            assert!(adaptive_q_idx > 4, "adaptive quality never caught up");
+            adaptive_q_idx -= 4;
+        };
+        eprintln!(
+            "q {base_q_idx}: error resilient {resilient_size} bytes at {resilient_quality:.2} dB,              adaptive (q {adaptive_q_idx}) {adaptive_size} bytes at {adaptive_quality:.2} dB"
+        );
+        assert!(
+            adaptive_size < resilient_size,
+            "adaptive {adaptive_size} bytes at {adaptive_quality:.2} dB (q {adaptive_q_idx})              against error-resilient {resilient_size} bytes at {resilient_quality:.2} dB              (q {base_q_idx})"
+        );
+    }
 }
 
 #[test]
@@ -807,8 +891,17 @@ mod ffmpeg {
 
     #[test]
     fn independent_decoders_reproduce_the_reconstruction_exactly() {
+        // Two groups of pictures, so the decoders also reset the adapted
+        // probabilities at the second key frame.
         let mut config = configuration(96, 64, PixelFormat::Yuv420p8);
         config.configuration = vec![DEFAULT_BASE_Q_IDX, 0, 5];
+        assert_decoders_match_reconstruction(&config, 12);
+    }
+
+    #[test]
+    fn error_resilient_frames_decode_exactly() {
+        let mut config = configuration(96, 64, PixelFormat::Yuv420p8);
+        config.configuration = vec![DEFAULT_BASE_Q_IDX, 0, 5, FLAG_ERROR_RESILIENT];
         assert_decoders_match_reconstruction(&config, 8);
     }
 
@@ -848,8 +941,16 @@ fn signalled_filter_level(sample: &EncodedSample) -> u8 {
     // Key frames: marker, profile, flags, sync code, colour, size, render
     // size and frame_context_idx. Inter frames: marker, profile, flags,
     // refresh flags, references, sizes, motion vector precision,
-    // interpolation filter and frame_context_idx.
-    let start = if sample.is_sync { 71 } else { 36 };
+    // interpolation filter and frame_context_idx. Frames that are not error
+    // resilient add refresh_frame_context and frame_parallel_decoding_mode,
+    // and inter frames reset_frame_context too.
+    let adaptive = !error_resilient_mode(sample);
+    let start = match (sample.is_sync, adaptive) {
+        (true, false) => 71,
+        (true, true) => 73,
+        (false, false) => 36,
+        (false, true) => 40,
+    };
     (start..start + 6).fold(0, |level, index| {
         (level << 1) | ((sample.data[index / 8] >> (7 - index % 8)) & 1)
     })
@@ -881,17 +982,23 @@ fn encode_group(frames: &[VideoFrame], base_q_idx: u8, loop_filter: bool) -> (us
     let (mut bytes, mut reconstructed, mut sources) = (0, Vec::new(), Vec::new());
     for frame in frames {
         let source = source_picture(&geometry, frame, Orientation::TopLeft).unwrap();
+        // Error resilient, so the comparison isolates the loop filter.
+        let context = FrameContext::default();
         let mut encoder = FrameEncoder::new(
             geometry,
             &source,
             reference.as_ref(),
             base_q_idx,
             CodingTools::ALL,
+            true,
+            &context,
+            None,
         );
         if !loop_filter {
             encoder = encoder.without_loop_filter();
         }
-        let (data, reconstruction) = encoder.encode(false);
+        let encoded = encoder.encode(false);
+        let (data, reconstruction) = (encoded.data, encoded.reconstruction);
         bytes += data.len();
         reconstructed.extend(visible(&reconstruction, &geometry));
         sources.extend(visible(&source, &geometry));
@@ -902,8 +1009,11 @@ fn encode_group(frames: &[VideoFrame], base_q_idx: u8, loop_filter: bool) -> (us
 
 #[test]
 fn every_frame_signals_a_loop_filter_level() {
+    // Error resilient, so every frame codes the content afresh. With adapted
+    // probabilities an inter frame can code it well enough that the search
+    // rightly leaves the filter off.
     let mut config = configuration(96, 64, PixelFormat::Yuv420p8);
-    config.configuration = vec![DEFAULT_BASE_Q_IDX, 0, 5];
+    config.configuration = vec![DEFAULT_BASE_Q_IDX, 0, 5, FLAG_ERROR_RESILIENT];
     let (samples, _, _) = encode_sequence(&config, 8);
     for (index, sample) in samples.iter().enumerate() {
         let level = signalled_filter_level(sample);
@@ -916,11 +1026,14 @@ fn loop_filter_is_a_rate_distortion_gain() {
     // Larger blocks and transforms leave less blocking for the filter to
     // remove, so it mostly buys quality rather than bits: the filtered stream
     // must be sharper, and no larger than the unfiltered one would have to
-    // grow to match it at the high-rate 6 dB per doubling of the rate.
+    // grow to match it at the high-rate 6 dB per doubling of the rate. The
+    // coarse quantizers are where the greedy per-frame level search used to
+    // smooth the panning references until the whole sequence came out larger
+    // and blurrier than with no filter (issue #563).
     let frames: Vec<VideoFrame> = (0..12)
         .map(|index| test_card_frame(160, 90, index))
         .collect();
-    for base_q_idx in [100, 150] {
+    for base_q_idx in [100, 150, 210, 220, 230] {
         let (unfiltered_bytes, unfiltered_psnr) = encode_group(&frames, base_q_idx, false);
         let (filtered_bytes, filtered_psnr) = encode_group(&frames, base_q_idx, true);
         let equivalent_bytes =
