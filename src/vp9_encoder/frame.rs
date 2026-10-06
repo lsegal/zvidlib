@@ -285,6 +285,7 @@ enum Node {
 }
 
 /// The result of coding one plane of a block.
+#[derive(Clone)]
 struct PlaneCoding {
     blocks: Vec<TxBlock>,
     error: u64,
@@ -937,14 +938,15 @@ impl<'a> FrameEncoder<'a> {
     ) -> (TxBlock, u64, f64) {
         let n = 4 << tx_size;
         let stride = self.recon.strides[plane];
-        let mut residual = vec![0_i32; n * n];
-        let mut prediction = vec![0_u8; n * n];
+        // Stack scratch: this runs for every transform block of every
+        // candidate the search tries, so heap allocations here dominated it.
+        let mut residual = [0_i32; 32 * 32];
+        let residual = &mut residual[..n * n];
         let mut prediction_error = 0_u64;
         for row in 0..n {
             let start = (y + row) * stride + x;
             let source = &self.source.planes[plane][start..start + n];
             let predicted = &self.recon.planes[plane][start..start + n];
-            prediction[row * n..row * n + n].copy_from_slice(predicted);
             for column in 0..n {
                 let difference = i32::from(source[column]) - i32::from(predicted[column]);
                 residual[row * n + column] = difference;
@@ -957,8 +959,9 @@ impl<'a> FrameEncoder<'a> {
             false,
             coefficient_probs(tx_size, plane_type, reference, 0, context)[0],
         );
+        // An empty block's levels are never read.
         let empty = TxBlock {
-            levels: vec![0; n * n],
+            levels: Vec::new(),
             eob: 0,
             tx_type,
         };
@@ -966,23 +969,42 @@ impl<'a> FrameEncoder<'a> {
             return (empty, 0, empty_bits);
         }
 
-        let mut coefficients = vec![0.0; n * n];
-        forward_transform(&residual, tx_size, tx_type, &mut coefficients);
+        let mut coefficients = [0.0; 32 * 32];
+        let coefficients = &mut coefficients[..n * n];
+        forward_transform(residual, tx_size, tx_type, coefficients);
         // A smaller rounding offset for inter residuals, as libvpx uses.
         let rounding = if inter { 0.25 } else { 0.375 };
-        let mut levels = vec![0_i32; n * n];
-        let mut dequantized = vec![0_i32; n * n];
-        for (index, &coefficient) in coefficients.iter().enumerate() {
-            let step = if index == 0 { self.dc_q } else { self.ac_q };
-            // 32x32 levels dequantize to half the step.
-            let (effective, limit) = if tx_size == 3 {
-                (f64::from(step) / 2.0, 65535 / step)
+        // 32x32 levels dequantize to half the step.
+        let effective = |step: i32| {
+            if tx_size == 3 {
+                f64::from(step) / 2.0
             } else {
-                (f64::from(step), 32767 / step)
+                f64::from(step)
+            }
+        };
+        // Below these magnitudes a coefficient quantizes to zero; they sit a
+        // little under the exact threshold, so the division below still
+        // decides every coefficient near it.
+        let dead_zone =
+            [self.dc_q, self.ac_q].map(|step| (1.0 - rounding) * effective(step) * 0.999);
+        let mut levels = [0_i32; 32 * 32];
+        let levels = &mut levels[..n * n];
+        let mut dequantized = [0_i32; 32 * 32];
+        let dequantized = &mut dequantized[..n * n];
+        for (index, &coefficient) in coefficients.iter().enumerate() {
+            if coefficient.abs() < dead_zone[usize::from(index > 0)] {
+                continue;
+            }
+            let step = if index == 0 { self.dc_q } else { self.ac_q };
+            let limit = if tx_size == 3 {
+                65535 / step
+            } else {
+                32767 / step
             };
             // Keep every dequantized value inside the 16-bit range the decoder
             // stores coefficients in.
-            let level = ((coefficient.abs() / effective + rounding).floor() as i32).min(limit);
+            let level =
+                ((coefficient.abs() / effective(step) + rounding).floor() as i32).min(limit);
             let value = (level * step) >> u32::from(tx_size == 3);
             levels[index] = if coefficient < 0.0 { -level } else { level };
             dequantized[index] = if coefficient < 0.0 { -value } else { value };
@@ -998,7 +1020,7 @@ impl<'a> FrameEncoder<'a> {
         let mut counter = BitCost::default();
         write_coefficients(
             &mut counter,
-            &levels,
+            levels,
             eob,
             tx_size,
             tx_type,
@@ -1006,9 +1028,17 @@ impl<'a> FrameEncoder<'a> {
             reference,
             context,
         );
+        // Restored if the residual is not worth its bits.
+        let mut prediction = [0_u8; 32 * 32];
+        let prediction = &mut prediction[..n * n];
+        for row in 0..n {
+            let start = (y + row) * stride + x;
+            prediction[row * n..row * n + n]
+                .copy_from_slice(&self.recon.planes[plane][start..start + n]);
+        }
         let start = y * stride + x;
         inverse_transform_add(
-            &dequantized,
+            dequantized,
             tx_size,
             tx_type,
             eob,
@@ -1036,7 +1066,7 @@ impl<'a> FrameEncoder<'a> {
             return (empty, prediction_error, empty_bits);
         }
         let block = TxBlock {
-            levels,
+            levels: levels.to_vec(),
             eob,
             tx_type,
         };
@@ -1410,21 +1440,38 @@ impl<'a> FrameEncoder<'a> {
                 });
             }
 
+            // Chroma caps its transform at its own block size, so several luma
+            // sizes can share one chroma coding; it is coded once.
+            let mut chroma: Option<(usize, [PlaneCoding; 2], [Vec<u8>; 2])> = None;
             for tx_size in 0..=max_tx_size {
                 if tx_size > 0 {
-                    for (plane, pixels) in predicted.iter().enumerate() {
-                        self.load_pixels(plane, mi_row, mi_col, bsl, pixels);
-                    }
+                    self.load_pixels(0, mi_row, mi_col, bsl, &predicted[0]);
                 }
                 let uv_tx_size = plane_tx_size(tx_size, bsl, 1);
-                let codings = [0, 1, 2].map(|plane| {
-                    let plane_tx = if plane == 0 {
-                        usize::from(tx_size)
-                    } else {
-                        uv_tx_size
-                    };
-                    self.code_plane(plane, mi_row, mi_col, bsl, plane_tx, None)
-                });
+                let luma = self.code_plane(0, mi_row, mi_col, bsl, usize::from(tx_size), None);
+                let [u, v] = match &chroma {
+                    Some((size, codings, pixels)) if *size == uv_tx_size => {
+                        for (plane, pixels) in [1, 2].into_iter().zip(pixels) {
+                            self.load_pixels(plane, mi_row, mi_col, bsl, pixels);
+                        }
+                        codings.clone()
+                    }
+                    _ => {
+                        if tx_size > 0 {
+                            for plane in [1, 2] {
+                                self.load_pixels(plane, mi_row, mi_col, bsl, &predicted[plane]);
+                            }
+                        }
+                        let codings = [1, 2].map(|plane| {
+                            self.code_plane(plane, mi_row, mi_col, bsl, uv_tx_size, None)
+                        });
+                        let pixels =
+                            [1, 2].map(|plane| self.block_pixels(plane, mi_row, mi_col, bsl));
+                        chroma = Some((uv_tx_size, codings.clone(), pixels));
+                        codings
+                    }
+                };
+                let codings = [luma, u, v];
                 if codings
                     .iter()
                     .all(|coding| coding.blocks.iter().all(|block| block.eob == 0))

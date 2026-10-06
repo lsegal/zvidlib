@@ -190,26 +190,99 @@ pub(super) fn forward_transform(
     let shift = if tx_size == 1 { 32.0 } else { 64.0 };
     let half = (n / 2) as f64;
     let scale = shift / (half * half);
-    // Both products accumulate whole rows, which the compiler vectorizes.
-    let mut columns = vec![0.0; n * n];
-    for (i, samples) in residual.chunks_exact(n).enumerate() {
-        let samples: Vec<f64> = samples.iter().map(|&value| f64::from(value)).collect();
-        for k in 0..n {
-            let weight = vertical[i * n + k] * scale;
-            for (column, &sample) in columns[k * n..][..n].iter_mut().zip(&samples) {
-                *column += weight * sample;
-            }
+    // Both passes work on whole rows of samples, which the compiler
+    // vectorizes, and keep their scratch on the stack: this runs for every
+    // transform block of every candidate the search tries. The second pass
+    // runs on the transpose, so it is the same column transform.
+    let mut samples = [0.0; 32 * 32];
+    for (sample, &value) in samples[..n * n].iter_mut().zip(residual) {
+        *sample = f64::from(value) * scale;
+    }
+    let mut columns = [0.0; 32 * 32];
+    transform_columns(
+        &samples[..n * n],
+        n,
+        vertical,
+        tx_type.vertical_adst() && tx_size < 3,
+        &mut columns,
+    );
+    transpose(&columns[..n * n], n, &mut samples);
+    transform_columns(
+        &samples[..n * n],
+        n,
+        horizontal,
+        tx_type.horizontal_adst() && tx_size < 3,
+        &mut columns,
+    );
+    transpose(&columns[..n * n], n, output);
+}
+
+fn transpose(input: &[f64], n: usize, output: &mut [f64]) {
+    for row in 0..n {
+        for column in 0..n {
+            output[column * n + row] = input[row * n + column];
         }
     }
+}
+
+/// Applies the 1-D forward transform `basis` down every column of the `n` x
+/// `n` block `rows`: row `k` of `output` is `sum(basis[i * n + k] * rows[i])`.
+fn transform_columns(rows: &[f64], n: usize, basis: &[f64], adst: bool, output: &mut [f64]) {
     output[..n * n].fill(0.0);
-    for (k, row) in output.chunks_exact_mut(n).take(n).enumerate() {
-        for j in 0..n {
-            let weight = columns[k * n + j];
-            for (output, &basis) in row.iter_mut().zip(&horizontal[j * n..][..n]) {
-                *output += weight * basis;
+    if adst {
+        accumulate(rows, n, basis, 0..n, output);
+    } else {
+        fold_dct(rows, n, n, basis, 1, output);
+    }
+}
+
+/// Adds `basis[i * n + frequency] * rows[i]` over the rows `i` to the output
+/// row of each `frequency`.
+fn accumulate(
+    rows: &[f64],
+    n: usize,
+    basis: &[f64],
+    frequencies: impl Iterator<Item = usize>,
+    output: &mut [f64],
+) {
+    for frequency in frequencies {
+        let out = &mut output[frequency * n..][..n];
+        for (i, row) in rows.chunks_exact(n).enumerate() {
+            let weight = basis[i * n + frequency];
+            for (out, &sample) in out.iter_mut().zip(row) {
+                *out += weight * sample;
             }
         }
     }
+}
+
+/// The DCT down the columns of the `m` rows of `rows`, for the frequencies
+/// `stride * k`, `k < m`, of the `n`-point basis.
+///
+/// A DCT basis is symmetric about its middle sample for even frequencies and
+/// antisymmetric for odd ones, so the odd frequencies need only the
+/// differences of mirrored rows and the even ones are a DCT of half the size
+/// of their sums. Folding that way repeatedly takes about a third of the
+/// multiplications of the plain matrix product.
+fn fold_dct(rows: &[f64], m: usize, n: usize, basis: &[f64], stride: usize, output: &mut [f64]) {
+    if m <= 2 {
+        let frequencies = (0..m).map(|k| k * stride);
+        accumulate(rows, n, basis, frequencies, output);
+        return;
+    }
+    let half = m / 2;
+    let mut sums = [0.0; 16 * 32];
+    let mut differences = [0.0; 16 * 32];
+    for i in 0..half {
+        let (top, bottom) = (&rows[i * n..][..n], &rows[(m - 1 - i) * n..][..n]);
+        for (j, (&a, &b)) in top.iter().zip(bottom).enumerate() {
+            sums[i * n + j] = a + b;
+            differences[i * n + j] = a - b;
+        }
+    }
+    let odd = (1..m).step_by(2).map(|k| k * stride);
+    accumulate(&differences[..half * n], n, basis, odd, output);
+    fold_dct(&sums[..half * n], half, n, basis, stride * 2, output);
 }
 
 /// Adds the inverse transform of dequantized `coefficients` (raster order,
