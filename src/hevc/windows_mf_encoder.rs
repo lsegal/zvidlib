@@ -1908,6 +1908,124 @@ mod tests {
         }
     }
 
+    /// A hardware VP9 MFT, where this host has one, encodes every input
+    /// format into a stream that opens on a key frame, carries a profile 0
+    /// `vpcC` taken from that key frame, keeps the constant-rate clock, and
+    /// decodes through the crate's own VP9 decoder close to the source.
+    /// Microsoft ships no software VP9 encoder, so only the hardware class is
+    /// tried, and a host without one skips.
+    #[test]
+    fn a_hardware_vp9_mft_round_trips_through_the_native_decoder() {
+        const FRAMES: u64 = 12;
+        let limits = Limits::default();
+        for input_format in [
+            PixelFormat::Rgba8,
+            PixelFormat::Bgra8,
+            PixelFormat::Yuv420p8,
+        ] {
+            let settings = Settings {
+                format: OutputFormat::Vp9,
+                quality: Some(70),
+                ..round_trip_settings(input_format)
+            };
+            let mut encoder = match create(settings, MftClass::Hardware, &limits) {
+                Ok(encoder) => encoder,
+                Err(error) => {
+                    eprintln!("skipping VP9 {input_format:?}: {error}");
+                    continue;
+                }
+            };
+            let label = format!("VP9 {input_format:?} via {}", encoder.backend_name());
+            assert_eq!(encoder.implementation(), CodecImplementation::Hardware);
+            assert_eq!(encoder.config().codec, Codec::Vp9);
+            let vpcc = encoder.config().decoder_config.clone();
+            let derived = crate::derive_codec_string(Codec::Vp9, &vpcc).unwrap();
+            assert_eq!(derived.profile, crate::CodecProfile::Vp9Profile0, "{label}");
+            let mut samples = Vec::new();
+            for index in 0..FRAMES {
+                let source = frame(320, 240, index, input_format);
+                samples.extend(encode_frame(encoder.as_mut(), &source, index).unwrap());
+            }
+            samples.extend(block_on(encoder.finish()).unwrap());
+            assert_eq!(samples.len() as u64, FRAMES, "{label}");
+            assert!(samples[0].is_sync, "{label}");
+            for (index, sample) in samples.iter().enumerate() {
+                let tick = index as i64 * 1_001;
+                assert_eq!((sample.dts, sample.pts), (tick, tick), "{label}");
+                assert_eq!(
+                    crate::vp9_encoder::key_frame_vpcc(&sample.data, derived_level(&vpcc))
+                        .is_some(),
+                    sample.is_sync,
+                    "{label} frame {index}"
+                );
+            }
+
+            let decoder_config = VideoDecoderConfig {
+                codec: Codec::Vp9,
+                profile: crate::CodecProfile::Vp9Profile0,
+                coded_dimensions: VideoDimensions::new(320, 240, &limits).unwrap(),
+                output_format: PixelFormat::Rgba8,
+                color_range: ColorRange::Limited,
+                hardware: crate::HardwarePreference::Avoid,
+                configuration: vpcc,
+            };
+            let samples = samples
+                .into_iter()
+                .enumerate()
+                .map(|(index, sample)| EncodedVideoSample {
+                    presentation_index: FrameIndex(index as u64),
+                    random_access: sample.is_sync,
+                    data: sample.data,
+                })
+                .collect();
+            let mut reader = ExactFrameReader::new(
+                &crate::native_vp9_video_decoder_factory(),
+                decoder_config,
+                samples,
+                limits,
+            )
+            .unwrap();
+            let mut worst = f64::INFINITY;
+            for index in 0..FRAMES {
+                let decoded = reader
+                    .get(FrameIndex(index), &CancellationToken::new())
+                    .unwrap();
+                let reference = frame(320, 240, index, PixelFormat::Rgba8);
+                worst = worst.min(psnr(&reference, &decoded));
+            }
+            eprintln!("{label}: worst PSNR {worst:.1} dB");
+            assert!(worst > 30.0, "{label}: worst PSNR {worst:.1} dB");
+        }
+    }
+
+    /// The level a `vpcC` names.
+    fn derived_level(vpcc: &[u8]) -> u8 {
+        vpcc[13]
+    }
+
+    /// What a VP9 request asks Media Foundation for, and what it refuses,
+    /// names VP9 rather than HEVC, on every Windows host.
+    #[test]
+    fn vp9_settings_ask_for_vp9_profile_0() {
+        assert_eq!(OutputFormat::Vp9.subtype(), MFVideoFormat_VP90);
+        assert_eq!(
+            OutputFormat::Vp9.profile(),
+            eAVEncVP9VProfile_420_8.0 as u32
+        );
+        assert_eq!(OutputFormat::Vp9.codec(), Codec::Vp9);
+        assert_eq!(OutputFormat::Hevc.subtype(), MFVideoFormat_HEVC);
+        let mut odd = Settings {
+            format: OutputFormat::Vp9,
+            ..settings(30, 1)
+        };
+        odd.width = 63;
+        let reason = odd.unsupported_reason().unwrap();
+        assert!(reason.contains("VP9"), "{reason}");
+        let error = unavailable(MftClass::Hardware, OutputFormat::Vp9, Vec::new());
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        assert!(error.message().contains("VP9"), "{}", error.message());
+    }
+
     /// The first class of MFT this host has, as an encoder, or `None` to skip.
     fn any_encoder(settings: Settings) -> Option<Box<dyn VideoEncoder>> {
         [MftClass::Hardware, MftClass::Software]
