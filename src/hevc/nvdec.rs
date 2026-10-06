@@ -134,7 +134,7 @@ pub(crate) fn create_vp9(
         configuration.clone(),
         *limits,
         Bitstream::Vp9 {
-            inspector: ChunkInspector::default(),
+            inspector: Box::default(),
             shown: VecDeque::new(),
             slots: [None; 8],
         },
@@ -166,7 +166,7 @@ enum Bitstream {
     /// reference slots holds, and the surface a shown slot names is read back directly. The
     /// parser keeps a surface while any slot still references it.
     Vp9 {
-        inspector: ChunkInspector,
+        inspector: Box<ChunkInspector>,
         shown: VecDeque<FrameShape>,
         slots: [Option<c_int>; 8],
     },

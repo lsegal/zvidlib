@@ -27,6 +27,12 @@
 
 mod bits;
 mod block;
+// What the hardware backends read from a chunk before handing it to the platform decoder.
+#[cfg(any(
+    test,
+    all(any(windows, target_os = "linux"), target_pointer_width = "64"),
+    target_os = "macos"
+))]
 mod chunk;
 mod idct1d;
 mod loopfilter;
@@ -43,7 +49,12 @@ use bits::{BitReader, BoolDecoder};
 use block::{FrameDecoder, MvRef};
 use probs::{FrameContext, FrameCounts};
 
-pub(crate) use chunk::{ChunkInspector, FrameInfo, FrameShape, chunk_frames};
+#[cfg(any(
+    test,
+    all(any(windows, target_os = "linux"), target_pointer_width = "64"),
+    target_os = "macos"
+))]
+pub(crate) use chunk::{ChunkInspector, FrameShape, chunk_frames};
 
 use crate::{Error, ErrorKind, Limits, Result};
 

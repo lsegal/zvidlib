@@ -35,7 +35,8 @@ use crate::{
 ///
 /// `Prefer` and `Require` select a hardware decoder where the host has one
 /// that decodes VP9 profile 0 at the configured size: NVIDIA NVDEC on 64-bit
-/// Windows and Linux. `Prefer` falls back to the dependency-free software
+/// Windows and Linux, and VideoToolbox on Macs whose media engine decodes VP9.
+/// `Prefer` falls back to the dependency-free software
 /// decoder when none is available, and `Require` reports
 /// [`CodecSupport::HardwareUnavailable`]. `Avoid` always selects software.
 pub fn native_vp9_video_decoder_factory() -> impl VideoDecoderFactory {
@@ -139,6 +140,10 @@ fn hardware_available(_configuration: &VideoDecoderConfig) -> bool {
     if crate::hevc::nvdec::is_vp9_available(_configuration.coded_dimensions) {
         return true;
     }
+    #[cfg(target_os = "macos")]
+    if crate::hevc::videotoolbox_vp9::is_vp9_available(_configuration.coded_dimensions) {
+        return true;
+    }
     false
 }
 
@@ -149,7 +154,10 @@ fn create_hardware(
     _limits: &Limits,
 ) -> std::result::Result<Box<dyn VideoDecoder>, Vec<String>> {
     #[cfg_attr(
-        not(all(any(windows, target_os = "linux"), target_pointer_width = "64")),
+        not(any(
+            all(any(windows, target_os = "linux"), target_pointer_width = "64"),
+            target_os = "macos"
+        )),
         allow(unused_mut)
     )]
     let mut errors = Vec::new();
@@ -157,6 +165,11 @@ fn create_hardware(
     match crate::hevc::nvdec::create_vp9(_configuration, _limits) {
         Ok(decoder) => return Ok(decoder),
         Err(error) => errors.push(format!("NVDEC: {}", error.message())),
+    }
+    #[cfg(target_os = "macos")]
+    match crate::hevc::videotoolbox_vp9::create_vp9(_configuration, _limits) {
+        Ok(decoder) => return Ok(decoder),
+        Err(error) => errors.push(format!("VideoToolbox: {}", error.message())),
     }
     Err(errors)
 }

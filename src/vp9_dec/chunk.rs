@@ -54,6 +54,7 @@ impl ChunkInspector {
 
     /// Reads one chunk (a frame or a superframe) and returns the shape of the frame it shows,
     /// which is that of its last frame when that frame is shown.
+    #[cfg(test)]
     pub(crate) fn inspect(&mut self, data: &[u8]) -> Result<Option<FrameShape>> {
         if data.is_empty() {
             return Err(malformed("VP9 sample is empty"));
