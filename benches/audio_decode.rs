@@ -7,8 +7,8 @@
 //! 1. [`NativeAacDecoder::decode`] over a fixed run of AAC-LC access units, in
 //!    both channel layouts the backend accepts. Demuxing happens once in the
 //!    shared fixture cache, never inside a timed loop, so an iteration is
-//!    Symphonia's decode work and the interleave into `AudioBuffer` and
-//!    nothing else. Reported as decoded samples per second and, in the printed
+//!    the decoder's work and the interleave into `AudioBuffer` and nothing
+//!    else. Reported as decoded samples per second and, in the printed
 //!    scale lines, as a realtime factor - the number that decides whether
 //!    playback can keep up.
 //! 2. [`AacSampleReader::get_range`], where the non-trivial work lives. Its
@@ -23,6 +23,11 @@
 //!    each of the Vorbis synthesis kernels on its own, scalar against every
 //!    vector instruction set the host has (issue #572).
 //!
+//! `NativeAacDecoder` runs on a different decoder per platform, so the AAC
+//! groups measure AudioToolbox on macOS, Media Foundation's AAC decoder MFT on
+//! Windows, and Symphonia's pure-Rust decoder on Linux (issue #561). Numbers
+//! are comparable across commits on one platform, not across platforms.
+//!
 //! # Which groups have a scalar-versus-SIMD axis
 //!
 //! The Vorbis groups do, and are named `<group>/<isa>` like the per-ISA
@@ -32,12 +37,12 @@
 //! before any arm is timed.
 //!
 //! The AAC groups do not, and their names carry no `simd=` tag. AAC decoding
-//! is delegated to the third-party `symphonia-codec-aac` crate, the
-//! process-wide override in `zvidlib::simd` does not reach it, and so a scalar
-//! arm and a vector arm would be the same code producing two identical
-//! numbers. If Symphonia's own performance turns out to bound playback, that
-//! is a dependency-level finding for its own ticket rather than an axis to add
-//! here.
+//! is delegated to the operating system's decoder or to the third-party
+//! `symphonia-codec-aac` crate, the process-wide override in `zvidlib::simd`
+//! reaches neither, and so a scalar arm and a vector arm would be the same
+//! code producing two identical numbers. If a decoder's performance turns out
+//! to bound playback, that is a finding for its own ticket rather than an axis
+//! to add here.
 
 mod support;
 

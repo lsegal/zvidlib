@@ -4126,9 +4126,20 @@ together would average the seek cost away, and the seek cost is the one that
 shows up as an audible stall.
 
 The AAC groups carry **no `simd=` tag and no per-ISA arms**. AAC decoding is
-delegated to the third-party `symphonia-codec-aac` crate and `zvidlib::simd`'s
-override does not reach it, so a scalar arm and a vector arm would be the same
-code reported twice.
+delegated to AudioToolbox on macOS, to Media Foundation on Windows, and to the
+third-party `symphonia-codec-aac` crate on Linux; `zvidlib::simd`'s override
+reaches none of them, so a scalar arm and a vector arm would be the same code
+reported twice. Because the decoder differs by platform, so do these groups'
+numbers: the Linux benchmark runners measure Symphonia.
+
+The mono fixture exists because the bundled sample is stereo and carries no edit
+list, while `NativeAacDecoder` accepts AAC-LC mono as well (and rejects
+everything beyond stereo, so mono and stereo are its entire supported input
+space). It also supplies the real `elst` and decoder-priming timing the bundled
+sample does not have.
+
+Every bench target shares `benches/support/`, so each one leaves some of its
+helpers unused; the module allows `dead_code` for that reason.
 
 ### The Vorbis groups
 
@@ -4185,12 +4196,3 @@ Interleaving the decoded planes into the `f32` PCM a `NativeVorbisDecoder`
 returns was the third candidate #572 named, conditional on a profile. It is not
 vectorized: replacing Symphonia's interleaving copy with a direct one moved the
 whole-stream groups by about 1%, inside the noise of this host.
-
-The mono fixture exists because the bundled sample is stereo and carries no edit
-list, while `NativeAacDecoder` accepts AAC-LC mono as well (and rejects
-everything beyond stereo, so mono and stereo are its entire supported input
-space). It also supplies the real `elst` and decoder-priming timing the bundled
-sample does not have.
-
-Every bench target shares `benches/support/`, so each one leaves some of its
-helpers unused; the module allows `dead_code` for that reason.

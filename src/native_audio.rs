@@ -1,4 +1,16 @@
 //! Native AAC-LC decoding and default-device PCM output.
+//!
+//! Where the operating system has an AAC decoder, zvidlib decodes through it,
+//! as it encodes (see [`crate::AudioEncoder`]): macOS through AudioToolbox and
+//! Windows through Media Foundation's AAC decoder MFT. Linux and the other
+//! native targets have none, and decode through Symphonia's.
+
+#[cfg(target_os = "macos")]
+mod audiotoolbox;
+#[cfg(not(any(target_os = "macos", windows)))]
+mod symphonia;
+#[cfg(windows)]
+mod windows_mf;
 
 use crate::{
     AacTrackConfig, AudioBuffer, AudioDecoder, AudioOutputBackend, CancellationToken, Error,
@@ -11,47 +23,67 @@ use cpal::{
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use symphonia_codec_aac::AacDecoder as SymphoniaAacDecoder;
-use symphonia_core::audio::{Channels, SampleBuffer};
-use symphonia_core::codecs::{CODEC_TYPE_AAC, CodecParameters, Decoder, DecoderOptions};
-use symphonia_core::formats::Packet;
 
-/// Dependency-independent AAC-LC access-unit decoder backed by Symphonia.
+#[cfg(target_os = "macos")]
+use audiotoolbox::Decoder as Backend;
+#[cfg(not(any(target_os = "macos", windows)))]
+use symphonia::Decoder as Backend;
+#[cfg(windows)]
+use windows_mf::Decoder as Backend;
+
+/// AAC-LC access-unit decoder: AudioToolbox on macOS, Media Foundation on
+/// Windows, and Symphonia's decoder on the native targets with no platform AAC
+/// decoder, such as Linux.
+///
+/// Mono and stereo AAC-LC are accepted.
 pub struct NativeAacDecoder {
-    decoder: SymphoniaAacDecoder,
+    backend: Backend,
     sample_rate: u32,
     channels: u16,
     limits: Limits,
+    /// Whether the backend has been seen to trail its input by one access
+    /// unit; see [`NativeAacDecoder::decode_trailing`].
+    trailing: bool,
+    /// The access unit last decoded and its position, whose overlap the next
+    /// one needs; `None` when the backend is fresh or was just reset.
+    previous: Option<(Vec<u8>, u64)>,
 }
 
 impl NativeAacDecoder {
     pub fn new(config: &AacTrackConfig, limits: Limits) -> Result<Self> {
-        if config.audio_object_type != 2 || config.channels > 2 {
+        if config.audio_object_type != 2 || !matches!(config.channels, 1 | 2) {
             return Err(unsupported(
                 "the native AAC backend supports AAC-LC mono and stereo streams",
             ));
         }
-        let channels = match config.channels {
-            1 => Channels::FRONT_LEFT,
-            2 => Channels::FRONT_LEFT | Channels::FRONT_RIGHT,
-            _ => return Err(unsupported("the native AAC channel layout is unsupported")),
-        };
-        let mut parameters = CodecParameters::new();
-        parameters
-            .for_codec(CODEC_TYPE_AAC)
-            .with_sample_rate(config.sample_rate)
-            .with_channels(channels)
-            .with_extra_data(config.audio_specific_config.clone().into_boxed_slice());
-        let decoder = SymphoniaAacDecoder::try_new(&parameters, &DecoderOptions::default())
-            .map_err(|error| {
-                unsupported(format!("native AAC configuration is unavailable: {error}"))
-            })?;
         Ok(Self {
-            decoder,
+            backend: Backend::new(config)?,
             sample_rate: config.sample_rate,
             channels: config.channels,
             limits,
+            trailing: false,
+            previous: None,
         })
+    }
+
+    /// Decodes `data` through a backend that emits each access unit's PCM only
+    /// once the next unit arrives, as Media Foundation's decoder does.
+    ///
+    /// An AAC-LC frame's PCM depends only on its own access unit and the one
+    /// before it, so this starts the backend clean, feeds that pair, and pushes
+    /// the current frame out by repeating its unit. The repeat's own PCM is
+    /// never emitted: the next call starts clean again. After a reset there is
+    /// no previous unit, and the frame overlaps silence, as a clean decoder's
+    /// first frame does.
+    fn decode_trailing(&mut self, data: &[u8], position: u64, out: &mut Vec<f32>) -> Result<()> {
+        self.backend.reset()?;
+        let mut discarded = Vec::new();
+        if let Some((previous, previous_position)) = &self.previous {
+            self.backend
+                .decode(previous, *previous_position, &mut discarded)?;
+        }
+        self.backend.decode(data, position, &mut discarded)?;
+        self.backend.decode(data, position, out)
     }
 }
 
@@ -64,42 +96,48 @@ impl AudioDecoder for NativeAacDecoder {
         if cancellation.is_cancelled() {
             return Err(Error::new(ErrorKind::Cancelled, "AAC decode cancelled"));
         }
-        let packet = Packet::new_from_slice(
-            0,
-            sample.decoded_range.start,
-            sample.decoded_range.len(),
-            &sample.data,
-        );
-        let decoded = self
-            .decoder
-            .decode(&packet)
-            .map_err(|error| codec(format!("malformed AAC access unit: {error}")))?;
-        let frames = decoded.frames() as u64;
+        let channels = usize::from(self.channels);
+        let expected = usize::try_from(sample.decoded_range.len()).unwrap_or(usize::MAX);
+        let mut samples = Vec::with_capacity(expected.saturating_mul(channels));
+        let position = sample.decoded_range.start;
+        if self.trailing {
+            self.decode_trailing(&sample.data, position, &mut samples)?;
+        } else {
+            self.backend.decode(&sample.data, position, &mut samples)?;
+            // A backend that emits nothing for the first unit it is given is
+            // holding that unit's frame back until the next one arrives.
+            if samples.is_empty() && self.previous.is_none() {
+                self.trailing = true;
+                self.decode_trailing(&sample.data, position, &mut samples)?;
+            }
+        }
+        let mut previous = self
+            .previous
+            .take()
+            .map(|(previous, _)| previous)
+            .unwrap_or_default();
+        previous.clear();
+        previous.extend_from_slice(&sample.data);
+        self.previous = Some((previous, position));
+        let frames = (samples.len() / channels) as u64;
         if frames != sample.decoded_range.len() {
             return Err(codec(format!(
                 "AAC decoder produced {frames} frames for an indexed {}-frame interval",
                 sample.decoded_range.len()
             )));
         }
-        if decoded.spec().rate != self.sample_rate
-            || decoded.spec().channels.count() != usize::from(self.channels)
-        {
-            return Err(codec("AAC decoder output format changed unexpectedly"));
-        }
-        let mut interleaved = SampleBuffer::<f32>::new(frames, *decoded.spec());
-        interleaved.copy_interleaved_ref(decoded);
         AudioBuffer::new(
             sample.decoded_range,
             self.sample_rate,
             self.channels,
-            interleaved.samples().to_vec(),
+            samples,
             &self.limits,
         )
     }
 
     fn reset(&mut self) -> Result<()> {
-        self.decoder.reset();
-        Ok(())
+        self.previous = None;
+        self.backend.reset()
     }
 }
 
