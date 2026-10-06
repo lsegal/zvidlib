@@ -57,18 +57,20 @@ pub(crate) fn schedule_event_loop_tick(resolve: &js_sys::Function) {
     }
 }
 
-/// The `description` a `WebCodecs` decoder is configured with: the payload
-/// of `hvcC` or `av1C`. VP9 has none; its bitstream describes itself, and
-/// the `WebCodecs` VP9 registration defines no `description`.
-fn codec_description(codec: Codec, decoder_config: &[u8]) -> Result<Option<&[u8]>> {
+fn codec_description(codec: Codec, decoder_config: &[u8]) -> Result<&[u8]> {
     match codec {
-        Codec::Hevc => box_payload(decoder_config, b"hvcC").map(Some),
-        Codec::Av1 => box_payload(decoder_config, b"av1C").map(Some),
-        Codec::Vp9 => Ok(None),
-        Codec::UncompressedVideo | Codec::H264 | Codec::Aac => Err(Error::new(
-            ErrorKind::Unsupported,
-            "only HEVC, AV1 and VP9 have a WebCodecs decoder backend",
-        )),
+        Codec::Hevc => box_payload(decoder_config, b"hvcC"),
+        Codec::Av1 => box_payload(decoder_config, b"av1C"),
+        // WebCodecs' VP8 registration takes no description.
+        Codec::Vp8 => Ok(&[]),
+        // Nor does VP9's: its bitstream describes itself.
+        Codec::Vp9 => Ok(&[]),
+        Codec::UncompressedVideo | Codec::H264 | Codec::Aac | Codec::Opus | Codec::Vorbis => {
+            Err(Error::new(
+                ErrorKind::Unsupported,
+                "only HEVC, AV1, VP8 and VP9 have a WebCodecs decoder backend",
+            ))
+        }
     }
 }
 
@@ -193,7 +195,7 @@ impl WebVideoDecodeSession {
         let config = JsVideoDecoderConfig::new(&derived.codec_string);
         config.set_coded_width(dimensions.width);
         config.set_coded_height(dimensions.height);
-        if let Some(description) = description {
+        if !description.is_empty() {
             config.set_description_u8_array(&js_sys::Uint8Array::from(description));
         }
         config.set_optimize_for_latency(true);
@@ -214,7 +216,8 @@ impl WebVideoDecodeSession {
         };
 
         let samples = track.to_encoded_video_samples(&source, limits).await?;
-        let frame_count = samples.len() as u64;
+        // A decode-only sample, such as a hidden VP8 frame, is not a frame.
+        let frame_count = track.presentation_order.len() as u64;
         let backend = if webcodecs_supported {
             DecodeBackend::WebCodecs(WebCodecsDecoder::open(config, samples, limits)?)
         } else {
@@ -290,11 +293,14 @@ fn software_decoder_factory(codec: Codec) -> Result<Box<dyn VideoDecoderFactory>
     match codec {
         Codec::Hevc => Ok(Box::new(crate::native_hevc_video_decoder_factory())),
         Codec::Av1 => Ok(Box::new(crate::native_av1_video_decoder_factory())),
+        Codec::Vp8 => Ok(Box::new(crate::native_vp8_video_decoder_factory())),
         Codec::Vp9 => Ok(Box::new(crate::native_vp9_video_decoder_factory())),
-        Codec::UncompressedVideo | Codec::H264 | Codec::Aac => Err(Error::new(
-            ErrorKind::Unsupported,
-            "only HEVC, AV1 and VP9 have a software decoder backend",
-        )),
+        Codec::UncompressedVideo | Codec::H264 | Codec::Aac | Codec::Opus | Codec::Vorbis => {
+            Err(Error::new(
+                ErrorKind::Unsupported,
+                "only HEVC, AV1, VP8 and VP9 have a software decoder backend",
+            ))
+        }
     }
 }
 
@@ -1126,9 +1132,7 @@ mod tests {
         config.set_coded_width(512);
         config.set_coded_height(288);
         config.set_description_u8_array(&js_sys::Uint8Array::from(
-            codec_description(track.codec, &track.decoder_config)
-                .unwrap()
-                .unwrap(),
+            codec_description(track.codec, &track.decoder_config).unwrap(),
         ));
         config.set_optimize_for_latency(true);
         let support: VideoDecoderSupport =
@@ -1482,5 +1486,109 @@ mod tests {
             "{}",
             error.message()
         );
+    }
+
+    const VP8_ALTREF: &[u8] = include_bytes!("../tests/fixtures/codec/vp8/vp8_altref_98x66.webm");
+
+    /// Issue #537: three of this WebM track's 43 VP8 blocks are hidden
+    /// alternate references. The session counts only its 40 shown frames and
+    /// decodes through the hidden ones to reach any of them, in sequential,
+    /// reverse and alternating order, on either backend. The software
+    /// fallback matches a straight decode of every sample with the native
+    /// decoder; `WebCodecs` converts to RGBA its own way, so it has to match a
+    /// sequential read of a fresh `WebCodecs` session.
+    #[wasm_bindgen_test(async)]
+    async fn hidden_vp8_frames_are_decoded_through_but_not_counted() {
+        let limits = Limits::default();
+        let cancellation = CancellationToken::new();
+        let source = MemorySource::new(VP8_ALTREF.to_vec());
+        let track = parse_video_track(&source, 0, &limits).await.unwrap();
+        let samples = track
+            .to_encoded_video_samples(&source, &limits)
+            .await
+            .unwrap();
+        assert_eq!(samples.len(), 43);
+        let factory = crate::native_vp8_video_decoder_factory();
+        let configuration = VideoDecoderConfig {
+            codec: track.codec,
+            profile: CodecProfile::Vp8,
+            coded_dimensions: track.dimensions.unwrap(),
+            output_format: PixelFormat::Rgba8,
+            color_range: ColorRange::Limited,
+            hardware: HardwarePreference::Avoid,
+            configuration: Vec::new(),
+        };
+        let mut decoder = factory.create(&configuration, &limits).unwrap();
+        let mut native = vec![String::new(); 40];
+        for sample in &samples {
+            for output in decoder.submit(sample, &cancellation).unwrap() {
+                native[output.presentation_index.0 as usize] =
+                    crate::conformance::FrameDigest::from_frame(&output.frame)
+                        .unwrap()
+                        .to_hex();
+            }
+        }
+        assert!(native.iter().all(|digest| !digest.is_empty()));
+        assert_eq!(
+            video_frame_durations_ms(VP8_ALTREF, 0, &limits)
+                .await
+                .unwrap()
+                .len(),
+            40
+        );
+
+        let mut alternating = Vec::new();
+        let (mut low, mut high) = (0, 40);
+        while low < high {
+            high -= 1;
+            alternating.push(high);
+            if low < high {
+                alternating.push(low);
+                low += 1;
+            }
+        }
+        let orders = [
+            (0..40).collect::<Vec<u64>>(),
+            (0..40).rev().collect(),
+            alternating,
+        ];
+
+        let webcodecs = WebVideoDecodeSession::open(VP8_ALTREF, 0, &limits)
+            .await
+            .unwrap();
+        let expected = if webcodecs.is_software() {
+            native.clone()
+        } else {
+            let mut session = webcodecs;
+            let mut digests = Vec::new();
+            for index in 0..40 {
+                let (dimensions, rgba) =
+                    session.get(FrameIndex(index), &cancellation).await.unwrap();
+                digests.push(digest(dimensions, rgba));
+            }
+            digests
+        };
+        for (choice, expected) in [
+            (BackendChoice::SoftwareOnly, &native),
+            (BackendChoice::Automatic, &expected),
+        ] {
+            for order in &orders {
+                let mut session = WebVideoDecodeSession::open_with(VP8_ALTREF, 0, &limits, choice)
+                    .await
+                    .unwrap();
+                assert_eq!(session.frame_count(), 40);
+                for &index in order {
+                    let (dimensions, rgba) = session
+                        .get(FrameIndex(index), &cancellation)
+                        .await
+                        .unwrap_or_else(|error| panic!("{choice:?} frame {index}: {error}"));
+                    assert_eq!(
+                        digest(dimensions, rgba),
+                        expected[index as usize],
+                        "{choice:?} frame {index}"
+                    );
+                }
+            }
+        }
     }
 }

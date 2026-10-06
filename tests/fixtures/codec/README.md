@@ -221,3 +221,252 @@ reaches the tools it is listed against (recorded by `src/av1_dec/coverage.rs`
 in test builds), so a regenerated fixture that stops using a tool fails rather
 than silently losing its check. As above, FFmpeg is only the offline fixture
 generator and is not a build, test, or runtime dependency.
+
+`vp8/vp80-00-comprehensive-001.ivf` to `-018.ivf` are libvpx's VP8 decoder
+test vectors, downloaded unmodified from
+`https://storage.googleapis.com/downloads.webmproject.org/test_data/libvpx/`
+together with the `.ivf.md5` file libvpx publishes beside each. Every line of
+an `.md5` file is the MD5 of one shown frame's I420 output from libvpx,
+cropped to the display size. They are the set libvpx checks its own VP8
+decoder against, and include every bitstream version (003 and 007 are version
+1, 004 version 2 and 005 version 3, so bilinear and full-pixel chroma
+prediction), odd frame sizes (006 and 014 are 175x143), a 1432x888 stream
+(008), streams with up to four key frames, and a hidden key frame (018).
+`src/vp8/tests.rs` decodes each vector and compares every shown frame with
+libvpx's digest; `tests/vp8_conformance.rs` checks that every frame comes
+back identically through `ExactFrameReader` in sequential, reverse and
+alternating order. They are distributed under the libvpx license; see
+`THIRD_PARTY_NOTICES.md`.
+
+`vp8/vp8_testsrc2_98x66.webm` is a 30-frame VP8 WebM track with a key frame
+every 12 frames and a size that is not a whole number of macroblocks, and
+`vp8_testsrc2_98x66.webm.md5` is libvpx's decode of it, one MD5 of each
+frame's I420 output per line. They were generated offline with
+
+```sh
+ffmpeg -f lavfi -i "testsrc2=size=98x66:rate=25" -t 1.2 -c:v libvpx -g 12 \
+  -auto-alt-ref 0 -b:v 300k -deadline good vp8_testsrc2_98x66.webm
+ffmpeg -c:v libvpx -i vp8_testsrc2_98x66.webm -f framemd5 - | grep -v '^#' \
+  | awk -F', *' '{print $6}' > vp8_testsrc2_98x66.webm.md5
+```
+
+`src/vp8/tests.rs` demuxes it with `WebmDemuxer` and compares every frame with
+libvpx's digest, and `tests/vp8_conformance.rs` reads it back through
+`ExactFrameReader` in sequential, reverse and alternating order. As above,
+FFmpeg is only the offline fixture generator.
+
+`vp8/vp8_altref_98x66.ivf` is a 42-frame VP8 IVF stream from a two-pass
+libvpx encode with automatic alternate references, so frames 1 and 17 are
+hidden inter frames that only update the alternate reference, and 40 frames
+are shown. `vp8_altref_98x66.ivf.md5` is libvpx's decode of it, one MD5 of
+each shown frame's I420 output per line. None of libvpx's own vectors has a
+hidden alternate reference, which is what this covers. They were generated
+offline with
+
+```sh
+ffmpeg -f lavfi -i "testsrc2=size=98x66:rate=30:duration=1.3333334" \
+  -pix_fmt yuv420p src98.y4m
+for pass in 1 2; do
+  ffmpeg -y -i src98.y4m -c:v libvpx -auto-alt-ref 1 -lag-in-frames 16 \
+    -arnr-maxframes 7 -arnr-strength 5 -g 40 -b:v 200k -pass $pass \
+    -passlogfile vp8pl -f ivf vp8_altref_98x66.ivf
+done
+ffmpeg -c:v libvpx -i vp8_altref_98x66.ivf -f framemd5 - | grep -v '^#' \
+  | awk -F', *' '{print $6}' > vp8_altref_98x66.ivf.md5
+```
+
+`src/vp8/tests.rs` compares every shown frame with libvpx's digest, and
+`tests/vp8_conformance.rs` holds a hardware VP8 decoder, where the host has
+one, to the software decoder's output and exact-frame seeks on it.
+
+`opus_celt_stereo.mp4`, `opus_hybrid_mono.mp4` and `opus_silk_mono.mp4` are
+half-second Opus tracks encoded by libopus, one per Opus coding mode: CELT
+fullband stereo (TOC configuration 31), hybrid fullband mono (15) and SILK
+narrowband mono (1). `tests/opus_codec.rs` checks every packet is in the mode
+its name says, so a regenerated fixture that drifts to another mode fails. The
+stereo one is music from the bundled `examples/media/BigBuckBunny.mp4`; the
+mono ones are a synthetic voice written by `opus_speechlike.py` here, a pulse
+train through moving formant filters with an unvoiced burst, which libopus
+codes as speech. FFmpeg writes each with a `dOps` box, an edit list whose media
+time is the 312-sample pre-skip, and a last sample whose duration is shortened
+to trim the end, which is the form zvidlib has to read. They were generated
+offline with
+
+```sh
+ffmpeg -ss 20 -t 0.5 -i ../../../examples/media/BigBuckBunny.mp4 -vn -ac 2 \
+  -ar 48000 -c:a libopus -b:a 96k -frame_duration 20 -movflags +faststart \
+  opus_celt_stereo.mp4
+python3 opus_speechlike.py speech.f32 1.0
+ffmpeg -f f32le -ar 48000 -ac 1 -i speech.f32 -t 0.5 -c:a libopus -b:a 28k \
+  -application voip -frame_duration 20 -movflags +faststart opus_hybrid_mono.mp4
+ffmpeg -f f32le -ar 48000 -ac 1 -i speech.f32 -t 0.5 -c:a libopus -b:a 8k \
+  -application voip -frame_duration 20 -movflags +faststart opus_silk_mono.mp4
+```
+
+Each `opus_*_libopus.s16` is libopus's decode of its fixture as interleaved
+16-bit little-endian PCM, the first 24 000 frames of
+
+```sh
+ffmpeg -c:a libopus -i opus_celt_stereo.mp4 -f s16le opus_celt_stereo.s16
+```
+
+FFmpeg trims the pre-skip but, at the version used, not the end padding, which
+is why only the encoded length is kept.
+
+`opus_stereo.webm` is the same half second of music encoded by libopus
+straight into WebM, which FFmpeg writes with the pre-skip as `CodecDelay` and
+the end trim as the last block's `DiscardPadding`.
+`opus_stereo_webm_libopus.s16` is libopus's decode of it, which FFmpeg trims
+by both to exactly the 24 000 encoded frames:
+
+```sh
+ffmpeg -ss 20 -t 0.5 -i ../../../examples/media/BigBuckBunny.mp4 -vn -ac 2 \
+  -ar 48000 -c:a libopus -b:a 96k -frame_duration 20 opus_stereo.webm
+ffmpeg -c:a libopus -i opus_stereo.webm -f s16le opus_stereo_webm_libopus.s16
+```
+
+`opus_stereo.webm` is the same half second of music encoded by libopus
+straight into WebM, which FFmpeg writes with the pre-skip as `CodecDelay` and
+the end trim as the last block's `DiscardPadding`.
+`opus_stereo_webm_libopus.s16` is libopus's decode of it, which FFmpeg trims
+by both to exactly the 24 000 encoded frames:
+
+```sh
+ffmpeg -ss 20 -t 0.5 -i ../../../examples/media/BigBuckBunny.mp4 -vn -ac 2 \
+  -ar 48000 -c:a libopus -b:a 96k -frame_duration 20 opus_stereo.webm
+ffmpeg -c:a libopus -i opus_stereo.webm -f s16le opus_stereo_webm_libopus.s16
+``` The official RFC 8251 decoder test
+vectors are 75 MB and are not committed; CI downloads them for
+`rfc8251_test_vectors_pass_opus_compare`.
+
+`vorbis_stereo_44k.ogg` and `vorbis_transient_mono.ogg` are half-second Vorbis
+streams encoded by libvorbis: music from the bundled sample at 44.1 kHz, and a
+tone with sharp clicks at 48 kHz, which makes the encoder switch to short
+blocks so packet durations vary. `vorbis_6ch_16k.ogg` is a quarter second of
+5.1, one tone per channel, whose setup header has several coupling steps.
+`vorbis_6ch_48k.ogg` and `vorbis_4ch_44k.ogg` are a quarter second of the same
+music mixed differently into each channel, in two of the configurations
+Symphonia 0.5.5 decoded wrongly (issue #547): at 48 kHz and `-q:a 4`
+libvorbis's 5.1 mapping couples the left channel in three of its four steps,
+and four channels share one uncoupled residue whose partitions do not fill its
+last classword.
+
+```sh
+ffmpeg -ss 20 -t 0.5 -i ../../../examples/media/BigBuckBunny.mp4 -vn -ac 2 \
+  -ar 44100 -c:a libvorbis -q:a 4 vorbis_stereo_44k.ogg
+ffmpeg -f lavfi \
+  -i "sine=f=440:d=4,aeval=val(0)*0.3+0.6*(lt(mod(t\,0.5)\,0.003))*(random(0)-0.5)|val(0)*0.3:c=stereo" \
+  -ar 48000 -f f32le transient.f32
+ffmpeg -f f32le -ar 48000 -ac 2 -i transient.f32 -t 0.5 -ac 1 -c:a libvorbis -q:a 2 \
+  vorbis_transient_mono.ogg
+ffmpeg -f lavfi -i "aevalsrc=0.4*sin(2*PI*300*t)|0.4*sin(2*PI*500*t)|0.4*sin(2*PI*700*t)|0.4*sin(2*PI*900*t)|0.4*sin(2*PI*1100*t)|0.4*sin(2*PI*1300*t):s=16000:d=0.25:c=5.1" \
+  -c:a libvorbis -q:a 0 vorbis_6ch_16k.ogg
+ffmpeg -ss 20 -t 0.25 -i ../../../examples/media/BigBuckBunny.mp4 -vn -ar 48000 \
+  -af "aformat=channel_layouts=stereo,pan=5.1|c0=c0|c1=c1|c2=0.5*c0+0.5*c1|c3=0.3*c0+0.3*c1|c4=0.7*c0-0.3*c1|c5=0.3*c0-0.7*c1" \
+  -c:a libvorbis -q:a 4 vorbis_6ch_48k.ogg
+ffmpeg -ss 20 -t 0.25 -i ../../../examples/media/BigBuckBunny.mp4 -vn -ar 44100 \
+  -af "aformat=channel_layouts=stereo,pan=quad|c0=c0|c1=c1|c2=0.7*c0-0.3*c1|c3=0.3*c0-0.7*c1" \
+  -c:a libvorbis -q:a 3 vorbis_4ch_44k.ogg
+```
+
+The references below interleave each frame's channels in the order the stream
+codes them, which is the Vorbis channel order (Vorbis I section 4.3.9).
+
+Each `vorbis_*_libvorbis.s16` is libvorbis's own decode through `vorbisfile`,
+which trims the stream to its granule positions, written as interleaved 16-bit
+little-endian PCM by a few lines of C built against libvorbis 1.3.7 and libogg
+1.3.5:
+
+```c
+OggVorbis_File vf;
+ov_fopen(argv[1], &vf);
+int channels = ov_info(&vf, -1)->channels;
+float **pcm;
+int section;
+long n;
+while ((n = ov_read_float(&vf, &pcm, 4096, &section)) > 0)
+  for (long i = 0; i < n; i++)
+    for (int c = 0; c < channels; c++) {
+      long s = lrintf(pcm[c][i] * 32768.f);
+      short o = s > 32767 ? 32767 : s < -32768 ? -32768 : s;
+      fwrite(&o, 2, 1, out);
+    }
+```
+
+FFmpeg's own Vorbis decode is not used for these references: at the version
+used it did not trim to the granule positions consistently.
+`vp8/vp8_altref_98x66.webm` is a two-pass VP8 WebM encode of `testsrc2` with
+alternate references: 43 WebM blocks, three of which are hidden alternate
+reference frames (`show_frame` = 0) stored as blocks of their own, at the
+timestamp of the shown frame after them. `vp8_altref_98x66.webm.md5` is
+libvpx's decode of its 40 shown frames, one MD5 of each frame's I420 output per
+line. They were generated offline with
+
+```sh
+for pass in 1 2; do
+  ffmpeg -f lavfi -i "testsrc2=size=98x66:rate=25" -t 1.6 -c:v libvpx -g 16 \
+    -auto-alt-ref 1 -lag-in-frames 16 -b:v 300k -deadline good -pass $pass \
+    vp8_altref_98x66.webm
+done
+ffmpeg -c:v libvpx -i vp8_altref_98x66.webm -f framemd5 - | grep -v '^#' \
+  | awk -F', *' '{print $6}' > vp8_altref_98x66.webm.md5
+```
+
+(the first pass may write to the null muxer instead). `src/vp8/tests.rs`
+checks that `WebmDemuxer` presents only the shown frames and that each matches
+libvpx's digest, and `tests/vp8_conformance.rs` and the browser tests in
+`src/web_decoder.rs` read every shown frame back in sequential, reverse and
+alternating order, decoding through the hidden ones.
+
+`vp9_bbb_256x144.mp4` and `vp9_bbb_250x142.mp4` are VP9 profile 0 (8-bit
+4:2:0) tracks encoded by libvpx from the bundled sample, for the VP9 decoder
+(issue #527). The first is 48 frames at 256x144 in two groups of pictures,
+encoded in two passes so that libvpx codes hidden alternate reference frames,
+each carried in a superframe with the frame shown after it; the second is 12
+frames at 250x142, whose edges are not a multiple of 8. Both leave their colour
+space unspecified and use studio range. They were generated offline with
+FFmpeg 6.0's libvpx wrapper:
+
+```sh
+B=../../../examples/media/BigBuckBunny.mp4
+ffmpeg -ss 10 -i $B -an -frames:v 48 -vf scale=256:144 -pix_fmt yuv420p bbb.y4m
+ffmpeg -ss 20 -i $B -an -frames:v 12 -vf scale=250:142 -pix_fmt yuv420p bbb_odd.y4m
+A="-c:v libvpx-vp9 -auto-alt-ref 1 -deadline good -cpu-used 2 -row-mt 0"
+W="$A -b:v 200k -g 24 -keyint_min 24 -lag-in-frames 16 -arnr-maxframes 5"
+O="$A -b:v 150k -g 12 -keyint_min 12 -lag-in-frames 8"
+ffmpeg -i bbb.y4m $W -pass 1 -passlogfile a -f null /dev/null
+ffmpeg -i bbb.y4m $W -pass 2 -passlogfile a -movflags +faststart vp9_bbb_256x144.mp4
+ffmpeg -i bbb_odd.y4m $O -pass 1 -passlogfile b -f null /dev/null
+ffmpeg -i bbb_odd.y4m $O -pass 2 -passlogfile b -movflags +faststart vp9_bbb_250x142.mp4
+```
+
+Each `vp9_bbb_*_yuv420.sha256` holds one `FrameDigest` per presentation
+frame of libvpx's own decode of the fixture, hashed as
+`big_buck_bunny_av1_yuv420.sha256` above, and each `vp9_bbb_*_rgba.sha256` the
+`Rgba8` digests of the same frames after this crate's BT.601
+`convert_to_rgba8`, the conversion `native_vp9_video_decoder_factory` applies to
+a stream that does not name its colour space:
+
+```sh
+ffmpeg -c:v libvpx-vp9 -i vp9_bbb_256x144.mp4 -fps_mode passthrough \
+  -f rawvideo -pix_fmt yuv420p ref.yuv
+```
+
+`src/vp9_dec/tests.rs` compares the decoder's YUV output with the first and
+`tests/codec_conformance.rs` and the browser fallback test in
+`src/web_decoder.rs` the factory's RGBA output with the second. As above, FFmpeg
+and libvpx are only the offline fixture generators and are not build, test, or
+runtime dependencies.
+
+`libvpx_vp9_test_vectors.txt` lists the VP9 profile 0 test vectors of libvpx's
+own test suite (the `vp90-2-*` names of libvpx's `test/test_vectors.cc`).
+They are not checked in: CI downloads each, with the `.md5` file of per-frame
+digests libvpx's test harness checks, from the WebM project's test-data bucket
+and runs the ignored `vp9_dec::tests::libvpx_test_vectors` test over them, which
+reads the WebM and IVF files directly and requires every shown frame's MD5 to
+match libvpx's.
+
+`vp9_bbb_256x144.webm` is `vp9_bbb_256x144.mp4` remuxed to WebM without
+re-encoding (`ffmpeg -i vp9_bbb_256x144.mp4 -c copy vp9_bbb_256x144.webm`), a
+`V_VP9` track with no `CodecPrivate`; `src/vp9_dec/tests.rs` checks that
+`WebmDemuxer` yields the same chunks and that they decode to the same digests.

@@ -52,6 +52,52 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ---
 
+The VP8 probability, quantizer and mode tables in `src/vp8/tables.rs` are
+transcribed from the reference decoder published in RFC 6386 section 20, and
+`src/vp8/` follows that decoder's structure. The VP8 test vectors and their MD5
+files in `tests/fixtures/codec/vp8/` are from the libvpx project. Both are
+distributed under the following license.
+
+
+Copyright (c) 2010, 2011, Google Inc.  All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+
+o  Redistributions of source code must retain the above copyright
+   notice, this list of conditions and the following disclaimer.
+
+o  Redistributions in binary form must reproduce the above copyright
+   notice, this list of conditions and the following disclaimer in
+   the documentation and/or other materials provided with the
+   distribution.
+
+o  Neither the name of Google nor the names of its contributors may
+   be used to endorse or promote products derived from this software
+   without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT
+HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED
+AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY
+WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.
+
+---
+
+The VP9 decoder's constant tables (`src/vp9_dec/tables.rs`) and its
+one-dimensional inverse transforms (`src/vp9_dec/idct1d.rs`) are generated
+from libvpx's `vp9/common` and `vpx_dsp` sources, and the rest of
+`src/vp9_dec/` follows the structure of libvpx's VP9 decoder, so that it
+decodes bit for bit as libvpx does.
+
 The VP9 default probability, quantizer, scan and interpolation filter tables in
 `src/vp9_encoder/tables.rs` are generated from [libvpx](https://chromium.googlesource.com/webm/libvpx)
 (`vp9/common/vp9_entropy.c`, `vp9_entropymode.c`, `vp9_quant_common.c`,
@@ -90,3 +136,52 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+---
+
+`src/vorbis_decoder/` is the Vorbis decoder of
+[Symphonia](https://github.com/pdeljanov/Symphonia), `symphonia-codec-vorbis`
+0.5.5, modified by zvidlib to decode streams of more than two channels
+correctly and in the Vorbis channel order; the changes are listed at the top of
+`src/vorbis_decoder/mod.rs`. Those files are covered by the Mozilla Public
+License, version 2.0, and keep its notice. A copy of the license is at
+<https://mozilla.org/MPL/2.0/>, and their source, as modified, is the files
+themselves.
+
+Copyright (c) 2019-2022 The Project Symphonia Developers.
+
+---
+
+`src/vorbis_encoder/` is a port of the encoder in libvorbis 1.3.7
+(https://xiph.org/vorbis/), and its `tables/gen_*.rs` files are generated from
+libvorbis's own tables by `tools/vorbis_encoder/gen_tables.py`. The tools under
+`tools/vorbis_encoder/` build the unmodified libvorbis the port is checked
+against.
+
+Copyright (c) 2002-2020 Xiph.org Foundation
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+
+- Redistributions of source code must retain the above copyright
+notice, this list of conditions and the following disclaimer.
+
+- Redistributions in binary form must reproduce the above copyright
+notice, this list of conditions and the following disclaimer in the
+documentation and/or other materials provided with the distribution.
+
+- Neither the name of the Xiph.org Foundation nor the names of its
+contributors may be used to endorse or promote products derived from
+this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE FOUNDATION
+OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.

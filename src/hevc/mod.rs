@@ -27,7 +27,9 @@ pub use engine::profile as decode_profile;
 mod encoder;
 pub(crate) mod engine;
 #[cfg(all(any(windows, target_os = "linux"), target_pointer_width = "64"))]
-mod nvdec;
+pub(crate) mod nvdec;
+#[cfg(any(windows, all(target_os = "linux", target_pointer_width = "64")))]
+pub(crate) mod planar;
 // internal — exposed for the hardware benchmark suite; not part of the stable API
 #[cfg(not(target_arch = "wasm32"))]
 #[doc(hidden)]
@@ -36,8 +38,10 @@ pub mod readback;
 mod videotoolbox;
 #[cfg(target_os = "macos")]
 mod videotoolbox_encoder;
+#[cfg(target_os = "macos")]
+pub(crate) mod videotoolbox_vp9;
 #[cfg(windows)]
-mod windows_mf;
+pub(crate) mod windows_mf;
 #[cfg(windows)]
 mod windows_mf_encoder;
 

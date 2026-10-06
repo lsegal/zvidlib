@@ -27,6 +27,14 @@
 
 mod bits;
 mod block;
+// What the hardware backends read from a chunk before handing it to the platform decoder.
+#[cfg(any(
+    test,
+    windows,
+    all(target_os = "linux", target_pointer_width = "64"),
+    target_os = "macos"
+))]
+mod chunk;
 mod idct1d;
 mod loopfilter;
 mod probs;
@@ -41,6 +49,17 @@ use std::sync::Arc;
 use bits::{BitReader, BoolDecoder};
 use block::{FrameDecoder, MvRef};
 use probs::{FrameContext, FrameCounts};
+
+#[cfg(any(
+    test,
+    windows,
+    all(target_os = "linux", target_pointer_width = "64"),
+    target_os = "macos"
+))]
+pub(crate) use chunk::{ChunkInspector, chunk_frames};
+// The NVDEC and Media Foundation backends name the shape they carry to readback.
+#[cfg(any(test, windows, all(target_os = "linux", target_pointer_width = "64")))]
+pub(crate) use chunk::FrameShape;
 
 use crate::{Error, ErrorKind, Limits, Result};
 

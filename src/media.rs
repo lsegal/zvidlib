@@ -50,11 +50,24 @@ pub enum Codec {
     H264,
     Hevc,
     Av1,
+    /// VP8 video, as carried in WebM (`V_VP8`). It has no decoder
+    /// configuration record. [`crate::native_vp8_video_decoder_factory`]
+    /// decodes it; no encoder factory accepts it.
+    Vp8,
     /// VP9 video, carried in MP4 as a `vp09` sample entry whose decoder
     /// configuration is the complete `vpcC` box (see
     /// [`crate::Vp9CodecConfig`]).
     Vp9,
     Aac,
+    /// Opus audio (RFC 6716). MP4 carries it in an `Opus` sample entry whose
+    /// decoder configuration is a `dOps` box; Matroska and WebM carry the
+    /// RFC 7845 `OpusHead` identification header as `CodecPrivate`. See
+    /// [`crate::OpusHead`].
+    Opus,
+    /// Vorbis I audio. There is no widely supported MP4 mapping for Vorbis, so
+    /// it has no MP4 sample entry; Matroska and WebM carry its three setup
+    /// headers Xiph-laced as `CodecPrivate`. See [`crate::VorbisConfig`].
+    Vorbis,
 }
 
 /// CPU video pixel formats supported by the portable media layer.

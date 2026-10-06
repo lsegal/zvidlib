@@ -1,6 +1,7 @@
 //! Portable derivation of WebCodecs codec strings and [`CodecProfile`] values
-//! from raw MP4 `hvcC`/`av1C`/`vpcC` codec configuration boxes, and the VP9
-//! codec configuration record ([`Vp9CodecConfig`]).
+//! from raw MP4 `hvcC`/`av1C`/`vpcC` codec configuration boxes and for VP8,
+//! which has none, and the VP9 codec configuration record
+//! ([`Vp9CodecConfig`]).
 //!
 //! This module contains no browser (`web_sys`) types so it can be unit
 //! tested natively. It is consumed by the browser WebCodecs decoder factory
@@ -19,11 +20,37 @@ pub struct DerivedCodecString {
 }
 
 /// Derives a WebCodecs `codec` string and [`CodecProfile`] from a track's
-/// complete raw codec configuration box (including its size/fourcc header).
+/// complete raw codec configuration box (including its size/fourcc header):
+/// `hvcC`, `av1C` or Opus's `dOps`. Vorbis has no MP4 box, so its
+/// configuration is the Xiph-laced `CodecPrivate` [`crate::VorbisConfig`]
+/// reads.
 pub fn derive_codec_string(codec: Codec, decoder_config: &[u8]) -> Result<DerivedCodecString> {
     match codec {
         Codec::Hevc => derive_hevc(decoder_config),
         Codec::Av1 => derive_av1(decoder_config),
+        // VP8 has one profile and no configuration record, so its WebCodecs
+        // string is the bare codec name.
+        Codec::Vp8 => Ok(DerivedCodecString {
+            codec_string: "vp8".to_owned(),
+            profile: CodecProfile::Vp8,
+        }),
+        // Opus and Vorbis each have a single codec string; the configuration
+        // is still checked so a track the browser is handed is one zvidlib
+        // could also decode itself.
+        Codec::Opus => {
+            crate::OpusHead::from_dops(decoder_config)?;
+            Ok(DerivedCodecString {
+                codec_string: "opus".into(),
+                profile: CodecProfile::Opus,
+            })
+        }
+        Codec::Vorbis => {
+            crate::VorbisConfig::from_codec_private(decoder_config)?;
+            Ok(DerivedCodecString {
+                codec_string: "vorbis".into(),
+                profile: CodecProfile::Vorbis,
+            })
+        }
         Codec::Vp9 => {
             let config = Vp9CodecConfig::parse(decoder_config)?;
             Ok(DerivedCodecString {
@@ -33,7 +60,7 @@ pub fn derive_codec_string(codec: Codec, decoder_config: &[u8]) -> Result<Derive
         }
         Codec::UncompressedVideo | Codec::H264 | Codec::Aac => Err(Error::new(
             ErrorKind::Unsupported,
-            "codec string derivation only supports HEVC, AV1 and VP9 video",
+            "codec string derivation only supports HEVC, AV1, VP8, VP9, Opus and Vorbis",
         )),
     }
 }
@@ -340,6 +367,27 @@ impl Vp9CodecConfig {
         })
     }
 
+    /// The complete version 1 `vpcC` box describing this configuration,
+    /// with no codec initialization data.
+    pub fn to_vpcc(&self) -> Vec<u8> {
+        let mut bytes = 20u32.to_be_bytes().to_vec();
+        bytes.extend_from_slice(b"vpcC");
+        bytes.extend_from_slice(&[1, 0, 0, 0, self.profile, self.level]);
+        bytes.push(
+            (self.bit_depth << 4)
+                | (self.chroma_subsampling << 1)
+                | u8::from(self.video_full_range),
+        );
+        bytes.extend_from_slice(&[
+            self.colour_primaries,
+            self.transfer_characteristics,
+            self.matrix_coefficients,
+            0,
+            0,
+        ]);
+        bytes
+    }
+
     /// The `vp09.PP.LL.DD` codec string of the VP9 ISO-BMFF binding, which
     /// WebCodecs and `MediaSource` accept. An unspecified or invalid level
     /// is written as level 1.0, since the string requires one.
@@ -454,6 +502,13 @@ mod tests {
     }
 
     #[test]
+    fn derives_the_vp8_codec_string_without_a_configuration_record() {
+        let derived = derive_codec_string(Codec::Vp8, &[]).unwrap();
+        assert_eq!(derived.codec_string, "vp8");
+        assert_eq!(derived.profile, CodecProfile::Vp8);
+    }
+
+    #[test]
     fn rejects_unsupported_codecs() {
         let error = derive_codec_string(Codec::Aac, &boxed(b"esds", &[0; 4])).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Unsupported);
@@ -543,6 +598,8 @@ mod tests {
             let error = Vp9CodecConfig::parse(&bytes).unwrap_err();
             assert_eq!(error.kind(), ErrorKind::MalformedMedia, "{bytes:?}");
         }
+        let config = Vp9CodecConfig::parse(&[1, 1, 0, 2, 1, 41, 4, 1, 1]).unwrap();
+        assert_eq!(Vp9CodecConfig::parse(&config.to_vpcc()).unwrap(), config);
         let mut inconsistent = vpcc(1, &[0, 10, 0x80, 1, 1, 1, 0, 0]);
         inconsistent[3] += 1;
         assert!(Vp9CodecConfig::parse(&inconsistent).is_err());

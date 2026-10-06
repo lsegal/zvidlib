@@ -133,6 +133,12 @@ web = [
 ]
 
 [dependencies]
+# Pure-Rust Opus decoding (a port of libopus 1.6), and the DSP and bit readers
+# the Vorbis decoder vendored in `src/vorbis_decoder/` builds on. Both build for
+# `wasm32` as well as native targets, so the browser build's software audio
+# fallback runs the same decoders native callers do.
+opus-pure = "0.2.2"
+symphonia-core = "0.5.5"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 js-sys = { version = "0.3.104", optional = true }
@@ -141,21 +147,31 @@ wasm-bindgen-futures = { version = "0.4.77", optional = true }
 web-sys = { version = "0.3.104", optional = true, features = [
     "AbortController",
     "AbortSignal",
+    # The Web Audio types only the browser tests use, to have Chrome's own media
+    # stack decode an Opus MP4 zvidlib wrote.
+    "AudioBuffer",
     "AudioData",
+    "AudioDataCopyToOptions",
     "AudioDataInit",
+    "AudioDecoder",
     "AudioDecoderConfig",
+    "AudioDecoderInit",
+    "AudioDecoderSupport",
     "AudioEncoder",
     "AudioEncoderConfig",
     "AudioEncoderInit",
     "AudioSampleFormat",
+    "BaseAudioContext",
     "Blob",
     "EncodedAudioChunk",
+    "EncodedAudioChunkInit",
     "EncodedAudioChunkMetadata",
     "EncodedAudioChunkType",
     "EncodedVideoChunk",
     "EncodedVideoChunkInit",
     "EncodedVideoChunkMetadata",
     "EncodedVideoChunkType",
+    "OfflineAudioContext",
     # `performance.now()` is what times the browser preview lookup against the
     # section 3.2 budget; see `web_previews`.
     "Performance",
@@ -191,7 +207,6 @@ winit = "0.30.13"
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 cpal = "0.15.3"
 symphonia-codec-aac = "0.5.5"
-symphonia-core = "0.5.5"
 
 [target.'cfg(any(windows, target_os = "linux"))'.dependencies]
 libloading = "0.8.9"

@@ -3,17 +3,24 @@
 //! [`WebmDemuxer::open`] builds the same decode-order sample index
 //! [`crate::Mp4Demuxer`] does, as [`Mp4Track`] values, so everything that
 //! consumes an MP4 index - [`Mp4Track::to_encoded_video_samples`],
-//! [`crate::ExactFrameReader`], the browser decoder - reads a WebM track the
-//! same way. Only metadata elements are read whole; a block's payload is never
+//! [`Mp4Track::to_encoded_audio_samples`], [`crate::ExactFrameReader`],
+//! [`crate::AudioSampleReader`], the browser decoders - reads a WebM track the
+//! same way. Opus and Vorbis audio tracks are indexed alongside the video, and
+//! [`WebmDemuxer::audio_timing`] reads the trimming they declare. Only metadata elements are read whole; a block's payload is never
 //! read, only its header and lacing, so indexing costs the same however large
 //! the frames are.
 
+use crate::audio::AudioTrackTiming;
 use crate::codec::{SampleDependency, TrackKind};
-use crate::ebml::{self, children, read_float, read_id, read_known_vint, read_string, read_uint};
+use crate::ebml::{
+    self, children, read_float, read_id, read_int, read_known_vint, read_string, read_uint,
+};
 use crate::io::ByteSource;
 use crate::media::{Codec, VideoDimensions};
 use crate::mp4_demux::{Mp4Sample, Mp4Track};
-use crate::{Error, ErrorKind, Limits, Result, Vp9CodecConfig};
+use crate::opus::{OPUS_SAMPLE_RATE, OpusHead};
+use crate::vorbis::VorbisConfig;
+use crate::{Error, ErrorKind, Limits, Result};
 use std::collections::BTreeMap;
 
 /// Matroska's default `TimestampScale`: one tick is a millisecond.
@@ -21,8 +28,11 @@ const DEFAULT_TIMESTAMP_SCALE: u64 = 1_000_000;
 const NANOSECONDS_PER_SECOND: u64 = 1_000_000_000;
 /// The longest element header: a four-byte ID and an eight-byte size.
 const MAX_HEADER: usize = 12;
-/// Enough of an unlaced block for its track number, timestamp and flags.
-const BLOCK_PREFIX: usize = 11;
+/// Enough of an unlaced block for its track number, timestamp and flags, and
+/// the first byte of its frame, which holds a VP8 frame's `show_frame` bit.
+const BLOCK_PREFIX: usize = 12;
+/// The Matroska invisible flag, in both SimpleBlock and Block flags.
+const INVISIBLE: u8 = 0x08;
 
 /// Resource limits specific to untrusted WebM structure.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -72,7 +82,7 @@ pub struct WebmSeekPoint {
 }
 
 /// A track the demuxer left out of [`WebmDemuxer::tracks`] because zvidlib
-/// has no reader for it, such as an Opus or Vorbis audio track.
+/// has no reader for it, such as a Matroska AAC audio track.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WebmSkippedTrack {
     pub number: u64,
@@ -86,15 +96,36 @@ pub struct WebmDemuxer {
     pub doc_type: String,
     /// The segment's `Duration`, in seconds, when the file declares one.
     pub duration_seconds: Option<f64>,
-    /// Indexed video tracks, in `Tracks` order. Each track's
+    /// Indexed video and audio tracks, in `Tracks` order. Each track's
     /// [`Mp4Track::timescale`] is derived from the segment's
-    /// `TimestampScale`, and a V_AV1 track's `decoder_config` is its
-    /// `CodecPrivate` wrapped in an `av1C` box, as an MP4 track's is.
+    /// `TimestampScale`. A V_AV1 track's `decoder_config` is its
+    /// `CodecPrivate` wrapped in an `av1C` box, and an A_OPUS track's is its
+    /// `OpusHead` rewritten as a `dOps` box, as an MP4 track's are. A V_VP9
+    /// track's is the `vpcC` box its `CodecPrivate` describes (see
+    /// [`crate::Vp9CodecConfig`]), a V_VP8 track has none, and an A_VORBIS
+    /// track's is its Xiph-laced `CodecPrivate`.
     pub tracks: Vec<Mp4Track>,
     /// Cue points, in file order, for the indexed tracks. Empty when the file
     /// has no `Cues`, as a live `MediaRecorder` capture usually does.
     pub cues: Vec<WebmCuePoint>,
     pub skipped_tracks: Vec<WebmSkippedTrack>,
+    /// What each indexed audio track declares about the samples to trim from
+    /// its decoded stream; see [`Self::audio_timing`].
+    pub audio_trims: Vec<WebmAudioTrim>,
+}
+
+/// The trimming one WebM audio track declares, in nanoseconds as Matroska
+/// stores it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WebmAudioTrim {
+    /// The Matroska track number, which is also the [`Mp4Track::id`].
+    pub track: u32,
+    /// `CodecDelay`: decoded audio to discard from the start, an Opus
+    /// stream's pre-skip. `None` when the track does not declare one.
+    pub codec_delay_ns: Option<u64>,
+    /// The track's last block's `DiscardPadding`: decoded audio to discard
+    /// from the end. Zero when it declares none.
+    pub discard_padding_ns: u64,
 }
 
 /// Bounded format detection: whether `source` starts with an EBML header
@@ -213,6 +244,41 @@ impl WebmDemuxer {
         self.tracks.iter().find(|track| track.id == id)
     }
 
+    /// An audio track's timing on the decoded sample clock
+    /// [`crate::AudioSampleReader`] reads it on, the WebM counterpart of
+    /// [`Mp4Track::audio_timing`]: `CodecDelay` is the priming and the last
+    /// block's `DiscardPadding` the end padding, each converted to samples. An
+    /// Opus track that declares no `CodecDelay` is primed by its `OpusHead`
+    /// pre-skip instead.
+    pub fn audio_timing(&self, track_id: u32) -> Result<AudioTrackTiming> {
+        let track = self
+            .track(track_id)
+            .filter(|track| track.kind == TrackKind::Audio)
+            .ok_or_else(|| invalid("no such WebM audio track"))?;
+        let trim = self
+            .audio_trims
+            .iter()
+            .find(|trim| trim.track == track_id)
+            .ok_or_else(|| invalid("no such WebM audio track"))?;
+        let sample_rate = track.audio_sample_rate()?;
+        let to_samples = |nanoseconds: u64| -> Result<u32> {
+            let samples = (u128::from(nanoseconds) * u128::from(sample_rate)
+                + u128::from(NANOSECONDS_PER_SECOND) / 2)
+                / u128::from(NANOSECONDS_PER_SECOND);
+            u32::try_from(samples).map_err(|_| limit("WebM audio trim is out of range"))
+        };
+        let priming = match (trim.codec_delay_ns, track.codec) {
+            (Some(delay), _) => to_samples(delay)?,
+            (None, Codec::Opus) => u32::from(track.opus_config()?.pre_skip),
+            (None, _) => 0,
+        };
+        Ok(AudioTrackTiming {
+            priming,
+            padding: to_samples(trim.discard_padding_ns)?,
+            ..AudioTrackTiming::default()
+        })
+    }
+
     /// The random-access point a decode reaching `time` (in track ticks)
     /// starts from: the latest cue at or before it when the file has `Cues`
     /// for the track, otherwise the latest sync sample at or before it from
@@ -278,19 +344,42 @@ struct TrackEntry {
 
 struct IndexedTrack {
     codec: Codec,
-    dimensions: VideoDimensions,
+    media: TrackMedia,
     decoder_config: Vec<u8>,
     default_duration_ns: Option<u64>,
-    frames: Vec<(u64, u32)>,
+    frames: Vec<Frame>,
     blocks: Vec<Block>,
+}
+
+/// What an indexed track carries.
+enum TrackMedia {
+    Video(VideoDimensions),
+    Audio {
+        channels: u16,
+        sample_rate: u32,
+        codec_delay_ns: Option<u64>,
+    },
+}
+
+#[derive(Clone, Copy)]
+struct Frame {
+    offset: u64,
+    size: u32,
+    /// `false` for a decode-only frame that is never presented, such as a
+    /// hidden VP8 alternate reference stored as a block of its own.
+    shown: bool,
 }
 
 struct Block {
     /// Raw timestamp in `TimestampScale` ticks.
     timestamp: i64,
+    /// `DiscardPadding`, in nanoseconds.
+    discard_padding_ns: i64,
     first_frame: usize,
     frames: u32,
     keyframe: bool,
+    /// Whether any of the block's frames is presented.
+    shown: bool,
     /// `BlockDuration`, in raw ticks.
     duration: Option<u64>,
     cluster_offset: u64,
@@ -413,6 +502,7 @@ impl<S: ByteSource + ?Sized> Scan<'_, S> {
     ) -> Result<ParsedBlock> {
         let mut block = None;
         let mut duration = None;
+        let mut discard_padding = 0;
         let mut references = 0_u32;
         let mut cursor = group.data_start;
         while cursor < end {
@@ -427,6 +517,12 @@ impl<S: ByteSource + ?Sized> Scan<'_, S> {
                     duration = Some(read_uint(&self.payload(header, element_end).await?)?);
                 }
                 ebml::REFERENCE_BLOCK => references = references.saturating_add(1),
+                ebml::DISCARD_PADDING => {
+                    if element_end - header.data_start > 8 {
+                        return Err(malformed("WebM DiscardPadding is too long"));
+                    }
+                    discard_padding = read_int(&self.payload(header, element_end).await?)?;
+                }
                 _ => {}
             }
             cursor = element_end;
@@ -435,8 +531,11 @@ impl<S: ByteSource + ?Sized> Scan<'_, S> {
             block.ok_or_else(|| malformed("a WebM BlockGroup contains no Block"))?;
         // A Block's flags carry no keyframe bit; a block that references no
         // other block is the random-access point.
-        self.block(start, block_end, timestamp, Some(references == 0), duration)
-            .await
+        let mut parsed = self
+            .block(start, block_end, timestamp, Some(references == 0), duration)
+            .await?;
+        parsed.discard_padding_ns = discard_padding;
+        Ok(parsed)
     }
 
     /// Parses a block's header and lacing. Only an unlaced block's first few
@@ -465,7 +564,11 @@ impl<S: ByteSource + ?Sized> Scan<'_, S> {
         let lacing = (flags >> 1) & 0b11;
         let frames = if lacing == 0 {
             let size = length - header_length as u64;
-            vec![(start + header_length as u64, frame_size(size)?)]
+            vec![(
+                start + header_length as u64,
+                frame_size(size)?,
+                prefix.get(header_length).copied(),
+            )]
         } else {
             if length > self.options.max_element_bytes {
                 return Err(limit(
@@ -477,7 +580,10 @@ impl<S: ByteSource + ?Sized> Scan<'_, S> {
             read_exact(self.source, start, &mut bytes).await?;
             parse_lacing(&bytes, header_length, lacing)?
                 .into_iter()
-                .map(|(offset, size)| Ok((start + offset as u64, frame_size(size as u64)?)))
+                .map(|(offset, size)| {
+                    let first_byte = (size > 0).then(|| bytes[offset]);
+                    Ok((start + offset as u64, frame_size(size as u64)?, first_byte))
+                })
                 .collect::<Result<_>>()?
         };
         Ok(ParsedBlock {
@@ -486,7 +592,9 @@ impl<S: ByteSource + ?Sized> Scan<'_, S> {
                 .checked_add(i64::from(relative))
                 .ok_or_else(|| malformed("WebM block timestamp overflow"))?,
             keyframe: keyframe.unwrap_or(flags & 0x80 != 0),
+            invisible: flags & INVISIBLE != 0,
             duration,
+            discard_padding_ns: 0,
             frames,
         })
     }
@@ -496,8 +604,11 @@ struct ParsedBlock {
     track: u64,
     timestamp: i64,
     keyframe: bool,
+    invisible: bool,
     duration: Option<u64>,
-    frames: Vec<(u64, u32)>,
+    discard_padding_ns: i64,
+    /// Each frame's offset, size and first byte.
+    frames: Vec<(u64, u32, Option<u8>)>,
 }
 
 impl ParsedBlock {
@@ -520,19 +631,43 @@ impl ParsedBlock {
         }
         ensure_allocation(
             total,
-            std::mem::size_of::<(u64, u32)>() + std::mem::size_of::<Mp4Sample>(),
+            std::mem::size_of::<Frame>() + std::mem::size_of::<Mp4Sample>(),
             options,
             "WebM sample index",
         )?;
+        let first_frame = track.frames.len();
+        for (offset, size, first_byte) in self.frames {
+            // A VP8 frame with `show_frame` (bit 4 of its frame tag) clear is
+            // decoded for its references but never presented (RFC 6386
+            // section 9.1), and Matroska's invisible flag says the same of
+            // the whole block.
+            //
+            // A VP9 block is a chunk that shows one frame, carrying hidden
+            // frames ahead of it in a superframe; whether a chunk shows a
+            // frame is only known from its last frame, so a block that does
+            // not is identified by the invisible flag alone.
+            let shown = match track.codec {
+                Codec::Vp8 => !self.invisible && first_byte.is_none_or(|tag| tag & 0x10 != 0),
+                Codec::Vp9 => !self.invisible,
+                _ => true,
+            };
+            track.frames.push(Frame {
+                offset,
+                size,
+                shown,
+            });
+        }
         track.blocks.push(Block {
             timestamp: self.timestamp,
-            first_frame: track.frames.len(),
-            frames: u32::try_from(self.frames.len()).expect("a lace holds at most 256 frames"),
+            discard_padding_ns: self.discard_padding_ns,
+            first_frame,
+            frames: u32::try_from(track.frames.len() - first_frame)
+                .expect("a lace holds at most 256 frames"),
             keyframe: self.keyframe,
+            shown: track.frames[first_frame..].iter().any(|frame| frame.shown),
             duration: self.duration,
             cluster_offset,
         });
-        track.frames.extend(self.frames);
         Ok(())
     }
 }
@@ -697,9 +832,12 @@ fn parse_track_entry(payload: &[u8], options: &WebmDemuxerOptions) -> Result<Tra
     let mut codec_id = None;
     let mut codec_private = None;
     let mut default_duration = None;
+    let mut codec_delay = None;
     let mut encoded = false;
     let mut width = None;
     let mut height = None;
+    let mut sampling_frequency = None;
+    let mut channels = None;
     for child in children(payload) {
         let (id, value) = child?;
         match id {
@@ -708,6 +846,17 @@ fn parse_track_entry(payload: &[u8], options: &WebmDemuxerOptions) -> Result<Tra
             ebml::CODEC_ID => codec_id = Some(read_string(value)?),
             ebml::CODEC_PRIVATE => codec_private = Some(value),
             ebml::DEFAULT_DURATION => default_duration = Some(read_uint(value)?),
+            ebml::CODEC_DELAY => codec_delay = Some(read_uint(value)?),
+            ebml::AUDIO => {
+                for child in children(value) {
+                    let (id, value) = child?;
+                    match id {
+                        ebml::SAMPLING_FREQUENCY => sampling_frequency = Some(read_float(value)?),
+                        ebml::CHANNELS => channels = Some(read_uint(value)?),
+                        _ => {}
+                    }
+                }
+            }
             ebml::CONTENT_ENCODINGS => encoded = true,
             ebml::VIDEO => {
                 for child in children(value) {
@@ -726,6 +875,68 @@ fn parse_track_entry(payload: &[u8], options: &WebmDemuxerOptions) -> Result<Tra
         .filter(|&number| number != 0)
         .ok_or_else(|| malformed("WebM track has no nonzero TrackNumber"))?;
     let codec_id = codec_id.ok_or_else(|| malformed("WebM track has no CodecID"))?;
+    if track_type == Some(ebml::TRACK_TYPE_AUDIO)
+        && let Some(codec) = audio_codec(&codec_id)
+    {
+        if encoded {
+            return Err(unsupported(
+                "compressed or encrypted WebM audio tracks are unsupported",
+            ));
+        }
+        let private = codec_private
+            .ok_or_else(|| malformed(format!("{codec_id} track has no CodecPrivate")))?;
+        // The codec's own header is authoritative for the format; the Audio
+        // element only has to agree with it.
+        let (decoder_config, header_channels, sample_rate) = match codec {
+            Codec::Opus => {
+                let head = OpusHead::from_identification_header(private)?;
+                (head.to_dops(), u16::from(head.channels), OPUS_SAMPLE_RATE)
+            }
+            _ => {
+                let config = VorbisConfig::from_codec_private(private)?;
+                (
+                    private.to_vec(),
+                    u16::from(config.channels),
+                    config.sample_rate,
+                )
+            }
+        };
+        if channels.is_some_and(|channels| channels != u64::from(header_channels)) {
+            return Err(malformed(format!(
+                "{codec_id} Channels disagrees with its CodecPrivate"
+            )));
+        }
+        if codec == Codec::Vorbis
+            && sampling_frequency.is_some_and(|rate| (rate - f64::from(sample_rate)).abs() > 0.5)
+        {
+            return Err(malformed(
+                "A_VORBIS SamplingFrequency disagrees with its CodecPrivate",
+            ));
+        }
+        if u32::from(header_channels) > u32::from(options.limits.max_audio_channels)
+            || sample_rate > options.limits.max_sample_rate
+        {
+            return Err(limit(
+                "WebM audio channels or sample rate exceed the configured limits",
+            ));
+        }
+        return Ok(TrackEntry {
+            number,
+            codec_id,
+            indexed: Some(IndexedTrack {
+                codec,
+                media: TrackMedia::Audio {
+                    channels: header_channels,
+                    sample_rate,
+                    codec_delay_ns: codec_delay,
+                },
+                decoder_config,
+                default_duration_ns: default_duration.filter(|&duration| duration > 0),
+                frames: Vec::new(),
+                blocks: Vec::new(),
+            }),
+        });
+    }
     if track_type != Some(ebml::TRACK_TYPE_VIDEO) {
         return Ok(TrackEntry {
             number,
@@ -756,7 +967,7 @@ fn parse_track_entry(payload: &[u8], options: &WebmDemuxerOptions) -> Result<Tra
         codec_id,
         indexed: Some(IndexedTrack {
             codec,
-            dimensions,
+            media: TrackMedia::Video(dimensions),
             decoder_config,
             default_duration_ns: default_duration.filter(|&duration| duration > 0),
             frames: Vec::new(),
@@ -766,13 +977,25 @@ fn parse_track_entry(payload: &[u8], options: &WebmDemuxerOptions) -> Result<Tra
 }
 
 /// The codec indexed for a Matroska video `CodecID`, or `None` when zvidlib
-/// has no decoder for it. `V_VP8` belongs here once [`Codec`] has it,
-/// together with an arm in [`decoder_config`] for its `CodecPrivate` (a
-/// sibling sub-issue of #523).
+/// has no decoder for it.
 fn video_codec(codec_id: &str) -> Option<Codec> {
     match codec_id {
         "V_AV1" => Some(Codec::Av1),
+        "V_VP8" => Some(Codec::Vp8),
         "V_VP9" => Some(Codec::Vp9),
+        _ => None,
+    }
+}
+
+/// The codec indexed for a Matroska audio `CodecID`, or `None` when zvidlib
+/// has no decoder for it. An Opus track's `decoder_config` is its `OpusHead`
+/// rewritten as the `dOps` box an MP4 Opus track carries, so
+/// [`Mp4Track::opus_config`] reads either; a Vorbis track's is its
+/// `CodecPrivate` as stored, which [`Mp4Track::vorbis_config`] reads.
+fn audio_codec(codec_id: &str) -> Option<Codec> {
+    match codec_id {
+        "A_OPUS" => Some(Codec::Opus),
+        "A_VORBIS" => Some(Codec::Vorbis),
         _ => None,
     }
 }
@@ -792,28 +1015,17 @@ fn decoder_config(codec: Codec, codec_private: Option<&[u8]>) -> Result<Vec<u8>>
             config.extend_from_slice(record);
             Ok(config)
         }
+        // VP8 defines no configuration record, so any `CodecPrivate` is
+        // ignored and decoders configure from each key frame's header.
+        Codec::Vp8 => Ok(Vec::new()),
+        // VP9's `CodecPrivate` is an optional list of features (profile,
+        // level, bit depth, chroma subsampling); it becomes the `vpcC` box an
+        // MP4 track would carry, with the profile 0 defaults for any it
+        // leaves out.
         Codec::Vp9 => {
-            // The optional feature list becomes the `vpcC` box an MP4 VP9
-            // track carries; WebM has no colour fields there, so those stay
-            // unspecified.
-            let config = Vp9CodecConfig::parse_webm_codec_private(codec_private.unwrap_or(&[]))?;
-            let mut vpcc = Vec::with_capacity(20);
-            vpcc.extend_from_slice(&20_u32.to_be_bytes());
-            vpcc.extend_from_slice(b"vpcC");
-            vpcc.extend_from_slice(&[1, 0, 0, 0, config.profile, config.level]);
-            vpcc.push(
-                (config.bit_depth << 4)
-                    | ((config.chroma_subsampling & 0b111) << 1)
-                    | u8::from(config.video_full_range),
-            );
-            vpcc.extend_from_slice(&[
-                config.colour_primaries,
-                config.transfer_characteristics,
-                config.matrix_coefficients,
-                0,
-                0,
-            ]);
-            Ok(vpcc)
+            let config =
+                crate::Vp9CodecConfig::parse_webm_codec_private(codec_private.unwrap_or_default())?;
+            Ok(config.to_vpcc())
         }
         _ => Err(unsupported(
             "codec has no WebM decoder configuration mapping",
@@ -898,6 +1110,7 @@ fn finish(
     let mut tracks = Vec::new();
     let mut skipped_tracks = Vec::new();
     let mut cues = Vec::new();
+    let mut audio_trims = Vec::new();
     for entry in entries {
         let Some(track) = entry.indexed else {
             skipped_tracks.push(WebmSkippedTrack {
@@ -928,16 +1141,23 @@ fn finish(
                 as u64
         });
 
+        // A shown frame lasts until the next shown block, not the hidden one
+        // an encoder may store a tick after it.
+        let mut next_shown = vec![None; track.blocks.len()];
+        let mut following = None;
+        for (index, block) in track.blocks.iter().enumerate().rev() {
+            next_shown[index] = following;
+            if block.shown {
+                following = Some(block.timestamp);
+            }
+        }
         let mut samples = Vec::with_capacity(track.frames.len());
+        let mut shown = Vec::with_capacity(track.frames.len());
         let mut previous_frame_duration = None;
         let mut dts = 0_u64;
         for (index, block) in track.blocks.iter().enumerate() {
             let pts = to_ticks(block.timestamp)?;
-            let next = track
-                .blocks
-                .get(index + 1)
-                .map(|next| to_ticks(next.timestamp))
-                .transpose()?;
+            let next = next_shown[index].map(to_ticks).transpose()?;
             let frames = u64::from(block.frames);
             let duration = block
                 .duration
@@ -960,7 +1180,12 @@ fn finish(
             let keyframe = block.keyframe || cued[index];
             let mut frame_pts = pts;
             for frame in 0..block.frames {
-                let (offset, size) = track.frames[block.first_frame + frame as usize];
+                let Frame {
+                    offset,
+                    size,
+                    shown: frame_shown,
+                } = track.frames[block.first_frame + frame as usize];
+                shown.push(frame_shown);
                 let this_duration = if frame + 1 == block.frames {
                     duration - frame_duration * (frames - 1)
                 } else {
@@ -1001,20 +1226,44 @@ fn finish(
             options,
             "presentation index",
         )?;
-        let mut presentation_order: Vec<usize> = (0..samples.len()).collect();
+        // A decode-only frame is decoded whenever a seek passes through it,
+        // but it is not a presentation frame.
+        let mut presentation_order: Vec<usize> =
+            (0..samples.len()).filter(|&index| shown[index]).collect();
         presentation_order.sort_by_key(|&index| {
             let sample = &samples[index];
             (sample.pts, sample.dts, index)
         });
+        let (kind, dimensions, channels, sample_rate) = match track.media {
+            TrackMedia::Video(dimensions) => (TrackKind::Video, Some(dimensions), None, None),
+            TrackMedia::Audio {
+                channels,
+                sample_rate,
+                codec_delay_ns,
+            } => {
+                // Only the last block's padding trims the stream's end.
+                let discard_padding_ns = track
+                    .blocks
+                    .last()
+                    .map_or(0, |block| block.discard_padding_ns);
+                audio_trims.push(WebmAudioTrim {
+                    track: id,
+                    codec_delay_ns,
+                    discard_padding_ns: u64::try_from(discard_padding_ns)
+                        .map_err(|_| malformed("WebM DiscardPadding is negative"))?,
+                });
+                (TrackKind::Audio, None, Some(channels), Some(sample_rate))
+            }
+        };
         tracks.push(Mp4Track {
             id,
-            kind: TrackKind::Video,
+            kind,
             codec: track.codec,
             timescale,
             duration,
-            dimensions: Some(track.dimensions),
-            channels: None,
-            sample_rate: None,
+            dimensions,
+            channels,
+            sample_rate,
             decoder_config: track.decoder_config,
             edits: Vec::new(),
             samples,
@@ -1029,6 +1278,7 @@ fn finish(
         tracks,
         cues,
         skipped_tracks,
+        audio_trims,
     })
 }
 
@@ -1177,11 +1427,11 @@ mod tests {
         output
     }
 
-    fn opus_entry(number: u64) -> Vec<u8> {
+    fn aac_entry(number: u64) -> Vec<u8> {
         let mut entry = Vec::new();
         write_uint(&mut entry, ebml::TRACK_NUMBER, number);
         write_uint(&mut entry, ebml::TRACK_TYPE, 2);
-        write_string(&mut entry, ebml::CODEC_ID, "A_OPUS");
+        write_string(&mut entry, ebml::CODEC_ID, "A_AAC");
         let mut output = Vec::new();
         write_element(&mut output, ebml::TRACK_ENTRY, &entry);
         output
@@ -1263,7 +1513,7 @@ mod tests {
             "webm",
             &[
                 info(None, None),
-                tracks(&[video_entry(1, "V_AV1", Some(33_000_000)), opus_entry(2)]),
+                tracks(&[video_entry(1, "V_AV1", Some(33_000_000)), aac_entry(2)]),
                 cluster(
                     0,
                     &[
@@ -1292,7 +1542,7 @@ mod tests {
             demuxer.skipped_tracks,
             vec![WebmSkippedTrack {
                 number: 2,
-                codec_id: "A_OPUS".to_owned(),
+                codec_id: "A_AAC".to_owned(),
             }]
         );
         assert_eq!(demuxer.tracks.len(), 1);
@@ -1421,6 +1671,59 @@ mod tests {
     }
 
     #[test]
+    fn hidden_vp8_frames_are_decoded_but_not_presented() {
+        // Issue #537. A VP8 frame tag's bit 4 is `show_frame`, and bit 0 is
+        // clear on a key frame. The hidden frame one tick after frame 40 is
+        // how vpxenc stores an alternate reference, and the block at 120 is
+        // hidden by its Matroska invisible flag instead. The AV1 track shows
+        // the same first bytes are only read as a VP8 frame tag.
+        let mut invisible = Vec::new();
+        write_element(
+            &mut invisible,
+            ebml::SIMPLE_BLOCK,
+            &block_body(1, 120, INVISIBLE, &[0x11, 0]),
+        );
+        let bytes = file(
+            "webm",
+            &[
+                info(None, None),
+                tracks(&[video_entry(1, "V_VP8", None), video_entry(2, "V_AV1", None)]),
+                cluster(
+                    0,
+                    &[
+                        simple_block(1, 0, true, &[0x10, 0]),
+                        simple_block(2, 0, true, &[0x00, 0]),
+                        simple_block(1, 40, false, &[0x11, 0]),
+                        simple_block(1, 41, false, &[0x01, 0]),
+                        simple_block(2, 40, false, &[0x01, 0]),
+                        simple_block(1, 80, false, &[0x11, 0]),
+                        invisible,
+                        simple_block(1, 160, false, &[0x11, 0]),
+                    ],
+                    true,
+                ),
+            ],
+            true,
+        );
+        let source = MemorySource::new(bytes.clone());
+        let demuxer = open(bytes).unwrap();
+        let vp8 = &demuxer.tracks[0];
+        assert_eq!(vp8.samples.len(), 6);
+        assert_eq!(vp8.presentation_order, vec![0, 1, 3, 5]);
+        // Frame 40 lasts until the next shown frame, not the hidden one.
+        assert_eq!(vp8.presentation_sample(1).unwrap().duration, 40);
+        let samples = block_on(vp8.to_encoded_video_samples(&source, &Limits::default())).unwrap();
+        assert_eq!(
+            samples
+                .iter()
+                .map(|sample| sample.presentation_index.0)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 4, 2, 5, 3]
+        );
+        assert_eq!(demuxer.tracks[1].presentation_order, vec![0, 1]);
+    }
+
+    #[test]
     fn block_groups_are_keyframes_unless_they_reference_a_block() {
         let group = |relative: i16, reference: bool, duration: Option<u64>| {
             let mut payload = Vec::new();
@@ -1541,7 +1844,7 @@ mod tests {
                     "webm",
                     &[
                         info(None, None),
-                        tracks(&[video_entry(1, "V_VP8", None)]),
+                        tracks(&[video_entry(1, "V_THEORA", None)]),
                         blocks(),
                     ],
                     true,

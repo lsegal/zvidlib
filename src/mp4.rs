@@ -231,6 +231,27 @@ impl<S: ByteSink> Mp4Muxer<S> {
 }
 
 fn validate_track_config(config: &Mp4TrackConfig) -> Result<()> {
+    let expected_config = match config.encoder.codec {
+        Codec::UncompressedVideo => {
+            return Err(invalid(
+                "the uncompressed conformance codec is not an MP4 output codec",
+            ));
+        }
+        Codec::H264 => b"avcC",
+        Codec::Hevc => b"hvcC",
+        Codec::Av1 => b"av1C",
+        Codec::Aac => b"esds",
+        Codec::Opus => b"dOps",
+        Codec::Vp9 => b"vpcC",
+        // VP8-in-MP4 is not a standard mapping; VP8 is carried in WebM.
+        Codec::Vp8 => return Err(invalid("VP8 is not an MP4 output codec")),
+        Codec::Vorbis => {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                "Vorbis has no widely supported MP4 mapping; write it to a WebM container instead",
+            ));
+        }
+    };
     if config.encoder.timescale == 0 {
         return Err(invalid("an MP4 track timescale must be nonzero"));
     }
@@ -247,24 +268,27 @@ fn validate_track_config(config: &Mp4TrackConfig) -> Result<()> {
     if usize::try_from(declared).ok() != Some(config.encoder.decoder_config.len()) {
         return Err(invalid("codec configuration box size is inconsistent"));
     }
-    let expected_config = match config.encoder.codec {
-        Codec::UncompressedVideo => {
-            return Err(invalid(
-                "the uncompressed conformance codec is not an MP4 output codec",
-            ));
-        }
-        Codec::H264 => b"avcC",
-        Codec::Hevc => b"hvcC",
-        Codec::Av1 => b"av1C",
-        Codec::Vp9 => b"vpcC",
-        Codec::Aac => b"esds",
-    };
     if &config.encoder.decoder_config[4..8] != expected_config {
         return Err(invalid("codec configuration box type is incompatible"));
     }
     match (config.encoder.codec, config.format) {
         (Codec::H264 | Codec::Hevc | Codec::Av1 | Codec::Vp9, Mp4TrackFormat::Video(_))
         | (Codec::Aac, Mp4TrackFormat::Audio { .. }) => Ok(()),
+        (Codec::Opus, Mp4TrackFormat::Audio { channels }) => {
+            // "Encapsulation of Opus in ISO Base Media File Format" section
+            // 4.3: the sample entry's rate is always 48 kHz, and the media
+            // timescale should be too, so packet durations are exact.
+            if config.encoder.timescale != crate::OPUS_SAMPLE_RATE {
+                return Err(invalid("an Opus track's timescale must be 48000"));
+            }
+            let head = crate::OpusHead::from_dops(&config.encoder.decoder_config)?;
+            if u16::from(head.channels) != channels {
+                return Err(invalid(
+                    "the Opus dOps channel count disagrees with the track format",
+                ));
+            }
+            Ok(())
+        }
         _ => Err(invalid("codec and MP4 track kind are incompatible")),
     }
 }
@@ -568,7 +592,10 @@ fn video_sample_entry(track: &TrackState, dimensions: VideoDimensions) -> Result
             Codec::Hevc => *b"hvc1",
             Codec::Av1 => *b"av01",
             Codec::Vp9 => *b"vp09",
-            Codec::Aac => return Err(internal("AAC used for a video sample entry")),
+            Codec::Aac | Codec::Opus | Codec::Vorbis => {
+                return Err(internal("audio codec used for a video sample entry"));
+            }
+            Codec::Vp8 => return Err(internal("VP8 used for an MP4 video sample entry")),
         },
         body,
     )
@@ -592,7 +619,18 @@ fn audio_sample_entry(track: &TrackState, channels: u16) -> Result<Vec<u8>> {
             .to_be_bytes(),
     );
     body.extend_from_slice(&track.config.encoder.decoder_config);
-    make_box(*b"mp4a", body)
+    make_box(
+        match track.config.encoder.codec {
+            Codec::Aac => *b"mp4a",
+            Codec::Opus => *b"Opus",
+            _ => {
+                return Err(internal(
+                    "non-MP4 audio codec used for an audio sample entry",
+                ));
+            }
+        },
+        body,
+    )
 }
 
 fn stts_box(track: &TrackState) -> Result<Vec<u8>> {

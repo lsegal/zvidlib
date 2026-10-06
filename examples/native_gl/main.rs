@@ -50,13 +50,14 @@ use winit::window::{Window, WindowId};
 
 use zvidlib::io::MemorySource;
 use zvidlib::{
-    AacSampleReader, Codec, CodecProfile, ColorRange, CpuFrameSource, DefaultAudioOutput, Error,
-    ErrorKind, FrameDestination, FrameSource, GraphicsAdapter, GraphicsApi, GraphicsResource,
-    HardwarePreference, IndexedPresentationTimeline, Limits, Mp4Demuxer, Mp4DemuxerOptions,
-    NativeAacDecoder, NativeAudioOutput, Orientation, PixelFormat, PlaybackController,
-    PlaybackOptions, PreviewIndex, PreviewOptions, ResourceKind, ResourceOwnership, Result,
-    TrackKind, TransferPolicy, VideoDecoderConfig, VideoDecoderFactory, VideoDimensions,
-    execute_transfer, native_hevc_video_decoder_factory,
+    AudioDecoder, AudioSampleReader, Codec, CodecProfile, ColorRange, CpuFrameSource,
+    DefaultAudioOutput, Error, ErrorKind, FrameDestination, FrameSource, GraphicsAdapter,
+    GraphicsApi, GraphicsResource, HardwarePreference, IndexedPresentationTimeline, Limits,
+    Mp4Demuxer, Mp4DemuxerOptions, NativeAacDecoder, NativeAudioOutput, NativeOpusDecoder,
+    OPUS_SAMPLE_RATE, Orientation, PixelFormat, PlaybackController, PlaybackOptions, PreviewIndex,
+    PreviewOptions, ResourceKind, ResourceOwnership, Result, TrackKind, TransferPolicy,
+    VideoDecoderConfig, VideoDecoderFactory, VideoDimensions, execute_transfer,
+    native_hevc_video_decoder_factory, opus_preroll_packets,
 };
 
 mod gl_window;
@@ -96,8 +97,10 @@ fn run() -> Result<()> {
     let audio = demuxer
         .tracks
         .iter()
-        .find(|track| track.kind == TrackKind::Audio && track.codec == Codec::Aac)
-        .ok_or_else(|| invalid("the MP4 does not contain an AAC audio track"))?;
+        .find(|track| {
+            track.kind == TrackKind::Audio && matches!(track.codec, Codec::Aac | Codec::Opus)
+        })
+        .ok_or_else(|| invalid("the MP4 does not contain an AAC or Opus audio track"))?;
     let dimensions = video
         .dimensions
         .ok_or_else(|| invalid("the video track does not report dimensions"))?;
@@ -113,7 +116,6 @@ fn run() -> Result<()> {
     );
     let limits = Limits::default();
     let video_samples = block_on(video.to_encoded_video_samples(&source, &limits))?;
-    let audio_config = audio.aac_config()?;
     let audio_packets = block_on(audio.to_encoded_audio_samples(&source, &limits))?;
     let audio_timing = audio.audio_timing(demuxer.movie_timescale)?;
     let factory = native_hevc_video_decoder_factory();
@@ -150,38 +152,55 @@ fn run() -> Result<()> {
         PreviewOptions::for_frame_rate(frames_per_second),
     )?;
     let video_reader = frames.source();
-    let audio_decoder = NativeAacDecoder::new(&audio_config, Limits::default())?;
-    let audio_reader = AacSampleReader::new(
+    // The track's codec picks the decoder: an AAC track, as the bundled sample has, or Opus.
+    let (audio_decoder, sample_rate, channels, preroll): (Box<dyn AudioDecoder>, u32, u16, usize) =
+        match audio.codec {
+            Codec::Opus => {
+                let head = audio.opus_config()?;
+                (
+                    Box::new(NativeOpusDecoder::new(&head, Limits::default())?),
+                    OPUS_SAMPLE_RATE,
+                    u16::from(head.channels),
+                    opus_preroll_packets(&audio_packets),
+                )
+            }
+            _ => {
+                let config = audio.aac_config()?;
+                (
+                    Box::new(NativeAacDecoder::new(&config, Limits::default())?),
+                    config.sample_rate,
+                    config.channels,
+                    2,
+                )
+            }
+        };
+    let audio_reader = AudioSampleReader::new(
         audio_decoder,
         audio_packets,
-        audio_config.sample_rate,
-        audio_config.channels,
+        sample_rate,
+        channels,
         audio_timing,
-        2,
+        preroll,
         Limits::default(),
     )?;
-    let output = NativeAudioOutput(DefaultAudioOutput::open(
-        audio_config.sample_rate,
-        audio_config.channels,
-    )?);
+    let output = NativeAudioOutput(DefaultAudioOutput::open(sample_rate, channels)?);
     let frame_count = video.presentation_order.len().max(1) as u64;
     let frames_per_five_seconds = ((u128::from(frame_count) * u128::from(video.timescale) * 5)
         / u128::from(video.duration.max(1)))
     .max(1)
     .min(u128::from(frame_count)) as u64;
-    let timeline =
-        IndexedPresentationTimeline::from_mp4_track(video, audio_config.sample_rate, &limits)?;
+    let timeline = IndexedPresentationTimeline::from_mp4_track(video, sample_rate, &limits)?;
     let playback = PlaybackController::new_with_indexed_timeline(
         video_reader,
         audio_reader,
         output,
         timeline,
-        PlaybackOptions::for_sample_rate(audio_config.sample_rate),
+        PlaybackOptions::for_sample_rate(sample_rate),
     )?;
     println!("Selected {support:?} HEVC decoding.");
     println!(
-        "Playing {:?} video and AAC audio through zvidlib's synchronized pipeline.",
-        video.codec
+        "Playing {:?} video and {:?} audio through zvidlib's synchronized pipeline.",
+        video.codec, audio.codec
     );
 
     println!(
