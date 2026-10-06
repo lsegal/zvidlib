@@ -154,6 +154,32 @@ fn a_hidden_frame_updates_references_without_a_picture() {
 }
 
 #[test]
+fn hidden_alternate_reference_frames_decode_exactly_as_libvpx_does() {
+    // FFmpeg's two-pass libvpx encode with automatic alternate references:
+    // frames 1 and 17 are hidden inter frames that only update the alternate
+    // reference; see `tests/fixtures/codec/README.md`.
+    let ivf = include_bytes!("../../tests/fixtures/codec/vp8/vp8_altref_98x66.ivf");
+    let expected: Vec<&str> =
+        include_str!("../../tests/fixtures/codec/vp8/vp8_altref_98x66.ivf.md5")
+            .lines()
+            .collect();
+    let frames = ivf_frames(ivf);
+    let hidden: Vec<usize> = (0..frames.len())
+        .filter(|&index| frames[index][0] & 0x10 == 0)
+        .collect();
+    assert_eq!(hidden, vec![1, 17]);
+    assert!(hidden.iter().all(|&index| frames[index][0] & 1 == 1));
+    let mut decoder = Decoder::new(Limits::default());
+    let mut actual = Vec::new();
+    for (index, frame) in frames.into_iter().enumerate() {
+        let picture = decoder.decode(frame).unwrap();
+        assert_eq!(picture.is_none(), hidden.contains(&index), "frame {index}");
+        actual.extend(picture.as_ref().map(i420_md5));
+    }
+    assert_eq!(actual, expected);
+}
+
+#[test]
 fn an_inter_frame_before_any_key_frame_is_refused() {
     let ivf = include_bytes!("../../tests/fixtures/codec/vp8/vp80-00-comprehensive-001.ivf");
     let frames = ivf_frames(ivf);

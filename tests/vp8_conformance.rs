@@ -6,6 +6,11 @@
 //! the same through `ExactFrameReader` whatever order it is asked for in, so
 //! a seek decodes from the right key frame and through every hidden frame
 //! before it.
+//!
+//! On a host with a hardware VP8 decoder, the hardware tests below hold it to
+//! the software decoder's output for every frame of the same vectors, and to
+//! the same exact-frame seeks. Elsewhere they skip and only the hardware
+//! preference answers are checked.
 #![cfg(not(target_arch = "wasm32"))]
 
 use zvidlib::{
@@ -292,7 +297,7 @@ fn a_webm_vp8_track_skips_its_hidden_alternate_references() {
 }
 
 #[test]
-fn capability_reports_vp8_software_decode() {
+fn capability_honors_the_hardware_preference() {
     let factory = native_vp8_video_decoder_factory();
     let limits = Limits::default();
     let mut candidate = configuration(VideoDimensions::new(176, 144, &limits).unwrap());
@@ -303,12 +308,27 @@ fn capability_reports_vp8_software_decode() {
         }
     );
     candidate.hardware = HardwarePreference::Prefer;
-    assert!(factory.capability(&candidate).is_supported());
+    let preferred = factory.capability(&candidate);
     candidate.hardware = HardwarePreference::Require;
-    assert_eq!(
-        factory.capability(&candidate),
-        CodecSupport::HardwareUnavailable
-    );
+    let required = factory.capability(&candidate);
+    match preferred {
+        CodecSupport::Supported {
+            implementation: CodecImplementation::Hardware,
+        } => {
+            assert_eq!(required, preferred);
+            assert!(factory.create(&candidate, &limits).is_ok());
+        }
+        CodecSupport::Supported {
+            implementation: CodecImplementation::Software,
+        } => {
+            assert_eq!(required, CodecSupport::HardwareUnavailable);
+            let error = factory.create(&candidate, &limits).err().unwrap();
+            assert_eq!(error.kind(), ErrorKind::Unsupported);
+        }
+        other => panic!("unexpected Prefer capability {other:?}"),
+    }
+    candidate.hardware = HardwarePreference::Prefer;
+    assert!(factory.create(&candidate, &limits).is_ok());
     candidate.hardware = HardwarePreference::Avoid;
     candidate.output_format = PixelFormat::Yuv420p8;
     assert!(matches!(
@@ -362,4 +382,136 @@ fn a_frame_of_the_wrong_size_or_a_malformed_frame_is_an_error() {
         .submit(&sample(frames[0].data), &cancelled)
         .unwrap_err();
     assert_eq!(error.kind(), ErrorKind::Cancelled);
+}
+
+/// The hardware configuration for `dimensions`, or `None`, after saying why,
+/// when this host has no hardware VP8 decoder.
+fn hardware_configuration(dimensions: VideoDimensions) -> Option<VideoDecoderConfig> {
+    let factory = native_vp8_video_decoder_factory();
+    let configuration = VideoDecoderConfig {
+        hardware: HardwarePreference::Require,
+        ..configuration(dimensions)
+    };
+    if factory.capability(&configuration) == CodecSupport::HardwareUnavailable {
+        let reason = factory
+            .create(&configuration, &Limits::default())
+            .err()
+            .map_or_else(|| "unknown reason".into(), |error| error.to_string());
+        eprintln!("skipping: hardware VP8 unavailable: {reason}");
+        return None;
+    }
+    Some(configuration)
+}
+
+/// Every shown frame of `samples` through `ExactFrameReader` in sequential,
+/// reverse and alternating order, each compared with `expected`.
+fn assert_exact_seeks(
+    name: &str,
+    factory: &dyn VideoDecoderFactory,
+    configuration: &VideoDecoderConfig,
+    samples: &[EncodedVideoSample],
+    expected: &[FrameDigest],
+) {
+    let shown = expected.len() as u64;
+    let mut alternating = Vec::new();
+    let (mut low, mut high) = (0, shown);
+    while low < high {
+        high -= 1;
+        alternating.push(high);
+        if low < high {
+            alternating.push(low);
+            low += 1;
+        }
+    }
+    let cancellation = CancellationToken::new();
+    for order in [
+        (0..shown).collect::<Vec<_>>(),
+        (0..shown).rev().collect(),
+        alternating,
+    ] {
+        let mut reader = ExactFrameReader::new(
+            factory,
+            configuration.clone(),
+            samples.to_vec(),
+            Limits::default(),
+        )
+        .unwrap();
+        for index in order {
+            let frame = reader
+                .get(FrameIndex(index), &cancellation)
+                .unwrap_or_else(|error| panic!("{name} frame {index}: {error}"));
+            assert_eq!(
+                FrameDigest::from_frame(&frame).unwrap(),
+                expected[index as usize],
+                "{name} frame {index}"
+            );
+        }
+    }
+}
+
+#[test]
+fn hardware_vp8_matches_the_software_decoder_and_seeks_exactly() {
+    let factory = native_vp8_video_decoder_factory();
+    let mut vectors = vectors!(
+        "001", "002", "003", "004", "005", "006", "007", "008", "009", "010", "011", "012", "013",
+        "014", "015", "016", "017", "018",
+    )
+    .to_vec();
+    vectors.push((
+        "vp8_altref_98x66",
+        &include_bytes!("fixtures/codec/vp8/vp8_altref_98x66.ivf")[..],
+    ));
+    for (name, file) in vectors {
+        let (dimensions, frames) = ivf(file);
+        let Some(hardware) = hardware_configuration(dimensions) else {
+            return;
+        };
+        let software = configuration(dimensions);
+        let samples = samples(&frames);
+        let expected = sequential_digests(&factory, &software, &samples);
+        assert_eq!(
+            expected.len(),
+            frames.iter().filter(|frame| frame.shown).count(),
+            "{name}"
+        );
+
+        // One uninterrupted hardware decode: a hidden frame's sample returns
+        // no picture, and every shown frame matches the software decoder's.
+        let mut decoder = factory.create(&hardware, &Limits::default()).unwrap();
+        let cancellation = CancellationToken::new();
+        let mut actual = Vec::new();
+        for (sample, frame) in samples.iter().zip(&frames) {
+            let outputs = decoder
+                .submit(sample, &cancellation)
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert_eq!(outputs.len(), usize::from(frame.shown), "{name}");
+            for output in outputs {
+                assert_eq!(output.presentation_index, sample.presentation_index);
+                actual.push(FrameDigest::from_frame(&output.frame).unwrap());
+            }
+        }
+        assert!(decoder.drain(&cancellation).unwrap().is_empty(), "{name}");
+        assert_eq!(actual, expected, "{name}");
+
+        assert_exact_seeks(name, &factory, &hardware, &samples, &expected);
+    }
+}
+
+#[test]
+fn a_hardware_webm_vp8_track_matches_the_software_decoder() {
+    let source = zvidlib::io::MemorySource::new(
+        include_bytes!("fixtures/codec/vp8/vp8_testsrc2_98x66.webm").to_vec(),
+    );
+    let limits = Limits::default();
+    let demuxer = block_on(WebmDemuxer::open(&source, Default::default())).unwrap();
+    let track = &demuxer.tracks[0];
+    let dimensions = track.dimensions.unwrap();
+    let Some(hardware) = hardware_configuration(dimensions) else {
+        return;
+    };
+    let samples = block_on(track.to_encoded_video_samples(&source, &limits)).unwrap();
+    let factory = native_vp8_video_decoder_factory();
+    let expected = sequential_digests(&factory, &configuration(dimensions), &samples);
+    assert_eq!(sequential_digests(&factory, &hardware, &samples), expected);
+    assert_exact_seeks("VP8 in WebM", &factory, &hardware, &samples, &expected);
 }
