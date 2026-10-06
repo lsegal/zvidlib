@@ -17,6 +17,7 @@ mod audiotoolbox;
 #[cfg(windows)]
 mod windows_mf;
 
+use crate::codec::parse_audio_bit_rate;
 use crate::{
     AudioEncoder, AudioEncoderConfig, AudioEncoderFactory, Codec, CodecImplementation,
     CodecProfile, CodecSupport, Error, ErrorKind, Limits, Result,
@@ -54,7 +55,7 @@ impl AudioEncoderFactory for AacEncoderFactory {
         {
             return unsupported;
         }
-        let bit_rate = parse_bit_rate(&configuration.configuration).flatten();
+        let bit_rate = parse_audio_bit_rate(&configuration.configuration).flatten();
         #[cfg(target_os = "macos")]
         {
             audiotoolbox::capability(configuration, bit_rate)
@@ -94,7 +95,7 @@ impl AudioEncoderFactory for AacEncoderFactory {
             }
             CodecSupport::HardwareUnavailable => unreachable!("hardware is not checked here"),
         }
-        let bit_rate = parse_bit_rate(&configuration.configuration).flatten();
+        let bit_rate = parse_audio_bit_rate(&configuration.configuration).flatten();
         #[cfg(target_os = "macos")]
         {
             audiotoolbox::create(configuration, bit_rate, limits)
@@ -121,7 +122,7 @@ fn capability_without_backend(configuration: &AudioEncoderConfig) -> CodecSuppor
     if configuration.profile != CodecProfile::AacLowComplexity {
         return CodecSupport::UnsupportedProfile;
     }
-    if parse_bit_rate(&configuration.configuration).is_none() {
+    if parse_audio_bit_rate(&configuration.configuration).is_none() {
         return CodecSupport::InvalidConfiguration {
             reason: "native AAC encoder configuration is either empty or four big-endian bytes \
                      giving a nonzero target bit rate in bits a second"
@@ -148,21 +149,6 @@ fn capability_without_backend(configuration: &AudioEncoderConfig) -> CodecSuppor
     }
     CodecSupport::Supported {
         implementation: CodecImplementation::Hardware,
-    }
-}
-
-/// Reads the backend-private configuration: `Some(None)` for an empty one
-/// (the backend's default bit rate), `Some(Some(bits_per_second))` for four
-/// big-endian bytes naming a nonzero rate, and `None` for anything else. Zero
-/// is rejected rather than read as "no target", as the HEVC encoder does.
-fn parse_bit_rate(configuration: &[u8]) -> Option<Option<u32>> {
-    match configuration {
-        [] => Some(None),
-        [a, b, c, d] => match u32::from_be_bytes([*a, *b, *c, *d]) {
-            0 => None,
-            bits_per_second => Some(Some(bits_per_second)),
-        },
-        _ => None,
     }
 }
 
@@ -344,13 +330,13 @@ mod tests {
 
     #[test]
     fn configuration_is_empty_or_a_nonzero_big_endian_bit_rate() {
-        assert_eq!(parse_bit_rate(&[]), Some(None));
+        assert_eq!(parse_audio_bit_rate(&[]), Some(None));
         assert_eq!(
-            parse_bit_rate(&128_000_u32.to_be_bytes()),
+            parse_audio_bit_rate(&128_000_u32.to_be_bytes()),
             Some(Some(128_000))
         );
-        assert_eq!(parse_bit_rate(&0_u32.to_be_bytes()), None);
-        assert_eq!(parse_bit_rate(&[1, 2]), None);
+        assert_eq!(parse_audio_bit_rate(&0_u32.to_be_bytes()), None);
+        assert_eq!(parse_audio_bit_rate(&[1, 2]), None);
     }
 
     #[test]

@@ -257,6 +257,14 @@ fn validate_track_config(config: &Mp4TrackConfig) -> Result<()> {
         Codec::Hevc => b"hvcC",
         Codec::Av1 => b"av1C",
         Codec::Aac => b"esds",
+        Codec::Opus => b"dOps",
+        Codec::Vorbis => {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                "Vorbis has no widely supported MP4 mapping; write it to a Matroska or WebM \
+                 container instead",
+            ));
+        }
     };
     if &config.encoder.decoder_config[4..8] != expected_config {
         return Err(invalid("codec configuration box type is incompatible"));
@@ -264,6 +272,21 @@ fn validate_track_config(config: &Mp4TrackConfig) -> Result<()> {
     match (config.encoder.codec, config.format) {
         (Codec::H264 | Codec::Hevc | Codec::Av1, Mp4TrackFormat::Video(_))
         | (Codec::Aac, Mp4TrackFormat::Audio { .. }) => Ok(()),
+        (Codec::Opus, Mp4TrackFormat::Audio { channels }) => {
+            // "Encapsulation of Opus in ISO Base Media File Format" section
+            // 4.3: the sample entry's rate is always 48 kHz, and the media
+            // timescale should be too, so packet durations are exact.
+            if config.encoder.timescale != crate::OPUS_SAMPLE_RATE {
+                return Err(invalid("an Opus track's timescale must be 48000"));
+            }
+            let head = crate::OpusHead::from_dops(&config.encoder.decoder_config)?;
+            if u16::from(head.channels) != channels {
+                return Err(invalid(
+                    "the Opus dOps channel count disagrees with the track format",
+                ));
+            }
+            Ok(())
+        }
         _ => Err(invalid("codec and MP4 track kind are incompatible")),
     }
 }
@@ -566,7 +589,9 @@ fn video_sample_entry(track: &TrackState, dimensions: VideoDimensions) -> Result
             Codec::H264 => *b"avc1",
             Codec::Hevc => *b"hvc1",
             Codec::Av1 => *b"av01",
-            Codec::Aac => return Err(internal("AAC used for a video sample entry")),
+            Codec::Aac | Codec::Opus | Codec::Vorbis => {
+                return Err(internal("audio codec used for a video sample entry"));
+            }
         },
         body,
     )
@@ -590,7 +615,18 @@ fn audio_sample_entry(track: &TrackState, channels: u16) -> Result<Vec<u8>> {
             .to_be_bytes(),
     );
     body.extend_from_slice(&track.config.encoder.decoder_config);
-    make_box(*b"mp4a", body)
+    make_box(
+        match track.config.encoder.codec {
+            Codec::Aac => *b"mp4a",
+            Codec::Opus => *b"Opus",
+            _ => {
+                return Err(internal(
+                    "non-MP4 audio codec used for an audio sample entry",
+                ));
+            }
+        },
+        body,
+    )
 }
 
 fn stts_box(track: &TrackState) -> Result<Vec<u8>> {

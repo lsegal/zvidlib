@@ -179,6 +179,10 @@ pub enum CodecProfile {
     Av1High,
     Av1Professional,
     AacLowComplexity,
+    /// Opus has a single profile.
+    Opus,
+    /// Vorbis I has a single profile.
+    Vorbis,
 }
 
 /// Whether a caller permits or requires a hardware codec implementation.
@@ -372,6 +376,22 @@ pub trait AudioEncoderFactory {
         configuration: &AudioEncoderConfig,
         limits: &Limits,
     ) -> Result<Box<dyn AudioEncoder>>;
+}
+
+/// Reads an audio encoder's backend-private configuration: `Some(None)` for
+/// an empty one (the backend's default bit rate), `Some(Some(bits_per_second))`
+/// for four big-endian bytes naming a nonzero rate, and `None` for anything
+/// else. Zero is rejected rather than read as "no target", as the HEVC encoder
+/// does. Every native audio encoder takes this form.
+pub(crate) fn parse_audio_bit_rate(configuration: &[u8]) -> Option<Option<u32>> {
+    match configuration {
+        [] => Some(None),
+        [a, b, c, d] => match u32::from_be_bytes([*a, *b, *c, *d]) {
+            0 => None,
+            bits_per_second => Some(Some(bits_per_second)),
+        },
+        _ => None,
+    }
 }
 
 /// Observable counters for validating cache and decoder reuse behavior.

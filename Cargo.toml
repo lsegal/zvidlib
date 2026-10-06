@@ -133,6 +133,12 @@ web = [
 ]
 
 [dependencies]
+# Pure-Rust Opus (a port of libopus 1.6) and Vorbis decoding. Both build for
+# `wasm32` as well as native targets, so the browser build's software audio
+# fallback runs the same decoders native callers do.
+opus-pure = "0.2.2"
+symphonia-codec-vorbis = "0.5.5"
+symphonia-core = "0.5.5"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 js-sys = { version = "0.3.104", optional = true }
@@ -191,7 +197,6 @@ winit = "0.30.13"
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 cpal = "0.15.3"
 symphonia-codec-aac = "0.5.5"
-symphonia-core = "0.5.5"
 
 [target.'cfg(any(windows, target_os = "linux"))'.dependencies]
 libloading = "0.8.9"

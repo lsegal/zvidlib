@@ -5,6 +5,7 @@ use crate::codec::{EncodedVideoSample, SampleDependency, TrackKind};
 use crate::io::ByteSource;
 use crate::media::{Codec, VideoDimensions};
 use crate::mp4::{CoverArt, CoverArtFormat};
+use crate::opus::{OPUS_SAMPLE_RATE, OpusHead};
 use crate::timeline::FrameIndex;
 use crate::{Error, ErrorKind, Limits, Result};
 use std::collections::{BTreeMap, BTreeSet};
@@ -159,16 +160,48 @@ impl Mp4Track {
         parse_aac_config(&self.decoder_config, sample_rate, channels)
     }
 
-    /// Reads every indexed AAC access unit from its validated byte range.
+    /// Parses the Opus identification header carried by this track's `dOps`
+    /// box.
+    pub fn opus_config(&self) -> Result<OpusHead> {
+        if self.kind != TrackKind::Audio || self.codec != Codec::Opus {
+            return Err(unsupported(
+                "Opus configuration requires an Opus audio track",
+            ));
+        }
+        let head = OpusHead::from_dops(&self.decoder_config)?;
+        if self.channels != Some(u16::from(head.channels)) {
+            return Err(malformed(
+                "Opus dOps channel count disagrees with the sample entry",
+            ));
+        }
+        Ok(head)
+    }
+
+    /// The sample rate this audio track decodes at: the AAC
+    /// `AudioSpecificConfig`'s, or 48 kHz for Opus, which always decodes at
+    /// that rate whatever its input was.
+    pub fn audio_sample_rate(&self) -> Result<u32> {
+        match self.codec {
+            Codec::Aac => Ok(self.aac_config()?.sample_rate),
+            Codec::Opus => {
+                self.opus_config()?;
+                Ok(OPUS_SAMPLE_RATE)
+            }
+            _ => Err(unsupported("audio packets require an AAC or Opus track")),
+        }
+    }
+
+    /// Reads every indexed audio packet - AAC access units or Opus packets -
+    /// from its validated byte range.
     ///
     /// Packet intervals use the decoded PCM sample clock and remain contiguous
-    /// even when the MP4 track timescale differs from the AAC sample rate.
+    /// even when the MP4 track timescale differs from the decoded sample rate.
     pub async fn to_encoded_audio_samples<S: ByteSource + ?Sized>(
         &self,
         source: &S,
         limits: &Limits,
     ) -> Result<Vec<EncodedAudioSample>> {
-        let config = self.aac_config()?;
+        let sample_rate = self.audio_sample_rate()?;
         let mut total_bytes = 0_u64;
         let mut decoded_start = 0_u64;
         let mut track_ticks = 0_u64;
@@ -176,22 +209,31 @@ impl Mp4Track {
         for (decode_index, sample) in self.samples.iter().enumerate() {
             total_bytes = total_bytes
                 .checked_add(u64::from(sample.size))
-                .ok_or_else(|| limit("encoded AAC allocation overflow"))?;
+                .ok_or_else(|| limit("encoded audio allocation overflow"))?;
             if total_bytes > limits.max_allocation_bytes {
                 return Err(limit(
-                    "encoded AAC samples exceed the configured allocation limit",
+                    "encoded audio samples exceed the configured allocation limit",
                 ));
-            }
-            track_ticks = track_ticks
-                .checked_add(u64::from(sample.duration))
-                .ok_or_else(|| limit("AAC track timing overflow"))?;
-            let decoded_end = scale_time(track_ticks, self.timescale, config.sample_rate)?;
-            if decoded_end <= decoded_start {
-                return Err(malformed("AAC packet has an empty decoded interval"));
             }
             let mut data = vec![0_u8; sample.size as usize];
             self.read_sample_into(source, decode_index, &mut data)
                 .await?;
+            let decoded_end = if self.codec == Codec::Opus {
+                // An Opus packet's own table of contents says how long it
+                // decodes. Muxers shorten the last sample's duration to trim
+                // the stream's end - FFmpeg does - so the sample table cannot.
+                decoded_start
+                    .checked_add(u64::from(crate::opus::opus_packet_samples(&data)?))
+                    .ok_or_else(|| limit("audio track timing overflow"))?
+            } else {
+                track_ticks = track_ticks
+                    .checked_add(u64::from(sample.duration))
+                    .ok_or_else(|| limit("audio track timing overflow"))?;
+                scale_time(track_ticks, self.timescale, sample_rate)?
+            };
+            if decoded_end <= decoded_start {
+                return Err(malformed("audio packet has an empty decoded interval"));
+            }
             packets.push(EncodedAudioSample {
                 decoded_range: crate::SampleRange::new(decoded_start, decoded_end)?,
                 data,
@@ -199,18 +241,39 @@ impl Mp4Track {
             decoded_start = decoded_end;
         }
         if packets.is_empty() {
-            return Err(malformed("AAC track contains no samples"));
+            return Err(malformed("audio track contains no samples"));
         }
         Ok(packets)
     }
 
     /// Converts MP4 edit-list timing to the presentation sample clock used by
-    /// [`crate::AacSampleReader`], including decoder priming and end padding.
+    /// [`crate::AudioSampleReader`], including decoder priming and end padding.
+    ///
+    /// An Opus track without an edit list still has its `dOps` pre-skip
+    /// trimmed as priming, and ends where its sample table does: the packets
+    /// themselves can decode past that end, which is how a muxer that writes
+    /// no edit list trims the stream.
     pub fn audio_timing(&self, movie_timescale: u32) -> Result<AudioTrackTiming> {
-        let config = self.aac_config()?;
-        let decoded_length = scale_time(self.duration, self.timescale, config.sample_rate)?;
+        let sample_rate = self.audio_sample_rate()?;
+        let decoded_length = scale_time(self.duration, self.timescale, sample_rate)?;
         if self.edits.is_empty() {
-            return Ok(AudioTrackTiming::default());
+            if self.codec != Codec::Opus {
+                return Ok(AudioTrackTiming::default());
+            }
+            let priming = self.opus_config()?.pre_skip;
+            let length = decoded_length
+                .checked_sub(u64::from(priming))
+                .filter(|&length| length > 0)
+                .ok_or_else(|| malformed("Opus pre-skip covers the whole track"))?;
+            return Ok(AudioTrackTiming {
+                priming: u32::from(priming),
+                padding: 0,
+                track_offset: 0,
+                edits: vec![AudioEdit {
+                    presentation: crate::SampleRange::new(0, length)?,
+                    media_start: Some(u64::from(priming)),
+                }],
+            });
         }
         let mut presentation_start = 0_u64;
         let mut edits = Vec::with_capacity(self.edits.len());
@@ -218,25 +281,27 @@ impl Mp4Track {
         let mut last_media_end = 0_u64;
         for edit in &self.edits {
             if edit.media_rate_integer != 1 || edit.media_rate_fraction != 0 {
-                return Err(unsupported("AAC edit rates other than 1.0 are unsupported"));
+                return Err(unsupported(
+                    "audio edit rates other than 1.0 are unsupported",
+                ));
             }
-            let length = scale_time(edit.segment_duration, movie_timescale, config.sample_rate)?;
+            let length = scale_time(edit.segment_duration, movie_timescale, sample_rate)?;
             if length == 0 {
-                return Err(malformed("AAC edit has an empty presentation interval"));
+                return Err(malformed("audio edit has an empty presentation interval"));
             }
             let presentation_end = presentation_start
                 .checked_add(length)
-                .ok_or_else(|| limit("AAC edit presentation overflow"))?;
+                .ok_or_else(|| limit("audio edit presentation overflow"))?;
             let media_start = if edit.media_time == -1 {
                 None
             } else {
                 if edit.media_time < 0 {
-                    return Err(malformed("AAC edit has an invalid negative media time"));
+                    return Err(malformed("audio edit has an invalid negative media time"));
                 }
-                let start = scale_time(edit.media_time as u64, self.timescale, config.sample_rate)?;
+                let start = scale_time(edit.media_time as u64, self.timescale, sample_rate)?;
                 let end = start
                     .checked_add(length)
-                    .ok_or_else(|| limit("AAC edit media range overflow"))?;
+                    .ok_or_else(|| limit("audio edit media range overflow"))?;
                 first_media = Some(first_media.map_or(start, |value: u64| value.min(start)));
                 last_media_end = last_media_end.max(end);
                 Some(start)
@@ -248,9 +313,9 @@ impl Mp4Track {
             presentation_start = presentation_end;
         }
         let priming = u32::try_from(first_media.unwrap_or(0))
-            .map_err(|_| limit("AAC priming exceeds the supported range"))?;
+            .map_err(|_| limit("audio priming exceeds the supported range"))?;
         let padding = u32::try_from(decoded_length.saturating_sub(last_media_end))
-            .map_err(|_| limit("AAC padding exceeds the supported range"))?;
+            .map_err(|_| limit("audio padding exceeds the supported range"))?;
         Ok(AudioTrackTiming {
             priming,
             padding,
@@ -860,6 +925,7 @@ fn parse_stsd(
         b"hvc1" | b"hev1" => (Codec::Hevc, 78, TrackKind::Video),
         b"av01" => (Codec::Av1, 78, TrackKind::Video),
         b"mp4a" => (Codec::Aac, 28, TrackKind::Audio),
+        b"Opus" => (Codec::Opus, 28, TrackKind::Audio),
         _ => return Err(unsupported("unsupported MP4 sample entry")),
     };
     if let Some(handler) = track.kind
@@ -875,7 +941,7 @@ fn parse_stsd(
         track.channels = Some(be_u16(entry.payload, 16)?);
         let fixed_rate = be_u32(entry.payload, 24)?;
         if fixed_rate & 0xffff != 0 {
-            return Err(unsupported("fractional AAC sample rates are unsupported"));
+            return Err(unsupported("fractional audio sample rates are unsupported"));
         }
         track.sample_rate = Some(fixed_rate >> 16);
     }
@@ -884,11 +950,13 @@ fn parse_stsd(
         Codec::Hevc => b"hvcC",
         Codec::Av1 => b"av1C",
         Codec::Aac => b"esds",
+        Codec::Opus => b"dOps",
         Codec::UncompressedVideo => {
             return Err(unsupported(
                 "uncompressed MP4 sample entries are not supported",
             ));
         }
+        Codec::Vorbis => return Err(unsupported("Vorbis has no MP4 sample entry")),
     };
     let nested = children(&entry.payload[prefix..], 7, budget, options)?;
     let config = nested

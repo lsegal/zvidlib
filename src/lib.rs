@@ -28,11 +28,13 @@ pub mod io;
 pub mod media;
 pub mod mp4;
 pub mod mp4_demux;
+pub mod opus;
 pub mod output;
 pub mod playback;
 pub mod simd;
 pub mod timeline;
 pub mod transfer;
+pub mod vorbis;
 
 mod av1_dec;
 mod av1_decoder;
@@ -121,7 +123,10 @@ pub mod web_previews;
 pub use wasm_api::*;
 
 pub use api::{Capability, Error, ErrorKind, Limits, Result, Support, TransferMode};
-pub use audio::{AacDecoder, AacSampleReader, AudioEdit, AudioTrackTiming, EncodedAudioSample};
+pub use audio::{
+    AacDecoder, AacSampleReader, AudioDecoder, AudioEdit, AudioSampleReader, AudioTrackTiming,
+    EncodedAudioSample,
+};
 pub use av1::{
     Av1CodecConfigurationRecord, Av1ColorConfig, Av1FrameHeader, Av1FrameType, Av1Metadata, Av1Obu,
     Av1ObuHeader, Av1ObuType, Av1OperatingPoint, Av1Parser, Av1SequenceHeader, Av1SyntaxSupport,
@@ -178,6 +183,10 @@ pub use mp4::{CoverArt, CoverArtFormat};
 pub use mp4_demux::{
     AacTrackConfig, EditMapping, Mp4Demuxer, Mp4DemuxerOptions, Mp4Sample, Mp4Track, probe_mp4,
 };
+pub use opus::{
+    NativeOpusDecoder, OPUS_PREROLL_SAMPLES, OPUS_SAMPLE_RATE, OpusHead,
+    native_opus_audio_encoder_factory, opus_packet_samples, opus_preroll_packets,
+};
 pub use output::{MediaOutput, OutputOptions};
 pub use playback::{
     AudioOutputBackend, AudioOutputKind, IndexedPresentationTimeline, NativeAudioOutput,
@@ -192,6 +201,7 @@ pub use transfer::{
     Orientation, ResourceKind, ResourceOwnership, ScaleFilter, TransferCapability, TransferPolicy,
     TransferStage, execute_transfer, inspect_transfer,
 };
+pub use vorbis::{NativeVorbisDecoder, VORBIS_PREROLL_PACKETS, VorbisConfig};
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use aac_encoder::native_aac_audio_encoder_factory;
