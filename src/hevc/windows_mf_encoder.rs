@@ -1,6 +1,6 @@
-//! Windows Media Foundation HEVC Main encode: the GPU vendor's hardware MFT
-//! when one is registered (NVENC, Quick Sync, AMF), else Microsoft's software
-//! HEVC MFT from the HEVC Video Extensions.
+//! Windows Media Foundation HEVC Main and VP9 profile 0 encode: the GPU
+//! vendor's hardware MFT when one is registered (NVENC, Quick Sync, AMF), else,
+//! for HEVC, Microsoft's software HEVC MFT from the HEVC Video Extensions.
 //!
 //! Each encoder runs on its own worker thread, as the Media Foundation decoder
 //! in [`super::windows_mf`] does, so the MFT lives in a multithreaded COM
@@ -10,11 +10,15 @@
 //! bitrate, a caller-chosen keyframe interval, no B-frames (so output order is
 //! input order and every sample's DTS equals its PTS) and low latency. Hardware
 //! MFTs are asynchronous and are driven through their event queue; software
-//! ones are synchronous. The output is Annex B, so each access unit is reframed
-//! with four-byte lengths and its parameter sets are moved into the `hvcC`,
-//! which has to exist before the first frame is submitted and is therefore
-//! taken from the MFT's sequence header or, for an MFT that does not publish
-//! one, from a one-frame probe encode.
+//! ones are synchronous. HEVC output is Annex B, so each access unit is
+//! reframed with four-byte lengths and its parameter sets are moved into the
+//! `hvcC`, which has to exist before the first frame is submitted and is
+//! therefore taken from the MFT's sequence header or, for an MFT that does not
+//! publish one, from a one-frame probe encode. VP9 output is already one chunk
+//! a sample, and its `vpcC` always comes from a probe encode's key frame, since
+//! only the bitstream says which colour space the MFT signals. VP9 is rate
+//! controlled by quality, from the `base_q_idx` the native VP9 encoder takes,
+//! rather than to a bitrate.
 //!
 //! RGBA and BGRA input is handed to a hardware MFT as ARGB32 when it accepts
 //! that, so the colour conversion runs on the GPU; everything else is
@@ -33,7 +37,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Media::MediaFoundation::{
-    CODECAPI_AVEncCommonMaxBitRate, CODECAPI_AVEncCommonMeanBitRate,
+    CODECAPI_AVEncCommonMaxBitRate, CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonQuality,
     CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVEncMPVDefaultBPictureCount,
     CODECAPI_AVEncMPVGOPSize, CODECAPI_AVLowLatencyMode, ICodecAPI, IMFActivate, IMFMediaEvent,
     IMFMediaEventGenerator, IMFMediaType, IMFSample, IMFShutdown, IMFTransform, MEError,
@@ -52,8 +56,9 @@ use windows::Win32::Media::MediaFoundation::{
     MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
     MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES,
     MFT_REGISTER_TYPE_INFO, MFTEnumEx, MFVideoFormat_ARGB32, MFVideoFormat_HEVC,
-    MFVideoFormat_NV12, MFVideoInterlace_Progressive, MFVideoTransferMatrix_BT601,
-    eAVEncCommonRateControlMode_PeakConstrainedVBR, eAVEncH265VProfile_Main_420_8,
+    MFVideoFormat_NV12, MFVideoFormat_VP90, MFVideoInterlace_Progressive,
+    MFVideoTransferMatrix_BT601, eAVEncCommonRateControlMode_PeakConstrainedVBR,
+    eAVEncCommonRateControlMode_Quality, eAVEncH265VProfile_Main_420_8, eAVEncVP9VProfile_420_8,
 };
 use windows::Win32::System::Com::{
     COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize,
@@ -64,7 +69,7 @@ use windows::core::{GUID, HRESULT, Interface, PWSTR};
 use super::annexb::{self, ParameterSets};
 use super::engine::encoder::colorconv;
 use crate::{
-    CodecImplementation, ColorRange, EncodedSample, EncoderConfig, EncoderFuture, Error, ErrorKind,
+    Codec, CodecImplementation, ColorRange, EncodedSample, EncoderConfig, EncoderFuture, Error, ErrorKind,
     FrameIndex, FrameSource, Limits, Orientation, PixelFormat, Result, SampleDependency,
     VideoEncoder, VideoEncoderFormat,
 };
@@ -84,7 +89,7 @@ const HNS_PER_SECOND: i128 = 10_000_000;
 
 /// Which class of registered MFT to use.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum MftClass {
+pub(crate) enum MftClass {
     /// The GPU vendor's asynchronous hardware encoder.
     Hardware,
     /// Microsoft's synchronous software encoder.
@@ -107,39 +112,94 @@ impl MftClass {
     }
 }
 
+/// The compressed format an MFT is asked to produce.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OutputFormat {
+    /// HEVC Main, rate controlled to [`Settings::bits_per_second`].
+    Hevc,
+    /// VP9 profile 0, rate controlled to [`Settings::quality`].
+    Vp9,
+}
+
+impl OutputFormat {
+    fn subtype(self) -> GUID {
+        match self {
+            Self::Hevc => MFVideoFormat_HEVC,
+            Self::Vp9 => MFVideoFormat_VP90,
+        }
+    }
+
+    /// `MF_MT_MPEG2_PROFILE`.
+    fn profile(self) -> u32 {
+        match self {
+            Self::Hevc => eAVEncH265VProfile_Main_420_8.0 as u32,
+            Self::Vp9 => eAVEncVP9VProfile_420_8.0 as u32,
+        }
+    }
+
+    fn codec(self) -> Codec {
+        match self {
+            Self::Hevc => Codec::Hevc,
+            Self::Vp9 => Codec::Vp9,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Hevc => "HEVC",
+            Self::Vp9 => "VP9",
+        }
+    }
+}
+
 /// The encode an MFT is asked for, resolved from a
 /// [`crate::VideoEncoderConfig`] by the factory.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct Settings {
+pub(crate) struct Settings {
+    pub format: OutputFormat,
     pub width: u32,
     pub height: u32,
     pub input_format: PixelFormat,
     pub timescale: u32,
     pub frame_duration: u32,
+    /// The target bitrate, or for a stream rate controlled by quality the
+    /// nominal bitrate its output type declares.
     pub bits_per_second: u32,
+    /// `CODECAPI_AVEncCommonQuality` in `0..=100`, for a stream rate
+    /// controlled by quality rather than to [`Self::bits_per_second`].
+    pub quality: Option<u32>,
     /// Frames from one keyframe to the next. Nonzero.
     pub keyframe_interval: u32,
 }
 
 impl Settings {
     /// Why this backend cannot take `self`, if it cannot.
-    pub(super) fn unsupported_reason(&self) -> Option<&'static str> {
+    pub(crate) fn unsupported_reason(&self) -> Option<String> {
+        let name = self.format.name();
         if !matches!(
             self.input_format,
             PixelFormat::Rgba8 | PixelFormat::Bgra8 | PixelFormat::Yuv420p8
         ) {
-            return Some("Media Foundation HEVC encoding accepts Rgba8, Bgra8 or Yuv420p8 input");
+            return Some(format!(
+                "Media Foundation {name} encoding accepts Rgba8, Bgra8 or Yuv420p8 input"
+            ));
         }
         if self.width % 2 != 0 || self.height % 2 != 0 {
-            return Some("Media Foundation HEVC encoding requires even dimensions");
+            return Some(format!(
+                "Media Foundation {name} encoding requires even dimensions"
+            ));
         }
         if self.timescale == 0 || self.frame_duration == 0 {
-            return Some("HEVC encoding requires a nonzero timescale and frame duration");
+            return Some(format!(
+                "{name} encoding requires a nonzero timescale and frame duration"
+            ));
         }
         // A frame shorter than two 100 ns ticks cannot be told apart from its
         // neighbour once Media Foundation rounds its timestamp.
         if i128::from(self.frame_duration) * HNS_PER_SECOND < 2 * i128::from(self.timescale) {
-            return Some("Media Foundation HEVC encoding requires frames of at least 200 ns");
+            return Some(format!(
+                "Media Foundation {name} encoding requires frames of at least 200 ns"
+            ));
         }
         None
     }
@@ -210,22 +270,22 @@ impl Feed {
 }
 
 /// Whether an MFT of `class` can take `settings`, by configuring one.
-pub(super) fn probe(settings: Settings, class: MftClass) -> Result<()> {
-    run_on_mf_thread("zvidlib-mf-hevc-probe", move || {
+pub(crate) fn probe(settings: Settings, class: MftClass) -> Result<()> {
+    run_on_mf_thread("zvidlib-mf-encode-probe", move || {
         let mut reasons = Vec::new();
-        for activate in candidates(class)? {
+        for activate in candidates(class, settings.format)? {
             let name = friendly_name(&activate);
             match Mft::open(activate, class, &settings) {
                 Ok(_) => return Ok(()),
                 Err(error) => reasons.push(format!("{name}: {}", error.message())),
             }
         }
-        Err(unavailable(class, reasons))
+        Err(unavailable(class, settings.format, reasons))
     })
 }
 
 /// Creates an encoder on the first MFT of `class` that accepts `settings`.
-pub(super) fn create(
+pub(crate) fn create(
     settings: Settings,
     class: MftClass,
     limits: &Limits,
@@ -237,10 +297,13 @@ pub(super) fn create(
     {
         return Err(Error::new(
             ErrorKind::ResourceLimit,
-            "HEVC frame exceeds configured allocation limit",
+            format!(
+                "{} frame exceeds configured allocation limit",
+                settings.format.name()
+            ),
         ));
     }
-    MfHevcEncoder::spawn(settings, class, *limits)
+    MfVideoEncoder::spawn(settings, class, *limits)
         .map(|encoder| Box::new(encoder) as Box<dyn VideoEncoder>)
 }
 
@@ -262,7 +325,7 @@ fn run_on_mf_thread<T: Send + 'static>(
         .map_err(|_| codec("Media Foundation thread stopped unexpectedly"))?
 }
 
-fn unavailable(class: MftClass, reasons: Vec<String>) -> Error {
+fn unavailable(class: MftClass, format: OutputFormat, reasons: Vec<String>) -> Error {
     let detail = if reasons.is_empty() {
         "none is installed".to_owned()
     } else {
@@ -271,17 +334,18 @@ fn unavailable(class: MftClass, reasons: Vec<String>) -> Error {
     Error::new(
         ErrorKind::Unsupported,
         format!(
-            "no {} Media Foundation HEVC encoder accepts this configuration ({detail})",
-            class.label()
+            "no {} Media Foundation {} encoder accepts this configuration ({detail})",
+            class.label(),
+            format.name()
         ),
     )
 }
 
-/// Registered HEVC encoders of `class`, best first.
-fn candidates(class: MftClass) -> Result<Vec<IMFActivate>> {
+/// Registered encoders of `class` that produce `format`, best first.
+fn candidates(class: MftClass, format: OutputFormat) -> Result<Vec<IMFActivate>> {
     let output = MFT_REGISTER_TYPE_INFO {
         guidMajorType: MFMediaType_Video,
-        guidSubtype: MFVideoFormat_HEVC,
+        guidSubtype: format.subtype(),
     };
     let mut list: *mut Option<IMFActivate> = std::ptr::null_mut();
     let mut count = 0u32;
@@ -296,7 +360,7 @@ fn candidates(class: MftClass) -> Result<Vec<IMFActivate>> {
             &mut list,
             &mut count,
         )
-        .map_err(|error| windows_error("could not enumerate HEVC encoders", error))?;
+        .map_err(|error| windows_error("could not enumerate encoders", error))?;
         if list.is_null() {
             return Ok(Vec::new());
         }
@@ -317,7 +381,7 @@ fn friendly_name(activate: &IMFActivate) -> String {
             .GetAllocatedString(&MFT_FRIENDLY_NAME_Attribute, &mut value, &mut len)
             .is_err()
         {
-            return "unnamed HEVC encoder".to_owned();
+            return "unnamed encoder".to_owned();
         }
         let name = value.to_string().unwrap_or_default();
         CoTaskMemFree(Some(value.0 as *const c_void));
@@ -401,18 +465,18 @@ impl Mft {
             // several encoders only read them when the output type is set.
             self.set_codec_values(settings);
 
-            let output = video_type(settings, MFVideoFormat_HEVC)?;
+            let output = video_type(settings, settings.format.subtype())?;
             set(
                 output.SetUINT32(&MF_MT_AVG_BITRATE, settings.bits_per_second),
                 "bitrate",
             )?;
             set(
-                output.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH265VProfile_Main_420_8.0 as u32),
+                output.SetUINT32(&MF_MT_MPEG2_PROFILE, settings.format.profile()),
                 "profile",
             )?;
             self.transform
                 .SetOutputType(0, &output, 0)
-                .map_err(|error| windows_error("encoder rejected the HEVC Main output", error))?;
+                .map_err(|error| windows_error("encoder rejected the output format", error))?;
 
             self.feed = self.set_input_type(settings)?;
             // Some encoders settle their final values only once both types
@@ -492,29 +556,41 @@ impl Mft {
         let Ok(api) = self.transform.cast::<ICodecAPI>() else {
             return;
         };
-        let values = [
-            (CODECAPI_AVLowLatencyMode, VARIANT::from(true)),
-            (
-                CODECAPI_AVEncCommonRateControlMode,
-                VARIANT::from(eAVEncCommonRateControlMode_PeakConstrainedVBR.0 as u32),
-            ),
-            (
-                CODECAPI_AVEncCommonMeanBitRate,
-                VARIANT::from(settings.bits_per_second),
-            ),
-            (
-                CODECAPI_AVEncCommonMaxBitRate,
-                VARIANT::from(settings.bits_per_second.saturating_mul(2)),
-            ),
-            (
-                CODECAPI_AVEncMPVGOPSize,
-                VARIANT::from(settings.keyframe_interval),
-            ),
-            (CODECAPI_AVEncMPVDefaultBPictureCount, VARIANT::from(0u32)),
-        ];
-        for (property, value) in &values {
+        let rate_control = match settings.quality {
+            Some(quality) => vec![
+                (
+                    CODECAPI_AVEncCommonRateControlMode,
+                    VARIANT::from(eAVEncCommonRateControlMode_Quality.0 as u32),
+                ),
+                (CODECAPI_AVEncCommonQuality, VARIANT::from(quality)),
+            ],
+            None => vec![
+                (
+                    CODECAPI_AVEncCommonRateControlMode,
+                    VARIANT::from(eAVEncCommonRateControlMode_PeakConstrainedVBR.0 as u32),
+                ),
+                (
+                    CODECAPI_AVEncCommonMeanBitRate,
+                    VARIANT::from(settings.bits_per_second),
+                ),
+                (
+                    CODECAPI_AVEncCommonMaxBitRate,
+                    VARIANT::from(settings.bits_per_second.saturating_mul(2)),
+                ),
+            ],
+        };
+        let values = std::iter::once((CODECAPI_AVLowLatencyMode, VARIANT::from(true)))
+            .chain(rate_control)
+            .chain([
+                (
+                    CODECAPI_AVEncMPVGOPSize,
+                    VARIANT::from(settings.keyframe_interval),
+                ),
+                (CODECAPI_AVEncMPVDefaultBPictureCount, VARIANT::from(0u32)),
+            ]);
+        for (property, value) in values {
             // SAFETY: both pointers are valid for the call.
-            let _ = unsafe { api.SetValue(property, value) };
+            let _ = unsafe { api.SetValue(&property, &value) };
         }
     }
 
@@ -820,13 +896,32 @@ fn set(result: windows::core::Result<()>, what: &str) -> Result<()> {
     result.map_err(|error| windows_error(&format!("could not set the {what}"), error))
 }
 
+/// What the track's decoder configuration declares, which every sample is
+/// held to.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum Declared {
+    /// The parameter sets the `hvcC` carries.
+    Hevc(ParameterSets),
+    /// The `vpcC`, and the level it names, as the probe's key frame signalled
+    /// them.
+    Vp9 { vpcc: Vec<u8>, level: u8 },
+}
+
+impl Declared {
+    fn decoder_config(&self) -> Option<Vec<u8>> {
+        match self {
+            Self::Hevc(sets) => sets.hvcc(),
+            Self::Vp9 { vpcc, .. } => Some(vpcc.clone()),
+        }
+    }
+}
+
 /// The encoder as the worker thread holds it.
 struct Core {
     mft: Mft,
     settings: Settings,
     limits: Limits,
-    /// The parameter sets the `hvcC` declares.
-    declared: ParameterSets,
+    declared: Declared,
     /// Frames submitted, in order, not yet matched to an output.
     pending: std::collections::VecDeque<u64>,
     /// The last frame an output was emitted for.
@@ -842,7 +937,7 @@ impl Core {
     fn open(settings: Settings, class: MftClass, limits: Limits) -> Result<Self> {
         let runtime = MfRuntime::start()?;
         let mut reasons = Vec::new();
-        for activate in candidates(class)? {
+        for activate in candidates(class, settings.format)? {
             let name = friendly_name(&activate);
             match Self::open_with(activate, class, settings) {
                 Ok((mft, declared)) => {
@@ -860,31 +955,45 @@ impl Core {
                 Err(error) => reasons.push(format!("{name}: {}", error.message())),
             }
         }
-        Err(unavailable(class, reasons))
+        Err(unavailable(class, settings.format, reasons))
     }
 
-    /// Opens and starts one candidate, with the parameter sets its stream
-    /// will reference.
+    /// Opens and starts one candidate, with the decoder configuration its
+    /// stream will need.
     fn open_with(
         activate: IMFActivate,
         class: MftClass,
         settings: Settings,
-    ) -> Result<(Mft, ParameterSets)> {
+    ) -> Result<(Mft, Declared)> {
         let mut mft = Mft::open(activate.clone(), class, &settings)?;
-        let mut declared = mft.sequence_header();
-        if !declared.is_complete() {
-            // This MFT only writes its parameter sets in-band, so encode one
-            // throwaway frame to learn them. The probe has to be a separate
-            // instance: the real stream must start with its own first frame.
-            drop(mft);
-            declared = probe_parameter_sets(activate.clone(), class, &settings)?;
-            mft = Mft::open(activate, class, &settings)?;
-        }
-        if declared.hvcc().is_none() {
-            return Err(codec(
-                "encoder parameter sets do not describe an HEVC stream",
-            ));
-        }
+        let declared = match settings.format {
+            OutputFormat::Hevc => {
+                let mut sets = mft.sequence_header();
+                if !sets.is_complete() {
+                    // This MFT only writes its parameter sets in-band, so
+                    // encode one throwaway frame to learn them. The probe has
+                    // to be a separate instance: the real stream must start
+                    // with its own first frame.
+                    drop(mft);
+                    sets = probe_parameter_sets(activate.clone(), class, &settings)?;
+                    mft = Mft::open(activate, class, &settings)?;
+                }
+                if sets.hvcc().is_none() {
+                    return Err(codec(
+                        "encoder parameter sets do not describe an HEVC stream",
+                    ));
+                }
+                Declared::Hevc(sets)
+            }
+            OutputFormat::Vp9 => {
+                // VP9 carries everything in band, so the colour space the
+                // `vpcC` declares is whatever the encoder's key frames signal.
+                drop(mft);
+                let declared = probe_vpcc(activate.clone(), class, &settings)?;
+                mft = Mft::open(activate, class, &settings)?;
+                declared
+            }
+        };
         mft.start()?;
         Ok((mft, declared))
     }
@@ -912,7 +1021,10 @@ impl Core {
         })?;
         self.failure = Some(Error::new(
             ErrorKind::InvalidState,
-            "the HEVC encoder has already been finished",
+            format!(
+                "the {} encoder has already been finished",
+                self.settings.format.name()
+            ),
         ));
         Ok(samples)
     }
@@ -942,31 +1054,52 @@ impl Core {
     }
 
     fn samples(&mut self, outputs: Vec<RawOutput>) -> Result<Vec<EncodedSample>> {
+        let name = self.settings.format.name();
         let mut samples = Vec::with_capacity(outputs.len());
         for output in outputs {
-            let mut seen = ParameterSets::default();
-            let Some(unit) = annexb::reframe_access_unit(&output.stream, &mut seen) else {
-                continue;
+            let (data, is_sync) = match &self.declared {
+                Declared::Hevc(declared) => {
+                    let mut seen = ParameterSets::default();
+                    let Some(unit) = annexb::reframe_access_unit(&output.stream, &mut seen) else {
+                        continue;
+                    };
+                    if !declared.contains_all(&seen) {
+                        return Err(codec(
+                            "encoder changed its parameter sets mid-stream, which an hvc1 track cannot carry",
+                        ));
+                    }
+                    (unit.data, unit.is_irap || output.clean_point)
+                }
+                Declared::Vp9 { vpcc, level } => {
+                    if output.stream.is_empty() {
+                        continue;
+                    }
+                    // Only a key frame makes a VP9 sample a sync sample,
+                    // whatever the MFT marks as a clean point.
+                    let key = crate::vp9_encoder::key_frame_vpcc(&output.stream, *level);
+                    if key.as_ref().is_some_and(|key| key != vpcc) {
+                        return Err(codec(
+                            "encoder changed its colour signalling mid-stream, which a vp09 track cannot carry",
+                        ));
+                    }
+                    (output.stream, key.is_some())
+                }
             };
-            if !self.declared.contains_all(&seen) {
-                return Err(codec(
-                    "encoder changed its parameter sets mid-stream, which an hvc1 track cannot carry",
-                ));
-            }
-            if unit.data.len() as u64 > self.limits.max_allocation_bytes {
+            if data.len() as u64 > self.limits.max_allocation_bytes {
                 return Err(Error::new(
                     ErrorKind::ResourceLimit,
-                    "HEVC access unit exceeds configured allocation limit",
+                    format!("{name} sample exceeds configured allocation limit"),
                 ));
             }
             let index = self.output_index(output.time)?;
-            let is_sync = unit.is_irap || output.clean_point;
             let tick = index
                 .checked_mul(u64::from(self.settings.frame_duration))
                 .and_then(|tick| i64::try_from(tick).ok())
-                .ok_or_else(|| Error::new(ErrorKind::ResourceLimit, "HEVC timeline overflows"))?;
+                .ok_or_else(|| {
+                    Error::new(ErrorKind::ResourceLimit, format!("{name} timeline overflows"))
+                })?;
             samples.push(EncodedSample {
-                data: unit.data,
+                data,
                 dts: tick,
                 pts: tick,
                 duration: self.settings.frame_duration,
@@ -1022,6 +1155,53 @@ fn probe_parameter_sets(
     class: MftClass,
     settings: &Settings,
 ) -> Result<ParameterSets> {
+    let mut sets = ParameterSets::default();
+    for output in &probe_encode(activate, class, settings)? {
+        for nal in annexb::split_annex_b(&output.stream) {
+            sets.collect(nal);
+        }
+    }
+    if sets.is_complete() {
+        Ok(sets)
+    } else {
+        Err(codec("encoder did not emit its parameter sets"))
+    }
+}
+
+/// Encodes one black frame on a throwaway instance to learn the colour space
+/// and range a VP9 MFT's key frames signal, as the `vpcC` declaring them.
+fn probe_vpcc(activate: IMFActivate, class: MftClass, settings: &Settings) -> Result<Declared> {
+    let level = crate::vp9_encoder::pick_level(
+        crate::VideoDimensions {
+            width: settings.width,
+            height: settings.height,
+        },
+        settings.timescale,
+        settings.frame_duration,
+    )
+    .ok_or_else(|| {
+        Error::new(
+            ErrorKind::InvalidInput,
+            "VP9 dimensions and frame rate exceed level 6.2 limits",
+        )
+    })?;
+    let outputs = probe_encode(activate, class, settings)?;
+    let first = outputs
+        .iter()
+        .find(|output| !output.stream.is_empty())
+        .ok_or_else(|| codec("encoder emitted nothing for its first VP9 frame"))?;
+    let vpcc = crate::vp9_encoder::key_frame_vpcc(&first.stream, level)
+        .ok_or_else(|| codec("encoder did not open its stream with a VP9 profile 0 key frame"))?;
+    Ok(Declared::Vp9 { vpcc, level })
+}
+
+/// Encodes one black frame on a throwaway instance of `activate`, returning
+/// everything it emitted.
+fn probe_encode(
+    activate: IMFActivate,
+    class: MftClass,
+    settings: &Settings,
+) -> Result<Vec<RawOutput>> {
     let mut mft = Mft::open(activate, class, settings)?;
     mft.start()?;
     let payload = match mft.feed {
@@ -1038,22 +1218,12 @@ fn probe_parameter_sets(
     let mut out = Vec::new();
     mft.submit(&sample, &never, &mut out)?;
     mft.drain(&never, &mut out)?;
-    let mut sets = ParameterSets::default();
-    for output in &out {
-        for nal in annexb::split_annex_b(&output.stream) {
-            sets.collect(nal);
-        }
-    }
-    if sets.is_complete() {
-        Ok(sets)
-    } else {
-        Err(codec("encoder did not emit its parameter sets"))
-    }
+    Ok(out)
 }
 
 fn input_sample(payload: &[u8], settings: &Settings, index: u64) -> Result<IMFSample> {
     let len = u32::try_from(payload.len())
-        .map_err(|_| Error::new(ErrorKind::ResourceLimit, "HEVC input frame is too large"))?;
+        .map_err(|_| Error::new(ErrorKind::ResourceLimit, "input frame is too large"))?;
     // SAFETY: the buffer is locked for the copy and holds `len` bytes.
     unsafe {
         let buffer = MFCreateMemoryBuffer(len).map_err(|error| mf_error("input buffer", error))?;
@@ -1163,7 +1333,7 @@ impl Drop for Pending {
     }
 }
 
-struct MfHevcEncoder {
+struct MfVideoEncoder {
     commands: Option<Sender<Command>>,
     worker: Option<JoinHandle<()>>,
     cancelled: Arc<AtomicBool>,
@@ -1176,17 +1346,17 @@ struct MfHevcEncoder {
     finished: bool,
 }
 
-impl MfHevcEncoder {
+impl MfVideoEncoder {
     fn spawn(settings: Settings, class: MftClass, limits: Limits) -> Result<Self> {
         let (command_tx, command_rx) = channel();
         let (ready_tx, ready_rx) = sync_channel(1);
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);
         let worker = thread::Builder::new()
-            .name("zvidlib-mf-hevc-encode".into())
+            .name("zvidlib-mf-encode".into())
             .spawn(move || match Core::open(settings, class, limits) {
                 Ok(core) => {
-                    let ready = (core.declared.hvcc(), core.mft.feed, core.mft.name.clone());
+                    let ready = (core.declared.decoder_config(), core.mft.feed, core.mft.name.clone());
                     if ready_tx.send(Ok(ready)).is_ok() {
                         run_worker(core, &command_rx, &worker_cancelled);
                     }
@@ -1201,7 +1371,7 @@ impl MfHevcEncoder {
                 "Media Foundation worker stopped during initialization",
             ))
         });
-        let (hvcc, feed, name) = match ready {
+        let (decoder_config, feed, name) = match ready {
             Ok(ready) => ready,
             Err(error) => {
                 let _ = worker.join();
@@ -1213,9 +1383,9 @@ impl MfHevcEncoder {
             worker: Some(worker),
             cancelled,
             config: EncoderConfig {
-                codec: crate::Codec::Hevc,
+                codec: settings.format.codec(),
                 timescale: settings.timescale,
-                decoder_config: hvcc.expect("checked when the encoder was opened"),
+                decoder_config: decoder_config.expect("checked when the encoder was opened"),
             },
             settings,
             feed,
@@ -1249,7 +1419,10 @@ impl MfHevcEncoder {
         if self.finished {
             return Err(Error::new(
                 ErrorKind::InvalidState,
-                "the HEVC encoder has already been finished",
+                format!(
+                    "the {} encoder has already been finished",
+                    self.settings.format.name()
+                ),
             ));
         }
         Ok(())
@@ -1257,10 +1430,11 @@ impl MfHevcEncoder {
 
     /// Converts a source frame to the layout the MFT was given.
     fn payload(feed: Feed, settings: &Settings, source: FrameSource<'_>) -> Result<Vec<u8>> {
+        let name = settings.format.name();
         let FrameSource::Cpu(source) = source else {
             return Err(Error::new(
                 ErrorKind::Unsupported,
-                "Media Foundation HEVC encoder requires a CPU frame source",
+                format!("Media Foundation {name} encoder requires a CPU frame source"),
             ));
         };
         let frame = source.frame;
@@ -1272,7 +1446,7 @@ impl MfHevcEncoder {
         {
             return Err(Error::new(
                 ErrorKind::InvalidInput,
-                "HEVC input frame does not match the configured format",
+                format!("{name} input frame does not match the configured format"),
             ));
         }
         let (width, height) = (width as usize, height as usize);
@@ -1339,7 +1513,7 @@ impl MfHevcEncoder {
             _ => {
                 return Err(Error::new(
                     ErrorKind::Unsupported,
-                    "Media Foundation HEVC encoder cannot take this pixel format",
+                    format!("Media Foundation {name} encoder cannot take this pixel format"),
                 ));
             }
         }
@@ -1354,7 +1528,7 @@ fn swap_red_blue(src: &[u8], dst: &mut [u8]) {
     }
 }
 
-impl VideoEncoder for MfHevcEncoder {
+impl VideoEncoder for MfVideoEncoder {
     fn config(&self) -> &EncoderConfig {
         &self.config
     }
@@ -1389,7 +1563,10 @@ impl VideoEncoder for MfHevcEncoder {
             if index.0 != self.next_index {
                 return Err(Error::new(
                     ErrorKind::InvalidInput,
-                    "HEVC encoder frame indexes must be consecutive and start at zero",
+                    format!(
+                        "{} encoder frame indexes must be consecutive and start at zero",
+                        self.settings.format.name()
+                    ),
                 ));
             }
             Self::payload(self.feed, &self.settings, source)
@@ -1416,7 +1593,7 @@ impl VideoEncoder for MfHevcEncoder {
     }
 }
 
-impl Drop for MfHevcEncoder {
+impl Drop for MfVideoEncoder {
     fn drop(&mut self) {
         // Closing the channel stops the worker once any request it is still
         // on returns, which a cancelled one does within a poll interval.
@@ -1497,14 +1674,14 @@ fn device_lost(detail: impl std::fmt::Display) -> Error {
     Error::new(
         ErrorKind::Graphics,
         format!(
-            "the Media Foundation HEVC encoder lost its device ({detail}); \
+            "the Media Foundation encoder lost its device ({detail}); \
              create a new encoder to continue"
         ),
     )
 }
 
 fn cancelled_error() -> Error {
-    Error::new(ErrorKind::Cancelled, "HEVC encoding was cancelled")
+    Error::new(ErrorKind::Cancelled, "encoding was cancelled")
 }
 
 fn windows_error(context: &str, error: windows::core::Error) -> Error {
@@ -1618,12 +1795,14 @@ mod tests {
 
     fn round_trip_settings(input_format: PixelFormat) -> Settings {
         Settings {
+            format: OutputFormat::Hevc,
             width: 320,
             height: 240,
             input_format,
             timescale: 30_000,
             frame_duration: 1_001,
             bits_per_second: 4_000_000,
+            quality: None,
             keyframe_interval: 5,
         }
     }
@@ -1684,7 +1863,7 @@ mod tests {
                 }
 
                 let decoder_config = VideoDecoderConfig {
-                    codec: crate::Codec::Hevc,
+                    codec: settings.format.codec(),
                     profile: crate::CodecProfile::HevcMain,
                     coded_dimensions: VideoDimensions::new(320, 240, &limits).unwrap(),
                     output_format: PixelFormat::Rgba8,
@@ -1816,7 +1995,7 @@ mod tests {
         let checked = run_on_mf_thread("zvidlib-mf-hevc-test", move || {
             let mut checked = 0;
             for class in [MftClass::Hardware, MftClass::Software] {
-                for activate in candidates(class)? {
+                for activate in candidates(class, OutputFormat::Hevc)? {
                     let Ok(mft) = Mft::open(activate.clone(), class, &settings) else {
                         continue;
                     };
@@ -1880,7 +2059,7 @@ mod tests {
     fn every_input_layout_converts_to_the_same_encoder_input() {
         let convert = |feed, format, frame: &VideoFrame, orientation| {
             let settings = round_trip_settings(format);
-            MfHevcEncoder::payload(
+            MfVideoEncoder::payload(
                 feed,
                 &settings,
                 FrameSource::Cpu(CpuFrameSource { frame, orientation }),
@@ -1928,7 +2107,7 @@ mod tests {
             bgra.planes[0].data
         );
         // A frame that is not the configured format is refused, not converted.
-        let error = MfHevcEncoder::payload(
+        let error = MfVideoEncoder::payload(
             Feed::Nv12,
             &round_trip_settings(PixelFormat::Rgba8),
             FrameSource::Cpu(CpuFrameSource {
@@ -1942,12 +2121,14 @@ mod tests {
 
     fn settings(timescale: u32, frame_duration: u32) -> Settings {
         Settings {
+            format: OutputFormat::Hevc,
             width: 64,
             height: 64,
             input_format: PixelFormat::Rgba8,
             timescale,
             frame_duration,
             bits_per_second: 1_000_000,
+            quality: None,
             keyframe_interval: 30,
         }
     }
