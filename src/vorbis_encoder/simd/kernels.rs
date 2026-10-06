@@ -9,8 +9,10 @@
 //! The comment on each kernel names the scalar function it must agree with,
 //! and `super::tests` compares the two on random and edge-case input.
 //!
-//! The kernels index through raw pointers after checking every bound they
-//! rely on up front, so the inner loops carry no bounds checks of their own.
+//! The kernels index through raw pointers wherever the bound follows from
+//! the shape of the loop, after checking it up front. Indices read out of
+//! data (the bit-reversal table, the bark windows, the companding index) are
+//! bounds-checked one by one, so a bad table can only panic.
 
 use super::vector::{F32x4, I32x4};
 use crate::vorbis_encoder::floor1::{self, FitSums};
@@ -143,26 +145,26 @@ unsafe fn butterfly_generic<V: F32x4>(
     }
 }
 
-/// `mdct_bitreverse`: one scalar iteration (two index pairs) per vector.
+/// `mdct_bitreverse` over `x[..n]`: one scalar iteration (two index pairs)
+/// per vector. The bit-reversal indices are table data, so every pair they
+/// name is bounds-checked before it is loaded.
 #[inline(always)]
-unsafe fn bitreverse<V: F32x4>(m: &MdctLookup, x: *mut f32) {
+unsafe fn bitreverse<V: F32x4>(m: &MdctLookup, x: &mut [f32]) {
+    let n = m.n;
+    let (wlo, xs) = x[..n].split_at_mut(n >> 1);
+    let xs = &*xs;
+    let bit = &m.bitrev[..n >> 2];
+    let pair = |b: i32| xs[b as usize..b as usize + 2].as_ptr();
     unsafe {
-        let n = m.n;
-        let wlo = x;
-        let xs = x.add(n >> 1) as *const f32;
-        let bit = m.bitrev.as_ptr();
+        let wlo = wlo.as_mut_ptr();
         let trig = m.trig.as_ptr().add(n);
         let half = V::splat(0.5);
         let mut w0 = 0usize;
         let mut w1 = n >> 1;
         let mut t = 0usize;
         loop {
-            let b0 = *bit.add(t) as usize;
-            let b1 = *bit.add(t + 1) as usize;
-            let b2 = *bit.add(t + 2) as usize;
-            let b3 = *bit.add(t + 3) as usize;
-            let v0 = V::load_pairs(xs.add(b0), xs.add(b2));
-            let v1 = V::load_pairs(xs.add(b1), xs.add(b3));
+            let v0 = V::load_pairs(pair(bit[t]), pair(bit[t + 2]));
+            let v1 = V::load_pairs(pair(bit[t + 1]), pair(bit[t + 3]));
             let sum = v0.add(v1);
             let diff = v0.sub(v1);
             // (r1, r0) = (x0 + x1, x0' - x1') and its rotation (r2, r3)
@@ -257,7 +259,7 @@ pub(super) unsafe fn mdct_forward<V: F32x4>(
             mdct::butterfly_32(chunk);
         }
 
-        bitreverse::<V>(m, wp);
+        bitreverse::<V>(m, core::slice::from_raw_parts_mut(wp, n));
 
         // rotate + window
         let scale = V::splat(m.scale);
