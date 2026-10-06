@@ -212,7 +212,8 @@ impl WebVideoDecodeSession {
         };
 
         let samples = track.to_encoded_video_samples(&source, limits).await?;
-        let frame_count = samples.len() as u64;
+        // A decode-only sample, such as a hidden VP8 frame, is not a frame.
+        let frame_count = track.presentation_order.len() as u64;
         let backend = if webcodecs_supported {
             DecodeBackend::WebCodecs(WebCodecsDecoder::open(config, samples, limits)?)
         } else {

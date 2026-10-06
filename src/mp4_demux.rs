@@ -70,7 +70,10 @@ pub struct Mp4Track {
     pub edits: Vec<EditMapping>,
     /// Samples in decode order.
     pub samples: Vec<Mp4Sample>,
-    /// Decode-order indexes sorted by PTS, then DTS, then decode index.
+    /// Decode-order indexes of the presentation frames, sorted by PTS, then
+    /// DTS, then decode index. A decode-only sample, such as a hidden VP8
+    /// frame stored as a WebM block of its own, is decoded on the way to the
+    /// frames after it but is never presented, so it is not listed.
     pub presentation_order: Vec<usize>,
 }
 
@@ -105,8 +108,11 @@ impl Mp4Track {
     ///
     /// The zero-based position of each sample within
     /// [`Self::presentation_order`] becomes its `presentation_index`, and
-    /// `is_sync` becomes `random_access`. Total decoded sample bytes are
-    /// bounded by `limits.max_allocation_bytes`.
+    /// `is_sync` becomes `random_access`. A decode-only sample, which
+    /// `presentation_order` does not list, takes an identity past the last
+    /// presentation frame, in decode order, so it never collides with a frame
+    /// a caller asks for. Total decoded sample bytes are bounded by
+    /// `limits.max_allocation_bytes`.
     pub async fn to_encoded_video_samples<S: ByteSource + ?Sized>(
         &self,
         source: &S,
@@ -115,12 +121,25 @@ impl Mp4Track {
         if self.kind != TrackKind::Video {
             return Err(unsupported("encoded video samples require a video track"));
         }
-        let mut presentation_index_by_decode = vec![0_u64; self.samples.len()];
+        let mut presentation_index_by_decode = vec![None; self.samples.len()];
         for (presentation_index, &decode_index) in self.presentation_order.iter().enumerate() {
             let presentation_index = u64::try_from(presentation_index)
                 .map_err(|_| limit("presentation index overflow"))?;
-            presentation_index_by_decode[decode_index] = presentation_index;
+            *presentation_index_by_decode
+                .get_mut(decode_index)
+                .ok_or_else(|| malformed("presentation order references a missing sample"))? =
+                Some(presentation_index);
         }
+        let mut next_decode_only = self.presentation_order.len() as u64;
+        let presentation_index_by_decode: Vec<u64> = presentation_index_by_decode
+            .into_iter()
+            .map(|index| {
+                index.unwrap_or_else(|| {
+                    next_decode_only += 1;
+                    next_decode_only - 1
+                })
+            })
+            .collect();
 
         let mut total_bytes = 0_u64;
         let mut samples = Vec::with_capacity(self.samples.len());
