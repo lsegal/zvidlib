@@ -57,6 +57,19 @@ duration is an exact multiple of the 1024-sample AAC-LC access unit and no
 packet's indexed interval is truncated. As above, FFmpeg is only the offline
 fixture generator and is not a build, test, or runtime dependency.
 
+`aac_reference.bin` is the AAC decode both AAC tracks above produced before
+issue #561 replaced Symphonia's AAC decoder with the platform ones, and what
+`tests/native_aac_decoder.rs` holds AudioToolbox and Media Foundation to. For
+the bundled stereo sample and then the mono fixture, it holds three 1024-frame
+windows of each one's presentation timeline, as `AacSampleReader` returned
+them over `symphonia-codec-aac` 0.5.5 with a preroll of two access units: the
+first window, one starting at half the presentation length plus 333 frames,
+and the last full window. The samples are interleaved little-endian `f32`,
+36,864 bytes in all. The decoder that produced them is no longer a
+dependency, so the file is not regenerated; a platform decoder is compared
+against it by signal-to-noise ratio, since AAC decoders are not bit-exact with
+each other.
+
 `bbb_hevc_512x288_gop768.mp4` and `bbb_hevc_512x288_gop32.mp4` are the paired
 random-access-cadence tracks the `exact_seek` benchmark target measures over.
 Both are the same 768 frames of the bundled `examples/media/BigBuckBunny.mp4`

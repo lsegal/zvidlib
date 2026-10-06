@@ -369,7 +369,13 @@ Every native encoder, by operating system, and what does the encoding. A *hardwa
 | Opus (`native_opus_audio_encoder_factory`) | **Software**: `opus-pure`, a pure-Rust port of libopus (48 kHz, mono or stereo) | **Software**: `opus-pure` | **Software**: `opus-pure` |
 | Vorbis (`native_vorbis_audio_encoder_factory`) | **Software**: zvidlib's port of the libvorbis 1.3.7 encoder (mono or stereo, every rate libvorbis supports) | **Software**: the libvorbis port | **Software**: the libvorbis port |
 
-The native audio decoders are pure Rust on every platform except AAC's: `NativeAacDecoder` runs Symphonia's AAC decoder, `NativeVorbisDecoder` a copy of Symphonia's Vorbis decoder vendored in `src/vorbis_decoder/` with its surround decoding fixed, for one to eight channels in the Vorbis channel order, and `NativeOpusDecoder` runs `opus-pure`, which passes all twelve RFC 8251 decoder conformance vectors in stereo and in mono. Opus is read from and written to MP4 (`Opus` sample entries with `dOps`) and WebM; Vorbis has no MP4 mapping, so it is read from and written to WebM, `VorbisConfig` parses and writes the Xiph-laced `CodecPrivate` WebM carries, and `Mp4Muxer` refuses a Vorbis track.
+| Audio decoder | Windows | macOS | Linux |
+| --- | --- | --- | --- |
+| AAC-LC (`NativeAacDecoder`) | **Platform**: Media Foundation AAC decoder MFT (mono or stereo) | **Platform**: AudioToolbox (mono or stereo) | None: `NativeAacDecoder::new` reports `ErrorKind::Unsupported` |
+| Opus (`NativeOpusDecoder`) | **Software**: `opus-pure` | **Software**: `opus-pure` | **Software**: `opus-pure` |
+| Vorbis (`NativeVorbisDecoder`) | **Software**: vendored Symphonia Vorbis decoder | **Software**: vendored Symphonia Vorbis decoder | **Software**: vendored Symphonia Vorbis decoder |
+
+The native audio decoders are pure Rust on every platform except AAC's: `NativeAacDecoder` runs the platform's AAC-LC decoder, AudioToolbox on macOS and Media Foundation's AAC decoder MFT on Windows, for mono and stereo streams, and reports `ErrorKind::Unsupported` on Linux and other targets, which have no platform AAC decoder. `NativeVorbisDecoder` runs a copy of Symphonia's Vorbis decoder vendored in `src/vorbis_decoder/` with its surround decoding fixed, for one to eight channels in the Vorbis channel order, and `NativeOpusDecoder` runs `opus-pure`, which passes all twelve RFC 8251 decoder conformance vectors in stereo and in mono. Opus is read from and written to MP4 (`Opus` sample entries with `dOps`) and WebM; Vorbis has no MP4 mapping, so it is read from and written to WebM, `VorbisConfig` parses and writes the Xiph-laced `CodecPrivate` WebM carries, and `Mp4Muxer` refuses a Vorbis track.
 
 The browser build encodes through `WebCodecs` instead: AV1 Main, HEVC Main or VP9 profile 0 video and AAC-LC or Opus audio, wherever the browser provides those encoders (see [Implemented browser boundary](#implemented-browser-boundary)).
 

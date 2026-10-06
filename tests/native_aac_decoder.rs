@@ -3,12 +3,12 @@
 //! On macOS and Windows the backend is the operating system's own decoder, so
 //! these hold it to the sample-exact contract `AacSampleReader` is built on:
 //! the same presentation length and boundaries the reader produced when the
-//! crate carried Symphonia's AAC decoder, and PCM within a small tolerance of
-//! that decoder's output, recorded in `tests/fixtures/codec/aac_reference.bin`.
-//! Decoders are not bit-exact with each other, but a decoder that added or
-//! dropped even one sample of delay would be off by far more than the
-//! tolerance. Elsewhere there is no platform decoder and the backend must say
-//! so.
+//! crate carried Symphonia's AAC decoder, and PCM close to that decoder's
+//! output, recorded in `tests/fixtures/codec/aac_reference.bin`. Decoders are
+//! not bit-exact with each other, so the PCM is compared by signal-to-noise
+//! ratio, and each window must match the reference clearly better than it does
+//! one sample early or late. Elsewhere there is no platform decoder and the
+//! backend must say so.
 
 use std::future::Future;
 use std::pin::Pin;

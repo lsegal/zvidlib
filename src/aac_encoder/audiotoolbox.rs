@@ -24,9 +24,9 @@ use super::{FRAME_LENGTH, esds_box, gapless_padding};
 pub(crate) type OSStatus = i32;
 pub(crate) type AudioConverterRef = *mut c_void;
 
-/// A sentinel this module's own [`input_proc`] returns from
-/// `AudioConverterFillComplexBuffer`'s pull callback to say no more source
-/// frames are available for the current call. Not a system `OSStatus`: the
+/// A sentinel this module's own [`input_proc`], and the AAC decoder's in
+/// `native_audio`, return from `AudioConverterFillComplexBuffer`'s pull
+/// callback to say no more source data is available for the current call. Not a system `OSStatus`: the
 /// converter passes whatever the callback returns straight back to its
 /// caller, so this only ever needs to be distinguishable from `0` (`noErr`),
 /// which with zero frames is instead how the callback reports end of stream.
