@@ -16,9 +16,9 @@
 use zvidlib::{
     CancellationToken, Codec, CodecImplementation, CodecProfile, CodecSupport, ColorRange,
     EncodedVideoSample, ErrorKind, ExactFrameReader, ExpectedVideoFrame, FrameDigest, FrameIndex,
-    HardwarePreference, Limits, PixelFormat, VideoDecoderConfig, VideoDecoderConformanceVector,
-    VideoDecoderFactory, VideoDimensions, WebmDemuxer, native_vp8_video_decoder_factory,
-    verify_video_decoder_conformance,
+    HardwarePreference, Limits, PixelFormat, PreviewIndex, PreviewOptions, VideoDecoderConfig,
+    VideoDecoderConformanceVector, VideoDecoderFactory, VideoDimensions, WebmDemuxer,
+    native_vp8_video_decoder_factory, verify_video_decoder_conformance,
 };
 
 struct IvfFrame<'a> {
@@ -294,6 +294,38 @@ fn a_webm_vp8_track_skips_its_hidden_alternate_references() {
     let expected = sequential_digests(&factory, &configuration, &samples);
     assert_eq!(expected.len(), 40);
     assert_every_order_matches(&factory, &configuration, &samples, &expected);
+}
+
+#[test]
+fn a_preview_index_covers_only_the_shown_frames() {
+    // Issue #543: the three hidden alternate references are decode-only
+    // samples, so the index plans its slots over the 40 shown frames, and
+    // every slot it plans is one a decode fills.
+    let source = zvidlib::io::MemorySource::new(
+        include_bytes!("fixtures/codec/vp8/vp8_altref_98x66.webm").to_vec(),
+    );
+    let demuxer = block_on(WebmDemuxer::open(&source, Default::default())).unwrap();
+    let track = &demuxer.tracks[0];
+    let samples = block_on(track.to_encoded_video_samples(&source, &Limits::default())).unwrap();
+    assert_eq!(samples.len(), 43);
+    // One preview per frame, so a slot planned for a hidden sample's identity
+    // would show up in the total rather than vanish into a wider stride.
+    let options = PreviewOptions {
+        previews_per_second: 30,
+        ..PreviewOptions::for_frame_rate(30)
+    };
+    let index = PreviewIndex::with_frame_count(
+        &native_vp8_video_decoder_factory(),
+        configuration(track.dimensions.unwrap()),
+        samples,
+        track.presentation_order.len() as u64,
+        Limits::default(),
+        options,
+    )
+    .unwrap();
+    assert_eq!(index.store().stride(), 1);
+    index.wait_for_coverage();
+    assert_eq!(index.coverage(), (40, 40));
 }
 
 #[test]
