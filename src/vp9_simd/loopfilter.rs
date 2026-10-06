@@ -10,6 +10,12 @@
 //! side within each row, so they are read as one 32-bit word per row and
 //! split into bytes.
 
+// Loops over vectors index rather than iterate: an iterator adapter or an
+// `array::from_fn` closure over vector values is a separate function the
+// inliner can leave outside the `#[target_feature]` wrapper, compiled at the
+// baseline instruction set (#341).
+#![allow(clippy::needless_range_loop)]
+
 use crate::av1_simd::vector::I32x;
 pub(crate) use crate::vp9_dec::loopfilter::Thresholds;
 
@@ -105,9 +111,9 @@ pub(super) unsafe fn filter_edge<V: I32x>(
             // `px[reach - 1]` is p0 and `px[reach]` is q0.
             let mut px = [V::zero(); 16];
             if horizontal {
-                for (i, tap) in px.iter_mut().enumerate().take(2 * reach) {
+                for i in 0..2 * reach {
                     let at = base + (i as isize - reach as isize) * step;
-                    *tap = V::load_u8(&data[at as usize..]);
+                    px[i] = V::load_u8(&data[at as usize..]);
                 }
             } else {
                 for word in 0..2 * reach / 4 {
@@ -185,8 +191,8 @@ pub(super) unsafe fn filter_edge<V: I32x>(
                     p1.add(p0).add(q0).add(q1).add(q1).add(q2).add(q3).add(q3),
                     p0.add(q0).add(q1).add(q2).add(q2).add(q3).add(q3).add(q3),
                 ];
-                for (k, sum) in seven.into_iter().enumerate() {
-                    out[o + 1 + k] = V::select(flat, round3(sum), out[o + 1 + k]);
+                for k in 0..6 {
+                    out[o + 1 + k] = V::select(flat, round3(seven[k]), out[o + 1 + k]);
                 }
                 if taps == Taps::Eight {
                     (o + 1, o + 7)
@@ -220,9 +226,9 @@ pub(super) unsafe fn filter_edge<V: I32x>(
             };
 
             if horizontal {
-                for (i, value) in out.iter().enumerate().take(last).skip(first) {
+                for i in first..last {
                     let at = base + (i as isize - reach as isize) * step;
-                    value.store_u8_clamped(&mut data[at as usize..]);
+                    out[i].store_u8_clamped(&mut data[at as usize..]);
                 }
             } else {
                 for word in 0..2 * reach / 4 {

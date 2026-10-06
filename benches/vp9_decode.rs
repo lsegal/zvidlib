@@ -47,8 +47,9 @@ const WIDTH: usize = 1920;
 const HEIGHT: usize = 1080;
 
 /// Criterion windows for the per-stage groups, which are many and each
-/// measured once per instruction set.
-fn stage_workload<'a>(codec: &'a str, work: FrameWork) -> IsaWorkload<'a> {
+/// measured once per instruction set. Every group name is a literal argument
+/// here, which is what lets `tests/bench_group_names_are_unique.rs` see it.
+fn kernel_workload<'a>(codec: &'a str, work: FrameWork) -> IsaWorkload<'a> {
     IsaWorkload {
         measurement_time: Duration::from_secs(2),
         warm_up_time: Duration::from_millis(300),
@@ -56,14 +57,15 @@ fn stage_workload<'a>(codec: &'a str, work: FrameWork) -> IsaWorkload<'a> {
     }
 }
 
+/// One 1080p plane of work.
 fn frame_work() -> FrameWork {
     FrameWork::new(1, WIDTH as u64, HEIGHT as u64)
 }
 
-fn bench_stage(criterion: &mut Criterion, name: &str, stage: &Stage) {
-    bench_across_isas(criterion, &stage_workload(name, frame_work()), || {
-        stage.run()
-    });
+fn bench_stages(criterion: &mut Criterion, stages: Vec<(IsaWorkload<'_>, Stage)>) {
+    for (workload, stage) in stages {
+        bench_across_isas(criterion, &workload, || stage.run());
+    }
 }
 
 /// The bundled 256x144 stream, libvpx's two-pass encode of the sample with
@@ -87,58 +89,120 @@ fn vp9_decode_frame(criterion: &mut Criterion) {
 }
 
 fn vp9_inverse_transforms(criterion: &mut Criterion) {
-    for (kind, name, sizes) in [
-        (TransformKind::Dct, "dct", &[4usize, 8, 16, 32][..]),
-        (TransformKind::Adst, "adst", &[4, 8, 16]),
-        (TransformKind::Wht, "wht", &[4]),
-    ] {
-        for &size in sizes {
-            let stage = Stage::inverse_transform(kind, size, WIDTH, HEIGHT);
-            bench_stage(
-                criterion,
-                &format!("vp9_inverse_{name}_{size}x{size}"),
-                &stage,
-            );
-        }
-    }
+    let transform = |kind, size| Stage::inverse_transform(kind, size, WIDTH, HEIGHT);
+    bench_stages(
+        criterion,
+        vec![
+            (
+                kernel_workload("vp9_inverse_dct_4x4", frame_work()),
+                transform(TransformKind::Dct, 4),
+            ),
+            (
+                kernel_workload("vp9_inverse_dct_8x8", frame_work()),
+                transform(TransformKind::Dct, 8),
+            ),
+            (
+                kernel_workload("vp9_inverse_dct_16x16", frame_work()),
+                transform(TransformKind::Dct, 16),
+            ),
+            (
+                kernel_workload("vp9_inverse_dct_32x32", frame_work()),
+                transform(TransformKind::Dct, 32),
+            ),
+            (
+                kernel_workload("vp9_inverse_adst_4x4", frame_work()),
+                transform(TransformKind::Adst, 4),
+            ),
+            (
+                kernel_workload("vp9_inverse_adst_8x8", frame_work()),
+                transform(TransformKind::Adst, 8),
+            ),
+            (
+                kernel_workload("vp9_inverse_adst_16x16", frame_work()),
+                transform(TransformKind::Adst, 16),
+            ),
+            (
+                kernel_workload("vp9_inverse_wht_4x4", frame_work()),
+                transform(TransformKind::Wht, 4),
+            ),
+        ],
+    );
 }
 
 fn vp9_inter_prediction(criterion: &mut Criterion) {
-    for (filter, name) in [
-        (InterpFilter::Regular, "regular"),
-        (InterpFilter::Smooth, "smooth"),
-        (InterpFilter::Sharp, "sharp"),
-        (InterpFilter::Bilinear, "bilinear"),
-    ] {
-        let stage = Stage::inter_prediction(filter, false, 16, WIDTH, HEIGHT);
-        bench_stage(criterion, &format!("vp9_mc_{name}"), &stage);
-    }
-    let stage = Stage::inter_prediction(InterpFilter::Regular, false, 4, WIDTH, HEIGHT);
-    bench_stage(criterion, "vp9_mc_4x4", &stage);
-    let stage = Stage::inter_prediction(InterpFilter::Regular, true, 16, WIDTH, HEIGHT);
-    bench_stage(criterion, "vp9_mc_compound", &stage);
+    let inter =
+        |filter, compound, block| Stage::inter_prediction(filter, compound, block, WIDTH, HEIGHT);
+    bench_stages(
+        criterion,
+        vec![
+            (
+                kernel_workload("vp9_mc_regular", frame_work()),
+                inter(InterpFilter::Regular, false, 16),
+            ),
+            (
+                kernel_workload("vp9_mc_smooth", frame_work()),
+                inter(InterpFilter::Smooth, false, 16),
+            ),
+            (
+                kernel_workload("vp9_mc_sharp", frame_work()),
+                inter(InterpFilter::Sharp, false, 16),
+            ),
+            (
+                kernel_workload("vp9_mc_bilinear", frame_work()),
+                inter(InterpFilter::Bilinear, false, 16),
+            ),
+            (
+                kernel_workload("vp9_mc_4x4", frame_work()),
+                inter(InterpFilter::Regular, false, 4),
+            ),
+            (
+                kernel_workload("vp9_mc_compound", frame_work()),
+                inter(InterpFilter::Regular, true, 16),
+            ),
+        ],
+    );
 }
 
 fn vp9_intra_prediction(criterion: &mut Criterion) {
-    for (kind, name) in [
-        (IntraKind::Dc, "dc"),
-        (IntraKind::Tm, "tm"),
-        (IntraKind::Directional, "directional"),
-    ] {
-        let stage = Stage::intra_prediction(kind, WIDTH, HEIGHT);
-        bench_stage(criterion, &format!("vp9_intra_{name}"), &stage);
-    }
+    let intra = |kind| Stage::intra_prediction(kind, WIDTH, HEIGHT);
+    bench_stages(
+        criterion,
+        vec![
+            (
+                kernel_workload("vp9_intra_dc", frame_work()),
+                intra(IntraKind::Dc),
+            ),
+            (
+                kernel_workload("vp9_intra_tm", frame_work()),
+                intra(IntraKind::Tm),
+            ),
+            (
+                kernel_workload("vp9_intra_directional", frame_work()),
+                intra(IntraKind::Directional),
+            ),
+        ],
+    );
 }
 
 fn vp9_loop_filter(criterion: &mut Criterion) {
-    for (taps, name) in [
-        (LoopFilterTaps::Four, "4"),
-        (LoopFilterTaps::Eight, "8"),
-        (LoopFilterTaps::Sixteen, "16"),
-    ] {
-        let stage = Stage::loop_filter(taps, WIDTH, HEIGHT);
-        bench_stage(criterion, &format!("vp9_loop_filter_{name}"), &stage);
-    }
+    let filter = |taps| Stage::loop_filter(taps, WIDTH, HEIGHT);
+    bench_stages(
+        criterion,
+        vec![
+            (
+                kernel_workload("vp9_loop_filter_4", frame_work()),
+                filter(LoopFilterTaps::Four),
+            ),
+            (
+                kernel_workload("vp9_loop_filter_8", frame_work()),
+                filter(LoopFilterTaps::Eight),
+            ),
+            (
+                kernel_workload("vp9_loop_filter_16", frame_work()),
+                filter(LoopFilterTaps::Sixteen),
+            ),
+        ],
+    );
 }
 
 criterion_group!(

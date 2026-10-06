@@ -7,6 +7,12 @@
 //! [`transform`] site, so each 1-D transform is inlined once per instruction
 //! set rather than once per pass.
 
+// Loops over vectors index rather than iterate: an iterator adapter or an
+// `array::from_fn` closure over vector values is a separate function the
+// inliner can leave outside the `#[target_feature]` wrapper, compiled at the
+// baseline instruction set (#341).
+#![allow(clippy::needless_range_loop)]
+
 use super::idct1d::{iadst4, iadst8, iadst16, idct4, idct8, idct16, idct32};
 use super::wide::W;
 use crate::av1_simd::vector::{I32x, MAX_LANES};
@@ -163,8 +169,8 @@ unsafe fn inverse_2d<V: I32x>(
             };
             for group in 0..groups {
                 let first = group * lanes;
-                for (k, vector) in vectors_in.iter_mut().enumerate().take(n) {
-                    *vector = if pass == 0 {
+                for k in 0..n {
+                    vectors_in[k] = if pass == 0 {
                         // Lane `j` is row `first + j`, read down column `k`.
                         for (lane, slot) in scratch.iter_mut().enumerate().take(lanes) {
                             let row = first + lane;
@@ -178,8 +184,8 @@ unsafe fn inverse_2d<V: I32x>(
                 }
                 transform(n, adst, &vectors_in[..n], &mut vectors_out[..n]);
                 if pass == 0 {
-                    for (k, vector) in vectors_out.iter().enumerate().take(n) {
-                        vector.0.store(&mut scratch);
+                    for k in 0..n {
+                        vectors_out[k].0.store(&mut scratch);
                         for (lane, &value) in scratch.iter().enumerate().take(lanes) {
                             let row = first + lane;
                             if row < n {
@@ -189,9 +195,9 @@ unsafe fn inverse_2d<V: I32x>(
                     }
                 } else {
                     let round = V::splat(1 << (shift - 1));
-                    for (y, vector) in vectors_out.iter().enumerate().take(n) {
+                    for y in 0..n {
                         let at = y * stride + first;
-                        let residual = vector.0.add(round).sra_var(shift);
+                        let residual = vectors_out[y].0.add(round).sra_var(shift);
                         V::load_u8(&dest[at..])
                             .add(residual)
                             .store_u8_clamped(&mut dest[at..]);
@@ -263,23 +269,28 @@ unsafe fn iwht4x4_add<V: I32x>(input: &[i32], dest: &mut [u8], stride: usize, eo
         } else {
             // Row pass, one row per lane: tap `k` is column `k` of every row.
             let mut scratch = [0i32; MAX_LANES];
-            let taps: [V; 4] = core::array::from_fn(|k| {
-                for (row, slot) in scratch.iter_mut().enumerate().take(4) {
-                    *slot = input[row * 4 + k];
+            let mut taps = [V::zero(); 4];
+            for k in 0..4 {
+                for row in 0..4 {
+                    scratch[row] = input[row * 4 + k];
                 }
-                V::load(&scratch).sra::<2>()
-            });
+                taps[k] = V::load(&scratch).sra::<2>();
+            }
             let columns = wht_butterfly(taps);
-            for (k, column) in columns.into_iter().enumerate() {
-                column.store(&mut scratch);
+            for k in 0..4 {
+                columns[k].store(&mut scratch);
                 for row in 0..4 {
                     rows[row * 4 + k] = scratch[row];
                 }
             }
             // Column pass, one column per lane: tap `y` is row `y`.
-            let taps: [V; 4] = core::array::from_fn(|y| V::load(&rows[y * 4..]));
-            for (y, row) in wht_butterfly(taps).into_iter().enumerate() {
-                row.store(&mut scratch);
+            let mut taps = [V::zero(); 4];
+            for y in 0..4 {
+                taps[y] = V::load(&rows[y * 4..]);
+            }
+            let columns = wht_butterfly(taps);
+            for y in 0..4 {
+                columns[y].store(&mut scratch);
                 rows[y * 4..y * 4 + 4].copy_from_slice(&scratch[..4]);
             }
         }

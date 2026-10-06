@@ -9,13 +9,25 @@
 //! references too; a scaled horizontal step gives each pixel of a row its
 //! own phase, and that pass alone stays scalar.
 
+// Loops over vectors index rather than iterate: an iterator adapter or an
+// `array::from_fn` closure over vector values is a separate function the
+// inliner can leave outside the `#[target_feature]` wrapper, compiled at the
+// baseline instruction set (#341).
+#![allow(clippy::needless_range_loop)]
+
 use crate::av1_simd::vector::I32x;
 pub(crate) use crate::vp9_dec::recon::Kernel;
 
 /// The eight taps of one phase, one splatted vector each.
 #[inline(always)]
 unsafe fn splat_taps<V: I32x>(taps: &[i16; 8]) -> [V; 8] {
-    unsafe { core::array::from_fn(|k| V::splat(i32::from(taps[k]))) }
+    unsafe {
+        let mut splatted = [V::zero(); 8];
+        for k in 0..8 {
+            splatted[k] = V::splat(i32::from(taps[k]));
+        }
+        splatted
+    }
 }
 
 /// `ROUND_POWER_OF_TWO(sum, 7)` of eight taps applied to the vectors at
@@ -24,8 +36,8 @@ unsafe fn splat_taps<V: I32x>(taps: &[i16; 8]) -> [V; 8] {
 unsafe fn filter<V: I32x>(src: &[u8], at: usize, pitch: usize, taps: &[V; 8]) -> V {
     unsafe {
         let mut sum = V::splat(64);
-        for (k, &tap) in taps.iter().enumerate() {
-            sum = sum.add(V::load_u8(&src[at + k * pitch..]).mul(tap));
+        for k in 0..8 {
+            sum = sum.add(V::load_u8(&src[at + k * pitch..]).mul(taps[k]));
         }
         sum.sra::<7>().clamp(V::zero(), V::splat(255))
     }
