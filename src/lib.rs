@@ -39,6 +39,7 @@ pub mod transfer;
 pub mod vorbis;
 mod vorbis_decoder;
 mod vorbis_encoder;
+mod vorbis_simd;
 mod vp9_encoder;
 pub mod webm;
 pub mod webm_demux;
@@ -58,6 +59,7 @@ mod vp8;
 pub use vp8::bench as vp8_decoder_bench;
 mod vp9_dec;
 mod vp9_decoder;
+mod yuv_to_rgba;
 
 /// The bounded preview tier over a track, for callers that need an answer at an
 /// arbitrary position faster than a decode from the nearest random-access point
@@ -87,6 +89,14 @@ pub use hevc::bench as hevc_encoder_bench;
 #[cfg(not(target_arch = "wasm32"))]
 #[doc(hidden)]
 pub use hevc::decode_bench as hevc_decoder_bench;
+
+/// Per-stage access to the Vorbis decoder's synthesis kernels for the
+/// criterion benchmark suite.
+///
+/// Internal and unstable: the kernels are not otherwise reachable from a
+/// benchmark, which is a separate crate. See `benches/audio_decode.rs`.
+#[doc(hidden)]
+pub use vorbis_simd::bench as vorbis_decoder_bench;
 
 /// Stage attribution for a whole-frame HEVC decode.
 ///

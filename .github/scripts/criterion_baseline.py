@@ -532,7 +532,12 @@ SITE_GROUP_PREFIXES: dict[str, tuple[str, ...]] = {
     "av1_mc": ("av1_mc_", "av1_motion_compensation"),
     "av1_intra_pred": ("av1_intra_",),
     "av1_coeff_ctx": ("av1_encode_stage_coeff_ctx", "av1_encode_stage_tile"),
-    "vp8_decode": ("vp8_",),
+    "vp8_decode": (
+        "vp8_inverse_transform",
+        "vp8_inter_pred",
+        "vp8_intra_pred",
+        "vp8_loop_filter",
+    ),
     "hevc_prediction_filters": (
         "hevc_inter_pred",
         "hevc_intra_pred",
@@ -545,6 +550,13 @@ SITE_GROUP_PREFIXES: dict[str, tuple[str, ...]] = {
     "hevc_fwd_transform_quant": ("hevc_encode_640x352_fwd_transform_quant",),
     "hevc_colorconv": ("hevc_encode_640x352_rgba_to_yuv420",),
     "hevc_color_convert": ("hevc_color_convert",),
+    "yuv_to_rgba": ("yuv_to_rgba",),
+    "vorbis_decode": (
+        "vorbis_imdct",
+        "vorbis_overlap_add",
+        "vorbis_coupling",
+        "vorbis_floor_product",
+    ),
 }
 
 # `Measured on **<host>**, at `<sha>`.` - the line `table` renders above every
