@@ -248,3 +248,196 @@ fn libvpx_test_vectors() {
     );
     assert!(failures.is_empty(), "mismatching vectors: {failures:?}");
 }
+
+const BBB_256X144: &[u8] = include_bytes!("../../tests/fixtures/codec/vp9_bbb_256x144.mp4");
+const BBB_250X142: &[u8] = include_bytes!("../../tests/fixtures/codec/vp9_bbb_250x142.mp4");
+
+fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
+    use std::task::{Context, Poll, Waker};
+    let mut context = Context::from_waker(Waker::noop());
+    let mut future = Box::pin(future);
+    loop {
+        if let Poll::Ready(value) = future.as_mut().poll(&mut context) {
+            return value;
+        }
+    }
+}
+
+fn mp4_samples(mp4: &[u8]) -> Vec<crate::EncodedVideoSample> {
+    let source = crate::io::MemorySource::new(mp4.to_vec());
+    let movie = block_on(crate::Mp4Demuxer::open(
+        &source,
+        crate::Mp4DemuxerOptions::default(),
+    ))
+    .unwrap();
+    let track = movie.track(1).unwrap();
+    assert_eq!(track.codec, crate::Codec::Vp9);
+    block_on(track.to_encoded_video_samples(&source, &Limits::default())).unwrap()
+}
+
+fn digests(text: &str) -> Vec<crate::FrameDigest> {
+    text.lines()
+        .map(|line| crate::FrameDigest::from_hex(line.split_once(' ').unwrap().1).unwrap())
+        .collect()
+}
+
+fn yuv_digest(picture: &DecodedPicture) -> crate::FrameDigest {
+    let limits = Limits::default();
+    let chroma_width = picture.width.div_ceil(2);
+    let frame = crate::VideoFrame::new(
+        crate::VideoDimensions::new(picture.width as u32, picture.height as u32, &limits).unwrap(),
+        crate::PixelFormat::Yuv420p8,
+        if picture.full_range {
+            crate::ColorRange::Full
+        } else {
+            crate::ColorRange::Limited
+        },
+        picture
+            .planes
+            .iter()
+            .enumerate()
+            .map(|(index, plane)| crate::Plane {
+                data: plane.clone(),
+                stride: if index == 0 {
+                    picture.width
+                } else {
+                    chroma_width
+                },
+            })
+            .collect(),
+        &limits,
+    )
+    .unwrap();
+    crate::FrameDigest::from_frame(&frame).unwrap()
+}
+
+/// Both MP4 fixtures, encoded by libvpx from the bundled sample, decode to
+/// exactly the frames libvpx decodes them to. The 256x144 one is a two-pass
+/// encode whose superframes carry hidden alternate reference frames, which
+/// is checked too so a regenerated fixture cannot quietly lose them; the
+/// 250x142 one exercises frame edges that are not a multiple of 8. See
+/// `tests/fixtures/codec/README.md`.
+#[test]
+fn mp4_fixtures_decode_bit_exactly_against_libvpx() {
+    for (mp4, expected, size, frames) in [
+        (
+            BBB_256X144,
+            include_str!("../../tests/fixtures/codec/vp9_bbb_256x144_yuv420.sha256"),
+            (256, 144),
+            48,
+        ),
+        (
+            BBB_250X142,
+            include_str!("../../tests/fixtures/codec/vp9_bbb_250x142_yuv420.sha256"),
+            (250, 142),
+            12,
+        ),
+    ] {
+        let expected = digests(expected);
+        let samples = mp4_samples(mp4);
+        assert_eq!((samples.len(), expected.len()), (frames, frames));
+        let mut decoder = Decoder::new(Limits::default());
+        let mut superframes_with_hidden_frames = 0;
+        for (index, sample) in samples.iter().enumerate() {
+            if superframe_index(&sample.data)
+                .unwrap()
+                .is_some_and(|sizes| sizes.len() > 1)
+            {
+                superframes_with_hidden_frames += 1;
+            }
+            let picture = decoder.decode_chunk(&sample.data).unwrap().unwrap();
+            assert_eq!((picture.width, picture.height), size);
+            assert!(!picture.full_range);
+            assert_eq!(yuv_digest(&picture), expected[index], "frame {index}");
+        }
+        if size == (256, 144) {
+            assert_eq!(superframes_with_hidden_frames, 4);
+        }
+        assert_eq!(decoder.frames_shown(), frames as u64);
+    }
+}
+
+#[test]
+fn an_inter_frame_after_reset_is_refused_without_panicking() {
+    let samples = mp4_samples(BBB_256X144);
+    let mut decoder = Decoder::new(Limits::default());
+    assert!(decoder.decode_chunk(&samples[0].data).unwrap().is_some());
+    decoder.reset();
+    let error = decoder.decode_chunk(&samples[2].data).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::MalformedMedia);
+    // The key frame restarts decoding cleanly.
+    assert!(decoder.decode_chunk(&samples[0].data).unwrap().is_some());
+}
+
+#[test]
+fn show_existing_frame_shows_a_reference_again() {
+    let samples = mp4_samples(BBB_256X144);
+    let mut decoder = Decoder::new(Limits::default());
+    let key = decoder.decode_chunk(&samples[0].data).unwrap().unwrap();
+    let next = decoder.decode_chunk(&samples[1].data).unwrap().unwrap();
+    assert_ne!(key.planes, next.planes);
+    // A key frame refreshes every slot; slot 7 is still the key frame here
+    // unless the next frame refreshed it, so pick a slot by looking.
+    let shown_before = decoder.frames_shown();
+    let mut found = false;
+    for slot in 0..8u8 {
+        // frame_marker 2, profile 0, show_existing_frame 1, then the slot.
+        let picture = decoder.decode_chunk(&[0x88 | slot]).unwrap().unwrap();
+        found |= picture.planes == key.planes;
+    }
+    assert!(found, "some reference slot still holds the key frame");
+    assert_eq!(decoder.frames_shown(), shown_before + 8);
+    // Output that is not wanted is still counted.
+    decoder.set_output_wanted(false);
+    assert!(decoder.decode_chunk(&[0x88]).unwrap().is_none());
+    assert_eq!(decoder.frames_shown(), shown_before + 9);
+}
+
+#[test]
+fn damaged_samples_are_rejected_or_decoded_without_panicking() {
+    let samples = mp4_samples(BBB_256X144);
+    for index in [0usize, 1, 2] {
+        let data = &samples[index].data;
+        for cut in [
+            1,
+            2,
+            4,
+            9,
+            16,
+            data.len() / 3,
+            data.len() / 2,
+            data.len() - 1,
+        ] {
+            let mut decoder = Decoder::new(Limits::default());
+            for previous in &samples[..index] {
+                decoder.decode_chunk(&previous.data).unwrap();
+            }
+            let _ = decoder.decode_chunk(&data[..cut]);
+        }
+        let step = (data.len() / 211).max(1);
+        for position in (0..data.len()).step_by(step) {
+            for pattern in [0x5a, 0xff, 0x01] {
+                let mut decoder = Decoder::new(Limits::default());
+                for previous in &samples[..index] {
+                    decoder.decode_chunk(&previous.data).unwrap();
+                }
+                let mut damaged = data.clone();
+                damaged[position] ^= pattern;
+                let _ = decoder.decode_chunk(&damaged);
+                // Whatever the damaged frame did, the decoder keeps working.
+                let _ = decoder.decode_chunk(&samples[index + 1].data);
+            }
+        }
+    }
+}
+
+#[test]
+fn oversized_frames_are_refused_before_allocation() {
+    let samples = mp4_samples(BBB_256X144);
+    let mut decoder = Decoder::new(Limits {
+        max_width: 128,
+        ..Limits::default()
+    });
+    let error = decoder.decode_chunk(&samples[0].data).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::ResourceLimit);
+}
