@@ -1455,6 +1455,59 @@ mod tests {
     }
 
     #[test]
+    fn hidden_vp8_frames_are_decoded_but_not_presented() {
+        // Issue #537. A VP8 frame tag's bit 4 is `show_frame`, and bit 0 is
+        // clear on a key frame. The hidden frame one tick after frame 40 is
+        // how vpxenc stores an alternate reference, and the block at 120 is
+        // hidden by its Matroska invisible flag instead. The AV1 track shows
+        // the same first bytes are only read as a VP8 frame tag.
+        let mut invisible = Vec::new();
+        write_element(
+            &mut invisible,
+            ebml::SIMPLE_BLOCK,
+            &block_body(1, 120, INVISIBLE, &[0x11, 0]),
+        );
+        let bytes = file(
+            "webm",
+            &[
+                info(None, None),
+                tracks(&[video_entry(1, "V_VP8", None), video_entry(2, "V_AV1", None)]),
+                cluster(
+                    0,
+                    &[
+                        simple_block(1, 0, true, &[0x10, 0]),
+                        simple_block(2, 0, true, &[0x00, 0]),
+                        simple_block(1, 40, false, &[0x11, 0]),
+                        simple_block(1, 41, false, &[0x01, 0]),
+                        simple_block(2, 40, false, &[0x01, 0]),
+                        simple_block(1, 80, false, &[0x11, 0]),
+                        invisible,
+                        simple_block(1, 160, false, &[0x11, 0]),
+                    ],
+                    true,
+                ),
+            ],
+            true,
+        );
+        let source = MemorySource::new(bytes.clone());
+        let demuxer = open(bytes).unwrap();
+        let vp8 = &demuxer.tracks[0];
+        assert_eq!(vp8.samples.len(), 6);
+        assert_eq!(vp8.presentation_order, vec![0, 1, 3, 5]);
+        // Frame 40 lasts until the next shown frame, not the hidden one.
+        assert_eq!(vp8.presentation_sample(1).unwrap().duration, 40);
+        let samples = block_on(vp8.to_encoded_video_samples(&source, &Limits::default())).unwrap();
+        assert_eq!(
+            samples
+                .iter()
+                .map(|sample| sample.presentation_index.0)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 4, 2, 5, 3]
+        );
+        assert_eq!(demuxer.tracks[1].presentation_order, vec![0, 1]);
+    }
+
+    #[test]
     fn block_groups_are_keyframes_unless_they_reference_a_block() {
         let group = |relative: i16, reference: bool, duration: Option<u64>| {
             let mut payload = Vec::new();
