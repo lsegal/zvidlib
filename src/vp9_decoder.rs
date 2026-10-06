@@ -35,7 +35,9 @@ use crate::{
 ///
 /// `Prefer` and `Require` select a hardware decoder where the host has one
 /// that decodes VP9 profile 0 at the configured size: NVIDIA NVDEC on 64-bit
-/// Windows and Linux, and VideoToolbox on Macs whose media engine decodes VP9.
+/// Windows and Linux, then Media Foundation on Windows adapters that expose the
+/// D3D11 VP9 profile 0 decoder, and VideoToolbox on Macs whose media engine
+/// decodes VP9.
 /// `Prefer` falls back to the dependency-free software
 /// decoder when none is available, and `Require` reports
 /// [`CodecSupport::HardwareUnavailable`]. `Avoid` always selects software.
@@ -140,6 +142,10 @@ fn hardware_available(_configuration: &VideoDecoderConfig) -> bool {
     if crate::hevc::nvdec::is_vp9_available(_configuration.coded_dimensions) {
         return true;
     }
+    #[cfg(windows)]
+    if crate::hevc::windows_mf::is_vp9_available(_configuration.coded_dimensions) {
+        return true;
+    }
     #[cfg(target_os = "macos")]
     if crate::hevc::videotoolbox_vp9::is_vp9_available(_configuration.coded_dimensions) {
         return true;
@@ -155,7 +161,8 @@ fn create_hardware(
 ) -> std::result::Result<Box<dyn VideoDecoder>, Vec<String>> {
     #[cfg_attr(
         not(any(
-            all(any(windows, target_os = "linux"), target_pointer_width = "64"),
+            windows,
+            all(target_os = "linux", target_pointer_width = "64"),
             target_os = "macos"
         )),
         allow(unused_mut)
@@ -165,6 +172,11 @@ fn create_hardware(
     match crate::hevc::nvdec::create_vp9(_configuration, _limits) {
         Ok(decoder) => return Ok(decoder),
         Err(error) => errors.push(format!("NVDEC: {}", error.message())),
+    }
+    #[cfg(windows)]
+    match crate::hevc::windows_mf::create_vp9(_configuration, _limits) {
+        Ok(decoder) => return Ok(decoder),
+        Err(error) => errors.push(format!("Media Foundation: {}", error.message())),
     }
     #[cfg(target_os = "macos")]
     match crate::hevc::videotoolbox_vp9::create_vp9(_configuration, _limits) {
@@ -444,5 +456,151 @@ mod tests {
         assert_eq!(matrix_for(2), MatrixCoefficients::Bt709);
         assert_eq!(matrix_for(3), MatrixCoefficients::Bt601);
         assert_eq!(matrix_for(5), MatrixCoefficients::Bt2020Ncl);
+    }
+
+    /// Each hardware backend on its own, held to the software decoder.
+    ///
+    /// `tests/vp9_hardware.rs` checks whichever backend the factory selects,
+    /// which is NVDEC on a host that has both it and Media Foundation; this
+    /// reaches every backend the host has. For each fixture, every frame of one
+    /// uninterrupted decode and of `ExactFrameReader`'s sequential, reverse and
+    /// alternating seeks must match the software decoder's, and so must every
+    /// reference slot shown again by `show_existing_frame`. A backend the host
+    /// lacks is skipped with the reason.
+    #[cfg(any(
+        windows,
+        all(target_os = "linux", target_pointer_width = "64"),
+        target_os = "macos"
+    ))]
+    #[test]
+    fn each_hardware_backend_matches_the_software_decoder_and_seeks_exactly() {
+        use crate::{
+            ExpectedVideoFrame, FrameDigest, FrameIndex, VideoDecoderConformanceVector,
+            verify_video_decoder_conformance,
+        };
+
+        type Create = fn(&VideoDecoderConfig, &Limits) -> Result<Box<dyn VideoDecoder>>;
+
+        struct Backend(Create);
+
+        impl VideoDecoderFactory for Backend {
+            fn capability(&self, _configuration: &VideoDecoderConfig) -> CodecSupport {
+                CodecSupport::Supported {
+                    implementation: CodecImplementation::Hardware,
+                }
+            }
+
+            fn create(
+                &self,
+                configuration: &VideoDecoderConfig,
+                limits: &Limits,
+            ) -> Result<Box<dyn VideoDecoder>> {
+                (self.0)(configuration, limits)
+            }
+        }
+
+        fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
+            use std::task::{Context, Poll, Waker};
+            let mut context = Context::from_waker(Waker::noop());
+            let mut future = Box::pin(future);
+            loop {
+                if let Poll::Ready(value) = future.as_mut().poll(&mut context) {
+                    return value;
+                }
+            }
+        }
+
+        let mut backends: Vec<(&str, Create)> = Vec::new();
+        #[cfg(all(any(windows, target_os = "linux"), target_pointer_width = "64"))]
+        backends.push(("NVDEC", crate::hevc::nvdec::create_vp9));
+        #[cfg(windows)]
+        backends.push(("Media Foundation", crate::hevc::windows_mf::create_vp9));
+        #[cfg(target_os = "macos")]
+        backends.push(("VideoToolbox", crate::hevc::videotoolbox_vp9::create_vp9));
+
+        let limits = Limits::default();
+        let mut streams = Vec::new();
+        for (name, file) in [
+            (
+                "VP9 256x144 with hidden frames",
+                &include_bytes!("../tests/fixtures/codec/vp9_bbb_256x144.mp4")[..],
+            ),
+            (
+                "VP9 250x142",
+                &include_bytes!("../tests/fixtures/codec/vp9_bbb_250x142.mp4")[..],
+            ),
+        ] {
+            let source = crate::io::MemorySource::new(file.to_vec());
+            let movie = block_on(crate::Mp4Demuxer::open(&source, Default::default())).unwrap();
+            let track = movie.track(1).unwrap();
+            let configuration = VideoDecoderConfig {
+                codec: Codec::Vp9,
+                profile: CodecProfile::Vp9Profile0,
+                coded_dimensions: track.dimensions.unwrap(),
+                output_format: PixelFormat::Rgba8,
+                color_range: ColorRange::Limited,
+                hardware: HardwarePreference::Avoid,
+                configuration: track.decoder_config.clone(),
+            };
+            let samples = block_on(track.to_encoded_video_samples(&source, &limits)).unwrap();
+            streams.push((name, configuration, samples));
+        }
+        // The first frames of the first fixture, then each reference slot shown
+        // again by a one-byte `show_existing_frame` chunk: frame marker 2,
+        // profile 0, show_existing_frame 1, then the slot.
+        let (_, configuration, samples) = &streams[0];
+        let mut existing = samples[..4].to_vec();
+        for slot in 0..8u8 {
+            existing.push(EncodedVideoSample {
+                presentation_index: FrameIndex(existing.len() as u64),
+                random_access: false,
+                data: vec![0x88 | slot],
+            });
+        }
+        streams.push(("VP9 show_existing_frame", configuration.clone(), existing));
+
+        let cancellation = CancellationToken::new();
+        let software = native_vp9_video_decoder_factory();
+        for (backend, create) in backends {
+            let factory = Backend(create);
+            if let Err(error) = factory.create(&streams[0].1, &limits) {
+                eprintln!("skipping {backend}: hardware VP9 decoding unavailable: {error}");
+                continue;
+            }
+            for (name, configuration, samples) in &streams {
+                let decode = |factory: &dyn VideoDecoderFactory| {
+                    let mut decoder = factory.create(configuration, &limits).unwrap();
+                    let mut digests = Vec::new();
+                    for sample in samples {
+                        let outputs = decoder
+                            .submit(sample, &cancellation)
+                            .unwrap_or_else(|error| panic!("{backend} {name}: {error}"));
+                        assert_eq!(outputs.len(), 1, "{backend} {name}");
+                        assert_eq!(outputs[0].presentation_index, sample.presentation_index);
+                        digests.push(FrameDigest::from_frame(&outputs[0].frame).unwrap());
+                    }
+                    assert!(decoder.drain(&cancellation).unwrap().is_empty());
+                    digests
+                };
+                let expected = decode(&software);
+                assert_eq!(decode(&factory), expected, "{backend} {name}");
+                let vector = VideoDecoderConformanceVector {
+                    name: (*name).into(),
+                    configuration: configuration.clone(),
+                    expected_frames: expected
+                        .iter()
+                        .enumerate()
+                        .map(|(index, &digest)| ExpectedVideoFrame {
+                            presentation_index: FrameIndex(index as u64),
+                            digest,
+                        })
+                        .collect(),
+                    samples: samples.clone(),
+                };
+                verify_video_decoder_conformance(&factory, &vector, limits)
+                    .unwrap_or_else(|error| panic!("{backend} {name}: {error}"));
+            }
+            eprintln!("{backend}: every VP9 frame matches the software decoder");
+        }
     }
 }

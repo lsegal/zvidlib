@@ -87,21 +87,22 @@ pub(super) fn nv12_to_planar(
     Ok([luma, u, v])
 }
 
-/// Crops a VP9 picture from an NV12 surface (laid out as [`nv12_to_planar`] takes it) to the size
-/// its header gave it, and converts it with the colour its header named, as the software decoder
-/// converts its own pictures.
+/// The size a VP9 frame's header gives it, which its picture is cropped to.
+pub(super) fn vp9_dimensions(shape: FrameShape, limits: &Limits) -> Result<VideoDimensions> {
+    VideoDimensions::new(shape.width as u32, shape.height as u32, limits)
+}
+
+/// Converts a VP9 picture, cropped to [`vp9_dimensions`], with the colour its header named, as
+/// the software decoder converts its own pictures.
 pub(super) fn vp9_frame(
-    data: &[u8],
-    pitch: usize,
-    surface_height: usize,
+    planes: [Vec<u8>; 3],
     shape: FrameShape,
     limits: &Limits,
 ) -> Result<VideoFrame> {
-    let dimensions = VideoDimensions::new(shape.width as u32, shape.height as u32, limits)?;
     let picture = DecodedPicture {
         width: shape.width,
         height: shape.height,
-        planes: nv12_to_planar(data, pitch, surface_height, dimensions)?,
+        planes,
         color_space: shape.color_space,
         full_range: shape.full_range,
     };

@@ -14,7 +14,9 @@ use std::thread::{self, JoinHandle};
 use libloading::Library;
 
 use super::engine::hvcc::{HvccRecord, split_length_prefixed};
-use super::planar::{PlanarConverter, nv12_to_planar, vp8_frame_is_shown, vp8_sample, vp9_frame};
+use super::planar::{
+    PlanarConverter, nv12_to_planar, vp8_frame_is_shown, vp8_sample, vp9_dimensions, vp9_frame,
+};
 use super::readback;
 use crate::vp9_dec::{ChunkInspector, FrameShape, chunk_frames};
 use crate::{
@@ -608,13 +610,13 @@ impl NvDecoderCore {
                     )?,
                     Bitstream::Vp9 { .. } => {
                         let shape = shapes.next().expect("one shape per read-back frame");
-                        vp9_frame(
+                        let planes = nv12_to_planar(
                             &raw.data,
                             raw.pitch,
                             raw.surface_height,
-                            shape,
-                            &self.limits,
-                        )?
+                            vp9_dimensions(shape, &self.limits)?,
+                        )?;
+                        vp9_frame(planes, shape, &self.limits)?
                     }
                 };
                 Ok(DecodedVideoFrame {
