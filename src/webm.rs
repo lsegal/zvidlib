@@ -8,9 +8,9 @@
 //! [`crate::WebmDemuxer`] without a remux.
 //!
 //! WebM permits only VP8, VP9 and AV1 video and Vorbis or Opus audio. zvidlib
-//! encodes AV1 video and Opus and Vorbis audio, so those are what it writes:
-//! an AAC track is refused rather than written into a file no WebM player
-//! would accept.
+//! encodes VP8 and AV1 video and Opus and Vorbis audio, so those are what it
+//! writes: an AAC track is refused rather than written into a file no WebM
+//! player would accept.
 //!
 //! An audio track's encoder delay is written as its `CodecDelay` and its end
 //! padding as its last block's `DiscardPadding`, so a reader trims the decoded
@@ -503,7 +503,7 @@ fn validate_track_config(config: &Mp4TrackConfig) -> Result<()> {
         return Err(invalid("a WebM track timescale must be nonzero"));
     }
     match (config.encoder.codec, config.format) {
-        (Codec::Av1, Mp4TrackFormat::Video(_)) => {}
+        (Codec::Av1 | Codec::Vp8, Mp4TrackFormat::Video(_)) => {}
         (Codec::Opus | Codec::Vorbis, Mp4TrackFormat::Audio { channels }) => {
             let declared = match config.encoder.codec {
                 Codec::Opus => {
@@ -552,8 +552,8 @@ fn codec_delay(config: &Mp4TrackConfig) -> Result<u32> {
     }
 }
 
-/// The track's `CodecID` and `CodecPrivate`. A V_VP8 or V_VP9 arm joins V_AV1
-/// here once zvidlib encodes them (the sibling sub-issues of #523).
+/// The track's `CodecID` and `CodecPrivate`. A V_VP9 arm joins these once
+/// zvidlib encodes VP9 (a sibling sub-issue of #523).
 fn codec_private(config: &Mp4TrackConfig) -> Result<(&'static str, Vec<u8>)> {
     match config.encoder.codec {
         Codec::Av1 => {
@@ -571,6 +571,14 @@ fn codec_private(config: &Mp4TrackConfig) -> Result<(&'static str, Vec<u8>)> {
             }
             // WebM's CodecPrivate is the AV1CodecConfigurationRecord itself.
             Ok(("V_AV1", whole[8..].to_vec()))
+        }
+        // VP8 carries everything a decoder needs in its key frames, so the
+        // Matroska VP8 mapping has no CodecPrivate.
+        Codec::Vp8 => {
+            if !config.encoder.decoder_config.is_empty() {
+                return Err(invalid("VP8 has no codec configuration record"));
+            }
+            Ok(("V_VP8", Vec::new()))
         }
         // The Matroska Opus mapping's CodecPrivate is the RFC 7845 OpusHead.
         Codec::Opus => Ok((
@@ -661,7 +669,9 @@ fn tracks_element(configs: &[Mp4TrackConfig]) -> Result<Vec<u8>> {
                 write_uint(&mut entry, ebml::TRACK_TYPE, ebml::TRACK_TYPE_VIDEO);
                 write_uint(&mut entry, ebml::FLAG_LACING, 0);
                 write_string(&mut entry, ebml::CODEC_ID, codec_id);
-                write_element(&mut entry, ebml::CODEC_PRIVATE, &private);
+                if !private.is_empty() {
+                    write_element(&mut entry, ebml::CODEC_PRIVATE, &private);
+                }
                 let mut video = Vec::new();
                 write_uint(&mut video, ebml::PIXEL_WIDTH, u64::from(dimensions.width));
                 write_uint(&mut video, ebml::PIXEL_HEIGHT, u64::from(dimensions.height));

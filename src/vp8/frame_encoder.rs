@@ -48,9 +48,13 @@ struct Quantizer {
     y1: [i32; 2],
     y2: [i32; 2],
     uv: [i32; 2],
-    /// The rate-distortion multiplier, in distortion units per 1/256 bit.
+    /// The rate-distortion multiplier for SATD and SAD, in distortion units
+    /// per 1/256 bit.
     lambda: u32,
-    /// The multiplier for squared-error distortion.
+    /// The multiplier for squared-error distortion. It is well below the
+    /// textbook `0.85 * step^2 / 4`: a residual skipped in a frame later
+    /// frames predict from is paid for again in each of them, and on test
+    /// content this setting gives the best quality for its bit rate.
     sse_lambda: u32,
 }
 
@@ -63,8 +67,8 @@ impl Quantizer {
             y1: [dc, ac],
             y2: [dc * 2, (ac * 155 / 100).max(8)],
             uv: [dc.min(132), ac],
-            lambda: (ac as u32 * 5 / 8).max(1),
-            sse_lambda: (ac * ac / 5).max(1) as u32,
+            lambda: (ac as u32 / 2).max(1),
+            sse_lambda: (ac * ac / 25).max(1) as u32,
         }
     }
 
@@ -404,7 +408,15 @@ impl FrameEncoder {
         }
 
         if macroblock.info.reference != INTRA_FRAME
-            && !residual_pays(source, frame, quantizer, &macroblock, &dequantized, mb_x, mb_y)
+            && !residual_pays(
+                source,
+                frame,
+                quantizer,
+                &macroblock,
+                &dequantized,
+                mb_x,
+                mb_y,
+            )
         {
             macroblock.levels = [[0; 16]; 25];
             dequantized = [[0; 16]; 25];
@@ -705,7 +717,7 @@ fn loop_filter_level(q: u8) -> u8 {
     if q < 4 {
         0
     } else {
-        (u32::from(q) * 3 / 8 + 2).min(63) as u8
+        (u32::from(q) * 5 / 16 + 2).min(63) as u8
     }
 }
 
@@ -1455,9 +1467,9 @@ fn quantize(coefficients: &[i16; 16], factors: [i32; 2], first: usize) -> ([i16;
     for (index, &position) in ZIGZAG.iter().enumerate().skip(first) {
         let step = factors[usize::from(index > 0)];
         let value = i32::from(coefficients[position]);
-        // A dead zone a little wider than rounding to nearest: small
-        // coefficients cost more to code than they return.
-        let bias = if index == 0 { step / 2 } else { step * 3 / 8 };
+        // A dead zone wider than rounding to nearest: small coefficients
+        // cost more to code than they return.
+        let bias = if index == 0 { step / 2 } else { step / 4 };
         let level = ((value.abs() + bias) / step).min(2048);
         let level = if value < 0 { -level } else { level };
         levels[position] = level as i16;
@@ -1633,8 +1645,12 @@ mod tests {
         let (width, height) = (128, 96);
         let mut encoder = FrameEncoder::new(width, height);
         let key = encoder.encode(&source(width, height, 0), true, 24).unwrap();
-        let still = encoder.encode(&source(width, height, 0), false, 24).unwrap();
-        let moved = encoder.encode(&source(width, height, 1), false, 24).unwrap();
+        let still = encoder
+            .encode(&source(width, height, 0), false, 24)
+            .unwrap();
+        let moved = encoder
+            .encode(&source(width, height, 1), false, 24)
+            .unwrap();
         // An unchanged picture skips nearly every macroblock.
         assert!(still.len() * 20 < key.len(), "still {} bytes", still.len());
         assert!(

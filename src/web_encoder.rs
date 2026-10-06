@@ -63,7 +63,9 @@ pub fn video_encode_capability(
 ) -> CodecSupport {
     let supported = matches!(
         (codec, profile),
-        (Codec::Av1, CodecProfile::Av1Main) | (Codec::Hevc, CodecProfile::HevcMain)
+        (Codec::Av1, CodecProfile::Av1Main)
+            | (Codec::Hevc, CodecProfile::HevcMain)
+            | (Codec::Vp8, CodecProfile::Vp8)
     );
     if !supported {
         return CodecSupport::UnsupportedProfile;
@@ -103,7 +105,7 @@ pub struct WebVideoEncodeSession {
 }
 
 impl WebVideoEncodeSession {
-    /// Opens a session targeting `codec` (AV1 Main or HEVC Main) at
+    /// Opens a session targeting `codec` (AV1 Main, HEVC Main or VP8) at
     /// `width`x`height`, timestamps and durations given in microseconds.
     pub async fn open(
         codec: Codec,
@@ -117,16 +119,16 @@ impl WebVideoEncodeSession {
             // starting point for `configure()`: like AV1, the real profile
             // and level are read back from what the encoder actually emits.
             Codec::Hevc => "hev1.1.6.L93.B0",
+            Codec::Vp8 => "vp8",
             Codec::UncompressedVideo
             | Codec::H264
-            | Codec::Vp8
             | Codec::Vp9
             | Codec::Aac
             | Codec::Opus
             | Codec::Vorbis => {
                 return Err(Error::new(
                     ErrorKind::Unsupported,
-                    "the WebCodecs video encoder bridge only supports AV1 and HEVC",
+                    "the WebCodecs video encoder bridge only supports AV1, HEVC and VP8",
                 ));
             }
         };
@@ -310,13 +312,15 @@ impl WebVideoEncodeSession {
         // real `av1C` is derived from the key chunk's own bytes. HEVC's
         // parameter sets are genuinely out-of-band, so its `hvcC` is instead
         // read from `EncodedVideoChunkMetadata.decoderConfig.description`.
+        // VP8 has no configuration record at all: its key frames carry
+        // everything a decoder needs.
         let decoder_config = if !self.emitted_config && is_sync {
             let config = match self.codec {
                 Codec::Av1 => av1c_from_bitstream(&data),
                 Codec::Hevc => hvcc_from_metadata(&metadata),
+                Codec::Vp8 => Some(Vec::new()),
                 Codec::UncompressedVideo
                 | Codec::H264
-                | Codec::Vp8
                 | Codec::Vp9
                 | Codec::Aac
                 | Codec::Opus

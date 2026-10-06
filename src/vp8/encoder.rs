@@ -12,7 +12,7 @@ use crate::{
 
 /// The quantizer index an empty configuration encodes at: visually close to
 /// the source at a moderate bit rate.
-const DEFAULT_QUANTIZER: u8 = 24;
+const DEFAULT_QUANTIZER: u8 = 32;
 
 /// The largest width or height a VP8 key frame header can carry.
 const MAX_DIMENSION: u32 = 16_383;
@@ -446,7 +446,7 @@ fn source_planes(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::{CpuFrameSource, Plane as FramePlane, VideoDimensions};
     use std::future::Future;
@@ -463,7 +463,11 @@ mod tests {
         }
     }
 
-    fn configuration(width: u32, height: u32, configuration: Vec<u8>) -> VideoEncoderConfig {
+    pub(in crate::vp8) fn configuration(
+        width: u32,
+        height: u32,
+        configuration: Vec<u8>,
+    ) -> VideoEncoderConfig {
         VideoEncoderConfig {
             codec: Codec::Vp8,
             profile: CodecProfile::Vp8,
@@ -479,7 +483,7 @@ mod tests {
 
     /// A moving gradient with a bright square, so frames have both texture
     /// and motion.
-    pub(crate) fn test_frame(width: u32, height: u32, index: u32) -> VideoFrame {
+    pub(in crate::vp8) fn test_frame(width: u32, height: u32, index: u32) -> VideoFrame {
         let mut data = vec![0u8; (width * height * 4) as usize];
         for y in 0..height {
             for x in 0..width {
@@ -512,7 +516,10 @@ mod tests {
         .unwrap()
     }
 
-    pub(crate) fn encode(config: &VideoEncoderConfig, frames: &[VideoFrame]) -> Vec<EncodedSample> {
+    pub(in crate::vp8) fn encode(
+        config: &VideoEncoderConfig,
+        frames: &[VideoFrame],
+    ) -> Vec<EncodedSample> {
         let mut encoder = native_vp8_video_encoder_factory()
             .create(config, &Limits::default())
             .unwrap();
