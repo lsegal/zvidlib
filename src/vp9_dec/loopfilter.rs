@@ -11,7 +11,7 @@ use super::tables::UV_TXSIZE_LOOKUP;
 /// The edge masks of one 64x64 superblock (`LOOP_FILTER_MASK`): one bit per
 /// 8x8 luma block (row-major, low bit first) or per 8x8 chroma block.
 #[derive(Clone, Copy, Debug)]
-pub(super) struct LoopFilterMask {
+pub(crate) struct LoopFilterMask {
     left_y: [u64; 4],
     above_y: [u64; 4],
     int_4x4_y: u64,
@@ -97,16 +97,16 @@ const LEFT_BORDER_UV: u16 = 0x1111;
 const ABOVE_BORDER_UV: u16 = 0x000f;
 
 /// The facts about one decoded block the masks are built from.
-pub(super) struct MaskBlock {
-    pub(super) sb_type: u8,
-    pub(super) tx_size: u8,
-    pub(super) skip_inter: bool,
-    pub(super) filter_level: u8,
+pub(crate) struct MaskBlock {
+    pub(crate) sb_type: u8,
+    pub(crate) tx_size: u8,
+    pub(crate) skip_inter: bool,
+    pub(crate) filter_level: u8,
 }
 
 /// `vp9_build_mask`: adds one block, of `bw`x`bh` 8x8 units at
 /// (`mi_row`, `mi_col`), to its superblock's masks.
-pub(super) fn build_mask(
+pub(crate) fn build_mask(
     lfm: &mut LoopFilterMask,
     block: &MaskBlock,
     mi_row: usize,
@@ -583,16 +583,16 @@ fn filter_selectively_horiz(
 }
 
 /// One plane of the frame being filtered.
-pub(super) struct FilterPlane<'a> {
-    pub(super) data: &'a mut [u8],
-    pub(super) stride: usize,
+pub(crate) struct FilterPlane<'a> {
+    pub(crate) data: &'a mut [u8],
+    pub(crate) stride: usize,
     /// The index of the plane's top-left pixel in `data`.
-    pub(super) origin: usize,
+    pub(crate) origin: usize,
 }
 
 /// Filters the whole frame (`loop_filter_rows` over every superblock row
 /// with the 4:2:0 path).
-pub(super) fn filter_frame(
+pub(crate) fn filter_frame(
     planes: &mut [FilterPlane; 3],
     masks: &mut [LoopFilterMask],
     mi_rows: usize,
