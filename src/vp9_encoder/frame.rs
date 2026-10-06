@@ -329,7 +329,7 @@ impl<'a> FrameEncoder<'a> {
     /// can signal, and the filter stays off. There the greedy search keeps
     /// choosing levels that lower each frame's own error, but the smoothed
     /// references make the frames after them larger and blurrier: on a
-    /// panning test card the whole sequence came out up to a quarter larger
+    /// panning test card the whole sequence came out over a quarter larger
     /// at lower PSNR than with no filter at all, and it bought at most a
     /// sixth of a decibel on other content.
     fn apply_loop_filter(&mut self) {
