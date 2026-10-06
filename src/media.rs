@@ -50,6 +50,10 @@ pub enum Codec {
     H264,
     Hevc,
     Av1,
+    /// VP8 video, as carried in WebM (`V_VP8`). It has no decoder
+    /// configuration record. [`crate::native_vp8_video_decoder_factory`]
+    /// decodes it; no encoder factory accepts it.
+    Vp8,
     Aac,
 }
 
