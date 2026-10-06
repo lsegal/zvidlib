@@ -107,9 +107,9 @@ simd::set_override(None);                  // back to per-host detection
 ```
 
 `set_override` reaches every dispatch family at once: the AV1 transforms and
-in-loop filters, AV1 motion compensation, AV1 intra prediction, and every HEVC
+in-loop filters, AV1 motion compensation, AV1 intra prediction, every HEVC
 engine kernel (inter/intra prediction, in-loop filters, inverse transforms, and
-encoder-side distortion metrics). An instruction set this host cannot execute is
+encoder-side distortion metrics), and the VP9 encoder's kernels. An instruction set this host cannot execute is
 clamped to `SimdIsa::Scalar` rather than silently ignored, so the arm you asked
 for is always a defined one. `simd::active()` reports what is in force and
 `simd::available()` lists what this host can run.
@@ -1679,6 +1679,44 @@ are near parity with their scalar reference on some hosts — the HEVC arms come
 out roughly even on Apple Silicon, where LLVM auto-vectorizes the scalar code
 well under `lto = "fat"`, while AV1 deblocking and motion compensation on the
 same host are 2.4-4.9x. `active_by_site()` answers the question directly.
+
+## The VP9 encoder suite (`--bench vp9_encode`)
+
+`benches/vp9_encode.rs` measures the native VP9 encoder on the same two axes as
+the AV1 and HEVC encoder suites. Every group is a per-ISA group, guarded for
+bit-exactness and for the override reaching every dispatch site, and all of
+them run at 640x360 on the synthetic content from `benches/support`:
+
+| Group | Stage |
+| --- | --- |
+| `vp9_encode_key_frame` | one RGBA8 key frame through `native_vp9_video_encoder_factory`: input conversion and the intra search |
+| `vp9_encode_sequence` | a key frame and three inter frames, which adds the motion search |
+| `vp9_encode_stage_fdct_quant_{4x4,8x8,16x16,32x32}` | residual, forward transform and quantization of every block of a plane, cycling the four transform types below 32x32 |
+| `vp9_encode_stage_sad` | a 9x9-candidate whole-sample motion search per 16x16 block, with the encoder's early exit |
+| `vp9_encode_stage_sse` | squared error per 8x8 block and over the whole plane, as mode decisions and the loop filter level search take it |
+| `vp9_encode_stage_inter_pred` | 8-tap sub-sample motion compensation of every 16x16 block, half of them past the plane's edges |
+| `vp9_encode_stage_tm_pred` | TM intra prediction of every 16x16 block |
+| `vp9_encode_stage_rgba_to_yuv420` | RGBA8 to the encoder's 8-aligned 4:2:0 source picture |
+
+The stage groups reach the kernels through `zvidlib::vp9_encoder_bench`, the
+`#[doc(hidden)]` per-stage access that is the VP9 counterpart to
+`hevc_encoder_bench`, and they call the same entry points the search does.
+Every group is attributed to the `vp9_encode` dispatch site.
+
+The whole-frame groups also spend time the `vp9_encode` site does not reach:
+bit costing, mode and partition bookkeeping, and the inverse transforms and
+loop filter, which are the VP9 decoder's own kernels and are vectorized with
+the decoder (#570). Their ratio is therefore smaller than any stage's.
+
+There is no AVX2 SAD kernel. The early exit needs the sum as a scalar after
+every row, and at the 8- to 64-wide rows the search uses, a 256-bit load, its
+lane fold and the `vzeroupper` on return measured slower than the 128-bit loop.
+AVX2 hosts run the SSE2 kernel, which is inlined into the dispatcher, because
+the search often exits after one or two rows, where a call into a
+`#[target_feature]` function costs more than the row. The squared-error kernel
+uses AVX2 only for rows of 32 samples or more, and the TM predictor,
+residual and chroma conversion have no wider formulation, so their AVX2 arms
+run the SSE4.1 code.
 
 ## What a drag preview cadence cost the frame under the pointer (removed)
 
