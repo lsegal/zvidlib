@@ -3,6 +3,7 @@
 //! code so results are bit-exact.
 
 use super::os::rint;
+use crate::simd::SimdIsa;
 use std::f64::consts::PI;
 
 const C_PI3_8: f32 = 0.382_683_43;
@@ -12,11 +13,11 @@ const C_PI1_8: f32 = 0.923_879_5;
 /// Port of `mdct_lookup` (mdct.h).
 #[derive(Debug, Clone)]
 pub(crate) struct MdctLookup {
-    n: usize,
-    log2n: i32,
-    trig: Vec<f32>,
-    bitrev: Vec<i32>,
-    scale: f32,
+    pub(super) n: usize,
+    pub(super) log2n: i32,
+    pub(super) trig: Vec<f32>,
+    pub(super) bitrev: Vec<i32>,
+    pub(super) scale: f32,
 }
 
 impl MdctLookup {
@@ -64,8 +65,14 @@ impl MdctLookup {
     }
 
     /// Port of mdct.c `mdct_forward`: `out` receives n/2 coefficients.
-    /// `w` is scratch space of at least n floats.
-    pub(crate) fn forward(&self, input: &[f32], out: &mut [f32], w: &mut [f32]) {
+    /// `w` is scratch space of at least n floats. Runs the `isa` kernels of
+    /// [`super::simd`], which agree with [`Self::forward_scalar`] bit for bit.
+    pub(crate) fn forward(&self, isa: SimdIsa, input: &[f32], out: &mut [f32], w: &mut [f32]) {
+        super::simd::mdct_forward(isa, self, input, out, w);
+    }
+
+    /// The scalar reference for [`Self::forward`].
+    pub(super) fn forward_scalar(&self, input: &[f32], out: &mut [f32], w: &mut [f32]) {
         let n = self.n;
         let n2 = n >> 1;
         let n4 = n >> 2;
@@ -350,7 +357,7 @@ fn butterfly_16(x: &mut [f32]) {
 
 /// Port of mdct.c `mdct_butterfly_32`.
 #[inline]
-fn butterfly_32(x: &mut [f32]) {
+pub(super) fn butterfly_32(x: &mut [f32]) {
     let r0 = x[30] - x[14];
     let r1 = x[31] - x[15];
 
@@ -434,7 +441,7 @@ mod tests {
                 .collect();
             let mut out = vec![0f32; n / 2];
             let mut w = vec![0f32; n];
-            m.forward(&x, &mut out, &mut w);
+            m.forward_scalar(&x, &mut out, &mut w);
             for (k, &got) in out.iter().enumerate() {
                 let mut acc = 0f64;
                 for (i, &xi) in x.iter().enumerate() {

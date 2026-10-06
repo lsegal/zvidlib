@@ -6,6 +6,7 @@ use super::bitpack::OggPackBuffer;
 use super::codebook::Codebook;
 use super::os::{ilog, rint};
 use super::tables::types::InfoFloor1;
+use crate::simd::SimdIsa;
 
 const VIF_POSIT: usize = 63;
 
@@ -110,8 +111,9 @@ impl LookFloor1 {
 
     /// Port of floor1.c `floor1_fit`. Returns the fitted posts (with 0x8000
     /// marking posts that interpolation predicts), or `None` for an all-zero
-    /// (unused) floor.
-    pub(crate) fn fit(&self, logmdct: &[f32], logmask: &[f32]) -> Option<Vec<i32>> {
+    /// (unused) floor. The accumulation runs the `isa` kernels of
+    /// [`super::simd`], which agree with [`accumulate_fit_scalar`] exactly.
+    pub(crate) fn fit(&self, isa: SimdIsa, logmdct: &[f32], logmask: &[f32]) -> Option<Vec<i32>> {
         let info = &self.vi;
         let n = self.n;
         let posts = self.posts;
@@ -126,10 +128,11 @@ impl LookFloor1 {
         // quantize the relevant floor points and collect them into line fit
         // structures (one per minimal division) at the same time
         if posts == 0 {
-            nonzero += accumulate_fit(logmask, logmdct, 0, n, &mut fits[0], n, info);
+            nonzero += accumulate_fit(isa, logmask, logmdct, 0, n, &mut fits[0], n, info);
         } else {
             for (i, fit) in fits.iter_mut().enumerate().take(posts - 1) {
                 nonzero += accumulate_fit(
+                    isa,
                     logmask,
                     logmdct,
                     self.sorted_index[i],
@@ -484,8 +487,29 @@ fn render_line0(n: i32, x0: i32, x1: i32, y0: i32, y1: i32, d: &mut [i32]) {
     }
 }
 
+/// The sums `accumulate_fit` collects over a run of bins, for the "a" points
+/// (where the spectrum comes within `twofitatten` of the mask) and the "b"
+/// points (the rest), skipping bins whose mask quantizes to zero.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct FitSums {
+    pub(super) xa: i32,
+    pub(super) ya: i32,
+    pub(super) x2a: i32,
+    pub(super) y2a: i32,
+    pub(super) xya: i32,
+    pub(super) na: i32,
+    pub(super) xb: i32,
+    pub(super) yb: i32,
+    pub(super) x2b: i32,
+    pub(super) y2b: i32,
+    pub(super) xyb: i32,
+    pub(super) nb: i32,
+}
+
 /// Port of floor1.c `accumulate_fit`. Returns the number of "a" points.
+#[allow(clippy::too_many_arguments)]
 fn accumulate_fit(
+    isa: SimdIsa,
     flr: &[f32],
     mdct: &[f32],
     x0: i32,
@@ -494,51 +518,61 @@ fn accumulate_fit(
     n: i32,
     info: &InfoFloor1,
 ) -> i32 {
-    let (mut xa, mut ya, mut x2a, mut y2a, mut xya, mut na) = (0i32, 0i32, 0i32, 0i32, 0i32, 0i32);
-    let (mut xb, mut yb, mut x2b, mut y2b, mut xyb, mut nb) = (0i32, 0i32, 0i32, 0i32, 0i32, 0i32);
-
     *a = LsfitAcc::default();
     a.x0 = x0;
     a.x1 = x1;
     let x1 = if x1 >= n { n - 1 } else { x1 };
 
+    let s = super::simd::accumulate_fit(isa, flr, mdct, x0, x1, info.twofitatten);
+
+    a.xa = s.xa;
+    a.ya = s.ya;
+    a.x2a = s.x2a;
+    a.y2a = s.y2a;
+    a.xya = s.xya;
+    a.an = s.na;
+
+    a.xb = s.xb;
+    a.yb = s.yb;
+    a.x2b = s.x2b;
+    a.y2b = s.y2b;
+    a.xyb = s.xyb;
+    a.bn = s.nb;
+
+    s.na
+}
+
+/// The loop of `accumulate_fit` over bins `x0..=x1`.
+pub(super) fn accumulate_fit_scalar(
+    flr: &[f32],
+    mdct: &[f32],
+    x0: i32,
+    x1: i32,
+    twofitatten: f32,
+) -> FitSums {
+    let mut s = FitSums::default();
     for i in x0..=x1 {
         let iu = i as usize;
         let quantized = db_quant(flr[iu]);
         if quantized != 0 {
-            if mdct[iu] + info.twofitatten >= flr[iu] {
-                xa += i;
-                ya += quantized;
-                x2a += i * i;
-                y2a += quantized * quantized;
-                xya += i * quantized;
-                na += 1;
+            if mdct[iu] + twofitatten >= flr[iu] {
+                s.xa += i;
+                s.ya += quantized;
+                s.x2a += i * i;
+                s.y2a += quantized * quantized;
+                s.xya += i * quantized;
+                s.na += 1;
             } else {
-                xb += i;
-                yb += quantized;
-                x2b += i * i;
-                y2b += quantized * quantized;
-                xyb += i * quantized;
-                nb += 1;
+                s.xb += i;
+                s.yb += quantized;
+                s.x2b += i * i;
+                s.y2b += quantized * quantized;
+                s.xyb += i * quantized;
+                s.nb += 1;
             }
         }
     }
-
-    a.xa = xa;
-    a.ya = ya;
-    a.x2a = x2a;
-    a.y2a = y2a;
-    a.xya = xya;
-    a.an = na;
-
-    a.xb = xb;
-    a.yb = yb;
-    a.x2b = x2b;
-    a.y2b = y2b;
-    a.xyb = xyb;
-    a.bn = nb;
-
-    na
+    s
 }
 
 /// Port of floor1.c `fit_line`. Returns `true` when the fit is degenerate

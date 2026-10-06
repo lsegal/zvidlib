@@ -40,7 +40,8 @@
 //! distributed under the BSD-3-Clause license; this port and the generated
 //! tables are derived from it under the same terms.
 
-#![forbid(unsafe_code)]
+// Only the `simd` kernels may use `unsafe`; everything else stays safe code.
+#![deny(unsafe_code)]
 
 mod bitpack;
 mod block;
@@ -55,6 +56,8 @@ mod os;
 mod psy;
 mod res0;
 mod setup;
+#[allow(unsafe_code)]
+mod simd;
 mod smallft;
 mod tables;
 #[cfg(test)]
