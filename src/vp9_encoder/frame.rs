@@ -31,8 +31,8 @@
 
 use super::bitwriter::{BitCost, BitWriter, BoolEncoder, BoolSink, bit_cost};
 use super::dsp::{
-    IntraMode, ReferencePlane, TxType, forward_transform, inverse_transform_add, predict_inter,
-    predict_intra,
+    IntraMode, ReferencePlane, TransformScratch, TxType, forward_transform, inverse_transform_add,
+    predict_inter, predict_intra,
 };
 use super::tables::{
     AC_QLOOKUP, CAT6_PROBS, DC_QLOOKUP, IF_UV_MODE_PROBS, IF_Y_MODE_PROBS, INTER_MODE_PROBS,
@@ -305,6 +305,31 @@ struct LumaCandidate {
 /// their reconstruction.
 type ChromaCandidate = (f64, IntraMode, [PlaneCoding; 2], [Vec<u8>; 2]);
 
+/// Working memory for coding one transform block, kept between blocks
+/// because the search codes every transform block of every candidate it
+/// tries.
+struct Scratch {
+    residual: [i32; 32 * 32],
+    coefficients: [f64; 32 * 32],
+    levels: [i32; 32 * 32],
+    dequantized: [i32; 32 * 32],
+    prediction: [u8; 32 * 32],
+    transform: Box<TransformScratch>,
+}
+
+impl Scratch {
+    fn new() -> Box<Self> {
+        Box::new(Self {
+            residual: [0; 32 * 32],
+            coefficients: [0.0; 32 * 32],
+            levels: [0; 32 * 32],
+            dequantized: [0; 32 * 32],
+            prediction: [0; 32 * 32],
+            transform: TransformScratch::new(),
+        })
+    }
+}
+
 /// The above and left coding contexts a block reads and writes.
 struct ContextSnapshot {
     above_nonzero: [Vec<bool>; 3],
@@ -345,6 +370,7 @@ pub(super) struct FrameEncoder<'a> {
     left_nonzero: [[bool; 16]; 3],
     above_partition: Vec<u8>,
     left_partition: [u8; 8],
+    scratch: Box<Scratch>,
 }
 
 impl<'a> FrameEncoder<'a> {
@@ -387,6 +413,7 @@ impl<'a> FrameEncoder<'a> {
             left_nonzero: [[false; 16]; 3],
             above_partition: vec![0; geometry.mi_cols],
             left_partition: [0; 8],
+            scratch: Scratch::new(),
         }
     }
 
@@ -938,9 +965,14 @@ impl<'a> FrameEncoder<'a> {
     ) -> (TxBlock, u64, f64) {
         let n = 4 << tx_size;
         let stride = self.recon.strides[plane];
-        // Stack scratch: this runs for every transform block of every
-        // candidate the search tries, so heap allocations here dominated it.
-        let mut residual = [0_i32; 32 * 32];
+        let Scratch {
+            residual,
+            coefficients,
+            levels,
+            dequantized,
+            prediction,
+            transform,
+        } = &mut *self.scratch;
         let residual = &mut residual[..n * n];
         let mut prediction_error = 0_u64;
         for row in 0..n {
@@ -969,43 +1001,38 @@ impl<'a> FrameEncoder<'a> {
             return (empty, 0, empty_bits);
         }
 
-        let mut coefficients = [0.0; 32 * 32];
         let coefficients = &mut coefficients[..n * n];
-        forward_transform(residual, tx_size, tx_type, coefficients);
+        forward_transform(residual, tx_size, tx_type, coefficients, transform);
         // A smaller rounding offset for inter residuals, as libvpx uses.
         let rounding = if inter { 0.25 } else { 0.375 };
-        // 32x32 levels dequantize to half the step.
-        let effective = |step: i32| {
+        // The DC then AC steps; 32x32 levels dequantize to half the step.
+        let steps = [self.dc_q, self.ac_q];
+        let effective = steps.map(|step| {
             if tx_size == 3 {
                 f64::from(step) / 2.0
             } else {
                 f64::from(step)
             }
-        };
+        });
+        // Keep every dequantized value inside the 16-bit range the decoder
+        // stores coefficients in.
+        let limits = steps.map(|step| if tx_size == 3 { 65535 } else { 32767 } / step);
         // Below these magnitudes a coefficient quantizes to zero; they sit a
         // little under the exact threshold, so the division below still
         // decides every coefficient near it.
-        let dead_zone =
-            [self.dc_q, self.ac_q].map(|step| (1.0 - rounding) * effective(step) * 0.999);
-        let mut levels = [0_i32; 32 * 32];
+        let dead_zone = effective.map(|effective| (1.0 - rounding) * effective * 0.999);
         let levels = &mut levels[..n * n];
-        let mut dequantized = [0_i32; 32 * 32];
         let dequantized = &mut dequantized[..n * n];
+        levels.fill(0);
+        dequantized.fill(0);
         for (index, &coefficient) in coefficients.iter().enumerate() {
-            if coefficient.abs() < dead_zone[usize::from(index > 0)] {
+            let kind = usize::from(index > 0);
+            let magnitude = coefficient.abs();
+            if magnitude < dead_zone[kind] {
                 continue;
             }
-            let step = if index == 0 { self.dc_q } else { self.ac_q };
-            let limit = if tx_size == 3 {
-                65535 / step
-            } else {
-                32767 / step
-            };
-            // Keep every dequantized value inside the 16-bit range the decoder
-            // stores coefficients in.
-            let level =
-                ((coefficient.abs() / effective(step) + rounding).floor() as i32).min(limit);
-            let value = (level * step) >> u32::from(tx_size == 3);
+            let level = ((magnitude / effective[kind] + rounding).floor() as i32).min(limits[kind]);
+            let value = (level * steps[kind]) >> u32::from(tx_size == 3);
             levels[index] = if coefficient < 0.0 { -level } else { level };
             dequantized[index] = if coefficient < 0.0 { -value } else { value };
         }
@@ -1029,7 +1056,6 @@ impl<'a> FrameEncoder<'a> {
             context,
         );
         // Restored if the residual is not worth its bits.
-        let mut prediction = [0_u8; 32 * 32];
         let prediction = &mut prediction[..n * n];
         for row in 0..n {
             let start = (y + row) * stride + x;
@@ -1082,7 +1108,8 @@ impl<'a> FrameEncoder<'a> {
     ) -> BlockChoice {
         // The luma mode is chosen with the largest transform, whose prediction
         // reads only the block's own edges, and the smaller transforms are
-        // then tried with that mode.
+        // then tried with that mode, from the largest down, for as long as
+        // each improves on the last.
         let max_tx_size = self.max_tx_size(bsl);
         let mut best_luma: Option<LumaCandidate> = None;
         let try_luma = |encoder: &mut Self,
@@ -1097,7 +1124,8 @@ impl<'a> FrameEncoder<'a> {
                     encoder.y_mode_symbol(sink, neighbors, bsl, mode);
                 });
             let total = coding.error as f64 + encoder.lambda * bits;
-            if best_luma.as_ref().is_none_or(|best| total < best.cost) {
+            let improves = best_luma.as_ref().is_none_or(|best| total < best.cost);
+            if improves {
                 *best_luma = Some(LumaCandidate {
                     cost: total,
                     tx_size,
@@ -1106,13 +1134,16 @@ impl<'a> FrameEncoder<'a> {
                     coding,
                 });
             }
+            improves
         };
         for mode in IntraMode::ALL {
             try_luma(self, &mut best_luma, max_tx_size, mode);
         }
         let y_mode = best_luma.as_ref().expect("an intra mode is evaluated").mode;
-        for tx_size in 0..max_tx_size {
-            try_luma(self, &mut best_luma, tx_size, y_mode);
+        for tx_size in (0..max_tx_size).rev() {
+            if !try_luma(self, &mut best_luma, tx_size, y_mode) {
+                break;
+            }
         }
         let LumaCandidate {
             tx_size,
