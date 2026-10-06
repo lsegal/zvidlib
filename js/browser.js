@@ -115,3 +115,48 @@ export function makeTestStream(chunks) {
 export function makePendingStream() {
   return new ReadableStream({ pull() {} });
 }
+
+// Test-only: loads `blob` into a muted <video>, seeks it to `seekTo` seconds,
+// and resolves [duration, seekable end, currentTime after the seek, videoWidth]
+// once the browser has a decoded frame there. Rejects with the media error if
+// the browser cannot play the file, and after ten seconds if it never settles.
+export async function probeTestVideo(blob, seekTo) {
+  const video = document.createElement("video");
+  video.muted = true;
+  video.preload = "auto";
+  const url = URL.createObjectURL(blob);
+  const settle = (event) =>
+    new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`timed out waiting for ${event}`)), 10_000);
+      video.addEventListener(
+        event,
+        () => {
+          clearTimeout(timer);
+          resolve();
+        },
+        { once: true },
+      );
+      video.addEventListener(
+        "error",
+        () => {
+          clearTimeout(timer);
+          reject(new Error(`video error ${video.error?.code}: ${video.error?.message}`));
+        },
+        { once: true },
+      );
+    });
+  try {
+    const loaded = settle("loadeddata");
+    video.src = url;
+    await loaded;
+    const seeked = settle("seeked");
+    video.currentTime = seekTo;
+    await seeked;
+    const seekableEnd = video.seekable.length > 0 ? video.seekable.end(video.seekable.length - 1) : 0;
+    return [video.duration, seekableEnd, video.currentTime, video.videoWidth];
+  } finally {
+    video.removeAttribute("src");
+    video.load();
+    URL.revokeObjectURL(url);
+  }
+}

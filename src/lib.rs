@@ -1,7 +1,7 @@
 //! Portable core types for frame-accurate video and synchronized audio I/O.
 //!
 //! The crate provides checked timeline and media values, byte I/O, codec and
-//! transfer contracts, exact-frame decoding, indexed MP4 output, and a
+//! transfer contracts, exact-frame decoding, indexed MP4 and WebM output, and a
 //! browser-facing WebAssembly boundary. Production container, codec, and
 //! playback backends build on these types without leaking platform-specific
 //! values into the common API.
@@ -23,7 +23,9 @@ pub mod av1_simd;
 pub mod codec;
 pub mod codec_config;
 pub mod conformance;
+pub mod container;
 pub mod cover;
+mod ebml;
 pub mod io;
 pub mod media;
 pub mod mp4;
@@ -36,9 +38,12 @@ pub mod timeline;
 pub mod transfer;
 pub mod vorbis;
 mod vorbis_encoder;
+pub mod webm;
+pub mod webm_demux;
 
 mod av1_dec;
 mod av1_decoder;
+mod vp8;
 
 /// The bounded preview tier over a track, for callers that need an answer at an
 /// arbitrary position faster than a decode from the nearest random-access point
@@ -179,6 +184,7 @@ pub use conformance::{
     VideoEncoderConformanceReport, VideoEncoderConformanceVector, verify_video_decoder_conformance,
     verify_video_encoder_conformance,
 };
+pub use container::{container_capabilities, probe_container};
 pub use cover::{COVER_THUMBNAIL_MAX_EDGE, CoverSource, DEFAULT_COVER_FRAME};
 pub use media::{
     AudioBuffer, Codec, ColorRange, Container, PixelFormat, Plane, VideoDimensions, VideoFrame,
@@ -208,6 +214,10 @@ pub use transfer::{
 pub use vorbis::{
     NativeVorbisDecoder, VORBIS_PREROLL_PACKETS, VorbisConfig, native_vorbis_audio_encoder_factory,
 };
+pub use webm::WebmMuxer;
+pub use webm_demux::{
+    WebmCuePoint, WebmDemuxer, WebmDemuxerOptions, WebmSeekPoint, WebmSkippedTrack, probe_webm,
+};
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use aac_encoder::native_aac_audio_encoder_factory;
@@ -219,3 +229,4 @@ pub use hevc::native_hevc_video_encoder_factory;
 pub use native_audio::{DefaultAudioOutput, NativeAacDecoder};
 #[cfg(not(target_arch = "wasm32"))]
 pub use previews::PreviewIndex;
+pub use vp8::native_vp8_video_decoder_factory;

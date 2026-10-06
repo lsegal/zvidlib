@@ -117,7 +117,12 @@ impl WebVideoEncodeSession {
             // starting point for `configure()`: like AV1, the real profile
             // and level are read back from what the encoder actually emits.
             Codec::Hevc => "hev1.1.6.L93.B0",
-            Codec::UncompressedVideo | Codec::H264 | Codec::Aac | Codec::Opus | Codec::Vorbis => {
+            Codec::UncompressedVideo
+            | Codec::H264
+            | Codec::Vp8
+            | Codec::Aac
+            | Codec::Opus
+            | Codec::Vorbis => {
                 return Err(Error::new(
                     ErrorKind::Unsupported,
                     "the WebCodecs video encoder bridge only supports AV1 and HEVC",
@@ -310,6 +315,7 @@ impl WebVideoEncodeSession {
                 Codec::Hevc => hvcc_from_metadata(&metadata),
                 Codec::UncompressedVideo
                 | Codec::H264
+                | Codec::Vp8
                 | Codec::Aac
                 | Codec::Opus
                 | Codec::Vorbis => None,

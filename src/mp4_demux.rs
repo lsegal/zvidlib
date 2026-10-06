@@ -951,7 +951,7 @@ fn parse_stsd(
         Codec::Av1 => b"av1C",
         Codec::Aac => b"esds",
         Codec::Opus => b"dOps",
-        Codec::UncompressedVideo => {
+        Codec::UncompressedVideo | Codec::Vp8 => {
             return Err(unsupported(
                 "uncompressed MP4 sample entries are not supported",
             ));

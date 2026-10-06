@@ -178,6 +178,9 @@ pub enum CodecProfile {
     Av1Main,
     Av1High,
     Av1Professional,
+    /// VP8 has a single profile; the bitstream version each frame carries
+    /// selects its reconstruction and loop filters.
+    Vp8,
     AacLowComplexity,
     /// Opus has a single profile.
     Opus,

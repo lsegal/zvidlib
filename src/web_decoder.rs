@@ -23,7 +23,7 @@ use crate::codec::{
 use crate::codec_config::{box_payload, derive_codec_string};
 use crate::io::MemorySource;
 use crate::media::{Codec, ColorRange, PixelFormat, VideoDimensions, VideoFrame};
-use crate::mp4_demux::{Mp4Demuxer, Mp4DemuxerOptions, Mp4Track};
+use crate::mp4_demux::Mp4Track;
 use crate::timeline::FrameIndex;
 use crate::{Error, ErrorKind, Limits, Result};
 use std::cell::RefCell;
@@ -61,10 +61,12 @@ fn codec_description(codec: Codec, decoder_config: &[u8]) -> Result<&[u8]> {
     match codec {
         Codec::Hevc => box_payload(decoder_config, b"hvcC"),
         Codec::Av1 => box_payload(decoder_config, b"av1C"),
+        // WebCodecs' VP8 registration takes no description.
+        Codec::Vp8 => Ok(&[]),
         Codec::UncompressedVideo | Codec::H264 | Codec::Aac | Codec::Opus | Codec::Vorbis => {
             Err(Error::new(
                 ErrorKind::Unsupported,
-                "only HEVC and AV1 have a WebCodecs decoder backend",
+                "only HEVC, AV1 and VP8 have a WebCodecs decoder backend",
             ))
         }
     }
@@ -74,17 +76,10 @@ pub(crate) fn js_to_promise(value: impl JsCast) -> js_sys::Promise {
     value.unchecked_into()
 }
 
+/// Indexes a video track of an MP4 or WebM input, whichever its signature says it is.
 async fn parse_video_track(source: &MemorySource, index: u32, limits: &Limits) -> Result<Mp4Track> {
-    let demuxer = Mp4Demuxer::open(
-        source,
-        Mp4DemuxerOptions {
-            limits: *limits,
-            ..Mp4DemuxerOptions::default()
-        },
-    )
-    .await?;
-    demuxer
-        .tracks
+    crate::container::open_tracks(source, limits)
+        .await?
         .into_iter()
         .filter(|track| track.kind == crate::codec::TrackKind::Video)
         .nth(index as usize)
@@ -198,7 +193,9 @@ impl WebVideoDecodeSession {
         let config = JsVideoDecoderConfig::new(&derived.codec_string);
         config.set_coded_width(dimensions.width);
         config.set_coded_height(dimensions.height);
-        config.set_description_u8_array(&js_sys::Uint8Array::from(description));
+        if !description.is_empty() {
+            config.set_description_u8_array(&js_sys::Uint8Array::from(description));
+        }
         config.set_optimize_for_latency(true);
 
         let webcodecs_supported = match choice {
@@ -293,10 +290,11 @@ fn software_decoder_factory(codec: Codec) -> Result<Box<dyn VideoDecoderFactory>
     match codec {
         Codec::Hevc => Ok(Box::new(crate::native_hevc_video_decoder_factory())),
         Codec::Av1 => Ok(Box::new(crate::native_av1_video_decoder_factory())),
+        Codec::Vp8 => Ok(Box::new(crate::native_vp8_video_decoder_factory())),
         Codec::UncompressedVideo | Codec::H264 | Codec::Aac | Codec::Opus | Codec::Vorbis => {
             Err(Error::new(
                 ErrorKind::Unsupported,
-                "only HEVC and AV1 have a software decoder backend",
+                "only HEVC, AV1 and VP8 have a software decoder backend",
             ))
         }
     }

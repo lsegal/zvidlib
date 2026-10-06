@@ -183,6 +183,18 @@ jobs:
       # for bit by the library unit tests above.
       - name: Test Vorbis decode and encode
         run: cargo test --features native --test vorbis_codec
+      # Remuxes the bundled AV1 sample into WebM and back, asserting the WebM
+      # index hands a decoder exactly the MP4's samples and frames, and that
+      # the written Cues are seekable (#526). Its ffprobe and ffmpeg check
+      # skips itself where those tools are not installed.
+      - name: Test the WebM container
+        run: cargo test --features native --test webm_container
+      # The libvpx MD5 comparison of every VP8 test vector runs with the
+      # library units above; this checks every frame also comes back exactly
+      # through `ExactFrameReader` in reverse and alternating order, through
+      # the hidden key frame of vector 018 (#529).
+      - name: Test VP8 exact-frame decoding
+        run: cargo test --features native --test vp8_conformance
       - name: Test AV1 SIMD motion compensation
         run: cargo test --features native --lib av1_mc -- --nocapture
       # `--release` is the profile #327 was reported against: nothing about the
@@ -574,6 +586,13 @@ jobs:
         run: cargo test --features native --lib
       - name: Test accelerated HEVC selection and correctness
         run: cargo test --features native --test native_hevc_hardware -- --nocapture
+      # The VP8 factory's hardware selection (#538): NVDEC is compiled into the
+      # Windows build, so this is where `Prefer` is seen to fall back to the
+      # software decoder and `Require` to report hardware unavailable on a
+      # runner without an NVIDIA adapter. On a host with one, the same test
+      # holds NVDEC to the software decoder's pixels on every vector.
+      - name: Test accelerated VP8 selection and correctness
+        run: cargo test --features native --test vp8_conformance -- --nocapture
       # The encode direction (#487, #486): which encoder `Prefer` and `Require`
       # select, and on a host with a hardware encoder an MP4 that zvidlib and
       # ffmpeg both decode. `macos-latest` reaches VideoToolbox's hardware

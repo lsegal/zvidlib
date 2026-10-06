@@ -72,6 +72,27 @@ const blob = await output.finish();
 console.log(blob.type); // "video/mp4"
 ```
 
+### WebM
+
+WebM is read and written alongside MP4 through the same indexed `get(n)`/`put(n)` API. `MediaInput.open` tells the two apart by the bytes themselves, never by a file name or MIME type: an EBML header whose `DocType` is `webm` or `matroska` is WebM, and `input.container` reports `"webm"`, `"mp4"`, or `null`. A WebM input's AV1 video tracks then answer `get(n)`, `frameDuration(n)`, `randomAccessPoints()` and `previews()` exactly as an MP4's do. `new CreateOptions("webm")` makes `MediaOutput.finish()` mux the encoded video into a seekable WebM and return a `video/webm` Blob; `supportedContainers()` lists both names.
+
+WebM permits only VP8, VP9 or AV1 video and Vorbis or Opus audio, so WebM output is AV1 video only: `output.audio(n)` and `setCoverArt()` reject with `UNSUPPORTED` on a WebM output, and so does `videoCodec = "hevc"`. On input, Opus and Vorbis tracks are skipped rather than refused, so a browser `MediaRecorder` capture still opens for its video; VP8 video decodes through the browser's `WebCodecs` `vp8` decoder, or zvidlib's own VP8 decoder where `WebCodecs` cannot, and VP9 video tracks report `UNSUPPORTED` until its decoder lands. A VP8 frame the encoder hid (an alternate reference stored as a block of its own) is currently indexed as a frame, and asking for that frame fails.
+
+```js
+const options = new CreateOptions("webm");
+options.setTimeline(30, 1, 48_000);
+const output = await MediaOutput.create(options);
+for (let frameIndex = 0n; frameIndex < 90n; frameIndex++) {
+  await output.video(0).put(frameIndex, VideoFrame.rgba(width, height, pixels));
+}
+const webm = await output.finish(); // Blob { type: "video/webm" }
+const input = await MediaInput.open(webm);
+console.log(input.container); // "webm"
+const frame = await input.video(0).get(45n);
+```
+
+Natively, `WebmDemuxer::open` builds the same `Mp4Track` sample index `Mp4Demuxer::open` does, so `to_encoded_video_samples` and `ExactFrameReader` read a WebM track unchanged. It handles unknown-size Segments and Clusters (as live recorders write them), SimpleBlocks and BlockGroups, Xiph, EBML and fixed-size lacing, and any `TimestampScale`; `WebmDemuxer::seek_point` starts a decode from the file's `Cues` when it has them and from the scanned keyframes when it does not. `WebmMuxer` takes the same `Mp4TrackConfig` declarations `Mp4Muxer` does, writes payload bytes as samples arrive, and at `finish` fills in the Segment and Cluster sizes, the `Duration`, a `SeekHead`, and `Cues` with one cue per keyframe, which is what lets Chrome and Firefox seek the file. Samples are written in one presentation-time order across tracks, because a WebM Cluster interleaves them. `probe_container` detects either container from a `ByteSource`, and `container_capabilities` reports both.
+
 All exported 64-bit frame, sample, and timestamp values return JavaScript `BigInt`. Inputs accept `BigInt` across the full Rust range or validated `Number` values only within JavaScript's safe-integer range. Rust and boundary failures reject with native `Error` instances named `ZvidError`; their stable `code` values can be read directly or with `errorCode(error)`.
 
 Input `VideoStream` handles also expose `frameDuration(index)`, which resolves to that presentation
@@ -324,6 +345,8 @@ The native HEVC Main backends each factory can select, in the order it tries the
 
 The decoder also takes HEVC Main 10 (`CodecProfile::HevcMain10`, 8- to 10-bit 4:2:0) on every platform, always in pure Rust: none of the hardware backends is wired for more than 8 bits per sample, so `Require` reports a Main 10 track unavailable.
 
+`native_vp8_video_decoder_factory` selects its backends the same way: NVDEC on 64-bit Windows and Linux hosts with an NVIDIA adapter that decodes VP8, then pure Rust, and pure Rust on macOS, where VideoToolbox has no VP8 decoder. NVDEC's frames are cropped and converted to RGBA by the same code as the pure-Rust decoder's, so both backends return the same pixels.
+
 Every native encoder, by operating system, and what does the encoding. A *hardware* encoder runs on the GPU or media engine. A *platform* encoder is the operating system's own codec; it reports `CodecImplementation::Hardware` because zvidlib runs none of the codec itself. A *software* encoder is zvidlib's own pure-Rust code and reports `CodecImplementation::Software`. `VideoEncoder::implementation()` and `backend_name()` report which one a created video encoder is.
 
 | Encoder | Windows | macOS | Linux |
@@ -384,7 +407,7 @@ cargo fmt --all -- --check
 cargo clippy --all-targets --features native -- -D warnings
 ```
 
-These commands validate the portable core on both targets. Native builds include accelerated HEVC Main decode through NVDEC on supported 64-bit Windows/Linux systems, Media Foundation on Windows, and VideoToolbox on macOS, with a dependency-free pure-Rust fallback. They also include the pure-Rust AV1 Main decoder (8-bit 4:2:0 colour and monochrome streams with every Main-profile coding tool and in-loop filter, verified frame-for-frame against an independent libdav1d decode), dependency-free HEVC Main and monochrome AV1 Main-profile encoders (lossless, plus a non-lossless path verified against both the crate's own decoder and an independent ffmpeg decode), AAC-LC, Opus and Vorbis decode, pure-Rust Opus and Vorbis encoders, and default-device PCM output described above. Native builds also encode HEVC Main in hardware through VideoToolbox on macOS and Media Foundation on Windows, and AAC-LC through AudioToolbox on macOS and Media Foundation on Windows. The encoder table under [Platform expectations](#platform-expectations) lists every encoder by operating system. The browser build reads exact AAC and Opus sample ranges through `WebCodecs` `AudioDecoder` with a software Opus fallback, and encodes AAC-LC or Opus through its own `WebCodecs` `AudioEncoder` bridge (see [Implemented browser boundary](#implemented-browser-boundary)). Color AV1 encoding beyond the monochrome profile and fully portable audio-device abstractions remain planned.
+These commands validate the portable core on both targets. Native builds include accelerated HEVC Main decode through NVDEC on supported 64-bit Windows/Linux systems, Media Foundation on Windows, and VideoToolbox on macOS, with a dependency-free pure-Rust fallback. They also include the pure-Rust AV1 Main decoder (8-bit 4:2:0 colour and monochrome streams with every Main-profile coding tool and in-loop filter, verified frame-for-frame against an independent libdav1d decode), a VP8 decoder (`native_vp8_video_decoder_factory`, every bitstream version, bit-exact with libvpx on its VP8 test vectors, including hidden alternate-reference frames) that uses NVDEC where available and pure Rust otherwise, dependency-free HEVC Main and monochrome AV1 Main-profile encoders (lossless, plus a non-lossless path verified against both the crate's own decoder and an independent ffmpeg decode), AAC-LC, Opus and Vorbis decode, pure-Rust Opus and Vorbis encoders, and default-device PCM output described above. Native builds also encode HEVC Main in hardware through VideoToolbox on macOS and Media Foundation on Windows, and AAC-LC through AudioToolbox on macOS and Media Foundation on Windows. The encoder table under [Platform expectations](#platform-expectations) lists every encoder by operating system. The browser build reads exact AAC and Opus sample ranges through `WebCodecs` `AudioDecoder` with a software Opus fallback, and encodes AAC-LC or Opus through its own `WebCodecs` `AudioEncoder` bridge (see [Implemented browser boundary](#implemented-browser-boundary)). Color AV1 encoding beyond the monochrome profile and fully portable audio-device abstractions remain planned.
 
 Native compressed-codec backends use the public `VideoDecoderConformanceVector`
 and `VideoEncoderConformanceVector` runners before registration. Decoder vectors

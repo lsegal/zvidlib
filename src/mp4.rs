@@ -242,10 +242,12 @@ fn validate_track_config(config: &Mp4TrackConfig) -> Result<()> {
         Codec::Av1 => b"av1C",
         Codec::Aac => b"esds",
         Codec::Opus => b"dOps",
+        // VP8-in-MP4 is not a standard mapping; VP8 is carried in WebM.
+        Codec::Vp8 => return Err(invalid("VP8 is not an MP4 output codec")),
         Codec::Vorbis => {
             return Err(Error::new(
                 ErrorKind::Unsupported,
-                "Vorbis has no widely supported MP4 mapping; write it to a Matroska or WebM                  container instead",
+                "Vorbis has no widely supported MP4 mapping; write it to a WebM container instead",
             ));
         }
     };
@@ -591,6 +593,7 @@ fn video_sample_entry(track: &TrackState, dimensions: VideoDimensions) -> Result
             Codec::Aac | Codec::Opus | Codec::Vorbis => {
                 return Err(internal("audio codec used for a video sample entry"));
             }
+            Codec::Vp8 => return Err(internal("VP8 used for an MP4 video sample entry")),
         },
         body,
     )

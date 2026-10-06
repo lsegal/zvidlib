@@ -5,6 +5,37 @@ use crate::{Error, ErrorKind, Limits, Result, SampleRange};
 #[non_exhaustive]
 pub enum Container {
     Mp4,
+    /// The WebM subset of Matroska, read by [`crate::WebmDemuxer`] and
+    /// written by [`crate::webm::WebmMuxer`].
+    WebM,
+}
+
+impl Container {
+    /// Every container, in the order capability discovery reports them.
+    pub const ALL: [Self; 2] = [Self::Mp4, Self::WebM];
+
+    /// The lowercase name the browser API uses: `"mp4"` or `"webm"`.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Mp4 => "mp4",
+            Self::WebM => "webm",
+        }
+    }
+
+    /// The MIME type of a file in this container.
+    pub const fn mime_type(self) -> &'static str {
+        match self {
+            Self::Mp4 => "video/mp4",
+            Self::WebM => "video/webm",
+        }
+    }
+
+    /// Looks a container up by [`Self::name`], ignoring ASCII case.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|container| container.name().eq_ignore_ascii_case(name))
+    }
 }
 
 /// Normalized codec identifiers used across containers and backends.
@@ -19,6 +50,10 @@ pub enum Codec {
     H264,
     Hevc,
     Av1,
+    /// VP8 video, as carried in WebM (`V_VP8`). It has no decoder
+    /// configuration record. [`crate::native_vp8_video_decoder_factory`]
+    /// decodes it; no encoder factory accepts it.
+    Vp8,
     Aac,
     /// Opus audio (RFC 6716). MP4 carries it in an `Opus` sample entry whose
     /// decoder configuration is a `dOps` box; Matroska and WebM carry the
