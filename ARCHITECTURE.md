@@ -4,7 +4,7 @@
 
 zvidlib is a Rust media library that provides frame-accurate, indexed video access and synchronized audio access for native and WebAssembly applications. The first complete vertical slice will read and write MP4-family containers carrying HEVC/H.265 or AV1 video and AAC audio, and transfer images through CPU memory, OpenGL, or WebGL.
 
-This document is primarily a design contract. The repository implements the portable foundation—errors, limits, capability values, rational timeline arithmetic, synchronized audio intervals, validated CPU media buffers, byte I/O, bounded ordinary/fragmented MP4 sample indexing, normalized codec factories, bounded exact-frame video decoding with portable conformance, accelerated Windows/Linux/macOS HEVC Main decode with a dependency-free software fallback, accelerated HEVC Main encode through Media Foundation on Windows and VideoToolbox on macOS, dependency-free native AV1 Main decode and HEVC/AV1 encode backends (`native_hevc_video_decoder_factory`, `native_hevc_video_encoder_factory`, `native_av1_video_decoder_factory`, `native_av1_video_encoder_factory`), exact AAC packet/sample reads, audio-clock playback control and native/Web Audio adapter contracts, encoder contracts, CPU/GL/WebGL transfer contracts, strict synchronized indexed output, deterministic seekable MP4 muxing, and bounded WebM sample indexing with seekable AV1 WebM muxing—while a concrete AAC encoder and audio-device bindings remain planned.
+This document is primarily a design contract. The repository implements the portable foundation—errors, limits, capability values, rational timeline arithmetic, synchronized audio intervals, validated CPU media buffers, byte I/O, bounded ordinary/fragmented MP4 sample indexing, normalized codec factories, bounded exact-frame video decoding with portable conformance, accelerated Windows/Linux/macOS HEVC Main decode with a dependency-free software fallback, accelerated HEVC Main encode through Media Foundation on Windows and VideoToolbox on macOS, dependency-free native AV1 Main and VP8 decode and HEVC/AV1 encode backends (`native_hevc_video_decoder_factory`, `native_hevc_video_encoder_factory`, `native_av1_video_decoder_factory`, `native_vp8_video_decoder_factory`, `native_av1_video_encoder_factory`), exact AAC packet/sample reads, audio-clock playback control and native/Web Audio adapter contracts, encoder contracts, CPU/GL/WebGL transfer contracts, strict synchronized indexed output, deterministic seekable MP4 muxing, and bounded WebM sample indexing with seekable AV1 WebM muxing—while a concrete AAC encoder and audio-device bindings remain planned.
 
 The design is governed by these constraints:
 
@@ -76,7 +76,7 @@ For `get(n)`, the reader:
 5. Applies composition timestamps, edit mapping, and discard rules until exact presentation frame `n` is available.
 6. Converts or transfers the frame to the requested CPU/GL/WebGL destination and records useful state for likely subsequent access.
 
-HEVC CRA/IDR behavior, recovery points, leading pictures, and AV1 show-existing-frame semantics require codec-specific random-access validation. The container's sync flag alone is not always sufficient; a codec backend supplies dependency and reset information to the seek planner.
+HEVC CRA/IDR behavior, recovery points, leading pictures, AV1 show-existing-frame semantics, and VP8 hidden frames require codec-specific random-access validation. A VP8 sample holds exactly one frame; a hidden frame (`show_frame` = 0, usually an alternate reference coded ahead of the frames that use it) is decoded and updates the references but produces no picture, so a container must give it an identity that is never requested as a presentation frame, and a seek to any later frame decodes through it from the preceding key frame. The container's sync flag alone is not always sufficient; a codec backend supplies dependency and reset information to the seek planner.
 
 ### 3.1 Cache policy
 
@@ -147,7 +147,7 @@ Codec interfaces operate on owned or lifetime-safe encoded packets and media val
 
 Container codec configuration is normalized before reaching a backend and serialized by the muxer without depending on backend-private types. This permits multiple implementations: browser WebCodecs, operating-system APIs, pure Rust/WASM codecs, or optional external adapters.
 
-The initial codec priorities are HEVC/H.265 and AV1 video plus AAC audio. They are goals, not a promise that every browser exposes all three encoders/decoders. Capability discovery must distinguish unsupported codec, unsupported profile, invalid configuration, and unavailable hardware.
+The initial codec priorities are HEVC/H.265 and AV1 video plus AAC audio; VP8 decode follows for WebM, through WebCodecs' `vp8` decoder in the browser with the pure-Rust decoder as the native backend and browser fallback. They are goals, not a promise that every browser exposes all three encoders/decoders. Capability discovery must distinguish unsupported codec, unsupported profile, invalid configuration, and unavailable hardware.
 
 No codec implementation is automatically trusted with arbitrary allocation sizes. Backends receive limits and must validate decoded dimensions and formats before publishing a frame.
 

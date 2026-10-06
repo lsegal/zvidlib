@@ -766,12 +766,13 @@ fn parse_track_entry(payload: &[u8], options: &WebmDemuxerOptions) -> Result<Tra
 }
 
 /// The codec indexed for a Matroska video `CodecID`, or `None` when zvidlib
-/// has no decoder for it. `V_VP8` and `V_VP9` belong here once [`Codec`] has
-/// them, together with an arm in [`decoder_config`] for their `CodecPrivate`
-/// (the sibling sub-issues of #523).
+/// has no decoder for it. `V_VP9` belongs here once [`Codec`] has it,
+/// together with an arm in [`decoder_config`] for its `CodecPrivate` (a
+/// sibling sub-issue of #523).
 fn video_codec(codec_id: &str) -> Option<Codec> {
     match codec_id {
         "V_AV1" => Some(Codec::Av1),
+        "V_VP8" => Some(Codec::Vp8),
         _ => None,
     }
 }
@@ -791,6 +792,9 @@ fn decoder_config(codec: Codec, codec_private: Option<&[u8]>) -> Result<Vec<u8>>
             config.extend_from_slice(record);
             Ok(config)
         }
+        // VP8 defines no configuration record, so any `CodecPrivate` is
+        // ignored and decoders configure from each key frame's header.
+        Codec::Vp8 => Ok(Vec::new()),
         _ => Err(unsupported(
             "codec has no WebM decoder configuration mapping",
         )),

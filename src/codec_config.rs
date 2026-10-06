@@ -1,5 +1,6 @@
 //! Portable derivation of WebCodecs codec strings and [`CodecProfile`] values
-//! from raw MP4 `hvcC`/`av1C` codec configuration boxes.
+//! from raw MP4 `hvcC`/`av1C` codec configuration boxes, and for VP8, which
+//! has none.
 //!
 //! This module contains no browser (`web_sys`) types so it can be unit
 //! tested natively. It is consumed by the browser WebCodecs decoder factory
@@ -23,9 +24,15 @@ pub fn derive_codec_string(codec: Codec, decoder_config: &[u8]) -> Result<Derive
     match codec {
         Codec::Hevc => derive_hevc(decoder_config),
         Codec::Av1 => derive_av1(decoder_config),
+        // VP8 has one profile and no configuration record, so its WebCodecs
+        // string is the bare codec name.
+        Codec::Vp8 => Ok(DerivedCodecString {
+            codec_string: "vp8".to_owned(),
+            profile: CodecProfile::Vp8,
+        }),
         Codec::UncompressedVideo | Codec::H264 | Codec::Aac => Err(Error::new(
             ErrorKind::Unsupported,
-            "codec string derivation only supports HEVC and AV1 video",
+            "codec string derivation only supports HEVC, AV1 and VP8 video",
         )),
     }
 }
@@ -261,6 +268,13 @@ mod tests {
         let short_av1 = boxed(b"av1C", &[1]);
         let error = derive_codec_string(Codec::Av1, &short_av1).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::MalformedMedia);
+    }
+
+    #[test]
+    fn derives_the_vp8_codec_string_without_a_configuration_record() {
+        let derived = derive_codec_string(Codec::Vp8, &[]).unwrap();
+        assert_eq!(derived.codec_string, "vp8");
+        assert_eq!(derived.profile, CodecProfile::Vp8);
     }
 
     #[test]

@@ -40,6 +40,7 @@ pub mod webm_demux;
 
 mod av1_dec;
 mod av1_decoder;
+mod vp8;
 
 /// The bounded preview tier over a track, for callers that need an answer at an
 /// arbitrary position faster than a decode from the nearest random-access point
@@ -212,3 +213,4 @@ pub use hevc::native_hevc_video_encoder_factory;
 pub use native_audio::{DefaultAudioOutput, NativeAacDecoder};
 #[cfg(not(target_arch = "wasm32"))]
 pub use previews::PreviewIndex;
+pub use vp8::native_vp8_video_decoder_factory;
