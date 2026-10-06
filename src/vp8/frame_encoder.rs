@@ -290,40 +290,32 @@ impl FrameEncoder {
             ));
         }
 
-        let intra_probabilities = if context.key_frame {
-            None
-        } else {
-            Some(DEFAULT_Y_MODE_PROBS)
-        };
+        let intra_probabilities = (!context.key_frame).then_some(DEFAULT_Y_MODE_PROBS);
         let (y_mode, intra_cost) =
             choose_luma_mode(source, frame, quantizer, intra_probabilities, mb_x, mb_y);
-        let use_inter = inter.is_some_and(|(_, _, cost)| cost <= intra_cost);
-        let y_mode = if use_inter {
-            let (mode, mv, _) = inter.expect("checked above");
-            macroblock.info.reference = LAST_FRAME;
-            macroblock.info.y_mode = mode;
-            macroblock.info.uv_mode = mode;
-            macroblock.info.mv = mv;
-            macroblock.info.mvs = [mv; 16];
-            mode
-        } else {
-            y_mode
+        let y_mode = match inter {
+            Some((mode, mv, cost)) if cost <= intra_cost => {
+                macroblock.info.reference = LAST_FRAME;
+                macroblock.info.y_mode = mode;
+                macroblock.info.uv_mode = mode;
+                macroblock.info.mv = mv;
+                macroblock.info.mvs = [mv; 16];
+                mode
+            }
+            _ => y_mode,
         };
 
         let origin = mb_y * 16 * frame.planes[0].width + mb_x * 16;
         if y_mode == B_PRED {
             // Choose and code the subblocks in order, each predicted from
             // the reconstruction of the ones before it.
-            let (above_modes, left_modes) = if context.key_frame {
-                (Some(neighbours[0].b_modes), Some(neighbours[1].b_modes))
-            } else {
-                (None, None)
-            };
             let modes = code_subblocks(
                 source,
                 &mut frame.planes[0],
                 quantizer,
-                above_modes.zip(left_modes),
+                context
+                    .key_frame
+                    .then(|| (neighbours[0].b_modes, neighbours[1].b_modes)),
                 mb_x,
                 mb_y,
                 &mut macroblock.levels,
@@ -421,16 +413,10 @@ impl FrameEncoder {
             dequantized = [[0; 16]; 25];
         }
 
-        let first = if macroblock.has_y2() { 1 } else { 0 };
-        let has_coefficients = macroblock.levels[..24]
-            .iter()
-            .enumerate()
-            .any(|(index, block)| {
-                let start = if index < 16 { first } else { 0 };
-                block[start..].iter().any(|&level| level != 0)
-            })
-            || (macroblock.has_y2() && macroblock.levels[24].iter().any(|&level| level != 0));
-        macroblock.info.skip = !has_coefficients;
+        // A luma DC that goes through Y2 is never quantized in its own block,
+        // and a macroblock without Y2 never fills one, so any level left is
+        // a token to code.
+        macroblock.info.skip = macroblock.levels.iter().flatten().all(|&level| level == 0);
         (macroblock, dequantized)
     }
 
@@ -455,12 +441,7 @@ impl FrameEncoder {
         mb_y: usize,
     ) -> (u8, MotionVector, u64) {
         let reference = &self.reference().planes[0];
-        let mode_probabilities = [
-            MODE_CONTEXTS[counts[0]][0],
-            MODE_CONTEXTS[counts[1]][1],
-            MODE_CONTEXTS[counts[2]][2],
-            MODE_CONTEXTS[counts[3]][3],
-        ];
+        let mode_probabilities = mode_probabilities(counts);
         let x0 = mb_x * 16;
         let y0 = mb_y * 16;
         let new_mv = motion_search(
@@ -673,14 +654,11 @@ impl FrameEncoder {
                 continue;
             }
             header.write(255, false); // last frame
-            let counts = &macroblock.near_counts;
-            let mode_probabilities = [
-                MODE_CONTEXTS[counts[0]][0],
-                MODE_CONTEXTS[counts[1]][1],
-                MODE_CONTEXTS[counts[2]][2],
-                MODE_CONTEXTS[counts[3]][3],
-            ];
-            header.write_tree(&MV_REF_TREE, &mode_probabilities, info.y_mode);
+            header.write_tree(
+                &MV_REF_TREE,
+                &mode_probabilities(&macroblock.near_counts),
+                info.y_mode,
+            );
             if info.y_mode == NEWMV {
                 write_mv(&mut header, info.mv, macroblock.best_mv);
             }
@@ -705,6 +683,11 @@ impl FrameEncoder {
         data.extend_from_slice(&tokens);
         Ok(data)
     }
+}
+
+/// The inter mode probabilities the near-MV counts select.
+fn mode_probabilities(counts: &[usize; 4]) -> [u8; 4] {
+    [0, 1, 2, 3].map(|index| MODE_CONTEXTS[counts[index]][index])
 }
 
 /// The largest first partition the frame tag's 19-bit size can describe.
