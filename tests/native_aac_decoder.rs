@@ -46,15 +46,16 @@ const WINDOW: u64 = 1024;
 
 /// The signal-to-noise ratio, in dB, a platform decoder's PCM must reach
 /// against the Symphonia reference. Decoders are not bit-exact with each other:
-/// Media Foundation agrees with Symphonia to 48 dB or better on the mono
-/// fixture but only to about 16 dB on the bundled stereo track's first window,
-/// which is nearly silent, so this is set low enough for that window and
-/// [`MIN_ALIGNMENT_MARGIN_DB`] is what pins the alignment.
+/// AudioToolbox and Media Foundation both agree with Symphonia to 48 dB or
+/// better on the mono fixture but only to about 15 dB on the bundled stereo
+/// track's first window, which is nearly silent, so this is set low enough for
+/// that window and [`MIN_ALIGNMENT_MARGIN_DB`] is what pins the alignment.
 #[cfg(any(target_os = "macos", windows))]
 const MIN_SNR_DB: f32 = 12.0;
 
 /// How much closer to the reference a window must be than the same window one
-/// sample early or late. Measured at 6.9 dB or more on every window.
+/// sample early or late. Measured at 6 dB or more on every window with both
+/// platform decoders.
 #[cfg(any(target_os = "macos", windows))]
 const MIN_ALIGNMENT_MARGIN_DB: f32 = 5.0;
 
