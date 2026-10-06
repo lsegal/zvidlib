@@ -14,6 +14,8 @@
 //! A hardware encoder takes the same configuration: it is rate controlled by
 //! quality, which `base_q_idx` maps onto, instead of to a bitrate.
 
+#[cfg(not(target_arch = "wasm32"))]
+pub mod bench;
 mod bitwriter;
 mod dsp;
 mod frame;

@@ -301,21 +301,15 @@ pub(super) fn sad(
     assert!(reference.len() >= (size - 1) * reference_stride + size);
     match isa_code() {
         #[cfg(target_arch = "x86_64")]
-        // SAFETY: the bounds were checked above, and AVX2 was detected.
-        ISA_AVX2 if size >= 32 => unsafe {
-            x86::sad_avx2(
-                source,
-                source_stride,
-                reference,
-                reference_stride,
-                size,
-                limit,
-            )
-        },
-        #[cfg(target_arch = "x86_64")]
-        // SAFETY: as above, with SSE4.1 detected.
+        // SAFETY: the bounds were checked above. The kernel is SSE2 only, the
+        // x86_64 baseline, so it can be inlined here: the search often exits
+        // after a row or two, where a call into a `#[target_feature]` function
+        // costs more than the row. There is no 256-bit arm, because the sum
+        // has to reach a scalar after every row for the early exit, and at
+        // the 8- to 64-wide rows the search uses, a 256-bit load, its lane
+        // fold and the `vzeroupper` on return measured slower.
         ISA_AVX2 | ISA_SSE41 => unsafe {
-            x86::sad_sse41(
+            x86::sad_sse2(
                 source,
                 source_stride,
                 reference,
@@ -391,11 +385,14 @@ pub(super) fn sse(
     assert!(b.len() >= (height - 1) * b_stride + width);
     match isa_code() {
         #[cfg(target_arch = "x86_64")]
-        // SAFETY: the bounds were checked above, and AVX2 was detected.
-        ISA_AVX2 => unsafe { x86::sse_avx2(a, a_stride, b, b_stride, width, height) },
+        // SAFETY: the bounds were checked above, and AVX2 was detected. Below
+        // 32 samples a row has no whole 256-bit step to amortize its lane fold.
+        ISA_AVX2 if width >= 32 => unsafe {
+            x86::sse_avx2(a, a_stride, b, b_stride, width, height)
+        },
         #[cfg(target_arch = "x86_64")]
-        // SAFETY: as above, with SSE4.1 detected.
-        ISA_SSE41 => unsafe { x86::sse_sse41(a, a_stride, b, b_stride, width, height) },
+        // SAFETY: as above, with SSE4.1 detected (AVX2 implies it).
+        ISA_AVX2 | ISA_SSE41 => unsafe { x86::sse_sse41(a, a_stride, b, b_stride, width, height) },
         #[cfg(target_arch = "aarch64")]
         // SAFETY: the bounds were checked above, and NEON is in the baseline.
         ISA_NEON => unsafe { neon::sse(a, a_stride, b, b_stride, width, height) },
@@ -582,23 +579,21 @@ pub(super) fn convolve8(
     assert!(window_stride >= w + 7);
     assert!(window.len() >= (h + 6) * window_stride + w + 7);
     assert!(output.len() >= w * h);
-    let taps_x: [i16; 8] = core::array::from_fn(|tap| filter_x[tap] as i16);
-    let taps_y: [i16; 8] = core::array::from_fn(|tap| filter_y[tap] as i16);
     match isa_code() {
         #[cfg(target_arch = "x86_64")]
         // SAFETY: the bounds were checked above, and AVX2 was detected.
         ISA_AVX2 if w >= 16 => unsafe {
-            x86::convolve8_avx2(window, window_stride, w, h, &taps_x, &taps_y, output)
+            x86::convolve8_avx2(window, window_stride, w, h, filter_x, filter_y, output)
         },
         #[cfg(target_arch = "x86_64")]
         // SAFETY: as above, with SSE4.1 detected.
         ISA_AVX2 | ISA_SSE41 => unsafe {
-            x86::convolve8_sse41(window, window_stride, w, h, &taps_x, &taps_y, output)
+            x86::convolve8_sse41(window, window_stride, w, h, filter_x, filter_y, output)
         },
         #[cfg(target_arch = "aarch64")]
         // SAFETY: the bounds were checked above, and NEON is in the baseline.
         ISA_NEON => unsafe {
-            neon::convolve8(window, window_stride, w, h, &taps_x, &taps_y, output)
+            neon::convolve8(window, window_stride, w, h, filter_x, filter_y, output)
         },
         _ => convolve8_scalar(window, window_stride, w, h, filter_x, filter_y, output),
     }
@@ -1142,10 +1137,10 @@ mod x86 {
     // ---- distortion -----------------------------------------------------
 
     /// The sum of the two 64-bit lanes of a `psadbw` accumulator.
-    #[target_feature(enable = "sse4.1")]
     #[inline]
     fn sum_sad(acc: __m128i) -> u32 {
-        (_mm_cvtsi128_si32(acc) + _mm_extract_epi32::<2>(acc)) as u32
+        // SAFETY: SSE2 is part of the x86_64 baseline.
+        unsafe { _mm_cvtsi128_si32(_mm_add_epi32(acc, _mm_unpackhi_epi64(acc, acc))) as u32 }
     }
 
     /// The SAD of one row of `width` samples, 16 and then 8 at a time.
@@ -1153,11 +1148,11 @@ mod x86 {
     /// # Safety
     ///
     /// `a` and `b` must be valid for `width` bytes.
-    #[target_feature(enable = "sse4.1")]
     #[inline]
-    unsafe fn row_sad_sse41(a: *const u8, b: *const u8, width: usize, done: usize) -> u32 {
-        let mut acc = _mm_setzero_si128();
-        let mut column = done;
+    unsafe fn row_sad_sse2(a: *const u8, b: *const u8, width: usize) -> u32 {
+        // SAFETY: SSE2 is part of the x86_64 baseline.
+        let mut acc = unsafe { _mm_setzero_si128() };
+        let mut column = 0;
         // SAFETY: every load stays below `width`.
         unsafe {
             while column + 16 <= width {
@@ -1182,11 +1177,13 @@ mod x86 {
         sad
     }
 
+    /// The SAD kernel, in SSE2 alone, which is the x86_64 baseline.
+    ///
     /// # Safety
     ///
     /// The caller checks that both blocks are `size` rows of `size` samples.
-    #[target_feature(enable = "sse4.1")]
-    pub(super) unsafe fn sad_sse41(
+    #[inline]
+    pub(super) unsafe fn sad_sse2(
         source: &[u8],
         source_stride: usize,
         reference: &[u8],
@@ -1194,58 +1191,52 @@ mod x86 {
         size: usize,
         limit: u32,
     ) -> u32 {
+        let (a, b) = (source.as_ptr(), reference.as_ptr());
         let mut sad = 0_u32;
-        for row in 0..size {
-            // SAFETY: the caller checked the row is in bounds.
-            sad += unsafe {
-                row_sad_sse41(
-                    source.as_ptr().add(row * source_stride),
-                    reference.as_ptr().add(row * reference_stride),
-                    size,
-                    0,
-                )
-            };
-            if sad >= limit {
-                return sad;
-            }
-        }
-        sad
-    }
-
-    /// # Safety
-    ///
-    /// As [`sad_sse41`].
-    #[target_feature(enable = "avx2")]
-    pub(super) unsafe fn sad_avx2(
-        source: &[u8],
-        source_stride: usize,
-        reference: &[u8],
-        reference_stride: usize,
-        size: usize,
-        limit: u32,
-    ) -> u32 {
-        let mut sad = 0_u32;
-        for row in 0..size {
-            let a = source[row * source_stride..].as_ptr();
-            let b = reference[row * reference_stride..].as_ptr();
-            let mut acc = _mm256_setzero_si256();
-            let mut column = 0;
-            // SAFETY: the caller checked the row is in bounds.
-            unsafe {
-                while column + 32 <= size {
-                    let x = _mm256_loadu_si256(a.add(column).cast());
-                    let y = _mm256_loadu_si256(b.add(column).cast());
-                    acc = _mm256_add_epi64(acc, _mm256_sad_epu8(x, y));
-                    column += 32;
+        // The block sizes the search uses get loops without a remainder.
+        if size == 8 {
+            for row in 0..size {
+                // SAFETY: the caller checked the row is in bounds.
+                sad += unsafe {
+                    let x = _mm_loadl_epi64(a.add(row * source_stride).cast());
+                    let y = _mm_loadl_epi64(b.add(row * reference_stride).cast());
+                    _mm_cvtsi128_si32(_mm_sad_epu8(x, y)) as u32
+                };
+                if sad >= limit {
+                    return sad;
                 }
-                let folded = _mm_add_epi64(
-                    _mm256_castsi256_si128(acc),
-                    _mm256_extracti128_si256::<1>(acc),
-                );
-                sad += sum_sad(folded) + row_sad_sse41(a, b, size, column);
             }
-            if sad >= limit {
-                return sad;
+        } else if size % 16 == 0 {
+            for row in 0..size {
+                let (x, y) = (row * source_stride, row * reference_stride);
+                // SAFETY: SSE2 is part of the x86_64 baseline.
+                let mut acc = unsafe { _mm_setzero_si128() };
+                for column in (0..size).step_by(16) {
+                    // SAFETY: the caller checked the row is in bounds.
+                    unsafe {
+                        let p = _mm_loadu_si128(a.add(x + column).cast());
+                        let q = _mm_loadu_si128(b.add(y + column).cast());
+                        acc = _mm_add_epi64(acc, _mm_sad_epu8(p, q));
+                    }
+                }
+                sad += sum_sad(acc);
+                if sad >= limit {
+                    return sad;
+                }
+            }
+        } else {
+            for row in 0..size {
+                // SAFETY: the caller checked the row is in bounds.
+                sad += unsafe {
+                    row_sad_sse2(
+                        a.add(row * source_stride),
+                        b.add(row * reference_stride),
+                        size,
+                    )
+                };
+                if sad >= limit {
+                    return sad;
+                }
             }
         }
         sad
@@ -1504,13 +1495,13 @@ mod x86 {
         window_stride: usize,
         w: usize,
         h: usize,
-        taps_x: &[i16; 8],
-        taps_y: &[i16; 8],
+        filter_x: &[i32],
+        filter_y: &[i32],
         output: &mut [u8],
     ) {
-        let (pairs_x, pairs_y) = (tap_pairs(taps_x), tap_pairs(taps_y));
-        let filter_x: [i32; 8] = taps_x.map(i32::from);
-        let filter_y: [i32; 8] = taps_y.map(i32::from);
+        let taps_x: [i16; 8] = core::array::from_fn(|tap| filter_x[tap] as i16);
+        let taps_y: [i16; 8] = core::array::from_fn(|tap| filter_y[tap] as i16);
+        let (pairs_x, pairs_y) = (tap_pairs(&taps_x), tap_pairs(&taps_y));
         let mut intermediate = vec![0_u8; (h + 7) * w];
         for row in 0..h + 7 {
             let source = &window[row * window_stride..];
@@ -1529,7 +1520,7 @@ mod x86 {
                 }
                 column += 8;
             }
-            super::filter_row_scalar(source, &filter_x, out, column);
+            super::filter_row_scalar(source, filter_x, out, column);
         }
         for row in 0..h {
             let source = &intermediate[row * w..];
@@ -1551,7 +1542,7 @@ mod x86 {
                 }
                 column += 8;
             }
-            super::filter_column_scalar(source, w, &filter_y, out, column);
+            super::filter_column_scalar(source, w, filter_y, out, column);
         }
     }
 
@@ -1582,8 +1573,8 @@ mod x86 {
         window_stride: usize,
         w: usize,
         h: usize,
-        taps_x: &[i16; 8],
-        taps_y: &[i16; 8],
+        filter_x: &[i32],
+        filter_y: &[i32],
         output: &mut [u8],
     ) {
         let pairs = |taps: &[i16; 8]| -> [__m256i; 4] {
@@ -1593,10 +1584,10 @@ mod x86 {
                 _mm256_set1_epi32(packed)
             })
         };
-        let (pairs_x, pairs_y) = (pairs(taps_x), pairs(taps_y));
-        let (narrow_x, narrow_y) = (tap_pairs(taps_x), tap_pairs(taps_y));
-        let filter_x: [i32; 8] = taps_x.map(i32::from);
-        let filter_y: [i32; 8] = taps_y.map(i32::from);
+        let taps_x: [i16; 8] = core::array::from_fn(|tap| filter_x[tap] as i16);
+        let taps_y: [i16; 8] = core::array::from_fn(|tap| filter_y[tap] as i16);
+        let (pairs_x, pairs_y) = (pairs(&taps_x), pairs(&taps_y));
+        let (narrow_x, narrow_y) = (tap_pairs(&taps_x), tap_pairs(&taps_y));
         let mut intermediate = vec![0_u8; (h + 7) * w];
         for row in 0..h + 7 {
             let source = &window[row * window_stride..];
@@ -1628,7 +1619,7 @@ mod x86 {
                     column += 8;
                 }
             }
-            super::filter_row_scalar(source, &filter_x, out, column);
+            super::filter_row_scalar(source, filter_x, out, column);
         }
         for row in 0..h {
             let source = &intermediate[row * w..];
@@ -1662,7 +1653,7 @@ mod x86 {
                     column += 8;
                 }
             }
-            super::filter_column_scalar(source, w, &filter_y, out, column);
+            super::filter_column_scalar(source, w, filter_y, out, column);
         }
     }
 
@@ -2288,12 +2279,12 @@ mod neon {
         window_stride: usize,
         w: usize,
         h: usize,
-        taps_x: &[i16; 8],
-        taps_y: &[i16; 8],
+        filter_x: &[i32],
+        filter_y: &[i32],
         output: &mut [u8],
     ) {
-        let filter_x: [i32; 8] = taps_x.map(i32::from);
-        let filter_y: [i32; 8] = taps_y.map(i32::from);
+        let taps_x: [i16; 8] = core::array::from_fn(|tap| filter_x[tap] as i16);
+        let taps_y: [i16; 8] = core::array::from_fn(|tap| filter_y[tap] as i16);
         let mut intermediate = vec![0_u8; (h + 7) * w];
         for row in 0..h + 7 {
             let source = &window[row * window_stride..];
@@ -2304,11 +2295,11 @@ mod neon {
                 unsafe {
                     let samples: [uint8x8_t; 8] =
                         core::array::from_fn(|tap| vld1_u8(source.as_ptr().add(column + tap)));
-                    vst1_u8(out.as_mut_ptr().add(column), filter8(samples, taps_x));
+                    vst1_u8(out.as_mut_ptr().add(column), filter8(samples, &taps_x));
                 }
                 column += 8;
             }
-            super::filter_row_scalar(source, &filter_x, out, column);
+            super::filter_row_scalar(source, filter_x, out, column);
         }
         for row in 0..h {
             let source = &intermediate[row * w..];
@@ -2320,11 +2311,11 @@ mod neon {
                 unsafe {
                     let samples: [uint8x8_t; 8] =
                         core::array::from_fn(|tap| vld1_u8(source.as_ptr().add(tap * w + column)));
-                    vst1_u8(out.as_mut_ptr().add(column), filter8(samples, taps_y));
+                    vst1_u8(out.as_mut_ptr().add(column), filter8(samples, &taps_y));
                 }
                 column += 8;
             }
-            super::filter_column_scalar(source, w, &filter_y, out, column);
+            super::filter_column_scalar(source, w, filter_y, out, column);
         }
     }
 
@@ -2608,7 +2599,7 @@ mod tests {
                     }
                     for width in [size, size.saturating_sub(1).max(1)] {
                         assert_eq!(
-                            sse(&a, stride, &b, stride + 0, width, size),
+                            sse(&a, stride, &b, stride, width, size),
                             sse_scalar(&a, stride, &b, stride, width, size),
                             "{} sse {width}x{size} {kind}",
                             isa.name()
@@ -2697,9 +2688,12 @@ mod tests {
         });
     }
 
+    /// Luma coefficients, luma offset, Cb coefficients and Cr coefficients.
+    type Matrix = ([i32; 3], i32, [i32; 3], [i32; 3]);
+
     /// The BT.601 rows `super::source_picture` converts with, in RGBA byte
-    /// order: limited and full range luma, Cb and Cr.
-    const MATRICES: [([i32; 3], i32, [i32; 3], [i32; 3]); 2] = [
+    /// order: limited and full range.
+    const MATRICES: [Matrix; 2] = [
         ([66, 129, 25], 16, [-38, -74, 112], [112, -94, -18]),
         ([77, 150, 29], 0, [-43, -85, 128], [128, -107, -21]),
     ];
@@ -2804,5 +2798,38 @@ mod tests {
             simd::detected() != SimdIsa::Scalar,
             "detection disagrees with the crate-wide probe"
         );
+    }
+}
+#[cfg(test)]
+mod tmp_timing {
+    #[test]
+    #[ignore]
+    fn tmp_sad_timing() {
+        let a: Vec<u8> = (0..640 * 360).map(|i| (i * 7 % 251) as u8).collect();
+        let b: Vec<u8> = (0..640 * 360).map(|i| (i * 13 % 241) as u8).collect();
+        for isa in crate::simd::available() {
+            crate::simd::set_override(Some(isa));
+            for size in [8, 16, 32, 64] {
+                let start = std::time::Instant::now();
+                let mut total = 0u64;
+                for i in 0..200_000usize {
+                    let off = (i * 37) % (640 * 200);
+                    total += u64::from(super::sad(
+                        &a[off..],
+                        640,
+                        &b[(off + 3)..],
+                        640,
+                        size,
+                        u32::MAX,
+                    ));
+                }
+                println!(
+                    "{} {size}: {:?} ({total})",
+                    isa.name(),
+                    start.elapsed() / 200_000
+                );
+            }
+        }
+        crate::simd::set_override(None);
     }
 }

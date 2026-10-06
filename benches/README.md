@@ -1,7 +1,7 @@
 # Benchmarks
 
 zvidlib's benchmarks run under [criterion](https://docs.rs/criterion) with
-`harness = false`, across nine bench targets that share `benches/support/`:
+`harness = false`, across ten bench targets that share `benches/support/`:
 
 | Target | Measures |
 | --- | --- |
@@ -11,6 +11,7 @@ zvidlib's benchmarks run under [criterion](https://docs.rs/criterion) with
 | `benches/audio_decode.rs` | the audio decode path: AAC access units and `AacSampleReader` range/seek reads |
 | `benches/audio_mux.rs` | the audio container path: MP4 muxing, sample-table growth, demux, and gapless timing |
 | `benches/hevc_encode.rs` | the pure-Rust HEVC encoder, whole-frame and per-stage |
+| `benches/vp9_encode.rs` | the native VP9 encoder: whole-frame encode and every vectorized kernel, scalar versus SIMD |
 | `benches/hevc_decode.rs` | the HEVC software decoder: whole-frame decode and every hot stage, scalar versus SIMD |
 | `benches/hevc_hardware.rs` | the platform fixed-function HEVC decoders against the software one, and the hardware HEVC encoder |
 | `benches/exact_seek.rs` | what an exact frame at an arbitrary point costs, by backend and by random-access cadence |
@@ -1990,7 +1991,7 @@ job per `[[bench]]` target, each running only its own target with
 crate-wide override reaches the HEVC kernels, is included. Each of those jobs
 uploads its own criterion output, and a single `Benchmark report` job then:
 
-1. reassembles one `target/criterion/` tree and one `bench.log` out of the nine
+1. reassembles one `target/criterion/` tree and one `bench.log` out of the ten
    partial artifacts, and puts every host and its instruction sets into the job
    summary;
 2. reduces that tree to one small JSON baseline through
@@ -2012,8 +2013,8 @@ time. On one runner the job's wall clock was their sum: on `main` push
 was 11m24s and `av1_encode` 10m29s — two targets, more than half the time, with
 the other seven waiting on them. Fanned out, the wall clock is the slowest
 single target plus its build. The compile check is *not* fanned out, for the
-mirror-image reason: its cost is almost entirely the shared crate build, so nine
-copies would pay that nine times for one answer.
+mirror-image reason: its cost is almost entirely the shared crate build, so ten
+copies would pay that ten times for one answer.
 
 The matrix lists its targets by name, which is a second copy of what `Cargo.toml`
 declares, so `tests/ci_benchmarks_run_every_target.rs` asserts the two agree. A
@@ -2022,7 +2023,7 @@ and is simply never measured again, and the only symptom is a baseline that
 stops carrying its groups — which reads as benchmarks that were deleted.
 
 **What this costs is host attribution.** One stored baseline is now a merge
-across nine runners rather than one machine's suite, so its `host` field is every
+across ten runners rather than one machine's suite, so its `host` field is every
 distinct model observed, joined, and the job summary carries a target-to-model
 table. Nothing in the delta report depended on a single host — `compare` already
 diffs point estimates across two machines from a shared pool, which is why its
