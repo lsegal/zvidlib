@@ -1,35 +1,10 @@
 //! Default probabilities and lookup tables from the VP9 bitstream specification.
 //!
 //! Generated from libvpx (`vp9/common/vp9_entropy.c`, `vp9_entropymode.c`,
-//! `vp9_quant_common.c`, `vp9_scan.c` and `vp9_filter.c`); see
-//! `THIRD_PARTY_NOTICES.md`. Multi-dimensional C arrays are flattened in
-//! row-major order, and each table documents its shape.
-
-/// 4x4 coefficient model probabilities: `[plane type 2][reference 2][band 6][context 6][node 3]`.
-///
-/// Band 0 has only three contexts; its unused contexts are zero.
-pub(super) const COEF_PROBS_4X4: [u8; 432] = [
-    195, 29, 183, 84, 49, 136, 8, 42, 71, 0, 0, 0, 0, 0, 0, 0, 0, 0, 31, 107, 169, 35, 99, 159, 17,
-    82, 140, 8, 66, 114, 2, 44, 76, 1, 19, 32, 40, 132, 201, 29, 114, 187, 13, 91, 157, 7, 75, 127,
-    3, 58, 95, 1, 28, 47, 69, 142, 221, 42, 122, 201, 15, 91, 159, 6, 67, 121, 1, 42, 77, 1, 17,
-    31, 102, 148, 228, 67, 117, 204, 17, 82, 154, 6, 59, 114, 2, 39, 75, 1, 15, 29, 156, 57, 233,
-    119, 57, 212, 58, 48, 163, 29, 40, 124, 12, 30, 81, 3, 12, 31, 191, 107, 226, 124, 117, 204,
-    25, 99, 155, 0, 0, 0, 0, 0, 0, 0, 0, 0, 29, 148, 210, 37, 126, 194, 8, 93, 157, 2, 68, 118, 1,
-    39, 69, 1, 17, 33, 41, 151, 213, 27, 123, 193, 3, 82, 144, 1, 58, 105, 1, 32, 60, 1, 13, 26,
-    59, 159, 220, 23, 126, 198, 4, 88, 151, 1, 66, 114, 1, 38, 71, 1, 18, 34, 114, 136, 232, 51,
-    114, 207, 11, 83, 155, 3, 56, 105, 1, 33, 65, 1, 17, 34, 149, 65, 234, 121, 57, 215, 61, 49,
-    166, 28, 36, 114, 12, 25, 76, 3, 16, 42, 214, 49, 220, 132, 63, 188, 42, 65, 137, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 85, 137, 221, 104, 131, 216, 49, 111, 192, 21, 87, 155, 2, 49, 87, 1, 16, 28,
-    89, 163, 230, 90, 137, 220, 29, 100, 183, 10, 70, 135, 2, 42, 81, 1, 17, 33, 108, 167, 237, 55,
-    133, 222, 15, 97, 179, 4, 72, 135, 1, 45, 85, 1, 19, 38, 124, 146, 240, 66, 124, 224, 17, 88,
-    175, 4, 58, 122, 1, 36, 75, 1, 18, 37, 141, 79, 241, 126, 70, 227, 66, 58, 182, 30, 44, 136,
-    12, 34, 96, 2, 20, 47, 229, 99, 249, 143, 111, 235, 46, 109, 192, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    82, 158, 236, 94, 146, 224, 25, 117, 191, 9, 87, 149, 3, 56, 99, 1, 33, 57, 83, 167, 237, 68,
-    145, 222, 10, 103, 177, 2, 72, 131, 1, 41, 79, 1, 20, 39, 99, 167, 239, 47, 141, 224, 10, 104,
-    178, 2, 73, 133, 1, 44, 85, 1, 22, 47, 127, 145, 243, 71, 129, 228, 17, 93, 177, 3, 61, 124, 1,
-    41, 84, 1, 21, 52, 157, 78, 244, 140, 72, 231, 69, 58, 184, 31, 44, 137, 14, 38, 105, 8, 23,
-    61,
-];
+//! `vp9_quant_common.c` and `vp9_filter.c`); see `THIRD_PARTY_NOTICES.md`. The
+//! coefficient probabilities and scans of every transform size are the native
+//! decoder's (`crate::vp9_dec::tables`). Multi-dimensional C arrays are
+//! flattened in row-major order, and each table documents its shape.
 
 /// Pareto tail probabilities for the token tree beyond `ONE`: `[pivot probability - 1 (255)][node 8]`.
 pub(super) const PARETO8_FULL: [u8; 2040] = [
@@ -240,6 +215,16 @@ pub(super) const SINGLE_REF_PROBS: [u8; 10] = [33, 16, 77, 74, 142, 142, 172, 17
 /// Skip probabilities by context.
 pub(super) const SKIP_PROBS: [u8; 3] = [192, 128, 64];
 
+/// Transform size probabilities of blocks whose largest transform is 8x8:
+/// `[context 2][node 1]`.
+pub(super) const TX_PROBS_8X8: [u8; 2] = [100, 66];
+
+/// Transform size probabilities up to 16x16: `[context 2][node 2]`.
+pub(super) const TX_PROBS_16X16: [u8; 4] = [20, 152, 15, 101];
+
+/// Transform size probabilities up to 32x32: `[context 2][node 3]`.
+pub(super) const TX_PROBS_32X32: [u8; 6] = [3, 136, 37, 5, 52, 13];
+
 /// 8-bit DC quantizer step by quantizer index.
 pub(super) const DC_QLOOKUP: [i32; 256] = [
     4, 8, 8, 9, 10, 11, 12, 12, 13, 14, 15, 16, 17, 18, 19, 19, 20, 21, 22, 23, 24, 25, 26, 26, 27,
@@ -272,34 +257,6 @@ pub(super) const AC_QLOOKUP: [i32; 256] = [
     757, 771, 786, 801, 816, 832, 848, 864, 881, 898, 915, 933, 951, 969, 988, 1007, 1026, 1046,
     1066, 1087, 1108, 1129, 1151, 1173, 1196, 1219, 1243, 1267, 1292, 1317, 1343, 1369, 1396, 1423,
     1451, 1479, 1508, 1537, 1567, 1597, 1628, 1660, 1692, 1725, 1759, 1793, 1828,
-];
-
-/// 4x4 zig-zag scan, used for DCT_DCT and ADST_ADST.
-pub(super) const DEFAULT_SCAN_4X4: [usize; 16] =
-    [0, 4, 1, 5, 8, 2, 12, 9, 3, 6, 13, 10, 7, 14, 11, 15];
-
-/// 4x4 column scan, used for DCT_ADST.
-pub(super) const COL_SCAN_4X4: [usize; 16] = [0, 4, 8, 1, 12, 5, 9, 2, 13, 6, 10, 3, 7, 14, 11, 15];
-
-/// 4x4 row scan, used for ADST_DCT.
-pub(super) const ROW_SCAN_4X4: [usize; 16] = [0, 1, 4, 2, 5, 3, 6, 8, 9, 7, 12, 10, 13, 11, 14, 15];
-
-/// The two already-coded neighbours of each scan position: `[position 17][2]`.
-pub(super) const DEFAULT_SCAN_4X4_NEIGHBORS: [usize; 34] = [
-    0, 0, 0, 0, 0, 0, 1, 4, 4, 4, 1, 1, 8, 8, 5, 8, 2, 2, 2, 5, 9, 12, 6, 9, 3, 6, 10, 13, 7, 10,
-    11, 14, 0, 0,
-];
-
-/// Neighbours for [`COL_SCAN_4X4`]: `[position 17][2]`.
-pub(super) const COL_SCAN_4X4_NEIGHBORS: [usize; 34] = [
-    0, 0, 0, 0, 4, 4, 0, 0, 8, 8, 1, 1, 5, 5, 1, 1, 9, 9, 2, 2, 6, 6, 2, 2, 3, 3, 10, 10, 7, 7, 11,
-    11, 0, 0,
-];
-
-/// Neighbours for [`ROW_SCAN_4X4`]: `[position 17][2]`.
-pub(super) const ROW_SCAN_4X4_NEIGHBORS: [usize; 34] = [
-    0, 0, 0, 0, 0, 0, 1, 1, 4, 4, 2, 2, 5, 5, 4, 4, 8, 8, 6, 6, 8, 8, 9, 9, 12, 12, 10, 10, 13, 13,
-    14, 14, 0, 0,
 ];
 
 /// The regular 8-tap subpixel kernels: `[sixteenth-pel position 16][tap 8]`.
