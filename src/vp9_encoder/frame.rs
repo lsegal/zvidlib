@@ -855,10 +855,8 @@ impl<'a> FrameEncoder<'a> {
             return;
         }
         let intra_inter = intra_inter_context(above, left);
-        self.writer.write(
-            choice.info.is_inter,
-            self.context.intra_inter[intra_inter],
-        );
+        self.writer
+            .write(choice.info.is_inter, self.context.intra_inter[intra_inter]);
         self.counts.intra_inter[intra_inter][usize::from(choice.info.is_inter)] += 1;
         if !choice.info.is_inter {
             // `size_group_lookup[BLOCK_8X8]` is 1.
@@ -916,8 +914,7 @@ impl<'a> FrameEncoder<'a> {
                 &mut self.counts,
                 levels,
                 choice.tx_types[index],
-                usize::from(plane > 0),
-                usize::from(is_inter),
+                usize::from(plane > 0) * 2 + usize::from(is_inter),
                 context,
             );
             self.above_nonzero[plane][x4] = nonzero;
@@ -978,8 +975,9 @@ fn write_coefficients(
     counts: &mut FrameCounts,
     levels: &[i32; 16],
     tx_type: TxType,
-    plane_type: usize,
-    reference: usize,
+    // The plane type (luma or chroma) times two plus the reference type
+    // (intra or inter).
+    block_type: usize,
     mut context: usize,
 ) -> bool {
     let (scan, neighbors) = scan_for(tx_type);
@@ -987,8 +985,7 @@ fn write_coefficients(
         .iter()
         .rposition(|&position| levels[position] != 0)
         .map_or(0, |last| last + 1);
-    let context_index =
-        |band: usize, context: usize| ((plane_type * 2 + reference) * 6 + band) * 6 + context;
+    let context_index = |band: usize, context: usize| (block_type * 6 + band) * 6 + context;
     let mut cache = [0_u8; 16];
     let mut previous_zero = false;
     for c in 0..end {

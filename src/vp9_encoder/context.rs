@@ -215,8 +215,8 @@ fn merge(previous: u8, left: u32, right: u32, max_count: u32, max_update_factor:
     if count == 0 {
         return previous;
     }
-    let observed = ((u64::from(left) * 256 + u64::from(count >> 1)) / u64::from(count))
-        .clamp(1, 255) as i32;
+    let observed =
+        ((u64::from(left) * 256 + u64::from(count >> 1)) / u64::from(count)).clamp(1, 255) as i32;
     let factor = (max_update_factor * count.min(max_count) / max_count) as i32;
     let previous = i32::from(previous);
     (previous + (((observed - previous) * factor + 128) >> 8)) as u8
@@ -257,11 +257,13 @@ mod tests {
         // Saturated counts move halfway: factor 128.
         assert_eq!(merge_mode(128, [40, 0]), 192);
         // Ten of twenty symbols give factor 64, toward 255.
-        assert_eq!(merge_mode(100, [10, 0]), 100 + ((155 * 64 + 128) >> 8));
-        // Moving down rounds toward negative infinity as libvpx's shift does.
-        assert_eq!(merge_mode(200, [0, 20]), 200 + ((-199 * 128 + 128) >> 8));
-        // Coefficient merging saturates at 24 symbols.
-        assert_eq!(merge(128, 0, 48, 24, 112), 128 + ((-127 * 112 + 128) >> 8));
+        assert_eq!(merge_mode(100, [10, 0]), 139);
+        // Moving down rounds toward negative infinity as libvpx's shift does:
+        // 200 + ((1 - 200) * 128 + 128) >> 8.
+        assert_eq!(merge_mode(200, [0, 20]), 101);
+        // Coefficient merging saturates at 24 symbols, with factor 112:
+        // 128 + ((1 - 128) * 112 + 128) >> 8.
+        assert_eq!(merge(128, 0, 48, 24, 112), 72);
     }
 
     #[test]
