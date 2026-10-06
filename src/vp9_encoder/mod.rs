@@ -8,10 +8,13 @@
 //!
 //! [`VideoEncoderConfig::configuration`] is either empty, which encodes at
 //! [`DEFAULT_BASE_Q_IDX`] with a key frame every [`DEFAULT_KEYFRAME_INTERVAL`]
-//! frames, a single nonzero `base_q_idx` byte, or that byte followed by the key
-//! frame interval in frames as a big-endian `u16`. See [`parse_configuration`].
+//! frames, a single nonzero `base_q_idx` byte, that byte followed by the key
+//! frame interval in frames as a big-endian `u16`, or those three bytes
+//! followed by a flags byte whose bit 0 ([`FLAG_ERROR_RESILIENT`]) makes every
+//! frame error resilient. See [`parse_configuration`].
 
 mod bitwriter;
+mod context;
 mod dsp;
 mod frame;
 mod tables;
@@ -22,12 +25,18 @@ use crate::{
     Limits, Orientation, PixelFormat, Result, SampleDependency, VideoDimensions, VideoEncoder,
     VideoEncoderConfig, VideoEncoderFactory, VideoEncoderFormat, VideoFrame,
 };
-use frame::{FrameEncoder, Geometry, Picture};
+use context::FrameContext;
+use frame::{FrameEncoder, Geometry, ModeInfo, Picture};
 
 /// The quantizer index an empty configuration encodes at.
 pub const DEFAULT_BASE_Q_IDX: u8 = 80;
 /// The key frame interval, in frames, an empty or one-byte configuration uses.
 pub const DEFAULT_KEYFRAME_INTERVAL: u16 = 60;
+/// The configuration flag that codes every frame error resilient: with the
+/// default probabilities, and without the probabilities or motion vectors
+/// earlier frames adapted to, so a frame decodes from its reference picture
+/// alone.
+pub const FLAG_ERROR_RESILIENT: u8 = 1;
 /// The widest frame the single-tile-column encoder accepts. VP9 requires more
 /// than one tile column above this width.
 const MAX_WIDTH: u32 = 4096;
@@ -59,8 +68,9 @@ impl VideoEncoderFactory for NativeVp9EncoderFactory {
 }
 
 const CONFIGURATION_SHAPE: &str = "the native VP9 encoder's configuration is empty, a nonzero \
-                                   base_q_idx byte, or that byte and a nonzero big-endian u16 key \
-                                   frame interval";
+                                   base_q_idx byte, that byte and a nonzero big-endian u16 key \
+                                   frame interval, or those and a flags byte with only bit 0 \
+                                   (error resilient) defined";
 
 fn validate_configuration(configuration: &VideoEncoderConfig) -> CodecSupport {
     if configuration.codec != Codec::Vp9 {
@@ -107,23 +117,37 @@ fn validate_configuration(configuration: &VideoEncoderConfig) -> CodecSupport {
     }
 }
 
-/// The backend-private configuration as `(base_q_idx, keyframe_interval)`, or
-/// `None` when the blob is not one this backend understands.
-///
-/// `base_q_idx` is the frame header's quantizer index (VP9 section 7.2.9);
-/// higher is smaller and blurrier. Zero, which would select VP9's lossless
-/// mode, is not supported. A key frame interval of 1 makes every frame a key
-/// frame.
-fn parse_configuration(configuration: &[u8]) -> Option<(u8, u16)> {
-    match *configuration {
-        [] => Some((DEFAULT_BASE_Q_IDX, DEFAULT_KEYFRAME_INTERVAL)),
-        [base_q_idx] if base_q_idx != 0 => Some((base_q_idx, DEFAULT_KEYFRAME_INTERVAL)),
-        [base_q_idx, high, low] if base_q_idx != 0 => {
-            let interval = u16::from_be_bytes([high, low]);
-            (interval != 0).then_some((base_q_idx, interval))
-        }
-        _ => None,
-    }
+/// The settings a backend-private configuration selects.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Settings {
+    /// The frame header's quantizer index (VP9 section 7.2.9); higher is
+    /// smaller and blurrier. Zero, which would select VP9's lossless mode, is
+    /// not supported.
+    base_q_idx: u8,
+    /// A key frame every this many frames; 1 makes every frame a key frame.
+    keyframe_interval: u16,
+    /// Code every frame error resilient instead of adapting probabilities
+    /// from frame to frame.
+    error_resilient: bool,
+}
+
+/// The backend-private configuration's settings, or `None` when the blob is
+/// not one this backend understands.
+fn parse_configuration(configuration: &[u8]) -> Option<Settings> {
+    let (base_q_idx, keyframe_interval, flags) = match *configuration {
+        [] => (DEFAULT_BASE_Q_IDX, DEFAULT_KEYFRAME_INTERVAL, 0),
+        [base_q_idx] => (base_q_idx, DEFAULT_KEYFRAME_INTERVAL, 0),
+        [base_q_idx, high, low] => (base_q_idx, u16::from_be_bytes([high, low]), 0),
+        [base_q_idx, high, low, flags] => (base_q_idx, u16::from_be_bytes([high, low]), flags),
+        _ => return None,
+    };
+    (base_q_idx != 0 && keyframe_interval != 0 && flags & !FLAG_ERROR_RESILIENT == 0).then_some(
+        Settings {
+            base_q_idx,
+            keyframe_interval,
+            error_resilient: flags & FLAG_ERROR_RESILIENT != 0,
+        },
+    )
 }
 
 /// The lowest VP9 level (as `level_idc`, e.g. 31 for 3.1) whose picture size and
@@ -281,9 +305,18 @@ struct NativeVp9Encoder {
     geometry: Geometry,
     base_q_idx: u8,
     keyframe_interval: u64,
+    error_resilient: bool,
     /// The previous frame's reconstruction, which the next inter frame
     /// predicts from.
     reference: Option<Picture>,
+    /// The probabilities the next frame codes with: the decoder's frame
+    /// context 0, which every frame that is not error resilient adapts and
+    /// saves.
+    context: FrameContext,
+    /// The previous frame's block modes, whose motion vectors the next inter
+    /// frame takes as candidates.
+    previous_mode_info: Vec<ModeInfo>,
+    previous_was_key: bool,
     next_index: u64,
     finished: bool,
 }
@@ -309,6 +342,7 @@ impl VideoEncoder for NativeVp9Encoder {
         Box::pin(async move {
             self.finished = true;
             self.reference = None;
+            self.previous_mode_info = Vec::new();
             Ok(Vec::new())
         })
     }
@@ -321,7 +355,7 @@ impl NativeVp9Encoder {
             return Err(capability_error(support));
         }
         validate_limits(configuration.coded_dimensions, limits)?;
-        let (base_q_idx, keyframe_interval) = parse_configuration(&configuration.configuration)
+        let settings = parse_configuration(&configuration.configuration)
             .ok_or_else(|| Error::new(ErrorKind::InvalidInput, CONFIGURATION_SHAPE))?;
         let level = pick_level(
             configuration.coded_dimensions,
@@ -353,9 +387,13 @@ impl NativeVp9Encoder {
                 configuration.coded_dimensions.width as usize,
                 configuration.coded_dimensions.height as usize,
             ),
-            base_q_idx,
-            keyframe_interval: u64::from(keyframe_interval),
+            base_q_idx: settings.base_q_idx,
+            keyframe_interval: u64::from(settings.keyframe_interval),
+            error_resilient: settings.error_resilient,
             reference: None,
+            context: FrameContext::default(),
+            previous_mode_info: Vec::new(),
+            previous_was_key: false,
             next_index: 0,
             finished: false,
         })
@@ -398,16 +436,41 @@ impl NativeVp9Encoder {
 
         let key = index.0 % self.keyframe_interval == 0;
         let reference = if key { None } else { self.reference.as_ref() };
-        let (data, reconstruction) =
-            FrameEncoder::new(self.geometry, &picture, reference, self.base_q_idx)
-                .encode(self.color_range == ColorRange::Full);
+        // Key frames and error-resilient frames reset every frame context to
+        // the defaults (`setup_past_independence`).
+        if key || self.error_resilient {
+            self.context = FrameContext::default();
+        }
+        // Each frame is shown and the same size as the one before, so a frame
+        // that is not error resilient uses its motion vectors.
+        let previous_mode_info = (!self.error_resilient && !self.previous_mode_info.is_empty())
+            .then_some(self.previous_mode_info.as_slice());
+        let encoded = FrameEncoder::new(
+            self.geometry,
+            &picture,
+            reference,
+            self.base_q_idx,
+            self.error_resilient,
+            &self.context,
+            previous_mode_info,
+        )
+        .encode(self.color_range == ColorRange::Full);
+        let data = encoded.data;
         if u64::try_from(data.len()).unwrap_or(u64::MAX) > self.limits.max_allocation_bytes {
             return Err(Error::new(
                 ErrorKind::ResourceLimit,
                 "encoded VP9 frame exceeds the configured allocation limit",
             ));
         }
-        self.reference = Some(reconstruction);
+        if !self.error_resilient {
+            // refresh_frame_context = 1, frame_parallel_decoding_mode = 0.
+            self.context = self
+                .context
+                .adapted(&encoded.counts, key, self.previous_was_key);
+        }
+        self.reference = Some(encoded.reconstruction);
+        self.previous_mode_info = encoded.mode_info;
+        self.previous_was_key = key;
 
         let timestamp = i64::try_from(index.0)
             .ok()

@@ -4,9 +4,12 @@
 //! The coding tools are a deliberately small, fully specified subset of VP9
 //! profile 0:
 //!
-//! - every frame is error resilient, so it is coded with the default
-//!   probabilities, sends no probability updates, and needs no state from
-//!   earlier frames other than the reconstructed reference picture;
+//! - frames send no forward probability updates. By default they adapt
+//!   backwards instead: each frame codes with the probabilities the frames
+//!   before it adapted to (see [`super::context`]), and inter frames also take
+//!   the previous frame's motion vectors as candidates. Error-resilient frames
+//!   code with the default probabilities and need no state from earlier
+//!   frames other than the reconstructed reference picture;
 //! - every superblock is split down to 8x8 blocks, every transform is 4x4
 //!   (`tx_mode = ONLY_4X4`), and the loop filter is off (`filter_level = 0`);
 //! - key frames choose among the DC, V, H and TM intra modes per block;
@@ -18,61 +21,28 @@
 //! exactly, and predicts every later block and frame from it.
 
 use super::bitwriter::{BitWriter, BoolEncoder};
+use super::context::{FrameContext, FrameCounts, MvComponentCounts};
 use super::dsp::{
     IntraMode, ReferencePlane, TxType, forward_transform, inverse_transform_add, predict_inter,
     predict_intra_4x4,
 };
 use super::tables::{
-    AC_QLOOKUP, CAT6_PROBS, COEF_PROBS_4X4, COL_SCAN_4X4, COL_SCAN_4X4_NEIGHBORS, DC_QLOOKUP,
-    DEFAULT_SCAN_4X4, DEFAULT_SCAN_4X4_NEIGHBORS, IF_UV_MODE_PROBS, IF_Y_MODE_PROBS,
-    INTER_MODE_PROBS, INTRA_INTER_PROBS, KF_PARTITION_PROBS, KF_UV_MODE_PROBS, KF_Y_MODE_PROBS,
-    PARETO8_FULL, PARTITION_PROBS, ROW_SCAN_4X4, ROW_SCAN_4X4_NEIGHBORS, SINGLE_REF_PROBS,
-    SKIP_PROBS,
+    AC_QLOOKUP, CAT6_PROBS, COL_SCAN_4X4, COL_SCAN_4X4_NEIGHBORS, DC_QLOOKUP, DEFAULT_SCAN_4X4,
+    DEFAULT_SCAN_4X4_NEIGHBORS, KF_PARTITION_PROBS, KF_UV_MODE_PROBS, KF_Y_MODE_PROBS,
+    PARETO8_FULL, ROW_SCAN_4X4, ROW_SCAN_4X4_NEIGHBORS,
 };
 
-const INTRA_MODE_TREE: [i8; 18] = [
+pub(super) const INTRA_MODE_TREE: [i8; 18] = [
     0, 2, -9, 4, -1, 6, 8, 12, -2, 10, -4, -5, -3, 14, -8, 16, -6, -7,
 ];
-const PARTITION_TREE: [i8; 6] = [0, 2, -1, 4, -2, -3];
+pub(super) const PARTITION_TREE: [i8; 6] = [0, 2, -1, 4, -2, -3];
 /// Leaves are `mode - NEARESTMV`: NEARESTMV 0, NEARMV 1, ZEROMV 2, NEWMV 3.
-const INTER_MODE_TREE: [i8; 6] = [-2, 2, 0, 4, -1, -3];
-const MV_JOINT_TREE: [i8; 6] = [0, 2, -1, 4, -2, -3];
-const MV_CLASS_TREE: [i8; 20] = [
+pub(super) const INTER_MODE_TREE: [i8; 6] = [-2, 2, 0, 4, -1, -3];
+pub(super) const MV_JOINT_TREE: [i8; 6] = [0, 2, -1, 4, -2, -3];
+pub(super) const MV_CLASS_TREE: [i8; 20] = [
     0, 2, -1, 4, 6, 8, -2, -3, 10, 12, -4, -5, -6, 14, 16, 18, -7, -8, -9, -10,
 ];
-const MV_FP_TREE: [i8; 6] = [0, 2, -1, 4, -2, -3];
-
-const MV_JOINT_PROBS: [u8; 3] = [32, 64, 96];
-
-/// The default probabilities of one motion vector component.
-struct MvComponentProbs {
-    sign: u8,
-    classes: [u8; 10],
-    class0: u8,
-    bits: [u8; 10],
-    class0_fp: [[u8; 3]; 2],
-    fp: [u8; 3],
-}
-
-/// Row (vertical) then column (horizontal) component defaults.
-const MV_COMPONENT_PROBS: [MvComponentProbs; 2] = [
-    MvComponentProbs {
-        sign: 128,
-        classes: [224, 144, 192, 168, 192, 176, 192, 198, 198, 245],
-        class0: 216,
-        bits: [136, 140, 148, 160, 176, 192, 224, 234, 234, 240],
-        class0_fp: [[128, 128, 64], [96, 112, 64]],
-        fp: [64, 96, 64],
-    },
-    MvComponentProbs {
-        sign: 128,
-        classes: [216, 128, 176, 160, 176, 176, 192, 198, 198, 208],
-        class0: 208,
-        bits: [136, 140, 148, 160, 176, 192, 224, 234, 234, 240],
-        class0_fp: [[128, 128, 64], [96, 112, 64]],
-        fp: [64, 96, 64],
-    },
-];
+pub(super) const MV_FP_TREE: [i8; 6] = [0, 2, -1, 4, -2, -3];
 
 const COEF_BAND_4X4: [usize; 16] = [0, 1, 1, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 5, 5, 5];
 const CAT_PROBS: [&[u8]; 5] = [
@@ -166,9 +136,10 @@ struct Mv {
     col: i32,
 }
 
-/// The mode information later blocks read as context.
+/// The mode information later blocks, and the next frame's motion vector
+/// candidate search, read as context.
 #[derive(Clone, Copy, Default)]
-struct ModeInfo {
+pub(super) struct ModeInfo {
     is_inter: bool,
     /// The VP9 mode number: an intra mode, or `NEARESTMV..=NEWMV`.
     mode: u8,
@@ -200,12 +171,29 @@ struct ChromaChoice {
     pixels: [[u8; 16]; 2],
 }
 
+/// A coded frame and the state the frames after it depend on.
+pub(super) struct EncodedFrame {
+    pub(super) data: Vec<u8>,
+    pub(super) reconstruction: Picture,
+    /// The symbols the frame coded, for backward adaptation.
+    pub(super) counts: FrameCounts,
+    /// Every 8x8 block's mode and motion vector, in raster order.
+    pub(super) mode_info: Vec<ModeInfo>,
+}
+
 pub(super) struct FrameEncoder<'a> {
     geometry: Geometry,
     source: &'a Picture,
     reference: Option<&'a Picture>,
     recon: Picture,
     base_q_idx: u8,
+    error_resilient: bool,
+    /// The probabilities the frame codes with.
+    context: &'a FrameContext,
+    counts: FrameCounts,
+    /// The previous frame's modes, when this frame takes its motion vectors as
+    /// candidates (`UsePrevFrameMvs`).
+    previous_mode_info: Option<&'a [ModeInfo]>,
     /// The quantizer steps every plane uses: the header codes no deltas.
     dc_q: i32,
     ac_q: i32,
@@ -220,12 +208,21 @@ pub(super) struct FrameEncoder<'a> {
 
 impl<'a> FrameEncoder<'a> {
     /// Prepares to encode `source`, as a key frame when `reference` is `None`
-    /// and as an inter frame predicted from `reference` otherwise.
+    /// and as an inter frame predicted from `reference` otherwise, coding with
+    /// the probabilities in `context`.
+    ///
+    /// An error-resilient frame must code with the default context and has no
+    /// `previous_mode_info`. Otherwise `previous_mode_info` is the previous
+    /// frame's [`EncodedFrame::mode_info`], which an inter frame's motion
+    /// vector candidates include.
     pub(super) fn new(
         geometry: Geometry,
         source: &'a Picture,
         reference: Option<&'a Picture>,
         base_q_idx: u8,
+        error_resilient: bool,
+        context: &'a FrameContext,
+        previous_mode_info: Option<&'a [ModeInfo]>,
     ) -> Self {
         let q = usize::from(base_q_idx);
         let ac = AC_QLOOKUP[q];
@@ -235,6 +232,10 @@ impl<'a> FrameEncoder<'a> {
             reference,
             recon: Picture::new(&geometry),
             base_q_idx,
+            error_resilient,
+            context,
+            counts: FrameCounts::default(),
+            previous_mode_info: previous_mode_info.filter(|_| reference.is_some()),
             dc_q: DC_QLOOKUP[q],
             ac_q: ac,
             // Distortion is a pixel-domain squared error and rate is in bits.
@@ -258,9 +259,9 @@ impl<'a> FrameEncoder<'a> {
         self.reference.is_none()
     }
 
-    /// Encodes the frame and returns its bytes with the reconstruction;
-    /// `full_range` is the colour range the key frame header signals.
-    pub(super) fn encode(mut self, full_range: bool) -> (Vec<u8>, Picture) {
+    /// Encodes the frame; `full_range` is the colour range the key frame
+    /// header signals.
+    pub(super) fn encode(mut self, full_range: bool) -> EncodedFrame {
         let sb_rows = self.geometry.mi_rows.div_ceil(8);
         let sb_cols = self.geometry.mi_cols.div_ceil(8);
         for sb_row in 0..sb_rows {
@@ -274,16 +275,22 @@ impl<'a> FrameEncoder<'a> {
         let geometry = self.geometry;
         let tile = std::mem::replace(&mut self.writer, BoolEncoder::new()).finish();
         let compressed = compressed_header(key);
-        let mut frame = uncompressed_header(
+        let mut data = uncompressed_header(
             &geometry,
             key,
+            self.error_resilient,
             self.base_q_idx,
             full_range,
             compressed.len(),
         );
-        frame.extend_from_slice(&compressed);
-        frame.extend_from_slice(&tile);
-        (frame, self.recon)
+        data.extend_from_slice(&compressed);
+        data.extend_from_slice(&tile);
+        EncodedFrame {
+            data,
+            reconstruction: self.recon,
+            counts: self.counts,
+            mode_info: self.mode_info,
+        }
     }
 
     fn encode_partition(&mut self, mi_row: usize, mi_col: usize, bsl: usize) {
@@ -299,9 +306,12 @@ impl<'a> FrameEncoder<'a> {
         let table = if self.is_key() {
             &KF_PARTITION_PROBS
         } else {
-            &PARTITION_PROBS
+            &self.context.partition
         };
         let probs = &table[context * 3..context * 3 + 3];
+        // The decoder counts every partition, including the implied splits
+        // at the frame edges: NONE at 8x8 and SPLIT above.
+        self.counts.partition[context][if bsl == 0 { 0 } else { 3 }] += 1;
         if bsl == 0 {
             self.writer.tree(&PARTITION_TREE, probs, 0);
             self.encode_block(mi_row, mi_col);
@@ -455,7 +465,7 @@ impl<'a> FrameEncoder<'a> {
                 let index = (usize::from(above_mode) * 10 + usize::from(left_mode)) * 9;
                 &KF_Y_MODE_PROBS[index..index + 9]
             } else {
-                &IF_Y_MODE_PROBS[9..18]
+                &self.context.y_mode[9..18]
             };
             bits += tree_bits(&INTRA_MODE_TREE, probs, mode as u8);
             let cost = error as f64 + self.lambda * bits;
@@ -532,7 +542,7 @@ impl<'a> FrameEncoder<'a> {
             let probs = if key {
                 &KF_UV_MODE_PROBS[y_mode * 9..y_mode * 9 + 9]
             } else {
-                &IF_UV_MODE_PROBS[y_mode * 9..y_mode * 9 + 9]
+                &self.context.uv_mode[y_mode * 9..y_mode * 9 + 9]
             };
             bits += tree_bits(&INTRA_MODE_TREE, probs, mode as u8);
             let cost = error as f64 + self.lambda * bits;
@@ -561,7 +571,7 @@ impl<'a> FrameEncoder<'a> {
                 self.above_info(mi_row, mi_col),
                 self.left_info(mi_row, mi_col),
             );
-            best.cost += self.lambda * bool_bits(false, INTRA_INTER_PROBS[context]);
+            best.cost += self.lambda * bool_bits(false, self.context.intra_inter[context]);
         }
         best
     }
@@ -598,8 +608,20 @@ impl<'a> FrameEncoder<'a> {
                 done = true;
             }
         }
-        // Every inter block predicts from LAST_FRAME, so the search over other
-        // reference frames finds nothing. Clamp as `clamp_mv_ref` does.
+        // Then the co-located block of the previous frame.
+        if !done
+            && let Some(previous) = self.previous_mode_info
+            && let candidate = previous[mi_row * self.geometry.mi_cols + mi_col]
+            && candidate.is_inter
+        {
+            if count == 0 {
+                list[0] = candidate.mv;
+            } else if candidate.mv != list[0] {
+                list[1] = candidate.mv;
+            }
+        }
+        // Every inter block predicts from LAST_FRAME, so the searches over
+        // other reference frames find nothing. Clamp as `clamp_mv_ref` does.
         let border = 16 * 8;
         let to_left = -((mi_col * 64) as i32);
         let to_right = ((self.geometry.mi_cols - 1 - mi_col) * 64) as i32;
@@ -716,7 +738,7 @@ impl<'a> FrameEncoder<'a> {
         };
         let mut bits = tree_bits(
             &INTER_MODE_TREE,
-            &INTER_MODE_PROBS[mode_context * 3..mode_context * 3 + 3],
+            &self.context.inter_mode[mode_context * 3..mode_context * 3 + 3],
             mode - NEARESTMV,
         );
         if mode == NEWMV {
@@ -727,8 +749,14 @@ impl<'a> FrameEncoder<'a> {
         }
         let above = self.above_info(mi_row, mi_col);
         let left = self.left_info(mi_row, mi_col);
-        bits += bool_bits(true, INTRA_INTER_PROBS[intra_inter_context(above, left)]);
-        bits += bool_bits(false, SINGLE_REF_PROBS[single_ref_context(above, left) * 2]);
+        bits += bool_bits(
+            true,
+            self.context.intra_inter[intra_inter_context(above, left)],
+        );
+        bits += bool_bits(
+            false,
+            self.context.single_ref[single_ref_context(above, left) * 2],
+        );
 
         // Prediction, then the residual of each 4x4 block.
         let geometry = self.geometry;
@@ -809,7 +837,8 @@ impl<'a> FrameEncoder<'a> {
         let skip_context = usize::from(above.is_some_and(|info| info.skip))
             + usize::from(left.is_some_and(|info| info.skip));
         self.writer
-            .write(choice.info.skip, SKIP_PROBS[skip_context]);
+            .write(choice.info.skip, self.context.skip[skip_context]);
+        self.counts.skip[skip_context][usize::from(choice.info.skip)] += 1;
         let y_mode = choice.info.mode;
         if self.is_key() {
             let above_mode = above.map_or(0, |info| usize::from(info.mode));
@@ -825,37 +854,44 @@ impl<'a> FrameEncoder<'a> {
             );
             return;
         }
+        let intra_inter = intra_inter_context(above, left);
         self.writer.write(
             choice.info.is_inter,
-            INTRA_INTER_PROBS[intra_inter_context(above, left)],
+            self.context.intra_inter[intra_inter],
         );
+        self.counts.intra_inter[intra_inter][usize::from(choice.info.is_inter)] += 1;
         if !choice.info.is_inter {
             // `size_group_lookup[BLOCK_8X8]` is 1.
             self.writer
-                .tree(&INTRA_MODE_TREE, &IF_Y_MODE_PROBS[9..18], y_mode);
+                .tree(&INTRA_MODE_TREE, &self.context.y_mode[9..18], y_mode);
+            self.counts.y_mode[1][usize::from(y_mode)] += 1;
             let index = usize::from(y_mode) * 9;
             self.writer.tree(
                 &INTRA_MODE_TREE,
-                &IF_UV_MODE_PROBS[index..index + 9],
+                &self.context.uv_mode[index..index + 9],
                 choice.uv_mode as u8,
             );
+            self.counts.uv_mode[usize::from(y_mode)][choice.uv_mode as usize] += 1;
             return;
         }
         // A single LAST_FRAME reference: the first single_ref bit is zero.
+        let single_ref = single_ref_context(above, left);
         self.writer
-            .write(false, SINGLE_REF_PROBS[single_ref_context(above, left) * 2]);
+            .write(false, self.context.single_ref[single_ref * 2]);
+        self.counts.single_ref[single_ref][0] += 1;
         let (_, mode_context) = self.mv_references(mi_row, mi_col);
         self.writer.tree(
             &INTER_MODE_TREE,
-            &INTER_MODE_PROBS[mode_context * 3..mode_context * 3 + 3],
+            &self.context.inter_mode[mode_context * 3..mode_context * 3 + 3],
             y_mode - NEARESTMV,
         );
+        self.counts.inter_mode[mode_context][usize::from(y_mode - NEARESTMV)] += 1;
         if y_mode == NEWMV {
             let difference = Mv {
                 row: choice.info.mv.row - choice.best_mv.row,
                 col: choice.info.mv.col - choice.best_mv.col,
             };
-            write_mv(&mut self.writer, difference);
+            write_mv(&mut self.writer, self.context, &mut self.counts, difference);
         }
     }
 
@@ -876,6 +912,8 @@ impl<'a> FrameEncoder<'a> {
                 + usize::from(self.left_nonzero[plane][y4]);
             let nonzero = write_coefficients(
                 &mut self.writer,
+                &self.context.coef,
+                &mut self.counts,
                 levels,
                 choice.tx_types[index],
                 usize::from(plane > 0),
@@ -932,10 +970,12 @@ fn energy_class(magnitude: u32) -> u8 {
     }
 }
 
-/// Writes one 4x4 block's tokens as `decode_coefs` reads them; returns
-/// whether any coefficient was nonzero.
+/// Writes one 4x4 block's tokens as `decode_coefs` reads them, counting them
+/// as it does; returns whether any coefficient was nonzero.
 fn write_coefficients(
     writer: &mut BoolEncoder,
+    coef_probs: &[u8],
+    counts: &mut FrameCounts,
     levels: &[i32; 16],
     tx_type: TxType,
     plane_type: usize,
@@ -947,23 +987,21 @@ fn write_coefficients(
         .iter()
         .rposition(|&position| levels[position] != 0)
         .map_or(0, |last| last + 1);
-    let probs_for = |band: usize, context: usize| -> [u8; 3] {
-        let index = ((((plane_type * 2 + reference) * 6 + band) * 6) + context) * 3;
-        [
-            COEF_PROBS_4X4[index],
-            COEF_PROBS_4X4[index + 1],
-            COEF_PROBS_4X4[index + 2],
-        ]
-    };
+    let context_index =
+        |band: usize, context: usize| ((plane_type * 2 + reference) * 6 + band) * 6 + context;
     let mut cache = [0_u8; 16];
     let mut previous_zero = false;
     for c in 0..end {
-        let probs = probs_for(COEF_BAND_4X4[c], context);
+        let index = context_index(COEF_BAND_4X4[c], context);
+        let probs = &coef_probs[index * 3..index * 3 + 3];
         if !previous_zero {
             writer.write(true, probs[0]);
+            counts.eob_branch[index] += 1;
         }
         let level = levels[scan[c]];
         let magnitude = level.unsigned_abs();
+        // ZERO_TOKEN, ONE_TOKEN or TWO_TOKEN (any larger magnitude).
+        counts.coef[index][magnitude.min(2) as usize] += 1;
         if magnitude == 0 {
             writer.write(false, probs[1]);
             previous_zero = true;
@@ -981,8 +1019,10 @@ fn write_coefficients(
             >> 1;
     }
     if end < 16 {
-        let probs = probs_for(COEF_BAND_4X4[end], context);
-        writer.write(false, probs[0]);
+        let index = context_index(COEF_BAND_4X4[end], context);
+        writer.write(false, coef_probs[index * 3]);
+        counts.eob_branch[index] += 1;
+        counts.coef[index][3] += 1; // EOB_MODEL_TOKEN
     }
     end > 0
 }
@@ -1054,33 +1094,58 @@ fn mv_class(z: u32) -> (usize, u32) {
     (class, z - base)
 }
 
-fn write_mv(writer: &mut BoolEncoder, difference: Mv) {
+/// Writes a motion vector difference and counts it as `vp9_inc_mv` does.
+fn write_mv(
+    writer: &mut BoolEncoder,
+    context: &FrameContext,
+    counts: &mut FrameCounts,
+    difference: Mv,
+) {
     let joint = usize::from(difference.row != 0) * 2 + usize::from(difference.col != 0);
-    writer.tree(&MV_JOINT_TREE, &MV_JOINT_PROBS, joint as u8);
+    writer.tree(&MV_JOINT_TREE, &context.mv_joints, joint as u8);
+    counts.mv_joints[joint] += 1;
     for (component, value) in [(0, difference.row), (1, difference.col)] {
         if value == 0 {
             continue;
         }
-        let probs = &MV_COMPONENT_PROBS[component];
+        let probs = &context.mv[component];
+        let MvComponentCounts {
+            sign,
+            classes,
+            class0,
+            bits,
+            class0_fp,
+            fp: fp_counts,
+        } = &mut counts.mv[component];
         writer.write(value < 0, probs.sign);
+        sign[usize::from(value < 0)] += 1;
         let (class, offset) = mv_class(value.unsigned_abs() - 1);
         writer.tree(&MV_CLASS_TREE, &probs.classes, class as u8);
+        classes[class] += 1;
         let integer = offset >> 3;
         if class == 0 {
             writer.write(integer != 0, probs.class0);
+            class0[integer as usize] += 1;
         } else {
-            for bit in 0..class {
-                writer.write((integer >> bit) & 1 != 0, probs.bits[bit]);
+            for (bit, bit_counts) in bits.iter_mut().enumerate().take(class) {
+                let value = (integer >> bit) & 1;
+                writer.write(value != 0, probs.bits[bit]);
+                bit_counts[value as usize] += 1;
             }
         }
         let fraction = ((offset >> 1) & 3) as u8;
-        let fp = if class == 0 {
-            &probs.class0_fp[integer as usize]
+        let (fp, fraction_counts) = if class == 0 {
+            (
+                &probs.class0_fp[integer as usize],
+                &mut class0_fp[integer as usize],
+            )
         } else {
-            &probs.fp
+            (&probs.fp, fp_counts)
         };
         writer.tree(&MV_FP_TREE, fp, fraction);
-        // Without high-precision vectors the eighth-sample bit is implied.
+        fraction_counts[usize::from(fraction)] += 1;
+        // Without high-precision vectors the eighth-sample bit is implied,
+        // and its probabilities are never adapted.
     }
 }
 
@@ -1167,6 +1232,7 @@ fn compressed_header(key: bool) -> Vec<u8> {
 fn uncompressed_header(
     geometry: &Geometry,
     key: bool,
+    error_resilient: bool,
     base_q_idx: u8,
     full_range: bool,
     compressed_size: usize,
@@ -1177,7 +1243,7 @@ fn uncompressed_header(
     writer.bit(false); // show_existing_frame
     writer.bit(!key); // frame_type
     writer.bit(true); // show_frame
-    writer.bit(true); // error_resilient_mode
+    writer.bit(error_resilient); // error_resilient_mode
     if key {
         writer.literal(0x49_83_42, 24); // frame sync code
         writer.literal(1, 3); // color_space = CS_BT_601
@@ -1186,6 +1252,9 @@ fn uncompressed_header(
         writer.literal(geometry.height as u32 - 1, 16);
         writer.bit(false); // render_and_frame_size_different
     } else {
+        if !error_resilient {
+            writer.literal(0, 2); // reset_frame_context
+        }
         writer.literal(1, 8); // refresh_frame_flags: slot 0 only
         for _ in 0..3 {
             writer.literal(0, 3); // ref_frame_idx: every reference is slot 0
@@ -1196,6 +1265,12 @@ fn uncompressed_header(
         writer.bit(false); // allow_high_precision_mv
         writer.bit(false); // is_filter_switchable
         writer.literal(1, 2); // raw_interpolation_filter = EIGHTTAP (regular)
+    }
+    if !error_resilient {
+        // Adapt the probabilities backwards after every frame and keep them
+        // for the next one.
+        writer.bit(true); // refresh_frame_context
+        writer.bit(false); // frame_parallel_decoding_mode
     }
     writer.literal(0, 2); // frame_context_idx
     writer.literal(0, 6); // loop_filter_level
