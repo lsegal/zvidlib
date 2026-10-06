@@ -20,6 +20,7 @@ use zvidlib::{
     Mp4Demuxer, Mp4DemuxerOptions, NativeOpusDecoder, OPUS_SAMPLE_RATE, OpusHead, SampleRange,
     TrackKind, native_opus_audio_encoder_factory, opus_packet_samples, opus_preroll_packets,
 };
+use zvidlib::{WebmDemuxer, WebmDemuxerOptions, WebmMuxer};
 
 fn block_on<T>(future: impl Future<Output = T>) -> T {
     let waker = Waker::noop();
@@ -613,6 +614,266 @@ fn ffmpeg_decodes_the_native_encoders_mp4() {
         snr > 15.0,
         "ffmpeg's decode is only {snr:.1} dB from the input"
     );
+}
+
+// --- WebM ------------------------------------------------------------------------
+
+/// An exact-sample reader over a WebM's Opus track, as a caller builds one.
+fn open_webm_reader(bytes: Vec<u8>) -> (AudioSampleReader<NativeOpusDecoder>, OpusHead) {
+    let source = MemorySource::new(bytes);
+    let webm = block_on(WebmDemuxer::open(&source, WebmDemuxerOptions::default())).unwrap();
+    let track = webm
+        .tracks
+        .iter()
+        .find(|track| track.kind == TrackKind::Audio)
+        .expect("an audio track");
+    assert_eq!(track.codec, Codec::Opus);
+    let head = track.opus_config().unwrap();
+    let packets = block_on(track.to_encoded_audio_samples(&source, &Limits::default())).unwrap();
+    let timing = webm.audio_timing(track.id).unwrap();
+    let preroll = opus_preroll_packets(&packets);
+    let decoder = NativeOpusDecoder::new(&head, Limits::default()).unwrap();
+    let reader = AudioSampleReader::new(
+        decoder,
+        packets,
+        OPUS_SAMPLE_RATE,
+        u16::from(head.channels),
+        timing,
+        preroll,
+        Limits::default(),
+    )
+    .unwrap();
+    (reader, head)
+}
+
+/// FFmpeg's libopus WebM declares the pre-skip as `CodecDelay` and the end
+/// trim as the last block's `DiscardPadding`; read through both, it decodes
+/// to exactly libopus's output.
+#[test]
+fn a_libopus_webm_decodes_as_libopus_does() {
+    let bytes = std::fs::read(fixture("opus_stereo.webm")).unwrap();
+    let (mut reader, head) = open_webm_reader(bytes);
+    assert_eq!(head.channels, 2);
+    assert_eq!(reader.presentation_length(), 24_000);
+    let decoded = to_s16(&read_all(&mut reader));
+    let reference = read_s16(&fixture("opus_stereo_webm_libopus.s16"));
+    assert_eq!(decoded.len(), reference.len());
+    let largest_difference = decoded
+        .iter()
+        .zip(&reference)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0, f32::max);
+    assert!(
+        largest_difference <= 2.0,
+        "decoded samples differ from libopus's by up to {largest_difference}"
+    );
+}
+
+/// Encodes interleaved `samples` with the native encoder into a WebM.
+fn encode_to_webm(samples: &[f32], channels: u16, chunk: usize) -> Vec<u8> {
+    let factory = native_opus_audio_encoder_factory();
+    let configuration = AudioEncoderConfig {
+        codec: Codec::Opus,
+        profile: CodecProfile::Opus,
+        sample_rate: OPUS_SAMPLE_RATE,
+        channels,
+        timescale: OPUS_SAMPLE_RATE,
+        configuration: Vec::new(),
+    };
+    let mut encoder = factory.create(&configuration, &Limits::default()).unwrap();
+    let frames = samples.len() / usize::from(channels);
+    let mut muxer = block_on(WebmMuxer::new(
+        MemorySink::new(),
+        vec![Mp4TrackConfig {
+            encoder: encoder.config().clone(),
+            format: Mp4TrackFormat::Audio { channels },
+        }],
+        1_000_000,
+    ))
+    .unwrap();
+    let mut start = 0;
+    while start < frames {
+        let end = (start + chunk).min(frames);
+        let buffer = AudioBuffer::new(
+            SampleRange::new(start as u64, end as u64).unwrap(),
+            OPUS_SAMPLE_RATE,
+            channels,
+            samples[start * usize::from(channels)..end * usize::from(channels)].to_vec(),
+            &Limits::default(),
+        )
+        .unwrap();
+        for sample in block_on(encoder.encode(FrameIndex(0), buffer)).unwrap() {
+            block_on(muxer.write_sample(0, sample)).unwrap();
+        }
+        start = end;
+    }
+    let drain = block_on(encoder.finish()).unwrap();
+    for sample in drain.samples {
+        block_on(muxer.write_sample(0, sample)).unwrap();
+    }
+    muxer.set_audio_gapless(0, drain.gapless).unwrap();
+    block_on(muxer.finish()).unwrap().into_inner()
+}
+
+#[test]
+fn encoded_opus_round_trips_through_webm_with_its_exact_length() {
+    let frames = 48_000;
+    let input = test_signal(frames);
+    let bytes = encode_to_webm(&input, 2, 1_001);
+    let (mut reader, head) = open_webm_reader(bytes);
+    assert_eq!(head.channels, 2);
+    assert_eq!(reader.presentation_length(), frames as u64);
+    let decoded = read_all(&mut reader);
+    let snr = snr_db(&input, &decoded);
+    assert!(snr > 15.0, "round-trip SNR is only {snr:.1} dB");
+}
+
+/// FFmpeg reads zvidlib's Opus WebM with its trims applied. FFmpeg is an
+/// optional oracle: without it the test skips.
+#[test]
+fn ffmpeg_decodes_the_native_encoders_webm_to_its_exact_length() {
+    if !tool_available("ffmpeg") {
+        eprintln!("ffmpeg is not installed; skipping");
+        return;
+    }
+    let frames = 48_000;
+    let input = test_signal(frames);
+    let bytes = encode_to_webm(&input, 2, 960);
+    let path = std::env::temp_dir().join(format!("zvidlib-opus-{}.webm", std::process::id()));
+    std::fs::write(&path, bytes).unwrap();
+    let output = Command::new("ffmpeg")
+        .args(["-v", "error", "-c:a", "libopus", "-i"])
+        .arg(&path)
+        .args(["-f", "f32le", "-"])
+        .output()
+        .unwrap();
+    std::fs::remove_file(&path).ok();
+    if !output.status.success() {
+        // An FFmpeg built without libopus; its own Opus decoder honours
+        // the same fields.
+        eprintln!(
+            "ffmpeg could not use libopus: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let decoded: Vec<f32> = output
+        .stdout
+        .chunks_exact(4)
+        .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+        .collect();
+    assert_eq!(
+        decoded.len(),
+        input.len(),
+        "ffmpeg did not apply both trims"
+    );
+    let snr = snr_db(&input, &decoded);
+    assert!(
+        snr > 15.0,
+        "ffmpeg's decode is only {snr:.1} dB from the input"
+    );
+}
+
+/// An Opus track interleaved with video: the audio blocks the muxer holds
+/// back still land in presentation order, only the video is cued, and the
+/// audio reads back with exactly its length.
+#[test]
+fn opus_interleaves_with_video_in_webm() {
+    use zvidlib::{EncodedSample, EncoderConfig, SampleDependency, VideoDimensions};
+    let frames = 48_000;
+    let input = test_signal(frames);
+    let factory = native_opus_audio_encoder_factory();
+    let mut encoder = factory
+        .create(
+            &AudioEncoderConfig {
+                codec: Codec::Opus,
+                profile: CodecProfile::Opus,
+                sample_rate: OPUS_SAMPLE_RATE,
+                channels: 2,
+                timescale: OPUS_SAMPLE_RATE,
+                configuration: Vec::new(),
+            },
+            &Limits::default(),
+        )
+        .unwrap();
+    let buffer = AudioBuffer::new(
+        SampleRange::new(0, frames as u64).unwrap(),
+        OPUS_SAMPLE_RATE,
+        2,
+        input.clone(),
+        &Limits::default(),
+    )
+    .unwrap();
+    let mut audio = block_on(encoder.encode(FrameIndex(0), buffer)).unwrap();
+    let drain = block_on(encoder.finish()).unwrap();
+    audio.extend(drain.samples);
+
+    // A 30 fps video track of placeholder AV1 samples, a key frame a second.
+    let mut av1c = 12_u32.to_be_bytes().to_vec();
+    av1c.extend_from_slice(b"av1C");
+    av1c.extend_from_slice(&[0x81, 0, 0, 0]);
+    let video: Vec<EncodedSample> = (0..30)
+        .map(|index| EncodedSample {
+            data: vec![index as u8 + 1],
+            dts: index,
+            pts: index,
+            duration: 1,
+            is_sync: index % 30 == 0,
+            dependency: if index % 30 == 0 {
+                SampleDependency::INDEPENDENT
+            } else {
+                SampleDependency::DEPENDENT
+            },
+        })
+        .collect();
+    let mut muxer = block_on(WebmMuxer::new(
+        MemorySink::new(),
+        vec![
+            Mp4TrackConfig {
+                encoder: EncoderConfig {
+                    codec: Codec::Av1,
+                    timescale: 30,
+                    decoder_config: av1c,
+                },
+                format: Mp4TrackFormat::Video(
+                    VideoDimensions::new(16, 16, &Limits::default()).unwrap(),
+                ),
+            },
+            Mp4TrackConfig {
+                encoder: encoder.config().clone(),
+                format: Mp4TrackFormat::Audio { channels: 2 },
+            },
+        ],
+        1_000_000,
+    ))
+    .unwrap();
+    // Write both tracks in presentation order, as a recorder does.
+    let mut video = video.into_iter().peekable();
+    let mut audio = audio.into_iter().peekable();
+    loop {
+        let video_ms = video.peek().map(|sample| sample.pts * 1_000 / 30);
+        let audio_ms = audio.peek().map(|sample| sample.pts * 1_000 / 48_000);
+        match (video_ms, audio_ms) {
+            (Some(v), Some(a)) if v <= a => {
+                block_on(muxer.write_sample(0, video.next().unwrap())).unwrap()
+            }
+            (_, Some(_)) => block_on(muxer.write_sample(1, audio.next().unwrap())).unwrap(),
+            (Some(_), None) => block_on(muxer.write_sample(0, video.next().unwrap())).unwrap(),
+            (None, None) => break,
+        }
+    }
+    muxer.set_audio_gapless(1, drain.gapless).unwrap();
+    let bytes = block_on(muxer.finish()).unwrap().into_inner();
+
+    let source = MemorySource::new(bytes.clone());
+    let webm = block_on(WebmDemuxer::open(&source, WebmDemuxerOptions::default())).unwrap();
+    assert_eq!(webm.tracks.len(), 2);
+    assert_eq!(webm.tracks[0].samples.len(), 30);
+    assert!(webm.cues.iter().all(|cue| cue.track == webm.tracks[0].id));
+    let (mut reader, _) = open_webm_reader(bytes);
+    assert_eq!(reader.presentation_length(), frames as u64);
+    let snr = snr_db(&input, &read_all(&mut reader));
+    assert!(snr > 15.0, "round-trip SNR is only {snr:.1} dB");
 }
 
 // --- RFC 8251 test vectors ---------------------------------------------------

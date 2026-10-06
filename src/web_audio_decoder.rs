@@ -1,13 +1,13 @@
 //! Browser audio decoding for the `web` target: exact sample reads over an
-//! input MP4's AAC or Opus track.
+//! input MP4's AAC or Opus track or an input WebM's Opus or Vorbis track.
 //!
 //! Reads go through the same [`AudioSampleReader`] native callers use, so
 //! priming, padding, edits and preroll are handled identically. What decodes
 //! the packets it asks for is the browser's `WebCodecs` `AudioDecoder` when it
 //! supports the track, and the crate's own software decoder otherwise - the
-//! same arrangement [`crate::web_decoder`] has for video. Opus has a software
-//! decoder on every target; AAC has none in the browser build, so an AAC track
-//! the browser cannot decode is unsupported.
+//! same arrangement [`crate::web_decoder`] has for video. Opus and Vorbis have
+//! software decoders on every target; AAC has none in the browser build, so an
+//! AAC track the browser cannot decode is unsupported.
 //!
 //! A `WebCodecs` decoder may reset its state when it is flushed, so each read
 //! decodes from a freshly configured decoder, preroll included, rather than
@@ -20,7 +20,7 @@ use crate::audio::{AudioDecoder, AudioSampleReader, EncodedAudioSample};
 use crate::codec::CancellationToken;
 use crate::io::MemorySource;
 use crate::media::{AudioBuffer, Codec};
-use crate::mp4_demux::{Mp4Demuxer, Mp4DemuxerOptions, Mp4Track};
+use crate::mp4_demux::Mp4Track;
 use crate::timeline::SampleRange;
 use crate::web_decoder::{js_to_promise, normalize_js_error};
 use crate::{Error, ErrorKind, Limits, Result};
@@ -52,7 +52,7 @@ pub struct WebAudioDecoderConfig {
 }
 
 impl WebAudioDecoderConfig {
-    /// The configuration for `track`, an AAC or Opus track.
+    /// The configuration for `track`, an AAC, Opus or Vorbis track.
     pub fn for_track(track: &Mp4Track) -> Result<Self> {
         match track.codec {
             Codec::Aac => {
@@ -79,9 +79,20 @@ impl WebAudioDecoderConfig {
                     description,
                 })
             }
+            // WebCodecs takes Vorbis's three headers Xiph-laced, exactly as a
+            // WebM track's CodecPrivate stores them.
+            Codec::Vorbis => {
+                let config = track.vorbis_config()?;
+                Ok(Self {
+                    codec: "vorbis".to_owned(),
+                    sample_rate: config.sample_rate,
+                    channels: u16::from(config.channels),
+                    description: Some(config.to_codec_private()),
+                })
+            }
             _ => Err(Error::new(
                 ErrorKind::Unsupported,
-                "browser audio decoding supports AAC and Opus tracks",
+                "browser audio decoding supports AAC, Opus and Vorbis tracks",
             )),
         }
     }
@@ -128,16 +139,10 @@ impl WebAudioDecodeSession {
         choice: BackendChoice,
     ) -> Result<Self> {
         let source = MemorySource::new(bytes.to_vec());
-        let movie = Mp4Demuxer::open(&source, Mp4DemuxerOptions::default()).await?;
-        let track = movie
-            .tracks
-            .iter()
-            .filter(|track| track.kind == crate::TrackKind::Audio)
-            .nth(track_index as usize)
-            .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "no such audio track"))?;
-        let config = WebAudioDecoderConfig::for_track(track)?;
+        let (track, timing) =
+            crate::container::open_audio_track(&source, track_index as usize, limits).await?;
+        let config = WebAudioDecoderConfig::for_track(&track)?;
         let packets = track.to_encoded_audio_samples(&source, limits).await?;
-        let timing = track.audio_timing(movie.movie_timescale)?;
         let (software, preroll): (Option<Box<dyn AudioDecoder>>, usize) = match track.codec {
             Codec::Opus => (
                 Some(Box::new(crate::NativeOpusDecoder::new(
@@ -145,6 +150,13 @@ impl WebAudioDecodeSession {
                     *limits,
                 )?)),
                 crate::opus_preroll_packets(&packets),
+            ),
+            Codec::Vorbis => (
+                Some(Box::new(crate::NativeVorbisDecoder::new(
+                    &track.vorbis_config()?,
+                    *limits,
+                )?)),
+                crate::VORBIS_PREROLL_PACKETS,
             ),
             _ => (None, AAC_PREROLL_PACKETS),
         };
@@ -207,6 +219,12 @@ impl WebAudioDecodeSession {
     #[cfg(test)]
     pub(crate) fn is_software(&self) -> bool {
         self.webcodecs.is_none()
+    }
+
+    /// Drops the `WebCodecs` decoder, so reads go through software.
+    #[cfg(test)]
+    pub(crate) fn reset_to_software(&mut self) {
+        self.webcodecs = None;
     }
 
     /// Returns exactly the requested half-open range of presentation samples.
@@ -409,8 +427,12 @@ fn append_interleaved(
 
 /// Splits a batch's decoded samples into one buffer per packet by the
 /// packets' indexed intervals, which they must fill exactly.
+///
+/// The one exception is the batch's first packet, which a Vorbis decoder
+/// configured afresh decodes to nothing, having no block before it to overlap.
+/// It is the read's preroll, which is never kept, so it is given silence.
 fn split_into_packets(
-    samples: Vec<f32>,
+    mut samples: Vec<f32>,
     packets: &[EncodedAudioSample],
     sample_rate: u32,
     channels: u16,
@@ -421,6 +443,16 @@ fn split_into_packets(
         .map(|packet| packet.decoded_range.len())
         .sum();
     let channel_count = usize::from(channels);
+    let first = packets
+        .first()
+        .map_or(0, |packet| packet.decoded_range.len());
+    if packets.len() > 1
+        && first > 0
+        && samples.len() as u64 == (expected - first) * u64::from(channels)
+    {
+        let silence = first as usize * channel_count;
+        samples.splice(0..0, std::iter::repeat_n(0.0, silence));
+    }
     if samples.len() as u64 != expected * u64::from(channels) {
         return Err(Error::new(
             ErrorKind::Codec,

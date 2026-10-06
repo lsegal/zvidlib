@@ -13,13 +13,13 @@
 
 use std::path::{Path, PathBuf};
 
-use zvidlib::io::MemorySink;
+use zvidlib::io::{MemorySink, MemorySource};
 use zvidlib::mp4::{Mp4Muxer, Mp4TrackConfig, Mp4TrackFormat};
 use zvidlib::{
     AudioBuffer, AudioEncoderConfig, AudioEncoderFactory, AudioSampleReader, AudioTrackTiming,
     CancellationToken, Codec, CodecProfile, CodecSupport, EncodedSample, FrameIndex, Limits,
-    NativeVorbisDecoder, SampleRange, VORBIS_PREROLL_PACKETS, VorbisConfig,
-    native_vorbis_audio_encoder_factory,
+    NativeVorbisDecoder, SampleRange, TrackKind, VORBIS_PREROLL_PACKETS, VorbisConfig, WebmDemuxer,
+    WebmDemuxerOptions, WebmMuxer, native_vorbis_audio_encoder_factory,
 };
 
 fn fixture(name: &str) -> PathBuf {
@@ -476,4 +476,139 @@ fn mp4_refuses_a_vorbis_track() {
     ));
     let error = result.err().expect("Vorbis has no MP4 sample entry");
     assert_eq!(error.kind(), zvidlib::ErrorKind::Unsupported);
+}
+
+// --- WebM ------------------------------------------------------------------------
+
+/// The Vorbis track of a WebM, read the way a caller reads one.
+fn open_webm(bytes: Vec<u8>) -> (VorbisConfig, AudioSampleReader<NativeVorbisDecoder>) {
+    let source = MemorySource::new(bytes);
+    let webm = block_on(WebmDemuxer::open(&source, WebmDemuxerOptions::default())).unwrap();
+    let track = webm
+        .tracks
+        .iter()
+        .find(|track| track.kind == TrackKind::Audio)
+        .expect("an audio track");
+    assert_eq!(track.codec, Codec::Vorbis);
+    let config = track.vorbis_config().unwrap();
+    let packets = block_on(track.to_encoded_audio_samples(&source, &Limits::default())).unwrap();
+    let reader = AudioSampleReader::new(
+        NativeVorbisDecoder::new(&config, Limits::default()).unwrap(),
+        packets,
+        config.sample_rate,
+        u16::from(config.channels),
+        webm.audio_timing(track.id).unwrap(),
+        VORBIS_PREROLL_PACKETS,
+        Limits::default(),
+    )
+    .unwrap();
+    (config, reader)
+}
+
+fn encode_to_webm(input: &[f32], sample_rate: u32, channels: u16) -> Vec<u8> {
+    let factory = native_vorbis_audio_encoder_factory();
+    let mut encoder = factory
+        .create(
+            &encoder_config(sample_rate, channels, Vec::new()),
+            &Limits::default(),
+        )
+        .unwrap();
+    let mut muxer = block_on(WebmMuxer::new(
+        MemorySink::new(),
+        vec![Mp4TrackConfig {
+            encoder: encoder.config().clone(),
+            format: Mp4TrackFormat::Audio { channels },
+        }],
+        1_000_000,
+    ))
+    .unwrap();
+    let frames = input.len() / usize::from(channels);
+    let buffer = AudioBuffer::new(
+        SampleRange::new(0, frames as u64).unwrap(),
+        sample_rate,
+        channels,
+        input.to_vec(),
+        &Limits::default(),
+    )
+    .unwrap();
+    for sample in block_on(encoder.encode(FrameIndex(0), buffer)).unwrap() {
+        block_on(muxer.write_sample(0, sample)).unwrap();
+    }
+    let drain = block_on(encoder.finish()).unwrap();
+    for sample in drain.samples {
+        block_on(muxer.write_sample(0, sample)).unwrap();
+    }
+    muxer.set_audio_gapless(0, drain.gapless).unwrap();
+    block_on(muxer.finish()).unwrap().into_inner()
+}
+
+#[test]
+fn encoded_vorbis_round_trips_through_webm_with_its_exact_length() {
+    let frames = 44_100;
+    let input = music_like(frames, 44_100);
+    let (config, mut reader) = open_webm(encode_to_webm(&input, 44_100, 2));
+    assert_eq!(config.channels, 2);
+    assert_eq!(reader.presentation_length(), frames as u64);
+    let decoded = read_all(&mut reader);
+    let snr = snr_db(&input, &decoded);
+    assert!(snr > 20.0, "round trip is only {snr:.1} dB");
+}
+
+/// FFmpeg reads zvidlib's Vorbis WebM. FFmpeg is an optional oracle: without
+/// it the test skips. Its Vorbis decode, of libvorbis's own files too, comes
+/// out half a short block (128 samples) shorter than libvorbis's, so the
+/// decode is compared at the alignment that fits it best within that.
+#[test]
+fn ffmpeg_decodes_the_native_encoders_webm() {
+    let available = std::process::Command::new("ffmpeg")
+        .arg("-version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok();
+    if !available {
+        eprintln!("ffmpeg is not installed; skipping");
+        return;
+    }
+    let frames = 44_100;
+    let input = music_like(frames, 44_100);
+    let path = std::env::temp_dir().join(format!("zvidlib-vorbis-{}.webm", std::process::id()));
+    std::fs::write(&path, encode_to_webm(&input, 44_100, 2)).unwrap();
+    let output = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(&path)
+        .args(["-f", "f32le", "-"])
+        .output()
+        .unwrap();
+    std::fs::remove_file(&path).ok();
+    assert!(
+        output.status.success(),
+        "ffmpeg rejected the WebM: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let decoded: Vec<f32> = output
+        .stdout
+        .chunks_exact(4)
+        .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+        .collect();
+    assert!(
+        decoded.len().abs_diff(input.len()) <= 2 * 128,
+        "ffmpeg decoded {} samples of {}",
+        decoded.len(),
+        input.len()
+    );
+    let compared = decoded.len().min(input.len()) - 2 * 128;
+    let best = (0..=128)
+        .flat_map(|shift| [(shift, 0), (0, shift)])
+        .map(|(skip_input, skip_decoded)| {
+            snr_db(
+                &input[2 * skip_input..2 * skip_input + compared],
+                &decoded[2 * skip_decoded..2 * skip_decoded + compared],
+            )
+        })
+        .fold(f64::NEG_INFINITY, f64::max);
+    assert!(
+        best > 20.0,
+        "ffmpeg's decode is only {best:.1} dB from the input"
+    );
 }

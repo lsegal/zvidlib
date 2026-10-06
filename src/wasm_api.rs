@@ -636,7 +636,8 @@ pub struct WasmCreateOptions {
 #[wasm_bindgen(js_class = CreateOptions)]
 impl WasmCreateOptions {
     /// `container` is `"mp4"` (the default) or `"webm"`, whose `finish()`
-    /// returns a `video/webm` Blob. WebM output is AV1 video only.
+    /// returns a `video/webm` Blob. WebM output carries AV1 video and Opus or
+    /// Vorbis audio.
     #[wasm_bindgen(constructor)]
     pub fn new(container: Option<String>) -> Result<WasmCreateOptions, JsValue> {
         let name = container.unwrap_or_else(|| "mp4".to_owned());
@@ -653,7 +654,11 @@ impl WasmCreateOptions {
             frame_rate: None,
             audio_sample_rate: None,
             video_codec: Codec::Av1,
-            audio_codec: Codec::Aac,
+            // WebM permits no AAC, so a WebM output starts out on Opus.
+            audio_codec: match container {
+                Container::WebM => Codec::Opus,
+                _ => Codec::Aac,
+            },
             cover_source: CoverSource::default(),
         })
     }
@@ -744,29 +749,29 @@ impl WasmCreateOptions {
         Ok(())
     }
 
-    /// The browser audio codec for [`WasmAudioStream::put`]: `"aac"` (AAC-LC,
-    /// the default) or `"opus"`. Opus is encoded from 48 kHz PCM, the rate it
-    /// decodes at. Vorbis is refused: the output container is MP4, which has
-    /// no widely supported mapping for it.
+    /// The browser audio codec for [`WasmAudioStream::put`]: `"aac"` (AAC-LC),
+    /// `"opus"` or `"vorbis"`. An `"mp4"` output defaults to AAC and takes AAC
+    /// or Opus; MP4 has no widely supported mapping for Vorbis. A `"webm"`
+    /// output defaults to Opus and takes Opus or Vorbis; WebM permits no AAC.
+    /// AAC and Opus encode through `WebCodecs`, Opus through zvidlib's own
+    /// encoder where the browser has no `AudioEncoder`, and Vorbis, which no
+    /// browser encodes, always through zvidlib's own encoder. Opus is encoded
+    /// from 48 kHz PCM, the rate it decodes at.
     #[wasm_bindgen(getter, js_name = audioCodec)]
     pub fn audio_codec(&self) -> String {
         match self.audio_codec {
             Codec::Opus => "opus".to_owned(),
+            Codec::Vorbis => "vorbis".to_owned(),
             _ => "aac".to_owned(),
         }
     }
 
     #[wasm_bindgen(setter, js_name = audioCodec)]
     pub fn set_audio_codec(&mut self, value: String) -> Result<(), JsValue> {
-        self.audio_codec = match value.as_str() {
+        let codec = match value.as_str() {
             "aac" => Codec::Aac,
             "opus" => Codec::Opus,
-            "vorbis" => {
-                return Err(js_error(
-                    ErrorKind::Unsupported,
-                    "Vorbis cannot be written to MP4, the only browser output container",
-                ));
-            }
+            "vorbis" => Codec::Vorbis,
             other => {
                 return Err(js_error(
                     ErrorKind::Unsupported,
@@ -774,6 +779,19 @@ impl WasmCreateOptions {
                 ));
             }
         };
+        match (self.container, codec) {
+            (Container::WebM, Codec::Aac) => {
+                return Err(js_error(ErrorKind::Unsupported, WEBM_AUDIO_UNSUPPORTED));
+            }
+            (Container::Mp4, Codec::Vorbis) => {
+                return Err(js_error(
+                    ErrorKind::Unsupported,
+                    "Vorbis has no widely supported MP4 mapping; write it to a webm output",
+                ));
+            }
+            _ => {}
+        }
+        self.audio_codec = codec;
         Ok(())
     }
 
@@ -1182,10 +1200,11 @@ pub fn video_encode_support(
     Ok(support.is_supported())
 }
 
-/// Reports whether this browser's `WebCodecs` bridge can encode `codec`:
-/// `"aac"` (AAC-LC, the default) or `"opus"`. `"vorbis"` is always `false`:
-/// browsers offer no `WebCodecs` Vorbis encoder, and MP4, the browser output
-/// container, has no widely supported mapping for Vorbis to write one to.
+/// Reports whether this browser build can encode `codec`: `"aac"` (AAC-LC,
+/// the default), which needs the browser's `WebCodecs` `AudioEncoder`, or
+/// `"opus"` or `"vorbis"`, which zvidlib encodes itself where the browser
+/// cannot. Which container can carry the codec is `CreateOptions.audioCodec`'s
+/// concern: MP4 takes AAC or Opus, WebM Opus or Vorbis.
 ///
 /// `hardware` accepts the same values as [`video_encode_support`], for the
 /// same reason: `WebCodecs`' own `isConfigSupported()` is asynchronous and
@@ -1766,7 +1785,8 @@ pub struct WasmMediaInput {
 /// box header, or an EBML header, which a WebM probe bounds at 4 KiB.
 const SIGNATURE_PREFIX_BYTES: usize = 8 * 1024;
 
-const WEBM_AUDIO_UNSUPPORTED: &str = "WebM output is video-only: WebM permits only Vorbis or Opus audio, so AAC audio needs an mp4 output";
+const WEBM_AUDIO_UNSUPPORTED: &str =
+    "WebM permits only Opus or Vorbis audio, so AAC audio needs an mp4 output";
 
 impl WasmMediaInput {
     async fn open_inner(
@@ -2021,6 +2041,11 @@ async fn encode_browser_video_frame(
 struct BrowserAudioTrack {
     codec: Codec,
     session: Option<WebAudioEncodeSession>,
+    /// zvidlib's own encoder, for Vorbis, which no browser encodes, and for
+    /// Opus in a browser without a `WebCodecs` `AudioEncoder`.
+    software: Option<Box<dyn crate::AudioEncoder>>,
+    /// The trim the software encoder reported when it drained.
+    software_gapless: Option<crate::AudioGapless>,
     sample_rate: Option<u32>,
     channels: Option<u16>,
     decoder_config: Option<Vec<u8>>,
@@ -2036,6 +2061,8 @@ impl BrowserAudioTrack {
         Self {
             codec,
             session: None,
+            software: None,
+            software_gapless: None,
             sample_rate: None,
             channels: None,
             decoder_config: None,
@@ -2102,6 +2129,18 @@ async fn encode_browser_audio_frame(
         }
     }
 
+    let codec = track.borrow().codec;
+    if encodes_in_software(codec) {
+        return encode_software_audio_frame(
+            track,
+            index,
+            sample_rate,
+            channels,
+            range_start,
+            samples,
+        )
+        .await;
+    }
     let mut session = {
         let mut state = track.borrow_mut();
         match state.session.take() {
@@ -2124,6 +2163,85 @@ async fn encode_browser_audio_frame(
     state.session = Some(session);
     let chunks = result?;
     push_audio_chunks(&mut state, sample_rate, chunks)?;
+    state.next_put_index += 1;
+    state.input_frames += frames;
+    Ok(())
+}
+
+/// Whether `codec` is encoded by zvidlib's own encoder rather than
+/// `WebCodecs`: always for Vorbis, which no browser encodes, and for Opus
+/// where the browser has no `AudioEncoder`.
+fn encodes_in_software(codec: Codec) -> bool {
+    match codec {
+        Codec::Vorbis => true,
+        Codec::Opus => {
+            !Reflect::has(&js_sys::global(), &JsValue::from_str("AudioEncoder")).unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+
+/// Encodes one buffer through zvidlib's own Opus or Vorbis encoder, creating
+/// it on the first call.
+async fn encode_software_audio_frame(
+    track: &Rc<RefCell<BrowserAudioTrack>>,
+    index: u64,
+    sample_rate: u32,
+    channels: u16,
+    range_start: u64,
+    samples: Vec<f32>,
+) -> crate::Result<()> {
+    let mut encoder = {
+        let mut state = track.borrow_mut();
+        match state.software.take() {
+            Some(encoder) => encoder,
+            None => {
+                let configuration = crate::AudioEncoderConfig {
+                    codec: state.codec,
+                    profile: if state.codec == Codec::Vorbis {
+                        CodecProfile::Vorbis
+                    } else {
+                        CodecProfile::Opus
+                    },
+                    sample_rate,
+                    channels,
+                    timescale: sample_rate,
+                    configuration: Vec::new(),
+                };
+                let encoder = if state.codec == Codec::Vorbis {
+                    crate::AudioEncoderFactory::create(
+                        &crate::native_vorbis_audio_encoder_factory(),
+                        &configuration,
+                        &Limits::default(),
+                    )?
+                } else {
+                    crate::AudioEncoderFactory::create(
+                        &crate::native_opus_audio_encoder_factory(),
+                        &configuration,
+                        &Limits::default(),
+                    )?
+                };
+                state.sample_rate = Some(sample_rate);
+                state.channels = Some(channels);
+                state.decoder_config = Some(encoder.config().decoder_config.clone());
+                encoder
+            }
+        }
+    };
+    let frames = (samples.len() / usize::from(channels.max(1))) as u64;
+    let result = match CoreAudioBuffer::new(
+        CoreSampleRange::new(range_start, range_start + frames)?,
+        sample_rate,
+        channels,
+        samples,
+        &Limits::default(),
+    ) {
+        Ok(buffer) => encoder.encode(CoreFrameIndex(index), buffer).await,
+        Err(error) => Err(error),
+    };
+    let mut state = track.borrow_mut();
+    state.software = Some(encoder);
+    state.samples.extend(result?);
     state.next_put_index += 1;
     state.input_frames += frames;
     Ok(())
@@ -2184,8 +2302,16 @@ async fn finalize_audio_track(
         let mut state = track.borrow_mut();
         state.session.take()
     };
-    if pending_session.is_none() && track.borrow().samples.is_empty() {
+    let pending_software = track.borrow_mut().software.take();
+    if pending_session.is_none() && pending_software.is_none() && track.borrow().samples.is_empty()
+    {
         return Ok(None);
+    }
+    if let Some(mut encoder) = pending_software {
+        let drain = encoder.finish().await?;
+        let mut state = track.borrow_mut();
+        state.samples.extend(drain.samples);
+        state.software_gapless = Some(drain.gapless);
     }
     if let Some(mut session) = pending_session {
         let remaining = session.finish().await?;
@@ -2229,7 +2355,10 @@ async fn finalize_audio_track(
     // An Opus encoder's delay is its pre-skip, and the silence it codes after
     // the input to flush that delay out is end padding, so the edit list trims
     // both and the track presents exactly what was put.
-    let gapless = if codec == Codec::Opus {
+    let software_gapless = track.borrow().software_gapless;
+    let gapless = if let Some(gapless) = software_gapless {
+        gapless
+    } else if codec == Codec::Opus {
         let priming = u32::from(crate::OpusHead::from_dops(&decoder_config)?.pre_skip);
         let encoded: u64 = samples
             .iter()
@@ -2376,16 +2505,7 @@ async fn finalize_browser_output(
     }
 
     if container == Container::WebM {
-        if track_configs
-            .iter()
-            .any(|config| matches!(config.format, Mp4TrackFormat::Audio { .. }))
-        {
-            return Err(crate::Error::new(
-                ErrorKind::Unsupported,
-                WEBM_AUDIO_UNSUPPORTED,
-            ));
-        }
-        return mux_browser_webm(track_configs, track_samples).await;
+        return mux_browser_webm(track_configs, track_samples, audio_gapless).await;
     }
 
     let sink = MemorySink::new();
@@ -2410,13 +2530,14 @@ async fn finalize_browser_output(
     Ok(sink.into_inner())
 }
 
-/// Muxes buffered browser video tracks into a WebM. [`WebmMuxer`] takes
+/// Muxes buffered browser tracks into a WebM. [`WebmMuxer`] takes
 /// samples in one presentation-time order across tracks, so the per-track
 /// buffers are merged by exact presentation time, each track keeping its own
 /// order and earlier tracks winning ties.
 async fn mux_browser_webm(
     track_configs: Vec<Mp4TrackConfig>,
     track_samples: Vec<Vec<EncodedSample>>,
+    audio_gapless: Option<(usize, crate::AudioGapless)>,
 ) -> crate::Result<Vec<u8>> {
     let timescales: Vec<i128> = track_configs
         .iter()
@@ -2438,8 +2559,21 @@ async fn mux_browser_webm(
         crate::OutputOptions::default().max_samples_per_track,
     )
     .await?;
+    // An audio track's trim is declared right after its last sample, before
+    // a later video sample can write that sample's block without it.
+    let mut remaining: Vec<usize> = vec![0; timescales.len()];
+    for (track, _) in &merged {
+        remaining[*track] += 1;
+    }
     for (track, sample) in merged {
         muxer.write_sample(track, sample).await?;
+        remaining[track] -= 1;
+        if remaining[track] == 0
+            && let Some((audio_track, gapless)) = audio_gapless
+            && audio_track == track
+        {
+            muxer.set_audio_gapless(track, gapless)?;
+        }
     }
     Ok(muxer.finish().await?.into_inner())
 }
@@ -2559,12 +2693,12 @@ impl WasmMediaOutput {
         })
     }
 
-    /// A `"webm"` output has no audio track: WebM permits only Vorbis or Opus
-    /// audio and the browser bridge encodes AAC, so this rejects with
-    /// `UNSUPPORTED` rather than produce a file no WebM player accepts.
+    /// Output audio track `index`. Track 0 encodes in the codec
+    /// `CreateOptions.audioCodec` chose; other indices report `UNSUPPORTED`
+    /// from `put()`.
     pub fn audio(&self, index: u32) -> Result<WasmAudioStream, JsValue> {
         ensure_open(&self.state)?;
-        if self.container == Container::WebM {
+        if self.container == Container::WebM && self.browser_audio.borrow().codec == Codec::Aac {
             return Err(js_error(ErrorKind::Unsupported, WEBM_AUDIO_UNSUPPORTED));
         }
         // The WebCodecs bridge currently supports encoding a single audio
@@ -3537,17 +3671,23 @@ mod tests {
             video_frame_duration: 1,
             video_codec: Codec::Av1,
             browser_video_tracks: Rc::new(RefCell::new(BTreeMap::new())),
-            browser_audio: Rc::new(RefCell::new(BrowserAudioTrack::new())),
+            browser_audio: Rc::new(RefCell::new(BrowserAudioTrack::new(options.audio_codec))),
             cover_art: None,
             cover_source: options.cover_source,
         }
     }
 
     #[wasm_bindgen_test]
-    fn webm_output_refuses_audio_and_cover_art() {
-        let options = WasmCreateOptions::new(Some("webm".to_owned())).unwrap();
+    fn webm_output_takes_opus_or_vorbis_audio_but_refuses_aac_and_cover_art() {
+        let mut options = WasmCreateOptions::new(Some("webm".to_owned())).unwrap();
+        assert_eq!(options.audio_codec(), "opus");
+        assert_error_code(
+            &options.set_audio_codec("aac".into()).unwrap_err(),
+            "UNSUPPORTED",
+        );
+        options.set_audio_codec("vorbis".into()).unwrap();
         let mut output = webm_output(&options);
-        assert_error_code(&output.audio(0).err().unwrap(), "UNSUPPORTED");
+        assert!(output.audio(0).is_ok());
         let picture = Uint8Array::from(&[0xFF_u8, 0xD8, 0xFF][..]);
         assert_error_code(
             &output
@@ -3758,12 +3898,9 @@ mod tests {
             audio_encode_support(None, Some("aac".into())).unwrap(),
             has_encoder
         );
-        assert_eq!(
-            audio_encode_support(None, Some("opus".into())).unwrap(),
-            has_encoder
-        );
-        // No browser encodes Vorbis, and MP4 could not carry it.
-        assert!(!audio_encode_support(None, Some("vorbis".into())).unwrap());
+        // zvidlib encodes Opus and Vorbis itself where the browser cannot.
+        assert!(audio_encode_support(None, Some("opus".into())).unwrap());
+        assert!(audio_encode_support(None, Some("vorbis".into())).unwrap());
         assert!(!audio_encode_support(Some("require".into()), Some("opus".into())).unwrap());
         assert_error_code(
             &audio_encode_support(None, Some("flac".into())).unwrap_err(),
@@ -3796,6 +3933,7 @@ mod tests {
         let mut output = WasmMediaOutput {
             bytes: Vec::new(),
             mime_type: options.mime_type,
+            container: options.container,
             max_output_bytes: options.max_output_bytes,
             state: Rc::new(Cell::new(false)),
             timeline: None,
@@ -3929,6 +4067,7 @@ mod tests {
         let media = WasmMediaInput {
             bytes: Rc::new(bytes),
             state: Rc::new(Cell::new(false)),
+            container: Some(Container::Mp4),
         };
         let audio = media.audio(0).unwrap();
         let count = JsFuture::from(audio.sample_count(None)).await.unwrap();
@@ -3983,5 +4122,153 @@ mod tests {
             .unwrap_err(),
             "INVALID_INPUT",
         );
+    }
+
+    /// Encodes `seconds` of a 48 kHz stereo tone through a browser output's
+    /// track 0 and returns the finished file and the PCM that was put.
+    async fn browser_audio_output(options: WasmCreateOptions) -> (Vec<u8>, Vec<f32>) {
+        let mut output = WasmMediaOutput {
+            bytes: Vec::new(),
+            mime_type: options.mime_type.clone(),
+            container: options.container,
+            max_output_bytes: options.max_output_bytes,
+            state: Rc::new(Cell::new(false)),
+            timeline: None,
+            video_timescale: 30,
+            video_frame_duration: 1,
+            video_codec: Codec::Av1,
+            browser_video_tracks: Rc::new(RefCell::new(BTreeMap::new())),
+            browser_audio: Rc::new(RefCell::new(BrowserAudioTrack::new(options.audio_codec))),
+            cover_art: None,
+            cover_source: options.cover_source,
+        };
+        const FRAMES_PER_BUFFER: u64 = 4_800;
+        const BUFFERS: u64 = 10;
+        let input: Vec<f32> = (0..FRAMES_PER_BUFFER * BUFFERS)
+            .flat_map(|i| {
+                let t = i as f32 / 48_000.0;
+                [
+                    0.3 * (2.0 * std::f32::consts::PI * 440.0 * t).sin(),
+                    0.3 * (2.0 * std::f32::consts::PI * 550.0 * t).sin(),
+                ]
+            })
+            .collect();
+        let audio = output.audio(0).unwrap();
+        for buffer_index in 0..BUFFERS {
+            let start = buffer_index * FRAMES_PER_BUFFER;
+            let range =
+                WasmSampleRange(CoreSampleRange::new(start, start + FRAMES_PER_BUFFER).unwrap());
+            let samples = &input[2 * start as usize..2 * (start + FRAMES_PER_BUFFER) as usize];
+            let buffer =
+                WasmAudioBuffer::new(&range, 48_000, 2, Float32Array::from(samples)).unwrap();
+            JsFuture::from(audio.put(BigInt::from(buffer_index).into(), &buffer, None))
+                .await
+                .expect("encoding an audio buffer must succeed");
+        }
+        let blob: Blob = JsFuture::from(output.finish())
+            .await
+            .expect("the output must finish")
+            .unchecked_into();
+        let bytes = Uint8Array::new(&JsFuture::from(blob.array_buffer()).await.unwrap()).to_vec();
+        (bytes, input)
+    }
+
+    /// Issue #524: a WebM output carries Opus or Vorbis audio, which reads
+    /// back through an input stream with exactly the samples that were put,
+    /// and which Chrome's own media stack decodes.
+    #[wasm_bindgen_test(async)]
+    async fn a_webm_output_carries_opus_and_vorbis_audio() {
+        for codec in ["opus", "vorbis"] {
+            let mut options = WasmCreateOptions::new(Some("webm".to_owned())).unwrap();
+            options.set_audio_codec(codec.into()).unwrap();
+            let (bytes, input) = browser_audio_output(options).await;
+
+            let media = WasmMediaInput {
+                bytes: Rc::new(bytes.clone()),
+                state: Rc::new(Cell::new(false)),
+                container: Some(Container::WebM),
+            };
+            let audio = media.audio(0).unwrap();
+            let config = JsFuture::from(audio.decoder_config(None)).await.unwrap();
+            assert_eq!(
+                Reflect::get(&config, &"codec".into())
+                    .unwrap()
+                    .as_string()
+                    .as_deref(),
+                Some(codec)
+            );
+            let count = JsFuture::from(audio.sample_count(None)).await.unwrap();
+            assert_eq!(parse_u64(&count, "sampleCount").unwrap(), 48_000, "{codec}");
+            let buffer = JsFuture::from(audio.get_range(
+                BigInt::from(0_u64).into(),
+                BigInt::from(48_000_u64).into(),
+                None,
+            ))
+            .await
+            .unwrap();
+            let samples: Float32Array = Reflect::get(&buffer, &"samples".into())
+                .unwrap()
+                .unchecked_into();
+            let samples = samples.to_vec();
+            let noise: f32 = samples
+                .iter()
+                .zip(&input)
+                .map(|(a, b)| (a - b).powi(2))
+                .sum();
+            let signal: f32 = input.iter().map(|v| v * v).sum();
+            let snr = 10.0 * (signal / noise).log10();
+            assert!(snr > 15.0, "{codec} reads back {snr:.1} dB from its input");
+
+            let context =
+                web_sys::OfflineAudioContext::new_with_number_of_channels_and_length_and_sample_rate(
+                    2, 48_000, 48_000.0,
+                )
+                .unwrap();
+            let array = Uint8Array::from(bytes.as_slice());
+            let decoded: web_sys::AudioBuffer = JsFuture::from(
+                context
+                    .decode_audio_data(&array.buffer())
+                    .expect("decodeAudioData must accept the call"),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("the browser must decode zvidlib's {codec} WebM"))
+            .unchecked_into();
+            assert_eq!(decoded.number_of_channels(), 2);
+            assert!(
+                decoded.length().abs_diff(48_000) <= 960,
+                "the browser decoded {} frames of {codec} where 48000 were put",
+                decoded.length()
+            );
+        }
+    }
+
+    /// The browser's `WebCodecs` Vorbis decoder, where it has one, and
+    /// zvidlib's own agree on a WebM Vorbis track; the software fallback is
+    /// what a browser without one reads with.
+    #[wasm_bindgen_test(async)]
+    async fn software_and_webcodecs_reads_agree_on_a_vorbis_webm() {
+        let mut options = WasmCreateOptions::new(Some("webm".to_owned())).unwrap();
+        options.set_audio_codec("vorbis".into()).unwrap();
+        let (bytes, _) = browser_audio_output(options).await;
+        let cancellation = CancellationToken::new();
+        let mut session = WebAudioDecodeSession::open(&bytes, 0, &Limits::default())
+            .await
+            .unwrap();
+        let mut software = WebAudioDecodeSession::open(&bytes, 0, &Limits::default())
+            .await
+            .unwrap();
+        for (start, end) in [(10_000, 12_000), (0, 500), (47_000, 48_000)] {
+            let range = CoreSampleRange::new(start, end).unwrap();
+            let got = session.get_range(range, &cancellation).await.unwrap();
+            software.reset_to_software();
+            let expected = software.get_range(range, &cancellation).await.unwrap();
+            let largest = got
+                .samples
+                .iter()
+                .zip(&expected.samples)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0, f32::max);
+            assert!(largest < 1e-3, "[{start}, {end}) differs by {largest}");
+        }
     }
 }

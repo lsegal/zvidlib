@@ -216,7 +216,8 @@ pub use vorbis::{
 };
 pub use webm::WebmMuxer;
 pub use webm_demux::{
-    WebmCuePoint, WebmDemuxer, WebmDemuxerOptions, WebmSeekPoint, WebmSkippedTrack, probe_webm,
+    WebmAudioTrim, WebmCuePoint, WebmDemuxer, WebmDemuxerOptions, WebmSeekPoint, WebmSkippedTrack,
+    probe_webm,
 };
 
 #[cfg(not(target_arch = "wasm32"))]

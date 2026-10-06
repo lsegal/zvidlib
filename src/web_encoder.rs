@@ -439,13 +439,20 @@ pub fn audio_encode_capability(
     hardware: HardwarePreference,
 ) -> CodecSupport {
     match (codec, profile) {
-        (Codec::Aac, CodecProfile::AacLowComplexity) | (Codec::Opus, CodecProfile::Opus) => {}
-        // Browsers offer no Vorbis encoder, and MP4 no mapping to write one to.
-        (Codec::Vorbis, _) => return CodecSupport::UnsupportedCodec,
+        (Codec::Aac, CodecProfile::AacLowComplexity)
+        | (Codec::Opus, CodecProfile::Opus)
+        | (Codec::Vorbis, CodecProfile::Vorbis) => {}
         _ => return CodecSupport::UnsupportedProfile,
     }
     if hardware == HardwarePreference::Require {
         return CodecSupport::HardwareUnavailable;
+    }
+    // zvidlib's own encoders cover Opus where the browser has no
+    // `AudioEncoder`, and Vorbis, which no browser encodes.
+    if codec != Codec::Aac {
+        return CodecSupport::Supported {
+            implementation: CodecImplementation::Software,
+        };
     }
     let global = js_sys::global();
     let has_constructor =

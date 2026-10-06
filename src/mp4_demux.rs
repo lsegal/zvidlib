@@ -7,6 +7,7 @@ use crate::media::{Codec, VideoDimensions};
 use crate::mp4::{CoverArt, CoverArtFormat};
 use crate::opus::{OPUS_SAMPLE_RATE, OpusHead};
 use crate::timeline::FrameIndex;
+use crate::vorbis::VorbisConfig;
 use crate::{Error, ErrorKind, Limits, Result};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -177,9 +178,21 @@ impl Mp4Track {
         Ok(head)
     }
 
+    /// Parses the three Vorbis header packets a WebM Vorbis track carries as
+    /// its `decoder_config` (see [`crate::WebmDemuxer`]); Vorbis has no MP4
+    /// sample entry.
+    pub fn vorbis_config(&self) -> Result<VorbisConfig> {
+        if self.kind != TrackKind::Audio || self.codec != Codec::Vorbis {
+            return Err(unsupported(
+                "Vorbis configuration requires a Vorbis audio track",
+            ));
+        }
+        VorbisConfig::from_codec_private(&self.decoder_config)
+    }
+
     /// The sample rate this audio track decodes at: the AAC
-    /// `AudioSpecificConfig`'s, or 48 kHz for Opus, which always decodes at
-    /// that rate whatever its input was.
+    /// `AudioSpecificConfig`'s or the Vorbis identification header's, or 48
+    /// kHz for Opus, which always decodes at that rate whatever its input was.
     pub fn audio_sample_rate(&self) -> Result<u32> {
         match self.codec {
             Codec::Aac => Ok(self.aac_config()?.sample_rate),
@@ -187,12 +200,15 @@ impl Mp4Track {
                 self.opus_config()?;
                 Ok(OPUS_SAMPLE_RATE)
             }
-            _ => Err(unsupported("audio packets require an AAC or Opus track")),
+            Codec::Vorbis => Ok(self.vorbis_config()?.sample_rate),
+            _ => Err(unsupported(
+                "audio packets require an AAC, Opus or Vorbis track",
+            )),
         }
     }
 
-    /// Reads every indexed audio packet - AAC access units or Opus packets -
-    /// from its validated byte range.
+    /// Reads every indexed audio packet - AAC access units, Opus or Vorbis
+    /// packets - from its validated byte range.
     ///
     /// Packet intervals use the decoded PCM sample clock and remain contiguous
     /// even when the MP4 track timescale differs from the decoded sample rate.
@@ -202,6 +218,13 @@ impl Mp4Track {
         limits: &Limits,
     ) -> Result<Vec<EncodedAudioSample>> {
         let sample_rate = self.audio_sample_rate()?;
+        // A Vorbis packet's length depends on the one before it, so the
+        // intervals are assigned once every packet has been read.
+        let vorbis = if self.codec == Codec::Vorbis {
+            Some(self.vorbis_config()?)
+        } else {
+            None
+        };
         let mut total_bytes = 0_u64;
         let mut decoded_start = 0_u64;
         let mut track_ticks = 0_u64;
@@ -218,6 +241,13 @@ impl Mp4Track {
             let mut data = vec![0_u8; sample.size as usize];
             self.read_sample_into(source, decode_index, &mut data)
                 .await?;
+            if vorbis.is_some() {
+                packets.push(EncodedAudioSample {
+                    decoded_range: crate::SampleRange::new(0, 0)?,
+                    data,
+                });
+                continue;
+            }
             let decoded_end = if self.codec == Codec::Opus {
                 // An Opus packet's own table of contents says how long it
                 // decodes. Muxers shorten the last sample's duration to trim
@@ -242,6 +272,9 @@ impl Mp4Track {
         }
         if packets.is_empty() {
             return Err(malformed("audio track contains no samples"));
+        }
+        if let Some(vorbis) = vorbis {
+            return vorbis.encoded_samples(packets.into_iter().map(|packet| packet.data).collect());
         }
         Ok(packets)
     }
