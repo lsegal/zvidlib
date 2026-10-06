@@ -3,8 +3,8 @@
 //! Decodes through Microsoft's AAC decoder MFT, a synchronous transform that
 //! takes raw AAC access units (`MF_MT_AAC_PAYLOAD_TYPE` 0) configured from the
 //! track's `AudioSpecificConfig` and returns interleaved 32-bit float PCM.
-//! Its output trails its input by one access unit, which [`Decoder::decode`]
-//! hides from the caller.
+//! Its output trails its input by one access unit, which
+//! [`super::NativeAacDecoder`] compensates for.
 
 use std::mem::ManuallyDrop;
 use std::ptr;
@@ -36,9 +36,6 @@ pub(super) struct Decoder {
     transform: IMFTransform,
     output_size: u32,
     sample_rate: u32,
-    /// The access unit the last `decode` call was given and its position,
-    /// whose overlap the next one needs; `None` after `reset`.
-    previous: Option<(Vec<u8>, u64)>,
 }
 
 // The MFT is a free-threaded COM object living in the process's multithreaded
@@ -83,39 +80,15 @@ impl Decoder {
                 transform,
                 output_size: info.cbSize.max(MIN_OUTPUT_BYTES),
                 sample_rate: config.sample_rate,
-                previous: None,
             })
         }
     }
 
     /// Decodes one access unit starting at media sample `position`, appending
-    /// its interleaved PCM to `out`.
-    ///
-    /// The MFT emits each access unit's PCM only once the next unit arrives,
-    /// and neither its low-latency mode nor draining changes that. An AAC-LC
-    /// frame's PCM depends only on its own access unit and the one before it,
-    /// so each call starts the MFT clean, feeds that pair, and pushes the
-    /// current frame out by repeating its unit. The repeat's own PCM is never
-    /// emitted: the next call starts clean again.
+    /// whatever interleaved PCM the MFT emits for it to `out`.
     pub(super) fn decode(&mut self, data: &[u8], position: u64, out: &mut Vec<f32>) -> Result<()> {
-        self.flush()?;
-        let mut discarded = Vec::new();
-        if let Some((previous, previous_position)) = &self.previous {
-            let sample = self.access_unit(previous, *previous_position)?;
-            self.process(&sample, &mut discarded)?;
-        }
         let sample = self.access_unit(data, position)?;
-        self.process(&sample, &mut discarded)?;
-        self.process(&sample, out)?;
-        let mut previous = self
-            .previous
-            .take()
-            .map(|(previous, _)| previous)
-            .unwrap_or_default();
-        previous.clear();
-        previous.extend_from_slice(data);
-        self.previous = Some((previous, position));
-        Ok(())
+        self.process(&sample, out)
     }
 
     fn process(&mut self, sample: &IMFSample, out: &mut Vec<f32>) -> Result<()> {
@@ -124,14 +97,9 @@ impl Decoder {
         self.drain_output(out)
     }
 
-    fn flush(&mut self) -> Result<()> {
+    pub(super) fn reset(&mut self) -> Result<()> {
         unsafe { self.transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0) }
             .map_err(|error| windows_error("the AAC decoder MFT would not flush", error))
-    }
-
-    pub(super) fn reset(&mut self) -> Result<()> {
-        self.previous = None;
-        self.flush()
     }
 
     fn access_unit(&self, data: &[u8], position: u64) -> Result<IMFSample> {

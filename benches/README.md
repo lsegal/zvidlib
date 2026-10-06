@@ -4124,9 +4124,11 @@ together would average the seek cost away, and the seek cost is the one that
 shows up as an audible stall.
 
 These groups carry **no `simd=` tag and no per-ISA arms**. AAC decoding is
-delegated to the third-party `symphonia-codec-aac` crate, `zvidlib::simd`'s
-override does not reach it, and the crate has no audio SIMD kernels of its own,
-so a scalar arm and a vector arm would be the same code reported twice.
+delegated to the platform's decoder (AudioToolbox on macOS, Media Foundation on
+Windows), `zvidlib::simd`'s override does not reach it, and the crate has no
+audio SIMD kernels of its own, so a scalar arm and a vector arm would be the
+same code reported twice. A host with no platform AAC decoder, such as the Linux
+benchmark runners, skips every group and prints why.
 
 The mono fixture exists because the bundled sample is stereo and carries no edit
 list, while `NativeAacDecoder` accepts AAC-LC mono as well (and rejects

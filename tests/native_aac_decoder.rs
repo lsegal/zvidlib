@@ -14,11 +14,14 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 
+#[cfg(not(any(target_os = "macos", windows)))]
+use zvidlib::ErrorKind;
 use zvidlib::io::MemorySource;
 use zvidlib::{
-    AacSampleReader, CancellationToken, ErrorKind, Limits, Mp4Demuxer, Mp4DemuxerOptions,
-    NativeAacDecoder, SampleRange, TrackKind,
+    AacSampleReader, Limits, Mp4Demuxer, Mp4DemuxerOptions, NativeAacDecoder, TrackKind,
 };
+#[cfg(any(target_os = "macos", windows))]
+use zvidlib::{CancellationToken, SampleRange};
 
 fn block_on<T>(future: impl Future<Output = T>) -> T {
     let waker = Waker::noop();
@@ -36,6 +39,7 @@ const BUNDLED_STEREO: &[u8] = include_bytes!("../examples/media/BigBuckBunny.mp4
 const FIXTURE_MONO: &[u8] = include_bytes!("fixtures/codec/aac_lc_mono_48k.m4a");
 
 /// Frames in each reference window.
+#[cfg(any(target_os = "macos", windows))]
 const WINDOW: u64 = 1024;
 
 /// The signal-to-noise ratio, in dB, a platform decoder's PCM must reach
@@ -54,6 +58,7 @@ const MIN_ALIGNMENT_MARGIN_DB: f32 = 5.0;
 
 /// One fixture's presentation length as `AacSampleReader` reported it over
 /// Symphonia's decoder, which the platform decoders must reproduce exactly.
+#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
 struct Fixture {
     name: &'static str,
     bytes: &'static [u8],
@@ -79,6 +84,7 @@ const FIXTURES: [Fixture; 2] = [
 
 /// Where each fixture's reference windows start: the first frame, a point off
 /// every access-unit boundary partway through, and the last full window.
+#[cfg(any(target_os = "macos", windows))]
 fn window_starts(length: u64) -> [u64; 3] {
     [0, length / 2 + 333, length - WINDOW]
 }

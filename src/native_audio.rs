@@ -60,6 +60,12 @@ pub struct NativeAacDecoder {
     sample_rate: u32,
     channels: u16,
     limits: Limits,
+    /// Whether the backend has been seen to trail its input by one access
+    /// unit; see [`NativeAacDecoder::decode_trailing`].
+    trailing: bool,
+    /// The access unit last decoded and its position, whose overlap the next
+    /// one needs; `None` when the backend is fresh or was just reset.
+    previous: Option<(Vec<u8>, u64)>,
 }
 
 impl NativeAacDecoder {
@@ -74,7 +80,29 @@ impl NativeAacDecoder {
             sample_rate: config.sample_rate,
             channels: config.channels,
             limits,
+            trailing: false,
+            previous: None,
         })
+    }
+
+    /// Decodes `data` through a backend that emits each access unit's PCM only
+    /// once the next unit arrives, as Media Foundation's decoder does.
+    ///
+    /// An AAC-LC frame's PCM depends only on its own access unit and the one
+    /// before it, so this starts the backend clean, feeds that pair, and pushes
+    /// the current frame out by repeating its unit. The repeat's own PCM is
+    /// never emitted: the next call starts clean again. After a reset there is
+    /// no previous unit, and the frame overlaps silence, as a clean decoder's
+    /// first frame does.
+    fn decode_trailing(&mut self, data: &[u8], position: u64, out: &mut Vec<f32>) -> Result<()> {
+        self.backend.reset()?;
+        let mut discarded = Vec::new();
+        if let Some((previous, previous_position)) = &self.previous {
+            self.backend
+                .decode(previous, *previous_position, &mut discarded)?;
+        }
+        self.backend.decode(data, position, &mut discarded)?;
+        self.backend.decode(data, position, out)
     }
 }
 
@@ -90,8 +118,26 @@ impl AudioDecoder for NativeAacDecoder {
         let channels = usize::from(self.channels);
         let expected = usize::try_from(sample.decoded_range.len()).unwrap_or(usize::MAX);
         let mut samples = Vec::with_capacity(expected.saturating_mul(channels));
-        self.backend
-            .decode(&sample.data, sample.decoded_range.start, &mut samples)?;
+        let position = sample.decoded_range.start;
+        if self.trailing {
+            self.decode_trailing(&sample.data, position, &mut samples)?;
+        } else {
+            self.backend.decode(&sample.data, position, &mut samples)?;
+            // A backend that emits nothing for the first unit it is given is
+            // holding that unit's frame back until the next one arrives.
+            if samples.is_empty() && self.previous.is_none() {
+                self.trailing = true;
+                self.decode_trailing(&sample.data, position, &mut samples)?;
+            }
+        }
+        let mut previous = self
+            .previous
+            .take()
+            .map(|(previous, _)| previous)
+            .unwrap_or_default();
+        previous.clear();
+        previous.extend_from_slice(&sample.data);
+        self.previous = Some((previous, position));
         let frames = (samples.len() / channels) as u64;
         if frames != sample.decoded_range.len() {
             return Err(codec(format!(
@@ -109,6 +155,7 @@ impl AudioDecoder for NativeAacDecoder {
     }
 
     fn reset(&mut self) -> Result<()> {
+        self.previous = None;
         self.backend.reset()
     }
 }
@@ -369,11 +416,18 @@ fn io(message: impl Into<String>) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(any(target_os = "macos", windows))]
     use crate::io::MemorySource;
+    #[cfg(any(target_os = "macos", windows))]
     use crate::{Mp4Demuxer, Mp4DemuxerOptions, TrackKind};
+    #[cfg(any(target_os = "macos", windows))]
     use std::future::Future;
+    #[cfg(any(target_os = "macos", windows))]
     use std::task::{Context, Poll, Waker};
 
+    // The platform decoders, and the Linux report that there is none, are
+    // also exercised end to end by `tests/native_aac_decoder.rs`.
+    #[cfg(any(target_os = "macos", windows))]
     #[test]
     fn native_decoder_consumes_demuxed_aac_access_units_as_exact_f32_intervals() {
         let source =
@@ -460,6 +514,7 @@ mod tests {
         assert_eq!(select_output_format(supported, 48_000, 2), Err(Vec::new()));
     }
 
+    #[cfg(any(target_os = "macos", windows))]
     fn block_on<F: Future>(future: F) -> F::Output {
         let mut future = Box::pin(future);
         let waker = Waker::noop();
