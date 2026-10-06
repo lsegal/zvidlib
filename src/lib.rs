@@ -46,6 +46,16 @@ pub mod webm_demux;
 mod av1_dec;
 mod av1_decoder;
 mod vp8;
+
+/// Per-stage access to the VP8 software decoder for the criterion benchmark
+/// suite.
+///
+/// Internal and unstable: the decoder's transforms, prediction and loop filter
+/// are not otherwise reachable from a benchmark, which is a separate crate.
+/// See `benches/vp8_decode.rs`.
+#[cfg(not(target_arch = "wasm32"))]
+#[doc(hidden)]
+pub use vp8::bench as vp8_decoder_bench;
 mod vp9_dec;
 mod vp9_decoder;
 

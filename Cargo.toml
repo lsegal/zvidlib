@@ -54,6 +54,14 @@ name = "av1_decode"
 path = "benches/av1_decode.rs"
 harness = false
 
+# The VP8 software decoder's own scalar-vs-SIMD suite (issue #568): its
+# whole-frame decode and the per-stage groups behind the `vp8_decode` dispatch
+# site. A separate target for the same reason `av1_decode` is one.
+[[bench]]
+name = "vp8_decode"
+path = "benches/vp8_decode.rs"
+harness = false
+
 # The AV1 encoder's own scalar-vs-SIMD suite. Encoder kernels are measured
 # separately from `av1_decode` so neither target's name overstates its scope,
 # and separately from `codec` because it shares none of that target's

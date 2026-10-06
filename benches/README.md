@@ -1,7 +1,7 @@
 # Benchmarks
 
 zvidlib's benchmarks run under [criterion](https://docs.rs/criterion) with
-`harness = false`, across nine bench targets that share `benches/support/`:
+`harness = false`, across ten bench targets that share `benches/support/`:
 
 | Target | Measures |
 | --- | --- |
@@ -1990,7 +1990,7 @@ job per `[[bench]]` target, each running only its own target with
 crate-wide override reaches the HEVC kernels, is included. Each of those jobs
 uploads its own criterion output, and a single `Benchmark report` job then:
 
-1. reassembles one `target/criterion/` tree and one `bench.log` out of the nine
+1. reassembles one `target/criterion/` tree and one `bench.log` out of the ten
    partial artifacts, and puts every host and its instruction sets into the job
    summary;
 2. reduces that tree to one small JSON baseline through
@@ -2022,7 +2022,7 @@ and is simply never measured again, and the only symptom is a baseline that
 stops carrying its groups — which reads as benchmarks that were deleted.
 
 **What this costs is host attribution.** One stored baseline is now a merge
-across nine runners rather than one machine's suite, so its `host` field is every
+across ten runners rather than one machine's suite, so its `host` field is every
 distinct model observed, joined, and the job summary carries a target-to-model
 table. Nothing in the delta report depended on a single host — `compare` already
 diffs point estimates across two machines from a shared pool, which is why its
