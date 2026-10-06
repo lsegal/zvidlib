@@ -45,8 +45,7 @@ unsafe fn nonzero<V: I32x>(x: V) -> V {
 unsafe fn hadamard_sum<V: Transpose4>([r0, r1, r2, r3]: [V; 4]) -> u32 {
     unsafe {
         let (s0, s1, d0, d1) = (r0.add(r1), r2.add(r3), r0.sub(r1), r2.sub(r3));
-        let [t0, t1, t2, t3] =
-            V::transpose4([s0.add(s1), s0.sub(s1), d0.add(d1), d0.sub(d1)]);
+        let [t0, t1, t2, t3] = V::transpose4([s0.add(s1), s0.sub(s1), d0.add(d1), d0.sub(d1)]);
         let (s0, s1, d0, d1) = (t0.add(t1), t2.add(t3), t0.sub(t1), t2.sub(t3));
         let sum = s0
             .add(s1)
@@ -521,27 +520,12 @@ unsafe fn filter_segments<V: I32x>(p: &mut [V; 4], q: &mut [V; 4], limits: EdgeL
             // taps; anything else the macroblock filter, whose `w` is that
             // same clamped value.
             let (hev_p0, hev_q0, _) = common(outer);
-            let tap = |weight: i32| {
-                clamp(
-                    outer
-                        .mul(V::splat(weight))
-                        .add(V::splat(63))
-                        .sra::<7>(),
-                )
-            };
+            let tap = |weight: i32| clamp(outer.mul(V::splat(weight)).add(V::splat(63)).sra::<7>());
             let (a0, a1, a2) = (tap(27), tap(18), tap(9));
             let p2 = p[2].sub(bias);
             let q2 = q[2].sub(bias);
-            p[0] = V::select(
-                mask,
-                V::select(hev, hev_p0, to_unsigned(p0.add(a0))),
-                p[0],
-            );
-            q[0] = V::select(
-                mask,
-                V::select(hev, hev_q0, to_unsigned(q0.sub(a0))),
-                q[0],
-            );
+            p[0] = V::select(mask, V::select(hev, hev_p0, to_unsigned(p0.add(a0))), p[0]);
+            q[0] = V::select(mask, V::select(hev, hev_q0, to_unsigned(q0.sub(a0))), q[0]);
             p[1] = V::select(wide, to_unsigned(p1.add(a1)), p[1]);
             q[1] = V::select(wide, to_unsigned(q1.sub(a1)), q[1]);
             p[2] = V::select(wide, to_unsigned(p2.add(a2)), p[2]);

@@ -193,10 +193,10 @@ entry_points! {
     ) = filter_vertical_edge, avx2 = Avx2;
 }
 
-#[cfg(target_arch = "x86_64")]
-use sad::x86::{sad16_avx2, sad16_sse41};
 #[cfg(target_arch = "aarch64")]
 use sad::arm::sad16_neon;
+#[cfg(target_arch = "x86_64")]
+use sad::x86::{sad16_avx2, sad16_sse41};
 
 /// Expands to a `match` over `$isa` that calls the matching wrapper and
 /// evaluates to its result in `Some`, or to `None` on scalar or on an
@@ -239,10 +239,7 @@ pub(crate) fn sad16(
 
 /// `satd4` of a residual block.
 pub(crate) fn satd4(block: &[i16; 16]) -> Option<u32> {
-    dispatch!(
-        encode_isa(),
-        [satd4_sse41, satd4_avx2, satd4_neon](block)
-    )
+    dispatch!(encode_isa(), [satd4_sse41, satd4_avx2, satd4_neon](block))
 }
 
 /// The SATD of the `size`x`size` block at `origin` of two planes of one
@@ -300,11 +297,13 @@ pub(crate) fn idct_add(
     offset: usize,
     stride: usize,
 ) -> bool {
-    dispatch!(
-        recon_isa(),
-        [idct_add_sse41, idct_add_avx2, idct_add_neon](coefficients, plane, offset, stride)
+    matches!(
+        dispatch!(
+            recon_isa(),
+            [idct_add_sse41, idct_add_avx2, idct_add_neon](coefficients, plane, offset, stride)
+        ),
+        Some(())
     )
-    .is_some()
 }
 
 /// The inverse Walsh-Hadamard transform of the Y2 block.
@@ -329,20 +328,22 @@ pub(crate) fn sixtap(
         isa if width % 8 != 0 => narrow(isa),
         isa => isa,
     };
-    dispatch!(
-        isa,
-        [sixtap_sse41, sixtap_avx2, sixtap_neon](
-            window,
-            width,
-            height,
-            horizontal,
-            vertical,
-            output,
-            destination,
-            stride
-        )
+    matches!(
+        dispatch!(
+            isa,
+            [sixtap_sse41, sixtap_avx2, sixtap_neon](
+                window,
+                width,
+                height,
+                horizontal,
+                vertical,
+                output,
+                destination,
+                stride
+            )
+        ),
+        Some(())
     )
-    .is_some()
 }
 
 /// `TM_PRED` of a `size`x`size` block (8 or 16), returning whether a vector
@@ -356,11 +357,13 @@ pub(crate) fn tm_predict(
     offset: usize,
     stride: usize,
 ) -> bool {
-    dispatch!(
-        recon_isa(),
-        [tm_sse41, tm_avx2, tm_neon](above, left, corner, size, plane, offset, stride)
+    matches!(
+        dispatch!(
+            recon_isa(),
+            [tm_sse41, tm_avx2, tm_neon](above, left, corner, size, plane, offset, stride)
+        ),
+        Some(())
     )
-    .is_some()
 }
 
 /// Loop-filters `count` (8 or 16) segments across a horizontal edge,
@@ -372,11 +375,13 @@ pub(crate) fn filter_horizontal_edge(
     count: usize,
     limits: EdgeLimits,
 ) -> bool {
-    dispatch!(
-        recon_isa(),
-        [filter_h_sse41, filter_h_avx2, filter_h_neon](data, at, stride, count, limits)
+    matches!(
+        dispatch!(
+            recon_isa(),
+            [filter_h_sse41, filter_h_avx2, filter_h_neon](data, at, stride, count, limits)
+        ),
+        Some(())
     )
-    .is_some()
 }
 
 /// Loop-filters `count` (8 or 16) segments across a vertical edge, returning
@@ -388,9 +393,11 @@ pub(crate) fn filter_vertical_edge(
     count: usize,
     limits: EdgeLimits,
 ) -> bool {
-    dispatch!(
-        recon_isa(),
-        [filter_v_sse41, filter_v_avx2, filter_v_neon](data, at, stride, count, limits)
+    matches!(
+        dispatch!(
+            recon_isa(),
+            [filter_v_sse41, filter_v_avx2, filter_v_neon](data, at, stride, count, limits)
+        ),
+        Some(())
     )
-    .is_some()
 }

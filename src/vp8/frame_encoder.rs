@@ -1137,7 +1137,14 @@ fn motion_search(
 /// The sum of absolute differences between the source macroblock at
 /// `(x0, y0)` and the reference displaced by whole samples, with the
 /// reference extended beyond its edges.
-pub(super) fn sad16_full(source: &Plane, reference: &Plane, x0: usize, y0: usize, dx: i32, dy: i32) -> u32 {
+pub(super) fn sad16_full(
+    source: &Plane,
+    reference: &Plane,
+    x0: usize,
+    y0: usize,
+    dx: i32,
+    dy: i32,
+) -> u32 {
     let rx = x0 as i32 + dx;
     let ry = y0 as i32 + dy;
     let inside = rx >= 0
@@ -1470,7 +1477,11 @@ fn quantize_luma_with_y2(
 
 /// Quantizes a block's coefficients (raster order) from zigzag position
 /// `first`, returning the levels and their dequantized values.
-pub(super) fn quantize(coefficients: &[i16; 16], factors: [i32; 2], first: usize) -> ([i16; 16], [i16; 16]) {
+pub(super) fn quantize(
+    coefficients: &[i16; 16],
+    factors: [i32; 2],
+    first: usize,
+) -> ([i16; 16], [i16; 16]) {
     simd::quantize(coefficients, factors, first)
         .unwrap_or_else(|| quantize_scalar(coefficients, factors, first))
 }

@@ -260,7 +260,11 @@ mod x86 {
         }
         #[inline(always)]
         unsafe fn load_i16(src: &[i16]) -> Self {
-            unsafe { Self(_mm_cvtepi16_epi32(_mm_loadl_epi64(src[..4].as_ptr().cast()))) }
+            unsafe {
+                Self(_mm_cvtepi16_epi32(_mm_loadl_epi64(
+                    src[..4].as_ptr().cast(),
+                )))
+            }
         }
         #[inline(always)]
         unsafe fn store_i16(self, dst: &mut [i16]) {
@@ -437,7 +441,11 @@ mod x86 {
         }
         #[inline(always)]
         unsafe fn load_i16(src: &[i16]) -> Self {
-            unsafe { Self(_mm256_cvtepi16_epi32(_mm_loadu_si128(src[..8].as_ptr().cast()))) }
+            unsafe {
+                Self(_mm256_cvtepi16_epi32(_mm_loadu_si128(
+                    src[..8].as_ptr().cast(),
+                )))
+            }
         }
         #[inline(always)]
         unsafe fn store_i16(self, dst: &mut [i16]) {

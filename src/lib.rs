@@ -218,6 +218,15 @@ pub use transfer::{
 pub use vorbis::{
     NativeVorbisDecoder, VORBIS_PREROLL_PACKETS, VorbisConfig, native_vorbis_audio_encoder_factory,
 };
+/// Per-stage access to the native VP8 encoder for the criterion benchmark
+/// suite.
+///
+/// Internal and unstable, and the VP8 counterpart to [`hevc_encoder_bench`]:
+/// the encoder's distortion metrics, transforms, quantization, prediction and
+/// loop filter are not otherwise reachable from a benchmark, which is a
+/// separate crate. See `benches/vp8_encode.rs`.
+#[doc(hidden)]
+pub use vp8::bench as vp8_encoder_bench;
 pub use vp9_encoder::native_vp9_video_encoder_factory;
 pub use webm::WebmMuxer;
 pub use webm_demux::{

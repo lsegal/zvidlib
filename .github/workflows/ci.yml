@@ -397,6 +397,7 @@ jobs:
           - audio_mux
           - exact_seek
           - hevc_hardware
+          - vp8_encode
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4

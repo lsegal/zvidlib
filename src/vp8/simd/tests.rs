@@ -11,12 +11,8 @@ use super::super::frame_encoder::{
     forward_walsh, quantize, residual_dct, sad16, sad16_full, satd, satd4,
 };
 use super::super::loop_filter::{FrameFilter, MacroblockFilter, filter_frame};
-use super::super::predict::{
-    Edges, Plane, idct_add, inverse_walsh, predict_block, predict_inter,
-};
-use super::super::tables::{
-    AC_Q_LOOKUP, BILINEAR_FILTERS, DC_Q_LOOKUP, SIXTAP_FILTERS, TM_PRED,
-};
+use super::super::predict::{Edges, Plane, idct_add, inverse_walsh, predict_block, predict_inter};
+use super::super::tables::{AC_Q_LOOKUP, BILINEAR_FILTERS, DC_Q_LOOKUP, SIXTAP_FILTERS, TM_PRED};
 use crate::simd::{self, SimdIsa};
 
 /// A small deterministic generator, so a failure reproduces.
@@ -125,10 +121,7 @@ fn every_vector_instruction_set_takes_the_vector_kernels() {
         assert_eq!(super::quantize(&block, [8, 8], 0).is_some(), vector);
         assert_eq!(super::inverse_walsh(&block).is_some(), vector);
         let mut output = [0u8; 256];
-        assert_eq!(
-            super::idct_add(&block, &mut output, 0, 16),
-            vector
-        );
+        assert_eq!(super::idct_add(&block, &mut output, 0, 16), vector);
         for width in [4, 8, 16] {
             assert_eq!(
                 super::sixtap(

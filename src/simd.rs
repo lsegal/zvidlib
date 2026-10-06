@@ -1,10 +1,12 @@
 //! The process-wide SIMD instruction-set override shared by every codec kernel.
 //!
-//! zvidlib's pure-Rust HEVC and AV1 codecs dispatch their hot loops to
+//! zvidlib's pure-Rust HEVC, AV1 and VP8 codecs dispatch their hot loops to
 //! runtime-detected vector kernels in several independent places: the AV1
 //! transforms and in-loop filters ([`crate::av1_simd`]), AV1 inter prediction
-//! ([`crate::av1_mc`]), AV1 intra prediction ([`crate::av1_intra_pred`]), and
-//! the HEVC engine's inter/intra prediction, in-loop filters, inverse
+//! ([`crate::av1_mc`]), AV1 intra prediction ([`crate::av1_intra_pred`]), the
+//! VP8 encoder's distortion metrics, forward transforms and quantization and
+//! the reconstruction and loop filter it shares with the VP8 decoder, and the
+//! HEVC engine's inter/intra prediction, in-loop filters, inverse
 //! transforms, encoder-side distortion metrics, and encoder-side color
 //! conversion. Each of those sites caches
 //! its own CPU feature probe, which is what you want in production but makes
@@ -46,10 +48,10 @@ static OVERRIDE: AtomicU8 = AtomicU8::new(0);
 /// Forces every SIMD-dispatched kernel in the crate onto `isa`, or restores
 /// per-site automatic detection with `None`.
 ///
-/// The override reaches all four dispatch families: the AV1 transform and
-/// in-loop filter kernels, AV1 motion compensation (through the default level
-/// [`crate::av1_mc::McContext::new`] picks up), AV1 intra prediction, and every
-/// HEVC engine kernel. [`SimdIsa::Scalar`] therefore genuinely reaches the
+/// The override reaches every dispatch family: the AV1 transform and in-loop
+/// filter kernels, AV1 motion compensation (through the default level
+/// [`crate::av1_mc::McContext::new`] picks up), AV1 intra prediction, the VP8
+/// encoder and reconstruction kernels, and every HEVC engine kernel. [`SimdIsa::Scalar`] therefore genuinely reaches the
 /// scalar code path rather than merely the widest scalar-ish one.
 ///
 /// An instruction set this host cannot execute is clamped to
@@ -112,6 +114,8 @@ pub fn available() -> Vec<SimdIsa> {
 /// | `av1_mc` | AV1 motion compensation (the level [`crate::av1_mc::McContext::new`] picks) |
 /// | `av1_intra_pred` | AV1 intra prediction and residual reconstruction |
 /// | `av1_coeff_ctx` | AV1 encoder-side coefficient context derivation (§8.3.2) |
+/// | `vp8_encode` | VP8 encoder-side SAD and SATD, residual and forward DCT, forward WHT and quantization |
+/// | `vp8_recon` | VP8 inverse transforms, inter and `TM_PRED` prediction and loop filter, shared by the encoder and decoder |
 /// | `hevc_prediction_filters` | HEVC inter/intra prediction and in-loop filters |
 /// | `hevc_transforms` | HEVC inverse transforms and dequantization |
 /// | `hevc_rdcost` | HEVC encoder-side distortion metrics |
@@ -133,6 +137,8 @@ pub fn active_by_site() -> Vec<(&'static str, SimdIsa)> {
             from_intra_simd(crate::av1_intra_pred::av1_intra_simd()),
         ),
         ("av1_coeff_ctx", crate::av1_simd::coeff::active_isa()),
+        ("vp8_encode", crate::vp8::simd::encode_isa()),
+        ("vp8_recon", crate::vp8::simd::recon_isa()),
     ];
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -365,6 +371,11 @@ mod tests {
         // AV1 motion compensation, through the level `McContext::new` picks.
         assert_eq!(default_level(), SimdLevel::Scalar);
         assert_eq!(McContext::new().level(), SimdLevel::Scalar);
+        // VP8 encoder-side distortion metrics, forward transforms and
+        // quantization.
+        assert_eq!(crate::vp8::simd::encode_isa(), SimdIsa::Scalar);
+        // VP8 reconstruction and loop filter, shared with the decoder.
+        assert_eq!(crate::vp8::simd::recon_isa(), SimdIsa::Scalar);
         // HEVC inter/intra prediction and in-loop filters.
         assert_eq!(hevc_simd::detected_isa(), hevc_simd::Isa::Scalar);
         // HEVC inverse transforms and dequantization.
@@ -388,6 +399,8 @@ mod tests {
             "av1_mc",
             "av1_intra_pred",
             "av1_coeff_ctx",
+            "vp8_encode",
+            "vp8_recon",
             "hevc_prediction_filters",
             "hevc_transforms",
             "hevc_rdcost",
@@ -456,6 +469,11 @@ mod tests {
             default_level() != crate::av1_mc::SimdLevel::Scalar,
             vectorized
         );
+        // VP8 encoder-side distortion metrics, forward transforms and
+        // quantization.
+        assert_eq!(crate::vp8::simd::encode_isa(), detected());
+        // VP8 reconstruction and loop filter, shared with the decoder.
+        assert_eq!(crate::vp8::simd::recon_isa(), detected());
         // HEVC inter/intra prediction and in-loop filters.
         assert_eq!(
             hevc_simd::detected_isa() != hevc_simd::Isa::Scalar,
@@ -492,6 +510,8 @@ mod tests {
             "av1_mc",
             "av1_intra_pred",
             "av1_coeff_ctx",
+            "vp8_encode",
+            "vp8_recon",
             "hevc_prediction_filters",
             "hevc_transforms",
             "hevc_rdcost",
