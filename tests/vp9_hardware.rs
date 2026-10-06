@@ -7,6 +7,10 @@
 //! `show_existing_frame` included, and `ExactFrameReader` must return the
 //! requested frames in sequential, reverse and alternating order. Elsewhere
 //! they skip, and only the hardware preference answers are checked.
+//!
+//! The encode direction is checked the same way: where the host has a
+//! hardware VP9 encoder, its stream muxes into MP4 and WebM exactly as the
+//! software encoder's does and decodes through the native VP9 decoder.
 #![cfg(not(target_arch = "wasm32"))]
 
 use zvidlib::io::MemorySource;
@@ -286,4 +290,186 @@ fn hardware_refuses_what_the_software_decoder_refuses() {
     cancelled.cancel();
     let error = decoder.submit(&track.samples[0], &cancelled).unwrap_err();
     assert_eq!(error.kind(), ErrorKind::Cancelled);
+}
+
+/// A 320x240 RGBA test card that pans four pixels a frame under a fixed block.
+fn encoder_frame(index: u32, limits: &Limits) -> zvidlib::VideoFrame {
+    let (width, height) = (320_u32, 240_u32);
+    let mut data = Vec::with_capacity((width * height * 4) as usize);
+    for y in 0..height {
+        for x in 0..width {
+            let u = x + index * 4;
+            if (80..160).contains(&x) && (60..120).contains(&y) {
+                data.extend_from_slice(&[200, 60, 40, 255]);
+            } else {
+                data.extend_from_slice(&[
+                    (u * 255 / (width + 64)) as u8,
+                    (y * 255 / height) as u8,
+                    ((u + y) * 255 / (width + height + 64)) as u8,
+                    255,
+                ]);
+            }
+        }
+    }
+    zvidlib::VideoFrame::new(
+        VideoDimensions::new(width, height, limits).unwrap(),
+        PixelFormat::Rgba8,
+        ColorRange::Limited,
+        vec![zvidlib::Plane {
+            data,
+            stride: (width * 4) as usize,
+        }],
+        limits,
+    )
+    .unwrap()
+}
+
+/// Issue #550: `Require` selects the host's hardware VP9 encoder where it has
+/// one. Its stream opens on a key frame, its `vpcC` describes 8-bit 4:2:0
+/// profile 0, it muxes as `vp09`/`vpcC` in MP4 and `V_VP9` in WebM exactly as
+/// the software encoder's does, and it passes the conformance runner against
+/// the native VP9 decoder. A host without one skips with the reason, after the
+/// preference answers are checked.
+#[test]
+fn hardware_vp9_encoder_output_muxes_and_decodes_through_the_native_decoder() {
+    use zvidlib::io::MemorySink;
+    use zvidlib::mp4::{Mp4Muxer, Mp4TrackConfig, Mp4TrackFormat};
+    use zvidlib::{
+        CpuFrameSource, FrameSource, Orientation, VideoEncoderConfig,
+        VideoEncoderConformanceVector, VideoEncoderFactory, WebmMuxer,
+        native_vp9_video_encoder_factory, verify_video_encoder_conformance,
+    };
+
+    const FRAMES: u32 = 12;
+    let limits = Limits::default();
+    let dimensions = VideoDimensions::new(320, 240, &limits).unwrap();
+    let factory = native_vp9_video_encoder_factory();
+    let encoder_configuration = |hardware| VideoEncoderConfig {
+        codec: Codec::Vp9,
+        profile: CodecProfile::Vp9Profile0,
+        coded_dimensions: dimensions,
+        input_format: PixelFormat::Rgba8,
+        color_range: ColorRange::Limited,
+        hardware,
+        timescale: 30,
+        frame_duration: 1,
+        configuration: vec![60, 0, 5],
+    };
+    let required = encoder_configuration(HardwarePreference::Require);
+    let hardware = CodecSupport::Supported {
+        implementation: CodecImplementation::Hardware,
+    };
+    let preferred = factory.capability(&encoder_configuration(HardwarePreference::Prefer));
+    if factory.capability(&required) != hardware {
+        assert_eq!(
+            factory.capability(&required),
+            CodecSupport::HardwareUnavailable
+        );
+        assert_eq!(
+            preferred,
+            CodecSupport::Supported {
+                implementation: CodecImplementation::Software
+            }
+        );
+        let reason = factory
+            .create(&required, &limits)
+            .err()
+            .map_or_else(|| "unknown reason".into(), |error| error.to_string());
+        eprintln!("skipping: hardware VP9 encoding unavailable: {reason}");
+        return;
+    }
+    assert_eq!(preferred, hardware);
+
+    let frames: Vec<_> = (0..FRAMES)
+        .map(|index| encoder_frame(index, &limits))
+        .collect();
+    let mut encoder = factory.create(&required, &limits).unwrap();
+    assert_eq!(encoder.implementation(), CodecImplementation::Hardware);
+    eprintln!("hardware VP9 encoder: {}", encoder.backend_name());
+    let vpcc = encoder.config().decoder_config.clone();
+    let derived = zvidlib::derive_codec_string(Codec::Vp9, &vpcc).unwrap();
+    assert_eq!(derived.profile, CodecProfile::Vp9Profile0);
+    assert!(
+        derived.codec_string.starts_with("vp09.00."),
+        "{}",
+        derived.codec_string
+    );
+    assert!(
+        derived.codec_string.ends_with(".08"),
+        "{}",
+        derived.codec_string
+    );
+    let mut samples = Vec::new();
+    for (index, frame) in frames.iter().enumerate() {
+        let source = FrameSource::Cpu(CpuFrameSource {
+            frame,
+            orientation: Orientation::TopLeft,
+        });
+        samples.extend(block_on(encoder.encode(FrameIndex(index as u64), source)).unwrap());
+    }
+    samples.extend(block_on(encoder.finish()).unwrap());
+    assert!(!samples.is_empty());
+    assert!(samples[0].is_sync, "the stream opens on a key frame");
+    assert_eq!(samples[0].dts, 0);
+    for pair in samples.windows(2) {
+        assert_eq!(pair[0].dts + i64::from(pair[0].duration), pair[1].dts);
+    }
+    let last = samples.last().unwrap();
+    assert_eq!(last.dts + i64::from(last.duration), i64::from(FRAMES));
+
+    let track = Mp4TrackConfig {
+        encoder: encoder.config().clone(),
+        format: Mp4TrackFormat::Video(dimensions),
+    };
+    let mut mp4 = block_on(Mp4Muxer::new(MemorySink::new(), vec![track.clone()], 64)).unwrap();
+    let mut webm = block_on(WebmMuxer::new(MemorySink::new(), vec![track], 64)).unwrap();
+    for sample in &samples {
+        block_on(mp4.write_sample(0, sample.clone())).unwrap();
+        block_on(webm.write_sample(0, sample.clone())).unwrap();
+    }
+    let mp4 = block_on(mp4.finish()).unwrap().into_inner();
+    let webm = block_on(webm.finish()).unwrap().into_inner();
+    let movie = block_on(Mp4Demuxer::open(
+        &MemorySource::new(mp4),
+        Default::default(),
+    ))
+    .unwrap();
+    let demuxed = &movie.tracks[0];
+    assert_eq!(demuxed.codec, Codec::Vp9);
+    assert_eq!(demuxed.decoder_config, vpcc);
+    assert_eq!(demuxed.samples.len(), samples.len());
+    let matroska = block_on(WebmDemuxer::open(
+        &MemorySource::new(webm),
+        Default::default(),
+    ))
+    .unwrap();
+    let demuxed_webm = &matroska.tracks[0];
+    assert_eq!(demuxed_webm.codec, Codec::Vp9);
+    assert_eq!(demuxed_webm.samples.len(), samples.len());
+    for (index, sample) in samples.iter().enumerate() {
+        assert_eq!(
+            demuxed.samples[index].is_sync, sample.is_sync,
+            "MP4 sample {index}"
+        );
+        assert_eq!(
+            demuxed_webm.samples[index].is_sync, sample.is_sync,
+            "WebM sample {index}"
+        );
+    }
+
+    let vector = VideoEncoderConformanceVector {
+        name: "vp9-hardware-rgba-pan".into(),
+        configuration: required,
+        decoder_configuration: configuration(dimensions, Vec::new()),
+        frames,
+        minimum_psnr_db: 30.0,
+    };
+    let report = block_on(verify_video_encoder_conformance(
+        &factory,
+        &native_vp9_video_decoder_factory(),
+        &vector,
+        limits,
+    ))
+    .unwrap();
+    assert_eq!(report.frames_encoded, u64::from(FRAMES));
 }
