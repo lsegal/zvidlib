@@ -221,3 +221,81 @@ reaches the tools it is listed against (recorded by `src/av1_dec/coverage.rs`
 in test builds), so a regenerated fixture that stops using a tool fails rather
 than silently losing its check. As above, FFmpeg is only the offline fixture
 generator and is not a build, test, or runtime dependency.
+
+`opus_celt_stereo.mp4`, `opus_hybrid_mono.mp4` and `opus_silk_mono.mp4` are
+half-second Opus tracks encoded by libopus, one per Opus coding mode: CELT
+fullband stereo (TOC configuration 31), hybrid fullband mono (15) and SILK
+narrowband mono (1). `tests/opus_codec.rs` checks every packet is in the mode
+its name says, so a regenerated fixture that drifts to another mode fails. The
+stereo one is music from the bundled `examples/media/BigBuckBunny.mp4`; the
+mono ones are a synthetic voice written by `opus_speechlike.py` here, a pulse
+train through moving formant filters with an unvoiced burst, which libopus
+codes as speech. FFmpeg writes each with a `dOps` box, an edit list whose media
+time is the 312-sample pre-skip, and a last sample whose duration is shortened
+to trim the end, which is the form zvidlib has to read. They were generated
+offline with
+
+```sh
+ffmpeg -ss 20 -t 0.5 -i ../../../examples/media/BigBuckBunny.mp4 -vn -ac 2 \
+  -ar 48000 -c:a libopus -b:a 96k -frame_duration 20 -movflags +faststart \
+  opus_celt_stereo.mp4
+python3 opus_speechlike.py speech.f32 1.0
+ffmpeg -f f32le -ar 48000 -ac 1 -i speech.f32 -t 0.5 -c:a libopus -b:a 28k \
+  -application voip -frame_duration 20 -movflags +faststart opus_hybrid_mono.mp4
+ffmpeg -f f32le -ar 48000 -ac 1 -i speech.f32 -t 0.5 -c:a libopus -b:a 8k \
+  -application voip -frame_duration 20 -movflags +faststart opus_silk_mono.mp4
+```
+
+Each `opus_*_libopus.s16` is libopus's decode of its fixture as interleaved
+16-bit little-endian PCM, the first 24 000 frames of
+
+```sh
+ffmpeg -c:a libopus -i opus_celt_stereo.mp4 -f s16le opus_celt_stereo.s16
+```
+
+FFmpeg trims the pre-skip but, at the version used, not the end padding, which
+is why only the encoded length is kept. The official RFC 8251 decoder test
+vectors are 75 MB and are not committed; CI downloads them for
+`rfc8251_test_vectors_pass_opus_compare`.
+
+`vorbis_stereo_44k.ogg` and `vorbis_transient_mono.ogg` are half-second Vorbis
+streams encoded by libvorbis: music from the bundled sample at 44.1 kHz, and a
+tone with sharp clicks at 48 kHz, which makes the encoder switch to short
+blocks so packet durations vary. `vorbis_6ch_16k.ogg` is a quarter second of
+5.1, one tone per channel, whose setup header has several coupling steps.
+
+```sh
+ffmpeg -ss 20 -t 0.5 -i ../../../examples/media/BigBuckBunny.mp4 -vn -ac 2 \
+  -ar 44100 -c:a libvorbis -q:a 4 vorbis_stereo_44k.ogg
+ffmpeg -f lavfi \
+  -i "sine=f=440:d=4,aeval=val(0)*0.3+0.6*(lt(mod(t\,0.5)\,0.003))*(random(0)-0.5)|val(0)*0.3:c=stereo" \
+  -ar 48000 -f f32le transient.f32
+ffmpeg -f f32le -ar 48000 -ac 2 -i transient.f32 -t 0.5 -ac 1 -c:a libvorbis -q:a 2 \
+  vorbis_transient_mono.ogg
+ffmpeg -f lavfi -i "aevalsrc=0.4*sin(2*PI*300*t)|0.4*sin(2*PI*500*t)|0.4*sin(2*PI*700*t)|0.4*sin(2*PI*900*t)|0.4*sin(2*PI*1100*t)|0.4*sin(2*PI*1300*t):s=16000:d=0.25:c=5.1" \
+  -c:a libvorbis -q:a 0 vorbis_6ch_16k.ogg
+```
+
+Each `vorbis_*_libvorbis.s16` is libvorbis's own decode through `vorbisfile`,
+which trims the stream to its granule positions, written as interleaved 16-bit
+little-endian PCM by a few lines of C built against libvorbis 1.3.7 and libogg
+1.3.5:
+
+```c
+OggVorbis_File vf;
+ov_fopen(argv[1], &vf);
+int channels = ov_info(&vf, -1)->channels;
+float **pcm;
+int section;
+long n;
+while ((n = ov_read_float(&vf, &pcm, 4096, &section)) > 0)
+  for (long i = 0; i < n; i++)
+    for (int c = 0; c < channels; c++) {
+      long s = lrintf(pcm[c][i] * 32768.f);
+      short o = s > 32767 ? 32767 : s < -32768 ? -32768 : s;
+      fwrite(&o, 2, 1, out);
+    }
+```
+
+FFmpeg's own Vorbis decode is not used for these references: at the version
+used it did not trim to the granule positions consistently.

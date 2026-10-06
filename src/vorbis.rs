@@ -435,8 +435,8 @@ impl<'a> BitReader<'a> {
     }
 }
 
-/// A native, pure-Rust Vorbis decoder producing interleaved `f32` PCM in the
-/// Vorbis channel order (Vorbis I section 4.3.9).
+/// A native, pure-Rust Vorbis decoder for mono and stereo streams, producing
+/// interleaved `f32` PCM.
 ///
 /// A packet decoded straight after [`AudioDecoder::reset`] has no previous
 /// block to overlap and decodes to silence; [`VORBIS_PREROLL_PACKETS`] is the
@@ -459,9 +459,12 @@ impl NativeVorbisDecoder {
                 "Vorbis channel count or sample rate is outside configured limits",
             ));
         }
-        if channels > 8 {
+        // Symphonia's Vorbis decoder, which this wraps, decodes some streams of
+        // more than two channels wrongly where FFmpeg's and libvorbis's agree,
+        // so those are refused rather than decoded to the wrong audio.
+        if channels > 2 {
             return Err(unsupported(
-                "the native Vorbis decoder supports up to eight channels",
+                "the native Vorbis decoder supports mono and stereo streams",
             ));
         }
         let mut extra_data = config.identification_header.clone();
@@ -508,7 +511,7 @@ impl AudioDecoder for NativeVorbisDecoder {
         let frames = decoded.frames();
         let expected = sample.decoded_range.len();
         let samples = if frames as u64 == expected {
-            interleave_in_vorbis_order(decoded, self.channels)
+            interleave(decoded)
         } else if frames == 0 && cold {
             vec![
                 0.0;
@@ -537,22 +540,15 @@ impl AudioDecoder for NativeVorbisDecoder {
     }
 }
 
-/// Interleaves a decoded buffer, undoing Symphonia's remapping of the Vorbis
-/// channel order onto its own.
-fn interleave_in_vorbis_order(decoded: AudioBufferRef<'_>, channels: u16) -> Vec<f32> {
-    let frames = decoded.frames();
-    let mut planar = SampleBuffer::<f32>::new(frames as u64, *decoded.spec());
-    planar.copy_planar_ref(decoded);
-    let planes = planar.samples();
-    let count = usize::from(channels);
-    let mut interleaved = Vec::with_capacity(frames * count);
-    let sources: Vec<usize> = (0..count)
-        .map(|channel| symphonia_codec_vorbis::map_vorbis_channel(channels as u8, channel) * frames)
-        .collect();
-    for frame in 0..frames {
-        interleaved.extend(sources.iter().map(|&plane| planes[plane + frame]));
+fn interleave(decoded: AudioBufferRef<'_>) -> Vec<f32> {
+    // Symphonia's interleaving copy panics on an empty buffer, which is what
+    // a stream's first packet decodes to.
+    if decoded.frames() == 0 {
+        return Vec::new();
     }
-    interleaved
+    let mut interleaved = SampleBuffer::<f32>::new(decoded.frames() as u64, *decoded.spec());
+    interleaved.copy_interleaved_ref(decoded);
+    interleaved.samples().to_vec()
 }
 
 fn codec(message: impl Into<String>) -> Error {
