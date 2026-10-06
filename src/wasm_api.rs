@@ -1736,15 +1736,9 @@ async fn encode_browser_video_frame(
         Some(session) => session,
         None => {
             let codec = track.borrow().codec;
-            let session = WebVideoEncodeSession::open(
-                codec,
-                width,
-                height,
-                timescale,
-                frame_duration,
-                None,
-            )
-            .await?;
+            let session =
+                WebVideoEncodeSession::open(codec, width, height, timescale, frame_duration, None)
+                    .await?;
             track.borrow_mut().dimensions = Some((width, height));
             session
         }
@@ -2987,6 +2981,61 @@ mod tests {
         assert_eq!(demuxer.tracks.len(), 1);
         assert_eq!(demuxer.tracks[0].codec, Codec::Hevc);
         assert_eq!(demuxer.tracks[0].samples.len(), 3);
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn put_encodes_vp9_through_webcodecs_into_a_playable_mp4() {
+        if !video_encode_support(None, Some("vp9".to_owned())).unwrap() {
+            return;
+        }
+        let mut options = WasmCreateOptions::new(None).unwrap();
+        options.set_video_codec("vp9".to_owned()).unwrap();
+        assert_eq!(options.video_codec(), "vp9");
+        let output = WasmMediaOutput {
+            bytes: Vec::new(),
+            mime_type: options.mime_type,
+            max_output_bytes: options.max_output_bytes,
+            state: Rc::new(Cell::new(false)),
+            timeline: None,
+            video_timescale: 30,
+            video_frame_duration: 1,
+            video_codec: options.video_codec,
+            browser_video_tracks: Rc::new(RefCell::new(BTreeMap::new())),
+            browser_audio: Rc::new(RefCell::new(BrowserAudioTrack::new())),
+            cover_art: None,
+            cover_source: CoverSource::default(),
+        };
+        let video = output.video(0).unwrap();
+        let frame = WasmVideoFrame::rgba(16, 16, owned_u8_array(&[128_u8; 16 * 16 * 4])).unwrap();
+        for frame_index in 0..3_u64 {
+            if let Err(error) =
+                JsFuture::from(video.put(BigInt::from(frame_index).into(), &frame, None)).await
+            {
+                // As for HEVC, the browser can still refuse this concrete
+                // configuration asynchronously.
+                assert_error_code(&error, "UNSUPPORTED");
+                return;
+            }
+        }
+        let mut output = output;
+        let blob: Blob = JsFuture::from(output.finish())
+            .await
+            .unwrap()
+            .unchecked_into();
+        let bytes = Uint8Array::new(&JsFuture::from(blob.array_buffer()).await.unwrap()).to_vec();
+        let demuxer = crate::Mp4Demuxer::open(
+            &MemorySource::new(bytes),
+            crate::Mp4DemuxerOptions::default(),
+        )
+        .await
+        .expect("the browser-encoded output must be a parseable MP4");
+        assert_eq!(demuxer.tracks.len(), 1);
+        let track = &demuxer.tracks[0];
+        assert_eq!(track.codec, Codec::Vp9);
+        assert_eq!(track.samples.len(), 3);
+        assert!(track.samples[0].is_sync);
+        let derived = crate::derive_codec_string(Codec::Vp9, &track.decoder_config).unwrap();
+        assert_eq!(derived.codec_string, "vp09.00.10.08");
     }
 
     /// Issue #474's acceptance criteria: a synchronized, playable audio+video

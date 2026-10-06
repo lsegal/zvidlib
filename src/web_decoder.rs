@@ -1244,6 +1244,106 @@ mod tests {
         }
     }
 
+    /// Issue #528: the native VP9 encoder's MP4 output decodes through the
+    /// browser's own WebCodecs VP9 decoder, key frames and inter frames alike,
+    /// including a backwards seek across a key frame.
+    #[wasm_bindgen_test(async)]
+    async fn webcodecs_decodes_native_vp9_output() {
+        use crate::codec::{VideoEncoderConfig, VideoEncoderFactory};
+        use crate::io::MemorySink;
+        use crate::mp4::{Mp4Muxer, Mp4TrackConfig, Mp4TrackFormat};
+        use crate::transfer::{CpuFrameSource, FrameSource, Orientation};
+
+        let limits = Limits::default();
+        let dimensions = VideoDimensions::new(64, 36, &limits).unwrap();
+        let rgba = |index: u64| -> Vec<u8> {
+            (0..dimensions.height)
+                .flat_map(|y| {
+                    (0..dimensions.width).flat_map(move |x| {
+                        let u = x + index as u32 * 2;
+                        [(u * 3) as u8, (y * 6) as u8, 200 - (u * 2) as u8, 255]
+                    })
+                })
+                .collect()
+        };
+        let mut encoder = crate::native_vp9_video_encoder_factory()
+            .create(
+                &VideoEncoderConfig {
+                    codec: Codec::Vp9,
+                    profile: CodecProfile::Vp9Profile0,
+                    coded_dimensions: dimensions,
+                    input_format: PixelFormat::Rgba8,
+                    color_range: ColorRange::Limited,
+                    hardware: HardwarePreference::Avoid,
+                    timescale: 30,
+                    frame_duration: 1,
+                    // A key frame every three frames.
+                    configuration: vec![40, 0, 3],
+                },
+                &limits,
+            )
+            .unwrap();
+        let mut muxer = Mp4Muxer::new(
+            MemorySink::new(),
+            vec![Mp4TrackConfig {
+                encoder: encoder.config().clone(),
+                format: Mp4TrackFormat::Video(dimensions),
+            }],
+            60,
+        )
+        .await
+        .unwrap();
+        for index in 0..7_u64 {
+            let frame = VideoFrame::new(
+                dimensions,
+                PixelFormat::Rgba8,
+                ColorRange::Limited,
+                vec![crate::media::Plane {
+                    data: rgba(index),
+                    stride: dimensions.width as usize * 4,
+                }],
+                &limits,
+            )
+            .unwrap();
+            let samples = encoder
+                .encode(
+                    FrameIndex(index),
+                    FrameSource::Cpu(CpuFrameSource {
+                        frame: &frame,
+                        orientation: Orientation::TopLeft,
+                    }),
+                )
+                .await
+                .unwrap();
+            for sample in samples {
+                muxer.write_sample(0, sample).await.unwrap();
+            }
+        }
+        let bytes = muxer.finish().await.unwrap().into_inner();
+
+        let Ok(mut session) = WebVideoDecodeSession::open(&bytes, 0, &limits).await else {
+            // No WebCodecs VP9 decoder in this browser.
+            return;
+        };
+        assert!(!session.is_software());
+        for index in [5_u64, 1, 6] {
+            let (decoded, pixels) = session
+                .get(FrameIndex(index), &CancellationToken::new())
+                .await
+                .unwrap();
+            assert_eq!(decoded, dimensions);
+            let expected = rgba(index);
+            let error = pixels
+                .iter()
+                .zip(&expected)
+                .map(|(&a, &b)| (f64::from(a) - f64::from(b)).powi(2))
+                .sum::<f64>()
+                / pixels.len() as f64;
+            let psnr = 10.0 * (255.0 * 255.0 / error.max(1e-9)).log10();
+            assert!(psnr > 30.0, "frame {index}: {psnr:.1} dB");
+        }
+    }
+
     /// Issue #509: a colour AV1 track (the bundled SVT-AV1 8-bit 4:2:0 Main
     /// sample) decodes through the fallback. The digests are FFmpeg/libdav1d's
     /// decode of the same frames converted by the crate's own BT.601 RGBA

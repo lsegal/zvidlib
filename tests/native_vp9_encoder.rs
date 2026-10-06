@@ -4,16 +4,19 @@
 //! independent decoders in ffmpeg (its own `vp9` and, where built in, libvpx).
 
 use std::future::Future;
+use std::io::Write;
 use std::pin::pin;
 use std::process::{Command, Stdio};
 use std::task::{Context, Poll, Waker};
 use zvidlib::io::{MemorySink, MemorySource};
 use zvidlib::mp4::{Mp4Muxer, Mp4TrackConfig, Mp4TrackFormat};
 use zvidlib::{
-    Codec, CodecProfile, ColorRange, CpuFrameSource, FrameIndex, FrameSource, HardwarePreference,
-    Limits, Mp4Demuxer, Mp4DemuxerOptions, Orientation, PixelFormat, Plane, SampleDependency,
-    VideoDimensions, VideoEncoderConfig, VideoEncoderFactory, VideoFrame,
-    native_vp9_video_encoder_factory,
+    CancellationToken, Codec, CodecImplementation, CodecProfile, CodecSupport, ColorRange,
+    CpuFrameSource, DecodedVideoFrame, EncodedVideoSample, FrameIndex, FrameSource,
+    HardwarePreference, Limits, Mp4Demuxer, Mp4DemuxerOptions, Orientation, PixelFormat, Plane,
+    Result, SampleDependency, VideoDecoder, VideoDecoderConfig, VideoDecoderFactory,
+    VideoDimensions, VideoEncoderConfig, VideoEncoderConformanceVector, VideoEncoderFactory,
+    VideoFrame, native_vp9_video_encoder_factory, verify_video_encoder_conformance,
 };
 
 const WIDTH: u32 = 160;
@@ -36,7 +39,11 @@ fn rgba_frame(index: u32) -> Vec<u8> {
     for y in 0..HEIGHT {
         for x in 0..WIDTH {
             let u = x + index * 2;
-            let checker = if ((u / 10) + (y / 10)) % 2 == 0 { 60 } else { 0 };
+            let checker = if ((u / 10) + (y / 10)) % 2 == 0 {
+                60
+            } else {
+                0
+            };
             pixels.extend_from_slice(&[
                 (u * 255 / (WIDTH + 2 * FRAMES)) as u8,
                 (y * 255 / HEIGHT) as u8 / 2 + checker,
@@ -188,7 +195,10 @@ fn vp9_mp4_plays_in_independent_decoders() {
     if let Ok(probe) = probe {
         let report = String::from_utf8_lossy(&probe.stdout);
         assert!(report.contains("codec_name=vp9"), "{report}");
-        assert!(report.contains("width=160") && report.contains("height=90"), "{report}");
+        assert!(
+            report.contains("width=160") && report.contains("height=90"),
+            "{report}"
+        );
         assert!(report.contains(&format!("nb_frames={FRAMES}")), "{report}");
     }
 
@@ -215,10 +225,257 @@ fn vp9_mp4_plays_in_independent_decoders() {
         }
         // Every conforming decoder produces the same pictures.
         if let Some(first) = &first {
-            assert!(first == &decoded, "{decoder} disagrees with the first decoder");
+            assert!(
+                first == &decoded,
+                "{decoder} disagrees with the first decoder"
+            );
         } else {
             first = Some(decoded);
         }
     }
     let _ = std::fs::remove_file(&path);
+}
+
+fn ivf(frames: &[&[u8]], dimensions: VideoDimensions) -> Vec<u8> {
+    let mut output = Vec::new();
+    output.extend_from_slice(b"DKIF");
+    output.extend_from_slice(&0_u16.to_le_bytes());
+    output.extend_from_slice(&32_u16.to_le_bytes());
+    output.extend_from_slice(b"VP90");
+    output.extend_from_slice(&(dimensions.width as u16).to_le_bytes());
+    output.extend_from_slice(&(dimensions.height as u16).to_le_bytes());
+    output.extend_from_slice(&30_u32.to_le_bytes());
+    output.extend_from_slice(&1_u32.to_le_bytes());
+    output.extend_from_slice(&(frames.len() as u32).to_le_bytes());
+    output.extend_from_slice(&0_u32.to_le_bytes());
+    for (index, frame) in frames.iter().enumerate() {
+        output.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+        output.extend_from_slice(&(index as u64).to_le_bytes());
+        output.extend_from_slice(frame);
+    }
+    output
+}
+
+/// A conforming VP9 decoder for the conformance runner, backed by ffmpeg's
+/// libvpx (or its own VP9 decoder where libvpx is not built in). Each
+/// submission decodes again from the last random-access sample, so the
+/// adapter keeps no state but that run of samples.
+struct FfmpegVp9DecoderFactory {
+    decoder: &'static str,
+}
+
+impl VideoDecoderFactory for FfmpegVp9DecoderFactory {
+    fn capability(&self, configuration: &VideoDecoderConfig) -> CodecSupport {
+        if configuration.codec == Codec::Vp9
+            && configuration.profile == CodecProfile::Vp9Profile0
+            && configuration.output_format == PixelFormat::Yuv420p8
+        {
+            CodecSupport::Supported {
+                implementation: CodecImplementation::Software,
+            }
+        } else {
+            CodecSupport::UnsupportedCodec
+        }
+    }
+
+    fn create(
+        &self,
+        configuration: &VideoDecoderConfig,
+        _limits: &Limits,
+    ) -> Result<Box<dyn VideoDecoder>> {
+        Ok(Box::new(FfmpegVp9Decoder {
+            decoder: self.decoder,
+            dimensions: configuration.coded_dimensions,
+            color_range: configuration.color_range,
+            run: Vec::new(),
+        }))
+    }
+}
+
+struct FfmpegVp9Decoder {
+    decoder: &'static str,
+    dimensions: VideoDimensions,
+    color_range: ColorRange,
+    run: Vec<Vec<u8>>,
+}
+
+impl VideoDecoder for FfmpegVp9Decoder {
+    fn submit(
+        &mut self,
+        sample: &EncodedVideoSample,
+        _cancellation: &CancellationToken,
+    ) -> Result<Vec<DecodedVideoFrame>> {
+        if sample.random_access {
+            self.run.clear();
+        }
+        self.run.push(sample.data.clone());
+        let frames: Vec<&[u8]> = self.run.iter().map(Vec::as_slice).collect();
+        let mut child = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-c:v",
+                self.decoder,
+                "-f",
+                "ivf",
+                "-i",
+                "pipe:0",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "yuv420p",
+                "pipe:1",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(&ivf(&frames, self.dimensions))
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success() && output.stderr.is_empty(),
+            "{} failed: {}",
+            self.decoder,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let (width, height) = (
+            self.dimensions.width as usize,
+            self.dimensions.height as usize,
+        );
+        let (chroma_width, chroma_height) = (width.div_ceil(2), height.div_ceil(2));
+        let frame_size = width * height + 2 * chroma_width * chroma_height;
+        assert_eq!(output.stdout.len(), frame_size * frames.len());
+        let last = &output.stdout[frame_size * (frames.len() - 1)..];
+        let (luma, chroma) = last.split_at(width * height);
+        let (cb, cr) = chroma.split_at(chroma_width * chroma_height);
+        let frame = VideoFrame::new(
+            self.dimensions,
+            PixelFormat::Yuv420p8,
+            self.color_range,
+            vec![
+                Plane {
+                    data: luma.to_vec(),
+                    stride: width,
+                },
+                Plane {
+                    data: cb.to_vec(),
+                    stride: chroma_width,
+                },
+                Plane {
+                    data: cr.to_vec(),
+                    stride: chroma_width,
+                },
+            ],
+            &Limits::default(),
+        )?;
+        Ok(vec![DecodedVideoFrame {
+            presentation_index: sample.presentation_index,
+            frame,
+        }])
+    }
+
+    fn drain(&mut self, _cancellation: &CancellationToken) -> Result<Vec<DecodedVideoFrame>> {
+        Ok(Vec::new())
+    }
+
+    fn reset(&mut self) -> Result<()> {
+        self.run.clear();
+        Ok(())
+    }
+}
+
+/// A panning checkerboard over smooth chroma ramps.
+fn yuv_frame(dimensions: VideoDimensions, index: u32) -> VideoFrame {
+    let (width, height) = (dimensions.width as usize, dimensions.height as usize);
+    let (chroma_width, chroma_height) = (width.div_ceil(2), height.div_ceil(2));
+    let luma = (0..height)
+        .flat_map(|y| {
+            (0..width).map(move |x| {
+                let u = x + index as usize * 2;
+                (32 + u * 2 + ((u / 6 + y / 6) % 2) * 50) as u8
+            })
+        })
+        .collect();
+    let plane = |base: usize| -> Vec<u8> {
+        (0..chroma_height)
+            .flat_map(|y| (0..chroma_width).map(move |x| (base + x + index as usize + y) as u8))
+            .collect()
+    };
+    VideoFrame::new(
+        dimensions,
+        PixelFormat::Yuv420p8,
+        ColorRange::Limited,
+        vec![
+            Plane {
+                data: luma,
+                stride: width,
+            },
+            Plane {
+                data: plane(90),
+                stride: chroma_width,
+            },
+            Plane {
+                data: plane(140),
+                stride: chroma_width,
+            },
+        ],
+        &Limits::default(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn native_vp9_encoder_passes_conformance_against_an_independent_decoder() {
+    let decoders = ffmpeg_decoders();
+    // Prefer libvpx, the reference decoder, when ffmpeg was built with it.
+    let Some(&decoder) = decoders
+        .iter()
+        .find(|&&name| name == "libvpx-vp9")
+        .or(decoders.first())
+    else {
+        eprintln!("skipping VP9 conformance because ffmpeg has no VP9 decoder");
+        return;
+    };
+    let limits = Limits::default();
+    let dimensions = VideoDimensions::new(50, 34, &limits).unwrap();
+    let vector = VideoEncoderConformanceVector {
+        name: "vp9-pan-key-every-4".into(),
+        configuration: VideoEncoderConfig {
+            codec: Codec::Vp9,
+            profile: CodecProfile::Vp9Profile0,
+            coded_dimensions: dimensions,
+            input_format: PixelFormat::Yuv420p8,
+            color_range: ColorRange::Limited,
+            hardware: HardwarePreference::Avoid,
+            timescale: 30,
+            frame_duration: 1,
+            configuration: vec![50, 0, 4],
+        },
+        decoder_configuration: VideoDecoderConfig {
+            codec: Codec::Vp9,
+            profile: CodecProfile::Vp9Profile0,
+            coded_dimensions: dimensions,
+            output_format: PixelFormat::Yuv420p8,
+            color_range: ColorRange::Limited,
+            hardware: HardwarePreference::Avoid,
+            configuration: Vec::new(),
+        },
+        frames: (0..9).map(|index| yuv_frame(dimensions, index)).collect(),
+        minimum_psnr_db: 35.0,
+    };
+    let report = block_on(verify_video_encoder_conformance(
+        &native_vp9_video_encoder_factory(),
+        &FfmpegVp9DecoderFactory { decoder },
+        &vector,
+        limits,
+    ))
+    .unwrap();
+    assert_eq!(report.frames_encoded, 9);
+    assert_eq!(report.packets_emitted, 9);
 }

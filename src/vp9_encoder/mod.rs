@@ -128,7 +128,11 @@ fn parse_configuration(configuration: &[u8]) -> Option<(u8, u16)> {
 
 /// The lowest VP9 level (as `level_idc`, e.g. 31 for 3.1) whose picture size and
 /// luma sample rate limits admit the stream (VP9 Annex A).
-pub(crate) fn pick_level(dimensions: VideoDimensions, timescale: u32, frame_duration: u32) -> Option<u8> {
+pub(crate) fn pick_level(
+    dimensions: VideoDimensions,
+    timescale: u32,
+    frame_duration: u32,
+) -> Option<u8> {
     const LEVELS: [(u8, u64, u64); 14] = [
         (10, 36_864, 829_440),
         (11, 73_728, 2_764_800),

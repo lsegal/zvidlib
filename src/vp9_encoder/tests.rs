@@ -105,10 +105,19 @@ fn encode_sequence(
     let mut samples = Vec::new();
     let mut reconstructions = Vec::new();
     let mut sources = Vec::new();
-    let (width, height) = (config.coded_dimensions.width, config.coded_dimensions.height);
+    let (width, height) = (
+        config.coded_dimensions.width,
+        config.coded_dimensions.height,
+    );
     for index in 0..frames {
         let frame = moving_yuv_frame(width, height, index);
-        sources.push(frame.planes.iter().flat_map(|plane| plane.data.clone()).collect());
+        sources.push(
+            frame
+                .planes
+                .iter()
+                .flat_map(|plane| plane.data.clone())
+                .collect(),
+        );
         let source = FrameSource::Cpu(CpuFrameSource {
             frame: &frame,
             orientation: Orientation::TopLeft,
@@ -241,7 +250,9 @@ fn vpcc_reads_colour_from_a_key_frame() {
         frame: &frame,
         orientation: Orientation::TopLeft,
     });
-    let sample = block_on(encoder.encode(FrameIndex(0), source)).unwrap().remove(0);
+    let sample = block_on(encoder.encode(FrameIndex(0), source))
+        .unwrap()
+        .remove(0);
     let vpcc = vpcc_from_key_frame(&sample.data, 10).unwrap();
     assert_eq!(vpcc, encoder.config().decoder_config);
     assert_eq!(vpcc[14], 0x83);
@@ -409,7 +420,10 @@ mod ffmpeg {
             return;
         }
         let (samples, reconstructions, _) = encode_sequence(config, frames);
-        let (width, height) = (config.coded_dimensions.width, config.coded_dimensions.height);
+        let (width, height) = (
+            config.coded_dimensions.width,
+            config.coded_dimensions.height,
+        );
         let stream = ivf(&samples, width, height);
         let expected: Vec<u8> = reconstructions.concat();
         for decoder in decoders {
