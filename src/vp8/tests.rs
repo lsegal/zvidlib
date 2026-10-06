@@ -240,3 +240,142 @@ fn decodes_a_webm_vp8_track_exactly_as_libvpx_does() {
         assert_eq!(i420_md5(&picture), expected[index], "frame {index}");
     }
 }
+
+/// The Media Foundation backend on its own, held to the software decoder for
+/// every frame of the vectors and the WebM fixture, sequentially and through
+/// `ExactFrameReader`'s seeks.
+///
+/// `tests/vp8_conformance.rs` checks whichever backend the factory selects,
+/// which is NVDEC on a host that has both, as a hybrid laptop with an Intel
+/// and an NVIDIA adapter does; this reaches Media Foundation there too. Hosts
+/// whose adapter lacks the D3D11 VP8 decoder profile, or that have no
+/// D3D11-aware VP8 decoder transform installed, skip with the reason.
+#[cfg(windows)]
+#[test]
+fn media_foundation_vp8_matches_the_software_decoder_and_seeks_exactly() {
+    use crate::{
+        CancellationToken, CodecImplementation, CodecSupport, EncodedVideoSample,
+        ExpectedVideoFrame, FrameDigest, FrameIndex, HardwarePreference, VideoDecoder,
+        VideoDecoderConfig, VideoDecoderConformanceVector, VideoDecoderFactory, VideoDimensions,
+        native_vp8_video_decoder_factory, verify_video_decoder_conformance,
+    };
+
+    struct MediaFoundation;
+
+    impl VideoDecoderFactory for MediaFoundation {
+        fn capability(&self, _configuration: &VideoDecoderConfig) -> CodecSupport {
+            CodecSupport::Supported {
+                implementation: CodecImplementation::Hardware,
+            }
+        }
+
+        fn create(
+            &self,
+            configuration: &VideoDecoderConfig,
+            limits: &Limits,
+        ) -> crate::Result<Box<dyn VideoDecoder>> {
+            crate::hevc::windows_mf::create_vp8(configuration, limits, super::planes_to_rgba)
+        }
+    }
+
+    let limits = Limits::default();
+    let configuration = |width: u32, height: u32| VideoDecoderConfig {
+        codec: crate::Codec::Vp8,
+        profile: crate::CodecProfile::Vp8,
+        coded_dimensions: VideoDimensions::new(width, height, &limits).unwrap(),
+        output_format: crate::PixelFormat::Rgba8,
+        color_range: crate::ColorRange::Limited,
+        hardware: HardwarePreference::Avoid,
+        configuration: Vec::new(),
+    };
+    if let Err(error) = MediaFoundation.create(&configuration(176, 144), &limits) {
+        eprintln!("skipping: Media Foundation VP8 decoding unavailable: {error}");
+        return;
+    }
+
+    let mut streams = Vec::new();
+    let mut ivfs = vectors!(
+        "001", "002", "003", "004", "005", "006", "007", "008", "009", "010", "011", "012", "013",
+        "014", "015", "016", "017", "018",
+    )
+    .map(|(name, ivf, _)| (name, &ivf[..]))
+    .to_vec();
+    ivfs.push((
+        "vp8_altref_98x66",
+        include_bytes!("../../tests/fixtures/codec/vp8/vp8_altref_98x66.ivf"),
+    ));
+    for (name, ivf) in ivfs {
+        let width = u32::from(u16::from_le_bytes([ivf[12], ivf[13]]));
+        let height = u32::from(u16::from_le_bytes([ivf[14], ivf[15]]));
+        let frames = ivf_frames(ivf);
+        // Shown frames are numbered in order; a hidden frame takes an
+        // identity past the last shown frame that nothing asks for.
+        let shown = frames.iter().filter(|frame| frame[0] & 0x10 != 0).count() as u64;
+        let (mut next_shown, mut next_hidden) = (0, shown);
+        let samples = frames
+            .iter()
+            .map(|frame| {
+                let counter = if frame[0] & 0x10 != 0 {
+                    &mut next_shown
+                } else {
+                    &mut next_hidden
+                };
+                let presentation_index = FrameIndex(*counter);
+                *counter += 1;
+                EncodedVideoSample {
+                    presentation_index,
+                    random_access: frame[0] & 1 == 0,
+                    data: frame.to_vec(),
+                }
+            })
+            .collect::<Vec<_>>();
+        streams.push((name, configuration(width, height), samples));
+    }
+    let webm = crate::io::MemorySource::new(
+        include_bytes!("../../tests/fixtures/codec/vp8/vp8_testsrc2_98x66.webm").to_vec(),
+    );
+    let demuxer = block_on(crate::WebmDemuxer::open(&webm, Default::default())).unwrap();
+    let samples = block_on(demuxer.tracks[0].to_encoded_video_samples(&webm, &limits)).unwrap();
+    streams.push(("VP8 in WebM", configuration(98, 66), samples));
+
+    let cancellation = CancellationToken::new();
+    let software = native_vp8_video_decoder_factory();
+    for (name, configuration, samples) in streams {
+        let decode = |factory: &dyn VideoDecoderFactory| {
+            let mut decoder = factory.create(&configuration, &limits).unwrap();
+            let mut digests = Vec::new();
+            for sample in &samples {
+                let outputs = decoder
+                    .submit(sample, &cancellation)
+                    .unwrap_or_else(|error| panic!("{name}: {error}"));
+                // A shown frame comes back from the sample that codes it,
+                // and a hidden frame's sample returns nothing.
+                let shown = sample.data[0] & 0x10 != 0;
+                assert_eq!(outputs.len(), usize::from(shown), "{name}");
+                for output in outputs {
+                    assert_eq!(output.presentation_index, sample.presentation_index);
+                    digests.push(FrameDigest::from_frame(&output.frame).unwrap());
+                }
+            }
+            assert!(decoder.drain(&cancellation).unwrap().is_empty(), "{name}");
+            digests
+        };
+        let expected = decode(&software);
+        assert_eq!(decode(&MediaFoundation), expected, "{name}");
+        let vector = VideoDecoderConformanceVector {
+            name: name.into(),
+            configuration,
+            expected_frames: expected
+                .iter()
+                .enumerate()
+                .map(|(index, &digest)| ExpectedVideoFrame {
+                    presentation_index: FrameIndex(index as u64),
+                    digest,
+                })
+                .collect(),
+            samples,
+        };
+        verify_video_decoder_conformance(&MediaFoundation, &vector, limits)
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+    }
+}

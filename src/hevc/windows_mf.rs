@@ -91,7 +91,6 @@ pub(super) fn create(
             nal_length_size: record.length_size,
             parameter_sets: annex_b_parameter_sets(record),
         },
-        true,
     )
     .map(|decoder| Box::new(decoder) as Box<dyn VideoDecoder>)
 }
@@ -103,34 +102,8 @@ pub(crate) fn create_vp8(
     limits: &Limits,
     convert: PlanarConverter,
 ) -> Result<Box<dyn VideoDecoder>> {
-    HardwareDecoder::spawn(
-        configuration.clone(),
-        *limits,
-        Bitstream::Vp8 { convert },
-        true,
-    )
-    .map(|decoder| Box::new(decoder) as Box<dyn VideoDecoder>)
-}
-
-/// [`create_vp8`] without the D3D11 VP8 decoder profile, for hosts whose adapter lacks it.
-///
-/// The decoder transform then decodes on the CPU into D3D11 surfaces, which is not hardware
-/// decoding, so the factory never selects it. It runs everything else this backend does - the
-/// transform search, the identities of hidden frames, the surface readback and crop - which is
-/// what lets a host without the profile test that code.
-#[cfg(test)]
-pub(crate) fn create_vp8_without_hardware_profile(
-    configuration: &VideoDecoderConfig,
-    limits: &Limits,
-    convert: PlanarConverter,
-) -> Result<Box<dyn VideoDecoder>> {
-    HardwareDecoder::spawn(
-        configuration.clone(),
-        *limits,
-        Bitstream::Vp8 { convert },
-        false,
-    )
-    .map(|decoder| Box::new(decoder) as Box<dyn VideoDecoder>)
+    HardwareDecoder::spawn(configuration.clone(), *limits, Bitstream::Vp8 { convert })
+        .map(|decoder| Box::new(decoder) as Box<dyn VideoDecoder>)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -215,7 +188,6 @@ impl HardwareDecoder {
         configuration: VideoDecoderConfig,
         limits: Limits,
         bitstream: Bitstream,
-        require_profile: bool,
     ) -> Result<Self> {
         let (command_tx, command_rx) = sync_channel(1);
         let (ready_tx, ready_rx) = sync_channel(1);
@@ -226,7 +198,7 @@ impl HardwareDecoder {
         let worker = thread::Builder::new()
             .name(thread_name)
             .spawn(move || {
-                let core = DecoderCore::new(configuration, limits, bitstream, require_profile);
+                let core = DecoderCore::new(configuration, limits, bitstream);
                 match core {
                     Ok(core) => {
                         if ready_tx.send(Ok(())).is_ok() {
@@ -368,15 +340,12 @@ impl DecoderCore {
         configuration: VideoDecoderConfig,
         limits: Limits,
         bitstream: Bitstream,
-        require_profile: bool,
     ) -> Result<Self> {
         let format = bitstream.format();
         let name = format.name();
         let runtime = MfRuntime::start()?;
         let (device, context) = create_d3d_device()?;
-        if require_profile {
-            require_hardware(&device, format, configuration.coded_dimensions)?;
-        }
+        require_hardware(&device, format, configuration.coded_dimensions)?;
         let transform = create_transform(format)?;
         if format == Format::Vp8 {
             // VP8 never reorders, so a decoder that held frames back would return a shown frame
