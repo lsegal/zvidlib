@@ -7,8 +7,8 @@
 //! `benches/README.md` for how to run and filter it.
 //!
 //! The per-codec targets own their own measurements: `benches/hevc_decode.rs`,
-//! `benches/av1_decode.rs`, `benches/hevc_encode.rs`, `benches/audio_decode.rs`
-//! and `benches/audio_mux.rs`.
+//! `benches/av1_decode.rs`, `benches/hevc_encode.rs`, `benches/audio_decode.rs`,
+//! `benches/audio_mux.rs` and `benches/vpx_decode.rs`.
 
 mod support;
 

@@ -15,6 +15,7 @@ zvidlib's benchmarks run under [criterion](https://docs.rs/criterion) with
 | `benches/hevc_decode.rs` | the HEVC software decoder: whole-frame decode and every hot stage, scalar versus SIMD |
 | `benches/hevc_hardware.rs` | the platform fixed-function HEVC decoders against the software one, and the hardware HEVC encoder |
 | `benches/exact_seek.rs` | what an exact frame at an arbitrary point costs, by backend and by random-access cadence |
+| `benches/vpx_decode.rs` | the VP8 and VP9 software decoders, and the YUV-to-RGBA conversion they share with AV1, scalar versus SIMD |
 
 Each target loads and decodes its fixtures once per process, so every iteration
 measures the work under test and nothing else. `codec` is one target rather than
@@ -40,6 +41,7 @@ cargo bench --bench hevc_encode   # the HEVC encoder groups only
 cargo bench --bench hevc_decode   # the HEVC software decoder only
 cargo bench --bench hevc_hardware # the platform hardware HEVC decoders and encoder
 cargo bench --bench exact_seek    # exact-seek cost by backend and cadence
+cargo bench --bench vpx_decode    # VP8/VP9 decode and the AV1/VP8/VP9 output conversion
 cargo bench --features simd       # the same groups, recorded under `simd=on`
 cargo bench --no-run              # compile only
 ```
@@ -181,6 +183,44 @@ cargo bench --bench codec -- av1_deblock_luma
 cargo bench --bench av1_decode -- 'av1_deblock/scalar'
 cargo bench --bench av1_decode -- av1_inverse   # every inverse-transform group
 ```
+
+## The VP8 and VP9 decoder suite (`--bench vpx_decode`)
+
+`benches/vpx_decode.rs` measures the pure-Rust VP8 and VP9 software decoders
+end to end, and the YUV-to-RGBA conversion every AV1, VP8 and VP9 software
+picture leaves through (`convert_to_rgba8`, the `yuv_to_rgba` dispatch site,
+issue #574). Every group is a per-ISA group.
+
+| Group | Stage |
+| --- | --- |
+| `yuv_to_rgba_1080p`, `yuv_to_rgba_4k` | `convert_to_rgba8` over one limited-range BT.709 4:2:0 picture, `src/yuv_to_rgba.rs` |
+| `vp8_decode_frame` | whole-frame decode through `native_vp8_video_decoder_factory` |
+| `vp9_decode_frame` | whole-frame decode through `native_vp9_video_decoder_factory` |
+
+The decode groups decode six 640x360 frames the crate's own VP8 and VP9
+encoders produce once per process. Neither decoder has another vector kernel,
+so the conversion is the only thing their arms differ in, and their ratio is
+the share of a decode the conversion kernel recovers. `av1_decode_frame` in
+[the AV1 decoder suite](#the-av1-decoder-suite---bench-av1_decode) converts
+through the same site.
+
+The conversion's `scalar` arm is the fixed-point scalar code, not the `f64`
+loop it replaced. The vector arms are bit-exact with it, and it is bit-exact
+with that `f64` definition for every input: pixels whose fixed-point value
+lands next to a rounding boundary, about 0.1-0.9% of random content, are
+recomputed in `f64`. Indicative medians from two runs for the #574 pull
+request, on a 20-thread x86_64 host that other builds were loading at the time,
+so read the ratios rather than the absolute times; the first column is the
+fastest the replaced `f64` loop measured over three runs on the same host:
+
+| Group | `f64` before #574 | `scalar` | `sse4.1` | `avx2` |
+| --- | ---: | ---: | ---: | ---: |
+| `yuv_to_rgba_1080p` | 54 ms or more | 25.8-35.3 ms | 10.1-11.8 ms (2.6-3.0x) | 7.8-9.7 ms (2.7-4.5x) |
+| `yuv_to_rgba_4k` | 217 ms or more | 97.0-113.2 ms | 32.5-39.0 ms (2.9-3.0x) | 21.3-31.1 ms (3.1-5.3x) |
+
+The decode groups' arms could not be told apart on that host: two arms running
+identical code differed by up to 2x between runs. The CI timed-benchmark job
+measures this target on every `main` push, on uncontended runners.
 
 ## The AV1 encoder suite (`--bench av1_encode`)
 
@@ -4163,9 +4203,12 @@ together would average the seek cost away, and the seek cost is the one that
 shows up as an audible stall.
 
 These groups carry **no `simd=` tag and no per-ISA arms**. AAC decoding is
-delegated to the third-party `symphonia-codec-aac` crate, `zvidlib::simd`'s
-override does not reach it, and the crate has no audio SIMD kernels of its own,
-so a scalar arm and a vector arm would be the same code reported twice.
+delegated to AudioToolbox on macOS, to Media Foundation on Windows, and to the
+third-party `symphonia-codec-aac` crate on Linux; `zvidlib::simd`'s override
+reaches none of them, and the crate has no audio SIMD kernels of its own, so a
+scalar arm and a vector arm would be the same code reported twice. Because the
+decoder differs by platform, so do these groups' numbers: the Linux benchmark
+runners measure Symphonia.
 
 The mono fixture exists because the bundled sample is stereo and carries no edit
 list, while `NativeAacDecoder` accepts AAC-LC mono as well (and rejects

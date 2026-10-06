@@ -103,7 +103,7 @@ pub(super) fn create(
 /// are deliberately never torn down: an encoder is `Send` and may be dropped
 /// on any thread, which rules out pairing them with per-thread uninitialize
 /// calls, and Media Foundation's startup is reference-counted process state.
-fn ensure_media_foundation() -> Result<()> {
+pub(crate) fn ensure_media_foundation() -> Result<()> {
     static STARTED: OnceLock<std::result::Result<(), String>> = OnceLock::new();
     STARTED
         .get_or_init(|| unsafe {
@@ -461,7 +461,7 @@ impl AudioEncoder for AacEncoder {
     }
 }
 
-fn windows_error(context: &str, error: windows::core::Error) -> Error {
+pub(crate) fn windows_error(context: &str, error: windows::core::Error) -> Error {
     Error::new(ErrorKind::Codec, format!("{context}: {error}"))
 }
 
