@@ -4,11 +4,11 @@
 //!
 //! It replaces `symphonia_core::dsp::mdct::Imdct`. Symphonia's only vector
 //! path is `rustfft`'s behind its `opt-simd` feature, which picks an
-//! instruction set on its own - out of reach of [`crate::simd::set_override`]
-//! - and rounds differently from its scalar FFT, which would break the
-//! crate-wide promise that the override never changes output (issue #572).
-//! The transform here keeps Symphonia's pre- and post-twiddle arithmetic and
-//! its FFT's twiddle factors, so it is the same IMDCT up to rounding.
+//! instruction set on its own, out of reach of [`crate::simd::set_override`],
+//! and rounds differently from its scalar FFT; that would break the crate-wide
+//! promise that the override never changes output (issue #572). The transform
+//! here keeps Symphonia's pre- and post-twiddle arithmetic and its FFT's
+//! twiddle factors, so it is the same IMDCT up to rounding.
 
 // Symphonia
 // Copyright (c) 2019-2022 The Project Symphonia Developers.

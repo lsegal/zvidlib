@@ -50,8 +50,9 @@ static OVERRIDE: AtomicU8 = AtomicU8::new(0);
 /// The override reaches every dispatch family: the AV1 transform and
 /// in-loop filter kernels, AV1 motion compensation (through the default level
 /// [`crate::av1_mc::McContext::new`] picks up), AV1 intra prediction, every
-/// HEVC engine kernel, and the Vorbis decoder's synthesis kernels. [`SimdIsa::Scalar`] therefore genuinely reaches the
-/// scalar code path rather than merely the widest scalar-ish one.
+/// HEVC engine kernel, and the Vorbis decoder's synthesis kernels.
+/// [`SimdIsa::Scalar`] therefore genuinely reaches the scalar code path rather
+/// than merely the widest scalar-ish one.
 ///
 /// An instruction set this host cannot execute is clamped to
 /// [`SimdIsa::Scalar`] rather than silently ignored, so a caller that asks for
