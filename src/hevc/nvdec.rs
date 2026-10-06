@@ -14,6 +14,7 @@ use std::thread::{self, JoinHandle};
 use libloading::Library;
 
 use super::engine::hvcc::{HvccRecord, split_length_prefixed};
+use super::planar::{PlanarConverter, nv12_to_planar, vp8_frame_is_shown, vp8_sample};
 use super::readback;
 use crate::{
     CancellationToken, DecodedVideoFrame, EncodedVideoSample, Error, ErrorKind, FrameIndex, Limits,
@@ -100,11 +101,6 @@ pub(super) fn create(
     )
     .map(|decoder| Box::new(decoder) as Box<dyn VideoDecoder>)
 }
-
-/// Converts a decoded picture, cropped to the configured dimensions and given as three tightly
-/// packed 4:2:0 planes, to the frame the decoder returns.
-pub(crate) type PlanarConverter =
-    fn([Vec<u8>; 3], &VideoDecoderConfig, &Limits) -> Result<VideoFrame>;
 
 /// Creates an NVDEC VP8 decoder whose pictures are converted by `convert`, so the hardware
 /// decoder's output goes through exactly the conversion the software decoder's does.
@@ -366,7 +362,7 @@ impl NvDecoderCore {
                 true,
             ),
             Bitstream::Vp8 { .. } => (
-                vp8_sample(sample, self.limits.max_allocation_bytes)?,
+                vp8_sample(sample, self.limits.max_allocation_bytes)?.to_vec(),
                 vp8_frame_is_shown(&sample.data),
             ),
         };
@@ -442,7 +438,12 @@ impl NvDecoderCore {
                 let frame = match &self.bitstream {
                     Bitstream::Hevc { .. } => nv12_to_rgba(raw, &self.configuration, &self.limits)?,
                     Bitstream::Vp8 { convert } => convert(
-                        nv12_to_planar(&raw, self.configuration.coded_dimensions)?,
+                        nv12_to_planar(
+                            &raw.data,
+                            raw.pitch,
+                            raw.surface_height,
+                            self.configuration.coded_dimensions,
+                        )?,
                         &self.configuration,
                         &self.limits,
                     )?,
@@ -1030,69 +1031,6 @@ fn annex_b_sample(
     Ok(output)
 }
 
-fn vp8_sample(sample: &EncodedVideoSample, max_allocation_bytes: u64) -> Result<Vec<u8>> {
-    // A VP8 frame tag is three bytes, and a key frame adds seven more; anything shorter is
-    // refused here, as the software decoder refuses it, rather than handed to the driver.
-    let minimum = if sample.data.first().is_some_and(|tag| tag & 1 == 0) {
-        10
-    } else {
-        3
-    };
-    if sample.data.len() < minimum {
-        return Err(Error::new(
-            ErrorKind::MalformedMedia,
-            "VP8 frame is truncated",
-        ));
-    }
-    if sample.data.len() as u64 > max_allocation_bytes {
-        return Err(Error::new(
-            ErrorKind::ResourceLimit,
-            "VP8 frame exceeds the allocation limit",
-        ));
-    }
-    Ok(sample.data.clone())
-}
-
-/// The `show_frame` bit of a VP8 frame tag (RFC 6386 section 9.1).
-fn vp8_frame_is_shown(data: &[u8]) -> bool {
-    data.first().is_some_and(|tag| tag & 0x10 != 0)
-}
-
-/// Crops an NV12 surface to `dimensions` and splits its interleaved chroma, giving the three
-/// 4:2:0 planes a software decoder would have produced.
-fn nv12_to_planar(raw: &RawNv12Frame, dimensions: VideoDimensions) -> Result<[Vec<u8>; 3]> {
-    let width = dimensions.width as usize;
-    let height = dimensions.height as usize;
-    let chroma_width = width.div_ceil(2);
-    let chroma_height = height.div_ceil(2);
-    let chroma_start = raw
-        .pitch
-        .checked_mul(raw.surface_height)
-        .ok_or_else(|| Error::new(ErrorKind::ResourceLimit, "NVDEC output size overflows"))?;
-    if raw.pitch < chroma_width * 2
-        || raw.surface_height < height
-        || raw.data.len() < chroma_start + raw.pitch * chroma_height
-    {
-        return Err(codec("NVDEC output surface is smaller than the frame"));
-    }
-    let mut luma = Vec::with_capacity(width * height);
-    for row in raw.data.chunks(raw.pitch).take(height) {
-        luma.extend_from_slice(&row[..width]);
-    }
-    let mut u = Vec::with_capacity(chroma_width * chroma_height);
-    let mut v = Vec::with_capacity(chroma_width * chroma_height);
-    for row in raw.data[chroma_start..]
-        .chunks(raw.pitch)
-        .take(chroma_height)
-    {
-        for pair in row[..chroma_width * 2].chunks_exact(2) {
-            u.push(pair[0]);
-            v.push(pair[1]);
-        }
-    }
-    Ok([luma, u, v])
-}
-
 fn append_annex_b_unit(output: &mut Vec<u8>, unit: &super::engine::nal::NalUnit) {
     output.extend_from_slice(&[0, 0, 0, 1]);
     output.push((unit.header.nal_unit_type << 1) | (unit.header.nuh_layer_id >> 5));
@@ -1305,44 +1243,6 @@ mod tests {
             surface_height: 2,
             data: vec![byte; 6],
         }
-    }
-
-    #[test]
-    fn nv12_is_cropped_to_odd_dimensions_and_deinterleaved() {
-        // A 3x3 picture on a 4x4 surface with a pitch of 6: luma samples are 10 * row + column,
-        // and chroma pairs are (100 + n, 200 + n).
-        let mut data = vec![0_u8; 6 * 4 + 6 * 2];
-        for row in 0..4 {
-            for column in 0..4 {
-                data[row * 6 + column] = (10 * row + column) as u8;
-            }
-        }
-        for row in 0..2 {
-            for pair in 0..2 {
-                let n = (row * 2 + pair) as u8;
-                data[24 + row * 6 + pair * 2] = 100 + n;
-                data[24 + row * 6 + pair * 2 + 1] = 200 + n;
-            }
-        }
-        let raw = RawNv12Frame {
-            pitch: 6,
-            surface_height: 4,
-            data,
-        };
-        let dimensions = VideoDimensions::new(3, 3, &Limits::default()).unwrap();
-
-        let [luma, u, v] = nv12_to_planar(&raw, dimensions).unwrap();
-
-        assert_eq!(luma, vec![0, 1, 2, 10, 11, 12, 20, 21, 22]);
-        assert_eq!(u, vec![100, 101, 102, 103]);
-        assert_eq!(v, vec![200, 201, 202, 203]);
-    }
-
-    #[test]
-    fn a_hidden_vp8_frame_is_recognised_from_its_tag() {
-        assert!(vp8_frame_is_shown(&[0x10, 0, 0]));
-        assert!(!vp8_frame_is_shown(&[0x00, 0, 0]));
-        assert!(!vp8_frame_is_shown(&[]));
     }
 
     /// The hazard the suppressed path introduces: a picture that was displayed but not read back
