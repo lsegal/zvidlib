@@ -548,3 +548,36 @@ fn read_residue_partition_format1(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_2_deinterleaves_a_pair_that_does_not_start_at_channel_0() {
+        let mut residue = Residue {
+            setup: ResidueSetup {
+                residue_type: 2,
+                residue_begin: 0,
+                residue_end: 4,
+                residue_partition_size: 2,
+                residue_classifications: 1,
+                residue_classbook: 0,
+                residue_vq_class: Vec::new(),
+                residue_max_pass: 0,
+            },
+            part_classes: Vec::new(),
+            type2_buf: vec![1.0, 2.0, 3.0, 4.0],
+        };
+        let mut channels: Vec<DspChannel> = (0..4).map(|_| DspChannel::new(6, 6)).collect();
+        let mut pair = BitSet256::default();
+        pair.set(1);
+        pair.set(2);
+
+        residue.deinterleave_2(&pair, &mut channels);
+
+        assert_eq!(channels[1].residue[..2], [1.0, 3.0]);
+        assert_eq!(channels[2].residue[..2], [2.0, 4.0]);
+        assert_eq!(channels[3].residue[..2], [0.0, 0.0]);
+    }
+}

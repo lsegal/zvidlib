@@ -11,12 +11,15 @@
 //!   partitions only. The classword that ends a channel's partitions spilled
 //!   its unused classes into the next channel's, whose later passes then read
 //!   the wrong codebooks.
-//! - Format 2 residues deinterleave into the submap's second channel rather
-//!   than into one past it when the submap does not start at channel 0.
+//! - A format 2 residue shared by two channels deinterleaves into the second
+//!   of them. When the first was not channel 0, the second's samples went to
+//!   the channel at the sum of both indices instead.
 //! - Channels come out in the Vorbis order (Vorbis I section 4.3.9), plane `i`
 //!   being Vorbis channel `i`, rather than reordered by Symphonia's channel
 //!   flags, so `symphonia-utils-xiph` is not needed; and the setup-header
 //!   trace that used `log` is gone.
+//! - Two loops in `codebook.rs` and one test in `common.rs` are written the
+//!   way this crate's lints ask, computing the same values.
 //!
 //! Upstream source: <https://github.com/pdeljanov/Symphonia>, tag `v0.5.5`.
 
