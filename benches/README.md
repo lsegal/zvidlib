@@ -12,6 +12,7 @@ zvidlib's benchmarks run under [criterion](https://docs.rs/criterion) with
 | `benches/audio_mux.rs` | the audio container path: MP4 muxing, sample-table growth, demux, and gapless timing |
 | `benches/hevc_encode.rs` | the pure-Rust HEVC encoder, whole-frame and per-stage |
 | `benches/hevc_decode.rs` | the HEVC software decoder: whole-frame decode and every hot stage, scalar versus SIMD |
+| `benches/vp9_decode.rs` | the VP9 software decoder: whole-frame decode and every vectorized stage, scalar versus SIMD |
 | `benches/hevc_hardware.rs` | the platform fixed-function HEVC decoders against the software one, and the hardware HEVC encoder |
 | `benches/exact_seek.rs` | what an exact frame at an arbitrary point costs, by backend and by random-access cadence |
 
@@ -37,6 +38,7 @@ cargo bench --bench audio_decode  # the audio decode path only
 cargo bench --bench audio_mux     # the audio container path only
 cargo bench --bench hevc_encode   # the HEVC encoder groups only
 cargo bench --bench hevc_decode   # the HEVC software decoder only
+cargo bench --bench vp9_decode    # the VP9 software decoder only
 cargo bench --bench hevc_hardware # the platform hardware HEVC decoders and encoder
 cargo bench --bench exact_seek    # exact-seek cost by backend and cadence
 cargo bench --features simd       # the same groups, recorded under `simd=on`
@@ -180,6 +182,68 @@ cargo bench --bench codec -- av1_deblock_luma
 cargo bench --bench av1_decode -- 'av1_deblock/scalar'
 cargo bench --bench av1_decode -- av1_inverse   # every inverse-transform group
 ```
+
+## The VP9 decoder suite (`--bench vp9_decode`)
+
+`benches/vp9_decode.rs` measures the pure-Rust VP9 profile 0 decoder end to
+end and per vectorized stage (issue #570). Every group is a per-ISA group, and
+all of them reach the one `vp9_decode` dispatch site, so pinning the override
+reaches every VP9 kernel at once.
+
+| Group | Stage |
+| --- | --- |
+| `vp9_decode_frame` | whole-frame decode of the bundled 256x144 libvpx stream, to YUV |
+| `vp9_inverse_dct_{4x4,8x8,16x16,32x32}` | inverse DCT and add-to-prediction, `src/vp9_simd/transforms.rs` |
+| `vp9_inverse_adst_{4x4,8x8,16x16}` | inverse ADST and add-to-prediction |
+| `vp9_inverse_wht_4x4` | the lossless Walsh-Hadamard transform |
+| `vp9_mc_{regular,smooth,sharp,bilinear}` | 16x16 sub-pixel inter prediction per filter, `src/vp9_simd/convolve.rs` |
+| `vp9_mc_4x4`, `vp9_mc_compound` | the narrowest block, and two predictions averaged |
+| `vp9_intra_dc`, `vp9_intra_tm`, `vp9_intra_directional` | intra prediction, 4x4 to 32x32, `src/vp9_simd/intra.rs` |
+| `vp9_loop_filter_{4,8,16}` | the three loop filters on every edge of a plane, `src/vp9_simd/loopfilter.rs` |
+
+The per-stage groups run over one 1080p luma plane through
+`zvidlib::vp9_decoder_bench`, and the whole-frame group stops at the decoded YUV
+picture, because the RGBA conversion the public decoder ends with is shared,
+scalar and tracked separately.
+
+### The speedups #570 measured
+
+On an Intel Core i9-10850K (Windows, SSE4.1 and AVX2) with the `release`
+profile, as the best of 25 rounds that interleave the three arms over the same
+`vp9_decoder_bench` stages these groups time. The host was busy with other work
+throughout, which a best-of-rounds reading is robust to and a criterion median
+is not; treat the ratios, not the absolute times, as the result.
+
+| Stage | `scalar` | `sse4.1` | `avx2` |
+| --- | ---: | ---: | ---: |
+| whole-frame decode (256x144, 48 frames) | 26.870 ms | 18.455 ms (1.46x) | 18.143 ms (1.48x) |
+| inverse DCT 4x4 | 16.678 ms | 9.664 ms (1.73x) | 9.508 ms (1.75x) |
+| inverse DCT 8x8 | 16.269 ms | 8.119 ms (2.00x) | 7.570 ms (2.15x) |
+| inverse DCT 16x16 | 19.662 ms | 7.708 ms (2.55x) | 7.673 ms (2.56x) |
+| inverse DCT 32x32 | 21.498 ms | 8.907 ms (2.41x) | 8.475 ms (2.54x) |
+| inverse ADST 4x4 | 16.201 ms | 10.195 ms (1.59x) | 10.738 ms (1.51x) |
+| inverse ADST 8x8 | 19.386 ms | 10.423 ms (1.86x) | 9.948 ms (1.95x) |
+| inverse ADST 16x16 | 23.953 ms | 11.330 ms (2.11x) | 10.126 ms (2.37x) |
+| inverse WHT 4x4 | 9.299 ms | 7.720 ms (1.20x) | 8.757 ms (1.06x) |
+| inter prediction, regular 16x16 | 22.131 ms | 8.953 ms (2.47x) | 5.563 ms (3.98x) |
+| inter prediction, bilinear 16x16 | 15.134 ms | 7.045 ms (2.15x) | 3.833 ms (3.95x) |
+| inter prediction, regular 4x4 | 27.433 ms | 13.155 ms (2.09x) | 13.184 ms (2.08x) |
+| inter prediction, compound 16x16 | 29.545 ms | 11.124 ms (2.66x) | 6.521 ms (4.53x) |
+| intra DC | 1.764 ms | 1.522 ms (1.16x) | 1.537 ms (1.15x) |
+| intra TM | 3.224 ms | 1.793 ms (1.80x) | 1.559 ms (2.07x) |
+| intra directional | 3.200 ms | 2.608 ms (1.23x) | 2.635 ms (1.21x) |
+| loop filter 4 | 12.056 ms | 6.965 ms (1.73x) | 7.248 ms (1.66x) |
+| loop filter 8 | 12.865 ms | 7.415 ms (1.74x) | 7.580 ms (1.70x) |
+| loop filter 16 | 7.019 ms | 3.597 ms (1.95x) | 3.604 ms (1.95x) |
+
+The transforms run the SSE4.1 instantiation on AVX2 hosts (their data moves
+through four-lane register transposes, as the AV1 transforms' does), and so do
+4-pixel-wide predictions, which is why those AVX2 cells read as the SSE4.1 ones
+within noise. The convolution is where AVX2's eight lanes pay twice: it
+multiplies in 32 bits, as the scalar code does, and a 256-bit vector holds
+eight of those products to SSE4.1's four. Intra DC is mostly the fill, which
+both arms do the same way, and the lossless WHT is a handful of additions per
+block, so those two are close to parity by construction.
 
 ## The AV1 encoder suite (`--bench av1_encode`)
 

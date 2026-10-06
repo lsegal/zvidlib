@@ -13,6 +13,9 @@
 //! The kernels are written once, generic over the 32-bit lane abstraction
 //! [`crate::av1_simd::vector::I32x`] the AV1 kernels already use, and
 //! instantiated per instruction set behind `#[target_feature]` wrappers. The
+//! convolution is the exception in its inner loop: one 8-byte load feeds
+//! eight outputs there, which `I32x` cannot express, so it is written over the
+//! few per-instruction-set primitives of [`convolve::Convolver`] instead. The
 //! transforms move data through four-lane register transposes and 4-pixel-
 //! wide predictions have no useful 256-bit form, so AVX2 runs those through
 //! the SSE4.1 instantiation.
