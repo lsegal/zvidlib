@@ -189,9 +189,9 @@ async function main() {
   let audioState = null;
   try {
     audioState = await prepareAudio(audio);
-    lines.push(`AAC audio ready: ${audioState.config.sampleRate} Hz, ${audioState.config.numberOfChannels} channels.`);
+    lines.push(`${audioState.config.codec} audio ready: ${audioState.config.sampleRate} Hz, ${audioState.config.numberOfChannels} channels.`);
   } catch (error) {
-    lines.push(`AAC audio unavailable (${errorCode(error) ?? error?.name ?? "ERROR"}): playback will be silent.`);
+    lines.push(`Audio unavailable (${errorCode(error) ?? error?.name ?? "ERROR"}): playback will be silent.`);
   }
   const frameStarts = await buildFrameStarts(video);
   // Where a decode can start from, which is what a backwards scrub walks forwards from (see
@@ -590,74 +590,41 @@ async function main() {
 }
 
 async function prepareAudio(audio) {
-  if (!globalThis.AudioDecoder) throw new Error("WebCodecs AudioDecoder is unavailable");
-  const config = await audio.aacConfig();
-  const packetCount = Number(await audio.packetCount());
-  const packets = [];
-  for (let index = 0; index < packetCount; index++) {
-    packets.push(await audio.packet(BigInt(index)));
-  }
+  // `decoderConfig()` describes AAC and Opus tracks alike; reading the track's samples goes
+  // through zvidlib, which decodes with WebCodecs where it can and in software where it cannot.
+  const config = await audio.decoderConfig();
+  const sampleCount = await audio.sampleCount();
   const context = new AudioContext({ sampleRate: config.sampleRate });
   return {
     audio,
-    config: {
-      codec: config.codec,
-      sampleRate: config.sampleRate,
-      numberOfChannels: config.channels,
-      description: config.audioSpecificConfig,
-    },
+    config,
+    sampleCount,
     context,
-    packets,
     buffer: undefined,
     sources: [],
   };
 }
 
-/// Decodes every AAC packet once into a single contiguous `AudioBuffer` covering the whole track.
-/// Seeking and scrubbing then only reschedule one buffer source instead of re-running the decoder.
+/// Reads the whole track once into a single contiguous `AudioBuffer`. Seeking and scrubbing then
+/// only reschedule one buffer source instead of re-running the decoder. `getRange` returns exactly
+/// the track's presentation samples - its encoder priming and end padding already trimmed - so
+/// sample 0 of the buffer is media time zero.
 async function decodeAudioBuffer(state) {
   if (state.buffer) return state.buffer;
-  const outputs = [];
-  const decoder = new AudioDecoder({
-    output: (data) => outputs.push(data),
-    error: (error) => console.error(error),
-  });
-  decoder.configure(state.config);
-  for (const packet of state.packets) {
-    const range = packet.range;
-    decoder.decode(new EncodedAudioChunk({
-      type: "key",
-      timestamp: Number(range.start) * 1_000_000 / state.config.sampleRate,
-      duration: Number(range.length) * 1_000_000 / state.config.sampleRate,
-      data: packet.data,
-    }));
-  }
-  await decoder.flush();
-  decoder.close();
-  if (outputs.length === 0) throw new Error("AAC decode produced no audio");
-
-  const sampleRate = outputs[0].sampleRate;
-  const channels = outputs[0].numberOfChannels;
-  const frames = outputs.reduce(
-    (end, data) => Math.max(end, sampleAt(data, sampleRate) + data.numberOfFrames),
-    0,
-  );
-  const buffer = state.context.createBuffer(channels, Math.max(frames, 1), sampleRate);
-  for (const data of outputs) {
-    const start = sampleAt(data, sampleRate);
-    for (let channel = 0; channel < channels; channel++) {
-      const plane = new Float32Array(data.numberOfFrames);
-      data.copyTo(plane, { planeIndex: Math.min(channel, data.numberOfChannels - 1), format: "f32-planar" });
-      buffer.copyToChannel(plane, channel, start);
+  const pcm = await state.audio.getRange(0n, state.sampleCount);
+  const channels = pcm.channels;
+  const samples = pcm.samples;
+  const frames = Math.max(samples.length / channels, 1);
+  const buffer = state.context.createBuffer(channels, frames, pcm.sampleRate);
+  for (let channel = 0; channel < channels; channel++) {
+    const plane = new Float32Array(frames);
+    for (let frame = 0; frame < samples.length / channels; frame++) {
+      plane[frame] = samples[frame * channels + channel];
     }
-    data.close();
+    buffer.copyToChannel(plane, channel);
   }
   state.buffer = buffer;
   return buffer;
-}
-
-function sampleAt(data, sampleRate) {
-  return Math.max(0, Math.round((data.timestamp / 1_000_000) * sampleRate));
 }
 
 async function startAudio(state, offsetMs = 0) {

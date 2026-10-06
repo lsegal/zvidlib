@@ -8,14 +8,26 @@
 //! [`crate::WebmDemuxer`] without a remux.
 //!
 //! WebM permits only VP8, VP9 and AV1 video and Vorbis or Opus audio. zvidlib
-//! encodes AV1, so output is AV1 video only: an AAC track is refused rather
-//! than written into a file no WebM player would accept.
+//! encodes AV1 video and Opus and Vorbis audio, so those are what it writes:
+//! an AAC track is refused rather than written into a file no WebM player
+//! would accept.
+//!
+//! An audio track's encoder delay is written as its `CodecDelay` and its end
+//! padding as its last block's `DiscardPadding`, so a reader trims the decoded
+//! stream to exactly the samples that were encoded. The padding is only known
+//! once the encoder drains, after its last packets are handed over, so each
+//! audio track's newest block is held back until a later block or `finish`
+//! writes it.
 
-use crate::codec::{EncodedSample, TrackKind};
-use crate::ebml::{self, write_element, write_float, write_id, write_string, write_uint};
+use crate::codec::{AudioGapless, EncodedSample, TrackKind};
+use crate::ebml::{
+    self, write_element, write_float, write_id, write_int, write_string, write_uint,
+};
 use crate::io::ByteSink;
 use crate::media::Codec;
 use crate::mp4::{Mp4TrackConfig, Mp4TrackFormat};
+use crate::opus::OpusHead;
+use crate::vorbis::VorbisConfig;
 use crate::{Error, ErrorKind, Result};
 
 /// One tick of every block timestamp written: a millisecond, Matroska's
@@ -27,12 +39,40 @@ const MAX_TRACKS: usize = 126;
 /// The Seek entries `finish` fills in, in `SeekHead` order.
 const SEEK_TARGETS: [u32; 3] = [ebml::INFO, ebml::TRACKS, ebml::CUES];
 const MUXING_APP: &str = concat!("zvidlib ", env!("CARGO_PKG_VERSION"));
+const NANOSECONDS_PER_SECOND: u64 = 1_000_000_000;
+/// How much Opus to decode ahead of a seek target, the `SeekPreRoll` the
+/// Matroska Opus mapping asks for.
+const OPUS_SEEK_PRE_ROLL_NS: u64 = 80_000_000;
+/// How long a Cluster of a file with no video runs before the next one opens.
+/// A video file opens one at each random-access sample instead.
+const AUDIO_CLUSTER_TICKS: u64 = 5_000;
 
 struct TrackState {
     number: u64,
     timescale: u32,
     is_video: bool,
     samples: usize,
+    audio: Option<AudioTrackState>,
+}
+
+struct AudioTrackState {
+    /// The decoded samples the track's `CodecDelay` declares.
+    codec_delay: u32,
+    padding: u32,
+    /// The track's newest block, not yet written.
+    held: Option<HeldBlock>,
+    /// Whether a block of the track has been written.
+    wrote_block: bool,
+    /// Whether [`WebmMuxer::set_audio_gapless`] has ended the track, so the
+    /// held block is its last.
+    complete: bool,
+}
+
+struct HeldBlock {
+    timestamp: u64,
+    data: Vec<u8>,
+    /// End of the block's samples, in the track's timescale.
+    end: u64,
 }
 
 struct OpenCluster {
@@ -74,6 +114,7 @@ pub struct WebmMuxer<S> {
     last_timestamp: u64,
     end_ticks: f64,
     max_samples_per_track: usize,
+    has_video: bool,
     finished: bool,
 }
 
@@ -118,16 +159,29 @@ impl<S: ByteSink> WebmMuxer<S> {
         let tracks_position = sink.position();
         sink.write(&tracks_element(&configs)?).await?;
 
-        let tracks = configs
+        let tracks: Vec<TrackState> = configs
             .iter()
             .enumerate()
-            .map(|(index, config)| TrackState {
-                number: index as u64 + 1,
-                timescale: config.encoder.timescale,
-                is_video: config.kind() == TrackKind::Video,
-                samples: 0,
+            .map(|(index, config)| {
+                Ok(TrackState {
+                    number: index as u64 + 1,
+                    timescale: config.encoder.timescale,
+                    is_video: config.kind() == TrackKind::Video,
+                    samples: 0,
+                    audio: match config.format {
+                        Mp4TrackFormat::Video(_) => None,
+                        Mp4TrackFormat::Audio { .. } => Some(AudioTrackState {
+                            codec_delay: codec_delay(config)?,
+                            padding: 0,
+                            held: None,
+                            wrote_block: false,
+                            complete: false,
+                        }),
+                    },
+                })
             })
-            .collect();
+            .collect::<Result<_>>()?;
+        let has_video = tracks.iter().any(|track| track.is_video);
         Ok(Self {
             sink,
             tracks,
@@ -142,6 +196,7 @@ impl<S: ByteSink> WebmMuxer<S> {
             last_timestamp: 0,
             end_ticks: 0.0,
             max_samples_per_track,
+            has_video,
             finished: false,
         })
     }
@@ -150,8 +205,12 @@ impl<S: ByteSink> WebmMuxer<S> {
         self.tracks.len()
     }
 
-    /// Writes one sample as a SimpleBlock. A video random-access sample starts
-    /// a new Cluster and gets a cue point, so every Cluster opens on one.
+    /// Writes one sample. A video random-access sample starts a new Cluster
+    /// and gets a cue point, so every Cluster opens on one; in a file without
+    /// video, a Cluster opens every few seconds and its first audio block is
+    /// cued instead. An audio sample is held back until a later sample or
+    /// [`Self::finish`] writes it, so its track's last block can carry the
+    /// end padding [`Self::set_audio_gapless`] declares.
     pub async fn write_sample(&mut self, track: usize, sample: EncodedSample) -> Result<()> {
         if self.finished {
             return Err(invalid_state("cannot write a WebM after finish"));
@@ -166,7 +225,14 @@ impl<S: ByteSink> WebmMuxer<S> {
                 "WebM track sample limit exceeded",
             ));
         }
-        if sample.duration == 0 {
+        if state.audio.as_ref().is_some_and(|audio| audio.complete) {
+            return Err(invalid_state(
+                "a WebM audio track's gapless trim was set, which ends the track",
+            ));
+        }
+        // A Vorbis stream's first packet decodes no samples, so an audio
+        // sample may last no time at all.
+        if sample.duration == 0 && state.audio.is_none() {
             return Err(invalid("encoded sample duration must be nonzero"));
         }
         if sample.data.is_empty() {
@@ -180,44 +246,55 @@ impl<S: ByteSink> WebmMuxer<S> {
                 "WebM samples must be written in nondecreasing presentation-time order across tracks",
             ));
         }
+        self.flush_held(Some(timestamp)).await?;
+        let state = &mut self.tracks[track];
+        state.samples += 1;
         let number = state.number;
-        let starts_cluster = sample.is_sync && state.is_video;
+        if let Some(audio) = state.audio.as_mut() {
+            audio.held = Some(HeldBlock {
+                timestamp,
+                data: sample.data,
+                end: pts + u64::from(sample.duration),
+            });
+            self.last_timestamp = timestamp;
+            return Ok(());
+        }
         let end = (pts as f64 + f64::from(sample.duration)) * TICKS_PER_SECOND as f64
             / f64::from(state.timescale);
-
-        let needs_cluster = match &self.cluster {
-            None => true,
-            Some(cluster) => {
-                (starts_cluster && cluster.blocks > 0)
-                    || timestamp - cluster.timestamp > i16::MAX as u64
-            }
-        };
-        if needs_cluster {
-            self.close_cluster().await?;
-            self.open_cluster(timestamp).await?;
-        }
-        let cluster = self.cluster.as_mut().expect("opened above");
-        let relative = i16::try_from(timestamp - cluster.timestamp).expect("checked above");
-        if sample.is_sync {
-            self.cues.push(CueRecord {
-                time: timestamp,
-                track: number,
-                cluster_position: cluster.start - self.segment_data_start,
-                relative_position: self.sink.position() - cluster.data_start,
-            });
-        }
-        let mut block = Vec::with_capacity(16);
-        write_id(&mut block, ebml::SIMPLE_BLOCK);
-        ebml::write_vint(&mut block, 4 + sample.data.len() as u64);
-        ebml::write_vint(&mut block, number);
-        block.extend_from_slice(&relative.to_be_bytes());
-        block.push(if sample.is_sync { 0x80 } else { 0x00 });
-        self.sink.write(&block).await?;
-        self.sink.write(&sample.data).await?;
-        cluster.blocks += 1;
-        self.last_timestamp = timestamp;
+        self.write_block(number, timestamp, &sample.data, sample.is_sync, true, None)
+            .await?;
         self.end_ticks = self.end_ticks.max(end);
-        self.tracks[track].samples += 1;
+        Ok(())
+    }
+
+    /// Declares an audio track's gapless trim and ends the track. The
+    /// priming must be the delay its codec configuration already declares - an
+    /// Opus stream's pre-skip, zero for Vorbis - and the padding is written as
+    /// the track's last block's `DiscardPadding`, so it has to be set after the
+    /// track's last sample and before a sample of another track is written past
+    /// that sample's time.
+    pub fn set_audio_gapless(&mut self, track: usize, gapless: AudioGapless) -> Result<()> {
+        let state = self
+            .tracks
+            .get_mut(track)
+            .ok_or_else(|| invalid("WebM track index is out of range"))?;
+        let audio = state
+            .audio
+            .as_mut()
+            .ok_or_else(|| invalid("gapless metadata belongs to an audio track"))?;
+        if gapless.priming != audio.codec_delay {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                "WebM audio priming must equal the codec's own delay, which its CodecDelay declares",
+            ));
+        }
+        if gapless.padding != 0 && audio.held.is_none() && audio.wrote_block {
+            return Err(invalid_state(
+                "a WebM audio track's end padding must be set before later samples write its last block",
+            ));
+        }
+        audio.padding = gapless.padding;
+        audio.complete = true;
         Ok(())
     }
 
@@ -225,6 +302,7 @@ impl<S: ByteSink> WebmMuxer<S> {
         if self.finished {
             return Err(invalid_state("WebM muxer was already finished"));
         }
+        self.flush_held(None).await?;
         self.close_cluster().await?;
         let cues_position = (!self.cues.is_empty()).then(|| self.sink.position());
         if !self.cues.is_empty() {
@@ -254,6 +332,134 @@ impl<S: ByteSink> WebmMuxer<S> {
         self.sink.flush().await?;
         self.finished = true;
         Ok(self.sink)
+    }
+
+    /// Writes every held audio block timestamped at or before `before`, or
+    /// every one when it is `None` - then each is its track's last, and
+    /// carries the track's end padding.
+    async fn flush_held(&mut self, before: Option<u64>) -> Result<()> {
+        loop {
+            let next = self
+                .tracks
+                .iter()
+                .enumerate()
+                .filter_map(|(index, track)| {
+                    let held = track.audio.as_ref()?.held.as_ref()?;
+                    before
+                        .is_none_or(|before| held.timestamp <= before)
+                        .then_some((held.timestamp, index))
+                })
+                .min();
+            let Some((_, index)) = next else {
+                return Ok(());
+            };
+            let state = &mut self.tracks[index];
+            let number = state.number;
+            let timescale = state.timescale;
+            let audio = state.audio.as_mut().expect("held blocks are audio");
+            let held = audio.held.take().expect("found above");
+            audio.wrote_block = true;
+            let last = before.is_none() || audio.complete;
+            let padding = if last { audio.padding } else { 0 };
+            let discard_padding = (padding > 0)
+                .then(|| {
+                    let nanoseconds = u128::from(padding) * u128::from(NANOSECONDS_PER_SECOND)
+                        / u128::from(timescale);
+                    i64::try_from(nanoseconds)
+                        .map_err(|_| Error::new(ErrorKind::ResourceLimit, "WebM padding overflow"))
+                })
+                .transpose()?;
+            let presented_end = held
+                .end
+                .saturating_sub(u64::from(audio.codec_delay) + u64::from(padding));
+            let end = presented_end as f64 * TICKS_PER_SECOND as f64 / f64::from(timescale);
+            self.write_block(
+                number,
+                held.timestamp,
+                &held.data,
+                true,
+                false,
+                discard_padding,
+            )
+            .await?;
+            self.end_ticks = self.end_ticks.max(end);
+        }
+    }
+
+    /// Writes one block, opening a Cluster first when it needs one.
+    async fn write_block(
+        &mut self,
+        number: u64,
+        timestamp: u64,
+        data: &[u8],
+        is_sync: bool,
+        is_video: bool,
+        discard_padding_ns: Option<i64>,
+    ) -> Result<()> {
+        let starts_cluster = is_sync && is_video;
+        let needs_cluster = match &self.cluster {
+            None => true,
+            Some(cluster) => {
+                (starts_cluster && cluster.blocks > 0)
+                    || timestamp - cluster.timestamp > i16::MAX as u64
+                    || (!self.has_video && timestamp - cluster.timestamp >= AUDIO_CLUSTER_TICKS)
+            }
+        };
+        if needs_cluster {
+            self.close_cluster().await?;
+            self.open_cluster(timestamp).await?;
+        }
+        let cluster = self.cluster.as_mut().expect("opened above");
+        let relative = i16::try_from(timestamp - cluster.timestamp).expect("checked above");
+        // Every video random-access sample is cued. Audio is cued once a
+        // Cluster, at its first block, in a file with no video to cue.
+        let cued = if is_video {
+            is_sync
+        } else {
+            !self.has_video && cluster.blocks == 0
+        };
+        if cued {
+            self.cues.push(CueRecord {
+                time: timestamp,
+                track: number,
+                cluster_position: cluster.start - self.segment_data_start,
+                relative_position: self.sink.position() - cluster.data_start,
+            });
+        }
+        let mut block = Vec::with_capacity(32);
+        match discard_padding_ns {
+            None => {
+                write_id(&mut block, ebml::SIMPLE_BLOCK);
+                ebml::write_vint(&mut block, 4 + data.len() as u64);
+                ebml::write_vint(&mut block, number);
+                block.extend_from_slice(&relative.to_be_bytes());
+                block.push(if is_sync { 0x80 } else { 0x00 });
+                self.sink.write(&block).await?;
+                self.sink.write(data).await?;
+            }
+            // `DiscardPadding` belongs to a BlockGroup, whose Block carries
+            // no keyframe flag.
+            Some(padding) => {
+                let mut padding_element = Vec::new();
+                write_int(&mut padding_element, ebml::DISCARD_PADDING, padding);
+                let mut block_header = Vec::new();
+                write_id(&mut block_header, ebml::BLOCK);
+                ebml::write_vint(&mut block_header, 4 + data.len() as u64);
+                ebml::write_vint(&mut block_header, number);
+                block_header.extend_from_slice(&relative.to_be_bytes());
+                block_header.push(0x00);
+                let group_length = (block_header.len() + data.len() + padding_element.len()) as u64;
+                write_id(&mut block, ebml::BLOCK_GROUP);
+                ebml::write_vint(&mut block, group_length);
+                block.extend_from_slice(&block_header);
+                self.sink.write(&block).await?;
+                self.sink.write(data).await?;
+                self.sink.write(&padding_element).await?;
+            }
+        }
+        cluster.blocks += 1;
+        self.last_timestamp = self.last_timestamp.max(timestamp);
+        Ok(())
     }
 
     async fn open_cluster(&mut self, timestamp: u64) -> Result<()> {
@@ -298,10 +504,25 @@ fn validate_track_config(config: &Mp4TrackConfig) -> Result<()> {
     }
     match (config.encoder.codec, config.format) {
         (Codec::Av1, Mp4TrackFormat::Video(_)) => {}
+        (Codec::Opus | Codec::Vorbis, Mp4TrackFormat::Audio { channels }) => {
+            let declared = match config.encoder.codec {
+                Codec::Opus => {
+                    u16::from(OpusHead::from_dops(&config.encoder.decoder_config)?.channels)
+                }
+                _ => u16::from(
+                    VorbisConfig::from_codec_private(&config.encoder.decoder_config)?.channels,
+                ),
+            };
+            if declared != channels {
+                return Err(invalid(
+                    "the audio codec configuration's channel count disagrees with the track format",
+                ));
+            }
+        }
         (Codec::Aac, _) | (_, Mp4TrackFormat::Audio { .. }) => {
             return Err(Error::new(
                 ErrorKind::Unsupported,
-                "WebM output is video-only: WebM permits only Vorbis or Opus audio, so an AAC track cannot be written to it",
+                "WebM permits only Vorbis or Opus audio; write AAC to MP4",
             ));
         }
         (Codec::Hevc | Codec::H264, _) => {
@@ -320,9 +541,20 @@ fn validate_track_config(config: &Mp4TrackConfig) -> Result<()> {
     codec_private(config).map(|_| ())
 }
 
+/// The decoded samples a track's `CodecDelay` declares: an Opus stream's
+/// pre-skip, and none for any other codec.
+fn codec_delay(config: &Mp4TrackConfig) -> Result<u32> {
+    match config.encoder.codec {
+        Codec::Opus => Ok(u32::from(
+            OpusHead::from_dops(&config.encoder.decoder_config)?.pre_skip,
+        )),
+        _ => Ok(0),
+    }
+}
+
 /// The track's `CodecID` and `CodecPrivate`. A V_VP8 or V_VP9 arm joins V_AV1
 /// here once zvidlib encodes them (the sibling sub-issues of #523).
-fn codec_private(config: &Mp4TrackConfig) -> Result<(&'static str, &[u8])> {
+fn codec_private(config: &Mp4TrackConfig) -> Result<(&'static str, Vec<u8>)> {
     match config.encoder.codec {
         Codec::Av1 => {
             let whole = &config.encoder.decoder_config;
@@ -338,8 +570,16 @@ fn codec_private(config: &Mp4TrackConfig) -> Result<(&'static str, &[u8])> {
                 ));
             }
             // WebM's CodecPrivate is the AV1CodecConfigurationRecord itself.
-            Ok(("V_AV1", &whole[8..]))
+            Ok(("V_AV1", whole[8..].to_vec()))
         }
+        // The Matroska Opus mapping's CodecPrivate is the RFC 7845 OpusHead.
+        Codec::Opus => Ok((
+            "A_OPUS",
+            OpusHead::from_dops(&config.encoder.decoder_config)?.to_identification_header(),
+        )),
+        // A Vorbis encoder's configuration is already the Xiph-laced
+        // headers Matroska carries.
+        Codec::Vorbis => Ok(("A_VORBIS", config.encoder.decoder_config.clone())),
         _ => Err(Error::new(
             ErrorKind::Unsupported,
             "codec is not a WebM output codec",
@@ -413,20 +653,43 @@ fn tracks_element(configs: &[Mp4TrackConfig]) -> Result<Vec<u8>> {
     for (index, config) in configs.iter().enumerate() {
         let number = index as u64 + 1;
         let (codec_id, private) = codec_private(config)?;
-        let Mp4TrackFormat::Video(dimensions) = config.format else {
-            return Err(internal("WebM track configuration was not validated"));
-        };
         let mut entry = Vec::new();
         write_uint(&mut entry, ebml::TRACK_NUMBER, number);
         write_uint(&mut entry, ebml::TRACK_UID, number);
-        write_uint(&mut entry, ebml::TRACK_TYPE, ebml::TRACK_TYPE_VIDEO);
-        write_uint(&mut entry, ebml::FLAG_LACING, 0);
-        write_string(&mut entry, ebml::CODEC_ID, codec_id);
-        write_element(&mut entry, ebml::CODEC_PRIVATE, private);
-        let mut video = Vec::new();
-        write_uint(&mut video, ebml::PIXEL_WIDTH, u64::from(dimensions.width));
-        write_uint(&mut video, ebml::PIXEL_HEIGHT, u64::from(dimensions.height));
-        write_element(&mut entry, ebml::VIDEO, &video);
+        match config.format {
+            Mp4TrackFormat::Video(dimensions) => {
+                write_uint(&mut entry, ebml::TRACK_TYPE, ebml::TRACK_TYPE_VIDEO);
+                write_uint(&mut entry, ebml::FLAG_LACING, 0);
+                write_string(&mut entry, ebml::CODEC_ID, codec_id);
+                write_element(&mut entry, ebml::CODEC_PRIVATE, &private);
+                let mut video = Vec::new();
+                write_uint(&mut video, ebml::PIXEL_WIDTH, u64::from(dimensions.width));
+                write_uint(&mut video, ebml::PIXEL_HEIGHT, u64::from(dimensions.height));
+                write_element(&mut entry, ebml::VIDEO, &video);
+            }
+            Mp4TrackFormat::Audio { channels } => {
+                write_uint(&mut entry, ebml::TRACK_TYPE, ebml::TRACK_TYPE_AUDIO);
+                write_uint(&mut entry, ebml::FLAG_LACING, 0);
+                write_string(&mut entry, ebml::CODEC_ID, codec_id);
+                write_element(&mut entry, ebml::CODEC_PRIVATE, &private);
+                let delay = codec_delay(config)?;
+                if config.encoder.codec == Codec::Opus {
+                    // Opus's delay and preroll are on its 48 kHz clock.
+                    let delay_ns = u64::from(delay) * NANOSECONDS_PER_SECOND
+                        / u64::from(crate::OPUS_SAMPLE_RATE);
+                    write_uint(&mut entry, ebml::CODEC_DELAY, delay_ns);
+                    write_uint(&mut entry, ebml::SEEK_PRE_ROLL, OPUS_SEEK_PRE_ROLL_NS);
+                }
+                let mut audio = Vec::new();
+                write_float(
+                    &mut audio,
+                    ebml::SAMPLING_FREQUENCY,
+                    f64::from(config.encoder.timescale),
+                );
+                write_uint(&mut audio, ebml::CHANNELS, u64::from(channels));
+                write_element(&mut entry, ebml::AUDIO, &audio);
+            }
+        }
         write_element(&mut tracks, ebml::TRACK_ENTRY, &entry);
     }
     let mut output = Vec::new();
