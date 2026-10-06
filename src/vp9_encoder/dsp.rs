@@ -190,20 +190,24 @@ pub(super) fn forward_transform(
     let shift = if tx_size == 1 { 32.0 } else { 64.0 };
     let half = (n / 2) as f64;
     let scale = shift / (half * half);
+    // Both products accumulate whole rows, which the compiler vectorizes.
     let mut columns = vec![0.0; n * n];
-    for k in 0..n {
-        for j in 0..n {
-            columns[k * n + j] = (0..n)
-                .map(|i| vertical[i * n + k] * f64::from(residual[i * n + j]))
-                .sum();
+    for (i, samples) in residual.chunks_exact(n).enumerate() {
+        let samples: Vec<f64> = samples.iter().map(|&value| f64::from(value)).collect();
+        for k in 0..n {
+            let weight = vertical[i * n + k] * scale;
+            for (column, &sample) in columns[k * n..][..n].iter_mut().zip(&samples) {
+                *column += weight * sample;
+            }
         }
     }
-    for k in 0..n {
-        for l in 0..n {
-            output[k * n + l] = scale
-                * (0..n)
-                    .map(|j| columns[k * n + j] * horizontal[j * n + l])
-                    .sum::<f64>();
+    output[..n * n].fill(0.0);
+    for (k, row) in output.chunks_exact_mut(n).take(n).enumerate() {
+        for j in 0..n {
+            let weight = columns[k * n + j];
+            for (output, &basis) in row.iter_mut().zip(&horizontal[j * n..][..n]) {
+                *output += weight * basis;
+            }
         }
     }
 }

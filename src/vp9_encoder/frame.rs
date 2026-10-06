@@ -18,8 +18,12 @@
 //!
 //! Each superblock is searched first, with every candidate's rate counted
 //! from the same probabilities and contexts the bitstream codes it with, and
-//! then written. The encoder keeps a reconstruction that matches the decoding
-//! process exactly, and predicts every later block and frame from it.
+//! then written. The search leaves out what rarely pays: a block coded
+//! without residual is not split further, intra prediction is not tried
+//! where motion compensation alone codes a block, and the luma intra mode
+//! is chosen with the largest transform before the smaller ones are tried.
+//! The encoder keeps a reconstruction that matches the decoding process
+//! exactly, and predicts every later block and frame from it.
 
 use super::bitwriter::{BitCost, BitWriter, BoolEncoder, BoolSink, bit_cost};
 use super::dsp::{
@@ -282,6 +286,15 @@ struct PlaneCoding {
     bits: f64,
 }
 
+/// The best luma mode and transform size found so far.
+struct LumaCandidate {
+    cost: f64,
+    tx_size: u8,
+    mode: IntraMode,
+    pixels: Vec<u8>,
+    coding: PlaneCoding,
+}
+
 /// The best chroma mode found so far: its cost, mode, both planes' coding and
 /// their reconstruction.
 type ChromaCandidate = (f64, IntraMode, [PlaneCoding; 2], [Vec<u8>; 2]);
@@ -422,7 +435,12 @@ impl<'a> FrameEncoder<'a> {
             let choice = self.choose_block(mi_row, mi_col, bsl);
             let total = choice.cost + self.lambda * bits;
             self.commit(mi_row, mi_col, bsl, &choice);
+            // A block its prediction alone codes well enough is not split.
+            let settled = choice.info.skip;
             best = Some((Node::Whole(Box::new(choice)), total));
+            if settled {
+                return best.expect("just coded whole");
+            }
         }
         if bsl == 0 {
             return best.expect("an 8x8 block inside the frame is coded whole");
@@ -658,14 +676,19 @@ impl<'a> FrameEncoder<'a> {
 
     fn choose_block(&mut self, mi_row: usize, mi_col: usize, bsl: usize) -> BlockChoice {
         let neighbors = self.neighbors(mi_row, mi_col);
-        let mut choice = self.choose_intra(mi_row, mi_col, bsl, neighbors);
-        if !self.is_key()
-            && let Some(inter) = self.choose_inter(mi_row, mi_col, bsl, neighbors)
-            && inter.cost < choice.cost
+        let inter = self.choose_inter(mi_row, mi_col, bsl, neighbors);
+        // Intra prediction is not tried where motion compensation alone
+        // already codes the block.
+        if let Some(inter) = &inter
+            && inter.info.skip
         {
-            choice = inter;
+            return inter.clone();
         }
-        choice
+        let intra = self.choose_intra(mi_row, mi_col, bsl, neighbors);
+        match inter {
+            Some(inter) if inter.cost < intra.cost => inter,
+            _ => intra,
+        }
     }
 
     /// Codes one plane of a block with `tx_size` transforms (the plane's own
@@ -857,79 +880,96 @@ impl<'a> FrameEncoder<'a> {
         bsl: usize,
         neighbors: Neighbors,
     ) -> BlockChoice {
-        let mut best: Option<BlockChoice> = None;
-        for tx_size in 0..=self.max_tx_size(bsl) {
-            let mut best_luma: Option<(f64, IntraMode, PlaneCoding, Vec<u8>)> = None;
-            for mode in IntraMode::ALL {
-                let coding =
-                    self.code_plane(0, mi_row, mi_col, bsl, usize::from(tx_size), Some(mode));
-                let bits =
-                    coding.bits + cost(|sink| self.y_mode_symbol(sink, neighbors, bsl, mode));
-                let total = coding.error as f64 + self.lambda * bits;
-                if best_luma.as_ref().is_none_or(|best| total < best.0) {
-                    let pixels = self.block_pixels(0, mi_row, mi_col, bsl);
-                    best_luma = Some((total, mode, coding, pixels));
-                }
-            }
-            let (_, y_mode, luma, luma_pixels) =
-                best_luma.expect("at least one intra mode is evaluated");
-
-            let uv_tx_size = plane_tx_size(tx_size, bsl, 1);
-            let mut best_uv: Option<ChromaCandidate> = None;
-            for mode in IntraMode::ALL {
-                let codings = [1, 2].map(|plane| {
-                    self.code_plane(plane, mi_row, mi_col, bsl, uv_tx_size, Some(mode))
+        // The luma mode is chosen with the largest transform, whose prediction
+        // reads only the block's own edges, and the smaller transforms are
+        // then tried with that mode.
+        let max_tx_size = self.max_tx_size(bsl);
+        let mut best_luma: Option<LumaCandidate> = None;
+        let try_luma = |encoder: &mut Self,
+                        best_luma: &mut Option<LumaCandidate>,
+                        tx_size: u8,
+                        mode: IntraMode| {
+            let coding =
+                encoder.code_plane(0, mi_row, mi_col, bsl, usize::from(tx_size), Some(mode));
+            let bits = coding.bits
+                + cost(|sink| {
+                    encoder.tx_size_symbol(sink, neighbors, bsl, tx_size);
+                    encoder.y_mode_symbol(sink, neighbors, bsl, mode);
                 });
-                let bits = codings.iter().map(|coding| coding.bits).sum::<f64>()
-                    + cost(|sink| self.uv_mode_symbol(sink, y_mode, mode));
-                let error: u64 = codings.iter().map(|coding| coding.error).sum();
-                let total = error as f64 + self.lambda * bits;
-                if best_uv.as_ref().is_none_or(|best| total < best.0) {
-                    let pixels = [1, 2].map(|plane| self.block_pixels(plane, mi_row, mi_col, bsl));
-                    best_uv = Some((total, mode, codings, pixels));
-                }
+            let total = coding.error as f64 + encoder.lambda * bits;
+            if best_luma.as_ref().is_none_or(|best| total < best.cost) {
+                *best_luma = Some(LumaCandidate {
+                    cost: total,
+                    tx_size,
+                    mode,
+                    pixels: encoder.block_pixels(0, mi_row, mi_col, bsl),
+                    coding,
+                });
             }
-            let (_, uv_mode, [u, v], [u_pixels, v_pixels]) =
-                best_uv.expect("at least one chroma mode is evaluated");
+        };
+        for mode in IntraMode::ALL {
+            try_luma(self, &mut best_luma, max_tx_size, mode);
+        }
+        let y_mode = best_luma.as_ref().expect("an intra mode is evaluated").mode;
+        for tx_size in 0..max_tx_size {
+            try_luma(self, &mut best_luma, tx_size, y_mode);
+        }
+        let LumaCandidate {
+            tx_size,
+            pixels: luma_pixels,
+            coding: luma,
+            ..
+        } = best_luma.expect("an intra mode is evaluated");
 
-            let skip = [&luma, &u, &v]
-                .iter()
-                .all(|coding| coding.blocks.iter().all(|block| block.eob == 0));
-            let info = ModeInfo {
+        let uv_tx_size = plane_tx_size(tx_size, bsl, 1);
+        let mut best_uv: Option<ChromaCandidate> = None;
+        for mode in IntraMode::ALL {
+            let codings = [1, 2]
+                .map(|plane| self.code_plane(plane, mi_row, mi_col, bsl, uv_tx_size, Some(mode)));
+            let bits = codings.iter().map(|coding| coding.bits).sum::<f64>()
+                + cost(|sink| self.uv_mode_symbol(sink, y_mode, mode));
+            let error: u64 = codings.iter().map(|coding| coding.error).sum();
+            let total = error as f64 + self.lambda * bits;
+            if best_uv.as_ref().is_none_or(|best| total < best.0) {
+                let pixels = [1, 2].map(|plane| self.block_pixels(plane, mi_row, mi_col, bsl));
+                best_uv = Some((total, mode, codings, pixels));
+            }
+        }
+        let (_, uv_mode, [u, v], [u_pixels, v_pixels]) =
+            best_uv.expect("at least one chroma mode is evaluated");
+
+        let skip = [&luma, &u, &v]
+            .iter()
+            .all(|coding| coding.blocks.iter().all(|block| block.eob == 0));
+        let token_bits = if skip {
+            0.0
+        } else {
+            luma.bits + u.bits + v.bits
+        };
+        let header_bits = cost(|sink| {
+            self.skip_symbol(sink, neighbors, skip);
+            if !self.is_key() {
+                sink.write(false, INTRA_INTER_PROBS[intra_inter_context(neighbors)]);
+            }
+            self.tx_size_symbol(sink, neighbors, bsl, tx_size);
+            self.y_mode_symbol(sink, neighbors, bsl, y_mode);
+            self.uv_mode_symbol(sink, y_mode, uv_mode);
+        });
+        let error = luma.error + u.error + v.error;
+        BlockChoice {
+            info: ModeInfo {
                 is_inter: false,
                 mode: y_mode as u8,
                 mv: Mv::default(),
                 skip,
                 tx_size,
-            };
-            let token_bits = if skip {
-                0.0
-            } else {
-                luma.bits + u.bits + v.bits
-            };
-            let header_bits = cost(|sink| {
-                self.skip_symbol(sink, neighbors, skip);
-                if !self.is_key() {
-                    sink.write(false, INTRA_INTER_PROBS[intra_inter_context(neighbors)]);
-                }
-                self.tx_size_symbol(sink, neighbors, bsl, tx_size);
-                self.y_mode_symbol(sink, neighbors, bsl, y_mode);
-                self.uv_mode_symbol(sink, y_mode, uv_mode);
-            });
-            let error = luma.error + u.error + v.error;
-            let total = error as f64 + self.lambda * (header_bits + token_bits);
-            if best.as_ref().is_none_or(|best| total < best.cost) {
-                best = Some(BlockChoice {
-                    info,
-                    uv_mode,
-                    best_mv: Mv::default(),
-                    blocks: [luma.blocks, u.blocks, v.blocks],
-                    pixels: [luma_pixels, u_pixels, v_pixels],
-                    cost: total,
-                });
-            }
+            },
+            uv_mode,
+            best_mv: Mv::default(),
+            blocks: [luma.blocks, u.blocks, v.blocks],
+            pixels: [luma_pixels, u_pixels, v_pixels],
+            cost: error as f64 + self.lambda * (header_bits + token_bits),
         }
-        best.expect("at least one transform size is evaluated")
     }
 
     /// The `NEARESTMV` and `NEARMV` candidates and the inter mode context, as
@@ -1092,12 +1132,21 @@ impl<'a> FrameEncoder<'a> {
         let [nearest, near] = candidates;
         let size = 8 << bsl;
         let searched = self.search_motion(reference, mi_row, mi_col, size, candidates);
-        // Also try the cheapest-to-code vector nearest the searched one.
+        // Also try the reference vector that predicts best, if it predicts
+        // nearly as well as the searched one: it codes in fewer bits.
+        let searched_sad = self.luma_sad(reference, mi_row, mi_col, size, searched, u32::MAX);
         let mut vectors = vec![searched];
-        if let Some(alternative) = [Mv::default(), nearest, near]
+        if let Some((alternative, sad)) = [Mv::default(), nearest, near]
             .into_iter()
             .filter(|&mv| mv != searched)
-            .min_by_key(|&mv| self.luma_sad(reference, mi_row, mi_col, size, mv, u32::MAX))
+            .map(|mv| {
+                (
+                    mv,
+                    self.luma_sad(reference, mi_row, mi_col, size, mv, u32::MAX),
+                )
+            })
+            .min_by_key(|&(_, sad)| sad)
+            && sad <= searched_sad + searched_sad / 8
         {
             vectors.push(alternative);
         }
