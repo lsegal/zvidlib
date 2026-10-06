@@ -192,6 +192,11 @@ jobs:
       # the hidden key frame of vector 018 (#529).
       - name: Test VP8 exact-frame decoding
         run: cargo test --features native --test vp8_conformance
+      # The VP9 factory's hardware selection (#545): with no GPU on this
+      # runner, `Prefer` must fall back to the software decoder and `Require`
+      # report hardware unavailable.
+      - name: Test VP9 hardware selection
+        run: cargo test --features native --test vp9_hardware -- --nocapture
       - name: Test AV1 SIMD motion compensation
         run: cargo test --features native --lib av1_mc -- --nocapture
       # `--release` is the profile #327 was reported against: nothing about the
@@ -590,6 +595,15 @@ jobs:
       # holds NVDEC to the software decoder's pixels on every vector.
       - name: Test accelerated VP8 selection and correctness
         run: cargo test --features native --test vp8_conformance -- --nocapture
+      # The VP9 factory's hardware selection (#545): NVDEC and Media Foundation
+      # are compiled into the Windows build and VideoToolbox into the macOS
+      # ones. Where a runner has a hardware VP9 decoder, the hardware tests hold
+      # it to the software decoder's pixels, through `show_existing_frame` and
+      # every seek order; where it has none, they skip with the reason, and
+      # `Prefer` is seen to fall back to software and `Require` to report
+      # hardware unavailable. `--lib` above runs each backend on its own.
+      - name: Test accelerated VP9 selection and correctness
+        run: cargo test --features native --test vp9_hardware -- --nocapture
       # The encode direction (#487, #486): which encoder `Prefer` and `Require`
       # select, and on a host with a hardware encoder an MP4 that zvidlib and
       # ffmpeg both decode. `macos-latest` reaches VideoToolbox's hardware

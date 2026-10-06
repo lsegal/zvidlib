@@ -7,8 +7,10 @@
 //!
 //! A `show_existing_frame` chunk decodes nothing, so it is not handed over at all: the backend
 //! keeps the picture each reference slot holds, as the slots' frames are output, and shows the
-//! named slot's picture again. A hidden frame is never output, so a slot holding one cannot be
-//! shown again this way and is reported as an error rather than shown wrong.
+//! named slot's picture again. A hidden frame is never output, so for a slot holding one the
+//! chunks since the last key frame, which the backend keeps, are replayed through the software
+//! decoder, which gives the same picture since VP9 decoding is exact. Encoders show a hidden
+//! frame again rarely, so the replay is rare too.
 
 use std::ptr;
 use std::sync::{Arc, Mutex, Once};
@@ -18,7 +20,7 @@ use apple_cf::cm::{CMBlockBuffer, CMFormatDescription, CMSampleBuffer};
 use apple_cf::raw;
 use videotoolbox::DecompressionSession;
 
-use crate::vp9_dec::{ChunkInspector, DecodedPicture, chunk_frames};
+use crate::vp9_dec::{ChunkInspector, DecodedPicture, Decoder, chunk_frames};
 use crate::{
     CancellationToken, DecodedVideoFrame, EncodedVideoSample, Error, ErrorKind, Limits, Result,
     VideoDecoder, VideoDecoderConfig, VideoDimensions, Vp9CodecConfig,
@@ -69,6 +71,7 @@ pub(crate) fn create_vp9(
         session: Some(session),
         inspector: ChunkInspector::default(),
         slots: Default::default(),
+        history: Vec::new(),
         output_wanted: true,
     }))
 }
@@ -85,6 +88,8 @@ struct Vp9Decoder {
     /// The picture each reference slot holds, or `None` when it holds a frame that was never
     /// output.
     slots: [Option<Arc<RawPicture>>; 8],
+    /// Every chunk decoded since the last key frame, for showing a hidden frame again.
+    history: Vec<Vec<u8>>,
     output_wanted: bool,
 }
 
@@ -122,6 +127,25 @@ impl Vp9Decoder {
         }
         Ok(picture)
     }
+
+    /// Shows a hidden frame again by replaying the chunks since the last key frame through the
+    /// software decoder, then `chunk`, the `show_existing_frame` that names it.
+    fn replay(&self, chunk: &[u8]) -> Result<RawPicture> {
+        let mut decoder = Decoder::new(self.limits);
+        decoder.set_output_wanted(false);
+        for earlier in &self.history {
+            decoder.decode_chunk(earlier)?;
+        }
+        decoder.set_output_wanted(true);
+        let picture = decoder
+            .decode_chunk(chunk)?
+            .ok_or_else(|| codec("the VP9 frame shown again was not decoded"))?;
+        Ok(RawPicture {
+            width: picture.width,
+            height: picture.height,
+            planes: picture.planes,
+        })
+    }
 }
 
 impl VideoDecoder for Vp9Decoder {
@@ -156,15 +180,21 @@ impl VideoDecoder for Vp9Decoder {
                          showing an existing frame",
                     ));
                 }
-                self.slots[slot].clone().ok_or_else(|| {
-                    unsupported(
-                        "VideoToolbox VP9 decoding cannot show a hidden frame again, since \
-                         VideoToolbox never outputs it",
-                    )
-                })?
+                match self.slots[slot].clone() {
+                    Some(picture) => picture,
+                    None => {
+                        let picture = Arc::new(self.replay(&sample.data)?);
+                        self.slots[slot] = Some(Arc::clone(&picture));
+                        picture
+                    }
+                }
             }
             None => {
                 let picture = Arc::new(self.decode(sample)?);
+                if infos[0].key_frame {
+                    self.history.clear();
+                }
+                self.history.push(sample.data.clone());
                 // Only the chunk's last frame is output; the hidden ones before it are not.
                 let count = infos.len();
                 for (position, info) in infos.iter().enumerate() {
@@ -215,6 +245,7 @@ impl VideoDecoder for Vp9Decoder {
             .clear();
         self.inspector.reset();
         self.slots = Default::default();
+        self.history.clear();
         self.session = Some(create_session(
             &self.format,
             self.full_range,

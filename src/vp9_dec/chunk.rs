@@ -30,6 +30,8 @@ pub(crate) struct FrameInfo {
     /// The frame's size and colour, or for `show_existing_frame` those of the frame it shows.
     pub(crate) shape: FrameShape,
     pub(crate) shown: bool,
+    /// Whether the frame is a key frame, which refreshes every reference slot.
+    pub(crate) key_frame: bool,
     /// The reference slot a `show_existing_frame` header shows again. Such a header decodes
     /// nothing and refreshes no slot.
     pub(crate) existing: Option<usize>,
@@ -91,6 +93,7 @@ impl ChunkInspector {
             return Ok(FrameInfo {
                 shape,
                 shown: true,
+                key_frame: false,
                 existing: Some(index),
                 refresh_frame_flags: 0,
             });
@@ -174,6 +177,7 @@ impl ChunkInspector {
         Ok(FrameInfo {
             shape,
             shown: show_frame,
+            key_frame,
             existing: None,
             refresh_frame_flags,
         })
