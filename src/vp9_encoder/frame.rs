@@ -11,7 +11,8 @@
 //!   (`tx_mode = ONLY_4X4`);
 //! - the loop filter runs at the per-frame level that brings the
 //!   reconstruction closest to the source, with sharpness 0 and no mode or
-//!   reference deltas;
+//!   reference deltas, and stays off at quantizers too coarse for libvpx's
+//!   estimate of that level to fit in the frame header;
 //! - key frames choose among the DC, V, H and TM intra modes per block;
 //! - inter frames predict from the previous frame (`LAST_FRAME`) with
 //!   whole-sample motion vectors found by a diamond search, coded as
@@ -323,8 +324,19 @@ impl<'a> FrameEncoder<'a> {
     /// libvpx it biases the search towards lower levels, because a level
     /// that only just lowers this frame's error over-smooths the reference
     /// later frames predict from and makes them cost more.
+    ///
+    /// Past `base_q_idx` 208 that guess exceeds the highest level the header
+    /// can signal, and the filter stays off. There the greedy search keeps
+    /// choosing levels that lower each frame's own error, but the smoothed
+    /// references make the frames after them larger and blurrier: on a
+    /// panning test card the whole sequence came out up to a quarter larger
+    /// at lower PSNR than with no filter at all, and it bought at most a
+    /// sixth of a decibel on other content.
     fn apply_loop_filter(&mut self) {
         let mut guess = (i64::from(self.ac_q) * 20_723 + 1_015_158 + (1 << 17)) >> 18;
+        if guess > 63 {
+            return;
+        }
         if self.is_key() {
             guess -= 4;
         }

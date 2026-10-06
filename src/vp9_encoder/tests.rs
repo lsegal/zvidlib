@@ -693,3 +693,16 @@ fn loop_filter_shrinks_output_at_better_psnr() {
         );
     }
 }
+
+#[test]
+fn loop_filter_stays_off_at_coarse_quantizers() {
+    let frames: Vec<VideoFrame> = (0..12).map(test_card_frame).collect();
+    for base_q_idx in [210, 220, 230] {
+        let (unfiltered_bytes, unfiltered_psnr) = encode_group(&frames, base_q_idx, false);
+        let (filtered_bytes, filtered_psnr) = encode_group(&frames, base_q_idx, true);
+        assert!(
+            filtered_bytes <= unfiltered_bytes && filtered_psnr >= unfiltered_psnr,
+            "q {base_q_idx}: {filtered_bytes} bytes at {filtered_psnr:.2} dB filtered,              {unfiltered_bytes} bytes at {unfiltered_psnr:.2} dB unfiltered"
+        );
+    }
+}
