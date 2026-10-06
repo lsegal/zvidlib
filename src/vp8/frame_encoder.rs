@@ -50,6 +50,8 @@ struct Quantizer {
     uv: [i32; 2],
     /// The rate-distortion multiplier, in distortion units per 1/256 bit.
     lambda: u32,
+    /// The multiplier for squared-error distortion.
+    sse_lambda: u32,
 }
 
 impl Quantizer {
@@ -62,6 +64,7 @@ impl Quantizer {
             y2: [dc * 2, (ac * 155 / 100).max(8)],
             uv: [dc.min(132), ac],
             lambda: (ac as u32 * 5 / 8).max(1),
+            sse_lambda: (ac * ac / 5).max(1) as u32,
         }
     }
 
@@ -216,6 +219,27 @@ impl FrameEncoder {
             self.references[LAST_FRAME] = Some(frame);
         }
         Ok(data)
+    }
+
+    /// The last frame coded, cropped to the picture's dimensions, as a
+    /// decoder reconstructs it.
+    #[cfg(test)]
+    pub(crate) fn reconstruction(&self) -> [Vec<u8>; 3] {
+        let frame = self.references[LAST_FRAME]
+            .as_deref()
+            .expect("a frame has been coded");
+        let crop = |plane: &Plane, width: usize, height: usize| {
+            (0..height)
+                .flat_map(|row| &plane.data[row * plane.width..row * plane.width + width])
+                .copied()
+                .collect()
+        };
+        let (chroma_width, chroma_height) = (self.width.div_ceil(2), self.height.div_ceil(2));
+        [
+            crop(&frame.planes[0], self.width, self.height),
+            crop(&frame.planes[1], chroma_width, chroma_height),
+            crop(&frame.planes[2], chroma_width, chroma_height),
+        ]
     }
 
     /// Chooses a macroblock's modes and quantizes its residual, returning
@@ -377,6 +401,13 @@ impl FrameEncoder {
                 (macroblock.levels[index], dequantized[index]) =
                     quantize(&coefficients, quantizer.uv, 0);
             }
+        }
+
+        if macroblock.info.reference != INTRA_FRAME
+            && !residual_pays(source, frame, quantizer, &macroblock, &dequantized, mb_x, mb_y)
+        {
+            macroblock.levels = [[0; 16]; 25];
+            dequantized = [[0; 16]; 25];
         }
 
         let first = if macroblock.has_y2() { 1 } else { 0 };
@@ -676,6 +707,88 @@ fn loop_filter_level(q: u8) -> u8 {
     } else {
         (u32::from(q) * 3 / 8 + 2).min(63) as u8
     }
+}
+
+/// Sums the cost of tokens with the default probabilities.
+struct TokenCost {
+    cost: u32,
+}
+
+impl TokenSink for TokenCost {
+    fn coefficient(&mut self, [t, b, c, n]: [usize; 4], bit: bool) {
+        self.cost += bit_cost(DEFAULT_COEFF_PROBS[t][b][c][n], bit);
+    }
+
+    fn fixed(&mut self, probability: u8, bit: bool) {
+        self.cost += bit_cost(probability, bit);
+    }
+}
+
+/// Whether coding an inter macroblock's quantized residual improves its
+/// picture by more than the residual's bits are worth, rather than skipping
+/// it and keeping the prediction now in `frame`. Re-coding the small
+/// differences a reference's own coding left behind rarely pays.
+fn residual_pays(
+    source: &Source,
+    frame: &Frame,
+    quantizer: &Quantizer,
+    macroblock: &CodedMacroblock,
+    dequantized: &Coefficients,
+    mb_x: usize,
+    mb_y: usize,
+) -> bool {
+    let mut bits = TokenCost { cost: 0 };
+    let has_y2 = macroblock.has_y2();
+    if has_y2 {
+        write_block(&mut bits, 1, 0, 0, &macroblock.levels[24]);
+    }
+    let (y_type, y_first) = if has_y2 { (0, 1) } else { (3, 0) };
+    for block in 0..16 {
+        write_block(&mut bits, y_type, 0, y_first, &macroblock.levels[block]);
+    }
+    for block in 16..24 {
+        write_block(&mut bits, 2, 0, 0, &macroblock.levels[block]);
+    }
+
+    let mut luma = *dequantized;
+    if has_y2 {
+        let dc = super::predict::inverse_walsh(&luma[24]);
+        for (block, value) in dc.into_iter().enumerate() {
+            luma[block][0] = value;
+        }
+    }
+    let mut skip_distortion = 0u64;
+    let mut coded_distortion = 0u64;
+    for (plane, size, first_block) in [(0, 16, 0), (1, 8, 16), (2, 8, 20)] {
+        let stride = frame.planes[plane].width;
+        let origin = mb_y * size * stride + mb_x * size;
+        let mut reconstruction = [0u8; 256];
+        for row in 0..size {
+            reconstruction[row * size..(row + 1) * size].copy_from_slice(
+                &frame.planes[plane].data[origin + row * stride..origin + row * stride + size],
+            );
+        }
+        let per_row = size / 4;
+        for block in 0..per_row * per_row {
+            let coefficients = &luma[first_block + block];
+            if coefficients.iter().any(|&value| value != 0) {
+                let offset = (block / per_row) * 4 * size + (block % per_row) * 4;
+                idct_add(coefficients, &mut reconstruction, offset, size);
+            }
+        }
+        for row in 0..size {
+            for column in 0..size {
+                let at = origin + row * stride + column;
+                let original = i64::from(source[plane].data[at]);
+                let predicted = i64::from(frame.planes[plane].data[at]);
+                let coded = i64::from(reconstruction[row * size + column]);
+                skip_distortion += ((original - predicted) * (original - predicted)) as u64;
+                coded_distortion += ((original - coded) * (original - coded)) as u64;
+            }
+        }
+    }
+    let lambda = u64::from(quantizer.sse_lambda);
+    (coded_distortion << 8) + lambda * u64::from(bits.cost) < skip_distortion << 8
 }
 
 /// Writes every macroblock's tokens in order, tracking the above and left
@@ -1441,6 +1554,95 @@ mod tests {
                 assert!((got - want).abs() <= 1, "{got} vs {want}");
             }
         }
+    }
+
+    /// A moving pattern with texture, edges and a sliding square.
+    fn source(width: usize, height: usize, index: usize) -> Source {
+        let (padded_width, padded_height) = (width.div_ceil(16) * 16, height.div_ceil(16) * 16);
+        let mut planes = [
+            Plane::new(padded_width, padded_height),
+            Plane::new(padded_width / 2, padded_height / 2),
+            Plane::new(padded_width / 2, padded_height / 2),
+        ];
+        for (plane_index, plane) in planes.iter_mut().enumerate() {
+            let scale = if plane_index == 0 { 1 } else { 2 };
+            for y in 0..plane.height {
+                for x in 0..plane.width {
+                    let (sx, sy) = (
+                        (x * scale).min(width - 1) + index * 2,
+                        (y * scale).min(height - 1) + index,
+                    );
+                    let square = (sx / 3 + 7) % 40 < 12 && (sy + 5) % 30 < 10;
+                    let value = if square {
+                        200 + plane_index * 15
+                    } else {
+                        40 + (sx * 3 + sy * 2) % 120 + ((sx / 5 + sy / 7) % 2) * 30
+                            - plane_index * 10
+                    };
+                    plane.data[y * plane.width + x] = value as u8;
+                }
+            }
+        }
+        planes
+    }
+
+    fn psnr(a: &[u8], b: &[u8]) -> f64 {
+        let error: f64 = a
+            .iter()
+            .zip(b)
+            .map(|(&x, &y)| (f64::from(x) - f64::from(y)).powi(2))
+            .sum::<f64>()
+            / a.len() as f64;
+        10.0 * (255.0 * 255.0 / error.max(1e-9)).log10()
+    }
+
+    #[test]
+    fn the_decoder_reconstructs_exactly_what_the_encoder_predicts_from() {
+        let (width, height) = (70, 50);
+        for q in [0u8, 10, 24, 60, 127] {
+            let mut encoder = FrameEncoder::new(width, height);
+            let mut decoder = super::super::decoder::Decoder::new(crate::Limits::default());
+            let mut total_psnr = 0.0;
+            for index in 0..12 {
+                let source = source(width, height, index);
+                let data = encoder.encode(&source, index % 6 == 0, q).unwrap();
+                assert_eq!(data[0] & 1 == 0, index % 6 == 0, "frame type");
+                let picture = decoder.decode(&data).unwrap().expect("a shown frame");
+                let expected = encoder.reconstruction();
+                assert_eq!(picture.planes, expected, "q {q}, frame {index}");
+                let luma: Vec<u8> = (0..height)
+                    .flat_map(|row| &source[0].data[row * source[0].width..][..width])
+                    .copied()
+                    .collect();
+                total_psnr += psnr(&luma, &picture.planes[0]);
+            }
+            let average = total_psnr / 12.0;
+            let floor = match q {
+                0 => 45.0,
+                10 => 40.0,
+                24 => 34.0,
+                60 => 27.0,
+                _ => 18.0,
+            };
+            assert!(average > floor, "q {q}: {average:.1} dB");
+        }
+    }
+
+    #[test]
+    fn inter_frames_code_motion_instead_of_pictures() {
+        let (width, height) = (128, 96);
+        let mut encoder = FrameEncoder::new(width, height);
+        let key = encoder.encode(&source(width, height, 0), true, 24).unwrap();
+        let still = encoder.encode(&source(width, height, 0), false, 24).unwrap();
+        let moved = encoder.encode(&source(width, height, 1), false, 24).unwrap();
+        // An unchanged picture skips nearly every macroblock.
+        assert!(still.len() * 20 < key.len(), "still {} bytes", still.len());
+        assert!(
+            moved.len() * 2 < key.len(),
+            "key {} bytes, moved {} bytes",
+            key.len(),
+            moved.len()
+        );
     }
 
     #[test]
