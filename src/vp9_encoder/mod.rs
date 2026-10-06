@@ -25,7 +25,7 @@ use crate::{
     Limits, Orientation, PixelFormat, Result, SampleDependency, VideoDimensions, VideoEncoder,
     VideoEncoderConfig, VideoEncoderFactory, VideoEncoderFormat, VideoFrame,
 };
-use frame::{FrameEncoder, Geometry, Picture};
+use frame::{CodingTools, FrameEncoder, Geometry, Picture};
 
 /// The quantizer index an empty configuration encodes at.
 pub const DEFAULT_BASE_Q_IDX: u8 = 80;
@@ -514,6 +514,8 @@ struct NativeVp9Encoder {
     geometry: Geometry,
     base_q_idx: u8,
     keyframe_interval: u64,
+    /// The partition and transform sizes the frame encoder searches.
+    tools: CodingTools,
     /// The previous frame's reconstruction, which the next inter frame
     /// predicts from.
     reference: Option<Picture>,
@@ -588,6 +590,7 @@ impl NativeVp9Encoder {
             ),
             base_q_idx,
             keyframe_interval: u64::from(keyframe_interval),
+            tools: CodingTools::ALL,
             reference: None,
             next_index: 0,
             finished: false,
@@ -631,9 +634,14 @@ impl NativeVp9Encoder {
 
         let key = index.0 % self.keyframe_interval == 0;
         let reference = if key { None } else { self.reference.as_ref() };
-        let (data, reconstruction) =
-            FrameEncoder::new(self.geometry, &picture, reference, self.base_q_idx)
-                .encode(self.color_range == ColorRange::Full);
+        let (data, reconstruction) = FrameEncoder::new(
+            self.geometry,
+            &picture,
+            reference,
+            self.base_q_idx,
+            self.tools,
+        )
+        .encode(self.color_range == ColorRange::Full);
         if u64::try_from(data.len()).unwrap_or(u64::MAX) > self.limits.max_allocation_bytes {
             return Err(Error::new(
                 ErrorKind::ResourceLimit,
