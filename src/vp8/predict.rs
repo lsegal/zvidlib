@@ -51,12 +51,7 @@ pub(crate) fn idct_add(coefficients: &[i16; 16], plane: &mut [u8], offset: usize
     }
 }
 
-fn idct_add_scalar(
-    coefficients: &[i16; 16],
-    plane: &mut [u8],
-    offset: usize,
-    stride: usize,
-) {
+fn idct_add_scalar(coefficients: &[i16; 16], plane: &mut [u8], offset: usize, stride: usize) {
     let mut temp = [0i16; 16];
     for column in 0..4 {
         let i0 = i32::from(coefficients[column]);

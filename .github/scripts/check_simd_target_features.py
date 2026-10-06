@@ -24,14 +24,14 @@ checks (issue #341):
 
 The first rule is crate-wide and so covers every `#[target_feature]` site the
 crate has, `hevc::engine::simd`, `hevc::engine::transform_simd`,
-`hevc::color_convert`, `av1_mc` and the VP8 SAD included: an out-of-line
-intrinsic call is the same defect wherever it appears. The second covers the
-modules that dispatch through generic kernels, `av1_simd` and `vp8::simd`
-(issue #569). Both instantiate their kernels over the same `av1_simd::vector`
-types, so a `vp8::simd` kernel's symbol carries the `av1_simd` path of its
-vector argument and the one rule matches both. The other sites write their
-intrinsics directly inside the `#[target_feature]` function, where there is no
-separate body for the inliner to leave behind.
+`hevc::color_convert`, `yuv_to_rgba`, `av1_mc` and the VP8 SAD included: an
+out-of-line intrinsic call is the same defect wherever it appears. The second
+covers the modules that dispatch through generic kernels, `av1_simd` and
+`vp8::simd` (issue #569). Both instantiate their kernels over the same
+`av1_simd::vector` types, so a `vp8::simd` kernel's symbol carries the
+`av1_simd` path of its vector argument and the one rule matches both. The other
+sites write their intrinsics directly inside the `#[target_feature]` function,
+where there is no separate body for the inliner to leave behind.
 
     build --target-dir target/simd-feature-check
     check --asm path/to/crate.s

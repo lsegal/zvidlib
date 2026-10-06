@@ -124,6 +124,15 @@ name = "exact_seek"
 path = "benches/exact_seek.rs"
 harness = false
 
+# The VP8 and VP9 software decoders, and the YUV-to-RGBA output conversion they
+# share with the AV1 decoder (issue #574). A separate target because it decodes
+# streams the crate's own VP8 and VP9 encoders produce, which no other target
+# needs, and because the conversion groups run at 1080p and 4K.
+[[bench]]
+name = "vpx_decode"
+path = "benches/vpx_decode.rs"
+harness = false
+
 [features]
 default = []
 # Additive, off by default. The crate's SIMD kernels dispatch at run time rather

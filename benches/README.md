@@ -1,7 +1,7 @@
 # Benchmarks
 
 zvidlib's benchmarks run under [criterion](https://docs.rs/criterion) with
-`harness = false`, across ten bench targets that share `benches/support/`:
+`harness = false`, across eleven bench targets that share `benches/support/`:
 
 | Target | Measures |
 | --- | --- |
@@ -14,6 +14,7 @@ zvidlib's benchmarks run under [criterion](https://docs.rs/criterion) with
 | `benches/hevc_decode.rs` | the HEVC software decoder: whole-frame decode and every hot stage, scalar versus SIMD |
 | `benches/hevc_hardware.rs` | the platform fixed-function HEVC decoders against the software one, and the hardware HEVC encoder |
 | `benches/exact_seek.rs` | what an exact frame at an arbitrary point costs, by backend and by random-access cadence |
+| `benches/vpx_decode.rs` | the VP8 and VP9 software decoders, and the YUV-to-RGBA conversion they share with AV1, scalar versus SIMD |
 | `benches/vp8_encode.rs` | the native VP8 encoder: whole-frame encode and every SIMD kernel, scalar versus SIMD |
 
 Each target loads and decodes its fixtures once per process, so every iteration
@@ -40,6 +41,7 @@ cargo bench --bench hevc_encode   # the HEVC encoder groups only
 cargo bench --bench hevc_decode   # the HEVC software decoder only
 cargo bench --bench hevc_hardware # the platform hardware HEVC decoders and encoder
 cargo bench --bench exact_seek    # exact-seek cost by backend and cadence
+cargo bench --bench vpx_decode    # VP8/VP9 decode and the AV1/VP8/VP9 output conversion
 cargo bench --bench vp8_encode    # the VP8 encoder, whole-frame and per-kernel
 cargo bench --features simd       # the same groups, recorded under `simd=on`
 cargo bench --no-run              # compile only
@@ -182,6 +184,44 @@ cargo bench --bench codec -- av1_deblock_luma
 cargo bench --bench av1_decode -- 'av1_deblock/scalar'
 cargo bench --bench av1_decode -- av1_inverse   # every inverse-transform group
 ```
+
+## The VP8 and VP9 decoder suite (`--bench vpx_decode`)
+
+`benches/vpx_decode.rs` measures the pure-Rust VP8 and VP9 software decoders
+end to end, and the YUV-to-RGBA conversion every AV1, VP8 and VP9 software
+picture leaves through (`convert_to_rgba8`, the `yuv_to_rgba` dispatch site,
+issue #574). Every group is a per-ISA group.
+
+| Group | Stage |
+| --- | --- |
+| `yuv_to_rgba_1080p`, `yuv_to_rgba_4k` | `convert_to_rgba8` over one limited-range BT.709 4:2:0 picture, `src/yuv_to_rgba.rs` |
+| `vp8_decode_frame` | whole-frame decode through `native_vp8_video_decoder_factory` |
+| `vp9_decode_frame` | whole-frame decode through `native_vp9_video_decoder_factory` |
+
+The decode groups decode six 640x360 frames the crate's own VP8 and VP9
+encoders produce once per process. Neither decoder has another vector kernel,
+so the conversion is the only thing their arms differ in, and their ratio is
+the share of a decode the conversion kernel recovers. `av1_decode_frame` in
+[the AV1 decoder suite](#the-av1-decoder-suite---bench-av1_decode) converts
+through the same site.
+
+The conversion's `scalar` arm is the fixed-point scalar code, not the `f64`
+loop it replaced. The vector arms are bit-exact with it, and it is bit-exact
+with that `f64` definition for every input: pixels whose fixed-point value
+lands next to a rounding boundary, about 0.1-0.9% of random content, are
+recomputed in `f64`. Indicative medians from two runs for the #574 pull
+request, on a 20-thread x86_64 host that other builds were loading at the time,
+so read the ratios rather than the absolute times; the first column is the
+fastest the replaced `f64` loop measured over three runs on the same host:
+
+| Group | `f64` before #574 | `scalar` | `sse4.1` | `avx2` |
+| --- | ---: | ---: | ---: | ---: |
+| `yuv_to_rgba_1080p` | 54 ms or more | 25.8-35.3 ms | 10.1-11.8 ms (2.6-3.0x) | 7.8-9.7 ms (2.7-4.5x) |
+| `yuv_to_rgba_4k` | 217 ms or more | 97.0-113.2 ms | 32.5-39.0 ms (2.9-3.0x) | 21.3-31.1 ms (3.1-5.3x) |
+
+The decode groups' arms could not be told apart on that host: two arms running
+identical code differed by up to 2x between runs. The CI timed-benchmark job
+measures this target on every `main` push, on uncontended runners.
 
 ## The AV1 encoder suite (`--bench av1_encode`)
 
@@ -2061,7 +2101,7 @@ job per `[[bench]]` target, each running only its own target with
 crate-wide override reaches the HEVC kernels, is included. Each of those jobs
 uploads its own criterion output, and a single `Benchmark report` job then:
 
-1. reassembles one `target/criterion/` tree and one `bench.log` out of the ten
+1. reassembles one `target/criterion/` tree and one `bench.log` out of the eleven
    partial artifacts, and puts every host and its instruction sets into the job
    summary;
 2. reduces that tree to one small JSON baseline through
@@ -2083,8 +2123,8 @@ time. On one runner the job's wall clock was their sum: on `main` push
 was 11m24s and `av1_encode` 10m29s — two targets, more than half the time, with
 the other seven waiting on them. Fanned out, the wall clock is the slowest
 single target plus its build. The compile check is *not* fanned out, for the
-mirror-image reason: its cost is almost entirely the shared crate build, so ten
-copies would pay that ten times for one answer.
+mirror-image reason: its cost is almost entirely the shared crate build, so eleven
+copies would pay that eleven times for one answer.
 
 The matrix lists its targets by name, which is a second copy of what `Cargo.toml`
 declares, so `tests/ci_benchmarks_run_every_target.rs` asserts the two agree. A
@@ -2093,7 +2133,7 @@ and is simply never measured again, and the only symptom is a baseline that
 stops carrying its groups — which reads as benchmarks that were deleted.
 
 **What this costs is host attribution.** One stored baseline is now a merge
-across ten runners rather than one machine's suite, so its `host` field is every
+across eleven runners rather than one machine's suite, so its `host` field is every
 distinct model observed, joined, and the job summary carries a target-to-model
 table. Nothing in the delta report depended on a single host — `compare` already
 diffs point estimates across two machines from a shared pool, which is why its

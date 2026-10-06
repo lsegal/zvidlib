@@ -61,6 +61,7 @@
 //! module's tests). Chroma grain synthesis remains out of scope, matching
 //! this module's luma-only application in [`apply_film_grain`].
 
+use crate::yuv_to_rgba::{self, Conversion};
 use crate::{ColorRange, Error, ErrorKind, Limits, Result};
 
 // ---------------------------------------------------------------------
@@ -2009,7 +2010,7 @@ impl MatrixCoefficients {
         }
     }
 
-    fn kr_kb(self) -> (f64, f64) {
+    pub(crate) fn kr_kb(self) -> (f64, f64) {
         match self {
             MatrixCoefficients::Identity => (0.0, 0.0),
             MatrixCoefficients::Bt709 => (0.2126, 0.0722),
@@ -2046,85 +2047,27 @@ pub fn convert_to_rgba8(
     }
 
     let mut out = vec![0u8; total];
-    // Chroma is always centered at 128 regardless of range (spec §7.11); only
-    // the scale differs between full and studio (limited) swing.
-    let uv_lo: f64 = 128.0;
-    let (y_lo, y_hi): (f64, f64) = match color_range {
-        ColorRange::Full => (0.0, 255.0),
-        ColorRange::Limited => (16.0, 235.0),
-    };
-    let (y_scale, range_low) = match color_range {
-        ColorRange::Full => (255.0, y_lo),
-        ColorRange::Limited => (y_hi - y_lo, y_lo),
-    };
-    let uv_scale = match color_range {
-        ColorRange::Full => 255.0,
-        ColorRange::Limited => 224.0,
-    };
-
-    let (kr, kb) = matrix.kr_kb();
-    for py in 0..height {
-        for px in 0..width {
-            let y_sample = frame.y.get(px, py) as f64;
-            let (cb, cr) = sample_chroma(frame, px, py);
-            let (r, g, b) = if matches!(matrix, MatrixCoefficients::Identity) {
-                // Identity: planes are already (G, B, R) per spec §7.11.
-                let g = y_sample;
-                let b = cb as f64;
-                let r = cr as f64;
+    let conversion = Conversion::new(color_range, matrix);
+    // A monochrome frame converts with neutral chroma, which is one sample
+    // reused for the whole row.
+    let neutral = [128u8];
+    for (py, out_row) in out.chunks_exact_mut(width * 4).enumerate() {
+        let luma = &frame.y.data[py * frame.y.stride..py * frame.y.stride + width];
+        let (cb, cr, subsampled_x) = match (&frame.u, &frame.v) {
+            (Some(u), Some(v)) => {
+                let cy = if frame.subsampling_y { py / 2 } else { py }.min(u.height - 1);
                 (
-                    normalize(r, range_low, y_scale),
-                    normalize(g, range_low, y_scale),
-                    normalize(b, range_low, y_scale),
+                    &u.data[cy * u.stride..cy * u.stride + u.width],
+                    &v.data[cy * v.stride..cy * v.stride + u.width.min(v.width)],
+                    frame.subsampling_x,
                 )
-            } else {
-                let yn = (y_sample - y_lo) / y_scale.max(1.0);
-                let un = (cb as f64 - uv_lo) / uv_scale;
-                let vn = (cr as f64 - uv_lo) / uv_scale;
-                let r = yn + 2.0 * (1.0 - kr) * vn;
-                let b = yn + 2.0 * (1.0 - kb) * un;
-                let g = (yn - kr * r - kb * b) / (1.0 - kr - kb).max(1e-9);
-                (r, g, b)
-            };
-            let idx = (py * width + px) * 4;
-            if matches!(matrix, MatrixCoefficients::Identity) {
-                out[idx] = to_u8(r);
-                out[idx + 1] = to_u8(g);
-                out[idx + 2] = to_u8(b);
-            } else {
-                out[idx] = to_u8_unit(r);
-                out[idx + 1] = to_u8_unit(g);
-                out[idx + 2] = to_u8_unit(b);
             }
-            out[idx + 3] = 255;
-        }
+            _ => (&neutral[..], &neutral[..], false),
+        };
+        let cb = &cb[..cr.len()];
+        yuv_to_rgba::convert_row(&conversion, luma, cb, cr, subsampled_x, out_row);
     }
     Ok(out)
-}
-
-fn normalize(v: f64, low: f64, scale: f64) -> f64 {
-    ((v - low) / scale.max(1.0)).clamp(0.0, 1.0)
-}
-
-fn sample_chroma(frame: &FilterFrame, px: usize, py: usize) -> (u8, u8) {
-    match (&frame.u, &frame.v) {
-        (Some(u), Some(v)) => {
-            let cx = if frame.subsampling_x { px / 2 } else { px }.min(u.width - 1);
-            let cy = if frame.subsampling_y { py / 2 } else { py }.min(u.height - 1);
-            (u.get(cx, cy), v.get(cx, cy))
-        }
-        _ => (128, 128),
-    }
-}
-
-#[inline]
-fn to_u8(v: f64) -> u8 {
-    (v.clamp(0.0, 1.0) * 255.0).round() as u8
-}
-
-#[inline]
-fn to_u8_unit(v: f64) -> u8 {
-    (v.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
 // ---------------------------------------------------------------------
