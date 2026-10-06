@@ -36,7 +36,7 @@ mod block;
 ))]
 mod chunk;
 pub(crate) mod idct1d;
-mod loopfilter;
+pub(crate) mod loopfilter;
 mod probs;
 pub(crate) mod recon;
 pub(crate) mod tables;

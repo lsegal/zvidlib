@@ -10,7 +10,10 @@
 //! - each 64x64 superblock is either coded whole or split into four, down to
 //!   8x8 blocks, and each block picks its transform size from 4x4 up to the
 //!   largest that fits (`tx_mode = TX_MODE_SELECT`), both by rate and
-//!   distortion; the loop filter is off (`filter_level = 0`);
+//!   distortion;
+//! - the loop filter runs at the per-frame level that brings the
+//!   reconstruction closest to the source, with sharpness 0 and no mode or
+//!   reference deltas;
 //! - key frames choose among the DC, V, H and TM intra modes per block;
 //! - inter frames predict from the previous frame (`LAST_FRAME`) with
 //!   whole-sample motion vectors found by a diamond search, coded as
@@ -23,7 +26,8 @@
 //! where motion compensation alone codes a block, and the luma intra mode
 //! is chosen with the largest transform before the smaller ones are tried.
 //! The encoder keeps a reconstruction that matches the decoding process
-//! exactly, and predicts every later block and frame from it.
+//! exactly: blocks predict from it unfiltered within the frame, and later
+//! frames predict from it after the loop filter.
 
 use super::bitwriter::{BitCost, BitWriter, BoolEncoder, BoolSink, bit_cost};
 use super::dsp::{
@@ -35,6 +39,7 @@ use super::tables::{
     INTRA_INTER_PROBS, KF_PARTITION_PROBS, KF_UV_MODE_PROBS, KF_Y_MODE_PROBS, PARETO8_FULL,
     PARTITION_PROBS, SINGLE_REF_PROBS, SKIP_PROBS, TX_PROBS_8X8, TX_PROBS_16X16, TX_PROBS_32X32,
 };
+use crate::vp9_dec::loopfilter::{self, FilterPlane, LoopFilterMask, MaskBlock};
 use crate::vp9_dec::tables as shared;
 
 const INTRA_MODE_TREE: [i8; 18] = [
@@ -322,6 +327,14 @@ pub(super) struct FrameEncoder<'a> {
     recon: Picture,
     tools: CodingTools,
     base_q_idx: u8,
+    /// The loop filter level the frame header signals; zero turns it off.
+    filter_level: u8,
+    /// Whether [`Self::encode`] chooses a loop filter level at all; tests
+    /// clear it to compare against an unfiltered encode.
+    loop_filter: bool,
+    /// Every block written, as `(mi_row, mi_col, bsl)`, which the loop
+    /// filter's edge masks are built from.
+    coded_blocks: Vec<(usize, usize, usize)>,
     /// The quantizer steps every plane uses: the header codes no deltas.
     dc_q: i32,
     ac_q: i32,
@@ -352,6 +365,9 @@ impl<'a> FrameEncoder<'a> {
             recon: Picture::new(&geometry),
             tools,
             base_q_idx,
+            filter_level: 0,
+            loop_filter: true,
+            coded_blocks: Vec::new(),
             dc_q: DC_QLOOKUP[q],
             ac_q: ac,
             // Distortion is a pixel-domain squared error and rate is in bits.
@@ -377,6 +393,13 @@ impl<'a> FrameEncoder<'a> {
         self.reference.is_none()
     }
 
+    /// Leaves the loop filter off, as the encoder did before it chose a level.
+    #[cfg(test)]
+    pub(super) fn without_loop_filter(mut self) -> Self {
+        self.loop_filter = false;
+        self
+    }
+
     /// Encodes the frame and returns its bytes with the reconstruction;
     /// `full_range` is the colour range the key frame header signals.
     pub(super) fn encode(mut self, full_range: bool) -> (Vec<u8>, Picture) {
@@ -397,6 +420,9 @@ impl<'a> FrameEncoder<'a> {
                 self.write_partition(&mut writer, &node, mi_row, mi_col, 3);
             }
         }
+        if self.loop_filter {
+            self.apply_loop_filter();
+        }
         let key = self.is_key();
         let geometry = self.geometry;
         let tile = writer.finish();
@@ -405,12 +431,155 @@ impl<'a> FrameEncoder<'a> {
             &geometry,
             key,
             self.base_q_idx,
+            self.filter_level,
             full_range,
             compressed.len(),
         );
         frame.extend_from_slice(&compressed);
         frame.extend_from_slice(&tile);
         (frame, self.recon)
+    }
+
+    /// Chooses the loop filter level whose output is closest to the source
+    /// and filters the reconstruction with it, as the decoder will.
+    ///
+    /// This is libvpx's `search_filter_level`: start from the level libvpx's
+    /// `LPF_PICK_FROM_Q` guesses for the quantizer, then step towards lower
+    /// error, halving the step each time neither neighbour improves. Like
+    /// libvpx it biases the search towards lower levels, because a level
+    /// that only just lowers this frame's error over-smooths the reference
+    /// later frames predict from and makes them cost more.
+    fn apply_loop_filter(&mut self) {
+        let mut guess = (i64::from(self.ac_q) * 20_723 + 1_015_158 + (1 << 17)) >> 18;
+        if self.is_key() {
+            guess -= 4;
+        }
+        let mut errors = [None; 64];
+        let mut error = |level: u8| {
+            *errors[usize::from(level)]
+                .get_or_insert_with(|| self.source_error(&self.filtered(level)))
+        };
+
+        let mut middle = guess.clamp(0, 63) as u8;
+        let mut best = middle;
+        let mut best_error = error(middle);
+        let mut step = if middle < 16 { 4 } else { middle / 4 };
+        let mut direction = 0_i8;
+        while step > 0 {
+            let low = middle.saturating_sub(step);
+            let high = (middle + step).min(63);
+            let bias = (best_error >> (15 - middle / 8)) * u64::from(step);
+            if direction <= 0 && low != middle {
+                let low_error = error(low);
+                if low_error.saturating_sub(bias) < best_error {
+                    best_error = best_error.min(low_error);
+                    best = low;
+                }
+            }
+            if direction >= 0 && high != middle {
+                let high_error = error(high);
+                if high_error < best_error.saturating_sub(bias) {
+                    best_error = high_error;
+                    best = high;
+                }
+            }
+            if best == middle {
+                step /= 2;
+                direction = 0;
+            } else {
+                direction = if best < middle { -1 } else { 1 };
+                middle = best;
+            }
+        }
+        self.filter_level = best;
+        self.recon = self.filtered(best);
+    }
+
+    /// The reconstruction after the loop filter at `level`.
+    fn filtered(&self, level: u8) -> Picture {
+        let mut picture = self.recon.clone();
+        if level == 0 {
+            return picture;
+        }
+        let Geometry {
+            mi_rows, mi_cols, ..
+        } = self.geometry;
+        let sb_cols = mi_cols.div_ceil(8);
+        let mut masks = vec![LoopFilterMask::default(); sb_cols * mi_rows.div_ceil(8)];
+        // One mask entry per coded block, as `decode_block` builds them.
+        for &(mi_row, mi_col, bsl) in &self.coded_blocks {
+            let info = self.mode_info[mi_row * mi_cols + mi_col];
+            let size = 1 << bsl;
+            loopfilter::build_mask(
+                &mut masks[(mi_row >> 3) * sb_cols + (mi_col >> 3)],
+                &MaskBlock {
+                    // `BLOCK_8X8` and every square size above it.
+                    sb_type: 3 + 3 * bsl as u8,
+                    tx_size: info.tx_size,
+                    skip_inter: info.skip && info.is_inter,
+                    filter_level: level,
+                },
+                mi_row,
+                mi_col,
+                size,
+                size,
+            );
+        }
+        // The filter works a superblock at a time and may touch samples past
+        // the decoded area, so it runs on copies laid out as the decoder's
+        // planes are: whole superblocks with an 8-sample border.
+        const BORDER: usize = 8;
+        let mut padded = [0, 1, 2].map(|plane| {
+            let superblock = if plane == 0 { 64 } else { 32 };
+            let stride = picture.strides[plane];
+            let rows = picture.planes[plane].len() / stride;
+            let padded_stride = stride.div_ceil(superblock) * superblock + 2 * BORDER;
+            let padded_rows = rows.div_ceil(superblock) * superblock + 2 * BORDER;
+            let mut data = vec![0; padded_stride * padded_rows];
+            for row in 0..rows {
+                let start = (row + BORDER) * padded_stride + BORDER;
+                data[start..start + stride]
+                    .copy_from_slice(&picture.planes[plane][row * stride..(row + 1) * stride]);
+            }
+            (data, padded_stride)
+        });
+        let mut planes = padded.each_mut().map(|(data, stride)| FilterPlane {
+            data,
+            stride: *stride,
+            origin: BORDER * *stride + BORDER,
+        });
+        loopfilter::filter_frame(&mut planes, &mut masks, mi_rows, mi_cols, 0);
+        for (plane, (data, padded_stride)) in padded.iter().enumerate() {
+            let stride = picture.strides[plane];
+            for (row, output) in picture.planes[plane].chunks_exact_mut(stride).enumerate() {
+                let start = (row + BORDER) * padded_stride + BORDER;
+                output.copy_from_slice(&data[start..start + stride]);
+            }
+        }
+        picture
+    }
+
+    /// The squared error between `picture` and the source over the visible
+    /// area of every plane.
+    fn source_error(&self, picture: &Picture) -> u64 {
+        let geometry = &self.geometry;
+        let mut error = 0;
+        for (plane, width, height) in [
+            (0, geometry.width, geometry.height),
+            (1, geometry.chroma_width(), geometry.chroma_height()),
+            (2, geometry.chroma_width(), geometry.chroma_height()),
+        ] {
+            let stride = picture.strides[plane];
+            for row in 0..height {
+                let range = row * stride..row * stride + width;
+                error += picture.planes[plane][range.clone()]
+                    .iter()
+                    .zip(&self.source.planes[plane][range])
+                    .map(|(&a, &b)| u64::from(a.abs_diff(b)).pow(2))
+                    .sum::<u64>();
+            }
+        }
+        error
     }
 
     /// Whether a block of `bsl` at `(mi_row, mi_col)` lies wholly inside the
@@ -485,6 +654,7 @@ impl<'a> FrameEncoder<'a> {
         match node {
             Node::Outside => {}
             Node::Whole(choice) => {
+                self.coded_blocks.push((mi_row, mi_col, bsl));
                 self.partition_symbol(writer, mi_row, mi_col, bsl, false);
                 self.write_mode_info(writer, mi_row, mi_col, bsl, choice);
                 self.write_tokens(writer, mi_row, mi_col, bsl, choice);
@@ -1841,6 +2011,7 @@ fn uncompressed_header(
     geometry: &Geometry,
     key: bool,
     base_q_idx: u8,
+    filter_level: u8,
     full_range: bool,
     compressed_size: usize,
 ) -> Vec<u8> {
@@ -1871,7 +2042,7 @@ fn uncompressed_header(
         writer.literal(1, 2); // raw_interpolation_filter = EIGHTTAP (regular)
     }
     writer.literal(0, 2); // frame_context_idx
-    writer.literal(0, 6); // loop_filter_level
+    writer.literal(u32::from(filter_level), 6); // loop_filter_level
     writer.literal(0, 3); // loop_filter_sharpness
     writer.bit(false); // loop_filter_delta_enabled
     writer.literal(u32::from(base_q_idx), 8);
