@@ -20,6 +20,10 @@
 //!   trace that used `log` is gone.
 //! - Two loops in `codebook.rs` and one test in `common.rs` are written the
 //!   way this crate's lints ask, computing the same values.
+//! - The inverse MDCT, overlap-add, output clamp, inverse coupling and
+//!   floor-times-residue product run on `crate::vorbis_simd`'s runtime
+//!   dispatched kernels, and the IMDCT is that module's own rather than
+//!   `symphonia_core`'s (issue #572).
 //!
 //! Upstream source: <https://github.com/pdeljanov/Symphonia>, tag `v0.5.5`.
 
@@ -45,7 +49,6 @@ use symphonia_core::audio::{AsAudioBufferRef, AudioBuffer, AudioBufferRef};
 use symphonia_core::audio::{Channels, Signal, SignalSpec};
 use symphonia_core::codecs::{CODEC_TYPE_VORBIS, CodecDescriptor, CodecParameters};
 use symphonia_core::codecs::{Decoder, DecoderOptions, FinalizeResult};
-use symphonia_core::dsp::mdct::Imdct;
 use symphonia_core::errors::{Result, decode_error, unsupported_error};
 use symphonia_core::formats::Packet;
 use symphonia_core::io::{BitReaderRtl, BufReader, ReadBitsRtl, ReadBytes};
@@ -57,6 +60,8 @@ mod dsp;
 mod floor;
 mod residue;
 mod window;
+
+use crate::vorbis_simd::{self, Imdct};
 
 use codebook::VorbisCodebook;
 use common::*;
@@ -211,27 +216,7 @@ impl VorbisDecoder {
                 (&mut b[0], &mut a[coupling.angle_ch as usize])
             };
 
-            for (m, a) in magnitude_ch.residue[..n2]
-                .iter_mut()
-                .zip(&mut angle_ch.residue[..n2])
-            {
-                let (new_m, new_a) = if *m > 0.0 {
-                    if *a > 0.0 {
-                        (*m, *m - *a)
-                    } else {
-                        (*m + *a, *m)
-                    }
-                } else {
-                    if *a > 0.0 {
-                        (*m, *m + *a)
-                    } else {
-                        (*m - *a, *m)
-                    }
-                };
-
-                *m = new_m;
-                *a = new_a;
-            }
+            vorbis_simd::inverse_coupling(&mut magnitude_ch.residue[..n2], &mut angle_ch.residue[..n2]);
         }
 
         // Section 4.3.6 - Dot Product
@@ -243,12 +228,7 @@ impl VorbisDecoder {
                 continue;
             }
 
-            for (f, r) in channel.floor[..n2]
-                .iter_mut()
-                .zip(&mut channel.residue[..n2])
-            {
-                *f *= *r;
-            }
+            vorbis_simd::apply_floor(&mut channel.floor[..n2], &channel.residue[..n2]);
         }
 
         // Combined Section 4.3.7 and 4.3.8 - Inverse MDCT and Overlap-add (Synthesis)
