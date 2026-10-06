@@ -703,11 +703,12 @@ impl WasmCreateOptions {
     }
 
     /// The browser video codec for [`WasmVideoStream::put`]: `"av1"`
-    /// (default) or `"hevc"`.
+    /// (default), `"hevc"` or `"vp9"`.
     #[wasm_bindgen(getter, js_name = videoCodec)]
     pub fn video_codec(&self) -> String {
         match self.video_codec {
             Codec::Hevc => "hevc".to_owned(),
+            Codec::Vp9 => "vp9".to_owned(),
             _ => "av1".to_owned(),
         }
     }
@@ -717,6 +718,7 @@ impl WasmCreateOptions {
         self.video_codec = match value.as_str() {
             "av1" => Codec::Av1,
             "hevc" => Codec::Hevc,
+            "vp9" => Codec::Vp9,
             other => {
                 return Err(js_error(
                     ErrorKind::Unsupported,
@@ -1084,8 +1086,9 @@ pub fn seek_latency_budget_ms() -> f64 {
     SEEK_LATENCY_BUDGET.as_secs_f64() * 1_000.0
 }
 
-/// Reports whether this browser's `WebCodecs` bridge can encode AV1 Main or
-/// HEVC Main profile video.
+/// Reports whether this browser's `WebCodecs` bridge can encode AV1 Main,
+/// HEVC Main or VP9 profile 0 video: `codec` is `"av1"` (the default),
+/// `"hevc"` or `"vp9"`.
 ///
 /// `hardware` accepts `"require"`, `"prefer"` (the default), or `"avoid"`,
 /// mirroring [`crate::HardwarePreference`]. This is a synchronous,
@@ -1112,6 +1115,7 @@ pub fn video_encode_support(
     let (codec, profile) = match codec.as_deref() {
         None | Some("av1") => (Codec::Av1, CodecProfile::Av1Main),
         Some("hevc") => (Codec::Hevc, CodecProfile::HevcMain),
+        Some("vp9") => (Codec::Vp9, CodecProfile::Vp9Profile0),
         Some(other) => {
             return Err(js_error(
                 ErrorKind::Unsupported,
@@ -1732,7 +1736,15 @@ async fn encode_browser_video_frame(
         Some(session) => session,
         None => {
             let codec = track.borrow().codec;
-            let session = WebVideoEncodeSession::open(codec, width, height, None).await?;
+            let session = WebVideoEncodeSession::open(
+                codec,
+                width,
+                height,
+                timescale,
+                frame_duration,
+                None,
+            )
+            .await?;
             track.borrow_mut().dimensions = Some((width, height));
             session
         }

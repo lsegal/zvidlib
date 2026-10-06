@@ -28,12 +28,12 @@ fn configuration(width: u32, height: u32, input_format: PixelFormat) -> VideoEnc
     }
 }
 
-/// A textured scene whose content pans and whose square moves, so inter
-/// frames find real motion.
+/// A textured scene that pans four samples a frame (two in chroma) under a
+/// square that moves two samples a frame, so inter frames find real motion.
 fn moving_yuv_frame(width: u32, height: u32, index: u32) -> VideoFrame {
     let (width, height) = (width as usize, height as usize);
     let (chroma_width, chroma_height) = (width.div_ceil(2), height.div_ceil(2));
-    let shift = index as usize * 3;
+    let shift = index as usize * 4;
     let mut luma = vec![0_u8; width * height];
     for y in 0..height {
         for x in 0..width {
@@ -48,7 +48,7 @@ fn moving_yuv_frame(width: u32, height: u32, index: u32) -> VideoFrame {
         }
     }
     let cb = (0..chroma_width * chroma_height)
-        .map(|i| (100 + (i % chroma_width + shift / 2) % 50) as u8)
+        .map(|i| (100 + (i % chroma_width + shift / 2) * 50 / (chroma_width + 30)) as u8)
         .collect();
     let cr = (0..chroma_width * chroma_height)
         .map(|i| (150 - (i / chroma_width) % 40) as u8)
@@ -223,6 +223,28 @@ fn vpcc_describes_8_bit_420_profile_0() {
     let derived = crate::derive_codec_string(Codec::Vp9, vpcc).unwrap();
     assert_eq!(derived.codec_string, "vp09.00.40.08");
     assert_eq!(derived.profile, CodecProfile::Vp9Profile0);
+}
+
+#[test]
+fn vpcc_reads_colour_from_a_key_frame() {
+    let mut config = configuration(32, 16, PixelFormat::Yuv420p8);
+    let (samples, _, _) = encode_sequence(&config, 2);
+    let vpcc = vpcc_from_key_frame(&samples[0].data, 10).unwrap();
+    assert_eq!(&vpcc[12..17], &[0, 10, 0x82, 6, 6]);
+    assert_eq!(vpcc_from_key_frame(&samples[1].data, 10), None);
+
+    config.color_range = ColorRange::Full;
+    let mut encoder = NativeVp9Encoder::new(&config, &Limits::default()).unwrap();
+    let mut frame = moving_yuv_frame(32, 16, 0);
+    frame.color_range = ColorRange::Full;
+    let source = FrameSource::Cpu(CpuFrameSource {
+        frame: &frame,
+        orientation: Orientation::TopLeft,
+    });
+    let sample = block_on(encoder.encode(FrameIndex(0), source)).unwrap().remove(0);
+    let vpcc = vpcc_from_key_frame(&sample.data, 10).unwrap();
+    assert_eq!(vpcc, encoder.config().decoder_config);
+    assert_eq!(vpcc[14], 0x83);
 }
 
 #[test]
