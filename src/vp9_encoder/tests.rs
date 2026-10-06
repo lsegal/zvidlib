@@ -188,7 +188,8 @@ fn factory_advertises_only_the_implemented_surface() {
 #[test]
 fn the_hardware_preference_selects_hardware_only_where_the_host_has_it() {
     let factory = native_vp9_video_encoder_factory();
-    let mut config = configuration(64, 48, PixelFormat::Yuv420p8);
+    // RGBA is an input every platform's hardware encoder takes.
+    let mut config = configuration(64, 48, PixelFormat::Rgba8);
     let software = CodecSupport::Supported {
         implementation: CodecImplementation::Software,
     };
@@ -219,18 +220,21 @@ fn the_hardware_preference_selects_hardware_only_where_the_host_has_it() {
     }
 
     // What no hardware encoder can take is an invalid configuration for
-    // `Require`, and `Prefer` still falls back to software for it.
+    // `Require` where the platform has hardware encoders, and `Prefer` still
+    // falls back to software for it. Linux has none at all.
     for (width, height, range) in [(63, 48, ColorRange::Limited), (64, 48, ColorRange::Full)] {
-        let mut config = configuration(width, height, PixelFormat::Yuv420p8);
+        let mut config = configuration(width, height, PixelFormat::Rgba8);
         config.color_range = range;
         config.hardware = HardwarePreference::Require;
-        assert!(
-            matches!(
-                factory.capability(&config),
-                CodecSupport::InvalidConfiguration { .. }
-            ),
-            "{width}x{height} {range:?}"
-        );
+        let support = factory.capability(&config);
+        if cfg!(any(windows, target_os = "macos")) {
+            assert!(
+                matches!(support, CodecSupport::InvalidConfiguration { .. }),
+                "{width}x{height} {range:?}: {support:?}"
+            );
+        } else {
+            assert_eq!(support, CodecSupport::HardwareUnavailable);
+        }
         config.hardware = HardwarePreference::Prefer;
         assert_eq!(factory.capability(&config), software);
     }
