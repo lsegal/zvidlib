@@ -10,8 +10,10 @@
 //! - every superblock is split down to 8x8 blocks, every transform is 4x4
 //!   (`tx_mode = ONLY_4X4`), and the loop filter is off (`filter_level = 0`);
 //! - key frames choose among the DC, V, H and TM intra modes per block;
-//! - inter frames predict from the previous frame (`LAST_FRAME`) with
-//!   whole-sample motion vectors found by a diamond search, coded as
+//! - inter frames predict from the previous frame (`LAST_FRAME`) with motion
+//!   vectors found by a whole-sample diamond search and refined to quarter
+//!   samples, or to eighth samples where `allow_high_precision_mv` lets the
+//!   block code them, through the regular 8-tap filters. They are coded as
 //!   `ZEROMV`, `NEARESTMV`, `NEARMV` or `NEWMV`, or fall back to intra.
 //!
 //! The encoder keeps a reconstruction that matches the decoding process
@@ -52,6 +54,8 @@ struct MvComponentProbs {
     bits: [u8; 10],
     class0_fp: [[u8; 3]; 2],
     fp: [u8; 3],
+    class0_hp: u8,
+    hp: u8,
 }
 
 /// Row (vertical) then column (horizontal) component defaults.
@@ -63,6 +67,8 @@ const MV_COMPONENT_PROBS: [MvComponentProbs; 2] = [
         bits: [136, 140, 148, 160, 176, 192, 224, 234, 234, 240],
         class0_fp: [[128, 128, 64], [96, 112, 64]],
         fp: [64, 96, 64],
+        class0_hp: 160,
+        hp: 128,
     },
     MvComponentProbs {
         sign: 128,
@@ -71,6 +77,8 @@ const MV_COMPONENT_PROBS: [MvComponentProbs; 2] = [
         bits: [136, 140, 148, 160, 176, 192, 224, 234, 234, 240],
         class0_fp: [[128, 128, 64], [96, 112, 64]],
         fp: [64, 96, 64],
+        class0_hp: 160,
+        hp: 128,
     },
 ];
 
@@ -103,6 +111,20 @@ const NEARESTMV: u8 = 10;
 const NEARMV: u8 = 11;
 const ZEROMV: u8 = 12;
 const NEWMV: u8 = 13;
+
+/// libvpx enables eighth-sample vectors below this quantizer index, where the
+/// residual is fine enough for the extra precision to pay for its bit.
+const HIGH_PRECISION_MV_QTHRESH: u8 = 200;
+/// `COMPANDED_MVREF_THRESH`: a block codes eighth-sample vectors only when
+/// both components of its reference vector are shorter than this many samples.
+const COMPANDED_MVREF_THRESH: i32 = 8;
+
+/// Whether a vector coded against `reference` may use eighth samples
+/// (`use_mv_hp`).
+fn use_mv_hp(reference: Mv) -> bool {
+    (reference.row.abs() >> 3) < COMPANDED_MVREF_THRESH
+        && (reference.col.abs() >> 3) < COMPANDED_MVREF_THRESH
+}
 
 /// Sizes derived once per stream from the frame dimensions.
 #[derive(Clone, Copy, Debug)]
@@ -210,6 +232,11 @@ pub(super) struct FrameEncoder<'a> {
     dc_q: i32,
     ac_q: i32,
     lambda: f64,
+    /// Whether inter blocks may code eighth-sample motion vectors.
+    allow_high_precision_mv: bool,
+    /// The finest motion search step in eighth samples: 1 or 2, or 8 to
+    /// search whole samples only.
+    subpel_step: i32,
     mode_info: Vec<ModeInfo>,
     above_nonzero: [Vec<bool>; 3],
     left_nonzero: [[bool; 16]; 3],
@@ -241,6 +268,9 @@ impl<'a> FrameEncoder<'a> {
             // The transform's coefficients are eight times orthonormal, so the
             // effective step is `ac / 8`.
             lambda: f64::from(ac * ac) / 96.0,
+            allow_high_precision_mv: reference.is_some()
+                && base_q_idx < HIGH_PRECISION_MV_QTHRESH,
+            subpel_step: 1,
             mode_info: vec![ModeInfo::default(); geometry.mi_cols * geometry.mi_rows],
             above_nonzero: [
                 vec![false; geometry.mi_cols * 2],
@@ -252,6 +282,15 @@ impl<'a> FrameEncoder<'a> {
             left_partition: [0; 8],
             writer: BoolEncoder::new(),
         }
+    }
+
+    /// Restricts the motion search to whole samples, as the encoder searched
+    /// before sub-sample refinement, so tests can measure what it gains.
+    #[cfg(test)]
+    pub(super) fn whole_sample_motion(mut self) -> Self {
+        self.allow_high_precision_mv = false;
+        self.subpel_step = 8;
+        self
     }
 
     fn is_key(&self) -> bool {
@@ -273,10 +312,11 @@ impl<'a> FrameEncoder<'a> {
         let key = self.is_key();
         let geometry = self.geometry;
         let tile = std::mem::replace(&mut self.writer, BoolEncoder::new()).finish();
-        let compressed = compressed_header(key);
+        let compressed = compressed_header(key, self.allow_high_precision_mv);
         let mut frame = uncompressed_header(
             &geometry,
             key,
+            self.allow_high_precision_mv,
             self.base_q_idx,
             full_range,
             compressed.len(),
@@ -608,6 +648,15 @@ impl<'a> FrameEncoder<'a> {
         for mv in &mut list {
             mv.col = mv.col.clamp(to_left - border, to_right + border);
             mv.row = mv.row.clamp(to_top - border, to_bottom + border);
+            // `lower_mv_precision`: a candidate the block cannot code in
+            // eighth samples rounds its odd components toward zero.
+            if !(self.allow_high_precision_mv && use_mv_hp(*mv)) {
+                for component in [&mut mv.row, &mut mv.col] {
+                    if *component & 1 != 0 {
+                        *component -= component.signum();
+                    }
+                }
+            }
         }
         (list, usize::from(COUNTER_TO_CONTEXT[counter]))
     }
@@ -645,6 +694,43 @@ impl<'a> FrameEncoder<'a> {
             }
         }
         sad
+    }
+
+    /// The squared error of the 8x8 luma prediction `mv` builds.
+    fn luma_prediction_error(
+        &self,
+        reference: &Picture,
+        mi_row: usize,
+        mi_col: usize,
+        mv: Mv,
+    ) -> u64 {
+        let reference_plane = ReferencePlane {
+            pixels: &reference.planes[0],
+            stride: reference.strides[0],
+            width: self.geometry.width,
+            height: self.geometry.height,
+        };
+        let mut prediction = [0_u8; 64];
+        let (x, y) = (mi_col * 8, mi_row * 8);
+        predict_inter(
+            &reference_plane,
+            x,
+            y,
+            8,
+            mv.row * 2,
+            mv.col * 2,
+            &mut prediction,
+        );
+        let stride = self.source.strides[0];
+        let mut error = 0_u64;
+        for row in 0..8 {
+            let source = &self.source.planes[0][(y + row) * stride + x..][..8];
+            for (&source, &predicted) in source.iter().zip(&prediction[row * 8..row * 8 + 8]) {
+                let difference = i32::from(source) - i32::from(predicted);
+                error += (difference * difference) as u64;
+            }
+        }
+        error
     }
 
     fn choose_inter(&mut self, mi_row: usize, mi_col: usize) -> Option<BlockChoice> {
@@ -705,26 +791,83 @@ impl<'a> FrameEncoder<'a> {
             }
         }
 
-        let mode = if best_mv == Mv::default() {
-            ZEROMV
-        } else if best_mv == nearest {
-            NEARESTMV
-        } else if best_mv == near {
-            NEARMV
-        } else {
-            NEWMV
+        // Sub-sample refinement around the whole-sample vector, measured on
+        // the 8-tap prediction itself and including the rate of coding it.
+        let usehp = self.allow_high_precision_mv && use_mv_hp(nearest);
+        let motion_bits = |mv: Mv| -> Option<f64> {
+            let mode = inter_mode(mv, nearest, near);
+            let mut bits = tree_bits(
+                &INTER_MODE_TREE,
+                &INTER_MODE_PROBS[mode_context * 3..mode_context * 3 + 3],
+                mode - NEARESTMV,
+            );
+            if mode == NEWMV {
+                let difference = Mv {
+                    row: mv.row - nearest.row,
+                    col: mv.col - nearest.col,
+                };
+                // Without eighth samples only even differences are codable.
+                if !usehp && (difference.row | difference.col) & 1 != 0 {
+                    return None;
+                }
+                bits += mv_bits(difference, usehp);
+            }
+            Some(bits)
         };
-        let mut bits = tree_bits(
-            &INTER_MODE_TREE,
-            &INTER_MODE_PROBS[mode_context * 3..mode_context * 3 + 3],
-            mode - NEARESTMV,
-        );
-        if mode == NEWMV {
-            bits += mv_bits(Mv {
-                row: best_mv.row - nearest.row,
-                col: best_mv.col - nearest.col,
-            });
+        if self.subpel_step < 8 {
+            let finest = if usehp {
+                self.subpel_step
+            } else {
+                self.subpel_step.max(2)
+            };
+            let cost = |mv: Mv| {
+                motion_bits(mv).map(|bits| {
+                    self.luma_prediction_error(reference, mi_row, mi_col, mv) as f64
+                        + self.lambda * bits
+                })
+            };
+            let mut best_cost = cost(best_mv).unwrap_or(f64::INFINITY);
+            for candidate in [nearest, near, Mv::default()] {
+                if let Some(candidate_cost) = cost(candidate)
+                    && candidate_cost < best_cost
+                {
+                    best_cost = candidate_cost;
+                    best_mv = candidate;
+                }
+            }
+            let mut step = 4;
+            while step >= finest {
+                let center = best_mv;
+                for (row, col) in [
+                    (-1, 0),
+                    (1, 0),
+                    (0, -1),
+                    (0, 1),
+                    (-1, -1),
+                    (-1, 1),
+                    (1, -1),
+                    (1, 1),
+                ] {
+                    let candidate = Mv {
+                        row: center.row + row * step,
+                        col: center.col + col * step,
+                    };
+                    if candidate.row.abs() > range || candidate.col.abs() > range {
+                        continue;
+                    }
+                    if let Some(candidate_cost) = cost(candidate)
+                        && candidate_cost < best_cost
+                    {
+                        best_cost = candidate_cost;
+                        best_mv = candidate;
+                    }
+                }
+                step /= 2;
+            }
         }
+
+        let mode = inter_mode(best_mv, nearest, near);
+        let mut bits = motion_bits(best_mv).expect("the chosen motion vector is codable");
         let above = self.above_info(mi_row, mi_col);
         let left = self.left_info(mi_row, mi_col);
         bits += bool_bits(true, INTRA_INTER_PROBS[intra_inter_context(above, left)]);
@@ -855,7 +998,8 @@ impl<'a> FrameEncoder<'a> {
                 row: choice.info.mv.row - choice.best_mv.row,
                 col: choice.info.mv.col - choice.best_mv.col,
             };
-            write_mv(&mut self.writer, difference);
+            let usehp = self.allow_high_precision_mv && use_mv_hp(choice.best_mv);
+            write_mv(&mut self.writer, difference, usehp);
         }
     }
 
@@ -1054,7 +1198,22 @@ fn mv_class(z: u32) -> (usize, u32) {
     (class, z - base)
 }
 
-fn write_mv(writer: &mut BoolEncoder, difference: Mv) {
+/// The inter mode that codes `mv` given the block's reference candidates.
+fn inter_mode(mv: Mv, nearest: Mv, near: Mv) -> u8 {
+    if mv == Mv::default() {
+        ZEROMV
+    } else if mv == nearest {
+        NEARESTMV
+    } else if mv == near {
+        NEARMV
+    } else {
+        NEWMV
+    }
+}
+
+/// Writes a motion vector difference as `read_mv` reads it; `usehp` is whether
+/// the block codes eighth samples, and otherwise every component is even.
+fn write_mv(writer: &mut BoolEncoder, difference: Mv, usehp: bool) {
     let joint = usize::from(difference.row != 0) * 2 + usize::from(difference.col != 0);
     writer.tree(&MV_JOINT_TREE, &MV_JOINT_PROBS, joint as u8);
     for (component, value) in [(0, difference.row), (1, difference.col)] {
@@ -1081,6 +1240,10 @@ fn write_mv(writer: &mut BoolEncoder, difference: Mv) {
         };
         writer.tree(&MV_FP_TREE, fp, fraction);
         // Without high-precision vectors the eighth-sample bit is implied.
+        if usehp {
+            let hp = if class == 0 { probs.class0_hp } else { probs.hp };
+            writer.write(offset & 1 != 0, hp);
+        }
     }
 }
 
@@ -1107,16 +1270,38 @@ fn tree_bits(tree: &[i8], probs: &[u8], value: u8) -> f64 {
     walk(tree, probs, 0, i16::from(value)).unwrap_or(0.0)
 }
 
-fn mv_bits(difference: Mv) -> f64 {
-    let component = |value: i32| -> f64 {
+/// The exact cost in bits of what [`write_mv`] writes.
+fn mv_bits(difference: Mv, usehp: bool) -> f64 {
+    let joint = usize::from(difference.row != 0) * 2 + usize::from(difference.col != 0);
+    let mut bits = tree_bits(&MV_JOINT_TREE, &MV_JOINT_PROBS, joint as u8);
+    for (component, value) in [(0, difference.row), (1, difference.col)] {
         if value == 0 {
-            0.0
-        } else {
-            let (class, _) = mv_class(value.unsigned_abs() - 1);
-            3.0 + 1.5 * class as f64
+            continue;
         }
-    };
-    2.0 + component(difference.row) + component(difference.col)
+        let probs = &MV_COMPONENT_PROBS[component];
+        bits += bool_bits(value < 0, probs.sign);
+        let (class, offset) = mv_class(value.unsigned_abs() - 1);
+        bits += tree_bits(&MV_CLASS_TREE, &probs.classes, class as u8);
+        let integer = offset >> 3;
+        if class == 0 {
+            bits += bool_bits(integer != 0, probs.class0);
+        } else {
+            for bit in 0..class {
+                bits += bool_bits((integer >> bit) & 1 != 0, probs.bits[bit]);
+            }
+        }
+        let fp = if class == 0 {
+            &probs.class0_fp[integer as usize]
+        } else {
+            &probs.fp
+        };
+        bits += tree_bits(&MV_FP_TREE, fp, ((offset >> 1) & 3) as u8);
+        if usehp {
+            let hp = if class == 0 { probs.class0_hp } else { probs.hp };
+            bits += bool_bits(offset & 1 != 0, hp);
+        }
+    }
+    bits
 }
 
 /// A rough rate estimate for mode decision; the exact cost depends on
@@ -1139,7 +1324,7 @@ fn estimate_token_bits(levels: &[i32; 16], tx_type: TxType) -> f64 {
 }
 
 /// The compressed header: ONLY_4X4 transforms and no probability updates.
-fn compressed_header(key: bool) -> Vec<u8> {
+fn compressed_header(key: bool, allow_high_precision_mv: bool) -> Vec<u8> {
     const NO_UPDATE: u8 = 252;
     let mut writer = BoolEncoder::new();
     // tx_mode = ONLY_4X4, then no update of the 4x4 coefficient probabilities.
@@ -1156,7 +1341,8 @@ fn compressed_header(key: bool) -> Vec<u8> {
             + 16 * 3 // partition
             + 3 // motion vector joints
             + 2 * (1 + 10 + 1 + 10) // sign, classes, class0, bits
-            + 2 * (2 * 3 + 3); // class0_fp, fp
+            + 2 * (2 * 3 + 3) // class0_fp, fp
+            + if allow_high_precision_mv { 2 * 2 } else { 0 }; // class0_hp, hp
         for _ in 0..updates {
             writer.write(false, NO_UPDATE);
         }
@@ -1167,6 +1353,7 @@ fn compressed_header(key: bool) -> Vec<u8> {
 fn uncompressed_header(
     geometry: &Geometry,
     key: bool,
+    allow_high_precision_mv: bool,
     base_q_idx: u8,
     full_range: bool,
     compressed_size: usize,
@@ -1193,7 +1380,7 @@ fn uncompressed_header(
         }
         writer.bit(true); // found_ref: the size of LAST_FRAME
         writer.bit(false); // render_and_frame_size_different
-        writer.bit(false); // allow_high_precision_mv
+        writer.bit(allow_high_precision_mv);
         writer.bit(false); // is_filter_switchable
         writer.literal(1, 2); // raw_interpolation_filter = EIGHTTAP (regular)
     }
