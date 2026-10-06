@@ -116,34 +116,97 @@ fn inverse_probability_remapping_table_matches_libvpx() {
     assert_eq!(&INV_MAP_TABLE[248..], &[248, 249, 250, 251, 252, 253, 253]);
 }
 
-/// Decodes every libvpx VP9 profile 0 test vector in the directory named
-/// by `ZVIDLIB_VP9_VECTORS` (IVF files with their `.md5` files beside
-/// them) and compares each shown frame with libvpx's digest.
-/// `ZVIDLIB_VP9_VECTOR_FILTER` restricts the run to names containing it.
+/// The frames of a WebM file's first video track, in file order: the
+/// `SimpleBlock`s and `BlockGroup` `Block`s of every `Cluster`. Only what
+/// the libvpx test vectors use is read; lacing is refused.
+pub(crate) fn webm_frames(data: &[u8]) -> Vec<&[u8]> {
+    fn vint(data: &[u8], offset: usize, keep_marker: bool) -> (u64, usize) {
+        let first = data[offset];
+        let length = first.leading_zeros() as usize + 1;
+        assert!(length <= 8, "invalid EBML variable-length integer");
+        let mut value = if keep_marker {
+            u64::from(first)
+        } else {
+            u64::from(first) & ((1u64 << (8 - length)) - 1)
+        };
+        for &byte in &data[offset + 1..offset + length] {
+            value = (value << 8) | u64::from(byte);
+        }
+        (value, length)
+    }
+    fn walk<'a>(data: &'a [u8], mut offset: usize, end: usize, frames: &mut Vec<&'a [u8]>) {
+        while offset < end {
+            let (id, id_length) = vint(data, offset, true);
+            let (size, size_length) = vint(data, offset + id_length, false);
+            let body = offset + id_length + size_length;
+            let unknown = size == (1u64 << (7 * size_length)) - 1;
+            let body_end = if unknown {
+                end
+            } else {
+                (body + size as usize).min(end)
+            };
+            match id {
+                // Segment, Cluster and BlockGroup hold the blocks.
+                0x1853_8067 | 0x1F43_B675 | 0xA0 => walk(data, body, body_end, frames),
+                // SimpleBlock and Block.
+                0xA3 | 0xA1 => {
+                    let (track, track_length) = vint(data, body, false);
+                    let flags = data[body + track_length + 2];
+                    assert_eq!(flags & 0x06, 0, "laced WebM blocks are not supported");
+                    if track == 1 {
+                        frames.push(&data[body + track_length + 3..body_end]);
+                    }
+                }
+                _ => {}
+            }
+            offset = body_end;
+        }
+    }
+    let mut frames = Vec::new();
+    walk(data, 0, data.len(), &mut frames);
+    frames
+}
+
+/// The libvpx VP9 profile 0 test vectors, listed in
+/// `tests/fixtures/codec/libvpx_vp9_test_vectors.txt` (the profile 0 part of
+/// `test/test_vectors.cc`).
+const LIBVPX_VECTORS: &str = include_str!("../../tests/fixtures/codec/libvpx_vp9_test_vectors.txt");
+
+/// Decodes every libvpx VP9 profile 0 test vector in the directory named by
+/// `ZVIDLIB_VP9_VECTORS` and compares each shown frame with the per-frame
+/// MD5 libvpx's own test harness checks (`<vector>.md5` beside the vector).
+/// CI downloads the vectors from the WebM project and runs this with
+/// `--ignored`. `ZVIDLIB_VP9_VECTOR_FILTER` restricts a run to the vectors
+/// whose names contain it.
 #[test]
 #[ignore = "needs the libvpx test vectors; set ZVIDLIB_VP9_VECTORS"]
 fn libvpx_test_vectors() {
-    let Ok(directory) = std::env::var("ZVIDLIB_VP9_VECTORS") else {
-        return;
-    };
+    let directory = std::path::PathBuf::from(
+        std::env::var("ZVIDLIB_VP9_VECTORS")
+            .expect("ZVIDLIB_VP9_VECTORS names the directory holding the libvpx test vectors"),
+    );
     let filter = std::env::var("ZVIDLIB_VP9_VECTOR_FILTER").unwrap_or_default();
-    let mut names: Vec<_> = std::fs::read_dir(&directory)
-        .unwrap()
-        .filter_map(|entry| {
-            let path = entry.unwrap().path();
-            (path.extension()? == "ivf").then_some(path)
-        })
-        .filter(|path| path.to_string_lossy().contains(&filter))
+    let names: Vec<&str> = LIBVPX_VECTORS
+        .lines()
+        .map(str::trim)
+        .filter(|name| !name.is_empty() && name.contains(&filter))
         .collect();
-    names.sort();
+    assert!(!names.is_empty(), "no test vectors match the filter");
     let mut failures = Vec::new();
-    for path in &names {
-        let data = std::fs::read(path).unwrap();
-        let expected: Vec<String> = std::fs::read_to_string(path.with_extension("md5"))
-            .unwrap()
+    for name in &names {
+        let path = directory.join(name);
+        let data = std::fs::read(&path)
+            .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
+        let expected: Vec<String> = std::fs::read_to_string(directory.join(format!("{name}.md5")))
+            .unwrap_or_else(|error| panic!("cannot read the digests of {name}: {error}"))
             .lines()
-            .map(|line| line.split_whitespace().next().unwrap().to_owned())
+            .filter_map(|line| line.split_whitespace().next().map(str::to_owned))
             .collect();
+        let chunks = if name.ends_with(".ivf") {
+            ivf_frames(&data)
+        } else {
+            webm_frames(&data)
+        };
         let mut decoder = Decoder::new(Limits {
             max_width: 65536,
             max_height: 65536,
@@ -152,17 +215,15 @@ fn libvpx_test_vectors() {
         });
         let mut shown = 0usize;
         let mut failure = None;
-        for (index, frame) in ivf_frames(&data).into_iter().enumerate() {
-            match decoder.decode_chunk(frame) {
-                Ok(picture) => {
-                    if let Some(picture) = picture {
-                        let digest = picture_md5(&picture);
-                        if expected.get(shown) != Some(&digest) {
-                            failure = Some(format!("frame {shown} (chunk {index}) differs"));
-                        }
-                        shown += 1;
+        for (index, chunk) in chunks.into_iter().enumerate() {
+            match decoder.decode_chunk(chunk) {
+                Ok(Some(picture)) => {
+                    if expected.get(shown) != Some(&picture_md5(&picture)) {
+                        failure = Some(format!("frame {shown} (chunk {index}) differs"));
                     }
+                    shown += 1;
                 }
+                Ok(None) => {}
                 Err(error) => failure = Some(format!("chunk {index}: {error}")),
             }
             if failure.is_some() {
@@ -172,11 +233,10 @@ fn libvpx_test_vectors() {
         if failure.is_none() && shown != expected.len() {
             failure = Some(format!("{shown} frames shown, {} expected", expected.len()));
         }
-        let name = path.file_name().unwrap().to_string_lossy().into_owned();
         match failure {
             Some(reason) => {
                 eprintln!("FAIL {name}: {reason}");
-                failures.push(name);
+                failures.push(*name);
             }
             None => eprintln!("ok   {name} ({shown} frames)"),
         }

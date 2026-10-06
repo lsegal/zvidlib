@@ -178,6 +178,14 @@ pub enum CodecProfile {
     Av1Main,
     Av1High,
     Av1Professional,
+    /// VP9 profile 0: 8-bit 4:2:0.
+    Vp9Profile0,
+    /// VP9 profile 1: 8-bit 4:2:2, 4:4:0 or 4:4:4.
+    Vp9Profile1,
+    /// VP9 profile 2: 10- or 12-bit 4:2:0.
+    Vp9Profile2,
+    /// VP9 profile 3: 10- or 12-bit 4:2:2, 4:4:0 or 4:4:4.
+    Vp9Profile3,
     AacLowComplexity,
 }
 

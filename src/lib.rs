@@ -37,6 +37,7 @@ pub mod transfer;
 mod av1_dec;
 mod av1_decoder;
 mod vp9_dec;
+mod vp9_decoder;
 
 /// The bounded preview tier over a track, for callers that need an answer at an
 /// arbitrary position faster than a decode from the nearest random-access point
@@ -165,7 +166,7 @@ pub use codec::{
     VideoEncoder, VideoEncoderConfig, VideoEncoderFactory, VideoEncoderFormat,
     uncompressed_video_decoder_factory,
 };
-pub use codec_config::{DerivedCodecString, derive_codec_string};
+pub use codec_config::{DerivedCodecString, Vp9CodecConfig, derive_codec_string};
 pub use conformance::{
     ExpectedVideoFrame, FrameDigest, VideoDecoderConformanceReport, VideoDecoderConformanceVector,
     VideoEncoderConformanceReport, VideoEncoderConformanceVector, verify_video_decoder_conformance,
@@ -204,3 +205,4 @@ pub use hevc::native_hevc_video_encoder_factory;
 pub use native_audio::{DefaultAudioOutput, NativeAacDecoder};
 #[cfg(not(target_arch = "wasm32"))]
 pub use previews::PreviewIndex;
+pub use vp9_decoder::native_vp9_video_decoder_factory;

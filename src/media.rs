@@ -19,6 +19,10 @@ pub enum Codec {
     H264,
     Hevc,
     Av1,
+    /// VP9 video, carried in MP4 as a `vp09` sample entry whose decoder
+    /// configuration is the complete `vpcC` box (see
+    /// [`crate::Vp9CodecConfig`]).
+    Vp9,
     Aac,
 }
 

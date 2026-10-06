@@ -6,7 +6,7 @@
 //! (`vp9_filter_block_plane_ss00`/`_ss11`). The order matters because
 //! neighbouring edges' filters overlap, so it is kept exactly.
 
-use super::tables::{NUM_8X8_BLOCKS_HIGH_LOOKUP, NUM_8X8_BLOCKS_WIDE_LOOKUP, UV_TXSIZE_LOOKUP};
+use super::tables::UV_TXSIZE_LOOKUP;
 
 /// The edge masks of one 64x64 superblock (`LOOP_FILTER_MASK`): one bit per
 /// 8x8 luma block (row-major, low bit first) or per 8x8 chroma block.
@@ -806,13 +806,4 @@ pub(super) fn filter_levels(
         }
     }
     levels
-}
-
-/// `num_8x8_blocks_{wide,high}_lookup`, re-exported for the callers that
-/// size `build_mask`'s level fill.
-pub(super) fn block_extent(sb_type: u8) -> (usize, usize) {
-    (
-        usize::from(NUM_8X8_BLOCKS_WIDE_LOOKUP[usize::from(sb_type)]),
-        usize::from(NUM_8X8_BLOCKS_HIGH_LOOKUP[usize::from(sb_type)]),
-    )
 }

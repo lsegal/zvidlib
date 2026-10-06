@@ -859,6 +859,7 @@ fn parse_stsd(
         b"avc1" | b"avc3" => (Codec::H264, 78, TrackKind::Video),
         b"hvc1" | b"hev1" => (Codec::Hevc, 78, TrackKind::Video),
         b"av01" => (Codec::Av1, 78, TrackKind::Video),
+        b"vp09" => (Codec::Vp9, 78, TrackKind::Video),
         b"mp4a" => (Codec::Aac, 28, TrackKind::Audio),
         _ => return Err(unsupported("unsupported MP4 sample entry")),
     };
@@ -883,6 +884,7 @@ fn parse_stsd(
         Codec::H264 => b"avcC",
         Codec::Hevc => b"hvcC",
         Codec::Av1 => b"av1C",
+        Codec::Vp9 => b"vpcC",
         Codec::Aac => b"esds",
         Codec::UncompressedVideo => {
             return Err(unsupported(

@@ -11,7 +11,6 @@ use super::idct1d::{iadst4, iadst8, iadst16, idct4, idct8, idct16, idct32};
 pub(super) const DCT_DCT: u8 = 0;
 pub(super) const ADST_DCT: u8 = 1;
 pub(super) const DCT_ADST: u8 = 2;
-pub(super) const ADST_ADST: u8 = 3;
 
 #[inline]
 fn clip_pixel_add(dest: u8, residual: i32) -> u8 {
@@ -225,7 +224,6 @@ pub(super) const H_PRED: u8 = 2;
 pub(super) const D45_PRED: u8 = 3;
 pub(super) const D135_PRED: u8 = 4;
 pub(super) const D117_PRED: u8 = 5;
-pub(super) const D153_PRED: u8 = 6;
 pub(super) const D207_PRED: u8 = 7;
 pub(super) const D63_PRED: u8 = 8;
 pub(super) const TM_PRED: u8 = 9;
