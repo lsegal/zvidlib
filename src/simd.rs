@@ -3,14 +3,14 @@
 //! zvidlib's pure-Rust HEVC and AV1 codecs dispatch their hot loops to
 //! runtime-detected vector kernels in several independent places: the AV1
 //! transforms and in-loop filters ([`crate::av1_simd`]), AV1 inter prediction
-//! ([`crate::av1_mc`]), AV1 intra prediction ([`crate::av1_intra_pred`]), and
+//! ([`crate::av1_mc`]), AV1 intra prediction ([`crate::av1_intra_pred`]),
 //! the HEVC engine's inter/intra prediction, in-loop filters, inverse
 //! transforms, encoder-side distortion metrics, and encoder-side color
-//! conversion, and the AV1, VP8 and VP9 decoders' shared output color
-//! conversion ([`crate::av1_filters::convert_to_rgba8`]). Each of those sites
-//! caches its own CPU feature probe, which is what you want in production but
-//! makes "run this workload with SIMD off" impossible to express from outside
-//! the crate.
+//! conversion, the AV1, VP8 and VP9 decoders' shared output color
+//! conversion ([`crate::av1_filters::convert_to_rgba8`]), and the Vorbis
+//! decoder's synthesis (`crate::vorbis_simd`). Each of those sites caches its
+//! own CPU feature probe, which is what you want in production but makes "run
+//! this workload with SIMD off" impossible to express from outside the crate.
 //!
 //! This module is that single switch. [`set_override`] pins **every** kernel in
 //! the crate to one [`SimdIsa`] (or restores per-site automatic detection with
@@ -50,7 +50,8 @@ static OVERRIDE: AtomicU8 = AtomicU8::new(0);
 /// The override reaches every dispatch family: the AV1 transform and in-loop
 /// filter kernels, AV1 motion compensation (through the default level
 /// [`crate::av1_mc::McContext::new`] picks up), AV1 intra prediction, every
-/// HEVC engine kernel, and the AV1, VP8 and VP9 output color conversion.
+/// HEVC engine kernel, the AV1, VP8 and VP9 output color conversion, and the
+/// Vorbis decoder's synthesis kernels.
 /// [`SimdIsa::Scalar`] therefore genuinely reaches the scalar code path rather
 /// than merely the widest scalar-ish one.
 ///
@@ -122,6 +123,7 @@ pub fn available() -> Vec<SimdIsa> {
 /// | `hevc_colorconv` | HEVC encoder-side RGBA8 to YUV420 input conversion |
 /// | `hevc_color_convert` | HEVC decoder output YUV420-to-RGBA conversion |
 /// | `yuv_to_rgba` | AV1, VP8 and VP9 decoder output YUV-to-RGBA conversion |
+/// | `vorbis_decode` | Vorbis inverse MDCT, overlap-add, inverse coupling and floor product |
 ///
 /// The `hevc_*` sites are absent on `wasm32`, where the HEVC kernels have no
 /// vector backend and always run the scalar path.
@@ -166,6 +168,7 @@ pub fn active_by_site() -> Vec<(&'static str, SimdIsa)> {
         "yuv_to_rgba",
         from_yuv_to_rgba_isa(crate::yuv_to_rgba::detected_isa()),
     ));
+    sites.push(("vorbis_decode", crate::vorbis_simd::active_isa()));
     sites
 }
 
@@ -404,6 +407,8 @@ mod tests {
             crate::yuv_to_rgba::detected_isa(),
             crate::yuv_to_rgba::Isa::Scalar
         );
+        // The Vorbis decoder's synthesis kernels.
+        assert_eq!(crate::vorbis_simd::active_isa(), SimdIsa::Scalar);
 
         // The list above is written out by hand, one selector per site, so it
         // only stays exhaustive as long as it matches `active_by_site`. A new
@@ -421,6 +426,7 @@ mod tests {
             "hevc_colorconv",
             "hevc_color_convert",
             "yuv_to_rgba",
+            "vorbis_decode",
         ];
         let sites: Vec<&str> = active_by_site().into_iter().map(|(site, _)| site).collect();
         assert_eq!(sites, checked);
@@ -513,6 +519,8 @@ mod tests {
             crate::yuv_to_rgba::detected_isa() != crate::yuv_to_rgba::Isa::Scalar,
             vectorized
         );
+        // The Vorbis decoder's synthesis kernels.
+        assert_eq!(crate::vorbis_simd::active_isa(), detected());
 
         // As in `pinning_scalar_reaches_every_dispatch_site`, the list above is
         // written out by hand, one selector per site, so it only stays
@@ -531,6 +539,7 @@ mod tests {
             "hevc_colorconv",
             "hevc_color_convert",
             "yuv_to_rgba",
+            "vorbis_decode",
         ];
         let sites: Vec<&str> = active_by_site().into_iter().map(|(site, _)| site).collect();
         assert_eq!(sites, checked);
