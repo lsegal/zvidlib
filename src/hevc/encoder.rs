@@ -154,7 +154,7 @@ fn create_native(c: &VideoEncoderConfig, limits: &Limits) -> Result<Box<dyn Vide
 /// on every target.
 #[cfg(windows)]
 mod platform {
-    use super::super::windows_mf_encoder::{self, MftClass, Settings};
+    use super::super::windows_mf_encoder::{self, MftClass, OutputFormat, Settings};
     use super::{OperatingPoint, parse_operating_point};
     use crate::{
         CodecImplementation, CodecSupport, ColorRange, Error, ErrorKind, HardwarePreference,
@@ -162,7 +162,7 @@ mod platform {
     };
 
     /// The Media Foundation request `c` resolves to, or why it cannot be one.
-    fn settings(c: &VideoEncoderConfig) -> std::result::Result<Settings, &'static str> {
+    fn settings(c: &VideoEncoderConfig) -> std::result::Result<Settings, String> {
         let Some(OperatingPoint::TargetBitrate {
             bits_per_second,
             keyframe_interval,
@@ -171,19 +171,22 @@ mod platform {
             return Err(
                 "hardware HEVC encoding requires a target-bitrate configuration: four \
                  big-endian bytes of bits a second, optionally followed by four big-endian \
-                 bytes of keyframe interval in frames",
+                 bytes of keyframe interval in frames"
+                    .into(),
             );
         };
         if c.color_range != ColorRange::Limited {
-            return Err("Media Foundation HEVC encoding requires limited-range input");
+            return Err("Media Foundation HEVC encoding requires limited-range input".into());
         }
         let settings = Settings {
+            format: OutputFormat::Hevc,
             width: c.coded_dimensions.width,
             height: c.coded_dimensions.height,
             input_format: c.input_format,
             timescale: c.timescale,
             frame_duration: c.frame_duration,
             bits_per_second,
+            quality: None,
             keyframe_interval: match keyframe_interval {
                 // One second, rounded up to a whole frame.
                 0 => c.timescale.div_ceil(c.frame_duration.max(1)).max(1),
@@ -220,9 +223,7 @@ mod platform {
     /// is invalid, and one it would take on a host without one is unavailable.
     pub(super) fn unavailable(c: &VideoEncoderConfig) -> CodecSupport {
         match settings(c) {
-            Err(reason) => CodecSupport::InvalidConfiguration {
-                reason: reason.into(),
-            },
+            Err(reason) => CodecSupport::InvalidConfiguration { reason },
             Ok(_) => CodecSupport::HardwareUnavailable,
         }
     }
@@ -251,8 +252,8 @@ mod platform {
     use super::super::videotoolbox_encoder::{self, Settings};
     use super::{OperatingPoint, parse_operating_point};
     use crate::{
-        CodecImplementation, CodecSupport, ColorRange, Error, ErrorKind, Limits, PixelFormat,
-        Result, VideoEncoder, VideoEncoderConfig,
+        Codec, CodecImplementation, CodecSupport, ColorRange, Error, ErrorKind, Limits,
+        PixelFormat, Result, VideoEncoder, VideoEncoderConfig,
     };
 
     /// The VideoToolbox request `c` resolves to, or why it cannot be one.
@@ -298,13 +299,14 @@ mod platform {
         }
         Ok(Settings {
             bits_per_second,
+            quality: None,
             keyframe_interval,
         })
     }
 
     pub(super) fn capability(c: &VideoEncoderConfig) -> Option<CodecImplementation> {
         settings(c).ok()?;
-        videotoolbox_encoder::is_available(c.coded_dimensions)
+        videotoolbox_encoder::is_available(Codec::Hevc, c.coded_dimensions)
             .then_some(CodecImplementation::Hardware)
     }
 
@@ -322,7 +324,7 @@ mod platform {
 
     pub(super) fn create(c: &VideoEncoderConfig, limits: &Limits) -> Result<Box<dyn VideoEncoder>> {
         let settings = settings(c).map_err(|reason| Error::new(ErrorKind::InvalidInput, reason))?;
-        if !videotoolbox_encoder::is_available(c.coded_dimensions) {
+        if !videotoolbox_encoder::is_available(Codec::Hevc, c.coded_dimensions) {
             return Err(Error::new(
                 ErrorKind::Unsupported,
                 "hardware HEVC encoding is unavailable (VideoToolbox has no hardware HEVC \
