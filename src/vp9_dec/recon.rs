@@ -188,7 +188,7 @@ fn iwht4x4_add(input: &[i32], dest: &mut [u8], stride: usize, eob: usize) {
 /// adds them to the prediction in `dest`, choosing the same kernels as
 /// libvpx's `inverse_transform_block_inter`/`_intra` for the given
 /// end-of-block position.
-pub(super) fn inverse_transform_add(
+pub(crate) fn inverse_transform_add(
     coefficients: &[i32],
     dest: &mut [u8],
     stride: usize,

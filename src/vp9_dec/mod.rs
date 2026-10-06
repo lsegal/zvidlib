@@ -35,11 +35,11 @@ mod block;
     target_os = "macos"
 ))]
 mod chunk;
-mod idct1d;
+pub(crate) mod idct1d;
 pub(crate) mod loopfilter;
 mod probs;
-mod recon;
-mod tables;
+pub(crate) mod recon;
+pub(crate) mod tables;
 
 #[cfg(test)]
 mod tests;
