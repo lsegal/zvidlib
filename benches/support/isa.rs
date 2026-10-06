@@ -23,8 +23,8 @@
 //! measured axis and is named directly, so both arms of a comparison always
 //! appear in the same run.
 
-// Compiled separately by each bench target; `audio_decode.rs` has no
-// scalar-vs-SIMD axis and uses none of this module.
+// Compiled separately by each bench target, each of which uses only the
+// helpers its own groups need.
 #![allow(dead_code)]
 
 use std::hint::black_box;
@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 use criterion::Criterion;
 use zvidlib::simd::{self, SimdIsa};
 
-use super::{AudioWork, FrameWork, report_audio_throughput};
+use super::{AudioWork, FrameWork};
 
 /// Logs what this host can actually execute, before anything is timed.
 ///
@@ -124,37 +124,67 @@ where
     group.finish();
 }
 
-/// Benchmarks an audio `run` once per available instruction set.
-///
-/// The audio counterpart of [`bench_across_isas`], with the same two guards
-/// (bit-exact output across every arm, and the override reaching every
-/// dispatch site) but measured in samples rather than pixels: criterion
-/// reports samples per second, and each arm prints the realtime factor that
-/// decides whether an encoder keeps up with its input.
-pub fn bench_audio_across_isas<F>(criterion: &mut Criterion, codec: &str, work: AudioWork, run: F)
-where
-    F: Fn() -> Vec<u8>,
-{
-    assert_bit_exact_across_isas(codec, &run);
+/// How to measure one audio workload across instruction sets: the
+/// sample-clock counterpart to [`IsaWorkload`].
+pub struct AudioIsaWorkload<'a> {
+    /// Group name, conventionally `<codec>_<stage>` (e.g. `vorbis_imdct`).
+    pub codec: &'a str,
+    /// Samples one iteration covers, for throughput reporting.
+    pub work: AudioWork,
+    pub sample_size: usize,
+    pub measurement_time: Duration,
+    pub warm_up_time: Duration,
+}
 
-    let mut group = criterion.benchmark_group(codec);
-    group.sample_size(10);
-    group.warm_up_time(Duration::from_millis(500));
-    group.measurement_time(Duration::from_secs(5));
-    report_audio_throughput(&mut group, codec, work);
+impl<'a> AudioIsaWorkload<'a> {
+    /// A workload with criterion settings that suit a millisecond-scale run.
+    #[must_use]
+    pub fn new(codec: &'a str, work: AudioWork) -> AudioIsaWorkload<'a> {
+        AudioIsaWorkload {
+            codec,
+            work,
+            sample_size: 20,
+            measurement_time: Duration::from_secs(3),
+            warm_up_time: Duration::from_millis(500),
+        }
+    }
+}
+
+/// [`bench_across_isas`] for an audio workload: the same bit-exactness guard
+/// and per-site override assertion, reported on the samples/sec and
+/// x-realtime scale rather than in megapixels.
+pub fn bench_audio_across_isas<F>(
+    criterion: &mut Criterion,
+    workload: &AudioIsaWorkload<'_>,
+    mut run: F,
+) where
+    F: FnMut() -> Vec<u8>,
+{
+    {
+        // The guard takes a `Fn`; a stage that reuses its buffers is `FnMut`.
+        let run = std::cell::RefCell::new(&mut run);
+        assert_bit_exact_across_isas(workload.codec, &|| (*run.borrow_mut())());
+    }
+
+    let mut group = criterion.benchmark_group(workload.codec);
+    group.sample_size(workload.sample_size);
+    group.warm_up_time(workload.warm_up_time);
+    group.measurement_time(workload.measurement_time);
+    group.throughput(workload.work.elements());
     for isa in simd::available() {
         simd::set_override(Some(isa));
-        assert_reached_every_site(codec, isa);
+        assert_reached_every_site(workload.codec, isa);
         let started = Instant::now();
-        let output = black_box(run());
+        black_box(run());
         let elapsed = started.elapsed();
         println!(
-            "# {codec}/{}: {:.4}s of audio in {:.4}s => {:.1}x realtime ({} output bytes)",
+            "# {}/{}: {:.4}s of audio in {:.6}s => {:.0} samples/s = {:.1}x realtime",
+            workload.codec,
             isa.name(),
-            work.seconds(),
+            workload.work.seconds(),
             elapsed.as_secs_f64(),
-            work.realtime_factor(elapsed),
-            output.len(),
+            workload.work.samples_per_second(elapsed),
+            workload.work.realtime_factor(elapsed),
         );
         group.bench_function(isa.name(), |bencher| bencher.iter(|| black_box(run())));
     }

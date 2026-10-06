@@ -29,6 +29,7 @@
 mod support;
 
 use std::f32::consts::TAU;
+use std::time::Duration;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use zvidlib::{
@@ -36,7 +37,7 @@ use zvidlib::{
     FrameIndex, Limits, SampleRange, native_vorbis_audio_encoder_factory,
 };
 
-use support::isa::{bench_audio_across_isas, log_host_isas};
+use support::isa::{AudioIsaWorkload, bench_audio_across_isas, log_host_isas};
 use support::{AudioWork, block_on};
 
 /// Seconds of audio one iteration encodes: long enough that the stream start
@@ -124,7 +125,14 @@ fn vorbis_encode(c: &mut Criterion) {
         let layout = if channels == 1 { "mono" } else { "stereo" };
         let name = format!("vorbis_encode_{sample_rate}_{layout}_{label}");
         let work = AudioWork::new(u64::from(sample_rate * SECONDS), sample_rate, channels);
-        bench_audio_across_isas(c, &name, work, || encode(&config, &pcm));
+        // A whole encode takes a tenth of a second or more, so fewer, longer
+        // samples than the stage-sized default.
+        let workload = AudioIsaWorkload {
+            sample_size: 10,
+            measurement_time: Duration::from_secs(5),
+            ..AudioIsaWorkload::new(&name, work)
+        };
+        bench_audio_across_isas(c, &workload, || encode(&config, &pcm));
     }
 }
 

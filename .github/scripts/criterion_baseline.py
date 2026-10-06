@@ -549,6 +549,12 @@ SITE_GROUP_PREFIXES: dict[str, tuple[str, ...]] = {
     "hevc_colorconv": ("hevc_encode_640x352_rgba_to_yuv420",),
     "hevc_color_convert": ("hevc_color_convert",),
     "yuv_to_rgba": ("yuv_to_rgba",),
+    "vorbis_decode": (
+        "vorbis_imdct",
+        "vorbis_overlap_add",
+        "vorbis_coupling",
+        "vorbis_floor_product",
+    ),
 }
 
 # `Measured on **<host>**, at `<sha>`.` - the line `table` renders above every
