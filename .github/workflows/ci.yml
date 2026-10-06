@@ -158,6 +158,12 @@ jobs:
       # skips itself where those tools are not installed.
       - name: Test the WebM container
         run: cargo test --features native --test webm_container
+      # The libvpx MD5 comparison of every VP8 test vector runs with the
+      # library units above; this checks every frame also comes back exactly
+      # through `ExactFrameReader` in reverse and alternating order, through
+      # the hidden key frame of vector 018 (#529).
+      - name: Test VP8 exact-frame decoding
+        run: cargo test --features native --test vp8_conformance
       - name: Test AV1 SIMD motion compensation
         run: cargo test --features native --lib av1_mc -- --nocapture
       # `--release` is the profile #327 was reported against: nothing about the
