@@ -16,8 +16,9 @@ use crate::web_encoder::{
     video_encode_capability,
 };
 use crate::web_previews::WebPreviewIndex;
+use crate::webm::WebmMuxer;
 use crate::{
-    AudioBuffer as CoreAudioBuffer, CancellationToken, Codec, CodecProfile, ColorRange,
+    AudioBuffer as CoreAudioBuffer, CancellationToken, Codec, CodecProfile, ColorRange, Container,
     EncodedSample, EncoderConfig, ErrorKind, FrameIndex as CoreFrameIndex, FrameRate,
     HardwarePreference, Limits, PixelFormat, Plane, PreviewOptions as CorePreviewOptions,
     PreviewStore, Rational as CoreRational, SEEK_LATENCY_BUDGET, SampleRange as CoreSampleRange,
@@ -59,6 +60,10 @@ extern "C" {
     #[cfg(test)]
     #[wasm_bindgen(js_name = makePendingStream)]
     fn make_pending_stream() -> ReadableStream;
+
+    #[cfg(test)]
+    #[wasm_bindgen(js_name = probeTestVideo)]
+    fn probe_test_video(blob: &Blob, seek_to: f64) -> Promise;
 }
 
 fn error_code_for_kind(kind: ErrorKind) -> &'static str {
@@ -617,7 +622,7 @@ impl WasmOpenOptions {
 
 #[wasm_bindgen(js_name = CreateOptions)]
 pub struct WasmCreateOptions {
-    container: String,
+    container: Container,
     mime_type: String,
     max_output_bytes: u64,
     frame_rate: Option<FrameRate>,
@@ -628,18 +633,20 @@ pub struct WasmCreateOptions {
 
 #[wasm_bindgen(js_class = CreateOptions)]
 impl WasmCreateOptions {
+    /// `container` is `"mp4"` (the default) or `"webm"`, whose `finish()`
+    /// returns a `video/webm` Blob. WebM output is AV1 video only.
     #[wasm_bindgen(constructor)]
     pub fn new(container: Option<String>) -> Result<WasmCreateOptions, JsValue> {
-        let container = container.unwrap_or_else(|| "mp4".to_owned());
-        if !container.eq_ignore_ascii_case("mp4") {
-            return Err(js_error(
+        let name = container.unwrap_or_else(|| "mp4".to_owned());
+        let container = Container::from_name(&name).ok_or_else(|| {
+            js_error(
                 ErrorKind::Unsupported,
-                format!("unsupported output container: {container}"),
-            ));
-        }
+                format!("unsupported output container: {name}"),
+            )
+        })?;
         Ok(Self {
-            container: "mp4".to_owned(),
-            mime_type: "video/mp4".to_owned(),
+            container,
+            mime_type: container.mime_type().to_owned(),
             max_output_bytes: Limits::default().max_allocation_bytes,
             frame_rate: None,
             audio_sample_rate: None,
@@ -650,7 +657,7 @@ impl WasmCreateOptions {
 
     #[wasm_bindgen(getter)]
     pub fn container(&self) -> String {
-        self.container.clone()
+        self.container.name().to_owned()
     }
 
     #[wasm_bindgen(getter, js_name = mimeType)]
@@ -703,7 +710,8 @@ impl WasmCreateOptions {
     }
 
     /// The browser video codec for [`WasmVideoStream::put`]: `"av1"`
-    /// (default), `"hevc"` or `"vp9"`.
+    /// (default), `"hevc"` or `"vp9"`. WebM permits no HEVC, so a `"webm"`
+    /// output accepts `"av1"` or `"vp9"`.
     #[wasm_bindgen(getter, js_name = videoCodec)]
     pub fn video_codec(&self) -> String {
         match self.video_codec {
@@ -717,6 +725,12 @@ impl WasmCreateOptions {
     pub fn set_video_codec(&mut self, value: String) -> Result<(), JsValue> {
         self.video_codec = match value.as_str() {
             "av1" => Codec::Av1,
+            "hevc" if self.container == Container::WebM => {
+                return Err(js_error(
+                    ErrorKind::Unsupported,
+                    "WebM permits only VP8, VP9 or AV1 video; write HEVC to an mp4 output",
+                ));
+            }
             "hevc" => Codec::Hevc,
             "vp9" => Codec::Vp9,
             other => {
@@ -1065,15 +1079,24 @@ async fn parse_audio_track(
         )
     })?;
     let source = MemorySource::new((*bytes).clone());
-    let demuxer = crate::Mp4Demuxer::open(&source, crate::Mp4DemuxerOptions::default())
+    crate::container::open_tracks(&source, &Limits::default())
         .await
-        .map_err(|error| js_error(error.kind(), error.message()))?;
-    demuxer
-        .tracks
+        .map_err(|error| js_error(error.kind(), error.message()))?
         .into_iter()
         .filter(|track| track.kind == crate::TrackKind::Audio)
         .nth(index as usize)
         .ok_or_else(|| js_error(ErrorKind::InvalidInput, "no such audio track"))
+}
+
+/// The containers `CreateOptions` accepts and `MediaInput.open` detects, by
+/// the name `CreateOptions.container` takes: `["mp4", "webm"]`.
+#[wasm_bindgen(js_name = supportedContainers)]
+pub fn supported_containers() -> Array {
+    crate::container_capabilities()
+        .into_iter()
+        .filter(|capability| capability.support.is_available())
+        .map(|capability| JsValue::from(capability.name))
+        .collect()
 }
 
 /// The longest a seek to any position of any track may take, in milliseconds.
@@ -1560,7 +1583,14 @@ impl WasmAudioStream {
 pub struct WasmMediaInput {
     bytes: Rc<Vec<u8>>,
     state: Rc<Cell<bool>>,
+    container: Option<Container>,
 }
+
+/// More than the leading bytes either container's signature occupies: an MP4
+/// box header, or an EBML header, which a WebM probe bounds at 4 KiB.
+const SIGNATURE_PREFIX_BYTES: usize = 8 * 1024;
+
+const WEBM_AUDIO_UNSUPPORTED: &str = "WebM output is video-only: WebM permits only Vorbis or Opus audio, so AAC audio needs an mp4 output";
 
 impl WasmMediaInput {
     async fn open_inner(
@@ -1580,9 +1610,16 @@ impl WasmMediaInput {
                 "browser source adapter returned a non-byte value",
             )
         })?;
+        let bytes = bytes.to_vec();
+        // Detected from the bytes themselves, never a file name or MIME type.
+        let prefix = MemorySource::new(&bytes[..bytes.len().min(SIGNATURE_PREFIX_BYTES)]);
+        let container = crate::probe_container(&prefix)
+            .await
+            .map_err(|error| js_error(error.kind(), error.message()))?;
         Ok(Self {
-            bytes: Rc::new(bytes.to_vec()),
+            bytes: Rc::new(bytes),
             state: Rc::new(Cell::new(false)),
+            container,
         })
     }
 }
@@ -1608,6 +1645,14 @@ impl WasmMediaInput {
     pub fn bytes(&self) -> Result<Uint8Array, JsValue> {
         ensure_open(&self.state)?;
         Ok(owned_u8_array(&self.bytes))
+    }
+
+    /// The container `open` detected from the source's leading bytes:
+    /// `"mp4"`, `"webm"`, or `null` when neither signature matched.
+    #[wasm_bindgen(getter)]
+    pub fn container(&self) -> Result<Option<String>, JsValue> {
+        ensure_open(&self.state)?;
+        Ok(self.container.map(|container| container.name().to_owned()))
     }
 
     pub fn video(&self, index: u32) -> Result<WasmVideoStream, JsValue> {
@@ -1991,7 +2036,7 @@ async fn finalize_audio_track(
 
 /// Flushes any open browser video encode session on every video track and any
 /// open browser audio encode session and, if at least one track produced
-/// samples, muxes them together into a complete MP4. Falls back to
+/// samples, muxes them together into a complete MP4 or WebM. Falls back to
 /// `raw_bytes` (accumulated via [`WasmMediaOutput::write_encoded_chunk`])
 /// when no browser encode path was ever used, and silently omits a video
 /// track that was opened via [`WasmMediaOutput::video`] but never encoded a
@@ -2000,8 +2045,11 @@ async fn finalize_audio_track(
 /// Video tracks are muxed first, in ascending output track index order,
 /// renumbered to the contiguous positions the muxer expects (the original
 /// indices requested through `video()` are not preserved in the output MP4);
+/// the audio track, if used, is muxed last. WebM output carries no audio
+/// and no cover art, and interleaves its tracks by presentation time.
 /// the audio track, if used, is muxed last.
 async fn finalize_browser_output(
+    container: Container,
     tracks: &Rc<RefCell<BTreeMap<u32, Rc<RefCell<BrowserVideoTrack>>>>>,
     audio: &Rc<RefCell<BrowserAudioTrack>>,
     raw_bytes: Vec<u8>,
@@ -2054,7 +2102,7 @@ async fn finalize_browser_output(
             continue;
         }
         // The first muxed video track supplies the generated cover.
-        if track_configs.is_empty() {
+        if track_configs.is_empty() && container == Container::Mp4 {
             generated_cover = track.borrow().cover.cover_art();
         }
 
@@ -2103,6 +2151,19 @@ async fn finalize_browser_output(
         return Ok(raw_bytes);
     }
 
+    if container == Container::WebM {
+        if track_configs
+            .iter()
+            .any(|config| matches!(config.format, Mp4TrackFormat::Audio { .. }))
+        {
+            return Err(crate::Error::new(
+                ErrorKind::Unsupported,
+                WEBM_AUDIO_UNSUPPORTED,
+            ));
+        }
+        return mux_browser_webm(track_configs, track_samples).await;
+    }
+
     let sink = MemorySink::new();
     let mut muxer = Mp4Muxer::new(
         sink,
@@ -2120,11 +2181,47 @@ async fn finalize_browser_output(
     Ok(sink.into_inner())
 }
 
+/// Muxes buffered browser video tracks into a WebM. [`WebmMuxer`] takes
+/// samples in one presentation-time order across tracks, so the per-track
+/// buffers are merged by exact presentation time, each track keeping its own
+/// order and earlier tracks winning ties.
+async fn mux_browser_webm(
+    track_configs: Vec<Mp4TrackConfig>,
+    track_samples: Vec<Vec<EncodedSample>>,
+) -> crate::Result<Vec<u8>> {
+    let timescales: Vec<i128> = track_configs
+        .iter()
+        .map(|config| i128::from(config.encoder.timescale))
+        .collect();
+    let mut merged: Vec<(usize, EncodedSample)> = track_samples
+        .into_iter()
+        .enumerate()
+        .flat_map(|(track, samples)| samples.into_iter().map(move |sample| (track, sample)))
+        .collect();
+    merged.sort_by(|(left_track, left), (right_track, right)| {
+        (i128::from(left.pts) * timescales[*right_track])
+            .cmp(&(i128::from(right.pts) * timescales[*left_track]))
+            .then(left_track.cmp(right_track))
+    });
+    let mut muxer = WebmMuxer::new(
+        MemorySink::new(),
+        track_configs,
+        crate::OutputOptions::default().max_samples_per_track,
+    )
+    .await?;
+    for (track, sample) in merged {
+        muxer.write_sample(track, sample).await?;
+    }
+    Ok(muxer.finish().await?.into_inner())
+}
+
 /// A browser output adapter that returns finalized bytes as an owned `Blob`.
 #[wasm_bindgen(js_name = MediaOutput)]
 pub struct WasmMediaOutput {
     bytes: Vec<u8>,
     mime_type: String,
+    /// Which container `finish` muxes the browser-encoded tracks into.
+    container: Container,
     max_output_bytes: u64,
     state: Rc<Cell<bool>>,
     timeline: Option<Timeline>,
@@ -2147,6 +2244,7 @@ pub struct WasmMediaOutput {
 impl WasmMediaOutput {
     pub fn create(options: &WasmCreateOptions) -> Promise {
         let mime_type = options.mime_type.clone();
+        let container = options.container;
         let max_output_bytes = options.max_output_bytes;
         let video_codec = options.video_codec;
         let cover_source = options.cover_source;
@@ -2172,6 +2270,7 @@ impl WasmMediaOutput {
             Ok(JsValue::from(Self {
                 bytes: Vec::new(),
                 mime_type,
+                container,
                 max_output_bytes,
                 state: Rc::new(Cell::new(false)),
                 timeline,
@@ -2230,8 +2329,14 @@ impl WasmMediaOutput {
         })
     }
 
+    /// A `"webm"` output has no audio track: WebM permits only Vorbis or Opus
+    /// audio and the browser bridge encodes AAC, so this rejects with
+    /// `UNSUPPORTED` rather than produce a file no WebM player accepts.
     pub fn audio(&self, index: u32) -> Result<WasmAudioStream, JsValue> {
         ensure_open(&self.state)?;
+        if self.container == Container::WebM {
+            return Err(js_error(ErrorKind::Unsupported, WEBM_AUDIO_UNSUPPORTED));
+        }
         // The WebCodecs bridge currently supports encoding a single audio
         // track (track 0); `put()` on any other index reports Unsupported.
         let browser_audio = (index == 0).then(|| Rc::clone(&self.browser_audio));
@@ -2248,6 +2353,7 @@ impl WasmMediaOutput {
     /// Sets the cover art embedded in the finished MP4 as its file-browser
     /// thumbnail. `mimeType` is `image/jpeg` or `image/png`; `null` clears it.
     /// May be called any time before `finish()`.
+    /// WebM has no cover-art element, so a `"webm"` output refuses a picture.
     #[wasm_bindgen(js_name = setCoverArt)]
     pub fn set_cover_art(
         &mut self,
@@ -2259,6 +2365,12 @@ impl WasmMediaOutput {
             self.cover_art = None;
             return Ok(());
         };
+        if self.container == Container::WebM {
+            return Err(js_error(
+                ErrorKind::Unsupported,
+                "WebM output cannot carry cover art; setCoverArt needs an mp4 output",
+            ));
+        }
         let format = match mime_type.as_deref() {
             Some("image/jpeg") => CoverArtFormat::Jpeg,
             Some("image/png") => CoverArtFormat::Png,
@@ -2284,6 +2396,7 @@ impl WasmMediaOutput {
 
     pub fn finish(&mut self) -> Promise {
         let state = Rc::clone(&self.state);
+        let container = self.container;
         let mime_type = self.mime_type.clone();
         let browser_video_tracks = Rc::clone(&self.browser_video_tracks);
         let browser_audio = Rc::clone(&self.browser_audio);
@@ -2292,6 +2405,7 @@ impl WasmMediaOutput {
         future_to_promise(async move {
             ensure_open(&state)?;
             let bytes = finalize_browser_output(
+                container,
                 &browser_video_tracks,
                 &browser_audio,
                 raw_bytes,
@@ -2572,6 +2686,7 @@ mod tests {
         let output = WasmMediaOutput {
             bytes: Vec::new(),
             mime_type: options.mime_type,
+            container: options.container,
             max_output_bytes: options.max_output_bytes,
             state: Rc::new(Cell::new(false)),
             timeline: None,
@@ -2754,6 +2869,7 @@ mod tests {
         let mut output = WasmMediaOutput {
             bytes: Vec::new(),
             mime_type: options.mime_type,
+            container: options.container,
             max_output_bytes: options.max_output_bytes,
             state: Rc::new(Cell::new(false)),
             timeline: None,
@@ -2783,6 +2899,7 @@ mod tests {
         let output = WasmMediaOutput {
             bytes: Vec::new(),
             mime_type: options.mime_type,
+            container: options.container,
             max_output_bytes: options.max_output_bytes,
             state: Rc::new(Cell::new(false)),
             timeline: None,
@@ -2829,6 +2946,7 @@ mod tests {
         let mut output = WasmMediaOutput {
             bytes: Vec::new(),
             mime_type: options.mime_type,
+            container: options.container,
             max_output_bytes: options.max_output_bytes,
             state: Rc::new(Cell::new(false)),
             timeline: None,
@@ -2901,6 +3019,7 @@ mod tests {
             let mut output = WasmMediaOutput {
                 bytes: Vec::new(),
                 mime_type: options.mime_type.clone(),
+                container: options.container,
                 max_output_bytes: options.max_output_bytes,
                 state: Rc::new(Cell::new(false)),
                 timeline: None,
@@ -2942,6 +3061,7 @@ mod tests {
         let output = WasmMediaOutput {
             bytes: Vec::new(),
             mime_type: options.mime_type,
+            container: options.container,
             max_output_bytes: options.max_output_bytes,
             state: Rc::new(Cell::new(false)),
             timeline: None,
@@ -2983,59 +3103,58 @@ mod tests {
         assert_eq!(demuxer.tracks[0].samples.len(), 3);
     }
 
+    /// Issue #528: `videoCodec = "vp9"` encodes through WebCodecs into a
+    /// demuxable `vp09` MP4 and a `V_VP9` WebM.
     #[wasm_bindgen_test(async)]
-    async fn put_encodes_vp9_through_webcodecs_into_a_playable_mp4() {
+    async fn put_encodes_vp9_through_webcodecs_into_mp4_and_webm() {
         if !video_encode_support(None, Some("vp9".to_owned())).unwrap() {
             return;
         }
-        let mut options = WasmCreateOptions::new(None).unwrap();
-        options.set_video_codec("vp9".to_owned()).unwrap();
-        assert_eq!(options.video_codec(), "vp9");
-        let output = WasmMediaOutput {
-            bytes: Vec::new(),
-            mime_type: options.mime_type,
-            max_output_bytes: options.max_output_bytes,
-            state: Rc::new(Cell::new(false)),
-            timeline: None,
-            video_timescale: 30,
-            video_frame_duration: 1,
-            video_codec: options.video_codec,
-            browser_video_tracks: Rc::new(RefCell::new(BTreeMap::new())),
-            browser_audio: Rc::new(RefCell::new(BrowserAudioTrack::new())),
-            cover_art: None,
-            cover_source: CoverSource::default(),
-        };
-        let video = output.video(0).unwrap();
-        let frame = WasmVideoFrame::rgba(16, 16, owned_u8_array(&[128_u8; 16 * 16 * 4])).unwrap();
-        for frame_index in 0..3_u64 {
-            if let Err(error) =
-                JsFuture::from(video.put(BigInt::from(frame_index).into(), &frame, None)).await
-            {
-                // As for HEVC, the browser can still refuse this concrete
-                // configuration asynchronously.
-                assert_error_code(&error, "UNSUPPORTED");
-                return;
+        for container in ["mp4", "webm"] {
+            let mut options = WasmCreateOptions::new(Some(container.to_owned())).unwrap();
+            options.set_video_codec("vp9".to_owned()).unwrap();
+            assert_eq!(options.video_codec(), "vp9");
+            let mut output = browser_output(&options);
+            let video = output.video(0).unwrap();
+            let frame =
+                WasmVideoFrame::rgba(16, 16, owned_u8_array(&[128_u8; 16 * 16 * 4])).unwrap();
+            for frame_index in 0..3_u64 {
+                if let Err(error) =
+                    JsFuture::from(video.put(BigInt::from(frame_index).into(), &frame, None)).await
+                {
+                    // As for HEVC, the browser can still refuse this concrete
+                    // configuration asynchronously.
+                    assert_error_code(&error, "UNSUPPORTED");
+                    return;
+                }
             }
+            let blob: Blob = JsFuture::from(output.finish())
+                .await
+                .unwrap()
+                .unchecked_into();
+            let source = MemorySource::new(
+                Uint8Array::new(&JsFuture::from(blob.array_buffer()).await.unwrap()).to_vec(),
+            );
+            let tracks = if container == "webm" {
+                assert_eq!(blob.type_(), "video/webm");
+                crate::WebmDemuxer::open(&source, crate::WebmDemuxerOptions::default())
+                    .await
+                    .expect("the browser-encoded output must be a parseable WebM")
+                    .tracks
+            } else {
+                crate::Mp4Demuxer::open(&source, crate::Mp4DemuxerOptions::default())
+                    .await
+                    .expect("the browser-encoded output must be a parseable MP4")
+                    .tracks
+            };
+            assert_eq!(tracks.len(), 1, "{container}");
+            let track = &tracks[0];
+            assert_eq!(track.codec, Codec::Vp9, "{container}");
+            assert_eq!(track.samples.len(), 3, "{container}");
+            assert!(track.samples[0].is_sync, "{container}");
+            let derived = crate::derive_codec_string(Codec::Vp9, &track.decoder_config).unwrap();
+            assert_eq!(derived.codec_string, "vp09.00.10.08", "{container}");
         }
-        let mut output = output;
-        let blob: Blob = JsFuture::from(output.finish())
-            .await
-            .unwrap()
-            .unchecked_into();
-        let bytes = Uint8Array::new(&JsFuture::from(blob.array_buffer()).await.unwrap()).to_vec();
-        let demuxer = crate::Mp4Demuxer::open(
-            &MemorySource::new(bytes),
-            crate::Mp4DemuxerOptions::default(),
-        )
-        .await
-        .expect("the browser-encoded output must be a parseable MP4");
-        assert_eq!(demuxer.tracks.len(), 1);
-        let track = &demuxer.tracks[0];
-        assert_eq!(track.codec, Codec::Vp9);
-        assert_eq!(track.samples.len(), 3);
-        assert!(track.samples[0].is_sync);
-        let derived = crate::derive_codec_string(Codec::Vp9, &track.decoder_config).unwrap();
-        assert_eq!(derived.codec_string, "vp09.00.10.08");
     }
 
     /// Issue #474's acceptance criteria: a synchronized, playable audio+video
@@ -3052,6 +3171,7 @@ mod tests {
         let output = WasmMediaOutput {
             bytes: Vec::new(),
             mime_type: options.mime_type,
+            container: options.container,
             max_output_bytes: options.max_output_bytes,
             state: Rc::new(Cell::new(false)),
             timeline: None,
@@ -3138,6 +3258,7 @@ mod tests {
         let output = WasmMediaOutput {
             bytes: Vec::new(),
             mime_type: options.mime_type,
+            container: options.container,
             max_output_bytes: options.max_output_bytes,
             state: Rc::new(Cell::new(false)),
             timeline: None,
@@ -3193,6 +3314,7 @@ mod tests {
         let output = WasmMediaOutput {
             bytes: Vec::new(),
             mime_type: options.mime_type,
+            container: options.container,
             max_output_bytes: options.max_output_bytes,
             state: Rc::new(Cell::new(false)),
             timeline: None,
@@ -3229,6 +3351,221 @@ mod tests {
         assert_eq!(demuxer.tracks.len(), 1);
         assert_eq!(demuxer.tracks[0].kind, crate::TrackKind::Video);
         assert_eq!(demuxer.tracks[0].samples.len(), 3);
+    }
+
+    #[wasm_bindgen_test]
+    fn create_options_select_a_webm_container() {
+        let options = WasmCreateOptions::new(Some("WebM".to_owned())).unwrap();
+        assert_eq!(options.container(), "webm");
+        assert_eq!(options.mime_type(), "video/webm");
+        let mut options = options;
+        options.set_video_codec("av1".to_owned()).unwrap();
+        assert_error_code(
+            &options.set_video_codec("hevc".to_owned()).unwrap_err(),
+            "UNSUPPORTED",
+        );
+        assert_error_code(
+            &WasmCreateOptions::new(Some("mkv".to_owned()))
+                .err()
+                .unwrap(),
+            "UNSUPPORTED",
+        );
+        let names: Vec<_> = supported_containers()
+            .iter()
+            .map(|name| name.as_string().unwrap())
+            .collect();
+        assert_eq!(names, ["mp4", "webm"]);
+    }
+
+    fn browser_output(options: &WasmCreateOptions) -> WasmMediaOutput {
+        WasmMediaOutput {
+            bytes: Vec::new(),
+            mime_type: options.mime_type.clone(),
+            container: options.container,
+            max_output_bytes: options.max_output_bytes,
+            state: Rc::new(Cell::new(false)),
+            timeline: None,
+            video_timescale: 30,
+            video_frame_duration: 1,
+            video_codec: options.video_codec,
+            browser_video_tracks: Rc::new(RefCell::new(BTreeMap::new())),
+            browser_audio: Rc::new(RefCell::new(BrowserAudioTrack::new())),
+            cover_art: None,
+            cover_source: options.cover_source,
+        }
+    }
+
+    #[wasm_bindgen_test]
+    fn webm_output_refuses_audio_and_cover_art() {
+        let options = WasmCreateOptions::new(Some("webm".to_owned())).unwrap();
+        let mut output = browser_output(&options);
+        assert_error_code(&output.audio(0).err().unwrap(), "UNSUPPORTED");
+        let picture = Uint8Array::from(&[0xFF_u8, 0xD8, 0xFF][..]);
+        assert_error_code(
+            &output
+                .set_cover_art(Some(picture), Some("image/jpeg".to_owned()))
+                .unwrap_err(),
+            "UNSUPPORTED",
+        );
+        output.set_cover_art(None, None).unwrap();
+    }
+
+    /// The bundled AV1 sample's video track remuxed into WebM by
+    /// [`WebmMuxer`], as a recorder writing WebM would produce it.
+    async fn bundled_av1_as_webm() -> Vec<u8> {
+        const SAMPLE: &[u8] = include_bytes!("../examples/media/BigBuckBunny.av1.mp4");
+        let source = MemorySource::new(SAMPLE.to_vec());
+        let movie = crate::Mp4Demuxer::open(&source, crate::Mp4DemuxerOptions::default())
+            .await
+            .unwrap();
+        let track = movie
+            .tracks
+            .into_iter()
+            .find(|track| track.kind == crate::TrackKind::Video)
+            .unwrap();
+        let config = Mp4TrackConfig {
+            encoder: EncoderConfig {
+                codec: track.codec,
+                timescale: track.timescale,
+                decoder_config: track.decoder_config.clone(),
+            },
+            format: Mp4TrackFormat::Video(track.dimensions.unwrap()),
+        };
+        let mut muxer = WebmMuxer::new(MemorySink::new(), vec![config], 1_000_000)
+            .await
+            .unwrap();
+        for (index, sample) in track.samples.iter().enumerate() {
+            let mut data = vec![0; sample.size as usize];
+            track
+                .read_sample_into(&source, index, &mut data)
+                .await
+                .unwrap();
+            muxer
+                .write_sample(
+                    0,
+                    EncodedSample {
+                        data,
+                        dts: sample.dts as i64,
+                        pts: sample.pts,
+                        duration: sample.duration,
+                        is_sync: sample.is_sync,
+                        dependency: sample.dependency,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        muxer.finish().await.unwrap().into_inner()
+    }
+
+    async fn frame_pixels(video: &WasmVideoStream, index: u64) -> Vec<u8> {
+        let frame = JsFuture::from(video.get(BigInt::from(index).into(), None))
+            .await
+            .expect("an AV1 frame decodes through WebCodecs or the software fallback");
+        let pixels = Reflect::get(&frame, &JsValue::from_str("pixels")).unwrap();
+        pixels.unchecked_into::<Uint8Array>().to_vec()
+    }
+
+    /// Issue #526: `MediaInput.open` tells WebM from MP4 by its EBML
+    /// signature, and a WebM input answers `get(n)` with exactly the picture
+    /// the same AV1 track gives from MP4.
+    #[wasm_bindgen_test(async)]
+    async fn webm_input_is_detected_and_decodes_the_mp4_frames() {
+        const SAMPLE: &[u8] = include_bytes!("../examples/media/BigBuckBunny.av1.mp4");
+        let webm = bundled_av1_as_webm().await;
+        // A Blob typed as MP4 is still detected by its bytes.
+        let blob = make_blob(&webm, "video/mp4").unwrap();
+        let limit = Limits::default().max_allocation_bytes;
+        let from_webm = WasmMediaInput::open_inner(blob.into(), limit, None)
+            .await
+            .unwrap();
+        let from_mp4 = WasmMediaInput::open_inner(Uint8Array::from(SAMPLE).into(), limit, None)
+            .await
+            .unwrap();
+        assert_eq!(from_webm.container().unwrap().as_deref(), Some("webm"));
+        assert_eq!(from_mp4.container().unwrap().as_deref(), Some("mp4"));
+        let unknown =
+            WasmMediaInput::open_inner(Uint8Array::from(&[1_u8, 2, 3][..]).into(), limit, None)
+                .await
+                .unwrap();
+        assert_eq!(unknown.container().unwrap(), None);
+
+        let webm_video = from_webm.video(0).unwrap();
+        let mp4_video = from_mp4.video(0).unwrap();
+        let points = JsFuture::from(webm_video.random_access_points(None))
+            .await
+            .unwrap();
+        assert_eq!(Array::from(&points).length(), {
+            let points = JsFuture::from(mp4_video.random_access_points(None))
+                .await
+                .unwrap();
+            Array::from(&points).length()
+        });
+        for index in [2_u64, 0] {
+            assert_eq!(
+                frame_pixels(&webm_video, index).await,
+                frame_pixels(&mp4_video, index).await,
+                "frame {index} differs between containers"
+            );
+        }
+    }
+
+    /// Issue #526: the WebM the muxer writes plays in Chrome, which reads its
+    /// Cues to seek.
+    #[wasm_bindgen_test(async)]
+    async fn written_webm_plays_and_seeks_in_the_browser() {
+        let webm = bundled_av1_as_webm().await;
+        let blob = make_blob(&webm, "video/webm").unwrap();
+        let probe = JsFuture::from(probe_test_video(&blob, 2.0))
+            .await
+            .expect("the browser must load and seek the written WebM");
+        let probe = Array::from(&probe);
+        let value = |index: u32| probe.get(index).as_f64().unwrap();
+        let (duration, seekable_end, current_time, width) =
+            (value(0), value(1), value(2), value(3));
+        assert!(
+            duration.is_finite() && duration > 2.0,
+            "duration {duration}"
+        );
+        assert!(
+            (seekable_end - duration).abs() < 0.1,
+            "seekable to {seekable_end}"
+        );
+        assert!((current_time - 2.0).abs() < 0.1, "seeked to {current_time}");
+        assert!(width > 0.0);
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn put_encodes_through_webcodecs_into_a_webm_blob() {
+        if !video_encode_support(None, None).unwrap() {
+            // No WebCodecs AV1 encoder in this browser; nothing to verify here.
+            return;
+        }
+        let options = WasmCreateOptions::new(Some("webm".to_owned())).unwrap();
+        let mut output = browser_output(&options);
+        let video = output.video(0).unwrap();
+        let pixels = owned_u8_array(&[128_u8; 4 * 4 * 4]);
+        let frame = WasmVideoFrame::rgba(4, 4, pixels).unwrap();
+        for frame_index in 0..3_u64 {
+            JsFuture::from(video.put(BigInt::from(frame_index).into(), &frame, None))
+                .await
+                .expect("encoding a frame through WebCodecs must succeed");
+        }
+        let blob: Blob = JsFuture::from(output.finish())
+            .await
+            .unwrap()
+            .unchecked_into();
+        assert_eq!(blob.type_(), "video/webm");
+        let array_buffer = JsFuture::from(blob.array_buffer()).await.unwrap();
+        let source = MemorySource::new(Uint8Array::new(&array_buffer).to_vec());
+        let demuxer = crate::WebmDemuxer::open(&source, crate::WebmDemuxerOptions::default())
+            .await
+            .expect("the browser-encoded output must be a parseable WebM");
+        assert_eq!(demuxer.doc_type, "webm");
+        assert_eq!(demuxer.tracks.len(), 1);
+        assert_eq!(demuxer.tracks[0].codec, Codec::Av1);
+        assert_eq!(demuxer.tracks[0].samples.len(), 3);
+        assert!(!demuxer.cues.is_empty());
     }
 
     #[wasm_bindgen_test]

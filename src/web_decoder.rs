@@ -23,7 +23,7 @@ use crate::codec::{
 use crate::codec_config::{box_payload, derive_codec_string};
 use crate::io::MemorySource;
 use crate::media::{Codec, ColorRange, PixelFormat, VideoDimensions, VideoFrame};
-use crate::mp4_demux::{Mp4Demuxer, Mp4DemuxerOptions, Mp4Track};
+use crate::mp4_demux::Mp4Track;
 use crate::timeline::FrameIndex;
 use crate::{Error, ErrorKind, Limits, Result};
 use std::cell::RefCell;
@@ -76,17 +76,10 @@ pub(crate) fn js_to_promise(value: impl JsCast) -> js_sys::Promise {
     value.unchecked_into()
 }
 
+/// Indexes a video track of an MP4 or WebM input, whichever its signature says it is.
 async fn parse_video_track(source: &MemorySource, index: u32, limits: &Limits) -> Result<Mp4Track> {
-    let demuxer = Mp4Demuxer::open(
-        source,
-        Mp4DemuxerOptions {
-            limits: *limits,
-            ..Mp4DemuxerOptions::default()
-        },
-    )
-    .await?;
-    demuxer
-        .tracks
+    crate::container::open_tracks(source, limits)
+        .await?
         .into_iter()
         .filter(|track| track.kind == crate::codec::TrackKind::Video)
         .nth(index as usize)

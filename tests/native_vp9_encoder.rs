@@ -18,6 +18,7 @@ use zvidlib::{
     VideoDimensions, VideoEncoderConfig, VideoEncoderConformanceVector, VideoEncoderFactory,
     VideoFrame, native_vp9_video_encoder_factory, verify_video_encoder_conformance,
 };
+use zvidlib::{EncodedSample, WebmDemuxer, WebmDemuxerOptions, WebmMuxer};
 
 const WIDTH: u32 = 160;
 const HEIGHT: u32 = 90;
@@ -55,8 +56,9 @@ fn rgba_frame(index: u32) -> Vec<u8> {
     pixels
 }
 
-/// Encodes the test card into a VP9 MP4 with a key frame every five frames.
-fn encode_mp4() -> (Vec<u8>, Vec<u8>) {
+/// Encodes the test card with a key frame every five frames, returning the
+/// MP4 track declaration and the samples in decode order.
+fn encode_samples() -> (Mp4TrackConfig, Vec<EncodedSample>) {
     let limits = Limits::default();
     let dimensions = VideoDimensions::new(WIDTH, HEIGHT, &limits).unwrap();
     let configuration = VideoEncoderConfig {
@@ -77,8 +79,7 @@ fn encode_mp4() -> (Vec<u8>, Vec<u8>) {
         encoder: encoder.config().clone(),
         format: Mp4TrackFormat::Video(dimensions),
     };
-    let vpcc = encoder.config().decoder_config.clone();
-    let mut muxer = block_on(Mp4Muxer::new(MemorySink::new(), vec![track], 64)).unwrap();
+    let mut samples = Vec::new();
     for index in 0..FRAMES {
         let frame = VideoFrame::new(
             dimensions,
@@ -95,13 +96,53 @@ fn encode_mp4() -> (Vec<u8>, Vec<u8>) {
             frame: &frame,
             orientation: Orientation::TopLeft,
         });
-        for sample in block_on(encoder.encode(FrameIndex(u64::from(index)), source)).unwrap() {
-            block_on(muxer.write_sample(0, sample)).unwrap();
-        }
+        samples.extend(block_on(encoder.encode(FrameIndex(u64::from(index)), source)).unwrap());
     }
     assert!(block_on(encoder.finish()).unwrap().is_empty());
-    let bytes = block_on(muxer.finish()).unwrap().into_inner();
-    (bytes, vpcc)
+    (track, samples)
+}
+
+/// Encodes the test card into a VP9 MP4, returning it with its `vpcC`.
+fn encode_mp4() -> (Vec<u8>, Vec<u8>) {
+    let (track, samples) = encode_samples();
+    let vpcc = track.encoder.decoder_config.clone();
+    let mut muxer = block_on(Mp4Muxer::new(MemorySink::new(), vec![track], 64)).unwrap();
+    for sample in samples {
+        block_on(muxer.write_sample(0, sample)).unwrap();
+    }
+    (block_on(muxer.finish()).unwrap().into_inner(), vpcc)
+}
+
+/// Encodes the test card into a VP9 WebM.
+fn encode_webm() -> Vec<u8> {
+    let (track, samples) = encode_samples();
+    let mut muxer = block_on(WebmMuxer::new(MemorySink::new(), vec![track], 64)).unwrap();
+    for sample in samples {
+        block_on(muxer.write_sample(0, sample)).unwrap();
+    }
+    block_on(muxer.finish()).unwrap().into_inner()
+}
+
+#[test]
+fn vp9_webm_round_trips_through_the_demuxer() {
+    let (_, samples) = encode_samples();
+    let bytes = encode_webm();
+    let demuxer = block_on(WebmDemuxer::open(
+        &MemorySource::new(bytes),
+        WebmDemuxerOptions::default(),
+    ))
+    .unwrap();
+    assert_eq!(demuxer.tracks.len(), 1);
+    let track = &demuxer.tracks[0];
+    assert_eq!(track.codec, Codec::Vp9);
+    let derived = zvidlib::derive_codec_string(Codec::Vp9, &track.decoder_config).unwrap();
+    assert_eq!(derived.codec_string, "vp09.00.10.08");
+    assert_eq!(derived.profile, CodecProfile::Vp9Profile0);
+    assert_eq!(track.samples.len(), samples.len());
+    for (index, (indexed, sample)) in track.samples.iter().zip(&samples).enumerate() {
+        assert_eq!(indexed.is_sync, sample.is_sync, "sample {index}");
+        assert_eq!(indexed.size as usize, sample.data.len(), "sample {index}");
+    }
 }
 
 #[test]
@@ -152,7 +193,7 @@ fn ffmpeg_decoders() -> Vec<&'static str> {
         .collect()
 }
 
-fn decode_mp4(decoder: &str, path: &std::path::Path) -> Vec<u8> {
+fn decode_file(decoder: &str, path: &std::path::Path) -> Vec<u8> {
     let output = Command::new("ffmpeg")
         .args(["-v", "error", "-c:v", decoder, "-i"])
         .arg(path)
@@ -204,7 +245,7 @@ fn vp9_mp4_plays_in_independent_decoders() {
 
     let mut first: Option<Vec<u8>> = None;
     for decoder in decoders {
-        let decoded = decode_mp4(decoder, &path);
+        let decoded = decode_file(decoder, &path);
         let frame_size = (WIDTH * HEIGHT * 3) as usize;
         assert_eq!(decoded.len(), frame_size * FRAMES as usize, "{decoder}");
         for index in 0..FRAMES {
@@ -234,6 +275,34 @@ fn vp9_mp4_plays_in_independent_decoders() {
         }
     }
     let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn vp9_webm_plays_in_independent_decoders() {
+    let decoders = ffmpeg_decoders();
+    if decoders.is_empty() {
+        eprintln!("skipping independent VP9 decode because ffmpeg has no VP9 decoder");
+        return;
+    }
+    let mp4 = std::env::temp_dir().join(format!("zvidlib-vp9-{}-ref.mp4", std::process::id()));
+    let webm = std::env::temp_dir().join(format!("zvidlib-vp9-{}.webm", std::process::id()));
+    std::fs::write(&mp4, encode_mp4().0).unwrap();
+    std::fs::write(&webm, encode_webm()).unwrap();
+    for decoder in decoders {
+        // The same frames in either container decode to the same pictures.
+        let from_webm = decode_file(decoder, &webm);
+        assert_eq!(
+            from_webm.len(),
+            (WIDTH * HEIGHT * 3 * FRAMES) as usize,
+            "{decoder}"
+        );
+        assert!(
+            from_webm == decode_file(decoder, &mp4),
+            "{decoder} decodes the WebM differently from the MP4"
+        );
+    }
+    let _ = std::fs::remove_file(&mp4);
+    let _ = std::fs::remove_file(&webm);
 }
 
 fn ivf(frames: &[&[u8]], dimensions: VideoDimensions) -> Vec<u8> {

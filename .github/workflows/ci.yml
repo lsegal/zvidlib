@@ -162,6 +162,12 @@ jobs:
       # decoder, and runs the encoder conformance vector against libvpx (#528).
       - name: Test VP9 encoder output
         run: cargo test --features native --test native_vp9_encoder
+      # Remuxes the bundled AV1 sample into WebM and back, asserting the WebM
+      # index hands a decoder exactly the MP4's samples and frames, and that
+      # the written Cues are seekable (#526). Its ffprobe and ffmpeg check
+      # skips itself where those tools are not installed.
+      - name: Test the WebM container
+        run: cargo test --features native --test webm_container
       - name: Test AV1 SIMD motion compensation
         run: cargo test --features native --lib av1_mc -- --nocapture
       # `--release` is the profile #327 was reported against: nothing about the
