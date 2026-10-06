@@ -116,11 +116,31 @@ macro_rules! vectors {
 
 #[test]
 fn decodes_every_test_vector_exactly_as_libvpx_does() {
+    check_every_test_vector("detected");
+}
+
+/// The vectors again under every instruction set the host has, pinned through
+/// the crate-wide override, so the scalar reference and each vector arm are
+/// all held to libvpx rather than only whichever one detection picks
+/// (issue #568).
+#[test]
+fn every_instruction_set_decodes_every_test_vector_exactly_as_libvpx_does() {
+    let _guard = crate::simd::test_lock();
+    for isa in crate::simd::available() {
+        crate::simd::set_override(Some(isa));
+        assert_eq!(super::simd::active_isa(), isa);
+        check_every_test_vector(isa.name());
+    }
+    crate::simd::set_override(None);
+}
+
+fn check_every_test_vector(arm: &str) {
     let vectors = vectors!(
         "001", "002", "003", "004", "005", "006", "007", "008", "009", "010", "011", "012", "013",
         "014", "015", "016", "017", "018",
     );
     for (name, ivf, expected) in vectors {
+        let name = format!("{name} ({arm})");
         let expected: Vec<&str> = expected
             .lines()
             .filter_map(|line| line.split_whitespace().next())

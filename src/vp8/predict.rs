@@ -5,6 +5,12 @@
 //! Intermediate values are truncated to 16 bits wherever libvpx stores them
 //! in `short`, so even out-of-range coefficients reconstruct exactly as the
 //! reference decoder reconstructs them.
+//!
+//! The transforms, the sub-pixel filters, TM and subblock prediction run on
+//! the vector kernels in [`super::simd`] where the host has them; each
+//! `*_scalar` function here is the reference they are bit-exact with.
+
+use super::simd;
 
 /// A plane of 8-bit samples whose dimensions are whole macroblocks.
 #[derive(Clone, Debug)]
@@ -44,8 +50,39 @@ const COS_PI8_SQRT2_MINUS1: i32 = 20091;
 const SIN_PI8_SQRT2: i32 = 35468;
 
 /// Inverse 4x4 DCT of dequantized `coefficients` (raster order), added to the
-/// 4x4 block at `offset` of `plane`.
+/// 4x4 block at `offset` of `plane`, on the active instruction set.
 pub(crate) fn idct_add(coefficients: &[i16; 16], plane: &mut [u8], offset: usize, stride: usize) {
+    if !simd::idct_add(simd::active_isa(), coefficients, plane, offset, stride) {
+        idct_add_scalar(coefficients, plane, offset, stride);
+    }
+}
+
+/// [`idct_add`] of a block whose only nonzero coefficient is the DC, which
+/// adds the same rounded value to all 16 samples (libvpx's
+/// `vp8_dc_only_idct_add`).
+pub(crate) fn idct_dc_add(dc: i16, plane: &mut [u8], offset: usize, stride: usize) {
+    if !simd::idct_dc_add(simd::active_isa(), dc, plane, offset, stride) {
+        idct_dc_add_scalar(dc, plane, offset, stride);
+    }
+}
+
+/// The scalar reference for [`idct_dc_add`].
+pub(crate) fn idct_dc_add_scalar(dc: i16, plane: &mut [u8], offset: usize, stride: usize) {
+    let residual = (i32::from(dc) + 4) >> 3;
+    for row in 0..4 {
+        for sample in &mut plane[offset + row * stride..offset + row * stride + 4] {
+            *sample = clamp255(i32::from(*sample) + residual);
+        }
+    }
+}
+
+/// The scalar reference for [`idct_add`].
+pub(crate) fn idct_add_scalar(
+    coefficients: &[i16; 16],
+    plane: &mut [u8],
+    offset: usize,
+    stride: usize,
+) {
     let mut temp = [0i16; 16];
     for column in 0..4 {
         let i0 = i32::from(coefficients[column]);
@@ -86,6 +123,11 @@ pub(crate) fn idct_add(coefficients: &[i16; 16], plane: &mut [u8], offset: usize
 /// Inverse Walsh-Hadamard transform of the dequantized Y2 block, returning
 /// the DC coefficient of each of the 16 luma blocks in raster order.
 pub(crate) fn inverse_walsh(input: &[i16; 16]) -> [i16; 16] {
+    simd::inverse_walsh(simd::active_isa(), input).unwrap_or_else(|| inverse_walsh_scalar(input))
+}
+
+/// The scalar reference for [`inverse_walsh`].
+pub(crate) fn inverse_walsh_scalar(input: &[i16; 16]) -> [i16; 16] {
     let mut temp = [0i32; 16];
     for column in 0..4 {
         let i0 = i32::from(input[column]);
@@ -127,18 +169,6 @@ pub(crate) fn inverse_walsh(input: &[i16; 16]) -> [i16; 16] {
 pub(crate) struct Edges<const N: usize, const A: usize> {
     pub above: [u8; A],
     pub left: [u8; N],
-}
-
-impl<const N: usize, const A: usize> Edges<N, A> {
-    #[inline]
-    fn corner(&self) -> i32 {
-        i32::from(self.above[0])
-    }
-
-    #[inline]
-    fn top(&self, index: usize) -> i32 {
-        i32::from(self.above[index + 1])
-    }
 }
 
 /// Gathers a macroblock's prediction edges from the frame being decoded,
@@ -223,21 +253,59 @@ pub(crate) fn predict_block<const N: usize, const A: usize>(
             }
         }
         TM_PRED => {
-            let corner = edges.corner();
-            for row in 0..N {
-                let left = i32::from(edges.left[row]) - corner;
-                for column in 0..N {
-                    plane[offset + row * stride + column] = clamp255(left + edges.top(column));
-                }
+            let above = &edges.above[..=N];
+            if !simd::tm_block(
+                simd::active_isa(),
+                above,
+                &edges.left,
+                plane,
+                offset,
+                stride,
+            ) {
+                tm_block_scalar(above, &edges.left, plane, offset, stride);
             }
         }
         _ => unreachable!("macroblock intra modes are DC, V, H and TM"),
     }
 }
 
+/// TM prediction of the `N`x`N` block at `offset`, `N` being `left.len()`;
+/// `above` holds the pixel above-left at index 0. The scalar reference for
+/// [`simd::tm_block`].
+pub(crate) fn tm_block_scalar(
+    above: &[u8],
+    left: &[u8],
+    plane: &mut [u8],
+    offset: usize,
+    stride: usize,
+) {
+    let n = left.len();
+    let corner = i32::from(above[0]);
+    for (row, &left) in left.iter().enumerate() {
+        let left = i32::from(left) - corner;
+        for column in 0..n {
+            plane[offset + row * stride + column] = clamp255(left + i32::from(above[column + 1]));
+        }
+    }
+}
+
 /// Predicts one 4x4 luma subblock. `above` holds the pixel above-left, the
 /// four above and the four above-right; `left` the four to the left.
 pub(crate) fn predict_subblock(
+    mode: u8,
+    above: &[u8; 9],
+    left: &[u8; 4],
+    plane: &mut [u8],
+    offset: usize,
+    stride: usize,
+) {
+    if !simd::subblock(simd::active_isa(), mode, above, left, plane, offset, stride) {
+        predict_subblock_scalar(mode, above, left, plane, offset, stride);
+    }
+}
+
+/// The scalar reference for [`predict_subblock`].
+pub(crate) fn predict_subblock_scalar(
     mode: u8,
     above: &[u8; 9],
     left: &[u8; 4],
@@ -439,6 +507,49 @@ pub(crate) fn predict_inter(
     // identity, so a whole-sample displacement in one direction is exact.
     let horizontal = &filters[fraction_x];
     let vertical = &filters[fraction_y];
+    if !simd::filter_block(
+        simd::active_isa(),
+        &window,
+        window_width,
+        width,
+        height,
+        horizontal,
+        vertical,
+        &mut output.data,
+        destination,
+        stride,
+    ) {
+        filter_block_scalar(
+            &window,
+            window_width,
+            width,
+            height,
+            horizontal,
+            vertical,
+            &mut output.data,
+            destination,
+            stride,
+        );
+    }
+}
+
+/// The two sub-pixel filter passes of [`predict_inter`] over a gathered
+/// `window` of `width + 5` by `height + 5` samples: the horizontal filter over
+/// every window row, then the vertical filter into `output`. The scalar
+/// reference for [`simd::filter_block`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn filter_block_scalar(
+    window: &[u8],
+    window_width: usize,
+    width: usize,
+    height: usize,
+    horizontal: &[i32; 6],
+    vertical: &[i32; 6],
+    output: &mut [u8],
+    destination: usize,
+    stride: usize,
+) {
+    let window_height = height + 5;
     let mut first = [0u8; 16 * 21];
     for row in 0..window_height {
         let line = &window[row * window_width..];
@@ -458,7 +569,7 @@ pub(crate) fn predict_inter(
             for (tap_index, &tap) in vertical.iter().enumerate() {
                 sum += i32::from(first[(row + tap_index) * width + column]) * tap;
             }
-            output.data[destination + row * stride + column] = clamp255(sum >> 7);
+            output[destination + row * stride + column] = clamp255(sum >> 7);
         }
     }
 }
