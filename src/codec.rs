@@ -181,6 +181,14 @@ pub enum CodecProfile {
     /// VP8 has a single profile; the bitstream version each frame carries
     /// selects its reconstruction and loop filters.
     Vp8,
+    /// VP9 profile 0: 8-bit 4:2:0.
+    Vp9Profile0,
+    /// VP9 profile 1: 8-bit 4:2:2, 4:4:0 or 4:4:4.
+    Vp9Profile1,
+    /// VP9 profile 2: 10- or 12-bit 4:2:0.
+    Vp9Profile2,
+    /// VP9 profile 3: 10- or 12-bit 4:2:2, 4:4:0 or 4:4:4.
+    Vp9Profile3,
     AacLowComplexity,
 }
 

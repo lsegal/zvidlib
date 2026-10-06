@@ -16,9 +16,9 @@
 use zvidlib::{
     CancellationToken, Codec, CodecImplementation, CodecProfile, CodecSupport, ColorRange,
     EncodedVideoSample, ErrorKind, ExactFrameReader, ExpectedVideoFrame, FrameDigest, FrameIndex,
-    HardwarePreference, Limits, PixelFormat, VideoDecoderConfig, VideoDecoderConformanceVector,
-    VideoDecoderFactory, VideoDimensions, WebmDemuxer, native_vp8_video_decoder_factory,
-    verify_video_decoder_conformance,
+    HardwarePreference, Limits, PixelFormat, PreviewIndex, PreviewOptions, VideoDecoderConfig,
+    VideoDecoderConformanceVector, VideoDecoderFactory, VideoDimensions, WebmDemuxer,
+    native_vp8_video_decoder_factory, verify_video_decoder_conformance,
 };
 
 struct IvfFrame<'a> {
@@ -218,7 +218,12 @@ fn a_seek_decodes_through_a_hidden_key_frame() {
     let expected = sequential_digests(&factory, &configuration, &samples);
     assert_eq!(expected.len(), frames.len() - 1);
 
-    let shown = expected.len() as u64;
+    assert_every_order_matches(&factory, &configuration, &samples, &expected);
+}
+
+/// Sequential, reverse and alternating presentation orders over `shown`
+/// frames.
+fn access_orders(shown: u64) -> [Vec<u64>; 3] {
     let mut alternating = Vec::new();
     let (mut low, mut high) = (0, shown);
     while low < high {
@@ -229,16 +234,27 @@ fn a_seek_decodes_through_a_hidden_key_frame() {
             low += 1;
         }
     }
-    let cancellation = CancellationToken::new();
-    for order in [
-        (0..shown).collect::<Vec<_>>(),
+    [
+        (0..shown).collect(),
         (0..shown).rev().collect(),
         alternating,
-    ] {
+    ]
+}
+
+/// Reads every shown frame through a fresh `ExactFrameReader` in each order
+/// of [`access_orders`] and checks it against `expected`.
+fn assert_every_order_matches(
+    factory: &dyn VideoDecoderFactory,
+    configuration: &VideoDecoderConfig,
+    samples: &[EncodedVideoSample],
+    expected: &[FrameDigest],
+) {
+    let cancellation = CancellationToken::new();
+    for order in access_orders(expected.len() as u64) {
         let mut reader = ExactFrameReader::new(
-            &factory,
+            factory,
             configuration.clone(),
-            samples.clone(),
+            samples.to_vec(),
             Limits::default(),
         )
         .unwrap();
@@ -251,6 +267,65 @@ fn a_seek_decodes_through_a_hidden_key_frame() {
             );
         }
     }
+}
+
+#[test]
+fn a_webm_vp8_track_skips_its_hidden_alternate_references() {
+    // Issue #537: three of this track's 43 blocks are hidden alternate
+    // references. `src/vp8/tests.rs` holds the 40 shown frames to libvpx's
+    // MD5s.
+    let source = zvidlib::io::MemorySource::new(
+        include_bytes!("fixtures/codec/vp8/vp8_altref_98x66.webm").to_vec(),
+    );
+    let demuxer = block_on(WebmDemuxer::open(&source, Default::default())).unwrap();
+    let track = &demuxer.tracks[0];
+    assert_eq!(track.presentation_order.len(), 40);
+    assert_eq!(track.samples.len(), 43);
+    let samples = block_on(track.to_encoded_video_samples(&source, &Limits::default())).unwrap();
+    let mut identities: Vec<u64> = samples
+        .iter()
+        .map(|sample| sample.presentation_index.0)
+        .collect();
+    identities.sort_unstable();
+    assert_eq!(identities, (0..43).collect::<Vec<_>>());
+
+    let factory = native_vp8_video_decoder_factory();
+    let configuration = configuration(track.dimensions.unwrap());
+    let expected = sequential_digests(&factory, &configuration, &samples);
+    assert_eq!(expected.len(), 40);
+    assert_every_order_matches(&factory, &configuration, &samples, &expected);
+}
+
+#[test]
+fn a_preview_index_covers_only_the_shown_frames() {
+    // Issue #543: the three hidden alternate references are decode-only
+    // samples, so the index plans its slots over the 40 shown frames, and
+    // every slot it plans is one a decode fills.
+    let source = zvidlib::io::MemorySource::new(
+        include_bytes!("fixtures/codec/vp8/vp8_altref_98x66.webm").to_vec(),
+    );
+    let demuxer = block_on(WebmDemuxer::open(&source, Default::default())).unwrap();
+    let track = &demuxer.tracks[0];
+    let samples = block_on(track.to_encoded_video_samples(&source, &Limits::default())).unwrap();
+    assert_eq!(samples.len(), 43);
+    // One preview per frame, so a slot planned for a hidden sample's identity
+    // would show up in the total rather than vanish into a wider stride.
+    let options = PreviewOptions {
+        previews_per_second: 30,
+        ..PreviewOptions::for_frame_rate(30)
+    };
+    let index = PreviewIndex::with_frame_count(
+        &native_vp8_video_decoder_factory(),
+        configuration(track.dimensions.unwrap()),
+        samples,
+        track.presentation_order.len() as u64,
+        Limits::default(),
+        options,
+    )
+    .unwrap();
+    assert_eq!(index.store().stride(), 1);
+    index.wait_for_coverage();
+    assert_eq!(index.coverage(), (40, 40));
 }
 
 #[test]

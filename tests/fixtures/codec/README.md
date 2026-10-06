@@ -278,3 +278,79 @@ ffmpeg -c:v libvpx -i vp8_altref_98x66.ivf -f framemd5 - | grep -v '^#' \
 `src/vp8/tests.rs` compares every shown frame with libvpx's digest, and
 `tests/vp8_conformance.rs` holds a hardware VP8 decoder, where the host has
 one, to the software decoder's output and exact-frame seeks on it.
+
+`vp8/vp8_altref_98x66.webm` is a two-pass VP8 WebM encode of `testsrc2` with
+alternate references: 43 WebM blocks, three of which are hidden alternate
+reference frames (`show_frame` = 0) stored as blocks of their own, at the
+timestamp of the shown frame after them. `vp8_altref_98x66.webm.md5` is
+libvpx's decode of its 40 shown frames, one MD5 of each frame's I420 output per
+line. They were generated offline with
+
+```sh
+for pass in 1 2; do
+  ffmpeg -f lavfi -i "testsrc2=size=98x66:rate=25" -t 1.6 -c:v libvpx -g 16 \
+    -auto-alt-ref 1 -lag-in-frames 16 -b:v 300k -deadline good -pass $pass \
+    vp8_altref_98x66.webm
+done
+ffmpeg -c:v libvpx -i vp8_altref_98x66.webm -f framemd5 - | grep -v '^#' \
+  | awk -F', *' '{print $6}' > vp8_altref_98x66.webm.md5
+```
+
+(the first pass may write to the null muxer instead). `src/vp8/tests.rs`
+checks that `WebmDemuxer` presents only the shown frames and that each matches
+libvpx's digest, and `tests/vp8_conformance.rs` and the browser tests in
+`src/web_decoder.rs` read every shown frame back in sequential, reverse and
+alternating order, decoding through the hidden ones.
+
+`vp9_bbb_256x144.mp4` and `vp9_bbb_250x142.mp4` are VP9 profile 0 (8-bit
+4:2:0) tracks encoded by libvpx from the bundled sample, for the VP9 decoder
+(issue #527). The first is 48 frames at 256x144 in two groups of pictures,
+encoded in two passes so that libvpx codes hidden alternate reference frames,
+each carried in a superframe with the frame shown after it; the second is 12
+frames at 250x142, whose edges are not a multiple of 8. Both leave their colour
+space unspecified and use studio range. They were generated offline with
+FFmpeg 6.0's libvpx wrapper:
+
+```sh
+B=../../../examples/media/BigBuckBunny.mp4
+ffmpeg -ss 10 -i $B -an -frames:v 48 -vf scale=256:144 -pix_fmt yuv420p bbb.y4m
+ffmpeg -ss 20 -i $B -an -frames:v 12 -vf scale=250:142 -pix_fmt yuv420p bbb_odd.y4m
+A="-c:v libvpx-vp9 -auto-alt-ref 1 -deadline good -cpu-used 2 -row-mt 0"
+W="$A -b:v 200k -g 24 -keyint_min 24 -lag-in-frames 16 -arnr-maxframes 5"
+O="$A -b:v 150k -g 12 -keyint_min 12 -lag-in-frames 8"
+ffmpeg -i bbb.y4m $W -pass 1 -passlogfile a -f null /dev/null
+ffmpeg -i bbb.y4m $W -pass 2 -passlogfile a -movflags +faststart vp9_bbb_256x144.mp4
+ffmpeg -i bbb_odd.y4m $O -pass 1 -passlogfile b -f null /dev/null
+ffmpeg -i bbb_odd.y4m $O -pass 2 -passlogfile b -movflags +faststart vp9_bbb_250x142.mp4
+```
+
+Each `vp9_bbb_*_yuv420.sha256` holds one `FrameDigest` per presentation
+frame of libvpx's own decode of the fixture, hashed as
+`big_buck_bunny_av1_yuv420.sha256` above, and each `vp9_bbb_*_rgba.sha256` the
+`Rgba8` digests of the same frames after this crate's BT.601
+`convert_to_rgba8`, the conversion `native_vp9_video_decoder_factory` applies to
+a stream that does not name its colour space:
+
+```sh
+ffmpeg -c:v libvpx-vp9 -i vp9_bbb_256x144.mp4 -fps_mode passthrough \
+  -f rawvideo -pix_fmt yuv420p ref.yuv
+```
+
+`src/vp9_dec/tests.rs` compares the decoder's YUV output with the first and
+`tests/codec_conformance.rs` and the browser fallback test in
+`src/web_decoder.rs` the factory's RGBA output with the second. As above, FFmpeg
+and libvpx are only the offline fixture generators and are not build, test, or
+runtime dependencies.
+
+`libvpx_vp9_test_vectors.txt` lists the VP9 profile 0 test vectors of libvpx's
+own test suite (the `vp90-2-*` names of libvpx's `test/test_vectors.cc`).
+They are not checked in: CI downloads each, with the `.md5` file of per-frame
+digests libvpx's test harness checks, from the WebM project's test-data bucket
+and runs the ignored `vp9_dec::tests::libvpx_test_vectors` test over them, which
+reads the WebM and IVF files directly and requires every shown frame's MD5 to
+match libvpx's.
+
+`vp9_bbb_256x144.webm` is `vp9_bbb_256x144.mp4` remuxed to WebM without
+re-encoding (`ffmpeg -i vp9_bbb_256x144.mp4 -c copy vp9_bbb_256x144.webm`), a
+`V_VP9` track with no `CodecPrivate`; `src/vp9_dec/tests.rs` checks that
+`WebmDemuxer` yields the same chunks and that they decode to the same digests.

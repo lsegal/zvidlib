@@ -63,9 +63,11 @@ fn codec_description(codec: Codec, decoder_config: &[u8]) -> Result<&[u8]> {
         Codec::Av1 => box_payload(decoder_config, b"av1C"),
         // WebCodecs' VP8 registration takes no description.
         Codec::Vp8 => Ok(&[]),
+        // Nor does VP9's: its bitstream describes itself.
+        Codec::Vp9 => Ok(&[]),
         Codec::UncompressedVideo | Codec::H264 | Codec::Aac => Err(Error::new(
             ErrorKind::Unsupported,
-            "only HEVC, AV1 and VP8 have a WebCodecs decoder backend",
+            "only HEVC, AV1, VP8 and VP9 have a WebCodecs decoder backend",
         )),
     }
 }
@@ -212,7 +214,8 @@ impl WebVideoDecodeSession {
         };
 
         let samples = track.to_encoded_video_samples(&source, limits).await?;
-        let frame_count = samples.len() as u64;
+        // A decode-only sample, such as a hidden VP8 frame, is not a frame.
+        let frame_count = track.presentation_order.len() as u64;
         let backend = if webcodecs_supported {
             DecodeBackend::WebCodecs(WebCodecsDecoder::open(config, samples, limits)?)
         } else {
@@ -289,9 +292,10 @@ fn software_decoder_factory(codec: Codec) -> Result<Box<dyn VideoDecoderFactory>
         Codec::Hevc => Ok(Box::new(crate::native_hevc_video_decoder_factory())),
         Codec::Av1 => Ok(Box::new(crate::native_av1_video_decoder_factory())),
         Codec::Vp8 => Ok(Box::new(crate::native_vp8_video_decoder_factory())),
+        Codec::Vp9 => Ok(Box::new(crate::native_vp9_video_decoder_factory())),
         Codec::UncompressedVideo | Codec::H264 | Codec::Aac => Err(Error::new(
             ErrorKind::Unsupported,
-            "only HEVC, AV1 and VP8 have a software decoder backend",
+            "only HEVC, AV1, VP8 and VP9 have a software decoder backend",
         )),
     }
 }
@@ -303,25 +307,27 @@ struct SoftwareDecoder {
 }
 
 impl SoftwareDecoder {
-    /// `hevc_profile` is the profile the track's `hvcC` names, so a Main 10
-    /// track is opened as Main 10 (issue #508).
+    /// `profile` is the profile the track's configuration box names, so an
+    /// HEVC Main 10 track is opened as Main 10 (issue #508) and a VP9 track
+    /// as the VP9 profile its `vpcC` declares.
     fn open(
         track: &Mp4Track,
-        hevc_profile: CodecProfile,
+        profile: CodecProfile,
         dimensions: VideoDimensions,
         samples: Vec<EncodedVideoSample>,
         limits: &Limits,
     ) -> Result<Self> {
         let factory = software_decoder_factory(track.codec)?;
         // The HEVC decoder only accepts limited-range input, while the AV1
-        // decoder reports whatever range the sequence header signals and the
+        // and VP9 decoders report whatever range the stream signals and the
         // reader holds every frame to the configured one.
         let (profile, color_range) = match track.codec {
             Codec::Av1 => (
                 CodecProfile::Av1Main,
                 av1_color_range(track, &samples, limits),
             ),
-            _ => (hevc_profile, ColorRange::Limited),
+            Codec::Vp9 => (profile, vp9_color_range(track, &samples)),
+            _ => (profile, ColorRange::Limited),
         };
         // The decoders validate the configuration record itself, so a stream
         // they cannot decode (colour AV1, say) is refused here, at open,
@@ -378,6 +384,26 @@ fn av1_color_range(
     match sequence {
         Some(sequence) if sequence.color_config.color_range => ColorRange::Full,
         _ => ColorRange::Limited,
+    }
+}
+
+/// The colour range a VP9 track's first key frame signals, which is what
+/// its pictures are decoded in. The `vpcC` box's `videoFullRangeFlag` stands
+/// in when the first sample does not parse, and limited range when neither
+/// says, which leaves the reader to reject the first frame that disagrees.
+fn vp9_color_range(track: &Mp4Track, samples: &[EncodedVideoSample]) -> ColorRange {
+    let full = samples
+        .first()
+        .and_then(|sample| crate::vp9_dec::chunk_full_range(&sample.data))
+        .or_else(|| {
+            crate::Vp9CodecConfig::parse(&track.decoder_config)
+                .ok()
+                .map(|config| config.video_full_range)
+        });
+    if full == Some(true) {
+        ColorRange::Full
+    } else {
+        ColorRange::Limited
     }
 }
 
@@ -1258,6 +1284,81 @@ mod tests {
         }
     }
 
+    /// Issue #527: a VP9 track (libvpx's two-pass encode of the bundled
+    /// sample, whose superframes carry hidden alternate reference frames)
+    /// decodes through the fallback to exactly the frames libvpx decodes it
+    /// to, converted by the crate's BT.601 RGBA conversion - the lines of
+    /// `tests/fixtures/codec/vp9_bbb_256x144_rgba.sha256` the native
+    /// conformance test checks. Frame 30 is reached from the key frame at 24,
+    /// and frame 3 by restarting at 0.
+    #[wasm_bindgen_test(async)]
+    async fn software_fallback_decodes_vp9_like_libvpx() {
+        const VP9: &[u8] = include_bytes!("../tests/fixtures/codec/vp9_bbb_256x144.mp4");
+        let expected: Vec<&str> =
+            include_str!("../tests/fixtures/codec/vp9_bbb_256x144_rgba.sha256")
+                .lines()
+                .map(|line| line.split_once(' ').unwrap().1)
+                .collect();
+        let mut session = WebVideoDecodeSession::open_with(
+            VP9,
+            0,
+            &Limits::default(),
+            BackendChoice::SoftwareOnly,
+        )
+        .await
+        .unwrap();
+        assert!(session.is_software());
+        assert_eq!(session.frame_count(), 48);
+        for frame in [0_u64, 1, 30, 3] {
+            let (dimensions, rgba) = session
+                .get(FrameIndex(frame), &CancellationToken::new())
+                .await
+                .unwrap();
+            assert_eq!((dimensions.width, dimensions.height), (256, 144));
+            assert_eq!(
+                digest(dimensions, rgba),
+                expected[frame as usize],
+                "frame {frame}"
+            );
+        }
+    }
+
+    /// The same VP9 track opened the ordinary way, through `WebCodecs` with a
+    /// `vp09.00.LL.08` codec string wherever the browser decodes VP9, and the
+    /// fallback otherwise. Either way it yields whole RGBA frames of the
+    /// track's size.
+    #[wasm_bindgen_test(async)]
+    async fn vp9_tracks_decode_through_webcodecs_or_the_fallback() {
+        const VP9: &[u8] = include_bytes!("../tests/fixtures/codec/vp9_bbb_256x144.mp4");
+        let source = MemorySource::new(VP9.to_vec());
+        let track = parse_video_track(&source, 0, &Limits::default())
+            .await
+            .unwrap();
+        let derived = derive_codec_string(track.codec, &track.decoder_config).unwrap();
+        assert!(
+            derived.codec_string.starts_with("vp09.00."),
+            "{}",
+            derived.codec_string
+        );
+        assert!(
+            derived.codec_string.ends_with(".08"),
+            "{}",
+            derived.codec_string
+        );
+
+        let mut session = WebVideoDecodeSession::open(VP9, 0, &Limits::default())
+            .await
+            .unwrap();
+        for frame in [0_u64, 47, 12] {
+            let (dimensions, rgba) = session
+                .get(FrameIndex(frame), &CancellationToken::new())
+                .await
+                .unwrap();
+            assert_eq!((dimensions.width, dimensions.height), (256, 144));
+            assert_eq!(rgba.len(), 256 * 144 * 4, "frame {frame}");
+        }
+    }
+
     /// A track neither `WebCodecs` nor the software decoder can take is still
     /// reported `Unsupported`, naming why the fallback refused it. The software
     /// AV1 decoder covers 8-bit streams, so a 10-bit Main track is refused.
@@ -1281,5 +1382,109 @@ mod tests {
             "{}",
             error.message()
         );
+    }
+
+    const VP8_ALTREF: &[u8] = include_bytes!("../tests/fixtures/codec/vp8/vp8_altref_98x66.webm");
+
+    /// Issue #537: three of this WebM track's 43 VP8 blocks are hidden
+    /// alternate references. The session counts only its 40 shown frames and
+    /// decodes through the hidden ones to reach any of them, in sequential,
+    /// reverse and alternating order, on either backend. The software
+    /// fallback matches a straight decode of every sample with the native
+    /// decoder; `WebCodecs` converts to RGBA its own way, so it has to match a
+    /// sequential read of a fresh `WebCodecs` session.
+    #[wasm_bindgen_test(async)]
+    async fn hidden_vp8_frames_are_decoded_through_but_not_counted() {
+        let limits = Limits::default();
+        let cancellation = CancellationToken::new();
+        let source = MemorySource::new(VP8_ALTREF.to_vec());
+        let track = parse_video_track(&source, 0, &limits).await.unwrap();
+        let samples = track
+            .to_encoded_video_samples(&source, &limits)
+            .await
+            .unwrap();
+        assert_eq!(samples.len(), 43);
+        let factory = crate::native_vp8_video_decoder_factory();
+        let configuration = VideoDecoderConfig {
+            codec: track.codec,
+            profile: CodecProfile::Vp8,
+            coded_dimensions: track.dimensions.unwrap(),
+            output_format: PixelFormat::Rgba8,
+            color_range: ColorRange::Limited,
+            hardware: HardwarePreference::Avoid,
+            configuration: Vec::new(),
+        };
+        let mut decoder = factory.create(&configuration, &limits).unwrap();
+        let mut native = vec![String::new(); 40];
+        for sample in &samples {
+            for output in decoder.submit(sample, &cancellation).unwrap() {
+                native[output.presentation_index.0 as usize] =
+                    crate::conformance::FrameDigest::from_frame(&output.frame)
+                        .unwrap()
+                        .to_hex();
+            }
+        }
+        assert!(native.iter().all(|digest| !digest.is_empty()));
+        assert_eq!(
+            video_frame_durations_ms(VP8_ALTREF, 0, &limits)
+                .await
+                .unwrap()
+                .len(),
+            40
+        );
+
+        let mut alternating = Vec::new();
+        let (mut low, mut high) = (0, 40);
+        while low < high {
+            high -= 1;
+            alternating.push(high);
+            if low < high {
+                alternating.push(low);
+                low += 1;
+            }
+        }
+        let orders = [
+            (0..40).collect::<Vec<u64>>(),
+            (0..40).rev().collect(),
+            alternating,
+        ];
+
+        let webcodecs = WebVideoDecodeSession::open(VP8_ALTREF, 0, &limits)
+            .await
+            .unwrap();
+        let expected = if webcodecs.is_software() {
+            native.clone()
+        } else {
+            let mut session = webcodecs;
+            let mut digests = Vec::new();
+            for index in 0..40 {
+                let (dimensions, rgba) =
+                    session.get(FrameIndex(index), &cancellation).await.unwrap();
+                digests.push(digest(dimensions, rgba));
+            }
+            digests
+        };
+        for (choice, expected) in [
+            (BackendChoice::SoftwareOnly, &native),
+            (BackendChoice::Automatic, &expected),
+        ] {
+            for order in &orders {
+                let mut session = WebVideoDecodeSession::open_with(VP8_ALTREF, 0, &limits, choice)
+                    .await
+                    .unwrap();
+                assert_eq!(session.frame_count(), 40);
+                for &index in order {
+                    let (dimensions, rgba) = session
+                        .get(FrameIndex(index), &cancellation)
+                        .await
+                        .unwrap_or_else(|error| panic!("{choice:?} frame {index}: {error}"));
+                    assert_eq!(
+                        digest(dimensions, rgba),
+                        expected[index as usize],
+                        "{choice:?} frame {index}"
+                    );
+                }
+            }
+        }
     }
 }

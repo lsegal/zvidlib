@@ -256,6 +256,7 @@ fn validate_track_config(config: &Mp4TrackConfig) -> Result<()> {
         Codec::H264 => b"avcC",
         Codec::Hevc => b"hvcC",
         Codec::Av1 => b"av1C",
+        Codec::Vp9 => b"vpcC",
         Codec::Aac => b"esds",
         // VP8-in-MP4 is not a standard mapping; VP8 is carried in WebM.
         Codec::Vp8 => return Err(invalid("VP8 is not an MP4 output codec")),
@@ -264,7 +265,7 @@ fn validate_track_config(config: &Mp4TrackConfig) -> Result<()> {
         return Err(invalid("codec configuration box type is incompatible"));
     }
     match (config.encoder.codec, config.format) {
-        (Codec::H264 | Codec::Hevc | Codec::Av1, Mp4TrackFormat::Video(_))
+        (Codec::H264 | Codec::Hevc | Codec::Av1 | Codec::Vp9, Mp4TrackFormat::Video(_))
         | (Codec::Aac, Mp4TrackFormat::Audio { .. }) => Ok(()),
         _ => Err(invalid("codec and MP4 track kind are incompatible")),
     }
@@ -568,6 +569,7 @@ fn video_sample_entry(track: &TrackState, dimensions: VideoDimensions) -> Result
             Codec::H264 => *b"avc1",
             Codec::Hevc => *b"hvc1",
             Codec::Av1 => *b"av01",
+            Codec::Vp9 => *b"vp09",
             Codec::Aac => return Err(internal("AAC used for a video sample entry")),
             Codec::Vp8 => return Err(internal("VP8 used for an MP4 video sample entry")),
         },

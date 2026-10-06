@@ -70,7 +70,10 @@ pub struct Mp4Track {
     pub edits: Vec<EditMapping>,
     /// Samples in decode order.
     pub samples: Vec<Mp4Sample>,
-    /// Decode-order indexes sorted by PTS, then DTS, then decode index.
+    /// Decode-order indexes of the presentation frames, sorted by PTS, then
+    /// DTS, then decode index. A decode-only sample, such as a hidden VP8
+    /// frame stored as a WebM block of its own, is decoded on the way to the
+    /// frames after it but is never presented, so it is not listed.
     pub presentation_order: Vec<usize>,
 }
 
@@ -105,8 +108,11 @@ impl Mp4Track {
     ///
     /// The zero-based position of each sample within
     /// [`Self::presentation_order`] becomes its `presentation_index`, and
-    /// `is_sync` becomes `random_access`. Total decoded sample bytes are
-    /// bounded by `limits.max_allocation_bytes`.
+    /// `is_sync` becomes `random_access`. A decode-only sample, which
+    /// `presentation_order` does not list, takes an identity past the last
+    /// presentation frame, in decode order, so it never collides with a frame
+    /// a caller asks for. Total decoded sample bytes are bounded by
+    /// `limits.max_allocation_bytes`.
     pub async fn to_encoded_video_samples<S: ByteSource + ?Sized>(
         &self,
         source: &S,
@@ -115,12 +121,25 @@ impl Mp4Track {
         if self.kind != TrackKind::Video {
             return Err(unsupported("encoded video samples require a video track"));
         }
-        let mut presentation_index_by_decode = vec![0_u64; self.samples.len()];
+        let mut presentation_index_by_decode = vec![None; self.samples.len()];
         for (presentation_index, &decode_index) in self.presentation_order.iter().enumerate() {
             let presentation_index = u64::try_from(presentation_index)
                 .map_err(|_| limit("presentation index overflow"))?;
-            presentation_index_by_decode[decode_index] = presentation_index;
+            *presentation_index_by_decode
+                .get_mut(decode_index)
+                .ok_or_else(|| malformed("presentation order references a missing sample"))? =
+                Some(presentation_index);
         }
+        let mut next_decode_only = self.presentation_order.len() as u64;
+        let presentation_index_by_decode: Vec<u64> = presentation_index_by_decode
+            .into_iter()
+            .map(|index| {
+                index.unwrap_or_else(|| {
+                    next_decode_only += 1;
+                    next_decode_only - 1
+                })
+            })
+            .collect();
 
         let mut total_bytes = 0_u64;
         let mut samples = Vec::with_capacity(self.samples.len());
@@ -859,6 +878,7 @@ fn parse_stsd(
         b"avc1" | b"avc3" => (Codec::H264, 78, TrackKind::Video),
         b"hvc1" | b"hev1" => (Codec::Hevc, 78, TrackKind::Video),
         b"av01" => (Codec::Av1, 78, TrackKind::Video),
+        b"vp09" => (Codec::Vp9, 78, TrackKind::Video),
         b"mp4a" => (Codec::Aac, 28, TrackKind::Audio),
         _ => return Err(unsupported("unsupported MP4 sample entry")),
     };
@@ -883,6 +903,7 @@ fn parse_stsd(
         Codec::H264 => b"avcC",
         Codec::Hevc => b"hvcC",
         Codec::Av1 => b"av1C",
+        Codec::Vp9 => b"vpcC",
         Codec::Aac => b"esds",
         Codec::UncompressedVideo | Codec::Vp8 => {
             return Err(unsupported(
@@ -2224,6 +2245,88 @@ mod tests {
         .unwrap();
         assert_eq!(demuxer.tracks[0].codec, Codec::H264);
         assert_eq!(demuxer.tracks[0].decoder_config, avcc_box());
+    }
+
+    #[test]
+    fn vp9_vp09_track_round_trips_through_the_muxer_and_demuxer() {
+        use crate::io::MemorySink;
+        use crate::mp4::{Mp4Muxer, Mp4TrackConfig, Mp4TrackFormat};
+        // vpcC version 1: profile 0, level 3.0, 8-bit colocated 4:2:0.
+        let vpcc = full_box(b"vpcC", 1, 0, &[0, 30, 0x82, 1, 1, 1, 0, 0]);
+        let samples: Vec<crate::EncodedSample> = (0..3_u8)
+            .map(|index| crate::EncodedSample {
+                data: vec![index + 1; 10],
+                dts: i64::from(index) * 512,
+                pts: i64::from(index) * 512,
+                duration: 512,
+                is_sync: index == 0,
+                dependency: SampleDependency::INDEPENDENT,
+            })
+            .collect();
+        let bytes = block_on(async {
+            let mut muxer = Mp4Muxer::new(
+                MemorySink::new(),
+                vec![Mp4TrackConfig {
+                    encoder: crate::EncoderConfig {
+                        codec: Codec::Vp9,
+                        timescale: 15_360,
+                        decoder_config: vpcc.clone(),
+                    },
+                    format: Mp4TrackFormat::Video(VideoDimensions {
+                        width: 320,
+                        height: 180,
+                    }),
+                }],
+                16,
+            )
+            .await
+            .unwrap();
+            for sample in &samples {
+                muxer.write_sample(0, sample.clone()).await.unwrap();
+            }
+            muxer.finish().await.unwrap().into_inner()
+        });
+        assert!(bytes.windows(4).any(|window| window == b"vp09"));
+
+        let source = MemorySource::new(bytes);
+        let demuxer = block_on(Mp4Demuxer::open(&source, Mp4DemuxerOptions::default())).unwrap();
+        let track = &demuxer.tracks[0];
+        assert_eq!(track.codec, Codec::Vp9);
+        assert_eq!(track.decoder_config, vpcc);
+        assert_eq!(
+            track.dimensions,
+            Some(VideoDimensions {
+                width: 320,
+                height: 180
+            })
+        );
+        let read = block_on(track.to_encoded_video_samples(&source, &Limits::default())).unwrap();
+        assert_eq!(read.len(), 3);
+        assert!(read[0].random_access && !read[1].random_access);
+        assert_eq!(read[2].data, samples[2].data);
+
+        let derived =
+            crate::codec_config::derive_codec_string(track.codec, &track.decoder_config).unwrap();
+        assert_eq!(derived.codec_string, "vp09.00.30.08");
+        assert_eq!(derived.profile, crate::CodecProfile::Vp9Profile0);
+    }
+
+    #[test]
+    fn libvpx_vp9_mp4_exposes_its_vpcc_configuration() {
+        let source = MemorySource::new(
+            include_bytes!("../tests/fixtures/codec/vp9_bbb_256x144.mp4").to_vec(),
+        );
+        let demuxer = block_on(Mp4Demuxer::open(&source, Mp4DemuxerOptions::default())).unwrap();
+        let track = &demuxer.tracks[0];
+        assert_eq!(track.codec, Codec::Vp9);
+        let config = crate::Vp9CodecConfig::parse(&track.decoder_config).unwrap();
+        assert_eq!((config.profile, config.bit_depth), (0, 8));
+        assert!(config.is_420());
+        assert_eq!(track.samples.len(), 48);
+        assert_eq!(
+            track.samples.iter().filter(|sample| sample.is_sync).count(),
+            2
+        );
     }
 
     #[test]

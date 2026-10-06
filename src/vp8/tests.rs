@@ -242,7 +242,7 @@ fn decodes_a_webm_vp8_track_exactly_as_libvpx_does() {
 }
 
 /// The Media Foundation backend on its own, held to the software decoder for
-/// every frame of the vectors and the WebM fixture, sequentially and through
+/// every frame of the vectors and the WebM fixtures, sequentially and through
 /// `ExactFrameReader`'s seeks.
 ///
 /// `tests/vp8_conformance.rs` checks whichever backend the factory selects,
@@ -331,12 +331,21 @@ fn media_foundation_vp8_matches_the_software_decoder_and_seeks_exactly() {
             .collect::<Vec<_>>();
         streams.push((name, configuration(width, height), samples));
     }
-    let webm = crate::io::MemorySource::new(
-        include_bytes!("../../tests/fixtures/codec/vp8/vp8_testsrc2_98x66.webm").to_vec(),
-    );
-    let demuxer = block_on(crate::WebmDemuxer::open(&webm, Default::default())).unwrap();
-    let samples = block_on(demuxer.tracks[0].to_encoded_video_samples(&webm, &limits)).unwrap();
-    streams.push(("VP8 in WebM", configuration(98, 66), samples));
+    for (name, file) in [
+        (
+            "VP8 in WebM",
+            &include_bytes!("../../tests/fixtures/codec/vp8/vp8_testsrc2_98x66.webm")[..],
+        ),
+        (
+            "VP8 in WebM with hidden alternate references",
+            &include_bytes!("../../tests/fixtures/codec/vp8/vp8_altref_98x66.webm")[..],
+        ),
+    ] {
+        let webm = crate::io::MemorySource::new(file.to_vec());
+        let demuxer = block_on(crate::WebmDemuxer::open(&webm, Default::default())).unwrap();
+        let samples = block_on(demuxer.tracks[0].to_encoded_video_samples(&webm, &limits)).unwrap();
+        streams.push((name, configuration(98, 66), samples));
+    }
 
     let cancellation = CancellationToken::new();
     let software = native_vp8_video_decoder_factory();
@@ -378,4 +387,44 @@ fn media_foundation_vp8_matches_the_software_decoder_and_seeks_exactly() {
         verify_video_decoder_conformance(&MediaFoundation, &vector, limits)
             .unwrap_or_else(|error| panic!("{name}: {error}"));
     }
+}
+
+#[test]
+fn skips_a_webm_vp8_tracks_hidden_alternate_references_as_libvpx_does() {
+    // Issue #537: a two-pass FFmpeg libvpx encode with alternate references,
+    // whose hidden frames are WebM blocks of their own. libvpx's MD5s list
+    // only the shown frames; see `tests/fixtures/codec/README.md`.
+    let source = crate::io::MemorySource::new(
+        include_bytes!("../../tests/fixtures/codec/vp8/vp8_altref_98x66.webm").to_vec(),
+    );
+    let expected: Vec<&str> =
+        include_str!("../../tests/fixtures/codec/vp8/vp8_altref_98x66.webm.md5")
+            .lines()
+            .collect();
+    assert_eq!(expected.len(), 40);
+    let demuxer = block_on(crate::WebmDemuxer::open(&source, Default::default())).unwrap();
+    let track = &demuxer.tracks[0];
+    assert_eq!(track.presentation_order.len(), expected.len());
+    assert_eq!(track.samples.len(), 43);
+    let samples = block_on(track.to_encoded_video_samples(&source, &Limits::default())).unwrap();
+    let mut decoder = Decoder::new(Limits::default());
+    let mut next_shown = 0;
+    let mut next_hidden = expected.len() as u64;
+    for sample in &samples {
+        let shown = sample.data[0] & 0x10 != 0;
+        let counter = if shown {
+            &mut next_shown
+        } else {
+            &mut next_hidden
+        };
+        assert_eq!(sample.presentation_index.0, *counter);
+        *counter += 1;
+        let picture = decoder.decode(&sample.data).unwrap();
+        assert_eq!(picture.is_some(), shown);
+        if let Some(picture) = picture {
+            let index = sample.presentation_index.0 as usize;
+            assert_eq!(i420_md5(&picture), expected[index], "frame {index}");
+        }
+    }
+    assert_eq!((next_shown, next_hidden), (40, 43));
 }
