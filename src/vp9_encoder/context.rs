@@ -5,21 +5,29 @@
 //! `vp9_adapt_mode_probs` and `vp9_adapt_mv_probs`).
 //!
 //! The context holds only the probabilities this encoder's coding tools read.
-//! The rest (larger transforms, compound references, switchable filters,
-//! transform sizes, high-precision vectors) is never coded, counted or
-//! updated, so it keeps its default value in the decoder too.
+//! The rest (compound references, switchable filters, high-precision vectors)
+//! is never coded, counted or updated, so it keeps its default value in the
+//! decoder too.
 
 use super::frame::{
     INTER_MODE_TREE, INTRA_MODE_TREE, MV_CLASS_TREE, MV_FP_TREE, MV_JOINT_TREE, PARTITION_TREE,
 };
 use super::tables::{
-    COEF_PROBS_4X4, IF_UV_MODE_PROBS, IF_Y_MODE_PROBS, INTER_MODE_PROBS, INTRA_INTER_PROBS,
-    PARTITION_PROBS, SINGLE_REF_PROBS, SKIP_PROBS,
+    IF_UV_MODE_PROBS, IF_Y_MODE_PROBS, INTER_MODE_PROBS, INTRA_INTER_PROBS, PARTITION_PROBS,
+    SINGLE_REF_PROBS, SKIP_PROBS, TX_PROBS_8X8, TX_PROBS_16X16, TX_PROBS_32X32,
 };
+use crate::vp9_dec::tables as shared;
 
-/// The number of 4x4 coefficient probability contexts:
-/// `[plane type 2][reference 2][band 6][context 6]`.
-pub(super) const COEF_CONTEXTS: usize = 144;
+/// One transform size's coefficient model probabilities:
+/// `[plane type 2][reference 2][band 6][context 6][node 3]`.
+pub(super) type CoefProbs = [[[[[u8; 3]; 6]; 6]; 2]; 2];
+
+/// One transform size's token counts, laid out like [`CoefProbs`]: ZERO, ONE,
+/// larger and end-of-block tokens per context.
+type CoefCounts = [[[[[u32; 4]; 6]; 6]; 2]; 2];
+
+/// One transform size's end-of-block node counts per context.
+type EobCounts = [[[[u32; 6]; 6]; 2]; 2];
 
 /// The probabilities of one motion vector component.
 #[derive(Clone, Copy)]
@@ -52,13 +60,19 @@ const DEFAULT_MV_COMPONENT_PROBS: [MvComponentProbs; 2] = [
     },
 ];
 
-/// The probabilities a frame codes its partitions, modes, motion vectors and
-/// 4x4 coefficient tokens with. Key frames read their partitions and modes
-/// from fixed tables instead.
+/// The probabilities a frame codes its partitions, modes, transform sizes,
+/// motion vectors and coefficient tokens with. Key frames read their
+/// partitions and modes from fixed tables instead.
 #[derive(Clone)]
 pub(super) struct FrameContext {
-    /// `[plane type 2][reference 2][band 6][context 6][node 3]`.
-    pub(super) coef: [u8; COEF_CONTEXTS * 3],
+    /// Indexed by transform size, 4x4 to 32x32.
+    pub(super) coef: [CoefProbs; 4],
+    /// Transform size probabilities for blocks whose largest transform is
+    /// 8x8 (`[context 2][node 1]`), 16x16 (`[context 2][node 2]`) and 32x32
+    /// (`[context 2][node 3]`).
+    pub(super) tx_8x8: [u8; 2],
+    pub(super) tx_16x16: [u8; 4],
+    pub(super) tx_32x32: [u8; 6],
     pub(super) skip: [u8; 3],
     /// `[mode context 7][node 3]`.
     pub(super) inter_mode: [u8; 21],
@@ -78,7 +92,15 @@ pub(super) struct FrameContext {
 impl Default for FrameContext {
     fn default() -> Self {
         Self {
-            coef: COEF_PROBS_4X4,
+            coef: [
+                shared::DEFAULT_COEF_PROBS_4X4,
+                shared::DEFAULT_COEF_PROBS_8X8,
+                shared::DEFAULT_COEF_PROBS_16X16,
+                shared::DEFAULT_COEF_PROBS_32X32,
+            ],
+            tx_8x8: TX_PROBS_8X8,
+            tx_16x16: TX_PROBS_16X16,
+            tx_32x32: TX_PROBS_32X32,
             skip: SKIP_PROBS,
             inter_mode: INTER_MODE_PROBS,
             intra_inter: INTRA_INTER_PROBS,
@@ -105,12 +127,16 @@ pub(super) struct MvComponentCounts {
 
 /// The symbols one frame coded, counted as the decoder counts them while it
 /// reads the frame.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub(super) struct FrameCounts {
-    /// Per coefficient context: ZERO, ONE, larger and end-of-block tokens.
-    pub(super) coef: [[u32; 4]; COEF_CONTEXTS],
-    /// Per coefficient context: how often the end-of-block node was read.
-    pub(super) eob_branch: [u32; COEF_CONTEXTS],
+    /// Per transform size and coefficient context: ZERO, ONE, larger and
+    /// end-of-block tokens.
+    pub(super) coef: [CoefCounts; 4],
+    /// Per transform size and coefficient context: how often the
+    /// end-of-block node was read.
+    pub(super) eob_branch: [EobCounts; 4],
+    /// `[largest transform - 1][context][transform size]`.
+    pub(super) tx: [[[u32; 4]; 2]; 3],
     pub(super) skip: [[u32; 2]; 3],
     /// `[mode context][mode - NEARESTMV]`.
     pub(super) inter_mode: [[u32; 4]; 7],
@@ -125,40 +151,36 @@ pub(super) struct FrameCounts {
     pub(super) mv: [MvComponentCounts; 2],
 }
 
-impl Default for FrameCounts {
-    fn default() -> Self {
-        Self {
-            coef: [[0; 4]; COEF_CONTEXTS],
-            eob_branch: [0; COEF_CONTEXTS],
-            skip: [[0; 2]; 3],
-            inter_mode: [[0; 4]; 7],
-            intra_inter: [[0; 2]; 4],
-            single_ref: [[0; 2]; 5],
-            y_mode: [[0; 10]; 4],
-            uv_mode: [[0; 10]; 10],
-            partition: [[0; 4]; 16],
-            mv_joints: [0; 4],
-            mv: [MvComponentCounts::default(); 2],
-        }
-    }
-}
-
 impl FrameContext {
     /// The context a frame that coded with `self` and gathered `counts` saves
     /// for the next frame. Intra frames adapt only the coefficient
     /// probabilities; the frame after a key frame adapts them faster.
-    pub(super) fn adapted(&self, counts: &FrameCounts, intra: bool, after_key: bool) -> Self {
+    /// Transform size probabilities adapt only when the frame selected
+    /// transform sizes per block (`TX_MODE_SELECT`).
+    pub(super) fn adapted(
+        &self,
+        counts: &FrameCounts,
+        intra: bool,
+        after_key: bool,
+        tx_select: bool,
+    ) -> Self {
         // COEF_MAX_UPDATE_FACTOR(_KEY, _AFTER_KEY) and COEF_COUNT_SAT.
         let update_factor = if !intra && after_key { 128 } else { 112 };
         let mut next = self.clone();
-        for (index, &[zero, one, more, end]) in counts.coef.iter().enumerate() {
-            let branches = [
-                [end, counts.eob_branch[index] - end],
-                [zero, one + more],
-                [one, more],
-            ];
-            for (node, [left, right]) in branches.into_iter().enumerate() {
-                let probability = &mut next.coef[index * 3 + node];
+        let contexts = next.coef.iter_mut().flatten().flatten().flatten().flatten();
+        let token_counts = counts.coef.iter().flatten().flatten().flatten().flatten();
+        let eob_counts = counts
+            .eob_branch
+            .iter()
+            .flatten()
+            .flatten()
+            .flatten()
+            .flatten();
+        for ((probs, &[zero, one, more, end]), &eob_branch) in
+            contexts.zip(token_counts).zip(eob_counts)
+        {
+            let branches = [[end, eob_branch - end], [zero, one + more], [one, more]];
+            for (probability, [left, right]) in probs.iter_mut().zip(branches) {
                 *probability = merge(*probability, left, right, 24, update_factor);
             }
         }
@@ -166,6 +188,23 @@ impl FrameContext {
             return next;
         }
 
+        if tx_select {
+            for context in 0..2 {
+                let [c0, c1, ..] = counts.tx[0][context];
+                next.tx_8x8[context] = merge_mode(next.tx_8x8[context], [c0, c1]);
+                let [c0, c1, c2, _] = counts.tx[1][context];
+                let probs = &mut next.tx_16x16[context * 2..context * 2 + 2];
+                for (probability, branch) in probs.iter_mut().zip([[c0, c1 + c2], [c1, c2]]) {
+                    *probability = merge_mode(*probability, branch);
+                }
+                let [c0, c1, c2, c3] = counts.tx[2][context];
+                let probs = &mut next.tx_32x32[context * 3..context * 3 + 3];
+                let branches = [[c0, c1 + c2 + c3], [c1, c2 + c3], [c2, c3]];
+                for (probability, branch) in probs.iter_mut().zip(branches) {
+                    *probability = merge_mode(*probability, branch);
+                }
+            }
+        }
         for (probability, &counts) in next.intra_inter.iter_mut().zip(&counts.intra_inter) {
             *probability = merge_mode(*probability, counts);
         }
@@ -282,18 +321,24 @@ mod tests {
     #[test]
     fn intra_frames_adapt_only_coefficients() {
         let mut counts = FrameCounts::default();
-        counts.coef[0] = [10, 0, 0, 10];
-        counts.eob_branch[0] = 20;
+        counts.coef[1][0][0][0][0] = [10, 0, 0, 10];
+        counts.eob_branch[1][0][0][0][0] = 20;
         counts.skip[0] = [0, 20];
+        counts.tx[2][0] = [20, 0, 0, 0];
         let context = FrameContext::default();
-        let intra = context.adapted(&counts, true, false);
-        assert_ne!(intra.coef[..3], context.coef[..3]);
+        let intra = context.adapted(&counts, true, false, true);
+        assert_ne!(intra.coef[1][0][0][0][0], context.coef[1][0][0][0][0]);
         assert_eq!(intra.skip, context.skip);
-        let inter = context.adapted(&counts, false, false);
-        assert_eq!(inter.coef[..3], intra.coef[..3]);
+        assert_eq!(intra.tx_32x32, context.tx_32x32);
+        let inter = context.adapted(&counts, false, false, true);
+        assert_eq!(inter.coef[1][0][0][0][0], intra.coef[1][0][0][0][0]);
         assert_ne!(inter.skip, context.skip);
+        assert_ne!(inter.tx_32x32, context.tx_32x32);
+        // Transform sizes adapt only when blocks select them.
+        let only_4x4 = context.adapted(&counts, false, false, false);
+        assert_eq!(only_4x4.tx_32x32, context.tx_32x32);
         // After a key frame, coefficients adapt with the larger factor.
-        let after_key = context.adapted(&counts, false, true);
-        assert_ne!(after_key.coef[..3], inter.coef[..3]);
+        let after_key = context.adapted(&counts, false, true, true);
+        assert_ne!(after_key.coef[1][0][0][0][0], inter.coef[1][0][0][0][0]);
     }
 }

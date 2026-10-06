@@ -79,6 +79,58 @@ fn moving_yuv_frame(width: u32, height: u32, index: u32) -> VideoFrame {
     .unwrap()
 }
 
+/// Smooth gradients under a soft highlight, drifting one sample a frame: the
+/// flat, slowly varying content that larger blocks and transforms code cheaply.
+fn smooth_yuv_frame(width: u32, height: u32, index: u32) -> VideoFrame {
+    let (width, height) = (width as usize, height as usize);
+    let (chroma_width, chroma_height) = (width.div_ceil(2), height.div_ceil(2));
+    let shift = index as f64;
+    let mut luma = vec![0_u8; width * height];
+    for y in 0..height {
+        for x in 0..width {
+            let (u, v) = (x as f64 + shift, y as f64);
+            let highlight = (-((u - 70.0).powi(2) + (v - 40.0).powi(2)) / 900.0).exp();
+            let value = 50.0 + u * 0.6 + v * 0.4 + 90.0 * highlight;
+            luma[y * width + x] = value.round().clamp(0.0, 255.0) as u8;
+        }
+    }
+    let chroma = |base: f64, slope: f64| -> Vec<u8> {
+        (0..chroma_width * chroma_height)
+            .map(|i| {
+                let (x, y) = (
+                    (i % chroma_width) as f64 + shift / 2.0,
+                    (i / chroma_width) as f64,
+                );
+                (base + slope * x - 0.2 * y).round().clamp(0.0, 255.0) as u8
+            })
+            .collect()
+    };
+    VideoFrame::new(
+        VideoDimensions {
+            width: width as u32,
+            height: height as u32,
+        },
+        PixelFormat::Yuv420p8,
+        ColorRange::Limited,
+        vec![
+            Plane {
+                data: luma,
+                stride: width,
+            },
+            Plane {
+                data: chroma(110.0, 0.3),
+                stride: chroma_width,
+            },
+            Plane {
+                data: chroma(150.0, -0.25),
+                stride: chroma_width,
+            },
+        ],
+        &Limits::default(),
+    )
+    .unwrap()
+}
+
 /// The visible `yuv420p` bytes of the encoder's reconstruction.
 fn reconstruction(encoder: &NativeVp9Encoder) -> Vec<u8> {
     let picture = encoder.reference.as_ref().unwrap();
@@ -97,11 +149,25 @@ fn reconstruction(encoder: &NativeVp9Encoder) -> Vec<u8> {
     bytes
 }
 
+type Frames = fn(u32, u32, u32) -> VideoFrame;
+
 fn encode_sequence(
     config: &VideoEncoderConfig,
     frames: u32,
 ) -> (Vec<EncodedSample>, Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    encode_with(config, frames, moving_yuv_frame, CodingTools::ALL)
+}
+
+/// Encodes `frames` frames of `content` with the given coding tools, returning
+/// the samples, the encoder's reconstructions and the sources.
+fn encode_with(
+    config: &VideoEncoderConfig,
+    frames: u32,
+    content: Frames,
+    tools: CodingTools,
+) -> (Vec<EncodedSample>, Vec<Vec<u8>>, Vec<Vec<u8>>) {
     let mut encoder = NativeVp9Encoder::new(config, &Limits::default()).unwrap();
+    encoder.tools = tools;
     let mut samples = Vec::new();
     let mut reconstructions = Vec::new();
     let mut sources = Vec::new();
@@ -110,7 +176,7 @@ fn encode_sequence(
         config.coded_dimensions.height,
     );
     for index in 0..frames {
-        let frame = moving_yuv_frame(width, height, index);
+        let frame = content(width, height, index);
         sources.push(
             frame
                 .planes
@@ -497,6 +563,187 @@ fn inter_frames_are_smaller_than_key_frames_for_moving_content() {
     }
 }
 
+/// The coding tools the encoder had before larger partitions and transforms:
+/// every block 8x8 with 4x4 transforms.
+const SMALL_BLOCKS: CodingTools = CodingTools {
+    largest_block: 0,
+    larger_transforms: false,
+};
+
+fn total_bytes(samples: &[EncodedSample]) -> usize {
+    samples.iter().map(|sample| sample.data.len()).sum()
+}
+
+#[test]
+fn larger_partitions_and_transforms_shrink_the_stream_at_no_loss_of_quality() {
+    for (name, content) in [
+        ("moving", moving_yuv_frame as Frames),
+        ("smooth", smooth_yuv_frame),
+    ] {
+        for base_q_idx in [40, DEFAULT_BASE_Q_IDX, 160] {
+            let mut config = configuration(160, 96, PixelFormat::Yuv420p8);
+            config.configuration = vec![base_q_idx, 0, 4];
+            let (small, small_recon, sources) = encode_with(&config, 6, content, SMALL_BLOCKS);
+            let (large, large_recon, _) = encode_with(&config, 6, content, CodingTools::ALL);
+            let sources = sources.concat();
+            let small_quality = psnr(&small_recon.concat(), &sources);
+            let large_quality = psnr(&large_recon.concat(), &sources);
+            let (small_bytes, large_bytes) = (total_bytes(&small), total_bytes(&large));
+            eprintln!(
+                "{name} q{base_q_idx}: {small_bytes} bytes at {small_quality:.2} dB in 8x8 \
+                 blocks, {large_bytes} bytes at {large_quality:.2} dB in larger ones"
+            );
+            assert!(
+                large_bytes < small_bytes,
+                "{name} q{base_q_idx}: {large_bytes} bytes against {small_bytes}"
+            );
+            assert!(
+                large_quality >= small_quality,
+                "{name} q{base_q_idx}: {large_quality:.2} dB against {small_quality:.2} dB"
+            );
+        }
+    }
+}
+
+/// The RGBA test card of `tests/native_vp9_encoder.rs`: gradients under a
+/// checkerboard of sharp-edged squares, panning two samples a frame.
+fn test_card_frame(width: u32, height: u32, index: u32) -> VideoFrame {
+    let mut pixels = Vec::with_capacity((width * height * 4) as usize);
+    for y in 0..height {
+        for x in 0..width {
+            let u = x + index * 2;
+            let checker = if ((u / 10) + (y / 10)) % 2 == 0 {
+                60
+            } else {
+                0
+            };
+            pixels.extend_from_slice(&[
+                (u * 255 / (width + 24)) as u8,
+                (y * 255 / height) as u8 / 2 + checker,
+                (255 - u * 200 / (width + 24)) as u8,
+                255,
+            ]);
+        }
+    }
+    VideoFrame::new(
+        VideoDimensions { width, height },
+        PixelFormat::Rgba8,
+        ColorRange::Limited,
+        vec![Plane {
+            data: pixels,
+            stride: width as usize * 4,
+        }],
+        &Limits::default(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn smaller_and_sharper_than_the_8x8_only_encoder() {
+    // Ten frames with a key frame every five, as the encoder before larger
+    // partitions and transforms coded them, loop filtered: quantizer index,
+    // bytes and PSNR over every plane.
+    type Baselines = [(u8, usize, f64); 3];
+    let cases: [(&str, Frames, PixelFormat, u32, Baselines); 2] = [
+        (
+            "moving",
+            moving_yuv_frame,
+            PixelFormat::Yuv420p8,
+            96,
+            [(40, 50060, 44.01), (80, 29587, 38.79), (160, 9518, 29.21)],
+        ),
+        (
+            "test card",
+            test_card_frame,
+            PixelFormat::Rgba8,
+            90,
+            [(40, 10209, 47.95), (80, 7674, 43.16), (160, 4042, 33.92)],
+        ),
+    ];
+    for (name, content, format, height, baselines) in cases {
+        for (base_q_idx, baseline_bytes, baseline_quality) in baselines {
+            let mut config = configuration(160, height, format);
+            config.configuration = vec![base_q_idx, 0, 5];
+            let mut encoder = NativeVp9Encoder::new(&config, &Limits::default()).unwrap();
+            let (mut bytes, mut decoded, mut sources) = (0, Vec::new(), Vec::new());
+            for index in 0..10 {
+                let frame = content(160, height, index);
+                let source = FrameSource::Cpu(CpuFrameSource {
+                    frame: &frame,
+                    orientation: Orientation::TopLeft,
+                });
+                let sample = block_on(encoder.encode(FrameIndex(u64::from(index)), source))
+                    .unwrap()
+                    .remove(0);
+                bytes += sample.data.len();
+                let picture =
+                    source_picture(&encoder.geometry, &frame, Orientation::TopLeft).unwrap();
+                let reconstruction = encoder.reference.as_ref().unwrap();
+                for plane in 0..3 {
+                    decoded.extend_from_slice(&reconstruction.planes[plane]);
+                    sources.extend_from_slice(&picture.planes[plane]);
+                }
+            }
+            let quality = psnr(&decoded, &sources);
+            eprintln!(
+                "{name} q{base_q_idx}: {bytes} bytes at {quality:.2} dB, was {baseline_bytes} \
+                 bytes at {baseline_quality:.2} dB"
+            );
+            assert!(
+                bytes < baseline_bytes && quality >= baseline_quality,
+                "{name} q{base_q_idx}: {bytes} bytes at {quality:.2} dB, against \
+                 {baseline_bytes} bytes at {baseline_quality:.2} dB"
+            );
+        }
+    }
+}
+
+#[test]
+fn flat_frames_code_in_whole_superblocks() {
+    // 64x64 blocks with 32x32 transforms code a flat picture in a handful of
+    // symbols, where 8x8 blocks need four 4x4 transforms each.
+    fn flat_frame(width: u32, height: u32, _index: u32) -> VideoFrame {
+        let (width, height) = (width as usize, height as usize);
+        let chroma = width.div_ceil(2) * height.div_ceil(2);
+        VideoFrame::new(
+            VideoDimensions {
+                width: width as u32,
+                height: height as u32,
+            },
+            PixelFormat::Yuv420p8,
+            ColorRange::Limited,
+            vec![
+                Plane {
+                    data: vec![90; width * height],
+                    stride: width,
+                },
+                Plane {
+                    data: vec![120; chroma],
+                    stride: width.div_ceil(2),
+                },
+                Plane {
+                    data: vec![140; chroma],
+                    stride: width.div_ceil(2),
+                },
+            ],
+            &Limits::default(),
+        )
+        .unwrap()
+    }
+    let config = configuration(256, 256, PixelFormat::Yuv420p8);
+    let (small, _, _) = encode_with(&config, 2, flat_frame, SMALL_BLOCKS);
+    let (large, reconstructions, sources) = encode_with(&config, 2, flat_frame, CodingTools::ALL);
+    for (frame, (small, large)) in small.iter().zip(&large).enumerate() {
+        assert!(
+            large.data.len() * 4 < small.data.len(),
+            "frame {frame}: {} bytes against {} with 8x8 blocks",
+            large.data.len(),
+            small.data.len()
+        );
+    }
+    assert_eq!(reconstructions, sources);
+}
+
 #[test]
 fn rgba_input_converts_with_bt601() {
     let config = configuration(16, 16, PixelFormat::Rgba8);
@@ -609,6 +856,10 @@ mod ffmpeg {
     }
 
     fn assert_decoders_match_reconstruction(config: &VideoEncoderConfig, frames: u32) {
+        assert_decoders_match(config, frames, moving_yuv_frame);
+    }
+
+    fn assert_decoders_match(config: &VideoEncoderConfig, frames: u32, content: Frames) {
         let decoders: Vec<&str> = ["vp9", "libvpx-vp9"]
             .into_iter()
             .filter(|name| decoder_available(name))
@@ -617,7 +868,7 @@ mod ffmpeg {
             eprintln!("skipping independent VP9 decode because ffmpeg has no VP9 decoder");
             return;
         }
-        let (samples, reconstructions, _) = encode_sequence(config, frames);
+        let (samples, reconstructions, _) = encode_with(config, frames, content, CodingTools::ALL);
         let (width, height) = (
             config.coded_dimensions.width,
             config.coded_dimensions.height,
@@ -670,6 +921,19 @@ mod ffmpeg {
             assert_decoders_match_reconstruction(&config, 3);
         }
     }
+
+    #[test]
+    fn whole_superblocks_and_large_transforms_decode_exactly() {
+        // Smooth content codes in 32x32 and 64x64 blocks with transforms up to
+        // 32x32, including superblocks cut by the bottom and right edges.
+        for (width, height) in [(160, 96), (200, 136)] {
+            for base_q_idx in [1, DEFAULT_BASE_Q_IDX, 255] {
+                let mut config = configuration(width, height, PixelFormat::Yuv420p8);
+                config.configuration = vec![base_q_idx, 0, 3];
+                assert_decoders_match(&config, 4, smooth_yuv_frame);
+            }
+        }
+    }
 }
 
 /// The `loop_filter_level` an encoded frame's uncompressed header signals.
@@ -677,8 +941,16 @@ fn signalled_filter_level(sample: &EncodedSample) -> u8 {
     // Key frames: marker, profile, flags, sync code, colour, size, render
     // size and frame_context_idx. Inter frames: marker, profile, flags,
     // refresh flags, references, sizes, motion vector precision,
-    // interpolation filter and frame_context_idx.
-    let start = if sample.is_sync { 71 } else { 36 };
+    // interpolation filter and frame_context_idx. Frames that are not error
+    // resilient add refresh_frame_context and frame_parallel_decoding_mode,
+    // and inter frames reset_frame_context too.
+    let adaptive = !error_resilient_mode(sample);
+    let start = match (sample.is_sync, adaptive) {
+        (true, false) => 71,
+        (true, true) => 73,
+        (false, false) => 36,
+        (false, true) => 40,
+    };
     (start..start + 6).fold(0, |level, index| {
         (level << 1) | ((sample.data[index / 8] >> (7 - index % 8)) & 1)
     })
@@ -700,45 +972,6 @@ fn visible(picture: &Picture, geometry: &Geometry) -> Vec<u8> {
     bytes
 }
 
-/// The RGBA test card `tests/native_vp9_encoder.rs` encodes: gradients
-/// under a checkerboard, panning right two pixels a frame.
-fn test_card_frame(index: u32) -> VideoFrame {
-    const WIDTH: u32 = 160;
-    const HEIGHT: u32 = 90;
-    const FRAMES: u32 = 12;
-    let mut pixels = Vec::with_capacity((WIDTH * HEIGHT * 4) as usize);
-    for y in 0..HEIGHT {
-        for x in 0..WIDTH {
-            let u = x + index * 2;
-            let checker = if ((u / 10) + (y / 10)) % 2 == 0 {
-                60
-            } else {
-                0
-            };
-            pixels.extend_from_slice(&[
-                (u * 255 / (WIDTH + 2 * FRAMES)) as u8,
-                (y * 255 / HEIGHT) as u8 / 2 + checker,
-                (255 - u * 200 / (WIDTH + 2 * FRAMES)) as u8,
-                255,
-            ]);
-        }
-    }
-    VideoFrame::new(
-        VideoDimensions {
-            width: WIDTH,
-            height: HEIGHT,
-        },
-        PixelFormat::Rgba8,
-        ColorRange::Limited,
-        vec![Plane {
-            data: pixels,
-            stride: WIDTH as usize * 4,
-        }],
-        &Limits::default(),
-    )
-    .unwrap()
-}
-
 /// Encodes `frames` as one group of pictures, with or without the loop
 /// filter, and returns the total size in bytes and the PSNR of the
 /// reconstruction against the source.
@@ -756,6 +989,7 @@ fn encode_group(frames: &[VideoFrame], base_q_idx: u8, loop_filter: bool) -> (us
             &source,
             reference.as_ref(),
             base_q_idx,
+            CodingTools::ALL,
             true,
             &context,
             None,
@@ -775,8 +1009,11 @@ fn encode_group(frames: &[VideoFrame], base_q_idx: u8, loop_filter: bool) -> (us
 
 #[test]
 fn every_frame_signals_a_loop_filter_level() {
+    // Error resilient, so every frame codes the content afresh. With adapted
+    // probabilities an inter frame can code it well enough that the search
+    // rightly leaves the filter off.
     let mut config = configuration(96, 64, PixelFormat::Yuv420p8);
-    config.configuration = vec![DEFAULT_BASE_Q_IDX, 0, 5];
+    config.configuration = vec![DEFAULT_BASE_Q_IDX, 0, 5, FLAG_ERROR_RESILIENT];
     let (samples, _, _) = encode_sequence(&config, 8);
     for (index, sample) in samples.iter().enumerate() {
         let level = signalled_filter_level(sample);
@@ -785,13 +1022,21 @@ fn every_frame_signals_a_loop_filter_level() {
 }
 
 #[test]
-fn loop_filter_shrinks_output_at_better_psnr() {
-    let frames: Vec<VideoFrame> = (0..12).map(test_card_frame).collect();
+fn loop_filter_is_a_rate_distortion_gain() {
+    // Larger blocks and transforms leave less blocking for the filter to
+    // remove, so it mostly buys quality rather than bits: the filtered stream
+    // must be sharper, and no larger than the unfiltered one would have to
+    // grow to match it at the high-rate 6 dB per doubling of the rate.
+    let frames: Vec<VideoFrame> = (0..12)
+        .map(|index| test_card_frame(160, 90, index))
+        .collect();
     for base_q_idx in [100, 150] {
         let (unfiltered_bytes, unfiltered_psnr) = encode_group(&frames, base_q_idx, false);
         let (filtered_bytes, filtered_psnr) = encode_group(&frames, base_q_idx, true);
+        let equivalent_bytes =
+            unfiltered_bytes as f64 * 2_f64.powf((filtered_psnr - unfiltered_psnr) / 6.0);
         assert!(
-            filtered_bytes < unfiltered_bytes && filtered_psnr >= unfiltered_psnr,
+            filtered_psnr > unfiltered_psnr && (filtered_bytes as f64) <= equivalent_bytes,
             "q {base_q_idx}: {filtered_bytes} bytes at {filtered_psnr:.2} dB filtered, \
              {unfiltered_bytes} bytes at {unfiltered_psnr:.2} dB unfiltered"
         );

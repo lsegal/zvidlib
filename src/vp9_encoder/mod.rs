@@ -29,7 +29,7 @@ use crate::{
     VideoEncoderConfig, VideoEncoderFactory, VideoEncoderFormat, VideoFrame,
 };
 use context::FrameContext;
-use frame::{FrameEncoder, Geometry, ModeInfo, Picture};
+use frame::{CodingTools, FrameEncoder, Geometry, ModeInfo, Picture};
 
 /// The quantizer index an empty configuration encodes at.
 pub const DEFAULT_BASE_Q_IDX: u8 = 80;
@@ -541,6 +541,8 @@ struct NativeVp9Encoder {
     base_q_idx: u8,
     keyframe_interval: u64,
     error_resilient: bool,
+    /// The partition and transform sizes the frame encoder searches.
+    tools: CodingTools,
     /// The previous frame's reconstruction, which the next inter frame
     /// predicts from.
     reference: Option<Picture>,
@@ -625,6 +627,7 @@ impl NativeVp9Encoder {
             base_q_idx: settings.base_q_idx,
             keyframe_interval: u64::from(settings.keyframe_interval),
             error_resilient: settings.error_resilient,
+            tools: CodingTools::ALL,
             reference: None,
             context: FrameContext::default(),
             previous_mode_info: Vec::new(),
@@ -685,6 +688,7 @@ impl NativeVp9Encoder {
             &picture,
             reference,
             self.base_q_idx,
+            self.tools,
             self.error_resilient,
             &self.context,
             previous_mode_info,
@@ -699,9 +703,12 @@ impl NativeVp9Encoder {
         }
         if !self.error_resilient {
             // refresh_frame_context = 1, frame_parallel_decoding_mode = 0.
-            self.context = self
-                .context
-                .adapted(&encoded.counts, key, self.previous_was_key);
+            self.context = self.context.adapted(
+                &encoded.counts,
+                key,
+                self.previous_was_key,
+                self.tools.larger_transforms,
+            );
         }
         self.reference = Some(encoded.reconstruction);
         self.previous_mode_info = encoded.mode_info;
