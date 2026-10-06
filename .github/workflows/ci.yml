@@ -233,6 +233,21 @@ jobs:
       # the hidden key frame of vector 018 (#529).
       - name: Test VP8 exact-frame decoding
         run: cargo test --features native --test vp8_conformance
+      # Re-encodes the bundled VP8 clip with the native VP8 encoder into WebM
+      # and checks one cue per key frame, exact frames through
+      # `ExactFrameReader` in every access order, and a quality floor (#530).
+      - name: Test native VP8 encoding
+        run: cargo test --features native --test native_vp8_encoder
+      # libvpx must decode the native VP8 encoder's WebM to exactly the
+      # pictures zvidlib's decoder does, and ffmpeg must seek it through its
+      # Cues (#530). The test skips itself without ffmpeg's libvpx decoder
+      # elsewhere, so this step installs it and requires it.
+      - name: Test native VP8 encoding against libvpx
+        env:
+          ZVIDLIB_REQUIRE_LIBVPX: "1"
+        run: |
+          sudo apt-get install -y --no-install-recommends ffmpeg
+          cargo test --features native --lib vp8::tests::libvpx_decodes_the_encoders_webm_exactly -- --nocapture
       # The VP9 factory's hardware selection (#545): with no GPU on this
       # runner, `Prefer` must fall back to the software decoder and `Require`
       # report hardware unavailable.
