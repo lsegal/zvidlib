@@ -63,6 +63,14 @@ name = "av1_encode"
 path = "benches/av1_encode.rs"
 harness = false
 
+# The VP9 software decoder's own scalar-vs-SIMD suite: whole-frame decode and
+# every stage the `vp9_decode` dispatch site vectorizes. A separate target for
+# the same reasons as `av1_decode`; it shares `benches/support/` with the rest.
+[[bench]]
+name = "vp9_decode"
+path = "benches/vp9_decode.rs"
+harness = false
+
 [[bench]]
 name = "hevc_decode"
 path = "benches/hevc_decode.rs"
@@ -86,6 +94,15 @@ name = "hevc_encode"
 path = "benches/hevc_encode.rs"
 harness = false
 
+# The native VP9 encoder, whole-frame and per stage, scalar versus SIMD
+# (#571). Its own target for the same reasons as `hevc_encode`: synthetic
+# inputs only, and a rate-distortion search slow enough to keep out of the
+# other targets' default runs.
+[[bench]]
+name = "vp9_encode"
+path = "benches/vp9_encode.rs"
+harness = false
+
 # The audio write/read path is a separate target rather than another group in
 # `codec`: it shares `benches/support/` but none of `codec`'s decoded-frame
 # fixtures, and issue #153 specifies `cargo bench --bench audio_mux` as its
@@ -103,6 +120,15 @@ harness = false
 [[bench]]
 name = "hevc_hardware"
 path = "benches/hevc_hardware.rs"
+harness = false
+
+# The native VP8 encoder's scalar-vs-SIMD suite: whole frames through the
+# public encoder and each of its `vp8_encode` and `vp8_recon` kernels. Its own
+# target for the same reason as `av1_encode`: it shares none of `codec`'s
+# decoded-frame fixtures, and its name says what it measures.
+[[bench]]
+name = "vp8_encode"
+path = "benches/vp8_encode.rs"
 harness = false
 
 # Issue #395's measurement: what an exact frame at an arbitrary point of a track

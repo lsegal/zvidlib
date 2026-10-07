@@ -24,6 +24,32 @@ OUTLINED_KERNEL = (
     "NtNtNtB4_6vector3x864Avx2EB6_"
 )
 
+# `vp9_simd::transforms::inverse_transform_add::<av1_simd::vector::x86::Avx2>`,
+# a VP9 kernel written over the AV1 vector types, outlined the same way.
+OUTLINED_VP9_KERNEL = (
+    "__RINvNtNtCs7lEMBtiCmc_7zvidlib8vp9_simd10transforms21inverse_transform_add"
+    "NtNtNtB6_8av1_simd6vector3x864Avx2EB8_"
+)
+
+# `vorbis_simd::kernels::overlap_add::<vector::x86::Avx2>`, the same defect in
+# the Vorbis kernels' generic module (issue #572), mangled the way the AV1 one
+# above is.
+OUTLINED_VORBIS_KERNEL = (
+    "__RINvNtNtCs7lEMBtiCmc_7zvidlib11vorbis_simd7kernels11overlap_add"
+    "NtNtNtB4_6vector3x864Avx2EB6_"
+)
+
+# `vp8::simd::kernels::sixtap::<av1_simd::vector::x86::Avx2>`: a `vp8::simd`
+# kernel is generic over the same vector types, so the `av1_simd` component
+# its symbol carries is its vector argument's path (issue #569).
+OUTLINED_VP8_KERNEL = (
+    "__RINvNtNtNtCs7lEMBtiCmc_7zvidlib3vp84simd7kernels6sixtap"
+    "NtNtNtB8_8av1_simd6vector3x864Avx2EB8_"
+)
+
+# The `#[target_feature]` wrapper `vp8::simd` generates for that kernel.
+VP8_WRAPPER = "__RNvNtNtCs7lEMBtiCmc_7zvidlib3vp84simd11sixtap_avx2"
+
 # `core::core_arch::x86::avx2::_mm256_and_si256`, an intrinsic emitted as a
 # function because the caller was not compiled with AVX2 enabled.
 INTRINSIC = "__RNvNtNtNtCsl7QZrza34zr_4core9core_arch3x864avx216__mm256_and_si256"
@@ -64,6 +90,23 @@ class ClassificationTest(unittest.TestCase):
 
     def test_a_generic_kernel_instantiation_is_outlined(self):
         self.assertTrue(checker.is_outlined_kernel(OUTLINED_KERNEL))
+
+    def test_a_generic_vp9_kernel_instantiation_is_outlined(self):
+        self.assertTrue(checker.is_outlined_kernel(OUTLINED_VP9_KERNEL))
+
+    def test_a_vorbis_kernel_instantiation_is_outlined(self):
+        self.assertTrue(checker.is_outlined_kernel(OUTLINED_VORBIS_KERNEL))
+        self.assertEqual(
+            checker.readable(OUTLINED_VORBIS_KERNEL),
+            "zvidlib::vorbis_simd::kernels::overlap_add::vector::x86::Avx2",
+        )
+
+    def test_a_vp8_kernel_instantiation_is_outlined(self):
+        self.assertTrue(checker.is_outlined_kernel(OUTLINED_VP8_KERNEL))
+
+    def test_a_vp8_wrapper_is_not_a_violation(self):
+        self.assertFalse(checker.is_outlined_kernel(VP8_WRAPPER))
+        self.assertFalse(checker.is_core_arch(VP8_WRAPPER))
 
     def test_an_intrinsic_is_recognized(self):
         self.assertTrue(checker.is_core_arch(INTRINSIC))

@@ -39,6 +39,7 @@ use super::dsp::{
     IntraMode, ReferencePlane, TxType, forward_transform, inverse_transform_add, predict_inter,
     predict_intra,
 };
+use super::simd::{self, Quantizer};
 use super::tables::{
     AC_QLOOKUP, CAT6_PROBS, DC_QLOOKUP, KF_PARTITION_PROBS, KF_UV_MODE_PROBS, KF_Y_MODE_PROBS,
     PARETO8_FULL,
@@ -605,14 +606,14 @@ impl<'a> FrameEncoder<'a> {
             (2, geometry.chroma_width(), geometry.chroma_height()),
         ] {
             let stride = picture.strides[plane];
-            for row in 0..height {
-                let range = row * stride..row * stride + width;
-                error += picture.planes[plane][range.clone()]
-                    .iter()
-                    .zip(&self.source.planes[plane][range])
-                    .map(|(&a, &b)| u64::from(a.abs_diff(b)).pow(2))
-                    .sum::<u64>();
-            }
+            error += simd::sse(
+                &picture.planes[plane],
+                stride,
+                &self.source.planes[plane],
+                stride,
+                width,
+                height,
+            );
         }
         error
     }
@@ -974,18 +975,19 @@ impl<'a> FrameEncoder<'a> {
         let stride = self.recon.strides[plane];
         let mut residual = vec![0_i32; n * n];
         let mut prediction = vec![0_u8; n * n];
-        let mut prediction_error = 0_u64;
+        let start = y * stride + x;
         for row in 0..n {
-            let start = (y + row) * stride + x;
-            let source = &self.source.planes[plane][start..start + n];
-            let predicted = &self.recon.planes[plane][start..start + n];
-            prediction[row * n..row * n + n].copy_from_slice(predicted);
-            for column in 0..n {
-                let difference = i32::from(source[column]) - i32::from(predicted[column]);
-                residual[row * n + column] = difference;
-                prediction_error += (difference * difference) as u64;
-            }
+            prediction[row * n..row * n + n]
+                .copy_from_slice(&self.recon.planes[plane][start + row * stride..][..n]);
         }
+        let prediction_error = simd::residual(
+            &self.source.planes[plane][start..],
+            stride,
+            &prediction,
+            n,
+            n,
+            &mut residual,
+        );
         let plane_type = usize::from(plane > 0);
         let reference = usize::from(inter);
         let probs = &self.context.coef[tx_size];
@@ -1005,21 +1007,13 @@ impl<'a> FrameEncoder<'a> {
         let rounding = if inter { 0.25 } else { 0.375 };
         let mut levels = vec![0_i32; n * n];
         let mut dequantized = vec![0_i32; n * n];
-        for (index, &coefficient) in coefficients.iter().enumerate() {
-            let step = if index == 0 { self.dc_q } else { self.ac_q };
-            // 32x32 levels dequantize to half the step.
-            let (effective, limit) = if tx_size == 3 {
-                (f64::from(step) / 2.0, 65535 / step)
-            } else {
-                (f64::from(step), 32767 / step)
-            };
-            // Keep every dequantized value inside the 16-bit range the decoder
-            // stores coefficients in.
-            let level = ((coefficient.abs() / effective + rounding).floor() as i32).min(limit);
-            let value = (level * step) >> u32::from(tx_size == 3);
-            levels[index] = if coefficient < 0.0 { -level } else { level };
-            dequantized[index] = if coefficient < 0.0 { -value } else { value };
-        }
+        let quantizer = Quantizer {
+            dc_q: self.dc_q,
+            ac_q: self.ac_q,
+            half_step: tx_size == 3,
+            rounding,
+        };
+        simd::quantize(&coefficients, &quantizer, &mut levels, &mut dequantized);
         let (scan, _) = scan_order(tx_size, tx_type);
         let eob = scan
             .iter()
@@ -1048,16 +1042,14 @@ impl<'a> FrameEncoder<'a> {
             &mut self.recon.planes[plane][start..],
             stride,
         );
-        let mut error = 0_u64;
-        for row in 0..n {
-            let start = (y + row) * stride + x;
-            let source = &self.source.planes[plane][start..start + n];
-            let reconstructed = &self.recon.planes[plane][start..start + n];
-            for (&source, &reconstructed) in source.iter().zip(reconstructed) {
-                let difference = i32::from(source) - i32::from(reconstructed);
-                error += (difference * difference) as u64;
-            }
-        }
+        let error = simd::sse(
+            &self.source.planes[plane][start..],
+            stride,
+            &self.recon.planes[plane][start..],
+            stride,
+            n,
+            n,
+        );
         if prediction_error as f64 + self.lambda * empty_bits
             <= error as f64 + self.lambda * counter.0
         {
@@ -1251,17 +1243,23 @@ impl<'a> FrameEncoder<'a> {
         let max_y = self.geometry.height as isize - 1;
         let last = size as isize - 1;
         let inside = x0 >= 0 && y0 >= 0 && x0 + last <= max_x && y0 + last <= max_y;
+        if inside {
+            return simd::sad(
+                &self.source.planes[0][mi_row * 8 * stride + mi_col * 8..],
+                stride,
+                &reference.planes[0][y0 as usize * stride + x0 as usize..],
+                stride,
+                size,
+                limit,
+            );
+        }
         let mut sad = 0_u32;
         for row in 0..size {
             let source_row =
                 &self.source.planes[0][(mi_row * 8 + row) * stride + mi_col * 8..][..size];
             let y = (y0 + row as isize).clamp(0, max_y) as usize;
             for (column, &source) in source_row.iter().enumerate() {
-                let x = if inside {
-                    (x0 + column as isize) as usize
-                } else {
-                    (x0 + column as isize).clamp(0, max_x) as usize
-                };
+                let x = (x0 + column as isize).clamp(0, max_x) as usize;
                 sad += u32::from(source.abs_diff(reference.planes[0][y * stride + x]));
             }
             if sad >= limit {
@@ -1479,14 +1477,17 @@ impl<'a> FrameEncoder<'a> {
                     &mut prediction,
                 );
                 let stride = self.recon.strides[plane];
-                for row in 0..size {
-                    let start = (y + row) * stride + x;
-                    let source = &self.source.planes[plane][start..start + size];
-                    let predicted = &prediction[row * size..row * size + size];
-                    for (&source, &predicted) in source.iter().zip(predicted) {
-                        let difference = i32::from(source) - i32::from(predicted);
-                        prediction_error += (difference * difference) as u64;
-                    }
+                let start = y * stride + x;
+                prediction_error += simd::sse(
+                    &self.source.planes[plane][start..],
+                    stride,
+                    &prediction,
+                    size,
+                    size,
+                    size,
+                );
+                for (row, predicted) in prediction.chunks_exact(size).enumerate() {
+                    let start = start + row * stride;
                     self.recon.planes[plane][start..start + size].copy_from_slice(predicted);
                 }
             }
