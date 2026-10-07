@@ -132,22 +132,77 @@ pub(super) trait BoolSink {
         None
     }
 
-    /// Writes `value` with a libvpx tree: positive entries index the next
-    /// node pair, and zero or negative entries are leaves holding `-value`.
-    fn tree(&mut self, tree: &[i8], probabilities: &[u8], value: u8) {
-        let mut path = [false; 16];
-        let mut length = 0;
-        let found = tree_path(tree, 0, i16::from(value), &mut path, &mut length);
-        debug_assert!(found, "value {value} is not a leaf of the tree");
-        let mut node = 0_usize;
-        for &bit in &path[..length] {
-            self.write(bit, probabilities[node >> 1]);
-            let next = tree[node + usize::from(bit)];
-            if next <= 0 {
-                break;
-            }
-            node = next as usize;
+    /// Writes `value` with a libvpx tree.
+    fn tree(&mut self, tree: &Tree, probabilities: &[u8], value: u8) {
+        let path = tree.path(value);
+        debug_assert!(!path.is_empty(), "value {value} is not a leaf of the tree");
+        for &index in path {
+            self.write(index & 1 != 0, probabilities[usize::from(index >> 1)]);
         }
+    }
+}
+
+/// A libvpx tree, with the path to each leaf found once when it is built:
+/// the search costs symbols far too often to search the tree for each.
+pub(super) struct Tree {
+    /// Positive entries index the next node pair, and zero or negative
+    /// entries are leaves holding `-value`.
+    pub(super) nodes: &'static [i8],
+    /// The entries each leaf value's path takes, from the root: an entry's
+    /// parity is the bit coded and its half the probability's index.
+    paths: [[u8; Self::DEPTH]; Self::LEAVES],
+    lengths: [u8; Self::LEAVES],
+}
+
+impl Tree {
+    const LEAVES: usize = 16;
+    const DEPTH: usize = 16;
+
+    pub(super) const fn new(nodes: &'static [i8]) -> Self {
+        let mut paths = [[0; Self::DEPTH]; Self::LEAVES];
+        let mut lengths = [0; Self::LEAVES];
+        let mut leaf = 0;
+        while leaf < nodes.len() {
+            if nodes[leaf] <= 0 {
+                // Walk up from the leaf to the root through the entries that
+                // index each node pair, then store the path root first.
+                let mut up = [0; Self::DEPTH];
+                let mut length = 0;
+                let mut entry = leaf;
+                loop {
+                    up[length] = entry as u8;
+                    length += 1;
+                    let pair = entry & !1;
+                    if pair == 0 {
+                        break;
+                    }
+                    let mut parent = 0;
+                    while nodes[parent] <= 0 || nodes[parent] as usize != pair {
+                        parent += 1;
+                    }
+                    entry = parent;
+                }
+                let value = (-nodes[leaf]) as usize;
+                let mut step = 0;
+                while step < length {
+                    paths[value][step] = up[length - 1 - step];
+                    step += 1;
+                }
+                lengths[value] = length as u8;
+            }
+            leaf += 1;
+        }
+        Self {
+            nodes,
+            paths,
+            lengths,
+        }
+    }
+
+    /// The entries on the path to leaf `value`, empty if it is not a leaf.
+    fn path(&self, value: u8) -> &[u8] {
+        let value = usize::from(value);
+        &self.paths[value][..usize::from(self.lengths[value])]
     }
 }
 
@@ -183,29 +238,6 @@ fn costs() -> &'static [f64; 256] {
 fn cost_from(costs: &[f64; 256], bit: bool, probability: u8) -> f64 {
     let p = usize::from(probability);
     costs[if bit { 256 - p } else { p }]
-}
-
-fn tree_path(
-    tree: &[i8],
-    node: usize,
-    value: i16,
-    path: &mut [bool; 16],
-    length: &mut usize,
-) -> bool {
-    for bit in [false, true] {
-        let entry = tree[node + usize::from(bit)];
-        path[*length] = bit;
-        *length += 1;
-        if entry <= 0 {
-            if -i16::from(entry) == value {
-                return true;
-            }
-        } else if tree_path(tree, entry as usize, value, path, length) {
-            return true;
-        }
-        *length -= 1;
-    }
-    false
 }
 
 #[cfg(test)]
@@ -289,11 +321,12 @@ mod tests {
     #[test]
     fn tree_writes_each_leaf_along_its_path() {
         // The VP9 inter mode tree: ZEROMV(2), NEARESTMV(0), NEARMV(1), NEWMV(3).
-        let tree = [-2, 2, 0, 4, -1, -3];
+        const TREE: Tree = Tree::new(&[-2, 2, 0, 4, -1, -3]);
+        let tree = TREE.nodes;
         let probabilities = [40, 90, 200];
         let mut encoder = BoolEncoder::new();
         for value in [2, 0, 1, 3, 3, 0] {
-            encoder.tree(&tree, &probabilities, value);
+            encoder.tree(&TREE, &probabilities, value);
         }
         let bytes = encoder.finish();
         let mut decoder = BoolDecoder::new(&bytes);

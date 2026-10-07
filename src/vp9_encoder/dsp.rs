@@ -129,6 +129,29 @@ pub(super) fn forward_transform_4x4_scalar(
 struct Bases {
     dct: [Vec<f64>; 3],
     adst: [Vec<f64>; 2],
+    /// The forward transform's vertical weights for each of those bases, in
+    /// the same order: see [`vertical_weights`].
+    dct_weights: [Vec<f64>; 3],
+    adst_weights: [Vec<f64>; 2],
+}
+
+/// The vertical pass of [`forward_transform`] as a matrix product's
+/// weights: the transpose of `basis`, scaled by the transform's shift over
+/// `(n / 2)^2`.
+fn vertical_weights(basis: &[f64], tx_size: usize) -> Vec<f64> {
+    let n = 4 << tx_size;
+    // The inverse is `vertical * coefficients * horizontal^T`, shifted right
+    // by 5 bits for 8x8 and 6 bits above, so the forward transform is
+    // `vertical^T * residual * horizontal` scaled by that shift over (n / 2)^2.
+    let shift = if tx_size == 1 { 32.0 } else { 64.0 };
+    let half = (n / 2) as f64;
+    let scale = shift / (half * half);
+    (0..n * n)
+        .map(|index| {
+            let (k, i) = (index / n, index % n);
+            basis[i * n + k] * scale
+        })
+        .collect()
 }
 
 fn bases() -> &'static Bases {
@@ -152,9 +175,13 @@ fn bases() -> &'static Bases {
                 })
                 .collect()
         };
+        let dct = [dct(8), dct(16), dct(32)];
+        let adst = [adst(8), adst(16)];
         Bases {
-            dct: [dct(8), dct(16), dct(32)],
-            adst: [adst(8), adst(16)],
+            dct_weights: core::array::from_fn(|index| vertical_weights(&dct[index], index + 1)),
+            adst_weights: core::array::from_fn(|index| vertical_weights(&adst[index], index + 1)),
+            dct,
+            adst,
         }
     })
 }
@@ -186,38 +213,21 @@ pub(super) fn forward_transform(
     }
     let n = 4 << tx_size;
     let bases = bases();
-    let basis = |adst: bool| {
-        if adst && tx_size < 3 {
-            &bases.adst[tx_size - 1]
-        } else {
-            &bases.dct[tx_size - 1]
-        }
+    let vertical_adst = tx_type.vertical_adst() && tx_size < 3;
+    let weights = if vertical_adst {
+        &bases.adst_weights[tx_size - 1]
+    } else {
+        &bases.dct_weights[tx_size - 1]
     };
-    let vertical = basis(tx_type.vertical_adst());
-    let horizontal = basis(tx_type.horizontal_adst());
-    // The inverse is `vertical * coefficients * horizontal^T`, shifted right
-    // by 5 bits for 8x8 and 6 bits above, so the forward transform is
-    // `vertical^T * residual * horizontal` scaled by that shift over (n / 2)^2.
-    let shift = if tx_size == 1 { 32.0 } else { 64.0 };
-    let half = (n / 2) as f64;
-    let scale = shift / (half * half);
-    // The vertical pass with `scale` folded into its weights, then the
+    let horizontal = if tx_type.horizontal_adst() && tx_size < 3 {
+        &bases.adst[tx_size - 1]
+    } else {
+        &bases.dct[tx_size - 1]
+    };
+    // The vertical pass, with the scale folded into its weights, then the
     // horizontal one, each a matrix product.
-    let TransformScratch {
-        weights,
-        samples,
-        columns,
-    } = scratch;
-    let (weights, samples, columns) = (
-        &mut weights[..n * n],
-        &mut samples[..n * n],
-        &mut columns[..n * n],
-    );
-    for (k, row) in weights.chunks_exact_mut(n).enumerate() {
-        for (i, weight) in row.iter_mut().enumerate() {
-            *weight = vertical[i * n + k] * scale;
-        }
-    }
+    let TransformScratch { samples, columns } = scratch;
+    let (samples, columns) = (&mut samples[..n * n], &mut columns[..n * n]);
     for (sample, &value) in samples.iter_mut().zip(residual) {
         *sample = f64::from(value);
     }
@@ -229,7 +239,6 @@ pub(super) fn forward_transform(
 /// search transforms every transform block of every candidate it tries, and
 /// allocating fresh buffers each time cost more than many of the transforms.
 pub(super) struct TransformScratch {
-    weights: [f64; 32 * 32],
     samples: [f64; 32 * 32],
     columns: [f64; 32 * 32],
 }
@@ -237,7 +246,6 @@ pub(super) struct TransformScratch {
 impl TransformScratch {
     pub(super) fn new() -> Box<Self> {
         Box::new(Self {
-            weights: [0.0; 32 * 32],
             samples: [0.0; 32 * 32],
             columns: [0.0; 32 * 32],
         })

@@ -41,7 +41,7 @@
 //! exactly: blocks predict from it unfiltered within the frame, and later
 //! frames predict from it after the loop filter.
 
-use super::bitwriter::{BitCost, BitWriter, BoolEncoder, BoolSink, bit_cost};
+use super::bitwriter::{BitCost, BitWriter, BoolEncoder, BoolSink, Tree, bit_cost};
 use super::context::{CoefProbs, FrameContext, FrameCounts, MvComponentCounts};
 use super::dsp::{
     InterScratch, IntraMode, ReferencePlane, TransformScratch, TxType, forward_transform,
@@ -58,17 +58,17 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 
-pub(super) const INTRA_MODE_TREE: [i8; 18] = [
+pub(super) const INTRA_MODE_TREE: Tree = Tree::new(&[
     0, 2, -9, 4, -1, 6, 8, 12, -2, 10, -4, -5, -3, 14, -8, 16, -6, -7,
-];
-pub(super) const PARTITION_TREE: [i8; 6] = [0, 2, -1, 4, -2, -3];
+]);
+pub(super) const PARTITION_TREE: Tree = Tree::new(&[0, 2, -1, 4, -2, -3]);
 /// Leaves are `mode - NEARESTMV`: NEARESTMV 0, NEARMV 1, ZEROMV 2, NEWMV 3.
-pub(super) const INTER_MODE_TREE: [i8; 6] = [-2, 2, 0, 4, -1, -3];
-pub(super) const MV_JOINT_TREE: [i8; 6] = [0, 2, -1, 4, -2, -3];
-pub(super) const MV_CLASS_TREE: [i8; 20] = [
+pub(super) const INTER_MODE_TREE: Tree = Tree::new(&[-2, 2, 0, 4, -1, -3]);
+pub(super) const MV_JOINT_TREE: Tree = Tree::new(&[0, 2, -1, 4, -2, -3]);
+pub(super) const MV_CLASS_TREE: Tree = Tree::new(&[
     0, 2, -1, 4, 6, 8, -2, -3, 10, 12, -4, -5, -6, 14, 16, 18, -7, -8, -9, -10,
-];
-pub(super) const MV_FP_TREE: [i8; 6] = [0, 2, -1, 4, -2, -3];
+]);
+pub(super) const MV_FP_TREE: Tree = Tree::new(&[0, 2, -1, 4, -2, -3]);
 
 const CAT_PROBS: [&[u8]; 5] = [
     &[159],
@@ -2831,9 +2831,9 @@ struct ContextCosts {
     more: f64,
     /// The end of block.
     end: f64,
-    zero: f64,
-    /// A nonzero level of each magnitude from 1, with its sign.
-    nonzero: [f64; COSTED_MAGNITUDES],
+    /// A level of each magnitude: the zero token, then each nonzero
+    /// magnitude from 1 with its sign.
+    levels: [f64; COSTED_MAGNITUDES + 1],
     /// The context's probabilities, for magnitudes past `nonzero`.
     probs: [u8; 3],
 }
@@ -2846,16 +2846,17 @@ impl ContextCosts {
             return Self {
                 more: f64::INFINITY,
                 end: f64::INFINITY,
-                zero: f64::INFINITY,
-                nonzero: [f64::INFINITY; COSTED_MAGNITUDES],
+                levels: [f64::INFINITY; COSTED_MAGNITUDES + 1],
                 probs: *probs,
             };
         }
         Self {
             more: bit_cost(true, probs[0]),
             end: bit_cost(false, probs[0]),
-            zero: bit_cost(false, probs[1]),
-            nonzero: core::array::from_fn(|index| nonzero_cost(index as u32 + 1, probs)),
+            levels: core::array::from_fn(|magnitude| match magnitude {
+                0 => bit_cost(false, probs[1]),
+                _ => nonzero_cost(magnitude as u32, probs),
+            }),
             probs: *probs,
         }
     }
@@ -2935,32 +2936,31 @@ fn token_bits<const SIZE: usize>(
         &shared::COEFBAND_TRANS_8X8PLUS
     };
     let costs = &costs[plane_type][reference];
+    // `energy_class` of each magnitude up to the last class's first.
+    const CLASSES: [u8; 12] = [0, 1, 2, 3, 3, 4, 4, 4, 4, 4, 4, 5];
     let mut bits = 0.0;
     let mut cache = [0_u8; SIZE];
     let mut previous_zero = false;
-    for c in 0..eob {
-        let band = usize::from(bands[c]);
-        let token = &costs[band][context];
-        if !previous_zero {
-            bits += token.more;
-        }
-        let position = scan[c] as usize;
+    // The neighbours of each coefficient's successor, from which its context
+    // follows.
+    let successors = neighbors[2..].chunks_exact(2);
+    for ((&position, &band), successor) in scan[..eob].iter().zip(&bands[..eob]).zip(successors) {
+        let token = &costs[usize::from(band)][context];
+        // Selected rather than branched on: whether a coefficient is zero is
+        // data, so a branch mispredicts often. Adding zero leaves the sum,
+        // which is never negative zero, exactly as skipping the term does.
+        bits += if previous_zero { 0.0 } else { token.more };
+        let position = position as usize;
         let magnitude = levels[position].unsigned_abs();
-        if magnitude == 0 {
-            bits += token.zero;
-            previous_zero = true;
-        } else {
-            bits += match token.nonzero.get(magnitude as usize - 1) {
-                Some(&cost) => cost,
-                None => nonzero_cost(magnitude, &token.probs),
-            };
-            previous_zero = false;
-        }
-        cache[position] = energy_class(magnitude);
-        let next = c + 1;
+        bits += match token.levels.get(magnitude as usize) {
+            Some(&cost) => cost,
+            None => nonzero_cost(magnitude, &token.probs),
+        };
+        previous_zero = magnitude == 0;
+        cache[position] = CLASSES[(magnitude as usize).min(CLASSES.len() - 1)];
         context = (1
-            + usize::from(cache[neighbors[next * 2] as usize])
-            + usize::from(cache[neighbors[next * 2 + 1] as usize]))
+            + usize::from(cache[successor[0] as usize])
+            + usize::from(cache[successor[1] as usize]))
             >> 1;
     }
     if eob < scan.len() {
