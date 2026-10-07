@@ -2,7 +2,8 @@ name: Release
 
 # Prepares a release from the Actions tab: sets the workspace version, promotes
 # the changelog, pushes both to `main` with the tag, and hands the tag to
-# Finalize release (`finalize-release.yml`), which packages and publishes it.
+# Finalize release (`finalize-release.yml`), which packages it, creates the
+# GitHub release and starts Publish crates (`publish-crates.yml`).
 on:
   workflow_dispatch:
     inputs:

@@ -3,7 +3,9 @@ name: Finalize release
 # Builds and publishes a release whose tag already exists. The Release
 # workflow (`release.yml`) pushes the tag and then dispatches this one, since
 # a tag pushed with `GITHUB_TOKEN` starts no other workflow; a tag pushed by
-# hand starts it directly.
+# hand starts it directly. It creates the GitHub release and then starts
+# Publish crates (`publish-crates.yml`) to upload the crates to crates.io,
+# without waiting for crates.io's rate limits (#649).
 on:
   push:
     tags: ['v*']
@@ -15,6 +17,7 @@ on:
         type: string
 
 permissions:
+  actions: write
   contents: write
 
 jobs:
@@ -78,28 +81,8 @@ jobs:
           wasm-pack build --release --target web --out-dir pkg --features web
           (cd pkg && npm pack --pack-destination ../release)
           mv release/zvidlib-*.tgz "release/zvidlib-web-${TAG}.tgz"
-      # `publish_crates.py` uploads every crate `cargo package` just verified,
-      # one at a time in dependency order (#610), pacing them to crates.io's
-      # rate limits and waiting out a 429 rather than failing (#637). It runs
-      # before the GitHub release is created so a re-run of a failed job
-      # repeats both: a crate already on crates.io at this version is skipped,
-      # so a re-run resumes after a partial publish. A tag pushed before the
-      # token secret exists still gets its GitHub release.
-      - name: Publish the crates to crates.io
-        # A first release of a dozen new crates waits about ten minutes
-        # between uploads once crates.io's burst of five is spent.
-        timeout-minutes: 240
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: |
-          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
-            echo "::notice::CARGO_REGISTRY_TOKEN is not set, so no crate was published to crates.io."
-            exit 0
-          fi
-          python3 .github/scripts/publish_crates.py --version "${TAG#v}"
       # The notes are the tag's `CHANGELOG.md` section, or `## Unreleased` for
-      # a tag pushed without the Release workflow promoting it. They are
-      # written outside the checkout, which `cargo publish` needs clean.
+      # a tag pushed without the Release workflow promoting it.
       - name: Extract the release notes
         run: |
           set -euo pipefail
@@ -128,3 +111,13 @@ jobs:
           else
             gh release create "$TAG" release/* --verify-tag --title "zvidlib ${TAG}" --notes-file "$NOTES_FILE"
           fi
+      # Publish crates starts only after `cargo package` has verified every
+      # crate, since it uploads them with `--no-verify`, and after the GitHub
+      # release exists, so a release that fails here never reaches crates.io.
+      # It is not awaited: crates.io's limit on new crates can hold it for
+      # hours. A re-run dispatches it again, which skips the crates already
+      # uploaded and queues behind a publish still running for the tag.
+      - name: Start Publish crates
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run publish-crates.yml --repo "$GITHUB_REPOSITORY" --ref "$TAG" -f tag="$TAG"

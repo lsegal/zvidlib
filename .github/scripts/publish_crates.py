@@ -16,6 +16,9 @@ failed attempt; it is answered by waiting until the time crates.io names and
 retrying the same crate, and the bucket is emptied so later uploads are paced
 from there.
 
+It runs in the Publish crates workflow, which Finalize release starts without
+waiting for it, so a slow publish never holds back the GitHub release (#649).
+
 A crate already on crates.io at the release version is skipped, so a re-run
 continues where the last one stopped. Every upload, skip, and wait is logged,
 with the time a wait ends, so a slow run cannot be mistaken for a hung one.

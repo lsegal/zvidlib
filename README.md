@@ -475,7 +475,9 @@ and Cargo consumers must use the same release version when they exchange media o
 zvidlib follows pre-1.0 semantic versioning: patch releases preserve documented public API and
 behavior, while a minor release may make breaking API changes. Every release publishes its Rust
 crates to crates.io and attaches its browser package to the GitHub release; release notes call out
-any platform capability change.
+any platform capability change. The crates are uploaded after the GitHub release is created and
+paced to crates.io's rate limits, so a release whose crates are new names can take a few hours to
+appear on crates.io.
 
 ## Building the library
 
