@@ -2327,7 +2327,7 @@ mirror-image reason: its cost is almost entirely the shared crate build, so fift
 copies would pay that fifteen times for one answer.
 
 The matrix lists its targets by name, which is a second copy of what `Cargo.toml`
-declares, so `tests/ci_benchmarks_run_every_target.rs` asserts the two agree. A
+declares, so a target added to a manifest has to be added there too. A
 target added to the manifest and not to the matrix still compiles on every PR
 and is simply never measured again, and the only symptom is a baseline that
 stops carrying its groups — which reads as benchmarks that were deleted.
@@ -2540,8 +2540,7 @@ so the report was skipped by exactly the change it exists to check, and the
 split keeps both halves: a prose change gets the report and still does not pay
 for the `Rust checks` matrix, the benchmark suite or the delta report. It
 reports and does not gate, there as here — a stale row is a table to redraw,
-not a broken build — and the arrangement is pinned by
-`tests/ci_staleness_report_sees_markdown_changes.rs`.
+not a broken build.
 
 Three things about how it reads the site set are worth stating, because each is
 a place a more obvious implementation does not work:

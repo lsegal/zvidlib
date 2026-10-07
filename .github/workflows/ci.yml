@@ -38,7 +38,7 @@ permissions:
 # `refs/pull/N/merge`, so a PR's runs supersede each other and no other PR's -
 # while a `push` or a `workflow_dispatch` keys on `github.run_id` and is
 # therefore alone in its group, where `cancel-in-progress` has nothing to act
-# on. `tests/ci_concurrency_spares_main.rs` asserts both halves.
+# on.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: true
@@ -78,10 +78,7 @@ jobs:
   # platform backends for the WebAssembly checks, and the
   # `cfg(target_arch = "wasm32")` browser modules for the native jobs. With
   # `some-with-excludes` a file is matched by any pattern of a filter and
-  # unmatched by any `!` pattern of it. `tests/ci_path_filters_are_conservative.rs`
-  # holds each exclusion to its module's `cfg`, each job filter to the files its
-  # job is known to read, and each package filter to the package's manifests
-  # and includes.
+  # unmatched by any `!` pattern of it.
   changes:
     name: Changed paths
     runs-on: ubuntu-latest
@@ -149,17 +146,12 @@ jobs:
               - '!crates/zvidlib-hardware/src/windows_mf.rs'
               - '!crates/zvidlib-hardware/src/windows_mf_encoder.rs'
               - '!crates/zvidlib-hevc-decoder/src/decode_bench.rs'
-            # The library's units read `benches/README.md` and
-            # `.github/scripts/criterion_baseline.py` through `include_str!`,
-            # and the `ci_*` guards read every workflow.
             rust_tests:
               - 'src/**'
               - 'tests/**'
               - 'benches/**'
               - 'examples/**'
               - 'crates/**'
-              - '.github/scripts/**'
-              - '.github/workflows/**'
               - '!src/wasm_api.rs'
               - '!src/web_audio_decoder.rs'
               - '!src/web_decoder.rs'
@@ -171,7 +163,6 @@ jobs:
               - 'benches/**'
               - 'examples/**'
               - 'crates/**'
-              - '.github/scripts/**'
               - '!src/wasm_api.rs'
               - '!src/web_audio_decoder.rs'
               - '!src/web_decoder.rs'
@@ -194,8 +185,6 @@ jobs:
               - 'tests/**'
               - 'benches/**'
               - 'examples/**'
-              - '.github/scripts/**'
-              - '.github/workflows/**'
               - 'crates/zvidlib-aac-encoder/**'
               - 'crates/zvidlib-av1/**'
               - 'crates/zvidlib-av1-decoder/**'
@@ -386,10 +375,7 @@ jobs:
       # filters that matched, so this narrows it to package names: every one in
       # `WORKSPACE` on a `main` push, a `workflow_dispatch` or a change to the
       # build definition, and otherwise the ones whose filter matched.
-      # `WORKSPACE` is every workspace package, one per line, and
-      # `tests/ci_path_filters_are_conservative.rs` holds it to the manifests,
-      # so a crate added to the workspace and not here fails that test rather
-      # than going untested.
+      # `WORKSPACE` is every workspace package, one per line.
       - name: List the packages whose tests run
         id: crates
         env:
@@ -760,10 +746,7 @@ jobs:
       matrix:
         # Slowest first, because a pool that cannot start all fifteen at once
         # starts them in this order and the wall clock is whatever finishes
-        # last. `tests/ci_benchmarks_run_every_target.rs` asserts this list is
-        # exactly the `[[bench]]` targets the workspace's manifests declare,
-        # each with the package that declares it, so a target added there
-        # cannot silently stop being measured.
+        # last.
         include:
           - { bench: hevc_encode, package: zvidlib-hevc-encoder }
           - { bench: av1_encode, package: zvidlib-av1-encoder }
