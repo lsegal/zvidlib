@@ -150,14 +150,16 @@ class InstallTest(unittest.TestCase):
 
     def test_main_exit_status_reflects_the_install(self):
         apt = FakeApt([1, 0, 1])
-        original = apt_install.run, apt_install.time.sleep
+        original = apt_install.run, apt_install.time.sleep, apt_install.MIRROR_LIST
         apt_install.run, apt_install.time.sleep = apt.run, apt.sleep
+        # Keep the runner's own mirror list out of reach, as on CI it exists.
+        apt_install.MIRROR_LIST = apt.mirror_list
         try:
             with redirect_stdout(io.StringIO()):
                 failed = apt_install.main(["--attempts", "2", "ffmpeg"])
                 passed = apt_install.main(["ffmpeg"])
         finally:
-            apt_install.run, apt_install.time.sleep = original
+            apt_install.run, apt_install.time.sleep, apt_install.MIRROR_LIST = original
         self.assertEqual((failed, passed), (1, 0))
 
 

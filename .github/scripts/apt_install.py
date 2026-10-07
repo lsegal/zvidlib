@@ -96,12 +96,13 @@ def install(
     attempt_timeout: int,
     runner: Runner | None = None,
     sleep: Callable[[float], None] | None = None,
-    mirror_list: str = MIRROR_LIST,
+    mirror_list: str | None = None,
 ) -> bool:
     """Install `packages`, trying up to `attempts` times. Returns whether an
     attempt succeeded."""
     runner = runner or run
     sleep = sleep or time.sleep
+    mirror_list = mirror_list or MIRROR_LIST
     commands = {
         "update": ["apt-get", *APT_OPTIONS, "update"],
         "install": ["apt-get", *APT_OPTIONS, "install", "-y", "--no-install-recommends", *packages],
