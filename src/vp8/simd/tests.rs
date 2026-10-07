@@ -11,7 +11,10 @@ use super::super::frame_encoder::{
     forward_walsh, quantize, residual_dct, sad16, sad16_full, satd, satd4,
 };
 use super::super::loop_filter::{FrameFilter, MacroblockFilter, filter_frame};
-use super::super::predict::{Edges, Plane, idct_add, inverse_walsh, predict_block, predict_inter};
+use super::super::predict::{
+    Edges, Plane, idct_add, idct_dc_add, idct_dc_add_row, idct_dc_add_row_scalar, inverse_walsh,
+    predict_block, predict_inter, predict_subblock, predict_subblock_scalar,
+};
 use super::super::tables::{AC_Q_LOOKUP, BILINEAR_FILTERS, DC_Q_LOOKUP, SIXTAP_FILTERS, TM_PRED};
 use crate::simd::{self, SimdIsa};
 
@@ -104,6 +107,7 @@ fn every_vector_instruction_set_takes_the_vector_kernels() {
         let vector = isa != SimdIsa::Scalar;
         assert_eq!(super::encode_isa(), isa);
         assert_eq!(super::recon_isa(), isa);
+        assert_eq!(super::decode_isa(), isa);
         assert_eq!(
             super::sad16(&plane.data, 16, &plane.data, 16).is_some(),
             vector
@@ -142,8 +146,100 @@ fn every_vector_instruction_set_takes_the_vector_kernels() {
             super::tm_predict(&[0; 16], &[0; 16], 0, 16, &mut output, 0, 16),
             vector
         );
+        for mode in 0..10 {
+            assert_eq!(
+                super::subblock(mode, &[0; 9], &[0; 4], &mut output, 0, 16),
+                vector,
+                "subblock mode {mode}"
+            );
+        }
+        assert_eq!(super::idct_dc_add_row(&[8; 4], &mut output, 0, 16), vector);
     }
     simd::set_override(None);
+}
+
+#[test]
+fn subblock_prediction_matches_scalar_in_every_mode() {
+    let mut random = Random(0x568);
+    for mode in 0..10 {
+        for round in 0..256 {
+            let (above, left): ([u8; 9], [u8; 4]) = match round {
+                0 => ([0; 9], [255; 4]),
+                1 => ([255; 9], [0; 4]),
+                2 => {
+                    let mut above = [255; 9];
+                    above[0] = 0;
+                    (above, [255; 4])
+                }
+                _ => (
+                    std::array::from_fn(|_| random.sample()),
+                    std::array::from_fn(|_| random.sample()),
+                ),
+            };
+            // The vector kernel against the scalar function directly, as well
+            // as through the entry point the decoder calls.
+            let mut expected = vec![0x5a; 12 * 4 + 4];
+            predict_subblock_scalar(mode, &above, &left, &mut expected, 2, 12);
+            across_isas(&format!("subblock mode {mode}"), || {
+                let mut plane = vec![0x5a; 12 * 4 + 4];
+                predict_subblock(mode, &above, &left, &mut plane, 2, 12);
+                assert_eq!(plane, expected, "mode {mode} above {above:?} left {left:?}");
+                plane
+            });
+        }
+    }
+}
+
+#[test]
+fn dc_only_inverse_dct_matches_scalar_and_the_full_transform() {
+    let mut random = Random(0xdc);
+    let mut dc = |round: usize| match round {
+        0 => i16::MAX,
+        1 => i16::MIN,
+        2 => 0,
+        _ => random.coefficient() >> random.below(12),
+    };
+    let mut samples = Random(0x5a);
+    for round in 0..512 {
+        for blocks in [2, 4] {
+            let dcs: Vec<i16> = (0..blocks).map(|block| dc(round + block)).collect();
+            let stride = 24;
+            let mut plane = vec![0u8; stride * 6];
+            for sample in &mut plane {
+                *sample = match round % 3 {
+                    0 => samples.sample(),
+                    1 => 255,
+                    _ => 0,
+                };
+            }
+            let offset = stride + 3;
+            // The shortcut is exactly the full inverse DCT of blocks whose
+            // only coefficient is the DC.
+            let mut full = plane.clone();
+            let mut shortcut = plane.clone();
+            {
+                let _guard = simd::test_lock();
+                simd::set_override(Some(SimdIsa::Scalar));
+                for (index, &dc) in dcs.iter().enumerate() {
+                    let mut block = [0i16; 16];
+                    block[0] = dc;
+                    idct_add(&block, &mut full, offset + index * 4, stride);
+                    idct_dc_add(dc, &mut shortcut, offset + index * 4, stride);
+                }
+                simd::set_override(None);
+            }
+            assert_eq!(shortcut, full, "dcs {dcs:?}");
+            let mut reference = plane.clone();
+            idct_dc_add_row_scalar(&dcs, &mut reference, offset, stride);
+            assert_eq!(reference, full, "dcs {dcs:?}");
+            across_isas(&format!("dc-only idct row {dcs:?}"), || {
+                let mut output = plane.clone();
+                idct_dc_add_row(&dcs, &mut output, offset, stride);
+                assert_eq!(output, full, "dcs {dcs:?}");
+                output
+            });
+        }
+    }
 }
 
 #[test]

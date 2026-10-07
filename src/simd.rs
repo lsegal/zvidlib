@@ -6,7 +6,8 @@
 //! prediction ([`crate::av1_mc`]), AV1 intra prediction
 //! ([`crate::av1_intra_pred`]), the Vorbis encoder's analysis stages, the VP8
 //! encoder's distortion metrics, forward transforms and quantization and the
-//! reconstruction and loop filter it shares with the VP8 decoder, the VP9
+//! reconstruction and loop filter it shares with the VP8 decoder, the VP8
+//! decoder's subblock intra prediction and DC-only inverse DCT, the VP9
 //! decoder's inverse transforms, prediction and loop filter
 //! (`crate::vp9_simd`), the HEVC engine's inter/intra prediction, in-loop
 //! filters, inverse transforms, encoder-side distortion metrics, and
@@ -55,11 +56,12 @@ static OVERRIDE: AtomicU8 = AtomicU8::new(0);
 /// The override reaches every dispatch family: the AV1 transform and in-loop
 /// filter kernels, AV1 motion compensation (through the default level
 /// [`crate::av1_mc::McContext::new`] picks up), AV1 intra prediction, the
-/// Vorbis encoder's analysis kernels, the VP8 encoder and reconstruction
-/// kernels, every VP9 decoder kernel, every HEVC engine kernel, the AV1, VP8
-/// and VP9 output color conversion, the Vorbis decoder's synthesis kernels,
-/// and the VP9 encoder's kernels. [`SimdIsa::Scalar`] therefore genuinely
-/// reaches the scalar code path rather than merely the widest scalar-ish one.
+/// Vorbis encoder's analysis kernels, the VP8 encoder, reconstruction and
+/// decoder kernels, every VP9 decoder kernel, every HEVC engine kernel, the
+/// AV1, VP8 and VP9 output color conversion, the Vorbis decoder's synthesis
+/// kernels, and the VP9 encoder's kernels. [`SimdIsa::Scalar`] therefore
+/// genuinely reaches the scalar code path rather than merely the widest
+/// scalar-ish one.
 ///
 /// An instruction set this host cannot execute is clamped to
 /// [`SimdIsa::Scalar`] rather than silently ignored, so a caller that asks for
@@ -124,6 +126,7 @@ pub fn available() -> Vec<SimdIsa> {
 /// | `vorbis_encode` | Vorbis encoder forward MDCT, real FFT, noise-mask fits, floor fitting and log spectra |
 /// | `vp8_encode` | VP8 encoder-side SAD and SATD, residual and forward DCT, forward WHT and quantization |
 /// | `vp8_recon` | VP8 inverse transforms, inter and `TM_PRED` prediction and loop filter, shared by the encoder and decoder |
+/// | `vp8_decode` | VP8 4x4 subblock intra prediction and DC-only inverse DCT |
 /// | `vp9_decode` | VP9 decoder inverse transforms, inter and intra prediction, and loop filter |
 /// | `vp9_encode` | VP9 encoder forward transforms, quantization, distortion metrics, intra/inter prediction and RGBA8 to YUV420 input conversion |
 /// | `hevc_prediction_filters` | HEVC inter/intra prediction and in-loop filters |
@@ -152,6 +155,7 @@ pub fn active_by_site() -> Vec<(&'static str, SimdIsa)> {
         ("vorbis_encode", crate::vorbis_encoder::simd::active_isa()),
         ("vp8_encode", crate::vp8::simd::encode_isa()),
         ("vp8_recon", crate::vp8::simd::recon_isa()),
+        ("vp8_decode", crate::vp8::simd::decode_isa()),
         ("vp9_decode", crate::vp9_simd::active_isa()),
         (
             "vp9_encode",
@@ -429,6 +433,8 @@ mod tests {
         assert_eq!(crate::vp8::simd::encode_isa(), SimdIsa::Scalar);
         // VP8 reconstruction and loop filter, shared with the decoder.
         assert_eq!(crate::vp8::simd::recon_isa(), SimdIsa::Scalar);
+        // VP8 subblock intra prediction and the DC-only inverse DCT.
+        assert_eq!(crate::vp8::simd::decode_isa(), SimdIsa::Scalar);
         // VP9 decoder transforms, prediction and loop filter.
         assert_eq!(crate::vp9_simd::active_isa(), SimdIsa::Scalar);
         // The VP9 encoder's kernels.
@@ -466,6 +472,7 @@ mod tests {
             "vorbis_encode",
             "vp8_encode",
             "vp8_recon",
+            "vp8_decode",
             "vp9_decode",
             "vp9_encode",
             "hevc_prediction_filters",
@@ -546,6 +553,8 @@ mod tests {
         assert_eq!(crate::vp8::simd::encode_isa(), detected());
         // VP8 reconstruction and loop filter, shared with the decoder.
         assert_eq!(crate::vp8::simd::recon_isa(), detected());
+        // VP8 subblock intra prediction and the DC-only inverse DCT.
+        assert_eq!(crate::vp8::simd::decode_isa(), detected());
         // VP9 decoder transforms, prediction and loop filter.
         assert_eq!(crate::vp9_simd::active_isa(), detected());
         // The VP9 encoder's kernels.
@@ -596,6 +605,7 @@ mod tests {
             "vorbis_encode",
             "vp8_encode",
             "vp8_recon",
+            "vp8_decode",
             "vp9_decode",
             "vp9_encode",
             "hevc_prediction_filters",
