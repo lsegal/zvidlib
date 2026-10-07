@@ -1,0 +1,41 @@
+[package]
+name = "zvidlib-vp9-encoder"
+description = "Pure-Rust VP9 software encoder for zvidlib"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+# Tests, their fixtures and benchmarks are not needed to build the crate.
+exclude = ["/tests", "/benches"]
+
+[build-dependencies]
+zvidlib-build = { workspace = true }
+
+[dependencies]
+zvidlib-core = { workspace = true }
+zvidlib-color = { workspace = true }
+zvidlib-vp9-syntax = { workspace = true }
+zvidlib-vp9-decoder = { workspace = true }
+zvidlib-hardware = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+zvidlib-bench-support = { path = "../zvidlib-bench-support" }
+zvidlib-container = { path = "../zvidlib-container" }
+
+[features]
+# Additive, off by default, and gating no code: the benchmark harness folds it
+# into every criterion group name (`simd=off` / `simd=on`), as zvidlib's own
+# `simd` feature does, so the two arms are recorded separately.
+simd = []
+
+# The native VP9 encoder, whole-frame and per stage, scalar versus SIMD
+# (#571). Its own target for the same reasons as `hevc_encode`: synthetic
+# inputs only, and a rate-distortion search slow enough to keep out of the
+# other targets' default runs.
+[[bench]]
+name = "vp9_encode"
+harness = false

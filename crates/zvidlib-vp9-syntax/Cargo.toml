@@ -1,0 +1,14 @@
+[package]
+name = "zvidlib-vp9-syntax"
+description = "VP9 frame inspection, picture output and level selection shared by zvidlib's VP9 codecs and hardware backends"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+zvidlib-core = { workspace = true }
+zvidlib-color = { workspace = true }

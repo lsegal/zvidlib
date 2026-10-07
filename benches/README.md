@@ -1,25 +1,32 @@
 # Benchmarks
 
 zvidlib's benchmarks run under [criterion](https://docs.rs/criterion) with
-`harness = false`, across fifteen bench targets that share `benches/support/`:
+`harness = false`, across fifteen bench targets. Since the workspace split
+(#604) each target lives in the package it measures - a codec's own targets in
+its crate under `crates/`, and the targets that measure zvidlib as a whole in
+the root package's `benches/` - so a change to one crate compiles and runs only
+the benchmarks of that crate and of the crates that depend on it. Their shared
+helpers are the development-only `zvidlib-bench-support` crate, which each
+package's own `benches/support/` binds to the SIMD dispatch sites that package
+exercises and extends with the fixtures it decodes:
 
 | Target | Measures |
 | --- | --- |
-| `benches/codec.rs` | codec work: decode, encoder inputs, and the per-ISA SIMD groups |
-| `benches/av1_decode.rs` | the AV1 software decoder: whole-frame decode and every hot stage, scalar versus SIMD |
-| `benches/av1_encode.rs` | the native AV1 encoder: whole-frame encode, every stage, and the forward-transform kernels, scalar versus SIMD |
-| `benches/vorbis_encode.rs` | the native Vorbis encoder: whole encodes, scalar versus SIMD |
+| `crates/zvidlib-av1/benches/codec.rs` | codec work: decode, encoder inputs, and the per-ISA SIMD groups |
+| `crates/zvidlib-av1-decoder/benches/av1_decode.rs` | the AV1 software decoder: whole-frame decode and every hot stage, scalar versus SIMD |
+| `crates/zvidlib-av1-encoder/benches/av1_encode.rs` | the native AV1 encoder: whole-frame encode, every stage, and the forward-transform kernels, scalar versus SIMD |
+| `crates/zvidlib-vorbis-encoder/benches/vorbis_encode.rs` | the native Vorbis encoder: whole encodes, scalar versus SIMD |
 | `benches/audio_decode.rs` | the audio decode paths: AAC access units, `AacSampleReader` range/seek reads, and the Vorbis decoder and its synthesis kernels, scalar versus SIMD |
 | `benches/audio_mux.rs` | the audio container path: MP4 muxing, sample-table growth, demux, and gapless timing |
-| `benches/hevc_encode.rs` | the pure-Rust HEVC encoder, whole-frame and per-stage |
-| `benches/vp9_encode.rs` | the native VP9 encoder: whole-frame encode and every vectorized kernel, scalar versus SIMD |
-| `benches/hevc_decode.rs` | the HEVC software decoder: whole-frame decode and every hot stage, scalar versus SIMD |
-| `benches/vp9_decode.rs` | the VP9 software decoder: whole-frame decode and every vectorized stage, scalar versus SIMD |
-| `benches/hevc_hardware.rs` | the platform fixed-function HEVC decoders against the software one, and the hardware HEVC encoder |
+| `crates/zvidlib-hevc-encoder/benches/hevc_encode.rs` | the pure-Rust HEVC encoder, whole-frame and per-stage |
+| `crates/zvidlib-vp9-encoder/benches/vp9_encode.rs` | the native VP9 encoder: whole-frame encode and every vectorized kernel, scalar versus SIMD |
+| `crates/zvidlib-hevc-decoder/benches/hevc_decode.rs` | the HEVC software decoder: whole-frame decode and every hot stage, scalar versus SIMD |
+| `crates/zvidlib-vp9-decoder/benches/vp9_decode.rs` | the VP9 software decoder: whole-frame decode and every vectorized stage, scalar versus SIMD |
+| `crates/zvidlib-hevc-decoder/benches/hevc_hardware.rs` | the platform fixed-function HEVC decoders against the software one, and the hardware HEVC encoder |
 | `benches/exact_seek.rs` | what an exact frame at an arbitrary point costs, by backend and by random-access cadence |
 | `benches/vpx_decode.rs` | the VP8 and VP9 software decoders, and the YUV-to-RGBA conversion they share with AV1, scalar versus SIMD |
-| `benches/vp8_encode.rs` | the native VP8 encoder: whole-frame encode and every SIMD kernel, scalar versus SIMD |
-| `benches/vp8_decode.rs` | the VP8 software decoder: whole-frame decode and the stages only the decoder runs, scalar versus SIMD |
+| `crates/zvidlib-vp8/benches/vp8_encode.rs` | the native VP8 encoder: whole-frame encode and every SIMD kernel, scalar versus SIMD |
+| `crates/zvidlib-vp8/benches/vp8_decode.rs` | the VP8 software decoder: whole-frame decode and the stages only the decoder runs, scalar versus SIMD |
 
 Each target loads and decodes its fixtures once per process, so every iteration
 measures the work under test and nothing else. `codec` is one target rather than
@@ -30,27 +37,31 @@ from each other so neither one's name overstates what it measures: encoder
 kernels are not decoder stages, even where both reach the same `av1_simd`
 dispatch site. The encoder target is separate for a second reason too:
 its mode search is slow enough that keeping it out of the default
-`cargo bench --bench codec` run is worth more than sharing a process.
+`cargo bench -p zvidlib-av1 --bench codec` run is worth more than sharing a process.
 
 ## Running
 
+A plain `cargo bench` at the repository root runs the root package's targets
+only; `--workspace` runs every package's, and `-p <package>` one package's.
+
 ```sh
-cargo bench                       # the default, fast groups in every target
-cargo bench --bench codec         # codec work only
-cargo bench --bench av1_decode    # the AV1 software decoder only
-cargo bench --bench av1_encode    # the AV1 encoder, whole-frame and per-stage
-cargo bench --bench vorbis_encode # the Vorbis encoder, scalar versus SIMD
+cargo bench --workspace           # the default, fast groups in every target
+cargo bench                       # the root package's targets
+cargo bench -p zvidlib-av1 --bench codec         # codec work only
+cargo bench -p zvidlib-av1-decoder --bench av1_decode    # the AV1 software decoder only
+cargo bench -p zvidlib-av1-encoder --bench av1_encode    # the AV1 encoder, whole-frame and per-stage
+cargo bench -p zvidlib-vorbis-encoder --bench vorbis_encode # the Vorbis encoder, scalar versus SIMD
 cargo bench --bench audio_decode  # the audio decode path only
 cargo bench --bench audio_mux     # the audio container path only
-cargo bench --bench hevc_encode   # the HEVC encoder groups only
-cargo bench --bench hevc_decode   # the HEVC software decoder only
-cargo bench --bench vp9_decode    # the VP9 software decoder only
-cargo bench --bench hevc_hardware # the platform hardware HEVC decoders and encoder
+cargo bench -p zvidlib-hevc-encoder --bench hevc_encode   # the HEVC encoder groups only
+cargo bench -p zvidlib-hevc-decoder --bench hevc_decode   # the HEVC software decoder only
+cargo bench -p zvidlib-vp9-decoder --bench vp9_decode    # the VP9 software decoder only
+cargo bench -p zvidlib-hevc-decoder --bench hevc_hardware # the platform hardware HEVC decoders and encoder
 cargo bench --bench exact_seek    # exact-seek cost by backend and cadence
 cargo bench --bench vpx_decode    # VP8/VP9 decode and the AV1/VP8/VP9 output conversion
-cargo bench --bench vp8_encode    # the VP8 encoder, whole-frame and per-kernel
-cargo bench --features simd       # the same groups, recorded under `simd=on`
-cargo bench --no-run              # compile only
+cargo bench -p zvidlib-vp8 --bench vp8_encode    # the VP8 encoder, whole-frame and per-kernel
+cargo bench --workspace --features simd  # the same groups, recorded under `simd=on`
+cargo bench --workspace --no-run  # compile only
 ```
 
 Criterion writes HTML reports to `target/criterion/report/index.html`.
@@ -61,15 +72,15 @@ Criterion treats its first positional argument as a regular expression matched
 against the full benchmark id:
 
 ```sh
-cargo bench --bench codec -- av1_decode          # one codec's group
-cargo bench --bench codec -- 'simd=off'          # one feature arm
-cargo bench --bench codec -- inter_show_existing # one benchmark
+cargo bench -p zvidlib-av1 --bench codec -- av1_decode          # one codec's group
+cargo bench -p zvidlib-av1 --bench codec -- 'simd=off'          # one feature arm
+cargo bench -p zvidlib-av1 --bench codec -- inter_show_existing # one benchmark
 ```
 
 Use `--warm-up-time` and `--measurement-time` for a quicker smoke run:
 
 ```sh
-cargo bench --bench codec -- --warm-up-time 0.5 --measurement-time 2
+cargo bench -p zvidlib-av1 --bench codec -- --warm-up-time 0.5 --measurement-time 2
 ```
 
 ### The long-running 1080p group
@@ -79,13 +90,13 @@ decoded by a pure-Rust decoder, so it is not part of the default run. Opt in wit
 an environment variable:
 
 ```sh
-ZVIDLIB_BENCH_LARGE=1 cargo bench --bench codec -- hevc_decode_1080p
+ZVIDLIB_BENCH_LARGE=1 cargo bench -p zvidlib-av1 --bench codec -- hevc_decode_1080p
 ```
 
 The same variable gates the encoder target's 1080p-class groups:
 
 ```sh
-ZVIDLIB_BENCH_LARGE=1 cargo bench --bench hevc_encode
+ZVIDLIB_BENCH_LARGE=1 cargo bench -p zvidlib-hevc-encoder --bench hevc_encode
 ```
 
 ## Group naming and the `simd` feature
@@ -137,20 +148,20 @@ av1_motion_compensation/neon
 
 ## The AV1 decoder suite (`--bench av1_decode`)
 
-`benches/av1_decode.rs` measures the pure-Rust AV1 software decoder end to end
+`crates/zvidlib-av1-decoder/benches/av1_decode.rs` measures the pure-Rust AV1 software decoder end to end
 and per hot stage. Every group in it is a per-ISA group, because the point of
 the target is where AV1 decode time goes and how much of it vectorizes.
 
 | Group | Stage |
 | --- | --- |
 | `av1_decode_frame` | whole-frame decode through `native_av1_video_decoder_factory` |
-| `av1_inverse_dct_{4x4,8x8,16x16,32x32,64x64}` | inverse DCT, `src/av1_simd/transforms.rs` |
+| `av1_inverse_dct_{4x4,8x8,16x16,32x32,64x64}` | inverse DCT, `crates/zvidlib-av1/src/av1_simd/transforms.rs` |
 | `av1_inverse_adst_8x8`, `av1_inverse_flipadst_16x16` | the inverse ADST family |
 | `av1_deblock`, `av1_deblock_wide`, `av1_deblock_boundary` | deblocking: narrow filters, the wide 8/14-tap filters, and boundary-dominated planes |
 | `av1_cdef`, `av1_wiener`, `av1_self_guided` | CDEF and loop restoration |
-| `av1_mc_single`, `av1_mc_compound_average`, `av1_mc_blend_mask` | inter prediction, `src/av1_mc.rs` |
-| `av1_intra_paeth`, `av1_intra_smooth`, `av1_intra_directional` | intra prediction, `src/av1_intra_pred.rs` |
-| `av1_entropy_symbol` | arithmetic symbol decode, `src/av1_entropy.rs` |
+| `av1_mc_single`, `av1_mc_compound_average`, `av1_mc_blend_mask` | inter prediction, `crates/zvidlib-av1/src/av1_mc.rs` |
+| `av1_intra_paeth`, `av1_intra_smooth`, `av1_intra_directional` | intra prediction, `crates/zvidlib-av1/src/av1_intra_pred.rs` |
+| `av1_entropy_symbol` | arithmetic symbol decode, `crates/zvidlib-av1/src/av1_entropy.rs` |
 
 A single `scalar` arm is only meaningful here because `simd::set_override`
 covers all three of AV1's independent dispatch sites at once (`av1_simd`,
@@ -163,7 +174,7 @@ ceiling on any whole-frame SIMD win: the number to take from it is its share of
 `av1_decode_frame`, not a speedup. Its throughput line counts symbols rather
 than pixels, so the harness's "Mpx/s" reads as millions of symbols per second.
 There is no separate CDF-adaptation measurement because both AV1 decoders in the
-crate require `disable_cdf_update = 1`, so `src/av1_cdf.rs`'s tables are read but
+crate require `disable_cdf_update = 1`, so `crates/zvidlib-av1/src/av1_cdf.rs`'s tables are read but
 never adapted.
 
 The forward transforms are not in this table. They are encoder kernels and are
@@ -176,7 +187,7 @@ input generators are now `support::av1_structured_plane`,
 `support::av1_flat_blocks_plane`, and `support::av1_wide_tx_grid`, and its
 hand-rolled timing loops are the criterion groups above, so the same
 measurements now produce stored baselines. The bit-exactness tests that file sat
-next to (`tests/av1_simd_intra.rs`, `src/av1_simd/tests.rs`) are correctness
+next to (`crates/zvidlib-av1/tests/av1_simd_intra.rs`, `crates/zvidlib-av1/src/av1_simd/tests.rs`) are correctness
 checks and are unchanged.
 
 On an `x86_64` host with AVX2 the arms are `scalar`, `sse4.1`, and `avx2`
@@ -187,9 +198,9 @@ axis here, and both arms always appear in the same run.
 Filter to one of them the same way as any other group:
 
 ```sh
-cargo bench --bench codec -- av1_deblock_luma
-cargo bench --bench av1_decode -- 'av1_deblock/scalar'
-cargo bench --bench av1_decode -- av1_inverse   # every inverse-transform group
+cargo bench -p zvidlib-av1 --bench codec -- av1_deblock_luma
+cargo bench -p zvidlib-av1-decoder --bench av1_decode -- 'av1_deblock/scalar'
+cargo bench -p zvidlib-av1-decoder --bench av1_decode -- av1_inverse   # every inverse-transform group
 ```
 
 ## The VP8 and VP9 decoder suite (`--bench vpx_decode`)
@@ -201,7 +212,7 @@ issue #574). Every group is a per-ISA group.
 
 | Group | Stage |
 | --- | --- |
-| `yuv_to_rgba_1080p`, `yuv_to_rgba_4k` | `convert_to_rgba8` over one limited-range BT.709 4:2:0 picture, `src/yuv_to_rgba.rs` |
+| `yuv_to_rgba_1080p`, `yuv_to_rgba_4k` | `convert_to_rgba8` over one limited-range BT.709 4:2:0 picture, `crates/zvidlib-color/src/yuv_to_rgba.rs` |
 | `vp8_decode_frame` | whole-frame decode through `native_vp8_video_decoder_factory` |
 | `vp9_decode_frame` | whole-frame decode through `native_vp9_video_decoder_factory` |
 
@@ -235,7 +246,7 @@ measures this target on every `main` push, on uncontended runners.
 
 ## The VP9 decoder suite (`--bench vp9_decode`)
 
-`benches/vp9_decode.rs` measures the pure-Rust VP9 profile 0 decoder end to
+`crates/zvidlib-vp9-decoder/benches/vp9_decode.rs` measures the pure-Rust VP9 profile 0 decoder end to
 end and per vectorized stage (issue #570). Every group is a per-ISA group, and
 all of them reach the one `vp9_decode` dispatch site, so pinning the override
 reaches every VP9 kernel at once.
@@ -243,13 +254,13 @@ reaches every VP9 kernel at once.
 | Group | Stage |
 | --- | --- |
 | `vp9_decode_to_picture` | whole-frame decode of the bundled 256x144 libvpx stream, stopping at the YUV picture |
-| `vp9_inverse_dct_{4x4,8x8,16x16,32x32}` | inverse DCT and add-to-prediction, `src/vp9_simd/transforms.rs` |
+| `vp9_inverse_dct_{4x4,8x8,16x16,32x32}` | inverse DCT and add-to-prediction, `crates/zvidlib-vp9-decoder/src/vp9_simd/transforms.rs` |
 | `vp9_inverse_adst_{4x4,8x8,16x16}` | inverse ADST and add-to-prediction |
 | `vp9_inverse_wht_4x4` | the lossless Walsh-Hadamard transform |
-| `vp9_mc_{regular,smooth,sharp,bilinear}` | 16x16 sub-pixel inter prediction per filter, `src/vp9_simd/convolve.rs` |
+| `vp9_mc_{regular,smooth,sharp,bilinear}` | 16x16 sub-pixel inter prediction per filter, `crates/zvidlib-vp9-decoder/src/vp9_simd/convolve.rs` |
 | `vp9_mc_4x4`, `vp9_mc_compound` | the narrowest block, and two predictions averaged |
-| `vp9_intra_dc`, `vp9_intra_tm`, `vp9_intra_directional` | intra prediction, 4x4 to 32x32, `src/vp9_simd/intra.rs` |
-| `vp9_loop_filter_{4,8,16}` | the three loop filters on every edge of a plane, `src/vp9_simd/loopfilter.rs` |
+| `vp9_intra_dc`, `vp9_intra_tm`, `vp9_intra_directional` | intra prediction, 4x4 to 32x32, `crates/zvidlib-vp9-decoder/src/vp9_simd/intra.rs` |
+| `vp9_loop_filter_{4,8,16}` | the three loop filters on every edge of a plane, `crates/zvidlib-vp9-decoder/src/vp9_simd/loopfilter.rs` |
 
 The per-stage groups run over one 1080p luma plane through
 `zvidlib::vp9_decoder_bench`. The whole-frame group stops at the decoded YUV
@@ -299,7 +310,7 @@ block, so those two are close to parity by construction.
 
 ## The AV1 encoder suite (`--bench av1_encode`)
 
-`benches/av1_encode.rs` measures the native AV1 encoder on two axes: whole-frame
+`crates/zvidlib-av1-encoder/benches/av1_encode.rs` measures the native AV1 encoder on two axes: whole-frame
 versus per-stage, and instruction set.
 
 The whole-frame groups encode a synthetic monochrome frame through the public
@@ -312,14 +323,14 @@ is not mistaken for bitstream-writing cost. Both default to 640x352 and add a
 
 | Group | Stage |
 | --- | --- |
-| `av1_encode_frame_q{0,32,160}` | one whole frame through the public encoder, `src/av1_encoder/tile.rs` |
-| `av1_encode_stage_wht` | the forward 4x4 WHT, `src/av1_encoder/wht.rs` |
-| `av1_encode_stage_iwht` | the lossless inverse 4x4 WHT, `src/av1_encoder/wht.rs` |
-| `av1_encode_stage_symbol` | symbol coding over the static CDF tables, `src/av1_encoder/symbol.rs` and `cdf.rs` |
-| `av1_encode_stage_coeff_ctx` | the §8.3.2 `coeff_base`/`coeff_br` context derivation on its own, `src/av1_simd/coeff.rs` |
-| `av1_encode_stage_tile` | tile encoding: superblock iteration, `DC_PRED`, coefficient coding and its vectorized §8.3.2 context derivation, `src/av1_encoder/tile.rs` and `src/av1_simd/coeff.rs` |
-| `av1_encode_stage_bitstream` | headers, bit writing and OBU LEB128 framing, `src/av1_encoder/{bitwriter,headers,leb128}.rs` |
-| `av1_forward_dct_{4x4,8x8,16x16,32x32}` | forward DCT, `src/av1_encoder/transform.rs` through `zvidlib::forward_transform` |
+| `av1_encode_frame_q{0,32,160}` | one whole frame through the public encoder, `crates/zvidlib-av1-encoder/src/tile.rs` |
+| `av1_encode_stage_wht` | the forward 4x4 WHT, `crates/zvidlib-av1/src/av1_encoder/wht.rs` |
+| `av1_encode_stage_iwht` | the lossless inverse 4x4 WHT, `crates/zvidlib-av1/src/av1_encoder/wht.rs` |
+| `av1_encode_stage_symbol` | symbol coding over the static CDF tables, `crates/zvidlib-av1-encoder/src/symbol.rs` and `cdf.rs` |
+| `av1_encode_stage_coeff_ctx` | the §8.3.2 `coeff_base`/`coeff_br` context derivation on its own, `crates/zvidlib-av1/src/av1_simd/coeff.rs` |
+| `av1_encode_stage_tile` | tile encoding: superblock iteration, `DC_PRED`, coefficient coding and its vectorized §8.3.2 context derivation, `crates/zvidlib-av1-encoder/src/tile.rs` and `crates/zvidlib-av1/src/av1_simd/coeff.rs` |
+| `av1_encode_stage_bitstream` | headers, bit writing and OBU LEB128 framing, `crates/zvidlib-av1-encoder/src/{bitwriter,headers,leb128}.rs` |
+| `av1_forward_dct_{4x4,8x8,16x16,32x32}` | forward DCT, `crates/zvidlib-av1/src/av1_encoder/transform.rs` through `zvidlib::forward_transform` |
 | `av1_forward_adst_8x8`, `av1_forward_flipadst_16x16` | the forward ADST family, including a flipped type |
 
 The per-stage groups run at `base_q_idx = 0`, the lossless WHT profile, so they
@@ -345,7 +356,7 @@ is the measurement that says why, and what the remaining target is.
 This encoder's vectorized kernels are the forward transforms, the forward WHT
 and its inverse — both WHT directions on `neon` only, since each was measured
 under parity on x86_64 and routed to the scalar reference there — and the
-`coeff_base` / `coeff_br` context derivation the coefficient coding loop runs on (§8.3.2, `src/av1_simd/coeff.rs`, the `av1_coeff_ctx` dispatch site).
+`coeff_base` / `coeff_br` context derivation the coefficient coding loop runs on (§8.3.2, `crates/zvidlib-av1/src/av1_simd/coeff.rs`, the `av1_coeff_ctx` dispatch site).
 The last of those derives a whole block's contexts in one data-parallel pass
 ahead of the serial symbol loop, which is legal because the loop walks the
 up-right diagonal scan backwards, so every neighbour a position consults is
@@ -365,8 +376,8 @@ list on every run, so a group that stops being measured reads as a broken run
 rather than as a stage that costs nothing.
 
 ```sh
-cargo bench --bench av1_encode -- av1_encode_stage    # the per-stage groups only
-ZVIDLIB_BENCH_LARGE=1 cargo bench --bench av1_encode  # add the 1080p pass
+cargo bench -p zvidlib-av1-encoder --bench av1_encode -- av1_encode_stage    # the per-stage groups only
+ZVIDLIB_BENCH_LARGE=1 cargo bench -p zvidlib-av1-encoder --bench av1_encode  # add the 1080p pass
 ```
 
 ### Why the tile group barely moves
@@ -404,7 +415,7 @@ literal-bit runs the coefficient loop writes — not another dispatch family.
 #### What the serial work bought
 
 Both of those changes have since been made, and the 64% figure above is the
-state before them rather than the state now. `src/av1_encoder/symbol.rs` no
+state before them rather than the state now. `crates/zvidlib-av1-encoder/src/symbol.rs` no
 longer buffers each output byte as a `u16` and resolves the pending carries in a
 second reverse pass over the whole stream at `finish`; it normalizes each byte
 as it arrives, which halves the sink and drops the pass. And the equiprobable
@@ -451,8 +462,8 @@ through
 groups in `av1_decode` — so the two directions stay directly comparable:
 
 ```sh
-cargo bench --bench av1_encode -- av1_forward
-cargo bench --bench av1_encode -- 'av1_forward_dct_16x16/scalar'
+cargo bench -p zvidlib-av1-encoder --bench av1_encode -- av1_forward
+cargo bench -p zvidlib-av1-encoder --bench av1_encode -- 'av1_forward_dct_16x16/scalar'
 ```
 
 Note that the correctness guard below runs for every group in a target
@@ -699,7 +710,7 @@ uniform 4x gives 1.95x. So the kernels are *not* a minority of decode time.
 `picture_to_rgba` — was a third of everything the whole-frame groups measure
 with no vector path whatsoever, so every whole-frame SIMD number was diluted by
 roughly a third for a stage no HEVC kernel touched. Issue #219 vectorized it
-(`src/hevc/color_convert.rs`, timed by the `hevc_color_convert` group), and it
+(`crates/zvidlib-color/src/color_convert.rs`, timed by the `hevc_color_convert` group), and it
 falls from **9.16 ms/frame to 1.86 ms/frame — 4.9x** — which is most of why the
 whole-frame ratio moved from ~1.06x to 1.41x on this host. It is still a third
 of the `scalar` arm, because that arm is what a *scalar* colour conversion
@@ -731,7 +742,7 @@ length that LLVM vectorizes on its own: **1.89 → 0.97 ms/frame on the `neon` a
 (1.95x) and 1.84 → 0.98 on the `scalar` arm (1.88x)**, taking the whole decode
 from 20.33 to 19.32 ms/frame on `neon` (5.0% faster) and 28.10 to 27.23 on
 `scalar`, and the whole-frame ratio from 1.38x to 1.41x. The arithmetic is
-unchanged and `tests/codec_conformance.rs` passes on its committed per-frame
+unchanged and `crates/zvidlib-hevc-decoder/tests/hevc_conformance.rs` passes on its committed per-frame
 SHA-256 digests, which is what says the samples written are the same ones.
 
 **The isolated benchmark was measuring the wrong blocks.** `hevc_inter_pred` ran
@@ -1059,7 +1070,7 @@ pool — which is where this file's other multi-model x86_64 readings come from,
 `ubuntu-latest` being a pool of several CPU models — three consecutive
 invocations of the same binary per host, the same in-process interleaved
 best-of-fifteen instrument, the arms asserted equal sample-for-sample before
-anything is timed. To re-take it, run `cargo test --release --features native
+anything is timed. To re-take it, run `cargo test -p zvidlib-hevc-decoder --release
 --lib measure_narrow_vs_wide_block -- --ignored --nocapture` from a workflow job
 on `ubuntu-latest` and `macos-15-intel`, and name the model each draw landed on:
 a ratio that is not attributed to a CPU model is attributed to nothing, and the
@@ -1797,7 +1808,7 @@ same host are 2.4-4.9x. `active_by_site()` answers the question directly.
 
 ## The VP8 encoder suite (`--bench vp8_encode`)
 
-`benches/vp8_encode.rs` measures the native VP8 encoder (issue #569) whole-frame
+`crates/zvidlib-vp8/benches/vp8_encode.rs` measures the native VP8 encoder (issue #569) whole-frame
 and kernel by kernel, scalar against every instruction set the host has. The
 whole-frame groups encode a key frame and three inter frames of
 `support::synthetic_rgba8_sequence` through the public
@@ -1860,13 +1871,13 @@ eight-lane AVX2 body measured behind the four-lane one on this host in every
 run; `sixtap`, `tm_pred` and `quantize` use all eight lanes.
 
 ```sh
-cargo bench --bench vp8_encode -- vp8_encode_stage    # the kernels only
-ZVIDLIB_BENCH_LARGE=1 cargo bench --bench vp8_encode  # add the 1080p frames
+cargo bench -p zvidlib-vp8 --bench vp8_encode -- vp8_encode_stage    # the kernels only
+ZVIDLIB_BENCH_LARGE=1 cargo bench -p zvidlib-vp8 --bench vp8_encode  # add the 1080p frames
 ```
 
 ## The VP8 decoder suite (`--bench vp8_decode`)
 
-`benches/vp8_decode.rs` measures the native VP8 software decoder (issue #568)
+`crates/zvidlib-vp8/benches/vp8_decode.rs` measures the native VP8 software decoder (issue #568)
 whole-frame, and the stages only the decoder runs; the kernels it shares with
 the encoder are timed stage by stage in
 [the VP8 encoder suite](#the-vp8-encoder-suite---bench-vp8_encode). The
@@ -1917,12 +1928,12 @@ macroblock's DC-only blocks, 16 or 8 samples wide, in one load and store per
 sample row.
 
 ```sh
-cargo bench --bench vp8_decode -- vp8_decode_stage   # the stages only
+cargo bench -p zvidlib-vp8 --bench vp8_decode -- vp8_decode_stage   # the stages only
 ```
 
 ## The VP9 encoder suite (`--bench vp9_encode`)
 
-`benches/vp9_encode.rs` measures the native VP9 encoder on the same two axes as
+`crates/zvidlib-vp9-encoder/benches/vp9_encode.rs` measures the native VP9 encoder on the same two axes as
 the AV1 and HEVC encoder suites. Every group is a per-ISA group, guarded for
 bit-exactness and for the override reaching every dispatch site, and all of
 them run at 640x360 on the synthetic content from `benches/support`:
@@ -2140,7 +2151,7 @@ scrub's, and the preview tier is what a scrub was asking for.
 
 **Nothing about the decoded frames changes.** The preview tier is additive and
 opt-in, the reader is untouched, and the 768-frame fixture digests in
-`tests/codec_conformance.rs` and `tests/native_hevc_hardware.rs` still hold.
+`crates/zvidlib-hevc-decoder/tests/hevc_conformance.rs` and `crates/zvidlib-hevc-encoder/tests/native_hevc_hardware.rs` still hold.
 
 ### The same seek in a browser
 
@@ -2199,7 +2210,7 @@ it does not.
 
 ## The Vorbis encoder suite (`--bench vorbis_encode`)
 
-`cargo bench --bench vorbis_encode` encodes ten seconds of synthetic audio
+`cargo bench -p zvidlib-vorbis-encoder --bench vorbis_encode` encodes ten seconds of synthetic audio
 (two partials per channel with vibrato, percussive bursts that force short
 blocks, and a noise floor) through `native_vorbis_audio_encoder_factory()`,
 once per instruction set `zvidlib::simd::available()` reports:
@@ -2218,7 +2229,7 @@ samples per second; each arm also prints its realtime factor.
 The whole encode is the unit on purpose. The vector kernels (issue #573) cover
 the forward MDCT, the real FFT, the noise-mask fits, floor fitting and the log
 spectra. Tone masking, coupling/quantization and residue coding are serial
-and stay scalar; `src/vorbis_encoder/simd/mod.rs` says why for each. They are
+and stay scalar; `crates/zvidlib-vorbis-encoder/src/vorbis_encoder/simd/mod.rs` says why for each. They are
 about half of an encode, so the whole-encode ratio is far below the kernels'
 own: interleaved and best of nine on one x86_64 desktop, the vector arms ran
 the MDCT 2.5-2.9x, the FFT 2.2-2.3x and the noise mask 1.1-1.3x faster, and
@@ -2271,7 +2282,8 @@ because that tag records which *build* produced a number, not which kernel ran.
 the event, and splits it across jobs differently for each.
 
 **On every pull request** the `Benchmarks (compile only)` job runs
-`cargo bench --no-run` over every target and stops. That is one build and no
+`cargo bench --no-run` over every target of every package the pull request can
+affect, and stops. That is one build and no
 measurement. It exists because the usual way a benchmark suite dies is not a bad
 number, it is rotting: the bench code stops compiling against the crate, nobody
 runs it locally, and the decay is only discovered when someone needs a
@@ -2451,8 +2463,10 @@ measurement rather than an edit.
 
 ```sh
 for round in 1 2 3; do
-  for target in codec av1_decode av1_encode hevc_decode hevc_encode; do
-    cargo bench --features native --bench "$target"
+  for target in zvidlib-av1:codec zvidlib-av1-decoder:av1_decode \
+    zvidlib-av1-encoder:av1_encode zvidlib-hevc-decoder:hevc_decode \
+    zvidlib-hevc-encoder:hevc_encode; do
+    cargo bench -p "${target%%:*}" --bench "${target#*:}"
   done
   python3 .github/scripts/criterion_baseline.py collect \
     --criterion-dir target/criterion --out "baseline-$round.json"
@@ -2570,7 +2584,7 @@ Both groups still run, both print their timings and both pass their
 bit-exactness guard; the target that runs second simply overwrites the first,
 and `criterion_baseline.py collect` can only ever see one of them.
 
-`benches/codec.rs` and `benches/av1_decode.rs` both claimed `av1_deblock` until
+`crates/zvidlib-av1/benches/codec.rs` and `crates/zvidlib-av1-decoder/benches/av1_decode.rs` both claimed `av1_deblock` until
 issue #414, and they do not measure the same thing: `codec.rs` filters a
 synthetic 1080p luma plane at level 24, `av1_decode.rs` a structured plane at
 level 32. **Their vector arms agree to 0.1% and their `scalar` arms are 27%
@@ -2653,23 +2667,23 @@ near-parity row now. The table has also grown by twenty-six rows that had no
 rows, both `av1_encode_stage_iwht` rows, `hevc_decode`, `hevc_decode_to_picture`
 and the `hevc_encode_1920x1088` family.
 
-The `av1_deblock` row here is `benches/av1_decode.rs`'s group, which this draw
-ran second and so collected, and `benches/codec.rs`'s group was overwritten in
+The `av1_deblock` row here is `crates/zvidlib-av1-decoder/benches/av1_decode.rs`'s group, which this draw
+ran second and so collected, and `crates/zvidlib-av1/benches/codec.rs`'s group was overwritten in
 every one of its six rounds. That is the opposite side of the collision the
 x86_64 table below collected. See [One group name, two
 targets](#one-group-name-two-targets-and-the-row-that-moved-for-nothing) above.
 
 The `av1_deblock_luma` row is the one figure here not from that draw. #417 made
 it nameable and issue #423 measured it, on the same Apple M1, at
-`6dfd4b53479f`, from `benches/codec.rs` alone so nothing could overwrite it, as
+`6dfd4b53479f`, from `crates/zvidlib-av1/benches/codec.rs` alone so nothing could overwrite it, as
 the elementwise minimum of six rounds of its own under the same recipe.
-`src/av1_simd/filters.rs` and `src/av1_filters.rs` — the vector and scalar
+`crates/zvidlib-av1/src/av1_simd/filters.rs` and `crates/zvidlib-av1/src/av1_filters.rs` — the vector and scalar
 deblocking code the two arms run — are unchanged between that commit and this
 table's stamp, so the row measures the same kernels as the rows around it; for
 this group the rename is the only thing separating the two commits.
 
 The host was quieter for that draw than for the six rounds above, so the row is
-reported with a control rather than on its own. `benches/av1_decode.rs`'s
+reported with a control rather than on its own. `crates/zvidlib-av1-decoder/benches/av1_decode.rs`'s
 `av1_deblock` was re-measured in the same session, same recipe, and read
 **20.288 ms / 2.845 ms (7.13x)** against the **23.124 ms / 3.364 ms (6.87x)**
 the row above carries: both arms 12-15% faster, the ratio within 4%. Read the
@@ -2833,7 +2847,7 @@ by contention, never down. Two arms whose floors are 14% apart under the *same*
 contention were never going to be explained by that contention.
 
 **`av1_encode_stage_wht` is no longer 2.72x.** The old table put the forward
-4x4 WHT at 2.72x `neon`, and `src/av1_simd/mod.rs` cited exactly that figure as
+4x4 WHT at 2.72x `neon`, and `crates/zvidlib-av1/src/av1_simd/mod.rs` cited exactly that figure as
 why `fwht4x4` keeps its kernel on aarch64 while returning `None` on x86_64. This
 draw reads it at **1.03x** at 320x180 and 1.03x at 1080p, and reads the inverse
 direction — `av1_encode_stage_iwht`, which the old table had no row for at all —
@@ -2913,8 +2927,8 @@ does not contain `f695a1a`, the #222 merge, even though #222 landed on `main`
 fifty minutes before the checkpoint was written. That is the whole of why
 `hevc_color_convert` moved; see [Reading the rows](#reading-the-rows) below.
 
-The `av1_deblock` row here is `benches/av1_decode.rs`'s group, which this draw
-ran second and so collected, and `benches/codec.rs`'s group was overwritten in
+The `av1_deblock` row here is `crates/zvidlib-av1-decoder/benches/av1_decode.rs`'s group, which this draw
+ran second and so collected, and `crates/zvidlib-av1/benches/codec.rs`'s group was overwritten in
 every one of its rounds. That is the opposite side of the collision from the
 table this one supersedes, which is why the row moved by a quarter in its
 `scalar` column and not at all in its vector ones. See [One group name, two
@@ -2922,7 +2936,7 @@ targets](#one-group-name-two-targets-and-the-row-that-moved-for-nothing) above.
 
 The `av1_deblock_luma` row is the one figure here not from that draw. #417 made
 it nameable and issue #445 measured it, on the same CPU model, at
-`358259443817`, from `benches/codec.rs` alone and into a `CRITERION_HOME` of its
+`358259443817`, from `crates/zvidlib-av1/benches/codec.rs` alone and into a `CRITERION_HOME` of its
 own so nothing could overwrite it. Six rounds were dispatched by the same
 round-selection this table's own draw used; three landed on the AMD EPYC 7763
 and are the row, as the elementwise minimum of the **nine** rounds they carry
@@ -2933,7 +2947,7 @@ other three (two on an AMD EPYC 9V74 80-Core, one on an Intel Xeon Platinum
 33812836030](https://github.com/lsegal/zvidlib/actions/runs/33812836030), [run
 33812841697](https://github.com/lsegal/zvidlib/actions/runs/33812841697)). The
 nine agree to 0.30% on `scalar` and 0.82% on either vector arm.
-`src/av1_simd/filters.rs` and `src/av1_filters.rs` — the vector and scalar
+`crates/zvidlib-av1/src/av1_simd/filters.rs` and `crates/zvidlib-av1/src/av1_filters.rs` — the vector and scalar
 deblocking code the arms run — are unchanged between `d39c8df519d5` and that
 commit, so the row measures the same kernels as the rows around it and the
 table's stamp does not move; for this group the rename is the only thing
@@ -2941,7 +2955,7 @@ separating the two commits.
 
 Unlike the aarch64 table's `av1_deblock_luma` row, this one needs no allowance
 for a quieter host, because the same session re-measured
-`benches/av1_decode.rs`'s `av1_deblock` into a second `CRITERION_HOME` as a
+`crates/zvidlib-av1-decoder/benches/av1_decode.rs`'s `av1_deblock` into a second `CRITERION_HOME` as a
 control and it lands on the committed row above: **26.975 ms / 3.927 ms
 (6.87x) / 3.381 ms (7.98x)** against the row's 26.956 ms / 3.934 ms (6.85x) /
 3.392 ms (7.95x), every arm within **0.32%**. The new row is therefore directly
@@ -3173,7 +3187,7 @@ cannot name.**
   targets that both registered `av1_deblock` filter different content, so only
   the scalar arm, which branches per position on the filter mask, separates
   them. This draw ran `av1_decode.rs` second and so collected its side; the
-  superseded table collected `benches/codec.rs`'s, now `av1_deblock_luma`. A
+  superseded table collected `crates/zvidlib-av1/benches/codec.rs`'s, now `av1_deblock_luma`. A
   nine-step paired bisect over the range read 0.977x to 1.000x at every step,
   so nothing between the stamps moved the arm. See [One group name, two
   targets](#one-group-name-two-targets-and-the-row-that-moved-for-nothing).
@@ -3188,12 +3202,12 @@ AV1 forward transforms sit between 3.0x and 3.7x, `av1_self_guided` at 3.47x and
 **`hevc_color_convert` reads 4.80x, and the 1.00x it replaced was #222's
 absence rather than a measurement fault.** Every other row of the
 `e115506f8bf6` draw is attributable to #337, and this one is the move #351
-recorded without a cause, because #337 touched only `src/av1_simd` and never
-`src/hevc/color_convert.rs`. At `e115506f8bf6` there is no
-`src/hevc/color_convert.rs` in the tree at all. The conversion is a per-pixel
-scalar double loop inside `picture_to_rgba` in `src/hevc/mod.rs`, with no `simd`
+recorded without a cause, because #337 touched only `crates/zvidlib-av1/src/av1_simd` and never
+`crates/zvidlib-color/src/color_convert.rs`. At `e115506f8bf6` there is no
+`crates/zvidlib-color/src/color_convert.rs` in the tree at all. The conversion is a per-pixel
+scalar double loop inside `picture_to_rgba` in `crates/zvidlib-hevc-decoder/src/lib.rs`, with no `simd`
 dispatch of any kind, so `scalar`, `sse4.1` and `avx2` ran byte-identical code
-and `1.00x / 1.00x` is exactly what they should have read. `benches/hevc_decode.rs`
+and `1.00x / 1.00x` is exactly what they should have read. `crates/zvidlib-hevc-decoder/benches/hevc_decode.rs`
 said as much at that commit: its per-stage table listed the group's `Vectorized`
 column as "no, today". The `convert_row_{sse41,avx2}` kernels arrived with #222
 (`f695a1a`), which the checkpoint the draw was taken on does not contain — see
@@ -3211,7 +3225,7 @@ it was not the only row in that position — `av1_encode_stage_tile` and
 
 **What keeps the hole from reopening.** A per-ISA group is only measuring its
 arms if the code under it reaches a dispatch site that `zvidlib::simd` drives,
-and that is now checked rather than assumed. `src/hevc/color_convert.rs` is
+and that is now checked rather than assumed. `crates/zvidlib-color/src/color_convert.rs` is
 registered as the `hevc_color_convert` site in `simd::active_by_site`, and four
 tests in `src/simd.rs` hold it there: `pinning_scalar_reaches_every_dispatch_site`
 and `clearing_the_override_restores_per_site_detection` assert one selector per
@@ -3246,7 +3260,7 @@ shapes these workloads actually use**, and the answer in each case was to give
 it width rather than to route around it. The mechanism differs, and the
 re-measurement sections below are the record of how each was established.
 
-- `av1_encode_stage_coeff_ctx`. `src/av1_simd/coeff.rs` steps along a *row* of
+- `av1_encode_stage_coeff_ctx`. `crates/zvidlib-av1/src/av1_simd/coeff.rs` steps along a *row* of
   the transform block, and a row shorter than the vector cannot be split across
   more than one iteration however wide the vector is. A 4x4 block is one
   iteration per row under `sse4.1` *and* under `avx2`, four of AVX2's eight
@@ -3517,14 +3531,14 @@ model, which is the strongest form the attribution below can take.
 
 ## Hardware HEVC decoders
 
-`benches/hevc_hardware.rs` is its own `[[bench]]` target. It
+`crates/zvidlib-hevc-decoder/benches/hevc_hardware.rs` is its own `[[bench]]` target. It
 measures whichever platform fixed-function HEVC decoder the host provides —
 NVDEC, Windows Media Foundation, or VideoToolbox — against the pure-Rust
 software decoder on the bundled 1080p sample.
 
 ```sh
-cargo bench --bench hevc_hardware                     # hardware arms only
-ZVIDLIB_BENCH_LARGE=1 cargo bench --bench hevc_hardware  # plus the software baseline
+cargo bench -p zvidlib-hevc-decoder --bench hevc_hardware                     # hardware arms only
+ZVIDLIB_BENCH_LARGE=1 cargo bench -p zvidlib-hevc-decoder --bench hevc_hardware  # plus the software baseline
 ```
 
 Three things make this target different from the rest of the suite:
@@ -3542,7 +3556,7 @@ Three things make this target different from the rest of the suite:
   after that frame is out. Both use `Bencher::iter_custom` to draw the line.
 - **It skips, it does not fail.** With no hardware decoder the group prints why
   and returns, so `cargo bench` works on a dev box without one — the same policy
-  as the `#[ignore]`d `tests/native_hevc_hardware.rs`.
+  as the `#[ignore]`d `crates/zvidlib-hevc-encoder/tests/native_hevc_hardware.rs`.
 
 The software baseline sits behind `ZVIDLIB_BENCH_LARGE=1` like every other group
 that puts the 1080p sample through the software decoder. Both arms decode the
@@ -3741,7 +3755,7 @@ is the GPU's; the only CPU work per frame is the red/blue swap into BGRA and the
 copy into a Media Foundation buffer. Setup is dominated by NVENC's own session
 initialization, and is paid once per recording rather than per frame.
 
-The VideoToolbox row is `cargo bench --features native --bench hevc_hardware`
+The VideoToolbox row is `cargo bench -p zvidlib-hevc-decoder --bench hevc_hardware`
 in release on an Apple M1 on battery, with no builds running (load average 2-3).
 Encode is the criterion estimate from a 40-second measurement; three default
 runs before it gave 107-129 fps, and the untimed pass at the top of each run
@@ -3758,8 +3772,8 @@ criterion measurement and is not comparable.
 
 | Helper | Fixture |
 | --- | --- |
-| `av1_lossless_intra_stream` / `av1_lossless_intra_frame` | `tests/fixtures/codec/av1_lossless_17x9.hex` |
-| `av1_inter_stream` / `av1_inter_temporal_units` | `tests/fixtures/codec/av1_inter_show_existing_16x16.hex` |
+| `av1_lossless_intra_stream` / `av1_lossless_intra_frame` | `crates/zvidlib-av1/tests/fixtures/av1_lossless_17x9.hex` |
+| `av1_inter_stream` / `av1_inter_temporal_units` | `crates/zvidlib-av1/tests/fixtures/av1_inter_show_existing_16x16.hex` |
 | `bundled_hevc_sample` | `examples/media/BigBuckBunny.mp4` |
 | `bundled_aac_track` / `bundled_mp4_bytes` | `examples/media/BigBuckBunny.mp4` (its AAC-LC stereo track) |
 | `aac_mono_track` | `tests/fixtures/codec/aac_lc_mono_48k.m4a` |
@@ -3800,7 +3814,7 @@ judged by and criterion has no unit for it.
 
 ## The HEVC encoder target
 
-`benches/hevc_encode.rs` measures the pure-Rust HEVC encoder on two axes.
+`crates/zvidlib-hevc-encoder/benches/hevc_encode.rs` measures the pure-Rust HEVC encoder on two axes.
 
 **Whole-frame** groups encode a fixed-length synthetic RGBA8 sequence through
 the public `native_hevc_video_encoder_factory` and report frames/sec and
@@ -3844,11 +3858,11 @@ the wrap spans nearly the whole 8-bit range instead of the narrow one video's
 spatial coherence would give it. The chroma — a `% 24` sawtooth around 128 — has
 the opposite skew, being *more* concentrated than video everywhere.
 
-`tests/sao_band_occupancy.rs` is the measurement of this and the way to re-take
+`crates/zvidlib-hevc-encoder/tests/sao_band_occupancy.rs` is the measurement of this and the way to re-take
 it:
 
 ```sh
-cargo test --features native --release --test sao_band_occupancy -- \
+cargo test -p zvidlib-hevc-encoder --release --test sao_band_occupancy -- \
   --ignored --nocapture
 ```
 
@@ -3885,7 +3899,7 @@ Prediction-mode selection, transform-size selection and anything driven by local
 variance carry the same exposure. Before writing a kernel whose cost varies with
 value distribution, re-take the measurement above and check that the group meant
 to judge it carries the distribution the kernel needs; when it does not, judge it
-on the bundled sample's decoded luma, which `tests/sao_band_occupancy.rs` reads
+on the bundled sample's decoded luma, which `crates/zvidlib-hevc-encoder/tests/sao_band_occupancy.rs` reads
 alongside the synthetic planes for exactly that comparison.
 
 The generators are deliberately left as they are. Clamping or reflecting the ramp
@@ -4119,7 +4133,7 @@ histogram and no scatter at all.
 its cost is proportional to the bands it visits and only the band *range* is
 derivable at a price it can pay: a vector min/max is two operations per sample,
 while the set of distinct occupied bands is not available at any price the pass
-can afford. `tests/sao_band_occupancy.rs` is that measurement.
+can afford. `crates/zvidlib-hevc-encoder/tests/sao_band_occupancy.rs` is that measurement.
 
 | content | distinct bands | band range `max - min + 1` |
 | --- | --- | --- |
@@ -4444,16 +4458,16 @@ helpers unused; the module allows `dead_code` for that reason.
 ### The Vorbis groups
 
 The Vorbis decoder is this crate's own (vendored from Symphonia in
-`src/vorbis_decoder/`), and its inverse MDCT, windowed overlap-add and output
+`crates/zvidlib-vorbis-decoder/src/vorbis_decoder/`), and its inverse MDCT, windowed overlap-add and output
 clamp, inverse coupling and floor-times-residue product dispatch through the
-`vorbis_decode` site in `src/vorbis_simd/` (issue #572). Its groups are built
+`vorbis_decode` site in `crates/zvidlib-vorbis-decoder/src/vorbis_simd/` (issue #572). Its groups are built
 through `support::isa::bench_audio_across_isas`, the sample-clock counterpart
 of `bench_across_isas`: one `<group>/<isa>` arm per available instruction set,
 the same bit-exactness guard before anything is timed, and the same per-site
 override assertion, reported in samples/sec and x-realtime rather than
 megapixels.
 
-The whole-stream groups decode the fixtures `tests/vorbis_codec.rs` checks
+The whole-stream groups decode the fixtures `crates/zvidlib-vorbis-encoder/tests/vorbis_codec.rs` checks
 against libvorbis's own decode: half a second of 44.1 kHz stereo music, and a
 quarter second of 48 kHz 5.1 whose mapping couples one channel in several
 steps. The per-stage groups come from `zvidlib::vorbis_decoder_bench`, a narrow

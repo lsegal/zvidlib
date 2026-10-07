@@ -1,0 +1,13 @@
+[package]
+name = "zvidlib-bench-support"
+description = "Shared helpers for zvidlib's criterion benchmarks (development only)"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+criterion = { workspace = true }
+zvidlib-core = { workspace = true }

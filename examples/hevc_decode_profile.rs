@@ -1,10 +1,11 @@
 //! Where HEVC decode time actually goes, on the bundled 1080p sample.
 //!
-//! The per-stage criterion groups in `benches/hevc_decode.rs` time each kernel
-//! on a synthetic workload of its own: they say how fast §8.7.3 SAO is, not how
-//! much SAO a 1080p frame runs. Issue #189 is the gap that leaves — the
-//! whole-frame `hevc_decode/<isa>` arms move only ~1.06x while the individual
-//! kernels measure 1.3x-2.4x, and neither number explains the other without a
+//! The per-stage criterion groups in
+//! `crates/zvidlib-hevc-decoder/benches/hevc_decode.rs` time each kernel on a
+//! synthetic workload of its own: they say how fast §8.7.3 SAO is, not how much
+//! SAO a 1080p frame runs. Issue #189 is the gap that leaves — the whole-frame
+//! `hevc_decode/<isa>` arms move only ~1.06x while the individual kernels
+//! measure 1.3x-2.4x, and neither number explains the other without a
 //! share-of-total breakdown.
 //!
 //! Issue #280 then split §8.5.3.3 inter prediction into `inter_pred_filter`,

@@ -24,11 +24,11 @@ OUTLINED_KERNEL = (
     "NtNtNtB4_6vector3x864Avx2EB6_"
 )
 
-# `vp9_simd::transforms::inverse_transform_add::<av1_simd::vector::x86::Avx2>`,
-# a VP9 kernel written over the AV1 vector types, outlined the same way.
+# `vp9_simd::transforms::inverse_transform_add::<zvidlib_core::simd::vector::x86::Avx2>`,
+# a VP9 kernel written over the shared vector types, outlined the same way.
 OUTLINED_VP9_KERNEL = (
-    "__RINvNtNtCs7lEMBtiCmc_7zvidlib8vp9_simd10transforms21inverse_transform_add"
-    "NtNtNtB6_8av1_simd6vector3x864Avx2EB8_"
+    "__RINvNtNtCs7lEMBtiCmc_19zvidlib_vp9_decoder8vp9_simd10transforms21inverse_transform_add"
+    "NtNtNtNtCs9dUmMyQx2a_12zvidlib_core4simd6vector3x864Avx2EB8_"
 )
 
 # `vorbis_simd::kernels::overlap_add::<vector::x86::Avx2>`, the same defect in
@@ -39,16 +39,16 @@ OUTLINED_VORBIS_KERNEL = (
     "NtNtNtB4_6vector3x864Avx2EB6_"
 )
 
-# `vp8::simd::kernels::sixtap::<av1_simd::vector::x86::Avx2>`: a `vp8::simd`
-# kernel is generic over the same vector types, so the `av1_simd` component
-# its symbol carries is its vector argument's path (issue #569).
+# `zvidlib_vp8::simd::kernels::sixtap::<zvidlib_core::simd::vector::x86::Avx2>`:
+# a VP8 kernel is generic over the same shared vector types (issue #569), and
+# since the workspace split (#604) its `simd` module sits at its crate's root.
 OUTLINED_VP8_KERNEL = (
-    "__RINvNtNtNtCs7lEMBtiCmc_7zvidlib3vp84simd7kernels6sixtap"
-    "NtNtNtB8_8av1_simd6vector3x864Avx2EB8_"
+    "__RINvNtNtCs7lEMBtiCmc_11zvidlib_vp84simd7kernels6sixtap"
+    "NtNtNtNtCs9dUmMyQx2a_12zvidlib_core4simd6vector3x864Avx2EB8_"
 )
 
-# The `#[target_feature]` wrapper `vp8::simd` generates for that kernel.
-VP8_WRAPPER = "__RNvNtNtCs7lEMBtiCmc_7zvidlib3vp84simd11sixtap_avx2"
+# The `#[target_feature]` wrapper `zvidlib_vp8::simd` generates for that kernel.
+VP8_WRAPPER = "__RNvNtCs7lEMBtiCmc_11zvidlib_vp84simd11sixtap_avx2"
 
 # `core::core_arch::x86::avx2::_mm256_and_si256`, an intrinsic emitted as a
 # function because the caller was not compiled with AVX2 enabled.

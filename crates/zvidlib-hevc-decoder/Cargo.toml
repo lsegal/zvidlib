@@ -1,0 +1,46 @@
+[package]
+name = "zvidlib-hevc-decoder"
+description = "Pure-Rust HEVC software decoder for zvidlib"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+# Tests, their fixtures and benchmarks are not needed to build the crate.
+exclude = ["/tests", "/benches"]
+
+[build-dependencies]
+zvidlib-build = { workspace = true }
+
+[dependencies]
+zvidlib-core = { workspace = true }
+zvidlib-color = { workspace = true }
+zvidlib-hevc-syntax = { workspace = true }
+zvidlib-hardware = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+zvidlib-bench-support = { path = "../zvidlib-bench-support" }
+zvidlib-container = { path = "../zvidlib-container" }
+zvidlib-hevc-encoder = { path = "../zvidlib-hevc-encoder" }
+
+[features]
+# Additive, off by default, and gating no code: the benchmark harness folds it
+# into every criterion group name (`simd=off` / `simd=on`), as zvidlib's own
+# `simd` feature does, so the two arms are recorded separately.
+simd = []
+
+[[bench]]
+name = "hevc_decode"
+harness = false
+
+# The platform hardware HEVC decoders against the software one. A separate
+# target because it measures the OS/driver decoders rather than any of the
+# crate's own kernels, so it shares none of the scalar-vs-SIMD machinery the
+# other targets are built around, and because it is the only target that skips
+# itself outright on a host without the hardware it measures.
+[[bench]]
+name = "hevc_hardware"
+harness = false

@@ -75,10 +75,10 @@ fn jobs(workflow: &str) -> Vec<Job> {
 /// Whether a job body runs cargo at all.
 ///
 /// `rustup show` alone does not need a cache: the deploy job installs nothing
-/// and builds nothing, and requiring a cache of it would be noise. Nor does a
-/// test shard in `ci.yml`: it runs a prebuilt `cargo nextest archive` by
-/// invoking `cargo-nextest` directly, which compiles nothing (#595), and the
-/// job that builds the archive is the one that carries the cache.
+/// and builds nothing, and requiring a cache of it would be noise. Nor would a
+/// job that only ran a prebuilt `cargo nextest archive` by invoking
+/// `cargo-nextest` directly, which compiles nothing; the test shards did that
+/// until each package's tests got a job of their own (#595, #612).
 fn builds_with_cargo(body: &str) -> bool {
     body.lines()
         .map(str::trim)

@@ -34,8 +34,11 @@ jobs:
           cache-on-failure: true
       - name: Install native audio dependencies
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      # Every workspace crate, not only `zvidlib`: its pages inline the
+      # subcrates' items, and `-D warnings` is what keeps their intra-doc links
+      # from rotting in the crates docs.rs documents on their own (#604).
       - name: Build API documentation
-        run: cargo doc --no-deps --features native
+        run: cargo doc --workspace --no-deps --features native
         env:
           RUSTDOCFLAGS: -D warnings
       - name: Add redirect index

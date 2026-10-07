@@ -20,7 +20,7 @@ use crate::codec::{
     CancellationToken, CodecProfile, EncodedVideoSample, ExactFrameReader, HardwarePreference,
     VideoDecoderConfig, VideoDecoderFactory,
 };
-use crate::codec_config::{box_payload, derive_codec_string};
+use crate::codec_config::derive_codec_string;
 use crate::io::MemorySource;
 use crate::media::{Codec, ColorRange, PixelFormat, VideoDimensions, VideoFrame};
 use crate::mp4_demux::Mp4Track;
@@ -37,6 +37,7 @@ use web_sys::{
     VideoDecoder as JsVideoDecoder, VideoDecoderConfig as JsVideoDecoderConfig, VideoDecoderInit,
     VideoDecoderSupport, VideoFrame as JsVideoFrame, VideoFrameCopyToOptions, VideoPixelFormat,
 };
+use zvidlib_core::codec_config::box_payload;
 
 /// How many samples may sit in the `WebCodecs` decoder's queue at once while
 /// `get()` waits for a frame. Deep enough to keep an accelerated decoder busy
@@ -65,12 +66,12 @@ fn codec_description(codec: Codec, decoder_config: &[u8]) -> Result<&[u8]> {
         Codec::Vp8 => Ok(&[]),
         // Nor does VP9's: its bitstream describes itself.
         Codec::Vp9 => Ok(&[]),
-        Codec::UncompressedVideo | Codec::H264 | Codec::Aac | Codec::Opus | Codec::Vorbis => {
-            Err(Error::new(
-                ErrorKind::Unsupported,
-                "only HEVC, AV1, VP8 and VP9 have a WebCodecs decoder backend",
-            ))
-        }
+        // Uncompressed video, H.264, the audio codecs, and any codec a later
+        // zvidlib-core adds.
+        _ => Err(Error::new(
+            ErrorKind::Unsupported,
+            "only HEVC, AV1, VP8 and VP9 have a WebCodecs decoder backend",
+        )),
     }
 }
 
@@ -295,12 +296,12 @@ fn software_decoder_factory(codec: Codec) -> Result<Box<dyn VideoDecoderFactory>
         Codec::Av1 => Ok(Box::new(crate::native_av1_video_decoder_factory())),
         Codec::Vp8 => Ok(Box::new(crate::native_vp8_video_decoder_factory())),
         Codec::Vp9 => Ok(Box::new(crate::native_vp9_video_decoder_factory())),
-        Codec::UncompressedVideo | Codec::H264 | Codec::Aac | Codec::Opus | Codec::Vorbis => {
-            Err(Error::new(
-                ErrorKind::Unsupported,
-                "only HEVC, AV1, VP8 and VP9 have a software decoder backend",
-            ))
-        }
+        // Uncompressed video, H.264, the audio codecs, and any codec a later
+        // zvidlib-core adds.
+        _ => Err(Error::new(
+            ErrorKind::Unsupported,
+            "only HEVC, AV1, VP8 and VP9 have a software decoder backend",
+        )),
     }
 }
 
@@ -398,7 +399,7 @@ fn av1_color_range(
 fn vp9_color_range(track: &Mp4Track, samples: &[EncodedVideoSample]) -> ColorRange {
     let full = samples
         .first()
-        .and_then(|sample| crate::vp9_dec::chunk_full_range(&sample.data))
+        .and_then(|sample| zvidlib_vp9_syntax::chunk_full_range(&sample.data))
         .or_else(|| {
             crate::Vp9CodecConfig::parse(&track.decoder_config)
                 .ok()
@@ -451,7 +452,7 @@ struct WebCodecsDecoder {
     /// Position of the next sample not yet submitted to `decoder` in the
     /// current decode session; `None` once a reset is needed. Mirrors
     /// `VideoDecoder::next_decode_position` in the portable backend
-    /// (`src/codec.rs`): as long as the requested frame can be reached by
+    /// (`crates/zvidlib-core/src/codec.rs`): as long as the requested frame can be reached by
     /// continuing to submit from here, `get()` avoids resetting the
     /// decoder, which is what lets a session walk arbitrarily deep into a
     /// single GOP (see `get()` for why resets are otherwise required).
@@ -968,7 +969,8 @@ mod tests {
         ));
     }
 
-    const SMALL_HEVC: &[u8] = include_bytes!("../tests/fixtures/codec/bbb_hevc_512x288_gop32.mp4");
+    const SMALL_HEVC: &[u8] =
+        include_bytes!("../crates/zvidlib-hevc-decoder/tests/fixtures/bbb_hevc_512x288_gop32.mp4");
 
     fn digest(dimensions: VideoDimensions, rgba: Vec<u8>) -> String {
         let limits = Limits::default();
@@ -1087,12 +1089,15 @@ mod tests {
     /// independent FFmpeg decode of the same track.
     #[wasm_bindgen_test(async)]
     async fn software_fallback_decodes_hevc_main10() {
-        const MAIN10: &[u8] = include_bytes!("../tests/fixtures/codec/bbb_hevc_main10_128x72.mp4");
-        let expected: Vec<&str> =
-            include_str!("../tests/fixtures/codec/bbb_hevc_main10_128x72_rgba.sha256")
-                .lines()
-                .map(|line| line.split_once(' ').unwrap().1)
-                .collect();
+        const MAIN10: &[u8] = include_bytes!(
+            "../crates/zvidlib-hevc-decoder/tests/fixtures/bbb_hevc_main10_128x72.mp4"
+        );
+        let expected: Vec<&str> = include_str!(
+            "../crates/zvidlib-hevc-decoder/tests/fixtures/bbb_hevc_main10_128x72_rgba.sha256"
+        )
+        .lines()
+        .map(|line| line.split_once(' ').unwrap().1)
+        .collect();
         let mut session = WebVideoDecodeSession::open_with(
             MAIN10,
             0,
@@ -1316,6 +1321,10 @@ mod tests {
                 muxer.write_sample(0, sample).await.unwrap();
             }
         }
+        // The encoder holds the start of each group back until it has seen it.
+        for sample in encoder.finish().await.unwrap() {
+            muxer.write_sample(0, sample).await.unwrap();
+        }
         let bytes = muxer.finish().await.unwrap().into_inner();
 
         let Ok(mut session) = WebVideoDecodeSession::open(&bytes, 0, &limits).await else {
@@ -1344,7 +1353,8 @@ mod tests {
     /// Issue #509: a colour AV1 track (the bundled SVT-AV1 8-bit 4:2:0 Main
     /// sample) decodes through the fallback. The digests are FFmpeg/libdav1d's
     /// decode of the same frames converted by the crate's own BT.601 RGBA
-    /// conversion, the lines of `tests/fixtures/codec/big_buck_bunny_av1_rgba.sha256`
+    /// conversion, the lines of
+    /// `crates/zvidlib-av1-decoder/tests/fixtures/big_buck_bunny_av1_rgba.sha256`
     /// the native conformance test checks every frame against; frame 20 is
     /// reached by walking forwards from the random-access point at frame 0.
     #[wasm_bindgen_test(async)]
@@ -1392,17 +1402,19 @@ mod tests {
     /// sample, whose superframes carry hidden alternate reference frames)
     /// decodes through the fallback to exactly the frames libvpx decodes it
     /// to, converted by the crate's BT.601 RGBA conversion - the lines of
-    /// `tests/fixtures/codec/vp9_bbb_256x144_rgba.sha256` the native
+    /// `crates/zvidlib-vp9-decoder/tests/fixtures/vp9_bbb_256x144_rgba.sha256` the native
     /// conformance test checks. Frame 30 is reached from the key frame at 24,
     /// and frame 3 by restarting at 0.
     #[wasm_bindgen_test(async)]
     async fn software_fallback_decodes_vp9_like_libvpx() {
-        const VP9: &[u8] = include_bytes!("../tests/fixtures/codec/vp9_bbb_256x144.mp4");
-        let expected: Vec<&str> =
-            include_str!("../tests/fixtures/codec/vp9_bbb_256x144_rgba.sha256")
-                .lines()
-                .map(|line| line.split_once(' ').unwrap().1)
-                .collect();
+        const VP9: &[u8] =
+            include_bytes!("../crates/zvidlib-vp9-decoder/tests/fixtures/vp9_bbb_256x144.mp4");
+        let expected: Vec<&str> = include_str!(
+            "../crates/zvidlib-vp9-decoder/tests/fixtures/vp9_bbb_256x144_rgba.sha256"
+        )
+        .lines()
+        .map(|line| line.split_once(' ').unwrap().1)
+        .collect();
         let mut session = WebVideoDecodeSession::open_with(
             VP9,
             0,
@@ -1433,7 +1445,8 @@ mod tests {
     /// track's size.
     #[wasm_bindgen_test(async)]
     async fn vp9_tracks_decode_through_webcodecs_or_the_fallback() {
-        const VP9: &[u8] = include_bytes!("../tests/fixtures/codec/vp9_bbb_256x144.mp4");
+        const VP9: &[u8] =
+            include_bytes!("../crates/zvidlib-vp9-decoder/tests/fixtures/vp9_bbb_256x144.mp4");
         let source = MemorySource::new(VP9.to_vec());
         let track = parse_video_track(&source, 0, &Limits::default())
             .await
@@ -1468,7 +1481,8 @@ mod tests {
     /// AV1 decoder covers 8-bit streams, so a 10-bit Main track is refused.
     #[wasm_bindgen_test(async)]
     async fn a_track_the_software_decoder_refuses_stays_unsupported() {
-        const MAIN_10_AV1: &[u8] = include_bytes!("../tests/fixtures/codec/av1_main10_64x64.mp4");
+        const MAIN_10_AV1: &[u8] =
+            include_bytes!("../crates/zvidlib-av1-decoder/tests/fixtures/av1_main10_64x64.mp4");
         let error = match WebVideoDecodeSession::open_with(
             MAIN_10_AV1,
             0,
@@ -1488,7 +1502,8 @@ mod tests {
         );
     }
 
-    const VP8_ALTREF: &[u8] = include_bytes!("../tests/fixtures/codec/vp8/vp8_altref_98x66.webm");
+    const VP8_ALTREF: &[u8] =
+        include_bytes!("../crates/zvidlib-vp8/tests/fixtures/vp8/vp8_altref_98x66.webm");
 
     /// Issue #537: three of this WebM track's 43 VP8 blocks are hidden
     /// alternate references. The session counts only its 40 shown frames and

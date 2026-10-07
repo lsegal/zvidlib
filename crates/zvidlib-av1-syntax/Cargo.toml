@@ -1,0 +1,13 @@
+[package]
+name = "zvidlib-av1-syntax"
+description = "AV1 OBU and codec configuration record parsing for zvidlib"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+zvidlib-core = { workspace = true }

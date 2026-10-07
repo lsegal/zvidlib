@@ -1,0 +1,39 @@
+[package]
+name = "zvidlib-vp9-decoder"
+description = "Pure-Rust VP9 software decoder for zvidlib"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+# Tests, their fixtures and benchmarks are not needed to build the crate.
+exclude = ["/tests", "/benches"]
+
+[build-dependencies]
+zvidlib-build = { workspace = true }
+
+[dependencies]
+zvidlib-core = { workspace = true }
+zvidlib-color = { workspace = true }
+zvidlib-vp9-syntax = { workspace = true }
+zvidlib-hardware = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+zvidlib-bench-support = { path = "../zvidlib-bench-support" }
+zvidlib-container = { path = "../zvidlib-container" }
+
+[features]
+# Additive, off by default, and gating no code: the benchmark harness folds it
+# into every criterion group name (`simd=off` / `simd=on`), as zvidlib's own
+# `simd` feature does, so the two arms are recorded separately.
+simd = []
+
+# The VP9 software decoder's own scalar-vs-SIMD suite: whole-frame decode and
+# every stage the `vp9_decode` dispatch site vectorizes. A separate target for
+# the same reasons as `av1_decode`; it shares `benches/support/` with the rest.
+[[bench]]
+name = "vp9_decode"
+harness = false

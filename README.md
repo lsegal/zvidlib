@@ -380,7 +380,7 @@ Every native encoder, by operating system, and what does the encoding. A *hardwa
 | Opus (`NativeOpusDecoder`) | **Software**: `opus-pure` | **Software**: `opus-pure` | **Software**: `opus-pure` |
 | Vorbis (`NativeVorbisDecoder`) | **Software**: vendored Symphonia Vorbis decoder | **Software**: vendored Symphonia Vorbis decoder | **Software**: vendored Symphonia Vorbis decoder |
 
-The native audio decoders are pure Rust except AAC's on macOS and Windows: `NativeAacDecoder` runs the platform's AAC-LC decoder there, AudioToolbox on macOS and Media Foundation's AAC decoder MFT on Windows, and Symphonia's AAC decoder on Linux and the other native targets, which have no platform AAC decoder; it takes mono and stereo streams. `NativeVorbisDecoder` runs a copy of Symphonia's Vorbis decoder vendored in `src/vorbis_decoder/` with its surround decoding fixed, for one to eight channels in the Vorbis channel order, and `NativeOpusDecoder` runs `opus-pure`, which passes all twelve RFC 8251 decoder conformance vectors in stereo and in mono. Opus is read from and written to MP4 (`Opus` sample entries with `dOps`) and WebM; Vorbis has no MP4 mapping, so it is read from and written to WebM, `VorbisConfig` parses and writes the Xiph-laced `CodecPrivate` WebM carries, and `Mp4Muxer` refuses a Vorbis track.
+The native audio decoders are pure Rust except AAC's on macOS and Windows: `NativeAacDecoder` runs the platform's AAC-LC decoder there, AudioToolbox on macOS and Media Foundation's AAC decoder MFT on Windows, and Symphonia's AAC decoder on Linux and the other native targets, which have no platform AAC decoder; it takes mono and stereo streams. `NativeVorbisDecoder` runs a copy of Symphonia's Vorbis decoder vendored in `crates/zvidlib-vorbis-decoder/src/vorbis_decoder/` with its surround decoding fixed, for one to eight channels in the Vorbis channel order, and `NativeOpusDecoder` runs `opus-pure`, which passes all twelve RFC 8251 decoder conformance vectors in stereo and in mono. Opus is read from and written to MP4 (`Opus` sample entries with `dOps`) and WebM; Vorbis has no MP4 mapping, so it is read from and written to WebM, `VorbisConfig` parses and writes the Xiph-laced `CodecPrivate` WebM carries, and `Mp4Muxer` refuses a Vorbis track.
 
 The browser build encodes through `WebCodecs` instead: AV1 Main, HEVC Main or VP9 profile 0 video and AAC-LC or Opus audio, wherever the browser provides those encoders (see [Implemented browser boundary](#implemented-browser-boundary)).
 
@@ -424,13 +424,19 @@ capability change.
 Install stable Rust with the `wasm32-unknown-unknown` target, then run:
 
 ```console
-cargo check --features native
+cargo check --workspace --features native
 cargo check --target wasm32-unknown-unknown --no-default-features --features web
 cargo fmt --all -- --check
-cargo clippy --all-targets --features native -- -D warnings
+cargo clippy --workspace --all-targets --features native -- -D warnings
 ```
 
-These commands validate the portable core on both targets. Native builds include accelerated HEVC Main decode through NVDEC on supported 64-bit Windows/Linux systems, Media Foundation on Windows, and VideoToolbox on macOS, with a dependency-free pure-Rust fallback. They also include the pure-Rust AV1 Main decoder (8-bit 4:2:0 colour and monochrome streams with every Main-profile coding tool and in-loop filter, verified frame-for-frame against an independent libdav1d decode), the pure-Rust VP9 profile 0 decoder (verified against libvpx's per-frame digests of its own test vectors), a dependency-free VP9 profile 0 encoder with inter frames (verified pixel for pixel against ffmpeg's VP9 decoder and libvpx), a VP8 decoder (`native_vp8_video_decoder_factory`, every bitstream version, bit-exact with libvpx on its VP8 test vectors, including hidden alternate-reference frames) that uses NVDEC or Media Foundation where available and pure Rust otherwise, dependency-free HEVC Main and monochrome AV1 Main-profile encoders (lossless, plus a non-lossless path verified against both the crate's own decoder and an independent ffmpeg decode), AAC-LC, Opus and Vorbis decode, pure-Rust Opus and Vorbis encoders, and default-device PCM output described above. Native builds also encode HEVC Main in hardware through VideoToolbox on macOS and Media Foundation on Windows, and AAC-LC through AudioToolbox on macOS and Media Foundation on Windows. The encoder table under [Platform expectations](#platform-expectations) lists every encoder by operating system. The browser build reads exact AAC, Opus and Vorbis sample ranges through `WebCodecs` `AudioDecoder` with software Opus and Vorbis fallbacks, and encodes AAC-LC, Opus or Vorbis through its own bridge (see [Implemented browser boundary](#implemented-browser-boundary)). Color AV1 encoding beyond the monochrome profile and fully portable audio-device abstractions remain planned.
+These commands validate the portable core on both targets. The repository is a
+Cargo workspace: `zvidlib` at the root, which is the only crate to depend on,
+and the codec, container and shared-core crates it is built from under
+`crates/` (see `ARCHITECTURE.md`). Without `--workspace` or `-p <crate>`, a
+cargo command at the root covers the root package only; `cargo test -p
+zvidlib-vp8` runs one crate's tests, `cargo test --workspace --features native`
+every package's. Native builds include accelerated HEVC Main decode through NVDEC on supported 64-bit Windows/Linux systems, Media Foundation on Windows, and VideoToolbox on macOS, with a dependency-free pure-Rust fallback. They also include the pure-Rust AV1 Main decoder (8-bit 4:2:0 colour and monochrome streams with every Main-profile coding tool and in-loop filter, verified frame-for-frame against an independent libdav1d decode), the pure-Rust VP9 profile 0 decoder (verified against libvpx's per-frame digests of its own test vectors), a dependency-free VP9 profile 0 encoder with inter frames (verified pixel for pixel against ffmpeg's VP9 decoder and libvpx), a VP8 decoder (`native_vp8_video_decoder_factory`, every bitstream version, bit-exact with libvpx on its VP8 test vectors, including hidden alternate-reference frames) that uses NVDEC or Media Foundation where available and pure Rust otherwise, dependency-free HEVC Main and monochrome AV1 Main-profile encoders (lossless, plus a non-lossless path verified against both the crate's own decoder and an independent ffmpeg decode), AAC-LC, Opus and Vorbis decode, pure-Rust Opus and Vorbis encoders, and default-device PCM output described above. Native builds also encode HEVC Main in hardware through VideoToolbox on macOS and Media Foundation on Windows, and AAC-LC through AudioToolbox on macOS and Media Foundation on Windows. The encoder table under [Platform expectations](#platform-expectations) lists every encoder by operating system. The browser build reads exact AAC, Opus and Vorbis sample ranges through `WebCodecs` `AudioDecoder` with software Opus and Vorbis fallbacks, and encodes AAC-LC, Opus or Vorbis through its own bridge (see [Implemented browser boundary](#implemented-browser-boundary)). Color AV1 encoding beyond the monochrome profile and fully portable audio-device abstractions remain planned.
 
 Native compressed-codec backends use the public `VideoDecoderConformanceVector`
 and `VideoEncoderConformanceVector` runners before registration. Decoder vectors
@@ -444,12 +450,12 @@ external library.
 The VP9 decoder is additionally checked against every VP9 profile 0 test vector
 libvpx's own test suite decodes, which CI downloads from the WebM project. To
 run that check locally, download the vectors named in
-`tests/fixtures/codec/libvpx_vp9_test_vectors.txt`, each with its `.md5` file,
+`crates/zvidlib-vp9-decoder/tests/fixtures/libvpx_vp9_test_vectors.txt`, each with its `.md5` file,
 from `https://storage.googleapis.com/downloads.webmproject.org/test_data/libvpx/`
 into one directory, then:
 
 ```console
-ZVIDLIB_VP9_VECTORS=/path/to/vectors cargo test --features native --lib vp9_dec::tests::libvpx_test_vectors -- --ignored
+ZVIDLIB_VP9_VECTORS=/path/to/vectors cargo test -p zvidlib-vp9-decoder --lib vp9_dec::tests::libvpx_test_vectors -- --ignored
 ```
 
 ## Building, testing, and using WebAssembly

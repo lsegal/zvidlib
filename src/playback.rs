@@ -525,6 +525,28 @@ impl PlaybackVideoSource for crate::ExactFrameReader {
     }
 }
 
+impl<D: crate::AudioDecoder> PlaybackAudioSource for crate::AudioSampleReader<D> {
+    fn sample_rate(&self) -> u32 {
+        self.sample_rate()
+    }
+
+    fn presentation_length(&self) -> u64 {
+        self.presentation_length()
+    }
+
+    fn read(
+        &mut self,
+        range: crate::SampleRange,
+        cancellation: &CancellationToken,
+    ) -> Result<AudioBuffer> {
+        self.get_range(range, cancellation)
+    }
+
+    fn reset(&mut self) -> Result<()> {
+        self.reset()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
