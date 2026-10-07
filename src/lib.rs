@@ -132,6 +132,16 @@ pub use hevc::narrow_interp as hevc_narrow_interp;
 #[doc(hidden)]
 pub use hevc::readback as hevc_hardware_readback;
 
+/// Per-stage access to the native VP9 encoder's pixel kernels for the criterion
+/// benchmark suite.
+///
+/// Internal and unstable, like [`hevc_encoder_bench`]: the kernels are not
+/// otherwise reachable from a benchmark, which is a separate crate. See
+/// `benches/vp9_encode.rs`.
+#[cfg(not(target_arch = "wasm32"))]
+#[doc(hidden)]
+pub use vp9_encoder::bench as vp9_encoder_bench;
+
 #[cfg(not(target_arch = "wasm32"))]
 mod native_audio;
 

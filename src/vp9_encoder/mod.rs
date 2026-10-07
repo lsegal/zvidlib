@@ -16,10 +16,13 @@
 //! takes the same configuration without that flag: it is rate controlled by
 //! quality, which `base_q_idx` maps onto, instead of to a bitrate.
 
+#[cfg(not(target_arch = "wasm32"))]
+pub mod bench;
 mod bitwriter;
 mod context;
 mod dsp;
 mod frame;
+pub(crate) mod simd;
 mod tables;
 
 use crate::{
@@ -806,39 +809,58 @@ fn source_picture(
         }
         PixelFormat::Rgba8 | PixelFormat::Bgra8 => {
             let input = &frame.planes[0];
-            let (red, blue) = if frame.pixel_format == PixelFormat::Rgba8 {
-                (0, 2)
-            } else {
-                (2, 0)
+            let bgra = frame.pixel_format == PixelFormat::Bgra8;
+            // The BT.601 rows, reordered to the pixels' byte order.
+            let order = |mut coefficients: [i32; 3]| {
+                if bgra {
+                    coefficients.swap(0, 2);
+                }
+                coefficients
             };
-            let rgb = |x: usize, y: usize| {
-                let offset = stored(y, height) * input.stride + x * 4;
-                [
-                    i32::from(input.data[offset + red]),
-                    i32::from(input.data[offset + 1]),
-                    i32::from(input.data[offset + blue]),
-                ]
+            let (luma, luma_offset, cb, cr) = if full {
+                ([77, 150, 29], 0, [-43, -85, 128], [128, -107, -21])
+            } else {
+                ([66, 129, 25], 16, [-38, -74, 112], [112, -94, -18])
+            };
+            let (luma, cb, cr) = (order(luma), order(cb), order(cr));
+            let row = |y: usize| {
+                let start = stored(y, height) * input.stride;
+                &input.data[start..start + width * 4]
             };
             let stride = picture.strides[0];
             for y in 0..height {
-                for x in 0..width {
-                    picture.planes[0][y * stride + x] = luma(rgb(x, y), full);
-                }
+                simd::luma_row(
+                    row(y),
+                    luma,
+                    luma_offset,
+                    &mut picture.planes[0][y * stride..y * stride + width],
+                );
             }
+            // An odd width's last chroma sample averages the last column with
+            // itself, and an odd height's last row averages the last row with
+            // itself.
+            let mut padded = [Vec::new(), Vec::new()];
             let chroma_stride = picture.strides[1];
+            let [_, cb_plane, cr_plane] = &mut picture.planes;
             for y in 0..chroma_height {
-                for x in 0..chroma_width {
-                    let mut sum = [0_i32; 3];
-                    for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
-                        let sample = rgb((x * 2 + dx).min(width - 1), (y * 2 + dy).min(height - 1));
-                        for channel in 0..3 {
-                            sum[channel] += sample[channel];
-                        }
+                let mut rows = [row(y * 2), row((y * 2 + 1).min(height - 1))];
+                if width % 2 == 1 {
+                    for (padded, row) in padded.iter_mut().zip(&mut rows) {
+                        padded.clear();
+                        padded.extend_from_slice(row);
+                        padded.extend_from_slice(&row[row.len() - 4..]);
+                        *row = padded;
                     }
-                    let [cb, cr] = chroma(sum.map(|value| (value + 2) >> 2), full);
-                    picture.planes[1][y * chroma_stride + x] = cb;
-                    picture.planes[2][y * chroma_stride + x] = cr;
                 }
+                let range = y * chroma_stride..y * chroma_stride + chroma_width;
+                simd::chroma_row(
+                    rows[0],
+                    rows[1],
+                    cb,
+                    cr,
+                    &mut cb_plane[range.clone()],
+                    &mut cr_plane[range],
+                );
             }
         }
         PixelFormat::Rgb8 => {
@@ -873,34 +895,6 @@ fn source_picture(
         }
     }
     Ok(picture)
-}
-
-/// BT.601 luma from 8-bit RGB.
-fn luma([r, g, b]: [i32; 3], full: bool) -> u8 {
-    if full {
-        ((77 * r + 150 * g + 29 * b + 128) >> 8).clamp(0, 255) as u8
-    } else {
-        (((66 * r + 129 * g + 25 * b + 128) >> 8) + 16).clamp(0, 255) as u8
-    }
-}
-
-/// BT.601 Cb and Cr from 8-bit RGB.
-fn chroma([r, g, b]: [i32; 3], full: bool) -> [u8; 2] {
-    let (cb, cr) = if full {
-        (
-            (-43 * r - 85 * g + 128 * b + 128) >> 8,
-            (128 * r - 107 * g - 21 * b + 128) >> 8,
-        )
-    } else {
-        (
-            (-38 * r - 74 * g + 112 * b + 128) >> 8,
-            (112 * r - 94 * g - 18 * b + 128) >> 8,
-        )
-    };
-    [
-        (cb + 128).clamp(0, 255) as u8,
-        (cr + 128).clamp(0, 255) as u8,
-    ]
 }
 
 #[cfg(test)]
