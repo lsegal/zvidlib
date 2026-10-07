@@ -10,6 +10,7 @@ members = ["crates/*"]
 
 [workspace.package]
 version = "0.3.0"
+license = "MIT"
 edition = "2024"
 rust-version = "1.85"
 repository = "https://github.com/lsegal/zvidlib"
@@ -63,6 +64,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
+license.workspace = true
 keywords.workspace = true
 categories.workspace = true
 # Integration fixtures and browser demo videos are not needed to build the
