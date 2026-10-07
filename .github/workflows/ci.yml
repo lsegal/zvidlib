@@ -289,9 +289,11 @@ jobs:
   # cache. `.config/nextest.toml` keeps the hardware and wall-clock tests from
   # sharing the machine, which one step per binary used to guarantee.
   #
-  # `--partition count:` deals the tests out round-robin, so no shard is handed
-  # a whole slow binary such as `opus_codec`, which alone took two and a half
-  # minutes of the old job.
+  # `--partition count:` deals the tests out round-robin, so the slow binaries'
+  # tests are spread over the shards rather than queued behind each other. The
+  # floor is `opus_codec`'s `rfc8251_test_vectors_pass_opus_compare`, a single
+  # test of about three minutes that whichever shard draws it runs alongside
+  # its other tests; more shards would not make that one test shorter.
   rust-tests:
     name: Rust tests (${{ matrix.shard }}/3)
     needs: rust-tests-build
@@ -344,27 +346,45 @@ jobs:
           cargo-nextest nextest run --profile ci \
             --archive-file nextest-archive.tar.zst --workspace-remap . \
             --partition count:${{ matrix.shard }}/3
-      # The VP9 decoder is held bit-exact to libvpx on every profile 0 test
-      # vector libvpx's own test suite decodes (#527): hidden frames,
-      # superframes, show_existing_frame, intra-only frames, scaled reference
-      # frames, tiles, frame sizes from 2x2 to 1920x1080 and so on. The vectors
-      # and their per-frame MD5s come from the WebM project's test-data bucket,
-      # about 27 MB in all, so they are cached between runs, keyed on the list
-      # of names the test reads. One host is enough: this one runs the widest
-      # vector kernels it detects, and every other instruction set is held to
-      # the scalar reference by the `vp9_simd` unit tests and the per-ISA
-      # fixture decode in the library units, which every native host runs
-      # (#570). The test is `#[ignore]`d for every other run, so one shard runs
-      # it alone with `--run-ignored only` and a filter that names it: the
-      # library's other ignored tests are measurement sweeps.
+
+  # The VP9 decoder is held bit-exact to libvpx on every profile 0 test vector
+  # libvpx's own test suite decodes (#527): hidden frames, superframes,
+  # show_existing_frame, intra-only frames, scaled reference frames, tiles,
+  # frame sizes from 2x2 to 1920x1080 and so on. The vectors and their
+  # per-frame MD5s come from the WebM project's test-data bucket, about 27 MB in
+  # all, so they are cached between runs, keyed on the list of names the test
+  # reads. One host is enough: this one runs the widest vector kernels it
+  # detects, and every other instruction set is held to the scalar reference by
+  # the `vp9_simd` unit tests and the per-ISA fixture decode in the library
+  # units, which every native host runs (#570).
+  #
+  # The test is `#[ignore]`d for every other run, so it is run on its own with
+  # `--run-ignored only` and a filter that names it - the library's other
+  # ignored tests are measurement sweeps. It is a job of its own rather than a
+  # step after one shard's tests because it is most of a minute by itself, and
+  # added to whichever shard it followed it made that shard the slowest.
+  rust-tests-vp9-vectors:
+    name: Rust tests (libvpx VP9 vectors)
+    needs: rust-tests-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native audio dependencies
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - name: Download the test archive
+        uses: actions/download-artifact@v4
+        with:
+          name: nextest-archive-linux-${{ github.run_id }}
       - name: Cache the libvpx VP9 test vectors
-        if: matrix.shard == 1
         uses: actions/cache@v4
         with:
           path: vp9-test-vectors
           key: libvpx-vp9-test-vectors-${{ hashFiles('tests/fixtures/codec/libvpx_vp9_test_vectors.txt') }}
       - name: Download the libvpx VP9 test vectors
-        if: matrix.shard == 1
         run: |
           mkdir -p vp9-test-vectors
           while read -r name; do
@@ -376,7 +396,6 @@ jobs:
             done
           done < tests/fixtures/codec/libvpx_vp9_test_vectors.txt
       - name: Test VP9 decoding against the libvpx test vectors
-        if: matrix.shard == 1
         env:
           ZVIDLIB_VP9_VECTORS: ${{ github.workspace }}/vp9-test-vectors
         run: |
@@ -789,14 +808,24 @@ jobs:
   # still take turns through the `hardware` test group in `.config/nextest.toml`,
   # which is what keeps the `macos-latest` VideoToolbox VP9 decoder from
   # failing a decode while another session decodes (#565).
+  #
+  # macOS gets a third shard because that turn-taking is where its time goes:
+  # its runner has a hardware VP9 decoder and encoder, so the `vp9_hardware`
+  # and VideoToolbox tests actually decode there, one at a time, and the shard
+  # that drew most of them ran four minutes against the other's ninety
+  # seconds. Windows has no hardware to take turns over and two is enough.
   native-tests:
-    name: Native tests (${{ matrix.os }}, ${{ matrix.shard }}/2)
+    name: Native tests (${{ matrix.os }}, ${{ matrix.shard }}/${{ matrix.shards }})
     needs: native-tests-build
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest]
-        shard: [1, 2]
+        include:
+          - { os: windows-latest, shard: 1, shards: 2 }
+          - { os: windows-latest, shard: 2, shards: 2 }
+          - { os: macos-latest, shard: 1, shards: 3 }
+          - { os: macos-latest, shard: 2, shards: 3 }
+          - { os: macos-latest, shard: 3, shards: 3 }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -813,7 +842,7 @@ jobs:
         run: |
           cargo-nextest nextest run --profile ci \
             --archive-file nextest-archive.tar.zst --workspace-remap . \
-            --partition count:${{ matrix.shard }}/2
+            --partition count:${{ matrix.shard }}/${{ matrix.shards }}
 
   # `--release` is the profile #327 was reported against: nothing about the
   # missing rpath is profile-specific, but this is the invocation the issue
