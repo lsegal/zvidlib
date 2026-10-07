@@ -237,7 +237,7 @@ fn factory_advertises_only_the_implemented_surface() {
         factory.capability(&invalid),
         CodecSupport::InvalidConfiguration { .. }
     ));
-    for blob in [vec![0], vec![40, 0, 0], vec![1, 2]] {
+    for blob in [vec![0], vec![40, 0, 0], vec![1, 2], vec![40, 0, 1, 0x80]] {
         invalid = configuration(64, 48, PixelFormat::Yuv420p8);
         invalid.configuration = blob;
         assert!(matches!(
@@ -335,7 +335,10 @@ fn hardware_requests_map_the_quantizer_onto_quality() {
     assert!(rejected(full).contains("limited-range"));
     let mut blob = configuration(64, 48, PixelFormat::Rgba8);
     blob.configuration = vec![0];
-    assert_eq!(rejected(blob), CONFIGURATION_SHAPE);
+    assert_eq!(rejected(blob.clone()), CONFIGURATION_SHAPE);
+    // Error resilience is the software encoder's alone.
+    blob.configuration = vec![60, 0, 5, FLAG_ERROR_RESILIENT];
+    assert!(rejected(blob).contains("error resilient"));
 }
 
 /// A hardware encoder's samples are sync samples exactly when they open on a
@@ -368,17 +371,98 @@ fn key_frame_vpcc_finds_key_frames_and_their_colour() {
 }
 
 #[test]
-fn configuration_selects_quantizer_and_keyframe_interval() {
+fn configuration_selects_quantizer_keyframe_interval_and_error_resilience() {
+    let settings = |base_q_idx, keyframe_interval, error_resilient| {
+        Some(Settings {
+            base_q_idx,
+            keyframe_interval,
+            error_resilient,
+        })
+    };
     assert_eq!(
         parse_configuration(&[]),
-        Some((DEFAULT_BASE_Q_IDX, DEFAULT_KEYFRAME_INTERVAL))
+        settings(DEFAULT_BASE_Q_IDX, DEFAULT_KEYFRAME_INTERVAL, false)
     );
     assert_eq!(
         parse_configuration(&[200]),
-        Some((200, DEFAULT_KEYFRAME_INTERVAL))
+        settings(200, DEFAULT_KEYFRAME_INTERVAL, false)
     );
-    assert_eq!(parse_configuration(&[30, 1, 2]), Some((30, 258)));
+    assert_eq!(parse_configuration(&[30, 1, 2]), settings(30, 258, false));
+    assert_eq!(
+        parse_configuration(&[30, 1, 2, 0]),
+        settings(30, 258, false)
+    );
+    assert_eq!(
+        parse_configuration(&[30, 0, 1, FLAG_ERROR_RESILIENT]),
+        settings(30, 1, true)
+    );
     assert_eq!(parse_configuration(&[0]), None);
+    assert_eq!(parse_configuration(&[30, 0, 1, 2]), None);
+    assert_eq!(parse_configuration(&[0, 0, 1, 1]), None);
+    assert_eq!(parse_configuration(&[30, 0, 0, 1]), None);
+}
+
+/// The error-resilient bit of a frame's uncompressed header.
+fn error_resilient_mode(sample: &EncodedSample) -> bool {
+    // frame_marker, profile_low_bit, profile_high_bit, show_existing_frame,
+    // frame_type, show_frame, then error_resilient_mode.
+    sample.data[0] & 1 == 1
+}
+
+#[test]
+fn frames_adapt_probabilities_unless_error_resilience_is_requested() {
+    let mut config = configuration(40, 24, PixelFormat::Yuv420p8);
+    let (samples, _, _) = encode_sequence(&config, 3);
+    assert!(samples.iter().all(|sample| !error_resilient_mode(sample)));
+    config.configuration = vec![DEFAULT_BASE_Q_IDX, 0, 60, FLAG_ERROR_RESILIENT];
+    let (samples, _, _) = encode_sequence(&config, 3);
+    assert!(samples.iter().all(error_resilient_mode));
+}
+
+/// The total size and mean PSNR of a sequence of moving content.
+fn size_and_quality(config: &VideoEncoderConfig, frames: u32) -> (usize, f64) {
+    let (samples, reconstructions, sources) = encode_sequence(config, frames);
+    let size = samples.iter().map(|sample| sample.data.len()).sum();
+    let quality = reconstructions
+        .iter()
+        .zip(&sources)
+        .map(|(reconstruction, source)| psnr(reconstruction, source))
+        .sum::<f64>()
+        / f64::from(frames);
+    (size, quality)
+}
+
+/// Issue #555: adapting the probabilities from frame to frame gives a smaller
+/// stream than coding every frame error resilient, as the encoder did before,
+/// at equal or better quality. Adapted rates steer mode decisions toward
+/// slightly different trade-offs, so the adaptive stream's quantizer is lowered
+/// until its quality at least matches the error-resilient stream's.
+#[test]
+fn adaptive_probabilities_shrink_the_output_at_equal_quality() {
+    let measure = |base_q_idx: u8, flags: u8| {
+        let mut config = configuration(96, 64, PixelFormat::Yuv420p8);
+        config.configuration = vec![base_q_idx, 0, 30, flags];
+        size_and_quality(&config, 30)
+    };
+    for base_q_idx in [80, 160] {
+        let (resilient_size, resilient_quality) = measure(base_q_idx, FLAG_ERROR_RESILIENT);
+        let mut adaptive_q_idx = base_q_idx;
+        let (adaptive_size, adaptive_quality) = loop {
+            let (size, quality) = measure(adaptive_q_idx, 0);
+            if quality >= resilient_quality {
+                break (size, quality);
+            }
+            assert!(adaptive_q_idx > 4, "adaptive quality never caught up");
+            adaptive_q_idx -= 4;
+        };
+        eprintln!(
+            "q {base_q_idx}: error resilient {resilient_size} bytes at {resilient_quality:.2} dB,              adaptive (q {adaptive_q_idx}) {adaptive_size} bytes at {adaptive_quality:.2} dB"
+        );
+        assert!(
+            adaptive_size < resilient_size,
+            "adaptive {adaptive_size} bytes at {adaptive_quality:.2} dB (q {adaptive_q_idx})              against error-resilient {resilient_size} bytes at {resilient_quality:.2} dB              (q {base_q_idx})"
+        );
+    }
 }
 
 #[test]
@@ -807,8 +891,17 @@ mod ffmpeg {
 
     #[test]
     fn independent_decoders_reproduce_the_reconstruction_exactly() {
+        // Two groups of pictures, so the decoders also reset the adapted
+        // probabilities at the second key frame.
         let mut config = configuration(96, 64, PixelFormat::Yuv420p8);
         config.configuration = vec![DEFAULT_BASE_Q_IDX, 0, 5];
+        assert_decoders_match_reconstruction(&config, 12);
+    }
+
+    #[test]
+    fn error_resilient_frames_decode_exactly() {
+        let mut config = configuration(96, 64, PixelFormat::Yuv420p8);
+        config.configuration = vec![DEFAULT_BASE_Q_IDX, 0, 5, FLAG_ERROR_RESILIENT];
         assert_decoders_match_reconstruction(&config, 8);
     }
 
@@ -848,8 +941,16 @@ fn signalled_filter_level(sample: &EncodedSample) -> u8 {
     // Key frames: marker, profile, flags, sync code, colour, size, render
     // size and frame_context_idx. Inter frames: marker, profile, flags,
     // refresh flags, references, sizes, motion vector precision,
-    // interpolation filter and frame_context_idx.
-    let start = if sample.is_sync { 71 } else { 36 };
+    // interpolation filter and frame_context_idx. Frames that are not error
+    // resilient add refresh_frame_context and frame_parallel_decoding_mode,
+    // and inter frames reset_frame_context too.
+    let adaptive = !error_resilient_mode(sample);
+    let start = match (sample.is_sync, adaptive) {
+        (true, false) => 71,
+        (true, true) => 73,
+        (false, false) => 36,
+        (false, true) => 40,
+    };
     (start..start + 6).fold(0, |level, index| {
         (level << 1) | ((sample.data[index / 8] >> (7 - index % 8)) & 1)
     })
@@ -875,35 +976,54 @@ fn visible(picture: &Picture, geometry: &Geometry) -> Vec<u8> {
 /// filter, and returns the total size in bytes and the PSNR of the
 /// reconstruction against the source.
 fn encode_group(frames: &[VideoFrame], base_q_idx: u8, loop_filter: bool) -> (usize, f64) {
+    let (sizes, psnr) = encode_group_frames(frames, base_q_idx, loop_filter);
+    (sizes.iter().sum(), psnr)
+}
+
+/// [`encode_group`], with the size of every frame.
+fn encode_group_frames(
+    frames: &[VideoFrame],
+    base_q_idx: u8,
+    loop_filter: bool,
+) -> (Vec<usize>, f64) {
     let dimensions = frames[0].dimensions;
     let geometry = Geometry::new(dimensions.width as usize, dimensions.height as usize);
     let mut reference: Option<Picture> = None;
-    let (mut bytes, mut reconstructed, mut sources) = (0, Vec::new(), Vec::new());
+    let (mut sizes, mut reconstructed, mut sources) = (Vec::new(), Vec::new(), Vec::new());
     for frame in frames {
         let source = source_picture(&geometry, frame, Orientation::TopLeft).unwrap();
+        // Error resilient, so the comparison isolates the loop filter.
+        let context = FrameContext::default();
         let mut encoder = FrameEncoder::new(
             geometry,
             &source,
             reference.as_ref(),
             base_q_idx,
             CodingTools::ALL,
+            true,
+            &context,
+            None,
         );
         if !loop_filter {
             encoder = encoder.without_loop_filter();
         }
-        let (data, reconstruction) = encoder.encode(false);
-        bytes += data.len();
+        let encoded = encoder.encode(false);
+        let (data, reconstruction) = (encoded.data, encoded.reconstruction);
+        sizes.push(data.len());
         reconstructed.extend(visible(&reconstruction, &geometry));
         sources.extend(visible(&source, &geometry));
         reference = Some(reconstruction);
     }
-    (bytes, psnr(&reconstructed, &sources))
+    (sizes, psnr(&reconstructed, &sources))
 }
 
 #[test]
 fn every_frame_signals_a_loop_filter_level() {
+    // Error resilient, so every frame codes the content afresh. With adapted
+    // probabilities an inter frame can code it well enough that the search
+    // rightly leaves the filter off.
     let mut config = configuration(96, 64, PixelFormat::Yuv420p8);
-    config.configuration = vec![DEFAULT_BASE_Q_IDX, 0, 5];
+    config.configuration = vec![DEFAULT_BASE_Q_IDX, 0, 5, FLAG_ERROR_RESILIENT];
     let (samples, _, _) = encode_sequence(&config, 8);
     for (index, sample) in samples.iter().enumerate() {
         let level = signalled_filter_level(sample);
@@ -916,11 +1036,14 @@ fn loop_filter_is_a_rate_distortion_gain() {
     // Larger blocks and transforms leave less blocking for the filter to
     // remove, so it mostly buys quality rather than bits: the filtered stream
     // must be sharper, and no larger than the unfiltered one would have to
-    // grow to match it at the high-rate 6 dB per doubling of the rate.
+    // grow to match it at the high-rate 6 dB per doubling of the rate. The
+    // coarse quantizers are where the greedy per-frame level search used to
+    // smooth the panning references until the whole sequence came out larger
+    // and blurrier than with no filter (issue #563).
     let frames: Vec<VideoFrame> = (0..12)
         .map(|index| test_card_frame(160, 90, index))
         .collect();
-    for base_q_idx in [100, 150] {
+    for base_q_idx in [100, 150, 210, 220, 230] {
         let (unfiltered_bytes, unfiltered_psnr) = encode_group(&frames, base_q_idx, false);
         let (filtered_bytes, filtered_psnr) = encode_group(&frames, base_q_idx, true);
         let equivalent_bytes =
@@ -931,4 +1054,285 @@ fn loop_filter_is_a_rate_distortion_gain() {
              {unfiltered_bytes} bytes at {unfiltered_psnr:.2} dB unfiltered"
         );
     }
+}
+
+#[test]
+fn panning_inter_frames_find_the_motion() {
+    // The texture's fine detail leaves the motion search many local minima.
+    // Started from the neighbours' vectors alone, a frame whose first blocks
+    // missed the pan fell back to intra nearly everywhere and came out about
+    // as large as the key frame, and the loop filter's small changes to the
+    // reference decided which frames did: the filtered sequence was up to a
+    // third larger than the unfiltered one would have to grow to match its
+    // quality (issue #583). Content this sharp has little blocking left for
+    // the filter to remove, so it must now cost next to nothing either way.
+    for (width, height) in [(96, 64), (192, 128)] {
+        let frames: Vec<VideoFrame> = (0..12)
+            .map(|index| moving_yuv_frame(width, height, index))
+            .collect();
+        for base_q_idx in [30, 40, 130, 200, 210, 220] {
+            let [
+                (unfiltered_bytes, unfiltered_psnr),
+                (filtered_bytes, filtered_psnr),
+            ] = [false, true].map(|loop_filter| {
+                let (sizes, psnr) = encode_group_frames(&frames, base_q_idx, loop_filter);
+                for (index, &size) in sizes.iter().enumerate().skip(1) {
+                    assert!(
+                        size < sizes[0] / 2,
+                        "{width}x{height} q {base_q_idx}, filter {loop_filter}: \
+                         frame {index} is {size} bytes, the key frame {}",
+                        sizes[0]
+                    );
+                }
+                (sizes.iter().sum::<usize>(), psnr)
+            });
+            let equivalent_bytes =
+                unfiltered_bytes as f64 * 2_f64.powf((filtered_psnr - unfiltered_psnr) / 6.0);
+            assert!(
+                filtered_bytes as f64 <= equivalent_bytes * 1.03,
+                "{width}x{height} q {base_q_idx}: {filtered_bytes} bytes at \
+                 {filtered_psnr:.2} dB filtered, {unfiltered_bytes} bytes at \
+                 {unfiltered_psnr:.2} dB unfiltered"
+            );
+        }
+    }
+}
+
+/// A frame of interleaved 4-byte pixels whose channels vary independently,
+/// with a pattern that pans by `index` samples a frame.
+fn moving_rgb_frame(
+    width: u32,
+    height: u32,
+    index: u32,
+    format: PixelFormat,
+    range: ColorRange,
+) -> VideoFrame {
+    let (width, height) = (width as usize, height as usize);
+    // A stride wider than the row, so the conversion must honour it.
+    let stride = width * 4 + 12;
+    let mut data = vec![0_u8; stride * height];
+    for y in 0..height {
+        for x in 0..width {
+            let u = x + index as usize * 3;
+            let pixel = &mut data[y * stride + x * 4..][..4];
+            pixel[0] = ((u * 5 + y * 3) % 256) as u8;
+            pixel[1] = (((u ^ y) * 7) % 256) as u8;
+            pixel[2] = (255 - (u * 2 + y * 9) % 256) as u8;
+            pixel[3] = (x * y % 256) as u8;
+        }
+    }
+    VideoFrame::new(
+        VideoDimensions {
+            width: width as u32,
+            height: height as u32,
+        },
+        format,
+        range,
+        vec![Plane { data, stride }],
+        &Limits::default(),
+    )
+    .unwrap()
+}
+
+/// The RGBA/BGRA conversion as it was written per pixel before it was
+/// vectorized: BT.601 luma per pixel, and chroma from each channel's rounded
+/// average over a 2x2 block whose last row and column repeat at odd sizes.
+fn reference_conversion(
+    frame: &VideoFrame,
+    orientation: Orientation,
+) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let (width, height) = (
+        frame.dimensions.width as usize,
+        frame.dimensions.height as usize,
+    );
+    let plane = &frame.planes[0];
+    let full = frame.color_range == ColorRange::Full;
+    let (red, blue) = if frame.pixel_format == PixelFormat::Rgba8 {
+        (0, 2)
+    } else {
+        (2, 0)
+    };
+    let rgb = |x: usize, y: usize| {
+        let y = match orientation {
+            Orientation::TopLeft => y,
+            Orientation::BottomLeft => height - 1 - y,
+        };
+        let offset = y * plane.stride + x * 4;
+        [red, 1, blue].map(|channel| i32::from(plane.data[offset + channel]))
+    };
+    let mut luma = Vec::new();
+    for y in 0..height {
+        for x in 0..width {
+            let [r, g, b] = rgb(x, y);
+            luma.push(if full {
+                ((77 * r + 150 * g + 29 * b + 128) >> 8).clamp(0, 255) as u8
+            } else {
+                (((66 * r + 129 * g + 25 * b + 128) >> 8) + 16).clamp(0, 255) as u8
+            });
+        }
+    }
+    let (mut cb, mut cr) = (Vec::new(), Vec::new());
+    for y in 0..height.div_ceil(2) {
+        for x in 0..width.div_ceil(2) {
+            let mut sum = [0_i32; 3];
+            for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                let sample = rgb((x * 2 + dx).min(width - 1), (y * 2 + dy).min(height - 1));
+                for channel in 0..3 {
+                    sum[channel] += sample[channel];
+                }
+            }
+            let [r, g, b] = sum.map(|value| (value + 2) >> 2);
+            let (u, v) = if full {
+                (
+                    (-43 * r - 85 * g + 128 * b + 128) >> 8,
+                    (128 * r - 107 * g - 21 * b + 128) >> 8,
+                )
+            } else {
+                (
+                    (-38 * r - 74 * g + 112 * b + 128) >> 8,
+                    (112 * r - 94 * g - 18 * b + 128) >> 8,
+                )
+            };
+            cb.push((u + 128).clamp(0, 255) as u8);
+            cr.push((v + 128).clamp(0, 255) as u8);
+        }
+    }
+    (luma, cb, cr)
+}
+
+#[test]
+fn rgb_conversion_matches_the_per_pixel_bt601_reference_on_every_isa() {
+    let _guard = crate::simd::test_lock();
+    for isa in crate::simd::available() {
+        crate::simd::set_override(Some(isa));
+        for (width, height) in [(16, 16), (17, 9), (33, 2), (1, 1), (70, 35)] {
+            let geometry = Geometry::new(width, height);
+            for format in [PixelFormat::Rgba8, PixelFormat::Bgra8] {
+                for range in [ColorRange::Limited, ColorRange::Full] {
+                    for orientation in [Orientation::TopLeft, Orientation::BottomLeft] {
+                        let frame = moving_rgb_frame(width as u32, height as u32, 1, format, range);
+                        let picture = source_picture(&geometry, &frame, orientation).unwrap();
+                        let (luma, cb, cr) = reference_conversion(&frame, orientation);
+                        let crop = |plane: usize, width: usize, height: usize| {
+                            let stride = picture.strides[plane];
+                            (0..height)
+                                .flat_map(|row| {
+                                    picture.planes[plane][row * stride..][..width].to_vec()
+                                })
+                                .collect::<Vec<u8>>()
+                        };
+                        let (chroma_width, chroma_height) =
+                            (geometry.chroma_width(), geometry.chroma_height());
+                        let label = format!(
+                            "{} {width}x{height} {format:?} {range:?} {orientation:?}",
+                            isa.name()
+                        );
+                        assert_eq!(crop(0, width, height), luma, "{label} luma");
+                        assert_eq!(crop(1, chroma_width, chroma_height), cb, "{label} Cb");
+                        assert_eq!(crop(2, chroma_width, chroma_height), cr, "{label} Cr");
+                    }
+                }
+            }
+        }
+    }
+    crate::simd::set_override(None);
+}
+
+/// The vector kernels are bit-exact with the scalar ones, so the encoder has
+/// to write the same bytes whichever instruction set it runs on (cf. #231).
+#[test]
+fn every_instruction_set_encodes_byte_identical_bitstreams() {
+    let _guard = crate::simd::test_lock();
+    let encode = |config: &VideoEncoderConfig, content: &dyn Fn(u32) -> VideoFrame| {
+        let mut encoder = NativeVp9Encoder::new(config, &Limits::default()).unwrap();
+        (0..4)
+            .flat_map(|index| {
+                let frame = content(index);
+                let source = FrameSource::Cpu(CpuFrameSource {
+                    frame: &frame,
+                    orientation: Orientation::TopLeft,
+                });
+                block_on(encoder.encode(FrameIndex(u64::from(index)), source))
+                    .unwrap()
+                    .into_iter()
+                    .flat_map(|sample| sample.data)
+            })
+            .collect::<Vec<u8>>()
+    };
+    let yuv = configuration(100, 66, PixelFormat::Yuv420p8);
+    let mut bgra = configuration(67, 45, PixelFormat::Bgra8);
+    bgra.color_range = ColorRange::Full;
+    let streams = || {
+        [
+            encode(&yuv, &|index| moving_yuv_frame(100, 66, index)),
+            encode(&bgra, &|index| {
+                moving_rgb_frame(67, 45, index, PixelFormat::Bgra8, ColorRange::Full)
+            }),
+        ]
+    };
+    crate::simd::set_override(Some(crate::simd::SimdIsa::Scalar));
+    let reference = streams();
+    for isa in crate::simd::available() {
+        crate::simd::set_override(Some(isa));
+        assert!(
+            streams() == reference,
+            "{} encoded different bytes from the scalar kernels",
+            isa.name()
+        );
+    }
+    crate::simd::set_override(None);
+}
+
+#[test]
+fn loop_filter_on_sharp_content_costs_less_than_decision_noise() {
+    // On content this sharp the filter has almost nothing to remove, and the
+    // strict rule of `loop_filter_is_a_rate_distortion_gain` fails at some
+    // quantizers by a percent or so either way (issue #590). The per-frame
+    // levels it chooses do lower each frame's error; what moves the size is
+    // which mode or vector later frames pick from a slightly different
+    // reference, a few bytes up or down per frame. The encoder is that noisy
+    // without the filter too: an unfiltered encode lands off the rate and
+    // distortion curve through its neighbouring quantizers by more, 3-4% RMS
+    // over q 20 to 240 and about 2% at the quantizers here. So no point may
+    // lose more than that measured noise, and the points together must still
+    // be a gain.
+    let (mut ratios, mut deviations) = (Vec::new(), Vec::new());
+    for (width, height) in [(96, 64), (192, 128)] {
+        let frames: Vec<VideoFrame> = (0..12)
+            .map(|index| moving_yuv_frame(width, height, index))
+            .collect();
+        for base_q_idx in [30_u8, 40, 130, 200, 210, 220] {
+            let [below, (unfiltered_bytes, unfiltered_psnr), above] =
+                [base_q_idx - 1, base_q_idx, base_q_idx + 1].map(|q| {
+                    let (bytes, psnr) = encode_group(&frames, q, false);
+                    (bytes as f64, psnr)
+                });
+            let (filtered_bytes, filtered_psnr) = encode_group(&frames, base_q_idx, true);
+            // In log2 of the size, which the 6 dB per doubling rule is linear
+            // in.
+            let along = (unfiltered_psnr - below.1) / (above.1 - below.1);
+            let curve = below.0.log2() + along * (above.0.log2() - below.0.log2());
+            deviations.push(unfiltered_bytes.log2() - curve);
+            let equivalent = unfiltered_bytes.log2() + (filtered_psnr - unfiltered_psnr) / 6.0;
+            let ratio = (filtered_bytes as f64).log2() - equivalent;
+            ratios.push((width, height, base_q_idx, ratio));
+        }
+    }
+    let percent = |log2: f64| (log2.exp2() - 1.0) * 100.0;
+    let noise = (deviations.iter().map(|d| d * d).sum::<f64>() / deviations.len() as f64).sqrt();
+    assert!(
+        percent(noise) < 3.0,
+        "unfiltered encodes are {:.2}% off their curve",
+        percent(noise)
+    );
+    for &(width, height, base_q_idx, ratio) in &ratios {
+        assert!(
+            ratio <= noise,
+            "{width}x{height} q {base_q_idx}: filtered {:+.2}%, noise {:.2}%",
+            percent(ratio),
+            percent(noise)
+        );
+    }
+    let mean = ratios.iter().map(|&(.., ratio)| ratio).sum::<f64>() / ratios.len() as f64;
+    assert!(mean <= 0.0, "filtered {:+.2}% on average", percent(mean));
 }

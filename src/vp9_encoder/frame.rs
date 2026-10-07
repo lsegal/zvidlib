@@ -4,9 +4,12 @@
 //! The coding tools are a deliberately small, fully specified subset of VP9
 //! profile 0:
 //!
-//! - every frame is error resilient, so it is coded with the default
-//!   probabilities, sends no probability updates, and needs no state from
-//!   earlier frames other than the reconstructed reference picture;
+//! - frames send no forward probability updates. By default they adapt
+//!   backwards instead: each frame codes with the probabilities the frames
+//!   before it adapted to (see [`super::context`]), and inter frames also take
+//!   the previous frame's motion vectors as candidates. Error-resilient frames
+//!   code with the default probabilities and need no state from earlier
+//!   frames other than the reconstructed reference picture;
 //! - each 64x64 superblock is either coded whole or split into four, down to
 //!   8x8 blocks, and each block picks its transform size from 4x4 up to the
 //!   largest that fits (`tx_mode = TX_MODE_SELECT`), both by rate and
@@ -16,8 +19,9 @@
 //!   reference deltas;
 //! - key frames choose among the DC, V, H and TM intra modes per block;
 //! - inter frames predict from the previous frame (`LAST_FRAME`) with
-//!   whole-sample motion vectors found by a diamond search, coded as
-//!   `ZEROMV`, `NEARESTMV`, `NEARMV` or `NEWMV`, or fall back to intra.
+//!   whole-sample motion vectors found by a diamond search, started from the
+//!   neighbours' vectors and the frame's motion estimated from its
+//!   projections, coded as `ZEROMV`, `NEARESTMV`, `NEARMV` or `NEWMV`, or fall back to intra.
 //!
 //! Each superblock is searched first, with every candidate's rate counted
 //! from the same probabilities and contexts the bitstream codes it with, and
@@ -35,63 +39,32 @@
 //! frames predict from it after the loop filter.
 
 use super::bitwriter::{BitCost, BitWriter, BoolEncoder, BoolSink, bit_cost};
+use super::context::{CoefProbs, FrameContext, FrameCounts, MvComponentCounts};
 use super::dsp::{
     IntraMode, ReferencePlane, TransformScratch, TxType, forward_transform, inverse_transform_add,
     predict_inter, predict_intra,
 };
+use super::simd::{self, Quantizer};
 use super::tables::{
-    AC_QLOOKUP, CAT6_PROBS, DC_QLOOKUP, IF_UV_MODE_PROBS, IF_Y_MODE_PROBS, INTER_MODE_PROBS,
-    INTRA_INTER_PROBS, KF_PARTITION_PROBS, KF_UV_MODE_PROBS, KF_Y_MODE_PROBS, PARETO8_FULL,
-    PARTITION_PROBS, SINGLE_REF_PROBS, SKIP_PROBS, TX_PROBS_8X8, TX_PROBS_16X16, TX_PROBS_32X32,
+    AC_QLOOKUP, CAT6_PROBS, DC_QLOOKUP, KF_PARTITION_PROBS, KF_UV_MODE_PROBS, KF_Y_MODE_PROBS,
+    PARETO8_FULL,
 };
 use crate::vp9_dec::loopfilter::{self, FilterPlane, LoopFilterMask, MaskBlock};
 use crate::vp9_dec::tables as shared;
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::hash::{BuildHasherDefault, Hasher};
 
-const INTRA_MODE_TREE: [i8; 18] = [
+pub(super) const INTRA_MODE_TREE: [i8; 18] = [
     0, 2, -9, 4, -1, 6, 8, 12, -2, 10, -4, -5, -3, 14, -8, 16, -6, -7,
 ];
-const PARTITION_TREE: [i8; 6] = [0, 2, -1, 4, -2, -3];
+pub(super) const PARTITION_TREE: [i8; 6] = [0, 2, -1, 4, -2, -3];
 /// Leaves are `mode - NEARESTMV`: NEARESTMV 0, NEARMV 1, ZEROMV 2, NEWMV 3.
-const INTER_MODE_TREE: [i8; 6] = [-2, 2, 0, 4, -1, -3];
-const MV_JOINT_TREE: [i8; 6] = [0, 2, -1, 4, -2, -3];
-const MV_CLASS_TREE: [i8; 20] = [
+pub(super) const INTER_MODE_TREE: [i8; 6] = [-2, 2, 0, 4, -1, -3];
+pub(super) const MV_JOINT_TREE: [i8; 6] = [0, 2, -1, 4, -2, -3];
+pub(super) const MV_CLASS_TREE: [i8; 20] = [
     0, 2, -1, 4, 6, 8, -2, -3, 10, 12, -4, -5, -6, 14, 16, 18, -7, -8, -9, -10,
 ];
-const MV_FP_TREE: [i8; 6] = [0, 2, -1, 4, -2, -3];
-
-const MV_JOINT_PROBS: [u8; 3] = [32, 64, 96];
-
-/// The default probabilities of one motion vector component.
-struct MvComponentProbs {
-    sign: u8,
-    classes: [u8; 10],
-    class0: u8,
-    bits: [u8; 10],
-    class0_fp: [[u8; 3]; 2],
-    fp: [u8; 3],
-}
-
-/// Row (vertical) then column (horizontal) component defaults.
-const MV_COMPONENT_PROBS: [MvComponentProbs; 2] = [
-    MvComponentProbs {
-        sign: 128,
-        classes: [224, 144, 192, 168, 192, 176, 192, 198, 198, 245],
-        class0: 216,
-        bits: [136, 140, 148, 160, 176, 192, 224, 234, 234, 240],
-        class0_fp: [[128, 128, 64], [96, 112, 64]],
-        fp: [64, 96, 64],
-    },
-    MvComponentProbs {
-        sign: 128,
-        classes: [216, 128, 176, 160, 176, 176, 192, 198, 198, 208],
-        class0: 208,
-        bits: [136, 140, 148, 160, 176, 192, 224, 234, 234, 240],
-        class0_fp: [[128, 128, 64], [96, 112, 64]],
-        fp: [64, 96, 64],
-    },
-];
+pub(super) const MV_FP_TREE: [i8; 6] = [0, 2, -1, 4, -2, -3];
 
 const CAT_PROBS: [&[u8]; 5] = [
     &[159],
@@ -243,9 +216,10 @@ struct Mv {
     col: i32,
 }
 
-/// The mode information later blocks read as context.
+/// The mode information later blocks, and the next frame's motion vector
+/// candidate search, read as context.
 #[derive(Clone, Copy, Default)]
-struct ModeInfo {
+pub(super) struct ModeInfo {
     is_inter: bool,
     /// The VP9 mode number: an intra mode, or `NEARESTMV..=NEWMV`.
     mode: u8,
@@ -328,6 +302,57 @@ enum ResidualKey {
         y: u16,
         prediction: u64,
     },
+}
+
+/// FxHash's mix of one word into `hash`.
+fn fx_mix(hash: u64, word: u64) -> u64 {
+    (hash.rotate_left(5) ^ word).wrapping_mul(0x517c_c1b7_2722_0a95)
+}
+
+/// A [`ResidualKey`] hasher: the cache is looked up for every transform block
+/// the search codes, and the keys are small integers, which the default
+/// SipHash spent more on than the lookups saved.
+#[derive(Default)]
+struct KeyHasher(u64);
+
+impl Hasher for KeyHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 = fx_mix(self.0, u64::from(byte));
+        }
+    }
+
+    fn write_u8(&mut self, value: u8) {
+        self.0 = fx_mix(self.0, u64::from(value));
+    }
+
+    fn write_u16(&mut self, value: u16) {
+        self.0 = fx_mix(self.0, u64::from(value));
+    }
+
+    fn write_u32(&mut self, value: u32) {
+        self.0 = fx_mix(self.0, u64::from(value));
+    }
+
+    fn write_i32(&mut self, value: i32) {
+        self.0 = fx_mix(self.0, u64::from(value as u32));
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.0 = fx_mix(self.0, value);
+    }
+
+    fn write_usize(&mut self, value: usize) {
+        self.0 = fx_mix(self.0, value as u64);
+    }
+
+    fn write_isize(&mut self, value: isize) {
+        self.0 = fx_mix(self.0, value as u64);
+    }
 }
 
 /// What coding one transform block's residual produced, for every candidate
@@ -455,6 +480,33 @@ struct BlockSnapshot {
     contexts: ContextSnapshot,
 }
 
+/// The tile's boolean encoder, counting each symbol as the decoder will
+/// when it reads it.
+struct TileWriter {
+    encoder: BoolEncoder,
+    counts: FrameCounts,
+}
+
+impl BoolSink for TileWriter {
+    fn write(&mut self, bit: bool, probability: u8) {
+        self.encoder.write(bit, probability);
+    }
+
+    fn counts(&mut self) -> Option<&mut FrameCounts> {
+        Some(&mut self.counts)
+    }
+}
+
+/// A coded frame and the state the frames after it depend on.
+pub(super) struct EncodedFrame {
+    pub(super) data: Vec<u8>,
+    pub(super) reconstruction: Picture,
+    /// The symbols the frame coded, for backward adaptation.
+    pub(super) counts: FrameCounts,
+    /// Every 8x8 block's mode and motion vector, in raster order.
+    pub(super) mode_info: Vec<ModeInfo>,
+}
+
 pub(super) struct FrameEncoder<'a> {
     geometry: Geometry,
     source: &'a Picture,
@@ -462,11 +514,20 @@ pub(super) struct FrameEncoder<'a> {
     recon: Picture,
     tools: CodingTools,
     base_q_idx: u8,
+    error_resilient: bool,
+    /// The probabilities the frame codes with.
+    context: &'a FrameContext,
+    /// The previous frame's modes, when this frame takes its motion vectors as
+    /// candidates (`UsePrevFrameMvs`).
+    previous_mode_info: Option<&'a [ModeInfo]>,
     /// The loop filter level the frame header signals; zero turns it off.
     filter_level: u8,
     /// Whether [`Self::encode`] chooses a loop filter level at all; tests
     /// clear it to compare against an unfiltered encode.
     loop_filter: bool,
+    /// The frame's motion estimated from its projections, which every
+    /// block's motion search also starts from.
+    projected_mvs: Vec<Mv>,
     /// Every block written, as `(mi_row, mi_col, bsl)`, which the loop
     /// filter's edge masks are built from.
     coded_blocks: Vec<(usize, usize, usize)>,
@@ -485,18 +546,30 @@ pub(super) struct FrameEncoder<'a> {
     over_ceiling: bool,
     /// The residuals coded in the current superblock, which the search codes
     /// again for every partition and candidate that shares one.
-    residual_cache: HashMap<ResidualKey, CachedResidual>,
+    residual_cache: HashMap<ResidualKey, CachedResidual, BuildHasherDefault<KeyHasher>>,
+    /// Token costs under `context`'s coefficient probabilities.
+    token_costs: Box<[TokenCosts; 4]>,
 }
 
 impl<'a> FrameEncoder<'a> {
     /// Prepares to encode `source`, as a key frame when `reference` is `None`
-    /// and as an inter frame predicted from `reference` otherwise.
+    /// and as an inter frame predicted from `reference` otherwise, coding with
+    /// the probabilities in `context`.
+    ///
+    /// An error-resilient frame must code with the default context and has no
+    /// `previous_mode_info`. Otherwise `previous_mode_info` is the previous
+    /// frame's [`EncodedFrame::mode_info`], which an inter frame's motion
+    /// vector candidates include.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         geometry: Geometry,
         source: &'a Picture,
         reference: Option<&'a Picture>,
         base_q_idx: u8,
         tools: CodingTools,
+        error_resilient: bool,
+        context: &'a FrameContext,
+        previous_mode_info: Option<&'a [ModeInfo]>,
     ) -> Self {
         let q = usize::from(base_q_idx);
         let ac = AC_QLOOKUP[q];
@@ -507,8 +580,12 @@ impl<'a> FrameEncoder<'a> {
             recon: Picture::new(&geometry),
             tools,
             base_q_idx,
+            error_resilient,
+            context,
+            previous_mode_info: previous_mode_info.filter(|_| reference.is_some()),
             filter_level: 0,
             loop_filter: true,
+            projected_mvs: Vec::new(),
             coded_blocks: Vec::new(),
             dc_q: DC_QLOOKUP[q],
             ac_q: ac,
@@ -530,7 +607,8 @@ impl<'a> FrameEncoder<'a> {
             left_partition: [0; 8],
             scratch: Scratch::new(),
             over_ceiling: false,
-            residual_cache: HashMap::new(),
+            residual_cache: HashMap::default(),
+            token_costs: token_costs(&context.coef),
         }
     }
 
@@ -545,12 +623,18 @@ impl<'a> FrameEncoder<'a> {
         self
     }
 
-    /// Encodes the frame and returns its bytes with the reconstruction;
-    /// `full_range` is the colour range the key frame header signals.
-    pub(super) fn encode(mut self, full_range: bool) -> (Vec<u8>, Picture) {
-        let mut writer = BoolEncoder::new();
+    /// Encodes the frame; `full_range` is the colour range the key frame
+    /// header signals.
+    pub(super) fn encode(mut self, full_range: bool) -> EncodedFrame {
+        let mut writer = TileWriter {
+            encoder: BoolEncoder::new(),
+            counts: FrameCounts::default(),
+        };
         let sb_rows = self.geometry.mi_rows.div_ceil(8);
         let sb_cols = self.geometry.mi_cols.div_ceil(8);
+        if let Some(reference) = self.reference {
+            self.projected_mvs = self.projected_motion(reference);
+        }
         for sb_row in 0..sb_rows {
             self.left_nonzero = [[false; 16]; 3];
             self.left_partition = [0; 8];
@@ -571,19 +655,25 @@ impl<'a> FrameEncoder<'a> {
         }
         let key = self.is_key();
         let geometry = self.geometry;
-        let tile = writer.finish();
+        let tile = writer.encoder.finish();
         let compressed = compressed_header(key, self.tools.larger_transforms);
-        let mut frame = uncompressed_header(
+        let mut data = uncompressed_header(
             &geometry,
             key,
+            self.error_resilient,
             self.base_q_idx,
             self.filter_level,
             full_range,
             compressed.len(),
         );
-        frame.extend_from_slice(&compressed);
-        frame.extend_from_slice(&tile);
-        (frame, self.recon)
+        data.extend_from_slice(&compressed);
+        data.extend_from_slice(&tile);
+        EncodedFrame {
+            data,
+            reconstruction: self.recon,
+            counts: writer.counts,
+            mode_info: self.mode_info,
+        }
     }
 
     /// Chooses the loop filter level whose output is closest to the source
@@ -738,14 +828,14 @@ impl<'a> FrameEncoder<'a> {
             (2, geometry.chroma_width(), geometry.chroma_height()),
         ] {
             let (samples, stride) = planes[plane];
-            let source_stride = self.source.strides[plane];
-            for row in 0..height {
-                error += samples[row * stride..][..width]
-                    .iter()
-                    .zip(&self.source.planes[plane][row * source_stride..][..width])
-                    .map(|(&a, &b)| u64::from(a.abs_diff(b)).pow(2))
-                    .sum::<u64>();
-            }
+            error += simd::sse(
+                samples,
+                stride,
+                &self.source.planes[plane],
+                self.source.strides[plane],
+                width,
+                height,
+            );
         }
         error
     }
@@ -840,7 +930,7 @@ impl<'a> FrameEncoder<'a> {
     /// Writes a searched partition, replaying its effect on the contexts.
     fn write_partition(
         &mut self,
-        writer: &mut BoolEncoder,
+        writer: &mut TileWriter,
         node: &Node,
         mi_row: usize,
         mi_col: usize,
@@ -1179,7 +1269,7 @@ impl<'a> FrameEncoder<'a> {
         let reference = usize::from(inter.is_some());
         let empty_bits = bit_cost(
             false,
-            coefficient_probs(tx_size, plane_type, reference, 0, context)[0],
+            self.context.coef[tx_size][plane_type][reference][0][context][0],
         );
         // An empty block's levels are never read.
         let empty = TxBlock {
@@ -1203,13 +1293,14 @@ impl<'a> FrameEncoder<'a> {
                 tx_type: tx_type as u8,
                 x: x as u16,
                 y: y as u16,
-                prediction: block_rows(&self.recon, plane, x, y, n)
-                    .flat_map(|row| row.chunks_exact(8))
-                    // FxHash's mix, eight samples at a time.
-                    .fold(0, |hash: u64, word| {
-                        let word = u64::from_le_bytes(word.try_into().expect("eight samples"));
-                        (hash.rotate_left(5) ^ word).wrapping_mul(0x517c_c1b7_2722_0a95)
-                    }),
+                prediction: block_rows(&self.recon, plane, x, y, n).fold(0, |hash, row| {
+                    row.chunks_exact(8).fold(hash, |hash, word| {
+                        fx_mix(
+                            hash,
+                            u64::from_le_bytes(word.try_into().expect("eight samples")),
+                        )
+                    })
+                }),
             }),
             _ => None,
         };
@@ -1234,7 +1325,14 @@ impl<'a> FrameEncoder<'a> {
             }
             let bits = *bits[context].get_or_insert_with(|| {
                 coefficient_bits(
-                    levels, *eob, tx_size, tx_type, plane_type, reference, context,
+                    &self.token_costs[tx_size],
+                    levels,
+                    *eob,
+                    tx_size,
+                    tx_type,
+                    plane_type,
+                    reference,
+                    context,
                 )
             });
             if *prediction_error as f64 + self.lambda * empty_bits
@@ -1262,27 +1360,24 @@ impl<'a> FrameEncoder<'a> {
             transform,
         } = &mut *self.scratch;
         let residual = &mut residual[..n * n];
-        let mut prediction_error = 0_u64;
-        for (row, residual) in residual.chunks_exact_mut(n).enumerate() {
-            let start = (y + row) * stride + x;
-            let source = &self.source.planes[plane][start..start + n];
-            let predicted = &self.recon.planes[plane][start..start + n];
-            // A row's squared error fits 32 bits, which vectorizes.
-            let mut row_error = 0_u32;
-            for ((residual, &source), &predicted) in residual.iter_mut().zip(source).zip(predicted)
-            {
-                let difference = i32::from(source) - i32::from(predicted);
-                *residual = difference;
-                row_error += (difference * difference) as u32;
-            }
-            prediction_error += u64::from(row_error);
-        }
+        let start = y * stride + x;
+        let prediction_error = simd::residual(
+            &self.source.planes[plane][start..],
+            stride,
+            &self.recon.planes[plane][start..],
+            stride,
+            n,
+            residual,
+        );
         // An intra block's prediction, kept with its coding.
         let mut prediction_copy = match key {
-            Some(ResidualKey::Intra { .. }) => block_rows(&self.recon, plane, x, y, n)
-                .flatten()
-                .copied()
-                .collect(),
+            Some(ResidualKey::Intra { .. }) => {
+                let mut copy = Vec::with_capacity(n * n);
+                for row in block_rows(&self.recon, plane, x, y, n) {
+                    copy.extend_from_slice(row);
+                }
+                copy
+            }
             _ => Vec::new(),
         };
         // Remembers an empty coding of this residual.
@@ -1311,37 +1406,15 @@ impl<'a> FrameEncoder<'a> {
         forward_transform(residual, tx_size, tx_type, coefficients, transform);
         // A smaller rounding offset for inter residuals, as libvpx uses.
         let rounding = if inter.is_some() { 0.25 } else { 0.375 };
-        // The DC then AC steps; 32x32 levels dequantize to half the step.
-        let steps = [self.dc_q, self.ac_q];
-        let effective = steps.map(|step| {
-            if tx_size == 3 {
-                f64::from(step) / 2.0
-            } else {
-                f64::from(step)
-            }
-        });
-        // Keep every dequantized value inside the 16-bit range the decoder
-        // stores coefficients in.
-        let limits = steps.map(|step| if tx_size == 3 { 65535 } else { 32767 } / step);
-        // Below these magnitudes a coefficient quantizes to zero; they sit a
-        // little under the exact threshold, so the division below still
-        // decides every coefficient near it.
-        let dead_zone = effective.map(|effective| (1.0 - rounding) * effective * 0.999);
         let levels = &mut levels[..n * n];
         let dequantized = &mut dequantized[..n * n];
-        levels.fill(0);
-        dequantized.fill(0);
-        for (index, &coefficient) in coefficients.iter().enumerate() {
-            let kind = usize::from(index > 0);
-            let magnitude = coefficient.abs();
-            if magnitude < dead_zone[kind] {
-                continue;
-            }
-            let level = ((magnitude / effective[kind] + rounding).floor() as i32).min(limits[kind]);
-            let value = (level * steps[kind]) >> u32::from(tx_size == 3);
-            levels[index] = if coefficient < 0.0 { -level } else { level };
-            dequantized[index] = if coefficient < 0.0 { -value } else { value };
-        }
+        let quantizer = Quantizer {
+            dc_q: self.dc_q,
+            ac_q: self.ac_q,
+            half_step: tx_size == 3,
+            rounding,
+        };
+        simd::quantize(coefficients, &quantizer, levels, dequantized);
         let (scan, _) = scan_order(tx_size, tx_type);
         let eob = scan
             .iter()
@@ -1352,7 +1425,14 @@ impl<'a> FrameEncoder<'a> {
             return (empty, prediction_error, empty_bits);
         }
         let bits = coefficient_bits(
-            levels, eob, tx_size, tx_type, plane_type, reference, context,
+            &self.token_costs[tx_size],
+            levels,
+            eob,
+            tx_size,
+            tx_type,
+            plane_type,
+            reference,
+            context,
         );
         // Restored if the residual is not worth its bits.
         let prediction = &mut prediction[..n * n];
@@ -1370,18 +1450,14 @@ impl<'a> FrameEncoder<'a> {
             &mut self.recon.planes[plane][start..],
             stride,
         );
-        let mut error = 0_u64;
-        for row in 0..n {
-            let start = (y + row) * stride + x;
-            let source = &self.source.planes[plane][start..start + n];
-            let reconstructed = &self.recon.planes[plane][start..start + n];
-            let row_error: u32 = source
-                .iter()
-                .zip(reconstructed)
-                .map(|(&source, &reconstructed)| u32::from(source.abs_diff(reconstructed)).pow(2))
-                .sum();
-            error += u64::from(row_error);
-        }
+        let error = simd::sse(
+            &self.source.planes[plane][start..],
+            stride,
+            &self.recon.planes[plane][start..],
+            stride,
+            n,
+            n,
+        );
         if let Some(key) = key {
             let mut cached_bits = [None; 3];
             cached_bits[context] = Some(bits);
@@ -1550,7 +1626,7 @@ impl<'a> FrameEncoder<'a> {
         let header_bits = cost(|sink| {
             self.skip_symbol(sink, neighbors, skip);
             if !self.is_key() {
-                sink.write(false, INTRA_INTER_PROBS[intra_inter_context(neighbors)]);
+                self.intra_inter_symbol(sink, neighbors, false);
             }
             self.tx_size_symbol(sink, neighbors, bsl, tx_size);
             self.y_mode_symbol(sink, neighbors, bsl, y_mode);
@@ -1655,8 +1731,20 @@ impl<'a> FrameEncoder<'a> {
                 done = true;
             }
         }
-        // Every inter block predicts from LAST_FRAME, so the search over other
-        // reference frames finds nothing. Clamp as `clamp_mv_ref` does.
+        // Then the co-located block of the previous frame.
+        if !done
+            && let Some(previous) = self.previous_mode_info
+            && let candidate = previous[mi_row * self.geometry.mi_cols + mi_col]
+            && candidate.is_inter
+        {
+            if count == 0 {
+                list[0] = candidate.mv;
+            } else if candidate.mv != list[0] {
+                list[1] = candidate.mv;
+            }
+        }
+        // Every inter block predicts from LAST_FRAME, so the searches over
+        // other reference frames find nothing. Clamp as `clamp_mv_ref` does.
         let border = 16 * 8;
         let size = 1_i32 << bsl;
         let to_left = -((mi_col * 64) as i32);
@@ -1687,17 +1775,23 @@ impl<'a> FrameEncoder<'a> {
         let max_y = self.geometry.height as isize - 1;
         let last = size as isize - 1;
         let inside = x0 >= 0 && y0 >= 0 && x0 + last <= max_x && y0 + last <= max_y;
+        if inside {
+            return simd::sad(
+                &self.source.planes[0][mi_row * 8 * stride + mi_col * 8..],
+                stride,
+                &reference.planes[0][y0 as usize * stride + x0 as usize..],
+                stride,
+                size,
+                limit,
+            );
+        }
         let mut sad = 0_u32;
         for row in 0..size {
             let source_row =
                 &self.source.planes[0][(mi_row * 8 + row) * stride + mi_col * 8..][..size];
             let y = (y0 + row as isize).clamp(0, max_y) as usize;
             for (column, &source) in source_row.iter().enumerate() {
-                let x = if inside {
-                    (x0 + column as isize) as usize
-                } else {
-                    (x0 + column as isize).clamp(0, max_x) as usize
-                };
+                let x = (x0 + column as isize).clamp(0, max_x) as usize;
                 sad += u32::from(source.abs_diff(reference.planes[0][y * stride + x]));
             }
             if sad >= limit {
@@ -1707,7 +1801,65 @@ impl<'a> FrameEncoder<'a> {
         sad
     }
 
-    /// Finds the whole-sample motion vector with the smallest luma SAD.
+    /// Estimates the frame's whole-sample motion from its luma projections,
+    /// as libvpx's `vp9_int_pro_motion_estimation` does for a block: the
+    /// column sums give the horizontal motion and the row sums the vertical,
+    /// each by the offset within the search range that matches the
+    /// reference's sums best. Content can leave one direction's sums nearly
+    /// flat, and its estimate noise, so each direction is also offered on its
+    /// own.
+    ///
+    /// A diamond search from the neighbours' vectors alone can settle in a
+    /// local minimum on fine texture. Once a frame's first blocks miss the
+    /// motion and fall back to intra, the blocks after them have no vectors
+    /// to start from either, and a panning frame can code nearly all intra:
+    /// small changes to the reference, such as the loop filter's, then swing
+    /// the size of the whole sequence (issue #583).
+    fn projected_motion(&self, reference: &Picture) -> Vec<Mv> {
+        const RANGE: usize = 64;
+        let stride = self.source.strides[0];
+        let (width, height) = (self.geometry.width, self.geometry.height);
+        let source = |x: usize, y: usize| u32::from(self.source.planes[0][y * stride + x]);
+        // The reference sample at an offset, extended past the edges as
+        // motion compensation extends it.
+        let reference = |x: isize, y: isize| {
+            let x = x.clamp(0, width as isize - 1) as usize;
+            let y = y.clamp(0, height as isize - 1) as usize;
+            u32::from(reference.planes[0][y * stride + x])
+        };
+        let best_offset = |projection: &[u32], shifted: &[u32]| {
+            (0..=2 * RANGE)
+                .min_by_key(|&offset| {
+                    let sad: u64 = projection
+                        .iter()
+                        .zip(&shifted[offset..])
+                        .map(|(&a, &b)| u64::from(a.abs_diff(b)))
+                        .sum();
+                    // Prefer the smaller offset among equals.
+                    (sad, offset.abs_diff(RANGE))
+                })
+                .expect("the range is not empty") as i32
+                - RANGE as i32
+        };
+        let columns: Vec<u32> = (0..width)
+            .map(|x| (0..height).map(|y| source(x, y)).sum())
+            .collect();
+        let reference_columns: Vec<u32> = (-(RANGE as isize)..(width + RANGE) as isize)
+            .map(|x| (0..height).map(|y| reference(x, y as isize)).sum())
+            .collect();
+        let rows: Vec<u32> = (0..height)
+            .map(|y| (0..width).map(|x| source(x, y)).sum())
+            .collect();
+        let reference_rows: Vec<u32> = (-(RANGE as isize)..(height + RANGE) as isize)
+            .map(|y| (0..width).map(|x| reference(x as isize, y)).sum())
+            .collect();
+        let row = best_offset(&rows, &reference_rows) * 8;
+        let col = best_offset(&columns, &reference_columns) * 8;
+        vec![Mv { row, col }, Mv { row: 0, col }, Mv { row, col: 0 }]
+    }
+
+    /// Finds the whole-sample motion vector with the smallest luma SAD,
+    /// starting from `starts` and the frame's projected motion.
     fn search_motion(
         &self,
         reference: &Picture,
@@ -1721,7 +1873,7 @@ impl<'a> FrameEncoder<'a> {
         let range = 64 * 8;
         let mut best_mv = Mv::default();
         let mut best_sad = self.luma_sad(reference, mi_row, mi_col, size, best_mv, u32::MAX);
-        for start in starts {
+        for start in starts.into_iter().chain(self.projected_mvs.iter().copied()) {
             let start = Mv {
                 row: start.row / 8 * 8,
                 col: start.col / 8 * 8,
@@ -1819,7 +1971,7 @@ impl<'a> FrameEncoder<'a> {
                 })
                 .map(|mode| {
                     let bits = cost(|sink| {
-                        sink.write(true, INTRA_INTER_PROBS[intra_inter_context(neighbors)]);
+                        self.intra_inter_symbol(sink, neighbors, true);
                         self.inter_symbols(sink, neighbors, mode_context, mode, mv, nearest);
                     });
                     (mode, bits)
@@ -1860,14 +2012,17 @@ impl<'a> FrameEncoder<'a> {
                     &mut prediction,
                 );
                 let stride = self.recon.strides[plane];
-                for row in 0..size {
-                    let start = (y + row) * stride + x;
-                    let source = &self.source.planes[plane][start..start + size];
-                    let predicted = &prediction[row * size..row * size + size];
-                    for (&source, &predicted) in source.iter().zip(predicted) {
-                        let difference = i32::from(source) - i32::from(predicted);
-                        prediction_error += (difference * difference) as u64;
-                    }
+                let start = y * stride + x;
+                prediction_error += simd::sse(
+                    &self.source.planes[plane][start..],
+                    stride,
+                    &prediction,
+                    size,
+                    size,
+                    size,
+                );
+                for (row, predicted) in prediction.chunks_exact(size).enumerate() {
+                    let start = start + row * stride;
                     self.recon.planes[plane][start..start + size].copy_from_slice(predicted);
                 }
             }
@@ -1991,9 +2146,14 @@ impl<'a> FrameEncoder<'a> {
         let table = if self.is_key() {
             &KF_PARTITION_PROBS
         } else {
-            &PARTITION_PROBS
+            &self.context.partition
         };
         let probs = &table[context * 3..context * 3 + 3];
+        // The decoder counts every partition, including the splits the frame
+        // edges imply.
+        if let Some(counts) = sink.counts() {
+            counts.partition[context][if split { 3 } else { 0 }] += 1;
+        }
         if bsl == 0 {
             debug_assert!(!split, "8x8 blocks are never split");
             sink.tree(&PARTITION_TREE, probs, 0);
@@ -2014,7 +2174,18 @@ impl<'a> FrameEncoder<'a> {
     fn skip_symbol<S: BoolSink>(&self, sink: &mut S, neighbors: Neighbors, skip: bool) {
         let context = usize::from(neighbors.above.is_some_and(|info| info.skip))
             + usize::from(neighbors.left.is_some_and(|info| info.skip));
-        sink.write(skip, SKIP_PROBS[context]);
+        sink.write(skip, self.context.skip[context]);
+        if let Some(counts) = sink.counts() {
+            counts.skip[context][usize::from(skip)] += 1;
+        }
+    }
+
+    fn intra_inter_symbol<S: BoolSink>(&self, sink: &mut S, neighbors: Neighbors, inter: bool) {
+        let context = intra_inter_context(neighbors);
+        sink.write(inter, self.context.intra_inter[context]);
+        if let Some(counts) = sink.counts() {
+            counts.intra_inter[context][usize::from(inter)] += 1;
+        }
     }
 
     /// Writes the transform size as `read_tx_size` reads it with
@@ -2043,10 +2214,13 @@ impl<'a> FrameEncoder<'a> {
         }
         let context = usize::from(above + left > max);
         let probs: &[u8] = match max {
-            1 => &TX_PROBS_8X8[context..context + 1],
-            2 => &TX_PROBS_16X16[context * 2..context * 2 + 2],
-            _ => &TX_PROBS_32X32[context * 3..context * 3 + 3],
+            1 => &self.context.tx_8x8[context..context + 1],
+            2 => &self.context.tx_16x16[context * 2..context * 2 + 2],
+            _ => &self.context.tx_32x32[context * 3..context * 3 + 3],
         };
+        if let Some(counts) = sink.counts() {
+            counts.tx[usize::from(max) - 1][context][usize::from(tx_size)] += 1;
+        }
         sink.write(tx_size != 0, probs[0]);
         if tx_size != 0 && max >= 2 {
             sink.write(tx_size != 1, probs[1]);
@@ -2071,7 +2245,10 @@ impl<'a> FrameEncoder<'a> {
         } else {
             // `size_group_lookup` of the square block sizes.
             let group = (bsl + 1).min(3);
-            &IF_Y_MODE_PROBS[group * 9..group * 9 + 9]
+            if let Some(counts) = sink.counts() {
+                counts.y_mode[group][mode as usize] += 1;
+            }
+            &self.context.y_mode[group * 9..group * 9 + 9]
         };
         sink.tree(&INTRA_MODE_TREE, probs, mode as u8);
     }
@@ -2081,7 +2258,10 @@ impl<'a> FrameEncoder<'a> {
         let table = if self.is_key() {
             &KF_UV_MODE_PROBS
         } else {
-            &IF_UV_MODE_PROBS
+            if let Some(counts) = sink.counts() {
+                counts.uv_mode[y_mode as usize][mode as usize] += 1;
+            }
+            &self.context.uv_mode
         };
         sink.tree(&INTRA_MODE_TREE, &table[index..index + 9], mode as u8);
     }
@@ -2098,15 +2278,21 @@ impl<'a> FrameEncoder<'a> {
         nearest: Mv,
     ) {
         // A single LAST_FRAME reference: the first single_ref bit is zero.
-        sink.write(false, SINGLE_REF_PROBS[single_ref_context(neighbors) * 2]);
+        let single_ref = single_ref_context(neighbors);
+        sink.write(false, self.context.single_ref[single_ref * 2]);
         sink.tree(
             &INTER_MODE_TREE,
-            &INTER_MODE_PROBS[mode_context * 3..mode_context * 3 + 3],
+            &self.context.inter_mode[mode_context * 3..mode_context * 3 + 3],
             mode - NEARESTMV,
         );
+        if let Some(counts) = sink.counts() {
+            counts.single_ref[single_ref][0] += 1;
+            counts.inter_mode[mode_context][usize::from(mode - NEARESTMV)] += 1;
+        }
         if mode == NEWMV {
             write_mv(
                 sink,
+                self.context,
                 Mv {
                     row: mv.row - nearest.row,
                     col: mv.col - nearest.col,
@@ -2117,7 +2303,7 @@ impl<'a> FrameEncoder<'a> {
 
     fn write_mode_info(
         &self,
-        writer: &mut BoolEncoder,
+        writer: &mut TileWriter,
         mi_row: usize,
         mi_col: usize,
         bsl: usize,
@@ -2127,10 +2313,7 @@ impl<'a> FrameEncoder<'a> {
         let info = choice.info;
         self.skip_symbol(writer, neighbors, info.skip);
         if !self.is_key() {
-            writer.write(
-                info.is_inter,
-                INTRA_INTER_PROBS[intra_inter_context(neighbors)],
-            );
+            self.intra_inter_symbol(writer, neighbors, info.is_inter);
         }
         if !info.is_inter || !info.skip {
             self.tx_size_symbol(writer, neighbors, bsl, info.tx_size);
@@ -2164,7 +2347,7 @@ impl<'a> FrameEncoder<'a> {
 
     fn write_tokens(
         &self,
-        writer: &mut BoolEncoder,
+        writer: &mut TileWriter,
         mi_row: usize,
         mi_col: usize,
         bsl: usize,
@@ -2193,12 +2376,12 @@ impl<'a> FrameEncoder<'a> {
                         + usize::from(left[row..row + step].contains(&true));
                     write_coefficients(
                         writer,
+                        &self.context.coef[tx_size],
                         &block.levels,
                         block.eob,
                         tx_size,
                         block.tx_type,
-                        usize::from(plane > 0),
-                        usize::from(choice.info.is_inter),
+                        usize::from(plane > 0) * 2 + usize::from(choice.info.is_inter),
                         context,
                     );
                     above[col..col + step].fill(block.eob > 0);
@@ -2300,28 +2483,6 @@ fn scan_order(tx_size: usize, tx_type: TxType) -> (&'static [i16], &'static [i16
     }
 }
 
-/// The default coefficient model probabilities of one context.
-fn coefficient_probs(
-    tx_size: usize,
-    plane_type: usize,
-    reference: usize,
-    band: usize,
-    context: usize,
-) -> &'static [u8; 3] {
-    &coefficient_model(tx_size)[plane_type][reference][band][context]
-}
-
-/// The default coefficient model probabilities of a transform size, by plane
-/// type, reference, band and context.
-fn coefficient_model(tx_size: usize) -> &'static [[[[[u8; 3]; 6]; 6]; 2]; 2] {
-    match tx_size {
-        0 => &shared::DEFAULT_COEF_PROBS_4X4,
-        1 => &shared::DEFAULT_COEF_PROBS_8X8,
-        2 => &shared::DEFAULT_COEF_PROBS_16X16,
-        _ => &shared::DEFAULT_COEF_PROBS_32X32,
-    }
-}
-
 /// The token cache energy class of a coefficient magnitude.
 fn energy_class(magnitude: u32) -> u8 {
     match magnitude {
@@ -2334,42 +2495,19 @@ fn energy_class(magnitude: u32) -> u8 {
     }
 }
 
-/// Writes one transform block's tokens as `decode_coefs` reads them, from
-/// `levels` in raster order with `eob` the end of block in scan order.
+/// Writes one transform block's tokens as `decode_coefs` reads them, and
+/// counts them as it does, from `levels` in raster order with `eob` the end
+/// of block in scan order. `block_type` is the plane type (luma or chroma)
+/// times two plus the reference type (intra or inter).
 #[allow(clippy::too_many_arguments)]
 fn write_coefficients<S: BoolSink>(
     sink: &mut S,
+    coef_probs: &CoefProbs,
     levels: &[i32],
     eob: usize,
     tx_size: usize,
     tx_type: TxType,
-    plane_type: usize,
-    reference: usize,
-    context: usize,
-) {
-    // The token cache is sized to the transform: the search costs every
-    // transform block it tries, most of them small.
-    let write = match tx_size {
-        0 => write_tokens::<S, 16>,
-        1 => write_tokens::<S, 64>,
-        2 => write_tokens::<S, 256>,
-        _ => write_tokens::<S, 1024>,
-    };
-    write(
-        sink, levels, eob, tx_size, tx_type, plane_type, reference, context,
-    );
-}
-
-/// [`write_coefficients`] for a transform of `SIZE` coefficients.
-#[allow(clippy::too_many_arguments)]
-fn write_tokens<S: BoolSink, const SIZE: usize>(
-    sink: &mut S,
-    levels: &[i32],
-    eob: usize,
-    tx_size: usize,
-    tx_type: TxType,
-    plane_type: usize,
-    reference: usize,
+    block_type: usize,
     mut context: usize,
 ) {
     let (scan, neighbors) = scan_order(tx_size, tx_type);
@@ -2378,17 +2516,27 @@ fn write_tokens<S: BoolSink, const SIZE: usize>(
     } else {
         &shared::COEFBAND_TRANS_8X8PLUS
     };
-    let model = &coefficient_model(tx_size)[plane_type][reference];
-    let mut cache = [0_u8; SIZE];
+    let probs = &coef_probs[block_type / 2][block_type % 2];
+    let mut cache = [0_u8; 1024];
     let mut previous_zero = false;
     for c in 0..eob {
-        let probs = &model[usize::from(bands[c])][context];
+        let band = usize::from(bands[c]);
+        let model = &probs[band][context];
         if !previous_zero {
-            sink.write(true, probs[0]);
+            sink.write(true, model[0]);
         }
         let position = scan[c] as usize;
         let level = levels[position];
         let magnitude = level.unsigned_abs();
+        if let Some(counts) = sink.counts() {
+            let (pt, reference) = (block_type / 2, block_type % 2);
+            if !previous_zero {
+                counts.eob_branch[tx_size][pt][reference][band][context] += 1;
+            }
+            // ZERO_TOKEN, ONE_TOKEN or TWO_TOKEN (any larger magnitude).
+            counts.coef[tx_size][pt][reference][band][context][magnitude.min(2) as usize] += 1;
+        }
+        let probs = model;
         if magnitude == 0 {
             sink.write(false, probs[1]);
             previous_zero = true;
@@ -2406,7 +2554,13 @@ fn write_tokens<S: BoolSink, const SIZE: usize>(
             >> 1;
     }
     if eob < scan.len() {
-        sink.write(false, model[usize::from(bands[eob])][context][0]);
+        let band = usize::from(bands[eob]);
+        sink.write(false, probs[band][context][0]);
+        if let Some(counts) = sink.counts() {
+            let (pt, reference) = (block_type / 2, block_type % 2);
+            counts.eob_branch[tx_size][pt][reference][band][context] += 1;
+            counts.coef[tx_size][pt][reference][band][context][3] += 1; // EOB_MODEL_TOKEN
+        }
     }
 }
 
@@ -2414,7 +2568,7 @@ fn write_tokens<S: BoolSink, const SIZE: usize>(
 const COSTED_MAGNITUDES: usize = 16;
 
 /// What each token costs in one coefficient context, in bits, as
-/// [`write_tokens`] codes it.
+/// [`write_coefficients`] codes it.
 struct ContextCosts {
     /// The "more coefficients" bit before a token that follows a nonzero one.
     more: f64,
@@ -2423,6 +2577,8 @@ struct ContextCosts {
     zero: f64,
     /// A nonzero level of each magnitude from 1, with its sign.
     nonzero: [f64; COSTED_MAGNITUDES],
+    /// The context's probabilities, for magnitudes past `nonzero`.
+    probs: [u8; 3],
 }
 
 impl ContextCosts {
@@ -2435,6 +2591,7 @@ impl ContextCosts {
                 end: f64::INFINITY,
                 zero: f64::INFINITY,
                 nonzero: [f64::INFINITY; COSTED_MAGNITUDES],
+                probs: *probs,
             };
         }
         Self {
@@ -2442,6 +2599,7 @@ impl ContextCosts {
             end: bit_cost(false, probs[0]),
             zero: bit_cost(false, probs[1]),
             nonzero: core::array::from_fn(|index| nonzero_cost(index as u32 + 1, probs)),
+            probs: *probs,
         }
     }
 }
@@ -2459,28 +2617,28 @@ fn nonzero_cost(magnitude: u32, probs: &[u8; 3]) -> f64 {
 /// plane type, reference, band and context.
 type TokenCosts = [[[[ContextCosts; 6]; 6]; 2]; 2];
 
-fn token_costs(tx_size: usize) -> &'static TokenCosts {
-    static COSTS: OnceLock<[TokenCosts; 4]> = OnceLock::new();
-    &COSTS.get_or_init(|| {
-        core::array::from_fn(|tx_size| {
-            let model = coefficient_model(tx_size);
-            core::array::from_fn(|plane_type| {
-                core::array::from_fn(|reference| {
-                    core::array::from_fn(|band| {
-                        core::array::from_fn(|context| {
-                            ContextCosts::new(&model[plane_type][reference][band][context])
-                        })
+/// The token costs of every transform size under a frame's coefficient
+/// probabilities.
+fn token_costs(coef: &[CoefProbs; 4]) -> Box<[TokenCosts; 4]> {
+    Box::new(core::array::from_fn(|tx_size| {
+        core::array::from_fn(|plane_type| {
+            core::array::from_fn(|reference| {
+                core::array::from_fn(|band| {
+                    core::array::from_fn(|context| {
+                        ContextCosts::new(&coef[tx_size][plane_type][reference][band][context])
                     })
                 })
             })
         })
-    })[tx_size]
+    }))
 }
 
 /// The bits [`write_coefficients`] codes one transform block's tokens in,
 /// from the costs of whole tokens: the search costs every transform block it
 /// tries, and summing bit by bit dominated it.
+#[allow(clippy::too_many_arguments)]
 fn coefficient_bits(
+    costs: &TokenCosts,
     levels: &[i32],
     eob: usize,
     tx_size: usize,
@@ -2496,13 +2654,15 @@ fn coefficient_bits(
         _ => token_bits::<1024>,
     };
     bits(
-        levels, eob, tx_size, tx_type, plane_type, reference, context,
+        costs, levels, eob, tx_size, tx_type, plane_type, reference, context,
     )
 }
 
 /// [`coefficient_bits`] for a transform of `SIZE` coefficients, following
-/// [`write_tokens`] token by token.
+/// [`write_coefficients`] token by token.
+#[allow(clippy::too_many_arguments)]
 fn token_bits<const SIZE: usize>(
+    costs: &TokenCosts,
     levels: &[i32],
     eob: usize,
     tx_size: usize,
@@ -2517,7 +2677,7 @@ fn token_bits<const SIZE: usize>(
     } else {
         &shared::COEFBAND_TRANS_8X8PLUS
     };
-    let costs = &token_costs(tx_size)[plane_type][reference];
+    let costs = &costs[plane_type][reference];
     let mut bits = 0.0;
     let mut cache = [0_u8; SIZE];
     let mut previous_zero = false;
@@ -2535,10 +2695,7 @@ fn token_bits<const SIZE: usize>(
         } else {
             bits += match token.nonzero.get(magnitude as usize - 1) {
                 Some(&cost) => cost,
-                None => nonzero_cost(
-                    magnitude,
-                    &coefficient_model(tx_size)[plane_type][reference][band][context],
-                ),
+                None => nonzero_cost(magnitude, &token.probs),
             };
             previous_zero = false;
         }
@@ -2622,14 +2779,18 @@ fn mv_class(z: u32) -> (usize, u32) {
     (class, z - base)
 }
 
-fn write_mv<S: BoolSink>(sink: &mut S, difference: Mv) {
+/// Writes a motion vector difference, counting it as `vp9_inc_mv` does.
+fn write_mv<S: BoolSink>(sink: &mut S, context: &FrameContext, difference: Mv) {
     let joint = usize::from(difference.row != 0) * 2 + usize::from(difference.col != 0);
-    sink.tree(&MV_JOINT_TREE, &MV_JOINT_PROBS, joint as u8);
+    sink.tree(&MV_JOINT_TREE, &context.mv_joints, joint as u8);
+    if let Some(counts) = sink.counts() {
+        counts.mv_joints[joint] += 1;
+    }
     for (component, value) in [(0, difference.row), (1, difference.col)] {
         if value == 0 {
             continue;
         }
-        let probs = &MV_COMPONENT_PROBS[component];
+        let probs = &context.mv[component];
         sink.write(value < 0, probs.sign);
         let (class, offset) = mv_class(value.unsigned_abs() - 1);
         sink.tree(&MV_CLASS_TREE, &probs.classes, class as u8);
@@ -2648,7 +2809,29 @@ fn write_mv<S: BoolSink>(sink: &mut S, difference: Mv) {
             &probs.fp
         };
         sink.tree(&MV_FP_TREE, fp, fraction);
-        // Without high-precision vectors the eighth-sample bit is implied.
+        // Without high-precision vectors the eighth-sample bit is implied,
+        // and its probabilities are never adapted.
+        if let Some(counts) = sink.counts() {
+            let MvComponentCounts {
+                sign,
+                classes,
+                class0,
+                bits,
+                class0_fp,
+                fp: fp_counts,
+            } = &mut counts.mv[component];
+            sign[usize::from(value < 0)] += 1;
+            classes[class] += 1;
+            if class == 0 {
+                class0[integer as usize] += 1;
+                class0_fp[integer as usize][usize::from(fraction)] += 1;
+            } else {
+                for (bit, bit_counts) in bits.iter_mut().enumerate().take(class) {
+                    bit_counts[((integer >> bit) & 1) as usize] += 1;
+                }
+                fp_counts[usize::from(fraction)] += 1;
+            }
+        }
     }
 }
 
@@ -2695,6 +2878,7 @@ fn compressed_header(key: bool, larger_transforms: bool) -> Vec<u8> {
 fn uncompressed_header(
     geometry: &Geometry,
     key: bool,
+    error_resilient: bool,
     base_q_idx: u8,
     filter_level: u8,
     full_range: bool,
@@ -2706,7 +2890,7 @@ fn uncompressed_header(
     writer.bit(false); // show_existing_frame
     writer.bit(!key); // frame_type
     writer.bit(true); // show_frame
-    writer.bit(true); // error_resilient_mode
+    writer.bit(error_resilient); // error_resilient_mode
     if key {
         writer.literal(0x49_83_42, 24); // frame sync code
         writer.literal(1, 3); // color_space = CS_BT_601
@@ -2715,6 +2899,9 @@ fn uncompressed_header(
         writer.literal(geometry.height as u32 - 1, 16);
         writer.bit(false); // render_and_frame_size_different
     } else {
+        if !error_resilient {
+            writer.literal(0, 2); // reset_frame_context
+        }
         writer.literal(1, 8); // refresh_frame_flags: slot 0 only
         for _ in 0..3 {
             writer.literal(0, 3); // ref_frame_idx: every reference is slot 0
@@ -2725,6 +2912,12 @@ fn uncompressed_header(
         writer.bit(false); // allow_high_precision_mv
         writer.bit(false); // is_filter_switchable
         writer.literal(1, 2); // raw_interpolation_filter = EIGHTTAP (regular)
+    }
+    if !error_resilient {
+        // Adapt the probabilities backwards after every frame and keep them
+        // for the next one.
+        writer.bit(true); // refresh_frame_context
+        writer.bit(false); // frame_parallel_decoding_mode
     }
     writer.literal(0, 2); // frame_context_idx
     writer.literal(u32::from(filter_level), 6); // loop_filter_level
@@ -2779,64 +2972,89 @@ mod tests {
     #[test]
     fn token_costs_match_costing_every_bit() {
         // `coefficient_bits` sums whole tokens where `write_coefficients`
-        // sums bits, so the two agree up to the order of the additions.
+        // sums bits, so the two agree up to the order of the additions. The
+        // default probabilities, and a set skewed as adaptation skews them.
+        let mut skewed = FrameContext::default().coef;
+        for (index, probs) in skewed
+            .as_flattened_mut()
+            .as_flattened_mut()
+            .as_flattened_mut()
+            .as_flattened_mut()
+            .iter_mut()
+            .enumerate()
+        {
+            for prob in probs.iter_mut().filter(|prob| **prob != 0) {
+                *prob = (u32::from(*prob) * 7 + index as u32 * 13).clamp(1, 255) as u8 % 255 + 1;
+            }
+        }
         let mut state = 0x2545_f491_u32;
-        for tx_size in [0, 1, 2, 3] {
-            let n = 4 << tx_size;
-            for tx_type in [
-                TxType::DctDct,
-                TxType::AdstDct,
-                TxType::DctAdst,
-                TxType::AdstAdst,
-            ] {
-                if tx_size == 3 && tx_type != TxType::DctDct {
-                    continue;
-                }
-                for (plane_type, reference, context) in [(0, 0, 0), (0, 1, 1), (1, 0, 2), (1, 1, 0)]
-                {
-                    let levels: Vec<i32> = (0..n * n)
-                        .map(|index| {
-                            state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
-                            // Mostly small levels, some past the costed
-                            // magnitudes, thinning out with frequency.
-                            let magnitude = match (state >> 16) % 16 {
-                                0..=7 => 0,
-                                8..=12 => ((state >> 8) % 4) as i32,
-                                13 | 14 => ((state >> 8) % 40) as i32,
-                                _ => ((state >> 8) % 3000) as i32,
-                            } >> (index / n).min(4);
-                            if state & 1 == 0 {
-                                magnitude
-                            } else {
-                                -magnitude
-                            }
-                        })
-                        .collect();
-                    let (scan, _) = scan_order(tx_size, tx_type);
-                    let last = scan
-                        .iter()
-                        .rposition(|&position| levels[position as usize] != 0)
-                        .map_or(0, |last| last + 1);
-                    for eob in [last, last / 2, 1] {
-                        let mut counter = BitCost::default();
-                        write_coefficients(
-                            &mut counter,
-                            &levels,
-                            eob,
-                            tx_size,
-                            tx_type,
-                            plane_type,
-                            reference,
-                            context,
-                        );
-                        let bits = coefficient_bits(
-                            &levels, eob, tx_size, tx_type, plane_type, reference, context,
-                        );
-                        assert!(
-                            (bits - counter.0).abs() <= 1e-9 * counter.0.max(1.0),
-                            "{n}x{n} {tx_type:?} eob {eob}: {bits} bits against {}",
-                            counter.0
-                        );
+        for coef in [FrameContext::default().coef, skewed] {
+            let costs = token_costs(&coef);
+            for tx_size in [0, 1, 2, 3] {
+                let n = 4 << tx_size;
+                for tx_type in [
+                    TxType::DctDct,
+                    TxType::AdstDct,
+                    TxType::DctAdst,
+                    TxType::AdstAdst,
+                ] {
+                    if tx_size == 3 && tx_type != TxType::DctDct {
+                        continue;
+                    }
+                    for (plane_type, reference, context) in
+                        [(0, 0, 0), (0, 1, 1), (1, 0, 2), (1, 1, 0)]
+                    {
+                        let levels: Vec<i32> = (0..n * n)
+                            .map(|index| {
+                                state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                                // Mostly small levels, some past the costed
+                                // magnitudes, thinning out with frequency.
+                                let magnitude = match (state >> 16) % 16 {
+                                    0..=7 => 0,
+                                    8..=12 => ((state >> 8) % 4) as i32,
+                                    13 | 14 => ((state >> 8) % 40) as i32,
+                                    _ => ((state >> 8) % 3000) as i32,
+                                } >> (index / n).min(4);
+                                if state & 1 == 0 {
+                                    magnitude
+                                } else {
+                                    -magnitude
+                                }
+                            })
+                            .collect();
+                        let (scan, _) = scan_order(tx_size, tx_type);
+                        let last = scan
+                            .iter()
+                            .rposition(|&position| levels[position as usize] != 0)
+                            .map_or(0, |last| last + 1);
+                        for eob in [last, last / 2, 1] {
+                            let mut counter = BitCost::default();
+                            write_coefficients(
+                                &mut counter,
+                                &coef[tx_size],
+                                &levels,
+                                eob,
+                                tx_size,
+                                tx_type,
+                                plane_type * 2 + reference,
+                                context,
+                            );
+                            let bits = coefficient_bits(
+                                &costs[tx_size],
+                                &levels,
+                                eob,
+                                tx_size,
+                                tx_type,
+                                plane_type,
+                                reference,
+                                context,
+                            );
+                            assert!(
+                                (bits - counter.0).abs() <= 1e-9 * counter.0.max(1.0),
+                                "{n}x{n} {tx_type:?} eob {eob}: {bits} bits against {}",
+                                counter.0
+                            );
+                        }
                     }
                 }
             }
@@ -2875,23 +3093,24 @@ mod tests {
         let mut counter = BitCost::default();
         for (tx_size, levels, eob) in &blocks {
             for context in 0..3 {
+                let probs = &FrameContext::default().coef[*tx_size];
                 write_coefficients(
                     &mut writer,
+                    probs,
                     levels,
                     *eob,
                     *tx_size,
                     TxType::DctDct,
-                    0,
                     1,
                     context,
                 );
                 write_coefficients(
                     &mut counter,
+                    probs,
                     levels,
                     *eob,
                     *tx_size,
                     TxType::DctDct,
-                    0,
                     1,
                     context,
                 );

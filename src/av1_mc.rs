@@ -2566,54 +2566,66 @@ mod tests {
         let plane = reference_plane(256, 256, 0xf00d);
         let reference = RefPlane::new(&plane, 256, 256);
         let (width, height) = (16, 16);
-        let blocks = 8_000;
-        let mut timings = Vec::new();
-        for level in available_levels() {
-            let mut context = McContext::with_level(level);
-            let mut dst = vec![0u8; width * height];
-            let mut checksum = 0u64;
-            // Warm the caches and the branch predictors before timing.
-            for _ in 0..64 {
-                context.predict_single(
-                    reference,
-                    8,
-                    8,
-                    width,
-                    height,
-                    5,
-                    7,
-                    InterpFilter::Regular,
-                    &mut dst,
-                    width,
-                );
-            }
-            // Shared CI runners are noisy, so the best of three trials is
-            // reported rather than a single measurement.
-            let mut elapsed = Duration::MAX;
-            for _ in 0..3 {
+        let blocks: i32 = 2_000;
+        let predict = |context: &mut McContext, x: i32, y: i32, dst: &mut [u8]| {
+            context.predict_single(
+                reference,
+                x,
+                y,
+                width,
+                height,
+                5,
+                7,
+                InterpFilter::Regular,
+                dst,
+                width,
+            );
+        };
+        let mut backends: Vec<_> = available_levels()
+            .into_iter()
+            .map(|level| {
+                let mut context = McContext::with_level(level);
+                let mut dst = vec![0u8; width * height];
+                // Warm the caches and the branch predictors before timing.
+                for _ in 0..64 {
+                    predict(&mut context, 8, 8, &mut dst);
+                }
+                (level, context, dst, Duration::MAX)
+            })
+            .collect();
+        // Shared CI runners are noisy, and load only ever slows a trial down,
+        // so each backend keeps its fastest trial. The trials are short and
+        // interleaved round by round, so a burst of load lands on every
+        // backend alike instead of on all of one backend's trials.
+        let vector_wins = |backends: &[(SimdLevel, McContext, Vec<u8>, Duration)]| {
+            let scalar = backends
+                .iter()
+                .find(|(level, ..)| *level == SimdLevel::Scalar)
+                .map(|(.., elapsed)| *elapsed);
+            backends
+                .iter()
+                .filter(|(level, ..)| *level != SimdLevel::Scalar)
+                .any(|(.., elapsed)| Some(*elapsed) < scalar)
+        };
+        let mut checksum = 0u64;
+        for round in 0..24 {
+            for (_, context, dst, elapsed) in &mut backends {
                 let start = Instant::now();
                 for block in 0..blocks {
-                    let x = block % 200;
-                    let y = (block / 200) % 200;
-                    context.predict_single(
-                        reference,
-                        x,
-                        y,
-                        width,
-                        height,
-                        5,
-                        7,
-                        InterpFilter::Regular,
-                        &mut dst,
-                        width,
-                    );
+                    predict(context, block % 200, (block / 200) % 200, dst);
                     checksum += u64::from(dst[0]);
                 }
-                elapsed = elapsed.min(start.elapsed());
+                *elapsed = (*elapsed).min(start.elapsed());
             }
-            assert!(checksum > 0);
-            timings.push((level, elapsed));
+            if round >= 4 && vector_wins(&backends) {
+                break;
+            }
         }
+        assert!(checksum > 0);
+        let timings: Vec<_> = backends
+            .into_iter()
+            .map(|(level, .., elapsed)| (level, elapsed))
+            .collect();
         let scalar = timings
             .iter()
             .find(|(level, _)| *level == SimdLevel::Scalar)

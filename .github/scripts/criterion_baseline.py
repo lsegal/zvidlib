@@ -532,6 +532,29 @@ SITE_GROUP_PREFIXES: dict[str, tuple[str, ...]] = {
     "av1_mc": ("av1_mc_", "av1_motion_compensation"),
     "av1_intra_pred": ("av1_intra_",),
     "av1_coeff_ctx": ("av1_encode_stage_coeff_ctx", "av1_encode_stage_tile"),
+    # Whole encodes, unlike whole frames above: no other site's kernels run
+    # inside the Vorbis encoder, so every row of `benches/vorbis_encode.rs` is
+    # this site's own number.
+    "vorbis_encode": ("vorbis_encode_",),
+    "vp8_encode": (
+        "vp8_encode_stage_sad",
+        "vp8_encode_stage_satd",
+        "vp8_encode_stage_fdct",
+        "vp8_encode_stage_fwht",
+        "vp8_encode_stage_quantize",
+    ),
+    "vp8_recon": (
+        "vp8_encode_stage_idct",
+        "vp8_encode_stage_iwht",
+        "vp8_encode_stage_sixtap",
+        "vp8_encode_stage_tm_pred",
+        "vp8_encode_stage_loop_filter",
+        "vp8_decode_stage_bilinear",
+        "vp8_decode_stage_loop_filter_simple",
+    ),
+    "vp8_decode": ("vp8_decode_stage_subblock_pred", "vp8_decode_stage_dc_idct"),
+    "vp9_decode": ("vp9_inverse_", "vp9_mc_", "vp9_intra_", "vp9_loop_filter_"),
+    "vp9_encode": ("vp9_encode_",),
     "hevc_prediction_filters": (
         "hevc_inter_pred",
         "hevc_intra_pred",
@@ -544,6 +567,13 @@ SITE_GROUP_PREFIXES: dict[str, tuple[str, ...]] = {
     "hevc_fwd_transform_quant": ("hevc_encode_640x352_fwd_transform_quant",),
     "hevc_colorconv": ("hevc_encode_640x352_rgba_to_yuv420",),
     "hevc_color_convert": ("hevc_color_convert",),
+    "yuv_to_rgba": ("yuv_to_rgba",),
+    "vorbis_decode": (
+        "vorbis_imdct",
+        "vorbis_overlap_add",
+        "vorbis_coupling",
+        "vorbis_floor_product",
+    ),
 }
 
 # `Measured on **<host>**, at `<sha>`.` - the line `table` renders above every

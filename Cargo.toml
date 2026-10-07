@@ -63,9 +63,25 @@ name = "av1_encode"
 path = "benches/av1_encode.rs"
 harness = false
 
+# The VP9 software decoder's own scalar-vs-SIMD suite: whole-frame decode and
+# every stage the `vp9_decode` dispatch site vectorizes. A separate target for
+# the same reasons as `av1_decode`; it shares `benches/support/` with the rest.
+[[bench]]
+name = "vp9_decode"
+path = "benches/vp9_decode.rs"
+harness = false
+
 [[bench]]
 name = "hevc_decode"
 path = "benches/hevc_decode.rs"
+harness = false
+
+# The native Vorbis encoder's scalar-vs-SIMD suite (issue #573): whole encodes
+# through the public factory, one arm per instruction set. Synthetic input
+# only, so it shares nothing with `codec`'s decoded-fixture cache.
+[[bench]]
+name = "vorbis_encode"
+path = "benches/vorbis_encode.rs"
 harness = false
 
 # The audio decode path is a separate target rather than another group in
@@ -86,9 +102,10 @@ name = "hevc_encode"
 path = "benches/hevc_encode.rs"
 harness = false
 
-# The pure-Rust VP9 encoder (#567). Its own target for the same reason as
-# `hevc_encode`: synthetic inputs only, and a rate-distortion search slow
-# enough to keep out of the other targets' default runs.
+# The native VP9 encoder, whole-frame and per stage, scalar versus SIMD
+# (#571). Its own target for the same reasons as `hevc_encode`: synthetic
+# inputs only, and a rate-distortion search slow enough to keep out of the
+# other targets' default runs.
 [[bench]]
 name = "vp9_encode"
 path = "benches/vp9_encode.rs"
@@ -113,6 +130,23 @@ name = "hevc_hardware"
 path = "benches/hevc_hardware.rs"
 harness = false
 
+# The VP8 software decoder's scalar-vs-SIMD suite (issue #568): its whole-frame
+# decode and the stages only the decoder runs. The kernels it shares with the
+# encoder are timed by `vp8_encode`.
+[[bench]]
+name = "vp8_decode"
+path = "benches/vp8_decode.rs"
+harness = false
+
+# The native VP8 encoder's scalar-vs-SIMD suite: whole frames through the
+# public encoder and each of its `vp8_encode` and `vp8_recon` kernels. Its own
+# target for the same reason as `av1_encode`: it shares none of `codec`'s
+# decoded-frame fixtures, and its name says what it measures.
+[[bench]]
+name = "vp8_encode"
+path = "benches/vp8_encode.rs"
+harness = false
+
 # Issue #395's measurement: what an exact frame at an arbitrary point of a track
 # costs, by backend and by how often the track lets a decode restart. A separate
 # target because it is the only one whose fixtures are the paired gop-cadence
@@ -121,6 +155,15 @@ harness = false
 [[bench]]
 name = "exact_seek"
 path = "benches/exact_seek.rs"
+harness = false
+
+# The VP8 and VP9 software decoders, and the YUV-to-RGBA output conversion they
+# share with the AV1 decoder (issue #574). A separate target because it decodes
+# streams the crate's own VP8 and VP9 encoders produce, which no other target
+# needs, and because the conversion groups run at 1080p and 4K.
+[[bench]]
+name = "vpx_decode"
+path = "benches/vpx_decode.rs"
 harness = false
 
 [features]
@@ -214,6 +257,11 @@ winit = "0.30.13"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 cpal = "0.15.3"
+
+# Native AAC decoding where the operating system has no AAC decoder of its own:
+# macOS decodes through AudioToolbox and Windows through Media Foundation, so
+# only Linux and the other native targets carry Symphonia's (issue #561).
+[target.'cfg(not(any(target_arch = "wasm32", target_os = "macos", windows)))'.dependencies]
 symphonia-codec-aac = "0.5.5"
 
 [target.'cfg(any(windows, target_os = "linux"))'.dependencies]

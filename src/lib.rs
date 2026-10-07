@@ -39,6 +39,7 @@ pub mod transfer;
 pub mod vorbis;
 mod vorbis_decoder;
 mod vorbis_encoder;
+mod vorbis_simd;
 mod vp9_encoder;
 pub mod webm;
 pub mod webm_demux;
@@ -48,6 +49,8 @@ mod av1_decoder;
 mod vp8;
 mod vp9_dec;
 mod vp9_decoder;
+mod vp9_simd;
+mod yuv_to_rgba;
 
 /// The bounded preview tier over a track, for callers that need an answer at an
 /// arbitrary position faster than a decode from the nearest random-access point
@@ -77,6 +80,21 @@ pub use hevc::bench as hevc_encoder_bench;
 #[cfg(not(target_arch = "wasm32"))]
 #[doc(hidden)]
 pub use hevc::decode_bench as hevc_decoder_bench;
+
+/// Per-stage access to the VP9 decoder for the criterion benchmark suite.
+///
+/// Internal and unstable: the decoder's stages are not otherwise reachable
+/// from a benchmark, which is a separate crate. See `benches/vp9_decode.rs`.
+#[doc(hidden)]
+pub use vp9_simd::bench as vp9_decoder_bench;
+
+/// Per-stage access to the Vorbis decoder's synthesis kernels for the
+/// criterion benchmark suite.
+///
+/// Internal and unstable: the kernels are not otherwise reachable from a
+/// benchmark, which is a separate crate. See `benches/audio_decode.rs`.
+#[doc(hidden)]
+pub use vorbis_simd::bench as vorbis_decoder_bench;
 
 /// Stage attribution for a whole-frame HEVC decode.
 ///
@@ -111,6 +129,16 @@ pub use hevc::narrow_interp as hevc_narrow_interp;
 #[cfg(not(target_arch = "wasm32"))]
 #[doc(hidden)]
 pub use hevc::readback as hevc_hardware_readback;
+
+/// Per-stage access to the native VP9 encoder's pixel kernels for the criterion
+/// benchmark suite.
+///
+/// Internal and unstable, like [`hevc_encoder_bench`]: the kernels are not
+/// otherwise reachable from a benchmark, which is a separate crate. See
+/// `benches/vp9_encode.rs`.
+#[cfg(not(target_arch = "wasm32"))]
+#[doc(hidden)]
+pub use vp9_encoder::bench as vp9_encoder_bench;
 
 #[cfg(not(target_arch = "wasm32"))]
 mod native_audio;
@@ -218,6 +246,25 @@ pub use transfer::{
 pub use vorbis::{
     NativeVorbisDecoder, VORBIS_PREROLL_PACKETS, VorbisConfig, native_vorbis_audio_encoder_factory,
 };
+/// Per-stage access to the native VP8 encoder for the criterion benchmark
+/// suite.
+///
+/// Internal and unstable, and the VP8 counterpart to [`hevc_encoder_bench`]:
+/// the encoder's distortion metrics, transforms, quantization, prediction and
+/// loop filter are not otherwise reachable from a benchmark, which is a
+/// separate crate. See `benches/vp8_encode.rs`.
+#[doc(hidden)]
+pub use vp8::bench as vp8_encoder_bench;
+
+/// Per-stage access to the native VP8 decoder for the criterion benchmark
+/// suite.
+///
+/// Internal and unstable, and the decode-side counterpart to
+/// [`vp8_encoder_bench`]: the stages only the decoder takes and its whole-frame
+/// decode, which a benchmark, being a separate crate, cannot otherwise reach.
+/// See `benches/vp8_decode.rs`.
+#[doc(hidden)]
+pub use vp8::decode_bench as vp8_decoder_bench;
 pub use vp9_encoder::native_vp9_video_encoder_factory;
 pub use webm::WebmMuxer;
 pub use webm_demux::{

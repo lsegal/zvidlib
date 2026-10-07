@@ -9,14 +9,20 @@
 //!
 //! [`VideoEncoderConfig::configuration`] is either empty, which encodes at
 //! [`DEFAULT_BASE_Q_IDX`] with a key frame every [`DEFAULT_KEYFRAME_INTERVAL`]
-//! frames, a single nonzero `base_q_idx` byte, or that byte followed by the key
-//! frame interval in frames as a big-endian `u16`. See [`parse_configuration`].
-//! A hardware encoder takes the same configuration: it is rate controlled by
+//! frames, a single nonzero `base_q_idx` byte, that byte followed by the key
+//! frame interval in frames as a big-endian `u16`, or those three bytes
+//! followed by a flags byte whose bit 0 ([`FLAG_ERROR_RESILIENT`]) makes every
+//! frame error resilient. See [`parse_configuration`]. A hardware encoder
+//! takes the same configuration without that flag: it is rate controlled by
 //! quality, which `base_q_idx` maps onto, instead of to a bitrate.
 
+#[cfg(not(target_arch = "wasm32"))]
+pub mod bench;
 mod bitwriter;
+mod context;
 mod dsp;
 mod frame;
+pub(crate) mod simd;
 mod tables;
 
 use crate::{
@@ -25,12 +31,18 @@ use crate::{
     Limits, Orientation, PixelFormat, Result, SampleDependency, VideoDimensions, VideoEncoder,
     VideoEncoderConfig, VideoEncoderFactory, VideoEncoderFormat, VideoFrame,
 };
-use frame::{CodingTools, FrameEncoder, Geometry, Picture};
+use context::FrameContext;
+use frame::{CodingTools, FrameEncoder, Geometry, ModeInfo, Picture};
 
 /// The quantizer index an empty configuration encodes at.
 pub const DEFAULT_BASE_Q_IDX: u8 = 80;
 /// The key frame interval, in frames, an empty or one-byte configuration uses.
 pub const DEFAULT_KEYFRAME_INTERVAL: u16 = 60;
+/// The configuration flag that codes every frame error resilient: with the
+/// default probabilities, and without the probabilities or motion vectors
+/// earlier frames adapted to, so a frame decodes from its reference picture
+/// alone.
+pub const FLAG_ERROR_RESILIENT: u8 = 1;
 /// The widest frame the single-tile-column encoder accepts. VP9 requires more
 /// than one tile column above this width.
 const MAX_WIDTH: u32 = 4096;
@@ -133,8 +145,10 @@ fn hardware_request(
     if configuration.timescale == 0 || configuration.frame_duration == 0 {
         return Err("VP9 timescale and frame duration must be nonzero".into());
     }
-    let (base_q_idx, keyframe_interval) =
-        parse_configuration(&configuration.configuration).ok_or(CONFIGURATION_SHAPE)?;
+    let settings = parse_configuration(&configuration.configuration).ok_or(CONFIGURATION_SHAPE)?;
+    if settings.error_resilient {
+        return Err("hardware VP9 encoders cannot code every frame error resilient".into());
+    }
     pick_level(
         dimensions,
         configuration.timescale,
@@ -142,7 +156,7 @@ fn hardware_request(
     )
     .ok_or("VP9 dimensions and frame rate exceed level 6.2 limits")?;
     // `base_q_idx` 1 is the finest quantizer and 255 the coarsest.
-    let quality = f64::from(255 - base_q_idx) / 254.0;
+    let quality = f64::from(255 - settings.base_q_idx) / 254.0;
     // About 0.17 bits a pixel at the default quantizer, rising steeply toward
     // the finest one: 1080p30 at the default declares roughly 10 Mbit/s.
     let bits_per_pixel = 0.05 + 0.25 * quality * quality;
@@ -154,7 +168,7 @@ fn hardware_request(
         quality,
         nominal_bits_per_second: (pixels_per_second * bits_per_pixel)
             .clamp(100_000.0, f64::from(i32::MAX)) as u32,
-        keyframe_interval: u32::from(keyframe_interval),
+        keyframe_interval: u32::from(settings.keyframe_interval),
     })
 }
 
@@ -294,8 +308,9 @@ mod platform {
 }
 
 const CONFIGURATION_SHAPE: &str = "the native VP9 encoder's configuration is empty, a nonzero \
-                                   base_q_idx byte, or that byte and a nonzero big-endian u16 key \
-                                   frame interval";
+                                   base_q_idx byte, that byte and a nonzero big-endian u16 key \
+                                   frame interval, or those and a flags byte with only bit 0 \
+                                   (error resilient) defined";
 
 fn validate_configuration(configuration: &VideoEncoderConfig) -> CodecSupport {
     if configuration.codec != Codec::Vp9 {
@@ -339,23 +354,37 @@ fn validate_configuration(configuration: &VideoEncoderConfig) -> CodecSupport {
     }
 }
 
-/// The backend-private configuration as `(base_q_idx, keyframe_interval)`, or
-/// `None` when the blob is not one this backend understands.
-///
-/// `base_q_idx` is the frame header's quantizer index (VP9 section 7.2.9);
-/// higher is smaller and blurrier. Zero, which would select VP9's lossless
-/// mode, is not supported. A key frame interval of 1 makes every frame a key
-/// frame.
-fn parse_configuration(configuration: &[u8]) -> Option<(u8, u16)> {
-    match *configuration {
-        [] => Some((DEFAULT_BASE_Q_IDX, DEFAULT_KEYFRAME_INTERVAL)),
-        [base_q_idx] if base_q_idx != 0 => Some((base_q_idx, DEFAULT_KEYFRAME_INTERVAL)),
-        [base_q_idx, high, low] if base_q_idx != 0 => {
-            let interval = u16::from_be_bytes([high, low]);
-            (interval != 0).then_some((base_q_idx, interval))
-        }
-        _ => None,
-    }
+/// The settings a backend-private configuration selects.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Settings {
+    /// The frame header's quantizer index (VP9 section 7.2.9); higher is
+    /// smaller and blurrier. Zero, which would select VP9's lossless mode, is
+    /// not supported.
+    base_q_idx: u8,
+    /// A key frame every this many frames; 1 makes every frame a key frame.
+    keyframe_interval: u16,
+    /// Code every frame error resilient instead of adapting probabilities
+    /// from frame to frame.
+    error_resilient: bool,
+}
+
+/// The backend-private configuration's settings, or `None` when the blob is
+/// not one this backend understands.
+fn parse_configuration(configuration: &[u8]) -> Option<Settings> {
+    let (base_q_idx, keyframe_interval, flags) = match *configuration {
+        [] => (DEFAULT_BASE_Q_IDX, DEFAULT_KEYFRAME_INTERVAL, 0),
+        [base_q_idx] => (base_q_idx, DEFAULT_KEYFRAME_INTERVAL, 0),
+        [base_q_idx, high, low] => (base_q_idx, u16::from_be_bytes([high, low]), 0),
+        [base_q_idx, high, low, flags] => (base_q_idx, u16::from_be_bytes([high, low]), flags),
+        _ => return None,
+    };
+    (base_q_idx != 0 && keyframe_interval != 0 && flags & !FLAG_ERROR_RESILIENT == 0).then_some(
+        Settings {
+            base_q_idx,
+            keyframe_interval,
+            error_resilient: flags & FLAG_ERROR_RESILIENT != 0,
+        },
+    )
 }
 
 /// The lowest VP9 level (as `level_idc`, e.g. 31 for 3.1) whose picture size and
@@ -514,11 +543,20 @@ struct NativeVp9Encoder {
     geometry: Geometry,
     base_q_idx: u8,
     keyframe_interval: u64,
+    error_resilient: bool,
     /// The partition and transform sizes the frame encoder searches.
     tools: CodingTools,
     /// The previous frame's reconstruction, which the next inter frame
     /// predicts from.
     reference: Option<Picture>,
+    /// The probabilities the next frame codes with: the decoder's frame
+    /// context 0, which every frame that is not error resilient adapts and
+    /// saves.
+    context: FrameContext,
+    /// The previous frame's block modes, whose motion vectors the next inter
+    /// frame takes as candidates.
+    previous_mode_info: Vec<ModeInfo>,
+    previous_was_key: bool,
     next_index: u64,
     finished: bool,
 }
@@ -544,6 +582,7 @@ impl VideoEncoder for NativeVp9Encoder {
         Box::pin(async move {
             self.finished = true;
             self.reference = None;
+            self.previous_mode_info = Vec::new();
             Ok(Vec::new())
         })
     }
@@ -556,7 +595,7 @@ impl NativeVp9Encoder {
             return Err(capability_error(support));
         }
         validate_limits(configuration.coded_dimensions, limits)?;
-        let (base_q_idx, keyframe_interval) = parse_configuration(&configuration.configuration)
+        let settings = parse_configuration(&configuration.configuration)
             .ok_or_else(|| Error::new(ErrorKind::InvalidInput, CONFIGURATION_SHAPE))?;
         let level = pick_level(
             configuration.coded_dimensions,
@@ -588,10 +627,14 @@ impl NativeVp9Encoder {
                 configuration.coded_dimensions.width as usize,
                 configuration.coded_dimensions.height as usize,
             ),
-            base_q_idx,
-            keyframe_interval: u64::from(keyframe_interval),
+            base_q_idx: settings.base_q_idx,
+            keyframe_interval: u64::from(settings.keyframe_interval),
+            error_resilient: settings.error_resilient,
             tools: CodingTools::ALL,
             reference: None,
+            context: FrameContext::default(),
+            previous_mode_info: Vec::new(),
+            previous_was_key: false,
             next_index: 0,
             finished: false,
         })
@@ -634,21 +677,45 @@ impl NativeVp9Encoder {
 
         let key = index.0 % self.keyframe_interval == 0;
         let reference = if key { None } else { self.reference.as_ref() };
-        let (data, reconstruction) = FrameEncoder::new(
+        // Key frames and error-resilient frames reset every frame context to
+        // the defaults (`setup_past_independence`).
+        if key || self.error_resilient {
+            self.context = FrameContext::default();
+        }
+        // Each frame is shown and the same size as the one before, so a frame
+        // that is not error resilient uses its motion vectors.
+        let previous_mode_info = (!self.error_resilient && !self.previous_mode_info.is_empty())
+            .then_some(self.previous_mode_info.as_slice());
+        let encoded = FrameEncoder::new(
             self.geometry,
             &picture,
             reference,
             self.base_q_idx,
             self.tools,
+            self.error_resilient,
+            &self.context,
+            previous_mode_info,
         )
         .encode(self.color_range == ColorRange::Full);
+        let data = encoded.data;
         if u64::try_from(data.len()).unwrap_or(u64::MAX) > self.limits.max_allocation_bytes {
             return Err(Error::new(
                 ErrorKind::ResourceLimit,
                 "encoded VP9 frame exceeds the configured allocation limit",
             ));
         }
-        self.reference = Some(reconstruction);
+        if !self.error_resilient {
+            // refresh_frame_context = 1, frame_parallel_decoding_mode = 0.
+            self.context = self.context.adapted(
+                &encoded.counts,
+                key,
+                self.previous_was_key,
+                self.tools.larger_transforms,
+            );
+        }
+        self.reference = Some(encoded.reconstruction);
+        self.previous_mode_info = encoded.mode_info;
+        self.previous_was_key = key;
 
         let timestamp = i64::try_from(index.0)
             .ok()
@@ -742,39 +809,58 @@ fn source_picture(
         }
         PixelFormat::Rgba8 | PixelFormat::Bgra8 => {
             let input = &frame.planes[0];
-            let (red, blue) = if frame.pixel_format == PixelFormat::Rgba8 {
-                (0, 2)
-            } else {
-                (2, 0)
+            let bgra = frame.pixel_format == PixelFormat::Bgra8;
+            // The BT.601 rows, reordered to the pixels' byte order.
+            let order = |mut coefficients: [i32; 3]| {
+                if bgra {
+                    coefficients.swap(0, 2);
+                }
+                coefficients
             };
-            let rgb = |x: usize, y: usize| {
-                let offset = stored(y, height) * input.stride + x * 4;
-                [
-                    i32::from(input.data[offset + red]),
-                    i32::from(input.data[offset + 1]),
-                    i32::from(input.data[offset + blue]),
-                ]
+            let (luma, luma_offset, cb, cr) = if full {
+                ([77, 150, 29], 0, [-43, -85, 128], [128, -107, -21])
+            } else {
+                ([66, 129, 25], 16, [-38, -74, 112], [112, -94, -18])
+            };
+            let (luma, cb, cr) = (order(luma), order(cb), order(cr));
+            let row = |y: usize| {
+                let start = stored(y, height) * input.stride;
+                &input.data[start..start + width * 4]
             };
             let stride = picture.strides[0];
             for y in 0..height {
-                for x in 0..width {
-                    picture.planes[0][y * stride + x] = luma(rgb(x, y), full);
-                }
+                simd::luma_row(
+                    row(y),
+                    luma,
+                    luma_offset,
+                    &mut picture.planes[0][y * stride..y * stride + width],
+                );
             }
+            // An odd width's last chroma sample averages the last column with
+            // itself, and an odd height's last row averages the last row with
+            // itself.
+            let mut padded = [Vec::new(), Vec::new()];
             let chroma_stride = picture.strides[1];
+            let [_, cb_plane, cr_plane] = &mut picture.planes;
             for y in 0..chroma_height {
-                for x in 0..chroma_width {
-                    let mut sum = [0_i32; 3];
-                    for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
-                        let sample = rgb((x * 2 + dx).min(width - 1), (y * 2 + dy).min(height - 1));
-                        for channel in 0..3 {
-                            sum[channel] += sample[channel];
-                        }
+                let mut rows = [row(y * 2), row((y * 2 + 1).min(height - 1))];
+                if width % 2 == 1 {
+                    for (padded, row) in padded.iter_mut().zip(&mut rows) {
+                        padded.clear();
+                        padded.extend_from_slice(row);
+                        padded.extend_from_slice(&row[row.len() - 4..]);
+                        *row = padded;
                     }
-                    let [cb, cr] = chroma(sum.map(|value| (value + 2) >> 2), full);
-                    picture.planes[1][y * chroma_stride + x] = cb;
-                    picture.planes[2][y * chroma_stride + x] = cr;
                 }
+                let range = y * chroma_stride..y * chroma_stride + chroma_width;
+                simd::chroma_row(
+                    rows[0],
+                    rows[1],
+                    cb,
+                    cr,
+                    &mut cb_plane[range.clone()],
+                    &mut cr_plane[range],
+                );
             }
         }
         PixelFormat::Rgb8 => {
@@ -809,34 +895,6 @@ fn source_picture(
         }
     }
     Ok(picture)
-}
-
-/// BT.601 luma from 8-bit RGB.
-fn luma([r, g, b]: [i32; 3], full: bool) -> u8 {
-    if full {
-        ((77 * r + 150 * g + 29 * b + 128) >> 8).clamp(0, 255) as u8
-    } else {
-        (((66 * r + 129 * g + 25 * b + 128) >> 8) + 16).clamp(0, 255) as u8
-    }
-}
-
-/// BT.601 Cb and Cr from 8-bit RGB.
-fn chroma([r, g, b]: [i32; 3], full: bool) -> [u8; 2] {
-    let (cb, cr) = if full {
-        (
-            (-43 * r - 85 * g + 128 * b + 128) >> 8,
-            (128 * r - 107 * g - 21 * b + 128) >> 8,
-        )
-    } else {
-        (
-            (-38 * r - 74 * g + 112 * b + 128) >> 8,
-            (112 * r - 94 * g - 18 * b + 128) >> 8,
-        )
-    };
-    [
-        (cb + 128).clamp(0, 255) as u8,
-        (cr + 128).clamp(0, 255) as u8,
-    ]
 }
 
 #[cfg(test)]

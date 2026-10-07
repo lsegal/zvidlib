@@ -8,6 +8,7 @@
 //! approximation of the inverse: the 4x4 one follows libvpx's `vp9_fht4x4_c`,
 //! and the larger ones are exact floating-point transforms.
 
+use super::simd;
 use super::tables::SUBPEL_FILTERS_REGULAR;
 use std::sync::OnceLock;
 
@@ -80,8 +81,13 @@ fn fadst4(input: [i64; 4]) -> [i64; 4] {
     ]
 }
 
-/// Forward 4x4 transform of a residual block, in raster order.
-fn forward_transform_4x4(residual: &[i32], tx_type: TxType) -> [i32; 16] {
+/// Forward 4x4 transform of a residual block, in raster order: the scalar
+/// reference for `simd::forward_transform_4x4`.
+pub(super) fn forward_transform_4x4_scalar(
+    residual: &[i32],
+    vertical_adst: bool,
+    horizontal_adst: bool,
+) -> [i32; 16] {
     let mut columns = [0_i64; 16];
     for column in 0..4 {
         let mut input = [0_i64; 4];
@@ -91,7 +97,7 @@ fn forward_transform_4x4(residual: &[i32], tx_type: TxType) -> [i32; 16] {
         if column == 0 && input[0] != 0 {
             input[0] += 1;
         }
-        let output = if tx_type.vertical_adst() {
+        let output = if vertical_adst {
             fadst4(input)
         } else {
             fdct4(input)
@@ -104,7 +110,7 @@ fn forward_transform_4x4(residual: &[i32], tx_type: TxType) -> [i32; 16] {
     for row in 0..4 {
         let mut input = [0_i64; 4];
         input.copy_from_slice(&columns[row * 4..row * 4 + 4]);
-        let output = if tx_type.horizontal_adst() {
+        let output = if horizontal_adst {
             fadst4(input)
         } else {
             fdct4(input)
@@ -168,7 +174,11 @@ pub(super) fn forward_transform(
     scratch: &mut TransformScratch,
 ) {
     if tx_size == 0 {
-        let coefficients = forward_transform_4x4(residual, tx_type);
+        let coefficients = simd::forward_transform_4x4(
+            residual,
+            tx_type.vertical_adst(),
+            tx_type.horizontal_adst(),
+        );
         for (output, coefficient) in output.iter_mut().zip(coefficients) {
             *output = f64::from(coefficient);
         }
@@ -191,138 +201,47 @@ pub(super) fn forward_transform(
     let shift = if tx_size == 1 { 32.0 } else { 64.0 };
     let half = (n / 2) as f64;
     let scale = shift / (half * half);
-    // Both passes work on whole rows of samples, which the compiler
-    // vectorizes. The second pass runs on the transpose, so it is the same
-    // column transform.
+    // The vertical pass with `scale` folded into its weights, then the
+    // horizontal one, each a matrix product.
     let TransformScratch {
+        weights,
         samples,
         columns,
-        fold,
     } = scratch;
-    let (samples, columns) = (&mut samples[..n * n], &mut columns[..n * n]);
-    for (sample, &value) in samples.iter_mut().zip(residual) {
-        *sample = f64::from(value) * scale;
+    let (weights, samples, columns) = (
+        &mut weights[..n * n],
+        &mut samples[..n * n],
+        &mut columns[..n * n],
+    );
+    for (k, row) in weights.chunks_exact_mut(n).enumerate() {
+        for (i, weight) in row.iter_mut().enumerate() {
+            *weight = vertical[i * n + k] * scale;
+        }
     }
-    let vertical_adst = tx_type.vertical_adst() && tx_size < 3;
-    transform_columns(samples, n, vertical, vertical_adst, columns, fold);
-    transpose(columns, n, samples);
-    let horizontal_adst = tx_type.horizontal_adst() && tx_size < 3;
-    transform_columns(samples, n, horizontal, horizontal_adst, columns, fold);
-    transpose(columns, n, output);
+    for (sample, &value) in samples.iter_mut().zip(residual) {
+        *sample = f64::from(value);
+    }
+    simd::matrix_product(weights, samples, n, columns);
+    simd::matrix_product(columns, horizontal, n, output);
 }
 
 /// Working memory for [`forward_transform`], kept between calls because the
 /// search transforms every transform block of every candidate it tries, and
-/// clearing fresh buffers of the largest size each time cost more than many of
-/// the transforms.
+/// allocating fresh buffers each time cost more than many of the transforms.
 pub(super) struct TransformScratch {
+    weights: [f64; 32 * 32],
     samples: [f64; 32 * 32],
     columns: [f64; 32 * 32],
-    /// The mirrored sums and differences of every fold of a 32-point DCT:
-    /// `32 * 32` values for the first, half that for the next, and so on.
-    fold: [f64; 2 * 32 * 32],
 }
 
 impl TransformScratch {
     pub(super) fn new() -> Box<Self> {
         Box::new(Self {
+            weights: [0.0; 32 * 32],
             samples: [0.0; 32 * 32],
             columns: [0.0; 32 * 32],
-            fold: [0.0; 2 * 32 * 32],
         })
     }
-}
-
-fn transpose(input: &[f64], n: usize, output: &mut [f64]) {
-    for row in 0..n {
-        for column in 0..n {
-            output[column * n + row] = input[row * n + column];
-        }
-    }
-}
-
-/// Applies the 1-D forward transform `basis` down every column of the `n` x
-/// `n` block `rows`: row `k` of `output` is `sum(basis[i * n + k] * rows[i])`.
-fn transform_columns(
-    rows: &[f64],
-    n: usize,
-    basis: &[f64],
-    adst: bool,
-    output: &mut [f64],
-    scratch: &mut [f64],
-) {
-    output[..n * n].fill(0.0);
-    if adst {
-        accumulate(rows, n, basis, 0..n, output);
-    } else {
-        fold_dct(rows, n, n, basis, 1, output, scratch);
-    }
-}
-
-/// Adds `basis[i * n + frequency] * rows[i]` over the rows `i` to the output
-/// row of each `frequency`.
-fn accumulate(
-    rows: &[f64],
-    n: usize,
-    basis: &[f64],
-    frequencies: impl Iterator<Item = usize>,
-    output: &mut [f64],
-) {
-    // Eight columns at a time, so the sums stay in registers across the rows;
-    // every transform this runs is at least 8 wide.
-    const LANES: usize = 8;
-    for frequency in frequencies {
-        let out = &mut output[frequency * n..][..n];
-        for (start, out) in (0..n).step_by(LANES).zip(out.chunks_exact_mut(LANES)) {
-            let mut sums = [0.0; LANES];
-            sums.copy_from_slice(out);
-            for (i, row) in rows.chunks_exact(n).enumerate() {
-                let weight = basis[i * n + frequency];
-                for (sum, &sample) in sums.iter_mut().zip(&row[start..start + LANES]) {
-                    *sum += weight * sample;
-                }
-            }
-            out.copy_from_slice(&sums);
-        }
-    }
-}
-
-/// The DCT down the columns of the `m` rows of `rows`, for the frequencies
-/// `stride * k`, `k < m`, of the `n`-point basis.
-///
-/// A DCT basis is symmetric about its middle sample for even frequencies and
-/// antisymmetric for odd ones, so the odd frequencies need only the
-/// differences of mirrored rows and the even ones are a DCT of half the size
-/// of their sums. Folding that way repeatedly takes about a third of the
-/// multiplications of the plain matrix product. `scratch` holds at least
-/// `m * n` values.
-fn fold_dct(
-    rows: &[f64],
-    m: usize,
-    n: usize,
-    basis: &[f64],
-    stride: usize,
-    output: &mut [f64],
-    scratch: &mut [f64],
-) {
-    if m <= 2 {
-        let frequencies = (0..m).map(|k| k * stride);
-        accumulate(rows, n, basis, frequencies, output);
-        return;
-    }
-    let half = m / 2;
-    let (sums, rest) = scratch.split_at_mut(half * n);
-    let (differences, rest) = rest.split_at_mut(half * n);
-    for i in 0..half {
-        let (top, bottom) = (&rows[i * n..][..n], &rows[(m - 1 - i) * n..][..n]);
-        for (j, (&a, &b)) in top.iter().zip(bottom).enumerate() {
-            sums[i * n + j] = a + b;
-            differences[i * n + j] = a - b;
-        }
-    }
-    let odd = (1..m).step_by(2).map(|k| k * stride);
-    accumulate(differences, n, basis, odd, output);
-    fold_dct(sums, half, n, basis, stride * 2, output, rest);
 }
 
 /// Adds the inverse transform of dequantized `coefficients` (raster order,
@@ -403,6 +322,11 @@ pub(super) fn predict_intra(
             *value = plane[(y + row) * stride + x - 1];
         }
     }
+    if mode == IntraMode::Tm {
+        let block = &mut plane[y * stride + x..];
+        simd::predict_tm(block, stride, size, above, left, above_left);
+        return;
+    }
     let log2 = size.trailing_zeros();
     for row in 0..size {
         let output = &mut plane[(y + row) * stride + x..][..size];
@@ -421,13 +345,7 @@ pub(super) fn predict_intra(
             }
             IntraMode::V => output.copy_from_slice(above),
             IntraMode::H => output.fill(left[row]),
-            IntraMode::Tm => {
-                for (column, value) in output.iter_mut().enumerate() {
-                    *value = (i32::from(left[row]) + i32::from(above[column])
-                        - i32::from(above_left))
-                    .clamp(0, 255) as u8;
-                }
-            }
+            IntraMode::Tm => unreachable!("predicted above"),
         }
     }
 }
@@ -465,56 +383,42 @@ pub(super) fn predict_inter(
     mv_col_q4: i32,
     output: &mut [u8],
 ) {
-    let x0 = x as isize + (mv_col_q4 >> 4) as isize;
-    let y0 = y as isize + (mv_row_q4 >> 4) as isize;
+    let x0 = x as isize + (mv_col_q4 >> 4) as isize - 3;
+    let y0 = y as isize + (mv_row_q4 >> 4) as isize - 3;
     let (fraction_x, fraction_y) = ((mv_col_q4 & 15) as usize, (mv_row_q4 & 15) as usize);
     let filter_x = &SUBPEL_FILTERS_REGULAR[fraction_x * 8..][..8];
     let filter_y = &SUBPEL_FILTERS_REGULAR[fraction_y * 8..][..8];
-    let (w, h) = (size, size);
-    // The identity kernel copies its centre sample, so a whole-sample
-    // component skips its pass: the encoder's luma vectors are all whole
+    // The samples the filters read, three rows and columns before the block
+    // and four after, edge-clamped.
+    let span = size + 7;
+    let inside = x0 >= 0
+        && y0 >= 0
+        && x0 as usize + span <= reference.width
+        && y0 as usize + span <= reference.height;
+    // The identity kernel copies its centre sample, so a whole-sample vector
+    // inside the plane is a copy: the encoder's luma vectors are all whole
     // samples, and so are half of its chroma ones.
-    let mut intermediate = [0_u8; (64 + 7) * 64];
-    let (target, first_row, rows) = if fraction_y == 0 {
-        (&mut output[..h * w], 3, h)
-    } else {
-        (&mut intermediate[..(h + 7) * w], 0, h + 7)
-    };
-    for (row, target) in target.chunks_exact_mut(w).take(rows).enumerate() {
-        let source_y = y0 + (first_row + row) as isize - 3;
-        if fraction_x == 0 {
-            let inside = x0 >= 0 && x0 as usize + w <= reference.width;
-            if inside && (0..reference.height as isize).contains(&source_y) {
-                let start = source_y as usize * reference.stride + x0 as usize;
-                target.copy_from_slice(&reference.pixels[start..start + w]);
-            } else {
-                for (column, target) in target.iter_mut().enumerate() {
-                    *target = reference.sample(x0 + column as isize, source_y);
-                }
-            }
-            continue;
+    if inside && fraction_x == 0 && fraction_y == 0 {
+        for (row, out) in output.chunks_exact_mut(size).take(size).enumerate() {
+            let start = (y0 as usize + 3 + row) * reference.stride + x0 as usize + 3;
+            out.copy_from_slice(&reference.pixels[start..start + size]);
         }
-        for (column, target) in target.iter_mut().enumerate() {
-            let source_x = x0 + column as isize - 3;
-            let sum: i32 = (0..8)
-                .map(|tap| {
-                    filter_x[tap] * i32::from(reference.sample(source_x + tap as isize, source_y))
-                })
-                .sum();
-            *target = ((sum + 64) >> 7).clamp(0, 255) as u8;
-        }
-    }
-    if fraction_y == 0 {
         return;
     }
-    for row in 0..h {
-        for column in 0..w {
-            let sum: i32 = (0..8)
-                .map(|tap| filter_y[tap] * i32::from(intermediate[(row + tap) * w + column]))
-                .sum();
-            output[row * w + column] = ((sum + 64) >> 7).clamp(0, 255) as u8;
+    let mut window = [0_u8; (64 + 7) * (64 + 7)];
+    let window = &mut window[..span * span];
+    for (row, out) in window.chunks_exact_mut(span).enumerate() {
+        let source_y = y0 + row as isize;
+        if inside {
+            let start = source_y as usize * reference.stride + x0 as usize;
+            out.copy_from_slice(&reference.pixels[start..start + span]);
+        } else {
+            for (column, out) in out.iter_mut().enumerate() {
+                *out = reference.sample(x0 + column as isize, source_y);
+            }
         }
     }
+    simd::convolve8(window, span, size, size, filter_x, filter_y, output);
 }
 
 #[cfg(test)]

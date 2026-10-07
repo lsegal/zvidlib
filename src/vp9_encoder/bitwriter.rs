@@ -2,6 +2,7 @@
 //! frame header, and the boolean (arithmetic) encoder for the compressed header
 //! and tile data (VP9 specification sections 9.1 and 9.2).
 
+use super::context::FrameCounts;
 use std::sync::OnceLock;
 
 /// Writes the uncompressed header's fixed-width fields, most significant bit
@@ -123,6 +124,13 @@ impl BoolSink for BoolEncoder {
 /// [`BitCost`] that totals what they would cost to write.
 pub(super) trait BoolSink {
     fn write(&mut self, bit: bool, probability: u8);
+
+    /// The symbol counts to add the written symbols to, when the sink writes
+    /// the frame the decoder reads and counts; `None` when it only costs or
+    /// writes symbols.
+    fn counts(&mut self) -> Option<&mut FrameCounts> {
+        None
+    }
 
     /// Writes `value` with a libvpx tree: positive entries index the next
     /// node pair, and zero or negative entries are leaves holding `-value`.

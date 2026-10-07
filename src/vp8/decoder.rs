@@ -11,8 +11,8 @@
 use super::bool_decoder::BoolDecoder;
 use super::loop_filter::{FrameFilter, MacroblockFilter, filter_frame};
 use super::predict::{
-    Edges, Plane, idct_add, inverse_walsh, macroblock_edges, predict_block, predict_inter,
-    predict_subblock,
+    Edges, Plane, idct_add, idct_dc_add, idct_dc_add_row, inverse_walsh, macroblock_edges,
+    predict_block, predict_inter, predict_subblock,
 };
 use super::tables::*;
 use crate::{Error, ErrorKind, Limits, Result};
@@ -1234,12 +1234,35 @@ fn read_tokens(
 /// plane at `origin`.
 fn add_residual(blocks: &[[i16; 16]], plane: &mut Plane, origin: usize, per_row: usize) {
     let stride = plane.width;
-    for (index, block) in blocks.iter().enumerate() {
-        if block.iter().all(|&value| value == 0) {
+    for (row, blocks) in blocks.chunks_exact(per_row).enumerate() {
+        let offset = origin + row * 4 * stride;
+        if blocks
+            .iter()
+            .all(|block| block[1..].iter().all(|&value| value == 0))
+        {
+            // A row of DC-only blocks, the common case at low rates, is one
+            // call rather than `per_row`.
+            let dcs: [i16; 4] = std::array::from_fn(|index| blocks.get(index).map_or(0, |b| b[0]));
+            if dcs.iter().any(|&dc| dc != 0) {
+                idct_dc_add_row(&dcs[..per_row], &mut plane.data, offset, stride);
+            }
             continue;
         }
-        let offset = origin + (index / per_row) * 4 * stride + (index % per_row) * 4;
-        idct_add(block, &mut plane.data, offset, stride);
+        for (index, block) in blocks.iter().enumerate() {
+            add_block_residual(block, &mut plane.data, offset + index * 4, stride);
+        }
+    }
+}
+
+/// Adds one 4x4 block's residual, skipping a block with none and taking the
+/// DC-only shortcut for a block with nothing else.
+fn add_block_residual(block: &[i16; 16], plane: &mut [u8], offset: usize, stride: usize) {
+    if block[1..].iter().all(|&value| value == 0) {
+        if block[0] != 0 {
+            idct_dc_add(block[0], plane, offset, stride);
+        }
+    } else {
+        idct_add(block, plane, offset, stride);
     }
 }
 
@@ -1277,9 +1300,7 @@ fn reconstruct_intra_luma(
             offset,
             stride,
         );
-        if residual.iter().any(|&value| value != 0) {
-            idct_add(residual, &mut plane.data, offset, stride);
-        }
+        add_block_residual(residual, &mut plane.data, offset, stride);
     }
 }
 

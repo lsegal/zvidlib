@@ -7,6 +7,7 @@
 //! neighbouring edges' filters overlap, so it is kept exactly.
 
 use super::tables::UV_TXSIZE_LOOKUP;
+use crate::vp9_simd::{self, SimdIsa, loopfilter::Taps};
 
 /// The edge masks of one 64x64 superblock (`LOOP_FILTER_MASK`): one bit per
 /// 8x8 luma block (row-major, low bit first) or per 8x8 chroma block.
@@ -238,14 +239,14 @@ fn adjust_mask(
 
 /// The thresholds of one filter level (`loop_filter_thresh`).
 #[derive(Clone, Copy, Debug, Default)]
-struct Thresholds {
-    mblim: u8,
-    lim: u8,
-    hev_thr: u8,
+pub(crate) struct Thresholds {
+    pub(crate) mblim: u8,
+    pub(crate) lim: u8,
+    pub(crate) hev_thr: u8,
 }
 
 /// `update_sharpness` and the `hev_thr` setup of `vp9_loop_filter_init`.
-fn thresholds(sharpness: u8) -> [Thresholds; 64] {
+pub(crate) fn thresholds(sharpness: u8) -> [Thresholds; 64] {
     let mut table = [Thresholds::default(); 64];
     for (level, entry) in table.iter_mut().enumerate() {
         let level = level as i32;
@@ -266,9 +267,11 @@ fn thresholds(sharpness: u8) -> [Thresholds; 64] {
 
 /// A view of one plane for the filters: `data[offset]` is the pixel the
 /// current edge starts at.
-struct Pixels<'a> {
-    data: &'a mut [u8],
-    stride: usize,
+pub(crate) struct Pixels<'a> {
+    pub(crate) data: &'a mut [u8],
+    pub(crate) stride: usize,
+    /// The instruction set the filters run on, resolved once per frame.
+    pub(crate) isa: SimdIsa,
 }
 
 #[inline]
@@ -358,7 +361,26 @@ impl Pixels<'_> {
 
     /// The 4-tap filter along `count` pixels of an edge. `step` crosses
     /// the edge and `along` moves along it.
-    fn lpf4(&mut self, start: isize, step: isize, along: isize, count: usize, t: Thresholds) {
+    pub(crate) fn lpf4(
+        &mut self,
+        start: isize,
+        step: isize,
+        along: isize,
+        count: usize,
+        t: Thresholds,
+    ) {
+        if vp9_simd::filter_edge(
+            self.isa,
+            self.data,
+            start,
+            step,
+            along,
+            count,
+            t,
+            Taps::Four,
+        ) {
+            return;
+        }
         for i in 0..count as isize {
             let base = start + i * along;
             let (p, q) = self.taps4(base, step);
@@ -368,7 +390,26 @@ impl Pixels<'_> {
     }
 
     /// `filter8` along `count` pixels of an edge.
-    fn lpf8(&mut self, start: isize, step: isize, along: isize, count: usize, t: Thresholds) {
+    pub(crate) fn lpf8(
+        &mut self,
+        start: isize,
+        step: isize,
+        along: isize,
+        count: usize,
+        t: Thresholds,
+    ) {
+        if vp9_simd::filter_edge(
+            self.isa,
+            self.data,
+            start,
+            step,
+            along,
+            count,
+            t,
+            Taps::Eight,
+        ) {
+            return;
+        }
         for i in 0..count as isize {
             let base = start + i * along;
             let (p, q) = self.taps4(base, step);
@@ -394,7 +435,26 @@ impl Pixels<'_> {
     }
 
     /// `filter16` along `count` pixels of an edge.
-    fn lpf16(&mut self, start: isize, step: isize, along: isize, count: usize, t: Thresholds) {
+    pub(crate) fn lpf16(
+        &mut self,
+        start: isize,
+        step: isize,
+        along: isize,
+        count: usize,
+        t: Thresholds,
+    ) {
+        if vp9_simd::filter_edge(
+            self.isa,
+            self.data,
+            start,
+            step,
+            along,
+            count,
+            t,
+            Taps::Sixteen,
+        ) {
+            return;
+        }
         for i in 0..count as isize {
             let base = start + i * along;
             let (p, q) = self.taps4(base, step);
@@ -600,6 +660,7 @@ pub(crate) fn filter_frame(
     sharpness: u8,
 ) {
     let thresholds = thresholds(sharpness);
+    let isa = vp9_simd::active_isa();
     let sb_cols = mi_cols.div_ceil(8);
     for mi_row in (0..mi_rows).step_by(8) {
         for mi_col in (0..mi_cols).step_by(8) {
@@ -617,6 +678,7 @@ pub(crate) fn filter_frame(
                 let mut pixels = Pixels {
                     data: plane.data,
                     stride: plane.stride,
+                    isa,
                 };
                 if subsampled {
                     filter_plane_ss11(&mut pixels, start, &lfm, mi_row, mi_rows, &thresholds);
