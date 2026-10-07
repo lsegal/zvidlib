@@ -2350,6 +2350,7 @@ fn compressed_header(key: bool, larger_transforms: bool, allow_high_precision_mv
     writer.finish()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn uncompressed_header(
     geometry: &Geometry,
     key: bool,
