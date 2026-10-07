@@ -2397,23 +2397,46 @@ mod neon {
         super::predict_tm_scalar(block, stride, size, above, left, above_left, column);
     }
 
-    /// One 8-tap pass over 8 outputs from `samples[t]`, the inputs output
-    /// lanes 0..8 read at tap `t`.
+    /// One 8-tap pass over eight samples in 16-bit lanes, as libvpx's NEON
+    /// convolutions compute it: the outer taps sum without overflow, and the
+    /// two centre taps, which are never negative, are added saturating. A
+    /// saturated sum is past `255 << 7`, where the result clamps anyway, so
+    /// this is `clamp((sum + 64) >> 7)` exactly.
     #[target_feature(enable = "neon")]
     #[inline]
-    fn filter8(samples: [uint8x8_t; 8], taps: &[i16; 8]) -> uint8x8_t {
-        let mut lo = vdupq_n_s32(0);
-        let mut hi = vdupq_n_s32(0);
-        for (tap, &weight) in taps.iter().enumerate() {
-            let wide = vreinterpretq_s16_u16(vmovl_u8(samples[tap]));
-            lo = vmlal_n_s16(lo, vget_low_s16(wide), weight);
-            hi = vmlal_high_n_s16(hi, wide, weight);
+    fn filter8(samples: [int16x8_t; 8], taps: &[i16; 8]) -> uint8x8_t {
+        let mut sum = vmulq_n_s16(samples[0], taps[0]);
+        for tap in [1, 2, 5, 6, 7] {
+            sum = vmlaq_n_s16(sum, samples[tap], taps[tap]);
         }
-        // `(sum + 64) >> 7`, saturated to `0..=65535` and then to a byte.
-        vqmovn_u16(vcombine_u16(
-            vqrshrun_n_s32::<7>(lo),
-            vqrshrun_n_s32::<7>(hi),
-        ))
+        sum = vqaddq_s16(sum, vmulq_n_s16(samples[3], taps[3]));
+        sum = vqaddq_s16(sum, vmulq_n_s16(samples[4], taps[4]));
+        vqrshrun_n_s16::<7>(sum)
+    }
+
+    /// [`filter8`] over sixteen samples.
+    #[target_feature(enable = "neon")]
+    #[inline]
+    fn filter16(samples: [uint8x16_t; 8], taps: &[i16; 8]) -> uint8x16_t {
+        let low = samples.map(|bytes| vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(bytes))));
+        let high = samples.map(|bytes| vreinterpretq_s16_u16(vmovl_high_u8(bytes)));
+        vcombine_u8(filter8(low, taps), filter8(high, taps))
+    }
+
+    /// The taps of a filter for [`filter8`], which needs its two centre taps
+    /// non-negative and its outer ones small enough to sum in 16 bits, as
+    /// every VP9 sub-sample filter's are.
+    fn narrow_taps(filter: &[i32]) -> [i16; 8] {
+        debug_assert!(filter[3] >= 0 && filter[4] >= 0);
+        debug_assert!(
+            [0, 1, 2, 5, 6, 7]
+                .map(|tap| filter[tap].abs())
+                .iter()
+                .sum::<i32>()
+                * 255
+                <= i32::from(i16::MAX)
+        );
+        core::array::from_fn(|tap| filter[tap] as i16)
     }
 
     /// # Safety
@@ -2429,19 +2452,27 @@ mod neon {
         filter: &[i32],
         output: &mut [u8],
     ) {
-        let taps: [i16; 8] = core::array::from_fn(|tap| filter[tap] as i16);
+        let taps = narrow_taps(filter);
         for row in 0..rows {
             let source = &source[row * source_stride..];
             let out = &mut output[row * w..][..w];
             let mut column = 0;
-            while column + 8 <= w {
-                // SAFETY: the 8-byte loads end at `column + 15 <= w + 7`.
-                unsafe {
-                    let samples: [uint8x8_t; 8] =
-                        core::array::from_fn(|tap| vld1_u8(source.as_ptr().add(column + tap)));
-                    vst1_u8(out.as_mut_ptr().add(column), filter8(samples, &taps));
+            // SAFETY: the 16-byte loads end at `column + 22 < w + 7`, and the
+            // 8-byte ones at `column + 14 < w + 7`.
+            unsafe {
+                while column + 16 <= w {
+                    let samples: [uint8x16_t; 8] =
+                        core::array::from_fn(|tap| vld1q_u8(source.as_ptr().add(column + tap)));
+                    vst1q_u8(out.as_mut_ptr().add(column), filter16(samples, &taps));
+                    column += 16;
                 }
-                column += 8;
+                while column + 8 <= w {
+                    let samples: [int16x8_t; 8] = core::array::from_fn(|tap| {
+                        vreinterpretq_s16_u16(vmovl_u8(vld1_u8(source.as_ptr().add(column + tap))))
+                    });
+                    vst1_u8(out.as_mut_ptr().add(column), filter8(samples, &taps));
+                    column += 8;
+                }
             }
             super::filter_row_scalar(source, filter, out, column);
         }
@@ -2460,21 +2491,30 @@ mod neon {
         filter: &[i32],
         output: &mut [u8],
     ) {
-        let taps: [i16; 8] = core::array::from_fn(|tap| filter[tap] as i16);
+        let taps = narrow_taps(filter);
         for row in 0..h {
             let source = &source[row * source_stride..];
             let out = &mut output[row * w..][..w];
             let mut column = 0;
-            while column + 8 <= w {
-                // SAFETY: row `row + 7` of the source exists and
-                // `column + 7 < w`.
-                unsafe {
-                    let samples: [uint8x8_t; 8] = core::array::from_fn(|tap| {
-                        vld1_u8(source.as_ptr().add(tap * source_stride + column))
+            // SAFETY: row `row + 7` of the source exists and every load ends
+            // below `w` within it.
+            unsafe {
+                while column + 16 <= w {
+                    let samples: [uint8x16_t; 8] = core::array::from_fn(|tap| {
+                        vld1q_u8(source.as_ptr().add(tap * source_stride + column))
+                    });
+                    vst1q_u8(out.as_mut_ptr().add(column), filter16(samples, &taps));
+                    column += 16;
+                }
+                while column + 8 <= w {
+                    let samples: [int16x8_t; 8] = core::array::from_fn(|tap| {
+                        vreinterpretq_s16_u16(vmovl_u8(vld1_u8(
+                            source.as_ptr().add(tap * source_stride + column),
+                        )))
                     });
                     vst1_u8(out.as_mut_ptr().add(column), filter8(samples, &taps));
+                    column += 8;
                 }
-                column += 8;
             }
             super::filter_column_scalar(source, source_stride, filter, out, column);
         }
