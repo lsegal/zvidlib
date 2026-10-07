@@ -500,6 +500,15 @@ impl Scratch {
 struct InterBuffers {
     prediction: [u8; 64 * 64],
     filter: Box<InterScratch>,
+    /// The slot of each vector the superblock being searched has predicted
+    /// luma along.
+    slots: HashMap<Mv, usize, BuildHasherDefault<KeyHasher>>,
+    /// Each slot's luma prediction of the superblock, row stride 64, and
+    /// which of its 8x8 cells hold it. A sample's prediction depends only on
+    /// its position and the vector, so the blocks of every partition share
+    /// one, and the refinement around the same vector at each level predicts
+    /// it once. Kept between superblocks to reuse the buffers.
+    planes: Vec<(Box<[u8; 64 * 64]>, u64)>,
 }
 
 impl InterBuffers {
@@ -507,7 +516,58 @@ impl InterBuffers {
         Box::new(Self {
             prediction: [0; 64 * 64],
             filter: InterScratch::new(),
+            slots: HashMap::default(),
+            planes: Vec::new(),
         })
+    }
+
+    /// Forgets the predictions of the previous superblock.
+    fn start_superblock(&mut self) {
+        self.slots.clear();
+    }
+
+    /// The `size` x `size` luma prediction along `mv` of the block at
+    /// `(mi_row, mi_col)`, with row stride 64.
+    fn luma(
+        &mut self,
+        reference: &ReferencePlane<'_>,
+        mi_row: usize,
+        mi_col: usize,
+        size: usize,
+        mv: Mv,
+    ) -> &[u8] {
+        let next = self.slots.len();
+        let slot = *self.slots.entry(mv).or_insert(next);
+        if slot == self.planes.len() {
+            self.planes.push((Box::new([0; 64 * 64]), 0));
+        } else if slot == next {
+            self.planes[slot].1 = 0;
+        }
+        let (row, col) = (mi_row % 8, mi_col % 8);
+        let cells = size / 8;
+        let cells_mask = (0..cells).fold(0_u64, |mask, cell_row| {
+            mask | ((1_u64 << cells) - 1) << ((row + cell_row) * 8 + col)
+        });
+        let offset = row * 8 * 64 + col * 8;
+        let (pixels, valid) = &mut self.planes[slot];
+        if *valid & cells_mask != cells_mask {
+            let prediction = &mut self.prediction[..size * size];
+            predict_inter(
+                reference,
+                mi_col * 8,
+                mi_row * 8,
+                size,
+                mv.row * 2,
+                mv.col * 2,
+                &mut self.filter,
+                prediction,
+            );
+            for (row, predicted) in prediction.chunks_exact(size).enumerate() {
+                pixels[offset + row * 64..][..size].copy_from_slice(predicted);
+            }
+            *valid |= cells_mask;
+        }
+        &pixels[offset..]
     }
 }
 
@@ -703,6 +763,7 @@ impl<'a> FrameEncoder<'a> {
                 // replayed as the superblock is written.
                 let contexts = self.save_contexts(mi_col, 3);
                 self.residual_cache.clear();
+                self.inter.get_mut().start_superblock();
                 let (node, _) = self.search_partition(mi_row, mi_col, 3, f64::INFINITY);
                 self.restore_contexts(mi_col, 3, &contexts);
                 self.write_partition(&mut writer, &node, mi_row, mi_col, 3);
@@ -2078,25 +2139,14 @@ impl<'a> FrameEncoder<'a> {
             height: self.geometry.height,
         };
         let mut inter = self.inter.borrow_mut();
-        let InterBuffers { prediction, filter } = &mut **inter;
-        let prediction = &mut prediction[..size * size];
+        let prediction = inter.luma(&reference_plane, mi_row, mi_col, size, mv);
         let (x, y) = (mi_col * 8, mi_row * 8);
-        predict_inter(
-            &reference_plane,
-            x,
-            y,
-            size,
-            mv.row * 2,
-            mv.col * 2,
-            filter,
-            prediction,
-        );
         let stride = self.source.strides[0];
         simd::sse(
             &self.source.planes[0][y * stride + x..],
             stride,
             prediction,
-            size,
+            64,
             size,
             size,
         )
@@ -2254,32 +2304,39 @@ impl<'a> FrameEncoder<'a> {
                     width,
                     height,
                 };
-                let mut prediction = vec![0_u8; size * size];
                 let ss = usize::from(plane > 0);
                 let (x, y) = ((mi_col * 8) >> ss, (mi_row * 8) >> ss);
-                predict_inter(
-                    &reference_plane,
-                    x,
-                    y,
-                    size,
-                    mv.row * scale,
-                    mv.col * scale,
-                    &mut self.inter.get_mut().filter,
-                    &mut prediction,
-                );
+                let inter = self.inter.get_mut();
+                let (prediction, prediction_stride): (&[u8], usize) = if plane == 0 {
+                    (inter.luma(&reference_plane, mi_row, mi_col, size, mv), 64)
+                } else {
+                    let prediction = &mut inter.prediction[..size * size];
+                    predict_inter(
+                        &reference_plane,
+                        x,
+                        y,
+                        size,
+                        mv.row * scale,
+                        mv.col * scale,
+                        &mut inter.filter,
+                        prediction,
+                    );
+                    (prediction, size)
+                };
                 let stride = self.recon.strides[plane];
                 let start = y * stride + x;
                 prediction_error += simd::sse(
                     &self.source.planes[plane][start..],
                     stride,
-                    &prediction,
-                    size,
+                    prediction,
+                    prediction_stride,
                     size,
                     size,
                 );
-                for (row, predicted) in prediction.chunks_exact(size).enumerate() {
+                for row in 0..size {
                     let start = start + row * stride;
-                    self.recon.planes[plane][start..start + size].copy_from_slice(predicted);
+                    self.recon.planes[plane][start..start + size]
+                        .copy_from_slice(&prediction[row * prediction_stride..][..size]);
                 }
             }
             let predicted: [Vec<u8>; 3] =
