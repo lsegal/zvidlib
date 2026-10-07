@@ -1454,6 +1454,45 @@ fn the_lookahead_codes_each_key_frame_as_it_would_code_alone() {
 }
 
 #[test]
+fn small_key_frame_weights_code_the_group_start_once() {
+    // Below `base_q_idx` 160 the weight lowers the key frame's lambda by a
+    // few percent at most, so the lookahead codes the group's start
+    // unweighted only (issue #630). Before, it kept the weighted key frame
+    // here on decision noise, which left the test card's 5 frames 3.5%
+    // smaller at q 140 and 3% smaller at q 150.
+    let (width, height) = (160, 90);
+    let geometry = Geometry::new(width as usize, height as usize);
+    let pictures: Vec<Picture> = (0..5)
+        .map(|index| {
+            let frame = test_card_frame(width, height, index);
+            source_picture(&geometry, &frame, Orientation::TopLeft).unwrap()
+        })
+        .collect();
+    for base_q_idx in [140, 150] {
+        let settings = StreamSettings {
+            geometry,
+            base_q_idx,
+            tools: CodingTools::ALL,
+            error_resilient: false,
+            full_range: false,
+            loop_filter: true,
+        };
+        let kept: Vec<Vec<u8>> = StreamState::default()
+            .code_group_start(&settings, &pictures)
+            .into_iter()
+            .map(|frame| frame.data)
+            .collect();
+        let mut alone = StreamState::default();
+        let unweighted: Vec<Vec<u8>> = pictures
+            .iter()
+            .enumerate()
+            .map(|(index, picture)| alone.code(&settings, picture, index == 0, false).data)
+            .collect();
+        assert!(kept == unweighted, "q {base_q_idx}");
+    }
+}
+
+#[test]
 fn group_starts_are_emitted_once_the_lookahead_fills() {
     // The key frame waits for the rest of its group, up to the lookahead,
     // and frames past the lookahead code as they arrive.

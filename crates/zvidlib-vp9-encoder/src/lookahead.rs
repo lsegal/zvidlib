@@ -15,7 +15,9 @@
 use std::sync::{Mutex, PoisonError};
 
 use crate::context::FrameContext;
-use crate::frame::{CodingTools, FrameEncoder, Geometry, ModeInfo, Picture, lambda};
+use crate::frame::{
+    CodingTools, FrameEncoder, Geometry, ModeInfo, Picture, key_frame_weight, lambda,
+};
 
 /// How much less, as a fraction of the unweighted coding's rate-distortion
 /// cost, the coding with the key frame weighted must cost for the encoder to
@@ -31,6 +33,19 @@ use crate::frame::{CodingTools, FrameEncoder, Geometry, ModeInfo, Picture, lambd
 /// inter frame would otherwise buy it back at twice the key frame's size,
 /// save 1.5% or more.
 const WEIGHTED_KEY_MARGIN: f64 = 0.01;
+
+/// The smallest [`key_frame_weight`] the encoder codes a group's start
+/// weighted for: that of `base_q_idx` 160.
+///
+/// Below it the weight lowers the key frame's lambda by a few percent at
+/// most, which moves its decisions only as noise does, yet the weighted
+/// coding codes every buffered frame a second time (issue #630). Over
+/// `moving`, `smooth`, `sub_sample` and the test card at 96x64 and 192x128
+/// with 12 or 48 frames and 160x90 and 160x96 with 5, error resilient or
+/// not, at every fifth quantizer below 160, the weighted key frame was kept
+/// in 36 of 1240 groups, each by under 4% in either direction, and coding
+/// every group unweighted left the total 0.02% larger at equal quality.
+const MIN_KEY_FRAME_WEIGHT: f64 = 1.12;
 
 /// How a stream's frames are coded.
 #[derive(Clone, Copy)]
@@ -138,7 +153,8 @@ impl StreamState {
     /// Codes `pictures`, the start of a group whose first picture is its key
     /// frame, with the key frame weighted or not, whichever leaves these
     /// frames the lower total rate-distortion cost. The weighted key frame
-    /// must win by [`WEIGHTED_KEY_MARGIN`].
+    /// must win by [`WEIGHTED_KEY_MARGIN`], and is not tried where its weight
+    /// is under [`MIN_KEY_FRAME_WEIGHT`].
     ///
     /// Only the key frame's lambda differs between the two; the frames after
     /// it code as they otherwise would, from whichever key frame is kept.
@@ -153,8 +169,9 @@ impl StreamState {
         settings: &StreamSettings,
         pictures: &[Picture],
     ) -> Vec<CodedFrame> {
-        // A key frame coded alone has nothing to keep its detail for.
-        if pictures.len() < 2 {
+        // A key frame coded alone has nothing to keep its detail for, and a
+        // small weight keeps none worth a second coding.
+        if pictures.len() < 2 || key_frame_weight(settings.base_q_idx) < MIN_KEY_FRAME_WEIGHT {
             return self.code_frames(settings, pictures, true);
         }
         let mut weighted_state = self.clone();
