@@ -1905,14 +1905,15 @@ impl<'a> FrameEncoder<'a> {
                     mi_row > 0,
                     mi_col > 0,
                 );
-                for row in y..y + size {
-                    let range = row * stride + x..row * stride + x + size;
-                    error += self.recon.planes[plane][range.clone()]
-                        .iter()
-                        .zip(&self.source.planes[plane][range])
-                        .map(|(&a, &b)| u64::from(a.abs_diff(b)).pow(2))
-                        .sum::<u64>();
-                }
+                let start = y * stride + x;
+                error += simd::sse(
+                    &self.recon.planes[plane][start..],
+                    stride,
+                    &self.source.planes[plane][start..],
+                    stride,
+                    size,
+                    size,
+                );
             }
             (error as f64 + self.lambda * bits(self, mode), mode)
         });
