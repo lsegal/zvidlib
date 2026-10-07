@@ -55,28 +55,20 @@ const BUILD_DEFINITION: &[&str] = &[
 const GATED_JOBS: &[(&str, &str)] = &[
     ("rust", "rust"),
     ("wasm", "wasm"),
-    ("rust-tests-build", "rust_tests"),
-    ("native-tests-build", "native_tests"),
+    ("rust-tests", "rust_tests"),
+    ("native-tests", "native_tests"),
     ("macos-swift-rpath", "macos_swift_rpath"),
-];
-
-/// Jobs that are skipped with the build job they need rather than by a filter
-/// of their own: a shard has nothing to run without the archive.
-const SKIPPED_WITH_THEIR_BUILD: &[(&str, &str)] = &[
-    ("rust-tests", "rust-tests-build"),
-    ("native-tests", "native-tests-build"),
 ];
 
 /// The `changes` output that lists the packages a pull request can affect.
 const PACKAGES: &str = "packages";
 
-/// The libvpx VP9 vector job runs a unit of `zvidlib-vp9-decoder` out of the
-/// Linux archive, so it needs the archive and that package's own filter.
-const VP9_VECTORS: (&str, &str, &str) = (
-    "rust-tests-vp9-vectors",
-    "vp9_vectors",
-    "zvidlib-vp9-decoder",
-);
+/// The `changes` output the per-package test matrix expands (#612): the same
+/// selection as [`PACKAGES`], as package names only.
+const CRATES: &str = "crates";
+
+/// The job that runs each selected package's tests as a leg of its own.
+const PER_PACKAGE_TESTS: &str = "rust-tests";
 
 /// The filters whose jobs build the native target, and so compile every
 /// `include_str!` and `include_bytes!` that is not browser-only.
@@ -424,29 +416,29 @@ fn main_pushes_and_dispatches_run_every_gated_job() {
             "the `{output}` output reads a filter that does not exist"
         );
     }
-    let (_, vp9_output, vp9_package) = VP9_VECTORS;
-    assert_eq!(
-        outputs.get(vp9_output).map(String::as_str),
-        Some(
-            format!(
-                "${{{{ github.event_name != 'pull_request' || steps.filter.outputs.{EVERYTHING} == 'true' \
-                 || steps.filter.outputs.{vp9_package} == 'true' }}}}"
-            )
-            .as_str()
-        ),
-        "the `{vp9_output}` output must follow `{vp9_package}`'s own filter"
+    let packages_expression = format!(
+        "${{{{ (github.event_name != 'pull_request' || steps.filter.outputs.{EVERYTHING} == 'true') \
+         && 'all' || steps.filter.outputs.changes }}}}"
     );
     assert_eq!(
-        outputs.get(PACKAGES).map(String::as_str),
-        Some(
-            format!(
-                "${{{{ (github.event_name != 'pull_request' || steps.filter.outputs.{EVERYTHING} == 'true') \
-                 && 'all' || steps.filter.outputs.changes }}}}"
-            )
-            .as_str()
-        ),
+        outputs.get(PACKAGES),
+        Some(&packages_expression),
         "the `{PACKAGES}` output must be `all` on anything but a pull request and when the \
          build definition changed, and otherwise the filters a pull request matched"
+    );
+    assert_eq!(
+        outputs.get(CRATES).map(String::as_str),
+        Some("${{ steps.crates.outputs.crates }}"),
+        "the `{CRATES}` output must be what the step that expands `{PACKAGES}` lists"
+    );
+    // The step that lists them reads the same selection `packages` is, so on a
+    // push it is `all` and every package's tests run.
+    assert!(
+        changes
+            .body
+            .lines()
+            .any(|line| line.trim() == format!("PACKAGES: {packages_expression}")),
+        "the step behind the `{CRATES}` output no longer reads the `{PACKAGES}` selection"
     );
     assert_eq!(
         outputs.len(),
@@ -473,32 +465,13 @@ fn each_gated_job_is_skipped_only_by_its_own_filter() {
             "`{id}` is not gated on the `{output}` output"
         );
     }
-    for (id, build) in SKIPPED_WITH_THEIR_BUILD {
-        assert_eq!(
-            job_key(job(&jobs, id), "needs").as_deref(),
-            Some(*build),
-            "`{id}` no longer needs `{build}`, so it would run without the archive it tests"
-        );
-    }
-    let (vp9_job, vp9_output, _) = VP9_VECTORS;
-    let vp9 = job(&jobs, vp9_job);
-    assert_eq!(
-        job_key(vp9, "needs").as_deref(),
-        Some("[changes, rust-tests-build]"),
-        "`{vp9_job}` must need the archive it runs and the `changes` job it is gated by"
-    );
-    assert_eq!(
-        job_key(vp9, "if"),
-        Some(format!("needs.changes.outputs.{vp9_output} == 'true'")),
-        "`{vp9_job}` is not gated on the `{vp9_output}` output"
-    );
     // A job gated on an output nobody sets would never run at all.
     for job in &jobs {
         if let Some(condition) = job_key(job, "if") {
             if let Some(output) = condition.strip_prefix("needs.changes.outputs.") {
                 let output = output.split_whitespace().next().unwrap_or_default();
                 assert!(
-                    GATED_JOBS.iter().any(|(_, known)| *known == output) || output == vp9_output,
+                    GATED_JOBS.iter().any(|(_, known)| *known == output),
                     "`{}` is gated on `{output}`, which is not one of the known outputs",
                     job.id
                 );
@@ -570,7 +543,7 @@ fn each_job_runs_on_the_files_it_reads() {
         ),
         ("wasm", "examples/hevc_decode_profile.rs", true),
         ("wasm", ".github/scripts/criterion_baseline.py", false),
-        // The Linux shards run the guards, which read every workflow.
+        // The Linux tests run the guards, which read every workflow.
         ("rust_tests", "crates/zvidlib-hardware/src/nvdec.rs", true),
         ("rust_tests", "src/wasm_api.rs", false),
         ("rust_tests", "js/browser.js", false),
@@ -619,7 +592,11 @@ fn each_job_runs_on_the_files_it_reads() {
             "tests/macos_swift_runtime_rpath.rs",
             true,
         ),
-        ("macos_swift_rpath", "tests/mp4_cover_art.rs", false),
+        (
+            "macos_swift_rpath",
+            "tests/media_output_cover_art.rs",
+            false,
+        ),
         ("macos_swift_rpath", "src/web_previews.rs", false),
     ];
     let wrong: Vec<String> = cases
@@ -766,7 +743,7 @@ fn representative_files(package: &workspace::Package) -> Vec<String> {
     if package.dir == "." {
         return [
             "src/lib.rs",
-            "tests/mp4_cover_art.rs",
+            "tests/media_output_cover_art.rs",
             "benches/audio_mux.rs",
             "examples/native_encode.rs",
         ]
@@ -933,29 +910,148 @@ fn every_file_a_package_includes_runs_its_filter() {
     );
 }
 
-/// The packages each test archive lists with `targets`: every package has to
-/// be listed, or selecting it would build and run none of its tests.
+/// The packages the native test job lists with `targets`: every package has
+/// to be listed, or selecting it would build and run none of its tests. The
+/// Linux job runs a leg per package instead, which
+/// `the_per_package_test_matrix_covers_every_package` checks.
 #[test]
-fn every_package_is_listed_in_each_test_archive() {
+fn every_package_is_listed_in_the_native_test_job() {
     let workflow = ci_workflow();
     let jobs = jobs(&workflow);
     let packages = workspace::packages();
-    for id in ["rust-tests-build", "native-tests-build"] {
-        let listed: Vec<&str> = job(&jobs, id)
-            .body
-            .lines()
-            .filter_map(|line| line.trim().strip_prefix("targets "))
-            .filter_map(|rest| rest.split_whitespace().next())
-            .collect();
-        let missing: Vec<&str> = packages
+    let listed: Vec<&str> = job(&jobs, "native-tests")
+        .body
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("targets "))
+        .filter_map(|rest| rest.split_whitespace().next())
+        .collect();
+    let missing: Vec<&str> = packages
+        .iter()
+        .map(|package| package.name.as_str())
+        .filter(|name| !listed.contains(name))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "`native-tests` lists no `targets` line for these packages, so their library units \
+         never run: {missing:?}"
+    );
+}
+
+/// The package names the `changes` job expands `all` to, from its
+/// `WORKSPACE: |` block, one per line.
+fn listed_workspace(changes: &Job) -> Vec<String> {
+    let mut lines = changes.body.lines();
+    let header = lines
+        .by_ref()
+        .find(|line| line.trim() == "WORKSPACE: |")
+        .expect("the `changes` job lists the workspace's packages under `WORKSPACE: |`");
+    let block_indent = indent(header);
+    lines
+        .take_while(|line| line.trim().is_empty() || indent(line) > block_indent)
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The per-package test matrix runs one leg per name in `crates`, and on a
+/// `main` push that is every name the `changes` job lists. A package missing
+/// from that list would never be tested on `main`, and one a pull request
+/// selected would be dropped from `crates` and go untested there too (#612).
+#[test]
+fn the_per_package_test_matrix_covers_every_package() {
+    let workflow = ci_workflow();
+    let jobs = jobs(&workflow);
+    let listed = listed_workspace(job(&jobs, "changes"));
+    let mut packages: Vec<String> = workspace::packages()
+        .into_iter()
+        .map(|package| package.name)
+        .collect();
+    packages.sort();
+    let mut sorted = listed.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(
+        sorted.len(),
+        listed.len(),
+        "`WORKSPACE` lists a package twice: {listed:?}"
+    );
+    assert_eq!(
+        sorted, packages,
+        "`WORKSPACE` in the `changes` job must list every workspace package and nothing \
+         else, or the per-package test matrix skips the ones it leaves out"
+    );
+    let tests = job(&jobs, PER_PACKAGE_TESTS);
+    assert!(
+        tests.body.lines().any(|line| line.trim()
+            == format!("package: ${{{{ fromJSON(needs.changes.outputs.{CRATES}) }}}}")),
+        "`{PER_PACKAGE_TESTS}` no longer runs one leg per package in the `{CRATES}` output"
+    );
+    assert!(
+        !workflow.contains("--partition"),
+        "a job deals its tests out over shards again; each package runs its own (#612)"
+    );
+}
+
+/// A step limited to one leg of the matrix, such as the libvpx VP9 vectors,
+/// runs only while that leg exists: a condition naming a package the workspace
+/// no longer has would skip the step on every run without saying so.
+#[test]
+fn a_step_for_one_package_names_a_workspace_package() {
+    let workflow = ci_workflow();
+    let packages = workspace::packages();
+    let mut named = 0;
+    for (at, _) in workflow.match_indices("matrix.package == '") {
+        let rest = &workflow[at + "matrix.package == '".len()..];
+        let name = &rest[..rest.find('\'').expect("a closed package name")];
+        workspace::package(&packages, name);
+        named += 1;
+    }
+    assert!(
+        named >= 2,
+        "expected the Opus and VP9 vector steps to be limited to their packages' legs"
+    );
+}
+
+/// The packages a pull request's change selects, as the `changes` job would:
+/// every package whose filter matches one of the paths.
+fn selected(filters: &BTreeMap<String, Vec<String>>, paths: &[&str]) -> Vec<String> {
+    workspace::packages()
+        .into_iter()
+        .map(|package| package.name)
+        .filter(|name| {
+            paths
+                .iter()
+                .any(|path| filter_matches(&filters[name], path))
+        })
+        .collect()
+}
+
+/// #612's acceptance cases, by name: a leaf crate's change tests that crate and
+/// the crates depending on it and nothing unrelated, and a shared crate's
+/// change tests every crate that depends on it.
+#[test]
+fn a_change_selects_its_crate_and_the_crates_that_depend_on_it() {
+    let filters = filters(&ci_workflow());
+    let packages = workspace::packages();
+    let dependents = |name: &str| -> Vec<String> {
+        packages
             .iter()
-            .map(|package| package.name.as_str())
-            .filter(|name| !listed.contains(name))
-            .collect();
+            .filter(|package| workspace::affected_by(&packages, &package.name).contains(name))
+            .map(|package| package.name.clone())
+            .collect()
+    };
+
+    let vp8 = selected(&filters, &["crates/zvidlib-vp8/src/lib.rs"]);
+    assert_eq!(vp8, dependents("zvidlib-vp8"));
+    assert_eq!(vp8, ["zvidlib", "zvidlib-vp8"]);
+
+    let core = selected(&filters, &["crates/zvidlib-core/src/lib.rs"]);
+    assert_eq!(core, dependents("zvidlib-core"));
+    for name in ["zvidlib-aac-encoder", "zvidlib-hevc-decoder", "zvidlib-vp8"] {
         assert!(
-            missing.is_empty(),
-            "`{id}` lists no `targets` line for these packages, so their library units \
-             never run: {missing:?}"
+            core.contains(&name.to_string()),
+            "{name} depends on zvidlib-core"
         );
     }
 }

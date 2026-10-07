@@ -6,13 +6,14 @@
 //! nothing. Keeping that list in step by hand was the fix for a while, and it
 //! made every new test an edit to `ci.yml` (#616).
 //!
-//! So CI names no test at all: each test archive is built with every test
-//! target of every package it selects - `--lib`, `--tests` and the examples
-//! that set `test = true` - and the shards run the whole archive. That every
-//! package is selected by each archive is `ci_path_filters_are_conservative`'s
-//! to check; what is checked here is that no archive goes back to naming its
-//! targets, and that no shard filters what it runs, since either would let a
-//! test be compiled and left out again. A test that must not run on some host
+//! So CI names no test at all: each test job runs every test target of every
+//! package it selects - `--lib`, `--tests` and the examples that set
+//! `test = true` - on Linux in a leg per package and on Windows and macOS in
+//! one run per host (#612). That every package is selected by each job is
+//! `ci_path_filters_are_conservative`'s to check; what is checked here is that
+//! no test run goes back to naming its targets, and that none filters or
+//! shards what it runs, since either would let a test be compiled and left out
+//! again. A test that must not run on some host
 //! says so itself, with `#[cfg]` or `#[ignore]`, or in `.config/nextest.toml`.
 //!
 //! Deliberately line-based rather than a YAML parse, for the same reason
@@ -59,22 +60,26 @@ fn commands(source: &str) -> Vec<String> {
     commands
 }
 
-/// The `cargo nextest archive` commands in `source`.
-fn archives(source: &str) -> Vec<String> {
+/// The `nextest run` commands in `source` that run a package's tests, as
+/// opposed to the one that runs an `#[ignore]`d test on its own
+/// (`--run-ignored only`), which can only add to what the others run.
+fn test_runs(source: &str) -> Vec<String> {
     commands(source)
         .into_iter()
-        .filter(|command| command.contains("cargo nextest archive "))
+        .filter(|command| {
+            command.contains("nextest run ") && !command.contains("--run-ignored only")
+        })
         .collect()
 }
 
-/// Arguments that pick out individual targets, which an archive must not
-/// take: every target it leaves out is one the shards never run.
+/// Arguments that pick out individual targets, which a test run must not
+/// take: every target it leaves out is one CI never runs.
 const TARGET_SELECTORS: &[&str] = &["--test", "--example", "--bin", "--bench"];
 
-/// Why `archive` would leave a test target of a package it selects unbuilt,
-/// if it would.
-fn archive_problem(archive: &str) -> Option<String> {
-    let words: Vec<&str> = archive.split_whitespace().collect();
+/// Why `run` would leave a test target of a package it selects unrun, if it
+/// would.
+fn run_problem(run: &str) -> Option<String> {
+    let words: Vec<&str> = run.split_whitespace().collect();
     for required in ["--lib", "--tests", "--examples"] {
         if !words.contains(&required) {
             return Some(format!("it does not take `{required}`"));
@@ -91,76 +96,68 @@ fn archive_problem(archive: &str) -> Option<String> {
 }
 
 #[test]
-fn every_test_archive_builds_every_test_target_of_its_packages() {
+fn every_test_run_runs_every_test_target_of_its_packages() {
     let workflow = ci_workflow();
-    let archives = archives(&workflow);
+    let runs = test_runs(&workflow);
     assert!(
-        archives.len() >= 2,
-        "expected the Linux and native test archives in ci.yml, found {archives:?}"
+        runs.len() >= 2,
+        "expected the Linux and native test runs in ci.yml, found {runs:?}"
     );
-    let problems: Vec<String> = archives
+    let problems: Vec<String> = runs
         .iter()
-        .filter_map(|archive| archive_problem(archive).map(|why| format!("{why}: {archive}")))
+        .filter_map(|run| run_problem(run).map(|why| format!("{why}: {run}")))
         .collect();
     assert!(
         problems.is_empty(),
-        "a test archive has to build every test target of each package it selects, so a \
-         new test runs without a change to the workflow (#616): {problems:?}"
+        "a test run has to run every test target of each package it selects, so a new \
+         test runs without a change to the workflow (#616): {problems:?}"
     );
 }
 
-/// The shards run the whole archive. A filter on one would leave out the tests
-/// it does not match, which is the per-test list again by another name; a
-/// host-specific exclusion belongs in the test or in `.config/nextest.toml`.
-/// The one job allowed a filter runs an `#[ignore]`d test on its own
-/// (`--run-ignored only`), so it can only add to what the shards run.
+/// A test run runs everything it builds. A filter on one would leave out the
+/// tests it does not match, which is the per-test list again by another name,
+/// and a partition would deal them out over shards again, each running tests
+/// of packages the change cannot reach (#612). A host-specific exclusion
+/// belongs in the test or in `.config/nextest.toml`.
 #[test]
-fn every_shard_runs_its_whole_archive() {
+fn every_test_run_runs_everything_it_builds() {
     let workflow = ci_workflow();
-    let runs: Vec<String> = commands(&workflow)
+    let filtered: Vec<String> = test_runs(&workflow)
         .into_iter()
-        .filter(|command| command.contains("nextest run ") && command.contains("--archive-file"))
-        .collect();
-    assert!(
-        runs.iter().any(|run| run.contains("--partition")),
-        "expected the sharded `nextest run`s in ci.yml, found {runs:?}"
-    );
-    let filtered: Vec<&String> = runs
-        .iter()
-        .filter(|run| !run.contains("--run-ignored only"))
         .filter(|run| {
             run.split_whitespace().any(|word| {
                 word == "-E"
                     || word.starts_with("--filterset")
                     || word.starts_with("--filter-expr")
+                    || word.starts_with("--partition")
                     || word == "--"
             })
         })
         .collect();
     assert!(
         filtered.is_empty(),
-        "these test shards filter what they run, so a test the filter does not match is \
-         compiled and never executed: {filtered:?}"
+        "these test runs filter or shard what they run, so a test is compiled and never \
+         executed, or run beside packages the change cannot reach: {filtered:?}"
     );
 }
 
 /// The reader itself, on workflow text written for it.
 #[test]
-fn an_archive_that_names_a_target_or_skips_a_kind_is_caught() {
+fn a_run_that_names_a_target_or_skips_a_kind_is_caught() {
     let workflow = r#"
-      # `cargo nextest archive --test in_a_comment` is prose, not a command.
+      # `cargo nextest run --test in_a_comment` is prose, not a command.
       - run: |
-          cargo nextest archive --features native --lib --tests --examples -p a \
-            --archive-file whole.tar.zst
+          cargo nextest run --profile ci --features native -p a \
+            --lib --tests --examples
       - run: |
-          cargo nextest archive --features native --lib --tests --examples -p a \
-            --test named_on_a_continuation_line \
-            --archive-file named.tar.zst
-      - run: cargo nextest archive --lib -p a --archive-file no-tests.tar.zst
+          cargo nextest run --profile ci --lib --tests --examples -p a \
+            --test named_on_a_continuation_line
+      - run: cargo nextest run --lib -p a
+      - run: cargo nextest run -p a --lib --run-ignored only -E 'test(=one)'
 "#;
-    let problems: Vec<Option<String>> = archives(workflow)
+    let problems: Vec<Option<String>> = test_runs(workflow)
         .iter()
-        .map(|archive| archive_problem(archive))
+        .map(|run| run_problem(run))
         .collect();
     assert_eq!(
         problems,

@@ -48,10 +48,9 @@ jobs:
   # touches nothing a job reads still paid for that job (#600). This decides
   # which of the jobs below a pull request has to run, from the files it
   # changes, and the others are skipped rather than failed: `Rust checks`,
-  # `WebAssembly checks`, `Rust tests (build)` and the shards that need it,
-  # `Native tests (build, ...)` and the shards that need it, and `macOS Swift
-  # runtime rpath`. The benchmark jobs are not gated; on a pull request the
-  # only one is the compile check.
+  # `WebAssembly checks`, `Rust tests (<package>)`, `Native tests (<os>)` and
+  # `macOS Swift runtime rpath`. The benchmark jobs are not gated; on a pull
+  # request the only one is the compile check.
   #
   # It also decides which workspace packages a pull request can affect (#604),
   # and the test and benchmark jobs build and run only those. Every package has
@@ -60,8 +59,10 @@ jobs:
   # build-dependencies and dev-dependencies, and theirs - and every file it
   # pulls in through `include_str!` or `include_bytes!` from anywhere else, so
   # a change to a crate selects that crate and everything that depends on it,
-  # and nothing else. `packages` is the JSON list of the filters that matched,
-  # or `all`; the jobs pick their package names out of it.
+  # directly or transitively, and nothing else (#612). `packages` is the JSON
+  # list of the filters that matched, or `all`; the jobs pick their package
+  # names out of it. `crates` is the same selection as a JSON list of package
+  # names only, `all` expanded, which is what the per-crate test matrix runs.
   #
   # Only a pull request is filtered. A `main` push and a `workflow_dispatch`
   # run everything, because the benchmark baseline is a chain and `main`'s
@@ -95,7 +96,7 @@ jobs:
       native_tests: ${{ github.event_name != 'pull_request' || steps.filter.outputs.everything == 'true' || steps.filter.outputs.native_tests == 'true' }}
       macos_swift_rpath: ${{ github.event_name != 'pull_request' || steps.filter.outputs.everything == 'true' || steps.filter.outputs.macos_swift_rpath == 'true' }}
       packages: ${{ (github.event_name != 'pull_request' || steps.filter.outputs.everything == 'true') && 'all' || steps.filter.outputs.changes }}
-      vp9_vectors: ${{ github.event_name != 'pull_request' || steps.filter.outputs.everything == 'true' || steps.filter.outputs.zvidlib-vp9-decoder == 'true' }}
+      crates: ${{ steps.crates.outputs.crates }}
     steps:
       - name: Match the changed files against each job's and package's inputs
         id: filter
@@ -381,14 +382,56 @@ jobs:
               - 'crates/zvidlib-vp9-syntax/**'
               - 'crates/zvidlib-color/**'
               - 'crates/zvidlib-core/**'
+      # A matrix cannot expand `all`, and `packages` also names the job
+      # filters that matched, so this narrows it to package names: every one in
+      # `WORKSPACE` on a `main` push, a `workflow_dispatch` or a change to the
+      # build definition, and otherwise the ones whose filter matched.
+      # `WORKSPACE` is every workspace package, one per line, and
+      # `tests/ci_path_filters_are_conservative.rs` holds it to the manifests,
+      # so a crate added to the workspace and not here fails that test rather
+      # than going untested.
+      - name: List the packages whose tests run
+        id: crates
+        env:
+          PACKAGES: ${{ (github.event_name != 'pull_request' || steps.filter.outputs.everything == 'true') && 'all' || steps.filter.outputs.changes }}
+          WORKSPACE: |
+            zvidlib
+            zvidlib-aac-encoder
+            zvidlib-av1
+            zvidlib-av1-decoder
+            zvidlib-av1-encoder
+            zvidlib-av1-syntax
+            zvidlib-bench-support
+            zvidlib-build
+            zvidlib-color
+            zvidlib-container
+            zvidlib-core
+            zvidlib-hardware
+            zvidlib-hevc-decoder
+            zvidlib-hevc-encoder
+            zvidlib-hevc-syntax
+            zvidlib-opus
+            zvidlib-vorbis-decoder
+            zvidlib-vorbis-encoder
+            zvidlib-vp8
+            zvidlib-vp9-decoder
+            zvidlib-vp9-encoder
+            zvidlib-vp9-syntax
+        run: |
+          workspace="$(jq -cnR '[inputs | select(length > 0)]' <<<"$WORKSPACE")"
+          if [ "$PACKAGES" = all ]; then
+            crates="$workspace"
+          else
+            crates="$(jq -c --argjson workspace "$workspace" 'map(select(IN($workspace[])))' <<<"$PACKAGES")"
+          fi
+          echo "crates=$crates" | tee -a "$GITHUB_OUTPUT"
 
   # The Rust tests used to run here and in `native-platforms` as one
   # `cargo test` step after another, each a separate binary that waited for the
   # one before it, and the two jobs took twelve minutes apiece (#595). They are
-  # now built once per platform into a `cargo nextest archive` and run in
-  # parallel across every binary, split over a matrix of shards; see
-  # `rust-tests-build` below. What is left here is the part of the old job that
-  # is not a Rust test: formatting, lints and the scripts the workflow uses.
+  # now run with cargo-nextest, one job per workspace package on Linux, in
+  # `rust-tests` below. What is left here is the part of the old job that is
+  # not a Rust test: formatting, lints and the scripts the workflow uses.
   rust:
     name: Rust checks
     needs: changes
@@ -492,193 +535,119 @@ jobs:
       - name: Test in headless Chrome
         run: wasm-pack test --headless --chrome --no-default-features --features web
 
-  # Builds every Linux test binary once, for the shards below to run (#595).
-  # `cargo test` runs a binary's tests in parallel but the binaries one at a
-  # time, and each of the old steps here was its own binary, so the job's wall
-  # clock was their sum. cargo-nextest runs each test as its own process across
-  # every binary at once, and `cargo nextest archive` packs the binaries so a
-  # shard restores them instead of compiling them again.
+  # Every package's tests on Linux, one job per package the pull request can
+  # affect (#612). cargo-nextest runs each test as its own process across every
+  # binary of the package at once, and the packages run side by side as jobs of
+  # their own, so a change to one codec builds and runs that codec's tests and
+  # those of the crates that depend on it, and not the whole suite. `changes`
+  # decides which packages those are; a `main` push and a `workflow_dispatch`
+  # run every one. The root package depends on every library crate, so a pull
+  # request that runs this job always runs its `zvidlib` leg, and the matrix is
+  # never empty. The packages used to be built into a single archive dealt out
+  # over a matrix of shards (#595), and a shard ran tests from every package in
+  # it whether or not the change could reach them.
   #
-  # Each package `changes` selects is archived with every test target it has -
-  # `--lib`, `--tests` and the examples that set `test = true` - and the shards
-  # run the whole archive, so a new test file runs without a change here (#616).
-  # A package `changes` did not select is left out altogether, its library
-  # units included. What a test checks is written in its own doc comment, and
-  # a test that cannot run on some host is kept off it by `#[cfg]`,
+  # Each leg runs every test target of its package - `--lib`, `--tests` and
+  # the examples that set `test = true` - so a new test file runs without a
+  # change here (#616). What a test checks is written in its own doc comment,
+  # and a test that cannot run on some host is kept off it by `#[cfg]`,
   # `#[ignore]` or `.config/nextest.toml`, never by leaving it out of this job.
-  rust-tests-build:
-    name: Rust tests (build)
+  # `.config/nextest.toml` also keeps the hardware and wall-clock tests from
+  # sharing the machine, which one step per binary used to guarantee.
+  # `--no-tests=warn`, because a package such as `zvidlib-build` has no test of
+  # its own, and running none is then correct rather than a failure.
+  rust-tests:
+    name: Rust tests (${{ matrix.package }})
     needs: changes
     if: needs.changes.outputs.rust_tests == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Rust toolchain
-        run: rustup show
-      - name: Cache cargo registry and build artifacts
-        uses: Swatinem/rust-cache@v2
-        with:
-          cache-on-failure: true
-      - name: Install native audio dependencies
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
-      # A release binary rather than `cargo install`, which would compile the
-      # runner and its dependency tree on every run.
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@v2
-        with:
-          tool: nextest
-      # `targets` adds a package to the archive when the pull request can
-      # affect it, and the shards run everything in the archive. The root package depends on every library crate, so a
-      # change anywhere selects it and the list is never empty.
-      - name: Build the test archive
-        env:
-          PACKAGES: ${{ needs.changes.outputs.packages }}
-        run: |
-          packages=()
-          targets() {
-            if [ "$PACKAGES" = all ] || jq -e --arg p "$1" 'index($p) != null' <<<"$PACKAGES" >/dev/null; then
-              packages+=(-p "$1")
-            fi
-          }
-          targets zvidlib
-          targets zvidlib-aac-encoder
-          targets zvidlib-av1
-          targets zvidlib-av1-decoder
-          targets zvidlib-av1-encoder
-          targets zvidlib-av1-syntax
-          targets zvidlib-bench-support
-          targets zvidlib-build
-          targets zvidlib-color
-          targets zvidlib-container
-          targets zvidlib-core
-          targets zvidlib-hardware
-          targets zvidlib-hevc-decoder
-          targets zvidlib-hevc-encoder
-          targets zvidlib-hevc-syntax
-          targets zvidlib-opus
-          targets zvidlib-vorbis-decoder
-          targets zvidlib-vorbis-encoder
-          targets zvidlib-vp8
-          targets zvidlib-vp9-decoder
-          targets zvidlib-vp9-encoder
-          targets zvidlib-vp9-syntax
-          cargo nextest archive --features native --lib --tests --examples "${packages[@]}" \
-            --archive-file nextest-archive.tar.zst
-      - name: Upload the test archive
-        uses: actions/upload-artifact@v4
-        with:
-          name: nextest-archive-linux-${{ github.run_id }}
-          path: nextest-archive.tar.zst
-          # The archive is already zstd-compressed.
-          compression-level: 0
-          retention-days: 1
-
-  # Every shard checks out the same commit at the same path the archive was
-  # built at, which is what the tests' `env!("CARGO_MANIFEST_DIR")` fixture
-  # paths resolve against. A shard compiles nothing - it runs `cargo-nextest`
-  # on the archive directly rather than through `cargo` - so it needs no build
-  # cache. `.config/nextest.toml` keeps the hardware and wall-clock tests from
-  # sharing the machine, which one step per binary used to guarantee.
-  #
-  # `--partition count:` deals the tests out round-robin, so the slow binaries'
-  # tests are spread over the shards rather than queued behind each other. The
-  # floor is `opus_codec`'s `rfc8251_test_vectors_pass_opus_compare`, a single
-  # test of about three minutes that whichever shard draws it runs alongside
-  # its other tests; more shards would not make that one test shorter.
-  rust-tests:
-    name: Rust tests (${{ matrix.shard }}/3)
-    needs: rust-tests-build
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3]
+        package: ${{ fromJSON(needs.changes.outputs.crates) }}
     env:
       ZVIDLIB_OPUS_TEST_VECTORS: ${{ github.workspace }}/opus_newvectors
       # libvpx must decode the native VP8 encoder's WebM to exactly the pictures
       # zvidlib's decoder does, and ffmpeg must seek it through its Cues (#530).
-      # The test skips itself without ffmpeg's libvpx decoder elsewhere, so the
-      # shards install ffmpeg below and require it.
+      # The test skips itself without ffmpeg's libvpx decoder elsewhere, so this
+      # job installs ffmpeg below and requires it.
       ZVIDLIB_REQUIRE_LIBVPX: "1"
     steps:
       - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: rustup show
+      # One cache per package, since each leg builds a different slice of the
+      # workspace and a shared key would have the legs overwrite each other.
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.package }}
+          cache-on-failure: true
       # The VP9 encoder's tests require libvpx and FFmpeg's own VP9 decoder to
       # reproduce its reconstruction exactly (#528), and the cover-art and WebM
       # tests check their output with ffprobe. They skip themselves where
       # ffmpeg is missing, so it is installed before they run.
       - name: Install native audio dependencies and ffmpeg
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev ffmpeg
+      # A release binary rather than `cargo install`, which would compile the
+      # runner and its dependency tree on every run.
       - name: Install cargo-nextest
         uses: taiki-e/install-action@v2
         with:
           tool: nextest
-      - name: Download the test archive
-        uses: actions/download-artifact@v4
-        with:
-          name: nextest-archive-linux-${{ github.run_id }}
       # The twelve official Opus decoder test vectors (RFC 8251) are 75 MB, so
       # they are downloaded rather than committed, and cached so most runs do
       # not download them at all. The key names the file; it never changes.
-      # Every shard restores them, because which shard `opus_codec`'s tests
-      # land on depends on how many tests sort before them.
+      # Only `opus_codec` reads them.
       - name: Cache the Opus RFC 8251 test vectors
         id: opus-test-vectors
+        if: matrix.package == 'zvidlib-opus'
         uses: actions/cache@v4
         with:
           path: opus_newvectors
           key: opus-testvectors-rfc8251-workspace
       - name: Download the Opus RFC 8251 test vectors
-        if: steps.opus-test-vectors.outputs.cache-hit != 'true'
+        if: matrix.package == 'zvidlib-opus' && steps.opus-test-vectors.outputs.cache-hit != 'true'
         run: |
           curl -sSfL https://opus-codec.org/static/testvectors/opus_testvectors-rfc8251.tar.gz \
             | tar -xz
-      - name: Run this shard's tests
+      # `native` is a feature of the root package only, and naming a feature
+      # no selected package declares is an error.
+      - name: Run this package's tests
+        env:
+          PACKAGE: ${{ matrix.package }}
         run: |
-          cargo-nextest nextest run --profile ci \
-            --archive-file nextest-archive.tar.zst --workspace-remap . \
-            --partition count:${{ matrix.shard }}/3
+          features=()
+          if [ "$PACKAGE" = zvidlib ]; then
+            features=(--features native)
+          fi
+          cargo nextest run --profile ci --no-tests=warn -p "$PACKAGE" "${features[@]}" \
+            --lib --tests --examples
 
-  # The VP9 decoder is held bit-exact to libvpx on every profile 0 test vector
-  # libvpx's own test suite decodes (#527): hidden frames, superframes,
-  # show_existing_frame, intra-only frames, scaled reference frames, tiles,
-  # frame sizes from 2x2 to 1920x1080 and so on. The vectors and their
-  # per-frame MD5s come from the WebM project's test-data bucket, about 27 MB in
-  # all, so they are cached between runs, keyed on the list of names the test
-  # reads. One host is enough: this one runs the widest vector kernels it
-  # detects, and every other instruction set is held to the scalar reference by
-  # the `vp9_simd` unit tests and the per-ISA fixture decode in the library
-  # units, which every native host runs (#570).
-  #
-  # The test is `#[ignore]`d for every other run, so it is run on its own with
-  # `--run-ignored only` and a filter that names it - the library's other
-  # ignored tests are measurement sweeps. It is a job of its own rather than a
-  # step after one shard's tests because it is most of a minute by itself, and
-  # added to whichever shard it followed it made that shard the slowest.
-  rust-tests-vp9-vectors:
-    name: Rust tests (libvpx VP9 vectors)
-    needs: [changes, rust-tests-build]
-    # The test is a unit of `zvidlib-vp9-decoder`, which is only in the archive
-    # when the pull request can affect it.
-    if: needs.changes.outputs.vp9_vectors == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install native audio dependencies
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@v2
-        with:
-          tool: nextest
-      - name: Download the test archive
-        uses: actions/download-artifact@v4
-        with:
-          name: nextest-archive-linux-${{ github.run_id }}
+      # The VP9 decoder is held bit-exact to libvpx on every profile 0 test
+      # vector libvpx's own test suite decodes (#527): hidden frames,
+      # superframes, show_existing_frame, intra-only frames, scaled reference
+      # frames, tiles, frame sizes from 2x2 to 1920x1080 and so on. The vectors
+      # and their per-frame MD5s come from the WebM project's test-data bucket,
+      # about 27 MB in all, so they are cached between runs, keyed on the list
+      # of names the test reads. One host is enough: this one runs the widest
+      # vector kernels it detects, and every other instruction set is held to
+      # the scalar reference by the `vp9_simd` unit tests and the per-ISA
+      # fixture decode in the library units, which every native host runs
+      # (#570).
+      #
+      # The test is a unit of `zvidlib-vp9-decoder`, `#[ignore]`d for every
+      # other run, so that package's leg runs it on its own with
+      # `--run-ignored only` and a filter that names it - the library's other
+      # ignored tests are measurement sweeps.
       - name: Cache the libvpx VP9 test vectors
+        if: matrix.package == 'zvidlib-vp9-decoder'
         uses: actions/cache@v4
         with:
           path: vp9-test-vectors
           key: libvpx-vp9-test-vectors-${{ hashFiles('crates/zvidlib-vp9-decoder/tests/fixtures/libvpx_vp9_test_vectors.txt') }}
       - name: Download the libvpx VP9 test vectors
+        if: matrix.package == 'zvidlib-vp9-decoder'
         run: |
           mkdir -p vp9-test-vectors
           while read -r name; do
@@ -690,11 +659,11 @@ jobs:
             done
           done < crates/zvidlib-vp9-decoder/tests/fixtures/libvpx_vp9_test_vectors.txt
       - name: Test VP9 decoding against the libvpx test vectors
+        if: matrix.package == 'zvidlib-vp9-decoder'
         env:
           ZVIDLIB_VP9_VECTORS: ${{ github.workspace }}/vp9-test-vectors
         run: |
-          cargo-nextest nextest run --profile ci \
-            --archive-file nextest-archive.tar.zst --workspace-remap . \
+          cargo nextest run --profile ci -p zvidlib-vp9-decoder --lib \
             --run-ignored only -E 'test(=vp9_dec::tests::libvpx_test_vectors)'
 
   # Benchmarks are measured, not gated. On a pull request the suite is only
@@ -1024,9 +993,9 @@ jobs:
           retention-days: 30
 
 
-  # The Windows and macOS halves of what `rust-tests-build` does for Linux
-  # (#595): lint the platform's `cfg` half of the tree, then build its test
-  # binaries once into an archive for the shards below.
+  # The Windows and macOS halves of what `rust-tests` does for Linux (#595,
+  # #612): lint the platform's `cfg` half of the tree, then run the tests of
+  # the packages the pull request can affect, each named with `-p`.
   #
   # `macos-latest` is aarch64, and Apple silicon's dyld shared cache resolves
   # the Swift runtime the `apple-cf` bridge references whether or not the
@@ -1036,12 +1005,19 @@ jobs:
   # regression is only caught when someone runs the tests on an Intel Mac by
   # hand.
   #
-  # The archive holds every test target of each package the pull request can
-  # affect, as on Linux, so each test runs on every host its `#[cfg]` builds
-  # it for: the hardware tests reach VideoToolbox, Media Foundation and NVDEC
-  # here, and the platform AAC tests the codecs Linux does not have.
-  native-tests-build:
-    name: Native tests (build, ${{ matrix.os }})
+  # Every test target of each package the pull request can affect runs, as on
+  # Linux, so each test runs on every host its `#[cfg]` builds it for: the
+  # hardware tests reach VideoToolbox, Media Foundation and NVDEC here, and the
+  # platform AAC tests the codecs Linux does not have. The selected packages
+  # run in one `cargo nextest run` per host rather than a job per package,
+  # because each job here would repeat the platform lint and these runners are
+  # the scarce ones; nextest still runs every binary at once. The hardware
+  # tests take turns through the `hardware` test group in
+  # `.config/nextest.toml`, which is what keeps the `macos-latest` VideoToolbox
+  # VP9 decoder from failing a decode while another session decodes (#565).
+  # These were dealt out over shards before (#595); they are not split now.
+  native-tests:
+    name: Native tests (${{ matrix.os }})
     needs: changes
     if: needs.changes.outputs.native_tests == 'true'
     strategy:
@@ -1077,7 +1053,7 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: nextest
-      - name: Build the test archive
+      - name: Run the tests of the packages this run selected
         shell: bash
         env:
           PACKAGES: ${{ needs.changes.outputs.packages }}
@@ -1110,55 +1086,8 @@ jobs:
           targets zvidlib-vp9-decoder
           targets zvidlib-vp9-encoder
           targets zvidlib-vp9-syntax
-          cargo nextest archive --features native --lib --tests --examples "${packages[@]}" \
-            --archive-file nextest-archive.tar.zst
-      - name: Upload the test archive
-        uses: actions/upload-artifact@v4
-        with:
-          name: nextest-archive-${{ matrix.os }}-${{ github.run_id }}
-          path: nextest-archive.tar.zst
-          compression-level: 0
-          retention-days: 1
-
-  # As `rust-tests`, for Windows and macOS. The hardware tests in each shard
-  # still take turns through the `hardware` test group in `.config/nextest.toml`,
-  # which is what keeps the `macos-latest` VideoToolbox VP9 decoder from
-  # failing a decode while another session decodes (#565).
-  #
-  # macOS gets a third shard because that turn-taking is where its time goes:
-  # its runner has a hardware VP9 decoder and encoder, so the `vp9_hardware`
-  # and VideoToolbox tests actually decode there, one at a time, and the shard
-  # that drew most of them ran four minutes against the other's ninety
-  # seconds. Windows has no hardware to take turns over and two is enough.
-  native-tests:
-    name: Native tests (${{ matrix.os }}, ${{ matrix.shard }}/${{ matrix.shards }})
-    needs: native-tests-build
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { os: windows-latest, shard: 1, shards: 2 }
-          - { os: windows-latest, shard: 2, shards: 2 }
-          - { os: macos-latest, shard: 1, shards: 3 }
-          - { os: macos-latest, shard: 2, shards: 3 }
-          - { os: macos-latest, shard: 3, shards: 3 }
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@v2
-        with:
-          tool: nextest
-      - name: Download the test archive
-        uses: actions/download-artifact@v4
-        with:
-          name: nextest-archive-${{ matrix.os }}-${{ github.run_id }}
-      - name: Run this shard's tests
-        shell: bash
-        run: |
-          cargo-nextest nextest run --profile ci \
-            --archive-file nextest-archive.tar.zst --workspace-remap . \
-            --partition count:${{ matrix.shard }}/${{ matrix.shards }}
+          cargo nextest run --profile ci --no-tests=warn --features native \
+            --lib --tests --examples "${packages[@]}"
 
   # `--release` is the profile #327 was reported against: nothing about the
   # missing rpath is profile-specific, but this is the invocation the issue
@@ -1170,8 +1099,8 @@ jobs:
   #
   # Only the rpath test needs the release profile. This step also used to rerun
   # every library unit in release, which was most of its four and a half
-  # minutes and repeated what the shards run (#595); it is its own job now so
-  # the fat-LTO build is off the shards' path entirely.
+  # minutes and repeated what the test jobs run (#595); it is its own job now
+  # so the fat-LTO build is off the test jobs' path entirely.
   macos-swift-rpath:
     name: macOS Swift runtime rpath
     needs: changes
