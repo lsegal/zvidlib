@@ -460,7 +460,8 @@ jobs:
         with:
           cache-on-failure: true
       - name: Install native audio dependencies
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+        timeout-minutes: 15
+        run: python3 .github/scripts/apt_install.py libasound2-dev
       - name: Check formatting
         run: cargo fmt --all -- --check
       # Clippy type-checks every target on its way to linting it, so a separate
@@ -631,9 +632,13 @@ jobs:
       # The VP9 encoder's tests require libvpx and FFmpeg's own VP9 decoder to
       # reproduce its reconstruction exactly (#528), and the cover-art and WebM
       # tests check their output with ffprobe. They skip themselves where
-      # ffmpeg is missing, so it is installed before they run.
+      # ffmpeg is missing, so it is installed before they run. A stalled apt
+      # mirror once held these steps for hours (#647): the script kills an
+      # apt-get that runs for four minutes and retries it, and the step limit
+      # fails the job if every attempt stalls.
       - name: Install native audio dependencies and ffmpeg
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev ffmpeg
+        timeout-minutes: 15
+        run: python3 .github/scripts/apt_install.py libasound2-dev ffmpeg
       # A release binary rather than `cargo install`, which would compile the
       # runner and its dependency tree on every run.
       - name: Install cargo-nextest
@@ -757,7 +762,8 @@ jobs:
         with:
           cache-on-failure: true
       - name: Install native audio dependencies
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+        timeout-minutes: 15
+        run: python3 .github/scripts/apt_install.py libasound2-dev
       # Every `[[bench]]` target of every package the pull request can affect,
       # not one of them: naming one would let the others rot unnoticed, which
       # is the exact failure this job exists to catch. A package `changes` did
@@ -832,7 +838,8 @@ jobs:
         with:
           cache-on-failure: true
       - name: Install native audio dependencies
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+        timeout-minutes: 15
+        run: python3 .github/scripts/apt_install.py libasound2-dev
       - name: Compile ${{ matrix.bench }}
         run: cargo bench -p ${{ matrix.package }} --bench ${{ matrix.bench }} --no-run
 

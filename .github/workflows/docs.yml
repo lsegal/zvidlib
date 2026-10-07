@@ -33,7 +33,8 @@ jobs:
         with:
           cache-on-failure: true
       - name: Install native audio dependencies
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+        timeout-minutes: 15
+        run: python3 .github/scripts/apt_install.py libasound2-dev
       # Every workspace crate, not only `zvidlib`: its pages inline the
       # subcrates' items, and `-D warnings` is what keeps their intra-doc links
       # from rotting in the crates docs.rs documents on their own (#604).
