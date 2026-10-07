@@ -12,6 +12,8 @@
 //! and keeps whichever costs less in the frames' own rate-distortion terms,
 //! the weighted key frame only by a margin.
 
+use std::sync::{Mutex, PoisonError};
+
 use crate::context::FrameContext;
 use crate::frame::{CodingTools, FrameEncoder, Geometry, ModeInfo, Picture, lambda};
 
@@ -140,26 +142,40 @@ impl StreamState {
     ///
     /// Only the key frame's lambda differs between the two; the frames after
     /// it code as they otherwise would, from whichever key frame is kept.
+    ///
+    /// The two codings share nothing but the state they start from, so they
+    /// run side by side (issue #628): the key frames first, so that a weight
+    /// that changes nothing codes the frames after it only once, then the
+    /// frames after each key frame. Either coding is exactly what it would be
+    /// alone.
     pub(super) fn code_group_start(
         &mut self,
         settings: &StreamSettings,
         pictures: &[Picture],
     ) -> Vec<CodedFrame> {
-        let start = self.clone();
-        let unweighted = self.code_frames(settings, pictures, true);
-        // A key frame coded alone has nothing to keep its detail for, and
-        // where the weight changes nothing the frames after it would code the
-        // same either way.
+        // A key frame coded alone has nothing to keep its detail for.
         if pictures.len() < 2 {
+            return self.code_frames(settings, pictures, true);
+        }
+        let mut weighted_state = self.clone();
+        let (weighted_key, unweighted_key) = join(
+            || weighted_state.code(settings, &pictures[0], true, true),
+            || self.code(settings, &pictures[0], true, false),
+        );
+        let mut unweighted = vec![unweighted_key];
+        // Where the weight changes nothing, the frames after the key frame
+        // would code the same either way.
+        if weighted_key.data == unweighted[0].data {
+            unweighted.extend(self.code_frames(settings, &pictures[1..], false));
             return unweighted;
         }
-        let mut weighted_state = start;
-        let key = weighted_state.code(settings, &pictures[0], true, true);
-        if key.data == unweighted[0].data {
-            return unweighted;
-        }
-        let mut weighted = vec![key];
-        weighted.extend(weighted_state.code_frames(settings, &pictures[1..], false));
+        let mut weighted = vec![weighted_key];
+        let (weighted_rest, unweighted_rest) = join(
+            || weighted_state.code_frames(settings, &pictures[1..], false),
+            || self.code_frames(settings, &pictures[1..], false),
+        );
+        weighted.extend(weighted_rest);
+        unweighted.extend(unweighted_rest);
         let lambda = lambda(settings.base_q_idx);
         let cost = |frames: &[CodedFrame]| {
             frames
@@ -189,6 +205,39 @@ impl StreamState {
             .map(|(index, picture)| self.code(settings, picture, key_first && index == 0, false))
             .collect()
     }
+}
+
+/// Runs `first` and `second`, `first` on a thread of its own where the host
+/// has more than one core and the thread starts, and after `second`
+/// otherwise.
+fn join<A: Send, B>(first: impl FnOnce() -> A + Send, second: impl FnOnce() -> B) -> (A, B) {
+    // Taken by the thread; left in place if it does not start.
+    let first = Mutex::new(Some(first));
+    let (threaded, second) = std::thread::scope(|scope| {
+        let task = || {
+            let first = first.lock().ok()?.take()?;
+            Some(first())
+        };
+        let handle = std::thread::available_parallelism()
+            .is_ok_and(|cores| cores.get() > 1)
+            .then(|| std::thread::Builder::new().spawn_scoped(scope, task).ok())
+            .flatten();
+        let second = second();
+        let threaded = handle.and_then(|handle| {
+            handle
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        });
+        (threaded, second)
+    });
+    let first = threaded.unwrap_or_else(|| {
+        let first = first
+            .into_inner()
+            .unwrap_or_else(PoisonError::into_inner)
+            .expect("`first` is left in place when its thread does not run it");
+        first()
+    });
+    (first, second)
 }
 
 /// The squared error of `reconstruction` against `source` over the visible
