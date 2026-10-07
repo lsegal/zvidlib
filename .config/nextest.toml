@@ -1,6 +1,6 @@
 # cargo-nextest runs every test as its own process, in parallel across every
-# test binary (#595). That is what lets CI build the tests once and shard them
-# across runners, and it is also what undoes two things the tests relied on
+# test binary (#595). That is what lets CI run a package's tests in one go
+# (#612), and it is also what undoes two things the tests relied on
 # under `cargo test`, where a binary's tests were threads of one process and
 # the binaries ran one after another. The overrides below put both back.
 #
@@ -36,9 +36,9 @@ filter = '''
 threads-required = 'num-cpus'
 
 [profile.ci]
-# Every failure in a shard is worth seeing in one run, not just the first.
+# Every failure in a job is worth seeing in one run, not just the first.
 fail-fast = false
-# Failures print where they happen and again in the summary, so a failed shard's
+# Failures print where they happen and again in the summary, so a failed job's
 # reason is at the bottom of its log.
 failure-output = 'immediate-final'
 

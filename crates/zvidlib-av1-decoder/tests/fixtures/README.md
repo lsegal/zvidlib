@@ -23,7 +23,7 @@ decoder against every one of them. `big_buck_bunny_av1_rgba.sha256` carries the
 `Rgba8` digests of the same libdav1d frames after this crate's BT.601
 `convert_to_rgba8` (`crates/zvidlib-av1/src/av1_filters.rs`), the conversion
 `native_av1_video_decoder_factory` applies to BT.601 (`matrix_coefficients` 6)
-streams; `tests/codec_conformance.rs` and the browser fallback test in
+streams; `tests/av1_conformance.rs` and the browser fallback test in
 `src/web_decoder.rs` compare the factory's output with them.
 
 `av1_main10_64x64.mp4` is a single 64x64 10-bit 4:2:0 AV1 Main frame, which
@@ -111,7 +111,7 @@ ffmpeg -c:v libvpx-vp9 -i vp9_bbb_256x144.mp4 -fps_mode passthrough \
 ```
 
 `crates/zvidlib-vp9-decoder/src/vp9_dec/tests.rs` compares the decoder's YUV output with the first and
-`tests/codec_conformance.rs` and the browser fallback test in
+`tests/av1_conformance.rs` and the browser fallback test in
 `src/web_decoder.rs` the factory's RGBA output with the second. As above, FFmpeg
 and libvpx are only the offline fixture generators and are not build, test, or
 runtime dependencies.

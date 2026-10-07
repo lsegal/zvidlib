@@ -87,7 +87,8 @@ fn native_av1_decoder_conforms_for_sequential_reverse_and_alternating_seeks() {
     // This low-overhead OBU sequence (also exercised directly against
     // `Av1InterDecoder` in `crates/zvidlib-av1/tests/av1_inter_decoder.rs`) is generated from
     // the normative AV1 syntax tables and independently decoded by
-    // FFmpeg/libdav1d; see `tests/fixtures/codec/README.md`. It contains a
+    // FFmpeg/libdav1d; see `crates/zvidlib-av1/tests/fixtures/README.md`. It
+    // contains a
     // key frame, two refreshed inter references, LAST/LAST2 average
     // compound prediction, and a show-existing-frame header for the
     // retained compound frame. The RGBA digests below are the canonical
@@ -184,7 +185,7 @@ fn native_av1_decoder_matches_an_independent_decode_of_the_colour_sample() {
     // the registered factory. The digests are FFmpeg/libdav1d's decode of the
     // same track converted to RGBA by this crate's BT.601 `convert_to_rgba8`,
     // the conversion the factory itself applies; see
-    // `tests/fixtures/codec/README.md`. The track has a single random-access
+    // `tests/fixtures/README.md`. The track has a single random-access
     // point, so `verify_video_decoder_conformance`'s reverse pattern would
     // re-decode it from the start for nearly every frame; every frame is
     // checked in order instead, followed by backward and forward seeks.

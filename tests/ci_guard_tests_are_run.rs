@@ -13,11 +13,11 @@
 //! comment beside the list is where the reason each guard exists is written,
 //! and `--test 'ci_*'` would leave nothing saying what any of them protects.
 //! The list used to be one `cargo test --test <name>` step per test; since
-//! #595 it is the `--test` arguments of the `cargo nextest archive` that the
-//! test shards run in full, and since the workspace split (#604) those are
+//! #595 it is run by cargo-nextest, and since the workspace split (#604) it is
 //! written as `targets <package> --test <name> ...` lines, each adding a
-//! package's targets to that archive when the pull request can affect the
-//! package. What made the omission possible was that nothing compared the two
+//! package's targets to the `cargo nextest run` of the test job when the pull
+//! request can affect the package - on Linux, the job's leg for that package
+//! (#612). What made the omission possible was that nothing compared the two
 //! lists, so that is what this does: the `tests/ci_*.rs` files and the
 //! `--test` names of the cargo invocations that *run* tests in
 //! `.github/workflows/` have to be the same set, and a guard added without a
@@ -59,7 +59,7 @@ fn workflow_files() -> Vec<PathBuf> {
 
 /// Integration tests that no workflow runs, each with the reason it is left out.
 ///
-/// Every test in these files is `#[ignore]`d, so naming one in an archive would
+/// Every test in these files is `#[ignore]`d, so naming one in a test job would
 /// only add a binary whose every test is skipped. A file that gains a test that
 /// asserts something belongs in a workflow instead.
 /// [`every_test_left_out_of_ci_exists_and_is_not_run`] fails if a workflow
@@ -156,22 +156,19 @@ fn commands(source: &str) -> Vec<String> {
 /// Whether a command runs the test targets it names, rather than only
 /// building them.
 ///
-/// `cargo test` and `cargo nextest run` run what they build.
-/// `cargo nextest archive` does not by itself, but the shards in `ci.yml` run
-/// every binary in the archive, so naming a target there is what runs it, and
-/// a `targets <package> ...` line is how a target is named there.
-/// `cargo build --test`, `cargo check` and `cargo clippy` only compile it,
+/// `cargo test` and `cargo nextest run` run what they build, and a
+/// `targets <package> ...` line is how the test jobs in `ci.yml` name a target
+/// for their `cargo nextest run`. `cargo nextest archive` only packs the
+/// binaries; nothing in CI runs an archive since the per-package test jobs
+/// replaced the shards that did (#612). `cargo build --test`, `cargo check`
+/// and `cargo clippy` only compile it,
 /// which is exactly the state these guards sat in unnoticed, and `node --test`
 /// takes a path rather than a cargo target.
 fn runs_tests(command: &str) -> bool {
     command.starts_with("targets ")
-        || [
-            "cargo test ",
-            "cargo nextest run ",
-            "cargo nextest archive ",
-        ]
-        .iter()
-        .any(|invocation| command.contains(invocation))
+        || ["cargo test ", "cargo nextest run "]
+            .iter()
+            .any(|invocation| command.contains(invocation))
 }
 
 /// Every target named by a `--test <name>` argument of a command in `source`
@@ -216,8 +213,8 @@ fn every_ci_guard_test_is_run_by_a_workflow() {
     assert!(
         unrun.is_empty(),
         "these tests/ci_*.rs guards are not named by a `--test <name>` of any cargo \
-         invocation in .github/workflows/ that runs tests - the `cargo nextest archive` \
-         the test shards run, or a `cargo test` - so they are compiled and never \
+         invocation in .github/workflows/ that runs tests - a `targets` line of a test \
+         job, a `cargo nextest run` or a `cargo test` - so they are compiled and never \
          executed: {unrun:?}"
     );
 }
@@ -235,8 +232,8 @@ fn every_integration_test_is_run_by_a_workflow_or_left_out_with_a_reason() {
         unrun.is_empty(),
         "these packages' tests/*.rs files are not named by a `--test <name>` of any cargo \
          invocation in .github/workflows/ that runs tests, so they are compiled and \
-         never executed (#599). Name each one in the archive of the job that should \
-         run it, or add it to NOT_RUN_BY_CI with the reason it is left out: {unrun:?}"
+         never executed (#599). Name each one on the `targets` line of the job that \
+         should run it, or add it to NOT_RUN_BY_CI with the reason it is left out: {unrun:?}"
     );
 }
 
@@ -309,7 +306,8 @@ fn package_targets(source: &str) -> Vec<(String, String)> {
 /// A test listed under the wrong package is never built: `-p` selects the
 /// package and `--test` then names a target cargo looks for among the selected
 /// packages, so one under a package the pull request did not select fails the
-/// archive, and on `main` it would be built only by coincidence.
+/// run, and on Linux, where each package runs in a leg of its own, it fails
+/// every leg of the package it is listed under (#612).
 #[test]
 fn every_test_a_workflow_runs_belongs_to_the_package_it_is_listed_under() {
     let packages = workspace::packages();
@@ -342,10 +340,10 @@ fn only_a_command_that_runs_a_test_counts_as_running_it() {
       - run: cargo clippy --all-targets --test ci_only_linted
       - run: node --test 'examples/*.test.js'
       - run: cargo test --features native --test ci_run_by_cargo_test
+      - run: cargo nextest archive --lib --test ci_only_archived
       - run: |
-          cargo nextest archive --features native --lib \
-            --test ci_on_a_continuation_line \
-            --archive-file nextest-archive.tar.zst
+          cargo nextest run --profile ci --lib \
+            --test ci_on_a_continuation_line
       - run: |
           targets zvidlib \
             --test ci_listed_for_a_package

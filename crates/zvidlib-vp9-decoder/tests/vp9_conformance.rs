@@ -35,7 +35,7 @@ fn block_on<T>(future: impl Future<Output = T>) -> T {
 /// unspecified), for sequential, reverse and alternating access. The
 /// 256x144 track's superframes carry hidden alternate reference frames and
 /// it has two random-access points; the 250x142 one has edges that are not
-/// a multiple of 8. See `tests/fixtures/codec/README.md`.
+/// a multiple of 8. See `tests/fixtures/README.md`.
 #[test]
 fn native_vp9_decoder_conforms_to_libvpx_for_sequential_reverse_and_alternating_seeks() {
     let limits = Limits::default();
