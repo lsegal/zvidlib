@@ -2089,7 +2089,8 @@ impl<'a> FrameEncoder<'a> {
     }
 
     /// Finds the whole-sample motion vector with the smallest luma SAD,
-    /// starting from `starts` and the frame's projected motion.
+    /// starting from `starts` and the frame's projected motion, and returns
+    /// it with its SAD.
     fn search_motion(
         &self,
         reference: &Picture,
@@ -2097,7 +2098,7 @@ impl<'a> FrameEncoder<'a> {
         mi_col: usize,
         size: usize,
         starts: [Mv; 2],
-    ) -> Mv {
+    ) -> (Mv, u32) {
         // Kept within 64 samples of the block so every vector stays in the
         // cheap motion vector classes.
         let range = 64 * 8;
@@ -2118,6 +2119,10 @@ impl<'a> FrameEncoder<'a> {
         }
         for step in [8, 4, 2, 1] {
             let delta = step * 8;
+            // A vector tried before has a SAD of at least the best so far, so
+            // it cannot win and is not tried again: after a move, those
+            // around the previous center.
+            let mut previous: Option<Mv> = None;
             for _ in 0..16 {
                 let mut improved = false;
                 let center = best_mv;
@@ -2135,7 +2140,13 @@ impl<'a> FrameEncoder<'a> {
                         row: center.row + row * delta,
                         col: center.col + col * delta,
                     };
-                    if candidate.row.abs() > range || candidate.col.abs() > range {
+                    if candidate.row.abs() > range
+                        || candidate.col.abs() > range
+                        || previous.is_some_and(|previous| {
+                            (candidate.row - previous.row).abs() <= delta
+                                && (candidate.col - previous.col).abs() <= delta
+                        })
+                    {
                         continue;
                     }
                     let sad = self.luma_sad(reference, mi_row, mi_col, size, candidate, best_sad);
@@ -2148,9 +2159,11 @@ impl<'a> FrameEncoder<'a> {
                 if !improved {
                     break;
                 }
+                previous = Some(center);
             }
         }
-        best_mv
+        // The SAD of a vector that won is whole: it came in under the limit.
+        (best_mv, best_sad)
     }
 
     /// The cheapest mode that codes `mv`, and its bits with the intra/inter
@@ -2236,8 +2249,25 @@ impl<'a> FrameEncoder<'a> {
             2
         };
         let error = |mv: Mv| self.luma_prediction_error(reference, mi_row, mi_col, size, mv);
-        let bits =
-            |mv: Mv| self.lambda * self.inter_mode(neighbors, mode_context, candidates, mv).1;
+        // A vector other than the zero and reference ones codes only as
+        // `NEWMV`, whose symbols before the vector are the same for every
+        // candidate: they are costed once, and each vector continues the sum
+        // exactly as costing all of them does.
+        let new_mv_prefix = cost(|sink| {
+            self.intra_inter_symbol(sink, neighbors, true);
+            self.inter_mode_symbols(sink, neighbors, mode_context, NEWMV);
+        });
+        let bits = |mv: Mv| {
+            let rate = if [Mv::default(), candidates[0], candidates[1]].contains(&mv) {
+                self.inter_mode(neighbors, mode_context, candidates, mv).1
+            } else {
+                let mut sink = BitCost::default();
+                sink.0 = new_mv_prefix;
+                self.new_mv_symbols(&mut sink, mv, candidates[0]);
+                sink.0
+            };
+            self.lambda * rate
+        };
         let searched_error = error(searched);
         let mut best_mv = searched;
         let mut best_error = searched_error;
@@ -2302,10 +2332,10 @@ impl<'a> FrameEncoder<'a> {
         let (candidates, mode_context) = self.mv_references(mi_row, mi_col, bsl);
         let [nearest, near] = candidates;
         let size = 8 << bsl;
-        let searched = self.search_motion(reference, mi_row, mi_col, size, candidates);
+        let (searched, searched_sad) =
+            self.search_motion(reference, mi_row, mi_col, size, candidates);
         // Also try the reference vector that predicts best, if it predicts
         // nearly as well as the searched one: it codes in fewer bits.
-        let searched_sad = self.luma_sad(reference, mi_row, mi_col, size, searched, u32::MAX);
         let mut vectors = vec![searched];
         if self.tools.sub_sample_motion {
             let refined = self.refine_motion(
@@ -2651,6 +2681,21 @@ impl<'a> FrameEncoder<'a> {
         mv: Mv,
         nearest: Mv,
     ) {
+        self.inter_mode_symbols(sink, neighbors, mode_context, mode);
+        if mode == NEWMV {
+            self.new_mv_symbols(sink, mv, nearest);
+        }
+    }
+
+    /// The reference and the inter mode, the symbols [`Self::inter_symbols`]
+    /// starts with.
+    fn inter_mode_symbols<S: BoolSink>(
+        &self,
+        sink: &mut S,
+        neighbors: Neighbors,
+        mode_context: usize,
+        mode: u8,
+    ) {
         // A single LAST_FRAME reference: the first single_ref bit is zero.
         let single_ref = single_ref_context(neighbors);
         sink.write(false, self.context.single_ref[single_ref * 2]);
@@ -2663,17 +2708,19 @@ impl<'a> FrameEncoder<'a> {
             counts.single_ref[single_ref][0] += 1;
             counts.inter_mode[mode_context][usize::from(mode - NEARESTMV)] += 1;
         }
-        if mode == NEWMV {
-            write_mv(
-                sink,
-                self.context,
-                Mv {
-                    row: mv.row - nearest.row,
-                    col: mv.col - nearest.col,
-                },
-                self.allow_high_precision_mv && use_mv_hp(nearest),
-            );
-        }
+    }
+
+    /// The vector of a `NEWMV` block, as its difference from `nearest`.
+    fn new_mv_symbols<S: BoolSink>(&self, sink: &mut S, mv: Mv, nearest: Mv) {
+        write_mv(
+            sink,
+            self.context,
+            Mv {
+                row: mv.row - nearest.row,
+                col: mv.col - nearest.col,
+            },
+            self.allow_high_precision_mv && use_mv_hp(nearest),
+        );
     }
 
     fn write_mode_info(
