@@ -1,21 +1,23 @@
 //! Guards against a CI guard test that no CI job runs.
 //!
-//! The `Rust checks` job names its integration tests one
-//! `cargo test --test <name>` step at a time - there is no blanket
-//! `cargo test --tests` - so a test file that is not given a step is compiled
-//! by `cargo check --all-targets`, passes review as a test that exists, and is
+//! CI names the integration tests it runs one `--test <name>` at a time -
+//! there is no blanket `--tests` - so a test file that is not named is compiled
+//! by `cargo clippy --all-targets`, passes review as a test that exists, and is
 //! never executed. `ci_concurrency_spares_main` and
 //! `ci_staleness_report_sees_markdown_changes` sat that way from the day they
 //! landed (#464): both guard arrangements whose own failure mode is silent, and
 //! neither would have failed CI if the arrangement it pins were undone.
 //!
-//! The per-test steps are kept rather than collapsed into one glob step,
-//! because each step's comment is where the reason that guard exists is
-//! written, and `cargo test --test 'ci_*'` would leave a list of names with
-//! nothing saying what any of them protects. What made the omission possible
-//! was that nothing compared the two lists, so that is what this does: the
-//! `tests/ci_*.rs` files and the `--test` names in `.github/workflows/` have to
-//! be the same set, and a guard added without a step fails here.
+//! The names are kept explicit rather than collapsed into a glob, because the
+//! comment beside the list is where the reason each guard exists is written,
+//! and `--test 'ci_*'` would leave nothing saying what any of them protects.
+//! The list used to be one `cargo test --test <name>` step per test; since
+//! #595 it is the `--test` arguments of the `cargo nextest archive` that the
+//! test shards run in full. What made the omission possible was that nothing
+//! compared the two lists, so that is what this does: the `tests/ci_*.rs`
+//! files and the `--test` names of the cargo invocations that *run* tests in
+//! `.github/workflows/` have to be the same set, and a guard added without a
+//! name there fails here.
 //!
 //! Deliberately line-based rather than a YAML parse, for the same reason
 //! `ci_workflows_cache_cargo` is: the alternative is a `serde_yaml` dependency
@@ -69,29 +71,67 @@ fn ci_guard_targets() -> BTreeSet<String> {
     targets
 }
 
-/// Every target named by a `--test <name>` argument anywhere in the workflows.
+/// The shell commands of a workflow, one string per command.
 ///
-/// A name is taken from the argument that follows `--test` on a line invoking
-/// cargo, so a step is counted however its command is otherwise spelled. The
-/// prose in the comments beside those steps is not - a comment mentioning a
-/// test by name is what made these two look covered while they were not - and
-/// neither is `node --test`, which takes a path rather than a cargo target.
-fn targets_run_by_workflows() -> BTreeSet<String> {
+/// A command continued onto the next line with a trailing `\` is joined back
+/// into one, so a `--test` on a continuation line is read as part of the
+/// command it belongs to. Comment lines are skipped: the prose beside a step
+/// mentioning a test by name is what made two guards look covered while they
+/// were not (#464).
+fn commands(source: &str) -> Vec<String> {
+    let mut commands = Vec::new();
+    let mut pending = String::new();
+    for line in source.lines() {
+        let code = line.trim();
+        if code.starts_with('#') {
+            continue;
+        }
+        let (code, continued) = match code.strip_suffix('\') {
+            Some(head) => (head.trim_end(), true),
+            None => (code, false),
+        };
+        if !pending.is_empty() {
+            pending.push(' ');
+        }
+        pending.push_str(code);
+        if !continued {
+            commands.push(std::mem::take(&mut pending));
+        }
+    }
+    if !pending.is_empty() {
+        commands.push(pending);
+    }
+    commands
+}
+
+/// Whether a command runs the test targets it names, rather than only
+/// building them.
+///
+/// `cargo test` and `cargo nextest run` run what they build.
+/// `cargo nextest archive` does not by itself, but the shards in `ci.yml` run
+/// every binary in the archive, so naming a target there is what runs it.
+/// `cargo build --test`, `cargo check` and `cargo clippy` only compile it,
+/// which is exactly the state these guards sat in unnoticed, and `node --test`
+/// takes a path rather than a cargo target.
+fn runs_tests(command: &str) -> bool {
+    ["cargo test ", "cargo nextest run ", "cargo nextest archive "]
+        .iter()
+        .any(|invocation| command.contains(invocation))
+}
+
+/// Every target named by a `--test <name>` argument of a command in `source`
+/// that runs it.
+fn targets_run_by(source: &str) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
-    for path in workflow_files() {
-        let source = std::fs::read_to_string(&path)
-            .unwrap_or_else(|error| panic!("reading {}: {error}", path.display()));
-        for line in source.lines() {
-            let code = line.trim_start();
-            if code.starts_with('#') || !code.contains("cargo ") {
-                continue;
-            }
-            let mut words = code.split_whitespace();
-            while let Some(word) = words.next() {
-                if word == "--test" {
-                    if let Some(name) = words.next() {
-                        names.insert(name.trim_matches(['"', '\'']).to_string());
-                    }
+    for command in commands(source) {
+        if !runs_tests(&command) {
+            continue;
+        }
+        let mut words = command.split_whitespace();
+        while let Some(word) = words.next() {
+            if word == "--test" {
+                if let Some(name) = words.next() {
+                    names.insert(name.trim_matches(['"', '\'']).to_string());
                 }
             }
         }
@@ -99,8 +139,19 @@ fn targets_run_by_workflows() -> BTreeSet<String> {
     names
 }
 
+/// Every target run by a `--test <name>` argument anywhere in the workflows.
+fn targets_run_by_workflows() -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for path in workflow_files() {
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("reading {}: {error}", path.display()));
+        names.extend(targets_run_by(&source));
+    }
+    names
+}
+
 #[test]
-fn every_ci_guard_test_is_named_by_a_workflow_step() {
+fn every_ci_guard_test_is_run_by_a_workflow() {
     let run = targets_run_by_workflows();
     let unrun: Vec<String> = ci_guard_targets()
         .into_iter()
@@ -109,8 +160,10 @@ fn every_ci_guard_test_is_named_by_a_workflow_step() {
 
     assert!(
         unrun.is_empty(),
-        "these tests/ci_*.rs guards have no `cargo test --test <name>` step in \
-         .github/workflows/, so they are compiled and never executed: {unrun:?}"
+        "these tests/ci_*.rs guards are not named by a `--test <name>` of any cargo \
+         invocation in .github/workflows/ that runs tests - the `cargo nextest archive` \
+         the test shards run, or a `cargo test` - so they are compiled and never \
+         executed: {unrun:?}"
     );
 }
 
@@ -124,7 +177,27 @@ fn every_test_a_workflow_runs_exists() {
 
     assert!(
         missing.is_empty(),
-        "these `cargo test --test <name>` steps in .github/workflows/ name a \
+        "these `--test <name>` arguments in .github/workflows/ name a \
          test that does not exist under tests/: {missing:?}"
     );
+}
+
+/// The reader itself, on workflow text written for it: a guard that is only
+/// compiled, or only mentioned in a comment, must not count as run, and one
+/// named on a continuation line of a command that runs it must.
+#[test]
+fn only_a_command_that_runs_a_test_counts_as_running_it() {
+    let workflow = r#"
+      # `--test ci_in_a_comment` is prose, not a command.
+      - run: cargo build --test ci_only_built
+      - run: cargo clippy --all-targets --test ci_only_linted
+      - run: node --test 'examples/*.test.js'
+      - run: cargo test --features native --test ci_run_by_cargo_test
+      - run: |
+          cargo nextest archive --features native --lib \
+            --test ci_on_a_continuation_line \
+            --archive-file nextest-archive.tar.zst
+"#;
+    let run: Vec<String> = targets_run_by(workflow).into_iter().collect();
+    assert_eq!(run, ["ci_on_a_continuation_line", "ci_run_by_cargo_test"]);
 }

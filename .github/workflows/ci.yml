@@ -44,6 +44,13 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # The Rust tests used to run here and in `native-platforms` as one
+  # `cargo test` step after another, each a separate binary that waited for the
+  # one before it, and the two jobs took twelve minutes apiece (#595). They are
+  # now built once per platform into a `cargo nextest archive` and run in
+  # parallel across every binary, split over a matrix of shards; see
+  # `rust-tests-build` below. What is left here is the part of the old job that
+  # is not a Rust test: formatting, lints and the scripts the workflow uses.
   rust:
     name: Rust checks
     runs-on: ubuntu-latest
@@ -63,64 +70,12 @@ jobs:
           cache-on-failure: true
       - name: Install native audio dependencies
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
-      # The VP9 encoder's tests require libvpx and FFmpeg's own VP9 decoder to
-      # reproduce its reconstruction exactly (#528). They skip themselves where
-      # ffmpeg is missing, so install it before the library units run.
-      - name: Install ffmpeg for independent VP9 decoding
-        run: sudo apt-get install -y ffmpeg
       - name: Check formatting
         run: cargo fmt --all -- --check
-      - name: Check native target
-        run: cargo check --all-targets --features native
+      # Clippy type-checks every target on its way to linting it, so a separate
+      # `cargo check --all-targets` before it only did the same work twice.
       - name: Lint native target
         run: cargo clippy --all-targets --features native -- -D warnings
-      # The checks above only cover files some target actually compiles, so an
-      # undeclared file under benches/ passes them by being skipped. This asserts
-      # every one of them is reachable from a [[bench]] target.
-      - name: Check every bench source is compiled
-        run: cargo test --features native --test bench_sources_compile
-      # Criterion keys a group by its name alone, so two targets claiming one
-      # name overwrite each other under target/criterion/ and a collected
-      # baseline sees whichever ran second. That is silent in a bench log and
-      # only surfaces as a committed table row that moved for no reason a commit
-      # explains, which is what issue #414 turned out to be.
-      - name: Check no two bench targets claim one criterion group
-        run: cargo test --features native --test bench_group_names_are_unique
-      # The caching this workflow depends on is opt-in per job, so a job added
-      # without it is slow in a way nothing else here would report.
-      - name: Check every cargo CI job is cached
-        run: cargo test --features native --test ci_workflows_cache_cargo
-      # `ci.yml` and `baseline-staleness.yml` spare a `main` push from
-      # cancellation in their group key rather than with `cancel-in-progress`,
-      # because Actions reads that key's value as a string and every non-empty
-      # string is truthy - so an expression there cancelled the `main` runs the
-      # comment beside it documented as never cancelled (#451). A cancelled
-      # `main` run is a hole in the benchmark baseline chain and reports itself
-      # as nothing at all, so the arrangement needs a test rather than a reader.
-      - name: Check the concurrency groups still spare a main push
-        run: cargo test --features native --test ci_concurrency_spares_main
-      # `baseline-staleness.yml` names `benches/README.md` twice - once in the
-      # `push` trigger's `paths:` and once in the `pull_request` trigger's - and
-      # a report that skips itself on exactly the change it exists to check is
-      # silent by construction (#449). This asserts the two lists stay in step
-      # and that the workflow keeps no `paths-ignore` of its own.
-      - name: Check the staleness report still sees markdown changes
-        run: cargo test --features native --test ci_staleness_report_sees_markdown_changes
-      # The steps above are one per test by design - each carries the reason its
-      # guard exists - and that is exactly how #464 happened: two of them had no
-      # step and were compiled but never run. This closes that by asserting the
-      # steps and the `tests/ci_*.rs` files are the same set, so a guard added
-      # without a step fails here instead of passing silently forever.
-      - name: Check every CI guard test is given a step
-        run: cargo test --features native --test ci_guard_tests_are_run
-      # The timed benchmark run names its `[[bench]]` targets in a matrix, which
-      # is a second copy of what `Cargo.toml` declares. A target added to the
-      # manifest and not the matrix still compiles on every PR and is simply
-      # never measured again (#459), and the same test pins the
-      # `rm -rf target/criterion` that keeps a restored build cache from making
-      # criterion log an error per benchmark.
-      - name: Check the benchmark matrix measures every target
-        run: cargo test --features native --test ci_benchmarks_run_every_target
       # `criterion_baseline.py` is where a benchmark regression threshold is
       # justified from, and it runs in a job that takes two hours to reach it.
       # Standard library only, so this needs no install step. Its `table`
@@ -128,158 +83,27 @@ jobs:
       # table with a column silently missing rather than a crash - the arm name
       # it matched drifted from the one `SimdIsa` prints and every SSE4.1
       # measurement was dropped - and nothing else in CI executes it.
-      - name: Test the benchmark baseline script
-        run: python3 -m unittest discover -s .github/scripts -v
+      #
       # The staleness report used to run here and is now `baseline-staleness.yml`:
       # its whole input is `benches/README.md`, and the `paths-ignore` above
       # meant the changes that edit that file were exactly the changes that
       # skipped it (#449). The unit tests of the script it runs stay here,
       # since those depend on the script rather than on the tables.
-      - name: Test AV1 SIMD kernels against the scalar path
-        run: cargo test --features native --lib av1_simd -- --nocapture
-      # The kernels being bit-exact is not the same as their being fast, and
-      # `--lib av1_simd` above only proves the first. `#[target_feature]` widens
-      # the function it is written on and nothing it calls, so an `av1_simd`
-      # kernel the inliner declines to absorb into its wrapper is compiled at
-      # the baseline instruction set and runs several times slower than the
-      # scalar code it replaces, with every test still passing (#336). This
-      # greps that out of the emitted assembly. One x86_64 host is enough and
-      # this job is one: on the matrix's aarch64 macOS runner NEON is in the
-      # baseline, so a kernel that lost its attribute still compiles to NEON and
-      # leaves no trace. CI runs no x86_64 macOS host (#593), and one would
-      # only repeat what runs here.
+      - name: Test the benchmark baseline script
+        run: python3 -m unittest discover -s .github/scripts -v
+      # The AV1 SIMD kernels being bit-exact is not the same as their being
+      # fast, and the `av1_simd` unit tests only prove the first.
+      # `#[target_feature]` widens the function it is written on and nothing it
+      # calls, so an `av1_simd` kernel the inliner declines to absorb into its
+      # wrapper is compiled at the baseline instruction set and runs several
+      # times slower than the scalar code it replaces, with every test still
+      # passing (#336). This greps that out of the emitted assembly. One x86_64
+      # host is enough and this job is one: on the matrix's aarch64 macOS runner
+      # NEON is in the baseline, so a kernel that lost its attribute still
+      # compiles to NEON and leaves no trace. CI runs no x86_64 macOS host
+      # (#593), and one would only repeat what runs here.
       - name: Check the SIMD kernels kept their target feature
         run: python3 .github/scripts/check_simd_target_features.py build
-      - name: Test library units
-        run: cargo test --features native --lib
-      # The VP9 decoder is held bit-exact to libvpx on every profile 0 test
-      # vector libvpx's own test suite decodes (#527): hidden frames,
-      # superframes, show_existing_frame, intra-only frames, scaled reference
-      # frames, tiles, frame sizes from 2x2 to 1920x1080 and so on. The vectors
-      # and their per-frame MD5s come from the WebM project's test-data bucket,
-      # about 27 MB in all, so they are cached between runs, keyed on the list
-      # of names the test reads. One host is enough: this one runs the widest
-      # vector kernels it detects, and every other instruction set is held to
-      # the scalar reference by the `vp9_simd` unit tests and the per-ISA
-      # fixture decode in the library units, which every native host runs
-      # (#570).
-      - name: Cache the libvpx VP9 test vectors
-        uses: actions/cache@v4
-        with:
-          path: vp9-test-vectors
-          key: libvpx-vp9-test-vectors-${{ hashFiles('tests/fixtures/codec/libvpx_vp9_test_vectors.txt') }}
-      - name: Download the libvpx VP9 test vectors
-        run: |
-          mkdir -p vp9-test-vectors
-          while read -r name; do
-            for file in "$name" "$name.md5"; do
-              if [ ! -f "vp9-test-vectors/$file" ]; then
-                curl -sSfL --retry 3 -o "vp9-test-vectors/$file" \
-                  "https://storage.googleapis.com/downloads.webmproject.org/test_data/libvpx/$file"
-              fi
-            done
-          done < tests/fixtures/codec/libvpx_vp9_test_vectors.txt
-      - name: Test VP9 decoding against the libvpx test vectors
-        env:
-          ZVIDLIB_VP9_VECTORS: ${{ github.workspace }}/vp9-test-vectors
-        run: cargo test --features native --lib vp9_dec::tests::libvpx_test_vectors -- --ignored --nocapture
-      # Pins no-cover output byte for byte and round-trips JPEG and PNG cover
-      # art through `Mp4Muxer` and `Mp4Demuxer` (#502), and checks the cover
-      # `MediaOutput` generates from a frame (#510); the ffprobe and ffmpeg
-      # checks in it skip themselves where those tools are not installed.
-      - name: Test MP4 cover art
-        run: cargo test --features native --test mp4_cover_art
-      # The twelve official Opus decoder test vectors (RFC 8251) are 75 MB, so
-      # they are downloaded rather than committed, and cached so most runs do
-      # not download them at all. The key names the file; it never changes.
-      - name: Cache the Opus RFC 8251 test vectors
-        id: opus-test-vectors
-        uses: actions/cache@v4
-        with:
-          path: ${{ runner.temp }}/opus_newvectors
-          key: opus-testvectors-rfc8251
-      - name: Download the Opus RFC 8251 test vectors
-        if: steps.opus-test-vectors.outputs.cache-hit != 'true'
-        run: |
-          curl -sSfL https://opus-codec.org/static/testvectors/opus_testvectors-rfc8251.tar.gz \
-            | tar -xz -C "$RUNNER_TEMP"
-      # Holds the Opus decoder to libopus: every RFC 8251 vector, decoded in
-      # stereo and in mono, must pass `opus_compare` as the RFC requires, and
-      # one libopus-encoded MP4 per coding mode must decode to libopus's own
-      # output. It also pins exact-length reads through pre-skip and end
-      # trimming, reads after a seek, and the native encoder's round trip
-      # (#524).
-      - name: Test Opus decode and encode
-        env:
-          ZVIDLIB_OPUS_TEST_VECTORS: ${{ runner.temp }}/opus_newvectors
-        run: cargo test --features native --test opus_codec
-      # Holds the Vorbis decoder to libvorbis's own output, short blocks and
-      # surround streams included (#547), and pins packet durations read from the setup header,
-      # bit-identical reads after a seek, and the native encoder's exact-length
-      # round trip (#524). The encoder's packets are pinned to libvorbis's bit
-      # for bit by the library unit tests above.
-      - name: Test Vorbis decode and encode
-        run: cargo test --features native --test vorbis_codec
-      # Linux has no platform AAC decoder, so `NativeAacDecoder` still runs
-      # Symphonia's here (#561), held to the same reference PCM, recorded from
-      # Symphonia, that the macOS and Windows runners hold their platform
-      # decoders to.
-      - name: Test native AAC decoding through Symphonia
-        run: cargo test --features native --test native_aac_decoder
-      # Muxes the native VP9 encoder's output as `vp09`/`vpcC`, reads it back
-      # through `Mp4Demuxer`, plays the MP4 through libvpx and FFmpeg's VP9
-      # decoder, and runs the encoder conformance vector against libvpx (#528).
-      - name: Test VP9 encoder output
-        run: cargo test --features native --test native_vp9_encoder
-      # Remuxes the bundled AV1 sample into WebM and back, asserting the WebM
-      # index hands a decoder exactly the MP4's samples and frames, and that
-      # the written Cues are seekable (#526). Its ffprobe and ffmpeg check
-      # skips itself where those tools are not installed.
-      - name: Test the WebM container
-        run: cargo test --features native --test webm_container
-      # The libvpx MD5 comparison of every VP8 test vector runs with the
-      # library units above; this checks every frame also comes back exactly
-      # through `ExactFrameReader` in reverse and alternating order, through
-      # the hidden key frame of vector 018 (#529).
-      - name: Test VP8 exact-frame decoding
-        run: cargo test --features native --test vp8_conformance
-      # Re-encodes the bundled VP8 clip with the native VP8 encoder into WebM
-      # and checks one cue per key frame, exact frames through
-      # `ExactFrameReader` in every access order, and a quality floor (#530).
-      - name: Test native VP8 encoding
-        run: cargo test --features native --test native_vp8_encoder
-      # libvpx must decode the native VP8 encoder's WebM to exactly the
-      # pictures zvidlib's decoder does, and ffmpeg must seek it through its
-      # Cues (#530). The test skips itself without ffmpeg's libvpx decoder
-      # elsewhere, so this step installs it and requires it.
-      - name: Test native VP8 encoding against libvpx
-        env:
-          ZVIDLIB_REQUIRE_LIBVPX: "1"
-        run: |
-          sudo apt-get install -y --no-install-recommends ffmpeg
-          cargo test --features native --lib vp8::tests::libvpx_decodes_the_encoders_webm_exactly -- --nocapture
-      # The VP9 factory's hardware selection (#545): with no GPU on this
-      # runner, `Prefer` must fall back to the software decoder and `Require`
-      # report hardware unavailable.
-      - name: Test VP9 hardware selection
-        run: cargo test --features native --test vp9_hardware -- --nocapture
-      - name: Test AV1 SIMD motion compensation
-        run: cargo test --features native --lib av1_mc -- --nocapture
-      # `--release` is the profile #327 was reported against: nothing about the
-      # missing rpath is profile-specific, but this is the invocation the issue
-      # names and the one the Intel benchmark column is measured with, so it is
-      # the one worth asserting launches unaided. `cargo build` first so the
-      # shipped cdylib exists for the rpath test to check as well - `cargo test`
-      # alone links the library as an rlib and never produces it. Neither step
-      # sets a `DYLD_*` variable, which is the point.
-      - name: Test the macOS Swift runtime rpath
-        if: runner.os == 'macOS'
-        run: |
-          cargo build --release --features native
-          cargo test --release --features native --test macos_swift_runtime_rpath -- --nocapture
-          cargo test --release --features native --lib
-      - name: Test native_gl example overlays
-        run: cargo test --features native --example native_gl
       # The web example makes the same scrubbing decisions `native_gl` does - the random-access
       # restart, the measured stride, the walk's next step - and its copy of them had nothing
       # asserting it (#380). Node's built-in runner, so this needs no install step and no
@@ -289,17 +113,21 @@ jobs:
       # unrun. Not the bare directory - `node --test <dir>` resolves it as a module and fails.
       - name: Test the web example's pure decisions
         run: node --test 'examples/web_canvas/*.test.js'
-      # `samples.test.js` can only check the choice, not the claim it is made from: the codec
-      # string the page probes with is written down in JavaScript, so this demuxes each declared
-      # sample and asserts the declaration against what zvidlib derives from the track itself.
-      - name: Check the web example's samples match their declarations
-        run: cargo test --features native --test web_canvas_samples_match_their_files
-      # The HEVC/AV1 engine unit tests are pure numerics, and the inter-prediction
-      # ones compare every SIMD backend the runner's CPU offers against the scalar
-      # reference — which is how the x86_64 SSE4.1/AVX2 kernels get covered at all,
-      # since the other CI hosts are aarch64.
-      - name: Test HEVC/AV1 engine unit tests (including SIMD backends)
-        run: "cargo test --features native --lib -- hevc::engine:: av1"
+
+  # The browser build shares nothing with the native one - another target,
+  # another feature set, another `target/` subtree - so it runs beside the other
+  # jobs instead of at the end of one of them.
+  wasm:
+    name: WebAssembly checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: rustup show
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       - name: Check WebAssembly target
         run: cargo check --target wasm32-unknown-unknown --no-default-features --features web
       # The published musl binary rather than `cargo install wasm-pack`, which
@@ -320,6 +148,241 @@ jobs:
         run: wasm-pack build --target web --out-dir pkg --no-default-features --features web
       - name: Test in headless Chrome
         run: wasm-pack test --headless --chrome --no-default-features --features web
+
+  # Builds every Linux test binary once, for the shards below to run (#595).
+  # `cargo test` runs a binary's tests in parallel but the binaries one at a
+  # time, and each of the old steps here was its own binary, so the job's wall
+  # clock was their sum. cargo-nextest runs each test as its own process across
+  # every binary at once, and `cargo nextest archive` packs the binaries so a
+  # shard restores them instead of compiling them again.
+  #
+  # The archive names its targets rather than taking `--tests`, because it is
+  # also the list of what runs: the shards run every target named here in full,
+  # and nothing that is not. Each `--test` was its own step before, and the
+  # reason each one is run is written here:
+  #
+  # - `bench_sources_compile`: the lints only cover files some target actually
+  #   compiles, so an undeclared file under benches/ passes them by being
+  #   skipped. This asserts every one of them is reachable from a [[bench]].
+  # - `bench_group_names_are_unique`: Criterion keys a group by its name alone,
+  #   so two targets claiming one name overwrite each other under
+  #   target/criterion/ and a collected baseline sees whichever ran second.
+  #   That is silent in a bench log and only surfaces as a committed table row
+  #   that moved for no reason a commit explains, which is what #414 was.
+  # - `ci_workflows_cache_cargo`: the caching this workflow depends on is
+  #   opt-in per job, so a job added without it is slow in a way nothing else
+  #   here would report.
+  # - `ci_concurrency_spares_main`: `ci.yml` and `baseline-staleness.yml` spare
+  #   a `main` push from cancellation in their group key rather than with
+  #   `cancel-in-progress`, because Actions reads that key's value as a string
+  #   and every non-empty string is truthy - so an expression there cancelled
+  #   the `main` runs the comment beside it documented as never cancelled
+  #   (#451). A cancelled `main` run is a hole in the benchmark baseline chain
+  #   and reports itself as nothing at all, so this needs a test, not a reader.
+  # - `ci_staleness_report_sees_markdown_changes`: `baseline-staleness.yml`
+  #   names `benches/README.md` in both triggers' `paths:`, and a report that
+  #   skips itself on exactly the change it exists to check is silent by
+  #   construction (#449). This asserts the two lists stay in step and that the
+  #   workflow keeps no `paths-ignore` of its own.
+  # - `ci_guard_tests_are_run`: two guards once had no step and were compiled
+  #   but never run (#464). This asserts every `tests/ci_*.rs` file is named by
+  #   the `--test` of a cargo invocation that runs it, which here is this list.
+  # - `ci_benchmarks_run_every_target`: the timed benchmark run names its
+  #   `[[bench]]` targets in a matrix, a second copy of what `Cargo.toml`
+  #   declares; a target in the manifest and not the matrix is never measured
+  #   again (#459). It also pins the `rm -rf target/criterion` that keeps a
+  #   restored build cache from making criterion log an error per benchmark.
+  # - `mp4_cover_art`: pins no-cover output byte for byte and round-trips JPEG
+  #   and PNG cover art through `Mp4Muxer` and `Mp4Demuxer` (#502), and checks
+  #   the cover `MediaOutput` generates from a frame (#510).
+  # - `opus_codec`: holds the Opus decoder to libopus - every RFC 8251 vector,
+  #   in stereo and in mono, must pass `opus_compare`, and one libopus-encoded
+  #   MP4 per coding mode must decode to libopus's own output - and pins
+  #   exact-length reads through pre-skip and end trimming, reads after a seek,
+  #   and the native encoder's round trip (#524).
+  # - `vorbis_codec`: holds the Vorbis decoder to libvorbis's own output, short
+  #   blocks and surround streams included (#547), and pins packet durations,
+  #   bit-identical reads after a seek and the native encoder's exact-length
+  #   round trip (#524).
+  # - `native_aac_decoder`: Linux has no platform AAC decoder, so
+  #   `NativeAacDecoder` runs Symphonia's here (#561), held to the same
+  #   reference PCM the macOS and Windows shards hold their platform decoders to.
+  # - `native_vp9_encoder`: muxes the native VP9 encoder's output as
+  #   `vp09`/`vpcC`, plays the MP4 through libvpx and FFmpeg's VP9 decoder, and
+  #   runs the encoder conformance vector against libvpx (#528).
+  # - `webm_container`: remuxes the bundled AV1 sample into WebM and back,
+  #   asserting the WebM index hands a decoder exactly the MP4's samples and
+  #   frames, and that the written Cues are seekable (#526).
+  # - `vp8_conformance`: every VP8 test vector frame comes back exactly through
+  #   `ExactFrameReader` in reverse and alternating order, through the hidden
+  #   key frame of vector 018 (#529).
+  # - `native_vp8_encoder`: re-encodes the bundled VP8 clip into WebM and
+  #   checks one cue per key frame, exact frames in every access order, and a
+  #   quality floor (#530).
+  # - `vp9_hardware`: with no GPU on this runner, `Prefer` must fall back to the
+  #   software decoder and `Require` report hardware unavailable (#545).
+  # - `web_canvas_samples_match_their_files`: `samples.test.js` can only check
+  #   the choice, not the claim it is made from: the codec string the page
+  #   probes with is written down in JavaScript, so this demuxes each declared
+  #   sample and asserts the declaration against what zvidlib derives.
+  # - `native_gl`: the example's bitmap-font overlay helpers.
+  #
+  # `--lib` includes the HEVC/AV1 engine tests that compare every SIMD backend
+  # the runner's CPU offers against the scalar reference, which is how the
+  # x86_64 SSE4.1/AVX2 kernels get covered at all, since the other CI hosts are
+  # aarch64. They and the `av1_simd` and `av1_mc` tests used to be run a second
+  # time by steps of their own; the library units are now run once.
+  rust-tests-build:
+    name: Rust tests (build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: rustup show
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Install native audio dependencies
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      # A release binary rather than `cargo install`, which would compile the
+      # runner and its dependency tree on every run.
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - name: Build the test archive
+        run: |
+          cargo nextest archive --features native --lib \
+            --test bench_sources_compile \
+            --test bench_group_names_are_unique \
+            --test ci_workflows_cache_cargo \
+            --test ci_concurrency_spares_main \
+            --test ci_staleness_report_sees_markdown_changes \
+            --test ci_guard_tests_are_run \
+            --test ci_benchmarks_run_every_target \
+            --test mp4_cover_art \
+            --test opus_codec \
+            --test vorbis_codec \
+            --test native_aac_decoder \
+            --test native_vp9_encoder \
+            --test webm_container \
+            --test vp8_conformance \
+            --test native_vp8_encoder \
+            --test vp9_hardware \
+            --test web_canvas_samples_match_their_files \
+            --example native_gl \
+            --archive-file nextest-archive.tar.zst
+      - name: Upload the test archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: nextest-archive-linux-${{ github.run_id }}
+          path: nextest-archive.tar.zst
+          # The archive is already zstd-compressed.
+          compression-level: 0
+          retention-days: 1
+
+  # Every shard checks out the same commit at the same path the archive was
+  # built at, which is what the tests' `env!("CARGO_MANIFEST_DIR")` fixture
+  # paths resolve against. A shard compiles nothing - it runs `cargo-nextest`
+  # on the archive directly rather than through `cargo` - so it needs no build
+  # cache. `.config/nextest.toml` keeps the hardware and wall-clock tests from
+  # sharing the machine, which one step per binary used to guarantee.
+  #
+  # `--partition count:` deals the tests out round-robin, so no shard is handed
+  # a whole slow binary such as `opus_codec`, which alone took two and a half
+  # minutes of the old job.
+  rust-tests:
+    name: Rust tests (${{ matrix.shard }}/3)
+    needs: rust-tests-build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    env:
+      ZVIDLIB_OPUS_TEST_VECTORS: ${{ github.workspace }}/opus_newvectors
+      # libvpx must decode the native VP8 encoder's WebM to exactly the pictures
+      # zvidlib's decoder does, and ffmpeg must seek it through its Cues (#530).
+      # The test skips itself without ffmpeg's libvpx decoder elsewhere, so the
+      # shards install ffmpeg below and require it.
+      ZVIDLIB_REQUIRE_LIBVPX: "1"
+    steps:
+      - uses: actions/checkout@v4
+      # The VP9 encoder's tests require libvpx and FFmpeg's own VP9 decoder to
+      # reproduce its reconstruction exactly (#528), and the cover-art and WebM
+      # tests check their output with ffprobe. They skip themselves where
+      # ffmpeg is missing, so it is installed before they run.
+      - name: Install native audio dependencies and ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev ffmpeg
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - name: Download the test archive
+        uses: actions/download-artifact@v4
+        with:
+          name: nextest-archive-linux-${{ github.run_id }}
+      # The twelve official Opus decoder test vectors (RFC 8251) are 75 MB, so
+      # they are downloaded rather than committed, and cached so most runs do
+      # not download them at all. The key names the file; it never changes.
+      # Every shard restores them, because which shard `opus_codec`'s tests
+      # land on depends on how many tests sort before them.
+      - name: Cache the Opus RFC 8251 test vectors
+        id: opus-test-vectors
+        uses: actions/cache@v4
+        with:
+          path: opus_newvectors
+          key: opus-testvectors-rfc8251-workspace
+      - name: Download the Opus RFC 8251 test vectors
+        if: steps.opus-test-vectors.outputs.cache-hit != 'true'
+        run: |
+          curl -sSfL https://opus-codec.org/static/testvectors/opus_testvectors-rfc8251.tar.gz \
+            | tar -xz
+      - name: Run this shard's tests
+        run: |
+          cargo-nextest nextest run --profile ci \
+            --archive-file nextest-archive.tar.zst --workspace-remap . \
+            --partition count:${{ matrix.shard }}/3
+      # The VP9 decoder is held bit-exact to libvpx on every profile 0 test
+      # vector libvpx's own test suite decodes (#527): hidden frames,
+      # superframes, show_existing_frame, intra-only frames, scaled reference
+      # frames, tiles, frame sizes from 2x2 to 1920x1080 and so on. The vectors
+      # and their per-frame MD5s come from the WebM project's test-data bucket,
+      # about 27 MB in all, so they are cached between runs, keyed on the list
+      # of names the test reads. One host is enough: this one runs the widest
+      # vector kernels it detects, and every other instruction set is held to
+      # the scalar reference by the `vp9_simd` unit tests and the per-ISA
+      # fixture decode in the library units, which every native host runs
+      # (#570). The test is `#[ignore]`d for every other run, so one shard runs
+      # it alone with `--run-ignored only` and a filter that names it: the
+      # library's other ignored tests are measurement sweeps.
+      - name: Cache the libvpx VP9 test vectors
+        if: matrix.shard == 1
+        uses: actions/cache@v4
+        with:
+          path: vp9-test-vectors
+          key: libvpx-vp9-test-vectors-${{ hashFiles('tests/fixtures/codec/libvpx_vp9_test_vectors.txt') }}
+      - name: Download the libvpx VP9 test vectors
+        if: matrix.shard == 1
+        run: |
+          mkdir -p vp9-test-vectors
+          while read -r name; do
+            for file in "$name" "$name.md5"; do
+              if [ ! -f "vp9-test-vectors/$file" ]; then
+                curl -sSfL --retry 3 -o "vp9-test-vectors/$file" \
+                  "https://storage.googleapis.com/downloads.webmproject.org/test_data/libvpx/$file"
+              fi
+            done
+          done < tests/fixtures/codec/libvpx_vp9_test_vectors.txt
+      - name: Test VP9 decoding against the libvpx test vectors
+        if: matrix.shard == 1
+        env:
+          ZVIDLIB_VP9_VECTORS: ${{ github.workspace }}/vp9-test-vectors
+        run: |
+          cargo-nextest nextest run --profile ci \
+            --archive-file nextest-archive.tar.zst --workspace-remap . \
+            --run-ignored only -E 'test(=vp9_dec::tests::libvpx_test_vectors)'
 
   # Benchmarks are measured, not gated. On a pull request the suite is only
   # compiled: `cargo bench --no-run` costs one build and catches bench-code
@@ -617,18 +680,63 @@ jobs:
             target/criterion/**/new/estimates.json
           retention-days: 30
 
-  native-platforms:
-    name: Native checks (${{ matrix.os }})
+
+  # The Windows and macOS halves of what `rust-tests-build` does for Linux
+  # (#595): lint the platform's `cfg` half of the tree, then build its test
+  # binaries once into an archive for the shards below.
+  #
+  # `macos-latest` is aarch64, and Apple silicon's dyld shared cache resolves
+  # the Swift runtime the `apple-cf` bridge references whether or not the
+  # binary carries an rpath for it. x86_64 macOS does not, so a missing rpath is
+  # a launch failure there and invisible here (#327). x86_64 macOS is still
+  # supported, but CI no longer runs an Intel macOS leg (#593), so that
+  # regression is only caught when someone runs the tests on an Intel Mac by
+  # hand.
+  #
+  # The archive's targets are the ones these hosts have something of their own
+  # to say about:
+  #
+  # - `--lib`: every library unit, including each platform backend run on its
+  #   own and the AV1 SIMD motion compensation tests, which used to be run a
+  #   second time by a step of their own.
+  # - `native_hevc_hardware`: accelerated HEVC selection and correctness.
+  # - `vp8_conformance`: the VP8 factory's hardware selection (#538). NVDEC is
+  #   compiled into the Windows build, so this is where `Prefer` is seen to fall
+  #   back to the software decoder and `Require` to report hardware unavailable
+  #   on a runner without an NVIDIA adapter. On a host with one, the same test
+  #   holds NVDEC to the software decoder's pixels on every vector.
+  # - `vp9_hardware`: the VP9 factory's hardware selection (#545). NVDEC and
+  #   Media Foundation are compiled into the Windows build and VideoToolbox
+  #   into the macOS one. Where a runner has a hardware VP9 decoder, the
+  #   hardware tests hold it to the software decoder's pixels, through
+  #   `show_existing_frame` and every seek order; where it has none, they skip
+  #   with the reason, and `Prefer` is seen to fall back to software and
+  #   `Require` to report hardware unavailable. The same file covers the encode
+  #   direction (#550): a hardware VP9 encoder's stream must mux into MP4 and
+  #   WebM and decode through the native VP9 decoder.
+  # - `native_hevc_encoder`: which encoder `Prefer` and `Require` select (#487,
+  #   #486), and on a host with a hardware encoder an MP4 that zvidlib and
+  #   ffmpeg both decode. `macos-latest` reaches VideoToolbox's hardware
+  #   encoder, so it runs the hardware cases, including the check that
+  #   AVFoundation plays that MP4 and decodes every frame of it (#495) through
+  #   `tests/support/avfoundation_decode.swift`; the other hosted runners have
+  #   no hardware encoder, so they skip them and the preference answers are
+  #   what is checked. The Media Foundation backend's unit tests in `--lib`
+  #   still cover Microsoft's software encoder on any runner that has it.
+  # - `native_aac_encoder`: needs a platform AAC encoder - AudioToolbox on
+  #   macOS, Media Foundation on Windows, and none on Linux. Its impulse tests
+  #   are what hold each backend's reported priming and padding to the access
+  #   units it actually emits (#488).
+  # - `native_aac_decoder`: `NativeAacDecoder` is the platform's AAC decoder -
+  #   AudioToolbox on macOS and Media Foundation on Windows (#561) - so this is
+  #   where it is held to the window boundaries and, within a signal-to-noise
+  #   bound, the PCM that Symphonia's decoder produced before it was dropped on
+  #   these platforms. The Linux shards run the same file against Symphonia.
+  native-tests-build:
+    name: Native tests (build, ${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
-        # `macos-latest` is aarch64, and Apple silicon's dyld shared cache
-        # resolves the Swift runtime the `apple-cf` bridge references whether or
-        # not the binary carries an rpath for it. x86_64 macOS does not, so a
-        # missing rpath is a launch failure there and invisible here (#327).
-        # x86_64 macOS is still supported, but CI no longer runs an Intel macOS
-        # leg (#593), so that regression is only caught when someone runs the
-        # tests on an Intel Mac by hand.
         os: [windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
@@ -645,78 +753,92 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-      - name: Check native target
-        run: cargo check --all-targets --features native
       # The `cfg(windows)` half of the tree - `src/hevc/windows_mf.rs`, the
       # Windows arm of `src/hevc/nvdec.rs`, and the `windows` crate feature
       # list - only ever compiles here, so linting it anywhere else is
       # impossible. Same `-D warnings` gate the Linux job uses, so a
       # platform-specific warning fails the build rather than waiting for
-      # someone to build on that platform by hand.
+      # someone to build on that platform by hand. Clippy type-checks every
+      # target as it goes, which is why there is no `cargo check` before it.
       - name: Lint native target
         run: cargo clippy --all-targets --features native -- -D warnings
-      - name: Test library units
-        run: cargo test --features native --lib
-      - name: Test accelerated HEVC selection and correctness
-        run: cargo test --features native --test native_hevc_hardware -- --nocapture
-      # The VP8 factory's hardware selection (#538): NVDEC is compiled into the
-      # Windows build, so this is where `Prefer` is seen to fall back to the
-      # software decoder and `Require` to report hardware unavailable on a
-      # runner without an NVIDIA adapter. On a host with one, the same test
-      # holds NVDEC to the software decoder's pixels on every vector.
-      - name: Test accelerated VP8 selection and correctness
-        run: cargo test --features native --test vp8_conformance -- --nocapture
-      # The VP9 factory's hardware selection (#545): NVDEC and Media Foundation
-      # are compiled into the Windows build and VideoToolbox into the macOS
-      # ones. Where a runner has a hardware VP9 decoder, the hardware tests hold
-      # it to the software decoder's pixels, through `show_existing_frame` and
-      # every seek order; where it has none, they skip with the reason, and
-      # `Prefer` is seen to fall back to software and `Require` to report
-      # hardware unavailable. `--lib` above runs each backend on its own. The
-      # same file covers the encode direction (#550): a hardware VP9 encoder's
-      # stream must mux into MP4 and WebM and decode through the native VP9
-      # decoder, and a runner without one skips after checking the preference
-      # answers.
-      - name: Test accelerated VP9 selection and correctness
-        run: cargo test --features native --test vp9_hardware -- --nocapture
-      # The encode direction (#487, #486): which encoder `Prefer` and `Require`
-      # select, and on a host with a hardware encoder an MP4 that zvidlib and
-      # ffmpeg both decode. `macos-latest` reaches VideoToolbox's hardware
-      # encoder, so it runs the hardware cases, including the check that
-      # AVFoundation plays that MP4 and decodes every frame of it (#495) through
-      # `tests/support/avfoundation_decode.swift`; the other hosted runners have no
-      # hardware encoder, so they skip them and the preference answers are what
-      # is checked. The Media Foundation backend's unit tests in `--lib` above
-      # still cover Microsoft's software encoder on any runner that has it
-      # installed.
-      - name: Test platform HEVC encoder selection and output
-        run: cargo test --features native --test native_hevc_encoder -- --nocapture
-      - name: Test AV1 SIMD motion compensation
-        run: cargo test --features native --lib av1_mc -- --nocapture
-      # `--release` is the profile #327 was reported against: nothing about the
-      # missing rpath is profile-specific, but this is the invocation the issue
-      # names and the one the Intel benchmark column is measured with, so it is
-      # the one worth asserting launches unaided. `cargo build` first so the
-      # shipped cdylib exists for the rpath test to check as well - `cargo test`
-      # alone links the library as an rlib and never produces it. Neither step
-      # sets a `DYLD_*` variable, which is the point.
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - name: Build the test archive
+        shell: bash
+        run: |
+          cargo nextest archive --features native --lib \
+            --test native_hevc_hardware \
+            --test vp8_conformance \
+            --test vp9_hardware \
+            --test native_hevc_encoder \
+            --test native_aac_encoder \
+            --test native_aac_decoder \
+            --archive-file nextest-archive.tar.zst
+      - name: Upload the test archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: nextest-archive-${{ matrix.os }}-${{ github.run_id }}
+          path: nextest-archive.tar.zst
+          compression-level: 0
+          retention-days: 1
+
+  # As `rust-tests`, for Windows and macOS. The hardware tests in each shard
+  # still take turns through the `hardware` test group in `.config/nextest.toml`,
+  # which is what keeps the `macos-latest` VideoToolbox VP9 decoder from
+  # failing a decode while another session decodes (#565).
+  native-tests:
+    name: Native tests (${{ matrix.os }}, ${{ matrix.shard }}/2)
+    needs: native-tests-build
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+        shard: [1, 2]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - name: Download the test archive
+        uses: actions/download-artifact@v4
+        with:
+          name: nextest-archive-${{ matrix.os }}-${{ github.run_id }}
+      - name: Run this shard's tests
+        shell: bash
+        run: |
+          cargo-nextest nextest run --profile ci \
+            --archive-file nextest-archive.tar.zst --workspace-remap . \
+            --partition count:${{ matrix.shard }}/2
+
+  # `--release` is the profile #327 was reported against: nothing about the
+  # missing rpath is profile-specific, but this is the invocation the issue
+  # names and the one the Intel benchmark column is measured with, so it is the
+  # one worth asserting launches unaided. `cargo build` first so the shipped
+  # cdylib exists for the rpath test to check as well - `cargo test` alone links
+  # the library as an rlib and never produces it. Neither step sets a `DYLD_*`
+  # variable, which is the point.
+  #
+  # Only the rpath test needs the release profile. This step also used to rerun
+  # every library unit in release, which was most of its four and a half
+  # minutes and repeated what the shards run (#595); it is its own job now so
+  # the fat-LTO build is off the shards' path entirely.
+  macos-swift-rpath:
+    name: macOS Swift runtime rpath
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: rustup show
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       - name: Test the macOS Swift runtime rpath
-        if: runner.os == 'macOS'
         run: |
           cargo build --release --features native
           cargo test --release --features native --test macos_swift_runtime_rpath -- --nocapture
-          cargo test --release --features native --lib
-      # `native_aac_encoder.rs` needs a platform AAC encoder - AudioToolbox on
-      # macOS, Media Foundation on Windows, and none on Linux - so it runs here on
-      # every matrix host rather than in the Linux-only `rust` job. Its impulse
-      # tests are what hold each backend's reported priming and padding to the
-      # access units it actually emits (#488).
-      - name: Test the native AAC encoder
-        run: cargo test --features native --test native_aac_encoder -- --nocapture
-      # `NativeAacDecoder` is the platform's AAC decoder - AudioToolbox on macOS
-      # and Media Foundation on Windows (#561) - so this is where it is held to
-      # the window boundaries and, within a signal-to-noise bound, the PCM that
-      # Symphonia's decoder produced before it was dropped on these platforms.
-      # The Linux `rust` job runs the same file against Symphonia itself.
-      - name: Test the native AAC decoder
-        run: cargo test --features native --test native_aac_decoder -- --nocapture
