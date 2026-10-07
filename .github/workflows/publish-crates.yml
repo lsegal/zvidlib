@@ -1,0 +1,64 @@
+name: Publish crates
+
+# Uploads a release's crates to crates.io. Finalize release
+# (`finalize-release.yml`) dispatches this once it has verified the crates
+# with `cargo package` and created the GitHub release, and does not wait for
+# it: crates.io allows five new crates at once and then one every ten minutes,
+# so a release of new crates can take hours here without holding back the
+# GitHub release (#649). Dispatch it by hand with a tag to finish a publish
+# that failed or timed out.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag, for example v1.0.0
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+# Two runs for one release never upload at the same time. A new run queues
+# behind the one in progress rather than cancelling it, since a cancelled run
+# would only have to be resumed later.
+concurrency:
+  group: publish-crates-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish the crates to crates.io
+    runs-on: ubuntu-latest
+    steps:
+      - name: Select the release tag
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="$INPUT_TAG"
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "invalid release tag: $tag" >&2; exit 1; }
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ env.TAG }}
+      - name: Install Rust toolchain
+        run: rustup show
+      # `publish_crates.py` uploads every publishable crate one at a time in
+      # dependency order (#610), pacing them to crates.io's rate limits and
+      # waiting out a 429 rather than failing (#637). It publishes with
+      # `--no-verify`, since Finalize release's `cargo package` already
+      # verified the crates, so this job needs no wasm or audio dependencies.
+      # A crate already on crates.io at this version is skipped, so a re-run
+      # or a new dispatch for the same tag resumes after a partial publish.
+      - name: Publish the crates to crates.io
+        # A first release of a dozen new crates waits about ten minutes
+        # between uploads once crates.io's burst of five is spent.
+        timeout-minutes: 240
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
+            echo "::notice::CARGO_REGISTRY_TOKEN is not set, so no crate was published to crates.io."
+            exit 0
+          fi
+          python3 .github/scripts/publish_crates.py --version "${TAG#v}"
