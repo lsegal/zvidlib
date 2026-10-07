@@ -860,8 +860,15 @@ impl<'a> FrameEncoder<'a> {
             guess -= 4;
         }
         let mut errors = [None; 64];
+        // The filtered copy of each level tried, so the chosen one is not
+        // filtered again.
+        let mut copies = Vec::new();
         let mut error = |level: u8| {
-            *errors[usize::from(level)].get_or_insert_with(|| self.filtered_error(level))
+            *errors[usize::from(level)].get_or_insert_with(|| {
+                let (error, copy) = self.filtered_error(level);
+                copies.extend(copy.map(|copy| (level, copy)));
+                error
+            })
         };
 
         let mut middle = guess.clamp(0, 63) as u8;
@@ -896,39 +903,41 @@ impl<'a> FrameEncoder<'a> {
             }
         }
         self.filter_level = best;
-        self.recon = self.filtered(best);
+        if let Some((_, copy)) = copies.into_iter().find(|&(level, _)| level == best) {
+            self.load_filtered(&copy);
+        }
     }
 
-    /// The reconstruction after the loop filter at `level`.
-    fn filtered(&self, level: u8) -> Picture {
-        let mut picture = self.recon.clone();
-        if level == 0 {
-            return picture;
-        }
-        for (plane, (data, padded_stride)) in self.filter_copy(level).iter().enumerate() {
+    /// Replaces the reconstruction with a [`Self::filter_copy`] of it.
+    fn load_filtered(&mut self, copy: &[(Vec<u8>, usize); 3]) {
+        let picture = &mut self.recon;
+        for (plane, (data, padded_stride)) in copy.iter().enumerate() {
             let stride = picture.strides[plane];
             for (row, output) in picture.planes[plane].chunks_exact_mut(stride).enumerate() {
                 let start = (row + FILTER_BORDER) * padded_stride + FILTER_BORDER;
                 output.copy_from_slice(&data[start..start + stride]);
             }
         }
-        picture
     }
 
     /// The squared error from the source of the reconstruction after the
-    /// loop filter at `level`, measured on the filter's own copies.
-    fn filtered_error(&self, level: u8) -> u64 {
+    /// loop filter at `level`, measured on the filter's own copies, and the
+    /// filtered copy unless `level` is zero, which leaves the reconstruction
+    /// as it is.
+    fn filtered_error(&self, level: u8) -> (u64, Option<[(Vec<u8>, usize); 3]>) {
         if level == 0 {
-            return self.source_error(core::array::from_fn(|plane| {
+            let error = self.source_error(core::array::from_fn(|plane| {
                 (&self.recon.planes[plane][..], self.recon.strides[plane])
             }));
+            return (error, None);
         }
         let padded = self.filter_copy(level);
-        self.source_error(
+        let error = self.source_error(
             padded
                 .each_ref()
                 .map(|(data, stride)| (&data[FILTER_BORDER * stride + FILTER_BORDER..], *stride)),
-        )
+        );
+        (error, Some(padded))
     }
 
     /// Copies of the reconstruction's planes after the loop filter at
@@ -2473,12 +2482,11 @@ impl<'a> FrameEncoder<'a> {
                 let Some(luma) = self.code_plane(0, mi_row, mi_col, bsl, tx, inter, bound) else {
                     continue;
                 };
-                let [u, v] = match &chroma {
-                    Some((size, codings, pixels)) if *size == uv_tx_size => {
+                match &chroma {
+                    Some((size, _, pixels)) if *size == uv_tx_size => {
                         for (plane, pixels) in [1, 2].into_iter().zip(pixels) {
                             self.load_pixels(plane, mi_row, mi_col, bsl, pixels);
                         }
-                        codings.clone()
                     }
                     _ => {
                         if tx_size > 0 {
@@ -2493,11 +2501,13 @@ impl<'a> FrameEncoder<'a> {
                         });
                         let pixels =
                             [1, 2].map(|plane| self.block_pixels(plane, mi_row, mi_col, bsl));
-                        chroma = Some((uv_tx_size, codings.clone(), pixels));
-                        codings
+                        chroma = Some((uv_tx_size, codings, pixels));
                     }
-                };
-                let codings = [luma, u, v];
+                }
+                let (_, [u, v], _) = chroma.as_ref().expect("chroma is coded above");
+                // Cloned only for the best candidate: the chroma coding is kept
+                // for other sizes.
+                let codings = [&luma, u, v];
                 if codings
                     .iter()
                     .all(|coding| coding.blocks.iter().all(|block| block.eob == 0))
@@ -2509,7 +2519,7 @@ impl<'a> FrameEncoder<'a> {
                 let error: u64 = codings.iter().map(|coding| coding.error).sum();
                 let total = error as f64 + self.lambda * (header_bits + token_bits);
                 if best.as_ref().is_none_or(|best| total < best.cost) {
-                    let [y, u, v] = codings;
+                    let blocks = [luma.blocks, u.blocks.clone(), v.blocks.clone()];
                     best = Some(BlockChoice {
                         info: ModeInfo {
                             skip: false,
@@ -2518,7 +2528,7 @@ impl<'a> FrameEncoder<'a> {
                         },
                         uv_mode: IntraMode::Dc,
                         best_mv: nearest,
-                        blocks: [y.blocks, u.blocks, v.blocks],
+                        blocks,
                         pixels: core::array::from_fn(|plane| {
                             self.block_pixels(plane, mi_row, mi_col, bsl)
                         }),
