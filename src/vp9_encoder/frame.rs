@@ -380,16 +380,55 @@ impl Hasher for KeyHasher {
 /// What coding one transform block's residual produced, for every candidate
 /// in the superblock that codes the same one. Only its token bits depend on
 /// the block's surroundings, through the nonzero context.
+///
+/// Its sample and level arrays live in the [`ResidualCache`]'s arenas, at
+/// these offsets, `n * n` long for an `n` x `n` transform.
 struct CachedResidual {
     /// An intra block's prediction, to tell blocks apart whose hashes agree.
-    prediction: Vec<u8>,
+    prediction: Option<usize>,
     prediction_error: u64,
     eob: usize,
-    levels: Vec<i32>,
+    /// The levels, if `eob` is not zero.
+    levels: usize,
     /// The reconstruction with the levels coded, and its squared error.
-    reconstructed: Vec<u8>,
+    reconstructed: usize,
     error: u64,
     bits: [Option<f64>; 3],
+}
+
+/// The [`CachedResidual`]s of the superblock being searched. Their arrays
+/// are kept in arenas cleared with it, rather than allocated and freed for
+/// every entry, which cost as much as several of the lookups saved.
+#[derive(Default)]
+struct ResidualCache {
+    entries: HashMap<ResidualKey, CachedResidual, BuildHasherDefault<KeyHasher>>,
+    samples: Vec<u8>,
+    levels: Vec<i32>,
+}
+
+impl ResidualCache {
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.samples.clear();
+        self.levels.clear();
+    }
+
+    /// Appends the `n` x `n` block of `plane` at `(x, y)` to the sample
+    /// arena, returning its offset.
+    fn push_block(
+        &mut self,
+        picture: &Picture,
+        plane: usize,
+        x: usize,
+        y: usize,
+        n: usize,
+    ) -> usize {
+        let start = self.samples.len();
+        for row in block_rows(picture, plane, x, y, n) {
+            self.samples.extend_from_slice(row);
+        }
+        start
+    }
 }
 
 /// The result of coding one plane of a block.
@@ -660,7 +699,7 @@ pub(super) struct FrameEncoder<'a> {
     over_ceiling: bool,
     /// The residuals coded in the current superblock, which the search codes
     /// again for every partition and candidate that shares one.
-    residual_cache: HashMap<ResidualKey, CachedResidual, BuildHasherDefault<KeyHasher>>,
+    residual_cache: ResidualCache,
     /// Token costs under `context`'s coefficient probabilities.
     token_costs: Box<[TokenCosts; 4]>,
 }
@@ -725,7 +764,7 @@ impl<'a> FrameEncoder<'a> {
             scratch: Scratch::new(),
             inter: RefCell::new(InterBuffers::new()),
             over_ceiling: false,
-            residual_cache: HashMap::default(),
+            residual_cache: ResidualCache::default(),
             token_costs: token_costs(&context.coef),
         }
     }
@@ -1459,12 +1498,18 @@ impl<'a> FrameEncoder<'a> {
             }),
             _ => None,
         };
+        let ResidualCache {
+            entries,
+            samples: cached_samples,
+            levels: cached_levels,
+        } = &mut self.residual_cache;
         if let Some(key) = &key
-            && let Some(cached) = self.residual_cache.get_mut(key)
-            && (cached.prediction.is_empty()
-                || block_rows(&self.recon, plane, x, y, n)
-                    .zip(cached.prediction.chunks_exact(n))
-                    .all(|(row, cached)| row == cached))
+            && let Some(cached) = entries.get_mut(key)
+            && cached.prediction.is_none_or(|prediction| {
+                block_rows(&self.recon, plane, x, y, n)
+                    .zip(cached_samples[prediction..][..n * n].chunks_exact(n))
+                    .all(|(row, cached)| row == cached)
+            })
         {
             let CachedResidual {
                 prediction: _,
@@ -1478,6 +1523,7 @@ impl<'a> FrameEncoder<'a> {
             if *eob == 0 {
                 return (empty, *prediction_error, empty_bits);
             }
+            let levels = &cached_levels[*levels..][..n * n];
             let bits = *bits[context].get_or_insert_with(|| {
                 coefficient_bits(
                     &self.token_costs[tx_size],
@@ -1495,12 +1541,13 @@ impl<'a> FrameEncoder<'a> {
             {
                 return (empty, *prediction_error, empty_bits);
             }
+            let reconstructed = &cached_samples[*reconstructed..][..n * n];
             for (row, pixels) in reconstructed.chunks_exact(n).enumerate() {
                 let start = (y + row) * stride + x;
                 self.recon.planes[plane][start..start + n].copy_from_slice(pixels);
             }
             let block = TxBlock {
-                levels: levels.clone(),
+                levels: levels.to_vec(),
                 eob: *eob,
                 tx_type,
             };
@@ -1525,27 +1572,23 @@ impl<'a> FrameEncoder<'a> {
             residual,
         );
         // An intra block's prediction, kept with its coding.
-        let mut prediction_copy = match key {
+        let prediction_copy = match key {
             Some(ResidualKey::Intra { .. }) => {
-                let mut copy = Vec::with_capacity(n * n);
-                for row in block_rows(&self.recon, plane, x, y, n) {
-                    copy.extend_from_slice(row);
-                }
-                copy
+                Some(self.residual_cache.push_block(&self.recon, plane, x, y, n))
             }
-            _ => Vec::new(),
+            _ => None,
         };
         // Remembers an empty coding of this residual.
-        let mut cache_empty = |encoder: &mut Self| {
+        let cache_empty = |encoder: &mut Self| {
             if let Some(key) = key {
-                encoder.residual_cache.insert(
+                encoder.residual_cache.entries.insert(
                     key,
                     CachedResidual {
-                        prediction: core::mem::take(&mut prediction_copy),
+                        prediction: prediction_copy,
                         prediction_error,
                         eob: 0,
-                        levels: Vec::new(),
-                        reconstructed: Vec::new(),
+                        levels: 0,
+                        reconstructed: 0,
                         error: prediction_error,
                         bits: [None; 3],
                     },
@@ -1616,18 +1659,17 @@ impl<'a> FrameEncoder<'a> {
         if let Some(key) = key {
             let mut cached_bits = [None; 3];
             cached_bits[context] = Some(bits);
-            let mut reconstructed = Vec::with_capacity(n * n);
-            for row in 0..n {
-                let start = (y + row) * stride + x;
-                reconstructed.extend_from_slice(&self.recon.planes[plane][start..start + n]);
-            }
-            self.residual_cache.insert(
+            let cache = &mut self.residual_cache;
+            let reconstructed = cache.push_block(&self.recon, plane, x, y, n);
+            let cached_levels = cache.levels.len();
+            cache.levels.extend_from_slice(levels);
+            cache.entries.insert(
                 key,
                 CachedResidual {
                     prediction: prediction_copy,
                     prediction_error,
                     eob,
-                    levels: levels.to_vec(),
+                    levels: cached_levels,
                     reconstructed,
                     error,
                     bits: cached_bits,
