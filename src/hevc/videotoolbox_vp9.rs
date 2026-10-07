@@ -11,9 +11,14 @@
 //! chunks since the last key frame, which the backend keeps, are replayed through the software
 //! decoder, which gives the same picture since VP9 decoding is exact. Encoders show a hidden
 //! frame again rarely, so the replay is rare too.
+//!
+//! On a virtual Mac, VideoToolbox's VP9 decoder fails a decode with OSStatus -12909 or -19092
+//! while another session in the process is decoding, so there every session's creation, decode
+//! and teardown take turns (#580). Physical Macs decode in every session at once.
 
+use std::ffi::{c_char, c_int, c_void};
 use std::ptr;
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Mutex, MutexGuard, Once, OnceLock, PoisonError};
 
 use apple_cf::cf::{AsCFType, CFData, CFDictionary, CFNumber, CFString, CFType};
 use apple_cf::cm::{CMBlockBuffer, CMFormatDescription, CMSampleBuffer};
@@ -42,6 +47,42 @@ fn register_decoder() {
     REGISTER.call_once(|| unsafe {
         videotoolbox::ffi::VTRegisterSupplementalVideoDecoderIfAvailable(CODEC_TYPE_VP9);
     });
+}
+
+unsafe extern "C" {
+    fn sysctlbyname(
+        name: *const c_char,
+        old: *mut c_void,
+        old_length: *mut usize,
+        new: *mut c_void,
+        new_length: usize,
+    ) -> c_int;
+}
+
+/// Whether this Mac runs under a hypervisor, as the `macos-latest` GitHub runner does.
+fn is_virtual_machine() -> bool {
+    static VIRTUAL: OnceLock<bool> = OnceLock::new();
+    *VIRTUAL.get_or_init(|| {
+        let mut present: c_int = 0;
+        let mut length = size_of::<c_int>();
+        let status = unsafe {
+            sysctlbyname(
+                c"kern.hv_vmm_present".as_ptr(),
+                (&raw mut present).cast(),
+                &mut length,
+                ptr::null_mut(),
+                0,
+            )
+        };
+        status == 0 && present != 0
+    })
+}
+
+/// Holds every other VP9 session's VideoToolbox calls off on a virtual Mac, whose VP9 decoder
+/// fails a decode while another session decodes; `None` on a physical Mac, which needs no turns.
+fn exclusive() -> Option<MutexGuard<'static, ()>> {
+    static SESSIONS: Mutex<()> = Mutex::new(());
+    is_virtual_machine().then(|| SESSIONS.lock().unwrap_or_else(PoisonError::into_inner))
 }
 
 /// Whether this Mac advertises a hardware VP9 decoder.
@@ -104,6 +145,7 @@ impl Vp9Decoder {
     fn decode(&mut self, sample: &EncodedVideoSample) -> Result<RawPicture> {
         let sample_buffer = create_sample_buffer(sample, &self.format)?;
         let session = self.session()?;
+        let _exclusive = exclusive();
         session
             .decode_with_options(&sample_buffer, 0, None)
             .map_err(|error| codec(format!("VideoToolbox rejected VP9 input: {error}")))?;
@@ -238,7 +280,7 @@ impl VideoDecoder for Vp9Decoder {
     }
 
     fn reset(&mut self) -> Result<()> {
-        self.session.take();
+        drop_session(self.session.take());
         self.output
             .lock()
             .map_err(|_| codec("VideoToolbox output queue is unavailable"))?
@@ -260,6 +302,18 @@ impl VideoDecoder for Vp9Decoder {
         // again; only the RGBA conversion is skipped.
         self.output_wanted = wanted;
     }
+}
+
+impl Drop for Vp9Decoder {
+    fn drop(&mut self) {
+        drop_session(self.session.take());
+    }
+}
+
+/// Invalidates a session, in turn with the other sessions on a virtual Mac.
+fn drop_session(session: Option<DecompressionSession>) {
+    let _exclusive = exclusive();
+    drop(session);
 }
 
 /// Crops a picture's planes to `width` x `height`.
@@ -299,6 +353,7 @@ fn create_session(
         &pixel_format_key as &dyn AsCFType,
         &pixel_format as &dyn AsCFType,
     )]);
+    let _exclusive = exclusive();
     let session = DecompressionSession::new_with_image_buffer_attributes(
         format,
         Some(&attributes),
