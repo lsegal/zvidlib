@@ -46,7 +46,8 @@ jobs:
       - name: Install wasm32 target
         run: rustup target add wasm32-unknown-unknown
       - name: Install native audio dependencies
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+        timeout-minutes: 15
+        run: python3 .github/scripts/apt_install.py libasound2-dev
       - name: Install wasm-pack
         env:
           WASM_PACK_VERSION: '0.15.0'
