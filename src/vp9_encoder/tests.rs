@@ -1282,3 +1282,57 @@ fn every_instruction_set_encodes_byte_identical_bitstreams() {
     }
     crate::simd::set_override(None);
 }
+
+#[test]
+fn loop_filter_on_sharp_content_costs_less_than_decision_noise() {
+    // On content this sharp the filter has almost nothing to remove, and the
+    // strict rule of `loop_filter_is_a_rate_distortion_gain` fails at some
+    // quantizers by a percent or so either way (issue #590). The per-frame
+    // levels it chooses do lower each frame's error; what moves the size is
+    // which mode or vector later frames pick from a slightly different
+    // reference, a few bytes up or down per frame. The encoder is that noisy
+    // without the filter too: an unfiltered encode lands off the rate and
+    // distortion curve through its neighbouring quantizers by more, 3-4% RMS
+    // over q 20 to 240 and about 2% at the quantizers here. So no point may
+    // lose more than that measured noise, and the points together must still
+    // be a gain.
+    let (mut ratios, mut deviations) = (Vec::new(), Vec::new());
+    for (width, height) in [(96, 64), (192, 128)] {
+        let frames: Vec<VideoFrame> = (0..12)
+            .map(|index| moving_yuv_frame(width, height, index))
+            .collect();
+        for base_q_idx in [30_u8, 40, 130, 200, 210, 220] {
+            let [below, (unfiltered_bytes, unfiltered_psnr), above] =
+                [base_q_idx - 1, base_q_idx, base_q_idx + 1].map(|q| {
+                    let (bytes, psnr) = encode_group(&frames, q, false);
+                    (bytes as f64, psnr)
+                });
+            let (filtered_bytes, filtered_psnr) = encode_group(&frames, base_q_idx, true);
+            // In log2 of the size, which the 6 dB per doubling rule is linear
+            // in.
+            let along = (unfiltered_psnr - below.1) / (above.1 - below.1);
+            let curve = below.0.log2() + along * (above.0.log2() - below.0.log2());
+            deviations.push(unfiltered_bytes.log2() - curve);
+            let equivalent = unfiltered_bytes.log2() + (filtered_psnr - unfiltered_psnr) / 6.0;
+            let ratio = (filtered_bytes as f64).log2() - equivalent;
+            ratios.push((width, height, base_q_idx, ratio));
+        }
+    }
+    let percent = |log2: f64| (log2.exp2() - 1.0) * 100.0;
+    let noise = (deviations.iter().map(|d| d * d).sum::<f64>() / deviations.len() as f64).sqrt();
+    assert!(
+        percent(noise) < 3.0,
+        "unfiltered encodes are {:.2}% off their curve",
+        percent(noise)
+    );
+    for &(width, height, base_q_idx, ratio) in &ratios {
+        assert!(
+            ratio <= noise,
+            "{width}x{height} q {base_q_idx}: filtered {:+.2}%, noise {:.2}%",
+            percent(ratio),
+            percent(noise)
+        );
+    }
+    let mean = ratios.iter().map(|&(.., ratio)| ratio).sum::<f64>() / ratios.len() as f64;
+    assert!(mean <= 0.0, "filtered {:+.2}% on average", percent(mean));
+}
