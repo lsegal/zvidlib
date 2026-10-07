@@ -13,5 +13,22 @@ zvidlib-core = { workspace = true }
 zvidlib-av1 = { workspace = true }
 
 [dev-dependencies]
+zvidlib-color = { path = "../zvidlib-color" }
+criterion = { workspace = true }
+zvidlib-bench-support = { path = "../zvidlib-bench-support" }
 zvidlib-av1-decoder = { path = "../zvidlib-av1-decoder" }
 zvidlib-container = { path = "../zvidlib-container" }
+
+[features]
+# Additive, off by default, and gating no code: the benchmark harness folds it
+# into every criterion group name (`simd=off` / `simd=on`), as zvidlib's own
+# `simd` feature does, so the two arms are recorded separately.
+simd = []
+
+# The AV1 encoder's own scalar-vs-SIMD suite. Encoder kernels are measured
+# separately from `av1_decode` so neither target's name overstates its scope,
+# and separately from `codec` because it shares none of that target's
+# decoded-frame fixtures.
+[[bench]]
+name = "av1_encode"
+harness = false

@@ -15,7 +15,7 @@
 //!
 //! Unlike every other group in this suite, the arms here are *not* built
 //! through [`support::isa`]. These decoders are opaque drivers and OS
-//! frameworks; `zvidlib::simd`'s process-wide override does not reach a single
+//! frameworks; `zvidlib_core::simd`'s process-wide override does not reach a single
 //! instruction they execute. Emitting `scalar` and `neon` arms for them would
 //! produce a pair of numbers that differ only by measurement noise and read as
 //! a result. The meaningful comparison is hardware against software on the same
@@ -44,12 +44,12 @@
 //! The issue this module closes asks for the surface-copy cost as its own arm
 //! "where the backend exposes one". No backend exposed one, because the whole
 //! readback happens inside `submit`: `VideoDecoder` hands back a host-side
-//! [`zvidlib::VideoFrame`], the decoder configuration only accepts
+//! [`zvidlib_core::VideoFrame`], the decoder configuration only accepts
 //! `PixelFormat::Rgba8` (`src/hevc/mod.rs`), and each backend maps its own
 //! surface and converts to RGBA before returning. Issue #283 settled what to do
 //! about that: not a public zero-copy output path — three platform handle types
 //! and an NV12 output family the crate cannot keep stable across drivers it
-//! does not own — but a measurement seam, `zvidlib::hevc_hardware_readback`,
+//! does not own — but a measurement seam, `zvidlib_hardware::readback`,
 //! which times the copy that actually runs rather than a reimplemented
 //! stand-in.
 //!
@@ -66,7 +66,7 @@
 //!
 //! There is no readback arm for the software comparison arm. The seam covers
 //! the fixed-function backends; the software decoder's own conversion cost is
-//! already attributed by `zvidlib::hevc_decode_profile`'s `color_convert`
+//! already attributed by `zvidlib_hevc_decoder::decode_profile`'s `color_convert`
 //! stage and measured directly by `hevc_color_convert` in
 //! `benches/hevc_decode.rs`.
 //!
@@ -86,14 +86,15 @@ use std::time::{Duration, Instant};
 
 use criterion::measurement::WallTime;
 use criterion::{BenchmarkGroup, Criterion, criterion_group, criterion_main};
-use zvidlib::hevc_hardware_readback as readback;
-use zvidlib::{
+use zvidlib_core::{
     CancellationToken, Codec, CodecProfile, CodecSupport, ColorRange, CpuFrameSource,
     EncodedVideoSample, FrameIndex, FrameSource, HardwarePreference, Limits, Orientation,
     PixelFormat, VideoDecoderConfig, VideoDecoderFactory, VideoDimensions, VideoEncoderConfig,
-    VideoEncoderFactory, VideoFrame, native_hevc_video_decoder_factory,
-    native_hevc_video_encoder_factory,
+    VideoEncoderFactory, VideoFrame,
 };
+use zvidlib_hardware::readback;
+use zvidlib_hevc_decoder::native_hevc_video_decoder_factory;
+use zvidlib_hevc_encoder::native_hevc_video_encoder_factory;
 
 mod support;
 
@@ -338,7 +339,7 @@ fn hevc_hardware(criterion: &mut Criterion) {
     let hardware = configuration(HardwarePreference::Require);
     if factory.capability(&hardware)
         != (CodecSupport::Supported {
-            implementation: zvidlib::CodecImplementation::Hardware,
+            implementation: zvidlib_core::CodecImplementation::Hardware,
         })
     {
         let reason = factory
@@ -359,7 +360,7 @@ fn hevc_hardware(criterion: &mut Criterion) {
     );
     println!(
         "# frame readback is a separate group: the backend charges each frame's surface copy and \
-         RGBA conversion to `zvidlib::hevc_hardware_readback`, so both are reported out of the \
+         RGBA conversion to `zvidlib_hardware::readback`, so both are reported out of the \
          decode number they are part of"
     );
 
@@ -460,7 +461,7 @@ fn hevc_hardware_encode(criterion: &mut Criterion) {
     let factory = native_hevc_video_encoder_factory();
     if factory.capability(&configuration)
         != (CodecSupport::Supported {
-            implementation: zvidlib::CodecImplementation::Hardware,
+            implementation: zvidlib_core::CodecImplementation::Hardware,
         })
     {
         let reason = factory

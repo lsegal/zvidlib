@@ -13,4 +13,19 @@ zvidlib-core = { workspace = true }
 zvidlib-vorbis-decoder = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
+zvidlib-bench-support = { path = "../zvidlib-bench-support" }
 zvidlib-container = { path = "../zvidlib-container" }
+
+[features]
+# Additive, off by default, and gating no code: the benchmark harness folds it
+# into every criterion group name (`simd=off` / `simd=on`), as zvidlib's own
+# `simd` feature does, so the two arms are recorded separately.
+simd = []
+
+# The native Vorbis encoder's scalar-vs-SIMD suite (issue #573): whole encodes
+# through the public factory, one arm per instruction set. Synthetic input
+# only, so it shares nothing with `codec`'s decoded-fixture cache.
+[[bench]]
+name = "vorbis_encode"
+harness = false

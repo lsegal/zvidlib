@@ -38,10 +38,10 @@ use zvidlib_core::*;
 // The containers and conformance harness the tests read their fixtures with.
 #[cfg(test)]
 #[allow(unused_imports)]
-use zvidlib_container::*;
+use zvidlib_av1_decoder::native_av1_video_decoder_factory;
 #[cfg(test)]
 #[allow(unused_imports)]
-use zvidlib_av1_decoder::native_av1_video_decoder_factory;
+use zvidlib_container::*;
 
 use crate::{
     Codec, CodecImplementation, CodecProfile, CodecSupport, ColorRange, EncodedSample,

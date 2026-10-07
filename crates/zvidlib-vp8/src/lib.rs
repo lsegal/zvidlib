@@ -322,3 +322,16 @@ fn picture_to_rgba(
         limits,
     )
 }
+
+/// The SIMD dispatch sites in this crate, each with the instruction set it
+/// resolves to right now. `zvidlib::simd::active_by_site` reports every crate's
+/// sites together and documents what each one covers.
+#[doc(hidden)]
+#[must_use]
+pub fn simd_sites() -> Vec<(&'static str, zvidlib_core::SimdIsa)> {
+    vec![
+        ("vp8_encode", simd::encode_isa()),
+        ("vp8_recon", simd::recon_isa()),
+        ("vp8_decode", simd::decode_isa()),
+    ]
+}

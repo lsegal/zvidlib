@@ -2,8 +2,8 @@
 //!
 //! This target answers two questions the crate's other benchmarks do not: how
 //! fast a whole AV1 frame decodes end to end, and where that time goes. Every
-//! group runs once per instruction set `zvidlib::simd::available()` reports,
-//! through the crate-wide override in [`zvidlib::simd`], which is what makes a
+//! group runs once per instruction set `zvidlib_core::simd::available()` reports,
+//! through the crate-wide override in [`zvidlib_core::simd`], which is what makes a
 //! single "scalar" arm meaningful here: AV1's kernels are reached through three
 //! independent dispatch sites (`av1_simd` for the transforms and in-loop
 //! filters, `av1_mc` for inter prediction, `av1_intra_pred` for intra
@@ -44,19 +44,19 @@ mod support;
 use std::time::Duration;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use zvidlib::av1_filters::{
+use zvidlib_av1::av1_filters::{
     CdefStrength, FilterFrame, LoopFilterParams, RestorationUnit, apply_restoration_unit,
     cdef_frame, deblock_frame,
 };
-use zvidlib::av1_intra_pred::{SmoothMode, directional_row, paeth_row, smooth_row};
-use zvidlib::av1_mc::{
+use zvidlib_av1::av1_intra_pred::{SmoothMode, directional_row, paeth_row, smooth_row};
+use zvidlib_av1::av1_mc::{
     InterpFilter, McContext, RefPlane, blend_average, blend_mask, build_difference_mask,
     default_level,
 };
-use zvidlib::{
-    AV1_CDF_MAX, Av1SymbolDecoder, Av1TxType, CancellationToken, FrameDigest, Limits,
-    VideoDecoderFactory, inverse_transform, native_av1_video_decoder_factory,
-};
+use zvidlib_av1::{AV1_CDF_MAX, Av1SymbolDecoder, Av1TxType, inverse_transform};
+use zvidlib_av1_decoder::native_av1_video_decoder_factory;
+use zvidlib_container::FrameDigest;
+use zvidlib_core::{CancellationToken, Limits, VideoDecoderFactory};
 
 use support::FrameWork;
 use support::isa::{IsaWorkload, bench_across_isas, checksum, log_host_isas};

@@ -7,8 +7,8 @@
 //! sweep because they are encoder work, and a decoder target that reports
 //! encoder numbers is a target whose scope cannot be read off its name.
 //!
-//! Every group runs once per instruction set `zvidlib::simd::available()`
-//! reports, through the crate-wide override in [`zvidlib::simd`], and
+//! Every group runs once per instruction set `zvidlib_core::simd::available()`
+//! reports, through the crate-wide override in [`zvidlib_core::simd`], and
 //! `benches/support/isa.rs` asserts that each arm is bit-exact with scalar
 //! before timing it and that the override really landed in each dispatch
 //! family — so a reported speedup cannot come from a kernel that quietly
@@ -18,7 +18,7 @@
 //!
 //! | Group | Stage |
 //! | --- | --- |
-//! | `av1_forward_dct_{4x4,8x8,16x16,32x32}` | forward DCT, `src/av1_encoder/transform.rs` through `zvidlib::forward_transform` |
+//! | `av1_forward_dct_{4x4,8x8,16x16,32x32}` | forward DCT, `src/av1_encoder/transform.rs` through `zvidlib_av1::forward_transform` |
 //! | `av1_forward_adst_8x8`, `av1_forward_flipadst_16x16` | the forward ADST family, including a flipped type |
 //! | `av1_encode_frame_q{0,32,160}` | one whole frame through the public encoder, `src/av1_encoder/tile.rs` |
 //! | `av1_encode_stage_wht` | the forward 4x4 WHT, `src/av1_encoder/wht.rs` |
@@ -30,8 +30,8 @@
 //!
 //! The whole-frame groups say what a frame costs; the per-stage groups say
 //! where that cost goes. They reach the encoder's individual stages through
-//! [`zvidlib::av1_encoder_bench`], the `#[doc(hidden)]` per-stage access that is
-//! the AV1 counterpart to `zvidlib::hevc_encoder_bench`, because a whole-frame
+//! [`zvidlib_av1_encoder::bench`], the `#[doc(hidden)]` per-stage access that is
+//! the AV1 counterpart to `zvidlib_hevc_encoder::bench`, because a whole-frame
 //! number cannot distinguish tile-encoding cost from bitstream-writing cost —
 //! and the breakdown is lopsided enough that the distinction is the whole
 //! point. Both run at the same two sizes as the whole-frame groups.
@@ -62,12 +62,13 @@ mod support;
 use std::time::Duration;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use zvidlib::av1_encoder_bench as encoder_bench;
-use zvidlib::{
-    Av1TxType, Codec, CodecProfile, ColorRange, CpuFrameSource, FrameIndex, FrameSource,
-    HardwarePreference, Limits, Orientation, PixelFormat, Plane, VideoDimensions,
-    VideoEncoderConfig, VideoEncoderFactory, VideoFrame, forward_transform,
-    native_av1_video_encoder_factory,
+use zvidlib_av1::{Av1TxType, forward_transform};
+use zvidlib_av1_encoder::bench as encoder_bench;
+use zvidlib_av1_encoder::native_av1_video_encoder_factory;
+use zvidlib_core::{
+    Codec, CodecProfile, ColorRange, CpuFrameSource, FrameIndex, FrameSource, HardwarePreference,
+    Limits, Orientation, PixelFormat, Plane, VideoDimensions, VideoEncoderConfig,
+    VideoEncoderFactory, VideoFrame,
 };
 
 use support::FrameWork;
@@ -233,7 +234,7 @@ fn av1_encode_whole_frame(criterion: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
-// Per-stage encoder groups (src/av1_encoder/, through zvidlib::av1_encoder_bench)
+// Per-stage encoder groups (src/av1_encoder/, through zvidlib_av1_encoder::bench)
 // ---------------------------------------------------------------------------
 
 /// CDF-coded symbols the symbol group encodes per 4x4 block.

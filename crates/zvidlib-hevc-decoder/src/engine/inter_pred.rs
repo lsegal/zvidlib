@@ -2927,7 +2927,7 @@ mod tests {
     ///
     /// Ignored by default because it is a timing measurement, not an
     /// assertion. Run it with
-    /// `cargo test --release --features native --lib
+    /// `cargo test -p zvidlib-hevc-decoder --release --lib
     /// measure_narrow_vs_wide_block -- --ignored --nocapture`.
     #[test]
     #[ignore = "benchmark; run with --ignored --nocapture"]
@@ -3059,7 +3059,7 @@ mod tests {
     ///
     /// Ignored by default because it is a timing measurement, not an
     /// assertion. Run it with
-    /// `cargo test --release --features native --lib
+    /// `cargo test -p zvidlib-hevc-decoder --release --lib
     /// measure_narrow_gather_vs_kernel -- --ignored --nocapture`.
     #[test]
     #[ignore = "benchmark; run with --ignored --nocapture"]
@@ -3197,7 +3197,7 @@ mod tests {
     ///
     /// Ignored by default because it is a timing measurement, not an
     /// assertion. Run it with
-    /// `cargo test --release --features native --lib
+    /// `cargo test -p zvidlib-hevc-decoder --release --lib
     /// measure_narrow_gather_by_row_bytes -- --ignored --nocapture`.
     #[test]
     #[ignore = "benchmark; run with --ignored --nocapture"]
@@ -3290,7 +3290,7 @@ mod tests {
     ///
     /// Ignored by default because it is a timing measurement, not an
     /// assertion. Run it with
-    /// `cargo test --release --features native --lib
+    /// `cargo test -p zvidlib-hevc-decoder --release --lib
     /// measure_narrow_mirror_amortization -- --ignored --nocapture`.
     #[test]
     #[ignore = "benchmark; run with --ignored --nocapture"]
@@ -3474,7 +3474,7 @@ mod tests {
     ///
     /// Ignored by default because it is a timing measurement, not an
     /// assertion. Run it with
-    /// `cargo test --release --features native --lib
+    /// `cargo test -p zvidlib-hevc-decoder --release --lib
     /// measure_2d_ring_vs_flat -- --ignored --nocapture`.
     #[test]
     #[ignore = "benchmark; run with --ignored --nocapture"]
@@ -3644,7 +3644,7 @@ mod tests {
     ///
     /// Ignored by default because it is a timing measurement, not an
     /// assertion. Run it with
-    /// `cargo test --release --features native --lib
+    /// `cargo test -p zvidlib-hevc-decoder --release --lib
     /// measure_interp_pass_split -- --ignored --nocapture`.
     #[test]
     #[ignore = "benchmark; run with --ignored --nocapture"]
@@ -3776,7 +3776,7 @@ mod tests {
 
     /// Ignored by default because it is a timing measurement, not an
     /// assertion. Run it with
-    /// `cargo test --release --features native --lib
+    /// `cargo test -p zvidlib-hevc-decoder --release --lib
     /// simd_inter_pred_benchmark -- --ignored --nocapture`.
     #[test]
     #[ignore = "benchmark; run with --ignored --nocapture"]

@@ -14,4 +14,19 @@ zvidlib-color = { workspace = true }
 zvidlib-av1-syntax = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
+zvidlib-bench-support = { path = "../zvidlib-bench-support" }
 zvidlib-container = { path = "../zvidlib-container" }
+
+[features]
+# Additive, off by default, and gating no code: the benchmark harness folds it
+# into every criterion group name (`simd=off` / `simd=on`), as zvidlib's own
+# `simd` feature does, so the two arms are recorded separately.
+simd = []
+
+# Criterion drives its own harness (`harness = false`), so the bench targets must
+# not link libtest. Every codec group lives in this one target so the shared
+# `benches/support/` fixture cache is loaded and decoded once per process.
+[[bench]]
+name = "codec"
+harness = false

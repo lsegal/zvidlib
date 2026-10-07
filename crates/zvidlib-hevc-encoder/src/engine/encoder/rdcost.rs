@@ -1465,7 +1465,7 @@ mod tests {
     /// Encoder cost-estimation throughput, scalar versus the detected SIMD path.
     ///
     /// Ignored by default because it measures rather than asserts; run it with
-    /// `cargo test --features native --release --lib rdcost::tests::bench -- --ignored --nocapture`.
+    /// `cargo test -p zvidlib-hevc-encoder --release --lib rdcost::tests::bench -- --ignored --nocapture`.
     #[test]
     #[ignore = "benchmark; run explicitly with --ignored --nocapture"]
     fn bench_distortion_metrics() {

@@ -55,10 +55,9 @@ fn standardized_inter_and_show_existing_vector_matches_canonical_digest() {
     let stream = vector();
     let units = temporal_units(&stream);
     assert_eq!(units.len(), 5);
-    let expected = FrameDigest::from_hex(
-        include_str!("fixtures/av1_inter_show_existing_16x16.sha256").trim(),
-    )
-    .unwrap();
+    let expected =
+        FrameDigest::from_hex(include_str!("fixtures/av1_inter_show_existing_16x16.sha256").trim())
+            .unwrap();
 
     let mut decoder = Av1InterDecoder::new(Limits::default()).unwrap();
     let mut outputs = Vec::new();

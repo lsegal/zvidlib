@@ -186,11 +186,7 @@ macro_rules! tool_fixture {
         ToolFixture {
             name: $name,
             mp4: include_bytes!(concat!("../../tests/fixtures/", $name, ".mp4")),
-            digests: include_str!(concat!(
-                "../../tests/fixtures/",
-                $name,
-                "_yuv420.sha256"
-            )),
+            digests: include_str!(concat!("../../tests/fixtures/", $name, "_yuv420.sha256")),
             size: $size,
             tools: $tools,
         }

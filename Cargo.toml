@@ -37,6 +37,7 @@ zvidlib-vorbis-encoder = { path = "crates/zvidlib-vorbis-encoder", version = "=0
 zvidlib-aac-encoder = { path = "crates/zvidlib-aac-encoder", version = "=0.3.0" }
 zvidlib-container = { path = "crates/zvidlib-container", version = "=0.3.0" }
 
+criterion = { version = "0.7", features = ["html_reports"] }
 opus-pure = "0.2.2"
 symphonia-core = "0.5.5"
 libloading = "0.8.9"
@@ -92,53 +93,6 @@ name = "native_encode"
 path = "examples/native_encode.rs"
 required-features = ["native"]
 
-# Criterion drives its own harness (`harness = false`), so the bench targets must
-# not link libtest. Every codec group lives in this one target so the shared
-# `benches/support/` fixture cache is loaded and decoded once per process.
-[[bench]]
-name = "codec"
-path = "benches/codec.rs"
-harness = false
-
-# The AV1 software decoder's own scalar-vs-SIMD suite. It is a separate target
-# because its per-stage groups and its whole-frame decode are slower than the
-# shared fast groups above and deserve to be runnable on their own; it shares
-# `benches/support/` with them.
-[[bench]]
-name = "av1_decode"
-path = "benches/av1_decode.rs"
-harness = false
-
-# The AV1 encoder's own scalar-vs-SIMD suite. Encoder kernels are measured
-# separately from `av1_decode` so neither target's name overstates its scope,
-# and separately from `codec` because it shares none of that target's
-# decoded-frame fixtures.
-[[bench]]
-name = "av1_encode"
-path = "benches/av1_encode.rs"
-harness = false
-
-# The VP9 software decoder's own scalar-vs-SIMD suite: whole-frame decode and
-# every stage the `vp9_decode` dispatch site vectorizes. A separate target for
-# the same reasons as `av1_decode`; it shares `benches/support/` with the rest.
-[[bench]]
-name = "vp9_decode"
-path = "benches/vp9_decode.rs"
-harness = false
-
-[[bench]]
-name = "hevc_decode"
-path = "benches/hevc_decode.rs"
-harness = false
-
-# The native Vorbis encoder's scalar-vs-SIMD suite (issue #573): whole encodes
-# through the public factory, one arm per instruction set. Synthetic input
-# only, so it shares nothing with `codec`'s decoded-fixture cache.
-[[bench]]
-name = "vorbis_encode"
-path = "benches/vorbis_encode.rs"
-harness = false
-
 # The audio decode path is a separate target rather than another group in
 # `codec`: it shares `benches/support/` but none of `codec`'s decoded-frame
 # fixtures, and issue #152 specifies `cargo bench --bench audio_decode` as its
@@ -148,24 +102,6 @@ name = "audio_decode"
 path = "benches/audio_decode.rs"
 harness = false
 
-# The HEVC encoder benchmarks are their own target: they use only the synthetic
-# inputs from `benches/support`, never the decoded-fixture cache the `codec`
-# target exists to share, and the encoder's mode search is slow enough that it is
-# worth keeping out of that target's default run.
-[[bench]]
-name = "hevc_encode"
-path = "benches/hevc_encode.rs"
-harness = false
-
-# The native VP9 encoder, whole-frame and per stage, scalar versus SIMD
-# (#571). Its own target for the same reasons as `hevc_encode`: synthetic
-# inputs only, and a rate-distortion search slow enough to keep out of the
-# other targets' default runs.
-[[bench]]
-name = "vp9_encode"
-path = "benches/vp9_encode.rs"
-harness = false
-
 # The audio write/read path is a separate target rather than another group in
 # `codec`: it shares `benches/support/` but none of `codec`'s decoded-frame
 # fixtures, and issue #153 specifies `cargo bench --bench audio_mux` as its
@@ -173,33 +109,6 @@ harness = false
 [[bench]]
 name = "audio_mux"
 path = "benches/audio_mux.rs"
-harness = false
-
-# The platform hardware HEVC decoders against the software one. A separate
-# target because it measures the OS/driver decoders rather than any of the
-# crate's own kernels, so it shares none of the scalar-vs-SIMD machinery the
-# other targets are built around, and because it is the only target that skips
-# itself outright on a host without the hardware it measures.
-[[bench]]
-name = "hevc_hardware"
-path = "benches/hevc_hardware.rs"
-harness = false
-
-# The VP8 software decoder's scalar-vs-SIMD suite (issue #568): its whole-frame
-# decode and the stages only the decoder runs. The kernels it shares with the
-# encoder are timed by `vp8_encode`.
-[[bench]]
-name = "vp8_decode"
-path = "benches/vp8_decode.rs"
-harness = false
-
-# The native VP8 encoder's scalar-vs-SIMD suite: whole frames through the
-# public encoder and each of its `vp8_encode` and `vp8_recon` kernels. Its own
-# target for the same reason as `av1_encode`: it shares none of `codec`'s
-# decoded-frame fixtures, and its name says what it measures.
-[[bench]]
-name = "vp8_encode"
-path = "benches/vp8_encode.rs"
 harness = false
 
 # Issue #395's measurement: what an exact frame at an arbitrary point of a track
@@ -316,7 +225,8 @@ web-sys = { version = "0.3.104", optional = true, features = [
 wasm-bindgen-test = "0.3.77"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-criterion = { version = "0.7", features = ["html_reports"] }
+criterion = { workspace = true }
+zvidlib-bench-support = { path = "crates/zvidlib-bench-support" }
 glow = "0.18.0"
 glutin = "0.32.3"
 glutin-winit = "0.5.0"

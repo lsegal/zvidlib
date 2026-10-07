@@ -2216,7 +2216,7 @@ mod tests {
     /// `tests/sao_band_occupancy.rs` measured real content to have.
     ///
     /// Ignored by default because it measures rather than asserts; run it with
-    /// `cargo test --features native --release --lib
+    /// `cargo test -p zvidlib-hevc-encoder --release --lib
     /// recon_simd::tests::bench_band_offset_rect -- --ignored --nocapture`.
     ///
     /// This is deliberately not `bench_band_offset_row`. That benchmark times
@@ -2762,7 +2762,7 @@ mod tests {
     /// measurement used.
     ///
     /// Ignored by default because it measures rather than asserts; run it with
-    /// `cargo test --features native --release --lib
+    /// `cargo test -p zvidlib-hevc-encoder --release --lib
     /// recon_simd::tests::bench_band_offset_row -- --ignored --nocapture`.
     ///
     /// The runs are L1-resident and the arms are interleaved within each round

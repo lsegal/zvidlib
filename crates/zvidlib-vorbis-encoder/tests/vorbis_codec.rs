@@ -13,11 +13,15 @@
 
 use std::path::{Path, PathBuf};
 
-use zvidlib_core::io::{MemorySink, MemorySource};
 use zvidlib_container::mp4::{Mp4Muxer, Mp4TrackConfig, Mp4TrackFormat};
-use zvidlib_vorbis_decoder::{NativeVorbisDecoder, VORBIS_PREROLL_PACKETS, VorbisConfig};
 use zvidlib_container::{WebmDemuxer, WebmDemuxerOptions, WebmMuxer};
-use zvidlib_core::{AudioBuffer, AudioEncoderConfig, AudioEncoderFactory, AudioSampleReader, AudioTrackTiming, CancellationToken, Codec, CodecProfile, CodecSupport, EncodedSample, FrameIndex, Limits, SampleRange, TrackKind};
+use zvidlib_core::io::{MemorySink, MemorySource};
+use zvidlib_core::{
+    AudioBuffer, AudioEncoderConfig, AudioEncoderFactory, AudioSampleReader, AudioTrackTiming,
+    CancellationToken, Codec, CodecProfile, CodecSupport, EncodedSample, FrameIndex, Limits,
+    SampleRange, TrackKind,
+};
+use zvidlib_vorbis_decoder::{NativeVorbisDecoder, VORBIS_PREROLL_PACKETS, VorbisConfig};
 use zvidlib_vorbis_encoder::native_vorbis_audio_encoder_factory;
 
 fn fixture(name: &str) -> PathBuf {

@@ -19,3 +19,54 @@ pub mod yuv_to_rgba;
 use zvidlib_core::*;
 
 pub use frame::{FilterFrame, FilterPlane, MatrixCoefficients, convert_to_rgba8};
+
+/// The SIMD dispatch sites in this crate, each with the instruction set it
+/// resolves to right now. `zvidlib::simd::active_by_site` reports every crate's
+/// sites together and documents what each one covers.
+#[doc(hidden)]
+#[must_use]
+pub fn simd_sites() -> Vec<(&'static str, SimdIsa)> {
+    #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
+    let mut sites = Vec::new();
+    // The HEVC conversions have no vector backend on `wasm32`.
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        sites.push(("hevc_colorconv", colorconv::isa().as_simd_isa()));
+        sites.push((
+            "hevc_color_convert",
+            from_color_convert_isa(color_convert::detected_isa()),
+        ));
+    }
+    sites.push((
+        "yuv_to_rgba",
+        from_yuv_to_rgba_isa(yuv_to_rgba::detected_isa()),
+    ));
+    sites
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn from_color_convert_isa(isa: color_convert::Isa) -> SimdIsa {
+    use color_convert::Isa;
+    match isa {
+        Isa::Scalar => SimdIsa::Scalar,
+        #[cfg(target_arch = "x86_64")]
+        Isa::Sse41 => SimdIsa::Sse41,
+        #[cfg(target_arch = "x86_64")]
+        Isa::Avx2 => SimdIsa::Avx2,
+        #[cfg(target_arch = "aarch64")]
+        Isa::Neon => SimdIsa::Neon,
+    }
+}
+
+fn from_yuv_to_rgba_isa(isa: yuv_to_rgba::Isa) -> SimdIsa {
+    use yuv_to_rgba::Isa;
+    match isa {
+        Isa::Scalar => SimdIsa::Scalar,
+        #[cfg(target_arch = "x86_64")]
+        Isa::Sse41 => SimdIsa::Sse41,
+        #[cfg(target_arch = "x86_64")]
+        Isa::Avx2 => SimdIsa::Avx2,
+        #[cfg(target_arch = "aarch64")]
+        Isa::Neon => SimdIsa::Neon,
+    }
+}

@@ -1,4 +1,7 @@
-use zvidlib_av1::{LoopFilterParams, TxSizeGrid, deblock_frame, decode_av1_lossless_intra, decode_av1_lossless_intra_with_tx_sizes};
+use zvidlib_av1::{
+    LoopFilterParams, TxSizeGrid, deblock_frame, decode_av1_lossless_intra,
+    decode_av1_lossless_intra_with_tx_sizes,
+};
 use zvidlib_color::{FilterFrame, FilterPlane};
 use zvidlib_container::FrameDigest;
 use zvidlib_core::{ErrorKind, Limits, PixelFormat};
@@ -26,10 +29,9 @@ fn standardized_lossless_intra_vector_reconstructs_canonical_yuv() {
     assert_eq!(frame.planes[0].data, expected_luma);
     assert!(frame.planes[1].data.iter().all(|&sample| sample == 128));
     assert!(frame.planes[2].data.iter().all(|&sample| sample == 128));
-    let expected = FrameDigest::from_hex(
-        include_str!("fixtures/av1_lossless_17x9_yuv420.sha256").trim(),
-    )
-    .unwrap();
+    let expected =
+        FrameDigest::from_hex(include_str!("fixtures/av1_lossless_17x9_yuv420.sha256").trim())
+            .unwrap();
     assert_eq!(FrameDigest::from_frame(&frame).unwrap(), expected);
 }
 

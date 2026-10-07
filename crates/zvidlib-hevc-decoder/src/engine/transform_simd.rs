@@ -112,6 +112,22 @@ pub enum Backend {
 }
 
 impl Backend {
+    /// This backend in the crate-wide vocabulary of `zvidlib::simd`. SSE4.2 is
+    /// SSE4.1 plus the 64-bit compare the dequantization clip needs; that
+    /// vocabulary has no separate name for it, so both report as `Sse41`.
+    #[doc(hidden)]
+    pub fn as_simd_isa(self) -> zvidlib_core::SimdIsa {
+        use zvidlib_core::SimdIsa;
+        match self {
+            Backend::Scalar => SimdIsa::Scalar,
+            Backend::Sse41 | Backend::Sse42 => SimdIsa::Sse41,
+            Backend::Avx2 => SimdIsa::Avx2,
+            Backend::Neon => SimdIsa::Neon,
+        }
+    }
+}
+
+impl Backend {
     /// Whether the running host can execute this backend at all.
     #[must_use]
     pub fn supported(self) -> bool {
@@ -1157,7 +1173,7 @@ mod tests {
     /// reason.
     ///
     /// Ignored by default because it only measures; run it with
-    /// `cargo test --release --features native --lib \
+    /// `cargo test -p zvidlib-hevc-decoder --release --lib \
     ///  bench_inverse_transform_and_dequant -- --ignored --nocapture`.
     #[test]
     #[ignore = "benchmark; run explicitly with --ignored --nocapture"]

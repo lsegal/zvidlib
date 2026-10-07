@@ -8,10 +8,17 @@
 //! libvpx's decode where ffmpeg is installed.
 #![cfg(not(target_arch = "wasm32"))]
 
-use zvidlib_core::io::{MemorySink, MemorySource};
 use zvidlib_container::mp4::{Mp4TrackConfig, Mp4TrackFormat};
-use zvidlib_container::{ExpectedVideoFrame, FrameDigest, VideoDecoderConformanceVector, WebmDemuxer, WebmMuxer, verify_video_decoder_conformance};
-use zvidlib_core::{CancellationToken, Codec, CodecProfile, ColorRange, CpuFrameSource, EncodedSample, FrameIndex, FrameSource, HardwarePreference, Limits, Orientation, PixelFormat, Plane, VideoDecoderConfig, VideoDecoderFactory, VideoDimensions, VideoEncoderConfig, VideoEncoderFactory, VideoFrame};
+use zvidlib_container::{
+    ExpectedVideoFrame, FrameDigest, VideoDecoderConformanceVector, WebmDemuxer, WebmMuxer,
+    verify_video_decoder_conformance,
+};
+use zvidlib_core::io::{MemorySink, MemorySource};
+use zvidlib_core::{
+    CancellationToken, Codec, CodecProfile, ColorRange, CpuFrameSource, EncodedSample, FrameIndex,
+    FrameSource, HardwarePreference, Limits, Orientation, PixelFormat, Plane, VideoDecoderConfig,
+    VideoDecoderFactory, VideoDimensions, VideoEncoderConfig, VideoEncoderFactory, VideoFrame,
+};
 use zvidlib_vp8::{native_vp8_video_decoder_factory, native_vp8_video_encoder_factory};
 
 fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
@@ -56,8 +63,7 @@ fn encoder_configuration(
 
 /// Every frame of the bundled 98x66 `testsrc2` clip, as RGBA.
 fn source_frames() -> (VideoDimensions, Vec<VideoFrame>) {
-    let source =
-        MemorySource::new(include_bytes!("fixtures/vp8/vp8_testsrc2_98x66.webm").to_vec());
+    let source = MemorySource::new(include_bytes!("fixtures/vp8/vp8_testsrc2_98x66.webm").to_vec());
     let limits = Limits::default();
     let demuxer = block_on(WebmDemuxer::open(&source, Default::default())).unwrap();
     let track = &demuxer.tracks[0];

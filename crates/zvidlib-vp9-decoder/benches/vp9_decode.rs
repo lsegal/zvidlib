@@ -3,8 +3,8 @@
 //! The VP9 counterpart of `benches/av1_decode.rs` and `benches/hevc_decode.rs`:
 //! how fast whole VP9 frames decode, and how fast each stage the `vp9_decode`
 //! dispatch site vectorizes runs on its own. Every group runs once per
-//! instruction set `zvidlib::simd::available()` reports, through the
-//! crate-wide override in [`zvidlib::simd`], and `benches/support/isa.rs`
+//! instruction set `zvidlib_core::simd::available()` reports, through the
+//! crate-wide override in [`zvidlib_core::simd`], and `benches/support/isa.rs`
 //! asserts that every arm is bit-exact with scalar before timing it and that
 //! the override really landed in every dispatch site.
 //!
@@ -23,7 +23,7 @@
 //! | `vp9_loop_filter_{4,8,16}` | `filter4`, `filter8` and the 16-wide filter on every edge of a plane, `src/vp9_simd/loopfilter.rs` |
 //!
 //! The per-stage groups run over one 1080p luma plane each, through
-//! `zvidlib::vp9_decoder_bench`, the narrow benchmark-only surface over the
+//! `zvidlib_vp9_decoder::vp9_simd::bench`, the narrow benchmark-only surface over the
 //! otherwise crate-private decoder. The whole-frame group stops at the decoded
 //! YUV picture, as `hevc_decode_to_picture` does: the public decoder's RGBA
 //! output conversion is the separate `yuv_to_rgba` site, and
@@ -37,9 +37,12 @@ mod support;
 use std::time::Duration;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use zvidlib::io::MemorySource;
-use zvidlib::vp9_decoder_bench::{InterpFilter, IntraKind, LoopFilterTaps, Stage, TransformKind};
-use zvidlib::{Codec, Limits, Mp4Demuxer, Mp4DemuxerOptions};
+use zvidlib_container::{Mp4Demuxer, Mp4DemuxerOptions};
+use zvidlib_core::io::MemorySource;
+use zvidlib_core::{Codec, Limits};
+use zvidlib_vp9_decoder::vp9_simd::bench::{
+    InterpFilter, IntraKind, LoopFilterTaps, Stage, TransformKind,
+};
 
 use support::isa::{IsaWorkload, bench_across_isas, log_host_isas};
 use support::{FrameWork, block_on};
@@ -74,7 +77,7 @@ fn bench_stages(criterion: &mut Criterion, stages: Vec<(IsaWorkload<'_>, Stage)>
 /// hidden alternate reference frames, decoded end to end.
 fn vp9_decode_to_picture(criterion: &mut Criterion) {
     let source =
-        MemorySource::new(include_bytes!("../crates/zvidlib-vp9-decoder/tests/fixtures/vp9_bbb_256x144.mp4").to_vec());
+        MemorySource::new(include_bytes!("../tests/fixtures/vp9_bbb_256x144.mp4").to_vec());
     let movie = block_on(Mp4Demuxer::open(&source, Mp4DemuxerOptions::default()))
         .expect("the VP9 fixture is a readable MP4");
     let track = movie.track(1).expect("the VP9 fixture has track 1");

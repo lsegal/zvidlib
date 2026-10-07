@@ -6,9 +6,9 @@
 //! order:
 //!
 //! 1. runs the workload under every instruction set
-//!    [`zvidlib::simd::available`] reports and checks that all of them produce
+//!    [`simd::available`] reports and checks that all of them produce
 //!    byte-identical output (see [`assert_bit_exact_across_isas`]);
-//! 2. asserts, through [`zvidlib::simd::active_by_site`], that each dispatch
+//! 2. asserts, through the package's [`Sites`], that each dispatch
 //!    family really did follow the override;
 //! 3. hands each arm to criterion as `<codec>/<isa>`, which is what makes
 //!    scalar-vs-SIMD a direct criterion comparison rather than two unrelated
@@ -18,22 +18,18 @@
 //!
 //! These groups are named `<codec>/<isa>` (`av1_deblock/scalar` next to
 //! `av1_deblock/neon`) rather than carrying the `simd=on`/`simd=off` build tag
-//! [`super::group_name`] adds. The tag distinguishes two *builds* of a crate
+//! the package's `group_name` adds. The tag distinguishes two *builds* of a crate
 //! whose kernels are chosen at run time; here the instruction set is the
 //! measured axis and is named directly, so both arms of a comparison always
 //! appear in the same run.
-
-// Compiled separately by each bench target, each of which uses only the
-// helpers its own groups need.
-#![allow(dead_code)]
 
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use criterion::Criterion;
-use zvidlib::simd::{self, SimdIsa};
+use zvidlib_core::simd::{self, SimdIsa};
 
-use super::{AudioWork, FrameWork};
+use crate::{AudioWork, FrameWork, Sites};
 
 /// Logs what this host can actually execute, before anything is timed.
 ///
@@ -47,7 +43,7 @@ use super::{AudioWork, FrameWork};
 /// lifts these lines into its job summary so a run whose vector arms vanished
 /// because the runner pool changed is diagnosable rather than mysterious.
 ///
-/// [`simd::active_by_site`] is logged alongside it because "this host supports
+/// the package's [`Sites`] is logged alongside it because "this host supports
 /// AVX2" and "every dispatch family agrees to use it" are separate claims;
 /// [`bench_across_isas`] asserts the second one per arm, and this prints its
 /// starting state.
@@ -55,14 +51,14 @@ use super::{AudioWork, FrameWork};
 /// It takes a `&mut Criterion` and measures nothing so that it can be listed in
 /// a target's `criterion_group!` like any other group, which is what guarantees
 /// it runs before the first timed arm.
-pub fn log_host_isas(_criterion: &mut Criterion) {
+pub fn log_host_isas(_criterion: &mut Criterion, sites: Sites) {
     let names: Vec<&str> = simd::available().iter().map(|isa| isa.name()).collect();
     println!("# host instruction sets: {}", names.join(", "));
     println!(
         "# widest detected instruction set: {}",
         simd::active().name()
     );
-    for (site, isa) in simd::active_by_site() {
+    for (site, isa) in sites() {
         println!("# dispatch site {site}: {}", isa.name());
     }
 }
@@ -103,11 +99,15 @@ impl<'a> IsaWorkload<'a> {
 /// are what the bit-exactness guard compares across arms, so returning
 /// something that does not depend on the kernels under test would silently
 /// disarm it.
-pub fn bench_across_isas<F>(criterion: &mut Criterion, workload: &IsaWorkload<'_>, run: F)
-where
+pub fn bench_across_isas<F>(
+    criterion: &mut Criterion,
+    workload: &IsaWorkload<'_>,
+    sites: Sites,
+    run: F,
+) where
     F: Fn() -> Vec<u8>,
 {
-    assert_bit_exact_across_isas(workload.codec, &run);
+    assert_bit_exact_across_isas(workload.codec, sites, &run);
 
     let mut group = criterion.benchmark_group(workload.codec);
     group.sample_size(workload.sample_size);
@@ -116,7 +116,7 @@ where
     group.throughput(workload.work.elements());
     for isa in simd::available() {
         simd::set_override(Some(isa));
-        assert_reached_every_site(workload.codec, isa);
+        assert_reached_every_site(workload.codec, isa, sites);
         report_megapixels_per_second(workload, isa, &run);
         group.bench_function(isa.name(), |bencher| bencher.iter(|| black_box(run())));
     }
@@ -156,6 +156,7 @@ impl<'a> AudioIsaWorkload<'a> {
 pub fn bench_audio_across_isas<F>(
     criterion: &mut Criterion,
     workload: &AudioIsaWorkload<'_>,
+    sites: Sites,
     mut run: F,
 ) where
     F: FnMut() -> Vec<u8>,
@@ -163,7 +164,7 @@ pub fn bench_audio_across_isas<F>(
     {
         // The guard takes a `Fn`; a stage that reuses its buffers is `FnMut`.
         let run = std::cell::RefCell::new(&mut run);
-        assert_bit_exact_across_isas(workload.codec, &|| (*run.borrow_mut())());
+        assert_bit_exact_across_isas(workload.codec, sites, &|| (*run.borrow_mut())());
     }
 
     let mut group = criterion.benchmark_group(workload.codec);
@@ -173,7 +174,7 @@ pub fn bench_audio_across_isas<F>(
     group.throughput(workload.work.elements());
     for isa in simd::available() {
         simd::set_override(Some(isa));
-        assert_reached_every_site(workload.codec, isa);
+        assert_reached_every_site(workload.codec, isa, sites);
         let started = Instant::now();
         black_box(run());
         let elapsed = started.elapsed();
@@ -199,9 +200,9 @@ pub fn bench_audio_across_isas<F>(
 /// kernel's vector path is not faster on this host" — and the latter really
 /// happens, notably for HEVC on hosts where the scalar reference
 /// auto-vectorizes well under `lto = "fat"`. Reading each site's own selector
-/// back through [`simd::active_by_site`] settles it directly.
-pub fn assert_reached_every_site(codec: &str, isa: SimdIsa) {
-    for (site, site_isa) in simd::active_by_site() {
+/// back through the package's [`Sites`] settles it directly.
+pub fn assert_reached_every_site(codec: &str, isa: SimdIsa, sites: Sites) {
+    for (site, site_isa) in sites() {
         assert_eq!(
             site_isa,
             isa,
@@ -243,7 +244,7 @@ where
 /// scalar reference. This re-checks that claim against the exact workload about
 /// to be timed, because a speedup measured on a kernel that quietly diverged is
 /// worse than no measurement: it looks like progress.
-pub fn assert_bit_exact_across_isas<F>(label: &str, run: &F)
+pub fn assert_bit_exact_across_isas<F>(label: &str, sites: Sites, run: &F)
 where
     F: Fn() -> Vec<u8>,
 {
@@ -255,7 +256,7 @@ where
             continue;
         }
         simd::set_override(Some(isa));
-        assert_reached_every_site(label, isa);
+        assert_reached_every_site(label, isa, sites);
         let actual = run();
         assert_eq!(
             actual.len(),

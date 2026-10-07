@@ -857,11 +857,10 @@ mod tests {
             VideoDecoderConformanceVector, VideoDimensions, verify_video_decoder_conformance,
         };
 
-        let expected =
-            include_str!("../tests/fixtures/bbb_hevc_512x288_gop32_rgba.sha256")
-                .lines()
-                .map(|line| FrameDigest::from_hex(line.split_once(' ').unwrap().1).unwrap())
-                .collect::<Vec<_>>();
+        let expected = include_str!("../tests/fixtures/bbb_hevc_512x288_gop32_rgba.sha256")
+            .lines()
+            .map(|line| FrameDigest::from_hex(line.split_once(' ').unwrap().1).unwrap())
+            .collect::<Vec<_>>();
         let limits = Limits::default();
         let source = MemorySource::new(
             include_bytes!("../tests/fixtures/bbb_hevc_512x288_gop32.mp4").to_vec(),
@@ -927,4 +926,27 @@ mod tests {
             }
         }
     }
+}
+
+/// The SIMD dispatch sites in this crate, each with the instruction set it
+/// resolves to right now. `zvidlib::simd::active_by_site` reports every crate's
+/// sites together and documents what each one covers.
+#[doc(hidden)]
+#[must_use]
+pub fn simd_sites() -> Vec<(&'static str, SimdIsa)> {
+    // The HEVC kernels have no vector backend on `wasm32`, so they are not
+    // reported there.
+    #[cfg(target_arch = "wasm32")]
+    return Vec::new();
+    #[cfg(not(target_arch = "wasm32"))]
+    vec![
+        (
+            "hevc_prediction_filters",
+            engine::simd::detected_isa().as_simd_isa(),
+        ),
+        (
+            "hevc_transforms",
+            engine::transform_simd::detected().as_simd_isa(),
+        ),
+    ]
 }

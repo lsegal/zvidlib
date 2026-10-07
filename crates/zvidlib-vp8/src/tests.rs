@@ -179,10 +179,9 @@ fn hidden_alternate_reference_frames_decode_exactly_as_libvpx_does() {
     // frames 1 and 17 are hidden inter frames that only update the alternate
     // reference; see `tests/fixtures/codec/README.md`.
     let ivf = include_bytes!("../tests/fixtures/vp8/vp8_altref_98x66.ivf");
-    let expected: Vec<&str> =
-        include_str!("../tests/fixtures/vp8/vp8_altref_98x66.ivf.md5")
-            .lines()
-            .collect();
+    let expected: Vec<&str> = include_str!("../tests/fixtures/vp8/vp8_altref_98x66.ivf.md5")
+        .lines()
+        .collect();
     let frames = ivf_frames(ivf);
     let hidden: Vec<usize> = (0..frames.len())
         .filter(|&index| frames[index][0] & 0x10 == 0)
@@ -242,10 +241,9 @@ fn decodes_a_webm_vp8_track_exactly_as_libvpx_does() {
     let source = crate::io::MemorySource::new(
         include_bytes!("../tests/fixtures/vp8/vp8_testsrc2_98x66.webm").to_vec(),
     );
-    let expected: Vec<&str> =
-        include_str!("../tests/fixtures/vp8/vp8_testsrc2_98x66.webm.md5")
-            .lines()
-            .collect();
+    let expected: Vec<&str> = include_str!("../tests/fixtures/vp8/vp8_testsrc2_98x66.webm.md5")
+        .lines()
+        .collect();
     let demuxer = block_on(crate::WebmDemuxer::open(&source, Default::default())).unwrap();
     let track = &demuxer.tracks[0];
     assert_eq!(track.codec, crate::Codec::Vp8);
@@ -417,10 +415,9 @@ fn skips_a_webm_vp8_tracks_hidden_alternate_references_as_libvpx_does() {
     let source = crate::io::MemorySource::new(
         include_bytes!("../tests/fixtures/vp8/vp8_altref_98x66.webm").to_vec(),
     );
-    let expected: Vec<&str> =
-        include_str!("../tests/fixtures/vp8/vp8_altref_98x66.webm.md5")
-            .lines()
-            .collect();
+    let expected: Vec<&str> = include_str!("../tests/fixtures/vp8/vp8_altref_98x66.webm.md5")
+        .lines()
+        .collect();
     assert_eq!(expected.len(), 40);
     let demuxer = block_on(crate::WebmDemuxer::open(&source, Default::default())).unwrap();
     let track = &demuxer.tracks[0];

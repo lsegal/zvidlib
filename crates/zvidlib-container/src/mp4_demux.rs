@@ -2459,8 +2459,9 @@ mod tests {
     #[test]
     fn bundled_aac_track_exposes_indexed_packets_configuration_and_gapless_timing() {
         block_on(async {
-            let source =
-                MemorySource::new(include_bytes!("../../../examples/media/BigBuckBunny.mp4").to_vec());
+            let source = MemorySource::new(
+                include_bytes!("../../../examples/media/BigBuckBunny.mp4").to_vec(),
+            );
             let movie = Mp4Demuxer::open(&source, Mp4DemuxerOptions::default())
                 .await
                 .unwrap();

@@ -16,4 +16,20 @@ zvidlib-vp9-decoder = { workspace = true }
 zvidlib-hardware = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
+zvidlib-bench-support = { path = "../zvidlib-bench-support" }
 zvidlib-container = { path = "../zvidlib-container" }
+
+[features]
+# Additive, off by default, and gating no code: the benchmark harness folds it
+# into every criterion group name (`simd=off` / `simd=on`), as zvidlib's own
+# `simd` feature does, so the two arms are recorded separately.
+simd = []
+
+# The native VP9 encoder, whole-frame and per stage, scalar versus SIMD
+# (#571). Its own target for the same reasons as `hevc_encode`: synthetic
+# inputs only, and a rate-distortion search slow enough to keep out of the
+# other targets' default runs.
+[[bench]]
+name = "vp9_encode"
+harness = false

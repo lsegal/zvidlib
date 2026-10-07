@@ -8,7 +8,10 @@
 
 use std::time::Instant;
 
-use zvidlib_av1::{Av1IntraBlock, Av1IntraFrame, Av1IntraMode, SmoothMode, add_residual_row, av1_intra_simd, directional_row, paeth_row, smooth_row, sum_samples};
+use zvidlib_av1::{
+    Av1IntraBlock, Av1IntraFrame, Av1IntraMode, SmoothMode, add_residual_row, av1_intra_simd,
+    directional_row, paeth_row, smooth_row, sum_samples,
+};
 use zvidlib_core::{ColorRange, Limits, VideoDimensions};
 
 const MODES: [Av1IntraMode; 14] = [
@@ -304,7 +307,7 @@ fn reconstructed_blocks_are_bit_exact_for_every_size_and_mode() {
 
 /// Reports the throughput of the dispatched kernels against the scalar
 /// reference for representative AV1 block sizes. Run with
-/// `cargo test --release --features native --test av1_simd_intra -- --nocapture`
+/// `cargo test -p zvidlib-av1 --release --test av1_simd_intra -- --nocapture`
 /// to see the numbers; the test itself only asserts that both paths agree, so
 /// it never fails because a shared CI runner was slow.
 #[test]

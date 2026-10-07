@@ -4,12 +4,12 @@
 //!
 //! * **Whole-frame versus per-stage.** The whole-frame groups encode a
 //!   synthetic sequence through the public
-//!   [`zvidlib::native_hevc_video_encoder_factory`] and report frames/sec and
+//!   [`zvidlib_hevc_encoder::native_hevc_video_encoder_factory`] and report frames/sec and
 //!   megapixels/sec. The per-stage groups time the pipeline's individual stages
-//!   through [`zvidlib::hevc_encoder_bench`], so the mode-search cost — which
+//!   through [`zvidlib_hevc_encoder::bench`], so the mode-search cost — which
 //!   dominates — is not mistaken for bitstream-writing cost.
 //! * **Instruction set.** Every group runs once per entry in
-//!   `zvidlib::simd::available()` through `support::isa::bench_across_isas`,
+//!   `zvidlib_core::simd::available()` through `support::isa::bench_across_isas`,
 //!   which pins the crate-wide override, asserts it reached every dispatch
 //!   family, and checks each arm is bit-exact with scalar before timing it.
 //!
@@ -64,12 +64,13 @@
 mod support;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use zvidlib::hevc_encoder_bench as encoder_bench;
-use zvidlib::{
+use zvidlib_core::{
     Codec, CodecProfile, ColorRange, CpuFrameSource, FrameIndex, FrameSource, HardwarePreference,
     Limits, Orientation, PixelFormat, VideoDimensions, VideoEncoderConfig, VideoEncoderFactory,
-    VideoFrame, native_hevc_video_encoder_factory,
+    VideoFrame,
 };
+use zvidlib_hevc_encoder::bench as encoder_bench;
+use zvidlib_hevc_encoder::native_hevc_video_encoder_factory;
 
 use support::FrameWork;
 use support::isa::{IsaWorkload, bench_across_isas, log_host_isas};

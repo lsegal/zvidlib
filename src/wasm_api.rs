@@ -3005,7 +3005,8 @@ mod tests {
     /// decoder otherwise, for frames on either side of its second key frame.
     #[wasm_bindgen_test(async)]
     async fn video_get_decodes_a_vp9_track() {
-        const SAMPLE: &[u8] = include_bytes!("../crates/zvidlib-vp9-decoder/tests/fixtures/vp9_bbb_256x144.mp4");
+        const SAMPLE: &[u8] =
+            include_bytes!("../crates/zvidlib-vp9-decoder/tests/fixtures/vp9_bbb_256x144.mp4");
         let bytes = Uint8Array::from(SAMPLE);
         let input =
             WasmMediaInput::open_inner(bytes.into(), Limits::default().max_allocation_bytes, None)

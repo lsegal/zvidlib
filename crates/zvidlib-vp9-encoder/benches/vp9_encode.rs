@@ -4,13 +4,13 @@
 //!
 //! * **Whole-frame versus per-stage.** `vp9_encode_key_frame` and
 //!   `vp9_encode_sequence` encode synthetic RGBA8 frames through the public
-//!   [`zvidlib::native_vp9_video_encoder_factory`]: one key frame, which
+//!   [`zvidlib_vp9_encoder::native_vp9_video_encoder_factory`]: one key frame, which
 //!   searches intra prediction only, and a key frame followed by three inter
 //!   frames, which adds the motion search. The `vp9_encode_stage_*` groups time
-//!   each vectorized kernel on its own through [`zvidlib::vp9_encoder_bench`],
+//!   each vectorized kernel on its own through [`zvidlib_vp9_encoder::bench`],
 //!   so a whole-frame ratio can be attributed to the stage that moved it.
 //! * **Instruction set.** Every group runs once per entry in
-//!   `zvidlib::simd::available()` through `support::isa::bench_across_isas`,
+//!   `zvidlib_core::simd::available()` through `support::isa::bench_across_isas`,
 //!   which pins the crate-wide override, asserts it reached every dispatch
 //!   family (the encoder's kernels are the `vp9_encode` site), and checks each
 //!   arm is bit-exact with scalar before timing it. For the whole-frame groups
@@ -27,12 +27,13 @@
 mod support;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use zvidlib::vp9_encoder_bench as encoder_bench;
-use zvidlib::{
+use zvidlib_core::{
     Codec, CodecProfile, ColorRange, CpuFrameSource, FrameIndex, FrameSource, HardwarePreference,
     Limits, Orientation, PixelFormat, VideoDimensions, VideoEncoderConfig, VideoEncoderFactory,
-    VideoFrame, native_vp9_video_encoder_factory,
+    VideoFrame,
 };
+use zvidlib_vp9_encoder::bench as encoder_bench;
+use zvidlib_vp9_encoder::native_vp9_video_encoder_factory;
 
 use support::FrameWork;
 use support::isa::{IsaWorkload, bench_across_isas, log_host_isas};

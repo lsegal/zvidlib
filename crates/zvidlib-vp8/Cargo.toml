@@ -14,4 +14,27 @@ zvidlib-color = { workspace = true }
 zvidlib-hardware = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
+zvidlib-bench-support = { path = "../zvidlib-bench-support" }
 zvidlib-container = { path = "../zvidlib-container" }
+
+[features]
+# Additive, off by default, and gating no code: the benchmark harness folds it
+# into every criterion group name (`simd=off` / `simd=on`), as zvidlib's own
+# `simd` feature does, so the two arms are recorded separately.
+simd = []
+
+# The VP8 software decoder's scalar-vs-SIMD suite (issue #568): its whole-frame
+# decode and the stages only the decoder runs. The kernels it shares with the
+# encoder are timed by `vp8_encode`.
+[[bench]]
+name = "vp8_decode"
+harness = false
+
+# The native VP8 encoder's scalar-vs-SIMD suite: whole frames through the
+# public encoder and each of its `vp8_encode` and `vp8_recon` kernels. Its own
+# target for the same reason as `av1_encode`: it shares none of `codec`'s
+# decoded-frame fixtures, and its name says what it measures.
+[[bench]]
+name = "vp8_encode"
+harness = false

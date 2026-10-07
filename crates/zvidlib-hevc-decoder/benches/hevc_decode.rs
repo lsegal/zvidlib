@@ -5,8 +5,8 @@
 //! decodes, how much of that is the decoder's own work rather than the RGBA
 //! output conversion every application pays on the way out, and where the time
 //! inside a decode goes. Every group runs once per
-//! instruction set `zvidlib::simd::available()` reports, through the crate-wide
-//! override in [`zvidlib::simd`], and `benches/support/isa.rs` asserts both that
+//! instruction set `zvidlib_core::simd::available()` reports, through the crate-wide
+//! override in [`zvidlib_core::simd`], and `benches/support/isa.rs` asserts both that
 //! each arm is bit-exact with scalar before timing it and that the override
 //! really landed in every dispatch family — so a reported speedup cannot come
 //! from a kernel that quietly diverged or a switch that never took effect.
@@ -51,7 +51,7 @@
 //! what vectorizing everything else can buy, and that is only readable next to
 //! the other stages in the same report.
 //!
-//! The per-stage inputs come from `zvidlib::hevc_decoder_bench`, a narrow public
+//! The per-stage inputs come from `zvidlib_hevc_decoder::decode_bench`, a narrow public
 //! surface over the otherwise crate-private HEVC engine, which is what lets an
 //! external benchmark crate reach the individual stages at all.
 //!
@@ -61,10 +61,9 @@ mod support;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
-use zvidlib::hevc_decoder_bench::{HevcStageInputs, decode_frames, decode_pictures};
-use zvidlib::{
-    CancellationToken, ExactFrameReader, FrameIndex, Limits, native_hevc_video_decoder_factory,
-};
+use zvidlib_core::{CancellationToken, ExactFrameReader, FrameIndex, Limits};
+use zvidlib_hevc_decoder::decode_bench::{HevcStageInputs, decode_frames, decode_pictures};
+use zvidlib_hevc_decoder::native_hevc_video_decoder_factory;
 
 use support::isa::{IsaWorkload, bench_across_isas, log_host_isas};
 use support::{FrameWork, group_name, report_throughput};

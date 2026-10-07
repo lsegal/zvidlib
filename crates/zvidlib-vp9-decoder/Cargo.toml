@@ -15,4 +15,19 @@ zvidlib-vp9-syntax = { workspace = true }
 zvidlib-hardware = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
+zvidlib-bench-support = { path = "../zvidlib-bench-support" }
 zvidlib-container = { path = "../zvidlib-container" }
+
+[features]
+# Additive, off by default, and gating no code: the benchmark harness folds it
+# into every criterion group name (`simd=off` / `simd=on`), as zvidlib's own
+# `simd` feature does, so the two arms are recorded separately.
+simd = []
+
+# The VP9 software decoder's own scalar-vs-SIMD suite: whole-frame decode and
+# every stage the `vp9_decode` dispatch site vectorizes. A separate target for
+# the same reasons as `av1_decode`; it shares `benches/support/` with the rest.
+[[bench]]
+name = "vp9_decode"
+harness = false

@@ -7,8 +7,8 @@
 //! decoder's. This target times whole frames through the public encoder and
 //! then each of those kernels over a frame's worth of blocks.
 //!
-//! Every group runs once per instruction set `zvidlib::simd::available()`
-//! reports, through the crate-wide override in [`zvidlib::simd`], and
+//! Every group runs once per instruction set `zvidlib_core::simd::available()`
+//! reports, through the crate-wide override in [`zvidlib_core::simd`], and
 //! `benches/support/isa.rs` asserts that each arm is bit-exact with scalar
 //! before timing it and that the override really landed in each dispatch
 //! family — so a reported speedup cannot come from a kernel that quietly
@@ -32,8 +32,8 @@
 //! | `vp8_encode_stage_loop_filter` | the normal loop filter over a frame, `loop_filter.rs` | `vp8_recon` |
 //!
 //! The per-stage groups reach the kernels through
-//! [`zvidlib::vp8_encoder_bench`], the `#[doc(hidden)]` per-stage access that is
-//! the VP8 counterpart to `zvidlib::av1_encoder_bench`. Each covers one
+//! [`zvidlib_vp8::bench`], the `#[doc(hidden)]` per-stage access that is
+//! the VP8 counterpart to `zvidlib_av1_encoder::bench`. Each covers one
 //! 640x352 frame, the whole-frame size, so a stage's time reads directly
 //! against a frame's. `ZVIDLIB_BENCH_LARGE=1` adds the 1080p whole-frame
 //! groups.
@@ -46,12 +46,12 @@ mod support;
 use std::time::Duration;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use zvidlib::vp8_encoder_bench::{self as encoder_bench, BenchPlane};
-use zvidlib::{
+use zvidlib_core::{
     Codec, CodecProfile, ColorRange, CpuFrameSource, FrameIndex, FrameSource, HardwarePreference,
     Limits, Orientation, PixelFormat, VideoDimensions, VideoEncoderConfig, VideoEncoderFactory,
-    native_vp8_video_encoder_factory,
 };
+use zvidlib_vp8::bench::{self as encoder_bench, BenchPlane};
+use zvidlib_vp8::native_vp8_video_encoder_factory;
 
 use support::FrameWork;
 use support::isa::{IsaWorkload, bench_across_isas, log_host_isas};
@@ -137,7 +137,7 @@ fn vp8_encode_whole_frame(criterion: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
-// Per-stage groups (src/vp8/, through zvidlib::vp8_encoder_bench)
+// Per-stage groups (src/vp8/, through zvidlib_vp8::bench)
 // ---------------------------------------------------------------------------
 
 /// A deterministic plane: a gradient with texture and noise, so neither a

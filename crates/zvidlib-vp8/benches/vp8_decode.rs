@@ -4,8 +4,8 @@
 //! The decode-side counterpart to `benches/vp8_encode.rs`, which times the
 //! reconstruction kernels the encoder and decoder share (`vp8_recon`). This
 //! target times what only the decoder runs, and the decoder as a whole. Every
-//! group runs once per instruction set `zvidlib::simd::available()` reports,
-//! through the crate-wide override in [`zvidlib::simd`], and
+//! group runs once per instruction set `zvidlib_core::simd::available()` reports,
+//! through the crate-wide override in [`zvidlib_core::simd`], and
 //! `benches/support/isa.rs` asserts both that each arm is bit-exact with scalar
 //! before timing it and that the override really landed in every dispatch
 //! family.
@@ -26,7 +26,7 @@
 //! `vpx_decode`'s `vp8_decode_frame`), so their ratio sits below the per-stage
 //! ones.
 //!
-//! The per-stage inputs come from `zvidlib::vp8_decoder_bench`, a narrow public
+//! The per-stage inputs come from `zvidlib_vp8::decode_bench`, a narrow public
 //! surface over the otherwise crate-private decoder.
 //!
 //! See `benches/README.md` for how to run and filter the suite.
@@ -37,7 +37,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use zvidlib::vp8_decoder_bench::{Vp8StageInputs, decode_pictures, synthetic_stream};
+use zvidlib_vp8::decode_bench::{Vp8StageInputs, decode_pictures, synthetic_stream};
 
 use support::FrameWork;
 use support::isa::{IsaWorkload, bench_across_isas, log_host_isas};
@@ -89,7 +89,7 @@ fn conformance_vectors() -> Vec<Vec<&'static [u8]>> {
     macro_rules! vectors {
         ($($number:literal),* $(,)?) => {
             [$(&include_bytes!(concat!(
-                "../crates/zvidlib-vp8/tests/fixtures/vp8/vp80-00-comprehensive-",
+                "../tests/fixtures/vp8/vp80-00-comprehensive-",
                 $number,
                 ".ivf"
             ))[..]),*]

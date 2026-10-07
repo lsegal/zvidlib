@@ -5,12 +5,20 @@ use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
-use zvidlib_hardware::readback as readback;
-use zvidlib_core::io::{MemorySink, MemorySource};
 use zvidlib_container::mp4::{Mp4Muxer, Mp4TrackConfig, Mp4TrackFormat};
+use zvidlib_container::{
+    FrameDigest, Mp4Demuxer, Mp4DemuxerOptions, VideoDecoderConformanceVector,
+    VideoEncoderConformanceVector, verify_video_encoder_conformance,
+};
+use zvidlib_core::io::{MemorySink, MemorySource};
 use zvidlib_core::{CancellationToken, ExactFrameReader, FrameIndex};
-use zvidlib_container::{FrameDigest, Mp4Demuxer, Mp4DemuxerOptions, VideoDecoderConformanceVector, VideoEncoderConformanceVector, verify_video_encoder_conformance};
-use zvidlib_core::{Codec, CodecImplementation, CodecProfile, CodecSupport, ColorRange, CpuFrameSource, EncodedSample, EncodedVideoSample, FrameSource, HardwarePreference, Limits, Orientation, PixelFormat, Plane, VideoDecoderConfig, VideoDecoderFactory, VideoDimensions, VideoEncoder, VideoEncoderConfig, VideoEncoderFactory, VideoFrame};
+use zvidlib_core::{
+    Codec, CodecImplementation, CodecProfile, CodecSupport, ColorRange, CpuFrameSource,
+    EncodedSample, EncodedVideoSample, FrameSource, HardwarePreference, Limits, Orientation,
+    PixelFormat, Plane, VideoDecoderConfig, VideoDecoderFactory, VideoDimensions, VideoEncoder,
+    VideoEncoderConfig, VideoEncoderFactory, VideoFrame,
+};
+use zvidlib_hardware::readback;
 use zvidlib_hevc_decoder::native_hevc_video_decoder_factory;
 use zvidlib_hevc_encoder::native_hevc_video_encoder_factory;
 
@@ -27,15 +35,17 @@ fn block_on<T>(future: impl Future<Output = T>) -> T {
 }
 
 fn bundled_vector() -> VideoDecoderConformanceVector {
-    let expected = include_str!("../../zvidlib-hevc-decoder/tests/fixtures/big_buck_bunny_hevc_rgba.sha256")
-        .lines()
-        .map(|line| {
-            let (_, digest) = line.split_once(' ').unwrap();
-            FrameDigest::from_hex(digest).unwrap()
-        })
-        .collect::<Vec<_>>();
+    let expected =
+        include_str!("../../zvidlib-hevc-decoder/tests/fixtures/big_buck_bunny_hevc_rgba.sha256")
+            .lines()
+            .map(|line| {
+                let (_, digest) = line.split_once(' ').unwrap();
+                FrameDigest::from_hex(digest).unwrap()
+            })
+            .collect::<Vec<_>>();
     let limits = Limits::default();
-    let source = MemorySource::new(include_bytes!("../../../examples/media/BigBuckBunny.mp4").to_vec());
+    let source =
+        MemorySource::new(include_bytes!("../../../examples/media/BigBuckBunny.mp4").to_vec());
     block_on(VideoDecoderConformanceVector::from_mp4(
         "bundled HEVC Main sample",
         &source,

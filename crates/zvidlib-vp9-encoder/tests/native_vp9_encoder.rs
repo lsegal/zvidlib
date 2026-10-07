@@ -8,13 +8,21 @@ use std::io::Write;
 use std::pin::pin;
 use std::process::{Command, Stdio};
 use std::task::{Context, Poll, Waker};
-use zvidlib_core::io::{MemorySink, MemorySource};
 use zvidlib_container::mp4::{Mp4Muxer, Mp4TrackConfig, Mp4TrackFormat};
-use zvidlib_container::{Mp4Demuxer, Mp4DemuxerOptions, VideoEncoderConformanceVector, verify_video_encoder_conformance};
-use zvidlib_core::{CancellationToken, Codec, CodecImplementation, CodecProfile, CodecSupport, ColorRange, CpuFrameSource, DecodedVideoFrame, EncodedVideoSample, FrameIndex, FrameSource, HardwarePreference, Limits, Orientation, PixelFormat, Plane, Result, SampleDependency, VideoDecoder, VideoDecoderConfig, VideoDecoderFactory, VideoDimensions, VideoEncoderConfig, VideoEncoderFactory, VideoFrame};
-use zvidlib_vp9_encoder::native_vp9_video_encoder_factory;
+use zvidlib_container::{
+    Mp4Demuxer, Mp4DemuxerOptions, VideoEncoderConformanceVector, verify_video_encoder_conformance,
+};
 use zvidlib_container::{WebmDemuxer, WebmDemuxerOptions, WebmMuxer};
 use zvidlib_core::EncodedSample;
+use zvidlib_core::io::{MemorySink, MemorySource};
+use zvidlib_core::{
+    CancellationToken, Codec, CodecImplementation, CodecProfile, CodecSupport, ColorRange,
+    CpuFrameSource, DecodedVideoFrame, EncodedVideoSample, FrameIndex, FrameSource,
+    HardwarePreference, Limits, Orientation, PixelFormat, Plane, Result, SampleDependency,
+    VideoDecoder, VideoDecoderConfig, VideoDecoderFactory, VideoDimensions, VideoEncoderConfig,
+    VideoEncoderFactory, VideoFrame,
+};
+use zvidlib_vp9_encoder::native_vp9_video_encoder_factory;
 
 const WIDTH: u32 = 160;
 const HEIGHT: u32 = 90;
@@ -131,7 +139,8 @@ fn vp9_webm_round_trips_through_the_demuxer() {
     assert_eq!(demuxer.tracks.len(), 1);
     let track = &demuxer.tracks[0];
     assert_eq!(track.codec, Codec::Vp9);
-    let derived = zvidlib_container::derive_codec_string(Codec::Vp9, &track.decoder_config).unwrap();
+    let derived =
+        zvidlib_container::derive_codec_string(Codec::Vp9, &track.decoder_config).unwrap();
     assert_eq!(derived.codec_string, "vp09.00.10.08");
     assert_eq!(derived.profile, CodecProfile::Vp9Profile0);
     assert_eq!(track.samples.len(), samples.len());
@@ -171,7 +180,8 @@ fn vp9_mp4_round_trips_through_the_demuxer() {
         };
         assert_eq!(sample.dependency, dependency, "sample {index}");
     }
-    let derived = zvidlib_container::derive_codec_string(Codec::Vp9, &track.decoder_config).unwrap();
+    let derived =
+        zvidlib_container::derive_codec_string(Codec::Vp9, &track.decoder_config).unwrap();
     assert_eq!(derived.codec_string, "vp09.00.10.08");
 }
 
@@ -626,9 +636,13 @@ fn native_vp9_encoder_round_trips_through_the_native_decoder() {
     configuration.configuration = encoder.config().decoder_config.clone();
     let decoder = zvidlib_vp9_decoder::native_vp9_video_decoder_factory();
     let cancellation = CancellationToken::new();
-    let mut sequential =
-        zvidlib_core::ExactFrameReader::new(&decoder, configuration.clone(), samples.clone(), limits)
-            .unwrap();
+    let mut sequential = zvidlib_core::ExactFrameReader::new(
+        &decoder,
+        configuration.clone(),
+        samples.clone(),
+        limits,
+    )
+    .unwrap();
     let in_order: Vec<VideoFrame> = (0..u64::from(FRAMES))
         .map(|index| sequential.get(FrameIndex(index), &cancellation).unwrap())
         .collect();

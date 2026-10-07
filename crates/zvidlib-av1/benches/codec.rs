@@ -3,7 +3,7 @@
 //! This target is the harness the per-codec benchmark tickets extend: it wires
 //! up criterion, the shared fixtures in [`support`], the `simd` feature tag that
 //! every group name carries, and the scalar-vs-SIMD groups built on
-//! `zvidlib::simd`'s process-wide instruction-set override. See
+//! `zvidlib_core::simd`'s process-wide instruction-set override. See
 //! `benches/README.md` for how to run and filter it.
 //!
 //! The per-codec targets own their own measurements: `benches/hevc_decode.rs`,
@@ -16,9 +16,10 @@ use std::time::Instant;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
-use zvidlib::av1_filters::{FilterFrame, FilterPlane, LoopFilterParams, deblock_frame};
-use zvidlib::av1_mc::{InterpFilter, McContext, RefPlane};
-use zvidlib::{Av1InterDecoder, Limits, TxSizeGrid, decode_av1_lossless_intra};
+use zvidlib_av1::av1_filters::{FilterFrame, FilterPlane, LoopFilterParams, deblock_frame};
+use zvidlib_av1::av1_mc::{InterpFilter, McContext, RefPlane};
+use zvidlib_av1::{Av1InterDecoder, TxSizeGrid, decode_av1_lossless_intra};
+use zvidlib_core::Limits;
 
 use support::isa::{IsaWorkload, bench_across_isas, log_host_isas};
 use support::{FrameWork, group_name, report_throughput};
@@ -113,7 +114,7 @@ const ISA_HEIGHT: usize = 1080;
 /// A deterministic synthetic luma plane for the kernel-level groups.
 ///
 /// [`support::synthetic_yuv420_sequence`] builds whole validated
-/// [`zvidlib::VideoFrame`]s for encoder inputs; the in-loop filter and motion
+/// [`zvidlib_core::VideoFrame`]s for encoder inputs; the in-loop filter and motion
 /// compensation kernels want one bare plane, so this borrows its first frame's
 /// luma.
 fn isa_luma_plane() -> &'static [u8] {

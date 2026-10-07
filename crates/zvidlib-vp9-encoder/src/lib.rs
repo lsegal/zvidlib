@@ -816,3 +816,26 @@ fn source_picture(
 
 #[cfg(test)]
 mod tests;
+
+/// The SIMD dispatch sites in this crate, each with the instruction set it
+/// resolves to right now. `zvidlib::simd::active_by_site` reports every crate's
+/// sites together and documents what each one covers.
+#[doc(hidden)]
+#[must_use]
+pub fn simd_sites() -> Vec<(&'static str, zvidlib_core::SimdIsa)> {
+    vec![("vp9_encode", from_vp9_encode_isa(simd::isa()))]
+}
+
+fn from_vp9_encode_isa(isa: simd::Isa) -> zvidlib_core::SimdIsa {
+    use simd::Isa;
+    use zvidlib_core::SimdIsa;
+    match isa {
+        Isa::Scalar => SimdIsa::Scalar,
+        #[cfg(target_arch = "x86_64")]
+        Isa::Sse41 => SimdIsa::Sse41,
+        #[cfg(target_arch = "x86_64")]
+        Isa::Avx2 => SimdIsa::Avx2,
+        #[cfg(target_arch = "aarch64")]
+        Isa::Neon => SimdIsa::Neon,
+    }
+}

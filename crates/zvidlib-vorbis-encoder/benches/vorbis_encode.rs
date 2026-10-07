@@ -2,8 +2,8 @@
 //!
 //! Each group encodes the same ten seconds of synthetic audio through the
 //! public [`native_vorbis_audio_encoder_factory`], once per instruction set
-//! `zvidlib::simd::available()` reports, through the crate-wide override in
-//! [`zvidlib::simd`]. `benches/support/isa.rs` asserts that every arm's
+//! `zvidlib_core::simd::available()` reports, through the crate-wide override in
+//! [`zvidlib_core::simd`]. `benches/support/isa.rs` asserts that every arm's
 //! packets are byte-identical with the scalar arm's before timing it, and that
 //! the override really reached the `vorbis_encode` dispatch site, so a reported
 //! speedup cannot come from a kernel that quietly diverged or from a switch
@@ -32,10 +32,11 @@ use std::f32::consts::TAU;
 use std::time::Duration;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use zvidlib::{
+use zvidlib_core::{
     AudioBuffer, AudioEncoderConfig, AudioEncoderFactory, Codec, CodecProfile, EncodedSample,
-    FrameIndex, Limits, SampleRange, native_vorbis_audio_encoder_factory,
+    FrameIndex, Limits, SampleRange,
 };
+use zvidlib_vorbis_encoder::native_vorbis_audio_encoder_factory;
 
 use support::isa::{AudioIsaWorkload, bench_audio_across_isas, log_host_isas};
 use support::{AudioWork, block_on};

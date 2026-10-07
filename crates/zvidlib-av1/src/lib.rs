@@ -58,3 +58,40 @@ pub use av1_intra_pred::{
     smooth_row, sum_samples,
 };
 pub use av1_simd::SimdIsa;
+
+/// The SIMD dispatch sites in this crate, each with the instruction set it
+/// resolves to right now. `zvidlib::simd::active_by_site` reports every crate's
+/// sites together and documents what each one covers.
+#[doc(hidden)]
+#[must_use]
+pub fn simd_sites() -> Vec<(&'static str, SimdIsa)> {
+    vec![
+        ("av1_simd", av1_simd::active_isa()),
+        ("av1_mc", from_mc_level(av1_mc::default_level())),
+        (
+            "av1_intra_pred",
+            from_intra_simd(av1_intra_pred::av1_intra_simd()),
+        ),
+        ("av1_coeff_ctx", av1_simd::coeff::active_isa()),
+    ]
+}
+
+fn from_mc_level(isa: av1_mc::SimdLevel) -> SimdIsa {
+    use av1_mc::SimdLevel as Isa;
+    match isa {
+        Isa::Scalar => SimdIsa::Scalar,
+        Isa::Sse41 => SimdIsa::Sse41,
+        Isa::Avx2 => SimdIsa::Avx2,
+        Isa::Neon => SimdIsa::Neon,
+    }
+}
+
+fn from_intra_simd(isa: av1_intra_pred::Av1IntraSimd) -> SimdIsa {
+    use av1_intra_pred::Av1IntraSimd as Isa;
+    match isa {
+        Isa::Scalar => SimdIsa::Scalar,
+        Isa::Sse41 => SimdIsa::Sse41,
+        Isa::Avx2 => SimdIsa::Avx2,
+        Isa::Neon => SimdIsa::Neon,
+    }
+}

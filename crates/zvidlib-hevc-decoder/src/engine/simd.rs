@@ -1389,7 +1389,7 @@ mod tests {
     ///
     /// Ignored by default because it is a timing measurement, not an
     /// assertion. Run it with
-    /// `cargo test --release --features native --lib
+    /// `cargo test -p zvidlib-hevc-decoder --release --lib
     /// measure_filter_taps_by_row_length -- --ignored --nocapture`.
     #[test]
     #[ignore = "benchmark; run with --ignored --nocapture"]
@@ -1571,7 +1571,7 @@ mod tests {
     ///
     /// Ignored by default because it is a timing measurement, not an
     /// assertion. Run it with
-    /// `cargo test --release --features native --lib
+    /// `cargo test -p zvidlib-hevc-decoder --release --lib
     /// measure_narrow_filter_taps -- --ignored --nocapture`.
     #[test]
     #[ignore = "benchmark; run with --ignored --nocapture"]
@@ -3157,7 +3157,7 @@ pub(crate) mod in_loop {
         /// measurement, not an assertion):
         ///
         /// ```text
-        /// cargo test --release --features native --lib \
+        /// cargo test -p zvidlib-hevc-decoder --release --lib \
         ///     hevc::engine::simd::in_loop::tests::bench_in_loop_filters -- --ignored --nocapture
         /// ```
         #[test]
