@@ -267,7 +267,7 @@ pub(super) fn inverse_transform_add(
 }
 
 /// The intra modes this encoder chooses from, with their VP9 mode numbers.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(super) enum IntraMode {
     Dc = 0,
     V = 1,
@@ -360,10 +360,29 @@ pub(super) struct ReferencePlane<'a> {
 }
 
 impl ReferencePlane<'_> {
+    #[cfg(test)]
     fn sample(&self, x: isize, y: isize) -> u8 {
         let x = x.clamp(0, self.width as isize - 1) as usize;
         let y = y.clamp(0, self.height as isize - 1) as usize;
         self.pixels[y * self.stride + x]
+    }
+
+    /// Fills `out` with the samples of row `y` from column `x` on, clamped
+    /// to the plane like [`Self::sample`], copying the part inside in one go.
+    fn clamped_row(&self, x: isize, y: isize, out: &mut [u8]) {
+        let y = y.clamp(0, self.height as isize - 1) as usize;
+        let row = &self.pixels[y * self.stride..][..self.width];
+        let len = out.len() as isize;
+        // Columns before `left` lie left of the plane, and from `right` on
+        // right of it.
+        let left = (-x).clamp(0, len) as usize;
+        let right = (self.width as isize - x).clamp(0, len) as usize;
+        out[..left].fill(row[0]);
+        if left < right {
+            let start = (x + left as isize) as usize;
+            out[left..right].copy_from_slice(&row[start..start + right - left]);
+        }
+        out[right..].fill(row[self.width - 1]);
     }
 }
 
@@ -391,32 +410,19 @@ pub(super) fn predict_inter(
     // The samples the filters read, three rows and columns before the block
     // and four after, edge-clamped.
     let span = size + 7;
-    let inside = x0 >= 0
-        && y0 >= 0
-        && x0 as usize + span <= reference.width
-        && y0 as usize + span <= reference.height;
     // The identity kernel copies its centre sample, so a whole-sample vector
-    // inside the plane is a copy: the encoder's luma vectors are all whole
-    // samples, and so are half of its chroma ones.
-    if inside && fraction_x == 0 && fraction_y == 0 {
+    // is a copy: most of the encoder's vectors are whole samples, as the
+    // motion search finds them.
+    if fraction_x == 0 && fraction_y == 0 {
         for (row, out) in output.chunks_exact_mut(size).take(size).enumerate() {
-            let start = (y0 as usize + 3 + row) * reference.stride + x0 as usize + 3;
-            out.copy_from_slice(&reference.pixels[start..start + size]);
+            reference.clamped_row(x0 + 3, y0 + 3 + row as isize, out);
         }
         return;
     }
     let mut window = [0_u8; (64 + 7) * (64 + 7)];
     let window = &mut window[..span * span];
     for (row, out) in window.chunks_exact_mut(span).enumerate() {
-        let source_y = y0 + row as isize;
-        if inside {
-            let start = source_y as usize * reference.stride + x0 as usize;
-            out.copy_from_slice(&reference.pixels[start..start + span]);
-        } else {
-            for (column, out) in out.iter_mut().enumerate() {
-                *out = reference.sample(x0 + column as isize, source_y);
-            }
-        }
+        reference.clamped_row(x0, y0 + row as isize, out);
     }
     simd::convolve8(window, span, size, size, filter_x, filter_y, output);
 }
