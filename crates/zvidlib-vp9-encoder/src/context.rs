@@ -551,6 +551,105 @@ mod tests {
         assert_ne!(after_key.coef[1][0][0][0][0], inter.coef[1][0][0][0][0]);
     }
 
+    /// The decoder's `inv_remap_prob`, as the specification defines it.
+    fn inv_remap_prob(delta: u32, old: u8) -> u8 {
+        let mut inv_map_table: Vec<i32> = (0..20).map(|index| 7 + 13 * index).collect();
+        inv_map_table.extend((1..=253).filter(|value| *value < 7 || (value - 7) % 13 != 0));
+        let v = inv_map_table[delta as usize];
+        let inv_recenter_nonneg = |v: i32, m: i32| {
+            if v > 2 * m {
+                v
+            } else if v & 1 == 1 {
+                m - ((v + 1) >> 1)
+            } else {
+                m + (v >> 1)
+            }
+        };
+        let m = i32::from(old) - 1;
+        if m << 1 <= 255 {
+            (1 + inv_recenter_nonneg(v, m)) as u8
+        } else {
+            (255 - inv_recenter_nonneg(v, 254 - m)) as u8
+        }
+    }
+
+    #[test]
+    fn remapped_differences_decode_to_the_new_probability() {
+        for old in 1..=255_u8 {
+            let mut seen = [false; 254];
+            for new in (1..=255_u8).filter(|&new| new != old) {
+                let delta = remap_prob(new, old);
+                assert_eq!(inv_remap_prob(delta, old), new, "{old} to {new}");
+                assert!(!std::mem::replace(&mut seen[delta as usize], true));
+            }
+        }
+    }
+
+    #[test]
+    fn subexponential_codes_grow_with_the_difference() {
+        let bits = |value| {
+            let mut sink = BitCost::default();
+            write_term_subexp(&mut sink, value);
+            sink.0
+        };
+        for (value, expected) in [(0, 5.0), (15, 5.0), (16, 6.0), (31, 6.0), (32, 8.0)] {
+            assert_eq!(bits(value), expected, "{value}");
+        }
+        // `decode_uniform`: 64 more values in seven bits, the rest in eight.
+        assert_eq!(bits(63), 8.0);
+        assert_eq!(bits(64), 10.0);
+        assert_eq!(bits(64 + 64), 10.0);
+        assert_eq!(bits(64 + 65), 11.0);
+        assert_eq!(bits(253), 11.0);
+    }
+
+    #[test]
+    fn coefficient_updates_follow_the_tokens_only_where_they_pay() {
+        let context = FrameContext::default();
+        let mut counts = FrameCounts::default();
+        assert_eq!(context.coef_updates(&counts, 4), context.coef);
+
+        // A handful of tokens cannot pay for an update.
+        counts.coef[1][0][0][1][0] = [3, 0, 0, 0];
+        counts.eob_branch[1][0][0][1][0] = 3;
+        assert_eq!(context.coef_updates(&counts, 4), context.coef);
+
+        // Thousands of zeros in one context, none of them ending the block,
+        // pay for raising the probability of ZERO there and lowering that of
+        // the end of block; nothing else changes.
+        counts.coef[1][0][0][1][0] = [4000, 0, 0, 0];
+        counts.eob_branch[1][0][0][1][0] = 4000;
+        let updated = context.coef_updates(&counts, 4);
+        let (old, new) = (context.coef[1][0][0][1][0], updated[1][0][0][1][0]);
+        assert!(new[0] < old[0] && new[1] > old[1], "{old:?} to {new:?}");
+        assert_eq!(new[2], old[2]);
+        let mut unchanged = updated;
+        unchanged[1][0][0][1][0] = old;
+        assert_eq!(unchanged, context.coef);
+
+        // Only the transform sizes the frame can code are updated.
+        assert_eq!(context.coef_updates(&counts, 1), context.coef);
+    }
+
+    #[test]
+    fn pivot_updates_weigh_every_larger_token() {
+        // As many ONEs as larger tokens: the binary counts alone would keep
+        // the pivot near even, but every larger token here is a category 6,
+        // whose path through the model a lower pivot shortens.
+        let context = FrameContext::default();
+        let mut counts = FrameCounts::default();
+        counts.coef[0][0][0][1][0] = [0, 2000, 2000, 0];
+        counts.larger_tokens[0][0][0][1][0][8] = 2000;
+        let cat6 = context.coef_updates(&counts, 1)[0][0][0][1][0][2];
+        counts.larger_tokens[0][0][0][1][0] = [0; 9];
+        counts.larger_tokens[0][0][0][1][0][0] = 2000;
+        let two = context.coef_updates(&counts, 1)[0][0][0][1][0][2];
+        assert!(
+            cat6 < two,
+            "pivot {cat6} for category 6 tokens, {two} for TWOs"
+        );
+    }
+
     #[test]
     fn eighth_sample_bits_adapt_only_when_the_frame_allows_them() {
         let mut counts = FrameCounts::default();
