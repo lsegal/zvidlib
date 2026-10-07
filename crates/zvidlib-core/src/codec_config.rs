@@ -224,4 +224,3 @@ impl Vp9CodecConfig {
 fn malformed_config(message: &str) -> Error {
     Error::new(ErrorKind::MalformedMedia, message)
 }
-

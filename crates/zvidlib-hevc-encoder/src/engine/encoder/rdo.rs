@@ -5,12 +5,12 @@
 //! writer can consume, while the bootstrap encoder can already run the same
 //! deterministic search to exercise the SIMD distortion kernels end to end.
 
-use crate::hevc::engine::binarization::INTRA_PRED_MODE_MAX;
-use crate::hevc::engine::encoder::rdcost;
-use crate::hevc::engine::encoder::residual::{
+use crate::engine::binarization::INTRA_PRED_MODE_MAX;
+use crate::engine::encoder::rdcost;
+use crate::engine::encoder::residual::{
     ResidualBinSink, ResidualWriteParams, has_coded_levels, write_residual_coding,
 };
-use crate::hevc::engine::residual::ResidualElement;
+use crate::engine::residual::ResidualElement;
 
 const CTB: usize = 16;
 const NEUTRAL_LUMA: u8 = 128;
@@ -788,12 +788,12 @@ mod tests {
     /// asks of it.
     #[test]
     fn the_residual_rate_estimate_orders_blocks_the_way_the_writer_does() {
-        use crate::hevc::engine::cabac::init_type;
-        use crate::hevc::engine::ctx_init::SliceContexts;
-        use crate::hevc::engine::encoder::bitwriter::BitWriter;
-        use crate::hevc::engine::encoder::cabac::CabacEncoder;
-        use crate::hevc::engine::encoder::residual::EngineResidualBinSink;
-        use crate::hevc::engine::scan::ScanIdx;
+        use crate::engine::cabac::init_type;
+        use crate::engine::ctx_init::SliceContexts;
+        use crate::engine::encoder::bitwriter::BitWriter;
+        use crate::engine::encoder::cabac::CabacEncoder;
+        use crate::engine::encoder::residual::EngineResidualBinSink;
+        use crate::engine::scan::ScanIdx;
 
         let params = ResidualWriteParams {
             log2_trafo_size: 4,

@@ -2,45 +2,43 @@
 //! pictures.
 //!
 //! This is the §8.1 general decoding process expressed over the crate's
-//! subsystems: the [`crate::hevc::engine::nal`] Annex B demux feeds parameter-set
-//! activation ([`crate::hevc::engine::sps`] / [`crate::hevc::engine::pps`]), each coded picture's
-//! slice segments are parsed ([`crate::hevc::engine::slice`]) and their
+//! subsystems: the [`crate::engine::nal`] Annex B demux feeds parameter-set
+//! activation ([`crate::engine::sps`] / [`crate::engine::pps`]), each coded picture's
+//! slice segments are parsed ([`crate::engine::slice`]) and their
 //! `slice_segment_data()` CABAC-decoded through the §7.3.8 syntax walk
-//! ([`crate::hevc::engine::slice_data`]), and the decoded coding tree units are handed
+//! ([`crate::engine::slice_data`]), and the decoded coding tree units are handed
 //! to the picture-level reconstruction + in-loop-filter driver
-//! ([`crate::hevc::engine::inter_recon::reconstruct_inter_picture`]) with the §8.3
+//! ([`crate::engine::inter_recon::reconstruct_inter_picture`]) with the §8.3
 //! POC / RPS / reference-list cycle threaded by
-//! [`crate::hevc::engine::decode::PictureSequenceState`]. Decoded pictures are
+//! [`crate::engine::decode::PictureSequenceState`]. Decoded pictures are
 //! returned in output order (§8.3.1 `PicOrderCntVal` order within each
 //! coded video sequence).
 
 use std::collections::BTreeMap;
 
-use crate::hevc::engine::availability::{PictureTiling, TilingParams};
-use crate::hevc::engine::bitreader::BitReader;
-use crate::hevc::engine::cabac::{CabacEngine, init_type};
-use crate::hevc::engine::ctx_init::SliceContexts;
-use crate::hevc::engine::decode::{PictureHeaderInfo, PictureSequenceState, SliceRefParams};
-use crate::hevc::engine::dpb::{LongTermEntry, RefPicLists};
-use crate::hevc::engine::inter_pred::WpListWeights;
-use crate::hevc::engine::inter_recon::{
+use crate::engine::availability::{PictureTiling, TilingParams};
+use crate::engine::bitreader::BitReader;
+use crate::engine::cabac::{CabacEngine, init_type};
+use crate::engine::ctx_init::SliceContexts;
+use crate::engine::decode::{PictureHeaderInfo, PictureSequenceState, SliceRefParams};
+use crate::engine::dpb::{LongTermEntry, RefPicLists};
+use crate::engine::inter_pred::WpListWeights;
+use crate::engine::inter_recon::{
     InterSliceContext, PlacedInterCtu, RefListAccess, SliceWpTables, reconstruct_inter_picture,
 };
-use crate::hevc::engine::nal::{NalError, NalIter, NalUnit};
-use crate::hevc::engine::picture::Picture;
-use crate::hevc::engine::poc::NalKind;
-use crate::hevc::engine::pps::{PicParameterSet, PpsError};
-use crate::hevc::engine::profile::{Stage as ProfStage, scope as prof_scope};
-use crate::hevc::engine::recon::{ReconError, ReconParams};
-use crate::hevc::engine::residual::ResidualCodingError;
-use crate::hevc::engine::slice::{
-    SliceError, SliceLongTermRefPicSource, SliceSegmentHeader, SliceType,
-};
-use crate::hevc::engine::slice_data::{
+use crate::engine::nal::{NalError, NalIter, NalUnit};
+use crate::engine::picture::Picture;
+use crate::engine::poc::NalKind;
+use crate::engine::pps::{PicParameterSet, PpsError};
+use crate::engine::profile::{Stage as ProfStage, scope as prof_scope};
+use crate::engine::recon::{ReconError, ReconParams};
+use crate::engine::residual::ResidualCodingError;
+use crate::engine::slice::{SliceError, SliceLongTermRefPicSource, SliceSegmentHeader, SliceType};
+use crate::engine::slice_data::{
     CodingTreeUnit, PictureParseState, SliceDataParams, decode_coding_tree_unit_in_picture,
     end_of_slice_segment_flag,
 };
-use crate::hevc::engine::sps::{
+use crate::engine::sps::{
     MaterializedShortTermRefPicSet, SeqParameterSet, ShortTermRefPicSetMaterializeError, SpsError,
 };
 
@@ -323,7 +321,7 @@ impl SequenceDecoder {
     }
 
     /// Drain the pictures decoded so far, in decode order. The caller
-    /// owns output reordering (the streaming [`crate::hevc::engine::decoder`] holds a
+    /// owns output reordering (the streaming [`crate::engine::decoder`] holds a
     /// `sps_max_num_reorder_pics`-deep queue; [`Self::finish`] sorts a
     /// whole sequence at once).
     pub fn take_decoded(&mut self) -> Vec<DecodedFrame> {
@@ -1026,7 +1024,7 @@ fn build_recon_params(
         let factors = match (&pps.scaling_list_data, &sps.scaling_list_data) {
             (Some(d), _) => d.scaling_factors(geom.chroma_array_type),
             (None, Some(d)) => d.scaling_factors(geom.chroma_array_type),
-            (None, None) => crate::hevc::engine::scaling_list::ScalingListData::all_default()
+            (None, None) => crate::engine::scaling_list::ScalingListData::all_default()
                 .scaling_factors(geom.chroma_array_type),
         };
         Some(factors)
@@ -1181,7 +1179,7 @@ fn build_inter_slice_context(
 /// 7-31 / 7-32 + 8-268 / 8-269 / 8-273 / 8-274), and the equation-7-58
 /// `ChromaOffsetLX` derivation.
 fn build_slice_wp_tables(
-    pwt: &crate::hevc::engine::slice::PredWeightTable,
+    pwt: &crate::engine::slice::PredWeightTable,
     sps: &SeqParameterSet,
 ) -> SliceWpTables {
     let hp = sps
@@ -1403,7 +1401,7 @@ fn decode_slice_segment_data(
     )?;
 
     // Table 9-4 initType: I => 0; P => cabac_init ? 2 : 1;
-    // B => cabac_init ? 1 : 2 (crate::hevc::engine::cabac::init_type on the raw
+    // B => cabac_init ? 1 : 2 (crate::engine::cabac::init_type on the raw
     // slice_type value).
     let raw_slice_type = match slice_type {
         SliceType::B => 0,
@@ -1447,7 +1445,7 @@ fn decode_slice_segment_data(
         .as_ref()
         .filter(|e| e.pps_palette_predictor_initializers_present_flag)
         .map(|e| {
-            crate::hevc::engine::palette::PalettePredictor::from_initializers(
+            crate::engine::palette::PalettePredictor::from_initializers(
                 &e.pps_palette_predictor_initializer,
                 num_comps,
             )
@@ -1457,7 +1455,7 @@ fn decode_slice_segment_data(
                 .as_ref()
                 .filter(|e| e.sps_palette_predictor_initializers_present_flag)
                 .map(|e| {
-                    crate::hevc::engine::palette::PalettePredictor::from_initializers(
+                    crate::engine::palette::PalettePredictor::from_initializers(
                         &e.sps_palette_predictor_initializer,
                         num_comps,
                     )
@@ -1676,7 +1674,7 @@ fn split_substreams(
     escaped: &[u8],
     rbsp_len: usize,
     stripped_data_offset: usize,
-    entry_points: Option<&crate::hevc::engine::slice::EntryPointOffsets>,
+    entry_points: Option<&crate::engine::slice::EntryPointOffsets>,
 ) -> Result<Vec<(usize, usize)>, SequenceError> {
     let n_offsets = entry_points.map_or(0, |e| e.entry_point_offset_minus1.len());
     if n_offsets == 0 {

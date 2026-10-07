@@ -28,55 +28,30 @@
 // checkable line by line against the code it reproduces.
 #![allow(clippy::needless_range_loop)]
 
-mod bits;
 mod block;
-// What the hardware backends read from a chunk before handing it to the platform decoder.
-#[cfg(any(
-    test,
-    windows,
-    all(target_os = "linux", target_pointer_width = "64"),
-    target_os = "macos"
-))]
-mod chunk;
-pub(crate) mod idct1d;
-pub(crate) mod loopfilter;
+pub mod idct1d;
+#[doc(hidden)]
+pub mod loopfilter;
 mod probs;
-pub(crate) mod recon;
-pub(crate) mod tables;
+#[doc(hidden)]
+pub mod recon;
+#[doc(hidden)]
+pub mod tables;
 
 #[cfg(test)]
 mod tests;
 
 use std::sync::Arc;
 
-use bits::{BitReader, BoolDecoder};
 use block::{FrameDecoder, MvRef};
 use probs::{FrameContext, FrameCounts};
+use zvidlib_vp9_syntax::bits::{BitReader, BoolDecoder};
+pub use zvidlib_vp9_syntax::{
+    DecodedPicture, limit, malformed, read_render_size, read_sync_code, superframe_index,
+    unsupported,
+};
 
-#[cfg(any(
-    test,
-    windows,
-    all(target_os = "linux", target_pointer_width = "64"),
-    target_os = "macos"
-))]
-pub(crate) use chunk::{ChunkInspector, chunk_frames};
-// The NVDEC and Media Foundation backends name the shape they carry to readback.
-#[cfg(any(test, windows, all(target_os = "linux", target_pointer_width = "64")))]
-pub(crate) use chunk::FrameShape;
-
-use crate::{Error, ErrorKind, Limits, Result};
-
-pub(crate) fn malformed(message: impl Into<String>) -> Error {
-    Error::new(ErrorKind::MalformedMedia, message)
-}
-
-pub(crate) fn unsupported(message: impl Into<String>) -> Error {
-    Error::new(ErrorKind::Unsupported, message)
-}
-
-pub(crate) fn limit(message: impl Into<String>) -> Error {
-    Error::new(ErrorKind::ResourceLimit, message)
-}
+use crate::{Limits, Result};
 
 /// The border, in pixels, kept around every plane so the 8-tap filters can
 /// read the taps a whole-pixel position multiplies by zero without bounds
@@ -85,17 +60,17 @@ const BORDER: usize = 8;
 
 /// One plane of a decoded frame.
 #[derive(Clone, Debug)]
-pub(crate) struct Plane {
-    pub(crate) data: Vec<u8>,
-    pub(crate) stride: usize,
+pub struct Plane {
+    pub data: Vec<u8>,
+    pub stride: usize,
     /// The index of the top-left pixel in `data`.
-    pub(crate) origin: usize,
+    pub origin: usize,
     /// The decoded area, aligned to 8 luma pixels (libvpx's `y_width`).
-    pub(crate) width: usize,
-    pub(crate) height: usize,
+    pub width: usize,
+    pub height: usize,
     /// The visible area (libvpx's `y_crop_width`).
-    pub(crate) crop_width: usize,
-    pub(crate) crop_height: usize,
+    pub crop_width: usize,
+    pub crop_height: usize,
 }
 
 impl Plane {
@@ -117,19 +92,19 @@ impl Plane {
     }
 
     #[inline]
-    pub(crate) fn index(&self, x: usize, y: usize) -> usize {
+    pub fn index(&self, x: usize, y: usize) -> usize {
         self.origin + y * self.stride + x
     }
 }
 
 /// A decoded frame: the buffer a reference slot holds.
 #[derive(Clone, Debug)]
-pub(crate) struct Frame {
-    pub(crate) width: usize,
-    pub(crate) height: usize,
-    pub(crate) planes: [Plane; 3],
-    pub(crate) color_space: u8,
-    pub(crate) full_range: bool,
+pub struct Frame {
+    pub width: usize,
+    pub height: usize,
+    pub planes: [Plane; 3],
+    pub color_space: u8,
+    pub full_range: bool,
 }
 
 impl Frame {
@@ -156,7 +131,7 @@ impl Frame {
     }
 
     /// The visible picture, each plane tightly packed.
-    pub(crate) fn picture(&self) -> DecodedPicture {
+    pub fn picture(&self) -> DecodedPicture {
         let planes = std::array::from_fn(|index| {
             let plane = &self.planes[index];
             let mut packed = Vec::with_capacity(plane.crop_width * plane.crop_height);
@@ -176,44 +151,31 @@ impl Frame {
     }
 }
 
-/// A shown picture, as the output process produces it.
-#[derive(Clone, Debug)]
-pub(crate) struct DecodedPicture {
-    pub(crate) width: usize,
-    pub(crate) height: usize,
-    /// Y, U and V, tightly packed; the chroma planes are subsampled 2x2.
-    pub(crate) planes: [Vec<u8>; 3],
-    /// `color_space` of the uncompressed header (`CS_BT_601` is 1,
-    /// `CS_BT_709` 2 and so on).
-    pub(crate) color_space: u8,
-    pub(crate) full_range: bool,
-}
-
 /// The segmentation parameters, which persist from frame to frame
 /// (section 7.2.10).
 #[derive(Clone, Debug, Default)]
-pub(crate) struct Segmentation {
-    pub(crate) enabled: bool,
-    pub(crate) update_map: bool,
-    pub(crate) temporal_update: bool,
-    pub(crate) abs_delta: bool,
-    pub(crate) tree_probs: [u8; 7],
-    pub(crate) pred_probs: [u8; 3],
-    pub(crate) feature_enabled: [[bool; 4]; 8],
-    pub(crate) feature_data: [[i16; 4]; 8],
+pub struct Segmentation {
+    pub enabled: bool,
+    pub update_map: bool,
+    pub temporal_update: bool,
+    pub abs_delta: bool,
+    pub tree_probs: [u8; 7],
+    pub pred_probs: [u8; 3],
+    pub feature_enabled: [[bool; 4]; 8],
+    pub feature_data: [[i16; 4]; 8],
 }
 
-pub(crate) const SEG_LVL_ALT_Q: usize = 0;
-pub(crate) const SEG_LVL_ALT_LF: usize = 1;
-pub(crate) const SEG_LVL_REF_FRAME: usize = 2;
-pub(crate) const SEG_LVL_SKIP: usize = 3;
+pub const SEG_LVL_ALT_Q: usize = 0;
+pub const SEG_LVL_ALT_LF: usize = 1;
+pub const SEG_LVL_REF_FRAME: usize = 2;
+pub const SEG_LVL_SKIP: usize = 3;
 
 impl Segmentation {
-    pub(crate) fn feature_active(&self, segment: u8, feature: usize) -> bool {
+    pub fn feature_active(&self, segment: u8, feature: usize) -> bool {
         self.enabled && self.feature_enabled[usize::from(segment)][feature]
     }
 
-    pub(crate) fn data(&self, segment: u8, feature: usize) -> i32 {
+    pub fn data(&self, segment: u8, feature: usize) -> i32 {
         i32::from(self.feature_data[usize::from(segment)][feature])
     }
 
@@ -225,23 +187,23 @@ impl Segmentation {
 
 /// The interpolation filter literal of the uncompressed header that means
 /// "chosen per block".
-pub(crate) const SWITCHABLE: u8 = 4;
+pub const SWITCHABLE: u8 = 4;
 
 /// Reference-mode values of the compressed header.
-pub(crate) const SINGLE_REFERENCE: u8 = 0;
-pub(crate) const COMPOUND_REFERENCE: u8 = 1;
-pub(crate) const REFERENCE_MODE_SELECT: u8 = 2;
+pub const SINGLE_REFERENCE: u8 = 0;
+pub const COMPOUND_REFERENCE: u8 = 1;
+pub const REFERENCE_MODE_SELECT: u8 = 2;
 
 /// The transform mode that selects a size per block.
-pub(crate) const TX_MODE_SELECT: u8 = 4;
+pub const TX_MODE_SELECT: u8 = 4;
 
 /// A reference frame's motion compensation scale (`struct scale_factors`).
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Scale {
-    pub(crate) x_scale_fp: i32,
-    pub(crate) y_scale_fp: i32,
-    pub(crate) x_step_q4: i32,
-    pub(crate) y_step_q4: i32,
+pub struct Scale {
+    pub x_scale_fp: i32,
+    pub y_scale_fp: i32,
+    pub x_step_q4: i32,
+    pub y_step_q4: i32,
 }
 
 const REF_SCALE_SHIFT: u32 = 14;
@@ -272,19 +234,19 @@ impl Scale {
         scale
     }
 
-    pub(crate) fn is_valid(&self) -> bool {
+    pub fn is_valid(&self) -> bool {
         self.x_scale_fp != REF_INVALID_SCALE && self.y_scale_fp != REF_INVALID_SCALE
     }
 
-    pub(crate) fn is_scaled(&self) -> bool {
+    pub fn is_scaled(&self) -> bool {
         self.is_valid() && (self.x_scale_fp != REF_NO_SCALE || self.y_scale_fp != REF_NO_SCALE)
     }
 
-    pub(crate) fn scale_x(&self, value: i32) -> i32 {
+    pub fn scale_x(&self, value: i32) -> i32 {
         ((i64::from(value) * i64::from(self.x_scale_fp)) >> REF_SCALE_SHIFT) as i32
     }
 
-    pub(crate) fn scale_y(&self, value: i32) -> i32 {
+    pub fn scale_y(&self, value: i32) -> i32 {
         ((i64::from(value) * i64::from(self.y_scale_fp)) >> REF_SCALE_SHIFT) as i32
     }
 }
@@ -298,48 +260,48 @@ fn valid_ref_frame_size(ref_width: usize, ref_height: usize, width: usize, heigh
 
 /// The uncompressed and compressed header of one frame.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct FrameHeader {
-    pub(crate) key_frame: bool,
-    pub(crate) show_frame: bool,
-    pub(crate) error_resilient: bool,
-    pub(crate) intra_only: bool,
-    pub(crate) reset_frame_context: u8,
-    pub(crate) refresh_frame_flags: u8,
-    pub(crate) ref_frame_idx: [usize; 3],
+pub struct FrameHeader {
+    pub key_frame: bool,
+    pub show_frame: bool,
+    pub error_resilient: bool,
+    pub intra_only: bool,
+    pub reset_frame_context: u8,
+    pub refresh_frame_flags: u8,
+    pub ref_frame_idx: [usize; 3],
     /// Indexed by reference frame (`LAST_FRAME` is 1).
-    pub(crate) ref_frame_sign_bias: [bool; 4],
-    pub(crate) width: usize,
-    pub(crate) height: usize,
-    pub(crate) allow_high_precision_mv: bool,
-    pub(crate) interp_filter: u8,
-    pub(crate) refresh_frame_context: bool,
-    pub(crate) frame_parallel_decoding_mode: bool,
-    pub(crate) frame_context_idx: usize,
-    pub(crate) filter_level: u8,
-    pub(crate) sharpness: u8,
-    pub(crate) base_qindex: u8,
-    pub(crate) y_dc_delta_q: i32,
-    pub(crate) uv_dc_delta_q: i32,
-    pub(crate) uv_ac_delta_q: i32,
-    pub(crate) lossless: bool,
-    pub(crate) log2_tile_cols: u32,
-    pub(crate) log2_tile_rows: u32,
-    pub(crate) header_size: usize,
-    pub(crate) tx_mode: u8,
-    pub(crate) reference_mode: u8,
-    pub(crate) comp_fixed_ref: i8,
-    pub(crate) comp_var_ref: [i8; 2],
+    pub ref_frame_sign_bias: [bool; 4],
+    pub width: usize,
+    pub height: usize,
+    pub allow_high_precision_mv: bool,
+    pub interp_filter: u8,
+    pub refresh_frame_context: bool,
+    pub frame_parallel_decoding_mode: bool,
+    pub frame_context_idx: usize,
+    pub filter_level: u8,
+    pub sharpness: u8,
+    pub base_qindex: u8,
+    pub y_dc_delta_q: i32,
+    pub uv_dc_delta_q: i32,
+    pub uv_ac_delta_q: i32,
+    pub lossless: bool,
+    pub log2_tile_cols: u32,
+    pub log2_tile_rows: u32,
+    pub header_size: usize,
+    pub tx_mode: u8,
+    pub reference_mode: u8,
+    pub comp_fixed_ref: i8,
+    pub comp_var_ref: [i8; 2],
 }
 
 impl FrameHeader {
-    pub(crate) fn is_intra_only(&self) -> bool {
+    pub fn is_intra_only(&self) -> bool {
         self.key_frame || self.intra_only
     }
 }
 
 /// The decoder: the reference frames and every piece of state the
 /// bitstream carries from one frame to the next.
-pub(crate) struct Decoder {
+pub struct Decoder {
     limits: Limits,
     refs: [Option<Arc<Frame>>; 8],
     frame_contexts: Box<[FrameContext; 4]>,
@@ -369,7 +331,7 @@ pub(crate) struct Decoder {
 }
 
 impl Decoder {
-    pub(crate) fn new(limits: Limits) -> Self {
+    pub fn new(limits: Limits) -> Self {
         Self {
             limits,
             refs: Default::default(),
@@ -396,19 +358,19 @@ impl Decoder {
         }
     }
 
-    pub(crate) fn reset(&mut self) {
+    pub fn reset(&mut self) {
         let output_wanted = self.output_wanted;
         *self = Self::new(self.limits);
         self.output_wanted = output_wanted;
     }
 
-    pub(crate) fn set_output_wanted(&mut self, wanted: bool) {
+    pub fn set_output_wanted(&mut self, wanted: bool) {
         self.output_wanted = wanted;
     }
 
     /// How many frames have been shown since the decoder was created or
     /// reset.
-    pub(crate) fn frames_shown(&self) -> u64 {
+    pub fn frames_shown(&self) -> u64 {
         self.frames_shown
     }
 
@@ -420,7 +382,7 @@ impl Decoder {
     /// hidden frames followed by the one frame it shows; with spatial
     /// layers every layer is marked shown, and the last is the one to
     /// present.
-    pub(crate) fn decode_chunk(&mut self, data: &[u8]) -> Result<Option<DecodedPicture>> {
+    pub fn decode_chunk(&mut self, data: &[u8]) -> Result<Option<DecodedPicture>> {
         if data.is_empty() {
             return Err(malformed("VP9 sample is empty"));
         }
@@ -870,21 +832,6 @@ fn adapt(
     }
 }
 
-fn read_sync_code(reader: &mut BitReader) -> Result<()> {
-    if reader.literal(24)? != 0x49_83_42 {
-        return Err(malformed("VP9 frame sync code is invalid"));
-    }
-    Ok(())
-}
-
-fn read_render_size(reader: &mut BitReader) -> Result<()> {
-    // The render size is presentation metadata; decoding ignores it.
-    if reader.bit()? {
-        reader.literal(32)?;
-    }
-    Ok(())
-}
-
 fn read_quantization(reader: &mut BitReader, header: &mut FrameHeader) -> Result<()> {
     header.base_qindex = reader.literal(8)? as u8;
     let mut delta = || -> Result<i32> {
@@ -1163,65 +1110,4 @@ fn read_compressed_header(
         return Err(malformed("VP9 compressed header is corrupt"));
     }
     Ok(())
-}
-
-/// The colour range a chunk's first frame signals: `Some(full_range)` when
-/// that frame is a profile 0 key frame, or an intra-only frame (which profile
-/// 0 makes studio range), and `None` for any other frame or for data that
-/// does not parse. A track's first sample is a key frame, so this is the
-/// range of its first picture, read without decoding it.
-#[cfg_attr(not(all(feature = "web", target_arch = "wasm32")), allow(dead_code))]
-pub(crate) fn chunk_full_range(data: &[u8]) -> Option<bool> {
-    let first = match superframe_index(data).ok()? {
-        Some(sizes) => data.get(..*sizes.first()?)?,
-        None => data,
-    };
-    let mut reader = BitReader::new(first);
-    if reader.literal(2).ok()? != 2 || reader.literal(2).ok()? != 0 || reader.bit().ok()? {
-        // Not a frame marker, not profile 0, or show_existing_frame.
-        return None;
-    }
-    let key_frame = !reader.bit().ok()?;
-    let show_frame = reader.bit().ok()?;
-    let error_resilient = reader.bit().ok()?;
-    if key_frame {
-        if reader.literal(24).ok()? != 0x49_83_42 || reader.literal(3).ok()? == 7 {
-            return None;
-        }
-        return reader.bit().ok();
-    }
-    let intra_only = !show_frame && reader.bit().ok()?;
-    if !error_resilient {
-        reader.literal(2).ok()?;
-    }
-    intra_only.then_some(false)
-}
-
-/// Parses a superframe index (Annex B.3), returning the frame sizes it
-/// lists, or `None` when the chunk holds a single frame.
-fn superframe_index(data: &[u8]) -> Result<Option<Vec<usize>>> {
-    if data.is_empty() {
-        return Ok(None);
-    }
-    let marker = data[data.len() - 1];
-    if marker & 0xe0 != 0xc0 {
-        return Ok(None);
-    }
-    let frames = usize::from(marker & 0x7) + 1;
-    let magnitude = usize::from((marker >> 3) & 0x3) + 1;
-    let index_size = 2 + magnitude * frames;
-    if data.len() < index_size || data[data.len() - index_size] != marker {
-        return Err(malformed("VP9 superframe index is invalid"));
-    }
-    let mut bytes = &data[data.len() - index_size + 1..];
-    let mut sizes = Vec::with_capacity(frames);
-    for _ in 0..frames {
-        let mut size = 0usize;
-        for j in 0..magnitude {
-            size |= usize::from(bytes[j]) << (j * 8);
-        }
-        bytes = &bytes[magnitude..];
-        sizes.push(size);
-    }
-    Ok(Some(sizes))
 }

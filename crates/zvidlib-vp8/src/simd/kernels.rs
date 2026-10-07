@@ -14,7 +14,7 @@
 //! the inliner left standing would be compiled at the baseline instruction set
 //! and `.github/scripts/check_simd_target_features.py` fails on it.
 
-use crate::av1_simd::vector::{I32x, Transpose4};
+use zvidlib_core::simd::vector::{I32x, Transpose4};
 
 const COS_PI8_SQRT2_MINUS1: i32 = 20091;
 const SIN_PI8_SQRT2: i32 = 35468;
@@ -82,7 +82,7 @@ unsafe fn residual_rows<V: I32x>(
 
 /// `satd4` of a residual block in raster order.
 #[inline(always)]
-pub(super) unsafe fn satd4<V: Transpose4>(block: &[i16; 16]) -> u32 {
+pub unsafe fn satd4<V: Transpose4>(block: &[i16; 16]) -> u32 {
     unsafe {
         hadamard_sum::<V>([
             V::load_i16(&block[0..]),
@@ -96,7 +96,7 @@ pub(super) unsafe fn satd4<V: Transpose4>(block: &[i16; 16]) -> u32 {
 /// The SATD of the `size`x`size` block at `origin` of two planes of one
 /// stride: the sum of every 4x4 block's [`satd4`].
 #[inline(always)]
-pub(super) unsafe fn satd<V: Transpose4>(
+pub unsafe fn satd<V: Transpose4>(
     source: &[u8],
     prediction: &[u8],
     origin: usize,
@@ -120,7 +120,7 @@ pub(super) unsafe fn satd<V: Transpose4>(
 /// libvpx's forward 4x4 DCT (`vp8_short_fdct4x4_c`) of the residual of the
 /// 4x4 block at `offset`, raster order.
 #[inline(always)]
-pub(super) unsafe fn residual_dct<V: Transpose4>(
+pub unsafe fn residual_dct<V: Transpose4>(
     source: &[u8],
     prediction: &[u8],
     offset: usize,
@@ -181,7 +181,7 @@ pub(super) unsafe fn residual_dct<V: Transpose4>(
 /// libvpx's forward Walsh-Hadamard transform (`vp8_short_walsh4x4_c`) of the
 /// 16 luma DC coefficients in raster order.
 #[inline(always)]
-pub(super) unsafe fn forward_walsh<V: Transpose4>(input: &[i16; 16]) -> [i16; 16] {
+pub unsafe fn forward_walsh<V: Transpose4>(input: &[i16; 16]) -> [i16; 16] {
     unsafe {
         let [c0, c1, c2, c3] = V::transpose4([
             V::load_i16(&input[0..]),
@@ -223,7 +223,7 @@ pub(super) unsafe fn forward_walsh<V: Transpose4>(input: &[i16; 16]) -> [i16; 16
 /// with the DC step and bias in lane 0, and clears position 0 afterwards when
 /// `first` skips it.
 #[inline(always)]
-pub(super) unsafe fn quantize<V: I32x>(
+pub unsafe fn quantize<V: I32x>(
     coefficients: &[i16; 16],
     [dc, ac]: [i32; 2],
     first: usize,
@@ -276,7 +276,7 @@ unsafe fn idct_pass<V: I32x>([i0, i1, i2, i3]: [V; 4]) -> (V, V, V, V) {
 /// Inverse 4x4 DCT of dequantized `coefficients` (raster order), added to the
 /// 4x4 block at `offset` of `plane`, as `idct_add` in `predict.rs` does.
 #[inline(always)]
-pub(super) unsafe fn idct_add<V: Transpose4>(
+pub unsafe fn idct_add<V: Transpose4>(
     coefficients: &[i16; 16],
     plane: &mut [u8],
     offset: usize,
@@ -316,7 +316,7 @@ pub(super) unsafe fn idct_add<V: Transpose4>(
 /// Inverse Walsh-Hadamard transform of the dequantized Y2 block, as
 /// `inverse_walsh` in `predict.rs` computes it.
 #[inline(always)]
-pub(super) unsafe fn inverse_walsh<V: Transpose4>(input: &[i16; 16]) -> [i16; 16] {
+pub unsafe fn inverse_walsh<V: Transpose4>(input: &[i16; 16]) -> [i16; 16] {
     unsafe {
         let r0 = V::load_i16(&input[0..]);
         let r1 = V::load_i16(&input[4..]);
@@ -363,7 +363,7 @@ pub(super) unsafe fn inverse_walsh<V: Transpose4>(input: &[i16; 16]) -> [i16; 16
 /// have two to four of them.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
-pub(super) unsafe fn sixtap<V: I32x>(
+pub unsafe fn sixtap<V: I32x>(
     window: &[u8],
     width: usize,
     height: usize,
@@ -415,7 +415,7 @@ pub(super) unsafe fn sixtap<V: I32x>(
 /// plus the one above it minus the corner, clamped. `above` holds the `size`
 /// samples above the block, without the corner.
 #[inline(always)]
-pub(super) unsafe fn tm_predict<V: I32x>(
+pub unsafe fn tm_predict<V: I32x>(
     above: &[u8],
     left: &[u8],
     corner: i32,
@@ -443,7 +443,7 @@ pub(super) unsafe fn tm_predict<V: I32x>(
 /// The thresholds `filter_edge` in `loop_filter.rs` takes, already resolved
 /// for the edge being filtered.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct EdgeLimits {
+pub struct EdgeLimits {
     /// The macroblock- or subblock-edge limit, whichever this edge uses.
     pub edge: i32,
     pub interior: i32,
@@ -555,7 +555,7 @@ unsafe fn filter_segments<V: I32x>(p: &mut [V; 4], q: &mut [V; 4], limits: EdgeL
 /// `data[at]`: the segments run along a row, and each crosses the edge
 /// vertically. `count` is a multiple of `V::LANES`.
 #[inline(always)]
-pub(super) unsafe fn filter_horizontal_edge<V: I32x>(
+pub unsafe fn filter_horizontal_edge<V: I32x>(
     data: &mut [u8],
     at: usize,
     stride: usize,
@@ -597,7 +597,7 @@ pub(super) unsafe fn filter_horizontal_edge<V: I32x>(
 /// A segment's eight samples are two little-endian words of its row, `p3` to
 /// `p0` and `q0` to `q3`, so each side is read and written as one word a lane.
 #[inline(always)]
-pub(super) unsafe fn filter_vertical_edge<V: I32x>(
+pub unsafe fn filter_vertical_edge<V: I32x>(
     data: &mut [u8],
     at: usize,
     stride: usize,

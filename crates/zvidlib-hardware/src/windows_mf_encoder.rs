@@ -67,12 +67,12 @@ use windows::Win32::System::Variant::VARIANT;
 use windows::core::{GUID, HRESULT, Interface, PWSTR};
 
 use super::annexb::{self, ParameterSets};
-use super::engine::encoder::colorconv;
 use crate::{
     Codec, CodecImplementation, ColorRange, EncodedSample, EncoderConfig, EncoderFuture, Error,
     ErrorKind, FrameIndex, FrameSource, Limits, Orientation, PixelFormat, Result, SampleDependency,
     VideoEncoder, VideoEncoderFormat,
 };
+use zvidlib_color::colorconv;
 
 /// How long an asynchronous MFT may go without raising an event while this
 /// backend is waiting on one before the encoder is reported as lost. A
@@ -89,7 +89,7 @@ const HNS_PER_SECOND: i128 = 10_000_000;
 
 /// Which class of registered MFT to use.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum MftClass {
+pub enum MftClass {
     /// The GPU vendor's asynchronous hardware encoder.
     Hardware,
     /// Microsoft's synchronous software encoder.
@@ -114,7 +114,7 @@ impl MftClass {
 
 /// The compressed format an MFT is asked to produce.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum OutputFormat {
+pub enum OutputFormat {
     /// HEVC Main, rate controlled to [`Settings::bits_per_second`].
     Hevc,
     /// VP9 profile 0, rate controlled to [`Settings::quality`].
@@ -155,7 +155,7 @@ impl OutputFormat {
 /// The encode an MFT is asked for, resolved from a
 /// [`crate::VideoEncoderConfig`] by the factory.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct Settings {
+pub struct Settings {
     pub format: OutputFormat,
     pub width: u32,
     pub height: u32,
@@ -174,7 +174,7 @@ pub(crate) struct Settings {
 
 impl Settings {
     /// Why this backend cannot take `self`, if it cannot.
-    pub(crate) fn unsupported_reason(&self) -> Option<String> {
+    pub fn unsupported_reason(&self) -> Option<String> {
         let name = self.format.name();
         if !matches!(
             self.input_format,
@@ -270,7 +270,7 @@ impl Feed {
 }
 
 /// Whether an MFT of `class` can take `settings`, by configuring one.
-pub(crate) fn probe(settings: Settings, class: MftClass) -> Result<()> {
+pub fn probe(settings: Settings, class: MftClass) -> Result<()> {
     run_on_mf_thread("zvidlib-mf-encode-probe", move || {
         let mut reasons = Vec::new();
         for activate in candidates(class, settings.format)? {
@@ -285,7 +285,7 @@ pub(crate) fn probe(settings: Settings, class: MftClass) -> Result<()> {
 }
 
 /// Creates an encoder on the first MFT of `class` that accepts `settings`.
-pub(crate) fn create(
+pub fn create(
     settings: Settings,
     class: MftClass,
     limits: &Limits,
@@ -1076,7 +1076,7 @@ impl Core {
                     }
                     // Only a key frame makes a VP9 sample a sync sample,
                     // whatever the MFT marks as a clean point.
-                    let key = crate::vp9_encoder::key_frame_vpcc(&output.stream, *level);
+                    let key = zvidlib_vp9_syntax::key_frame_vpcc(&output.stream, *level);
                     if key.as_ref().is_some_and(|key| key != vpcc) {
                         return Err(codec(
                             "encoder changed its colour signalling mid-stream, which a vp09 track cannot carry",
@@ -1174,7 +1174,7 @@ fn probe_parameter_sets(
 /// Encodes one black frame on a throwaway instance to learn the colour space
 /// and range a VP9 MFT's key frames signal, as the `vpcC` declaring them.
 fn probe_vpcc(activate: IMFActivate, class: MftClass, settings: &Settings) -> Result<Declared> {
-    let level = crate::vp9_encoder::pick_level(
+    let level = zvidlib_vp9_syntax::pick_level(
         crate::VideoDimensions {
             width: settings.width,
             height: settings.height,
@@ -1193,7 +1193,7 @@ fn probe_vpcc(activate: IMFActivate, class: MftClass, settings: &Settings) -> Re
         .iter()
         .find(|output| !output.stream.is_empty())
         .ok_or_else(|| codec("encoder emitted nothing for its first VP9 frame"))?;
-    let vpcc = crate::vp9_encoder::key_frame_vpcc(&first.stream, level)
+    let vpcc = zvidlib_vp9_syntax::key_frame_vpcc(&first.stream, level)
         .ok_or_else(|| codec("encoder did not open its stream with a VP9 profile 0 key frame"))?;
     Ok(Declared::Vp9 { vpcc, level })
 }
@@ -1953,7 +1953,7 @@ mod tests {
                 let tick = index as i64 * 1_001;
                 assert_eq!((sample.dts, sample.pts), (tick, tick), "{label}");
                 assert_eq!(
-                    crate::vp9_encoder::key_frame_vpcc(&sample.data, derived_level(&vpcc))
+                    zvidlib_vp9_syntax::key_frame_vpcc(&sample.data, derived_level(&vpcc))
                         .is_some(),
                     sample.is_sync,
                     "{label} frame {index}"

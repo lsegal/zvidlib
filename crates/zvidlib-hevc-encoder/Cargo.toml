@@ -14,3 +14,6 @@ zvidlib-color = { workspace = true }
 zvidlib-hevc-syntax = { workspace = true }
 zvidlib-hevc-decoder = { workspace = true }
 zvidlib-hardware = { workspace = true }
+
+[dev-dependencies]
+zvidlib-container = { path = "../zvidlib-container" }

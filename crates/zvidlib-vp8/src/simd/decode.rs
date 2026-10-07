@@ -21,16 +21,16 @@
 //! show up as out-of-line intrinsic calls to
 //! `.github/scripts/check_simd_target_features.py` (#341).
 
-use crate::simd::SimdIsa;
-use crate::vp8::tables::{
+use crate::tables::{
     B_DC_PRED, B_HD_PRED, B_HE_PRED, B_HU_PRED, B_LD_PRED, B_RD_PRED, B_TM_PRED, B_VE_PRED,
     B_VL_PRED, B_VR_PRED,
 };
+use zvidlib_core::simd::SimdIsa;
 
 /// The instruction set the `vp8_decode` kernels use.
 #[must_use]
-pub(crate) fn decode_isa() -> SimdIsa {
-    crate::simd::active()
+pub fn decode_isa() -> SimdIsa {
+    zvidlib_core::simd::active()
 }
 
 /// Where a subblock mode takes each of its 16 samples from (raster order).
@@ -108,7 +108,7 @@ fn write_rows(words: [u32; 4], plane: &mut [u8], offset: usize, stride: usize) {
     }
 }
 
-/// [`crate::vp8::predict::predict_subblock_scalar`].
+/// [`crate::predict::predict_subblock_scalar`].
 #[inline(always)]
 unsafe fn subblock_kernel<B: Bytes16>(
     mode: u8,
@@ -164,7 +164,7 @@ mod x86 {
     };
 
     #[derive(Clone, Copy)]
-    pub(super) struct X86Bytes(__m128i);
+    pub struct X86Bytes(__m128i);
 
     impl Bytes16 for X86Bytes {
         #[inline(always)]
@@ -274,7 +274,7 @@ mod arm {
     use core::arch::aarch64::*;
 
     #[derive(Clone, Copy)]
-    pub(super) struct NeonBytes(uint8x16_t);
+    pub struct NeonBytes(uint8x16_t);
 
     impl Bytes16 for NeonBytes {
         #[inline(always)]
@@ -376,7 +376,7 @@ mod arm {
     }
 }
 
-/// [`crate::vp8::predict::idct_dc_add_row_scalar`]: the DC-only inverse DCT
+/// [`crate::predict::idct_dc_add_row_scalar`]: the DC-only inverse DCT
 /// of the 2 or 4 blocks side by side at `offset`, one row of a macroblock's
 /// blocks at a time.
 #[inline(always)]
@@ -453,9 +453,9 @@ macro_rules! dispatch {
     };
 }
 
-/// The vector [`crate::vp8::predict::predict_subblock_scalar`], or `false`
+/// The vector [`crate::predict::predict_subblock_scalar`], or `false`
 /// when the active instruction set has none.
-pub(crate) fn subblock(
+pub fn subblock(
     mode: u8,
     above: &[u8; 9],
     left: &[u8; 4],
@@ -469,9 +469,9 @@ pub(crate) fn subblock(
     )
 }
 
-/// The vector [`crate::vp8::predict::idct_dc_add_row_scalar`] over `dcs`, 2
+/// The vector [`crate::predict::idct_dc_add_row_scalar`] over `dcs`, 2
 /// or 4 blocks, or `false` when the active instruction set has none.
-pub(crate) fn idct_dc_add_row(dcs: &[i16], plane: &mut [u8], offset: usize, stride: usize) -> bool {
+pub fn idct_dc_add_row(dcs: &[i16], plane: &mut [u8], offset: usize, stride: usize) -> bool {
     assert!(matches!(dcs.len(), 2 | 4), "a row of 2 or 4 blocks");
     dispatch!(
         decode_isa(),

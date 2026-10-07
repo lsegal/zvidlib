@@ -24,12 +24,12 @@
 //! into the two-dimensional `ScalingFactor[sizeId][matrixId][x][y]`
 //! quantization matrices (§7.4.5 equations 7-44..7-51), placing each
 //! flat coefficient at the `(x, y)` cell given by the §6.5.3 up-right
-//! diagonal scan order ([`crate::hevc::engine::scan`]) and applying the
+//! diagonal scan order ([`crate::scan`]) and applying the
 //! `2x`/`4x` block-upsampling for the 16x16 / 32x32 sizes plus the
 //! DC-coefficient `[0][0]` override.
 
-use crate::hevc::engine::bitreader::{BitReader, BitReaderError};
-use crate::hevc::engine::scan::up_right_diagonal;
+use crate::bitreader::{BitReader, BitReaderError};
+use crate::scan::up_right_diagonal;
 
 /// Number of `sizeId` values (4x4, 8x8, 16x16, 32x32) — §7.4.5
 /// Table 7-3.
@@ -451,7 +451,7 @@ impl ScalingListData {
 fn place(
     matrix: &mut ScalingFactorMatrix,
     coef: &[u16],
-    scan: &[crate::hevc::engine::scan::ScanPos],
+    scan: &[crate::scan::ScanPos],
     rep: usize,
 ) {
     let dim = matrix.dim as usize;
@@ -865,7 +865,7 @@ mod tests {
         let f = all_default_factors(1);
         let mat = &f.factors[1][0];
         assert_eq!(mat.dim, 8);
-        let scan = crate::hevc::engine::scan::up_right_diagonal(8);
+        let scan = crate::scan::up_right_diagonal(8);
         for (i, &expected) in DEFAULT_8X8_INTRA.iter().enumerate() {
             let p = scan[i];
             assert_eq!(
@@ -1000,7 +1000,7 @@ mod tests {
         // The chroma 32x32 matrix matches the 16x16 luma-scan placement
         // of the same matrixId's 8x8 default table, replicated 4x4.
         let mat = &f.factors[3][1];
-        let scan = crate::hevc::engine::scan::up_right_diagonal(8);
+        let scan = crate::scan::up_right_diagonal(8);
         // i=1 (intra default table entry) lands at scan[1] scaled by 4.
         let p = scan[1];
         assert_eq!(

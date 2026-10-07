@@ -13,3 +13,6 @@ zvidlib-core = { workspace = true }
 zvidlib-color = { workspace = true }
 zvidlib-vp9-syntax = { workspace = true }
 zvidlib-hardware = { workspace = true }
+
+[dev-dependencies]
+zvidlib-container = { path = "../zvidlib-container" }

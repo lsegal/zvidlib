@@ -46,7 +46,7 @@
 //! the caller's / follow-ups' responsibility — this module starts at the
 //! marked reference array and stops at `predSamples`.
 
-use crate::hevc::engine::simd::{self, Isa};
+use crate::engine::simd::{self, Isa};
 
 /// Table 8-1 mode index `0` — the planar predictor (§8.4.4.2.4).
 pub const INTRA_PLANAR: u8 = 0;

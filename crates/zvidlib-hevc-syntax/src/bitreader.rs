@@ -13,7 +13,7 @@
 //!   descriptor, parsed per §9.2).
 //!
 //! The reader takes an already-unescaped RBSP buffer (see
-//! [`crate::hevc::engine::nal::strip_emulation_prevention`]) and does not attempt to
+//! [`crate::nal::strip_emulation_prevention`]) and does not attempt to
 //! locate the RBSP stop bit — that is left to the calling parser.
 
 /// Errors that can arise while consuming bits from an RBSP buffer.

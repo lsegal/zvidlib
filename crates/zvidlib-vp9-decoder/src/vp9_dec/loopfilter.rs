@@ -12,7 +12,8 @@ use crate::vp9_simd::{self, SimdIsa, loopfilter::Taps};
 /// The edge masks of one 64x64 superblock (`LOOP_FILTER_MASK`): one bit per
 /// 8x8 luma block (row-major, low bit first) or per 8x8 chroma block.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct LoopFilterMask {
+#[doc(hidden)]
+pub struct LoopFilterMask {
     left_y: [u64; 4],
     above_y: [u64; 4],
     int_4x4_y: u64,
@@ -98,16 +99,18 @@ const LEFT_BORDER_UV: u16 = 0x1111;
 const ABOVE_BORDER_UV: u16 = 0x000f;
 
 /// The facts about one decoded block the masks are built from.
-pub(crate) struct MaskBlock {
-    pub(crate) sb_type: u8,
-    pub(crate) tx_size: u8,
-    pub(crate) skip_inter: bool,
-    pub(crate) filter_level: u8,
+#[doc(hidden)]
+pub struct MaskBlock {
+    pub sb_type: u8,
+    pub tx_size: u8,
+    pub skip_inter: bool,
+    pub filter_level: u8,
 }
 
 /// `vp9_build_mask`: adds one block, of `bw`x`bh` 8x8 units at
 /// (`mi_row`, `mi_col`), to its superblock's masks.
-pub(crate) fn build_mask(
+#[doc(hidden)]
+pub fn build_mask(
     lfm: &mut LoopFilterMask,
     block: &MaskBlock,
     mi_row: usize,
@@ -239,14 +242,14 @@ fn adjust_mask(
 
 /// The thresholds of one filter level (`loop_filter_thresh`).
 #[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct Thresholds {
-    pub(crate) mblim: u8,
-    pub(crate) lim: u8,
-    pub(crate) hev_thr: u8,
+pub struct Thresholds {
+    pub mblim: u8,
+    pub lim: u8,
+    pub hev_thr: u8,
 }
 
 /// `update_sharpness` and the `hev_thr` setup of `vp9_loop_filter_init`.
-pub(crate) fn thresholds(sharpness: u8) -> [Thresholds; 64] {
+pub fn thresholds(sharpness: u8) -> [Thresholds; 64] {
     let mut table = [Thresholds::default(); 64];
     for (level, entry) in table.iter_mut().enumerate() {
         let level = level as i32;
@@ -267,11 +270,11 @@ pub(crate) fn thresholds(sharpness: u8) -> [Thresholds; 64] {
 
 /// A view of one plane for the filters: `data[offset]` is the pixel the
 /// current edge starts at.
-pub(crate) struct Pixels<'a> {
-    pub(crate) data: &'a mut [u8],
-    pub(crate) stride: usize,
+pub struct Pixels<'a> {
+    pub data: &'a mut [u8],
+    pub stride: usize,
     /// The instruction set the filters run on, resolved once per frame.
-    pub(crate) isa: SimdIsa,
+    pub isa: SimdIsa,
 }
 
 #[inline]
@@ -361,14 +364,7 @@ impl Pixels<'_> {
 
     /// The 4-tap filter along `count` pixels of an edge. `step` crosses
     /// the edge and `along` moves along it.
-    pub(crate) fn lpf4(
-        &mut self,
-        start: isize,
-        step: isize,
-        along: isize,
-        count: usize,
-        t: Thresholds,
-    ) {
+    pub fn lpf4(&mut self, start: isize, step: isize, along: isize, count: usize, t: Thresholds) {
         if vp9_simd::filter_edge(
             self.isa,
             self.data,
@@ -390,14 +386,7 @@ impl Pixels<'_> {
     }
 
     /// `filter8` along `count` pixels of an edge.
-    pub(crate) fn lpf8(
-        &mut self,
-        start: isize,
-        step: isize,
-        along: isize,
-        count: usize,
-        t: Thresholds,
-    ) {
+    pub fn lpf8(&mut self, start: isize, step: isize, along: isize, count: usize, t: Thresholds) {
         if vp9_simd::filter_edge(
             self.isa,
             self.data,
@@ -435,14 +424,7 @@ impl Pixels<'_> {
     }
 
     /// `filter16` along `count` pixels of an edge.
-    pub(crate) fn lpf16(
-        &mut self,
-        start: isize,
-        step: isize,
-        along: isize,
-        count: usize,
-        t: Thresholds,
-    ) {
+    pub fn lpf16(&mut self, start: isize, step: isize, along: isize, count: usize, t: Thresholds) {
         if vp9_simd::filter_edge(
             self.isa,
             self.data,
@@ -643,16 +625,18 @@ fn filter_selectively_horiz(
 }
 
 /// One plane of the frame being filtered.
-pub(crate) struct FilterPlane<'a> {
-    pub(crate) data: &'a mut [u8],
-    pub(crate) stride: usize,
+#[doc(hidden)]
+pub struct FilterPlane<'a> {
+    pub data: &'a mut [u8],
+    pub stride: usize,
     /// The index of the plane's top-left pixel in `data`.
-    pub(crate) origin: usize,
+    pub origin: usize,
 }
 
 /// Filters the whole frame (`loop_filter_rows` over every superblock row
 /// with the 4:2:0 path).
-pub(crate) fn filter_frame(
+#[doc(hidden)]
+pub fn filter_frame(
     planes: &mut [FilterPlane; 3],
     masks: &mut [LoopFilterMask],
     mi_rows: usize,
@@ -838,7 +822,7 @@ fn filter_plane_ss11(
 /// The filter level of every segment, reference frame and mode class
 /// (`vp9_loop_filter_frame_init`'s `lfi->lvl`), indexed
 /// `[segment][reference frame][mode is not ZEROMV]`.
-pub(super) fn filter_levels(
+pub fn filter_levels(
     default_level: u8,
     segment_levels: [Option<(bool, i32)>; 8],
     mode_ref_delta_enabled: bool,

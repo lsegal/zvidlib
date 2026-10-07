@@ -7,7 +7,7 @@
 //! and the motion vectors / reference pictures of the two prediction
 //! blocks straddling the edge. This module implements that derivation —
 //! [`derive_boundary_strength`] — reading the per-4×4-block motion / mode
-//! state from a [`crate::hevc::engine::motion::MotionField`].
+//! state from a [`crate::engine::motion::MotionField`].
 //!
 //! The §8.7.2.2 / §8.7.2.3 edge-flag derivation (which marks the
 //! transform-block / prediction-block boundaries an edge falls on, from
@@ -25,9 +25,9 @@
 //! [`filter_chroma_block_edge`] (§8.7.2.5.5) gather/apply those
 //! primitives across a 4-row edge segment of a [`SamplePlane`] in place.
 
-use crate::hevc::engine::binarization::PartMode;
-use crate::hevc::engine::motion::MotionField;
-use crate::hevc::engine::picture::{Picture, Plane, sub_wh_c};
+use crate::engine::binarization::PartMode;
+use crate::engine::motion::MotionField;
+use crate::engine::picture::{Picture, Plane, sub_wh_c};
 
 /// §8.7.2.1 — the edge orientation being filtered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,14 +76,14 @@ impl TransformSplit {
         ]))
     }
 
-    /// Map a parsed §7.3.8.8 [`crate::hevc::engine::transform_tree::TransformTree`] to the
+    /// Map a parsed §7.3.8.8 [`crate::engine::transform_tree::TransformTree`] to the
     /// deblocking transform-split structure the §8.7.2.2 transform-block
     /// boundary recursion consumes (only the split topology matters, not the
     /// per-leaf residual). A CU with no transform tree (skip / `rqt_root_cbf
     /// == 0`) is a single whole-CB leaf.
     #[must_use]
-    pub fn from_tree(tree: Option<&crate::hevc::engine::transform_tree::TransformTree>) -> Self {
-        use crate::hevc::engine::transform_tree::TransformTree;
+    pub fn from_tree(tree: Option<&crate::engine::transform_tree::TransformTree>) -> Self {
+        use crate::engine::transform_tree::TransformTree;
         match tree {
             None | Some(TransformTree::Leaf { .. }) => TransformSplit::Leaf,
             Some(TransformTree::Split { children, .. }) => TransformSplit::Split(Box::new([
@@ -308,8 +308,8 @@ impl BoundaryStrength {
 /// list-independent (spec NOTE 1): block p uses reference-picture set
 /// `{ p.l0?, p.l1? }`, block q uses `{ q.l0?, q.l1? }`.
 fn different_refs_or_count(
-    p: &crate::hevc::engine::motion::MotionCell,
-    q: &crate::hevc::engine::motion::MotionCell,
+    p: &crate::engine::motion::MotionCell,
+    q: &crate::engine::motion::MotionCell,
 ) -> bool {
     let p_count = u8::from(p.pred_flag_l0) + u8::from(p.pred_flag_l1);
     let q_count = u8::from(q.pred_flag_l0) + u8::from(q.pred_flag_l1);
@@ -347,8 +347,8 @@ fn mv_diff_ge4(a: [i32; 2], b: [i32; 2]) -> bool {
 /// (the third bullet onward: same/different references, MV differences).
 /// Returns `true` when bS should be 1 on motion grounds.
 fn motion_bs_is_one(
-    p: &crate::hevc::engine::motion::MotionCell,
-    q: &crate::hevc::engine::motion::MotionCell,
+    p: &crate::engine::motion::MotionCell,
+    q: &crate::engine::motion::MotionCell,
 ) -> bool {
     // Bullet 1: different reference pictures or different number of MVs.
     if different_refs_or_count(p, q) {
@@ -600,7 +600,7 @@ pub fn filter_luma_sample(
 ) -> LumaFilterOut {
     let [p0, p1, p2, p3] = p;
     let [q0, q1, q2, q3] = q;
-    let clip = |v: i32| crate::hevc::engine::picture::clip1(v, bit_depth);
+    let clip = |v: i32| crate::engine::picture::clip1(v, bit_depth);
     if de == 2 {
         // Strong filter (eqs. 8-389..8-394).
         let p0p =
@@ -765,8 +765,8 @@ pub fn filter_chroma_sample(p: [i32; 2], q: [i32; 2], tc: i32, bit_depth: u8) ->
     let [q0, q1] = q;
     let delta = (((q0 - p0) << 2) + p1 - q1 + 4) >> 3; // eq. 8-403
     let delta = delta.clamp(-tc, tc);
-    let p0p = crate::hevc::engine::picture::clip1(p0 + delta, bit_depth); // eq. 8-404
-    let q0p = crate::hevc::engine::picture::clip1(q0 - delta, bit_depth); // eq. 8-405
+    let p0p = crate::engine::picture::clip1(p0 + delta, bit_depth); // eq. 8-404
+    let q0p = crate::engine::picture::clip1(q0 - delta, bit_depth); // eq. 8-405
     (p0p, q0p)
 }
 
@@ -932,8 +932,8 @@ pub fn filter_luma_block_edge_gated(
     // Both orientations gather four contiguous samples per access, so
     // the whole segment costs eight row reads rather than 32 bounds-
     // checked per-sample reads.
-    let mut seg_p: crate::hevc::engine::simd::in_loop::LumaSeg = [[0i32; 4]; 4];
-    let mut seg_q: crate::hevc::engine::simd::in_loop::LumaSeg = [[0i32; 4]; 4];
+    let mut seg_p: crate::engine::simd::in_loop::LumaSeg = [[0i32; 4]; 4];
+    let mut seg_q: crate::engine::simd::in_loop::LumaSeg = [[0i32; 4]; 4];
     match edge {
         EdgeType::Vertical => {
             for k in 0..4 {
@@ -969,9 +969,9 @@ pub fn filter_luma_block_edge_gated(
     // Apply the filter to all 4 rows at once (eq. 8-372/8-373 layout).
     // Rows the weak filter leaves alone come back holding their input
     // samples, so writing `0..nDp` / `0..nDq` back is a no-op for them.
-    let mut out_p: crate::hevc::engine::simd::in_loop::LumaSegOut = [[0i32; 4]; 3];
-    let mut out_q: crate::hevc::engine::simd::in_loop::LumaSegOut = [[0i32; 4]; 3];
-    crate::hevc::engine::simd::in_loop::filter_luma_rows(
+    let mut out_p: crate::engine::simd::in_loop::LumaSegOut = [[0i32; 4]; 3];
+    let mut out_q: crate::engine::simd::in_loop::LumaSegOut = [[0i32; 4]; 3];
+    crate::engine::simd::in_loop::filter_luma_rows(
         &seg_p, &seg_q, dec.de, dec.dep, dec.deq, tc, bit_depth, &mut out_p, &mut out_q,
     );
     let ndp = if dec.de == 2 {
@@ -1060,8 +1060,8 @@ pub fn filter_chroma_block_edge_gated(
     );
     // Gather the whole 4-row segment (`seg_p[i][k]` = `pi,k`) and filter
     // its four rows together.
-    let mut seg_p: crate::hevc::engine::simd::in_loop::ChromaSeg = [[0i32; 4]; 2];
-    let mut seg_q: crate::hevc::engine::simd::in_loop::ChromaSeg = [[0i32; 4]; 2];
+    let mut seg_p: crate::engine::simd::in_loop::ChromaSeg = [[0i32; 4]; 2];
+    let mut seg_q: crate::engine::simd::in_loop::ChromaSeg = [[0i32; 4]; 2];
     match edge {
         EdgeType::Vertical => {
             for k in 0..4 {
@@ -1081,7 +1081,7 @@ pub fn filter_chroma_block_edge_gated(
     }
     let mut out_p0 = [0i32; 4];
     let mut out_q0 = [0i32; 4];
-    crate::hevc::engine::simd::in_loop::filter_chroma_rows(
+    crate::engine::simd::in_loop::filter_chroma_rows(
         &seg_p,
         &seg_q,
         tc,
@@ -1560,7 +1560,7 @@ fn apply_cu_direction(
 #[cfg(any())]
 mod tests {
     use super::*;
-    use crate::hevc::engine::motion::MotionCell;
+    use crate::engine::motion::MotionCell;
 
     fn inter_cell(mv0: [i32; 2], poc0: i32) -> MotionCell {
         MotionCell {

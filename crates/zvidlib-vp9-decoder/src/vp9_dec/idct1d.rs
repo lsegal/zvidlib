@@ -52,7 +52,7 @@ fn round_shift(x: i64) -> i64 {
     (x + (1 << 13)) >> 14
 }
 
-pub(super) fn idct4(input: &[i32], output: &mut [i32]) {
+pub fn idct4(input: &[i32], output: &mut [i32]) {
     let mut step = [0i64; 4];
     let mut temp1: i64;
     let mut temp2: i64;
@@ -72,7 +72,7 @@ pub(super) fn idct4(input: &[i32], output: &mut [i32]) {
     output[3] = (wraplow(step[0] - step[3])) as i32;
 }
 
-pub(super) fn iadst4(input: &[i32], output: &mut [i32]) {
+pub fn iadst4(input: &[i32], output: &mut [i32]) {
     let mut s0: i64;
     let mut s1: i64;
     let mut s2: i64;
@@ -107,7 +107,7 @@ pub(super) fn iadst4(input: &[i32], output: &mut [i32]) {
     output[3] = (wraplow(round_shift(s0 + s1 - s3))) as i32;
 }
 
-pub(crate) fn idct8(input: &[i32], output: &mut [i32]) {
+pub fn idct8(input: &[i32], output: &mut [i32]) {
     let mut step1 = [0i64; 8];
     let mut step2 = [0i64; 8];
     let mut temp1: i64;
@@ -160,7 +160,7 @@ pub(crate) fn idct8(input: &[i32], output: &mut [i32]) {
     output[7] = (wraplow(step1[0] - step1[7])) as i32;
 }
 
-pub(crate) fn iadst8(input: &[i32], output: &mut [i32]) {
+pub fn iadst8(input: &[i32], output: &mut [i32]) {
     let mut s0: i64;
     let mut s1: i64;
     let mut s2: i64;
@@ -231,7 +231,7 @@ pub(crate) fn iadst8(input: &[i32], output: &mut [i32]) {
     output[7] = (wraplow(-x1)) as i32;
 }
 
-pub(crate) fn idct16(input: &[i32], output: &mut [i32]) {
+pub fn idct16(input: &[i32], output: &mut [i32]) {
     let mut step1 = [0i64; 16];
     let mut step2 = [0i64; 16];
     let mut temp1: i64;
@@ -376,7 +376,7 @@ pub(crate) fn idct16(input: &[i32], output: &mut [i32]) {
     output[15] = (wraplow(step2[0] - step2[15])) as i32;
 }
 
-pub(crate) fn iadst16(input: &[i32], output: &mut [i32]) {
+pub fn iadst16(input: &[i32], output: &mut [i32]) {
     let mut s0: i64;
     let mut s1: i64;
     let mut s2: i64;
@@ -543,7 +543,7 @@ pub(crate) fn iadst16(input: &[i32], output: &mut [i32]) {
     output[15] = (wraplow(-x1)) as i32;
 }
 
-pub(crate) fn idct32(input: &[i32], output: &mut [i32]) {
+pub fn idct32(input: &[i32], output: &mut [i32]) {
     let mut step1 = [0i64; 32];
     let mut step2 = [0i64; 32];
     let mut temp1: i64;

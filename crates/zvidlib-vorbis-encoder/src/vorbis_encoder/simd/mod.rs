@@ -76,7 +76,8 @@ use super::psy::NoiseAcc;
 /// cached CPU probe, so pinning an instruction set reaches these kernels and a
 /// benchmark can prove that it did.
 #[must_use]
-pub(crate) fn active_isa() -> SimdIsa {
+#[doc(hidden)]
+pub fn active_isa() -> SimdIsa {
     static DETECTED: OnceLock<SimdIsa> = OnceLock::new();
     crate::simd::override_isa().unwrap_or_else(|| *DETECTED.get_or_init(crate::simd::detected))
 }

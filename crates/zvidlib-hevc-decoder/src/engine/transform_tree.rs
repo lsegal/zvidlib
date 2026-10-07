@@ -4,12 +4,12 @@
 //! This module drives the residual-quadtree split that the §7.3.8.5
 //! `coding_unit( )` body enters (under `rqt_root_cbf`) and that bottoms
 //! out in the §7.3.8.10 `transform_unit( )` leaf already implemented in
-//! [`crate::hevc::engine::transform_unit`]. It is the missing rung between the
+//! [`crate::engine::transform_unit`]. It is the missing rung between the
 //! coding-unit walk and the transform-unit leaf: it reads
 //! `split_transform_flag`, the per-node `cbf_cb` / `cbf_cr` chroma
 //! coded-block flags, recurses into four quarter-size nodes when split,
 //! and at each leaf reads `cbf_luma` then invokes
-//! [`crate::hevc::engine::transform_unit::decode_transform_unit`].
+//! [`crate::engine::transform_unit::decode_transform_unit`].
 //!
 //! The driver mirrors the §7.3.8.8 syntax table exactly, including the
 //! inheritance gate (`trafoDepth == 0 || cbf_cb[xBase][yBase][trafoDepth
@@ -29,15 +29,15 @@
 //! decoded coefficient blocks into sample residuals likewise remains the
 //! caller's responsibility.
 
-use crate::hevc::engine::binarization::{
+use crate::engine::binarization::{
     cbf_cb_ctx_inc, cbf_chroma_inferred, cbf_cr_ctx_inc, cbf_luma_ctx_inc, cbf_luma_inferred,
     decode_cbf_cb, decode_cbf_cr, decode_cbf_luma, decode_split_transform_flag,
     split_transform_flag_ctx_inc, split_transform_flag_inferred,
 };
-use crate::hevc::engine::cabac::CabacEngine;
-use crate::hevc::engine::ctx_init::SliceContexts;
-use crate::hevc::engine::residual::ResidualCodingError;
-use crate::hevc::engine::transform_unit::{
+use crate::engine::cabac::CabacEngine;
+use crate::engine::ctx_init::SliceContexts;
+use crate::engine::residual::ResidualCodingError;
+use crate::engine::transform_unit::{
     CuPredMode, QuantGroupState, TransformUnit, TransformUnitParams, decode_transform_unit,
 };
 
@@ -161,7 +161,7 @@ pub fn decode_transform_tree(
     y0: u32,
     // xBase / yBase identify the parent node's top-left position. The
     // §7.3.8.10 deferred-chroma leaf reads chroma at (xBase, yBase), but
-    // that positional lookup is carried into the [`crate::hevc::engine::transform_unit`]
+    // that positional lookup is carried into the [`crate::engine::transform_unit`]
     // leaf via the inherited `parent_cbf_cb` / `parent_cbf_cr` cbf state
     // rather than raw coordinates, so these are retained for §7.3.8.8
     // signature fidelity and bounds reasoning only.

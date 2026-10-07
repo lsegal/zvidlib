@@ -11,7 +11,7 @@
 //! target (including `wasm32`).
 //!
 //! The kernels are written once, generic over the 32-bit lane abstraction
-//! [`crate::av1_simd::vector::I32x`] the AV1 kernels already use, and
+//! [`zvidlib_core::simd::vector::I32x`] the AV1 kernels already use, and
 //! instantiated per instruction set behind `#[target_feature]` wrappers. The
 //! convolution is the exception in its inner loop: one 8-byte load feeds
 //! eight outputs there, which `I32x` cannot express, so it is written over the
@@ -53,8 +53,8 @@ pub(crate) mod loopfilter;
 pub(crate) mod transforms;
 pub(crate) mod wide;
 
-pub use crate::av1_simd::SimdIsa;
-use crate::av1_simd::vector;
+pub use zvidlib_core::simd::SimdIsa;
+use zvidlib_core::simd::vector;
 
 /// The instruction set the VP9 kernels will actually use: the crate-wide
 /// [`crate::simd::active`] value, so [`crate::simd::set_override`] reaches

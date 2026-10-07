@@ -4,7 +4,7 @@ use super::*;
 
 /// A minimal MD5 (RFC 1321), for comparing decoded frames with the
 /// per-frame digests libvpx's test vectors ship with.
-pub(crate) fn md5(data: &[u8]) -> [u8; 16] {
+pub fn md5(data: &[u8]) -> [u8; 16] {
     const S: [u32; 64] = [
         7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5,
         9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10,
@@ -55,13 +55,13 @@ pub(crate) fn md5(data: &[u8]) -> [u8; 16] {
     digest
 }
 
-pub(crate) fn hex(bytes: &[u8]) -> String {
+pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// The MD5 libvpx's test harness computes for a picture: the visible
 /// rows of Y, then U, then V.
-pub(crate) fn picture_md5(picture: &DecodedPicture) -> String {
+pub fn picture_md5(picture: &DecodedPicture) -> String {
     let mut bytes = Vec::new();
     for plane in &picture.planes {
         bytes.extend_from_slice(plane);
@@ -70,7 +70,7 @@ pub(crate) fn picture_md5(picture: &DecodedPicture) -> String {
 }
 
 /// The frames of an IVF file.
-pub(crate) fn ivf_frames(data: &[u8]) -> Vec<&[u8]> {
+pub fn ivf_frames(data: &[u8]) -> Vec<&[u8]> {
     assert_eq!(&data[..4], b"DKIF", "not an IVF file");
     let header_size = usize::from(u16::from_le_bytes([data[6], data[7]]));
     let mut offset = header_size;
@@ -119,7 +119,7 @@ fn inverse_probability_remapping_table_matches_libvpx() {
 /// The frames of a WebM file's first video track, in file order: the
 /// `SimpleBlock`s and `BlockGroup` `Block`s of every `Cluster`. Only what
 /// the libvpx test vectors use is read; lacing is refused.
-pub(crate) fn webm_frames(data: &[u8]) -> Vec<&[u8]> {
+pub fn webm_frames(data: &[u8]) -> Vec<&[u8]> {
     fn vint(data: &[u8], offset: usize, keep_marker: bool) -> (u64, usize) {
         let first = data[offset];
         let length = first.leading_zeros() as usize + 1;

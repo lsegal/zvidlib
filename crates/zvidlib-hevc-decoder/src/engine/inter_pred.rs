@@ -43,7 +43,7 @@
 //! a `(xInt, yInt, xFrac, yFrac)` location and a reference plane, and
 //! stops at the prediction sample arrays.
 
-use crate::hevc::engine::simd::{self, Isa};
+use crate::engine::simd::{self, Isa};
 
 /// A reference-picture luma / chroma sample plane with the §8.5.3.3.3
 /// `Clip3( 0, dim − 1, … )` edge-extension border (equations 8-222 /
@@ -60,7 +60,7 @@ pub struct RefPlane<'a> {
     samples: &'a [i32],
     /// The same samples again as `i16`, when the picture carries the
     /// eight-bit mirror of this plane
-    /// ([`crate::hevc::engine::picture::Picture::narrow_plane`]).
+    /// ([`crate::engine::picture::Picture::narrow_plane`]).
     ///
     /// This is what lets [`RefPlane::row_window_narrow`] *borrow* a
     /// narrow window instead of materializing one, which is the whole
@@ -1630,7 +1630,7 @@ pub struct InterPredGeometry {
 }
 
 /// `(SubWidthC, SubHeightC)` from Table 6-1 (mirrors
-/// [`crate::hevc::engine::picture::sub_wh_c`] without the cross-module dependency).
+/// [`crate::engine::picture::sub_wh_c`] without the cross-module dependency).
 #[inline]
 fn sub_wh_c_local(chroma_array_type: u8) -> (i32, i32) {
     match chroma_array_type {

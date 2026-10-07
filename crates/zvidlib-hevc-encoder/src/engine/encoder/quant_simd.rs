@@ -1,7 +1,7 @@
 //! Runtime-dispatched SIMD kernel for the encoder-side quantization loop.
 //!
 //! Quantization is the exact inverse of the decoder's §8.6.3 scaling
-//! loop ([`crate::hevc::engine::transform_simd::dequant_block`]): where
+//! loop ([`crate::engine::transform_simd::dequant_block`]): where
 //! the decoder multiplies a level by `levelScale[ qP % 6 ]` and shifts
 //! left by `qP / 6`, the encoder multiplies a transform coefficient by
 //! the reciprocal step `quantScale[ qP % 6 ]` and shifts right by
@@ -22,7 +22,7 @@
 
 use core::sync::atomic::{AtomicU8, Ordering};
 
-pub use crate::hevc::engine::transform_simd::Backend;
+pub use crate::engine::transform_simd::Backend;
 
 /// Candidate backends in descending preference order, matching the
 /// decode-side kernel's list. SSE4.1 is enough here — the clip runs on

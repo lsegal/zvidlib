@@ -72,8 +72,8 @@
 //! }
 //! ```
 
-use crate::hevc::engine::bitreader::{BitReader, BitReaderError};
-use crate::hevc::engine::vps::HEVC_MAX_SUB_LAYERS;
+use crate::bitreader::{BitReader, BitReaderError};
+use crate::vps::HEVC_MAX_SUB_LAYERS;
 
 /// Upper bound on `cpb_cnt_minus1[i]`. §E.3.2 mandates the range
 /// 0..=31, so a CPB array has at most 32 entries.
@@ -559,7 +559,7 @@ impl VpsHrdEntry {
         // guaranteed-out-of-range regardless of VPS context; cap here
         // so the cross-check against the active VPS in §7.4.3.1 is
         // free to look at a believable value.
-        if hrd_layer_set_idx > crate::hevc::engine::vps::HEVC_VPS_MAX_NUM_LAYER_SETS as u32 {
+        if hrd_layer_set_idx > crate::vps::HEVC_VPS_MAX_NUM_LAYER_SETS as u32 {
             return Err(HrdError::ValueOutOfRange {
                 field: "hrd_layer_set_idx",
                 got: hrd_layer_set_idx,

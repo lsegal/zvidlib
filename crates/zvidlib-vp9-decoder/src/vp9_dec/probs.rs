@@ -8,82 +8,82 @@
 use super::tables::*;
 
 /// `vp9_intra_mode_tree`.
-pub(super) const INTRA_MODE_TREE: [i8; 18] = [
+pub const INTRA_MODE_TREE: [i8; 18] = [
     -DC_PRED, 2, -TM_PRED, 4, -V_PRED, 6, 8, 12, -H_PRED, 10, -D135_PRED, -D117_PRED, -D45_PRED,
     14, -D63_PRED, 16, -D153_PRED, -D207_PRED,
 ];
 /// `vp9_inter_mode_tree`, with symbols relative to `NEARESTMV`.
-pub(super) const INTER_MODE_TREE: [i8; 6] = [-2, 2, 0, 4, -1, -3];
+pub const INTER_MODE_TREE: [i8; 6] = [-2, 2, 0, 4, -1, -3];
 /// `vp9_partition_tree`.
-pub(super) const PARTITION_TREE: [i8; 6] = [0, 2, -1, 4, -2, -3];
+pub const PARTITION_TREE: [i8; 6] = [0, 2, -1, 4, -2, -3];
 /// `vp9_switchable_interp_tree`: regular, smooth, sharp.
-pub(super) const SWITCHABLE_INTERP_TREE: [i8; 4] = [0, 2, -1, -2];
+pub const SWITCHABLE_INTERP_TREE: [i8; 4] = [0, 2, -1, -2];
 /// `vp9_segment_tree`.
-pub(super) const SEGMENT_TREE: [i8; 14] = [2, 4, 6, 8, 10, 12, 0, -1, -2, -3, -4, -5, -6, -7];
+pub const SEGMENT_TREE: [i8; 14] = [2, 4, 6, 8, 10, 12, 0, -1, -2, -3, -4, -5, -6, -7];
 /// `vp9_mv_joint_tree`.
-pub(super) const MV_JOINT_TREE: [i8; 6] = [0, 2, -1, 4, -2, -3];
+pub const MV_JOINT_TREE: [i8; 6] = [0, 2, -1, 4, -2, -3];
 /// `vp9_mv_class_tree`.
-pub(super) const MV_CLASS_TREE: [i8; 20] = [
+pub const MV_CLASS_TREE: [i8; 20] = [
     0, 2, -1, 4, 6, 8, -2, -3, 10, 12, -4, -5, -6, 14, 16, 18, -7, -8, -9, -10,
 ];
 /// `vp9_mv_class0_tree`.
-pub(super) const MV_CLASS0_TREE: [i8; 2] = [0, -1];
+pub const MV_CLASS0_TREE: [i8; 2] = [0, -1];
 /// `vp9_mv_fp_tree`.
-pub(super) const MV_FP_TREE: [i8; 6] = [0, 2, -1, 4, -2, -3];
+pub const MV_FP_TREE: [i8; 6] = [0, 2, -1, 4, -2, -3];
 
-pub(super) const DC_PRED: i8 = 0;
-pub(super) const V_PRED: i8 = 1;
-pub(super) const H_PRED: i8 = 2;
-pub(super) const D45_PRED: i8 = 3;
-pub(super) const D135_PRED: i8 = 4;
-pub(super) const D117_PRED: i8 = 5;
-pub(super) const D153_PRED: i8 = 6;
-pub(super) const D207_PRED: i8 = 7;
-pub(super) const D63_PRED: i8 = 8;
-pub(super) const TM_PRED: i8 = 9;
+pub const DC_PRED: i8 = 0;
+pub const V_PRED: i8 = 1;
+pub const H_PRED: i8 = 2;
+pub const D45_PRED: i8 = 3;
+pub const D135_PRED: i8 = 4;
+pub const D117_PRED: i8 = 5;
+pub const D153_PRED: i8 = 6;
+pub const D207_PRED: i8 = 7;
+pub const D63_PRED: i8 = 8;
+pub const TM_PRED: i8 = 9;
 
 /// The coefficient probabilities of one transform size:
 /// `[plane type][ref][band][context][node]` (`vp9_coeff_probs_model`).
-pub(super) type CoefProbs = [[[[[u8; 3]; 6]; 6]; 2]; 2];
+pub type CoefProbs = [[[[[u8; 3]; 6]; 6]; 2]; 2];
 
 /// The coefficient counts of one transform size, over the four model tokens
 /// (zero, one, more than one, end of block): `[plane type][ref][band]
 /// [context][token]` (`vp9_coeff_count_model`).
-pub(super) type CoefCounts = [[[[[u32; 4]; 6]; 6]; 2]; 2];
+pub type CoefCounts = [[[[[u32; 4]; 6]; 6]; 2]; 2];
 
 /// The motion vector probabilities of one component (`nmv_component`).
 #[derive(Clone, Copy, Debug)]
-pub(super) struct MvComponentProbs {
-    pub(super) sign: u8,
-    pub(super) classes: [u8; 10],
-    pub(super) class0: [u8; 1],
-    pub(super) bits: [u8; 10],
-    pub(super) class0_fp: [[u8; 3]; 2],
-    pub(super) fp: [u8; 3],
-    pub(super) class0_hp: u8,
-    pub(super) hp: u8,
+pub struct MvComponentProbs {
+    pub sign: u8,
+    pub classes: [u8; 10],
+    pub class0: [u8; 1],
+    pub bits: [u8; 10],
+    pub class0_fp: [[u8; 3]; 2],
+    pub fp: [u8; 3],
+    pub class0_hp: u8,
+    pub hp: u8,
 }
 
 /// One frame context (`FRAME_CONTEXT`).
 #[derive(Clone, Debug)]
-pub(super) struct FrameContext {
-    pub(super) y_mode: [[u8; 9]; 4],
-    pub(super) uv_mode: [[u8; 9]; 10],
-    pub(super) partition: [[u8; 3]; 16],
+pub struct FrameContext {
+    pub y_mode: [[u8; 9]; 4],
+    pub uv_mode: [[u8; 9]; 10],
+    pub partition: [[u8; 3]; 16],
     /// Indexed by transform size.
-    pub(super) coef: [CoefProbs; 4],
-    pub(super) switchable_interp: [[u8; 2]; 4],
-    pub(super) inter_mode: [[u8; 3]; 7],
-    pub(super) intra_inter: [u8; 4],
-    pub(super) comp_inter: [u8; 5],
-    pub(super) single_ref: [[u8; 2]; 5],
-    pub(super) comp_ref: [u8; 5],
-    pub(super) tx8: [[u8; 1]; 2],
-    pub(super) tx16: [[u8; 2]; 2],
-    pub(super) tx32: [[u8; 3]; 2],
-    pub(super) skip: [u8; 3],
-    pub(super) mv_joints: [u8; 3],
-    pub(super) mv: [MvComponentProbs; 2],
+    pub coef: [CoefProbs; 4],
+    pub switchable_interp: [[u8; 2]; 4],
+    pub inter_mode: [[u8; 3]; 7],
+    pub intra_inter: [u8; 4],
+    pub comp_inter: [u8; 5],
+    pub single_ref: [[u8; 2]; 5],
+    pub comp_ref: [u8; 5],
+    pub tx8: [[u8; 1]; 2],
+    pub tx16: [[u8; 2]; 2],
+    pub tx32: [[u8; 3]; 2],
+    pub skip: [u8; 3],
+    pub mv_joints: [u8; 3],
+    pub mv: [MvComponentProbs; 2],
 }
 
 impl Default for FrameContext {
@@ -130,38 +130,38 @@ impl Default for FrameContext {
 
 /// The counts of one motion vector component (`nmv_component_counts`).
 #[derive(Clone, Copy, Debug, Default)]
-pub(super) struct MvComponentCounts {
-    pub(super) sign: [u32; 2],
-    pub(super) classes: [u32; 11],
-    pub(super) class0: [u32; 2],
-    pub(super) bits: [[u32; 2]; 10],
-    pub(super) class0_fp: [[u32; 4]; 2],
-    pub(super) fp: [u32; 4],
-    pub(super) class0_hp: [u32; 2],
-    pub(super) hp: [u32; 2],
+pub struct MvComponentCounts {
+    pub sign: [u32; 2],
+    pub classes: [u32; 11],
+    pub class0: [u32; 2],
+    pub bits: [[u32; 2]; 10],
+    pub class0_fp: [[u32; 4]; 2],
+    pub fp: [u32; 4],
+    pub class0_hp: [u32; 2],
+    pub hp: [u32; 2],
 }
 
 /// The symbol counts of one frame (`FRAME_COUNTS`).
 #[derive(Clone, Debug, Default)]
-pub(super) struct FrameCounts {
-    pub(super) y_mode: [[u32; 10]; 4],
-    pub(super) uv_mode: [[u32; 10]; 10],
-    pub(super) partition: [[u32; 4]; 16],
+pub struct FrameCounts {
+    pub y_mode: [[u32; 10]; 4],
+    pub uv_mode: [[u32; 10]; 10],
+    pub partition: [[u32; 4]; 16],
     /// Indexed by transform size.
-    pub(super) coef: [CoefCounts; 4],
-    pub(super) eob_branch: [[[[[u32; 6]; 6]; 2]; 2]; 4],
-    pub(super) switchable_interp: [[u32; 3]; 4],
-    pub(super) inter_mode: [[u32; 4]; 7],
-    pub(super) intra_inter: [[u32; 2]; 4],
-    pub(super) comp_inter: [[u32; 2]; 5],
-    pub(super) single_ref: [[[u32; 2]; 2]; 5],
-    pub(super) comp_ref: [[u32; 2]; 5],
-    pub(super) tx8: [[u32; 2]; 2],
-    pub(super) tx16: [[u32; 3]; 2],
-    pub(super) tx32: [[u32; 4]; 2],
-    pub(super) skip: [[u32; 2]; 3],
-    pub(super) mv_joints: [u32; 4],
-    pub(super) mv: [MvComponentCounts; 2],
+    pub coef: [CoefCounts; 4],
+    pub eob_branch: [[[[[u32; 6]; 6]; 2]; 2]; 4],
+    pub switchable_interp: [[u32; 3]; 4],
+    pub inter_mode: [[u32; 4]; 7],
+    pub intra_inter: [[u32; 2]; 4],
+    pub comp_inter: [[u32; 2]; 5],
+    pub single_ref: [[[u32; 2]; 2]; 5],
+    pub comp_ref: [[u32; 2]; 5],
+    pub tx8: [[u32; 2]; 2],
+    pub tx16: [[u32; 3]; 2],
+    pub tx32: [[u32; 4]; 2],
+    pub skip: [[u32; 2]; 3],
+    pub mv_joints: [u32; 4],
+    pub mv: [MvComponentCounts; 2],
 }
 
 /// `get_prob`.
@@ -231,7 +231,7 @@ fn tree_merge(tree: &[i8], pre: &[u8], counts: &[u32], probs: &mut [u8]) {
 }
 
 /// `vp9_adapt_coef_probs`.
-pub(super) fn adapt_coef_probs(
+pub fn adapt_coef_probs(
     fc: &mut FrameContext,
     pre: &FrameContext,
     counts: &FrameCounts,
@@ -272,7 +272,7 @@ pub(super) fn adapt_coef_probs(
 }
 
 /// `vp9_adapt_mode_probs`.
-pub(super) fn adapt_mode_probs(
+pub fn adapt_mode_probs(
     fc: &mut FrameContext,
     pre: &FrameContext,
     counts: &FrameCounts,
@@ -359,7 +359,7 @@ pub(super) fn adapt_mode_probs(
 }
 
 /// `vp9_adapt_mv_probs`.
-pub(super) fn adapt_mv_probs(
+pub fn adapt_mv_probs(
     fc: &mut FrameContext,
     pre: &FrameContext,
     counts: &FrameCounts,

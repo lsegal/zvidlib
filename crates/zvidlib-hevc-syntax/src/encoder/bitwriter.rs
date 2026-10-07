@@ -117,9 +117,9 @@ impl BitWriter {
     /// outside the range the spec allows and which no conforming
     /// decoder — this crate's reader included — accepts.
     ///
-    /// [`BitReader::ue`]: crate::hevc::engine::bitreader::BitReader::ue
+    /// [`BitReader::ue`]: crate::bitreader::BitReader::ue
     /// [`BitReaderError::ExpGolombOverflow`]:
-    ///     crate::hevc::engine::bitreader::BitReaderError::ExpGolombOverflow
+    ///     crate::bitreader::BitReaderError::ExpGolombOverflow
     pub const MAX_UE: u32 = u32::MAX - 1;
 
     /// Most negative value `se(v)` can carry. Table 9-3 maps it to
@@ -212,7 +212,7 @@ impl BitWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hevc::engine::bitreader::{BitReader, BitReaderError};
+    use crate::bitreader::{BitReader, BitReaderError};
 
     #[test]
     fn bits_pack_msb_first() {

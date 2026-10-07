@@ -18,11 +18,11 @@ use super::planar::{
     PlanarConverter, nv12_to_planar, vp8_frame_is_shown, vp8_sample, vp9_dimensions, vp9_frame,
 };
 use super::readback;
-use crate::vp9_dec::{ChunkInspector, FrameShape, chunk_frames};
 use crate::{
     CancellationToken, DecodedVideoFrame, EncodedVideoSample, Error, ErrorKind, FrameIndex, Limits,
     PixelFormat, Plane, Result, VideoDecoder, VideoDecoderConfig, VideoDimensions, VideoFrame,
 };
+use zvidlib_vp9_syntax::{ChunkInspector, FrameShape, chunk_frames};
 
 const CUDA_SUCCESS: i32 = 0;
 const CUDA_VIDEO_CODEC_HEVC: u32 = 8;
@@ -65,17 +65,17 @@ type CuvidParseVideoData =
     unsafe extern "system" fn(*mut c_void, *mut CuvidSourceDataPacket) -> i32;
 type CuvidDestroyVideoParser = unsafe extern "system" fn(*mut c_void) -> i32;
 
-pub(super) fn is_available(dimensions: VideoDimensions) -> bool {
+pub fn is_available(dimensions: VideoDimensions) -> bool {
     probe(CUDA_VIDEO_CODEC_HEVC, dimensions)
 }
 
 /// Whether NVDEC can decode VP8 at `dimensions` on this host.
-pub(crate) fn is_vp8_available(dimensions: VideoDimensions) -> bool {
+pub fn is_vp8_available(dimensions: VideoDimensions) -> bool {
     probe(CUDA_VIDEO_CODEC_VP8, dimensions)
 }
 
 /// Whether NVDEC can decode VP9 profile 0 at `dimensions` on this host.
-pub(crate) fn is_vp9_available(dimensions: VideoDimensions) -> bool {
+pub fn is_vp9_available(dimensions: VideoDimensions) -> bool {
     probe(CUDA_VIDEO_CODEC_VP9, dimensions)
 }
 
@@ -95,7 +95,7 @@ fn probe(codec_type: u32, dimensions: VideoDimensions) -> bool {
     matches!(ready_rx.recv(), Ok(Ok(())))
 }
 
-pub(super) fn create(
+pub fn create(
     configuration: &VideoDecoderConfig,
     limits: &Limits,
     record: &HvccRecord,
@@ -113,7 +113,7 @@ pub(super) fn create(
 
 /// Creates an NVDEC VP8 decoder whose pictures are converted by `convert`, so the hardware
 /// decoder's output goes through exactly the conversion the software decoder's does.
-pub(crate) fn create_vp8(
+pub fn create_vp8(
     configuration: &VideoDecoderConfig,
     limits: &Limits,
     convert: PlanarConverter,
@@ -124,7 +124,7 @@ pub(crate) fn create_vp8(
 
 /// Creates an NVDEC VP9 profile 0 decoder. Its pictures are converted by the software decoder's
 /// own conversion, with the colour each frame's header names, so both return the same frames.
-pub(crate) fn create_vp9(
+pub fn create_vp9(
     configuration: &VideoDecoderConfig,
     limits: &Limits,
 ) -> Result<Box<dyn VideoDecoder>> {

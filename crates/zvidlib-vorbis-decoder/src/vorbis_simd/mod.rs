@@ -56,7 +56,8 @@ use kernels::Scratch;
 /// The instruction set the Vorbis kernels will use: the crate-wide
 /// [`crate::simd::active`] value, so an override reaches them immediately.
 #[must_use]
-pub(crate) fn active_isa() -> SimdIsa {
+#[doc(hidden)]
+pub fn active_isa() -> SimdIsa {
     crate::simd::active()
 }
 

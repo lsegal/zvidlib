@@ -17,12 +17,6 @@
 mod av1_dec;
 
 use crate::av1_dec::{DecodedPicture, Decoder};
-#[allow(unused_imports)]
-use zvidlib_color::*;
-#[allow(unused_imports)]
-use zvidlib_core::*;
-#[allow(unused_imports)]
-use zvidlib_av1_syntax::*;
 use crate::{
     Av1CodecConfigurationRecord, Av1SyntaxSupport, CancellationToken, Codec, CodecImplementation,
     CodecProfile, CodecSupport, ColorRange, DecodedVideoFrame, EncodedVideoSample, Error,
@@ -30,6 +24,12 @@ use crate::{
     PixelFormat, Result, VideoDecoder, VideoDecoderConfig, VideoDecoderFactory, VideoFrame,
     convert_to_rgba8,
 };
+#[allow(unused_imports)]
+use zvidlib_av1_syntax::*;
+#[allow(unused_imports)]
+use zvidlib_color::*;
+#[allow(unused_imports)]
+use zvidlib_core::*;
 
 /// Returns the dependency-free native AV1 Main-profile (8-bit 4:2:0 and
 /// monochrome) software decoder backend.

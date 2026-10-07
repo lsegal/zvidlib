@@ -27,12 +27,12 @@
 //! sequence whose 9-bit preload the §9.3.2.6 decoder init consumes.
 //!
 //! Correctness contract: any bin sequence encoded through this engine
-//! and decoded through [`crate::hevc::engine::cabac::CabacEngine`] (with identically
+//! and decoded through [`crate::cabac::CabacEngine`] (with identically
 //! initialized context models) reproduces the original bins — pinned
 //! by the roundtrip tests below.
 
-use crate::hevc::engine::cabac::{ContextModel, RANGE_TAB_LPS, TRANS_IDX_LPS, TRANS_IDX_MPS};
-use crate::hevc::engine::encoder::bitwriter::BitWriter;
+use crate::cabac::{ContextModel, RANGE_TAB_LPS, TRANS_IDX_LPS, TRANS_IDX_MPS};
+use crate::encoder::bitwriter::BitWriter;
 
 /// §9.3.5 arithmetic encoding engine over a borrowed [`BitWriter`].
 #[derive(Debug)]
@@ -144,7 +144,7 @@ impl CabacEncoder {
     }
 
     /// MSB-first multi-bit bypass helper (the dual of
-    /// [`crate::hevc::engine::cabac::CabacEngine::decode_bypass_bits`]).
+    /// [`crate::cabac::CabacEngine::decode_bypass_bits`]).
     pub fn encode_bypass_bits(&mut self, w: &mut BitWriter, value: u32, n: u8) {
         for i in (0..n).rev() {
             self.encode_bypass(w, ((value >> i) & 1) as u8);
@@ -182,8 +182,8 @@ impl CabacEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hevc::engine::bitreader::BitReader;
-    use crate::hevc::engine::cabac::CabacEngine;
+    use crate::bitreader::BitReader;
+    use crate::cabac::CabacEngine;
 
     /// Encode `bins` as context-coded decisions with a single shared
     /// context (encoder and decoder start from the same init), append a

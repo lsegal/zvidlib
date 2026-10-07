@@ -237,7 +237,7 @@
 //!
 //! See [`nal`] for the byte-stream walker entry points, [`vps`] for
 //! the parsed VPS structure, [`sps`] for the parsed SPS, [`pps`]
-//! for the parsed PPS, and [`crate::hevc::engine::slice`] for the parsed slice
+//! for the parsed PPS, and [`crate::engine::slice`] for the parsed slice
 //! header.
 
 #![warn(missing_debug_implementations)]
@@ -248,20 +248,20 @@
 pub mod availability;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
-pub mod binarization;
+pub use zvidlib_hevc_syntax::binarization;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
-pub mod bitreader;
+pub use zvidlib_hevc_syntax::bitreader;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
-pub mod cabac;
+pub use zvidlib_hevc_syntax::cabac;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod ctx_init;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod deblock;
-pub mod encoder;
+pub use zvidlib_hevc_syntax::encoder;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod decode;
@@ -270,8 +270,8 @@ pub mod decode;
 pub mod dpb;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
-pub mod hrd;
-pub mod hvcc;
+pub use zvidlib_hevc_syntax::hrd;
+pub use zvidlib_hevc_syntax::hvcc;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod inter_pred;
@@ -287,7 +287,7 @@ pub mod intra_pred;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod motion;
-pub mod nal;
+pub use zvidlib_hevc_syntax::nal;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod palette;
@@ -297,7 +297,7 @@ pub mod picture;
 pub mod poc;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
-pub mod pps;
+pub use zvidlib_hevc_syntax::pps;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod profile;
@@ -315,26 +315,26 @@ pub mod residual;
 pub mod sao;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
-pub mod scaling_list;
+pub use zvidlib_hevc_syntax::scaling_list;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
-pub mod scan;
+pub use zvidlib_hevc_syntax::scan;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod simd;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
-pub mod sei;
+pub use zvidlib_hevc_syntax::sei;
 pub mod sequence;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
-pub mod slice;
+pub use zvidlib_hevc_syntax::slice;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod slice_data;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
-pub mod sps;
+pub use zvidlib_hevc_syntax::sps;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod transform;
@@ -349,10 +349,10 @@ pub mod transform_tree;
 pub mod transform_unit;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
-pub mod vps;
+pub use zvidlib_hevc_syntax::vps;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
-pub mod vui;
+pub use zvidlib_hevc_syntax::vui;
 
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]

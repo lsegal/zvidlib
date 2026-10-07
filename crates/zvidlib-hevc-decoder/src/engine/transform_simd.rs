@@ -211,7 +211,7 @@ pub fn supported_backends() -> Vec<Backend> {
 /// `out[ i ] = Σ_j basis[ j * row_step ][ i ] * input[ j ]`.
 ///
 /// `basis` is a row-major `transMatrix` table of `basis_stride`-wide
-/// rows ([`crate::hevc::engine::transform`] passes the flattened `DCT32`
+/// rows ([`crate::engine::transform`] passes the flattened `DCT32`
 /// or `DST4`), and `row_step` is equation 8-317's `1 << ( 5 − log2( nTbS
 /// ) )` basis-row stride (always 1 for the DST). The sum is evaluated as
 /// one broadcast-multiply-add per non-zero `input[ j ]` across a tile of
@@ -221,7 +221,7 @@ pub fn supported_backends() -> Vec<Backend> {
 /// one multiply-add instead of a read-modify-write of `out`.
 ///
 /// Callers must guarantee that no partial sum leaves the `i32` range;
-/// see [`crate::hevc::engine::transform::inverse_transform`], which
+/// see [`crate::engine::transform::inverse_transform`], which
 /// checks the worst-case bound for `nTbS` and the block's
 /// `coeffMin`/`coeffMax` before choosing this path.
 ///
@@ -855,8 +855,8 @@ mod aarch64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hevc::engine::scaling_list::ScalingFactorMatrix;
-    use crate::hevc::engine::transform::{
+    use crate::engine::scaling_list::ScalingFactorMatrix;
+    use crate::engine::transform::{
         Component, PredMode, coeff_range, inverse_transform_reference,
         inverse_transform_with_backend, scale_coefficients,
     };

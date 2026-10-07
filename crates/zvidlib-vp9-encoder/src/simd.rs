@@ -37,7 +37,8 @@ use std::sync::atomic::{AtomicU8, Ordering};
 
 /// The instruction set the kernels in this module are running on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Isa {
+#[doc(hidden)]
+pub enum Isa {
     /// Portable fallback used on targets without a vectorized implementation.
     Scalar,
     /// x86_64 SSE4.1 (128-bit).
@@ -86,8 +87,8 @@ fn detect_isa() -> u8 {
 /// Maps the crate-wide SIMD override, if any, onto this module's ISA codes.
 #[inline]
 fn overridden_isa_code() -> Option<u8> {
-    use crate::simd::SimdIsa;
-    Some(match crate::simd::override_isa()? {
+    use zvidlib_core::simd::SimdIsa;
+    Some(match zvidlib_core::simd::override_isa()? {
         SimdIsa::Scalar => ISA_SCALAR,
         #[cfg(target_arch = "x86_64")]
         SimdIsa::Sse41 => ISA_SSE41,
@@ -100,7 +101,7 @@ fn overridden_isa_code() -> Option<u8> {
     })
 }
 
-/// The cached ISA code, with any [`crate::simd::set_override`] override taking
+/// The cached ISA code, with any [`zvidlib_core::simd::set_override`] override taking
 /// precedence so it applies even after detection has resolved.
 fn isa_code() -> u8 {
     if let Some(code) = overridden_isa_code() {
@@ -116,7 +117,8 @@ fn isa_code() -> u8 {
 }
 
 /// Returns the instruction set the VP9 encoder kernels will use on this machine.
-pub(crate) fn isa() -> Isa {
+#[doc(hidden)]
+pub fn isa() -> Isa {
     match isa_code() {
         #[cfg(target_arch = "x86_64")]
         ISA_AVX2 => Isa::Avx2,
@@ -2423,7 +2425,7 @@ mod neon {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::simd::{self, SimdIsa};
+    use zvidlib_core::simd::{self, SimdIsa};
 
     /// A small deterministic generator, so failures reproduce.
     struct Lcg(u64);
@@ -2807,8 +2809,8 @@ mod tmp_timing {
     fn tmp_sad_timing() {
         let a: Vec<u8> = (0..640 * 360).map(|i| (i * 7 % 251) as u8).collect();
         let b: Vec<u8> = (0..640 * 360).map(|i| (i * 13 % 241) as u8).collect();
-        for isa in crate::simd::available() {
-            crate::simd::set_override(Some(isa));
+        for isa in zvidlib_core::simd::available() {
+            zvidlib_core::simd::set_override(Some(isa));
             for size in [8, 16, 32, 64] {
                 let start = std::time::Instant::now();
                 let mut total = 0u64;
@@ -2830,6 +2832,6 @@ mod tmp_timing {
                 );
             }
         }
-        crate::simd::set_override(None);
+        zvidlib_core::simd::set_override(None);
     }
 }

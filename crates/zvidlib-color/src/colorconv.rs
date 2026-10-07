@@ -389,12 +389,7 @@ mod x86 {
     /// SSE4.1 chroma: four chroma samples (eight source pixels) per iteration, with a scalar
     /// tail.
     #[target_feature(enable = "ssse3", enable = "sse4.1")]
-    pub unsafe fn chroma_row_pair_sse41(
-        top: &[u8],
-        bottom: &[u8],
-        cb: &mut [u8],
-        cr: &mut [u8],
-    ) {
+    pub unsafe fn chroma_row_pair_sse41(top: &[u8], bottom: &[u8], cb: &mut [u8], cr: &mut [u8]) {
         unsafe {
             let n = cb.len();
             let (tp, bp) = (top.as_ptr(), bottom.as_ptr());
@@ -420,12 +415,7 @@ mod x86 {
     /// AVX2 chroma: eight chroma samples (sixteen source pixels) per iteration, with the
     /// 128-bit path finishing a four-sample remainder and the scalar reference the rest.
     #[target_feature(enable = "avx2")]
-    pub unsafe fn chroma_row_pair_avx2(
-        top: &[u8],
-        bottom: &[u8],
-        cb: &mut [u8],
-        cr: &mut [u8],
-    ) {
+    pub unsafe fn chroma_row_pair_avx2(top: &[u8], bottom: &[u8], cb: &mut [u8], cr: &mut [u8]) {
         unsafe {
             let n = cb.len();
             let (tp, bp) = (top.as_ptr(), bottom.as_ptr());

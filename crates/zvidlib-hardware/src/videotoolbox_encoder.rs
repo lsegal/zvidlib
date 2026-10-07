@@ -237,13 +237,14 @@ unsafe extern "C" {
 
 /// What the HEVC or VP9 factory resolved from a configuration for the hardware path.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct Settings {
+#[doc(hidden)]
+pub struct Settings {
     /// The target bitrate, or for a stream rate controlled by quality a nominal one.
-    pub(crate) bits_per_second: u32,
+    pub bits_per_second: u32,
     /// `kVTCompressionPropertyKey_Quality` in `0.0..=1.0`, for a stream rate controlled by
     /// quality rather than to [`Self::bits_per_second`].
-    pub(crate) quality: Option<f64>,
-    pub(crate) keyframe_interval: u32,
+    pub quality: Option<f64>,
+    pub keyframe_interval: u32,
 }
 
 /// The `CMVideoCodecType` VideoToolbox encodes `codec` as.
@@ -266,7 +267,8 @@ fn codec_name(codec: Codec) -> &'static str {
 ///
 /// Asks for the encoder's supported properties under the same "hardware required" specification
 /// the session is created with, which answers without creating a session.
-pub(crate) fn is_available(codec: Codec, dimensions: VideoDimensions) -> bool {
+#[doc(hidden)]
+pub fn is_available(codec: Codec, dimensions: VideoDimensions) -> bool {
     let Some(codec) = codec_type(codec) else {
         return false;
     };
@@ -295,7 +297,8 @@ pub(crate) fn is_available(codec: Codec, dimensions: VideoDimensions) -> bool {
     }
 }
 
-pub(crate) fn create(
+#[doc(hidden)]
+pub fn create(
     configuration: &VideoEncoderConfig,
     limits: &Limits,
     settings: Settings,
@@ -593,7 +596,7 @@ impl VideoToolboxEncoder {
 
     /// Declares the `vpcC` the priming key frame signals.
     fn prime_vp9(&mut self) -> Result<()> {
-        let level = crate::vp9_encoder::pick_level(
+        let level = zvidlib_vp9_syntax::pick_level(
             self.configuration.coded_dimensions,
             self.configuration.timescale,
             self.configuration.frame_duration,
@@ -604,7 +607,7 @@ impl VideoToolboxEncoder {
             match output {
                 Output::Picture(picture) if vpcc.is_none() => {
                     vpcc = Some(
-                        crate::vp9_encoder::key_frame_vpcc(&picture.data, level).ok_or_else(
+                        zvidlib_vp9_syntax::key_frame_vpcc(&picture.data, level).ok_or_else(
                             || codec("VideoToolbox primed with no VP9 profile 0 key frame"),
                         )?,
                     );
@@ -776,7 +779,7 @@ impl VideoToolboxEncoder {
                 }
                 Declared::Vp9 { vpcc, level } => {
                     // Only a key frame makes a VP9 sample a sync sample.
-                    let key = crate::vp9_encoder::key_frame_vpcc(&picture.data, *level);
+                    let key = zvidlib_vp9_syntax::key_frame_vpcc(&picture.data, *level);
                     if key.as_ref().is_some_and(|key| key != vpcc) {
                         return Err(codec(
                             "VideoToolbox changed its VP9 colour signalling after the stream was declared",

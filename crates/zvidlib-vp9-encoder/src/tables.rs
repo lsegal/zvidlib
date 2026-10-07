@@ -3,7 +3,7 @@
 //! Generated from libvpx (`vp9/common/vp9_entropy.c`, `vp9_entropymode.c`,
 //! `vp9_quant_common.c` and `vp9_filter.c`); see `THIRD_PARTY_NOTICES.md`. The
 //! coefficient probabilities and scans of every transform size are the native
-//! decoder's (`crate::vp9_dec::tables`). Multi-dimensional C arrays are
+//! decoder's (`zvidlib_vp9_decoder::vp9_dec::tables`). Multi-dimensional C arrays are
 //! flattened in row-major order, and each table documents its shape.
 
 /// Pareto tail probabilities for the token tree beyond `ONE`: `[pivot probability - 1 (255)][node 8]`.

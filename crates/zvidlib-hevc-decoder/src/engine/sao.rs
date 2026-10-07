@@ -35,9 +35,9 @@
 //! single-tile picture; multi-slice / multi-tile boundary masking is a
 //! follow-up that threads the per-sample slice / tile id.
 
-use crate::hevc::engine::picture::{Picture, Plane, sub_wh_c};
-use crate::hevc::engine::profile::{Stage as ProfStage, scope as prof_scope};
-use crate::hevc::engine::slice_data::{SaoComponent, SaoCtbParams};
+use crate::engine::picture::{Picture, Plane, sub_wh_c};
+use crate::engine::profile::{Stage as ProfStage, scope as prof_scope};
+use crate::engine::slice_data::{SaoComponent, SaoCtbParams};
 
 /// `Sign( x )` (§5, equation 5-18).
 #[inline]
@@ -54,7 +54,8 @@ fn sign(x: i32) -> i32 {
 /// `pub(crate)` so the encoder's SAO estimation classifies with the
 /// same table.
 #[inline]
-pub(crate) fn eo_pos(eo_class: u8) -> (i32, i32, i32, i32) {
+#[doc(hidden)]
+pub fn eo_pos(eo_class: u8) -> (i32, i32, i32, i32) {
     match eo_class {
         // horizontal: left + right.
         0 => (-1, 0, 1, 0),
@@ -360,14 +361,14 @@ pub fn apply_sao_ctb_full(
     n_w: usize,
     n_h: usize,
     boundaries: Option<&SaoBoundaries>,
-    no_filter: Option<&crate::hevc::engine::deblock::NoFilterMap<'_>>,
+    no_filter: Option<&crate::engine::deblock::NoFilterMap<'_>>,
 ) {
     if comp.sao_type_idx == 0 {
         return;
     }
     let (nf_sw, nf_sh) = match plane {
         Plane::Luma => (1, 1),
-        _ => crate::hevc::engine::picture::sub_wh_c(rec.chroma_array_type()),
+        _ => crate::engine::picture::sub_wh_c(rec.chroma_array_type()),
     };
     let suppressed =
         |x: usize, y: usize| -> bool { no_filter.is_some_and(|m| m.at_luma(x * nf_sw, y * nf_sh)) };
@@ -485,7 +486,7 @@ pub fn apply_sao_ctb_full(
                 if let Some(b) = boundaries {
                     let (sw, sh) = match plane {
                         Plane::Luma => (1, 1),
-                        _ => crate::hevc::engine::picture::sub_wh_c(rec.chroma_array_type()),
+                        _ => crate::engine::picture::sub_wh_c(rec.chroma_array_type()),
                     };
                     let (lx, ly) = (xsi as usize * sw, ysj as usize * sh);
                     if !b.neighbour_allowed(lx, ly, n0x as usize * sw, n0y as usize * sh)
@@ -609,7 +610,7 @@ pub fn apply_sao_picture_full(
     slice_sao_luma_flag: bool,
     slice_sao_chroma_flag: bool,
     boundaries: Option<&SaoBoundaries>,
-    no_filter: Option<&crate::hevc::engine::deblock::NoFilterMap<'_>>,
+    no_filter: Option<&crate::engine::deblock::NoFilterMap<'_>>,
 ) -> Picture {
     let ctb_size_y = 1usize << ctb_log2_size_y;
     let pic_width_in_ctbs = pic.width_luma().div_ceil(ctb_size_y);
@@ -702,7 +703,7 @@ pub fn apply_sao_picture_full(
 #[cfg(any())]
 mod tests {
     use super::*;
-    use crate::hevc::engine::slice_data::{SaoComponent, SaoCtbParams};
+    use crate::engine::slice_data::{SaoComponent, SaoCtbParams};
 
     fn band_component(band_position: u8, abs: [u32; 4], sign: [u8; 4]) -> SaoComponent {
         SaoComponent {

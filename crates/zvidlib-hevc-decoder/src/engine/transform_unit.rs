@@ -2,10 +2,10 @@
 //! trafoDepth, blkIdx )` syntax driver.
 //!
 //! This module composes the per-element primitives already exposed by
-//! [`crate::hevc::engine::binarization`] (`tu_residual_act_flag`, `delta_qp()` /
+//! [`crate::engine::binarization`] (`tu_residual_act_flag`, `delta_qp()` /
 //! `cu_qp_delta`, `chroma_qp_offset()` / `cu_chroma_qp_offset`, and the
 //! §7.3.8.12 `cross_comp_pred()` element) together with the
-//! [`crate::hevc::engine::residual`] §7.3.8.11 `residual_coding()` driver into the
+//! [`crate::engine::residual`] §7.3.8.11 `residual_coding()` driver into the
 //! full §7.3.8.10 transform-unit walk.
 //!
 //! The driver is the leaf of the §7.3.8 quadtree that the
@@ -22,19 +22,19 @@
 //! `log2TrafoSize`) at the last luma leaf.
 //!
 //! The driver does **not** own the §8.6 dequantization / inverse
-//! transform that turns the returned [`crate::hevc::engine::residual::ResidualBlock`]
-//! arrays into sample residuals (that is [`crate::hevc::engine::transform`]), nor the
+//! transform that turns the returned [`crate::engine::residual::ResidualBlock`]
+//! arrays into sample residuals (that is [`crate::engine::transform`]), nor the
 //! §7.3.8.8 `transform_tree()` recursion that derives the cbf flags and
 //! invokes it; both remain the caller's responsibility.
 
-use crate::hevc::engine::binarization::{
+use crate::engine::binarization::{
     CrossCompPred, CuChromaQpOffset, CuQpDelta, decode_cross_comp_pred, decode_cu_chroma_qp_offset,
     decode_cu_qp_delta, decode_tu_residual_act_flag, log2_res_scale_abs_plus1_ctx_inc,
     res_scale_sign_flag_ctx_inc, tu_residual_act_flag_inferred,
 };
-use crate::hevc::engine::cabac::CabacEngine;
-use crate::hevc::engine::ctx_init::SliceContexts;
-use crate::hevc::engine::residual::{
+use crate::engine::cabac::CabacEngine;
+use crate::engine::ctx_init::SliceContexts;
+use crate::engine::residual::{
     ResidualBlock, ResidualCodingError, ResidualCodingParams, decode_residual_coding,
     residual_coding_scan_idx,
 };
@@ -531,7 +531,7 @@ fn decode_one_residual(
 #[cfg(any())]
 mod tests {
     use super::*;
-    use crate::hevc::engine::bitreader::BitReader;
+    use crate::engine::bitreader::BitReader;
 
     fn base_params() -> TransformUnitParams {
         TransformUnitParams {

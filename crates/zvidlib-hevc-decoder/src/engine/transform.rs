@@ -2,7 +2,7 @@
 //! array construction prior to the deblocking filter process.
 //!
 //! This module turns the parsed `TransCoeffLevel[ xC ][ yC ]` array of
-//! one transform block (produced by the [`crate::hevc::engine::residual`] §7.3.8.11
+//! one transform block (produced by the [`crate::engine::residual`] §7.3.8.11
 //! driver) into the `(nTbS)x(nTbS)` array `r` of residual samples that
 //! the picture-construction step (§8.6.7) adds to the prediction.
 //!
@@ -50,9 +50,9 @@
 //! construction are the consumers' / follow-ups' responsibility — this
 //! module stops at the `(nTbS)x(nTbS)` array `r`.
 
-use crate::hevc::engine::profile::{Stage as ProfStage, scope as prof_scope};
-use crate::hevc::engine::scaling_list::ScalingFactorMatrix;
-use crate::hevc::engine::transform_simd::{self, Backend};
+use crate::engine::profile::{Stage as ProfStage, scope as prof_scope};
+use crate::engine::scaling_list::ScalingFactorMatrix;
+use crate::engine::transform_simd::{self, Backend};
 
 /// §8.6.3 `levelScale[ k ]` rational quantization-step list, indexed by
 /// `qP % 6` (the list is `{ 40, 45, 51, 57, 64, 72 }`).
@@ -136,7 +136,8 @@ impl std::error::Error for TransformError {}
 /// `log2( nTbS )` for a legal transform-block side, or `None` if `n_tbs`
 /// is not 4 / 8 / 16 / 32.
 #[inline]
-pub(crate) fn log2_tbs(n_tbs: usize) -> Option<u32> {
+#[doc(hidden)]
+pub fn log2_tbs(n_tbs: usize) -> Option<u32> {
     match n_tbs {
         4 => Some(2),
         8 => Some(3),
@@ -176,7 +177,7 @@ fn clip3(lo: i64, hi: i64, x: i64) -> i64 {
 ///
 /// Inputs:
 /// * `levels` — the `TransCoeffLevel[ x ][ y ]` array, row-major by
-///   `y` (`levels[ y * nTbS + x ]`), as [`crate::hevc::engine::residual::ResidualBlock`]
+///   `y` (`levels[ y * nTbS + x ]`), as [`crate::engine::residual::ResidualBlock`]
 ///   stores it.
 /// * `n_tbs` — the block side `nTbS` (4 / 8 / 16 / 32).
 /// * `q_p` — the quantization parameter `qP` derived by §8.6.2.
@@ -271,7 +272,8 @@ pub fn scale_coefficients(
 /// §8.6.4.2 equation 8-316 — the `trType == 1` 4x4 alternate (DST-VII)
 /// transform matrix, `transMatrix[ i ][ j ]`, row-major.
 #[rustfmt::skip]
-pub(crate) const DST4: [[i32; 4]; 4] = [
+#[doc(hidden)]
+pub const DST4: [[i32; 4]; 4] = [
     [29,  55,  74,  84],
     [74,  74,   0, -74],
     [84, -29, -74,  55],
@@ -283,7 +285,8 @@ pub(crate) const DST4: [[i32; 4]; 4] = [
 /// row-major. The smaller 4 / 8 / 16 transforms subsample column `n`
 /// at stride `1 << ( 5 − log2( nTbS ) )` per equation 8-317.
 #[rustfmt::skip]
-pub(crate) const DCT32: [[i32; 32]; 32] = [
+#[doc(hidden)]
+pub const DCT32: [[i32; 32]; 32] = [
     [64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64],
     [90, 90, 88, 85, 82, 78, 73, 67, 61, 54, 46, 38, 31, 22, 13, 4, -4, -13, -22, -31, -38, -46, -54, -61, -67, -73, -78, -82, -85, -88, -90, -90],
     [90, 87, 80, 70, 57, 43, 25, 9, -9, -25, -43, -57, -70, -80, -87, -90, -90, -87, -80, -70, -57, -43, -25, -9, 9, 25, 43, 57, 70, 80, 87, 90],
@@ -740,7 +743,7 @@ pub struct BlockParams {
 /// array `r`.
 ///
 /// `levels` is the `TransCoeffLevel[ x ][ y ]` array, row-major by `y`
-/// (as [`crate::hevc::engine::residual::ResidualBlock::levels`] stores it). `scaling`
+/// (as [`crate::engine::residual::ResidualBlock::levels`] stores it). `scaling`
 /// is the per-position `ScalingFactor` matrix when
 /// `scaling_list_enabled_flag == 1` and the §8.6.3 flat-16 exception
 /// does not apply, else `None`. Returns the residual array `r`,

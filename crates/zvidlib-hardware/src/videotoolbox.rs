@@ -22,11 +22,13 @@ type OutputQueue = Arc<Mutex<Vec<Result<DecodedVideoFrame>>>>;
 /// would otherwise convert each one to RGBA.
 type OutputWanted = Arc<AtomicBool>;
 
-pub(super) fn is_available(_dimensions: VideoDimensions) -> bool {
+#[doc(hidden)]
+pub fn is_available(_dimensions: VideoDimensions) -> bool {
     DecompressionSession::is_hardware_decode_supported(VtCodec::HEVC)
 }
 
-pub(super) fn create(
+#[doc(hidden)]
+pub fn create(
     configuration: &VideoDecoderConfig,
     limits: &Limits,
     record: &HvccRecord,

@@ -16,7 +16,8 @@
 #![cfg(not(target_arch = "wasm32"))]
 
 #[cfg(target_os = "macos")]
-pub(crate) mod audiotoolbox;
+#[doc(hidden)]
+pub mod audiotoolbox;
 #[cfg(windows)]
 pub(crate) mod windows_mf;
 

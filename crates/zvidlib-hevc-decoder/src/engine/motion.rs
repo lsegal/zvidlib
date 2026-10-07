@@ -4,7 +4,7 @@
 //! This module turns the §7.3.8.6 `prediction_unit()` syntax (the
 //! signalled `mvd`, `mvp_lX_flag`, `ref_idx`, `inter_pred_idc` /
 //! `merge_idx`) into the resolved per-PU motion data the §8.5.3.3.1
-//! block-walk driver ([`crate::hevc::engine::inter_pred::predict_inter_pu`]) consumes,
+//! block-walk driver ([`crate::engine::inter_pred::predict_inter_pu`]) consumes,
 //! and stores it in a per-4×4-block [`MotionField`] that the §8.7.2.4
 //! boundary-filtering-strength derivation reads.
 //!

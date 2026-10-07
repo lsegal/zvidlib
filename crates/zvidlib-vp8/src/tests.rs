@@ -125,13 +125,13 @@ fn decodes_every_test_vector_exactly_as_libvpx_does() {
 /// only whichever one detection picks (issue #568).
 #[test]
 fn every_instruction_set_decodes_every_test_vector_exactly_as_libvpx_does() {
-    let _guard = crate::simd::test_lock();
-    for isa in crate::simd::available() {
-        crate::simd::set_override(Some(isa));
+    let _guard = zvidlib_core::simd::test_lock();
+    for isa in zvidlib_core::simd::available() {
+        zvidlib_core::simd::set_override(Some(isa));
         assert_eq!(super::simd::decode_isa(), isa);
         check_every_test_vector(isa.name());
     }
-    crate::simd::set_override(None);
+    zvidlib_core::simd::set_override(None);
 }
 
 fn check_every_test_vector(arm: &str) {
@@ -294,7 +294,7 @@ fn media_foundation_vp8_matches_the_software_decoder_and_seeks_exactly() {
             configuration: &VideoDecoderConfig,
             limits: &Limits,
         ) -> crate::Result<Box<dyn VideoDecoder>> {
-            crate::hevc::windows_mf::create_vp8(configuration, limits, super::planes_to_rgba)
+            zvidlib_hardware::windows_mf::create_vp8(configuration, limits, super::planes_to_rgba)
         }
     }
 

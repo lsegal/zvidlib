@@ -204,7 +204,7 @@ impl Picture {
     /// Borrow the raw row-major plane buffer + its row stride (mutable).
     ///
     /// Used by the §8.7.2 deblocking driver to wrap a component plane in a
-    /// [`crate::hevc::engine::deblock::SamplePlane`] for in-place edge filtering.
+    /// [`crate::engine::deblock::SamplePlane`] for in-place edge filtering.
     pub fn plane_mut(&mut self, plane: Plane) -> (&mut [i32], usize) {
         self.plane_slice_mut(plane)
     }

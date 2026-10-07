@@ -815,6 +815,10 @@ fn support_error(s: CodecSupport) -> Error {
             ErrorKind::Internal,
             "encoder capability changed unexpectedly",
         ),
+        _ => Error::new(
+            ErrorKind::Unsupported,
+            "native HEVC encoder does not support the requested configuration",
+        ),
     }
 }
 

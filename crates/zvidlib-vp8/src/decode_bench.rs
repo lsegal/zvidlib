@@ -6,7 +6,7 @@
 //! decoder takes - subblock intra prediction, the DC-only inverse DCT, the
 //! bilinear filters of bitstream versions 1 to 3 and the simple loop filter -
 //! plus whole-frame decoding. Each stage runs the decoder's own entry point,
-//! on whichever instruction set [`crate::simd::set_override`] selects, over a
+//! on whichever instruction set [`zvidlib_core::simd::set_override`] selects, over a
 //! frame's worth of deterministic synthetic input, and returns the bytes it
 //! produced so the benchmark can hold every instruction set to the scalar
 //! result before timing it.

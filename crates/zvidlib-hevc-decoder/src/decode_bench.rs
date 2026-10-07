@@ -1,7 +1,7 @@
 //! Prepared per-stage workloads for the HEVC decoder benchmark.
 //!
 //! `benches/codec.rs` is an external crate and the HEVC engine
-//! (`crate::hevc::engine`) is crate-private, so a benchmark cannot reach the
+//! (`crate::engine`) is crate-private, so a benchmark cannot reach the
 //! individual decode stages the way it reaches the public AV1 kernels. This
 //! module is the narrow surface that closes that gap: one prepared workload per
 //! hot stage, each with its input construction in [`HevcStageInputs::new`] and

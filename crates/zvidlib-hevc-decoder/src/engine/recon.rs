@@ -1,11 +1,11 @@
 //! §8.4 intra sample reconstruction driver.
 //!
 //! This module is the rung between the §7.3.8 slice-data syntax walk
-//! (the [`crate::hevc::engine::slice_data`] CTU/CU/transform-tree structures) and the
+//! (the [`crate::engine::slice_data`] CTU/CU/transform-tree structures) and the
 //! per-block §8.4.4 intra prediction + §8.6 dequantization / inverse
-//! transform primitives already implemented in [`crate::hevc::engine::intra_pred`] and
-//! [`crate::hevc::engine::transform`]. It walks a decoded [`crate::hevc::engine::slice_data::CodingTreeUnit`]
-//! and writes reconstructed samples into a [`crate::hevc::engine::picture::Picture`]:
+//! transform primitives already implemented in [`crate::engine::intra_pred`] and
+//! [`crate::engine::transform`]. It walks a decoded [`crate::engine::slice_data::CodingTreeUnit`]
+//! and writes reconstructed samples into a [`crate::engine::picture::Picture`]:
 //!
 //! 1. §8.4.2 — derive `IntraPredModeY` for each luma prediction block
 //!    from the signalled `prev_intra_luma_pred_flag` / `mpm_idx` /
@@ -24,26 +24,26 @@
 //! sees its left / above neighbours already reconstructed before it
 //! predicts.
 
-use crate::hevc::engine::availability::PictureTiling;
-use crate::hevc::engine::binarization::{
+use crate::engine::availability::PictureTiling;
+use crate::engine::binarization::{
     CuPredMode, LumaIntraModeSource, PartMode, derive_intra_pred_mode_c, derive_intra_pred_mode_y,
     intra_luma_cand_mode_list, luma_intra_mode_source_from_flag,
 };
-use crate::hevc::engine::intra_mode_field::{IntraModeField, Neighbour};
-use crate::hevc::engine::intra_pred::{
+use crate::engine::intra_mode_field::{IntraModeField, Neighbour};
+use crate::engine::intra_pred::{
     Component as IpComponent, INTRA_DC, IntraPredError, IntraPredParams, MarkedReferenceSamples,
     intra_predict_with_substitution,
 };
-use crate::hevc::engine::picture::{Picture, Plane, clip1, sub_wh_c};
-use crate::hevc::engine::profile::{Stage as ProfStage, scope as prof_scope};
-use crate::hevc::engine::scaling_list::ScalingFactors;
-use crate::hevc::engine::slice_data::{CodingQuadtree, CodingTreeUnit, CodingUnit, IntraLumaMode};
-use crate::hevc::engine::transform::{
+use crate::engine::picture::{Picture, Plane, clip1, sub_wh_c};
+use crate::engine::profile::{Stage as ProfStage, scope as prof_scope};
+use crate::engine::scaling_list::ScalingFactors;
+use crate::engine::slice_data::{CodingQuadtree, CodingTreeUnit, CodingUnit, IntraLumaMode};
+use crate::engine::transform::{
     BlockParams, Component as TfComponent, PredMode, TransformError, rdpcm_accumulate,
     residual_block,
 };
-use crate::hevc::engine::transform_tree::TransformTree;
-use crate::hevc::engine::transform_unit::TransformUnit;
+use crate::engine::transform_tree::TransformTree;
+use crate::engine::transform_unit::TransformUnit;
 
 /// Errors raised while reconstructing samples from a decoded CTU.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,13 +53,13 @@ pub enum ReconError {
     /// A §8.6.2 dequantization / inverse-transform primitive failed.
     Transform(TransformError),
     /// A §8.5.3.3 inter-prediction primitive failed.
-    InterPred(crate::hevc::engine::inter_pred::InterPredError),
+    InterPred(crate::engine::inter_pred::InterPredError),
     /// The decoded CTU carried an inter prediction unit, which the intra
     /// reconstruction path does not handle.
     InterNotSupported,
     /// The §6.4.1 picture-tiling geometry needed for neighbour
     /// availability could not be built.
-    Tiling(crate::hevc::engine::availability::AvailabilityError),
+    Tiling(crate::engine::availability::AvailabilityError),
 }
 
 impl core::fmt::Display for ReconError {
@@ -162,7 +162,7 @@ pub struct ReconParams {
 /// `(0, 0)` when the flag is 0) and store it in the live state.
 fn apply_cu_chroma_qp_offset(
     params: &ReconParams,
-    off: &crate::hevc::engine::binarization::CuChromaQpOffset,
+    off: &crate::engine::binarization::CuChromaQpOffset,
 ) {
     let pair = match off.offset_indices() {
         Some(idx) => params
@@ -188,7 +188,7 @@ fn scaling_matrix(
     pred_mode: PredMode,
     cidx: TfComponent,
     transform_skip: bool,
-) -> Option<&crate::hevc::engine::scaling_list::ScalingFactorMatrix> {
+) -> Option<&crate::engine::scaling_list::ScalingFactorMatrix> {
     let sf = params.scaling.as_ref()?;
     if transform_skip && n_tbs > 4 {
         return None;
@@ -403,7 +403,7 @@ impl<'a> CcpInput<'a> {
     /// predict from (an all-zero `rY` contributes nothing).
     fn resolve(
         chroma_array_type: u8,
-        ccp: Option<&crate::hevc::engine::binarization::CrossCompPred>,
+        ccp: Option<&crate::engine::binarization::CrossCompPred>,
         luma_residual: Option<&'a [i32]>,
     ) -> Option<Self> {
         if chroma_array_type != 3 {
@@ -601,9 +601,7 @@ fn predict_add_store(
 // §8.5 inter sample reconstruction
 // ---------------------------------------------------------------------------
 
-use crate::hevc::engine::inter_pred::{
-    InterPredGeometry, InterPrediction, ListPrediction, RefPlane,
-};
+use crate::engine::inter_pred::{InterPredGeometry, InterPrediction, ListPrediction, RefPlane};
 
 /// One reference list's fully-resolved per-PU motion: the
 /// §8.5.3.2-derived luma motion vector, the §8.5.3.2.10 chroma motion
@@ -669,7 +667,7 @@ fn build_list_prediction<'a>(
 /// # Errors
 /// Propagates [`ReconError::InterNotSupported`] reuse is avoided here; the
 /// §8.5.3.3 interpolation failures surface as [`ReconError`] via the
-/// `InterPred` variant carrying the [`crate::hevc::engine::inter_pred::InterPredError`].
+/// `InterPred` variant carrying the [`crate::engine::inter_pred::InterPredError`].
 #[allow(clippy::too_many_arguments)]
 pub fn reconstruct_inter_pu(
     pic: &mut Picture,
@@ -720,7 +718,7 @@ pub fn reconstruct_inter_pu_weighted(
     residual_luma: Option<&[i32]>,
     residual_cb: Option<&[i32]>,
     residual_cr: Option<&[i32]>,
-    weights: Option<&crate::hevc::engine::inter_pred::PuWeights>,
+    weights: Option<&crate::engine::inter_pred::PuWeights>,
 ) -> Result<(), ReconError> {
     // Issue #189 stage attribution: `reconstruct_inter_pu` delegates here, so
     // this one scope covers every inter prediction unit in a picture.
@@ -740,7 +738,7 @@ pub fn reconstruct_inter_pu_weighted(
     };
     let InterPrediction { luma, cb, cr } = {
         let _profile = prof_scope(ProfStage::InterPredFilter);
-        crate::hevc::engine::inter_pred::predict_inter_pu_weighted(&lp0, &lp1, &geom, weights)
+        crate::engine::inter_pred::predict_inter_pu_weighted(&lp0, &lp1, &geom, weights)
             .map_err(ReconError::InterPred)?
     };
 
@@ -1070,7 +1068,7 @@ fn extract_residual_tree(
                     )?,
                     None => vec![0i32; n_tbs * n_tbs],
                 };
-                let chroma_res = |blocks: &[crate::hevc::engine::residual::ResidualBlock],
+                let chroma_res = |blocks: &[crate::engine::residual::ResidualBlock],
                                   coded: bool,
                                   cidx: TfComponent|
                  -> Result<Vec<i32>, ReconError> {
@@ -1103,7 +1101,7 @@ fn extract_residual_tree(
                         );
                     }
                 }
-                crate::hevc::engine::transform::act_inverse(
+                crate::engine::transform::act_inverse(
                     &mut r_y,
                     &mut r_cb,
                     &mut r_cr,
@@ -1209,7 +1207,7 @@ fn extract_residual_tree(
 #[allow(clippy::too_many_arguments)]
 fn write_chroma_residual_blocks(
     params: &ReconParams,
-    blocks: &[crate::hevc::engine::residual::ResidualBlock],
+    blocks: &[crate::engine::residual::ResidualBlock],
     coded_halves: [bool; 2],
     cidx: TfComponent,
     qp: u32,
@@ -1268,7 +1266,7 @@ fn write_chroma_residual_blocks(
 /// inter, vs. the §8.6.4.1 DST-VII gate that only fires for 4×4 luma intra).
 fn inter_residual_block(
     params: &ReconParams,
-    rb: &crate::hevc::engine::residual::ResidualBlock,
+    rb: &crate::engine::residual::ResidualBlock,
     cidx: TfComponent,
     qp: u32,
     transquant_bypass: bool,
@@ -1379,14 +1377,14 @@ impl ReconCtx {
     /// layout.
     ///
     /// # Errors
-    /// Propagates [`crate::hevc::engine::availability::AvailabilityError`] (wrapped in
+    /// Propagates [`crate::engine::availability::AvailabilityError`] (wrapped in
     /// [`ReconError::Tiling`]) when the geometry is degenerate.
     pub fn new(
         pic_width_luma: usize,
         pic_height_luma: usize,
         ctb_log2_size_y: u32,
         min_tb_log2_size_y: u32,
-        tiles: &crate::hevc::engine::availability::TilingParams,
+        tiles: &crate::engine::availability::TilingParams,
     ) -> Result<Self, ReconError> {
         let ctb_size = 1usize << ctb_log2_size_y;
         let pic_w_ctbs = pic_width_luma.div_ceil(ctb_size) as u32;
@@ -1715,7 +1713,7 @@ pub fn reconstruct_intra_ctu_ctx(
 /// This is the per-CU entry the §8.5 picture-level inter driver calls for
 /// an intra coding unit embedded in a P / B slice (mixed-mode pictures);
 /// the inter coding units of the same picture go through
-/// [`crate::hevc::engine::inter_recon::resolve_and_reconstruct_inter_cu`].
+/// [`crate::engine::inter_recon::resolve_and_reconstruct_inter_cu`].
 ///
 /// # Errors
 /// [`ReconError::IntraPred`] / [`ReconError::Transform`] on a primitive
@@ -1756,7 +1754,7 @@ pub fn reconstruct_intra_ctu(
         pic.height_luma(),
         ctb_log2,
         min_tb_log2,
-        &crate::hevc::engine::availability::TilingParams::single_tile(),
+        &crate::engine::availability::TilingParams::single_tile(),
     )?;
     reconstruct_intra_ctu_ctx(pic, params, &mut ctx, ctu)
 }
@@ -1835,7 +1833,7 @@ pub struct IntraPictureParams {
     /// `MinTbLog2SizeY` (= `log2_min_luma_transform_block_size_minus2 + 2`).
     pub min_tb_log2_size_y: u32,
     /// The active PPS tile layout (§6.5.1).
-    pub tiles: crate::hevc::engine::availability::TilingParams,
+    pub tiles: crate::engine::availability::TilingParams,
     /// `slice_sao_luma_flag` (§8.7.3.1 luma gate).
     pub slice_sao_luma_flag: bool,
     /// `slice_sao_chroma_flag` (§8.7.3.1 chroma gate).
@@ -1871,13 +1869,13 @@ pub struct PlacedCtu<'a> {
 /// reconstructed when it is processed, which the tile-scan order
 /// guarantees. The driver shares one [`ReconCtx`] across all CTUs so the
 /// §8.4.2 most-probable-mode derivation sees the true neighbour modes, then
-/// resolves each CTB's [`crate::hevc::engine::sao::ResolvedSao`] (honouring
+/// resolves each CTB's [`crate::engine::sao::ResolvedSao`] (honouring
 /// `sao_merge_left_flag` / `sao_merge_up_flag`) and runs
-/// [`crate::hevc::engine::sao::apply_sao_picture`].
+/// [`crate::engine::sao::apply_sao_picture`].
 ///
 /// The returned picture is the §8.7.3 SAO output (the in-loop deblocking
 /// filter, §8.7.2, is applied by the caller via
-/// [`crate::hevc::engine::deblock::deblock_picture`] before SAO when deblocking is
+/// [`crate::engine::deblock::deblock_picture`] before SAO when deblocking is
 /// enabled; this driver covers the recon + SAO stages).
 ///
 /// # Errors
@@ -1922,7 +1920,7 @@ pub fn reconstruct_intra_picture(
 
     // §8.7.3.1 resolved-SAO grid (raster order), default all-off so a CTU
     // not present in `ctus` leaves its CTB unmodified.
-    let mut sao_grid = vec![crate::hevc::engine::sao::ResolvedSao::off(); pic_w_ctbs * pic_h_ctbs];
+    let mut sao_grid = vec![crate::engine::sao::ResolvedSao::off(); pic_w_ctbs * pic_h_ctbs];
 
     for placed in ctus {
         reconstruct_intra_ctu_ctx(&mut pic, params, &mut ctx, placed.ctu)?;
@@ -1940,7 +1938,7 @@ pub fn reconstruct_intra_picture(
                 .then(|| sao_grid[ry * pic_w_ctbs + (rx - 1)]);
             let above = (ry > 0 && slice_addr_map[(ry - 1) * pic_w_ctbs + rx] == here)
                 .then(|| sao_grid[(ry - 1) * pic_w_ctbs + rx]);
-            sao_grid[ry * pic_w_ctbs + rx] = crate::hevc::engine::sao::ResolvedSao::resolve(
+            sao_grid[ry * pic_w_ctbs + rx] = crate::engine::sao::ResolvedSao::resolve(
                 sao_params,
                 left.as_ref(),
                 above.as_ref(),
@@ -1952,7 +1950,7 @@ pub fn reconstruct_intra_picture(
 
     // §8.7.3.1 — apply SAO across the whole picture (no-op when both slice
     // SAO flags are clear or every CTB resolved to type 0).
-    let filtered = crate::hevc::engine::sao::apply_sao_picture(
+    let filtered = crate::engine::sao::apply_sao_picture(
         pic,
         &sao_grid,
         pic_params.ctb_log2_size_y,
@@ -2029,7 +2027,7 @@ fn derive_and_record_luma_mode(
 fn write_palette_cu(
     pic: &mut Picture,
     params: &ReconParams,
-    pal: &crate::hevc::engine::palette::PaletteCu,
+    pal: &crate::engine::palette::PaletteCu,
     x_cb: usize,
     y_cb: usize,
     qp_y: i32,
@@ -2042,7 +2040,7 @@ fn write_palette_cu(
         apply_cu_chroma_qp_offset(params, off);
     }
     let qp_luma = luma_qp(params, qp_y) as i32;
-    crate::hevc::engine::palette::reconstruct_palette_component(
+    crate::engine::palette::reconstruct_palette_component(
         pal,
         0,
         1,
@@ -2060,7 +2058,7 @@ fn write_palette_cu(
             (2, Plane::Cr, TfComponent::Cr),
         ] {
             let qp_c = chroma_qp(params, qp_y, comp) as i32;
-            crate::hevc::engine::palette::reconstruct_palette_component(
+            crate::engine::palette::reconstruct_palette_component(
                 pal,
                 c_idx,
                 sub_w,
@@ -2080,7 +2078,7 @@ fn write_pcm_cu(
     x_cb: usize,
     y_cb: usize,
     n_cb: usize,
-    pcm: &crate::hevc::engine::slice_data::PcmSamples,
+    pcm: &crate::engine::slice_data::PcmSamples,
 ) {
     for j in 0..n_cb {
         for i in 0..n_cb {
@@ -2179,13 +2177,15 @@ fn reconstruct_cu(
     for (i, &(qx, qy)) in pb_origins.iter().enumerate() {
         let x_pb = x_cb + qx * n_pb;
         let y_pb = y_cb + qy * n_pb;
-        let luma_mode = cu.intra_luma.get(i).copied().unwrap_or(
-            crate::hevc::engine::slice_data::IntraLumaMode {
-                prev_intra_luma_pred_flag: true,
-                mpm_idx: Some(0),
-                rem_intra_luma_pred_mode: None,
-            },
-        );
+        let luma_mode =
+            cu.intra_luma
+                .get(i)
+                .copied()
+                .unwrap_or(crate::engine::slice_data::IntraLumaMode {
+                    prev_intra_luma_pred_flag: true,
+                    mpm_idx: Some(0),
+                    rem_intra_luma_pred_mode: None,
+                });
         pb_modes[i] = derive_and_record_luma_mode(ctx, x_pb, y_pb, n_pb, &luma_mode, false);
     }
 
@@ -2608,7 +2608,7 @@ fn reconstruct_act_transform_unit(
         )?,
         None => vec![0i32; n_tbs * n_tbs],
     };
-    let chroma_res = |blocks: &[crate::hevc::engine::residual::ResidualBlock],
+    let chroma_res = |blocks: &[crate::engine::residual::ResidualBlock],
                       coded: bool,
                       cidx: TfComponent,
                       qp: u32|
@@ -2670,7 +2670,7 @@ fn reconstruct_act_transform_unit(
     }
 
     // §8.6.8.2 — the inverse adaptive colour transformation.
-    crate::hevc::engine::transform::act_inverse(
+    crate::engine::transform::act_inverse(
         &mut r_y,
         &mut r_cb,
         &mut r_cr,
@@ -2731,7 +2731,7 @@ fn reconstruct_chroma_blocks(
     ctx: &ReconCtx,
     plane: Plane,
     cidx: TfComponent,
-    residual_blocks: &[crate::hevc::engine::residual::ResidualBlock],
+    residual_blocks: &[crate::engine::residual::ResidualBlock],
     coded_halves: [bool; 2],
     xc: usize,
     yc: usize,
@@ -2785,14 +2785,12 @@ fn reconstruct_chroma_blocks(
 #[cfg(any())]
 mod tests {
     use super::*;
-    use crate::hevc::engine::availability::TilingParams;
-    use crate::hevc::engine::binarization::{CuPredMode, PartMode};
-    use crate::hevc::engine::residual::ResidualBlock;
-    use crate::hevc::engine::slice_data::{
-        CodingQuadtree, CodingTreeUnit, CodingUnit, IntraLumaMode,
-    };
-    use crate::hevc::engine::transform_tree::TransformTree;
-    use crate::hevc::engine::transform_unit::TransformUnit;
+    use crate::engine::availability::TilingParams;
+    use crate::engine::binarization::{CuPredMode, PartMode};
+    use crate::engine::residual::ResidualBlock;
+    use crate::engine::slice_data::{CodingQuadtree, CodingTreeUnit, CodingUnit, IntraLumaMode};
+    use crate::engine::transform_tree::TransformTree;
+    use crate::engine::transform_unit::TransformUnit;
 
     /// §8 reconstruction params for a Main-profile 4:2:0 8-bit slice at
     /// SliceQpY = 25 (the tiny-i fixture geometry).
@@ -3382,7 +3380,7 @@ mod tests {
     /// band's offset.
     #[test]
     fn picture_driver_applies_sao_band_offset() {
-        use crate::hevc::engine::slice_data::{SaoComponent, SaoCtbParams};
+        use crate::engine::slice_data::{SaoComponent, SaoCtbParams};
         let params = tiny_params();
         let ctu = flat_intra_ctu(-67, Some(-27), Some(64));
         // SAO band offset on luma: band_position chosen so the 81-valued
@@ -3597,10 +3595,10 @@ mod tests {
 
     /// A §7.4.9.12 `cross_comp_pred()` result with the given
     /// `ResScaleVal` (a signed power of two in −8..=8).
-    fn ccp(res_scale_val: i32) -> crate::hevc::engine::binarization::CrossCompPred {
+    fn ccp(res_scale_val: i32) -> crate::engine::binarization::CrossCompPred {
         let mag = res_scale_val.unsigned_abs();
         assert!(mag.is_power_of_two() && mag <= 8);
-        crate::hevc::engine::binarization::CrossCompPred {
+        crate::engine::binarization::CrossCompPred {
             log2_res_scale_abs_plus1: mag.trailing_zeros() + 1,
             res_scale_sign_flag: Some(u8::from(res_scale_val < 0)),
             res_scale_val,
@@ -3612,8 +3610,8 @@ mod tests {
     fn ccp_intra_ctu(
         luma_levels: Vec<i32>,
         cb_levels: Option<Vec<i32>>,
-        ccp_cb: Option<crate::hevc::engine::binarization::CrossCompPred>,
-        ccp_cr: Option<crate::hevc::engine::binarization::CrossCompPred>,
+        ccp_cb: Option<crate::engine::binarization::CrossCompPred>,
+        ccp_cr: Option<crate::engine::binarization::CrossCompPred>,
     ) -> CodingTreeUnit {
         let raw = |levels: Vec<i32>| ResidualBlock {
             log2_trafo_size: 4,
@@ -3818,7 +3816,7 @@ mod tests {
     #[test]
     fn ccp_zero_scale_is_noop() {
         let params = params_444();
-        let none = crate::hevc::engine::binarization::CrossCompPred {
+        let none = crate::engine::binarization::CrossCompPred {
             log2_res_scale_abs_plus1: 0,
             res_scale_sign_flag: None,
             res_scale_val: 0,

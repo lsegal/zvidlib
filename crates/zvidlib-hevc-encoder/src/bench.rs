@@ -10,7 +10,7 @@
 //! This module is that access, and nothing more: thin wrappers that own their
 //! inputs, return plain bytes, and add no logic the benchmark could accidentally
 //! measure instead of the encoder. It is `#[doc(hidden)]` and explicitly not
-//! part of the stable API, matching the `crate::hevc::engine` convention of
+//! part of the stable API, matching the `crate::engine` convention of
 //! exposing internals for tests and fuzzing without promising them.
 //!
 //! Each wrapper returns the bytes that identify its result, because
@@ -18,17 +18,17 @@
 //! timing anything: a stage whose return value did not depend on the kernels
 //! under test would silently disarm that guard.
 
-use crate::hevc::engine::cabac::ContextModel;
-use crate::hevc::engine::encoder::bitwriter::BitWriter;
-use crate::hevc::engine::encoder::cabac::CabacEncoder;
-use crate::hevc::engine::encoder::lossy::encode_idr_residual_au;
-use crate::hevc::engine::encoder::pcm::encode_idr_pcm_au;
-use crate::hevc::engine::encoder::rdo::{DecisionConfig, PictureDecision, decide_picture};
-use crate::hevc::engine::encoder::recon::{
+use crate::engine::cabac::ContextModel;
+use crate::engine::encoder::bitwriter::BitWriter;
+use crate::engine::encoder::cabac::CabacEncoder;
+use crate::engine::encoder::lossy::encode_idr_residual_au;
+use crate::engine::encoder::pcm::encode_idr_pcm_au;
+use crate::engine::encoder::rdo::{DecisionConfig, PictureDecision, decide_picture};
+use crate::engine::encoder::recon::{
     ReconConfig, ReconstructedPicture, SourcePlanes, reconstruct_picture,
 };
-use crate::hevc::engine::encoder::transform::{self as fwd_transform, ForwardBlockParams};
-use crate::hevc::engine::transform::{Component, PredMode};
+use crate::engine::encoder::transform::{self as fwd_transform, ForwardBlockParams};
+use crate::engine::transform::{Component, PredMode};
 
 /// Bit depth the encoder benchmarks run at — the only depth the PCM
 /// writer and the synthetic 8-bit inputs use.

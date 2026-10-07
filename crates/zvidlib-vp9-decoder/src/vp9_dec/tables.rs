@@ -5,7 +5,8 @@
 #![allow(dead_code)]
 
 /// `default_coef_probs_4x4`: `[plane type][ref][band][context][node]`.
-pub(crate) static DEFAULT_COEF_PROBS_4X4: [[[[[u8; 3]; 6]; 6]; 2]; 2] = [
+#[doc(hidden)]
+pub static DEFAULT_COEF_PROBS_4X4: [[[[[u8; 3]; 6]; 6]; 2]; 2] = [
     [
         [
             [
@@ -213,7 +214,8 @@ pub(crate) static DEFAULT_COEF_PROBS_4X4: [[[[[u8; 3]; 6]; 6]; 2]; 2] = [
 ];
 
 /// `default_coef_probs_8x8`: `[plane type][ref][band][context][node]`.
-pub(crate) static DEFAULT_COEF_PROBS_8X8: [[[[[u8; 3]; 6]; 6]; 2]; 2] = [
+#[doc(hidden)]
+pub static DEFAULT_COEF_PROBS_8X8: [[[[[u8; 3]; 6]; 6]; 2]; 2] = [
     [
         [
             [
@@ -421,7 +423,8 @@ pub(crate) static DEFAULT_COEF_PROBS_8X8: [[[[[u8; 3]; 6]; 6]; 2]; 2] = [
 ];
 
 /// `default_coef_probs_16x16`: `[plane type][ref][band][context][node]`.
-pub(crate) static DEFAULT_COEF_PROBS_16X16: [[[[[u8; 3]; 6]; 6]; 2]; 2] = [
+#[doc(hidden)]
+pub static DEFAULT_COEF_PROBS_16X16: [[[[[u8; 3]; 6]; 6]; 2]; 2] = [
     [
         [
             [
@@ -629,7 +632,8 @@ pub(crate) static DEFAULT_COEF_PROBS_16X16: [[[[[u8; 3]; 6]; 6]; 2]; 2] = [
 ];
 
 /// `default_coef_probs_32x32`: `[plane type][ref][band][context][node]`.
-pub(crate) static DEFAULT_COEF_PROBS_32X32: [[[[[u8; 3]; 6]; 6]; 2]; 2] = [
+#[doc(hidden)]
+pub static DEFAULT_COEF_PROBS_32X32: [[[[[u8; 3]; 6]; 6]; 2]; 2] = [
     [
         [
             [
@@ -837,7 +841,7 @@ pub(crate) static DEFAULT_COEF_PROBS_32X32: [[[[[u8; 3]; 6]; 6]; 2]; 2] = [
 ];
 
 /// `vp9_pareto8_full`.
-pub(super) static PARETO8_FULL: [[u8; 8]; 255] = [
+pub static PARETO8_FULL: [[u8; 8]; 255] = [
     [3, 86, 128, 6, 86, 23, 88, 29],
     [6, 86, 128, 11, 87, 42, 91, 52],
     [9, 86, 129, 17, 88, 61, 94, 76],
@@ -1096,7 +1100,8 @@ pub(super) static PARETO8_FULL: [[u8; 8]; 255] = [
 ];
 
 /// `vp9_coefband_trans_8x8plus`.
-pub(crate) static COEFBAND_TRANS_8X8PLUS: [u8; 1024] = [
+#[doc(hidden)]
+pub static COEFBAND_TRANS_8X8PLUS: [u8; 1024] = [
     0, 1, 1, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
     5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
     5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
@@ -1132,15 +1137,16 @@ pub(crate) static COEFBAND_TRANS_8X8PLUS: [u8; 1024] = [
 ];
 
 /// `vp9_coefband_trans_4x4`.
-pub(crate) static COEFBAND_TRANS_4X4: [u8; 16] = [0, 1, 1, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 5, 5, 5];
+#[doc(hidden)]
+pub static COEFBAND_TRANS_4X4: [u8; 16] = [0, 1, 1, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 5, 5, 5];
 
 /// `vp9_cat6_prob`.
-pub(super) static CAT6_PROB: [u8; 14] = [
+pub static CAT6_PROB: [u8; 14] = [
     254, 254, 254, 252, 249, 243, 230, 196, 177, 153, 140, 133, 130, 129,
 ];
 
 /// `vp9_kf_y_mode_prob`: `[above][left][node]`.
-pub(super) static KF_Y_MODE_PROB: [[[u8; 9]; 10]; 10] = [
+pub static KF_Y_MODE_PROB: [[[u8; 9]; 10]; 10] = [
     [
         [137, 30, 42, 148, 151, 207, 70, 52, 91],
         [92, 45, 102, 136, 116, 180, 74, 90, 100],
@@ -1264,7 +1270,7 @@ pub(super) static KF_Y_MODE_PROB: [[[u8; 9]; 10]; 10] = [
 ];
 
 /// `vp9_kf_uv_mode_prob`.
-pub(super) static KF_UV_MODE_PROB: [[u8; 9]; 10] = [
+pub static KF_UV_MODE_PROB: [[u8; 9]; 10] = [
     [144, 11, 54, 157, 195, 130, 46, 58, 108],
     [118, 15, 123, 148, 131, 101, 44, 93, 131],
     [113, 12, 23, 188, 226, 142, 26, 32, 125],
@@ -1278,7 +1284,7 @@ pub(super) static KF_UV_MODE_PROB: [[u8; 9]; 10] = [
 ];
 
 /// `default_if_y_probs`.
-pub(super) static DEFAULT_IF_Y_PROBS: [[u8; 9]; 4] = [
+pub static DEFAULT_IF_Y_PROBS: [[u8; 9]; 4] = [
     [65, 32, 18, 144, 162, 194, 41, 51, 98],
     [132, 68, 18, 165, 217, 196, 45, 40, 78],
     [173, 80, 19, 176, 240, 193, 64, 35, 46],
@@ -1286,7 +1292,7 @@ pub(super) static DEFAULT_IF_Y_PROBS: [[u8; 9]; 4] = [
 ];
 
 /// `default_if_uv_probs`.
-pub(super) static DEFAULT_IF_UV_PROBS: [[u8; 9]; 10] = [
+pub static DEFAULT_IF_UV_PROBS: [[u8; 9]; 10] = [
     [120, 7, 76, 176, 208, 126, 28, 54, 103],
     [48, 12, 154, 155, 139, 90, 34, 117, 119],
     [67, 6, 25, 204, 243, 158, 13, 21, 96],
@@ -1300,7 +1306,7 @@ pub(super) static DEFAULT_IF_UV_PROBS: [[u8; 9]; 10] = [
 ];
 
 /// `vp9_kf_partition_probs`.
-pub(super) static KF_PARTITION_PROBS: [[u8; 3]; 16] = [
+pub static KF_PARTITION_PROBS: [[u8; 3]; 16] = [
     [158, 97, 94],
     [93, 24, 99],
     [85, 119, 44],
@@ -1320,7 +1326,7 @@ pub(super) static KF_PARTITION_PROBS: [[u8; 3]; 16] = [
 ];
 
 /// `default_partition_probs`.
-pub(super) static DEFAULT_PARTITION_PROBS: [[u8; 3]; 16] = [
+pub static DEFAULT_PARTITION_PROBS: [[u8; 3]; 16] = [
     [199, 122, 141],
     [147, 63, 159],
     [148, 133, 118],
@@ -1340,7 +1346,7 @@ pub(super) static DEFAULT_PARTITION_PROBS: [[u8; 3]; 16] = [
 ];
 
 /// `default_inter_mode_probs`.
-pub(super) static DEFAULT_INTER_MODE_PROBS: [[u8; 3]; 7] = [
+pub static DEFAULT_INTER_MODE_PROBS: [[u8; 3]; 7] = [
     [2, 173, 34],
     [7, 145, 85],
     [7, 166, 63],
@@ -1351,42 +1357,49 @@ pub(super) static DEFAULT_INTER_MODE_PROBS: [[u8; 3]; 7] = [
 ];
 
 /// `default_scan_4x4`.
-pub(crate) static DEFAULT_SCAN_4X4: [i16; 16] =
-    [0, 4, 1, 5, 8, 2, 12, 9, 3, 6, 13, 10, 7, 14, 11, 15];
+#[doc(hidden)]
+pub static DEFAULT_SCAN_4X4: [i16; 16] = [0, 4, 1, 5, 8, 2, 12, 9, 3, 6, 13, 10, 7, 14, 11, 15];
 
 /// `default_scan_4x4_neighbors`.
-pub(crate) static DEFAULT_SCAN_4X4_NEIGHBORS: [i16; 34] = [
+#[doc(hidden)]
+pub static DEFAULT_SCAN_4X4_NEIGHBORS: [i16; 34] = [
     0, 0, 0, 0, 0, 0, 1, 4, 4, 4, 1, 1, 8, 8, 5, 8, 2, 2, 2, 5, 9, 12, 6, 9, 3, 6, 10, 13, 7, 10,
     11, 14, 0, 0,
 ];
 
 /// `col_scan_4x4`.
-pub(crate) static COL_SCAN_4X4: [i16; 16] = [0, 4, 8, 1, 12, 5, 9, 2, 13, 6, 10, 3, 7, 14, 11, 15];
+#[doc(hidden)]
+pub static COL_SCAN_4X4: [i16; 16] = [0, 4, 8, 1, 12, 5, 9, 2, 13, 6, 10, 3, 7, 14, 11, 15];
 
 /// `col_scan_4x4_neighbors`.
-pub(crate) static COL_SCAN_4X4_NEIGHBORS: [i16; 34] = [
+#[doc(hidden)]
+pub static COL_SCAN_4X4_NEIGHBORS: [i16; 34] = [
     0, 0, 0, 0, 4, 4, 0, 0, 8, 8, 1, 1, 5, 5, 1, 1, 9, 9, 2, 2, 6, 6, 2, 2, 3, 3, 10, 10, 7, 7, 11,
     11, 0, 0,
 ];
 
 /// `row_scan_4x4`.
-pub(crate) static ROW_SCAN_4X4: [i16; 16] = [0, 1, 4, 2, 5, 3, 6, 8, 9, 7, 12, 10, 13, 11, 14, 15];
+#[doc(hidden)]
+pub static ROW_SCAN_4X4: [i16; 16] = [0, 1, 4, 2, 5, 3, 6, 8, 9, 7, 12, 10, 13, 11, 14, 15];
 
 /// `row_scan_4x4_neighbors`.
-pub(crate) static ROW_SCAN_4X4_NEIGHBORS: [i16; 34] = [
+#[doc(hidden)]
+pub static ROW_SCAN_4X4_NEIGHBORS: [i16; 34] = [
     0, 0, 0, 0, 0, 0, 1, 1, 4, 4, 2, 2, 5, 5, 4, 4, 8, 8, 6, 6, 8, 8, 9, 9, 12, 12, 10, 10, 13, 13,
     14, 14, 0, 0,
 ];
 
 /// `default_scan_8x8`.
-pub(crate) static DEFAULT_SCAN_8X8: [i16; 64] = [
+#[doc(hidden)]
+pub static DEFAULT_SCAN_8X8: [i16; 64] = [
     0, 8, 1, 16, 9, 2, 17, 24, 10, 3, 18, 25, 32, 11, 4, 26, 33, 19, 40, 12, 34, 27, 5, 41, 20, 48,
     13, 35, 42, 28, 21, 6, 49, 56, 36, 43, 29, 7, 14, 50, 57, 44, 22, 37, 15, 51, 58, 30, 45, 23,
     52, 59, 38, 31, 60, 53, 46, 39, 61, 54, 47, 62, 55, 63,
 ];
 
 /// `default_scan_8x8_neighbors`.
-pub(crate) static DEFAULT_SCAN_8X8_NEIGHBORS: [i16; 130] = [
+#[doc(hidden)]
+pub static DEFAULT_SCAN_8X8_NEIGHBORS: [i16; 130] = [
     0, 0, 0, 0, 0, 0, 8, 8, 1, 8, 1, 1, 9, 16, 16, 16, 2, 9, 2, 2, 10, 17, 17, 24, 24, 24, 3, 10,
     3, 3, 18, 25, 25, 32, 11, 18, 32, 32, 4, 11, 26, 33, 19, 26, 4, 4, 33, 40, 12, 19, 40, 40, 5,
     12, 27, 34, 34, 41, 20, 27, 13, 20, 5, 5, 41, 48, 48, 48, 28, 35, 35, 42, 21, 28, 6, 6, 6, 13,
@@ -1396,14 +1409,16 @@ pub(crate) static DEFAULT_SCAN_8X8_NEIGHBORS: [i16; 130] = [
 ];
 
 /// `col_scan_8x8`.
-pub(crate) static COL_SCAN_8X8: [i16; 64] = [
+#[doc(hidden)]
+pub static COL_SCAN_8X8: [i16; 64] = [
     0, 8, 16, 1, 24, 9, 32, 17, 2, 40, 25, 10, 33, 18, 48, 3, 26, 41, 11, 56, 19, 34, 4, 49, 27,
     42, 12, 35, 20, 57, 50, 28, 5, 43, 13, 36, 58, 51, 21, 44, 6, 29, 59, 37, 14, 52, 22, 7, 45,
     60, 30, 15, 38, 53, 23, 46, 31, 61, 39, 54, 47, 62, 55, 63,
 ];
 
 /// `col_scan_8x8_neighbors`.
-pub(crate) static COL_SCAN_8X8_NEIGHBORS: [i16; 130] = [
+#[doc(hidden)]
+pub static COL_SCAN_8X8_NEIGHBORS: [i16; 130] = [
     0, 0, 0, 0, 8, 8, 0, 0, 16, 16, 1, 1, 24, 24, 9, 9, 1, 1, 32, 32, 17, 17, 2, 2, 25, 25, 10, 10,
     40, 40, 2, 2, 18, 18, 33, 33, 3, 3, 48, 48, 11, 11, 26, 26, 3, 3, 41, 41, 19, 19, 34, 34, 4, 4,
     27, 27, 12, 12, 49, 49, 42, 42, 20, 20, 4, 4, 35, 35, 5, 5, 28, 28, 50, 50, 43, 43, 13, 13, 36,
@@ -1413,14 +1428,16 @@ pub(crate) static COL_SCAN_8X8_NEIGHBORS: [i16; 130] = [
 ];
 
 /// `row_scan_8x8`.
-pub(crate) static ROW_SCAN_8X8: [i16; 64] = [
+#[doc(hidden)]
+pub static ROW_SCAN_8X8: [i16; 64] = [
     0, 1, 2, 8, 9, 3, 16, 10, 4, 17, 11, 24, 5, 18, 25, 12, 19, 26, 32, 6, 13, 20, 33, 27, 7, 34,
     40, 21, 28, 41, 14, 35, 48, 42, 29, 36, 49, 22, 43, 15, 56, 37, 50, 44, 30, 57, 23, 51, 58, 45,
     38, 52, 31, 59, 53, 46, 60, 39, 61, 47, 54, 55, 62, 63,
 ];
 
 /// `row_scan_8x8_neighbors`.
-pub(crate) static ROW_SCAN_8X8_NEIGHBORS: [i16; 130] = [
+#[doc(hidden)]
+pub static ROW_SCAN_8X8_NEIGHBORS: [i16; 130] = [
     0, 0, 0, 0, 1, 1, 0, 0, 8, 8, 2, 2, 8, 8, 9, 9, 3, 3, 16, 16, 10, 10, 16, 16, 4, 4, 17, 17, 24,
     24, 11, 11, 18, 18, 25, 25, 24, 24, 5, 5, 12, 12, 19, 19, 32, 32, 26, 26, 6, 6, 33, 33, 32, 32,
     20, 20, 27, 27, 40, 40, 13, 13, 34, 34, 40, 40, 41, 41, 28, 28, 35, 35, 48, 48, 21, 21, 42, 42,
@@ -1430,7 +1447,8 @@ pub(crate) static ROW_SCAN_8X8_NEIGHBORS: [i16; 130] = [
 ];
 
 /// `default_scan_16x16`.
-pub(crate) static DEFAULT_SCAN_16X16: [i16; 256] = [
+#[doc(hidden)]
+pub static DEFAULT_SCAN_16X16: [i16; 256] = [
     0, 16, 1, 32, 17, 2, 48, 33, 18, 3, 64, 34, 49, 19, 65, 80, 50, 4, 35, 66, 20, 81, 96, 51, 5,
     36, 82, 97, 67, 112, 21, 52, 98, 37, 83, 113, 6, 68, 128, 53, 22, 99, 114, 84, 7, 129, 38, 69,
     100, 115, 144, 130, 85, 54, 23, 8, 145, 39, 70, 116, 101, 131, 160, 146, 55, 86, 24, 71, 132,
@@ -1447,7 +1465,8 @@ pub(crate) static DEFAULT_SCAN_16X16: [i16; 256] = [
 ];
 
 /// `default_scan_16x16_neighbors`.
-pub(crate) static DEFAULT_SCAN_16X16_NEIGHBORS: [i16; 514] = [
+#[doc(hidden)]
+pub static DEFAULT_SCAN_16X16_NEIGHBORS: [i16; 514] = [
     0, 0, 0, 0, 0, 0, 16, 16, 1, 16, 1, 1, 32, 32, 17, 32, 2, 17, 2, 2, 48, 48, 18, 33, 33, 48, 3,
     18, 49, 64, 64, 64, 34, 49, 3, 3, 19, 34, 50, 65, 4, 19, 65, 80, 80, 80, 35, 50, 4, 4, 20, 35,
     66, 81, 81, 96, 51, 66, 96, 96, 5, 20, 36, 51, 82, 97, 21, 36, 67, 82, 97, 112, 5, 5, 52, 67,
@@ -1476,7 +1495,8 @@ pub(crate) static DEFAULT_SCAN_16X16_NEIGHBORS: [i16; 514] = [
 ];
 
 /// `col_scan_16x16`.
-pub(crate) static COL_SCAN_16X16: [i16; 256] = [
+#[doc(hidden)]
+pub static COL_SCAN_16X16: [i16; 256] = [
     0, 16, 32, 48, 1, 64, 17, 80, 33, 96, 49, 2, 65, 112, 18, 81, 34, 128, 50, 97, 3, 66, 144, 19,
     113, 35, 82, 160, 98, 51, 129, 4, 67, 176, 20, 114, 145, 83, 36, 99, 130, 52, 192, 5, 161, 68,
     115, 21, 146, 84, 208, 177, 37, 131, 100, 53, 162, 224, 69, 6, 116, 193, 147, 85, 22, 240, 132,
@@ -1493,7 +1513,8 @@ pub(crate) static COL_SCAN_16X16: [i16; 256] = [
 ];
 
 /// `col_scan_16x16_neighbors`.
-pub(crate) static COL_SCAN_16X16_NEIGHBORS: [i16; 514] = [
+#[doc(hidden)]
+pub static COL_SCAN_16X16_NEIGHBORS: [i16; 514] = [
     0, 0, 0, 0, 16, 16, 32, 32, 0, 0, 48, 48, 1, 1, 64, 64, 17, 17, 80, 80, 33, 33, 1, 1, 49, 49,
     96, 96, 2, 2, 65, 65, 18, 18, 112, 112, 34, 34, 81, 81, 2, 2, 50, 50, 128, 128, 3, 3, 97, 97,
     19, 19, 66, 66, 144, 144, 82, 82, 35, 35, 113, 113, 3, 3, 51, 51, 160, 160, 4, 4, 98, 98, 129,
@@ -1522,7 +1543,8 @@ pub(crate) static COL_SCAN_16X16_NEIGHBORS: [i16; 514] = [
 ];
 
 /// `row_scan_16x16`.
-pub(crate) static ROW_SCAN_16X16: [i16; 256] = [
+#[doc(hidden)]
+pub static ROW_SCAN_16X16: [i16; 256] = [
     0, 1, 2, 16, 3, 17, 4, 18, 32, 5, 33, 19, 6, 34, 48, 20, 49, 7, 35, 21, 50, 64, 8, 36, 65, 22,
     51, 37, 80, 9, 66, 52, 23, 38, 81, 67, 10, 53, 24, 82, 68, 96, 39, 11, 54, 83, 97, 69, 25, 98,
     84, 40, 112, 55, 12, 70, 99, 113, 85, 26, 41, 56, 114, 100, 13, 71, 128, 86, 27, 115, 101, 129,
@@ -1539,7 +1561,8 @@ pub(crate) static ROW_SCAN_16X16: [i16; 256] = [
 ];
 
 /// `row_scan_16x16_neighbors`.
-pub(crate) static ROW_SCAN_16X16_NEIGHBORS: [i16; 514] = [
+#[doc(hidden)]
+pub static ROW_SCAN_16X16_NEIGHBORS: [i16; 514] = [
     0, 0, 0, 0, 1, 1, 0, 0, 2, 2, 16, 16, 3, 3, 17, 17, 16, 16, 4, 4, 32, 32, 18, 18, 5, 5, 33, 33,
     32, 32, 19, 19, 48, 48, 6, 6, 34, 34, 20, 20, 49, 49, 48, 48, 7, 7, 35, 35, 64, 64, 21, 21, 50,
     50, 36, 36, 64, 64, 8, 8, 65, 65, 51, 51, 22, 22, 37, 37, 80, 80, 66, 66, 9, 9, 52, 52, 23, 23,
@@ -1568,7 +1591,8 @@ pub(crate) static ROW_SCAN_16X16_NEIGHBORS: [i16; 514] = [
 ];
 
 /// `default_scan_32x32`.
-pub(crate) static DEFAULT_SCAN_32X32: [i16; 1024] = [
+#[doc(hidden)]
+pub static DEFAULT_SCAN_32X32: [i16; 1024] = [
     0, 32, 1, 64, 33, 2, 96, 65, 34, 128, 3, 97, 66, 160, 129, 35, 98, 4, 67, 130, 161, 192, 36,
     99, 224, 5, 162, 193, 68, 131, 37, 100, 225, 194, 256, 163, 69, 132, 6, 226, 257, 288, 195,
     101, 164, 38, 258, 7, 227, 289, 133, 320, 70, 196, 165, 290, 259, 228, 39, 321, 102, 352, 8,
@@ -1626,7 +1650,8 @@ pub(crate) static DEFAULT_SCAN_32X32: [i16; 1024] = [
 ];
 
 /// `default_scan_32x32_neighbors`.
-pub(crate) static DEFAULT_SCAN_32X32_NEIGHBORS: [i16; 2050] = [
+#[doc(hidden)]
+pub static DEFAULT_SCAN_32X32_NEIGHBORS: [i16; 2050] = [
     0, 0, 0, 0, 0, 0, 32, 32, 1, 32, 1, 1, 64, 64, 33, 64, 2, 33, 96, 96, 2, 2, 65, 96, 34, 65,
     128, 128, 97, 128, 3, 34, 66, 97, 3, 3, 35, 66, 98, 129, 129, 160, 160, 160, 4, 35, 67, 98,
     192, 192, 4, 4, 130, 161, 161, 192, 36, 67, 99, 130, 5, 36, 68, 99, 193, 224, 162, 193, 224,
@@ -1736,7 +1761,7 @@ pub(crate) static DEFAULT_SCAN_32X32_NEIGHBORS: [i16; 2050] = [
 ];
 
 /// `dc_qlookup` (8-bit).
-pub(super) static DC_QLOOKUP: [i16; 256] = [
+pub static DC_QLOOKUP: [i16; 256] = [
     4, 8, 8, 9, 10, 11, 12, 12, 13, 14, 15, 16, 17, 18, 19, 19, 20, 21, 22, 23, 24, 25, 26, 26, 27,
     28, 29, 30, 31, 32, 32, 33, 34, 35, 36, 37, 38, 38, 39, 40, 41, 42, 43, 43, 44, 45, 46, 47, 48,
     48, 49, 50, 51, 52, 53, 53, 54, 55, 56, 57, 57, 58, 59, 60, 61, 62, 62, 63, 64, 65, 66, 66, 67,
@@ -1753,7 +1778,7 @@ pub(super) static DC_QLOOKUP: [i16; 256] = [
 ];
 
 /// `ac_qlookup` (8-bit).
-pub(super) static AC_QLOOKUP: [i16; 256] = [
+pub static AC_QLOOKUP: [i16; 256] = [
     4, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
     31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54,
     55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78,
@@ -1770,7 +1795,7 @@ pub(super) static AC_QLOOKUP: [i16; 256] = [
 ];
 
 /// `vp9_filter_kernels`, indexed by interpolation filter: regular, smooth, sharp, bilinear.
-pub(crate) static FILTER_KERNELS: [[[i16; 8]; 16]; 4] = [
+pub static FILTER_KERNELS: [[[i16; 8]; 16]; 4] = [
     [
         [0, 0, 0, 128, 0, 0, 0, 0],
         [0, 1, -5, 126, 8, -3, 1, 0],
@@ -1846,37 +1871,37 @@ pub(crate) static FILTER_KERNELS: [[[i16; 8]; 16]; 4] = [
 ];
 
 /// `b_width_log2_lookup`.
-pub(super) static B_WIDTH_LOG2_LOOKUP: [u8; 13] = [0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4];
+pub static B_WIDTH_LOG2_LOOKUP: [u8; 13] = [0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4];
 
 /// `b_height_log2_lookup`.
-pub(super) static B_HEIGHT_LOG2_LOOKUP: [u8; 13] = [0, 1, 0, 1, 2, 1, 2, 3, 2, 3, 4, 3, 4];
+pub static B_HEIGHT_LOG2_LOOKUP: [u8; 13] = [0, 1, 0, 1, 2, 1, 2, 3, 2, 3, 4, 3, 4];
 
 /// `num_4x4_blocks_wide_lookup`.
-pub(super) static NUM_4X4_BLOCKS_WIDE_LOOKUP: [u8; 13] = [1, 1, 2, 2, 2, 4, 4, 4, 8, 8, 8, 16, 16];
+pub static NUM_4X4_BLOCKS_WIDE_LOOKUP: [u8; 13] = [1, 1, 2, 2, 2, 4, 4, 4, 8, 8, 8, 16, 16];
 
 /// `num_4x4_blocks_high_lookup`.
-pub(super) static NUM_4X4_BLOCKS_HIGH_LOOKUP: [u8; 13] = [1, 2, 1, 2, 4, 2, 4, 8, 4, 8, 16, 8, 16];
+pub static NUM_4X4_BLOCKS_HIGH_LOOKUP: [u8; 13] = [1, 2, 1, 2, 4, 2, 4, 8, 4, 8, 16, 8, 16];
 
 /// `mi_width_log2_lookup`.
-pub(super) static MI_WIDTH_LOG2_LOOKUP: [u8; 13] = [0, 0, 0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3];
+pub static MI_WIDTH_LOG2_LOOKUP: [u8; 13] = [0, 0, 0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3];
 
 /// `num_8x8_blocks_wide_lookup`.
-pub(super) static NUM_8X8_BLOCKS_WIDE_LOOKUP: [u8; 13] = [1, 1, 1, 1, 1, 2, 2, 2, 4, 4, 4, 8, 8];
+pub static NUM_8X8_BLOCKS_WIDE_LOOKUP: [u8; 13] = [1, 1, 1, 1, 1, 2, 2, 2, 4, 4, 4, 8, 8];
 
 /// `num_8x8_blocks_high_lookup`.
-pub(super) static NUM_8X8_BLOCKS_HIGH_LOOKUP: [u8; 13] = [1, 1, 1, 1, 2, 1, 2, 4, 2, 4, 8, 4, 8];
+pub static NUM_8X8_BLOCKS_HIGH_LOOKUP: [u8; 13] = [1, 1, 1, 1, 2, 1, 2, 4, 2, 4, 8, 4, 8];
 
 /// `size_group_lookup`.
-pub(super) static SIZE_GROUP_LOOKUP: [u8; 13] = [0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 3];
+pub static SIZE_GROUP_LOOKUP: [u8; 13] = [0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 3];
 
 /// `max_txsize_lookup`.
-pub(super) static MAX_TXSIZE_LOOKUP: [u8; 13] = [0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 3];
+pub static MAX_TXSIZE_LOOKUP: [u8; 13] = [0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 3];
 
 /// `tx_mode_to_biggest_tx_size`.
-pub(super) static TX_MODE_TO_BIGGEST_TX_SIZE: [u8; 5] = [0, 1, 2, 3, 3];
+pub static TX_MODE_TO_BIGGEST_TX_SIZE: [u8; 5] = [0, 1, 2, 3, 3];
 
 /// `subsize_lookup`: `[partition][block size]`.
-pub(super) static SUBSIZE_LOOKUP: [[u8; 13]; 4] = [
+pub static SUBSIZE_LOOKUP: [[u8; 13]; 4] = [
     [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
     [13, 13, 13, 2, 13, 13, 5, 13, 13, 8, 13, 13, 11],
     [13, 13, 13, 1, 13, 13, 4, 13, 13, 7, 13, 13, 10],
@@ -1884,7 +1909,7 @@ pub(super) static SUBSIZE_LOOKUP: [[u8; 13]; 4] = [
 ];
 
 /// `ss_size_lookup`: `[block size][ss_x][ss_y]`.
-pub(super) static SS_SIZE_LOOKUP: [[[u8; 2]; 2]; 13] = [
+pub static SS_SIZE_LOOKUP: [[[u8; 2]; 2]; 13] = [
     [[0, 13], [13, 13]],
     [[1, 0], [13, 13]],
     [[2, 13], [0, 13]],
@@ -1901,7 +1926,7 @@ pub(super) static SS_SIZE_LOOKUP: [[[u8; 2]; 2]; 13] = [
 ];
 
 /// `uv_txsize_lookup`: `[block size][tx size][ss_x][ss_y]`.
-pub(super) static UV_TXSIZE_LOOKUP: [[[[u8; 2]; 2]; 4]; 13] = [
+pub static UV_TXSIZE_LOOKUP: [[[[u8; 2]; 2]; 4]; 13] = [
     [
         [[0, 0], [0, 0]],
         [[0, 0], [0, 0]],

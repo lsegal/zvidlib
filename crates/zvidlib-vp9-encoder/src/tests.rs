@@ -1202,9 +1202,9 @@ fn reference_conversion(
 
 #[test]
 fn rgb_conversion_matches_the_per_pixel_bt601_reference_on_every_isa() {
-    let _guard = crate::simd::test_lock();
-    for isa in crate::simd::available() {
-        crate::simd::set_override(Some(isa));
+    let _guard = zvidlib_core::simd::test_lock();
+    for isa in zvidlib_core::simd::available() {
+        zvidlib_core::simd::set_override(Some(isa));
         for (width, height) in [(16, 16), (17, 9), (33, 2), (1, 1), (70, 35)] {
             let geometry = Geometry::new(width, height);
             for format in [PixelFormat::Rgba8, PixelFormat::Bgra8] {
@@ -1235,14 +1235,14 @@ fn rgb_conversion_matches_the_per_pixel_bt601_reference_on_every_isa() {
             }
         }
     }
-    crate::simd::set_override(None);
+    zvidlib_core::simd::set_override(None);
 }
 
 /// The vector kernels are bit-exact with the scalar ones, so the encoder has
 /// to write the same bytes whichever instruction set it runs on (cf. #231).
 #[test]
 fn every_instruction_set_encodes_byte_identical_bitstreams() {
-    let _guard = crate::simd::test_lock();
+    let _guard = zvidlib_core::simd::test_lock();
     let encode = |config: &VideoEncoderConfig, content: &dyn Fn(u32) -> VideoFrame| {
         let mut encoder = NativeVp9Encoder::new(config, &Limits::default()).unwrap();
         (0..4)
@@ -1270,17 +1270,17 @@ fn every_instruction_set_encodes_byte_identical_bitstreams() {
             }),
         ]
     };
-    crate::simd::set_override(Some(crate::simd::SimdIsa::Scalar));
+    zvidlib_core::simd::set_override(Some(zvidlib_core::simd::SimdIsa::Scalar));
     let reference = streams();
-    for isa in crate::simd::available() {
-        crate::simd::set_override(Some(isa));
+    for isa in zvidlib_core::simd::available() {
+        zvidlib_core::simd::set_override(Some(isa));
         assert!(
             streams() == reference,
             "{} encoded different bytes from the scalar kernels",
             isa.name()
         );
     }
-    crate::simd::set_override(None);
+    zvidlib_core::simd::set_override(None);
 }
 
 #[test]

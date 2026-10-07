@@ -15,34 +15,34 @@ use crate::Result;
 
 /// The size and colour of a decoded frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct FrameShape {
-    pub(crate) width: usize,
-    pub(crate) height: usize,
+pub struct FrameShape {
+    pub width: usize,
+    pub height: usize,
     /// `color_space` of the uncompressed header, as [`DecodedPicture`](super::DecodedPicture)
     /// reports it.
-    pub(crate) color_space: u8,
-    pub(crate) full_range: bool,
+    pub color_space: u8,
+    pub full_range: bool,
 }
 
 /// What the start of one frame's header says.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct FrameInfo {
+pub struct FrameInfo {
     /// The frame's size and colour, or for `show_existing_frame` those of the frame it shows.
-    pub(crate) shape: FrameShape,
-    pub(crate) shown: bool,
+    pub shape: FrameShape,
+    pub shown: bool,
     /// Whether the frame is a key frame, which refreshes every reference slot.
-    pub(crate) key_frame: bool,
+    pub key_frame: bool,
     /// The reference slot a `show_existing_frame` header shows again. Such a header decodes
     /// nothing and refreshes no slot.
-    pub(crate) existing: Option<usize>,
+    pub existing: Option<usize>,
     /// The reference slots the decoded frame replaces.
-    pub(crate) refresh_frame_flags: u8,
+    pub refresh_frame_flags: u8,
 }
 
 /// Follows a VP9 stream chunk by chunk, as a [`Decoder`](super::Decoder) would, without
 /// decoding it.
 #[derive(Debug, Default)]
-pub(crate) struct ChunkInspector {
+pub struct ChunkInspector {
     refs: [Option<FrameShape>; 8],
     color_space: u8,
     full_range: bool,
@@ -50,14 +50,14 @@ pub(crate) struct ChunkInspector {
 }
 
 impl ChunkInspector {
-    pub(crate) fn reset(&mut self) {
+    pub fn reset(&mut self) {
         *self = Self::default();
     }
 
     /// Reads one chunk (a frame or a superframe) and returns the shape of the frame it shows,
     /// which is that of its last frame when that frame is shown.
     #[cfg(test)]
-    pub(crate) fn inspect(&mut self, data: &[u8]) -> Result<Option<FrameShape>> {
+    pub fn inspect(&mut self, data: &[u8]) -> Result<Option<FrameShape>> {
         if data.is_empty() {
             return Err(malformed("VP9 sample is empty"));
         }
@@ -70,7 +70,7 @@ impl ChunkInspector {
     }
 
     /// Reads one frame of a chunk and records the reference slots it refreshes.
-    pub(crate) fn inspect_frame(&mut self, data: &[u8]) -> Result<FrameInfo> {
+    pub fn inspect_frame(&mut self, data: &[u8]) -> Result<FrameInfo> {
         let mut reader = BitReader::new(data);
         if reader.literal(2)? != 2 {
             return Err(malformed("VP9 frame marker is invalid"));
@@ -185,7 +185,7 @@ impl ChunkInspector {
 }
 
 /// The frames of a chunk: those its superframe index lists, or the whole chunk when it has none.
-pub(crate) fn chunk_frames(data: &[u8]) -> Result<Vec<&[u8]>> {
+pub fn chunk_frames(data: &[u8]) -> Result<Vec<&[u8]>> {
     let Some(sizes) = superframe_index(data)? else {
         return Ok(vec![data]);
     };

@@ -111,9 +111,9 @@
 //! * `pps_cb_qp_offset` / `pps_cr_qp_offset` range −12..=12.
 //! * `pps_beta_offset_div2` / `pps_tc_offset_div2` range −6..=6.
 
-use crate::hevc::engine::bitreader::{BitReader, BitReaderError};
-use crate::hevc::engine::scaling_list::{ScalingListData, ScalingListError};
-use crate::hevc::engine::sps::OpaqueTail;
+use crate::bitreader::{BitReader, BitReaderError};
+use crate::scaling_list::{ScalingListData, ScalingListError};
+use crate::sps::OpaqueTail;
 
 /// Errors that can arise while parsing a PPS RBSP.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -721,7 +721,7 @@ pub struct PicParameterSet {
 impl PicParameterSet {
     /// Parse `pic_parameter_set_rbsp()` starting from the first bit of
     /// the (already-unescaped) RBSP body — i.e. after the two-byte NAL
-    /// header has been removed (see [`crate::hevc::engine::nal::NalUnit`]).
+    /// header has been removed (see [`crate::nal::NalUnit`]).
     pub fn parse(rbsp: &[u8]) -> Result<Self, PpsError> {
         let mut br = BitReader::new(rbsp);
         Self::parse_inner(&mut br, rbsp)
@@ -1067,7 +1067,7 @@ impl PicParameterSet {
 #[cfg(any())]
 mod tests {
     use super::*;
-    use crate::hevc::engine::nal::collect_nal_units;
+    use crate::nal::collect_nal_units;
 
     /// PPS RBSP body extracted from
     /// `docs/video/h265/fixtures/tiny-i-only-16x16-main/input.hevc`,

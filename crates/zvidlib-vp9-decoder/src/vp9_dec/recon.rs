@@ -9,9 +9,9 @@
 use super::idct1d::{iadst4, iadst8, iadst16, idct4, idct8, idct16, idct32};
 use crate::vp9_simd;
 
-pub(crate) const DCT_DCT: u8 = 0;
-pub(crate) const ADST_DCT: u8 = 1;
-pub(crate) const DCT_ADST: u8 = 2;
+pub const DCT_DCT: u8 = 0;
+pub const ADST_DCT: u8 = 1;
+pub const DCT_ADST: u8 = 2;
 
 #[inline]
 fn clip_pixel_add(dest: u8, residual: i32) -> u8 {
@@ -193,7 +193,8 @@ fn iwht4x4_add(input: &[i32], dest: &mut [u8], stride: usize, eob: usize) {
 /// Runs the vector kernels of [`crate::vp9_simd`] where the host has them,
 /// and [`inverse_transform_add_scalar`], which they reproduce exactly,
 /// everywhere else.
-pub(crate) fn inverse_transform_add(
+#[doc(hidden)]
+pub fn inverse_transform_add(
     coefficients: &[i32],
     dest: &mut [u8],
     stride: usize,
@@ -217,7 +218,7 @@ pub(crate) fn inverse_transform_add(
 }
 
 /// The scalar reference for [`inverse_transform_add`].
-pub(crate) fn inverse_transform_add_scalar(
+pub fn inverse_transform_add_scalar(
     coefficients: &[i32],
     dest: &mut [u8],
     stride: usize,
@@ -304,15 +305,15 @@ pub(crate) fn inverse_transform_add_scalar(
 }
 
 /// The prediction mode numbering of the bitstream.
-pub(crate) const DC_PRED: u8 = 0;
-pub(crate) const V_PRED: u8 = 1;
-pub(crate) const H_PRED: u8 = 2;
-pub(crate) const D45_PRED: u8 = 3;
-pub(crate) const D135_PRED: u8 = 4;
-pub(crate) const D117_PRED: u8 = 5;
-pub(crate) const D207_PRED: u8 = 7;
-pub(crate) const D63_PRED: u8 = 8;
-pub(crate) const TM_PRED: u8 = 9;
+pub const DC_PRED: u8 = 0;
+pub const V_PRED: u8 = 1;
+pub const H_PRED: u8 = 2;
+pub const D45_PRED: u8 = 3;
+pub const D135_PRED: u8 = 4;
+pub const D117_PRED: u8 = 5;
+pub const D207_PRED: u8 = 7;
+pub const D63_PRED: u8 = 8;
+pub const TM_PRED: u8 = 9;
 
 #[inline]
 fn avg2(a: u8, b: u8) -> u8 {
@@ -327,9 +328,9 @@ fn avg3(a: u8, b: u8, c: u8) -> u8 {
 /// Edge pixels for one intra prediction: `above[0]` is the above-left
 /// pixel and `above[1..=2 * bs]` the row above, `left[..bs]` the column to
 /// the left.
-pub(crate) struct IntraEdges {
-    pub(crate) above: [u8; 65],
-    pub(crate) left: [u8; 32],
+pub struct IntraEdges {
+    pub above: [u8; 65],
+    pub left: [u8; 32],
 }
 
 /// Fills a `bs`x`bs` block of `dest` with the intra prediction `mode`
@@ -339,7 +340,7 @@ pub(crate) struct IntraEdges {
 /// Runs the vector kernels of [`crate::vp9_simd`] where the host has them,
 /// and [`predict_intra_scalar`], which they reproduce exactly, everywhere
 /// else.
-pub(crate) fn predict_intra(
+pub fn predict_intra(
     dest: &mut [u8],
     stride: usize,
     bs: usize,
@@ -364,7 +365,7 @@ pub(crate) fn predict_intra(
 }
 
 /// The scalar reference for [`predict_intra`].
-pub(crate) fn predict_intra_scalar(
+pub fn predict_intra_scalar(
     dest: &mut [u8],
     stride: usize,
     bs: usize,
@@ -552,7 +553,7 @@ pub(crate) fn predict_intra_scalar(
 }
 
 /// One libvpx `InterpKernel` table: 16 sub-pixel phases of 8 taps.
-pub(crate) type Kernel = [[i16; 8]; 16];
+pub type Kernel = [[i16; 8]; 16];
 
 /// The separable 8-tap convolution of `vpx_convolve8_c` and its scaled
 /// variants, writing `w`x`h` pixels to `dest`. `src[origin]` is the
@@ -569,7 +570,7 @@ pub(crate) type Kernel = [[i16; 8]; 16];
 /// Runs the vector kernels of [`crate::vp9_simd`] where the host has them,
 /// and [`convolve_scalar`], which they reproduce exactly, everywhere else.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn convolve(
+pub fn convolve(
     src: &[u8],
     origin: usize,
     src_stride: usize,
@@ -611,7 +612,7 @@ pub(crate) fn convolve(
 
 /// The scalar reference for [`convolve`].
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn convolve_scalar(
+pub fn convolve_scalar(
     src: &[u8],
     origin: usize,
     src_stride: usize,

@@ -75,9 +75,9 @@
 //! intra-only fixtures this rebuild targets — are parsed end to end
 //! through `byte_alignment()`.
 
-use crate::hevc::engine::bitreader::{BitReader, BitReaderError};
-use crate::hevc::engine::pps::PicParameterSet;
-use crate::hevc::engine::sps::{OpaqueTail, SeqParameterSet, ShortTermRefPicSet, SpsError};
+use crate::bitreader::{BitReader, BitReaderError};
+use crate::pps::PicParameterSet;
+use crate::sps::{OpaqueTail, SeqParameterSet, ShortTermRefPicSet, SpsError};
 
 /// `nal_unit_type` value `BLA_W_LP` (Table 7-1). The IRAP range used by
 /// the `no_output_of_prior_pics_flag` gate is `BLA_W_LP..=RSV_IRAP_VCL23`.
@@ -1474,7 +1474,7 @@ impl SliceSegmentHeader {
     /// Parse `slice_segment_header()` from the first bit of the
     /// (already-unescaped) slice-segment-layer RBSP body — i.e. after
     /// the two-byte NAL header has been removed (see
-    /// [`crate::hevc::engine::nal::NalUnit`]).
+    /// [`crate::nal::NalUnit`]).
     ///
     /// * `nal_unit_type` is the value from the NAL header; it gates
     ///   both `no_output_of_prior_pics_flag` (IRAP range) and the
@@ -2533,7 +2533,7 @@ enum ActiveShortTermRps {
     /// The active short-term RPS has been resolved to its post-§7.4.8
     /// form. The contained `UsedByCurrPicS{0,1}` arrays are the
     /// per-position flags consumed by equation 7-57.
-    Materialized(crate::hevc::engine::sps::MaterializedShortTermRefPicSet),
+    Materialized(crate::sps::MaterializedShortTermRefPicSet),
     /// The slice has no active short-term RPS (an IDR slice, where the
     /// non-IDR POC/RPS block is absent). `NumPicTotalCurr` is `0`.
     Empty,
@@ -2643,7 +2643,7 @@ fn consume_byte_alignment(br: &mut BitReader<'_>) -> Result<usize, SliceError> {
 #[cfg(any())]
 mod tests {
     use super::*;
-    use crate::hevc::engine::sps::LongTermRefPicEntry;
+    use crate::sps::LongTermRefPicEntry;
 
     /// Build a minimal SPS for slice-header parsing context. Only the
     /// fields the slice parser reads are populated meaningfully; the
@@ -2776,7 +2776,7 @@ mod tests {
     fn parses_slice_act_qp_offsets_when_pps_signals_them() {
         let sps = ctx_sps(1, false, true, true, 16, 16, 1, 0, 4);
         let mut pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
-        pps.pps_scc_extension = Some(crate::hevc::engine::pps::PpsSccExtension {
+        pps.pps_scc_extension = Some(crate::pps::PpsSccExtension {
             pps_slice_act_qp_offsets_present_flag: true,
             ..Default::default()
         });
@@ -2819,7 +2819,7 @@ mod tests {
     fn parses_cu_chroma_qp_offset_enabled_flag_when_list_enabled() {
         let sps = ctx_sps(1, false, true, true, 16, 16, 1, 0, 4);
         let mut pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
-        pps.pps_range_extension = Some(crate::hevc::engine::pps::PpsRangeExtension {
+        pps.pps_range_extension = Some(crate::pps::PpsRangeExtension {
             chroma_qp_offset_list_enabled_flag: true,
             ..Default::default()
         });
@@ -2851,7 +2851,7 @@ mod tests {
         let sps = ctx_sps(1, false, true, true, 16, 16, 1, 0, 4);
         let mut pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
         // PpsActQpOffsetY = +10 (pps_act_y_qp_offset_plus5 = 15).
-        pps.pps_scc_extension = Some(crate::hevc::engine::pps::PpsSccExtension {
+        pps.pps_scc_extension = Some(crate::pps::PpsSccExtension {
             pps_slice_act_qp_offsets_present_flag: true,
             pps_act_y_qp_offset_plus5: 15,
             ..Default::default()
@@ -3028,7 +3028,7 @@ mod tests {
     /// entry, each with `delta_poc_msb_present_flag` and the cycle.
     #[test]
     fn parses_non_idr_i_slice_with_long_term_block() {
-        use crate::hevc::engine::sps::LongTermRefPicEntry;
+        use crate::sps::LongTermRefPicEntry;
         let mut sps = ctx_sps(1, false, true, true, 16, 16, 1, 0, 4);
         sps.long_term_ref_pics_present_flag = true;
         sps.num_long_term_ref_pics_sps = 2; // lt_idx_sps width = 1 bit
@@ -4319,7 +4319,7 @@ mod tests {
 
     #[test]
     fn end_to_end_via_nal_walker() {
-        use crate::hevc::engine::nal::collect_nal_units;
+        use crate::nal::collect_nal_units;
         // Build an Annex B stream carrying a single IDR_N_LP slice NAL
         // whose RBSP is the hand-assembled I-slice header from
         // `parses_hand_assembled_i_idr_header`.

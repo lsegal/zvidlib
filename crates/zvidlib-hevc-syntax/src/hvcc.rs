@@ -48,7 +48,7 @@
 //! `lengthSizeMinusOne + 1`-byte big-endian sizes, each followed by
 //! that many coded NAL bytes.
 
-use crate::hevc::engine::nal::{NalError, NalHeader, NalUnit, strip_emulation_prevention};
+use crate::nal::{NalError, NalHeader, NalUnit, strip_emulation_prevention};
 
 /// Errors from the `hvcC` record parse or the length-prefixed
 /// sample-data split.

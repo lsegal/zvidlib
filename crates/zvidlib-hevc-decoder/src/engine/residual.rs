@@ -2,7 +2,7 @@
 //! driver.
 //!
 //! This module composes the per-element residual primitives the
-//! [`crate::hevc::engine::binarization`] module accumulated across rounds 26..35 —
+//! [`crate::engine::binarization`] module accumulated across rounds 26..35 —
 //! `last_sig_coeff_{x,y}_{prefix,suffix}` (§9.3.4.2.3),
 //! `coded_sub_block_flag` (§9.3.4.2.4), `sig_coeff_flag` (§9.3.4.2.5,
 //! including the Table 9-50 16-entry `ctxIdxMap` whose `i = 15` cell
@@ -58,7 +58,7 @@
 //!   `persistent_rice_adaptation_enabled_flag == 0` path; the
 //!   persistent `StatCoeff[ sbType ]` path of eqs. 9-20..9-23 /
 //!   9-25 remains with the §9.3.3.11 follow-up noted on
-//!   [`crate::hevc::engine::binarization::decode_coeff_abs_level_remaining`]).
+//!   [`crate::engine::binarization::decode_coeff_abs_level_remaining`]).
 //!
 //! Out of driver scope (caller-supplied / follow-up):
 //!
@@ -100,13 +100,13 @@
 //! (`coded_sub_block_flag`, 12 ⇒ 4), Table 9-29 (`sig_coeff_flag`,
 //! 132 ⇒ 44), Table 9-30 (`coeff_abs_level_greater1_flag`, 72 ⇒ 24)
 //! and Table 9-31 (`coeff_abs_level_greater2_flag`, 18 ⇒ 6). The
-//! initValue tables themselves live in [`crate::hevc::engine::ctx_init`];
+//! initValue tables themselves live in [`crate::engine::ctx_init`];
 //! [`ResidualContexts::init`] performs the §9.3.2.2 per-`initType`
 //! bank initialization from them, and
 //! [`ResidualContexts::init_uniform`] remains as a single-initValue
 //! bring-up constructor for scripted tests.
 
-use crate::hevc::engine::binarization::{
+use crate::engine::binarization::{
     Greater1State, coded_sub_block_flag_ctx_inc_with_edge, coeff_abs_level_greater2_flag_ctx_inc,
     coeff_abs_level_remaining_c_rice_param_eq_9_24, coeff_abs_level_remaining_c_rice_param_eq_9_25,
     decode_coeff_abs_level_remaining_ext_with, decode_coeff_abs_level_remaining_with,
@@ -116,9 +116,9 @@ use crate::hevc::engine::binarization::{
     sig_coeff_flag_sig_ctx_general, sig_coeff_flag_sig_ctx_log2_2,
     sig_coeff_flag_sig_ctx_transform_skip, signed_level_from_sign_flag,
 };
-use crate::hevc::engine::cabac::{CabacEngine, CabacError, ContextModel};
-use crate::hevc::engine::profile::{Stage as ProfStage, scope as prof_scope};
-use crate::hevc::engine::scan::{ScanIdx, ScanOrderError, scan_order};
+use crate::engine::cabac::{CabacEngine, CabacError, ContextModel};
+use crate::engine::profile::{Stage as ProfStage, scope as prof_scope};
+use crate::engine::scan::{ScanIdx, ScanOrderError, scan_order};
 
 // ---------------------------------------------------------------------
 // Context banks
@@ -183,7 +183,7 @@ pub enum ResidualElement {
 /// constants). [`init`](Self::init) performs the §9.3.2.2
 /// initialization from the Table 9-26..9-31 initValues with the
 /// Table 9-4 `initType` → ctxIdx mapping (tables in
-/// [`crate::hevc::engine::ctx_init`]); [`init_uniform`](Self::init_uniform)
+/// [`crate::engine::ctx_init`]); [`init_uniform`](Self::init_uniform)
 /// constructs a bank set from a single initValue for bring-up and
 /// tests.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -215,7 +215,7 @@ pub struct ResidualContexts {
 impl ResidualContexts {
     /// §9.3.2.2 initialization of every bank from the Table 9-26..9-31
     /// `initValue` entries for the given `initType` (the Table 9-4
-    /// ctxIdx spans; see [`crate::hevc::engine::ctx_init`]) at `SliceQpY ==
+    /// ctxIdx spans; see [`crate::engine::ctx_init`]) at `SliceQpY ==
     /// slice_qp_y` (equation 7-54).
     ///
     /// # Panics
@@ -223,7 +223,7 @@ impl ResidualContexts {
     /// Panics when `init_type > 2`.
     #[must_use]
     pub fn init(init_type: u8, slice_qp_y: i32) -> Self {
-        use crate::hevc::engine::ctx_init::{
+        use crate::engine::ctx_init::{
             TABLE_9_26_LAST_SIG_COEFF_X_PREFIX, TABLE_9_27_LAST_SIG_COEFF_Y_PREFIX,
             TABLE_9_28_CODED_SUB_BLOCK_FLAG, TABLE_9_30_COEFF_ABS_LEVEL_GREATER1_FLAG,
             TABLE_9_31_COEFF_ABS_LEVEL_GREATER2_FLAG, sig_coeff_flag_init_values,
@@ -498,11 +498,11 @@ pub enum ResidualCodingError {
     /// (only diagonal / horizontal / vertical are reachable).
     UnsupportedScanIdx(ScanIdx),
     /// A §7.3.8.13 `palette_coding( )` element violated a parse bound.
-    Palette(crate::hevc::engine::palette::PaletteError),
+    Palette(crate::engine::palette::PaletteError),
 }
 
-impl From<crate::hevc::engine::palette::PaletteError> for ResidualCodingError {
-    fn from(e: crate::hevc::engine::palette::PaletteError) -> Self {
+impl From<crate::engine::palette::PaletteError> for ResidualCodingError {
+    fn from(e: crate::engine::palette::PaletteError) -> Self {
         Self::Palette(e)
     }
 }
@@ -993,7 +993,7 @@ pub fn decode_residual_coding(
 #[cfg(any())]
 mod tests {
     use super::*;
-    use crate::hevc::engine::bitreader::BitReader;
+    use crate::engine::bitreader::BitReader;
     use std::collections::VecDeque;
 
     /// Scripted [`ResidualBinSource`]: serves context-coded bins from

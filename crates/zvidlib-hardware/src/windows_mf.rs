@@ -47,27 +47,27 @@ use super::planar::{
     PlanarConverter, nv12_to_planar, vp8_frame_is_shown, vp8_sample, vp9_dimensions, vp9_frame,
 };
 use super::readback;
-use crate::vp9_dec::{ChunkInspector, FrameShape, chunk_frames};
 use crate::{
     CancellationToken, DecodedVideoFrame, EncodedVideoSample, Error, ErrorKind, FrameIndex, Limits,
     PixelFormat, Plane, Result, VideoDecoder, VideoDecoderConfig, VideoDimensions, VideoFrame,
 };
+use zvidlib_vp9_syntax::{ChunkInspector, FrameShape, chunk_frames};
 
-pub(super) fn is_available(dimensions: VideoDimensions) -> bool {
+pub fn is_available(dimensions: VideoDimensions) -> bool {
     probe(Format::Hevc, dimensions)
 }
 
 /// Whether Media Foundation can decode VP8 in hardware at `dimensions` on this host: the
 /// adapter exposes the D3D11 VP8 decoder profile with NV12 output, and a D3D11-aware VP8 decoder
 /// transform is installed.
-pub(crate) fn is_vp8_available(dimensions: VideoDimensions) -> bool {
+pub fn is_vp8_available(dimensions: VideoDimensions) -> bool {
     probe(Format::Vp8, dimensions)
 }
 
 /// Whether Media Foundation can decode VP9 profile 0 in hardware at `dimensions` on this host:
 /// the adapter exposes the D3D11 VP9 profile 0 decoder profile with NV12 output, and a
 /// D3D11-aware VP9 decoder transform is installed.
-pub(crate) fn is_vp9_available(dimensions: VideoDimensions) -> bool {
+pub fn is_vp9_available(dimensions: VideoDimensions) -> bool {
     probe(Format::Vp9, dimensions)
 }
 
@@ -90,7 +90,7 @@ fn probe(format: Format, dimensions: VideoDimensions) -> bool {
     matches!(ready_rx.recv(), Ok(Ok(())))
 }
 
-pub(super) fn create(
+pub fn create(
     configuration: &VideoDecoderConfig,
     limits: &Limits,
     record: &HvccRecord,
@@ -108,7 +108,7 @@ pub(super) fn create(
 
 /// Creates a Media Foundation VP8 decoder whose pictures are converted by `convert`, so the
 /// hardware decoder's output goes through exactly the conversion the software decoder's does.
-pub(crate) fn create_vp8(
+pub fn create_vp8(
     configuration: &VideoDecoderConfig,
     limits: &Limits,
     convert: PlanarConverter,
@@ -119,7 +119,7 @@ pub(crate) fn create_vp8(
 
 /// Creates a Media Foundation VP9 profile 0 decoder. Its pictures are converted by the software
 /// decoder's own conversion, with the colour each frame's header names.
-pub(crate) fn create_vp9(
+pub fn create_vp9(
     configuration: &VideoDecoderConfig,
     limits: &Limits,
 ) -> Result<Box<dyn VideoDecoder>> {

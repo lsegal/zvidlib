@@ -1,6 +1,6 @@
 //! The residual-coding IDR writer — the encoder's lossy access-unit path.
 //!
-//! [`crate::hevc::engine::encoder::pcm`] writes every coding unit as a
+//! [`crate::engine::encoder::pcm`] writes every coding unit as a
 //! `pcm_flag == 1` PCM block, so its output is exactly the source picture and
 //! nothing in the encoder ever quantizes. This module is the other writer: the
 //! same fixed geometry (`CtbSizeY == MinCbSizeY == 16`, one unsplit
@@ -16,14 +16,14 @@
 //! this writer reconstructs as it codes, block by block in coding order, and
 //! returns the reconstructed picture alongside the access unit. That
 //! reconstruction is the decoder's own output by construction: the prediction
-//! comes from [`crate::hevc::engine::intra_pred`] and the residual from
-//! [`crate::hevc::engine::encoder::quant::reconstruct_residual`], which is the
+//! comes from [`crate::engine::intra_pred`] and the residual from
+//! [`crate::engine::encoder::quant::reconstruct_residual`], which is the
 //! decoder's §8.6.2 process run on the levels that were actually written.
 //!
 //! ## What is coded
 //!
 //! Every coding unit carries the intra luma mode
-//! [`crate::hevc::engine::encoder::rdo::decide_intra_luma_mode`] picked for it
+//! [`crate::engine::encoder::rdo::decide_intra_luma_mode`] picked for it
 //! out of all 35 Table 8-1 directions, searched against the same reference
 //! samples the block is then coded from, and signalled per §7.3.8.5: a
 //! `prev_intra_luma_pred_flag == 1` plus `mpm_idx` when the mode is in the
@@ -44,12 +44,12 @@
 //! reads its neighbouring samples *prior to* the in-loop filter process — the
 //! filtered samples are the picture's output and the next picture's reference,
 //! never this picture's own prediction input. See
-//! [`crate::hevc::engine::encoder::recon::deblock_reconstruction`].
+//! [`crate::engine::encoder::recon::deblock_reconstruction`].
 //!
 //! §8.7.3 SAO runs behind it, in the §8.7.1 order: the SPS carries
 //! `sample_adaptive_offset_enabled_flag == 1`, the writer searches both
 //! §8.7.3.2 types per CTB over the *deblocked* reconstruction
-//! ([`crate::hevc::engine::encoder::recon::sao_reconstruction`]) and codes the
+//! ([`crate::engine::encoder::recon::sao_reconstruction`]) and codes the
 //! §7.3.8.3 `sao( )` structure it found at the head of each CTB's slice data.
 //! Both types, because they reach different error: the four edge-offset
 //! classes shape the error around a local edge, while band offset shapes it
@@ -163,39 +163,35 @@
 //! and once without, the decision compares their sizes, and the one it keeps
 //! is appended to the slice header verbatim.
 
-use crate::hevc::engine::binarization::{derive_intra_pred_mode_c, intra_luma_cand_mode_list};
-use crate::hevc::engine::cabac::init_type;
-use crate::hevc::engine::ctx_init::SliceContexts;
-use crate::hevc::engine::encoder::bitwriter::BitWriter;
-use crate::hevc::engine::encoder::cabac::CabacEncoder;
-use crate::hevc::engine::encoder::nal::{annexb, nal_unit};
-use crate::hevc::engine::encoder::pcm::{
-    PcmEncodeError, level_idc_for, write_pps, write_sps, write_vps,
-};
-use crate::hevc::engine::encoder::rdo::{
+use crate::engine::binarization::{derive_intra_pred_mode_c, intra_luma_cand_mode_list};
+use crate::engine::cabac::init_type;
+use crate::engine::ctx_init::SliceContexts;
+use crate::engine::encoder::bitwriter::BitWriter;
+use crate::engine::encoder::cabac::CabacEncoder;
+use crate::engine::encoder::nal::{annexb, nal_unit};
+use crate::engine::encoder::pcm::{PcmEncodeError, level_idc_for, write_pps, write_sps, write_vps};
+use crate::engine::encoder::rdo::{
     DistortionBackend, intra_mode_bit_cost, lambda_q8, residual_rate_bits,
     shortlist_intra_luma_modes,
 };
-use crate::hevc::engine::encoder::recon::{
+use crate::engine::encoder::recon::{
     ReconstructedPicture, SAO_LAMBDA_BAND, SAO_OFFSET_MAX, SourcePlanes, deblock_reconstruction,
     grid_bins, sao_reconstruction,
 };
-use crate::hevc::engine::encoder::residual::{
+use crate::engine::encoder::residual::{
     EngineResidualBinSink, ResidualWriteParams, has_coded_levels, write_residual_coding,
 };
-use crate::hevc::engine::encoder::transform::{
+use crate::engine::encoder::transform::{
     ForwardBlockParams, chroma_qp, luma_qp, transform_and_quantize,
 };
-use crate::hevc::engine::intra_pred::{
+use crate::engine::intra_pred::{
     Component as IpComponent, IntraPredParams, MarkedReferenceSamples, ReferenceSamples,
     intra_predict, substitute_reference_samples,
 };
-use crate::hevc::engine::picture::clip1;
-use crate::hevc::engine::sao::ResolvedSao;
-use crate::hevc::engine::scan::ScanIdx;
-use crate::hevc::engine::transform::{
-    BlockParams, Component as TfComponent, PredMode, residual_block,
-};
+use crate::engine::picture::clip1;
+use crate::engine::sao::ResolvedSao;
+use crate::engine::scan::ScanIdx;
+use crate::engine::transform::{BlockParams, Component as TfComponent, PredMode, residual_block};
 
 /// `CtbLog2SizeY` of the writer's fixed geometry, matching the PCM writer's.
 const CTB_LOG2: u32 = 4;
@@ -326,7 +322,7 @@ pub fn encode_idr_residual_au(
 ///
 /// This is the writer the public factory's target-bitrate operating point
 /// codes every picture through, with `qp` chosen per picture by
-/// [`crate::hevc::engine::encoder::ratecontrol`]. The fixed-QP configuration
+/// [`crate::engine::encoder::ratecontrol`]. The fixed-QP configuration
 /// stays on [`encode_idr_residual_au`]: a caller that names a QP is asking for
 /// a picture, not a rate.
 ///
@@ -1770,9 +1766,9 @@ fn write_luma_intra_mode(
         }
     }
     debug_assert_eq!(
-        crate::hevc::engine::binarization::derive_intra_pred_mode_y(
+        crate::engine::binarization::derive_intra_pred_mode_y(
             candidates,
-            crate::hevc::engine::binarization::LumaIntraModeSource::Remaining,
+            crate::engine::binarization::LumaIntraModeSource::Remaining,
             rem,
         ),
         mode,
@@ -1821,7 +1817,7 @@ mod tests {
     /// Decode an access unit through the crate's own end-to-end HEVC driver
     /// and return its 4:2:0 planes.
     fn decode(au: &[u8], width: usize, height: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-        let frames = crate::hevc::engine::sequence::decode_annexb_sequence(au).expect("decode");
+        let frames = crate::engine::sequence::decode_annexb_sequence(au).expect("decode");
         assert_eq!(frames.len(), 1, "one IDR frame");
         let planar = frames[0].picture.to_planar_u8().expect("8-bit");
         let luma = width * height;
@@ -1894,8 +1890,8 @@ mod tests {
         // access unit must be a fraction of the raw sample payload.
         let (width, height) = (64, 48);
         let (y, cb, cr) = picture(width, height);
-        let pcm = crate::hevc::engine::encoder::pcm::encode_idr_pcm_au(&y, &cb, &cr, width, height)
-            .unwrap();
+        let pcm =
+            crate::engine::encoder::pcm::encode_idr_pcm_au(&y, &cb, &cr, width, height).unwrap();
         let (lossy, _) = encode_idr_residual_au(&y, &cb, &cr, width, height, 32).unwrap();
         assert!(
             lossy.len() * 2 < pcm.len(),
@@ -2261,13 +2257,12 @@ mod tests {
         let (width, height) = (32, 32);
         let (y, cb, cr) = picture(width, height);
         let (au, _) = encode_idr_residual_au(&y, &cb, &cr, width, height, 32).unwrap();
-        let pps = crate::hevc::engine::nal::collect_nal_units(&au)
+        let pps = crate::engine::nal::collect_nal_units(&au)
             .expect("the access unit parses")
             .into_iter()
             .find(|nal| nal.header.nal_unit_type == 34)
             .expect("the access unit carries a PPS");
-        let parsed =
-            crate::hevc::engine::pps::PicParameterSet::parse(&pps.rbsp).expect("PPS parses");
+        let parsed = crate::engine::pps::PicParameterSet::parse(&pps.rbsp).expect("PPS parses");
         assert!(parsed.deblocking_filter_control_present_flag);
         assert!(
             !parsed.deblocking.disabled_flag,
@@ -3094,13 +3089,12 @@ mod tests {
         let (width, height) = (64, 48);
         let (y, cb, cr) = smooth_picture(width, height);
         let (au, _) = encode_idr_residual_au(&y, &cb, &cr, width, height, 12).unwrap();
-        let sps = crate::hevc::engine::nal::collect_nal_units(&au)
+        let sps = crate::engine::nal::collect_nal_units(&au)
             .expect("the access unit parses")
             .into_iter()
             .find(|nal| nal.header.nal_unit_type == 33)
             .expect("the access unit carries an SPS");
-        let parsed =
-            crate::hevc::engine::sps::SeqParameterSet::parse(&sps.rbsp).expect("SPS parses");
+        let parsed = crate::engine::sps::SeqParameterSet::parse(&sps.rbsp).expect("SPS parses");
         assert!(
             parsed.sample_adaptive_offset_enabled_flag,
             "the writer's SPS still disables SAO"

@@ -2,13 +2,13 @@
 
 use super::frame_encoder::{FrameEncoder, Source};
 use super::predict::Plane;
-use crate::hevc::engine::encoder::colorconv;
 use crate::{
     Codec, CodecImplementation, CodecProfile, CodecSupport, ColorRange, EncodedSample,
     EncoderConfig, EncoderFuture, Error, ErrorKind, FrameIndex, FrameSource, HardwarePreference,
     Limits, Orientation, PixelFormat, Result, SampleDependency, VideoEncoder, VideoEncoderConfig,
     VideoEncoderFactory, VideoEncoderFormat, VideoFrame,
 };
+use zvidlib_color::colorconv;
 
 /// The quantizer index an empty configuration encodes at: visually close to
 /// the source at a moderate bit rate.
@@ -151,6 +151,12 @@ impl VideoEncoderFactory for Vp8EncoderFactory {
             }
             CodecSupport::InvalidConfiguration { reason } => {
                 return Err(Error::new(ErrorKind::InvalidInput, reason));
+            }
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::Unsupported,
+                    "native VP8 encoder does not support this configuration",
+                ));
             }
         }
         let dimensions = c.coded_dimensions;
@@ -463,7 +469,7 @@ pub(super) mod tests {
         }
     }
 
-    pub(in crate::vp8) fn configuration(
+    pub(crate) fn configuration(
         width: u32,
         height: u32,
         configuration: Vec<u8>,
@@ -483,7 +489,7 @@ pub(super) mod tests {
 
     /// A moving gradient with a bright square, so frames have both texture
     /// and motion.
-    pub(in crate::vp8) fn test_frame(width: u32, height: u32, index: u32) -> VideoFrame {
+    pub(crate) fn test_frame(width: u32, height: u32, index: u32) -> VideoFrame {
         let mut data = vec![0u8; (width * height * 4) as usize];
         for y in 0..height {
             for x in 0..width {
@@ -516,10 +522,7 @@ pub(super) mod tests {
         .unwrap()
     }
 
-    pub(in crate::vp8) fn encode(
-        config: &VideoEncoderConfig,
-        frames: &[VideoFrame],
-    ) -> Vec<EncodedSample> {
+    pub(crate) fn encode(config: &VideoEncoderConfig, frames: &[VideoFrame]) -> Vec<EncodedSample> {
         let mut encoder = native_vp8_video_encoder_factory()
             .create(config, &Limits::default())
             .unwrap();

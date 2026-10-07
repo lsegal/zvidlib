@@ -8,7 +8,6 @@
 
 use std::sync::Arc;
 
-use super::bits::BoolDecoder;
 use super::loopfilter::{self, LoopFilterMask, MaskBlock};
 use super::probs::*;
 use super::recon::{self, IntraEdges};
@@ -18,6 +17,7 @@ use super::{
     SEG_LVL_REF_FRAME, SEG_LVL_SKIP, SWITCHABLE, Scale, Segmentation, TX_MODE_SELECT, malformed,
 };
 use crate::Result;
+use zvidlib_vp9_syntax::bits::BoolDecoder;
 
 const BLOCK_4X4: u8 = 0;
 const BLOCK_8X8: u8 = 3;
@@ -41,9 +41,9 @@ const NONE_FRAME: i8 = -1;
 
 /// A motion vector in 1/8 pixel units (`MV`).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct Mv {
-    pub(crate) row: i16,
-    pub(crate) col: i16,
+pub struct Mv {
+    pub row: i16,
+    pub col: i16,
 }
 
 impl Mv {
@@ -66,7 +66,7 @@ impl Mv {
 /// The mode info of one block (`MODE_INFO`), copied to every 8x8 position
 /// the block covers.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct ModeInfo {
+pub struct ModeInfo {
     sb_type: u8,
     mode: u8,
     uv_mode: u8,
@@ -122,7 +122,7 @@ impl ModeInfo {
 /// The motion of one 8x8 position, kept for the next frame's motion
 /// vector prediction (`MV_REF`).
 #[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct MvRef {
+pub struct MvRef {
     ref_frame: [i8; 2],
     mv: [Mv; 2],
 }
@@ -163,7 +163,7 @@ struct BlockContext {
 }
 
 /// Decodes the tiles of one frame into its buffer.
-pub(crate) struct FrameDecoder<'a> {
+pub struct FrameDecoder<'a> {
     header: &'a FrameHeader,
     fc: &'a FrameContext,
     seg: &'a Segmentation,
@@ -174,8 +174,8 @@ pub(crate) struct FrameDecoder<'a> {
     frame: &'a mut Frame,
     mi_rows: usize,
     mi_cols: usize,
-    pub(crate) counts: Option<Box<FrameCounts>>,
-    pub(crate) cur_mvs: Vec<MvRef>,
+    pub counts: Option<Box<FrameCounts>>,
+    pub cur_mvs: Vec<MvRef>,
     mi: Vec<ModeInfo>,
     above_context: [Vec<u8>; 3],
     above_partition: Vec<u8>,
@@ -194,7 +194,7 @@ pub(crate) struct FrameDecoder<'a> {
 
 impl<'a> FrameDecoder<'a> {
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
+    pub fn new(
         header: &'a FrameHeader,
         fc: &'a FrameContext,
         seg: &'a Segmentation,
@@ -276,7 +276,7 @@ impl<'a> FrameDecoder<'a> {
 
     /// `decode_tiles`: decodes every tile and applies the loop filter,
     /// returning the offset in `data` just past the last tile's data.
-    pub(crate) fn decode_tiles(&mut self, data: &'a [u8]) -> Result<usize> {
+    pub fn decode_tiles(&mut self, data: &'a [u8]) -> Result<usize> {
         let tile_cols = 1usize << self.header.log2_tile_cols;
         let tile_rows = 1usize << self.header.log2_tile_rows;
 

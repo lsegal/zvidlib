@@ -6,17 +6,17 @@
 //! `( xPb − 1, yPb )` and the above neighbour `( xPb, yPb − 1 )`, together
 //! with each neighbour's `CuPredMode` and `pcm_flag` and its z-scan
 //! availability. This module stores those three per-block facts on a
-//! minimum-block (4×4 luma sample) grid so the [`crate::hevc::engine::recon`] driver can
+//! minimum-block (4×4 luma sample) grid so the [`crate::engine::recon`] driver can
 //! reconstruct a multi-coding-unit / multi-prediction-block intra picture
 //! with the spec-exact most-probable-mode derivation instead of the
 //! flat-single-CU `INTRA_DC` neighbour assumption.
 //!
 //! The field is luma-only: §8.4.2 operates on luma prediction-block
 //! locations, and §8.4.3 derives `IntraPredModeC` from the co-located
-//! `IntraPredModeY` (already threaded through [`crate::hevc::engine::recon`]).
+//! `IntraPredModeY` (already threaded through [`crate::engine::recon`]).
 
-use crate::hevc::engine::binarization::CuPredMode;
-use crate::hevc::engine::intra_pred::INTRA_DC;
+use crate::engine::binarization::CuPredMode;
+use crate::engine::intra_pred::INTRA_DC;
 
 /// `Log2MinTbSizeY` is at most 2 across all profiles (a 4×4 minimum
 /// transform / prediction block), so the §8.4.2 neighbour grid is keyed
@@ -191,7 +191,7 @@ impl IntraModeField {
     /// of the prediction block at `( x_pb, y_pb )`.
     ///
     /// `available` is the §6.4.1 z-scan availability of the neighbour
-    /// location, supplied by the caller (the [`crate::hevc::engine::availability`]
+    /// location, supplied by the caller (the [`crate::engine::availability`]
     /// `z_scan_availability` consults the picture tiling / slice map the
     /// driver owns). The remaining branches — the not-`MODE_INTRA` /
     /// `pcm_flag` mask, the neighbour-`B` CTB-row test, and the

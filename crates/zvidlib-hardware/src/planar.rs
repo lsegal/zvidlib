@@ -2,19 +2,18 @@
 //! frame's shape from its tag, and turning the NV12 surface a decoder writes into the three 4:2:0
 //! planes the software decoder produces, so both go through the same RGBA conversion.
 
-use crate::vp9_dec::{DecodedPicture, FrameShape};
 use crate::{
     EncodedVideoSample, Error, ErrorKind, Limits, Result, VideoDecoderConfig, VideoDimensions,
     VideoFrame,
 };
+use zvidlib_vp9_syntax::{DecodedPicture, FrameShape};
 
 /// Converts a decoded picture, cropped to the configured dimensions and given as three tightly
 /// packed 4:2:0 planes, to the frame the decoder returns.
-pub(crate) type PlanarConverter =
-    fn([Vec<u8>; 3], &VideoDecoderConfig, &Limits) -> Result<VideoFrame>;
+pub type PlanarConverter = fn([Vec<u8>; 3], &VideoDecoderConfig, &Limits) -> Result<VideoFrame>;
 
 /// Checks a VP8 sample before it is handed to a hardware decoder, and returns its frame.
-pub(super) fn vp8_sample(sample: &EncodedVideoSample, max_allocation_bytes: u64) -> Result<&[u8]> {
+pub fn vp8_sample(sample: &EncodedVideoSample, max_allocation_bytes: u64) -> Result<&[u8]> {
     // A VP8 frame tag is three bytes, and a key frame adds seven more; anything shorter is
     // refused here, as the software decoder refuses it, rather than handed to the driver.
     let minimum = if sample.data.first().is_some_and(|tag| tag & 1 == 0) {
@@ -38,7 +37,7 @@ pub(super) fn vp8_sample(sample: &EncodedVideoSample, max_allocation_bytes: u64)
 }
 
 /// The `show_frame` bit of a VP8 frame tag (RFC 6386 section 9.1).
-pub(super) fn vp8_frame_is_shown(data: &[u8]) -> bool {
+pub fn vp8_frame_is_shown(data: &[u8]) -> bool {
     data.first().is_some_and(|tag| tag & 0x10 != 0)
 }
 
@@ -47,7 +46,7 @@ pub(super) fn vp8_frame_is_shown(data: &[u8]) -> bool {
 ///
 /// `data` starts at the first luma row; rows are `pitch` bytes apart, and the interleaved chroma
 /// plane starts `surface_height` rows in.
-pub(super) fn nv12_to_planar(
+pub fn nv12_to_planar(
     data: &[u8],
     pitch: usize,
     surface_height: usize,
@@ -88,17 +87,13 @@ pub(super) fn nv12_to_planar(
 }
 
 /// The size a VP9 frame's header gives it, which its picture is cropped to.
-pub(super) fn vp9_dimensions(shape: FrameShape, limits: &Limits) -> Result<VideoDimensions> {
+pub fn vp9_dimensions(shape: FrameShape, limits: &Limits) -> Result<VideoDimensions> {
     VideoDimensions::new(shape.width as u32, shape.height as u32, limits)
 }
 
 /// Converts a VP9 picture, cropped to [`vp9_dimensions`], with the colour its header named, as
 /// the software decoder converts its own pictures.
-pub(super) fn vp9_frame(
-    planes: [Vec<u8>; 3],
-    shape: FrameShape,
-    limits: &Limits,
-) -> Result<VideoFrame> {
+pub fn vp9_frame(planes: [Vec<u8>; 3], shape: FrameShape, limits: &Limits) -> Result<VideoFrame> {
     let picture = DecodedPicture {
         width: shape.width,
         height: shape.height,
@@ -106,7 +101,7 @@ pub(super) fn vp9_frame(
         color_space: shape.color_space,
         full_range: shape.full_range,
     };
-    crate::vp9_decoder::picture_to_rgba(&picture, limits)
+    zvidlib_vp9_syntax::picture_to_rgba(&picture, limits)
 }
 
 #[cfg(test)]

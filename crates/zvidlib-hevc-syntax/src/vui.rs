@@ -9,7 +9,7 @@
 //! The nested §E.2.3 `hrd_parameters( 1, sps_max_sub_layers_minus1 )`
 //! call (reached through `vui_timing_info_present_flag` /
 //! `vui_hrd_parameters_present_flag`) is delegated to the shared
-//! [`crate::hevc::engine::hrd::HrdParameters`] parser.
+//! [`crate::hrd::HrdParameters`] parser.
 //!
 //! ## §E.2.1 layout summary
 //!
@@ -77,8 +77,8 @@
 //! }
 //! ```
 
-use crate::hevc::engine::bitreader::{BitReader, BitReaderError};
-use crate::hevc::engine::hrd::{HrdError, HrdParameters};
+use crate::bitreader::{BitReader, BitReaderError};
+use crate::hrd::{HrdError, HrdParameters};
 
 /// `aspect_ratio_idc` value that signals the extended (explicit
 /// `sar_width`:`sar_height`) sample aspect ratio per §E.3.1 Table E.1.

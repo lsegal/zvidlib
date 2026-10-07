@@ -294,7 +294,8 @@ impl CancellationToken {
         self.cancelled.load(Ordering::Acquire)
     }
 
-    pub(crate) fn check(&self) -> Result<()> {
+    #[doc(hidden)]
+    pub fn check(&self) -> Result<()> {
         if self.is_cancelled() {
             Err(Error::new(
                 ErrorKind::Cancelled,

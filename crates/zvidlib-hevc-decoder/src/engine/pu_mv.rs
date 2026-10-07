@@ -2,39 +2,39 @@
 //! resolution driver.
 //!
 //! This module is the seam between the §7.3.8.6 `prediction_unit()`
-//! syntax (parsed by [`crate::hevc::engine::slice_data`] into a
-//! [`crate::hevc::engine::slice_data::PredictionUnit`]) and the resolved per-PU motion
+//! syntax (parsed by [`crate::engine::slice_data`] into a
+//! [`crate::engine::slice_data::PredictionUnit`]) and the resolved per-PU motion
 //! data the §8.5.3.3 inter-sample-prediction path
-//! ([`crate::hevc::engine::recon::reconstruct_inter_pu`]) consumes. It runs the
+//! ([`crate::engine::recon::reconstruct_inter_pu`]) consumes. It runs the
 //! §8.5.3.2.1 "Derivation process for motion vector components and
 //! reference indices": it gathers the §8.5.3.2.3 spatial neighbours out
 //! of the per-block [`MotionField`], dispatches the merge-mode
 //! (§8.5.3.2.2) versus MVP (§8.5.3.2.6) candidate derivation that already
-//! lives in [`crate::hevc::engine::motion`], reconstructs each list's
+//! lives in [`crate::engine::motion`], reconstructs each list's
 //! `mvLX = mvpLX + mvdLX` (eqs 8-94..8-101), applies the §8.5.3.2.1
 //! `nPbSw == 8 && nPbSh == 8` bi→uni reduction (eqs 8-102/8-103), and
 //! returns the fully-resolved [`PuMotion`] — which the caller then writes
 //! back into the motion field (eqs 8-80..8-85) before reconstruction.
 //!
 //! The arithmetic sub-processes (spatial / temporal candidate lists, MVP
-//! candidate, the MV wrap) stay in [`crate::hevc::engine::motion`]; this module owns the
+//! candidate, the MV wrap) stay in [`crate::engine::motion`]; this module owns the
 //! neighbour-location plumbing and the §8.5.3.2.1 ordered-step control
 //! flow that ties them to the parsed PU syntax.
 
-use crate::hevc::engine::binarization::InterPredIdc;
-use crate::hevc::engine::motion::{
+use crate::engine::binarization::InterPredIdc;
+use crate::engine::motion::{
     MergeCandidate, MergeListParams, MotionCell, MotionField, Mv, MvpContext, NeighbourPu,
     PartitionContext, RefPicId, SpatialMergeNeighbours, TemporalMvContext, build_merge_candidate,
     derive_mvp_candidate, derive_spatial_merge_candidates, derive_temporal_mv, reconstruct_mv,
 };
-use crate::hevc::engine::slice_data::PredictionUnit;
+use crate::engine::slice_data::PredictionUnit;
 
 /// The §8.5.3.2.1 `PartMode` split class the `nPbSw` / `nPbSh` (eqs
 /// 8-86/8-87) and the §8.5.3.2.3 partition-exclusion rules read.
 ///
 /// The values mirror the §7.4.9.5 `PartMode` enumeration but carry only
 /// the geometry the MV-resolution driver needs (the §7.3.8.5 part-mode
-/// binarization itself lives in [`crate::hevc::engine::binarization`]).
+/// binarization itself lives in [`crate::engine::binarization`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PartMode {
     /// `PART_2Nx2N` — one PU covering the whole CU.
@@ -73,9 +73,9 @@ impl PartMode {
     }
 }
 
-impl From<crate::hevc::engine::binarization::PartMode> for PartMode {
-    fn from(m: crate::hevc::engine::binarization::PartMode) -> Self {
-        use crate::hevc::engine::binarization::PartMode as B;
+impl From<crate::engine::binarization::PartMode> for PartMode {
+    fn from(m: crate::engine::binarization::PartMode) -> Self {
+        use crate::engine::binarization::PartMode as B;
         match m {
             B::Part2Nx2N => Self::Part2Nx2N,
             B::Part2NxN => Self::Part2NxN,
@@ -203,7 +203,7 @@ impl PuMotion {
 /// current-picture / slice context that does not vary per PU.
 ///
 /// All POC / long-term / short-term lookups go through closures so this
-/// driver stays independent of the [`crate::hevc::engine::dpb`] reference-list layout:
+/// driver stays independent of the [`crate::engine::dpb`] reference-list layout:
 /// the picture-level driver binds them to `RefPicListX[ refIdx ]`.
 pub struct PuMvContext<'a> {
     /// `PicOrderCntVal` of the current picture.
@@ -555,7 +555,7 @@ pub struct InterCuDesc {
 /// modulo the §8.5.3.2.3 same-CU partition exclusion).
 ///
 /// Returns the resolved [`PuMotion`] for each PU (same order as `pus`), so
-/// the caller can drive [`crate::hevc::engine::recon::reconstruct_inter_pu`] per PU.
+/// the caller can drive [`crate::engine::recon::reconstruct_inter_pu`] per PU.
 #[must_use]
 pub fn resolve_cu_motion(
     field: &mut MotionField,
@@ -843,7 +843,7 @@ fn apply_bi_to_uni_reduction(out: &mut PuMotion, geom: &PuGeometry, ctx: &PuMvCo
 #[cfg(any())]
 mod tests {
     use super::*;
-    use crate::hevc::engine::binarization::MvdComponent;
+    use crate::engine::binarization::MvdComponent;
 
     fn intra_field(w: usize, h: usize) -> MotionField {
         MotionField::new(w, h)

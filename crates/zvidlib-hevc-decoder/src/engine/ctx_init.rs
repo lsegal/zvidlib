@@ -25,7 +25,7 @@
 //!   §9.3.2.2 process ([`ContextModel::init`], equations 9-4..9-6).
 //!   [`SliceContexts::for_slice`] additionally applies the
 //!   equation 9-7 `initType` derivation from `slice_type` and
-//!   `cabac_init_flag` ([`crate::hevc::engine::cabac::init_type`]).
+//!   `cabac_init_flag` ([`crate::engine::cabac::init_type`]).
 //!
 //! # Shared context variables
 //!
@@ -65,9 +65,9 @@
 //! `part_mode` only ctxIdx 0 there: the I-slice §9.3.4.2 binarization
 //! uses a single context-coded bin).
 
-use crate::hevc::engine::cabac::{ContextModel, init_type};
-use crate::hevc::engine::residual::ResidualContexts;
-use crate::hevc::engine::slice::SliceType;
+use crate::engine::cabac::{ContextModel, init_type};
+use crate::engine::residual::ResidualContexts;
+use crate::engine::slice::SliceType;
 
 // ---------------------------------------------------------------------
 // initValue tables (Tables 9-5 .. 9-42)
@@ -327,7 +327,7 @@ pub fn inter_init_values<const N: usize>(table: &[u8], init_type: u8) -> Option<
 /// `42 * initType ..`, followed by the two equation 9-40
 /// transform-skip contexts (luma then chroma) from ctxIdx
 /// `126 + 2 * initType ..`. Matches the
-/// [`crate::hevc::engine::residual::ResidualContexts`] bank layout (slots 42 / 43
+/// [`crate::engine::residual::ResidualContexts`] bank layout (slots 42 / 43
 /// are the transform-skip contexts).
 ///
 /// # Panics
@@ -453,7 +453,7 @@ pub struct SliceContexts {
     /// struct. [`Self::init`] leaves it empty; the slice driver
     /// assigns the PPS / SPS initializer-derived predictor at every
     /// §9.3.2.2 re-initialization point.
-    pub palette_predictor: crate::hevc::engine::palette::PalettePredictor,
+    pub palette_predictor: crate::engine::palette::PalettePredictor,
 }
 
 impl SliceContexts {
@@ -599,7 +599,7 @@ impl SliceContexts {
                 init_type,
                 slice_qp_y,
             ),
-            palette_predictor: crate::hevc::engine::palette::PalettePredictor::default(),
+            palette_predictor: crate::engine::palette::PalettePredictor::default(),
         }
     }
 

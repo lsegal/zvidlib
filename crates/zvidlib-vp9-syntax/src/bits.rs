@@ -6,17 +6,17 @@ use super::malformed;
 use crate::Result;
 
 /// A most-significant-bit-first reader over the uncompressed header.
-pub(super) struct BitReader<'a> {
+pub struct BitReader<'a> {
     data: &'a [u8],
     position: usize,
 }
 
 impl<'a> BitReader<'a> {
-    pub(super) fn new(data: &'a [u8]) -> Self {
+    pub fn new(data: &'a [u8]) -> Self {
         Self { data, position: 0 }
     }
 
-    pub(super) fn bit(&mut self) -> Result<bool> {
+    pub fn bit(&mut self) -> Result<bool> {
         let byte = self
             .data
             .get(self.position >> 3)
@@ -26,7 +26,7 @@ impl<'a> BitReader<'a> {
         Ok(bit == 1)
     }
 
-    pub(super) fn literal(&mut self, bits: u32) -> Result<u32> {
+    pub fn literal(&mut self, bits: u32) -> Result<u32> {
         let mut value = 0;
         for _ in 0..bits {
             value = (value << 1) | u32::from(self.bit()?);
@@ -35,13 +35,13 @@ impl<'a> BitReader<'a> {
     }
 
     /// `su(n)`: a magnitude followed by a sign bit.
-    pub(super) fn signed_literal(&mut self, bits: u32) -> Result<i32> {
+    pub fn signed_literal(&mut self, bits: u32) -> Result<i32> {
         let value = self.literal(bits)? as i32;
         Ok(if self.bit()? { -value } else { value })
     }
 
     /// The header's length in whole bytes (`trailing_bits` pad it to a byte).
-    pub(super) fn bytes_read(&self) -> usize {
+    pub fn bytes_read(&self) -> usize {
         self.position.div_ceil(8)
     }
 }
@@ -50,7 +50,7 @@ impl<'a> BitReader<'a> {
 /// `vpx_reader`, including its 64-bit window and its end-of-buffer
 /// handling: reading past the end yields zero bits, which is what lets
 /// [`BoolDecoder::find_end`] report where a frame's data stopped.
-pub(super) struct BoolDecoder<'a> {
+pub struct BoolDecoder<'a> {
     data: &'a [u8],
     position: usize,
     value: u64,
@@ -62,7 +62,7 @@ const BD_VALUE_SIZE: i32 = 64;
 const LOTS_OF_BITS: i32 = 0x4000_0000;
 
 impl<'a> BoolDecoder<'a> {
-    pub(super) fn new(data: &'a [u8]) -> Result<Self> {
+    pub fn new(data: &'a [u8]) -> Result<Self> {
         if data.is_empty() {
             return Err(malformed("VP9 bool-coded partition is empty"));
         }
@@ -113,7 +113,7 @@ impl<'a> BoolDecoder<'a> {
     }
 
     #[inline]
-    pub(super) fn read(&mut self, probability: u8) -> bool {
+    pub fn read(&mut self, probability: u8) -> bool {
         let split = (self.range * u32::from(probability) + (256 - u32::from(probability))) >> 8;
         if self.count < 0 {
             self.fill();
@@ -133,11 +133,11 @@ impl<'a> BoolDecoder<'a> {
     }
 
     #[inline]
-    pub(super) fn bit(&mut self) -> bool {
+    pub fn bit(&mut self) -> bool {
         self.read(128)
     }
 
-    pub(super) fn literal(&mut self, bits: u32) -> u32 {
+    pub fn literal(&mut self, bits: u32) -> u32 {
         let mut value = 0;
         for _ in 0..bits {
             value = (value << 1) | u32::from(self.bit());
@@ -149,7 +149,7 @@ impl<'a> BoolDecoder<'a> {
     /// entries, where a non-positive entry is a leaf holding the negated
     /// symbol and a positive one indexes the next node.
     #[inline]
-    pub(super) fn tree(&mut self, tree: &[i8], probabilities: &[u8]) -> u8 {
+    pub fn tree(&mut self, tree: &[i8], probabilities: &[u8]) -> u8 {
         let mut index = 0i8;
         loop {
             let node = index as usize;
@@ -162,13 +162,13 @@ impl<'a> BoolDecoder<'a> {
 
     /// Whether more bits were read than the partition holds (libvpx's
     /// `vpx_reader_has_error`).
-    pub(super) fn has_error(&self) -> bool {
+    pub fn has_error(&self) -> bool {
         self.count > BD_VALUE_SIZE && self.count < LOTS_OF_BITS
     }
 
     /// The offset just past the last byte the decoder consumed (libvpx's
     /// `vpx_reader_find_end`).
-    pub(super) fn find_end(&self) -> usize {
+    pub fn find_end(&self) -> usize {
         let mut count = self.count;
         let mut position = self.position;
         while count > 8 && count < BD_VALUE_SIZE {

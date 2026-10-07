@@ -156,17 +156,17 @@ pub fn report() -> Report {
 /// compiled in — the `unsafe` FFI modules are all `cfg`-gated — has nothing
 /// that constructs one.
 #[allow(dead_code)]
-pub(crate) struct Timer(Instant);
+pub struct Timer(Instant);
 
 #[allow(dead_code)]
 impl Timer {
     /// Starts measuring.
-    pub(crate) fn start() -> Self {
+    pub fn start() -> Self {
         Timer(Instant::now())
     }
 
     /// Charges everything since [`Timer::start`] to `phase`.
-    pub(crate) fn record(self, phase: Phase) {
+    pub fn record(self, phase: Phase) {
         let nanos = u64::try_from(self.0.elapsed().as_nanos()).unwrap_or(u64::MAX);
         phase.counter().fetch_add(nanos, Ordering::Relaxed);
     }
@@ -178,7 +178,7 @@ impl Timer {
 /// runs exactly once per delivered frame; see [`Timer`] for the `dead_code`
 /// allowance.
 #[allow(dead_code)]
-pub(crate) fn count_frame() {
+pub fn count_frame() {
     FRAMES.fetch_add(1, Ordering::Relaxed);
 }
 

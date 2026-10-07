@@ -52,10 +52,7 @@ const AAC_PROFILE_L2: u32 = 0x29;
 /// this with an impulse through a full mux and demux.
 const PRIMING_FRAMES: u32 = 0;
 
-pub(super) fn capability(
-    configuration: &AudioEncoderConfig,
-    bit_rate: Option<u32>,
-) -> CodecSupport {
+pub fn capability(configuration: &AudioEncoderConfig, bit_rate: Option<u32>) -> CodecSupport {
     match open_transform(configuration, bit_rate) {
         Ok(_) => CodecSupport::Supported {
             implementation: CodecImplementation::Hardware,
@@ -64,7 +61,7 @@ pub(super) fn capability(
     }
 }
 
-pub(super) fn create(
+pub fn create(
     configuration: &AudioEncoderConfig,
     bit_rate: Option<u32>,
     limits: &Limits,
@@ -103,7 +100,7 @@ pub(super) fn create(
 /// are deliberately never torn down: an encoder is `Send` and may be dropped
 /// on any thread, which rules out pairing them with per-thread uninitialize
 /// calls, and Media Foundation's startup is reference-counted process state.
-pub(crate) fn ensure_media_foundation() -> Result<()> {
+pub fn ensure_media_foundation() -> Result<()> {
     static STARTED: OnceLock<std::result::Result<(), String>> = OnceLock::new();
     STARTED
         .get_or_init(|| unsafe {
@@ -249,7 +246,7 @@ fn nearest_bytes_per_second(bit_rate: Option<u32>) -> u32 {
         .unwrap_or(DEFAULT_BYTES_PER_SECOND)
 }
 
-pub(super) struct AacEncoder {
+pub struct AacEncoder {
     transform: IMFTransform,
     config: EncoderConfig,
     format: AudioEncoderFormat,
@@ -461,7 +458,7 @@ impl AudioEncoder for AacEncoder {
     }
 }
 
-pub(crate) fn windows_error(context: &str, error: windows::core::Error) -> Error {
+pub fn windows_error(context: &str, error: windows::core::Error) -> Error {
     Error::new(ErrorKind::Codec, format!("{context}: {error}"))
 }
 

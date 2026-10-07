@@ -15,10 +15,10 @@
 // baseline instruction set (#341).
 #![allow(clippy::needless_range_loop)]
 
-use crate::av1_simd::vector::I32x;
 use crate::vp9_dec::recon::{
     D45_PRED, D63_PRED, D117_PRED, D135_PRED, D207_PRED, DC_PRED, H_PRED, TM_PRED, V_PRED,
 };
+use zvidlib_core::simd::vector::I32x;
 
 /// Large enough for a 64-entry run, rounded up to whole vectors, plus the
 /// two taps an average reads past its last position.

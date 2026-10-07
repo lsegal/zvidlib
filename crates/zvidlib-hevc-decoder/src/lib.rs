@@ -4,15 +4,7 @@
 //! fallback when WebCodecs cannot decode a track (issue #504); the platform backends and the
 //! encoder's public factory stay native-only.
 
-// Annex B and length-prefixed reframing for the platform encoders: Media Foundation on Windows
-// and VideoToolbox on macOS.
-#[cfg(any(windows, target_os = "macos", all(test, not(target_arch = "wasm32"))))]
-mod annexb;
 // internal — exposed for the criterion benchmark suite; not part of the stable API
-#[cfg(not(target_arch = "wasm32"))]
-#[doc(hidden)]
-pub mod bench;
-pub(crate) mod color_convert;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod decode_bench;
 // internal — exposed for the stage-attribution example; not part of the stable API
@@ -23,27 +15,28 @@ pub use engine::inter_pred::narrow_interp;
 #[cfg(not(target_arch = "wasm32"))]
 #[doc(hidden)]
 pub use engine::profile as decode_profile;
-#[cfg(not(target_arch = "wasm32"))]
-mod encoder;
-pub(crate) mod engine;
-#[cfg(all(any(windows, target_os = "linux"), target_pointer_width = "64"))]
-pub(crate) mod nvdec;
-#[cfg(any(windows, all(target_os = "linux", target_pointer_width = "64")))]
-pub(crate) mod planar;
-// internal — exposed for the hardware benchmark suite; not part of the stable API
-#[cfg(not(target_arch = "wasm32"))]
+// internal — the HEVC engine, shared with the encoder crate; not part of the stable API
 #[doc(hidden)]
-pub mod readback;
+pub mod engine;
+
+#[allow(unused_imports)]
+use zvidlib_color::color_convert;
+#[allow(unused_imports)]
+use zvidlib_core::*;
+// The platform backends the factory selects between.
+#[cfg(all(any(windows, target_os = "linux"), target_pointer_width = "64"))]
+use zvidlib_hardware::nvdec;
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(unused_imports)]
+use zvidlib_hardware::readback;
 #[cfg(target_os = "macos")]
-mod videotoolbox;
-#[cfg(target_os = "macos")]
-pub(crate) mod videotoolbox_encoder;
-#[cfg(target_os = "macos")]
-pub(crate) mod videotoolbox_vp9;
+use zvidlib_hardware::videotoolbox;
 #[cfg(windows)]
-pub(crate) mod windows_mf;
-#[cfg(windows)]
-pub(crate) mod windows_mf_encoder;
+use zvidlib_hardware::windows_mf;
+// The containers and conformance harness the tests read their fixtures with.
+#[cfg(test)]
+#[allow(unused_imports)]
+use zvidlib_container::*;
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -55,8 +48,6 @@ use crate::{
     Limits, PixelFormat, Plane, Result, VideoDecoder, VideoDecoderConfig, VideoDecoderFactory,
     VideoFrame,
 };
-#[cfg(not(target_arch = "wasm32"))]
-pub use encoder::native_hevc_video_encoder_factory;
 use engine::hvcc::{HvccRecord, parse_hvcc, split_length_prefixed};
 use engine::picture::{Picture, Plane as HevcPlane, sub_wh_c};
 use engine::sequence::{DecodedFrame, SequenceDecoder, SequenceError};
@@ -129,6 +120,12 @@ impl VideoDecoderFactory for HevcDecoderFactory {
             CodecSupport::HardwareUnavailable => unreachable!("hardware is not checked here"),
             CodecSupport::InvalidConfiguration { reason } => {
                 return Err(Error::new(ErrorKind::InvalidInput, reason));
+            }
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::Unsupported,
+                    "native HEVC decoder does not support this configuration",
+                ));
             }
         }
         let parsed = ParsedConfiguration::parse(configuration, limits)?;

@@ -21,13 +21,13 @@
 //! inside [`SliceContexts`] so the existing storage / synchronization
 //! clones carry it.
 
-use crate::hevc::engine::binarization::{
+use crate::engine::binarization::{
     CuChromaQpOffset, CuQpDelta, decode_cu_chroma_qp_offset, decode_cu_qp_delta, decode_eg_k,
     palette_run_prefix_ctx_inc, palette_run_prefix_tr_cmax, read_truncated_rice_prefix,
 };
-use crate::hevc::engine::cabac::{CabacEngine, CabacError};
-use crate::hevc::engine::ctx_init::SliceContexts;
-use crate::hevc::engine::scan::traverse;
+use crate::engine::cabac::{CabacEngine, CabacError};
+use crate::engine::ctx_init::SliceContexts;
+use crate::engine::scan::traverse;
 
 /// The rolling predictor palette (§9.3.2.3 / eq. 8-79):
 /// `PredictorPaletteSize` and `PredictorPaletteEntries[comp][i]`.
@@ -225,7 +225,7 @@ fn decode_palette_escape_val(
 ///
 /// `is_cu_qp_delta_coded` / `is_cu_chroma_qp_offset_coded` mirror the
 /// §7.3.8.14 / §7.3.8.15 quantization-group gates (the caller's
-/// [`crate::hevc::engine::transform_unit::QuantGroupState`]).
+/// [`crate::engine::transform_unit::QuantGroupState`]).
 ///
 /// # Errors
 /// [`PaletteError`] on CABAC exhaustion or a §7.4.9.6 bound violation.
@@ -234,7 +234,7 @@ pub fn decode_palette_coding(
     engine: &mut CabacEngine<'_>,
     ctx: &mut SliceContexts,
     params: &PaletteParams,
-    qg: &mut crate::hevc::engine::transform_unit::QuantGroupState,
+    qg: &mut crate::engine::transform_unit::QuantGroupState,
     n_cbs: usize,
 ) -> Result<PaletteCu, PaletteError> {
     let num_comps = if params.chroma_array_type == 0 { 1 } else { 3 };
@@ -652,10 +652,10 @@ pub fn reconstruct_palette_component<F: FnMut(usize, usize, i32)>(
 #[cfg(any())]
 mod tests {
     use super::*;
-    use crate::hevc::engine::cabac::init_type;
-    use crate::hevc::engine::encoder::bitwriter::BitWriter;
-    use crate::hevc::engine::encoder::cabac::CabacEncoder;
-    use crate::hevc::engine::transform_unit::QuantGroupState;
+    use crate::engine::cabac::init_type;
+    use crate::engine::encoder::bitwriter::BitWriter;
+    use crate::engine::encoder::cabac::CabacEncoder;
+    use crate::engine::transform_unit::QuantGroupState;
 
     fn params(bypass: bool) -> PaletteParams {
         PaletteParams {
@@ -803,8 +803,8 @@ mod tests {
 
         // ---- decode ----
         let mut dctx = SliceContexts::init(init_type(2, false), 26);
-        let mut engine = CabacEngine::new(crate::hevc::engine::bitreader::BitReader::new(&bytes))
-            .expect("engine");
+        let mut engine =
+            CabacEngine::new(crate::engine::bitreader::BitReader::new(&bytes)).expect("engine");
         let mut qg = QuantGroupState::default();
         let cu = decode_palette_coding(&mut engine, &mut dctx, &params(true), &mut qg, n)
             .expect("palette parse");
@@ -902,8 +902,8 @@ mod tests {
 
         let mut dctx = SliceContexts::init(init_type(2, false), 26);
         dctx.palette_predictor = seed;
-        let mut engine = CabacEngine::new(crate::hevc::engine::bitreader::BitReader::new(&bytes))
-            .expect("engine");
+        let mut engine =
+            CabacEngine::new(crate::engine::bitreader::BitReader::new(&bytes)).expect("engine");
         let mut qg = QuantGroupState::default();
         let cu = decode_palette_coding(&mut engine, &mut dctx, &params(true), &mut qg, n)
             .expect("palette parse");
@@ -926,9 +926,8 @@ mod tests {
                 encode_tb(&mut cabac, &mut w, v, c_max);
                 cabac.encode_terminate(&mut w, 1);
                 let bytes = w.finish();
-                let mut engine =
-                    CabacEngine::new(crate::hevc::engine::bitreader::BitReader::new(&bytes))
-                        .expect("engine");
+                let mut engine = CabacEngine::new(crate::engine::bitreader::BitReader::new(&bytes))
+                    .expect("engine");
                 assert_eq!(
                     decode_tb(&mut engine, c_max).expect("tb"),
                     v,

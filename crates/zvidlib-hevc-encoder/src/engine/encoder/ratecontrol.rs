@@ -1,6 +1,6 @@
 //! Per-picture rate control for the lossy HEVC writer.
 //!
-//! [`crate::hevc::engine::encoder::lossy`] codes a picture at whatever
+//! [`crate::engine::encoder::lossy`] codes a picture at whatever
 //! `SliceQpY` it is handed; deciding that QP against a bitrate is this
 //! module's job. The writer is intra-only and every access unit is an IDR, so
 //! there is no frame-type hierarchy to distribute a budget across and no

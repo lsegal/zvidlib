@@ -10,7 +10,7 @@
 //! Callers check that both slices hold a whole 16x16 block at their stride.
 
 #[cfg(target_arch = "x86_64")]
-pub(super) mod x86 {
+pub mod x86 {
     use core::arch::x86_64::*;
 
     /// # Safety
@@ -18,7 +18,7 @@ pub(super) mod x86 {
     /// SSE4.1 must be available, and each slice must hold `15 * stride + 16`
     /// bytes.
     #[target_feature(enable = "sse4.1")]
-    pub(in crate::vp8::simd) unsafe fn sad16_sse41(
+    pub(in crate::simd) unsafe fn sad16_sse41(
         source: &[u8],
         source_stride: usize,
         prediction: &[u8],
@@ -43,7 +43,7 @@ pub(super) mod x86 {
     /// AVX2 must be available, and each slice must hold `15 * stride + 16`
     /// bytes.
     #[target_feature(enable = "avx2")]
-    pub(in crate::vp8::simd) unsafe fn sad16_avx2(
+    pub(in crate::simd) unsafe fn sad16_avx2(
         source: &[u8],
         source_stride: usize,
         prediction: &[u8],
@@ -71,7 +71,7 @@ pub(super) mod x86 {
 }
 
 #[cfg(target_arch = "aarch64")]
-pub(super) mod arm {
+pub mod arm {
     use core::arch::aarch64::*;
 
     /// # Safety
@@ -79,7 +79,7 @@ pub(super) mod arm {
     /// NEON must be available, and each slice must hold `15 * stride + 16`
     /// bytes.
     #[target_feature(enable = "neon")]
-    pub(in crate::vp8::simd) unsafe fn sad16_neon(
+    pub(in crate::simd) unsafe fn sad16_neon(
         source: &[u8],
         source_stride: usize,
         prediction: &[u8],

@@ -1,7 +1,7 @@
 //! §9.3.4.2 per-syntax-element binarization + context-index derivation.
 //!
 //! Sits one layer above the §9.3 arithmetic decoding engine
-//! ([`crate::hevc::engine::cabac::CabacEngine`]). For each entropy-coded syntax
+//! ([`crate::cabac::CabacEngine`]). For each entropy-coded syntax
 //! element this module supplies the §9.3.3 binarization shape (truncated
 //! rice, fixed length, Exp-Golomb of order *k*, …) plus the §9.3.4.2.X
 //! per-bin `ctxInc` derivation, returning a context-index into the
@@ -458,7 +458,7 @@
 //! [`intra_pred_mode_c_chroma_422`] (Table 8-3), and
 //! [`derive_intra_pred_mode_c`] (the full §8.4.3 output).
 
-use crate::hevc::engine::cabac::{CabacEngine, CabacError, ContextModel};
+use crate::cabac::{CabacEngine, CabacError, ContextModel};
 
 // ---------------------------------------------------------------------
 // Truncated-rice helper — §9.3.3.10
@@ -478,10 +478,8 @@ use crate::hevc::engine::cabac::{CabacEngine, CabacError, ContextModel};
 /// Returns `(prefix_val, is_escape)`. `is_escape` is `true` exactly
 /// when `prefix_val == cMax`: i.e. all `cMax` bins were 1, signalling
 /// that a TR + EGk continuation suffix must be read by the caller.
-pub(crate) fn read_truncated_rice_prefix<F>(
-    c_max: u32,
-    mut read_bin: F,
-) -> Result<(u32, bool), CabacError>
+#[doc(hidden)]
+pub fn read_truncated_rice_prefix<F>(c_max: u32, mut read_bin: F) -> Result<(u32, bool), CabacError>
 where
     F: FnMut(u32) -> Result<u8, CabacError>,
 {
@@ -523,7 +521,8 @@ where
 /// against runaway encodings; the cap is comfortably above any legal
 /// HEVC bypass-coded suffix value (§7.4.9.11 puts the practical
 /// ceiling well below `2^31`).
-pub(crate) fn decode_eg_k(engine: &mut CabacEngine<'_>, k: u32) -> Result<u32, CabacError> {
+#[doc(hidden)]
+pub fn decode_eg_k(engine: &mut CabacEngine<'_>, k: u32) -> Result<u32, CabacError> {
     read_eg_k_with(k, || engine.decode_bypass())
 }
 
@@ -4429,7 +4428,7 @@ pub fn decode_mvd_pair(
 #[cfg(any())]
 mod tests {
     use super::*;
-    use crate::hevc::engine::bitreader::BitReader;
+    use crate::bitreader::BitReader;
 
     // -------------------------------------------------------------
     // ctxInc derivation — pure-function tables

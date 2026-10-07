@@ -226,7 +226,7 @@ pub(super) fn inverse_transform_add(
     pixels: &mut [u8],
     stride: usize,
 ) {
-    crate::vp9_dec::recon::inverse_transform_add(
+    zvidlib_vp9_decoder::vp9_dec::recon::inverse_transform_add(
         coefficients,
         pixels,
         stride,
@@ -383,7 +383,7 @@ pub(super) fn predict_inter(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vp9_dec::idct1d;
+    use zvidlib_vp9_decoder::vp9_dec::idct1d;
 
     const TX_TYPES: [TxType; 4] = [
         TxType::DctDct,

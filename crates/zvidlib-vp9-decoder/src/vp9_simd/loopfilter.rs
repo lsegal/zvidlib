@@ -16,8 +16,8 @@
 // baseline instruction set (#341).
 #![allow(clippy::needless_range_loop)]
 
-use crate::av1_simd::vector::I32x;
 pub(crate) use crate::vp9_dec::loopfilter::Thresholds;
+use zvidlib_core::simd::vector::I32x;
 
 /// Which filter an edge takes: `lpf4`, `lpf8` or `lpf16`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

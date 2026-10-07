@@ -22,14 +22,26 @@
 //! and converted by [`picture_to_rgba`] with the colour space and range the
 //! header names, exactly as a software picture is.
 
+#[doc(hidden)]
+pub mod vp9_dec;
+#[doc(hidden)]
+pub mod vp9_simd;
+
 use crate::vp9_dec::{DecodedPicture, Decoder};
 use crate::{
-    CancellationToken, Codec, CodecImplementation, CodecProfile, CodecSupport, ColorRange,
-    DecodedVideoFrame, EncodedVideoSample, Error, ErrorKind, FilterFrame, FilterPlane,
-    HardwarePreference, Limits, MatrixCoefficients, PixelFormat, Result, VideoDecoder,
-    VideoDecoderConfig, VideoDecoderFactory, VideoDimensions, VideoFrame, Vp9CodecConfig,
-    convert_to_rgba8,
+    CancellationToken, Codec, CodecImplementation, CodecProfile, CodecSupport, DecodedVideoFrame,
+    EncodedVideoSample, Error, ErrorKind, HardwarePreference, Limits, PixelFormat, Result,
+    VideoDecoder, VideoDecoderConfig, VideoDecoderFactory, Vp9CodecConfig,
 };
+#[allow(unused_imports)]
+use zvidlib_color::*;
+#[allow(unused_imports)]
+use zvidlib_core::*;
+pub(crate) use zvidlib_vp9_syntax::picture_to_rgba;
+// The containers the tests read their fixtures from.
+#[cfg(test)]
+#[allow(unused_imports)]
+use zvidlib_container::*;
 
 /// Returns the native VP9 profile 0 (8-bit 4:2:0) decoder backend.
 ///
@@ -94,6 +106,12 @@ impl VideoDecoderFactory for Vp9DecoderFactory {
             CodecSupport::InvalidConfiguration { reason } => {
                 return Err(Error::new(ErrorKind::InvalidInput, reason));
             }
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::Unsupported,
+                    "native VP9 decoder does not support this configuration",
+                ));
+            }
         }
         parse_configuration(configuration, limits)?;
         if configuration.hardware != HardwarePreference::Avoid {
@@ -139,15 +157,15 @@ impl Vp9DecoderFactory {
 
 fn hardware_available(_configuration: &VideoDecoderConfig) -> bool {
     #[cfg(all(any(windows, target_os = "linux"), target_pointer_width = "64"))]
-    if crate::hevc::nvdec::is_vp9_available(_configuration.coded_dimensions) {
+    if zvidlib_hardware::nvdec::is_vp9_available(_configuration.coded_dimensions) {
         return true;
     }
     #[cfg(windows)]
-    if crate::hevc::windows_mf::is_vp9_available(_configuration.coded_dimensions) {
+    if zvidlib_hardware::windows_mf::is_vp9_available(_configuration.coded_dimensions) {
         return true;
     }
     #[cfg(target_os = "macos")]
-    if crate::hevc::videotoolbox_vp9::is_vp9_available(_configuration.coded_dimensions) {
+    if zvidlib_hardware::videotoolbox_vp9::is_vp9_available(_configuration.coded_dimensions) {
         return true;
     }
     false
@@ -169,21 +187,48 @@ fn create_hardware(
     )]
     let mut errors = Vec::new();
     #[cfg(all(any(windows, target_os = "linux"), target_pointer_width = "64"))]
-    match crate::hevc::nvdec::create_vp9(_configuration, _limits) {
+    match zvidlib_hardware::nvdec::create_vp9(_configuration, _limits) {
         Ok(decoder) => return Ok(decoder),
         Err(error) => errors.push(format!("NVDEC: {}", error.message())),
     }
     #[cfg(windows)]
-    match crate::hevc::windows_mf::create_vp9(_configuration, _limits) {
+    match zvidlib_hardware::windows_mf::create_vp9(_configuration, _limits) {
         Ok(decoder) => return Ok(decoder),
         Err(error) => errors.push(format!("Media Foundation: {}", error.message())),
     }
     #[cfg(target_os = "macos")]
-    match crate::hevc::videotoolbox_vp9::create_vp9(_configuration, _limits) {
+    match create_videotoolbox(_configuration, _limits) {
         Ok(decoder) => return Ok(decoder),
         Err(error) => errors.push(format!("VideoToolbox: {}", error.message())),
     }
     Err(errors)
+}
+
+/// VideoToolbox, which shows a hidden frame again by replaying it through the
+/// software decoder.
+#[cfg(target_os = "macos")]
+fn create_videotoolbox(
+    configuration: &VideoDecoderConfig,
+    limits: &Limits,
+) -> Result<Box<dyn VideoDecoder>> {
+    zvidlib_hardware::videotoolbox_vp9::create_vp9(configuration, limits, replay)
+}
+
+/// Decodes `history` and then `chunk`, returning the picture `chunk` outputs.
+#[cfg(target_os = "macos")]
+fn replay(limits: &Limits, history: &[Vec<u8>], chunk: &[u8]) -> Result<DecodedPicture> {
+    let mut decoder = Decoder::new(*limits);
+    decoder.set_output_wanted(false);
+    for earlier in history {
+        decoder.decode_chunk(earlier)?;
+    }
+    decoder.set_output_wanted(true);
+    decoder.decode_chunk(chunk)?.ok_or_else(|| {
+        Error::new(
+            ErrorKind::Codec,
+            "the VP9 frame shown again was not decoded",
+        )
+    })
 }
 
 fn invalid_configuration(reason: impl Into<String>) -> CodecSupport {
@@ -258,58 +303,6 @@ impl VideoDecoder for Vp9Decoder {
         // skipped.
         self.inner.set_output_wanted(wanted);
     }
-}
-
-/// The conversion matrix for a VP9 `color_space`: `CS_BT_709` (2) and
-/// `CS_BT_2020` (5) have their own, and everything else, including
-/// `CS_UNKNOWN`, `CS_BT_601` and `CS_SMPTE_170`, uses BT.601.
-fn matrix_for(color_space: u8) -> MatrixCoefficients {
-    match color_space {
-        2 => MatrixCoefficients::Bt709,
-        5 => MatrixCoefficients::Bt2020Ncl,
-        _ => MatrixCoefficients::Bt601,
-    }
-}
-
-pub(crate) fn picture_to_rgba(picture: &DecodedPicture, limits: &Limits) -> Result<VideoFrame> {
-    let width = picture.width;
-    let height = picture.height;
-    let dimensions = VideoDimensions::new(width as u32, height as u32, limits)?;
-    let plane = |index: usize, plane_width: usize, plane_height: usize| {
-        FilterPlane::from_samples(
-            plane_width,
-            plane_height,
-            picture.planes[index].clone(),
-            limits,
-        )
-        .map_err(|error| malformed(format!("invalid VP9 decoded plane: {error}")))
-    };
-    let chroma_width = width.div_ceil(2);
-    let chroma_height = height.div_ceil(2);
-    let frame = FilterFrame::new_yuv(
-        plane(0, width, height)?,
-        plane(1, chroma_width, chroma_height)?,
-        plane(2, chroma_width, chroma_height)?,
-        true,
-        true,
-    )
-    .map_err(|error| malformed(format!("invalid VP9 decoded plane layout: {error}")))?;
-    let color_range = if picture.full_range {
-        ColorRange::Full
-    } else {
-        ColorRange::Limited
-    };
-    let rgba = convert_to_rgba8(&frame, color_range, matrix_for(picture.color_space), limits)?;
-    let stride = width
-        .checked_mul(4)
-        .ok_or_else(|| limit("VP9 RGBA stride overflows"))?;
-    VideoFrame::new(
-        dimensions,
-        PixelFormat::Rgba8,
-        color_range,
-        vec![crate::Plane { data: rgba, stride }],
-        limits,
-    )
 }
 
 fn malformed(message: impl Into<String>) -> Error {
@@ -512,11 +505,11 @@ mod tests {
 
         let backends: [(&str, Create); _] = [
             #[cfg(all(any(windows, target_os = "linux"), target_pointer_width = "64"))]
-            ("NVDEC", crate::hevc::nvdec::create_vp9),
+            ("NVDEC", zvidlib_hardware::nvdec::create_vp9),
             #[cfg(windows)]
-            ("Media Foundation", crate::hevc::windows_mf::create_vp9),
+            ("Media Foundation", zvidlib_hardware::windows_mf::create_vp9),
             #[cfg(target_os = "macos")]
-            ("VideoToolbox", crate::hevc::videotoolbox_vp9::create_vp9),
+            ("VideoToolbox", create_videotoolbox),
         ];
 
         let limits = Limits::default();

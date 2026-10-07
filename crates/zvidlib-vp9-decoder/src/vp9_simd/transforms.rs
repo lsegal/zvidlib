@@ -17,8 +17,8 @@
 
 use super::idct1d::{iadst4, iadst8, iadst16, idct4, idct8, idct16, idct32};
 use super::wide::W;
-use crate::av1_simd::vector::{I32x, Transpose4};
 use crate::vp9_dec::recon::{ADST_DCT, DCT_ADST, DCT_DCT};
+use zvidlib_core::simd::vector::{I32x, Transpose4};
 
 /// The largest input magnitude for which no intermediate value of
 /// `iadst4` leaves `i32`, so 32-bit lanes reproduce the scalar `i64`

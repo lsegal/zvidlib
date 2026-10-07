@@ -6,11 +6,11 @@
 //! inter prediction of the current and future pictures. Each
 //! [`DpbEntry`] carries:
 //!
-//! * the reconstructed [`crate::hevc::engine::picture::Picture`] samples
+//! * the reconstructed [`crate::engine::picture::Picture`] samples
 //!   (`refPicLXL` / `refPicLXCb` / `refPicLXCr` of §8.5.3.3.2),
 //! * its `PicOrderCntVal` (the §8.3.1 identity used to address it),
 //! * its short/long-term reference [`Marking`],
-//! * its per-PU [`crate::hevc::engine::motion::MotionField`] (the `MvLXCol` /
+//! * its per-PU [`crate::engine::motion::MotionField`] (the `MvLXCol` /
 //!   `PredFlagLXCol` / `RefIdxLXCol`-equivalent arrays the §8.5.3.2.9
 //!   collocated-MV derivation reads).
 //!
@@ -22,10 +22,10 @@
 //! `RefPicList1`, and [`select_col_pic`] (§8.3.5) to pick the collocated
 //! picture for temporal MV prediction.
 
-use crate::hevc::engine::motion::MotionField;
-use crate::hevc::engine::picture::Picture;
-use crate::hevc::engine::poc::diff_pic_order_cnt;
-use crate::hevc::engine::sps::MaterializedShortTermRefPicSet;
+use crate::engine::motion::MotionField;
+use crate::engine::picture::Picture;
+use crate::engine::poc::diff_pic_order_cnt;
+use crate::engine::sps::MaterializedShortTermRefPicSet;
 
 /// A decoded picture's reference marking (§8.3.2). Exactly one of these
 /// applies at any moment.
@@ -543,7 +543,7 @@ fn apply_list_modification(
 #[cfg(any())]
 mod tests {
     use super::*;
-    use crate::hevc::engine::picture::Picture;
+    use crate::engine::picture::Picture;
 
     fn entry(poc: i32, marking: Marking) -> DpbEntry {
         DpbEntry {

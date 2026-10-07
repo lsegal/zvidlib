@@ -42,7 +42,8 @@ mod encoder;
 mod frame_encoder;
 mod loop_filter;
 mod predict;
-pub(crate) mod simd;
+#[doc(hidden)]
+pub mod simd;
 mod tables;
 #[cfg(test)]
 mod tests;
@@ -50,6 +51,15 @@ mod tests;
 pub use encoder::native_vp8_video_encoder_factory;
 
 use decoder::{Decoder, Picture};
+
+#[allow(unused_imports)]
+use zvidlib_color::*;
+#[allow(unused_imports)]
+use zvidlib_core::*;
+// The containers and conformance harness the tests read their fixtures with.
+#[cfg(test)]
+#[allow(unused_imports)]
+use zvidlib_container::*;
 
 use crate::{
     CancellationToken, Codec, CodecImplementation, CodecProfile, CodecSupport, ColorRange,
@@ -118,6 +128,12 @@ impl VideoDecoderFactory for Vp8DecoderFactory {
             CodecSupport::InvalidConfiguration { reason } => {
                 return Err(Error::new(ErrorKind::InvalidInput, reason));
             }
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::Unsupported,
+                    "native VP8 decoder does not support this configuration",
+                ));
+            }
         }
         if configuration.hardware != HardwarePreference::Avoid {
             #[cfg_attr(
@@ -126,12 +142,12 @@ impl VideoDecoderFactory for Vp8DecoderFactory {
             )]
             let mut hardware_errors = Vec::<String>::new();
             #[cfg(all(any(windows, target_os = "linux"), target_pointer_width = "64"))]
-            match crate::hevc::nvdec::create_vp8(configuration, limits, planes_to_rgba) {
+            match zvidlib_hardware::nvdec::create_vp8(configuration, limits, planes_to_rgba) {
                 Ok(decoder) => return Ok(decoder),
                 Err(error) => hardware_errors.push(format!("NVDEC: {}", error.message())),
             }
             #[cfg(windows)]
-            match crate::hevc::windows_mf::create_vp8(configuration, limits, planes_to_rgba) {
+            match zvidlib_hardware::windows_mf::create_vp8(configuration, limits, planes_to_rgba) {
                 Ok(decoder) => return Ok(decoder),
                 Err(error) => {
                     hardware_errors.push(format!("Media Foundation: {}", error.message()));
@@ -178,11 +194,11 @@ impl Vp8DecoderFactory {
 
 fn hardware_available(_configuration: &VideoDecoderConfig) -> bool {
     #[cfg(all(any(windows, target_os = "linux"), target_pointer_width = "64"))]
-    if crate::hevc::nvdec::is_vp8_available(_configuration.coded_dimensions) {
+    if zvidlib_hardware::nvdec::is_vp8_available(_configuration.coded_dimensions) {
         return true;
     }
     #[cfg(windows)]
-    if crate::hevc::windows_mf::is_vp8_available(_configuration.coded_dimensions) {
+    if zvidlib_hardware::windows_mf::is_vp8_available(_configuration.coded_dimensions) {
         return true;
     }
     false

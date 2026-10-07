@@ -28,7 +28,7 @@
 //! the individual payload parser when it reads a non-byte-aligned body;
 //! the framing layer only needs the byte count.
 
-use crate::hevc::engine::bitreader::{BitReader, BitReaderError};
+use crate::bitreader::{BitReader, BitReaderError};
 
 /// The SEI NAL-unit type, which selects the §D.2 payload dispatch
 /// branch. Per §7.4.2.2 (Table 7-1), `nal_unit_type == 39` is

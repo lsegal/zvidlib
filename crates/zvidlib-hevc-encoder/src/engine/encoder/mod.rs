@@ -1,10 +1,14 @@
 //! Dependency-free HEVC write-side primitives.
 
-pub mod bitwriter;
-pub mod cabac;
-pub mod colorconv;
+// The lints the decoder's engine module sets for the whole vendored engine,
+// which this half of it no longer sits under.
+#![warn(missing_debug_implementations)]
+#![allow(dead_code, unused_imports)]
+
+pub use zvidlib_color::colorconv;
+pub use zvidlib_hevc_syntax::encoder::{bitwriter, cabac, nal};
+
 pub mod lossy;
-pub mod nal;
 pub mod pcm;
 pub mod quant_simd;
 pub mod ratecontrol;

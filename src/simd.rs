@@ -43,9 +43,9 @@
 //! assert_eq!(simd::active(), simd::detected());
 //! ```
 
-pub use zvidlib_core::simd::{SimdIsa, active, available, detected, set_override};
 #[cfg(test)]
 use zvidlib_core::simd::test_lock;
+pub use zvidlib_core::simd::{SimdIsa, active, available, detected, set_override};
 
 /// The instruction set every individual dispatch site resolves to right now,
 /// paired with a stable name for that site.
@@ -89,13 +89,19 @@ pub fn active_by_site() -> Vec<(&'static str, SimdIsa)> {
     #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
     let mut sites = vec![
         ("av1_simd", zvidlib_av1::av1_simd::active_isa()),
-        ("av1_mc", from_mc_level(zvidlib_av1::av1_mc::default_level())),
+        (
+            "av1_mc",
+            from_mc_level(zvidlib_av1::av1_mc::default_level()),
+        ),
         (
             "av1_intra_pred",
             from_intra_simd(zvidlib_av1::av1_intra_pred::av1_intra_simd()),
         ),
         ("av1_coeff_ctx", zvidlib_av1::av1_simd::coeff::active_isa()),
-        ("vorbis_encode", zvidlib_vorbis_encoder::vorbis_encoder::simd::active_isa()),
+        (
+            "vorbis_encode",
+            zvidlib_vorbis_encoder::vorbis_encoder::simd::active_isa(),
+        ),
         ("vp8_encode", zvidlib_vp8::simd::encode_isa()),
         ("vp8_recon", zvidlib_vp8::simd::recon_isa()),
         ("vp8_decode", zvidlib_vp8::simd::decode_isa()),
@@ -109,8 +115,8 @@ pub fn active_by_site() -> Vec<(&'static str, SimdIsa)> {
     {
         use zvidlib_color::color_convert;
         use zvidlib_color::colorconv;
-        use zvidlib_hevc_encoder::engine::encoder::{rdcost, recon_simd};
         use zvidlib_hevc_decoder::engine::{simd as hevc_simd, transform_simd};
+        use zvidlib_hevc_encoder::engine::encoder::{rdcost, recon_simd};
         sites.push((
             "hevc_prediction_filters",
             from_hevc_isa(hevc_simd::detected_isa()),
@@ -135,7 +141,10 @@ pub fn active_by_site() -> Vec<(&'static str, SimdIsa)> {
         "yuv_to_rgba",
         from_yuv_to_rgba_isa(zvidlib_color::yuv_to_rgba::detected_isa()),
     ));
-    sites.push(("vorbis_decode", zvidlib_vorbis_decoder::vorbis_simd::active_isa()));
+    sites.push((
+        "vorbis_decode",
+        zvidlib_vorbis_decoder::vorbis_simd::active_isa(),
+    ));
     sites
 }
 
@@ -285,8 +294,8 @@ mod tests {
         use zvidlib_av1::av1_mc::{McContext, SimdLevel, default_level};
         use zvidlib_color::color_convert;
         use zvidlib_color::colorconv;
-        use zvidlib_hevc_encoder::engine::encoder::{quant_simd, rdcost, recon_simd};
         use zvidlib_hevc_decoder::engine::{simd as hevc_simd, transform_simd};
+        use zvidlib_hevc_encoder::engine::encoder::{quant_simd, rdcost, recon_simd};
         use zvidlib_vp9_encoder::simd as vp9_encode;
 
         let _guard = lock();
@@ -302,7 +311,10 @@ mod tests {
         assert_eq!(zvidlib_av1::av1_simd::coeff::active_isa(), SimdIsa::Scalar);
         // The Vorbis encoder's analysis kernels, whose `OnceLock` detection
         // may likewise have already resolved to a vector backend.
-        assert_eq!(zvidlib_vorbis_encoder::vorbis_encoder::simd::active_isa(), SimdIsa::Scalar);
+        assert_eq!(
+            zvidlib_vorbis_encoder::vorbis_encoder::simd::active_isa(),
+            SimdIsa::Scalar
+        );
         // AV1 motion compensation, through the level `McContext::new` picks.
         assert_eq!(default_level(), SimdLevel::Scalar);
         assert_eq!(McContext::new().level(), SimdLevel::Scalar);
@@ -337,7 +349,10 @@ mod tests {
             zvidlib_color::yuv_to_rgba::Isa::Scalar
         );
         // The Vorbis decoder's synthesis kernels.
-        assert_eq!(zvidlib_vorbis_decoder::vorbis_simd::active_isa(), SimdIsa::Scalar);
+        assert_eq!(
+            zvidlib_vorbis_decoder::vorbis_simd::active_isa(),
+            SimdIsa::Scalar
+        );
 
         // The list above is written out by hand, one selector per site, so it
         // only stays exhaustive as long as it matches `active_by_site`. A new
@@ -402,8 +417,8 @@ mod tests {
         use zvidlib_av1::av1_mc::default_level;
         use zvidlib_color::color_convert;
         use zvidlib_color::colorconv;
-        use zvidlib_hevc_encoder::engine::encoder::{quant_simd, rdcost, recon_simd};
         use zvidlib_hevc_decoder::engine::{simd as hevc_simd, transform_simd};
+        use zvidlib_hevc_encoder::engine::encoder::{quant_simd, rdcost, recon_simd};
         use zvidlib_vp9_encoder::simd as vp9_encode;
 
         let _guard = lock();
@@ -421,7 +436,10 @@ mod tests {
             vectorized
         );
         // The Vorbis encoder's analysis kernels.
-        assert_eq!(zvidlib_vorbis_encoder::vorbis_encoder::simd::active_isa(), detected());
+        assert_eq!(
+            zvidlib_vorbis_encoder::vorbis_encoder::simd::active_isa(),
+            detected()
+        );
         // AV1 motion compensation.
         assert_eq!(
             default_level() != zvidlib_av1::av1_mc::SimdLevel::Scalar,
@@ -470,7 +488,10 @@ mod tests {
             vectorized
         );
         // The Vorbis decoder's synthesis kernels.
-        assert_eq!(zvidlib_vorbis_decoder::vorbis_simd::active_isa(), detected());
+        assert_eq!(
+            zvidlib_vorbis_decoder::vorbis_simd::active_isa(),
+            detected()
+        );
 
         // As in `pinning_scalar_reaches_every_dispatch_site`, the list above is
         // written out by hand, one selector per site, so it only stays

@@ -9,34 +9,34 @@
 //! actually wrote, profile and constraint flags included. Ported from
 //! lsegal/zvid@7fe6a80 `record/bitstream.rs` (issue #487).
 
-pub(super) const NAL_VPS: u8 = 32;
-pub(super) const NAL_SPS: u8 = 33;
-pub(super) const NAL_PPS: u8 = 34;
-pub(super) const NAL_AUD: u8 = 35;
+pub const NAL_VPS: u8 = 32;
+pub const NAL_SPS: u8 = 33;
+pub const NAL_PPS: u8 = 34;
+pub const NAL_AUD: u8 = 35;
 
 /// The NAL unit type of an HEVC NAL unit (with its two-byte header).
-pub(super) fn nal_type(nal: &[u8]) -> u8 {
+pub fn nal_type(nal: &[u8]) -> u8 {
     nal.first().map_or(0, |byte| (byte >> 1) & 0x3f)
 }
 
 /// Whether `nal` is a VCL NAL unit, i.e. carries slice data.
-pub(super) fn is_vcl(nal: &[u8]) -> bool {
+pub fn is_vcl(nal: &[u8]) -> bool {
     nal_type(nal) < 32
 }
 
 /// Whether `nal` is a random access point (BLA, IDR or CRA picture).
-pub(super) fn is_irap(nal: &[u8]) -> bool {
+pub fn is_irap(nal: &[u8]) -> bool {
     (16..=23).contains(&nal_type(nal))
 }
 
 /// Whether a NAL unit is a parameter set or delimiter, which `hvc1` tracks
 /// carry in the sample entry rather than in samples.
-pub(super) fn is_out_of_band(nal: &[u8]) -> bool {
+pub fn is_out_of_band(nal: &[u8]) -> bool {
     matches!(nal_type(nal), NAL_VPS | NAL_SPS | NAL_PPS | NAL_AUD)
 }
 
 /// Splits an Annex B byte stream into NAL units without start codes.
-pub(super) fn split_annex_b(stream: &[u8]) -> Vec<&[u8]> {
+pub fn split_annex_b(stream: &[u8]) -> Vec<&[u8]> {
     let mut starts = Vec::new();
     let mut index = 0;
     while index + 3 <= stream.len() {
@@ -64,7 +64,7 @@ pub(super) fn split_annex_b(stream: &[u8]) -> Vec<&[u8]> {
 }
 
 /// Joins NAL units into one four-byte length-prefixed MP4 sample.
-pub(super) fn length_prefixed<'a>(units: impl IntoIterator<Item = &'a [u8]>) -> Vec<u8> {
+pub fn length_prefixed<'a>(units: impl IntoIterator<Item = &'a [u8]>) -> Vec<u8> {
     let mut out = Vec::new();
     for unit in units {
         out.extend_from_slice(&(unit.len() as u32).to_be_bytes());
@@ -119,7 +119,7 @@ impl Bits<'_> {
 
 /// Fields of an SPS that `hvcC` repeats.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct SpsInfo {
+pub struct SpsInfo {
     /// `general_profile_space`, `general_tier_flag`, `general_profile_idc`.
     pub profile_byte: u8,
     pub compatibility_flags: u32,
@@ -137,7 +137,7 @@ pub(super) struct SpsInfo {
 }
 
 /// Parses the fields `hvcC` needs from an SPS NAL unit.
-pub(super) fn parse_sps(nal: &[u8]) -> Option<SpsInfo> {
+pub fn parse_sps(nal: &[u8]) -> Option<SpsInfo> {
     let data = rbsp(nal);
     let mut bits = Bits {
         data: data.get(2..)?,
@@ -202,7 +202,7 @@ pub(super) fn parse_sps(nal: &[u8]) -> Option<SpsInfo> {
 }
 
 /// Builds an `hvcC` box (with header) from VPS, SPS and PPS NAL units.
-pub(super) fn hvcc_box(vps: &[&[u8]], sps: &[&[u8]], pps: &[&[u8]]) -> Option<Vec<u8>> {
+pub fn hvcc_box(vps: &[&[u8]], sps: &[&[u8]], pps: &[&[u8]]) -> Option<Vec<u8>> {
     let info = parse_sps(sps.first()?)?;
     if vps.is_empty() || pps.is_empty() {
         return None;
@@ -239,7 +239,7 @@ pub(super) fn hvcc_box(vps: &[&[u8]], sps: &[&[u8]], pps: &[&[u8]]) -> Option<Ve
 /// Collects parameter sets from NAL units, in the order first seen and
 /// without exact repeats.
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
-pub(super) struct ParameterSets {
+pub struct ParameterSets {
     pub vps: Vec<Vec<u8>>,
     pub sps: Vec<Vec<u8>>,
     pub pps: Vec<Vec<u8>>,
@@ -288,7 +288,7 @@ impl ParameterSets {
 
 /// One access unit from a platform encoder, reframed for an `hvc1` track.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct AccessUnit {
+pub struct AccessUnit {
     /// The VCL and SEI NAL units, four-byte length-prefixed.
     pub data: Vec<u8>,
     /// Whether the picture is a random access point.
@@ -300,14 +300,14 @@ pub(super) struct AccessUnit {
 /// no picture - an encoder that emits its parameter sets on their own, ahead
 /// of the first picture, produces one of these.
 #[cfg_attr(not(windows), allow(dead_code))]
-pub(super) fn reframe_access_unit(stream: &[u8], sets: &mut ParameterSets) -> Option<AccessUnit> {
+pub fn reframe_access_unit(stream: &[u8], sets: &mut ParameterSets) -> Option<AccessUnit> {
     reframe_units(split_annex_b(stream), sets)
 }
 
 /// Splits four-byte length-prefixed NAL units, the framing VideoToolbox
 /// already emits. `None` when the data ends inside a length or a unit.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub(super) fn split_length_prefixed(data: &[u8]) -> Option<Vec<&[u8]>> {
+pub fn split_length_prefixed(data: &[u8]) -> Option<Vec<&[u8]>> {
     let mut units = Vec::new();
     let mut rest = data;
     while !rest.is_empty() {
@@ -322,7 +322,7 @@ pub(super) fn split_length_prefixed(data: &[u8]) -> Option<Vec<&[u8]>> {
 /// length-prefixed: the parameter sets and delimiters are taken out and the
 /// rest re-emitted. `None` when the data is truncated or carries no picture.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub(super) fn reframe_length_prefixed(data: &[u8], sets: &mut ParameterSets) -> Option<AccessUnit> {
+pub fn reframe_length_prefixed(data: &[u8], sets: &mut ParameterSets) -> Option<AccessUnit> {
     reframe_units(split_length_prefixed(data)?, sets)
 }
 

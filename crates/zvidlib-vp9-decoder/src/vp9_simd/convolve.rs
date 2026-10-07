@@ -251,7 +251,7 @@ mod x86 {
     use core::arch::x86_64::*;
 
     use super::Convolver;
-    use crate::av1_simd::vector::{Avx2, Sse4};
+    use zvidlib_core::simd::vector::{Avx2, Sse4};
 
     #[inline(always)]
     unsafe fn load4(src: *const u8) -> __m128i {
@@ -430,7 +430,7 @@ mod arm {
     use core::arch::aarch64::*;
 
     use super::Convolver;
-    use crate::av1_simd::vector::Neon;
+    use zvidlib_core::simd::vector::Neon;
 
     #[inline(always)]
     unsafe fn load4(src: *const u8) -> uint8x8_t {

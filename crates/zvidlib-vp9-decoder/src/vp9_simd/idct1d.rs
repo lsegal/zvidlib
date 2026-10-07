@@ -13,7 +13,7 @@
 #![allow(unused_assignments, unused_mut, unused_parens, clippy::all)]
 
 use super::wide::{W, round_shift, wrap32, wraplow};
-use crate::av1_simd::vector::I32x;
+use zvidlib_core::simd::vector::I32x;
 
 const COSPI_1_64: i64 = 16364;
 const COSPI_2_64: i64 = 16305;

@@ -1,10 +1,10 @@
 //! §8.5 picture-level inter reconstruction driver.
 //!
 //! This module is the rung between the §7.3.8 slice-data parse tree (the
-//! decoded [`crate::hevc::engine::slice_data::CodingTreeUnit`] structures, with their
+//! decoded [`crate::engine::slice_data::CodingTreeUnit`] structures, with their
 //! inter coding units carrying §7.3.8.6 prediction units) and the per-PU
 //! §8.5.3.3 motion-compensated prediction + §8.6.2 residual reconstruction
-//! already implemented in [`crate::hevc::engine::inter_pred`] and [`crate::hevc::engine::recon`]. It
+//! already implemented in [`crate::engine::inter_pred`] and [`crate::engine::recon`]. It
 //! walks a picture's decoded CTUs in tile-scan (decode) order and, for each
 //! inter coding unit:
 //!
@@ -13,28 +13,28 @@
 //!    the spatial merge / MVP neighbours from the *current* picture's
 //!    motion field (built up by the earlier CUs) and the temporal `Col`
 //!    candidate from the collocated picture's motion field
-//!    ([`crate::hevc::engine::pu_mv::resolve_cu_motion`]).
+//!    ([`crate::engine::pu_mv::resolve_cu_motion`]).
 //! 2. §8.5.3.3 — for each PU, build the §8.5.3.3.2 reference planes from the
 //!    resolved `RefPicListX[ refIdxLX ]` pictures, interpolate + combine,
 //!    add the §8.6.2 residual sliced from the CU residual planes
-//!    ([`crate::hevc::engine::recon::extract_cu_residual`]) and clip into the target
-//!    picture ([`crate::hevc::engine::recon::reconstruct_inter_pu`]).
+//!    ([`crate::engine::recon::extract_cu_residual`]) and clip into the target
+//!    picture ([`crate::engine::recon::reconstruct_inter_pu`]).
 //!
 //! Intra coding units inside a P / B slice are reconstructed by the §8.4
 //! intra path; the motion field records them as intra so a later inter CU's
 //! §6.4.2 prediction-block availability denies them as motion neighbours.
 
-use crate::hevc::engine::dpb::{DpbEntry, RefPicLists};
-use crate::hevc::engine::inter_pred::{PuWeights, WpListWeights};
-use crate::hevc::engine::motion::{MotionField, derive_chroma_mv};
-use crate::hevc::engine::picture::{Picture, sub_wh_c};
-use crate::hevc::engine::profile::{Stage as ProfStage, scope as prof_scope};
-use crate::hevc::engine::pu_mv::{InterCuDesc, PuMotion, PuMvContext, PuRect, resolve_cu_motion};
-use crate::hevc::engine::recon::{
+use crate::engine::dpb::{DpbEntry, RefPicLists};
+use crate::engine::inter_pred::{PuWeights, WpListWeights};
+use crate::engine::motion::{MotionField, derive_chroma_mv};
+use crate::engine::picture::{Picture, sub_wh_c};
+use crate::engine::profile::{Stage as ProfStage, scope as prof_scope};
+use crate::engine::pu_mv::{InterCuDesc, PuMotion, PuMvContext, PuRect, resolve_cu_motion};
+use crate::engine::recon::{
     CuResidual, ReconError, ReconParams, ResolvedList, extract_cu_residual,
     reconstruct_inter_pu_weighted,
 };
-use crate::hevc::engine::slice_data::{CodingUnit, PredictionUnit};
+use crate::engine::slice_data::{CodingUnit, PredictionUnit};
 
 /// The slice's §7.4.7.3-derived weighted-prediction tables, resolved
 /// from the parsed `pred_weight_table()` into the per-reference values
@@ -97,7 +97,7 @@ impl SliceWpTables {
 /// `RefPicListX[ refIdx ]` → a borrowed reference [`Picture`] and its POC.
 ///
 /// The picture-level driver binds this to the §8.3.4 [`RefPicLists`] + the
-/// [`crate::hevc::engine::dpb::Dpb`] entries; the per-CU reconstruction reads it through
+/// [`crate::engine::dpb::Dpb`] entries; the per-CU reconstruction reads it through
 /// the [`PuMvContext`] resolvers (for the candidate derivation) and to
 /// fetch each used list's reference planes (for the interpolation).
 #[derive(Debug)]
@@ -124,12 +124,12 @@ impl<'a> RefListAccess<'a> {
 
     /// Borrow `RefPicListX[ ref_idx ]`'s DPB entry, or `None` when the
     /// list slot is "no reference picture", out of range, or the
-    /// current picture ([`crate::hevc::engine::dpb::CURR_PIC`] — resolved by the
+    /// current picture ([`crate::engine::dpb::CURR_PIC`] — resolved by the
     /// reconstruction driver, not the DPB).
     #[must_use]
     pub fn entry(&self, list: usize, ref_idx: i32) -> Option<&'a DpbEntry> {
         let idx = self.slot(list, ref_idx)?;
-        if idx == crate::hevc::engine::dpb::CURR_PIC {
+        if idx == crate::engine::dpb::CURR_PIC {
             return None;
         }
         self.entries.get(idx)
@@ -139,7 +139,7 @@ impl<'a> RefListAccess<'a> {
     /// §8.3.4 currPic append — intra block copy).
     #[must_use]
     pub fn is_curr_pic(&self, list: usize, ref_idx: i32) -> bool {
-        self.slot(list, ref_idx) == Some(crate::hevc::engine::dpb::CURR_PIC)
+        self.slot(list, ref_idx) == Some(crate::engine::dpb::CURR_PIC)
     }
 
     /// The raw `RefPicListX[ ref_idx ]` slot value.
@@ -193,12 +193,12 @@ pub fn reconstruct_inter_cu(
     let needs_curr = refs
         .lists
         .list0
-        .contains(&Some(crate::hevc::engine::dpb::CURR_PIC))
+        .contains(&Some(crate::engine::dpb::CURR_PIC))
         || refs
             .lists
             .list1
             .as_ref()
-            .is_some_and(|l| l.contains(&Some(crate::hevc::engine::dpb::CURR_PIC)));
+            .is_some_and(|l| l.contains(&Some(crate::engine::dpb::CURR_PIC)));
     let needs_curr = needs_curr
         && motions.iter().any(|m| {
             (m.pred_flag_l0 && refs.is_curr_pic(0, m.ref_idx_l0))
@@ -360,7 +360,7 @@ pub fn resolve_and_reconstruct_inter_cu(
         let _profile = prof_scope(ProfStage::MotionDerive);
         resolve_cu_motion(field, desc, pus, ctx, available)
     };
-    let rects = crate::hevc::engine::pu_mv::pu_partitions(
+    let rects = crate::engine::pu_mv::pu_partitions(
         cu.x0 as usize,
         cu.y0 as usize,
         n_cb_s,
@@ -393,12 +393,12 @@ pub fn resolve_and_reconstruct_inter_cu(
 /// ([`MotionField::mark_nonzero_coeff`]).
 fn mark_nonzero_luma(
     field: &mut MotionField,
-    tree: &crate::hevc::engine::transform_tree::TransformTree,
+    tree: &crate::engine::transform_tree::TransformTree,
     x0: usize,
     y0: usize,
     log2_trafo_size: u32,
 ) {
-    use crate::hevc::engine::transform_tree::TransformTree;
+    use crate::engine::transform_tree::TransformTree;
     let n = 1usize << log2_trafo_size;
     match tree {
         TransformTree::Leaf { cbf_luma, unit } => {
@@ -527,19 +527,19 @@ pub struct PlacedInterCtu<'a> {
     /// owning this CTB (§7.4.7.1 — per-slice, not per-picture).
     pub filter_across_slices: bool,
     /// The decoded coding tree unit.
-    pub ctu: &'a crate::hevc::engine::slice_data::CodingTreeUnit,
+    pub ctu: &'a crate::engine::slice_data::CodingTreeUnit,
 }
 
 /// §8.5 — reconstruct a full P / B picture from its decoded CTUs.
 ///
 /// Walks the placed CTUs in decode order, dispatching each leaf coding unit:
 /// an intra CU goes through the §8.4 intra path
-/// ([`crate::hevc::engine::recon::reconstruct_intra_cu_ctx`]), an inter CU through
+/// ([`crate::engine::recon::reconstruct_intra_cu_ctx`]), an inter CU through
 /// [`resolve_and_reconstruct_inter_cu`] (§8.5.3.2 candidate derivation from
 /// the in-progress motion field + the collocated `col_field`, then §8.5.3.3
 /// motion-compensated reconstruction). The §6.4.2 prediction-block
 /// availability the candidate derivation needs is evaluated against the
-/// shared [`crate::hevc::engine::recon::ReconCtx`] tiling + the per-cell intra / inter
+/// shared [`crate::engine::recon::ReconCtx`] tiling + the per-cell intra / inter
 /// flag of the motion field built up so far.
 ///
 /// Returns the reconstructed picture and its per-PU motion field (the
@@ -556,7 +556,7 @@ pub fn reconstruct_inter_picture(
     pic_height_luma: usize,
     params: &ReconParams,
     slice: &InterSliceContext,
-    tiles: &crate::hevc::engine::availability::TilingParams,
+    tiles: &crate::engine::availability::TilingParams,
     ctus: &[PlacedInterCtu<'_>],
     refs: &RefListAccess,
     col_field: Option<&MotionField>,
@@ -568,7 +568,7 @@ pub fn reconstruct_inter_picture(
         params.bit_depth_luma,
         params.bit_depth_chroma,
     );
-    let mut ctx = crate::hevc::engine::recon::ReconCtx::new(
+    let mut ctx = crate::engine::recon::ReconCtx::new(
         pic_width_luma,
         pic_height_luma,
         slice.ctb_log2_size_y,
@@ -615,11 +615,11 @@ pub fn reconstruct_inter_picture(
         refs.is_curr_pic(list, ref_idx)
             || refs
                 .entry(list, ref_idx)
-                .is_some_and(|e| e.marking == crate::hevc::engine::dpb::Marking::LongTerm)
+                .is_some_and(|e| e.marking == crate::engine::dpb::Marking::LongTerm)
     };
     let ref_short_term = |list: usize, ref_idx: i32| {
         refs.entry(list, ref_idx)
-            .is_some_and(|e| e.marking == crate::hevc::engine::dpb::Marking::ShortTerm)
+            .is_some_and(|e| e.marking == crate::engine::dpb::Marking::ShortTerm)
     };
     let col_ref_long_term = |_poc: i32| false;
     let is_curr_pic = |list: usize, ref_idx: i32| refs.is_curr_pic(list, ref_idx);
@@ -648,7 +648,7 @@ pub fn reconstruct_inter_picture(
         is_curr_pic: &is_curr_pic,
     };
 
-    let mut deblock_cus: Vec<crate::hevc::engine::deblock::DeblockCuDesc> = Vec::new();
+    let mut deblock_cus: Vec<crate::engine::deblock::DeblockCuDesc> = Vec::new();
     // §8.7.2.5.4 / §8.7.3.1 — per-4×4-cell loop-filter suppression for
     // PCM (`pcm_loop_filter_disabled_flag`) / transquant-bypass CUs.
     let (w4, h4) = (pic_width_luma.div_ceil(4), pic_height_luma.div_ceil(4));
@@ -703,7 +703,7 @@ pub fn reconstruct_inter_picture(
         no_filter_cells
             .iter()
             .any(|&b| b)
-            .then_some(crate::hevc::engine::deblock::NoFilterMap {
+            .then_some(crate::engine::deblock::NoFilterMap {
                 cells: &no_filter_cells,
                 w_cells: w4,
             });
@@ -716,8 +716,8 @@ pub fn reconstruct_inter_picture(
         let _profile = prof_scope(ProfStage::Deblock);
         let qp_map = ctx
             .qp_cells()
-            .map(|(cells, w_cells)| crate::hevc::engine::deblock::QpMap { cells, w_cells });
-        crate::hevc::engine::deblock::deblock_picture_full(
+            .map(|(cells, w_cells)| crate::engine::deblock::QpMap { cells, w_cells });
+        crate::engine::deblock::deblock_picture_full(
             &mut pic,
             &field,
             &deblock_cus,
@@ -733,7 +733,7 @@ pub fn reconstruct_inter_picture(
     // grids below reach no vector kernel, so they are their own row rather than
     // part of what `sao_filter` reports.
     let _sao_profile = prof_scope(ProfStage::Sao);
-    let mut sao_grid = vec![crate::hevc::engine::sao::ResolvedSao::off(); pic_w_ctbs * pic_h_ctbs];
+    let mut sao_grid = vec![crate::engine::sao::ResolvedSao::off(); pic_w_ctbs * pic_h_ctbs];
     for placed in ctus {
         let rx = (placed.x_ctb as usize) >> slice.ctb_log2_size_y;
         let ry = (placed.y_ctb as usize) >> slice.ctb_log2_size_y;
@@ -743,7 +743,7 @@ pub fn reconstruct_inter_picture(
                 .then(|| sao_grid[ry * pic_w_ctbs + (rx - 1)]);
             let above = (ry > 0 && slice_addr_map[(ry - 1) * pic_w_ctbs + rx] == here)
                 .then(|| sao_grid[(ry - 1) * pic_w_ctbs + rx]);
-            sao_grid[ry * pic_w_ctbs + rx] = crate::hevc::engine::sao::ResolvedSao::resolve(
+            sao_grid[ry * pic_w_ctbs + rx] = crate::engine::sao::ResolvedSao::resolve(
                 sao_params,
                 left.as_ref(),
                 above.as_ref(),
@@ -752,7 +752,7 @@ pub fn reconstruct_inter_picture(
             );
         }
     }
-    let sao_boundaries = crate::hevc::engine::sao::SaoBoundaries {
+    let sao_boundaries = crate::engine::sao::SaoBoundaries {
         slice_addr_of_ctb: slice_addr_map.clone(),
         tile_id_of_ctb: (0..(pic_w_ctbs * pic_h_ctbs) as u32)
             .map(|rs| {
@@ -771,7 +771,7 @@ pub fn reconstruct_inter_picture(
                 .collect(),
         ),
     };
-    let filtered = crate::hevc::engine::sao::apply_sao_picture_full(
+    let filtered = crate::engine::sao::apply_sao_picture_full(
         pic,
         &sao_grid,
         slice.ctb_log2_size_y,
@@ -790,20 +790,20 @@ pub fn reconstruct_inter_picture(
 #[allow(clippy::too_many_arguments)]
 fn reconstruct_inter_quadtree(
     pic: &mut Picture,
-    ctx: &mut crate::hevc::engine::recon::ReconCtx,
+    ctx: &mut crate::engine::recon::ReconCtx,
     field: &mut MotionField,
     params: &ReconParams,
     mv_ctx: &PuMvContext,
     refs: &RefListAccess,
     slice: &InterSliceContext,
-    deblock_cus: &mut Vec<crate::hevc::engine::deblock::DeblockCuDesc>,
+    deblock_cus: &mut Vec<crate::engine::deblock::DeblockCuDesc>,
     no_filter_cells: &mut [bool],
     intra_cells: &mut [bool],
     w4: usize,
     filter_across_of_ctb: &[bool],
-    qt: &crate::hevc::engine::slice_data::CodingQuadtree,
+    qt: &crate::engine::slice_data::CodingQuadtree,
 ) -> Result<(), ReconError> {
-    use crate::hevc::engine::slice_data::CodingQuadtree;
+    use crate::engine::slice_data::CodingQuadtree;
     match qt {
         CodingQuadtree::Split(children) => {
             for child in children {
@@ -857,7 +857,7 @@ fn reconstruct_inter_quadtree(
     }
 }
 
-/// Build the §8.7.2 [`crate::hevc::engine::deblock::DeblockCuDesc`] for one coding unit
+/// Build the §8.7.2 [`crate::engine::deblock::DeblockCuDesc`] for one coding unit
 /// (its geometry, transform-split topology, partition mode, QP context, and
 /// the CB-boundary edge-flag gates) and append it to `deblock_cus`.
 #[allow(clippy::too_many_arguments)]
@@ -872,9 +872,9 @@ fn collect_deblock_cu(
     qp_y_p_top: i32,
     filter_left: bool,
     filter_top: bool,
-    deblock_cus: &mut Vec<crate::hevc::engine::deblock::DeblockCuDesc>,
+    deblock_cus: &mut Vec<crate::engine::deblock::DeblockCuDesc>,
 ) {
-    let cu_params = crate::hevc::engine::deblock::DeblockCuParams {
+    let cu_params = crate::engine::deblock::DeblockCuParams {
         qp_y,
         beta_offset_div2: slice.beta_offset_div2,
         tc_offset_div2: slice.tc_offset_div2,
@@ -884,8 +884,8 @@ fn collect_deblock_cu(
         bit_depth_chroma,
         chroma_array_type,
     };
-    deblock_cus.push(crate::hevc::engine::deblock::DeblockCuDesc {
-        cu: crate::hevc::engine::deblock::DeblockCu {
+    deblock_cus.push(crate::engine::deblock::DeblockCuDesc {
+        cu: crate::engine::deblock::DeblockCu {
             x_cb: cu.x0 as usize,
             y_cb: cu.y0 as usize,
             log2_cb_size: cu.log2_cb_size,
@@ -893,7 +893,7 @@ fn collect_deblock_cu(
             qp_y_p_left,
             qp_y_p_top,
         },
-        transform_split: crate::hevc::engine::deblock::TransformSplit::from_tree(
+        transform_split: crate::engine::deblock::TransformSplit::from_tree(
             cu.transform_tree.as_ref(),
         ),
         part_mode: cu.part_mode,
@@ -911,26 +911,26 @@ fn collect_deblock_cu(
 #[allow(clippy::too_many_arguments)]
 fn reconstruct_inter_leaf_cu(
     pic: &mut Picture,
-    ctx: &mut crate::hevc::engine::recon::ReconCtx,
+    ctx: &mut crate::engine::recon::ReconCtx,
     field: &mut MotionField,
     params: &ReconParams,
     mv_ctx: &PuMvContext,
     refs: &RefListAccess,
     slice: &InterSliceContext,
-    deblock_cus: &mut Vec<crate::hevc::engine::deblock::DeblockCuDesc>,
+    deblock_cus: &mut Vec<crate::engine::deblock::DeblockCuDesc>,
     intra_cells: &mut [bool],
     w4: usize,
     filter_across_of_ctb: &[bool],
     cu: &CodingUnit,
 ) -> Result<(), ReconError> {
-    use crate::hevc::engine::binarization::CuPredMode;
+    use crate::engine::binarization::CuPredMode;
     let n_cb_s = 1usize << cu.log2_cb_size;
     // §8.6.1 — the CU's QpY (in decode order, before anything reads the
     // QP map for this CU).
     let cu_delta = cu
         .transform_tree
         .as_ref()
-        .and_then(crate::hevc::engine::recon::first_tree_cu_qp_delta);
+        .and_then(crate::engine::recon::first_tree_cu_qp_delta);
     let qp_y = ctx.derive_cu_qp(
         params,
         cu.x0 as usize,
@@ -990,15 +990,15 @@ fn reconstruct_inter_leaf_cu(
     if matches!(cu.cu_pred_mode, CuPredMode::Intra) {
         // §8.4 intra reconstruction; stamp the motion field intra so a
         // later inter CU's §6.4.2 availability denies it as a candidate.
-        crate::hevc::engine::recon::reconstruct_intra_cu_ctx(pic, params, ctx, cu)?;
+        crate::engine::recon::reconstruct_intra_cu_ctx(pic, params, ctx, cu)?;
         field.fill_rect(
             cu.x0 as usize,
             cu.y0 as usize,
             n_cb_s,
             n_cb_s,
-            crate::hevc::engine::motion::MotionCell {
+            crate::engine::motion::MotionCell {
                 is_intra: true,
-                ..crate::hevc::engine::motion::MotionCell::default()
+                ..crate::engine::motion::MotionCell::default()
             },
         );
         // §8.7.2.4 — mark the intra CU's coded transform blocks (intra
@@ -1044,7 +1044,7 @@ fn reconstruct_inter_leaf_cu(
             }
             let (gx, gy) = ((x as usize) / 4, (y as usize) / 4);
             if gx < w4 && gy < h4 && intra_cells[gy * w4 + gx] {
-                crate::hevc::engine::availability::MODE_INTRA
+                crate::engine::availability::MODE_INTRA
             } else {
                 0
             }
@@ -1083,12 +1083,12 @@ fn reconstruct_inter_leaf_cu(
 /// decoded-picture buffer, completing the per-picture reference cycle.
 ///
 /// Ties the §8.3.1 → §8.3.2 → §8.3.4 → §8.3.5 reference derivation
-/// ([`crate::hevc::engine::decode::PictureSequenceState::begin_picture`]) to the
+/// ([`crate::engine::decode::PictureSequenceState::begin_picture`]) to the
 /// picture-level inter reconstruction: it resolves `RefPicList0` /
 /// `RefPicList1` + `ColPic` into the [`RefListAccess`] + collocated motion
 /// field the inter driver reads, runs [`reconstruct_inter_picture`] (recon →
 /// deblock → SAO), then inserts the reconstructed picture + its motion field
-/// into the DPB ([`crate::hevc::engine::decode::PictureSequenceState::store_picture`]) as a
+/// into the DPB ([`crate::engine::decode::PictureSequenceState::store_picture`]) as a
 /// short-term reference for the next picture.
 ///
 /// `header` / `slice_ref` carry the §8.3 inputs; `slice` the §8.5.3.2 /
@@ -1102,14 +1102,14 @@ fn reconstruct_inter_leaf_cu(
 /// reconstruction errors.
 #[allow(clippy::too_many_arguments)]
 pub fn decode_inter_picture(
-    seq: &mut crate::hevc::engine::decode::PictureSequenceState,
-    header: &crate::hevc::engine::decode::PictureHeaderInfo,
-    slice_ref: &crate::hevc::engine::decode::SliceRefParams,
+    seq: &mut crate::engine::decode::PictureSequenceState,
+    header: &crate::engine::decode::PictureHeaderInfo,
+    slice_ref: &crate::engine::decode::SliceRefParams,
     pic_width_luma: usize,
     pic_height_luma: usize,
     params: &ReconParams,
     slice: &InterSliceContext,
-    tiles: &crate::hevc::engine::availability::TilingParams,
+    tiles: &crate::engine::availability::TilingParams,
     ctus: &[PlacedInterCtu<'_>],
 ) -> Result<Picture, ReconError> {
     // §8.3.1 → §8.3.5 — POC, RPS marking, reference lists, ColPic.
@@ -1152,15 +1152,15 @@ pub fn decode_inter_picture(
 #[cfg(any())]
 mod tests {
     use super::*;
-    use crate::hevc::engine::binarization::{CuPredMode, PartMode};
-    use crate::hevc::engine::dpb::{Marking, RefPicLists};
-    use crate::hevc::engine::motion::MotionField;
-    use crate::hevc::engine::picture::{Picture, Plane};
-    use crate::hevc::engine::pu_mv::PuMvContext;
-    use crate::hevc::engine::residual::ResidualBlock;
-    use crate::hevc::engine::slice_data::{CodingUnit, PredictionUnit};
-    use crate::hevc::engine::transform_tree::TransformTree;
-    use crate::hevc::engine::transform_unit::TransformUnit;
+    use crate::engine::binarization::{CuPredMode, PartMode};
+    use crate::engine::dpb::{Marking, RefPicLists};
+    use crate::engine::motion::MotionField;
+    use crate::engine::picture::{Picture, Plane};
+    use crate::engine::pu_mv::PuMvContext;
+    use crate::engine::residual::ResidualBlock;
+    use crate::engine::slice_data::{CodingUnit, PredictionUnit};
+    use crate::engine::transform_tree::TransformTree;
+    use crate::engine::transform_unit::TransformUnit;
 
     fn p_params() -> ReconParams {
         ReconParams {
@@ -1311,7 +1311,7 @@ mod tests {
         let params = p_params();
         let entries: Vec<DpbEntry> = Vec::new();
         let lists = RefPicLists {
-            list0: vec![Some(crate::hevc::engine::dpb::CURR_PIC)],
+            list0: vec![Some(crate::engine::dpb::CURR_PIC)],
             list1: None,
         };
         let refs = RefListAccess {
@@ -1327,7 +1327,7 @@ mod tests {
         let mut ctx = p_ctx(&ref_poc, &long, &short, &col_long);
         ctx.is_curr_pic = &is_curr;
 
-        let mvd = |v: i32| crate::hevc::engine::binarization::MvdComponent {
+        let mvd = |v: i32| crate::engine::binarization::MvdComponent {
             greater0_flag: u8::from(v != 0),
             greater1_flag: None,
             minus2: None,
@@ -1337,7 +1337,7 @@ mod tests {
         let pu = PredictionUnit {
             merge_flag: false,
             merge_idx: None,
-            inter_pred_idc: Some(crate::hevc::engine::binarization::InterPredIdc::PredL0),
+            inter_pred_idc: Some(crate::engine::binarization::InterPredIdc::PredL0),
             ref_idx_l0: Some(0),
             mvd_l0: Some([mvd(-16), mvd(0)]),
             mvp_l0_flag: Some(0),
@@ -1576,9 +1576,9 @@ mod tests {
         // covering the whole picture.
         let mut cu = inter_cu_16(merge_pu(0), None);
         cu.log2_cb_size = 5;
-        let ctu = crate::hevc::engine::slice_data::CodingTreeUnit {
+        let ctu = crate::engine::slice_data::CodingTreeUnit {
             sao: None,
-            quadtree: crate::hevc::engine::slice_data::CodingQuadtree::Leaf(Box::new(cu)),
+            quadtree: crate::engine::slice_data::CodingQuadtree::Leaf(Box::new(cu)),
         };
         let placed = vec![PlacedInterCtu {
             x_ctb: 0,
@@ -1589,7 +1589,7 @@ mod tests {
         }];
 
         let slice = p_slice_ctx();
-        let tiles = crate::hevc::engine::availability::TilingParams::single_tile();
+        let tiles = crate::engine::availability::TilingParams::single_tile();
         let (pic, field) =
             reconstruct_inter_picture(32, 32, &params, &slice, &tiles, &placed, &refs, None)
                 .unwrap();
@@ -1638,7 +1638,7 @@ mod tests {
             pcm: None,
             palette: None,
             prediction_units: vec![],
-            intra_luma: vec![crate::hevc::engine::slice_data::IntraLumaMode {
+            intra_luma: vec![crate::engine::slice_data::IntraLumaMode {
                 prev_intra_luma_pred_flag: true,
                 mpm_idx: Some(0),
                 rem_intra_luma_pred_mode: None,
@@ -1658,13 +1658,13 @@ mod tests {
         inter_br.x0 = 16;
         inter_br.y0 = 16;
 
-        let ctu = crate::hevc::engine::slice_data::CodingTreeUnit {
+        let ctu = crate::engine::slice_data::CodingTreeUnit {
             sao: None,
-            quadtree: crate::hevc::engine::slice_data::CodingQuadtree::Split(vec![
-                crate::hevc::engine::slice_data::CodingQuadtree::Leaf(Box::new(intra_cu)),
-                crate::hevc::engine::slice_data::CodingQuadtree::Leaf(Box::new(inter_tr)),
-                crate::hevc::engine::slice_data::CodingQuadtree::Leaf(Box::new(inter_bl)),
-                crate::hevc::engine::slice_data::CodingQuadtree::Leaf(Box::new(inter_br)),
+            quadtree: crate::engine::slice_data::CodingQuadtree::Split(vec![
+                crate::engine::slice_data::CodingQuadtree::Leaf(Box::new(intra_cu)),
+                crate::engine::slice_data::CodingQuadtree::Leaf(Box::new(inter_tr)),
+                crate::engine::slice_data::CodingQuadtree::Leaf(Box::new(inter_bl)),
+                crate::engine::slice_data::CodingQuadtree::Leaf(Box::new(inter_br)),
             ]),
         };
         let placed = vec![PlacedInterCtu {
@@ -1676,7 +1676,7 @@ mod tests {
         }];
 
         let slice = p_slice_ctx();
-        let tiles = crate::hevc::engine::availability::TilingParams::single_tile();
+        let tiles = crate::engine::availability::TilingParams::single_tile();
         let (pic, field) =
             reconstruct_inter_picture(32, 32, &params, &slice, &tiles, &placed, &refs, None)
                 .unwrap();
@@ -1726,7 +1726,7 @@ mod tests {
             pcm: None,
             palette: None,
             prediction_units: vec![],
-            intra_luma: vec![crate::hevc::engine::slice_data::IntraLumaMode {
+            intra_luma: vec![crate::engine::slice_data::IntraLumaMode {
                 prev_intra_luma_pred_flag: false,
                 mpm_idx: None,
                 rem_intra_luma_pred_mode: Some(1),
@@ -1744,13 +1744,13 @@ mod tests {
             c.y0 = y0;
             c
         };
-        let ctu = crate::hevc::engine::slice_data::CodingTreeUnit {
+        let ctu = crate::engine::slice_data::CodingTreeUnit {
             sao: None,
-            quadtree: crate::hevc::engine::slice_data::CodingQuadtree::Split(vec![
-                crate::hevc::engine::slice_data::CodingQuadtree::Leaf(Box::new(intra(0, 0))),
-                crate::hevc::engine::slice_data::CodingQuadtree::Leaf(Box::new(inter(16, 0))),
-                crate::hevc::engine::slice_data::CodingQuadtree::Leaf(Box::new(intra(0, 16))),
-                crate::hevc::engine::slice_data::CodingQuadtree::Leaf(Box::new(inter(16, 16))),
+            quadtree: crate::engine::slice_data::CodingQuadtree::Split(vec![
+                crate::engine::slice_data::CodingQuadtree::Leaf(Box::new(intra(0, 0))),
+                crate::engine::slice_data::CodingQuadtree::Leaf(Box::new(inter(16, 0))),
+                crate::engine::slice_data::CodingQuadtree::Leaf(Box::new(intra(0, 16))),
+                crate::engine::slice_data::CodingQuadtree::Leaf(Box::new(inter(16, 16))),
             ]),
         };
         let placed = vec![PlacedInterCtu {
@@ -1761,7 +1761,7 @@ mod tests {
             ctu: &ctu,
         }];
 
-        let tiles = crate::hevc::engine::availability::TilingParams::single_tile();
+        let tiles = crate::engine::availability::TilingParams::single_tile();
         // Undeblocked baseline.
         let mut undeb = p_slice_ctx();
         undeb.deblock_enabled = false;
@@ -1812,24 +1812,24 @@ mod tests {
         cu.log2_cb_size = 5;
         // Band-offset SAO on luma: band_position 12 (covers value 100),
         // first offset +5 ⇒ luma 100 → 105.
-        let sao = crate::hevc::engine::slice_data::SaoCtbParams {
+        let sao = crate::engine::slice_data::SaoCtbParams {
             merge_left: false,
             merge_up: false,
             components: [
-                crate::hevc::engine::slice_data::SaoComponent {
+                crate::engine::slice_data::SaoComponent {
                     sao_type_idx: 1,
                     offset_abs: [5, 0, 0, 0],
                     offset_sign: [0, 0, 0, 0],
                     band_position: 12,
                     eo_class: 0,
                 },
-                crate::hevc::engine::slice_data::SaoComponent::default(),
-                crate::hevc::engine::slice_data::SaoComponent::default(),
+                crate::engine::slice_data::SaoComponent::default(),
+                crate::engine::slice_data::SaoComponent::default(),
             ],
         };
-        let ctu = crate::hevc::engine::slice_data::CodingTreeUnit {
+        let ctu = crate::engine::slice_data::CodingTreeUnit {
             sao: Some(sao),
-            quadtree: crate::hevc::engine::slice_data::CodingQuadtree::Leaf(Box::new(cu)),
+            quadtree: crate::engine::slice_data::CodingQuadtree::Leaf(Box::new(cu)),
         };
         let placed = vec![PlacedInterCtu {
             x_ctb: 0,
@@ -1841,7 +1841,7 @@ mod tests {
 
         let mut slice = p_slice_ctx();
         slice.slice_sao_luma_flag = true;
-        let tiles = crate::hevc::engine::availability::TilingParams::single_tile();
+        let tiles = crate::engine::availability::TilingParams::single_tile();
         let (pic, _) =
             reconstruct_inter_picture(32, 32, &params, &slice, &tiles, &placed, &refs, None)
                 .unwrap();
@@ -1861,14 +1861,14 @@ mod tests {
     /// as a short-term reference.
     #[test]
     fn decode_inter_picture_full_cycle() {
-        use crate::hevc::engine::poc::NalKind;
-        use crate::hevc::engine::sps::MaterializedShortTermRefPicSet;
+        use crate::engine::poc::NalKind;
+        use crate::engine::sps::MaterializedShortTermRefPicSet;
 
         let params = p_params();
-        let mut seq = crate::hevc::engine::decode::PictureSequenceState::new();
+        let mut seq = crate::engine::decode::PictureSequenceState::new();
 
         // IDR (POC 0): a flat-110 reference picture stored directly.
-        let idr_header = crate::hevc::engine::decode::PictureHeaderInfo {
+        let idr_header = crate::engine::decode::PictureHeaderInfo {
             nal_kind: NalKind::new(NalKind::IDR_N_LP),
             temporal_id: 0,
             layer_id: 0,
@@ -1883,7 +1883,7 @@ mod tests {
             },
             long_term: vec![],
         };
-        let i_slice = crate::hevc::engine::decode::SliceRefParams {
+        let i_slice = crate::engine::decode::SliceRefParams {
             is_inter: false,
             is_b: false,
             num_ref_idx_l0_active_minus1: 0,
@@ -1898,7 +1898,7 @@ mod tests {
         seq.store_picture(idr.poc, 0, flat_ref(110, 128), MotionField::new(32, 32));
 
         // P picture (POC 1): one short-term-before reference at POC 0.
-        let p_header = crate::hevc::engine::decode::PictureHeaderInfo {
+        let p_header = crate::engine::decode::PictureHeaderInfo {
             nal_kind: NalKind::new(NalKind::TRAIL_R),
             no_rasl_output: false,
             poc_lsb: 1,
@@ -1910,7 +1910,7 @@ mod tests {
             },
             ..idr_header.clone()
         };
-        let p_slice_ref = crate::hevc::engine::decode::SliceRefParams {
+        let p_slice_ref = crate::engine::decode::SliceRefParams {
             is_inter: true,
             num_pic_total_curr: 1,
             ..i_slice
@@ -1918,9 +1918,9 @@ mod tests {
 
         let mut cu = inter_cu_16(merge_pu(0), None);
         cu.log2_cb_size = 5;
-        let ctu = crate::hevc::engine::slice_data::CodingTreeUnit {
+        let ctu = crate::engine::slice_data::CodingTreeUnit {
             sao: None,
-            quadtree: crate::hevc::engine::slice_data::CodingQuadtree::Leaf(Box::new(cu)),
+            quadtree: crate::engine::slice_data::CodingQuadtree::Leaf(Box::new(cu)),
         };
         let placed = vec![PlacedInterCtu {
             x_ctb: 0,
@@ -1930,7 +1930,7 @@ mod tests {
             ctu: &ctu,
         }];
         let slice = p_slice_ctx();
-        let tiles = crate::hevc::engine::availability::TilingParams::single_tile();
+        let tiles = crate::engine::availability::TilingParams::single_tile();
 
         let out = decode_inter_picture(
             &mut seq,
@@ -1957,7 +1957,7 @@ mod tests {
         assert_eq!(seq.dpb().entries()[1].poc, 1);
         assert_eq!(
             seq.dpb().entries()[1].marking,
-            crate::hevc::engine::dpb::Marking::ShortTerm
+            crate::engine::dpb::Marking::ShortTerm
         );
         // The P picture's motion field records the inter CU (for a future
         // picture's temporal MVP).

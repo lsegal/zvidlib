@@ -23,3 +23,12 @@ windows = { workspace = true }
 [target.'cfg(target_os = "macos")'.dependencies]
 apple-cf = { workspace = true }
 videotoolbox = { workspace = true }
+
+# The tests round-trip each backend's output through zvidlib's own codecs.
+# These are path-only so they are dropped from the published manifest, which
+# would otherwise name crates that depend on this one.
+[dev-dependencies]
+zvidlib-container = { path = "../zvidlib-container" }
+zvidlib-hevc-decoder = { path = "../zvidlib-hevc-decoder" }
+zvidlib-hevc-encoder = { path = "../zvidlib-hevc-encoder" }
+zvidlib-vp9-decoder = { path = "../zvidlib-vp9-decoder" }

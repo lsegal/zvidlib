@@ -60,13 +60,15 @@ impl CoverArt {
 
 /// Tracks the frame a [`CoverSource`] selects while a stream is written.
 #[derive(Debug)]
-pub(crate) struct CoverCapture {
+#[doc(hidden)]
+pub struct CoverCapture {
     source: CoverSource,
     thumbnail: Option<Thumbnail>,
 }
 
 impl CoverCapture {
-    pub(crate) fn new(source: CoverSource) -> Self {
+    #[doc(hidden)]
+    pub fn new(source: CoverSource) -> Self {
         Self {
             source,
             thumbnail: None,
@@ -75,7 +77,8 @@ impl CoverCapture {
 
     /// Offers the frame at presentation `index`. A frame at or before the
     /// chosen index replaces the held thumbnail; later frames are ignored.
-    pub(crate) fn offer(&mut self, index: u64, frame: FrameSource<'_>) {
+    #[doc(hidden)]
+    pub fn offer(&mut self, index: u64, frame: FrameSource<'_>) {
         let CoverSource::Frame(target) = self.source else {
             return;
         };
@@ -91,7 +94,8 @@ impl CoverCapture {
     }
 
     /// Encodes the captured frame, if there is one.
-    pub(crate) fn cover_art(&self) -> Option<CoverArt> {
+    #[doc(hidden)]
+    pub fn cover_art(&self) -> Option<CoverArt> {
         self.thumbnail.as_ref().map(Thumbnail::to_cover_art)
     }
 }
@@ -159,7 +163,13 @@ impl<'a> PixelReader<'a> {
     fn new(frame: &'a VideoFrame) -> Result<Self> {
         let planes_needed = match frame.pixel_format {
             PixelFormat::Yuv420p8 => 3,
-            _ => 1,
+            PixelFormat::Rgba8 | PixelFormat::Bgra8 | PixelFormat::Rgb8 | PixelFormat::Gray8 => 1,
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::Unsupported,
+                    "cover art cannot be made from this pixel format",
+                ));
+            }
         };
         if frame.planes.len() < planes_needed {
             return Err(Error::new(
@@ -191,6 +201,7 @@ impl<'a> PixelReader<'a> {
                     self.range,
                 );
             }
+            _ => unreachable!("PixelReader::new rejects every other pixel format"),
         };
         match self.range {
             ColorRange::Limited => rgb.map(|component| {

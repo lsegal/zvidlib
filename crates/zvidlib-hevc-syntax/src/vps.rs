@@ -5,12 +5,12 @@
 //! `vps_time_scale` / `vps_poc_proportional_to_timing_flag` /
 //! `vps_num_ticks_poc_diff_one_minus1` and the `vps_num_hrd_parameters`
 //! count). The per-HRD `hrd_parameters()` bodies (§E.2.2) are decoded
-//! as a vector of [`crate::hevc::engine::hrd::VpsHrdEntry`] values (one per
+//! as a vector of [`crate::hrd::VpsHrdEntry`] values (one per
 //! `vps_num_hrd_parameters`), with the §E.2.3 sub-layer HRD payloads
-//! folded into each entry's [`crate::hevc::engine::hrd::SubLayerHrd`]. The
+//! folded into each entry's [`crate::hrd::SubLayerHrd`]. The
 //! `vps_extension_flag` follows the HRD loop; when 1, the
 //! `vps_extension_data_flag` run + `rbsp_trailing_bits()` are surfaced
-//! as an [`crate::hevc::engine::sps::OpaqueTail`] for callers that want the raw
+//! as an [`crate::sps::OpaqueTail`] for callers that want the raw
 //! bytes.
 //!
 //! The profile-tier-level subroutine of §7.3.3 is also parsed
@@ -63,9 +63,9 @@
 //! /* extension payload + rbsp_trailing_bits() surfaced as opaque */
 //! ```
 
-use crate::hevc::engine::bitreader::{BitReader, BitReaderError};
-use crate::hevc::engine::hrd::{HrdError, VpsHrdEntry};
-use crate::hevc::engine::sps::OpaqueTail;
+use crate::bitreader::{BitReader, BitReaderError};
+use crate::hrd::{HrdError, VpsHrdEntry};
+use crate::sps::OpaqueTail;
 
 /// Maximum number of sub-layers an HEVC stream may declare.
 /// `vps_max_sub_layers_minus1` is u(3), so the count is bounded at 7
@@ -108,7 +108,7 @@ pub enum VpsError {
     /// An unexpected bitstream-level error surfaced from the reader.
     Bitstream(BitReaderError),
     /// An `hrd_parameters()` body inside the VPS HRD loop was malformed.
-    /// Propagated up from [`crate::hevc::engine::hrd::HrdError`] so a caller that
+    /// Propagated up from [`crate::hrd::HrdError`] so a caller that
     /// only looks at [`VpsError`] still sees the failure.
     Hrd(HrdError),
 }
@@ -387,7 +387,7 @@ impl HevcVps {
     /// Parse `video_parameter_set_rbsp()` starting from the first bit
     /// of the (already-unescaped) RBSP body — that is, *after* the
     /// two-byte NAL header has been removed (see
-    /// [`crate::hevc::engine::nal::NalUnit`]).
+    /// [`crate::nal::NalUnit`]).
     pub fn parse(rbsp: &[u8]) -> Result<Self, VpsError> {
         let mut br = BitReader::new(rbsp);
         Self::parse_inner(&mut br, rbsp)
@@ -532,7 +532,7 @@ impl HevcVps {
             //     hrd_parameters( cprms_present_flag[ i ], vps_max_sub_layers_minus1 )
             //   }
             //
-            // The per-HRD body (§E.2.2) lives in the `crate::hevc::engine::hrd`
+            // The per-HRD body (§E.2.2) lives in the `crate::hrd`
             // module — the `cprms_present_flag` inheritance chain is
             // walked here so each entry sees the previous entry's
             // common-info gates when its own flag is 0.
@@ -581,7 +581,7 @@ impl HevcVps {
 #[cfg(any())]
 mod tests {
     use super::*;
-    use crate::hevc::engine::nal::{collect_nal_units, strip_emulation_prevention};
+    use crate::nal::{collect_nal_units, strip_emulation_prevention};
 
     /// VPS RBSP body extracted from the workspace fixture
     /// `docs/video/h265/fixtures/tiny-i-only-16x16-main/input.hevc`,

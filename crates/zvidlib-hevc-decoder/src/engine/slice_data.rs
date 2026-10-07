@@ -5,9 +5,9 @@
 //! §7.3.8.3 `sao( )`, §7.3.8.4 `coding_tree_unit( )` /
 //! `coding_quadtree( )`, §7.3.8.5 `coding_unit( )`, and §7.3.8.6
 //! `prediction_unit( )` — composing the §7.3.8.3 / §7.3.8.5 / §7.3.8.6
-//! leaf decode primitives ([`crate::hevc::engine::binarization`]) with the already
+//! leaf decode primitives ([`crate::engine::binarization`]) with the already
 //! implemented §7.3.8.8 `transform_tree( )` recursion
-//! ([`crate::hevc::engine::transform_tree`]) and its §7.3.8.10 `transform_unit( )`
+//! ([`crate::engine::transform_tree`]) and its §7.3.8.10 `transform_unit( )`
 //! leaf.
 //!
 //! The driver produces a structured parse tree (`CodingTreeUnit` →
@@ -26,10 +26,10 @@
 //! §7.3.8.4 `coding_quadtree( )` walk at each node whose `log2CbSize`
 //! meets the `Log2MinCuQpDeltaSize` / `Log2MinCuChromaQpOffsetSize`
 //! threshold, mirroring the syntax table; the resulting
-//! [`crate::hevc::engine::transform_unit::QuantGroupState`] is threaded into the
+//! [`crate::engine::transform_unit::QuantGroupState`] is threaded into the
 //! transform tree.
 
-use crate::hevc::engine::binarization::{
+use crate::engine::binarization::{
     CuPredMode, InterPredIdc, LumaIntraModeSource, MvdComponent, PartMode, PartModeResult,
     cu_pred_mode_from_flag, cu_pred_mode_from_skip, cu_skip_flag_ctx_inc, decode_cu_skip_flag,
     decode_cu_transquant_bypass_flag, decode_end_of_slice_segment_flag, decode_inter_pred_idc,
@@ -41,21 +41,19 @@ use crate::hevc::engine::binarization::{
     derive_intra_pred_mode_c, derive_intra_pred_mode_y, intra_luma_cand_mode_list,
     luma_intra_mode_source_from_flag, split_cu_flag_ctx_inc,
 };
-use crate::hevc::engine::cabac::CabacEngine;
-use crate::hevc::engine::ctx_init::SliceContexts;
-use crate::hevc::engine::intra_mode_field::{IntraModeField, Neighbour};
-use crate::hevc::engine::profile::{Stage as ProfStage, scope as prof_scope};
-use crate::hevc::engine::residual::ResidualCodingError;
-use crate::hevc::engine::transform_tree::{
-    TransformTree, TransformTreeParams, decode_transform_tree,
-};
-use crate::hevc::engine::transform_unit::{
+use crate::engine::cabac::CabacEngine;
+use crate::engine::ctx_init::SliceContexts;
+use crate::engine::intra_mode_field::{IntraModeField, Neighbour};
+use crate::engine::profile::{Stage as ProfStage, scope as prof_scope};
+use crate::engine::residual::ResidualCodingError;
+use crate::engine::transform_tree::{TransformTree, TransformTreeParams, decode_transform_tree};
+use crate::engine::transform_unit::{
     CuPredMode as TuCuPredMode, QuantGroupState, TransformUnitParams,
 };
 
 /// Map the §7.3.8.5 [`binarization::CuPredMode`](CuPredMode) (which
 /// carries the `MODE_SKIP` not-present variant) to the two-state
-/// [`crate::hevc::engine::transform_unit::CuPredMode`] the transform tree / unit
+/// [`crate::engine::transform_unit::CuPredMode`] the transform tree / unit
 /// consume. A skip CU never enters the transform tree (it has no
 /// residual), so `Skip` collapses to `Inter` defensively.
 fn to_tu_pred_mode(m: CuPredMode) -> TuCuPredMode {
@@ -231,7 +229,7 @@ pub struct CodingUnit {
     /// §7.3.8.13 palette coding unit payload (`Some` iff
     /// `palette_mode_flag == 1`; such a CU has no prediction units and
     /// no transform tree).
-    pub palette: Option<Box<crate::hevc::engine::palette::PaletteCu>>,
+    pub palette: Option<Box<crate::engine::palette::PaletteCu>>,
     /// Decoded prediction units (intra: empty — the luma/chroma intra
     /// modes carry the prediction; inter: 1..=4 entries).
     pub prediction_units: Vec<PredictionUnit>,
@@ -892,7 +890,7 @@ fn decode_coding_unit(
         // palette_mode_flag: one Table 9-38 context-coded bin.
         && engine.decode_decision(&mut ctx.palette_mode_flag[0])? != 0
     {
-        let pp = crate::hevc::engine::palette::PaletteParams {
+        let pp = crate::engine::palette::PaletteParams {
             palette_max_size: params.palette_max_size,
             palette_max_predictor_size: params.palette_max_predictor_size,
             chroma_array_type: params.chroma_array_type,
@@ -903,7 +901,7 @@ fn decode_coding_unit(
             cu_chroma_qp_offset_enabled_flag: params.cu_chroma_qp_offset_enabled_flag,
             chroma_qp_offset_list_len_minus1: params.chroma_qp_offset_list_len_minus1,
         };
-        let pal = crate::hevc::engine::palette::decode_palette_coding(
+        let pal = crate::engine::palette::decode_palette_coding(
             engine,
             ctx,
             &pp,
@@ -924,7 +922,7 @@ fn decode_coding_unit(
     let part_result: PartModeResult = if part_present {
         decode_part_mode_banked(engine, ctx, cu_pred_mode, log2_cb_size, params)?
     } else {
-        crate::hevc::engine::binarization::part_mode_inferred()
+        crate::engine::binarization::part_mode_inferred()
     };
     cu.part_mode = part_result.part_mode;
 
@@ -1032,7 +1030,7 @@ fn decode_pcm_sample(
 
     let (mut cb, mut cr) = (Vec::new(), Vec::new());
     if params.chroma_array_type != 0 {
-        let (sub_w, sub_h) = crate::hevc::engine::picture::sub_wh_c(params.chroma_array_type);
+        let (sub_w, sub_h) = crate::engine::picture::sub_wh_c(params.chroma_array_type);
         let count = (n / sub_w) * (n / sub_h);
         let shift_c = params
             .bit_depth_chroma

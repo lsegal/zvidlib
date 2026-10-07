@@ -2,7 +2,7 @@
 //!
 //! Each Vorbis kernel is written once, generic over [`F32x`], and instantiated
 //! per instruction set behind a `#[target_feature]` wrapper in [`super`], the
-//! same arrangement `crate::av1_simd::vector` uses for the AV1 kernels.
+//! same arrangement `zvidlib_core::simd::vector` uses for the AV1 kernels.
 //!
 //! The trait's methods are not themselves `#[target_feature]`: they are
 //! `#[inline(always)]` and only ever reached from a wrapper that already

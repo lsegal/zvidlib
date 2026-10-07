@@ -3,7 +3,7 @@
 //! Scope: parse the full SPS RBSP body through the
 //! `strong_intra_smoothing_enabled_flag` field, the
 //! `vui_parameters_present_flag` gate (whose §E.2.1
-//! `vui_parameters()` body is decoded into [`crate::hevc::engine::vui::VuiParameters`]),
+//! `vui_parameters()` body is decoded into [`crate::vui::VuiParameters`]),
 //! and the `sps_extension_present_flag` gate. When the extension gate
 //! is set, the trailing bytes (extension payload + RBSP trailing
 //! bits) are surfaced as an **opaque tail**: a copy of the
@@ -14,7 +14,7 @@
 //! When `scaling_list_enabled_flag == 1` and
 //! `sps_scaling_list_data_present_flag == 1`, the §7.3.4
 //! `scaling_list_data()` block is parsed via the shared
-//! [`crate::hevc::engine::scaling_list`] module; otherwise the §7.4.5 default lists
+//! [`crate::scaling_list`] module; otherwise the §7.4.5 default lists
 //! apply.
 //!
 //! ## Layout summary
@@ -133,14 +133,12 @@
 //!   `abs_delta_rps_minus1` range 0..=2^15-1.
 //! * `sps_scaling_list_data_present_flag == 1` triggers a §7.3.4
 //!   `scaling_list_data()` parse into [`ScalingListData`] via the
-//!   shared [`crate::hevc::engine::scaling_list`] module.
+//!   shared [`crate::scaling_list`] module.
 
-use crate::hevc::engine::bitreader::{BitReader, BitReaderError};
-use crate::hevc::engine::scaling_list::{ScalingListData, ScalingListError};
-use crate::hevc::engine::vps::{
-    HEVC_MAX_SUB_LAYERS, ProfileTierLevel, SubLayerOrderingInfo, VpsError,
-};
-use crate::hevc::engine::vui::{VuiError, VuiParameters};
+use crate::bitreader::{BitReader, BitReaderError};
+use crate::scaling_list::{ScalingListData, ScalingListError};
+use crate::vps::{HEVC_MAX_SUB_LAYERS, ProfileTierLevel, SubLayerOrderingInfo, VpsError};
+use crate::vui::{VuiError, VuiParameters};
 
 /// Maximum number of short-term reference picture sets an SPS may
 /// carry. Per §7.4.3.2 the field is bounded at 64 inclusive.
@@ -601,7 +599,7 @@ pub struct LongTermRefPicEntry {
 /// `sps_multilayer_extension()`, `sps_3d_extension()`,
 /// `sps_scc_extension()`, or the `sps_extension_data_flag` while-loop
 /// gated by `sps_extension_4bits != 0`; also reused by the
-/// [`crate::hevc::engine::pps::PicParameterSet`] extension tail). The bytes captured
+/// [`crate::pps::PicParameterSet`] extension tail). The bytes captured
 /// are the still-unparsed RBSP body, starting at the byte that
 /// contains the next un-read bit. `start_bit_in_first_byte` is the
 /// bit offset of that next bit within `bytes[0]` (0 = MSB).
@@ -1051,7 +1049,7 @@ pub struct SeqParameterSet {
 impl SeqParameterSet {
     /// Parse `seq_parameter_set_rbsp()` starting from the first bit
     /// of the (already-unescaped) RBSP body — i.e. after the two-byte
-    /// NAL header has been removed (see [`crate::hevc::engine::nal::NalUnit`]).
+    /// NAL header has been removed (see [`crate::nal::NalUnit`]).
     pub fn parse(rbsp: &[u8]) -> Result<Self, SpsError> {
         let mut br = BitReader::new(rbsp);
         Self::parse_inner(&mut br, rbsp)
@@ -1571,7 +1569,7 @@ impl OpaqueTail {
     /// Capture all RBSP bytes from the byte holding the bit at
     /// `bit_pos` (counted MSB-first from the start of `rbsp`) through
     /// end-of-buffer. Used by both the SPS extension tail and the
-    /// [`crate::hevc::engine::pps::PicParameterSet`] extension tail.
+    /// [`crate::pps::PicParameterSet`] extension tail.
     pub fn capture_at(bit_pos: usize, rbsp: &[u8]) -> Self {
         let byte_index = bit_pos / 8;
         let bit_in_byte = (bit_pos % 8) as u8;
@@ -1758,7 +1756,7 @@ impl ShortTermRefPicSet {
 #[cfg(any())]
 mod tests {
     use super::*;
-    use crate::hevc::engine::nal::{collect_nal_units, strip_emulation_prevention};
+    use crate::nal::{collect_nal_units, strip_emulation_prevention};
 
     /// Helper: convert a bit string (any non-`0`/`1` characters are
     /// ignored, useful for visual spacing) into a packed MSB-first

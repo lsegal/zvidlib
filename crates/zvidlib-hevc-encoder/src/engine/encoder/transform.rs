@@ -16,7 +16,7 @@
 //!   `trType` selection (the 4x4 DST-VII of equation 8-316 for
 //!   `MODE_INTRA` 4x4 luma, the equation 8-318 DCT-II otherwise) and both
 //!   run through the vectorized butterfly in
-//!   [`crate::hevc::engine::transform_simd`] — the forward pass simply
+//!   [`crate::engine::transform_simd`] — the forward pass simply
 //!   feeds it the transposed basis, so the two directions share one
 //!   kernel and one bit-exactness guarantee.
 //! * [`quantize`] — the reciprocal of the §8.6.3 scaling loop. The
@@ -52,13 +52,13 @@
 //! `(nTbS)x(nTbS)` level array.
 
 use super::quant_simd::{self, QuantParams};
-use crate::hevc::engine::scaling_list::ScalingFactorMatrix;
-use crate::hevc::engine::transform::{
+use crate::engine::scaling_list::ScalingFactorMatrix;
+use crate::engine::transform::{
     Component, DCT32, DST4, PredMode, TransformError, coeff_range, log2_tbs,
 };
-use crate::hevc::engine::transform_simd::{self, Backend};
+use crate::engine::transform_simd::{self, Backend};
 
-/// The reciprocal of [`crate::hevc::engine::transform::LEVEL_SCALE`],
+/// The reciprocal of [`crate::engine::transform::LEVEL_SCALE`],
 /// indexed by `qP % 6`.
 ///
 /// Each entry is `round( 2^20 / levelScale[ k ] )`, so
@@ -142,7 +142,7 @@ pub fn use_dst(n_tbs: usize, pred_mode: PredMode, component: Component) -> bool 
 /// Forward (analysis) transform for one residual block.
 ///
 /// `residual` is the `(nTbS)x(nTbS)` residual array, row-major by `y`,
-/// in the same layout [`crate::hevc::engine::transform::residual_block`]
+/// in the same layout [`crate::engine::transform::residual_block`]
 /// returns. The result is the transform coefficient array `c`, also
 /// row-major, clipped into the `[ coeffMin, coeffMax ]` range the
 /// decoder's §8.6.3 accepts.
@@ -273,7 +273,7 @@ fn qbits(q_p: u32, bit_depth: u8, log2: u32, extended_precision: bool) -> i32 {
 /// * `coefficients` — the forward-transform output, row-major by `y`.
 /// * `n_tbs` — the block side `nTbS` (4 / 8 / 16 / 32).
 /// * `q_p` — the §8.6.1-derived quantization parameter, as
-///   [`crate::hevc::engine::transform::scale_coefficients`] takes it.
+///   [`crate::engine::transform::scale_coefficients`] takes it.
 /// * `bit_depth` / `extended_precision` — fix `bdShift` and the
 ///   `coeffMin` / `coeffMax` clip, exactly as they do on the decode side.
 /// * `intra` — selects the rounding offset ([`INTRA_ROUND`] vs
@@ -410,7 +410,7 @@ pub struct ForwardBlockParams {
 
 /// Runs the forward transform and then quantization for one block — the
 /// encoder-side counterpart of
-/// [`crate::hevc::engine::transform::residual_block`].
+/// [`crate::engine::transform::residual_block`].
 ///
 /// # Errors
 /// [`TransformError`] as for [`forward_transform`] / [`quantize`].
@@ -492,7 +492,7 @@ fn qpc_420(qpi: i32) -> i32 {
 /// `ChromaArrayType == 1` `qPCx = qPC_table( qPiCx )` (Table 8-10), for
 /// the other chroma types `qPCx = Min( qPiCx, 51 )`; then
 /// `Qp′Cx = qPCx + QpBdOffsetC` (eq. 8-260). This is the same mapping
-/// [`crate::hevc::engine::recon`] applies on the decode side, so an
+/// [`crate::engine::recon`] applies on the decode side, so an
 /// encoder and decoder given the same offsets agree on `qP`.
 #[must_use]
 pub fn chroma_qp(qp_y: i32, chroma_qp_offset: i32, bit_depth_c: u8, chroma_array_type: u8) -> u32 {
@@ -509,7 +509,7 @@ pub fn chroma_qp(qp_y: i32, chroma_qp_offset: i32, bit_depth_c: u8, chroma_array
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hevc::engine::transform::{LEVEL_SCALE, inverse_transform, scale_coefficients};
+    use crate::engine::transform::{LEVEL_SCALE, inverse_transform, scale_coefficients};
 
     /// Deterministic pseudo-random residual generator. A fixed LCG keeps
     /// the round-trip tests reproducible across hosts, which matters

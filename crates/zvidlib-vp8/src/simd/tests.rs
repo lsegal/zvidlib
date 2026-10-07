@@ -16,7 +16,7 @@ use super::super::predict::{
     predict_block, predict_inter, predict_subblock, predict_subblock_scalar,
 };
 use super::super::tables::{AC_Q_LOOKUP, BILINEAR_FILTERS, DC_Q_LOOKUP, SIXTAP_FILTERS, TM_PRED};
-use crate::simd::{self, SimdIsa};
+use zvidlib_core::simd::{self, SimdIsa};
 
 /// A small deterministic generator, so a failure reproduces.
 struct Random(u64);

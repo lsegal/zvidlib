@@ -57,7 +57,7 @@ pub fn annexb(units: &[Vec<u8>]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hevc::engine::nal::{collect_nal_units, strip_emulation_prevention};
+    use crate::nal::{collect_nal_units, strip_emulation_prevention};
 
     #[test]
     fn escape_inserts_before_low_bytes() {

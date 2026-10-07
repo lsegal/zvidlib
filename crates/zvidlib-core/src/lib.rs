@@ -31,9 +31,11 @@ pub use codec::{
     VideoEncoder, VideoEncoderConfig, VideoEncoderFactory, VideoEncoderFormat,
     uncompressed_video_decoder_factory,
 };
+pub use codec_config::Vp9CodecConfig;
 pub use media::{
     AudioBuffer, Codec, ColorRange, Container, PixelFormat, Plane, VideoDimensions, VideoFrame,
 };
+pub use simd::SimdIsa;
 pub use timeline::{FrameIndex, FrameRate, Rational, SampleRange, Timeline};
 pub use transfer::{
     ColorConversion, ContextIdentity, CpuFrameDestination, CpuFrameSource, CpuPlaneDestination,
@@ -41,5 +43,3 @@ pub use transfer::{
     Orientation, ResourceKind, ResourceOwnership, ScaleFilter, TransferCapability, TransferPolicy,
     TransferStage, execute_transfer, inspect_transfer,
 };
-pub use codec_config::Vp9CodecConfig;
-pub use simd::SimdIsa;

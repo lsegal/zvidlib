@@ -12,3 +12,6 @@ categories.workspace = true
 zvidlib-core = { workspace = true }
 zvidlib-color = { workspace = true }
 zvidlib-hardware = { workspace = true }
+
+[dev-dependencies]
+zvidlib-container = { path = "../zvidlib-container" }

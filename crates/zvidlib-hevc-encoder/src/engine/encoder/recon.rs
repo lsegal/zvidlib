@@ -8,21 +8,21 @@
 //! coded residual back onto it (§8.6.6), and then runs the §8.7.2 deblocking
 //! filter and the §8.7.3 sample-adaptive offset over the whole picture through
 //! the decoder's own kernels. The result is the reference picture the next
-//! frame's mode search in [`crate::hevc::engine::encoder::rdo`] predicts from.
+//! frame's mode search in [`crate::engine::encoder::rdo`] predicts from.
 //!
 //! ## Lossless and lossy reconstruction
 //!
 //! [`ReconConfig::quantized_residual`] selects which writer this
 //! reconstruction models. Cleared, the residual is coded exactly, matching the
-//! PCM writer in [`crate::hevc::engine::encoder::pcm`] whose coding units are
+//! PCM writer in [`crate::engine::encoder::pcm`] whose coding units are
 //! all `pcm_flag == 1` blocks: the reconstruction is then bit-identical to the
 //! source. Set, the residual is round-tripped through the §8.6.4 forward
 //! transform and §8.6.3 quantization in
-//! [`crate::hevc::engine::encoder::transform`] and back through the decoder's
+//! [`crate::engine::encoder::transform`] and back through the decoder's
 //! own scaling and inverse transform, which is what the residual writer in
-//! [`crate::hevc::engine::encoder::lossy`] codes — and the reconstructed
+//! [`crate::engine::encoder::lossy`] codes — and the reconstructed
 //! reference then genuinely diverges from the source, so the mode search in
-//! [`crate::hevc::engine::encoder::rdo`] predicts from a lossy picture the way
+//! [`crate::engine::encoder::rdo`] predicts from a lossy picture the way
 //! a real encoder's does.
 //!
 //! Either way the loop here is the real one — predict, add the coded residual,
@@ -35,26 +35,24 @@
 //! [`ReconConfig`] mirrors the loop-filter shape of the access unit the writer
 //! emits, so the encoder's reconstruction is always the picture a conforming
 //! decoder derives from that access unit — never an approximation of it. With
-//! the shipped [`crate::hevc::engine::encoder::pcm::PcmAuOptions`] defaults
+//! the shipped [`crate::engine::encoder::pcm::PcmAuOptions`] defaults
 //! (deblocking disabled in the PPS, SAO off in the SPS,
 //! `pcm_loop_filter_disabled_flag == 1`) the filters are correctly *not*
 //! applied and the encode stays lossless; with an access unit that enables
 //! them, the §8.7.2 and §8.7.3 drivers run over the reconstruction exactly as
 //! the decoder's do, including the §8.7.2.5.4 / §8.7.3.1 PCM suppression map.
 
-use crate::hevc::engine::binarization::PartMode;
-use crate::hevc::engine::deblock::{DeblockCu, DeblockCuDesc, DeblockCuParams, NoFilterMap};
-use crate::hevc::engine::encoder::rdo::{BlockDecision, PictureDecision};
-use crate::hevc::engine::encoder::recon_simd::{self, BandStats, EdgeStats};
-use crate::hevc::engine::encoder::transform::{
+use crate::engine::binarization::PartMode;
+use crate::engine::deblock::{DeblockCu, DeblockCuDesc, DeblockCuParams, NoFilterMap};
+use crate::engine::encoder::rdo::{BlockDecision, PictureDecision};
+use crate::engine::encoder::recon_simd::{self, BandStats, EdgeStats};
+use crate::engine::encoder::transform::{
     ForwardBlockParams, chroma_qp, luma_qp, transform_and_quantize,
 };
-use crate::hevc::engine::motion::{MotionCell, MotionField};
-use crate::hevc::engine::picture::{Picture, Plane, clip1};
-use crate::hevc::engine::sao::{ResolvedSao, ResolvedSaoComponent};
-use crate::hevc::engine::transform::{
-    BlockParams, Component as TfComponent, PredMode, residual_block,
-};
+use crate::engine::motion::{MotionCell, MotionField};
+use crate::engine::picture::{Picture, Plane, clip1};
+use crate::engine::sao::{ResolvedSao, ResolvedSaoComponent};
+use crate::engine::transform::{BlockParams, Component as TfComponent, PredMode, residual_block};
 
 /// `CtbLog2SizeY` of the encoder's fixed geometry (16-sample CTBs), matching
 /// the PCM writer's `CTB_LOG2`.
@@ -73,7 +71,7 @@ const NEUTRAL_LUMA: i32 = 128;
 /// reconstruction has to model it.
 ///
 /// These are the decoder-visible flags, not encoder preferences: they must
-/// match what [`crate::hevc::engine::encoder::pcm`] writes into the SPS / PPS /
+/// match what [`crate::engine::encoder::pcm`] writes into the SPS / PPS /
 /// slice header, or the encoder's reference picture stops being the decoder's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ReconConfig {
@@ -106,7 +104,7 @@ pub(crate) struct ReconConfig {
     /// outside — #382 needed the difference between the whole-picture group
     /// with the search running and with it skipped, and an estimate was
     /// exactly what would not settle the question. See
-    /// [`crate::hevc::engine::encoder::recon_simd::band_offset_row`].
+    /// [`crate::engine::encoder::recon_simd::band_offset_row`].
     pub sao_band_search: bool,
 }
 
@@ -130,7 +128,8 @@ impl Default for ReconConfig {
 /// the same layout the source planes and the RDO search use, so a
 /// reconstruction can be fed straight back in as the next picture's reference.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ReconstructedPicture {
+#[doc(hidden)]
+pub struct ReconstructedPicture {
     /// Reconstructed luma, `width * height`.
     pub y: Vec<u8>,
     /// Reconstructed Cb, `(width / 2) * (height / 2)`.
@@ -237,7 +236,7 @@ pub(crate) fn reconstruct_picture(
 
     if cfg.deblocking {
         let cus = deblock_descriptors(width, height, cfg.qp);
-        crate::hevc::engine::deblock::deblock_picture_full(
+        crate::engine::deblock::deblock_picture_full(
             &mut pic,
             &field,
             &cus,
@@ -257,7 +256,7 @@ pub(crate) fn reconstruct_picture(
             0,
             cfg.sao_band_search,
         );
-        pic = crate::hevc::engine::sao::apply_sao_picture_full(
+        pic = crate::engine::sao::apply_sao_picture_full(
             pic,
             &grid,
             CTB_LOG2,
@@ -595,7 +594,7 @@ fn deblock_descriptors(width: usize, height: usize, qp: i32) -> Vec<DeblockCuDes
                     qp_y_p_left: qp,
                     qp_y_p_top: qp,
                 },
-                transform_split: crate::hevc::engine::deblock::TransformSplit::leaf(),
+                transform_split: crate::engine::deblock::TransformSplit::leaf(),
                 part_mode: PartMode::Part2Nx2N,
                 filter_left: x_cb > 0,
                 filter_top: y_cb > 0,
@@ -608,7 +607,7 @@ fn deblock_descriptors(width: usize, height: usize, qp: i32) -> Vec<DeblockCuDes
 /// §8.7.2 — run the in-loop deblocking filter over a finished
 /// reconstruction, in place.
 ///
-/// The residual writer in [`crate::hevc::engine::encoder::lossy`] builds its
+/// The residual writer in [`crate::engine::encoder::lossy`] builds its
 /// reconstruction block by block as it codes, because §8.4.4.2.2 intra
 /// prediction reads the neighbouring samples *prior to* the in-loop filter
 /// process. Deblocking is therefore a whole-picture pass run once the last
@@ -636,7 +635,7 @@ pub(crate) fn deblock_reconstruction(recon: &mut ReconstructedPicture, qp: i32) 
     }
     let field = MotionField::new(width, height);
     let cus = deblock_descriptors(width, height, qp);
-    crate::hevc::engine::deblock::deblock_picture(&mut pic, &field, &cus);
+    crate::engine::deblock::deblock_picture(&mut pic, &field, &cus);
     recon.y = plane_to_u8(&pic, Plane::Luma);
     recon.cb = plane_to_u8(&pic, Plane::Cb);
     recon.cr = plane_to_u8(&pic, Plane::Cr);
@@ -668,7 +667,7 @@ pub(crate) fn sao_reconstruction(
 ) -> Vec<ResolvedSao> {
     let pic = as_picture(recon);
     let grid = estimate_sao(&pic, src, true, true, lambda_q8, true);
-    let pic = crate::hevc::engine::sao::apply_sao_picture_full(
+    let pic = crate::engine::sao::apply_sao_picture_full(
         pic,
         &grid,
         CTB_LOG2,
@@ -737,7 +736,7 @@ fn as_picture(recon: &ReconstructedPicture) -> Picture {
 /// which is the whole of what the syntax gives cIdx 2 of its own.
 ///
 /// `lambda_q8` is the §9 rate-distortion multiplier the candidates are priced
-/// with, in the 1/256 units [`crate::hevc::engine::encoder::rdo::lambda_q8`]
+/// with, in the 1/256 units [`crate::engine::encoder::rdo::lambda_q8`]
 /// returns. SAO costs per-CTB syntax on every CTB it is enabled for, so a
 /// candidate is taken only when its SSE reduction clears `lambda_q8 * bins`, the bins being the §9.3.3 binarization's
 /// own count for the parameters that would be coded. At a zero `lambda` the
@@ -1290,7 +1289,7 @@ fn edge_stats(
     let (x0, y0, x1, y1) = rect;
     let (pw, ph) = pic.plane_dims(plane);
     let samples = pic.plane(plane);
-    let (h0, v0, h1, v1) = crate::hevc::engine::sao::eo_pos(eo_class);
+    let (h0, v0, h1, v1) = crate::engine::sao::eo_pos(eo_class);
     // Per §8.7.3.2 category (1..4), the summed and counted error. The
     // neighbour bounds test is hoisted out of the sample loop and turned into
     // a row range: a sample is classifiable exactly when both of its
@@ -1369,7 +1368,7 @@ fn plane_to_u8(pic: &Picture, plane: Plane) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hevc::engine::encoder::rdo::{
+    use crate::engine::encoder::rdo::{
         BlockDecision, DecisionConfig, PartitionDecision, decide_picture,
     };
 

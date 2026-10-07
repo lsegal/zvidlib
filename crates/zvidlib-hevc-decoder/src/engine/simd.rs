@@ -1,5 +1,5 @@
 //! Runtime-dispatched SIMD kernels for the §8.5.3.3 inter-prediction hot
-//! loops (`crate::hevc::engine::inter_pred`).
+//! loops (`crate::engine::inter_pred`).
 //!
 //! Two primitives cover every vectorizable loop in the fractional-sample
 //! interpolation and weighted-sample-prediction processes:
@@ -2798,12 +2798,12 @@ pub(crate) mod in_loop {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use crate::hevc::engine::deblock::{
+        use crate::engine::deblock::{
             EdgePos, EdgeQp, EdgeType, SamplePlane, filter_chroma_block_edge,
             filter_luma_block_edge,
         };
-        use crate::hevc::engine::picture::{Picture, Plane};
-        use crate::hevc::engine::sao::{ResolvedSaoComponent, SaoBoundaries, apply_sao_ctb_full};
+        use crate::engine::picture::{Picture, Plane};
+        use crate::engine::sao::{ResolvedSaoComponent, SaoBoundaries, apply_sao_ctb_full};
         use std::sync::MutexGuard;
 
         /// A pinned reference run: everything inside `f` uses the scalar

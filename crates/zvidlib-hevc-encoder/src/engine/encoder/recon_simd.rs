@@ -1,6 +1,6 @@
 //! SIMD kernels for the two scalar stages of encoder-side reconstruction.
 //!
-//! [`crate::hevc::engine::encoder::recon`] spends nearly all of its time in two
+//! [`crate::engine::encoder::recon`] spends nearly all of its time in two
 //! per-sample loops, neither of which is one of the decoder's already-vectorized
 //! in-loop filter kernels:
 //!
@@ -22,7 +22,7 @@
 //! Both are dispatched here through cached runtime CPU feature detection
 //! ([`isa`]) to an SSE4.1 or AVX2 implementation on `x86_64`, a NEON
 //! implementation on `aarch64`, or the portable scalar reference everywhere
-//! else, exactly as [`crate::hevc::engine::encoder::rdcost`] does for the
+//! else, exactly as [`crate::engine::encoder::rdcost`] does for the
 //! distortion metrics. The crate-wide [`crate::simd::set_override`] is
 //! consulted ahead of the cached probe, so this module appears in
 //! [`crate::simd::active_by_site`] as `hevc_recon` and the benchmark harness's
@@ -43,7 +43,8 @@ const BIT_DEPTH_MAX: i32 = 255;
 
 /// The instruction set the reconstruction kernels in this module are running on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Isa {
+#[doc(hidden)]
+pub enum Isa {
     /// Portable fallback used on targets without a vectorized implementation.
     Scalar,
     /// x86_64 SSE4.1 (128-bit).
@@ -121,7 +122,8 @@ fn isa_code() -> u8 {
 }
 
 /// Returns the instruction set the reconstruction kernels will use on this machine.
-pub(crate) fn isa() -> Isa {
+#[doc(hidden)]
+pub fn isa() -> Isa {
     match isa_code() {
         #[cfg(target_arch = "x86_64")]
         ISA_AVX2 => Isa::Avx2,
@@ -385,13 +387,13 @@ const BAND_SHIFT: i32 = 3;
 /// lane reads in front of the same four dependent read-modify-writes. Neither
 /// was worth landing on NEON, so `aarch64` still resolves to the scalar
 /// reference here, the way
-/// [`crate::hevc::engine::simd::combine_weighted`] does on the instruction sets
+/// [`crate::engine::simd::combine_weighted`] does on the instruction sets
 /// where its kernel measured below parity.
 ///
 /// # x86_64 separates in isolation and not in the encoder
 ///
 /// The site was kept rather than the call inlined into
-/// [`crate::hevc::engine::encoder::recon`] so the band search stayed a named
+/// [`crate::engine::encoder::recon`] so the band search stayed a named
 /// `hevc_recon` dispatch point with a bit-exactness harness pointed at it, on
 /// the argument that the NEON result was measured rather than universal. The
 /// same two shapes were therefore timed on x86_64, and the answer depends on
@@ -459,7 +461,7 @@ const BAND_SHIFT: i32 = 3;
 /// start instead.
 ///
 /// **No x86_64 kernel is dispatched to**, the same call
-/// [`crate::hevc::engine::simd::combine_weighted`] got at four lanes and the
+/// [`crate::engine::simd::combine_weighted`] got at four lanes and the
 /// same one #305 made for NEON. Both x86 shapes stay behind `#[cfg(test)]` as
 /// the measurement apparatus, asserted bit-exact so the figures above are
 /// figures for kernels that would be correct to land.
@@ -585,7 +587,7 @@ pub(crate) fn band_offset_row(here: &[i32], src: &[u8], stats: &mut BandStats) {
 /// costs more than the width it saves, and `u16` counts were worse again than
 /// the `u32` the table was taken at. The `fold deleted` row is the ceiling: it
 /// prices away the one cost this shape adds that a per-row `BandStats` does not,
-/// so no rewiring of [`crate::hevc::engine::encoder::recon::band_stats`] to
+/// so no rewiring of [`crate::engine::encoder::recon::band_stats`] to
 /// consume [`NarrowBandStats`] directly could beat it. Even there the narrow
 /// kernel reads 1.06-1.11x on luma and 0.94-0.99x on chroma, against a
 /// wide-scatter kernel already at 1.07-1.09x and 0.98-1.02x in the same rounds.

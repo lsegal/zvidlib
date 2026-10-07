@@ -41,11 +41,11 @@
 //! spec is [`BitReader::u1`], `read_bits(9)` is `BitReader::u(9)`). The
 //! caller positions the reader at the first byte of `slice_segment_data()`
 //! — for example via
-//! [`crate::hevc::engine::slice::SliceSegmentHeader::byte_offset_to_slice_data`] — and
+//! [`crate::slice::SliceSegmentHeader::byte_offset_to_slice_data`] — and
 //! then constructs the engine, which immediately consumes the 9-bit
 //! initial `ivlOffset` per §9.3.2.6.
 
-use crate::hevc::engine::bitreader::{BitReader, BitReaderError};
+use crate::bitreader::{BitReader, BitReaderError};
 
 /// Errors that can arise while running the CABAC decode engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,7 +95,7 @@ impl From<BitReaderError> for CabacError {
 /// else /* B */                initType = cabac_init_flag ? 1 : 2
 /// ```
 ///
-/// `slice_type` here uses [`crate::hevc::engine::slice::SliceType`]'s numeric values:
+/// `slice_type` here uses [`crate::slice::SliceType`]'s numeric values:
 /// `SliceType::B == 0`, `SliceType::P == 1`, `SliceType::I == 2`.
 #[must_use]
 pub fn init_type(slice_type: u8, cabac_init_flag: bool) -> u8 {

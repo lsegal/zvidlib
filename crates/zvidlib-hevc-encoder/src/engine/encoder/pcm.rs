@@ -22,12 +22,12 @@
 //! `pcm_loop_filter_disabled_flag == 1` — a PCM-only picture
 //! reconstructs to the raw samples bit for bit.
 
-use crate::hevc::engine::availability::{PictureTiling, TilingParams};
-use crate::hevc::engine::cabac::init_type;
-use crate::hevc::engine::ctx_init::SliceContexts;
-use crate::hevc::engine::encoder::bitwriter::BitWriter;
-use crate::hevc::engine::encoder::cabac::CabacEncoder;
-use crate::hevc::engine::encoder::nal::{annexb, nal_unit};
+use crate::engine::availability::{PictureTiling, TilingParams};
+use crate::engine::cabac::init_type;
+use crate::engine::ctx_init::SliceContexts;
+use crate::engine::encoder::bitwriter::BitWriter;
+use crate::engine::encoder::cabac::CabacEncoder;
+use crate::engine::encoder::nal::{annexb, nal_unit};
 
 /// The fixed CTB / coding-block / PCM-block log2 size of this encoder.
 const CTB_LOG2: u32 = 4;
@@ -870,8 +870,8 @@ fn encode_au(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hevc::engine::pps::PicParameterSet;
-    use crate::hevc::engine::sps::SeqParameterSet;
+    use crate::engine::pps::PicParameterSet;
+    use crate::engine::sps::SeqParameterSet;
 
     fn gradient_planes(w: usize, h: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         let y: Vec<u8> = (0..w * h).map(|i| (i * 7 % 251) as u8).collect();
@@ -900,8 +900,7 @@ mod tests {
         for (w, h) in [(16usize, 16usize), (48, 32), (32, 64)] {
             let (y, cb, cr) = gradient_planes(w, h);
             let au = encode_idr_pcm_au(&y, &cb, &cr, w, h).expect("encode");
-            let frames =
-                crate::hevc::engine::sequence::decode_annexb_sequence(&au).expect("decode");
+            let frames = crate::engine::sequence::decode_annexb_sequence(&au).expect("decode");
             assert_eq!(frames.len(), 1, "{w}x{h}: one IDR frame");
             let mut expected = Vec::new();
             expected.extend_from_slice(&y);
@@ -923,8 +922,7 @@ mod tests {
         let y1: Vec<u8> = y0.iter().map(|&v| v ^ 0x5A).collect();
         let mut stream = encode_idr_pcm_au(&y0, &cb0, &cr0, 32, 32).expect("au0");
         stream.extend(encode_idr_pcm_au(&y1, &cb0, &cr0, 32, 32).expect("au1"));
-        let frames =
-            crate::hevc::engine::sequence::decode_annexb_sequence(&stream).expect("decode");
+        let frames = crate::engine::sequence::decode_annexb_sequence(&stream).expect("decode");
         assert_eq!(frames.len(), 2);
         let p0 = frames[0].picture.to_planar_u8().unwrap();
         let p1 = frames[1].picture.to_planar_u8().unwrap();
@@ -944,11 +942,10 @@ mod tests {
         for segments in [2usize, 3, 9] {
             let au = encode_idr_pcm_au_segmented(&y, &cb, &cr, w, h, segments).expect("encode");
             // One IDR NAL per segment behind the parameter sets.
-            let units = crate::hevc::engine::nal::collect_nal_units(&au).expect("walk");
+            let units = crate::engine::nal::collect_nal_units(&au).expect("walk");
             assert_eq!(units.len(), 3 + segments, "{segments} segments");
             assert!(units[4..].iter().all(|u| u.header.nal_unit_type == 20));
-            let frames =
-                crate::hevc::engine::sequence::decode_annexb_sequence(&au).expect("decode");
+            let frames = crate::engine::sequence::decode_annexb_sequence(&au).expect("decode");
             assert_eq!(frames.len(), 1);
             let mut expected = Vec::new();
             expected.extend_from_slice(&y);
@@ -968,7 +965,7 @@ mod tests {
     fn dependent_segment_without_predecessor_is_rejected() {
         let (y, cb, cr) = gradient_planes(32, 32);
         let au = encode_idr_pcm_au_segmented(&y, &cb, &cr, 32, 32, 2).expect("encode");
-        let units = crate::hevc::engine::nal::collect_nal_units(&au).expect("walk");
+        let units = crate::engine::nal::collect_nal_units(&au).expect("walk");
         // Drop the independent slice segment (unit 3), keep the
         // dependent one: the driver must refuse.
         let mut broken = Vec::new();
@@ -977,7 +974,7 @@ mod tests {
                 continue;
             }
             let mut coded = vec![0, 0, 0, 1];
-            coded.extend(crate::hevc::engine::encoder::nal::nal_unit(
+            coded.extend(crate::engine::encoder::nal::nal_unit(
                 u.header.nal_unit_type,
                 u.header.nuh_layer_id,
                 u.header.temporal_id,
@@ -985,7 +982,7 @@ mod tests {
             ));
             broken.extend(coded);
         }
-        assert!(crate::hevc::engine::sequence::decode_annexb_sequence(&broken).is_err());
+        assert!(crate::engine::sequence::decode_annexb_sequence(&broken).is_err());
     }
 
     /// §8.7.2.5.4 / §8.7.3.1 — with deblocking and luma band-offset
@@ -1006,8 +1003,7 @@ mod tests {
                 ..PcmAuOptions::default()
             };
             let au = encode_idr_pcm_au_opts(&y, &cb, &cr, w, h, opts).expect("encode");
-            let frames =
-                crate::hevc::engine::sequence::decode_annexb_sequence(&au).expect("decode");
+            let frames = crate::engine::sequence::decode_annexb_sequence(&au).expect("decode");
             assert_eq!(frames.len(), 1);
             let mut expected = Vec::new();
             expected.extend_from_slice(&y);
@@ -1040,8 +1036,7 @@ mod tests {
                 ..PcmAuOptions::default()
             };
             let au = encode_idr_pcm_au_opts(&y, &cb, &cr, w, h, opts).expect("encode");
-            let frames =
-                crate::hevc::engine::sequence::decode_annexb_sequence(&au).expect("decode");
+            let frames = crate::engine::sequence::decode_annexb_sequence(&au).expect("decode");
             assert_eq!(frames.len(), 1);
             decoded.push(frames[0].picture.to_planar_u8().expect("8-bit"));
         }
@@ -1071,8 +1066,7 @@ mod tests {
                 ..PcmAuOptions::default()
             };
             let au = encode_idr_pcm_au_opts(&y, &cb, &cr, w, h, opts).expect("encode");
-            let frames =
-                crate::hevc::engine::sequence::decode_annexb_sequence(&au).expect("decode");
+            let frames = crate::engine::sequence::decode_annexb_sequence(&au).expect("decode");
             assert_eq!(frames.len(), 1, "{cols}x{rows}: one IDR frame");
             let mut expected = Vec::new();
             expected.extend_from_slice(&y);
@@ -1099,7 +1093,7 @@ mod tests {
             ..PcmAuOptions::default()
         };
         let au = encode_idr_pcm_au_opts(&y, &cb, &cr, w, h, opts).expect("encode");
-        let units = crate::hevc::engine::nal::collect_nal_units(&au).expect("walk");
+        let units = crate::engine::nal::collect_nal_units(&au).expect("walk");
         assert_eq!(units.len(), 4);
         let sps = SeqParameterSet::parse(&units[1].rbsp).expect("sps");
         let pps = PicParameterSet::parse(&units[2].rbsp).expect("pps");
@@ -1108,7 +1102,7 @@ mod tests {
         assert_eq!(pps.tiles.num_tile_rows_minus1, 1);
         assert!(pps.tiles.uniform_spacing_flag);
         assert!(!pps.loop_filter_across_tiles_enabled_flag);
-        let header = crate::hevc::engine::slice::SliceSegmentHeader::parse(
+        let header = crate::engine::slice::SliceSegmentHeader::parse(
             &units[3].rbsp,
             units[3].header.nal_unit_type,
             &sps,
@@ -1164,7 +1158,7 @@ mod tests {
     fn written_sps_pps_parse_back() {
         let (y, cb, cr) = gradient_planes(48, 32);
         let au = encode_idr_pcm_au(&y, &cb, &cr, 48, 32).expect("encode");
-        let units = crate::hevc::engine::nal::collect_nal_units(&au).expect("walk");
+        let units = crate::engine::nal::collect_nal_units(&au).expect("walk");
         assert_eq!(units.len(), 4);
         let sps = SeqParameterSet::parse(&units[1].rbsp).expect("sps parses");
         assert_eq!(sps.pic_width_in_luma_samples, 48);

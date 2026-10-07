@@ -27,12 +27,12 @@ pub(crate) use zvidlib_av1::av1_encoder::transform;
 pub(crate) use zvidlib_av1::av1_encoder::wht;
 
 #[allow(unused_imports)]
+use zvidlib_av1::*;
+#[allow(unused_imports)]
 use zvidlib_av1::{
     av1_cdf, av1_entropy, av1_filters, av1_inter_decoder, av1_intra, av1_intra_decoder,
     av1_intra_pred, av1_mc, av1_simd,
 };
-#[allow(unused_imports)]
-use zvidlib_av1::*;
 #[allow(unused_imports)]
 use zvidlib_core::*;
 

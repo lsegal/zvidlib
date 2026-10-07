@@ -20,7 +20,8 @@ use std::sync::atomic::{AtomicU8, Ordering};
 
 /// The instruction set the distortion metrics in this module are running on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Isa {
+#[doc(hidden)]
+pub enum Isa {
     /// Portable fallback used on targets without a vectorized implementation.
     Scalar,
     /// x86_64 SSE4.1 (128-bit).
@@ -97,7 +98,8 @@ fn isa_code() -> u8 {
 }
 
 /// Returns the instruction set the distortion metrics will use on this machine.
-pub(crate) fn isa() -> Isa {
+#[doc(hidden)]
+pub fn isa() -> Isa {
     match isa_code() {
         #[cfg(target_arch = "x86_64")]
         ISA_AVX2 => Isa::Avx2,

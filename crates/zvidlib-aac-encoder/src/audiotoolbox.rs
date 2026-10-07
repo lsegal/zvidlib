@@ -21,8 +21,8 @@ use crate::{
 
 use super::{FRAME_LENGTH, esds_box, gapless_padding};
 
-pub(crate) type OSStatus = i32;
-pub(crate) type AudioConverterRef = *mut c_void;
+pub type OSStatus = i32;
+pub type AudioConverterRef = *mut c_void;
 
 /// A sentinel this module's own [`input_proc`], and the AAC decoder's in
 /// `native_audio`, return from `AudioConverterFillComplexBuffer`'s pull
@@ -30,41 +30,41 @@ pub(crate) type AudioConverterRef = *mut c_void;
 /// converter passes whatever the callback returns straight back to its
 /// caller, so this only ever needs to be distinguishable from `0` (`noErr`),
 /// which with zero frames is instead how the callback reports end of stream.
-pub(crate) const NO_MORE_INPUT: OSStatus = 1;
+pub const NO_MORE_INPUT: OSStatus = 1;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub(crate) struct AudioStreamBasicDescription {
-    pub(crate) sample_rate: f64,
-    pub(crate) format_id: u32,
-    pub(crate) format_flags: u32,
-    pub(crate) bytes_per_packet: u32,
-    pub(crate) frames_per_packet: u32,
-    pub(crate) bytes_per_frame: u32,
-    pub(crate) channels_per_frame: u32,
-    pub(crate) bits_per_channel: u32,
-    pub(crate) reserved: u32,
+pub struct AudioStreamBasicDescription {
+    pub sample_rate: f64,
+    pub format_id: u32,
+    pub format_flags: u32,
+    pub bytes_per_packet: u32,
+    pub frames_per_packet: u32,
+    pub bytes_per_frame: u32,
+    pub channels_per_frame: u32,
+    pub bits_per_channel: u32,
+    pub reserved: u32,
 }
 
 #[repr(C)]
-pub(crate) struct AudioBufferStruct {
-    pub(crate) number_channels: u32,
-    pub(crate) data_byte_size: u32,
-    pub(crate) data: *mut c_void,
+pub struct AudioBufferStruct {
+    pub number_channels: u32,
+    pub data_byte_size: u32,
+    pub data: *mut c_void,
 }
 
 #[repr(C)]
-pub(crate) struct AudioBufferList {
-    pub(crate) number_buffers: u32,
-    pub(crate) buffers: [AudioBufferStruct; 1],
+pub struct AudioBufferList {
+    pub number_buffers: u32,
+    pub buffers: [AudioBufferStruct; 1],
 }
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub(crate) struct AudioStreamPacketDescription {
-    pub(crate) start_offset: i64,
-    pub(crate) variable_frames_in_packet: u32,
-    pub(crate) data_byte_size: u32,
+pub struct AudioStreamPacketDescription {
+    pub start_offset: i64,
+    pub variable_frames_in_packet: u32,
+    pub data_byte_size: u32,
 }
 
 #[repr(C)]
@@ -81,7 +81,7 @@ struct AudioConverterPrimeInfo {
     trailing_frames: u32,
 }
 
-pub(crate) type InputProc = extern "C" fn(
+pub type InputProc = extern "C" fn(
     AudioConverterRef,
     *mut u32,
     *mut AudioBufferList,
@@ -91,17 +91,17 @@ pub(crate) type InputProc = extern "C" fn(
 
 #[link(name = "AudioToolbox", kind = "framework")]
 unsafe extern "C" {
-    pub(crate) fn AudioConverterNew(
+    pub fn AudioConverterNew(
         in_source_format: *const AudioStreamBasicDescription,
         in_destination_format: *const AudioStreamBasicDescription,
         out_audio_converter: *mut AudioConverterRef,
     ) -> OSStatus;
 
-    pub(crate) fn AudioConverterDispose(in_audio_converter: AudioConverterRef) -> OSStatus;
+    pub fn AudioConverterDispose(in_audio_converter: AudioConverterRef) -> OSStatus;
 
-    pub(crate) fn AudioConverterReset(in_audio_converter: AudioConverterRef) -> OSStatus;
+    pub fn AudioConverterReset(in_audio_converter: AudioConverterRef) -> OSStatus;
 
-    pub(crate) fn AudioConverterFillComplexBuffer(
+    pub fn AudioConverterFillComplexBuffer(
         in_audio_converter: AudioConverterRef,
         in_input_data_proc: InputProc,
         in_input_data_proc_user_data: *mut c_void,
@@ -124,7 +124,7 @@ unsafe extern "C" {
         out_writable: *mut u8,
     ) -> OSStatus;
 
-    pub(crate) fn AudioConverterSetProperty(
+    pub fn AudioConverterSetProperty(
         in_audio_converter: AudioConverterRef,
         in_property_id: u32,
         in_property_data_size: u32,
@@ -132,17 +132,17 @@ unsafe extern "C" {
     ) -> OSStatus;
 }
 
-pub(crate) const fn fourcc(bytes: &[u8; 4]) -> u32 {
+pub const fn fourcc(bytes: &[u8; 4]) -> u32 {
     ((bytes[0] as u32) << 24)
         | ((bytes[1] as u32) << 16)
         | ((bytes[2] as u32) << 8)
         | bytes[3] as u32
 }
 
-pub(crate) const K_AUDIO_FORMAT_LINEAR_PCM: u32 = fourcc(b"lpcm");
-pub(crate) const K_AUDIO_FORMAT_MPEG4_AAC: u32 = fourcc(b"aac ");
-pub(crate) const K_AUDIO_FORMAT_FLAG_IS_FLOAT: u32 = 1 << 0;
-pub(crate) const K_AUDIO_FORMAT_FLAG_IS_PACKED: u32 = 1 << 3;
+pub const K_AUDIO_FORMAT_LINEAR_PCM: u32 = fourcc(b"lpcm");
+pub const K_AUDIO_FORMAT_MPEG4_AAC: u32 = fourcc(b"aac ");
+pub const K_AUDIO_FORMAT_FLAG_IS_FLOAT: u32 = 1 << 0;
+pub const K_AUDIO_FORMAT_FLAG_IS_PACKED: u32 = 1 << 3;
 const K_AUDIO_CONVERTER_PROPERTY_MAXIMUM_OUTPUT_PACKET_SIZE: u32 = fourcc(b"xops");
 const K_AUDIO_CONVERTER_PROPERTY_PRIME_INFO: u32 = fourcc(b"prim");
 const K_AUDIO_CONVERTER_ENCODE_BIT_RATE: u32 = fourcc(b"brat");
@@ -153,10 +153,7 @@ const K_AUDIO_CONVERTER_APPLICABLE_ENCODE_BIT_RATES: u32 = fourcc(b"aebr");
 /// at any bit rate this encoder would plausibly be asked for.
 const FALLBACK_MAX_PACKET_SIZE: u32 = 8192;
 
-pub(super) fn capability(
-    configuration: &AudioEncoderConfig,
-    bit_rate: Option<u32>,
-) -> CodecSupport {
+pub fn capability(configuration: &AudioEncoderConfig, bit_rate: Option<u32>) -> CodecSupport {
     match new_converter(configuration, bit_rate) {
         Ok(converter) => {
             unsafe {
@@ -170,7 +167,7 @@ pub(super) fn capability(
     }
 }
 
-pub(super) fn create(
+pub fn create(
     configuration: &AudioEncoderConfig,
     bit_rate: Option<u32>,
     limits: &Limits,
@@ -330,7 +327,7 @@ fn query_priming_frames(converter: AudioConverterRef) -> u32 {
     if status == 0 { value.leading_frames } else { 0 }
 }
 
-pub(crate) fn status_error(status: OSStatus, context: &str) -> Error {
+pub fn status_error(status: OSStatus, context: &str) -> Error {
     Error::new(ErrorKind::Codec, format!("{context} (OSStatus {status})"))
 }
 
@@ -403,7 +400,7 @@ extern "C" fn input_proc(
     0
 }
 
-pub(super) struct AacEncoder {
+pub struct AacEncoder {
     converter: AudioConverterRef,
     config: EncoderConfig,
     format: AudioEncoderFormat,

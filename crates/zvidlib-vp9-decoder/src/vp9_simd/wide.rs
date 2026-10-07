@@ -10,7 +10,7 @@
 
 use core::ops::{Add, Mul, Neg, Sub};
 
-use crate::av1_simd::vector::I32x;
+use zvidlib_core::simd::vector::I32x;
 
 /// One `i32` per lane, with wrapping arithmetic.
 #[derive(Clone, Copy)]

@@ -1687,7 +1687,7 @@ mod tests {
     /// put motion search and the loop filter at the frame's edges too.
     #[test]
     fn bitstreams_are_byte_identical_under_every_instruction_set() {
-        use crate::simd::{self, SimdIsa};
+        use zvidlib_core::simd::{self, SimdIsa};
 
         let encode = |width: usize, height: usize, q: u8| {
             let mut encoder = FrameEncoder::new(width, height);

@@ -1,9 +1,9 @@
 //! Picture-sequence decode state machine: the §8.3.1 → §8.3.2 → §8.3.4 →
-//! §8.3.5 per-picture chain that ties the [`crate::hevc::engine::poc`] POC derivation
-//! and the [`crate::hevc::engine::dpb`] decoded-picture buffer together.
+//! §8.3.5 per-picture chain that ties the [`crate::engine::poc`] POC derivation
+//! and the [`crate::engine::dpb`] decoded-picture buffer together.
 //!
 //! [`PictureSequenceState`] threads the cross-picture state — the
-//! [`crate::hevc::engine::poc::PocState`] (`prevTid0Pic`) and the [`crate::hevc::engine::dpb::Dpb`] —
+//! [`crate::engine::poc::PocState`] (`prevTid0Pic`) and the [`crate::engine::dpb::Dpb`] —
 //! across a coded video sequence. For each coded picture the driver:
 //!
 //! 1. derives `PicOrderCntVal` (§8.3.1) from the picture's `NalKind`,
@@ -18,14 +18,14 @@
 //! [`PictureSequenceState::store_picture`] inserts it into the DPB as a
 //! short-term reference, completing the per-picture cycle.
 
-use crate::hevc::engine::dpb::{
+use crate::engine::dpb::{
     Dpb, DpbEntry, LongTermEntry, Marking, RefPicListParams, RefPicLists, ResolvedRps,
     build_rps_poc_lists, no_backward_pred_flag, select_col_pic,
 };
-use crate::hevc::engine::motion::MotionField;
-use crate::hevc::engine::picture::Picture;
-use crate::hevc::engine::poc::{NalKind, PicOrderCnt, PocState};
-use crate::hevc::engine::sps::MaterializedShortTermRefPicSet;
+use crate::engine::motion::MotionField;
+use crate::engine::picture::Picture;
+use crate::engine::poc::{NalKind, PicOrderCnt, PocState};
+use crate::engine::sps::MaterializedShortTermRefPicSet;
 
 /// The per-picture §8.3 inputs the [`PictureSequenceState`] driver needs,
 /// resolved from the picture's NAL header + activated SPS + parsed slice

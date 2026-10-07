@@ -260,4 +260,3 @@ fn resource(message: impl Into<String>) -> Error {
 fn unsupported(message: impl Into<String>) -> Error {
     Error::new(ErrorKind::Unsupported, message)
 }
-

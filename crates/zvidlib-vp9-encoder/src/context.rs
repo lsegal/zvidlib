@@ -16,7 +16,7 @@ use super::tables::{
     IF_UV_MODE_PROBS, IF_Y_MODE_PROBS, INTER_MODE_PROBS, INTRA_INTER_PROBS, PARTITION_PROBS,
     SINGLE_REF_PROBS, SKIP_PROBS, TX_PROBS_8X8, TX_PROBS_16X16, TX_PROBS_32X32,
 };
-use crate::vp9_dec::tables as shared;
+use zvidlib_vp9_decoder::vp9_dec::tables as shared;
 
 /// One transform size's coefficient model probabilities:
 /// `[plane type 2][reference 2][band 6][context 6][node 3]`.

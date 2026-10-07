@@ -11,7 +11,7 @@
 //! every other target, `wasm32` included.
 //!
 //! The kernels fall into three dispatch sites, registered with
-//! [`crate::simd::active_by_site`]:
+//! [`zvidlib_core::simd::active_by_site`]:
 //!
 //! - `vp8_encode` ([`encode_isa`]): the encoder-only kernels - [`sad16`],
 //!   [`satd4`] and [`satd`], the residual and forward DCT ([`residual_dct`]),
@@ -43,8 +43,8 @@
 //!
 //! Each dispatcher here returns `None` (or `false`) when the active
 //! instruction set has no vector path, and the caller then runs its scalar
-//! code. The instruction set is [`crate::simd::active`], so
-//! [`crate::simd::set_override`] reaches these kernels like every other site.
+//! code. The instruction set is [`zvidlib_core::simd::active`], so
+//! [`zvidlib_core::simd::set_override`] reaches these kernels like every other site.
 //! AVX2 hosts run the 4x4 kernels - the transforms and SATD - through the
 //! 128-bit body, as `av1_simd` does its 4-point transforms (#342): a 4x4 block
 //! is four 4-lane rows with no 256-bit shape, and the transposes between their
@@ -70,23 +70,26 @@ mod sad;
 #[cfg(test)]
 mod tests;
 
+use zvidlib_core::simd::SimdIsa;
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-use crate::av1_simd::vector;
-use crate::simd::SimdIsa;
+use zvidlib_core::simd::vector;
 
-pub(crate) use decode::{decode_isa, idct_dc_add_row, subblock};
-pub(crate) use kernels::EdgeLimits;
+#[doc(hidden)]
+pub use decode::{decode_isa, idct_dc_add_row, subblock};
+pub use kernels::EdgeLimits;
 
 /// The instruction set the `vp8_encode` kernels use.
 #[must_use]
-pub(crate) fn encode_isa() -> SimdIsa {
-    crate::simd::active()
+#[doc(hidden)]
+pub fn encode_isa() -> SimdIsa {
+    zvidlib_core::simd::active()
 }
 
 /// The instruction set the `vp8_recon` kernels use.
 #[must_use]
-pub(crate) fn recon_isa() -> SimdIsa {
-    crate::simd::active()
+#[doc(hidden)]
+pub fn recon_isa() -> SimdIsa {
+    zvidlib_core::simd::active()
 }
 
 /// The instruction set a kernel narrower than eight lanes runs under: AVX2
@@ -229,13 +232,13 @@ macro_rules! dispatch {
 // Safe dispatchers
 //
 // The instruction set each match arm names has been established by
-// `crate::simd::active`, which only ever reports one this host can execute,
+// `zvidlib_core::simd::active`, which only ever reports one this host can execute,
 // and every kernel reads and writes its slices through bounds-checked
 // indexing, so a dispatcher is safe to call with any arguments.
 // ---------------------------------------------------------------------
 
 /// The SAD of two 16x16 blocks at the front of `source` and `prediction`.
-pub(crate) fn sad16(
+pub fn sad16(
     source: &[u8],
     source_stride: usize,
     prediction: &[u8],
@@ -248,13 +251,13 @@ pub(crate) fn sad16(
 }
 
 /// `satd4` of a residual block.
-pub(crate) fn satd4(block: &[i16; 16]) -> Option<u32> {
+pub fn satd4(block: &[i16; 16]) -> Option<u32> {
     dispatch!(encode_isa(), [satd4_sse41, satd4_avx2, satd4_neon](block))
 }
 
 /// The SATD of the `size`x`size` block at `origin` of two planes of one
 /// stride.
-pub(crate) fn satd(
+pub fn satd(
     source: &[u8],
     prediction: &[u8],
     origin: usize,
@@ -268,7 +271,7 @@ pub(crate) fn satd(
 }
 
 /// The forward DCT of the residual of the 4x4 block at `offset`.
-pub(crate) fn residual_dct(
+pub fn residual_dct(
     source: &[u8],
     prediction: &[u8],
     offset: usize,
@@ -283,12 +286,12 @@ pub(crate) fn residual_dct(
 }
 
 /// The forward Walsh-Hadamard transform of the luma DC coefficients.
-pub(crate) fn forward_walsh(input: &[i16; 16]) -> Option<[i16; 16]> {
+pub fn forward_walsh(input: &[i16; 16]) -> Option<[i16; 16]> {
     dispatch!(encode_isa(), [fwht_sse41, fwht_avx2, fwht_neon](input))
 }
 
 /// The levels and dequantized values of a block's coefficients.
-pub(crate) fn quantize(
+pub fn quantize(
     coefficients: &[i16; 16],
     factors: [i32; 2],
     first: usize,
@@ -301,12 +304,7 @@ pub(crate) fn quantize(
 
 /// Adds the inverse DCT of `coefficients` to the 4x4 block at `offset`,
 /// returning whether a vector kernel did.
-pub(crate) fn idct_add(
-    coefficients: &[i16; 16],
-    plane: &mut [u8],
-    offset: usize,
-    stride: usize,
-) -> bool {
+pub fn idct_add(coefficients: &[i16; 16], plane: &mut [u8], offset: usize, stride: usize) -> bool {
     matches!(
         dispatch!(
             recon_isa(),
@@ -317,14 +315,14 @@ pub(crate) fn idct_add(
 }
 
 /// The inverse Walsh-Hadamard transform of the Y2 block.
-pub(crate) fn inverse_walsh(input: &[i16; 16]) -> Option<[i16; 16]> {
+pub fn inverse_walsh(input: &[i16; 16]) -> Option<[i16; 16]> {
     dispatch!(recon_isa(), [iwht_sse41, iwht_avx2, iwht_neon](input))
 }
 
 /// Filters `window` into the `width`x`height` block at `destination`,
 /// returning whether a vector kernel did. `width` is 4, 8 or 16.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn sixtap(
+pub fn sixtap(
     window: &[u8],
     width: usize,
     height: usize,
@@ -358,7 +356,7 @@ pub(crate) fn sixtap(
 
 /// `TM_PRED` of a `size`x`size` block (8 or 16), returning whether a vector
 /// kernel did it.
-pub(crate) fn tm_predict(
+pub fn tm_predict(
     above: &[u8],
     left: &[u8],
     corner: i32,
@@ -378,7 +376,7 @@ pub(crate) fn tm_predict(
 
 /// Loop-filters `count` (8 or 16) segments across a horizontal edge,
 /// returning whether a vector kernel did.
-pub(crate) fn filter_horizontal_edge(
+pub fn filter_horizontal_edge(
     data: &mut [u8],
     at: usize,
     stride: usize,
@@ -396,7 +394,7 @@ pub(crate) fn filter_horizontal_edge(
 
 /// Loop-filters `count` (8 or 16) segments across a vertical edge, returning
 /// whether a vector kernel did.
-pub(crate) fn filter_vertical_edge(
+pub fn filter_vertical_edge(
     data: &mut [u8],
     at: usize,
     stride: usize,

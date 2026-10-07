@@ -25,11 +25,11 @@ use apple_cf::cm::{CMBlockBuffer, CMFormatDescription, CMSampleBuffer};
 use apple_cf::raw;
 use videotoolbox::DecompressionSession;
 
-use crate::vp9_dec::{ChunkInspector, DecodedPicture, Decoder, chunk_frames};
 use crate::{
     CancellationToken, DecodedVideoFrame, EncodedVideoSample, Error, ErrorKind, Limits, Result,
     VideoDecoder, VideoDecoderConfig, VideoDimensions, Vp9CodecConfig,
 };
+use zvidlib_vp9_syntax::{ChunkInspector, DecodedPicture, chunk_frames};
 
 const CODEC_TYPE_VP9: videotoolbox::ffi::CMVideoCodecType = u32::from_be_bytes(*b"vp09");
 
@@ -86,14 +86,23 @@ fn exclusive() -> Option<MutexGuard<'static, ()>> {
 }
 
 /// Whether this Mac advertises a hardware VP9 decoder.
-pub(crate) fn is_vp9_available(_dimensions: VideoDimensions) -> bool {
+#[doc(hidden)]
+pub fn is_vp9_available(_dimensions: VideoDimensions) -> bool {
     register_decoder();
     unsafe { videotoolbox::ffi::VTIsHardwareDecodeSupported(CODEC_TYPE_VP9) != 0 }
 }
 
-pub(crate) fn create_vp9(
+/// Decodes the chunks since the last key frame and then `chunk` in software,
+/// returning the picture `chunk` outputs. This is how a hidden frame
+/// VideoToolbox never output is shown again; the software decoder that does it
+/// lives in the VP9 decoder crate, which passes it in.
+pub type Replay = fn(&Limits, &[Vec<u8>], &[u8]) -> Result<DecodedPicture>;
+
+#[doc(hidden)]
+pub fn create_vp9(
     configuration: &VideoDecoderConfig,
     limits: &Limits,
+    replay: Replay,
 ) -> Result<Box<dyn VideoDecoder>> {
     if !is_vp9_available(configuration.coded_dimensions) {
         return Err(unsupported(
@@ -113,6 +122,7 @@ pub(crate) fn create_vp9(
         inspector: ChunkInspector::default(),
         slots: Default::default(),
         history: Vec::new(),
+        replay,
         output_wanted: true,
     }))
 }
@@ -131,6 +141,7 @@ struct Vp9Decoder {
     slots: [Option<Arc<RawPicture>>; 8],
     /// Every chunk decoded since the last key frame, for showing a hidden frame again.
     history: Vec<Vec<u8>>,
+    replay: Replay,
     output_wanted: bool,
 }
 
@@ -173,15 +184,7 @@ impl Vp9Decoder {
     /// Shows a hidden frame again by replaying the chunks since the last key frame through the
     /// software decoder, then `chunk`, the `show_existing_frame` that names it.
     fn replay(&self, chunk: &[u8]) -> Result<RawPicture> {
-        let mut decoder = Decoder::new(self.limits);
-        decoder.set_output_wanted(false);
-        for earlier in &self.history {
-            decoder.decode_chunk(earlier)?;
-        }
-        decoder.set_output_wanted(true);
-        let picture = decoder
-            .decode_chunk(chunk)?
-            .ok_or_else(|| codec("the VP9 frame shown again was not decoded"))?;
+        let picture = (self.replay)(&self.limits, &self.history, chunk)?;
         Ok(RawPicture {
             width: picture.width,
             height: picture.height,
@@ -269,7 +272,7 @@ impl VideoDecoder for Vp9Decoder {
         };
         Ok(vec![DecodedVideoFrame {
             presentation_index: sample.presentation_index,
-            frame: crate::vp9_decoder::picture_to_rgba(&picture, &self.limits)?,
+            frame: zvidlib_vp9_syntax::picture_to_rgba(&picture, &self.limits)?,
         }])
     }
 

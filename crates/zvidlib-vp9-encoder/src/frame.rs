@@ -44,8 +44,9 @@ use super::tables::{
     AC_QLOOKUP, CAT6_PROBS, DC_QLOOKUP, KF_PARTITION_PROBS, KF_UV_MODE_PROBS, KF_Y_MODE_PROBS,
     PARETO8_FULL,
 };
-use crate::vp9_dec::loopfilter::{self, FilterPlane, LoopFilterMask, MaskBlock};
-use crate::vp9_dec::tables as shared;
+#[doc(hidden)]
+pub use zvidlib_vp9_decoder::vp9_dec::loopfilter::{self, FilterPlane, LoopFilterMask, MaskBlock};
+use zvidlib_vp9_decoder::vp9_dec::tables as shared;
 
 pub(super) const INTRA_MODE_TREE: [i8; 18] = [
     0, 2, -9, 4, -1, 6, 8, 12, -2, 10, -4, -5, -3, 14, -8, 16, -6, -7,

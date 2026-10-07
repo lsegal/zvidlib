@@ -1,8 +1,8 @@
 //! §7.3.8.11 `residual_coding( )` on the write side.
 //!
-//! The mirror of [`crate::hevc::engine::residual::decode_residual_coding_with`]:
+//! The mirror of [`crate::engine::residual::decode_residual_coding_with`]:
 //! same walk, same order, same §9.3.4.2 `ctxInc` derivations — every one of
-//! which is imported from [`crate::hevc::engine::binarization`] rather than
+//! which is imported from [`crate::engine::binarization`] rather than
 //! restated here, so the two directions cannot drift apart. The only
 //! difference is the direction of each bin: where the decoder asks its source
 //! for a bin and stores the result, this driver computes the bin from the
@@ -29,7 +29,7 @@
 //! decoder's `infer_sb_dc_sig` state for that reason rather than deriving the
 //! same thing a second, differently-shaped way.
 
-use crate::hevc::engine::binarization::{
+use crate::engine::binarization::{
     COEFF_ABS_LEVEL_REMAINING_TR_PREFIX_ESCAPE_LEN, Greater1State,
     coded_sub_block_flag_ctx_inc_with_edge, coeff_abs_level_greater2_flag_ctx_inc,
     coeff_abs_level_remaining_c_max_eq_9_26, coeff_abs_level_remaining_c_rice_param_eq_9_24,
@@ -38,15 +38,15 @@ use crate::hevc::engine::binarization::{
     sig_coeff_flag_ctx_inc_from_sig_ctx, sig_coeff_flag_sig_ctx_dc, sig_coeff_flag_sig_ctx_general,
     sig_coeff_flag_sig_ctx_log2_2,
 };
-use crate::hevc::engine::cabac::ContextModel;
-use crate::hevc::engine::encoder::bitwriter::BitWriter;
-use crate::hevc::engine::encoder::cabac::CabacEncoder;
-use crate::hevc::engine::residual::{ResidualContexts, ResidualElement};
-use crate::hevc::engine::scan::{ScanIdx, scan_order};
+use crate::engine::cabac::ContextModel;
+use crate::engine::encoder::bitwriter::BitWriter;
+use crate::engine::encoder::cabac::CabacEncoder;
+use crate::engine::residual::{ResidualContexts, ResidualElement};
+use crate::engine::scan::{ScanIdx, scan_order};
 
 /// A sink for the bins one `residual_coding( )` invocation produces — the
 /// write-side counterpart of
-/// [`crate::hevc::engine::residual::ResidualBinSource`].
+/// [`crate::engine::residual::ResidualBinSource`].
 ///
 /// Tests script a recording sink to compare the `(element, ctxInc)` request
 /// sequence against the decoder's; production uses [`EngineResidualBinSink`].
@@ -104,7 +104,7 @@ impl ResidualBinSink for EngineResidualBinSink<'_, '_, '_> {
 
 /// The caller-derived inputs to one `residual_coding( )` invocation the writer
 /// needs. The counterpart of
-/// [`crate::hevc::engine::residual::ResidualCodingParams`], minus every field
+/// [`crate::engine::residual::ResidualCodingParams`], minus every field
 /// that names a feature this writer does not emit (see the module docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ResidualWriteParams {
@@ -113,7 +113,7 @@ pub(crate) struct ResidualWriteParams {
     /// `cIdx > 0`.
     pub is_chroma: bool,
     /// The §7.4.9.11 scan order
-    /// ([`crate::hevc::engine::residual::residual_coding_scan_idx`]).
+    /// ([`crate::engine::residual::residual_coding_scan_idx`]).
     pub scan_idx: ScanIdx,
 }
 
@@ -476,9 +476,9 @@ fn write_coeff_abs_level_remaining<S: ResidualBinSink>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hevc::engine::bitreader::BitReader;
-    use crate::hevc::engine::cabac::CabacEngine;
-    use crate::hevc::engine::residual::{
+    use crate::engine::bitreader::BitReader;
+    use crate::engine::cabac::CabacEngine;
+    use crate::engine::residual::{
         EngineResidualBinSource, ResidualCodingParams, decode_residual_coding_with,
     };
 
