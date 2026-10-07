@@ -400,7 +400,14 @@ impl<'a> FrameEncoder<'a> {
             // its square: enough to drop coefficients, skip blocks and merge
             // partitions where they cost more than they restore, without
             // trading away the quality the quantizer would otherwise keep.
-            lambda: f64::from(ac * ac) / 1200.0,
+            //
+            // A key frame's distortion is inherited by every frame predicted
+            // from it, so it trades rate at half that lambda, as libvpx codes
+            // key frames at a finer quantizer. Weighed as one frame, a key
+            // frame at quantizers above about 230 dropped nearly all its
+            // detail, and the next inter frames bought it back at several
+            // times the key frame's size (issue #597).
+            lambda: f64::from(ac * ac) / if reference.is_none() { 2400.0 } else { 1200.0 },
             mode_info: vec![ModeInfo::default(); geometry.mi_cols * geometry.mi_rows],
             above_nonzero: [
                 vec![false; geometry.mi_cols * 2],
