@@ -313,8 +313,10 @@ jobs:
   #   construction (#449). This asserts the two lists stay in step and that the
   #   workflow keeps no `paths-ignore` of its own.
   # - `ci_guard_tests_are_run`: two guards once had no step and were compiled
-  #   but never run (#464). This asserts every `tests/ci_*.rs` file is named by
-  #   the `--test` of a cargo invocation that runs it, which here is this list.
+  #   but never run (#464), and nine library tests sat the same way (#599).
+  #   This asserts every `tests/*.rs` file is named by the `--test` of a cargo
+  #   invocation that runs it, which here is this list, unless the test's
+  #   `NOT_RUN_BY_CI` names it with the reason it is left out.
   # - `ci_benchmarks_run_every_target`: the timed benchmark run names its
   #   `[[bench]]` targets in a matrix, a second copy of what `Cargo.toml`
   #   declares; a target in the manifest and not the matrix is never measured
@@ -358,6 +360,31 @@ jobs:
   #   the choice, not the claim it is made from: the codec string the page
   #   probes with is written down in JavaScript, so this demuxes each declared
   #   sample and asserts the declaration against what zvidlib derives.
+  # - `av1_intra_decoder` and `av1_inter_decoder`: the native AV1 decoder
+  #   against standardized vectors - a lossless intra stream reconstructs the
+  #   canonical YUV, and an inter stream with `show_existing_frame` matches its
+  #   canonical digest - plus explicit failures for malformed and over-budget
+  #   units and a reference store bounded by `Limits`.
+  # - `av1_simd_intra`: the AV1 intra prediction kernels and block
+  #   reconstruction, on whatever SIMD level the runner has, bit for bit against
+  #   an independent scalar reference. Its two benchmarks print timings but
+  #   assert only that both paths agree, so a slow runner cannot fail them.
+  # - `codec_conformance`: the registered HEVC (Main and Main 10), AV1 and VP9
+  #   decoders against reference RGBA digests through sequential, reverse and
+  #   alternating seeks (#508, #527), and a seek that skips pictures still
+  #   returning the fixture's frames. The bundled 1080p HEVC and AV1 samples
+  #   have one random-access point each, so they are walked in order with a few
+  #   seeks instead; a reverse walk of either re-decodes the whole track per
+  #   frame and does not finish on a runner.
+  # - `hevc_bitstream_byte_identity`: the HEVC bit writer's output against
+  #   golden digests taken before it was widened (#233), so a throughput change
+  #   that alters a bit fails.
+  # - `indexed_mp4_output`: `MediaOutput`'s MP4 index tables round-trip exactly,
+  #   an empty output stays consistent, incompatible audio and unsynchronized
+  #   finishes are rejected, and sink backpressure and errors reach the caller.
+  # - `native_av1_encoder`: the native AV1 encoder's output decodes through
+  #   ffmpeg (which the shards install) above a PSNR floor, round-trips through
+  #   the native decoder, and passes the shared encoder conformance runner.
   # - `native_gl`: the example's bitmap-font overlay helpers.
   #
   # `--lib` includes the HEVC/AV1 engine tests that compare every SIMD backend
@@ -407,6 +434,13 @@ jobs:
             --test native_vp8_encoder \
             --test vp9_hardware \
             --test web_canvas_samples_match_their_files \
+            --test av1_intra_decoder \
+            --test av1_inter_decoder \
+            --test av1_simd_intra \
+            --test codec_conformance \
+            --test hevc_bitstream_byte_identity \
+            --test indexed_mp4_output \
+            --test native_av1_encoder \
             --example native_gl \
             --archive-file nextest-archive.tar.zst
       - name: Upload the test archive

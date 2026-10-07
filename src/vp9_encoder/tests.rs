@@ -131,6 +131,55 @@ fn smooth_yuv_frame(width: u32, height: u32, index: u32) -> VideoFrame {
     .unwrap()
 }
 
+/// Smooth detail that pans 1.375 samples right and 0.625 down a frame, so
+/// only sub-sample motion vectors predict it well.
+fn sub_sample_yuv_frame(width: u32, height: u32, index: u32) -> VideoFrame {
+    let (width, height) = (width as usize, height as usize);
+    let (chroma_width, chroma_height) = (width.div_ceil(2), height.div_ceil(2));
+    let (dx, dy) = (f64::from(index) * 1.375, f64::from(index) * 0.625);
+    let scene = |x: f64, y: f64| {
+        128.0
+            + 45.0 * (0.41 * (x - dx)).sin() * (0.23 * (y - dy)).cos()
+            + 30.0 * (0.17 * (x - dx) + 0.29 * (y - dy)).sin()
+    };
+    let sample = |value: f64| value.round().clamp(0.0, 255.0) as u8;
+    let luma = (0..width * height)
+        .map(|i| sample(scene((i % width) as f64, (i / width) as f64)))
+        .collect();
+    let chroma = |offset: f64| -> Vec<u8> {
+        (0..chroma_width * chroma_height)
+            .map(|i| {
+                let (x, y) = ((i % chroma_width) as f64, (i / chroma_width) as f64);
+                sample(128.0 + 0.4 * (scene(x * 2.0 + 0.5, y * 2.0 + 0.5) - 128.0) + offset)
+            })
+            .collect()
+    };
+    VideoFrame::new(
+        VideoDimensions {
+            width: width as u32,
+            height: height as u32,
+        },
+        PixelFormat::Yuv420p8,
+        ColorRange::Limited,
+        vec![
+            Plane {
+                data: luma,
+                stride: width,
+            },
+            Plane {
+                data: chroma(-10.0),
+                stride: chroma_width,
+            },
+            Plane {
+                data: chroma(10.0),
+                stride: chroma_width,
+            },
+        ],
+        &Limits::default(),
+    )
+    .unwrap()
+}
+
 /// The visible `yuv420p` bytes of the encoder's reconstruction.
 fn reconstruction(encoder: &NativeVp9Encoder) -> Vec<u8> {
     let picture = encoder.reference.as_ref().unwrap();
@@ -568,7 +617,63 @@ fn inter_frames_are_smaller_than_key_frames_for_moving_content() {
 const SMALL_BLOCKS: CodingTools = CodingTools {
     largest_block: 0,
     larger_transforms: false,
+    sub_sample_motion: true,
 };
+
+/// Every coding tool except sub-sample motion vectors.
+const WHOLE_SAMPLE_MOTION: CodingTools = CodingTools {
+    sub_sample_motion: false,
+    ..CodingTools::ALL
+};
+
+/// The inter frames' bytes and mean PSNR.
+fn inter_size_and_quality(
+    config: &VideoEncoderConfig,
+    frames: u32,
+    content: Frames,
+    tools: CodingTools,
+) -> (usize, f64) {
+    let (samples, reconstructions, sources) = encode_with(config, frames, content, tools);
+    let quality = reconstructions[1..]
+        .iter()
+        .zip(&sources[1..])
+        .map(|(reconstruction, source)| psnr(reconstruction, source))
+        .sum::<f64>()
+        / f64::from(frames - 1);
+    (total_bytes(&samples[1..]), quality)
+}
+
+#[test]
+fn sub_sample_motion_shrinks_output_at_equal_or_better_quality() {
+    for (name, content, sub_sample) in [
+        ("sub-sample", sub_sample_yuv_frame as Frames, true),
+        ("moving", moving_yuv_frame, false),
+        ("smooth", smooth_yuv_frame, false),
+    ] {
+        for base_q_idx in [40, DEFAULT_BASE_Q_IDX, 150] {
+            let mut config = configuration(96, 64, PixelFormat::Yuv420p8);
+            config.configuration = vec![base_q_idx];
+            let (whole_bytes, whole_quality) =
+                inter_size_and_quality(&config, 8, content, WHOLE_SAMPLE_MOTION);
+            let (bytes, quality) = inter_size_and_quality(&config, 8, content, CodingTools::ALL);
+            let message = format!(
+                "{name} q{base_q_idx}: {bytes} bytes at {quality:.2} dB against {whole_bytes} \
+                 bytes at {whole_quality:.2} dB with whole-sample motion"
+            );
+            eprintln!("{message}");
+            if sub_sample {
+                // Sub-sample motion cuts the inter frames by more than a fifth.
+                assert!(bytes * 5 < whole_bytes * 4, "{message}");
+                assert!(quality >= whole_quality, "{message}");
+            } else {
+                // Whole-sample motion gains nothing from refinement, and must
+                // lose nothing to it either.
+                assert!(bytes * 100 <= whole_bytes * 101, "{message}");
+                assert!(quality >= whole_quality - 0.01, "{message}");
+            }
+        }
+    }
+}
 
 fn total_bytes(samples: &[EncodedSample]) -> usize {
     samples.iter().map(|sample| sample.data.len()).sum()
@@ -855,8 +960,13 @@ mod ffmpeg {
         output.stdout
     }
 
+    /// Checks both the whole-sample test content and the sub-sample content,
+    /// whose eighth-sample vectors exercise the 8-tap filters and the
+    /// high-precision motion vector bits.
     fn assert_decoders_match_reconstruction(config: &VideoEncoderConfig, frames: u32) {
-        assert_decoders_match(config, frames, moving_yuv_frame);
+        for content in [moving_yuv_frame as Frames, sub_sample_yuv_frame] {
+            assert_decoders_match(config, frames, content);
+        }
     }
 
     fn assert_decoders_match(config: &VideoEncoderConfig, frames: u32, content: Frames) {
