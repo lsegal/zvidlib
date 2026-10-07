@@ -336,25 +336,46 @@ pub(super) fn predict_intra(
         return;
     }
     let log2 = size.trailing_zeros();
-    for row in 0..size {
-        let output = &mut plane[(y + row) * stride + x..][..size];
-        match mode {
-            IntraMode::Dc => {
-                let above_sum: u32 = above.iter().map(|&value| u32::from(value)).sum();
-                let left_sum: u32 = left.iter().map(|&value| u32::from(value)).sum();
-                let half = (size / 2) as u32;
-                let dc = match (have_above, have_left) {
-                    (true, true) => (above_sum + left_sum + size as u32) >> (log2 + 1),
-                    (true, false) => (above_sum + half) >> log2,
-                    (false, true) => (left_sum + half) >> log2,
-                    (false, false) => 128,
-                } as u8;
-                output.fill(dc);
-            }
-            IntraMode::V => output.copy_from_slice(above),
-            IntraMode::H => output.fill(left[row]),
-            IntraMode::Tm => unreachable!("predicted above"),
+    let dc = if mode == IntraMode::Dc {
+        let above_sum: u32 = above.iter().map(|&value| u32::from(value)).sum();
+        let left_sum: u32 = left.iter().map(|&value| u32::from(value)).sum();
+        let half = (size / 2) as u32;
+        (match (have_above, have_left) {
+            (true, true) => (above_sum + left_sum + size as u32) >> (log2 + 1),
+            (true, false) => (above_sum + half) >> log2,
+            (false, true) => (left_sum + half) >> log2,
+            (false, false) => 128,
+        }) as u8
+    } else {
+        0
+    };
+    // Rows of a width the compiler sees are filled in place; a row of an
+    // unknown width was a library call each.
+    fn rows<const SIZE: usize>(
+        block: &mut [u8],
+        stride: usize,
+        mode: IntraMode,
+        dc: u8,
+        above: &[u8],
+        left: &[u8],
+    ) {
+        let above: &[u8; SIZE] = above.try_into().expect("a whole edge");
+        for (row, &left) in left.iter().enumerate() {
+            block[row * stride..][..SIZE].copy_from_slice(&match mode {
+                IntraMode::Dc => [dc; SIZE],
+                IntraMode::V => *above,
+                IntraMode::H => [left; SIZE],
+                IntraMode::Tm => unreachable!("predicted above"),
+            });
         }
+    }
+    let block = &mut plane[y * stride + x..];
+    match size {
+        4 => rows::<4>(block, stride, mode, dc, above, left),
+        8 => rows::<8>(block, stride, mode, dc, above, left),
+        16 => rows::<16>(block, stride, mode, dc, above, left),
+        32 => rows::<32>(block, stride, mode, dc, above, left),
+        _ => unreachable!("transform blocks are 4 to 32 samples wide"),
     }
 }
 
