@@ -1177,11 +1177,15 @@ fn panning_inter_frames_find_the_motion() {
     // third larger than the unfiltered one would have to grow to match its
     // quality (issue #583). Content this sharp has little blocking left for
     // the filter to remove, so it must now cost next to nothing either way.
+    //
+    // At quantizers above about 230 a key frame weighed as a single frame
+    // dropped nearly all of the texture, and an inter frame later bought it
+    // back at up to three times the key frame's size (issue #597).
     for (width, height) in [(96, 64), (192, 128)] {
         let frames: Vec<VideoFrame> = (0..12)
             .map(|index| moving_yuv_frame(width, height, index))
             .collect();
-        for base_q_idx in [30, 40, 130, 200, 210, 220] {
+        for base_q_idx in [30, 40, 130, 200, 210, 220, 230, 240] {
             let [
                 (unfiltered_bytes, unfiltered_psnr),
                 (filtered_bytes, filtered_psnr),
