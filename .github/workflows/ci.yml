@@ -320,6 +320,11 @@ jobs:
   #   declares; a target in the manifest and not the matrix is never measured
   #   again (#459). It also pins the `rm -rf target/criterion` that keeps a
   #   restored build cache from making criterion log an error per benchmark.
+  # - `ci_path_filters_are_conservative`: a pull request skips the jobs whose
+  #   inputs it does not touch (#600), and a filter too narrow for its job
+  #   skips it on exactly the change that would have failed it, which reports
+  #   itself as nothing. This holds each filter to the files its job reads and
+  #   each exclusion to its module's `cfg`, and keeps `main` running everything.
   # - `mp4_cover_art`: pins no-cover output byte for byte and round-trips JPEG
   #   and PNG cover art through `Mp4Muxer` and `Mp4Demuxer` (#502), and checks
   #   the cover `MediaOutput` generates from a frame (#510).
@@ -391,6 +396,7 @@ jobs:
             --test ci_staleness_report_sees_markdown_changes \
             --test ci_guard_tests_are_run \
             --test ci_benchmarks_run_every_target \
+            --test ci_path_filters_are_conservative \
             --test mp4_cover_art \
             --test opus_codec \
             --test vorbis_codec \
