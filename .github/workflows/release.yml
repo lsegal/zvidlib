@@ -1,83 +1,119 @@
 name: Release
 
+# Prepares a release from the Actions tab: sets the workspace version, promotes
+# the changelog, pushes both to `main` with the tag, and hands the tag to
+# Finalize release (`finalize-release.yml`), which packages and publishes it.
 on:
-  push:
-    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      level:
+        description: Release level
+        required: true
+        type: choice
+        default: patch
+        options:
+          - major
+          - minor
+          - patch
+          - version
+      version:
+        description: Version to release (if level is "version"), for example 1.0.0
+        required: false
+        type: string
 
 permissions:
+  actions: write
   contents: write
 
 jobs:
-  package:
-    name: Package release assets
+  release:
+    name: Prepare the release
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust toolchain
-        run: rustup show
-      - name: Cache cargo registry and build artifacts
-        uses: Swatinem/rust-cache@v2
         with:
-          cache-on-failure: true
-      - name: Install wasm32 target
-        run: rustup target add wasm32-unknown-unknown
-      - name: Install native audio dependencies
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
-      - name: Install wasm-pack
+          ref: main
+          fetch-depth: 0
+      - name: Select the release version
         env:
-          WASM_PACK_VERSION: '0.15.0'
+          LEVEL: ${{ inputs.level }}
+          VERSION_INPUT: ${{ inputs.version }}
         run: |
-          target="wasm-pack-v${WASM_PACK_VERSION}-x86_64-unknown-linux-musl"
-          mkdir -p "$RUNNER_TEMP/wasm-pack"
-          curl -sSfL "https://github.com/rustwasm/wasm-pack/releases/download/v${WASM_PACK_VERSION}/${target}.tar.gz" \
-            | tar -xz --strip-components=1 -C "$RUNNER_TEMP/wasm-pack" "${target}/wasm-pack"
-          echo "$RUNNER_TEMP/wasm-pack" >> "$GITHUB_PATH"
-      # Every workspace package is versioned in lockstep with `zvidlib` (#604),
-      # so each one has to match the tag, not just the first one listed.
-      - name: Verify every package version matches the release tag
-        run: |
-          mismatched="$(cargo metadata --no-deps --format-version 1 \
-            | jq -r --arg version "${TAG#v}" '.packages[] | select(.version != $version) | .name')"
-          if [ -n "$mismatched" ]; then
-            echo "these packages are not at ${TAG#v}: $mismatched"
-            exit 1
+          set -euo pipefail
+          if [ "$LEVEL" = "version" ]; then
+            version="${VERSION_INPUT#v}"
+          else
+            latest="$(git tag -l 'v*' --sort=-v:refname | head -n1)"
+            latest="${latest:-v0.0.0}"
+            [[ "$latest" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] || { echo "invalid latest tag: $latest" >&2; exit 1; }
+            major="${BASH_REMATCH[1]}"
+            minor="${BASH_REMATCH[2]}"
+            patch="${BASH_REMATCH[3]}"
+            case "$LEVEL" in
+              major) major=$((major + 1)); minor=0; patch=0 ;;
+              minor) minor=$((minor + 1)); patch=0 ;;
+              patch) patch=$((patch + 1)) ;;
+              *) echo "invalid release level: $LEVEL" >&2; exit 1 ;;
+            esac
+            version="${major}.${minor}.${patch}"
           fi
-        env:
-          TAG: ${{ github.ref_name }}
-      - name: Build release assets
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "invalid release version: $version" >&2; exit 1; }
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "TAG=v$version" >> "$GITHUB_ENV"
+      # Every package takes its version from `[workspace.package]`, and each
+      # `[workspace.dependencies]` entry pins its crate to exactly that version
+      # (#604), so these are the only version strings to change. `Cargo.lock`
+      # is not committed, so there is no lockfile to update.
+      - name: Set the workspace version
         run: |
-          mkdir release
-          # `zvidlib` and every crate it is built from, verified together so
-          # each one builds against the others as they will be published.
-          # The benchmark helpers are development-only and never published.
-          cargo package --workspace --exclude zvidlib-bench-support --locked
-          cp target/package/*.crate release/
-          wasm-pack build --release --target web --out-dir pkg --features web
-          (cd pkg && npm pack --pack-destination ../release)
-          mv release/zvidlib-*.tgz "release/zvidlib-web-${{ github.ref_name }}.tgz"
-      # `publish_crates.py` uploads every crate `cargo package` just verified,
-      # one at a time in dependency order (#610), pacing them to crates.io's
-      # rate limits and waiting out a 429 rather than failing (#637). It runs
-      # before the GitHub release is created so a re-run of a failed job
-      # repeats both: a crate already on crates.io at this version is skipped,
-      # so a re-run resumes after a partial publish. A tag pushed before the
-      # token secret exists still gets its GitHub release.
-      # `tests/ci_release_publishes_every_crate.rs` holds what it publishes to
-      # the packages that do not declare `publish = false`.
-      - name: Publish the crates to crates.io
-        # A first release of a dozen new crates waits about ten minutes
-        # between uploads once crates.io's burst of five is spent.
-        timeout-minutes: 240
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-          TAG: ${{ github.ref_name }}
+          set -euo pipefail
+          current="$(awk '
+            /^\[/ { in_package = ($0 == "[workspace.package]") }
+            in_package && /^version = "/ { gsub(/^version = "|"$/, ""); print; exit }
+          ' Cargo.toml)"
+          [ -n "$current" ] || { echo "Cargo.toml has no [workspace.package] version" >&2; exit 1; }
+          if [ "$current" != "$VERSION" ]; then
+            sed -i \
+              -e "s/^version = \"${current}\"\$/version = \"${VERSION}\"/" \
+              -e "s/version = \"=${current}\"/version = \"=${VERSION}\"/" \
+              Cargo.toml
+            if grep -q "\"=${current}\"" Cargo.toml; then
+              echo "Cargo.toml still pins a crate to ${current}" >&2
+              exit 1
+            fi
+          fi
+      # Renames `## Unreleased` to the release's heading and opens a new empty
+      # `## Unreleased` above it. A changelog that already has the heading was
+      # promoted by an earlier run and is left alone.
+      - name: Promote the changelog
         run: |
-          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
-            echo "::notice::CARGO_REGISTRY_TOKEN is not set, so no crate was published to crates.io."
+          set -euo pipefail
+          if grep -q "^## ${VERSION} - " CHANGELOG.md; then
             exit 0
           fi
-          python3 .github/scripts/publish_crates.py --version "${TAG#v}"
-      - name: Create the GitHub release with its assets
+          grep -q '^## Unreleased$' CHANGELOG.md || { echo "CHANGELOG.md has no ## Unreleased section" >&2; exit 1; }
+          awk -v heading="## ${VERSION} - $(date -u +%Y-%m-%d)" '
+            !done && $0 == "## Unreleased" { print; print ""; print heading; done = 1; next }
+            { print }
+          ' CHANGELOG.md > "$RUNNER_TEMP/CHANGELOG.md"
+          mv "$RUNNER_TEMP/CHANGELOG.md" CHANGELOG.md
+      - name: Push the release commit and tag
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Cargo.toml CHANGELOG.md
+          if ! git diff --cached --quiet; then
+            git commit -m "Release zvidlib ${VERSION}"
+            git push origin HEAD:main
+          fi
+          if ! git ls-remote --exit-code --tags origin "refs/tags/${TAG}" > /dev/null 2>&1; then
+            git tag "$TAG"
+            git push origin "$TAG"
+          fi
+      # A tag pushed with `GITHUB_TOKEN` starts no workflow, so Finalize
+      # release is started on it explicitly.
+      - name: Start Finalize release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${{ github.ref_name }}" release/* --verify-tag --title "zvidlib ${{ github.ref_name }}" --generate-notes
+        run: gh workflow run finalize-release.yml --repo "$GITHUB_REPOSITORY" --ref "$TAG" -f tag="$TAG"
