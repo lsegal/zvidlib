@@ -395,15 +395,59 @@ the release tag as the native Cargo dependency coordinate:
 
 ```toml
 [dependencies]
-zvidlib = { git = "https://github.com/lsegal/zvidlib.git", tag = "v0.4.0", features = ["native"] }
+zvidlib = { git = "https://github.com/lsegal/zvidlib.git", tag = "v0.4.0" }
 ```
 
 Cargo fetches the versioned release tag itself; applications do not need to clone or vendor zvidlib.
 The matching `zvidlib-0.4.0.crate` GitHub Release asset provides an archive for inspection or
 offline packaging. From 0.4.0, `zvidlib` and its `zvidlib-*` crates are also published to crates.io, so
-`zvidlib = { version = "0.4.0", features = ["native"] }` works as well.
+`zvidlib = "0.4.0"` works as well.
 The native API requires Rust 1.85 or later, as recorded by `rust-version` in `Cargo.toml`; platform codec
 adapters retain their documented platform capability checks.
+
+### Choosing codecs
+
+Every native codec is a Cargo feature, one per codec and direction, and the
+default features enable all of them along with the platform hardware backends.
+An application that needs only some codecs turns the defaults off and names the
+ones it uses, and builds none of the others:
+
+```toml
+[dependencies]
+# Decode VP9 only, in software.
+zvidlib = { version = "0.4.0", default-features = false, features = ["vp9-decoder"] }
+# Both AV1 directions and the HEVC encoder, with hardware acceleration.
+zvidlib = { version = "0.4.0", default-features = false, features = ["av1", "hevc-encoder", "hardware"] }
+```
+
+| Codec | Decoder | Encoder | Both |
+| --- | --- | --- | --- |
+| AV1 | `av1-decoder` | `av1-encoder` | `av1` |
+| VP8 | `vp8-decoder` | `vp8-encoder` | `vp8` |
+| VP9 | `vp9-decoder` | `vp9-encoder` | `vp9` |
+| HEVC | `hevc-decoder` | `hevc-encoder` | `hevc` |
+| Opus | `opus-decoder` | `opus-encoder` | `opus` |
+| Vorbis | `vorbis-decoder` | `vorbis-encoder` | `vorbis` |
+| AAC | `aac-decoder` | `aac-encoder` | `aac` |
+
+- `all` enables every codec feature in the table. The default features are
+  `all` and `hardware`.
+- `hardware` builds the platform backends (NVDEC, Media Foundation,
+  VideoToolbox) for whichever enabled codecs have one. Without it the enabled
+  codecs are pure Rust: `HardwarePreference::Require` reports
+  `HardwareUnavailable`, and `Prefer` falls back to software, as it does on a
+  host with no backend.
+- Features are additive and mix freely. The containers, the codec traits and
+  the configuration records the containers read and write (`OpusHead`,
+  `VorbisConfig`, the AV1, VP9 and HEVC syntax) are built in every
+  configuration, so MP4 and WebM files with any track open regardless; a track
+  whose codec is not enabled has no native decoder or encoder.
+- The AAC decoder runs on the operating system's decoder on macOS and Windows
+  and on Symphonia's elsewhere; the AAC encoder needs macOS or Windows.
+- In a `web` build, a codec whose feature is off has no software fallback
+  behind `WebCodecs`.
+- `native` gates no library code. It only keeps the native-only examples out of
+  `wasm32` builds, so applications do not need it for the native codecs.
 
 For a browser build, install the matching release asset directly:
 

@@ -204,7 +204,12 @@ vorbis-encoder = ["dep:zvidlib-vorbis-encoder"]
 # AAC decodes through the platform's decoder (AudioToolbox on macOS, Media
 # Foundation on Windows), whose bindings it shares with the AAC encoder, and
 # through Symphonia's on Linux and the other native targets.
-aac-decoder = ["dep:zvidlib-aac-encoder", "dep:symphonia-codec-aac", "dep:symphonia-core"]
+aac-decoder = [
+    "dep:zvidlib-aac-encoder",
+    "dep:symphonia-codec-aac",
+    "dep:symphonia-core",
+    "dep:windows",
+]
 aac-encoder = ["dep:zvidlib-aac-encoder"]
 # The platform hardware video backends (NVDEC, Media Foundation, VideoToolbox)
 # for whichever enabled codecs have one. Without it the enabled codecs are pure
@@ -329,8 +334,9 @@ cpal = "0.15.3"
 symphonia-codec-aac = { version = "0.5.5", optional = true }
 symphonia-core = { workspace = true, optional = true }
 
+# The AAC decoder's Media Foundation backend.
 [target.'cfg(windows)'.dependencies]
-windows = { workspace = true }
+windows = { workspace = true, optional = true }
 
 # The native HEVC/AV1 decoders are pure-Rust software codecs with no fast path at opt-level 0,
 # so an unoptimized debug build is unusably slow. opt-level 2 keeps debug assertions and fast
