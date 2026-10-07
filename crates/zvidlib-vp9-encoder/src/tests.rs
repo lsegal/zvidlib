@@ -333,7 +333,7 @@ fn the_hardware_preference_selects_hardware_only_where_the_host_has_it() {
         config.color_range = range;
         config.hardware = HardwarePreference::Require;
         let support = factory.capability(&config);
-        if cfg!(any(windows, target_os = "macos")) {
+        if cfg!(all(feature = "hardware", any(windows, target_os = "macos"))) {
             assert!(
                 matches!(support, CodecSupport::InvalidConfiguration { .. }),
                 "{width}x{height} {range:?}: {support:?}"

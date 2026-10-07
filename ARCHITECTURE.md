@@ -221,8 +221,10 @@ crates/
                            VP8 encoders and the hardware backends
   zvidlib-container/       MP4 and WebM muxers and demuxers, probing, codec strings,
                            cover art, and the conformance harness
+  zvidlib-opus-syntax/     Opus configuration records and packet timing
   zvidlib-opus/            Opus decoding and encoding
-  zvidlib-vorbis-decoder/  Vorbis decoding and configuration
+  zvidlib-vorbis-syntax/   Vorbis header parsing and packet timing
+  zvidlib-vorbis-decoder/  Vorbis decoding
   zvidlib-vorbis-encoder/  the libvorbis encoder port
   zvidlib-aac-encoder/     platform AAC encoding
   zvidlib-av1-syntax/      AV1 OBU and configuration record parsing
@@ -235,6 +237,7 @@ crates/
   zvidlib-vp9-decoder/     the VP9 software decoder
   zvidlib-vp9-encoder/     the VP9 encoder
   zvidlib-hevc-syntax/     HEVC bit reading and writing, CABAC, parameter sets, slice headers
+  zvidlib-hevc/            the HEVC engine and SIMD kernels shared by the decoder and encoder
   zvidlib-hevc-decoder/    the HEVC software decoder
   zvidlib-hevc-encoder/    the HEVC encoder
   zvidlib-hardware/        NVDEC, Media Foundation and VideoToolbox backends
@@ -242,7 +245,7 @@ crates/
   zvidlib-bench-support/   shared benchmark helpers (development only, unpublished)
 ```
 
-Each codec crate's factory selects between its software implementation and the hardware backends, so `zvidlib-hardware` sits below the codec crates and depends only on the syntax and color crates; the one thing a backend needs from a software codec, VideoToolbox's replay of a hidden VP9 frame, is handed to it by the VP9 decoder as a function. Tests, fixtures and benchmarks live in the crate they exercise; the root package keeps the API-level and CI-level ones.
+`zvidlib` depends on each codec crate through a Cargo feature per codec and direction, and on the containers, the core and the syntax crates unconditionally, so a build names only the codecs it uses (#635). Each codec crate's factory selects between its software implementation and the hardware backends, behind the codec crate's `hardware` feature, so `zvidlib-hardware` sits below the codec crates and depends only on the syntax and color crates; the one thing a backend needs from a software codec, VideoToolbox's replay of a hidden VP9 frame, is handed to it by the VP9 decoder as a function. Tests, fixtures and benchmarks live in the crate they exercise; the root package keeps the API-level and CI-level ones.
 
 Circular dependencies are forbidden. In particular, timeline and media values cannot depend on a container, codec, or platform implementation; container code cannot depend on GL/WebGL; and codec backends cannot directly drive playback. The crate graph enforces the first two.
 

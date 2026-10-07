@@ -505,11 +505,7 @@ fn each_job_runs_on_the_files_it_reads() {
         // Formatting and lints cover every target, browser modules included.
         ("rust", "src/lib.rs", true),
         ("rust", "src/wasm_api.rs", true),
-        (
-            "rust",
-            "crates/zvidlib-hevc-decoder/src/engine/mod.rs",
-            true,
-        ),
+        ("rust", "crates/zvidlib-hevc/src/engine/mod.rs", true),
         ("rust", "crates/zvidlib-opus/tests/opus_codec.rs", true),
         ("rust", "crates/zvidlib-av1/benches/codec.rs", true),
         ("rust", "benches/audio_mux.rs", true),
@@ -529,11 +525,7 @@ fn each_job_runs_on_the_files_it_reads() {
         ("wasm", "src/lib.rs", true),
         ("wasm", "src/wasm_api.rs", true),
         ("wasm", "crates/zvidlib-hevc-decoder/src/lib.rs", true),
-        (
-            "wasm",
-            "crates/zvidlib-hevc-decoder/src/engine/mod.rs",
-            true,
-        ),
+        ("wasm", "crates/zvidlib-hevc/src/engine/mod.rs", true),
         ("wasm", "crates/zvidlib-color/src/color_convert.rs", true),
         ("wasm", "js/browser.js", true),
         (
