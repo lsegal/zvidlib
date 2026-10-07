@@ -358,7 +358,7 @@ impl Isa {
 /// Detects the widest backend the running CPU supports, once per process.
 ///
 /// NEON is architecturally mandatory on AArch64, so `aarch64` reports
-/// [`Isa::Neon`] unconditionally; `x86_64` probes AVX2 then SSE4.1 at
+/// `Isa::Neon` unconditionally; `x86_64` probes AVX2 then SSE4.1 at
 /// runtime; every other target (including `wasm32`) reports
 /// [`Isa::Scalar`].
 ///

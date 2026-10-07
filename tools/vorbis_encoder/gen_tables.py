@@ -41,7 +41,7 @@ import numpy as np
 
 # The repository root: this file is tools/vorbis_encoder/gen_tables.py.
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-OUTDIR = os.path.join(ROOT, "src", "vorbis_encoder", "tables")
+OUTDIR = os.path.join(ROOT, "crates", "zvidlib-vorbis-encoder", "src", "vorbis_encoder", "tables")
 
 # --------------------------------------------------------------------------
 # Tokenizer / parser

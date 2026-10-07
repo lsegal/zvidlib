@@ -2,7 +2,7 @@
 //!
 //! It decodes HEVC Main for the HEVC factory, VP8 for the VP8 factory and VP9 profile 0 for the
 //! VP9 factory. They share the driver loading, the worker thread that owns the CUDA context, and
-//! the parser callbacks; a [`Bitstream`] holds what differs between them.
+//! the parser callbacks; a `Bitstream` holds what differs between them.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, VecDeque};

@@ -399,7 +399,7 @@ fn hardware_output_muxes_to_an_mp4_that_avfoundation_plays_and_decodes() {
     std::fs::write(&path, &bytes).unwrap();
     let _cleanup = RemoveOnDrop(path.clone());
     let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("crates/zvidlib-hevc-encoder/tests/support/avfoundation_decode.swift");
+        .join("tests/support/avfoundation_decode.swift");
     // The Swift toolchain comes with the Xcode command line tools this crate
     // already needs to build its Swift bridge on macOS, so a missing `swift`
     // is a broken host rather than a reason to skip.

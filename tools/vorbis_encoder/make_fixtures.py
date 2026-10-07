@@ -124,7 +124,9 @@ def main():
             q = "Some(%s_f32)" % np.format_float_positional(v, unique=True, trim="0")
         lines.append("    (%s, %s, %s, %s)," % (f[0], f[1], f[2], q))
     lines.append("];")
-    path = os.path.join(ROOT, "src", "vorbis_encoder", "test_fixtures.rs")
+    path = os.path.join(
+        ROOT, "crates", "zvidlib-vorbis-encoder", "src", "vorbis_encoder", "test_fixtures.rs"
+    )
     with open(path, "w", newline="\n") as fh:
         fh.write("\n".join(lines) + "\n")
     print("wrote", path)
