@@ -19,7 +19,7 @@ zvidlib-core = { workspace = true }
 zvidlib-color = { workspace = true }
 zvidlib-vp9-syntax = { workspace = true }
 zvidlib-vp9-decoder = { workspace = true }
-zvidlib-hardware = { workspace = true }
+zvidlib-hardware = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
@@ -27,6 +27,11 @@ zvidlib-bench-support = { path = "../zvidlib-bench-support" }
 zvidlib-container = { path = "../zvidlib-container" }
 
 [features]
+default = ["hardware"]
+# The platform hardware backends (NVDEC, Media Foundation, VideoToolbox). With
+# it off the crate is pure Rust, and `HardwarePreference::Require` reports
+# `HardwareUnavailable` as it does on a host without a backend (#635).
+hardware = ["dep:zvidlib-hardware"]
 # Additive, off by default, and gating no code: the benchmark harness folds it
 # into every criterion group name (`simd=off` / `simd=on`), as zvidlib's own
 # `simd` feature does, so the two arms are recorded separately.

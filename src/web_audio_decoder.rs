@@ -114,7 +114,7 @@ enum BackendChoice {
     Automatic,
     /// Software whatever the browser supports, so a test covers the fallback
     /// even in a browser that decodes the codec itself.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "all"))]
     SoftwareOnly,
 }
 
@@ -144,6 +144,7 @@ impl WebAudioDecodeSession {
         let config = WebAudioDecoderConfig::for_track(&track)?;
         let packets = track.to_encoded_audio_samples(&source, limits).await?;
         let (software, preroll): (Option<Box<dyn AudioDecoder>>, usize) = match track.codec {
+            #[cfg(feature = "opus-decoder")]
             Codec::Opus => (
                 Some(Box::new(crate::NativeOpusDecoder::new(
                     &track.opus_config()?,
@@ -151,6 +152,11 @@ impl WebAudioDecodeSession {
                 )?)),
                 crate::opus_preroll_packets(&packets),
             ),
+            // A build without the codec's feature has only WebCodecs to decode
+            // it with.
+            #[cfg(not(feature = "opus-decoder"))]
+            Codec::Opus => (None, crate::opus_preroll_packets(&packets)),
+            #[cfg(feature = "vorbis-decoder")]
             Codec::Vorbis => (
                 Some(Box::new(crate::NativeVorbisDecoder::new(
                     &track.vorbis_config()?,
@@ -158,6 +164,8 @@ impl WebAudioDecodeSession {
                 )?)),
                 crate::VORBIS_PREROLL_PACKETS,
             ),
+            #[cfg(not(feature = "vorbis-decoder"))]
+            Codec::Vorbis => (None, crate::VORBIS_PREROLL_PACKETS),
             _ => (None, AAC_PREROLL_PACKETS),
         };
 
@@ -173,7 +181,7 @@ impl WebAudioDecodeSession {
                 .unchecked_into();
                 support.get_supported().unwrap_or(false)
             }
-            #[cfg(test)]
+            #[cfg(all(test, feature = "all"))]
             BackendChoice::SoftwareOnly => false,
         };
         if !webcodecs_supported && software.is_none() {
@@ -216,13 +224,13 @@ impl WebAudioDecodeSession {
 
     /// Whether reads go through the software decoder because `WebCodecs`
     /// cannot decode the track, or decoded it wrongly.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "all"))]
     pub(crate) fn is_software(&self) -> bool {
         self.webcodecs.is_none()
     }
 
     /// Drops the `WebCodecs` decoder, so reads go through software.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "all"))]
     pub(crate) fn reset_to_software(&mut self) {
         self.webcodecs = None;
     }
@@ -478,7 +486,9 @@ fn split_into_packets(
     Ok(buffers)
 }
 
-#[cfg(test)]
+// The browser tests round-trip media through every native codec, so they
+// build with the whole codec matrix.
+#[cfg(all(test, feature = "all"))]
 pub(crate) mod tests {
     use super::*;
     use crate::io::MemorySink;

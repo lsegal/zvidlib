@@ -18,7 +18,7 @@ pub mod encoder;
 // internal — the HEVC engine with its encoder half; not part of the stable API
 #[doc(hidden)]
 pub mod engine {
-    pub use zvidlib_hevc_decoder::engine::*;
+    pub use zvidlib_hevc::engine::*;
     pub mod encoder;
 }
 
@@ -26,9 +26,9 @@ pub use encoder::native_hevc_video_encoder_factory;
 
 #[allow(unused_imports)]
 use zvidlib_core::*;
-#[cfg(target_os = "macos")]
+#[cfg(all(feature = "hardware", target_os = "macos"))]
 use zvidlib_hardware::videotoolbox_encoder;
-#[cfg(windows)]
+#[cfg(all(feature = "hardware", windows))]
 use zvidlib_hardware::windows_mf_encoder;
 #[cfg(test)]
 #[allow(unused_imports)]

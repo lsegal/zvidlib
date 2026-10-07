@@ -13,12 +13,13 @@ exclude = ["/tests", "/benches"]
 
 [dependencies]
 zvidlib-core = { workspace = true }
-zvidlib-vorbis-decoder = { workspace = true }
+zvidlib-vorbis-syntax = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
 zvidlib-bench-support = { path = "../zvidlib-bench-support" }
 zvidlib-container = { path = "../zvidlib-container" }
+zvidlib-vorbis-decoder = { path = "../zvidlib-vorbis-decoder" }
 
 [features]
 # Additive, off by default, and gating no code: the benchmark harness folds it

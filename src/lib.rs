@@ -9,6 +9,7 @@
 // The library is a workspace of codec, container and shared-core crates
 // (#604); these re-export their modules under the paths they had when they
 // were modules of this crate.
+#[cfg(any(feature = "av1-decoder", feature = "av1-encoder"))]
 #[doc(inline)]
 pub use zvidlib_av1::{
     av1_entropy, av1_filters, av1_inter_decoder, av1_intra, av1_intra_decoder, av1_intra_pred,
@@ -22,49 +23,74 @@ pub use zvidlib_container::{
 };
 #[doc(inline)]
 pub use zvidlib_core::{api, audio, codec, io, media, timeline, transfer};
+/// Opus configuration records, packet timing and, with the `opus-decoder` or
+/// `opus-encoder` feature, the native Opus codec.
+#[cfg(any(feature = "opus-decoder", feature = "opus-encoder"))]
 #[doc(inline)]
 pub use zvidlib_opus as opus;
+#[cfg(not(any(feature = "opus-decoder", feature = "opus-encoder")))]
+#[doc(inline)]
+pub use zvidlib_opus_syntax as opus;
 pub mod output;
 pub mod playback;
 pub mod previews;
 pub mod simd;
 pub mod vorbis;
 
-#[cfg(not(target_arch = "wasm32"))]
+// The AAC encoder, and the platform bindings the macOS and Windows AAC decoders
+// share with it.
+#[cfg(all(
+    any(
+        feature = "aac-encoder",
+        all(feature = "aac-decoder", any(target_os = "macos", windows))
+    ),
+    not(target_arch = "wasm32")
+))]
 use zvidlib_aac_encoder as aac_encoder;
+#[cfg(feature = "av1-decoder")]
 use zvidlib_av1_decoder as av1_decoder;
+#[cfg(feature = "av1-encoder")]
 use zvidlib_av1_encoder as av1_encoder;
+#[cfg(any(feature = "vp8-decoder", feature = "vp8-encoder"))]
 use zvidlib_vp8 as vp8;
+#[cfg(feature = "vp9-decoder")]
 use zvidlib_vp9_decoder as vp9_decoder;
+#[cfg(feature = "vp9-encoder")]
 use zvidlib_vp9_encoder as vp9_encoder;
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "hevc-encoder", not(target_arch = "wasm32")))]
 #[doc(hidden)]
 pub use zvidlib_hevc_encoder::bench as hevc_encoder_bench;
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "hevc-decoder", not(target_arch = "wasm32")))]
 #[doc(hidden)]
 pub use zvidlib_hevc_decoder::decode_bench as hevc_decoder_bench;
 
+#[cfg(feature = "vp9-decoder")]
 #[doc(hidden)]
 pub use zvidlib_vp9_decoder::vp9_simd::bench as vp9_decoder_bench;
 
+#[cfg(feature = "vorbis-decoder")]
 #[doc(hidden)]
 pub use zvidlib_vorbis_decoder::vorbis_simd::bench as vorbis_decoder_bench;
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "hevc-decoder", not(target_arch = "wasm32")))]
 #[doc(hidden)]
 pub use zvidlib_hevc_decoder::decode_profile as hevc_decode_profile;
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "hevc-decoder", not(target_arch = "wasm32")))]
 #[doc(hidden)]
 pub use zvidlib_hevc_decoder::narrow_interp as hevc_narrow_interp;
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(
+    feature = "hevc-decoder",
+    feature = "hardware",
+    not(target_arch = "wasm32")
+))]
 #[doc(hidden)]
-pub use zvidlib_hardware::readback as hevc_hardware_readback;
+pub use zvidlib_hevc_decoder::readback as hevc_hardware_readback;
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "vp9-encoder", not(target_arch = "wasm32")))]
 #[doc(hidden)]
 pub use vp9_encoder::bench as vp9_encoder_bench;
 
@@ -111,34 +137,40 @@ pub use av1::{
 /// the encoder's forward WHT, symbol coder, tile encoder and bitstream writers
 /// are not otherwise reachable from a benchmark, which is a separate crate.
 /// See `crates/zvidlib-av1-encoder/benches/av1_encode.rs`.
+#[cfg(feature = "av1-encoder")]
 #[doc(hidden)]
 pub use av1_encoder::bench as av1_encoder_bench;
+#[cfg(feature = "av1-encoder")]
 #[doc(inline)]
 pub use av1_encoder::native_av1_video_encoder_factory;
+#[cfg(any(feature = "av1-decoder", feature = "av1-encoder"))]
 #[doc(no_inline)]
 pub use av1_entropy::{AV1_CDF_MAX, Av1SymbolDecoder, validate_cdf};
+#[cfg(any(feature = "av1-decoder", feature = "av1-encoder"))]
 #[doc(no_inline)]
 pub use av1_filters::{
     CdefStrength, FilmGrainParams, FilterFrame, FilterPlane, LoopFilterParams, MatrixCoefficients,
     RestorationUnit, TxSizeGrid, apply_film_grain, apply_restoration_unit, cdef_frame,
     convert_to_rgba8, deblock_frame, super_resolution_upscale,
 };
+#[cfg(any(feature = "av1-decoder", feature = "av1-encoder"))]
 #[doc(no_inline)]
 pub use av1_inter_decoder::Av1InterDecoder;
+#[cfg(any(feature = "av1-decoder", feature = "av1-encoder"))]
 #[doc(no_inline)]
 pub use av1_intra::{
     Av1IntraBlock, Av1IntraFrame, Av1IntraMode, Av1TxType, Tx1d, get_ac_quant, get_dc_quant,
     inverse_transform, inverse_wht_4x4,
 };
+#[cfg(any(feature = "av1-decoder", feature = "av1-encoder"))]
 #[doc(no_inline)]
 pub use av1_intra_decoder::{decode_av1_lossless_intra, decode_av1_lossless_intra_with_tx_sizes};
+#[cfg(any(feature = "av1-decoder", feature = "av1-encoder"))]
 #[doc(no_inline)]
 pub use av1_intra_pred::{
     Av1IntraSimd, SmoothMode, add_residual_row, av1_intra_simd, directional_row, paeth_row,
     smooth_row, sum_samples,
 };
-#[doc(no_inline)]
-pub use av1_simd::SimdIsa;
 #[doc(no_inline)]
 pub use codec::{
     AudioDrain, AudioEncoder, AudioEncoderConfig, AudioEncoderFactory, AudioEncoderFormat,
@@ -171,10 +203,15 @@ pub use mp4::{CoverArt, CoverArtFormat};
 pub use mp4_demux::{
     AacTrackConfig, EditMapping, Mp4Demuxer, Mp4DemuxerOptions, Mp4Sample, Mp4Track, probe_mp4,
 };
+#[cfg(feature = "opus-decoder")]
+#[doc(no_inline)]
+pub use opus::NativeOpusDecoder;
+#[cfg(feature = "opus-encoder")]
+#[doc(no_inline)]
+pub use opus::native_opus_audio_encoder_factory;
 #[doc(no_inline)]
 pub use opus::{
-    NativeOpusDecoder, OPUS_PREROLL_SAMPLES, OPUS_SAMPLE_RATE, OpusHead,
-    native_opus_audio_encoder_factory, opus_packet_samples, opus_preroll_packets,
+    OPUS_PREROLL_SAMPLES, OPUS_SAMPLE_RATE, OpusHead, opus_packet_samples, opus_preroll_packets,
 };
 #[doc(no_inline)]
 pub use output::{MediaOutput, OutputOptions};
@@ -195,10 +232,14 @@ pub use transfer::{
     Orientation, ResourceKind, ResourceOwnership, ScaleFilter, TransferCapability, TransferPolicy,
     TransferStage, execute_transfer, inspect_transfer,
 };
+#[cfg(feature = "vorbis-decoder")]
 #[doc(no_inline)]
-pub use vorbis::{
-    NativeVorbisDecoder, VORBIS_PREROLL_PACKETS, VorbisConfig, native_vorbis_audio_encoder_factory,
-};
+pub use vorbis::NativeVorbisDecoder;
+#[cfg(feature = "vorbis-encoder")]
+#[doc(no_inline)]
+pub use vorbis::native_vorbis_audio_encoder_factory;
+#[doc(no_inline)]
+pub use vorbis::{VORBIS_PREROLL_PACKETS, VorbisConfig};
 /// Per-stage access to the native VP8 encoder for the criterion benchmark
 /// suite.
 ///
@@ -206,10 +247,14 @@ pub use vorbis::{
 /// the encoder's distortion metrics, transforms, quantization, prediction and
 /// loop filter are not otherwise reachable from a benchmark, which is a
 /// separate crate. See `crates/zvidlib-vp8/benches/vp8_encode.rs`.
+#[cfg(feature = "vp8-encoder")]
 #[doc(hidden)]
 pub use vp8::bench as vp8_encoder_bench;
+#[cfg(any(feature = "av1-decoder", feature = "av1-encoder"))]
 #[doc(inline)]
 pub use zvidlib_av1::forward_transform;
+#[doc(no_inline)]
+pub use zvidlib_core::SimdIsa;
 
 /// Per-stage access to the native VP8 decoder for the criterion benchmark
 /// suite.
@@ -218,8 +263,10 @@ pub use zvidlib_av1::forward_transform;
 /// [`vp8_encoder_bench`]: the stages only the decoder takes and its whole-frame
 /// decode, which a benchmark, being a separate crate, cannot otherwise reach.
 /// See `crates/zvidlib-vp8/benches/vp8_decode.rs`.
+#[cfg(feature = "vp8-decoder")]
 #[doc(hidden)]
 pub use vp8::decode_bench as vp8_decoder_bench;
+#[cfg(feature = "vp9-encoder")]
 #[doc(inline)]
 pub use vp9_encoder::native_vp9_video_encoder_factory;
 #[doc(no_inline)]
@@ -230,22 +277,31 @@ pub use webm_demux::{
     probe_webm,
 };
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "aac-encoder", not(target_arch = "wasm32")))]
 #[doc(inline)]
 pub use aac_encoder::native_aac_audio_encoder_factory;
+#[cfg(feature = "av1-decoder")]
 #[doc(inline)]
 pub use av1_decoder::native_av1_video_decoder_factory;
 #[cfg(not(target_arch = "wasm32"))]
-pub use native_audio::{DefaultAudioOutput, NativeAacDecoder};
+pub use native_audio::DefaultAudioOutput;
+#[cfg(all(feature = "aac-decoder", not(target_arch = "wasm32")))]
+pub use native_audio::NativeAacDecoder;
 #[cfg(not(target_arch = "wasm32"))]
 #[doc(no_inline)]
 pub use previews::PreviewIndex;
+#[cfg(feature = "vp8-decoder")]
 #[doc(inline)]
-pub use vp8::{native_vp8_video_decoder_factory, native_vp8_video_encoder_factory};
+pub use vp8::native_vp8_video_decoder_factory;
+#[cfg(feature = "vp8-encoder")]
+#[doc(inline)]
+pub use vp8::native_vp8_video_encoder_factory;
+#[cfg(feature = "vp9-decoder")]
 #[doc(inline)]
 pub use vp9_decoder::native_vp9_video_decoder_factory;
+#[cfg(feature = "hevc-decoder")]
 #[doc(inline)]
 pub use zvidlib_hevc_decoder::native_hevc_video_decoder_factory;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "hevc-encoder", not(target_arch = "wasm32")))]
 #[doc(inline)]
 pub use zvidlib_hevc_encoder::native_hevc_video_encoder_factory;

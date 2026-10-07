@@ -268,7 +268,7 @@ fn decodes_a_webm_vp8_track_exactly_as_libvpx_does() {
 /// and an NVIDIA adapter does; this reaches Media Foundation there too. Hosts
 /// whose adapter lacks the D3D11 VP8 decoder profile, or that have no
 /// D3D11-aware VP8 decoder transform installed, skip with the reason.
-#[cfg(windows)]
+#[cfg(all(feature = "hardware", windows))]
 #[test]
 fn media_foundation_vp8_matches_the_software_decoder_and_seeks_exactly() {
     use crate::{

@@ -17,21 +17,28 @@ pub use engine::inter_pred::narrow_interp;
 pub use engine::profile as decode_profile;
 // internal — the HEVC engine, shared with the encoder crate; not part of the stable API
 #[doc(hidden)]
-pub mod engine;
+pub use zvidlib_hevc::engine;
 
 #[allow(unused_imports)]
 use zvidlib_color::color_convert;
 #[allow(unused_imports)]
 use zvidlib_core::*;
 // The platform backends the factory selects between.
-#[cfg(all(any(windows, target_os = "linux"), target_pointer_width = "64"))]
+#[cfg(all(
+    feature = "hardware",
+    any(windows, target_os = "linux"),
+    target_pointer_width = "64"
+))]
 use zvidlib_hardware::nvdec;
-#[cfg(not(target_arch = "wasm32"))]
+// internal — the hardware backends' readback seam, re-exported for the
+// benchmark suite; not part of the stable API
+#[cfg(all(feature = "hardware", not(target_arch = "wasm32")))]
 #[allow(unused_imports)]
-use zvidlib_hardware::readback;
-#[cfg(target_os = "macos")]
+#[doc(hidden)]
+pub use zvidlib_hardware::readback;
+#[cfg(all(feature = "hardware", target_os = "macos"))]
 use zvidlib_hardware::videotoolbox;
-#[cfg(windows)]
+#[cfg(all(feature = "hardware", windows))]
 use zvidlib_hardware::windows_mf;
 // The containers and conformance harness the tests read their fixtures with.
 #[cfg(test)]
@@ -138,21 +145,28 @@ impl VideoDecoderFactory for HevcDecoderFactory {
             ));
         }
         if configuration.hardware != HardwarePreference::Avoid && !parsed.high_bit_depth {
-            #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
+            #[cfg_attr(
+                any(target_arch = "wasm32", not(feature = "hardware")),
+                allow(unused_mut)
+            )]
             let mut hardware_errors = Vec::<String>::new();
-            #[cfg(all(any(windows, target_os = "linux"), target_pointer_width = "64"))]
+            #[cfg(all(
+                feature = "hardware",
+                any(windows, target_os = "linux"),
+                target_pointer_width = "64"
+            ))]
             match nvdec::create(configuration, limits, &parsed.record) {
                 Ok(decoder) => return Ok(decoder),
                 Err(error) => hardware_errors.push(format!("NVDEC: {}", error.message())),
             }
-            #[cfg(windows)]
+            #[cfg(all(feature = "hardware", windows))]
             match windows_mf::create(configuration, limits, &parsed.record) {
                 Ok(decoder) => return Ok(decoder),
                 Err(error) => {
                     hardware_errors.push(format!("Media Foundation: {}", error.message()));
                 }
             }
-            #[cfg(target_os = "macos")]
+            #[cfg(all(feature = "hardware", target_os = "macos"))]
             match videotoolbox::create(configuration, limits, &parsed.record) {
                 Ok(decoder) => return Ok(decoder),
                 Err(error) => {
@@ -203,15 +217,19 @@ impl HevcDecoderFactory {
 }
 
 fn hardware_available(_configuration: &VideoDecoderConfig) -> bool {
-    #[cfg(all(any(windows, target_os = "linux"), target_pointer_width = "64"))]
+    #[cfg(all(
+        feature = "hardware",
+        any(windows, target_os = "linux"),
+        target_pointer_width = "64"
+    ))]
     if nvdec::is_available(_configuration.coded_dimensions) {
         return true;
     }
-    #[cfg(windows)]
+    #[cfg(all(feature = "hardware", windows))]
     if windows_mf::is_available(_configuration.coded_dimensions) {
         return true;
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(all(feature = "hardware", target_os = "macos"))]
     if videotoolbox::is_available(_configuration.coded_dimensions) {
         return true;
     }

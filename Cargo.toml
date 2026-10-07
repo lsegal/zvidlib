@@ -28,12 +28,15 @@ zvidlib-av1-encoder = { path = "crates/zvidlib-av1-encoder", version = "=0.4.0" 
 zvidlib-vp9-syntax = { path = "crates/zvidlib-vp9-syntax", version = "=0.4.0" }
 zvidlib-hevc-syntax = { path = "crates/zvidlib-hevc-syntax", version = "=0.4.0" }
 zvidlib-hardware = { path = "crates/zvidlib-hardware", version = "=0.4.0" }
-zvidlib-vp8 = { path = "crates/zvidlib-vp8", version = "=0.4.0" }
-zvidlib-vp9-decoder = { path = "crates/zvidlib-vp9-decoder", version = "=0.4.0" }
-zvidlib-vp9-encoder = { path = "crates/zvidlib-vp9-encoder", version = "=0.4.0" }
-zvidlib-hevc-decoder = { path = "crates/zvidlib-hevc-decoder", version = "=0.4.0" }
-zvidlib-hevc-encoder = { path = "crates/zvidlib-hevc-encoder", version = "=0.4.0" }
+zvidlib-vp8 = { path = "crates/zvidlib-vp8", version = "=0.4.0", default-features = false }
+zvidlib-vp9-decoder = { path = "crates/zvidlib-vp9-decoder", version = "=0.4.0", default-features = false }
+zvidlib-vp9-encoder = { path = "crates/zvidlib-vp9-encoder", version = "=0.4.0", default-features = false }
+zvidlib-hevc = { path = "crates/zvidlib-hevc", version = "=0.4.0" }
+zvidlib-hevc-decoder = { path = "crates/zvidlib-hevc-decoder", version = "=0.4.0", default-features = false }
+zvidlib-hevc-encoder = { path = "crates/zvidlib-hevc-encoder", version = "=0.4.0", default-features = false }
 zvidlib-opus = { path = "crates/zvidlib-opus", version = "=0.4.0" }
+zvidlib-opus-syntax = { path = "crates/zvidlib-opus-syntax", version = "=0.4.0" }
+zvidlib-vorbis-syntax = { path = "crates/zvidlib-vorbis-syntax", version = "=0.4.0" }
 zvidlib-vorbis-decoder = { path = "crates/zvidlib-vorbis-decoder", version = "=0.4.0" }
 zvidlib-vorbis-encoder = { path = "crates/zvidlib-vorbis-encoder", version = "=0.4.0" }
 zvidlib-aac-encoder = { path = "crates/zvidlib-aac-encoder", version = "=0.4.0" }
@@ -77,7 +80,7 @@ crate-type = ["rlib", "cdylib"]
 [[example]]
 name = "native_gl"
 path = "examples/native_gl/main.rs"
-required-features = ["native"]
+required-features = ["native", "hevc-decoder", "aac-decoder", "opus-decoder"]
 # The example's bitmap-font overlay helpers carry unit tests; `test = true` lets
 # `cargo test --features native --example native_gl` run them.
 test = true
@@ -89,12 +92,12 @@ test = true
 [[example]]
 name = "hevc_decode_profile"
 path = "examples/hevc_decode_profile.rs"
-required-features = ["native"]
+required-features = ["native", "hevc-decoder"]
 
 [[example]]
 name = "native_encode"
 path = "examples/native_encode.rs"
-required-features = ["native"]
+required-features = ["native", "av1-encoder"]
 
 # Criterion drives its own harness (`harness = false`), so the bench targets must
 # not link libtest. These are the targets that measure zvidlib as a whole; each
@@ -108,6 +111,7 @@ required-features = ["native"]
 name = "audio_decode"
 path = "benches/audio_decode.rs"
 harness = false
+required-features = ["aac-decoder", "vorbis-decoder"]
 
 # The audio write/read path is a separate target rather than another group in
 # `codec`: it shares `benches/support/` but none of `codec`'s decoded-frame
@@ -127,6 +131,7 @@ harness = false
 name = "exact_seek"
 path = "benches/exact_seek.rs"
 harness = false
+required-features = ["hevc-decoder"]
 
 # The VP8 and VP9 software decoders, and the YUV-to-RGBA output conversion they
 # share with the AV1 decoder (issue #574). A separate target because it decodes
@@ -136,12 +141,87 @@ harness = false
 name = "vpx_decode"
 path = "benches/vpx_decode.rs"
 harness = false
+required-features = ["av1-decoder", "vp8-decoder", "vp8-encoder", "vp9-decoder", "vp9-encoder"]
+
+# The integration tests that exercise a codec build only with its feature, so a
+# `--no-default-features` build of the test targets still compiles (#635).
+[[test]]
+name = "native_aac_decoder"
+path = "tests/native_aac_decoder.rs"
+required-features = ["aac-decoder"]
+
+[[test]]
+name = "native_aac_encoder"
+path = "tests/native_aac_encoder.rs"
+required-features = ["aac-decoder", "aac-encoder", "av1-encoder"]
+
+[[test]]
+name = "preview_index"
+path = "tests/preview_index.rs"
+required-features = ["hevc-decoder"]
+
+[[test]]
+name = "vp8_preview_index"
+path = "tests/vp8_preview_index.rs"
+required-features = ["vp8-decoder"]
 
 [build-dependencies]
 zvidlib-build = { workspace = true }
 
 [features]
-default = []
+# Every codec, with the platform hardware backends, so `zvidlib = "..."` keeps
+# the whole matrix. Depend on zvidlib with `default-features = false` and name
+# the codec features below to build only the codecs and directions an
+# application uses (#635).
+default = ["all", "hardware"]
+all = ["av1", "vp8", "vp9", "hevc", "opus", "vorbis", "aac"]
+# One shorthand per codec, enabling both of its directions. They mix freely
+# with the direction features: `features = ["av1", "hevc-encoder"]`.
+av1 = ["av1-decoder", "av1-encoder"]
+vp8 = ["vp8-decoder", "vp8-encoder"]
+vp9 = ["vp9-decoder", "vp9-encoder"]
+hevc = ["hevc-decoder", "hevc-encoder"]
+opus = ["opus-decoder", "opus-encoder"]
+vorbis = ["vorbis-decoder", "vorbis-encoder"]
+aac = ["aac-decoder", "aac-encoder"]
+# The native codecs, one feature per codec and direction. Each is additive and
+# enables only the crates that direction needs; where one crate implements both
+# directions (VP8, Opus), both features enable it. The containers, the shared
+# core and the codec syntax crates they write configuration records with are
+# built in every configuration.
+av1-decoder = ["dep:zvidlib-av1", "dep:zvidlib-av1-decoder"]
+av1-encoder = ["dep:zvidlib-av1", "dep:zvidlib-av1-encoder"]
+vp8-decoder = ["dep:zvidlib-vp8"]
+vp8-encoder = ["dep:zvidlib-vp8"]
+vp9-decoder = ["dep:zvidlib-vp9-decoder"]
+vp9-encoder = ["dep:zvidlib-vp9-encoder"]
+hevc-decoder = ["dep:zvidlib-hevc-decoder"]
+hevc-encoder = ["dep:zvidlib-hevc-encoder"]
+opus-decoder = ["dep:zvidlib-opus"]
+opus-encoder = ["dep:zvidlib-opus"]
+vorbis-decoder = ["dep:zvidlib-vorbis-decoder"]
+vorbis-encoder = ["dep:zvidlib-vorbis-encoder"]
+# AAC decodes through the platform's decoder (AudioToolbox on macOS, Media
+# Foundation on Windows), whose bindings it shares with the AAC encoder, and
+# through Symphonia's on Linux and the other native targets.
+aac-decoder = [
+    "dep:zvidlib-aac-encoder",
+    "dep:symphonia-codec-aac",
+    "dep:symphonia-core",
+    "dep:windows",
+]
+aac-encoder = ["dep:zvidlib-aac-encoder"]
+# The platform hardware video backends (NVDEC, Media Foundation, VideoToolbox)
+# for whichever enabled codecs have one. Without it the enabled codecs are pure
+# Rust: `HardwarePreference::Require` reports `HardwareUnavailable`, and
+# `Prefer` falls back to software as it does on a host with no backend.
+hardware = [
+    "zvidlib-vp8?/hardware",
+    "zvidlib-vp9-decoder?/hardware",
+    "zvidlib-vp9-encoder?/hardware",
+    "zvidlib-hevc-decoder?/hardware",
+    "zvidlib-hevc-encoder?/hardware",
+]
 # Additive, off by default. The crate's SIMD kernels dispatch at run time rather
 # than at compile time, so this feature intentionally gates no code today: it is
 # the switch the per-codec benchmark tickets code against, and the benchmark
@@ -161,21 +241,22 @@ web = [
 zvidlib-core = { workspace = true }
 zvidlib-color = { workspace = true }
 zvidlib-av1-syntax = { workspace = true }
-zvidlib-av1 = { workspace = true }
-zvidlib-av1-decoder = { workspace = true }
-zvidlib-av1-encoder = { workspace = true }
+zvidlib-av1 = { workspace = true, optional = true }
+zvidlib-av1-decoder = { workspace = true, optional = true }
+zvidlib-av1-encoder = { workspace = true, optional = true }
 zvidlib-vp9-syntax = { workspace = true }
 zvidlib-hevc-syntax = { workspace = true }
-zvidlib-hardware = { workspace = true }
-zvidlib-vp8 = { workspace = true }
-zvidlib-vp9-decoder = { workspace = true }
-zvidlib-vp9-encoder = { workspace = true }
-zvidlib-hevc-decoder = { workspace = true }
-zvidlib-hevc-encoder = { workspace = true }
-zvidlib-opus = { workspace = true }
-zvidlib-vorbis-decoder = { workspace = true }
-zvidlib-vorbis-encoder = { workspace = true }
-zvidlib-aac-encoder = { workspace = true }
+zvidlib-vp8 = { workspace = true, optional = true }
+zvidlib-vp9-decoder = { workspace = true, optional = true }
+zvidlib-vp9-encoder = { workspace = true, optional = true }
+zvidlib-hevc-decoder = { workspace = true, optional = true }
+zvidlib-hevc-encoder = { workspace = true, optional = true }
+zvidlib-opus-syntax = { workspace = true }
+zvidlib-opus = { workspace = true, optional = true }
+zvidlib-vorbis-syntax = { workspace = true }
+zvidlib-vorbis-decoder = { workspace = true, optional = true }
+zvidlib-vorbis-encoder = { workspace = true, optional = true }
+zvidlib-aac-encoder = { workspace = true, optional = true }
 zvidlib-container = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
@@ -250,11 +331,12 @@ cpal = "0.15.3"
 # macOS decodes through AudioToolbox and Windows through Media Foundation, so
 # only Linux and the other native targets carry Symphonia's (issue #561).
 [target.'cfg(not(any(target_arch = "wasm32", target_os = "macos", windows)))'.dependencies]
-symphonia-codec-aac = "0.5.5"
-symphonia-core = { workspace = true }
+symphonia-codec-aac = { version = "0.5.5", optional = true }
+symphonia-core = { workspace = true, optional = true }
 
+# The AAC decoder's Media Foundation backend.
 [target.'cfg(windows)'.dependencies]
-windows = { workspace = true }
+windows = { workspace = true, optional = true }
 
 # The native HEVC/AV1 decoders are pure-Rust software codecs with no fast path at opt-level 0,
 # so an unoptimized debug build is unusably slow. opt-level 2 keeps debug assertions and fast

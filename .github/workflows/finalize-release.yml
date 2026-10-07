@@ -74,7 +74,7 @@ jobs:
           # The benchmark helpers are development-only and never published.
           cargo package --workspace --exclude zvidlib-bench-support --locked
           cp target/package/*.crate release/
-          wasm-pack build --release --target web --out-dir pkg --no-default-features --features web
+          wasm-pack build --release --target web --out-dir pkg --features web
           (cd pkg && npm pack --pack-destination ../release)
           mv release/zvidlib-*.tgz "release/zvidlib-web-${TAG}.tgz"
       # `publish_crates.py` uploads every crate `cargo package` just verified,

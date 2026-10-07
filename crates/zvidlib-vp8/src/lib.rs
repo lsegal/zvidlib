@@ -137,16 +137,23 @@ impl VideoDecoderFactory for Vp8DecoderFactory {
         }
         if configuration.hardware != HardwarePreference::Avoid {
             #[cfg_attr(
-                not(any(windows, all(target_os = "linux", target_pointer_width = "64"))),
+                not(all(
+                    feature = "hardware",
+                    any(windows, all(target_os = "linux", target_pointer_width = "64"))
+                )),
                 allow(unused_mut)
             )]
             let mut hardware_errors = Vec::<String>::new();
-            #[cfg(all(any(windows, target_os = "linux"), target_pointer_width = "64"))]
+            #[cfg(all(
+                feature = "hardware",
+                any(windows, target_os = "linux"),
+                target_pointer_width = "64"
+            ))]
             match zvidlib_hardware::nvdec::create_vp8(configuration, limits, planes_to_rgba) {
                 Ok(decoder) => return Ok(decoder),
                 Err(error) => hardware_errors.push(format!("NVDEC: {}", error.message())),
             }
-            #[cfg(windows)]
+            #[cfg(all(feature = "hardware", windows))]
             match zvidlib_hardware::windows_mf::create_vp8(configuration, limits, planes_to_rgba) {
                 Ok(decoder) => return Ok(decoder),
                 Err(error) => {
@@ -193,11 +200,15 @@ impl Vp8DecoderFactory {
 }
 
 fn hardware_available(_configuration: &VideoDecoderConfig) -> bool {
-    #[cfg(all(any(windows, target_os = "linux"), target_pointer_width = "64"))]
+    #[cfg(all(
+        feature = "hardware",
+        any(windows, target_os = "linux"),
+        target_pointer_width = "64"
+    ))]
     if zvidlib_hardware::nvdec::is_vp8_available(_configuration.coded_dimensions) {
         return true;
     }
-    #[cfg(windows)]
+    #[cfg(all(feature = "hardware", windows))]
     if zvidlib_hardware::windows_mf::is_vp8_available(_configuration.coded_dimensions) {
         return true;
     }
@@ -255,7 +266,10 @@ impl VideoDecoder for Vp8Decoder {
 
 /// Converts the cropped 4:2:0 planes a hardware decoder read back, so its pictures take exactly
 /// the software decoder's conversion.
-#[cfg(any(windows, all(target_os = "linux", target_pointer_width = "64")))]
+#[cfg(all(
+    feature = "hardware",
+    any(windows, all(target_os = "linux", target_pointer_width = "64"))
+))]
 pub(crate) fn planes_to_rgba(
     planes: [Vec<u8>; 3],
     configuration: &VideoDecoderConfig,

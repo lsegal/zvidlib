@@ -152,7 +152,7 @@ fn create_native(c: &VideoEncoderConfig, limits: &Limits) -> Result<Box<dyn Vide
 
 /// The platform encoders, behind one interface so the factory reads the same
 /// on every target.
-#[cfg(windows)]
+#[cfg(all(feature = "hardware", windows))]
 mod platform {
     use super::super::windows_mf_encoder::{self, MftClass, OutputFormat, Settings};
     use super::{OperatingPoint, parse_operating_point};
@@ -247,7 +247,7 @@ mod platform {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(feature = "hardware", target_os = "macos"))]
 mod platform {
     use super::super::videotoolbox_encoder::{self, Settings};
     use super::{OperatingPoint, parse_operating_point};
@@ -335,7 +335,7 @@ mod platform {
     }
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(not(all(feature = "hardware", any(windows, target_os = "macos"))))]
 mod platform {
     use crate::{
         CodecImplementation, CodecSupport, Error, ErrorKind, Limits, Result, VideoEncoder,

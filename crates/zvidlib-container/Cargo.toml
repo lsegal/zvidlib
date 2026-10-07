@@ -13,8 +13,8 @@ exclude = ["/tests"]
 
 [dependencies]
 zvidlib-core = { workspace = true }
-zvidlib-opus = { workspace = true }
-zvidlib-vorbis-decoder = { workspace = true }
+zvidlib-opus-syntax = { workspace = true }
+zvidlib-vorbis-syntax = { workspace = true }
 zvidlib-av1-syntax = { workspace = true }
 
 [dev-dependencies]

@@ -8,4 +8,4 @@ subprocess dependency.
 
 The upstream project is <https://github.com/OxideAV/oxideav-h265>. Its MIT
 license is reproduced in [`LICENSE`](LICENSE). Adapter code, resource-limit
-enforcement, output reordering, and RGBA conversion live one directory above.
+enforcement, output reordering, and RGBA conversion live in the `zvidlib-hevc-decoder` crate.

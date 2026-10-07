@@ -9,9 +9,14 @@
 //!
 //! Decoding runs on Symphonia's pure-Rust Vorbis decoder, and encoding on
 //! zvidlib's own port of the libvorbis encoder, so both work on every target
-//! zvidlib builds for, `wasm32` included.
+//! zvidlib builds for, `wasm32` included. They are built with the
+//! `vorbis-decoder` and `vorbis-encoder` features.
 
+#[cfg(feature = "vorbis-decoder")]
 #[doc(inline)]
-pub use zvidlib_vorbis_decoder::{NativeVorbisDecoder, VORBIS_PREROLL_PACKETS, VorbisConfig};
+pub use zvidlib_vorbis_decoder::NativeVorbisDecoder;
+#[cfg(feature = "vorbis-encoder")]
 #[doc(inline)]
 pub use zvidlib_vorbis_encoder::native_vorbis_audio_encoder_factory;
+#[doc(inline)]
+pub use zvidlib_vorbis_syntax::{VORBIS_PREROLL_PACKETS, VorbisConfig};

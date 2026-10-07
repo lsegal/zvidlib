@@ -395,11 +395,11 @@ zvidlib is published to [crates.io](https://crates.io/crates/zvidlib), with API 
 
 ```toml
 [dependencies]
-zvidlib = { version = "<version>", features = ["native"] }
+zvidlib = { version = "<version>" }
 ```
 
 with the latest version from crates.io in place of `<version>`, or run
-`cargo add zvidlib --features native`. The workspace's `zvidlib-*` crates are published
+`cargo add zvidlib`. The workspace's `zvidlib-*` crates are published
 alongside `zvidlib` at the same version, but they are implementation crates that `zvidlib`
 re-exports; depend on `zvidlib` only. The native API requires Rust 1.85 or later, as recorded by
 `rust-version` in `Cargo.toml`; platform codec adapters retain their documented platform capability
@@ -410,11 +410,55 @@ instead, with the release version in place of `X.Y.Z`:
 
 ```toml
 [dependencies]
-zvidlib = { git = "https://github.com/lsegal/zvidlib.git", tag = "vX.Y.Z", features = ["native"] }
+zvidlib = { git = "https://github.com/lsegal/zvidlib.git", tag = "vX.Y.Z" }
 ```
 
 Each GitHub release also attaches the `.crate` archives it published, such as `zvidlib-X.Y.Z.crate`,
 for inspection or offline packaging.
+
+### Choosing codecs
+
+Every native codec is a Cargo feature, one per codec and direction, and the
+default features enable all of them along with the platform hardware backends.
+An application that needs only some codecs turns the defaults off and names the
+ones it uses, and builds none of the others:
+
+```toml
+[dependencies]
+# Decode VP9 only, in software.
+zvidlib = { version = "<version>", default-features = false, features = ["vp9-decoder"] }
+# Both AV1 directions and the HEVC encoder, with hardware acceleration.
+zvidlib = { version = "<version>", default-features = false, features = ["av1", "hevc-encoder", "hardware"] }
+```
+
+| Codec | Decoder | Encoder | Both |
+| --- | --- | --- | --- |
+| AV1 | `av1-decoder` | `av1-encoder` | `av1` |
+| VP8 | `vp8-decoder` | `vp8-encoder` | `vp8` |
+| VP9 | `vp9-decoder` | `vp9-encoder` | `vp9` |
+| HEVC | `hevc-decoder` | `hevc-encoder` | `hevc` |
+| Opus | `opus-decoder` | `opus-encoder` | `opus` |
+| Vorbis | `vorbis-decoder` | `vorbis-encoder` | `vorbis` |
+| AAC | `aac-decoder` | `aac-encoder` | `aac` |
+
+- `all` enables every codec feature in the table. The default features are
+  `all` and `hardware`.
+- `hardware` builds the platform backends (NVDEC, Media Foundation,
+  VideoToolbox) for whichever enabled codecs have one. Without it the enabled
+  codecs are pure Rust: `HardwarePreference::Require` reports
+  `HardwareUnavailable`, and `Prefer` falls back to software, as it does on a
+  host with no backend.
+- Features are additive and mix freely. The containers, the codec traits and
+  the configuration records the containers read and write (`OpusHead`,
+  `VorbisConfig`, the AV1, VP9 and HEVC syntax) are built in every
+  configuration, so MP4 and WebM files with any track open regardless; a track
+  whose codec is not enabled has no native decoder or encoder.
+- The AAC decoder runs on the operating system's decoder on macOS and Windows
+  and on Symphonia's elsewhere; the AAC encoder needs macOS or Windows.
+- In a `web` build, a codec whose feature is off has no software fallback
+  behind `WebCodecs`.
+- `native` gates no library code. It only keeps the native-only examples out of
+  `wasm32` builds, so applications do not need it for the native codecs.
 
 The browser package is not on crates.io or npm: it is a GitHub release asset. For a browser build,
 download the `zvidlib-web-vX.Y.Z.tgz` asset from the
@@ -439,7 +483,7 @@ Install stable Rust with the `wasm32-unknown-unknown` target, then run:
 
 ```console
 cargo check --workspace --features native
-cargo check --target wasm32-unknown-unknown --no-default-features --features web
+cargo check --target wasm32-unknown-unknown --features web
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --features native -- -D warnings
 ```
@@ -478,14 +522,14 @@ The `web` feature excludes native-only integrations. During scaffold development
 
 ```console
 rustup target add wasm32-unknown-unknown
-cargo check --target wasm32-unknown-unknown --no-default-features --features web
+cargo check --target wasm32-unknown-unknown --features web
 ```
 
 Install [`wasm-pack`](https://rustwasm.github.io/wasm-pack/installer/) and create a browser-ready ES module package:
 
 ```console
 cargo install wasm-pack
-wasm-pack build --target web --out-dir pkg --no-default-features --features web
+wasm-pack build --target web --out-dir pkg --features web
 python -m http.server 8000
 ```
 
@@ -496,7 +540,7 @@ For the browser example specifically, `examples/web_canvas/package.json` wraps t
 Run the browser integration suite in an installed Chrome browser with:
 
 ```console
-wasm-pack test --headless --chrome --no-default-features --features web
+wasm-pack test --headless --chrome --features web
 ```
 
 The suite verifies Blob and stream input, cancellation, reader-lock cleanup, BigInt range handling, typed-array copy lifetimes, browser-object ownership, stable errors, Blob output, decoding the bundled HEVC sample and a VP9 track through WebCodecs, and the software fallback for browsers whose WebCodecs cannot decode a track. The base build does not require WASM threads or cross-origin isolation. Future optional threaded builds will document their additional headers and browser requirements separately.

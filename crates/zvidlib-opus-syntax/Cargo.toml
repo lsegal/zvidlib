@@ -1,0 +1,13 @@
+[package]
+name = "zvidlib-opus-syntax"
+description = "Opus configuration records and packet timing shared by zvidlib's containers and Opus codec"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+zvidlib-core = { workspace = true }

@@ -170,7 +170,7 @@ enum BackendChoice {
     Automatic,
     /// Software whatever the browser supports, so a test covers the fallback
     /// even in a browser that happens to decode the codec itself.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "all"))]
     SoftwareOnly,
 }
 
@@ -212,7 +212,7 @@ impl WebVideoDecodeSession {
                         .unchecked_into();
                 support.get_supported().unwrap_or(false)
             }
-            #[cfg(test)]
+            #[cfg(all(test, feature = "all"))]
             BackendChoice::SoftwareOnly => false,
         };
 
@@ -255,7 +255,7 @@ impl WebVideoDecodeSession {
     }
 
     /// Whether this session decodes in software because `WebCodecs` could not.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "all"))]
     fn is_software(&self) -> bool {
         matches!(self.backend, DecodeBackend::Software(_))
     }
@@ -263,7 +263,7 @@ impl WebVideoDecodeSession {
     /// Whether this browser decodes `track_index` of `bytes` through
     /// `WebCodecs`, for the tests that exercise that session's own behaviour
     /// and have nothing to check where the software fallback takes over.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "all"))]
     pub(crate) async fn decodes_through_webcodecs(bytes: &[u8], track_index: u32) -> bool {
         Self::open(bytes, track_index, &Limits::default())
             .await
@@ -292,15 +292,20 @@ impl WebVideoDecodeSession {
 /// The crate's own software decoder for `codec`.
 fn software_decoder_factory(codec: Codec) -> Result<Box<dyn VideoDecoderFactory>> {
     match codec {
+        #[cfg(feature = "hevc-decoder")]
         Codec::Hevc => Ok(Box::new(crate::native_hevc_video_decoder_factory())),
+        #[cfg(feature = "av1-decoder")]
         Codec::Av1 => Ok(Box::new(crate::native_av1_video_decoder_factory())),
+        #[cfg(feature = "vp8-decoder")]
         Codec::Vp8 => Ok(Box::new(crate::native_vp8_video_decoder_factory())),
+        #[cfg(feature = "vp9-decoder")]
         Codec::Vp9 => Ok(Box::new(crate::native_vp9_video_decoder_factory())),
-        // Uncompressed video, H.264, the audio codecs, and any codec a later
-        // zvidlib-core adds.
+        // Uncompressed video, H.264, the audio codecs, any codec a later
+        // zvidlib-core adds, and a decoder whose Cargo feature is off.
         _ => Err(Error::new(
             ErrorKind::Unsupported,
-            "only HEVC, AV1, VP8 and VP9 have a software decoder backend",
+            "only HEVC, AV1, VP8 and VP9 have a software decoder backend, each with its \
+             <codec>-decoder Cargo feature",
         )),
     }
 }
@@ -856,7 +861,9 @@ pub(crate) fn normalize_js_error(error: JsValue, context: &str) -> Error {
     Error::new(ErrorKind::Codec, format!("{context}: {detail}"))
 }
 
-#[cfg(test)]
+// The browser tests round-trip media through every native codec, so they
+// build with the whole codec matrix.
+#[cfg(all(test, feature = "all"))]
 mod tests {
     use super::*;
     use wasm_bindgen_test::*;

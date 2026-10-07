@@ -13,4 +13,5 @@ exclude = ["/tests"]
 
 [dependencies]
 zvidlib-core = { workspace = true }
+zvidlib-vorbis-syntax = { workspace = true }
 symphonia-core = { workspace = true }

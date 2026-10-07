@@ -196,12 +196,15 @@ jobs:
               - 'crates/zvidlib-container/**'
               - 'crates/zvidlib-core/**'
               - 'crates/zvidlib-hardware/**'
+              - 'crates/zvidlib-hevc/**'
               - 'crates/zvidlib-hevc-decoder/**'
               - 'crates/zvidlib-hevc-encoder/**'
               - 'crates/zvidlib-hevc-syntax/**'
               - 'crates/zvidlib-opus/**'
+              - 'crates/zvidlib-opus-syntax/**'
               - 'crates/zvidlib-vorbis-decoder/**'
               - 'crates/zvidlib-vorbis-encoder/**'
+              - 'crates/zvidlib-vorbis-syntax/**'
               - 'crates/zvidlib-vp8/**'
               - 'crates/zvidlib-vp9-decoder/**'
               - 'crates/zvidlib-vp9-encoder/**'
@@ -216,31 +219,31 @@ jobs:
               - 'crates/zvidlib-color/**'
               - 'crates/zvidlib-container/**'
               - 'crates/zvidlib-core/**'
-              - 'crates/zvidlib-opus/**'
-              - 'crates/zvidlib-vorbis-decoder/**'
+              - 'crates/zvidlib-opus-syntax/**'
+              - 'crates/zvidlib-vorbis-syntax/**'
             zvidlib-av1-decoder:
-              - 'crates/zvidlib-av1-decoder/**'
               - 'crates/zvidlib-av1/**'
+              - 'crates/zvidlib-av1-decoder/**'
               - 'crates/zvidlib-av1-encoder/**'
               - 'crates/zvidlib-av1-syntax/**'
               - 'crates/zvidlib-bench-support/**'
               - 'crates/zvidlib-color/**'
               - 'crates/zvidlib-container/**'
               - 'crates/zvidlib-core/**'
-              - 'crates/zvidlib-opus/**'
-              - 'crates/zvidlib-vorbis-decoder/**'
+              - 'crates/zvidlib-opus-syntax/**'
+              - 'crates/zvidlib-vorbis-syntax/**'
               - 'examples/media/**'
             zvidlib-av1-encoder:
-              - 'crates/zvidlib-av1-encoder/**'
               - 'crates/zvidlib-av1/**'
               - 'crates/zvidlib-av1-decoder/**'
+              - 'crates/zvidlib-av1-encoder/**'
               - 'crates/zvidlib-av1-syntax/**'
               - 'crates/zvidlib-bench-support/**'
               - 'crates/zvidlib-color/**'
               - 'crates/zvidlib-container/**'
               - 'crates/zvidlib-core/**'
-              - 'crates/zvidlib-opus/**'
-              - 'crates/zvidlib-vorbis-decoder/**'
+              - 'crates/zvidlib-opus-syntax/**'
+              - 'crates/zvidlib-vorbis-syntax/**'
             zvidlib-av1-syntax:
               - 'crates/zvidlib-av1-syntax/**'
               - 'crates/zvidlib-core/**'
@@ -253,33 +256,37 @@ jobs:
               - 'crates/zvidlib-color/**'
               - 'crates/zvidlib-core/**'
             zvidlib-container:
-              - 'crates/zvidlib-container/**'
               - 'crates/zvidlib-av1-decoder/**'
               - 'crates/zvidlib-av1-syntax/**'
               - 'crates/zvidlib-color/**'
+              - 'crates/zvidlib-container/**'
               - 'crates/zvidlib-core/**'
-              - 'crates/zvidlib-opus/**'
-              - 'crates/zvidlib-vorbis-decoder/**'
+              - 'crates/zvidlib-opus-syntax/**'
+              - 'crates/zvidlib-vorbis-syntax/**'
               - 'crates/zvidlib-vp9-decoder/tests/fixtures/vp9_bbb_256x144.mp4'
               - 'examples/media/**'
             zvidlib-core:
               - 'crates/zvidlib-core/**'
             zvidlib-hardware:
-              - 'crates/zvidlib-hardware/**'
               - 'crates/zvidlib-av1-syntax/**'
               - 'crates/zvidlib-build/**'
               - 'crates/zvidlib-color/**'
               - 'crates/zvidlib-container/**'
               - 'crates/zvidlib-core/**'
+              - 'crates/zvidlib-hardware/**'
+              - 'crates/zvidlib-hevc/**'
               - 'crates/zvidlib-hevc-decoder/**'
               - 'crates/zvidlib-hevc-encoder/**'
               - 'crates/zvidlib-hevc-syntax/**'
-              - 'crates/zvidlib-opus/**'
-              - 'crates/zvidlib-vorbis-decoder/**'
+              - 'crates/zvidlib-opus-syntax/**'
+              - 'crates/zvidlib-vorbis-syntax/**'
               - 'crates/zvidlib-vp9-decoder/**'
               - 'crates/zvidlib-vp9-syntax/**'
+            zvidlib-hevc:
+              - 'crates/zvidlib-core/**'
+              - 'crates/zvidlib-hevc/**'
+              - 'crates/zvidlib-hevc-syntax/**'
             zvidlib-hevc-decoder:
-              - 'crates/zvidlib-hevc-decoder/**'
               - 'crates/zvidlib-av1-syntax/**'
               - 'crates/zvidlib-bench-support/**'
               - 'crates/zvidlib-build/**'
@@ -287,14 +294,15 @@ jobs:
               - 'crates/zvidlib-container/**'
               - 'crates/zvidlib-core/**'
               - 'crates/zvidlib-hardware/**'
+              - 'crates/zvidlib-hevc/**'
+              - 'crates/zvidlib-hevc-decoder/**'
               - 'crates/zvidlib-hevc-encoder/**'
               - 'crates/zvidlib-hevc-syntax/**'
-              - 'crates/zvidlib-opus/**'
-              - 'crates/zvidlib-vorbis-decoder/**'
+              - 'crates/zvidlib-opus-syntax/**'
+              - 'crates/zvidlib-vorbis-syntax/**'
               - 'crates/zvidlib-vp9-syntax/**'
               - 'examples/media/**'
             zvidlib-hevc-encoder:
-              - 'crates/zvidlib-hevc-encoder/**'
               - 'crates/zvidlib-av1-syntax/**'
               - 'crates/zvidlib-bench-support/**'
               - 'crates/zvidlib-build/**'
@@ -302,33 +310,43 @@ jobs:
               - 'crates/zvidlib-container/**'
               - 'crates/zvidlib-core/**'
               - 'crates/zvidlib-hardware/**'
+              - 'crates/zvidlib-hevc/**'
               - 'crates/zvidlib-hevc-decoder/**'
+              - 'crates/zvidlib-hevc-encoder/**'
               - 'crates/zvidlib-hevc-syntax/**'
-              - 'crates/zvidlib-opus/**'
-              - 'crates/zvidlib-vorbis-decoder/**'
+              - 'crates/zvidlib-opus-syntax/**'
+              - 'crates/zvidlib-vorbis-syntax/**'
               - 'crates/zvidlib-vp9-syntax/**'
               - 'examples/media/**'
             zvidlib-hevc-syntax:
               - 'crates/zvidlib-hevc-syntax/**'
             zvidlib-opus:
-              - 'crates/zvidlib-opus/**'
               - 'crates/zvidlib-av1-syntax/**'
               - 'crates/zvidlib-container/**'
               - 'crates/zvidlib-core/**'
-              - 'crates/zvidlib-vorbis-decoder/**'
-            zvidlib-vorbis-decoder:
-              - 'crates/zvidlib-vorbis-decoder/**'
+              - 'crates/zvidlib-opus/**'
+              - 'crates/zvidlib-opus-syntax/**'
+              - 'crates/zvidlib-vorbis-syntax/**'
+            zvidlib-opus-syntax:
               - 'crates/zvidlib-core/**'
+              - 'crates/zvidlib-opus-syntax/**'
+            zvidlib-vorbis-decoder:
+              - 'crates/zvidlib-core/**'
+              - 'crates/zvidlib-vorbis-decoder/**'
+              - 'crates/zvidlib-vorbis-syntax/**'
             zvidlib-vorbis-encoder:
-              - 'crates/zvidlib-vorbis-encoder/**'
               - 'crates/zvidlib-av1-syntax/**'
               - 'crates/zvidlib-bench-support/**'
               - 'crates/zvidlib-container/**'
               - 'crates/zvidlib-core/**'
-              - 'crates/zvidlib-opus/**'
+              - 'crates/zvidlib-opus-syntax/**'
               - 'crates/zvidlib-vorbis-decoder/**'
+              - 'crates/zvidlib-vorbis-encoder/**'
+              - 'crates/zvidlib-vorbis-syntax/**'
+            zvidlib-vorbis-syntax:
+              - 'crates/zvidlib-core/**'
+              - 'crates/zvidlib-vorbis-syntax/**'
             zvidlib-vp8:
-              - 'crates/zvidlib-vp8/**'
               - 'crates/zvidlib-av1-syntax/**'
               - 'crates/zvidlib-bench-support/**'
               - 'crates/zvidlib-build/**'
@@ -337,11 +355,11 @@ jobs:
               - 'crates/zvidlib-core/**'
               - 'crates/zvidlib-hardware/**'
               - 'crates/zvidlib-hevc-syntax/**'
-              - 'crates/zvidlib-opus/**'
-              - 'crates/zvidlib-vorbis-decoder/**'
+              - 'crates/zvidlib-opus-syntax/**'
+              - 'crates/zvidlib-vorbis-syntax/**'
+              - 'crates/zvidlib-vp8/**'
               - 'crates/zvidlib-vp9-syntax/**'
             zvidlib-vp9-decoder:
-              - 'crates/zvidlib-vp9-decoder/**'
               - 'crates/zvidlib-av1-syntax/**'
               - 'crates/zvidlib-bench-support/**'
               - 'crates/zvidlib-build/**'
@@ -350,11 +368,11 @@ jobs:
               - 'crates/zvidlib-core/**'
               - 'crates/zvidlib-hardware/**'
               - 'crates/zvidlib-hevc-syntax/**'
-              - 'crates/zvidlib-opus/**'
-              - 'crates/zvidlib-vorbis-decoder/**'
+              - 'crates/zvidlib-opus-syntax/**'
+              - 'crates/zvidlib-vorbis-syntax/**'
+              - 'crates/zvidlib-vp9-decoder/**'
               - 'crates/zvidlib-vp9-syntax/**'
             zvidlib-vp9-encoder:
-              - 'crates/zvidlib-vp9-encoder/**'
               - 'crates/zvidlib-av1-syntax/**'
               - 'crates/zvidlib-bench-support/**'
               - 'crates/zvidlib-build/**'
@@ -363,14 +381,15 @@ jobs:
               - 'crates/zvidlib-core/**'
               - 'crates/zvidlib-hardware/**'
               - 'crates/zvidlib-hevc-syntax/**'
-              - 'crates/zvidlib-opus/**'
-              - 'crates/zvidlib-vorbis-decoder/**'
+              - 'crates/zvidlib-opus-syntax/**'
+              - 'crates/zvidlib-vorbis-syntax/**'
               - 'crates/zvidlib-vp9-decoder/**'
+              - 'crates/zvidlib-vp9-encoder/**'
               - 'crates/zvidlib-vp9-syntax/**'
             zvidlib-vp9-syntax:
-              - 'crates/zvidlib-vp9-syntax/**'
               - 'crates/zvidlib-color/**'
               - 'crates/zvidlib-core/**'
+              - 'crates/zvidlib-vp9-syntax/**'
       # A matrix cannot expand `all`, and `packages` also names the job
       # filters that matched, so this narrows it to package names: every one in
       # `WORKSPACE` on a `main` push, a `workflow_dispatch` or a change to the
@@ -393,12 +412,15 @@ jobs:
             zvidlib-container
             zvidlib-core
             zvidlib-hardware
+            zvidlib-hevc
             zvidlib-hevc-decoder
             zvidlib-hevc-encoder
             zvidlib-hevc-syntax
             zvidlib-opus
+            zvidlib-opus-syntax
             zvidlib-vorbis-decoder
             zvidlib-vorbis-encoder
+            zvidlib-vorbis-syntax
             zvidlib-vp8
             zvidlib-vp9-decoder
             zvidlib-vp9-encoder
@@ -446,6 +468,29 @@ jobs:
       # `--workspace`, because without it cargo only reaches the root package.
       - name: Lint native target
         run: cargo clippy --workspace --all-targets --features native -- -D warnings
+      # The codec features (#635) are additive, and each has to build on its
+      # own: the lint above only sees every feature at once, where a missing
+      # `#[cfg(feature = "...")]` never shows. Each codec feature and shorthand
+      # alone, with and without the platform hardware backends, plus none at
+      # all. The codec crates themselves are built with their hardware off too.
+      - name: Lint each codec feature on its own
+        run: |
+          set -euo pipefail
+          cargo clippy -p zvidlib --all-targets --no-default-features --features native -- -D warnings
+          for feature in av1-decoder av1-encoder vp8-decoder vp8-encoder vp9-decoder vp9-encoder \
+            hevc-decoder hevc-encoder opus-decoder opus-encoder \
+            vorbis-decoder vorbis-encoder aac-decoder aac-encoder \
+            av1 vp8 vp9 hevc opus vorbis aac all; do
+            for hardware in "" hardware; do
+              echo "::group::$feature $hardware"
+              cargo clippy -p zvidlib --all-targets --no-default-features \
+                --features "native $feature $hardware" -- -D warnings
+              echo "::endgroup::"
+            done
+          done
+          cargo clippy -p zvidlib-vp8 -p zvidlib-vp9-decoder -p zvidlib-vp9-encoder \
+            -p zvidlib-hevc-decoder -p zvidlib-hevc-encoder \
+            --all-targets --no-default-features -- -D warnings
       # `criterion_baseline.py` is where a benchmark regression threshold is
       # justified from, and it runs in a job that takes two hours to reach it.
       # Standard library only, so this needs no install step. Its `table`
@@ -501,7 +546,21 @@ jobs:
         with:
           cache-on-failure: true
       - name: Check WebAssembly target
-        run: cargo check --target wasm32-unknown-unknown --no-default-features --features web
+        run: cargo check --target wasm32-unknown-unknown --features web
+      # Each codec feature (#635) on its own in the browser build, as the
+      # `rust` job lints them natively.
+      - name: Check each codec feature on its own for WebAssembly
+        run: |
+          set -euo pipefail
+          for feature in "" av1-decoder av1-encoder vp8-decoder vp8-encoder vp9-decoder vp9-encoder \
+            hevc-decoder hevc-encoder opus-decoder opus-encoder \
+            vorbis-decoder vorbis-encoder aac-decoder aac-encoder \
+            av1 vp8 vp9 hevc opus vorbis aac all; do
+            echo "::group::web $feature"
+            cargo check --target wasm32-unknown-unknown -p zvidlib --lib --tests --examples \
+              --no-default-features --features "web $feature"
+            echo "::endgroup::"
+          done
       # The published musl binary rather than `cargo install wasm-pack`, which
       # compiled the tool and its dependency tree from source on every run for
       # a build that is not this crate's. The version is still pinned, and the
@@ -517,9 +576,9 @@ jobs:
           "$RUNNER_TEMP/wasm-pack/wasm-pack" --version
           echo "$RUNNER_TEMP/wasm-pack" >> "$GITHUB_PATH"
       - name: Build browser package
-        run: wasm-pack build --target web --out-dir pkg --no-default-features --features web
+        run: wasm-pack build --target web --out-dir pkg --features web
       - name: Test in headless Chrome
-        run: wasm-pack test --headless --chrome --no-default-features --features web
+        run: wasm-pack test --headless --chrome --features web
 
   # Every package's tests on Linux, one job per package the pull request can
   # affect (#612). cargo-nextest runs each test as its own process across every
@@ -1059,12 +1118,15 @@ jobs:
           targets zvidlib-container
           targets zvidlib-core
           targets zvidlib-hardware
+          targets zvidlib-hevc
           targets zvidlib-hevc-decoder
           targets zvidlib-hevc-encoder
           targets zvidlib-hevc-syntax
           targets zvidlib-opus
+          targets zvidlib-opus-syntax
           targets zvidlib-vorbis-decoder
           targets zvidlib-vorbis-encoder
+          targets zvidlib-vorbis-syntax
           targets zvidlib-vp8
           targets zvidlib-vp9-decoder
           targets zvidlib-vp9-encoder

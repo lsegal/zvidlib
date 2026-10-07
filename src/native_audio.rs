@@ -5,17 +5,16 @@
 //! Windows through Media Foundation's AAC decoder MFT. Linux and the other
 //! native targets have none, and decode through Symphonia's.
 
-#[cfg(target_os = "macos")]
+#[cfg(all(feature = "aac-decoder", target_os = "macos"))]
 mod audiotoolbox;
-#[cfg(not(any(target_os = "macos", windows)))]
+#[cfg(all(feature = "aac-decoder", not(any(target_os = "macos", windows))))]
 mod symphonia;
-#[cfg(windows)]
+#[cfg(all(feature = "aac-decoder", windows))]
 mod windows_mf;
 
-use crate::{
-    AacTrackConfig, AudioBuffer, AudioDecoder, AudioOutputBackend, CancellationToken, Error,
-    ErrorKind, Limits, Result,
-};
+#[cfg(feature = "aac-decoder")]
+use crate::{AacTrackConfig, AudioDecoder, CancellationToken, Limits};
+use crate::{AudioBuffer, AudioOutputBackend, Error, ErrorKind, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{
     FromSample, SampleFormat, SizedSample, Stream, StreamConfig, SupportedStreamConfigRange,
@@ -24,11 +23,11 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-#[cfg(target_os = "macos")]
+#[cfg(all(feature = "aac-decoder", target_os = "macos"))]
 use audiotoolbox::Decoder as Backend;
-#[cfg(not(any(target_os = "macos", windows)))]
+#[cfg(all(feature = "aac-decoder", not(any(target_os = "macos", windows))))]
 use symphonia::Decoder as Backend;
-#[cfg(windows)]
+#[cfg(all(feature = "aac-decoder", windows))]
 use windows_mf::Decoder as Backend;
 
 /// AAC-LC access-unit decoder: AudioToolbox on macOS, Media Foundation on
@@ -36,6 +35,7 @@ use windows_mf::Decoder as Backend;
 /// decoder, such as Linux.
 ///
 /// Mono and stereo AAC-LC are accepted.
+#[cfg(feature = "aac-decoder")]
 pub struct NativeAacDecoder {
     backend: Backend,
     sample_rate: u32,
@@ -49,6 +49,7 @@ pub struct NativeAacDecoder {
     previous: Option<(Vec<u8>, u64)>,
 }
 
+#[cfg(feature = "aac-decoder")]
 impl NativeAacDecoder {
     pub fn new(config: &AacTrackConfig, limits: Limits) -> Result<Self> {
         if config.audio_object_type != 2 || !matches!(config.channels, 1 | 2) {
@@ -87,6 +88,7 @@ impl NativeAacDecoder {
     }
 }
 
+#[cfg(feature = "aac-decoder")]
 impl AudioDecoder for NativeAacDecoder {
     fn decode(
         &mut self,
@@ -386,6 +388,7 @@ fn unsupported(message: impl Into<String>) -> Error {
     Error::new(ErrorKind::Unsupported, message)
 }
 
+#[cfg(feature = "aac-decoder")]
 fn codec(message: impl Into<String>) -> Error {
     Error::new(ErrorKind::Codec, message)
 }
@@ -397,12 +400,17 @@ fn io(message: impl Into<String>) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "aac-decoder")]
     use crate::io::MemorySource;
+    #[cfg(feature = "aac-decoder")]
     use crate::{Mp4Demuxer, Mp4DemuxerOptions, TrackKind};
+    #[cfg(feature = "aac-decoder")]
     use std::future::Future;
+    #[cfg(feature = "aac-decoder")]
     use std::task::{Context, Poll, Waker};
 
     #[test]
+    #[cfg(feature = "aac-decoder")]
     fn native_decoder_consumes_demuxed_aac_access_units_as_exact_f32_intervals() {
         let source =
             MemorySource::new(include_bytes!("../examples/media/BigBuckBunny.mp4").to_vec());
@@ -488,6 +496,7 @@ mod tests {
         assert_eq!(select_output_format(supported, 48_000, 2), Err(Vec::new()));
     }
 
+    #[cfg(feature = "aac-decoder")]
     fn block_on<F: Future>(future: F) -> F::Output {
         let mut future = Box::pin(future);
         let waker = Waker::noop();

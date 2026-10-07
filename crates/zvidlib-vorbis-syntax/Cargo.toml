@@ -1,0 +1,13 @@
+[package]
+name = "zvidlib-vorbis-syntax"
+description = "Vorbis header parsing and packet timing shared by zvidlib's containers and Vorbis codecs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+zvidlib-core = { workspace = true }
