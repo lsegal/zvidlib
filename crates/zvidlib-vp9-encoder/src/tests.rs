@@ -1412,6 +1412,48 @@ fn long_pans_keep_key_frame_detail_only_where_it_pays() {
 }
 
 #[test]
+fn the_lookahead_codes_each_key_frame_as_it_would_code_alone() {
+    // The weighted and unweighted codings of a group's start run side by side
+    // (issue #628). Each must be exactly the coding it would be alone, and
+    // the stream must continue from the one kept: here the weighted key frame
+    // is kept at q 240 and not at q 220, where it codes differently.
+    let (width, height) = (96, 64);
+    let geometry = Geometry::new(width as usize, height as usize);
+    let pictures: Vec<Picture> = (0..13)
+        .map(|index| {
+            let frame = moving_yuv_frame(width, height, index);
+            source_picture(&geometry, &frame, Orientation::TopLeft).unwrap()
+        })
+        .collect();
+    let (start, next) = pictures.split_at(12);
+    for (base_q_idx, weighted) in [(240, true), (220, false)] {
+        let settings = StreamSettings {
+            geometry,
+            base_q_idx,
+            tools: CodingTools::ALL,
+            error_resilient: true,
+            full_range: false,
+            loop_filter: true,
+        };
+        let mut stream = StreamState::default();
+        let mut kept = stream.code_group_start(&settings, start);
+        kept.push(stream.code(&settings, &next[0], false, false));
+        let mut alone = StreamState::default();
+        let expected: Vec<Vec<u8>> = pictures
+            .iter()
+            .enumerate()
+            .map(|(index, picture)| {
+                alone
+                    .code(&settings, picture, index == 0, index == 0 && weighted)
+                    .data
+            })
+            .collect();
+        let kept: Vec<Vec<u8>> = kept.into_iter().map(|frame| frame.data).collect();
+        assert!(kept == expected, "q {base_q_idx}: weighted {weighted}");
+    }
+}
+
+#[test]
 fn group_starts_are_emitted_once_the_lookahead_fills() {
     // The key frame waits for the rest of its group, up to the lookahead,
     // and frames past the lookahead code as they arrive.
