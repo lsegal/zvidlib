@@ -2,6 +2,7 @@
 //! every macroblock has been reconstructed.
 
 use super::predict::Plane;
+use super::simd::{self, EdgeLimits};
 
 /// Per-macroblock filter parameters, already adjusted for segment and mode.
 #[derive(Clone, Copy, Debug, Default)]
@@ -182,6 +183,23 @@ fn filter_edge(
     } else {
         limits.subblock_edge
     };
+    // The segments along an edge are independent of each other, so the
+    // vector kernels filter a vector of them at a time.
+    let vector = EdgeLimits {
+        edge: edge_limit,
+        interior: limits.interior,
+        hev_threshold: limits.hev_threshold,
+        macroblock_edge,
+        simple,
+    };
+    let vectorized = if step == 1 {
+        simd::filter_vertical_edge(data, at, advance, count, vector)
+    } else {
+        simd::filter_horizontal_edge(data, at, step, count, vector)
+    };
+    if vectorized {
+        return;
+    }
     for index in 0..count {
         let mut segment = Segment {
             data: &mut *data,

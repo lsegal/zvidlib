@@ -17,6 +17,7 @@ zvidlib's benchmarks run under [criterion](https://docs.rs/criterion) with
 | `benches/hevc_hardware.rs` | the platform fixed-function HEVC decoders against the software one, and the hardware HEVC encoder |
 | `benches/exact_seek.rs` | what an exact frame at an arbitrary point costs, by backend and by random-access cadence |
 | `benches/vpx_decode.rs` | the VP8 and VP9 software decoders, and the YUV-to-RGBA conversion they share with AV1, scalar versus SIMD |
+| `benches/vp8_encode.rs` | the native VP8 encoder: whole-frame encode and every SIMD kernel, scalar versus SIMD |
 
 Each target loads and decodes its fixtures once per process, so every iteration
 measures the work under test and nothing else. `codec` is one target rather than
@@ -44,6 +45,7 @@ cargo bench --bench vp9_decode    # the VP9 software decoder only
 cargo bench --bench hevc_hardware # the platform hardware HEVC decoders and encoder
 cargo bench --bench exact_seek    # exact-seek cost by backend and cadence
 cargo bench --bench vpx_decode    # VP8/VP9 decode and the AV1/VP8/VP9 output conversion
+cargo bench --bench vp8_encode    # the VP8 encoder, whole-frame and per-kernel
 cargo bench --features simd       # the same groups, recorded under `simd=on`
 cargo bench --no-run              # compile only
 ```
@@ -1789,6 +1791,75 @@ are near parity with their scalar reference on some hosts — the HEVC arms come
 out roughly even on Apple Silicon, where LLVM auto-vectorizes the scalar code
 well under `lto = "fat"`, while AV1 deblocking and motion compensation on the
 same host are 2.4-4.9x. `active_by_site()` answers the question directly.
+
+## The VP8 encoder suite (`--bench vp8_encode`)
+
+`benches/vp8_encode.rs` measures the native VP8 encoder (issue #569) whole-frame
+and kernel by kernel, scalar against every instruction set the host has. The
+whole-frame groups encode a key frame and three inter frames of
+`support::synthetic_rgba8_sequence` through the public
+`zvidlib::native_vp8_video_encoder_factory`, so intra mode decision and motion
+search are both in them, and add a 1920x1080 pass behind
+`ZVIDLIB_BENCH_LARGE=1`. The per-stage groups run one kernel over a 640x352
+frame's worth of blocks through `zvidlib::vp8_encoder_bench`, the VP8
+counterpart to `av1_encoder_bench`, which calls exactly the entry point the
+encoder does:
+
+| Group | Stage | Site |
+| --- | --- | --- |
+| `vp8_encode_frame_640x352_q{24,90}` | four frames through the public encoder | all |
+| `vp8_encode_stage_sad` | 16x16 whole-sample SAD (`sad16_full`) | `vp8_encode` |
+| `vp8_encode_stage_satd` | 16x16 SATD | `vp8_encode` |
+| `vp8_encode_stage_fdct` | residual and forward 4x4 DCT | `vp8_encode` |
+| `vp8_encode_stage_fwht` | forward Y2 Walsh-Hadamard transform | `vp8_encode` |
+| `vp8_encode_stage_quantize` | quantization and dequantization | `vp8_encode` |
+| `vp8_encode_stage_idct` | inverse 4x4 DCT and add | `vp8_recon` |
+| `vp8_encode_stage_iwht` | inverse Y2 Walsh-Hadamard transform | `vp8_recon` |
+| `vp8_encode_stage_sixtap` | six-tap 16x16 inter prediction | `vp8_recon` |
+| `vp8_encode_stage_tm_pred` | 16x16 `TM_PRED` | `vp8_recon` |
+| `vp8_encode_stage_loop_filter` | the normal loop filter over a frame | `vp8_recon` |
+
+`vp8_recon` is the reconstruction the encoder runs through the decoder's own
+code, so the decoder takes those kernels too; the `iwht`, `idct`, `sixtap`,
+`tm_pred` and `loop_filter` ratios are the decoder's as well.
+
+### What they measured when the kernels landed
+
+On an **Intel Core i9-10850K (Windows)**, under enough background load that
+criterion's sequential arms drifted by up to 2x between runs, so these are the
+best of 60 interleaved rounds per arm (10 for whole frames) rather than
+criterion's estimates, over the same inputs the groups use:
+
+| Kernel | `sse4.1` | `avx2` |
+| --- | ---: | ---: |
+| whole frame, `q24` | 1.54x | 1.65x |
+| whole frame, `q90` | 1.69x | 1.70x |
+| `satd` | 2.65x | 2.75x |
+| `sixtap` | 2.26x | 2.61x |
+| `quantize` | 1.88x | 2.46x |
+| `loop_filter` | 1.86x | 1.95x |
+| `tm_pred` | 1.13x | 1.53x |
+| `fwht` | 1.31x | 1.31x |
+| `idct` | 1.27x | 1.27x |
+| `fdct` | 1.15x | 1.14x |
+| `iwht` | 1.07x | 1.10x |
+| `sad` | 1.08x | 1.07x |
+
+`sad` is at parity, and that is the expected result rather than a missing
+kernel: LLVM already compiles the scalar 16-byte `abs_diff` loop to `psadbw`,
+the instruction the vector kernel is written with, and inlines it, so the vector
+arm can only match it. The kernel is kept because it states that instruction
+outright instead of depending on the auto-vectorizer, and on aarch64 it is
+`uabd`/`uadalp`. The 4x4 kernels (`fdct`, `fwht`, `idct`, `iwht`, `satd`) run
+their 128-bit body on AVX2 hosts, as `av1_simd`'s 4-point transforms do: a 4x4
+block is four 4-lane rows with no 256-bit shape. So does the loop filter, whose
+eight-lane AVX2 body measured behind the four-lane one on this host in every
+run; `sixtap`, `tm_pred` and `quantize` use all eight lanes.
+
+```sh
+cargo bench --bench vp8_encode -- vp8_encode_stage    # the kernels only
+ZVIDLIB_BENCH_LARGE=1 cargo bench --bench vp8_encode  # add the 1080p frames
+```
 
 ## The VP9 encoder suite (`--bench vp9_encode`)
 

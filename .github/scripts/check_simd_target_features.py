@@ -24,13 +24,15 @@ checks (issue #341):
 
 The first rule is crate-wide and so covers every `#[target_feature]` site the
 crate has, `hevc::engine::simd`, `hevc::engine::transform_simd`,
-`hevc::color_convert`, `yuv_to_rgba` and `av1_mc` included: an out-of-line
-intrinsic call is the same defect wherever it appears. The second covers the
-three modules that dispatch through generic kernels, `av1_simd`,
-`vorbis_simd` (issue #572) and `vp9_simd` (issue #570, whose kernels are
-written over the `av1_simd` vector types); the other sites write their
-intrinsics directly inside the `#[target_feature]` function, where there is no
-separate body for the inliner to leave behind.
+`hevc::color_convert`, `yuv_to_rgba`, `av1_mc` and the VP8 SAD included: an
+out-of-line intrinsic call is the same defect wherever it appears. The second
+covers the modules that dispatch through generic kernels, `av1_simd`,
+`vorbis_simd` (issue #572), `vp9_simd` (issue #570) and `vp8::simd` (issue
+#569). The last two are written over the `av1_simd` vector types, so a
+`vp8::simd` kernel's symbol carries the `av1_simd` path of its vector argument
+and the `av1_simd` rule matches it. The other sites write their intrinsics
+directly inside the `#[target_feature]` function, where there is no separate
+body for the inliner to leave behind.
 
     build --target-dir target/simd-feature-check
     check --asm path/to/crate.s
@@ -145,9 +147,11 @@ def is_core_arch(symbol: str) -> bool:
 
 def is_outlined_kernel(symbol: str) -> bool:
     """True for an `av1_simd`, `vorbis_simd` or `vp9_simd` item monomorphized
-    over one of the `vector` types.
+    over one of the `vector` types, which includes a `vp8::simd` kernel
+    instantiated over an `av1_simd` vector type.
 
-    That combination only occurs for a generic kernel instantiation: the
+    That combination only occurs for a generic kernel instantiation, in
+    `av1_simd` or in `vp8::simd`, whose kernels take the same vector types: the
     `#[target_feature]` wrappers are not generic, and the vector types' own
     inherent items would not mention a second `av1_simd` path component.
     """
