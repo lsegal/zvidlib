@@ -2,7 +2,7 @@
 //!
 //! `zvidlib` depends on every `zvidlib-*` crate at exactly its own version, so
 //! a release whose publish skips one of them cannot be installed from
-//! crates.io at all (#610). `release.yml` names what it leaves out of
+//! crates.io at all (#610). `finalize-release.yml` names what it leaves out of
 //! `cargo package` with `--exclude`, a second copy of the `publish = false`
 //! the manifests declare; this asserts the copies agree, so a crate added to
 //! the workspace is packaged, and one marked development only is not. The
@@ -24,7 +24,7 @@ mod workspace;
 use std::collections::BTreeSet;
 
 fn release_workflow() -> String {
-    let path = workspace::root().join(".github/workflows/release.yml");
+    let path = workspace::root().join(".github/workflows/finalize-release.yml");
     std::fs::read_to_string(&path)
         .unwrap_or_else(|error| panic!("reading {}: {error}", path.display()))
 }
@@ -51,7 +51,7 @@ fn publish_script() -> String {
         .unwrap_or_else(|error| panic!("reading {}: {error}", path.display()))
 }
 
-/// The one line of `release.yml` that runs `command`.
+/// The one line of `finalize-release.yml` that runs `command`.
 fn line_running<'a>(workflow: &'a str, command: &str) -> &'a str {
     let lines: Vec<&str> = workflow
         .lines()
@@ -60,12 +60,12 @@ fn line_running<'a>(workflow: &'a str, command: &str) -> &'a str {
     assert_eq!(
         lines.len(),
         1,
-        "release.yml should run `{command}` exactly once, but runs it on {lines:?}"
+        "finalize-release.yml should run `{command}` exactly once, but runs it on {lines:?}"
     );
     lines[0]
 }
 
-/// The `--exclude` names of the one line of `release.yml` that runs `command`.
+/// The `--exclude` names of the one line of `finalize-release.yml` that runs `command`.
 fn excluded_by(workflow: &str, command: &str) -> BTreeSet<String> {
     let words: Vec<&str> = line_running(workflow, command).split_whitespace().collect();
     words
@@ -86,14 +86,14 @@ fn every_published_crate_is_packaged_and_published() {
     assert_eq!(
         excluded_by(&workflow, "cargo package --workspace"),
         unpublished,
-        "release.yml's `cargo package --workspace` must exclude exactly the \
+        "finalize-release.yml's `cargo package --workspace` must exclude exactly the \
          packages that declare `publish = false`: any other crate left out is \
          missing from crates.io, and `zvidlib` cannot be installed without it"
     );
     assert!(
         !line_running(&workflow, PUBLISH_COMMAND).contains("--exclude"),
         "the publish script must take the crates to publish from the manifests, \
-         not from a list in release.yml"
+         not from a list in finalize-release.yml"
     );
     let script = publish_script();
     assert!(
@@ -133,7 +133,7 @@ fn crates_are_published_before_the_github_release() {
     let position = |needle: &str| {
         workflow
             .find(needle)
-            .unwrap_or_else(|| panic!("release.yml has no `{needle}`"))
+            .unwrap_or_else(|| panic!("finalize-release.yml has no `{needle}`"))
     };
     assert!(
         position(PUBLISH_COMMAND) < position("gh release create"),
