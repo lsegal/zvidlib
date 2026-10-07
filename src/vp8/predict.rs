@@ -46,6 +46,12 @@ const SIN_PI8_SQRT2: i32 = 35468;
 /// Inverse 4x4 DCT of dequantized `coefficients` (raster order), added to the
 /// 4x4 block at `offset` of `plane`.
 pub(crate) fn idct_add(coefficients: &[i16; 16], plane: &mut [u8], offset: usize, stride: usize) {
+    if !super::simd::idct_add(coefficients, plane, offset, stride) {
+        idct_add_scalar(coefficients, plane, offset, stride);
+    }
+}
+
+fn idct_add_scalar(coefficients: &[i16; 16], plane: &mut [u8], offset: usize, stride: usize) {
     let mut temp = [0i16; 16];
     for column in 0..4 {
         let i0 = i32::from(coefficients[column]);
@@ -86,6 +92,10 @@ pub(crate) fn idct_add(coefficients: &[i16; 16], plane: &mut [u8], offset: usize
 /// Inverse Walsh-Hadamard transform of the dequantized Y2 block, returning
 /// the DC coefficient of each of the 16 luma blocks in raster order.
 pub(crate) fn inverse_walsh(input: &[i16; 16]) -> [i16; 16] {
+    super::simd::inverse_walsh(input).unwrap_or_else(|| inverse_walsh_scalar(input))
+}
+
+fn inverse_walsh_scalar(input: &[i16; 16]) -> [i16; 16] {
     let mut temp = [0i32; 16];
     for column in 0..4 {
         let i0 = i32::from(input[column]);
@@ -224,6 +234,17 @@ pub(crate) fn predict_block<const N: usize, const A: usize>(
         }
         TM_PRED => {
             let corner = edges.corner();
+            if super::simd::tm_predict(
+                &edges.above[1..=N],
+                &edges.left,
+                corner,
+                N,
+                plane,
+                offset,
+                stride,
+            ) {
+                return;
+            }
             for row in 0..N {
                 let left = i32::from(edges.left[row]) - corner;
                 for column in 0..N {
@@ -439,6 +460,46 @@ pub(crate) fn predict_inter(
     // identity, so a whole-sample displacement in one direction is exact.
     let horizontal = &filters[fraction_x];
     let vertical = &filters[fraction_y];
+    if super::simd::sixtap(
+        &window,
+        width,
+        height,
+        horizontal,
+        vertical,
+        &mut output.data,
+        destination,
+        stride,
+    ) {
+        return;
+    }
+    filter_window(
+        &window,
+        width,
+        height,
+        horizontal,
+        vertical,
+        &mut output.data,
+        destination,
+        stride,
+    );
+}
+
+/// The scalar two-pass filter of `predict_inter`: `horizontal` over the
+/// `(width + 5)`-wide `window`, then `vertical` into the block at
+/// `destination` of `output`.
+#[allow(clippy::too_many_arguments)]
+fn filter_window(
+    window: &[u8],
+    width: usize,
+    height: usize,
+    horizontal: &[i32; 6],
+    vertical: &[i32; 6],
+    output: &mut [u8],
+    destination: usize,
+    stride: usize,
+) {
+    let window_width = width + 5;
+    let window_height = height + 5;
     let mut first = [0u8; 16 * 21];
     for row in 0..window_height {
         let line = &window[row * window_width..];
@@ -458,7 +519,7 @@ pub(crate) fn predict_inter(
             for (tap_index, &tap) in vertical.iter().enumerate() {
                 sum += i32::from(first[(row + tap_index) * width + column]) * tap;
             }
-            output.data[destination + row * stride + column] = clamp255(sum >> 7);
+            output[destination + row * stride + column] = clamp255(sum >> 7);
         }
     }
 }

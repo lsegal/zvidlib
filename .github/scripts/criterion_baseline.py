@@ -536,6 +536,20 @@ SITE_GROUP_PREFIXES: dict[str, tuple[str, ...]] = {
     # inside the Vorbis encoder, so every row of `benches/vorbis_encode.rs` is
     # this site's own number.
     "vorbis_encode": ("vorbis_encode_",),
+    "vp8_encode": (
+        "vp8_encode_stage_sad",
+        "vp8_encode_stage_satd",
+        "vp8_encode_stage_fdct",
+        "vp8_encode_stage_fwht",
+        "vp8_encode_stage_quantize",
+    ),
+    "vp8_recon": (
+        "vp8_encode_stage_idct",
+        "vp8_encode_stage_iwht",
+        "vp8_encode_stage_sixtap",
+        "vp8_encode_stage_tm_pred",
+        "vp8_encode_stage_loop_filter",
+    ),
     "vp9_decode": ("vp9_inverse_", "vp9_mc_", "vp9_intra_", "vp9_loop_filter_"),
     "vp9_encode": ("vp9_encode_",),
     "hevc_prediction_filters": (
