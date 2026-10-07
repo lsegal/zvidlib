@@ -15,13 +15,10 @@
 
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use zvidlib::io::MemorySource;
-use zvidlib::{
-    CancellationToken, Codec, CodecImplementation, CodecProfile, CodecSupport, ColorRange,
-    EncodedVideoSample, ErrorKind, ExactFrameReader, FrameDigest, FrameIndex, HardwarePreference,
-    Limits, Mp4Demuxer, PixelFormat, VideoDecoderConfig, VideoDecoderFactory, VideoDimensions,
-    WebmDemuxer, native_vp9_video_decoder_factory,
-};
+use zvidlib_core::io::MemorySource;
+use zvidlib_container::{FrameDigest, Mp4Demuxer, WebmDemuxer};
+use zvidlib_core::{CancellationToken, Codec, CodecImplementation, CodecProfile, CodecSupport, ColorRange, EncodedVideoSample, ErrorKind, ExactFrameReader, FrameIndex, HardwarePreference, Limits, PixelFormat, VideoDecoderConfig, VideoDecoderFactory, VideoDimensions};
+use zvidlib_vp9_decoder::native_vp9_video_decoder_factory;
 
 fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
     use std::task::{Context, Poll, Waker};
@@ -87,15 +84,15 @@ fn fixtures() -> [(&'static str, Track); 3] {
     [
         (
             "VP9 256x144 with hidden frames",
-            mp4_track(include_bytes!("fixtures/codec/vp9_bbb_256x144.mp4")),
+            mp4_track(include_bytes!("../../zvidlib-vp9-decoder/tests/fixtures/vp9_bbb_256x144.mp4")),
         ),
         (
             "VP9 250x142",
-            mp4_track(include_bytes!("fixtures/codec/vp9_bbb_250x142.mp4")),
+            mp4_track(include_bytes!("../../zvidlib-vp9-decoder/tests/fixtures/vp9_bbb_250x142.mp4")),
         ),
         (
             "VP9 in WebM",
-            webm_track(include_bytes!("fixtures/codec/vp9_bbb_256x144.webm")),
+            webm_track(include_bytes!("../../zvidlib-vp9-decoder/tests/fixtures/vp9_bbb_256x144.webm")),
         ),
     ]
 }
@@ -173,7 +170,7 @@ fn capability_honors_the_hardware_preference() {
     }
     // Prefer decodes either way, in hardware or in software.
     candidate.hardware = HardwarePreference::Prefer;
-    let track = mp4_track(include_bytes!("fixtures/codec/vp9_bbb_256x144.mp4"));
+    let track = mp4_track(include_bytes!("../../zvidlib-vp9-decoder/tests/fixtures/vp9_bbb_256x144.mp4"));
     let mut decoder = factory.create(&candidate, &limits).unwrap();
     let outputs = decoder
         .submit(&track.samples[0], &CancellationToken::new())
@@ -237,7 +234,7 @@ fn hardware_vp9_matches_the_software_decoder_and_seeks_exactly() {
 #[test]
 fn hardware_show_existing_frame_shows_the_same_reference_as_software() {
     let _serial = serial();
-    let track = mp4_track(include_bytes!("fixtures/codec/vp9_bbb_256x144.mp4"));
+    let track = mp4_track(include_bytes!("../../zvidlib-vp9-decoder/tests/fixtures/vp9_bbb_256x144.mp4"));
     let Some(hardware) = hardware_configuration(&track.configuration) else {
         return;
     };
@@ -300,7 +297,7 @@ fn concurrent_hardware_vp9_sessions_match_the_software_decoder() {
 #[test]
 fn hardware_refuses_what_the_software_decoder_refuses() {
     let _serial = serial();
-    let track = mp4_track(include_bytes!("fixtures/codec/vp9_bbb_256x144.mp4"));
+    let track = mp4_track(include_bytes!("../../zvidlib-vp9-decoder/tests/fixtures/vp9_bbb_256x144.mp4"));
     let Some(hardware) = hardware_configuration(&track.configuration) else {
         return;
     };
@@ -350,7 +347,7 @@ fn hardware_refuses_what_the_software_decoder_refuses() {
 }
 
 /// A 320x240 RGBA test card that pans four pixels a frame under a fixed block.
-fn encoder_frame(index: u32, limits: &Limits) -> zvidlib::VideoFrame {
+fn encoder_frame(index: u32, limits: &Limits) -> zvidlib_core::VideoFrame {
     let (width, height) = (320_u32, 240_u32);
     let mut data = Vec::with_capacity((width * height * 4) as usize);
     for y in 0..height {
@@ -368,11 +365,11 @@ fn encoder_frame(index: u32, limits: &Limits) -> zvidlib::VideoFrame {
             }
         }
     }
-    zvidlib::VideoFrame::new(
+    zvidlib_core::VideoFrame::new(
         VideoDimensions::new(width, height, limits).unwrap(),
         PixelFormat::Rgba8,
         ColorRange::Limited,
-        vec![zvidlib::Plane {
+        vec![zvidlib_core::Plane {
             data,
             stride: (width * 4) as usize,
         }],
@@ -390,13 +387,11 @@ fn encoder_frame(index: u32, limits: &Limits) -> zvidlib::VideoFrame {
 #[test]
 fn hardware_vp9_encoder_output_muxes_and_decodes_through_the_native_decoder() {
     let _serial = serial();
-    use zvidlib::io::MemorySink;
-    use zvidlib::mp4::{Mp4Muxer, Mp4TrackConfig, Mp4TrackFormat};
-    use zvidlib::{
-        CpuFrameSource, FrameSource, Orientation, VideoEncoderConfig,
-        VideoEncoderConformanceVector, VideoEncoderFactory, WebmMuxer,
-        native_vp9_video_encoder_factory, verify_video_encoder_conformance,
-    };
+    use zvidlib_core::io::MemorySink;
+    use zvidlib_container::mp4::{Mp4Muxer, Mp4TrackConfig, Mp4TrackFormat};
+    use zvidlib_container::{VideoEncoderConformanceVector, WebmMuxer, verify_video_encoder_conformance};
+    use zvidlib_core::{CpuFrameSource, FrameSource, Orientation, VideoEncoderConfig, VideoEncoderFactory};
+    use zvidlib_vp9_encoder::native_vp9_video_encoder_factory;
 
     const FRAMES: u32 = 12;
     let limits = Limits::default();
@@ -445,7 +440,7 @@ fn hardware_vp9_encoder_output_muxes_and_decodes_through_the_native_decoder() {
     assert_eq!(encoder.implementation(), CodecImplementation::Hardware);
     eprintln!("hardware VP9 encoder: {}", encoder.backend_name());
     let vpcc = encoder.config().decoder_config.clone();
-    let derived = zvidlib::derive_codec_string(Codec::Vp9, &vpcc).unwrap();
+    let derived = zvidlib_container::derive_codec_string(Codec::Vp9, &vpcc).unwrap();
     assert_eq!(derived.profile, CodecProfile::Vp9Profile0);
     assert!(
         derived.codec_string.starts_with("vp09.00."),

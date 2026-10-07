@@ -11,3 +11,6 @@ categories.workspace = true
 [dependencies]
 zvidlib-core = { workspace = true }
 zvidlib-vorbis-decoder = { workspace = true }
+
+[dev-dependencies]
+zvidlib-container = { path = "../zvidlib-container" }

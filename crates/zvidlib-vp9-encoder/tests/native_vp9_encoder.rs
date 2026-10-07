@@ -8,17 +8,13 @@ use std::io::Write;
 use std::pin::pin;
 use std::process::{Command, Stdio};
 use std::task::{Context, Poll, Waker};
-use zvidlib::io::{MemorySink, MemorySource};
-use zvidlib::mp4::{Mp4Muxer, Mp4TrackConfig, Mp4TrackFormat};
-use zvidlib::{
-    CancellationToken, Codec, CodecImplementation, CodecProfile, CodecSupport, ColorRange,
-    CpuFrameSource, DecodedVideoFrame, EncodedVideoSample, FrameIndex, FrameSource,
-    HardwarePreference, Limits, Mp4Demuxer, Mp4DemuxerOptions, Orientation, PixelFormat, Plane,
-    Result, SampleDependency, VideoDecoder, VideoDecoderConfig, VideoDecoderFactory,
-    VideoDimensions, VideoEncoderConfig, VideoEncoderConformanceVector, VideoEncoderFactory,
-    VideoFrame, native_vp9_video_encoder_factory, verify_video_encoder_conformance,
-};
-use zvidlib::{EncodedSample, WebmDemuxer, WebmDemuxerOptions, WebmMuxer};
+use zvidlib_core::io::{MemorySink, MemorySource};
+use zvidlib_container::mp4::{Mp4Muxer, Mp4TrackConfig, Mp4TrackFormat};
+use zvidlib_container::{Mp4Demuxer, Mp4DemuxerOptions, VideoEncoderConformanceVector, verify_video_encoder_conformance};
+use zvidlib_core::{CancellationToken, Codec, CodecImplementation, CodecProfile, CodecSupport, ColorRange, CpuFrameSource, DecodedVideoFrame, EncodedVideoSample, FrameIndex, FrameSource, HardwarePreference, Limits, Orientation, PixelFormat, Plane, Result, SampleDependency, VideoDecoder, VideoDecoderConfig, VideoDecoderFactory, VideoDimensions, VideoEncoderConfig, VideoEncoderFactory, VideoFrame};
+use zvidlib_vp9_encoder::native_vp9_video_encoder_factory;
+use zvidlib_container::{WebmDemuxer, WebmDemuxerOptions, WebmMuxer};
+use zvidlib_core::EncodedSample;
 
 const WIDTH: u32 = 160;
 const HEIGHT: u32 = 90;
@@ -135,7 +131,7 @@ fn vp9_webm_round_trips_through_the_demuxer() {
     assert_eq!(demuxer.tracks.len(), 1);
     let track = &demuxer.tracks[0];
     assert_eq!(track.codec, Codec::Vp9);
-    let derived = zvidlib::derive_codec_string(Codec::Vp9, &track.decoder_config).unwrap();
+    let derived = zvidlib_container::derive_codec_string(Codec::Vp9, &track.decoder_config).unwrap();
     assert_eq!(derived.codec_string, "vp09.00.10.08");
     assert_eq!(derived.profile, CodecProfile::Vp9Profile0);
     assert_eq!(track.samples.len(), samples.len());
@@ -175,7 +171,7 @@ fn vp9_mp4_round_trips_through_the_demuxer() {
         };
         assert_eq!(sample.dependency, dependency, "sample {index}");
     }
-    let derived = zvidlib::derive_codec_string(Codec::Vp9, &track.decoder_config).unwrap();
+    let derived = zvidlib_container::derive_codec_string(Codec::Vp9, &track.decoder_config).unwrap();
     assert_eq!(derived.codec_string, "vp09.00.10.08");
 }
 
@@ -601,7 +597,7 @@ fn native_vp9_encoder_round_trips_through_the_native_decoder() {
     };
     let report = block_on(verify_video_encoder_conformance(
         &native_vp9_video_encoder_factory(),
-        &zvidlib::native_vp9_video_decoder_factory(),
+        &zvidlib_vp9_decoder::native_vp9_video_decoder_factory(),
         &vector,
         limits,
     ))
@@ -628,16 +624,16 @@ fn native_vp9_encoder_round_trips_through_the_native_decoder() {
     }
     let mut configuration = decoder_configuration;
     configuration.configuration = encoder.config().decoder_config.clone();
-    let decoder = zvidlib::native_vp9_video_decoder_factory();
+    let decoder = zvidlib_vp9_decoder::native_vp9_video_decoder_factory();
     let cancellation = CancellationToken::new();
     let mut sequential =
-        zvidlib::ExactFrameReader::new(&decoder, configuration.clone(), samples.clone(), limits)
+        zvidlib_core::ExactFrameReader::new(&decoder, configuration.clone(), samples.clone(), limits)
             .unwrap();
     let in_order: Vec<VideoFrame> = (0..u64::from(FRAMES))
         .map(|index| sequential.get(FrameIndex(index), &cancellation).unwrap())
         .collect();
     let mut seeking =
-        zvidlib::ExactFrameReader::new(&decoder, configuration, samples, limits).unwrap();
+        zvidlib_core::ExactFrameReader::new(&decoder, configuration, samples, limits).unwrap();
     for index in [11_u64, 3, 9, 0, 6, 4, 10] {
         let frame = seeking.get(FrameIndex(index), &cancellation).unwrap();
         assert!(

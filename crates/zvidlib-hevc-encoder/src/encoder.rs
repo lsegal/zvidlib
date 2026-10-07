@@ -752,7 +752,8 @@ fn coded(unit: &super::engine::nal::NalUnit) -> Vec<u8> {
 }
 /// Visible to the rest of `hevc` so the decoder-side tests can build a real
 /// bitstream with the encoder's own writer rather than a fixture.
-pub(super) fn hvcc_box(annexb: &[u8]) -> Result<Vec<u8>> {
+#[doc(hidden)]
+pub fn hvcc_box(annexb: &[u8]) -> Result<Vec<u8>> {
     let units = collect_nal_units(annexb)
         .map_err(|e| invalid_input(format!("invalid generated HEVC parameter sets: {e}")))?;
     let mut p = vec![
@@ -776,7 +777,8 @@ pub(super) fn hvcc_box(annexb: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 /// Visible to the rest of `hevc` for the same reason as [`hvcc_box`].
-pub(super) fn length_prefixed_vcl(annexb: &[u8]) -> Result<Vec<u8>> {
+#[doc(hidden)]
+pub fn length_prefixed_vcl(annexb: &[u8]) -> Result<Vec<u8>> {
     let units = collect_nal_units(annexb)
         .map_err(|e| invalid_input(format!("invalid generated HEVC access unit: {e}")))?;
     let mut out = Vec::new();

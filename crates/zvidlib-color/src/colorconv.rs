@@ -47,6 +47,23 @@ pub enum Isa {
     Neon,
 }
 
+impl Isa {
+    /// This instruction set in the crate-wide vocabulary of `zvidlib::simd`.
+    #[doc(hidden)]
+    pub fn as_simd_isa(self) -> zvidlib_core::SimdIsa {
+        use zvidlib_core::SimdIsa;
+        match self {
+            Isa::Scalar => SimdIsa::Scalar,
+            #[cfg(target_arch = "x86_64")]
+            Isa::Sse41 => SimdIsa::Sse41,
+            #[cfg(target_arch = "x86_64")]
+            Isa::Avx2 => SimdIsa::Avx2,
+            #[cfg(target_arch = "aarch64")]
+            Isa::Neon => SimdIsa::Neon,
+        }
+    }
+}
+
 const ISA_UNDETECTED: u8 = 0;
 const ISA_SCALAR: u8 = 1;
 #[cfg(target_arch = "x86_64")]
@@ -732,13 +749,8 @@ mod tests {
         let _guard = simd::test_lock();
         for isa in simd::available() {
             simd::set_override(Some(isa));
-            let sites = simd::active_by_site();
-            let (_, site_isa) = sites
-                .iter()
-                .find(|(name, _)| *name == "hevc_colorconv")
-                .expect("hevc_colorconv is a reported dispatch site");
             assert_eq!(
-                *site_isa,
+                super::isa().as_simd_isa(),
                 isa,
                 "pinning {} left the site behind",
                 isa.name()

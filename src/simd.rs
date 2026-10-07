@@ -196,16 +196,7 @@ fn from_vp9_encode_isa(isa: zvidlib_vp9_encoder::simd::Isa) -> SimdIsa {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn from_hevc_isa(isa: zvidlib_hevc_decoder::engine::simd::Isa) -> SimdIsa {
-    use zvidlib_hevc_decoder::engine::simd::Isa;
-    match isa {
-        Isa::Scalar => SimdIsa::Scalar,
-        #[cfg(target_arch = "x86_64")]
-        Isa::Sse41 => SimdIsa::Sse41,
-        #[cfg(target_arch = "x86_64")]
-        Isa::Avx2 => SimdIsa::Avx2,
-        #[cfg(target_arch = "aarch64")]
-        Isa::Neon => SimdIsa::Neon,
-    }
+    isa.as_simd_isa()
 }
 
 /// SSE4.2 is SSE4.1 plus the 64-bit compare the dequantization clip needs; the
@@ -266,16 +257,7 @@ fn from_rdcost_isa(isa: zvidlib_hevc_encoder::engine::encoder::rdcost::Isa) -> S
 
 #[cfg(not(target_arch = "wasm32"))]
 fn from_colorconv_isa(isa: zvidlib_color::colorconv::Isa) -> SimdIsa {
-    use zvidlib_color::colorconv::Isa;
-    match isa {
-        Isa::Scalar => SimdIsa::Scalar,
-        #[cfg(target_arch = "x86_64")]
-        Isa::Sse41 => SimdIsa::Sse41,
-        #[cfg(target_arch = "x86_64")]
-        Isa::Avx2 => SimdIsa::Avx2,
-        #[cfg(target_arch = "aarch64")]
-        Isa::Neon => SimdIsa::Neon,
-    }
+    isa.as_simd_isa()
 }
 
 #[cfg(test)]

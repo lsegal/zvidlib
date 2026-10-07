@@ -110,7 +110,7 @@ macro_rules! vectors {
         [$((
             concat!("vp80-00-comprehensive-", $number),
             &include_bytes!(concat!(
-                "fixtures/codec/vp8/vp80-00-comprehensive-",
+                "../crates/zvidlib-vp8/tests/fixtures/vp8/vp80-00-comprehensive-",
                 $number,
                 ".ivf"
             ))[..],
@@ -167,7 +167,7 @@ fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
 #[test]
 fn a_webm_vp8_track_returns_every_frame_exactly() {
     let source = zvidlib::io::MemorySource::new(
-        include_bytes!("fixtures/codec/vp8/vp8_testsrc2_98x66.webm").to_vec(),
+        include_bytes!("../crates/zvidlib-vp8/tests/fixtures/vp8/vp8_testsrc2_98x66.webm").to_vec(),
     );
     let limits = Limits::default();
     let demuxer = block_on(WebmDemuxer::open(&source, Default::default())).unwrap();
@@ -208,7 +208,7 @@ fn a_seek_decodes_through_a_hidden_key_frame() {
     // Vector 018 opens with a key frame that is never shown; every frame
     // after it predicts from it.
     let (dimensions, frames) = ivf(include_bytes!(
-        "fixtures/codec/vp8/vp80-00-comprehensive-018.ivf"
+        "../crates/zvidlib-vp8/tests/fixtures/vp8/vp80-00-comprehensive-018.ivf"
     ));
     assert!(frames[0].key_frame && !frames[0].shown);
     assert!(frames[1..].iter().all(|frame| frame.shown));
@@ -275,7 +275,7 @@ fn a_webm_vp8_track_skips_its_hidden_alternate_references() {
     // references. `src/vp8/tests.rs` holds the 40 shown frames to libvpx's
     // MD5s.
     let source = zvidlib::io::MemorySource::new(
-        include_bytes!("fixtures/codec/vp8/vp8_altref_98x66.webm").to_vec(),
+        include_bytes!("../crates/zvidlib-vp8/tests/fixtures/vp8/vp8_altref_98x66.webm").to_vec(),
     );
     let demuxer = block_on(WebmDemuxer::open(&source, Default::default())).unwrap();
     let track = &demuxer.tracks[0];
@@ -302,7 +302,7 @@ fn a_preview_index_covers_only_the_shown_frames() {
     // samples, so the index plans its slots over the 40 shown frames, and
     // every slot it plans is one a decode fills.
     let source = zvidlib::io::MemorySource::new(
-        include_bytes!("fixtures/codec/vp8/vp8_altref_98x66.webm").to_vec(),
+        include_bytes!("../crates/zvidlib-vp8/tests/fixtures/vp8/vp8_altref_98x66.webm").to_vec(),
     );
     let demuxer = block_on(WebmDemuxer::open(&source, Default::default())).unwrap();
     let track = &demuxer.tracks[0];
@@ -383,7 +383,7 @@ fn capability_honors_the_hardware_preference() {
 #[test]
 fn a_frame_of_the_wrong_size_or_a_malformed_frame_is_an_error() {
     let (_, frames) = ivf(include_bytes!(
-        "fixtures/codec/vp8/vp80-00-comprehensive-001.ivf"
+        "../crates/zvidlib-vp8/tests/fixtures/vp8/vp80-00-comprehensive-001.ivf"
     ));
     let factory = native_vp8_video_decoder_factory();
     let limits = Limits::default();
@@ -491,7 +491,7 @@ fn hardware_vp8_matches_the_software_decoder_and_seeks_exactly() {
     .to_vec();
     vectors.push((
         "vp8_altref_98x66",
-        &include_bytes!("fixtures/codec/vp8/vp8_altref_98x66.ivf")[..],
+        &include_bytes!("../crates/zvidlib-vp8/tests/fixtures/vp8/vp8_altref_98x66.ivf")[..],
     ));
     for (name, file) in vectors {
         let (dimensions, frames) = ivf(file);
@@ -532,7 +532,7 @@ fn hardware_vp8_matches_the_software_decoder_and_seeks_exactly() {
 #[test]
 fn a_hardware_webm_vp8_track_matches_the_software_decoder() {
     let source = zvidlib::io::MemorySource::new(
-        include_bytes!("fixtures/codec/vp8/vp8_testsrc2_98x66.webm").to_vec(),
+        include_bytes!("../crates/zvidlib-vp8/tests/fixtures/vp8/vp8_testsrc2_98x66.webm").to_vec(),
     );
     let limits = Limits::default();
     let demuxer = block_on(WebmDemuxer::open(&source, Default::default())).unwrap();

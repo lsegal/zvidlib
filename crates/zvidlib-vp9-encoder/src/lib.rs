@@ -28,6 +28,13 @@ mod tables;
 
 #[allow(unused_imports)]
 use zvidlib_core::*;
+// The containers and conformance harness the tests read their fixtures with.
+#[cfg(test)]
+#[allow(unused_imports)]
+use zvidlib_container::*;
+#[cfg(test)]
+#[allow(unused_imports)]
+use zvidlib_vp9_syntax::{key_frame_vpcc, vpcc_from_key_frame};
 pub(crate) use zvidlib_vp9_syntax::{pick_level, vpcc_box};
 
 use crate::{

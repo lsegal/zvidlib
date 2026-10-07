@@ -8,7 +8,8 @@ use crate::{DecodedPicture, limit, malformed};
 /// The conversion matrix for a VP9 `color_space`: `CS_BT_709` (2) and
 /// `CS_BT_2020` (5) have their own, and everything else, including
 /// `CS_UNKNOWN`, `CS_BT_601` and `CS_SMPTE_170`, uses BT.601.
-fn matrix_for(color_space: u8) -> MatrixCoefficients {
+#[doc(hidden)]
+pub fn matrix_for(color_space: u8) -> MatrixCoefficients {
     match color_space {
         2 => MatrixCoefficients::Bt709,
         5 => MatrixCoefficients::Bt2020Ncl,

@@ -1,4 +1,4 @@
-// `zvidlib::hevc_encoder_bench` is itself gated to non-wasm targets, so this
+// `zvidlib_hevc_encoder::bench` is itself gated to non-wasm targets, so this
 // guard keeps `wasm-pack test`'s `cargo build --tests` from failing to resolve
 // it, the way the other native-only integration tests do.
 #![cfg(not(target_arch = "wasm32"))]
@@ -12,7 +12,7 @@
 //! golden digests below were captured from the pre-rewrite implementation; a
 //! change here is a bitstream regression, not a benchmark result.
 
-use zvidlib::hevc_encoder_bench as encoder_bench;
+use zvidlib_hevc_encoder::bench as encoder_bench;
 
 /// FNV-1a over the access unit. A digest rather than a stored bitstream keeps
 /// the guard readable while still being byte-exact — any single flipped bit

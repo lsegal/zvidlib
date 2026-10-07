@@ -9,17 +9,13 @@ use std::future::Future;
 use std::pin::Pin;
 use std::process::{Command, Stdio};
 use std::task::{Context, Poll, Waker};
-use zvidlib::io::{MemorySink, MemorySource};
-use zvidlib::mp4::{Mp4TrackConfig, Mp4TrackFormat};
-use zvidlib::{
-    CancellationToken, Codec, CodecProfile, ColorRange, Container, EncodedSample, EncoderConfig,
-    ErrorKind, ExactFrameReader, FrameIndex, HardwarePreference, Limits, Mp4Demuxer,
-    Mp4DemuxerOptions, Mp4Track, PixelFormat, SampleDependency, TrackKind, VideoDecoderConfig,
-    VideoDimensions, WebmDemuxer, WebmDemuxerOptions, WebmMuxer, container_capabilities,
-    native_av1_video_decoder_factory, probe_container,
-};
+use zvidlib_core::io::{MemorySink, MemorySource};
+use zvidlib_container::mp4::{Mp4TrackConfig, Mp4TrackFormat};
+use zvidlib_av1_decoder::native_av1_video_decoder_factory;
+use zvidlib_container::{Mp4Demuxer, Mp4DemuxerOptions, Mp4Track, WebmDemuxer, WebmDemuxerOptions, WebmMuxer, container_capabilities, probe_container};
+use zvidlib_core::{CancellationToken, Codec, CodecProfile, ColorRange, Container, EncodedSample, EncoderConfig, ErrorKind, ExactFrameReader, FrameIndex, HardwarePreference, Limits, PixelFormat, SampleDependency, TrackKind, VideoDecoderConfig, VideoDimensions};
 
-const AV1_MP4: &[u8] = include_bytes!("../examples/media/BigBuckBunny.av1.mp4");
+const AV1_MP4: &[u8] = include_bytes!("../../../examples/media/BigBuckBunny.av1.mp4");
 
 fn block_on<T>(future: impl Future<Output = T>) -> T {
     let mut context = Context::from_waker(Waker::noop());

@@ -89,7 +89,7 @@ fn conformance_vectors() -> Vec<Vec<&'static [u8]>> {
     macro_rules! vectors {
         ($($number:literal),* $(,)?) => {
             [$(&include_bytes!(concat!(
-                "../tests/fixtures/codec/vp8/vp80-00-comprehensive-",
+                "../crates/zvidlib-vp8/tests/fixtures/vp8/vp80-00-comprehensive-",
                 $number,
                 ".ivf"
             ))[..]),*]

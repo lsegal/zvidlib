@@ -12,15 +12,13 @@ use std::pin::Pin;
 use std::process::{Command, Stdio};
 use std::task::{Context, Poll, Waker};
 
-use zvidlib::io::{MemorySink, MemorySource};
-use zvidlib::mp4::{Mp4Muxer, Mp4TrackConfig, Mp4TrackFormat};
-use zvidlib::{
-    AudioBuffer, AudioDecoder, AudioEncoderConfig, AudioEncoderFactory, AudioSampleReader,
-    CancellationToken, Codec, CodecProfile, CodecSupport, EncodedAudioSample, FrameIndex, Limits,
-    Mp4Demuxer, Mp4DemuxerOptions, NativeOpusDecoder, OPUS_SAMPLE_RATE, OpusHead, SampleRange,
-    TrackKind, native_opus_audio_encoder_factory, opus_packet_samples, opus_preroll_packets,
-};
-use zvidlib::{WebmDemuxer, WebmDemuxerOptions, WebmMuxer};
+use zvidlib_core::io::{MemorySink, MemorySource};
+use zvidlib_container::mp4::{Mp4Muxer, Mp4TrackConfig, Mp4TrackFormat};
+use zvidlib_opus::{NativeOpusDecoder, OPUS_SAMPLE_RATE, OpusHead};
+use zvidlib_container::{Mp4Demuxer, Mp4DemuxerOptions};
+use zvidlib_core::{AudioBuffer, AudioDecoder, AudioEncoderConfig, AudioEncoderFactory, AudioSampleReader, CancellationToken, Codec, CodecProfile, CodecSupport, EncodedAudioSample, FrameIndex, Limits, SampleRange, TrackKind};
+use zvidlib_opus::{native_opus_audio_encoder_factory, opus_packet_samples, opus_preroll_packets};
+use zvidlib_container::{WebmDemuxer, WebmDemuxerOptions, WebmMuxer};
 
 fn block_on<T>(future: impl Future<Output = T>) -> T {
     let waker = Waker::noop();
@@ -36,7 +34,7 @@ fn block_on<T>(future: impl Future<Output = T>) -> T {
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/codec")
+        .join("tests/fixtures")
         .join(name)
 }
 
@@ -521,7 +519,7 @@ fn encoder_capability_rejects_what_it_cannot_encode() {
     assert_eq!(
         factory.capability(&base),
         CodecSupport::Supported {
-            implementation: zvidlib::CodecImplementation::Software
+            implementation: zvidlib_core::CodecImplementation::Software
         }
     );
     let cases = [
@@ -779,7 +777,7 @@ fn ffmpeg_decodes_the_native_encoders_webm_to_its_exact_length() {
 /// audio reads back with exactly its length.
 #[test]
 fn opus_interleaves_with_video_in_webm() {
-    use zvidlib::{EncodedSample, EncoderConfig, SampleDependency, VideoDimensions};
+    use zvidlib_core::{EncodedSample, EncoderConfig, SampleDependency, VideoDimensions};
     let frames = 48_000;
     let input = test_signal(frames);
     let factory = native_opus_audio_encoder_factory();

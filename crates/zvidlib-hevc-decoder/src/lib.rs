@@ -727,7 +727,7 @@ mod tests {
 
         let limits = Limits::default();
         let source = MemorySource::new(
-            include_bytes!("../../tests/fixtures/codec/bbb_hevc_main10_128x72.mp4").to_vec(),
+            include_bytes!("../tests/fixtures/bbb_hevc_main10_128x72.mp4").to_vec(),
         );
         let movie = block_on(Mp4Demuxer::open(&source, Mp4DemuxerOptions::default())).unwrap();
         let track = &movie.tracks[0];
@@ -756,10 +756,10 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         let expected = digests(include_str!(
-            "../../tests/fixtures/codec/bbb_hevc_main10_128x72_yuv420p10le.sha256"
+            "../tests/fixtures/bbb_hevc_main10_128x72_yuv420p10le.sha256"
         ));
         let expected_rgba = digests(include_str!(
-            "../../tests/fixtures/codec/bbb_hevc_main10_128x72_rgba.sha256"
+            "../tests/fixtures/bbb_hevc_main10_128x72_rgba.sha256"
         ));
         let limits = Limits::default();
         let (configuration, samples) =
@@ -858,13 +858,13 @@ mod tests {
         };
 
         let expected =
-            include_str!("../../tests/fixtures/codec/bbb_hevc_512x288_gop32_rgba.sha256")
+            include_str!("../tests/fixtures/bbb_hevc_512x288_gop32_rgba.sha256")
                 .lines()
                 .map(|line| FrameDigest::from_hex(line.split_once(' ').unwrap().1).unwrap())
                 .collect::<Vec<_>>();
         let limits = Limits::default();
         let source = MemorySource::new(
-            include_bytes!("../../tests/fixtures/codec/bbb_hevc_512x288_gop32.mp4").to_vec(),
+            include_bytes!("../tests/fixtures/bbb_hevc_512x288_gop32.mp4").to_vec(),
         );
         let vector = block_on(VideoDecoderConformanceVector::from_mp4(
             "open-GOP HEVC Main fixture",

@@ -8,16 +8,11 @@
 //! libvpx's decode where ffmpeg is installed.
 #![cfg(not(target_arch = "wasm32"))]
 
-use zvidlib::io::{MemorySink, MemorySource};
-use zvidlib::mp4::{Mp4TrackConfig, Mp4TrackFormat};
-use zvidlib::{
-    CancellationToken, Codec, CodecProfile, ColorRange, CpuFrameSource, EncodedSample,
-    ExpectedVideoFrame, FrameDigest, FrameIndex, FrameSource, HardwarePreference, Limits,
-    Orientation, PixelFormat, Plane, VideoDecoderConfig, VideoDecoderConformanceVector,
-    VideoDecoderFactory, VideoDimensions, VideoEncoderConfig, VideoEncoderFactory, VideoFrame,
-    WebmDemuxer, WebmMuxer, native_vp8_video_decoder_factory, native_vp8_video_encoder_factory,
-    verify_video_decoder_conformance,
-};
+use zvidlib_core::io::{MemorySink, MemorySource};
+use zvidlib_container::mp4::{Mp4TrackConfig, Mp4TrackFormat};
+use zvidlib_container::{ExpectedVideoFrame, FrameDigest, VideoDecoderConformanceVector, WebmDemuxer, WebmMuxer, verify_video_decoder_conformance};
+use zvidlib_core::{CancellationToken, Codec, CodecProfile, ColorRange, CpuFrameSource, EncodedSample, FrameIndex, FrameSource, HardwarePreference, Limits, Orientation, PixelFormat, Plane, VideoDecoderConfig, VideoDecoderFactory, VideoDimensions, VideoEncoderConfig, VideoEncoderFactory, VideoFrame};
+use zvidlib_vp8::{native_vp8_video_decoder_factory, native_vp8_video_encoder_factory};
 
 fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
     use std::task::{Context, Poll, Waker};
@@ -62,7 +57,7 @@ fn encoder_configuration(
 /// Every frame of the bundled 98x66 `testsrc2` clip, as RGBA.
 fn source_frames() -> (VideoDimensions, Vec<VideoFrame>) {
     let source =
-        MemorySource::new(include_bytes!("fixtures/codec/vp8/vp8_testsrc2_98x66.webm").to_vec());
+        MemorySource::new(include_bytes!("fixtures/vp8/vp8_testsrc2_98x66.webm").to_vec());
     let limits = Limits::default();
     let demuxer = block_on(WebmDemuxer::open(&source, Default::default())).unwrap();
     let track = &demuxer.tracks[0];
@@ -104,7 +99,7 @@ fn encode(
 
 fn mux(dimensions: VideoDimensions, timescale: u32, samples: Vec<EncodedSample>) -> Vec<u8> {
     let config = Mp4TrackConfig {
-        encoder: zvidlib::EncoderConfig {
+        encoder: zvidlib_core::EncoderConfig {
             codec: Codec::Vp8,
             timescale,
             decoder_config: Vec::new(),
@@ -239,19 +234,19 @@ fn bgra_and_bottom_up_frames_encode_exactly_as_rgba() {
 fn mp4_refuses_a_vp8_track() {
     let limits = Limits::default();
     let config = Mp4TrackConfig {
-        encoder: zvidlib::EncoderConfig {
+        encoder: zvidlib_core::EncoderConfig {
             codec: Codec::Vp8,
             timescale: 25,
             decoder_config: Vec::new(),
         },
         format: Mp4TrackFormat::Video(VideoDimensions::new(16, 16, &limits).unwrap()),
     };
-    let error = block_on(zvidlib::mp4::Mp4Muxer::new(
+    let error = block_on(zvidlib_container::mp4::Mp4Muxer::new(
         MemorySink::new(),
         vec![config],
         16,
     ))
     .err()
     .unwrap();
-    assert_eq!(error.kind(), zvidlib::ErrorKind::InvalidInput);
+    assert_eq!(error.kind(), zvidlib_core::ErrorKind::InvalidInput);
 }

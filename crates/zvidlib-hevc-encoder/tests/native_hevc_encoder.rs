@@ -15,15 +15,12 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
-use zvidlib::io::{MemorySink, MemorySource};
-use zvidlib::mp4::{Mp4Muxer, Mp4TrackConfig, Mp4TrackFormat};
-use zvidlib::{
-    CancellationToken, Codec, CodecImplementation, CodecProfile, CodecSupport, ColorRange,
-    CpuFrameSource, EncodedSample, ExactFrameReader, FrameIndex, FrameSource, HardwarePreference,
-    Limits, Mp4Demuxer, Mp4DemuxerOptions, Orientation, PixelFormat, Plane, VideoDecoderConfig,
-    VideoDimensions, VideoEncoder, VideoEncoderConfig, VideoEncoderFactory, VideoFrame,
-    native_hevc_video_decoder_factory, native_hevc_video_encoder_factory,
-};
+use zvidlib_core::io::{MemorySink, MemorySource};
+use zvidlib_container::mp4::{Mp4Muxer, Mp4TrackConfig, Mp4TrackFormat};
+use zvidlib_container::{Mp4Demuxer, Mp4DemuxerOptions};
+use zvidlib_core::{CancellationToken, Codec, CodecImplementation, CodecProfile, CodecSupport, ColorRange, CpuFrameSource, EncodedSample, ExactFrameReader, FrameIndex, FrameSource, HardwarePreference, Limits, Orientation, PixelFormat, Plane, VideoDecoderConfig, VideoDimensions, VideoEncoder, VideoEncoderConfig, VideoEncoderFactory, VideoFrame};
+use zvidlib_hevc_decoder::native_hevc_video_decoder_factory;
+use zvidlib_hevc_encoder::native_hevc_video_encoder_factory;
 
 fn block_on<T>(future: impl Future<Output = T>) -> T {
     let mut context = Context::from_waker(Waker::noop());
@@ -202,7 +199,7 @@ fn the_factory_honours_hardware_preference_and_reports_the_implementation() {
         }
         CodecSupport::HardwareUnavailable => {
             let error = factory.create(&require, &limits).err().unwrap();
-            assert_eq!(error.kind(), zvidlib::ErrorKind::Unsupported, "{error}");
+            assert_eq!(error.kind(), zvidlib_core::ErrorKind::Unsupported, "{error}");
             // Prefer still produces an encoder: Media Foundation's software
             // one where it is installed, else the native one.
             let encoder = factory.create(&prefer, &limits).unwrap();

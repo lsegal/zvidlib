@@ -138,13 +138,12 @@ impl ByteSink for MemorySink {
 /// A sequential-only in-memory sink used to test the non-seekable `ByteSink`
 /// contract: it reports `is_seekable() == false` and rejects every `seek()`
 /// call with [`ErrorKind::Unsupported`].
-#[cfg(test)]
+#[doc(hidden)]
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct NonSeekableSink {
+pub struct NonSeekableSink {
     bytes: Vec<u8>,
 }
 
-#[cfg(test)]
 impl ByteSink for NonSeekableSink {
     fn position(&self) -> u64 {
         self.bytes.len() as u64

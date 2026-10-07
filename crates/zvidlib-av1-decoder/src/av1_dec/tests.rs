@@ -8,7 +8,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 
-const COLOR_AV1: &[u8] = include_bytes!("../../examples/media/BigBuckBunny.av1.mp4");
+const COLOR_AV1: &[u8] = include_bytes!("../../../../examples/media/BigBuckBunny.av1.mp4");
 
 fn block_on<T>(future: impl Future<Output = T>) -> T {
     let mut context = Context::from_waker(Waker::noop());
@@ -76,7 +76,7 @@ fn yuv_digest(picture: &DecodedPicture) -> FrameDigest {
 #[test]
 fn colour_sample_decodes_bit_exactly_against_an_independent_decoder() {
     let expected = digests(include_str!(
-        "../../tests/fixtures/codec/big_buck_bunny_av1_yuv420.sha256"
+        "../../tests/fixtures/big_buck_bunny_av1_yuv420.sha256"
     ));
     assert_eq!(expected.len(), 768);
     let mut decoder = Decoder::new(Limits::default());
@@ -185,9 +185,9 @@ macro_rules! tool_fixture {
     ($name:literal, $size:expr, $tools:expr) => {
         ToolFixture {
             name: $name,
-            mp4: include_bytes!(concat!("../../tests/fixtures/codec/", $name, ".mp4")),
+            mp4: include_bytes!(concat!("../../tests/fixtures/", $name, ".mp4")),
             digests: include_str!(concat!(
-                "../../tests/fixtures/codec/",
+                "../../tests/fixtures/",
                 $name,
                 "_yuv420.sha256"
             )),

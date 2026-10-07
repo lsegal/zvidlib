@@ -1331,8 +1331,8 @@ mod tests {
     /// A short PCM-coded stream, built with the crate's own HEVC encoder so
     /// the decode-side tests run on a real bitstream without a fixture.
     fn pcm_stream() -> (VideoDecoderConfig, Vec<EncodedVideoSample>) {
-        use super::super::encoder::{hvcc_box, length_prefixed_vcl};
-        use super::super::engine::encoder::pcm::encode_idr_pcm_au;
+        use zvidlib_hevc_encoder::encoder::{hvcc_box, length_prefixed_vcl};
+        use zvidlib_hevc_encoder::engine::encoder::pcm::encode_idr_pcm_au;
         use crate::FrameIndex;
 
         const SIDE: usize = 16;

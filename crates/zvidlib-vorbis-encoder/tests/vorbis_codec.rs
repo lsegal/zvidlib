@@ -13,18 +13,16 @@
 
 use std::path::{Path, PathBuf};
 
-use zvidlib::io::{MemorySink, MemorySource};
-use zvidlib::mp4::{Mp4Muxer, Mp4TrackConfig, Mp4TrackFormat};
-use zvidlib::{
-    AudioBuffer, AudioEncoderConfig, AudioEncoderFactory, AudioSampleReader, AudioTrackTiming,
-    CancellationToken, Codec, CodecProfile, CodecSupport, EncodedSample, FrameIndex, Limits,
-    NativeVorbisDecoder, SampleRange, TrackKind, VORBIS_PREROLL_PACKETS, VorbisConfig, WebmDemuxer,
-    WebmDemuxerOptions, WebmMuxer, native_vorbis_audio_encoder_factory,
-};
+use zvidlib_core::io::{MemorySink, MemorySource};
+use zvidlib_container::mp4::{Mp4Muxer, Mp4TrackConfig, Mp4TrackFormat};
+use zvidlib_vorbis_decoder::{NativeVorbisDecoder, VORBIS_PREROLL_PACKETS, VorbisConfig};
+use zvidlib_container::{WebmDemuxer, WebmDemuxerOptions, WebmMuxer};
+use zvidlib_core::{AudioBuffer, AudioEncoderConfig, AudioEncoderFactory, AudioSampleReader, AudioTrackTiming, CancellationToken, Codec, CodecProfile, CodecSupport, EncodedSample, FrameIndex, Limits, SampleRange, TrackKind};
+use zvidlib_vorbis_encoder::native_vorbis_audio_encoder_factory;
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/codec")
+        .join("../zvidlib-vorbis-decoder/tests/fixtures")
         .join(name)
 }
 
@@ -175,7 +173,7 @@ fn several_channels_sharing_one_residue_decode_as_libvorbis_does() {
 /// run decodes every fixture to the very same samples.
 #[test]
 fn every_instruction_set_decodes_to_the_same_samples() {
-    use zvidlib::simd::{self, SimdIsa};
+    use zvidlib_core::simd::{self, SimdIsa};
     for name in [
         "vorbis_stereo_44k",
         "vorbis_transient_mono",
@@ -458,7 +456,7 @@ fn encoder_capability_rejects_what_it_cannot_encode() {
     assert_eq!(
         factory.capability(&base),
         CodecSupport::Supported {
-            implementation: zvidlib::CodecImplementation::Software
+            implementation: zvidlib_core::CodecImplementation::Software
         }
     );
     let cases = [
@@ -512,7 +510,7 @@ fn mp4_refuses_a_vorbis_track() {
         1_000,
     ));
     let error = result.err().expect("Vorbis has no MP4 sample entry");
-    assert_eq!(error.kind(), zvidlib::ErrorKind::Unsupported);
+    assert_eq!(error.kind(), zvidlib_core::ErrorKind::Unsupported);
 }
 
 // --- WebM ------------------------------------------------------------------------

@@ -2200,7 +2200,7 @@ mod tests {
     fn to_encoded_video_samples_reads_the_bundled_hevc_sample_in_presentation_order() {
         let bytes = std::fs::read(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/examples/media/BigBuckBunny.mp4"
+            "/../../examples/media/BigBuckBunny.mp4"
         ))
         .expect("bundled sample video is checked into the repository");
         let source = MemorySource::new(bytes);
@@ -2416,7 +2416,7 @@ mod tests {
     #[test]
     fn libvpx_vp9_mp4_exposes_its_vpcc_configuration() {
         let source = MemorySource::new(
-            include_bytes!("../tests/fixtures/codec/vp9_bbb_256x144.mp4").to_vec(),
+            include_bytes!("../../zvidlib-vp9-decoder/tests/fixtures/vp9_bbb_256x144.mp4").to_vec(),
         );
         let demuxer = block_on(Mp4Demuxer::open(&source, Mp4DemuxerOptions::default())).unwrap();
         let track = &demuxer.tracks[0];
@@ -2460,7 +2460,7 @@ mod tests {
     fn bundled_aac_track_exposes_indexed_packets_configuration_and_gapless_timing() {
         block_on(async {
             let source =
-                MemorySource::new(include_bytes!("../examples/media/BigBuckBunny.mp4").to_vec());
+                MemorySource::new(include_bytes!("../../../examples/media/BigBuckBunny.mp4").to_vec());
             let movie = Mp4Demuxer::open(&source, Mp4DemuxerOptions::default())
                 .await
                 .unwrap();

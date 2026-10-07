@@ -1,7 +1,9 @@
-use zvidlib::{Av1InterDecoder, ErrorKind, FrameDigest, Limits};
+use zvidlib_av1::Av1InterDecoder;
+use zvidlib_container::FrameDigest;
+use zvidlib_core::{ErrorKind, Limits};
 
 fn vector() -> Vec<u8> {
-    let hex = include_str!("fixtures/codec/av1_inter_show_existing_16x16.hex").trim();
+    let hex = include_str!("fixtures/av1_inter_show_existing_16x16.hex").trim();
     hex.as_bytes()
         .chunks_exact(2)
         .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
@@ -54,7 +56,7 @@ fn standardized_inter_and_show_existing_vector_matches_canonical_digest() {
     let units = temporal_units(&stream);
     assert_eq!(units.len(), 5);
     let expected = FrameDigest::from_hex(
-        include_str!("fixtures/codec/av1_inter_show_existing_16x16.sha256").trim(),
+        include_str!("fixtures/av1_inter_show_existing_16x16.sha256").trim(),
     )
     .unwrap();
 

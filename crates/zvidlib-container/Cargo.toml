@@ -13,3 +13,6 @@ zvidlib-core = { workspace = true }
 zvidlib-opus = { workspace = true }
 zvidlib-vorbis-decoder = { workspace = true }
 zvidlib-av1-syntax = { workspace = true }
+
+[dev-dependencies]
+zvidlib-av1-decoder = { path = "../zvidlib-av1-decoder" }

@@ -968,7 +968,7 @@ mod tests {
         ));
     }
 
-    const SMALL_HEVC: &[u8] = include_bytes!("../tests/fixtures/codec/bbb_hevc_512x288_gop32.mp4");
+    const SMALL_HEVC: &[u8] = include_bytes!("../crates/zvidlib-hevc-decoder/tests/fixtures/bbb_hevc_512x288_gop32.mp4");
 
     fn digest(dimensions: VideoDimensions, rgba: Vec<u8>) -> String {
         let limits = Limits::default();
@@ -1087,9 +1087,9 @@ mod tests {
     /// independent FFmpeg decode of the same track.
     #[wasm_bindgen_test(async)]
     async fn software_fallback_decodes_hevc_main10() {
-        const MAIN10: &[u8] = include_bytes!("../tests/fixtures/codec/bbb_hevc_main10_128x72.mp4");
+        const MAIN10: &[u8] = include_bytes!("../crates/zvidlib-hevc-decoder/tests/fixtures/bbb_hevc_main10_128x72.mp4");
         let expected: Vec<&str> =
-            include_str!("../tests/fixtures/codec/bbb_hevc_main10_128x72_rgba.sha256")
+            include_str!("../crates/zvidlib-hevc-decoder/tests/fixtures/bbb_hevc_main10_128x72_rgba.sha256")
                 .lines()
                 .map(|line| line.split_once(' ').unwrap().1)
                 .collect();
@@ -1397,9 +1397,9 @@ mod tests {
     /// and frame 3 by restarting at 0.
     #[wasm_bindgen_test(async)]
     async fn software_fallback_decodes_vp9_like_libvpx() {
-        const VP9: &[u8] = include_bytes!("../tests/fixtures/codec/vp9_bbb_256x144.mp4");
+        const VP9: &[u8] = include_bytes!("../crates/zvidlib-vp9-decoder/tests/fixtures/vp9_bbb_256x144.mp4");
         let expected: Vec<&str> =
-            include_str!("../tests/fixtures/codec/vp9_bbb_256x144_rgba.sha256")
+            include_str!("../crates/zvidlib-vp9-decoder/tests/fixtures/vp9_bbb_256x144_rgba.sha256")
                 .lines()
                 .map(|line| line.split_once(' ').unwrap().1)
                 .collect();
@@ -1433,7 +1433,7 @@ mod tests {
     /// track's size.
     #[wasm_bindgen_test(async)]
     async fn vp9_tracks_decode_through_webcodecs_or_the_fallback() {
-        const VP9: &[u8] = include_bytes!("../tests/fixtures/codec/vp9_bbb_256x144.mp4");
+        const VP9: &[u8] = include_bytes!("../crates/zvidlib-vp9-decoder/tests/fixtures/vp9_bbb_256x144.mp4");
         let source = MemorySource::new(VP9.to_vec());
         let track = parse_video_track(&source, 0, &Limits::default())
             .await
@@ -1468,7 +1468,7 @@ mod tests {
     /// AV1 decoder covers 8-bit streams, so a 10-bit Main track is refused.
     #[wasm_bindgen_test(async)]
     async fn a_track_the_software_decoder_refuses_stays_unsupported() {
-        const MAIN_10_AV1: &[u8] = include_bytes!("../tests/fixtures/codec/av1_main10_64x64.mp4");
+        const MAIN_10_AV1: &[u8] = include_bytes!("../crates/zvidlib-av1-decoder/tests/fixtures/av1_main10_64x64.mp4");
         let error = match WebVideoDecodeSession::open_with(
             MAIN_10_AV1,
             0,
@@ -1488,7 +1488,7 @@ mod tests {
         );
     }
 
-    const VP8_ALTREF: &[u8] = include_bytes!("../tests/fixtures/codec/vp8/vp8_altref_98x66.webm");
+    const VP8_ALTREF: &[u8] = include_bytes!("../crates/zvidlib-vp8/tests/fixtures/vp8/vp8_altref_98x66.webm");
 
     /// Issue #537: three of this WebM track's 43 VP8 blocks are hidden
     /// alternate references. The session counts only its 40 shown frames and

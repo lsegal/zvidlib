@@ -13,7 +13,8 @@
 // internal — exposed for the criterion benchmark suite; not part of the stable API
 #[doc(hidden)]
 pub mod bench;
-mod encoder;
+#[doc(hidden)]
+pub mod encoder;
 // internal — the HEVC engine with its encoder half; not part of the stable API
 #[doc(hidden)]
 pub mod engine {
@@ -25,6 +26,9 @@ pub use encoder::native_hevc_video_encoder_factory;
 
 #[allow(unused_imports)]
 use zvidlib_core::*;
+#[cfg(test)]
+#[allow(unused_imports)]
+use zvidlib_hevc_decoder::native_hevc_video_decoder_factory;
 #[cfg(target_os = "macos")]
 use zvidlib_hardware::videotoolbox_encoder;
 #[cfg(windows)]

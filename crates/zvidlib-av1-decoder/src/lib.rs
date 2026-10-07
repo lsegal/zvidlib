@@ -30,6 +30,10 @@ use zvidlib_av1_syntax::*;
 use zvidlib_color::*;
 #[allow(unused_imports)]
 use zvidlib_core::*;
+// The containers and conformance harness the tests read their fixtures with.
+#[cfg(test)]
+#[allow(unused_imports)]
+use zvidlib_container::*;
 
 /// Returns the dependency-free native AV1 Main-profile (8-bit 4:2:0 and
 /// monochrome) software decoder backend.

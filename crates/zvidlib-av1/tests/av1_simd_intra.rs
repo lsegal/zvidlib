@@ -1,5 +1,5 @@
 //! Bit-exactness and throughput coverage for the SIMD AV1 intra prediction
-//! kernels (`zvidlib::av1_intra_pred`).
+//! kernels (`zvidlib_av1::av1_intra_pred`).
 //!
 //! Every test compares the dispatched kernels (AVX2/SSE4.1 on x86_64, NEON on
 //! aarch64, scalar elsewhere) against an independent scalar reference written
@@ -8,10 +8,8 @@
 
 use std::time::Instant;
 
-use zvidlib::{
-    Av1IntraBlock, Av1IntraFrame, Av1IntraMode, ColorRange, Limits, SmoothMode, VideoDimensions,
-    add_residual_row, av1_intra_simd, directional_row, paeth_row, smooth_row, sum_samples,
-};
+use zvidlib_av1::{Av1IntraBlock, Av1IntraFrame, Av1IntraMode, SmoothMode, add_residual_row, av1_intra_simd, directional_row, paeth_row, smooth_row, sum_samples};
+use zvidlib_core::{ColorRange, Limits, VideoDimensions};
 
 const MODES: [Av1IntraMode; 14] = [
     Av1IntraMode::Dc,

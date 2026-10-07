@@ -1853,6 +1853,8 @@ fn resource(message: impl Into<String>) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ColorRange;
+    use zvidlib_color::frame::chroma_dim;
 
     fn limits() -> Limits {
         Limits::default()

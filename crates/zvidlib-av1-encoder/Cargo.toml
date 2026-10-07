@@ -11,3 +11,7 @@ categories.workspace = true
 [dependencies]
 zvidlib-core = { workspace = true }
 zvidlib-av1 = { workspace = true }
+
+[dev-dependencies]
+zvidlib-av1-decoder = { path = "../zvidlib-av1-decoder" }
+zvidlib-container = { path = "../zvidlib-container" }

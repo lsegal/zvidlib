@@ -153,7 +153,7 @@ pub fn av1_lossless_intra_stream() -> &'static [u8] {
     static STREAM: OnceLock<Vec<u8>> = OnceLock::new();
     STREAM.get_or_init(|| {
         from_hex(include_str!(
-            "../../tests/fixtures/codec/av1_lossless_17x9.hex"
+            "../../crates/zvidlib-av1/tests/fixtures/av1_lossless_17x9.hex"
         ))
     })
 }
@@ -163,7 +163,7 @@ pub fn av1_inter_stream() -> &'static [u8] {
     static STREAM: OnceLock<Vec<u8>> = OnceLock::new();
     STREAM.get_or_init(|| {
         from_hex(include_str!(
-            "../../tests/fixtures/codec/av1_inter_show_existing_16x16.hex"
+            "../../crates/zvidlib-av1/tests/fixtures/av1_inter_show_existing_16x16.hex"
         ))
     })
 }
@@ -786,7 +786,7 @@ pub fn vorbis_stereo_fixture() -> &'static VorbisFixture {
     static FIXTURE: OnceLock<VorbisFixture> = OnceLock::new();
     FIXTURE.get_or_init(|| {
         VorbisFixture::parse(
-            include_bytes!("../../tests/fixtures/codec/vorbis_stereo_44k.ogg"),
+            include_bytes!("../../crates/zvidlib-vorbis-decoder/tests/fixtures/vorbis_stereo_44k.ogg"),
             "the stereo Vorbis fixture",
         )
     })
@@ -798,7 +798,7 @@ pub fn vorbis_surround_fixture() -> &'static VorbisFixture {
     static FIXTURE: OnceLock<VorbisFixture> = OnceLock::new();
     FIXTURE.get_or_init(|| {
         VorbisFixture::parse(
-            include_bytes!("../../tests/fixtures/codec/vorbis_6ch_48k.ogg"),
+            include_bytes!("../../crates/zvidlib-vorbis-decoder/tests/fixtures/vorbis_6ch_48k.ogg"),
             "the 5.1 Vorbis fixture",
         )
     })
@@ -879,11 +879,11 @@ pub fn gop_cadence_tracks() -> &'static [GopCadenceTrack; 2] {
         [
             gop_cadence_track(
                 "raps=1",
-                include_bytes!("../../tests/fixtures/codec/bbb_hevc_512x288_gop768.mp4").to_vec(),
+                include_bytes!("../../crates/zvidlib-hevc-decoder/tests/fixtures/bbb_hevc_512x288_gop768.mp4").to_vec(),
             ),
             gop_cadence_track(
                 "raps=24",
-                include_bytes!("../../tests/fixtures/codec/bbb_hevc_512x288_gop32.mp4").to_vec(),
+                include_bytes!("../../crates/zvidlib-hevc-decoder/tests/fixtures/bbb_hevc_512x288_gop32.mp4").to_vec(),
             ),
         ]
     })

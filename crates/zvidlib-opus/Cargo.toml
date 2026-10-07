@@ -11,3 +11,6 @@ categories.workspace = true
 [dependencies]
 zvidlib-core = { workspace = true }
 opus-pure = { workspace = true }
+
+[dev-dependencies]
+zvidlib-container = { path = "../zvidlib-container" }

@@ -15,7 +15,7 @@ mod picture;
 
 pub use chunk::{ChunkInspector, FrameShape, chunk_frames};
 pub use level::{key_frame_vpcc, pick_level, vpcc_box, vpcc_from_key_frame};
-pub use picture::picture_to_rgba;
+pub use picture::{matrix_for, picture_to_rgba};
 
 use bits::BitReader;
 use zvidlib_core::{Error, ErrorKind, Result};

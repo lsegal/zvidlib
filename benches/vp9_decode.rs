@@ -74,7 +74,7 @@ fn bench_stages(criterion: &mut Criterion, stages: Vec<(IsaWorkload<'_>, Stage)>
 /// hidden alternate reference frames, decoded end to end.
 fn vp9_decode_to_picture(criterion: &mut Criterion) {
     let source =
-        MemorySource::new(include_bytes!("../tests/fixtures/codec/vp9_bbb_256x144.mp4").to_vec());
+        MemorySource::new(include_bytes!("../crates/zvidlib-vp9-decoder/tests/fixtures/vp9_bbb_256x144.mp4").to_vec());
     let movie = block_on(Mp4Demuxer::open(&source, Mp4DemuxerOptions::default()))
         .expect("the VP9 fixture is a readable MP4");
     let track = movie.track(1).expect("the VP9 fixture has track 1");

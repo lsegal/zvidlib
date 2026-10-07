@@ -16,3 +16,4 @@ zvidlib-hardware = { workspace = true }
 
 [dev-dependencies]
 zvidlib-container = { path = "../zvidlib-container" }
+zvidlib-hevc-encoder = { path = "../zvidlib-hevc-encoder" }

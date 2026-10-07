@@ -1,6 +1,8 @@
 //! Tests of the VP9 decoder against libvpx, the reference decoder.
 
 use super::*;
+use crate::ErrorKind;
+use zvidlib_vp9_syntax::{ChunkInspector, FrameShape, chunk_full_range};
 
 /// A minimal MD5 (RFC 1321), for comparing decoded frames with the
 /// per-frame digests libvpx's test vectors ship with.
@@ -170,7 +172,7 @@ pub fn webm_frames(data: &[u8]) -> Vec<&[u8]> {
 /// The libvpx VP9 profile 0 test vectors, listed in
 /// `tests/fixtures/codec/libvpx_vp9_test_vectors.txt` (the profile 0 part of
 /// `test/test_vectors.cc`).
-const LIBVPX_VECTORS: &str = include_str!("../../tests/fixtures/codec/libvpx_vp9_test_vectors.txt");
+const LIBVPX_VECTORS: &str = include_str!("../../tests/fixtures/libvpx_vp9_test_vectors.txt");
 
 /// Decodes every libvpx VP9 profile 0 test vector in the directory named by
 /// `ZVIDLIB_VP9_VECTORS` and compares each shown frame with the per-frame
@@ -257,8 +259,8 @@ fn libvpx_test_vectors() {
     assert!(failures.is_empty(), "mismatching vectors: {failures:?}");
 }
 
-const BBB_256X144: &[u8] = include_bytes!("../../tests/fixtures/codec/vp9_bbb_256x144.mp4");
-const BBB_250X142: &[u8] = include_bytes!("../../tests/fixtures/codec/vp9_bbb_250x142.mp4");
+const BBB_256X144: &[u8] = include_bytes!("../../tests/fixtures/vp9_bbb_256x144.mp4");
+const BBB_250X142: &[u8] = include_bytes!("../../tests/fixtures/vp9_bbb_250x142.mp4");
 
 fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
     use std::task::{Context, Poll, Waker};
@@ -339,13 +341,13 @@ fn mp4_fixtures_decode_bit_exactly_against_libvpx() {
     for (mp4, expected, size, frames) in [
         (
             BBB_256X144,
-            include_str!("../../tests/fixtures/codec/vp9_bbb_256x144_yuv420.sha256"),
+            include_str!("../../tests/fixtures/vp9_bbb_256x144_yuv420.sha256"),
             (256, 144),
             48,
         ),
         (
             BBB_250X142,
-            include_str!("../../tests/fixtures/codec/vp9_bbb_250x142_yuv420.sha256"),
+            include_str!("../../tests/fixtures/vp9_bbb_250x142_yuv420.sha256"),
             (250, 142),
             12,
         ),
@@ -387,11 +389,11 @@ fn mp4_fixtures_decode_bit_exactly_under_every_instruction_set() {
     for (mp4, expected) in [
         (
             BBB_256X144,
-            include_str!("../../tests/fixtures/codec/vp9_bbb_256x144_yuv420.sha256"),
+            include_str!("../../tests/fixtures/vp9_bbb_256x144_yuv420.sha256"),
         ),
         (
             BBB_250X142,
-            include_str!("../../tests/fixtures/codec/vp9_bbb_250x142_yuv420.sha256"),
+            include_str!("../../tests/fixtures/vp9_bbb_250x142_yuv420.sha256"),
         ),
     ] {
         let expected = digests(expected);
@@ -542,7 +544,7 @@ fn the_colour_range_of_a_key_frame_is_read_without_decoding_it() {
 #[test]
 fn webm_vp9_track_decodes_like_its_mp4_original() {
     let source = crate::io::MemorySource::new(
-        include_bytes!("../../tests/fixtures/codec/vp9_bbb_256x144.webm").to_vec(),
+        include_bytes!("../../tests/fixtures/vp9_bbb_256x144.webm").to_vec(),
     );
     let tracks = block_on(crate::container::open_tracks(&source, &Limits::default())).unwrap();
     let track = &tracks[0];
@@ -554,7 +556,7 @@ fn webm_vp9_track_decodes_like_its_mp4_original() {
     let mp4 = mp4_samples(BBB_256X144);
     assert_eq!(samples.len(), mp4.len());
     let expected = digests(include_str!(
-        "../../tests/fixtures/codec/vp9_bbb_256x144_yuv420.sha256"
+        "../../tests/fixtures/vp9_bbb_256x144_yuv420.sha256"
     ));
     let mut decoder = Decoder::new(Limits::default());
     for (index, (sample, original)) in samples.iter().zip(&mp4).enumerate() {

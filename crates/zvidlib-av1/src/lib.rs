@@ -35,6 +35,10 @@ use zvidlib_av1_syntax::*;
 use zvidlib_color::yuv_to_rgba;
 #[allow(unused_imports)]
 use zvidlib_core::*;
+// The containers and conformance harness the tests read their fixtures with.
+#[cfg(test)]
+#[allow(unused_imports)]
+use zvidlib_container::*;
 
 pub use av1_encoder::transform::forward_transform;
 pub use av1_entropy::{AV1_CDF_MAX, Av1SymbolDecoder, validate_cdf};

@@ -316,6 +316,7 @@ fn limit(message: impl Into<String>) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zvidlib_vp9_syntax::matrix_for;
 
     fn vpcc(record: &[u8]) -> Vec<u8> {
         let mut bytes = (12u32 + record.len() as u32).to_be_bytes().to_vec();
@@ -517,11 +518,11 @@ mod tests {
         for (name, file) in [
             (
                 "VP9 256x144 with hidden frames",
-                &include_bytes!("../tests/fixtures/codec/vp9_bbb_256x144.mp4")[..],
+                &include_bytes!("../tests/fixtures/vp9_bbb_256x144.mp4")[..],
             ),
             (
                 "VP9 250x142",
-                &include_bytes!("../tests/fixtures/codec/vp9_bbb_250x142.mp4")[..],
+                &include_bytes!("../tests/fixtures/vp9_bbb_250x142.mp4")[..],
             ),
         ] {
             let source = crate::io::MemorySource::new(file.to_vec());

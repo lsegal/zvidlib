@@ -101,12 +101,12 @@ macro_rules! vectors {
         [$((
             concat!("vp80-00-comprehensive-", $number),
             &include_bytes!(concat!(
-                "../../tests/fixtures/codec/vp8/vp80-00-comprehensive-",
+                "../tests/fixtures/vp8/vp80-00-comprehensive-",
                 $number,
                 ".ivf"
             ))[..],
             include_str!(concat!(
-                "../../tests/fixtures/codec/vp8/vp80-00-comprehensive-",
+                "../tests/fixtures/vp8/vp80-00-comprehensive-",
                 $number,
                 ".ivf.md5"
             )),
@@ -165,7 +165,7 @@ fn check_every_test_vector(arm: &str) {
 #[test]
 fn a_hidden_frame_updates_references_without_a_picture() {
     // Vector 018 opens with a key frame that is not shown.
-    let ivf = include_bytes!("../../tests/fixtures/codec/vp8/vp80-00-comprehensive-018.ivf");
+    let ivf = include_bytes!("../tests/fixtures/vp8/vp80-00-comprehensive-018.ivf");
     let frames = ivf_frames(ivf);
     let mut decoder = Decoder::new(Limits::default());
     assert!(decoder.decode(frames[0]).unwrap().is_none());
@@ -178,9 +178,9 @@ fn hidden_alternate_reference_frames_decode_exactly_as_libvpx_does() {
     // FFmpeg's two-pass libvpx encode with automatic alternate references:
     // frames 1 and 17 are hidden inter frames that only update the alternate
     // reference; see `tests/fixtures/codec/README.md`.
-    let ivf = include_bytes!("../../tests/fixtures/codec/vp8/vp8_altref_98x66.ivf");
+    let ivf = include_bytes!("../tests/fixtures/vp8/vp8_altref_98x66.ivf");
     let expected: Vec<&str> =
-        include_str!("../../tests/fixtures/codec/vp8/vp8_altref_98x66.ivf.md5")
+        include_str!("../tests/fixtures/vp8/vp8_altref_98x66.ivf.md5")
             .lines()
             .collect();
     let frames = ivf_frames(ivf);
@@ -201,7 +201,7 @@ fn hidden_alternate_reference_frames_decode_exactly_as_libvpx_does() {
 
 #[test]
 fn an_inter_frame_before_any_key_frame_is_refused() {
-    let ivf = include_bytes!("../../tests/fixtures/codec/vp8/vp80-00-comprehensive-001.ivf");
+    let ivf = include_bytes!("../tests/fixtures/vp8/vp80-00-comprehensive-001.ivf");
     let frames = ivf_frames(ivf);
     let mut decoder = Decoder::new(Limits::default());
     let error = decoder.decode(frames[1]).unwrap_err();
@@ -210,7 +210,7 @@ fn an_inter_frame_before_any_key_frame_is_refused() {
 
 #[test]
 fn truncated_and_oversized_frames_are_errors_not_panics() {
-    let ivf = include_bytes!("../../tests/fixtures/codec/vp8/vp80-00-comprehensive-001.ivf");
+    let ivf = include_bytes!("../tests/fixtures/vp8/vp80-00-comprehensive-001.ivf");
     let key_frame = ivf_frames(ivf)[0];
     for length in [0, 2, 3, 9, 10, 20] {
         let mut decoder = Decoder::new(Limits::default());
@@ -240,10 +240,10 @@ fn decodes_a_webm_vp8_track_exactly_as_libvpx_does() {
     // FFmpeg's libvpx encode of `testsrc2`, with libvpx's decode of each
     // frame as an MD5; see `tests/fixtures/codec/README.md`.
     let source = crate::io::MemorySource::new(
-        include_bytes!("../../tests/fixtures/codec/vp8/vp8_testsrc2_98x66.webm").to_vec(),
+        include_bytes!("../tests/fixtures/vp8/vp8_testsrc2_98x66.webm").to_vec(),
     );
     let expected: Vec<&str> =
-        include_str!("../../tests/fixtures/codec/vp8/vp8_testsrc2_98x66.webm.md5")
+        include_str!("../tests/fixtures/vp8/vp8_testsrc2_98x66.webm.md5")
             .lines()
             .collect();
     let demuxer = block_on(crate::WebmDemuxer::open(&source, Default::default())).unwrap();
@@ -322,7 +322,7 @@ fn media_foundation_vp8_matches_the_software_decoder_and_seeks_exactly() {
     .to_vec();
     ivfs.push((
         "vp8_altref_98x66",
-        include_bytes!("../../tests/fixtures/codec/vp8/vp8_altref_98x66.ivf"),
+        include_bytes!("../tests/fixtures/vp8/vp8_altref_98x66.ivf"),
     ));
     for (name, ivf) in ivfs {
         let width = u32::from(u16::from_le_bytes([ivf[12], ivf[13]]));
@@ -354,11 +354,11 @@ fn media_foundation_vp8_matches_the_software_decoder_and_seeks_exactly() {
     for (name, file) in [
         (
             "VP8 in WebM",
-            &include_bytes!("../../tests/fixtures/codec/vp8/vp8_testsrc2_98x66.webm")[..],
+            &include_bytes!("../tests/fixtures/vp8/vp8_testsrc2_98x66.webm")[..],
         ),
         (
             "VP8 in WebM with hidden alternate references",
-            &include_bytes!("../../tests/fixtures/codec/vp8/vp8_altref_98x66.webm")[..],
+            &include_bytes!("../tests/fixtures/vp8/vp8_altref_98x66.webm")[..],
         ),
     ] {
         let webm = crate::io::MemorySource::new(file.to_vec());
@@ -415,10 +415,10 @@ fn skips_a_webm_vp8_tracks_hidden_alternate_references_as_libvpx_does() {
     // whose hidden frames are WebM blocks of their own. libvpx's MD5s list
     // only the shown frames; see `tests/fixtures/codec/README.md`.
     let source = crate::io::MemorySource::new(
-        include_bytes!("../../tests/fixtures/codec/vp8/vp8_altref_98x66.webm").to_vec(),
+        include_bytes!("../tests/fixtures/vp8/vp8_altref_98x66.webm").to_vec(),
     );
     let expected: Vec<&str> =
-        include_str!("../../tests/fixtures/codec/vp8/vp8_altref_98x66.webm.md5")
+        include_str!("../tests/fixtures/vp8/vp8_altref_98x66.webm.md5")
             .lines()
             .collect();
     assert_eq!(expected.len(), 40);
