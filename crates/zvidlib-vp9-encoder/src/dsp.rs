@@ -129,6 +129,29 @@ pub(super) fn forward_transform_4x4_scalar(
 struct Bases {
     dct: [Vec<f64>; 3],
     adst: [Vec<f64>; 2],
+    /// The forward transform's vertical weights for each of those bases, in
+    /// the same order: see [`vertical_weights`].
+    dct_weights: [Vec<f64>; 3],
+    adst_weights: [Vec<f64>; 2],
+}
+
+/// The vertical pass of [`forward_transform`] as a matrix product's
+/// weights: the transpose of `basis`, scaled by the transform's shift over
+/// `(n / 2)^2`.
+fn vertical_weights(basis: &[f64], tx_size: usize) -> Vec<f64> {
+    let n = 4 << tx_size;
+    // The inverse is `vertical * coefficients * horizontal^T`, shifted right
+    // by 5 bits for 8x8 and 6 bits above, so the forward transform is
+    // `vertical^T * residual * horizontal` scaled by that shift over (n / 2)^2.
+    let shift = if tx_size == 1 { 32.0 } else { 64.0 };
+    let half = (n / 2) as f64;
+    let scale = shift / (half * half);
+    (0..n * n)
+        .map(|index| {
+            let (k, i) = (index / n, index % n);
+            basis[i * n + k] * scale
+        })
+        .collect()
 }
 
 fn bases() -> &'static Bases {
@@ -152,9 +175,13 @@ fn bases() -> &'static Bases {
                 })
                 .collect()
         };
+        let dct = [dct(8), dct(16), dct(32)];
+        let adst = [adst(8), adst(16)];
         Bases {
-            dct: [dct(8), dct(16), dct(32)],
-            adst: [adst(8), adst(16)],
+            dct_weights: core::array::from_fn(|index| vertical_weights(&dct[index], index + 1)),
+            adst_weights: core::array::from_fn(|index| vertical_weights(&adst[index], index + 1)),
+            dct,
+            adst,
         }
     })
 }
@@ -186,38 +213,21 @@ pub(super) fn forward_transform(
     }
     let n = 4 << tx_size;
     let bases = bases();
-    let basis = |adst: bool| {
-        if adst && tx_size < 3 {
-            &bases.adst[tx_size - 1]
-        } else {
-            &bases.dct[tx_size - 1]
-        }
+    let vertical_adst = tx_type.vertical_adst() && tx_size < 3;
+    let weights = if vertical_adst {
+        &bases.adst_weights[tx_size - 1]
+    } else {
+        &bases.dct_weights[tx_size - 1]
     };
-    let vertical = basis(tx_type.vertical_adst());
-    let horizontal = basis(tx_type.horizontal_adst());
-    // The inverse is `vertical * coefficients * horizontal^T`, shifted right
-    // by 5 bits for 8x8 and 6 bits above, so the forward transform is
-    // `vertical^T * residual * horizontal` scaled by that shift over (n / 2)^2.
-    let shift = if tx_size == 1 { 32.0 } else { 64.0 };
-    let half = (n / 2) as f64;
-    let scale = shift / (half * half);
-    // The vertical pass with `scale` folded into its weights, then the
+    let horizontal = if tx_type.horizontal_adst() && tx_size < 3 {
+        &bases.adst[tx_size - 1]
+    } else {
+        &bases.dct[tx_size - 1]
+    };
+    // The vertical pass, with the scale folded into its weights, then the
     // horizontal one, each a matrix product.
-    let TransformScratch {
-        weights,
-        samples,
-        columns,
-    } = scratch;
-    let (weights, samples, columns) = (
-        &mut weights[..n * n],
-        &mut samples[..n * n],
-        &mut columns[..n * n],
-    );
-    for (k, row) in weights.chunks_exact_mut(n).enumerate() {
-        for (i, weight) in row.iter_mut().enumerate() {
-            *weight = vertical[i * n + k] * scale;
-        }
-    }
+    let TransformScratch { samples, columns } = scratch;
+    let (samples, columns) = (&mut samples[..n * n], &mut columns[..n * n]);
     for (sample, &value) in samples.iter_mut().zip(residual) {
         *sample = f64::from(value);
     }
@@ -229,7 +239,6 @@ pub(super) fn forward_transform(
 /// search transforms every transform block of every candidate it tries, and
 /// allocating fresh buffers each time cost more than many of the transforms.
 pub(super) struct TransformScratch {
-    weights: [f64; 32 * 32],
     samples: [f64; 32 * 32],
     columns: [f64; 32 * 32],
 }
@@ -237,7 +246,6 @@ pub(super) struct TransformScratch {
 impl TransformScratch {
     pub(super) fn new() -> Box<Self> {
         Box::new(Self {
-            weights: [0.0; 32 * 32],
             samples: [0.0; 32 * 32],
             columns: [0.0; 32 * 32],
         })
@@ -328,25 +336,46 @@ pub(super) fn predict_intra(
         return;
     }
     let log2 = size.trailing_zeros();
-    for row in 0..size {
-        let output = &mut plane[(y + row) * stride + x..][..size];
-        match mode {
-            IntraMode::Dc => {
-                let above_sum: u32 = above.iter().map(|&value| u32::from(value)).sum();
-                let left_sum: u32 = left.iter().map(|&value| u32::from(value)).sum();
-                let half = (size / 2) as u32;
-                let dc = match (have_above, have_left) {
-                    (true, true) => (above_sum + left_sum + size as u32) >> (log2 + 1),
-                    (true, false) => (above_sum + half) >> log2,
-                    (false, true) => (left_sum + half) >> log2,
-                    (false, false) => 128,
-                } as u8;
-                output.fill(dc);
-            }
-            IntraMode::V => output.copy_from_slice(above),
-            IntraMode::H => output.fill(left[row]),
-            IntraMode::Tm => unreachable!("predicted above"),
+    let dc = if mode == IntraMode::Dc {
+        let above_sum: u32 = above.iter().map(|&value| u32::from(value)).sum();
+        let left_sum: u32 = left.iter().map(|&value| u32::from(value)).sum();
+        let half = (size / 2) as u32;
+        (match (have_above, have_left) {
+            (true, true) => (above_sum + left_sum + size as u32) >> (log2 + 1),
+            (true, false) => (above_sum + half) >> log2,
+            (false, true) => (left_sum + half) >> log2,
+            (false, false) => 128,
+        }) as u8
+    } else {
+        0
+    };
+    // Rows of a width the compiler sees are filled in place; a row of an
+    // unknown width was a library call each.
+    fn rows<const SIZE: usize>(
+        block: &mut [u8],
+        stride: usize,
+        mode: IntraMode,
+        dc: u8,
+        above: &[u8],
+        left: &[u8],
+    ) {
+        let above: &[u8; SIZE] = above.try_into().expect("a whole edge");
+        for (row, &left) in left.iter().enumerate() {
+            block[row * stride..][..SIZE].copy_from_slice(&match mode {
+                IntraMode::Dc => [dc; SIZE],
+                IntraMode::V => *above,
+                IntraMode::H => [left; SIZE],
+                IntraMode::Tm => unreachable!("predicted above"),
+            });
         }
+    }
+    let block = &mut plane[y * stride + x..];
+    match size {
+        4 => rows::<4>(block, stride, mode, dc, above, left),
+        8 => rows::<8>(block, stride, mode, dc, above, left),
+        16 => rows::<16>(block, stride, mode, dc, above, left),
+        32 => rows::<32>(block, stride, mode, dc, above, left),
+        _ => unreachable!("transform blocks are 4 to 32 samples wide"),
     }
 }
 
@@ -393,6 +422,7 @@ impl ReferencePlane<'_> {
 /// Like libvpx's `vpx_convolve8_c`, the horizontal pass is rounded and clipped
 /// to 8 bits before the vertical pass, and a whole-sample component filters
 /// with the identity kernel.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn predict_inter(
     reference: &ReferencePlane<'_>,
     x: usize,
@@ -400,6 +430,7 @@ pub(super) fn predict_inter(
     size: usize,
     mv_row_q4: i32,
     mv_col_q4: i32,
+    scratch: &mut InterScratch,
     output: &mut [u8],
 ) {
     let x0 = x as isize + (mv_col_q4 >> 4) as isize - 3;
@@ -419,12 +450,55 @@ pub(super) fn predict_inter(
         }
         return;
     }
-    let mut window = [0_u8; (64 + 7) * (64 + 7)];
-    let window = &mut window[..span * span];
-    for (row, out) in window.chunks_exact_mut(span).enumerate() {
-        reference.clamped_row(x0, y0 + row as isize, out);
+    let InterScratch {
+        window,
+        intermediate,
+    } = scratch;
+    // A window inside the plane needs no clamping, so the filters read the
+    // plane itself.
+    let inside = x0 >= 0
+        && y0 >= 0
+        && x0 as usize + span <= reference.width
+        && y0 as usize + span <= reference.height;
+    let (window, stride): (&[u8], usize) = if inside {
+        let start = y0 as usize * reference.stride + x0 as usize;
+        (&reference.pixels[start..], reference.stride)
+    } else {
+        let window = &mut window[..span * span];
+        for (row, out) in window.chunks_exact_mut(span).enumerate() {
+            reference.clamped_row(x0, y0 + row as isize, out);
+        }
+        (window, span)
+    };
+    simd::convolve8(
+        window,
+        stride,
+        size,
+        size,
+        filter_x,
+        filter_y,
+        intermediate,
+        output,
+    );
+}
+
+/// Working memory for [`predict_inter`], kept between calls for the same
+/// reason as [`TransformScratch`]: the motion search predicts many candidate
+/// vectors for every block.
+pub(super) struct InterScratch {
+    /// The edge-clamped window of a block near the plane's edges.
+    window: [u8; (64 + 7) * (64 + 7)],
+    /// The horizontal pass of the 8-tap filter.
+    intermediate: [u8; (64 + 7) * 64],
+}
+
+impl InterScratch {
+    pub(super) fn new() -> Box<Self> {
+        Box::new(Self {
+            window: [0; (64 + 7) * (64 + 7)],
+            intermediate: [0; (64 + 7) * 64],
+        })
     }
-    simd::convolve8(window, span, size, size, filter_x, filter_y, output);
 }
 
 #[cfg(test)]
@@ -583,7 +657,16 @@ mod tests {
             height: 8,
         };
         let mut output = [0_u8; 16];
-        predict_inter(&reference, 4, 4, 4, -16 * 6, 16 * 2, &mut output);
+        predict_inter(
+            &reference,
+            4,
+            4,
+            4,
+            -16 * 6,
+            16 * 2,
+            &mut InterScratch::new(),
+            &mut output,
+        );
         // Rows -2..=1 read rows 0, 0, 0, 1 and columns 6..=9 read 6, 7, 7, 7.
         assert_eq!(&output[..4], &[18, 21, 21, 21]);
         assert_eq!(&output[8..12], &[18, 21, 21, 21]);
@@ -636,7 +719,16 @@ mod tests {
                 for mv_row in [-16 * 7, -24, 0, 8, 16 * 3, 16 * 9 + 8] {
                     for mv_col in [-16 * 5 - 8, -16, 0, 5, 16 * 2, 16 * 20] {
                         let mut output = vec![0_u8; size * size];
-                        predict_inter(&reference, x, y, size, mv_row, mv_col, &mut output);
+                        predict_inter(
+                            &reference,
+                            x,
+                            y,
+                            size,
+                            mv_row,
+                            mv_col,
+                            &mut InterScratch::new(),
+                            &mut output,
+                        );
                         assert_eq!(
                             output,
                             filtered(x, y, size, mv_row, mv_col),

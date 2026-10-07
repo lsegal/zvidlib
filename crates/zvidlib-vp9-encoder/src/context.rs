@@ -241,33 +241,33 @@ impl FrameContext {
             next.single_ref[context * 2] = merge_mode(next.single_ref[context * 2], counts);
         }
         for (probs, counts) in next.inter_mode.chunks_mut(3).zip(&counts.inter_mode) {
-            merge_tree(&INTER_MODE_TREE, probs, counts);
+            merge_tree(INTER_MODE_TREE.nodes, probs, counts);
         }
         for (probs, counts) in next.y_mode.chunks_mut(9).zip(&counts.y_mode) {
-            merge_tree(&INTRA_MODE_TREE, probs, counts);
+            merge_tree(INTRA_MODE_TREE.nodes, probs, counts);
         }
         for (probs, counts) in next.uv_mode.chunks_mut(9).zip(&counts.uv_mode) {
-            merge_tree(&INTRA_MODE_TREE, probs, counts);
+            merge_tree(INTRA_MODE_TREE.nodes, probs, counts);
         }
         for (probs, counts) in next.partition.chunks_mut(3).zip(&counts.partition) {
-            merge_tree(&PARTITION_TREE, probs, counts);
+            merge_tree(PARTITION_TREE.nodes, probs, counts);
         }
         for (probability, &counts) in next.skip.iter_mut().zip(&counts.skip) {
             *probability = merge_mode(*probability, counts);
         }
 
-        merge_tree(&MV_JOINT_TREE, &mut next.mv_joints, &counts.mv_joints);
+        merge_tree(MV_JOINT_TREE.nodes, &mut next.mv_joints, &counts.mv_joints);
         for (probs, counts) in next.mv.iter_mut().zip(&counts.mv) {
             probs.sign = merge_mode(probs.sign, counts.sign);
-            merge_tree(&MV_CLASS_TREE, &mut probs.classes, &counts.classes);
+            merge_tree(MV_CLASS_TREE.nodes, &mut probs.classes, &counts.classes);
             probs.class0 = merge_mode(probs.class0, counts.class0);
             for (probability, &counts) in probs.bits.iter_mut().zip(&counts.bits) {
                 *probability = merge_mode(*probability, counts);
             }
             for (fp, counts) in probs.class0_fp.iter_mut().zip(&counts.class0_fp) {
-                merge_tree(&MV_FP_TREE, fp, counts);
+                merge_tree(MV_FP_TREE.nodes, fp, counts);
             }
-            merge_tree(&MV_FP_TREE, &mut probs.fp, &counts.fp);
+            merge_tree(MV_FP_TREE.nodes, &mut probs.fp, &counts.fp);
             if allow_high_precision_mv {
                 probs.class0_hp = merge_mode(probs.class0_hp, counts.class0_hp);
                 probs.hp = merge_mode(probs.hp, counts.hp);
@@ -518,11 +518,11 @@ mod tests {
     fn tree_merging_sums_the_leaves_below_each_node() {
         // PARTITION_TREE: NONE | (HORZ | (VERT | SPLIT)).
         let mut probs = [128_u8; 3];
-        merge_tree(&PARTITION_TREE, &mut probs, &[0, 0, 0, 20]);
+        merge_tree(PARTITION_TREE.nodes, &mut probs, &[0, 0, 0, 20]);
         // Every node saw only its right branch: 128 + ((1 - 128) * 128 + 128) >> 8.
         assert_eq!(probs, [65, 65, 65]);
         let mut probs = [128_u8; 3];
-        merge_tree(&PARTITION_TREE, &mut probs, &[20, 0, 0, 0]);
+        merge_tree(PARTITION_TREE.nodes, &mut probs, &[20, 0, 0, 0]);
         // Only the root saw symbols.
         assert_eq!(probs, [192, 128, 128]);
     }
