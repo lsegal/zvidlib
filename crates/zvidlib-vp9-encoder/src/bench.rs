@@ -15,7 +15,8 @@
 //! are `#[doc(hidden)]` and not part of the stable API.
 
 use super::dsp::{
-    IntraMode, ReferencePlane, TxType, forward_transform, predict_inter, predict_intra,
+    IntraMode, ReferencePlane, TransformScratch, TxType, forward_transform, predict_inter,
+    predict_intra,
 };
 use super::frame::Geometry;
 use super::simd::{self, Quantizer};
@@ -59,6 +60,7 @@ pub fn forward_transform_quantize(
     let mut residual = vec![0; n * n];
     let mut coefficients = vec![0.0; n * n];
     let mut levels = vec![0; n * n];
+    let mut scratch = TransformScratch::new();
     let mut dequantized = vec![0; n * n];
     let mut output = Vec::new();
     for (index, (x, y)) in blocks(width, height, n).enumerate() {
@@ -76,7 +78,7 @@ pub fn forward_transform_quantize(
         } else {
             TYPES[index % 4]
         };
-        forward_transform(&residual, tx_size, tx_type, &mut coefficients);
+        forward_transform(&residual, tx_size, tx_type, &mut coefficients, &mut scratch);
         simd::quantize(&coefficients, &quantizer, &mut levels, &mut dequantized);
         output.extend(levels.iter().map(|&level| level as u8));
     }

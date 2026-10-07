@@ -171,6 +171,7 @@ pub(super) fn forward_transform(
     tx_size: usize,
     tx_type: TxType,
     output: &mut [f64],
+    scratch: &mut TransformScratch,
 ) {
     if tx_size == 0 {
         let coefficients = simd::forward_transform_4x4(
@@ -200,19 +201,47 @@ pub(super) fn forward_transform(
     let shift = if tx_size == 1 { 32.0 } else { 64.0 };
     let half = (n / 2) as f64;
     let scale = shift / (half * half);
-    let mut weights = vec![0.0; n * n];
+    // The vertical pass with `scale` folded into its weights, then the
+    // horizontal one, each a matrix product.
+    let TransformScratch {
+        weights,
+        samples,
+        columns,
+    } = scratch;
+    let (weights, samples, columns) = (
+        &mut weights[..n * n],
+        &mut samples[..n * n],
+        &mut columns[..n * n],
+    );
     for (k, row) in weights.chunks_exact_mut(n).enumerate() {
         for (i, weight) in row.iter_mut().enumerate() {
             *weight = vertical[i * n + k] * scale;
         }
     }
-    let samples: Vec<f64> = residual[..n * n]
-        .iter()
-        .map(|&value| f64::from(value))
-        .collect();
-    let mut columns = vec![0.0; n * n];
-    simd::matrix_product(&weights, &samples, n, &mut columns);
-    simd::matrix_product(&columns, horizontal, n, output);
+    for (sample, &value) in samples.iter_mut().zip(residual) {
+        *sample = f64::from(value);
+    }
+    simd::matrix_product(weights, samples, n, columns);
+    simd::matrix_product(columns, horizontal, n, output);
+}
+
+/// Working memory for [`forward_transform`], kept between calls because the
+/// search transforms every transform block of every candidate it tries, and
+/// allocating fresh buffers each time cost more than many of the transforms.
+pub(super) struct TransformScratch {
+    weights: [f64; 32 * 32],
+    samples: [f64; 32 * 32],
+    columns: [f64; 32 * 32],
+}
+
+impl TransformScratch {
+    pub(super) fn new() -> Box<Self> {
+        Box::new(Self {
+            weights: [0.0; 32 * 32],
+            samples: [0.0; 32 * 32],
+            columns: [0.0; 32 * 32],
+        })
+    }
 }
 
 /// Adds the inverse transform of dequantized `coefficients` (raster order,
@@ -238,7 +267,7 @@ pub(super) fn inverse_transform_add(
 }
 
 /// The intra modes this encoder chooses from, with their VP9 mode numbers.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(super) enum IntraMode {
     Dc = 0,
     V = 1,
@@ -331,10 +360,29 @@ pub(super) struct ReferencePlane<'a> {
 }
 
 impl ReferencePlane<'_> {
+    #[cfg(test)]
     fn sample(&self, x: isize, y: isize) -> u8 {
         let x = x.clamp(0, self.width as isize - 1) as usize;
         let y = y.clamp(0, self.height as isize - 1) as usize;
         self.pixels[y * self.stride + x]
+    }
+
+    /// Fills `out` with the samples of row `y` from column `x` on, clamped
+    /// to the plane like [`Self::sample`], copying the part inside in one go.
+    fn clamped_row(&self, x: isize, y: isize, out: &mut [u8]) {
+        let y = y.clamp(0, self.height as isize - 1) as usize;
+        let row = &self.pixels[y * self.stride..][..self.width];
+        let len = out.len() as isize;
+        // Columns before `left` lie left of the plane, and from `right` on
+        // right of it.
+        let left = (-x).clamp(0, len) as usize;
+        let right = (self.width as isize - x).clamp(0, len) as usize;
+        out[..left].fill(row[0]);
+        if left < right {
+            let start = (x + left as isize) as usize;
+            out[left..right].copy_from_slice(&row[start..start + right - left]);
+        }
+        out[right..].fill(row[self.width - 1]);
     }
 }
 
@@ -356,28 +404,27 @@ pub(super) fn predict_inter(
 ) {
     let x0 = x as isize + (mv_col_q4 >> 4) as isize - 3;
     let y0 = y as isize + (mv_row_q4 >> 4) as isize - 3;
-    let filter_x = &SUBPEL_FILTERS_REGULAR[(mv_col_q4 & 15) as usize * 8..][..8];
-    let filter_y = &SUBPEL_FILTERS_REGULAR[(mv_row_q4 & 15) as usize * 8..][..8];
+    let (fraction_x, fraction_y) = ((mv_col_q4 & 15) as usize, (mv_row_q4 & 15) as usize);
+    let filter_x = &SUBPEL_FILTERS_REGULAR[fraction_x * 8..][..8];
+    let filter_y = &SUBPEL_FILTERS_REGULAR[fraction_y * 8..][..8];
     // The samples the filters read, three rows and columns before the block
     // and four after, edge-clamped.
     let span = size + 7;
-    let mut window = vec![0_u8; span * span];
-    let inside = x0 >= 0
-        && y0 >= 0
-        && x0 as usize + span <= reference.width
-        && y0 as usize + span <= reference.height;
-    for (row, out) in window.chunks_exact_mut(span).enumerate() {
-        let source_y = y0 + row as isize;
-        if inside {
-            let start = source_y as usize * reference.stride + x0 as usize;
-            out.copy_from_slice(&reference.pixels[start..start + span]);
-        } else {
-            for (column, out) in out.iter_mut().enumerate() {
-                *out = reference.sample(x0 + column as isize, source_y);
-            }
+    // The identity kernel copies its centre sample, so a whole-sample vector
+    // is a copy: most of the encoder's vectors are whole samples, as the
+    // motion search finds them.
+    if fraction_x == 0 && fraction_y == 0 {
+        for (row, out) in output.chunks_exact_mut(size).take(size).enumerate() {
+            reference.clamped_row(x0 + 3, y0 + 3 + row as isize, out);
         }
+        return;
     }
-    simd::convolve8(&window, span, size, size, filter_x, filter_y, output);
+    let mut window = [0_u8; (64 + 7) * (64 + 7)];
+    let window = &mut window[..span * span];
+    for (row, out) in window.chunks_exact_mut(span).enumerate() {
+        reference.clamped_row(x0, y0 + row as isize, out);
+    }
+    simd::convolve8(window, span, size, size, filter_x, filter_y, output);
 }
 
 #[cfg(test)]
@@ -437,7 +484,13 @@ mod tests {
                     tx_type
                 };
                 let mut coefficients = vec![0.0; n * n];
-                forward_transform(&residual, tx_size, tx_type, &mut coefficients);
+                forward_transform(
+                    &residual,
+                    tx_size,
+                    tx_type,
+                    &mut coefficients,
+                    &mut TransformScratch::new(),
+                );
                 let rounded: Vec<i32> = coefficients
                     .iter()
                     .map(|&value| value.round() as i32)
@@ -462,7 +515,13 @@ mod tests {
             for value in [-60, -1, 1, 17, 90] {
                 let residual = vec![value; n * n];
                 let mut coefficients = vec![0.0; n * n];
-                forward_transform(&residual, tx_size, TxType::DctDct, &mut coefficients);
+                forward_transform(
+                    &residual,
+                    tx_size,
+                    TxType::DctDct,
+                    &mut coefficients,
+                    &mut TransformScratch::new(),
+                );
                 let mut dc = vec![0; n * n];
                 dc[0] = coefficients[0].round() as i32;
                 assert!(
@@ -529,5 +588,63 @@ mod tests {
         assert_eq!(&output[..4], &[18, 21, 21, 21]);
         assert_eq!(&output[8..12], &[18, 21, 21, 21]);
         assert_eq!(&output[12..], &[42, 45, 45, 45]);
+    }
+
+    #[test]
+    fn whole_sample_shortcuts_match_the_filtered_prediction() {
+        let pixels: Vec<u8> = (0..48 * 40).map(|index| (index * 37 % 251) as u8).collect();
+        let reference = ReferencePlane {
+            pixels: &pixels,
+            stride: 48,
+            width: 45,
+            height: 40,
+        };
+        // Both passes in full, as `vpx_convolve8_c` runs them.
+        let filtered = |x: usize, y: usize, size: usize, mv_row: i32, mv_col: i32| {
+            let x0 = x as isize + (mv_col >> 4) as isize;
+            let y0 = y as isize + (mv_row >> 4) as isize;
+            let filter_x = &SUBPEL_FILTERS_REGULAR[(mv_col & 15) as usize * 8..][..8];
+            let filter_y = &SUBPEL_FILTERS_REGULAR[(mv_row & 15) as usize * 8..][..8];
+            let mut intermediate = vec![0_u8; (size + 7) * size];
+            for row in 0..size + 7 {
+                for column in 0..size {
+                    let sum: i32 = (0..8)
+                        .map(|tap| {
+                            let sample_x = x0 + column as isize - 3 + tap as isize;
+                            let sample_y = y0 + row as isize - 3;
+                            filter_x[tap] * i32::from(reference.sample(sample_x, sample_y))
+                        })
+                        .sum();
+                    intermediate[row * size + column] = ((sum + 64) >> 7).clamp(0, 255) as u8;
+                }
+            }
+            let mut output = vec![0_u8; size * size];
+            for row in 0..size {
+                for column in 0..size {
+                    let sum: i32 = (0..8)
+                        .map(|tap| {
+                            filter_y[tap] * i32::from(intermediate[(row + tap) * size + column])
+                        })
+                        .sum();
+                    output[row * size + column] = ((sum + 64) >> 7).clamp(0, 255) as u8;
+                }
+            }
+            output
+        };
+        for size in [4, 8, 16, 32] {
+            for (x, y) in [(0, 0), (8, 4), (12, 8)] {
+                for mv_row in [-16 * 7, -24, 0, 8, 16 * 3, 16 * 9 + 8] {
+                    for mv_col in [-16 * 5 - 8, -16, 0, 5, 16 * 2, 16 * 20] {
+                        let mut output = vec![0_u8; size * size];
+                        predict_inter(&reference, x, y, size, mv_row, mv_col, &mut output);
+                        assert_eq!(
+                            output,
+                            filtered(x, y, size, mv_row, mv_col),
+                            "{size}x{size} at ({x}, {y}) by ({mv_row}, {mv_col})"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

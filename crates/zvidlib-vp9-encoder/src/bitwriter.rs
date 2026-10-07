@@ -152,19 +152,35 @@ pub(super) trait BoolSink {
 }
 
 /// Totals the ideal cost, in bits, of the symbols written to it.
-#[derive(Default)]
-pub(super) struct BitCost(pub(super) f64);
+///
+/// It holds the cost table itself: the search costs every token of every
+/// candidate, and fetching the table once per symbol showed in profiles.
+pub(super) struct BitCost(pub(super) f64, &'static [f64; 256]);
+
+impl Default for BitCost {
+    fn default() -> Self {
+        Self(0.0, costs())
+    }
+}
 
 impl BoolSink for BitCost {
     fn write(&mut self, bit: bool, probability: u8) {
-        self.0 += bit_cost(bit, probability);
+        self.0 += cost_from(self.1, bit, probability);
     }
 }
 
 /// The cost in bits of coding `bit` when a zero has `probability` / 256.
 pub(super) fn bit_cost(bit: bool, probability: u8) -> f64 {
+    cost_from(costs(), bit, probability)
+}
+
+/// The cost in bits of each probability, out of 256, of the coded value.
+fn costs() -> &'static [f64; 256] {
     static COSTS: OnceLock<[f64; 256]> = OnceLock::new();
-    let costs = COSTS.get_or_init(|| core::array::from_fn(|p| -(p.max(1) as f64 / 256.0).log2()));
+    COSTS.get_or_init(|| core::array::from_fn(|p| -(p.max(1) as f64 / 256.0).log2()))
+}
+
+fn cost_from(costs: &[f64; 256], bit: bool, probability: u8) -> f64 {
     let p = usize::from(probability);
     costs[if bit { 256 - p } else { p }]
 }
