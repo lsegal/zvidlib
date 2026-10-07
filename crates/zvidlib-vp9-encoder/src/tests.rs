@@ -618,6 +618,7 @@ const SMALL_BLOCKS: CodingTools = CodingTools {
     largest_block: 0,
     larger_transforms: false,
     sub_sample_motion: true,
+    coef_updates: true,
 };
 
 /// Every coding tool except sub-sample motion vectors.

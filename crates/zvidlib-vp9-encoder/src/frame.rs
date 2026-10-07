@@ -42,7 +42,10 @@
 //! frames predict from it after the loop filter.
 
 use super::bitwriter::{BitCost, BitWriter, BoolEncoder, BoolSink, bit_cost};
-use super::context::{CoefProbs, FrameContext, FrameCounts, MvComponentCounts};
+use super::context::{
+    CoefProbs, FrameContext, FrameCounts, LARGER_TOKEN_MAGNITUDES, MvComponentCounts,
+    coef_contexts, write_diff_update,
+};
 use super::dsp::{
     IntraMode, ReferencePlane, TransformScratch, TxType, forward_transform, inverse_transform_add,
     predict_inter, predict_intra,
@@ -164,6 +167,10 @@ pub(super) struct CodingTools {
     /// Whether motion vectors are refined to quarter and eighth samples, or
     /// stay whole samples.
     pub(super) sub_sample_motion: bool,
+    /// Whether key frames and error-resilient frames update the coefficient
+    /// probabilities they code with in the compressed header, or code with
+    /// the defaults.
+    pub(super) coef_updates: bool,
 }
 
 impl CodingTools {
@@ -172,6 +179,7 @@ impl CodingTools {
         largest_block: 3,
         larger_transforms: true,
         sub_sample_motion: true,
+        coef_updates: true,
     };
 }
 
@@ -549,8 +557,11 @@ pub(super) struct FrameEncoder<'a> {
     tools: CodingTools,
     base_q_idx: u8,
     error_resilient: bool,
-    /// The probabilities the frame codes with.
-    context: &'a FrameContext,
+    /// The probabilities the frame starts from, which its compressed header
+    /// updates.
+    base: &'a FrameContext,
+    /// The probabilities the frame codes with: `base` and the updates.
+    context: FrameContext,
     /// The previous frame's modes, when this frame takes its motion vectors as
     /// candidates (`UsePrevFrameMvs`).
     previous_mode_info: Option<&'a [ModeInfo]>,
@@ -620,7 +631,8 @@ impl<'a> FrameEncoder<'a> {
             tools,
             base_q_idx,
             error_resilient,
-            context,
+            base: context,
+            context: context.clone(),
             previous_mode_info: previous_mode_info.filter(|_| reference.is_some()),
             filter_level: 0,
             loop_filter: true,
@@ -680,28 +692,26 @@ impl<'a> FrameEncoder<'a> {
     /// Encodes the frame; `full_range` is the colour range the key frame
     /// header signals.
     pub(super) fn encode(mut self, full_range: bool) -> EncodedFrame {
-        let mut writer = TileWriter {
-            encoder: BoolEncoder::new(),
-            counts: FrameCounts::default(),
-        };
-        let sb_rows = self.geometry.mi_rows.div_ceil(8);
-        let sb_cols = self.geometry.mi_cols.div_ceil(8);
         if let Some(reference) = self.reference {
             self.projected_mvs = self.projected_motion(reference);
         }
-        for sb_row in 0..sb_rows {
-            self.left_nonzero = [[false; 16]; 3];
-            self.left_partition = [0; 8];
-            for sb_col in 0..sb_cols {
-                let (mi_row, mi_col) = (sb_row * 8, sb_col * 8);
-                // The search leaves the reconstruction and mode information
-                // of the chosen partition in place, and the contexts are
-                // replayed as the superblock is written.
-                let contexts = self.save_contexts(mi_col, 3);
-                self.residual_cache.clear();
-                let (node, _) = self.search_partition(mi_row, mi_col, 3, f64::INFINITY);
-                self.restore_contexts(mi_col, 3, &contexts);
-                self.write_partition(&mut writer, &node, mi_row, mi_col, 3);
+        let mut writer = self.code_tiles();
+        // Key frames and error-resilient frames start from the default
+        // coefficient probabilities, which fit few frames' tokens well: on
+        // textured content at coarse quantizers a key frame coded with them
+        // was more than twice the size it is with probabilities fitted to
+        // its own tokens (issue #622). Such a frame updates them in the
+        // compressed header where that saves bits, and codes again with the
+        // updated ones, so that its search costs tokens as they are written.
+        // Other frames code with probabilities adapted from the frames
+        // before them, which fit already, and are not coded twice.
+        if (self.is_key() || self.error_resilient) && self.tools.coef_updates {
+            let tx_sizes = if self.tools.larger_transforms { 4 } else { 1 };
+            let coef = self.base.coef_updates(&writer.counts, tx_sizes);
+            if coef != self.context.coef {
+                self.context.coef = coef;
+                self.token_costs = token_costs(&self.context.coef);
+                writer = self.code_tiles();
             }
         }
         if self.loop_filter {
@@ -714,6 +724,8 @@ impl<'a> FrameEncoder<'a> {
             key,
             self.tools.larger_transforms,
             self.allow_high_precision_mv,
+            &self.base.coef,
+            &self.context.coef,
         );
         let mut data = uncompressed_header(
             &geometry,
@@ -734,6 +746,40 @@ impl<'a> FrameEncoder<'a> {
             mode_info: self.mode_info,
             allow_high_precision_mv: self.allow_high_precision_mv,
         }
+    }
+
+    /// Searches and writes every superblock with the probabilities in
+    /// `self.context`, starting from an empty reconstruction.
+    fn code_tiles(&mut self) -> TileWriter {
+        let mut writer = TileWriter {
+            encoder: BoolEncoder::new(),
+            counts: FrameCounts::default(),
+        };
+        self.recon = Picture::new(&self.geometry);
+        self.mode_info.fill(ModeInfo::default());
+        for above in &mut self.above_nonzero {
+            above.fill(false);
+        }
+        self.above_partition.fill(0);
+        self.coded_blocks.clear();
+        let sb_rows = self.geometry.mi_rows.div_ceil(8);
+        let sb_cols = self.geometry.mi_cols.div_ceil(8);
+        for sb_row in 0..sb_rows {
+            self.left_nonzero = [[false; 16]; 3];
+            self.left_partition = [0; 8];
+            for sb_col in 0..sb_cols {
+                let (mi_row, mi_col) = (sb_row * 8, sb_col * 8);
+                // The search leaves the reconstruction and mode information
+                // of the chosen partition in place, and the contexts are
+                // replayed as the superblock is written.
+                let contexts = self.save_contexts(mi_col, 3);
+                self.residual_cache.clear();
+                let (node, _) = self.search_partition(mi_row, mi_col, 3, f64::INFINITY);
+                self.restore_contexts(mi_col, 3, &contexts);
+                self.write_partition(&mut writer, &node, mi_row, mi_col, 3);
+            }
+        }
+        writer
     }
 
     /// Chooses the loop filter level whose output is closest to the source
@@ -2541,7 +2587,7 @@ impl<'a> FrameEncoder<'a> {
         if mode == NEWMV {
             write_mv(
                 sink,
-                self.context,
+                &self.context,
                 Mv {
                     row: mv.row - nearest.row,
                     col: mv.col - nearest.col,
@@ -2785,6 +2831,10 @@ fn write_coefficients<S: BoolSink>(
             }
             // ZERO_TOKEN, ONE_TOKEN or TWO_TOKEN (any larger magnitude).
             counts.coef[tx_size][pt][reference][band][context][magnitude.min(2) as usize] += 1;
+            if magnitude >= 2 {
+                let token = LARGER_TOKEN_MAGNITUDES.partition_point(|&least| least <= magnitude);
+                counts.larger_tokens[tx_size][pt][reference][band][context][token - 1] += 1;
+            }
         }
         let probs = model;
         if magnitude == 0 {
@@ -2962,7 +3012,7 @@ fn token_bits<const SIZE: usize>(
     bits
 }
 
-fn write_magnitude<S: BoolSink>(sink: &mut S, magnitude: u32, pivot: u8) {
+pub(super) fn write_magnitude<S: BoolSink>(sink: &mut S, magnitude: u32, pivot: u8) {
     if magnitude == 1 {
         sink.write(false, pivot);
         return;
@@ -3100,8 +3150,16 @@ fn write_mv<S: BoolSink>(sink: &mut S, context: &FrameContext, difference: Mv, u
     }
 }
 
-/// The compressed header: the transform mode and no probability updates.
-fn compressed_header(key: bool, larger_transforms: bool, allow_high_precision_mv: bool) -> Vec<u8> {
+/// The compressed header: the transform mode, the updates from `base` to
+/// `coef` of the coefficient probabilities, and no other probability
+/// updates.
+fn compressed_header(
+    key: bool,
+    larger_transforms: bool,
+    allow_high_precision_mv: bool,
+    base: &[CoefProbs; 4],
+    coef: &[CoefProbs; 4],
+) -> Vec<u8> {
     const NO_UPDATE: u8 = 252;
     let mut writer = BoolEncoder::new();
     if larger_transforms {
@@ -3116,10 +3174,21 @@ fn compressed_header(key: bool, larger_transforms: bool, allow_high_precision_mv
         // tx_mode = ONLY_4X4.
         writer.literal(0, 2);
     }
-    // No update of the coefficient probabilities of each transform size.
+    // The coefficient probabilities of each transform size the frame can
+    // code, updated or not as a whole.
     let tx_sizes = if larger_transforms { 4 } else { 1 };
-    for _ in 0..tx_sizes {
-        writer.bit(false);
+    for (base, coef) in base.iter().zip(coef).take(tx_sizes) {
+        writer.bit(base != coef);
+        if base == coef {
+            continue;
+        }
+        for (plane_type, reference, band, context) in coef_contexts() {
+            let old = &base[plane_type][reference][band][context];
+            let new = &coef[plane_type][reference][band][context];
+            for (&old, &new) in old.iter().zip(new) {
+                write_diff_update(&mut writer, old, new);
+            }
+        }
     }
     for _ in 0..3 {
         writer.write(false, NO_UPDATE); // skip
