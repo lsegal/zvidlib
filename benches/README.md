@@ -1,7 +1,7 @@
 # Benchmarks
 
 zvidlib's benchmarks run under [criterion](https://docs.rs/criterion) with
-`harness = false`, across eleven bench targets that share `benches/support/`:
+`harness = false`, across twelve bench targets that share `benches/support/`:
 
 | Target | Measures |
 | --- | --- |
@@ -11,6 +11,7 @@ zvidlib's benchmarks run under [criterion](https://docs.rs/criterion) with
 | `benches/audio_decode.rs` | the audio decode paths: AAC access units, `AacSampleReader` range/seek reads, and the Vorbis decoder and its synthesis kernels, scalar versus SIMD |
 | `benches/audio_mux.rs` | the audio container path: MP4 muxing, sample-table growth, demux, and gapless timing |
 | `benches/hevc_encode.rs` | the pure-Rust HEVC encoder, whole-frame and per-stage |
+| `benches/vp9_encode.rs` | the native VP9 encoder: whole-frame encode and every vectorized kernel, scalar versus SIMD |
 | `benches/hevc_decode.rs` | the HEVC software decoder: whole-frame decode and every hot stage, scalar versus SIMD |
 | `benches/hevc_hardware.rs` | the platform fixed-function HEVC decoders against the software one, and the hardware HEVC encoder |
 | `benches/exact_seek.rs` | what an exact frame at an arbitrary point costs, by backend and by random-access cadence |
@@ -112,11 +113,11 @@ simd::set_override(None);                  // back to per-host detection
 `set_override` reaches every dispatch family at once: the AV1 transforms and
 in-loop filters, AV1 motion compensation, AV1 intra prediction, every HEVC
 engine kernel (inter/intra prediction, in-loop filters, inverse transforms, and
-encoder-side distortion metrics), and the Vorbis decoder's synthesis kernels.
-An instruction set this host cannot execute is clamped to `SimdIsa::Scalar`
-rather than silently ignored, so the arm you asked for is always a defined one.
-`simd::active()` reports what is in force and `simd::available()` lists what
-this host can run.
+encoder-side distortion metrics), the Vorbis decoder's synthesis kernels, and
+the VP9 encoder's kernels. An instruction set this host cannot execute is
+clamped to `SimdIsa::Scalar` rather than silently ignored, so the arm you asked
+for is always a defined one. `simd::active()` reports what is in force and
+`simd::available()` lists what this host can run.
 
 Groups built through `support::isa::bench_across_isas` run once per entry in
 `simd::available()` and are named `<codec>/<isa>`, so criterion compares the
@@ -1791,6 +1792,44 @@ cargo bench --bench vp8_encode -- vp8_encode_stage    # the kernels only
 ZVIDLIB_BENCH_LARGE=1 cargo bench --bench vp8_encode  # add the 1080p frames
 ```
 
+## The VP9 encoder suite (`--bench vp9_encode`)
+
+`benches/vp9_encode.rs` measures the native VP9 encoder on the same two axes as
+the AV1 and HEVC encoder suites. Every group is a per-ISA group, guarded for
+bit-exactness and for the override reaching every dispatch site, and all of
+them run at 640x360 on the synthetic content from `benches/support`:
+
+| Group | Stage |
+| --- | --- |
+| `vp9_encode_key_frame` | one RGBA8 key frame through `native_vp9_video_encoder_factory`: input conversion and the intra search |
+| `vp9_encode_sequence` | a key frame and three inter frames, which adds the motion search |
+| `vp9_encode_stage_fdct_quant_{4x4,8x8,16x16,32x32}` | residual, forward transform and quantization of every block of a plane, cycling the four transform types below 32x32 |
+| `vp9_encode_stage_sad` | a 9x9-candidate whole-sample motion search per 16x16 block, with the encoder's early exit |
+| `vp9_encode_stage_sse` | squared error per 8x8 block and over the whole plane, as mode decisions and the loop filter level search take it |
+| `vp9_encode_stage_inter_pred` | 8-tap sub-sample motion compensation of every 16x16 block, half of them past the plane's edges |
+| `vp9_encode_stage_tm_pred` | TM intra prediction of every 16x16 block |
+| `vp9_encode_stage_rgba_to_yuv420` | RGBA8 to the encoder's 8-aligned 4:2:0 source picture |
+
+The stage groups reach the kernels through `zvidlib::vp9_encoder_bench`, the
+`#[doc(hidden)]` per-stage access that is the VP9 counterpart to
+`hevc_encoder_bench`, and they call the same entry points the search does.
+Every group is attributed to the `vp9_encode` dispatch site.
+
+The whole-frame groups also spend time the `vp9_encode` site does not reach:
+bit costing, mode and partition bookkeeping, and the inverse transforms and
+loop filter, which are the VP9 decoder's own kernels and are vectorized with
+the decoder (#570). Their ratio is therefore smaller than any stage's.
+
+There is no AVX2 SAD kernel. The early exit needs the sum as a scalar after
+every row, and at the 8- to 64-wide rows the search uses, a 256-bit load, its
+lane fold and the `vzeroupper` on return measured slower than the 128-bit loop.
+AVX2 hosts run the SSE2 kernel, which is inlined into the dispatcher, because
+the search often exits after one or two rows, where a call into a
+`#[target_feature]` function costs more than the row. The squared-error kernel
+uses AVX2 only for rows of 32 samples or more, and the TM predictor,
+residual and chroma conversion have no wider formulation, so their AVX2 arms
+run the SSE4.1 code.
+
 ## What a drag preview cadence cost the frame under the pointer (removed)
 
 **The harness this section describes no longer exists.** Dragging `native_gl`'s
@@ -2102,7 +2141,7 @@ job per `[[bench]]` target, each running only its own target with
 crate-wide override reaches the HEVC kernels, is included. Each of those jobs
 uploads its own criterion output, and a single `Benchmark report` job then:
 
-1. reassembles one `target/criterion/` tree and one `bench.log` out of the eleven
+1. reassembles one `target/criterion/` tree and one `bench.log` out of the twelve
    partial artifacts, and puts every host and its instruction sets into the job
    summary;
 2. reduces that tree to one small JSON baseline through
@@ -2124,8 +2163,8 @@ time. On one runner the job's wall clock was their sum: on `main` push
 was 11m24s and `av1_encode` 10m29s — two targets, more than half the time, with
 the other seven waiting on them. Fanned out, the wall clock is the slowest
 single target plus its build. The compile check is *not* fanned out, for the
-mirror-image reason: its cost is almost entirely the shared crate build, so eleven
-copies would pay that eleven times for one answer.
+mirror-image reason: its cost is almost entirely the shared crate build, so twelve
+copies would pay that twelve times for one answer.
 
 The matrix lists its targets by name, which is a second copy of what `Cargo.toml`
 declares, so `tests/ci_benchmarks_run_every_target.rs` asserts the two agree. A
@@ -2134,7 +2173,7 @@ and is simply never measured again, and the only symptom is a baseline that
 stops carrying its groups — which reads as benchmarks that were deleted.
 
 **What this costs is host attribution.** One stored baseline is now a merge
-across eleven runners rather than one machine's suite, so its `host` field is every
+across twelve runners rather than one machine's suite, so its `host` field is every
 distinct model observed, joined, and the job summary carries a target-to-model
 table. Nothing in the delta report depended on a single host — `compare` already
 diffs point estimates across two machines from a shared pool, which is why its
