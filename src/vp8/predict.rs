@@ -51,6 +51,33 @@ pub(crate) fn idct_add(coefficients: &[i16; 16], plane: &mut [u8], offset: usize
     }
 }
 
+/// [`idct_add`] of a block whose only nonzero coefficient is the DC, which
+/// adds the same rounded value to all 16 samples (libvpx's
+/// `vp8_dc_only_idct_add`).
+pub(crate) fn idct_dc_add(dc: i16, plane: &mut [u8], offset: usize, stride: usize) {
+    let residual = (i32::from(dc) + 4) >> 3;
+    for row in 0..4 {
+        for sample in &mut plane[offset + row * stride..offset + row * stride + 4] {
+            *sample = clamp255(i32::from(*sample) + residual);
+        }
+    }
+}
+
+/// [`idct_dc_add`] of the 2 or 4 blocks side by side at `offset`, whose DCs
+/// are `dcs`: one row of a macroblock's chroma or luma blocks.
+pub(crate) fn idct_dc_add_row(dcs: &[i16], plane: &mut [u8], offset: usize, stride: usize) {
+    if !super::simd::idct_dc_add_row(dcs, plane, offset, stride) {
+        idct_dc_add_row_scalar(dcs, plane, offset, stride);
+    }
+}
+
+/// The scalar reference for [`idct_dc_add_row`].
+pub(super) fn idct_dc_add_row_scalar(dcs: &[i16], plane: &mut [u8], offset: usize, stride: usize) {
+    for (index, &dc) in dcs.iter().enumerate() {
+        idct_dc_add(dc, plane, offset + index * 4, stride);
+    }
+}
+
 fn idct_add_scalar(coefficients: &[i16; 16], plane: &mut [u8], offset: usize, stride: usize) {
     let mut temp = [0i16; 16];
     for column in 0..4 {
@@ -259,6 +286,20 @@ pub(crate) fn predict_block<const N: usize, const A: usize>(
 /// Predicts one 4x4 luma subblock. `above` holds the pixel above-left, the
 /// four above and the four above-right; `left` the four to the left.
 pub(crate) fn predict_subblock(
+    mode: u8,
+    above: &[u8; 9],
+    left: &[u8; 4],
+    plane: &mut [u8],
+    offset: usize,
+    stride: usize,
+) {
+    if !super::simd::subblock(mode, above, left, plane, offset, stride) {
+        predict_subblock_scalar(mode, above, left, plane, offset, stride);
+    }
+}
+
+/// The scalar reference for [`predict_subblock`].
+pub(super) fn predict_subblock_scalar(
     mode: u8,
     above: &[u8; 9],
     left: &[u8; 4],
