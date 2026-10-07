@@ -86,7 +86,7 @@ fn commands(source: &str) -> Vec<String> {
         if code.starts_with('#') {
             continue;
         }
-        let (code, continued) = match code.strip_suffix('\') {
+        let (code, continued) = match code.strip_suffix('\\') {
             Some(head) => (head.trim_end(), true),
             None => (code, false),
         };
@@ -114,9 +114,13 @@ fn commands(source: &str) -> Vec<String> {
 /// which is exactly the state these guards sat in unnoticed, and `node --test`
 /// takes a path rather than a cargo target.
 fn runs_tests(command: &str) -> bool {
-    ["cargo test ", "cargo nextest run ", "cargo nextest archive "]
-        .iter()
-        .any(|invocation| command.contains(invocation))
+    [
+        "cargo test ",
+        "cargo nextest run ",
+        "cargo nextest archive ",
+    ]
+    .iter()
+    .any(|invocation| command.contains(invocation))
 }
 
 /// Every target named by a `--test <name>` argument of a command in `source`

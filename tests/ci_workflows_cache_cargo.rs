@@ -126,9 +126,9 @@ fn every_cargo_job_caches_its_build() {
 #[test]
 fn running_a_prebuilt_test_archive_is_not_building() {
     assert!(builds_with_cargo(
-        "        run: |\n          cargo nextest archive --lib \\n            --archive-file a.tar.zst\n"
+        "        run: |\n          cargo nextest archive --lib \\\n            --archive-file a.tar.zst\n"
     ));
     assert!(!builds_with_cargo(
-        "        run: |\n          cargo-nextest nextest run --profile ci \\n            --archive-file a.tar.zst\n"
+        "        run: |\n          cargo-nextest nextest run --profile ci \\\n            --archive-file a.tar.zst\n"
     ));
 }
