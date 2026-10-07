@@ -130,6 +130,14 @@ name = "hevc_hardware"
 path = "benches/hevc_hardware.rs"
 harness = false
 
+# The VP8 software decoder's scalar-vs-SIMD suite (issue #568): its whole-frame
+# decode and the stages only the decoder runs. The kernels it shares with the
+# encoder are timed by `vp8_encode`.
+[[bench]]
+name = "vp8_decode"
+path = "benches/vp8_decode.rs"
+harness = false
+
 # The native VP8 encoder's scalar-vs-SIMD suite: whole frames through the
 # public encoder and each of its `vp8_encode` and `vp8_recon` kernels. Its own
 # target for the same reason as `av1_encode`: it shares none of `codec`'s
