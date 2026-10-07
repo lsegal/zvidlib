@@ -5,7 +5,7 @@
 #![allow(dead_code)]
 
 /// `default_coef_probs_4x4`: `[plane type][ref][band][context][node]`.
-pub(super) static DEFAULT_COEF_PROBS_4X4: [[[[[u8; 3]; 6]; 6]; 2]; 2] = [
+pub(crate) static DEFAULT_COEF_PROBS_4X4: [[[[[u8; 3]; 6]; 6]; 2]; 2] = [
     [
         [
             [
@@ -213,7 +213,7 @@ pub(super) static DEFAULT_COEF_PROBS_4X4: [[[[[u8; 3]; 6]; 6]; 2]; 2] = [
 ];
 
 /// `default_coef_probs_8x8`: `[plane type][ref][band][context][node]`.
-pub(super) static DEFAULT_COEF_PROBS_8X8: [[[[[u8; 3]; 6]; 6]; 2]; 2] = [
+pub(crate) static DEFAULT_COEF_PROBS_8X8: [[[[[u8; 3]; 6]; 6]; 2]; 2] = [
     [
         [
             [
@@ -421,7 +421,7 @@ pub(super) static DEFAULT_COEF_PROBS_8X8: [[[[[u8; 3]; 6]; 6]; 2]; 2] = [
 ];
 
 /// `default_coef_probs_16x16`: `[plane type][ref][band][context][node]`.
-pub(super) static DEFAULT_COEF_PROBS_16X16: [[[[[u8; 3]; 6]; 6]; 2]; 2] = [
+pub(crate) static DEFAULT_COEF_PROBS_16X16: [[[[[u8; 3]; 6]; 6]; 2]; 2] = [
     [
         [
             [
@@ -629,7 +629,7 @@ pub(super) static DEFAULT_COEF_PROBS_16X16: [[[[[u8; 3]; 6]; 6]; 2]; 2] = [
 ];
 
 /// `default_coef_probs_32x32`: `[plane type][ref][band][context][node]`.
-pub(super) static DEFAULT_COEF_PROBS_32X32: [[[[[u8; 3]; 6]; 6]; 2]; 2] = [
+pub(crate) static DEFAULT_COEF_PROBS_32X32: [[[[[u8; 3]; 6]; 6]; 2]; 2] = [
     [
         [
             [
@@ -1096,7 +1096,7 @@ pub(super) static PARETO8_FULL: [[u8; 8]; 255] = [
 ];
 
 /// `vp9_coefband_trans_8x8plus`.
-pub(super) static COEFBAND_TRANS_8X8PLUS: [u8; 1024] = [
+pub(crate) static COEFBAND_TRANS_8X8PLUS: [u8; 1024] = [
     0, 1, 1, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
     5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
     5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
@@ -1132,7 +1132,7 @@ pub(super) static COEFBAND_TRANS_8X8PLUS: [u8; 1024] = [
 ];
 
 /// `vp9_coefband_trans_4x4`.
-pub(super) static COEFBAND_TRANS_4X4: [u8; 16] = [0, 1, 1, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 5, 5, 5];
+pub(crate) static COEFBAND_TRANS_4X4: [u8; 16] = [0, 1, 1, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 5, 5, 5];
 
 /// `vp9_cat6_prob`.
 pub(super) static CAT6_PROB: [u8; 14] = [
@@ -1351,42 +1351,42 @@ pub(super) static DEFAULT_INTER_MODE_PROBS: [[u8; 3]; 7] = [
 ];
 
 /// `default_scan_4x4`.
-pub(super) static DEFAULT_SCAN_4X4: [i16; 16] =
+pub(crate) static DEFAULT_SCAN_4X4: [i16; 16] =
     [0, 4, 1, 5, 8, 2, 12, 9, 3, 6, 13, 10, 7, 14, 11, 15];
 
 /// `default_scan_4x4_neighbors`.
-pub(super) static DEFAULT_SCAN_4X4_NEIGHBORS: [i16; 34] = [
+pub(crate) static DEFAULT_SCAN_4X4_NEIGHBORS: [i16; 34] = [
     0, 0, 0, 0, 0, 0, 1, 4, 4, 4, 1, 1, 8, 8, 5, 8, 2, 2, 2, 5, 9, 12, 6, 9, 3, 6, 10, 13, 7, 10,
     11, 14, 0, 0,
 ];
 
 /// `col_scan_4x4`.
-pub(super) static COL_SCAN_4X4: [i16; 16] = [0, 4, 8, 1, 12, 5, 9, 2, 13, 6, 10, 3, 7, 14, 11, 15];
+pub(crate) static COL_SCAN_4X4: [i16; 16] = [0, 4, 8, 1, 12, 5, 9, 2, 13, 6, 10, 3, 7, 14, 11, 15];
 
 /// `col_scan_4x4_neighbors`.
-pub(super) static COL_SCAN_4X4_NEIGHBORS: [i16; 34] = [
+pub(crate) static COL_SCAN_4X4_NEIGHBORS: [i16; 34] = [
     0, 0, 0, 0, 4, 4, 0, 0, 8, 8, 1, 1, 5, 5, 1, 1, 9, 9, 2, 2, 6, 6, 2, 2, 3, 3, 10, 10, 7, 7, 11,
     11, 0, 0,
 ];
 
 /// `row_scan_4x4`.
-pub(super) static ROW_SCAN_4X4: [i16; 16] = [0, 1, 4, 2, 5, 3, 6, 8, 9, 7, 12, 10, 13, 11, 14, 15];
+pub(crate) static ROW_SCAN_4X4: [i16; 16] = [0, 1, 4, 2, 5, 3, 6, 8, 9, 7, 12, 10, 13, 11, 14, 15];
 
 /// `row_scan_4x4_neighbors`.
-pub(super) static ROW_SCAN_4X4_NEIGHBORS: [i16; 34] = [
+pub(crate) static ROW_SCAN_4X4_NEIGHBORS: [i16; 34] = [
     0, 0, 0, 0, 0, 0, 1, 1, 4, 4, 2, 2, 5, 5, 4, 4, 8, 8, 6, 6, 8, 8, 9, 9, 12, 12, 10, 10, 13, 13,
     14, 14, 0, 0,
 ];
 
 /// `default_scan_8x8`.
-pub(super) static DEFAULT_SCAN_8X8: [i16; 64] = [
+pub(crate) static DEFAULT_SCAN_8X8: [i16; 64] = [
     0, 8, 1, 16, 9, 2, 17, 24, 10, 3, 18, 25, 32, 11, 4, 26, 33, 19, 40, 12, 34, 27, 5, 41, 20, 48,
     13, 35, 42, 28, 21, 6, 49, 56, 36, 43, 29, 7, 14, 50, 57, 44, 22, 37, 15, 51, 58, 30, 45, 23,
     52, 59, 38, 31, 60, 53, 46, 39, 61, 54, 47, 62, 55, 63,
 ];
 
 /// `default_scan_8x8_neighbors`.
-pub(super) static DEFAULT_SCAN_8X8_NEIGHBORS: [i16; 130] = [
+pub(crate) static DEFAULT_SCAN_8X8_NEIGHBORS: [i16; 130] = [
     0, 0, 0, 0, 0, 0, 8, 8, 1, 8, 1, 1, 9, 16, 16, 16, 2, 9, 2, 2, 10, 17, 17, 24, 24, 24, 3, 10,
     3, 3, 18, 25, 25, 32, 11, 18, 32, 32, 4, 11, 26, 33, 19, 26, 4, 4, 33, 40, 12, 19, 40, 40, 5,
     12, 27, 34, 34, 41, 20, 27, 13, 20, 5, 5, 41, 48, 48, 48, 28, 35, 35, 42, 21, 28, 6, 6, 6, 13,
@@ -1396,14 +1396,14 @@ pub(super) static DEFAULT_SCAN_8X8_NEIGHBORS: [i16; 130] = [
 ];
 
 /// `col_scan_8x8`.
-pub(super) static COL_SCAN_8X8: [i16; 64] = [
+pub(crate) static COL_SCAN_8X8: [i16; 64] = [
     0, 8, 16, 1, 24, 9, 32, 17, 2, 40, 25, 10, 33, 18, 48, 3, 26, 41, 11, 56, 19, 34, 4, 49, 27,
     42, 12, 35, 20, 57, 50, 28, 5, 43, 13, 36, 58, 51, 21, 44, 6, 29, 59, 37, 14, 52, 22, 7, 45,
     60, 30, 15, 38, 53, 23, 46, 31, 61, 39, 54, 47, 62, 55, 63,
 ];
 
 /// `col_scan_8x8_neighbors`.
-pub(super) static COL_SCAN_8X8_NEIGHBORS: [i16; 130] = [
+pub(crate) static COL_SCAN_8X8_NEIGHBORS: [i16; 130] = [
     0, 0, 0, 0, 8, 8, 0, 0, 16, 16, 1, 1, 24, 24, 9, 9, 1, 1, 32, 32, 17, 17, 2, 2, 25, 25, 10, 10,
     40, 40, 2, 2, 18, 18, 33, 33, 3, 3, 48, 48, 11, 11, 26, 26, 3, 3, 41, 41, 19, 19, 34, 34, 4, 4,
     27, 27, 12, 12, 49, 49, 42, 42, 20, 20, 4, 4, 35, 35, 5, 5, 28, 28, 50, 50, 43, 43, 13, 13, 36,
@@ -1413,14 +1413,14 @@ pub(super) static COL_SCAN_8X8_NEIGHBORS: [i16; 130] = [
 ];
 
 /// `row_scan_8x8`.
-pub(super) static ROW_SCAN_8X8: [i16; 64] = [
+pub(crate) static ROW_SCAN_8X8: [i16; 64] = [
     0, 1, 2, 8, 9, 3, 16, 10, 4, 17, 11, 24, 5, 18, 25, 12, 19, 26, 32, 6, 13, 20, 33, 27, 7, 34,
     40, 21, 28, 41, 14, 35, 48, 42, 29, 36, 49, 22, 43, 15, 56, 37, 50, 44, 30, 57, 23, 51, 58, 45,
     38, 52, 31, 59, 53, 46, 60, 39, 61, 47, 54, 55, 62, 63,
 ];
 
 /// `row_scan_8x8_neighbors`.
-pub(super) static ROW_SCAN_8X8_NEIGHBORS: [i16; 130] = [
+pub(crate) static ROW_SCAN_8X8_NEIGHBORS: [i16; 130] = [
     0, 0, 0, 0, 1, 1, 0, 0, 8, 8, 2, 2, 8, 8, 9, 9, 3, 3, 16, 16, 10, 10, 16, 16, 4, 4, 17, 17, 24,
     24, 11, 11, 18, 18, 25, 25, 24, 24, 5, 5, 12, 12, 19, 19, 32, 32, 26, 26, 6, 6, 33, 33, 32, 32,
     20, 20, 27, 27, 40, 40, 13, 13, 34, 34, 40, 40, 41, 41, 28, 28, 35, 35, 48, 48, 21, 21, 42, 42,
@@ -1430,7 +1430,7 @@ pub(super) static ROW_SCAN_8X8_NEIGHBORS: [i16; 130] = [
 ];
 
 /// `default_scan_16x16`.
-pub(super) static DEFAULT_SCAN_16X16: [i16; 256] = [
+pub(crate) static DEFAULT_SCAN_16X16: [i16; 256] = [
     0, 16, 1, 32, 17, 2, 48, 33, 18, 3, 64, 34, 49, 19, 65, 80, 50, 4, 35, 66, 20, 81, 96, 51, 5,
     36, 82, 97, 67, 112, 21, 52, 98, 37, 83, 113, 6, 68, 128, 53, 22, 99, 114, 84, 7, 129, 38, 69,
     100, 115, 144, 130, 85, 54, 23, 8, 145, 39, 70, 116, 101, 131, 160, 146, 55, 86, 24, 71, 132,
@@ -1447,7 +1447,7 @@ pub(super) static DEFAULT_SCAN_16X16: [i16; 256] = [
 ];
 
 /// `default_scan_16x16_neighbors`.
-pub(super) static DEFAULT_SCAN_16X16_NEIGHBORS: [i16; 514] = [
+pub(crate) static DEFAULT_SCAN_16X16_NEIGHBORS: [i16; 514] = [
     0, 0, 0, 0, 0, 0, 16, 16, 1, 16, 1, 1, 32, 32, 17, 32, 2, 17, 2, 2, 48, 48, 18, 33, 33, 48, 3,
     18, 49, 64, 64, 64, 34, 49, 3, 3, 19, 34, 50, 65, 4, 19, 65, 80, 80, 80, 35, 50, 4, 4, 20, 35,
     66, 81, 81, 96, 51, 66, 96, 96, 5, 20, 36, 51, 82, 97, 21, 36, 67, 82, 97, 112, 5, 5, 52, 67,
@@ -1476,7 +1476,7 @@ pub(super) static DEFAULT_SCAN_16X16_NEIGHBORS: [i16; 514] = [
 ];
 
 /// `col_scan_16x16`.
-pub(super) static COL_SCAN_16X16: [i16; 256] = [
+pub(crate) static COL_SCAN_16X16: [i16; 256] = [
     0, 16, 32, 48, 1, 64, 17, 80, 33, 96, 49, 2, 65, 112, 18, 81, 34, 128, 50, 97, 3, 66, 144, 19,
     113, 35, 82, 160, 98, 51, 129, 4, 67, 176, 20, 114, 145, 83, 36, 99, 130, 52, 192, 5, 161, 68,
     115, 21, 146, 84, 208, 177, 37, 131, 100, 53, 162, 224, 69, 6, 116, 193, 147, 85, 22, 240, 132,
@@ -1493,7 +1493,7 @@ pub(super) static COL_SCAN_16X16: [i16; 256] = [
 ];
 
 /// `col_scan_16x16_neighbors`.
-pub(super) static COL_SCAN_16X16_NEIGHBORS: [i16; 514] = [
+pub(crate) static COL_SCAN_16X16_NEIGHBORS: [i16; 514] = [
     0, 0, 0, 0, 16, 16, 32, 32, 0, 0, 48, 48, 1, 1, 64, 64, 17, 17, 80, 80, 33, 33, 1, 1, 49, 49,
     96, 96, 2, 2, 65, 65, 18, 18, 112, 112, 34, 34, 81, 81, 2, 2, 50, 50, 128, 128, 3, 3, 97, 97,
     19, 19, 66, 66, 144, 144, 82, 82, 35, 35, 113, 113, 3, 3, 51, 51, 160, 160, 4, 4, 98, 98, 129,
@@ -1522,7 +1522,7 @@ pub(super) static COL_SCAN_16X16_NEIGHBORS: [i16; 514] = [
 ];
 
 /// `row_scan_16x16`.
-pub(super) static ROW_SCAN_16X16: [i16; 256] = [
+pub(crate) static ROW_SCAN_16X16: [i16; 256] = [
     0, 1, 2, 16, 3, 17, 4, 18, 32, 5, 33, 19, 6, 34, 48, 20, 49, 7, 35, 21, 50, 64, 8, 36, 65, 22,
     51, 37, 80, 9, 66, 52, 23, 38, 81, 67, 10, 53, 24, 82, 68, 96, 39, 11, 54, 83, 97, 69, 25, 98,
     84, 40, 112, 55, 12, 70, 99, 113, 85, 26, 41, 56, 114, 100, 13, 71, 128, 86, 27, 115, 101, 129,
@@ -1539,7 +1539,7 @@ pub(super) static ROW_SCAN_16X16: [i16; 256] = [
 ];
 
 /// `row_scan_16x16_neighbors`.
-pub(super) static ROW_SCAN_16X16_NEIGHBORS: [i16; 514] = [
+pub(crate) static ROW_SCAN_16X16_NEIGHBORS: [i16; 514] = [
     0, 0, 0, 0, 1, 1, 0, 0, 2, 2, 16, 16, 3, 3, 17, 17, 16, 16, 4, 4, 32, 32, 18, 18, 5, 5, 33, 33,
     32, 32, 19, 19, 48, 48, 6, 6, 34, 34, 20, 20, 49, 49, 48, 48, 7, 7, 35, 35, 64, 64, 21, 21, 50,
     50, 36, 36, 64, 64, 8, 8, 65, 65, 51, 51, 22, 22, 37, 37, 80, 80, 66, 66, 9, 9, 52, 52, 23, 23,
@@ -1568,7 +1568,7 @@ pub(super) static ROW_SCAN_16X16_NEIGHBORS: [i16; 514] = [
 ];
 
 /// `default_scan_32x32`.
-pub(super) static DEFAULT_SCAN_32X32: [i16; 1024] = [
+pub(crate) static DEFAULT_SCAN_32X32: [i16; 1024] = [
     0, 32, 1, 64, 33, 2, 96, 65, 34, 128, 3, 97, 66, 160, 129, 35, 98, 4, 67, 130, 161, 192, 36,
     99, 224, 5, 162, 193, 68, 131, 37, 100, 225, 194, 256, 163, 69, 132, 6, 226, 257, 288, 195,
     101, 164, 38, 258, 7, 227, 289, 133, 320, 70, 196, 165, 290, 259, 228, 39, 321, 102, 352, 8,
@@ -1626,7 +1626,7 @@ pub(super) static DEFAULT_SCAN_32X32: [i16; 1024] = [
 ];
 
 /// `default_scan_32x32_neighbors`.
-pub(super) static DEFAULT_SCAN_32X32_NEIGHBORS: [i16; 2050] = [
+pub(crate) static DEFAULT_SCAN_32X32_NEIGHBORS: [i16; 2050] = [
     0, 0, 0, 0, 0, 0, 32, 32, 1, 32, 1, 1, 64, 64, 33, 64, 2, 33, 96, 96, 2, 2, 65, 96, 34, 65,
     128, 128, 97, 128, 3, 34, 66, 97, 3, 3, 35, 66, 98, 129, 129, 160, 160, 160, 4, 35, 67, 98,
     192, 192, 4, 4, 130, 161, 161, 192, 36, 67, 99, 130, 5, 36, 68, 99, 193, 224, 162, 193, 224,
@@ -1770,7 +1770,7 @@ pub(super) static AC_QLOOKUP: [i16; 256] = [
 ];
 
 /// `vp9_filter_kernels`, indexed by interpolation filter: regular, smooth, sharp, bilinear.
-pub(super) static FILTER_KERNELS: [[[i16; 8]; 16]; 4] = [
+pub(crate) static FILTER_KERNELS: [[[i16; 8]; 16]; 4] = [
     [
         [0, 0, 0, 128, 0, 0, 0, 0],
         [0, 1, -5, 126, 8, -3, 1, 0],

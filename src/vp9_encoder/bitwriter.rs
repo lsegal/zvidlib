@@ -2,6 +2,9 @@
 //! frame header, and the boolean (arithmetic) encoder for the compressed header
 //! and tile data (VP9 specification sections 9.1 and 9.2).
 
+use super::context::FrameCounts;
+use std::sync::OnceLock;
+
 /// Writes the uncompressed header's fixed-width fields, most significant bit
 /// first.
 #[derive(Default)]
@@ -56,7 +59,31 @@ impl BoolEncoder {
         encoder
     }
 
-    pub(super) fn write(&mut self, bit: bool, probability: u8) {
+    pub(super) fn bit(&mut self, bit: bool) {
+        self.write(bit, 128);
+    }
+
+    pub(super) fn literal(&mut self, value: u32, bits: u32) {
+        for shift in (0..bits).rev() {
+            self.bit((value >> shift) & 1 != 0);
+        }
+    }
+
+    /// Flushes the partition the way libvpx's `vpx_stop_encode` does.
+    pub(super) fn finish(mut self) -> Vec<u8> {
+        for _ in 0..32 {
+            self.bit(false);
+        }
+        // Keep the final byte from looking like a superframe index marker.
+        if self.bytes.last().is_some_and(|byte| byte & 0xe0 == 0xc0) {
+            self.bytes.push(0);
+        }
+        self.bytes
+    }
+}
+
+impl BoolSink for BoolEncoder {
+    fn write(&mut self, bit: bool, probability: u8) {
         let split = 1 + (((self.range - 1) * u32::from(probability)) >> 8);
         let mut range = split;
         let mut low = self.low;
@@ -91,20 +118,23 @@ impl BoolEncoder {
         self.low = low;
         self.range = range;
     }
+}
 
-    pub(super) fn bit(&mut self, bit: bool) {
-        self.write(bit, 128);
-    }
+/// Where boolean-coded symbols go: the [`BoolEncoder`] itself, or a
+/// [`BitCost`] that totals what they would cost to write.
+pub(super) trait BoolSink {
+    fn write(&mut self, bit: bool, probability: u8);
 
-    pub(super) fn literal(&mut self, value: u32, bits: u32) {
-        for shift in (0..bits).rev() {
-            self.bit((value >> shift) & 1 != 0);
-        }
+    /// The symbol counts to add the written symbols to, when the sink writes
+    /// the frame the decoder reads and counts; `None` when it only costs or
+    /// writes symbols.
+    fn counts(&mut self) -> Option<&mut FrameCounts> {
+        None
     }
 
     /// Writes `value` with a libvpx tree: positive entries index the next
     /// node pair, and zero or negative entries are leaves holding `-value`.
-    pub(super) fn tree(&mut self, tree: &[i8], probabilities: &[u8], value: u8) {
+    fn tree(&mut self, tree: &[i8], probabilities: &[u8], value: u8) {
         let mut path = [false; 16];
         let mut length = 0;
         let found = tree_path(tree, 0, i16::from(value), &mut path, &mut length);
@@ -119,18 +149,24 @@ impl BoolEncoder {
             node = next as usize;
         }
     }
+}
 
-    /// Flushes the partition the way libvpx's `vpx_stop_encode` does.
-    pub(super) fn finish(mut self) -> Vec<u8> {
-        for _ in 0..32 {
-            self.bit(false);
-        }
-        // Keep the final byte from looking like a superframe index marker.
-        if self.bytes.last().is_some_and(|byte| byte & 0xe0 == 0xc0) {
-            self.bytes.push(0);
-        }
-        self.bytes
+/// Totals the ideal cost, in bits, of the symbols written to it.
+#[derive(Default)]
+pub(super) struct BitCost(pub(super) f64);
+
+impl BoolSink for BitCost {
+    fn write(&mut self, bit: bool, probability: u8) {
+        self.0 += bit_cost(bit, probability);
     }
+}
+
+/// The cost in bits of coding `bit` when a zero has `probability` / 256.
+pub(super) fn bit_cost(bit: bool, probability: u8) -> f64 {
+    static COSTS: OnceLock<[f64; 256]> = OnceLock::new();
+    let costs = COSTS.get_or_init(|| core::array::from_fn(|p| -(p.max(1) as f64 / 256.0).log2()));
+    let p = usize::from(probability);
+    costs[if bit { 256 - p } else { p }]
 }
 
 fn tree_path(

@@ -13,6 +13,8 @@
 //! software encoder's does and decodes through the native VP9 decoder.
 #![cfg(not(target_arch = "wasm32"))]
 
+use std::sync::{Mutex, MutexGuard, PoisonError};
+
 use zvidlib::io::MemorySource;
 use zvidlib::{
     CancellationToken, Codec, CodecImplementation, CodecProfile, CodecSupport, ColorRange,
@@ -30,6 +32,16 @@ fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
             return value;
         }
     }
+}
+
+/// Holds the other tests in this file off while one runs. The `macos-latest`
+/// runner is a virtual Mac (`Apple M1 (Virtual)`), and its VideoToolbox VP9
+/// decoder fails a decode with OSStatus -12909 or -19092 while another session
+/// in the process is decoding: run in parallel, this file failed 9 times in 12
+/// there, and run one test at a time it failed none (#565).
+fn serial() -> MutexGuard<'static, ()> {
+    static HARDWARE: Mutex<()> = Mutex::new(());
+    HARDWARE.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 struct Track {
@@ -129,6 +141,7 @@ fn sequential_digests(
 
 #[test]
 fn capability_honors_the_hardware_preference() {
+    let _serial = serial();
     let factory = native_vp9_video_decoder_factory();
     let limits = Limits::default();
     let mut candidate = configuration(VideoDimensions::new(256, 144, &limits).unwrap(), Vec::new());
@@ -170,6 +183,7 @@ fn capability_honors_the_hardware_preference() {
 
 #[test]
 fn hardware_vp9_matches_the_software_decoder_and_seeks_exactly() {
+    let _serial = serial();
     for (name, track) in fixtures() {
         let Some(hardware) = hardware_configuration(&track.configuration) else {
             return;
@@ -222,6 +236,7 @@ fn hardware_vp9_matches_the_software_decoder_and_seeks_exactly() {
 
 #[test]
 fn hardware_show_existing_frame_shows_the_same_reference_as_software() {
+    let _serial = serial();
     let track = mp4_track(include_bytes!("fixtures/codec/vp9_bbb_256x144.mp4"));
     let Some(hardware) = hardware_configuration(&track.configuration) else {
         return;
@@ -241,8 +256,50 @@ fn hardware_show_existing_frame_shows_the_same_reference_as_software() {
     assert_eq!(sequential_digests(&hardware, &samples), expected);
 }
 
+/// Hardware sessions on several threads at once, each required to decode
+/// every fixture exactly as the software decoder does. On a virtual Mac,
+/// VideoToolbox fails a VP9 decode while another session decodes, so the
+/// backend must keep its sessions from overlapping there (#580).
+#[test]
+fn concurrent_hardware_vp9_sessions_match_the_software_decoder() {
+    const THREADS: usize = 4;
+    const ROUNDS: usize = 3;
+    let _serial = serial();
+    let mut streams = Vec::new();
+    for (name, track) in fixtures() {
+        let Some(hardware) = hardware_configuration(&track.configuration) else {
+            return;
+        };
+        let expected = sequential_digests(&track.configuration, &track.samples);
+        streams.push((name, hardware, track.samples, expected));
+    }
+    let start = std::sync::Barrier::new(THREADS);
+    std::thread::scope(|scope| {
+        for thread in 0..THREADS {
+            let (streams, start) = (&streams, &start);
+            scope.spawn(move || {
+                start.wait();
+                for round in 0..ROUNDS {
+                    // Each thread starts on a different fixture, so sessions
+                    // of every size decode side by side.
+                    for offset in 0..streams.len() {
+                        let (name, hardware, samples, expected) =
+                            &streams[(thread + round + offset) % streams.len()];
+                        assert_eq!(
+                            &sequential_digests(hardware, samples),
+                            expected,
+                            "{name}, thread {thread}, round {round}"
+                        );
+                    }
+                }
+            });
+        }
+    });
+}
+
 #[test]
 fn hardware_refuses_what_the_software_decoder_refuses() {
+    let _serial = serial();
     let track = mp4_track(include_bytes!("fixtures/codec/vp9_bbb_256x144.mp4"));
     let Some(hardware) = hardware_configuration(&track.configuration) else {
         return;
@@ -332,6 +389,7 @@ fn encoder_frame(index: u32, limits: &Limits) -> zvidlib::VideoFrame {
 /// preference answers are checked.
 #[test]
 fn hardware_vp9_encoder_output_muxes_and_decodes_through_the_native_decoder() {
+    let _serial = serial();
     use zvidlib::io::MemorySink;
     use zvidlib::mp4::{Mp4Muxer, Mp4TrackConfig, Mp4TrackFormat};
     use zvidlib::{

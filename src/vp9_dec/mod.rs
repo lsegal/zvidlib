@@ -10,6 +10,9 @@
 //! one-dimensional transforms in `idct1d`, and `loopfilter` the loop filter
 //! (section 8.8). `probs` holds the probability contexts and their
 //! adaptation, and `tables` the constant tables, generated from libvpx's.
+//! The reconstruction kernels and the loop filter run the bit-exact vector
+//! kernels of [`crate::vp9_simd`] where the host has SSE4.1, AVX2 or NEON,
+//! and their scalar forms here everywhere else.
 //!
 //! A sample is a VP9 *chunk*: one frame, or a superframe of several frames
 //! with an index at its end (Annex B), of which at most one is shown.
@@ -35,11 +38,11 @@ mod block;
     target_os = "macos"
 ))]
 mod chunk;
-mod idct1d;
+pub(crate) mod idct1d;
 pub(crate) mod loopfilter;
 mod probs;
-mod recon;
-mod tables;
+pub(crate) mod recon;
+pub(crate) mod tables;
 
 #[cfg(test)]
 mod tests;

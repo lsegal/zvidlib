@@ -5,7 +5,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use symphonia_core::dsp::mdct::Imdct;
+use crate::vorbis_simd::{self, Imdct};
 
 use super::window::Windows;
 
@@ -85,17 +85,23 @@ impl DspChannel {
 
         // Overlap-add and windowing with the previous buffer.
         if let Some(lap_state) = &lap_state {
-            // Window for this block.
-            let win = if block_flag && lap_state.prev_block_flag {
-                &windows.long
+            // Window for this block, and the same window reversed.
+            let (win, win_rev) = if block_flag && lap_state.prev_block_flag {
+                (&windows.long, &windows.long_rev)
             } else {
-                &windows.short
+                (&windows.short, &windows.short_rev)
             };
 
             if lap_state.prev_block_flag == block_flag {
                 // Both the previous and current blocks are either short or long. In this case,
                 // there is a complete overlap between.
-                overlap_add(buf, &self.overlap[..bs / 2], &self.imdct[..bs / 2], win);
+                vorbis_simd::overlap_add(
+                    buf,
+                    &self.overlap[..bs / 2],
+                    &self.imdct[..bs / 2],
+                    win,
+                    win_rev,
+                );
             } else if lap_state.prev_block_flag && !block_flag {
                 // The previous block is long and the current block is short.
                 let start = (self.bs1 - self.bs0) / 4;
@@ -105,11 +111,12 @@ impl DspChannel {
                 buf[..start].copy_from_slice(&self.overlap[..start]);
 
                 // Overlapping samples.
-                overlap_add(
+                vorbis_simd::overlap_add(
                     &mut buf[start..],
                     &self.overlap[start..end],
                     &self.imdct[..self.bs0 / 2],
                     win,
+                    win_rev,
                 );
             } else {
                 // The previous block is short and the current block is long.
@@ -117,11 +124,12 @@ impl DspChannel {
                 let end = start + self.bs0 / 2;
 
                 // Overlapping samples.
-                overlap_add(
+                vorbis_simd::overlap_add(
                     &mut buf[..self.bs0 / 2],
                     &self.overlap[..self.bs0 / 2],
                     &self.imdct[start..end],
                     win,
+                    win_rev,
                 );
 
                 // Unity samples (no overlap).
@@ -129,9 +137,7 @@ impl DspChannel {
             }
 
             // Clamp the output samples.
-            for s in buf.iter_mut() {
-                *s = s.clamp(-1.0, 1.0);
-            }
+            vorbis_simd::clamp_unit(buf);
         }
 
         // Save right-half of IMDCT buffer for later.
@@ -141,23 +147,5 @@ impl DspChannel {
     pub fn reset(&mut self) {
         // Clear the overlap buffer. Nothing else is used across packets.
         self.overlap.fill(0.0);
-    }
-}
-
-#[inline(always)]
-fn overlap_add(out: &mut [f32], left: &[f32], right: &[f32], win: &[f32]) {
-    assert!(left.len() == right.len());
-    assert!(left.len() == win.len());
-    assert!(left.len() == out.len());
-
-    let iter = left
-        .iter()
-        .zip(right)
-        .zip(win.iter().rev())
-        .zip(win)
-        .zip(out);
-
-    for ((((&s0, &s1), &w0), &w1), out) in iter {
-        *out = s0 * w0 + s1 * w1;
     }
 }

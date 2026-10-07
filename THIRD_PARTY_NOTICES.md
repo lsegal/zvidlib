@@ -98,12 +98,11 @@ from libvpx's `vp9/common` and `vpx_dsp` sources, and the rest of
 `src/vp9_dec/` follows the structure of libvpx's VP9 decoder, so that it
 decodes bit for bit as libvpx does.
 
-The VP9 default probability, quantizer, scan and interpolation filter tables in
+The VP9 default probability, quantizer and interpolation filter tables in
 `src/vp9_encoder/tables.rs` are generated from [libvpx](https://chromium.googlesource.com/webm/libvpx)
-(`vp9/common/vp9_entropy.c`, `vp9_entropymode.c`, `vp9_quant_common.c`,
-`vp9_scan.c` and `vp9_filter.c`), and the 4x4 transforms in
-`src/vp9_encoder/dsp.rs` follow its `vpx_dsp/inv_txfm.c` and
-`vp9/encoder/vp9_dct.c`.
+(`vp9/common/vp9_entropy.c`, `vp9_entropymode.c`, `vp9_quant_common.c` and
+`vp9_filter.c`), and the 4x4 forward transform in `src/vp9_encoder/dsp.rs`
+follows its `vp9/encoder/vp9_dct.c`.
 
 Copyright (c) 2010, The WebM Project authors. All rights reserved.
 
@@ -142,8 +141,10 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 [Symphonia](https://github.com/pdeljanov/Symphonia), `symphonia-codec-vorbis`
 0.5.5, modified by zvidlib to decode streams of more than two channels
 correctly and in the Vorbis channel order; the changes are listed at the top of
-`src/vorbis_decoder/mod.rs`. Those files are covered by the Mozilla Public
-License, version 2.0, and keep its notice. A copy of the license is at
+`src/vorbis_decoder/mod.rs`. `src/vorbis_simd/kernels.rs` and
+`src/vorbis_simd/imdct.rs` restructure its synthesis loops and
+`symphonia-core` 0.5.5's inverse MDCT for runtime-dispatched SIMD. Those files
+are covered by the Mozilla Public License, version 2.0, and keep its notice. A copy of the license is at
 <https://mozilla.org/MPL/2.0/>, and their source, as modified, is the files
 themselves.
 

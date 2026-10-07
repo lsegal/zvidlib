@@ -116,11 +116,31 @@ macro_rules! vectors {
 
 #[test]
 fn decodes_every_test_vector_exactly_as_libvpx_does() {
+    check_every_test_vector("detected");
+}
+
+/// The vectors again under every instruction set the host has, pinned through
+/// the crate-wide override, so the scalar reference and each vector arm of
+/// the `vp8_recon` and `vp8_decode` kernels are all held to libvpx rather than
+/// only whichever one detection picks (issue #568).
+#[test]
+fn every_instruction_set_decodes_every_test_vector_exactly_as_libvpx_does() {
+    let _guard = crate::simd::test_lock();
+    for isa in crate::simd::available() {
+        crate::simd::set_override(Some(isa));
+        assert_eq!(super::simd::decode_isa(), isa);
+        check_every_test_vector(isa.name());
+    }
+    crate::simd::set_override(None);
+}
+
+fn check_every_test_vector(arm: &str) {
     let vectors = vectors!(
         "001", "002", "003", "004", "005", "006", "007", "008", "009", "010", "011", "012", "013",
         "014", "015", "016", "017", "018",
     );
     for (name, ivf, expected) in vectors {
+        let name = format!("{name} ({arm})");
         let expected: Vec<&str> = expected
             .lines()
             .filter_map(|line| line.split_whitespace().next())
@@ -427,4 +447,132 @@ fn skips_a_webm_vp8_tracks_hidden_alternate_references_as_libvpx_does() {
         }
     }
     assert_eq!((next_shown, next_hidden), (40, 43));
+}
+
+/// Issue #530: libvpx decodes the native encoder's output, written as WebM,
+/// to exactly the pictures zvidlib's decoder does, and ffmpeg reads the WebM
+/// as seekable VP8. Skips where ffmpeg, or its libvpx decoder, is missing,
+/// unless `ZVIDLIB_REQUIRE_LIBVPX` is set.
+#[test]
+fn libvpx_decodes_the_encoders_webm_exactly() {
+    use super::encoder::tests::{configuration, encode, test_frame};
+    use crate::io::MemorySink;
+    use crate::mp4::{Mp4TrackConfig, Mp4TrackFormat};
+    use crate::{EncoderConfig, VideoDimensions, WebmMuxer};
+    use std::process::{Command, Stdio};
+
+    let libvpx = Command::new("ffmpeg")
+        .args(["-hide_banner", "-decoders"])
+        .stderr(Stdio::null())
+        .output()
+        .is_ok_and(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .any(|line| line.split_whitespace().nth(1) == Some("libvpx"))
+        });
+    if !libvpx {
+        // CI installs ffmpeg for this test and sets the variable, so there
+        // a missing decoder fails rather than passing unchecked.
+        assert!(
+            std::env::var_os("ZVIDLIB_REQUIRE_LIBVPX").is_none(),
+            "ffmpeg with the libvpx VP8 decoder is required"
+        );
+        eprintln!("skipping: ffmpeg with the libvpx VP8 decoder is unavailable");
+        return;
+    }
+
+    // An odd size, so the cropped edge macroblocks are compared too, and a
+    // key frame every 12 frames under rate control.
+    let (width, height) = (99, 67);
+    let config = configuration(
+        width,
+        height,
+        [150_000u32.to_be_bytes(), 12u32.to_be_bytes()].concat(),
+    );
+    let frames: Vec<_> = (0..40)
+        .map(|index| test_frame(width, height, index))
+        .collect();
+    let samples = encode(&config, &frames);
+
+    let mut expected = Vec::new();
+    let mut decoder = Decoder::new(Limits::default());
+    for sample in &samples {
+        let picture = decoder.decode(&sample.data).unwrap().expect("shown");
+        for plane in &picture.planes {
+            expected.extend_from_slice(plane);
+        }
+    }
+
+    let track = Mp4TrackConfig {
+        encoder: EncoderConfig {
+            codec: crate::Codec::Vp8,
+            timescale: config.timescale,
+            decoder_config: Vec::new(),
+        },
+        format: Mp4TrackFormat::Video(
+            VideoDimensions::new(width, height, &Limits::default()).unwrap(),
+        ),
+    };
+    let webm = block_on(async {
+        let mut muxer = WebmMuxer::new(MemorySink::new(), vec![track], 1_000)
+            .await
+            .unwrap();
+        for sample in samples {
+            muxer.write_sample(0, sample).await.unwrap();
+        }
+        muxer.finish().await.unwrap().into_inner()
+    });
+    let path =
+        std::env::temp_dir().join(format!("zvidlib-vp8-encoder-{}.webm", std::process::id()));
+    std::fs::write(&path, webm).unwrap();
+
+    let decoded = Command::new("ffmpeg")
+        .args(["-v", "error", "-c:v", "libvpx", "-i"])
+        .arg(&path)
+        .args(["-f", "rawvideo", "-pix_fmt", "yuv420p", "-"])
+        .output()
+        .unwrap();
+    let probe = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=format_name:stream=codec_name,width,height",
+            "-of",
+            "default=noprint_wrappers=1",
+        ])
+        .arg(&path)
+        .output()
+        .unwrap();
+    // `-ss` before `-i` seeks through the container's Cues.
+    let seek = Command::new("ffmpeg")
+        .args(["-v", "error", "-ss", "1", "-c:v", "libvpx", "-i"])
+        .arg(&path)
+        .args(["-frames:v", "1", "-f", "null", "-"])
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_file(&path);
+
+    assert!(
+        decoded.status.success(),
+        "ffmpeg failed: {}",
+        String::from_utf8_lossy(&decoded.stderr)
+    );
+    assert_eq!(decoded.stdout.len(), expected.len(), "decoded byte count");
+    assert!(
+        decoded.stdout == expected,
+        "libvpx decoded different pictures"
+    );
+    let report = String::from_utf8_lossy(&probe.stdout);
+    assert!(report.contains("format_name=matroska,webm"), "{report}");
+    assert!(report.contains("codec_name=vp8"), "{report}");
+    assert!(
+        report.contains("width=99") && report.contains("height=67"),
+        "{report}"
+    );
+    assert!(
+        seek.status.success(),
+        "ffmpeg could not seek: {}",
+        String::from_utf8_lossy(&seek.stderr)
+    );
 }
