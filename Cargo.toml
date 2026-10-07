@@ -86,6 +86,15 @@ name = "hevc_encode"
 path = "benches/hevc_encode.rs"
 harness = false
 
+# The native VP9 encoder, whole-frame and per stage, scalar versus SIMD
+# (#571). Its own target for the same reasons as `hevc_encode`: synthetic
+# inputs only, and a rate-distortion search slow enough to keep out of the
+# other targets' default runs.
+[[bench]]
+name = "vp9_encode"
+path = "benches/vp9_encode.rs"
+harness = false
+
 # The audio write/read path is a separate target rather than another group in
 # `codec`: it shares `benches/support/` but none of `codec`'s decoded-frame
 # fixtures, and issue #153 specifies `cargo bench --bench audio_mux` as its

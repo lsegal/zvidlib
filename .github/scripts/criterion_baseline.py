@@ -532,6 +532,7 @@ SITE_GROUP_PREFIXES: dict[str, tuple[str, ...]] = {
     "av1_mc": ("av1_mc_", "av1_motion_compensation"),
     "av1_intra_pred": ("av1_intra_",),
     "av1_coeff_ctx": ("av1_encode_stage_coeff_ctx", "av1_encode_stage_tile"),
+    "vp9_encode": ("vp9_encode_",),
     "hevc_prediction_filters": (
         "hevc_inter_pred",
         "hevc_intra_pred",

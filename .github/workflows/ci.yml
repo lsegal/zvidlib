@@ -391,6 +391,7 @@ jobs:
           - hevc_encode
           - av1_encode
           - av1_decode
+          - vp9_encode
           - hevc_decode
           - vpx_decode
           - codec

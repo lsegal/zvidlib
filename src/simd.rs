@@ -1,16 +1,17 @@
 //! The process-wide SIMD instruction-set override shared by every codec kernel.
 //!
-//! zvidlib's pure-Rust HEVC and AV1 codecs dispatch their hot loops to
+//! zvidlib's pure-Rust HEVC, AV1 and VP9 codecs dispatch their hot loops to
 //! runtime-detected vector kernels in several independent places: the AV1
 //! transforms and in-loop filters ([`crate::av1_simd`]), AV1 inter prediction
 //! ([`crate::av1_mc`]), AV1 intra prediction ([`crate::av1_intra_pred`]),
 //! the HEVC engine's inter/intra prediction, in-loop filters, inverse
 //! transforms, encoder-side distortion metrics, and encoder-side color
-//! conversion, the AV1, VP8 and VP9 decoders' shared output color
-//! conversion ([`crate::av1_filters::convert_to_rgba8`]), and the Vorbis
-//! decoder's synthesis (`crate::vorbis_simd`). Each of those sites caches its
-//! own CPU feature probe, which is what you want in production but makes "run
-//! this workload with SIMD off" impossible to express from outside the crate.
+//! conversion, the AV1, VP8 and VP9 decoders' shared output color conversion
+//! ([`crate::av1_filters::convert_to_rgba8`]), the Vorbis decoder's synthesis
+//! (`crate::vorbis_simd`), and the native VP9 encoder's pixel kernels. Each of
+//! those sites caches its own CPU feature probe, which is what you want in
+//! production but makes "run this workload with SIMD off" impossible to express
+//! from outside the crate.
 //!
 //! This module is that single switch. [`set_override`] pins **every** kernel in
 //! the crate to one [`SimdIsa`] (or restores per-site automatic detection with
@@ -50,8 +51,8 @@ static OVERRIDE: AtomicU8 = AtomicU8::new(0);
 /// The override reaches every dispatch family: the AV1 transform and in-loop
 /// filter kernels, AV1 motion compensation (through the default level
 /// [`crate::av1_mc::McContext::new`] picks up), AV1 intra prediction, every
-/// HEVC engine kernel, the AV1, VP8 and VP9 output color conversion, and the
-/// Vorbis decoder's synthesis kernels.
+/// HEVC engine kernel, the AV1, VP8 and VP9 output color conversion, the
+/// Vorbis decoder's synthesis kernels, and the VP9 encoder's kernels.
 /// [`SimdIsa::Scalar`] therefore genuinely reaches the scalar code path rather
 /// than merely the widest scalar-ish one.
 ///
@@ -115,6 +116,7 @@ pub fn available() -> Vec<SimdIsa> {
 /// | `av1_mc` | AV1 motion compensation (the level [`crate::av1_mc::McContext::new`] picks) |
 /// | `av1_intra_pred` | AV1 intra prediction and residual reconstruction |
 /// | `av1_coeff_ctx` | AV1 encoder-side coefficient context derivation (§8.3.2) |
+/// | `vp9_encode` | VP9 encoder forward transforms, quantization, distortion metrics, intra/inter prediction and RGBA8 to YUV420 input conversion |
 /// | `hevc_prediction_filters` | HEVC inter/intra prediction and in-loop filters |
 /// | `hevc_transforms` | HEVC inverse transforms and dequantization |
 /// | `hevc_rdcost` | HEVC encoder-side distortion metrics |
@@ -138,6 +140,10 @@ pub fn active_by_site() -> Vec<(&'static str, SimdIsa)> {
             from_intra_simd(crate::av1_intra_pred::av1_intra_simd()),
         ),
         ("av1_coeff_ctx", crate::av1_simd::coeff::active_isa()),
+        (
+            "vp9_encode",
+            from_vp9_encode_isa(crate::vp9_encoder::simd::isa()),
+        ),
     ];
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -202,6 +208,19 @@ fn from_intra_simd(simd: crate::av1_intra_pred::Av1IntraSimd) -> SimdIsa {
         Av1IntraSimd::Sse41 => SimdIsa::Sse41,
         Av1IntraSimd::Avx2 => SimdIsa::Avx2,
         Av1IntraSimd::Neon => SimdIsa::Neon,
+    }
+}
+
+fn from_vp9_encode_isa(isa: crate::vp9_encoder::simd::Isa) -> SimdIsa {
+    use crate::vp9_encoder::simd::Isa;
+    match isa {
+        Isa::Scalar => SimdIsa::Scalar,
+        #[cfg(target_arch = "x86_64")]
+        Isa::Sse41 => SimdIsa::Sse41,
+        #[cfg(target_arch = "x86_64")]
+        Isa::Avx2 => SimdIsa::Avx2,
+        #[cfg(target_arch = "aarch64")]
+        Isa::Neon => SimdIsa::Neon,
     }
 }
 
@@ -373,6 +392,7 @@ mod tests {
         use crate::hevc::color_convert;
         use crate::hevc::engine::encoder::{colorconv, quant_simd, rdcost, recon_simd};
         use crate::hevc::engine::{simd as hevc_simd, transform_simd};
+        use crate::vp9_encoder::simd as vp9_encode;
 
         let _guard = lock();
         set_override(Some(SimdIsa::Scalar));
@@ -388,6 +408,8 @@ mod tests {
         // AV1 motion compensation, through the level `McContext::new` picks.
         assert_eq!(default_level(), SimdLevel::Scalar);
         assert_eq!(McContext::new().level(), SimdLevel::Scalar);
+        // The VP9 encoder's kernels.
+        assert_eq!(vp9_encode::isa(), vp9_encode::Isa::Scalar);
         // HEVC inter/intra prediction and in-loop filters.
         assert_eq!(hevc_simd::detected_isa(), hevc_simd::Isa::Scalar);
         // HEVC inverse transforms and dequantization.
@@ -418,6 +440,7 @@ mod tests {
             "av1_mc",
             "av1_intra_pred",
             "av1_coeff_ctx",
+            "vp9_encode",
             "hevc_prediction_filters",
             "hevc_transforms",
             "hevc_rdcost",
@@ -468,6 +491,7 @@ mod tests {
         use crate::hevc::color_convert;
         use crate::hevc::engine::encoder::{colorconv, quant_simd, rdcost, recon_simd};
         use crate::hevc::engine::{simd as hevc_simd, transform_simd};
+        use crate::vp9_encoder::simd as vp9_encode;
 
         let _guard = lock();
         set_override(Some(SimdIsa::Scalar));
@@ -488,6 +512,8 @@ mod tests {
             default_level() != crate::av1_mc::SimdLevel::Scalar,
             vectorized
         );
+        // The VP9 encoder's kernels.
+        assert_eq!(vp9_encode::isa() != vp9_encode::Isa::Scalar, vectorized);
         // HEVC inter/intra prediction and in-loop filters.
         assert_eq!(
             hevc_simd::detected_isa() != hevc_simd::Isa::Scalar,
@@ -531,6 +557,7 @@ mod tests {
             "av1_mc",
             "av1_intra_pred",
             "av1_coeff_ctx",
+            "vp9_encode",
             "hevc_prediction_filters",
             "hevc_transforms",
             "hevc_rdcost",
