@@ -44,8 +44,8 @@
 use super::bitwriter::{BitCost, BitWriter, BoolEncoder, BoolSink, bit_cost};
 use super::context::{CoefProbs, FrameContext, FrameCounts, MvComponentCounts};
 use super::dsp::{
-    IntraMode, ReferencePlane, TransformScratch, TxType, forward_transform, inverse_transform_add,
-    predict_inter, predict_intra,
+    InterScratch, IntraMode, ReferencePlane, TransformScratch, TxType, forward_transform,
+    inverse_transform_add, predict_inter, predict_intra,
 };
 use super::simd::{self, Quantizer};
 use super::tables::{
@@ -54,6 +54,7 @@ use super::tables::{
 };
 use crate::vp9_dec::loopfilter::{self, FilterPlane, LoopFilterMask, MaskBlock};
 use crate::vp9_dec::tables as shared;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 
@@ -495,6 +496,21 @@ impl Scratch {
     }
 }
 
+/// Working memory for motion-compensating candidate vectors.
+struct InterBuffers {
+    prediction: [u8; 64 * 64],
+    filter: Box<InterScratch>,
+}
+
+impl InterBuffers {
+    fn new() -> Box<Self> {
+        Box::new(Self {
+            prediction: [0; 64 * 64],
+            filter: InterScratch::new(),
+        })
+    }
+}
+
 /// The above and left coding contexts a block reads and writes.
 struct ContextSnapshot {
     above_nonzero: [Vec<bool>; 3],
@@ -577,6 +593,8 @@ pub(super) struct FrameEncoder<'a> {
     above_partition: Vec<u8>,
     left_partition: [u8; 8],
     scratch: Box<Scratch>,
+    /// Borrowed by the motion search, which only reads the encoder.
+    inter: RefCell<Box<InterBuffers>>,
     /// Whether a candidate was ruled out by a [`Bound`]'s ceiling since
     /// [`Self::choose_block`] last cleared it.
     over_ceiling: bool,
@@ -645,6 +663,7 @@ impl<'a> FrameEncoder<'a> {
             above_partition: vec![0; geometry.mi_cols],
             left_partition: [0; 8],
             scratch: Scratch::new(),
+            inter: RefCell::new(InterBuffers::new()),
             over_ceiling: false,
             residual_cache: HashMap::default(),
             token_costs: token_costs(&context.coef),
@@ -2058,7 +2077,8 @@ impl<'a> FrameEncoder<'a> {
             width: self.geometry.width,
             height: self.geometry.height,
         };
-        let mut prediction = [0_u8; 64 * 64];
+        let mut inter = self.inter.borrow_mut();
+        let InterBuffers { prediction, filter } = &mut **inter;
         let prediction = &mut prediction[..size * size];
         let (x, y) = (mi_col * 8, mi_row * 8);
         predict_inter(
@@ -2068,6 +2088,7 @@ impl<'a> FrameEncoder<'a> {
             size,
             mv.row * 2,
             mv.col * 2,
+            filter,
             prediction,
         );
         let stride = self.source.strides[0];
@@ -2243,6 +2264,7 @@ impl<'a> FrameEncoder<'a> {
                     size,
                     mv.row * scale,
                     mv.col * scale,
+                    &mut self.inter.get_mut().filter,
                     &mut prediction,
                 );
                 let stride = self.recon.strides[plane];

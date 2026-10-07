@@ -14,8 +14,8 @@
 //! are `#[doc(hidden)]` and not part of the stable API.
 
 use super::dsp::{
-    IntraMode, ReferencePlane, TransformScratch, TxType, forward_transform, predict_inter,
-    predict_intra,
+    InterScratch, IntraMode, ReferencePlane, TransformScratch, TxType, forward_transform,
+    predict_inter, predict_intra,
 };
 use super::frame::Geometry;
 use super::simd::{self, Quantizer};
@@ -145,6 +145,7 @@ pub fn inter_prediction(reference: &[u8], width: usize, height: usize, size: usi
         height,
     };
     let mut prediction = vec![0; size * size];
+    let mut scratch = InterScratch::new();
     let mut output = Vec::new();
     for (index, (x, y)) in blocks(width, height, size).enumerate() {
         let index = index as i32;
@@ -153,7 +154,16 @@ pub fn inter_prediction(reference: &[u8], width: usize, height: usize, size: usi
         } else {
             (3 * index % 16, 5 * index % 16)
         };
-        predict_inter(&plane, x, y, size, mv_row, mv_col, &mut prediction);
+        predict_inter(
+            &plane,
+            x,
+            y,
+            size,
+            mv_row,
+            mv_col,
+            &mut scratch,
+            &mut prediction,
+        );
         output.extend_from_slice(&prediction);
     }
     output

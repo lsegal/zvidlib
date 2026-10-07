@@ -400,6 +400,7 @@ pub(super) fn predict_inter(
     size: usize,
     mv_row_q4: i32,
     mv_col_q4: i32,
+    scratch: &mut InterScratch,
     output: &mut [u8],
 ) {
     let x0 = x as isize + (mv_col_q4 >> 4) as isize - 3;
@@ -419,12 +420,55 @@ pub(super) fn predict_inter(
         }
         return;
     }
-    let mut window = [0_u8; (64 + 7) * (64 + 7)];
-    let window = &mut window[..span * span];
-    for (row, out) in window.chunks_exact_mut(span).enumerate() {
-        reference.clamped_row(x0, y0 + row as isize, out);
+    let InterScratch {
+        window,
+        intermediate,
+    } = scratch;
+    // A window inside the plane needs no clamping, so the filters read the
+    // plane itself.
+    let inside = x0 >= 0
+        && y0 >= 0
+        && x0 as usize + span <= reference.width
+        && y0 as usize + span <= reference.height;
+    let (window, stride): (&[u8], usize) = if inside {
+        let start = y0 as usize * reference.stride + x0 as usize;
+        (&reference.pixels[start..], reference.stride)
+    } else {
+        let window = &mut window[..span * span];
+        for (row, out) in window.chunks_exact_mut(span).enumerate() {
+            reference.clamped_row(x0, y0 + row as isize, out);
+        }
+        (window, span)
+    };
+    simd::convolve8(
+        window,
+        stride,
+        size,
+        size,
+        filter_x,
+        filter_y,
+        intermediate,
+        output,
+    );
+}
+
+/// Working memory for [`predict_inter`], kept between calls for the same
+/// reason as [`TransformScratch`]: the motion search predicts many candidate
+/// vectors for every block.
+pub(super) struct InterScratch {
+    /// The edge-clamped window of a block near the plane's edges.
+    window: [u8; (64 + 7) * (64 + 7)],
+    /// The horizontal pass of the 8-tap filter.
+    intermediate: [u8; (64 + 7) * 64],
+}
+
+impl InterScratch {
+    pub(super) fn new() -> Box<Self> {
+        Box::new(Self {
+            window: [0; (64 + 7) * (64 + 7)],
+            intermediate: [0; (64 + 7) * 64],
+        })
     }
-    simd::convolve8(window, span, size, size, filter_x, filter_y, output);
 }
 
 #[cfg(test)]
@@ -583,7 +627,16 @@ mod tests {
             height: 8,
         };
         let mut output = [0_u8; 16];
-        predict_inter(&reference, 4, 4, 4, -16 * 6, 16 * 2, &mut output);
+        predict_inter(
+            &reference,
+            4,
+            4,
+            4,
+            -16 * 6,
+            16 * 2,
+            &mut InterScratch::new(),
+            &mut output,
+        );
         // Rows -2..=1 read rows 0, 0, 0, 1 and columns 6..=9 read 6, 7, 7, 7.
         assert_eq!(&output[..4], &[18, 21, 21, 21]);
         assert_eq!(&output[8..12], &[18, 21, 21, 21]);
@@ -636,7 +689,16 @@ mod tests {
                 for mv_row in [-16 * 7, -24, 0, 8, 16 * 3, 16 * 9 + 8] {
                     for mv_col in [-16 * 5 - 8, -16, 0, 5, 16 * 2, 16 * 20] {
                         let mut output = vec![0_u8; size * size];
-                        predict_inter(&reference, x, y, size, mv_row, mv_col, &mut output);
+                        predict_inter(
+                            &reference,
+                            x,
+                            y,
+                            size,
+                            mv_row,
+                            mv_col,
+                            &mut InterScratch::new(),
+                            &mut output,
+                        );
                         assert_eq!(
                             output,
                             filtered(x, y, size, mv_row, mv_col),

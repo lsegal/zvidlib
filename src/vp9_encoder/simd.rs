@@ -559,10 +559,15 @@ pub(super) fn predict_tm_scalar(
 
 /// VP9's 8-tap separable interpolation of a `w` x `h` block from `window`, the
 /// `(w + 7)` x `(h + 7)` source samples starting three rows above and three
-/// columns left of the block, with row stride `window_stride`.
+/// columns left of the block, with row stride `window_stride`. `intermediate`
+/// holds the horizontal pass, `(h + 7) * w` samples.
 ///
 /// Like libvpx's `vpx_convolve8_c`, the horizontal pass is rounded and clipped
 /// to 8 bits before the vertical pass. The taps of each filter sum to 128.
+///
+/// A pass with the identity kernel, a whole-sample component, copies its
+/// centre sample exactly, so it is skipped: the other pass reads the window
+/// directly, and only `h` rows are filtered horizontally.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn convolve8(
     window: &[u8],
@@ -571,6 +576,7 @@ pub(super) fn convolve8(
     h: usize,
     filter_x: &[i32],
     filter_y: &[i32],
+    intermediate: &mut [u8],
     output: &mut [u8],
 ) {
     if w == 0 || h == 0 {
@@ -579,26 +585,108 @@ pub(super) fn convolve8(
     assert!(window_stride >= w + 7);
     assert!(window.len() >= (h + 6) * window_stride + w + 7);
     assert!(output.len() >= w * h);
+    let identity = |filter: &[i32]| filter[..8] == [0, 0, 0, 128, 0, 0, 0, 0];
+    if identity(filter_y) {
+        filter_rows(
+            &window[3 * window_stride..],
+            window_stride,
+            w,
+            h,
+            filter_x,
+            output,
+        );
+    } else if identity(filter_x) {
+        filter_columns(&window[3..], window_stride, w, h, filter_y, output);
+    } else {
+        let intermediate = &mut intermediate[..(h + 7) * w];
+        filter_rows(window, window_stride, w, h + 7, filter_x, intermediate);
+        filter_columns(intermediate, w, w, h, filter_y, output);
+    }
+}
+
+/// The horizontal 8-tap pass over `rows` rows of `w` outputs into `output`
+/// (row stride `w`), reading `w + 7` samples of each `source` row.
+fn filter_rows(
+    source: &[u8],
+    source_stride: usize,
+    w: usize,
+    rows: usize,
+    filter: &[i32],
+    output: &mut [u8],
+) {
+    assert!(source_stride >= w + 7);
+    assert!(source.len() >= (rows - 1) * source_stride + w + 7);
+    assert!(output.len() >= w * rows);
     match isa_code() {
         #[cfg(target_arch = "x86_64")]
         // SAFETY: the bounds were checked above, and AVX2 was detected.
         ISA_AVX2 if w >= 16 => unsafe {
-            x86::convolve8_avx2(window, window_stride, w, h, filter_x, filter_y, output)
+            x86::filter_rows_avx2(source, source_stride, w, rows, filter, output)
         },
         #[cfg(target_arch = "x86_64")]
         // SAFETY: as above, with SSE4.1 detected.
         ISA_AVX2 | ISA_SSE41 => unsafe {
-            x86::convolve8_sse41(window, window_stride, w, h, filter_x, filter_y, output)
+            x86::filter_rows_sse41(source, source_stride, w, rows, filter, output)
         },
         #[cfg(target_arch = "aarch64")]
         // SAFETY: the bounds were checked above, and NEON is in the baseline.
-        ISA_NEON => unsafe {
-            neon::convolve8(window, window_stride, w, h, filter_x, filter_y, output)
-        },
-        _ => convolve8_scalar(window, window_stride, w, h, filter_x, filter_y, output),
+        ISA_NEON => unsafe { neon::filter_rows(source, source_stride, w, rows, filter, output) },
+        _ => {
+            for row in 0..rows {
+                filter_row_scalar(
+                    &source[row * source_stride..],
+                    filter,
+                    &mut output[row * w..][..w],
+                    0,
+                );
+            }
+        }
     }
 }
 
+/// The vertical 8-tap pass over `h` rows of `w` outputs into `output` (row
+/// stride `w`), reading `h + 7` rows of `source`.
+fn filter_columns(
+    source: &[u8],
+    source_stride: usize,
+    w: usize,
+    h: usize,
+    filter: &[i32],
+    output: &mut [u8],
+) {
+    assert!(source_stride >= w);
+    assert!(source.len() >= (h + 6) * source_stride + w);
+    assert!(output.len() >= w * h);
+    match isa_code() {
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: the bounds were checked above, and AVX2 was detected.
+        ISA_AVX2 if w >= 16 => unsafe {
+            x86::filter_columns_avx2(source, source_stride, w, h, filter, output)
+        },
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: as above, with SSE4.1 detected.
+        ISA_AVX2 | ISA_SSE41 => unsafe {
+            x86::filter_columns_sse41(source, source_stride, w, h, filter, output)
+        },
+        #[cfg(target_arch = "aarch64")]
+        // SAFETY: the bounds were checked above, and NEON is in the baseline.
+        ISA_NEON => unsafe { neon::filter_columns(source, source_stride, w, h, filter, output) },
+        _ => {
+            for row in 0..h {
+                filter_column_scalar(
+                    &source[row * source_stride..],
+                    source_stride,
+                    filter,
+                    &mut output[row * w..][..w],
+                    0,
+                );
+            }
+        }
+    }
+}
+
+/// The full two-pass reference for [`convolve8`], identity passes included.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn convolve8_scalar(
     window: &[u8],
@@ -1487,25 +1575,22 @@ mod x86 {
 
     /// # Safety
     ///
-    /// The caller checks the window holds `h + 7` rows of `w + 7` samples at
-    /// `window_stride` and that `output` holds `w * h` samples.
+    /// The caller checks that `source` holds `rows` rows of `w + 7` samples at
+    /// `source_stride` and that `output` holds `w * rows` samples.
     #[target_feature(enable = "sse4.1")]
-    pub(super) unsafe fn convolve8_sse41(
-        window: &[u8],
-        window_stride: usize,
+    pub(super) unsafe fn filter_rows_sse41(
+        source: &[u8],
+        source_stride: usize,
         w: usize,
-        h: usize,
-        filter_x: &[i32],
-        filter_y: &[i32],
+        rows: usize,
+        filter: &[i32],
         output: &mut [u8],
     ) {
-        let taps_x: [i16; 8] = core::array::from_fn(|tap| filter_x[tap] as i16);
-        let taps_y: [i16; 8] = core::array::from_fn(|tap| filter_y[tap] as i16);
-        let (pairs_x, pairs_y) = (tap_pairs(&taps_x), tap_pairs(&taps_y));
-        let mut intermediate = vec![0_u8; (h + 7) * w];
-        for row in 0..h + 7 {
-            let source = &window[row * window_stride..];
-            let out = &mut intermediate[row * w..][..w];
+        let taps: [i16; 8] = core::array::from_fn(|tap| filter[tap] as i16);
+        let pairs = tap_pairs(&taps);
+        for row in 0..rows {
+            let source = &source[row * source_stride..];
+            let out = &mut output[row * w..][..w];
             let mut column = 0;
             while column + 8 <= w {
                 // SAFETY: the 8-byte loads end at `column + 15 <= w + 7`.
@@ -1515,34 +1600,51 @@ mod x86 {
                     });
                     _mm_storel_epi64(
                         out.as_mut_ptr().add(column).cast(),
-                        filter8(samples, &pairs_x),
+                        filter8(samples, &pairs),
                     );
                 }
                 column += 8;
             }
-            super::filter_row_scalar(source, filter_x, out, column);
+            super::filter_row_scalar(source, filter, out, column);
         }
+    }
+
+    /// # Safety
+    ///
+    /// The caller checks that `source` holds `h + 7` rows of `w` samples at
+    /// `source_stride` and that `output` holds `w * h` samples.
+    #[target_feature(enable = "sse4.1")]
+    pub(super) unsafe fn filter_columns_sse41(
+        source: &[u8],
+        source_stride: usize,
+        w: usize,
+        h: usize,
+        filter: &[i32],
+        output: &mut [u8],
+    ) {
+        let taps: [i16; 8] = core::array::from_fn(|tap| filter[tap] as i16);
+        let pairs = tap_pairs(&taps);
         for row in 0..h {
-            let source = &intermediate[row * w..];
+            let source = &source[row * source_stride..];
             let out = &mut output[row * w..][..w];
             let mut column = 0;
             while column + 8 <= w {
-                // SAFETY: row `row + 7` of the intermediate exists and
+                // SAFETY: row `row + 7` of the source exists and
                 // `column + 7 < w`.
                 unsafe {
                     let samples: [__m128i; 8] = core::array::from_fn(|tap| {
                         _mm_cvtepu8_epi16(_mm_loadl_epi64(
-                            source.as_ptr().add(tap * w + column).cast(),
+                            source.as_ptr().add(tap * source_stride + column).cast(),
                         ))
                     });
                     _mm_storel_epi64(
                         out.as_mut_ptr().add(column).cast(),
-                        filter8(samples, &pairs_y),
+                        filter8(samples, &pairs),
                     );
                 }
                 column += 8;
             }
-            super::filter_column_scalar(source, w, filter_y, out, column);
+            super::filter_column_scalar(source, source_stride, filter, out, column);
         }
     }
 
@@ -1564,34 +1666,33 @@ mod x86 {
         _mm256_castsi256_si128(_mm256_permute4x64_epi64::<0b1000>(bytes))
     }
 
+    /// The four tap pairs of `filter`, broadcast to 256-bit lanes.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn wide_tap_pairs(taps: &[i16; 8]) -> [__m256i; 4] {
+        core::array::from_fn(|pair| {
+            let packed = (i32::from(taps[2 * pair + 1]) << 16) | i32::from(taps[2 * pair] as u16);
+            _mm256_set1_epi32(packed)
+        })
+    }
+
     /// # Safety
     ///
-    /// As [`convolve8_sse41`].
+    /// As [`filter_rows_sse41`].
     #[target_feature(enable = "avx2")]
-    pub(super) unsafe fn convolve8_avx2(
-        window: &[u8],
-        window_stride: usize,
+    pub(super) unsafe fn filter_rows_avx2(
+        source: &[u8],
+        source_stride: usize,
         w: usize,
-        h: usize,
-        filter_x: &[i32],
-        filter_y: &[i32],
+        rows: usize,
+        filter: &[i32],
         output: &mut [u8],
     ) {
-        let pairs = |taps: &[i16; 8]| -> [__m256i; 4] {
-            core::array::from_fn(|pair| {
-                let packed =
-                    (i32::from(taps[2 * pair + 1]) << 16) | i32::from(taps[2 * pair] as u16);
-                _mm256_set1_epi32(packed)
-            })
-        };
-        let taps_x: [i16; 8] = core::array::from_fn(|tap| filter_x[tap] as i16);
-        let taps_y: [i16; 8] = core::array::from_fn(|tap| filter_y[tap] as i16);
-        let (pairs_x, pairs_y) = (pairs(&taps_x), pairs(&taps_y));
-        let (narrow_x, narrow_y) = (tap_pairs(&taps_x), tap_pairs(&taps_y));
-        let mut intermediate = vec![0_u8; (h + 7) * w];
-        for row in 0..h + 7 {
-            let source = &window[row * window_stride..];
-            let out = &mut intermediate[row * w..][..w];
+        let taps: [i16; 8] = core::array::from_fn(|tap| filter[tap] as i16);
+        let (pairs, narrow) = (wide_tap_pairs(&taps), tap_pairs(&taps));
+        for row in 0..rows {
+            let source = &source[row * source_stride..];
+            let out = &mut output[row * w..][..w];
             let mut column = 0;
             // SAFETY: the 16-byte loads end at `column + 22 < w + 7`, and the
             // 8-byte ones at `column + 14 < w + 7`.
@@ -1604,7 +1705,7 @@ mod x86 {
                     });
                     _mm_storeu_si128(
                         out.as_mut_ptr().add(column).cast(),
-                        filter16(samples, &pairs_x),
+                        filter16(samples, &pairs),
                     );
                     column += 16;
                 }
@@ -1614,46 +1715,62 @@ mod x86 {
                     });
                     _mm_storel_epi64(
                         out.as_mut_ptr().add(column).cast(),
-                        filter8(samples, &narrow_x),
+                        filter8(samples, &narrow),
                     );
                     column += 8;
                 }
             }
-            super::filter_row_scalar(source, filter_x, out, column);
+            super::filter_row_scalar(source, filter, out, column);
         }
+    }
+
+    /// # Safety
+    ///
+    /// As [`filter_columns_sse41`].
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn filter_columns_avx2(
+        source: &[u8],
+        source_stride: usize,
+        w: usize,
+        h: usize,
+        filter: &[i32],
+        output: &mut [u8],
+    ) {
+        let taps: [i16; 8] = core::array::from_fn(|tap| filter[tap] as i16);
+        let (pairs, narrow) = (wide_tap_pairs(&taps), tap_pairs(&taps));
         for row in 0..h {
-            let source = &intermediate[row * w..];
+            let source = &source[row * source_stride..];
             let out = &mut output[row * w..][..w];
             let mut column = 0;
-            // SAFETY: row `row + 7` of the intermediate exists and every load
-            // ends below `w` within it.
+            // SAFETY: row `row + 7` of the source exists and every load ends
+            // below `w` within it.
             unsafe {
                 while column + 16 <= w {
                     let samples: [__m256i; 8] = core::array::from_fn(|tap| {
                         _mm256_cvtepu8_epi16(_mm_loadu_si128(
-                            source.as_ptr().add(tap * w + column).cast(),
+                            source.as_ptr().add(tap * source_stride + column).cast(),
                         ))
                     });
                     _mm_storeu_si128(
                         out.as_mut_ptr().add(column).cast(),
-                        filter16(samples, &pairs_y),
+                        filter16(samples, &pairs),
                     );
                     column += 16;
                 }
                 while column + 8 <= w {
                     let samples: [__m128i; 8] = core::array::from_fn(|tap| {
                         _mm_cvtepu8_epi16(_mm_loadl_epi64(
-                            source.as_ptr().add(tap * w + column).cast(),
+                            source.as_ptr().add(tap * source_stride + column).cast(),
                         ))
                     });
                     _mm_storel_epi64(
                         out.as_mut_ptr().add(column).cast(),
-                        filter8(samples, &narrow_y),
+                        filter8(samples, &narrow),
                     );
                     column += 8;
                 }
             }
-            super::filter_column_scalar(source, w, filter_y, out, column);
+            super::filter_column_scalar(source, source_stride, filter, out, column);
         }
     }
 
@@ -1966,6 +2083,36 @@ mod neon {
         output: &mut [f64],
     ) {
         let (w, r, o) = (weights.as_ptr(), rows.as_ptr(), output.as_mut_ptr());
+        if n % 8 == 0 {
+            // Two output rows by eight columns at a time: eight independent
+            // accumulators hide the add latency, and each loaded row vector
+            // serves both output rows. Each lane still sums its own terms in
+            // order.
+            for k in (0..n).step_by(2) {
+                for column in (0..n).step_by(8) {
+                    // SAFETY: `k + 1, m, column + 7 < n` and every matrix is
+                    // `n * n`.
+                    unsafe {
+                        let mut acc = [vdupq_n_f64(0.0); 8];
+                        for m in 0..n {
+                            let upper = vdupq_n_f64(*w.add(k * n + m));
+                            let lower = vdupq_n_f64(*w.add((k + 1) * n + m));
+                            let row = r.add(m * n + column);
+                            for lane in 0..4 {
+                                let values = vld1q_f64(row.add(lane * 2));
+                                acc[lane] = vaddq_f64(acc[lane], vmulq_f64(upper, values));
+                                acc[lane + 4] = vaddq_f64(acc[lane + 4], vmulq_f64(lower, values));
+                            }
+                        }
+                        for lane in 0..4 {
+                            vst1q_f64(o.add(k * n + column + lane * 2), acc[lane]);
+                            vst1q_f64(o.add((k + 1) * n + column + lane * 2), acc[lane + 4]);
+                        }
+                    }
+                }
+            }
+            return;
+        }
         for k in 0..n {
             let mut column = 0;
             while column + 4 <= n {
@@ -2271,51 +2418,65 @@ mod neon {
 
     /// # Safety
     ///
-    /// The caller checks the window holds `h + 7` rows of `w + 7` samples at
-    /// `window_stride` and that `output` holds `w * h` samples.
+    /// The caller checks that `source` holds `rows` rows of `w + 7` samples at
+    /// `source_stride` and that `output` holds `w * rows` samples.
     #[target_feature(enable = "neon")]
-    pub(super) unsafe fn convolve8(
-        window: &[u8],
-        window_stride: usize,
+    pub(super) unsafe fn filter_rows(
+        source: &[u8],
+        source_stride: usize,
         w: usize,
-        h: usize,
-        filter_x: &[i32],
-        filter_y: &[i32],
+        rows: usize,
+        filter: &[i32],
         output: &mut [u8],
     ) {
-        let taps_x: [i16; 8] = core::array::from_fn(|tap| filter_x[tap] as i16);
-        let taps_y: [i16; 8] = core::array::from_fn(|tap| filter_y[tap] as i16);
-        let mut intermediate = vec![0_u8; (h + 7) * w];
-        for row in 0..h + 7 {
-            let source = &window[row * window_stride..];
-            let out = &mut intermediate[row * w..][..w];
+        let taps: [i16; 8] = core::array::from_fn(|tap| filter[tap] as i16);
+        for row in 0..rows {
+            let source = &source[row * source_stride..];
+            let out = &mut output[row * w..][..w];
             let mut column = 0;
             while column + 8 <= w {
                 // SAFETY: the 8-byte loads end at `column + 15 <= w + 7`.
                 unsafe {
                     let samples: [uint8x8_t; 8] =
                         core::array::from_fn(|tap| vld1_u8(source.as_ptr().add(column + tap)));
-                    vst1_u8(out.as_mut_ptr().add(column), filter8(samples, &taps_x));
+                    vst1_u8(out.as_mut_ptr().add(column), filter8(samples, &taps));
                 }
                 column += 8;
             }
-            super::filter_row_scalar(source, filter_x, out, column);
+            super::filter_row_scalar(source, filter, out, column);
         }
+    }
+
+    /// # Safety
+    ///
+    /// The caller checks that `source` holds `h + 7` rows of `w` samples at
+    /// `source_stride` and that `output` holds `w * h` samples.
+    #[target_feature(enable = "neon")]
+    pub(super) unsafe fn filter_columns(
+        source: &[u8],
+        source_stride: usize,
+        w: usize,
+        h: usize,
+        filter: &[i32],
+        output: &mut [u8],
+    ) {
+        let taps: [i16; 8] = core::array::from_fn(|tap| filter[tap] as i16);
         for row in 0..h {
-            let source = &intermediate[row * w..];
+            let source = &source[row * source_stride..];
             let out = &mut output[row * w..][..w];
             let mut column = 0;
             while column + 8 <= w {
-                // SAFETY: row `row + 7` of the intermediate exists and
+                // SAFETY: row `row + 7` of the source exists and
                 // `column + 7 < w`.
                 unsafe {
-                    let samples: [uint8x8_t; 8] =
-                        core::array::from_fn(|tap| vld1_u8(source.as_ptr().add(tap * w + column)));
-                    vst1_u8(out.as_mut_ptr().add(column), filter8(samples, &taps_y));
+                    let samples: [uint8x8_t; 8] = core::array::from_fn(|tap| {
+                        vld1_u8(source.as_ptr().add(tap * source_stride + column))
+                    });
+                    vst1_u8(out.as_mut_ptr().add(column), filter8(samples, &taps));
                 }
                 column += 8;
             }
-            super::filter_column_scalar(source, w, filter_y, out, column);
+            super::filter_column_scalar(source, source_stride, filter, out, column);
         }
     }
 
@@ -2675,7 +2836,16 @@ mod tests {
                             filter_y,
                             &mut expected,
                         );
-                        convolve8(&window, stride, size, size, filter_x, filter_y, &mut actual);
+                        convolve8(
+                            &window,
+                            stride,
+                            size,
+                            size,
+                            filter_x,
+                            filter_y,
+                            &mut [0; 71 * 64],
+                            &mut actual,
+                        );
                         assert_eq!(
                             actual,
                             expected,
