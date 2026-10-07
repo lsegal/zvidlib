@@ -7,6 +7,13 @@
 //! up to the next one depends on the samples before it. See `frame` for the
 //! coding tools.
 //!
+//! The encoder buffers the start of each group, up to 60 frames or the whole
+//! group if shorter, before coding any of it. It decides from those frames
+//! whether the key frame keeps detail for the frames after it (see
+//! `lookahead`). So [`VideoEncoder::encode`] returns no samples while a group
+//! starts, then all of the buffered ones at once, and
+//! [`VideoEncoder::finish`] returns whatever is still buffered.
+//!
 //! [`VideoEncoderConfig::configuration`] is either empty, which encodes at
 //! [`DEFAULT_BASE_Q_IDX`] with a key frame every [`DEFAULT_KEYFRAME_INTERVAL`]
 //! frames, a single nonzero `base_q_idx` byte, that byte followed by the key
@@ -22,6 +29,7 @@ mod bitwriter;
 mod context;
 mod dsp;
 mod frame;
+mod lookahead;
 #[doc(hidden)]
 pub mod simd;
 mod tables;
@@ -43,8 +51,8 @@ use crate::{
     Limits, Orientation, PixelFormat, Result, SampleDependency, VideoDimensions, VideoEncoder,
     VideoEncoderConfig, VideoEncoderFactory, VideoEncoderFormat, VideoFrame,
 };
-use context::FrameContext;
-use frame::{CodingTools, FrameEncoder, Geometry, ModeInfo, Picture};
+use frame::{CodingTools, Geometry, Picture};
+use lookahead::{CodedFrame, StreamSettings, StreamState};
 
 /// The quantizer index an empty configuration encodes at.
 pub const DEFAULT_BASE_Q_IDX: u8 = 80;
@@ -445,6 +453,10 @@ fn validate_limits(dimensions: VideoDimensions, limits: &Limits) -> Result<()> {
     Ok(())
 }
 
+/// The most frames the encoder buffers at the start of a group to decide how
+/// its key frame is coded: a whole group at the default interval.
+const LOOKAHEAD_FRAMES: usize = DEFAULT_KEYFRAME_INTERVAL as usize;
+
 struct NativeVp9Encoder {
     declared: EncoderConfig,
     format: VideoEncoderFormat,
@@ -457,17 +469,17 @@ struct NativeVp9Encoder {
     error_resilient: bool,
     /// The partition and transform sizes the frame encoder searches.
     tools: CodingTools,
-    /// The previous frame's reconstruction, which the next inter frame
-    /// predicts from.
-    reference: Option<Picture>,
-    /// The probabilities the next frame codes with: the decoder's frame
-    /// context 0, which every frame that is not error resilient adapts and
-    /// saves.
-    context: FrameContext,
-    /// The previous frame's block modes, whose motion vectors the next inter
-    /// frame takes as candidates.
-    previous_mode_info: Vec<ModeInfo>,
-    previous_was_key: bool,
+    /// What the next frame codes from.
+    stream: StreamState,
+    /// How many frames at the start of a group are buffered before any of
+    /// them is coded.
+    lookahead: usize,
+    /// The buffered start of the current group, from its key frame, with
+    /// each picture's frame index.
+    pending: Vec<(u64, Picture)>,
+    /// The reconstruction of every frame emitted so far, in order.
+    #[cfg(test)]
+    reconstructions: Vec<Picture>,
     next_index: u64,
     finished: bool,
 }
@@ -491,10 +503,13 @@ impl VideoEncoder for NativeVp9Encoder {
 
     fn finish<'a>(&'a mut self) -> EncoderFuture<'a, Vec<EncodedSample>> {
         Box::pin(async move {
+            if self.finished {
+                return Ok(Vec::new());
+            }
             self.finished = true;
-            self.reference = None;
-            self.previous_mode_info = Vec::new();
-            Ok(Vec::new())
+            let samples = self.code_pending();
+            self.stream = StreamState::default();
+            samples
         })
     }
 }
@@ -520,6 +535,10 @@ impl NativeVp9Encoder {
             )
         })?;
         let full_range = configuration.color_range == ColorRange::Full;
+        let geometry = Geometry::new(
+            configuration.coded_dimensions.width as usize,
+            configuration.coded_dimensions.height as usize,
+        );
         Ok(Self {
             declared: EncoderConfig {
                 codec: Codec::Vp9,
@@ -534,18 +553,16 @@ impl NativeVp9Encoder {
             color_range: configuration.color_range,
             frame_duration: configuration.frame_duration,
             limits: *limits,
-            geometry: Geometry::new(
-                configuration.coded_dimensions.width as usize,
-                configuration.coded_dimensions.height as usize,
-            ),
+            geometry,
             base_q_idx: settings.base_q_idx,
             keyframe_interval: u64::from(settings.keyframe_interval),
             error_resilient: settings.error_resilient,
             tools: CodingTools::ALL,
-            reference: None,
-            context: FrameContext::default(),
-            previous_mode_info: Vec::new(),
-            previous_was_key: false,
+            stream: StreamState::default(),
+            lookahead: lookahead_frames(&geometry, u64::from(settings.keyframe_interval), limits),
+            pending: Vec::new(),
+            #[cfg(test)]
+            reconstructions: Vec::new(),
             next_index: 0,
             finished: false,
         })
@@ -585,71 +602,94 @@ impl NativeVp9Encoder {
             ));
         }
         let picture = source_picture(&self.geometry, frame, source.orientation)?;
+        self.next_index = self
+            .next_index
+            .checked_add(1)
+            .ok_or_else(|| Error::new(ErrorKind::ResourceLimit, "VP9 frame index overflow"))?;
 
+        // A group's first frames are buffered until the lookahead is full,
+        // then coded together; later frames code as they arrive.
         let key = index.0 % self.keyframe_interval == 0;
-        let reference = if key { None } else { self.reference.as_ref() };
-        // Key frames and error-resilient frames reset every frame context to
-        // the defaults (`setup_past_independence`).
-        if key || self.error_resilient {
-            self.context = FrameContext::default();
+        if key || !self.pending.is_empty() {
+            let mut samples = if key {
+                self.code_pending()?
+            } else {
+                Vec::new()
+            };
+            self.pending.push((index.0, picture));
+            if self.pending.len() >= self.lookahead {
+                samples.extend(self.code_pending()?);
+            }
+            return Ok(samples);
         }
-        // Each frame is shown and the same size as the one before, so a frame
-        // that is not error resilient uses its motion vectors.
-        let previous_mode_info = (!self.error_resilient && !self.previous_mode_info.is_empty())
-            .then_some(self.previous_mode_info.as_slice());
-        let encoded = FrameEncoder::new(
-            self.geometry,
-            &picture,
-            reference,
-            self.base_q_idx,
-            self.tools,
-            self.error_resilient,
-            &self.context,
-            previous_mode_info,
-        )
-        .encode(self.color_range == ColorRange::Full);
-        let data = encoded.data;
-        if u64::try_from(data.len()).unwrap_or(u64::MAX) > self.limits.max_allocation_bytes {
+        let coded = self.stream.code(&self.settings(), &picture, false, false);
+        Ok(vec![self.sample(index.0, coded)?])
+    }
+
+    fn settings(&self) -> StreamSettings {
+        StreamSettings {
+            geometry: self.geometry,
+            base_q_idx: self.base_q_idx,
+            tools: self.tools,
+            error_resilient: self.error_resilient,
+            full_range: self.color_range == ColorRange::Full,
+            loop_filter: true,
+        }
+    }
+
+    /// Codes the buffered start of the group, if any.
+    fn code_pending(&mut self) -> Result<Vec<EncodedSample>> {
+        if self.pending.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (indexes, pictures): (Vec<u64>, Vec<Picture>) =
+            std::mem::take(&mut self.pending).into_iter().unzip();
+        let coded = self.stream.code_group_start(&self.settings(), &pictures);
+        indexes
+            .into_iter()
+            .zip(coded)
+            .map(|(index, coded)| self.sample(index, coded))
+            .collect()
+    }
+
+    /// The sample for frame `index`, coded as `coded`.
+    fn sample(&mut self, index: u64, coded: CodedFrame) -> Result<EncodedSample> {
+        if u64::try_from(coded.data.len()).unwrap_or(u64::MAX) > self.limits.max_allocation_bytes {
             return Err(Error::new(
                 ErrorKind::ResourceLimit,
                 "encoded VP9 frame exceeds the configured allocation limit",
             ));
         }
-        if !self.error_resilient {
-            // refresh_frame_context = 1, frame_parallel_decoding_mode = 0.
-            self.context = self.context.adapted(
-                &encoded.counts,
-                key,
-                self.previous_was_key,
-                self.tools.larger_transforms,
-                encoded.allow_high_precision_mv,
-            );
-        }
-        self.reference = Some(encoded.reconstruction);
-        self.previous_mode_info = encoded.mode_info;
-        self.previous_was_key = key;
-
-        let timestamp = i64::try_from(index.0)
+        #[cfg(test)]
+        self.reconstructions.push(coded.reconstruction);
+        let timestamp = i64::try_from(index)
             .ok()
             .and_then(|value| value.checked_mul(i64::from(self.frame_duration)))
             .ok_or_else(|| Error::new(ErrorKind::ResourceLimit, "VP9 timestamp overflow"))?;
-        self.next_index = self
-            .next_index
-            .checked_add(1)
-            .ok_or_else(|| Error::new(ErrorKind::ResourceLimit, "VP9 frame index overflow"))?;
-        Ok(vec![EncodedSample {
-            data,
+        Ok(EncodedSample {
+            data: coded.data,
             dts: timestamp,
             pts: timestamp,
             duration: self.frame_duration,
-            is_sync: key,
-            dependency: if key {
+            is_sync: coded.key,
+            dependency: if coded.key {
                 SampleDependency::INDEPENDENT
             } else {
                 SampleDependency::DEPENDENT
             },
-        }])
+        })
     }
+}
+
+/// How many frames to buffer at the start of a group: the whole group up to
+/// [`LOOKAHEAD_FRAMES`], and no more source pictures than the allocation
+/// limit holds.
+fn lookahead_frames(geometry: &Geometry, keyframe_interval: u64, limits: &Limits) -> usize {
+    let picture_bytes = (geometry.aligned_width * geometry.aligned_height * 3 / 2).max(1) as u64;
+    let affordable = (limits.max_allocation_bytes / picture_bytes).max(1);
+    LOOKAHEAD_FRAMES
+        .min(usize::try_from(keyframe_interval.min(affordable)).unwrap_or(usize::MAX))
+        .max(1)
 }
 
 /// Converts a frame to an 8-aligned 4:2:0 picture, replicating the last row
