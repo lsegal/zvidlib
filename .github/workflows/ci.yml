@@ -146,7 +146,8 @@ jobs:
       # greps that out of the emitted assembly. One x86_64 host is enough and
       # this job is one: on the matrix's aarch64 macOS runner NEON is in the
       # baseline, so a kernel that lost its attribute still compiles to NEON and
-      # leaves no trace, and `macos-15-intel` would only repeat what runs here.
+      # leaves no trace. CI runs no x86_64 macOS host (#593), and one would
+      # only repeat what runs here.
       - name: Check the SIMD kernels kept their target feature
         run: python3 .github/scripts/check_simd_target_features.py build
       - name: Test library units
@@ -624,10 +625,11 @@ jobs:
         # `macos-latest` is aarch64, and Apple silicon's dyld shared cache
         # resolves the Swift runtime the `apple-cf` bridge references whether or
         # not the binary carries an rpath for it. x86_64 macOS does not, so a
-        # missing rpath is a launch failure there and invisible here (#327);
-        # `macos-15-intel` is what makes that arm covered rather than only ever
-        # reached by hand when someone measures the Intel benchmark column.
-        os: [windows-latest, macos-latest, macos-15-intel]
+        # missing rpath is a launch failure there and invisible here (#327).
+        # x86_64 macOS is still supported, but CI no longer runs an Intel macOS
+        # leg (#593), so that regression is only caught when someone runs the
+        # tests on an Intel Mac by hand.
+        os: [windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
