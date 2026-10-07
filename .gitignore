@@ -9,3 +9,4 @@
 /examples/output/
 node_modules/
 __pycache__/
+/release/
