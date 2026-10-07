@@ -1,7 +1,7 @@
 # Benchmarks
 
 zvidlib's benchmarks run under [criterion](https://docs.rs/criterion) with
-`harness = false`, across fourteen bench targets that share `benches/support/`:
+`harness = false`, across fifteen bench targets that share `benches/support/`:
 
 | Target | Measures |
 | --- | --- |
@@ -19,6 +19,7 @@ zvidlib's benchmarks run under [criterion](https://docs.rs/criterion) with
 | `benches/exact_seek.rs` | what an exact frame at an arbitrary point costs, by backend and by random-access cadence |
 | `benches/vpx_decode.rs` | the VP8 and VP9 software decoders, and the YUV-to-RGBA conversion they share with AV1, scalar versus SIMD |
 | `benches/vp8_encode.rs` | the native VP8 encoder: whole-frame encode and every SIMD kernel, scalar versus SIMD |
+| `benches/vp8_decode.rs` | the VP8 software decoder: whole-frame decode and the stages only the decoder runs, scalar versus SIMD |
 
 Each target loads and decodes its fixtures once per process, so every iteration
 measures the work under test and nothing else. `codec` is one target rather than
@@ -205,12 +206,12 @@ issue #574). Every group is a per-ISA group.
 | `vp9_decode_frame` | whole-frame decode through `native_vp9_video_decoder_factory` |
 
 The decode groups decode six 640x360 frames the crate's own VP8 and VP9
-encoders produce once per process, `submit` to RGBA. VP8 has no other vector
-kernel, so the conversion is the only thing its arms differ in, and its ratio
-is the share of a decode the conversion kernel recovers. VP9's arms also
-differ in the decoding kernels of
-[the VP9 decoder suite](#the-vp9-decoder-suite---bench-vp9_decode), which
-times them on their own and a decode that stops before the conversion. `av1_decode_frame` in
+encoders produce once per process, `submit` to RGBA. Both decoders' arms also
+differ in their own decoding kernels, which
+[the VP8 decoder suite](#the-vp8-decoder-suite---bench-vp8_decode) and
+[the VP9 decoder suite](#the-vp9-decoder-suite---bench-vp9_decode) time on
+their own and in a decode that stops before the conversion, so the ratio here
+is the conversion kernel's share of a decode plus theirs. `av1_decode_frame` in
 [the AV1 decoder suite](#the-av1-decoder-suite---bench-av1_decode) converts
 through the same site.
 
@@ -1863,6 +1864,62 @@ cargo bench --bench vp8_encode -- vp8_encode_stage    # the kernels only
 ZVIDLIB_BENCH_LARGE=1 cargo bench --bench vp8_encode  # add the 1080p frames
 ```
 
+## The VP8 decoder suite (`--bench vp8_decode`)
+
+`benches/vp8_decode.rs` measures the native VP8 software decoder (issue #568)
+whole-frame, and the stages only the decoder runs; the kernels it shares with
+the encoder are timed stage by stage in
+[the VP8 encoder suite](#the-vp8-encoder-suite---bench-vp8_encode). The
+per-stage groups run over a 1280x720 frame's worth of blocks through
+`zvidlib::vp8_decoder_bench`:
+
+| Group | Stage | Site |
+| --- | --- | --- |
+| `vp8_decode_720p` | a key frame and seven inter frames (quarter-sample motion) of a synthetic 1280x720 stream from the native encoder, to the decoded planes | all |
+| `vp8_decode_conformance` | all 18 `vp80-00-comprehensive` vectors, which reach every feature of the format | all |
+| `vp8_decode_stage_subblock_pred` | the ten 4x4 subblock intra predictors | `vp8_decode` |
+| `vp8_decode_stage_dc_idct` | the DC-only inverse DCT, a row of a macroblock's blocks at a time | `vp8_decode` |
+| `vp8_decode_stage_bilinear` | bilinear inter prediction (bitstream versions 1-3), 16x16, 8x8 and 4x4 | `vp8_recon` |
+| `vp8_decode_stage_loop_filter_simple` | the simple loop filter over a frame's luma | `vp8_recon` |
+
+Neither whole-frame group converts to RGBA - that is `vpx_decode`'s
+`vp8_decode_frame` - and both include the serial boolean decoder, so their
+ratios sit below the per-stage ones.
+
+### What they measured when the kernels landed
+
+Criterion point estimates on one AMD64 Windows desktop with AVX2, which was not
+idle: whole-frame arms moved by up to 1.7x between runs, so read the ratios
+rather than the times. The four per-stage rows are the first of two dedicated
+reruns once the host had quietened, which agreed with each other to within 5%
+except one `avx2` arm that the second run caught under load.
+
+| Group | `scalar` | `sse4.1` | `avx2` |
+| --- | ---: | ---: | ---: |
+| `vp8_decode_720p` | 147.6 ms | 89.3 ms (1.65x) | 80.5 ms (1.83x) |
+| `vp8_decode_conformance` | 730.5 ms | 446.2 ms (1.64x) | 484.2 ms (1.51x) |
+| `vp8_decode_stage_subblock_pred` | 1.17 ms | 1.15 ms (1.02x) | 1.09 ms (1.07x) |
+| `vp8_decode_stage_dc_idct` | 914 µs | 743 µs (1.23x) | 739 µs (1.24x) |
+| `vp8_decode_stage_bilinear` | 10.37 ms | 3.70 ms (2.80x) | 3.42 ms (3.03x) |
+| `vp8_decode_stage_loop_filter_simple` | 4.12 ms | 3.15 ms (1.31x) | 3.01 ms (1.37x) |
+
+The two `vp8_decode` kernels are small wins by construction. A 4x4 subblock is
+sixteen bytes, so its kernel works on bytes rather than in 32-bit lanes - every
+directional mode is `avg2`/`avg3` of the edge (`pavgb` / `vrhadd`, `vhadd`) and
+one table lookup (`pshufb` / `tbl`) - and an `I32x` version of it measured 0.65x
+of the scalar code. Best of 30 interleaved rounds with the edges built the way
+the decoder builds them, the kernel alone is 1.15x (`sse4.1`) and 1.20x
+(`avx2`); the stage group's ratio is lower because building those edges is most
+of what it times and is the same on every arm. The DC-only inverse DCT of a
+single block is a loop LLVM already vectorizes, and a vector kernel per block
+measured at parity, so the decoder hands the kernel a whole row of a
+macroblock's DC-only blocks, 16 or 8 samples wide, in one load and store per
+sample row.
+
+```sh
+cargo bench --bench vp8_decode -- vp8_decode_stage   # the stages only
+```
+
 ## The VP9 encoder suite (`--bench vp9_encode`)
 
 `benches/vp9_encode.rs` measures the native VP9 encoder on the same two axes as
@@ -2232,7 +2289,7 @@ job per `[[bench]]` target, each running only its own target with
 crate-wide override reaches the HEVC kernels, is included. Each of those jobs
 uploads its own criterion output, and a single `Benchmark report` job then:
 
-1. reassembles one `target/criterion/` tree and one `bench.log` out of the fourteen
+1. reassembles one `target/criterion/` tree and one `bench.log` out of the fifteen
    partial artifacts, and puts every host and its instruction sets into the job
    summary;
 2. reduces that tree to one small JSON baseline through
@@ -2254,8 +2311,8 @@ time. On one runner the job's wall clock was their sum: on `main` push
 was 11m24s and `av1_encode` 10m29s — two targets, more than half the time, with
 the other seven waiting on them. Fanned out, the wall clock is the slowest
 single target plus its build. The compile check is *not* fanned out, for the
-mirror-image reason: its cost is almost entirely the shared crate build, so fourteen
-copies would pay that fourteen times for one answer.
+mirror-image reason: its cost is almost entirely the shared crate build, so fifteen
+copies would pay that fifteen times for one answer.
 
 The matrix lists its targets by name, which is a second copy of what `Cargo.toml`
 declares, so `tests/ci_benchmarks_run_every_target.rs` asserts the two agree. A
@@ -2264,7 +2321,7 @@ and is simply never measured again, and the only symptom is a baseline that
 stops carrying its groups — which reads as benchmarks that were deleted.
 
 **What this costs is host attribution.** One stored baseline is now a merge
-across fourteen runners rather than one machine's suite, so its `host` field is every
+across fifteen runners rather than one machine's suite, so its `host` field is every
 distinct model observed, joined, and the job summary carries a target-to-model
 table. Nothing in the delta report depended on a single host — `compare` already
 diffs point estimates across two machines from a shared pool, which is why its

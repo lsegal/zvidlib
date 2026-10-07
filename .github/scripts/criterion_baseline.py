@@ -549,7 +549,10 @@ SITE_GROUP_PREFIXES: dict[str, tuple[str, ...]] = {
         "vp8_encode_stage_sixtap",
         "vp8_encode_stage_tm_pred",
         "vp8_encode_stage_loop_filter",
+        "vp8_decode_stage_bilinear",
+        "vp8_decode_stage_loop_filter_simple",
     ),
+    "vp8_decode": ("vp8_decode_stage_subblock_pred", "vp8_decode_stage_dc_idct"),
     "vp9_decode": ("vp9_inverse_", "vp9_mc_", "vp9_intra_", "vp9_loop_filter_"),
     "vp9_encode": ("vp9_encode_",),
     "hevc_prediction_filters": (

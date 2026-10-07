@@ -10,7 +10,7 @@
 //! `predict.rs` and `loop_filter.rs` as the reference and as the fallback on
 //! every other target, `wasm32` included.
 //!
-//! The kernels fall into two dispatch sites, registered with
+//! The kernels fall into three dispatch sites, registered with
 //! [`crate::simd::active_by_site`]:
 //!
 //! - `vp8_encode` ([`encode_isa`]): the encoder-only kernels - [`sad16`],
@@ -24,10 +24,11 @@
 //!   `TM_PRED` ([`tm_predict`]) and the loop filter
 //!   ([`filter_horizontal_edge`], [`filter_vertical_edge`]). The decoder takes
 //!   the same kernels.
-//!
-//! The 4x4 subblock intra predictors stay scalar: each of the ten modes is its
-//! own pattern of averages over at most thirteen edge samples, with no shape a
-//! vector covers, and they write sixteen bytes.
+//! - `vp8_decode` ([`decode_isa`]): the decoder-path kernels the other two do
+//!   not cover (issue #568) - the ten 4x4 subblock intra predictors
+//!   ([`subblock`]) and the DC-only inverse DCT of a row of blocks
+//!   ([`idct_dc_add_row`]). These work on bytes rather than 32-bit lanes; see
+//!   `decode.rs`.
 //!
 //! # Bit-exactness
 //!
@@ -63,6 +64,7 @@
     allow(dead_code, unused_variables, unreachable_code)
 )]
 
+mod decode;
 mod kernels;
 mod sad;
 #[cfg(test)]
@@ -72,6 +74,7 @@ mod tests;
 use crate::av1_simd::vector;
 use crate::simd::SimdIsa;
 
+pub(crate) use decode::{decode_isa, idct_dc_add_row, subblock};
 pub(crate) use kernels::EdgeLimits;
 
 /// The instruction set the `vp8_encode` kernels use.
