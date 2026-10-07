@@ -55,15 +55,19 @@ jobs:
           wasm-pack build --release --target web --out-dir pkg --features web
           (cd pkg && npm pack --pack-destination ../release)
           mv release/zvidlib-*.tgz "release/zvidlib-web-${{ github.ref_name }}.tgz"
-      # `cargo publish --workspace` uploads the packages `cargo package` just
-      # verified, in dependency order (#610). It runs before the GitHub release
-      # is created so a re-run of a failed job repeats both: a package already
-      # on crates.io at this version is left out rather than failing the
-      # upload, so a re-run resumes after a partial publish. A tag pushed
-      # before the token secret exists still gets its GitHub release.
-      # `tests/ci_release_publishes_every_crate.rs` holds the excluded set to
-      # the packages that declare `publish = false`.
+      # `publish_crates.py` uploads every crate `cargo package` just verified,
+      # one at a time in dependency order (#610), pacing them to crates.io's
+      # rate limits and waiting out a 429 rather than failing (#637). It runs
+      # before the GitHub release is created so a re-run of a failed job
+      # repeats both: a crate already on crates.io at this version is skipped,
+      # so a re-run resumes after a partial publish. A tag pushed before the
+      # token secret exists still gets its GitHub release.
+      # `tests/ci_release_publishes_every_crate.rs` holds what it publishes to
+      # the packages that do not declare `publish = false`.
       - name: Publish the crates to crates.io
+        # A first release of a dozen new crates waits about ten minutes
+        # between uploads once crates.io's burst of five is spent.
+        timeout-minutes: 240
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
           TAG: ${{ github.ref_name }}
@@ -72,38 +76,7 @@ jobs:
             echo "::notice::CARGO_REGISTRY_TOKEN is not set, so no crate was published to crates.io."
             exit 0
           fi
-          version="${TAG#v}"
-          packages="$(cargo metadata --no-deps --format-version 1 \
-            | jq -c '[.packages[] | select(.publish != [])]')"
-          # crates.io refuses a package without a license, which would fail
-          # the upload partway through the workspace.
-          unlicensed="$(jq -r '.[] | select(.license == null and .license_file == null) | .name' <<<"$packages")"
-          if [ -n "$unlicensed" ]; then
-            echo "::error::these packages declare no license or license-file, which crates.io requires:"
-            echo "$unlicensed"
-            exit 1
-          fi
-          already=()
-          for name in $(jq -r '.[].name' <<<"$packages"); do
-            # The sparse index path of a name of four or more characters.
-            status="$(curl -sS -o index.json -w '%{http_code}' \
-              "https://index.crates.io/${name:0:2}/${name:2:2}/${name}")"
-            if [ "$status" = 200 ] && jq -s -e --arg v "$version" 'any(.[]; .vers == $v)' index.json >/dev/null; then
-              echo "$name $version is already on crates.io; not publishing it again"
-              already+=(--exclude "$name")
-            elif [ "$status" != 200 ] && [ "$status" != 404 ]; then
-              echo "::error::the crates.io index answered $status for $name"
-              exit 1
-            fi
-          done
-          rm -f index.json
-          if [ "$((${#already[@]} / 2))" = "$(jq length <<<"$packages")" ]; then
-            echo "every crate is already on crates.io at $version"
-            exit 0
-          fi
-          # The packages were verified by the step above, so this does not
-          # build them again.
-          cargo publish --workspace --exclude zvidlib-bench-support "${already[@]}" --locked --no-verify
+          python3 .github/scripts/publish_crates.py --version "${TAG#v}"
       - name: Create the GitHub release with its assets
         env:
           GH_TOKEN: ${{ github.token }}
