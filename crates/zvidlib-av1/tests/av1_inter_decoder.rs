@@ -1,3 +1,7 @@
+//! The native AV1 inter decoder against a standardized vector: an inter stream
+//! with `show_existing_frame` matches its canonical digest, and the reference
+//! store stays bounded by `Limits`.
+
 use zvidlib_av1::Av1InterDecoder;
 use zvidlib_container::FrameDigest;
 use zvidlib_core::{ErrorKind, Limits};

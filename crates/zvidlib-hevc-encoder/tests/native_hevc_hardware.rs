@@ -1,3 +1,9 @@
+//! Accelerated HEVC selection and correctness: which backend `Prefer` and
+//! `Require` select on this host, and on a host with a hardware decoder, that
+//! its pictures match the software decoder's through every seek order; on a
+//! host with a hardware encoder, that its stream muxes and decodes. The tests take turns through the
+//! `hardware` test group in `.config/nextest.toml`.
+
 #![cfg(not(target_arch = "wasm32"))]
 
 use std::future::Future;

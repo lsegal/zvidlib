@@ -742,7 +742,7 @@ length that LLVM vectorizes on its own: **1.89 → 0.97 ms/frame on the `neon` a
 (1.95x) and 1.84 → 0.98 on the `scalar` arm (1.88x)**, taking the whole decode
 from 20.33 to 19.32 ms/frame on `neon` (5.0% faster) and 28.10 to 27.23 on
 `scalar`, and the whole-frame ratio from 1.38x to 1.41x. The arithmetic is
-unchanged and `tests/codec_conformance.rs` passes on its committed per-frame
+unchanged and `crates/zvidlib-hevc-decoder/tests/hevc_conformance.rs` passes on its committed per-frame
 SHA-256 digests, which is what says the samples written are the same ones.
 
 **The isolated benchmark was measuring the wrong blocks.** `hevc_inter_pred` ran
@@ -2151,7 +2151,7 @@ scrub's, and the preview tier is what a scrub was asking for.
 
 **Nothing about the decoded frames changes.** The preview tier is additive and
 opt-in, the reader is untouched, and the 768-frame fixture digests in
-`tests/codec_conformance.rs` and `crates/zvidlib-hevc-encoder/tests/native_hevc_hardware.rs` still hold.
+`crates/zvidlib-hevc-decoder/tests/hevc_conformance.rs` and `crates/zvidlib-hevc-encoder/tests/native_hevc_hardware.rs` still hold.
 
 ### The same seek in a browser
 

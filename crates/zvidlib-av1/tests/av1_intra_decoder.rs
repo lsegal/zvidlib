@@ -1,3 +1,8 @@
+//! The native AV1 intra decoder against a standardized vector: a lossless intra
+//! stream reconstructs the canonical YUV and its transform-size grid filters
+//! the way the vector expects, and malformed and over-budget units fail
+//! explicitly.
+
 use zvidlib_av1::{
     LoopFilterParams, TxSizeGrid, deblock_frame, decode_av1_lossless_intra,
     decode_av1_lossless_intra_with_tx_sizes,

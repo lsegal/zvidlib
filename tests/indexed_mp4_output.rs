@@ -1,3 +1,7 @@
+//! `MediaOutput`'s MP4 index tables round-trip exactly, an empty output stays
+//! consistent, incompatible audio and unsynchronized finishes are rejected,
+//! and sink backpressure and errors reach the caller.
+
 use std::cell::Cell;
 use std::future::Future;
 use std::pin::Pin;

@@ -1,7 +1,7 @@
 //! Hardware VP9 decoding through the registered factory.
 //!
-//! `codec_conformance.rs` holds the factory to libvpx's decode of the VP9
-//! fixtures under `HardwarePreference::Prefer`, which is the hardware decoder
+//! `crates/zvidlib-vp9-decoder/tests/vp9_conformance.rs` holds the factory to
+//! libvpx's decode of the VP9 fixtures under `HardwarePreference::Prefer`, which is the hardware decoder
 //! wherever the host has one. On such a host these tests also require it:
 //! every frame must match the software decoder's, hidden frames and
 //! `show_existing_frame` included, and `ExactFrameReader` must return the

@@ -1,3 +1,8 @@
+//! The platform AAC encoder - AudioToolbox on macOS and Media Foundation on
+//! Windows; Linux has none, so this file is empty there. Its impulse tests are
+//! what hold each backend's reported priming and padding to the access units
+//! it actually emits (#488).
+
 #![cfg(any(target_os = "macos", windows))]
 
 use std::f32::consts::PI;
