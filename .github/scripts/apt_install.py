@@ -11,9 +11,13 @@ This runs `apt-get update` and `apt-get install` under `timeout`, so a stalled
 command is killed, along with the download and dpkg processes it started, after
 a few minutes. A failed or killed attempt is retried a bounded number of times
 after a short pause, finishing any install it interrupted with `dpkg
---configure -a` first. apt itself also retries each failed download and gives
+--configure -a` first. The first retry also drops the first mirror from the
+runner's mirror list, which is where the stalls have come from, so apt fetches
+from the next one instead. apt itself also retries each failed download and gives
 up on a connection that stops sending, so a single stalled request usually
-recovers within the attempt. Every attempt and its outcome is logged.
+recovers within the attempt. Packages are installed without their
+recommendations, which for ffmpeg are mostly video drivers the tests never load
+and only add to the download. Every attempt and its outcome is logged.
 
     apt_install.py libasound2-dev ffmpeg
     apt_install.py --attempts 3 --attempt-timeout 240 libasound2-dev
@@ -25,8 +29,10 @@ without an install step.
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Callable, Sequence
 
@@ -39,6 +45,10 @@ APT_OPTIONS = (
     "-o", "Acquire::https::Timeout=30",
     "-o", "DPkg::Lock::Timeout=120",
 )
+
+# The mirror list GitHub's Ubuntu runners point apt at, one mirror per line in
+# order of preference, starting with Azure's own mirror.
+MIRROR_LIST = "/etc/apt/apt-mirrors.txt"
 
 # `timeout` exits with this status when it had to stop the command.
 TIMED_OUT = 124
@@ -56,12 +66,37 @@ def limited(command: Sequence[str], seconds: int) -> list[str]:
     return ["sudo", "timeout", "--kill-after=30", str(seconds), *command]
 
 
+def drop_first_mirror(path: str, runner: Runner) -> None:
+    """Stop apt from trying the first mirror in the runner's mirror list,
+    when there is another to fall back to.
+
+    apt goes back to the first mirror for every file, so an unresponsive one
+    costs a connection timeout per package: a stalled Azure mirror held each
+    attempt to install ffmpeg's hundred packages past its time limit (#647)."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError:
+        return
+    mirrors = [line for line in lines if line.strip()]
+    if len(mirrors) < 2:
+        return
+    print(f"apt_install: no longer using mirror {mirrors[0].split()[0]}", flush=True)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as f:
+        f.writelines(mirrors[1:])
+    try:
+        runner(["sudo", "cp", f.name, path])
+    finally:
+        os.unlink(f.name)
+
+
 def install(
     packages: Sequence[str],
     attempts: int,
     attempt_timeout: int,
     runner: Runner | None = None,
     sleep: Callable[[float], None] | None = None,
+    mirror_list: str = MIRROR_LIST,
 ) -> bool:
     """Install `packages`, trying up to `attempts` times. Returns whether an
     attempt succeeded."""
@@ -69,13 +104,15 @@ def install(
     sleep = sleep or time.sleep
     commands = {
         "update": ["apt-get", *APT_OPTIONS, "update"],
-        "install": ["apt-get", *APT_OPTIONS, "install", "-y", *packages],
+        "install": ["apt-get", *APT_OPTIONS, "install", "-y", "--no-install-recommends", *packages],
     }
     for attempt in range(1, attempts + 1):
         if attempt > 1:
             pause = 10 * (attempt - 1)
             print(f"apt_install: retrying in {pause} s", flush=True)
             sleep(pause)
+            if attempt == 2:
+                drop_first_mirror(mirror_list, runner)
             # An install killed partway leaves packages unpacked but not
             # configured, which the next `apt-get install` refuses to run past.
             runner(limited(["dpkg", "--configure", "-a"], attempt_timeout))

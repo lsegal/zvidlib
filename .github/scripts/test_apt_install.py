@@ -13,6 +13,8 @@ bounded so a broken install still fails the job.
 from __future__ import annotations
 
 import io
+import os
+import tempfile
 import unittest
 from contextlib import redirect_stdout
 
@@ -24,13 +26,19 @@ class FakeApt:
     """Records each command and answers it from a scripted list of statuses,
     succeeding once the list runs out."""
 
-    def __init__(self, statuses: list[int] | None = None):
+    def __init__(self, statuses: list[int] | None = None, mirror_list: str = "/nonexistent/apt-mirrors.txt"):
+        self.mirror_list = mirror_list
         self.statuses = list(statuses or [])
         self.commands: list[list[str]] = []
         self.slept: list[float] = []
 
     def run(self, command):
         self.commands.append(list(command))
+        if command[:2] == ["sudo", "cp"]:
+            # Stand in for root writing the mirror list.
+            with open(command[2]) as source, open(command[3], "w") as target:
+                target.write(source.read())
+            return 0
         return self.statuses.pop(0) if self.statuses else 0
 
     def sleep(self, seconds: float) -> None:
@@ -39,12 +47,17 @@ class FakeApt:
     def install(self, attempts: int = 3) -> tuple[bool, str]:
         out = io.StringIO()
         with redirect_stdout(out):
-            ok = install(["libasound2-dev", "ffmpeg"], attempts, 240, self.run, self.sleep)
+            ok = install(
+                ["libasound2-dev", "ffmpeg"], attempts, 240, self.run, self.sleep, self.mirror_list
+            )
         return ok, out.getvalue()
 
     def steps(self) -> list[str]:
         """Each command reduced to its apt-get or dpkg action."""
-        return [c[-1] if c[-1] in ("update", "-a") else "install" for c in self.commands]
+        steps = {"update": "update", "-a": "-a"}
+        return [
+            "cp" if c[1] == "cp" else steps.get(c[-1], "install") for c in self.commands
+        ]
 
 
 class InstallTest(unittest.TestCase):
@@ -54,7 +67,9 @@ class InstallTest(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(apt.steps(), ["update", "install"])
         self.assertEqual(apt.slept, [])
-        self.assertEqual(apt.commands[1][-3:], ["-y", "libasound2-dev", "ffmpeg"])
+        self.assertEqual(
+            apt.commands[1][-4:], ["-y", "--no-install-recommends", "libasound2-dev", "ffmpeg"]
+        )
 
     def test_every_command_runs_as_root_under_a_time_limit(self):
         apt = FakeApt([TIMED_OUT])
@@ -97,6 +112,41 @@ class InstallTest(unittest.TestCase):
         )
         self.assertEqual(apt.slept, [10, 20])
         self.assertIn("giving up after 3 attempts", log)
+
+    def test_first_retry_drops_the_first_mirror(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "apt-mirrors.txt")
+            with open(path, "w") as f:
+                f.write(
+                    "http://azure.archive.ubuntu.com/ubuntu/\tpriority:1\n"
+                    "https://archive.ubuntu.com/ubuntu/\tpriority:2\n"
+                    "https://security.ubuntu.com/ubuntu/\tpriority:3\n"
+                )
+            apt = FakeApt([0, TIMED_OUT, 0, 0, TIMED_OUT], mirror_list=path)
+            ok, log = apt.install()
+            with open(path) as f:
+                mirrors = f.read()
+        self.assertTrue(ok)
+        self.assertEqual(
+            apt.steps(),
+            ["update", "install", "cp", "-a", "update", "install", "-a", "update", "install"],
+        )
+        self.assertEqual(
+            mirrors,
+            "https://archive.ubuntu.com/ubuntu/\tpriority:2\n"
+            "https://security.ubuntu.com/ubuntu/\tpriority:3\n",
+        )
+        self.assertIn("no longer using mirror http://azure.archive.ubuntu.com/ubuntu/", log)
+
+    def test_a_single_mirror_is_kept(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "apt-mirrors.txt")
+            with open(path, "w") as f:
+                f.write("https://archive.ubuntu.com/ubuntu/\tpriority:1\n")
+            apt = FakeApt([TIMED_OUT], mirror_list=path)
+            ok, _ = apt.install()
+        self.assertTrue(ok)
+        self.assertNotIn("cp", apt.steps())
 
     def test_main_exit_status_reflects_the_install(self):
         apt = FakeApt([1, 0, 1])
