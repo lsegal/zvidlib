@@ -14,11 +14,17 @@
 # beside other encodes measured them rather than the encoder. A mutex cannot
 # reach across processes, so the group does it instead: one hardware test at a
 # time, per runner, as the separate `cargo test` steps used to guarantee.
+# Every binary that can open a VideoToolbox session on macOS belongs here, not
+# only those that ask for hardware by name: `vp9_conformance` and
+# `preview_index` decode through the registered factories under `Prefer`,
+# which is VideoToolbox on `macos-latest`, and `vp9_conformance` failed
+# `native_hevc_encoder`'s AVFoundation decode when the two overlapped (#624).
 hardware = { max-threads = 1 }
 
 [[profile.default.overrides]]
 filter = '''
     binary(vp9_hardware) | binary(native_hevc_encoder) | binary(native_hevc_hardware)
+    | binary(vp9_conformance) | binary(preview_index)
     | (kind(lib) & test(/videotoolbox|windows_mf|nvdec|media_foundation|audiotoolbox|hardware/))
 '''
 test-group = 'hardware'
