@@ -919,24 +919,22 @@ fn every_package_is_listed_in_the_native_test_job() {
     let workflow = ci_workflow();
     let jobs = jobs(&workflow);
     let packages = workspace::packages();
-    for id in ["native-tests"] {
-        let listed: Vec<&str> = job(&jobs, id)
-            .body
-            .lines()
-            .filter_map(|line| line.trim().strip_prefix("targets "))
-            .filter_map(|rest| rest.split_whitespace().next())
-            .collect();
-        let missing: Vec<&str> = packages
-            .iter()
-            .map(|package| package.name.as_str())
-            .filter(|name| !listed.contains(name))
-            .collect();
-        assert!(
-            missing.is_empty(),
-            "`{id}` lists no `targets` line for these packages, so their library units \
-             never run: {missing:?}"
-        );
-    }
+    let listed: Vec<&str> = job(&jobs, "native-tests")
+        .body
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("targets "))
+        .filter_map(|rest| rest.split_whitespace().next())
+        .collect();
+    let missing: Vec<&str> = packages
+        .iter()
+        .map(|package| package.name.as_str())
+        .filter(|name| !listed.contains(name))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "`native-tests` lists no `targets` line for these packages, so their library units \
+         never run: {missing:?}"
+    );
 }
 
 /// The package names the `changes` job expands `all` to, from its
