@@ -6,8 +6,9 @@
 //! prediction ([`crate::av1_mc`]), AV1 intra prediction
 //! ([`crate::av1_intra_pred`]), the VP8 encoder's distortion metrics, forward
 //! transforms and quantization and the reconstruction and loop filter it shares
-//! with the VP8 decoder, the HEVC engine's inter/intra prediction, in-loop
-//! filters, inverse transforms, encoder-side distortion metrics, and
+//! with the VP8 decoder, the VP9 decoder's inverse transforms, prediction and
+//! loop filter (`crate::vp9_simd`), the HEVC engine's inter/intra prediction,
+//! in-loop filters, inverse transforms, encoder-side distortion metrics, and
 //! encoder-side color conversion, the AV1, VP8 and VP9 decoders' shared output
 //! color conversion ([`crate::av1_filters::convert_to_rgba8`]), the Vorbis
 //! decoder's synthesis (`crate::vorbis_simd`), and the native VP9 encoder's
@@ -53,9 +54,9 @@ static OVERRIDE: AtomicU8 = AtomicU8::new(0);
 /// The override reaches every dispatch family: the AV1 transform and in-loop
 /// filter kernels, AV1 motion compensation (through the default level
 /// [`crate::av1_mc::McContext::new`] picks up), AV1 intra prediction, the VP8
-/// encoder and reconstruction kernels, every HEVC engine kernel, the AV1, VP8
-/// and VP9 output color conversion, the Vorbis decoder's synthesis kernels, and
-/// the VP9 encoder's kernels.
+/// encoder and reconstruction kernels, every VP9 decoder kernel, every HEVC
+/// engine kernel, the AV1, VP8 and VP9 output color conversion, the Vorbis
+/// decoder's synthesis kernels, and the VP9 encoder's kernels.
 /// [`SimdIsa::Scalar`] therefore genuinely reaches the scalar code path rather
 /// than merely the widest scalar-ish one.
 ///
@@ -121,6 +122,7 @@ pub fn available() -> Vec<SimdIsa> {
 /// | `av1_coeff_ctx` | AV1 encoder-side coefficient context derivation (§8.3.2) |
 /// | `vp8_encode` | VP8 encoder-side SAD and SATD, residual and forward DCT, forward WHT and quantization |
 /// | `vp8_recon` | VP8 inverse transforms, inter and `TM_PRED` prediction and loop filter, shared by the encoder and decoder |
+/// | `vp9_decode` | VP9 decoder inverse transforms, inter and intra prediction, and loop filter |
 /// | `vp9_encode` | VP9 encoder forward transforms, quantization, distortion metrics, intra/inter prediction and RGBA8 to YUV420 input conversion |
 /// | `hevc_prediction_filters` | HEVC inter/intra prediction and in-loop filters |
 /// | `hevc_transforms` | HEVC inverse transforms and dequantization |
@@ -147,6 +149,7 @@ pub fn active_by_site() -> Vec<(&'static str, SimdIsa)> {
         ("av1_coeff_ctx", crate::av1_simd::coeff::active_isa()),
         ("vp8_encode", crate::vp8::simd::encode_isa()),
         ("vp8_recon", crate::vp8::simd::recon_isa()),
+        ("vp9_decode", crate::vp9_simd::active_isa()),
         (
             "vp9_encode",
             from_vp9_encode_isa(crate::vp9_encoder::simd::isa()),
@@ -420,6 +423,8 @@ mod tests {
         assert_eq!(crate::vp8::simd::encode_isa(), SimdIsa::Scalar);
         // VP8 reconstruction and loop filter, shared with the decoder.
         assert_eq!(crate::vp8::simd::recon_isa(), SimdIsa::Scalar);
+        // VP9 decoder transforms, prediction and loop filter.
+        assert_eq!(crate::vp9_simd::active_isa(), SimdIsa::Scalar);
         // The VP9 encoder's kernels.
         assert_eq!(vp9_encode::isa(), vp9_encode::Isa::Scalar);
         // HEVC inter/intra prediction and in-loop filters.
@@ -454,6 +459,7 @@ mod tests {
             "av1_coeff_ctx",
             "vp8_encode",
             "vp8_recon",
+            "vp9_decode",
             "vp9_encode",
             "hevc_prediction_filters",
             "hevc_transforms",
@@ -531,6 +537,8 @@ mod tests {
         assert_eq!(crate::vp8::simd::encode_isa(), detected());
         // VP8 reconstruction and loop filter, shared with the decoder.
         assert_eq!(crate::vp8::simd::recon_isa(), detected());
+        // VP9 decoder transforms, prediction and loop filter.
+        assert_eq!(crate::vp9_simd::active_isa(), detected());
         // The VP9 encoder's kernels.
         assert_eq!(vp9_encode::isa() != vp9_encode::Isa::Scalar, vectorized);
         // HEVC inter/intra prediction and in-loop filters.
@@ -578,6 +586,7 @@ mod tests {
             "av1_coeff_ctx",
             "vp8_encode",
             "vp8_recon",
+            "vp9_decode",
             "vp9_encode",
             "hevc_prediction_filters",
             "hevc_transforms",

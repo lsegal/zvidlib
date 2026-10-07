@@ -7,10 +7,11 @@
 //! intermediate value rounds the way the reference decoder's does.
 
 use super::idct1d::{iadst4, iadst8, iadst16, idct4, idct8, idct16, idct32};
+use crate::vp9_simd;
 
-pub(super) const DCT_DCT: u8 = 0;
-pub(super) const ADST_DCT: u8 = 1;
-pub(super) const DCT_ADST: u8 = 2;
+pub(crate) const DCT_DCT: u8 = 0;
+pub(crate) const ADST_DCT: u8 = 1;
+pub(crate) const DCT_ADST: u8 = 2;
 
 #[inline]
 fn clip_pixel_add(dest: u8, residual: i32) -> u8 {
@@ -188,7 +189,35 @@ fn iwht4x4_add(input: &[i32], dest: &mut [u8], stride: usize, eob: usize) {
 /// adds them to the prediction in `dest`, choosing the same kernels as
 /// libvpx's `inverse_transform_block_inter`/`_intra` for the given
 /// end-of-block position.
+///
+/// Runs the vector kernels of [`crate::vp9_simd`] where the host has them,
+/// and [`inverse_transform_add_scalar`], which they reproduce exactly,
+/// everywhere else.
 pub(crate) fn inverse_transform_add(
+    coefficients: &[i32],
+    dest: &mut [u8],
+    stride: usize,
+    tx_size: u8,
+    tx_type: u8,
+    eob: usize,
+    lossless: bool,
+) {
+    if !vp9_simd::inverse_transform_add(
+        vp9_simd::active_isa(),
+        coefficients,
+        dest,
+        stride,
+        tx_size,
+        tx_type,
+        eob,
+        lossless,
+    ) {
+        inverse_transform_add_scalar(coefficients, dest, stride, tx_size, tx_type, eob, lossless);
+    }
+}
+
+/// The scalar reference for [`inverse_transform_add`].
+pub(crate) fn inverse_transform_add_scalar(
     coefficients: &[i32],
     dest: &mut [u8],
     stride: usize,
@@ -275,15 +304,15 @@ pub(crate) fn inverse_transform_add(
 }
 
 /// The prediction mode numbering of the bitstream.
-pub(super) const DC_PRED: u8 = 0;
-pub(super) const V_PRED: u8 = 1;
-pub(super) const H_PRED: u8 = 2;
-pub(super) const D45_PRED: u8 = 3;
-pub(super) const D135_PRED: u8 = 4;
-pub(super) const D117_PRED: u8 = 5;
-pub(super) const D207_PRED: u8 = 7;
-pub(super) const D63_PRED: u8 = 8;
-pub(super) const TM_PRED: u8 = 9;
+pub(crate) const DC_PRED: u8 = 0;
+pub(crate) const V_PRED: u8 = 1;
+pub(crate) const H_PRED: u8 = 2;
+pub(crate) const D45_PRED: u8 = 3;
+pub(crate) const D135_PRED: u8 = 4;
+pub(crate) const D117_PRED: u8 = 5;
+pub(crate) const D207_PRED: u8 = 7;
+pub(crate) const D63_PRED: u8 = 8;
+pub(crate) const TM_PRED: u8 = 9;
 
 #[inline]
 fn avg2(a: u8, b: u8) -> u8 {
@@ -298,15 +327,44 @@ fn avg3(a: u8, b: u8, c: u8) -> u8 {
 /// Edge pixels for one intra prediction: `above[0]` is the above-left
 /// pixel and `above[1..=2 * bs]` the row above, `left[..bs]` the column to
 /// the left.
-pub(super) struct IntraEdges {
-    pub(super) above: [u8; 65],
-    pub(super) left: [u8; 32],
+pub(crate) struct IntraEdges {
+    pub(crate) above: [u8; 65],
+    pub(crate) left: [u8; 32],
 }
 
 /// Fills a `bs`x`bs` block of `dest` with the intra prediction `mode`
 /// (libvpx's `vpx_*_predictor_NxN`, with the DC variant chosen by edge
 /// availability as `build_intra_predictors` does).
-pub(super) fn predict_intra(
+///
+/// Runs the vector kernels of [`crate::vp9_simd`] where the host has them,
+/// and [`predict_intra_scalar`], which they reproduce exactly, everywhere
+/// else.
+pub(crate) fn predict_intra(
+    dest: &mut [u8],
+    stride: usize,
+    bs: usize,
+    mode: u8,
+    edges: &IntraEdges,
+    have_left: bool,
+    have_above: bool,
+) {
+    if !vp9_simd::predict_intra(
+        vp9_simd::active_isa(),
+        dest,
+        stride,
+        bs,
+        mode,
+        &edges.above,
+        &edges.left,
+        have_left,
+        have_above,
+    ) {
+        predict_intra_scalar(dest, stride, bs, mode, edges, have_left, have_above);
+    }
+}
+
+/// The scalar reference for [`predict_intra`].
+pub(crate) fn predict_intra_scalar(
     dest: &mut [u8],
     stride: usize,
     bs: usize,
@@ -494,7 +552,7 @@ pub(super) fn predict_intra(
 }
 
 /// One libvpx `InterpKernel` table: 16 sub-pixel phases of 8 taps.
-pub(super) type Kernel = [[i16; 8]; 16];
+pub(crate) type Kernel = [[i16; 8]; 16];
 
 /// The separable 8-tap convolution of `vpx_convolve8_c` and its scaled
 /// variants, writing `w`x`h` pixels to `dest`. `src[origin]` is the
@@ -507,8 +565,53 @@ pub(super) type Kernel = [[i16; 8]; 16];
 /// A phase-zero tap set is the identity, which is why libvpx's copy and
 /// one-dimensional convolutions give what this would; whole-pixel
 /// directions take those shortcuts here too.
+///
+/// Runs the vector kernels of [`crate::vp9_simd`] where the host has them,
+/// and [`convolve_scalar`], which they reproduce exactly, everywhere else.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn convolve(
+pub(crate) fn convolve(
+    src: &[u8],
+    origin: usize,
+    src_stride: usize,
+    dest: &mut [u8],
+    stride: usize,
+    w: usize,
+    h: usize,
+    kernel: &Kernel,
+    x_frac: i32,
+    x_step: i32,
+    y_frac: i32,
+    y_step: i32,
+    average: bool,
+    temp: &mut [u8; 64 * 135],
+) {
+    if !vp9_simd::convolve(
+        vp9_simd::active_isa(),
+        src,
+        origin,
+        src_stride,
+        dest,
+        stride,
+        w,
+        h,
+        kernel,
+        x_frac,
+        x_step,
+        y_frac,
+        y_step,
+        average,
+        temp,
+    ) {
+        convolve_scalar(
+            src, origin, src_stride, dest, stride, w, h, kernel, x_frac, x_step, y_frac, y_step,
+            average, temp,
+        );
+    }
+}
+
+/// The scalar reference for [`convolve`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn convolve_scalar(
     src: &[u8],
     origin: usize,
     src_stride: usize,

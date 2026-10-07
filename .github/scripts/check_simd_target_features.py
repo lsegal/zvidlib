@@ -18,21 +18,21 @@ checks (issue #341):
 
   * a branch into `core::core_arch`, or a `core::core_arch` symbol defined at
     all - an intrinsic that was not inlined, anywhere in the crate; and
-  * a symbol for an `av1_simd` or `vorbis_simd` generic kernel monomorphized
-    over one of that module's `vector` types - the kernel the wrapper was
+  * a symbol for an `av1_simd`, `vorbis_simd` or `vp9_simd` generic kernel
+    monomorphized over one of the `vector` types - the kernel the wrapper was
     supposed to absorb, left standing on its own.
 
 The first rule is crate-wide and so covers every `#[target_feature]` site the
 crate has, `hevc::engine::simd`, `hevc::engine::transform_simd`,
 `hevc::color_convert`, `yuv_to_rgba`, `av1_mc` and the VP8 SAD included: an
 out-of-line intrinsic call is the same defect wherever it appears. The second
-covers the modules that dispatch through generic kernels: `av1_simd`,
-`vorbis_simd` (issue #572) and `vp8::simd` (issue #569). `vp8::simd`
-instantiates its kernels over `av1_simd`'s vector types, so its kernels'
-symbols carry the `av1_simd` path of their vector argument and the `av1_simd`
-rule matches them. The other sites write their intrinsics directly inside the
-`#[target_feature]` function, where there is no separate body for the inliner
-to leave behind.
+covers the modules that dispatch through generic kernels, `av1_simd`,
+`vorbis_simd` (issue #572), `vp9_simd` (issue #570) and `vp8::simd` (issue
+#569). The last two are written over the `av1_simd` vector types, so a
+`vp8::simd` kernel's symbol carries the `av1_simd` path of its vector argument
+and the `av1_simd` rule matches it. The other sites write their intrinsics
+directly inside the `#[target_feature]` function, where there is no separate
+body for the inliner to leave behind.
 
     build --target-dir target/simd-feature-check
     check --asm path/to/crate.s
@@ -78,8 +78,8 @@ BRANCH = re.compile(r"^\s+(call|callq|jmp|jmpq|bl|b)\s+([^\s;#]+)")
 # comment from reading as a symbol.
 CORE_ARCH = re.compile(r"9core_arch")
 AV1_SIMD = re.compile(r"8av1_simd")
-# The modules whose kernels are generic over a `vector` type of their own.
-GENERIC_KERNEL_MODULE = re.compile(r"8av1_simd|11vorbis_simd")
+# The modules whose kernels are generic over a `vector` type.
+GENERIC_KERNEL_MODULE = re.compile(r"8av1_simd|11vorbis_simd|8vp9_simd")
 VECTOR_TYPE = re.compile(r"6vector3(x86|arm)")
 
 # A crate disambiguator (`Cs7lEMBtiCmc_`) and a legacy mangling hash
@@ -146,8 +146,8 @@ def is_core_arch(symbol: str) -> bool:
 
 
 def is_outlined_kernel(symbol: str) -> bool:
-    """True for an `av1_simd` or `vorbis_simd` item monomorphized over one of
-    that module's `vector` types, which includes a `vp8::simd` kernel
+    """True for an `av1_simd`, `vorbis_simd` or `vp9_simd` item monomorphized
+    over one of the `vector` types, which includes a `vp8::simd` kernel
     instantiated over an `av1_simd` vector type.
 
     That combination only occurs for a generic kernel instantiation, in
