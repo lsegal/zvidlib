@@ -26,7 +26,15 @@ fn block_on<T>(future: impl Future<Output = T>) -> T {
 }
 
 #[test]
-fn native_hevc_decoder_conforms_for_sequential_reverse_and_alternating_seeks() {
+fn native_hevc_decoder_matches_an_independent_decode_of_the_bundled_sample() {
+    // The bundled 1080p sample has a single random-access point, so
+    // `verify_video_decoder_conformance`'s reverse and alternating patterns
+    // would re-decode it from the start for nearly every frame - close to
+    // 300,000 1080p pictures, which never finished on a CI runner once this
+    // file was run (#599). As the AV1 colour sample below does, every frame is
+    // checked in order instead, followed by backward and forward seeks. The
+    // three patterns still run for HEVC Main on the 32-frame groups of
+    // `bbb_hevc_512x288_gop32.mp4`, in `src/hevc/mod.rs`.
     let expected = include_str!("fixtures/codec/big_buck_bunny_hevc_rgba.sha256")
         .lines()
         .map(|line| {
@@ -59,13 +67,25 @@ fn native_hevc_decoder_conforms_for_sequential_reverse_and_alternating_seeks() {
     assert!(vector.samples[0].random_access);
     assert!(!vector.configuration.configuration.is_empty());
 
-    let report =
-        verify_video_decoder_conformance(&native_hevc_video_decoder_factory(), &vector, limits)
-            .unwrap();
-    assert_eq!(report.frames_verified, 2304);
-    assert_eq!(report.access_patterns_verified, 3);
-
     let factory = native_hevc_video_decoder_factory();
+    let mut reader = ExactFrameReader::new(
+        &factory,
+        vector.configuration.clone(),
+        vector.samples.clone(),
+        limits,
+    )
+    .unwrap();
+    let cancellation = CancellationToken::new();
+    let order = (0..768).chain([5, 400, 401, 3]);
+    for index in order {
+        let frame = reader.get(FrameIndex(index), &cancellation).unwrap();
+        assert_eq!(
+            FrameDigest::from_frame(&frame).unwrap(),
+            expected[index as usize],
+            "frame {index}"
+        );
+    }
+
     let mut decoder = factory.create(&vector.configuration, &limits).unwrap();
     let malformed = EncodedVideoSample {
         presentation_index: FrameIndex(0),
