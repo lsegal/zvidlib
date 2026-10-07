@@ -1,0 +1,20 @@
+[package]
+name = "zvidlib-container"
+description = "MP4 and WebM muxing and demuxing for zvidlib"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+# Tests, their fixtures and benchmarks are not needed to build the crate.
+exclude = ["/tests"]
+
+[dependencies]
+zvidlib-core = { workspace = true }
+zvidlib-opus = { workspace = true }
+zvidlib-vorbis-decoder = { workspace = true }
+zvidlib-av1-syntax = { workspace = true }
+
+[dev-dependencies]
+zvidlib-av1-decoder = { path = "../zvidlib-av1-decoder" }

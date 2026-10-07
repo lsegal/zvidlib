@@ -3,7 +3,7 @@
 //!
 //! # There is no audio encoder in this crate to benchmark
 //!
-//! [`zvidlib::AudioEncoder`] (`src/codec.rs`) is a trait with no implementation
+//! [`zvidlib::AudioEncoder`] (`crates/zvidlib-core/src/codec.rs`) is a trait with no implementation
 //! anywhere in the tree. Its only implementor is `PcmFixtureEncoder` in
 //! `tests/indexed_mp4_output.rs`, a test double that packages PCM sample ranges
 //! into `EncodedSample`s without compressing anything. So "benchmark the audio
@@ -11,7 +11,7 @@
 //!
 //! That is now settled rather than open: the crate ships no audio encoder on
 //! purpose, and `AudioEncoder` stays the seam that platform and browser backends
-//! fill. The rationale is recorded on the trait itself in `src/codec.rs` and in
+//! fill. The rationale is recorded on the trait itself in `crates/zvidlib-core/src/codec.rs` and in
 //! the README. The practical consequence for this suite is that there will be no
 //! audio-encode target to add later unless that decision is revisited, so nothing
 //! here is a placeholder waiting on one.

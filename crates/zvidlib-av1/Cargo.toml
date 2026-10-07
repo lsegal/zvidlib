@@ -1,0 +1,34 @@
+[package]
+name = "zvidlib-av1"
+description = "AV1 coding tools shared by zvidlib's AV1 encoder and reference decoders"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+# Tests, their fixtures and benchmarks are not needed to build the crate.
+exclude = ["/tests", "/benches"]
+
+[dependencies]
+zvidlib-core = { workspace = true }
+zvidlib-color = { workspace = true }
+zvidlib-av1-syntax = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+zvidlib-bench-support = { path = "../zvidlib-bench-support" }
+zvidlib-container = { path = "../zvidlib-container" }
+
+[features]
+# Additive, off by default, and gating no code: the benchmark harness folds it
+# into every criterion group name (`simd=off` / `simd=on`), as zvidlib's own
+# `simd` feature does, so the two arms are recorded separately.
+simd = []
+
+# Criterion drives its own harness (`harness = false`), so the bench targets must
+# not link libtest. Every group of this target shares one process so the
+# `benches/support/` fixture cache is loaded and decoded once.
+[[bench]]
+name = "codec"
+harness = false

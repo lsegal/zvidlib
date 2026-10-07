@@ -8,7 +8,7 @@
 # run` gets it too; CI's `--profile ci` adds its own overrides on top.
 
 [test-groups]
-# `tests/vp9_hardware.rs` and `tests/native_hevc_encoder.rs` take turns through
+# `vp9_hardware` and `native_hevc_encoder` take turns through
 # an in-process mutex, because the `macos-latest` runner's VideoToolbox fails a
 # decode while another session decodes (#565, #580) and a hardware encode timed
 # beside other encodes measured them rather than the encoder. A mutex cannot
@@ -19,7 +19,7 @@ hardware = { max-threads = 1 }
 [[profile.default.overrides]]
 filter = '''
     binary(vp9_hardware) | binary(native_hevc_encoder) | binary(native_hevc_hardware)
-    | (binary_id(zvidlib) & test(/videotoolbox|windows_mf|nvdec|media_foundation|audiotoolbox|hardware/))
+    | (kind(lib) & test(/videotoolbox|windows_mf|nvdec|media_foundation|audiotoolbox|hardware/))
 '''
 test-group = 'hardware'
 
@@ -29,8 +29,8 @@ test-group = 'hardware'
 # reserves every slot, so nothing else runs while it is timed.
 [[profile.default.overrides]]
 filter = '''
-    (binary_id(zvidlib) & test(=av1_mc::tests::simd_backends_outrun_the_scalar_kernels))
-    | (binary_id(zvidlib) & test(=codec::tests::a_seek_to_any_position_answers_inside_the_latency_budget))
+    (binary_id(zvidlib-av1) & test(=av1_mc::tests::simd_backends_outrun_the_scalar_kernels))
+    | (binary_id(zvidlib-core) & test(=codec::tests::a_seek_to_any_position_answers_inside_the_latency_budget))
     | (binary(native_hevc_encoder) & test(=hardware_encodes_1080p30_faster_than_real_time))
 '''
 threads-required = 'num-cpus'
@@ -50,6 +50,7 @@ failure-output = 'immediate-final'
 filter = '''
     binary(vp9_hardware) | binary(native_hevc_hardware) | binary(native_hevc_encoder)
     | binary(vp8_conformance) | binary(native_aac_encoder) | binary(native_aac_decoder)
-    | (binary_id(zvidlib) & test(/^av1_mc::|^av1_simd::|libvpx/))
+    | (binary_id(zvidlib-av1) & test(/^av1_mc::|^av1_simd::/))
+    | (kind(lib) & test(/libvpx/))
 '''
 success-output = 'immediate'

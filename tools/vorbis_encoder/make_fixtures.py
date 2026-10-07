@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Capture unit-test fixtures from the C reference encoder.
 
-Writes src/vorbis_encoder/test_fixtures.rs (test-only data, @generated):
+Writes crates/zvidlib-vorbis-encoder/src/vorbis_encoder/test_fixtures.rs (test-only data, @generated):
 
 * HEADERS: identification + comment header bytes and setup-header length /
   FNV-1a-64 hash for a few configurations (build_ref.sh's ref_enc_posix);
@@ -35,7 +35,7 @@ def fnv64(data, h=0xCBF29CE484222325):
 
 
 def synth(frames, channels, seed):
-    """Must match `synth` in src/vorbis_encoder/tests.rs bit for bit."""
+    """Must match `synth` in crates/zvidlib-vorbis-encoder/src/vorbis_encoder/tests.rs bit for bit."""
     out = np.zeros(frames * channels, dtype=np.float32)
     state = seed & 0xFFFFFFFF
     k = 0
@@ -124,7 +124,9 @@ def main():
             q = "Some(%s_f32)" % np.format_float_positional(v, unique=True, trim="0")
         lines.append("    (%s, %s, %s, %s)," % (f[0], f[1], f[2], q))
     lines.append("];")
-    path = os.path.join(ROOT, "src", "vorbis_encoder", "test_fixtures.rs")
+    path = os.path.join(
+        ROOT, "crates", "zvidlib-vorbis-encoder", "src", "vorbis_encoder", "test_fixtures.rs"
+    )
     with open(path, "w", newline="\n") as fh:
         fh.write("\n".join(lines) + "\n")
     print("wrote", path)

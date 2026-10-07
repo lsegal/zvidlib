@@ -28,12 +28,13 @@
 //!
 //! # What is on the clock
 //!
-//! [`ExactFrameReader`] construction is *not*: `benches/hevc_hardware.rs`
-//! already measures session setup as its own arm, and folding it in here would
-//! mix a one-time driver cost into a per-seek one. Each iteration builds a fresh
-//! reader off the clock — so no cache, no decoder position, nothing warm — and
-//! times a single [`ExactFrameReader::get`] to the target frame. That is exactly
-//! the cold seek a caller pays when a user drops the playhead somewhere new.
+//! [`ExactFrameReader`] construction is *not*:
+//! `crates/zvidlib-hevc-decoder/benches/hevc_hardware.rs` already measures
+//! session setup as its own arm, and folding it in here would mix a one-time
+//! driver cost into a per-seek one. Each iteration builds a fresh reader off
+//! the clock — so no cache, no decoder position, nothing warm — and times a
+//! single [`ExactFrameReader::get`] to the target frame. That is exactly the
+//! cold seek a caller pays when a user drops the playhead somewhere new.
 //!
 //! # The preview arm
 //!
@@ -71,7 +72,8 @@ const TARGET_DENOMINATOR: u64 = 5;
 /// Environment variable that opts into the slow software arms.
 ///
 /// Shared with the other groups that decode a whole group of pictures through
-/// the software decoder; see `benches/hevc_decode.rs`. A single `raps=1`
+/// the software decoder; see
+/// `crates/zvidlib-hevc-decoder/benches/hevc_decode.rs`. A single `raps=1`
 /// software seek decodes 613 pictures, which is minutes rather than seconds, so
 /// it is not part of a default `cargo bench` run.
 const LARGE_GROUP_ENV: &str = "ZVIDLIB_BENCH_LARGE";

@@ -1,13 +1,70 @@
-[package]
-name = "zvidlib"
+# The library is split into a workspace of codec, container and shared-core
+# crates (#604) so a change to one codec recompiles, tests and benchmarks only
+# that codec and what depends on it. `zvidlib` is still the only crate a user
+# depends on: it re-exports the subcrates' public items under the paths they
+# always had. Every library crate here is published alongside it, at the same
+# version, which is why each workspace dependency below pins the version
+# exactly as well as the path.
+[workspace]
+members = ["crates/*"]
+
+[workspace.package]
 version = "0.3.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Frame-accurate video and audio I/O for native and WebAssembly applications"
 repository = "https://github.com/lsegal/zvidlib"
-readme = "README.md"
 keywords = ["video", "audio", "webassembly", "webgl", "mp4"]
 categories = ["multimedia", "wasm"]
+
+[workspace.dependencies]
+zvidlib-build = { path = "crates/zvidlib-build", version = "=0.3.0" }
+zvidlib-core = { path = "crates/zvidlib-core", version = "=0.3.0" }
+zvidlib-color = { path = "crates/zvidlib-color", version = "=0.3.0" }
+zvidlib-av1-syntax = { path = "crates/zvidlib-av1-syntax", version = "=0.3.0" }
+zvidlib-av1 = { path = "crates/zvidlib-av1", version = "=0.3.0" }
+zvidlib-av1-decoder = { path = "crates/zvidlib-av1-decoder", version = "=0.3.0" }
+zvidlib-av1-encoder = { path = "crates/zvidlib-av1-encoder", version = "=0.3.0" }
+zvidlib-vp9-syntax = { path = "crates/zvidlib-vp9-syntax", version = "=0.3.0" }
+zvidlib-hevc-syntax = { path = "crates/zvidlib-hevc-syntax", version = "=0.3.0" }
+zvidlib-hardware = { path = "crates/zvidlib-hardware", version = "=0.3.0" }
+zvidlib-vp8 = { path = "crates/zvidlib-vp8", version = "=0.3.0" }
+zvidlib-vp9-decoder = { path = "crates/zvidlib-vp9-decoder", version = "=0.3.0" }
+zvidlib-vp9-encoder = { path = "crates/zvidlib-vp9-encoder", version = "=0.3.0" }
+zvidlib-hevc-decoder = { path = "crates/zvidlib-hevc-decoder", version = "=0.3.0" }
+zvidlib-hevc-encoder = { path = "crates/zvidlib-hevc-encoder", version = "=0.3.0" }
+zvidlib-opus = { path = "crates/zvidlib-opus", version = "=0.3.0" }
+zvidlib-vorbis-decoder = { path = "crates/zvidlib-vorbis-decoder", version = "=0.3.0" }
+zvidlib-vorbis-encoder = { path = "crates/zvidlib-vorbis-encoder", version = "=0.3.0" }
+zvidlib-aac-encoder = { path = "crates/zvidlib-aac-encoder", version = "=0.3.0" }
+zvidlib-container = { path = "crates/zvidlib-container", version = "=0.3.0" }
+
+criterion = { version = "0.7", features = ["html_reports"] }
+opus-pure = "0.2.2"
+symphonia-core = "0.5.5"
+libloading = "0.8.9"
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+] }
+apple-cf = { version = "0.9.3", default-features = false, features = ["cm", "cv"] }
+videotoolbox = { version = "0.18.1", default-features = false, features = ["decompression"] }
+
+[package]
+name = "zvidlib"
+description = "Frame-accurate video and audio I/O for native and WebAssembly applications"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
 # Integration fixtures and browser demo videos are not needed to build the
 # published crate. Keep the MP4 sample used by the library's inline tests.
 exclude = ["/tests", "/examples/media/BigBuckBunny.av1.mp4", "/examples/web_canvas/*.mp4"]
@@ -38,52 +95,9 @@ path = "examples/native_encode.rs"
 required-features = ["native"]
 
 # Criterion drives its own harness (`harness = false`), so the bench targets must
-# not link libtest. Every codec group lives in this one target so the shared
-# `benches/support/` fixture cache is loaded and decoded once per process.
-[[bench]]
-name = "codec"
-path = "benches/codec.rs"
-harness = false
-
-# The AV1 software decoder's own scalar-vs-SIMD suite. It is a separate target
-# because its per-stage groups and its whole-frame decode are slower than the
-# shared fast groups above and deserve to be runnable on their own; it shares
-# `benches/support/` with them.
-[[bench]]
-name = "av1_decode"
-path = "benches/av1_decode.rs"
-harness = false
-
-# The AV1 encoder's own scalar-vs-SIMD suite. Encoder kernels are measured
-# separately from `av1_decode` so neither target's name overstates its scope,
-# and separately from `codec` because it shares none of that target's
-# decoded-frame fixtures.
-[[bench]]
-name = "av1_encode"
-path = "benches/av1_encode.rs"
-harness = false
-
-# The VP9 software decoder's own scalar-vs-SIMD suite: whole-frame decode and
-# every stage the `vp9_decode` dispatch site vectorizes. A separate target for
-# the same reasons as `av1_decode`; it shares `benches/support/` with the rest.
-[[bench]]
-name = "vp9_decode"
-path = "benches/vp9_decode.rs"
-harness = false
-
-[[bench]]
-name = "hevc_decode"
-path = "benches/hevc_decode.rs"
-harness = false
-
-# The native Vorbis encoder's scalar-vs-SIMD suite (issue #573): whole encodes
-# through the public factory, one arm per instruction set. Synthetic input
-# only, so it shares nothing with `codec`'s decoded-fixture cache.
-[[bench]]
-name = "vorbis_encode"
-path = "benches/vorbis_encode.rs"
-harness = false
-
+# not link libtest. These are the targets that measure zvidlib as a whole; each
+# codec's own targets live in its crate (#604).
+#
 # The audio decode path is a separate target rather than another group in
 # `codec`: it shares `benches/support/` but none of `codec`'s decoded-frame
 # fixtures, and issue #152 specifies `cargo bench --bench audio_decode` as its
@@ -93,24 +107,6 @@ name = "audio_decode"
 path = "benches/audio_decode.rs"
 harness = false
 
-# The HEVC encoder benchmarks are their own target: they use only the synthetic
-# inputs from `benches/support`, never the decoded-fixture cache the `codec`
-# target exists to share, and the encoder's mode search is slow enough that it is
-# worth keeping out of that target's default run.
-[[bench]]
-name = "hevc_encode"
-path = "benches/hevc_encode.rs"
-harness = false
-
-# The native VP9 encoder, whole-frame and per stage, scalar versus SIMD
-# (#571). Its own target for the same reasons as `hevc_encode`: synthetic
-# inputs only, and a rate-distortion search slow enough to keep out of the
-# other targets' default runs.
-[[bench]]
-name = "vp9_encode"
-path = "benches/vp9_encode.rs"
-harness = false
-
 # The audio write/read path is a separate target rather than another group in
 # `codec`: it shares `benches/support/` but none of `codec`'s decoded-frame
 # fixtures, and issue #153 specifies `cargo bench --bench audio_mux` as its
@@ -118,33 +114,6 @@ harness = false
 [[bench]]
 name = "audio_mux"
 path = "benches/audio_mux.rs"
-harness = false
-
-# The platform hardware HEVC decoders against the software one. A separate
-# target because it measures the OS/driver decoders rather than any of the
-# crate's own kernels, so it shares none of the scalar-vs-SIMD machinery the
-# other targets are built around, and because it is the only target that skips
-# itself outright on a host without the hardware it measures.
-[[bench]]
-name = "hevc_hardware"
-path = "benches/hevc_hardware.rs"
-harness = false
-
-# The VP8 software decoder's scalar-vs-SIMD suite (issue #568): its whole-frame
-# decode and the stages only the decoder runs. The kernels it shares with the
-# encoder are timed by `vp8_encode`.
-[[bench]]
-name = "vp8_decode"
-path = "benches/vp8_decode.rs"
-harness = false
-
-# The native VP8 encoder's scalar-vs-SIMD suite: whole frames through the
-# public encoder and each of its `vp8_encode` and `vp8_recon` kernels. Its own
-# target for the same reason as `av1_encode`: it shares none of `codec`'s
-# decoded-frame fixtures, and its name says what it measures.
-[[bench]]
-name = "vp8_encode"
-path = "benches/vp8_encode.rs"
 harness = false
 
 # Issue #395's measurement: what an exact frame at an arbitrary point of a track
@@ -166,6 +135,9 @@ name = "vpx_decode"
 path = "benches/vpx_decode.rs"
 harness = false
 
+[build-dependencies]
+zvidlib-build = { workspace = true }
+
 [features]
 default = []
 # Additive, off by default. The crate's SIMD kernels dispatch at run time rather
@@ -184,12 +156,25 @@ web = [
 ]
 
 [dependencies]
-# Pure-Rust Opus decoding (a port of libopus 1.6), and the DSP and bit readers
-# the Vorbis decoder vendored in `src/vorbis_decoder/` builds on. Both build for
-# `wasm32` as well as native targets, so the browser build's software audio
-# fallback runs the same decoders native callers do.
-opus-pure = "0.2.2"
-symphonia-core = "0.5.5"
+zvidlib-core = { workspace = true }
+zvidlib-color = { workspace = true }
+zvidlib-av1-syntax = { workspace = true }
+zvidlib-av1 = { workspace = true }
+zvidlib-av1-decoder = { workspace = true }
+zvidlib-av1-encoder = { workspace = true }
+zvidlib-vp9-syntax = { workspace = true }
+zvidlib-hevc-syntax = { workspace = true }
+zvidlib-hardware = { workspace = true }
+zvidlib-vp8 = { workspace = true }
+zvidlib-vp9-decoder = { workspace = true }
+zvidlib-vp9-encoder = { workspace = true }
+zvidlib-hevc-decoder = { workspace = true }
+zvidlib-hevc-encoder = { workspace = true }
+zvidlib-opus = { workspace = true }
+zvidlib-vorbis-decoder = { workspace = true }
+zvidlib-vorbis-encoder = { workspace = true }
+zvidlib-aac-encoder = { workspace = true }
+zvidlib-container = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 js-sys = { version = "0.3.104", optional = true }
@@ -248,7 +233,8 @@ web-sys = { version = "0.3.104", optional = true, features = [
 wasm-bindgen-test = "0.3.77"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-criterion = { version = "0.7", features = ["html_reports"] }
+criterion = { workspace = true }
+zvidlib-bench-support = { path = "crates/zvidlib-bench-support" }
 glow = "0.18.0"
 glutin = "0.32.3"
 glutin-winit = "0.5.0"
@@ -263,25 +249,10 @@ cpal = "0.15.3"
 # only Linux and the other native targets carry Symphonia's (issue #561).
 [target.'cfg(not(any(target_arch = "wasm32", target_os = "macos", windows)))'.dependencies]
 symphonia-codec-aac = "0.5.5"
-
-[target.'cfg(any(windows, target_os = "linux"))'.dependencies]
-libloading = "0.8.9"
+symphonia-core = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.62.2", features = [
-    "Win32_Foundation",
-    "Win32_Graphics_Direct3D",
-    "Win32_Graphics_Direct3D11",
-    "Win32_Graphics_Dxgi_Common",
-    "Win32_Media_MediaFoundation",
-    "Win32_System_Com",
-    "Win32_System_Ole",
-    "Win32_System_Variant",
-] }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-apple-cf = { version = "0.9.3", default-features = false, features = ["cm", "cv"] }
-videotoolbox = { version = "0.18.1", default-features = false, features = ["decompression"] }
+windows = { workspace = true }
 
 # The native HEVC/AV1 decoders are pure-Rust software codecs with no fast path at opt-level 0,
 # so an unoptimized debug build is unusably slow. opt-level 2 keeps debug assertions and fast

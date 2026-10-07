@@ -1,0 +1,2309 @@
+use crate::{
+    AudioBuffer, Codec, ColorRange, Error, ErrorKind, FrameIndex, FrameSource, Limits, PixelFormat,
+    Plane, Result, VideoDimensions, VideoFrame,
+};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+/// A non-`Send` encoder future that works on native and single-threaded WASM.
+pub type EncoderFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + 'a>>;
+
+/// The kind of media carried by an encoded track.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TrackKind {
+    Video,
+    Audio,
+}
+
+/// Dependency information written to the MP4 sample dependency table.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SampleDependency {
+    pub is_leading: u8,
+    pub depends_on: u8,
+    pub is_depended_on: u8,
+    pub has_redundancy: u8,
+}
+
+impl SampleDependency {
+    pub const INDEPENDENT: Self = Self {
+        is_leading: 0,
+        depends_on: 2,
+        is_depended_on: 0,
+        has_redundancy: 0,
+    };
+
+    pub const DEPENDENT: Self = Self {
+        is_leading: 0,
+        depends_on: 1,
+        is_depended_on: 0,
+        has_redundancy: 0,
+    };
+
+    #[doc(hidden)]
+    pub fn to_sdtp(self) -> u8 {
+        ((self.is_leading & 3) << 6)
+            | ((self.depends_on & 3) << 4)
+            | ((self.is_depended_on & 3) << 2)
+            | (self.has_redundancy & 3)
+    }
+}
+
+/// One encoded access unit with exact decode and presentation timing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EncodedSample {
+    pub data: Vec<u8>,
+    pub dts: i64,
+    pub pts: i64,
+    pub duration: u32,
+    pub is_sync: bool,
+    pub dependency: SampleDependency,
+}
+
+/// Codec and sample-entry information needed to declare an MP4 track.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EncoderConfig {
+    pub codec: Codec,
+    pub timescale: u32,
+    /// Complete codec configuration box, including its size and fourcc.
+    pub decoder_config: Vec<u8>,
+}
+
+/// Video format accepted by a video encoder.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VideoEncoderFormat {
+    pub dimensions: VideoDimensions,
+    pub pixel_format: PixelFormat,
+}
+
+/// Audio format accepted by an audio encoder.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AudioEncoderFormat {
+    pub sample_rate: u32,
+    pub channels: u16,
+}
+
+/// Gapless audio metadata produced when an encoder is drained.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AudioGapless {
+    pub priming: u32,
+    pub padding: u32,
+}
+
+/// Packets and metadata emitted while draining an audio encoder.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AudioDrain {
+    pub samples: Vec<EncodedSample>,
+    pub gapless: AudioGapless,
+}
+
+/// Backend-neutral video encoder contract.
+pub trait VideoEncoder {
+    fn config(&self) -> &EncoderConfig;
+    fn format(&self) -> VideoEncoderFormat;
+    /// Whether this encoder runs on dedicated hardware or in software.
+    ///
+    /// A factory's [`VideoEncoderFactory::capability`] answers the same
+    /// question before an encoder exists; this is the answer for the encoder
+    /// actually created, which can differ when a backend that probed as
+    /// available fails to start and a `Prefer` factory falls back. The
+    /// default is `Software`, which is what every encoder that does not
+    /// override it is.
+    fn implementation(&self) -> CodecImplementation {
+        CodecImplementation::Software
+    }
+    /// A human-readable name for the backend doing the encoding, such as a
+    /// Media Foundation encoder's friendly name. For logs and diagnostics
+    /// only; it is not stable across platforms, drivers or releases.
+    fn backend_name(&self) -> &str {
+        "zvidlib"
+    }
+    fn encode<'a>(
+        &'a mut self,
+        index: FrameIndex,
+        frame: FrameSource<'a>,
+    ) -> EncoderFuture<'a, Vec<EncodedSample>>;
+    fn finish<'a>(&'a mut self) -> EncoderFuture<'a, Vec<EncodedSample>>;
+}
+
+/// Backend-neutral audio encoder contract.
+///
+/// # Where the audio encoders come from
+///
+/// zvidlib writes no audio codec of its own design. Each encoder behind this
+/// trait is either the platform's or a faithful port of the codec's reference
+/// encoder, so the quality a caller gets is the reference's rather than a
+/// reimplementation's:
+///
+/// * AAC-LC: `native_aac_audio_encoder_factory` delegates to the operating
+///   system's encoder, AudioToolbox on macOS and Media Foundation on Windows,
+///   and reports `HardwareUnavailable` elsewhere; the browser build encodes
+///   through `WebCodecs`. A pure-Rust AAC-LC encoder is a large subsystem in
+///   its own right -- filter bank, psychoacoustic model, quantization and rate
+///   control -- with no open reference implementation to port, and the
+///   platforms already have good ones (issue #174).
+/// * Opus: `native_opus_audio_encoder_factory` runs `opus-pure`, a pure-Rust
+///   port of libopus, on every target; the browser build can also encode
+///   through `WebCodecs`.
+/// * Vorbis: `native_vorbis_audio_encoder_factory` runs zvidlib's own port of
+///   the libvorbis 1.3.7 encoder, whose packets are bit-identical to
+///   libvorbis's for the same input and quality.
+///
+/// The concern behind issue #174 was that a mediocre encoder shipped under
+/// this crate's name is worse for callers than none, because it is harder to
+/// route around. A port of the reference encoder answers that concern where an
+/// original design could not. `crate::MediaOutput` muxes an audio track
+/// given any `AudioEncoder`, so a caller with an encoder of its own still
+/// plugs it in here.
+pub trait AudioEncoder {
+    fn config(&self) -> &EncoderConfig;
+    fn format(&self) -> AudioEncoderFormat;
+    fn encode<'a>(
+        &'a mut self,
+        index: FrameIndex,
+        buffer: AudioBuffer,
+    ) -> EncoderFuture<'a, Vec<EncodedSample>>;
+    fn finish<'a>(&'a mut self) -> EncoderFuture<'a, AudioDrain>;
+}
+
+/// A normalized codec profile that can be compared across backend implementations.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum CodecProfile {
+    UncompressedGray8,
+    HevcMain,
+    HevcMain10,
+    Av1Main,
+    Av1High,
+    Av1Professional,
+    /// VP8 has a single profile; the bitstream version each frame carries
+    /// selects its reconstruction and loop filters.
+    Vp8,
+    /// VP9 profile 0: 8-bit 4:2:0.
+    Vp9Profile0,
+    /// VP9 profile 1: 8-bit 4:2:2, 4:4:0 or 4:4:4.
+    Vp9Profile1,
+    /// VP9 profile 2: 10- or 12-bit 4:2:0.
+    Vp9Profile2,
+    /// VP9 profile 3: 10- or 12-bit 4:2:2, 4:4:0 or 4:4:4.
+    Vp9Profile3,
+    AacLowComplexity,
+    /// Opus has a single profile.
+    Opus,
+    /// Vorbis I has a single profile.
+    Vorbis,
+}
+
+/// Whether a caller permits or requires a hardware codec implementation.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum HardwarePreference {
+    Require,
+    Prefer,
+    Avoid,
+}
+
+/// The implementation class selected by a codec factory.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum CodecImplementation {
+    Software,
+    Hardware,
+}
+
+/// The result of querying a factory with a complete normalized configuration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum CodecSupport {
+    Supported { implementation: CodecImplementation },
+    UnsupportedCodec,
+    UnsupportedProfile,
+    InvalidConfiguration { reason: String },
+    HardwareUnavailable,
+}
+
+impl CodecSupport {
+    pub const fn is_supported(&self) -> bool {
+        matches!(self, Self::Supported { .. })
+    }
+}
+
+/// Backend-neutral video decoder configuration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VideoDecoderConfig {
+    pub codec: Codec,
+    pub profile: CodecProfile,
+    pub coded_dimensions: VideoDimensions,
+    pub output_format: PixelFormat,
+    pub color_range: ColorRange,
+    pub hardware: HardwarePreference,
+    /// Container configuration bytes in the codec's standardized format.
+    pub configuration: Vec<u8>,
+}
+
+/// Backend-neutral video encoder configuration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VideoEncoderConfig {
+    pub codec: Codec,
+    pub profile: CodecProfile,
+    pub coded_dimensions: VideoDimensions,
+    pub input_format: PixelFormat,
+    pub color_range: ColorRange,
+    pub hardware: HardwarePreference,
+    /// Exact media-clock timescale used for emitted DTS and PTS values.
+    pub timescale: u32,
+    /// Exact duration, in `timescale` ticks, of every submitted frame.
+    pub frame_duration: u32,
+    pub configuration: Vec<u8>,
+}
+
+/// One owned compressed sample in decode order with its presentation identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EncodedVideoSample {
+    pub presentation_index: FrameIndex,
+    pub random_access: bool,
+    pub data: Vec<u8>,
+}
+
+/// One normalized decoder output, independent of backend-private image types.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DecodedVideoFrame {
+    pub presentation_index: FrameIndex,
+    pub frame: VideoFrame,
+}
+
+/// A cheap cloneable cancellation signal shared with a running codec operation.
+#[derive(Clone, Debug, Default)]
+pub struct CancellationToken {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl CancellationToken {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    #[doc(hidden)]
+    pub fn check(&self) -> Result<()> {
+        if self.is_cancelled() {
+            Err(Error::new(
+                ErrorKind::Cancelled,
+                "codec operation cancelled",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// A stateful video decoder that may retain reference and reorder state.
+///
+/// Requires `Send` so an [`ExactFrameReader`] (and the decoder it owns) can be moved to a
+/// background thread, which native examples rely on to decode without stalling rendering.
+pub trait VideoDecoder: Send {
+    fn submit(
+        &mut self,
+        sample: &EncodedVideoSample,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<DecodedVideoFrame>>;
+    fn drain(&mut self, cancellation: &CancellationToken) -> Result<Vec<DecodedVideoFrame>>;
+    fn reset(&mut self) -> Result<()>;
+
+    /// Whether the caller wants the pictures the next samples decode to, or is only decoding
+    /// them because a later frame references them.
+    ///
+    /// Reaching a frame in the middle of a long group of pictures means decoding every sample
+    /// before it, and on the way there nothing looks at those pictures. What they cost is not
+    /// the decoding: a hardware backend hands back NV12 and every one of these decoders then
+    /// converts a whole picture to RGBA on the CPU and allocates the frame that holds it. On
+    /// the bundled 1080p sample that conversion is 6.6 ms of the 9.6 ms a frame takes through
+    /// VideoToolbox, so a seek that skips it for the frames it passes costs a third of what it
+    /// did.
+    ///
+    /// A decoder must still *decode* a suppressed sample - the frames after it reference the
+    /// picture - and must still account for its presentation identity; what it may skip is
+    /// producing the [`DecodedVideoFrame`], which it reports by returning fewer frames than it
+    /// was given samples.
+    ///
+    /// The default implementation ignores the hint, which is always correct: a decoder that
+    /// keeps producing every frame is a decoder that is merely no faster. [`ExactFrameReader`]
+    /// tracks what it was actually handed rather than what it asked for, so a backend that
+    /// implements this and one that does not answer the same frames.
+    fn set_output_wanted(&mut self, _wanted: bool) {}
+}
+
+/// Discovers and creates video decoders without exposing backend-specific types.
+pub trait VideoDecoderFactory {
+    fn capability(&self, configuration: &VideoDecoderConfig) -> CodecSupport;
+    fn create(
+        &self,
+        configuration: &VideoDecoderConfig,
+        limits: &Limits,
+    ) -> Result<Box<dyn VideoDecoder>>;
+}
+
+/// Discovers and creates video encoders using the normalized capability model.
+pub trait VideoEncoderFactory {
+    fn capability(&self, configuration: &VideoEncoderConfig) -> CodecSupport;
+    fn create(
+        &self,
+        configuration: &VideoEncoderConfig,
+        limits: &Limits,
+    ) -> Result<Box<dyn VideoEncoder>>;
+}
+
+/// Backend-neutral audio encoder configuration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AudioEncoderConfig {
+    pub codec: Codec,
+    pub profile: CodecProfile,
+    pub sample_rate: u32,
+    pub channels: u16,
+    /// Exact media-clock timescale used for emitted DTS and PTS values.
+    pub timescale: u32,
+    pub configuration: Vec<u8>,
+}
+
+/// Discovers and creates audio encoders using the normalized capability model,
+/// the audio counterpart to [`VideoEncoderFactory`].
+///
+/// The native AAC, Opus and Vorbis factories implement it (see
+/// [`AudioEncoder`] for where each encoder comes from), and a caller's own
+/// adapter can too, so a caller that wants discoverable capability reporting
+/// is not left writing the `Result<Box<dyn AudioEncoder>>` construction by
+/// hand.
+pub trait AudioEncoderFactory {
+    fn capability(&self, configuration: &AudioEncoderConfig) -> CodecSupport;
+    fn create(
+        &self,
+        configuration: &AudioEncoderConfig,
+        limits: &Limits,
+    ) -> Result<Box<dyn AudioEncoder>>;
+}
+
+/// Reads an audio encoder's backend-private configuration: `Some(None)` for
+/// an empty one (the backend's default bit rate), `Some(Some(bits_per_second))`
+/// for four big-endian bytes naming a nonzero rate, and `None` for anything
+/// else. Zero is rejected rather than read as "no target", as the HEVC encoder
+/// does. Every native audio encoder takes this form.
+#[doc(hidden)]
+pub fn parse_audio_bit_rate(configuration: &[u8]) -> Option<Option<u32>> {
+    match configuration {
+        [] => Some(None),
+        [a, b, c, d] => match u32::from_be_bytes([*a, *b, *c, *d]) {
+            0 => None,
+            bits_per_second => Some(Some(bits_per_second)),
+        },
+        _ => None,
+    }
+}
+
+/// Observable counters for validating cache and decoder reuse behavior.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DecodeStatistics {
+    pub samples_submitted: u64,
+    /// Of those, the ones submitted only so a later frame could reference them, with the
+    /// decoder told not to produce their pictures.
+    pub samples_skipped: u64,
+    pub cache_hits: u64,
+    pub resets: u64,
+    pub drains: u64,
+}
+
+/// Presentation-indexed exact-frame access over decode-order compressed samples.
+pub struct ExactFrameReader {
+    configuration: VideoDecoderConfig,
+    decoder: Box<dyn VideoDecoder>,
+    samples: Vec<EncodedVideoSample>,
+    decode_position_by_presentation: HashMap<FrameIndex, usize>,
+    cache: BTreeMap<FrameIndex, VideoFrame>,
+    lru: VecDeque<FrameIndex>,
+    /// Presentation frames the decoder has emitted since the last reset, which is how far
+    /// continuing the open session is assumed to reach: one of these that has since been
+    /// evicted from the cache is assumed unreachable without a reset. It is only that
+    /// assumption. A decoder that emits one of them again is published again and cached, not
+    /// refused (see [`publish`]).
+    ///
+    /// [`publish`]: Self::publish
+    published_since_reset: HashSet<FrameIndex>,
+    /// Frames whose sample was submitted while the decoder was told nothing wanted its picture,
+    /// so the decoder passed through them without producing one. Reaching one again needs the
+    /// same reset an evicted published frame does.
+    suppressed_since_reset: HashSet<FrameIndex>,
+    /// Frames whose sample has been submitted and whose picture has not come back yet, because a
+    /// reordering decoder holds one until the samples after it arrive. They are the frames a
+    /// decoder may drop the moment output stops being wanted, so turning it off writes them off
+    /// with the rest.
+    in_flight_since_reset: HashSet<FrameIndex>,
+    /// What the decoder was last told, so a walk toggles it once at the target rather than
+    /// on every sample.
+    output_wanted: bool,
+    next_decode_position: Option<usize>,
+    /// The random-access position the open decode session started from. Only frames at or
+    /// after it have been, or can still be, submitted without a reset.
+    session_start: Option<usize>,
+    /// The fast tier [`ExactFrameReader::seek`] answers from, when the caller has attached one.
+    seek_previews: Option<Arc<dyn SeekPreviewSource>>,
+    limits: Limits,
+    statistics: DecodeStatistics,
+}
+
+/// The longest a seek to any position of any track may take.
+///
+/// This is the requirement `ARCHITECTURE.md` section 3.2 states, kept here as a value so the
+/// tests that hold the library to it and the callers that budget against it quote one number.
+pub const SEEK_LATENCY_BUDGET: Duration = Duration::from_millis(50);
+
+/// Already-decoded pictures spread over a track, which a seek may answer from.
+///
+/// This is a trait rather than the concrete index because [`ExactFrameReader`] is portable and
+/// `zvidlib::previews::PreviewIndex` is not - its pass owns a thread, so it is native-only - and a
+/// reader that named the concrete type could not be built for the browser at all, which is the
+/// target that needs the tier most. An implementation must not decode and must not wait on a
+/// decoder: what it returns is a picture it already had, or nothing.
+///
+/// Issue #432 gave the browser its own implementation. What answers a seek on either target is
+/// now the same `zvidlib::previews::PreviewStore`; what differs is only what fills it, a thread in
+/// `zvidlib::previews::PreviewIndex` against an idle callback in `zvidlib::web_previews`.
+pub trait SeekPreviewSource: Send + Sync {
+    /// The kept picture closest to `frame` and the frame it is actually of, or `None` while
+    /// nothing near that position has been decoded.
+    fn nearest_at(&self, frame: FrameIndex) -> Option<(FrameIndex, VideoFrame)>;
+}
+
+/// What a constant-time [`ExactFrameReader::seek`] could answer with.
+///
+/// A seek is a question about a position on the timeline, and it has to be answered now: the
+/// exact frame at an arbitrary point of a long group of pictures is a decode of every frame
+/// before it, which on a 1080p track is seconds rather than the [`SEEK_LATENCY_BUDGET`]
+/// `ARCHITECTURE.md` section 3.2 allows. So a seek returns the best picture already decoded and
+/// the caller walks to the exact one behind it with [`ExactFrameReader::get`] if it still wants
+/// it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Seek {
+    /// The frame asked for, already decoded and cached. Nothing further is needed.
+    Exact(VideoFrame),
+    /// A picture of a different frame, the closest one the seek preview index holds.
+    Preview {
+        picture: VideoFrame,
+        /// The frame `picture` is actually of, which is within one preview stride of the frame
+        /// asked for once the pass has covered that part of the track.
+        frame: FrameIndex,
+    },
+    /// Nothing is decoded yet for anywhere near this position: no cached frame, and either no
+    /// preview index attached or an index whose pass has not produced a picture.
+    Pending,
+}
+
+/// What a caller wants out of a request, which is what decides whether the reader keeps the
+/// frames behind the one it was asked for.
+///
+/// The frames a walk passes are decoded either way - a picture cannot be decoded without its
+/// references - so this only decides which of them are converted to RGBA, which is the part of
+/// a walk that costs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Request {
+    /// Somewhere to be: keep the frames behind it that the cache can hold, so coming back to
+    /// one of them is free.
+    Destination,
+    /// Somewhere to pass through: keep only the frame asked for, and the reordered frames at or
+    /// after it that the next step needs anyway.
+    Step,
+}
+
+impl Request {
+    /// How far behind the target this request keeps pictures, in presentation frames.
+    fn cache_tail(self, limits: &Limits) -> u64 {
+        match self {
+            Self::Destination => u64::from(limits.max_cached_frames),
+            Self::Step => 0,
+        }
+    }
+}
+
+impl ExactFrameReader {
+    pub fn new(
+        factory: &dyn VideoDecoderFactory,
+        configuration: VideoDecoderConfig,
+        samples: Vec<EncodedVideoSample>,
+        limits: Limits,
+    ) -> Result<Self> {
+        if limits.max_cached_frames == 0 || limits.max_decode_samples_per_seek == 0 {
+            return Err(Error::new(
+                ErrorKind::ResourceLimit,
+                "exact-frame limits must permit cached frames and decode work",
+            ));
+        }
+        let capability = factory.capability(&configuration);
+        if !capability.is_supported() {
+            return Err(capability_error(capability));
+        }
+        if samples.is_empty() {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "an exact-frame reader requires at least one sample",
+            ));
+        }
+        if !samples[0].random_access {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "the first decode-order sample must be a random-access point",
+            ));
+        }
+        let mut positions = HashMap::with_capacity(samples.len());
+        for (position, sample) in samples.iter().enumerate() {
+            if positions
+                .insert(sample.presentation_index, position)
+                .is_some()
+            {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "presentation frame identities must be unique",
+                ));
+            }
+        }
+        let decoder = factory.create(&configuration, &limits)?;
+        Ok(Self {
+            configuration,
+            decoder,
+            samples,
+            decode_position_by_presentation: positions,
+            cache: BTreeMap::new(),
+            lru: VecDeque::new(),
+            published_since_reset: HashSet::new(),
+            suppressed_since_reset: HashSet::new(),
+            in_flight_since_reset: HashSet::new(),
+            output_wanted: true,
+            next_decode_position: None,
+            session_start: None,
+            seek_previews: None,
+            limits,
+            statistics: DecodeStatistics::default(),
+        })
+    }
+
+    /// Attaches (or, with `None`, detaches) the preview source [`Self::seek`] answers from.
+    ///
+    /// The source is normally a `zvidlib::previews::PreviewIndex` filling itself on a decoder of its
+    /// own, and it is shared rather than owned so a reader can start answering seeks from it
+    /// while its pass is still walking the track.
+    pub fn set_seek_previews(&mut self, previews: Option<Arc<dyn SeekPreviewSource>>) {
+        self.seek_previews = previews;
+    }
+
+    /// Answers "what is at this position of the timeline" without decoding anything.
+    ///
+    /// This is the seek path, and it is bounded by `ARCHITECTURE.md` section 3.2: it takes the
+    /// same time whichever position of whatever track it is asked about, because it only ever
+    /// looks at pictures that are already decoded. It reads the presentation cache first - a
+    /// seek back to somewhere the reader has just been is exact for nothing - and then the
+    /// attached seek preview index, and it returns [`Seek::Pending`] rather than blocking when
+    /// neither holds anything.
+    ///
+    /// Reaching the exact frame is [`Self::get`], which is unbounded by construction: the frame
+    /// depends on every frame back to its random-access point and they all have to be decoded.
+    /// A caller that wants both draws what this returns and walks to the exact frame behind it.
+    pub fn seek(&mut self, presentation_index: FrameIndex) -> Seek {
+        if let Some(frame) = self.cache.get(&presentation_index).cloned() {
+            self.statistics.cache_hits = self.statistics.cache_hits.saturating_add(1);
+            self.touch(presentation_index);
+            return Seek::Exact(frame);
+        }
+        match self
+            .seek_previews
+            .as_ref()
+            .and_then(|previews| previews.nearest_at(presentation_index))
+        {
+            Some((frame, picture)) => Seek::Preview { picture, frame },
+            None => Seek::Pending,
+        }
+    }
+
+    /// Returns exactly the requested presentation frame, and the frames behind it that the
+    /// cache can hold, so a request that comes back for one of those is answered for nothing.
+    ///
+    /// This is the destination of a seek. A walk that is going to keep walking forwards should
+    /// ask for its intermediate frames with [`get_step`] instead, which converts the frame it
+    /// was asked for and nothing else.
+    ///
+    /// [`get_step`]: Self::get_step
+    pub fn get(
+        &mut self,
+        presentation_index: FrameIndex,
+        cancellation: &CancellationToken,
+    ) -> Result<VideoFrame> {
+        self.get_request(presentation_index, Request::Destination, cancellation)
+    }
+
+    /// Returns exactly the requested presentation frame and converts nothing else.
+    ///
+    /// A step is a picture on the way to somewhere, not somewhere: the caller is going to ask
+    /// for a frame further forward next, so the frames behind this one that [`get`] would keep
+    /// are converted for a request that never comes. That tail is bounded per call and so is
+    /// affordable for one seek, but a walk that publishes as it goes pays it once per published
+    /// picture, and once the stride is shorter than the tail the tails overlap and the walk
+    /// converts every picture it passes rather than the few it publishes (issue #402).
+    ///
+    /// Frames at or after the target in presentation order are still kept, exactly as [`get`]
+    /// keeps them: on a stream with B-pictures those are the reordered frames the next request
+    /// asks for, and dropping them would reset the decoder and re-walk the group of pictures.
+    ///
+    /// [`get`]: Self::get
+    pub fn get_step(
+        &mut self,
+        presentation_index: FrameIndex,
+        cancellation: &CancellationToken,
+    ) -> Result<VideoFrame> {
+        self.get_request(presentation_index, Request::Step, cancellation)
+    }
+
+    fn get_request(
+        &mut self,
+        presentation_index: FrameIndex,
+        request: Request,
+        cancellation: &CancellationToken,
+    ) -> Result<VideoFrame> {
+        cancellation.check()?;
+        if let Some(frame) = self.cache.get(&presentation_index).cloned() {
+            self.statistics.cache_hits = self.statistics.cache_hits.saturating_add(1);
+            self.touch(presentation_index);
+            return Ok(frame);
+        }
+        let target_position = *self
+            .decode_position_by_presentation
+            .get(&presentation_index)
+            .ok_or_else(|| {
+                Error::new(ErrorKind::InvalidInput, "presentation frame is not indexed")
+            })?;
+        let random_access_position = self.nearest_random_access(target_position);
+        // A decoder with output reordering (e.g. hierarchical B-frames) may need to be fed
+        // samples *past* `target_position` before the reordered frame at `target_position` is
+        // actually emitted. So `next_decode_position > target_position` does not by itself mean
+        // the frame is unreachable without a reset: it may simply still be buffered inside the
+        // decoder, pending release as more samples are submitted. The only case that truly
+        // requires a reset is when the frame was already published once and evicted from the
+        // cache, since a decoder is not expected to emit the same presentation frame twice
+        // without an intervening reset. That is an assumption about what continuing the session
+        // can reach, not a rule the decoder is held to: one that does emit the frame again is
+        // published a second time and cached rather than refused (see `publish`).
+        //
+        // A frame the decoder walked past without producing is in the same position as one that
+        // was published and evicted: the decoder will not emit it again, so only a reset can
+        // reach it.
+        //
+        // And a session that started at a later random-access point than the target's never
+        // submitted the target at all, however far it has since walked. On a track whose frames
+        // are all random-access points, a request for frame 2 opens the session at 2, and a
+        // request for frame 0 after it would otherwise walk on from 3 to the end of the track.
+        let can_reuse = self
+            .next_decode_position
+            .is_some_and(|position| position >= random_access_position)
+            && self
+                .session_start
+                .is_some_and(|start| start <= random_access_position)
+            && !self.published_since_reset.contains(&presentation_index)
+            && !self.suppressed_since_reset.contains(&presentation_index);
+        if !can_reuse {
+            self.decoder.reset()?;
+            self.statistics.resets = self.statistics.resets.saturating_add(1);
+            self.published_since_reset.clear();
+            self.suppressed_since_reset.clear();
+            self.in_flight_since_reset.clear();
+            self.next_decode_position = Some(random_access_position);
+            self.session_start = Some(random_access_position);
+        }
+
+        let mut work = 0_u32;
+        while let Some(position) = self.next_decode_position {
+            cancellation.check()?;
+            if work >= self.limits.max_decode_samples_per_seek {
+                return Err(Error::new(
+                    ErrorKind::ResourceLimit,
+                    "exact-frame request exceeded the configured decode-work limit",
+                ));
+            }
+            if position == self.samples.len() {
+                self.set_output_wanted(true);
+                self.drain_internal(cancellation)?;
+                break;
+            }
+            // Nothing looks at a picture decoded on the way to the target, and skipping the
+            // colour conversion it would otherwise pay is most of what a long walk costs. Two
+            // kinds of frame are kept anyway, both because the request after this one is very
+            // likely to be for them.
+            //
+            // The first is anything at or after the target in *presentation* order. A walk
+            // arrives at its target from behind and carries on forwards, and deciding this by
+            // decode position instead discards exactly the reordered frames a stream with
+            // B-pictures asks for next: on the bundled sample every fourth request would then
+            // reset the decoder and walk the whole group of pictures again.
+            //
+            // The second is the frames immediately behind the target, as many as the cache can
+            // hold, and that one belongs to the request rather than to the reader. Walking here
+            // fills the cache with them as a side effect, and that is what makes stepping
+            // backwards a frame at a time cost nothing after a seek; skipping them would leave
+            // the cache empty behind the target and turn every backward step into another walk
+            // from the random-access point. For a destination they are a bounded charge - the
+            // last `max_cached_frames` conversions of a walk however long - against a saving
+            // that grows with the distance. For a step they are a charge with no saving behind
+            // it at all: the caller is walking forwards and will never ask for them, and paying
+            // the tail once per step is what made a 150 ms preview cadence convert 765 of the
+            // bundled sample's 768 pictures (issue #402).
+            let cache_tail = request.cache_tail(&self.limits);
+            let wanted = position >= target_position
+                || self.samples[position].presentation_index.0
+                    >= presentation_index.0.saturating_sub(cache_tail);
+            self.set_output_wanted(wanted);
+            let suppressed = !self.output_wanted;
+            let outputs = self.decoder.submit(&self.samples[position], cancellation)?;
+            self.statistics.samples_submitted = self.statistics.samples_submitted.saturating_add(1);
+            if suppressed {
+                self.statistics.samples_skipped = self.statistics.samples_skipped.saturating_add(1);
+                self.suppressed_since_reset
+                    .insert(self.samples[position].presentation_index);
+            } else {
+                self.in_flight_since_reset
+                    .insert(self.samples[position].presentation_index);
+            }
+            self.next_decode_position = Some(position + 1);
+            work += 1;
+            self.publish(outputs)?;
+            if let Some(frame) = self.cache.get(&presentation_index).cloned() {
+                self.touch(presentation_index);
+                return Ok(frame);
+            }
+        }
+        if let Some(frame) = self.cache.get(&presentation_index).cloned() {
+            self.touch(presentation_index);
+            Ok(frame)
+        } else {
+            Err(Error::new(
+                ErrorKind::MalformedMedia,
+                "decoder did not produce the requested presentation frame",
+            ))
+        }
+    }
+
+    /// Drains delayed output into the bounded presentation cache.
+    pub fn drain(&mut self, cancellation: &CancellationToken) -> Result<usize> {
+        cancellation.check()?;
+        self.set_output_wanted(true);
+        self.drain_internal(cancellation)
+    }
+
+    /// Tells the decoder whether the next samples' pictures are wanted, when that has changed.
+    ///
+    /// Turning output off writes off the frames the decoder is still holding as well as the ones
+    /// it is about to be handed. A reordering decoder releases a picture several samples after
+    /// the one that carried it, so a frame submitted while output was wanted can come out - and
+    /// be dropped - during the suppressed stretch that follows. Not writing those off is a
+    /// decoder that will never produce them and a reader that still believes it can ask, which
+    /// ends in `decoder did not produce the requested presentation frame`. A picture that does
+    /// arrive after all takes itself back off the list in [`publish`].
+    ///
+    /// [`publish`]: Self::publish
+    fn set_output_wanted(&mut self, wanted: bool) {
+        if self.output_wanted == wanted {
+            return;
+        }
+        if !wanted {
+            for frame in self.in_flight_since_reset.drain() {
+                self.suppressed_since_reset.insert(frame);
+            }
+        }
+        self.decoder.set_output_wanted(wanted);
+        self.output_wanted = wanted;
+    }
+
+    /// Clears decoder, reorder, and frame-cache state.
+    pub fn reset(&mut self) -> Result<()> {
+        self.set_output_wanted(true);
+        self.decoder.reset()?;
+        self.statistics.resets = self.statistics.resets.saturating_add(1);
+        self.next_decode_position = None;
+        self.session_start = None;
+        self.cache.clear();
+        self.lru.clear();
+        self.published_since_reset.clear();
+        self.suppressed_since_reset.clear();
+        self.in_flight_since_reset.clear();
+        Ok(())
+    }
+
+    pub const fn statistics(&self) -> DecodeStatistics {
+        self.statistics
+    }
+
+    pub fn cached_frames(&self) -> usize {
+        self.cache.len()
+    }
+
+    /// The random-access point a decode reaching `target_position` starts from.
+    ///
+    /// A random-access point presented *after* the target cannot be it, even when it comes
+    /// first in decode order: the target is then one of its leading pictures, and an open-GOP
+    /// stream's leading pictures (HEVC RASL pictures) reference pictures from before the
+    /// random-access point, so a decode that starts there cannot reconstruct them (issue #506).
+    /// The walk goes back to a random-access point the target is not leading.
+    fn nearest_random_access(&self, target_position: usize) -> usize {
+        let target = self.samples[target_position].presentation_index;
+        (0..=target_position)
+            .rev()
+            .find(|position| {
+                let sample = &self.samples[*position];
+                sample.random_access && sample.presentation_index <= target
+            })
+            .unwrap_or(0)
+    }
+
+    fn drain_internal(&mut self, cancellation: &CancellationToken) -> Result<usize> {
+        let outputs = self.decoder.drain(cancellation)?;
+        let count = outputs.len();
+        self.statistics.drains = self.statistics.drains.saturating_add(1);
+        self.next_decode_position = Some(self.samples.len());
+        self.publish(outputs)?;
+        Ok(count)
+    }
+
+    fn publish(&mut self, outputs: Vec<DecodedVideoFrame>) -> Result<()> {
+        for output in outputs {
+            // A decoder that ignores the output hint, or one that only emits a suppressed
+            // sample's picture later, hands back a frame this reader had written off. What it
+            // was handed is what counts, so it is a cached frame again rather than a reset.
+            self.suppressed_since_reset
+                .remove(&output.presentation_index);
+            self.in_flight_since_reset
+                .remove(&output.presentation_index);
+            // A repeat of a frame already published since the last reset is not an error, and
+            // was one until issue #415. Nothing here depends on a decoder emitting each
+            // presentation frame at most once per session: `published_since_reset` only decides
+            // whether a re-request can continue the open session or has to reset, and a decoder
+            // that hands the frame back anyway makes that answer conservative rather than wrong.
+            // Refusing it rejected the whole stream as `MalformedMedia` over a backend's
+            // behaviour, and rejected it for a picture the reader was about to cache and could
+            // have answered the very request from. The `WebCodecs` backend already re-caches
+            // such a frame, so this is also what makes the two backends agree.
+            self.published_since_reset.insert(output.presentation_index);
+            if !self
+                .decode_position_by_presentation
+                .contains_key(&output.presentation_index)
+            {
+                return Err(Error::new(
+                    ErrorKind::MalformedMedia,
+                    "decoder produced an unindexed presentation frame",
+                ));
+            }
+            if output.frame.dimensions != self.configuration.coded_dimensions
+                || output.frame.pixel_format != self.configuration.output_format
+                || output.frame.color_range != self.configuration.color_range
+            {
+                return Err(Error::new(
+                    ErrorKind::MalformedMedia,
+                    "decoder output does not match its normalized configuration",
+                ));
+            }
+            self.insert_cache(output.presentation_index, output.frame);
+        }
+        Ok(())
+    }
+
+    fn insert_cache(&mut self, index: FrameIndex, frame: VideoFrame) {
+        self.cache.insert(index, frame);
+        self.touch(index);
+        while self.cache.len() > self.limits.max_cached_frames as usize {
+            if let Some(evicted) = self.lru.pop_front() {
+                self.cache.remove(&evicted);
+            }
+        }
+    }
+
+    fn touch(&mut self, index: FrameIndex) {
+        self.lru.retain(|candidate| *candidate != index);
+        self.lru.push_back(index);
+    }
+}
+
+fn capability_error(capability: CodecSupport) -> Error {
+    let (kind, message) = match capability {
+        CodecSupport::UnsupportedCodec => (
+            ErrorKind::Unsupported,
+            "decoder does not support the requested codec".into(),
+        ),
+        CodecSupport::UnsupportedProfile => (
+            ErrorKind::Unsupported,
+            "decoder does not support the requested profile".into(),
+        ),
+        CodecSupport::InvalidConfiguration { reason } => (ErrorKind::InvalidInput, reason),
+        CodecSupport::HardwareUnavailable => (
+            ErrorKind::Unsupported,
+            "requested hardware decoder is unavailable".into(),
+        ),
+        CodecSupport::Supported { .. } => (
+            ErrorKind::Internal,
+            "decoder capability changed unexpectedly".into(),
+        ),
+    };
+    Error::new(kind, message)
+}
+
+/// Returns the portable, software-only uncompressed Gray8 decoder backend.
+///
+/// Each packet contains one tightly packed Gray8 image. The concrete backend
+/// remains private while this factory provides an end-to-end reference path.
+pub fn uncompressed_video_decoder_factory() -> impl VideoDecoderFactory {
+    UncompressedVideoDecoderFactory
+}
+
+struct UncompressedVideoDecoderFactory;
+
+impl VideoDecoderFactory for UncompressedVideoDecoderFactory {
+    fn capability(&self, configuration: &VideoDecoderConfig) -> CodecSupport {
+        if configuration.codec != Codec::UncompressedVideo {
+            return CodecSupport::UnsupportedCodec;
+        }
+        if configuration.profile != CodecProfile::UncompressedGray8 {
+            return CodecSupport::UnsupportedProfile;
+        }
+        if configuration.output_format != PixelFormat::Gray8
+            || !configuration.configuration.is_empty()
+        {
+            return CodecSupport::InvalidConfiguration {
+                reason: "uncompressed Gray8 requires Gray8 output and no configuration bytes"
+                    .into(),
+            };
+        }
+        if configuration.hardware == HardwarePreference::Require {
+            return CodecSupport::HardwareUnavailable;
+        }
+        CodecSupport::Supported {
+            implementation: CodecImplementation::Software,
+        }
+    }
+
+    fn create(
+        &self,
+        configuration: &VideoDecoderConfig,
+        limits: &Limits,
+    ) -> Result<Box<dyn VideoDecoder>> {
+        let capability = self.capability(configuration);
+        if !capability.is_supported() {
+            return Err(capability_error(capability));
+        }
+        if configuration.coded_dimensions.width > limits.max_width
+            || configuration.coded_dimensions.height > limits.max_height
+        {
+            return Err(Error::new(
+                ErrorKind::ResourceLimit,
+                "decoded dimensions exceed the configured limits",
+            ));
+        }
+        let required = u64::from(configuration.coded_dimensions.width)
+            .checked_mul(u64::from(configuration.coded_dimensions.height))
+            .ok_or_else(|| Error::new(ErrorKind::ResourceLimit, "decoded frame size overflow"))?;
+        if required > limits.max_allocation_bytes {
+            return Err(Error::new(
+                ErrorKind::ResourceLimit,
+                "decoded frame exceeds the configured allocation limit",
+            ));
+        }
+        Ok(Box::new(UncompressedVideoDecoder {
+            configuration: configuration.clone(),
+            limits: *limits,
+        }))
+    }
+}
+
+struct UncompressedVideoDecoder {
+    configuration: VideoDecoderConfig,
+    limits: Limits,
+}
+
+impl VideoDecoder for UncompressedVideoDecoder {
+    fn submit(
+        &mut self,
+        sample: &EncodedVideoSample,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<DecodedVideoFrame>> {
+        cancellation.check()?;
+        let width = usize::try_from(self.configuration.coded_dimensions.width)
+            .map_err(|_| Error::new(ErrorKind::ResourceLimit, "decoded width is too large"))?;
+        let height = usize::try_from(self.configuration.coded_dimensions.height)
+            .map_err(|_| Error::new(ErrorKind::ResourceLimit, "decoded height is too large"))?;
+        let length = width
+            .checked_mul(height)
+            .ok_or_else(|| Error::new(ErrorKind::ResourceLimit, "decoded frame size overflow"))?;
+        if sample.data.len() != length {
+            return Err(Error::new(
+                ErrorKind::MalformedMedia,
+                "uncompressed Gray8 packet size does not match coded dimensions",
+            ));
+        }
+        let frame = VideoFrame::new(
+            self.configuration.coded_dimensions,
+            PixelFormat::Gray8,
+            self.configuration.color_range,
+            vec![Plane {
+                data: sample.data.clone(),
+                stride: width,
+            }],
+            &self.limits,
+        )?;
+        Ok(vec![DecodedVideoFrame {
+            presentation_index: sample.presentation_index,
+            frame,
+        }])
+    }
+
+    fn drain(&mut self, cancellation: &CancellationToken) -> Result<Vec<DecodedVideoFrame>> {
+        cancellation.check()?;
+        Ok(Vec::new())
+    }
+
+    fn reset(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    fn config() -> VideoDecoderConfig {
+        VideoDecoderConfig {
+            codec: Codec::UncompressedVideo,
+            profile: CodecProfile::UncompressedGray8,
+            coded_dimensions: VideoDimensions::new(1, 1, &Limits::default()).unwrap(),
+            output_format: PixelFormat::Gray8,
+            color_range: ColorRange::Full,
+            hardware: HardwarePreference::Avoid,
+            configuration: Vec::new(),
+        }
+    }
+
+    fn sample(index: u64, value: u8, random_access: bool) -> EncodedVideoSample {
+        EncodedVideoSample {
+            presentation_index: FrameIndex(index),
+            random_access,
+            data: vec![value],
+        }
+    }
+
+    fn value(frame: &VideoFrame) -> u8 {
+        frame.planes[0].data[0]
+    }
+
+    /// A reader over a single-group track: one random-access point at frame zero, so reaching
+    /// any frame exactly means decoding every frame before it. This is the shape the bundled
+    /// sample has and the shape the seek budget is hard for.
+    fn single_group_reader(frames: u64) -> ExactFrameReader {
+        let samples = (0..frames)
+            .map(|index| sample(index, (index % 251) as u8, index == 0))
+            .collect();
+        ExactFrameReader::new(
+            &uncompressed_video_decoder_factory(),
+            config(),
+            samples,
+            Limits::default(),
+        )
+        .unwrap()
+    }
+
+    /// A preview source holding one picture every `stride` frames, standing in for the pass a
+    /// `previews::PreviewIndex` runs. The reader's contract is that a seek reads pictures and
+    /// never decodes, and asserting that does not need a decoder behind the source.
+    struct StridedPreviews {
+        stride: u64,
+        frames: u64,
+    }
+
+    impl SeekPreviewSource for StridedPreviews {
+        fn nearest_at(&self, frame: FrameIndex) -> Option<(FrameIndex, VideoFrame)> {
+            if self.frames == 0 {
+                return None;
+            }
+            let at = (frame.0 / self.stride * self.stride).min(self.frames - 1);
+            let picture = VideoFrame::new(
+                config().coded_dimensions,
+                PixelFormat::Gray8,
+                ColorRange::Full,
+                vec![Plane {
+                    data: vec![(at % 251) as u8],
+                    stride: 1,
+                }],
+                &Limits::default(),
+            )
+            .ok()?;
+            Some((FrameIndex(at), picture))
+        }
+    }
+
+    /// A seek with nothing decoded anywhere near it says so rather than deciding to decode: the
+    /// caller falls through to its own exact request instead of the seek path silently becoming
+    /// the walk it is bounded against.
+    #[test]
+    fn a_seek_with_nothing_decoded_is_pending_and_submits_no_samples() {
+        let mut reader = single_group_reader(512);
+        assert_eq!(reader.seek(FrameIndex(511)), Seek::Pending);
+        assert_eq!(reader.statistics().samples_submitted, 0);
+        assert_eq!(reader.statistics().resets, 0);
+    }
+
+    /// A seek back to somewhere the reader has just been is the frame itself, from the cache.
+    #[test]
+    fn a_seek_into_the_cache_answers_exactly() {
+        let mut reader = single_group_reader(64);
+        let cancellation = CancellationToken::new();
+        reader.get(FrameIndex(40), &cancellation).unwrap();
+        let submitted = reader.statistics().samples_submitted;
+        let Seek::Exact(frame) = reader.seek(FrameIndex(40)) else {
+            panic!("a cached frame seeks exactly");
+        };
+        assert_eq!(value(&frame), 40);
+        assert_eq!(
+            reader.statistics().samples_submitted,
+            submitted,
+            "an exact seek decodes nothing"
+        );
+    }
+
+    /// The requirement in `ARCHITECTURE.md` section 3.2: a seek to any position of a track that
+    /// is one group of pictures answers from an already-decoded picture and decodes nothing, so
+    /// what it costs does not grow with how far along the track the position is.
+    #[test]
+    fn a_seek_anywhere_on_a_single_group_track_decodes_nothing() {
+        let mut reader = single_group_reader(512);
+        reader.set_seek_previews(Some(Arc::new(StridedPreviews {
+            stride: 12,
+            frames: 512,
+        })));
+        for target in [0_u64, 1, 255, 400, 511] {
+            match reader.seek(FrameIndex(target)) {
+                Seek::Preview { frame, .. } => assert!(
+                    frame.0.abs_diff(target) < 12,
+                    "frame {target} answered by {frame:?}, further than one stride away"
+                ),
+                Seek::Exact(_) => {}
+                Seek::Pending => panic!("frame {target} had no answer"),
+            }
+        }
+        assert_eq!(
+            reader.statistics().samples_submitted,
+            0,
+            "seeking is not decoding"
+        );
+        assert_eq!(reader.statistics().resets, 0);
+    }
+
+    /// The 50 ms half of the same requirement, held on every run rather than only in the
+    /// host-specific measurement over the bundled sample: a hundred positions of a single-group
+    /// track, the far end no slower than the near one.
+    #[test]
+    fn a_seek_to_any_position_answers_inside_the_latency_budget() {
+        let frames = 768;
+        let mut reader = single_group_reader(frames);
+        reader.set_seek_previews(Some(Arc::new(StridedPreviews { stride: 12, frames })));
+        let mut worst = Duration::ZERO;
+        for step in 0..=100_u64 {
+            let target = FrameIndex(step * (frames - 1) / 100);
+            let started = std::time::Instant::now();
+            let answer = reader.seek(target);
+            worst = worst.max(started.elapsed());
+            assert_ne!(answer, Seek::Pending, "frame {} had no answer", target.0);
+        }
+        assert!(
+            worst < SEEK_LATENCY_BUDGET,
+            "the worst seek took {worst:?}, over the {SEEK_LATENCY_BUDGET:?} budget"
+        );
+    }
+
+    /// Detaching the source puts the reader back to answering out of its own cache alone, so a
+    /// caller that drops a preview index does not keep serving its pictures.
+    #[test]
+    fn detaching_the_preview_source_leaves_only_the_cache() {
+        let mut reader = single_group_reader(64);
+        reader.set_seek_previews(Some(Arc::new(StridedPreviews {
+            stride: 12,
+            frames: 64,
+        })));
+        assert!(matches!(reader.seek(FrameIndex(63)), Seek::Preview { .. }));
+        reader.set_seek_previews(None);
+        assert_eq!(reader.seek(FrameIndex(63)), Seek::Pending);
+    }
+
+    /// Issue #506: frame 3 follows the random-access point at frame 4 in decode order but is
+    /// presented before it, the shape of an open-GOP stream's leading pictures. A decoder that
+    /// starts at frame 4 cannot reconstruct it, so the reader starts from frame 0 instead. Frame
+    /// 5 is not leading, so it is still decoded from frame 4.
+    #[test]
+    fn a_leading_picture_is_decoded_from_the_random_access_point_before_it() {
+        let samples = vec![
+            sample(0, 10, true),
+            sample(1, 11, false),
+            sample(2, 12, false),
+            sample(4, 14, true),
+            sample(3, 13, false),
+            sample(5, 15, false),
+        ];
+        let mut reader = ExactFrameReader::new(
+            &uncompressed_video_decoder_factory(),
+            config(),
+            samples.clone(),
+            Limits::default(),
+        )
+        .unwrap();
+        let cancellation = CancellationToken::new();
+        assert_eq!(
+            value(&reader.get(FrameIndex(3), &cancellation).unwrap()),
+            13
+        );
+        assert_eq!(reader.statistics().samples_submitted, 5);
+
+        let mut reader = ExactFrameReader::new(
+            &uncompressed_video_decoder_factory(),
+            config(),
+            samples,
+            Limits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            value(&reader.get(FrameIndex(5), &cancellation).unwrap()),
+            15
+        );
+        assert_eq!(reader.statistics().samples_submitted, 3);
+    }
+
+    #[test]
+    fn capability_distinguishes_codec_profile_configuration_and_hardware() {
+        let factory = uncompressed_video_decoder_factory();
+        assert!(factory.capability(&config()).is_supported());
+        let mut candidate = config();
+        candidate.codec = Codec::Av1;
+        assert_eq!(
+            factory.capability(&candidate),
+            CodecSupport::UnsupportedCodec
+        );
+        candidate = config();
+        candidate.profile = CodecProfile::Av1Main;
+        assert_eq!(
+            factory.capability(&candidate),
+            CodecSupport::UnsupportedProfile
+        );
+        candidate = config();
+        candidate.output_format = PixelFormat::Rgba8;
+        assert!(matches!(
+            factory.capability(&candidate),
+            CodecSupport::InvalidConfiguration { .. }
+        ));
+        candidate = config();
+        candidate.hardware = HardwarePreference::Require;
+        assert_eq!(
+            factory.capability(&candidate),
+            CodecSupport::HardwareUnavailable
+        );
+
+        candidate = config();
+        candidate.output_format = PixelFormat::Rgba8;
+        assert_eq!(
+            factory
+                .create(&candidate, &Limits::default())
+                .err()
+                .unwrap()
+                .kind(),
+            ErrorKind::InvalidInput
+        );
+
+        let restrictive = Limits {
+            max_width: 0,
+            ..Limits::default()
+        };
+        assert_eq!(
+            factory
+                .create(&config(), &restrictive)
+                .err()
+                .unwrap()
+                .kind(),
+            ErrorKind::ResourceLimit
+        );
+    }
+
+    /// Issue #504: every frame of an all-intra track is a random-access point, so a request for
+    /// frame 2 opens its decode session at frame 2. Frame 0 was never submitted in that session,
+    /// so reaching it needs a reset rather than a walk onwards from frame 3.
+    #[test]
+    fn a_request_before_the_open_session_start_resets_the_decoder() {
+        let samples = (0..4)
+            .map(|index| sample(index, index as u8 + 10, true))
+            .collect();
+        let mut reader = ExactFrameReader::new(
+            &uncompressed_video_decoder_factory(),
+            config(),
+            samples,
+            Limits {
+                max_cached_frames: 1,
+                ..Limits::default()
+            },
+        )
+        .unwrap();
+        let cancellation = CancellationToken::new();
+        assert_eq!(
+            value(&reader.get(FrameIndex(2), &cancellation).unwrap()),
+            12
+        );
+        assert_eq!(
+            value(&reader.get(FrameIndex(0), &cancellation).unwrap()),
+            10
+        );
+        assert_eq!(reader.statistics().resets, 2);
+    }
+
+    #[test]
+    fn conformance_vector_reorders_exact_frames_and_reuses_bounded_state() {
+        let samples = vec![
+            sample(0, 10, true),
+            sample(3, 40, false),
+            sample(1, 20, false),
+            sample(2, 30, false),
+            sample(4, 50, true),
+            sample(6, 70, false),
+            sample(5, 60, false),
+        ];
+        let factory = uncompressed_video_decoder_factory();
+        let mut reader = ExactFrameReader::new(
+            &factory,
+            config(),
+            samples,
+            Limits {
+                max_cached_frames: 3,
+                ..Limits::default()
+            },
+        )
+        .unwrap();
+        let cancellation = CancellationToken::new();
+        assert_eq!(
+            value(&reader.get(FrameIndex(1), &cancellation).unwrap()),
+            20
+        );
+        let first = reader.statistics();
+        assert_eq!(
+            value(&reader.get(FrameIndex(2), &cancellation).unwrap()),
+            30
+        );
+        assert_eq!(reader.statistics().resets, first.resets);
+        assert_eq!(
+            value(&reader.get(FrameIndex(3), &cancellation).unwrap()),
+            40
+        );
+        assert!(reader.statistics().cache_hits > 0);
+        assert_eq!(
+            value(&reader.get(FrameIndex(5), &cancellation).unwrap()),
+            60
+        );
+        assert_eq!(
+            value(&reader.get(FrameIndex(0), &cancellation).unwrap()),
+            10
+        );
+        assert!(reader.statistics().resets > first.resets);
+        assert!(reader.cached_frames() <= 3);
+    }
+
+    /// Records what each sample was asked to produce, so a test can see the hint the reader
+    /// actually gave rather than only its effect.
+    struct HintFactory {
+        wanted: Arc<Mutex<Vec<(u64, bool)>>>,
+    }
+
+    struct HintDecoder {
+        configuration: VideoDecoderConfig,
+        limits: Limits,
+        wanted: Arc<Mutex<Vec<(u64, bool)>>>,
+        output_wanted: bool,
+    }
+
+    impl VideoDecoderFactory for HintFactory {
+        fn capability(&self, _: &VideoDecoderConfig) -> CodecSupport {
+            CodecSupport::Supported {
+                implementation: CodecImplementation::Software,
+            }
+        }
+
+        fn create(
+            &self,
+            configuration: &VideoDecoderConfig,
+            limits: &Limits,
+        ) -> Result<Box<dyn VideoDecoder>> {
+            Ok(Box::new(HintDecoder {
+                configuration: configuration.clone(),
+                limits: *limits,
+                wanted: Arc::clone(&self.wanted),
+                output_wanted: true,
+            }))
+        }
+    }
+
+    impl VideoDecoder for HintDecoder {
+        fn submit(
+            &mut self,
+            sample: &EncodedVideoSample,
+            cancellation: &CancellationToken,
+        ) -> Result<Vec<DecodedVideoFrame>> {
+            cancellation.check()?;
+            self.wanted
+                .lock()
+                .expect("hint log poisoned")
+                .push((sample.presentation_index.0, self.output_wanted));
+            if !self.output_wanted {
+                return Ok(Vec::new());
+            }
+            Ok(vec![DecodedVideoFrame {
+                presentation_index: sample.presentation_index,
+                frame: VideoFrame::new(
+                    self.configuration.coded_dimensions,
+                    PixelFormat::Gray8,
+                    ColorRange::Full,
+                    vec![Plane {
+                        data: sample.data.clone(),
+                        stride: 1,
+                    }],
+                    &self.limits,
+                )?,
+            }])
+        }
+
+        fn drain(&mut self, _: &CancellationToken) -> Result<Vec<DecodedVideoFrame>> {
+            Ok(Vec::new())
+        }
+
+        fn reset(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn set_output_wanted(&mut self, wanted: bool) {
+            self.output_wanted = wanted;
+        }
+    }
+
+    /// A decoder that hands back the previous sample's picture again alongside the current
+    /// one, as a backend that does not deduplicate its output across a session does. Both
+    /// pictures are genuine and correctly identified; the repeat is only a frame the reader has
+    /// already seen since its last reset.
+    struct ReplayFactory;
+
+    struct ReplayDecoder {
+        configuration: VideoDecoderConfig,
+        limits: Limits,
+        previous: Option<(FrameIndex, u8)>,
+    }
+
+    impl ReplayDecoder {
+        fn produce(&self, presentation_index: FrameIndex, value: u8) -> Result<DecodedVideoFrame> {
+            Ok(DecodedVideoFrame {
+                presentation_index,
+                frame: VideoFrame::new(
+                    self.configuration.coded_dimensions,
+                    PixelFormat::Gray8,
+                    ColorRange::Full,
+                    vec![Plane {
+                        data: vec![value],
+                        stride: 1,
+                    }],
+                    &self.limits,
+                )?,
+            })
+        }
+    }
+
+    impl VideoDecoderFactory for ReplayFactory {
+        fn capability(&self, _: &VideoDecoderConfig) -> CodecSupport {
+            CodecSupport::Supported {
+                implementation: CodecImplementation::Software,
+            }
+        }
+
+        fn create(
+            &self,
+            configuration: &VideoDecoderConfig,
+            limits: &Limits,
+        ) -> Result<Box<dyn VideoDecoder>> {
+            Ok(Box::new(ReplayDecoder {
+                configuration: configuration.clone(),
+                limits: *limits,
+                previous: None,
+            }))
+        }
+    }
+
+    impl VideoDecoder for ReplayDecoder {
+        fn submit(
+            &mut self,
+            sample: &EncodedVideoSample,
+            cancellation: &CancellationToken,
+        ) -> Result<Vec<DecodedVideoFrame>> {
+            cancellation.check()?;
+            let value = sample.data[0];
+            let mut outputs = Vec::new();
+            if let Some((index, previous)) = self.previous {
+                outputs.push(self.produce(index, previous)?);
+            }
+            outputs.push(self.produce(sample.presentation_index, value)?);
+            self.previous = Some((sample.presentation_index, value));
+            Ok(outputs)
+        }
+
+        fn drain(&mut self, _: &CancellationToken) -> Result<Vec<DecodedVideoFrame>> {
+            Ok(Vec::new())
+        }
+
+        fn reset(&mut self) -> Result<()> {
+            self.previous = None;
+            Ok(())
+        }
+    }
+
+    /// Issue #415: publishing a presentation frame twice within one decode session used to fail
+    /// the whole request with `MalformedMedia`, which held the backend to a rule the reader does
+    /// not depend on and threw away a picture it was about to cache.
+    #[test]
+    fn a_frame_the_decoder_emits_twice_is_cached_again_rather_than_refused() {
+        let mut reader = ExactFrameReader::new(
+            &ReplayFactory,
+            config(),
+            single_group_of_pictures(),
+            Limits::default(),
+        )
+        .unwrap();
+        let cancellation = CancellationToken::new();
+
+        // Reaching frame 3 submits samples 0 through 3, and every sample after the first
+        // republishes its predecessor, so frames 0, 1, and 2 are each published twice.
+        assert_eq!(
+            value(&reader.get(FrameIndex(3), &cancellation).unwrap()),
+            30
+        );
+        assert_eq!(
+            value(&reader.get(FrameIndex(6), &cancellation).unwrap()),
+            60
+        );
+
+        // The repeats were cached rather than refused, so the frames behind the target are
+        // still answered from the cache instead of costing another reset.
+        let resets = reader.statistics().resets;
+        let hits = reader.statistics().cache_hits;
+        assert_eq!(
+            value(&reader.get(FrameIndex(5), &cancellation).unwrap()),
+            50
+        );
+        assert_eq!(reader.statistics().resets, resets);
+        assert!(reader.statistics().cache_hits > hits);
+    }
+
+    /// Ten frames behind one random-access point, as the bundled sample's single group of
+    /// pictures is, with `value == index * 10`.
+    fn single_group_of_pictures() -> Vec<EncodedVideoSample> {
+        (0..10)
+            .map(|index| sample(index, (index * 10) as u8, index == 0))
+            .collect()
+    }
+
+    /// A cache small enough that a walk over ten frames is longer than the tail the reader
+    /// keeps behind its target; the default cache would hold the whole group of pictures.
+    fn small_cache() -> Limits {
+        Limits {
+            max_cached_frames: 2,
+            ..Limits::default()
+        }
+    }
+
+    #[test]
+    fn walking_to_a_distant_frame_does_not_ask_for_the_pictures_it_passes() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let factory = HintFactory {
+            wanted: Arc::clone(&log),
+        };
+        let mut reader = ExactFrameReader::new(
+            &factory,
+            config(),
+            single_group_of_pictures(),
+            small_cache(),
+        )
+        .unwrap();
+        let cancellation = CancellationToken::new();
+
+        assert_eq!(
+            value(&reader.get(FrameIndex(8), &cancellation).unwrap()),
+            80
+        );
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec![
+                (0, false),
+                (1, false),
+                (2, false),
+                (3, false),
+                (4, false),
+                (5, false),
+                (6, true),
+                (7, true),
+                (8, true),
+            ],
+            "only the target and the tail the cache can hold are produced"
+        );
+        let statistics = reader.statistics();
+        assert_eq!(statistics.samples_submitted, 9);
+        assert_eq!(statistics.samples_skipped, 6);
+        assert_eq!(statistics.resets, 1, "the walk itself is one decode");
+    }
+
+    #[test]
+    fn a_frame_the_walk_went_past_is_decoded_again_rather_than_reported_missing() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let factory = HintFactory {
+            wanted: Arc::clone(&log),
+        };
+        let mut reader = ExactFrameReader::new(
+            &factory,
+            config(),
+            single_group_of_pictures(),
+            small_cache(),
+        )
+        .unwrap();
+        let cancellation = CancellationToken::new();
+        reader.get(FrameIndex(8), &cancellation).unwrap();
+        let resets = reader.statistics().resets;
+
+        // Frame 4 was submitted with nothing wanting its picture, so this decoder will never
+        // emit it again. The reader has to notice that and start over, exactly as it does for a
+        // frame it published and then evicted.
+        assert_eq!(
+            value(&reader.get(FrameIndex(4), &cancellation).unwrap()),
+            40
+        );
+        assert_eq!(reader.statistics().resets, resets + 1);
+        // And having decoded it, it is a cached frame again rather than a second reset.
+        assert_eq!(
+            value(&reader.get(FrameIndex(4), &cancellation).unwrap()),
+            40
+        );
+        assert_eq!(reader.statistics().resets, resets + 1);
+    }
+
+    #[test]
+    fn a_reordered_frame_at_or_past_the_target_is_kept_for_the_request_that_follows() {
+        // Decode order 0, 4, 2, 1, 3: reaching frame 4 means submitting samples whose own
+        // frames are 2, 1 and 3, which is a walk *backwards* in presentation order. Skipping by
+        // decode position would discard them and make every following request a fresh walk.
+        let samples = vec![
+            sample(0, 0, true),
+            sample(4, 40, false),
+            sample(2, 20, false),
+            sample(1, 10, false),
+            sample(3, 30, false),
+            sample(8, 80, false),
+            sample(6, 60, false),
+            sample(5, 50, false),
+            sample(7, 70, false),
+        ];
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let factory = HintFactory {
+            wanted: Arc::clone(&log),
+        };
+        let mut reader = ExactFrameReader::new(&factory, config(), samples, small_cache()).unwrap();
+        let cancellation = CancellationToken::new();
+
+        assert_eq!(
+            value(&reader.get(FrameIndex(4), &cancellation).unwrap()),
+            40
+        );
+        let resets = reader.statistics().resets;
+        for (index, expected) in [(1_u64, 10_u8), (2, 20), (3, 30)] {
+            assert_eq!(
+                value(&reader.get(FrameIndex(index), &cancellation).unwrap()),
+                expected,
+                "frame {index} is still available"
+            );
+        }
+        assert_eq!(
+            reader.statistics().resets,
+            resets,
+            "a frame after the target in decode order is not skipped"
+        );
+        assert_eq!(
+            reader.statistics().samples_skipped,
+            1,
+            "only frame 0, the random-access point the walk starts from, is behind frame 4"
+        );
+    }
+
+    #[test]
+    fn a_walk_leaves_the_frames_behind_its_target_cached_so_stepping_back_is_free() {
+        // Walking fills the cache with the frames just before the target as a side effect, and
+        // that is what makes the example's previous-frame key cheap. Skipping those too would
+        // send every backward step all the way back to the random-access point.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let factory = HintFactory {
+            wanted: Arc::clone(&log),
+        };
+        let samples: Vec<_> = (0..40)
+            .map(|index| sample(index, index as u8, index == 0))
+            .collect();
+        let mut reader = ExactFrameReader::new(
+            &factory,
+            config(),
+            samples,
+            Limits {
+                max_cached_frames: 4,
+                ..Limits::default()
+            },
+        )
+        .unwrap();
+        let cancellation = CancellationToken::new();
+        reader.get(FrameIndex(32), &cancellation).unwrap();
+        let after_walk = reader.statistics();
+        assert_eq!(after_walk.samples_skipped, 28, "frames 0 to 27 are skipped");
+
+        for index in [31_u64, 30, 29] {
+            assert_eq!(
+                value(&reader.get(FrameIndex(index), &cancellation).unwrap()),
+                index as u8
+            );
+        }
+        assert_eq!(
+            reader.statistics().resets,
+            after_walk.resets,
+            "the tail the walk kept is in the cache, so stepping back decodes nothing"
+        );
+        assert_eq!(
+            reader.statistics().samples_submitted,
+            after_walk.samples_submitted
+        );
+    }
+
+    #[test]
+    fn a_step_converts_its_own_picture_and_no_tail_behind_it() {
+        // The charge issue #402 is about. A destination keeps the frames behind it because the
+        // request after it is very likely to be for one of them; a step is passed through on
+        // the way somewhere else, so those frames are converted for a request that never comes,
+        // and a walk that steps more often than the tail is long converts everything it passes.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let factory = HintFactory {
+            wanted: Arc::clone(&log),
+        };
+        let samples: Vec<_> = (0..40)
+            .map(|index| sample(index, index as u8, index == 0))
+            .collect();
+        let mut reader = ExactFrameReader::new(
+            &factory,
+            config(),
+            samples,
+            Limits {
+                max_cached_frames: 4,
+                ..Limits::default()
+            },
+        )
+        .unwrap();
+        let cancellation = CancellationToken::new();
+
+        assert_eq!(
+            value(&reader.get_step(FrameIndex(32), &cancellation).unwrap()),
+            32
+        );
+        let after_step = reader.statistics();
+        assert_eq!(
+            after_step.samples_skipped, 32,
+            "frames 0 to 31 are all passed through, tail included"
+        );
+        assert_eq!(
+            reader.cached_frames(),
+            1,
+            "only the picture the step asked for was converted"
+        );
+    }
+
+    #[test]
+    fn a_walk_of_steps_converts_what_it_asks_for_rather_than_what_it_passes() {
+        // The shape of a drag's preview walk: repeated forward steps towards a far target. Each
+        // step used to pay its own cache tail, and with a stride shorter than the tail the tails
+        // overlapped and covered the whole span. As steps, the walk converts one picture per
+        // step however long the span is.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let factory = HintFactory {
+            wanted: Arc::clone(&log),
+        };
+        let samples: Vec<_> = (0..64)
+            .map(|index| sample(index, index as u8, index == 0))
+            .collect();
+        let mut reader = ExactFrameReader::new(
+            &factory,
+            config(),
+            samples,
+            Limits {
+                max_cached_frames: 8,
+                ..Limits::default()
+            },
+        )
+        .unwrap();
+        let cancellation = CancellationToken::new();
+
+        // A stride of 4 against a tail of 8: every frame in the span is within some step's tail.
+        let steps: Vec<u64> = (4..60).step_by(4).collect();
+        for step in &steps {
+            reader.get_step(FrameIndex(*step), &cancellation).unwrap();
+        }
+        let converted = reader.statistics().samples_submitted - reader.statistics().samples_skipped;
+        assert_eq!(
+            converted,
+            steps.len() as u64,
+            "one conversion per published step, not one per frame passed"
+        );
+        assert_eq!(
+            reader.statistics().resets,
+            1,
+            "only the cold start resets; a forward walk of steps never starts over again"
+        );
+    }
+
+    #[test]
+    fn a_step_walk_that_ends_in_a_destination_still_leaves_a_cache_tail_to_step_back_through() {
+        // What the request split must not cost: a committed scrub is a walk of steps that ends
+        // at the frame under the pointer, and stepping backwards from there is still expected
+        // to come out of the cache rather than walking from the random-access point again.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let factory = HintFactory {
+            wanted: Arc::clone(&log),
+        };
+        let samples: Vec<_> = (0..40)
+            .map(|index| sample(index, index as u8, index == 0))
+            .collect();
+        let mut reader = ExactFrameReader::new(
+            &factory,
+            config(),
+            samples,
+            Limits {
+                max_cached_frames: 4,
+                ..Limits::default()
+            },
+        )
+        .unwrap();
+        let cancellation = CancellationToken::new();
+
+        for step in [8_u64, 16, 24] {
+            reader.get_step(FrameIndex(step), &cancellation).unwrap();
+        }
+        reader.get(FrameIndex(32), &cancellation).unwrap();
+        let after_walk = reader.statistics();
+
+        for index in [31_u64, 30, 29] {
+            assert_eq!(
+                value(&reader.get(FrameIndex(index), &cancellation).unwrap()),
+                index as u8
+            );
+        }
+        assert_eq!(
+            reader.statistics().resets,
+            after_walk.resets,
+            "the destination kept its tail, so stepping back decodes nothing"
+        );
+        assert_eq!(
+            reader.statistics().samples_submitted,
+            after_walk.samples_submitted
+        );
+    }
+
+    /// A decoder that releases each picture one sample late, and drops whatever it is holding
+    /// when nothing wants its output - which is what a reordering decoder does.
+    struct LateFactory;
+
+    struct LateDecoder {
+        configuration: VideoDecoderConfig,
+        limits: Limits,
+        held: Option<EncodedVideoSample>,
+        output_wanted: bool,
+    }
+
+    impl VideoDecoderFactory for LateFactory {
+        fn capability(&self, _: &VideoDecoderConfig) -> CodecSupport {
+            CodecSupport::Supported {
+                implementation: CodecImplementation::Software,
+            }
+        }
+
+        fn create(
+            &self,
+            configuration: &VideoDecoderConfig,
+            limits: &Limits,
+        ) -> Result<Box<dyn VideoDecoder>> {
+            Ok(Box::new(LateDecoder {
+                configuration: configuration.clone(),
+                limits: *limits,
+                held: None,
+                output_wanted: true,
+            }))
+        }
+    }
+
+    impl LateDecoder {
+        fn release(&self, sample: EncodedVideoSample) -> Result<Vec<DecodedVideoFrame>> {
+            if !self.output_wanted {
+                return Ok(Vec::new());
+            }
+            Ok(vec![DecodedVideoFrame {
+                presentation_index: sample.presentation_index,
+                frame: VideoFrame::new(
+                    self.configuration.coded_dimensions,
+                    PixelFormat::Gray8,
+                    ColorRange::Full,
+                    vec![Plane {
+                        data: sample.data,
+                        stride: 1,
+                    }],
+                    &self.limits,
+                )?,
+            }])
+        }
+    }
+
+    impl VideoDecoder for LateDecoder {
+        fn submit(
+            &mut self,
+            sample: &EncodedVideoSample,
+            cancellation: &CancellationToken,
+        ) -> Result<Vec<DecodedVideoFrame>> {
+            cancellation.check()?;
+            match self.held.replace(sample.clone()) {
+                Some(previous) => self.release(previous),
+                None => Ok(Vec::new()),
+            }
+        }
+
+        fn drain(&mut self, _: &CancellationToken) -> Result<Vec<DecodedVideoFrame>> {
+            match self.held.take() {
+                Some(held) => self.release(held),
+                None => Ok(Vec::new()),
+            }
+        }
+
+        fn reset(&mut self) -> Result<()> {
+            self.held = None;
+            Ok(())
+        }
+
+        fn set_output_wanted(&mut self, wanted: bool) {
+            self.output_wanted = wanted;
+        }
+    }
+
+    #[test]
+    fn a_frame_still_inside_a_reordering_decoder_when_output_stops_is_written_off_too() {
+        // The frame a decoder is holding when output stops being wanted comes out during the
+        // suppressed stretch and is dropped, even though its own sample was submitted while
+        // output was still wanted. A reader that does not write it off believes it can still be
+        // asked for and reports the decoder as malformed when it never arrives.
+        let mut reader = ExactFrameReader::new(
+            &LateFactory,
+            config(),
+            single_group_of_pictures(),
+            small_cache(),
+        )
+        .unwrap();
+        let cancellation = CancellationToken::new();
+
+        // Reaching frame 4 means submitting frame 5's sample to release it, so the decoder is
+        // left holding frame 5 - which it releases, and drops, on the first suppressed submit of
+        // the request that follows.
+        assert_eq!(
+            value(&reader.get(FrameIndex(4), &cancellation).unwrap()),
+            40
+        );
+        assert_eq!(
+            value(&reader.get(FrameIndex(9), &cancellation).unwrap()),
+            90
+        );
+        assert_eq!(
+            value(&reader.get(FrameIndex(5), &cancellation).unwrap()),
+            50,
+            "the frame that was dropped in flight is decoded again, not reported missing"
+        );
+    }
+
+    #[test]
+    fn a_decoder_that_ignores_the_hint_still_answers_every_frame() {
+        // `set_output_wanted` is advisory: `uncompressed_video_decoder_factory` does not
+        // implement it, and the reader has to be no less correct for that.
+        let factory = uncompressed_video_decoder_factory();
+        let mut reader = ExactFrameReader::new(
+            &factory,
+            config(),
+            single_group_of_pictures(),
+            small_cache(),
+        )
+        .unwrap();
+        let cancellation = CancellationToken::new();
+        reader.get(FrameIndex(8), &cancellation).unwrap();
+        assert_eq!(reader.statistics().samples_skipped, 6);
+        for index in 0..9_u64 {
+            assert_eq!(
+                value(&reader.get(FrameIndex(index), &cancellation).unwrap()),
+                (index * 10) as u8,
+                "frame {index} came back from the decoder that ignored the hint"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_packets_and_cancellation_are_reported() {
+        let factory = uncompressed_video_decoder_factory();
+        let mut reader = ExactFrameReader::new(
+            &factory,
+            config(),
+            vec![EncodedVideoSample {
+                presentation_index: FrameIndex(0),
+                random_access: true,
+                data: Vec::new(),
+            }],
+            Limits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            reader
+                .get(FrameIndex(0), &CancellationToken::new())
+                .unwrap_err()
+                .kind(),
+            ErrorKind::MalformedMedia
+        );
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert_eq!(
+            reader.get(FrameIndex(0), &cancelled).unwrap_err().kind(),
+            ErrorKind::Cancelled
+        );
+    }
+
+    #[test]
+    fn random_access_decode_work_obeys_the_configured_bound() {
+        let factory = uncompressed_video_decoder_factory();
+        let mut reader = ExactFrameReader::new(
+            &factory,
+            config(),
+            vec![sample(0, 1, true), sample(1, 2, false), sample(2, 3, false)],
+            Limits {
+                max_decode_samples_per_seek: 2,
+                ..Limits::default()
+            },
+        )
+        .unwrap();
+        let error = reader
+            .get(FrameIndex(2), &CancellationToken::new())
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::ResourceLimit);
+        assert_eq!(reader.statistics().samples_submitted, 2);
+    }
+
+    struct DelayedFactory;
+    impl VideoDecoderFactory for DelayedFactory {
+        fn capability(&self, _: &VideoDecoderConfig) -> CodecSupport {
+            CodecSupport::Supported {
+                implementation: CodecImplementation::Software,
+            }
+        }
+        fn create(
+            &self,
+            configuration: &VideoDecoderConfig,
+            limits: &Limits,
+        ) -> Result<Box<dyn VideoDecoder>> {
+            Ok(Box::new(DelayedDecoder {
+                configuration: configuration.clone(),
+                limits: *limits,
+                delayed: None,
+            }))
+        }
+    }
+    struct DelayedDecoder {
+        configuration: VideoDecoderConfig,
+        limits: Limits,
+        delayed: Option<EncodedVideoSample>,
+    }
+    impl DelayedDecoder {
+        fn decode(&self, sample: EncodedVideoSample) -> Result<DecodedVideoFrame> {
+            Ok(DecodedVideoFrame {
+                presentation_index: sample.presentation_index,
+                frame: VideoFrame::new(
+                    self.configuration.coded_dimensions,
+                    PixelFormat::Gray8,
+                    ColorRange::Full,
+                    vec![Plane {
+                        data: sample.data,
+                        stride: 1,
+                    }],
+                    &self.limits,
+                )?,
+            })
+        }
+    }
+    impl VideoDecoder for DelayedDecoder {
+        fn submit(
+            &mut self,
+            sample: &EncodedVideoSample,
+            cancellation: &CancellationToken,
+        ) -> Result<Vec<DecodedVideoFrame>> {
+            cancellation.check()?;
+            let previous = self.delayed.replace(sample.clone());
+            previous
+                .map(|sample| self.decode(sample).map(|frame| vec![frame]))
+                .unwrap_or(Ok(Vec::new()))
+        }
+        fn drain(&mut self, cancellation: &CancellationToken) -> Result<Vec<DecodedVideoFrame>> {
+            cancellation.check()?;
+            self.delayed
+                .take()
+                .map(|sample| self.decode(sample).map(|frame| vec![frame]))
+                .unwrap_or(Ok(Vec::new()))
+        }
+        fn reset(&mut self) -> Result<()> {
+            self.delayed = None;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn delayed_output_drains_and_reset_clears_state() {
+        let mut reader = ExactFrameReader::new(
+            &DelayedFactory,
+            config(),
+            vec![sample(0, 11, true), sample(1, 22, false)],
+            Limits::default(),
+        )
+        .unwrap();
+        let cancellation = CancellationToken::new();
+        assert_eq!(
+            value(&reader.get(FrameIndex(1), &cancellation).unwrap()),
+            22
+        );
+        assert_eq!(reader.statistics().drains, 1);
+        reader.reset().unwrap();
+        assert_eq!(reader.cached_frames(), 0);
+        assert_eq!(
+            value(&reader.get(FrameIndex(0), &cancellation).unwrap()),
+            11
+        );
+    }
+
+    #[test]
+    fn sequential_playback_through_a_pipelined_decoder_does_not_reset_every_frame() {
+        // `DelayedDecoder` only emits a frame's output on the *next* `submit` call (or on
+        // `drain`), modeling the one-frame pipeline latency a real reordering decoder exhibits.
+        // Even though `next_decode_position` therefore always runs one step ahead of the frame
+        // a straightforward sequential `get(0), get(1), get(2), ...` walk is actually waiting
+        // on, that lag must not force a full reset-and-redecode-from-keyframe on every call.
+        let mut reader = ExactFrameReader::new(
+            &DelayedFactory,
+            config(),
+            vec![
+                sample(0, 11, true),
+                sample(1, 22, false),
+                sample(2, 33, false),
+                sample(3, 44, false),
+                sample(4, 55, false),
+            ],
+            Limits::default(),
+        )
+        .unwrap();
+        let cancellation = CancellationToken::new();
+
+        assert_eq!(
+            value(&reader.get(FrameIndex(0), &cancellation).unwrap()),
+            11
+        );
+        assert_eq!(reader.statistics().resets, 1);
+
+        for (index, expected) in [(1, 22_u8), (2, 33), (3, 44), (4, 55)] {
+            let frame = reader.get(FrameIndex(index), &cancellation).unwrap();
+            assert_eq!(value(&frame), expected);
+            assert_eq!(
+                reader.statistics().resets,
+                1,
+                "sequential forward playback must not reset once decoding has started"
+            );
+        }
+        assert_eq!(reader.statistics().samples_submitted, 5);
+        assert_eq!(reader.statistics().drains, 1);
+    }
+
+    struct MalformedOutputFactory;
+
+    impl VideoDecoderFactory for MalformedOutputFactory {
+        fn capability(&self, _: &VideoDecoderConfig) -> CodecSupport {
+            CodecSupport::Supported {
+                implementation: CodecImplementation::Software,
+            }
+        }
+
+        fn create(
+            &self,
+            configuration: &VideoDecoderConfig,
+            limits: &Limits,
+        ) -> Result<Box<dyn VideoDecoder>> {
+            let factory = UncompressedVideoDecoderFactory;
+            factory.create(configuration, limits).map(|decoder| {
+                Box::new(MalformedOutputDecoder {
+                    decoder,
+                    previous: None,
+                }) as Box<dyn VideoDecoder>
+            })
+        }
+    }
+
+    struct MalformedOutputDecoder {
+        decoder: Box<dyn VideoDecoder>,
+        previous: Option<FrameIndex>,
+    }
+
+    impl VideoDecoder for MalformedOutputDecoder {
+        fn submit(
+            &mut self,
+            sample: &EncodedVideoSample,
+            cancellation: &CancellationToken,
+        ) -> Result<Vec<DecodedVideoFrame>> {
+            let mut output = self.decoder.submit(sample, cancellation)?;
+            if let (Some(previous), Some(frame)) = (self.previous, output.first_mut()) {
+                frame.presentation_index = previous;
+            }
+            self.previous = Some(sample.presentation_index);
+            Ok(output)
+        }
+
+        fn drain(&mut self, cancellation: &CancellationToken) -> Result<Vec<DecodedVideoFrame>> {
+            self.decoder.drain(cancellation)
+        }
+
+        fn reset(&mut self) -> Result<()> {
+            self.previous = None;
+            self.decoder.reset()
+        }
+    }
+
+    #[test]
+    fn malformed_backend_output_is_rejected() {
+        let mut reader = ExactFrameReader::new(
+            &MalformedOutputFactory,
+            config(),
+            vec![sample(0, 1, true), sample(1, 2, false)],
+            Limits::default(),
+        )
+        .unwrap();
+        let error = reader
+            .get(FrameIndex(1), &CancellationToken::new())
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::MalformedMedia);
+    }
+}

@@ -34,14 +34,16 @@ fn native_hevc_decoder_matches_an_independent_decode_of_the_bundled_sample() {
     // file was run (#599). As the AV1 colour sample below does, every frame is
     // checked in order instead, followed by backward and forward seeks. The
     // three patterns still run for HEVC Main on the 32-frame groups of
-    // `bbb_hevc_512x288_gop32.mp4`, in `src/hevc/mod.rs`.
-    let expected = include_str!("fixtures/codec/big_buck_bunny_hevc_rgba.sha256")
-        .lines()
-        .map(|line| {
-            let (_, digest) = line.split_once(' ').unwrap();
-            FrameDigest::from_hex(digest).unwrap()
-        })
-        .collect::<Vec<_>>();
+    // `bbb_hevc_512x288_gop32.mp4`, in `crates/zvidlib-hevc-decoder/src/lib.rs`.
+    let expected = include_str!(
+        "../crates/zvidlib-hevc-decoder/tests/fixtures/big_buck_bunny_hevc_rgba.sha256"
+    )
+    .lines()
+    .map(|line| {
+        let (_, digest) = line.split_once(' ').unwrap();
+        FrameDigest::from_hex(digest).unwrap()
+    })
+    .collect::<Vec<_>>();
     let limits = Limits::default();
     let source = MemorySource::new(include_bytes!("../examples/media/BigBuckBunny.mp4").to_vec());
     let vector = block_on(VideoDecoderConformanceVector::from_mp4(
@@ -112,16 +114,20 @@ fn native_hevc_decoder_matches_an_independent_decode_of_the_bundled_sample() {
 /// to an 8-bit-only accelerated backend first.
 #[test]
 fn native_hevc_decoder_conforms_for_main10() {
-    let expected = include_str!("fixtures/codec/bbb_hevc_main10_128x72_rgba.sha256")
-        .lines()
-        .map(|line| {
-            let (_, digest) = line.split_once(' ').unwrap();
-            FrameDigest::from_hex(digest).unwrap()
-        })
-        .collect::<Vec<_>>();
+    let expected = include_str!(
+        "../crates/zvidlib-hevc-decoder/tests/fixtures/bbb_hevc_main10_128x72_rgba.sha256"
+    )
+    .lines()
+    .map(|line| {
+        let (_, digest) = line.split_once(' ').unwrap();
+        FrameDigest::from_hex(digest).unwrap()
+    })
+    .collect::<Vec<_>>();
     let limits = Limits::default();
-    let source =
-        MemorySource::new(include_bytes!("fixtures/codec/bbb_hevc_main10_128x72.mp4").to_vec());
+    let source = MemorySource::new(
+        include_bytes!("../crates/zvidlib-hevc-decoder/tests/fixtures/bbb_hevc_main10_128x72.mp4")
+            .to_vec(),
+    );
     let vector = block_on(VideoDecoderConformanceVector::from_mp4(
         "HEVC Main 10 sample",
         &source,
@@ -155,13 +161,15 @@ fn native_hevc_decoder_conforms_for_main10() {
 /// tail it keeps behind it, and a frame it passed are all still the fixture's frames.
 #[test]
 fn a_seek_that_skips_the_pictures_it_passes_still_decodes_the_frames_it_returns() {
-    let expected = include_str!("fixtures/codec/big_buck_bunny_hevc_rgba.sha256")
-        .lines()
-        .map(|line| {
-            let (_, digest) = line.split_once(' ').unwrap();
-            FrameDigest::from_hex(digest).unwrap()
-        })
-        .collect::<Vec<_>>();
+    let expected = include_str!(
+        "../crates/zvidlib-hevc-decoder/tests/fixtures/big_buck_bunny_hevc_rgba.sha256"
+    )
+    .lines()
+    .map(|line| {
+        let (_, digest) = line.split_once(' ').unwrap();
+        FrameDigest::from_hex(digest).unwrap()
+    })
+    .collect::<Vec<_>>();
     let limits = Limits::default();
     let source = MemorySource::new(include_bytes!("../examples/media/BigBuckBunny.mp4").to_vec());
     let vector = block_on(VideoDecoderConformanceVector::from_mp4(
@@ -245,7 +253,7 @@ fn a_seek_that_skips_the_pictures_it_passes_still_decodes_the_frames_it_returns(
 
 /// Splits a low-overhead AV1 byte stream into temporal units, delimited by
 /// (and including) each `TemporalDelimiter` OBU (`obu_type == 2`). Mirrors
-/// the parsing `tests/av1_inter_decoder.rs` already uses for this fixture.
+/// the parsing `crates/zvidlib-av1/tests/av1_inter_decoder.rs` already uses for this fixture.
 fn av1_temporal_units(stream: &[u8]) -> Vec<&[u8]> {
     let mut starts = Vec::new();
     let mut cursor = 0usize;
@@ -285,7 +293,7 @@ fn av1_temporal_units(stream: &[u8]) -> Vec<&[u8]> {
 /// A minimal `av1C` box declaring an 8-bit monochrome Main-profile stream
 /// with no `configOBUs` (AV1 spec §5.9.16 does not require the sequence
 /// header to be repeated there; this decoder validates coded dimensions
-/// against each decoded frame instead, see `src/av1_decoder.rs`).
+/// against each decoded frame instead, see `crates/zvidlib-av1-decoder/src/lib.rs`).
 fn av1c_monochrome_main() -> Vec<u8> {
     let payload = [0x81_u8, 0x00, 0x1C, 0x00];
     let mut bytes = (8_u32 + payload.len() as u32).to_be_bytes().to_vec();
@@ -297,7 +305,7 @@ fn av1c_monochrome_main() -> Vec<u8> {
 #[test]
 fn native_av1_decoder_conforms_for_sequential_reverse_and_alternating_seeks() {
     // This low-overhead OBU sequence (also exercised directly against
-    // `Av1InterDecoder` in `tests/av1_inter_decoder.rs`) is generated from
+    // `Av1InterDecoder` in `crates/zvidlib-av1/tests/av1_inter_decoder.rs`) is generated from
     // the normative AV1 syntax tables and independently decoded by
     // FFmpeg/libdav1d; see `tests/fixtures/codec/README.md`. It contains a
     // key frame, two refreshed inter references, LAST/LAST2 average
@@ -305,9 +313,11 @@ fn native_av1_decoder_conforms_for_sequential_reverse_and_alternating_seeks() {
     // retained compound frame. The RGBA digests below are the canonical
     // output of this crate's own spec-documented, independently
     // unit-tested `convert_to_rgba8` BT.601 conversion (see
-    // `src/av1_filters.rs`) applied to that hermetically decoded YUV420
+    // `crates/zvidlib-av1/src/av1_filters.rs`) applied to that hermetically decoded YUV420
     // output.
-    let stream_hex = include_str!("fixtures/codec/av1_inter_show_existing_16x16.hex").trim();
+    let stream_hex =
+        include_str!("../crates/zvidlib-av1/tests/fixtures/av1_inter_show_existing_16x16.hex")
+            .trim();
     let stream: Vec<u8> = stream_hex
         .as_bytes()
         .chunks_exact(2)
@@ -316,14 +326,15 @@ fn native_av1_decoder_conforms_for_sequential_reverse_and_alternating_seeks() {
     let units = av1_temporal_units(&stream);
     assert_eq!(units.len(), 5);
 
-    let expected: Vec<FrameDigest> =
-        include_str!("fixtures/codec/av1_inter_show_existing_16x16_rgba.sha256")
-            .lines()
-            .map(|line| {
-                let (_, digest) = line.split_once(' ').unwrap();
-                FrameDigest::from_hex(digest).unwrap()
-            })
-            .collect();
+    let expected: Vec<FrameDigest> = include_str!(
+        "../crates/zvidlib-av1/tests/fixtures/av1_inter_show_existing_16x16_rgba.sha256"
+    )
+    .lines()
+    .map(|line| {
+        let (_, digest) = line.split_once(' ').unwrap();
+        FrameDigest::from_hex(digest).unwrap()
+    })
+    .collect();
     assert_eq!(expected.len(), units.len());
 
     let limits = Limits::default();
@@ -399,13 +410,14 @@ fn native_av1_decoder_matches_an_independent_decode_of_the_colour_sample() {
     // point, so `verify_video_decoder_conformance`'s reverse pattern would
     // re-decode it from the start for nearly every frame; every frame is
     // checked in order instead, followed by backward and forward seeks.
-    let expected = include_str!("fixtures/codec/big_buck_bunny_av1_rgba.sha256")
-        .lines()
-        .map(|line| {
-            let (_, digest) = line.split_once(' ').unwrap();
-            FrameDigest::from_hex(digest).unwrap()
-        })
-        .collect::<Vec<_>>();
+    let expected =
+        include_str!("../crates/zvidlib-av1-decoder/tests/fixtures/big_buck_bunny_av1_rgba.sha256")
+            .lines()
+            .map(|line| {
+                let (_, digest) = line.split_once(' ').unwrap();
+                FrameDigest::from_hex(digest).unwrap()
+            })
+            .collect::<Vec<_>>();
     let limits = Limits::default();
     let source =
         MemorySource::new(include_bytes!("../examples/media/BigBuckBunny.av1.mp4").to_vec());
@@ -462,15 +474,21 @@ fn native_vp9_decoder_conforms_to_libvpx_for_sequential_reverse_and_alternating_
     for (name, mp4, expected, (width, height), frames) in [
         (
             "VP9 256x144 with hidden frames",
-            include_bytes!("fixtures/codec/vp9_bbb_256x144.mp4").as_slice(),
-            include_str!("fixtures/codec/vp9_bbb_256x144_rgba.sha256"),
+            include_bytes!("../crates/zvidlib-vp9-decoder/tests/fixtures/vp9_bbb_256x144.mp4")
+                .as_slice(),
+            include_str!(
+                "../crates/zvidlib-vp9-decoder/tests/fixtures/vp9_bbb_256x144_rgba.sha256"
+            ),
             (256, 144),
             48,
         ),
         (
             "VP9 250x142",
-            include_bytes!("fixtures/codec/vp9_bbb_250x142.mp4").as_slice(),
-            include_str!("fixtures/codec/vp9_bbb_250x142_rgba.sha256"),
+            include_bytes!("../crates/zvidlib-vp9-decoder/tests/fixtures/vp9_bbb_250x142.mp4")
+                .as_slice(),
+            include_str!(
+                "../crates/zvidlib-vp9-decoder/tests/fixtures/vp9_bbb_250x142_rgba.sha256"
+            ),
             (250, 142),
             12,
         ),

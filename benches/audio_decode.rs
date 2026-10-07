@@ -31,7 +31,7 @@
 //! # Which groups have a scalar-versus-SIMD axis
 //!
 //! The Vorbis groups do, and are named `<group>/<isa>` like the per-ISA
-//! groups in `benches/codec.rs`: the decoder and its kernels are this crate's
+//! groups in `crates/zvidlib-av1/benches/codec.rs`: the decoder and its kernels are this crate's
 //! own, dispatched through the `vorbis_decode` site of `zvidlib::simd`, so
 //! each arm runs different code and the bit-exactness guard checks they agree
 //! before any arm is timed.
