@@ -25,6 +25,11 @@
 //! without residual is not split further, intra prediction is not tried
 //! where motion compensation alone codes a block, and the luma intra mode
 //! is chosen with the largest transform before the smaller ones are tried.
+//! Beyond those, it stops searching wherever the result is already decided:
+//! a split's quadrants once they cost more than the block whole, and a
+//! candidate once its cost so far reaches the best one's. It also codes each
+//! transform block's residual once per superblock, however many partitions
+//! and candidates share it.
 //! The encoder keeps a reconstruction that matches the decoding process
 //! exactly: blocks predict from it unfiltered within the frame, and later
 //! frames predict from it after the loop filter.
@@ -478,8 +483,8 @@ pub(super) struct FrameEncoder<'a> {
     /// Whether a candidate was ruled out by a [`Bound`]'s ceiling since
     /// [`Self::choose_block`] last cleared it.
     over_ceiling: bool,
-    /// The inter residuals coded in the current superblock, which the search
-    /// codes again for every partition and candidate that shares one.
+    /// The residuals coded in the current superblock, which the search codes
+    /// again for every partition and candidate that shares one.
     residual_cache: HashMap<ResidualKey, CachedResidual>,
 }
 
@@ -1153,9 +1158,10 @@ impl<'a> FrameEncoder<'a> {
     /// returns its levels, squared error and token bits. A block whose
     /// levels cost more than the distortion they remove is coded empty.
     ///
-    /// An inter block, predicted along `inter`, reuses the coding of the same
-    /// residual earlier in the superblock. The 4x4 transform costs less than
-    /// looking it up, so those are always coded afresh.
+    /// The block reuses the coding of the same residual earlier in the
+    /// superblock: an inter one, predicted along `inter`, from 8x8 up, and an
+    /// intra one from 16x16 up. Smaller transforms cost less than looking
+    /// them up.
     #[allow(clippy::too_many_arguments)]
     fn code_residual(
         &mut self,
@@ -1199,6 +1205,7 @@ impl<'a> FrameEncoder<'a> {
                 y: y as u16,
                 prediction: block_rows(&self.recon, plane, x, y, n)
                     .flat_map(|row| row.chunks_exact(8))
+                    // FxHash's mix, eight samples at a time.
                     .fold(0, |hash: u64, word| {
                         let word = u64::from_le_bytes(word.try_into().expect("eight samples"));
                         (hash.rotate_left(5) ^ word).wrapping_mul(0x517c_c1b7_2722_0a95)
@@ -1270,7 +1277,6 @@ impl<'a> FrameEncoder<'a> {
             }
             prediction_error += u64::from(row_error);
         }
-        // Remembers an empty coding of this residual.
         // An intra block's prediction, kept with its coding.
         let mut prediction_copy = match key {
             Some(ResidualKey::Intra { .. }) => block_rows(&self.recon, plane, x, y, n)
@@ -1279,6 +1285,7 @@ impl<'a> FrameEncoder<'a> {
                 .collect(),
             _ => Vec::new(),
         };
+        // Remembers an empty coding of this residual.
         let mut cache_empty = |encoder: &mut Self| {
             if let Some(key) = key {
                 encoder.residual_cache.insert(
@@ -1458,11 +1465,10 @@ impl<'a> FrameEncoder<'a> {
                 Prediction::Intra(mode),
                 Some(bound),
             ) else {
-                return false;
+                return;
             };
             let total = coding.error as f64 + encoder.lambda * (coding.bits + symbol_bits);
-            let improves = best_luma.as_ref().is_none_or(|best| total < best.cost);
-            if improves {
+            if best_luma.as_ref().is_none_or(|best| total < best.cost) {
                 *best_luma = Some(LumaCandidate {
                     cost: total,
                     tx_size,
@@ -1471,7 +1477,6 @@ impl<'a> FrameEncoder<'a> {
                     coding,
                 });
             }
-            improves
         };
         let luma_order =
             self.intra_order(&[0], mi_row, mi_col, bsl, max_tx_size, |encoder, mode| {
@@ -2768,6 +2773,73 @@ mod tests {
                 class,
                 "magnitude {magnitude}"
             );
+        }
+    }
+
+    #[test]
+    fn token_costs_match_costing_every_bit() {
+        // `coefficient_bits` sums whole tokens where `write_coefficients`
+        // sums bits, so the two agree up to the order of the additions.
+        let mut state = 0x2545_f491_u32;
+        for tx_size in [0, 1, 2, 3] {
+            let n = 4 << tx_size;
+            for tx_type in [
+                TxType::DctDct,
+                TxType::AdstDct,
+                TxType::DctAdst,
+                TxType::AdstAdst,
+            ] {
+                if tx_size == 3 && tx_type != TxType::DctDct {
+                    continue;
+                }
+                for (plane_type, reference, context) in [(0, 0, 0), (0, 1, 1), (1, 0, 2), (1, 1, 0)]
+                {
+                    let levels: Vec<i32> = (0..n * n)
+                        .map(|index| {
+                            state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                            // Mostly small levels, some past the costed
+                            // magnitudes, thinning out with frequency.
+                            let magnitude = match (state >> 16) % 16 {
+                                0..=7 => 0,
+                                8..=12 => ((state >> 8) % 4) as i32,
+                                13 | 14 => ((state >> 8) % 40) as i32,
+                                _ => ((state >> 8) % 3000) as i32,
+                            } >> (index / n).min(4);
+                            if state & 1 == 0 {
+                                magnitude
+                            } else {
+                                -magnitude
+                            }
+                        })
+                        .collect();
+                    let (scan, _) = scan_order(tx_size, tx_type);
+                    let last = scan
+                        .iter()
+                        .rposition(|&position| levels[position as usize] != 0)
+                        .map_or(0, |last| last + 1);
+                    for eob in [last, last / 2, 1] {
+                        let mut counter = BitCost::default();
+                        write_coefficients(
+                            &mut counter,
+                            &levels,
+                            eob,
+                            tx_size,
+                            tx_type,
+                            plane_type,
+                            reference,
+                            context,
+                        );
+                        let bits = coefficient_bits(
+                            &levels, eob, tx_size, tx_type, plane_type, reference, context,
+                        );
+                        assert!(
+                            (bits - counter.0).abs() <= 1e-9 * counter.0.max(1.0),
+                            "{n}x{n} {tx_type:?} eob {eob}: {bits} bits against {}",
+                            counter.0
+                        );
+                    }
+                }
+            }
         }
     }
 

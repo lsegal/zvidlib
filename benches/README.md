@@ -1,7 +1,7 @@
 # Benchmarks
 
 zvidlib's benchmarks run under [criterion](https://docs.rs/criterion) with
-`harness = false`, across nine bench targets that share `benches/support/`:
+`harness = false`, across ten bench targets that share `benches/support/`:
 
 | Target | Measures |
 | --- | --- |
@@ -14,6 +14,7 @@ zvidlib's benchmarks run under [criterion](https://docs.rs/criterion) with
 | `benches/hevc_decode.rs` | the HEVC software decoder: whole-frame decode and every hot stage, scalar versus SIMD |
 | `benches/hevc_hardware.rs` | the platform fixed-function HEVC decoders against the software one, and the hardware HEVC encoder |
 | `benches/exact_seek.rs` | what an exact frame at an arbitrary point costs, by backend and by random-access cadence |
+| `benches/vp9_encode.rs` | the pure-Rust VP9 encoder's rate-distortion search: a key frame, and a key frame with three inter frames |
 
 Each target loads and decodes its fixtures once per process, so every iteration
 measures the work under test and nothing else. `codec` is one target rather than
@@ -39,6 +40,7 @@ cargo bench --bench hevc_encode   # the HEVC encoder groups only
 cargo bench --bench hevc_decode   # the HEVC software decoder only
 cargo bench --bench hevc_hardware # the platform hardware HEVC decoders and encoder
 cargo bench --bench exact_seek    # exact-seek cost by backend and cadence
+cargo bench --bench vp9_encode    # the VP9 encoder, key and inter frames
 cargo bench --features simd       # the same groups, recorded under `simd=on`
 cargo bench --no-run              # compile only
 ```
@@ -4063,6 +4065,38 @@ Measured on a contended Apple Silicon host, best of three interleaved rounds
 against 38.9 ms NEON. Before it, the same group read 11.2 ms scalar against
 9.6 ms NEON at 640x352 and did not separate at all at 1080p, because the in-loop
 filter kernels it called were a minority of its cost.
+
+## The VP9 encoder target
+
+`benches/vp9_encode.rs` times the pure-Rust VP9 encoder through the public
+`native_vp9_video_encoder_factory` on the encoder unit tests' moving content
+at 640x360: a texture panning four samples a frame under a square moving two.
+
+| Group | Work per iteration |
+| --- | --- |
+| `vp9_encode_key_frame` | one key frame: the intra mode, transform size and partition search |
+| `vp9_encode_sequence` | a key frame and three inter frames, adding the motion and inter mode search |
+
+Both are dominated by the rate-distortion search over partitions (64x64 down
+to 8x8) and transform sizes (4x4 to 32x32) that #560 added, and are what #567
+measured its cost with. The encoder has no SIMD dispatch site, so each group
+runs a single arm.
+
+On an Intel Core i9-10850K (Windows, x86_64), interleaved runs of the encoder
+at #560's merge and after #567 measured:
+
+| Group | At #560 | After #567 |
+| --- | --- | --- |
+| `vp9_encode_key_frame` | 358-366 ms | 208-213 ms |
+| `vp9_encode_sequence` | 0.99-1.03 s | 0.47-0.49 s |
+
+#567 made the search cheaper without changing what it decides: the streams
+the encoder's tests check are byte-for-byte the same. It skips the quadrants of a split once
+they already cost more than coding the block whole, and stops coding a
+candidate once its cost so far reaches the best one's; it reuses a transform
+block's coding wherever the search codes the same residual again, costs
+tokens from per-context tables, and keeps the forward transform's scratch
+off the heap.
 
 ## Per-stage access to the encoder
 
