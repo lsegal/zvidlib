@@ -377,6 +377,43 @@ fn mp4_fixtures_decode_bit_exactly_against_libvpx() {
     }
 }
 
+/// The same fixtures decode to libvpx's frames under every instruction set
+/// the host supports, scalar included, through `crate::simd`'s override: the
+/// test above only exercises the widest one. A vector kernel that diverged
+/// from the scalar reference anywhere in a real decode fails here (#570).
+#[test]
+fn mp4_fixtures_decode_bit_exactly_under_every_instruction_set() {
+    let _guard = crate::simd::test_lock();
+    for (mp4, expected) in [
+        (
+            BBB_256X144,
+            include_str!("../../tests/fixtures/codec/vp9_bbb_256x144_yuv420.sha256"),
+        ),
+        (
+            BBB_250X142,
+            include_str!("../../tests/fixtures/codec/vp9_bbb_250x142_yuv420.sha256"),
+        ),
+    ] {
+        let expected = digests(expected);
+        let samples = mp4_samples(mp4);
+        for isa in crate::simd::available() {
+            crate::simd::set_override(Some(isa));
+            assert_eq!(crate::vp9_simd::active_isa(), isa);
+            let mut decoder = Decoder::new(Limits::default());
+            for (index, sample) in samples.iter().enumerate() {
+                let picture = decoder.decode_chunk(&sample.data).unwrap().unwrap();
+                assert_eq!(
+                    yuv_digest(&picture),
+                    expected[index],
+                    "{} frame {index}",
+                    isa.name()
+                );
+            }
+        }
+    }
+    crate::simd::set_override(None);
+}
+
 #[test]
 fn an_inter_frame_after_reset_is_refused_without_panicking() {
     let samples = mp4_samples(BBB_256X144);

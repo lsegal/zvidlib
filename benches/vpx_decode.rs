@@ -16,10 +16,10 @@
 //!
 //! The conversion groups time the kernel on its own. The whole-frame groups
 //! decode a stream the crate's own encoders produce once per process, so an
-//! iteration is decoder work only, conversion included. VP9 has no other vector
-//! kernels, so its scalar-to-vector ratio is how much of a decode the
-//! conversion kernel recovers. VP8's arms also run the `vp8_decode` kernels
-//! (issue #568), which `benches/vp8_decode.rs` measures stage by stage.
+//! iteration is decoder work only, conversion included. Both decoders' arms
+//! also run their own vectorized decoding kernels, which `benches/vp8_decode.rs`
+//! (issue #568) and `benches/vp9_decode.rs` (issue #570) time on their own, the
+//! latter alongside a decode that stops before the conversion.
 //!
 //! See `benches/README.md` for how to run and filter the suite.
 
