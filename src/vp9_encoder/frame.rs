@@ -413,8 +413,8 @@ impl ResidualCache {
         self.levels.clear();
     }
 
-    /// Appends the `n` x `n` block of `plane` at `(x, y)` to the sample
-    /// arena, returning its offset.
+    /// Appends the `n` x `n` transform block of `plane` at `(x, y)` to the
+    /// sample arena, returning its offset.
     fn push_block(
         &mut self,
         picture: &Picture,
@@ -423,17 +423,25 @@ impl ResidualCache {
         y: usize,
         n: usize,
     ) -> usize {
+        fn rows<const WIDTH: usize>(samples: &mut Vec<u8>, block: &[u8], stride: usize) {
+            for row in 0..WIDTH {
+                let row: &[u8; WIDTH] = block[row * stride..][..WIDTH]
+                    .try_into()
+                    .expect("a whole row");
+                samples.extend_from_slice(row);
+            }
+        }
         let start = self.samples.len();
-        self.samples.resize(start + n * n, 0);
         let stride = picture.strides[plane];
-        copy_block(
-            &mut self.samples[start..],
-            n,
-            &picture.planes[plane][y * stride + x..],
-            stride,
-            n,
-            n,
-        );
+        let block = &picture.planes[plane][y * stride + x..];
+        self.samples.reserve(n * n);
+        match n {
+            4 => rows::<4>(&mut self.samples, block, stride),
+            8 => rows::<8>(&mut self.samples, block, stride),
+            16 => rows::<16>(&mut self.samples, block, stride),
+            32 => rows::<32>(&mut self.samples, block, stride),
+            _ => unreachable!("transform blocks are 4 to 32 samples wide"),
+        }
         start
     }
 }
