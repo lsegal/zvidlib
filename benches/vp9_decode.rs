@@ -12,7 +12,7 @@
 //!
 //! | Group | Stage |
 //! | --- | --- |
-//! | `vp9_decode_frame` | whole-frame decode of the bundled 256x144 libvpx stream, to YUV |
+//! | `vp9_decode_to_picture` | whole-frame decode of the bundled 256x144 libvpx stream, stopping at the YUV picture |
 //! | `vp9_inverse_dct_{4x4,8x8,16x16,32x32}` | inverse DCT and add-to-prediction, `src/vp9_simd/transforms.rs` |
 //! | `vp9_inverse_adst_{4x4,8x8,16x16}` | inverse ADST and add-to-prediction |
 //! | `vp9_inverse_wht_4x4` | the lossless Walsh-Hadamard transform |
@@ -25,8 +25,10 @@
 //! The per-stage groups run over one 1080p luma plane each, through
 //! `zvidlib::vp9_decoder_bench`, the narrow benchmark-only surface over the
 //! otherwise crate-private decoder. The whole-frame group stops at the decoded
-//! YUV picture: the public decoder's RGBA output conversion is shared, scalar
-//! code tracked separately, and would only dilute the ratio.
+//! YUV picture, as `hevc_decode_to_picture` does: the public decoder's RGBA
+//! output conversion is the separate `yuv_to_rgba` site, and
+//! `benches/vpx_decode.rs`'s `vp9_decode_frame` is the `submit`-to-RGBA round
+//! trip that includes it.
 //!
 //! See `benches/README.md` for how to run and filter the suite.
 
@@ -70,7 +72,7 @@ fn bench_stages(criterion: &mut Criterion, stages: Vec<(IsaWorkload<'_>, Stage)>
 
 /// The bundled 256x144 stream, libvpx's two-pass encode of the sample with
 /// hidden alternate reference frames, decoded end to end.
-fn vp9_decode_frame(criterion: &mut Criterion) {
+fn vp9_decode_to_picture(criterion: &mut Criterion) {
     let source =
         MemorySource::new(include_bytes!("../tests/fixtures/codec/vp9_bbb_256x144.mp4").to_vec());
     let movie = block_on(Mp4Demuxer::open(&source, Mp4DemuxerOptions::default()))
@@ -83,7 +85,7 @@ fn vp9_decode_frame(criterion: &mut Criterion) {
     let stage = Stage::decode(samples.into_iter().map(|sample| sample.data).collect());
     let workload = IsaWorkload {
         measurement_time: Duration::from_secs(5),
-        ..IsaWorkload::new("vp9_decode_frame", FrameWork::new(frames, 256, 144))
+        ..IsaWorkload::new("vp9_decode_to_picture", FrameWork::new(frames, 256, 144))
     };
     bench_across_isas(criterion, &workload, || stage.run());
 }
@@ -208,7 +210,7 @@ fn vp9_loop_filter(criterion: &mut Criterion) {
 criterion_group!(
     benches,
     log_host_isas,
-    vp9_decode_frame,
+    vp9_decode_to_picture,
     vp9_inverse_transforms,
     vp9_inter_prediction,
     vp9_intra_prediction,

@@ -4,7 +4,8 @@
 //! separate crate, so `benches/vp9_decode.rs` cannot otherwise reach the
 //! inverse transforms, the convolution, the intra predictors or the loop
 //! filter on their own, nor a decode that stops at the YUV picture rather
-//! than paying for the separate RGBA conversion the public decoder ends with.
+//! than paying for the RGBA conversion the public decoder ends with, which is
+//! a dispatch site of its own (`yuv_to_rgba`).
 //!
 //! Each [`Stage`] owns deterministic inputs built once, and
 //! [`Stage::run`] does the stage's work over a whole plane through the same

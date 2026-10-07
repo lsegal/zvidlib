@@ -18,16 +18,17 @@ checks (issue #341):
 
   * a branch into `core::core_arch`, or a `core::core_arch` symbol defined at
     all - an intrinsic that was not inlined, anywhere in the crate; and
-  * a symbol for an `av1_simd` or `vp9_simd` generic kernel monomorphized over
-    one of the `av1_simd::vector` types - the kernel the wrapper was supposed to
-    absorb, left standing on its own.
+  * a symbol for an `av1_simd`, `vorbis_simd` or `vp9_simd` generic kernel
+    monomorphized over one of the `vector` types - the kernel the wrapper was
+    supposed to absorb, left standing on its own.
 
 The first rule is crate-wide and so covers every `#[target_feature]` site the
 crate has, `hevc::engine::simd`, `hevc::engine::transform_simd`,
-`hevc::color_convert` and `av1_mc` included: an out-of-line intrinsic call is
-the same defect wherever it appears. The second is specific to `av1_simd` and
-`vp9_simd` because only those modules dispatch through generic kernels (the VP9
-ones are written over the AV1 vector types); the other sites write their
+`hevc::color_convert`, `yuv_to_rgba` and `av1_mc` included: an out-of-line
+intrinsic call is the same defect wherever it appears. The second covers the
+three modules that dispatch through generic kernels, `av1_simd`,
+`vorbis_simd` (issue #572) and `vp9_simd` (issue #570, whose kernels are
+written over the `av1_simd` vector types); the other sites write their
 intrinsics directly inside the `#[target_feature]` function, where there is no
 separate body for the inliner to leave behind.
 
@@ -75,7 +76,8 @@ BRANCH = re.compile(r"^\s+(call|callq|jmp|jmpq|bl|b)\s+([^\s;#]+)")
 # comment from reading as a symbol.
 CORE_ARCH = re.compile(r"9core_arch")
 AV1_SIMD = re.compile(r"8av1_simd")
-KERNEL_MODULE = re.compile(r"8(av1|vp9)_simd")
+# The modules whose kernels are generic over a `vector` type.
+GENERIC_KERNEL_MODULE = re.compile(r"8av1_simd|11vorbis_simd|8vp9_simd")
 VECTOR_TYPE = re.compile(r"6vector3(x86|arm)")
 
 # A crate disambiguator (`Cs7lEMBtiCmc_`) and a legacy mangling hash
@@ -142,14 +144,14 @@ def is_core_arch(symbol: str) -> bool:
 
 
 def is_outlined_kernel(symbol: str) -> bool:
-    """True for an `av1_simd` or `vp9_simd` item monomorphized over an
-    `av1_simd::vector` type.
+    """True for an `av1_simd`, `vorbis_simd` or `vp9_simd` item monomorphized
+    over one of the `vector` types.
 
     That combination only occurs for a generic kernel instantiation: the
     `#[target_feature]` wrappers are not generic, and the vector types' own
     inherent items would not mention a second `av1_simd` path component.
     """
-    return bool(KERNEL_MODULE.search(symbol) and VECTOR_TYPE.search(symbol))
+    return bool(GENERIC_KERNEL_MODULE.search(symbol) and VECTOR_TYPE.search(symbol))
 
 
 def analyze(lines) -> tuple[list[str], int]:

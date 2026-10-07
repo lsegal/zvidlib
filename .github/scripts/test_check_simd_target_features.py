@@ -31,6 +31,14 @@ OUTLINED_VP9_KERNEL = (
     "NtNtNtB6_8av1_simd6vector3x864Avx2EB8_"
 )
 
+# `vorbis_simd::kernels::overlap_add::<vector::x86::Avx2>`, the same defect in
+# the Vorbis kernels' generic module (issue #572), mangled the way the AV1 one
+# above is.
+OUTLINED_VORBIS_KERNEL = (
+    "__RINvNtNtCs7lEMBtiCmc_7zvidlib11vorbis_simd7kernels11overlap_add"
+    "NtNtNtB4_6vector3x864Avx2EB6_"
+)
+
 # `core::core_arch::x86::avx2::_mm256_and_si256`, an intrinsic emitted as a
 # function because the caller was not compiled with AVX2 enabled.
 INTRINSIC = "__RNvNtNtNtCsl7QZrza34zr_4core9core_arch3x864avx216__mm256_and_si256"
@@ -74,6 +82,13 @@ class ClassificationTest(unittest.TestCase):
 
     def test_a_generic_vp9_kernel_instantiation_is_outlined(self):
         self.assertTrue(checker.is_outlined_kernel(OUTLINED_VP9_KERNEL))
+
+    def test_a_vorbis_kernel_instantiation_is_outlined(self):
+        self.assertTrue(checker.is_outlined_kernel(OUTLINED_VORBIS_KERNEL))
+        self.assertEqual(
+            checker.readable(OUTLINED_VORBIS_KERNEL),
+            "zvidlib::vorbis_simd::kernels::overlap_add::vector::x86::Avx2",
+        )
 
     def test_an_intrinsic_is_recognized(self):
         self.assertTrue(checker.is_core_arch(INTRINSIC))
