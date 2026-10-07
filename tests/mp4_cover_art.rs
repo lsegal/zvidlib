@@ -1,3 +1,8 @@
+//! Pins no-cover MP4 output byte for byte and round-trips JPEG and PNG cover
+//! art through `Mp4Muxer` and `Mp4Demuxer` (#502), and checks the cover
+//! `MediaOutput` generates from a frame (#510). The output is also checked
+//! with ffprobe where it is installed.
+
 use std::future::Future;
 use std::pin::Pin;
 use std::process::{Command, Stdio};

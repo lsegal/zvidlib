@@ -1,3 +1,11 @@
+//! The registered HEVC (Main and Main 10), AV1 and VP9 decoders against
+//! reference RGBA digests through sequential, reverse and alternating seeks
+//! (#508, #527), and a seek that skips pictures still returning the fixture's
+//! frames. The bundled 1080p HEVC and AV1 samples have one random-access point
+//! each, so they are walked in order with a few seeks instead; a reverse walk
+//! of either re-decodes the whole track per frame and does not finish on a
+//! CI runner.
+
 #![cfg(not(target_arch = "wasm32"))]
 
 use std::future::Future;
