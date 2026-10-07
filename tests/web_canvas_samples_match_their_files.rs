@@ -11,8 +11,7 @@
 //! [`zvidlib::derive_codec_string`] performs on the track's own `hvcC`/`av1C` box when the page
 //! actually decodes it.
 //!
-//! Deliberately a hand-rolled scan rather than a JavaScript parse, for the reason
-//! `ci_workflows_cache_cargo` gives for reading YAML line by line: the alternative is a
+//! Deliberately a hand-rolled scan rather than a JavaScript parse: the alternative is a
 //! dependency for a hygiene check, and the file is one object literal per sample with one field
 //! per line.
 
