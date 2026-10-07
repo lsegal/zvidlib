@@ -229,9 +229,9 @@ fn segments_match(pattern: &[&str], path: &[&str]) -> bool {
     match pattern.split_first() {
         None => path.is_empty(),
         Some((&"**", rest)) => (0..=path.len()).any(|skip| segments_match(rest, &path[skip..])),
-        Some((first, rest)) => path
-            .split_first()
-            .is_some_and(|(segment, tail)| segment_matches(first, segment) && segments_match(rest, tail)),
+        Some((first, rest)) => path.split_first().is_some_and(|(segment, tail)| {
+            segment_matches(first, segment) && segments_match(rest, tail)
+        }),
     }
 }
 
@@ -330,7 +330,10 @@ fn excluded_module_cfg(excluded: &str) -> String {
     let parents = if dir == Path::new("src") {
         vec![root.join("src/lib.rs")]
     } else {
-        vec![root.join(dir).join("mod.rs"), root.join(dir).with_extension("rs")]
+        vec![
+            root.join(dir).join("mod.rs"),
+            root.join(dir).with_extension("rs"),
+        ]
     };
     parents
         .iter()
@@ -471,7 +474,11 @@ fn each_job_runs_on_the_files_it_reads() {
         ("rust_tests", "src/hevc/nvdec.rs", true),
         ("rust_tests", "src/wasm_api.rs", false),
         ("rust_tests", "js/browser.js", false),
-        ("rust_tests", "tests/fixtures/codec/libvpx_vp9_test_vectors.txt", true),
+        (
+            "rust_tests",
+            "tests/fixtures/codec/libvpx_vp9_test_vectors.txt",
+            true,
+        ),
         ("rust_tests", "examples/media/BigBuckBunny.mp4", true),
         ("rust_tests", "examples/web_canvas/samples.js", true),
         ("rust_tests", "benches/README.md", true),
@@ -484,10 +491,18 @@ fn each_job_runs_on_the_files_it_reads() {
         ("native_tests", "src/hevc/videotoolbox.rs", true),
         ("native_tests", "src/aac_encoder/windows_mf.rs", true),
         ("native_tests", "src/web_decoder.rs", false),
-        ("native_tests", "tests/support/avfoundation_decode.swift", true),
+        (
+            "native_tests",
+            "tests/support/avfoundation_decode.swift",
+            true,
+        ),
         ("native_tests", "benches/hevc_hardware.rs", true),
         ("macos_swift_rpath", "src/hevc/videotoolbox.rs", true),
-        ("macos_swift_rpath", "tests/macos_swift_runtime_rpath.rs", true),
+        (
+            "macos_swift_rpath",
+            "tests/macos_swift_runtime_rpath.rs",
+            true,
+        ),
         ("macos_swift_rpath", "tests/opus_codec.rs", false),
         ("macos_swift_rpath", "src/web_previews.rs", false),
     ];
@@ -499,13 +514,18 @@ fn each_job_runs_on_the_files_it_reads() {
             format!("`{output}` {verb} on `{path}`")
         })
         .collect();
-    assert!(wrong.is_empty(), "path filters disagree with their jobs' inputs: {wrong:?}");
+    assert!(
+        wrong.is_empty(),
+        "path filters disagree with their jobs' inputs: {wrong:?}"
+    );
 
     // Nothing but the build definition and documentation goes unread: a file
     // outside every filter is a file no change to which runs any check.
     for path in ["README.md", "tools/vorbis_encoder/ref_enc.c"] {
         assert!(
-            !GATED_JOBS.iter().any(|(_, output)| runs(&filters, output, path)),
+            !GATED_JOBS
+                .iter()
+                .any(|(_, output)| runs(&filters, output, path)),
             "`{path}` is expected to run no gated job"
         );
     }
@@ -550,7 +570,10 @@ fn every_file_a_source_includes_runs_the_native_test_jobs() {
             }
         }
     }
-    assert!(checked > 0, "found no `include_str!` or `include_bytes!` to check");
+    assert!(
+        checked > 0,
+        "found no `include_str!` or `include_bytes!` to check"
+    );
     assert!(
         missed.is_empty(),
         "these files are compiled into a native target, so a change to them has to run \
@@ -567,17 +590,23 @@ fn an_exclusion_names_a_module_the_target_does_not_compile() {
     const NOT_WASM: &str = "not(target_arch = \"wasm32\")";
     let filters = filters(&ci_workflow());
     for (name, patterns) in &filters {
-        for excluded in patterns.iter().filter_map(|pattern| pattern.strip_prefix('!')) {
+        for excluded in patterns
+            .iter()
+            .filter_map(|pattern| pattern.strip_prefix('!'))
+        {
             assert!(
                 excluded.starts_with("src/")
                     && !excluded.contains('{')
                     && (excluded.ends_with(".rs")
-                        || excluded.ends_with("/**") && !excluded[..excluded.len() - 3].contains('*')),
+                        || excluded.ends_with("/**")
+                            && !excluded[..excluded.len() - 3].contains('*')),
                 "`{name}` excludes `{excluded}`; exclusions name one module, a `src/` file or a \
                  `src/` module directory, so each can be held to its `cfg`"
             );
             let cfg = excluded_module_cfg(excluded);
-            let positive_wasm = cfg.replace(NOT_WASM, "").contains("target_arch = \"wasm32\"");
+            let positive_wasm = cfg
+                .replace(NOT_WASM, "")
+                .contains("target_arch = \"wasm32\"");
             if name == "wasm" {
                 let off_wasm = cfg.contains(NOT_WASM)
                     || ["windows", "target_os = \"macos\"", "target_os = \"linux\""]
@@ -590,7 +619,8 @@ fn an_exclusion_names_a_module_the_target_does_not_compile() {
                 );
             } else {
                 assert!(
-                    positive_wasm && cfg.starts_with("#[cfg(all(") || cfg == "#[cfg(target_arch = \"wasm32\")]",
+                    (positive_wasm && cfg.starts_with("#[cfg(all("))
+                        || cfg == "#[cfg(target_arch = \"wasm32\")]",
                     "`{excluded}` is skipped by `{name}`, but its module is declared under \
                      {cfg:?}, which does not limit it to wasm32"
                 );
