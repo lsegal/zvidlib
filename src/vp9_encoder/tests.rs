@@ -1071,24 +1071,28 @@ fn panning_inter_frames_find_the_motion() {
             .map(|index| moving_yuv_frame(width, height, index))
             .collect();
         for base_q_idx in [30, 40, 130, 200, 210, 220] {
-            let [unfiltered, filtered] = [false, true].map(|loop_filter| {
+            let [
+                (unfiltered_bytes, unfiltered_psnr),
+                (filtered_bytes, filtered_psnr),
+            ] = [false, true].map(|loop_filter| {
                 let (sizes, psnr) = encode_group_frames(&frames, base_q_idx, loop_filter);
                 for (index, &size) in sizes.iter().enumerate().skip(1) {
                     assert!(
                         size < sizes[0] / 2,
-                        "{width}x{height} q {base_q_idx}, filter {loop_filter}:                          frame {index} is {size} bytes, the key frame {}",
+                        "{width}x{height} q {base_q_idx}, filter {loop_filter}: \
+                         frame {index} is {size} bytes, the key frame {}",
                         sizes[0]
                     );
                 }
                 (sizes.iter().sum::<usize>(), psnr)
             });
-            let ((unfiltered_bytes, unfiltered_psnr), (filtered_bytes, filtered_psnr)) =
-                (unfiltered, filtered);
             let equivalent_bytes =
                 unfiltered_bytes as f64 * 2_f64.powf((filtered_psnr - unfiltered_psnr) / 6.0);
             assert!(
                 filtered_bytes as f64 <= equivalent_bytes * 1.03,
-                "{width}x{height} q {base_q_idx}: {filtered_bytes} bytes at                  {filtered_psnr:.2} dB filtered, {unfiltered_bytes} bytes at                  {unfiltered_psnr:.2} dB unfiltered"
+                "{width}x{height} q {base_q_idx}: {filtered_bytes} bytes at \
+                 {filtered_psnr:.2} dB filtered, {unfiltered_bytes} bytes at \
+                 {unfiltered_psnr:.2} dB unfiltered"
             );
         }
     }
