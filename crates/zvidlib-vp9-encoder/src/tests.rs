@@ -384,7 +384,7 @@ fn hardware_requests_map_the_quantizer_onto_quality() {
 /// A hardware encoder's samples are sync samples exactly when they open on a
 /// key frame, and that key frame's colour fields are what the `vpcC` declares:
 /// checked here against the software encoder's own key and inter frames.
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(all(feature = "hardware", any(windows, target_os = "macos")))]
 #[test]
 fn key_frame_vpcc_finds_key_frames_and_their_colour() {
     let mut config = configuration(64, 48, PixelFormat::Yuv420p8);

@@ -43,7 +43,7 @@
 //! assert_eq!(simd::active(), simd::detected());
 //! ```
 
-#[cfg(test)]
+#[cfg(all(test, feature = "all"))]
 use zvidlib_core::simd::test_lock;
 #[doc(inline)]
 pub use zvidlib_core::simd::{SimdIsa, active, available, detected, set_override};

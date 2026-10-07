@@ -156,15 +156,19 @@ impl Vp9DecoderFactory {
 }
 
 fn hardware_available(_configuration: &VideoDecoderConfig) -> bool {
-    #[cfg(all(any(windows, target_os = "linux"), target_pointer_width = "64"))]
+    #[cfg(all(
+        feature = "hardware",
+        any(windows, target_os = "linux"),
+        target_pointer_width = "64"
+    ))]
     if zvidlib_hardware::nvdec::is_vp9_available(_configuration.coded_dimensions) {
         return true;
     }
-    #[cfg(windows)]
+    #[cfg(all(feature = "hardware", windows))]
     if zvidlib_hardware::windows_mf::is_vp9_available(_configuration.coded_dimensions) {
         return true;
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(all(feature = "hardware", target_os = "macos"))]
     if zvidlib_hardware::videotoolbox_vp9::is_vp9_available(_configuration.coded_dimensions) {
         return true;
     }
@@ -178,25 +182,32 @@ fn create_hardware(
     _limits: &Limits,
 ) -> std::result::Result<Box<dyn VideoDecoder>, Vec<String>> {
     #[cfg_attr(
-        not(any(
-            windows,
-            all(target_os = "linux", target_pointer_width = "64"),
-            target_os = "macos"
+        not(all(
+            feature = "hardware",
+            any(
+                windows,
+                all(target_os = "linux", target_pointer_width = "64"),
+                target_os = "macos"
+            )
         )),
         allow(unused_mut)
     )]
     let mut errors = Vec::new();
-    #[cfg(all(any(windows, target_os = "linux"), target_pointer_width = "64"))]
+    #[cfg(all(
+        feature = "hardware",
+        any(windows, target_os = "linux"),
+        target_pointer_width = "64"
+    ))]
     match zvidlib_hardware::nvdec::create_vp9(_configuration, _limits) {
         Ok(decoder) => return Ok(decoder),
         Err(error) => errors.push(format!("NVDEC: {}", error.message())),
     }
-    #[cfg(windows)]
+    #[cfg(all(feature = "hardware", windows))]
     match zvidlib_hardware::windows_mf::create_vp9(_configuration, _limits) {
         Ok(decoder) => return Ok(decoder),
         Err(error) => errors.push(format!("Media Foundation: {}", error.message())),
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(all(feature = "hardware", target_os = "macos"))]
     match create_videotoolbox(_configuration, _limits) {
         Ok(decoder) => return Ok(decoder),
         Err(error) => errors.push(format!("VideoToolbox: {}", error.message())),
@@ -206,7 +217,7 @@ fn create_hardware(
 
 /// VideoToolbox, which shows a hidden frame again by replaying it through the
 /// software decoder.
-#[cfg(target_os = "macos")]
+#[cfg(all(feature = "hardware", target_os = "macos"))]
 fn create_videotoolbox(
     configuration: &VideoDecoderConfig,
     limits: &Limits,
@@ -215,7 +226,7 @@ fn create_videotoolbox(
 }
 
 /// Decodes `history` and then `chunk`, returning the picture `chunk` outputs.
-#[cfg(target_os = "macos")]
+#[cfg(all(feature = "hardware", target_os = "macos"))]
 fn replay(
     limits: &Limits,
     history: &[Vec<u8>],
@@ -519,11 +530,15 @@ mod tests {
         }
 
         let backends: [(&str, Create); _] = [
-            #[cfg(all(any(windows, target_os = "linux"), target_pointer_width = "64"))]
+            #[cfg(all(
+                feature = "hardware",
+                any(windows, target_os = "linux"),
+                target_pointer_width = "64"
+            ))]
             ("NVDEC", zvidlib_hardware::nvdec::create_vp9),
-            #[cfg(windows)]
+            #[cfg(all(feature = "hardware", windows))]
             ("Media Foundation", zvidlib_hardware::windows_mf::create_vp9),
-            #[cfg(target_os = "macos")]
+            #[cfg(all(feature = "hardware", target_os = "macos"))]
             ("VideoToolbox", create_videotoolbox),
         ];
 

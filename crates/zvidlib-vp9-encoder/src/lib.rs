@@ -134,7 +134,10 @@ impl VideoEncoderFactory for NativeVp9EncoderFactory {
 
 /// What a hardware encoder is asked for, resolved from a configuration on
 /// every platform alike.
-#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+#[cfg_attr(
+    not(all(feature = "hardware", any(windows, target_os = "macos"))),
+    allow(dead_code)
+)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct HardwareRequest {
     /// `base_q_idx` mapped onto `0.0..=1.0`, best quality highest.
@@ -148,7 +151,10 @@ struct HardwareRequest {
 /// The hardware request `configuration` resolves to, or why no hardware
 /// encoder can take it. Platform restrictions, such as the input formats a
 /// backend converts, are the backend's to add.
-#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+#[cfg_attr(
+    not(all(feature = "hardware", any(windows, target_os = "macos"))),
+    allow(dead_code)
+)]
 fn hardware_request(
     configuration: &VideoEncoderConfig,
 ) -> std::result::Result<HardwareRequest, String> {
@@ -194,7 +200,7 @@ fn hardware_request(
 
 /// The hardware encoders, behind one interface so the factory reads the same
 /// on every target.
-#[cfg(windows)]
+#[cfg(all(feature = "hardware", windows))]
 mod platform {
     use crate::{CodecSupport, Error, ErrorKind, Limits, Result, VideoEncoder, VideoEncoderConfig};
     use zvidlib_hardware::windows_mf_encoder::{self, MftClass, OutputFormat, Settings};
@@ -246,7 +252,7 @@ mod platform {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(feature = "hardware", target_os = "macos"))]
 mod platform {
     use crate::{
         Codec, CodecSupport, Error, ErrorKind, Limits, PixelFormat, Result, VideoEncoder,
@@ -297,7 +303,7 @@ mod platform {
     }
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(not(all(feature = "hardware", any(windows, target_os = "macos"))))]
 mod platform {
     use crate::{CodecSupport, Error, ErrorKind, Limits, Result, VideoEncoder, VideoEncoderConfig};
 

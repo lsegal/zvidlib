@@ -114,7 +114,7 @@ enum BackendChoice {
     Automatic,
     /// Software whatever the browser supports, so a test covers the fallback
     /// even in a browser that decodes the codec itself.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "all"))]
     SoftwareOnly,
 }
 
@@ -181,7 +181,7 @@ impl WebAudioDecodeSession {
                 .unchecked_into();
                 support.get_supported().unwrap_or(false)
             }
-            #[cfg(test)]
+            #[cfg(all(test, feature = "all"))]
             BackendChoice::SoftwareOnly => false,
         };
         if !webcodecs_supported && software.is_none() {
@@ -224,13 +224,13 @@ impl WebAudioDecodeSession {
 
     /// Whether reads go through the software decoder because `WebCodecs`
     /// cannot decode the track, or decoded it wrongly.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "all"))]
     pub(crate) fn is_software(&self) -> bool {
         self.webcodecs.is_none()
     }
 
     /// Drops the `WebCodecs` decoder, so reads go through software.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "all"))]
     pub(crate) fn reset_to_software(&mut self) {
         self.webcodecs = None;
     }
@@ -486,7 +486,9 @@ fn split_into_packets(
     Ok(buffers)
 }
 
-#[cfg(test)]
+// The browser tests round-trip media through every native codec, so they
+// build with the whole codec matrix.
+#[cfg(all(test, feature = "all"))]
 pub(crate) mod tests {
     use super::*;
     use crate::io::MemorySink;

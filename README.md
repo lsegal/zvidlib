@@ -426,7 +426,7 @@ Install stable Rust with the `wasm32-unknown-unknown` target, then run:
 
 ```console
 cargo check --workspace --features native
-cargo check --target wasm32-unknown-unknown --no-default-features --features web
+cargo check --target wasm32-unknown-unknown --features web
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --features native -- -D warnings
 ```
@@ -465,14 +465,14 @@ The `web` feature excludes native-only integrations. During scaffold development
 
 ```console
 rustup target add wasm32-unknown-unknown
-cargo check --target wasm32-unknown-unknown --no-default-features --features web
+cargo check --target wasm32-unknown-unknown --features web
 ```
 
 Install [`wasm-pack`](https://rustwasm.github.io/wasm-pack/installer/) and create a browser-ready ES module package:
 
 ```console
 cargo install wasm-pack
-wasm-pack build --target web --out-dir pkg --no-default-features --features web
+wasm-pack build --target web --out-dir pkg --features web
 python -m http.server 8000
 ```
 
@@ -483,7 +483,7 @@ For the browser example specifically, `examples/web_canvas/package.json` wraps t
 Run the browser integration suite in an installed Chrome browser with:
 
 ```console
-wasm-pack test --headless --chrome --no-default-features --features web
+wasm-pack test --headless --chrome --features web
 ```
 
 The suite verifies Blob and stream input, cancellation, reader-lock cleanup, BigInt range handling, typed-array copy lifetimes, browser-object ownership, stable errors, Blob output, decoding the bundled HEVC sample and a VP9 track through WebCodecs, and the software fallback for browsers whose WebCodecs cannot decode a track. The base build does not require WASM threads or cross-origin isolation. Future optional threaded builds will document their additional headers and browser requirements separately.

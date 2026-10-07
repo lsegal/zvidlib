@@ -2910,7 +2910,9 @@ impl WasmPlayback {
     }
 }
 
-#[cfg(test)]
+// The browser tests round-trip media through every native codec, so they
+// build with the whole codec matrix.
+#[cfg(all(test, feature = "all"))]
 mod tests {
     use super::*;
     use js_sys::Object;

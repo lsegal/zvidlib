@@ -77,9 +77,13 @@ pub use zvidlib_hevc_decoder::decode_profile as hevc_decode_profile;
 #[doc(hidden)]
 pub use zvidlib_hevc_decoder::narrow_interp as hevc_narrow_interp;
 
-#[cfg(all(feature = "hevc-decoder", not(target_arch = "wasm32")))]
+#[cfg(all(
+    feature = "hevc-decoder",
+    feature = "hardware",
+    not(target_arch = "wasm32")
+))]
 #[doc(hidden)]
-pub use zvidlib_hardware::readback as hevc_hardware_readback;
+pub use zvidlib_hevc_decoder::readback as hevc_hardware_readback;
 
 #[cfg(all(feature = "vp9-encoder", not(target_arch = "wasm32")))]
 #[doc(hidden)]

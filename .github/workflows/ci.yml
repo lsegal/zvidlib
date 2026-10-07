@@ -515,7 +515,7 @@ jobs:
         with:
           cache-on-failure: true
       - name: Check WebAssembly target
-        run: cargo check --target wasm32-unknown-unknown --no-default-features --features web
+        run: cargo check --target wasm32-unknown-unknown --features web
       # The published musl binary rather than `cargo install wasm-pack`, which
       # compiled the tool and its dependency tree from source on every run for
       # a build that is not this crate's. The version is still pinned, and the
@@ -531,9 +531,9 @@ jobs:
           "$RUNNER_TEMP/wasm-pack/wasm-pack" --version
           echo "$RUNNER_TEMP/wasm-pack" >> "$GITHUB_PATH"
       - name: Build browser package
-        run: wasm-pack build --target web --out-dir pkg --no-default-features --features web
+        run: wasm-pack build --target web --out-dir pkg --features web
       - name: Test in headless Chrome
-        run: wasm-pack test --headless --chrome --no-default-features --features web
+        run: wasm-pack test --headless --chrome --features web
 
   # Every package's tests on Linux, one job per package the pull request can
   # affect (#612). cargo-nextest runs each test as its own process across every

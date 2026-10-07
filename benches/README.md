@@ -2171,7 +2171,7 @@ measured here is that it stays that cheap when a browser is the thing calling
 it:
 
 ```sh
-wasm-pack test --headless --chrome --no-default-features --features web \
+wasm-pack test --headless --chrome --features web \
   --lib -- --nocapture web_previews
 ```
 

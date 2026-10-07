@@ -400,9 +400,13 @@ fn io(message: impl Into<String>) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "aac-decoder")]
     use crate::io::MemorySource;
+    #[cfg(feature = "aac-decoder")]
     use crate::{Mp4Demuxer, Mp4DemuxerOptions, TrackKind};
+    #[cfg(feature = "aac-decoder")]
     use std::future::Future;
+    #[cfg(feature = "aac-decoder")]
     use std::task::{Context, Poll, Waker};
 
     #[test]
@@ -492,6 +496,7 @@ mod tests {
         assert_eq!(select_output_format(supported, 48_000, 2), Err(Vec::new()));
     }
 
+    #[cfg(feature = "aac-decoder")]
     fn block_on<F: Future>(future: F) -> F::Output {
         let mut future = Box::pin(future);
         let waker = Waker::noop();
