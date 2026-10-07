@@ -1,0 +1,37 @@
+[package]
+name = "zvidlib-av1-decoder"
+description = "Pure-Rust AV1 software decoder for zvidlib"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+# Tests, their fixtures and benchmarks are not needed to build the crate.
+exclude = ["/tests", "/benches"]
+
+[dependencies]
+zvidlib-core = { workspace = true }
+zvidlib-color = { workspace = true }
+zvidlib-av1-syntax = { workspace = true }
+
+[dev-dependencies]
+zvidlib-av1-encoder = { path = "../zvidlib-av1-encoder" }
+zvidlib-av1 = { path = "../zvidlib-av1" }
+criterion = { workspace = true }
+zvidlib-bench-support = { path = "../zvidlib-bench-support" }
+zvidlib-container = { path = "../zvidlib-container" }
+
+[features]
+# Additive, off by default, and gating no code: the benchmark harness folds it
+# into every criterion group name (`simd=off` / `simd=on`), as zvidlib's own
+# `simd` feature does, so the two arms are recorded separately.
+simd = []
+
+# The AV1 software decoder's own scalar-vs-SIMD suite. It is a separate target
+# because its per-stage groups and its whole-frame decode are slower than the
+# shared fast groups above and deserve to be runnable on their own; it shares
+# `benches/support/` with them.
+[[bench]]
+name = "av1_decode"
+harness = false

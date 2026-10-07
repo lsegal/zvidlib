@@ -1,0 +1,40 @@
+[package]
+name = "zvidlib-hevc-encoder"
+description = "Pure-Rust HEVC software encoder for zvidlib"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+# Tests, their fixtures and benchmarks are not needed to build the crate.
+exclude = ["/tests", "/benches"]
+
+[build-dependencies]
+zvidlib-build = { workspace = true }
+
+[dependencies]
+zvidlib-core = { workspace = true }
+zvidlib-color = { workspace = true }
+zvidlib-hevc-syntax = { workspace = true }
+zvidlib-hevc-decoder = { workspace = true }
+zvidlib-hardware = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+zvidlib-bench-support = { path = "../zvidlib-bench-support" }
+zvidlib-container = { path = "../zvidlib-container" }
+
+[features]
+# Additive, off by default, and gating no code: the benchmark harness folds it
+# into every criterion group name (`simd=off` / `simd=on`), as zvidlib's own
+# `simd` feature does, so the two arms are recorded separately.
+simd = []
+
+# The HEVC encoder benchmarks are their own target: they use only the synthetic
+# inputs from `benches/support`, never the decoded-fixture cache the `codec`
+# target exists to share, and the encoder's mode search is slow enough that it is
+# worth keeping out of that target's default run.
+[[bench]]
+name = "hevc_encode"
+harness = false

@@ -11,7 +11,7 @@
 #   ref_enc_posix.exe  the same sources with two minimal patches that make the
 #                          Windows/mingw build behave like libvorbis on LP64 POSIX
 #                          systems (Linux, macOS, BSD), which is what the Rust port
-#                          reproduces (see src/vorbis_encoder/os.rs):
+#                          reproduces (see crates/zvidlib-vorbis-encoder/src/vorbis_encoder/os.rs):
 #                          1. os.h: the Windows-only `#define rint(x) (floor((x)+0.5f))`
 #                             is removed, so rint() is C99 rint (round-half-even);
 #                          2. scales.h: toBARK's `(n)*(n)` is evaluated in 64 bits
@@ -69,7 +69,7 @@ gcc $CFLAGS $INC2 -o "$OUT/ref_enc_posix.exe" "$TOOLS/ref_enc.c" $PSRCS \
 echo "built $OUT/ref_enc_posix.exe"
 
 # bitrate -> quality reference table (used to build the unit-test fixture in
-# src/vorbis_encoder/test_fixtures.rs)
+# crates/zvidlib-vorbis-encoder/src/vorbis_encoder/test_fixtures.rs)
 BSRCS=""
 for f in $PSRCS; do case "$(basename "$f")" in vorbisenc.c) ;; *) BSRCS="$BSRCS $f";; esac; done
 gcc $CFLAGS $INC2 -o "$OUT/ref_bitrate.exe" "$TOOLS/ref_bitrate.c" $BSRCS \

@@ -10,7 +10,7 @@
 //!
 //! | Group | Stage |
 //! | --- | --- |
-//! | `yuv_to_rgba_1080p`, `yuv_to_rgba_4k` | `convert_to_rgba8` over one 4:2:0 picture, `src/yuv_to_rgba.rs` |
+//! | `yuv_to_rgba_1080p`, `yuv_to_rgba_4k` | `convert_to_rgba8` over one 4:2:0 picture, `crates/zvidlib-color/src/yuv_to_rgba.rs` |
 //! | `vp8_decode_frame` | whole-frame decode through `native_vp8_video_decoder_factory` |
 //! | `vp9_decode_frame` | whole-frame decode through `native_vp9_video_decoder_factory` |
 //!
@@ -18,7 +18,8 @@
 //! decode a stream the crate's own encoders produce once per process, so an
 //! iteration is decoder work only, conversion included. Both decoders' own
 //! decoding kernels are vectorized too (issues #568 and #570), and
-//! `benches/vp8_decode.rs` and `benches/vp9_decode.rs` time them on their own
+//! `crates/zvidlib-vp8/benches/vp8_decode.rs` and
+//! `crates/zvidlib-vp9-decoder/benches/vp9_decode.rs` time them on their own
 //! and in a decode that stops before the conversion.
 //!
 //! See `benches/README.md` for how to run and filter the suite.
@@ -43,7 +44,7 @@ use support::isa::{IsaWorkload, bench_across_isas, log_host_isas};
 use support::{FrameWork, block_on, synthetic_yuv420_sequence};
 
 // ---------------------------------------------------------------------------
-// Output conversion (src/yuv_to_rgba.rs)
+// Output conversion (crates/zvidlib-color/src/yuv_to_rgba.rs)
 // ---------------------------------------------------------------------------
 
 /// One synthetic 4:2:0 picture as the decoders hand it to `convert_to_rgba8`.

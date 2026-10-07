@@ -122,7 +122,7 @@ impl WebVideoEncodeSession {
     ) -> Result<Self> {
         // VP9's level is not read back from the encoder's output, so the codec
         // string names the real one up front.
-        let vp9_level = crate::vp9_encoder::pick_level(
+        let vp9_level = zvidlib_vp9_syntax::pick_level(
             crate::VideoDimensions { width, height },
             timescale,
             frame_duration,
@@ -137,7 +137,9 @@ impl WebVideoEncodeSession {
             Codec::Hevc => "hev1.1.6.L93.B0",
             Codec::Vp8 => "vp8",
             Codec::Vp9 => vp9_codec_string.as_str(),
-            Codec::UncompressedVideo | Codec::H264 | Codec::Aac | Codec::Opus | Codec::Vorbis => {
+            // Uncompressed video, H.264, the audio codecs, and any codec a
+            // later zvidlib-core adds.
+            _ => {
                 return Err(Error::new(
                     ErrorKind::Unsupported,
                     "the WebCodecs video encoder bridge only supports AV1, HEVC, VP8 and VP9",
@@ -333,12 +335,9 @@ impl WebVideoEncodeSession {
                 Codec::Av1 => av1c_from_bitstream(&data),
                 Codec::Hevc => hvcc_from_metadata(&metadata),
                 Codec::Vp8 => Some(Vec::new()),
-                Codec::Vp9 => crate::vp9_encoder::vpcc_from_key_frame(&data, self.vp9_level),
-                Codec::UncompressedVideo
-                | Codec::H264
-                | Codec::Aac
-                | Codec::Opus
-                | Codec::Vorbis => None,
+                Codec::Vp9 => zvidlib_vp9_syntax::vpcc_from_key_frame(&data, self.vp9_level),
+                // The encoder is only ever configured for the four above.
+                _ => None,
             };
             config.inspect(|_| {
                 self.emitted_config = true;
@@ -383,7 +382,8 @@ fn web_pixel_format(pixel_format: PixelFormat) -> Result<VideoPixelFormat> {
         PixelFormat::Rgba8 => Ok(VideoPixelFormat::Rgba),
         PixelFormat::Bgra8 => Ok(VideoPixelFormat::Bgra),
         PixelFormat::Yuv420p8 => Ok(VideoPixelFormat::I420),
-        PixelFormat::Rgb8 | PixelFormat::Gray8 => Err(Error::new(
+        // `Rgb8`, `Gray8`, and any format a later zvidlib-core adds.
+        _ => Err(Error::new(
             ErrorKind::Unsupported,
             "this pixel format is not supported by the WebCodecs export bridge",
         )),

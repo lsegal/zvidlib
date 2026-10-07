@@ -14,9 +14,12 @@
 //! and `--test 'ci_*'` would leave nothing saying what any of them protects.
 //! The list used to be one `cargo test --test <name>` step per test; since
 //! #595 it is the `--test` arguments of the `cargo nextest archive` that the
-//! test shards run in full. What made the omission possible was that nothing
-//! compared the two lists, so that is what this does: the `tests/ci_*.rs`
-//! files and the `--test` names of the cargo invocations that *run* tests in
+//! test shards run in full, and since the workspace split (#604) those are
+//! written as `targets <package> --test <name> ...` lines, each adding a
+//! package's targets to that archive when the pull request can affect the
+//! package. What made the omission possible was that nothing compared the two
+//! lists, so that is what this does: the `tests/ci_*.rs` files and the
+//! `--test` names of the cargo invocations that *run* tests in
 //! `.github/workflows/` have to be the same set, and a guard added without a
 //! name there fails here.
 //!
@@ -29,11 +32,13 @@
 //! `ci_workflows_cache_cargo` is: the alternative is a `serde_yaml` dependency
 //! for a hygiene check, and a `run:` line is read here as the shell text it is.
 
+mod workspace;
+
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 fn manifest_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf()
+    workspace::root()
 }
 
 /// Every `.yml` file under `.github/workflows/`.
@@ -73,21 +78,30 @@ const NOT_RUN_BY_CI: &[(&str, &str)] = &[
     ),
 ];
 
-/// Every `tests/*.rs` file, by target name.
+/// Every `tests/*.rs` file of every workspace package, by target name. Since
+/// the workspace split (#604) a codec's integration tests live in its crate.
 fn test_targets() -> BTreeSet<String> {
-    let dir = manifest_dir().join("tests");
-    std::fs::read_dir(&dir)
-        .unwrap_or_else(|error| panic!("reading {}: {error}", dir.display()))
-        .map(|entry| entry.expect("tests directory entry").path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
-        .filter_map(|path| {
-            path.file_stem()
-                .map(|stem| stem.to_string_lossy().into_owned())
-        })
-        .collect()
+    let mut targets = BTreeSet::new();
+    for package in workspace::packages() {
+        let dir = package.path().join("tests");
+        if !dir.is_dir() {
+            continue;
+        }
+        targets.extend(
+            std::fs::read_dir(&dir)
+                .unwrap_or_else(|error| panic!("reading {}: {error}", dir.display()))
+                .map(|entry| entry.expect("tests directory entry").path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+                .filter_map(|path| {
+                    path.file_stem()
+                        .map(|stem| stem.to_string_lossy().into_owned())
+                }),
+        );
+    }
+    targets
 }
 
-/// The `tests/ci_*.rs` files, by target name.
+/// The `tests/ci_*.rs` files, by target name. They are all the root package's.
 ///
 /// The `ci_` prefix is the convention these guards are named by, and it is what
 /// distinguishes them from the integration tests that exercise the library:
@@ -144,18 +158,20 @@ fn commands(source: &str) -> Vec<String> {
 ///
 /// `cargo test` and `cargo nextest run` run what they build.
 /// `cargo nextest archive` does not by itself, but the shards in `ci.yml` run
-/// every binary in the archive, so naming a target there is what runs it.
+/// every binary in the archive, so naming a target there is what runs it, and
+/// a `targets <package> ...` line is how a target is named there.
 /// `cargo build --test`, `cargo check` and `cargo clippy` only compile it,
 /// which is exactly the state these guards sat in unnoticed, and `node --test`
 /// takes a path rather than a cargo target.
 fn runs_tests(command: &str) -> bool {
-    [
-        "cargo test ",
-        "cargo nextest run ",
-        "cargo nextest archive ",
-    ]
-    .iter()
-    .any(|invocation| command.contains(invocation))
+    command.starts_with("targets ")
+        || [
+            "cargo test ",
+            "cargo nextest run ",
+            "cargo nextest archive ",
+        ]
+        .iter()
+        .any(|invocation| command.contains(invocation))
 }
 
 /// Every target named by a `--test <name>` argument of a command in `source`
@@ -217,7 +233,7 @@ fn every_integration_test_is_run_by_a_workflow_or_left_out_with_a_reason() {
 
     assert!(
         unrun.is_empty(),
-        "these tests/*.rs files are not named by a `--test <name>` of any cargo \
+        "these packages' tests/*.rs files are not named by a `--test <name>` of any cargo \
          invocation in .github/workflows/ that runs tests, so they are compiled and \
          never executed (#599). Name each one in the archive of the job that should \
          run it, or add it to NOT_RUN_BY_CI with the reason it is left out: {unrun:?}"
@@ -239,7 +255,7 @@ fn every_test_left_out_of_ci_exists_and_is_not_run() {
         );
         assert!(
             targets.contains(*name),
-            "NOT_RUN_BY_CI names {name}, which is not a file under tests/"
+            "NOT_RUN_BY_CI names {name}, which is not a file under any package's tests/"
         );
         assert!(
             !run.contains(*name),
@@ -250,16 +266,68 @@ fn every_test_left_out_of_ci_exists_and_is_not_run() {
 
 #[test]
 fn every_test_a_workflow_runs_exists() {
-    let dir = manifest_dir().join("tests");
+    let packages = workspace::packages();
     let missing: Vec<String> = targets_run_by_workflows()
         .into_iter()
-        .filter(|name| !dir.join(format!("{name}.rs")).exists())
+        .filter(|name| {
+            !packages
+                .iter()
+                .any(|package| package.path().join(format!("tests/{name}.rs")).exists())
+        })
         .collect();
 
     assert!(
         missing.is_empty(),
         "these `--test <name>` arguments in .github/workflows/ name a \
-         test that does not exist under tests/: {missing:?}"
+         test that does not exist under any package's tests/: {missing:?}"
+    );
+}
+
+/// Each `targets <package> --test <name>` line in `source`, as
+/// `(package, name)`.
+fn package_targets(source: &str) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    for command in commands(source) {
+        let Some(rest) = command.strip_prefix("targets ") else {
+            continue;
+        };
+        let mut words = rest.split_whitespace();
+        let Some(package) = words.next() else {
+            continue;
+        };
+        while let Some(word) = words.next() {
+            if word == "--test" {
+                if let Some(name) = words.next() {
+                    pairs.push((package.to_string(), name.to_string()));
+                }
+            }
+        }
+    }
+    pairs
+}
+
+/// A test listed under the wrong package is never built: `-p` selects the
+/// package and `--test` then names a target cargo looks for among the selected
+/// packages, so one under a package the pull request did not select fails the
+/// archive, and on `main` it would be built only by coincidence.
+#[test]
+fn every_test_a_workflow_runs_belongs_to_the_package_it_is_listed_under() {
+    let packages = workspace::packages();
+    let mut misplaced = Vec::new();
+    for path in workflow_files() {
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("reading {}: {error}", path.display()));
+        for (package, name) in package_targets(&source) {
+            let owner = workspace::package(&packages, &package);
+            if !owner.path().join(format!("tests/{name}.rs")).exists() {
+                misplaced.push(format!("{package} --test {name}"));
+            }
+        }
+    }
+    assert!(
+        misplaced.is_empty(),
+        "these `targets` lines in .github/workflows/ list a test under a package \
+         whose tests/ does not have it: {misplaced:?}"
     );
 }
 
@@ -278,7 +346,17 @@ fn only_a_command_that_runs_a_test_counts_as_running_it() {
           cargo nextest archive --features native --lib \
             --test ci_on_a_continuation_line \
             --archive-file nextest-archive.tar.zst
+      - run: |
+          targets zvidlib \
+            --test ci_listed_for_a_package
 "#;
     let run: Vec<String> = targets_run_by(workflow).into_iter().collect();
-    assert_eq!(run, ["ci_on_a_continuation_line", "ci_run_by_cargo_test"]);
+    assert_eq!(
+        run,
+        [
+            "ci_listed_for_a_package",
+            "ci_on_a_continuation_line",
+            "ci_run_by_cargo_test"
+        ]
+    );
 }

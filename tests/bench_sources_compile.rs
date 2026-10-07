@@ -8,32 +8,14 @@
 //! happened to `benches/support/harness.rs`, which sat unreferenced long enough
 //! to accumulate a `use super::checksum;` that no longer resolved.
 //!
-//! This walks the module graph from the `[[bench]]` targets declared in
-//! `Cargo.toml` and asserts it covers every `.rs` file in the directory.
+//! This walks the module graph from the `[[bench]]` targets every workspace
+//! package declares and asserts it covers every `.rs` file in that package's
+//! `benches/` directory.
+
+mod workspace;
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-
-/// Paths of the `[[bench]]` targets `Cargo.toml` declares.
-fn declared_bench_targets(manifest: &str) -> Vec<String> {
-    let mut paths = Vec::new();
-    let mut in_bench = false;
-    for line in manifest.lines() {
-        let line = line.trim();
-        if line.starts_with('[') {
-            in_bench = line == "[[bench]]";
-            continue;
-        }
-        if !in_bench {
-            continue;
-        }
-        if let Some(value) = line.strip_prefix("path") {
-            let value = value.trim_start().trim_start_matches('=').trim();
-            paths.push(value.trim_matches('"').to_string());
-        }
-    }
-    paths
-}
 
 /// Names declared by non-inline `mod` items in one source file.
 ///
@@ -91,17 +73,20 @@ fn rust_sources(directory: &Path, found: &mut BTreeSet<PathBuf>) {
 
 #[test]
 fn every_bench_source_is_reachable_from_a_bench_target() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let manifest =
-        std::fs::read_to_string(root.join("Cargo.toml")).expect("Cargo.toml is readable");
-
-    let mut pending: Vec<(PathBuf, bool)> = declared_bench_targets(&manifest)
+    let root = workspace::root();
+    let packages = workspace::packages();
+    let mut pending: Vec<(PathBuf, bool)> = packages
         .iter()
-        .map(|path| (root.join(path), true))
+        .flat_map(|package| {
+            package
+                .bench_targets()
+                .into_iter()
+                .map(|(_, path)| (package.path().join(path), true))
+        })
         .collect();
     assert!(
         !pending.is_empty(),
-        "Cargo.toml declares no [[bench]] targets, so this guard would pass vacuously"
+        "the workspace declares no [[bench]] targets, so this guard would pass vacuously"
     );
 
     let mut reachable = BTreeSet::new();
@@ -129,12 +114,16 @@ fn every_bench_source_is_reachable_from_a_bench_target() {
     }
 
     let mut present = BTreeSet::new();
-    rust_sources(&root.join("benches"), &mut present);
-
+    for package in &packages {
+        let benches = package.path().join("benches");
+        if benches.is_dir() {
+            rust_sources(&benches, &mut present);
+        }
+    }
     let orphaned = present
         .difference(&reachable)
         .map(|path| {
-            path.strip_prefix(root)
+            path.strip_prefix(&root)
                 .unwrap_or(path)
                 .display()
                 .to_string()
@@ -142,8 +131,9 @@ fn every_bench_source_is_reachable_from_a_bench_target() {
         .collect::<Vec<_>>();
     assert!(
         orphaned.is_empty(),
-        "these files under benches/ are compiled by no bench target, so no lint or \
-         format check covers them; declare them with `mod` or delete them: {}",
+        "these files under a package's benches/ are compiled by no bench target, so \
+         no lint or format check covers them; declare them with `mod` or delete \
+         them: {}",
         orphaned.join(", ")
     );
 }

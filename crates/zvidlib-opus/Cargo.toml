@@ -1,0 +1,18 @@
+[package]
+name = "zvidlib-opus"
+description = "Opus decoding and encoding for zvidlib"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+# Tests, their fixtures and benchmarks are not needed to build the crate.
+exclude = ["/tests"]
+
+[dependencies]
+zvidlib-core = { workspace = true }
+opus-pure = { workspace = true }
+
+[dev-dependencies]
+zvidlib-container = { path = "../zvidlib-container" }
