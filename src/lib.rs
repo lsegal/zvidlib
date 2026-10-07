@@ -37,8 +37,13 @@ pub mod previews;
 pub mod simd;
 pub mod vorbis;
 
+// The AAC encoder, and the platform bindings the macOS and Windows AAC decoders
+// share with it.
 #[cfg(all(
-    any(feature = "aac-decoder", feature = "aac-encoder"),
+    any(
+        feature = "aac-encoder",
+        all(feature = "aac-decoder", any(target_os = "macos", windows))
+    ),
     not(target_arch = "wasm32")
 ))]
 use zvidlib_aac_encoder as aac_encoder;
