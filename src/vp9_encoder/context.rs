@@ -5,9 +5,8 @@
 //! `vp9_adapt_mode_probs` and `vp9_adapt_mv_probs`).
 //!
 //! The context holds only the probabilities this encoder's coding tools read.
-//! The rest (compound references, switchable filters, high-precision vectors)
-//! is never coded, counted or updated, so it keeps its default value in the
-//! decoder too.
+//! The rest (compound references, switchable filters) is never coded, counted
+//! or updated, so it keeps its default value in the decoder too.
 
 use super::frame::{
     INTER_MODE_TREE, INTRA_MODE_TREE, MV_CLASS_TREE, MV_FP_TREE, MV_JOINT_TREE, PARTITION_TREE,
@@ -38,6 +37,9 @@ pub(super) struct MvComponentProbs {
     pub(super) bits: [u8; 10],
     pub(super) class0_fp: [[u8; 3]; 2],
     pub(super) fp: [u8; 3],
+    /// The eighth-sample bit of class 0 and of the larger classes.
+    pub(super) class0_hp: u8,
+    pub(super) hp: u8,
 }
 
 /// Row (vertical) then column (horizontal) component defaults.
@@ -49,6 +51,8 @@ const DEFAULT_MV_COMPONENT_PROBS: [MvComponentProbs; 2] = [
         bits: [136, 140, 148, 160, 176, 192, 224, 234, 234, 240],
         class0_fp: [[128, 128, 64], [96, 112, 64]],
         fp: [64, 96, 64],
+        class0_hp: 160,
+        hp: 128,
     },
     MvComponentProbs {
         sign: 128,
@@ -57,6 +61,8 @@ const DEFAULT_MV_COMPONENT_PROBS: [MvComponentProbs; 2] = [
         bits: [136, 140, 148, 160, 176, 192, 224, 234, 234, 240],
         class0_fp: [[128, 128, 64], [96, 112, 64]],
         fp: [64, 96, 64],
+        class0_hp: 160,
+        hp: 128,
     },
 ];
 
@@ -123,6 +129,8 @@ pub(super) struct MvComponentCounts {
     pub(super) bits: [[u32; 2]; 10],
     pub(super) class0_fp: [[u32; 4]; 2],
     pub(super) fp: [u32; 4],
+    pub(super) class0_hp: [u32; 2],
+    pub(super) hp: [u32; 2],
 }
 
 /// The symbols one frame coded, counted as the decoder counts them while it
@@ -156,13 +164,15 @@ impl FrameContext {
     /// for the next frame. Intra frames adapt only the coefficient
     /// probabilities; the frame after a key frame adapts them faster.
     /// Transform size probabilities adapt only when the frame selected
-    /// transform sizes per block (`TX_MODE_SELECT`).
+    /// transform sizes per block (`TX_MODE_SELECT`), and the eighth-sample
+    /// bits only when it allowed high-precision vectors.
     pub(super) fn adapted(
         &self,
         counts: &FrameCounts,
         intra: bool,
         after_key: bool,
         tx_select: bool,
+        allow_high_precision_mv: bool,
     ) -> Self {
         // COEF_MAX_UPDATE_FACTOR(_KEY, _AFTER_KEY) and COEF_COUNT_SAT.
         let update_factor = if !intra && after_key { 128 } else { 112 };
@@ -239,8 +249,10 @@ impl FrameContext {
                 merge_tree(&MV_FP_TREE, fp, counts);
             }
             merge_tree(&MV_FP_TREE, &mut probs.fp, &counts.fp);
-            // High-precision vectors are never allowed, so their
-            // probabilities are not adapted.
+            if allow_high_precision_mv {
+                probs.class0_hp = merge_mode(probs.class0_hp, counts.class0_hp);
+                probs.hp = merge_mode(probs.hp, counts.hp);
+            }
         }
         next
     }
@@ -326,19 +338,33 @@ mod tests {
         counts.skip[0] = [0, 20];
         counts.tx[2][0] = [20, 0, 0, 0];
         let context = FrameContext::default();
-        let intra = context.adapted(&counts, true, false, true);
+        let intra = context.adapted(&counts, true, false, true, false);
         assert_ne!(intra.coef[1][0][0][0][0], context.coef[1][0][0][0][0]);
         assert_eq!(intra.skip, context.skip);
         assert_eq!(intra.tx_32x32, context.tx_32x32);
-        let inter = context.adapted(&counts, false, false, true);
+        let inter = context.adapted(&counts, false, false, true, false);
         assert_eq!(inter.coef[1][0][0][0][0], intra.coef[1][0][0][0][0]);
         assert_ne!(inter.skip, context.skip);
         assert_ne!(inter.tx_32x32, context.tx_32x32);
         // Transform sizes adapt only when blocks select them.
-        let only_4x4 = context.adapted(&counts, false, false, false);
+        let only_4x4 = context.adapted(&counts, false, false, false, false);
         assert_eq!(only_4x4.tx_32x32, context.tx_32x32);
         // After a key frame, coefficients adapt with the larger factor.
-        let after_key = context.adapted(&counts, false, true, true);
+        let after_key = context.adapted(&counts, false, true, true, false);
         assert_ne!(after_key.coef[1][0][0][0][0], inter.coef[1][0][0][0][0]);
+    }
+
+    #[test]
+    fn eighth_sample_bits_adapt_only_when_the_frame_allows_them() {
+        let mut counts = FrameCounts::default();
+        counts.mv[0].class0_hp = [0, 20];
+        counts.mv[1].hp = [20, 0];
+        let context = FrameContext::default();
+        let low = context.adapted(&counts, false, false, true, false);
+        assert_eq!(low.mv[0].class0_hp, context.mv[0].class0_hp);
+        assert_eq!(low.mv[1].hp, context.mv[1].hp);
+        let high = context.adapted(&counts, false, false, true, true);
+        assert!(high.mv[0].class0_hp < context.mv[0].class0_hp);
+        assert!(high.mv[1].hp > context.mv[1].hp);
     }
 }
