@@ -42,6 +42,7 @@ use super::tables::{
 use crate::vp9_dec::loopfilter::{self, FilterPlane, LoopFilterMask, MaskBlock};
 use crate::vp9_dec::tables as shared;
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 const INTRA_MODE_TREE: [i8; 18] = [
     0, 2, -9, 4, -1, 6, 8, 12, -2, 10, -4, -5, -3, 14, -8, 16, -6, -7,
@@ -1160,18 +1161,9 @@ impl<'a> FrameEncoder<'a> {
                 return (empty, *prediction_error, empty_bits);
             }
             let bits = *bits[context].get_or_insert_with(|| {
-                let mut counter = BitCost::default();
-                write_coefficients(
-                    &mut counter,
-                    levels,
-                    *eob,
-                    tx_size,
-                    tx_type,
-                    plane_type,
-                    reference,
-                    context,
-                );
-                counter.0
+                coefficient_bits(
+                    levels, *eob, tx_size, tx_type, plane_type, reference, context,
+                )
             });
             if *prediction_error as f64 + self.lambda * empty_bits
                 <= *error as f64 + self.lambda * bits
@@ -1199,15 +1191,19 @@ impl<'a> FrameEncoder<'a> {
         } = &mut *self.scratch;
         let residual = &mut residual[..n * n];
         let mut prediction_error = 0_u64;
-        for row in 0..n {
+        for (row, residual) in residual.chunks_exact_mut(n).enumerate() {
             let start = (y + row) * stride + x;
             let source = &self.source.planes[plane][start..start + n];
             let predicted = &self.recon.planes[plane][start..start + n];
-            for column in 0..n {
-                let difference = i32::from(source[column]) - i32::from(predicted[column]);
-                residual[row * n + column] = difference;
-                prediction_error += (difference * difference) as u64;
+            // A row's squared error fits 32 bits, which vectorizes.
+            let mut row_error = 0_u32;
+            for ((residual, &source), &predicted) in residual.iter_mut().zip(source).zip(predicted)
+            {
+                let difference = i32::from(source) - i32::from(predicted);
+                *residual = difference;
+                row_error += (difference * difference) as u32;
             }
+            prediction_error += u64::from(row_error);
         }
         // Remembers an empty coding of this residual.
         let cache_empty = |encoder: &mut Self| {
@@ -1274,16 +1270,8 @@ impl<'a> FrameEncoder<'a> {
             cache_empty(self);
             return (empty, prediction_error, empty_bits);
         }
-        let mut counter = BitCost::default();
-        write_coefficients(
-            &mut counter,
-            levels,
-            eob,
-            tx_size,
-            tx_type,
-            plane_type,
-            reference,
-            context,
+        let bits = coefficient_bits(
+            levels, eob, tx_size, tx_type, plane_type, reference, context,
         );
         // Restored if the residual is not worth its bits.
         let prediction = &mut prediction[..n * n];
@@ -1306,14 +1294,16 @@ impl<'a> FrameEncoder<'a> {
             let start = (y + row) * stride + x;
             let source = &self.source.planes[plane][start..start + n];
             let reconstructed = &self.recon.planes[plane][start..start + n];
-            for (&source, &reconstructed) in source.iter().zip(reconstructed) {
-                let difference = i32::from(source) - i32::from(reconstructed);
-                error += (difference * difference) as u64;
-            }
+            let row_error: u32 = source
+                .iter()
+                .zip(reconstructed)
+                .map(|(&source, &reconstructed)| u32::from(source.abs_diff(reconstructed)).pow(2))
+                .sum();
+            error += u64::from(row_error);
         }
         if let Some(key) = key {
-            let mut bits = [None; 3];
-            bits[context] = Some(counter.0);
+            let mut cached_bits = [None; 3];
+            cached_bits[context] = Some(bits);
             let mut reconstructed = Vec::with_capacity(n * n);
             for row in 0..n {
                 let start = (y + row) * stride + x;
@@ -1327,13 +1317,11 @@ impl<'a> FrameEncoder<'a> {
                     levels: levels.to_vec(),
                     reconstructed,
                     error,
-                    bits,
+                    bits: cached_bits,
                 },
             );
         }
-        if prediction_error as f64 + self.lambda * empty_bits
-            <= error as f64 + self.lambda * counter.0
-        {
+        if prediction_error as f64 + self.lambda * empty_bits <= error as f64 + self.lambda * bits {
             for row in 0..n {
                 let start = (y + row) * stride + x;
                 self.recon.planes[plane][start..start + n]
@@ -1346,7 +1334,7 @@ impl<'a> FrameEncoder<'a> {
             eob,
             tx_type,
         };
-        (block, error, counter.0)
+        (block, error, bits)
     }
 
     /// The best intra coding of the block, or `None` if it cannot cost
@@ -2227,13 +2215,18 @@ fn coefficient_probs(
     band: usize,
     context: usize,
 ) -> &'static [u8; 3] {
-    let table = match tx_size {
+    &coefficient_model(tx_size)[plane_type][reference][band][context]
+}
+
+/// The default coefficient model probabilities of a transform size, by plane
+/// type, reference, band and context.
+fn coefficient_model(tx_size: usize) -> &'static [[[[[u8; 3]; 6]; 6]; 2]; 2] {
+    match tx_size {
         0 => &shared::DEFAULT_COEF_PROBS_4X4,
         1 => &shared::DEFAULT_COEF_PROBS_8X8,
         2 => &shared::DEFAULT_COEF_PROBS_16X16,
         _ => &shared::DEFAULT_COEF_PROBS_32X32,
-    };
-    &table[plane_type][reference][band][context]
+    }
 }
 
 /// The token cache energy class of a coefficient magnitude.
@@ -2259,6 +2252,31 @@ fn write_coefficients<S: BoolSink>(
     tx_type: TxType,
     plane_type: usize,
     reference: usize,
+    context: usize,
+) {
+    // The token cache is sized to the transform: the search costs every
+    // transform block it tries, most of them small.
+    let write = match tx_size {
+        0 => write_tokens::<S, 16>,
+        1 => write_tokens::<S, 64>,
+        2 => write_tokens::<S, 256>,
+        _ => write_tokens::<S, 1024>,
+    };
+    write(
+        sink, levels, eob, tx_size, tx_type, plane_type, reference, context,
+    );
+}
+
+/// [`write_coefficients`] for a transform of `SIZE` coefficients.
+#[allow(clippy::too_many_arguments)]
+fn write_tokens<S: BoolSink, const SIZE: usize>(
+    sink: &mut S,
+    levels: &[i32],
+    eob: usize,
+    tx_size: usize,
+    tx_type: TxType,
+    plane_type: usize,
+    reference: usize,
     mut context: usize,
 ) {
     let (scan, neighbors) = scan_order(tx_size, tx_type);
@@ -2267,16 +2285,11 @@ fn write_coefficients<S: BoolSink>(
     } else {
         &shared::COEFBAND_TRANS_8X8PLUS
     };
-    let mut cache = [0_u8; 1024];
+    let model = &coefficient_model(tx_size)[plane_type][reference];
+    let mut cache = [0_u8; SIZE];
     let mut previous_zero = false;
     for c in 0..eob {
-        let probs = coefficient_probs(
-            tx_size,
-            plane_type,
-            reference,
-            usize::from(bands[c]),
-            context,
-        );
+        let probs = &model[usize::from(bands[c])][context];
         if !previous_zero {
             sink.write(true, probs[0]);
         }
@@ -2300,15 +2313,153 @@ fn write_coefficients<S: BoolSink>(
             >> 1;
     }
     if eob < scan.len() {
-        let probs = coefficient_probs(
-            tx_size,
-            plane_type,
-            reference,
-            usize::from(bands[eob]),
-            context,
-        );
-        sink.write(false, probs[0]);
+        sink.write(false, model[usize::from(bands[eob])][context][0]);
     }
+}
+
+/// Magnitudes up to this have their token costs precomputed per context.
+const COSTED_MAGNITUDES: usize = 16;
+
+/// What each token costs in one coefficient context, in bits, as
+/// [`write_tokens`] codes it.
+struct ContextCosts {
+    /// The "more coefficients" bit before a token that follows a nonzero one.
+    more: f64,
+    /// The end of block.
+    end: f64,
+    zero: f64,
+    /// A nonzero level of each magnitude from 1, with its sign.
+    nonzero: [f64; COSTED_MAGNITUDES],
+}
+
+impl ContextCosts {
+    fn new(probs: &[u8; 3]) -> Self {
+        // The first band has only three contexts; the rest of its table is
+        // zeros, which no block reads.
+        if probs.contains(&0) {
+            return Self {
+                more: f64::INFINITY,
+                end: f64::INFINITY,
+                zero: f64::INFINITY,
+                nonzero: [f64::INFINITY; COSTED_MAGNITUDES],
+            };
+        }
+        Self {
+            more: bit_cost(true, probs[0]),
+            end: bit_cost(false, probs[0]),
+            zero: bit_cost(false, probs[1]),
+            nonzero: core::array::from_fn(|index| nonzero_cost(index as u32 + 1, probs)),
+        }
+    }
+}
+
+/// What a nonzero level of `magnitude` costs with its sign, in bits.
+fn nonzero_cost(magnitude: u32, probs: &[u8; 3]) -> f64 {
+    cost(|sink| {
+        sink.write(true, probs[1]);
+        write_magnitude(sink, magnitude, probs[2]);
+        sink.write(false, 128);
+    })
+}
+
+/// The token costs of every coefficient context of a transform size, by
+/// plane type, reference, band and context.
+type TokenCosts = [[[[ContextCosts; 6]; 6]; 2]; 2];
+
+fn token_costs(tx_size: usize) -> &'static TokenCosts {
+    static COSTS: OnceLock<[TokenCosts; 4]> = OnceLock::new();
+    &COSTS.get_or_init(|| {
+        core::array::from_fn(|tx_size| {
+            let model = coefficient_model(tx_size);
+            core::array::from_fn(|plane_type| {
+                core::array::from_fn(|reference| {
+                    core::array::from_fn(|band| {
+                        core::array::from_fn(|context| {
+                            ContextCosts::new(&model[plane_type][reference][band][context])
+                        })
+                    })
+                })
+            })
+        })
+    })[tx_size]
+}
+
+/// The bits [`write_coefficients`] codes one transform block's tokens in,
+/// from the costs of whole tokens: the search costs every transform block it
+/// tries, and summing bit by bit dominated it.
+fn coefficient_bits(
+    levels: &[i32],
+    eob: usize,
+    tx_size: usize,
+    tx_type: TxType,
+    plane_type: usize,
+    reference: usize,
+    context: usize,
+) -> f64 {
+    let bits = match tx_size {
+        0 => token_bits::<16>,
+        1 => token_bits::<64>,
+        2 => token_bits::<256>,
+        _ => token_bits::<1024>,
+    };
+    bits(
+        levels, eob, tx_size, tx_type, plane_type, reference, context,
+    )
+}
+
+/// [`coefficient_bits`] for a transform of `SIZE` coefficients, following
+/// [`write_tokens`] token by token.
+fn token_bits<const SIZE: usize>(
+    levels: &[i32],
+    eob: usize,
+    tx_size: usize,
+    tx_type: TxType,
+    plane_type: usize,
+    reference: usize,
+    mut context: usize,
+) -> f64 {
+    let (scan, neighbors) = scan_order(tx_size, tx_type);
+    let bands: &[u8] = if tx_size == 0 {
+        &shared::COEFBAND_TRANS_4X4
+    } else {
+        &shared::COEFBAND_TRANS_8X8PLUS
+    };
+    let costs = &token_costs(tx_size)[plane_type][reference];
+    let mut bits = 0.0;
+    let mut cache = [0_u8; SIZE];
+    let mut previous_zero = false;
+    for c in 0..eob {
+        let band = usize::from(bands[c]);
+        let token = &costs[band][context];
+        if !previous_zero {
+            bits += token.more;
+        }
+        let position = scan[c] as usize;
+        let magnitude = levels[position].unsigned_abs();
+        if magnitude == 0 {
+            bits += token.zero;
+            previous_zero = true;
+        } else {
+            bits += match token.nonzero.get(magnitude as usize - 1) {
+                Some(&cost) => cost,
+                None => nonzero_cost(
+                    magnitude,
+                    &coefficient_model(tx_size)[plane_type][reference][band][context],
+                ),
+            };
+            previous_zero = false;
+        }
+        cache[position] = energy_class(magnitude);
+        let next = c + 1;
+        context = (1
+            + usize::from(cache[neighbors[next * 2] as usize])
+            + usize::from(cache[neighbors[next * 2 + 1] as usize]))
+            >> 1;
+    }
+    if eob < scan.len() {
+        bits += costs[usize::from(bands[eob])][context].end;
+    }
+    bits
 }
 
 fn write_magnitude<S: BoolSink>(sink: &mut S, magnitude: u32, pivot: u8) {
