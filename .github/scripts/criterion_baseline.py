@@ -536,6 +536,7 @@ SITE_GROUP_PREFIXES: dict[str, tuple[str, ...]] = {
     # inside the Vorbis encoder, so every row of `benches/vorbis_encode.rs` is
     # this site's own number.
     "vorbis_encode": ("vorbis_encode_",),
+    "vp9_encode": ("vp9_encode_",),
     "hevc_prediction_filters": (
         "hevc_inter_pred",
         "hevc_intra_pred",

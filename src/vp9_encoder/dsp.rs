@@ -8,6 +8,7 @@
 //! approximation of the inverse: the 4x4 one follows libvpx's `vp9_fht4x4_c`,
 //! and the larger ones are exact floating-point transforms.
 
+use super::simd;
 use super::tables::SUBPEL_FILTERS_REGULAR;
 use std::sync::OnceLock;
 
@@ -80,8 +81,13 @@ fn fadst4(input: [i64; 4]) -> [i64; 4] {
     ]
 }
 
-/// Forward 4x4 transform of a residual block, in raster order.
-fn forward_transform_4x4(residual: &[i32], tx_type: TxType) -> [i32; 16] {
+/// Forward 4x4 transform of a residual block, in raster order: the scalar
+/// reference for `simd::forward_transform_4x4`.
+pub(super) fn forward_transform_4x4_scalar(
+    residual: &[i32],
+    vertical_adst: bool,
+    horizontal_adst: bool,
+) -> [i32; 16] {
     let mut columns = [0_i64; 16];
     for column in 0..4 {
         let mut input = [0_i64; 4];
@@ -91,7 +97,7 @@ fn forward_transform_4x4(residual: &[i32], tx_type: TxType) -> [i32; 16] {
         if column == 0 && input[0] != 0 {
             input[0] += 1;
         }
-        let output = if tx_type.vertical_adst() {
+        let output = if vertical_adst {
             fadst4(input)
         } else {
             fdct4(input)
@@ -104,7 +110,7 @@ fn forward_transform_4x4(residual: &[i32], tx_type: TxType) -> [i32; 16] {
     for row in 0..4 {
         let mut input = [0_i64; 4];
         input.copy_from_slice(&columns[row * 4..row * 4 + 4]);
-        let output = if tx_type.horizontal_adst() {
+        let output = if horizontal_adst {
             fadst4(input)
         } else {
             fdct4(input)
@@ -167,7 +173,11 @@ pub(super) fn forward_transform(
     output: &mut [f64],
 ) {
     if tx_size == 0 {
-        let coefficients = forward_transform_4x4(residual, tx_type);
+        let coefficients = simd::forward_transform_4x4(
+            residual,
+            tx_type.vertical_adst(),
+            tx_type.horizontal_adst(),
+        );
         for (output, coefficient) in output.iter_mut().zip(coefficients) {
             *output = f64::from(coefficient);
         }
@@ -190,26 +200,19 @@ pub(super) fn forward_transform(
     let shift = if tx_size == 1 { 32.0 } else { 64.0 };
     let half = (n / 2) as f64;
     let scale = shift / (half * half);
-    // Both products accumulate whole rows, which the compiler vectorizes.
+    let mut weights = vec![0.0; n * n];
+    for (k, row) in weights.chunks_exact_mut(n).enumerate() {
+        for (i, weight) in row.iter_mut().enumerate() {
+            *weight = vertical[i * n + k] * scale;
+        }
+    }
+    let samples: Vec<f64> = residual[..n * n]
+        .iter()
+        .map(|&value| f64::from(value))
+        .collect();
     let mut columns = vec![0.0; n * n];
-    for (i, samples) in residual.chunks_exact(n).enumerate() {
-        let samples: Vec<f64> = samples.iter().map(|&value| f64::from(value)).collect();
-        for k in 0..n {
-            let weight = vertical[i * n + k] * scale;
-            for (column, &sample) in columns[k * n..][..n].iter_mut().zip(&samples) {
-                *column += weight * sample;
-            }
-        }
-    }
-    output[..n * n].fill(0.0);
-    for (k, row) in output.chunks_exact_mut(n).take(n).enumerate() {
-        for j in 0..n {
-            let weight = columns[k * n + j];
-            for (output, &basis) in row.iter_mut().zip(&horizontal[j * n..][..n]) {
-                *output += weight * basis;
-            }
-        }
-    }
+    simd::matrix_product(&weights, &samples, n, &mut columns);
+    simd::matrix_product(&columns, horizontal, n, output);
 }
 
 /// Adds the inverse transform of dequantized `coefficients` (raster order,
@@ -290,6 +293,11 @@ pub(super) fn predict_intra(
             *value = plane[(y + row) * stride + x - 1];
         }
     }
+    if mode == IntraMode::Tm {
+        let block = &mut plane[y * stride + x..];
+        simd::predict_tm(block, stride, size, above, left, above_left);
+        return;
+    }
     let log2 = size.trailing_zeros();
     for row in 0..size {
         let output = &mut plane[(y + row) * stride + x..][..size];
@@ -308,13 +316,7 @@ pub(super) fn predict_intra(
             }
             IntraMode::V => output.copy_from_slice(above),
             IntraMode::H => output.fill(left[row]),
-            IntraMode::Tm => {
-                for (column, value) in output.iter_mut().enumerate() {
-                    *value = (i32::from(left[row]) + i32::from(above[column])
-                        - i32::from(above_left))
-                    .clamp(0, 255) as u8;
-                }
-            }
+            IntraMode::Tm => unreachable!("predicted above"),
         }
     }
 }
@@ -352,32 +354,30 @@ pub(super) fn predict_inter(
     mv_col_q4: i32,
     output: &mut [u8],
 ) {
-    let x0 = x as isize + (mv_col_q4 >> 4) as isize;
-    let y0 = y as isize + (mv_row_q4 >> 4) as isize;
+    let x0 = x as isize + (mv_col_q4 >> 4) as isize - 3;
+    let y0 = y as isize + (mv_row_q4 >> 4) as isize - 3;
     let filter_x = &SUBPEL_FILTERS_REGULAR[(mv_col_q4 & 15) as usize * 8..][..8];
     let filter_y = &SUBPEL_FILTERS_REGULAR[(mv_row_q4 & 15) as usize * 8..][..8];
-    let (w, h) = (size, size);
-    let mut intermediate = vec![0_u8; (h + 7) * w];
-    for row in 0..h + 7 {
-        let source_y = y0 + row as isize - 3;
-        for column in 0..w {
-            let source_x = x0 + column as isize - 3;
-            let sum: i32 = (0..8)
-                .map(|tap| {
-                    filter_x[tap] * i32::from(reference.sample(source_x + tap as isize, source_y))
-                })
-                .sum();
-            intermediate[row * w + column] = ((sum + 64) >> 7).clamp(0, 255) as u8;
+    // The samples the filters read, three rows and columns before the block
+    // and four after, edge-clamped.
+    let span = size + 7;
+    let mut window = vec![0_u8; span * span];
+    let inside = x0 >= 0
+        && y0 >= 0
+        && x0 as usize + span <= reference.width
+        && y0 as usize + span <= reference.height;
+    for (row, out) in window.chunks_exact_mut(span).enumerate() {
+        let source_y = y0 + row as isize;
+        if inside {
+            let start = source_y as usize * reference.stride + x0 as usize;
+            out.copy_from_slice(&reference.pixels[start..start + span]);
+        } else {
+            for (column, out) in out.iter_mut().enumerate() {
+                *out = reference.sample(x0 + column as isize, source_y);
+            }
         }
     }
-    for row in 0..h {
-        for column in 0..w {
-            let sum: i32 = (0..8)
-                .map(|tap| filter_y[tap] * i32::from(intermediate[(row + tap) * w + column]))
-                .sum();
-            output[row * w + column] = ((sum + 64) >> 7).clamp(0, 255) as u8;
-        }
-    }
+    simd::convolve8(&window, span, size, size, filter_x, filter_y, output);
 }
 
 #[cfg(test)]
