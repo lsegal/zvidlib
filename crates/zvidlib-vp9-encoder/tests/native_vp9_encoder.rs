@@ -625,14 +625,18 @@ fn native_vp9_encoder_round_trips_through_the_native_decoder() {
             frame,
             orientation: Orientation::TopLeft,
         });
-        for sample in block_on(encoder.encode(FrameIndex(index as u64), source)).unwrap() {
-            samples.push(EncodedVideoSample {
-                presentation_index: FrameIndex(index as u64),
-                random_access: sample.is_sync,
-                data: sample.data,
-            });
-        }
+        samples.extend(block_on(encoder.encode(FrameIndex(index as u64), source)).unwrap());
     }
+    // The encoder holds the start of each group back until it has seen it.
+    samples.extend(block_on(encoder.finish()).unwrap());
+    let samples: Vec<EncodedVideoSample> = samples
+        .into_iter()
+        .map(|sample| EncodedVideoSample {
+            presentation_index: FrameIndex((sample.pts / i64::from(sample.duration)) as u64),
+            random_access: sample.is_sync,
+            data: sample.data,
+        })
+        .collect();
     let mut configuration = decoder_configuration;
     configuration.configuration = encoder.config().decoder_config.clone();
     let decoder = zvidlib_vp9_decoder::native_vp9_video_decoder_factory();

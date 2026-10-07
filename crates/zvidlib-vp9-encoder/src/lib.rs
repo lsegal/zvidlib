@@ -7,6 +7,13 @@
 //! up to the next one depends on the samples before it. See `frame` for the
 //! coding tools.
 //!
+//! The encoder buffers the start of each group, up to 60 frames or the whole
+//! group if shorter, before coding any of it. It decides from those frames
+//! whether the key frame keeps detail for the frames after it (see
+//! `lookahead`). So [`VideoEncoder::encode`] returns no samples while a group
+//! starts, then all of the buffered ones at once, and
+//! [`VideoEncoder::finish`] returns whatever is still buffered.
+//!
 //! [`VideoEncoderConfig::configuration`] is either empty, which encodes at
 //! [`DEFAULT_BASE_Q_IDX`] with a key frame every [`DEFAULT_KEYFRAME_INTERVAL`]
 //! frames, a single nonzero `base_q_idx` byte, that byte followed by the key
