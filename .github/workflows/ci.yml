@@ -44,6 +44,130 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Neither cargo nor nextest can cache a test result, so a pull request that
+  # touches nothing a job reads still paid for that job (#600). This decides
+  # which of the jobs below a pull request has to run, from the files it
+  # changes, and the others are skipped rather than failed: `Rust checks`,
+  # `WebAssembly checks`, `Rust tests (build)` and the shards that need it,
+  # `Native tests (build, ...)` and the shards that need it, and `macOS Swift
+  # runtime rpath`. The benchmark jobs are not gated; on a pull request the
+  # only one is the compile check.
+  #
+  # Only a pull request is filtered. A `main` push and a `workflow_dispatch`
+  # run everything, because the benchmark baseline is a chain and `main`'s
+  # history is what a regression is bisected through; the filter step does not
+  # even run there, and each output is `true` before it reads the step.
+  #
+  # The filters err towards running a job. `everything` is the build
+  # definition - the manifest, the lockfile, the build script, the toolchain,
+  # cargo's and nextest's configuration and this workflow - and any of those
+  # runs every job. Otherwise a job runs on every directory it compiles or
+  # reads, and the only exclusions are modules its target does not compile:
+  # the `cfg(not(target_arch = "wasm32"))` and platform backends for the
+  # WebAssembly checks, and the `cfg(target_arch = "wasm32")` browser modules
+  # for the native jobs. With `some-with-excludes` a file is matched by any
+  # pattern of a filter and unmatched by any `!` pattern of it.
+  # `tests/ci_path_filters_are_conservative.rs` holds each exclusion to its
+  # module's `cfg`, and each filter to the files its job is known to read.
+  changes:
+    name: Changed paths
+    runs-on: ubuntu-latest
+    # The pull-request file list comes from the API, so nothing is checked out.
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      rust: ${{ github.event_name != 'pull_request' || steps.filter.outputs.everything == 'true' || steps.filter.outputs.rust == 'true' }}
+      wasm: ${{ github.event_name != 'pull_request' || steps.filter.outputs.everything == 'true' || steps.filter.outputs.wasm == 'true' }}
+      rust_tests: ${{ github.event_name != 'pull_request' || steps.filter.outputs.everything == 'true' || steps.filter.outputs.rust_tests == 'true' }}
+      native_tests: ${{ github.event_name != 'pull_request' || steps.filter.outputs.everything == 'true' || steps.filter.outputs.native_tests == 'true' }}
+      macos_swift_rpath: ${{ github.event_name != 'pull_request' || steps.filter.outputs.everything == 'true' || steps.filter.outputs.macos_swift_rpath == 'true' }}
+    steps:
+      - name: Match the changed files against each job's inputs
+        id: filter
+        if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@v4
+        with:
+          predicate-quantifier: some-with-excludes
+          filters: |
+            everything:
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'build.rs'
+              - 'rust-toolchain.toml'
+              - '.cargo/**'
+              - '.config/**'
+              - '.github/workflows/ci.yml'
+            # Formatting covers every Rust file, the browser modules included;
+            # the lints cover every target; the scripts' tests, the SIMD
+            # assembly check and the web example's Node tests run here too.
+            rust:
+              - 'src/**'
+              - 'tests/**'
+              - 'benches/**'
+              - 'examples/**'
+              - 'rustfmt.toml'
+              - '.github/scripts/**'
+            # `wasm-pack test` builds the library's units and the integration
+            # tests for wasm32; the native-only examples are skipped by their
+            # `required-features`, but a new example might not be.
+            wasm:
+              - 'src/**'
+              - 'tests/**'
+              - 'examples/**/*.rs'
+              - 'js/**'
+              - '!src/aac_encoder/**'
+              - '!src/native_audio.rs'
+              - '!src/native_audio/**'
+              - '!src/hevc/annexb.rs'
+              - '!src/hevc/bench.rs'
+              - '!src/hevc/decode_bench.rs'
+              - '!src/hevc/encoder.rs'
+              - '!src/hevc/nvdec.rs'
+              - '!src/hevc/planar.rs'
+              - '!src/hevc/readback.rs'
+              - '!src/hevc/videotoolbox.rs'
+              - '!src/hevc/videotoolbox_encoder.rs'
+              - '!src/hevc/videotoolbox_vp9.rs'
+              - '!src/hevc/windows_mf.rs'
+              - '!src/hevc/windows_mf_encoder.rs'
+            # The library's units read `benches/README.md` and
+            # `.github/scripts/criterion_baseline.py` through `include_str!`,
+            # and the `ci_*` guards read every workflow.
+            rust_tests:
+              - 'src/**'
+              - 'tests/**'
+              - 'benches/**'
+              - 'examples/**'
+              - '.github/scripts/**'
+              - '.github/workflows/**'
+              - '!src/wasm_api.rs'
+              - '!src/web_audio_decoder.rs'
+              - '!src/web_decoder.rs'
+              - '!src/web_encoder.rs'
+              - '!src/web_previews.rs'
+            native_tests:
+              - 'src/**'
+              - 'tests/**'
+              - 'benches/**'
+              - 'examples/**'
+              - '.github/scripts/**'
+              - '!src/wasm_api.rs'
+              - '!src/web_audio_decoder.rs'
+              - '!src/web_decoder.rs'
+              - '!src/web_encoder.rs'
+              - '!src/web_previews.rs'
+            # A release build of the library and the one test that inspects
+            # what it links.
+            macos_swift_rpath:
+              - 'src/**'
+              - 'tests/macos_swift_runtime_rpath.rs'
+              - '!src/wasm_api.rs'
+              - '!src/web_audio_decoder.rs'
+              - '!src/web_decoder.rs'
+              - '!src/web_encoder.rs'
+              - '!src/web_previews.rs'
+
   # The Rust tests used to run here and in `native-platforms` as one
   # `cargo test` step after another, each a separate binary that waited for the
   # one before it, and the two jobs took twelve minutes apiece (#595). They are
@@ -53,6 +177,8 @@ jobs:
   # is not a Rust test: formatting, lints and the scripts the workflow uses.
   rust:
     name: Rust checks
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -119,6 +245,8 @@ jobs:
   # jobs instead of at the end of one of them.
   wasm:
     name: WebAssembly checks
+    needs: changes
+    if: needs.changes.outputs.wasm == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -234,6 +362,8 @@ jobs:
   # time by steps of their own; the library units are now run once.
   rust-tests-build:
     name: Rust tests (build)
+    needs: changes
+    if: needs.changes.outputs.rust_tests == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -754,6 +884,8 @@ jobs:
   #   these platforms. The Linux shards run the same file against Symphonia.
   native-tests-build:
     name: Native tests (build, ${{ matrix.os }})
+    needs: changes
+    if: needs.changes.outputs.native_tests == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -859,6 +991,8 @@ jobs:
   # the fat-LTO build is off the shards' path entirely.
   macos-swift-rpath:
     name: macOS Swift runtime rpath
+    needs: changes
+    if: needs.changes.outputs.macos_swift_rpath == 'true'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
