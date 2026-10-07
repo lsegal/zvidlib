@@ -547,126 +547,15 @@ jobs:
   # over a matrix of shards (#595), and a shard ran tests from every package in
   # it whether or not the change could reach them.
   #
-  # The list below is also the list of what runs: `--lib` is the selected
-  # package's library units, and the integration tests run are the ones named
-  # with `--test` on that package's `targets` line, and nothing else. Each
-  # `--test` was its own step before, and the reason each one is run is
-  # written here:
-  #
-  # - `bench_sources_compile`: the lints only cover files some target actually
-  #   compiles, so an undeclared file under benches/ passes them by being
-  #   skipped. This asserts every one of them is reachable from a [[bench]].
-  # - `bench_group_names_are_unique`: Criterion keys a group by its name alone,
-  #   so two targets claiming one name overwrite each other under
-  #   target/criterion/ and a collected baseline sees whichever ran second.
-  #   That is silent in a bench log and only surfaces as a committed table row
-  #   that moved for no reason a commit explains, which is what #414 was.
-  # - `ci_workflows_cache_cargo`: the caching this workflow depends on is
-  #   opt-in per job, so a job added without it is slow in a way nothing else
-  #   here would report.
-  # - `ci_concurrency_spares_main`: `ci.yml` and `baseline-staleness.yml` spare
-  #   a `main` push from cancellation in their group key rather than with
-  #   `cancel-in-progress`, because Actions reads that key's value as a string
-  #   and every non-empty string is truthy - so an expression there cancelled
-  #   the `main` runs the comment beside it documented as never cancelled
-  #   (#451). A cancelled `main` run is a hole in the benchmark baseline chain
-  #   and reports itself as nothing at all, so this needs a test, not a reader.
-  # - `ci_staleness_report_sees_markdown_changes`: `baseline-staleness.yml`
-  #   names `benches/README.md` in both triggers' `paths:`, and a report that
-  #   skips itself on exactly the change it exists to check is silent by
-  #   construction (#449). This asserts the two lists stay in step and that the
-  #   workflow keeps no `paths-ignore` of its own.
-  # - `ci_guard_tests_are_run`: two guards once had no step and were compiled
-  #   but never run (#464), and nine library tests sat the same way (#599).
-  #   This asserts every `tests/*.rs` file of every package is named by the
-  #   `--test` of a cargo invocation that runs it, which here is this list,
-  #   under the package it belongs to, unless the test's `NOT_RUN_BY_CI` names
-  #   it with the reason it is left out.
-  # - `ci_benchmarks_run_every_target`: the timed benchmark run names its
-  #   `[[bench]]` targets in a matrix, a second copy of what `Cargo.toml`
-  #   declares; a target in the manifest and not the matrix is never measured
-  #   again (#459). It also pins the `rm -rf target/criterion` that keeps a
-  #   restored build cache from making criterion log an error per benchmark.
-  # - `ci_path_filters_are_conservative`: a pull request skips the jobs and the
-  #   packages whose inputs it does not touch (#600, #612), and a filter too
-  #   narrow for its job skips it on exactly the change that would have failed
-  #   it, which reports itself as nothing. This holds each filter to the files
-  #   its job reads and each exclusion to its module's `cfg`, keeps `main`
-  #   running everything, and keeps this matrix covering every package.
-  # - `media_output_cover_art`: the cover `MediaOutput` generates from a frame
-  #   (#510). The cover's own mux and demux are `zvidlib-container`'s
-  #   `mp4_cover_art`.
-  # - `mp4_cover_art`: pins no-cover output byte for byte and round-trips JPEG
-  #   and PNG cover art through `Mp4Muxer` and `Mp4Demuxer` (#502).
-  # - `opus_codec`: holds the Opus decoder to libopus - every RFC 8251 vector,
-  #   in stereo and in mono, must pass `opus_compare`, and one libopus-encoded
-  #   MP4 per coding mode must decode to libopus's own output - and pins
-  #   exact-length reads through pre-skip and end trimming, reads after a seek,
-  #   and the native encoder's round trip (#524).
-  # - `vorbis_codec`: holds the Vorbis decoder to libvorbis's own output, short
-  #   blocks and surround streams included (#547), and pins packet durations,
-  #   bit-identical reads after a seek and the native encoder's exact-length
-  #   round trip (#524).
-  # - `native_aac_decoder`: Linux has no platform AAC decoder, so
-  #   `NativeAacDecoder` runs Symphonia's here (#561), held to the same
-  #   reference PCM the macOS and Windows jobs hold their platform decoders to.
-  # - `native_vp9_encoder`: muxes the native VP9 encoder's output as
-  #   `vp09`/`vpcC`, plays the MP4 through libvpx and FFmpeg's VP9 decoder, and
-  #   runs the encoder conformance vector against libvpx (#528).
-  # - `webm_container`: remuxes the bundled AV1 sample into WebM and back,
-  #   asserting the WebM index hands a decoder exactly the MP4's samples and
-  #   frames, and that the written Cues are seekable (#526).
-  # - `vp8_conformance`: every VP8 test vector frame comes back exactly through
-  #   `ExactFrameReader` in reverse and alternating order, through the hidden
-  #   key frame of vector 018 (#529).
-  # - `vp8_preview_index`: the preview tier plans its slots over a VP8 track's
-  #   shown frames only, not its hidden alternate references (#543).
-  # - `native_vp8_encoder`: re-encodes the bundled VP8 clip into WebM and
-  #   checks one cue per key frame, exact frames in every access order, and a
-  #   quality floor (#530).
-  # - `vp9_hardware`: with no GPU on this runner, `Prefer` must fall back to the
-  #   software decoder and `Require` report hardware unavailable (#545).
-  # - `web_canvas_samples_match_their_files`: `samples.test.js` can only check
-  #   the choice, not the claim it is made from: the codec string the page
-  #   probes with is written down in JavaScript, so this demuxes each declared
-  #   sample and asserts the declaration against what zvidlib derives.
-  # - `av1_intra_decoder` and `av1_inter_decoder`: the native AV1 decoder
-  #   against standardized vectors - a lossless intra stream reconstructs the
-  #   canonical YUV, and an inter stream with `show_existing_frame` matches its
-  #   canonical digest - plus explicit failures for malformed and over-budget
-  #   units and a reference store bounded by `Limits`.
-  # - `av1_simd_intra`: the AV1 intra prediction kernels and block
-  #   reconstruction, on whatever SIMD level the runner has, bit for bit against
-  #   an independent scalar reference. Its two benchmarks print timings but
-  #   assert only that both paths agree, so a slow runner cannot fail them.
-  # - `hevc_conformance`, `av1_conformance` and `vp9_conformance`: each
-  #   registered decoder - HEVC Main and Main 10, AV1, VP9 - against reference
-  #   RGBA digests through sequential, reverse and alternating seeks (#508,
-  #   #527), and for HEVC a seek that skips pictures still returning the
-  #   fixture's frames. The bundled 1080p HEVC and AV1 samples have one
-  #   random-access point each, so they are walked in order with a few seeks
-  #   instead; a reverse walk of either re-decodes the whole track per frame and
-  #   does not finish on a runner. One file per decoder, in its crate, since
-  #   they were split out of the root package's `codec_conformance` (#612).
-  # - `hevc_bitstream_byte_identity`: the HEVC bit writer's output against
-  #   golden digests taken before it was widened (#233), so a throughput change
-  #   that alters a bit fails.
-  # - `indexed_mp4_output`: `MediaOutput`'s MP4 index tables round-trip exactly,
-  #   an empty output stays consistent, incompatible audio and unsynchronized
-  #   finishes are rejected, and sink backpressure and errors reach the caller.
-  # - `native_av1_encoder`: the native AV1 encoder's output decodes through
-  #   ffmpeg (which this job installs) above a PSNR floor, round-trips through
-  #   the native decoder, and passes the shared encoder conformance runner.
-  # - `native_gl`: the example's bitmap-font overlay helpers.
-  #
-  # `--lib` includes the HEVC/AV1 engine tests that compare every SIMD backend
-  # the runner's CPU offers against the scalar reference, which is how the
-  # x86_64 SSE4.1/AVX2 kernels get covered at all, since the other CI hosts are
-  # aarch64. `--no-tests=warn`, because a package such as `zvidlib-build` can
-  # have no test of its own, and running none of them is then correct rather
-  # than a failure. `.config/nextest.toml` keeps the hardware and wall-clock
-  # tests from sharing the machine, which one step per binary used to
-  # guarantee.
+  # Each leg runs every test target of its package - `--lib`, `--tests` and
+  # the examples that set `test = true` - so a new test file runs without a
+  # change here (#616). What a test checks is written in its own doc comment,
+  # and a test that cannot run on some host is kept off it by `#[cfg]`,
+  # `#[ignore]` or `.config/nextest.toml`, never by leaving it out of this job.
+  # `.config/nextest.toml` also keeps the hardware and wall-clock tests from
+  # sharing the machine, which one step per binary used to guarantee.
+  # `--no-tests=warn`, because a package such as `zvidlib-build` has no test of
+  # its own, and running none is then correct rather than a failure.
   rust-tests:
     name: Rust tests (${{ matrix.package }})
     needs: changes
@@ -722,59 +611,18 @@ jobs:
         run: |
           curl -sSfL https://opus-codec.org/static/testvectors/opus_testvectors-rfc8251.tar.gz \
             | tar -xz
-      # `targets` adds the integration tests and other targets of the package
-      # this leg runs, and the `--features` only the root package declares.
+      # `native` is a feature of the root package only, and naming a feature
+      # no selected package declares is an error.
       - name: Run this package's tests
         env:
           PACKAGE: ${{ matrix.package }}
         run: |
-          args=()
-          targets() {
-            if [ "$1" = "$PACKAGE" ]; then
-              shift
-              args+=("$@")
-            fi
-          }
-          targets zvidlib --features native \
-            --test bench_sources_compile \
-            --test bench_group_names_are_unique \
-            --test ci_workflows_cache_cargo \
-            --test ci_concurrency_spares_main \
-            --test ci_staleness_report_sees_markdown_changes \
-            --test ci_guard_tests_are_run \
-            --test ci_benchmarks_run_every_target \
-            --test ci_path_filters_are_conservative \
-            --test media_output_cover_art \
-            --test native_aac_decoder \
-            --test vp8_preview_index \
-            --test web_canvas_samples_match_their_files \
-            --test indexed_mp4_output \
-            --example native_gl
-          targets zvidlib-aac-encoder
-          targets zvidlib-av1 \
-            --test av1_intra_decoder \
-            --test av1_inter_decoder \
-            --test av1_simd_intra
-          targets zvidlib-av1-decoder --test av1_conformance
-          targets zvidlib-av1-encoder --test native_av1_encoder
-          targets zvidlib-av1-syntax
-          targets zvidlib-bench-support
-          targets zvidlib-build
-          targets zvidlib-color
-          targets zvidlib-container --test webm_container --test mp4_cover_art
-          targets zvidlib-core
-          targets zvidlib-hardware
-          targets zvidlib-hevc-decoder --test hevc_conformance
-          targets zvidlib-hevc-encoder --test hevc_bitstream_byte_identity
-          targets zvidlib-hevc-syntax
-          targets zvidlib-opus --test opus_codec
-          targets zvidlib-vorbis-decoder
-          targets zvidlib-vorbis-encoder --test vorbis_codec
-          targets zvidlib-vp8 --test native_vp8_encoder --test vp8_conformance
-          targets zvidlib-vp9-decoder --test vp9_conformance
-          targets zvidlib-vp9-encoder --test native_vp9_encoder --test vp9_hardware
-          targets zvidlib-vp9-syntax
-          cargo nextest run --profile ci --no-tests=warn -p "$PACKAGE" --lib "${args[@]}"
+          features=()
+          if [ "$PACKAGE" = zvidlib ]; then
+            features=(--features native)
+          fi
+          cargo nextest run --profile ci --no-tests=warn -p "$PACKAGE" "${features[@]}" \
+            --lib --tests --examples
 
       # The VP9 decoder is held bit-exact to libvpx on every profile 0 test
       # vector libvpx's own test suite decodes (#527): hidden frames,
@@ -1157,53 +1005,17 @@ jobs:
   # regression is only caught when someone runs the tests on an Intel Mac by
   # hand.
   #
-  # The targets are the ones these hosts have something of their own to say
-  # about, listed under their packages and left out with them when the pull
-  # request cannot affect them, as on Linux. Every selected package runs in one
-  # `cargo nextest run` per host rather than a job per package, because each
-  # job here would repeat the platform lint and these runners are the scarce
-  # ones; nextest still runs every binary at once, and the hardware tests take
-  # turns through the `hardware` test group in `.config/nextest.toml`, which is
-  # what keeps the `macos-latest` VideoToolbox VP9 decoder from failing a
-  # decode while another session decodes (#565). These were dealt out over
-  # shards before (#595); they are not split any more.
-  #
-  # - `--lib`: every selected package's library units, including each platform
-  #   backend run on its own and the AV1 SIMD motion compensation tests, which
-  #   used to be run a second time by a step of their own.
-  # - `native_hevc_hardware`: accelerated HEVC selection and correctness.
-  # - `vp8_conformance`: the VP8 factory's hardware selection (#538). NVDEC is
-  #   compiled into the Windows build, so this is where `Prefer` is seen to fall
-  #   back to the software decoder and `Require` to report hardware unavailable
-  #   on a runner without an NVIDIA adapter. On a host with one, the same test
-  #   holds NVDEC to the software decoder's pixels on every vector.
-  # - `vp9_hardware`: the VP9 factory's hardware selection (#545). NVDEC and
-  #   Media Foundation are compiled into the Windows build and VideoToolbox
-  #   into the macOS one. Where a runner has a hardware VP9 decoder, the
-  #   hardware tests hold it to the software decoder's pixels, through
-  #   `show_existing_frame` and every seek order; where it has none, they skip
-  #   with the reason, and `Prefer` is seen to fall back to software and
-  #   `Require` to report hardware unavailable. The same file covers the encode
-  #   direction (#550): a hardware VP9 encoder's stream must mux into MP4 and
-  #   WebM and decode through the native VP9 decoder.
-  # - `native_hevc_encoder`: which encoder `Prefer` and `Require` select (#487,
-  #   #486), and on a host with a hardware encoder an MP4 that zvidlib and
-  #   ffmpeg both decode. `macos-latest` reaches VideoToolbox's hardware
-  #   encoder, so it runs the hardware cases, including the check that
-  #   AVFoundation plays that MP4 and decodes every frame of it (#495) through
-  #   `crates/zvidlib-hevc-encoder/tests/support/avfoundation_decode.swift`;
-  #   the other hosted runners have no hardware encoder, so they skip them and
-  #   the preference answers are what is checked. The Media Foundation backend's unit tests in `--lib`
-  #   still cover Microsoft's software encoder on any runner that has it.
-  # - `native_aac_encoder`: needs a platform AAC encoder - AudioToolbox on
-  #   macOS, Media Foundation on Windows, and none on Linux. Its impulse tests
-  #   are what hold each backend's reported priming and padding to the access
-  #   units it actually emits (#488).
-  # - `native_aac_decoder`: `NativeAacDecoder` is the platform's AAC decoder -
-  #   AudioToolbox on macOS and Media Foundation on Windows (#561) - so this is
-  #   where it is held to the window boundaries and, within a signal-to-noise
-  #   bound, the PCM that Symphonia's decoder produced before it was dropped on
-  #   these platforms. The Linux job runs the same file against Symphonia.
+  # Every test target of each package the pull request can affect runs, as on
+  # Linux, so each test runs on every host its `#[cfg]` builds it for: the
+  # hardware tests reach VideoToolbox, Media Foundation and NVDEC here, and the
+  # platform AAC tests the codecs Linux does not have. The selected packages
+  # run in one `cargo nextest run` per host rather than a job per package,
+  # because each job here would repeat the platform lint and these runners are
+  # the scarce ones; nextest still runs every binary at once. The hardware
+  # tests take turns through the `hardware` test group in
+  # `.config/nextest.toml`, which is what keeps the `macos-latest` VideoToolbox
+  # VP9 decoder from failing a decode while another session decodes (#565).
+  # These were dealt out over shards before (#595); they are not split now.
   native-tests:
     name: Native tests (${{ matrix.os }})
     needs: changes
@@ -1247,17 +1059,12 @@ jobs:
           PACKAGES: ${{ needs.changes.outputs.packages }}
         run: |
           packages=()
-          tests=()
           targets() {
             if [ "$PACKAGES" = all ] || jq -e --arg p "$1" 'index($p) != null' <<<"$PACKAGES" >/dev/null; then
               packages+=(-p "$1")
-              shift
-              tests+=("$@")
             fi
           }
-          targets zvidlib --features native \
-            --test native_aac_encoder \
-            --test native_aac_decoder
+          targets zvidlib
           targets zvidlib-aac-encoder
           targets zvidlib-av1
           targets zvidlib-av1-decoder
@@ -1270,18 +1077,17 @@ jobs:
           targets zvidlib-core
           targets zvidlib-hardware
           targets zvidlib-hevc-decoder
-          targets zvidlib-hevc-encoder \
-            --test native_hevc_hardware \
-            --test native_hevc_encoder
+          targets zvidlib-hevc-encoder
           targets zvidlib-hevc-syntax
           targets zvidlib-opus
           targets zvidlib-vorbis-decoder
           targets zvidlib-vorbis-encoder
-          targets zvidlib-vp8 --test vp8_conformance
+          targets zvidlib-vp8
           targets zvidlib-vp9-decoder
-          targets zvidlib-vp9-encoder --test vp9_hardware
+          targets zvidlib-vp9-encoder
           targets zvidlib-vp9-syntax
-          cargo nextest run --profile ci --no-tests=warn --lib "${packages[@]}" "${tests[@]}"
+          cargo nextest run --profile ci --no-tests=warn --features native \
+            --lib --tests --examples "${packages[@]}"
 
   # `--release` is the profile #327 was reported against: nothing about the
   # missing rpath is profile-specific, but this is the invocation the issue

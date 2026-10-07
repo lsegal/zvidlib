@@ -609,6 +609,9 @@ impl<'a> FrameEncoder<'a> {
     ) -> Self {
         let q = usize::from(base_q_idx);
         let ac = AC_QLOOKUP[q];
+        let coarseness = f64::from(base_q_idx) / 255.0;
+        let squared = coarseness * coarseness;
+        let key_weight = 1.0 + 2.0 * squared * squared * squared;
         Self {
             geometry,
             source,
@@ -631,7 +634,19 @@ impl<'a> FrameEncoder<'a> {
             // its square: enough to drop coefficients, skip blocks and merge
             // partitions where they cost more than they restore, without
             // trading away the quality the quantizer would otherwise keep.
-            lambda: f64::from(ac * ac) / 1200.0,
+            //
+            // A key frame's distortion is inherited by every frame predicted
+            // from it, so it trades rate at a lower lambda, much as libvpx
+            // codes key frames at a finer quantizer even at constant quality,
+            // and by more the coarser the quantizer. Weighed as one frame, a
+            // key frame at quantizers above about 230 dropped nearly all its
+            // detail, and an inter frame later bought it back at up to three
+            // times the key frame's size (issue #597). The weight grows to 3
+            // at the coarsest quantizer and stays near 1 below about 160,
+            // where key frames keep their detail anyway.
+            lambda: f64::from(ac * ac)
+                / 1200.0
+                / if reference.is_none() { key_weight } else { 1.0 },
             allow_high_precision_mv: reference.is_some()
                 && tools.sub_sample_motion
                 && base_q_idx < HIGH_PRECISION_MV_QTHRESH,

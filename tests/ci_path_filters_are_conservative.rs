@@ -910,14 +910,16 @@ fn every_file_a_package_includes_runs_its_filter() {
     );
 }
 
-/// The packages each test job lists with `targets`: every package has to be
-/// listed, or selecting it would build and run none of its tests.
+/// The packages the native test job lists with `targets`: every package has
+/// to be listed, or selecting it would build and run none of its tests. The
+/// Linux job runs a leg per package instead, which
+/// `the_per_package_test_matrix_covers_every_package` checks.
 #[test]
-fn every_package_is_listed_in_each_test_job() {
+fn every_package_is_listed_in_the_native_test_job() {
     let workflow = ci_workflow();
     let jobs = jobs(&workflow);
     let packages = workspace::packages();
-    for id in [PER_PACKAGE_TESTS, "native-tests"] {
+    for id in ["native-tests"] {
         let listed: Vec<&str> = job(&jobs, id)
             .body
             .lines()
