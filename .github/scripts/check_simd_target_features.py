@@ -29,12 +29,15 @@ crate has, `hevc::engine::simd`, `hevc::engine::transform_simd`,
 out-of-line intrinsic call is the same defect wherever it appears. The second
 covers the modules that dispatch through generic kernels, `av1_simd`,
 `vorbis_simd` (issue #572), `vp9_simd` (issue #570), `vp8::simd` (issue #569)
-and `vorbis_encoder::simd` (issue #573). `vp9_simd` and `vp8::simd` are
-written over the `av1_simd` vector types, so a `vp8::simd` kernel's symbol
-carries the `av1_simd` path of its vector argument and the `av1_simd` rule
-matches it. The other sites write their intrinsics directly inside the
-`#[target_feature]` function, where there is no separate body for the inliner
-to leave behind.
+and `vorbis_encoder::simd` (issue #573), all written over the shared `vector`
+types in `zvidlib-core`. The other sites write their intrinsics directly inside
+the `#[target_feature]` function, where there is no separate body for the
+inliner to leave behind.
+
+Since the workspace split (#604) those kernels live in several crates, so
+`build` emits the assembly of every crate that has any, each as its own
+`cargo rustc -p <crate>` invocation: the extra flags only reach the crate
+`cargo rustc` names, never its dependencies.
 
     build --target-dir target/simd-feature-check
     check --asm path/to/crate.s
@@ -81,8 +84,25 @@ BRANCH = re.compile(r"^\s+(call|callq|jmp|jmpq|bl|b)\s+([^\s;#]+)")
 CORE_ARCH = re.compile(r"9core_arch")
 AV1_SIMD = re.compile(r"8av1_simd")
 # The modules whose kernels are generic over a `vector` type.
-GENERIC_KERNEL_MODULE = re.compile(r"8av1_simd|11vorbis_simd|8vp9_simd|14vorbis_encoder4simd")
+# `zvidlib_vp8`'s `simd` module is at its crate root, so its path is the
+# crate name followed by the module.
+GENERIC_KERNEL_MODULE = re.compile(
+    r"8av1_simd|11vorbis_simd|8vp9_simd|14vorbis_encoder4simd|11zvidlib_vp84simd"
+)
 VECTOR_TYPE = re.compile(r"6vector3(x86|arm)")
+
+# The workspace crates with `#[target_feature]` kernels of their own.
+SIMD_PACKAGES = (
+    "zvidlib-av1",
+    "zvidlib-color",
+    "zvidlib-hevc-decoder",
+    "zvidlib-hevc-encoder",
+    "zvidlib-vorbis-decoder",
+    "zvidlib-vorbis-encoder",
+    "zvidlib-vp8",
+    "zvidlib-vp9-decoder",
+    "zvidlib-vp9-encoder",
+)
 
 # A crate disambiguator (`Cs7lEMBtiCmc_`) and a legacy mangling hash
 # (`17h1f0e2d3c4b5a6978`) are length-prefixed identifier-shaped runs that mean
@@ -283,31 +303,32 @@ def build(args: argparse.Namespace) -> int:
         return 0
 
     target_dir = pathlib.Path(args.target_dir)
-    command = [
-        "cargo",
-        "rustc",
-        "--lib",
-        "--release",
-        "--target-dir",
-        str(target_dir),
-    ]
-    if args.target:
-        command += ["--target", args.target]
-    for feature in args.features:
-        command += ["--features", feature]
-    command += [
-        "--",
-        "--emit=asm,link",
-        "-C",
-        "codegen-units=1",
-        "-C",
-        "symbol-mangling-version=v0",
-    ]
-    print(f"$ {' '.join(command)}", flush=True)
-    completed = subprocess.run(command, check=False)
-    if completed.returncode != 0:
-        print("the assembly build failed", file=sys.stderr)
-        return completed.returncode
+    for package in args.packages:
+        command = [
+            "cargo",
+            "rustc",
+            "--package",
+            package,
+            "--lib",
+            "--release",
+            "--target-dir",
+            str(target_dir),
+        ]
+        if args.target:
+            command += ["--target", args.target]
+        command += [
+            "--",
+            "--emit=asm,link",
+            "-C",
+            "codegen-units=1",
+            "-C",
+            "symbol-mangling-version=v0",
+        ]
+        print(f"$ {' '.join(command)}", flush=True)
+        completed = subprocess.run(command, check=False)
+        if completed.returncode != 0:
+            print(f"the assembly build of {package} failed", file=sys.stderr)
+            return completed.returncode
 
     # Cargo nests the artifacts under the triple as soon as `--target` is given.
     prefix = f"{args.target}/" if args.target else ""
@@ -338,7 +359,12 @@ def main(argv=None) -> int:
         "--target",
         help="cross-compile for this triple instead of building for the host",
     )
-    builder.add_argument("--features", nargs="*", default=["native"])
+    builder.add_argument(
+        "--packages",
+        nargs="*",
+        default=list(SIMD_PACKAGES),
+        help="the workspace crates whose assembly is checked",
+    )
     builder.set_defaults(func=build)
 
     args = parser.parse_args(argv)

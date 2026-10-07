@@ -3,10 +3,11 @@
 //! [`isa`].
 //!
 //! Each package's bench targets reach this through a local `support` module
-//! that [`bench_support!`] declares. The fixtures a package's benchmarks decode
-//! - the bundled samples and the checked-in streams - stay in that package's
-//! own `benches/support/`, next to the codec they need, so a benchmark depends
-//! on this crate, its own package, and nothing it does not measure.
+//! that [`bench_support!`] declares. The fixtures a package's benchmarks decode,
+//! such as the bundled samples and the checked-in streams, stay in that
+//! package's own `benches/support/`, next to the codec they need, so a
+//! benchmark depends on this crate, its own package, and nothing it does not
+//! measure.
 //!
 //! Development-only: this crate is not published.
 

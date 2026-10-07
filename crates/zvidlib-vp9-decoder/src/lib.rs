@@ -313,6 +313,15 @@ fn limit(message: impl Into<String>) -> Error {
     Error::new(ErrorKind::ResourceLimit, message)
 }
 
+/// The SIMD dispatch sites in this crate, each with the instruction set it
+/// resolves to right now. `zvidlib::simd::active_by_site` reports every crate's
+/// sites together and documents what each one covers.
+#[doc(hidden)]
+#[must_use]
+pub fn simd_sites() -> Vec<(&'static str, zvidlib_core::SimdIsa)> {
+    vec![("vp9_decode", vp9_simd::active_isa())]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -598,13 +607,4 @@ mod tests {
             eprintln!("{backend}: every VP9 frame matches the software decoder");
         }
     }
-}
-
-/// The SIMD dispatch sites in this crate, each with the instruction set it
-/// resolves to right now. `zvidlib::simd::active_by_site` reports every crate's
-/// sites together and documents what each one covers.
-#[doc(hidden)]
-#[must_use]
-pub fn simd_sites() -> Vec<(&'static str, zvidlib_core::SimdIsa)> {
-    vec![("vp9_decode", vp9_simd::active_isa())]
 }

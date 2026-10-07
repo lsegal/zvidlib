@@ -25,8 +25,9 @@
 //! argument to one of four constructors, and the alternative is a `syn`
 //! dependency for a hygiene check.
 
+mod workspace;
+
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
 
 /// The constructors a bench target names a criterion group through.
 ///
@@ -40,27 +41,6 @@ const GROUP_CONSTRUCTORS: [&str; 4] = [
     "group_name(",
     "benchmark_group(",
 ];
-
-/// Paths of the `[[bench]]` targets `Cargo.toml` declares.
-fn declared_bench_targets(manifest: &str) -> Vec<String> {
-    let mut paths = Vec::new();
-    let mut in_bench = false;
-    for line in manifest.lines() {
-        let line = line.trim();
-        if line.starts_with('[') {
-            in_bench = line == "[[bench]]";
-            continue;
-        }
-        if !in_bench {
-            continue;
-        }
-        if let Some(value) = line.strip_prefix("path") {
-            let value = value.trim_start().trim_start_matches('=').trim();
-            paths.push(value.trim_matches('"').to_string());
-        }
-    }
-    paths
-}
 
 /// The string literal that opens `rest`, if `rest` starts with one.
 ///
@@ -107,20 +87,26 @@ fn group_names(source: &str) -> BTreeSet<String> {
 
 #[test]
 fn no_two_bench_targets_register_the_same_group_name() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let manifest =
-        std::fs::read_to_string(root.join("Cargo.toml")).expect("Cargo.toml is readable");
-    let targets = declared_bench_targets(&manifest);
+    // Every package's targets, not one package's: criterion writes every
+    // group of the workspace under the one shared `target/criterion/`.
+    let targets: Vec<(String, std::path::PathBuf)> = workspace::packages()
+        .iter()
+        .flat_map(|package| {
+            package
+                .bench_targets()
+                .into_iter()
+                .map(|(_, path)| (package.repo_path(&path), package.path().join(&path)))
+        })
+        .collect();
     assert!(
         !targets.is_empty(),
-        "Cargo.toml declares no [[bench]] targets, so this guard would pass vacuously"
+        "the workspace declares no [[bench]] targets, so this guard would pass vacuously"
     );
 
     // name -> the targets that register it, so the failure names both sides of
     // a collision rather than only the one that happened to be read second.
     let mut owners: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for target in &targets {
-        let path = root.join(target);
+    for (target, path) in &targets {
         let source = std::fs::read_to_string(&path)
             .unwrap_or_else(|error| panic!("{} is readable: {error}", path.display()));
         for name in group_names(&source) {

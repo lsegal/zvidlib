@@ -16,7 +16,11 @@
 //!   file a source pulls in through `include_str!` or `include_bytes!`;
 //! - each exclusion names a module whose `cfg` keeps it out of the excluding
 //!   job's target, so a module that starts compiling for that target again
-//!   fails here instead of going unchecked.
+//!   fails here instead of going unchecked;
+//! - each workspace package has a filter that matches its own files, the files
+//!   of every crate it depends on and every file it includes, and nothing of
+//!   the crates it does not depend on (#604), so a change to one crate tests
+//!   and benchmarks that crate and its dependents and skips the rest.
 //!
 //! Deliberately line-based rather than a YAML parse, for the same reason
 //! `ci_workflows_cache_cargo` is: the alternative is a `serde_yaml` dependency
@@ -24,6 +28,8 @@
 //! The globs are matched by a reader that knows only `*`, `**` and `{a,b}`, and
 //! `every_pattern_uses_only_the_glob_syntax_this_test_reads` keeps the filters
 //! to that subset of what `dorny/paths-filter`'s picomatch accepts.
+
+mod workspace;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -58,9 +64,19 @@ const GATED_JOBS: &[(&str, &str)] = &[
 /// of their own: a shard has nothing to run without the archive.
 const SKIPPED_WITH_THEIR_BUILD: &[(&str, &str)] = &[
     ("rust-tests", "rust-tests-build"),
-    ("rust-tests-vp9-vectors", "rust-tests-build"),
     ("native-tests", "native-tests-build"),
 ];
+
+/// The `changes` output that lists the packages a pull request can affect.
+const PACKAGES: &str = "packages";
+
+/// The libvpx VP9 vector job runs a unit of `zvidlib-vp9-decoder` out of the
+/// Linux archive, so it needs the archive and that package's own filter.
+const VP9_VECTORS: (&str, &str, &str) = (
+    "rust-tests-vp9-vectors",
+    "vp9_vectors",
+    "zvidlib-vp9-decoder",
+);
 
 /// The filters whose jobs build the native target, and so compile every
 /// `include_str!` and `include_bytes!` that is not browser-only.
@@ -309,12 +325,48 @@ fn module_cfg(parent: &Path, name: &str) -> Option<String> {
     Some(attributes.join(" "))
 }
 
+/// The source directory an excluded path belongs to: `src` for the root
+/// package, `crates/<name>/src` for a workspace crate.
+fn source_root(path: &str) -> &str {
+    match path.strip_prefix("crates/") {
+        Some(rest) => {
+            let name = rest.split('/').next().expect("a crate directory");
+            &path[.."crates/".len() + name.len() + "/src".len()]
+        }
+        None => "src",
+    }
+}
+
+/// The crate-level `cfg` of a crate root: its `#![cfg(...)]` attributes,
+/// written as the outer `#[cfg(...)]` they act as.
+fn crate_cfg(lib: &Path) -> String {
+    let source = std::fs::read_to_string(lib)
+        .unwrap_or_else(|error| panic!("reading {}: {error}", lib.display()));
+    source
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("#![cfg("))
+        .map(|line| line.replacen("#![", "#[", 1))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// The `cfg` an excluded path's module is declared under: `src/a/**` is module
 /// `a` of `src/lib.rs`, `src/a.rs` likewise, and `src/a/b.rs` is module `b` of
-/// `src/a/mod.rs` or `src/a.rs`.
+/// `src/a/mod.rs` or `src/a.rs`; the same holds under `crates/<name>/src`, and
+/// `crates/<name>/src/**` is the whole crate, under its crate-level `cfg`.
 fn excluded_module_cfg(excluded: &str) -> String {
     let root = manifest_dir();
     let path = excluded.strip_suffix("/**").unwrap_or(excluded);
+    assert!(
+        root.join(path).exists(),
+        "`!{excluded}` names nothing in the repository; a renamed module is now matched \
+         again, so this exclusion is dead and should follow it or go"
+    );
+    let source_root = source_root(path);
+    if path == source_root {
+        return crate_cfg(&root.join(source_root).join("lib.rs"));
+    }
     let file = Path::new(path);
     let name = file
         .file_stem()
@@ -322,13 +374,8 @@ fn excluded_module_cfg(excluded: &str) -> String {
         .to_string_lossy()
         .into_owned();
     let dir = file.parent().expect("an excluded module has a directory");
-    assert!(
-        root.join(path).exists(),
-        "`!{excluded}` names nothing in the repository; a renamed module is now matched \
-         again, so this exclusion is dead and should follow it or go"
-    );
-    let parents = if dir == Path::new("src") {
-        vec![root.join("src/lib.rs")]
+    let parents = if dir == Path::new(source_root) {
+        vec![root.join(source_root).join("lib.rs")]
     } else {
         vec![
             root.join(dir).join("mod.rs"),
@@ -377,9 +424,33 @@ fn main_pushes_and_dispatches_run_every_gated_job() {
             "the `{output}` output reads a filter that does not exist"
         );
     }
+    let (_, vp9_output, vp9_package) = VP9_VECTORS;
+    assert_eq!(
+        outputs.get(vp9_output).map(String::as_str),
+        Some(
+            format!(
+                "${{{{ github.event_name != 'pull_request' || steps.filter.outputs.{EVERYTHING} == 'true' \
+                 || steps.filter.outputs.{vp9_package} == 'true' }}}}"
+            )
+            .as_str()
+        ),
+        "the `{vp9_output}` output must follow `{vp9_package}`'s own filter"
+    );
+    assert_eq!(
+        outputs.get(PACKAGES).map(String::as_str),
+        Some(
+            format!(
+                "${{{{ (github.event_name != 'pull_request' || steps.filter.outputs.{EVERYTHING} == 'true') \
+                 && 'all' || steps.filter.outputs.changes }}}}"
+            )
+            .as_str()
+        ),
+        "the `{PACKAGES}` output must be `all` on anything but a pull request and when the \
+         build definition changed, and otherwise the filters a pull request matched"
+    );
     assert_eq!(
         outputs.len(),
-        GATED_JOBS.len(),
+        GATED_JOBS.len() + 2,
         "the `changes` job has outputs this test does not know: {:?}",
         outputs.keys().collect::<Vec<_>>()
     );
@@ -409,13 +480,25 @@ fn each_gated_job_is_skipped_only_by_its_own_filter() {
             "`{id}` no longer needs `{build}`, so it would run without the archive it tests"
         );
     }
+    let (vp9_job, vp9_output, _) = VP9_VECTORS;
+    let vp9 = job(&jobs, vp9_job);
+    assert_eq!(
+        job_key(vp9, "needs").as_deref(),
+        Some("[changes, rust-tests-build]"),
+        "`{vp9_job}` must need the archive it runs and the `changes` job it is gated by"
+    );
+    assert_eq!(
+        job_key(vp9, "if"),
+        Some(format!("needs.changes.outputs.{vp9_output} == 'true'")),
+        "`{vp9_job}` is not gated on the `{vp9_output}` output"
+    );
     // A job gated on an output nobody sets would never run at all.
     for job in &jobs {
         if let Some(condition) = job_key(job, "if") {
             if let Some(output) = condition.strip_prefix("needs.changes.outputs.") {
                 let output = output.split_whitespace().next().unwrap_or_default();
                 assert!(
-                    GATED_JOBS.iter().any(|(_, known)| *known == output),
+                    GATED_JOBS.iter().any(|(_, known)| *known == output) || output == vp9_output,
                     "`{}` is gated on `{output}`, which is not one of the known outputs",
                     job.id
                 );
@@ -449,34 +532,51 @@ fn each_job_runs_on_the_files_it_reads() {
         // Formatting and lints cover every target, browser modules included.
         ("rust", "src/lib.rs", true),
         ("rust", "src/wasm_api.rs", true),
-        ("rust", "src/hevc/engine/mod.rs", true),
-        ("rust", "tests/opus_codec.rs", true),
-        ("rust", "benches/codec.rs", true),
+        (
+            "rust",
+            "crates/zvidlib-hevc-decoder/src/engine/mod.rs",
+            true,
+        ),
+        ("rust", "crates/zvidlib-opus/tests/opus_codec.rs", true),
+        ("rust", "crates/zvidlib-av1/benches/codec.rs", true),
+        ("rust", "benches/audio_mux.rs", true),
         ("rust", "examples/native_gl/main.rs", true),
         ("rust", "examples/web_canvas/scrub.test.js", true),
         ("rust", ".github/scripts/criterion_baseline.py", true),
         ("rust", "rustfmt.toml", true),
         // #600's own example: a change to native backends only skips these.
-        ("wasm", "src/hevc/nvdec.rs", false),
-        ("wasm", "src/hevc/windows_mf.rs", false),
+        ("wasm", "crates/zvidlib-hardware/src/nvdec.rs", false),
+        ("wasm", "crates/zvidlib-hardware/src/windows_mf.rs", false),
         ("wasm", "src/native_audio/symphonia.rs", false),
-        ("wasm", "src/aac_encoder/mod.rs", false),
+        ("wasm", "crates/zvidlib-aac-encoder/src/lib.rs", false),
+        ("wasm", "crates/zvidlib-hevc-encoder/src/encoder.rs", false),
+        // A native-only crate's manifest still decides what wasm32 resolves.
+        ("wasm", "crates/zvidlib-aac-encoder/Cargo.toml", true),
+        ("wasm", "crates/zvidlib-hardware/src/lib.rs", true),
         ("wasm", "src/lib.rs", true),
         ("wasm", "src/wasm_api.rs", true),
-        ("wasm", "src/hevc/mod.rs", true),
-        ("wasm", "src/hevc/engine/mod.rs", true),
-        ("wasm", "src/hevc/color_convert.rs", true),
+        ("wasm", "crates/zvidlib-hevc-decoder/src/lib.rs", true),
+        (
+            "wasm",
+            "crates/zvidlib-hevc-decoder/src/engine/mod.rs",
+            true,
+        ),
+        ("wasm", "crates/zvidlib-color/src/color_convert.rs", true),
         ("wasm", "js/browser.js", true),
-        ("wasm", "tests/fixtures/codec/vp9_bbb_256x144.mp4", true),
+        (
+            "wasm",
+            "crates/zvidlib-vp9-decoder/tests/fixtures/vp9_bbb_256x144.mp4",
+            true,
+        ),
         ("wasm", "examples/hevc_decode_profile.rs", true),
         ("wasm", ".github/scripts/criterion_baseline.py", false),
         // The Linux shards run the guards, which read every workflow.
-        ("rust_tests", "src/hevc/nvdec.rs", true),
+        ("rust_tests", "crates/zvidlib-hardware/src/nvdec.rs", true),
         ("rust_tests", "src/wasm_api.rs", false),
         ("rust_tests", "js/browser.js", false),
         (
             "rust_tests",
-            "tests/fixtures/codec/libvpx_vp9_test_vectors.txt",
+            "crates/zvidlib-vp9-decoder/tests/fixtures/libvpx_vp9_test_vectors.txt",
             true,
         ),
         ("rust_tests", "examples/media/BigBuckBunny.mp4", true),
@@ -488,22 +588,38 @@ fn each_job_runs_on_the_files_it_reads() {
             true,
         ),
         ("rust_tests", ".github/workflows/docs.yml", true),
-        ("native_tests", "src/hevc/videotoolbox.rs", true),
-        ("native_tests", "src/aac_encoder/windows_mf.rs", true),
+        (
+            "native_tests",
+            "crates/zvidlib-hardware/src/videotoolbox.rs",
+            true,
+        ),
+        (
+            "native_tests",
+            "crates/zvidlib-aac-encoder/src/windows_mf.rs",
+            true,
+        ),
         ("native_tests", "src/web_decoder.rs", false),
         (
             "native_tests",
-            "tests/support/avfoundation_decode.swift",
+            "crates/zvidlib-hevc-encoder/tests/support/avfoundation_decode.swift",
             true,
         ),
-        ("native_tests", "benches/hevc_hardware.rs", true),
-        ("macos_swift_rpath", "src/hevc/videotoolbox.rs", true),
+        (
+            "native_tests",
+            "crates/zvidlib-hevc-decoder/benches/hevc_hardware.rs",
+            true,
+        ),
+        (
+            "macos_swift_rpath",
+            "crates/zvidlib-hardware/src/videotoolbox.rs",
+            true,
+        ),
         (
             "macos_swift_rpath",
             "tests/macos_swift_runtime_rpath.rs",
             true,
         ),
-        ("macos_swift_rpath", "tests/opus_codec.rs", false),
+        ("macos_swift_rpath", "tests/mp4_cover_art.rs", false),
         ("macos_swift_rpath", "src/web_previews.rs", false),
     ];
     let wrong: Vec<String> = cases
@@ -544,6 +660,7 @@ fn every_file_a_source_includes_runs_the_native_test_jobs() {
     for dir in ["src", "tests", "benches", "examples"] {
         rust_files(&root.join(dir), &mut sources);
     }
+    rust_files(&root.join("crates"), &mut sources);
     let mut checked = 0;
     let mut missed = Vec::new();
     for source in sources {
@@ -594,14 +711,18 @@ fn an_exclusion_names_a_module_the_target_does_not_compile() {
             .iter()
             .filter_map(|pattern| pattern.strip_prefix('!'))
         {
+            let in_a_crate = excluded
+                .strip_prefix("crates/")
+                .is_some_and(|rest| rest.split('/').nth(1) == Some("src"));
             assert!(
-                excluded.starts_with("src/")
+                (excluded.starts_with("src/") || in_a_crate)
                     && !excluded.contains('{')
                     && (excluded.ends_with(".rs")
                         || excluded.ends_with("/**")
                             && !excluded[..excluded.len() - 3].contains('*')),
-                "`{name}` excludes `{excluded}`; exclusions name one module, a `src/` file or a \
-                 `src/` module directory, so each can be held to its `cfg`"
+                "`{name}` excludes `{excluded}`; exclusions name one module - a source file \
+                 or module directory under `src/` or a crate's `src/` - or one whole crate's \
+                 `src/`, so each can be held to its `cfg`"
             );
             let cfg = excluded_module_cfg(excluded);
             let positive_wasm = cfg
@@ -626,6 +747,216 @@ fn an_exclusion_names_a_module_the_target_does_not_compile() {
                 );
             }
         }
+    }
+}
+
+/// The filters that gate jobs; every other filter is a package's.
+const JOB_FILTERS: &[&str] = &[
+    EVERYTHING,
+    "rust",
+    "wasm",
+    "rust_tests",
+    "native_tests",
+    "macos_swift_rpath",
+];
+
+/// Files of a package a change to it would touch: its manifest and library
+/// root, and for the root package a file of each of its target directories.
+fn representative_files(package: &workspace::Package) -> Vec<String> {
+    if package.dir == "." {
+        return [
+            "src/lib.rs",
+            "tests/mp4_cover_art.rs",
+            "benches/audio_mux.rs",
+            "examples/native_encode.rs",
+        ]
+        .iter()
+        .map(|path| path.to_string())
+        .collect();
+    }
+    ["Cargo.toml", "src/lib.rs"]
+        .iter()
+        .map(|path| package.repo_path(path))
+        .collect()
+}
+
+#[test]
+fn every_package_has_a_filter_named_after_it() {
+    let filters = filters(&ci_workflow());
+    let packages: Vec<String> = workspace::packages()
+        .into_iter()
+        .map(|package| package.name)
+        .collect();
+    let missing: Vec<&String> = packages
+        .iter()
+        .filter(|name| !filters.contains_key(*name))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "these workspace packages have no filter, so `packages` never selects them and \
+         a pull request never tests them: {missing:?}"
+    );
+    let unknown: Vec<&String> = filters
+        .keys()
+        .filter(|name| !JOB_FILTERS.contains(&name.as_str()) && !packages.contains(name))
+        .collect();
+    assert!(
+        unknown.is_empty(),
+        "these filters name neither a job nor a workspace package: {unknown:?}"
+    );
+}
+
+/// A package's tests and benchmarks have to run when anything they compile
+/// against changes: the package itself and every crate it depends on, by any
+/// kind of dependency, transitively.
+#[test]
+fn a_package_filter_runs_on_its_own_and_its_dependencies_files() {
+    let filters = filters(&ci_workflow());
+    let packages = workspace::packages();
+    let mut missed = Vec::new();
+    for package in &packages {
+        let patterns = &filters[&package.name];
+        for dependency in workspace::affected_by(&packages, &package.name) {
+            for path in representative_files(workspace::package(&packages, &dependency)) {
+                if !filter_matches(patterns, &path) {
+                    missed.push(format!("{} skips {path} ({dependency})", package.name));
+                }
+            }
+        }
+    }
+    assert!(
+        missed.is_empty(),
+        "these package filters skip a change their package compiles against: {missed:?}"
+    );
+}
+
+/// The other half of #604: a change to one crate does not select the crates
+/// that do not depend on it, which is the whole point of the split.
+#[test]
+fn a_package_filter_skips_the_crates_it_does_not_depend_on() {
+    let filters = filters(&ci_workflow());
+    let packages = workspace::packages();
+    let mut extra = Vec::new();
+    for package in &packages {
+        let patterns = &filters[&package.name];
+        let affected = workspace::affected_by(&packages, &package.name);
+        for other in packages
+            .iter()
+            .filter(|other| !affected.contains(&other.name))
+        {
+            for path in representative_files(other) {
+                if filter_matches(patterns, &path) {
+                    extra.push(format!("{} runs on {path} ({})", package.name, other.name));
+                }
+            }
+        }
+    }
+    assert!(
+        extra.is_empty(),
+        "these package filters select a package on a change to a crate it does not \
+         depend on: {extra:?}"
+    );
+    // The leaf a pull request most often touches, checked by name.
+    let vp8 = &filters["zvidlib-vp8"];
+    assert!(filter_matches(vp8, "crates/zvidlib-vp8/src/decoder.rs"));
+    assert!(!filter_matches(
+        vp8,
+        "crates/zvidlib-hevc-decoder/src/lib.rs"
+    ));
+    assert!(!filter_matches(
+        vp8,
+        "crates/zvidlib-av1-encoder/src/lib.rs"
+    ));
+    assert!(filter_matches(
+        &filters["zvidlib"],
+        "crates/zvidlib-vp8/src/decoder.rs"
+    ));
+}
+
+/// As `every_file_a_source_includes_runs_the_native_test_jobs`, per package: a
+/// fixture a package's tests read from another crate's directory, or from the
+/// bundled examples, is an input of that package.
+#[test]
+fn every_file_a_package_includes_runs_its_filter() {
+    let filters = filters(&ci_workflow());
+    let root = manifest_dir().canonicalize().expect("the root");
+    let mut checked = 0;
+    let mut missed = Vec::new();
+    for package in workspace::packages() {
+        let patterns = &filters[&package.name];
+        let mut sources = Vec::new();
+        let dirs: &[&str] = if package.dir == "." {
+            &["src", "tests", "benches", "examples"]
+        } else {
+            &["src", "tests", "benches"]
+        };
+        for dir in dirs {
+            rust_files(&package.path().join(dir), &mut sources);
+        }
+        for source in sources {
+            let text = std::fs::read_to_string(&source)
+                .unwrap_or_else(|error| panic!("reading {}: {error}", source.display()));
+            for macro_name in ["include_str!(\"", "include_bytes!(\""] {
+                for (at, _) in text.match_indices(macro_name) {
+                    let rest = &text[at + macro_name.len()..];
+                    let literal = &rest[..rest.find('"').expect("a closed string literal")];
+                    let target = source.parent().expect("a source directory").join(literal);
+                    let Ok(target) = target.canonicalize() else {
+                        continue;
+                    };
+                    let Ok(path) = target.strip_prefix(&root) else {
+                        continue;
+                    };
+                    let path = path.to_string_lossy().replace('\\', "/");
+                    checked += 1;
+                    if !filter_matches(patterns, &path)
+                        && !filter_matches(&filters[EVERYTHING], &path)
+                    {
+                        missed.push(format!(
+                            "{} -> {path} ({})",
+                            relative(&source),
+                            package.name
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        checked > 0,
+        "found no `include_str!` or `include_bytes!` to check"
+    );
+    assert!(
+        missed.is_empty(),
+        "these files are compiled into a package's targets, so a change to them has to \
+         select the package: {missed:?}"
+    );
+}
+
+/// The packages each test archive lists with `targets`: every package has to
+/// be listed, or selecting it would build and run none of its tests.
+#[test]
+fn every_package_is_listed_in_each_test_archive() {
+    let workflow = ci_workflow();
+    let jobs = jobs(&workflow);
+    let packages = workspace::packages();
+    for id in ["rust-tests-build", "native-tests-build"] {
+        let listed: Vec<&str> = job(&jobs, id)
+            .body
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("targets "))
+            .filter_map(|rest| rest.split_whitespace().next())
+            .collect();
+        let missing: Vec<&str> = packages
+            .iter()
+            .map(|package| package.name.as_str())
+            .filter(|name| !listed.contains(name))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "`{id}` lists no `targets` line for these packages, so their library units \
+             never run: {missing:?}"
+        );
     }
 }
 

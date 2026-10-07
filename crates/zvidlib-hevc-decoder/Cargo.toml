@@ -8,6 +8,9 @@ repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[build-dependencies]
+zvidlib-build = { workspace = true }
+
 [dependencies]
 zvidlib-core = { workspace = true }
 zvidlib-color = { workspace = true }

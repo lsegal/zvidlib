@@ -17,6 +17,7 @@ keywords = ["video", "audio", "webassembly", "webgl", "mp4"]
 categories = ["multimedia", "wasm"]
 
 [workspace.dependencies]
+zvidlib-build = { path = "crates/zvidlib-build", version = "=0.3.0" }
 zvidlib-core = { path = "crates/zvidlib-core", version = "=0.3.0" }
 zvidlib-color = { path = "crates/zvidlib-color", version = "=0.3.0" }
 zvidlib-av1-syntax = { path = "crates/zvidlib-av1-syntax", version = "=0.3.0" }
@@ -129,6 +130,9 @@ harness = false
 name = "vpx_decode"
 path = "benches/vpx_decode.rs"
 harness = false
+
+[build-dependencies]
+zvidlib-build = { workspace = true }
 
 [features]
 default = []

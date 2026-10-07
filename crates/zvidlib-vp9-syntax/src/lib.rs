@@ -6,6 +6,11 @@
 //! This is an internal crate of [zvidlib](https://crates.io/crates/zvidlib).
 //! Depend on `zvidlib` rather than on this crate directly.
 
+// The processes below follow libvpx's C, which indexes several parallel
+// arrays with one loop variable; keeping that shape makes each function
+// checkable line by line against the code it reproduces.
+#![allow(clippy::needless_range_loop)]
+
 #[doc(hidden)]
 pub mod bits;
 #[doc(hidden)]
