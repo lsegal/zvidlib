@@ -75,7 +75,6 @@ impl Package {
         finish(current, &mut targets);
         targets
     }
-
 }
 
 /// `key = "value"` on one line, as `value`.
@@ -126,4 +125,3 @@ pub fn packages() -> Vec<Package> {
     );
     packages
 }
-
