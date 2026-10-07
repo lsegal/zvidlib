@@ -1321,6 +1321,10 @@ mod tests {
                 muxer.write_sample(0, sample).await.unwrap();
             }
         }
+        // The encoder holds the start of each group back until it has seen it.
+        for sample in encoder.finish().await.unwrap() {
+            muxer.write_sample(0, sample).await.unwrap();
+        }
         let bytes = muxer.finish().await.unwrap().into_inner();
 
         let Ok(mut session) = WebVideoDecodeSession::open(&bytes, 0, &limits).await else {

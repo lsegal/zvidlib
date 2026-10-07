@@ -78,6 +78,9 @@ fn encode(configuration: &VideoEncoderConfig, frames: &[VideoFrame]) -> Vec<u8> 
             bitstream.extend_from_slice(&sample.data);
         }
     }
+    for sample in support::block_on(encoder.finish()).expect("the encoder drains") {
+        bitstream.extend_from_slice(&sample.data);
+    }
     bitstream
 }
 

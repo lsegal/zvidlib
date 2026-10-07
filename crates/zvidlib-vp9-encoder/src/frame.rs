@@ -529,6 +529,34 @@ impl BoolSink for TileWriter {
 }
 
 /// A coded frame and the state the frames after it depend on.
+/// The Lagrange multiplier a frame at `base_q_idx` trades rate for distortion
+/// with, distortion being a pixel-domain squared error and rate in bits.
+///
+/// The transform's coefficients are eight times orthonormal, so the effective
+/// step is `ac / 8`, and lambda is about a nineteenth of its square: enough to
+/// drop coefficients, skip blocks and merge partitions where they cost more
+/// than they restore, without trading away the quality the quantizer would
+/// otherwise keep.
+pub(super) fn lambda(base_q_idx: u8) -> f64 {
+    let ac = AC_QLOOKUP[usize::from(base_q_idx)];
+    f64::from(ac * ac) / 1200.0
+}
+
+/// How much lower a key frame's lambda is when its detail is worth keeping
+/// for the frames that predict from it: `1 + 2 * (base_q_idx / 255)^6`, 1.007
+/// at q 100, 1.12 at q 160, 2.08 at q 230 and 3 at q 255.
+///
+/// Weighed as one frame, a key frame at quantizers above about 230 dropped
+/// nearly all its detail, and an inter frame later bought it back at up to
+/// three times the key frame's size (issue #597). Whether keeping the detail
+/// pays off depends on how long the content persists, so the encoder codes
+/// the start of each group both ways and keeps the cheaper (issue #618).
+pub(super) fn key_frame_weight(base_q_idx: u8) -> f64 {
+    let coarseness = f64::from(base_q_idx) / 255.0;
+    let squared = coarseness * coarseness;
+    1.0 + 2.0 * squared * squared * squared
+}
+
 pub(super) struct EncodedFrame {
     pub(super) data: Vec<u8>,
     pub(super) reconstruction: Picture,
@@ -609,9 +637,6 @@ impl<'a> FrameEncoder<'a> {
     ) -> Self {
         let q = usize::from(base_q_idx);
         let ac = AC_QLOOKUP[q];
-        let coarseness = f64::from(base_q_idx) / 255.0;
-        let squared = coarseness * coarseness;
-        let key_weight = 1.0 + 2.0 * squared * squared * squared;
         Self {
             geometry,
             source,
@@ -628,25 +653,7 @@ impl<'a> FrameEncoder<'a> {
             coded_blocks: Vec::new(),
             dc_q: DC_QLOOKUP[q],
             ac_q: ac,
-            // Distortion is a pixel-domain squared error and rate is in bits.
-            // The transform's coefficients are eight times orthonormal, so the
-            // effective step is `ac / 8`, and lambda is about a nineteenth of
-            // its square: enough to drop coefficients, skip blocks and merge
-            // partitions where they cost more than they restore, without
-            // trading away the quality the quantizer would otherwise keep.
-            //
-            // A key frame's distortion is inherited by every frame predicted
-            // from it, so it trades rate at a lower lambda, much as libvpx
-            // codes key frames at a finer quantizer even at constant quality,
-            // and by more the coarser the quantizer. Weighed as one frame, a
-            // key frame at quantizers above about 230 dropped nearly all its
-            // detail, and an inter frame later bought it back at up to three
-            // times the key frame's size (issue #597). The weight grows to 3
-            // at the coarsest quantizer and stays near 1 below about 160,
-            // where key frames keep their detail anyway.
-            lambda: f64::from(ac * ac)
-                / 1200.0
-                / if reference.is_none() { key_weight } else { 1.0 },
+            lambda: lambda(base_q_idx),
             allow_high_precision_mv: reference.is_some()
                 && tools.sub_sample_motion
                 && base_q_idx < HIGH_PRECISION_MV_QTHRESH,
@@ -670,8 +677,16 @@ impl<'a> FrameEncoder<'a> {
         self.reference.is_none()
     }
 
+    /// Codes a key frame at a lambda lowered by [`key_frame_weight`], for a
+    /// key frame whose detail the frames after it inherit.
+    pub(super) fn weighted_key_frame(mut self) -> Self {
+        if self.is_key() {
+            self.lambda /= key_frame_weight(self.base_q_idx);
+        }
+        self
+    }
+
     /// Leaves the loop filter off, as the encoder did before it chose a level.
-    #[cfg(test)]
     pub(super) fn without_loop_filter(mut self) -> Self {
         self.loop_filter = false;
         self
