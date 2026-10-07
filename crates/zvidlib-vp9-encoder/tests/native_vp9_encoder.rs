@@ -102,7 +102,8 @@ fn encode_samples() -> (Mp4TrackConfig, Vec<EncodedSample>) {
         });
         samples.extend(block_on(encoder.encode(FrameIndex(u64::from(index)), source)).unwrap());
     }
-    assert!(block_on(encoder.finish()).unwrap().is_empty());
+    samples.extend(block_on(encoder.finish()).unwrap());
+    assert_eq!(samples.len(), FRAMES as usize);
     (track, samples)
 }
 

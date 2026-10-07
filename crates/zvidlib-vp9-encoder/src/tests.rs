@@ -181,21 +181,9 @@ fn sub_sample_yuv_frame(width: u32, height: u32, index: u32) -> VideoFrame {
 }
 
 /// The visible `yuv420p` bytes of the encoder's reconstruction.
+/// The visible bytes of the last frame `encoder` emitted.
 fn reconstruction(encoder: &NativeVp9Encoder) -> Vec<u8> {
-    let picture = encoder.reference.as_ref().unwrap();
-    let geometry = encoder.geometry;
-    let mut bytes = Vec::new();
-    for (plane, width, height) in [
-        (0, geometry.width, geometry.height),
-        (1, geometry.chroma_width(), geometry.chroma_height()),
-        (2, geometry.chroma_width(), geometry.chroma_height()),
-    ] {
-        let stride = picture.strides[plane];
-        for row in 0..height {
-            bytes.extend_from_slice(&picture.planes[plane][row * stride..row * stride + width]);
-        }
-    }
-    bytes
+    visible(encoder.reconstructions.last().unwrap(), &encoder.geometry)
 }
 
 type Frames = fn(u32, u32, u32) -> VideoFrame;
@@ -218,7 +206,6 @@ fn encode_with(
     let mut encoder = NativeVp9Encoder::new(config, &Limits::default()).unwrap();
     encoder.tools = tools;
     let mut samples = Vec::new();
-    let mut reconstructions = Vec::new();
     let mut sources = Vec::new();
     let (width, height) = (
         config.coded_dimensions.width,
@@ -237,11 +224,15 @@ fn encode_with(
             frame: &frame,
             orientation: Orientation::TopLeft,
         });
-        let mut emitted = block_on(encoder.encode(FrameIndex(u64::from(index)), source)).unwrap();
-        assert_eq!(emitted.len(), 1);
-        samples.push(emitted.remove(0));
-        reconstructions.push(reconstruction(&encoder));
+        samples.extend(block_on(encoder.encode(FrameIndex(u64::from(index)), source)).unwrap());
     }
+    samples.extend(block_on(encoder.finish()).unwrap());
+    assert_eq!(samples.len(), frames as usize);
+    let reconstructions = encoder
+        .reconstructions
+        .iter()
+        .map(|picture| visible(picture, &encoder.geometry))
+        .collect();
     (samples, reconstructions, sources)
 }
 
@@ -563,9 +554,8 @@ fn vpcc_reads_colour_from_a_key_frame() {
         frame: &frame,
         orientation: Orientation::TopLeft,
     });
-    let sample = block_on(encoder.encode(FrameIndex(0), source))
-        .unwrap()
-        .remove(0);
+    block_on(encoder.encode(FrameIndex(0), source)).unwrap();
+    let sample = block_on(encoder.finish()).unwrap().remove(0);
     let vpcc = vpcc_from_key_frame(&sample.data, 10).unwrap();
     assert_eq!(vpcc, encoder.config().decoder_config);
     assert_eq!(vpcc[14], 0x83);
@@ -778,16 +768,26 @@ fn smaller_and_sharper_than_the_8x8_only_encoder() {
                     frame: &frame,
                     orientation: Orientation::TopLeft,
                 });
-                let sample = block_on(encoder.encode(FrameIndex(u64::from(index)), source))
-                    .unwrap()
-                    .remove(0);
-                bytes += sample.data.len();
+                let samples =
+                    block_on(encoder.encode(FrameIndex(u64::from(index)), source)).unwrap();
+                bytes += samples
+                    .iter()
+                    .map(|sample| sample.data.len())
+                    .sum::<usize>();
                 let picture =
                     source_picture(&encoder.geometry, &frame, Orientation::TopLeft).unwrap();
-                let reconstruction = encoder.reference.as_ref().unwrap();
+                for plane in 0..3 {
+                    sources.extend_from_slice(&picture.planes[plane]);
+                }
+            }
+            let samples = block_on(encoder.finish()).unwrap();
+            bytes += samples
+                .iter()
+                .map(|sample| sample.data.len())
+                .sum::<usize>();
+            for reconstruction in &encoder.reconstructions {
                 for plane in 0..3 {
                     decoded.extend_from_slice(&reconstruction.planes[plane]);
-                    sources.extend_from_slice(&picture.planes[plane]);
                 }
             }
             let quality = psnr(&decoded, &sources);
@@ -871,6 +871,7 @@ fn rgba_input_converts_with_bt601() {
         orientation: Orientation::BottomLeft,
     });
     block_on(encoder.encode(FrameIndex(0), source)).unwrap();
+    block_on(encoder.finish()).unwrap();
     let decoded = reconstruction(&encoder);
     // Limited-range BT.601 red is Y 82, Cb 90, Cr 240.
     let near = |value: u8, expected: i32| (i32::from(value) - expected).abs() <= 3;
@@ -892,8 +893,13 @@ fn rejects_out_of_order_frames_and_encoding_after_finish() {
     };
     let error = block_on(encoder.encode(FrameIndex(1), source())).unwrap_err();
     assert_eq!(error.kind(), ErrorKind::InvalidInput);
-    block_on(encoder.encode(FrameIndex(0), source())).unwrap();
-    assert!(block_on(encoder.finish()).unwrap().is_empty());
+    // The key frame waits for the frames after it, so finishing emits it.
+    assert!(
+        block_on(encoder.encode(FrameIndex(0), source()))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(block_on(encoder.finish()).unwrap().len(), 1);
     let error = block_on(encoder.encode(FrameIndex(1), source())).unwrap_err();
     assert_eq!(error.kind(), ErrorKind::InvalidState);
 }
@@ -1099,31 +1105,26 @@ fn encode_group_frames(
 ) -> (Vec<usize>, f64) {
     let dimensions = frames[0].dimensions;
     let geometry = Geometry::new(dimensions.width as usize, dimensions.height as usize);
-    let mut reference: Option<Picture> = None;
+    let pictures: Vec<Picture> = frames
+        .iter()
+        .map(|frame| source_picture(&geometry, frame, Orientation::TopLeft).unwrap())
+        .collect();
+    // Error resilient, so the comparison isolates the loop filter. The whole
+    // sequence is one group, which the encoder's lookahead would see whole.
+    let settings = StreamSettings {
+        geometry,
+        base_q_idx,
+        tools: CodingTools::ALL,
+        error_resilient: true,
+        full_range: false,
+        loop_filter,
+    };
+    let coded = StreamState::default().code_group_start(&settings, &pictures);
     let (mut sizes, mut reconstructed, mut sources) = (Vec::new(), Vec::new(), Vec::new());
-    for frame in frames {
-        let source = source_picture(&geometry, frame, Orientation::TopLeft).unwrap();
-        // Error resilient, so the comparison isolates the loop filter.
-        let context = FrameContext::default();
-        let mut encoder = FrameEncoder::new(
-            geometry,
-            &source,
-            reference.as_ref(),
-            base_q_idx,
-            CodingTools::ALL,
-            true,
-            &context,
-            None,
-        );
-        if !loop_filter {
-            encoder = encoder.without_loop_filter();
-        }
-        let encoded = encoder.encode(false);
-        let (data, reconstruction) = (encoded.data, encoded.reconstruction);
-        sizes.push(data.len());
-        reconstructed.extend(visible(&reconstruction, &geometry));
-        sources.extend(visible(&source, &geometry));
-        reference = Some(reconstruction);
+    for (frame, source) in coded.iter().zip(&pictures) {
+        sizes.push(frame.data.len());
+        reconstructed.extend(visible(&frame.reconstruction, &geometry));
+        sources.extend(visible(source, &geometry));
     }
     (sizes, psnr(&reconstructed, &sources))
 }
@@ -1264,6 +1265,97 @@ fn panning_inter_frames_find_the_motion() {
             );
         }
     }
+}
+
+#[test]
+fn long_pans_keep_key_frame_detail_only_where_it_pays() {
+    // A key frame at a lower lambda keeps the texture that
+    // `panning_inter_frames_find_the_motion` needs to avoid an inter frame
+    // buying it back at several times the key frame's size. But this pan
+    // replaces the whole picture within 48 frames, and an inter frame refining
+    // a blurry key frame buys the texture more cheaply than intra coding does,
+    // so over the longer group the weighted key frame left the sequence up to
+    // 44% larger at equal quality (issue #618). The lookahead codes the
+    // group's start both ways, so the long pan must code no worse than with
+    // the key frame unweighted, beyond decision noise.
+    for (width, height) in [(96, 64), (192, 128)] {
+        let frames: Vec<VideoFrame> = (0..48)
+            .map(|index| moving_yuv_frame(width, height, index))
+            .collect();
+        let geometry = Geometry::new(width as usize, height as usize);
+        for base_q_idx in [230, 235, 240] {
+            let settings = StreamSettings {
+                geometry,
+                base_q_idx,
+                tools: CodingTools::ALL,
+                error_resilient: true,
+                full_range: false,
+                loop_filter: true,
+            };
+            let mut stream = StreamState::default();
+            let (mut unweighted_bytes, mut reconstructed, mut sources) =
+                (0, Vec::new(), Vec::new());
+            for (index, frame) in frames.iter().enumerate() {
+                let source = source_picture(&geometry, frame, Orientation::TopLeft).unwrap();
+                let coded = stream.code(&settings, &source, index == 0, false);
+                unweighted_bytes += coded.data.len();
+                reconstructed.extend(visible(&coded.reconstruction, &geometry));
+                sources.extend(visible(&source, &geometry));
+            }
+            let unweighted_psnr = psnr(&reconstructed, &sources);
+            let (bytes, quality) = encode_group(&frames, base_q_idx, true);
+            let equivalent_bytes =
+                unweighted_bytes as f64 * 2_f64.powf((quality - unweighted_psnr) / 6.0);
+            assert!(
+                bytes as f64 <= equivalent_bytes * 1.01,
+                "{width}x{height} q {base_q_idx}: {bytes} bytes at {quality:.2} dB, \
+                 {unweighted_bytes} bytes at {unweighted_psnr:.2} dB unweighted"
+            );
+        }
+    }
+}
+
+#[test]
+fn group_starts_are_emitted_once_the_lookahead_fills() {
+    // The key frame waits for the rest of its group, up to the lookahead,
+    // and frames past the lookahead code as they arrive.
+    let mut config = configuration(16, 16, PixelFormat::Yuv420p8);
+    config.configuration = vec![60, 0, 3];
+    let mut encoder = NativeVp9Encoder::new(&config, &Limits::default()).unwrap();
+    let frame_number = |sample: &EncodedSample| sample.pts / i64::from(sample.duration);
+    let mut emitted = Vec::new();
+    for index in 0..7 {
+        let frame = moving_yuv_frame(16, 16, index);
+        let source = FrameSource::Cpu(CpuFrameSource {
+            frame: &frame,
+            orientation: Orientation::TopLeft,
+        });
+        let samples = block_on(encoder.encode(FrameIndex(u64::from(index)), source)).unwrap();
+        emitted.push(samples.iter().map(frame_number).collect::<Vec<_>>());
+    }
+    let drained: Vec<i64> = block_on(encoder.finish())
+        .unwrap()
+        .iter()
+        .map(frame_number)
+        .collect();
+    let empty = Vec::new();
+    assert_eq!(
+        emitted,
+        [
+            empty.clone(),
+            empty.clone(),
+            vec![0, 1, 2],
+            empty.clone(),
+            empty,
+            vec![3, 4, 5],
+            vec![]
+        ]
+    );
+    assert_eq!(drained, [6]);
+
+    config.configuration = vec![60, 1, 0];
+    let encoder = NativeVp9Encoder::new(&config, &Limits::default()).unwrap();
+    assert_eq!(encoder.lookahead, LOOKAHEAD_FRAMES);
 }
 
 /// A frame of interleaved 4-byte pixels whose channels vary independently,
@@ -1413,18 +1505,19 @@ fn every_instruction_set_encodes_byte_identical_bitstreams() {
     let _guard = zvidlib_core::simd::test_lock();
     let encode = |config: &VideoEncoderConfig, content: &dyn Fn(u32) -> VideoFrame| {
         let mut encoder = NativeVp9Encoder::new(config, &Limits::default()).unwrap();
-        (0..4)
-            .flat_map(|index| {
-                let frame = content(index);
-                let source = FrameSource::Cpu(CpuFrameSource {
-                    frame: &frame,
-                    orientation: Orientation::TopLeft,
-                });
-                block_on(encoder.encode(FrameIndex(u64::from(index)), source))
-                    .unwrap()
-                    .into_iter()
-                    .flat_map(|sample| sample.data)
-            })
+        let mut samples = Vec::new();
+        for index in 0..4 {
+            let frame = content(index);
+            let source = FrameSource::Cpu(CpuFrameSource {
+                frame: &frame,
+                orientation: Orientation::TopLeft,
+            });
+            samples.extend(block_on(encoder.encode(FrameIndex(u64::from(index)), source)).unwrap());
+        }
+        samples.extend(block_on(encoder.finish()).unwrap());
+        samples
+            .into_iter()
+            .flat_map(|sample| sample.data)
             .collect::<Vec<u8>>()
     };
     let yuv = configuration(100, 66, PixelFormat::Yuv420p8);
