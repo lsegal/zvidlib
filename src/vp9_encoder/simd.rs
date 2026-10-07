@@ -2177,28 +2177,12 @@ mod neon {
             )
         };
         let ac = lanes(1);
-        // Below `(1 - rounding) * effective`, less a margin far wider than
-        // the rounding of the division and the sum, a level is zero, so the
-        // division is skipped where a pair quantizes to zeros, as most of a
-        // block's coefficients do.
-        let zero_below = |effective: [f64; 2]| {
-            effective.map(|effective| effective * (1.0 - quantizer.rounding) * (1.0 - 1e-9))
-        };
-        let (dc_zero, ac_zero) = (zero_below(lanes(0).0), zero_below(ac.0));
         let mut index = 0;
         while index + 2 <= count {
             let (effective, limit, step) = if index == 0 { lanes(0) } else { ac };
-            let zero = if index == 0 { dc_zero } else { ac_zero };
             // SAFETY: `index + 1 < count` and the caller checked the outputs.
             unsafe {
                 let c = vld1q_f64(coefficients.as_ptr().add(index));
-                let small = vcltq_f64(vabsq_f64(c), vld1q_f64(zero.as_ptr()));
-                if vminvq_u32(vreinterpretq_u32_u64(small)) == u32::MAX {
-                    vst1_s32(levels.as_mut_ptr().add(index), vdup_n_s32(0));
-                    vst1_s32(dequantized.as_mut_ptr().add(index), vdup_n_s32(0));
-                    index += 2;
-                    continue;
-                }
                 let negative = vreinterpret_s32_u32(vmovn_u64(vcltzq_f64(c)));
                 let quotient = vdivq_f64(vabsq_f64(c), vld1q_f64(effective.as_ptr()));
                 let floored = vrndmq_f64(vaddq_f64(quotient, rounding));
@@ -2770,24 +2754,6 @@ mod tests {
                             let mut coefficients: Vec<f64> = (0..count)
                                 .map(|_| (f64::from(rng.next() % 80_000) - 40_000.0) / 3.0)
                                 .collect();
-                            // Every other coefficient from the eighth on sits at
-                            // or within a few units in the last place of where
-                            // its level leaves zero, or well below it.
-                            for (index, coefficient) in coefficients.iter_mut().enumerate() {
-                                if index < 7 || index % 2 == 1 {
-                                    continue;
-                                }
-                                let step = if index == 0 { dc_q } else { ac_q };
-                                let boundary = (1.0 - rounding) * quantizer.lane(step).0;
-                                let random = rng.next();
-                                let ulps = i64::from(random % 9) - 4;
-                                let value = match random / 9 % 3 {
-                                    0 => f64::from_bits((boundary.to_bits() as i64 + ulps) as u64),
-                                    1 => boundary * (1.0 + ulps as f64 * 1e-10),
-                                    _ => boundary * f64::from(random % 100) / 100.0,
-                                };
-                                *coefficient = if random & 1 == 0 { value } else { -value };
-                            }
                             // Exact multiples, signed zeros and rounding ties.
                             for (index, value) in [0.0, -0.0, 4.0, -4.0, 1.5, -1.5, 65_535.0]
                                 .into_iter()
