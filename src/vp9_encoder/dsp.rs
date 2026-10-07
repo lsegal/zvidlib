@@ -422,6 +422,7 @@ impl ReferencePlane<'_> {
 /// Like libvpx's `vpx_convolve8_c`, the horizontal pass is rounded and clipped
 /// to 8 bits before the vertical pass, and a whole-sample component filters
 /// with the identity kernel.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn predict_inter(
     reference: &ReferencePlane<'_>,
     x: usize,

@@ -396,6 +396,10 @@ struct CachedResidual {
     bits: [Option<f64>; 3],
 }
 
+/// Each plane of a reconstruction after the loop filter, with its border:
+/// the samples and the row stride.
+type FilteredCopy = [(Vec<u8>, usize); 3];
+
 /// The [`CachedResidual`]s of the superblock being searched. Their arrays
 /// are kept in arenas cleared with it, rather than allocated and freed for
 /// every entry, which cost as much as several of the lookups saved.
@@ -917,7 +921,7 @@ impl<'a> FrameEncoder<'a> {
     }
 
     /// Replaces the reconstruction with a [`Self::filter_copy`] of it.
-    fn load_filtered(&mut self, copy: &[(Vec<u8>, usize); 3]) {
+    fn load_filtered(&mut self, copy: &FilteredCopy) {
         let picture = &mut self.recon;
         for (plane, (data, padded_stride)) in copy.iter().enumerate() {
             let stride = picture.strides[plane];
@@ -932,7 +936,7 @@ impl<'a> FrameEncoder<'a> {
     /// loop filter at `level`, measured on the filter's own copies, and the
     /// filtered copy unless `level` is zero, which leaves the reconstruction
     /// as it is.
-    fn filtered_error(&self, level: u8) -> (u64, Option<[(Vec<u8>, usize); 3]>) {
+    fn filtered_error(&self, level: u8) -> (u64, Option<FilteredCopy>) {
         if level == 0 {
             let error = self.source_error(core::array::from_fn(|plane| {
                 (&self.recon.planes[plane][..], self.recon.strides[plane])
@@ -953,7 +957,7 @@ impl<'a> FrameEncoder<'a> {
     /// and may touch samples past the decoded area, so it runs on copies laid
     /// out as the decoder's planes are: whole superblocks with a border of
     /// [`FILTER_BORDER`] samples.
-    fn filter_copy(&self, level: u8) -> [(Vec<u8>, usize); 3] {
+    fn filter_copy(&self, level: u8) -> FilteredCopy {
         let Geometry {
             mi_rows, mi_cols, ..
         } = self.geometry;
