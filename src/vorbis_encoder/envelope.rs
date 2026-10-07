@@ -5,6 +5,7 @@
 use super::mdct::MdctLookup;
 use super::os::todb;
 use super::tables::types::InfoPsyGlobal;
+use crate::simd::SimdIsa;
 use std::f64::consts::PI;
 
 const VE_PRE: usize = 16;
@@ -118,7 +119,7 @@ impl EnvelopeLookup {
     }
 
     /// Port of envelope.c `_ve_amp` for one channel's filter bank.
-    fn amp(&mut self, gi: &InfoPsyGlobal, data: &[f32], fbase: usize) -> i32 {
+    fn amp(&mut self, isa: SimdIsa, gi: &InfoPsyGlobal, data: &[f32], fbase: usize) -> i32 {
         let n = self.winlength;
         let mut ret = 0;
         let min_v = self.minenergy;
@@ -139,7 +140,7 @@ impl EnvelopeLookup {
             *v = d * w;
         }
         self.mdct
-            .forward(&self.vec, &mut self.vec_out, &mut self.work);
+            .forward(isa, &self.vec, &mut self.vec_out, &mut self.work);
         let vec = &mut self.vec_out;
 
         // near-DC spreading function
@@ -251,6 +252,7 @@ impl EnvelopeLookup {
             self.mark.resize(need, 0);
         }
 
+        let isa = super::simd::active_isa();
         let mut j = first;
         while j < last {
             let mut ret = 0;
@@ -261,7 +263,7 @@ impl EnvelopeLookup {
             for i in 0..self.ch {
                 let off = (step * j) as usize;
                 let pcm = &v.pcm[i][off..off + self.winlength];
-                ret |= self.amp(gi, pcm, i * VE_BANDS);
+                ret |= self.amp(isa, gi, pcm, i * VE_BANDS);
             }
             let ju = j as usize;
             self.mark[ju + VE_POST as usize] = 0;

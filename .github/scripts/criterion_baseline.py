@@ -532,6 +532,10 @@ SITE_GROUP_PREFIXES: dict[str, tuple[str, ...]] = {
     "av1_mc": ("av1_mc_", "av1_motion_compensation"),
     "av1_intra_pred": ("av1_intra_",),
     "av1_coeff_ctx": ("av1_encode_stage_coeff_ctx", "av1_encode_stage_tile"),
+    # Whole encodes, unlike whole frames above: no other site's kernels run
+    # inside the Vorbis encoder, so every row of `benches/vorbis_encode.rs` is
+    # this site's own number.
+    "vorbis_encode": ("vorbis_encode_",),
     "vp8_encode": (
         "vp8_encode_stage_sad",
         "vp8_encode_stage_satd",

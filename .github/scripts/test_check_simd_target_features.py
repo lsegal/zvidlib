@@ -59,6 +59,17 @@ INTRINSIC = "__RNvNtNtNtCsl7QZrza34zr_4core9core_arch3x864avx216__mm256_and_si25
 # assembly.
 WRAPPER = "__RNvNtCs7lEMBtiCmc_7zvidlib8av1_simd14deblock_v_avx2"
 
+# `vorbis_encoder::simd::kernels::log_mdct::<vector::x86::Sse>` and the AVX2
+# wrapper that should have absorbed it, from a build with the kernel forced to
+# `#[inline(never)]` (issue #573). That build emitted no out-of-line intrinsic
+# at all - every SSE operation the kernel uses is in the x86_64 baseline - so
+# the outlined kernel is the only trace the defect leaves.
+VORBIS_ENCODER_OUTLINED_KERNEL = (
+    "_RINvNtNtNtCs2TqU2uc7h0A_7zvidlib14vorbis_encoder4simd7kernels8log_mdct"
+    "NtNtNtB4_6vector3x863SseEB8_"
+)
+VORBIS_ENCODER_WRAPPER = "_RNvNtNtCs2TqU2uc7h0A_7zvidlib14vorbis_encoder4simd13log_mdct_avx2"
+
 
 def asm(*lines: str) -> io.StringIO:
     return io.StringIO("\n".join(lines) + "\n")
@@ -101,6 +112,14 @@ class ClassificationTest(unittest.TestCase):
             "zvidlib::vorbis_simd::kernels::overlap_add::vector::x86::Avx2",
         )
 
+    def test_a_vorbis_encoder_kernel_instantiation_is_outlined(self):
+        self.assertTrue(checker.is_outlined_kernel(VORBIS_ENCODER_OUTLINED_KERNEL))
+        self.assertFalse(checker.is_outlined_kernel(VORBIS_ENCODER_WRAPPER))
+        self.assertEqual(
+            checker.readable(VORBIS_ENCODER_OUTLINED_KERNEL),
+            "zvidlib::vorbis_encoder::simd::kernels::log_mdct::vector::x86::Sse",
+        )
+
     def test_a_vp8_kernel_instantiation_is_outlined(self):
         self.assertTrue(checker.is_outlined_kernel(OUTLINED_VP8_KERNEL))
 
@@ -136,6 +155,19 @@ class AnalyzeTest(unittest.TestCase):
         self.assertEqual(len(violations), 1)
         self.assertIn("outlined generic kernel", violations[0])
         self.assertIn("deblock_edge_vertical", violations[0])
+
+    def test_a_wrapper_branching_to_an_outlined_vorbis_encoder_kernel_is_a_violation(self):
+        violations, _ = checker.analyze(
+            asm(
+                f"{VORBIS_ENCODER_WRAPPER}:",
+                f"\tjmp\t{VORBIS_ENCODER_OUTLINED_KERNEL}",
+                f"{VORBIS_ENCODER_OUTLINED_KERNEL}:",
+                "\tretq",
+            )
+        )
+        self.assertEqual(len(violations), 2)
+        self.assertIn("outlined generic kernel", violations[0])
+        self.assertIn("log_mdct_avx2", violations[1])
 
     def test_an_emitted_intrinsic_is_a_violation(self):
         violations, _ = checker.analyze(asm(f"{INTRINSIC}:", "\tretq"))

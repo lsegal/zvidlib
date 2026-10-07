@@ -3,6 +3,8 @@
 //! sizes, which factor into 4s and 2s, so the generic odd-radix pass
 //! (`dradfg`) is never reached and is not ported.
 
+use crate::simd::SimdIsa;
+
 /// Port of `drft_lookup` (smallft.h).
 #[derive(Debug, Clone)]
 pub(crate) struct DrftLookup {
@@ -28,11 +30,20 @@ impl DrftLookup {
     }
 
     /// Port of smallft.c `drft_forward`. `ch` is scratch of at least n floats.
-    pub(crate) fn forward(&self, data: &mut [f32], ch: &mut [f32]) {
+    /// Runs the `isa` kernels of [`super::simd`], which agree with the scalar
+    /// passes bit for bit.
+    pub(crate) fn forward(&self, isa: SimdIsa, data: &mut [f32], ch: &mut [f32]) {
         if self.n == 1 {
             return;
         }
-        drftf1(self.n as i32, data, &mut ch[..self.n], &self.wa, &self.ifac);
+        drftf1(
+            isa,
+            self.n as i32,
+            data,
+            &mut ch[..self.n],
+            &self.wa,
+            &self.ifac,
+        );
     }
 }
 
@@ -109,8 +120,9 @@ fn drfti1(n: i32, wa: &mut [f32], ifac: &mut [i32; 32]) {
     }
 }
 
-/// Port of smallft.c `dradf2`.
-fn dradf2(ido: usize, l1: usize, cc: &[f32], ch: &mut [f32], wa1: &[f32]) {
+/// Port of smallft.c `dradf2`. The twiddle loop runs the `isa` kernels of
+/// [`super::simd`], which agree with [`dradf2_twiddle_scalar`] bit for bit.
+fn dradf2(isa: SimdIsa, ido: usize, l1: usize, cc: &[f32], ch: &mut [f32], wa1: &[f32]) {
     let mut t1 = 0;
     let t0 = l1 * ido;
     let mut t2 = t0;
@@ -126,30 +138,7 @@ fn dradf2(ido: usize, l1: usize, cc: &[f32], ch: &mut [f32], wa1: &[f32]) {
         return;
     }
     if ido != 2 {
-        t1 = 0;
-        t2 = t0;
-        for _ in 0..l1 {
-            let mut t3 = t2;
-            let mut t4 = (t1 << 1) + (ido << 1);
-            let mut t5 = t1;
-            let mut t6 = t1 + t1;
-            let mut i = 2;
-            while i < ido {
-                t3 += 2;
-                t4 -= 2;
-                t5 += 2;
-                t6 += 2;
-                let tr2 = wa1[i - 2] * cc[t3 - 1] + wa1[i - 1] * cc[t3];
-                let ti2 = wa1[i - 2] * cc[t3] - wa1[i - 1] * cc[t3 - 1];
-                ch[t6] = cc[t5] + ti2;
-                ch[t4] = ti2 - cc[t5];
-                ch[t6 - 1] = cc[t5 - 1] + tr2;
-                ch[t4 - 1] = cc[t5 - 1] - tr2;
-                i += 2;
-            }
-            t1 += ido;
-            t2 += ido;
-        }
+        super::simd::dradf2_twiddle(isa, ido, l1, cc, ch, wa1);
         if ido % 2 == 1 {
             return;
         }
@@ -168,9 +157,53 @@ fn dradf2(ido: usize, l1: usize, cc: &[f32], ch: &mut [f32], wa1: &[f32]) {
     }
 }
 
-/// Port of smallft.c `dradf4`.
+/// The twiddle loop of `dradf2` (`ido > 2`), one butterfly per `i`.
+pub(super) fn dradf2_twiddle_scalar(
+    ido: usize,
+    l1: usize,
+    cc: &[f32],
+    ch: &mut [f32],
+    wa1: &[f32],
+) {
+    let t0 = l1 * ido;
+    for row in 0..l1 {
+        let mut i = 2;
+        while i < ido {
+            dradf2_twiddle_step(ido, t0, row * ido, i, cc, ch, wa1);
+            i += 2;
+        }
+    }
+}
+
+/// Butterfly `i` of row `t1 / ido` of `dradf2`'s twiddle loop.
+#[inline(always)]
+pub(super) fn dradf2_twiddle_step(
+    ido: usize,
+    t0: usize,
+    t1: usize,
+    i: usize,
+    cc: &[f32],
+    ch: &mut [f32],
+    wa1: &[f32],
+) {
+    let t3 = t0 + t1 + i;
+    let t4 = (t1 << 1) + (ido << 1) - i;
+    let t5 = t1 + i;
+    let t6 = (t1 << 1) + i;
+    let tr2 = wa1[i - 2] * cc[t3 - 1] + wa1[i - 1] * cc[t3];
+    let ti2 = wa1[i - 2] * cc[t3] - wa1[i - 1] * cc[t3 - 1];
+    ch[t6] = cc[t5] + ti2;
+    ch[t4] = ti2 - cc[t5];
+    ch[t6 - 1] = cc[t5 - 1] + tr2;
+    ch[t4 - 1] = cc[t5 - 1] - tr2;
+}
+
+/// Port of smallft.c `dradf4`. The `ido == 1` first loop and the twiddle
+/// loop run the `isa` kernels of [`super::simd`], which agree with
+/// [`dradf4_first_rows`] and [`dradf4_twiddle_scalar`] bit for bit.
 #[allow(clippy::too_many_arguments)]
 fn dradf4(
+    isa: SimdIsa,
     ido: usize,
     l1: usize,
     cc: &[f32],
@@ -182,80 +215,17 @@ fn dradf4(
     let hsqt2: f32 = 0.707_106_77;
     let t0 = l1 * ido;
 
-    let mut t1 = t0;
-    let mut t4 = t1 << 1;
-    let mut t2 = t1 + (t1 << 1);
-    let mut t3 = 0;
-
-    for _ in 0..l1 {
-        let tr1 = cc[t1] + cc[t2];
-        let tr2 = cc[t3] + cc[t4];
-
-        let mut t5 = t3 << 2;
-        ch[t5] = tr1 + tr2;
-        ch[(ido << 2) + t5 - 1] = tr2 - tr1;
-        t5 += ido << 1;
-        ch[t5 - 1] = cc[t3] - cc[t4];
-        ch[t5] = cc[t2] - cc[t1];
-
-        t1 += ido;
-        t2 += ido;
-        t3 += ido;
-        t4 += ido;
+    if ido == 1 {
+        super::simd::dradf4_ido1(isa, l1, cc, ch);
+    } else {
+        dradf4_first_rows(ido, l1, cc, ch, 0);
     }
 
     if ido < 2 {
         return;
     }
     if ido != 2 {
-        let mut t1 = 0;
-        for _ in 0..l1 {
-            let mut t2 = t1;
-            let mut t4 = t1 << 2;
-            let t6 = ido << 1;
-            let mut t5 = t6 + t4;
-            let mut i = 2;
-            while i < ido {
-                t2 += 2;
-                let mut t3 = t2;
-                t4 += 2;
-                t5 -= 2;
-
-                t3 += t0;
-                let cr2 = wa1[i - 2] * cc[t3 - 1] + wa1[i - 1] * cc[t3];
-                let ci2 = wa1[i - 2] * cc[t3] - wa1[i - 1] * cc[t3 - 1];
-                t3 += t0;
-                let cr3 = wa2[i - 2] * cc[t3 - 1] + wa2[i - 1] * cc[t3];
-                let ci3 = wa2[i - 2] * cc[t3] - wa2[i - 1] * cc[t3 - 1];
-                t3 += t0;
-                let cr4 = wa3[i - 2] * cc[t3 - 1] + wa3[i - 1] * cc[t3];
-                let ci4 = wa3[i - 2] * cc[t3] - wa3[i - 1] * cc[t3 - 1];
-
-                let tr1 = cr2 + cr4;
-                let tr4 = cr4 - cr2;
-                let ti1 = ci2 + ci4;
-                let ti4 = ci2 - ci4;
-
-                let ti2 = cc[t2] + ci3;
-                let ti3 = cc[t2] - ci3;
-                let tr2 = cc[t2 - 1] + cr3;
-                let tr3 = cc[t2 - 1] - cr3;
-
-                ch[t4 - 1] = tr1 + tr2;
-                ch[t4] = ti1 + ti2;
-
-                ch[t5 - 1] = tr3 - ti4;
-                ch[t5] = tr4 - ti3;
-
-                ch[t4 + t6 - 1] = ti4 + tr3;
-                ch[t4 + t6] = tr4 + ti3;
-
-                ch[t5 + t6 - 1] = tr2 - tr1;
-                ch[t5 + t6] = ti1 - ti2;
-                i += 2;
-            }
-            t1 += ido;
-        }
+        super::simd::dradf4_twiddle(isa, ido, l1, cc, ch, wa1, wa2, wa3);
         if ido & 1 != 0 {
             return;
         }
@@ -286,8 +256,108 @@ fn dradf4(
     }
 }
 
+/// The first loop of `dradf4`, from row `first` on.
+pub(super) fn dradf4_first_rows(ido: usize, l1: usize, cc: &[f32], ch: &mut [f32], first: usize) {
+    let t0 = l1 * ido;
+
+    let mut t3 = first * ido;
+    let mut t1 = t0 + t3;
+    let mut t4 = (t0 << 1) + t3;
+    let mut t2 = t0 + (t0 << 1) + t3;
+
+    for _ in first..l1 {
+        let tr1 = cc[t1] + cc[t2];
+        let tr2 = cc[t3] + cc[t4];
+
+        let mut t5 = t3 << 2;
+        ch[t5] = tr1 + tr2;
+        ch[(ido << 2) + t5 - 1] = tr2 - tr1;
+        t5 += ido << 1;
+        ch[t5 - 1] = cc[t3] - cc[t4];
+        ch[t5] = cc[t2] - cc[t1];
+
+        t1 += ido;
+        t2 += ido;
+        t3 += ido;
+        t4 += ido;
+    }
+}
+
+/// The twiddle loop of `dradf4` (`ido > 2`), one butterfly per `i`.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn dradf4_twiddle_scalar(
+    ido: usize,
+    l1: usize,
+    cc: &[f32],
+    ch: &mut [f32],
+    wa1: &[f32],
+    wa2: &[f32],
+    wa3: &[f32],
+) {
+    let t0 = l1 * ido;
+    for row in 0..l1 {
+        let mut i = 2;
+        while i < ido {
+            dradf4_twiddle_step(ido, t0, row * ido, i, cc, ch, wa1, wa2, wa3);
+            i += 2;
+        }
+    }
+}
+
+/// Butterfly `i` of row `t1 / ido` of `dradf4`'s twiddle loop.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn dradf4_twiddle_step(
+    ido: usize,
+    t0: usize,
+    t1: usize,
+    i: usize,
+    cc: &[f32],
+    ch: &mut [f32],
+    wa1: &[f32],
+    wa2: &[f32],
+    wa3: &[f32],
+) {
+    let t6 = ido << 1;
+    let t2 = t1 + i;
+    let t4 = (t1 << 2) + i;
+    let t5 = t6 + (t1 << 2) - i;
+
+    let mut t3 = t2 + t0;
+    let cr2 = wa1[i - 2] * cc[t3 - 1] + wa1[i - 1] * cc[t3];
+    let ci2 = wa1[i - 2] * cc[t3] - wa1[i - 1] * cc[t3 - 1];
+    t3 += t0;
+    let cr3 = wa2[i - 2] * cc[t3 - 1] + wa2[i - 1] * cc[t3];
+    let ci3 = wa2[i - 2] * cc[t3] - wa2[i - 1] * cc[t3 - 1];
+    t3 += t0;
+    let cr4 = wa3[i - 2] * cc[t3 - 1] + wa3[i - 1] * cc[t3];
+    let ci4 = wa3[i - 2] * cc[t3] - wa3[i - 1] * cc[t3 - 1];
+
+    let tr1 = cr2 + cr4;
+    let tr4 = cr4 - cr2;
+    let ti1 = ci2 + ci4;
+    let ti4 = ci2 - ci4;
+
+    let ti2 = cc[t2] + ci3;
+    let ti3 = cc[t2] - ci3;
+    let tr2 = cc[t2 - 1] + cr3;
+    let tr3 = cc[t2 - 1] - cr3;
+
+    ch[t4 - 1] = tr1 + tr2;
+    ch[t4] = ti1 + ti2;
+
+    ch[t5 - 1] = tr3 - ti4;
+    ch[t5] = tr4 - ti3;
+
+    ch[t4 + t6 - 1] = ti4 + tr3;
+    ch[t4 + t6] = tr4 + ti3;
+
+    ch[t5 + t6 - 1] = tr2 - tr1;
+    ch[t5 + t6] = ti1 - ti2;
+}
+
 /// Port of smallft.c `drftf1` (radix 2 and 4 only).
-fn drftf1(n: i32, c: &mut [f32], ch: &mut [f32], wa: &[f32], ifac: &[i32; 32]) {
+fn drftf1(isa: SimdIsa, n: i32, c: &mut [f32], ch: &mut [f32], wa: &[f32], ifac: &[i32; 32]) {
     let n = n as usize;
     let nf = ifac[1] as usize;
     let mut na = 1;
@@ -308,16 +378,16 @@ fn drftf1(n: i32, c: &mut [f32], ch: &mut [f32], wa: &[f32], ifac: &[i32; 32]) {
                 let ix3 = ix2 + ido;
                 let (w1, w2, w3) = (&wa[iw - 1..], &wa[ix2 - 1..], &wa[ix3 - 1..]);
                 if na != 0 {
-                    dradf4(ido, l1, ch, c, w1, w2, w3);
+                    dradf4(isa, ido, l1, ch, c, w1, w2, w3);
                 } else {
-                    dradf4(ido, l1, c, ch, w1, w2, w3);
+                    dradf4(isa, ido, l1, c, ch, w1, w2, w3);
                 }
             }
             2 => {
                 if na != 0 {
-                    dradf2(ido, l1, ch, c, &wa[iw - 1..]);
+                    dradf2(isa, ido, l1, ch, c, &wa[iw - 1..]);
                 } else {
-                    dradf2(ido, l1, c, ch, &wa[iw - 1..]);
+                    dradf2(isa, ido, l1, c, ch, &wa[iw - 1..]);
                 }
             }
             _ => unreachable!("smallft: only radix 2/4 factors occur for power-of-two sizes"),
@@ -355,7 +425,7 @@ mod tests {
             let x: Vec<f32> = (0..n).map(|i| ((i * 31) % 17) as f32 - 8.0).collect();
             let mut d = x.clone();
             let mut ch = vec![0f32; n];
-            l.forward(&mut d, &mut ch);
+            l.forward(SimdIsa::Scalar, &mut d, &mut ch);
             for k in 0..=n / 2 {
                 let (mut re, mut im) = (0f64, 0f64);
                 for (i, &xi) in x.iter().enumerate() {

@@ -76,6 +76,14 @@ name = "hevc_decode"
 path = "benches/hevc_decode.rs"
 harness = false
 
+# The native Vorbis encoder's scalar-vs-SIMD suite (issue #573): whole encodes
+# through the public factory, one arm per instruction set. Synthetic input
+# only, so it shares nothing with `codec`'s decoded-fixture cache.
+[[bench]]
+name = "vorbis_encode"
+path = "benches/vorbis_encode.rs"
+harness = false
+
 # The audio decode path is a separate target rather than another group in
 # `codec`: it shares `benches/support/` but none of `codec`'s decoded-frame
 # fixtures, and issue #152 specifies `cargo bench --bench audio_decode` as its
