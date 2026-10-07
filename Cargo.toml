@@ -63,6 +63,14 @@ name = "av1_encode"
 path = "benches/av1_encode.rs"
 harness = false
 
+# The VP9 software decoder's own scalar-vs-SIMD suite: whole-frame decode and
+# every stage the `vp9_decode` dispatch site vectorizes. A separate target for
+# the same reasons as `av1_decode`; it shares `benches/support/` with the rest.
+[[bench]]
+name = "vp9_decode"
+path = "benches/vp9_decode.rs"
+harness = false
+
 [[bench]]
 name = "hevc_decode"
 path = "benches/hevc_decode.rs"
