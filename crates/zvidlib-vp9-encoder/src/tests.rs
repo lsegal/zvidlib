@@ -1136,14 +1136,20 @@ fn encode_group_frames(
     let (mut sizes, mut reconstructed, mut sources) = (Vec::new(), Vec::new(), Vec::new());
     for frame in frames {
         let source = source_picture(&geometry, frame, Orientation::TopLeft).unwrap();
-        // Error resilient, so the comparison isolates the loop filter.
+        // Error resilient and with the default coefficient probabilities, so
+        // the comparison isolates the loop filter. Fitted to each frame's own
+        // tokens (issue #622), the probabilities move frame sizes between
+        // neighbouring quantizers by more than the filter does.
         let context = FrameContext::default();
         let mut encoder = FrameEncoder::new(
             geometry,
             &source,
             reference.as_ref(),
             base_q_idx,
-            CodingTools::ALL,
+            CodingTools {
+                coef_updates: false,
+                ..CodingTools::ALL
+            },
             true,
             &context,
             None,
@@ -1175,6 +1181,38 @@ fn every_frame_signals_a_loop_filter_level() {
     }
 }
 
+/// How far the unfiltered encode of `frames` at `base_q_idx` lands off the
+/// rate and distortion curve through its neighbouring quantizers, and how much
+/// larger the filtered encode is than the unfiltered one would have to grow to
+/// match its PSNR at the high-rate 6 dB per doubling of the rate, both in log2
+/// of the size, which that rule is linear in. Also the filter's PSNR gain.
+fn loop_filter_against_decision_noise(frames: &[VideoFrame], base_q_idx: u8) -> (f64, f64, f64) {
+    let [below, (unfiltered_bytes, unfiltered_psnr), above] =
+        [base_q_idx - 1, base_q_idx, base_q_idx + 1].map(|q| {
+            let (bytes, psnr) = encode_group(frames, q, false);
+            (bytes as f64, psnr)
+        });
+    let (filtered_bytes, filtered_psnr) = encode_group(frames, base_q_idx, true);
+    let along = (unfiltered_psnr - below.1) / (above.1 - below.1);
+    let curve = below.0.log2() + along * (above.0.log2() - below.0.log2());
+    let equivalent = unfiltered_bytes.log2() + (filtered_psnr - unfiltered_psnr) / 6.0;
+    (
+        unfiltered_bytes.log2() - curve,
+        (filtered_bytes as f64).log2() - equivalent,
+        filtered_psnr - unfiltered_psnr,
+    )
+}
+
+/// The RMS of `deviations`, in log2 of the size.
+fn decision_noise(deviations: &[f64]) -> f64 {
+    (deviations.iter().map(|d| d * d).sum::<f64>() / deviations.len() as f64).sqrt()
+}
+
+/// `log2` of a size ratio as a percentage change.
+fn percent(log2: f64) -> f64 {
+    (log2.exp2() - 1.0) * 100.0
+}
+
 #[test]
 fn loop_filter_is_a_rate_distortion_gain() {
     // Larger blocks and transforms leave less blocking for the filter to
@@ -1183,26 +1221,42 @@ fn loop_filter_is_a_rate_distortion_gain() {
     // grow to match it at the high-rate 6 dB per doubling of the rate. The
     // coarse quantizers are where the greedy per-frame level search used to
     // smooth the panning references until the whole sequence came out larger
-    // and blurrier than with no filter (issue #563).
+    // and blurrier than with no filter (issue #563): 10% or more larger and
+    // 0.3 dB or more blurrier.
     //
-    // The finest quantizer was 100 until frames fitted their coefficient
-    // probabilities to their own tokens (issue #622). Unfiltered, q 100 then
-    // came out about 4% below the line through q 99 and q 101, which no
-    // filter level could match; q 97 to 104 otherwise all pass by 1-3%.
+    // Held to that with no margin, the rule tracked the encoder's mode
+    // decisions rather than the filter: scaling only the key frame's lambda
+    // flipped which quantizer failed, by under 1.5% (issue #619). An
+    // unfiltered encode lands off the curve through its neighbouring
+    // quantizers by about 2% RMS here, so no point may lose more than that
+    // measured noise, and the points together must still be a gain, as
+    // `loop_filter_on_sharp_content_costs_less_than_decision_noise` does.
     let frames: Vec<VideoFrame> = (0..12)
         .map(|index| test_card_frame(160, 90, index))
         .collect();
-    for base_q_idx in [99, 150, 210, 220, 230] {
-        let (unfiltered_bytes, unfiltered_psnr) = encode_group(&frames, base_q_idx, false);
-        let (filtered_bytes, filtered_psnr) = encode_group(&frames, base_q_idx, true);
-        let equivalent_bytes =
-            unfiltered_bytes as f64 * 2_f64.powf((filtered_psnr - unfiltered_psnr) / 6.0);
+    let (mut ratios, mut deviations) = (Vec::new(), Vec::new());
+    for base_q_idx in [100, 150, 210, 220, 230] {
+        let (deviation, ratio, gain) = loop_filter_against_decision_noise(&frames, base_q_idx);
+        assert!(gain > 0.0, "q {base_q_idx}: filtered {gain:+.2} dB");
+        deviations.push(deviation);
+        ratios.push((base_q_idx, ratio));
+    }
+    let noise = decision_noise(&deviations);
+    assert!(
+        percent(noise) < 3.0,
+        "unfiltered encodes are {:.2}% off their curve",
+        percent(noise)
+    );
+    for &(base_q_idx, ratio) in &ratios {
         assert!(
-            filtered_psnr > unfiltered_psnr && (filtered_bytes as f64) <= equivalent_bytes,
-            "q {base_q_idx}: {filtered_bytes} bytes at {filtered_psnr:.2} dB filtered, \
-             {unfiltered_bytes} bytes at {unfiltered_psnr:.2} dB unfiltered"
+            ratio <= noise,
+            "q {base_q_idx}: filtered {:+.2}%, noise {:.2}%",
+            percent(ratio),
+            percent(noise)
         );
     }
+    let mean = ratios.iter().map(|&(_, ratio)| ratio).sum::<f64>() / ratios.len() as f64;
+    assert!(mean <= 0.0, "filtered {:+.2}% on average", percent(mean));
 }
 
 #[test]
@@ -1446,36 +1500,23 @@ fn loop_filter_on_sharp_content_costs_less_than_decision_noise() {
     // reference, a few bytes up or down per frame. The encoder is that noisy
     // without the filter too: an unfiltered encode lands off the rate and
     // distortion curve through its neighbouring quantizers by more, 3-4% RMS
-    // over q 20 to 240 and about 2% at the quantizers here, 3% once each
-    // error-resilient frame fits its coefficient probabilities to its own
-    // tokens (issue #622). So no point may lose more than that measured
-    // noise, and the points together must still be a gain.
+    // over q 20 to 240 and about 2% at the quantizers here. So no point may
+    // lose more than that measured noise, and the points together must still
+    // be a gain.
     let (mut ratios, mut deviations) = (Vec::new(), Vec::new());
     for (width, height) in [(96, 64), (192, 128)] {
         let frames: Vec<VideoFrame> = (0..12)
             .map(|index| moving_yuv_frame(width, height, index))
             .collect();
         for base_q_idx in [30_u8, 40, 130, 200, 210, 220] {
-            let [below, (unfiltered_bytes, unfiltered_psnr), above] =
-                [base_q_idx - 1, base_q_idx, base_q_idx + 1].map(|q| {
-                    let (bytes, psnr) = encode_group(&frames, q, false);
-                    (bytes as f64, psnr)
-                });
-            let (filtered_bytes, filtered_psnr) = encode_group(&frames, base_q_idx, true);
-            // In log2 of the size, which the 6 dB per doubling rule is linear
-            // in.
-            let along = (unfiltered_psnr - below.1) / (above.1 - below.1);
-            let curve = below.0.log2() + along * (above.0.log2() - below.0.log2());
-            deviations.push(unfiltered_bytes.log2() - curve);
-            let equivalent = unfiltered_bytes.log2() + (filtered_psnr - unfiltered_psnr) / 6.0;
-            let ratio = (filtered_bytes as f64).log2() - equivalent;
+            let (deviation, ratio, _) = loop_filter_against_decision_noise(&frames, base_q_idx);
+            deviations.push(deviation);
             ratios.push((width, height, base_q_idx, ratio));
         }
     }
-    let percent = |log2: f64| (log2.exp2() - 1.0) * 100.0;
-    let noise = (deviations.iter().map(|d| d * d).sum::<f64>() / deviations.len() as f64).sqrt();
+    let noise = decision_noise(&deviations);
     assert!(
-        percent(noise) < 3.5,
+        percent(noise) < 3.0,
         "unfiltered encodes are {:.2}% off their curve",
         percent(noise)
     );
