@@ -8,8 +8,10 @@
 //! The rest (compound references, switchable filters) is never coded, counted
 //! or updated, so it keeps its default value in the decoder too.
 
+use super::bitwriter::{BitCost, BoolSink, bit_cost};
 use super::frame::{
     INTER_MODE_TREE, INTRA_MODE_TREE, MV_CLASS_TREE, MV_FP_TREE, MV_JOINT_TREE, PARTITION_TREE,
+    write_magnitude,
 };
 use super::tables::{
     IF_UV_MODE_PROBS, IF_Y_MODE_PROBS, INTER_MODE_PROBS, INTRA_INTER_PROBS, PARTITION_PROBS,
@@ -27,6 +29,18 @@ type CoefCounts = [[[[[u32; 4]; 6]; 6]; 2]; 2];
 
 /// One transform size's end-of-block node counts per context.
 type EobCounts = [[[[u32; 6]; 6]; 2]; 2];
+
+/// One transform size's counts of the tokens past ONE per context:
+/// TWO, THREE, FOUR and the six categories.
+type LargerTokenCounts = [[[[[u32; 9]; 6]; 6]; 2]; 2];
+
+/// The smallest magnitude of each token past ONE, as [`LargerTokenCounts`]
+/// orders them.
+pub(super) const LARGER_TOKEN_MAGNITUDES: [u32; 9] = [2, 3, 4, 5, 7, 11, 19, 35, 67];
+
+/// The probability a frame signals whether it updates each probability with
+/// (`DIFF_UPDATE_PROB`).
+pub(super) const DIFF_UPDATE_PROB: u8 = 252;
 
 /// The probabilities of one motion vector component.
 #[derive(Clone, Copy)]
@@ -143,6 +157,11 @@ pub(super) struct FrameCounts {
     /// Per transform size and coefficient context: how often the
     /// end-of-block node was read.
     pub(super) eob_branch: [EobCounts; 4],
+    /// Per transform size and coefficient context: the tokens past ONE,
+    /// which the decoder does not count. Their probabilities are modelled
+    /// from the third node's, so the encoder weighs updates of that node by
+    /// every one of them.
+    pub(super) larger_tokens: [LargerTokenCounts; 4],
     /// `[largest transform - 1][context][transform size]`.
     pub(super) tx: [[[u32; 4]; 2]; 3],
     pub(super) skip: [[u32; 2]; 3],
@@ -258,6 +277,184 @@ impl FrameContext {
     }
 }
 
+impl FrameContext {
+    /// The coefficient probabilities a frame whose tokens `counts` counted
+    /// should code with, as forward updates of `self`'s signalled in its
+    /// compressed header, for the first `tx_sizes` transform sizes (libvpx's
+    /// `update_coef_probs_common`, two-loop search). Each probability moves
+    /// to the value between its own and the counts' that saves the most
+    /// bits once its update is paid for, and a transform size takes its
+    /// updates only when together they save more than declining every one
+    /// costs; otherwise it keeps `self`'s probabilities.
+    pub(super) fn coef_updates(&self, counts: &FrameCounts, tx_sizes: usize) -> [CoefProbs; 4] {
+        let keep = bit_cost(false, DIFF_UPDATE_PROB);
+        let update = bit_cost(true, DIFF_UPDATE_PROB);
+        let mut coded = self.coef;
+        for (tx_size, coded) in coded.iter_mut().enumerate().take(tx_sizes) {
+            let mut probs = *coded;
+            let mut savings = 0.0;
+            for (plane_type, reference, band, context) in coef_contexts() {
+                let [zero, one, more, end] =
+                    counts.coef[tx_size][plane_type][reference][band][context];
+                let eob_branch = counts.eob_branch[tx_size][plane_type][reference][band][context];
+                let larger = &counts.larger_tokens[tx_size][plane_type][reference][band][context];
+                let model = &mut probs[plane_type][reference][band][context];
+                let branches = [[end, eob_branch - end], [zero, one + more], [one, more]];
+                for (node, [left, right]) in branches.into_iter().enumerate() {
+                    let cost = |probability: u8| {
+                        if node < 2 {
+                            return f64::from(left) * bit_cost(false, probability)
+                                + f64::from(right) * bit_cost(true, probability);
+                        }
+                        // The pivot: ONE against every larger token, each of
+                        // which also pays its path through the model.
+                        let mut bits = f64::from(left) * bit_cost(false, probability);
+                        for (&count, &magnitude) in larger.iter().zip(&LARGER_TOKEN_MAGNITUDES) {
+                            if count != 0 {
+                                let mut sink = BitCost::default();
+                                write_magnitude(&mut sink, magnitude, probability);
+                                bits += f64::from(count) * sink.0;
+                            }
+                        }
+                        bits
+                    };
+                    let old = model[node];
+                    let target = observed(left, right).unwrap_or(old);
+                    let old_bits = cost(old);
+                    let mut best = (old, 0.0);
+                    let step: i16 = if target > old { -1 } else { 1 };
+                    let mut candidate = i16::from(target);
+                    while candidate != i16::from(old) {
+                        let probability = candidate as u8;
+                        let saving = old_bits
+                            - cost(probability)
+                            - (diff_update_bits(probability, old) + update - keep);
+                        if saving > best.1 {
+                            best = (probability, saving);
+                        }
+                        candidate += step;
+                    }
+                    if best.0 == old {
+                        savings -= keep;
+                    } else {
+                        model[node] = best.0;
+                        savings += best.1 - keep;
+                    }
+                }
+            }
+            if savings > 0.0 {
+                *coded = probs;
+            }
+        }
+        coded
+    }
+}
+
+/// Every coefficient context a frame codes, as `(plane type, reference,
+/// band, context)`: the first band has only three.
+pub(super) fn coef_contexts() -> impl Iterator<Item = (usize, usize, usize, usize)> {
+    (0..2).flat_map(|plane_type| {
+        (0..2).flat_map(move |reference| {
+            (0..6).flat_map(move |band| {
+                (0..if band == 0 { 3 } else { 6 })
+                    .map(move |context| (plane_type, reference, band, context))
+            })
+        })
+    })
+}
+
+/// The probability of a zero bit that `left` zeros and `right` ones imply
+/// (`get_binary_prob`), or `None` without symbols.
+fn observed(left: u32, right: u32) -> Option<u8> {
+    let count = u64::from(left) + u64::from(right);
+    (count != 0).then(|| ((u64::from(left) * 256 + (count >> 1)) / count).clamp(1, 255) as u8)
+}
+
+/// Writes the forward update of `old` to `new` in a compressed header, or
+/// that it does not change (`vp9_cond_prob_diff_update`).
+pub(super) fn write_diff_update<S: BoolSink>(sink: &mut S, old: u8, new: u8) {
+    sink.write(new != old, DIFF_UPDATE_PROB);
+    if new != old {
+        write_term_subexp(sink, remap_prob(new, old));
+    }
+}
+
+/// What updating `old` to `new` codes its difference in, in bits, beyond
+/// the update flag.
+fn diff_update_bits(new: u8, old: u8) -> f64 {
+    let mut sink = BitCost::default();
+    write_term_subexp(&mut sink, remap_prob(new, old));
+    sink.0
+}
+
+/// The index of `new` among the probabilities an update of `old` can code,
+/// ordered by their distance from `old` (libvpx's `remap_prob`), inverting the
+/// decoder's `inv_remap_prob`.
+fn remap_prob(new: u8, old: u8) -> u32 {
+    fn recenter_nonneg(v: i32, m: i32) -> i32 {
+        if v > m << 1 {
+            v
+        } else if v >= m {
+            (v - m) << 1
+        } else {
+            ((m - v) << 1) - 1
+        }
+    }
+    let (v, m) = (i32::from(new) - 1, i32::from(old) - 1);
+    let index = if m << 1 <= 255 {
+        recenter_nonneg(v, m)
+    } else {
+        recenter_nonneg(254 - v, 254 - m)
+    } - 1;
+    u32::from(MAP_TABLE[index as usize])
+}
+
+/// `map_table`: the inverse of the decoder's `inv_map_table`, which lists
+/// every 13th distance from 7 first so that they code in fewer bits.
+const MAP_TABLE: [u8; 254] = {
+    let mut table = [0_u8; 254];
+    let mut delta = 0;
+    while delta < 20 {
+        table[6 + 13 * delta] = delta as u8;
+        delta += 1;
+    }
+    let mut distance = 1;
+    while distance <= 254 {
+        if distance < 7 || (distance - 7) % 13 != 0 {
+            table[distance - 1] = delta as u8;
+            delta += 1;
+        }
+        distance += 1;
+    }
+    table
+};
+
+/// Writes a remapped difference with the terminated subexponential code
+/// `decode_term_subexp` reads, in equiprobable bits.
+fn write_term_subexp<S: BoolSink>(sink: &mut S, value: u32) {
+    let mut literal = |value: u32, bits: u32| {
+        for bit in (0..bits).rev() {
+            sink.write((value >> bit) & 1 != 0, 128);
+        }
+    };
+    match value {
+        0..16 => literal(value, 1 + 4),
+        16..32 => literal(0b10 << 4 | (value - 16), 2 + 4),
+        32..64 => literal(0b110 << 5 | (value - 32), 3 + 5),
+        _ => {
+            literal(0b111, 3);
+            // `decode_uniform`: seven bits below 65, then eight.
+            let value = value - 64;
+            const SHORT: u32 = (1 << 8) - 191;
+            if value < SHORT {
+                literal(value, 7);
+            } else {
+                literal(value + SHORT, 8);
+            }
+        }
+    }
+}
+
 /// Moves `previous` toward the probability `left / (left + right)` of a zero
 /// bit, by at most `max_update_factor / 256` once `max_count` symbols were
 /// seen (libvpx's `merge_probs`).
@@ -352,6 +549,105 @@ mod tests {
         // After a key frame, coefficients adapt with the larger factor.
         let after_key = context.adapted(&counts, false, true, true, false);
         assert_ne!(after_key.coef[1][0][0][0][0], inter.coef[1][0][0][0][0]);
+    }
+
+    /// The decoder's `inv_remap_prob`, as the specification defines it.
+    fn inv_remap_prob(delta: u32, old: u8) -> u8 {
+        let mut inv_map_table: Vec<i32> = (0..20).map(|index| 7 + 13 * index).collect();
+        inv_map_table.extend((1..=253).filter(|value| *value < 7 || (value - 7) % 13 != 0));
+        let v = inv_map_table[delta as usize];
+        let inv_recenter_nonneg = |v: i32, m: i32| {
+            if v > 2 * m {
+                v
+            } else if v & 1 == 1 {
+                m - ((v + 1) >> 1)
+            } else {
+                m + (v >> 1)
+            }
+        };
+        let m = i32::from(old) - 1;
+        if m << 1 <= 255 {
+            (1 + inv_recenter_nonneg(v, m)) as u8
+        } else {
+            (255 - inv_recenter_nonneg(v, 254 - m)) as u8
+        }
+    }
+
+    #[test]
+    fn remapped_differences_decode_to_the_new_probability() {
+        for old in 1..=255_u8 {
+            let mut seen = [false; 254];
+            for new in (1..=255_u8).filter(|&new| new != old) {
+                let delta = remap_prob(new, old);
+                assert_eq!(inv_remap_prob(delta, old), new, "{old} to {new}");
+                assert!(!std::mem::replace(&mut seen[delta as usize], true));
+            }
+        }
+    }
+
+    #[test]
+    fn subexponential_codes_grow_with_the_difference() {
+        let bits = |value| {
+            let mut sink = BitCost::default();
+            write_term_subexp(&mut sink, value);
+            sink.0
+        };
+        for (value, expected) in [(0, 5.0), (15, 5.0), (16, 6.0), (31, 6.0), (32, 8.0)] {
+            assert_eq!(bits(value), expected, "{value}");
+        }
+        // `decode_uniform`: 64 more values in seven bits, the rest in eight.
+        assert_eq!(bits(63), 8.0);
+        assert_eq!(bits(64), 10.0);
+        assert_eq!(bits(64 + 64), 10.0);
+        assert_eq!(bits(64 + 65), 11.0);
+        assert_eq!(bits(253), 11.0);
+    }
+
+    #[test]
+    fn coefficient_updates_follow_the_tokens_only_where_they_pay() {
+        let context = FrameContext::default();
+        let mut counts = FrameCounts::default();
+        assert_eq!(context.coef_updates(&counts, 4), context.coef);
+
+        // A handful of tokens cannot pay for an update.
+        counts.coef[1][0][0][1][0] = [3, 0, 0, 0];
+        counts.eob_branch[1][0][0][1][0] = 3;
+        assert_eq!(context.coef_updates(&counts, 4), context.coef);
+
+        // Thousands of zeros in one context, none of them ending the block,
+        // pay for raising the probability of ZERO there and lowering that of
+        // the end of block; nothing else changes.
+        counts.coef[1][0][0][1][0] = [4000, 0, 0, 0];
+        counts.eob_branch[1][0][0][1][0] = 4000;
+        let updated = context.coef_updates(&counts, 4);
+        let (old, new) = (context.coef[1][0][0][1][0], updated[1][0][0][1][0]);
+        assert!(new[0] < old[0] && new[1] > old[1], "{old:?} to {new:?}");
+        assert_eq!(new[2], old[2]);
+        let mut unchanged = updated;
+        unchanged[1][0][0][1][0] = old;
+        assert_eq!(unchanged, context.coef);
+
+        // Only the transform sizes the frame can code are updated.
+        assert_eq!(context.coef_updates(&counts, 1), context.coef);
+    }
+
+    #[test]
+    fn pivot_updates_weigh_every_larger_token() {
+        // As many ONEs as larger tokens: the binary counts alone would keep
+        // the pivot near even, but every larger token here is a category 6,
+        // whose path through the model a lower pivot shortens.
+        let context = FrameContext::default();
+        let mut counts = FrameCounts::default();
+        counts.coef[0][0][0][1][0] = [0, 2000, 2000, 0];
+        counts.larger_tokens[0][0][0][1][0][8] = 2000;
+        let cat6 = context.coef_updates(&counts, 1)[0][0][0][1][0][2];
+        counts.larger_tokens[0][0][0][1][0] = [0; 9];
+        counts.larger_tokens[0][0][0][1][0][0] = 2000;
+        let two = context.coef_updates(&counts, 1)[0][0][0][1][0][2];
+        assert!(
+            cat6 < two,
+            "pivot {cat6} for category 6 tokens, {two} for TWOs"
+        );
     }
 
     #[test]

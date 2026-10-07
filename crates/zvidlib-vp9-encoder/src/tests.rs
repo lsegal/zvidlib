@@ -505,6 +505,53 @@ fn adaptive_probabilities_shrink_the_output_at_equal_quality() {
     }
 }
 
+/// Issue #622: key frames used to code their tokens with VP9's default
+/// coefficient probabilities, which fit textured intra content at coarse
+/// quantizers badly. Updating them in the compressed header, and costing the
+/// search with the updated ones, must shrink such key frames at the same
+/// quality, judged at 6 dB per doubling of the size: by more than a quarter
+/// for the detailed key frame the lookahead keeps where its detail pays off,
+/// and at all for the plain one.
+#[test]
+fn coefficient_probability_updates_shrink_key_frames_at_equal_quality() {
+    let geometry = Geometry::new(192, 128);
+    let frame = moving_yuv_frame(192, 128, 0);
+    let source = source_picture(&geometry, &frame, Orientation::TopLeft).unwrap();
+    for base_q_idx in [230, 235, 240] {
+        for (weighted, gain) in [(true, 0.75), (false, 1.0)] {
+            let [(default_bytes, default_psnr), (updated_bytes, updated_psnr)] =
+                [false, true].map(|coef_updates| {
+                    let settings = StreamSettings {
+                        geometry,
+                        base_q_idx,
+                        tools: CodingTools {
+                            coef_updates,
+                            ..CodingTools::ALL
+                        },
+                        error_resilient: true,
+                        full_range: false,
+                        loop_filter: true,
+                    };
+                    let coded = StreamState::default().code(&settings, &source, true, weighted);
+                    (
+                        coded.data.len() as f64,
+                        psnr(
+                            &visible(&coded.reconstruction, &geometry),
+                            &visible(&source, &geometry),
+                        ),
+                    )
+                });
+            let equivalent_bytes = default_bytes * 2_f64.powf((updated_psnr - default_psnr) / 6.0);
+            assert!(
+                updated_bytes < equivalent_bytes * gain,
+                "q {base_q_idx}, weighted {weighted}: {updated_bytes} bytes at \
+                 {updated_psnr:.2} dB updated, {default_bytes} bytes at {default_psnr:.2} dB \
+                 with the defaults"
+            );
+        }
+    }
+}
+
 #[test]
 fn levels_follow_picture_size_and_sample_rate() {
     let level = |width, height, timescale, duration| {
@@ -608,6 +655,7 @@ const SMALL_BLOCKS: CodingTools = CodingTools {
     largest_block: 0,
     larger_transforms: false,
     sub_sample_motion: true,
+    coef_updates: true,
 };
 
 /// Every coding tool except sub-sample motion vectors.
@@ -1097,6 +1145,16 @@ fn encode_group(frames: &[VideoFrame], base_q_idx: u8, loop_filter: bool) -> (us
     (sizes.iter().sum(), psnr)
 }
 
+/// The coding tools [`encode_group`] codes with: every tool, with the default
+/// coefficient probabilities, so that its comparisons isolate the loop filter
+/// and the lookahead. Fitted to each frame's own tokens (issue #622), the
+/// probabilities move a group's size between neighbouring quantizers, and
+/// between a weighted and an unweighted key frame, by more than either does.
+const GROUP_TOOLS: CodingTools = CodingTools {
+    coef_updates: false,
+    ..CodingTools::ALL
+};
+
 /// [`encode_group`], with the size of every frame.
 fn encode_group_frames(
     frames: &[VideoFrame],
@@ -1114,7 +1172,7 @@ fn encode_group_frames(
     let settings = StreamSettings {
         geometry,
         base_q_idx,
-        tools: CodingTools::ALL,
+        tools: GROUP_TOOLS,
         error_resilient: true,
         full_range: false,
         loop_filter,
@@ -1287,7 +1345,7 @@ fn long_pans_keep_key_frame_detail_only_where_it_pays() {
             let settings = StreamSettings {
                 geometry,
                 base_q_idx,
-                tools: CodingTools::ALL,
+                tools: GROUP_TOOLS,
                 error_resilient: true,
                 full_range: false,
                 loop_filter: true,
