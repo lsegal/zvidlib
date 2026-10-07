@@ -4,14 +4,15 @@
 //! runtime-detected vector kernels in several independent places: the AV1
 //! transforms and in-loop filters ([`crate::av1_simd`]), AV1 inter prediction
 //! ([`crate::av1_mc`]), AV1 intra prediction ([`crate::av1_intra_pred`]),
-//! the HEVC engine's inter/intra prediction, in-loop filters, inverse
-//! transforms, encoder-side distortion metrics, and encoder-side color
-//! conversion, the AV1, VP8 and VP9 decoders' shared output color conversion
-//! ([`crate::av1_filters::convert_to_rgba8`]), the Vorbis decoder's synthesis
-//! (`crate::vorbis_simd`), and the native VP9 encoder's pixel kernels. Each of
-//! those sites caches its own CPU feature probe, which is what you want in
-//! production but makes "run this workload with SIMD off" impossible to express
-//! from outside the crate.
+//! the VP9 decoder's inverse transforms, prediction and loop filter
+//! (`crate::vp9_simd`), the HEVC engine's inter/intra prediction, in-loop
+//! filters, inverse transforms, encoder-side distortion metrics, and
+//! encoder-side color conversion, the AV1, VP8 and VP9 decoders' shared output
+//! color conversion ([`crate::av1_filters::convert_to_rgba8`]), the Vorbis
+//! decoder's synthesis (`crate::vorbis_simd`), and the native VP9 encoder's
+//! pixel kernels. Each of those sites caches its own CPU feature probe, which
+//! is what you want in production but makes "run this workload with SIMD off"
+//! impossible to express from outside the crate.
 //!
 //! This module is that single switch. [`set_override`] pins **every** kernel in
 //! the crate to one [`SimdIsa`] (or restores per-site automatic detection with
@@ -51,8 +52,9 @@ static OVERRIDE: AtomicU8 = AtomicU8::new(0);
 /// The override reaches every dispatch family: the AV1 transform and in-loop
 /// filter kernels, AV1 motion compensation (through the default level
 /// [`crate::av1_mc::McContext::new`] picks up), AV1 intra prediction, every
-/// HEVC engine kernel, the AV1, VP8 and VP9 output color conversion, the
-/// Vorbis decoder's synthesis kernels, and the VP9 encoder's kernels.
+/// VP9 decoder kernel, every HEVC engine kernel, the AV1, VP8 and VP9 output
+/// color conversion, the Vorbis decoder's synthesis kernels, and the VP9
+/// encoder's kernels.
 /// [`SimdIsa::Scalar`] therefore genuinely reaches the scalar code path rather
 /// than merely the widest scalar-ish one.
 ///
@@ -116,6 +118,7 @@ pub fn available() -> Vec<SimdIsa> {
 /// | `av1_mc` | AV1 motion compensation (the level [`crate::av1_mc::McContext::new`] picks) |
 /// | `av1_intra_pred` | AV1 intra prediction and residual reconstruction |
 /// | `av1_coeff_ctx` | AV1 encoder-side coefficient context derivation (§8.3.2) |
+/// | `vp9_decode` | VP9 decoder inverse transforms, inter and intra prediction, and loop filter |
 /// | `vp9_encode` | VP9 encoder forward transforms, quantization, distortion metrics, intra/inter prediction and RGBA8 to YUV420 input conversion |
 /// | `hevc_prediction_filters` | HEVC inter/intra prediction and in-loop filters |
 /// | `hevc_transforms` | HEVC inverse transforms and dequantization |
@@ -140,6 +143,7 @@ pub fn active_by_site() -> Vec<(&'static str, SimdIsa)> {
             from_intra_simd(crate::av1_intra_pred::av1_intra_simd()),
         ),
         ("av1_coeff_ctx", crate::av1_simd::coeff::active_isa()),
+        ("vp9_decode", crate::vp9_simd::active_isa()),
         (
             "vp9_encode",
             from_vp9_encode_isa(crate::vp9_encoder::simd::isa()),
@@ -408,6 +412,8 @@ mod tests {
         // AV1 motion compensation, through the level `McContext::new` picks.
         assert_eq!(default_level(), SimdLevel::Scalar);
         assert_eq!(McContext::new().level(), SimdLevel::Scalar);
+        // VP9 decoder transforms, prediction and loop filter.
+        assert_eq!(crate::vp9_simd::active_isa(), SimdIsa::Scalar);
         // The VP9 encoder's kernels.
         assert_eq!(vp9_encode::isa(), vp9_encode::Isa::Scalar);
         // HEVC inter/intra prediction and in-loop filters.
@@ -440,6 +446,7 @@ mod tests {
             "av1_mc",
             "av1_intra_pred",
             "av1_coeff_ctx",
+            "vp9_decode",
             "vp9_encode",
             "hevc_prediction_filters",
             "hevc_transforms",
@@ -512,6 +519,8 @@ mod tests {
             default_level() != crate::av1_mc::SimdLevel::Scalar,
             vectorized
         );
+        // VP9 decoder transforms, prediction and loop filter.
+        assert_eq!(crate::vp9_simd::active_isa(), detected());
         // The VP9 encoder's kernels.
         assert_eq!(vp9_encode::isa() != vp9_encode::Isa::Scalar, vectorized);
         // HEVC inter/intra prediction and in-loop filters.
@@ -557,6 +566,7 @@ mod tests {
             "av1_mc",
             "av1_intra_pred",
             "av1_coeff_ctx",
+            "vp9_decode",
             "vp9_encode",
             "hevc_prediction_filters",
             "hevc_transforms",
